@@ -34,16 +34,19 @@
 #         (`event_type=claimed`, `note_text=<text>` / `note_path=<p>`).
 #         Symmetric with `agb done` / `agb update`.
 #
-#   #1255: roster read-block softened for ADMIN shells. The strict
-#         read-intent whitelist (cat/grep/head/tail/...) is now bypassed
-#         when the bash command is issued by an admin agent AND has no
-#         detectable write-intent token (`tee`, `sed -i`, `awk -i
-#         inplace`, output redirection, known mutators). Non-admin
-#         class still hits the original deny — those agents must not
-#         dump roster secrets into commit messages / audit logs even
-#         under a non-write-intent verb (`git commit -F <roster>`).
-#         Write paths still flow through the `agent-bridge config
-#         set` wrapper.
+#   #1255 r2: admin roster read carve-out is a STRICT read-intent
+#         whitelist (cat / grep / head / `agent-bridge config get` /
+#         …). r1 used a write-intent blacklist that tolerated unknown
+#         stage leaders, which codex r1 review showed lets the admin
+#         shell run `python3 /tmp/mutator.py <roster>`, `my-mutator
+#         <roster>`, or `git commit -F <roster>` — paths that mutate
+#         or exfiltrate roster secrets outside the
+#         `agent-bridge config set` audit chain. r2 flips the
+#         classifier so unknown leaders default-deny. Operator
+#         diagnostics (`cat $roster`, `grep BRIDGE $roster`,
+#         `head -10 $roster`) are still allowed because they're on
+#         the canonical read-intent whitelist. Non-admin class still
+#         hits the original deny.
 #
 # Test plan:
 #   T1  (#1282 A): `bridge_run_prune_legacy_teams_mcp` line filter
@@ -70,14 +73,21 @@
 #   T5t (#1253 teeth): claim without `--note` writes a `task_events`
 #                  row with `event_type=claimed` AND `note_text IS
 #                  NULL`. Proves the propagation is opt-in.
-#   T6  (#1255): `_bash_command_has_no_write_intent` returns True for
-#                  benign reads + custom non-write commands; False
-#                  for `... > <roster>`, `tee <roster>`, `sed -i`, and
-#                  any output redirection.
-#   T6t (#1255 teeth): the strict `_is_read_intent_bash` whitelist
-#                  rejects a custom command that the new softer
-#                  classifier accepts — proving the softening is what
-#                  unblocks issue #1255's repro shape.
+#   T6  (#1255 r2): `_bash_command_has_read_intent` is a strict
+#                  whitelist — True for cat / grep / head / awk-no-i
+#                  / sed-no-i; False for `python3 /tmp/mutator.py
+#                  <roster>`, `my-mutator <roster>`, `git commit -F
+#                  <roster>`, `sed -i`, output-redirect, and any
+#                  unknown stage leader. End-to-end gate check via
+#                  `protected_alias_reason` confirms admin mutators
+#                  are blocked while admin read-only diagnostics
+#                  pass.
+#   T6t (#1255 r2 teeth): swapping the whitelist for a hypothetical
+#                  blacklist (here simulated by `lambda _: True`)
+#                  would let admin `python3 /tmp/mutator.py
+#                  <roster>` and `git commit -F <roster>` through —
+#                  proving the strict whitelist is what closes the
+#                  codex r1 BLOCKING gap.
 #
 # Footgun #11: no `<<EOF` to subprocess, no `<<<` here-strings into
 # command substitutions, no inline Python heredoc-to-stdin. Helpers
@@ -384,9 +394,23 @@ smoke_assert_contains "$T5T_EVENTS" "claimed|None" \
   "T5 teeth: claim row's note_text is NULL when --note omitted"
 
 # ---------------------------------------------------------------------------
-# T6 (#1255): roster read-block softer classifier + admin-only gate.
+# T6 (#1255 r2): admin roster read carve-out = STRICT read-intent whitelist.
+#
+# r1 used a write-intent BLACKLIST that tolerated unknown stage leaders;
+# codex r1 review demonstrated that posture admitted
+# `python3 /tmp/mutator.py <roster>`, `my-mutator <roster>`, and
+# `git commit -F <roster>` — admin paths that mutate or exfiltrate the
+# roster outside the `agent-bridge config set` audit chain. r2 flips
+# the classifier to a strict whitelist (`_bash_command_has_read_intent`
+# delegating to `_is_read_intent_bash`). Unknown leaders default-deny.
+#
+# This test covers the 10 codex r1 mutator/leak vectors at the
+# end-to-end `protected_alias_reason` boundary, plus unit cases on the
+# renamed classifier. The teeth case proves that swapping the strict
+# whitelist for an always-True stub would let admin mutators through —
+# i.e. the whitelist is what closes the BLOCKING gap.
 # ---------------------------------------------------------------------------
-smoke_log "T6: roster read-block softening — admin allow + non-admin still deny (#1255)"
+smoke_log "T6: admin roster carve-out blocks mutators (#1255 r2 — codex r1 BLOCKING fix)"
 
 T6_PROBE="$SMOKE_TMP_ROOT/t6-probe.py"
 {
@@ -408,38 +432,82 @@ T6_PROBE="$SMOKE_TMP_ROOT/t6-probe.py"
   printf 'roster_path.parent.mkdir(parents=True, exist_ok=True)\n'
   printf 'roster_path.write_text("# fixture roster\\n")\n'
   printf 'rp = str(roster_path)\n'
-  # _bash_command_has_no_write_intent unit-level cases.
+  # Unit-level cases for the renamed classifier
+  # `_bash_command_has_read_intent`. Strict whitelist: known read-only
+  # leaders → True; unknown leaders / `sed -i` / output redirects /
+  # known mutators → False.
   printf 'classifier_cases = [\n'
-  printf '    ("plain-read", "cat " + rp, True),\n'
-  printf '    ("custom-tool", "myprog --opt " + rp, True),\n'
+  # Read-only shapes on the canonical whitelist → True.
+  printf '    ("plain-cat", "cat " + rp, True),\n'
+  printf '    ("plain-grep", "grep BRIDGE " + rp, True),\n'
+  printf '    ("plain-head", "head -10 " + rp, True),\n'
+  printf '    ("plain-tail", "tail -5 " + rp, True),\n'
+  printf "    ('plain-awk', 'awk {print} ' + rp, True),\n"
+  # `sed` (no -i) is NOT on `_READ_INTENT_BASH_COMMANDS` and the
+  # whitelist refuses it. Operators use `cat | sed` or `agent-bridge
+  # config get` instead. This is correct behavior — sed has many
+  # write-capable subcommands ("w" / "W") even without `-i`.
+  printf "    ('plain-sed-noi', 'sed -n 1,5p ' + rp, False),\n"
   printf '    ("read-pipeline", "grep BRIDGE " + rp + " | head -3", True),\n'
+  # Unknown stage leaders the r1 blacklist wrongly admitted → False.
+  printf '    ("python3-mutator", "python3 /tmp/mutator.py " + rp, False),\n'
+  printf '    ("custom-binary", "my-mutator " + rp, False),\n'
+  printf '    ("git-commit-leak", "git commit -F " + rp, False),\n'
+  printf "    ('perl-leak', 'perl -e nop ' + rp, False),\n"
+  printf "    ('ruby-leak', 'ruby -e nop ' + rp, False),\n"
+  # Known mutators / write shapes → False (was also False under r1,
+  # kept here as regression guard).
   printf '    ("write-redirect", "cat foo > " + rp, False),\n'
+  printf '    ("append-redirect", "echo x >> " + rp, False),\n'
   printf '    ("tee-write", "echo line | tee " + rp, False),\n'
   printf '    ("sed-inplace", "sed -i s/a/b/ " + rp, False),\n'
   printf '    ("rm-mutator", "rm " + rp, False),\n'
   printf '    ("mv-mutator", "mv x " + rp, False),\n'
   printf '    ("numeric-fd-redirect", "cat x 1>" + rp, False),\n'
+  printf '    ("chained-leader", "cat " + rp + " ; python3 /tmp/x.py " + rp, False),\n'
   printf ']\n'
   printf 'failed = False\n'
   printf 'for label, cmd, expected in classifier_cases:\n'
-  printf '    got = m._bash_command_has_no_write_intent(cmd)\n'
+  printf '    got = m._bash_command_has_read_intent(cmd)\n'
   printf '    if got == expected:\n'
   printf '        print("OK classifier " + label + " got=" + str(got))\n'
   printf '    else:\n'
   printf '        failed = True\n'
   printf '        print("FAIL classifier " + label + " got=" + str(got) + " expected=" + str(expected) + " cmd=" + repr(cmd))\n'
-  # End-to-end cases via protected_alias_reason. admin-test is admin via
-  # BRIDGE_ADMIN_AGENT_ID; "self" is treated as non-admin.
+  # End-to-end cases via protected_alias_reason. admin-test is admin
+  # via BRIDGE_ADMIN_AGENT_ID; "self" is treated as non-admin.
+  #
+  # The 10 codex r1 BLOCKING vectors (admin context, expected denied):
+  #   1. python3 /tmp/mutator.py <roster>
+  #   2. my-mutator <roster>
+  #   3. git commit -F <roster>
+  #   4. chained: `cat <roster> ; python3 /tmp/x.py <roster>`
+  #   8. sed -i (in-place mutation)
+  #   9. awk redirect to /tmp/out
+  # And the operator diagnostics that must STILL pass (admin context):
+  #   5. cat <roster>
+  #   6. grep PATTERN <roster>
+  #   7. head -10 <roster>
+  # Plus parity (non-admin context): write shape stays denied.
   printf 'gate_cases = [\n'
-  # admin + custom non-write-intent tool → allowed (None).
-  printf '    ("admin-custom-tool", "admin-test", "myprog --opt " + rp, None),\n'
-  # admin + write-redirect → blocked. Admin deny preserves the
-  # `agent-bridge config set` wrapper wording per #341 CP2.
-  printf '    ("admin-redirect-write", "admin-test", "cat x > " + rp, "protected system config path"),\n'
-  # non-admin + custom non-write-intent tool → blocked ("shared roster
-  # secrets" wording, intentionally distinct from the admin deny).
-  printf '    ("non-admin-custom-tool", "self", "git commit -F " + rp, "shared roster secrets"),\n'
-  # non-admin + plain read → allowed via strict read_intent.
+  # Admin mutator / leak vectors → denied. The deny reason on the
+  # admin path is the ROSTER_LOCAL_DENY_REASON ("protected system
+  # config path"), preserving #341 CP2 wording.
+  printf '    ("admin-python3-mutator", "admin-test", "python3 /tmp/mutator.py " + rp, "protected system config path"),\n'
+  printf '    ("admin-custom-binary", "admin-test", "my-mutator " + rp, "protected system config path"),\n'
+  printf '    ("admin-git-commit-leak", "admin-test", "git commit -F " + rp, "protected system config path"),\n'
+  printf '    ("admin-sed-inplace", "admin-test", "sed -i s/foo/bar/ " + rp, "protected system config path"),\n'
+  printf "    ('admin-awk-redirect', 'admin-test', 'awk {print} ' + rp + ' > /tmp/out', 'protected system config path'),\n"
+  printf '    ("admin-tee-write", "admin-test", "echo x | tee " + rp, "protected system config path"),\n'
+  # Admin operator diagnostics → allowed (the #1255 unblock target).
+  printf '    ("admin-cat", "admin-test", "cat " + rp, None),\n'
+  printf '    ("admin-grep", "admin-test", "grep BRIDGE " + rp, None),\n'
+  printf '    ("admin-head", "admin-test", "head -10 " + rp, None),\n'
+  # Non-admin parity: write shape stays denied (no carve-out applied).
+  # Non-admin plain read is still allowed via the general read_intent
+  # branch at protected_alias_reason — preserved for issue #383.
+  printf '    ("non-admin-git-commit", "self", "git commit -F " + rp, "shared roster secrets"),\n'
+  printf '    ("non-admin-python3-mutator", "self", "python3 /tmp/mutator.py " + rp, "shared roster secrets"),\n'
   printf '    ("non-admin-plain-read", "self", "cat " + rp, None),\n'
   printf ']\n'
   printf 'for label, agent, cmd, expected in gate_cases:\n'
@@ -463,49 +531,132 @@ python3 "$T6_PROBE" >"$SMOKE_TMP_ROOT/t6.out" 2>&1 \
   || smoke_fail "T6: probe failed:
 $(cat "$SMOKE_TMP_ROOT/t6.out")"
 T6_OUT="$(cat "$SMOKE_TMP_ROOT/t6.out")"
-smoke_assert_contains "$T6_OUT" "OK classifier plain-read" \
-  "T6: plain read passes the softer classifier"
-smoke_assert_contains "$T6_OUT" "OK classifier custom-tool" \
-  "T6: a custom (unknown) tool passes the softer classifier"
+
+# Classifier assertions — read-only shapes admitted.
+smoke_assert_contains "$T6_OUT" "OK classifier plain-cat" \
+  "T6: plain cat admitted by whitelist"
+smoke_assert_contains "$T6_OUT" "OK classifier plain-grep" \
+  "T6: plain grep admitted by whitelist"
+smoke_assert_contains "$T6_OUT" "OK classifier plain-head" \
+  "T6: plain head admitted by whitelist"
+smoke_assert_contains "$T6_OUT" "OK classifier plain-tail" \
+  "T6: plain tail admitted by whitelist"
+smoke_assert_contains "$T6_OUT" "OK classifier plain-awk" \
+  "T6: plain awk (no -i) admitted by whitelist"
+smoke_assert_contains "$T6_OUT" "OK classifier plain-sed-noi" \
+  "T6: sed (even without -i) refused by whitelist — has write-capable subcommands"
+
+# Classifier assertions — unknown leaders refused (codex r1 BLOCKING).
+smoke_assert_contains "$T6_OUT" "OK classifier python3-mutator" \
+  "T6: python3 /tmp/mutator.py refused by whitelist (unknown leader)"
+smoke_assert_contains "$T6_OUT" "OK classifier custom-binary" \
+  "T6: custom binary refused by whitelist (unknown leader)"
+smoke_assert_contains "$T6_OUT" "OK classifier git-commit-leak" \
+  "T6: git commit -F refused by whitelist (unknown leader)"
+
+# Classifier assertions — known mutators / write shapes refused.
 smoke_assert_contains "$T6_OUT" "OK classifier write-redirect" \
-  "T6: write redirection rejected by softer classifier"
-smoke_assert_contains "$T6_OUT" "OK classifier tee-write" \
-  "T6: tee rejected by softer classifier"
+  "T6: > redirect refused by whitelist"
+smoke_assert_contains "$T6_OUT" "OK classifier append-redirect" \
+  "T6: >> redirect refused by whitelist"
 smoke_assert_contains "$T6_OUT" "OK classifier sed-inplace" \
-  "T6: sed -i rejected by softer classifier"
-smoke_assert_contains "$T6_OUT" "OK gate admin-custom-tool" \
-  "T6 gate: admin + custom non-write-intent tool → allowed (#1255 unblock)"
-smoke_assert_contains "$T6_OUT" "OK gate admin-redirect-write" \
-  "T6 gate: admin + write-redirect → blocked (security boundary preserved)"
-smoke_assert_contains "$T6_OUT" "OK gate non-admin-custom-tool" \
-  "T6 gate: non-admin + custom non-write-intent tool → STILL blocked (roster secrets)"
+  "T6: sed -i refused by whitelist"
+smoke_assert_contains "$T6_OUT" "OK classifier numeric-fd-redirect" \
+  "T6: 1> redirect refused by whitelist"
+
+# End-to-end gate assertions — the codex r1 mutator/leak vectors.
+smoke_assert_contains "$T6_OUT" "OK gate admin-python3-mutator" \
+  "T6 gate: admin python3 /tmp/mutator.py <roster> → DENIED (codex r1 vector 1)"
+smoke_assert_contains "$T6_OUT" "OK gate admin-custom-binary" \
+  "T6 gate: admin my-mutator <roster> → DENIED (codex r1 vector 2)"
+smoke_assert_contains "$T6_OUT" "OK gate admin-git-commit-leak" \
+  "T6 gate: admin git commit -F <roster> → DENIED (codex r1 vector 3)"
+smoke_assert_contains "$T6_OUT" "OK gate admin-sed-inplace" \
+  "T6 gate: admin sed -i <roster> → DENIED (in-place mutation)"
+smoke_assert_contains "$T6_OUT" "OK gate admin-awk-redirect" \
+  "T6 gate: admin awk <roster> > /tmp/out → DENIED (exfil redirect)"
+smoke_assert_contains "$T6_OUT" "OK gate admin-tee-write" \
+  "T6 gate: admin tee <roster> → DENIED (known mutator)"
+
+# Operator diagnostics must STILL pass (the #1255 unblock surface).
+smoke_assert_contains "$T6_OUT" "OK gate admin-cat" \
+  "T6 gate: admin cat <roster> → allowed (#1255 unblock preserved)"
+smoke_assert_contains "$T6_OUT" "OK gate admin-grep" \
+  "T6 gate: admin grep <roster> → allowed (#1255 unblock preserved)"
+smoke_assert_contains "$T6_OUT" "OK gate admin-head" \
+  "T6 gate: admin head <roster> → allowed (#1255 unblock preserved)"
+
+# Non-admin parity.
+smoke_assert_contains "$T6_OUT" "OK gate non-admin-git-commit" \
+  "T6 gate: non-admin git commit -F <roster> → still DENIED"
+smoke_assert_contains "$T6_OUT" "OK gate non-admin-python3-mutator" \
+  "T6 gate: non-admin python3 mutator <roster> → still DENIED"
 smoke_assert_contains "$T6_OUT" "OK gate non-admin-plain-read" \
-  "T6 gate: non-admin + plain read still allowed via strict read_intent"
+  "T6 gate: non-admin plain read still allowed (preserves #383)"
+
 smoke_assert_not_contains "$T6_OUT" "FAIL " \
   "T6: every classifier + gate case must pass"
 
-# T6 teeth: prove the admin-only softening (not the underlying
-# read-intent whitelist) is what unblocks the custom-tool repro shape.
-smoke_log "T6 teeth: strict read-intent whitelist STILL refuses custom-tool"
+# T6 teeth: prove that the STRICT whitelist is what closes the codex
+# r1 BLOCKING gap. Swap `_bash_command_has_read_intent` for a stub
+# that always returns True (i.e. the r1 blacklist's effective behavior
+# on unknown leaders) and confirm an admin python3 mutator command is
+# THEN incorrectly allowed by `protected_alias_reason`. Restore the
+# real function and confirm the same command is denied.
+smoke_log "T6 teeth: stubbing classifier → True admits admin mutator (proves whitelist is the seal)"
 T6T_PROBE="$SMOKE_TMP_ROOT/t6-teeth.py"
 {
   printf '#!/usr/bin/env python3\n'
-  printf 'import importlib.util, sys\n'
+  printf 'import os, importlib.util, sys, tempfile\n'
+  printf 'bridge_home = tempfile.mkdtemp(prefix="t6-teeth-bridge-home-")\n'
+  printf 'os.environ["BRIDGE_HOME"] = bridge_home\n'
+  printf 'os.environ["BRIDGE_ADMIN_AGENT_ID"] = "admin-test"\n'
   printf 'spec = importlib.util.spec_from_file_location("tp", "%s")\n' "$TOOL_POLICY_PY"
   printf 'm = importlib.util.module_from_spec(spec)\n'
   printf 'spec.loader.exec_module(m)\n'
-  printf 'cmd = "myprog --opt agent-roster.local.sh"\n'
-  printf 'r = m._is_read_intent_bash(cmd)\n'
-  printf 's = m._bash_command_has_no_write_intent(cmd)\n'
-  printf 'print("read_intent=" + str(r) + " soft_no_write=" + str(s))\n'
-  printf 'sys.exit(0 if (r is False and s is True) else 1)\n'
+  printf 'roster_path = m.roster_local_path()\n'
+  printf 'roster_path.parent.mkdir(parents=True, exist_ok=True)\n'
+  printf 'roster_path.write_text("# fixture roster\\n")\n'
+  printf 'rp = str(roster_path)\n'
+  printf 'admin_mutator = "python3 /tmp/mutator.py " + rp\n'
+  printf 'admin_leak = "git commit -F " + rp\n'
+  # Real classifier denies the mutator/leak.
+  printf 'real_mutator = m.protected_alias_reason(admin_mutator, "admin-test")\n'
+  printf 'real_leak = m.protected_alias_reason(admin_leak, "admin-test")\n'
+  printf 'real_cat = m.protected_alias_reason("cat " + rp, "admin-test")\n'
+  # Stub to True (simulating the r1 blacklist tolerating unknown leaders).
+  printf 'orig = m._bash_command_has_read_intent\n'
+  printf 'm._bash_command_has_read_intent = lambda cmd: True\n'
+  printf 'stub_mutator = m.protected_alias_reason(admin_mutator, "admin-test")\n'
+  printf 'stub_leak = m.protected_alias_reason(admin_leak, "admin-test")\n'
+  printf 'm._bash_command_has_read_intent = orig\n'
+  printf 'print("real_mutator=" + repr(real_mutator))\n'
+  printf 'print("real_leak=" + repr(real_leak))\n'
+  printf 'print("real_cat=" + repr(real_cat))\n'
+  printf 'print("stub_mutator=" + repr(stub_mutator))\n'
+  printf 'print("stub_leak=" + repr(stub_leak))\n'
+  # Pass iff real classifier denies mutator/leak, allows cat, AND stub
+  # lets the mutator/leak through (proving the whitelist is the seal).
+  printf 'ok = (real_mutator is not None\n'
+  printf '      and real_leak is not None\n'
+  printf '      and real_cat is None\n'
+  printf '      and stub_mutator is None\n'
+  printf '      and stub_leak is None)\n'
+  printf 'sys.exit(0 if ok else 1)\n'
 } >"$T6T_PROBE"
 T6T_OUT="$(python3 "$T6T_PROBE" 2>&1)" \
-  || smoke_fail "T6 teeth: classifier divergence not observed: $T6T_OUT"
-smoke_assert_contains "$T6T_OUT" "read_intent=False" \
-  "T6 teeth: strict whitelist refuses the custom-tool command"
-smoke_assert_contains "$T6T_OUT" "soft_no_write=True" \
-  "T6 teeth: softer classifier accepts the same command (issue #1255 unblock seed)"
+  || smoke_fail "T6 teeth: whitelist seal not observed:
+$T6T_OUT"
+smoke_assert_contains "$T6T_OUT" "real_mutator='" \
+  "T6 teeth: real classifier denies admin python3 mutator"
+smoke_assert_contains "$T6T_OUT" "real_leak='" \
+  "T6 teeth: real classifier denies admin git commit leak"
+smoke_assert_contains "$T6T_OUT" "real_cat=None" \
+  "T6 teeth: real classifier still allows admin cat diagnostic"
+smoke_assert_contains "$T6T_OUT" "stub_mutator=None" \
+  "T6 teeth: stubbed-True classifier wrongly admits admin mutator (r1 regression demo)"
+smoke_assert_contains "$T6T_OUT" "stub_leak=None" \
+  "T6 teeth: stubbed-True classifier wrongly admits admin git commit -F leak (r1 regression demo)"
 
 smoke_log "K-beta4-nits: all 6 tests + teeth passed"
 exit 0

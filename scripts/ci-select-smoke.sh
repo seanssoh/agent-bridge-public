@@ -809,14 +809,17 @@ select_for_path() {
       # the regression smoke whenever the file moves so the verb shape
       # surface (allow path + shape-deny audit row + path-traversal /
       # malformed-flag rejection) stays pinned.
-      # v0.15.0-beta4 Lane K (#1255): hooks/tool-policy.py now hosts
-      # `_bash_command_has_no_write_intent` — a softer (write-intent
-      # blacklist) classifier that gates the roster *read* path so a
-      # custom non-whitelist read command (e.g. `myprog --opt
-      # agent-roster.local.sh`) is no longer mis-rejected. Pull
-      # K-beta4-nits whenever tool-policy.py moves so a future PR
-      # cannot regress the softening back to the strict whitelist or
-      # widen the no-write-intent classifier into a write surface.
+      # v0.15.0-beta4 Lane K (#1255 r2): hooks/tool-policy.py hosts
+      # `_bash_command_has_read_intent` — a STRICT read-intent
+      # whitelist that gates the admin roster carve-out. r1 shipped
+      # this as a write-intent blacklist that codex r1 review showed
+      # admitted unknown stage leaders (`python3 /tmp/mutator.py
+      # <roster>`, `my-mutator <roster>`, `git commit -F <roster>`).
+      # r2 flips it to a whitelist delegating to
+      # `_is_read_intent_bash`. Pull K-beta4-nits whenever
+      # tool-policy.py moves so a future PR cannot regress the admin
+      # carve-out back to a blacklist or widen it into a write/leak
+      # surface.
       add_required hooks agent-update v2-cross-class-read admin-hook-exemption tool-policy-roster-read-classify 1205-hook-iso-fail-open 6607-hook-admin-allowlist K-beta4-nits
       add_integration integration-minimal
       ;;
