@@ -848,12 +848,18 @@ _bridge_iso_reconcile_row_agent_home_contract() {
   helper_line="$(grep -F "$(printf '%s\t' "$path")" "$helper_out_tmp" 2>/dev/null | head -n1 || true)"
   rm -f "$helper_out_tmp" 2>/dev/null || true
   if [[ -z "$helper_line" ]]; then
+    # No matching helper line. Since #1298 fixed the helper to always
+    # emit a per-target status line for every early-return path, hitting
+    # this branch indicates a true helper bug (not a known probe-failure
+    # condition). Surface as `degraded` (probe failure, NOT drift) so the
+    # operator sees the diagnostic without overall_rc reporting drift the
+    # operator cannot repair via re-apply.
     _bridge_iso_reconcile_emit_row "$row_name" \
-      "$BRIDGE_ISO_RECONCILE_STATUS_FAILED" "$path" \
+      "$BRIDGE_ISO_RECONCILE_STATUS_DEGRADED" "$path" \
       "$owner_resolved:$group_resolved $dir_mode" \
-      "(helper emitted no status line for $path)" \
-      "$notes (helper rc=$helper_rc)"
-    return 1
+      "(helper emitted no status line for $path — probe failure, NOT drift)" \
+      "$notes (helper rc=$helper_rc; rerun reconcile after stopping the agent or check sudoers)"
+    return 0
   fi
   # Parse tab-separated `helper_line` via parameter expansion — avoids
   # the `<<<` here-string heredoc-stdin class (footgun #11) that the
@@ -869,12 +875,41 @@ _bridge_iso_reconcile_row_agent_home_contract() {
   case "$_hstatus" in
     ok)      _hreport_status="$BRIDGE_ISO_RECONCILE_STATUS_OK" ;;
     changed) _hreport_status="$BRIDGE_ISO_RECONCILE_STATUS_CHANGED" ;;
+    denied|error)
+      # #1298 Gap A — helper reported a runtime/configuration probe
+      # failure (sudo denied, session running, anchor mismatch, malformed
+      # agent). NOT filesystem drift. Surface as `degraded` so the
+      # operator can see the diagnostic without overall_rc flagging drift
+      # the operator cannot repair by re-running apply. The actual
+      # remediation is operational (stop the agent, fix sudoers, fix
+      # config), not a reconcile retry. The helper has already warned to
+      # stderr with the specific reason.
+      _bridge_iso_reconcile_emit_row "$row_name" \
+        "$BRIDGE_ISO_RECONCILE_STATUS_DEGRADED" \
+        "$path" "$owner_resolved:$group_resolved $dir_mode" \
+        "(probe failure — helper status: $_hstatus)" \
+        "$notes (helper rc=$helper_rc; $_hstatus = NOT drift; see bridge_warn above for cause)"
+      return 0
+      ;;
+    missing)
+      # #1298 Gap A — helper reported the target path does not exist.
+      # This IS drift (the contract requires the path) and an apply-mode
+      # run should have created it; treat as missing/required.
+      _bridge_iso_reconcile_emit_row "$row_name" \
+        "$BRIDGE_ISO_RECONCILE_STATUS_MISSING" \
+        "$path" "$owner_resolved:$group_resolved $dir_mode" \
+        "(helper status: missing)" \
+        "$notes (helper rc=$helper_rc; path absent — re-run apply after addressing prerequisites)"
+      return 1
+      ;;
     *)
+      # Unrecognized status from helper — surface as failed (genuine
+      # helper-protocol bug; do not silently degrade).
       _bridge_iso_reconcile_emit_row "$row_name" \
         "$BRIDGE_ISO_RECONCILE_STATUS_FAILED" \
         "$path" "$owner_resolved:$group_resolved $dir_mode" \
         "${_howner_grp:-?} ${_hmode:-?} (helper status: $_hstatus)" \
-        "$notes (helper rc=$helper_rc — see bridge_warn above for the rejected sub-path)"
+        "$notes (helper rc=$helper_rc — unrecognized helper status; see bridge_warn above)"
       return 1
       ;;
   esac
@@ -1362,6 +1397,22 @@ EOF
       _bridge_iso_reconcile_log "skip: discriminator declined (non-Linux or BRIDGE_ISOLATION_REQUIRED=no)"
       return 0
     }
+  fi
+
+  # Manual-mode parity (#1298 Gap B): when an operator invokes
+  # `agent-bridge isolation reconcile --apply` (or --check) without
+  # specifying `--agent` or `--all-agents`, the prior contract emitted
+  # ONLY install-scope rows — agent-home-contract drift was silently
+  # invisible to manual reconcile and returned overall_rc=0 (false-OK).
+  # On reason=manual we now implicitly expand to all eligible isolated
+  # agents so manual reconcile reports the same row set as upgrade /
+  # install / agent-create. Non-manual callers (the install / upgrade /
+  # agent-create code paths) still honor the explicit --agent /
+  # --all-agents semantics so they can target a single agent without
+  # iterating the full roster.
+  if (( all_agents == 0 )) && [[ -z "$agent" ]] && [[ "$reason" == "manual" ]]; then
+    all_agents=1
+    _bridge_iso_reconcile_log "manual mode: implicit --all-agents (no --agent / --all given; including per-agent rows so agent-home-contract drift is visible — #1298 Gap B)"
   fi
 
   _bridge_iso_reconcile_log "begin mode=$mode reason=$reason agent=${agent:-<install-only>} all_agents=$all_agents"
