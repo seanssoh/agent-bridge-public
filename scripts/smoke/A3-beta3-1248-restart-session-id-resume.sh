@@ -296,10 +296,25 @@ test_continue1_with_session_id_emits_resume() {
 # ---------------------------------------------------------------------
 # T4 — continue=1 + session_id empty -> fail-loud with the exact
 #      remediation message. This is the #1248 surface.
+#
+#      Lane E PR #1259 (issue #1265) split the gate into two branches:
+#      `state/agents/<a>/launch.history` absent => fresh-first-wake
+#      bypass (legitimate fresh install); present => genuine #1248
+#      lost-state die. To preserve T4's lost-state contract on top of
+#      Lane E, the marker is pre-touched here so the gate routes the
+#      empty-session_id observation into the die branch instead of the
+#      fresh-state bypass.
 # ---------------------------------------------------------------------
 test_continue1_empty_session_id_fails_loud() {
   local agent="a3-T4"
   write_dryrun_roster "$agent" 1 ""
+
+  # Pre-touch launch.history so the Lane E (#1265) gate routes this
+  # empty-session_id observation into the lost-state die branch (#1248)
+  # rather than the fresh-first-wake bypass branch.
+  local marker="$BRIDGE_STATE_DIR/agents/$agent/launch.history"
+  mkdir -p "$(dirname "$marker")"
+  : >"$marker"
 
   local out=""
   local rc=0

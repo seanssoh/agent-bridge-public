@@ -209,11 +209,86 @@ if [[ "$_resume_gate_enabled" == "1" && $SAFE_MODE -eq 0 ]]; then
   _gate_continue="$(bridge_agent_continue "$AGENT")"
   _gate_session_id="$(bridge_agent_session_id "$AGENT")"
   if [[ "$_gate_continue" == "1" && -z "$_gate_session_id" ]]; then
-    bridge_audit_log state session_id_missing_resume_blocked "$AGENT" \
-      --detail continue_mode="$_gate_continue" \
-      --detail reason=session_id_empty_with_continue_1 \
-      2>/dev/null || true
-    bridge_die "session_id missing; one of: (a) run agent first interactively to capture, (b) set continue=0 explicitly, (c) check #1246 daemon supp-group state (agent=$AGENT continue=$_gate_continue session_id=empty)"
+    # Issue #1265 (v0.15.0-beta4 Lane E) — fresh-install first-wake
+    # carve-out. The Lane A3 gate (above) was designed for the
+    # `lost-state` case: an agent that has launched before (and
+    # therefore captured a session_id) but lost the persisted id due
+    # to the #1246 daemon supp-group write failure or operator-side
+    # rm -rf. That gate correctly fires loud so the operator sees it.
+    # However it also fired on the FRESH-install first-wake case, which
+    # is the OOTB-normal path:
+    #   `agb admin` on a fresh install -> patch agent has continue=1
+    #   (roster default for admins) AND session_id="" (no jsonl yet,
+    #   never launched). #1265 reported this as an OOTB-blocker for
+    #   the operator-visible `agb admin` flow AND for the daemon
+    #   picker-sweep wake of the codex pair (patch-dev), which had no
+    #   way to provide an `--no-continue` override.
+    #
+    # Heuristic: `state/agents/<a>/launch.history` is the marker that
+    # the agent has been launched at least once. Absent => fresh
+    # first-wake (proceed without --resume, emit a structured info
+    # log + audit row, and defer marker creation to the real-launch
+    # path so dry-run inspection stays side-effect-free; the NEXT
+    # empty-sid condition after a real launch correctly falls into
+    # the lost-state die branch).
+    # Present => the agent has launched before; an empty session_id
+    # now is the genuine #1248 lost-state and the die path is correct.
+    #
+    # The marker file is initially empty (touch only). Future passes
+    # may append 1-line per launch for ops-analytics; the schema is
+    # intentionally minimal so a `touch`/`rm` is the only operational
+    # surface. mkdir of the parent uses the existing self-heal helper
+    # (#1252 -- `bridge_agent_state_dir_self_heal`) to keep mode/group
+    # canonical on iso-v2 hosts; a touch fallback is also tried in
+    # case the helper is absent (non-v2 install) or the parent already
+    # exists but the helper short-circuits. Touch failure is
+    # non-fatal: we still proceed (the gate has decided the launch is
+    # legitimate) -- a future tick will retry.
+    #
+    # R2 (codex r1 BLOCKING — dry-run poisoning): the marker MUST NOT
+    # be created in this gate, because `bridge-run.sh --dry-run` is an
+    # advertised inspection mode and reaching the gate is not the same
+    # as "actually launched". Creating the marker here would flip a
+    # never-launched agent into "launched before" state, so the next
+    # real first launch (or even a second dry-run) would fall through
+    # to the lost-state die branch. We capture intent in a flag here
+    # and the real-launch path (after the dry-run early-exit) creates
+    # the marker exactly once, right before the launch loop.
+    #
+    # R3 (codex r2 BLOCKING — canonical state-dir path): the marker
+    # path MUST anchor on the canonical per-agent state leaf
+    # (`bridge_agent_idle_marker_dir <agent>` => `$BRIDGE_ACTIVE_AGENT_DIR/<a>`,
+    # which composes from `$BRIDGE_STATE_DIR/agents`), not on the
+    # hardcoded `$BRIDGE_HOME/state/agents/<a>` path. On hosts where
+    # `BRIDGE_STATE_DIR` is relocated independently of `BRIDGE_HOME`
+    # (operator override, isolated test layout) the two diverge and the
+    # gate would write the marker into one tree while the
+    # `bridge_agent_state_dir_self_heal` helper used by the real-launch
+    # block (and the daemon wake paths) targets the canonical tree —
+    # they would silently disagree and the next empty-sid gate would
+    # never see the marker, breaking the #1248 lost-state -> die
+    # contract on relocated layouts.
+    _gate_launch_history="$(bridge_agent_idle_marker_dir "$AGENT")/launch.history"
+    if [[ ! -f "$_gate_launch_history" ]]; then
+      bridge_info "[run] fresh first-wake (no session yet) — launching new session (agent=$AGENT)"
+      bridge_audit_log run fresh_first_wake "$AGENT" \
+        --detail continue_mode="$_gate_continue" \
+        --detail reason=fresh_install_no_launch_history \
+        2>/dev/null || true
+      # Defer marker creation to the real-launch path (see post-dry-run
+      # block below). The gate has decided the launch is legitimate;
+      # the marker becomes truth-on-disk only when an actual launch is
+      # attempted, NOT when --dry-run is inspecting the resolution.
+      BRIDGE_RUN_PENDING_FRESH_MARKER="$_gate_launch_history"
+      unset _gate_launch_history
+    else
+      unset _gate_launch_history
+      bridge_audit_log state session_id_missing_resume_blocked "$AGENT" \
+        --detail continue_mode="$_gate_continue" \
+        --detail reason=session_id_empty_with_continue_1 \
+        2>/dev/null || true
+      bridge_die "session_id missing; one of: (a) run agent first interactively to capture, (b) set continue=0 explicitly, (c) check #1246 daemon supp-group state (agent=$AGENT continue=$_gate_continue session_id=empty)"
+    fi
   fi
   unset _gate_continue _gate_session_id
 fi
@@ -243,7 +318,32 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "channels=$(bridge_agent_channels_csv "$AGENT")"
   echo "channel_status=$(bridge_agent_channel_status "$AGENT")"
   echo "launch=$(bridge_redact_inline_env_secrets "$LAUNCH_CMD")"
+  # R2 (codex r1 BLOCKING — dry-run poisoning): dry-run must NEVER
+  # create the launch.history marker. Unset the deferred-marker hint
+  # captured by the resume gate so a subsequent real launch in this
+  # process (none today, but defensive) cannot accidentally touch it
+  # via leaked global state.
+  unset BRIDGE_RUN_PENDING_FRESH_MARKER
   exit 0
+fi
+
+# R2 (codex r1 BLOCKING — dry-run poisoning, fresh first-wake real
+# launch path): the resume gate above captured a deferred marker hint
+# (BRIDGE_RUN_PENDING_FRESH_MARKER) when it observed continue=1 +
+# session_id="" + launch.history absent. Now that we have cleared the
+# dry-run early-exit, this IS a real launch — create the marker once,
+# right before the launch loop starts, so the NEXT empty-sid condition
+# (next process invocation) correctly falls into the lost-state die
+# branch (#1248). Marker creation failure stays non-fatal (the gate
+# has already decided the launch is legitimate) — a future tick will
+# retry.
+if [[ -n "${BRIDGE_RUN_PENDING_FRESH_MARKER:-}" ]]; then
+  if command -v bridge_agent_state_dir_self_heal >/dev/null 2>&1; then
+    bridge_agent_state_dir_self_heal "$AGENT" >/dev/null 2>&1 || true
+  fi
+  mkdir -p "$(dirname "$BRIDGE_RUN_PENDING_FRESH_MARKER")" 2>/dev/null || true
+  : >"$BRIDGE_RUN_PENDING_FRESH_MARKER" 2>/dev/null || true
+  unset BRIDGE_RUN_PENDING_FRESH_MARKER
 fi
 
 export PATH="$HOME/.local/bin:$HOME/.nix-profile/bin:/usr/local/bin:$PATH"
