@@ -608,6 +608,38 @@ bridge_isolation_v2_reapply_one_agent() {
     fi
   fi
 
+  # Lane A (v0.15.0-beta4): refresh the sanitized per-agent metadata
+  # snippet (`state/agents/<a>/agent-meta.env`) alongside the launch
+  # cmd refresh. Same staleness window — if the os_user / engine /
+  # config_dir composition drifted (e.g. operator manually
+  # renamed/migrated the iso UID), the iso UID context would carry
+  # stale identity until next prepare. Non-fatal: snippet absence is
+  # handled by the getent-based fallback in
+  # `bridge_agent_claude_home_dir`.
+  if [[ "$apply" == "1" ]]; then
+    if command -v bridge_isolation_v2_write_agent_metadata >/dev/null 2>&1; then
+      local _meta_file="${BRIDGE_ACTIVE_AGENT_DIR:-$BRIDGE_HOME/state/agents}/$agent/agent-meta.env"
+      if bridge_isolation_v2_write_agent_metadata "$agent" 2>/dev/null; then
+        bridge_isolation_v2_reapply_record_action \
+          "$actions_file" "$_meta_file" "agent_meta_regen" \
+          "stale|absent" "live-roster" "ok"
+      else
+        bridge_isolation_v2_reapply_record_action \
+          "$actions_file" "$_meta_file" "agent_meta_regen" \
+          "stale|absent" "live-roster" "error:write_failed"
+        printf '%s\n' "agent_meta_regen failed for $agent: $_meta_file (iso UID will fall back to getent-based config_dir resolution; #1272/#1277 mitigations remain operative)" \
+          >> "$errors_file"
+      fi
+    fi
+  else
+    local _meta_file_dr="${BRIDGE_ACTIVE_AGENT_DIR:-$BRIDGE_HOME/state/agents}/$agent/agent-meta.env"
+    local _meta_dr_status="would"
+    [[ "$mode" == "check" ]] && _meta_dr_status="drift"
+    bridge_isolation_v2_reapply_record_action \
+      "$actions_file" "$_meta_file_dr" "agent_meta_regen" \
+      "stale|absent" "live-roster" "$_meta_dr_status"
+  fi
+
   # ------------------------------------------------------------------
   # Agent's actual Linux home (`/home/agent-bridge-<agent>/`)
   # ------------------------------------------------------------------

@@ -435,3 +435,132 @@ bridge_source_module "bridge-agent-update.sh"
 # tests/upgrade-precompact-wire/smoke.sh case 5, which sources
 # lib/bridge-core.sh + lib/bridge-hooks.sh without bridge-lib.sh) without
 # requiring them to also pull bridge-lib.sh.
+
+# ---------------------------------------------------------------------------
+# Lane A (v0.15.0-beta4): sanitized-first metadata read for iso UID context.
+# ---------------------------------------------------------------------------
+#
+# When bridge-lib.sh is sourced from an iso UID (stop hook,
+# mark-idle.sh, sub-shell run as `agent-bridge-<X>`), the protected
+# `agent-roster.local.sh` is 0600 owner=controller and cannot be read.
+# `bridge_load_roster` recovers via the scoped `runtime/agent-env.sh`
+# under BRIDGE_AGENT_ROOT_V2 — but that recovery only fires when
+# `bridge_load_roster` is actually called (queue-safe verb), and even
+# then it depends on BRIDGE_AGENT_ID being exported into the hook env.
+# Many hook subprocess paths (Claude `Stop` hook -> mark-idle.sh ->
+# `bridge_agent_mark_idle_now`) consume the assoc arrays
+# (`BRIDGE_AGENT_OS_USER[$agent]`, `BRIDGE_AGENT_ISOLATION_MODE[$agent]`)
+# directly via lib/bridge-isolation-v2.sh::Path A0 before any explicit
+# roster load — and those arrays are empty until something populates
+# them.
+#
+# `agent-meta.env` (written by `bridge_isolation_v2_write_agent_metadata`,
+# 0640 controller:ab-agent-<a>) is the sanitized backup snippet the iso
+# UID can always read. Source-style sourcing would silently no-op
+# because `BRIDGE_AGENT_OS_USER` / `BRIDGE_AGENT_ISOLATION_MODE` are
+# bound to associative arrays (see #1213). Instead, we parse the file
+# line-by-line and explicitly populate the assoc-array slot for the
+# local agent.
+#
+# Backward compatibility: agents that have no snippet on disk
+# (legacy installs that have not run prepare/reapply after this
+# upgrade) fall through to the existing `bridge_load_roster` path —
+# behavior is identical to current.
+#
+# Triggers: BRIDGE_AGENT_ID must be set AND the snippet must exist at
+# the stable location. Empty / missing BRIDGE_AGENT_ID is the
+# controller-side path, which always uses the full roster.
+bridge_load_sanitized_agent_metadata() {
+  # iso UID scope guard (codex r1 BLOCKING #2, PR #1286 r2):
+  # This reader is only meaningful in an iso UID context (sub-shell
+  # running as `agent-bridge-<X>` or operator-configured prefix). The
+  # controller (operator user) has read access to the full
+  # `agent-roster.local.sh` via `bridge_load_roster`, so populating
+  # arrays from the sanitized snippet would (a) duplicate work and
+  # (b) risk preferring stale snippet contents over the live roster.
+  #
+  # Returns 1 (not 0) when the current user is NOT an iso UID — the
+  # call site at module-end uses `|| true` so this does not propagate
+  # under `set -e`. Tests that need to drive the reader from a
+  # controller context set BRIDGE_SANITIZED_METADATA_SKIP_GUARD=1 to
+  # bypass the guard (documented in scripts/smoke/lib.sh; never set
+  # in production code paths).
+  if [[ "${BRIDGE_SANITIZED_METADATA_SKIP_GUARD:-0}" != "1" ]]; then
+    local _cur_user
+    _cur_user="$(id -un 2>/dev/null)" || return 1
+    local _iso_prefix="${BRIDGE_OS_USER_PREFIX:-agent-bridge}"
+    case "$_cur_user" in
+      "${_iso_prefix}-"*) ;;        # iso UID — proceed
+      *) return 1 ;;                # controller / non-iso — skip sanitized read
+    esac
+  fi
+
+  local agent="${BRIDGE_AGENT_ID:-}"
+  [[ -n "$agent" ]] || return 1
+
+  local meta_file="${BRIDGE_ACTIVE_AGENT_DIR:-$BRIDGE_HOME/state/agents}/$agent/agent-meta.env"
+  [[ -r "$meta_file" ]] || return 1
+
+  # Ensure the assoc arrays exist (bridge-core.sh declares them inside
+  # `bridge_reset_roster_maps`, which fires inside `bridge_load_roster`).
+  # On a cold iso UID context the maps may not yet be declared at all;
+  # declaring here is idempotent.
+  declare -g -A BRIDGE_AGENT_OS_USER 2>/dev/null || true
+  declare -g -A BRIDGE_AGENT_ISOLATION_MODE 2>/dev/null || true
+  declare -g -A BRIDGE_AGENT_ENGINE 2>/dev/null || true
+  declare -g -a BRIDGE_AGENT_IDS 2>/dev/null || true
+
+  local key=""
+  local val=""
+  local line=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Strip CR (CRLF tolerance), skip blanks + comments.
+    line="${line%$'\r'}"
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    case "$line" in
+      *=*) ;;
+      *) continue ;;
+    esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    # Reject keys with whitespace or any character that's not in the
+    # set we recognize. This is sanitization, not security — the file
+    # is 0640 controller:ab-agent-<a>, owned by a privileged writer.
+    case "$key" in
+      BRIDGE_AGENT_OS_USER)
+        BRIDGE_AGENT_OS_USER["$agent"]="$val"
+        ;;
+      BRIDGE_AGENT_ISOLATION_MODE)
+        BRIDGE_AGENT_ISOLATION_MODE["$agent"]="$val"
+        ;;
+      BRIDGE_AGENT_ENGINE)
+        BRIDGE_AGENT_ENGINE["$agent"]="$val"
+        ;;
+      BRIDGE_AGENT_HOME|BRIDGE_AGENT_CLAUDE_CONFIG_DIR|BRIDGE_AGENT_AUDIT_DIR)
+        # Informational only — no array slot today. Future readers
+        # could prefer these over `getent` lookups; for now they
+        # serve as an operator-readable audit trail.
+        :
+        ;;
+      *)
+        # Unknown key — ignore (forward-compat snippet evolution).
+        :
+        ;;
+    esac
+  done <"$meta_file"
+
+  # If the agent isn't already in the IDs list (cold iso UID context),
+  # add it so callers that iterate `${BRIDGE_AGENT_IDS[@]}` see it.
+  local existing
+  for existing in "${BRIDGE_AGENT_IDS[@]+"${BRIDGE_AGENT_IDS[@]}"}"; do
+    if [[ "$existing" == "$agent" ]]; then
+      return 0
+    fi
+  done
+  BRIDGE_AGENT_IDS+=("$agent")
+  return 0
+}
+
+bridge_load_sanitized_agent_metadata || true
