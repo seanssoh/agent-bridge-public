@@ -469,7 +469,19 @@ select_for_path() {
       # Layer-2 fail-loud and breadcrumb cannot silently regress back to
       # the pre-#1248 swallowed-failure shape (every restart spawned a
       # fresh Claude session because session_id was never persisted).
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir
+      # v0.15.0-beta4 Lane D (issue #1276): bridge-daemon.sh's cmd_run
+      # now routes through `bridge_daemon_ensure_singleton` at the top
+      # of every spawn path (cmd_start fork, direct `bridge-daemon.sh run`,
+      # sudo-wrapped invocation, systemd ExecStart). The
+      # D-beta4-daemon-lifecycle smoke pins the singleton lock/flock,
+      # PID-file eviction, canonical `daemon_started` audit emit (with
+      # pid + parent_pid + wrapper + sudo_self fields), and the
+      # periodic `bridge_daemon_self_check`. Pull on every
+      # bridge-daemon.sh move so a future PR cannot silently regress
+      # back to the pre-Lane D duplicate-daemon surface that patch's
+      # beta3 fresh install hit (two daemons polling the same tasks.db,
+      # duplicate session_nudge_dropped rows, 5-10min nudge latency).
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -497,7 +509,17 @@ select_for_path() {
       # can never repeat undetected. Pull A12-beta3 on every
       # lib/bridge-daemon-control.sh move so the predicate's emit
       # contract stays pinned.
-      add_required F-daemon-supp-groups-mock F-daemon-supp-groups-real 1178-helper-contract-daemon-supp A12-beta3-1246-1252-daemon-supp-group-and-state-dir
+      # v0.15.0-beta4 Lane D (issue #1276): lib/bridge-daemon-control.sh
+      # hosts the new `bridge_daemon_ensure_singleton` + `bridge_daemon_self_check`
+      # helpers that close the duplicate-daemon spawn race. Any move to
+      # this lib OR to the systemd install script OR to the sudoers
+      # template MUST re-exercise the D-beta4 smoke because all three
+      # files participate in the spawn path that ensure_singleton
+      # guards (lib defines the helper; install-daemon-systemd.sh wires
+      # the ExecStart whose every restart now crosses the helper; the
+      # sudoers template authorizes the sudo-self path that emitted no
+      # `daemon_started` audit row pre-Lane D).
+      add_required F-daemon-supp-groups-mock F-daemon-supp-groups-real 1178-helper-contract-daemon-supp A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle
       ;;
 
     bridge-cron.py|bridge-cron-runner.py|bridge-cron-scheduler.py)

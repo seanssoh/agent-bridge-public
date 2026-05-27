@@ -996,3 +996,360 @@ bridge_daemon_control_preflight_row() {
   printf 'daemon_group_refresh_sudoers=%s\n' "$status"
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# v0.15.0-beta4 Lane D — singleton spawn guard (issue #1276)
+# ---------------------------------------------------------------------------
+#
+# Two daemon processes were observed running simultaneously on patch's
+# beta3 fresh install: PID 140897 (installer-spawned, audit row present)
+# + PID 1186715/1186719 (sudo-wrapped, audit row ABSENT). Both polled
+# state/tasks.db → duplicate session_nudge_dropped rows + 5-10min
+# operator-perceived nudge latency.
+#
+# Root: spawn entry points (cmd_start fork, direct `bridge-daemon.sh run`,
+# sudo-wrapped invocation, systemd ExecStart) did not share a single
+# pid-file lock; the existing `cmd_start` pre-check was advisory only
+# (no flock, no kill of an existing daemon, no audit emit when invoked
+# via `bridge-daemon.sh run` directly).
+#
+# Fix shape:
+#   - bridge_daemon_ensure_singleton: called at the TOP of cmd_run (the
+#     one bottleneck every spawn path crosses). Acquires an exclusive
+#     flock on ${BRIDGE_DAEMON_PID_FILE}.lock, evicts a stale-but-living
+#     bridge-daemon process (TERM + 10s grace + KILL fallback), atomic
+#     PID-file write (tmp + rename), then emits a `daemon_started` audit
+#     row carrying pid / parent_pid / wrapper / sudo_self for forensic
+#     attribution.
+#   - bridge_daemon_self_check: called periodically from cmd_run's main
+#     loop. Compares $$ against the latest `daemon_started` audit row;
+#     mismatch → audit `daemon_pid_mismatch` + best-effort alert task.
+#
+# Both helpers fail-safe: if flock/python/audit emit fails the daemon
+# continues (we never `bridge_die` from these helpers — a wedge inside
+# the singleton guard must not stop the daemon from running).
+
+# Internal: resolve the lock-file path next to the daemon PID file.
+_bridge_daemon_singleton_lock_path() {
+  printf '%s' "${BRIDGE_DAEMON_PID_FILE:-${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}/daemon.pid}.lock"
+}
+
+# Internal: best-effort process-cmdline lookup. Returns a string that
+# either looks like `bridge-daemon.sh run` (match) or anything else
+# (mismatch — likely PID recycling, do not kill).
+_bridge_daemon_singleton_cmdline() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 1
+  ps -p "$pid" -o args= 2>/dev/null | head -n1
+}
+
+# bridge_daemon_ensure_singleton — acquire the PID-file flock, evict
+# any stale-but-living bridge-daemon process, atomically claim the PID
+# file, and emit the `daemon_started` audit row.
+#
+# Returns 0 on success (PID file claimed, audit row written).
+# Returns 1 when the lock cannot be acquired within the timeout (means
+# a concurrent ensure_singleton is already in flight — this process
+# MUST NOT proceed; the canonical pattern is `bridge_die` at the
+# caller's site to abort the daemon's main loop before it starts
+# polling).
+#
+# Side effects on success:
+#   - $BRIDGE_DAEMON_PID_FILE contains $$ atomically (tmp + rename).
+#   - audit log row `daemon daemon_started daemon pid=$$ parent_pid=$PPID
+#     wrapper=<value> sudo_self=<0|1>` is written.
+#   - If an existing bridge-daemon process was found alive, an
+#     intermediate `daemon_spawn_replacing` audit row is also written.
+#
+# Locking model: critical-section-only flock. The lock is held during
+# the read-existing-PID → maybe-evict → atomic-write critical section
+# and released before return. Steady-state singleton-ness is enforced
+# by the PID file content + cmdline-verified pid resolver elsewhere in
+# the codebase (bridge_daemon_pid in lib/bridge-state.sh). Holding the
+# fd for the entire daemon lifetime would leak the lock to any
+# nohup/setsid child process (silence-watchdog, queue-gateway-socket-
+# listener) that survives the daemon's exit, blocking the next daemon
+# start until ALL those children exit. The critical-section pattern
+# matches the existing _bridge_daemon_control_lock_acquire helper in
+# this file.
+#
+# wrapper detection precedence:
+#   1. BRIDGE_DAEMON_WRAPPER env (caller-injected: "sudo-self" /
+#      "systemd-user" / "install" / "operator" — operator-set when
+#      known).
+#   2. SUDO_USER non-empty → "sudo".
+#   3. Default → "direct".
+#
+# sudo_self detection: BRIDGE_DAEMON_SUDO_SELF env truthy → 1, else 0.
+bridge_daemon_ensure_singleton() {
+  local pid_file="${BRIDGE_DAEMON_PID_FILE:-${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}/daemon.pid}"
+  local lock_path
+  lock_path="$(_bridge_daemon_singleton_lock_path)"
+  local lock_timeout="${BRIDGE_DAEMON_SINGLETON_LOCK_TIMEOUT_SECONDS:-15}"
+  [[ "$lock_timeout" =~ ^[0-9]+$ ]] || lock_timeout=15
+
+  # Ensure state dir exists so the lockfile parent is valid even on
+  # fresh installs where cmd_start was bypassed (the direct `run` call
+  # path is exactly the surface this helper guards).
+  local state_parent
+  state_parent="$(dirname -- "$pid_file" 2>/dev/null || printf '%s' "${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}")"
+  mkdir -p -- "$state_parent" 2>/dev/null || true
+
+  # Wrapper / sudo_self attribution (computed once so both audit rows
+  # carry the same fields).
+  local wrapper="${BRIDGE_DAEMON_WRAPPER:-}"
+  if [[ -z "$wrapper" ]]; then
+    if [[ -n "${SUDO_USER:-}" ]]; then
+      wrapper="sudo"
+    else
+      wrapper="direct"
+    fi
+  fi
+  local sudo_self="0"
+  case "${BRIDGE_DAEMON_SUDO_SELF:-}" in
+    1|yes|YES|Yes|on|ON|On|true|TRUE|True) sudo_self="1" ;;
+  esac
+
+  # Acquire the exclusive PID-file lock. Use a dedicated `.lock`
+  # sidecar so the lockfile lifetime is independent of pid-file content
+  # rewrites. flock(1) is the source of truth — concurrent ensure paths
+  # contend on the fd, not on file mtime. The lock is critical-section-
+  # only: released at the end of this function so a sibling nohup'd
+  # helper process (silence watchdog, queue-gateway-socket-listener)
+  # cannot trap the lock past the daemon's exit.
+  local lock_fd=""
+  local lock_backend=""
+  local lock_dir=""
+  if command -v flock >/dev/null 2>&1; then
+    # shellcheck disable=SC2093
+    if ! exec {lock_fd}>"$lock_path" 2>/dev/null; then
+      bridge_warn "daemon-singleton: cannot open lockfile $lock_path"
+      command -v bridge_audit_log >/dev/null 2>&1 \
+        && bridge_audit_log daemon daemon_spawn_lock_open_failed daemon \
+             --detail pid="$$" \
+             --detail lock_path="$lock_path" >/dev/null 2>&1 || true
+      return 1
+    fi
+    if ! flock -w "$lock_timeout" "$lock_fd" 2>/dev/null; then
+      # Another singleton-guard is in flight; refuse to spawn.
+      command -v bridge_audit_log >/dev/null 2>&1 \
+        && bridge_audit_log daemon daemon_spawn_lock_busy daemon \
+             --detail attempting_pid="$$" \
+             --detail parent_pid="$PPID" \
+             --detail wrapper="$wrapper" \
+             --detail sudo_self="$sudo_self" >/dev/null 2>&1 || true
+      bridge_warn "daemon-singleton: refused to spawn — another ensure_singleton holds $lock_path (waited ${lock_timeout}s)"
+      exec {lock_fd}>&- 2>/dev/null || true
+      return 1
+    fi
+    lock_backend="flock"
+  else
+    # No flock(1) — fall back to mkdir-as-lock. Less robust but still
+    # serializes the local critical section. This branch matters on
+    # macOS dev hosts without coreutils-style flock installed; the
+    # production Linux server path always has util-linux flock.
+    lock_dir="${lock_path}.d"
+    local waited=0
+    local acquired=0
+    while (( waited < lock_timeout )); do
+      if mkdir -- "$lock_dir" 2>/dev/null; then
+        printf '%s\n' "$$" >"$lock_dir/owner.pid" 2>/dev/null || true
+        acquired=1
+        break
+      fi
+      # Lock taken — reclaim if recorded owner is dead.
+      local owner_pid=""
+      if [[ -r "$lock_dir/owner.pid" ]]; then
+        owner_pid="$(head -n1 "$lock_dir/owner.pid" 2>/dev/null | tr -dc '0-9')"
+      fi
+      if [[ -n "$owner_pid" ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+        rm -f "$lock_dir/owner.pid" 2>/dev/null || true
+        rmdir "$lock_dir" 2>/dev/null || true
+        continue
+      fi
+      sleep 1
+      waited=$(( waited + 1 ))
+    done
+    if (( acquired == 0 )); then
+      command -v bridge_audit_log >/dev/null 2>&1 \
+        && bridge_audit_log daemon daemon_spawn_lock_busy daemon \
+             --detail attempting_pid="$$" \
+             --detail parent_pid="$PPID" \
+             --detail wrapper="$wrapper" \
+             --detail sudo_self="$sudo_self" \
+             --detail lock_backend="mkdir" >/dev/null 2>&1 || true
+      bridge_warn "daemon-singleton: refused to spawn — $lock_dir held (waited ${lock_timeout}s)"
+      return 1
+    fi
+    lock_backend="mkdir"
+  fi
+
+  # Internal lock-release closure. Called from every successful and
+  # failed return path below so we never leak the flock fd / lock dir
+  # to a long-lived child process (nohup'd silence-watchdog,
+  # queue-gateway-socket-listener).
+  _bridge_daemon_singleton_release_lock() {
+    case "$lock_backend" in
+      flock)
+        if [[ "$lock_fd" =~ ^[0-9]+$ ]]; then
+          eval "exec ${lock_fd}>&-" 2>/dev/null || true
+        fi
+        ;;
+      mkdir)
+        if [[ -n "${lock_dir:-}" && -d "$lock_dir" ]]; then
+          rm -f "$lock_dir/owner.pid" 2>/dev/null || true
+          rmdir "$lock_dir" 2>/dev/null || true
+        fi
+        ;;
+    esac
+  }
+
+  # Inspect the PID file. If a bridge-daemon process is still alive
+  # under the recorded PID, evict it with TERM + 10s grace + KILL.
+  local existing_pid=""
+  if [[ -f "$pid_file" ]]; then
+    existing_pid="$(cat "$pid_file" 2>/dev/null | tr -dc '0-9' | head -c 16)"
+  fi
+  if [[ -n "$existing_pid" ]] && [[ "$existing_pid" != "$$" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+    local existing_cmdline=""
+    existing_cmdline="$(_bridge_daemon_singleton_cmdline "$existing_pid" 2>/dev/null || true)"
+    if [[ "$existing_cmdline" == *"bridge-daemon.sh run"* ]]; then
+      command -v bridge_audit_log >/dev/null 2>&1 \
+        && bridge_audit_log daemon daemon_spawn_replacing daemon \
+             --detail existing_pid="$existing_pid" \
+             --detail new_pid="$$" \
+             --detail wrapper="$wrapper" \
+             --detail sudo_self="$sudo_self" >/dev/null 2>&1 || true
+      kill -TERM "$existing_pid" 2>/dev/null || true
+      local waited_evict=0
+      while kill -0 "$existing_pid" 2>/dev/null && (( waited_evict < 10 )); do
+        sleep 1
+        waited_evict=$(( waited_evict + 1 ))
+      done
+      if kill -0 "$existing_pid" 2>/dev/null; then
+        kill -KILL "$existing_pid" 2>/dev/null || true
+        sleep 1
+        command -v bridge_audit_log >/dev/null 2>&1 \
+          && bridge_audit_log daemon daemon_spawn_replacing_killed daemon \
+               --detail existing_pid="$existing_pid" \
+               --detail new_pid="$$" >/dev/null 2>&1 || true
+      fi
+    else
+      # Recorded PID belongs to a non-bridge process (recycled PID).
+      # Don't kill; just reclaim the pid-file slot.
+      command -v bridge_audit_log >/dev/null 2>&1 \
+        && bridge_audit_log daemon daemon_spawn_reclaim_recycled_pid daemon \
+             --detail recorded_pid="$existing_pid" \
+             --detail new_pid="$$" \
+             --detail recorded_cmdline_head="${existing_cmdline:0:120}" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # Atomic PID-file write — tmp + rename so a partial write cannot
+  # leave an empty pid-file under crash.
+  local pid_tmp="${pid_file}.new.$$"
+  if ! printf '%s\n' "$$" >"$pid_tmp" 2>/dev/null; then
+    bridge_warn "daemon-singleton: cannot write $pid_tmp"
+    rm -f "$pid_tmp" 2>/dev/null || true
+    _bridge_daemon_singleton_release_lock
+    return 1
+  fi
+  if ! mv -f -- "$pid_tmp" "$pid_file" 2>/dev/null; then
+    bridge_warn "daemon-singleton: cannot rename $pid_tmp -> $pid_file"
+    rm -f "$pid_tmp" 2>/dev/null || true
+    _bridge_daemon_singleton_release_lock
+    return 1
+  fi
+
+  # Emit the canonical `daemon_started` audit row. This is the row the
+  # issue identified as missing on the sudo-wrapped spawn path; we now
+  # emit it from cmd_run's entry, so every invocation path (cmd_start
+  # fork, direct `bridge-daemon.sh run`, sudo-wrapped, systemd ExecStart)
+  # produces exactly one row per live daemon process.
+  command -v bridge_audit_log >/dev/null 2>&1 \
+    && bridge_audit_log daemon daemon_started daemon \
+         --detail pid="$$" \
+         --detail parent_pid="$PPID" \
+         --detail wrapper="$wrapper" \
+         --detail sudo_self="$sudo_self" \
+         --detail interval_seconds="${BRIDGE_DAEMON_INTERVAL:-unknown}" >/dev/null 2>&1 || true
+
+  # Release the lock before returning. The PID file is now claimed and
+  # the audit row is durable; any concurrent ensure_singleton that
+  # acquired the lock AFTER us will read OUR pid, recognize us as the
+  # alive owner via /proc cmdline match, and evict + replace cleanly.
+  _bridge_daemon_singleton_release_lock
+  return 0
+}
+
+# bridge_daemon_self_check — periodic R3 visibility helper. Called
+# from cmd_run's main loop on a throttled schedule. Compares $$ to the
+# pid attribute of the most recent `daemon_started` audit row; mismatch
+# → audit `daemon_pid_mismatch` + best-effort alert task (admin nudge
+# is the canonical pathway; we use a structured audit row + warn so
+# operator-visible dashboards surface the divergence).
+#
+# Returns 0 on match, 1 on mismatch (caller may decide whether to
+# escalate further). Never aborts the daemon.
+bridge_daemon_self_check() {
+  local audit_log="${BRIDGE_AUDIT_LOG:-${BRIDGE_HOME}/logs/audit.jsonl}"
+  [[ -f "$audit_log" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  local latest_pid=""
+  latest_pid="$(BRIDGE_AUDIT_LOG="$audit_log" python3 -c '
+import json
+import os
+import sys
+
+path = os.environ.get("BRIDGE_AUDIT_LOG", "")
+if not path or not os.path.isfile(path):
+    sys.exit(0)
+latest = ""
+try:
+    # Tail-read up to the last 64KB so the scan is bounded even on
+    # multi-GB audit logs.
+    with open(path, "rb") as fh:
+        try:
+            fh.seek(-65536, os.SEEK_END)
+        except OSError:
+            fh.seek(0)
+        chunk = fh.read().decode("utf-8", errors="replace")
+    for line in chunk.splitlines():
+        line = line.strip()
+        if not line or "daemon_started" not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("action") != "daemon_started":
+            continue
+        detail = row.get("detail") or {}
+        pid_val = detail.get("pid") if isinstance(detail, dict) else None
+        if pid_val:
+            latest = str(pid_val)
+except OSError:
+    sys.exit(0)
+sys.stdout.write(latest)
+' 2>/dev/null || true)"
+
+  [[ -n "$latest_pid" ]] || return 0
+  if [[ "$latest_pid" == "$$" ]]; then
+    return 0
+  fi
+
+  # Mismatch: another daemon emitted `daemon_started` more recently.
+  # If that recent pid is still alive, we have a genuine duplicate.
+  local other_alive="false"
+  if kill -0 "$latest_pid" 2>/dev/null; then
+    other_alive="true"
+  fi
+  command -v bridge_audit_log >/dev/null 2>&1 \
+    && bridge_audit_log daemon daemon_pid_mismatch daemon \
+         --detail self_pid="$$" \
+         --detail recent_audit_pid="$latest_pid" \
+         --detail other_alive="$other_alive" >/dev/null 2>&1 || true
+  bridge_warn "daemon-self-check: pid mismatch — self=$$, latest audit daemon_started pid=$latest_pid, other_alive=$other_alive"
+  return 1
+}

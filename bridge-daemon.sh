@@ -7605,9 +7605,19 @@ cmd_start() {
   start_deadline=$(( $(date +%s) + BRIDGE_DAEMON_START_WAIT_SECONDS ))
   while (( $(date +%s) <= start_deadline )); do
     if bridge_daemon_is_running; then
-      bridge_audit_log daemon daemon_started daemon \
+      # Issue #1276 (Lane D): the canonical `daemon_started` audit row
+      # is now emitted by `bridge_daemon_ensure_singleton` inside
+      # cmd_run, so every spawn path (cmd_start fork, direct
+      # `bridge-daemon.sh run`, sudo-wrapped, systemd ExecStart) emits
+      # exactly one row per live process. cmd_start emits a separate
+      # `daemon_start_supervised` row to record the supervisor's
+      # observation that the forked daemon is alive — useful for
+      # tracing "operator typed `daemon start` and got rc=0" but no
+      # longer the source of truth for daemon-up detection.
+      bridge_audit_log daemon daemon_start_supervised daemon \
         --detail pid="$(bridge_daemon_pid)" \
-        --detail interval_seconds="$BRIDGE_DAEMON_INTERVAL"
+        --detail interval_seconds="$BRIDGE_DAEMON_INTERVAL" \
+        --detail wrapper="${BRIDGE_DAEMON_WRAPPER:-direct}" 2>/dev/null || true
       daemon_info "bridge daemon started (pid=$(bridge_daemon_pid))"
       bridge_start_silence_watchdog || true
       return 0
@@ -7638,7 +7648,36 @@ cmd_run() {
   trap '_bridge_daemon_on_exit' EXIT
 
   BRIDGE_DAEMON_LAST_STEP="startup"
-  echo "$$" >"$BRIDGE_DAEMON_PID_FILE"
+
+  # Issue #1276 (v0.15.0-beta4 Lane D): single-point spawn guard.
+  # Before this routes through `bridge_daemon_ensure_singleton`, two
+  # daemons could race the same `state/tasks.db` (cmd_start fork +
+  # sudo-wrapped direct `bridge-daemon.sh run` were observed live on
+  # patch's beta3 fresh install — only the cmd_start path emitted
+  # `daemon_started`, masking the duplicate from audit grep).
+  # ensure_singleton:
+  #   - acquires a flock on ${BRIDGE_DAEMON_PID_FILE}.lock (held for
+  #     the lifetime of this process; released by the kernel on exit)
+  #   - evicts a stale-but-living bridge-daemon (TERM + 10s + KILL)
+  #   - atomic PID-file write
+  #   - emits the canonical `daemon_started` audit row with pid +
+  #     parent_pid + wrapper + sudo_self fields
+  # If the lock is busy (another ensure_singleton in flight) we abort
+  # via bridge_die — the daemon must not proceed without a held lock.
+  BRIDGE_DAEMON_LAST_STEP="ensure_singleton"
+  if command -v bridge_daemon_ensure_singleton >/dev/null 2>&1; then
+    if ! bridge_daemon_ensure_singleton; then
+      bridge_die "daemon-singleton: refused to start (lock busy or pid-file write failed)"
+    fi
+  else
+    # Fallback: lib/bridge-daemon-control.sh was not loaded for some
+    # reason (e.g. a corrupted install). Preserve the pre-Lane D
+    # behavior so the daemon at least limps along instead of refusing
+    # to start, but warn loudly so the operator sees the missing guard.
+    bridge_warn "daemon-singleton: helper unavailable — falling back to advisory PID write (issue #1276)"
+    echo "$$" >"$BRIDGE_DAEMON_PID_FILE"
+  fi
+  BRIDGE_DAEMON_LAST_STEP="startup"
 
   # Issue #1178 (cycle 12, Deliverable C): emit a one-line warning when
   # the daemon's running supp-group set is stale vs the shadow DB. The
@@ -7728,6 +7767,20 @@ cmd_run() {
       # scripts/install-daemon-liveness-{launchagent,systemd}.sh.
       printf '%s\n' "$now_ts" 2>/dev/null >"$BRIDGE_STATE_DIR/daemon.heartbeat" || true
       last_heartbeat_ts="$now_ts"
+
+      # Issue #1276 Lane D R3 (visibility): on each heartbeat boundary,
+      # compare $$ against the pid in the most recent `daemon_started`
+      # audit row. A mismatch indicates a second daemon emitted its
+      # ensure_singleton row AFTER ours — the canonical "I'm not the
+      # primary daemon" signal. The helper emits a `daemon_pid_mismatch`
+      # audit row and warns; we do not auto-suicide (the lock acquired
+      # at startup proves we held the slot at our spawn time, and we
+      # don't want to fight a freshly-blessed sibling). Operator-visible
+      # via audit log + dashboard.
+      BRIDGE_DAEMON_LAST_STEP="self_check"
+      if command -v bridge_daemon_self_check >/dev/null 2>&1; then
+        bridge_daemon_self_check || true
+      fi
     fi
     BRIDGE_DAEMON_LAST_STEP="idle_sleep"
     sleep "$BRIDGE_DAEMON_INTERVAL"
