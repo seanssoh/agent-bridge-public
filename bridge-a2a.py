@@ -50,19 +50,27 @@ def die(msg: str, code: int = 1) -> "Optional[int]":
 
 def _audit_body_file_sudo_fallback(
     body_path: Path,
-    owner: str,
+    iso_uid: str,
     success: bool,
     rc: "int | None",
     call_site: str,
+    exception: "BaseException | None" = None,
 ) -> None:
-    """Emit a ``body_file_sudo_fallback`` audit row (Lane J r2 SHOULD-FIX).
+    """Emit a ``body_file_sudo_fallback`` audit row (Lane J r2 SHOULD-FIX
+    + r3 schema alignment).
 
     Mirrors ``bridge-queue.py:_audit_body_file_sudo_fallback`` for the
     A2A send path. See that helper for the rationale; this exists as a
     parallel copy because ``bridge-a2a.py`` does not import
     ``bridge-queue`` (and we deliberately avoid coupling the two CLIs
-    through a shared module just for one audit hook). Best-effort: any
-    failure to emit is swallowed silently.
+    through a shared module just for one audit hook).
+
+    Lane J r3 (codex r2 SHOULD-FIX): align the row schema with the
+    brief — the per-agent OS user field is named ``iso_uid`` (not
+    ``owner``) and exception branches log ``exception`` +
+    ``exception_type`` so the operator sees WHY the fallback failed.
+
+    Best-effort: any failure to emit is swallowed silently.
     """
     import subprocess as _subprocess
     audit_path = (
@@ -75,12 +83,15 @@ def _audit_body_file_sudo_fallback(
     )
     detail = {
         "file_path": str(body_path),
-        "owner": owner,
+        "iso_uid": iso_uid,
         "fallback_method": "sudo-read",
         "success": success,
         "rc": rc if rc is not None else "",
         "call_site": call_site,
     }
+    if exception is not None:
+        detail["exception"] = str(exception)
+        detail["exception_type"] = type(exception).__name__
     audit_script = Path(__file__).resolve().with_name("bridge-audit.py")
     if not audit_script.is_file():
         return
@@ -158,10 +169,11 @@ def _sudo_read_text(path: Path) -> str | None:
             stderr=_subprocess.PIPE,
             timeout=10,
         )
-    except (OSError, _subprocess.TimeoutExpired):
+    except (OSError, _subprocess.TimeoutExpired) as exc:
         _audit_body_file_sudo_fallback(
             path, owner, success=False, rc=None,
             call_site="bridge-a2a.cmd_send",
+            exception=exc,
         )
         return None
     if result.returncode != 0:

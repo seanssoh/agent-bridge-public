@@ -363,12 +363,14 @@ def is_ephemeral_body_path(path: Path) -> bool:
 
 def _audit_body_file_sudo_fallback(
     body_path: Path,
-    owner: str,
+    iso_uid: str,
     success: bool,
     rc: int | None,
     call_site: str,
+    exception: BaseException | None = None,
 ) -> None:
-    """Emit a ``body_file_sudo_fallback`` audit row (Lane J r2 SHOULD-FIX).
+    """Emit a ``body_file_sudo_fallback`` audit row (Lane J r2 SHOULD-FIX
+    + r3 schema alignment).
 
     OPERATIONS.md §"Iso v2 agent troubleshooting" promises operators
     that the sudo-fallback path is observable via
@@ -377,6 +379,12 @@ def _audit_body_file_sudo_fallback(
     docs/impl mismatch (codex r1 SHOULD-FIX on PR #1293). We emit
     here so a follow-up "but did the fallback actually run?"
     question has a structured answer.
+
+    Lane J r3 (codex r2 SHOULD-FIX): align the row schema with the
+    brief — the per-agent OS user field is named ``iso_uid`` (not
+    ``owner``) and exception branches log ``exception`` +
+    ``exception_type`` so the operator sees WHY the fallback failed,
+    not just an empty ``rc``.
 
     Best-effort: any failure to emit (missing bridge-audit.py, missing
     python interpreter, locked log file) is swallowed silently. The
@@ -394,12 +402,15 @@ def _audit_body_file_sudo_fallback(
     )
     detail = {
         "file_path": str(body_path),
-        "owner": owner,
+        "iso_uid": iso_uid,
         "fallback_method": "sudo-read",
         "success": success,
         "rc": rc if rc is not None else "",
         "call_site": call_site,
     }
+    if exception is not None:
+        detail["exception"] = str(exception)
+        detail["exception_type"] = type(exception).__name__
     audit_script = Path(__file__).resolve().with_name("bridge-audit.py")
     if not audit_script.is_file():
         return
@@ -492,9 +503,11 @@ def _sudo_read_body_file(path: Path) -> bytes | None:
             stderr=subprocess.PIPE,
             timeout=10,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
         _audit_body_file_sudo_fallback(
-            path, owner, success=False, rc=None, call_site="bridge-queue.stabilize_body_file",
+            path, owner, success=False, rc=None,
+            call_site="bridge-queue.stabilize_body_file",
+            exception=exc,
         )
         return None
     if result.returncode != 0:

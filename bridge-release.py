@@ -61,6 +61,57 @@ def parse_semver_core(text: str | None) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups()[:3])
 
 
+_UNDOTTED_PRERELEASE_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
+
+
+def _normalize_prerelease_identifier(ident: str) -> str:
+    """Normalize an undotted prerelease identifier into canonical dot form.
+
+    Project tags use the undotted form ``betaN`` / ``rcN`` / ``alphaN``
+    (e.g. ``v0.14.5-beta9``, ``v0.15.0-beta10``). Strict SemVer 2.0.0
+    §11 splits prerelease on dots and compares each identifier; an
+    identifier is "numeric" iff it parses as a base-10 integer. ``beta9``
+    and ``beta10`` are both alphanumeric (letters + digits) and compare
+    **lexically** — making ``beta10 < beta9`` ("1" < "9").
+
+    The fix is to rewrite ``letter-run + digit-run`` identifiers into
+    ``letters.digits`` BEFORE comparison so the digit run becomes a
+    numeric identifier and orders numerically (``beta.9 < beta.10``).
+
+    Codex r2 BLOCKING repros at HEAD ``2a4b926`` confirmed the
+    regression:
+      0.14.5-beta9  vs v0.14.5-beta10 → update_available=false (WRONG)
+      0.15.0-beta2  vs v0.15.0-beta10 → same wrong-direction false-no-update
+
+    CHANGELOG.md documents both ``v0.14.5-beta9`` and ``v0.14.5-beta10``
+    as actual tags, so this is not hypothetical.
+
+    Examples::
+
+        _normalize_prerelease_identifier("beta9")  == "beta.9"
+        _normalize_prerelease_identifier("beta10") == "beta.10"
+        _normalize_prerelease_identifier("rc1")    == "rc.1"
+        _normalize_prerelease_identifier("alpha2") == "alpha.2"
+        _normalize_prerelease_identifier("beta")   == "beta"      # no digits → untouched
+        _normalize_prerelease_identifier("beta.3") == "beta.3"    # already dotted → untouched
+        _normalize_prerelease_identifier("9")      == "9"         # pure numeric → untouched
+    """
+    m = _UNDOTTED_PRERELEASE_RE.match(ident)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    return ident
+
+
+def _normalize_prerelease(prerelease: str) -> str:
+    """Apply :func:`_normalize_prerelease_identifier` to each dot-split
+    identifier in ``prerelease`` and rejoin. Empty input → empty output."""
+    if not prerelease:
+        return prerelease
+    return ".".join(
+        _normalize_prerelease_identifier(p) for p in prerelease.split(".")
+    )
+
+
 def parse_semver_full(text: str | None) -> tuple[tuple[int, int, int], str] | None:
     """Parse ``text`` into ``(core_tuple, prerelease_str)``.
 
@@ -71,10 +122,18 @@ def parse_semver_full(text: str | None) -> tuple[tuple[int, int, int], str] | No
     which signals "final" — i.e. higher precedence than any prerelease
     of the same core.
 
+    Lane J r3 (codex r2 BLOCKING): project tags use the undotted
+    ``betaN``/``rcN``/``alphaN`` form (``v0.14.5-beta10``). We normalize
+    each identifier in the prerelease suffix into the canonical dotted
+    form (``beta.10``) before returning so downstream
+    :func:`_compare_prerelease_identifiers` sees the digit run as a
+    numeric identifier and orders ``beta.9 < beta.10`` correctly.
+
     Examples:
         parse_semver_full("0.15.0")          == ((0, 15, 0), "")
-        parse_semver_full("0.14.5-beta1")    == ((0, 14, 5), "beta1")
+        parse_semver_full("0.14.5-beta1")    == ((0, 14, 5), "beta.1")
         parse_semver_full("v0.14.5-beta.11") == ((0, 14, 5), "beta.11")
+        parse_semver_full("v0.14.5-beta10")  == ((0, 14, 5), "beta.10")
     """
     if not text:
         return None
@@ -82,7 +141,7 @@ def parse_semver_full(text: str | None) -> tuple[tuple[int, int, int], str] | No
     if not match:
         return None
     major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
-    prerelease = match.group(4) or ""
+    prerelease = _normalize_prerelease(match.group(4) or "")
     return ((major, minor, patch), prerelease)
 
 

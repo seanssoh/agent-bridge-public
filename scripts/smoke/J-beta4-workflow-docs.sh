@@ -35,6 +35,22 @@
 #                          short-circuit (existing-install path is
 #                          preserved); the script continues past the
 #                          gate. We confirm the gate did NOT fire.
+#   T9 / T10  (r2):       same-core beta→stable upgrade ordering +
+#                          body_file_sudo_fallback audit row emit.
+#   T9d (#1267 r3):       undotted prerelease ordering (codex r2
+#                          BLOCKING). Project tags use ``betaN`` /
+#                          ``rcN`` / ``alphaN`` (no dot). r3 normalizes
+#                          to ``beta.N`` / ``rc.N`` / ``alpha.N`` before
+#                          compare so ``beta9 < beta10`` orders
+#                          numerically, not lexically (was ``beta10 <
+#                          beta9`` pre-fix). Covers release_record +
+#                          downgrade-classify + direct comparator.
+#   T10d (#1281 r3):      audit row schema alignment (codex r2
+#                          SHOULD-FIX). Field renamed ``owner`` →
+#                          ``iso_uid``; exception branches gain
+#                          ``exception`` + ``exception_type`` so a
+#                          wedged sudo step is diagnosable from the
+#                          audit log alone.
 #
 # Footgun #11 (heredoc-stdin): every captured subprocess uses
 # `out=$(... 2>&1)`. No `<<EOF` / `<<'PY'` to subprocess; no `<<<`
@@ -706,5 +722,310 @@ if [[ -s "$T10C_AUDIT_LOG" ]]; then
   smoke_fail "T10c teeth: expected EMPTY audit log when target dir is read-only (sanity check), got: $(cat "$T10C_AUDIT_LOG")"
 fi
 smoke_log "T10c teeth ok: read-only audit dir → empty log (emit best-effort, T10a/b assertions have teeth)"
+
+# ----------------------------------------------------------------------------
+# T9d (#1267 r3 BLOCKING — codex r2): undotted prerelease ordering.
+#
+# Project tags use the undotted ``betaN`` / ``rcN`` / ``alphaN`` form
+# (CHANGELOG.md documents both ``v0.14.5-beta9`` AND ``v0.14.5-beta10``
+# as actual tags). Strict SemVer 2.0.0 §11 splits prerelease on dots;
+# without normalization ``beta9`` and ``beta10`` are both alphanumeric
+# identifiers and compare lexically — making ``beta10 < beta9``
+# because "1" < "9". The r3 fix rewrites ``letter-run+digit-run``
+# identifiers into the canonical ``letters.digits`` shape so the digit
+# run surfaces as a numeric identifier (``beta.9 < beta.10``).
+#
+# Direct codex r2 repros:
+#   0.14.5-beta9 vs v0.14.5-beta10 → update_available=true (was false)
+#   0.15.0-beta2 vs v0.15.0-beta10 → update_available=true (was false)
+#   0.14.5-rc1   vs v0.14.5-rc10   → update_available=true (was false)
+# Downgrade-classify MUST stay silent on the same pairs (these are real
+# upgrades, not downgrades).
+# ----------------------------------------------------------------------------
+smoke_log "T9d (#1267 r3): undotted betaN/rcN prerelease orders numerically (beta9 < beta10)"
+
+# T9d.1: release_record sees update_available=true on 0.14.5-beta9 vs v0.14.5-beta10.
+T9D1_OUT=""
+T9D1_RC=0
+T9D1_OUT="$(BRIDGE_RELEASE_MOCK_JSON='{"tag_name":"v0.14.5-beta10","html_url":"","published_at":""}' \
+  python3 "$REPO_ROOT/bridge-release.py" status \
+    --repo seanssoh/agent-bridge-public \
+    --installed-version 0.14.5-beta9 \
+    --json 2>&1)" || T9D1_RC=$?
+if (( T9D1_RC != 0 )); then
+  smoke_fail "T9d.1: bridge-release.py status rc=$T9D1_RC out: $T9D1_OUT"
+fi
+T9D1_UPDATE="$(python3 -c 'import json,sys;print(json.loads(sys.stdin.read())["release"]["update_available"])' <<<"$T9D1_OUT")"
+smoke_assert_eq "True" "$T9D1_UPDATE" "T9d.1 release_record beta9 → beta10 update_available=true"
+smoke_log "T9d.1 ok: release_record sees 0.14.5-beta9 < 0.14.5-beta10 (real upgrade)"
+
+# T9d.2: release_record sees update_available=true on 0.15.0-beta2 vs v0.15.0-beta10.
+T9D2_OUT=""
+T9D2_RC=0
+T9D2_OUT="$(BRIDGE_RELEASE_MOCK_JSON='{"tag_name":"v0.15.0-beta10","html_url":"","published_at":""}' \
+  python3 "$REPO_ROOT/bridge-release.py" status \
+    --repo seanssoh/agent-bridge-public \
+    --installed-version 0.15.0-beta2 \
+    --json 2>&1)" || T9D2_RC=$?
+if (( T9D2_RC != 0 )); then
+  smoke_fail "T9d.2: bridge-release.py status rc=$T9D2_RC out: $T9D2_OUT"
+fi
+T9D2_UPDATE="$(python3 -c 'import json,sys;print(json.loads(sys.stdin.read())["release"]["update_available"])' <<<"$T9D2_OUT")"
+smoke_assert_eq "True" "$T9D2_UPDATE" "T9d.2 release_record beta2 → beta10 update_available=true"
+smoke_log "T9d.2 ok: release_record sees 0.15.0-beta2 < 0.15.0-beta10 (real upgrade)"
+
+# T9d.3: release_record sees update_available=true on 0.14.5-rc1 vs v0.14.5-rc10.
+T9D3_OUT=""
+T9D3_RC=0
+T9D3_OUT="$(BRIDGE_RELEASE_MOCK_JSON='{"tag_name":"v0.14.5-rc10","html_url":"","published_at":""}' \
+  python3 "$REPO_ROOT/bridge-release.py" status \
+    --repo seanssoh/agent-bridge-public \
+    --installed-version 0.14.5-rc1 \
+    --json 2>&1)" || T9D3_RC=$?
+if (( T9D3_RC != 0 )); then
+  smoke_fail "T9d.3: bridge-release.py status rc=$T9D3_RC out: $T9D3_OUT"
+fi
+T9D3_UPDATE="$(python3 -c 'import json,sys;print(json.loads(sys.stdin.read())["release"]["update_available"])' <<<"$T9D3_OUT")"
+smoke_assert_eq "True" "$T9D3_UPDATE" "T9d.3 release_record rc1 → rc10 update_available=true"
+smoke_log "T9d.3 ok: release_record sees 0.14.5-rc1 < 0.14.5-rc10 (real upgrade)"
+
+# T9d.4: downgrade-classify stays SILENT (no row) for each pair — these
+# are real upgrades, not downgrades.
+T9D4_PAYLOAD='{"alerts":[],"release":{"installed_version":"0.14.5-beta9","latest_version":"0.14.5-beta10","latest_tag":"v0.14.5-beta10","update_available":true}}'
+T9D4_OUT=""
+T9D4_RC=0
+T9D4_OUT="$(python3 "$REPO_ROOT/bridge-daemon-helpers.py" release-downgrade-classify "$T9D4_PAYLOAD" 2>&1)" || T9D4_RC=$?
+if (( T9D4_RC != 0 )); then
+  smoke_fail "T9d.4: release-downgrade-classify rc=$T9D4_RC out: $T9D4_OUT"
+fi
+if [[ -n "$T9D4_OUT" ]]; then
+  smoke_fail "T9d.4: beta9→beta10 wrongly classified as downgrade-skip: $T9D4_OUT"
+fi
+smoke_log "T9d.4 ok: downgrade-classify silent on beta9→beta10 (real upgrade)"
+
+T9D5_PAYLOAD='{"alerts":[],"release":{"installed_version":"0.15.0-beta2","latest_version":"0.15.0-beta10","latest_tag":"v0.15.0-beta10","update_available":true}}'
+T9D5_OUT=""
+T9D5_RC=0
+T9D5_OUT="$(python3 "$REPO_ROOT/bridge-daemon-helpers.py" release-downgrade-classify "$T9D5_PAYLOAD" 2>&1)" || T9D5_RC=$?
+if (( T9D5_RC != 0 )); then
+  smoke_fail "T9d.5: release-downgrade-classify rc=$T9D5_RC out: $T9D5_OUT"
+fi
+if [[ -n "$T9D5_OUT" ]]; then
+  smoke_fail "T9d.5: beta2→beta10 wrongly classified as downgrade-skip: $T9D5_OUT"
+fi
+smoke_log "T9d.5 ok: downgrade-classify silent on beta2→beta10 (real upgrade)"
+
+# T9d.6 (teeth): the real downgrade direction (beta10 → beta9) MUST
+# still classify as downgrade. If the normalization ever broke ordering
+# in BOTH directions equally, T9d.4/.5 above would still pass but this
+# real-downgrade row would silently vanish — defeating the
+# release_notification_downgrade_skip guard. This is the explicit teeth
+# that catches "normalization removed but the new test still passes".
+T9D6_PAYLOAD='{"alerts":[],"release":{"installed_version":"0.14.5-beta10","latest_version":"0.14.5-beta9","latest_tag":"v0.14.5-beta9","update_available":false}}'
+T9D6_OUT=""
+T9D6_RC=0
+T9D6_OUT="$(python3 "$REPO_ROOT/bridge-daemon-helpers.py" release-downgrade-classify "$T9D6_PAYLOAD" 2>&1)" || T9D6_RC=$?
+if (( T9D6_RC != 0 )); then
+  smoke_fail "T9d.6: release-downgrade-classify rc=$T9D6_RC out: $T9D6_OUT"
+fi
+if [[ -z "$T9D6_OUT" ]]; then
+  smoke_fail "T9d.6 teeth: beta10→beta9 (real downgrade) MUST emit classify row; got empty"
+fi
+if [[ "$T9D6_OUT" != *"0.14.5-beta10"* || "$T9D6_OUT" != *"0.14.5-beta9"* ]]; then
+  smoke_fail "T9d.6: classify row missing expected versions: $T9D6_OUT"
+fi
+smoke_log "T9d.6 teeth ok: real downgrade beta10→beta9 still emits classify row"
+
+# T9d.7 (comparator-level teeth): direct compare_semver chain to assert
+# the full ordering across undotted boundaries. If anyone reverts the
+# normalization to lexical compare, this fails immediately rather than
+# waiting for a release_record integration regression to surface.
+T9D7_RESULT="$SMOKE_TMP_ROOT/t9d-cmp.json"
+T9D7_HARNESS="$SMOKE_TMP_ROOT/t9d-harness.py"
+cat >"$T9D7_HARNESS" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+
+repo_root = sys.argv[1]
+out_path = sys.argv[2]
+
+spec = importlib.util.spec_from_file_location(
+    "bridge_release", os.path.join(repo_root, "bridge-release.py")
+)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+# Undotted prerelease ordering — the codex r2 BLOCKING coverage.
+cases = [
+    ("0.14.5-beta9", "0.14.5-beta10", -1),
+    ("0.14.5-beta10", "0.14.5-beta9", 1),
+    ("0.14.5-beta9", "0.14.5-beta9", 0),
+    ("0.15.0-beta2", "0.15.0-beta10", -1),
+    ("0.14.5-rc1", "0.14.5-rc10", -1),
+    ("0.14.5-alpha1", "0.14.5-alpha10", -1),
+    ("0.14.5-beta1", "0.14.5-beta2", -1),
+    ("0.14.5-beta2", "0.14.5-beta10", -1),     # critical: 2 < 10 numerically
+    # Cross-tier ordering still holds after normalization
+    ("0.14.5-alpha10", "0.14.5-beta1", -1),
+    ("0.14.5-beta10", "0.14.5-rc1", -1),
+    ("0.14.5-rc10", "0.14.5", -1),
+    # Mixed dotted vs undotted should still compare equal core+identifier
+    ("0.14.5-beta.10", "0.14.5-beta10", 0),
+]
+out = []
+for a, b, want in cases:
+    got = mod.compare_semver(a, b)
+    out.append({"a": a, "b": b, "want": want, "got": got, "ok": got == want})
+
+open(out_path, "w").write(json.dumps(out))
+PY
+T9D7_OUT=""
+T9D7_RC=0
+T9D7_OUT="$(python3 "$T9D7_HARNESS" "$REPO_ROOT" "$T9D7_RESULT" 2>&1)" || T9D7_RC=$?
+if (( T9D7_RC != 0 )); then
+  smoke_fail "T9d.7: harness failed rc=$T9D7_RC out: $T9D7_OUT"
+fi
+T9D7_BAD="$(python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+bad = [r for r in data if not r["ok"]]
+if bad:
+    print(json.dumps(bad))
+' "$T9D7_RESULT")"
+if [[ -n "$T9D7_BAD" ]]; then
+  smoke_fail "T9d.7: undotted prerelease comparator regressions: $T9D7_BAD"
+fi
+smoke_log "T9d.7 teeth ok: undotted prerelease ordering chain passes (beta9<beta10, rc1<rc10, alpha10<beta1)"
+
+# ----------------------------------------------------------------------------
+# T10d (#1281 r3 SHOULD-FIX — codex r2): body_file_sudo_fallback audit
+# row schema alignment.
+#
+# Codex r2 caught two SHOULD-FIX gaps:
+#  - field name: brief asked ``iso_uid`` (matches operator runbook
+#    grep idiom); r2 emitted ``owner``. Operator greps for ``iso_uid``
+#    per OPERATIONS.md and finds nothing.
+#  - exception branches at bridge-queue/bridge-a2a logged empty rc and
+#    no exception detail, so when sudo wedges (OSError, TimeoutExpired)
+#    the audit row carries no diagnostic.
+#
+# T10d.1 asserts ``iso_uid`` field is present (and ``owner`` is gone).
+# T10d.2 asserts the exception branch carries ``exception`` +
+# ``exception_type`` fields.
+# ----------------------------------------------------------------------------
+smoke_log "T10d (#1281 r3): audit row schema — iso_uid field + exception detail"
+
+# T10d.1: reuse the T10a success row → assert ``iso_uid`` present and
+# ``owner`` absent. The T10A_AUDIT_LOG was populated above.
+if ! grep -q '"iso_uid"' "$T10A_AUDIT_LOG"; then
+  smoke_fail "T10d.1: T10A audit row missing iso_uid field. Contents: $(cat "$T10A_AUDIT_LOG")"
+fi
+if grep -q '"owner"' "$T10A_AUDIT_LOG"; then
+  smoke_fail "T10d.1: T10A audit row STILL contains owner field (should be renamed to iso_uid). Contents: $(cat "$T10A_AUDIT_LOG")"
+fi
+smoke_log "T10d.1 ok: T10A audit row has iso_uid (no owner)"
+
+# Also verify the bridge-a2a side (T10B audit log).
+if ! grep -q '"iso_uid"' "$T10B_AUDIT_LOG"; then
+  smoke_fail "T10d.1b: T10B audit row missing iso_uid field. Contents: $(cat "$T10B_AUDIT_LOG")"
+fi
+if grep -q '"owner"' "$T10B_AUDIT_LOG"; then
+  smoke_fail "T10d.1b: T10B audit row STILL contains owner field. Contents: $(cat "$T10B_AUDIT_LOG")"
+fi
+smoke_log "T10d.1b ok: T10B audit row has iso_uid (no owner)"
+
+# T10d.2: exception-branch audit row carries ``exception`` +
+# ``exception_type``. We exercise the OSError/TimeoutExpired branch
+# directly by calling _audit_body_file_sudo_fallback with a real
+# exception instance. The harness writes to its own audit log to keep
+# T10d.2 independent of T10a/b state.
+T10D2_AUDIT_LOG="$BRIDGE_HOME/logs/audit-t10d2.jsonl"
+mkdir -p "$(dirname "$T10D2_AUDIT_LOG")"
+: >"$T10D2_AUDIT_LOG"
+
+T10D2_HARNESS="$SMOKE_TMP_ROOT/t10d2-harness.py"
+cat >"$T10D2_HARNESS" <<'PY'
+import importlib.util
+import os
+import sys
+import subprocess
+from pathlib import Path
+
+repo_root = sys.argv[1]
+sys.path.insert(0, repo_root)
+
+# Test bridge-queue.py:_audit_body_file_sudo_fallback exception branch.
+spec_q = importlib.util.spec_from_file_location(
+    "bridge_queue", os.path.join(repo_root, "bridge-queue.py")
+)
+mq = importlib.util.module_from_spec(spec_q)
+spec_q.loader.exec_module(mq)
+
+try:
+    raise subprocess.TimeoutExpired(cmd=["sudo", "-n", "-u", "agent-bridge-test", "cat", "--", "/tmp/x"], timeout=10)
+except subprocess.TimeoutExpired as exc:
+    mq._audit_body_file_sudo_fallback(
+        Path("/tmp/x"), "agent-bridge-test", success=False, rc=None,
+        call_site="bridge-queue.stabilize_body_file", exception=exc,
+    )
+
+# Test bridge-a2a.py:_audit_body_file_sudo_fallback exception branch.
+spec_a = importlib.util.spec_from_file_location(
+    "bridge_a2a", os.path.join(repo_root, "bridge-a2a.py")
+)
+ma = importlib.util.module_from_spec(spec_a)
+spec_a.loader.exec_module(ma)
+
+try:
+    raise OSError("simulated sudo subprocess OSError")
+except OSError as exc:
+    ma._audit_body_file_sudo_fallback(
+        Path("/tmp/x"), "agent-bridge-test", success=False, rc=None,
+        call_site="bridge-a2a.cmd_send", exception=exc,
+    )
+PY
+
+T10D2_OUT=""
+T10D2_RC=0
+T10D2_OUT="$(BRIDGE_AUDIT_LOG="$T10D2_AUDIT_LOG" \
+  python3 "$T10D2_HARNESS" "$REPO_ROOT" 2>&1)" || T10D2_RC=$?
+if (( T10D2_RC != 0 )); then
+  smoke_fail "T10d.2: harness failed rc=$T10D2_RC out: $T10D2_OUT"
+fi
+smoke_assert_file_exists "$T10D2_AUDIT_LOG" "T10d.2 audit log exists"
+
+if ! grep -q '"exception"' "$T10D2_AUDIT_LOG"; then
+  smoke_fail "T10d.2: exception-branch audit row missing exception field. Contents: $(cat "$T10D2_AUDIT_LOG")"
+fi
+if ! grep -q '"exception_type"' "$T10D2_AUDIT_LOG"; then
+  smoke_fail "T10d.2: exception-branch audit row missing exception_type field. Contents: $(cat "$T10D2_AUDIT_LOG")"
+fi
+# Verify TimeoutExpired type was preserved
+if ! grep -q '"TimeoutExpired"' "$T10D2_AUDIT_LOG"; then
+  smoke_fail "T10d.2: exception_type=TimeoutExpired not preserved in audit row. Contents: $(cat "$T10D2_AUDIT_LOG")"
+fi
+# Verify OSError type was preserved (bridge-a2a side)
+if ! grep -q '"OSError"' "$T10D2_AUDIT_LOG"; then
+  smoke_fail "T10d.2: exception_type=OSError not preserved (bridge-a2a side). Contents: $(cat "$T10D2_AUDIT_LOG")"
+fi
+# Both must be iso_uid (not owner)
+if grep -q '"owner"' "$T10D2_AUDIT_LOG"; then
+  smoke_fail "T10d.2: exception-branch row STILL contains owner field. Contents: $(cat "$T10D2_AUDIT_LOG")"
+fi
+smoke_log "T10d.2 ok: exception-branch rows carry exception + exception_type (TimeoutExpired, OSError)"
+
+# T10d.3 (teeth): assert success-branch rows do NOT carry the exception
+# fields. This proves the conditional emit is correct: exception detail
+# is added IFF an exception was passed. Without this guard, a regression
+# that always emits empty exception fields would still pass T10d.2.
+if grep -q '"exception"' "$T10A_AUDIT_LOG"; then
+  smoke_fail "T10d.3 teeth: T10A success-branch row WRONGLY carries exception field. Contents: $(cat "$T10A_AUDIT_LOG")"
+fi
+if grep -q '"exception_type"' "$T10A_AUDIT_LOG"; then
+  smoke_fail "T10d.3 teeth: T10A success-branch row WRONGLY carries exception_type field. Contents: $(cat "$T10A_AUDIT_LOG")"
+fi
+smoke_log "T10d.3 teeth ok: success-branch rows do NOT carry exception/exception_type (conditional emit correct)"
 
 smoke_log "All J-beta4 workflow + docs tests passed."

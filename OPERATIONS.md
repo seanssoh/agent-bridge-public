@@ -1224,6 +1224,36 @@ escalating:
    `bridge_iso_run` ops to confirm what actually happened versus
    what the operator thinks happened.
 
+   The `body_file_sudo_fallback` row (emitted from both
+   `bridge-queue.stabilize_body_file` and `bridge-a2a.cmd_send`)
+   carries the following `detail` fields (v0.15.0-beta4 Lane J r3
+   canonical schema):
+
+   - `file_path` — absolute path of the body file
+   - `iso_uid` — the per-agent OS user that owns the file
+     (e.g. `agent-bridge-patch`)
+   - `fallback_method` — always `"sudo-read"` for this audit action
+   - `success` — `true` when sudo cat returned 0, `false` otherwise
+   - `rc` — the sudo exit code on success/non-zero exit, or `""`
+     when the subprocess itself raised (`OSError`, `TimeoutExpired`)
+   - `call_site` — the producer code path
+     (`bridge-queue.stabilize_body_file` or `bridge-a2a.cmd_send`)
+   - `exception` (exception branch only) — `str(exc)`
+   - `exception_type` (exception branch only) — `type(exc).__name__`
+     (e.g. `TimeoutExpired`, `OSError`)
+
+   Sample success row (`grep body_file_sudo_fallback state/audit.jsonl`):
+
+   ```
+   ..."detail":{"call_site":"bridge-queue.stabilize_body_file","fallback_method":"sudo-read","file_path":"/path/to/body.md","iso_uid":"agent-bridge-patch","rc":0,"success":true}
+   ```
+
+   Sample exception row (sudo wedged on a 10-second timeout):
+
+   ```
+   ..."detail":{"call_site":"bridge-a2a.cmd_send","exception":"Command '[...]' timed out after 10 seconds","exception_type":"TimeoutExpired","fallback_method":"sudo-read","file_path":"/path/to/body.md","iso_uid":"agent-bridge-patch","rc":"","success":false}
+   ```
+
 For the developer-side rationale, see [CLAUDE.md](./CLAUDE.md) §
 "Working with isolated agents (iso v2)" and
 [docs/developer-handover.md](./docs/developer-handover.md) §3.1.

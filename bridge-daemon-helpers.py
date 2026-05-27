@@ -176,13 +176,37 @@ def cmd_release_downgrade_classify(args: argparse.Namespace) -> int:
     _full_re = _re.compile(
         r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
     )
+    # Lane J r3 (codex r2 BLOCKING): mirror bridge-release.py's
+    # undotted-prerelease normalization. Project tags use the undotted
+    # ``betaN`` / ``rcN`` / ``alphaN`` form; without normalization the
+    # downstream identifier compare falls into the alphanumeric (lexical)
+    # branch and orders ``beta10 < beta9`` because "1" < "9". By rewriting
+    # ``betaN`` → ``beta.N`` (letter-run + digit-run → dotted) we surface
+    # the digit run as a numeric identifier so ``beta.9 < beta.10``
+    # compares correctly. Same logic and same regex shape as
+    # ``bridge-release.py:_normalize_prerelease_identifier`` — kept inline
+    # here for the same anti-coupling reason as the rest of this helper
+    # (no producer/consumer import cycle).
+    _undotted_ident_re = _re.compile(r"^([A-Za-z]+)(\d+)$")
+
+    def _normalize_prerelease(pre: str) -> str:
+        if not pre:
+            return pre
+        out = []
+        for p in pre.split("."):
+            m = _undotted_ident_re.match(p)
+            if m:
+                out.append(f"{m.group(1)}.{m.group(2)}")
+            else:
+                out.append(p)
+        return ".".join(out)
 
     def _full(text: str):
         match = _full_re.fullmatch(text)
         if not match:
             return None
         major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
-        return ((major, minor, patch), match.group(4) or "")
+        return ((major, minor, patch), _normalize_prerelease(match.group(4) or ""))
 
     def _cmp_pre(a: str, b: str) -> int:
         a_parts = a.split(".") if a else []
