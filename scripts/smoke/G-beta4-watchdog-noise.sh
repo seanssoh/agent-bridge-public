@@ -77,6 +77,27 @@
 #       expected schema (agent / written / reason). Idempotent — a
 #       re-invocation refreshes the timestamp without erroring.
 #
+#   T8 / T9 (r2 codex r1 BLOCKING #1) — detect_fresh_install
+#       precedence + pending-marker TTL across 5 cases (A-E): complete-
+#       marker precedence, SESSION-TYPE auto-detect, pending TTL
+#       active, pending TTL expired, pending + SESSION-TYPE complete.
+#
+#   T10 (r2 codex r1 BLOCKING #1) — bridge_init_write_onboarding_
+#       complete_marker schema + pending sibling cleanup + dry-run skip.
+#
+#   T_no_marker_no_session_recent_home (r3 codex r2 BLOCKING quiet-by-
+#       default — Case F) — no markers, no SESSION-TYPE.md, recent
+#       home mtime → fresh_install=False. Pre-r3 the home-mtime
+#       fallthrough returned True here on every recent home,
+#       silently demoting legitimate drift on legacy installs to
+#       priority=low.
+#
+#   T_malformed_pending (r3 codex r2 BLOCKING quiet-by-default —
+#       Case G) — pending marker exists but `written` field missing /
+#       unparseable + recent home → fresh_install=False. A pending
+#       marker we cannot parse is NOT a valid positive signal. Pre-r3
+#       this fell through to the mtime branch.
+#
 # Teeth (regression-revert simulation):
 #
 #   T1-teeth. Re-read the same payload after rewriting it to
@@ -89,6 +110,15 @@
 #             file's group is unchanged. Proves the chgrp/chmod is
 #             actually gated on a resolvable group, not silently
 #             applied with an empty value.
+#   T_no_marker_no_session_recent_home / T_malformed_pending teeth
+#             (r3 codex r2 BLOCKING quiet-by-default): re-introduce the
+#             home-mtime fallthrough at the end of
+#             bridge-watchdog.detect_fresh_install and Case F's
+#             assertion fails. Re-introduce "trust malformed pending
+#             via mtime" and Case G's assertion fails. The teeth prove
+#             that the quiet-by-default contract is enforced — absence
+#             of every positive signal MUST return False; recent home
+#             mtime alone is NOT a positive signal.
 #
 # Footgun #11 mitigation: zero heredoc-stdin to a subprocess. The
 # python assertions all run via `python3 <file>` with argv-only
@@ -502,19 +532,32 @@ T7_RC=$?
 smoke_log "T7 PASS — onboarding-pending marker schema + dry-run-skip honored"
 
 # ---------------------------------------------------------------------
-# T8 / T9 (r2 codex r1 BLOCKING #1): detect_fresh_install precedence +
-# pending-marker TTL. The fresh-install signal must NOT stick after
-# onboarding completes, and a stale pending marker (24h+ old by
-# default; 1h for this test via env override) must expire so a paused
-# install does not stay at priority=low forever.
+# T8 / T9 (r2 codex r1 BLOCKING #1) + T_no_marker_no_session_recent_home
+# / T_malformed_pending (r3 codex r2 BLOCKING quiet-by-default): one
+# helper exercises the full r3 decision matrix. The fresh-install
+# signal must NOT stick after onboarding completes, a stale pending
+# marker must expire so a paused install does not stay at priority=low
+# forever, and absence of every positive signal must return False
+# (legacy installs without a pending marker are NOT fresh just because
+# the home directory was recently touched — the r2 home-mtime
+# fallthrough was removed).
+#
+# Cases A-E close T8/T9 (r2 BLOCKING). Cases F-G close
+# T_no_marker_no_session_recent_home + T_malformed_pending (r3
+# BLOCKING quiet-by-default contract).
+#
+# Teeth (regression-revert simulation): re-introduce the home-mtime
+# fallthrough at the end of bridge-watchdog.detect_fresh_install and
+# Case F's assertion fails. Re-introduce trust-malformed-via-mtime
+# and Case G's assertion fails.
 # ---------------------------------------------------------------------
 T8_STATE_DIR="$SMOKE_TMP_ROOT/t8-state"
 T8_HOME_ROOT="$SMOKE_TMP_ROOT/t8-home-root"
 mkdir -p "$T8_STATE_DIR" "$T8_HOME_ROOT"
 "$PY_BIN" "$HELPER_DIR/assert-detect-fresh-install.py" \
   "$REPO_ROOT" "$T8_STATE_DIR" "$T8_HOME_ROOT" \
-  || smoke_fail "T8/T9 FAIL — detect_fresh_install precedence or TTL regression"
-smoke_log "T8 + T9 PASS — fresh_install precedence + TTL across 5 cases"
+  || smoke_fail "T8/T9/T_no_marker_no_session_recent_home/T_malformed_pending FAIL — detect_fresh_install precedence / TTL / quiet-by-default regression"
+smoke_log "T8 + T9 + T_no_marker_no_session_recent_home + T_malformed_pending PASS — fresh_install r3 quiet-by-default contract (7 cases)"
 
 # ---------------------------------------------------------------------
 # T10 (r2 codex r1 BLOCKING #1): bridge_init_write_onboarding_complete_
@@ -569,4 +612,4 @@ T10_RC=$?
   || smoke_fail "T10 FAIL — bridge_init_write_onboarding_complete_marker schema or pending cleanup regression"
 smoke_log "T10 PASS — complete marker schema + pending sibling cleanup + dry-run-skip"
 
-smoke_log "all 10 tests + 2 teeth PASS (#1266 + #1270 + #1254 v0.15.0-beta4 Lane G r2)"
+smoke_log "all 10 tests + 2 teeth + r3 quiet-by-default cases F/G PASS (#1266 + #1270 + #1254 v0.15.0-beta4 Lane G r3)"

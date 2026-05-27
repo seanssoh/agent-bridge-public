@@ -5,7 +5,14 @@ Usage:
   assert-detect-fresh-install.py <repo-root> <state-dir> <home-root>
 
 Exercises ``bridge-watchdog.detect_fresh_install`` directly across the
-r2 decision matrix (codex r1 BLOCKING #1 fix):
+r3 quiet-by-default contract (codex r2 BLOCKING closure).
+
+**r3 contract (Option A)**: ``fresh_install=True`` requires an
+explicit positive signal (valid pending marker within TTL). Absence
+of every signal returns ``False``. The r2 home-mtime fallthrough was
+removed because legacy installs without a pending marker were
+mis-flagged as fresh on every recent-mtime home, dropping legitimate
+drift to priority=low.
 
   * Case A (complete-marker precedence): pending marker present AND
     complete marker present → fresh_install=False. The complete
@@ -14,8 +21,7 @@ r2 decision matrix (codex r1 BLOCKING #1 fix):
 
   * Case B (SESSION-TYPE auto-detect): no markers, SESSION-TYPE.md
     reports ``Onboarding State: complete`` → fresh_install=False even
-    when the home mtime would otherwise place the agent inside the
-    fresh-install window. The watchdog cannot get stuck on
+    when the home mtime is recent. The watchdog cannot get stuck on
     fresh_install=True for an agent whose operator has actually
     finished onboarding but where the state-dir complete marker is
     missing.
@@ -33,6 +39,24 @@ r2 decision matrix (codex r1 BLOCKING #1 fix):
     so a complete SESSION-TYPE reading wins over a still-fresh
     pending marker. Operator may have edited SESSION-TYPE.md by hand
     without removing the marker.
+
+  * Case F (r3 quiet-by-default — no marker + no SESSION + recent
+    home): no complete marker, no pending marker, no SESSION-TYPE.md
+    at all, agent home mtime within the (former) fresh-install
+    window → fresh_install=False. This is the codex r2 BLOCKING
+    repro: pre-r3 the mtime fallthrough returned True here, which
+    silently dropped every legitimate drift on a recent-mtime legacy
+    install to priority=low. Under the r3 contract, fresh=True
+    requires an explicit positive signal — recent mtime alone is not
+    enough.
+
+  * Case G (r3 quiet-by-default — malformed pending + recent home):
+    pending marker present but the ``written`` field is missing /
+    non-numeric / unparseable, no complete marker, no SESSION-TYPE
+    complete reading, agent home mtime recent → fresh_install=False.
+    A pending marker we cannot parse is NOT a valid positive signal
+    and must not be honored via mtime as a back-door. Pre-r3 this
+    fell through to the mtime branch and returned True.
 """
 import importlib.util
 import os
@@ -163,7 +187,52 @@ def main():
         f"pending marker; got {result_e}"
     )
 
-    print("T8 + T9 PASS — fresh_install precedence + TTL across 5 cases")
+    # ---- Case F (r3 quiet-by-default): no marker + no SESSION + recent home → False
+    # Codex r2 BLOCKING repro. Pre-r3 the home-mtime fallthrough
+    # returned True here, silently demoting every legitimate drift on
+    # a recent-mtime legacy install to priority=low. Under the r3
+    # contract, absence of every positive signal returns False — a
+    # freshly-touched home with no marker and no SESSION-TYPE.md does
+    # NOT claim freshness.
+    agent_f = "case_f_no_marker_no_session_recent_home"
+    home_f = _setup_agent_dirs(home_root, state_dir, agent_f)
+    # No SESSION-TYPE.md, no markers. Touch home to "now" so the
+    # (removed) mtime branch would have voted True.
+    os.utime(home_f, (now_ts, now_ts))
+    result_f = detect_fresh_install(state_dir, agent_f, home_f)
+    assert result_f is False, (
+        f"Case F FAIL: r3 quiet-by-default — no marker + no SESSION + "
+        f"recent home must return False; got {result_f}. The home-mtime "
+        f"fallthrough should be removed."
+    )
+
+    # ---- Case G (r3 quiet-by-default): malformed pending + recent home → False
+    # A pending marker whose `written` field cannot be parsed is NOT
+    # a valid positive signal. Pre-r3 the malformed-marker branch
+    # fell through to the mtime branch which returned True on a
+    # recent home. Under the r3 contract, an unparseable pending
+    # marker is treated as "no signal" — quiet-by-default.
+    agent_g = "case_g_malformed_pending_recent_home"
+    home_g = _setup_agent_dirs(home_root, state_dir, agent_g)
+    # Write a pending marker with NO `written` field. _read_marker_
+    # written_ts returns None for this shape, which the r3
+    # detect_fresh_install treats as "no positive signal".
+    malformed_marker = state_dir / "agents" / agent_g / "onboarding-pending"
+    malformed_marker.write_text(
+        f"agent={agent_g}\nreason=test-no-written-field\n",
+        encoding="utf-8",
+    )
+    # Touch home to recent so the (removed) mtime branch would vote True.
+    os.utime(home_g, (now_ts, now_ts))
+    result_g = detect_fresh_install(state_dir, agent_g, home_g)
+    assert result_g is False, (
+        f"Case G FAIL: r3 quiet-by-default — malformed pending marker "
+        f"(no written field) + recent home must return False; got "
+        f"{result_g}. A pending marker we cannot parse is NOT a valid "
+        f"positive signal."
+    )
+
+    print("T8 + T9 PASS — fresh_install precedence + TTL across 7 cases (r3 quiet-by-default)")
 
 
 if __name__ == "__main__":

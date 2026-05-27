@@ -105,14 +105,18 @@ class AgentWatch:
     #     (mode/ownership corruption, broken ACL, missing setgid bit).
     #     Genuine drift; admin action required.
     error_category: str = ""
-    # #1266 (v0.15.0-beta4 Lane G): fresh-install detection. True when the
-    # admin onboarding marker `state/agents/<a>/onboarding-pending` exists
-    # OR the agent's home directory is younger than
-    # BRIDGE_WATCHDOG_FRESH_INSTALL_WINDOW_SECS (default 600s = 10 min) and
-    # no `onboarding-complete` marker is present. The daemon drift-task
-    # writer (process_watchdog_report) lowers the task priority to `low`
-    # when every problem row is fresh_install=True so first-run admins do
-    # not see a "high priority drift" alert as their first impression.
+    # #1266 (v0.15.0-beta4 Lane G, r3 quiet-by-default): fresh-install
+    # detection. True only when an explicit positive signal is present —
+    # either (a) `state/agents/<a>/onboarding-pending` marker exists with
+    # a valid `written` timestamp within
+    # BRIDGE_WATCHDOG_FRESH_INSTALL_PENDING_TTL_SECS (default 24h), or
+    # (b) `SESSION-TYPE.md` reads `Onboarding State: pending` AND the
+    # pending marker is present and valid. Absence of any positive signal
+    # → False (legacy/established installs are NOT fresh just because the
+    # home directory was recently touched). The daemon drift-task writer
+    # (process_watchdog_report) lowers the task priority to `low` when
+    # every problem row is fresh_install=True so first-run admins do not
+    # see a "high priority drift" alert as their first impression.
     fresh_install: bool = False
     # #1254 (v0.15.0-beta4 Lane G): set when a `state/agents/<a>/restart.
     # in-progress` marker is active (state=in_progress, PID alive, within
@@ -515,7 +519,16 @@ def fresh_install_window_secs() -> int:
     """Resolve the fresh-install age window from the env, with a safe
     fall-through to ``DEFAULT_FRESH_INSTALL_WINDOW_SECS``. A
     non-integer / non-positive override is treated as the default so
-    operator typos cannot disarm the gate entirely."""
+    operator typos cannot disarm the gate entirely.
+
+    .. note::
+       r3 quiet-by-default contract: this window is no longer consulted
+       by :func:`detect_fresh_install` (the home-mtime fallthrough was
+       removed — codex r2 BLOCKING). The function is retained for
+       backward compatibility with the ``BRIDGE_WATCHDOG_FRESH_INSTALL_
+       WINDOW_SECS`` env var documented in older releases; new callers
+       should rely on :func:`fresh_install_pending_ttl_secs` instead.
+    """
     raw = os.environ.get("BRIDGE_WATCHDOG_FRESH_INSTALL_WINDOW_SECS", "")
     try:
         parsed = int(raw)
@@ -580,7 +593,18 @@ def detect_fresh_install(
     session_type_search_dirs: list[Path] | None = None,
 ) -> bool:
     """Return True when this agent looks like a fresh-install candidate
-    (Lane G #1266 + r2).
+    (Lane G #1266 + r3 quiet-by-default contract).
+
+    **Quiet-by-default contract (r3)**: ``fresh_install=True`` requires
+    an explicit positive signal. Absence of every signal returns
+    ``False``. Legacy installs without a pending marker are NOT fresh —
+    they have been running and the admin has simply not authored the
+    marker file yet; that is ``priority=normal`` drift, not
+    ``priority=low``. The home-directory mtime fallthrough that r2
+    carried was a quiet-by-default violation: a freshly-touched home
+    with no markers and no SESSION-TYPE.md was reported fresh on every
+    new install regardless of whether onboarding was actually in
+    progress.
 
     Decision matrix (evaluated in order; the first matching branch
     decides):
@@ -600,13 +624,15 @@ def detect_fresh_install(
       2. ``state/agents/<a>/onboarding-pending`` marker EXISTS AND the
          marker's ``written`` timestamp is within
          ``fresh_install_pending_ttl_secs()`` (default 24h) →
-         fresh_install=True. An expired pending marker is treated as
-         "fresh install never finished — operator probably abandoned the
-         onboarding"; falls through to the mtime branch.
-      3. No marker, no SESSION-TYPE.md signal → fall back to the agent
-         home directory's mtime. Within
-         ``fresh_install_window_secs()`` (default 600s = 10 min) →
-         fresh_install=True; otherwise False.
+         fresh_install=True. An expired pending marker (or one whose
+         ``written`` timestamp cannot be parsed) is NOT fresh — the
+         pending signal is the entire contract; if it is malformed or
+         stale the install is not fresh-by-claim.
+      3. No complete marker, no SESSION-TYPE.md ``complete`` reading,
+         no valid pending marker → fresh_install=False (quiet). This is
+         the codex r2 BLOCKING fix: r2 fell back to the home-mtime
+         branch here and reported True on every recent home, which
+         dropped legitimate drift on legacy installs to priority=low.
 
     Returns False when the state_dir is unknown (``None`` — caller could
     not resolve ``$BRIDGE_HOME/state``) so the detection is conservative:
@@ -624,7 +650,7 @@ def detect_fresh_install(
             return False
     except (PermissionError, OSError):
         # Controller cannot reach the state dir — fall through. The
-        # SESSION-TYPE.md probe + mtime branch below is the safety net.
+        # SESSION-TYPE.md probe below is the safety net.
         pass
     # SESSION-TYPE.md "Onboarding State: complete" is the equivalent
     # signal: the admin has flipped the template to complete but a
@@ -643,37 +669,33 @@ def detect_fresh_install(
     try:
         if pending_marker.is_file():
             # Branch 2: pending marker present. TTL gate from the
-            # marker's `written` field.
+            # marker's `written` field. A malformed or expired marker
+            # is treated as "not fresh" (quiet-by-default contract) —
+            # the pending marker is the explicit positive signal, and
+            # absence of a valid one means there is no claim of
+            # freshness to honor.
             written_ts = _read_marker_written_ts(pending_marker)
-            if written_ts is None:
-                # Malformed marker — fall through to the mtime branch
-                # rather than trusting a parse failure as "fresh".
-                pass
-            else:
+            if written_ts is not None:
                 now_ts = int(datetime.now(timezone.utc).timestamp())
                 age = now_ts - written_ts
-                # Clock skew defense (mirrors the mtime branch below):
-                # a future timestamp is treated as "do not trust"
-                # rather than "eternally fresh".
+                # Clock skew defense: a future timestamp is treated as
+                # "do not trust" rather than "eternally fresh".
                 if 0 <= age <= fresh_install_pending_ttl_secs():
                     return True
-                # Expired or skewed pending marker → fall through.
+            # Malformed, expired, or skewed pending marker → not fresh.
     except (PermissionError, OSError):
-        # Controller cannot reach the pending marker — fall through to
-        # the mtime branch which is the catch-all signal.
+        # Controller cannot reach the pending marker — treat as no
+        # signal (quiet-by-default). The complete-marker branch above
+        # already ran; if the controller cannot read pending either,
+        # there is no positive signal to honor.
         pass
-    try:
-        home_mtime = agent_home_dir.stat().st_mtime
-    except (PermissionError, FileNotFoundError, OSError):
-        return False
-    now_ts = datetime.now(timezone.utc).timestamp()
-    age = int(now_ts - home_mtime)
-    if age < 0:
-        # Clock skew defense: a future mtime is treated as "not fresh"
-        # rather than the alternative ("always fresh forever") so a
-        # mis-set clock cannot disarm every drift task indefinitely.
-        return False
-    return age <= fresh_install_window_secs()
+    # r3 quiet-by-default: no complete marker, no SESSION-TYPE.md
+    # complete reading, no valid pending marker → not fresh. The r2
+    # home-mtime fallthrough was removed here (codex r2 BLOCKING) so
+    # legacy installs without a pending marker do NOT report fresh on
+    # every recent-mtime home — that path mis-flagged every legitimate
+    # priority=normal drift as priority=low.
+    return False
 
 
 _ONBOARDING_STATE_RE = re.compile(
