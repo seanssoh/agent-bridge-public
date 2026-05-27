@@ -4863,14 +4863,22 @@ bridge_agent_mcp_giveup_arm() {
     daemon_source_state_file "$state_file" "plugin-liveness/$agent" 0 "" \
         "LAST_KEY LAST_DETECTED_TS LAST_RESTART_TS RESTART_ATTEMPTS GIVEUP GIVEUP_TS LAST_ACTIVITY_STATE" || true
   fi
+  # Issue #1338 root cause: daemon_source_state_file UNSETS the sanitize-vars
+  # before sourcing (line 431). If the state file doesn't redefine one
+  # (e.g. fresh-seed with only GIVEUP/GIVEUP_TS, or partial flush from
+  # an iso UID), the var stays unset, and `[[ -n "$LAST_KEY" ]]` fires
+  # `unbound variable` under the daemon's `set -u`. That escalates into
+  # the daemon's main loop crash loop. Use `${VAR:-}` default expansion
+  # everywhere — preserves the "skip if empty" semantics without tripping
+  # set -u.
   {
-    [[ -n "$LAST_KEY" ]] && printf 'LAST_KEY=%s\n' "$(printf '%q' "$LAST_KEY")"
-    [[ -n "$LAST_DETECTED_TS" ]] && printf 'LAST_DETECTED_TS=%s\n' "$(printf '%q' "$LAST_DETECTED_TS")"
-    [[ -n "$LAST_RESTART_TS" ]] && printf 'LAST_RESTART_TS=%s\n' "$(printf '%q' "$LAST_RESTART_TS")"
-    [[ -n "$RESTART_ATTEMPTS" ]] && printf 'RESTART_ATTEMPTS=%s\n' "$(printf '%q' "$RESTART_ATTEMPTS")"
+    [[ -n "${LAST_KEY:-}" ]] && printf 'LAST_KEY=%s\n' "$(printf '%q' "${LAST_KEY}")"
+    [[ -n "${LAST_DETECTED_TS:-}" ]] && printf 'LAST_DETECTED_TS=%s\n' "$(printf '%q' "${LAST_DETECTED_TS}")"
+    [[ -n "${LAST_RESTART_TS:-}" ]] && printf 'LAST_RESTART_TS=%s\n' "$(printf '%q' "${LAST_RESTART_TS}")"
+    [[ -n "${RESTART_ATTEMPTS:-}" ]] && printf 'RESTART_ATTEMPTS=%s\n' "$(printf '%q' "${RESTART_ATTEMPTS}")"
     printf 'GIVEUP=%s\n' "$(printf '%q' '1')"
     printf 'GIVEUP_TS=%s\n' "$(printf '%q' "$now_ts")"
-    [[ -n "$LAST_ACTIVITY_STATE" ]] && printf 'LAST_ACTIVITY_STATE=%s\n' "$(printf '%q' "$LAST_ACTIVITY_STATE")"
+    [[ -n "${LAST_ACTIVITY_STATE:-}" ]] && printf 'LAST_ACTIVITY_STATE=%s\n' "$(printf '%q' "${LAST_ACTIVITY_STATE}")"
   } >"$state_file"
 }
 
@@ -4916,8 +4924,10 @@ bridge_agent_mcp_giveup_clear() {
     daemon_source_state_file "$state_file" "plugin-liveness/$agent" 0 "" \
         "LAST_ACTIVITY_STATE" || true
   fi
+  # Issue #1338: `${VAR:-}` default expansion guards against the
+  # daemon_source_state_file-unsets-then-source-skips path under set -u.
   {
-    [[ -n "$LAST_ACTIVITY_STATE" ]] && printf 'LAST_ACTIVITY_STATE=%s\n' "$(printf '%q' "$LAST_ACTIVITY_STATE")"
+    [[ -n "${LAST_ACTIVITY_STATE:-}" ]] && printf 'LAST_ACTIVITY_STATE=%s\n' "$(printf '%q' "${LAST_ACTIVITY_STATE}")"
   } >"$state_file"
 }
 
@@ -4937,13 +4947,25 @@ bridge_agent_mcp_note_activity_state() {
     daemon_source_state_file "$state_file" "plugin-liveness/$agent" 0 "" \
         "LAST_KEY LAST_DETECTED_TS LAST_RESTART_TS RESTART_ATTEMPTS GIVEUP GIVEUP_TS" || true
   fi
+  # Issue #1338 root cause: daemon_source_state_file unsets these
+  # sanitize-vars BEFORE sourcing (lib helper line 431). If the source
+  # path returns early (unreadable file / missing required-var / bad
+  # syntax) the vars remain UNSET and `[[ -n "$VAR" ]]` fires "unbound
+  # variable" under the daemon's `set -u`, triggering the beta5-1
+  # crash loop on cm-prod-agentworkflow-vm01. The same shape applies
+  # under `set -u` even when the source succeeds if the state file
+  # itself doesn't redefine one of the fields (e.g. fresh-seed with
+  # only GIVEUP/GIVEUP_TS/LAST_ACTIVITY_STATE — exactly what
+  # bridge_agent_mcp_giveup_arm writes on first arm). Use `${VAR:-}`
+  # default expansion to preserve the "skip if empty" semantics
+  # without tripping set -u.
   {
-    [[ -n "$LAST_KEY" ]] && printf 'LAST_KEY=%s\n' "$(printf '%q' "$LAST_KEY")"
-    [[ -n "$LAST_DETECTED_TS" ]] && printf 'LAST_DETECTED_TS=%s\n' "$(printf '%q' "$LAST_DETECTED_TS")"
-    [[ -n "$LAST_RESTART_TS" ]] && printf 'LAST_RESTART_TS=%s\n' "$(printf '%q' "$LAST_RESTART_TS")"
-    [[ -n "$RESTART_ATTEMPTS" ]] && printf 'RESTART_ATTEMPTS=%s\n' "$(printf '%q' "$RESTART_ATTEMPTS")"
-    [[ -n "$GIVEUP" ]] && printf 'GIVEUP=%s\n' "$(printf '%q' "$GIVEUP")"
-    [[ -n "$GIVEUP_TS" ]] && printf 'GIVEUP_TS=%s\n' "$(printf '%q' "$GIVEUP_TS")"
+    [[ -n "${LAST_KEY:-}" ]] && printf 'LAST_KEY=%s\n' "$(printf '%q' "${LAST_KEY}")"
+    [[ -n "${LAST_DETECTED_TS:-}" ]] && printf 'LAST_DETECTED_TS=%s\n' "$(printf '%q' "${LAST_DETECTED_TS}")"
+    [[ -n "${LAST_RESTART_TS:-}" ]] && printf 'LAST_RESTART_TS=%s\n' "$(printf '%q' "${LAST_RESTART_TS}")"
+    [[ -n "${RESTART_ATTEMPTS:-}" ]] && printf 'RESTART_ATTEMPTS=%s\n' "$(printf '%q' "${RESTART_ATTEMPTS}")"
+    [[ -n "${GIVEUP:-}" ]] && printf 'GIVEUP=%s\n' "$(printf '%q' "${GIVEUP}")"
+    [[ -n "${GIVEUP_TS:-}" ]] && printf 'GIVEUP_TS=%s\n' "$(printf '%q' "${GIVEUP_TS}")"
     printf 'LAST_ACTIVITY_STATE=%s\n' "$(printf '%q' "$state")"
   } >"$state_file"
 }
@@ -5188,6 +5210,16 @@ process_mcp_liveness_giveup_recovery() {
 
   now_ts="$(date +%s)"
 
+  # Issue #1338 (beta5-2 Lane π): every helper call inside the loop is
+  # explicitly `|| true`-guarded so an internal non-zero return cannot
+  # fire `set -e` in the parent daemon loop. The caller already wraps
+  # this function in a `( ... ) || true` subshell (defense-in-depth),
+  # but per Sean's "꼼꼼하게 사이드이펙트 없이 엣지케이스 고려" directive we
+  # also harden the function's own body so the same regression can't
+  # recur if the wrapping is ever loosened. Per-agent failures must
+  # never break the loop or the daemon tick — the worst observable
+  # outcome of an inner failure is one agent's ledger going stale until
+  # the next tick.
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
     [[ -z "$agent" ]] && continue
 
@@ -5196,10 +5228,11 @@ process_mcp_liveness_giveup_recovery() {
     # agents that later DO hit giveup have a correct "previous state"
     # anchor on the very next tick.
     cur_state="$(bridge_agent_heartbeat_activity_state "$agent" 2>/dev/null || printf 'unknown')"
+    [[ -n "$cur_state" ]] || cur_state="unknown"
     prev_state=""
-    if [[ -f "$(bridge_plugin_liveness_state_file "$agent")" ]]; then
+    if [[ -f "$(bridge_plugin_liveness_state_file "$agent" 2>/dev/null)" ]]; then
       local LAST_ACTIVITY_STATE=""
-      daemon_source_state_file "$(bridge_plugin_liveness_state_file "$agent")" \
+      daemon_source_state_file "$(bridge_plugin_liveness_state_file "$agent" 2>/dev/null)" \
           "plugin-liveness/$agent" 0 "" "LAST_ACTIVITY_STATE" || true
       prev_state="${LAST_ACTIVITY_STATE:-}"
     fi
@@ -5207,7 +5240,9 @@ process_mcp_liveness_giveup_recovery() {
     # Update LAST_ACTIVITY_STATE for next tick BEFORE the recheck path —
     # so even if recheck wedges or clears the state, the observer has a
     # fresh anchor for the next iteration's transition compute.
-    bridge_agent_mcp_note_activity_state "$agent" "$cur_state"
+    # #1338 hardening: explicit `|| true` so a permission-denied
+    # mkdir/write inside the helper (iso-v2 boundary) cannot escape.
+    bridge_agent_mcp_note_activity_state "$agent" "$cur_state" || true
 
     # Fast path — no giveup ledger for this agent. The activity-state
     # note above is the only side effect.
@@ -5221,7 +5256,7 @@ process_mcp_liveness_giveup_recovery() {
     if [[ "$cur_state" == "idle" && -n "$prev_state" && "$prev_state" != "idle" ]]; then
       trigger="activity_idle"
     else
-      giveup_ts="$(bridge_agent_mcp_giveup_ts "$agent" || printf '0')"
+      giveup_ts="$(bridge_agent_mcp_giveup_ts "$agent" 2>/dev/null || printf '0')"
       [[ "$giveup_ts" =~ ^[0-9]+$ ]] || giveup_ts=0
       if (( giveup_ts > 0 )) && (( now_ts - giveup_ts >= fallback_secs )); then
         trigger="fallback_timer"
@@ -5233,23 +5268,27 @@ process_mcp_liveness_giveup_recovery() {
     # Re-check liveness. On success: clear ledger + audit. On failure:
     # re-arm the timer window (bumps GIVEUP_TS) + audit so the operator
     # can see the re-arm cadence in the audit log.
+    # #1338 hardening: every audit/state mutation is `|| true`-guarded.
     if bridge_recheck_mcp_liveness "$agent"; then
       bridge_audit_log daemon plugin_mcp_liveness_recovered "$agent" \
         --detail trigger="$trigger" \
         --detail prev_activity_state="${prev_state:-unknown}" \
-        --detail activity_state="$cur_state"
-      bridge_agent_mcp_giveup_clear "$agent"
-      daemon_info "plugin MCP liveness recovered for ${agent} (trigger=${trigger}); cleared giveup, restored restart budget"
+        --detail activity_state="$cur_state" || true
+      bridge_agent_mcp_giveup_clear "$agent" || true
+      daemon_info "plugin MCP liveness recovered for ${agent} (trigger=${trigger}); cleared giveup, restored restart budget" || true
     else
       missing="$(bridge_agent_missing_plugin_mcp_channels_csv "$agent" 2>/dev/null || printf '')"
       bridge_audit_log daemon plugin_mcp_liveness_recheck_still_failed "$agent" \
         --detail trigger="$trigger" \
         --detail missing_channels="$missing" \
         --detail prev_activity_state="${prev_state:-unknown}" \
-        --detail activity_state="$cur_state"
-      bridge_agent_mcp_giveup_arm "$agent" "$now_ts"
+        --detail activity_state="$cur_state" || true
+      bridge_agent_mcp_giveup_arm "$agent" "$now_ts" || true
     fi
   done
+  # #1338 belt-and-suspenders: explicit success return so the function
+  # never inherits a stale non-zero rc from the last in-loop helper.
+  return 0
 }
 
 process_memory_daily_refresh_requests() {
@@ -7694,16 +7733,18 @@ cmd_sync_cycle() {
   bridge_roster_cache_invalidate
   bridge_load_roster
 
-  # Discord relay runs FIRST — lowest-latency path for DM wake
+  # Discord relay runs FIRST — lowest-latency path for DM wake.
+  # Issue #1338 defense-in-depth: subshell-isolate (see note above
+  # mcp_liveness_giveup_recovery for rationale).
   BRIDGE_DAEMON_LAST_STEP="discord_relay"
-  bridge_discord_relay_step || true
+  ( bridge_discord_relay_step ) || true
 
   # Issue #597 Track B: PreCompact channel auto-notify observer. Runs after
   # the Discord relay (so any inbound user activity is already mirrored into
   # the activity index when the route lookup runs) and before bridge-sync,
   # which is the cheap "I/O is mostly done for this cycle" boundary.
   BRIDGE_DAEMON_LAST_STEP="precompact_events"
-  process_precompact_events || true
+  ( process_precompact_events ) || true
 
   BRIDGE_DAEMON_LAST_STEP="bridge_sync"
   # Refs #815 Wave B: wrap with bridge_with_timeout so a stuck child cannot
@@ -7719,19 +7760,22 @@ cmd_sync_cycle() {
   if process_queue_gateway_requests; then
     changed=0
   fi
+  # Issue #1338 defense-in-depth: each `step_fn || true` is wrapped in
+  # `( ... )` to keep a set -e leak from inside the step (or any of its
+  # nested function calls) from exiting the daemon loop.
   BRIDGE_DAEMON_LAST_STEP="reconcile_idle_markers"
-  bridge_reconcile_idle_markers || true
+  ( bridge_reconcile_idle_markers ) || true
   BRIDGE_DAEMON_LAST_STEP="bootstrap_recovery"
-  recover_claude_bootstrap_blockers || true
+  ( recover_claude_bootstrap_blockers ) || true
   # Issue #589: prompt-ready latch reconciliation runs BEFORE the
   # attention-spool flush so an agent whose prompt just became visible
   # gets latched and its spooled wakes drain in the same sync tick.
   BRIDGE_DAEMON_LAST_STEP="prompt_ready_reconcile"
-  reconcile_prompt_ready_latches || true
+  ( reconcile_prompt_ready_latches ) || true
   BRIDGE_DAEMON_LAST_STEP="attention_flush"
-  flush_pending_attention_spools || true
+  ( flush_pending_attention_spools ) || true
   BRIDGE_DAEMON_LAST_STEP="channel_health"
-  process_channel_health || true
+  ( process_channel_health ) || true
   # Issue #1307 (v0.15.0-beta5-1 Lane 3) — auto-clear MCP-liveness giveup
   # on agent recovery. Runs BEFORE process_plugin_liveness because
   # process_plugin_liveness's silent-clear path
@@ -7753,11 +7797,24 @@ cmd_sync_cycle() {
   # active yet), so the fresh GIVEUP_TS is left intact and the NEXT
   # tick's recovery evaluates the fallback timer against an accurate
   # anchor.
+  # Issue #1338 (beta5-2 Lane π): subshell-isolate the step. Without the
+  # extra `( ... )` wrap, any failing simple command inside the function
+  # body — or, more pernicious, any failure inside a nested function the
+  # body calls — can fire `set -e` in the daemon's main loop despite the
+  # trailing `|| true`. Bash's "errexit suppressed in `||`-disabled
+  # context" rule is not bulletproof across nested function boundaries
+  # (the daemon's beta5-1 crash loop on cm-prod-agentworkflow-vm01 was
+  # the smoking gun: `last_step=mcp_liveness_giveup_recovery` repeating
+  # every 5-7s after upgrade). The subshell creates a hard process
+  # boundary — set -e inside the subshell exits the subshell with rc!=0,
+  # the outer `|| true` consumes that non-zero, and the daemon loop
+  # continues. Same defense-in-depth pattern applied to the other
+  # `step_fn || true` sites below.
   BRIDGE_DAEMON_LAST_STEP="mcp_liveness_giveup_recovery"
-  process_mcp_liveness_giveup_recovery || true
+  ( process_mcp_liveness_giveup_recovery ) || true
 
   BRIDGE_DAEMON_LAST_STEP="plugin_liveness"
-  process_plugin_liveness || true
+  ( process_plugin_liveness ) || true
 
   BRIDGE_DAEMON_LAST_STEP="nudge_scan"
   snapshot_file="$(mktemp)"
@@ -7811,8 +7868,9 @@ cmd_sync_cycle() {
   rm -f "$snapshot_file"
   rm -f "$ready_agents_file"
 
+  # Issue #1338 defense-in-depth: subshell-isolate (rationale above).
   BRIDGE_DAEMON_LAST_STEP="cron_dispatch_workers"
-  start_cron_dispatch_workers || true
+  ( start_cron_dispatch_workers ) || true
 
   # Issue #1197 (beta22): A2A cross-bridge delivery tick. No-op silently
   # when handoff.local.json is absent (most installs), throttled to
@@ -7820,8 +7878,9 @@ cmd_sync_cycle() {
   # bridge_with_timeout so an HTTP/socket hang cannot wedge the loop.
   # Placement: after cron_dispatch_workers (where queue maintenance is
   # done) and before nudge_agents (the cycle's last big external fanout).
+  # Issue #1338 defense-in-depth: subshell-isolate (rationale above).
   BRIDGE_DAEMON_LAST_STEP="a2a_deliver_tick"
-  process_a2a_deliver_tick || true
+  ( process_a2a_deliver_tick ) || true
 
   # Issue #1262 Gap 3 (v0.15.0-beta4 Lane I): A2A outbox stuck-alert
   # scan. Pairs with the deliver tick above — when a row stays in
@@ -7829,8 +7888,9 @@ cmd_sync_cycle() {
   # file an admin task so the operator sees the stall without polling
   # `agb a2a outbox list`. Throttled by
   # BRIDGE_A2A_STUCK_ALERT_SCAN_INTERVAL_SECONDS (default 300s).
+  # Issue #1338 defense-in-depth: subshell-isolate (rationale above).
   BRIDGE_DAEMON_LAST_STEP="a2a_stuck_scan_tick"
-  process_a2a_outbox_stuck_scan_tick || true
+  ( process_a2a_outbox_stuck_scan_tick ) || true
 
   BRIDGE_DAEMON_LAST_STEP="nudge_agents"
   printf '%s\n' "$nudge_output" > "$_nudge_tmp"
@@ -7985,11 +8045,14 @@ cmd_sync_cycle() {
   # only normalizes runtime state, never deletes job entries) so the orphan
   # list reflects the post-sync truth. Best-effort: any failure is logged
   # and must not abort the rest of the sync pass.
+  # Issue #1338 defense-in-depth: subshell-isolate (rationale above).
+  # `process_memory_daily_orphan_sweep` is wrapped so a set -e leak from
+  # its body cannot bypass the trailing `|| daemon_warn ...` warning path.
   BRIDGE_DAEMON_LAST_STEP="memory_daily_orphan_sweep"
-  process_memory_daily_orphan_sweep 2>/dev/null || daemon_warn "memory-daily orphan sweep failed"
+  ( process_memory_daily_orphan_sweep ) 2>/dev/null || daemon_warn "memory-daily orphan sweep failed"
 
   BRIDGE_DAEMON_LAST_STEP="dashboard_post"
-  bridge_dashboard_post_if_changed "$summary_output" || true
+  ( bridge_dashboard_post_if_changed "$summary_output" ) || true
 }
 
 # --- Silence-watchdog sibling (issue #265 proposal C) ----------------------
