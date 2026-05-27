@@ -153,6 +153,23 @@ bridge_agent_os_user() {
   printf '%s' "${SMOKE_OS_USER:-}"
 }
 
+# Stub 3: lie about `command -v setpriv` based on $SMOKE_SETPRIV_PRESENT.
+# The host may have a real /usr/bin/setpriv (Linux CI does) which would
+# otherwise leak into the "setpriv missing" test arm. By overriding the
+# `command` builtin here we decouple the test from host setpriv install
+# state. All other `command -v <X>` calls (e.g. `command -v sudo`) fall
+# through to the bash builtin via `builtin command`.
+command() {
+  if [[ "${1:-}" == "-v" && "${2:-}" == "setpriv" ]]; then
+    if [[ "${SMOKE_SETPRIV_PRESENT:-0}" == "1" ]]; then
+      printf '%s\n' "${SMOKE_FAKE_SETPRIV_PATH:-/usr/bin/setpriv}"
+      return 0
+    fi
+    return 1
+  fi
+  builtin command "$@"
+}
+
 # BRIDGE_CRON_STATE_DIR drives the cache root.
 export BRIDGE_CRON_STATE_DIR="$CACHE_ROOT"
 
@@ -179,15 +196,28 @@ DRIVER_EOF
 chmod +x "$DRIVER"
 
 # ---------------------------------------------------------------------
-# Build a PATH shim with a controllable `sudo`. The real `id` stays on
-# PATH so the same-UID short-circuit works against actual `id -u` calls.
+# Build a PATH shim with a controllable `sudo` AND optional `setpriv`.
+# The real `id` stays on PATH so the same-UID short-circuit works against
+# actual `id -u` calls.
+#
 # `sudo` honors:
 #   $SMOKE_SUDO_RESULT — 0 (success) or 1 (denial), default 1.
+# `setpriv` honors:
+#   $SMOKE_SETPRIV_RESULT — 0 (success) or 1, default 0.
+#
+# The setpriv shim is created lazily on demand: tests that want
+# "setpriv present" call `enable_fake_setpriv`; tests that want
+# "setpriv missing" use a PATH that excludes the fake bin entirely (we
+# use a separate `FAKE_BIN_SUDO_ONLY` directory which only has sudo).
 # ---------------------------------------------------------------------
 FAKE_BIN="$SMOKE_TMP_ROOT/fake-bin"
-mkdir -p "$FAKE_BIN"
+FAKE_BIN_SUDO_ONLY="$SMOKE_TMP_ROOT/fake-bin-sudo-only"
+mkdir -p "$FAKE_BIN" "$FAKE_BIN_SUDO_ONLY"
 FAKE_SUDO="$FAKE_BIN/sudo"
+FAKE_SUDO_SO="$FAKE_BIN_SUDO_ONLY/sudo"
+FAKE_SETPRIV="$FAKE_BIN/setpriv"
 SUDO_CALL_LOG="$SMOKE_TMP_ROOT/sudo-calls.log"
+SETPRIV_CALL_LOG="$SMOKE_TMP_ROOT/setpriv-calls.log"
 
 cat >"$FAKE_SUDO" <<'SUDO_EOF'
 #!/usr/bin/env bash
@@ -200,11 +230,29 @@ fi
 exit "${SMOKE_SUDO_RESULT:-1}"
 SUDO_EOF
 chmod +x "$FAKE_SUDO"
+cp "$FAKE_SUDO" "$FAKE_SUDO_SO"
+
+cat >"$FAKE_SETPRIV" <<'SETPRIV_EOF'
+#!/usr/bin/env bash
+# Fake setpriv. Records argv into $SMOKE_SETPRIV_CALL_LOG (if set), exits
+# according to $SMOKE_SETPRIV_RESULT (default 0 — succeeds).
+if [[ -n "${SMOKE_SETPRIV_CALL_LOG:-}" ]]; then
+  printf '%s\0' "$@" >>"$SMOKE_SETPRIV_CALL_LOG"
+  printf '\n' >>"$SMOKE_SETPRIV_CALL_LOG"
+fi
+exit "${SMOKE_SETPRIV_RESULT:-0}"
+SETPRIV_EOF
+chmod +x "$FAKE_SETPRIV"
 
 # ---------------------------------------------------------------------
 # Helper: invoke the driver with the desired stub config.
 # Args: <test-label> <iso_effective> <os_user> <sudo_result> <expect_rc>
-#       [force=0|1]
+#       [force=0|1] [setpriv_present=0|1] [use_setpriv_flag=""|"0"|"1"]
+#
+# When setpriv_present=1, the FAKE_BIN PATH (which has both sudo+setpriv)
+# is used; when 0, FAKE_BIN_SUDO_ONLY (sudo only) is used. The
+# use_setpriv_flag value is exported as BRIDGE_CRON_USE_SETPRIV — empty
+# string means "do not export at all" (unset).
 # ---------------------------------------------------------------------
 T_CACHE_ROOT="$SMOKE_TMP_ROOT/cache"
 mkdir -p "$T_CACHE_ROOT"
@@ -217,15 +265,38 @@ invoke_driver() {
   local sudo_result="$4"
   local expect_rc="$5"
   local force="${6:-0}"
+  local setpriv_present="${7:-0}"
+  local use_setpriv_flag="${8:-}"
   local out
   local rc=0
+  local fake_bin_dir="$FAKE_BIN_SUDO_ONLY"
+
+  if [[ "$setpriv_present" == "1" ]]; then
+    fake_bin_dir="$FAKE_BIN"
+  fi
 
   : >"$SUDO_CALL_LOG"
-  PATH="$FAKE_BIN:$PATH" \
-    SMOKE_ISO_EFFECTIVE="$iso_effective" \
-    SMOKE_OS_USER="$os_user" \
-    SMOKE_SUDO_RESULT="$sudo_result" \
-    SMOKE_SUDO_CALL_LOG="$SUDO_CALL_LOG" \
+  : >"$SETPRIV_CALL_LOG"
+
+  # Build env command piecewise so we can conditionally include
+  # BRIDGE_CRON_USE_SETPRIV (or omit it to test the unset case). The
+  # driver also overrides `command -v setpriv` to respect
+  # $SMOKE_SETPRIV_PRESENT — that decouples the test from whether the
+  # host has a real /usr/bin/setpriv installed (Linux CI typically does).
+  local -a env_args=(
+    "PATH=$fake_bin_dir:$PATH"
+    "SMOKE_ISO_EFFECTIVE=$iso_effective"
+    "SMOKE_OS_USER=$os_user"
+    "SMOKE_SUDO_RESULT=$sudo_result"
+    "SMOKE_SUDO_CALL_LOG=$SUDO_CALL_LOG"
+    "SMOKE_SETPRIV_CALL_LOG=$SETPRIV_CALL_LOG"
+    "SMOKE_SETPRIV_PRESENT=$setpriv_present"
+  )
+  if [[ -n "$use_setpriv_flag" ]]; then
+    env_args+=("BRIDGE_CRON_USE_SETPRIV=$use_setpriv_flag")
+  fi
+
+  env -u BRIDGE_CRON_USE_SETPRIV "${env_args[@]}" \
     "$BRIDGE_BASH" "$DRIVER" "$REPO_ROOT" "$EXTRACT" "$SAFE_STUB" \
       "$T_AGENT" "$T_CACHE_ROOT" "$force" \
     2>"$SMOKE_TMP_ROOT/${label}.err" || rc=$?
@@ -273,6 +344,12 @@ if [[ "$TARGET_UID" == "$CURRENT_UID" ]]; then
   exit 0
 fi
 
+# Cache file naming includes a flag suffix: <agent>.setpriv<0|1>.cache.
+# All cache assertions in T1-T4 use the .setpriv0.cache slot (flag absent
+# from env). T7-T9 exercise the .setpriv1.cache slot.
+T_CACHE_FLAG0_PATH="$T_CACHE_ROOT/preflight-uid-drop/$T_AGENT.setpriv0.cache"
+T_CACHE_FLAG1_PATH="$T_CACHE_ROOT/preflight-uid-drop/$T_AGENT.setpriv1.cache"
+
 # ---------------------------------------------------------------------
 # T1 — iso effective + sudo working → rc=0 (proceed).
 # ---------------------------------------------------------------------
@@ -280,14 +357,14 @@ rm -rf "$T_CACHE_ROOT"
 mkdir -p "$T_CACHE_ROOT"
 invoke_driver "T1-iso-sudo-ok" "1" "$T_OS_USER" "0" "0"
 # Confirm cache file was created with the success result (rc=0).
-T1_CACHE="$T_CACHE_ROOT/preflight-uid-drop/$T_AGENT.cache"
+T1_CACHE="$T_CACHE_FLAG0_PATH"
 smoke_assert_file_exists "$T1_CACHE" "T1 cache file written"
 if ! grep -qE $'^[0-9]+\t0$' "$T1_CACHE"; then
   smoke_fail "T1: cache file should record '<expires>\t0', got: $(cat "$T1_CACHE")"
 fi
 
 # ---------------------------------------------------------------------
-# T2 — iso effective + sudo broken → rc=1 (refuse).
+# T2 — iso effective + sudo broken (no setpriv) → rc=1 (refuse).
 # ---------------------------------------------------------------------
 rm -rf "$T_CACHE_ROOT"
 mkdir -p "$T_CACHE_ROOT"
@@ -307,7 +384,7 @@ case "$sudo_argv_txt" in
     smoke_fail "T2: sudo argv does NOT match runner shape ('-n -H -u <user> env -i'). Got: $sudo_argv_txt"
     ;;
 esac
-T2_CACHE="$T_CACHE_ROOT/preflight-uid-drop/$T_AGENT.cache"
+T2_CACHE="$T_CACHE_FLAG0_PATH"
 smoke_assert_file_exists "$T2_CACHE" "T2 cache file written"
 if ! grep -qE $'^[0-9]+\t1$' "$T2_CACHE"; then
   smoke_fail "T2: cache file should record '<expires>\t1', got: $(cat "$T2_CACHE")"
@@ -324,9 +401,8 @@ if [[ -s "$SUDO_CALL_LOG" ]]; then
   smoke_fail "T3: non-iso path must NOT invoke sudo, but call log is non-empty: $(tr '\0' ' ' <"$SUDO_CALL_LOG")"
 fi
 # Confirm NO cache file was written (no result to cache for short-circuit).
-T3_CACHE="$T_CACHE_ROOT/preflight-uid-drop/$T_AGENT.cache"
-if [[ -f "$T3_CACHE" ]]; then
-  smoke_fail "T3: non-iso path must NOT write cache file, but $T3_CACHE exists"
+if [[ -f "$T_CACHE_FLAG0_PATH" || -f "$T_CACHE_FLAG1_PATH" ]]; then
+  smoke_fail "T3: non-iso path must NOT write cache file (flag0/flag1 slots both empty)"
 fi
 
 # ---------------------------------------------------------------------
@@ -340,7 +416,7 @@ rm -rf "$T_CACHE_ROOT"
 mkdir -p "$T_CACHE_ROOT"
 # First call: populate cache (sudo broken → rc=1).
 invoke_driver "T4-seed" "1" "$T_OS_USER" "1" "1"
-T4_CACHE="$T_CACHE_ROOT/preflight-uid-drop/$T_AGENT.cache"
+T4_CACHE="$T_CACHE_FLAG0_PATH"
 smoke_assert_file_exists "$T4_CACHE" "T4 seed cache present"
 seed_sudo_size="$(wc -c <"$SUDO_CALL_LOG" | tr -d ' ')"
 
@@ -372,6 +448,265 @@ printf '%s\t%s\n' "$future_ts" "0" >"$T4_CACHE"
 invoke_driver "T4c-force-bypass" "1" "$T_OS_USER" "0" "0" "1"
 if [[ ! -s "$SUDO_CALL_LOG" ]]; then
   smoke_fail "T4c: force=1 MUST bypass cache and re-probe sudo, but call log is empty"
+fi
+
+# ---------------------------------------------------------------------
+# T6 — flag contract: iso + sudo-broken + setpriv-PRESENT + flag ABSENT
+#      → refuse (setpriv ignored without opt-in).
+#      Codex r1 BLOCKING: brief said BRIDGE_CRON_USE_SETPRIV, impl used a
+#      different name → flag did nothing. T6 catches a regression where
+#      the flag check is removed or the name drifts again.
+# ---------------------------------------------------------------------
+rm -rf "$T_CACHE_ROOT"
+mkdir -p "$T_CACHE_ROOT"
+invoke_driver "T6-flag-absent-setpriv-present" "1" "$T_OS_USER" "1" "1" "0" "1" ""
+T6_CACHE="$T_CACHE_FLAG0_PATH"
+smoke_assert_file_exists "$T6_CACHE" "T6 cache file written (flag-0 slot)"
+if ! grep -qE $'^[0-9]+\t1$' "$T6_CACHE"; then
+  smoke_fail "T6: cache should record rc=1 (refuse) when flag absent, got: $(cat "$T6_CACHE")"
+fi
+
+# ---------------------------------------------------------------------
+# T7 — flag contract: iso + sudo-broken + setpriv-PRESENT + flag=1
+#      → ALLOW (operator opted in, fallback eligible).
+# ---------------------------------------------------------------------
+rm -rf "$T_CACHE_ROOT"
+mkdir -p "$T_CACHE_ROOT"
+invoke_driver "T7-flag1-setpriv-present" "1" "$T_OS_USER" "1" "0" "0" "1" "1"
+T7_CACHE="$T_CACHE_FLAG1_PATH"
+smoke_assert_file_exists "$T7_CACHE" "T7 cache file written (flag-1 slot)"
+if ! grep -qE $'^[0-9]+\t0$' "$T7_CACHE"; then
+  smoke_fail "T7: cache should record rc=0 (allow) when flag=1 + setpriv present, got: $(cat "$T7_CACHE")"
+fi
+
+# ---------------------------------------------------------------------
+# T8 — runner consistency: with flag ABSENT + sudo missing/broken,
+#      shell_command_for_execution must raise RuntimeError. We invoke
+#      the runner's command-builder helper directly through Python.
+# ---------------------------------------------------------------------
+T8_OUT="$SMOKE_TMP_ROOT/T8.out"
+T8_ERR="$SMOKE_TMP_ROOT/T8.err"
+# Compose a Python harness that imports the runner and calls
+# shell_command_for_execution with a synthetic cross-UID execution.
+# Use a clean PATH (no sudo, no setpriv) to force the RuntimeError arm.
+# /usr/bin/env, python3, and the python stdlib are reached via absolute
+# python3 path so the empty PATH does not break the interpreter startup.
+PY_BIN="$(command -v python3 || true)"
+if [[ -z "$PY_BIN" ]]; then
+  smoke_fail "T8: python3 not on host PATH; cannot drive runner consistency check"
+fi
+T8_HARNESS="$SMOKE_TMP_ROOT/t8_harness.py"
+{
+  printf '%s\n' "import importlib.util, os, sys"
+  printf '%s\n' "spec = importlib.util.spec_from_file_location('bcr', '$REPO_ROOT/bridge-cron-runner.py')"
+  printf '%s\n' "mod = importlib.util.module_from_spec(spec)"
+  printf '%s\n' "spec.loader.exec_module(mod)"
+  printf '%s\n' "current_uid = os.geteuid()"
+  printf '%s\n' "synthetic_uid = current_uid + 1000  # ensure cross-UID branch"
+  printf '%s\n' "execution = {'os_user': 'nobody', 'uid': synthetic_uid, 'gid': synthetic_uid}"
+  printf '%s\n' "try:"
+  printf '%s\n' "    mod.shell_command_for_execution(execution, {}, '/bin/true', [])"
+  printf '%s\n' "except RuntimeError as e:"
+  printf '%s\n' "    print('GOT_RUNTIME_ERROR', str(e))"
+  printf '%s\n' "    sys.exit(0)"
+  printf '%s\n' "print('NO_ERROR')"
+  printf '%s\n' "sys.exit(1)"
+} >"$T8_HARNESS"
+
+# Strip sudo + setpriv from PATH; force BRIDGE_CRON_USE_SETPRIV absent.
+# Use PATH= (empty) — python's `shutil.which` returns None for both.
+if env -u BRIDGE_CRON_USE_SETPRIV PATH="" "$PY_BIN" "$T8_HARNESS" >"$T8_OUT" 2>"$T8_ERR"; then
+  if grep -q '^GOT_RUNTIME_ERROR' "$T8_OUT"; then
+    smoke_log "T8: runner raises RuntimeError when flag absent + sudo/setpriv missing"
+  else
+    smoke_fail "T8: expected GOT_RUNTIME_ERROR, got: $(cat "$T8_OUT") (stderr: $(cat "$T8_ERR"))"
+  fi
+else
+  smoke_fail "T8: harness exit non-zero — stdout=$(cat "$T8_OUT") stderr=$(cat "$T8_ERR")"
+fi
+
+# ---------------------------------------------------------------------
+# T9 — runner consistency: with flag=1 + setpriv present + sudo absent,
+#      shell_command_for_execution must return the setpriv command
+#      (NOT raise). We use a real `/usr/bin/setpriv` on Linux, or fall
+#      back to a shim on PATH for macOS.
+# ---------------------------------------------------------------------
+T9_OUT="$SMOKE_TMP_ROOT/T9.out"
+T9_ERR="$SMOKE_TMP_ROOT/T9.err"
+T9_PATH_DIR="$SMOKE_TMP_ROOT/t9-bin"
+mkdir -p "$T9_PATH_DIR"
+# Provide a no-op `setpriv` (the helper only does shutil.which, not exec).
+cat >"$T9_PATH_DIR/setpriv" <<'T9SP_EOF'
+#!/usr/bin/env bash
+exit 0
+T9SP_EOF
+chmod +x "$T9_PATH_DIR/setpriv"
+T9_HARNESS="$SMOKE_TMP_ROOT/t9_harness.py"
+{
+  printf '%s\n' "import importlib.util, os, sys"
+  printf '%s\n' "spec = importlib.util.spec_from_file_location('bcr', '$REPO_ROOT/bridge-cron-runner.py')"
+  printf '%s\n' "mod = importlib.util.module_from_spec(spec)"
+  printf '%s\n' "spec.loader.exec_module(mod)"
+  printf '%s\n' "current_uid = os.geteuid()"
+  printf '%s\n' "synthetic_uid = current_uid + 1000"
+  printf '%s\n' "execution = {'os_user': 'nobody', 'uid': synthetic_uid, 'gid': synthetic_uid}"
+  printf '%s\n' "cmd = mod.shell_command_for_execution(execution, {}, '/bin/true', [])"
+  printf '%s\n' "print('COMMAND', cmd[0])"
+} >"$T9_HARNESS"
+
+# PATH has ONLY t9-bin → setpriv present, sudo absent. flag=1.
+if env BRIDGE_CRON_USE_SETPRIV=1 PATH="$T9_PATH_DIR" "$PY_BIN" "$T9_HARNESS" >"$T9_OUT" 2>"$T9_ERR"; then
+  cmd0="$(awk '/^COMMAND/ { print $2 }' "$T9_OUT")"
+  case "$cmd0" in
+    */setpriv|setpriv)
+      smoke_log "T9: runner selects setpriv with flag=1 + setpriv present + sudo absent"
+      ;;
+    *)
+      smoke_fail "T9: expected setpriv command, got: $(cat "$T9_OUT") (stderr: $(cat "$T9_ERR"))"
+      ;;
+  esac
+else
+  smoke_fail "T9: harness exit non-zero — stdout=$(cat "$T9_OUT") stderr=$(cat "$T9_ERR")"
+fi
+
+# ---------------------------------------------------------------------
+# T_EDGE_1 — BRIDGE_CRON_USE_SETPRIV=0 explicitly behaves like unset.
+#            iso + sudo-broken + setpriv-present + flag=0 → refuse.
+# ---------------------------------------------------------------------
+rm -rf "$T_CACHE_ROOT"
+mkdir -p "$T_CACHE_ROOT"
+invoke_driver "T_EDGE_1-flag-explicit-0" "1" "$T_OS_USER" "1" "1" "0" "1" "0"
+T_EDGE_1_CACHE="$T_CACHE_FLAG0_PATH"
+smoke_assert_file_exists "$T_EDGE_1_CACHE" "T_EDGE_1 cache file written (flag-0 slot)"
+if ! grep -qE $'^[0-9]+\t1$' "$T_EDGE_1_CACHE"; then
+  smoke_fail "T_EDGE_1: explicit flag=0 should refuse like unset, got cache: $(cat "$T_EDGE_1_CACHE")"
+fi
+
+# ---------------------------------------------------------------------
+# T_EDGE_2 — setpriv MISSING + flag=1 → still refuse (cannot opt into a
+#            tool that does not exist on the host).
+# ---------------------------------------------------------------------
+rm -rf "$T_CACHE_ROOT"
+mkdir -p "$T_CACHE_ROOT"
+invoke_driver "T_EDGE_2-flag1-setpriv-missing" "1" "$T_OS_USER" "1" "1" "0" "0" "1"
+T_EDGE_2_CACHE="$T_CACHE_FLAG1_PATH"
+smoke_assert_file_exists "$T_EDGE_2_CACHE" "T_EDGE_2 cache file written (flag-1 slot)"
+if ! grep -qE $'^[0-9]+\t1$' "$T_EDGE_2_CACHE"; then
+  smoke_fail "T_EDGE_2: flag=1 + setpriv missing should refuse, got cache: $(cat "$T_EDGE_2_CACHE")"
+fi
+
+# ---------------------------------------------------------------------
+# T_EDGE_3 — sudo OK + setpriv-PRESENT + flag=1 → sudo wins (canonical
+#            iso v2 path). The runner ALSO prefers sudo over setpriv;
+#            preflight must match.
+# ---------------------------------------------------------------------
+rm -rf "$T_CACHE_ROOT"
+mkdir -p "$T_CACHE_ROOT"
+invoke_driver "T_EDGE_3-sudo-and-setpriv" "1" "$T_OS_USER" "0" "0" "0" "1" "1"
+# Sudo must have been invoked (probe ran); setpriv must NOT have been
+# invoked (preflight only `command -v`s it; the helper does not exec).
+if [[ ! -s "$SUDO_CALL_LOG" ]]; then
+  smoke_fail "T_EDGE_3: sudo MUST be probed when sudo OK + setpriv present"
+fi
+if [[ -s "$SETPRIV_CALL_LOG" ]]; then
+  smoke_fail "T_EDGE_3: setpriv MUST NOT be invoked when sudo wins"
+fi
+# Cache should record rc=0 (allow) under flag-1 slot.
+T_EDGE_3_CACHE="$T_CACHE_FLAG1_PATH"
+smoke_assert_file_exists "$T_EDGE_3_CACHE" "T_EDGE_3 cache (flag-1 slot)"
+if ! grep -qE $'^[0-9]+\t0$' "$T_EDGE_3_CACHE"; then
+  smoke_fail "T_EDGE_3: cache should record rc=0 when sudo wins, got: $(cat "$T_EDGE_3_CACHE")"
+fi
+
+# Verify the runner ALSO selects sudo (not setpriv) for the same shape.
+T_EDGE_3_OUT="$SMOKE_TMP_ROOT/T_EDGE_3.out"
+T_EDGE_3_ERR="$SMOKE_TMP_ROOT/T_EDGE_3.err"
+T_EDGE_3_BIN="$SMOKE_TMP_ROOT/t_edge_3-bin"
+mkdir -p "$T_EDGE_3_BIN"
+cat >"$T_EDGE_3_BIN/sudo" <<'TE3_SUDO_EOF'
+#!/usr/bin/env bash
+exit 0
+TE3_SUDO_EOF
+chmod +x "$T_EDGE_3_BIN/sudo"
+cat >"$T_EDGE_3_BIN/setpriv" <<'TE3_SP_EOF'
+#!/usr/bin/env bash
+exit 0
+TE3_SP_EOF
+chmod +x "$T_EDGE_3_BIN/setpriv"
+T_EDGE_3_HARNESS="$SMOKE_TMP_ROOT/t_edge_3_harness.py"
+{
+  printf '%s\n' "import importlib.util, os, sys"
+  printf '%s\n' "spec = importlib.util.spec_from_file_location('bcr', '$REPO_ROOT/bridge-cron-runner.py')"
+  printf '%s\n' "mod = importlib.util.module_from_spec(spec)"
+  printf '%s\n' "spec.loader.exec_module(mod)"
+  printf '%s\n' "current_uid = os.geteuid()"
+  printf '%s\n' "synthetic_uid = current_uid + 1000"
+  printf '%s\n' "execution = {'os_user': 'nobody', 'uid': synthetic_uid, 'gid': synthetic_uid}"
+  printf '%s\n' "cmd = mod.shell_command_for_execution(execution, {}, '/bin/true', [])"
+  printf '%s\n' "print('COMMAND', cmd[0])"
+} >"$T_EDGE_3_HARNESS"
+if env BRIDGE_CRON_USE_SETPRIV=1 PATH="$T_EDGE_3_BIN" "$PY_BIN" "$T_EDGE_3_HARNESS" >"$T_EDGE_3_OUT" 2>"$T_EDGE_3_ERR"; then
+  cmd0="$(awk '/^COMMAND/ { print $2 }' "$T_EDGE_3_OUT")"
+  case "$cmd0" in
+    */sudo|sudo)
+      smoke_log "T_EDGE_3: runner selects sudo when both sudo+setpriv present + flag=1 (matches preflight)"
+      ;;
+    *)
+      smoke_fail "T_EDGE_3: runner did NOT prefer sudo over setpriv: got $cmd0"
+      ;;
+  esac
+else
+  smoke_fail "T_EDGE_3 runner harness exit non-zero: $(cat "$T_EDGE_3_ERR")"
+fi
+
+# ---------------------------------------------------------------------
+# T_EDGE_4 — cache TTL flag-key. Same agent, two different flag values
+#            → two distinct cache files; toggling the flag does NOT
+#            serve the wrong-policy decision.
+# ---------------------------------------------------------------------
+rm -rf "$T_CACHE_ROOT"
+mkdir -p "$T_CACHE_ROOT"
+# Seed flag-absent + sudo-broken + setpriv-present → refuse (cache 1).
+invoke_driver "T_EDGE_4a-seed-flag-absent" "1" "$T_OS_USER" "1" "1" "0" "1" ""
+smoke_assert_file_exists "$T_CACHE_FLAG0_PATH" "T_EDGE_4a flag-0 cache present"
+# Now invoke with flag=1 + setpriv-present + sudo-broken → ALLOW (cache 0).
+invoke_driver "T_EDGE_4b-toggle-flag1" "1" "$T_OS_USER" "1" "0" "0" "1" "1"
+smoke_assert_file_exists "$T_CACHE_FLAG1_PATH" "T_EDGE_4b flag-1 cache present"
+# Verify each cache slot records its own policy outcome.
+if ! grep -qE $'^[0-9]+\t1$' "$T_CACHE_FLAG0_PATH"; then
+  smoke_fail "T_EDGE_4: flag-0 slot should still record rc=1 (refuse), got: $(cat "$T_CACHE_FLAG0_PATH")"
+fi
+if ! grep -qE $'^[0-9]+\t0$' "$T_CACHE_FLAG1_PATH"; then
+  smoke_fail "T_EDGE_4: flag-1 slot should record rc=0 (allow), got: $(cat "$T_CACHE_FLAG1_PATH")"
+fi
+smoke_log "T_EDGE_4: cache flag-key isolation works"
+
+# ---------------------------------------------------------------------
+# T_TEETH_FLAG — revert-detector: assert the helper actually GATES on
+#      BRIDGE_CRON_USE_SETPRIV (not the old name nor an ungated auto-
+#      select). If a future PR drops the gate, this test fails.
+# ---------------------------------------------------------------------
+if ! grep -E '\$\{?BRIDGE_CRON_USE_SETPRIV(:-[01])?\}?' "$CRON_LIB" >/dev/null; then
+  smoke_fail "T_TEETH_FLAG.1: lib/bridge-cron.sh must reference BRIDGE_CRON_USE_SETPRIV (opt-in flag gate)"
+fi
+if grep -E 'BRIDGE_CRON_UID_DROP_PREFLIGHT_SETPRIV_OK' "$CRON_LIB" >/dev/null; then
+  smoke_fail "T_TEETH_FLAG.2: lib/bridge-cron.sh must NOT reference the legacy BRIDGE_CRON_UID_DROP_PREFLIGHT_SETPRIV_OK name (r1 BLOCKING)"
+fi
+if ! grep -E 'BRIDGE_CRON_USE_SETPRIV' "$RUNNER_PY" >/dev/null; then
+  smoke_fail "T_TEETH_FLAG.3: bridge-cron-runner.py must gate setpriv arm on BRIDGE_CRON_USE_SETPRIV"
+fi
+
+# ---------------------------------------------------------------------
+# T_TEETH_COMMENT — comment correction: dispatch site comment block
+#      MUST say "audit-only" (NOT "admin task created").
+# ---------------------------------------------------------------------
+# Grep for the corrected comment phrasing. A future PR that re-introduces
+# the inaccurate "admin task" claim trips here.
+if grep -nE 'admin task instead of' "$DAEMON_SH" >/dev/null; then
+  smoke_fail "T_TEETH_COMMENT.1: bridge-daemon.sh comment still claims an admin task is created on refusal (R2 SHOULD-FIX regression)"
+fi
+if grep -nE 'admin task with an actionable repro' "$RUNNER_PY" >/dev/null; then
+  smoke_fail "T_TEETH_COMMENT.2: bridge-cron-runner.py comment still claims an admin task is created on refusal (R2 SHOULD-FIX regression)"
 fi
 
 # ---------------------------------------------------------------------

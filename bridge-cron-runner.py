@@ -466,10 +466,11 @@ def shell_command_for_execution(execution: dict[str, Any], env: dict[str, str], 
     # Layer 1 (PRE-FLIGHT, NEW): `bridge_cron_uid_drop_preflight` in
     # lib/bridge-cron.sh runs at the daemon dispatch site and refuses to
     # invoke the runner when an iso v2 agent's UID drop is unavailable
-    # (sudo/setpriv misconfigured). The daemon emits a
+    # (sudo/setpriv misconfigured). On refusal the daemon emits a
     # `cron_dispatch_refused reason=iso_uid_drop_unavailable` audit row
-    # AND a high-priority admin task with an actionable repro instead of
-    # producing the opaque RuntimeError traceback below.
+    # AND a `cron_human_config_drift` audit row (operator-visible via
+    # dashboard/audit grep) — NO admin task is created (audit-only),
+    # because a sudoers/setpriv repair is operator work, not admin work.
     #
     # Layer 2 (RUNNER-INTERNAL SEAL, BELOW): the RuntimeError remains as
     # the last-resort security boundary. If pre-flight is bypassed (custom
@@ -478,6 +479,14 @@ def shell_command_for_execution(execution: dict[str, Any], env: dict[str, str], 
     # rollback), this seal still prevents a silent controller-UID
     # fallthrough — which would be the iso v2 security boundary bypass.
     # DO NOT downgrade this to a warning; it is intentional fail-closed.
+    #
+    # setpriv opt-in (R2): both pre-flight AND this builder gate the setpriv
+    # arm on `BRIDGE_CRON_USE_SETPRIV=1`. The setpriv branch is dead on a
+    # standard controller-UID daemon (no CAP_SETUID/CAP_SETGID); auto-
+    # selecting it would mask a sudoers misconfig with an exec-time EPERM
+    # instead of a pre-flight refusal. With the opt-in, pre-flight and
+    # runner agree on policy: setpriv is only attempted when the operator
+    # has explicitly asserted that the host supports it.
     os_user = str(execution.get("os_user") or "")
     uid = int(execution.get("uid"))
     gid = int(execution.get("gid"))
@@ -492,9 +501,10 @@ def shell_command_for_execution(execution: dict[str, Any], env: dict[str, str], 
     sudo = shutil.which("sudo")
     if sudo and os_user:
         return [sudo, "-n", "-H", "-u", os_user, "env", "-i", *env_parts, script, *args]
-    setpriv = shutil.which("setpriv")
-    if setpriv:
-        return [setpriv, "--reuid", str(uid), "--regid", str(gid), "--init-groups", "env", "-i", *env_parts, script, *args]
+    if os.environ.get("BRIDGE_CRON_USE_SETPRIV", "0") == "1":
+        setpriv = shutil.which("setpriv")
+        if setpriv:
+            return [setpriv, "--reuid", str(uid), "--regid", str(gid), "--init-groups", "env", "-i", *env_parts, script, *args]
     raise RuntimeError("no supported UID drop helper found (sudo or setpriv)")
 
 

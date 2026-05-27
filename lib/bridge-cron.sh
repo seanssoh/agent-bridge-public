@@ -616,10 +616,20 @@ bridge_cron_uid_drop_cache_dir() {
 }
 
 # bridge_cron_uid_drop_cache_file <agent>
+#
+# Cache key includes the value of BRIDGE_CRON_USE_SETPRIV (0/1) as a suffix
+# so a flag toggle naturally invalidates the prior entry — e.g. if the
+# operator opts setpriv in (=1) after a refusal under =0, the next preflight
+# does NOT serve the stale "refuse" decision from the wrong-policy cache.
+# Each policy gets its own cache slot; both decay via the same TTL.
 bridge_cron_uid_drop_cache_file() {
   local agent="$1"
   [[ -n "$agent" ]] || return 1
-  printf '%s/%s.cache' "$(bridge_cron_uid_drop_cache_dir)" "$(bridge_cron_safe_component "$agent")"
+  local flag_suffix="0"
+  if [[ "${BRIDGE_CRON_USE_SETPRIV:-0}" == "1" ]]; then
+    flag_suffix="1"
+  fi
+  printf '%s/%s.setpriv%s.cache' "$(bridge_cron_uid_drop_cache_dir)" "$(bridge_cron_safe_component "$agent")" "$flag_suffix"
 }
 
 # bridge_cron_uid_drop_preflight <agent>
@@ -655,17 +665,34 @@ bridge_cron_uid_drop_cache_file() {
 #
 # Cache invalidation: a 0-byte / malformed / expired entry is treated as
 # absent — the helper re-probes and rewrites. The cache is NEVER consulted
-# for `force=1` (the smoke entry point uses this).
+# for `force=1` (the smoke entry point uses this). The cache file name also
+# includes the `BRIDGE_CRON_USE_SETPRIV` flag value (0/1) as a suffix so a
+# flag toggle naturally invalidates the prior decision — opting setpriv in
+# after a refusal under =0 starts at a fresh cache slot.
+#
+# setpriv opt-in (BRIDGE_CRON_USE_SETPRIV, default 0): when sudo fails AND
+# setpriv exists, pre-flight refuses unless the operator has explicitly
+# asserted `BRIDGE_CRON_USE_SETPRIV=1`. The runner (bridge-cron-runner.py
+# :492-498) gates its own setpriv branch on the same env var, so both
+# layers agree on policy. Auto-selecting setpriv would mask a sudoers
+# misconfig with an exec-time EPERM; opt-in keeps the security boundary
+# explicit. When BOTH sudo+setpriv are available and the flag is 1, sudo
+# wins (canonical iso v2 path).
 #
 # Edge cases (mirrors brief):
 #   - Non-iso agent (BRIDGE_AGENT_OS_USER empty / Linux-isolation-not-
 #     effective) → return 0 immediately; cron runs as controller UID.
 #   - macOS / non-Linux host → return 0 immediately (Linux-only iso v2).
 #   - Sudoers shape mismatch (sudo works for `id` but not `-n -H -u <user>
-#     env -i true`) → fail the probe AND fall back to setpriv check.
-#   - setpriv missing → if both sudo+setpriv fail, refuse.
+#     env -i true`) → fail the probe AND consult the setpriv fallback
+#     (which requires BRIDGE_CRON_USE_SETPRIV=1 to be eligible).
+#   - setpriv missing OR BRIDGE_CRON_USE_SETPRIV unset/0 → if sudo also
+#     fails, refuse.
+#   - Both sudo + setpriv work AND flag=1 → sudo wins (matches runner's
+#     ordering at lines 492-498).
 #   - Mixed env (one agent OK, another fails) → per-agent cache file, not
-#     global. The cache is keyed by `bridge_cron_safe_component(agent)`.
+#     global. The cache is keyed by `bridge_cron_safe_component(agent)`
+#     PLUS the flag suffix.
 #
 # Audit emission is the caller's responsibility (see dispatch site).
 bridge_cron_uid_drop_preflight() {
@@ -752,9 +779,13 @@ bridge_cron_uid_drop_preflight() {
 
   local result=1
   if [[ "$probe_rc" -eq 0 ]]; then
+    # Sudo arm OK — preferred (canonical iso v2 path). This branch wins even
+    # when setpriv is also present and BRIDGE_CRON_USE_SETPRIV=1: the runner
+    # at bridge-cron-runner.py:492-498 also prefers `sudo` over `setpriv`
+    # when both are present, so pre-flight matches that ordering exactly.
     result=0
-  elif command -v setpriv >/dev/null 2>&1; then
-    # The runner's setpriv fallback (line 478-480) does not actually require
+  elif [[ "${BRIDGE_CRON_USE_SETPRIV:-0}" == "1" ]] && command -v setpriv >/dev/null 2>&1; then
+    # The runner's setpriv fallback (line 495-497) does not actually require
     # privilege to test — `setpriv --reuid <controller_uid> --regid <gid>` to
     # the current UID/GID is a no-op if available. But we cannot probe a
     # cross-UID setpriv from the controller without root; the runner's
@@ -762,13 +793,12 @@ bridge_cron_uid_drop_preflight() {
     # running as root or with CAP_SETUID/CAP_SETGID. On a standard
     # controller-UID daemon, this branch is essentially dead — but the runner
     # keeps it for parity with hosts that run the daemon as root. We
-    # therefore treat `setpriv present` as "best-effort fallback may work";
-    # if sudo failed AND setpriv exists, we still refuse pre-flight unless
-    # we can also confirm root/CAP_SETUID. Conservative: require sudo OK OR
-    # explicit operator opt-in via BRIDGE_CRON_UID_DROP_PREFLIGHT_SETPRIV_OK=1.
-    if [[ "${BRIDGE_CRON_UID_DROP_PREFLIGHT_SETPRIV_OK:-0}" == "1" ]]; then
-      result=0
-    fi
+    # therefore treat `setpriv present + BRIDGE_CRON_USE_SETPRIV=1` as
+    # "operator-asserted best-effort fallback may work" and pass pre-flight.
+    # Without the opt-in flag, setpriv is ignored: the runner ALSO gates its
+    # setpriv arm on the same flag (kept in lockstep), so a refusal here
+    # mirrors a runtime refusal at the runner.
+    result=0
   fi
 
   # Persist cache entry (best-effort).

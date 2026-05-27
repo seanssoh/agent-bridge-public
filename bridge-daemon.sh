@@ -6539,10 +6539,15 @@ cmd_run_cron_worker() {
   if [[ "$CRON_RUN_STATE" != "success" || ! -f "$CRON_RESULT_FILE" ]]; then
     # Issue #1314 (beta5-2 Lane η, CRITICAL/security): pre-flight UID-drop
     # validation BEFORE invoking the runner. The runner's
-    # `shell_command_for_execution` RuntimeError (bridge-cron-runner.py:481)
+    # `shell_command_for_execution` RuntimeError (bridge-cron-runner.py:498)
     # is the last-resort seal; pre-flight here gives the operator an
-    # actionable `cron_dispatch_refused` audit row + admin task instead of
-    # an opaque runner-exit traceback.
+    # actionable `cron_dispatch_refused` audit row instead of an opaque
+    # runner-exit traceback. On refusal the failure-class path below sets
+    # CRON_FAILURE_CLASS=human-config so the existing followup emits a
+    # `cron_human_config_drift` audit row (dashboard-visible) and explicitly
+    # does NOT create an admin task — a sudoers/setpriv repair is operator
+    # work, not admin work. The operator investigates by grepping the audit
+    # log for `cron_human_config_drift` or `cron_dispatch_refused`.
     #
     # Scope (mirrors brief edge cases):
     #   - shell-cron only — `payload_kind=="shell"` is the only path that
@@ -6552,7 +6557,9 @@ cmd_run_cron_worker() {
     #   - iso v2 effective only — `bridge_cron_uid_drop_preflight` is a
     #     no-op (rc=0) on non-iso, non-Linux, or roster-empty agents, so
     #     non-iso shell-cron continues to dispatch normally.
-    #   - rc 0 → proceed with dispatch; rc 1 → refuse + audit + admin task.
+    #   - rc 0 → proceed with dispatch; rc 1 → refuse + audit-only
+    #     (cron_dispatch_refused + cron_human_config_drift rows, no
+    #     admin task — see comment block above).
     local preflight_rc=0
     if [[ "$CRON_PAYLOAD_KIND" == "shell" && -n "$CRON_TARGET_AGENT" ]] \
         && declare -F bridge_cron_uid_drop_preflight >/dev/null 2>&1; then
