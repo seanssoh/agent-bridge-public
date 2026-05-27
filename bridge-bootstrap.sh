@@ -317,6 +317,22 @@ payload = {
         f"Run `{sys.argv[8]}`.",
         "Let the admin agent guide the rest of the onboarding.",
     ],
+    # Issue #1263 (v0.15.0-beta4 Lane J): structured marker for the
+    # opt-in wiki-graph stack. The default on fresh installs is OFF;
+    # operators activate via `bootstrap-memory-system.sh --apply` with
+    # `BRIDGE_WIKI_GRAPH_ENABLED=1`. The activation command is published
+    # here so JSON consumers can surface it in onboarding UI.
+    "wiki_graph": {
+        "default_enabled": False,
+        "activation_command": (
+            "BRIDGE_WIKI_GRAPH_ENABLED=1 "
+            "bash $BRIDGE_HOME/bootstrap-memory-system.sh --apply"
+        ),
+        "note": (
+            "Optional — provisions the librarian dynamic agent + nine "
+            "admin-owned wiki/librarian crons. See #1263."
+        ),
+    },
 }
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY
@@ -373,3 +389,20 @@ echo "~/.claude/.credentials.json once per hour. Claude CLI only refreshes"
 echo "that file when the controller itself makes an API call, so a controller"
 echo "idle while agents run will silently propagate an expired token to every"
 echo "agent on the next sync. See #1261 / #1075 for the full failure mode."
+echo
+# Issue #1263 (v0.15.0-beta4 Lane J): wiki-graph + librarian automation
+# stack is opt-in. Fresh installs default to OFF — the operator must
+# explicitly run `bootstrap-memory-system.sh --apply` (with
+# `BRIDGE_WIKI_GRAPH_ENABLED=1` to override the fresh-install default).
+# Stderr routing for the advisory; the structured `wiki_graph` field is
+# emitted by the JSON variant above. Existing installs that already
+# have provisioning state under `state/bootstrap-memory/` are unchanged
+# — re-running `bootstrap-memory-system.sh --apply` is a no-op on a
+# converged install.
+echo "Optional — wiki-graph + librarian automation stack (default off on fresh installs):" >&2
+echo "  BRIDGE_WIKI_GRAPH_ENABLED=1 bash \"\$BRIDGE_HOME/bootstrap-memory-system.sh\" --apply" >&2
+echo
+echo "This provisions the 'librarian' dynamic agent + nine admin-owned crons" >&2
+echo "(wiki-mention-scan, wiki-hub-audit, librarian-watchdog, …) that maintain" >&2
+echo "the shared memory/ wiki. Skip if you do not want the extra CPU/disk" >&2
+echo "footprint. See #1263 for the activation tradeoff." >&2

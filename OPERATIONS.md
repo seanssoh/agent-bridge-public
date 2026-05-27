@@ -1177,6 +1177,57 @@ For an isolated agent that drifted across the v0.7 → v0.8 cut:
 If `agent-bridge migrate isolation v2` is not available (older install),
 follow the manual recovery in `KNOWN_ISSUES.md` §16.
 
+### Iso v2 agent troubleshooting
+
+Most "permission denied" / "file not found" reports against an iso v2
+agent fit into a handful of categories. Walk this checklist before
+escalating:
+
+1. **Iso UID can't read controller HOME state** (Issue #1281). The
+   controller's `~/.agent-bridge/state/active-roster.md` and
+   `HEARTBEAT.md` are root-owned mode 0640 under the v2 contract;
+   iso UIDs cannot read them by design. CLAUDE.md guides that
+   reference these paths apply to the controller, not iso agents.
+   Iso agents should use bridge CLI verbs (`agb agent list`,
+   `agb status`) instead of direct fs reads.
+
+2. **Body file at mode 0660 owned by iso UID** (Issue #1280).
+   `agent-bridge a2a send --body-file <path>` and
+   `bridge-task.sh create --body-file <path>` automatically try
+   `sudo -n -u <owner> cat <path>` when the direct read raises
+   `PermissionError`. If that fallback also fails (no sudoers
+   entry for the controller→iso UID drop, or the iso UID does not
+   own the file), the workaround is
+   `sudo chmod 0644 <path>` before retrying. The fallback is
+   logged in `state/audit.jsonl` so you can confirm whether the
+   sudo step ran.
+
+3. **Stale controller supplementary group membership**
+   (Issue #1207). When a new iso agent is created, the controller
+   needs to be added to `ab-agent-<a>` to read group-published
+   credentials. If `id <controller>` does not show the new group,
+   re-login (`exec sg ab-agent-<a> bash`) or wait for the next
+   login session.
+
+4. **Controller→iso boundary missed `bridge_iso_run`.** If a
+   custom script direct-touches an iso-owned path
+   (e.g. `cat /home/agent-bridge-<a>/.foo`) instead of going
+   through `agent-bridge iso-run --agent <a> --op read-file`,
+   the read will fail. The helper exists exactly to abstract
+   the sudo drop; bypass surfaces as the same "permission
+   denied" the operator reports.
+
+5. **Audit trail when in doubt.** Every controller→iso boundary
+   hop emits a structured row to `state/audit.jsonl`. Grep for
+   `release_notification_downgrade_skip` (Issue #1267),
+   `body_file_sudo_fallback` (Issue #1280), and the standard
+   `bridge_iso_run` ops to confirm what actually happened versus
+   what the operator thinks happened.
+
+For the developer-side rationale, see [CLAUDE.md](./CLAUDE.md) §
+"Working with isolated agents (iso v2)" and
+[docs/developer-handover.md](./docs/developer-handover.md) §3.1.
+
 ## Migrating to layout v2
 
 The v2 layout (PR-A/B/C, shipped in v0.6.19) replaces named-ACL access on

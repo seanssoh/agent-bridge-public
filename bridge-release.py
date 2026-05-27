@@ -15,6 +15,16 @@ from typing import Any
 
 
 SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+# Issue #1267 (v0.15.0-beta4 Lane J): the strict SEMVER_RE does not match
+# prerelease tags like "0.15.0-beta3" → parse_semver returns None for the
+# installed side, which made `release_record` flip `update_available=True`
+# whenever the operator was on a beta. That produced redundant "[release]
+# v0.14.4 available" downgrade prompts in the admin's inbox after every
+# beta install. SEMVER_PRERELEASE_RE captures the leading core version so
+# `release_record` can still order beta vs stable correctly: a beta of
+# the same or higher base version is treated as "not an upgrade" relative
+# to an older stable.
+SEMVER_PRERELEASE_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].+)?$")
 
 
 def now_iso() -> str:
@@ -25,6 +35,22 @@ def parse_semver(text: str | None) -> tuple[int, int, int] | None:
     if not text:
         return None
     match = SEMVER_RE.fullmatch(text.strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def parse_semver_core(text: str | None) -> tuple[int, int, int] | None:
+    """Like parse_semver but tolerates prerelease/build suffixes.
+
+    Returns the (major, minor, patch) tuple for the leading core version,
+    ignoring anything after `-` or `+`. Used by release comparison so a
+    beta install (e.g. ``0.15.0-beta3``) compares correctly against a
+    stable tag (``v0.14.4``) — the base version determines update_available.
+    """
+    if not text:
+        return None
+    match = SEMVER_PRERELEASE_RE.fullmatch(text.strip())
     if not match:
         return None
     return tuple(int(part) for part in match.groups())
@@ -98,10 +124,25 @@ def release_record(repo: str, installed_version: str, payload: dict[str, Any]) -
     installed = installed_version.strip()
     installed_tuple = parse_semver(installed)
     latest_tuple = parse_semver(version)
+    # Issue #1267: tolerate prerelease/build suffix on the installed side
+    # so a beta install (e.g. 0.15.0-beta3) compares correctly against an
+    # older stable tag (v0.14.4). When installed is a prerelease we use
+    # the core (major.minor.patch) for the comparison; treating a beta
+    # of an equal-or-newer base version as "not an upgrade" is the
+    # operator's expectation (see #1267 reproduction).
+    installed_core = parse_semver_core(installed)
     update_available = False
     if latest_tuple is not None:
-        if installed_tuple is None:
+        if installed_tuple is None and installed_core is None:
+            # Truly unparseable installed version → fall back to the
+            # legacy "always upgrade" hint so a misconfigured VERSION
+            # file does not silently swallow real releases.
             update_available = True
+        elif installed_tuple is None:
+            # Prerelease/build suffix only (no strict semver match) —
+            # compare the core. A beta of the same or higher base
+            # version is treated as already-ahead, no downgrade prompt.
+            update_available = latest_tuple > installed_core
         else:
             update_available = latest_tuple > installed_tuple
 

@@ -48,6 +48,59 @@ def die(msg: str, code: int = 1) -> "Optional[int]":
     return code
 
 
+def _sudo_read_text(path: Path) -> str | None:
+    """v0.15.0-beta4 Lane J (#1280): sudo-fallback body-file reader.
+
+    Mirrors ``bridge-queue.py:_sudo_read_body_file`` for the A2A send
+    path. When the body file is owned by an isolated UID
+    (``agent-bridge-<a>``) at mode 0660, the controller's bridge-a2a.py
+    process may hit ``PermissionError`` despite being a normal CLI
+    user. Drop to the owner via ``sudo -n -u <owner> cat`` (the
+    pre-existing controller<->iso boundary; see
+    ``lib/bridge-isolation-helpers.sh``) before surfacing the failure.
+    Returns the decoded text on success, ``None`` on any failure.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    try:
+        import pwd as _pwd
+        ent = _pwd.getpwuid(st.st_uid)
+    except (KeyError, ImportError, OSError):
+        return None
+    owner = ent.pw_name
+    prefix = os.environ.get("BRIDGE_AGENT_OS_USER_PREFIX", "agent-bridge-")
+    if not owner.startswith(prefix):
+        return None
+    try:
+        if os.geteuid() == st.st_uid:
+            return None
+    except OSError:
+        return None
+    import shutil
+    sudo_bin = shutil.which("sudo") or "/usr/bin/sudo"
+    if not Path(sudo_bin).is_file():
+        return None
+    import subprocess as _subprocess
+    try:
+        result = _subprocess.run(
+            [sudo_bin, "-n", "-u", owner, "cat", "--", str(path)],
+            stdin=_subprocess.DEVNULL,
+            stdout=_subprocess.PIPE,
+            stderr=_subprocess.PIPE,
+            timeout=10,
+        )
+    except (OSError, _subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return result.stdout.decode("utf-8", errors="replace")
+
+
 # --------------------------------------------------------------------------
 # a2a send — stage an outbound entry into the durable outbox
 # --------------------------------------------------------------------------
@@ -70,7 +123,22 @@ def cmd_send(args: argparse.Namespace) -> int:
         body_src = Path(args.body_file)
         if not body_src.is_file():
             return die(f"--body-file not found: {body_src}") or 1
-        body_text = body_src.read_text(encoding="utf-8")
+        try:
+            body_text = body_src.read_text(encoding="utf-8")
+        except PermissionError as exc:
+            # Issue #1280 (v0.15.0-beta4 Lane J): the body file may be
+            # owned by an isolated UID (``agent-bridge-<a>`` at mode
+            # 0660). Try the sudo-as-owner fallback before failing so
+            # iso agent → controller workflows (brief → a2a send)
+            # don't require a manual ``chmod 644`` on every send.
+            fallback = _sudo_read_text(body_src)
+            if fallback is None:
+                return die(
+                    f"--body-file unreadable: {body_src}: {exc} "
+                    f"(iso UID may own this file; chmod 0644 or run "
+                    f"`sudo -u <owner> cat {body_src}` to verify)"
+                ) or 1
+            body_text = fallback
     elif args.body is not None:
         body_text = args.body
     else:

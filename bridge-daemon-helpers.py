@@ -131,6 +131,56 @@ def cmd_release_alert_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release_downgrade_classify(args: argparse.Namespace) -> int:
+    """v0.15.0-beta4 Lane J (#1267).
+
+    Classify a release-monitor payload as a downgrade-skip case.
+
+    Input: the JSON envelope produced by ``bridge-release.py monitor``.
+    Output (a single tab-separated row, or empty):
+      installed_version \\t latest_version
+
+    Emits a row IFF: there is no alert AND the installed version's
+    core (major.minor.patch) is >= the latest tag's core. Empty stdout
+    otherwise. Parse errors are non-fatal and produce empty output —
+    the caller treats empty as "not a downgrade; do nothing".
+    """
+    try:
+        payload = json.loads(args.monitor_json)
+    except Exception:
+        return 0
+    alerts = payload.get("alerts") or []
+    if alerts:
+        # An alert was emitted → not a downgrade-skip case.
+        return 0
+    release = payload.get("release") or {}
+    installed = str(release.get("installed_version") or "").strip()
+    latest = str(release.get("latest_version") or "").strip()
+    if not installed or not latest:
+        return 0
+    # Reuse the prerelease-tolerant core parser from bridge-release.py.
+    # We re-implement inline here so this helper has no import-side
+    # dependency on bridge-release.py (which is the producer; importing
+    # consumer-side risks a circular load order via subprocess invocation).
+    import re as _re
+    _core_re = _re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].+)?$")
+
+    def _core(text: str) -> tuple[int, int, int] | None:
+        match = _core_re.fullmatch(text)
+        if not match:
+            return None
+        return tuple(int(part) for part in match.groups())
+
+    installed_core = _core(installed)
+    latest_core = _core(latest)
+    if installed_core is None or latest_core is None:
+        return 0
+    if installed_core >= latest_core:
+        # Downgrade or no-op case — emit the classification row.
+        print(f"{installed}\t{latest}")
+    return 0
+
+
 def cmd_backup_parse(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:1210 (process_daily_backup).
 
@@ -845,6 +895,12 @@ SUBCOMMANDS = {
         cmd_release_alert_parse,
         [("monitor_json", "JSON payload produced by bridge-release.py monitor")],
         "Single-row tabular extract of the first release alert (5 cols).",
+    ),
+    "release-downgrade-classify": (
+        cmd_release_downgrade_classify,
+        [("monitor_json", "JSON payload produced by bridge-release.py monitor")],
+        "Single-row downgrade-skip classification (installed \\t latest), "
+        "or empty when not a downgrade case (Issue #1267).",
     ),
     "backup-parse": (
         cmd_backup_parse,

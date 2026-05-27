@@ -194,6 +194,57 @@ if (( RE_JITTER == 1 )) && [[ "$MODE" != "apply" ]]; then
   exit 2
 fi
 
+# Issue #1263 (v0.15.0-beta4 Lane J): wiki-graph + librarian automation
+# stack is opt-in. The default is OFF on fresh installs; existing
+# installs that have already been provisioned (any prior
+# `report-*.json` under `$BRIDGE_STATE_ROOT/bootstrap-memory/`) stay
+# ON for back-compat. Operators can force the decision via the
+# `BRIDGE_WIKI_GRAPH_ENABLED` env var:
+#   - "1" / "true" / "yes" → run normally
+#   - "0" / "false" / "no" → skip with advisory (exit 0)
+#   - unset                → infer from state (existing report → on,
+#                            fresh install → off + advisory)
+# `--check` and `--dry-run` always proceed (they are read-only / report-
+# generating verbs that the operator needs to inspect drift), so the
+# gate only short-circuits `--apply`.
+_wgraph_enabled_env="${BRIDGE_WIKI_GRAPH_ENABLED:-}"
+_wgraph_should_skip=0
+_wgraph_skip_reason=""
+if [[ "$MODE" == "apply" ]]; then
+  case "${_wgraph_enabled_env,,}" in
+    1|true|yes|on)
+      :  # explicit opt-in, run normally
+      ;;
+    0|false|no|off)
+      _wgraph_should_skip=1
+      _wgraph_skip_reason="BRIDGE_WIKI_GRAPH_ENABLED=$_wgraph_enabled_env (operator opt-out)"
+      ;;
+    "")
+      # Infer from state. Any prior report file = previously provisioned
+      # = stay on. No prior report = fresh install = default off.
+      if compgen -G "$BRIDGE_STATE_ROOT/bootstrap-memory/report-*.json" >/dev/null 2>&1; then
+        :  # back-compat: previously provisioned install stays on
+      else
+        _wgraph_should_skip=1
+        _wgraph_skip_reason="fresh install (no prior bootstrap-memory report); wiki-graph + librarian default-off"
+      fi
+      ;;
+    *)
+      echo "bootstrap-memory: BRIDGE_WIKI_GRAPH_ENABLED must be one of 1/0/true/false/yes/no/on/off (got: $_wgraph_enabled_env)" >&2
+      exit 2
+      ;;
+  esac
+fi
+if (( _wgraph_should_skip == 1 )); then
+  # Routing: advisory to stderr (operator-visible), structured marker to
+  # stdout so JSON consumers / wrappers can detect the skip without
+  # parsing localized text. Exit 0 — this is a no-op success.
+  echo "[bootstrap-memory] wiki-graph + librarian provisioning skipped: $_wgraph_skip_reason" >&2
+  echo "[bootstrap-memory] re-run with BRIDGE_WIKI_GRAPH_ENABLED=1 to activate." >&2
+  printf 'wiki_graph_skipped=1\nwiki_graph_skip_reason=%s\n' "$_wgraph_skip_reason"
+  exit 0
+fi
+
 # Validate --backfill-history once, up-front, so a bad value fails fast
 # before any provisioning side-effects. Empty (unset) is the default; only
 # values that survive validation participate in the backfill loop.
