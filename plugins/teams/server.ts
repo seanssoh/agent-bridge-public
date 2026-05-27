@@ -1696,15 +1696,54 @@ export async function deliverMcpNotificationWithRetry(
 }
 
 /**
+ * Resolve the absolute path to `bridge-task.sh`. Mirrors the pattern in
+ * `bridge-memory.py` (BRIDGE_HOME-relative). `BRIDGE_SCRIPT_DIR` takes
+ * precedence when set (the daemon exports it on every isolated runner);
+ * otherwise we fall back to `BRIDGE_HOME` → `${HOME}/.agent-bridge`.
+ *
+ * Returns the resolved path even if the file does not exist on disk —
+ * the caller checks `existsSync` before spawning so the audit-row says
+ * `bridge_task_not_found` instead of crashing the plugin.
+ */
+function resolveBridgeTaskPath(): string {
+  const scriptDir = (process.env.BRIDGE_SCRIPT_DIR ?? '').trim()
+  if (scriptDir) {
+    return join(scriptDir, 'bridge-task.sh')
+  }
+  const bridgeHome = (process.env.BRIDGE_HOME ?? '').trim() || join(homedir(), '.agent-bridge')
+  return join(bridgeHome, 'bridge-task.sh')
+}
+
+/**
  * Emit a structured permanent-failure audit line for an MCP notification
- * that exhausted all retries. The shape is grep-friendly:
+ * that exhausted all retries, and queue an admin escalation task so the
+ * operator gets a durable, queue-tracked signal (not just a stderr line).
+ *
+ * Stderr line — operator log breadcrumb, grep-friendly:
  *
  *   teams channel: teams_mcp_notification_failed_permanent message_id=<id> chat_id=<id> attempts=<n> last_error=<text>
  *
- * The operator's daemon log scraper (and audit-since-tz consumers) keys
- * on the `teams_mcp_notification_failed_permanent` token to surface an
- * admin escalation. Stderr is the plugin's standard observability sink
- * (no separate audit transport exists in this plugin).
+ * Admin task — canonical operator signal. Created via the EXISTING
+ * `bridge-task.sh create` boundary (queue-first contract, CLAUDE.md
+ * §"Queue-First Is a Contract"). Routed to `$BRIDGE_ADMIN_AGENT_ID`
+ * with priority `high`. The task body carries the same fields as the
+ * stderr line plus a one-line operator action hint.
+ *
+ * Fallback ladder (each step writes its own stderr audit so the
+ * operator log shows WHY the queue task was skipped):
+ *
+ *   1. BRIDGE_ADMIN_AGENT_ID unset → stderr-only, audit reason
+ *      `admin_task_skipped reason=no_admin_configured`.
+ *   2. bridge-task.sh path missing → stderr-only, audit reason
+ *      `admin_task_skipped reason=bridge_task_not_found path=<resolved>`.
+ *   3. spawnSync nonzero exit → audit `admin_task_failed status=<n>
+ *      stderr=<truncated>`.
+ *   4. spawnSync throws (ENOENT, EACCES, …) → audit
+ *      `admin_task_exception err=<truncated>`.
+ *
+ * The function never throws — Teams webhook ack must not be blocked by
+ * a queue-create error. spawnSync timeout is 2000ms to bound the
+ * webhook-side latency hit (issue #1336 R2 brief edge-case #3).
  *
  * Exported for the `_smoke-mcp-retry` harness.
  */
@@ -1726,6 +1765,89 @@ export function emitMcpDeliveryFailurePermanent(
       + ` attempts=${attempts}`
       + ` last_error=${sanitizedError}\n`,
   )
+
+  // Admin task escalation — queue-first canonical operator signal.
+  const adminAgent = (process.env.BRIDGE_ADMIN_AGENT_ID ?? '').trim()
+  if (!adminAgent) {
+    process.stderr.write(
+      `teams channel: teams_mcp_perma_fail_admin_task_skipped`
+        + ` reason=no_admin_configured`
+        + ` message_id=${messageId}\n`,
+    )
+    return
+  }
+  const taskCli = resolveBridgeTaskPath()
+  if (!existsSync(taskCli)) {
+    process.stderr.write(
+      `teams channel: teams_mcp_perma_fail_admin_task_skipped`
+        + ` reason=bridge_task_not_found`
+        + ` path=${taskCli}`
+        + ` message_id=${messageId}\n`,
+    )
+    return
+  }
+  const taskTitle = `[teams-mcp-perma-fail] message ${messageId} undelivered after ${attempts} retries`
+  const taskBody = [
+    `Teams MCP notification failed permanently after ${attempts} retries.`,
+    ``,
+    `message_id: ${messageId}`,
+    `chat_id: ${chatId}`,
+    `attempts: ${attempts}`,
+    `last_error: ${sanitizedError}`,
+    ``,
+    `Operator action: inspect Teams channel + Claude session state.`,
+    `Manual re-deliver may be required. The dedup entry was preserved`,
+    `(beta5-2 Lane ζ contract) so a re-driven webhook will not re-fire.`,
+  ].join('\n')
+  try {
+    const result = spawnSync(
+      'bash',
+      [
+        taskCli,
+        'create',
+        '--to', adminAgent,
+        '--title', taskTitle,
+        '--body', taskBody,
+        '--priority', 'high',
+      ],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 2000,
+        encoding: 'utf8',
+      },
+    )
+    if (result.error) {
+      const errText = String(result.error).replace(/[\r\n]+/g, ' ').slice(0, 256)
+      process.stderr.write(
+        `teams channel: teams_mcp_perma_fail_admin_task_exception`
+          + ` err=${errText}`
+          + ` message_id=${messageId}\n`,
+      )
+      return
+    }
+    if (result.status !== 0) {
+      const stderrText = String(result.stderr ?? '').replace(/[\r\n]+/g, ' ').slice(0, 256)
+      process.stderr.write(
+        `teams channel: teams_mcp_perma_fail_admin_task_failed`
+          + ` status=${result.status}`
+          + ` stderr=${stderrText}`
+          + ` message_id=${messageId}\n`,
+      )
+      return
+    }
+    process.stderr.write(
+      `teams channel: teams_mcp_perma_fail_admin_task_created`
+        + ` admin=${adminAgent}`
+        + ` message_id=${messageId}\n`,
+    )
+  } catch (err) {
+    const errText = String(err).replace(/[\r\n]+/g, ' ').slice(0, 256)
+    process.stderr.write(
+      `teams channel: teams_mcp_perma_fail_admin_task_exception`
+        + ` err=${errText}`
+        + ` message_id=${messageId}\n`,
+    )
+  }
 }
 
 const mcp = new Server(

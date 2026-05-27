@@ -103,6 +103,29 @@ fi
 #        Asserts the entry is present so a future ci-select pass picks
 #        up regression coverage automatically.
 #
+#   T9 (codex r1 BLOCKING follow-up — admin task creation): in the
+#        all-fail variant with BRIDGE_ADMIN_AGENT_ID set, the smoke
+#        installs a PATH-shimmed bridge-task.sh that records argv. The
+#        smoke asserts: (1) the shim was invoked exactly once, (2) the
+#        argv carries `create --to <admin> --title <prefix> --body <…>
+#        --priority high`, (3) the body contains message_id / chat_id /
+#        attempts / last_error, and (4) stderr carries the
+#        `teams_mcp_perma_fail_admin_task_created` audit line. Closes
+#        the codex r1 BLOCKING gap (issue #1336 R2): the durable
+#        operator signal is a queue task, not just a stderr line.
+#
+#   T10 (edge case — admin unset): when BRIDGE_ADMIN_AGENT_ID is unset,
+#        the function MUST fall back to a `admin_task_skipped
+#        reason=no_admin_configured` stderr line WITHOUT crashing and
+#        WITHOUT spawning bridge-task.sh. Bun harness exit is 0.
+#
+#   T11 (teeth — strip catches a revert): a static-source pass strips
+#        `bridge-task.sh` / `resolveBridgeTaskPath` / the
+#        `admin_task_created` audit token from a copy of server.ts and
+#        confirms each token would trip a strict grep. Asserts the
+#        positive sanity (live source carries all three tokens) and
+#        the teeth (stripped copy has none).
+#
 # Isolation: temp BRIDGE_HOME via smoke_setup_bridge_home; the bun
 # invocation reuses plugins/teams/node_modules and exits before the
 # httpServer.listen (the `_smoke-mcp-retry` subcommand short-circuits).
@@ -202,6 +225,39 @@ run_mcp_retry_variant() {
     --chat-id "chat-smoke" --message-id "message-smoke" \
     >"$stdout_file" 2>"$stderr_file"
   printf '%s\n' "$stdout_file" "$stderr_file"
+}
+
+# Variant for T9: install a fake `bridge-task.sh` shim under a private
+# BRIDGE_HOME and invoke the smoke harness with BRIDGE_ADMIN_AGENT_ID
+# set. The shim records the argv it was called with to a sentinel file
+# the assertions read.
+run_mcp_retry_variant_with_admin_task() {
+  local variant="$1"; local admin_agent="$2"; local label="$3"
+  local stdout_file="$SMOKE_TMP_ROOT/mcp-retry.$label.stdout"
+  local stderr_file="$SMOKE_TMP_ROOT/mcp-retry.$label.stderr"
+  local shim_home="$SMOKE_TMP_ROOT/$label.bridge-home"
+  local shim_path="$shim_home/bridge-task.sh"
+  local argv_file="$SMOKE_TMP_ROOT/$label.shim-argv"
+  mkdir -p "$shim_home"
+  # PATH-shim (per brief): write a bash script that captures argv +
+  # exits 0 (success path). The shim emits a `task #<id>` line on
+  # stdout so any downstream parser sees a realistic shape.
+  cat >"$shim_path" <<'SHIM_EOF'
+#!/usr/bin/env bash
+# T9 shim — records argv so the smoke can assert the spawnSync call.
+printf '%s\n' "$@" >"$BRIDGE_TASK_SHIM_ARGV_FILE"
+printf 'task #99 created\n'
+exit 0
+SHIM_EOF
+  chmod 0755 "$shim_path"
+  TEAMS_APP_ID=smoke TEAMS_APP_PASSWORD=smoke \
+    BRIDGE_HOME="$shim_home" \
+    BRIDGE_ADMIN_AGENT_ID="$admin_agent" \
+    BRIDGE_TASK_SHIM_ARGV_FILE="$argv_file" \
+    bun "$TEAMS_SERVER" _smoke-mcp-retry --variant "$variant" \
+    --chat-id "chat-smoke" --message-id "message-smoke" \
+    >"$stdout_file" 2>"$stderr_file"
+  printf '%s\n' "$stdout_file" "$stderr_file" "$argv_file" "$shim_path"
 }
 
 json_field() {
@@ -387,6 +443,149 @@ test_t8_ci_select_registration() {
 }
 
 # ---------------------------------------------------------------------
+# T9: codex r1 BLOCKING follow-up — emitMcpDeliveryFailurePermanent
+# must create an admin escalation task via bridge-task.sh (the canonical
+# operator signal). PATH-shim bridge-task.sh records argv; the smoke
+# asserts:
+#   - shim was invoked exactly once (one task per perma-fail event)
+#   - argv: create, --to <admin>, --title <fixed prefix>, --body <…>,
+#     --priority high
+#   - body contains message_id, chat_id, attempts, last_error
+#   - stderr carries the `admin_task_created` audit line
+# ---------------------------------------------------------------------
+test_t9_admin_task_created() {
+  smoke_log "T9: emitMcpDeliveryFailurePermanent invokes bridge-task.sh create with admin escalation args"
+  local files stdout_file stderr_file argv_file
+  files="$(run_mcp_retry_variant_with_admin_task all-fail test-admin t9)"
+  stdout_file="$(printf '%s\n' "$files" | sed -n 1p)"
+  stderr_file="$(printf '%s\n' "$files" | sed -n 2p)"
+  argv_file="$(printf '%s\n' "$files" | sed -n 3p)"
+  # MCP retry result still has delivered=false (no behavioural drift).
+  smoke_assert_eq "false" "$(json_field "$stdout_file" delivered)" "T9 delivered"
+  smoke_assert_eq "3" "$(json_field "$stdout_file" attempts)" "T9 attempts"
+  # Audit row for the admin task creation MUST be on stderr.
+  if ! grep -q 'teams_mcp_perma_fail_admin_task_created' "$stderr_file"; then
+    smoke_fail "T9: stderr missing 'teams_mcp_perma_fail_admin_task_created' audit line: $(cat "$stderr_file")"
+  fi
+  # Shim argv file MUST exist (proves spawnSync actually executed the shim).
+  if [[ ! -f "$argv_file" ]]; then
+    smoke_fail "T9: bridge-task.sh shim was not invoked (argv file $argv_file missing)"
+  fi
+  # argv assertions — each argument on its own line in the shim file.
+  local argv_content
+  argv_content="$(cat "$argv_file")"
+  # NOTE: pass the search pattern via `-e --` so BSD grep (macOS) does
+  # not interpret a leading `--` argv token as a flag.
+  printf '%s\n' "$argv_content" | grep -qx -e 'create' \
+    || smoke_fail "T9: argv missing 'create': $argv_content"
+  printf '%s\n' "$argv_content" | grep -qx -e '--to' \
+    || smoke_fail "T9: argv missing '--to': $argv_content"
+  printf '%s\n' "$argv_content" | grep -qx -e 'test-admin' \
+    || smoke_fail "T9: argv missing 'test-admin' (admin agent value): $argv_content"
+  printf '%s\n' "$argv_content" | grep -qx -e '--title' \
+    || smoke_fail "T9: argv missing '--title': $argv_content"
+  printf '%s\n' "$argv_content" | grep -q -e '^\[teams-mcp-perma-fail\] message message-smoke undelivered' \
+    || smoke_fail "T9: argv title prefix wrong: $argv_content"
+  printf '%s\n' "$argv_content" | grep -qx -e '--body' \
+    || smoke_fail "T9: argv missing '--body': $argv_content"
+  printf '%s\n' "$argv_content" | grep -qx -e '--priority' \
+    || smoke_fail "T9: argv missing '--priority': $argv_content"
+  printf '%s\n' "$argv_content" | grep -qx -e 'high' \
+    || smoke_fail "T9: argv missing 'high' priority value: $argv_content"
+  # Body field assertions: body argument is the run of lines AFTER
+  # --body and BEFORE the next argv token (the body has embedded
+  # newlines because we built it with `[...].join('\n')`). The shim
+  # records each argv element on its own line via `printf '%s\n' "$@"`,
+  # which serializes the embedded `\n` as a literal newline run.
+  # We re-join everything between `--body` and the next `--priority`
+  # token. Use a fixed-string match in awk to avoid double-`--`
+  # BSD-flag tripping.
+  local body_line
+  body_line="$(awk '
+    $0=="--body" { in_body=1; next }
+    in_body && $0=="--priority" { exit }
+    in_body { print }
+  ' "$argv_file")"
+  if [[ -z "$body_line" ]]; then
+    smoke_fail "T9: --body argument empty"
+  fi
+  smoke_assert_contains "$body_line" "message-smoke" "T9 body contains message_id"
+  smoke_assert_contains "$body_line" "chat-smoke" "T9 body contains chat_id"
+  smoke_assert_contains "$body_line" "attempts: 3" "T9 body contains attempts count"
+  smoke_assert_contains "$body_line" "last_error:" "T9 body contains last_error label"
+  smoke_log "T9 PASS"
+}
+
+# ---------------------------------------------------------------------
+# T10: edge case — BRIDGE_ADMIN_AGENT_ID unset → fallback stderr line,
+# no bridge-task.sh invocation, no crash. Asserts the graceful skip path.
+# ---------------------------------------------------------------------
+test_t10_admin_unset_fallback() {
+  smoke_log "T10: BRIDGE_ADMIN_AGENT_ID unset → stderr fallback line, no task spawn, no crash"
+  local stdout_file="$SMOKE_TMP_ROOT/mcp-retry.t10.stdout"
+  local stderr_file="$SMOKE_TMP_ROOT/mcp-retry.t10.stderr"
+  # Invoke without BRIDGE_ADMIN_AGENT_ID. BRIDGE_HOME is the
+  # smoke_setup_bridge_home temp dir — no bridge-task.sh shim installed
+  # there, so the skip-no-admin branch fires before any path probe.
+  TEAMS_APP_ID=smoke TEAMS_APP_PASSWORD=smoke \
+    BRIDGE_ADMIN_AGENT_ID= \
+    bun "$TEAMS_SERVER" _smoke-mcp-retry --variant all-fail \
+    --chat-id "chat-smoke" --message-id "message-smoke" \
+    >"$stdout_file" 2>"$stderr_file"
+  local rc=$?
+  if (( rc != 0 )); then
+    smoke_fail "T10: smoke harness exited nonzero (rc=$rc) — emitMcpDeliveryFailurePermanent crashed: $(cat "$stderr_file")"
+  fi
+  smoke_assert_eq "false" "$(json_field "$stdout_file" delivered)" "T10 delivered"
+  if ! grep -q 'teams_mcp_perma_fail_admin_task_skipped reason=no_admin_configured' "$stderr_file"; then
+    smoke_fail "T10: missing 'teams_mcp_perma_fail_admin_task_skipped reason=no_admin_configured' fallback: $(cat "$stderr_file")"
+  fi
+  # MUST NOT log a `created` line when admin is unset.
+  if grep -q 'teams_mcp_perma_fail_admin_task_created' "$stderr_file"; then
+    smoke_fail "T10: leaked 'admin_task_created' line when BRIDGE_ADMIN_AGENT_ID was unset"
+  fi
+  smoke_log "T10 PASS"
+}
+
+# ---------------------------------------------------------------------
+# T11 (teeth): verify the static-source assertion catches a revert.
+# Splice a synthetic version of emitMcpDeliveryFailurePermanent that
+# OMITS the spawnSync call into a copy of server.ts, and confirm a
+# strict static grep would trip. Mirrors the T6 teeth pattern.
+# ---------------------------------------------------------------------
+test_t11_teeth_no_spawn_caught() {
+  smoke_log "T11 (teeth): reverting the spawnSync admin-task call MUST trip a static-source check"
+  local copy="$SMOKE_TMP_ROOT/server-no-spawn.ts"
+  # Build a copy that strips the bridge-task.sh spawn call from the
+  # function body. The strict check requires that the live source has
+  # BOTH the function `resolveBridgeTaskPath` AND the call site
+  # `bridge-task.sh` token + spawnSync. Removing either of those in a
+  # copy must trip the grep.
+  sed -e '/bridge-task\.sh/d' \
+      -e '/resolveBridgeTaskPath/d' \
+      -e '/teams_mcp_perma_fail_admin_task_created/d' \
+      "$TEAMS_SERVER" >"$copy"
+  # The live file must contain all three tokens (positive sanity).
+  grep -q 'bridge-task\.sh' "$TEAMS_SERVER" \
+    || smoke_fail "T11 sanity: live server.ts has no 'bridge-task.sh' reference — code regression"
+  grep -q 'resolveBridgeTaskPath' "$TEAMS_SERVER" \
+    || smoke_fail "T11 sanity: live server.ts has no resolveBridgeTaskPath helper"
+  grep -q 'teams_mcp_perma_fail_admin_task_created' "$TEAMS_SERVER" \
+    || smoke_fail "T11 sanity: live server.ts has no admin_task_created audit token"
+  # The stripped copy must trip all three checks.
+  if grep -q 'bridge-task\.sh' "$copy"; then
+    smoke_fail "T11: teeth strip incomplete — copy still has 'bridge-task.sh'"
+  fi
+  if grep -q 'resolveBridgeTaskPath' "$copy"; then
+    smoke_fail "T11: teeth strip incomplete — copy still has resolveBridgeTaskPath"
+  fi
+  if grep -q 'teams_mcp_perma_fail_admin_task_created' "$copy"; then
+    smoke_fail "T11: teeth strip incomplete — copy still has admin_task_created token"
+  fi
+  smoke_log "T11 PASS (teeth detector tripped on stripped copy)"
+}
+
+# ---------------------------------------------------------------------
 # Test runner.
 # ---------------------------------------------------------------------
 smoke_run "T1 no-forget-dedupe-line" test_t1_no_forget_dedupe_line
@@ -406,15 +605,20 @@ if (( HAS_BUN )); then
   smoke_run "T4 succeed-second" test_t4_succeed_second
   smoke_run "T5 all-fail-audit-row" test_t5_all_fail_audit_row
   smoke_run "T7 audit-row-shape" test_t7_audit_row_shape
+  smoke_run "T9 admin-task-created" test_t9_admin_task_created
+  smoke_run "T10 admin-unset-fallback" test_t10_admin_unset_fallback
 else
   smoke_skip "T3 succeed-first" "bun not on PATH"
   smoke_skip "T4 succeed-second" "bun not on PATH"
   smoke_skip "T5 all-fail-audit-row" "bun not on PATH"
   smoke_skip "T7 audit-row-shape" "bun not on PATH"
+  smoke_skip "T9 admin-task-created" "bun not on PATH"
+  smoke_skip "T10 admin-unset-fallback" "bun not on PATH"
 fi
 
 smoke_run "T6 teeth-revert-caught" test_t6_teeth_revert_caught
 smoke_run "T8 ci-select-registration" test_t8_ci_select_registration
+smoke_run "T11 teeth-no-spawn-caught" test_t11_teeth_no_spawn_caught
 
 smoke_log "beta5-2-zeta-teams-mcp-dedup: ALL TESTS PASS"
 exit 0
