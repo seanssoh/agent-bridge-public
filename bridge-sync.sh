@@ -105,6 +105,9 @@ prune_missing_dynamic_agents() {
 refresh_missing_session_ids() {
   local agent sid exclude_csv created_at detected key _resolved _rc
   local _claude_config_dir
+  # Issue #1299 (v0.15.0-beta5 Lane β): per-agent iso v2 os_user resolved
+  # per iteration so the detect helper can read 0600-jsonl via sudo-as-user.
+  local _iso_sudo_user=""
   local -a excluded
   local persisted_any=0
 
@@ -135,12 +138,18 @@ refresh_missing_session_ids() {
     # resolver returns empty for unregistered / non-isolated agents so the
     # helper keeps its daemon-HOME fallback.
     _claude_config_dir="$(bridge_resolve_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+    # Issue #1299 (v0.15.0-beta5 Lane β): pass the agent's iso v2 os_user
+    # so the detect helper can read `0600 <iso-uid>:ab-agent-<a>` jsonl
+    # files via sudo-as-user. Empty for non-isolated/unregistered agents
+    # (direct-as-controller invocation is the back-compat path).
+    _iso_sudo_user="$(bridge_resolve_agent_iso_sudo_user "$agent" 2>/dev/null || true)"
     detected="$(bridge_detect_session_id \
       "$(bridge_agent_engine "$agent")" \
       "$(bridge_agent_workdir "$agent")" \
       "$created_at" \
       "$exclude_csv" \
-      "$_claude_config_dir")"
+      "$_claude_config_dir" \
+      "$_iso_sudo_user")"
 
     if [[ -z "$detected" ]]; then
       continue

@@ -1144,6 +1144,111 @@ bridge_linux_can_sudo_to() {
   sudo -n -u "$os_user" -- "$bash_bin" -c 'exit 0' 2>/dev/null
 }
 
+# Issue #1299 (v0.15.0-beta5 Lane β): controller-side escalation to read
+# files Claude Code writes at 0600 owned by the iso UID. Mirrors
+# `bridge_linux_sudo_root` (same Linux/root short-circuit + sudo-missing
+# `bridge_die`) but targets `<os_user>` instead of root.
+#
+# Sudoers shape: `bridge_migration_sudoers_entry` whitelists `tmux` + `bash`
+# as the only sudo-invoked binaries (per-os_user). Any helper that needs to
+# run a non-whitelisted binary (e.g. `python3`) MUST wrap it in
+# `bash -c 'exec "$@"' bash <prog> <args...>` so sudo only sees `bash` on
+# its argv. Direct callers (e.g. `python3 ...`) work only when the daemon
+# runs as root OR when a per-host sudoers entry has been broadened.
+#
+# Behavior:
+#   * Non-Linux (macOS/BSD): falls through to direct invocation as the
+#     controller user — matches `bridge_linux_sudo_root` so iso-v2 path
+#     can no-op on dev hosts without surprise sudo prompts.
+#   * Linux + caller is root: drops to `sudo -u <os_user> ...` (real sudo)
+#     so the target UID is set correctly. `id -u == 0` cannot be its own
+#     short-circuit here because the goal is dropping privilege.
+#   * Linux + non-root caller: `sudo -n -u <os_user> ...`. Sudoers entry
+#     must already permit the binary or the wrap must already be a `bash`
+#     -c. Inherits stdio so the caller parses stdout directly.
+#
+# Returns the wrapped command's rc. On macOS with a non-Linux host, the
+# helper transparently dispatches without sudo so smokes that synthesize
+# iso v2 state on a dev host still exercise the surrounding code path.
+bridge_linux_sudo_as_user() {
+  local os_user="$1"
+  shift || return 2
+  [[ -n "$os_user" ]] || {
+    "$@"
+    return $?
+  }
+
+  # Non-Linux: no real iso-v2 in play, just dispatch directly. Smokes that
+  # need to assert the sudo-wrap shape MUST set BRIDGE_HOST_PLATFORM_OVERRIDE
+  # = Linux to take the real branch.
+  if [[ "$(bridge_host_platform)" != "Linux" ]]; then
+    "$@"
+    return $?
+  fi
+
+  if [[ "$(id -u)" == "0" ]]; then
+    # Already root — drop to the iso UID via sudo (no -n needed under
+    # root, but keep it for consistency / non-interactive guarantee).
+    sudo -n -u "$os_user" -- "$@"
+    return $?
+  fi
+
+  command -v sudo >/dev/null 2>&1 \
+    || bridge_die "linux-user isolation read-elevation requires sudo (target user=$os_user)"
+  sudo -n -u "$os_user" -- "$@"
+}
+
+# Issue #1299 (v0.15.0-beta5 Lane β): resolve the os_user that
+# `bridge_linux_sudo_as_user` should target so a controller-side read can
+# cross the iso v2 0600-jsonl boundary (Claude Code writes session
+# transcripts as `0600 <iso-uid>:<ab-agent-<a>>` — the group bit is unset,
+# so even a group-member controller cannot read directly).
+#
+# Returns 0 + prints the os_user on stdout when:
+#   * agent is registered
+#   * bridge_agent_linux_user_isolation_effective <agent> succeeds
+#   * an os_user is bound to that agent
+#   * the controller can actually `sudo -n -u <os_user>` (probed via
+#     bridge_linux_can_sudo_to)
+#
+# Returns 1 + prints nothing in EVERY other case. The non-effective branch
+# is the back-compat path: legacy non-iso-v2 callers / macOS hosts / smokes
+# without a real sudoers entry get the same byte-for-byte behavior they had
+# before this helper existed.
+#
+# Callers MUST short-circuit on empty stdout (e.g.
+# `[[ -n "$os_user" ]] && bridge_linux_sudo_as_user "$os_user" ...` else
+# direct dispatch) so the legacy code path is preserved when the wrap is
+# either not needed or not safe to attempt.
+bridge_resolve_agent_iso_sudo_user() {
+  local agent="$1"
+  local os_user=""
+
+  [[ -n "$agent" ]] || return 1
+
+  # Only registered + iso-v2-effective agents qualify. Unregistered
+  # callers (smoke fixtures, test harnesses) fall through to the legacy
+  # no-sudo path.
+  if command -v bridge_agent_exists >/dev/null 2>&1; then
+    bridge_agent_exists "$agent" 2>/dev/null || return 1
+  fi
+  command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+    || return 1
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+    || return 1
+
+  os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+  [[ -n "$os_user" ]] || return 1
+
+  # Final guard: only return the user when sudo actually permits the
+  # escalation. Otherwise the wrap call would silently fail and the
+  # caller's direct fallback (empty user → no wrap) is strictly better
+  # than a spurious sudo-policy stderr.
+  bridge_linux_can_sudo_to "$os_user" 2>/dev/null || return 1
+
+  printf '%s' "$os_user"
+}
+
 # Internal: non-fatal sudo presence probe. Returns 0 if the helper can
 # safely call bridge_linux_sudo_root, 1 if sudo is absent (so the helper
 # must early-return and the daemon is not killed by bridge_die).
