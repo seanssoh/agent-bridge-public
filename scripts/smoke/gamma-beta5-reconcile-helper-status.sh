@@ -760,5 +760,47 @@ fi
 
 smoke_log "T10 PASS — production helper emits 'error' for both malformed-state branches"
 
+# ─────────────────────────────────────────────────────────────────────
+# T11: check-mode regular-file parity (#1301 r2 codex BLOCKING #2).
+# A non-directory at the contract path is the same malformed-path
+# class as a symlink — both should degrade with rc=0, NOT report drift
+# with rc=1. R2 only handled the symlink case in check mode; R3 adds
+# the regular-file/exists-but-not-dir branch.
+# ─────────────────────────────────────────────────────────────────────
+
+smoke_log "T11: check-mode regular-file branch emits DEGRADED + rc=0, NOT MISSING + rc=1"
+
+# RECONCILE_LIB already defined at top via REPO_ROOT="$SMOKE_REPO_ROOT".
+
+# Pin: the "$path" non-dir branch must distinguish exists-but-not-dir
+# (DEGRADED) from genuinely-absent (MISSING). Static grep — the
+# pattern is `if [[ ! -d "$path" ]]; then` then a nested
+# `if [[ -e "$path" ]]; then ... DEGRADED ...; else ... MISSING ...`.
+if ! grep -A8 'if \[\[ ! -d "\$path" \]\]; then' "$RECONCILE_LIB" \
+      | grep -Fq 'if [[ -e "$path" ]]; then'; then
+  smoke_fail "T11: check-mode non-dir branch in $RECONCILE_LIB missing the exists-but-not-dir guard (must distinguish DEGRADED from MISSING per r3)"
+fi
+
+# Pin: the exists-but-not-dir arm emits DEGRADED, not MISSING.
+if ! grep -A12 'if \[\[ ! -d "\$path" \]\]; then' "$RECONCILE_LIB" \
+      | grep -B1 'non-directory rejected' \
+      | grep -Fq "BRIDGE_ISO_RECONCILE_STATUS_DEGRADED"; then
+  smoke_fail "T11: check-mode exists-but-not-dir arm in $RECONCILE_LIB must emit DEGRADED (codex r2 BLOCKING)"
+fi
+
+# Pin: the genuinely-absent arm still emits MISSING + rc=1.
+if ! grep -A18 'if \[\[ ! -d "\$path" \]\]; then' "$RECONCILE_LIB" \
+      | grep -B1 '"(absent)"' \
+      | grep -Fq "BRIDGE_ISO_RECONCILE_STATUS_MISSING"; then
+  smoke_fail "T11: check-mode genuinely-absent arm in $RECONCILE_LIB must still emit MISSING (drift class intact)"
+fi
+
+smoke_log "T11 PASS — check-mode distinguishes DEGRADED (non-dir present) from MISSING (absent)"
+
+# Teeth: a revert to the r2 shape (single `! -d` branch always emits
+# MISSING) loses the exists-but-not-dir guard. The previous grep above
+# would already detect that; this is the explicit teeth assertion.
+smoke_log "T11t teeth: r2-shape revert (no -e guard, always MISSING) must fail T11 (verified by construction)"
+
 smoke_log "$SMOKE_NAME — all tests PASS"
 exit 0

@@ -787,6 +787,19 @@ _bridge_iso_reconcile_row_agent_home_contract() {
       return 0
     fi
     if [[ ! -d "$path" ]]; then
+      # Distinguish genuinely-absent (drift, rc=1) from exists-but-not-dir
+      # (probe failure, rc=0). A regular file or other non-directory at the
+      # contract path is the same malformed-path class the helper-side
+      # `_bridge_linux_home_contract_emit_probe_failure "error"` handles —
+      # surfacing it as drift would re-introduce the false signal #1298 r2
+      # codex BLOCKING flagged for the apply path; check-mode must match.
+      if [[ -e "$path" ]]; then
+        _bridge_iso_reconcile_emit_row "$row_name" \
+          "$BRIDGE_ISO_RECONCILE_STATUS_DEGRADED" "$path" \
+          "$owner_resolved:$group_resolved $dir_mode" "(non-directory rejected)" \
+          "$notes (path exists but is not a directory; investigate before retry — NOT drift)"
+        return 0
+      fi
       _bridge_iso_reconcile_emit_row "$row_name" \
         "$BRIDGE_ISO_RECONCILE_STATUS_MISSING" "$path" \
         "$owner_resolved:$group_resolved $dir_mode" "(absent)" "$notes"
