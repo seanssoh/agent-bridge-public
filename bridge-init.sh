@@ -930,6 +930,21 @@ if [[ $dry_run -eq 0 ]]; then
     fi
   fi
 
+  # Issue #1312 (v0.15.0-beta5-2 Lane ε): refuse-at-startup advisory for the
+  # tmux inject spool. The runtime helper (lib/bridge-tmux.sh::
+  # bridge_tmux_spool_enabled) already refuses to honor =0 on iso v2 without
+  # the FORCE flag, but the operator only sees that warn when a nudge
+  # actually fires. Emit a clear startup-time warning so the
+  # misconfiguration is operator-visible at install/init time, not after
+  # the first dropped message. Non-iso installs and the FORCE escape hatch
+  # are silent here.
+  if command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+     && bridge_isolation_v2_active 2>/dev/null \
+     && [[ "${BRIDGE_TMUX_INJECT_SPOOL_ENABLED:-1}" != "1" ]] \
+     && [[ "${BRIDGE_TMUX_INJECT_SPOOL_DISABLE_FORCE:-0}" != "1" ]]; then
+    bridge_init_append_warning "BRIDGE_TMUX_INJECT_SPOOL_ENABLED=0 detected on iso v2 install — refused at runtime (would silently drop daemon nudges on busy agents). Unset the override or set BRIDGE_TMUX_INJECT_SPOOL_DISABLE_FORCE=1 to override (unsafe). See KNOWN_ISSUES.md §tmux_inject_dropped_spool_disabled."
+  fi
+
   # Beta20 L2 Variant 3A — install the daemon-refresh sudoers drop-in on
   # Linux server hosts so subsequent `agent create --linux-user` calls
   # can automatically refresh the daemon's supplementary groups. The

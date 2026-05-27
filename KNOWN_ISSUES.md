@@ -778,3 +778,42 @@ where the deferral can be applied at code time; this entry covers the
 operator-side action that is required regardless of how many code
 paths defer correctly, because the group set itself lives in the
 kernel process table.
+
+## 29. tmux inject spool MUST stay enabled on iso v2 (#1312 / v0.15.0-beta5-2)
+
+`BRIDGE_TMUX_INJECT_SPOOL_ENABLED=0` is silently destructive on iso v2
+installs. With the spool disabled, the daemon's busy-time dispatch path
+returns rc=1, and the caller (`bridge_dispatch_notification`) ignores
+that rc — the message never enters the queue and is never retried.
+
+This was flagged as **CRITICAL data-loss class** by the patch audit on
+2026-05-28 (issue #1312).
+
+Lane ε fix (v0.15.0-beta5-2):
+
+- `lib/bridge-tmux.sh::bridge_tmux_spool_enabled` now refuses to honor
+  `=0` on iso v2 installs. The runtime treats the spool as enabled and
+  emits a `bridge_warn` (once per process) explaining the refusal.
+- `bridge-init.sh` adds an init-time warning so the misconfiguration is
+  operator-visible at install/init time, not after the first dropped
+  message.
+- `lib/bridge-tmux.sh::bridge_tmux_send_and_submit` adds a single
+  busy→idle re-check (200ms default) before treating an inject as
+  definitely-busy, smoothing out mid-call transitions.
+- When the FORCE escape hatch is active and a busy-spool-disabled drop
+  still happens, the helper emits a
+  `tmux_inject_dropped_spool_disabled` audit row so the dropped message
+  has operator-visible evidence.
+
+Escape hatch (last-resort, unsafe):
+
+```bash
+export BRIDGE_TMUX_INJECT_SPOOL_DISABLE_FORCE=1
+export BRIDGE_TMUX_INJECT_SPOOL_ENABLED=0
+```
+
+The FORCE flag is documented as unsafe — it re-enables the data-loss
+class. Only use this for diagnostic runs in an isolated `BRIDGE_HOME`.
+
+Non-iso (legacy) installs are unaffected: `=0` remains a no-op-style
+toggle for them since the data-loss vector is iso-v2-specific.
