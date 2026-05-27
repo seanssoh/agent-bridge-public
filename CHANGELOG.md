@@ -6,6 +6,48 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.0-beta5-1] — 2026-05-28
+
+### Highlight — beta5 patch-verify hotfix (3 lanes, 3 issues)
+
+Patch's beta5 OOTB verify on `cm-prod-agentworkflow-vm01` (post v0.15.0-beta5 upgrade) surfaced 3 follow-up issues. Sean directive: ship as beta5-1 hotfix. Lane parallel dispatch, codex r1-r2 convergence per lane, ~2h wall-clock issue-file → merge. All 3 merged + 17/18 lane smokes PASS under bash 5.3.9 (G-beta4-watchdog-noise T3 pre-existing macOS umask). `-beta5-1` prerelease, tag `v0.15.0-beta5-1`, GitHub release marked **Pre-release**.
+
+Lane → PR map: 1 #1305 / 2 #1308 / 3 #1309.
+
+### Fixed — session_id detect race + empty-overwrite under per-agent session lock (#1304, Lane 1 PR #1305)
+
+beta5 Lane β PR #1300 wrapped `detect-claude-session-id.py` in iso UID sudo, but two residual bugs remained: (A) `os_user` not propagated to ALL detect call sites — some daemon ticks went through non-sudo path → `detect_empty`; (B) empty detect result silently overwrote a previously-successful persisted session_id. Patch's direct repro at cm-prod 20:08 UTC: PID 2830345 sudo-path SUCCESS (`session_id_persisted 54f1742e`); 11s later PID 2838856 non-sudo → `detect_empty` → empty value persisted → CLOBBERED 54f1742e. End state: `history.env AGENT_SESSION_ID=''`.
+
+- **Caller audit verdict**: all 3 production callers (`lib/bridge-state.sh:256` / `:3831-3837`, `bridge-sync.sh:146-152`) already thread `_iso_sudo_user`. Added `BRIDGE_TEST_TRACE_DETECT_CALLERS=1` env var to prove this on demand (stderr `[detect-trace] fn=<helper> caller=<fn> os_user=<value>`).
+- **Empty-detect guard under per-agent session lock (r2 root)**: `bridge_persist_agent_state` now wraps empty-detect guard + write under `bridge_agent_session_lock_file` (flock -w 30 + mkdir fallback for non-flock hosts). Re-read of `bridge_agent_persisted_session_id` happens INSIDE the lock. If sibling PID won the race, rehydrate in-memory map + skip persist + audit `session_id_detect_empty_persist_skipped reason=interleave_caught_under_lock`. `bridge_clear_persisted_session_id` (forget-session) shares the same lock.
+- **Explicit-clear bypass**: `BRIDGE_SKIP_EMPTY_SESSION_ID_PERSIST_GUARD=1` for `bridge_clear_agent_session_id` (forget-session / resolver rc=1).
+- Smoke: `scripts/smoke/beta5-1-session-id-detect-race.sh` T1-T8 + T_interleave_under_lock + T_lock_contention.
+
+### Fixed — dev-channel auto-accept on --no-attach daemon recovery path (#1306, Lane 2 PR #1308)
+
+After `agent-bridge upgrade --apply`, daemon auto-recovered iso v2 agents via `--no-attach`. Claude showed `--dangerously-load-development-channels` picker. `bridge-start.sh` logged "controller-side auto-accept armed" but the actual `1\r` was NEVER sent to tmux. 23-minute hang observed at cm-prod, only resolved by manual `tmux send-keys`.
+
+- **Root cause**: controller-side picker's attach/foreground gate prevented key send when no tmux client attached. Daemon `--no-attach` recovery → no client → gate blocked.
+- **`bridge-start.sh`** — direct-send branch added to `bridge_start_schedule_dev_channels_accept`. Picker auto-accept now fires on tmux-session-exists + picker-text-detected. NO attach gate. (Option A per [[feedback-root-vs-symptom-framing]] — gate removal, not timeout extension.)
+- Smoke: `scripts/smoke/dev-channel-auto-accept-no-attach.sh` T1-T4 + teeth (re-add attach gate → key NOT sent + attached-mode back-compat + non-dev-channel no-overhead).
+
+### Fixed — plugin_mcp_liveness_giveup auto-clear on agent recovery (#1307, Lane 3 PR #1309)
+
+`plugin_mcp_liveness_giveup` was sticky. After 5 restart failures, daemon stopped Teams channel wake attempts and never auto-reset when agent recovered. Cm-prod timeline: picker block (#1306) → 5 liveness restart fails → giveup → 23 min manual unblock → agent `activity_state: idle` → BUT `notify_status: miss` persisted indefinitely → Sean's Teams messages undelivered 5+ min.
+
+- **`bridge-daemon.sh`** — 6 new helpers (`bridge_agent_mcp_giveup_arm/active/ts/clear/note_activity_state`, `bridge_recheck_mcp_liveness`) + `process_mcp_liveness_giveup_recovery` tick step.
+- **Two-layer defense (r2 root)**:
+  1. Daemon main-loop reorder: `process_mcp_liveness_giveup_recovery` BEFORE `process_plugin_liveness`. Recovery emits `plugin_mcp_liveness_recovered` audit + clears giveup ledger BEFORE the existing silent-clear path can wipe it.
+  2. `bridge_clear_plugin_liveness_state_if_no_giveup` helper wraps 5 silent-clear sites — preserves giveup keys when active, lets recovery tick process them.
+- **Triggers**: (B) `activity_state` transition non-idle → idle observer (primary) + (A) `BRIDGE_MCP_LIVENESS_GIVEUP_FALLBACK_SECS` (default 300s = 5min) timer for missed transitions (defense-in-depth).
+- Smoke: `scripts/smoke/mcp-liveness-giveup-auto-clear.sh` T1-T5 + T_production_order + 2 teeth cases (guard-alone-sufficient + both-reverted-audit-missing).
+
+### Notes
+
+- **Convergence rounds**: Lane 1 r1→r2 (codex r1 BLOCKING: guard not under lock — interleaving race); Lane 2 r1 (smoke bash hardcode portability — caught BEFORE merge by codex r1); Lane 3 r1→r2 (codex r1 BLOCKING: production ordering bypass + smoke gap). Each lane required orchestrator-driven rebase at merge time (Lane 1 + Lane 2 dropped each other's cross-contamination; Lane 3 dropped Lane 1+2's).
+- **Worktree shared-stash footgun ([[feedback-worktree-stash-shared-git-dir]])** hit 4 more times this loop (Lane 2 fixer, Lane 3 R1 fixer, Lane 3 R2 fixer + orchestrator's automated python regex itself partially failed during Lane 3 rebase). Pattern is durable enough that future fixer briefs include explicit "DO NOT USE `git stash`" callout.
+- **A2A patch verify** pending. Acceptance: post-upgrade iso v2 agent reaches ready state without manual tmux intervention, session_id persists across 60s daemon-tick window, Teams messages delivered after activity_state transitions to idle.
+
 ## [0.15.0-beta5] — 2026-05-28
 
 ### Highlight — beta4 patch-verify follow-up (3 lanes, 3 issues)
