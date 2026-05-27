@@ -353,6 +353,114 @@ smoke_run "T6 orphan loop guard present" : ; {
   fi
 }
 
+# --- T6b: orphan-task transition clears stale counters ----------------
+# Codex r1 BLOCKING on PR #1340: pre-r2, the orphan branch re-used the
+# deferred state file as the one-time-emit dedup marker. That meant:
+#   (a) if the agent had prior `session_empty` deferred counters at the
+#       moment of deletion, the file already existed → the orphan audit
+#       was SKIPPED on the first orphan tick.
+#   (b) counters survived deletion. A future same-name agent recreation
+#       inherited them and could trip the escalation threshold on its
+#       first deferral.
+# r2 splits the dedup (a separate `.orphan` sibling) from the counter
+# file, and the orphan branch unconditionally clears the counter file
+# on first-orphan detect. T6b directly exercises the transition.
+#
+# Direct repro of the codex r1 finding at r2:
+#   1. Agent X has counter=5 prior to deletion.
+#   2. Run the orphan branch logic (counter clear + .orphan touch +
+#      audit emit).
+#   3. Assert: counter file gone, .orphan present, audit emitted.
+#   4. Recreate agent X (same name). One deferral. Counter must be 1,
+#      NOT 6.
+# Teeth — revert the clear-before-emit in the orphan branch (see
+# bridge_daemon_nudge_deferred_clear call) and T6b will catch the
+# regression because the recreate counter starts at 6.
+smoke_run "T6b orphan-task transition clears stale counters" : ; {
+  # --- Part A: structural check on the live loop body -----------------
+  # The orphan branch in cmd_sync_cycle MUST call
+  # bridge_daemon_nudge_deferred_clear before declaring the one-time
+  # emit "done". Without this call, a stale counter from before
+  # deletion leaks into a future same-name agent. Pin the structural
+  # invariant via a normalized-grep over the orphan-branch slice (so a
+  # future PR that removes the clear call in this branch fails T6b
+  # even before the dynamic part runs).
+  #
+  # Slice extraction: from the unique `command -v bridge_agent_exists`
+  # anchor (only one site in bridge-daemon.sh, inside the nudge fanout
+  # loop) down to the next `continue` (the orphan branch is short and
+  # self-contained).
+  orphan_slice="$(awk '
+    /command -v bridge_agent_exists/ { capture=1 }
+    capture { print }
+    capture && /^[[:space:]]*continue[[:space:]]*$/ { capture=0 }
+  ' "$REPO_ROOT/bridge-daemon.sh")"
+  if ! printf '%s' "$orphan_slice" \
+      | grep -q 'bridge_daemon_nudge_deferred_clear "\$agent"'; then
+    smoke_fail "T6b: orphan branch must call bridge_daemon_nudge_deferred_clear so stale counters don't leak to a recreated agent"
+  fi
+  if ! printf '%s' "$orphan_slice" \
+      | grep -q '\.orphan'; then
+    smoke_fail "T6b: orphan branch must use a dedicated .orphan dedup marker (separate from the deferred counter file)"
+  fi
+
+  # --- Part B: dynamic repro on the live helpers ----------------------
+  : >"$AUDIT_LOG"
+  bridge_daemon_nudge_deferred_clear "agent-t6b" >/dev/null 2>&1 || true
+
+  # Build prior deferred state (5 consecutive defers under the
+  # pre-deletion lifecycle).
+  for _ in 1 2 3 4 5; do
+    bridge_daemon_nudge_defer_and_maybe_escalate \
+      "agent-t6b" "601" session_empty "1" "601"
+  done
+
+  state_file="$(bridge_daemon_nudge_deferred_state_file agent-t6b)"
+  [[ -f "$state_file" ]] || smoke_fail "T6b pre-condition: deferred state file should exist before orphan"
+  pre_count=$(grep '^_NUDGE_DEFERRED_COUNT_601=' "$state_file" | sed 's/.*=//' | tr -d "'")
+  smoke_assert_eq 5 "$pre_count" "T6b pre-orphan counter=5"
+
+  # Pin agent as deleted (orphan) and exercise the r2 orphan-branch
+  # primitive sequence directly: clear-then-touch-then-emit. The loop
+  # body in cmd_sync_cycle is structurally covered by Part A above.
+  _SMOKE_AGENT_EXISTS[agent-t6b]=0
+  : >"$AUDIT_LOG"
+  orphan_marker="${state_file}.orphan"
+  rm -f "$orphan_marker" >/dev/null 2>&1 || true
+
+  if [[ ! -f "$orphan_marker" ]]; then
+    bridge_daemon_nudge_deferred_clear "agent-t6b" >/dev/null 2>&1 || true
+    : >"$orphan_marker"
+    bridge_audit_log daemon nudge_deferred "agent-t6b" \
+      --detail reason=orphan_task \
+      --detail task_id=601 \
+      --detail consecutive=1 \
+      --detail queued=1 \
+      --detail nudge_key="601"
+  fi
+
+  [[ ! -f "$state_file" ]] || smoke_fail "T6b orphan branch must remove deferred counter file"
+  [[ -f "$orphan_marker" ]] || smoke_fail "T6b orphan branch must touch .orphan dedup marker"
+
+  audit_rows=$(audit_count nudge_deferred "agent-t6b")
+  smoke_assert_eq 1 "$audit_rows" "T6b orphan audit emitted exactly once"
+  reason=$(audit_latest_detail nudge_deferred "agent-t6b" reason)
+  smoke_assert_eq orphan_task "$reason" "T6b reason=orphan_task"
+
+  # Simulate same-name agent recreation. The successful-recovery path
+  # is bridge_daemon_nudge_deferred_clear (called from
+  # nudge_agent_session). That also drops the .orphan marker so a
+  # future delete cycle re-emits.
+  bridge_daemon_nudge_deferred_clear "agent-t6b" >/dev/null 2>&1 || true
+  [[ ! -f "$orphan_marker" ]] || smoke_fail "T6b clear() on recovery must remove .orphan marker"
+
+  _SMOKE_AGENT_EXISTS[agent-t6b]=1
+  bridge_daemon_nudge_defer_and_maybe_escalate \
+    "agent-t6b" "601" session_empty "1" "601"
+  post_count=$(grep '^_NUDGE_DEFERRED_COUNT_601=' "$state_file" | sed 's/.*=//' | tr -d "'")
+  smoke_assert_eq 1 "$post_count" "T6b recreated agent counter=1 (NOT inherited 6)"
+}
+
 # --- T7: per-task counter isolation -----------------------------------
 smoke_run "T7 per-task counter isolation" : ; {
   : >"$AUDIT_LOG"

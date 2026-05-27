@@ -4333,6 +4333,12 @@ bridge_daemon_nudge_deferred_clear() {
   local agent="$1"
   local file
   file="$(bridge_daemon_nudge_deferred_state_file "$agent")"
+  # r2 (PR #1340): also clear the `.orphan` one-time-emit dedup marker
+  # used by the orphan-task branch of the nudge fanout loop. Otherwise a
+  # same-name agent recreated after a deletion-and-orphan-emit cycle
+  # would never re-emit on a subsequent delete, even after the
+  # operator-visible recovery via a successful nudge. Always best-effort.
+  rm -f "${file}.orphan" >/dev/null 2>&1 || true
   [[ -f "$file" ]] || return 0
   rm -f "$file" >/dev/null 2>&1 || true
   # Also drop the in-scope mangled vars so a subsequent load on the same
@@ -8260,14 +8266,28 @@ cmd_sync_cycle() {
     fi
     if command -v bridge_agent_exists >/dev/null 2>&1 \
         && ! bridge_agent_exists "$agent" 2>/dev/null; then
-      # Orphan task. Best-effort one-time audit per (orphan agent)
-      # via the deferred state file's existence as the dedup marker:
-      # if no state file exists yet, emit; if it does, the prior
-      # emit already happened. Always-clear at the end keeps a stale
-      # state file from persisting after the operator reassigns.
+      # Orphan task. Codex r1 BLOCKING (PR #1340 r2): the pre-r2
+      # implementation re-used the deferred state file's existence as
+      # the orphan-emit dedup marker. That conflated two concerns and
+      # both broke: if the agent had accumulated `session_empty`
+      # counters/escalation markers prior to deletion the file already
+      # existed → the orphan audit was SKIPPED, AND the stale counters
+      # leaked into a future same-name agent recreation (where they
+      # could spuriously trip the escalation threshold on the first
+      # deferral). r2 splits the two responsibilities:
+      #   - `.orphan` sibling marker = one-time-emit dedup
+      #   - the counter file is cleared on first-orphan detect so a
+      #     same-name recreation always starts at zero.
+      # Recovery via a successful nudge calls
+      # bridge_daemon_nudge_deferred_clear which now also removes the
+      # `.orphan` marker — so a future delete-orphan cycle for the same
+      # name will re-emit cleanly.
       local _ngd_orphan_marker
-      _ngd_orphan_marker="$(bridge_daemon_nudge_deferred_state_file "$agent")"
+      _ngd_orphan_marker="$(bridge_daemon_nudge_deferred_state_file "$agent").orphan"
       if [[ ! -f "$_ngd_orphan_marker" ]]; then
+        # First-orphan-detect for this (agent, lifecycle): wipe stale
+        # counter state, set the dedup marker, emit the audit + warn.
+        bridge_daemon_nudge_deferred_clear "$agent" >/dev/null 2>&1 || true
         : >"$_ngd_orphan_marker" 2>/dev/null || true
         bridge_audit_log daemon nudge_deferred "$agent" \
           --detail reason=orphan_task \
