@@ -1594,6 +1594,140 @@ function logDuplicateDrop(chatId: string, messageId: string): void {
   duplicateDropLogs += 1
 }
 
+// Issue #1313 (CRITICAL data-loss): the prior catch block called
+// `recentMessageIds.forget(dedupeKey(...))` on mcp.notification failure and
+// re-threw. The intent was "let Teams retry the webhook", but the side
+// effect was:
+//   1. dedup state for the in-flight message is dropped,
+//   2. Teams retries the webhook,
+//   3. the retry passes the in-memory dedup check (now empty) and the
+//      log-replay dedup (no row yet — appendMessage runs *after* the
+//      MCP notification),
+//   4. MCP notification is attempted again. If MCP is still degraded,
+//      the same failure repeats and Claude never receives the message.
+//   5. Worse: a transient MCP hiccup that recovers between Teams retries
+//      can yield N notifications for the same message (the "log silently
+//      lost" symptom from the patch C7 audit).
+//
+// Fix (Option 1 — internal retry, dedup-preserving):
+//   - Try the MCP notification up to MCP_NOTIFICATION_MAX_ATTEMPTS times
+//     with exponential backoff (base MCP_NOTIFICATION_BACKOFF_MS, doubling
+//     per attempt, jitter-free for predictability under smoke harness).
+//   - If a retry succeeds, behaviour is identical to a first-try success.
+//   - If all attempts fail, emit a structured audit line to stderr
+//     (teams_mcp_notification_failed_permanent) so the operator's daemon
+//     log scraper can escalate to an admin task. Then SWALLOW the error:
+//     returning 2xx to Teams stops Bot Framework from re-driving the same
+//     webhook against a degraded MCP transport (which would loop with no
+//     net progress). The dedup entry is preserved on every code path so
+//     a Teams retry that does sneak through is dropped cleanly.
+//
+// Edge cases (per #1313 brief):
+//   - Genuine new message vs Teams retry: dedupeKey() composes chat_id +
+//     message_id + revision (line 1587). A genuine new message has a new
+//     message_id or bumped revision, so it gets a fresh entry. A retry of
+//     the same activity collides on the same key — dropped at the seen()
+//     check above the try block.
+//   - Race (two concurrent inbound webhooks for the same activity.id):
+//     recentMessageIds.seen() is a Set+Queue Set.has check; the first
+//     caller wins, the second sees true and drops. No double-deliver.
+//   - MCP recovers mid-retry: attempt 2 succeeds → audit row not emitted,
+//     dedup stays, normal success path resumes.
+//   - Claude Code restart between Teams send + MCP retry: the StdioServer
+//     transport will fail every attempt; the audit row records the
+//     permanent failure. dedup stays — once Claude reconnects the next
+//     fresh Teams message flows through, no replay of the lost message
+//     (that's a separate persistence concern, tracked in the issue body).
+//   - Perma-down (MCP transport gone): all attempts fail → one audit row
+//     per failed message; Teams stops retrying (we return 2xx); admin
+//     sees the audit lines accumulate.
+//
+// The helper is exported for the `_smoke-mcp-retry` harness so the smoke
+// can exercise the retry-and-give-up shape without spinning up a real
+// MCP transport.
+const MCP_NOTIFICATION_MAX_ATTEMPTS = 3
+const MCP_NOTIFICATION_BACKOFF_MS = 100
+
+export type DeliverNotificationResult = {
+  delivered: boolean
+  attempts: number
+  errors: string[]
+}
+
+/**
+ * Deliver an MCP notification with bounded retry-and-backoff.
+ *
+ * @param send    closure that performs the actual `mcp.notification(...)`
+ *                call. Returns void on success, throws on failure.
+ * @param sleep   injectable async sleep — tests pass a no-op so the
+ *                harness completes in ms instead of seconds.
+ * @param opts    override the default attempt count / backoff base.
+ *
+ * Contract: `delivered: true` means at least one attempt resolved with
+ * no thrown error. `delivered: false` means every attempt threw; the
+ * caller is responsible for the perma-fail audit + swallow decision.
+ * The function never throws.
+ */
+export async function deliverMcpNotificationWithRetry(
+  send: () => Promise<void>,
+  sleep: (ms: number) => Promise<void> = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  opts: { maxAttempts?: number; backoffMs?: number } = {},
+): Promise<DeliverNotificationResult> {
+  const maxAttempts = Number.isFinite(opts.maxAttempts) && (opts.maxAttempts ?? 0) > 0
+    ? Math.floor(opts.maxAttempts ?? 0)
+    : MCP_NOTIFICATION_MAX_ATTEMPTS
+  const backoffMs = Number.isFinite(opts.backoffMs) && (opts.backoffMs ?? -1) >= 0
+    ? Math.floor(opts.backoffMs ?? 0)
+    : MCP_NOTIFICATION_BACKOFF_MS
+  const errors: string[] = []
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await send()
+      return { delivered: true, attempts: attempt, errors }
+    } catch (err) {
+      errors.push(String(err))
+      if (attempt < maxAttempts) {
+        // Exponential backoff: attempt 1 → backoffMs, 2 → 2*backoffMs, …
+        await sleep(backoffMs * Math.pow(2, attempt - 1))
+      }
+    }
+  }
+  return { delivered: false, attempts: maxAttempts, errors }
+}
+
+/**
+ * Emit a structured permanent-failure audit line for an MCP notification
+ * that exhausted all retries. The shape is grep-friendly:
+ *
+ *   teams channel: teams_mcp_notification_failed_permanent message_id=<id> chat_id=<id> attempts=<n> last_error=<text>
+ *
+ * The operator's daemon log scraper (and audit-since-tz consumers) keys
+ * on the `teams_mcp_notification_failed_permanent` token to surface an
+ * admin escalation. Stderr is the plugin's standard observability sink
+ * (no separate audit transport exists in this plugin).
+ *
+ * Exported for the `_smoke-mcp-retry` harness.
+ */
+export function emitMcpDeliveryFailurePermanent(
+  chatId: string,
+  messageId: string,
+  attempts: number,
+  errors: string[],
+): void {
+  const lastError = errors.length > 0 ? errors[errors.length - 1] : ''
+  // One-liner: keep grep-greppable; collapse newlines in the error to
+  // keep the audit row on a single line (downstream log parsers split
+  // on `\n`).
+  const sanitizedError = String(lastError).replace(/[\r\n]+/g, ' ').slice(0, 512)
+  process.stderr.write(
+    `teams channel: teams_mcp_notification_failed_permanent`
+      + ` message_id=${messageId}`
+      + ` chat_id=${chatId}`
+      + ` attempts=${attempts}`
+      + ` last_error=${sanitizedError}\n`,
+  )
+}
+
 const mcp = new Server(
   { name: 'teams', version: '0.1.0' },
   {
@@ -1994,31 +2128,48 @@ async function handleActivity(context: TurnContext): Promise<void> {
     ...(revision ? { revision } : {}),
     ...(attachments.length > 0 ? { attachments } : {}),
   }
-  // Channel delivery and local log append are split: a delivery failure must
-  // surface as a non-2xx so Teams retries, but a successful delivery followed
-  // by a failed log append (disk full, EACCES, …) should NOT cause Teams to
-  // retry — the message is already in the active Claude session. The only
-  // observable consequence of a log-append failure is that fetch_messages
-  // can't replay this entry from the local audit log.
+  // Channel delivery and local log append are split:
+  //
+  //   1. MCP delivery: bounded retry-with-backoff inside
+  //      deliverMcpNotificationWithRetry (issue #1313 — Lane ζ). The
+  //      dedup entry is preserved on every outcome so a Teams webhook
+  //      retry that races us is dropped at the seen() check above. On
+  //      permanent failure we emit the audit row + swallow (no throw)
+  //      so Bot Framework stops re-driving the same activity against a
+  //      degraded MCP transport (which would loop with no net progress
+  //      and previously cost the message entirely once dedup got
+  //      forgotten on the first failure).
+  //   2. Local log append: best-effort after a confirmed MCP delivery.
+  //      A failed log append (disk full, EACCES, …) only means
+  //      fetch_messages can't replay this entry from the local audit
+  //      log — the message is already in the active Claude session.
   //
   // Inbound messages are delivered exclusively via the MCP channel
   // notification (issue #1204): the prior bridge-queue delivery workaround
   // was removed because it silently dropped messages when BRIDGE_AGENT_ID
   // was unset in the plugin's environment, masking the very bug it claimed
-  // to work around. A channel-delivery failure is re-thrown so Teams
-  // retries the webhook.
-  try {
-    await mcp.notification({
+  // to work around.
+  const deliverResult = await deliverMcpNotificationWithRetry(
+    () => mcp.notification({
       method: 'notifications/claude/channel',
       params: {
         content: text || (attachments.length > 0 ? '(attachment)' : ''),
         meta: buildChannelNotificationMeta(activity, stored, attachments),
       },
-    })
-  } catch (err) {
-    process.stderr.write(`teams channel: failed to deliver inbound message_id=${messageId} via channel: ${err}\n`)
-    recentMessageIds.forget(dedupeKey(chatId, messageId, revision))
-    throw err
+    }),
+  )
+  if (!deliverResult.delivered) {
+    // All retries exhausted. Emit the structured permanent-failure
+    // audit row so the operator's log scraper escalates to an admin
+    // task, then swallow the error: returning 2xx to Teams stops Bot
+    // Framework from re-driving the same activity webhook against a
+    // degraded MCP transport. The dedup entry stays, so any in-flight
+    // Teams retry that races us is dropped at the seen() check above.
+    for (const errText of deliverResult.errors) {
+      process.stderr.write(`teams channel: failed to deliver inbound message_id=${messageId} via channel: ${errText}\n`)
+    }
+    emitMcpDeliveryFailurePermanent(chatId, messageId, deliverResult.attempts, deliverResult.errors)
+    return
   }
 
   try {
@@ -2247,14 +2398,18 @@ if (CLI_SUBCOMMAND === 'send-managed') {
   process.exit(code)
 }
 
-// Internal smoke harness — exercised only by tests/precompact-notify/teams-mattermost-adapter.sh.
+// Internal smoke harness — exercised only by tests/precompact-notify/teams-mattermost-adapter.sh
+// and scripts/smoke/zeta-beta5-2-teams-mcp-dedup.sh.
 // `_smoke-record-activity` invokes writeTeamsActivityIndex directly so the
 // smoke can validate the activity-index file schema without spinning up a
 // full Bot Framework adapter. `_smoke-should-record` reports whether a
 // synthesized activity would be skipped by the bot-self filter.
 // `_smoke-channel-meta` asserts the direct Claude channel notification uses
-// scalar metadata, not the richer bridge queue payload. All smoke commands
-// short-circuit before httpServer.listen.
+// scalar metadata, not the richer bridge queue payload.
+// `_smoke-mcp-retry` exercises deliverMcpNotificationWithRetry +
+// emitMcpDeliveryFailurePermanent (issue #1313) without standing up a
+// real MCP transport. All smoke commands short-circuit before
+// httpServer.listen.
 if (CLI_SUBCOMMAND === '_smoke-shim') {
   // L1 beta19 (codex r1 design 2026-05-25): exercise createExpressResponseShim
   // with a fake http.ServerResponse that has writeHead/end but no
@@ -2344,6 +2499,81 @@ if (CLI_SUBCOMMAND === '_smoke-shim') {
     bodyString: body === undefined || body === null ? '' : String(body),
   }
   process.stdout.write(JSON.stringify(result) + '\n')
+  process.exit(0)
+}
+
+if (CLI_SUBCOMMAND === '_smoke-mcp-retry') {
+  // Issue #1313 Lane ζ (#1313): exercise deliverMcpNotificationWithRetry
+  // + emitMcpDeliveryFailurePermanent without standing up a real MCP
+  // transport. Variants:
+  //
+  //   succeed-first  — send() resolves on attempt 1.
+  //   succeed-second — send() throws on attempt 1, resolves on attempt 2
+  //                    (MCP recovers mid-retry).
+  //   all-fail       — send() throws on every attempt (perma-down).
+  //   custom         — read --attempts (N total) and --fail-until (1-based
+  //                    attempt index, exclusive — every attempt < this
+  //                    index throws; the attempt at this index resolves).
+  //                    Set --fail-until 99 with --attempts 3 for "all fail".
+  //
+  // Output is a single JSON line on stdout consumed by the smoke harness.
+  // The audit-emit helper is invoked when delivered=false so the smoke
+  // can grep the captured stderr for the structured token.
+  const argv = process.argv.slice(3)
+  const flags: Record<string, string> = {}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (!arg.startsWith('--')) continue
+    const key = arg.slice(2)
+    const value = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : ''
+    if (value) i++
+    flags[key] = value
+  }
+  const variant = String(flags['variant'] ?? 'succeed-first').trim()
+  let maxAttempts: number
+  let failUntil: number
+  if (variant === 'succeed-first') {
+    maxAttempts = 3
+    failUntil = 1
+  } else if (variant === 'succeed-second') {
+    maxAttempts = 3
+    failUntil = 2
+  } else if (variant === 'all-fail') {
+    maxAttempts = 3
+    failUntil = 99
+  } else if (variant === 'custom') {
+    maxAttempts = Number(flags['attempts'] ?? '3')
+    failUntil = Number(flags['fail-until'] ?? '99')
+  } else {
+    process.stderr.write(`teams _smoke-mcp-retry: unknown variant '${variant}'\n`)
+    process.exit(2)
+  }
+  let calls = 0
+  const send = async (): Promise<void> => {
+    calls += 1
+    if (calls < failUntil) {
+      throw new Error(`smoke-injected-failure attempt=${calls}`)
+    }
+  }
+  const sleepCalls: number[] = []
+  const fakeSleep = async (ms: number): Promise<void> => {
+    sleepCalls.push(ms)
+    // No real wait — smoke completes in milliseconds.
+  }
+  const chatId = String(flags['chat-id'] ?? 'chat-smoke').trim()
+  const messageId = String(flags['message-id'] ?? 'message-smoke').trim()
+  const result = await deliverMcpNotificationWithRetry(send, fakeSleep, { maxAttempts, backoffMs: 100 })
+  if (!result.delivered) {
+    emitMcpDeliveryFailurePermanent(chatId, messageId, result.attempts, result.errors)
+  }
+  process.stdout.write(JSON.stringify({
+    variant,
+    delivered: result.delivered,
+    attempts: result.attempts,
+    errorsCount: result.errors.length,
+    sleepCount: sleepCalls.length,
+    sleepCalls,
+  }) + '\n')
   process.exit(0)
 }
 
