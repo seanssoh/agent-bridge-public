@@ -173,6 +173,29 @@ probe_sudo_self_refresh() {
     return 1
   fi
 
+  # Codex r1 BLOCKING #2 (v0.15.0-beta4 Lane F r2, 2026-05-27): probe
+  # the ExecStart command too. The r1 probe asked sudo whether the user
+  # could run `bridge-daemon.sh restart --force --internal-reason=group-refresh`
+  # but the rendered systemd unit's ExecStart at line ~225 is
+  # `... bridge-daemon.sh run`. A partial sudoers file that authorizes
+  # the `restart` command but NOT the `run` command would pass this
+  # probe, cause sudo-self ExecStart to be written, and then fail
+  # IMMEDIATELY at the first systemd unit start when sudo refuses the
+  # bare `run` invocation. Operator-visible symptom on a partial
+  # sudoers install: the unit ships as sudo-self, the operator
+  # message claims success, but the daemon never reaches `bridge_daemon_self_check`
+  # because sudo blocked the ExecStart subprocess.
+  #
+  # Fix: confirm BOTH `restart` AND `run` are authorized; either gap
+  # falls back to legacy direct-bash ExecStart so the operator gets
+  # the documented [warn] message at line ~248 instead of a silently-
+  # broken unit.
+  local run_cmd="${bash} ${bridge_home}/bridge-daemon.sh run"
+  # shellcheck disable=SC2086  # intentional command-as-args expansion
+  if ! sudo -n -ln $run_cmd >/dev/null 2>&1; then
+    return 1
+  fi
+
   # Defense-in-depth: confirm sudo actually executes a child as the
   # named user (PAM refresh probe). Catches edge cases where the
   # policy is listed but the underlying mechanism is broken

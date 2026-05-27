@@ -521,6 +521,55 @@ def cmd_sync_status_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync_aliveness_parse(args: argparse.Namespace) -> int:
+    """Codex r1 BLOCKING #1 (v0.15.0-beta4 Lane F r2, 2026-05-27).
+
+    Extracts per-agent ``aliveness`` + ``remaining_ms`` from a
+    bridge-auth.sh claude-token sync --json envelope. The wrapper now
+    produces ``agents: [{agent, aliveness, remaining_ms}, ...]`` instead
+    of a flat list of names, so the daemon's periodic-sync tick
+    (bridge-daemon.sh process_claude_token_periodic_sync_tick) can audit
+    each row's token freshness.
+
+    Output shape: one tab-separated row per agent, ``agent\\taliveness
+    \\tremaining_ms``. Empty stdout means no agents synced (skipped /
+    no_matching_claude_agents / failed-everything). Parse errors print
+    nothing — bash callsite treats that as "no rows to audit".
+
+    Backward-compat: tolerates the legacy list[str] shape (``agents``
+    being a list of names) by emitting ``agent\\t\\t0`` for each entry,
+    so a hybrid wrapper/daemon during rollout never crashes.
+    """
+    try:
+        payload = json.loads(args.sync_json)
+    except Exception:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    agents = payload.get("agents") or []
+    if not isinstance(agents, list):
+        return 0
+    for row in agents:
+        if isinstance(row, dict):
+            name = str(row.get("agent", "") or "")
+            aliveness = str(row.get("aliveness", "") or "")
+            try:
+                remaining_ms = int(row.get("remaining_ms", 0) or 0)
+            except (TypeError, ValueError):
+                remaining_ms = 0
+        elif isinstance(row, str):
+            # Legacy list[str] shape — name only, no aliveness signal.
+            name = row
+            aliveness = ""
+            remaining_ms = 0
+        else:
+            continue
+        if not name:
+            continue
+        print(f"{name}\t{aliveness}\t{remaining_ms}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI plumbing.
 # ---------------------------------------------------------------------------
@@ -614,6 +663,11 @@ SUBCOMMANDS = {
         cmd_sync_status_parse,
         [("sync_json", "JSON envelope from bridge-auth.sh claude-token sync --json")],
         "Single line — sync status string ('error' on parse failure).",
+    ),
+    "sync-aliveness-parse": (
+        cmd_sync_aliveness_parse,
+        [("sync_json", "JSON envelope from bridge-auth.sh claude-token sync --json")],
+        "Per-agent aliveness/remaining_ms (3 tab-separated cols / row). Empty on parse failure.",
     ),
 }
 

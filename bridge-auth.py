@@ -1131,18 +1131,26 @@ def controller_credentials_aliveness(
 ) -> tuple[str, int]:
     """Return ``(status, remaining_ms)`` for the controller token.
 
-    Status values:
-      - ``"alive"``           — ``expiresAt`` is in the future by at least
+    Status values (codex r1 SHOULD-FIX 2026-05-27: standardized to
+    underscore-JSON-friendly tokens — the previous ``alive`` / ``near-expiry``
+    / ``no-expires-at`` shape was a mix of literals that did not round-trip
+    cleanly through structured consumers and disagreed with the lane brief.
+    The new tokens use underscores so JSON callers + jq pipelines can name
+    fields without quoting; ``fresh`` is also semantically clearer than
+    ``alive`` for a credential whose state is "valid AND has comfortable
+    headroom"):
+
+      - ``"fresh"``           — ``expiresAt`` is in the future by at least
                                 ``_controller_credentials_min_ttl_ms()``.
                                 Propagation is safe.
       - ``"expired"``         — ``expiresAt`` is at or before ``now_ms``.
                                 The token will 401 the moment any agent
                                 tries to use it.
-      - ``"near-expiry"``     — ``expiresAt`` is in the future but within
+      - ``"near_expiry"``     — ``expiresAt`` is in the future but within
                                 the minimum-TTL window. Propagating it is
                                 a single-point-of-failure: agents will all
                                 401 within the remaining lifetime.
-      - ``"no-expires-at"``   — payload lacks an ``expiresAt`` field. We
+      - ``"no_expires_at"``   — payload lacks an ``expiresAt`` field. We
                                 cannot prove aliveness, so we defer to
                                 the caller's policy (currently: propagate
                                 with a warning — Claude CLI's own format
@@ -1162,20 +1170,20 @@ def controller_credentials_aliveness(
         now_ms = int(time.time() * 1000)
     oauth = payload.get("claudeAiOauth")
     if not isinstance(oauth, dict):
-        return ("no-expires-at", 0)
+        return ("no_expires_at", 0)
     expires_raw = oauth.get("expiresAt")
     if expires_raw is None:
-        return ("no-expires-at", 0)
+        return ("no_expires_at", 0)
     try:
         expires_at_ms = int(expires_raw)
     except (TypeError, ValueError):
-        return ("no-expires-at", 0)
+        return ("no_expires_at", 0)
     remaining_ms = expires_at_ms - now_ms
     if remaining_ms <= 0:
         return ("expired", remaining_ms)
     if remaining_ms < _controller_credentials_min_ttl_ms():
-        return ("near-expiry", remaining_ms)
-    return ("alive", remaining_ms)
+        return ("near_expiry", remaining_ms)
+    return ("fresh", remaining_ms)
 
 
 def read_controller_claude_credentials_payload(path: Path) -> dict[str, Any]:
@@ -1495,14 +1503,14 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
                     "add --id <id> --stdin --activate --sync --agents all "
                     "--enable-auto-rotate` to avoid the lazy-refresh dependency."
                 )
-            # near-expiry / no-expires-at: emit a structured warning to
+            # near_expiry / no_expires_at: emit a structured warning to
             # stderr so the audit row at the daemon side records the
             # near-expiry signal alongside the sync_status. We still
             # propagate (the token is technically valid right now) but
             # the operator gets a loud heads-up. JSON callers see the
             # warning on stderr; the JSON payload below carries the
             # ``aliveness`` field so structured consumers can branch.
-            if aliveness in ("near-expiry", "no-expires-at"):
+            if aliveness in ("near_expiry", "no_expires_at"):
                 ttl_min = _controller_credentials_min_ttl_ms() // 60000
                 print(
                     f"warning: controller token {aliveness} "

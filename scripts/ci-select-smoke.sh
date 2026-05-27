@@ -1188,6 +1188,41 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
+    bridge-auth.py|bridge-auth.sh)
+      # v0.15.0-beta4 Lane F r2 — codex r1 BLOCKING #3 (2026-05-27).
+      # bridge-auth.py and bridge-auth.sh are the canonical sites for
+      # the controller-credentials aliveness gate (#1261), the
+      # per-agent aliveness propagation through the wrapper, and the
+      # token-schema (fresh / near_expiry / expired / no_expires_at).
+      # The F-beta4-oauth-bootstrap smoke pins:
+      #
+      #   - controller_credentials_aliveness pure-Python classification
+      #     across all four states (T1).
+      #   - cmd_sync_agent refuses to propagate an expired credential
+      #     (T7) — the writer-side teeth that protects every periodic
+      #     sync from distributing a stale token.
+      #   - wrapper JSON carries per-agent aliveness/remaining_ms (T10)
+      #     so daemon-side auditing can branch.
+      #
+      # daemon-periodic-token-sync covers the bridge-daemon.sh tick
+      # that consumes the wrapper output and writes the
+      # controller_credentials_aliveness audit row + near_expiry
+      # daemon_warn line.
+      add_required F-beta4-oauth-bootstrap daemon-periodic-token-sync
+      add_integration integration-minimal
+      ;;
+
+    bridge-daemon-helpers.py)
+      # v0.15.0-beta4 Lane F r2 — codex r1 BLOCKING #3.
+      # bridge-daemon-helpers.py now hosts ``sync-aliveness-parse``
+      # alongside the existing ``sync-status-parse`` subcommand. The
+      # F-beta4 smoke + daemon periodic-sync smoke both exercise the
+      # parser; pull both whenever the helper moves so a future PR
+      # cannot regress either contract.
+      add_required F-beta4-oauth-bootstrap daemon-periodic-token-sync daemon queue
+      add_integration integration-minimal
+      ;;
+
     bridge-init.sh|lib/bridge-init-codex-pair.sh|lib/bridge-init-default-crons.sh|lib/bridge-host-profile.sh)
       # Issue #1047: bridge-init.sh's fresh-install admin `agent create`
       # runs as a subprocess (no TTY) and must mark itself an

@@ -47,10 +47,14 @@
 # Test plan (T1-T6 + teeth per issue):
 #
 #   T1 (#1261). controller_credentials_aliveness Python helper returns
-#       ("alive", >0)   for expiresAt in the future beyond min-TTL;
-#       ("expired", <=0) for expiresAt at/before now;
-#       ("near-expiry", >0) for expiresAt < now+min-TTL;
-#       ("no-expires-at", 0) for payload missing expiresAt.
+#       ("fresh", >0)        for expiresAt in the future beyond min-TTL;
+#       ("expired", <=0)     for expiresAt at/before now;
+#       ("near_expiry", >0)  for expiresAt < now+min-TTL;
+#       ("no_expires_at", 0) for payload missing expiresAt.
+#       Codex r1 SHOULD-FIX (2026-05-27): schema tokens migrated to
+#       underscore-JSON-friendly shape (fresh / near_expiry /
+#       no_expires_at) so structured consumers can branch without
+#       hyphen-quoting.
 #
 #   T2 (#1261). bridge-bootstrap.sh non-JSON output contains the OAT
 #       advisory block (so a fresh install operator sees it BEFORE the
@@ -91,6 +95,24 @@
 #       diagnostic line slipped through the stderr move. The dry-run
 #       path covers the `--json` schema path without requiring an
 #       actual install state.
+#
+#   T10 (codex r1 BLOCKING #1, r2). Wrapper JSON aliveness propagation.
+#       Drive bridge-auth.sh claude-token sync --json against a fresh
+#       fixture controller credential. Assert the wrapper JSON shape
+#       includes ``agents: [{agent, aliveness, remaining_ms}, ...]``
+#       (per-agent dicts, NOT bare names) AND a daemon-side parse via
+#       bridge-daemon-helpers.py sync-aliveness-parse extracts the
+#       per-agent rows.
+#
+#   T11 (codex r1 BLOCKING #2, r2). install-daemon-systemd.sh
+#       probe_sudo_self_refresh checks BOTH `restart` AND `run`
+#       commands. Static-source assertion: both invocations must be
+#       present so a partial sudoers (e.g. authorizing only restart)
+#       is detected and falls back to legacy direct-bash ExecStart.
+#
+#   T12 (codex r1 BLOCKING #3, r2). scripts/ci-select-smoke.sh routes
+#       bridge-auth.py + bridge-auth.sh → F-beta4-oauth-bootstrap so a
+#       future PR editing those files cannot bypass the smoke gate.
 #
 # Footgun #11: no `<<EOF` heredoc-stdin into command substitution; no
 # `<<<` here-strings into capture. All Python invocations pass paths
@@ -170,10 +192,10 @@ near = {"claudeAiOauth": {"expiresAt": now_ms + 5 * 60 * 1000}}
 no_field = {"claudeAiOauth": {}}
 
 for label, payload, want in (
-    ("alive", future, "alive"),
+    ("fresh", future, "fresh"),
     ("expired", expired, "expired"),
-    ("near-expiry", near, "near-expiry"),
-    ("no-expires-at", no_field, "no-expires-at"),
+    ("near_expiry", near, "near_expiry"),
+    ("no_expires_at", no_field, "no_expires_at"),
 ):
     got, remaining = ba.controller_credentials_aliveness(payload, now_ms=now_ms)
     print(f"{label}: status={got} remaining_ms={remaining}")
@@ -185,11 +207,18 @@ print("OK")
 PY
 
 T1_OUT="$(python3 "$T1_DRIVER" "$REPO_ROOT" 2>&1)" || smoke_fail "T1: aliveness helper raised: $T1_OUT"
-smoke_assert_contains "$T1_OUT" "alive: status=alive"                "T1: future expiry classified as alive"
-smoke_assert_contains "$T1_OUT" "expired: status=expired"            "T1: past expiry classified as expired"
-smoke_assert_contains "$T1_OUT" "near-expiry: status=near-expiry"    "T1: within-TTL expiry classified as near-expiry"
-smoke_assert_contains "$T1_OUT" "no-expires-at: status=no-expires-at" "T1: missing expiresAt classified as no-expires-at"
-smoke_assert_contains "$T1_OUT" "OK"                                 "T1: driver completed"
+smoke_assert_contains "$T1_OUT" "fresh: status=fresh"                  "T1: future expiry classified as fresh"
+smoke_assert_contains "$T1_OUT" "expired: status=expired"              "T1: past expiry classified as expired"
+smoke_assert_contains "$T1_OUT" "near_expiry: status=near_expiry"      "T1: within-TTL expiry classified as near_expiry"
+smoke_assert_contains "$T1_OUT" "no_expires_at: status=no_expires_at"  "T1: missing expiresAt classified as no_expires_at"
+smoke_assert_contains "$T1_OUT" "OK"                                   "T1: driver completed"
+# Codex r1 SHOULD-FIX (2026-05-27): the legacy hyphenated tokens must
+# NOT resurface. If a future PR puts ``near-expiry`` back, structured
+# consumers (the daemon-side audit / external monitoring) would
+# silently mis-classify rows.
+if grep -nE '"alive"|"near-expiry"|"no-expires-at"' "$REPO_ROOT/bridge-auth.py" >/dev/null; then
+  smoke_fail "T1 schema: legacy hyphenated aliveness tokens (alive / near-expiry / no-expires-at) found in bridge-auth.py — should be fresh / near_expiry / no_expires_at"
+fi
 smoke_log "T1 PASS — aliveness gate classifies all four token states correctly"
 
 # ---------------------------------------------------------------------------
@@ -405,5 +434,140 @@ else
     smoke_log "T9 PASS — bridge-init.sh --dry-run --json stdout is pure JSON"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# T10 (codex r1 BLOCKING #1, r2): wrapper JSON propagates per-agent aliveness
+# ---------------------------------------------------------------------------
+smoke_log "T10 (codex r1 BLOCKING #1, r2): wrapper JSON carries per-agent aliveness + remaining_ms"
+
+# We exercise the wrapper's argv-assembly path directly via the
+# wrapper Python helper at the end of bridge_auth_sync_agents. The full
+# wrapper invocation needs a working ``bridge_agent_engine`` setup,
+# which would drag the test into roster / bridge-core territory; the
+# narrower invariant the BLOCKING calls out is "the wrapper JSON
+# carries per-agent aliveness, parseable by sync-aliveness-parse".
+# Drive that by:
+#   1) constructing a synthetic wrapper JSON (matches the shape the
+#      bridge-auth.sh helper now emits), then
+#   2) running bridge-daemon-helpers.py sync-aliveness-parse on it,
+#      asserting we get the expected tab-separated rows back.
+#
+# Static-source assertion (defense-in-depth): the wrapper code path
+# in bridge-auth.sh references ``synced_payloads`` (per-agent JSON
+# capture) — if a future PR removes that, the wrapper would silently
+# regress to the pre-r2 list-of-names shape.
+
+T10_WRAPPER_JSON='{
+  "status": "ok",
+  "agents": [
+    {"agent": "agent_alpha", "aliveness": "fresh", "remaining_ms": 86400000},
+    {"agent": "agent_beta",  "aliveness": "near_expiry", "remaining_ms": 60000},
+    {"agent": "agent_gamma", "aliveness": "no_expires_at", "remaining_ms": 0}
+  ],
+  "agent_names": ["agent_alpha", "agent_beta", "agent_gamma"],
+  "failed": []
+}'
+
+T10_PARSE="$(python3 "$REPO_ROOT/bridge-daemon-helpers.py" sync-aliveness-parse "$T10_WRAPPER_JSON" 2>&1)" \
+  || smoke_fail "T10: sync-aliveness-parse raised: $T10_PARSE"
+
+smoke_assert_contains "$T10_PARSE" $'agent_alpha\tfresh\t86400000'        "T10: aliveness row for agent_alpha (fresh)"
+smoke_assert_contains "$T10_PARSE" $'agent_beta\tnear_expiry\t60000'      "T10: aliveness row for agent_beta (near_expiry)"
+smoke_assert_contains "$T10_PARSE" $'agent_gamma\tno_expires_at\t0'       "T10: aliveness row for agent_gamma (no_expires_at)"
+
+# Defense-in-depth: the wrapper must declare ``synced_payloads`` so the
+# inner JSON survives into the envelope assembly. Without it, the
+# envelope reverts to the pre-r2 list-of-names shape and the daemon
+# audit row's aliveness fields go blank.
+if ! grep -nF 'synced_payloads' "$REPO_ROOT/bridge-auth.sh" >/dev/null; then
+  smoke_fail "T10: bridge-auth.sh missing 'synced_payloads' — wrapper would emit pre-r2 list-of-names instead of per-agent aliveness dicts"
+fi
+# The wrapper JSON shape now carries ``agent_names`` alongside ``agents``
+# (list-of-dicts). Pin that contract so a future PR cannot revert the
+# envelope to list[str].
+if ! grep -nF 'agent_names' "$REPO_ROOT/bridge-auth.sh" >/dev/null; then
+  smoke_fail "T10: bridge-auth.sh missing 'agent_names' key — wrapper JSON envelope reverted to legacy list[str] shape"
+fi
+# Daemon-side consumption: bridge-daemon.sh must wire
+# ``sync-aliveness-parse`` into its periodic-sync tick so the audit
+# row materializes. Static-source pin.
+if ! grep -nF 'sync-aliveness-parse' "$REPO_ROOT/bridge-daemon.sh" >/dev/null; then
+  smoke_fail "T10: bridge-daemon.sh does not invoke sync-aliveness-parse — wrapper aliveness propagation is invisible to the daemon audit log"
+fi
+if ! grep -nF 'controller_credentials_aliveness' "$REPO_ROOT/bridge-daemon.sh" >/dev/null; then
+  smoke_fail "T10: bridge-daemon.sh missing 'controller_credentials_aliveness' audit emission — per-agent aliveness will not land in audit.jsonl"
+fi
+# Stderr forwarding: bridge-auth.sh must NOT silently discard the
+# inner stderr (where the near-expiry warning lives). The grep is for
+# the new stderr-tmp pattern.
+if ! grep -nF 'stderr_tmp' "$REPO_ROOT/bridge-auth.sh" >/dev/null; then
+  smoke_fail "T10: bridge-auth.sh does not capture inner stderr separately — near-expiry warnings would be silently discarded"
+fi
+smoke_log "T10 PASS — wrapper JSON carries per-agent aliveness + daemon-side consumption is wired"
+
+# ---------------------------------------------------------------------------
+# T11 (codex r1 BLOCKING #2, r2): probe_sudo_self_refresh checks BOTH
+#                                  restart AND run commands
+# ---------------------------------------------------------------------------
+smoke_log "T11 (codex r1 BLOCKING #2, r2): probe_sudo_self_refresh checks ExecStart 'run' command"
+
+T11_FN_BODY="$(awk '/^probe_sudo_self_refresh\(\) \{/,/^\}/' "$SYSTEMD_INSTALL_SH")"
+if [[ -z "$T11_FN_BODY" ]]; then
+  smoke_fail "T11: probe_sudo_self_refresh definition not found in $SYSTEMD_INSTALL_SH"
+fi
+# Both the restart probe (pre-r2 behavior) AND the run probe (r2 new)
+# must be present. A partial sudoers entry authorizing only one of the
+# two would otherwise pass the probe and silently render a broken
+# sudo-self ExecStart.
+if [[ "$T11_FN_BODY" != *"bridge-daemon.sh restart"* ]]; then
+  smoke_fail "T11: probe_sudo_self_refresh does not probe 'bridge-daemon.sh restart' (pre-r2 invariant) — partial sudoers detection regressed"
+fi
+if [[ "$T11_FN_BODY" != *"bridge-daemon.sh run"* ]]; then
+  smoke_fail "T11: probe_sudo_self_refresh does not probe 'bridge-daemon.sh run' (r2 fix) — partial sudoers (restart-only) would pass and yield a broken ExecStart"
+fi
+# Both probes must use the same sudo -n -ln policy-listing shape.
+# Count how many ``sudo -n -ln`` invocations are inside the function.
+T11_LN_COUNT="$(printf '%s\n' "$T11_FN_BODY" | grep -cE 'sudo -n -ln' || true)"
+if (( T11_LN_COUNT < 2 )); then
+  smoke_fail "T11: probe_sudo_self_refresh has only $T11_LN_COUNT 'sudo -n -ln' invocation(s) — expected >= 2 (restart + run)"
+fi
+# Both probes must be wired into the rc=1 failure path. A `sudo -n -ln`
+# whose rc was discarded (no ``if ! ... return 1``) would only test
+# parser tolerance, not actual policy presence.
+T11_FAIL_PATHS="$(printf '%s\n' "$T11_FN_BODY" | grep -cE 'if ! sudo -n -ln' || true)"
+if (( T11_FAIL_PATHS < 2 )); then
+  smoke_fail "T11: probe_sudo_self_refresh has only $T11_FAIL_PATHS 'if ! sudo -n -ln' rc=1 paths — both restart and run probes must short-circuit on failure"
+fi
+smoke_log "T11 PASS — probe_sudo_self_refresh checks BOTH restart and run; partial sudoers detection wired"
+
+# ---------------------------------------------------------------------------
+# T12 (codex r1 BLOCKING #3, r2): ci-select-smoke routes bridge-auth.py
+#                                  + bridge-auth.sh → F-beta4
+# ---------------------------------------------------------------------------
+smoke_log "T12 (codex r1 BLOCKING #3, r2): ci-select-smoke routes bridge-auth.py → F-beta4-oauth-bootstrap"
+
+CI_SELECT="$REPO_ROOT/scripts/ci-select-smoke.sh"
+smoke_assert_file_exists "$CI_SELECT" "ci-select-smoke.sh present"
+
+# Drive ci-select with the --changed-file shape (no git diff required).
+# The selector must include F-beta4-oauth-bootstrap for both file
+# paths; this is what the codex r1 BLOCKING called out (the brief
+# claimed bridge-auth.py was already a ci-select site but it wasn't).
+T12_OUT_AUTH_PY="$(bash "$CI_SELECT" --changed-file bridge-auth.py 2>/dev/null || true)"
+if [[ "$T12_OUT_AUTH_PY" != *"F-beta4-oauth-bootstrap"* ]]; then
+  smoke_fail "T12: 'ci-select-smoke --changed-file bridge-auth.py' does NOT include F-beta4-oauth-bootstrap. Output: $T12_OUT_AUTH_PY"
+fi
+T12_OUT_AUTH_SH="$(bash "$CI_SELECT" --changed-file bridge-auth.sh 2>/dev/null || true)"
+if [[ "$T12_OUT_AUTH_SH" != *"F-beta4-oauth-bootstrap"* ]]; then
+  smoke_fail "T12: 'ci-select-smoke --changed-file bridge-auth.sh' does NOT include F-beta4-oauth-bootstrap. Output: $T12_OUT_AUTH_SH"
+fi
+# bridge-daemon-helpers.py also hosts the new sync-aliveness-parse
+# subcommand — pin its routing too so a future PR that adds a sibling
+# subcommand without updating ci-select cannot bypass the smoke gate.
+T12_OUT_HELPERS="$(bash "$CI_SELECT" --changed-file bridge-daemon-helpers.py 2>/dev/null || true)"
+if [[ "$T12_OUT_HELPERS" != *"F-beta4-oauth-bootstrap"* ]]; then
+  smoke_fail "T12: 'ci-select-smoke --changed-file bridge-daemon-helpers.py' does NOT include F-beta4-oauth-bootstrap. Output: $T12_OUT_HELPERS"
+fi
+smoke_log "T12 PASS — ci-select-smoke routes bridge-auth.py + bridge-auth.sh + bridge-daemon-helpers.py → F-beta4-oauth-bootstrap"
 
 smoke_log "ALL TESTS PASS"
