@@ -374,10 +374,57 @@ bridge_sync_isolated_home_claude_skills() {
   # `.claude` may already be owned by the isolated UID; mkdir -p as root
   # is the safe primitive (sudo wrap matches every other isolated-home
   # mutation in lib/bridge-agents.sh).
-  bridge_linux_sudo_root mkdir -p "$skills_root" 2>/dev/null || {
-    bridge_warn "isolated skills sync: cannot mkdir $skills_root for $agent (sudo unavailable?)"
+  #
+  # Issue #1333 L3 (beta5-2 Lane ν): sudo-failure path. Pre-fix, sudo
+  # failure silently warn-and-return-0 — the operator never saw
+  # WHICH command failed and the dashboard reported nothing. New
+  # behavior:
+  #   1. Try sudo first (canonical path, matches every other isolated-
+  #      home mutation in lib/bridge-agents.sh).
+  #   2. If sudo fails AND BRIDGE_SKILLS_USE_SETPRIV=1 AND setpriv is
+  #      available AND the daemon is already root (the only context
+  #      where cross-UID setpriv works without CAP_SETUID elevation,
+  #      same constraint as Lane η BRIDGE_CRON_USE_SETPRIV at
+  #      lib/bridge-cron.sh:787) → try setpriv. Opt-in only so the
+  #      default behavior remains sudo-first (sudoers is the explicit
+  #      policy boundary the operator already approved at install).
+  #   3. If both fail → bridge_warn with an actionable message
+  #      (which env var to set, which binary is missing) instead of
+  #      the previous opaque "sudo unavailable?". Still return 0 so
+  #      this remains a non-fatal soft-fail for legacy callers that
+  #      depend on the skills sync being best-effort; the actionable
+  #      diagnostic is what the issue actually asked for.
+  local _skills_mkdir_ok=0
+  if bridge_linux_sudo_root mkdir -p "$skills_root" 2>/dev/null; then
+    _skills_mkdir_ok=1
+  elif [[ "${BRIDGE_SKILLS_USE_SETPRIV:-0}" == "1" ]] \
+      && command -v setpriv >/dev/null 2>&1 \
+      && [[ "$(id -u)" == "0" ]]; then
+    # setpriv fallback: only reachable when the daemon runs as root
+    # (per-host operator opted into systemd unit running root, or
+    # `sudo agent-bridge ...` invocation). `setpriv --reuid <uid>
+    # --regid <gid>` switches the active credentials of the current
+    # process for the mkdir invocation. We mkdir AS THE TARGET
+    # OS_USER directly (no root mkdir + chown step needed because
+    # the isolated UID itself owns its $HOME/.claude tree).
+    local _os_uid="" _os_gid=""
+    _os_uid="$(id -u "$os_user" 2>/dev/null || true)"
+    _os_gid="$(id -g "$os_user" 2>/dev/null || true)"
+    if [[ -n "$_os_uid" && -n "$_os_gid" ]]; then
+      if setpriv --reuid "$_os_uid" --regid "$_os_gid" --clear-groups \
+          mkdir -p "$skills_root" 2>/dev/null; then
+        _skills_mkdir_ok=1
+      fi
+    fi
+  fi
+
+  if (( _skills_mkdir_ok == 0 )); then
+    # Actionable diagnostic (#1333 L3): name the binary, the agent,
+    # and the env var operators can flip to unblock when sudoers is
+    # not an option (BRIDGE_SKILLS_USE_SETPRIV=1 + daemon-as-root).
+    bridge_warn "isolated skills sync: cannot mkdir $skills_root for $agent — sudo refused and no fallback active. Fix: configure passwordless sudo for the controller UID (preferred — \`agent-bridge isolate $agent --install-sudoers\`) OR set BRIDGE_SKILLS_USE_SETPRIV=1 and re-run with the daemon as root + setpriv installed."
     return 0
-  }
+  fi
   bridge_linux_sudo_root chown "$os_user:$os_user" "$skills_root" 2>/dev/null || true
   bridge_linux_sudo_root chmod 0755 "$skills_root" 2>/dev/null || true
 

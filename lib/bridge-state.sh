@@ -2983,18 +2983,63 @@ def _as_int(value):
         return None
 
 
+def _reason_hint(engine: str, exit_code_int):
+    """Issue #1317-B (beta5-2 Lane ν): produce an operator-actionable
+    hint based on the recorded exit code so `agent show` /
+    `session_health` displays WHAT went wrong + HOW to recover instead
+    of just emitting the structured-but-opaque marker file.
+
+    Exit-code mapping (POSIX shell conventions):
+      127 → command not found (most common in nvm/pyenv users where the
+            engine binary is not on the daemon non-login shell's PATH).
+      126 → permission denied (binary present, not executable; iso v2
+            host with wrong mode on the controller-installed engine).
+      125 → sudo internal failure (e.g. sudoers parse error). Rare.
+      Other non-zero → generic ("inspect stderr_file").
+    Returns a short single-line hint string.
+    """
+    engine_label = engine or "engine"
+    if exit_code_int == 127:
+        return (
+            f"engine CLI '{engine_label}' not found on daemon PATH; "
+            "set BRIDGE_ENGINE_PATH=/dir/with/engine OR install at a "
+            "PATH dir (e.g. ~/.local/bin) OR ensure NVM_DIR/PYENV_ROOT "
+            "is exported when the daemon starts"
+        )
+    if exit_code_int == 126:
+        return (
+            f"engine CLI '{engine_label}' present but not executable "
+            "by the daemon UID (chmod +x or fix iso v2 ACL on the "
+            "binary's parent dir)"
+        )
+    if exit_code_int == 125:
+        return (
+            "sudo refused the launch (sudoers parse error or "
+            "non-interactive password prompt); run `sudo -n -u "
+            "<os_user> true` to reproduce"
+        )
+    return (
+        f"agent process exited with code {exit_code_int}; inspect "
+        "stderr_file and `agent-bridge agent safe-mode <agent>` to "
+        "clear the marker"
+    )
+
+
 path = Path(sys.argv[1])
 agent, engine, fail_count, exit_code, stderr_file, launch_cmd, err_size_before = sys.argv[2:]
 
+exit_code_int = _as_int(exit_code)
 payload = {
     "agent": agent,
     "engine": engine,
     "fail_count": _as_int(fail_count),
-    "exit_code": _as_int(exit_code),
+    "exit_code": exit_code_int,
     "stderr_file": stderr_file,
     "launch_cmd": launch_cmd,
     "err_size_before": _as_int(err_size_before),
     "quarantined_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+    "reason_hint": _reason_hint(engine, exit_code_int) if exit_code_int is not None else "",
+    "recovery_cmd": f"agent-bridge agent safe-mode {agent}",
 }
 
 path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
@@ -4149,6 +4194,7 @@ bridge_write_roster_status_snapshot() {
   local loop_mode
   local engine
   local recent
+  local quarantined
 
   {
     echo -e "agent\tengine\tsession\tworkdir\tsource\tloop\tactive\twake\tchannels\tchannel_reason\tactivity_state\tconfigured_channels"
@@ -4165,7 +4211,23 @@ bridge_write_roster_status_snapshot() {
         channel_reason="${channel_reason//$'\t'/ }"
         channel_reason="${channel_reason//$'\n'/ }"
       fi
-      activity_state="stopped"
+      # Issue #1317 Lane ν R2: surface quarantine state in roster
+      # snapshot so `agb status` + cron readiness (bridge-daemon.sh's
+      # readiness path) see quarantined no-tmux agents, not just
+      # `bridge-agent.sh list/show`. Mirror the predicate in
+      # bridge-agent.sh::bridge_agent_activity_state — short-circuit at
+      # the top so the quarantine state wins over both the inactive
+      # default ("stopped") and any active-branch outcome
+      # (working/idle/starting). Operator can clear the marker by
+      # `rm state/agents/<a>/broken-launch` once the underlying engine
+      # CLI is back on PATH.
+      quarantined=0
+      if [[ -f "$BRIDGE_STATE_DIR/agents/$agent/broken-launch" ]]; then
+        quarantined=1
+        activity_state="quarantine-broken-launch"
+      else
+        activity_state="stopped"
+      fi
       session="$(bridge_agent_session "$agent")"
       engine="$(bridge_agent_engine "$agent")"
       loop_mode="$(bridge_agent_loop "$agent")"
@@ -4188,22 +4250,30 @@ bridge_write_roster_status_snapshot() {
             esac
           fi
         fi
-        if bridge_tmux_session_has_prompt_from_text "$engine" "$recent"; then
-          activity_state="idle"
-        else
-          # Issue #835 Wave B: distinguish "engine running, no prompt yet"
-          # (working) from "tmux exists but engine never spawned"
-          # (starting). Before this gate, the operator's 2026-05-14 wedge
-          # (bridge-run.sh patch --continue stuck in launch-cmd heredoc
-          # expansion, no `claude` child) rendered as `working`, hiding
-          # the failure mode from `agb status`. The helper is defined only
-          # for claude/codex (other engine shapes fall through to
-          # "working", preserving legacy behavior).
-          if bridge_tmux_engine_requires_prompt "$engine" \
-              && ! bridge_agent_engine_process_alive "$agent" "$engine"; then
-            activity_state="starting"
+        # Issue #1317 Lane ν R2: when the broken-launch marker is
+        # present, the activity_state already reads
+        # `quarantine-broken-launch` — do NOT overwrite it with the
+        # active-branch outcome. The active=1 / wake fields are still
+        # computed honestly because they describe tmux/channel state,
+        # not engine-health state.
+        if (( quarantined == 0 )); then
+          if bridge_tmux_session_has_prompt_from_text "$engine" "$recent"; then
+            activity_state="idle"
           else
-            activity_state="working"
+            # Issue #835 Wave B: distinguish "engine running, no prompt yet"
+            # (working) from "tmux exists but engine never spawned"
+            # (starting). Before this gate, the operator's 2026-05-14 wedge
+            # (bridge-run.sh patch --continue stuck in launch-cmd heredoc
+            # expansion, no `claude` child) rendered as `working`, hiding
+            # the failure mode from `agb status`. The helper is defined only
+            # for claude/codex (other engine shapes fall through to
+            # "working", preserving legacy behavior).
+            if bridge_tmux_engine_requires_prompt "$engine" \
+                && ! bridge_agent_engine_process_alive "$agent" "$engine"; then
+              activity_state="starting"
+            else
+              activity_state="working"
+            fi
           fi
         fi
       fi

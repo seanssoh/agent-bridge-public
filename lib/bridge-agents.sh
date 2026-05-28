@@ -6723,6 +6723,7 @@ bridge_agent_session_health_json() {
   python3 - "$agent" "$session" "$active" "$loop_mode" "$continue_mode" "$onboarding_state" "$attached_exit_behavior" "$restart_readiness" "$broken_launch_file" <<'PY'
 import json
 import sys
+from pathlib import Path
 
 agent, session, active, loop_mode, continue_mode, onboarding_state, attached_exit_behavior, restart_readiness, broken_launch_file = sys.argv[1:]
 payload = {
@@ -6738,6 +6739,25 @@ payload = {
 }
 if broken_launch_file:
     payload["broken_launch_file"] = broken_launch_file
+    # Issue #1317-B (beta5-2 Lane ν): when the marker file exists on
+    # disk AND parses as the v0.14.5-beta5-2+ schema, surface the
+    # reason_hint + recovery_cmd inline in the JSON so JSON consumers
+    # (dashboards, tooling) get the same one-glance signal as the
+    # text-mode session_guidance block. Best-effort: missing file /
+    # legacy schema silently drops the keys.
+    try:
+        _bl_path = Path(broken_launch_file)
+        if _bl_path.is_file():
+            _bl_data = json.loads(_bl_path.read_text(encoding="utf-8"))
+            if isinstance(_bl_data, dict):
+                _hint = _bl_data.get("reason_hint")
+                if isinstance(_hint, str) and _hint.strip():
+                    payload["broken_launch_reason"] = _hint.strip()
+                _recovery = _bl_data.get("recovery_cmd")
+                if isinstance(_recovery, str) and _recovery.strip():
+                    payload["broken_launch_recovery_cmd"] = _recovery.strip()
+    except (OSError, ValueError):
+        pass
 if session:
     payload["attach_command"] = f"tmux attach -t ={session}"
 print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
@@ -6790,6 +6810,26 @@ bridge_agent_session_guidance_text() {
   printf -- '- restart_readiness: %s\n' "$restart_readiness"
   if [[ -f "$broken_launch_file" ]]; then
     printf -- '- broken_launch_file: %s\n' "$broken_launch_file"
+    # Issue #1317-B (beta5-2 Lane ν): surface the JSON-encoded
+    # reason_hint inline so the operator sees "WHY did the agent get
+    # quarantined?" in `agent show` output without having to open the
+    # marker file. Standalone helper (file-as-argv) to keep the
+    # heredoc-stdin out of this `$()` and avoid the Bash 5.3.9
+    # read_comsub/heredoc_write deadlock (footgun #11 / KNOWN_ISSUES
+    # §26). Best-effort: missing python / malformed JSON / older
+    # broken-launch payload (pre-#1317) silently drops the line so
+    # this cannot break the guidance block on legacy installs
+    # mid-upgrade.
+    local _bl_reason_hint=""
+    if command -v python3 >/dev/null 2>&1 \
+        && [[ -f "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/broken-launch-reason-hint.py" ]]; then
+      _bl_reason_hint="$(python3 \
+        "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/broken-launch-reason-hint.py" \
+        "$broken_launch_file" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_bl_reason_hint" ]]; then
+      printf -- '- broken_launch_reason: %s\n' "$_bl_reason_hint"
+    fi
     printf -- '- recovery: agent-bridge agent safe-mode %s\n' "$agent"
   fi
   if [[ -n "$session" ]]; then
