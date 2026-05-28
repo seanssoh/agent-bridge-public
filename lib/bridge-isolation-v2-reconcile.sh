@@ -1445,6 +1445,17 @@ EOF
   # agent-create code paths) still honor the explicit --agent /
   # --all-agents semantics so they can target a single agent without
   # iterating the full roster.
+  #
+  # Issue #1325 (Lane κ v0.15.0-beta5-2 verification): the gate is
+  # deliberately mode-agnostic — it gates only on `reason == manual` +
+  # the no-target conjuncts, NOT on `mode == apply`. That means
+  # `agent-bridge isolation reconcile --check` (no --agent / --all) also
+  # benefits from the implicit --all-agents expansion, so per-agent
+  # .claude drift surfaces with overall_rc=1 instead of the pre-#1298
+  # silent rc=0. Lane κ adds a functional pin in
+  # `scripts/smoke/beta5-2-kappa-state-audit-reconcile.sh` (T4) that
+  # asserts the gate carries no `mode == "apply"` conjunct — gamma-beta5
+  # only static-grepped the branch presence.
   if (( all_agents == 0 )) && [[ -z "$agent" ]] && [[ "$reason" == "manual" ]]; then
     all_agents=1
     _bridge_iso_reconcile_log "manual mode: implicit --all-agents (no --agent / --all given; including per-agent rows so agent-home-contract drift is visible — #1298 Gap B)"

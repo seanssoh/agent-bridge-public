@@ -107,7 +107,7 @@ add_live() {
 
 add_all_required_static() {
 
-add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift phase2-install-tree-reconciler phase3-agent-home-contract 1201-1202-directory-marketplace-seed 1205-hook-iso-fail-open 1207-stale-supp-groups-allowlist 1208-lock-metadata-normalize 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1214-channel-validator-iso-fallback 1215-ms365-dir-mode beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers G-channel-spec-resolution F-daemon-supp-groups-mock F-daemon-supp-groups-real H-bootstrap-memory-iso-rebuild I-agent-description-roster ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers 6607-hook-admin-allowlist γ-cli-consistency δ-1234-daemon-start-policy B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir C-beta4-logger-and-spec B-beta4-setup-wizard A-beta4-iso-path-resolution D-beta4-daemon-lifecycle E-beta4-fresh-install-gate-state-dir H-beta4-iso-ownership F-beta4-oauth-bootstrap G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs K-beta4-nits Beta-beta5-session-id-detect-sudo α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-zeta-teams-mcp-dedup beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-eta-cron-iso-uid-preflight beta5-2-delta-nudge-session-empty beta5-2-theta-upgrade-backfill-perms beta5-2-nu-daemon-path-quarantine
+add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift phase2-install-tree-reconciler phase3-agent-home-contract 1201-1202-directory-marketplace-seed 1205-hook-iso-fail-open 1207-stale-supp-groups-allowlist 1208-lock-metadata-normalize 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1214-channel-validator-iso-fallback 1215-ms365-dir-mode beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers G-channel-spec-resolution F-daemon-supp-groups-mock F-daemon-supp-groups-real H-bootstrap-memory-iso-rebuild I-agent-description-roster ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers 6607-hook-admin-allowlist γ-cli-consistency δ-1234-daemon-start-policy B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir C-beta4-logger-and-spec B-beta4-setup-wizard A-beta4-iso-path-resolution D-beta4-daemon-lifecycle E-beta4-fresh-install-gate-state-dir H-beta4-iso-ownership F-beta4-oauth-bootstrap G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs K-beta4-nits Beta-beta5-session-id-detect-sudo α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-zeta-teams-mcp-dedup beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-eta-cron-iso-uid-preflight beta5-2-delta-nudge-session-empty beta5-2-theta-upgrade-backfill-perms beta5-2-nu-daemon-path-quarantine beta5-2-kappa-state-audit-reconcile
 
 
 }
@@ -375,6 +375,12 @@ select_for_path() {
       # every bridge-setup.py / bridge-setup.sh / wizard move so a
       # future refactor cannot silently regress the audit family.
       add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership
+      # v0.15.0-beta5-2 Lane κ (#1319 H1): bridge-status.py's `state`
+      # column width must accommodate the new `picker_blocked` value
+      # (14 chars). Pull beta5-2-kappa-state-audit-reconcile on every
+      # bridge-status.py move so a future PR cannot silently shrink the
+      # column back to 8 chars and clip `picker_blocked` to `picker_b`.
+      add_required beta5-2-kappa-state-audit-reconcile
       add_integration integration-minimal
       ;;
 
@@ -463,6 +469,26 @@ select_for_path() {
       # future PR cannot regress the audit-row contract that downstream
       # operator triage depends on.
       add_required queue 1106-nudge-shell-recheck nudge-task-age-gate nudge-redundant-active-agent a2a-cross-bridge 1100-audit-since-tz 1115-cli-usage-drift J-beta4-workflow-docs K-beta4-nits beta5-2-delta-nudge-session-empty
+      add_integration integration-minimal
+      ;;
+
+    bridge-stall.py|bridge-audit.sh)
+      # v0.15.0-beta5-2 Lane κ:
+      #   #1319 H1 — bridge-stall.py is the source of the
+      #     `interactive_picker` classification that lib/bridge-state.sh's
+      #     new `bridge_agent_picker_blocked` predicate reads via stall.env.
+      #     A future refactor that renames the classification (e.g. to
+      #     `quarantine` or `picker`) would silently break the resolver
+      #     branch without producing any compile-time error.
+      #   #1324 M1 — bridge-audit.sh's no-`--agent` enumerator must walk
+      #     BOTH the legacy controller-rooted tree
+      #     (`$BRIDGE_HOME/logs/agents/<a>/audit.jsonl`) AND the iso v2
+      #     canonical tree (`$BRIDGE_HOME/data/agents/<a>/logs/audit.jsonl`).
+      #     The Lane κ smoke pins both anchors + the `Issue #1324` comment
+      #     so a future PR cannot silently drop the v2 arm.
+      # Pull beta5-2-kappa-state-audit-reconcile on every bridge-stall.py
+      # or bridge-audit.sh move so either regression is caught at PR time.
+      add_required beta5-2-kappa-state-audit-reconcile
       add_integration integration-minimal
       ;;
 
@@ -675,6 +701,15 @@ add_required daemon queue launch-dev-channels-injection channel-env-readiness cr
       # state.sh / bridge-agent.sh move so a future PR cannot regress
       # the operator-actionable hint chain or the activity-state label.
       add_required beta5-2-nu-daemon-path-quarantine
+      # v0.15.0-beta5-2 Lane κ (#1319 H1): bridge-daemon.sh hosts
+      # bridge_agent_heartbeat_activity_state (one of the three resolvers
+      # that must agree on the new `picker_blocked` state); lib/bridge-
+      # state.sh hosts the predicate + the snapshot writer's resolver.
+      # Pull beta5-2-kappa-state-audit-reconcile on every bridge-daemon.sh
+      # / lib/bridge-state.sh move so a regression at any layer (predicate
+      # rename, predicate path drift, resolver branch removal) re-introduces
+      # the false-positive `working` shape patch flagged on stale picker.
+      add_required beta5-2-kappa-state-audit-reconcile
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -905,6 +940,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # silently regress either surface back to the pre-#1317 opaque
       # `stopped` label or the missing-engine create silent-pass.
       add_required beta5-2-nu-daemon-path-quarantine
+      # v0.15.0-beta5-2 Lane κ (#1319 H1): bridge-agent.sh hosts
+      # `bridge_agent_activity_state` which is the second of the three
+      # resolvers that emit `picker_blocked` (alongside the snapshot
+      # writer in lib/bridge-state.sh and the heartbeat path in
+      # bridge-daemon.sh). Pull beta5-2-kappa-state-audit-reconcile on
+      # every bridge-agent.sh move so the predicate call and branch
+      # ordering cannot silently regress.
+      add_required beta5-2-kappa-state-audit-reconcile
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -1178,6 +1221,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # caller-side classifier, or manual-mode parity guard) is caught
       # at PR time.
       add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup phase2-install-tree-reconciler phase3-agent-home-contract 1207-stale-supp-groups-allowlist A-beta4-iso-path-resolution H-beta4-iso-ownership G-beta4-watchdog-noise J-beta4-workflow-docs α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms
+      # v0.15.0-beta5-2 Lane κ (#1325 M2): lib/bridge-isolation-v2-
+      # reconcile.sh hosts the manual-mode parity branch (#1298 Gap B)
+      # that makes `agent-bridge isolation reconcile --check` AND --apply
+      # both implicitly expand to --all-agents on `reason=manual`. The
+      # Lane κ smoke functionally verifies the parity branch is
+      # mode-agnostic (does NOT gate on `mode == apply`) — gamma-beta5
+      # only static-grepped the branch. Pull on every reconcile-lib move
+      # so a future refactor cannot silently regress the --check arm
+      # back to the pre-#1298 silent-skip shape.
+      add_required beta5-2-kappa-state-audit-reconcile
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;

@@ -1529,6 +1529,20 @@ bridge_agent_activity_state() {
     return 0
   fi
 
+  # Issue #1319 (Lane κ v0.15.0-beta5-2): picker-blocked agents are NOT
+  # making progress and must NOT render as `working`. Mirror the
+  # snapshot writer in `bridge_write_roster_status_snapshot` so
+  # `agb agent show` + the daemon snapshot stay in sync. The daemon
+  # stall scan writes `STALL_ACTIVE_CLASSIFICATION=interactive_picker`
+  # to stall.env when bridge-stall.py detects the rate-limit / summary
+  # picker; the predicate clears automatically when stall.env is
+  # rm'd by `bridge_clear_stall_state` on recovery.
+  if command -v bridge_agent_picker_blocked >/dev/null 2>&1 \
+      && bridge_agent_picker_blocked "$agent"; then
+    printf '%s' "picker_blocked"
+    return 0
+  fi
+
   # Issue #835 Wave B: tmux exists but no claude/codex descendant in the
   # pane process tree → starting/stalled before engine. Without this,
   # `agb agent show` showed `working` for a wedged static admin (operator
