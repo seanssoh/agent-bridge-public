@@ -271,10 +271,6 @@ run_create() {
     esac
   done
 
-  if [[ "$kind" == "shell" ]]; then
-    bridge_cron_validate_shell_run_config "$run_as_agent" "$script_path"
-  fi
-
   # Issue #1359 tactical staging delegation. When the caller is an iso
   # v2 UID (`BRIDGE_AGENT_ID` set + current uid != controller uid +
   # cron/jobs.json not writable by the iso UID), route through the
@@ -301,13 +297,41 @@ run_create() {
   # short-circuited the guard and the direct write went through.
   # Split: identity check fires the guard first, then the staging
   # predicate decides stage vs direct for same-agent requests.
-  if [[ "$kind" == "text" ]]; then
-    if _bridge_cron_create_iso_identity_active; then
-      local effective_agent="${opt_agent:-${BRIDGE_AGENT_ID:-}}"
-      if [[ -n "$effective_agent" && "$effective_agent" != "${BRIDGE_AGENT_ID:-}" ]]; then
-        bridge_die "cron mutation refused: requested agent ${effective_agent} does not match BRIDGE_AGENT_ID ${BRIDGE_AGENT_ID:-<unset>} (iso agents may only mutate own cron)"
-      fi
+  #
+  # codex r2 self-review BLOCKING: the previous shape gated the
+  # bridge_die on `kind == text`. A `--kind shell` request from inside
+  # an iso UID with writable jobs.json would skip the guard entirely
+  # and fall through to `bridge_cron_python` which accepts shell
+  # payloads and writes the job for `args.agent`. The reject must fire
+  # on identity context regardless of kind — shell-kind staging
+  # delegation is still out of scope (the runner needs controller-side
+  # script ownership the staging path cannot prove), but the boundary
+  # "iso agents may only mutate own cron" applies to ALL kinds. After
+  # this guard, only same-agent or non-iso-identity requests proceed,
+  # and shell-kind same-agent requests still hit the direct write path
+  # (which is correct: a same-agent shell cron is the iso UID writing
+  # its own job, no boundary violation).
+  #
+  # NOTE on ordering: this guard MUST fire BEFORE
+  # `bridge_cron_validate_shell_run_config` below. The shell-kind
+  # validator rejects on missing `--run-as-agent` / `--script` with a
+  # different bridge_die that would mask the identity reject — and an
+  # attacker can satisfy both by passing `--kind shell --script foo
+  # --run-as-agent <peer>`. The identity reject must be the first thing
+  # an iso-context shell with cross-agent intent hits, regardless of
+  # what other args it carries.
+  if _bridge_cron_create_iso_identity_active; then
+    local effective_agent="${opt_agent:-${BRIDGE_AGENT_ID:-}}"
+    if [[ -n "$effective_agent" && "$effective_agent" != "${BRIDGE_AGENT_ID:-}" ]]; then
+      bridge_die "cron mutation refused: requested agent ${effective_agent} does not match BRIDGE_AGENT_ID ${BRIDGE_AGENT_ID:-<unset>} (iso agents may only mutate own cron)"
     fi
+  fi
+
+  if [[ "$kind" == "shell" ]]; then
+    bridge_cron_validate_shell_run_config "$run_as_agent" "$script_path"
+  fi
+
+  if [[ "$kind" == "text" ]]; then
     if _bridge_cron_create_iso_context_active; then
       _bridge_cron_create_via_staging \
         "$opt_agent" \

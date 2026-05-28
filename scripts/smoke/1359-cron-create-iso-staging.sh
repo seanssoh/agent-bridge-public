@@ -679,6 +679,55 @@ smoke_assert_eq "$T3C_HASH_BEFORE" "$T3C_HASH_AFTER" \
 smoke_log "ok: T3c — writable-jobs.json bypass closed (rc=$T3C_RC)"
 
 # ---------------------------------------------------------------------------
+# T3d (codex r2 self-review BLOCKING) — `--kind shell` must hit the
+# same cross-agent identity reject. The previous shape gated the
+# bridge_die on `kind == text`; a shell-kind request from inside an
+# iso UID with writable jobs.json would skip the guard entirely and
+# fall through to the native python entry point, which writes a job
+# for `args.agent`. The reject must fire on identity context
+# regardless of kind.
+# ---------------------------------------------------------------------------
+smoke_log "T3d: --kind shell + iso identity + cross-agent → rejected (kind-agnostic guard)"
+
+T3D_HOME="$BRIDGE_HOME/t3d"
+T3D_JOBS_DIR="$T3D_HOME/cron"
+T3D_JOBS_FILE="$T3D_JOBS_DIR/jobs.json"
+mkdir -p "$T3D_JOBS_DIR"
+printf '{"format":"agent-bridge-cron-v1","jobs":[]}\n' >"$T3D_JOBS_FILE"
+chmod 0600 "$T3D_JOBS_FILE"
+# Writable jobs.json so the bug shape (kind=shell skip → direct write)
+# would land a real mutation; the reject must still fire.
+[[ -w "$T3D_JOBS_FILE" ]] || smoke_fail "T3d: setup error — jobs.json must be writable"
+T3D_HASH_BEFORE="$("$PY_BIN" -c "import hashlib,sys;print(hashlib.sha1(open(sys.argv[1],'rb').read()).hexdigest())" "$T3D_JOBS_FILE")"
+
+T3D_STDERR="$SMOKE_TMP_ROOT/t3d-stderr.log"
+T3D_RC=0
+set +e
+BRIDGE_LAYOUT=v2 \
+BRIDGE_DATA_ROOT="$BRIDGE_HOME" \
+BRIDGE_AGENT_ID="$ISO_AGENT" \
+BRIDGE_NATIVE_CRON_JOBS_FILE="$T3D_JOBS_FILE" \
+bash "$REPO_ROOT/bridge-cron.sh" create \
+  --kind shell \
+  --agent "$PEER_AGENT" \
+  --schedule "0 18 * * *" \
+  --tz "Asia/Seoul" \
+  --title "$PEER_AGENT-shell-cross-agent-attempt" \
+  --payload "echo should be rejected" >/dev/null 2>"$T3D_STDERR"
+T3D_RC=$?
+set -e
+[[ "$T3D_RC" -ne 0 ]] || smoke_fail "T3d: --kind shell cross-agent create MUST exit non-zero (got rc=0)"
+T3D_ERR="$(cat "$T3D_STDERR" 2>/dev/null || true)"
+smoke_assert_contains "$T3D_ERR" "cron mutation refused" \
+  "T3d: stderr must explain the reject for kind=shell too"
+smoke_assert_contains "$T3D_ERR" "$PEER_AGENT" \
+  "T3d: stderr must name the requested peer agent"
+T3D_HASH_AFTER="$("$PY_BIN" -c "import hashlib,sys;print(hashlib.sha1(open(sys.argv[1],'rb').read()).hexdigest())" "$T3D_JOBS_FILE")"
+smoke_assert_eq "$T3D_HASH_BEFORE" "$T3D_HASH_AFTER" \
+  "T3d: jobs.json must be unchanged after the reject (no shell-kind direct write)"
+smoke_log "ok: T3d — kind=shell cross-agent reject pinned (rc=$T3D_RC)"
+
+# ---------------------------------------------------------------------------
 # T4b (codex r2 BLOCKING #2) — forged `actor_uid` field that does not
 # parse as int must produce an explicit reject result, NOT a Python
 # crash that leaves the request unresolved and re-applied next tick.
