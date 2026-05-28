@@ -231,6 +231,22 @@ bridge_setup_wizard_validate_auto() {
   local field
   for field in "${required[@]}"; do
     if [[ "$(_bridge_setup_wizard_argv_has "$field" "$@")" != "1" ]]; then
+      # Issue #1354: `--app-password-stdin` / `--client-secret-stdin` are
+      # value-less alternatives to the `*-file` flags. The python wizard
+      # reads from stdin when either is set, so accept their presence as
+      # satisfying the `*-file` requirement.
+      case "$field" in
+        app-password-file)
+          if _bridge_setup_wizard_argv_has_flag "app-password-stdin" "$@"; then
+            continue
+          fi
+          ;;
+        client-secret-file)
+          if _bridge_setup_wizard_argv_has_flag "client-secret-stdin" "$@"; then
+            continue
+          fi
+          ;;
+      esac
       missing+=("--${field}")
     fi
   done
@@ -238,6 +254,23 @@ bridge_setup_wizard_validate_auto() {
   if (( ${#missing[@]} > 0 )); then
     bridge_die "[setup ${channel}] 자동 모드(--yes)에서 필수 값 누락: ${missing[*]} (인터랙티브 모드로 실행하거나 모든 flag를 명시하세요)"
   fi
+}
+
+# Tiny argv scanner for value-less flags (e.g. --app-password-stdin /
+# --client-secret-stdin). Returns 0 if the flag is present, 1 otherwise.
+# Issue #1354 companion to _bridge_setup_wizard_argv_has — the existing
+# scanner only counts a flag present if it has a non-empty value after
+# it, which excludes action="store_true" forms.
+_bridge_setup_wizard_argv_has_flag() {
+  local needle="$1"
+  shift
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" == "--${needle}" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # --------------------------------------------------------------------

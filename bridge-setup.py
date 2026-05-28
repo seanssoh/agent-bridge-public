@@ -15,7 +15,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -910,20 +910,113 @@ def load_claude_plugin_channel_token(kind: str) -> str:
     return extract_token_from_text(env_path.read_text(encoding="utf-8"), kind)
 
 
-def read_secret_value(flag_value: str, flag_name: str, file_path: str, env_name: str) -> str:
+def read_secret_value(
+    flag_value: str,
+    flag_name: str,
+    file_path: Optional[str],
+    env_name: str,
+    stdin_flag: bool = False,
+    stdin_flag_name: str = "",
+) -> str:
     """Resolve a channel secret without requiring it on the command line.
 
-    Precedence: a `--<name>-file <path>` (a path is safe to pass in argv) wins,
-    then the env var, then the legacy `--<name> <secret>` flag. Passing the
-    secret as a bare argv value still works for compatibility but emits a
-    one-line warning, since it then lands in shell history and the process
-    table (`ps`, `/proc/<pid>/cmdline`).
+    Precedence: `--<name>-stdin` (read once from process stdin) wins, then
+    `--<name>-file <path>` (a path is safe to pass in argv), then the env var,
+    then the legacy `--<name> <secret>` flag. Passing the secret as a bare argv
+    value still works for compatibility but emits a one-line warning, since it
+    then lands in shell history and the process table (`ps`, `/proc/<pid>/cmdline`).
+
+    FD-aware file ingestion (Issue #1354): `--<name>-file` accepts any path the
+    process can open and read — regular files, `/dev/fd/N` (Bash process
+    substitution `<(...)`), named pipes (FIFOs), and character/socket specials.
+    The old `Path.is_file()` gate refused everything except regular files,
+    which broke the documented `<(printf '%s' "$secret")` pattern because
+    `/dev/fd/63` is a character device. We now try-open-and-read; if the read
+    fails we surface a hint that names the process-substitution + sudo subshell
+    interaction and the `--<name>-stdin` / tempfile alternatives.
+
+    Mutex defense (Issue #1354 R2): the argparse layer guards the
+    common-case `--<name>-file FOO --<name>-stdin`. This handler-side
+    check is a belt-and-suspenders second line in case a future caller
+    (programmatic invocation, refactor that drops the mutex group)
+    reaches this function with both signals set. Non-empty file_path +
+    stdin_flag both being live is unambiguously a mis-use.
     """
+    if stdin_flag and file_path:
+        file_flag = f"{flag_name}-file"
+        stdin_flag_label = stdin_flag_name or f"{flag_name}-stdin"
+        raise SetupError(
+            f"{file_flag} and {stdin_flag_label} are mutually exclusive — "
+            f"pass only one."
+        )
+    if stdin_flag:
+        # stdin path: read everything once. Single trailing newline (the shape
+        # tools like `printf %s\\n` and `cat` produce) is stripped; any embedded
+        # newlines AND any second trailing newline stay verbatim so multi-line
+        # key material and operator-meaningful trailing whitespace are preserved.
+        data = sys.stdin.read()
+        if data.endswith("\n"):
+            secret = data[:-1]
+        else:
+            secret = data
+        if not secret:
+            stdin_label = stdin_flag_name or f"{flag_name}-stdin"
+            raise SetupError(
+                f"{stdin_label} read an empty secret from stdin "
+                f"(no input received before EOF — check the producer wrote bytes)."
+            )
+        return secret
     if file_path:
         path = Path(file_path).expanduser()
-        if not path.is_file():  # noqa: raw-pathlib-controller-only — operator-supplied secret-file path
-            raise SetupError(f"Secret file not found: {file_path}")
-        return path.read_text(encoding="utf-8").strip()
+        # File-path companion flag is always `<flag_name>-file`; the
+        # stdin companion is `<flag_name>-stdin`. Naming both in the
+        # error keeps the operator from re-typing the bare `<flag_name>`
+        # form (which lands the secret in argv).
+        file_flag = f"{flag_name}-file"
+        stdin_flag_label = stdin_flag_name or f"{flag_name}-stdin"
+        # noqa: raw-pathlib-controller-only — operator-supplied secret-file path.
+        # Issue #1354: try-open-and-read instead of stat-fail-then-abort so
+        # `/dev/fd/N` (Bash process substitution `<(...)`), named pipes, and
+        # character/socket specials all work. The error path below names the
+        # process-substitution + sudo-subshell interaction as the most common
+        # cause and points at the regular-file / stdin alternatives.
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = handle.read()
+        except FileNotFoundError as exc:
+            raise SetupError(
+                f"{file_flag} path stat failed: {file_path} "
+                f"(file does not exist; use {file_flag} <regular-file> "
+                f"or {stdin_flag_label} and pipe the secret on stdin). "
+                "Note: process substitution `<(...)` → /dev/fd/N is not "
+                "preserved across sudo / subshell wrappers."
+            ) from exc
+        except (PermissionError, OSError) as exc:
+            # Includes EACCES, EISDIR, ENXIO (FIFO closed), and the
+            # process-substitution-across-sudo case where `/dev/fd/63`
+            # exists in the parent shell but not inside the sudo subshell
+            # the wizard wraps the python call in.
+            hint = (
+                f"{file_flag} path could not be opened: {file_path} "
+                f"({exc.__class__.__name__}: {exc}). "
+                "Process substitution (`<(...)` → /dev/fd/N) is not preserved across sudo / subshell "
+                f"wrappers; use {file_flag} <regular-file> or "
+                f"{stdin_flag_label} and pipe the secret on stdin."
+            )
+            raise SetupError(hint) from exc
+        # Single trailing newline strip (some tools add it); leave interior
+        # whitespace and any second trailing newline alone so multi-line keys
+        # and operator-meaningful trailing whitespace are preserved.
+        if data.endswith("\n"):
+            secret = data[:-1]
+        else:
+            secret = data
+        if not secret:
+            raise SetupError(
+                f"{file_flag} path opened but yielded an empty secret: {file_path} "
+                f"(producer wrote zero bytes before EOF)."
+            )
+        return secret
     env_value = os.environ.get(env_name, "").strip()
     if env_value:
         return env_value
@@ -2045,15 +2138,31 @@ def cmd_teams(args: argparse.Namespace) -> int:
             flag_name="--app-password",
             file_path=args.app_password_file,
             env_name="BRIDGE_TEAMS_APP_PASSWORD",
+            stdin_flag=bool(getattr(args, "app_password_stdin", False)),
+            stdin_flag_name="--app-password-stdin",
         )
-        app_password = str(
-            app_password_arg
-            or account_cfg.get("appPassword")
-            or account_cfg.get("app_password")
-            or account_cfg.get("clientSecret")
-            or account_cfg.get("client_secret")
-            or inspected["app_password"]
-        ).strip()
+        # Issue #1354 R2 (codex r1 BLOCKING #2): do NOT `.strip()` the
+        # secret here. `read_secret_value` already strips at most one
+        # trailing newline (the canonical contract — multi-line key
+        # material and operator-meaningful trailing whitespace are
+        # preserved). A handler-level `.strip()` greedily removes leading
+        # AND trailing whitespace including a second trailing newline,
+        # silently truncating valid secrets. The fallback paths
+        # (account_cfg, inspected) are configuration JSON / existing .env
+        # values; preserve them verbatim too — if `appPassword` in the
+        # account JSON has stray trailing whitespace the operator put it
+        # there and the .env round-trip already preserves it.
+        if app_password_arg:
+            app_password = app_password_arg
+        else:
+            app_password = (
+                account_cfg.get("appPassword")
+                or account_cfg.get("app_password")
+                or account_cfg.get("clientSecret")
+                or account_cfg.get("client_secret")
+                or inspected["app_password"]
+                or ""
+            )
         tenant_id = str(args.tenant_id or account_cfg.get("tenantId") or account_cfg.get("tenant_id") or inspected["tenant_id"]).strip()
         service_url = str(args.service_url or account_cfg.get("serviceUrl") or account_cfg.get("service_url") or inspected["service_url"]).strip()
         webhook_host = str(args.webhook_host or inspected["webhook_host"] or "127.0.0.1").strip()
@@ -2416,8 +2525,18 @@ def cmd_ms365(args: argparse.Namespace) -> int:
             flag_name="--client-secret",
             file_path=args.client_secret_file,
             env_name="BRIDGE_MS365_CLIENT_SECRET",
+            stdin_flag=bool(getattr(args, "client_secret_stdin", False)),
+            stdin_flag_name="--client-secret-stdin",
         )
-        client_secret = (client_secret_arg or inspected["client_secret"]).strip()
+        # Issue #1354 R2 (codex r1 BLOCKING #2): same shape as the teams
+        # handler — do NOT `.strip()` the secret. read_secret_value
+        # already does the canonical single-trailing-newline strip;
+        # handler-level `.strip()` would greedily eat operator-meaningful
+        # trailing whitespace and a legitimate second newline.
+        if client_secret_arg:
+            client_secret = client_secret_arg
+        else:
+            client_secret = inspected["client_secret"] or ""
         default_upn = (args.default_upn or inspected["default_upn"]).strip()
 
         # Issue #1355: protocol-convention default for --default-scopes.
@@ -2925,7 +3044,28 @@ def build_parser() -> argparse.ArgumentParser:
     teams_parser.add_argument("--channel-account")
     teams_parser.add_argument("--app-id", default="")
     teams_parser.add_argument("--app-password", default="")
-    teams_parser.add_argument("--app-password-file", default="")
+    # Issue #1354 R2 (codex r1 BLOCKING #1): `--app-password-file` and
+    # `--app-password-stdin` are mutually exclusive. argparse raises a
+    # non-zero exit when both are passed; pre-R2 the wizard silently
+    # preferred stdin and dropped the file value (precedence in
+    # `read_secret_value`), making it possible to leak the wrong secret
+    # without any signal to the operator.
+    #
+    # `default=None` (not `default=""`) so argparse can distinguish "user
+    # passed `--app-password-file ''`" from "user did not pass the flag
+    # at all". With `default=""`, argparse treats an explicit empty
+    # value as a no-op and lets `--app-password-file '' --app-password-stdin`
+    # bypass the mutex group (codex r2 review surfaced this argparse
+    # quirk). `read_secret_value` already treats `None` and `""` as the
+    # same "no file path" signal downstream.
+    teams_password_source = teams_parser.add_mutually_exclusive_group()
+    teams_password_source.add_argument("--app-password-file", default=None)
+    # Issue #1354: explicit stdin path for the secret. Bash process
+    # substitution `<(...)` lands as `/dev/fd/N` which is portable when the
+    # wizard does NOT cross a sudo boundary, but breaks when it does.
+    # `--app-password-stdin` is the unambiguous escape hatch — pipe the
+    # secret into stdin and the wizard reads it once.
+    teams_password_source.add_argument("--app-password-stdin", action="store_true")
     teams_parser.add_argument("--tenant-id", default="")
     teams_parser.add_argument("--service-url", default="")
     teams_parser.add_argument("--messaging-endpoint", default="")
@@ -2958,7 +3098,16 @@ def build_parser() -> argparse.ArgumentParser:
     ms365_parser.add_argument("--tenant-id", default="")
     ms365_parser.add_argument("--client-id", default="")
     ms365_parser.add_argument("--client-secret", default="")
-    ms365_parser.add_argument("--client-secret-file", default="")
+    # Issue #1354 R2 (codex r1 BLOCKING #1): `--client-secret-file` and
+    # `--client-secret-stdin` are mutually exclusive. See teams parser
+    # `--app-password-*` mutex for rationale (including the `default=None`
+    # choice that avoids the argparse default-equivalence quirk).
+    ms365_secret_source = ms365_parser.add_mutually_exclusive_group()
+    ms365_secret_source.add_argument("--client-secret-file", default=None)
+    # Issue #1354: explicit stdin path for the secret. See teams parser
+    # `--app-password-stdin` for rationale (process substitution + sudo
+    # subshell drops the `/dev/fd/N` mapping).
+    ms365_secret_source.add_argument("--client-secret-stdin", action="store_true")
     ms365_parser.add_argument("--default-upn", default="")
     # Issue #1355 r2 (codex r1 BLOCKING 1): argparse `default=""` cannot
     # distinguish "flag omitted" from `--default-scopes ""` — both land
