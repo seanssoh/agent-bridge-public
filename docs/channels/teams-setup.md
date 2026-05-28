@@ -68,6 +68,35 @@ agb setup teams patch \
   --yes
 ```
 
+### Secret delivery alternatives
+
+The wizard accepts three argv-safe forms for the bot client secret. Pick the
+one that matches your invocation style:
+
+1. **`--app-password-file <path>`** — pass any path the wizard can `open()`:
+   a regular file (the safest default, e.g. a `chmod 600` tempfile), or any of
+   `/dev/fd/N`, named pipes, character/socket specials when the wizard runs
+   without crossing a sudo subshell boundary. Bash process substitution
+   `<(printf '%s' "$secret")` works in plain-shell invocations but **breaks
+   when the call is wrapped in `sudo`** — the `/dev/fd/63` mapping does not
+   survive the subshell (issue #1354). Use a tempfile or `--app-password-stdin`
+   for `sudo`-wrapped flows.
+2. **`--app-password-stdin`** — the wizard reads the secret once from its own
+   stdin and uses it. Portable across sudo, useful in CI:
+   ```bash
+   printf '%s' "$BRIDGE_TEAMS_APP_PASSWORD" | agb setup teams patch \
+     --app-id "<azure-bot-app-id>" \
+     --tenant-id "<tenant-id>" \
+     --app-password-stdin \
+     --allow-from "<aad-object-id>" \
+     --messaging-endpoint "https://bot.example.com/api/messages" \
+     --webhook-host "0.0.0.0" --webhook-port "3978" --ingress-port "80" \
+     --yes
+   ```
+3. **`BRIDGE_TEAMS_APP_PASSWORD` env var** — the legacy form shown above.
+   Same security posture as `--app-password-stdin` (no argv, no shell
+   history), but the secret remains in the parent shell's environment.
+
 What this does:
 
 - writes `agents/<agent>/.teams/.env`

@@ -19,8 +19,8 @@ usage() {
 Usage:
   $(basename "$0") discord <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--channel <id>]... [--allow-from <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
-  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
-  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run] [--allow-probe-failure]
+  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--app-password-stdin] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
+  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--client-secret-stdin] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run] [--allow-probe-failure]
   $(basename "$0") agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start] [setup options...]
   $(basename "$0") admin <agent>
 
@@ -55,13 +55,13 @@ EOF
     teams)
       cat <<EOF
 Usage:
-  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
+  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--app-password-stdin] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
 EOF
       ;;
     ms365)
       cat <<EOF
 Usage:
-  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run] [--allow-probe-failure]
+  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--client-secret-stdin] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run] [--allow-probe-failure]
 EOF
       ;;
     agent)
@@ -699,7 +699,13 @@ run_teams() {
         py_args+=("$1" "$2")
         shift 2
         ;;
-      --require-mention|--skip-validate|--skip-send-test|--yes|--dry-run)
+      --require-mention|--skip-validate|--skip-send-test|--yes|--dry-run|--app-password-stdin)
+        # Issue #1354: `--app-password-stdin` is a value-less flag forwarded
+        # to the python wizard. The wizard reads sys.stdin once and uses
+        # the result as the secret. Process-substitution `<(...)` is the
+        # documented alternative for non-stdin cases but it does not
+        # survive the sudo-subshell wrapper run_teams puts around the
+        # python invocation; --app-password-stdin is the portable path.
         [[ "$1" == "--dry-run" ]] && dry_run=1
         py_args+=("$1")
         shift
@@ -835,9 +841,12 @@ run_ms365() {
         py_args+=("$1" "$2")
         shift 2
         ;;
-      --allow-localhost|--yes|--dry-run)
+      --allow-localhost|--yes|--dry-run|--client-secret-stdin)
         # PR #1220 codex r1: --allow-localhost is a value-less flag
         # that the Python wizard records as MS365_REDIRECT_URI_ALLOW_LOCALHOST=1.
+        # Issue #1354: --client-secret-stdin is the value-less companion to
+        # --client-secret-file — the wizard reads the secret from stdin
+        # (portable across sudo subshell wrappers, unlike `<(...)`).
         [[ "$1" == "--dry-run" ]] && dry_run=1
         py_args+=("$1")
         shift
