@@ -35,6 +35,14 @@ DEFAULT_MAX_BODY_BYTES = 256 * 1024
 DEFAULT_MAX_TITLE_BYTES = 1024
 DEFAULT_TIMESTAMP_SKEW_SECONDS = 300
 
+# v0.14.5-beta5-2 Lane λ (#1326): timestamps within (skew, grace_skew] are
+# treated as transient clock drift — the receiver responds with 503 +
+# Retry-After so the sender retries after the operator clock-syncs. Beyond
+# grace_skew the timestamp is too old to be drift; the request is rejected
+# with 401 (likely replay of a stale captured payload). Default grace =
+# 1 hour, configurable via top-level `timestamp_skew_grace_seconds`.
+DEFAULT_TIMESTAMP_SKEW_GRACE_SECONDS = 3600
+
 # Sender outbox caps — fail new sends locally instead of growing unbounded.
 DEFAULT_OUTBOX_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 DEFAULT_OUTBOX_MAX_PENDING_PER_PEER = 500
@@ -190,6 +198,59 @@ def peer_send_secret(peer: dict[str, Any]) -> str:
     if not secrets:
         raise A2AError(f"peer {peer.get('id')} has no secret configured", code="peer_no_secret")
     return secrets[0]
+
+
+def _allow_insecure_no_secret() -> bool:
+    """v0.14.5-beta5-2 Lane λ (#1331): paired flag to allow empty peer secrets.
+
+    Both env vars must be set to "1" — this is deliberately a *paired* flag
+    so a single env-var leak (e.g. a stale shell profile) cannot silently
+    relax the secret-validation contract in production. Mirrors the existing
+    `BRIDGE_A2A_ALLOW_TEST_BIND` pattern (loopback bind escape hatch) and is
+    only intended for the smoke harness, never for real deployments.
+    """
+    return (
+        os.environ.get("BRIDGE_A2A_DEV_INSECURE_BIND") == "1"
+        and os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") == "1"
+    )
+
+
+def validate_config_peer_secrets(
+    cfg: dict[str, Any], *, side: str = "receiver",
+) -> None:
+    """Refuse a config that carries any peer with an empty/missing secret.
+
+    `side` is "receiver" or "sender" — used only in the error message so
+    operators see which boot path tripped the check. Auditing of insecure
+    test-mode bypass is the caller's job (it has access to the audit
+    sink); this helper just enforces the contract.
+
+    Note: bridges that have *no* peers configured at all are allowed —
+    that is the early-install / probe state and we don't want to wedge
+    `handoffd preflight` on a fresh checkout. The fail-closed contract
+    fires only when at least one peer entry exists with no usable key.
+    """
+    peers = cfg.get("peers", [])
+    if not isinstance(peers, list):
+        return
+    insecure: list[str] = []
+    for peer in peers:
+        if not isinstance(peer, dict):
+            continue
+        if not peer_secrets(peer):
+            insecure.append(str(peer.get("id") or "(missing id)"))
+    if not insecure:
+        return
+    if _allow_insecure_no_secret():
+        return
+    raise A2AError(
+        f"A2A {side} refuses to start: peer(s) {', '.join(insecure)} "
+        "have no 'secret' configured. Set a long random shared secret "
+        "(>=32 random bytes) for each peer in handoff.local.json under "
+        "peers[].secret. For loopback test runs only, set BOTH "
+        "BRIDGE_A2A_DEV_INSECURE_BIND=1 and BRIDGE_A2A_ALLOW_TEST_BIND=1.",
+        code="peer_no_secret",
+    )
 
 
 def peer_cap(peer: dict[str, Any], key: str, default: Any) -> Any:

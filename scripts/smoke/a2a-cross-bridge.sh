@@ -169,9 +169,13 @@ allowlist_fail() {
 }
 
 skew_reject() {
+  # #1326: timestamps far beyond the grace window (here: Unix epoch 100,
+  # i.e. 1970) are too stale to be clock drift and still return 401
+  # (permanent — sender dead-letters). The narrow drift band → 503 case
+  # is exercised by the dedicated beta5-2-lambda-a2a-robustness smoke.
   local out
   out="$(helper skew "$(base_url)" bridge-a "$A2A_SECRET")"
-  smoke_assert_contains "$out" "STATUS=401" "stale timestamp -> 401"
+  smoke_assert_contains "$out" "STATUS=401" "very stale timestamp -> 401 (permanent)"
 }
 
 oversize_cap() {
