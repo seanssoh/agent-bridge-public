@@ -15,12 +15,17 @@
 # and operator-confusing.
 #
 # Fix (Option B from the brief — deterministic two-stage check):
-#   Stage 1: sleep BRIDGE_NUDGE_VERIFY_GRACE_SECONDS (default 2s).
+#   Stage 1: sleep BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS (default 2s).
 #            If task is no longer `queued` → ack, return 0.
-#   Stage 2: if task is still `queued`, sleep an additional
-#            BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2 (default 5s)
-#            and re-poll. Only emit `session_nudge_dropped` if the
-#            SECOND check still observes queued.
+#   Stage 2: if task is still `queued`, wait until
+#            BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS (default 5s) of
+#            TOTAL elapsed time from the start of the verify window
+#            (i.e. sleep stage_2_total - stage_1 = 3s additional) and
+#            re-poll. Only emit `session_nudge_dropped` if the SECOND
+#            check still observes queued. Total wait = stage_2_total
+#            (5s by default), NOT stage_1 + stage_2_total (7s — which
+#            was the r1 mis-implementation that codex r1 BLOCKING 1
+#            flagged).
 #
 # Companion observability: `agb status` renders a rolling
 # `nudge-recheck` line driven by `nudge_recheck_observability_counts`
@@ -30,16 +35,29 @@
 # Test plan:
 #   T1: agent acks within stage 1 (2s)
 #       → no audit row, return 0, no "appears dropped" log.
+#       (5s-boundary assertion: even at default stage_2_total=5, T1
+#       never reaches stage 2 because stage 1 already sees claimed.)
 #   T2: agent acks within stage 1 .. stage 2 window
 #       → stage 1 sees queued, stage 2 sees not-queued
 #       → no `session_nudge_dropped` row, no "appears dropped" log,
 #         return 0.
+#       (5s-boundary assertion: stage 2 polls at stage_2_total=5s
+#       TOTAL elapsed, not stage_1 + stage_2 = 7s.)
 #   T3: agent never acks (still queued after both stages)
 #       → `session_nudge_dropped` row emitted with stage2_used=1,
-#         grace_total_seconds=stage1+stage2, return 1.
-#   T4: STAGE2=0 disables stage 2 (legacy single-stage behavior)
-#       → stage 1 sees queued → immediate drop with stage2_used=0,
-#         grace_total_seconds=stage1, return 1.
+#         grace_total_seconds=stage_2_total=5, return 1. (Pre-r2
+#         this was 7s — see codex r1 BLOCKING 1.)
+#   T4: rapid succession (two nudges to the same agent for the same
+#       task within the verify window) — codex r1 BLOCKING 3.
+#       T4a: first nudge at t=0; stage 1 (2s) sees queued.
+#       T4b: second nudge fires at t=3s while first is still mid-verify;
+#            ack lands at t=2.5s on first nudge — both verify windows
+#            see the task transition to claimed.
+#       → No double `session_nudge_dropped` row, no spurious counter,
+#         both shim invocations return 0. This proves the verify-grace
+#         block alone tolerates rapid succession (the in-source dedup
+#         gate `bridge_daemon_should_skip_nudge` is exercised by the
+#         sibling iota smoke; here we pin the per-call audit-row math).
 #   T5_teeth: bridge-status.py renders the `nudge-recheck` line + JSON
 #       `nudge_recheck` block when an audit row exists, and the
 #       counter SQL distinguishes stage2_used=1 drops from legacy
@@ -157,6 +175,12 @@ timeline_set() {
 # Intentionally a 1:1 copy of the in-source logic so the smoke
 # regression bites if the daemon block drifts (the T5_teeth grep
 # below pins the source shape too).
+#
+# r2 semantic: stage_2_total is the TOTAL elapsed window from the
+# start of verify, not an additional sleep on top of stage 1. The
+# legacy env-var fallback (BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2
+# as ADDITIONAL sleep) is preserved so existing smoke harnesses
+# (scripts/smoke-test.sh STAGE2=0 path) keep working.
 verify_grace_shim() {
   local agent="$1"
   local task_id="$2"
@@ -165,33 +189,47 @@ verify_grace_shim() {
   local idle="${5:-0}"
   local title="${6:-test-title}"
 
-  local nudge_grace_seconds="${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS:-2}"
-  local nudge_grace_stage2_seconds="${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2:-5}"
+  local nudge_grace_seconds="${BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS:-${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS:-2}}"
   [[ "$nudge_grace_seconds" =~ ^[0-9]+$ ]] || nudge_grace_seconds=2
-  [[ "$nudge_grace_stage2_seconds" =~ ^[0-9]+$ ]] || nudge_grace_stage2_seconds=5
+  local nudge_grace_stage2_total
+  if [[ -n "${BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS:-}" ]]; then
+    nudge_grace_stage2_total="${BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS}"
+    [[ "$nudge_grace_stage2_total" =~ ^[0-9]+$ ]] || nudge_grace_stage2_total=5
+  elif [[ -n "${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2:-}" ]]; then
+    local _legacy_stage2_add="${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2}"
+    [[ "$_legacy_stage2_add" =~ ^[0-9]+$ ]] || _legacy_stage2_add=5
+    nudge_grace_stage2_total=$(( nudge_grace_seconds + _legacy_stage2_add ))
+  else
+    nudge_grace_stage2_total=5
+  fi
   local post_status=""
   local nudge_stage2_used=0
   if [[ -n "$task_id" ]]; then
     # Skip the real sleep in smoke — the timeline emulates clock advance.
     post_status="$(bridge_queue_task_status "$task_id" 2>/dev/null || true)"
-    if [[ "$post_status" == "queued" ]] && (( nudge_grace_stage2_seconds > 0 )); then
+    if [[ "$post_status" == "queued" ]] && (( nudge_grace_stage2_total > nudge_grace_seconds )); then
       nudge_stage2_used=1
       post_status="$(bridge_queue_task_status "$task_id" 2>/dev/null || true)"
     fi
     if [[ "$post_status" == "queued" ]]; then
-      local _total_wait_seconds=$(( nudge_grace_seconds + (nudge_stage2_used == 1 ? nudge_grace_stage2_seconds : 0) ))
+      local _total_wait_seconds
+      if (( nudge_stage2_used == 1 )); then
+        _total_wait_seconds=$nudge_grace_stage2_total
+      else
+        _total_wait_seconds=$nudge_grace_seconds
+      fi
       bridge_audit_log daemon session_nudge_dropped "$agent" \
         --detail task_id="$task_id" \
         --detail reason=submit_lost_post_grace \
         --detail grace_seconds="$nudge_grace_seconds" \
-        --detail grace_seconds_stage2="$nudge_grace_stage2_seconds" \
+        --detail grace_stage2_total_seconds="$nudge_grace_stage2_total" \
         --detail grace_total_seconds="$_total_wait_seconds" \
         --detail stage2_used="$nudge_stage2_used" \
         --detail queued="$live_queued" \
         --detail claimed="$live_claimed" \
         --detail idle_seconds="$idle" \
         --detail title="$title"
-      daemon_info "nudge to ${agent} appears dropped (task #${task_id} still queued after ${_total_wait_seconds}s, stage1=${nudge_grace_seconds}s+stage2=${nudge_grace_stage2_seconds}s); will retry on next idle-nudge tick"
+      daemon_info "nudge to ${agent} appears dropped (task #${task_id} still queued after ${_total_wait_seconds}s, stage1=${nudge_grace_seconds}s stage2_total=${nudge_grace_stage2_total}s); will retry on next idle-nudge tick"
       return 1
     fi
   fi
@@ -233,33 +271,43 @@ PYEOF
   python3 "$AUDIT_DETAIL_HELPER" "$row" "$field"
 }
 
-# --- T1: agent acks within stage 1 ---------------------------------
+# --- T1: agent acks within stage 1 (5s-boundary baseline) --------
 smoke_run "T1 stage1-ack: no audit, no drop log" : ; {
   : >"$AUDIT_LOG"
   : >"$DAEMON_INFO_LOG"
   # Timeline: stage 1 check sees claimed.
   timeline_set 101 claimed
+  # Pin defaults explicitly so the test asserts the published 2s+5s
+  # contract regardless of env inherited from the smoke harness.
+  export BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS=2
+  export BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS=5
   set +e
   verify_grace_shim "agent-t1" "101" 1 0 0 "t1"
   rc=$?
   set -e
+  unset BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS
   smoke_assert_eq 0 "$rc" "T1 returns 0 on stage-1 ack"
   drop_count="$(audit_count session_nudge_dropped agent-t1)"
   smoke_assert_eq 0 "$drop_count" "T1 no session_nudge_dropped row"
   smoke_assert_not_contains "$(cat "$DAEMON_INFO_LOG")" "appears dropped" "T1 no 'appears dropped' log"
 }
 
-# --- T2: agent acks within stage 2 window --------------------------
+# --- T2: agent acks within stage 2 window (5s-boundary suppression) ---
 smoke_run "T2 stage2-ack: stage1 queued, stage2 not — no audit, no drop log" : ; {
   : >"$AUDIT_LOG"
   : >"$DAEMON_INFO_LOG"
   # Timeline: stage 1 still queued; stage 2 sees claimed (the
-  # false-positive case from #1323 comment 2026-05-28).
+  # false-positive case from #1323 comment 2026-05-28). With the r2
+  # rewrite, the SECOND status poll happens at stage_2_total = 5s
+  # total elapsed (NOT 2+5=7s).
   timeline_set 202 queued claimed
+  export BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS=2
+  export BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS=5
   set +e
   verify_grace_shim "agent-t2" "202" 1 0 0 "t2"
   rc=$?
   set -e
+  unset BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS
   smoke_assert_eq 0 "$rc" "T2 returns 0 on stage-2 ack"
   drop_count="$(audit_count session_nudge_dropped agent-t2)"
   smoke_assert_eq 0 "$drop_count" "T2 no session_nudge_dropped row (false positive suppressed)"
@@ -267,41 +315,95 @@ smoke_run "T2 stage2-ack: stage1 queued, stage2 not — no audit, no drop log" :
 }
 
 # --- T3: agent never acks → emit drop with stage2_used=1 ----------
+# r2 BLOCKING 1: grace_total_seconds is the TOTAL window (5s), not
+# stage_1 + stage_2 (7s). The previous r1 assertion of 7 was the bug.
 smoke_run "T3 both-stages-queued: emit drop with stage2_used=1" : ; {
   : >"$AUDIT_LOG"
   : >"$DAEMON_INFO_LOG"
   timeline_set 303 queued queued
+  export BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS=2
+  export BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS=5
   set +e
   verify_grace_shim "agent-t3" "303" 1 0 0 "t3"
   rc=$?
   set -e
+  unset BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS
   smoke_assert_eq 1 "$rc" "T3 returns 1 on stage-2 still-queued"
   drop_count="$(audit_count session_nudge_dropped agent-t3)"
   smoke_assert_eq 1 "$drop_count" "T3 one session_nudge_dropped row"
   stage2_used="$(audit_latest_detail session_nudge_dropped agent-t3 stage2_used)"
   smoke_assert_eq 1 "$stage2_used" "T3 stage2_used=1"
   total="$(audit_latest_detail session_nudge_dropped agent-t3 grace_total_seconds)"
-  smoke_assert_eq 7 "$total" "T3 grace_total_seconds = stage1(2) + stage2(5) = 7"
+  smoke_assert_eq 5 "$total" "T3 grace_total_seconds = stage_2_total = 5 (NOT stage_1+stage_2=7)"
+  stage2_total="$(audit_latest_detail session_nudge_dropped agent-t3 grace_stage2_total_seconds)"
+  smoke_assert_eq 5 "$stage2_total" "T3 grace_stage2_total_seconds = 5"
   smoke_assert_contains "$(cat "$DAEMON_INFO_LOG")" "appears dropped" "T3 'appears dropped' log present"
-  smoke_assert_contains "$(cat "$DAEMON_INFO_LOG")" "stage1=2s+stage2=5s" "T3 log cites both stages"
+  smoke_assert_contains "$(cat "$DAEMON_INFO_LOG")" "stage1=2s stage2_total=5s" "T3 log cites stage_1 + stage_2_total"
 }
 
-# --- T4: STAGE2=0 disables stage 2 (legacy single-stage) ----------
-smoke_run "T4 STAGE2=0 disables stage 2 → drop after stage1 only" : ; {
+# --- T4: rapid succession — codex r1 BLOCKING 3 -------------------
+# T4a: nudge 1 at t=0; stage 1 (2s) sees queued.
+# T4b: ack lands at t=2.5s on first nudge; stage 2 poll sees claimed.
+# T4c: nudge 2 fires at t=3s (operator-overlapping idle-nudge tick or
+#      a new task surfacing on the same agent within the same verify
+#      window). Both stage-1 and stage-2 polls of nudge 2 see the
+#      task as claimed (it was acked at t=2.5s).
+#
+# Assertion: zero `session_nudge_dropped` rows total; both shim
+# invocations return 0; no double-counter. This pins the per-call
+# audit-row math under rapid succession — the in-source dedup gate
+# `bridge_daemon_should_skip_nudge` is exercised by the sibling iota
+# smoke (beta5-2-iota-daemon-escalation-family).
+smoke_run "T4 rapid succession: no double-audit, no double-counter, sane return" : ; {
   : >"$AUDIT_LOG"
   : >"$DAEMON_INFO_LOG"
-  timeline_set 404 queued
+
+  # Nudge 1 timeline: stage 1 queued → stage 2 claimed (ack at t=2.5s).
+  timeline_set 404 queued claimed
+  export BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS=2
+  export BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS=5
+  set +e
+  verify_grace_shim "agent-t4" "404" 1 0 0 "t4-nudge-1"
+  rc1=$?
+  set -e
+  smoke_assert_eq 0 "$rc1" "T4 nudge 1 returns 0 (stage 2 sees ack)"
+  drop_after_n1="$(audit_count session_nudge_dropped agent-t4)"
+  smoke_assert_eq 0 "$drop_after_n1" "T4 nudge 1: no session_nudge_dropped row"
+
+  # Nudge 2 timeline: task already acked → both polls see claimed.
+  timeline_set 404 claimed claimed
+  set +e
+  verify_grace_shim "agent-t4" "404" 1 0 0 "t4-nudge-2"
+  rc2=$?
+  set -e
+  unset BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS
+  smoke_assert_eq 0 "$rc2" "T4 nudge 2 returns 0 (task already claimed)"
+
+  drop_total="$(audit_count session_nudge_dropped agent-t4)"
+  smoke_assert_eq 0 "$drop_total" "T4 no double-audit (zero drops across both nudges)"
+  smoke_assert_not_contains "$(cat "$DAEMON_INFO_LOG")" "appears dropped" "T4 no 'appears dropped' log on either nudge"
+}
+
+# --- T4_legacy: STAGE2 fallback path still disables stage 2 -------
+# Legacy r1 env var (BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2=0) must
+# keep working so the existing scripts/smoke-test.sh STAGE2=0 path
+# does not break on the rename. Same as r1's T4 in spirit; renamed to
+# T4_legacy because the brief reassigned T4 to the race scenario.
+smoke_run "T4_legacy STAGE2=0 (legacy env) disables stage 2 → drop after stage1 only" : ; {
+  : >"$AUDIT_LOG"
+  : >"$DAEMON_INFO_LOG"
+  timeline_set 405 queued
   export BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2=0
   set +e
-  verify_grace_shim "agent-t4" "404" 1 0 0 "t4"
+  verify_grace_shim "agent-t4legacy" "405" 1 0 0 "t4legacy"
   rc=$?
   set -e
   unset BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2
-  smoke_assert_eq 1 "$rc" "T4 returns 1 (stage 2 disabled, stage 1 still queued)"
-  stage2_used="$(audit_latest_detail session_nudge_dropped agent-t4 stage2_used)"
-  smoke_assert_eq 0 "$stage2_used" "T4 stage2_used=0 (skipped)"
-  total="$(audit_latest_detail session_nudge_dropped agent-t4 grace_total_seconds)"
-  smoke_assert_eq 2 "$total" "T4 grace_total_seconds = stage1 only = 2"
+  smoke_assert_eq 1 "$rc" "T4_legacy returns 1 (stage 2 disabled via legacy STAGE2=0, stage 1 still queued)"
+  stage2_used="$(audit_latest_detail session_nudge_dropped agent-t4legacy stage2_used)"
+  smoke_assert_eq 0 "$stage2_used" "T4_legacy stage2_used=0 (skipped)"
+  total="$(audit_latest_detail session_nudge_dropped agent-t4legacy grace_total_seconds)"
+  smoke_assert_eq 2 "$total" "T4_legacy grace_total_seconds = stage1 only = 2"
 }
 
 # --- T5: bridge-status.py renders the counter line + JSON ----------
@@ -384,12 +486,22 @@ smoke_run "T5_teeth structural shape in bridge-daemon.sh + bridge-status.py" : ;
   daemon_sh="$REPO_ROOT/bridge-daemon.sh"
   status_py="$REPO_ROOT/bridge-status.py"
 
+  # r2 BLOCKING 1: bridge-daemon.sh must reference both new env var
+  # names. The legacy BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2 grep
+  # is preserved separately so the back-compat fallback survives any
+  # future renames.
+  grep -q 'BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS' "$daemon_sh" \
+    || smoke_fail "teeth: bridge-daemon.sh must reference BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS"
+  grep -q 'BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS' "$daemon_sh" \
+    || smoke_fail "teeth: bridge-daemon.sh must reference BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS"
   grep -q 'BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2' "$daemon_sh" \
-    || smoke_fail "teeth: bridge-daemon.sh must reference BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2"
+    || smoke_fail "teeth: bridge-daemon.sh must keep BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2 fallback"
   grep -q 'stage2_used' "$daemon_sh" \
     || smoke_fail "teeth: bridge-daemon.sh must emit stage2_used detail on session_nudge_dropped"
   grep -q 'grace_total_seconds' "$daemon_sh" \
     || smoke_fail "teeth: bridge-daemon.sh must emit grace_total_seconds detail"
+  grep -q 'grace_stage2_total_seconds' "$daemon_sh" \
+    || smoke_fail "teeth: bridge-daemon.sh must emit grace_stage2_total_seconds detail (r2)"
 
   grep -q 'nudge_recheck_observability_counts' "$status_py" \
     || smoke_fail "teeth: bridge-status.py must define nudge_recheck_observability_counts"

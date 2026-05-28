@@ -503,7 +503,8 @@ def nudge_recheck_observability_counts(
       whose `stage2_used=1` — i.e. drops that survived BOTH the stage-1
       and stage-2 grace windows. Stage-2 drops are stronger evidence of
       a real lost submit; stage-1-only drops are a stricter operator
-      knob (BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2=0).
+      knob (BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS<=STAGE_1, or the
+      legacy BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2=0 fallback).
     - `recheck_timeout_total`: `nudge_eligibility_recheck_timeout` rows
       (per #1323 H5 audit-row commit). The companion escalation row
       `nudge_recheck_timeout_escalated` lives in the audit log itself —

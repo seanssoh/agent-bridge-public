@@ -782,6 +782,16 @@ select_for_path() {
       # at-most-once admin escalation; (e) the unclaimed-queue daemon
       # tick + per-task marker cooldown contract.
       add_required beta5-2-iota-daemon-escalation-family
+      # v0.15.0-beta5-2 Track G (#1323 r2): bridge-daemon.sh's
+      # nudge_agent_session verify-grace block now does a two-stage
+      # check (stage_2 = TOTAL elapsed-time gate, not additional
+      # sleep). Pull 1323-nudge-eligibility-recheck-twostage on every
+      # bridge-daemon.sh move so a future PR cannot silently regress
+      # the two-stage shape, the env-knob fallbacks
+      # (BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS / _STAGE_2_SECONDS), or
+      # the rapid-succession dedup that prevents a same-agent second
+      # nudge from spawning a parallel verify window.
+      add_required 1323-nudge-eligibility-recheck-twostage
       # v0.15.0-beta5-2 Lane μ (#1327 / #1328): bridge-daemon.sh's
       # `cmd_run_cron_worker` now re-checks the manual-stop marker at
       # execute time (edge case 1: agent restart between dispatch and
