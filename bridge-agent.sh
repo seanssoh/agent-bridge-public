@@ -3497,6 +3497,20 @@ report and reap test-fixture agents per their pattern."
       # ``bridge_isolation_v2_enforce`` (Linux only) and on a resolvable
       # per-agent group; a shared-mode / non-linux-user agent skips
       # silently.
+      #
+      # Issue #1332 L2 (v0.14.5-beta5-2 Lane ξ): the materializer above
+      # now performs per-file chgrp+chmod immediately after each ``cp -f``
+      # via ``bridge_isolation_v2_chgrp_file_iso_group`` so that each
+      # materialized file is iso-UID-readable atomically — closing the
+      # per-file race window where a concurrent iso-side reader could
+      # see ``Permission denied``. This BULK normalize stays as a final
+      # safety net (idempotent stat-skip), and it remains the sole
+      # normalize site for the upgrade-time backfill in
+      # ``lib/bridge-isolation-v2-workdir-backfill.sh``. The dual-pass
+      # contract is intentional: per-file inside materialize closes the
+      # tight loop race; the bulk pass here closes the tail-end gap
+      # (additional directories / .claude/ tree / known_marketplaces.json)
+      # that the per-file loop does not iterate over.
       if [[ "$isolation_mode" == "linux-user" ]] \
           && declare -F bridge_isolation_v2_normalize_workdir_profile_group >/dev/null 2>&1; then
         bridge_isolation_v2_normalize_workdir_profile_group "$agent" "$workdir" \
@@ -6271,12 +6285,18 @@ Operator note: $note"
   actor="$(bridge_admin_agent_id)"
   [[ -n "$actor" ]] || actor="bridge-admin"
 
+  # Issue #1318 part A (v0.14.5-beta5-2 Lane ξ): admin-driven compact /
+  # handoff is dispatched intentionally against a possibly-stopped agent
+  # — the task will be consumed when the agent restarts. Use --force to
+  # bypass the active-state refuse check that protects the unsuspecting
+  # interactive `agb task create` flow.
   "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-task.sh" create \
     --to "$agent" \
     --from "$actor" \
     --priority high \
     --title "$title" \
-    --body "$body" >/dev/null
+    --body "$body" \
+    --force >/dev/null
 
   bridge_audit_log "$actor" "$audit_action" "$agent" \
     --detail via=bridge-primitive \

@@ -1543,10 +1543,14 @@ bridge_emit_daily_backup_failure_admin_task() {
       ;;
   esac
 
+  # Issue #1318 part A (v0.14.5-beta5-2 Lane ξ): daemon-fired urgent
+  # backup-failure escalation must enqueue even when admin is currently
+  # stopped — the task is the signal the operator restarts admin to
+  # consume. --force bypasses the active-state refuse gate.
   if ! "$target_bridge" task create \
        --to "$admin" --priority urgent --from daemon \
        --title "[backup-failed:${reason}] daily-backup paused on ${hostname_short}" \
-       --body-file "$body_file" >/dev/null 2>&1; then
+       --body-file "$body_file" --force >/dev/null 2>&1; then
     daemon_warn "failed to file [backup-failed:${reason}] task to admin=${admin}; check the admin id and try again"
   fi
   rm -f "$body_file"
@@ -2461,10 +2465,13 @@ process_a2a_outbox_stuck_scan_tick() {
       printf '`BRIDGE_A2A_STUCK_ALERT_REEMIT_SECS` (default 1h).\n'
     } >"$body_file"
 
+    # Issue #1318 part A (v0.14.5-beta5-2 Lane ξ): A2A stuck-outbox
+    # alerts to admin must enqueue when admin is stopped — the alert IS
+    # the trigger to wake admin.
     if "$target_bridge" task create \
          --to "$admin" --priority high --from daemon \
          --title "[A2A] outbox stuck: ${peer}:${target_agent} (${message_id:0:8})" \
-         --body-file "$body_file" >/dev/null 2>&1; then
+         --body-file "$body_file" --force >/dev/null 2>&1; then
       emitted=$((emitted + 1))
       # Codex r1 BLOCKING fix: stamp the ledger via ack helper at the
       # end of the loop, ONLY for rows whose admin task we actually
@@ -4863,10 +4870,13 @@ This is the operator-visible audit signal for issue #1311. The structured
 investigation is needed (\`agent-bridge audit follow --action nudge_deferred\`).
 EOF
 
+  # Issue #1318 part A (v0.14.5-beta5-2 Lane ξ): nudge-deferred alerts
+  # to admin must enqueue when admin is stopped — the alert IS the
+  # signal to start admin and triage the stuck agent.
   if ! "$target_bridge" task create \
        --to "$admin" --priority high --from daemon \
        --title "[nudge-deferred:${reason}] ${agent} stuck (${consecutive}× deferral) on ${hostname_short}" \
-       --body-file "$body_file" >/dev/null 2>&1; then
+       --body-file "$body_file" --force >/dev/null 2>&1; then
     daemon_warn "failed to file [nudge-deferred:${reason}] task to admin=${admin}; check the admin id and try again"
   fi
   rm -f "$body_file" >/dev/null 2>&1 || true

@@ -184,7 +184,11 @@ cmd_question() {
   fi
 
   if [[ $dry_run -eq 0 ]]; then
-    create_output="$(bash "$SCRIPT_DIR/bridge-task.sh" create --to "$admin_agent" --from "$agent" --priority urgent --title "$title" --body-file "$body_file")"
+    # Issue #1318 part A (v0.14.5-beta5-2 Lane ξ): urgent escalations to a
+    # stopped admin must still enqueue — the escalation IS the signal
+    # that prompts the operator to start the admin. Without --force,
+    # `agb task create` refuses against stopped agents by default.
+    create_output="$(bash "$SCRIPT_DIR/bridge-task.sh" create --to "$admin_agent" --from "$agent" --priority urgent --title "$title" --body-file "$body_file" --force)"
     if [[ "$create_output" =~ created\ task\ \#([0-9]+) ]]; then
       task_id="${BASH_REMATCH[1]}"
     else
