@@ -985,6 +985,272 @@ def derive_ms365_redirect_uri(messaging_endpoint: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}/auth/callback"
 
 
+# Issue #1355: protocol-convention default scope set for MS Graph.
+# Mail+Calendar are the de-facto MS365/Graph baseline — keeping this as
+# wizard-required cost wizard friction with no default benefit. Site-
+# specific values (client-id, secret, tenant, redirect-uri, default-upn)
+# stay wizard-required; default-scopes is the lone protocol-convention
+# exception and gets surfaced with `default_scopes_source: convention-default`
+# so the operator can see exactly what was applied without digging into
+# `.ms365/.env`.
+MS365_CONVENTION_DEFAULT_SCOPES = (
+    "https://graph.microsoft.com/Mail.Read "
+    "https://graph.microsoft.com/Mail.Send "
+    "https://graph.microsoft.com/Calendars.ReadWrite "
+    "offline_access"
+)
+
+
+def ms365_normalize_redirect_uri_for_compare(uri: str) -> str:
+    """Normalize a redirect URI for Entra registration comparison.
+
+    Entra app registrations match redirect URIs verbatim against the
+    operator-registered string. The Microsoft identity platform treats
+    `https://x/cb` and `https://x/cb/` as distinct (the trailing slash
+    matters). The probe still needs a basic sanity-normalization step to
+    avoid spurious mismatches from query strings (which Microsoft
+    discards) and whitespace. Compare on the path + scheme + host only;
+    the query is intentionally NOT stripped at the Entra layer but the
+    wizard always persists a clean URL with no query.
+    """
+    raw = (uri or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw
+    # Build a canonical form: scheme://netloc + path (keep trailing
+    # slash if the operator typed it; Microsoft preserves it). Drop
+    # fragment + query (Entra ignores them in match).
+    path = parsed.path or ""
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def ms365_acquire_graph_token(
+    tenant_id: str,
+    client_id: str,
+    client_secret: str,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Acquire a client_credentials access_token for Microsoft Graph.
+
+    Issue #1356: the redirect URI probe needs an app-only Graph token
+    (Application.Read.All or Directory.Read.All) to list the Entra
+    application's `web.redirectUris`. Returns a structured payload:
+
+      {"status": "ok",   "access_token": "..."}
+      {"status": "skipped", "reason": "creds_missing"|"unreachable"|...}
+      {"status": "error", "detail": "<message>"}
+
+    Caller is responsible for surfacing the skip reason in the wizard
+    output. This function NEVER raises — every transport or
+    application-layer failure routes through the structured return so
+    `cmd_ms365` can decide whether to fail-loud or annotate skipped.
+    """
+    tenant = (tenant_id or "").strip()
+    cid = (client_id or "").strip()
+    secret = (client_secret or "").strip()
+    if not tenant or not cid or not secret:
+        return {"status": "skipped", "reason": "creds_missing"}
+
+    base = os.environ.get(
+        "BRIDGE_MS365_LOGIN_BASE_URL", teams_login_base_url()
+    ).rstrip("/")
+    token_url = f"{base}/{tenant}/oauth2/v2.0/token"
+    body = urlencode(
+        {
+            "client_id": cid,
+            "client_secret": secret,
+            "grant_type": "client_credentials",
+            "scope": "https://graph.microsoft.com/.default",
+        }
+    ).encode("utf-8")
+    request = Request(
+        token_url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "agent-bridge-setup/ms365-redirect-probe",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        try:
+            parsed = json.loads(exc.read().decode("utf-8", errors="replace") or "{}")
+        except json.JSONDecodeError:
+            parsed = {}
+        return {
+            "status": "error",
+            "detail": str(parsed.get("error_description") or parsed.get("error") or exc.reason or "").strip(),
+            "http_status": int(exc.code or 0),
+        }
+    except URLError as exc:
+        return {"status": "skipped", "reason": "unreachable", "detail": str(exc.reason)}
+    except Exception as exc:  # noqa: BLE001 — best-effort probe, never bubble
+        return {"status": "skipped", "reason": "exception", "detail": repr(exc)}
+
+    access_token = str(payload.get("access_token") or "").strip()
+    if not access_token:
+        return {"status": "skipped", "reason": "no_access_token"}
+    return {"status": "ok", "access_token": access_token}
+
+
+def ms365_fetch_entra_redirect_uris(
+    access_token: str,
+    client_id: str,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """List the Entra application's registered `web.redirectUris`.
+
+    Microsoft Graph endpoint:
+      GET /v1.0/applications?$filter=appId eq '<client_id>'&$select=appId,web
+
+    Returns:
+      {"status": "ok",       "redirect_uris": [...]}
+      {"status": "skipped",  "reason": "insufficient_permission"|"unreachable"|...}
+      {"status": "error",    "detail": "<message>"}
+
+    A 403 with `Authorization_RequestDenied` or `Insufficient privileges`
+    surfaces as `skipped: insufficient_permission` so the wizard can
+    annotate `redirect_uri_check: skipped (insufficient app permission)`
+    instead of fail-loud. Any other transport/HTTP failure returns
+    `skipped` so the operator never gets blocked by a probe issue.
+    """
+    cid = (client_id or "").strip()
+    token = (access_token or "").strip()
+    if not cid or not token:
+        return {"status": "skipped", "reason": "missing_inputs"}
+
+    base = os.environ.get(
+        "BRIDGE_MS365_GRAPH_BASE_URL", "https://graph.microsoft.com"
+    ).rstrip("/")
+    filt = urlencode({"$filter": f"appId eq '{cid}'", "$select": "appId,web"})
+    url = f"{base}/v1.0/applications?{filt}"
+    request = Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "agent-bridge-setup/ms365-redirect-probe",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(body or "{}")
+        except json.JSONDecodeError:
+            parsed = {}
+            body = ""
+        code = int(exc.code or 0)
+        error_obj = parsed.get("error") if isinstance(parsed, dict) else None
+        error_code = ""
+        error_msg = ""
+        if isinstance(error_obj, dict):
+            error_code = str(error_obj.get("code") or "").strip()
+            error_msg = str(error_obj.get("message") or "").strip()
+        if code in {401, 403} or error_code in {
+            "Authorization_RequestDenied",
+            "Authorization_IdentityNotFound",
+            "Forbidden",
+        }:
+            return {
+                "status": "skipped",
+                "reason": "insufficient_permission",
+                "detail": (error_msg or body)[:240],
+            }
+        return {
+            "status": "error",
+            "http_status": code,
+            "detail": (error_msg or body or str(exc.reason))[:240],
+        }
+    except URLError as exc:
+        return {"status": "skipped", "reason": "unreachable", "detail": str(exc.reason)}
+    except Exception as exc:  # noqa: BLE001 — best-effort probe, never bubble
+        return {"status": "skipped", "reason": "exception", "detail": repr(exc)}
+
+    values = []
+    if isinstance(payload, dict):
+        items = payload.get("value")
+        if isinstance(items, list):
+            values = items
+    # The filter is an equality match, so the array is either empty
+    # (app not found in this tenant — the app-id is wrong, or the app
+    # registration lives in a different tenant) or one element.
+    if not values:
+        return {"status": "skipped", "reason": "app_not_found"}
+    first = values[0]
+    redirect_uris: list[str] = []
+    if isinstance(first, dict):
+        web = first.get("web")
+        if isinstance(web, dict):
+            raw_uris = web.get("redirectUris")
+            if isinstance(raw_uris, list):
+                redirect_uris = [str(u) for u in raw_uris if isinstance(u, str)]
+    return {"status": "ok", "redirect_uris": redirect_uris}
+
+
+def ms365_check_redirect_uri_registered(
+    redirect_uri: str,
+    tenant_id: str,
+    client_id: str,
+    client_secret: str,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Combined token + Graph fetch + verbatim match. Issue #1356.
+
+    Returns one of:
+      {"status": "registered",   "redirect_uris": [...]}
+      {"status": "not_registered","redirect_uris": [...]}
+      {"status": "skipped",       "reason": "<reason>", "detail"?: "..."}
+      {"status": "error",         "detail": "..."}
+
+    "skipped" is the safe default whenever a transport, permission, or
+    credential precondition prevents the lookup; callers annotate
+    `redirect_uri_check: skipped` and continue (do not abort the
+    wizard). "not_registered" is the only fail-loud signal.
+    """
+    target = (redirect_uri or "").strip()
+    if not target:
+        return {"status": "skipped", "reason": "redirect_uri_empty"}
+
+    token_result = ms365_acquire_graph_token(
+        tenant_id, client_id, client_secret, timeout=timeout
+    )
+    if token_result.get("status") != "ok":
+        # Map "error" → skipped for the wizard surface (the probe is
+        # best-effort; an Entra token failure should not block setup).
+        if token_result.get("status") == "error":
+            return {
+                "status": "skipped",
+                "reason": "token_error",
+                "detail": str(token_result.get("detail") or ""),
+            }
+        return token_result
+
+    fetch_result = ms365_fetch_entra_redirect_uris(
+        token_result["access_token"], client_id, timeout=timeout
+    )
+    if fetch_result.get("status") != "ok":
+        return fetch_result
+
+    registered = list(fetch_result.get("redirect_uris") or [])
+    target_norm = ms365_normalize_redirect_uri_for_compare(target)
+    registered_norm = {ms365_normalize_redirect_uri_for_compare(u) for u in registered}
+    if target_norm in registered_norm or target in registered:
+        return {"status": "registered", "redirect_uris": registered}
+    return {"status": "not_registered", "redirect_uris": registered}
+
+
 def teams_login_base_url() -> str:
     return os.environ.get("BRIDGE_TEAMS_LOGIN_BASE_URL", "https://login.microsoftonline.com").rstrip("/")
 
@@ -1909,6 +2175,19 @@ def print_ms365_result(result: dict[str, Any], *, stream: Any = sys.stdout) -> N
     else:
         print("redirect_uri: (unset)", file=stream)
     print(f"redirect_uri_source: {result['redirect_uri_source']}", file=stream)
+    # Issue #1356: tactical first-line elevation — the warning printer
+    # below puts the "Register this redirect URI" cue dead-last in the
+    # output, after every other field. Operators piping stdout into a
+    # log usually only see the LAST few lines and miss the call to
+    # action. Surface the Entra-registration verification status
+    # IMMEDIATELY after the redirect URI so the action lives next to
+    # the value it applies to.
+    redirect_uri_check = result.get("redirect_uri_check") or ""
+    if redirect_uri_check:
+        print(f"redirect_uri_check: {redirect_uri_check}", file=stream)
+    redirect_uri_registered = result.get("redirect_uri_registered") or ""
+    if redirect_uri_registered:
+        print(f"redirect_uri_registered: {redirect_uri_registered}", file=stream)
     if result["messaging_endpoint"]:
         print(f"messaging_endpoint: {result['messaging_endpoint']}", file=stream)
     if result.get("tenant_id"):
@@ -1917,6 +2196,16 @@ def print_ms365_result(result: dict[str, Any], *, stream: Any = sys.stdout) -> N
         print(f"client_id: {result['client_id']}", file=stream)
     if result.get("default_upn"):
         print(f"default_upn: {result['default_upn']}", file=stream)
+    # Issue #1355: surface the chosen scope set + its source so an
+    # operator can tell at a glance whether the wizard applied the
+    # protocol-convention default, preserved an existing value, or
+    # used an explicit --default-scopes flag.
+    default_scopes = result.get("default_scopes") or ""
+    default_scopes_source = result.get("default_scopes_source") or ""
+    if default_scopes:
+        print(f"default_scopes: {default_scopes}", file=stream)
+    if default_scopes_source:
+        print(f"default_scopes_source: {default_scopes_source}", file=stream)
     # PR #1220 codex r1: surface the allow-localhost state so an
     # operator who set the local-dev escape hatch can see at a glance
     # that the wizard preserved it on rerun.
@@ -1957,6 +2246,17 @@ def cmd_ms365(args: argparse.Namespace) -> int:
         "client_id": "",
         "default_upn": "",
         "allow_localhost": "",
+        # Issue #1355: default_scopes + provenance — when the operator
+        # neither passes --default-scopes nor has an existing value,
+        # the wizard applies MS365_CONVENTION_DEFAULT_SCOPES and
+        # surfaces `default_scopes_source: convention-default`.
+        "default_scopes": "",
+        "default_scopes_source": "",
+        # Issue #1356: redirect URI Entra-registration probe. Both
+        # fields are empty when --skip-entra-probe is in effect (the
+        # operator opted out of the Graph round-trip).
+        "redirect_uri_check": "",
+        "redirect_uri_registered": "",
         "write_status": "pending",
         "warnings": warnings,
     }
@@ -2046,7 +2346,34 @@ def cmd_ms365(args: argparse.Namespace) -> int:
         )
         client_secret = (client_secret_arg or inspected["client_secret"]).strip()
         default_upn = (args.default_upn or inspected["default_upn"]).strip()
-        default_scopes = (args.default_scopes or inspected["default_scopes"]).strip()
+
+        # Issue #1355: protocol-convention default for --default-scopes.
+        # Precedence:
+        #   1. --default-scopes "X Y" → flag (source: flag)
+        #   2. --default-scopes ""    → explicit empty (error — no
+        #      Graph call ever succeeds without at least one scope)
+        #   3. existing .ms365/.env MS365_DEFAULT_SCOPES → preserved
+        #      (source: existing:.ms365/.env)
+        #   4. otherwise → MS365_CONVENTION_DEFAULT_SCOPES
+        #      (source: convention-default)
+        # NOTE: argparse `default=""` means args.default_scopes is `""`
+        # whether the operator did not pass the flag OR passed
+        # `--default-scopes ""`. We treat both as "no override", which
+        # is the documented user expectation — falling back to the
+        # convention default for both cases. Operators who genuinely
+        # want to clobber the scope set need to delete the .env line
+        # by hand (matches the existing client_id / tenant_id contract).
+        flag_default_scopes = (args.default_scopes or "").strip()
+        existing_default_scopes = inspected["default_scopes"].strip()
+        if flag_default_scopes:
+            default_scopes = flag_default_scopes
+            default_scopes_source = "flag:--default-scopes"
+        elif existing_default_scopes:
+            default_scopes = existing_default_scopes
+            default_scopes_source = "existing:.ms365/.env"
+        else:
+            default_scopes = MS365_CONVENTION_DEFAULT_SCOPES
+            default_scopes_source = "convention-default"
 
         # PR #1220 codex r1: preserve the local-dev escape hatch
         # `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` across reruns.
@@ -2070,6 +2397,74 @@ def cmd_ms365(args: argparse.Namespace) -> int:
         result["client_id"] = client_id
         result["default_upn"] = default_upn
         result["allow_localhost"] = allow_localhost
+        result["default_scopes"] = default_scopes
+        result["default_scopes_source"] = default_scopes_source
+
+        # Issue #1356 root: run the Entra Graph probe BEFORE warnings
+        # so a confirmed mismatch fails fast and the operator gets a
+        # clean abort instead of a "wrote .env, now go fix Entra"
+        # confused tail. Probe respects --skip-entra-probe and any
+        # missing credential precondition (which short-circuits to
+        # `skipped: creds_missing`) so OOTB / air-gapped / CI runs
+        # never see a network call. --dry-run also skips the probe to
+        # match the existing dry-run contract of "no external state
+        # is touched".
+        skip_probe = bool(getattr(args, "skip_entra_probe", False)) or bool(args.dry_run)
+        if skip_probe:
+            # Distinguish "operator opted out" from "dry-run" for the
+            # audit surface, but use one stable `redirect_uri_check`
+            # vocabulary so smoke pins stay stable.
+            if args.dry_run:
+                result["redirect_uri_check"] = "skipped (dry-run)"
+            else:
+                result["redirect_uri_check"] = "skipped (--skip-entra-probe)"
+        else:
+            probe = ms365_check_redirect_uri_registered(
+                redirect_uri, tenant_id, client_id, client_secret
+            )
+            probe_status = str(probe.get("status") or "")
+            if probe_status == "registered":
+                result["redirect_uri_check"] = "ok"
+                result["redirect_uri_registered"] = "yes"
+            elif probe_status == "not_registered":
+                # Fail-loud: this is the whole point of #1356. Surface
+                # the list Entra DID return so the operator can spot a
+                # typo (trailing slash, wrong host, http vs https).
+                registered = probe.get("redirect_uris") or []
+                listing = ", ".join(registered) if registered else "(none registered)"
+                result["redirect_uri_check"] = "not_registered"
+                result["redirect_uri_registered"] = "no"
+                raise SetupError(
+                    "redirect URI가 Entra app에 등록돼 있지 않습니다. "
+                    "Authentication → Redirect URIs에 추가한 뒤 다시 실행하세요. "
+                    f"(target: {redirect_uri}; 조회 결과: [{listing}]) "
+                    "Probe를 건너뛰려면 --skip-entra-probe."
+                )
+            elif probe_status == "skipped":
+                reason = str(probe.get("reason") or "unknown")
+                # Map the internal skip reasons to a single operator-
+                # facing line that names the root cause without leaking
+                # the full Graph error body.
+                reason_map = {
+                    "creds_missing": "missing credentials (client_id/secret/tenant)",
+                    "unreachable": "Graph endpoint unreachable",
+                    "insufficient_permission": "insufficient app permission (need Application.Read.All)",
+                    "no_access_token": "token endpoint returned no access_token",
+                    "app_not_found": "appId not found in tenant",
+                    "token_error": "client_credentials token request failed",
+                    "missing_inputs": "internal: missing inputs to fetch",
+                    "exception": "transport exception",
+                    "redirect_uri_empty": "redirect_uri unresolved",
+                }
+                friendly = reason_map.get(reason, reason)
+                result["redirect_uri_check"] = f"skipped ({friendly})"
+            elif probe_status == "error":
+                detail = str(probe.get("detail") or "").strip()
+                # Any "error" surface from the probe layer is non-
+                # fatal — best-effort contract. Annotate and continue.
+                result["redirect_uri_check"] = "skipped (probe error)"
+                if detail:
+                    warnings.append(f"Entra redirect URI probe error: {detail}")
 
         if not tenant_id:
             warnings.append(
@@ -2087,10 +2482,27 @@ def cmd_ms365(args: argparse.Namespace) -> int:
                 "MS365_CLIENT_SECRET is present in .ms365/.env."
             )
 
-        warnings.append(
+        # Issue #1356 tactical: when the probe was registered, the
+        # "register this URI" cue would only confuse. When it wasn't,
+        # the SetupError above already aborted. The cue is only useful
+        # in the skipped + no-write paths. Always emit it (the no-op
+        # cost on the registered path is trivial — one extra line),
+        # but insert it at the FRONT of the warning list so the
+        # operator-facing "next action" lives above the
+        # MS365_TENANT_ID-unset family of plugin-readiness reminders.
+        warnings.insert(
+            0,
             "Register this redirect URI on the Entra app's Authentication → "
-            f"Redirect URIs page: {redirect_uri}"
+            f"Redirect URIs page: {redirect_uri}",
         )
+        # And surface the explicit verification-skipped reminder when
+        # the probe did not return a positive "registered" signal so
+        # the operator knows the wizard could not auto-verify.
+        if result.get("redirect_uri_registered") != "yes":
+            warnings.append(
+                "verification: Entra Authentication 페이지에서 redirect URI 등록 여부를 확인하세요. "
+                "미등록 상태라면 다음 pair_start가 redirect_uri_mismatch로 실패합니다."
+            )
 
         if args.dry_run:
             result["write_status"] = "dry_run"
@@ -2442,6 +2854,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-localhost",
         action="store_true",
         help="Persist MS365_REDIRECT_URI_ALLOW_LOCALHOST=1 (local-dev opt-in; the runtime plugin rejects localhost redirect URIs without this flag).",
+    )
+    # Issue #1356: opt out of the Entra Graph round-trip that verifies
+    # the operator-supplied redirect URI is registered on the Entra app
+    # registration. Useful for OOTB / air-gapped / CI runs where the
+    # Graph endpoint is unreachable or the app lacks Application.Read.All.
+    # The probe ALREADY short-circuits on missing credentials so an
+    # OOTB operator without client-id/secret never sees a Graph call;
+    # this flag is for the rarer "have credentials, do not call Graph"
+    # case (CI smoke).
+    ms365_parser.add_argument(
+        "--skip-entra-probe",
+        action="store_true",
+        help="Skip the Entra app redirect URI registration probe (#1356).",
     )
     ms365_parser.add_argument("--yes", action="store_true")
     ms365_parser.add_argument("--dry-run", action="store_true")
