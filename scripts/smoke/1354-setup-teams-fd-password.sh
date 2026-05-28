@@ -265,4 +265,119 @@ else
   smoke_fail "T5: read_secret_value still gates on is_file() — would re-break FD path. Output: $T5_OUT"
 fi
 
+# ----------------------------------------------------------------------------
+# T6 (R2 — codex r1 BLOCKING #1): `--app-password-file` and
+# `--app-password-stdin` are mutually exclusive at argparse level. Passing
+# both must exit non-zero with an argparse error (not silently prefer
+# stdin and drop the file value).
+# ----------------------------------------------------------------------------
+smoke_log "T6 (R2): --app-password-file + --app-password-stdin must fail-loud (mutex)"
+REGULAR_FILE_FOR_MUTEX="$SMOKE_TMP_ROOT/mutex-regular.txt"
+printf '%s' "file-value-should-not-be-picked" >"$REGULAR_FILE_FOR_MUTEX"
+chmod 0600 "$REGULAR_FILE_FOR_MUTEX"
+T6_OUT=""
+T6_RC=0
+T6_OUT="$(printf '%s' "stdin-value" | "$BRIDGE_BASH" "$BRIDGE_SETUP_SH" teams fd-test \
+  --app-id "test-app-id" \
+  --app-password-file "$REGULAR_FILE_FOR_MUTEX" \
+  --app-password-stdin \
+  --tenant-id "test-tenant" \
+  --allow-from "user-aad-1" \
+  --messaging-endpoint "https://bot.example.com/api/messages" \
+  --webhook-host "0.0.0.0" \
+  --webhook-port "3978" \
+  --skip-validate --skip-send-test \
+  --yes --dry-run 2>&1)" || T6_RC=$?
+if (( T6_RC != 0 )); then
+  smoke_log "T6 ok: both flags rejected (rc=$T6_RC)"
+  # argparse mutex error message includes the second flag listed as
+  # "not allowed with" the first. Either ordering of the flag names is
+  # acceptable; we only assert that argparse's mutex shape fired.
+  smoke_assert_contains "$T6_OUT" "not allowed with" "T6 argparse mutex error surfaced"
+else
+  smoke_fail "T6: passing both --app-password-file and --app-password-stdin should fail; out: $T6_OUT"
+fi
+
+# ----------------------------------------------------------------------------
+# T7 (R2 — codex r1 BLOCKING #1, ms365): same mutex shape for
+# `--client-secret-file` + `--client-secret-stdin` in the ms365 subcommand.
+# Mirror T6 to catch a future divergence where one subcommand keeps the
+# mutex and the other drops it.
+# ----------------------------------------------------------------------------
+smoke_log "T7 (R2): --client-secret-file + --client-secret-stdin must fail-loud (mutex)"
+T7_RC=0
+T7_OUT="$(printf '%s' "stdin-value" | "$BRIDGE_BASH" "$BRIDGE_SETUP_SH" ms365 fd-test \
+  --redirect-uri "https://bot.example.com/auth/callback" \
+  --tenant-id "test-tenant" \
+  --client-id "test-client" \
+  --client-secret-file "$REGULAR_FILE_FOR_MUTEX" \
+  --client-secret-stdin \
+  --default-upn "user@example.com" \
+  --default-scopes "openid profile" \
+  --yes --dry-run 2>&1)" || T7_RC=$?
+if (( T7_RC != 0 )); then
+  smoke_log "T7 ok: both ms365 secret flags rejected (rc=$T7_RC)"
+  smoke_assert_contains "$T7_OUT" "not allowed with" "T7 ms365 argparse mutex error surfaced"
+else
+  smoke_fail "T7: passing both --client-secret-file and --client-secret-stdin should fail; out: $T7_OUT"
+fi
+
+# ----------------------------------------------------------------------------
+# T8 (R2 — codex r1 BLOCKING #2): handler-level `.strip()` no longer
+# undoes read_secret_value's single-newline contract. AST teeth: scan
+# `cmd_teams` and `cmd_ms365` function bodies and assert NO `.strip()`
+# is invoked on an expression that includes a `*_arg` name (the
+# read_secret_value return). Pre-R2 the offenders were `str(app_password_arg
+# or ...).strip()` (teams) and `(client_secret_arg or ...).strip()`
+# (ms365); the R2 fix splits both into a guarded if/else.
+# ----------------------------------------------------------------------------
+smoke_log "T8 (R2 teeth): no handler-level .strip() on secret-arg expressions"
+T8_RC=0
+T8_OUT="$(python3 - "$BRIDGE_SETUP_PY" <<'PY' 2>&1
+import ast, sys
+path = sys.argv[1]
+src = open(path, "r", encoding="utf-8").read()
+tree = ast.parse(src)
+
+def names_in(node):
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+violations = []
+for fn in ast.walk(tree):
+    if not isinstance(fn, ast.FunctionDef):
+        continue
+    if fn.name not in ("cmd_teams", "cmd_ms365"):
+        continue
+    for call in ast.walk(fn):
+        if not isinstance(call, ast.Call):
+            continue
+        func = call.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        if func.attr != "strip":
+            continue
+        # Look at the receiver expression — does it reference a
+        # *_arg name that comes from read_secret_value?
+        recv_names = names_in(func.value)
+        if "app_password_arg" in recv_names or "client_secret_arg" in recv_names:
+            try:
+                rendered = ast.unparse(call)
+            except AttributeError:
+                rendered = "<call>"
+            violations.append(f"{fn.name}: {rendered}")
+
+if violations:
+    print("FOUND .strip() on secret-arg expression(s) (would undo read_secret_value newline contract):")
+    for v in violations:
+        print("  " + v)
+    sys.exit(1)
+print("cmd_teams / cmd_ms365 handler bodies have no .strip() on *_arg expressions")
+PY
+)" || T8_RC=$?
+if (( T8_RC == 0 )); then
+  smoke_log "T8 ok: $T8_OUT"
+else
+  smoke_fail "T8: handler-level .strip() on secret arg would silently truncate secrets. Output: $T8_OUT"
+fi
+
 smoke_log "all tests PASS"

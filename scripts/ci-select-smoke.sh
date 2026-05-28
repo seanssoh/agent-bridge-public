@@ -455,7 +455,15 @@ select_for_path() {
       # beta5-2-xi-misc-fixes on every teams/server.ts touch so the
       # startup-warning guard cannot silently come back as a silent
       # skip.
-      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
+      # Issue #1354 R2 (codex r1 SHOULD-FIX): the teams/ms365 plugin
+      # servers consume the credentials that the setup wizard plants in
+      # `.teams/.env` / `.ms365/.env`. A future change to either server
+      # that loosens credential parsing could mask a regression in the
+      # wizard's FD/stdin ingestion path (#1354). Pull
+      # 1354-setup-teams-fd-password on every plugins/teams/server.ts or
+      # plugins/ms365/server.ts touch so the wizard's secret-ingestion
+      # contract stays exercised end-to-end.
+      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes 1354-setup-teams-fd-password
       add_integration integration-minimal
       ;;
 
@@ -1976,7 +1984,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # remove-webhook-server now catches PermissionError/OSError quietly
       # so `agent create --isolate` no longer dumps a traceback. Cover the
       # channel-plugins regression smoke whenever the channel modules move.
-      add_required channel-plugins channel-env-readiness
+      # Issue #1354 R2 (codex r1 SHOULD-FIX): the channel module path
+      # owns `.<channel>/.env` write/read semantics that the setup
+      # wizard's FD/stdin secret ingestion (#1354) plants secrets into.
+      # Pull 1354-setup-teams-fd-password on every bridge-channels move
+      # so a future channel-side refactor cannot silently regress the
+      # wizard-to-channel credential contract.
+      add_required channel-plugins channel-env-readiness 1354-setup-teams-fd-password
       add_integration integration-minimal
       ;;
 

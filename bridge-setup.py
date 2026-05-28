@@ -1788,14 +1788,28 @@ def cmd_teams(args: argparse.Namespace) -> int:
             stdin_flag=bool(getattr(args, "app_password_stdin", False)),
             stdin_flag_name="--app-password-stdin",
         )
-        app_password = str(
-            app_password_arg
-            or account_cfg.get("appPassword")
-            or account_cfg.get("app_password")
-            or account_cfg.get("clientSecret")
-            or account_cfg.get("client_secret")
-            or inspected["app_password"]
-        ).strip()
+        # Issue #1354 R2 (codex r1 BLOCKING #2): do NOT `.strip()` the
+        # secret here. `read_secret_value` already strips at most one
+        # trailing newline (the canonical contract — multi-line key
+        # material and operator-meaningful trailing whitespace are
+        # preserved). A handler-level `.strip()` greedily removes leading
+        # AND trailing whitespace including a second trailing newline,
+        # silently truncating valid secrets. The fallback paths
+        # (account_cfg, inspected) are configuration JSON / existing .env
+        # values; preserve them verbatim too — if `appPassword` in the
+        # account JSON has stray trailing whitespace the operator put it
+        # there and the .env round-trip already preserves it.
+        if app_password_arg:
+            app_password = app_password_arg
+        else:
+            app_password = (
+                account_cfg.get("appPassword")
+                or account_cfg.get("app_password")
+                or account_cfg.get("clientSecret")
+                or account_cfg.get("client_secret")
+                or inspected["app_password"]
+                or ""
+            )
         tenant_id = str(args.tenant_id or account_cfg.get("tenantId") or account_cfg.get("tenant_id") or inspected["tenant_id"]).strip()
         service_url = str(args.service_url or account_cfg.get("serviceUrl") or account_cfg.get("service_url") or inspected["service_url"]).strip()
         webhook_host = str(args.webhook_host or inspected["webhook_host"] or "127.0.0.1").strip()
@@ -2127,7 +2141,15 @@ def cmd_ms365(args: argparse.Namespace) -> int:
             stdin_flag=bool(getattr(args, "client_secret_stdin", False)),
             stdin_flag_name="--client-secret-stdin",
         )
-        client_secret = (client_secret_arg or inspected["client_secret"]).strip()
+        # Issue #1354 R2 (codex r1 BLOCKING #2): same shape as the teams
+        # handler — do NOT `.strip()` the secret. read_secret_value
+        # already does the canonical single-trailing-newline strip;
+        # handler-level `.strip()` would greedily eat operator-meaningful
+        # trailing whitespace and a legitimate second newline.
+        if client_secret_arg:
+            client_secret = client_secret_arg
+        else:
+            client_secret = inspected["client_secret"] or ""
         default_upn = (args.default_upn or inspected["default_upn"]).strip()
         default_scopes = (args.default_scopes or inspected["default_scopes"]).strip()
 
@@ -2481,13 +2503,20 @@ def build_parser() -> argparse.ArgumentParser:
     teams_parser.add_argument("--channel-account")
     teams_parser.add_argument("--app-id", default="")
     teams_parser.add_argument("--app-password", default="")
-    teams_parser.add_argument("--app-password-file", default="")
+    # Issue #1354 R2 (codex r1 BLOCKING #1): `--app-password-file` and
+    # `--app-password-stdin` are mutually exclusive. argparse raises a
+    # non-zero exit when both are passed; pre-R2 the wizard silently
+    # preferred stdin and dropped the file value (precedence in
+    # `read_secret_value`), making it possible to leak the wrong secret
+    # without any signal to the operator.
+    teams_password_source = teams_parser.add_mutually_exclusive_group()
+    teams_password_source.add_argument("--app-password-file", default="")
     # Issue #1354: explicit stdin path for the secret. Bash process
     # substitution `<(...)` lands as `/dev/fd/N` which is portable when the
     # wizard does NOT cross a sudo boundary, but breaks when it does.
     # `--app-password-stdin` is the unambiguous escape hatch — pipe the
     # secret into stdin and the wizard reads it once.
-    teams_parser.add_argument("--app-password-stdin", action="store_true")
+    teams_password_source.add_argument("--app-password-stdin", action="store_true")
     teams_parser.add_argument("--tenant-id", default="")
     teams_parser.add_argument("--service-url", default="")
     teams_parser.add_argument("--messaging-endpoint", default="")
@@ -2520,11 +2549,15 @@ def build_parser() -> argparse.ArgumentParser:
     ms365_parser.add_argument("--tenant-id", default="")
     ms365_parser.add_argument("--client-id", default="")
     ms365_parser.add_argument("--client-secret", default="")
-    ms365_parser.add_argument("--client-secret-file", default="")
+    # Issue #1354 R2 (codex r1 BLOCKING #1): `--client-secret-file` and
+    # `--client-secret-stdin` are mutually exclusive. See teams parser
+    # `--app-password-*` mutex for rationale.
+    ms365_secret_source = ms365_parser.add_mutually_exclusive_group()
+    ms365_secret_source.add_argument("--client-secret-file", default="")
     # Issue #1354: explicit stdin path for the secret. See teams parser
     # `--app-password-stdin` for rationale (process substitution + sudo
     # subshell drops the `/dev/fd/N` mapping).
-    ms365_parser.add_argument("--client-secret-stdin", action="store_true")
+    ms365_secret_source.add_argument("--client-secret-stdin", action="store_true")
     ms365_parser.add_argument("--default-upn", default="")
     ms365_parser.add_argument("--default-scopes", default="")
     # PR #1220 codex r1: explicit opt-in for local-dev redirect URIs.
