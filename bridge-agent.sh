@@ -131,6 +131,12 @@ Create options:
   --test-fixture               opt into test-artifact name patterns
                                (smoke-/test-/bootstrap-/created-agent-/pref-,
                                *-repro-<N>); cleanup tooling may reap these
+  --force-engine-missing       (#1317-C) bypass the engine-CLI pre-flight
+                               check. Use only when the engine will be
+                               installed AFTER \`agent create\` (e.g.
+                               provisioning automation). Without this,
+                               \`create\` refuses when the engine binary
+                               is not on PATH.
 
 Policy: admin operates exclusively through these typed verbs. Direct edits
 to protected-roster files (\$BRIDGE_ROSTER_LOCAL_FILE) are intentionally
@@ -1493,6 +1499,23 @@ bridge_agent_activity_state() {
   local agent="$1"
   local session=""
   local engine=""
+
+  # Issue #1317-B (beta5-2 Lane ν): when the rapid-fail circuit breaker
+  # in bridge-run.sh has quarantined an agent (broken-launch marker
+  # present), surface it as `quarantine-broken-launch` instead of the
+  # generic `stopped`. Without this, `agb agent show` displayed only
+  # `active: no, activity_state: stopped` — operators had to open
+  # `state/agents/<a>/broken-launch` by hand to learn the engine CLI
+  # was missing. The `session_health` block surfaces the marker file +
+  # recovery hint; this field gives one-glance visibility in `agent
+  # list` / dashboard / status output that does not include the
+  # session_health subblock. Checked BEFORE the `is_active` short-
+  # circuit because a quarantined agent has no tmux session (the
+  # daemon's `bridge_daemon_autostart_allowed` gate blocks restarts).
+  if [[ -f "$(bridge_agent_broken_launch_file "$agent" 2>/dev/null)" ]]; then
+    printf '%s' "quarantine-broken-launch"
+    return 0
+  fi
 
   if ! bridge_agent_is_active "$agent"; then
     printf '%s' "stopped"
@@ -2883,6 +2906,14 @@ run_create() {
   # `<admin>-dev` into the admin's workdir, where bootstrap_project_skill has
   # already populated `.agents/`). Skips the non-empty-workdir guard.
   local allow_shared_workdir=0
+  # Issue #1317-C (beta5-2 Lane ν): last-resort opt-out of the engine
+  # CLI pre-flight check. Useful when the operator is bootstrapping a
+  # host where the engine will be installed AFTER `agent create` (e.g.
+  # provisioning automation that scaffolds the agent first, then runs
+  # `npm i -g @anthropic/claude-code` second). Without the override,
+  # missing-engine refuses create and the operator must either install
+  # the engine first or set BRIDGE_ENGINE_PATH.
+  local force_engine_missing=0
 
   shift || true
 
@@ -3120,6 +3151,17 @@ run_create() {
         allow_shared_workdir=1
         shift
         ;;
+      --force-engine-missing)
+        # Issue #1317-C (beta5-2 Lane ν): last-resort opt-out for the
+        # engine CLI pre-flight check below. Operators who scaffold
+        # agents before installing the engine (provisioning automation,
+        # CI seed flows) can use this to bypass the refusal. The
+        # resulting agent will fail to launch until the engine binary
+        # is on the daemon PATH — same as today's missing-engine
+        # behavior but without the at-create UX gate.
+        force_engine_missing=1
+        shift
+        ;;
       *)
         bridge_die "지원하지 않는 agent create 옵션입니다: $1"
         ;;
@@ -3190,6 +3232,33 @@ report and reap test-fixture agents per their pattern."
     claude|codex) ;;
     *) bridge_die "지원하지 않는 engine 입니다: $engine" ;;
   esac
+
+  # Issue #1317-C (beta5-2 Lane ν): engine CLI pre-flight at `agent
+  # create`. Before this gate, scaffolding an agent whose engine
+  # binary is not on the controller's PATH succeeded, then the daemon
+  # restart-loop wedged: every start attempt died with exit 127
+  # (`<engine>: command not found`), the rapid-fail circuit breaker
+  # quarantined the agent (broken-launch marker), and `agent show`
+  # surfaced only `activity_state: stopped` — operator's first
+  # diagnostic was usually opening the marker file by hand. The
+  # pre-flight catches the same condition AT CREATE TIME with an
+  # actionable hint: which env var to export (BRIDGE_ENGINE_PATH or
+  # NVM_DIR/PYENV_ROOT) and a last-resort `--force-engine-missing`
+  # opt-out for provisioning flows that install the engine AFTER
+  # scaffold. `bridge_resolve_engine_binary` is the same probe
+  # bridge-start.sh uses to resolve ENGINE_BIN_RESOLVED, so a pass
+  # here implies the launch path will resolve the binary too.
+  #
+  # Skip when --dry-run: the dry-run path scaffolds nothing and the
+  # daemon never tries to launch, so the engine binary presence is
+  # irrelevant for the planning surface. CI smoke tests + operators
+  # inspecting plans on a host where the engine is intentionally not
+  # installed (provisioning blueprint reviews) still get clean output.
+  if (( dry_run == 0 )) && (( force_engine_missing == 0 )); then
+    if ! bridge_resolve_engine_binary "$engine" >/dev/null 2>&1; then
+      bridge_die "engine CLI '$engine' not found on PATH. Install it (e.g. \`npm i -g @anthropic-ai/claude-code\` for claude, \`npm i -g @openai/codex\` for codex) OR set BRIDGE_ENGINE_PATH=/dir/with/$engine before retrying. If installed via nvm/pyenv, export NVM_DIR/PYENV_ROOT before invoking \`agent create\` so the daemon's non-login PATH picks it up. Last-resort override: rerun with \`--force-engine-missing\` (the agent will fail to launch until the engine is installed)."
+    fi
+  fi
 
   if [[ -z "$session_type" ]]; then
     case "$engine" in

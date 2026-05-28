@@ -321,6 +321,127 @@ bridge_prepend_path_entry "$HOME/.nix-profile/bin"
 bridge_prepend_path_entry "$HOME/bin"
 bridge_prepend_path_entry "/opt/homebrew/bin"
 bridge_prepend_path_entry "/usr/local/bin"
+
+# Issue #1317-A (beta5-2 Lane ν): daemon non-login shells miss nvm/pyenv
+# /rbenv/fnm/asdf PATH entries because operator shellrc init is skipped.
+# Without these, an nvm-installed `codex` (`~/.nvm/versions/node/vX/bin/`)
+# is not on the daemon's PATH, `bridge-start.sh` launch dies with
+# `codex: command not found` (exit 127), the rapid-fail circuit breaker
+# writes `broken-launch`, and the operator sees only `activity_state:
+# stopped` with no hint why.
+#
+# Strategy: hybrid override + auto-detect.
+#   1. BRIDGE_ENGINE_PATH (highest priority): colon-separated list of
+#      directories the operator explicitly wants on the daemon PATH.
+#      Each entry is prepended via bridge_prepend_path_entry so order is
+#      preserved and missing dirs are skipped.
+#   2. Auto-detect runtime managers from common env hints + canonical
+#      install paths:
+#        - $NVM_DIR/versions/node/<latest>/bin
+#        - $PYENV_ROOT/shims  ($PYENV_ROOT/bin already covered via shims
+#          for `pyenv` itself; shims is the path that exposes pyenv-
+#          managed Python)
+#        - $RBENV_ROOT/shims
+#        - ASDF_DATA_DIR (and ~/.asdf) shims
+#        - fnm: $FNM_DIR/aliases/default/bin OR canonical
+#          ~/.local/share/fnm/aliases/default/bin
+#
+# All checks are best-effort: missing env vars, missing dirs, or missing
+# `versions/node/<latest>` symlink targets fall through silently. This
+# function is idempotent (re-sourcing bridge-lib.sh is a no-op).
+bridge_augment_engine_path() {
+  local _entry=""
+  local _override_path="${BRIDGE_ENGINE_PATH:-}"
+
+  # 1. Operator override (highest priority — prepended last so it ends up
+  # at the front of PATH after all auto-detect entries are prepended).
+  # We iterate auto-detect first, then operator override last so the
+  # override wins.
+
+  # 2. Auto-detect — nvm
+  if [[ -n "${NVM_DIR:-}" && -d "$NVM_DIR/versions/node" ]]; then
+    # `nvm alias default` writes a name file under $NVM_DIR/alias/default
+    # pointing at the version dir; honor that when present.
+    local _nvm_default_alias=""
+    if [[ -r "$NVM_DIR/alias/default" ]]; then
+      _nvm_default_alias="$(cat "$NVM_DIR/alias/default" 2>/dev/null || true)"
+      _nvm_default_alias="${_nvm_default_alias#v}"
+    fi
+    if [[ -n "$_nvm_default_alias" \
+          && -d "$NVM_DIR/versions/node/v$_nvm_default_alias/bin" ]]; then
+      bridge_prepend_path_entry "$NVM_DIR/versions/node/v$_nvm_default_alias/bin"
+    else
+      # Fall back to the lexicographically-last version dir. `ls -1v`
+      # would be ideal for version-sort but isn't portable across macOS
+      # /Linux without GNU coreutils; the lexicographic last is close
+      # enough for `v24.16.0`-style names and matches operator intent
+      # ("most recent installed").
+      local _nvm_latest=""
+      # shellcheck disable=SC2012  # nvm version dirs are predictable
+      # `v24.16.0`-style names — ls + sort is intentional for lex-sort
+      # last; find -printf is non-portable on macOS BSD find.
+      _nvm_latest="$(ls -1 "$NVM_DIR/versions/node" 2>/dev/null | sort | tail -n1)"
+      if [[ -n "$_nvm_latest" && -d "$NVM_DIR/versions/node/$_nvm_latest/bin" ]]; then
+        bridge_prepend_path_entry "$NVM_DIR/versions/node/$_nvm_latest/bin"
+      fi
+    fi
+  fi
+
+  # 3. Auto-detect — pyenv
+  if [[ -n "${PYENV_ROOT:-}" ]]; then
+    bridge_prepend_path_entry "$PYENV_ROOT/shims"
+    bridge_prepend_path_entry "$PYENV_ROOT/bin"
+  elif [[ -d "$HOME/.pyenv" ]]; then
+    bridge_prepend_path_entry "$HOME/.pyenv/shims"
+    bridge_prepend_path_entry "$HOME/.pyenv/bin"
+  fi
+
+  # 4. Auto-detect — rbenv
+  if [[ -n "${RBENV_ROOT:-}" ]]; then
+    bridge_prepend_path_entry "$RBENV_ROOT/shims"
+    bridge_prepend_path_entry "$RBENV_ROOT/bin"
+  elif [[ -d "$HOME/.rbenv" ]]; then
+    bridge_prepend_path_entry "$HOME/.rbenv/shims"
+    bridge_prepend_path_entry "$HOME/.rbenv/bin"
+  fi
+
+  # 5. Auto-detect — asdf (legacy `.asdf` and current `ASDF_DATA_DIR`)
+  if [[ -n "${ASDF_DATA_DIR:-}" ]]; then
+    bridge_prepend_path_entry "$ASDF_DATA_DIR/shims"
+  fi
+  if [[ -d "$HOME/.asdf/shims" ]]; then
+    bridge_prepend_path_entry "$HOME/.asdf/shims"
+  fi
+
+  # 6. Auto-detect — fnm
+  if [[ -n "${FNM_DIR:-}" ]]; then
+    bridge_prepend_path_entry "$FNM_DIR/aliases/default/bin"
+  elif [[ -d "$HOME/.local/share/fnm/aliases/default/bin" ]]; then
+    bridge_prepend_path_entry "$HOME/.local/share/fnm/aliases/default/bin"
+  fi
+
+  # 7. Operator override last (becomes leftmost on PATH).
+  if [[ -n "$_override_path" ]]; then
+    # Honor colon-separated multi-dir overrides. Iterate from last to
+    # first so the first entry in BRIDGE_ENGINE_PATH ends up leftmost
+    # after all prepends.
+    local _entries=()
+    local IFS_save="$IFS"
+    IFS=':'
+    # shellcheck disable=SC2206
+    _entries=( $_override_path )
+    IFS="$IFS_save"
+    local _i
+    for (( _i=${#_entries[@]}-1; _i>=0; _i-- )); do
+      _entry="${_entries[$_i]}"
+      [[ -n "$_entry" ]] || continue
+      bridge_prepend_path_entry "$_entry"
+    done
+  fi
+}
+
+bridge_augment_engine_path
+
 export PATH
 
 RED='\033[0;31m'

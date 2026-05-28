@@ -2983,18 +2983,63 @@ def _as_int(value):
         return None
 
 
+def _reason_hint(engine: str, exit_code_int):
+    """Issue #1317-B (beta5-2 Lane ν): produce an operator-actionable
+    hint based on the recorded exit code so `agent show` /
+    `session_health` displays WHAT went wrong + HOW to recover instead
+    of just emitting the structured-but-opaque marker file.
+
+    Exit-code mapping (POSIX shell conventions):
+      127 → command not found (most common in nvm/pyenv users where the
+            engine binary is not on the daemon non-login shell's PATH).
+      126 → permission denied (binary present, not executable; iso v2
+            host with wrong mode on the controller-installed engine).
+      125 → sudo internal failure (e.g. sudoers parse error). Rare.
+      Other non-zero → generic ("inspect stderr_file").
+    Returns a short single-line hint string.
+    """
+    engine_label = engine or "engine"
+    if exit_code_int == 127:
+        return (
+            f"engine CLI '{engine_label}' not found on daemon PATH; "
+            "set BRIDGE_ENGINE_PATH=/dir/with/engine OR install at a "
+            "PATH dir (e.g. ~/.local/bin) OR ensure NVM_DIR/PYENV_ROOT "
+            "is exported when the daemon starts"
+        )
+    if exit_code_int == 126:
+        return (
+            f"engine CLI '{engine_label}' present but not executable "
+            "by the daemon UID (chmod +x or fix iso v2 ACL on the "
+            "binary's parent dir)"
+        )
+    if exit_code_int == 125:
+        return (
+            "sudo refused the launch (sudoers parse error or "
+            "non-interactive password prompt); run `sudo -n -u "
+            "<os_user> true` to reproduce"
+        )
+    return (
+        f"agent process exited with code {exit_code_int}; inspect "
+        "stderr_file and `agent-bridge agent safe-mode <agent>` to "
+        "clear the marker"
+    )
+
+
 path = Path(sys.argv[1])
 agent, engine, fail_count, exit_code, stderr_file, launch_cmd, err_size_before = sys.argv[2:]
 
+exit_code_int = _as_int(exit_code)
 payload = {
     "agent": agent,
     "engine": engine,
     "fail_count": _as_int(fail_count),
-    "exit_code": _as_int(exit_code),
+    "exit_code": exit_code_int,
     "stderr_file": stderr_file,
     "launch_cmd": launch_cmd,
     "err_size_before": _as_int(err_size_before),
     "quarantined_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+    "reason_hint": _reason_hint(engine, exit_code_int) if exit_code_int is not None else "",
+    "recovery_cmd": f"agent-bridge agent safe-mode {agent}",
 }
 
 path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
