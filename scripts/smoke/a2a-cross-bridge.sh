@@ -169,9 +169,13 @@ allowlist_fail() {
 }
 
 skew_reject() {
+  # #1326: timestamps far beyond the grace window (here: Unix epoch 100,
+  # i.e. 1970) are too stale to be clock drift and still return 401
+  # (permanent — sender dead-letters). The narrow drift band → 503 case
+  # is exercised by the dedicated beta5-2-lambda-a2a-robustness smoke.
   local out
   out="$(helper skew "$(base_url)" bridge-a "$A2A_SECRET")"
-  smoke_assert_contains "$out" "STATUS=401" "stale timestamp -> 401"
+  smoke_assert_contains "$out" "STATUS=401" "very stale timestamp -> 401 (permanent)"
 }
 
 oversize_cap() {
@@ -332,6 +336,101 @@ dry_run_no_outbox_write() {
   smoke_assert_eq "$before" "$after" "dry-run did not add an outbox row"
 }
 
+# Issue #1197 (beta22): smoke for the daemon-loop A2A tick helper.
+# Stage a fresh pending outbox row and invoke bridge_a2a_deliver_tick
+# (the python -c short-form used here is exactly the helper that
+# process_a2a_deliver_tick in bridge-daemon.sh wraps). Assert the row
+# transitions to acked against the live receiver.
+daemon_tick_drains_outbox() {
+  write_sender_config "$A2A_PORT"
+
+  sender_outbox send --peer bridge-b --to reviewer --from senderX \
+    --title "daemon tick drain" --body "tick drain body" >/dev/null
+
+  local before
+  before="$(sender_outbox outbox list)"
+  smoke_assert_contains "$before" "pending" "tick test: pre-tick row is pending"
+
+  # Source the helper and invoke. The helper just shells out to
+  # bridge-a2a.py deliver, same as `sender_outbox deliver` — but we are
+  # exercising the lib/bridge-a2a.sh entry point that bridge-daemon.sh's
+  # process_a2a_deliver_tick uses, not the python CLI directly.
+  (
+    # shellcheck source=/dev/null
+    source "$SMOKE_REPO_ROOT/lib/bridge-a2a.sh"
+    BRIDGE_A2A_CONFIG="$BRIDGE_HOME/handoff-sender.json" \
+      bridge_a2a_deliver_tick --timeout 5 >/dev/null 2>&1 || true
+  )
+
+  local after
+  after="$(sender_outbox outbox list)"
+  smoke_assert_contains "$after" "acked" \
+    "daemon-loop A2A tick drained pending outbox row (beta22 #1197)"
+}
+
+# Issue #1197 (beta22): smoke that the daemon's process_a2a_deliver_tick
+# no-ops silently when handoff.local.json is absent. Important regression
+# guard — most installs do NOT configure A2A, and the daemon must not log-
+# spam or fail on those hosts.
+daemon_tick_no_op_without_config() {
+  local missing_cfg="$BRIDGE_HOME/handoff-absent.json"
+  rm -f "$missing_cfg" 2>/dev/null || true
+
+  local out rc=0
+  out="$(BRIDGE_A2A_CONFIG="$missing_cfg" \
+    bash "$SMOKE_REPO_ROOT/bridge-daemon.sh" sync 2>&1)" || rc=$?
+
+  # `sync` runs a single cmd_sync_cycle and exits. With handoff config
+  # absent the tick step must short-circuit BEFORE attempting any deliver.
+  # rc=0 is the success contract (other cycle steps may emit unrelated
+  # warns but the tick itself should not surface).
+  smoke_assert_eq 0 "$rc" "daemon sync exits 0 with no handoff config"
+  smoke_assert_not_contains "$out" "a2a_deliver_tick] start" \
+    "no a2a_deliver_tick start line when handoff config absent"
+}
+
+# Issue #1197 (beta22): outbox list must surface staleness fields.
+# Use python to age a pending row (set next_attempt_ts to "an hour ago")
+# and assert the list output includes a due= field.
+outbox_list_staleness_fields() {
+  local dead_port
+  dead_port="$(pick_free_port)"
+  write_sender_config "$dead_port"
+
+  sender_outbox send --peer bridge-b --to reviewer --from senderX \
+    --title "staleness probe" --body "stale row body" >/dev/null
+
+  # Age the row: set created_ts AND next_attempt_ts to (now-3600).
+  # python3 -c invocation (NOT heredoc-stdin) to satisfy lint-heredoc-ban
+  # baseline (footgun #11 class — no <<'PY' to subprocess).
+  python3 -c "
+import sqlite3, sys, time
+db = sys.argv[1]
+conn = sqlite3.connect(db)
+now = int(time.time())
+old = now - 3600
+conn.execute(
+    \"UPDATE outbox SET created_ts=?, next_attempt_ts=?, updated_ts=? WHERE status='pending'\",
+    (old, old, old),
+)
+conn.commit()
+conn.close()
+" "$BRIDGE_STATE_DIR/handoff/outbox.db"
+
+  local list_out
+  list_out="$(sender_outbox outbox list)"
+  smoke_assert_contains "$list_out" "due=" \
+    "outbox list text rendering shows due= staleness for aged pending row"
+
+  # JSON output should carry the numeric due_for_seconds field too.
+  local list_json
+  list_json="$(sender_outbox outbox list --json)"
+  smoke_assert_contains "$list_json" '"due_for_seconds":' \
+    "outbox list --json includes due_for_seconds field"
+  smoke_assert_contains "$list_json" '"age_seconds":' \
+    "outbox list --json includes age_seconds field"
+}
+
 main() {
   smoke_require_cmd python3
   smoke_setup_bridge_home "a2a-cross-bridge"
@@ -351,6 +450,9 @@ main() {
   smoke_run "receiver-down delivery -> outbox retry" receiver_down_retry
   smoke_run "stale 'sending' lease reclaimed on next tick" stale_lease_reclaim
   smoke_run "send --dry-run writes no outbox row" dry_run_no_outbox_write
+  smoke_run "daemon-loop A2A tick drains pending outbox (#1197)" daemon_tick_drains_outbox
+  smoke_run "daemon tick no-op without handoff config (#1197)" daemon_tick_no_op_without_config
+  smoke_run "outbox list surfaces staleness fields (#1197)" outbox_list_staleness_fields
 
   smoke_log "passed"
 }

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import grp
 import hashlib
 import json
 import os
@@ -34,6 +35,11 @@ from bridge_iso_paths import (  # noqa: E402
     safe_read_env as _safe_read_env,
     safe_load_json as _safe_load_json,
     parse_dotenv_text as _parse_dotenv_text,
+    # Phase 2 lift: pull canonical atomic-write helper. The local
+    # `_sudo_write_as` wrapper now delegates here, so the inline bash
+    # body lives in lib/bridge_iso_paths.py (one source of truth, same
+    # contract as bridge_isolation_write_file_as_agent_user_via_bash).
+    write_text_atomic_as_owner as _write_text_atomic_as_owner_canonical,
 )
 
 
@@ -95,7 +101,7 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def save_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-owned scaffold; callers that target an isolated tree route through _isolation_aware_mkdir first
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -106,7 +112,7 @@ def save_json(path: Path, payload: Any) -> None:
 
 
 def save_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-owned scaffold; callers that target an isolated tree route through _isolation_aware_mkdir first
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.chmod(tmp, 0o600)
@@ -153,32 +159,20 @@ def _sudo_write_as(
     content: str,
     mode: int = 0o600,
 ) -> subprocess.CompletedProcess[str]:
-    """Symmetric write counterpart to `_sudo_run_as`. Streams `content` via
-    stdin to `bash -c <inline-script>` running as `os_user` under
-    `sudo -n`. The inline script atomically writes to `dest_path` at
-    `mode` using mktemp-in-target-dir + chmod-before-rename — same
-    contract as `bridge_isolation_write_file_as_agent_user_via_bash`.
+    """Atomic write of `content` to `dest_path` as `os_user`.
 
-    Does NOT raise on non-zero rc — caller inspects `proc.returncode`
-    against the contract above. Matches `_sudo_run_as` ergonomics.
+    Phase 2: thin delegating wrapper around
+    `bridge_iso_paths.write_text_atomic_as_owner`. The inline atomic-
+    write bash body lives in `lib/bridge_iso_paths.py` so a fix to
+    the contract (mktemp position, chmod-before-mv, trap shape) lands
+    in ONE place. The local `_ISOLATED_WRITE_SCRIPT` constant above
+    is kept for reference / unit-test introspection.
+
+    Does NOT raise on non-zero rc — caller inspects `proc.returncode`.
     """
-    full = [
-        "sudo", "-n", "-u", os_user, "bash", "-c", _ISOLATED_WRITE_SCRIPT,
-        "bridge-isolation", str(dest_path), f"{mode:o}",
-    ]
-    try:
-        return subprocess.run(
-            full, input=content, check=False, capture_output=True, text=True
-        )
-    except FileNotFoundError:
-        print(
-            f"[bridge-setup] sudo not available; cannot escalate to "
-            f"'{os_user}' for write to {dest_path}",
-            file=sys.stderr,
-        )
-        return subprocess.CompletedProcess(
-            args=full, returncode=127, stdout="", stderr=""
-        )
+    return _write_text_atomic_as_owner_canonical(
+        os_user, dest_path, content, mode
+    )
 
 
 def _isolation_aware_save_text(path: Path, text: str, mode: int = 0o600) -> None:
@@ -222,6 +216,231 @@ def _isolation_aware_save_json(path: Path, payload: Any, mode: int = 0o600) -> N
             f"isolation-aware save_json to {path} as {owner} failed "
             f"(rc={proc.returncode}): {proc.stderr.strip() or '(no stderr)'}"
         )
+
+
+def _iso_v2_effective_host() -> bool:
+    """Return True iff the host is iso-v2 effective right now.
+
+    Mirrors `_bridge_isolation_discriminator_primitives_ready` in
+    lib/bridge-isolation-discriminator.sh — the canonical v2 primitives-
+    ready signal is the existence of the `ab-shared` POSIX group, which
+    `agent-bridge migrate isolation v2 --apply` creates and which is
+    absent on:
+      * macOS dev hosts (v2 is a no-op there per the discriminator).
+      * Linux fresh installs that have not yet run v2 migrate.
+      * Any host where the operator explicitly disabled isolation.
+
+    The optional `BRIDGE_ISO_V2_EFFECTIVE_OVERRIDE` env hook lets the
+    smoke harness synth-iso2 the host without provisioning real POSIX
+    groups; values `yes` / `1` / `true` force True, `no` / `0` / `false`
+    force False, anything else falls through to the group probe. The
+    override exists only for unit smokes and is intentionally not
+    documented as a public knob.
+
+    Returns False on non-Linux to match the bash discriminator's
+    auto-resolve. A False return is the safe default: the caller skips
+    any cred-mutation entirely and the file stays at controller-owned
+    0600 (correct posture on a non-iso host).
+    """
+    override = os.environ.get("BRIDGE_ISO_V2_EFFECTIVE_OVERRIDE", "").strip().lower()
+    if override in {"yes", "1", "true"}:
+        return True
+    if override in {"no", "0", "false"}:
+        return False
+    if sys.platform != "linux":
+        return False
+    shared_group = os.environ.get("BRIDGE_SHARED_GROUP", "").strip() or "ab-shared"
+    try:
+        grp.getgrnam(shared_group)
+    except KeyError:
+        return False
+    except OSError:
+        # /etc/group unreadable / NSS service down — conservative skip.
+        return False
+    return True
+
+
+def _audit_normalize_skipped(
+    path: Path,
+    agent: str,
+    reason: str,
+    group: str | None = None,
+    *,
+    rc: int | None = None,
+    stderr: str | None = None,
+) -> None:
+    """Best-effort audit emission for a channel-cred normalize skip.
+
+    Routes through `bridge-audit.py write` so the row joins the hash
+    chain alongside `cron.*` / `daemon.*` rows. Mirrors the silent-
+    failure contract documented in `bridge-cron.py:emit_cron_mutation_audit`
+    — a failed audit write NEVER raises out of this helper, because we
+    are sitting on the post-write security path and an audit hiccup
+    must not flip the file's mode.
+
+    `reason` is one of `non_iso_v2_host` / `group_missing` /
+    `chgrp_failed`. The detail payload records the path, agent, group
+    name (where resolved), and chgrp rc / stderr (where applicable) so
+    an operator triaging "iso UID cannot read .teams/.env" has a
+    machine-readable trail.
+    """
+    try:
+        audit_path_str = os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+        if not audit_path_str:
+            log_dir = os.environ.get("BRIDGE_LOG_DIR", "").strip()
+            if log_dir:
+                audit_path_str = str(Path(log_dir).expanduser() / "audit.jsonl")
+            else:
+                home = os.environ.get("BRIDGE_HOME", "").strip()
+                if home:
+                    audit_path_str = str(Path(home).expanduser() / "logs" / "audit.jsonl")
+        if not audit_path_str:
+            return
+        actor = os.environ.get("BRIDGE_AGENT_ID", "").strip() \
+            or os.environ.get("USER", "").strip() \
+            or "unknown"
+        detail = {
+            "path": str(path),
+            "agent": agent,
+            "reason": reason,
+        }
+        if group is not None:
+            detail["group"] = group
+        if rc is not None:
+            detail["rc"] = rc
+        if stderr:
+            detail["stderr"] = stderr[:200]
+        audit_script = Path(__file__).resolve().parent / "bridge-audit.py"
+        if not audit_script.exists():
+            return
+        subprocess.run(
+            [
+                sys.executable,
+                str(audit_script),
+                "write",
+                "--file", audit_path_str,
+                "--actor", actor,
+                "--action", "channel_cred_normalize_skipped",
+                "--target", agent,
+                "--detail-json", json.dumps(detail, ensure_ascii=True, sort_keys=True),
+            ],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return
+
+
+def _post_write_normalize_channel_cred_group(path: Path, agent: str | None) -> None:
+    """Post-write normalization for channel credential files (#1329, Lane μ M6).
+
+    When the iso-aware write path falls through to controller-side
+    `save_json` / `save_text` (e.g. fresh-install agent create window
+    where `_resolve_isolated_owner_for_path` returned None, or
+    no-sudo-NOPASSWD hosts where the sudo dispatch is impossible), the
+    file lands at `controller:controller-primary-group 0600`. On iso v2
+    hosts the iso UID then EACCES on read and the channel plugin fails
+    silently.
+
+    This helper performs a best-effort post-write normalize to
+    `controller:ab-agent-<agent> 0640`:
+
+      * group  →  `ab-agent-<agent>` via `chgrp` (controller is a
+        supplementary member of this group on iso v2 hosts, so direct
+        chgrp succeeds without sudo).
+      * mode   →  `0o640` (owner-rw, group-r, world-none). The brief
+        explicitly chose 0640 NOT 0644 — narrowest grant that lets the
+        iso UID read via group, no world-read widening.
+
+    Security contract (r2, codex r1 BLOCKING):
+
+      The chmod 0640 widening is only safe AFTER a successful chgrp to
+      the per-agent `ab-agent-<a>` group. If chgrp fails — because the
+      host is not iso-v2 effective, the agent group does not exist
+      yet, the controller is not a supplementary member of it, or any
+      other ENOENT/EPERM — running chmod 0640 alone would widen secrets
+      to the controller's primary group (`staff` on macOS dev hosts,
+      a per-user group on Linux, etc.). r2 enforces strict gating:
+
+        1. iso-v2 effective host (`ab-shared` group exists) — else skip.
+        2. `ab-agent-<a>` group resolvable AND exists on host — else
+           audit skip + return WITHOUT chmod.
+        3. chgrp returncode is 0 — else audit skip + return WITHOUT chmod.
+
+      Any gate failure leaves the file at its prior mode (caller wrote
+      it at 0600). The controller-side fallback fileset on a non-iso-v2
+      install therefore stays at 0600, matching the controller-only
+      threat model on that host class.
+
+    No-op on:
+      * non-iso-v2 hosts (no `ab-shared` group).
+      * shared-mode agents (no `ab-agent-<a>` group).
+      * `agent` arg missing.
+      * file missing.
+
+    Failures past the gates (chmod errors after a successful chgrp) are
+    silently swallowed — the upgrade-time backfill in
+    `bridge_isolation_v2_normalize_workdir_profile_group`
+    (lib/bridge-isolation-v2.sh) is the second-line catch-all, so a
+    transient chmod failure here does not leave the operator blocked.
+    The contract here is best-effort write-time freshness.
+    """
+    try:
+        if agent is None:
+            return
+        if not isinstance(path, Path):
+            return
+        if not path.exists():
+            return
+        # Gate 1: iso-v2 effective host. Skipping here leaves the file
+        # at its caller-written 0600 — correct posture on non-iso-v2.
+        if not _iso_v2_effective_host():
+            return
+        group = _v2_agent_group_name(agent)
+        if not group:
+            return
+        # Gate 2: target ab-agent-<a> group must exist on host. Without
+        # it `chgrp` would either fail or — worse, on platforms that
+        # tolerate a name-to-gid miss — leave the file at the controller
+        # primary group, and the subsequent chmod 0640 would widen
+        # secrets. Skip + audit.
+        try:
+            grp.getgrnam(group)
+        except KeyError:
+            _audit_normalize_skipped(path, agent, "group_missing", group)
+            return
+        except OSError as exc:
+            _audit_normalize_skipped(
+                path, agent, "group_lookup_oserror", group,
+                stderr=str(exc),
+            )
+            return
+        # Gate 3: chgrp must succeed before any chmod widening. A
+        # failed chgrp here is the codex r1 BLOCKING case — running
+        # chmod 0640 alone would widen secrets to the controller's
+        # primary group (e.g. `staff` on macOS / `<user>` on Linux).
+        proc = subprocess.run(
+            ["chgrp", group, str(path)],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode != 0:
+            _audit_normalize_skipped(
+                path, agent, "chgrp_failed", group,
+                rc=proc.returncode,
+                stderr=(proc.stderr or "").strip(),
+            )
+            return
+        # chgrp landed `ab-agent-<a>` — safe to widen mode to 0640.
+        # chmod failure here is non-fatal; the v2 upgrade backfill
+        # picks it up on the next reapply pass.
+        subprocess.run(
+            ["chmod", "0640", str(path)],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
+        # All non-fatal — the upgrade backfill in
+        # bridge_isolation_v2_normalize_workdir_profile_group is the
+        # second-line recovery. Never raise out of a post-write hook.
+        return
 
 
 def load_dotenv(path: Path) -> dict[str, str]:
@@ -365,7 +584,15 @@ def _isolation_aware_mkdir(
     if _safe_path_check("exists", path, owner):
         return
     if owner is None:
-        path.mkdir(parents=True, exist_ok=True)
+        # #1178 (cycle 12): post-helper-A `owner is None` is now an
+        # authoritative signal of non-isolated lineage — the helper
+        # uses `_sudo_stat_owner` to recover the isolated owner when
+        # PermissionError fires (the cycle 12 root cause was that
+        # `except OSError: pass` silently mapped "path IS isolated"
+        # to None, producing this raw mkdir at L368 → PermissionError
+        # → operator-visible traceback). With #1178 in place, this raw
+        # mkdir only runs on truly controller-owned trees.
+        path.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — owner is None means non-isolated per #1178 helper contract
         return
     # Resolve the target group. Priority: explicit `group=` >
     # v2-helper-via-`agent=` > `id -gn` legacy fallback. The v2 helper
@@ -705,6 +932,57 @@ def inspect_teams_dir(teams_dir: Path) -> dict[str, Any]:
         "access_payload": access_payload if isinstance(access_payload, dict) else {},
         "state_payload": state_payload if isinstance(state_payload, dict) else {},
     }
+
+
+def inspect_ms365_dir(ms365_dir: Path) -> dict[str, Any]:
+    """Read existing `.ms365/.env` (if any) so the wizard preserves
+    operator-set credentials when only `--messaging-endpoint` is
+    being added on a re-run.
+
+    Same isolation-aware probe shape as `inspect_teams_dir`: route
+    through `_safe_read_env` which sudo-escalates to the isolated
+    UID's view when the controller cannot directly read the file.
+
+    PR #1220 codex r1 (#1209 follow-up): `allow_localhost` is also
+    inspected so `cmd_ms365` can preserve the documented local-dev
+    escape hatch (`MS365_REDIRECT_URI_ALLOW_LOCALHOST=1`) across
+    reruns. Without this, an operator who set the allow flag once
+    would have it silently dropped on the next
+    `agent-bridge setup ms365 <agent>` invocation, breaking the
+    next `pair_start` call.
+    """
+    env_path = ms365_dir / ".env"
+    env = _safe_read_env(env_path)
+    return {
+        "env_path": env_path,
+        "tenant_id": env.get("MS365_TENANT_ID", "").strip(),
+        "client_id": env.get("MS365_CLIENT_ID", "").strip(),
+        "client_secret": env.get("MS365_CLIENT_SECRET", "").strip(),
+        "default_upn": env.get("MS365_DEFAULT_UPN", "").strip(),
+        "redirect_uri": env.get("MS365_REDIRECT_URI", "").strip(),
+        "default_scopes": env.get("MS365_DEFAULT_SCOPES", "").strip(),
+        "allow_localhost": env.get("MS365_REDIRECT_URI_ALLOW_LOCALHOST", "").strip(),
+    }
+
+
+def derive_ms365_redirect_uri(messaging_endpoint: str) -> str:
+    """Derive an `/auth/callback` redirect URI from a Teams messaging
+    endpoint URL. Issue #1209: the Teams plugin multiplexes
+    `/auth/callback` through its existing webhook listener, so the
+    MS365 OAuth redirect URI is the same host + scheme as the Teams
+    `--messaging-endpoint` (typically `/api/messages`).
+
+    Raises `SetupError` if the input is not a valid http(s) URL.
+    """
+    raw = (messaging_endpoint or "").strip()
+    if not raw:
+        raise SetupError("Cannot derive MS365_REDIRECT_URI: no Teams messaging endpoint available")
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise SetupError(
+            f"Cannot derive MS365_REDIRECT_URI from messaging endpoint (must be a full http(s) URL): {raw}"
+        )
+    return f"{parsed.scheme}://{parsed.netloc}/auth/callback"
 
 
 def teams_login_base_url() -> str:
@@ -1198,9 +1476,21 @@ def cmd_discord(args: argparse.Namespace) -> int:
             print_result(result)
             return 0
 
-        _isolation_aware_mkdir(discord_dir, agent=args.agent)
+        # Issue #1215: pass explicit `mode=0o2770` so the channel state
+        # dir gets the setgid + rwx-for-group bits, not the helper's
+        # legacy `0o2750` default. Without the group write/exec bit
+        # the controller-side `agent start` channel-required validator
+        # cannot stat `.discord/.env` under the v2 isolation contract
+        # (drw-r-S--- on a long-running shell with stale supp-groups
+        # surfaced as `missing` on `agent start`).
+        _isolation_aware_mkdir(discord_dir, mode=0o2770, agent=args.agent)
         _isolation_aware_save_text(inspected["env_path"], f"DISCORD_BOT_TOKEN={token}\n")
         _isolation_aware_save_json(inspected["access_path"], access_doc)
+        # #1329 (v0.15.0-beta5-2 Lane μ M6): post-write normalize so a
+        # controller-side fallback write (no iso owner resolvable) does
+        # not leave the iso UID EACCESing on read.
+        _post_write_normalize_channel_cred_group(inspected["env_path"], args.agent)
+        _post_write_normalize_channel_cred_group(inspected["access_path"], args.agent)
         result["write_status"] = "ok"
 
         if args.skip_validate:
@@ -1326,9 +1616,15 @@ def cmd_telegram(args: argparse.Namespace) -> int:
             print_telegram_result(result)
             return 0
 
-        _isolation_aware_mkdir(telegram_dir, agent=args.agent)
+        # Issue #1215: explicit `mode=0o2770` for the v2 isolation
+        # channel-state-dir contract (see discord_dir above for the
+        # rationale).
+        _isolation_aware_mkdir(telegram_dir, mode=0o2770, agent=args.agent)
         _isolation_aware_save_text(inspected["env_path"], f"TELEGRAM_BOT_TOKEN={token}\n")
         _isolation_aware_save_json(inspected["access_path"], access_doc)
+        # #1329 (Lane μ M6): see discord post-write normalize comment.
+        _post_write_normalize_channel_cred_group(inspected["env_path"], args.agent)
+        _post_write_normalize_channel_cred_group(inspected["access_path"], args.agent)
         result["write_status"] = "ok"
 
         if args.skip_validate:
@@ -1525,7 +1821,10 @@ def cmd_teams(args: argparse.Namespace) -> int:
             print_teams_result(result)
             return 0
 
-        _isolation_aware_mkdir(teams_dir, agent=args.agent)
+        # Issue #1215: explicit `mode=0o2770` for the v2 isolation
+        # channel-state-dir contract (see discord_dir above for the
+        # rationale).
+        _isolation_aware_mkdir(teams_dir, mode=0o2770, agent=args.agent)
         env_lines = [
             f"TEAMS_APP_ID={app_id}",
             f"TEAMS_APP_PASSWORD={app_password}",
@@ -1538,6 +1837,9 @@ def cmd_teams(args: argparse.Namespace) -> int:
             env_lines.append(f"TEAMS_SERVICE_URL={service_url}")
         _isolation_aware_save_text(inspected["env_path"], "\n".join(env_lines) + "\n")
         _isolation_aware_save_json(inspected["access_path"], access_doc)
+        # #1329 (Lane μ M6): see discord post-write normalize comment.
+        _post_write_normalize_channel_cred_group(inspected["env_path"], args.agent)
+        _post_write_normalize_channel_cred_group(inspected["access_path"], args.agent)
         credential_validation = {"status": "skipped"}
         if not args.skip_validate:
             credential_validation = validate_teams_credentials(app_id, app_password, tenant_id)
@@ -1578,6 +1880,8 @@ def cmd_teams(args: argparse.Namespace) -> int:
         validation_state["messaging_endpoint"] = messaging_endpoint
         state_doc["validation"] = validation_state
         _isolation_aware_save_json(inspected["state_path"], state_doc)
+        # #1329 (Lane μ M6): see discord post-write normalize comment.
+        _post_write_normalize_channel_cred_group(inspected["state_path"], args.agent)
         result["write_status"] = "ok"
         result["validation"] = {
             "status": validation_state["status"],
@@ -1593,6 +1897,240 @@ def cmd_teams(args: argparse.Namespace) -> int:
         if result["credential_source"] == "":
             result["credential_source"] = "(unset)"
         print_teams_result(result, stream=sys.stderr)
+        return 1
+
+
+def print_ms365_result(result: dict[str, Any], *, stream: Any = sys.stdout) -> None:
+    print(f"agent: {result['agent']}", file=stream)
+    print(f"ms365_dir: {result['ms365_dir']}", file=stream)
+    print(f"env_file: {result['env_file']}", file=stream)
+    if result["redirect_uri"]:
+        print(f"redirect_uri: {result['redirect_uri']}", file=stream)
+    else:
+        print("redirect_uri: (unset)", file=stream)
+    print(f"redirect_uri_source: {result['redirect_uri_source']}", file=stream)
+    if result["messaging_endpoint"]:
+        print(f"messaging_endpoint: {result['messaging_endpoint']}", file=stream)
+    if result.get("tenant_id"):
+        print(f"tenant_id: {result['tenant_id']}", file=stream)
+    if result.get("client_id"):
+        print(f"client_id: {result['client_id']}", file=stream)
+    if result.get("default_upn"):
+        print(f"default_upn: {result['default_upn']}", file=stream)
+    # PR #1220 codex r1: surface the allow-localhost state so an
+    # operator who set the local-dev escape hatch can see at a glance
+    # that the wizard preserved it on rerun.
+    if result.get("allow_localhost") == "1":
+        print("allow_localhost: yes (MS365_REDIRECT_URI_ALLOW_LOCALHOST=1)", file=stream)
+    print(f"write_status: {result['write_status']}", file=stream)
+    for warning in result.get("warnings") or []:
+        print(f"warning: {warning}", file=stream)
+    if result.get("error"):
+        print(f"error: {result['error']}", file=stream)
+
+
+def cmd_ms365(args: argparse.Namespace) -> int:
+    """Issue #1209: `agent-bridge setup ms365 <agent>` wizard.
+
+    Persists `MS365_REDIRECT_URI` (and optional CLIENT_ID / SECRET /
+    TENANT_ID / DEFAULT_UPN) to `.ms365/.env`. The redirect URI is
+    derived from the Teams plugin's already-configured messaging
+    endpoint (`.teams/state.json.validation.messaging_endpoint`)
+    unless `--messaging-endpoint` overrides it. This pairs with the
+    fail-loud `resolveRedirectUri()` in plugins/ms365/server.ts so
+    the operator never sees a silent `http://localhost:3978/...`
+    default that produces guaranteed AADSTS50011 failures.
+    """
+    ms365_dir = Path(args.ms365_dir).expanduser()
+    inspected = inspect_ms365_dir(ms365_dir)
+    warnings: list[str] = []
+    interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.yes
+
+    result: dict[str, Any] = {
+        "agent": args.agent,
+        "ms365_dir": str(ms365_dir),
+        "env_file": str(inspected["env_path"]),
+        "redirect_uri": "",
+        "redirect_uri_source": "",
+        "messaging_endpoint": "",
+        "tenant_id": "",
+        "client_id": "",
+        "default_upn": "",
+        "allow_localhost": "",
+        "write_status": "pending",
+        "warnings": warnings,
+    }
+
+    try:
+        # Resolve the source for the redirect URI.
+        # Priority:
+        #   1. --redirect-uri (explicit)
+        #   2. --messaging-endpoint + /auth/callback
+        #   3. Existing .teams/state.json validation.messaging_endpoint
+        #      + /auth/callback
+        #   4. Interactive prompt with the best default we have
+        #   5. Existing .ms365/.env MS365_REDIRECT_URI (re-run preservation)
+        explicit_redirect = (args.redirect_uri or "").strip()
+        explicit_endpoint = (args.messaging_endpoint or "").strip()
+        teams_endpoint = ""
+        if args.teams_state_file:
+            teams_state_path = Path(args.teams_state_file).expanduser()
+            teams_state_doc = _safe_load_json(teams_state_path, {})
+            if isinstance(teams_state_doc, dict):
+                validation = teams_state_doc.get("validation") or {}
+                if isinstance(validation, dict):
+                    teams_endpoint = str(validation.get("messaging_endpoint") or "").strip()
+
+        redirect_uri = ""
+        redirect_uri_source = ""
+        if explicit_redirect:
+            redirect_uri = explicit_redirect
+            redirect_uri_source = "flag:--redirect-uri"
+        elif explicit_endpoint:
+            redirect_uri = derive_ms365_redirect_uri(explicit_endpoint)
+            redirect_uri_source = "derived:flag:--messaging-endpoint"
+            result["messaging_endpoint"] = explicit_endpoint
+        elif teams_endpoint:
+            redirect_uri = derive_ms365_redirect_uri(teams_endpoint)
+            redirect_uri_source = "derived:teams_state"
+            result["messaging_endpoint"] = teams_endpoint
+        elif interactive:
+            default = inspected["redirect_uri"]
+            redirect_uri = prompt_text(
+                "MS365 OAuth redirect URI (https://<bot-host>/auth/callback)",
+                default,
+            ).strip()
+            if redirect_uri:
+                redirect_uri_source = "prompt"
+        elif inspected["redirect_uri"]:
+            redirect_uri = inspected["redirect_uri"]
+            redirect_uri_source = "existing:.ms365/.env"
+
+        if not redirect_uri:
+            raise SetupError(
+                "MS365 redirect URI is required. Pass --redirect-uri or --messaging-endpoint, "
+                "or run in an interactive TTY, or pre-set MS365_REDIRECT_URI in .ms365/.env."
+            )
+
+        # Validate the chosen redirect URI shape.
+        parsed = urlparse(redirect_uri)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise SetupError(
+                f"MS365_REDIRECT_URI must be a full http(s) URL: {redirect_uri}"
+            )
+        if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1"}:
+            warnings.append(
+                "MS365_REDIRECT_URI uses plain http on a non-localhost host. "
+                "Entra app registrations require https for public redirect URIs."
+            )
+        # Note: the allow-localhost effective value is computed below
+        # (after credential merge); the warning here is harmless when
+        # the allow flag IS set because it just restates the local-dev
+        # opt-in contract. Operators get one clear line either way.
+        if parsed.hostname in {"localhost", "127.0.0.1"}:
+            warnings.append(
+                "MS365_REDIRECT_URI points at localhost. The MS365 plugin will reject "
+                "this at pair_start unless MS365_REDIRECT_URI_ALLOW_LOCALHOST=1 is also "
+                "set (intended for local dev only — production OAuth clicks happen on "
+                "the user's machine which has no listener on this loopback)."
+            )
+
+        # Merge optional credentials.
+        tenant_id = (args.tenant_id or inspected["tenant_id"]).strip()
+        client_id = (args.client_id or inspected["client_id"]).strip()
+        client_secret_arg = read_secret_value(
+            flag_value=args.client_secret,
+            flag_name="--client-secret",
+            file_path=args.client_secret_file,
+            env_name="BRIDGE_MS365_CLIENT_SECRET",
+        )
+        client_secret = (client_secret_arg or inspected["client_secret"]).strip()
+        default_upn = (args.default_upn or inspected["default_upn"]).strip()
+        default_scopes = (args.default_scopes or inspected["default_scopes"]).strip()
+
+        # PR #1220 codex r1: preserve the local-dev escape hatch
+        # `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` across reruns.
+        # CLI flag `--allow-localhost` takes priority (writes "1");
+        # otherwise the existing value (if any) survives. Runtime
+        # check in plugins/ms365/server.ts is strict `=== '1'` so we
+        # only persist "1" — any truthy-looking pre-existing value is
+        # treated as enabled and re-normalized to "1" on write.
+        if args.allow_localhost:
+            allow_localhost = "1"
+        else:
+            existing_allow = inspected["allow_localhost"]
+            # Strict equality with the runtime check: only "1" is
+            # honored. Any other pre-existing value is dropped on
+            # rewrite (would not have been honored at runtime anyway).
+            allow_localhost = "1" if existing_allow == "1" else ""
+
+        result["redirect_uri"] = redirect_uri
+        result["redirect_uri_source"] = redirect_uri_source
+        result["tenant_id"] = tenant_id
+        result["client_id"] = client_id
+        result["default_upn"] = default_upn
+        result["allow_localhost"] = allow_localhost
+
+        if not tenant_id:
+            warnings.append(
+                "MS365_TENANT_ID is unset. The ms365 plugin exits at startup until "
+                "MS365_TENANT_ID is present in .ms365/.env."
+            )
+        if not client_id:
+            warnings.append(
+                "MS365_CLIENT_ID is unset. The ms365 plugin exits at startup until "
+                "MS365_CLIENT_ID is present in .ms365/.env."
+            )
+        if not client_secret:
+            warnings.append(
+                "MS365_CLIENT_SECRET is unset. The ms365 plugin exits at startup until "
+                "MS365_CLIENT_SECRET is present in .ms365/.env."
+            )
+
+        warnings.append(
+            "Register this redirect URI on the Entra app's Authentication → "
+            f"Redirect URIs page: {redirect_uri}"
+        )
+
+        if args.dry_run:
+            result["write_status"] = "dry_run"
+            print_ms365_result(result)
+            return 0
+
+        # Issue #1215: explicit `mode=0o2770` for the v2 isolation
+        # channel-state-dir contract (see discord_dir / teams_dir).
+        _isolation_aware_mkdir(ms365_dir, mode=0o2770, agent=args.agent)
+        env_lines = [f"MS365_REDIRECT_URI={redirect_uri}"]
+        # PR #1220 codex r1: write the allow-localhost flag IMMEDIATELY
+        # after MS365_REDIRECT_URI so the env file's localhost pair is
+        # visually together for the operator inspecting the file by
+        # hand. Only persisted when "1" — any other value would not be
+        # honored by the runtime check anyway.
+        if allow_localhost == "1":
+            env_lines.append("MS365_REDIRECT_URI_ALLOW_LOCALHOST=1")
+        if tenant_id:
+            env_lines.append(f"MS365_TENANT_ID={tenant_id}")
+        if client_id:
+            env_lines.append(f"MS365_CLIENT_ID={client_id}")
+        if client_secret:
+            env_lines.append(f"MS365_CLIENT_SECRET={client_secret}")
+        if default_upn:
+            env_lines.append(f"MS365_DEFAULT_UPN={default_upn}")
+        if default_scopes:
+            env_lines.append(f"MS365_DEFAULT_SCOPES={default_scopes}")
+        # mode=0o600 (the default). Explicit to match #1215 contract:
+        # secret env files stay tight; only the parent dir gets 02770.
+        _isolation_aware_save_text(inspected["env_path"], "\n".join(env_lines) + "\n", mode=0o600)
+        # #1329 (Lane μ M6): see discord post-write normalize comment.
+        _post_write_normalize_channel_cred_group(inspected["env_path"], args.agent)
+        result["write_status"] = "ok"
+        print_ms365_result(result)
+        return 0
+    except SetupError as exc:
+        result["error"] = str(exc)
+        if result["write_status"] == "pending":
+            result["write_status"] = "skipped"
+        print_ms365_result(result, stream=sys.stderr)
         return 1
 
 
@@ -1781,10 +2319,17 @@ def cmd_mattermost(args: argparse.Namespace) -> int:
             print_mattermost_result(result)
             return 0
 
-        _isolation_aware_mkdir(mattermost_dir, agent=args.agent)
+        # Issue #1215: explicit `mode=0o2770` for the v2 isolation
+        # channel-state-dir contract (see discord_dir above for the
+        # rationale).
+        _isolation_aware_mkdir(mattermost_dir, mode=0o2770, agent=args.agent)
         _isolation_aware_save_text(env_path, env_text)
         _isolation_aware_save_json(access_path, access_doc)
         _isolation_aware_save_json(mcp_path, mcp_doc)
+        # #1329 (Lane μ M6): see discord post-write normalize comment.
+        _post_write_normalize_channel_cred_group(env_path, args.agent)
+        _post_write_normalize_channel_cred_group(access_path, args.agent)
+        _post_write_normalize_channel_cred_group(mcp_path, args.agent)
         result["write_status"] = "ok"
 
         if args.skip_validate:
@@ -1868,6 +2413,39 @@ def build_parser() -> argparse.ArgumentParser:
     teams_parser.add_argument("--skip-send-test", action="store_true")
     teams_parser.add_argument("--dry-run", action="store_true")
     teams_parser.set_defaults(handler=cmd_teams)
+
+    # Issue #1209: ms365 channel setup wizard. Pairs with the fail-loud
+    # `resolveRedirectUri()` in `plugins/ms365/server.ts` so the
+    # operator never has to discover `MS365_REDIRECT_URI` by Azure AD
+    # error after a failed first OAuth click.
+    ms365_parser = subparsers.add_parser("ms365")
+    ms365_parser.add_argument("--agent", required=True)
+    ms365_parser.add_argument("--ms365-dir", required=True)
+    ms365_parser.add_argument(
+        "--teams-state-file",
+        default="",
+        help="Path to .teams/state.json to derive redirect URI from validation.messaging_endpoint (optional)",
+    )
+    ms365_parser.add_argument("--redirect-uri", default="")
+    ms365_parser.add_argument("--messaging-endpoint", default="")
+    ms365_parser.add_argument("--tenant-id", default="")
+    ms365_parser.add_argument("--client-id", default="")
+    ms365_parser.add_argument("--client-secret", default="")
+    ms365_parser.add_argument("--client-secret-file", default="")
+    ms365_parser.add_argument("--default-upn", default="")
+    ms365_parser.add_argument("--default-scopes", default="")
+    # PR #1220 codex r1: explicit opt-in for local-dev redirect URIs.
+    # When set, persists `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` to
+    # `.ms365/.env`. Without this flag, the wizard preserves any
+    # pre-existing allow value but does not introduce one.
+    ms365_parser.add_argument(
+        "--allow-localhost",
+        action="store_true",
+        help="Persist MS365_REDIRECT_URI_ALLOW_LOCALHOST=1 (local-dev opt-in; the runtime plugin rejects localhost redirect URIs without this flag).",
+    )
+    ms365_parser.add_argument("--yes", action="store_true")
+    ms365_parser.add_argument("--dry-run", action="store_true")
+    ms365_parser.set_defaults(handler=cmd_ms365)
 
     mattermost_parser = subparsers.add_parser("mattermost")
     mattermost_parser.add_argument("--agent", required=True)

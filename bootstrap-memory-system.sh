@@ -74,6 +74,49 @@ export BRIDGE_ADMIN_AGENT_ID="${BRIDGE_ADMIN_AGENT_ID:-$BRIDGE_ADMIN_AGENT}"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/scripts/_common.sh"
 
+# Issue #1222: step_rebuild_one's apply path writes into the agent's
+# memory/ dir, which under linux-user isolation is owned by the iso UID
+# with group `ab-agent-<slug>` mode 2770. The controller is intentionally
+# NOT in that group (per the v2 contract), so direct `rm -f`, `mv -f`,
+# and `mkdir -p` of `$home/memory/*.rebuilding-*` and the swap into the
+# final `index.sqlite` slot all fail with `Permission denied`. The fix
+# (H.2 / codex r1 preferred) drops to the iso UID via
+# `bridge_isolation_run_as_agent_user_via_bash` for the *entire* rebuild
+# block — tmp create, python rebuild-index, validate, mkdir, mv — so no
+# controller-side write crosses the boundary.
+#
+# Sourcing bridge-lib.sh pulls in bridge-agents.sh (for
+# bridge_agent_linux_user_isolation_effective + bridge_agent_os_user)
+# and bridge-isolation-helpers.sh (for
+# bridge_isolation_run_as_agent_user_via_bash). The source is wrapped
+# in a guard so a stripped install (or smoke harness that uses a
+# minimal $BRIDGE_HOME tree) can still run the non-iso path —
+# `_BRIDGE_ISO_HELPERS_LOADED` records whether the helper is available.
+#
+# IMPORTANT (codex r1 BLOCKING finding): merely sourcing bridge-lib.sh
+# does NOT populate the per-agent assoc arrays
+# (`BRIDGE_AGENT_ISOLATION_MODE`, `BRIDGE_AGENT_OS_USER`, …) that
+# `bridge_agent_linux_user_isolation_effective` reads. The roster files
+# (`$BRIDGE_HOME/agent-roster.sh` + `agent-roster.local.sh`) are loaded
+# by `bridge_load_roster` from `lib/bridge-state.sh`, which then drives
+# the arrays. Without that call, every iso v2 agent's predicate returns
+# 1 ("not isolated") in the bootstrap shell and `step_rebuild_one`
+# falls back to the legacy controller-direct path — which is exactly
+# the codepath that hits `rm: Permission denied` on `2770 ab-agent-*`
+# memory/ trees (#1222). So: source, verify helpers AND the roster
+# loader are present, then actually load. Helpers-only is a bug.
+_BRIDGE_ISO_HELPERS_LOADED=0
+if [[ -r "$SCRIPT_DIR/bridge-lib.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/bridge-lib.sh" || true
+  if declare -F bridge_isolation_run_as_agent_user_via_bash >/dev/null 2>&1 \
+      && declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && declare -F bridge_load_roster >/dev/null 2>&1 \
+      && bridge_load_roster >/dev/null 2>&1; then
+    _BRIDGE_ISO_HELPERS_LOADED=1
+  fi
+fi
+
 # -----------------------------------------------------------------------------
 # arg parsing
 # -----------------------------------------------------------------------------
@@ -149,6 +192,57 @@ done
 if (( RE_JITTER == 1 )) && [[ "$MODE" != "apply" ]]; then
   echo "bootstrap-memory: --re-jitter requires --apply (current mode: $MODE)" >&2
   exit 2
+fi
+
+# Issue #1263 (v0.15.0-beta4 Lane J): wiki-graph + librarian automation
+# stack is opt-in. The default is OFF on fresh installs; existing
+# installs that have already been provisioned (any prior
+# `report-*.json` under `$BRIDGE_STATE_ROOT/bootstrap-memory/`) stay
+# ON for back-compat. Operators can force the decision via the
+# `BRIDGE_WIKI_GRAPH_ENABLED` env var:
+#   - "1" / "true" / "yes" → run normally
+#   - "0" / "false" / "no" → skip with advisory (exit 0)
+#   - unset                → infer from state (existing report → on,
+#                            fresh install → off + advisory)
+# `--check` and `--dry-run` always proceed (they are read-only / report-
+# generating verbs that the operator needs to inspect drift), so the
+# gate only short-circuits `--apply`.
+_wgraph_enabled_env="${BRIDGE_WIKI_GRAPH_ENABLED:-}"
+_wgraph_should_skip=0
+_wgraph_skip_reason=""
+if [[ "$MODE" == "apply" ]]; then
+  case "${_wgraph_enabled_env,,}" in
+    1|true|yes|on)
+      :  # explicit opt-in, run normally
+      ;;
+    0|false|no|off)
+      _wgraph_should_skip=1
+      _wgraph_skip_reason="BRIDGE_WIKI_GRAPH_ENABLED=$_wgraph_enabled_env (operator opt-out)"
+      ;;
+    "")
+      # Infer from state. Any prior report file = previously provisioned
+      # = stay on. No prior report = fresh install = default off.
+      if compgen -G "$BRIDGE_STATE_ROOT/bootstrap-memory/report-*.json" >/dev/null 2>&1; then
+        :  # back-compat: previously provisioned install stays on
+      else
+        _wgraph_should_skip=1
+        _wgraph_skip_reason="fresh install (no prior bootstrap-memory report); wiki-graph + librarian default-off"
+      fi
+      ;;
+    *)
+      echo "bootstrap-memory: BRIDGE_WIKI_GRAPH_ENABLED must be one of 1/0/true/false/yes/no/on/off (got: $_wgraph_enabled_env)" >&2
+      exit 2
+      ;;
+  esac
+fi
+if (( _wgraph_should_skip == 1 )); then
+  # Routing: advisory to stderr (operator-visible), structured marker to
+  # stdout so JSON consumers / wrappers can detect the skip without
+  # parsing localized text. Exit 0 — this is a no-op success.
+  echo "[bootstrap-memory] wiki-graph + librarian provisioning skipped: $_wgraph_skip_reason" >&2
+  echo "[bootstrap-memory] re-run with BRIDGE_WIKI_GRAPH_ENABLED=1 to activate." >&2
+  printf 'wiki_graph_skipped=1\nwiki_graph_skip_reason=%s\n' "$_wgraph_skip_reason"
+  exit 0
 fi
 
 # Validate --backfill-history once, up-front, so a bad value fails fast
@@ -359,6 +453,201 @@ PY
   # in-process (no cron). We reuse bridge-memory.py directly but with the
   # tmp+swap pattern.
   local tmp_db="$db.rebuilding-$STAMP"
+
+  # Issue #1222: under linux-user isolation, the controller cannot write
+  # into the iso-owned `memory/` dir (`2770 agent-bridge-<slug>:ab-agent-<slug>`).
+  # The whole rebuild/publish block — `rm -f tmp_db`, `bridge-memory.py
+  # rebuild-index --db-path tmp_db`, the python validate, `mkdir -p`, and
+  # the final `mv -f tmp_db db` — touches files inside that dir. Wrapping
+  # only the leading `rm -f` (or only the trailing `mv -f`) would still
+  # fail the others. So we either run the entire block under the iso UID
+  # (H.2 — preferred when isolated + sudo OK) or run it controller-direct
+  # (legacy non-isolated path).
+  local _iso_isolated=0
+  if (( _BRIDGE_ISO_HELPERS_LOADED == 1 )) \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    _iso_isolated=1
+  fi
+
+  if (( _iso_isolated == 1 )); then
+    # Inline rebuild script run as the iso UID via the sudoers `bash`
+    # allowlist. Self-contained — does NOT source bridge-lib.sh inside
+    # the isolated UID (sudoers allowlist is `bash` + `tmux` only).
+    #
+    # Args bound inside the script:
+    #   $1 = BRIDGE_PYTHON, $2 = BRIDGE_HOME, $3 = agent, $4 = home,
+    #   $5 = shared_root, $6 = db, $7 = tmp_db
+    #
+    # Script exit codes (all ≥ 10 so the wrapper's +2 shift on rc<3 cannot
+    # collide with the wrapper's own 0/1/2 pre-flight band):
+    #   0  — full rebuild + validate + swap succeeded
+    #   10 — `rebuild-index` invocation failed
+    #   11 — validate-failed (rebuild produced a wrong/empty DB);
+    #        script removes tmp_db and exits
+    #   12 — pre-rebuild tmp_db unlink failed (e.g. ACL drift inside
+    #        the iso UID itself — surface as drift, not silent continue)
+    #   13 — mkdir of memory/ parent failed
+    #   14 — final mv tmp_db -> db failed
+    #   15 — mktemp for the validate harness failed inside iso-owned tmp
+    #
+    # Footgun #11 (heredoc-stdin deadlock): no `<<EOF` / `<<<` / `<<'PY'`
+    # anywhere in this body. The body is a single-quoted bash string so
+    # $variables resolve only inside the sudo'd bash. The python harness
+    # writes its source to a tmp file inside iso-owned tmp first, then
+    # runs `python3 -- <tmp>`; that avoids feeding heredoc stdin into
+    # the sqlite-validate subprocess.
+    local iso_rebuild_script
+    iso_rebuild_script='
+bridge_python="$1"
+bridge_home="$2"
+agent="$3"
+home="$4"
+shared_root="$5"
+db="$6"
+tmp_db="$7"
+
+# Phase 1: clear stale tmp DB. Failure here means the iso UID itself
+# cannot unlink (true ACL/mode drift, not the cross-boundary case the
+# fix targets) — surface as exit 12 so the caller records a drift row.
+if [[ -e "$tmp_db" ]] && ! rm -f "$tmp_db"; then
+  exit 12
+fi
+
+# Phase 2: run rebuild-index. Cap with timeout when available.
+rebuild_rc=0
+if command -v timeout >/dev/null 2>&1; then
+  timeout 900 "$bridge_python" "$bridge_home/bridge-memory.py" rebuild-index \
+    --agent "$agent" --home "$home" \
+    --bridge-home "$bridge_home" \
+    --index-kind bridge-wiki-hybrid-v2 \
+    --shared-root "$shared_root" \
+    --db-path "$tmp_db" \
+    --json \
+    >/dev/null 2>&1 || rebuild_rc=$?
+elif command -v gtimeout >/dev/null 2>&1; then
+  gtimeout 900 "$bridge_python" "$bridge_home/bridge-memory.py" rebuild-index \
+    --agent "$agent" --home "$home" \
+    --bridge-home "$bridge_home" \
+    --index-kind bridge-wiki-hybrid-v2 \
+    --shared-root "$shared_root" \
+    --db-path "$tmp_db" \
+    --json \
+    >/dev/null 2>&1 || rebuild_rc=$?
+else
+  "$bridge_python" "$bridge_home/bridge-memory.py" rebuild-index \
+    --agent "$agent" --home "$home" \
+    --bridge-home "$bridge_home" \
+    --index-kind bridge-wiki-hybrid-v2 \
+    --shared-root "$shared_root" \
+    --db-path "$tmp_db" \
+    --json \
+    >/dev/null 2>&1 || rebuild_rc=$?
+fi
+if [[ "$rebuild_rc" -ne 0 ]]; then
+  exit 10
+fi
+
+# Phase 3: validate tmp_db via a python harness staged in iso-owned
+# tmp. Footgun #11: write the python source with printf first, then
+# `python3 -- file`, NOT a heredoc into stdin.
+tmp_validate_dir="$(dirname "$tmp_db")"
+validate_py="$(mktemp "$tmp_validate_dir/.bridge-memory-validate.XXXXXX.py")" || exit 15
+trap "rm -f \"$validate_py\" 2>/dev/null" EXIT INT TERM
+{
+  printf "%s\n" "import sqlite3, sys"
+  printf "%s\n" "p = sys.argv[1]"
+  printf "%s\n" "con = sqlite3.connect(p); cur = con.cursor()"
+  printf "%s\n" "cur.execute(\"SELECT value FROM meta WHERE key=\x27index_kind\x27\")"
+  printf "%s\n" "r = cur.fetchone()"
+  printf "%s\n" "kind = r[0] if r else \"\""
+  printf "%s\n" "cur.execute(\"SELECT COUNT(*) FROM chunks\")"
+  printf "%s\n" "chunks = cur.fetchone()[0]"
+  printf "%s\n" "con.close()"
+  printf "%s\n" "sys.exit(0 if (kind == \"bridge-wiki-hybrid-v2\" and chunks > 0) else 1)"
+} >"$validate_py"
+if ! "$bridge_python" "$validate_py" "$tmp_db"; then
+  rm -f "$tmp_db" 2>/dev/null
+  exit 11
+fi
+
+# Phase 4: ensure memory/ parent dir exists.
+if ! mkdir -p "$(dirname "$db")"; then
+  exit 13
+fi
+
+# Phase 5: atomic swap.
+if ! mv -f "$tmp_db" "$db"; then
+  exit 14
+fi
+exit 0
+'
+    local iso_rc=0
+    bridge_isolation_run_as_agent_user_via_bash "$agent" "$iso_rebuild_script" \
+      "$BRIDGE_PYTHON" "$BRIDGE_HOME" "$agent" "$home" \
+      "$BRIDGE_SHARED_ROOT" "$db" "$tmp_db" 2>/dev/null || iso_rc=$?
+    # bridge_isolation_run_as_agent_user_via_bash returns:
+    #   0    — script rc 0 (success)
+    #   1    — pre-flight: agent not isolated (impossible here, we gated above)
+    #   2    — pre-flight: sudo unavailable / no passwordless sudoers
+    #   3..  — script rc band (rc<3 shifted +2; rc≥3 passthrough). The
+    #          script's exit codes are pinned at ≥ 10 so the shift band
+    #          never collides with the pre-flight band.
+    case "$iso_rc" in
+      0)
+        record "$agent" "index" "rebuilt" ""
+        return 0
+        ;;
+      1)
+        # rc=1 here means the isolation gate inverted between our check
+        # and the helper's own re-check. Treat as a roster/state
+        # inconsistency drift signal rather than masking it.
+        record "$agent" "index" "rebuild-failed" "iso-helper rc=1 (not isolated?)"
+        return 0
+        ;;
+      2)
+        # Sudo unavailable / passwordless sudoers missing. The iso v2
+        # contract requires this — surface explicitly so the operator
+        # can fix the sudoers gap instead of seeing a silent skip.
+        record "$agent" "index" "rebuild-failed" "sudo-unavailable-for-iso-uid"
+        return 0
+        ;;
+      10)
+        record "$agent" "index" "rebuild-failed" ""
+        return 0
+        ;;
+      11)
+        record "$agent" "index" "validate-failed" ""
+        return 0
+        ;;
+      12)
+        # Pre-rebuild tmp_db unlink failed under iso UID itself. True
+        # drift (ACL/mode regression inside the agent's own tree), not
+        # the cross-boundary case this fix targets. Surface explicitly.
+        record "$agent" "index" "rebuild-failed" "stale-tmp-unlink-failed-as-iso-uid"
+        return 0
+        ;;
+      13)
+        record "$agent" "index" "rebuild-failed" "memory-mkdir-failed-as-iso-uid"
+        return 0
+        ;;
+      14)
+        record "$agent" "index" "rebuild-failed" "mv-into-place-failed-as-iso-uid"
+        return 0
+        ;;
+      15)
+        record "$agent" "index" "rebuild-failed" "validate-harness-mktemp-failed"
+        return 0
+        ;;
+      *)
+        record "$agent" "index" "rebuild-failed" "iso-helper rc=$iso_rc"
+        return 0
+        ;;
+    esac
+  fi
+
+  # Non-isolated (shared/legacy) path — keep the controller-direct
+  # implementation unchanged. Mode 2770 doesn't apply here, so the same
+  # rm/rebuild/validate/mkdir/mv sequence runs as the controller user.
   rm -f "$tmp_db"
   if ! run_with_timeout 900 "$BRIDGE_PYTHON" "$BRIDGE_HOME/bridge-memory.py" rebuild-index \
         --agent "$agent" --home "$home" \

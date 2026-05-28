@@ -1144,6 +1144,111 @@ bridge_linux_can_sudo_to() {
   sudo -n -u "$os_user" -- "$bash_bin" -c 'exit 0' 2>/dev/null
 }
 
+# Issue #1299 (v0.15.0-beta5 Lane β): controller-side escalation to read
+# files Claude Code writes at 0600 owned by the iso UID. Mirrors
+# `bridge_linux_sudo_root` (same Linux/root short-circuit + sudo-missing
+# `bridge_die`) but targets `<os_user>` instead of root.
+#
+# Sudoers shape: `bridge_migration_sudoers_entry` whitelists `tmux` + `bash`
+# as the only sudo-invoked binaries (per-os_user). Any helper that needs to
+# run a non-whitelisted binary (e.g. `python3`) MUST wrap it in
+# `bash -c 'exec "$@"' bash <prog> <args...>` so sudo only sees `bash` on
+# its argv. Direct callers (e.g. `python3 ...`) work only when the daemon
+# runs as root OR when a per-host sudoers entry has been broadened.
+#
+# Behavior:
+#   * Non-Linux (macOS/BSD): falls through to direct invocation as the
+#     controller user — matches `bridge_linux_sudo_root` so iso-v2 path
+#     can no-op on dev hosts without surprise sudo prompts.
+#   * Linux + caller is root: drops to `sudo -u <os_user> ...` (real sudo)
+#     so the target UID is set correctly. `id -u == 0` cannot be its own
+#     short-circuit here because the goal is dropping privilege.
+#   * Linux + non-root caller: `sudo -n -u <os_user> ...`. Sudoers entry
+#     must already permit the binary or the wrap must already be a `bash`
+#     -c. Inherits stdio so the caller parses stdout directly.
+#
+# Returns the wrapped command's rc. On macOS with a non-Linux host, the
+# helper transparently dispatches without sudo so smokes that synthesize
+# iso v2 state on a dev host still exercise the surrounding code path.
+bridge_linux_sudo_as_user() {
+  local os_user="$1"
+  shift || return 2
+  [[ -n "$os_user" ]] || {
+    "$@"
+    return $?
+  }
+
+  # Non-Linux: no real iso-v2 in play, just dispatch directly. Smokes that
+  # need to assert the sudo-wrap shape MUST set BRIDGE_HOST_PLATFORM_OVERRIDE
+  # = Linux to take the real branch.
+  if [[ "$(bridge_host_platform)" != "Linux" ]]; then
+    "$@"
+    return $?
+  fi
+
+  if [[ "$(id -u)" == "0" ]]; then
+    # Already root — drop to the iso UID via sudo (no -n needed under
+    # root, but keep it for consistency / non-interactive guarantee).
+    sudo -n -u "$os_user" -- "$@"
+    return $?
+  fi
+
+  command -v sudo >/dev/null 2>&1 \
+    || bridge_die "linux-user isolation read-elevation requires sudo (target user=$os_user)"
+  sudo -n -u "$os_user" -- "$@"
+}
+
+# Issue #1299 (v0.15.0-beta5 Lane β): resolve the os_user that
+# `bridge_linux_sudo_as_user` should target so a controller-side read can
+# cross the iso v2 0600-jsonl boundary (Claude Code writes session
+# transcripts as `0600 <iso-uid>:<ab-agent-<a>>` — the group bit is unset,
+# so even a group-member controller cannot read directly).
+#
+# Returns 0 + prints the os_user on stdout when:
+#   * agent is registered
+#   * bridge_agent_linux_user_isolation_effective <agent> succeeds
+#   * an os_user is bound to that agent
+#   * the controller can actually `sudo -n -u <os_user>` (probed via
+#     bridge_linux_can_sudo_to)
+#
+# Returns 1 + prints nothing in EVERY other case. The non-effective branch
+# is the back-compat path: legacy non-iso-v2 callers / macOS hosts / smokes
+# without a real sudoers entry get the same byte-for-byte behavior they had
+# before this helper existed.
+#
+# Callers MUST short-circuit on empty stdout (e.g.
+# `[[ -n "$os_user" ]] && bridge_linux_sudo_as_user "$os_user" ...` else
+# direct dispatch) so the legacy code path is preserved when the wrap is
+# either not needed or not safe to attempt.
+bridge_resolve_agent_iso_sudo_user() {
+  local agent="$1"
+  local os_user=""
+
+  [[ -n "$agent" ]] || return 1
+
+  # Only registered + iso-v2-effective agents qualify. Unregistered
+  # callers (smoke fixtures, test harnesses) fall through to the legacy
+  # no-sudo path.
+  if command -v bridge_agent_exists >/dev/null 2>&1; then
+    bridge_agent_exists "$agent" 2>/dev/null || return 1
+  fi
+  command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+    || return 1
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+    || return 1
+
+  os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+  [[ -n "$os_user" ]] || return 1
+
+  # Final guard: only return the user when sudo actually permits the
+  # escalation. Otherwise the wrap call would silently fail and the
+  # caller's direct fallback (empty user → no wrap) is strictly better
+  # than a spurious sudo-policy stderr.
+  bridge_linux_can_sudo_to "$os_user" 2>/dev/null || return 1
+
+  printf '%s' "$os_user"
+}
+
 # Internal: non-fatal sudo presence probe. Returns 0 if the helper can
 # safely call bridge_linux_sudo_root, 1 if sudo is absent (so the helper
 # must early-return and the daemon is not killed by bridge_die).
@@ -1859,6 +1964,18 @@ bridge_write_isolated_known_marketplaces_catalog() {
   # controller's full file. This keeps undeclared marketplaces out of isolated
   # Claude's loader and rewrites installLocation/source.path to isolated-home
   # aliases that bridge controls read-only.
+  #
+  # beta23 Option A: this function IS the controller-published, root-owned
+  # writer for `known_marketplaces.json` (the iso UID must NOT be able to
+  # rewrite its own plugin marketplace catalog — security boundary). It
+  # implements the same contract as `bridge_iso_run --op publish-root-file
+  # --mode 0640 --group-agent <agent>`: mktemp-in-dest-dir + chmod+chown+chgrp
+  # before mv -f. The mktemp + python + chown/chgrp/chmod/mv chain below
+  # IS the canonical root-publish flow; the helper-API equivalent is
+  # the publish-root-file op. New callsites that need a root-published
+  # write for an agent's plugin manifest should call bridge_iso_run;
+  # this function remains the in-place compatibility wrapper that other
+  # legacy callers depend on for the catalog-filtering work.
   local os_user="$1"
   local isolated_plugins="$2"
   local controller_plugins="$3"
@@ -2097,21 +2214,44 @@ PY
     bridge_die "bridge_write_isolated_known_marketplaces_catalog: refused to write per-UID catalog for $os_user (see [bridge-isolate] errors above)"
   fi
 
-  bridge_linux_sudo_root chown root:root "$catalog_tmp"
-  bridge_linux_sudo_root chmod 0640 "$catalog_tmp"
-  if [[ -n "$agent" ]]; then
-    local _v2_grp
-    _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
-      || _v2_grp=""
-    if [[ -n "$_v2_grp" ]]; then
-      bridge_linux_sudo_root chgrp "$_v2_grp" "$catalog_tmp" \
-        || bridge_die "isolation v2: chgrp '$_v2_grp' on marketplace catalog '$catalog_tmp' failed"
-    else
-      bridge_die "isolation v2: cannot resolve agent group for marketplace catalog '$catalog_tmp'"
-    fi
-  else
+  # Issue #1278 (Lane H beta4): own the catalog to the iso UID +
+  # `ab-agent-<a>` group at mode 0660. The iso UID's
+  # `bridge-dev-plugin-cache.py:update_known_marketplaces` (run at agent
+  # start under that UID) merges new directory-marketplace entries into
+  # this file via `tmp.write_text + os.replace`. The rename succeeds
+  # because the parent dir is mode 02770 (group-write), BUT the python
+  # writer ALSO does `os.chmod(tmp, existing_mode)` which preserves
+  # whatever mode the prior file carried. With the legacy `root:ab-agent
+  # 0640` shape, a subsequent direct-write fallback (or a future caller
+  # that re-opens the file with `open(path, 'r+')` instead of the tmp+
+  # replace pattern) would EACCES. Ownership=iso UID also lets the
+  # isolated agent's `bridge-dev-plugin-cache.py` perform a true
+  # in-place rewrite without traversing the rename indirection — the
+  # contract for the iso UID is "owner of own per-UID catalog".
+  #
+  # Security boundary preserved: alias validation (refusal of unsafe
+  # marketplace names / collisions / reserved aliases) ran above this
+  # block at controller-root level; the iso UID can only mutate
+  # ENTRIES of its own per-UID catalog (not the controller's shared
+  # `known_marketplaces.json`) and every subsequent merge in
+  # `update_known_marketplaces` itself goes through
+  # `_require_safe_path_component` validation before payload write.
+  if [[ -z "$agent" ]]; then
     bridge_die "isolation v2: bridge_write_isolated_known_marketplaces_catalog requires agent id"
   fi
+  local _v2_grp
+  _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
+    || _v2_grp=""
+  if [[ -z "$_v2_grp" ]]; then
+    bridge_die "isolation v2: cannot resolve agent group for marketplace catalog '$catalog_tmp'"
+  fi
+  if [[ -z "$os_user" ]]; then
+    bridge_die "isolation v2: bridge_write_isolated_known_marketplaces_catalog requires os_user"
+  fi
+  bridge_linux_sudo_root chown "$os_user:$_v2_grp" "$catalog_tmp" \
+    || bridge_die "isolation v2: chown '$os_user:$_v2_grp' on marketplace catalog '$catalog_tmp' failed"
+  bridge_linux_sudo_root chmod 0660 "$catalog_tmp" \
+    || bridge_die "isolation v2: chmod 0660 on marketplace catalog '$catalog_tmp' failed"
   bridge_linux_sudo_root mv "$catalog_tmp" "$catalog"
 }
 
@@ -2245,6 +2385,16 @@ bridge_write_isolated_installed_plugins_manifest() {
   # actually-existing location resolved by
   # bridge_resolve_plugin_install_path. The file is owned by root so the
   # isolated UID cannot tamper with which plugins it loads.
+  #
+  # beta23 Option A: this function IS the controller-published, root-owned
+  # writer for `installed_plugins.json` (security boundary: iso UID must
+  # NOT be able to rewrite its own plugin allowlist). It implements the
+  # same contract as `bridge_iso_run --op publish-root-file --mode 0640
+  # --group-agent <agent>`: mktemp-in-dest-dir + chmod+chown+chgrp BEFORE
+  # mv -f. New callsites that need a root-published per-agent plugin
+  # manifest should call bridge_iso_run; this function remains the
+  # in-place compatibility wrapper because legacy callers depend on the
+  # catalog-filtering work it performs inline.
   #
   # Arguments:
   #   os_user             — isolated UID
@@ -2599,7 +2749,51 @@ bridge_linux_share_plugin_catalog() {
         && [[ -z "$_v2_pcg_plugins" ]]; then
       return 0
     fi
-    bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) but agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries. Run \`agb plugins seed\` to populate the shared plugin catalog from the bundled agent-bridge marketplace, then retry. (For an external marketplace: \`agb plugins seed --marketplace-root <path>\`.)"
+    # Issue #1231 fail-closed fallback: install/init is the primary
+    # path that seeds the shared catalog (bridge-init.sh runs `agb
+    # plugins seed` after host-profile resolution). If we reach this
+    # branch the operator either skipped init seed, blew away
+    # plugins-cache by hand, or upgraded from a pre-#1231 release that
+    # did not seed on init. Rather than fail straight to bridge_die,
+    # attempt one in-flight bundled-marketplace seed using the same
+    # subprocess surface; only fail if THAT also fails. This covers
+    # fresh install, upgrades, partial installs, and manual cache
+    # deletion. The seed call is bounded to the bundled marketplace
+    # (no --marketplace-root / --channels args) — we never widen the
+    # operator's external marketplace surface from the agent-create
+    # fallback path; if the operator wanted an external marketplace,
+    # they need to run `agb plugins seed --marketplace-root <path>`
+    # explicitly.
+    local _v2_seed_cli=""
+    if [[ -n "${BRIDGE_HOME:-}" ]] && [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+      _v2_seed_cli="$BRIDGE_HOME/agent-bridge"
+    elif [[ -n "${BRIDGE_SCRIPT_DIR:-}" ]] && [[ -x "$BRIDGE_SCRIPT_DIR/agent-bridge" ]]; then
+      _v2_seed_cli="$BRIDGE_SCRIPT_DIR/agent-bridge"
+    fi
+    if [[ -n "$_v2_seed_cli" ]]; then
+      bridge_warn "isolation v2 plugin catalog: shared catalog at \$BRIDGE_SHARED_ROOT/plugins-cache is empty for agent '$agent' (plugin: channels declared) — attempting fallback seed via '$_v2_seed_cli plugins seed' (bundled agent-bridge marketplace)"
+      local _v2_seed_fallback_output=""
+      local _v2_seed_fallback_rc=0
+      local _v2_seed_bash="${BRIDGE_BASH_BIN:-bash}"
+      _v2_seed_fallback_output="$("$_v2_seed_bash" "$_v2_seed_cli" plugins seed 2>&1)" \
+        || _v2_seed_fallback_rc=$?
+      if (( _v2_seed_fallback_rc == 0 )) \
+         && bridge_isolation_v2_shared_plugins_root_populated 2>/dev/null; then
+        # Re-resolve controller_plugins now that the cache is populated;
+        # callers below depend on it.
+        controller_plugins="$(bridge_isolation_v2_shared_plugins_root 2>/dev/null)" || {
+          bridge_die "isolation v2 plugin catalog: fallback seed reported success but plugins root could not be resolved afterwards. Re-run \`agb plugins seed\` manually and retry \`agb agent create --isolate ...\`."
+        }
+      else
+        # Fallback seed failed — emit its output for the operator and
+        # then fail with the original actionable error (extended with
+        # the fallback rc).
+        [[ -n "$_v2_seed_fallback_output" ]] && printf '%s\n' "$_v2_seed_fallback_output" >&2
+        bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) and the in-flight fallback seed via '$_v2_seed_cli plugins seed' failed (rc=$_v2_seed_fallback_rc). Agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries — both require the shared catalog. Run \`agb plugins seed\` manually to populate from the bundled agent-bridge marketplace and inspect the error above, then retry. (For an external marketplace: \`agb plugins seed --marketplace-root <path>\`.)"
+      fi
+    else
+      bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) but agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries, and the fallback seed CLI was not locatable (\$BRIDGE_HOME/agent-bridge missing). Run \`agb plugins seed\` to populate the shared plugin catalog from the bundled agent-bridge marketplace, then retry. (For an external marketplace: \`agb plugins seed --marketplace-root <path>\`.)"
+    fi
   fi
 
   local isolated_plugins="$user_home/.claude/plugins"
@@ -3379,6 +3573,10 @@ declare -g -A BRIDGE_AGENT_HISTORY_KEY=()
 declare -g -A BRIDGE_AGENT_CREATED_AT=()
 declare -g -A BRIDGE_AGENT_UPDATED_AT=()
 declare -g -A BRIDGE_AGENT_IDLE_TIMEOUT=()
+# Issue #1234 (Lane δ): per-agent daemon auto-start policy mirrored into the
+# isolated agent-env snapshot so a scoped roster load preserves "hold" when
+# operating from the iso side. Assoc array (never scalar — refs #1213).
+declare -g -A BRIDGE_AGENT_START_POLICY=()
 declare -g -A BRIDGE_AGENT_NOTIFY_KIND=()
 declare -g -A BRIDGE_AGENT_NOTIFY_TARGET=()
 declare -g -A BRIDGE_AGENT_NOTIFY_ACCOUNT=()
@@ -3709,6 +3907,317 @@ bridge_refresh_isolated_agent_env_after_channel_mutation() {
     || bridge_warn "channel mutation: cached agent-env.sh regeneration reported a problem for '$agent'; run 'agent-bridge migrate isolation v2 --apply --agent $agent' before the next restart"
 }
 
+# ---------------------------------------------------------------------------
+# Shared isolated-home contract helper (Phase 3, codex design 2026-05-24)
+# ---------------------------------------------------------------------------
+#
+# Single source of truth for the per-agent isolated-home POSIX contract.
+# Three call sites previously rolled their own (slightly different)
+# variants of the same set of mkdir / chown / chmod calls:
+#
+#   1. `bridge_linux_prepare_agent_isolation`        (lib/bridge-agents.sh)
+#   2. `bridge_install_isolated_home_settings`       (lib/bridge-hooks.sh — THE RESTART REVERTER)
+#   3. `bridge_auth_prepare_credential_file`         (bridge-auth.sh, isolated branch)
+#
+# The restart reverter is the architectural root of Family 3 (the
+# session-env regression patch reported during Phase 3 acceptance).
+# `bridge_install_isolated_home_settings` previously chowned
+# `<isolated-home>/.claude` to `root:$os_user` mode `0750`, which directly
+# contradicted the prepare-side contract (`root:ab-agent-<agent>` mode
+# `3770`/`2770`). Every restart would silently revert the dir back to a
+# state where the isolated UID could not mkdir `.claude/session-env/` from
+# the supplementary-group path.
+#
+# Contract (codex design 2026-05-24, implement-ok):
+#
+#   $user_home                          owner=$os_user  group=ab-agent-<agent>  mode 2750
+#   $user_home/.claude                  owner=root      group=ab-agent-<agent>  mode 3770 (or 2770 fallback)
+#   $user_home/.claude/plugins          owner=root      group=ab-agent-<agent>  mode 3770 (or 2770 fallback)
+#   $user_home/.claude/session-env      owner=root      group=ab-agent-<agent>  mode 3770 (or 2770 fallback)
+#
+# Mode 3770 = sticky (1000) + setgid (2000) + group rwx. Sticky on a
+# group-writable directory prevents the isolated UID from unlinking
+# root-owned files inside (`settings.json`, `settings.effective.json`),
+# preserving the integrity boundary documented in
+# lib/bridge-hooks.sh:506-519. setgid keeps new subdir creation
+# inheriting `ab-agent-<agent>` so the controller harvester's group-r-X
+# path keeps working without re-running prepare. Mode 2770 (no sticky)
+# is the compat fallback if a future host rejects sticky on a
+# group-writable dir — see `BRIDGE_ISO_HOME_CONTRACT_MODE` below.
+#
+# Safety properties (anti-race, anti-symlink):
+#
+#   * Linux-only: no-op success on non-Linux. macOS dseditgroup / launchctl
+#     never enters this path.
+#   * Required inputs: `agent`, `os_user`, `user_home` must all be
+#     non-empty.
+#   * `$user_home` must resolve under the canonical isolated-home root
+#     (`BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT`). The controller's own
+#     `$HOME` is never a valid target.
+#   * Each target path is rejected if it is a symlink or non-directory
+#     BEFORE any mutation. The isolated UID owns `$user_home` and can
+#     swap `.claude` for a symlink between check and mutate; the
+#     `BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING` opt-out is intentionally
+#     gated to running-tmux-session checks, not to symlink checks.
+#   * The agent's tmux session must be stopped UNLESS this is the
+#     initial create/start path (the same gate
+#     `bridge_linux_prepare_agent_isolation` already enforces) or
+#     `BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING=1` is set (smoke fixtures).
+#
+# Status output (stdout, one tab-separated line per sub-path):
+#
+#   <path>\t<status>\t<owner>:<group>\t<mode>
+#
+#   status ∈ ok | changed | failed | rejected
+#
+# Caller can scrape these lines to emit reconciler child rows (the
+# `agent_home_contract` row kind in lib/bridge-isolation-v2-reconcile.sh
+# emits 4 child rows from this output, one per sub-path).
+#
+# Return code: 0 on full success (every sub-path OK or CHANGED), 1 on any
+# rejected/failed sub-path. Callers like the restart reverter return 0 on
+# the function's 0 + propagate 1 up; rendering still happens regardless
+# because the helper makes the dir contract canonical before render.
+bridge_linux_normalize_isolated_home_contract() {
+  local agent="$1"
+  local os_user="$2"
+  local user_home="$3"
+
+  # Linux-only — no-op success elsewhere.
+  [[ "$(bridge_host_platform)" == "Linux" ]] || return 0
+
+  # Emit probe-failure status lines for all four target sub-paths so
+  # callers (the reconciler row dispatcher) can distinguish "no status
+  # line emitted" (helper bug) from "row says X" (helper-reported probe
+  # outcome). Used by every early-return path below where the helper
+  # cannot reach the per-target normalize loop. Status word convention:
+  #   denied — runtime probe failure (sudo refused, session running,
+  #            anchor mismatch). NOT a state drift; operator action ≠ apply.
+  #   error  — invariant violation (bad args, unresolved group). NOT a
+  #            state drift; operator must fix configuration before retry.
+  # The four targets here MUST stay in sync with the per-target
+  # normalize loop below (target_home / target_claude / target_plugins /
+  # target_session_env). #1298.
+  _bridge_linux_home_contract_emit_probe_failure() {
+    local _status="$1" _user_home="$2"
+    [[ -n "$_user_home" ]] || return 0
+    printf '%s\t%s\t-\t-\n' "$_user_home"                       "$_status"
+    printf '%s\t%s\t-\t-\n' "$_user_home/.claude"               "$_status"
+    printf '%s\t%s\t-\t-\n' "$_user_home/.claude/plugins"       "$_status"
+    printf '%s\t%s\t-\t-\n' "$_user_home/.claude/session-env"   "$_status"
+  }
+
+  [[ -n "$agent" && -n "$os_user" && -n "$user_home" ]] || {
+    bridge_warn "normalize_isolated_home_contract: agent/os_user/user_home all required (got agent='$agent' os_user='$os_user' user_home='$user_home')"
+    # If user_home is empty here we cannot emit per-path probe lines;
+    # the caller will fall through to the "no helper line" case which
+    # already treats helper_rc=1 + empty output as a probe failure.
+    _bridge_linux_home_contract_emit_probe_failure "error" "$user_home"
+    unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
+    return 1
+  }
+
+  # Resolve the agent group up front so a malformed agent name surfaces
+  # the same `bridge_die` shape as the prepare path's existing
+  # `bridge_isolation_v2_agent_group_name` call.
+  local agent_group=""
+  agent_group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+  [[ -n "$agent_group" ]] || {
+    bridge_warn "normalize_isolated_home_contract: cannot resolve agent group for '$agent'"
+    _bridge_linux_home_contract_emit_probe_failure "error" "$user_home"
+    unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
+    return 1
+  }
+
+  # Path-anchor guard: refuse to operate on anything outside the
+  # canonical isolated-home root. The variable is set in bridge-lib.sh /
+  # bridge-core.sh; if unset we conservatively decline (a misconfigured
+  # caller should not be able to chmod arbitrary paths via this helper).
+  if [[ -z "${BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT:-}" ]]; then
+    bridge_warn "normalize_isolated_home_contract: BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT unset; declining (cannot validate user_home anchor)"
+    _bridge_linux_home_contract_emit_probe_failure "error" "$user_home"
+    unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
+    return 1
+  fi
+  case "$user_home" in
+    "$BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT"/*) : ;;
+    *)
+      bridge_warn "normalize_isolated_home_contract: user_home '$user_home' not under '$BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT' — refusing"
+      _bridge_linux_home_contract_emit_probe_failure "error" "$user_home"
+      unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
+      return 1
+      ;;
+  esac
+
+  # Stopped-session guard (skip on initial create/start path and the
+  # smoke opt-out). Mirrors the prepare-side check at lib/bridge-agents.sh.
+  if [[ "${BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING:-0}" != "1" ]]; then
+    local _quiesce_session=""
+    if command -v bridge_agent_session >/dev/null 2>&1; then
+      _quiesce_session="$(bridge_agent_session "$agent" 2>/dev/null || printf '')"
+    fi
+    if [[ -n "$_quiesce_session" ]] \
+        && command -v tmux >/dev/null 2>&1 \
+        && command -v bridge_tmux_session_exists >/dev/null 2>&1 \
+        && bridge_tmux_session_exists "$_quiesce_session"; then
+      # The prepare-side path bridge_die's here, but this helper is also
+      # called from the restart reverter mid-rerender. Bail soft so the
+      # caller's audit log surfaces the skip rather than killing the
+      # process. The matrix reconciler row will surface this as a
+      # `denied` row (probe failure, NOT drift) so the operator can tell
+      # "agent was running during reconcile" from "actual file mode drift".
+      # #1298 Gap A — root cause of the beta3→beta4 upgrade-reconcile 4-row
+      # [failed] symptom: upgrade reconcile runs while agents are live and
+      # this guard returned silently.
+      bridge_warn "normalize_isolated_home_contract: tmux session '$_quiesce_session' is alive — refusing (set BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING=1 for smoke fixtures, or stop the agent first)"
+      _bridge_linux_home_contract_emit_probe_failure "denied" "$user_home"
+      unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  # Resolve sticky-vs-no-sticky mode for the .claude subdirs. Default
+  # is 3770 (sticky + setgid) per codex design. Operator can override
+  # with BRIDGE_ISO_HOME_CONTRACT_MODE=2770 if a future kernel/FS combo
+  # rejects sticky on group-writable dirs. The HOME root stays 2750
+  # regardless (no group write, no sticky needed).
+  local claude_mode="${BRIDGE_ISO_HOME_CONTRACT_MODE:-3770}"
+  case "$claude_mode" in
+    3770|2770) : ;;
+    *)
+      bridge_warn "normalize_isolated_home_contract: BRIDGE_ISO_HOME_CONTRACT_MODE='$claude_mode' not in {3770,2770}; using 3770"
+      claude_mode="3770"
+      ;;
+  esac
+  local home_mode="2750"
+
+  # Targets, in mkdir order (parent before child).
+  local target_home="$user_home"
+  local target_claude="$user_home/.claude"
+  local target_plugins="$user_home/.claude/plugins"
+  local target_session_env="$user_home/.claude/session-env"
+
+  # Symlink / non-dir rejection. Iterate ALL targets first, refuse
+  # before any mutation if any one is a symlink. The isolated UID owns
+  # `$user_home` (mode 2770 elsewhere on prepare), so it can drop a
+  # symlink at `.claude` between two prepare runs. Test via
+  # bridge_linux_sudo_root so the controller sees the real fs (the
+  # isolated UID's view may differ if a hostile rebind is in progress).
+  local target overall_rc=0
+  local -a _bad_targets=()
+  for target in "$target_home" "$target_claude" "$target_plugins" "$target_session_env"; do
+    if bridge_linux_sudo_root test -L "$target" 2>/dev/null; then
+      # #1298 Gap A r2 — symlink target is a malformed-state probe failure
+      # (anti-race / anti-redirect refusal), NOT filesystem drift the
+      # operator can repair by re-running apply. Emit `error` so the
+      # reconciler's denied|error arm classifies as degraded/rc=0.
+      # Operator remediation: stop the agent, inspect the symlink, then
+      # remove it before retrying — not a re-apply.
+      printf '%s\terror\t-\t-\n' "$target"
+      bridge_warn "normalize_isolated_home_contract: refusing — '$target' is a symlink (anti-race / anti-redirect)"
+      overall_rc=1
+      _bad_targets+=("$target")
+      continue
+    fi
+    # `-e && ! -d` = exists but is not a directory (regular file, fifo,
+    # etc.). Refuse before mutation so we don't chmod a regular file
+    # and leave it in a confusing state.
+    if bridge_linux_sudo_root test -e "$target" 2>/dev/null \
+        && ! bridge_linux_sudo_root test -d "$target" 2>/dev/null \
+        && ! bridge_linux_sudo_root test -L "$target" 2>/dev/null; then
+      # #1298 Gap A r2 — non-directory target is also a malformed-state
+      # probe failure; emit `error` (same classification as symlink) so
+      # the reconciler degrades rather than reports drift.
+      printf '%s\terror\t-\t-\n' "$target"
+      bridge_warn "normalize_isolated_home_contract: refusing — '$target' exists but is not a directory"
+      overall_rc=1
+      _bad_targets+=("$target")
+    fi
+  done
+  if (( overall_rc != 0 )); then
+    # Emit status lines for the targets we did NOT inspect so the caller
+    # can distinguish "no helper line for this row" (helper bug) from
+    # "row was skipped because a sibling was malformed" (probe denied,
+    # operator action ≠ mutate that row's fs state). #1298 Gap A.
+    local _t _is_bad
+    for target in "$target_home" "$target_claude" "$target_plugins" "$target_session_env"; do
+      _is_bad=0
+      for _t in "${_bad_targets[@]+"${_bad_targets[@]}"}"; do
+        if [[ "$_t" == "$target" ]]; then
+          _is_bad=1
+          break
+        fi
+      done
+      if (( _is_bad == 0 )); then
+        printf '%s\tdenied\t-\t-\n' "$target"
+      fi
+    done
+    unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
+    return 1
+  fi
+
+  # Per-target normalize. mkdir first (idempotent), then chown, then chmod.
+  # Each step uses bridge_linux_sudo_root so the controller can mutate
+  # root-owned `.claude` even though the parent `$user_home` is owned by
+  # the isolated UID.
+  _bridge_normalize_one() {
+    # $1 = path, $2 = owner, $3 = group, $4 = mode
+    local path="$1" want_owner="$2" want_group="$3" want_mode="$4"
+
+    if ! bridge_linux_sudo_root mkdir -p "$path" 2>/dev/null; then
+      printf '%s\tfailed\t-\t-\n' "$path"
+      return 1
+    fi
+
+    local actual_owner_group actual_mode
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+      actual_owner_group="$(bridge_linux_sudo_root stat -f '%Su:%Sg' "$path" 2>/dev/null || printf '')"
+      actual_mode="$(bridge_linux_sudo_root stat -f '%Lp' "$path" 2>/dev/null || printf '')"
+    else
+      actual_owner_group="$(bridge_linux_sudo_root stat -c '%U:%G' "$path" 2>/dev/null || printf '')"
+      actual_mode="$(bridge_linux_sudo_root stat -c '%a' "$path" 2>/dev/null || printf '')"
+    fi
+    local want_owner_group="$want_owner:$want_group"
+    # Normalize mode (printf %o handles trimming leading zeros for ==).
+    local want_mode_norm actual_mode_norm
+    want_mode_norm="$(printf '%o' "$((8#${want_mode#0}))" 2>/dev/null || printf '%s' "$want_mode")"
+    actual_mode_norm="$(printf '%o' "$((8#${actual_mode:-0}))" 2>/dev/null || printf '%s' "$actual_mode")"
+
+    if [[ "$actual_owner_group" == "$want_owner_group" \
+          && "$actual_mode_norm" == "$want_mode_norm" ]]; then
+      printf '%s\tok\t%s\t%s\n' "$path" "$want_owner_group" "$want_mode_norm"
+      return 0
+    fi
+
+    local rc=0
+    if [[ "$actual_owner_group" != "$want_owner_group" ]]; then
+      if ! bridge_linux_sudo_root chown "$want_owner_group" "$path" 2>/dev/null; then
+        rc=1
+      fi
+    fi
+    if (( rc == 0 )) && [[ "$actual_mode_norm" != "$want_mode_norm" ]]; then
+      if ! bridge_linux_sudo_root chmod "$want_mode" "$path" 2>/dev/null; then
+        rc=1
+      fi
+    fi
+    if (( rc == 0 )); then
+      printf '%s\tchanged\t%s\t%s\n' "$path" "$want_owner_group" "$want_mode_norm"
+      return 0
+    fi
+    printf '%s\tfailed\t%s\t%s\n' "$path" "$want_owner_group" "$want_mode_norm"
+    return 1
+  }
+
+  _bridge_normalize_one "$target_home"        "$os_user" "$agent_group" "$home_mode"   || overall_rc=1
+  _bridge_normalize_one "$target_claude"      "root"     "$agent_group" "$claude_mode" || overall_rc=1
+  _bridge_normalize_one "$target_plugins"     "root"     "$agent_group" "$claude_mode" || overall_rc=1
+  _bridge_normalize_one "$target_session_env" "root"     "$agent_group" "$claude_mode" || overall_rc=1
+
+  unset -f _bridge_normalize_one 2>/dev/null || true
+  unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
+  return "$overall_rc"
+}
+
 bridge_linux_prepare_agent_isolation() {
   local agent="$1"
   local os_user="$2"
@@ -3798,6 +4307,29 @@ bridge_linux_prepare_agent_isolation() {
   bridge_isolation_v2_ensure_user_in_group "$controller_user" "$_v2_agent_group" \
     || bridge_die "isolation v2: cannot add controller '$controller_user' to '$_v2_agent_group'"
 
+  # Diagnostic warning for KNOWN_ISSUES §28 / #1207: a long-running shell
+  # or daemon does NOT pick up new supplementary groups until it restarts.
+  # The controller's `id -G` reflects login-time membership; an `agent create`
+  # that adds the controller to a fresh `ab-agent-<X>` group leaves any
+  # already-running process unable to traverse `data/agents/<X>/` until
+  # restart. Read/probe ops are protected by the #1207 literal-fallback in
+  # `bridge_iso_run_path_under_allowlist`, but write/publish ops still
+  # rely on canonicalization and benefit from the operator refreshing
+  # their shell. This is hint-only; first-touch correctness does NOT
+  # depend on the operator following the hint.
+  if [[ "$(uname -s 2>/dev/null)" == "Linux" ]]; then
+    local _current_supp_groups=""
+    _current_supp_groups="$(id -nG 2>/dev/null | tr ' ' '\n' || true)"
+    if ! printf '%s\n' "$_current_supp_groups" | grep -Fxq -- "$_v2_agent_group"; then
+      bridge_warn "isolation v2: this shell's supplementary group cache does not include the freshly created '$_v2_agent_group' (KNOWN_ISSUES §28)."
+      bridge_warn "             Read/probe paths (channel-required validator, .teams/.env, etc.) recover automatically via the iso-side fallback," # noqa: iso-helper-boundary
+      bridge_warn "             but controller-side writes under data/agents/$agent/ may need a refreshed shell. To refresh now, run:"
+      bridge_warn "               exec sg $_v2_agent_group -- \$SHELL"
+      bridge_warn "             OR wrap subsequent commands as: sg $_v2_agent_group -c \"...\"."
+      bridge_warn "             OR open a new terminal — supplementary groups refresh at login."
+    fi
+  fi
+
   # Shared-group membership. PR-C migration adds existing agents to
   # ab-shared, but a new/reapplied agent through prepare must also join so
   # bridge_linux_share_plugin_catalog can read the shared plugin cache.
@@ -3869,50 +4401,64 @@ bridge_linux_prepare_agent_isolation() {
   bridge_linux_sudo_root mkdir -p "$memory_daily_agent_dir" "$memory_daily_shared_aggregate_dir"
 
   bridge_linux_sudo_root chown -R "$os_user" "$workdir"
+  # Issue #1238: the scaffold (`bridge_scaffold_agent_home`) runs as the
+  # controller and writes `SOUL.md` / `CLAUDE.md` / `MEMORY*.md` /
+  # `SESSION-TYPE.md` / `TOOLS.md` / `.claude/` / `memory/` / `raw/` /
+  # `skills/` / `users/` into `$_v2_agent_root/home/` under controller
+  # `umask 077` (mode 0600 / 0700). The top-level `chown $os_user
+  # $_v2_agent_root/home` in the subdir loop above (4121-4126) only
+  # touches the directory itself, not its contents — so on a fresh
+  # `agent create --isolate`, the iso UID could traverse `home/` (group
+  # 2770) but could not read any of its own identity files (0600
+  # controller-owner). Claude session boot was structurally impossible
+  # because the iso process could not read `SOUL.md` / `CLAUDE.md` /
+  # `.claude/.credentials.json`.
+  #
+  # Hand `home/` recursively to the iso UID (mirrors the `$workdir`
+  # treatment above). Modes 0600 / 0700 stay — iso UID is now the owner,
+  # so they grant the right access. The per-agent root, `credentials/`,
+  # `runtime/`, `logs/`, `requests/`, and `responses/` are intentionally
+  # NOT included: per the v2 contract documented at 4031-4053,
+  # `credentials/` stays controller-owned and the per-agent root stays
+  # `root:ab-agent-<a> 2750`. Only the read-write content subtrees
+  # (`home/` and `workdir/`) transfer to the iso UID.
+  bridge_linux_sudo_root chown -R "$os_user" "$_v2_agent_root/home"
   bridge_linux_sudo_root chown -R "$os_user" "$runtime_state_dir" "$log_dir"
   bridge_linux_sudo_root chown "$os_user" "$audit_file" "$history_file"
 
-  # memory-daily transcripts read-access (issue #219 v1.3): grant the
-  # controller user r-X on the isolated user's ~/.claude/projects/ so the
-  # (controller-UID) harvester can _scan_transcripts under the target.
-  # We intentionally do NOT grant write — this is a strict read lens.
+  # Isolated-home POSIX contract (HOME + .claude + .claude/plugins +
+  # .claude/session-env). Phase 3 codex design: one shared helper at
+  # three call sites so the prepare path, the restart reverter
+  # (bridge_install_isolated_home_settings — lib/bridge-hooks.sh), and
+  # bridge_auth_prepare_credential_file can never disagree about
+  # owner/group/mode on these four paths.
   #
-  # We pre-create $user_home/.claude (owned by the isolated UID, 0700) so
-  # the default ACL lands before the first Claude session runs. Otherwise a
-  # fresh agent's first `.claude/projects/` directory would be created
-  # without the controller r-X inheritance, and the next harvester run
-  # would fall back to --skipped-permission until the next reapply.
+  # Contract:
+  #   $user_home                      $os_user:ab-agent-<agent> 2750
+  #   $user_home/.claude              root:ab-agent-<agent>     3770 (or 2770 fallback)
+  #   $user_home/.claude/plugins      root:ab-agent-<agent>     3770 (or 2770 fallback)
+  #   $user_home/.claude/session-env  root:ab-agent-<agent>     3770 (or 2770 fallback)
+  #
+  # Sticky (3000) on the group-writable .claude subdirs preserves the
+  # integrity boundary documented in lib/bridge-hooks.sh:506-519: the
+  # isolated UID is in the agent group, so without sticky it could
+  # unlink the root-owned settings.json under .claude. Sticky blocks
+  # unlink-by-non-owner. setgid (2000) keeps new subdir creation
+  # inheriting `ab-agent-<agent>` so the controller harvester's
+  # group-r-X read path keeps working on every new file under
+  # ~/.claude/projects/, ~/.claude/session-env/, etc., without
+  # re-running prepare.
+  #
+  # On a non-Linux host this helper is a no-op success. On Linux it
+  # bridge_warn + return 1 if any sub-path was rejected for being a
+  # symlink / non-dir; we bridge_die on that here so the prepare flow
+  # fails fast like the previous inline block did.
+  bridge_linux_normalize_isolated_home_contract "$agent" "$os_user" "$user_home" \
+      >/dev/null \
+    || bridge_die "isolation v2: cannot normalize isolated-home contract for '$agent' (~/$user_home; see bridge_warn above for the rejected sub-path)"
+  # Keep `isolated_claude_dir` available for callers below that still
+  # reference it (memory-daily ACL grant, channel state seeding, etc.).
   local isolated_claude_dir="$user_home/.claude"
-  bridge_linux_sudo_root mkdir -p "$isolated_claude_dir"
-  bridge_linux_sudo_root chown "$os_user" "$isolated_claude_dir" >/dev/null 2>&1 || true
-  # v2: chgrp ab-agent-<name> + chmod 2770 (setgid so new subdirs like
-  # projects/ and session-env/ inherit the group) so the controller
-  # (group member of ab-agent-<name>) can reach ~/.claude/projects/ for
-  # the memory-daily harvester without any named-user ACL.
-  #
-  # #1165 Gap 2: mode broadened from 2750 to 2770. The owner bit was
-  # rwx pre-fix (so an owner-UID mkdir should have worked), but the
-  # observed SessionStart hook failure shape is `mkdir: cannot create
-  # directory '/home/agent-bridge-<a>/.claude/session-env': Permission
-  # denied` — i.e. the hook process's effective UID is not the dir
-  # owner in practice (suspected tmux/sudo wrapper stripping owner
-  # identity on the SessionStart spawn path). Widening to 2770 makes
-  # the group bit writable, which unblocks the hook via the
-  # supplementary-group path. Security model: the only group members
-  # are the controller user + the isolated UID itself (PR-C agent-
-  # group composition); no third party gains write. setgid (2xxx) is
-  # preserved so new subdirs inside ~/.claude (projects/, session-env/,
-  # statsig/, etc.) inherit the agent group rather than the writer's
-  # primary group, keeping the controller harvester's group-r-x path
-  # working on every new file.
-  local _claude_v2_grp=""
-  _claude_v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
-  [[ -n "$_claude_v2_grp" ]] \
-    || bridge_die "isolation v2: cannot resolve agent group for ~/.claude of '$agent'"
-  bridge_linux_sudo_root chgrp "$_claude_v2_grp" "$isolated_claude_dir" \
-    || bridge_die "isolation v2: chgrp $_claude_v2_grp on '$isolated_claude_dir' failed"
-  bridge_linux_sudo_root chmod 2770 "$isolated_claude_dir" \
-    || bridge_die "isolation v2: chmod 2770 on '$isolated_claude_dir' failed"
   # Channel-ownership-aware plugin sharing. Without this the isolated UID's
   # ~/.claude/plugins/ is empty and Claude starts with no MCP servers loaded
   # (Teams/ms365/cosmax-* all silently missing). The helper writes a per-UID
@@ -3990,6 +4536,39 @@ bridge_linux_prepare_agent_isolation() {
       bridge_warn "bridge_linux_prepare_agent_isolation: grant-matrix apply FAIL agent=$agent"
       return 1
     fi
+  fi
+
+  # Phase 2 (post-v0.14.5-beta16): apply the install-tree reconciler
+  # for this newly-created isolated agent. This fires the per-agent
+  # rows (state-agent-leaf scaffold, credential-grant for the
+  # controller credential file) AND re-asserts the install-scope rows
+  # so a freshly created agent finds the tree canonical on first
+  # launch. Non-fatal — the per-agent grant matrix above already
+  # verified the per-agent leaf, and the install-scope rows may
+  # legitimately drift on macOS dev hosts that this prepare path is
+  # exercised on. Operator escape: `agent-bridge isolation reconcile
+  # --apply --agent <name>` reruns the same logic standalone.
+  if command -v bridge_isolation_v2_apply_install_tree_matrix >/dev/null 2>&1; then
+    if ! bridge_isolation_v2_apply_install_tree_matrix \
+          --mode apply --agent "$agent" --reason agent-create \
+          >/dev/null 2>&1; then
+      bridge_warn "bridge_linux_prepare_agent_isolation: install-tree reconciler reported drift for agent=$agent (non-fatal; run: agent-bridge isolation reconcile --apply --agent $agent)"
+    fi
+  fi
+
+  # Lane A (v0.15.0-beta4): write the sanitized per-agent metadata
+  # snippet (`state/agents/<a>/agent-meta.env`, 0640 controller:
+  # ab-agent-<a>) so the iso UID context can resolve its own
+  # `BRIDGE_AGENT_OS_USER` / `BRIDGE_AGENT_ISOLATION_MODE` / etc.
+  # without read access to the protected `agent-roster.local.sh`.
+  # Closes the precondition gap for #1272 (Path A0) and the
+  # ISOLATION_MODE bash-side surface from #1213. Non-fatal — the lane
+  # also adds a `getent`-based fallback in `bridge_agent_claude_home_dir`,
+  # so a write failure here degrades to the existing roster-array path
+  # rather than wedging.
+  if command -v bridge_isolation_v2_write_agent_metadata >/dev/null 2>&1; then
+    bridge_isolation_v2_write_agent_metadata "$agent" \
+      || bridge_warn "bridge_linux_prepare_agent_isolation: agent-meta.env write failed for agent=$agent (non-fatal; iso UID will fall back to getent-based config_dir resolution)"
   fi
 }
 bridge_linux_install_isolated_channel_symlink() {
@@ -4178,8 +4757,66 @@ bridge_agent_claude_home_dir() {
   bridge_agent_default_home "$agent"
 }
 
+# Lane A (v0.15.0-beta4): iso-v2 agents' Claude config dir must
+# resolve to the iso UID's actual Linux home (`/home/agent-bridge-<a>/
+# .claude`), not the controller view path
+# (`$BRIDGE_AGENT_HOME_ROOT/<a>/.claude` /
+# `$BRIDGE_AGENT_ROOT_V2/<a>/home/.claude`). The controller view does
+# not exist on disk for iso v2 — Claude writes session JSONL into the
+# iso UID's HOME — so the `[[ -d $config_dir ]]` gate in
+# `bridge_resolve_agent_claude_config_dir` rejected the controller-view
+# path and detect_claude_session_id fell back to the daemon's HOME,
+# never finding the agent's sessions. Closes #1277.
+#
+# Two-stage resolution:
+#   1) If `bridge_agent_os_user` returns non-empty, use the existing
+#      `bridge_agent_claude_home_dir` -> `bridge_agent_linux_user_home`
+#      path (controller context with populated roster array).
+#   2) If `bridge_agent_os_user` is empty (iso UID context where the
+#      assoc array hasn't been populated yet AND the agent-meta.env
+#      snippet hasn't fired) but iso v2 is structurally active for the
+#      agent (mode requested or `linux_user_isolation` recorded), fall
+#      back to a `getent passwd <os_user_prefix><agent>` lookup. The
+#      iso UID prefix is conventionally `agent-bridge-` and can be
+#      overridden by `BRIDGE_AGENT_OS_USER_PREFIX` (existing project
+#      convention; `BRIDGE_OS_USER_PREFIX` was a typo introduced at r2).
+#   3) Otherwise, non-iso path — daemon HOME (caller's view).
 bridge_agent_claude_config_dir() {
   local agent="$1"
+  local home_dir=""
+  local os_user=""
+  local pwent_home=""
+
+  # Fast-path: roster array populated.
+  if ! bridge_isolation_disabled_by_env 2>/dev/null \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    if [[ -n "$os_user" ]]; then
+      home_dir="$(bridge_agent_linux_user_home "$os_user")"
+      printf '%s/.claude' "$home_dir"
+      return 0
+    fi
+    # Roster array empty (iso UID context, agent-meta.env didn't fire
+    # for any reason). Fall back to a passwd-database lookup so the
+    # caller (`bridge_resolve_agent_claude_config_dir`) gets a real
+    # directory that exists on disk.
+    if command -v getent >/dev/null 2>&1; then
+      # Align with existing project convention used at
+      # lib/bridge-isolation-v2.sh:1437,2323,2420 — the prefix value
+      # itself carries the trailing dash (default `agent-bridge-`).
+      local prefix="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}"
+      local probe_user="${prefix}${agent}"
+      pwent_home="$(getent passwd "$probe_user" 2>/dev/null | cut -d: -f6)"
+      if [[ -n "$pwent_home" ]]; then
+        printf '%s/.claude' "$pwent_home"
+        return 0
+      fi
+    fi
+  fi
+
+  # Non-iso path or all iso-resolution attempts failed: print the
+  # legacy controller-view path. Callers gate on `[[ -d ]]`, so a
+  # non-existent path falls through to the daemon-HOME default.
   printf '%s/.claude' "$(bridge_agent_claude_home_dir "$agent")"
 }
 
@@ -4663,6 +5300,14 @@ bridge_append_csv_unique() {
   local csv="${1-}"
   local value="${2-}"
   local item=""
+  # Issue #1196 test-harness bug surfaced 2026-05-25: under `set -u` (e.g.
+  # scripts/test-channel-probe-isolated.sh extracts this fn and sources it
+  # with strict mode), `items` was used before being declared, tripping
+  # `items[@]: unbound variable`. The fix is defensive: declare it locally
+  # so the array is always defined even when csv is empty / produces no
+  # tokens. No behavior change for production callers (bridge-lib.sh
+  # sources without `set -u`).
+  local -a items=()
 
   value="$(bridge_trim_whitespace "$value")"
   [[ -n "$value" ]] || {
@@ -4707,9 +5352,43 @@ bridge_merge_channels_csv() {
   printf '%s' "$merged"
 }
 
+# Canonical marketplace suffix for an un-suffixed built-in plugin name.
+# Returns the marketplace slug (e.g. `agent-bridge`, `claude-plugins-official`)
+# without the leading `@`, or empty string when the name has no canonical home.
+#
+# Issue #1221: `agent create --channels "plugin:teams,plugin:ms365"` regressed
+# in v0.14.5-beta27 because `bridge_qualify_channel_item` only auto-suffixed
+# `teams|discord|telegram`. `ms365` and `mattermost` (also shipped from the
+# agent-bridge marketplace, see `.claude-plugin/marketplace.json`) stayed
+# un-suffixed and downstream `setup ms365` / `agent start` failed the
+# bridge-owned-plugin-manifest gate. Centralising the lookup here means every
+# caller of `bridge_qualify_channel_item` (the central normalizer, explicit
+# roster channels, dev-channel filtering, launch diagnostics) gets the same
+# canonical resolution for the full built-in set without a per-callsite case.
+#
+# Explicit suffixes (e.g. `plugin:teams@cosmax-marketplace`) are never
+# rewritten — `bridge_qualify_channel_item` only consults this table for names
+# that arrive without `@<marketplace>`.
+bridge_builtin_plugin_marketplace() {
+  local plugin_name="${1-}"
+
+  case "$plugin_name" in
+    discord|telegram)
+      printf '%s' "claude-plugins-official"
+      ;;
+    teams|ms365|mattermost)
+      printf '%s' "agent-bridge"
+      ;;
+    *)
+      printf '%s' ""
+      ;;
+  esac
+}
+
 bridge_qualify_channel_item() {
   local item="${1-}"
   local plugin_name=""
+  local marketplace=""
 
   item="$(bridge_trim_whitespace "$item")"
   [[ -n "$item" ]] || {
@@ -4717,25 +5396,13 @@ bridge_qualify_channel_item() {
     return 0
   }
 
-  case "$item" in
-    plugin:discord@claude-plugins-official|plugin:telegram@claude-plugins-official)
-      printf '%s' "$item"
-      return 0
-      ;;
-  esac
-
   if [[ "$item" == plugin:* && "$item" != *@* ]]; then
     plugin_name="${item#plugin:}"
-    case "$plugin_name" in
-      telegram|discord)
-        printf 'plugin:%s@claude-plugins-official' "$plugin_name"
-        return 0
-        ;;
-      teams)
-        printf 'plugin:%s@agent-bridge' "$plugin_name"
-        return 0
-        ;;
-    esac
+    marketplace="$(bridge_builtin_plugin_marketplace "$plugin_name")"
+    if [[ -n "$marketplace" ]]; then
+      printf 'plugin:%s@%s' "$plugin_name" "$marketplace"
+      return 0
+    fi
   fi
 
   printf '%s' "$item"
@@ -5297,16 +5964,23 @@ bridge_channel_env_file_readiness() {
   local file="$3"
   shift 3 || true
   local rc=0
-  local sudo_rc=0
   local probe_rc=0
 
-  if [[ ! -e "$file" ]]; then
-    printf 'missing'
-    return 0
-  fi
+  # Issue #1214: do NOT short-circuit on `[[ ! -e "$file" ]]`. Under iso
+  # v2 the channel state dir is owned by the isolated UID with mode
+  # 02770 / `ab-agent-<slug>` group, and a long-running controller shell
+  # that started BEFORE the agent's supplementary group was applied
+  # cannot satisfy `-e` even when the file is present. The pre-#1214
+  # body returned 'missing' for that case which then bubbled up as the
+  # operator-visible
+  # `missing MS365 client id under .../workdir/.ms365 (.env with
+  # MS365_CLIENT_ID required)` error during `agent start`, defeating
+  # the beta25 #1207 read-fallback. Route the isolated probe directly
+  # so a controller-blind file still resolves via the iso UID.
 
   # First read attempt as the controller; suppress stderr so EACCES does
-  # not leak to the daemon log. rc captured separately.
+  # not leak to the daemon log. The internal helper returns 0 on
+  # found-non-empty, 1 on missing-key, and 2 on file/permission error.
   rc=0
   bridge_env_file_has_any_nonempty_key "$file" "$@" >/dev/null 2>&1 || rc=$?
   if [[ $rc -eq 0 ]]; then
@@ -5320,85 +5994,85 @@ bridge_channel_env_file_readiness() {
     return 0
   fi
 
-  # Issue #832: controller cannot read the file. Before declaring unreadable,
-  # see if we can probe via the agent's isolated UID (linux-user mode only).
-  # The agent's own UID can read its own dotenv when ACL drift left the
-  # controller unable to, and operators have correctly configured tokens.
-  # Without this branch the daemon would emit a false channel_health_miss
-  # for a healthy isolated agent.
-  if declare -F bridge_isolation_can_sudo_to_agent >/dev/null 2>&1; then
-    sudo_rc=0
-    bridge_isolation_can_sudo_to_agent "$agent" 2>/dev/null || sudo_rc=$?
-    case "$sudo_rc" in
+  # Issue #1214: the controller could not read the file. Route directly
+  # through `bridge_iso_run --op env-has-any-key` whenever the agent is
+  # effectively under linux-user isolation. The outer
+  # `bridge_isolation_can_sudo_to_agent` pre-gate (pre-#1214) added a
+  # second sudo probe that itself could fail under stale supp-groups on
+  # the controller shell, causing the iso-side fallback to never run
+  # even when `bridge_iso_run`'s internal read/probe-only allowlist
+  # fallback (added in #1207) would have succeeded. Removing the outer
+  # gate makes the validator follow the same single-helper contract
+  # that direct callers use.
+  #
+  # bridge_iso_run rc band (see lib/bridge-isolation-helpers.sh:258+):
+  #   0  — env-has-any-key found a non-empty key → 'present'
+  #   30 — file absent under the isolated UID's view → 'missing'
+  #   31 — file present but key empty/missing → 'missing'
+  #   32 — file unreadable even to the isolated UID → 'unreadable'
+  #   20 — passwordless sudo to the agent UID unavailable →
+  #        'controller-blind' (cannot prove readiness either way)
+  #   40 — unsafe path (root-canonicalize escape) →
+  #        'controller-blind' for safety; never collapses to 'missing'
+  #   10 — agent not in linux-user isolation → fall through to the
+  #        legacy unreadable path
+  #   other — defensive 'controller-blind' (preserves the beta22 codex
+  #        r1 behavior of preferring fail-open + diagnostic over false
+  #        miss).
+  if declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    local _iso_run_argv=(--agent "$agent" --op env-has-any-key --path "$file")
+    local _k=""
+    for _k in "$@"; do
+      _iso_run_argv+=(--key "$_k")
+    done
+    probe_rc=0
+    bridge_iso_run "${_iso_run_argv[@]}" >/dev/null 2>&1 || probe_rc=$?
+    case "$probe_rc" in
       0)
-        # Agent isolated AND we can sudo to its UID — probe via that UID.
-        # Self-contained inline script: tests readability and key presence
-        # without sourcing bridge-lib.sh inside the isolated UID.
-        # Exit codes from the inline script:
-        #   0 — readable and at least one nonempty matching KEY=value line
-        #   1 — readable but no matching nonempty key
-        #   2 — not readable even to the isolated UID
-        local probe_script
-        probe_script='
-file="$1"
-shift
-keys=("$@")
-[[ -r "$file" ]] || exit 2
-if [[ ${#keys[@]} -eq 0 ]]; then
-  grep -Eq "^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=[^[:space:]#]" "$file" && exit 0 || exit 1
-fi
-for k in "${keys[@]}"; do
-  grep -Eq "^[[:space:]]*(export[[:space:]]+)?${k}=[^[:space:]#].*" "$file" && exit 0
-done
-exit 1
-'
-        probe_rc=0
-        bridge_isolation_run_as_agent_user_via_bash "$agent" "$probe_script" "$file" "$@" >/dev/null 2>&1 || probe_rc=$?
-        # The helper preserves script's exit code shifted into the 3+ band
-        # when nonzero (rc=0 stays 0; script-rc 1 -> 3; script-rc 2 -> 4).
-        # See lib/bridge-isolation-helpers.sh docstring.
-        case "$probe_rc" in
-          0)
-            : "${item}"
-            printf 'present'
-            return 0
-            ;;
-          3)
-            : "${item}"
-            printf 'missing'
-            return 0
-            ;;
-          4)
-            : "${item}"
-            printf 'unreadable'
-            return 0
-            ;;
-          *)
-            # Probe itself failed unexpectedly (e.g. sudoers raced) —
-            # fall through to the standard unreadable path.
-            ;;
-        esac
+        : "${item}"
+        printf 'present'
+        return 0
         ;;
-      2)
-        # Agent IS isolated but passwordless sudo is unavailable. Controller
-        # cannot determine readiness either way — degrade to controller-blind
-        # rather than firing a false miss. Caller maps this to status=unknown.
+      30|31)
+        : "${item}"
+        printf 'missing'
+        return 0
+        ;;
+      32)
+        : "${item}"
+        printf 'unreadable'
+        return 0
+        ;;
+      20|40)
+        # 20: sudo to the agent's UID unavailable (controller cannot
+        # prove readiness either way). 40: unsafe path — never collapse
+        # to 'missing' because that would lie about a file the
+        # controller is structurally unable to inspect. Both degrade to
+        # controller-blind so the caller maps to status=unknown
+        # (fail-open) rather than firing a false channel_health_miss.
         : "${item}"
         printf 'controller-blind'
         return 0
         ;;
+      10)
+        # Agent not in linux-user isolation — fall through to the
+        # legacy unreadable path.
+        ;;
       *)
-        # rc=1 — agent not in linux-user isolation. Fall through to the
-        # standard unreadable path (true ACL drift on a controller-managed
-        # file).
+        # Undefined rc — preserve the beta22 codex r1 behaviour:
+        # prefer controller-blind + diagnostic over false miss.
+        : "${item}"
+        printf 'controller-blind'
+        return 0
         ;;
     esac
   fi
 
-  # v3: the sudo-as-agent probe handled the isolated case above.
   # Reaching here means the file is genuinely unreadable to both the
-  # controller and the isolated UID probe, indicating ownership/mode or
-  # sudo drift — not something fixable via group/ACL grants.
+  # controller and the isolated UID probe (or the agent is not under
+  # linux-user isolation at all), indicating ownership/mode or sudo
+  # drift — not something fixable via group/ACL grants.
 
   # Suppress unused-warning shellcheck when item is reserved for future
   # per-channel scoped repair; ms365/teams currently share the agent-wide
@@ -5439,12 +6113,34 @@ exit 1
 # log; controllers without sudo simply degrade to the legacy probe
 # result.
 bridge_channel_access_file_present() {
+  # beta23 Option A: optional 2nd arg <agent_for_iso> routes through
+  # bridge_iso_run --op stat --test file when supplied. Callers in
+  # bridge_agent_runtime_channel_status_reason now pass the agent
+  # name so an isolated workdir whose access.json the controller
+  # cannot stat-directly still resolves via the iso UID.
+  #
+  # Without the agent arg the legacy controller-direct + sudo-root
+  # fallback path is taken (back-compat for callers without agent
+  # identity, e.g. operator-supplied controller-managed access files).
   local file="$1"
+  local agent_for_iso="${2:-}"
   [[ -n "$file" ]] || return 1
 
   if [[ -f "$file" ]]; then
     return 0
   fi
+
+  if [[ -n "$agent_for_iso" ]] && declare -F bridge_iso_run >/dev/null 2>&1; then
+    local iso_rc=0
+    bridge_iso_run --agent "$agent_for_iso" --op stat --path "$file" --test file \
+      >/dev/null 2>&1 || iso_rc=$?
+    case "$iso_rc" in
+      0)  return 0 ;;
+      10) ;;  # not isolated, fall through to legacy sudo-root
+      *)  ;;  # 20/30/40 — fall through to legacy
+    esac
+  fi
+
   if command -v bridge_linux_sudo_root >/dev/null 2>&1 \
       && bridge_linux_sudo_root test -f "$file" 2>/dev/null; then
     return 0
@@ -5514,20 +6210,29 @@ bridge_agent_channel_runtime_ready_for_item() {
   # rebind. discord/telegram are outbound bot connections — no LISTEN
   # socket — and ms365 shares the teams HTTP listener for the OAuth
   # callback, so neither gets a separate LISTEN probe here.
+  # Issue #1214: route access.json presence checks through
+  # `bridge_channel_access_file_present "$dir/access.json" "$agent"`
+  # so an isolated workdir the controller cannot directly stat still
+  # resolves via the same iso-aware probe family already used by the
+  # status-reason path at lib/bridge-agents.sh:6946/6978/7006/7101.
+  # Pre-#1214 these used a raw `[[ -f "$dir/access.json" ]]` test that
+  # silently returned 'not ready' on a long-running controller shell
+  # with stale supp-groups, defeating beta25 #1207's read-fallback the
+  # same way `bridge_channel_env_file_readiness` did.
   case "$item" in
     plugin:discord|plugin:discord@*)
       dir="$(bridge_agent_discord_state_dir "$agent")"
-      [[ -f "$dir/access.json" ]] || return 1
+      bridge_channel_access_file_present "$dir/access.json" "$agent" || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN)" == "present" ]]
       ;;
     plugin:telegram|plugin:telegram@*)
       dir="$(bridge_agent_telegram_state_dir "$agent")"
-      [[ -f "$dir/access.json" ]] || return 1
+      bridge_channel_access_file_present "$dir/access.json" "$agent" || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN)" == "present" ]]
       ;;
     plugin:teams|plugin:teams@*)
       dir="$(bridge_agent_teams_state_dir "$agent")"
-      [[ -f "$dir/access.json" ]] || return 1
+      bridge_channel_access_file_present "$dir/access.json" "$agent" || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_ID MicrosoftAppId)" == "present" ]] || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_PASSWORD MicrosoftAppPassword)" == "present" ]] || return 1
       # Issue #779: confirm the webhook listener is actually bound.
@@ -5548,7 +6253,7 @@ bridge_agent_channel_runtime_ready_for_item() {
       ;;
     plugin:mattermost|plugin:mattermost@*)
       dir="$(bridge_agent_mattermost_state_dir "$agent")"
-      [[ -f "$dir/access.json" ]] || return 1
+      bridge_channel_access_file_present "$dir/access.json" "$agent" || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MATTERMOST_BOT_TOKEN MATTERMOST_PERSONAL_TOKEN)" == "present" ]]
       ;;
     *)
@@ -6018,6 +6723,7 @@ bridge_agent_session_health_json() {
   python3 - "$agent" "$session" "$active" "$loop_mode" "$continue_mode" "$onboarding_state" "$attached_exit_behavior" "$restart_readiness" "$broken_launch_file" <<'PY'
 import json
 import sys
+from pathlib import Path
 
 agent, session, active, loop_mode, continue_mode, onboarding_state, attached_exit_behavior, restart_readiness, broken_launch_file = sys.argv[1:]
 payload = {
@@ -6033,6 +6739,25 @@ payload = {
 }
 if broken_launch_file:
     payload["broken_launch_file"] = broken_launch_file
+    # Issue #1317-B (beta5-2 Lane ν): when the marker file exists on
+    # disk AND parses as the v0.14.5-beta5-2+ schema, surface the
+    # reason_hint + recovery_cmd inline in the JSON so JSON consumers
+    # (dashboards, tooling) get the same one-glance signal as the
+    # text-mode session_guidance block. Best-effort: missing file /
+    # legacy schema silently drops the keys.
+    try:
+        _bl_path = Path(broken_launch_file)
+        if _bl_path.is_file():
+            _bl_data = json.loads(_bl_path.read_text(encoding="utf-8"))
+            if isinstance(_bl_data, dict):
+                _hint = _bl_data.get("reason_hint")
+                if isinstance(_hint, str) and _hint.strip():
+                    payload["broken_launch_reason"] = _hint.strip()
+                _recovery = _bl_data.get("recovery_cmd")
+                if isinstance(_recovery, str) and _recovery.strip():
+                    payload["broken_launch_recovery_cmd"] = _recovery.strip()
+    except (OSError, ValueError):
+        pass
 if session:
     payload["attach_command"] = f"tmux attach -t ={session}"
 print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
@@ -6085,6 +6810,26 @@ bridge_agent_session_guidance_text() {
   printf -- '- restart_readiness: %s\n' "$restart_readiness"
   if [[ -f "$broken_launch_file" ]]; then
     printf -- '- broken_launch_file: %s\n' "$broken_launch_file"
+    # Issue #1317-B (beta5-2 Lane ν): surface the JSON-encoded
+    # reason_hint inline so the operator sees "WHY did the agent get
+    # quarantined?" in `agent show` output without having to open the
+    # marker file. Standalone helper (file-as-argv) to keep the
+    # heredoc-stdin out of this `$()` and avoid the Bash 5.3.9
+    # read_comsub/heredoc_write deadlock (footgun #11 / KNOWN_ISSUES
+    # §26). Best-effort: missing python / malformed JSON / older
+    # broken-launch payload (pre-#1317) silently drops the line so
+    # this cannot break the guidance block on legacy installs
+    # mid-upgrade.
+    local _bl_reason_hint=""
+    if command -v python3 >/dev/null 2>&1 \
+        && [[ -f "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/broken-launch-reason-hint.py" ]]; then
+      _bl_reason_hint="$(python3 \
+        "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/broken-launch-reason-hint.py" \
+        "$broken_launch_file" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_bl_reason_hint" ]]; then
+      printf -- '- broken_launch_reason: %s\n' "$_bl_reason_hint"
+    fi
     printf -- '- recovery: agent-bridge agent safe-mode %s\n' "$agent"
   fi
   if [[ -n "$session" ]]; then
@@ -6600,7 +7345,7 @@ bridge_agent_runtime_channel_status_reason() {
     # Issue #1165 Gap 5: sudo-escalate the access.json presence probe so
     # the controller doesn't false-negative on an isolated workdir it
     # cannot stat directly. See bridge_channel_access_file_present.
-    if ! bridge_channel_access_file_present "$discord_dir/access.json"; then
+    if ! bridge_channel_access_file_present "$discord_dir/access.json" "$agent"; then
       printf 'missing Discord access file under %s (access.json required)' "$discord_dir"
       return 0
     fi
@@ -6614,7 +7359,12 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:discord:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      # beta23 Option A: removed stale `migrate isolation v3 --check`
+      # guidance. The recovery is now: provision passwordless sudoers
+      # for the controller -> agent-bridge-<slug> linux-user (see
+      # bridge_migration_sudoers_entry). The unified bridge_iso_run
+      # facade is the single boundary the operator needs to enable.
+      printf 'controller-blind:plugin:discord:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$discord_dir" "$(bridge_channel_env_file_acl_diagnostic "$discord_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6627,7 +7377,7 @@ bridge_agent_runtime_channel_status_reason() {
   if bridge_channel_csv_contains "$required" "plugin:telegram"; then
     telegram_dir="$(bridge_agent_telegram_state_dir "$agent")"
     # Issue #1165 Gap 5: sudo-escalate the access.json presence probe.
-    if ! bridge_channel_access_file_present "$telegram_dir/access.json"; then
+    if ! bridge_channel_access_file_present "$telegram_dir/access.json" "$agent"; then
       printf 'missing Telegram access file under %s (access.json required)' "$telegram_dir"
       return 0
     fi
@@ -6638,7 +7388,8 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:telegram:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      # beta23 Option A: same guidance update as discord branch above.
+      printf 'controller-blind:plugin:telegram:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$telegram_dir" "$(bridge_channel_env_file_acl_diagnostic "$telegram_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6654,7 +7405,7 @@ bridge_agent_runtime_channel_status_reason() {
     # This is the canonical reproducer site from the issue body — the
     # other three plugin branches (discord/telegram/mattermost) share
     # the same shape so the fix is applied uniformly.
-    if ! bridge_channel_access_file_present "$teams_dir/access.json"; then
+    if ! bridge_channel_access_file_present "$teams_dir/access.json" "$agent"; then
       printf 'missing Teams access file under %s (access.json required)' "$teams_dir"
       return 0
     fi
@@ -6665,7 +7416,8 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      # beta23 Option A: removed stale v3 migration guidance.
+      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$teams_dir" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6680,7 +7432,8 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      # beta23 Option A: removed stale v3 migration guidance.
+      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$teams_dir" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6703,7 +7456,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6718,7 +7471,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6733,7 +7486,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6747,7 +7500,7 @@ bridge_agent_runtime_channel_status_reason() {
     local mattermost_dir=""
     mattermost_dir="$(bridge_agent_mattermost_state_dir "$agent")"
     # Issue #1165 Gap 5: sudo-escalate the access.json presence probe.
-    if ! bridge_channel_access_file_present "$mattermost_dir/access.json"; then
+    if ! bridge_channel_access_file_present "$mattermost_dir/access.json" "$agent"; then
       printf 'missing Mattermost access file under %s (access.json required)' "$mattermost_dir"
       return 0
     fi
@@ -6758,7 +7511,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:mattermost:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      printf 'controller-blind:plugin:mattermost:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$mattermost_dir" "$(bridge_channel_env_file_acl_diagnostic "$mattermost_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6864,6 +7617,609 @@ bridge_agent_restart_preflight_guidance() {
   printf "\n%s" "$(bridge_agent_channel_setup_guidance "$agent" "$reason")"
 }
 
+# --------------------------------------------------------------------------
+# Issue #1251 — restart marker + snapshot + auto-rollback (v0.15.0-beta3
+# Track C1). The marker file under `state/agents/<a>/restart.in-progress`
+# is the contract Lane C2 (#1254 watchdog drift suppression) consumes, so
+# the schema below is the SSOT — coordinate any field shape change with
+# the next lane in the track.
+#
+# Marker schema (key=value lines):
+#   pid=<orchestrator-pid>       # process that started the restart; Lane C2
+#                                # uses `kill -0` for liveness gating.
+#   started=<unix-ts>            # seconds since epoch, captured at marker
+#                                # write time (Phase 2 entry).
+#   ttl=<seconds>                # operator-tunable, default 60. Lane C2's
+#                                # drift skip is gated on `now < started+ttl`.
+#   state=in_progress|rolled_back|completed
+#                                # in_progress = mid-Phase-2; rolled_back =
+#                                # restart failed and the auto-rollback path
+#                                # restored the snapshot; completed is set
+#                                # only briefly before marker_clear() removes
+#                                # the file on success (callers should treat
+#                                # missing marker == completed).
+#   reason=<structured>          # populated only on state=rolled_back. Free-
+#                                # form but should start with a stable tag
+#                                # (e.g. `launch-failed:`, `verify-failed:`)
+#                                # so the watchdog can quote it back to the
+#                                # operator without re-deriving the cause.
+# --------------------------------------------------------------------------
+
+# Default marker TTL in seconds. Issue body specifies 60s; the operator
+# can override via the env var below for slow / cold-cache hosts where
+# `claude` first-launch routinely exceeds the default.
+: "${BRIDGE_AGENT_RESTART_MARKER_TTL:=60}"
+
+# State directory for per-agent restart artifacts. Mirrors the v2 layout
+# already established by `state/agents/<a>/` (see
+# lib/bridge-isolation-v2-reconcile.sh's state-agent-leaf scaffold).
+# Returns the path on stdout; caller is responsible for mkdir -p.
+bridge_agent_restart_state_dir() {
+  local agent="$1"
+  local state_root=""
+  state_root="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  printf '%s/agents/%s' "$state_root" "$agent"
+}
+
+bridge_agent_restart_marker_path() {
+  local agent="$1"
+  printf '%s/restart.in-progress' "$(bridge_agent_restart_state_dir "$agent")"
+}
+
+# Snapshot path. We embed the unix timestamp so a second restart attempt
+# while a stale snapshot lingers does not collide with an existing file
+# (the cleanup path on success removes all `restart.snapshot.*` for the
+# agent, not just the timestamp this run created).
+bridge_agent_restart_snapshot_path() {
+  local agent="$1"
+  local ts="${2:-$(date +%s)}"
+  printf '%s/restart.snapshot.%s' "$(bridge_agent_restart_state_dir "$agent")" "$ts"
+}
+
+# Write the marker file at Phase 2 entry. Always overwrites any existing
+# marker — a stale file from a crashed prior restart should not block a
+# clean retry (the TTL check is the operator's signal, not file presence).
+#
+# Args:
+#   $1 — agent id
+#   $2 — pid (defaults to $$)
+#   $3 — ttl seconds (defaults to BRIDGE_AGENT_RESTART_MARKER_TTL)
+#   $4 — state (defaults to in_progress)
+#   $5 — reason (optional; only set on rolled_back state)
+bridge_agent_restart_marker_write() {
+  local agent="$1"
+  local pid="${2:-$$}"
+  local ttl="${3:-$BRIDGE_AGENT_RESTART_MARKER_TTL}"
+  local state="${4:-in_progress}"
+  local reason="${5:-}"
+  local state_dir=""
+  local marker=""
+  local started=""
+
+  state_dir="$(bridge_agent_restart_state_dir "$agent")"
+  marker="$(bridge_agent_restart_marker_path "$agent")"
+  started="$(date +%s)"
+
+  mkdir -p "$state_dir" 2>/dev/null || return 1
+
+  # Atomic write via temp + rename so an interrupted writer does not leave
+  # a half-formed marker that the watchdog might mis-parse. We deliberately
+  # do NOT mktemp under /tmp — the marker must live next to its final
+  # location so the rename is on the same filesystem.
+  #
+  # Note on the trailing `:` (true): the block's exit code is the LAST
+  # command's exit code. When reason="" the `[[ -n "$reason" ]] && ...`
+  # short-circuits to rc=1, which would mis-trigger the `|| { rm; return 1; }`
+  # cleanup even though every printf wrote successfully. Anchoring the
+  # block with `:` keeps the exit code at 0 for the empty-reason case.
+  local tmp="${marker}.tmp.$$"
+  {
+    printf 'pid=%s\n' "$pid"
+    printf 'started=%s\n' "$started"
+    printf 'ttl=%s\n' "$ttl"
+    printf 'state=%s\n' "$state"
+    [[ -n "$reason" ]] && printf 'reason=%s\n' "$reason"
+    :
+  } >"$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$marker" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+
+  # Issue #1251 codex r1 finding 3: marker file mode 0640 + chgrp
+  # ab-agent-<agent> for v2-isolated agents so the iso UID (member of
+  # that group) can read the marker. Default umask-dependent permissions
+  # would leave mode=600 / group=user-default and an iso-side reader
+  # (Lane C2 watchdog probe, operator triage) would get EACCES.
+  #
+  # Controller (owner) writes; watchdog (controller-side) reads via
+  # owner; iso UID reads via group. 0640 (not 0660) — the iso side has
+  # no business writing to the marker.
+  #
+  # Skip for non-isolated agents (shared-mode controllers): umask-default
+  # behavior is correct there and an unconditional chgrp would fail
+  # opaquely on hosts without the ab-agent-<agent> group.
+  if [[ "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    local _marker_grp=""
+    _marker_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+    if [[ -n "$_marker_grp" ]]; then
+      # Best-effort: a chmod/chgrp failure does NOT fail the write —
+      # the marker contents already landed. The worst case is the iso
+      # UID falls back to the watchdog's controller-side path, which
+      # still works for Lane C2 (#1254). bridge_linux_sudo_root is
+      # used because the marker may have been written under a parent
+      # dir whose group ownership requires elevation to reset.
+      chgrp "$_marker_grp" "$marker" 2>/dev/null \
+        || bridge_linux_sudo_root chgrp "$_marker_grp" "$marker" 2>/dev/null \
+        || true
+      chmod 0640 "$marker" 2>/dev/null \
+        || bridge_linux_sudo_root chmod 0640 "$marker" 2>/dev/null \
+        || true
+    fi
+  fi
+  return 0
+}
+
+# Read a single field from the marker. Returns empty string + rc=0 when
+# the marker is absent or the field is not set (callers gate on stdout
+# content, not rc).
+bridge_agent_restart_marker_read_field() {
+  local agent="$1"
+  local field="$2"
+  local marker=""
+  marker="$(bridge_agent_restart_marker_path "$agent")"
+  [[ -f "$marker" ]] || {
+    printf '%s' ""
+    return 0
+  }
+  awk -F'=' -v k="$field" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$marker" 2>/dev/null || printf '%s' ""
+}
+
+# TTL + PID liveness check. Returns rc=0 when the marker is present,
+# `state=in_progress`, `kill -0 <pid>` succeeds (orchestrator still alive)
+# AND `now < started + ttl`; rc=1 otherwise. Lane C2 consumes this
+# predicate when deciding whether to skip drift task enqueue.
+#
+# Issue #1251 codex r1 finding 2: the PID liveness check is REQUIRED. A
+# crashed orchestrator (e.g. operator's `agent restart` shell killed mid-
+# flight) used to leave a marker that suppressed the watchdog for the full
+# TTL window, even though no rollback would ever fire. Treating a dead-PID
+# marker as INACTIVE lets Lane C2 (#1254) take over and recover instead.
+bridge_agent_restart_marker_active() {
+  local agent="$1"
+  local pid=""
+  local started=""
+  local ttl=""
+  local state=""
+  local now=""
+
+  pid="$(bridge_agent_restart_marker_read_field "$agent" pid)"
+  started="$(bridge_agent_restart_marker_read_field "$agent" started)"
+  ttl="$(bridge_agent_restart_marker_read_field "$agent" ttl)"
+  state="$(bridge_agent_restart_marker_read_field "$agent" state)"
+  [[ -n "$started" && -n "$ttl" ]] || return 1
+  # rolled_back markers persist past the in-flight window so the operator
+  # can audit them, but they are NOT "active restart" — Lane C2 treats
+  # them as terminal markers, not drift-suppression signals.
+  [[ "$state" == "in_progress" ]] || return 1
+  # PID liveness gate (r1 finding 2). Empty / non-numeric pid → treat as
+  # dead. `kill -0` returns 0 when the process exists AND the caller has
+  # permission to signal it; for the watchdog use case the controller and
+  # the marker writer share a UID, so a "permission denied" return here
+  # would itself signal a malformed marker (PID reused by another UID's
+  # process) and we correctly reject it.
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  now="$(date +%s)"
+  # Guard against non-numeric values (corrupted marker) — awk above would
+  # have stripped the key prefix, but a tampered file could still leak a
+  # non-digit value through.
+  [[ "$started" =~ ^[0-9]+$ && "$ttl" =~ ^[0-9]+$ ]] || return 1
+  (( now < started + ttl )) || return 1
+  return 0
+}
+
+# Diagnostics helper: returns rc=0 when the marker carries a PID that is
+# no longer alive (or unreadable) AND `state=in_progress`. Used by smoke
+# tests and operator triage to distinguish "watchdog correctly skipped"
+# from "stale marker held the watchdog hostage". Returns rc=1 when the
+# marker is absent, the PID is alive, or the state is terminal.
+bridge_agent_restart_marker_stale_pid() {
+  local agent="$1"
+  local pid=""
+  local state=""
+  pid="$(bridge_agent_restart_marker_read_field "$agent" pid)"
+  state="$(bridge_agent_restart_marker_read_field "$agent" state)"
+  [[ "$state" == "in_progress" ]] || return 1
+  [[ -n "$pid" ]] || return 0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  kill -0 "$pid" 2>/dev/null && return 1
+  return 0
+}
+
+# Remove the marker + any leftover snapshot files. Called on the happy
+# path after a successful restart, and on the rollback path's restore
+# success (the rollback writer re-creates a fresh marker with state=
+# rolled_back AFTER the restore — keeping the marker is the audit
+# breadcrumb for Lane C2 / operator drift telemetry).
+bridge_agent_restart_marker_clear() {
+  local agent="$1"
+  local state_dir=""
+  local marker=""
+  state_dir="$(bridge_agent_restart_state_dir "$agent")"
+  marker="$(bridge_agent_restart_marker_path "$agent")"
+  rm -f "$marker" 2>/dev/null || true
+  # Clean up any snapshot leftovers from this and prior attempts. The
+  # glob is intentionally broad so a crashed restart that did not reach
+  # the cleanup hook still gets swept on the next successful one.
+  if [[ -d "$state_dir" ]]; then
+    rm -f "$state_dir"/restart.snapshot.* 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Snapshot the agent's managed block from the local roster file so the
+# rollback path can restore the pre-restart configuration if launch
+# fails after the kill. The snapshot captures the whole `# BEGIN AGENT
+# BRIDGE MANAGED ROLE: <agent>` ... `# END ...` block verbatim — that
+# block is the SSOT for BRIDGE_AGENT_CHANNELS / BRIDGE_AGENT_LAUNCH_CMD
+# and every other per-agent assignment (see bridge-agent.sh's role-block
+# writer at the bridge_write_role_block helper).
+#
+# Returns the snapshot file path on stdout (rc=0) when written; empty
+# string + rc=0 when the roster does not carry a managed block for this
+# agent (e.g. dynamic agent that was never persisted to roster.local).
+bridge_agent_restart_snapshot_managed_block() {
+  local agent="$1"
+  local roster=""
+  local state_dir=""
+  local ts=""
+  local snapshot=""
+
+  roster="${BRIDGE_ROSTER_LOCAL_FILE:-${BRIDGE_HOME:-$HOME/.agent-bridge}/agent-roster.local.sh}"
+  [[ -f "$roster" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  # Extract the managed block. We use awk over sed because the block
+  # may legitimately contain `$` and `/` that trip sed's regex parser
+  # under -E. Range pattern is on full-line anchors so a stray substring
+  # inside an arg cannot mis-trigger capture.
+  local block
+  block="$(awk -v a="$agent" '
+    $0 == "# BEGIN AGENT BRIDGE MANAGED ROLE: "a { capture=1 }
+    capture { print }
+    capture && $0 == "# END AGENT BRIDGE MANAGED ROLE: "a { capture=0 }
+  ' "$roster" 2>/dev/null)"
+  [[ -n "$block" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  state_dir="$(bridge_agent_restart_state_dir "$agent")"
+  mkdir -p "$state_dir" 2>/dev/null || return 1
+  ts="$(date +%s)"
+  snapshot="$(bridge_agent_restart_snapshot_path "$agent" "$ts")"
+  printf '%s\n' "$block" >"$snapshot" || return 1
+  printf '%s' "$snapshot"
+  return 0
+}
+
+# Issue #1251 codex r1 finding 1: capture a "last-known-good" snapshot
+# BEFORE the roster mutation lands. Called from `run_update` immediately
+# before `bridge_write_role_block`, so the snapshot represents the PRIOR
+# (working) config — not the post-update (possibly failing) config that
+# the inside-`run_restart` snapshot would capture.
+#
+# Path layout: `state/agents/<a>/restart.snapshot.pre-update.<ts>`. The
+# `pre-update.` infix is what `run_restart` uses to discriminate this
+# class of snapshot from the (post-mutation) one taken at restart entry.
+# `marker_clear`'s glob (`restart.snapshot.*`) still matches and sweeps
+# these on the success path — so a clean restart leaves no leftovers.
+#
+# Returns the snapshot file path on stdout (rc=0); empty + rc=0 when the
+# roster does not carry a managed block (e.g. agent-create's first call
+# before any block has been written).
+bridge_agent_restart_snapshot_pre_update() {
+  local agent="$1"
+  local roster=""
+  local state_dir=""
+  local ts=""
+  local snapshot=""
+
+  roster="${BRIDGE_ROSTER_LOCAL_FILE:-${BRIDGE_HOME:-$HOME/.agent-bridge}/agent-roster.local.sh}"
+  [[ -f "$roster" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  local block
+  block="$(awk -v a="$agent" '
+    $0 == "# BEGIN AGENT BRIDGE MANAGED ROLE: "a { capture=1 }
+    capture { print }
+    capture && $0 == "# END AGENT BRIDGE MANAGED ROLE: "a { capture=0 }
+  ' "$roster" 2>/dev/null)"
+  [[ -n "$block" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  state_dir="$(bridge_agent_restart_state_dir "$agent")"
+  mkdir -p "$state_dir" 2>/dev/null || return 1
+  ts="$(date +%s)"
+  snapshot="${state_dir}/restart.snapshot.pre-update.${ts}"
+  printf '%s\n' "$block" >"$snapshot" || return 1
+  printf '%s' "$snapshot"
+  return 0
+}
+
+# Find the most recent pre-update snapshot for `<agent>` that is still
+# within the operator-tunable freshness window (default 600s = 10 min).
+# Returns the path on stdout (rc=0) when one exists and is fresh; empty
+# + rc=0 otherwise. Used by `run_restart` to pick the LAST-KNOWN-GOOD
+# rollback target when the operator's flow was `agent update` → `agent
+# restart` (the production path codex r1 finding 1 calls out).
+#
+# Freshness gate: if the operator updated 30 minutes ago and only just
+# now hits restart, the pre-update snapshot is likely stale (other
+# mutations may have intervened) and we fall back to the at-entry
+# snapshot. Tunable via BRIDGE_AGENT_RESTART_PRE_UPDATE_WINDOW.
+bridge_agent_restart_find_pre_update_snapshot() {
+  local agent="$1"
+  local window="${BRIDGE_AGENT_RESTART_PRE_UPDATE_WINDOW:-600}"
+  local state_dir=""
+  state_dir="$(bridge_agent_restart_state_dir "$agent")"
+  [[ -d "$state_dir" ]] || {
+    printf '%s' ""
+    return 0
+  }
+  local newest=""
+  local newest_ts=0
+  local f ts
+  shopt -s nullglob
+  for f in "$state_dir"/restart.snapshot.pre-update.*; do
+    [[ -f "$f" ]] || continue
+    ts="${f##*.pre-update.}"
+    [[ "$ts" =~ ^[0-9]+$ ]] || continue
+    if (( ts > newest_ts )); then
+      newest_ts=$ts
+      newest=$f
+    fi
+  done
+  shopt -u nullglob
+  [[ -n "$newest" ]] || {
+    printf '%s' ""
+    return 0
+  }
+  local now
+  now="$(date +%s)"
+  [[ "$window" =~ ^[0-9]+$ ]] || window=600
+  if (( now - newest_ts > window )); then
+    printf '%s' ""
+    return 0
+  fi
+  printf '%s' "$newest"
+  return 0
+}
+
+# Restore the managed block from a snapshot file. Used by the rollback
+# path when restart fails post-kill. Atomic via temp file + rename so a
+# crashed restore does not corrupt the roster.
+#
+# Args:
+#   $1 — agent id
+#   $2 — snapshot file path (from bridge_agent_restart_snapshot_managed_block)
+bridge_agent_restart_restore_managed_block() {
+  local agent="$1"
+  local snapshot="$2"
+  local roster=""
+
+  roster="${BRIDGE_ROSTER_LOCAL_FILE:-${BRIDGE_HOME:-$HOME/.agent-bridge}/agent-roster.local.sh}"
+  [[ -f "$snapshot" ]] || return 1
+  [[ -f "$roster" ]] || return 1
+
+  local tmp="${roster}.restore.$$"
+  awk -v a="$agent" -v snap="$snapshot" '
+    BEGIN {
+      inserted = 0
+    }
+    $0 == "# BEGIN AGENT BRIDGE MANAGED ROLE: "a {
+      # Skip the existing block (which is the failed-launch config) and
+      # emit the snapshot in its place.
+      skip = 1
+      while ((getline line < snap) > 0) print line
+      close(snap)
+      inserted = 1
+      next
+    }
+    skip && $0 == "# END AGENT BRIDGE MANAGED ROLE: "a {
+      skip = 0
+      next
+    }
+    !skip { print }
+    END {
+      # If the existing roster no longer carried the managed block (e.g.
+      # operator manually removed it between snapshot and rollback), do
+      # NOT silently re-add — that would resurrect a possibly-stale
+      # config without operator intent. Leave the file as-is and let
+      # the caller decide whether to append.
+    }
+  ' "$roster" >"$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$roster" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# Full pre-flight check for `agent restart`. Runs BEFORE the prior tmux
+# session is killed so any "cannot start the new config" failure leaves
+# the running session intact. Returns empty string + rc=0 when every
+# check passes; structured failure reason + rc=0 when any check fails
+# (rc remains 0 so the caller can branch on stdout content without
+# wrapping in `|| true`).
+#
+# Checks (composed; the first failing check is what the caller sees):
+#   1. Channel-spec canonical resolution: every channel item in the
+#      current BRIDGE_AGENT_CHANNELS list must be a recognized shape
+#      (`plugin:<name>@<marketplace>` or a non-plugin transport token).
+#      Lane G beta1 wired the canonicalizer; we re-use it here so a
+#      typo like `plugin:teasms` is caught before the kill.
+#   2. Per-channel plugin manifest declaration: for every `plugin:*@*`
+#      item, the bridge-owned plugin manifest (per-UID +
+#      shared/plugins-cache) must declare the spec. This is the issue
+#      trace's smoking gun — `cosmax-crm@cosmax-marketplace` was
+#      unseeded, the launch reached `bridge_ensure_claude_plugin_enabled`
+#      post-kill, and bridge_die fired with the agent already stopped.
+#      Pulling the manifest check forward into pre-flight means the
+#      restart aborts with the agent still running.
+#   3. Engine binary exists on the controller's PATH (the same probe
+#      bridge_resolve_engine_binary uses). A missing `claude` / `codex`
+#      executable would have nuked the launch with an opaque exit-127
+#      otherwise.
+#
+# (Daemon supp-group + session-id consistency checks are co-owned with
+# Lane A12 / A3 of v0.15.0-beta3. Those lanes land their own predicates
+# and this helper composes any that are present at runtime — see the
+# end-of-function `if declare -f ... >/dev/null` guards below.)
+bridge_agent_restart_preflight_full_reason() {
+  local agent="$1"
+  local channels_csv=""
+  local item=""
+  local plugin_status=""
+  local engine=""
+  local engine_bin=""
+  local fragment=""
+  local -a items=()
+
+  [[ -n "$agent" ]] || {
+    printf 'missing agent id'
+    return 0
+  }
+
+  engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+  channels_csv="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
+
+  # Check 1+2: channel-spec resolution + per-plugin manifest declaration.
+  # We iterate over the raw CSV rather than going through the channel-
+  # status reason path because the issue's case (`cosmax-crm@cosmax-
+  # marketplace`) is a plugin-manifest miss, not a token / spec error.
+  # That helper's failure mode is downstream of seed; we want the seed
+  # failure surfaced FIRST with the actionable `agb plugins seed` hint.
+  if [[ -n "$channels_csv" ]]; then
+    IFS=',' read -r -a items <<<"$channels_csv"
+    local qualified=""
+    for item in "${items[@]}"; do
+      # bridge_trim_whitespace lives in bridge-core.sh and is sourced
+      # before us; defensive `|| true` so a missing helper does not
+      # crash the pre-flight (still better to fall back to raw item).
+      item="$(bridge_trim_whitespace "$item" 2>/dev/null || printf '%s' "$item")"
+      [[ -n "$item" ]] || continue
+
+      qualified="$(bridge_qualify_channel_item "$item" 2>/dev/null || printf '%s' "$item")"
+
+      # Check 1: must be either a `plugin:...@...` shape or a non-plugin
+      # transport token (no `plugin:` prefix at all). A bare `plugin:foo`
+      # that the canonicalizer could not resolve to a marketplace is a
+      # typo / unknown plugin — abort before the kill.
+      if [[ "$qualified" == plugin:* && "$qualified" != *@* ]]; then
+        printf 'channel-spec-unresolved: %s (canonical marketplace suffix could not be derived — typo or unknown plugin?)' "$qualified"
+        return 0
+      fi
+
+      # Check 2: plugin-manifest declaration. Only applies to engine=claude
+      # under linux-user isolation; other engines / shared-mode agents
+      # skip this branch because they do not consume the bridge-owned
+      # plugin cache.
+      if [[ "$qualified" == plugin:*@* && "$engine" == "claude" ]] \
+          && ! bridge_isolation_disabled_by_env 2>/dev/null \
+          && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+        # #1274 (v0.15.0-beta4): align the status-probe spec form with
+        # the rest of the codebase. `bridge_claude_plugin_status` and
+        # all downstream manifest predicates key by the BARE
+        # `<name>@<marketplace>` form (see `plugin_spec="${item#plugin:}"`
+        # at 6281 / 8406 and the manifest writer at 2470-2492). The
+        # qualified `plugin:...` form leaks here from
+        # `bridge_qualify_channel_item` because the v0.15.0-beta3 Lane C1
+        # preflight forgot to strip; passing it through produced a false
+        # `absent` and aborted every restart for iso v2 + plugin agents.
+        # Strip here so the operator-facing reason still names the
+        # qualified spec, while the predicate sees the canonical bare
+        # key. The helper boundary (claude-plugin-manifest-has-spec.py)
+        # also strips defensively, so both layers are now resilient.
+        local _plugin_spec_bare="${qualified#plugin:}"
+        plugin_status="$(bridge_claude_plugin_status "$_plugin_spec_bare" "$agent" 2>/dev/null || printf 'missing')"
+        if [[ "$plugin_status" == "missing" ]]; then
+          local marketplace="${qualified#*@}"
+          local seed_hint="agb plugins seed"
+          if [[ -n "$marketplace" && "$marketplace" != "agent-bridge" && "$marketplace" != "claude-plugins-official" ]]; then
+            seed_hint="agb plugins seed --marketplace-root <path-to-${marketplace}-source>"
+          fi
+          printf 'manifest-incomplete: %s (bridge-owned plugin manifest does not declare this spec; run: %s)' "$qualified" "$seed_hint"
+          return 0
+        fi
+      fi
+    done
+  fi
+
+  # Check 3: engine binary resolves. We do not require it for non-claude/
+  # codex engines — bridge_resolve_engine_binary returns rc=1 for unknown
+  # engines, which is indistinguishable from "binary missing"; honor the
+  # existing two-engine surface and skip the probe for anything else.
+  case "$engine" in
+    claude|codex)
+      engine_bin="$(bridge_resolve_engine_binary "$engine" 2>/dev/null || true)"
+      if [[ -z "$engine_bin" ]]; then
+        printf 'engine-binary-missing: %s not on controller PATH (install or update PATH before retrying)' "$engine"
+        return 0
+      fi
+      ;;
+  esac
+
+  # Daemon supp-group hint (Lane A12 v0.15.0-beta3 concurrent lane).
+  # Only consult the predicate when it exists — if Lane A12 has not yet
+  # landed in this branch, skip silently rather than emit a misleading
+  # "no such function" reason.
+  if declare -f bridge_daemon_supp_groups_includes_agent >/dev/null 2>&1; then
+    if ! bridge_daemon_supp_groups_includes_agent "$agent" 2>/dev/null; then
+      fragment="$(bridge_daemon_supp_groups_remediation "$agent" 2>/dev/null || true)"
+      [[ -n "$fragment" ]] || fragment="daemon supp-group set missing ab-agent-$agent — refresh daemon supp-groups before restart"
+      printf 'daemon-supp-group-missing: %s' "$fragment"
+      return 0
+    fi
+  fi
+
+  # Session-id consistency (Lane A3 v0.15.0-beta3 concurrent lane).
+  # Same opt-in pattern as the supp-group check above.
+  if declare -f bridge_agent_session_id_state_consistent >/dev/null 2>&1; then
+    if ! bridge_agent_session_id_state_consistent "$agent" 2>/dev/null; then
+      printf 'session-id-state-inconsistent: %s session_id pointer disagrees with on-disk transcript (Lane A3 reconcile required)' "$agent"
+      return 0
+    fi
+  fi
+
+  printf '%s' ""
+  return 0
+}
+
+# Compose an operator-facing block from a pre-flight reason string. Used
+# by `run_restart` in bridge-agent.sh to die with a structured, multi-line
+# error rather than a bare reason fragment. Output convention mirrors
+# the existing bridge_agent_restart_preflight_guidance shape so the
+# operator sees the same "session was left intact" closing line.
+bridge_agent_restart_preflight_full_guidance() {
+  local agent="$1"
+  local reason="${2:-$(bridge_agent_restart_preflight_full_reason "$agent")}"
+
+  [[ -n "$reason" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  printf 'restart_aborted=%s\n' "$(printf '%s' "$reason" | awk -F':' '{print $1}')"
+  printf 'agent=%s\n' "$agent"
+  printf 'detail=%s\n' "$reason"
+  printf 'prior_session_preserved=yes\n'
+  printf 'remediation=fix the underlying cause above and re-run: agent-bridge agent restart %s' "$agent"
+}
+
 bridge_agent_channel_status() {
   local agent="$1"
   local required=""
@@ -6894,6 +8250,82 @@ bridge_agent_channel_status() {
   printf '%s' "ok"
 }
 
+# #1202 bridge-owned manifest probe. For linux-user isolated v2 agents, the
+# controller's `~/.claude/plugins/installed_plugins.json` and
+# `claude plugin list` are NOT the source of truth — the iso agent loads
+# plugins from its own per-UID manifest (root-owned, written by
+# `bridge_write_isolated_installed_plugins_manifest`) and from the shared
+# plugin cache the operator seeded with `agb plugins seed`. The
+# controller's view diverges (especially for directory-source external
+# marketplaces installed via `--scope user`: spec appears in
+# `enabledPlugins` and `claude plugin list` reports enabled, but
+# `installed_plugins.json` does not include the entry).
+#
+# This helper returns `present` if either of the bridge-owned manifests
+# declares the spec, `absent` otherwise. Always returns 0 — callers gate
+# on stdout content. Per-UID manifest is consulted first; the shared
+# cache manifest covers the seed-only / pre-prepare case (e.g. seed has
+# run but `agent create` has not yet planted the per-UID manifest).
+#
+# Args:
+#   $1 — agent id (used to resolve per-UID HOME)
+#   $2 — plugin spec ("<name>@<marketplace>" or bare id)
+_bridge_claude_plugin_bridge_manifest_has_spec() {
+  local agent="$1"
+  local plugin_spec="$2"
+  local os_user=""
+  local user_home=""
+  local iso_manifest=""
+  local shared_manifest=""
+  local result=""
+
+  [[ -n "$agent" && -n "$plugin_spec" ]] || {
+    printf '%s' "absent"
+    return 0
+  }
+
+  # 1. Per-UID isolated manifest (root-owned, mode 0640). Read via the
+  #    same sudo-root path the catalog writer uses so the controller
+  #    UID can reach it across the isolation boundary.
+  os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+  if [[ -n "$os_user" ]]; then
+    user_home="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || printf '')"
+    if [[ -n "$user_home" ]]; then
+      iso_manifest="$user_home/.claude/plugins/installed_plugins.json"  # noqa: iso-helper-boundary
+      if bridge_linux_sudo_root test -f "$iso_manifest" 2>/dev/null; then
+        bridge_require_python
+        result="$(bridge_linux_sudo_root python3 \
+          "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/claude-plugin-manifest-has-spec.py" \
+          "$iso_manifest" "$plugin_spec" 2>/dev/null || printf 'absent')"
+        if [[ "$result" == "present" ]]; then
+          printf '%s' "present"
+          return 0
+        fi
+      fi
+    fi
+  fi
+
+  # 2. Shared plugin cache manifest (`$BRIDGE_SHARED_ROOT/plugins-cache/
+  #    installed_plugins.json`). Populated by `agb plugins seed`. Readable
+  #    by every member of `ab-shared` so no sudo escalation is needed.
+  if [[ -n "${BRIDGE_SHARED_ROOT:-}" ]]; then
+    shared_manifest="$BRIDGE_SHARED_ROOT/plugins-cache/installed_plugins.json"  # noqa: iso-helper-boundary
+    if [[ -f "$shared_manifest" ]]; then
+      bridge_require_python
+      result="$(python3 \
+        "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/claude-plugin-manifest-has-spec.py" \
+        "$shared_manifest" "$plugin_spec" 2>/dev/null || printf 'absent')"
+      if [[ "$result" == "present" ]]; then
+        printf '%s' "present"
+        return 0
+      fi
+    fi
+  fi
+
+  printf '%s' "absent"
+  return 0
+}
+
 bridge_claude_plugin_status() {
   local plugin_spec="$1"
   # #852 controller-blind plugin trust: optional agent id lets isolation-
@@ -6907,6 +8339,7 @@ bridge_claude_plugin_status() {
   local manifest_owner=""
   local manifest_has_spec=""
   local output=""
+  local bridge_manifest_has_spec=""
 
   if [[ -n "$registry" && -f "$registry" ]]; then
     bridge_require_python
@@ -6917,6 +8350,12 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 spec = sys.argv[2]
+# #1274 (v0.15.0-beta4): match the helper-boundary normalization in
+# scripts/python-helpers/claude-plugin-manifest-has-spec.py. Manifests
+# key by the bare `<name>@<marketplace>` form; strip a `plugin:` prefix
+# so this test-path probe is symmetric with the production path.
+if spec.startswith("plugin:"):
+    spec = spec[len("plugin:"):]
 try:
     payload = json.loads(path.read_text(encoding="utf-8"))
 except Exception:
@@ -6926,6 +8365,45 @@ except Exception:
 plugins = payload.get("plugins") or {}
 print("enabled" if spec in plugins else "missing")
 PY
+    return 0
+  fi
+
+  # #1202: for linux-user isolated v2 agents, bridge-owned manifests
+  # (per-UID `installed_plugins.json` + shared `plugins-cache/
+  # installed_plugins.json`) are the authoritative source. Disagreement
+  # rule (codex r1 spec):
+  #   - Controller missing + bridge present → ready (enabled).
+  #   - Controller enabled + bridge missing → not ready for iso v2
+  #     (return `missing` so `bridge_ensure_claude_plugin_enabled` fails
+  #     closed with seed/mirror guidance instead of attempting a
+  #     `claude plugin install` against drifted controller state).
+  # This trumps the controller's `~/.claude/plugins/installed_plugins.json`
+  # probe at the #852 callsite below AND the `claude plugin list`
+  # fallback further down.
+  #
+  # codex r2: gate on EFFECTIVE isolation rather than roster-requested
+  # isolation. `bridge_agent_linux_user_isolation_effective` checks
+  # roster mode + Linux host + os_user populated, AND `bridge_isolation_
+  # disabled_by_env` covers the BRIDGE_DISABLE_ISOLATION=1 runtime
+  # hatch that `bridge-start.sh:670-672` honors. Without this dual
+  # gate, an operator using the disable hatch on a linux-user roster
+  # would unexpectedly hit the iso-v2 fail-closed path instead of
+  # falling through to the legacy controller install flow that
+  # bridge-start.sh:907-912 still drives in disabled-mode.
+  if [[ -n "$agent" ]] \
+      && ! bridge_isolation_disabled_by_env \
+      && bridge_agent_linux_user_isolation_effective "$agent"; then
+    bridge_manifest_has_spec="$(_bridge_claude_plugin_bridge_manifest_has_spec "$agent" "$plugin_spec")"
+    if [[ "$bridge_manifest_has_spec" == "present" ]]; then
+      printf '%s' "enabled"
+      return 0
+    fi
+    # Bridge-owned manifests are silent on this spec → iso v2 is NOT
+    # ready. Skip the controller-side fallbacks so the ensure helper
+    # can fail closed with actionable seed guidance instead of falling
+    # into `claude plugin install`, which only mutates controller
+    # state and cannot repair the shared cache contract.
+    printf '%s' "missing"
     return 0
   fi
 
@@ -7168,12 +8646,46 @@ bridge_ensure_claude_plugin_enabled() {
       if [[ -n "${BRIDGE_CLAUDE_INSTALLED_PLUGINS_FILE:-}" ]]; then
         bridge_die "Claude plugin registry is missing '$plugin_spec' in test mode."
       fi
+      marketplace="$(bridge_claude_plugin_marketplace "$plugin_spec")"
+      # #1202: for linux-user isolated v2 agents, fail closed instead
+      # of running `claude plugin install --scope user`. That command
+      # only mutates the controller's Claude state (which the iso agent
+      # does NOT load from) and cannot repair the shared plugin cache
+      # / per-UID manifest contract the iso UID actually consumes. The
+      # bridge-owned manifests reach `missing` only when seed has not
+      # been run for this marketplace OR the per-UID prepare did not
+      # write the spec into `bridge_write_isolated_installed_plugins_
+      # manifest` (typically because the marketplace mirror was absent
+      # at `agent create` time — see #1201).
+      #
+      # Actionable remediation: point the operator at `agb plugins seed
+      # [--marketplace-root <path>]` plus an `agent start` rerun, which
+      # rederives the per-UID catalog via `bridge_linux_share_plugin_
+      # catalog` (lib/bridge-agents.sh:4178). No `agent create` rerun
+      # required.
+      #
+      # codex r2: gate on EFFECTIVE isolation, matching the status
+      # probe above. See the long comment at the status-helper iso-v2
+      # short-circuit for the rationale (BRIDGE_DISABLE_ISOLATION=1
+      # runtime hatch + non-Linux host fallthrough).
+      if [[ -n "$agent" ]] \
+          && ! bridge_isolation_disabled_by_env \
+          && bridge_agent_linux_user_isolation_effective "$agent"; then
+        local _seed_hint="agb plugins seed"
+        if [[ -n "$marketplace" && "$marketplace" != "agent-bridge" ]]; then
+          _seed_hint="agb plugins seed --marketplace-root <path-to-${marketplace}-source>"
+        fi
+        bridge_die "Claude plugin '$plugin_spec' is not declared in the bridge-owned plugin manifest for isolated agent '$agent'. The shared plugin cache (\$BRIDGE_SHARED_ROOT/plugins-cache) and the per-UID plugin manifest are the source of truth for isolated v2 agents — \`claude plugin install\` would mutate controller-side state that the isolated agent does not load. Run: $_seed_hint && agent-bridge agent start $agent --no-attach"
+      fi
+      # Non-isolated (shared-mode) agents: preserve the existing
+      # install/marketplace-self-heal flow. The iso-v2 short-circuit
+      # above carved out only the isolated path.
+      #
       # #853: self-heal a silently-drifted controller marketplace before
       # the install shell-out. Non-zero return = "could not self-heal,
       # proceed with install as before"; the existing
       # bridge_force_refresh_claude_marketplace retry path below still
       # catches the directory-source agent-bridge marketplace case.
-      marketplace="$(bridge_claude_plugin_marketplace "$plugin_spec")"
       if [[ -n "$marketplace" && -n "$agent" ]]; then
         # codex r1 (#858): drop the stdout/stderr suppression so the
         # helper's own bridge_warn on `claude plugin marketplace add`
@@ -7506,6 +9018,27 @@ bridge_agent_is_always_on() {
   (( timeout == 0 ))
 }
 
+# Issue #1234 (Lane δ): per-agent daemon auto-start policy reader. Operator
+# sets via `agent update --start-policy hold|auto`; the daemon's always-on
+# autostart loop consults this before invoking bridge-start.sh. Unset / blank
+# / unknown values default to "auto" so existing agents keep their warm
+# always-on semantics. Stored in BRIDGE_AGENT_START_POLICY (associative
+# array) so subprocess env-export never collapses it to a scalar — refs
+# #1213 collision class.
+bridge_agent_start_policy() {
+  local agent="$1"
+  local value="${BRIDGE_AGENT_START_POLICY[$agent]-}"
+  case "$value" in
+    hold|auto) printf '%s' "$value" ;;
+    *)         printf '%s' "auto" ;;
+  esac
+}
+
+bridge_agent_start_policy_configured() {
+  local agent="$1"
+  [[ -v "BRIDGE_AGENT_START_POLICY[$agent]" ]]
+}
+
 bridge_agent_memory_daily_refresh_enabled() {
   local agent="$1"
   local configured=""
@@ -7711,14 +9244,54 @@ bridge_refresh_runtime_state() {
 bridge_agent_plugin_port_from_env_file() {
   # Read a single <KEY>=<value> line from a plugin .env file and echo the
   # value if it parses as a port. Empty output on miss.
+  #
+  # beta23 Option A: when an agent name is in scope (callers pass it via
+  # the agent_for_iso optional 3rd arg), route through bridge_iso_run
+  # --op read-env-key so a controller-blind .env on an isolated agent
+  # still surfaces the value via the iso UID. Without the 3rd arg the
+  # legacy direct grep path is taken (back-compat for callers without
+  # an agent identity, e.g. operator-supplied token files outside the
+  # per-agent runtime).
   local env_file="$1"
   local key="$2"
+  local agent_for_iso="${3:-}"
   local line=""
   local value=""
 
-  [[ -n "$env_file" && -f "$env_file" ]] || return 0
+  [[ -n "$env_file" ]] || return 0
   [[ -n "$key" ]] || return 0
-  # Grab the last occurrence — plugin .env files are append-style in places.
+
+  if [[ -n "$agent_for_iso" ]] && declare -F bridge_iso_run >/dev/null 2>&1; then
+    # Path may be unreadable to controller but readable to iso UID —
+    # let bridge_iso_run sort it out. rc=0 with stdout = value.
+    local iso_rc=0
+    value="$(bridge_iso_run --agent "$agent_for_iso" --op read-env-key \
+              --path "$env_file" --key "$key" 2>/dev/null || true)"
+    iso_rc=$?
+    if [[ "$iso_rc" -eq 0 && -n "$value" ]]; then
+      # Strip surrounding quotes and whitespace, then validate as port.
+      value="${value%\"}"
+      value="${value#\"}"
+      value="${value%\'}"
+      value="${value#\'}"
+      value="${value//[[:space:]]/}"
+      if [[ "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$value"
+        return 0
+      fi
+      return 0
+    fi
+    # iso_rc 10 -> not isolated; fall through to legacy direct grep.
+    # iso_rc 20/30/31/32 -> structured failure; the legacy path will
+    # produce the same empty-output behaviour without surprising
+    # operators who depended on rc=0+empty-stdout-on-miss.
+    if [[ "$iso_rc" -ne 10 ]]; then
+      return 0
+    fi
+  fi
+
+  # Legacy direct grep path (back-compat).
+  [[ -f "$env_file" ]] || return 0
   line="$(grep -E "^${key}=" "$env_file" 2>/dev/null | tail -n 1 || true)"
   [[ -n "$line" ]] || return 0
   value="${line#${key}=}"
@@ -7741,7 +9314,9 @@ bridge_agent_plugin_ports() {
   local port=""
 
   teams_env="$(bridge_agent_teams_state_dir "$agent")/.env"
-  port="$(bridge_agent_plugin_port_from_env_file "$teams_env" "TEAMS_WEBHOOK_PORT" 2>/dev/null || true)"
+  # beta23 Option A: pass agent name so the iso UID can read a
+  # controller-blind .env via bridge_iso_run --op read-env-key.
+  port="$(bridge_agent_plugin_port_from_env_file "$teams_env" "TEAMS_WEBHOOK_PORT" "$agent" 2>/dev/null || true)"
   if [[ -n "$port" ]]; then
     printf '%s\t%s\t%s\n' "$port" "bun" "teams"
   fi

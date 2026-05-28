@@ -169,6 +169,11 @@ printf '%s\n' '    if cmd and cmd[0] == "mkdir":' >>"$T2_HARNESS"
 printf '%s\n' '        Path(cmd[-1]).mkdir(parents=True, exist_ok=True)' >>"$T2_HARNESS"
 printf '%s\n' '    return 0' >>"$T2_HARNESS"
 printf '%s\n' 'mod._sudo_run_as = fake_sudo_run_as' >>"$T2_HARNESS"
+# Phase 2 D7 lift: _ensure_dir_with_sudo delegates to bridge_iso_paths.ensure_dir,
+# which calls sudo_run_as from its own module globals — patch both sites.
+printf '%s\n' 'import importlib' >>"$T2_HARNESS"
+printf '%s\n' 'iso_paths = importlib.import_module("bridge_iso_paths")' >>"$T2_HARNESS"
+printf '%s\n' 'iso_paths.sudo_run_as = fake_sudo_run_as' >>"$T2_HARNESS"
 printf '%s\n' 'try:' >>"$T2_HARNESS"
 printf '%s\n' '    mod._ensure_dir_with_sudo(Path(target), iso_user)' >>"$T2_HARNESS"
 printf '%s\n' '    print("OK")' >>"$T2_HARNESS"

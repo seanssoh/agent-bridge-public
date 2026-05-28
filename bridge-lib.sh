@@ -321,6 +321,127 @@ bridge_prepend_path_entry "$HOME/.nix-profile/bin"
 bridge_prepend_path_entry "$HOME/bin"
 bridge_prepend_path_entry "/opt/homebrew/bin"
 bridge_prepend_path_entry "/usr/local/bin"
+
+# Issue #1317-A (beta5-2 Lane ν): daemon non-login shells miss nvm/pyenv
+# /rbenv/fnm/asdf PATH entries because operator shellrc init is skipped.
+# Without these, an nvm-installed `codex` (`~/.nvm/versions/node/vX/bin/`)
+# is not on the daemon's PATH, `bridge-start.sh` launch dies with
+# `codex: command not found` (exit 127), the rapid-fail circuit breaker
+# writes `broken-launch`, and the operator sees only `activity_state:
+# stopped` with no hint why.
+#
+# Strategy: hybrid override + auto-detect.
+#   1. BRIDGE_ENGINE_PATH (highest priority): colon-separated list of
+#      directories the operator explicitly wants on the daemon PATH.
+#      Each entry is prepended via bridge_prepend_path_entry so order is
+#      preserved and missing dirs are skipped.
+#   2. Auto-detect runtime managers from common env hints + canonical
+#      install paths:
+#        - $NVM_DIR/versions/node/<latest>/bin
+#        - $PYENV_ROOT/shims  ($PYENV_ROOT/bin already covered via shims
+#          for `pyenv` itself; shims is the path that exposes pyenv-
+#          managed Python)
+#        - $RBENV_ROOT/shims
+#        - ASDF_DATA_DIR (and ~/.asdf) shims
+#        - fnm: $FNM_DIR/aliases/default/bin OR canonical
+#          ~/.local/share/fnm/aliases/default/bin
+#
+# All checks are best-effort: missing env vars, missing dirs, or missing
+# `versions/node/<latest>` symlink targets fall through silently. This
+# function is idempotent (re-sourcing bridge-lib.sh is a no-op).
+bridge_augment_engine_path() {
+  local _entry=""
+  local _override_path="${BRIDGE_ENGINE_PATH:-}"
+
+  # 1. Operator override (highest priority — prepended last so it ends up
+  # at the front of PATH after all auto-detect entries are prepended).
+  # We iterate auto-detect first, then operator override last so the
+  # override wins.
+
+  # 2. Auto-detect — nvm
+  if [[ -n "${NVM_DIR:-}" && -d "$NVM_DIR/versions/node" ]]; then
+    # `nvm alias default` writes a name file under $NVM_DIR/alias/default
+    # pointing at the version dir; honor that when present.
+    local _nvm_default_alias=""
+    if [[ -r "$NVM_DIR/alias/default" ]]; then
+      _nvm_default_alias="$(cat "$NVM_DIR/alias/default" 2>/dev/null || true)"
+      _nvm_default_alias="${_nvm_default_alias#v}"
+    fi
+    if [[ -n "$_nvm_default_alias" \
+          && -d "$NVM_DIR/versions/node/v$_nvm_default_alias/bin" ]]; then
+      bridge_prepend_path_entry "$NVM_DIR/versions/node/v$_nvm_default_alias/bin"
+    else
+      # Fall back to the lexicographically-last version dir. `ls -1v`
+      # would be ideal for version-sort but isn't portable across macOS
+      # /Linux without GNU coreutils; the lexicographic last is close
+      # enough for `v24.16.0`-style names and matches operator intent
+      # ("most recent installed").
+      local _nvm_latest=""
+      # shellcheck disable=SC2012  # nvm version dirs are predictable
+      # `v24.16.0`-style names — ls + sort is intentional for lex-sort
+      # last; find -printf is non-portable on macOS BSD find.
+      _nvm_latest="$(ls -1 "$NVM_DIR/versions/node" 2>/dev/null | sort | tail -n1)"
+      if [[ -n "$_nvm_latest" && -d "$NVM_DIR/versions/node/$_nvm_latest/bin" ]]; then
+        bridge_prepend_path_entry "$NVM_DIR/versions/node/$_nvm_latest/bin"
+      fi
+    fi
+  fi
+
+  # 3. Auto-detect — pyenv
+  if [[ -n "${PYENV_ROOT:-}" ]]; then
+    bridge_prepend_path_entry "$PYENV_ROOT/shims"
+    bridge_prepend_path_entry "$PYENV_ROOT/bin"
+  elif [[ -d "$HOME/.pyenv" ]]; then
+    bridge_prepend_path_entry "$HOME/.pyenv/shims"
+    bridge_prepend_path_entry "$HOME/.pyenv/bin"
+  fi
+
+  # 4. Auto-detect — rbenv
+  if [[ -n "${RBENV_ROOT:-}" ]]; then
+    bridge_prepend_path_entry "$RBENV_ROOT/shims"
+    bridge_prepend_path_entry "$RBENV_ROOT/bin"
+  elif [[ -d "$HOME/.rbenv" ]]; then
+    bridge_prepend_path_entry "$HOME/.rbenv/shims"
+    bridge_prepend_path_entry "$HOME/.rbenv/bin"
+  fi
+
+  # 5. Auto-detect — asdf (legacy `.asdf` and current `ASDF_DATA_DIR`)
+  if [[ -n "${ASDF_DATA_DIR:-}" ]]; then
+    bridge_prepend_path_entry "$ASDF_DATA_DIR/shims"
+  fi
+  if [[ -d "$HOME/.asdf/shims" ]]; then
+    bridge_prepend_path_entry "$HOME/.asdf/shims"
+  fi
+
+  # 6. Auto-detect — fnm
+  if [[ -n "${FNM_DIR:-}" ]]; then
+    bridge_prepend_path_entry "$FNM_DIR/aliases/default/bin"
+  elif [[ -d "$HOME/.local/share/fnm/aliases/default/bin" ]]; then
+    bridge_prepend_path_entry "$HOME/.local/share/fnm/aliases/default/bin"
+  fi
+
+  # 7. Operator override last (becomes leftmost on PATH).
+  if [[ -n "$_override_path" ]]; then
+    # Honor colon-separated multi-dir overrides. Iterate from last to
+    # first so the first entry in BRIDGE_ENGINE_PATH ends up leftmost
+    # after all prepends.
+    local _entries=()
+    local IFS_save="$IFS"
+    IFS=':'
+    # shellcheck disable=SC2206
+    _entries=( $_override_path )
+    IFS="$IFS_save"
+    local _i
+    for (( _i=${#_entries[@]}-1; _i>=0; _i-- )); do
+      _entry="${_entries[$_i]}"
+      [[ -n "$_entry" ]] || continue
+      bridge_prepend_path_entry "$_entry"
+    done
+  fi
+}
+
+bridge_augment_engine_path
+
 export PATH
 
 RED='\033[0;31m'
@@ -383,6 +504,13 @@ bridge_source_module "bridge-isolation-v2.sh"
 # credential grants during upgrade. Source it here so every entry
 # point sees the helper.
 bridge_source_module "bridge-isolation-v2-reapply.sh"
+# Phase 2 (post-v0.14.5-beta16): declarative install-tree reconciler.
+# Sourced AFTER bridge-isolation-v2-reapply.sh because
+# `apply_install_tree_matrix --all-agents` defers to
+# `bridge_isolation_v2_reapply_eligible_agents` to enumerate the
+# isolated roster. Sourced BEFORE bridge-isolation-v3-channel-dotenv.sh
+# (no dependency) so the load order stays grouped under the v2 family.
+bridge_source_module "bridge-isolation-v2-reconcile.sh"
 # #857 PR-6 (v0.13.4): channel-dotenv migrator. Depends on v2-reapply
 # primitives (record_action / run_priv / has_named_acl /
 # probe_owner_group_mode / chown_chmod_file) — source after v2-reapply.
@@ -404,6 +532,14 @@ bridge_source_module "bridge-cron.sh"
 bridge_source_module "bridge-discord.sh"
 bridge_source_module "bridge-notify.sh"
 bridge_source_module "bridge-migration.sh"
+# Beta20 L2 Variant 3A — daemon refresh orchestration. Sourced AFTER
+# bridge-state.sh (provides bridge_daemon_pid / bridge_daemon_recorded_pid)
+# and bridge-agents.sh (bridge_current_user / bridge_linux_sudo_root) and
+# bridge-isolation-v2.sh (group membership probes). Provides
+# bridge_daemon_refresh_after_group_membership_change + sudoers installer
+# called by agent create / delete / isolate / `agent-bridge init sudoers
+# daemon-refresh`.
+bridge_source_module "bridge-daemon-control.sh"
 bridge_source_module "bridge-wave.sh"
 # bridge-agent-update.sh is the typed/audited mutation surface for the
 # protected agent-roster.local.sh managed-role fields (issue #528).
@@ -420,3 +556,161 @@ bridge_source_module "bridge-agent-update.sh"
 # tests/upgrade-precompact-wire/smoke.sh case 5, which sources
 # lib/bridge-core.sh + lib/bridge-hooks.sh without bridge-lib.sh) without
 # requiring them to also pull bridge-lib.sh.
+
+# ---------------------------------------------------------------------------
+# Lane A (v0.15.0-beta4): sanitized-first metadata read for iso UID context.
+# ---------------------------------------------------------------------------
+#
+# When bridge-lib.sh is sourced from an iso UID (stop hook,
+# mark-idle.sh, sub-shell run as `agent-bridge-<X>`), the protected
+# `agent-roster.local.sh` is 0600 owner=controller and cannot be read.
+# `bridge_load_roster` recovers via the scoped `runtime/agent-env.sh`
+# under BRIDGE_AGENT_ROOT_V2 — but that recovery only fires when
+# `bridge_load_roster` is actually called (queue-safe verb), and even
+# then it depends on BRIDGE_AGENT_ID being exported into the hook env.
+# Many hook subprocess paths (Claude `Stop` hook -> mark-idle.sh ->
+# `bridge_agent_mark_idle_now`) consume the assoc arrays
+# (`BRIDGE_AGENT_OS_USER[$agent]`, `BRIDGE_AGENT_ISOLATION_MODE[$agent]`)
+# directly via lib/bridge-isolation-v2.sh::Path A0 before any explicit
+# roster load — and those arrays are empty until something populates
+# them.
+#
+# `agent-meta.env` (written by `bridge_isolation_v2_write_agent_metadata`,
+# 0640 controller:ab-agent-<a>) is the sanitized backup snippet the iso
+# UID can always read. Source-style sourcing would silently no-op
+# because `BRIDGE_AGENT_OS_USER` / `BRIDGE_AGENT_ISOLATION_MODE` are
+# bound to associative arrays (see #1213). Instead, we parse the file
+# line-by-line and explicitly populate the assoc-array slot for the
+# local agent.
+#
+# Backward compatibility: agents that have no snippet on disk
+# (legacy installs that have not run prepare/reapply after this
+# upgrade) fall through to the existing `bridge_load_roster` path —
+# behavior is identical to current.
+#
+# Triggers: BRIDGE_AGENT_ID must be set AND the snippet must exist at
+# the stable location. Empty / missing BRIDGE_AGENT_ID is the
+# controller-side path, which always uses the full roster.
+bridge_load_sanitized_agent_metadata() {
+  # iso UID scope guard (codex r2 BLOCKING, PR #1286 r3):
+  # This reader is only meaningful in an iso UID context (sub-shell
+  # running as the agent's OS user). The controller (operator user)
+  # has read access to the full `agent-roster.local.sh` via
+  # `bridge_load_roster`, so populating arrays from the sanitized
+  # snippet would (a) duplicate work and (b) risk preferring stale
+  # snippet contents over the live roster.
+  #
+  # Prefix-independent 2-stage user-match guard — covers all three
+  # supported iso UID naming cases:
+  #   - default prefix (agent-bridge-<agent>)
+  #   - custom prefix via `BRIDGE_AGENT_OS_USER_PREFIX=<pfx>`
+  #   - explicit per-agent override via `bridge-agent.sh --os-user <user>`
+  #     (the snippet's BRIDGE_AGENT_OS_USER may bear no syntactic
+  #     relation to any prefix at all)
+  #
+  # Stage A peeks the snippet's BRIDGE_AGENT_OS_USER without sourcing
+  # the file (avoids the #1213 assoc/scalar collision class). Stage B
+  # compares `id -un` against that expected value. Match → load.
+  # Mismatch → return 1.
+  #
+  # Returns 1 (not 0) when the current user is NOT the iso UID for
+  # this agent — the call site at module-end uses `|| true` so this
+  # does not propagate under `set -e`. Tests that need to drive the
+  # reader from a controller context set
+  # BRIDGE_SANITIZED_METADATA_SKIP_GUARD=1 to bypass the guard
+  # (documented in scripts/smoke/lib.sh; never set in production
+  # code paths).
+
+  local agent="${BRIDGE_AGENT_ID:-}"
+  [[ -n "$agent" ]] || return 1
+
+  local meta_file="${BRIDGE_ACTIVE_AGENT_DIR:-$BRIDGE_HOME/state/agents}/$agent/agent-meta.env"
+  [[ -r "$meta_file" ]] || return 1
+
+  if [[ "${BRIDGE_SANITIZED_METADATA_SKIP_GUARD:-0}" != "1" ]]; then
+    # Stage A: extract the snippet's BRIDGE_AGENT_OS_USER value via
+    # awk peek — no `source`, no sub-shell variable bleed. Strip
+    # surrounding double or single quotes if present.
+    local _expected_os_user
+    _expected_os_user="$(awk -F= '
+      $1 == "BRIDGE_AGENT_OS_USER" {
+        v = $0
+        sub(/^BRIDGE_AGENT_OS_USER=/, "", v)
+        gsub(/^"|"$/, "", v)
+        gsub(/^'\''|'\''$/, "", v)
+        print v
+        exit
+      }
+    ' "$meta_file" 2>/dev/null)"
+    [[ -n "$_expected_os_user" ]] || return 1
+
+    # Stage B: match current user against the snippet's expected
+    # owner. Mismatch → controller context or wrong agent → skip.
+    local _cur_user
+    _cur_user="$(id -un 2>/dev/null)" || return 1
+    [[ "$_cur_user" == "$_expected_os_user" ]] || return 1
+  fi
+
+  # Ensure the assoc arrays exist (bridge-core.sh declares them inside
+  # `bridge_reset_roster_maps`, which fires inside `bridge_load_roster`).
+  # On a cold iso UID context the maps may not yet be declared at all;
+  # declaring here is idempotent.
+  declare -g -A BRIDGE_AGENT_OS_USER 2>/dev/null || true
+  declare -g -A BRIDGE_AGENT_ISOLATION_MODE 2>/dev/null || true
+  declare -g -A BRIDGE_AGENT_ENGINE 2>/dev/null || true
+  declare -g -a BRIDGE_AGENT_IDS 2>/dev/null || true
+
+  local key=""
+  local val=""
+  local line=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Strip CR (CRLF tolerance), skip blanks + comments.
+    line="${line%$'\r'}"
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    case "$line" in
+      *=*) ;;
+      *) continue ;;
+    esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    # Reject keys with whitespace or any character that's not in the
+    # set we recognize. This is sanitization, not security — the file
+    # is 0640 controller:ab-agent-<a>, owned by a privileged writer.
+    case "$key" in
+      BRIDGE_AGENT_OS_USER)
+        BRIDGE_AGENT_OS_USER["$agent"]="$val"
+        ;;
+      BRIDGE_AGENT_ISOLATION_MODE)
+        BRIDGE_AGENT_ISOLATION_MODE["$agent"]="$val"
+        ;;
+      BRIDGE_AGENT_ENGINE)
+        BRIDGE_AGENT_ENGINE["$agent"]="$val"
+        ;;
+      BRIDGE_AGENT_HOME|BRIDGE_AGENT_CLAUDE_CONFIG_DIR|BRIDGE_AGENT_AUDIT_DIR)
+        # Informational only — no array slot today. Future readers
+        # could prefer these over `getent` lookups; for now they
+        # serve as an operator-readable audit trail.
+        :
+        ;;
+      *)
+        # Unknown key — ignore (forward-compat snippet evolution).
+        :
+        ;;
+    esac
+  done <"$meta_file"
+
+  # If the agent isn't already in the IDs list (cold iso UID context),
+  # add it so callers that iterate `${BRIDGE_AGENT_IDS[@]}` see it.
+  local existing
+  for existing in "${BRIDGE_AGENT_IDS[@]+"${BRIDGE_AGENT_IDS[@]}"}"; do
+    if [[ "$existing" == "$agent" ]]; then
+      return 0
+    fi
+  done
+  BRIDGE_AGENT_IDS+=("$agent")
+  return 0
+}
+
+bridge_load_sanitized_agent_metadata || true

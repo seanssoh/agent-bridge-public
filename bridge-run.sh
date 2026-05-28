@@ -178,6 +178,122 @@ if [[ $SAFE_MODE -eq 1 ]]; then
   ONCE=1
 fi
 
+# Issue #1248 Lane A3 — `--no-continue` vs `continue=1` reconcile.
+#
+# Source-of-truth matrix (applied AFTER --continue/--no-continue overrides
+# from CLI args have been folded into BRIDGE_AGENT_CONTINUE):
+#
+#   effective continue=1 + session_id non-empty  ->  resume verb in
+#       launch_cmd (engine-specific: claude --resume <id>, codex resume
+#       <id>); decided by the downstream launch-cmd builders.
+#   effective continue=1 + session_id EMPTY      ->  bridge_die here with
+#       structured remediation. This is the #1248 surface — silent
+#       persist-write failure (downstream of #1246) left session_id
+#       empty, and every subsequent restart spawned a fresh Claude
+#       session because the launch-cmd builder's
+#       `bridge_claude_has_resumable_session_state` fallback emitted
+#       --continue and the post-startup capture in
+#       bridge_run_schedule_idle_marker_and_inbox_bootstrap silently
+#       swallowed the persist failure. Failing here makes the missing
+#       capture ops-visible on the next restart instead of compounding
+#       into another orphan jsonl.
+#   effective continue=0 or --no-continue passed  ->  NO resume verb
+#       (intentional fresh session); decided by the downstream builders.
+#
+# Safe-mode short-circuit: BRIDGE_AGENT_RESUME_GATE_ENABLED=0 disables
+# the gate for the rare case an operator needs to bypass it during
+# incident triage (e.g. inspecting a known-broken roster). Audit-log a
+# one-line breadcrumb so the bypass is not invisible.
+_resume_gate_enabled="${BRIDGE_AGENT_RESUME_GATE_ENABLED:-1}"
+if [[ "$_resume_gate_enabled" == "1" && $SAFE_MODE -eq 0 ]]; then
+  _gate_continue="$(bridge_agent_continue "$AGENT")"
+  _gate_session_id="$(bridge_agent_session_id "$AGENT")"
+  if [[ "$_gate_continue" == "1" && -z "$_gate_session_id" ]]; then
+    # Issue #1265 (v0.15.0-beta4 Lane E) — fresh-install first-wake
+    # carve-out. The Lane A3 gate (above) was designed for the
+    # `lost-state` case: an agent that has launched before (and
+    # therefore captured a session_id) but lost the persisted id due
+    # to the #1246 daemon supp-group write failure or operator-side
+    # rm -rf. That gate correctly fires loud so the operator sees it.
+    # However it also fired on the FRESH-install first-wake case, which
+    # is the OOTB-normal path:
+    #   `agb admin` on a fresh install -> patch agent has continue=1
+    #   (roster default for admins) AND session_id="" (no jsonl yet,
+    #   never launched). #1265 reported this as an OOTB-blocker for
+    #   the operator-visible `agb admin` flow AND for the daemon
+    #   picker-sweep wake of the codex pair (patch-dev), which had no
+    #   way to provide an `--no-continue` override.
+    #
+    # Heuristic: `state/agents/<a>/launch.history` is the marker that
+    # the agent has been launched at least once. Absent => fresh
+    # first-wake (proceed without --resume, emit a structured info
+    # log + audit row, and defer marker creation to the real-launch
+    # path so dry-run inspection stays side-effect-free; the NEXT
+    # empty-sid condition after a real launch correctly falls into
+    # the lost-state die branch).
+    # Present => the agent has launched before; an empty session_id
+    # now is the genuine #1248 lost-state and the die path is correct.
+    #
+    # The marker file is initially empty (touch only). Future passes
+    # may append 1-line per launch for ops-analytics; the schema is
+    # intentionally minimal so a `touch`/`rm` is the only operational
+    # surface. mkdir of the parent uses the existing self-heal helper
+    # (#1252 -- `bridge_agent_state_dir_self_heal`) to keep mode/group
+    # canonical on iso-v2 hosts; a touch fallback is also tried in
+    # case the helper is absent (non-v2 install) or the parent already
+    # exists but the helper short-circuits. Touch failure is
+    # non-fatal: we still proceed (the gate has decided the launch is
+    # legitimate) -- a future tick will retry.
+    #
+    # R2 (codex r1 BLOCKING — dry-run poisoning): the marker MUST NOT
+    # be created in this gate, because `bridge-run.sh --dry-run` is an
+    # advertised inspection mode and reaching the gate is not the same
+    # as "actually launched". Creating the marker here would flip a
+    # never-launched agent into "launched before" state, so the next
+    # real first launch (or even a second dry-run) would fall through
+    # to the lost-state die branch. We capture intent in a flag here
+    # and the real-launch path (after the dry-run early-exit) creates
+    # the marker exactly once, right before the launch loop.
+    #
+    # R3 (codex r2 BLOCKING — canonical state-dir path): the marker
+    # path MUST anchor on the canonical per-agent state leaf
+    # (`bridge_agent_idle_marker_dir <agent>` => `$BRIDGE_ACTIVE_AGENT_DIR/<a>`,
+    # which composes from `$BRIDGE_STATE_DIR/agents`), not on the
+    # hardcoded `$BRIDGE_HOME/state/agents/<a>` path. On hosts where
+    # `BRIDGE_STATE_DIR` is relocated independently of `BRIDGE_HOME`
+    # (operator override, isolated test layout) the two diverge and the
+    # gate would write the marker into one tree while the
+    # `bridge_agent_state_dir_self_heal` helper used by the real-launch
+    # block (and the daemon wake paths) targets the canonical tree —
+    # they would silently disagree and the next empty-sid gate would
+    # never see the marker, breaking the #1248 lost-state -> die
+    # contract on relocated layouts.
+    _gate_launch_history="$(bridge_agent_idle_marker_dir "$AGENT")/launch.history"
+    if [[ ! -f "$_gate_launch_history" ]]; then
+      bridge_info "[run] fresh first-wake (no session yet) — launching new session (agent=$AGENT)"
+      bridge_audit_log run fresh_first_wake "$AGENT" \
+        --detail continue_mode="$_gate_continue" \
+        --detail reason=fresh_install_no_launch_history \
+        2>/dev/null || true
+      # Defer marker creation to the real-launch path (see post-dry-run
+      # block below). The gate has decided the launch is legitimate;
+      # the marker becomes truth-on-disk only when an actual launch is
+      # attempted, NOT when --dry-run is inspecting the resolution.
+      BRIDGE_RUN_PENDING_FRESH_MARKER="$_gate_launch_history"
+      unset _gate_launch_history
+    else
+      unset _gate_launch_history
+      bridge_audit_log state session_id_missing_resume_blocked "$AGENT" \
+        --detail continue_mode="$_gate_continue" \
+        --detail reason=session_id_empty_with_continue_1 \
+        2>/dev/null || true
+      bridge_die "session_id missing; one of: (a) run agent first interactively to capture, (b) set continue=0 explicitly, (c) check #1246 daemon supp-group state (agent=$AGENT continue=$_gate_continue session_id=empty)"
+    fi
+  fi
+  unset _gate_continue _gate_session_id
+fi
+unset _resume_gate_enabled
+
 WORK_DIR="$(bridge_agent_workdir "$AGENT")"
 ENGINE="$(bridge_agent_engine "$AGENT")"
 SESSION="$(bridge_agent_session "$AGENT")"
@@ -202,13 +318,64 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "channels=$(bridge_agent_channels_csv "$AGENT")"
   echo "channel_status=$(bridge_agent_channel_status "$AGENT")"
   echo "launch=$(bridge_redact_inline_env_secrets "$LAUNCH_CMD")"
+  # R2 (codex r1 BLOCKING — dry-run poisoning): dry-run must NEVER
+  # create the launch.history marker. Unset the deferred-marker hint
+  # captured by the resume gate so a subsequent real launch in this
+  # process (none today, but defensive) cannot accidentally touch it
+  # via leaked global state.
+  unset BRIDGE_RUN_PENDING_FRESH_MARKER
   exit 0
+fi
+
+# R2 (codex r1 BLOCKING — dry-run poisoning, fresh first-wake real
+# launch path): the resume gate above captured a deferred marker hint
+# (BRIDGE_RUN_PENDING_FRESH_MARKER) when it observed continue=1 +
+# session_id="" + launch.history absent. Now that we have cleared the
+# dry-run early-exit, this IS a real launch — create the marker once,
+# right before the launch loop starts, so the NEXT empty-sid condition
+# (next process invocation) correctly falls into the lost-state die
+# branch (#1248). Marker creation failure stays non-fatal (the gate
+# has already decided the launch is legitimate) — a future tick will
+# retry.
+if [[ -n "${BRIDGE_RUN_PENDING_FRESH_MARKER:-}" ]]; then
+  if command -v bridge_agent_state_dir_self_heal >/dev/null 2>&1; then
+    bridge_agent_state_dir_self_heal "$AGENT" >/dev/null 2>&1 || true
+  fi
+  mkdir -p "$(dirname "$BRIDGE_RUN_PENDING_FRESH_MARKER")" 2>/dev/null || true
+  : >"$BRIDGE_RUN_PENDING_FRESH_MARKER" 2>/dev/null || true
+  unset BRIDGE_RUN_PENDING_FRESH_MARKER
 fi
 
 export PATH="$HOME/.local/bin:$HOME/.nix-profile/bin:/usr/local/bin:$PATH"
 export BRIDGE_AGENT_ID="$AGENT"
 export BRIDGE_ADMIN_AGENT_ID="$(bridge_admin_agent_id)"
 export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
+# Issue #1213 / #1217 (beta27): BRIDGE_AGENT_ISOLATION_MODE,
+# BRIDGE_AGENT_OS_USER, and BRIDGE_AGENT_INJECT_TIMESTAMP all share
+# their names with associative arrays declared in
+# lib/bridge-agents.sh:3410 (ISOLATION_MODE, OS_USER) and
+# lib/bridge-core.sh:867 (INJECT_TIMESTAMP). Bash silently no-ops a
+# scalar export of a name bound to an associative array (no error,
+# ARR=value writes to ARR[0] and `export ARR` refuses to export the
+# array), so the bare-name exports below never reach the child env.
+#
+# Fixes:
+#   - BRIDGE_AGENT_ISOLATION_MODE / BRIDGE_AGENT_OS_USER: #1213
+#     switched the Python hook predicate off the mode-string env to
+#     a UID-based check (_current_agent_under_foreign_uid); see
+#     hooks/bridge_hook_common.py:_under_isolated_uid. The bare-name
+#     scalar exports stay as silent-no-ops to avoid breaking any
+#     out-of-band consumer that might still read them on a future host.
+#   - BRIDGE_AGENT_INJECT_TIMESTAMP: #1217 (beta27 Track D) adds a
+#     distinctly-named scalar alias BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED
+#     (same shape as BRIDGE_AGENT_CLASS_FOR_HOOK for #539). The Python
+#     hook reads RESOLVED first, with a fallback to the bare name for
+#     manual / non-bridge launches where the assoc-array collision
+#     does not exist.
+#
+# DO NOT `unset` either array name as a workaround: downstream array
+# readers in bridge-run.sh and lib/* expect the lookup table to remain
+# populated.
 export BRIDGE_AGENT_ISOLATION_MODE="$(bridge_agent_isolation_mode "$AGENT")"
 export BRIDGE_AGENT_OS_USER="$(bridge_agent_os_user "$AGENT")"
 # Issue #539: privilege class consumed by hooks/tool-policy.py to gate
@@ -218,7 +385,13 @@ export BRIDGE_AGENT_OS_USER="$(bridge_agent_os_user "$AGENT")"
 # array of every agent's class; the hook only needs the calling agent's
 # value, so we surface a scalar alias here).
 export BRIDGE_AGENT_CLASS_FOR_HOOK="$(bridge_agent_class "$AGENT")"
+# Issue #1217 (beta27 Track D): the bare BRIDGE_AGENT_INJECT_TIMESTAMP
+# export silently no-ops because of the assoc-array name collision
+# documented in the comment block above. Keep it for backwards
+# compatibility, and add BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED as the
+# distinctly-named scalar alias the Python hook actually reads.
 export BRIDGE_AGENT_INJECT_TIMESTAMP="$(bridge_agent_inject_timestamp "$AGENT")"
+export BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED="$(bridge_agent_inject_timestamp "$AGENT")"
 export BRIDGE_AGENT_PROMPT_GUARD_POLICY="$(bridge_guard_policy_raw "$AGENT")"
 export BRIDGE_PROMPT_GUARD_CANARY_TOKENS="$(bridge_agent_prompt_guard_canary "$AGENT")"
 
@@ -389,13 +562,22 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
       previous_session_id="$6"
       source "$script_dir/bridge-lib.sh"
       if bridge_tmux_wait_for_prompt "$session" claude 30; then
+        # Issue #1248 Lane A3: drop the `>/dev/null 2>&1 || true` swallow
+        # that silently absorbed every persist-write failure (root
+        # symptom: session_id never landed on disk, every subsequent
+        # restart spawned a fresh Claude session). The function now
+        # `bridge_die`s on a persistence write failure; let stderr reach
+        # the parent subshell so the structured reason and the
+        # [session-id] success breadcrumb both land in the agent log.
+        # Suppress stdout (the captured id) — only stderr carries the
+        # ops-visible signal we care about here.
         if [[ -f "$next_file" && -n "$previous_session_id" ]]; then
-          bridge_refresh_agent_session_id "$agent" 24 0.5 "$previous_session_id" >/dev/null 2>&1 || true
+          bridge_refresh_agent_session_id "$agent" 24 0.5 "$previous_session_id" >/dev/null || true
         elif [[ -z "$(bridge_agent_session_id "$agent")" ]]; then
           # Claude session metadata can appear after tmux startup. Refresh once
           # more at prompt-ready time so static resume state is persisted before
           # the agent later goes inactive.
-          bridge_refresh_agent_session_id "$agent" 24 0.5 >/dev/null 2>&1 || true
+          bridge_refresh_agent_session_id "$agent" 24 0.5 >/dev/null || true
         fi
         bridge_agent_mark_idle_now "$agent"
         if [[ ! -f "$next_file" && ! -f "$marker_file" ]]; then
@@ -407,13 +589,22 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
               inject_text="[Agent Bridge] ACTION REQUIRED — queued tasks detected. Run exactly: ~/.agent-bridge/agb inbox $agent"
             fi
             bridge_tmux_send_and_submit "$session" claude "$inject_text" "$agent"
+            # Issue #1199 — record this injection as a nudge so the daemon
+            # nudge tick treats it as delivered for the queued set. Key =
+            # comma-separated task ids matching daemon nudge_key format
+            # (bridge-queue.py:2177). Without this, daemon fires again
+            # immediately (has_new_queue_ids=True since last_nudge_key empty).
+            queue_key=$(bridge_queue_cli find-open --agent "$agent" 2>/dev/null | tr "\012" "," | sed -e "s/,$//")
+            if [[ -n "$queue_key" ]]; then
+              bridge_task_note_nudge "$agent" "$queue_key" >/dev/null 2>&1 || true
+            fi
           fi
           mkdir -p "$(dirname "$marker_file")"
           printf "%s\n" "$(date +%s)" >"$marker_file"
         fi
       fi
     ' -- "$SCRIPT_DIR" "$SESSION" "$AGENT" "$marker_file" "$next_file" "$previous_session_id"
-  ) >/dev/null 2>&1 &
+  ) </dev/null >/dev/null 2>>"$ERRFILE" &
 }
 
 bridge_run_should_auto_accept_dev_channels() {
@@ -617,8 +808,20 @@ bridge_run_prune_legacy_teams_mcp() {
     --agent-root "$BRIDGE_AGENT_HOME_ROOT/$AGENT" \
     2>&1)" || rc=$?
 
+  # Issue #1282 (Surface A) — `absent path=…` is the steady-state output
+  # on a healthy install (legacy mcpServers.teams entry was already
+  # cleaned up or never existed). Logging it on every Claude run paints
+  # the operator's audit tail with cosmetic noise that masks real
+  # actions. Suppress `absent`/`unchanged` rows; keep `pruned`/`failed`/
+  # `skipped` rows because those reflect a real state change or a
+  # condition the operator may need to act on.
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
+    case "$line" in
+      "absent path="*|"unchanged path="*)
+        continue
+        ;;
+    esac
     log_line "[legacy-teams-mcp] $line"
   done <<<"$output"
 

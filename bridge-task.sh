@@ -4,6 +4,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# L1-N (beta21): mark this process as a queue-safe verb context BEFORE
+# sourcing bridge-lib.sh, so `bridge_load_roster` (inside the lib) can
+# distinguish queue commands (which only need the public roster + the
+# gateway socket) from other commands that genuinely need the
+# protected `BRIDGE_ROSTER_LOCAL_FILE`. This is what lets an iso UID
+# fall through to `bridge_warn`-skip on EACCES instead of dying with
+# the misleading "queue gateway timed out" wrapper error.
+#
+# Every subcommand in this file is by design queue-safe (the whole
+# file IS the queue CLI). Marking the entire process is therefore
+# correct — no per-verb gate needed.
+export BRIDGE_QUEUE_SAFE_CONTEXT=1
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 
@@ -19,10 +31,10 @@ ensure_roster_loaded() {
 usage() {
   cat <<EOF
 Usage:
-  bash $SCRIPT_DIR/bridge-task.sh create --to <agent> --title <title> [--body <text> | --body-file <path>] [--allow-empty-body] [--from <agent>] [--priority low|normal|high|urgent]
+  bash $SCRIPT_DIR/bridge-task.sh create --to <agent> --title <title> [--body <text> | --body-file <path>] [--allow-empty-body] [--from <agent>] [--priority low|normal|high|urgent] [--force]
   bash $SCRIPT_DIR/bridge-task.sh inbox [agent] [--all]
   bash $SCRIPT_DIR/bridge-task.sh show <task-id>
-  bash $SCRIPT_DIR/bridge-task.sh claim <task-id> [--agent <agent>] [--lease <seconds>]
+  bash $SCRIPT_DIR/bridge-task.sh claim <task-id> [--agent <agent>] [--lease <seconds>] [--note <text> | --note-file <path>]
   bash $SCRIPT_DIR/bridge-task.sh done <task-id> [--agent <agent>] [--note <text> | --note-file <path>]
   bash $SCRIPT_DIR/bridge-task.sh cancel <task-id> [--actor <name>] [--note <text> | --note-file <path>]
   bash $SCRIPT_DIR/bridge-task.sh update <task-id> [--status queued|claimed|blocked|in_progress] [--priority ...] [--title ...] [--note ...]
@@ -314,6 +326,7 @@ cmd_create() {
   local body_file=""
   local allow_empty_body=0
   local skip_companion_validate=0
+  local force=0
   local guard_threshold=""
   local guard_shell=""
   local severity=""
@@ -367,6 +380,17 @@ cmd_create() {
         skip_companion_validate=1
         shift
         ;;
+      --force)
+        # Issue #1318 part A (v0.14.5-beta5-2 Lane ξ): permit task create
+        # on a stopped target. Without this flag, a stopped target makes
+        # `agb task create` refuse with stderr warning + non-zero rc so
+        # the queued-task-with-no-reader pathology cannot silently
+        # accumulate. Pass --force when the caller intentionally queues
+        # to a stopped agent (cron prep, queue staging during scheduled
+        # downtime, etc.) — the audit log still records the create.
+        force=1
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -384,6 +408,50 @@ cmd_create() {
   explicit_actor="$actor"
   actor="$(infer_actor_if_possible "$actor")"
   emit_inferred_actor_hint "$explicit_actor" "$actor"
+
+  # Issue #1318 part A (v0.14.5-beta5-2 Lane ξ): refuse task create
+  # against a stopped target by default. Stopped targets cannot dequeue,
+  # so an enqueued task accumulates with no reader — the failure mode
+  # patch audit task #7051 hit (task queued 1h+ before operator
+  # noticed, no warning at create, no escalation while queued).
+  #
+  # Detection: bridge_agent_is_active returns true iff the agent's tmux
+  # session exists. A stopped agent's session has been torn down (or
+  # never spawned), so the predicate returns false. This is the same
+  # predicate `agb status` reports as `activity_state: stopped` —
+  # operator semantics are consistent.
+  #
+  # Override surface: --force CLI flag (above) for callers that
+  # legitimately queue against a stopped agent (cron prep flows, queue
+  # staging during scheduled downtime, the always-on auto-start path
+  # that handles its own activation). The --force path still emits the
+  # warning to stderr + an audit row so the create remains observable.
+  #
+  # Self-targeted create exemption: when actor == target (an agent
+  # queueing a task to itself, e.g. a hand-off chain) the active-state
+  # check would be misleading — the calling process IS the target's
+  # session, so by definition the target was active when the
+  # create call dispatched. Skip the gate to avoid a self-deadlock
+  # where an iso agent's own queue write trips the refuse branch.
+  if [[ "$actor" != "$target" ]] \
+      && declare -F bridge_agent_is_active >/dev/null 2>&1; then
+    if ! bridge_agent_is_active "$target" 2>/dev/null; then
+      if [[ $force -eq 1 ]]; then
+        bridge_warn "target agent '$target' is stopped — proceeding with --force; the task will sit in the queue until '$target' restarts. (#1318)"
+        # Emit a structured audit row so the explicit-override stays
+        # visible in the daemon log without the operator having to
+        # grep stderr. Best-effort: a logging failure must not block
+        # the create.
+        bridge_audit_log queue task_create_stopped_target_forced "$target" \
+          --detail actor="$actor" \
+          --detail title="$title" \
+          --detail priority="$priority" \
+          >/dev/null 2>&1 || true
+      else
+        bridge_die "target agent '$target' is stopped — task create refused (no reader to dequeue). Either restart '$target' (\`agent-bridge start $target\`) or pass --force to intentionally queue against a stopped agent. (#1318)"
+      fi
+    fi
+  fi
 
   # Companion-role validation: when sending a [plan] / [review] task to a
   # codex-engine recipient, require the body to carry a focus checklist and
@@ -533,6 +601,8 @@ cmd_claim() {
   local task_id=""
   local agent=""
   local lease=""
+  local note=""
+  local note_file=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -544,6 +614,20 @@ cmd_claim() {
       --lease)
         [[ $# -lt 2 ]] && bridge_die "--lease 뒤에 초 단위를 지정하세요."
         lease="$2"
+        shift 2
+        ;;
+      --note)
+        # Issue #1253 — symmetric with `agb done` / `agb update`. Lets
+        # operators record claim-time audit context (e.g. "claim during
+        # onboarding; will close after onboarding completes") without
+        # having to fall back to `agb update --status claimed --note ...`.
+        [[ $# -lt 2 ]] && bridge_die "--note 뒤에 텍스트를 지정하세요."
+        note="$2"
+        shift 2
+        ;;
+      --note-file)
+        [[ $# -lt 2 ]] && bridge_die "--note-file 뒤에 파일 경로를 지정하세요."
+        note_file="$2"
         shift 2
         ;;
       -h|--help)
@@ -569,6 +653,12 @@ cmd_claim() {
   args=(claim "$task_id" --agent "$agent")
   if [[ -n "$lease" ]]; then
     args+=(--lease-seconds "$lease")
+  fi
+  if [[ -n "$note" ]]; then
+    args+=(--note "$note")
+  fi
+  if [[ -n "$note_file" ]]; then
+    args+=(--note-file "$note_file")
   fi
   bridge_queue_cli "${args[@]}"
 }

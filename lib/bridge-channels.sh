@@ -419,6 +419,36 @@ bridge_write_idle_ready_agents() {
     engine="$(bridge_agent_engine "$agent")"
     session="$(bridge_agent_session "$agent")"
 
+    # #1252: best-effort self-heal for the per-agent state leaf BEFORE
+    # any idle-marker reads/writes. The matrix apply at `agent create`
+    # is the canonical creator (root:ab-agent-<X> 2770); this is purely
+    # a floor against silent-drop when the dir is somehow absent at
+    # runtime. On failure, emit a structured `[nudge-skip]` audit line
+    # naming the agent + reason so the daemon log never silently swallows
+    # the missing-state-dir class again.
+    if command -v bridge_agent_state_dir_self_heal >/dev/null 2>&1; then
+      if ! bridge_agent_state_dir_self_heal "$agent" 2>/dev/null; then
+        # Structured nudge-skip audit log. Fixed prefix `[nudge-skip]`
+        # so log scrapers can grep one line per skip per tick. Fields:
+        # agent, reason, evidence (concrete path that failed).
+        #
+        # r2 codex r1 BLOCKING #1252: emit task=none (NOT task=-). This
+        # call site is on the idle-marker writer loop — no specific task
+        # id is in scope at this depth (the loop iterates over agents,
+        # not over queued tasks). `none` is the canonical sentinel per
+        # the [nudge-skip] task=<id|none> contract.
+        local _idle_dir
+        _idle_dir="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null || printf '<unknown>')"
+        bridge_warn "[nudge-skip] agent=$agent task=none reason=state-dir-missing evidence=$_idle_dir"
+        if command -v bridge_audit_log >/dev/null 2>&1; then
+          bridge_audit_log daemon nudge_skip "$agent" \
+            --detail reason=state-dir-missing \
+            --detail evidence="$_idle_dir" 2>/dev/null || true
+        fi
+        continue
+      fi
+    fi
+
     case "$engine" in
       claude)
         if ! bridge_agent_idle_marker_exists "$agent"; then
@@ -655,6 +685,112 @@ bridge_install_teams_plugin_node_modules() {
   return 0
 }
 
+# Make the operator's bun runtime traversable by isolated UIDs.
+#
+# L1 beta19 (codex r1 design 2026-05-25): the Teams MCP launches bare
+# `bun` (plugins/teams/.mcp.json). PR #1090 settled the contract that
+# setup requires `command -v bun` to resolve to a PATH-reachable binary
+# — but in practice that binary is often a symlink like
+# `/usr/local/bin/bun -> $HOME/.bun/bin/bun`. The PATH-visible side is
+# fine for the controller, but isolated UIDs need to actually traverse
+# `$HOME/.bun/` to reach the real binary. On a Linux box where the
+# operator's $HOME is mode 0750 (Debian/Ubuntu default), iso UIDs cannot
+# `cd` into `$HOME/.bun` and the MCP fails with EACCES on exec.
+#
+# Helper behavior:
+#   * No-op unless Linux.
+#   * No-op when BRIDGE_BUN_CHMOD_OPT_OUT=1 (operator escape hatch).
+#   * Resolves `command -v bun`, walks symlinks via `readlink -f` (or a
+#     Python fallback for BSD/macOS readlink absence) to the real target.
+#   * If the real target sits under $HOME/.bun/: `chmod o+x` on
+#     $HOME/.bun and $HOME/.bun/bin — TRAVERSE-ONLY. Never grants `o+r`
+#     (no directory listing, no read of $HOME/.bun internals beyond
+#     traversal). Other-execute lets iso UIDs reach the resolved file
+#     without leaking the rest of the operator's home.
+#   * If the real target is anywhere else (homebrew /opt, asdf, fnm
+#     shims, system /usr/bin): no-op. Those paths already have global
+#     traverse modes; widening them would be a no-op or wrong-scope.
+#   * chmod failures are bridge_warn'd, never bridge_die'd — the caller
+#     (bridge_provision_teams_plugin_runtime + bridge-upgrade.sh) treats
+#     this as best-effort.
+#
+# Honors --dry-run: emits the chmod commands it WOULD run without
+# touching the host. We deliberately do NOT bundle or system-install
+# bun: that would require root + system-PATH ownership decisions and
+# changes the operator's runtime update model. The chmod-traverse is
+# the smallest L1 fix.
+bridge_ensure_bun_runtime_traversable_for_isolated() {
+  local dry_run="${1:-0}"
+
+  if [[ "$(uname -s 2>/dev/null)" != "Linux" ]]; then
+    return 0
+  fi
+  if [[ "${BRIDGE_BUN_CHMOD_OPT_OUT:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  local bun_path
+  if ! bun_path="$(command -v bun 2>/dev/null)" || [[ -z "$bun_path" ]]; then
+    # No bun on PATH — bridge_resolve_bun_executable will fail upstream
+    # and surface the canonical "missing bun" error. Stay quiet here.
+    return 0
+  fi
+
+  # Resolve symlinks. Prefer GNU `readlink -f` (Linux default); fall
+  # back to Python for portability (Linux without coreutils-style
+  # readlink is unusual but cheap to cover).
+  local real_target=""
+  if real_target="$(readlink -f "$bun_path" 2>/dev/null)" && [[ -n "$real_target" ]]; then
+    :
+  elif command -v python3 >/dev/null 2>&1; then
+    real_target="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$bun_path" 2>/dev/null || true)"
+  else
+    bridge_warn "bridge_ensure_bun_runtime_traversable_for_isolated: cannot resolve real path of $bun_path (no readlink -f, no python3); skipping traverse chmod"
+    return 0
+  fi
+  if [[ -z "$real_target" ]]; then
+    return 0
+  fi
+
+  # Only act on $HOME/.bun/ targets. Other PATH-resolved bun installs
+  # (homebrew /opt/homebrew, fnm shims under ~/.local/share/fnm, asdf,
+  # /usr/bin, etc.) are out of scope — those locations either already
+  # have global traverse OR their parent-mode contract is owned by
+  # another package manager / system policy we should not mutate.
+  local home_bun="${HOME:-}/.bun"
+  if [[ -z "${HOME:-}" || -z "$home_bun" ]]; then
+    return 0
+  fi
+  case "$real_target" in
+    "$home_bun"/*) ;;
+    *) return 0 ;;
+  esac
+
+  local bun_bin_dir="$home_bun/bin"
+
+  if [[ "$dry_run" == "1" ]]; then
+    bridge_info "[setup] [dry-run] would: chmod o+x $home_bun $bun_bin_dir (isolated-UID traverse for $real_target)"
+    return 0
+  fi
+
+  # TRAVERSE ONLY — `o+x`, not `o+rx`. Iso UIDs can `cd` into .bun/bin
+  # to reach the resolved binary but cannot list .bun/ contents.
+  local rc=0
+  if [[ -d "$home_bun" ]]; then
+    if ! chmod o+x "$home_bun" 2>/dev/null; then
+      bridge_warn "chmod o+x $home_bun failed — isolated UIDs may fail to exec bun (Teams MCP startup will hit EACCES)"
+      rc=1
+    fi
+  fi
+  if [[ -d "$bun_bin_dir" ]]; then
+    if ! chmod o+x "$bun_bin_dir" 2>/dev/null; then
+      bridge_warn "chmod o+x $bun_bin_dir failed — isolated UIDs may fail to exec bun (Teams MCP startup will hit EACCES)"
+      rc=1
+    fi
+  fi
+  return "$rc"
+}
+
 # Channel-setup-time entry point: ensure bun + plugins/teams/node_modules
 # are provisioned. Called from bridge-setup.sh `run_teams()` after the
 # Python config write succeeds. Failure does not abort setup (operator may
@@ -671,6 +807,111 @@ bridge_provision_teams_plugin_runtime() {
     bun_bin="$(bridge_resolve_bun_executable || true)"
   fi
 
+  # L1 beta19 (codex r1 design 2026-05-25): before we provision
+  # node_modules (which iso UIDs will read), make sure they can also
+  # traverse to the bun binary itself. Best-effort, non-fatal — the
+  # helper warns on chmod failure but does not block setup.
+  bridge_ensure_bun_runtime_traversable_for_isolated "$dry_run" || true
+
   bridge_install_teams_plugin_node_modules "$dry_run" "$bun_bin" || return 1
+
+  # L1-J (beta20, 2026-05-25): also provision sibling bundled plugins
+  # (ms365, future). The teams-specific helper above covers
+  # plugins/teams/ explicitly; this generalized pass picks up any other
+  # bundled plugin under $BRIDGE_SCRIPT_DIR/plugins/ that has a
+  # package.json. Best-effort + idempotent — re-running on an already-
+  # installed plugin is a no-op.
+  if bridge_resolve_script_dir_check; then
+    bridge_provision_bundled_plugins_node_modules "$dry_run" "$bun_bin" || true
+  fi
   return 0
+}
+
+# L1-J (beta20, 2026-05-25): provision node_modules for EVERY bundled
+# plugin under $BRIDGE_SCRIPT_DIR/plugins/ that has a package.json.
+# Generalizes bridge_install_teams_plugin_node_modules so a new bundled
+# plugin (e.g. ms365) does not need its own helper.
+#
+# Skips a plugin when:
+#   - it has no package.json (not a node-based MCP)
+#   - it already has a node_modules dir newer than package.json + bun.lock
+#
+# Idempotent: the chmod widen always runs over node_modules so a
+# previously-installed-but-tight tree is opened up for iso-UID copy.
+bridge_provision_bundled_plugins_node_modules() {
+  local dry_run="${1:-0}"
+  local bun_bin="${2:-}"
+
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  local plugins_root="$BRIDGE_SCRIPT_DIR/plugins"
+  if [[ ! -d "$plugins_root" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$bun_bin" ]]; then
+    bun_bin="$(bridge_resolve_bun_executable 2>/dev/null || true)"
+  fi
+  if [[ -z "$bun_bin" ]]; then
+    bridge_warn "[setup] bun executable missing — cannot provision bundled plugin node_modules. Install bun and re-run \`agb setup teams\`."
+    return 1
+  fi
+
+  local plugin_dir plugin_name pkg_json node_modules bun_lock
+  local overall_rc=0
+  shopt -s nullglob 2>/dev/null || true
+  for plugin_dir in "$plugins_root"/*/; do
+    plugin_dir="${plugin_dir%/}"
+    [[ -d "$plugin_dir" ]] || continue
+    plugin_name="$(basename -- "$plugin_dir")"
+    # Already covered by the teams-specific helper.
+    [[ "$plugin_name" == "teams" ]] && continue
+    case "$plugin_name" in
+      .*|marketplaces|cache) continue ;;
+    esac
+    pkg_json="$plugin_dir/package.json"
+    [[ -f "$pkg_json" ]] || continue
+    node_modules="$plugin_dir/node_modules"
+    bun_lock="$plugin_dir/bun.lock"
+
+    if [[ -d "$node_modules" ]]; then
+      local _stale=0
+      if [[ "$pkg_json" -nt "$node_modules" ]]; then
+        _stale=1
+      fi
+      if [[ -f "$bun_lock" && "$bun_lock" -nt "$node_modules" ]]; then
+        _stale=1
+      fi
+      if (( _stale == 0 )); then
+        chmod -R go+rX "$node_modules" 2>/dev/null \
+          || bridge_warn "[setup] chmod go+rX failed on $node_modules (non-fatal)"
+        bridge_info "[setup] $plugin_name: node_modules up to date (skipped)"
+        continue
+      fi
+      bridge_info "[setup] $plugin_name: node_modules stale — refreshing"
+    fi
+
+    if [[ "$dry_run" == "1" ]]; then
+      bridge_info "[setup] [dry-run] would run: bun install in $plugin_dir"
+      continue
+    fi
+
+    bridge_info "[setup] $plugin_name: running bun install in $plugin_dir"
+    local _rc=0
+    if [[ -f "$bun_lock" ]]; then
+      ( cd "$plugin_dir" && "$bun_bin" install --frozen-lockfile --no-summary >&2 ) || _rc=$?
+    else
+      ( cd "$plugin_dir" && "$bun_bin" install --no-summary >&2 ) || _rc=$?
+    fi
+    if (( _rc != 0 )); then
+      bridge_warn "[setup] $plugin_name: bun install failed (rc=$_rc) — MCP for this plugin will not start until deps resolve"
+      overall_rc=1
+      continue
+    fi
+    if ! chmod -R go+rX "$node_modules" 2>/dev/null; then
+      bridge_warn "[setup] $plugin_name: chmod -R go+rX failed on $node_modules — isolated agents may fail to copy via bridge-dev-plugin-cache"
+    fi
+  done
+  return "$overall_rc"
 }

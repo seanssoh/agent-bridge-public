@@ -34,6 +34,7 @@ Subcommands:
   list               List registered agents.
   registry           Read-only JSON inventory of registered agents.
   show               Show one agent's roster + runtime state.
+  describe           Print BRIDGE_AGENT_DESC[<agent>] (read-only getter).
   reclassify         Promote a runtime-detected admin to a static role.
   doctor             Run a 7-step CRUD self-check (create/update/registry/
                      show/reclassify/retire/delete) against an isolated fixture.
@@ -55,6 +56,7 @@ Examples:
   $(basename "$0") list --json
   $(basename "$0") registry --json
   $(basename "$0") show reviewer --json
+  $(basename "$0") describe reviewer
   $(basename "$0") reclassify --apply
   $(basename "$0") rerender-settings --apply
   $(basename "$0") start reviewer --dry-run
@@ -77,7 +79,10 @@ override) — same trust model as 'agent-bridge config set'. Repeatable.
   --launch-cmd-remove-env KEY          remove every KEY=... env-prefix token
   --launch-cmd-add-dev-channel <spec>  append --dangerously-load-development-channels <spec>
   --launch-cmd-remove-dev-channel <spec>
+  --channels <csv>                     alias for --channels-set (matches create-side flag, #1235)
   --channels-set <csv>                 full replace of BRIDGE_AGENT_CHANNELS
+                                       (auto-suffix shorthand + auto-reconcile
+                                       launch_cmd dev-channels per #1235)
   --channels-add <token>               append unique CSV token
   --channels-remove <token>            remove matching CSV token
   --desc <text>                        set BRIDGE_AGENT_DESC
@@ -89,6 +94,11 @@ override) — same trust model as 'agent-bridge config set'. Repeatable.
   --idle-timeout <seconds>             set BRIDGE_AGENT_IDLE_TIMEOUT (integer ≥0; 0 = always on)
   --always-on yes                      sugar for --idle-timeout 0 (records expressed_intent=always_on_yes)
   --always-on no                       requires --idle-timeout <positive>; records expressed_intent=always_on_no
+  --start-policy hold|auto             daemon auto-start policy (issue #1234, Lane δ);
+                                       "hold" suppresses the warm always-on autostart loop until
+                                       the operator runs 'agent start <agent>' (use while channel
+                                       setup is intentionally incomplete). "auto" (default)
+                                       restores warm always-on semantics.
   --json                               emit JSON envelope
   --dry-run                            do not mutate; emit planned diff
 
@@ -121,6 +131,12 @@ Create options:
   --test-fixture               opt into test-artifact name patterns
                                (smoke-/test-/bootstrap-/created-agent-/pref-,
                                *-repro-<N>); cleanup tooling may reap these
+  --force-engine-missing       (#1317-C) bypass the engine-CLI pre-flight
+                               check. Use only when the engine will be
+                               installed AFTER \`agent create\` (e.g.
+                               provisioning automation). Without this,
+                               \`create\` refuses when the engine binary
+                               is not on PATH.
 
 Policy: admin operates exclusively through these typed verbs. Direct edits
 to protected-roster files (\$BRIDGE_ROSTER_LOCAL_FILE) are intentionally
@@ -994,6 +1010,12 @@ bridge_write_role_block() {
   # (which sets always_on=1) and `--idle-timeout 0` produce the same byte
   # emission, and `--idle-timeout 300` writes the literal `"300"`.
   local idle_timeout_value="${21:-}"
+  # Issue #1234 (Lane δ): optional positional 22 carries an explicit
+  # BRIDGE_AGENT_START_POLICY value (hold|auto). Empty means "do not emit
+  # the line" — bridge_agent_start_policy's "auto" fallback covers absence.
+  # When non-empty, the writer emits the explicit assignment so a future
+  # roster reload restores the persisted value.
+  local start_policy_value="${22:-}"
 
   bridge_agent_manage_python \
     "$BRIDGE_ROSTER_LOCAL_FILE" \
@@ -1017,7 +1039,8 @@ bridge_write_role_block() {
     "$replace_existing" \
     "$agent_class" \
     "$loop_explicit_off" \
-    "$idle_timeout_value" <<'PY'
+    "$idle_timeout_value" \
+    "$start_policy_value" <<'PY'
 from pathlib import Path
 import shlex
 import sys
@@ -1046,6 +1069,7 @@ import re
     agent_class,
     loop_explicit_off,
     idle_timeout_value,
+    start_policy_value,
 ) = sys.argv[1:]
 
 path = Path(path_str)
@@ -1110,6 +1134,14 @@ if idle_timeout_value:
     lines.append(f'BRIDGE_AGENT_IDLE_TIMEOUT["{agent}"]="{idle_timeout_value}"')
 elif always_on == "1":
     lines.append(f'BRIDGE_AGENT_IDLE_TIMEOUT["{agent}"]="0"')
+# Issue #1234 (Lane δ): emit BRIDGE_AGENT_START_POLICY only when the caller
+# supplied an explicit value (`agent update --start-policy ...`). Default
+# "auto" reading lives in bridge_agent_start_policy's fallback, so omitting
+# the line is byte-identical to pre-#1234 emission for every legacy create /
+# reclassify caller. The closed value space (hold|auto) is enforced upstream
+# at the parse layer; the writer does not re-validate.
+if start_policy_value:
+    lines.append(f'BRIDGE_AGENT_START_POLICY["{agent}"]="{start_policy_value}"')
 if isolation_mode:
     # Emit the isolation mode verbatim (including "shared") so roster
     # round-trips preserve explicit configuration. Downstream tooling that
@@ -1364,12 +1396,30 @@ emit_create_json() {
   # JSON envelope; omitted entirely when empty so callers that didn't
   # pass the flag see a byte-stable envelope.
   local expressed_intent="${16:-}"
+  # Beta20 L2 Variant 3A — daemon supplementary-groups refresh status
+  # surfaced to JSON callers. One of:
+  #   ok / ok-systemd-sudo-self                  (success)
+  #   skipped-non-linux / skipped-daemon-not-running /
+  #     skipped-daemon-already-has-group         (no-op success)
+  #   manual-required-sudoers /
+  #     manual-required-sudo-refresh-no-gid /
+  #     manual-required-systemd-unit-stale /
+  #     manual-required-systemd-sudoers          (operator must run a recovery cmd)
+  #   failed-restart / failed-timeout /
+  #     failed-systemctl-restart /
+  #     failed-systemd-refresh-no-gid            (refresh attempted but failed)
+  #   ""                                          (no refresh attempted, shared-mode/macOS)
+  #
+  # When status is in the manual-required-* / failed-* family the
+  # envelope also carries `manual_command` with the exact recovery
+  # shell line — the python branches below own the mapping.
+  local daemon_group_refresh="${17:-}"
 
-  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" "$expressed_intent" <<'PY'
+  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" "$expressed_intent" "$daemon_group_refresh" <<'PY'
 import json
 import sys
 
-agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user, idle_timeout_persisted, loop_persisted, expressed_intent = sys.argv[1:]
+agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user, idle_timeout_persisted, loop_persisted, expressed_intent, daemon_group_refresh = sys.argv[1:]
 policy = {
     "idle_timeout": idle_timeout_persisted,
     "loop": loop_persisted,
@@ -1399,6 +1449,26 @@ payload = {
         f"bash bridge-start.sh {agent} --dry-run",
     ],
 }
+# Beta20 L2 Variant 3A — only emit the field when refresh was actually
+# attempted (linux-user isolation on Linux). Shared-mode / macOS callers
+# see a byte-stable envelope without the new key. r4 added the systemd-
+# user managed status family — its recovery command differs from the
+# r3 ad-hoc sudo-restart path (operators on systemd hosts must regen
+# the unit + sudoers, not just retry a bare bridge-daemon.sh restart).
+if daemon_group_refresh:
+    payload["daemon_group_refresh"] = daemon_group_refresh
+    if daemon_group_refresh == "manual-required-sudoers":
+        payload["manual_command"] = "agent-bridge init sudoers daemon-refresh --apply"
+    elif daemon_group_refresh == "manual-required-sudo-refresh-no-gid":
+        payload["manual_command"] = "bash bridge-daemon.sh restart --force"
+    elif daemon_group_refresh in ("failed-restart", "failed-timeout"):
+        payload["manual_command"] = "bash bridge-daemon.sh restart --force"
+    elif daemon_group_refresh == "manual-required-systemd-unit-stale":
+        payload["manual_command"] = "agent-bridge init sudoers daemon-refresh --apply && bash scripts/install-daemon-systemd.sh --apply --enable --bridge-home \"$BRIDGE_HOME\""
+    elif daemon_group_refresh == "manual-required-systemd-sudoers":
+        payload["manual_command"] = "agent-bridge init sudoers daemon-refresh --apply"
+    elif daemon_group_refresh in ("failed-systemctl-restart", "failed-systemd-refresh-no-gid"):
+        payload["manual_command"] = "systemctl --user restart agent-bridge-daemon.service"
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY
 }
@@ -1430,6 +1500,23 @@ bridge_agent_activity_state() {
   local session=""
   local engine=""
 
+  # Issue #1317-B (beta5-2 Lane ν): when the rapid-fail circuit breaker
+  # in bridge-run.sh has quarantined an agent (broken-launch marker
+  # present), surface it as `quarantine-broken-launch` instead of the
+  # generic `stopped`. Without this, `agb agent show` displayed only
+  # `active: no, activity_state: stopped` — operators had to open
+  # `state/agents/<a>/broken-launch` by hand to learn the engine CLI
+  # was missing. The `session_health` block surfaces the marker file +
+  # recovery hint; this field gives one-glance visibility in `agent
+  # list` / dashboard / status output that does not include the
+  # session_health subblock. Checked BEFORE the `is_active` short-
+  # circuit because a quarantined agent has no tmux session (the
+  # daemon's `bridge_daemon_autostart_allowed` gate blocks restarts).
+  if [[ -f "$(bridge_agent_broken_launch_file "$agent" 2>/dev/null)" ]]; then
+    printf '%s' "quarantine-broken-launch"
+    return 0
+  fi
+
   if ! bridge_agent_is_active "$agent"; then
     printf '%s' "stopped"
     return 0
@@ -1439,6 +1526,20 @@ bridge_agent_activity_state() {
   engine="$(bridge_agent_engine "$agent")"
   if bridge_tmux_session_has_prompt "$session" "$engine"; then
     printf '%s' "idle"
+    return 0
+  fi
+
+  # Issue #1319 (Lane κ v0.15.0-beta5-2): picker-blocked agents are NOT
+  # making progress and must NOT render as `working`. Mirror the
+  # snapshot writer in `bridge_write_roster_status_snapshot` so
+  # `agb agent show` + the daemon snapshot stay in sync. The daemon
+  # stall scan writes `STALL_ACTIVE_CLASSIFICATION=interactive_picker`
+  # to stall.env when bridge-stall.py detects the rate-limit / summary
+  # picker; the predicate clears automatically when stall.env is
+  # rm'd by `bridge_clear_stall_state` on recovery.
+  if command -v bridge_agent_picker_blocked >/dev/null 2>&1 \
+      && bridge_agent_picker_blocked "$agent"; then
+    printf '%s' "picker_blocked"
     return 0
   fi
 
@@ -2002,7 +2103,17 @@ run_show() {
     admin="${_fields[29]}"
     [[ "$row_agent" == "agent" ]] && continue
     printf 'agent: %s\n' "$row_agent"
-    printf 'description: %s\n' "$description"
+    # v0.15.0-beta1 Lane I: emit a self-contained hint when the operator
+    # has not set BRIDGE_AGENT_DESC for this agent. The JSON record stays
+    # raw (empty string) so downstream scripts can distinguish "unset"
+    # from "placeholder text"; the text mode line stays present so
+    # operators piping `agent show` through grep/awk still see a stable
+    # row, just with an actionable hint instead of a blank value.
+    if [[ -z "$description" ]]; then
+      printf 'description: [no description set; edit BRIDGE_AGENT_DESC["%s"] in agent-roster.local.sh]\n' "$row_agent"
+    else
+      printf 'description: %s\n' "$description"
+    fi
     printf 'engine: %s\n' "$engine"
     printf 'source: %s\n' "$source"
     printf 'admin: %s\n' "$admin"
@@ -2053,6 +2164,78 @@ run_show() {
     printf 'session_health:\n'
     bridge_agent_session_guidance_text "$agent" | sed 's/^/  /'
   done <<<"$output"
+}
+
+# v0.15.0-beta1 Lane I: read-only `agent describe <agent>` getter.
+#
+# Contract (codex r1):
+#   - With `-h`/`--help`: print short usage to stdout, exit 0. The flag is
+#     checked BEFORE `bridge_require_agent` so the universal --help gate
+#     (scripts/smoke/1117-cli-help-universal-gate.sh) sees a clean stdout
+#     without the "등록된 에이전트:" error marker.
+#   - With a registered agent that has a non-empty BRIDGE_AGENT_DESC entry:
+#     print the description + newline to stdout, exit 0.
+#   - With a registered agent whose BRIDGE_AGENT_DESC entry is unset/empty:
+#     print no stdout, exit non-zero, write a hint to stderr pointing the
+#     operator at the roster file.
+#   - With an unregistered agent: standard bridge_require_agent failure
+#     (registry list to stdout/stderr, bridge_die exit 1).
+#
+# No write path in beta1 — the source of truth is the roster file. See
+# docs/agent-runtime/admin-agent-convention.md.
+run_describe() {
+  # Honor `-h`/`--help` before any argument validation, so the universal
+  # --help gate (issue #1117) sees a clean rc=0 + non-empty stdout regardless
+  # of whether an agent id is also present on the command line.
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -h|--help)
+        cat <<EOF
+Usage:
+  $(basename "$0") describe <agent>
+
+Read-only getter for the BRIDGE_AGENT_DESC[<agent>] string.
+
+  - Set       → prints the description + newline, exit 0.
+  - Unset     → no stdout, exit non-zero, stderr hint points to
+                BRIDGE_AGENT_DESC["<agent>"] in agent-roster.local.sh.
+
+The description is operator-curated; the source of truth is the roster
+file. To change a description, edit \$BRIDGE_HOME/agent-roster.local.sh
+directly. See docs/agent-runtime/admin-agent-convention.md for the
+convention and per-role recommended one-liners.
+EOF
+        return 0
+        ;;
+    esac
+  done
+
+  local agent="${1:-}"
+  [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") describe <agent>"
+  shift || true
+
+  # Reject any extra positional or flag arguments — `describe` is a
+  # single-purpose getter, not a multi-flag operation. Matches the shape
+  # of similar read-only verbs (issue #163 intent-recovery hint surface).
+  if [[ $# -gt 0 ]]; then
+    bridge_die "지원하지 않는 agent describe 옵션입니다: $1"
+  fi
+
+  bridge_require_agent "$agent"
+
+  local description
+  description="$(bridge_agent_desc "$agent")"
+  if [[ -z "$description" ]]; then
+    # No stdout when unset (so callers piping the value into another
+    # command see an empty string, not a placeholder). Hint to stderr
+    # so an interactive operator running `agb agent describe foo` still
+    # sees the actionable next step.
+    bridge_warn "agent '$agent' has no description set. Edit BRIDGE_AGENT_DESC[\"$agent\"] in agent-roster.local.sh (see docs/agent-runtime/admin-agent-convention.md)."
+    return 1
+  fi
+
+  printf '%s\n' "$description"
 }
 
 run_reclassify() {
@@ -2737,6 +2920,14 @@ run_create() {
   # `<admin>-dev` into the admin's workdir, where bootstrap_project_skill has
   # already populated `.agents/`). Skips the non-empty-workdir guard.
   local allow_shared_workdir=0
+  # Issue #1317-C (beta5-2 Lane ν): last-resort opt-out of the engine
+  # CLI pre-flight check. Useful when the operator is bootstrapping a
+  # host where the engine will be installed AFTER `agent create` (e.g.
+  # provisioning automation that scaffolds the agent first, then runs
+  # `npm i -g @anthropic/claude-code` second). Without the override,
+  # missing-engine refuses create and the operator must either install
+  # the engine first or set BRIDGE_ENGINE_PATH.
+  local force_engine_missing=0
 
   shift || true
 
@@ -2974,6 +3165,17 @@ run_create() {
         allow_shared_workdir=1
         shift
         ;;
+      --force-engine-missing)
+        # Issue #1317-C (beta5-2 Lane ν): last-resort opt-out for the
+        # engine CLI pre-flight check below. Operators who scaffold
+        # agents before installing the engine (provisioning automation,
+        # CI seed flows) can use this to bypass the refusal. The
+        # resulting agent will fail to launch until the engine binary
+        # is on the daemon PATH — same as today's missing-engine
+        # behavior but without the at-create UX gate.
+        force_engine_missing=1
+        shift
+        ;;
       *)
         bridge_die "지원하지 않는 agent create 옵션입니다: $1"
         ;;
@@ -3044,6 +3246,33 @@ report and reap test-fixture agents per their pattern."
     claude|codex) ;;
     *) bridge_die "지원하지 않는 engine 입니다: $engine" ;;
   esac
+
+  # Issue #1317-C (beta5-2 Lane ν): engine CLI pre-flight at `agent
+  # create`. Before this gate, scaffolding an agent whose engine
+  # binary is not on the controller's PATH succeeded, then the daemon
+  # restart-loop wedged: every start attempt died with exit 127
+  # (`<engine>: command not found`), the rapid-fail circuit breaker
+  # quarantined the agent (broken-launch marker), and `agent show`
+  # surfaced only `activity_state: stopped` — operator's first
+  # diagnostic was usually opening the marker file by hand. The
+  # pre-flight catches the same condition AT CREATE TIME with an
+  # actionable hint: which env var to export (BRIDGE_ENGINE_PATH or
+  # NVM_DIR/PYENV_ROOT) and a last-resort `--force-engine-missing`
+  # opt-out for provisioning flows that install the engine AFTER
+  # scaffold. `bridge_resolve_engine_binary` is the same probe
+  # bridge-start.sh uses to resolve ENGINE_BIN_RESOLVED, so a pass
+  # here implies the launch path will resolve the binary too.
+  #
+  # Skip when --dry-run: the dry-run path scaffolds nothing and the
+  # daemon never tries to launch, so the engine binary presence is
+  # irrelevant for the planning surface. CI smoke tests + operators
+  # inspecting plans on a host where the engine is intentionally not
+  # installed (provisioning blueprint reviews) still get clean output.
+  if (( dry_run == 0 )) && (( force_engine_missing == 0 )); then
+    if ! bridge_resolve_engine_binary "$engine" >/dev/null 2>&1; then
+      bridge_die "engine CLI '$engine' not found on PATH. Install it (e.g. \`npm i -g @anthropic-ai/claude-code\` for claude, \`npm i -g @openai/codex\` for codex) OR set BRIDGE_ENGINE_PATH=/dir/with/$engine before retrying. If installed via nvm/pyenv, export NVM_DIR/PYENV_ROOT before invoking \`agent create\` so the daemon's non-login PATH picks it up. Last-resort override: rerun with \`--force-engine-missing\` (the agent will fail to launch until the engine is installed)."
+    fi
+  fi
 
   if [[ -z "$session_type" ]]; then
     case "$engine" in
@@ -3251,6 +3480,42 @@ report and reap test-fixture agents per their pattern."
       else
         bridge_layout_materialize_identity "$agent" "$engine" "$workdir"
       fi
+      # #1270 (v0.15.0-beta4 Lane G): the materializer's ``cp -f`` carried
+      # the controller's primary group + mode 0600 into the workdir's
+      # CLAUDE.md / SOUL.md / SESSION-TYPE.md / MEMORY*.md / engine
+      # entrypoint files. Every OTHER iso workdir file (.teams/.env,
+      # channel-state .env) lands at group=``ab-agent-<a>`` mode 0660 —
+      # the controller (a member of that group) reads them via group
+      # permission. Without the normalization below, controller-side
+      # grep on the materialized profile files emits ``Permission
+      # denied`` because the file's group is the controller's primary
+      # group AND mode 0600 strips the group read bit. Mirror the
+      # convention to the materialize fileset so the iso UID still owns
+      # the files but the controller can group-read them.
+      #
+      # NO-OP contract: the helper internally gates on
+      # ``bridge_isolation_v2_enforce`` (Linux only) and on a resolvable
+      # per-agent group; a shared-mode / non-linux-user agent skips
+      # silently.
+      #
+      # Issue #1332 L2 (v0.14.5-beta5-2 Lane ξ): the materializer above
+      # now performs per-file chgrp+chmod immediately after each ``cp -f``
+      # via ``bridge_isolation_v2_chgrp_file_iso_group`` so that each
+      # materialized file is iso-UID-readable atomically — closing the
+      # per-file race window where a concurrent iso-side reader could
+      # see ``Permission denied``. This BULK normalize stays as a final
+      # safety net (idempotent stat-skip), and it remains the sole
+      # normalize site for the upgrade-time backfill in
+      # ``lib/bridge-isolation-v2-workdir-backfill.sh``. The dual-pass
+      # contract is intentional: per-file inside materialize closes the
+      # tight loop race; the bulk pass here closes the tail-end gap
+      # (additional directories / .claude/ tree / known_marketplaces.json)
+      # that the per-file loop does not iterate over.
+      if [[ "$isolation_mode" == "linux-user" ]] \
+          && declare -F bridge_isolation_v2_normalize_workdir_profile_group >/dev/null 2>&1; then
+        bridge_isolation_v2_normalize_workdir_profile_group "$agent" "$workdir" \
+          >/dev/null 2>&1 || true
+      fi
     fi
     if [[ "$engine" == "claude" ]]; then
       # Issue #1151: thread $agent so the v2-isolation guard polarity fix
@@ -3388,6 +3653,25 @@ report and reap test-fixture agents per their pattern."
     if [[ "$engine" == "claude" ]]; then
       bridge_ensure_claude_first_run_config "$agent" "$workdir" >/dev/null 2>&1 || true
     fi
+    # #1252: state/agents/<a>/ MUST exist before this agent appears to
+    # operators as `create:ok`. The v2 matrix apply above is the
+    # canonical creator (root:ab-agent-<X> 2770); this is a synchronous
+    # belt-and-braces check that catches:
+    #   - non-v2 installs (matrix apply branch was skipped)
+    #   - matrix apply succeeded but the state-agent-dir row was
+    #     `degraded` (optional criticality demotion, e.g. shared-mode
+    #     on a fresh tree where the controller_group is unresolved)
+    #   - any other path where the dir is somehow absent post-create
+    #
+    # Self-heal is idempotent and silent on success; failure flips agent
+    # create to a hard fail so the operator never sees `create:ok` for
+    # an agent whose first nudge will silently drop. Routes through the
+    # same helper the daemon uses on the nudge hot path (lib/bridge-state.sh).
+    if command -v bridge_agent_state_dir_self_heal >/dev/null 2>&1; then
+      if ! bridge_agent_state_dir_self_heal "$agent"; then
+        bridge_die "agent create: cannot create state-agent-dir for '$agent' — daemon writes would fail and nudges would silently drop (#1252). Inspect parent permissions on '$BRIDGE_ACTIVE_AGENT_DIR' and retry, or 'agb agent delete $agent --force --purge-home' to roll back."
+      fi
+    fi
     # Issue #680: bridge-start.sh --dry-run is purely informational here — its
     # output is reprinted to the user as `start_dry_run:` for diagnostic
     # context. Letting its rc propagate via command-substitution + set -e
@@ -3487,6 +3771,32 @@ report and reap test-fixture agents per their pattern."
     trap - EXIT
   fi
 
+  # Beta20 L2 Variant 3A — refresh the daemon's supplementary groups so
+  # the new per-agent group becomes visible to bridge-send.sh --urgent
+  # writes / channel-readiness probes / Stop-hook idle-since checks. The
+  # refresh is non-fatal: an already-created agent stays created
+  # regardless of refresh result, and the rollback trap is already
+  # disarmed above so a refresh failure here CANNOT unwind the agent.
+  # Skipped on macOS, when the daemon isn't running, and when the daemon's
+  # /proc/<pid>/status Groups already contains the target GID. Status is
+  # surfaced via daemon_group_refresh / manual_command fields below.
+  local daemon_group_refresh_status=""
+  if [[ "$isolation_mode" == "linux-user" ]] \
+     && command -v bridge_daemon_refresh_after_group_membership_change >/dev/null 2>&1; then
+    local _v2_grp_for_refresh=""
+    if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+      _v2_grp_for_refresh="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_v2_grp_for_refresh" ]]; then
+      daemon_group_refresh_status="$(
+        bridge_daemon_refresh_after_group_membership_change \
+          --group "$_v2_grp_for_refresh" \
+          --reason "agent-create:$agent" \
+          2>/dev/null || true
+      )"
+    fi
+  fi
+
   if [[ $json_mode -eq 1 ]]; then
     # Issue #1093: derive the persisted-policy fields the same way the
     # writer does so the JSON envelope agrees with what landed on disk.
@@ -3510,7 +3820,8 @@ report and reap test-fixture agents per their pattern."
       "$agent" "$engine" "$session" "$workdir" "$profile_home" \
       "$launch_cmd" "$channels" "$BRIDGE_ROSTER_LOCAL_FILE" "$dry_run" \
       "$users_json" "$session_type" "$isolation_mode" "$os_user" \
-      "$_emit_idle_timeout" "$_emit_loop" "$always_on_intent"
+      "$_emit_idle_timeout" "$_emit_loop" "$always_on_intent" \
+      "$daemon_group_refresh_status"
     exit 0
   fi
 
@@ -3551,6 +3862,51 @@ report and reap test-fixture agents per their pattern."
     echo "dry_run: yes"
   else
     echo "create: ok"
+    # Beta20 L2 Variant 3A — surface refresh status + manual recovery
+    # path so the operator sees the wedge BEFORE attempting the next
+    # urgent-send/restart that would silently fall through to queue-only.
+    if [[ -n "$daemon_group_refresh_status" ]]; then
+      echo "daemon_group_refresh: $daemon_group_refresh_status"
+      case "$daemon_group_refresh_status" in
+        manual-required-sudoers)
+          echo ""
+          echo "[restart-required] daemon supplementary groups stale — automatic refresh failed: sudoers config absent or rejected."
+          echo "Run: agent-bridge init sudoers daemon-refresh --apply"
+          echo "Then retry: bash bridge-daemon.sh restart --force --internal-reason=group-refresh"
+          ;;
+        manual-required-sudo-refresh-no-gid)
+          echo ""
+          echo "[restart-required] daemon supplementary groups stale — sudo/PAM did not refresh groups on this host."
+          echo "Verify: sudo -n -u \"$(id -un)\" -H -- bash -c 'id -G'"
+          echo "Then run: bash bridge-daemon.sh restart --force"
+          ;;
+        failed-restart|failed-timeout)
+          echo ""
+          echo "[restart-required] daemon refresh failed ($daemon_group_refresh_status) — manual restart recommended."
+          echo "Run: bash bridge-daemon.sh restart --force"
+          ;;
+        manual-required-systemd-unit-stale)
+          echo ""
+          echo "[restart-required] systemd-user unit is active but its ExecStart is the legacy direct-bash shape — automatic supp-groups refresh would race Restart=always."
+          echo "Run: agent-bridge init sudoers daemon-refresh --apply"
+          echo "Then: bash scripts/install-daemon-systemd.sh --apply --enable --bridge-home \"\$BRIDGE_HOME\""
+          echo "Then retry the agent operation or run: systemctl --user restart agent-bridge-daemon.service"
+          ;;
+        manual-required-systemd-sudoers)
+          echo ""
+          echo "[restart-required] systemd-user unit is sudo-wrapped but the daemon-refresh sudoers drop-in is missing/rejecting — daemon cannot start."
+          echo "Run: agent-bridge init sudoers daemon-refresh --apply"
+          echo "Then: systemctl --user restart agent-bridge-daemon.service"
+          ;;
+        failed-systemctl-restart|failed-systemd-refresh-no-gid)
+          echo ""
+          echo "[restart-required] systemd-driven daemon refresh failed ($daemon_group_refresh_status) — supp-groups still stale."
+          echo "Run: systemctl --user restart agent-bridge-daemon.service"
+          echo "If groups still stale after restart, regenerate the unit:"
+          echo "  bash scripts/install-daemon-systemd.sh --apply --enable --bridge-home \"\$BRIDGE_HOME\""
+          ;;
+      esac
+    fi
     echo "start_dry_run: $start_dry_run_status"
     echo "$start_dry_run"
     echo "next_steps:"
@@ -3576,6 +3932,20 @@ report and reap test-fixture agents per their pattern."
 run_update() {
   local agent="${1:-}"
   shift || true
+
+  # Issue #1236: short-circuit `--help`/`-h`/`help` BEFORE the positional
+  # <agent> binding so `agent-bridge agent update --help` prints usage
+  # instead of treating `--help` as the agent id and falling into the
+  # registry-list error path (universal help gate KNOWN_BROKEN_VERBS row
+  # for "agent update"). Mirrors run_create's pre-bind short-circuit
+  # (issue #526).
+  case "$agent" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+  esac
+
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") update <agent> [...]"
   bridge_require_agent "$agent"
 
@@ -3623,6 +3993,18 @@ run_update() {
   # produces a searchable audit receipt).
   local always_on_intent=""
   local always_on_no_present=0
+  # Issue #1235 scratchpads for the --channels / --channels-set /
+  # --channels-add / --channels-remove auto-qualify path (set -u safe).
+  local _channels_normalized=""
+  local _channels_token=""
+  # Issue #1234 (Lane δ): explicit daemon auto-start policy. Operator picks
+  # "hold" to suppress the warm always-on autostart loop while channel setup
+  # is intentionally incomplete; "auto" restores default behavior. Persisted
+  # to BRIDGE_AGENT_START_POLICY (associative array — never scalar, refs
+  # #1213). Tri-state presence + value mirrors the other typed flags so the
+  # writer only emits when the operator actually touched the policy.
+  local start_policy_present=0
+  local start_policy_value=""
 
   add_launch_cmd_op() {
     launch_cmd_ops+="$1"$'\t'"$2"$'\n'
@@ -3699,27 +4081,46 @@ run_update() {
         add_launch_cmd_op "remove-dev-channel" "$2"
         shift 2
         ;;
-      --channels-set)
+      --channels|--channels-set)
+        # Issue #1235 gap (1): `agent create` accepts `--channels`; the
+        # update parser only accepted `--channels-set`. Operators trip on
+        # the asymmetry during routine "trim channels on this agent"
+        # flows. Accept `--channels` as an alias for `--channels-set` so
+        # both verbs share the same flag surface.
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        # Per-token plugin:NAME@SPEC validation on the CSV (codex r1
-        # finding 4). Allow trailing-comma tolerance and skip empty
-        # entries, but reject any non-empty token that fails the shape.
-        bridge_agent_update_validate_channels_csv "--channels-set" "$2"
+        # Issue #1235 gap (2): `agent create --channels` auto-suffixes
+        # un-qualified shorthand (per #1221) via bridge_normalize_channels_csv,
+        # but the update-side `--channels-set` ran token-shape validation
+        # against the RAW input — `plugin:teams` (no `@SPEC`) hit
+        # `bridge_die "token invalid"` instead of resolving to
+        # `plugin:teams@agent-bridge` via the canonical builtin table.
+        # Normalize FIRST through the same helper create uses, then run
+        # the shape validator on the normalized form. Trailing-comma
+        # tolerance + per-token whitespace stripping is preserved by the
+        # normalizer (it skips empty chunks).
+        _channels_normalized="$(bridge_normalize_channels_csv "$2")"
+        bridge_agent_update_validate_channels_csv "$1" "$_channels_normalized"
         channels_set_present=1
-        channels_set_value="$2"
-        add_channels_op "channels-set" "$2"
+        channels_set_value="$_channels_normalized"
+        add_channels_op "channels-set" "$_channels_normalized"
         shift 2
         ;;
       --channels-add)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        bridge_agent_update_validate_channel_token "--channels-add" "$2"
-        add_channels_op "channels-add" "$2"
+        # Issue #1235 gap (2) for single-token forms: qualify the token
+        # via bridge_qualify_channel_item so the shorthand `plugin:teams`
+        # resolves to `plugin:teams@agent-bridge` before validation, matching
+        # the create-side semantics.
+        _channels_token="$(bridge_qualify_channel_item "$2")"
+        bridge_agent_update_validate_channel_token "--channels-add" "$_channels_token"
+        add_channels_op "channels-add" "$_channels_token"
         shift 2
         ;;
       --channels-remove)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        bridge_agent_update_validate_channel_token "--channels-remove" "$2"
-        add_channels_op "channels-remove" "$2"
+        _channels_token="$(bridge_qualify_channel_item "$2")"
+        bridge_agent_update_validate_channel_token "--channels-remove" "$_channels_token"
+        add_channels_op "channels-remove" "$_channels_token"
         shift 2
         ;;
       --json)
@@ -3851,6 +4252,22 @@ run_update() {
           *)   bridge_die "--continue 는 on|off 만 가능합니다: $2" ;;
         esac
         continue_present=1
+        mutation_present=1
+        shift 2
+        ;;
+      --start-policy)
+        # Issue #1234 (Lane δ): daemon auto-start policy. Closed value
+        # space (hold|auto); the daemon's always-on autostart loop reads
+        # via bridge_agent_start_policy which normalizes unset/unknown to
+        # "auto", so the writer only emits when the operator explicitly
+        # set the value. Validate at parse time so a bad write never lands.
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        case "$2" in
+          hold|auto) ;;
+          *) bridge_die "--start-policy 는 hold|auto 만 가능합니다: $2" ;;
+        esac
+        start_policy_present=1
+        start_policy_value="$2"
         mutation_present=1
         shift 2
         ;;
@@ -3993,6 +4410,12 @@ run_update() {
           always_on_no)  printf 'always_on=no\n' ;;
         esac
       fi
+      # Issue #1234 (Lane δ): surface --start-policy hold|auto verbatim so
+      # audit-log readers see policy-flip events without joining on the
+      # before/after fields.
+      if [[ $start_policy_present -eq 1 ]]; then
+        printf 'start_policy=%s\n' "$start_policy_value"
+      fi
     } | tr '\n' ',' | sed 's/,$//'
   )"
 
@@ -4052,17 +4475,9 @@ run_update() {
     bridge_die "deny: $deny_reason"
   fi
 
-  # Compute the new launch_cmd value.
-  local new_launch_cmd="$before_launch_cmd"
-  local launch_actions_json="[]"
-  if [[ -n "$launch_cmd_ops" ]]; then
-    local lc_output
-    lc_output="$(printf '%s' "$launch_cmd_ops" | bridge_agent_update_apply_launch_cmd "$before_launch_cmd")"
-    new_launch_cmd="$(printf '%s\n' "$lc_output" | sed -n '1p')"
-    launch_actions_json="$(printf '%s\n' "$lc_output" | sed -n '2p')"
-  fi
-
-  # Compute the new channels CSV value.
+  # Compute the new channels CSV value FIRST so the launch_cmd
+  # reconciliation pass below can derive the dev-channel diff against
+  # the post-mutation channel set.
   local new_channels="$before_channels"
   local channels_actions_json="[]"
   if [[ -n "$channels_ops" ]]; then
@@ -4070,6 +4485,66 @@ run_update() {
     ch_output="$(printf '%s' "$channels_ops" | bridge_agent_update_apply_channels "$before_channels")"
     new_channels="$(printf '%s\n' "$ch_output" | sed -n '1p')"
     channels_actions_json="$(printf '%s\n' "$ch_output" | sed -n '2p')"
+  fi
+
+  # Issue #1235 gap (3): when the operator mutates the channel set via
+  # `--channels` / `--channels-set` / `--channels-add` / `--channels-remove`,
+  # any dev-channel CSV flags (`--dangerously-load-development-channels`)
+  # in the existing launch_cmd that correspond to dropped channels become
+  # orphans — the next `agent start` would silently re-load the removed
+  # channels via the CLI flag and defeat the channel-set update. The
+  # operator previously had to chase each orphan with a second
+  # `agent update --launch-cmd-remove-dev-channel <spec>` pass.
+  #
+  # Reconcile automatically by computing the dev-channel diff between
+  # `before_channels` and `new_channels` (both filtered to non-official
+  # plugin channels via bridge_filter_development_channels_csv) and
+  # appending the corresponding `remove-dev-channel <spec>` /
+  # `add-dev-channel <spec>` ops to the launch_cmd op stream. The
+  # applier already enforces idempotency, so if the operator also passed
+  # an explicit `--launch-cmd-add-dev-channel` for one of these specs
+  # (e.g. a channel they declared via --channels), the reconciliation
+  # add will no-op.
+  if [[ -n "$channels_ops" ]]; then
+    local _before_dev _after_dev _dev_item
+    _before_dev="$(bridge_filter_development_channels_csv "$before_channels")"
+    _after_dev="$(bridge_filter_development_channels_csv "$new_channels")"
+    # Removed dev channels (present before, absent after) → emit remove ops.
+    if [[ -n "$_before_dev" ]]; then
+      local -a _before_dev_items=()
+      IFS=',' read -r -a _before_dev_items <<<"$_before_dev"
+      for _dev_item in "${_before_dev_items[@]}"; do
+        _dev_item="$(bridge_trim_whitespace "$_dev_item")"
+        [[ -n "$_dev_item" ]] || continue
+        if ! bridge_channel_csv_contains "$_after_dev" "$_dev_item"; then
+          add_launch_cmd_op "remove-dev-channel" "$_dev_item"
+        fi
+      done
+    fi
+    # Added dev channels (absent before, present after) → emit add ops.
+    if [[ -n "$_after_dev" ]]; then
+      local -a _after_dev_items=()
+      IFS=',' read -r -a _after_dev_items <<<"$_after_dev"
+      for _dev_item in "${_after_dev_items[@]}"; do
+        _dev_item="$(bridge_trim_whitespace "$_dev_item")"
+        [[ -n "$_dev_item" ]] || continue
+        if ! bridge_channel_csv_contains "$_before_dev" "$_dev_item"; then
+          add_launch_cmd_op "add-dev-channel" "$_dev_item"
+        fi
+      done
+    fi
+  fi
+
+  # Compute the new launch_cmd value (now reflects both the operator's
+  # explicit launch_cmd mutations AND the auto-reconciliation ops queued
+  # above).
+  local new_launch_cmd="$before_launch_cmd"
+  local launch_actions_json="[]"
+  if [[ -n "$launch_cmd_ops" ]]; then
+    local lc_output
+    lc_output="$(printf '%s' "$launch_cmd_ops" | bridge_agent_update_apply_launch_cmd "$before_launch_cmd")"
+    new_launch_cmd="$(printf '%s\n' "$lc_output" | sed -n '1p')"
+    launch_actions_json="$(printf '%s\n' "$lc_output" | sed -n '2p')"
   fi
 
   # Merge actions arrays for the result envelope + audit row.
@@ -4091,6 +4566,7 @@ PY
   # below recognises a repeated `--idle-timeout` as `changed=false`.
   local before_desc before_engine before_workdir before_loop before_continue before_class
   local before_idle_timeout
+  local before_start_policy
   before_desc="$(bridge_agent_desc "$agent")"
   before_engine="$(bridge_agent_engine "$agent")"
   before_workdir="$(bridge_agent_workdir "$agent")"
@@ -4098,6 +4574,11 @@ PY
   before_continue="$(bridge_agent_continue "$agent")"
   before_class="$(bridge_agent_class "$agent")"
   before_idle_timeout="$(bridge_agent_idle_timeout "$agent")"
+  # Issue #1234 (Lane δ): capture pre-mutation start_policy value so the
+  # change-detection and audit row reflect the policy delta. The reader
+  # defaults to "auto" for unset agents so a first-time --start-policy hold
+  # write always trips `changed=true`.
+  before_start_policy="$(bridge_agent_start_policy "$agent")"
   # Issue #1093: detect real configured-ness from the roster FILE rather
   # than the in-memory map. bridge-state.sh:1236 backfills
   # BRIDGE_AGENT_IDLE_TIMEOUT for every loaded agent to the default 0, so
@@ -4115,6 +4596,15 @@ PY
   if [[ -f "$roster_path" ]] && grep -qF "BRIDGE_AGENT_IDLE_TIMEOUT[\"${agent}\"]=" "$roster_path"; then
     before_idle_timeout_configured=1
   fi
+  # Issue #1234 (Lane δ): same file-grep pattern for the start_policy line so
+  # the writer/audit/no-op short-circuit can distinguish "default (auto via
+  # reader fallback)" from "explicitly persisted auto". A first-time write
+  # to --start-policy hold trips configured=0→1, which the writer needs to
+  # emit the new BRIDGE_AGENT_START_POLICY assignment line.
+  local before_start_policy_configured=0
+  if [[ -f "$roster_path" ]] && grep -qF "BRIDGE_AGENT_START_POLICY[\"${agent}\"]=" "$roster_path"; then
+    before_start_policy_configured=1
+  fi
 
   local new_desc="$before_desc"
   local new_engine="$before_engine"
@@ -4124,6 +4614,8 @@ PY
   local new_class="$before_class"
   local new_idle_timeout="$before_idle_timeout"
   local new_idle_timeout_configured="$before_idle_timeout_configured"
+  local new_start_policy="$before_start_policy"
+  local new_start_policy_configured="$before_start_policy_configured"
   [[ $desc_present -eq 1 ]]         && new_desc="$desc_value"
   [[ $engine_present -eq 1 ]]       && new_engine="$engine_value"
   [[ $workdir_present -eq 1 ]]      && new_workdir="$workdir_value"
@@ -4133,6 +4625,10 @@ PY
   if [[ $idle_timeout_present -eq 1 ]]; then
     new_idle_timeout="$idle_timeout_value"
     new_idle_timeout_configured=1
+  fi
+  if [[ $start_policy_present -eq 1 ]]; then
+    new_start_policy="$start_policy_value"
+    new_start_policy_configured=1
   fi
 
   local changed=0
@@ -4145,7 +4641,9 @@ PY
         || "$new_continue" != "$before_continue" \
         || "$new_class" != "$before_class" \
         || "$new_idle_timeout" != "$before_idle_timeout" \
-        || "$new_idle_timeout_configured" != "$before_idle_timeout_configured" ]]; then
+        || "$new_idle_timeout_configured" != "$before_idle_timeout_configured" \
+        || "$new_start_policy" != "$before_start_policy" \
+        || "$new_start_policy_configured" != "$before_start_policy_configured" ]]; then
     changed=1
   fi
 
@@ -4207,6 +4705,30 @@ PY
     if [[ "$new_idle_timeout_configured" == "1" ]]; then
       idle_timeout_writer_arg="$new_idle_timeout"
     fi
+    # Issue #1234 (Lane δ): positional 22 carries the post-mutation
+    # start_policy value. Empty → writer omits the BRIDGE_AGENT_START_POLICY
+    # line (preserves byte-identical emission for updates that don't touch
+    # the policy). Configured-bit drives the explicit-emit decision so the
+    # default "auto" reading is implicit (line absent) and the persisted
+    # "auto" reading is explicit (line present, value "auto").
+    local start_policy_writer_arg=""
+    if [[ "$new_start_policy_configured" == "1" ]]; then
+      start_policy_writer_arg="$new_start_policy"
+    fi
+    # Issue #1251 codex r1 finding 1: capture the LAST-KNOWN-GOOD
+    # managed block BEFORE the writer mutates the roster. The snapshot
+    # lives at `state/agents/<a>/restart.snapshot.pre-update.<ts>` and
+    # is consumed by a subsequent `agent restart` whose post-mutation
+    # launch fails — without it, `run_restart`'s at-entry snapshot
+    # would capture the ALREADY-FAILING config (the mutation already
+    # landed) and the rollback would restore the broken config in place
+    # of the broken config. Best-effort: a snapshot failure does NOT
+    # abort the update — the prior behavior (no snapshot at all) was
+    # the baseline and the worst case is the rollback path falls back
+    # to the at-entry snapshot.
+    if command -v bridge_agent_restart_snapshot_pre_update >/dev/null 2>&1; then
+      bridge_agent_restart_snapshot_pre_update "$agent" >/dev/null 2>&1 || true
+    fi
     bridge_write_role_block \
       "$agent" \
       "$new_desc" \
@@ -4228,7 +4750,8 @@ PY
       "1" \
       "$new_class" \
       "$loop_explicit_off_arg" \
-      "$idle_timeout_writer_arg" >/dev/null
+      "$idle_timeout_writer_arg" \
+      "$start_policy_writer_arg" >/dev/null
     after_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
 
     # Issue #989: bridge_write_role_block just rewrote the roster file —
@@ -4346,6 +4869,13 @@ PY
   if [[ -n "$audit_before_loop" || -n "$audit_after_loop" ]]; then
     printf 'before_loop: %s\n' "$audit_before_loop"
     printf 'after_loop: %s\n' "$audit_after_loop"
+  fi
+  # Issue #1234 (Lane δ): surface start_policy delta in plain-text output
+  # when the mutation touched it. Same suppression rule as idle_timeout /
+  # loop: lines stay absent when the policy was not part of this update.
+  if [[ $start_policy_present -eq 1 || "$new_start_policy" != "$before_start_policy" ]]; then
+    printf 'before_start_policy: %s\n' "$before_start_policy"
+    printf 'after_start_policy: %s\n' "$new_start_policy"
   fi
   printf 'before_sha: %s\n' "$before_sha"
   printf 'after_sha: %s\n' "$after_sha"
@@ -4651,6 +5181,24 @@ PY
     local _delete_os_user
     _delete_os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
     bridge_isolation_v2_reap_isolated_agent_account "$agent" "$_delete_os_user"
+
+    # Beta20 L2 Variant 3A — stale-extra-gid cleanup. The deleted agent's
+    # per-agent group has been reaped, but the running daemon's
+    # supplementary set still contains the now-stale GID. Refresh so
+    # subsequent agent-create on a same-named slot reads a clean group
+    # set; non-critical for the add-side bug but tidies the symptom for
+    # heavy churn workflows.
+    if command -v bridge_daemon_refresh_after_group_membership_change >/dev/null 2>&1 \
+       && command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+      local _v2_grp_for_delete_refresh
+      _v2_grp_for_delete_refresh="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+      if [[ -n "$_v2_grp_for_delete_refresh" ]]; then
+        bridge_daemon_refresh_after_group_membership_change \
+          --group "$_v2_grp_for_delete_refresh" \
+          --reason "agent-delete:$agent" \
+          >/dev/null 2>&1 || true
+      fi
+    fi
   fi
 
   if [[ $purge_crons -eq 1 ]]; then
@@ -5305,6 +5853,20 @@ run_restart() {
     bridge_die "$(bridge_agent_restart_preflight_guidance "$agent" "$preflight_reason")"
   fi
 
+  # Issue #1251 Phase 1: full pre-flight runs BEFORE the kill so any
+  # "cannot start with current config" failure leaves the running
+  # session intact. This covers the issue trace's case (unseeded plugin
+  # spec in BRIDGE_AGENT_CHANNELS): without this gate, the legacy
+  # preflight passes (channels-runtime-status check), the kill fires,
+  # `bridge-start.sh` reaches `bridge_ensure_claude_plugin_enabled`, the
+  # iso-v2 manifest guard fires `bridge_die`, the new launch never
+  # happens, and the agent ends up stopped.
+  local full_preflight_reason=""
+  full_preflight_reason="$(bridge_agent_restart_preflight_full_reason "$agent")"
+  if [[ -n "$full_preflight_reason" ]]; then
+    bridge_die "$(bridge_agent_restart_preflight_full_guidance "$agent" "$full_preflight_reason")"
+  fi
+
   # #256 Gap 2: clear the rapid-fail quarantine marker only after the
   # dry-run short-circuit (handled above) and the preflight guidance
   # check have both allowed the restart to proceed. An aborted restart
@@ -5328,6 +5890,31 @@ run_restart() {
   local resume_session_snapshot=""
   resume_session_snapshot="$(bridge_agent_session_id "$agent" 2>/dev/null || true)"
 
+  # Issue #1251 Phase 2 entry: pick the rollback snapshot + write the
+  # in-progress marker BEFORE the kill. The marker is the Lane C2
+  # (#1254) contract for watchdog drift suppression; the snapshot is the
+  # rollback target. Both artifacts live under state/agents/<a>/.
+  #
+  # Snapshot selection (codex r1 finding 1): prefer a `pre-update`
+  # snapshot captured by `run_update` before the roster mutation — that
+  # is the LAST-KNOWN-GOOD config. Production ordering is operator runs
+  # `agent update --channels-add <new>` (which writes the pre-update
+  # snapshot + mutates the roster), THEN runs `agent restart`. By the
+  # time we enter `run_restart` the roster already holds the failing
+  # update — an at-entry snapshot would capture that failing state and
+  # the rollback would restore broken-over-broken. Fall back to the
+  # at-entry snapshot only when no pre-update one is available (e.g.
+  # operator hit restart directly without a prior update, in which case
+  # the at-entry snapshot IS the last-known-good).
+  local restart_snapshot=""
+  restart_snapshot="$(bridge_agent_restart_find_pre_update_snapshot "$agent" 2>/dev/null || true)"
+  if [[ -z "$restart_snapshot" ]]; then
+    restart_snapshot="$(bridge_agent_restart_snapshot_managed_block "$agent" 2>/dev/null || true)"
+  fi
+  bridge_agent_restart_marker_write "$agent" "$$" \
+    "${BRIDGE_AGENT_RESTART_MARKER_TTL:-60}" "in_progress" "" \
+    >/dev/null 2>&1 || true
+
   if bridge_tmux_session_exists "$session"; then
     bridge_kill_agent_session "$agent"
     bridge_refresh_runtime_state
@@ -5337,6 +5924,10 @@ run_restart() {
   fi
 
   if [[ $attach_mode -eq 1 ]]; then
+    # Attach mode hands off to bridge-start.sh via exec; clear marker
+    # before the handoff because we can no longer manage its lifecycle
+    # from this PID after exec. The operator's terminal owns the result.
+    bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
     exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --replace "${start_args[@]}"
   fi
 
@@ -5344,11 +5935,68 @@ run_restart() {
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --replace "${start_args[@]}"
   }
 
+  # Issue #1251 Phase 2 rollback helper. Invoked when a post-kill launch
+  # step fails. Restores the managed block from snapshot, attempts a
+  # second `restart_once` against the (now-restored) prior config, and
+  # records the outcome in the marker so Lane C2 (#1254) + the operator
+  # can audit what happened.
+  #
+  # Args:
+  #   $1 — reason fragment (e.g. "launch-failed", "verify-failed")
+  #   $2 — detail string for the marker reason field
+  # Returns 0 when rollback succeeded and re-launched on prior config,
+  # 1 when the rollback itself failed (agent left stopped).
+  restart_rollback() {
+    local rb_kind="${1:-launch-failed}"
+    local rb_detail="${2:-restart failed mid-flight}"
+
+    # Mark the marker with rolled_back state up-front so a watchdog tick
+    # that races the rollback's restart_once sees the terminal state
+    # instead of the still-in-progress flag. The reason field carries
+    # both the kind (machine-readable) and detail (operator-readable).
+    bridge_agent_restart_marker_write "$agent" "$$" \
+      "${BRIDGE_AGENT_RESTART_MARKER_TTL:-60}" "rolled_back" \
+      "$rb_kind: $rb_detail" \
+      >/dev/null 2>&1 || true
+
+    if [[ -z "$restart_snapshot" || ! -f "$restart_snapshot" ]]; then
+      bridge_warn "[restart] no snapshot available for '$agent' — agent left stopped (rollback target unknown). Underlying failure: $rb_kind: $rb_detail"
+      return 1
+    fi
+
+    if ! bridge_agent_restart_restore_managed_block "$agent" "$restart_snapshot" 2>/dev/null; then
+      bridge_warn "[restart] rollback failed for '$agent' — managed block could not be restored from snapshot ($restart_snapshot). Agent left stopped. Underlying failure: $rb_kind: $rb_detail"
+      return 1
+    fi
+
+    # Re-load roster + clear the in-memory caches so the second
+    # restart_once sees the restored config.
+    bridge_load_roster >/dev/null 2>&1 || true
+
+    bridge_warn "[restart] failed and rolled back to prior config for '$agent' — see $rb_kind: $rb_detail"
+
+    if ! restart_once; then
+      bridge_warn "[restart] rollback re-launch also failed for '$agent' — agent left stopped. Underlying failure: $rb_kind: $rb_detail"
+      return 1
+    fi
+
+    # Rollback path success — leave the marker in place with state=
+    # rolled_back so the audit trail survives. The snapshot itself is
+    # removed (it has served its purpose) but the marker persists until
+    # the next successful restart calls marker_clear.
+    rm -f "$restart_snapshot" 2>/dev/null || true
+    return 0
+  }
+
   if ! restart_once; then
+    restart_rollback "launch-failed" "bridge-start.sh exited non-zero" || true
     return 1
   fi
 
   if [[ "$engine" != "claude" ]]; then
+    # Issue #1251: success path — clear the marker + snapshot so Lane C2
+    # (#1254 watchdog) does not treat a stale marker as an active restart.
+    bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
     return 0
   fi
 
@@ -5363,6 +6011,10 @@ run_restart() {
   # during incident triage (issue #542).
   if [[ "${BRIDGE_SKIP_RESTART_PLUGIN_LIVENESS:-0}" == "1" ]]; then
     bridge_warn "BRIDGE_SKIP_RESTART_PLUGIN_LIVENESS=1; skipping restart-internal plugin MCP liveness verifier for '$agent'."
+    # Issue #1251: kill-switch path is still "restart completed from the
+    # operator's perspective" — clear the marker so a watchdog tick does
+    # not enqueue drift on a no-verify happy path.
+    bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
     return 0
   fi
 
@@ -5374,6 +6026,8 @@ run_restart() {
   # every plugin bun was alive. Align with the daemon's steady-state
   # liveness check so the two signals no longer disagree.
   if bridge_tmux_wait_for_claude_plugin_mcp_alive "$agent" "$verify_timeout"; then
+    # Issue #1251: success path — clear the marker + snapshot.
+    bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
     return 0
   fi
 
@@ -5401,14 +6055,30 @@ run_restart() {
       fi
     fi
     if ! restart_once; then
+      # Issue #1251: launch failed during the verify-retry loop, AFTER the
+      # in-loop kill above. Attempt rollback to the snapshot so the agent
+      # is not left stopped on a transient verify-then-launch failure.
+      restart_rollback "verify-retry-launch-failed" "restart_once exited non-zero during verify retry attempt $verify_attempts/$verify_max_attempts" || true
       return 1
     fi
     if bridge_tmux_wait_for_claude_plugin_mcp_alive "$agent" "$verify_timeout"; then
+      # Issue #1251: success path on a verify-retry — clear the marker.
+      bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
       return 0
     fi
   done
 
   bridge_warn "Claude plugin MCP liveness still missing after ${verify_max_attempts} attempts for '$agent'. Leaving the session alive so the daemon's next cycle can re-check (avoids the plugin-port death loop from issue #69)."
+  # Issue #1251: verify exhausted but session is alive — record the
+  # outcome as rolled_back state on the marker so Lane C2 can surface
+  # the structured cause instead of falling through to a generic drift.
+  # Do NOT call restart_rollback here: the session IS running (just
+  # without MCP liveness), so restoring a snapshot would unnecessarily
+  # restart the agent again. The marker write is the audit breadcrumb.
+  bridge_agent_restart_marker_write "$agent" "$$" \
+    "${BRIDGE_AGENT_RESTART_MARKER_TTL:-60}" "rolled_back" \
+    "verify-failed: plugin MCP liveness missing after $verify_max_attempts attempts (session left alive — see issue #69)" \
+    >/dev/null 2>&1 || true
   return 1
 }
 
@@ -5615,12 +6285,18 @@ Operator note: $note"
   actor="$(bridge_admin_agent_id)"
   [[ -n "$actor" ]] || actor="bridge-admin"
 
+  # Issue #1318 part A (v0.14.5-beta5-2 Lane ξ): admin-driven compact /
+  # handoff is dispatched intentionally against a possibly-stopped agent
+  # — the task will be consumed when the agent restarts. Use --force to
+  # bypass the active-state refuse check that protects the unsuspecting
+  # interactive `agb task create` flow.
   "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-task.sh" create \
     --to "$agent" \
     --from "$actor" \
     --priority high \
     --title "$title" \
-    --body "$body" >/dev/null
+    --body "$body" \
+    --force >/dev/null
 
   bridge_audit_log "$actor" "$audit_action" "$agent" \
     --detail via=bridge-primitive \
@@ -5741,6 +6417,11 @@ case "$subcommand" in
   show)
     run_show "$@"
     ;;
+  describe)
+    # v0.15.0-beta1 Lane I: read-only getter for BRIDGE_AGENT_DESC[<agent>].
+    # See docs/agent-runtime/admin-agent-convention.md.
+    run_describe "$@"
+    ;;
   reclassify)
     run_reclassify "$@"
     ;;
@@ -5783,7 +6464,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create update delete retire list registry show reclassify doctor rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
+      "create update delete retire list registry show describe reclassify doctor rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;

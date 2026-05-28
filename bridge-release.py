@@ -15,6 +15,21 @@ from typing import Any
 
 
 SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+# Issue #1267 (v0.15.0-beta4 Lane J): the strict SEMVER_RE does not match
+# prerelease tags like "0.15.0-beta3" → parse_semver returns None for the
+# installed side, which made `release_record` flip `update_available=True`
+# whenever the operator was on a beta. That produced redundant "[release]
+# v0.14.4 available" downgrade prompts in the admin's inbox after every
+# beta install. SEMVER_PRERELEASE_RE captures the leading core version
+# AND the prerelease/build suffix so `release_record` can order beta vs
+# stable correctly per semver 2.0.0:
+#   1.0.0-alpha < 1.0.0-alpha.1 < 1.0.0-beta < 1.0.0-rc.1 < 1.0.0
+# i.e. a beta of the same core IS upgradable to the corresponding stable
+# (Lane J r2 fix — r1 used core-only compare which treated
+# 0.14.5-beta1 vs 0.14.5 as "already ahead" and emitted
+# release_notification_downgrade_skip on a legitimate beta→stable
+# upgrade).
+SEMVER_PRERELEASE_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$")
 
 
 def now_iso() -> str:
@@ -28,6 +43,175 @@ def parse_semver(text: str | None) -> tuple[int, int, int] | None:
     if not match:
         return None
     return tuple(int(part) for part in match.groups())
+
+
+def parse_semver_core(text: str | None) -> tuple[int, int, int] | None:
+    """Like parse_semver but tolerates prerelease/build suffixes.
+
+    Returns the (major, minor, patch) tuple for the leading core version,
+    ignoring anything after `-` or `+`. Kept for back-compat (used by the
+    deprecated core-only comparison path); new code should use
+    :func:`parse_semver_full` which also captures the prerelease suffix.
+    """
+    if not text:
+        return None
+    match = SEMVER_PRERELEASE_RE.fullmatch(text.strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups()[:3])
+
+
+_UNDOTTED_PRERELEASE_RE = re.compile(r"^([A-Za-z]+)(\d+)$")
+
+
+def _normalize_prerelease_identifier(ident: str) -> str:
+    """Normalize an undotted prerelease identifier into canonical dot form.
+
+    Project tags use the undotted form ``betaN`` / ``rcN`` / ``alphaN``
+    (e.g. ``v0.14.5-beta9``, ``v0.15.0-beta10``). Strict SemVer 2.0.0
+    §11 splits prerelease on dots and compares each identifier; an
+    identifier is "numeric" iff it parses as a base-10 integer. ``beta9``
+    and ``beta10`` are both alphanumeric (letters + digits) and compare
+    **lexically** — making ``beta10 < beta9`` ("1" < "9").
+
+    The fix is to rewrite ``letter-run + digit-run`` identifiers into
+    ``letters.digits`` BEFORE comparison so the digit run becomes a
+    numeric identifier and orders numerically (``beta.9 < beta.10``).
+
+    Codex r2 BLOCKING repros at HEAD ``2a4b926`` confirmed the
+    regression:
+      0.14.5-beta9  vs v0.14.5-beta10 → update_available=false (WRONG)
+      0.15.0-beta2  vs v0.15.0-beta10 → same wrong-direction false-no-update
+
+    CHANGELOG.md documents both ``v0.14.5-beta9`` and ``v0.14.5-beta10``
+    as actual tags, so this is not hypothetical.
+
+    Examples::
+
+        _normalize_prerelease_identifier("beta9")  == "beta.9"
+        _normalize_prerelease_identifier("beta10") == "beta.10"
+        _normalize_prerelease_identifier("rc1")    == "rc.1"
+        _normalize_prerelease_identifier("alpha2") == "alpha.2"
+        _normalize_prerelease_identifier("beta")   == "beta"      # no digits → untouched
+        _normalize_prerelease_identifier("beta.3") == "beta.3"    # already dotted → untouched
+        _normalize_prerelease_identifier("9")      == "9"         # pure numeric → untouched
+    """
+    m = _UNDOTTED_PRERELEASE_RE.match(ident)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    return ident
+
+
+def _normalize_prerelease(prerelease: str) -> str:
+    """Apply :func:`_normalize_prerelease_identifier` to each dot-split
+    identifier in ``prerelease`` and rejoin. Empty input → empty output."""
+    if not prerelease:
+        return prerelease
+    return ".".join(
+        _normalize_prerelease_identifier(p) for p in prerelease.split(".")
+    )
+
+
+def parse_semver_full(text: str | None) -> tuple[tuple[int, int, int], str] | None:
+    """Parse ``text`` into ``(core_tuple, prerelease_str)``.
+
+    Returns ``None`` when the input does not look like ``MAJOR.MINOR.PATCH``
+    (optionally with ``-prerelease`` / ``+build``). Build metadata is
+    discarded per semver 2.0.0 (build metadata MUST be ignored when
+    determining precedence). Prerelease defaults to the empty string,
+    which signals "final" — i.e. higher precedence than any prerelease
+    of the same core.
+
+    Lane J r3 (codex r2 BLOCKING): project tags use the undotted
+    ``betaN``/``rcN``/``alphaN`` form (``v0.14.5-beta10``). We normalize
+    each identifier in the prerelease suffix into the canonical dotted
+    form (``beta.10``) before returning so downstream
+    :func:`_compare_prerelease_identifiers` sees the digit run as a
+    numeric identifier and orders ``beta.9 < beta.10`` correctly.
+
+    Examples:
+        parse_semver_full("0.15.0")          == ((0, 15, 0), "")
+        parse_semver_full("0.14.5-beta1")    == ((0, 14, 5), "beta.1")
+        parse_semver_full("v0.14.5-beta.11") == ((0, 14, 5), "beta.11")
+        parse_semver_full("v0.14.5-beta10")  == ((0, 14, 5), "beta.10")
+    """
+    if not text:
+        return None
+    match = SEMVER_PRERELEASE_RE.fullmatch(text.strip())
+    if not match:
+        return None
+    major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
+    prerelease = _normalize_prerelease(match.group(4) or "")
+    return ((major, minor, patch), prerelease)
+
+
+def _compare_prerelease_identifiers(a: str, b: str) -> int:
+    """Compare two prerelease strings per semver 2.0.0 §11.
+
+    Identifiers are dot-separated. Numeric identifiers compare
+    numerically and have lower precedence than alphanumeric ones. A
+    smaller set of identifiers (when all preceding ones equal) has
+    lower precedence. Returns -1/0/+1.
+
+    Caller MUST handle the "one side has no prerelease" case before
+    calling this (that is the "final > prerelease" semver rule and is
+    NOT expressible as a pure identifier compare).
+    """
+    a_parts = a.split(".") if a else []
+    b_parts = b.split(".") if b else []
+    for ai, bi in zip(a_parts, b_parts):
+        a_is_num = ai.isdigit()
+        b_is_num = bi.isdigit()
+        if a_is_num and b_is_num:
+            an, bn = int(ai), int(bi)
+            if an != bn:
+                return -1 if an < bn else 1
+            continue
+        if a_is_num and not b_is_num:
+            # numeric < alphanumeric
+            return -1
+        if not a_is_num and b_is_num:
+            return 1
+        if ai != bi:
+            return -1 if ai < bi else 1
+    # All shared identifiers equal — the side with more identifiers wins.
+    if len(a_parts) == len(b_parts):
+        return 0
+    return -1 if len(a_parts) < len(b_parts) else 1
+
+
+def compare_semver(installed: str | None, latest: str | None) -> int | None:
+    """Full semver 2.0.0 comparator. Returns -1/0/+1 or ``None`` when
+    either side is unparseable.
+
+    Used by both ``release_record`` (decide ``update_available``) and
+    ``bridge-daemon-helpers.py:cmd_release_downgrade_classify`` (decide
+    whether to emit ``release_notification_downgrade_skip``). They MUST
+    agree, otherwise a beta→stable upgrade like ``0.14.5-beta1`` vs
+    ``0.14.5`` is silently skipped by the downgrade classifier even
+    though it is a legitimate upgrade (Lane J r2 BLOCKING from codex
+    r1 — pre-fix used core-only compare).
+    """
+    inst = parse_semver_full(installed)
+    lat = parse_semver_full(latest)
+    if inst is None or lat is None:
+        return None
+    inst_core, inst_pre = inst
+    lat_core, lat_pre = lat
+    if inst_core != lat_core:
+        return -1 if inst_core < lat_core else 1
+    # Same core: prerelease compare. Per semver 2.0.0, a final (empty
+    # prerelease) has HIGHER precedence than any prerelease.
+    if inst_pre == lat_pre:
+        return 0
+    if not inst_pre and lat_pre:
+        # installed is final, latest is prerelease → installed > latest
+        return 1
+    if inst_pre and not lat_pre:
+        # installed is prerelease, latest is final → installed < latest
+        # (this is the beta→stable upgrade case; THE fix.)
+        return -1
+    return _compare_prerelease_identifiers(inst_pre, lat_pre)
 
 
 def normalize_tag(tag_name: str | None) -> str:
@@ -96,14 +280,28 @@ def release_record(repo: str, installed_version: str, payload: dict[str, Any]) -
     tag_name = normalize_tag(str(payload.get("tag_name") or ""))
     version = normalize_version(tag_name)
     installed = installed_version.strip()
-    installed_tuple = parse_semver(installed)
-    latest_tuple = parse_semver(version)
+    # Issue #1267 (Lane J r2): use the full semver 2.0.0 comparator so
+    # both core (major.minor.patch) AND prerelease suffix matter. r1
+    # used core-only compare on the prerelease branch, which made
+    # ``0.14.5-beta1`` vs ``0.14.5`` (legitimate beta→stable upgrade)
+    # appear as "already ahead" — and the downgrade classifier in
+    # ``bridge-daemon-helpers.py`` then suppressed the notification.
+    cmp_result = compare_semver(installed, version)
     update_available = False
-    if latest_tuple is not None:
-        if installed_tuple is None:
-            update_available = True
+    latest_full = parse_semver_full(version)
+    if latest_full is not None:
+        installed_full = parse_semver_full(installed)
+        if cmp_result is None:
+            # Latest parsed, installed didn't → truly unparseable installed
+            # version. Fall back to the legacy "always upgrade" hint so a
+            # misconfigured VERSION file does not silently swallow real
+            # releases.
+            if installed_full is None:
+                update_available = True
+            else:
+                update_available = False
         else:
-            update_available = latest_tuple > installed_tuple
+            update_available = cmp_result < 0
 
     return {
         "repo": repo,

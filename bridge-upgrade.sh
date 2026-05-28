@@ -44,6 +44,11 @@ trap _bridge_upgrade_exit_handler EXIT
 source "$SCRIPT_DIR/bridge-lib.sh"
 # shellcheck source=lib/bridge-cleanup.sh
 source "$SCRIPT_DIR/lib/bridge-cleanup.sh"
+# Beta20 L2 Variant 3A — bridge_host_profile_is_dev is defined in
+# lib/bridge-host-profile.sh (not pulled in by bridge-lib.sh). The
+# upgrade-time sudoers regeneration gate at line ~2243 depends on it.
+# shellcheck source=lib/bridge-host-profile.sh
+source "$SCRIPT_DIR/lib/bridge-host-profile.sh"
 ORIGINAL_ARGS=("$@")
 
 SOURCE_ROOT="$SCRIPT_DIR"
@@ -1808,6 +1813,104 @@ if [[ $DRY_RUN -eq 0 ]]; then
   rm -rf "$_write_state_payload_dir"
 fi
 
+# Phase 2 (post-v0.14.5-beta16): re-apply the declarative install-tree
+# reconciler on every `upgrade --apply` so existing installs (beta9-16)
+# converge to the canonical group/mode contract that v2 isolation
+# demands. The reconciler is idempotent — a clean tree shows zero
+# changes — and protected paths (agent-roster*, handoff.local*,
+# secrets) are refused by the per-row protected guard. Non-zero exit
+# surfaces as a warning (not bridge_die): the operator can run
+# `agent-bridge isolation reconcile --check` manually to inspect drift
+# and `--apply` to repair, without blocking the rest of the upgrade
+# from completing. Skip on dry-run for symmetry with shared-settings
+# rerender.
+if [[ $DRY_RUN -eq 0 ]]; then
+  set +e
+  _iso_reconcile_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-iso-recon.XXXXXX")"
+  # Footgun #11: invoke the helper as a standalone script with args via
+  # argv (no heredoc-stdin into a subprocess). The helper sources
+  # bridge-lib.sh from $TARGET_ROOT so the reconciler module loads
+  # against the upgraded install tree.
+  bridge_upgrade_with_target_env "$TARGET_ROOT" \
+    "$BRIDGE_BASH_BIN" \
+    "$SOURCE_ROOT/lib/upgrade-helpers/isolation-v2-reconcile.sh" \
+    "$SOURCE_ROOT" "$TARGET_ROOT" >"$_iso_reconcile_tmp" 2>&1
+  _iso_reconcile_rc=$?
+  set -e
+  if [[ $_iso_reconcile_rc -ne 0 ]]; then
+    echo "[bridge-upgrade] WARN: install-tree reconciler reported drift or partial apply (rc=$_iso_reconcile_rc)" >&2
+    echo "[bridge-upgrade] WARN: run 'agent-bridge isolation reconcile --check' on the target install to inspect, then '--apply' to converge" >&2
+    _upgrade_partial_failures+=("iso_reconcile")
+    # Tail the reconciler output into the upgrade log for the audit
+    # trail. Cap at 50 lines so a noisy run doesn't flood stderr.
+    tail -n 50 "$_iso_reconcile_tmp" >&2 || true
+  fi
+  rm -f -- "$_iso_reconcile_tmp"
+
+  # L1 beta19 (codex r1 design 2026-05-25): in-place upgrade is the
+  # beta19 acceptance path. patch may not rerun `agb setup teams`, so
+  # the bun-traverse helper has to fire here too — otherwise an upgrade
+  # from beta18 to beta19 leaves $HOME/.bun at the operator's umask
+  # (0750 on Debian/Ubuntu) and isolated Teams MCP startup hits EACCES
+  # on exec even though every install-tree row above converged.
+  #
+  # Best-effort, non-fatal: the bun-traverse helper emits bridge_warn on
+  # chmod failures but returns non-zero. Wrap in set +e so the upgrade
+  # does not abort. Linux + $HOME/.bun gating is internal to the helper
+  # (no-op elsewhere).
+  #
+  # Footgun #11: invoke via standalone helper in lib/upgrade-helpers/
+  # rather than -c with embedded script. Keeps the pattern symmetrical
+  # with isolation-v2-reconcile.sh and avoids any future heredoc-stdin
+  # temptation in this file.
+  set +e
+  _bun_traverse_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-bun-traverse.XXXXXX")"
+  bridge_upgrade_with_target_env "$TARGET_ROOT" \
+    "$BRIDGE_BASH_BIN" \
+    "$SOURCE_ROOT/lib/upgrade-helpers/bun-traverse-chmod.sh" \
+    "$SOURCE_ROOT" "$TARGET_ROOT" >"$_bun_traverse_tmp" 2>&1
+  _bun_traverse_rc=$?
+  set -e
+  if [[ $_bun_traverse_rc -ne 0 ]]; then
+    echo "[bridge-upgrade] WARN: bun-runtime traverse chmod reported failure (rc=$_bun_traverse_rc) — isolated agents may fail to exec bun. Run 'chmod o+x \$HOME/.bun \$HOME/.bun/bin' manually or set BRIDGE_BUN_CHMOD_OPT_OUT=1 to suppress." >&2
+    _upgrade_partial_failures+=("bun_traverse")
+    tail -n 20 "$_bun_traverse_tmp" >&2 || true
+  fi
+  rm -f -- "$_bun_traverse_tmp"
+
+  # L1-J (beta20, 2026-05-25): every bundled plugin with a package.json
+  # needs node_modules at install/upgrade time. The teams plugin path
+  # (`agb setup teams`) does this for plugins/teams/ specifically; this
+  # helper generalizes to ms365 + any future bundled plugin so the iso
+  # UID's MCP spawn does not hit "Cannot find module" on first start.
+  #
+  # Best-effort, non-fatal — mirrors the bun-traverse helper. The
+  # helper logs per-plugin status and the overall upgrade continues
+  # even when one plugin's install fails (operator can re-run
+  # `agb setup <plugin> <agent>` or fix bun availability and retry).
+  #
+  # Footgun #11: file-as-argv via standalone helper (no heredoc-stdin).
+  set +e
+  _bundled_plugins_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-bundled-plugins.XXXXXX")"
+  bridge_upgrade_with_target_env "$TARGET_ROOT" \
+    "$BRIDGE_BASH_BIN" \
+    "$SOURCE_ROOT/lib/upgrade-helpers/bundled-plugins-bun-install.sh" \
+    "$SOURCE_ROOT" "$TARGET_ROOT" >"$_bundled_plugins_tmp" 2>&1
+  _bundled_plugins_rc=$?
+  set -e
+  # Surface info lines (per-plugin status) regardless of rc — the
+  # operator wants to see "ms365: node_modules installed + widened"
+  # in the upgrade log.
+  if [[ -s "$_bundled_plugins_tmp" ]]; then
+    tail -n 50 "$_bundled_plugins_tmp" >&2 || true
+  fi
+  if [[ $_bundled_plugins_rc -ne 0 ]]; then
+    echo "[bridge-upgrade] WARN: one or more bundled plugins failed bun install (rc=$_bundled_plugins_rc). Affected MCPs will not start until deps resolve — re-run \`agb setup <plugin> <agent>\` or check bun availability." >&2
+    _upgrade_partial_failures+=("bundled_plugins_bun_install")
+  fi
+  rm -f -- "$_bundled_plugins_tmp"
+fi
+
 # Footgun #11: `bridge_upgrade_agent_restart_json` feeds python via heredoc;
 # `$()` capture would deadlock under Bash 5.3.9 once a real report ships
 # enough output to fill the pipe (the leap path traverses this twice).
@@ -2027,6 +2130,38 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
     fi
   fi
 
+  # Issue #1328 (v0.15.0-beta5-2 Lane μ M5): verify the cron-state-dir
+  # anchor and migrate the old tree if `BRIDGE_CRON_STATE_DIR` moved.
+  # Idempotent — when the anchor matches the live env, the helper is a
+  # no-op. The full edge-case matrix lives in
+  # `bridge_cron_state_dir_verify_and_migrate`'s docstring (lib/bridge-cron.sh).
+  # Run at upgrade time so the operator never observes a stale cron tree
+  # after a `BRIDGE_CRON_STATE_DIR` override change; the daemon's `sync`
+  # tick also calls the same helper for the steady-state path.
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[bridge-upgrade] plan: verify cron-state-dir anchor (idempotent; migrates stale tree if BRIDGE_CRON_STATE_DIR moved)" >&2
+  else
+    _cron_state_dir_verify_output=""
+    if ! _cron_state_dir_verify_output="$(
+      bridge_upgrade_with_target_env "$TARGET_ROOT" "$BRIDGE_BASH_BIN" -lc '
+        set -euo pipefail
+        SCRIPT_DIR="$1"
+        source "$SCRIPT_DIR/bridge-lib.sh"
+        # bridge-lib.sh sources lib/bridge-cron.sh transitively; the
+        # verify helper lives in lib/bridge-cron.sh.
+        bridge_cron_state_dir_verify_and_migrate
+      ' -- "$SOURCE_ROOT" 2>&1
+    )"; then
+      echo "[bridge-upgrade] WARN: cron-state-dir verify failed: $_cron_state_dir_verify_output" >&2
+      _upgrade_partial_failures+=("cron_state_dir_verify")
+    elif [[ -n "$_cron_state_dir_verify_output" ]]; then
+      # Helper emits human-readable bridge_warn lines on migrate/conflict;
+      # surface them to the upgrade summary so the operator sees them
+      # without grepping the audit log.
+      printf '%s\n' "$_cron_state_dir_verify_output" >&2
+    fi
+  fi
+
   # Also propagate per-agent doc sync (bridge-docs.py apply) so
   # MEMORY-SCHEMA.md / SKILLS.md / CLAUDE.md managed blocks track the
   # canonical runtime on every upgrade. Before 2026-04-19 this hook was
@@ -2163,6 +2298,69 @@ if [[ $DRY_RUN -eq 0 ]] && command -v tmux >/dev/null 2>&1; then
   tmux setenv -u -g BRIDGE_DATA_ROOT 2>/dev/null || true
 fi
 
+
+# Beta20 L2 Variant 3A — regenerate the daemon-refresh sudoers drop-in
+# so an upgrade that changes BRIDGE_BASH_BIN or BRIDGE_HOME (rare but
+# possible when operators relocate) lands a matching authorized command
+# in the sudoers entry. Idempotent: the helper skips the install when
+# the existing file is byte-equal to a fresh render. Linux + server
+# profile only; failure is logged but does NOT abort the upgrade (the
+# operator can re-run `agent-bridge init sudoers daemon-refresh --apply`
+# afterwards).
+if [[ $DRY_RUN -eq 0 ]] \
+   && [[ "$(uname -s 2>/dev/null)" == "Linux" ]] \
+   && ! bridge_host_profile_is_dev \
+   && command -v bridge_daemon_control_install_sudoers >/dev/null 2>&1; then
+  _upgrade_sudoers_path=""
+  _upgrade_sudoers_install_ok=0
+  if _upgrade_sudoers_path="$(BRIDGE_HOME="$TARGET_ROOT" bridge_daemon_control_install_sudoers 2>&1)"; then
+    if [[ -n "$_upgrade_sudoers_path" ]]; then
+      # >&2 — info goes to stderr so --json mode's stdout stays parseable
+      echo "[bridge-upgrade] daemon-refresh sudoers: at $_upgrade_sudoers_path" >&2
+      _upgrade_sudoers_install_ok=1
+    fi
+  else
+    echo "[bridge-upgrade] WARN: daemon-refresh sudoers regen failed; automatic supp-groups refresh may fall back to manual-required." >&2
+    echo "[bridge-upgrade] WARN: re-run: $TARGET_ROOT/agent-bridge init sudoers daemon-refresh --apply" >&2
+  fi
+
+  # Beta20 L2 Variant 3A r4 — regenerate the systemd-user unit so its
+  # ExecStart picks up the (possibly updated) sudo-wrapped shape. The
+  # install-daemon-systemd.sh helper auto-detects the sudoers drop-in
+  # and renders accordingly; we just re-apply + daemon-reload +
+  # restart-if-active. Without this step, an operator who upgrades
+  # from a pre-r4 install still has the legacy direct unit ExecStart,
+  # and `Restart=always` would keep defeating the r3 ad-hoc sudo
+  # restart at runtime.
+  if (( _upgrade_sudoers_install_ok == 1 )) \
+     && command -v systemctl >/dev/null 2>&1; then
+    _upgrade_systemd_rc=0
+    # install-daemon-systemd.sh emits [info] lines to stdout (designed
+    # for standalone CLI use). When invoked from inside `agent-bridge
+    # upgrade --json`, that chatter must not pollute the JSON envelope
+    # on our stdout. Redirect to stderr so --json callers (smokes, CI)
+    # get a clean JSON document; operator-facing terminal still sees
+    # the messages.
+    "$BRIDGE_BASH_BIN" "$TARGET_ROOT/scripts/install-daemon-systemd.sh" \
+      --bridge-home "$TARGET_ROOT" --apply >&2 \
+      || _upgrade_systemd_rc=$?
+    if (( _upgrade_systemd_rc == 0 )); then
+      if systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null; then
+        systemctl --user daemon-reload || true
+        if systemctl --user restart agent-bridge-daemon.service 2>/dev/null; then
+          echo "[bridge-upgrade] systemd-user unit regenerated (sudo-self) and restarted" >&2
+        else
+          echo "[bridge-upgrade] WARN: systemctl --user restart agent-bridge-daemon.service failed after unit regen — retry manually" >&2
+        fi
+      else
+        echo "[bridge-upgrade] systemd-user unit regenerated (sudo-self) — service not active, will pick up on next start" >&2
+      fi
+    else
+      echo "[bridge-upgrade] WARN: install-daemon-systemd.sh --apply returned rc=$_upgrade_systemd_rc — unit may carry legacy ExecStart" >&2
+      echo "[bridge-upgrade] WARN: re-run: $TARGET_ROOT/scripts/install-daemon-systemd.sh --bridge-home $TARGET_ROOT --apply" >&2
+    fi
+  fi
+fi
 
 # Bug #507 — auto-cleanup of daily-backup residue on every successful
 # `agb upgrade --apply`. Idempotent; reports failures via cleanup_failures

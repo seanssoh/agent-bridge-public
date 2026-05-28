@@ -86,7 +86,9 @@ smoke_assert_file_exists "$USAGE_FILE" "cli-help usage template present"
 # guard at the top of each affected run_* function.
 # ---------------------------------------------------------------------------
 KNOWN_BROKEN_VERBS=(
-  "agent update"          # #1114 bug class — run_update treats --help as agent id
+  # #1236 Lane γ landed the run_update pre-bind short-circuit (matches
+  # run_create's #526 pattern); the verb now prints usage on --help so
+  # the row is removed from the pin list.
   "agent show"            # #1114 bug class — run_show treats --help as agent id
   "agent safe-mode"       # #1114 bug class — run_safe_mode treats --help as agent id
   "agent restart"         # #1114 bug class — run_restart treats --help as agent id
@@ -358,6 +360,25 @@ run_verb_contract agent  "$AGENT_VERBS_FILE"
 run_verb_contract cron   "$CRON_VERBS_FILE"
 run_verb_contract task   "$TASK_VERBS_FILE"
 run_verb_contract daemon "$DAEMON_VERBS_FILE"
+
+# bridge-plugins.sh uses `case "${1:-}" in` at the script bottom (not the
+# enumerable `case "$subcommand" in` pattern the four dispatchers above
+# share), so its sub-verbs aren't reached by parse_verb_block. Pin the
+# documented operator surface here directly — keep this list in sync
+# with the `usage()` printf block in bridge-plugins.sh and the case
+# branches at the bottom of that file. New plugins sub-verbs added
+# downstream should append a row here.
+PLUGINS_VERBS=(
+  "seed"
+  "show"
+  "list"           # #1236 (Lane ζ): read-only installed plugin enumeration
+  "marketplaces"   # #1236 (Lane ζ): read-only known-marketplace enumeration
+)
+for verb in "${PLUGINS_VERBS[@]}"; do
+  assert_help_ok "T2: plugins $verb --help" \
+    "$AGB_FILE" plugins "$verb" --help
+done
+smoke_log "T2: plugins: covered ${#PLUGINS_VERBS[@]} verbs"
 
 # ---------------------------------------------------------------------------
 # T3 — Dangerous-case regression: daemon verbs' --help must NOT

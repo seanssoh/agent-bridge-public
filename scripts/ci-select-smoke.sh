@@ -107,7 +107,7 @@ add_live() {
 
 add_all_required_static() {
 
-  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift
+add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift phase2-install-tree-reconciler phase3-agent-home-contract 1201-1202-directory-marketplace-seed 1205-hook-iso-fail-open 1207-stale-supp-groups-allowlist 1208-lock-metadata-normalize 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1214-channel-validator-iso-fallback 1215-ms365-dir-mode beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers G-channel-spec-resolution F-daemon-supp-groups-mock F-daemon-supp-groups-real H-bootstrap-memory-iso-rebuild I-agent-description-roster ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers 6607-hook-admin-allowlist γ-cli-consistency δ-1234-daemon-start-policy B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir C-beta4-logger-and-spec B-beta4-setup-wizard A-beta4-iso-path-resolution D-beta4-daemon-lifecycle E-beta4-fresh-install-gate-state-dir H-beta4-iso-ownership F-beta4-oauth-bootstrap G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs K-beta4-nits Beta-beta5-session-id-detect-sudo α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-zeta-teams-mcp-dedup beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-eta-cron-iso-uid-preflight beta5-2-delta-nudge-session-empty beta5-2-theta-upgrade-backfill-perms beta5-2-nu-daemon-path-quarantine beta5-2-kappa-state-audit-reconcile beta5-2-iota-daemon-escalation-family beta5-2-lambda-a2a-robustness beta5-2-mu-cron-channel-creds beta5-2-xi-misc-fixes
 
 
 }
@@ -188,6 +188,17 @@ select_for_path() {
       # template-text drift still pulls the #1060 layout smokes.
       add_required 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning
       ;;
+    agent-roster.local.example.sh)
+      # v0.15.0-beta1 Lane I: the example roster is operator-facing copy.
+      # An edit here (recommended BRIDGE_AGENT_DESC one-liners, admin
+      # class examples) should still pull the Lane I smoke so the
+      # convention's expected shape — non-empty default desc, list/show
+      # carry the string, describe getter resolves it — cannot regress.
+      # The file is .sh, not .md, so is_docs_only_path wouldn't elide
+      # it anyway, but this explicit pre-case keeps the smoke gate
+      # consistent if the trigger ever flips into the docs path.
+      add_required I-agent-description-roster
+      ;;
   esac
 
   # Issue #1114: subcommand-group dispatchers previously rejected
@@ -208,7 +219,7 @@ select_for_path() {
   # verb the 16-site #1114 pin didn't cover.
   case "$path" in
     agent-bridge|agb|bridge-upgrade.sh|bridge-memory.sh|bridge-intake.sh|bridge-bundle.sh|bridge-cron.sh|bridge-daemon.sh|bridge-discord-relay.sh|bridge-send.sh|bridge-agent.sh|bridge-profile.sh|bridge-task.sh)
-      add_required 1114-cli-help-contract 1117-cli-help-universal-gate
+      add_required 1114-cli-help-contract 1117-cli-help-universal-gate β-1231-1236-fresh-install-seed-sudoers
       # Issue #1165 Gap 8: the agent-bridge dispatcher head carries
       # the BRIDGE_CONTROLLER_UID recovery block that re-arms the
       # marker validator's owner exemption (#1158) when agb is
@@ -246,6 +257,15 @@ select_for_path() {
       add_all_live
       ;;
 
+    scripts/audit/iso-v2-ownership-audit.sh)
+      # v0.15.0-beta4 Lane H (#1278): the iso v2 ownership audit
+      # subject. The H-beta4 smoke pins its existence + contract; pull
+      # the smoke when the audit changes so a refactor cannot drift the
+      # smoke's reference assumptions (paths checked, ownership contract,
+      # exit codes) out of sync.
+      add_required H-beta4-iso-ownership
+      ;;
+
     scripts/cli-help/*)
       # Issues #1115 + #1116: the operator-facing CLI usage template
       # (scripts/cli-help/agent-bridge-usage.txt) must stay in lockstep
@@ -257,10 +277,14 @@ select_for_path() {
       # same template to enumerate top-level commands. Pull it on every
       # template edit so a new __CLI_NAME__ <cmd> row that lacks an
       # accepting --help dispatcher arm trips CI at PR time.
-      add_required 1115-cli-usage-drift 1117-cli-help-universal-gate
+      #
+      # v0.15.0-beta1 Lane I: the template now advertises
+      # `agent describe <agent>`. Pull I-agent-description-roster on
+      # every template edit so the row + dispatcher arm cannot drift.
+      add_required 1115-cli-usage-drift 1117-cli-help-universal-gate I-agent-description-roster
       ;;
 
-    bridge-setup.py|bridge-setup.sh|bridge-status.py|bridge-status.sh)
+    bridge-setup.py|bridge-setup.sh|bridge-status.py|bridge-status.sh|lib/bridge-setup-wizard.sh)
       # Issue #835 Wave B: bridge-status.py gained the
       # `starting/stalled before engine` rendering branch — cover the
       # regression smoke + engine-alive unit smoke when status entry
@@ -293,7 +317,135 @@ select_for_path() {
       # idempotency, L1873 mattermost MCP, L1995 channel access preserve),
       # and the lint-raw-pathlib-on-isolated regression guard cannot
       # silently regress.
-      add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit
+      # Issue #1178 (cycle 12 architectural root): bridge-setup.py's
+      # `_isolation_aware_mkdir` traceback at L368 was unblocked by
+      # routing the new `_sudo_stat_owner` recovery in
+      # `lib/bridge_iso_paths.py`. The L368 raw mkdir is now noqa'd as
+      # the controller-owned post-helper fallback. Pull
+      # 1178-helper-contract-daemon-supp on every bridge-setup.py move
+      # so the L368 reproducer + extended lint baseline cannot regress.
+      # Issue #1215 (beta26): bridge-setup.py channel-dir mkdir call
+      # sites now pass an explicit `mode=0o2770` to
+      # `_isolation_aware_mkdir` (discord/telegram/teams/mattermost).
+      # The 1215 smoke pins both the per-call-site mode (so a future
+      # patch can't silently revert to the helper's legacy 0o2750
+      # default) AND the plugins/ms365/teams server.ts STATE_DIR
+      # mode + chmodSync self-heal contract. Behavioural tests skip
+      # on macOS unless BRIDGE_TEST_LINUX_ROOT=1.
+      # Issue #1209 (beta27): bridge-setup.py adds the `cmd_ms365`
+      # wizard + `inspect_ms365_dir` + `derive_ms365_redirect_uri`
+      # helpers, and bridge-setup.sh adds the `ms365` subcommand
+      # dispatch + `run_ms365`. The 1209 smoke pins the wizard's
+      # derive-from-messaging-endpoint behavior, the
+      # `MS365_REDIRECT_URI` persistence to `.ms365/.env`, the file
+      # mode (0600) regression check, and the runtime fail-loud
+      # `resolveRedirectUri()` contract in plugins/ms365/server.ts.
+      # Issue #1221 (v0.15.0 Lane G): bridge-setup.sh's per-channel
+      # helpers (`bridge_setup_add_agent_channel`,
+      # `bridge_setup_replace_agent_telegram_channel`,
+      # `bridge_setup_ensure_development_channels_launch_flag`) all
+      # route channel-spec tokens through `bridge_qualify_channel_item`.
+      # The G smoke pins the canonical built-in plugin → marketplace
+      # mapping (teams/ms365/mattermost → @agent-bridge; discord/telegram
+      # → @claude-plugins-official; explicit suffixes preserved verbatim)
+      # so a future bridge-setup.sh change cannot regress an un-suffixed
+      # `plugin:<name>` past the bridge-owned plugin-manifest gate.
+      # Issues #1268 + #1271 (v0.15.0-beta4 Lane B): bridge-setup.sh's
+      # `run_teams` / `run_ms365` invoke `bridge_setup_wizard_validate_auto`
+      # (auto mode) and `bridge_setup_wizard_run_teams|ms365` +
+      # `bridge_setup_wizard_post_summary_*` (interactive TTY) from
+      # `lib/bridge-setup-wizard.sh`. The B-beta4 smoke pins:
+      #   - the canonical required-field list per channel (teams: app-id,
+      #     app-password-file, tenant-id, allow-from, messaging-endpoint,
+      #     webhook-host, webhook-port; ms365: client-id,
+      #     client-secret-file, tenant-id, redirect-uri, default-scopes)
+      #   - auto-mode fail-loud with the enumerated missing list (vs the
+      #     legacy 2-flag check)
+      #   - the post-summary printer surface that names the Azure portal
+      #     manual-action steps after the python wizard returns
+      # Pull on every move so a future patch cannot silently collapse
+      # the wizard back to the silent-fail OOTB shape #1268 reproduced.
+      # Issue #1278 (v0.15.0-beta4 Lane H): the bridge-setup.py mkdir of
+      # `.ms365/` is the entry surface for the iso v2 ownership audit
+      # family — when `.ms365` drops mode 0o2770, the iso UID's
+      # subsequent `.env` reads EACCES on the parent. The H-beta4 smoke
+      # pins both the `.ms365` mode 0o2770 contract (#1215 cross-check)
+      # and the canonical iso v2 ownership pattern on
+      # `known_marketplaces.json` (#1278) + `*.lock` (#1208). Pull on
+      # every bridge-setup.py / bridge-setup.sh / wizard move so a
+      # future refactor cannot silently regress the audit family.
+      add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership
+      # v0.15.0-beta5-2 Lane κ (#1319 H1): bridge-status.py's `state`
+      # column width must accommodate the new `picker_blocked` value
+      # (14 chars). Pull beta5-2-kappa-state-audit-reconcile on every
+      # bridge-status.py move so a future PR cannot silently shrink the
+      # column back to 8 chars and clip `picker_blocked` to `picker_b`.
+      add_required beta5-2-kappa-state-audit-reconcile
+      # Issue #1329 (v0.15.0-beta5-2 Lane μ M6): bridge-setup.py's five
+      # channel handlers (cmd_discord / cmd_telegram / cmd_teams /
+      # cmd_ms365 / cmd_mattermost) now call
+      # `_post_write_normalize_channel_cred_group(...)` after the
+      # `_isolation_aware_save_*` writes so a controller-fallback write
+      # (no iso owner resolvable) lands at `controller:ab-agent-<a> 0640`
+      # instead of `controller-primary-group 0600`. The smoke pins the
+      # presence of the call in each handler. Pull on every
+      # bridge-setup.py move so a future PR cannot silently drop the
+      # post-write hook from any single handler.
+      add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership beta5-2-mu-cron-channel-creds
+      add_integration integration-minimal
+      ;;
+
+    plugins/teams/dedupe.ts)
+      # Issue #1313 (beta5-2 Lane ζ): the createRecentMessageDeduper /
+      # storedRowMatchesIncoming helpers gate the in-memory + log-replay
+      # dedup that the Lane ζ fix relies on for safe MCP-failure retry.
+      # A change to either helper must re-run the dedup-on-failure smoke
+      # so the regression detector (no `recentMessageIds.forget(...)` on
+      # the catch path) can flag a silent re-introduction.
+      add_required beta5-2-zeta-teams-mcp-dedup
+      add_integration integration-minimal
+      ;;
+
+    plugins/ms365/server.ts|plugins/teams/server.ts)
+      # Issue #1215 (beta26): plugins/ms365/server.ts:ensureDirs and
+      # plugins/teams/server.ts:ensureStateDir now mkdirSync STATE_DIR
+      # at mode 0o770 followed by an explicit `chmodSync(STATE_DIR,
+      # 0o2770)` self-heal so the v2 isolation `ab-agent-<slug>`
+      # group can traverse the per-agent `.ms365/` / `.teams/`
+      # parents. tokens/pending stay 0o700; secret files stay 0o600.
+      # The 1215 smoke pins both the source-level pattern and the
+      # behavioural self-heal (Linux only / BRIDGE_TEST_LINUX_ROOT=1
+      # on mac).
+      # Issue #1209 (beta27): plugins/ms365/server.ts replaces the
+      # silent `http://localhost:3978/auth/callback` fallback with a
+      # fail-loud `resolveRedirectUri()` invoked at pair_start time.
+      # The 1209 smoke pins the resolver priority table (unset →
+      # throw, explicit https → return, localhost without ALLOW →
+      # throw, localhost + ALLOW=1 → return) and verifies the
+      # bridge-setup.py ms365 wizard derives the URL from a Teams
+      # messaging endpoint.
+      # Issue #1210 (beta27): plugins/ms365/server.ts now normalizes
+      # the scope string (strip outer quotes, collapse whitespace)
+      # before passing to URLSearchParams, fixing AADSTS70011
+      # "scope is not valid" when operator .env had quoted scope
+      # values like `MS365_DEFAULT_SCOPES="openid ..."`. The 1210
+      # smoke pins normalizeScopes round-tripping through the full
+      # authorize_url builder with no stray quotes / %22.
+      # Issue #1313 (beta5-2 Lane ζ): plugins/teams/server.ts catch
+      # block no longer drops the in-memory dedup entry on MCP
+      # notification failure; deliverMcpNotificationWithRetry +
+      # emitMcpDeliveryFailurePermanent provide bounded retry-with-
+      # backoff and a structured audit row on permanent failure.
+      # Pull beta5-2-zeta-teams-mcp-dedup on every teams/server.ts
+      # touch so the symptom-cover line cannot silently come back.
+      # Issue #1330 M7 (beta5-2 Lane ξ): plugins/teams/server.ts now emits
+      # a startup warning when BRIDGE_AGENT_ID is empty (the activity-
+      # index write would otherwise silently skip → PreCompact channel-
+      # route lookup misses → channel dispatch fails). Pull
+      # beta5-2-xi-misc-fixes on every teams/server.ts touch so the
+      # startup-warning guard cannot silently come back as a silent
+      # skip.
+      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
       add_integration integration-minimal
       ;;
 
@@ -313,16 +465,103 @@ select_for_path() {
       # alt and the smoke's T2 documents-every-public-toplevel check. Pull
       # 1115-cli-usage-drift so a change to bridge-task.sh's case dispatch
       # cannot silently invalidate the operator-facing shorthand surface.
-      add_required queue 1106-nudge-shell-recheck nudge-task-age-gate nudge-redundant-active-agent a2a-cross-bridge 1100-audit-since-tz 1115-cli-usage-drift
+      #
+      # v0.15.0-beta4 Lane J (#1280): bridge-queue.py's
+      # `stabilize_body_file` now falls back to `sudo -n -u <owner> cat
+      # <path>` when the direct read raises PermissionError (iso UID-
+      # owned body file at mode 0660). J-beta4-workflow-docs (T1/T2)
+      # pins the helper behavior + the structured SystemExit failure
+      # surface; pull on every bridge-queue.py move so the fallback
+      # cannot regress to silent empty-body sends.
+      # v0.15.0-beta4 Lane K (#1253): bridge-queue.py + bridge-task.sh now
+      # accept `claim --note <text>` / `--note-file <path>` symmetric with
+      # `done` / `update`. The note text propagates into the task_events
+      # row (`event_type=claimed`, `note_text=<text>`). Pull K-beta4-nits
+      # whenever either file moves so a future PR cannot silently regress
+      # the symmetry back to the asymmetric pre-#1253 shape.
+      # v0.15.0-beta5-2 Lane δ (#1311): bridge-queue.py / bridge-task.sh
+      # produce the nudge candidate rows the daemon consumes; the
+      # beta5-2-delta smoke pins the defer-and-escalate path that
+      # replaced the silent soft-skip when those rows surface an empty
+      # session field. Pull on every queue or task surface move so a
+      # future PR cannot regress the audit-row contract that downstream
+      # operator triage depends on.
+      # v0.15.0-beta5-2 Lane κ r2 (#1345): bridge-queue.py daemon-step
+      # now excludes `picker_blocked` / `working` activity_state values
+      # from the idle_agents set used by stale-claim requeue. The Lane
+      # κ smoke (T8/T9/T10) pins both the python-side exclusion AND the
+      # snapshot writer column ordering. Pull on every bridge-queue.py
+      # move so a future refactor cannot silently re-introduce the
+      # codex r1 BLOCKING repro (claimed task + picker_blocked + aged
+      # → wrongly requeued).
+      add_required queue 1106-nudge-shell-recheck nudge-task-age-gate nudge-redundant-active-agent a2a-cross-bridge 1100-audit-since-tz 1115-cli-usage-drift J-beta4-workflow-docs K-beta4-nits beta5-2-delta-nudge-session-empty beta5-2-kappa-state-audit-reconcile
       add_integration integration-minimal
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py)
+    bridge-stall.py|bridge-audit.sh)
+      # v0.15.0-beta5-2 Lane κ:
+      #   #1319 H1 — bridge-stall.py is the source of the
+      #     `interactive_picker` classification that lib/bridge-state.sh's
+      #     new `bridge_agent_picker_blocked` predicate reads via stall.env.
+      #     A future refactor that renames the classification (e.g. to
+      #     `quarantine` or `picker`) would silently break the resolver
+      #     branch without producing any compile-time error.
+      #   #1324 M1 — bridge-audit.sh's no-`--agent` enumerator must walk
+      #     BOTH the legacy controller-rooted tree
+      #     (`$BRIDGE_HOME/logs/agents/<a>/audit.jsonl`) AND the iso v2
+      #     canonical tree (`$BRIDGE_HOME/data/agents/<a>/logs/audit.jsonl`).
+      #     The Lane κ smoke pins both anchors + the `Issue #1324` comment
+      #     so a future PR cannot silently drop the v2 arm.
+      # Pull beta5-2-kappa-state-audit-reconcile on every bridge-stall.py
+      # or bridge-audit.sh move so either regression is caught at PR time.
+      add_required beta5-2-kappa-state-audit-reconcile
+      # v0.15.0-beta5-2 Lane ι (#1318-B): bridge-queue.py + bridge-task.sh
+      # are the create boundary for queued tasks; the daemon's new
+      # process_unclaimed_queue_escalation tick scans these tables on
+      # every cycle. Pull beta5-2-iota-daemon-escalation-family on
+      # every queue / task move so a future PR cannot regress: the
+      # find-open --all --format json shape that the daemon's scan
+      # consumes; the created_ts / status / assigned_to fields that the
+      # age gate filters by; or the per-task dedup cooldown contract
+      # that prevents admin-task spam against a long-queued task.
+      add_required queue 1106-nudge-shell-recheck nudge-task-age-gate nudge-redundant-active-agent a2a-cross-bridge 1100-audit-since-tz 1115-cli-usage-drift J-beta4-workflow-docs K-beta4-nits beta5-2-delta-nudge-session-empty beta5-2-iota-daemon-escalation-family
+      # v0.15.0-beta5-2 Lane ξ (#1318 part A): bridge-task.sh cmd_create
+      # now refuses against stopped targets by default; --force overrides
+      # with a warning + audit row. Pull beta5-2-xi-misc-fixes whenever
+      # bridge-task.sh or bridge-queue.py moves so the --force flag parse,
+      # the default-refuse branch, and the self-target exemption cannot
+      # silently regress.
+      add_required queue 1106-nudge-shell-recheck nudge-task-age-gate nudge-redundant-active-agent a2a-cross-bridge 1100-audit-since-tz 1115-cli-usage-drift J-beta4-workflow-docs K-beta4-nits beta5-2-delta-nudge-session-empty beta5-2-xi-misc-fixes
+      add_integration integration-minimal
+      ;;
+
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the
       # end-to-end A2A smoke (auth/allowlist/dedupe/cap/retry).
-      add_required a2a-cross-bridge queue
+      #
+      # Issue #1262 (v0.15.0-beta4 Lane I): A2A 3 gaps — systemd
+      # auto-install (scripts/install-handoffd-systemd.sh), retry
+      # verify (already in a2a-cross-bridge), outbox stuck alerting
+      # (process_a2a_outbox_stuck_scan_tick in bridge-daemon.sh +
+      # a2a-stuck-decide in bridge-daemon-helpers.py). The
+      # I-beta4-a2a-3-gaps smoke covers the static-source contract for
+      # all three gaps plus the python helper unit tests.
+      # v0.15.0-beta4 Lane J (#1280): bridge-a2a.py's `cmd_send` now
+      # falls back to `sudo -n -u <owner> cat <path>` when the
+      # --body-file read raises PermissionError (iso UID-owned file at
+      # mode 0660). J-beta4-workflow-docs (T1/T2) pins the helper
+      # behavior + the structured failure surface; pull on every
+      # bridge-a2a.py move so the fallback cannot regress to silent
+      # empty-body sends.
+      # beta5-2 Sub-wave 2 Lane λ (#1326 + #1331): HMAC timestamp skew
+      # classification (narrow drift -> 503 transient, far-stale -> 401
+      # permanent) + empty-secret fail-closed (receiver + sender, with
+      # paired BRIDGE_A2A_DEV_INSECURE_BIND + BRIDGE_A2A_ALLOW_TEST_BIND
+      # test-only escape hatch). beta5-2-lambda-a2a-robustness pins the
+      # contract on both halves.
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)
@@ -356,9 +595,262 @@ select_for_path() {
       # 1115-cli-usage-drift on every cron dispatcher move so a future
       # PR cannot regress an internal subcommand back into the public
       # surface (or drop a public one).
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift
+      # Issue #1178 (cycle 12, Deliverable C): bridge-daemon.sh gained
+      # a startup supplementary-group staleness warning
+      # (bridge_daemon_warn_if_supp_groups_stale). Pull
+      # 1178-helper-contract-daemon-supp on every bridge-daemon.sh move
+      # so the warning behavior + macOS no-op gate cannot regress
+      # silently.
+      # v0.15.0-beta1 Lane F (autonomous daemon-side supp-groups poll):
+      # bridge-daemon.sh now hosts the new data helper
+      # (bridge_daemon_detect_stale_supp_groups), throttle state I/O
+      # (bridge_daemon_supp_group_refresh_throttle_*), autonomous poll
+      # (bridge_daemon_supp_groups_poll_and_dispatch), and the internal
+      # subcommand cmd_supp_refresh_worker. Pull the two Lane F smokes
+      # on every bridge-daemon.sh move so a future PR cannot silently
+      # regress the dispatch/throttle/detector contract or the
+      # no-SIGHUP invariant (codex spec-ok r1, F.B-prime pick).
+      # v0.15.0-beta2 Lane δ (issue #1234, codex r1 BLOCKING parity): the
+      # δ-1234-daemon-start-policy smoke pins both the always-on AND the
+      # on-demand queued-work branches of `process_on_demand_agents`.
+      # Codex r1 caught a parity gap where the on-demand branch was missing
+      # the channel-miss auto-hold (the always-on branch had it). The smoke
+      # extracts the production function verbatim and asserts the
+      # `channel-required-validator-miss:` reason is recorded on the
+      # on-demand branch — without this registration a future PR that
+      # touches bridge-daemon.sh could silently re-introduce the gap on
+      # the PR-path CI gate.
+      # v0.15.0-beta3 Lane A3 (issue #1248): lib/bridge-state.sh hosts the
+      # Layer-2 fix — `bridge_refresh_agent_session_id` now bridge_die's
+      # on a `bridge_persist_agent_state` write failure with the structured
+      # `state_dir_write_failed:session_id` reason, and emits the new
+      # `[session-id]` success breadcrumb + `session_id_persisted` audit
+      # row. bridge_write_agent_state_file / bridge_persist_agent_state
+      # now propagate write rc instead of silently returning 0. Pull
+      # A3-beta3-1248-restart-session-id-resume on every move so the
+      # Layer-2 fail-loud and breadcrumb cannot silently regress back to
+      # the pre-#1248 swallowed-failure shape (every restart spawned a
+      # fresh Claude session because session_id was never persisted).
+      # v0.15.0-beta4 Lane D (issue #1276): bridge-daemon.sh's cmd_run
+      # now routes through `bridge_daemon_ensure_singleton` at the top
+      # of every spawn path (cmd_start fork, direct `bridge-daemon.sh run`,
+      # sudo-wrapped invocation, systemd ExecStart). The
+      # D-beta4-daemon-lifecycle smoke pins the singleton lock/flock,
+      # PID-file eviction, canonical `daemon_started` audit emit (with
+      # pid + parent_pid + wrapper + sudo_self fields), and the
+      # periodic `bridge_daemon_self_check`. Pull on every
+      # bridge-daemon.sh move so a future PR cannot silently regress
+      # back to the pre-Lane D duplicate-daemon surface that patch's
+      # beta3 fresh install hit (two daemons polling the same tasks.db,
+      # duplicate session_nudge_dropped rows, 5-10min nudge latency).
+      # v0.15.0-beta4 Lane E (#1269): bridge-daemon.sh's three wake
+      # sites (process_on_demand_agents always-on branch, queued
+      # on-demand branch, and bridge_daemon_cron_dispatch_wake) now
+      # invoke `bridge_agent_state_dir_self_heal` before each
+      # bridge-start.sh call so a fresh-install (or VM-reboot) always-on
+      # agent self-heals its missing `state/agents/<a>/` instead of
+      # spinning on `start-command-failed`. The E-beta4 smoke pins all
+      # three call sites via distinct `trigger=` audit-detail markers,
+      # so a future PR cannot regress one of them silently while leaving
+      # the others intact. lib/bridge-state.sh hosts the helper
+      # (#1252), so the smoke also re-pulls on a state lib move.
+      # v0.15.0-beta4 Lane G (#1266 + #1254): bridge-daemon.sh's
+      # `process_watchdog_report` now downgrades the drift-task priority
+      # to `low` when the watchdog payload's `fresh_install_only=true`
+      # (the new daemon helper `watchdog-fresh-install-only` reads it).
+      # G-beta4-watchdog-noise pins both the downgrade gate and the
+      # daemon-helper readout contract — pull on every bridge-daemon.sh
+      # move so a future PR cannot silently regress the priority gate.
+      # v0.15.0-beta4 Lane I (#1262 Gap 3): bridge-daemon.sh now hosts
+      # process_a2a_outbox_stuck_scan_tick — a new tick that scans the
+      # A2A outbox for stuck rows and files admin tasks. Pull
+      # I-beta4-a2a-3-gaps on every bridge-daemon.sh move so the wiring
+      # (LAST_STEP literal, audit row name, target_bridge task create)
+      # and the python decision helper (cmd_a2a_stuck_decide) contract
+      # cannot regress silently.
+      # v0.15.0-beta4 Lane J (#1267): bridge-daemon.sh's
+      # `process_release_monitor` now emits a structured
+      # `release_notification_downgrade_skip` audit row when the monitor
+      # produced no alert but the installed version is ahead of the
+      # latest stable (the bridge-daemon-helpers.py
+      # `release-downgrade-classify` subcommand does the comparison).
+      # J-beta4-workflow-docs (T5/T6) pins the classifier behavior;
+      # pull on every bridge-daemon.sh move so the audit emit cannot
+      # silently regress.
+      # v0.15.0-beta5 Lane β (#1299): lib/bridge-state.sh hosts the
+      # bridge_detect_claude_session_id + bridge_resolve_resume_session_id
+      # shims that now wrap the python invocation in
+      # `sudo -n -u <iso-uid> -- bash -c 'exec python3 "$@"' bash …` so
+      # the 0600 Claude session JSON / jsonl files are readable from the
+      # controller on iso v2 (beta4 Lane A only fixed the path; this
+      # closes the permission boundary). bridge-sync.sh's
+      # refresh_missing_session_ids is one of the callers; it threads
+      # the agent's iso-v2 os_user resolved via
+      # bridge_resolve_agent_iso_sudo_user (lib/bridge-agents.sh). Pull
+      # Beta-beta5-session-id-detect-sudo on every move so the wrap
+      # cannot silently regress.
+      # v0.15.0-beta5-1 (#1304): lib/bridge-state.sh now also hosts the
+      # `bridge_persist_agent_state` empty-detect no-op guard — the
+      # defense-in-depth fix that prevents an empty in-memory session_id
+      # from clobbering a successful 54f1742e on disk when an iso v2
+      # detect race fires. Pull beta5-1-session-id-detect-race on every
+      # state lib / sync.sh move so the guard cannot silently regress
+      # back to the empty-overwrite shape patch caught on
+      # cm-prod-agentworkflow-vm01.
+      # v0.15.0-beta5-1 Lane 3 (#1307): bridge-daemon.sh now hosts the
+      # MCP-liveness giveup auto-clear ledger + tick. The new helpers
+      # (bridge_agent_mcp_giveup_arm/active/ts/clear/note_activity_state,
+      # bridge_recheck_mcp_liveness) and `process_mcp_liveness_giveup_recovery`
+      # close the silent message-drop class where a sticky giveup
+      # state never auto-recovered when the agent normalized. Pull
+      # mcp-liveness-giveup-auto-clear on every bridge-daemon.sh move
+      # so a future PR cannot regress the activity_state observer,
+      # the fallback timer, the audit-row shape (recovered /
+      # recheck_still_failed), or the re-arm semantics on recheck
+      # failure.
+      # v0.15.0-beta5-2 Lane κ r2 (#1345): lib/bridge-state.sh's
+      # bridge_write_agent_snapshot now appends the `activity_state`
+      # column so the daemon-step Python path can exclude
+      # picker_blocked agents from the idle_agents set used by
+      # stale-claim requeue. Pull beta5-2-kappa-state-audit-reconcile
+      # on every lib/bridge-state.sh or bridge-daemon.sh move so a
+      # future refactor cannot silently re-introduce the codex r1
+      # BLOCKING repro (claimed task + picker_blocked agent + aged
+      # session_activity_ts → wrongly requeued tasks).
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile
+      # v0.15.0-beta5-2 Lane η (#1314, CRITICAL/security):
+      # bridge-daemon.sh's `cmd_run_cron_worker` now gates shell-cron
+      # dispatch on `bridge_cron_uid_drop_preflight`. The new gate emits
+      # `cron_dispatch_refused reason=iso_uid_drop_unavailable` BEFORE
+      # invoking the runner when an iso v2 agent lacks a working UID-drop
+      # helper (sudo/setpriv misconfigured). Pair-defense with the
+      # untouched `RuntimeError` seal in bridge-cron-runner.py:481. Pull
+      # beta5-2-eta-cron-iso-uid-preflight on every bridge-daemon.sh
+      # move so the gate (including the CRON_PAYLOAD_KIND=="shell" scope,
+      # the audit-row name, and the refusal-side state propagation) cannot
+      # regress silently.
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-eta-cron-iso-uid-preflight
+      # v0.15.0-beta5-2 Lane δ (#1311): bridge-daemon.sh's nudge
+      # fanout loop (inside `cmd_sync_cycle`) used to silently drop
+      # any candidate row whose `$session` was empty or whose tmux
+      # session had died. patch's audit C5 classified that as a
+      # CRITICAL data-loss class because queued tasks stayed queued
+      # forever with no audit row, no retry signal, and no escalation.
+      # The new helpers
+      # (bridge_daemon_nudge_deferred_state_file/load/save/clear,
+      # bridge_daemon_nudge_defer_and_maybe_escalate,
+      # bridge_daemon_nudge_emit_session_empty_admin_task) close the
+      # silent-skip surface with a structured `nudge_deferred` audit
+      # row each tick plus an at-most-once `nudge_session_empty_
+      # escalated` admin task after BRIDGE_NUDGE_SESSION_EMPTY_
+      # ESCALATE_AFTER consecutive deferrals. Pull
+      # beta5-2-delta-nudge-session-empty on every bridge-daemon.sh
+      # move so a future PR cannot reintroduce the pre-#1311 silent
+      # soft-skip pattern, drop the per-task counter isolation, or
+      # regress the recovery-clears-counter contract that long-lived
+      # healthy agents depend on.
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-delta-nudge-session-empty
+      # v0.15.0-beta5-2 Lane ν (#1317 A/B/C + #1333 L3): the daemon's
+      # always-on auto-start engine pre-flight + bridge-state.sh's
+      # broken-launch writer (now with reason_hint payload) + the
+      # bridge-agent.sh activity_state observer (now surfacing
+      # `quarantine-broken-launch`) all interlock. Pull beta5-2-nu-
+      # daemon-path-quarantine on every bridge-daemon.sh / lib/bridge-
+      # state.sh / bridge-agent.sh move so a future PR cannot regress
+      # the operator-actionable hint chain or the activity-state label.
+      add_required beta5-2-nu-daemon-path-quarantine
+      # v0.15.0-beta5-2 Lane κ (#1319 H1): bridge-daemon.sh hosts
+      # bridge_agent_heartbeat_activity_state (one of the three resolvers
+      # that must agree on the new `picker_blocked` state); lib/bridge-
+      # state.sh hosts the predicate + the snapshot writer's resolver.
+      # Pull beta5-2-kappa-state-audit-reconcile on every bridge-daemon.sh
+      # / lib/bridge-state.sh move so a regression at any layer (predicate
+      # rename, predicate path drift, resolver branch removal) re-introduces
+      # the false-positive `working` shape patch flagged on stale picker.
+      add_required beta5-2-kappa-state-audit-reconcile
+      # v0.15.0-beta5-2 Lane ι (#1320 H2 + #1321 H3 + #1322 H4 + #1323 H5
+      # + #1318-B 7051): bridge-daemon.sh now hosts five new escalation /
+      # dedup / redeliver helpers that close the patch-audited operator-
+      # invisible failure surfaces. Pull
+      # beta5-2-iota-daemon-escalation-family on every bridge-daemon.sh
+      # move so a future PR cannot silently regress: (a) the
+      # always-on launch-failure escalation cooldown contract; (b) the
+      # MCP-giveup recovery miss-queue drain + dedup_key audit emit
+      # contract; (c) the per-(agent, task_id) nudge dedup window
+      # isolation contract (formerly the per-agent composite); (d) the
+      # recheck-timeout per-task consecutive counter +
+      # at-most-once admin escalation; (e) the unclaimed-queue daemon
+      # tick + per-task marker cooldown contract.
+      add_required beta5-2-iota-daemon-escalation-family
+      # v0.15.0-beta5-2 Lane μ (#1327 / #1328): bridge-daemon.sh's
+      # `cmd_run_cron_worker` now re-checks the manual-stop marker at
+      # execute time (edge case 1: agent restart between dispatch and
+      # execute), AND lib/bridge-cron.sh hosts the new cron-state-dir
+      # anchor / verify-and-migrate helper called from `run_sync` to
+      # preserve cron history when `BRIDGE_CRON_STATE_DIR` moves. The
+      # beta5-2-mu-cron-channel-creds smoke pins the audit-row name
+      # (`cron_dispatch_skipped`), the execute-time re-check site, the
+      # anchor-write contract, and the conflict-bail behaviour. Pull
+      # on every move of these files so the gates cannot regress
+      # silently.
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-mu-cron-channel-creds
       add_integration integration-minimal
       add_live live-tmux-daemon
+      ;;
+
+    lib/bridge-daemon-control.sh|scripts/install-daemon-systemd.sh|scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template)
+      # v0.15.0-beta1 Lane F: the autonomous supp-groups refresh path
+      # in bridge-daemon.sh dispatches a detached worker that sources
+      # `lib/bridge-daemon-control.sh` and calls
+      # bridge_daemon_refresh_after_group_membership_change. The
+      # sudo-self systemd unit (rendered by install-daemon-systemd.sh)
+      # and the sudoers template back-stop the PAM/initgroups boundary
+      # that actually refreshes the daemon's supplementary-group set
+      # (KillMode=process, exact ExecStart shape). Any change to those
+      # three files MUST re-exercise both the host-agnostic mock and
+      # the Linux-gated real smoke so a future PR cannot regress the
+      # systemd-self / direct-sudo branch coverage. The 1178 startup
+      # warning smoke is also pulled because the wrapper there shares
+      # the new data helper with Lane F.
+      # v0.15.0-beta3 Lane A12 (#1246): the supp-group pre-check
+      # `_bridge_daemon_control_daemon_has_gid` now emits a structured
+      # decision-evidence line on EVERY code path (daemon-not-running,
+      # proc-status-unreadable, already-has-group, missing-from-supp-set)
+      # so the silent false-positive that bypassed the systemd-user
+      # auto-restart branch (lines 404-411) on patch's fresh-install OOTB
+      # can never repeat undetected. Pull A12-beta3 on every
+      # lib/bridge-daemon-control.sh move so the predicate's emit
+      # contract stays pinned.
+      # v0.15.0-beta4 Lane D (issue #1276): lib/bridge-daemon-control.sh
+      # hosts the new `bridge_daemon_ensure_singleton` + `bridge_daemon_self_check`
+      # helpers that close the duplicate-daemon spawn race. Any move to
+      # this lib OR to the systemd install script OR to the sudoers
+      # template MUST re-exercise the D-beta4 smoke because all three
+      # files participate in the spawn path that ensure_singleton
+      # guards (lib defines the helper; install-daemon-systemd.sh wires
+      # the ExecStart whose every restart now crosses the helper; the
+      # sudoers template authorizes the sudo-self path that emitted no
+      # `daemon_started` audit row pre-Lane D).
+      # v0.15.0-beta4 Lane F (#1228): probe_sudo_self_refresh's glob
+      # anti-pattern was the structural root cause behind every Debian /
+      # Ubuntu / RHEL install silently landing on legacy ExecStart. The
+      # F-beta4-oauth-bootstrap smoke pins the sudo -ln replacement,
+      # the mode= machine-parseable emit, AND the silent-fallback warn —
+      # any move to install-daemon-systemd.sh OR the sudoers template
+      # must re-exercise this lane.
+      add_required F-daemon-supp-groups-mock F-daemon-supp-groups-real 1178-helper-contract-daemon-supp A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle F-beta4-oauth-bootstrap
+      ;;
+
+    lib/cron-helpers/*.py)
+      # v0.15.0-beta5-2 Lane η (#1314, CRITICAL/security): the cron-helpers
+      # python files (extracted from heredoc-stdin sites — see footgun #11)
+      # are part of the cron dispatch surface. load-run-shell.py in
+      # particular now surfaces CRON_PAYLOAD_KIND, which the daemon's pre-
+      # flight uses to scope shell-cron refusals. Pull the same regression
+      # smokes as bridge-cron-runner.py so a refactor of these helpers
+      # cannot silently regress the dispatch contract.
+      add_required cron-run-artifacts-retention cron-shell-runner beta5-2-eta-cron-iso-uid-preflight queue
+      add_integration integration-minimal
       ;;
 
     bridge-cron.py|bridge-cron-runner.py|bridge-cron-scheduler.py)
@@ -380,7 +872,16 @@ select_for_path() {
       # node interpreter under fnm/nvm/asdf/volta. Pin the registration
       # contract smoke whenever the runner moves so a future PR cannot
       # silently regress the fallback list.
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue
+      # v0.15.0-beta5-2 Lane η (#1314, CRITICAL/security):
+      # bridge-cron-runner.py:481 retains the `RuntimeError("no supported
+      # UID drop helper found (sudo or setpriv)")` seal as defense-in-
+      # depth; pre-flight validation now lives at the daemon dispatch
+      # site (`bridge_cron_uid_drop_preflight` in lib/bridge-cron.sh).
+      # Pull beta5-2-eta-cron-iso-uid-preflight whenever the runner moves
+      # so a future PR cannot silently downgrade the RuntimeError to a
+      # warning (which would re-open the iso v2 controller-UID
+      # fallthrough class).
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight
       add_integration integration-minimal
       ;;
 
@@ -443,7 +944,102 @@ select_for_path() {
       # any UID on the box (Gap 4). Pull 1165-track-a on every
       # bridge-agent.sh move so the scaffold legacy-root chmod cannot
       # regress back to a missing chmod.
-      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1028-isolated-workdir-check 1118-v2-engine-binary-path v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning 1115-cli-usage-drift 1151-step-a-helper 1155-bootstrap-skill-guard 1158-marker-load-order 1165-track-a-scaffold-modes
+      # Issue #1213 (beta26): bridge-run.sh:212 grew a comment block
+      # documenting the assoc-array vs scalar-export collision for
+      # BRIDGE_AGENT_ISOLATION_MODE / BRIDGE_AGENT_OS_USER /
+      # BRIDGE_AGENT_INJECT_TIMESTAMP. The fix is hook-side (UID-based
+      # predicate), but the 1213 smoke pins the bash collision
+      # reproducer against this exact line range. Pull it whenever
+      # bridge-run.sh moves so a future patch can't silently swap the
+      # working workaround back for an `unset` (which the brief
+      # explicitly forbids because downstream array readers depend on
+      # the lookup tables).
+      # Issue #1217 (beta27 Track D): bridge-run.sh now exports
+      # BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED as a distinctly-named
+      # scalar alias next to the bare-name export (the bare name
+      # silently no-ops because of the assoc-array collision in
+      # lib/bridge-core.sh:867). The beta27-D smoke pins both the
+      # bash collision repro and the Python hook's RESOLVED-first
+      # read order. Pull it whenever bridge-run.sh moves so the
+      # alias export and read order cannot regress.
+      # v0.15.0-beta1 Lane I: bridge-agent.sh gained the `describe` verb
+      # (read-only BRIDGE_AGENT_DESC getter) + `agent show` text-mode
+      # unset hint. Pull I-agent-description-roster on every dispatcher
+      # move so the describe dispatch arm + show hint cannot regress.
+      # Issue #1251 (v0.15.0-beta3 Lane C1): bridge-agent.sh::run_restart
+      # now drives a 3-phase transactional restart: pre-flight (full)
+      # before the kill, in-progress marker + roster snapshot, and
+      # auto-rollback on launch failure. The marker schema is the
+      # contract Lane C2 (#1254 watchdog drift suppression) consumes.
+      # Pull C1-beta3-1251-restart-preflight-rollback on every
+      # bridge-agent.sh move so the marker shape, the pre-flight ordering,
+      # and the rollback teeth all stay pinned alongside the call-site
+      # changes in run_restart.
+      # v0.15.0-beta4 Lane E (#1265): bridge-run.sh:207-... grew a
+      # fresh-install first-wake carve-out on top of the Lane A3 #1248
+      # reconcile gate. The carve-out uses
+      # `state/agents/<a>/launch.history` as the fresh-vs-lost-state
+      # heuristic (absent => proceed without --resume + touch marker;
+      # present => die with the existing (a)/(b)/(c) remediation).
+      # Pull E-beta4-fresh-install-gate-state-dir on every bridge-run.sh
+      # move so a future PR cannot silently regress the OOTB `agb admin`
+      # die into the lost-state branch (operator-blocking; first surface
+      # patch + admin-dev codex pair on a fresh install).
+      # v0.15.0-beta4 Lane K (#1282 Surface A): bridge-run.sh's
+      # `bridge_run_prune_legacy_teams_mcp` now filters the steady-state
+      # `absent path=…` / `unchanged path=…` rows out of the audit tail
+      # — only real actions (pruned/failed/skipped) reach the operator.
+      # Lane K (#1247) also adds the `agb admin set --auto-restart` CLI
+      # surface, dispatched from the agent-bridge `admin` case head and
+      # backed by scripts/python-helpers/admin-set-config.py. Pull
+      # K-beta4-nits on every bridge-run.sh / agent-bridge move so a
+      # future PR cannot silently regress either surface.
+      # Issue #1297 (v0.15.0-beta5 Lane α): bridge-agent.sh's
+      # `agent restart` is the operator-visible symptom — when the
+      # workdir-backfill normalize is skipped on an upgrade pass,
+      # restart's pre-launch grep on CLAUDE.md fails EACCES + rollback
+      # also fails. The Lane α smoke pins the normalize wiring upstream
+      # in the back-fill loop; pull it on every bridge-agent.sh move so
+      # a restart-path refactor cannot silently re-expose the dual-
+      # failure path (controller-grep + rollback) that #1297 captured.
+      # v0.15.0-beta5 Lane gamma (#1298): the `agent-bridge isolation
+      # reconcile` dispatcher (this CLI) routes into
+      # `bridge_isolation_v2_apply_install_tree_matrix`. The Lane gamma
+      # fix landed the manual-mode parity expansion inside that function
+      # (reason=manual + no --agent + no --all => implicit --all-agents)
+      # so manual reconcile reports agent-home-contract drift the prior
+      # contract silently skipped. Pull gamma-beta5-reconcile-helper-
+      # status whenever the dispatcher moves so a future PR cannot
+      # silently drift the dispatch shape (e.g. by passing `--reason
+      # install` instead of `--reason manual`, which would bypass the
+      # parity guard).
+add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1028-isolated-workdir-check 1118-v2-engine-binary-path v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning 1115-cli-usage-drift 1151-step-a-helper 1155-bootstrap-skill-guard 1158-marker-load-order 1165-track-a-scaffold-modes 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved I-agent-description-roster γ-cli-consistency C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir K-beta4-nits α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-epsilon-tmux-inject-busy beta5-2-theta-upgrade-backfill-perms
+      # v0.15.0-beta5-2 Lane ν (#1317-B/-C): bridge-agent.sh now hosts
+      # the engine-CLI pre-flight at `agent create` (refuses with
+      # actionable error when the engine binary is not on PATH; opt-out
+      # via --force-engine-missing) and the `bridge_agent_activity_state`
+      # extension that returns `quarantine-broken-launch` when the
+      # broken-launch marker exists. Pull beta5-2-nu-daemon-path-
+      # quarantine on every bridge-agent.sh move so a future PR cannot
+      # silently regress either surface back to the pre-#1317 opaque
+      # `stopped` label or the missing-engine create silent-pass.
+      add_required beta5-2-nu-daemon-path-quarantine
+      # v0.15.0-beta5-2 Lane κ (#1319 H1): bridge-agent.sh hosts
+      # `bridge_agent_activity_state` which is the second of the three
+      # resolvers that emit `picker_blocked` (alongside the snapshot
+      # writer in lib/bridge-state.sh and the heartbeat path in
+      # bridge-daemon.sh). Pull beta5-2-kappa-state-audit-reconcile on
+      # every bridge-agent.sh move so the predicate call and branch
+      # ordering cannot silently regress.
+      add_required beta5-2-kappa-state-audit-reconcile
+      # v0.15.0-beta5-2 Lane ξ (#1330/#1332/#1334/#1318-A): bridge-start.sh
+      # gained the BRIDGE_AGENT_ID env-prefix inline (#1330 M7) and the
+      # EFFECTIVE_CONTINUE_MODE warn gate (#1334 L4); bridge-run.sh's
+      # warn order must stay aligned with bridge-start.sh's. Pull
+      # beta5-2-xi-misc-fixes whenever either bridge-start.sh or
+      # bridge-run.sh moves so the env-prefix inline and the warn-order
+      # alignment cannot silently regress.
+add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1028-isolated-workdir-check 1118-v2-engine-binary-path v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning 1115-cli-usage-drift 1151-step-a-helper 1155-bootstrap-skill-guard 1158-marker-load-order 1165-track-a-scaffold-modes 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved I-agent-description-roster γ-cli-consistency C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir K-beta4-nits α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-epsilon-tmux-inject-busy beta5-2-theta-upgrade-backfill-perms beta5-2-xi-misc-fixes
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -457,7 +1053,14 @@ select_for_path() {
       # shared module risks breaking both surfaces simultaneously;
       # pull the consolidated regression smoke + the canonical-shape
       # 1170 smoke + the per-area smokes for both consumers.
-      add_required 1175-exhaustive-pathlib-audit 1170-safe-path-check-sudo-escalate 1165-track-a-scaffold-modes 1165-track-c-hooks-and-dispatcher hooks
+      # Issue #1178 (cycle 12 architectural root): the canonical
+      # helpers gained a `_sudo_stat_owner` recovery so a
+      # PermissionError on lstat()/exists() during the walker is no
+      # longer silently swallowed. Pull 1178-helper-contract-daemon-supp
+      # on every lib/bridge_iso_paths.py / lint /
+      # raw-pathlib-baseline.txt move so the helper contract + lint
+      # extension + boomerang test cannot regress.
+      add_required 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1170-safe-path-check-sudo-escalate 1165-track-a-scaffold-modes 1165-track-c-hooks-and-dispatcher hooks
       add_integration integration-minimal
       ;;
 
@@ -478,7 +1081,28 @@ select_for_path() {
       # routine `cd … && grep agent-roster.local.sh` read is no longer
       # mis-classified as a write. Cover the classifier regression smoke
       # whenever tool-policy.py moves.
-      add_required hooks agent-update v2-cross-class-read admin-hook-exemption tool-policy-roster-read-classify
+      # Issue #1205 (beta25 fast-follow): tool-policy.py::other_agent_homes()
+      # now wraps root.iterdir() + candidate.is_dir() in an iso-UID-gated
+      # try/except (returns [] under iso, re-raises for controller). Pull
+      # the regression smoke whenever tool-policy.py moves so the fail-open
+      # contract + the controller-side re-raise counter-test stay pinned.
+      # Issue #6607 (v0.15.0-beta2 Lane η): the anchored admin
+      # bridge-verb allowlist lives directly in tool-policy.py — pull
+      # the regression smoke whenever the file moves so the verb shape
+      # surface (allow path + shape-deny audit row + path-traversal /
+      # malformed-flag rejection) stays pinned.
+      # v0.15.0-beta4 Lane K (#1255 r2): hooks/tool-policy.py hosts
+      # `_bash_command_has_read_intent` — a STRICT read-intent
+      # whitelist that gates the admin roster carve-out. r1 shipped
+      # this as a write-intent blacklist that codex r1 review showed
+      # admitted unknown stage leaders (`python3 /tmp/mutator.py
+      # <roster>`, `my-mutator <roster>`, `git commit -F <roster>`).
+      # r2 flips it to a whitelist delegating to
+      # `_is_read_intent_bash`. Pull K-beta4-nits whenever
+      # tool-policy.py moves so a future PR cannot regress the admin
+      # carve-out back to a blacklist or widen it into a write/leak
+      # surface.
+      add_required hooks agent-update v2-cross-class-read admin-hook-exemption tool-policy-roster-read-classify 1205-hook-iso-fail-open 6607-hook-admin-allowlist K-beta4-nits
       add_integration integration-minimal
       ;;
 
@@ -588,7 +1212,127 @@ select_for_path() {
       # move so a future revert at any layer (row widening,
       # writer's Path A0 / Path A removal) re-introduces the Stop-hook
       # regression at PR time.
-      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup
+      # Phase 2 (post-v0.14.5-beta16): the new declarative install-tree
+      # reconciler lives at lib/bridge-isolation-v2-reconcile.sh and is
+      # called from bridge_isolation_v2_migrate_normalize_layout (D2),
+      # bridge_linux_prepare_agent_isolation (D4), and the new
+      # `agent-bridge isolation reconcile` CLI (D5). The Layer 17
+      # marker writer guard `_bridge_marker_writer_is_controller_uid`
+      # lives in lib/bridge-marker-bootstrap.sh (D6). Pull the phase2
+      # smoke on every isolation-lib + marker-bootstrap move so a
+      # regression at any layer (matrix row drift, dispatcher bug,
+      # protected-path guard removal, marker-write guard removal) is
+      # caught at PR time.
+      # Issue #1207: lib/bridge-isolation-helpers.sh's
+      # `bridge_iso_run_path_under_allowlist` gained a read/probe-only
+      # literal-prefix fallback for the stale-supp-groups class. Pull
+      # 1207-stale-supp-groups-allowlist on every isolation-helpers move
+      # so a future PR cannot regress (a) into letting write/publish
+      # ops accept the fallback, (b) drop the iso-side existence probe,
+      # or (c) drop the `..` reject ahead of the fallback.
+      # v0.15.0-beta4 Lane A (#1272 + #1277 + #1279 + #1213): the
+      # sanitized per-agent metadata writer
+      # (`bridge_isolation_v2_write_agent_metadata`) lives in
+      # lib/bridge-isolation-v2.sh, called from
+      # lib/bridge-isolation-v2-reapply.sh's reapply tick + from
+      # lib/bridge-agents.sh's prepare path. The smoke pins the
+      # writer presence, the reader's array-slot assignment shape,
+      # the getent-based config_dir fallback, the audit_dir_ensure
+      # helper, and the session_id_detect_empty visibility emit.
+      # Pull A-beta4-iso-path-resolution on every isolation-lib move
+      # so a regression at any layer cannot re-introduce the iso UID
+      # context's empty-array → controller-view-path drift.
+      # Issue #1278 (v0.15.0-beta4 Lane H): the per-UID
+      # `known_marketplaces.json` ownership/mode contract that the
+      # H-beta4 smoke pins depends directly on the matrix rows in
+      # lib/bridge-isolation-v2.sh (`isolated-plugin-manifests` at
+      # mode 2770 root:ab-agent-<a> — the parent dir is the rename
+      # surface for iso UID writes) and on the writer in
+      # lib/bridge-agents.sh (`bridge_write_isolated_known_marketplaces_
+      # catalog`, also reached transitively via the bridge-agents.sh
+      # all-required branch). Pull H-beta4-iso-ownership on every
+      # isolation-lib move so a matrix-row change that re-tightens the
+      # parent dir mode (or a refactor of the writer's chown/chmod
+      # block) immediately fails the regression contract.
+      # v0.15.0-beta4 Lane G (#1270): the new
+      # `bridge_isolation_v2_normalize_workdir_profile_group` helper
+      # lives in lib/bridge-isolation-v2.sh and is invoked from the
+      # `agent create` post-materialize path (bridge-agent.sh) and the
+      # `bridge_isolation_v2_backfill_workdir_identity` migrate path
+      # (lib/bridge-isolation-v2-workdir-backfill.sh). Pull
+      # G-beta4-watchdog-noise on every isolation-lib move so the
+      # CLAUDE.md group=ab-agent-<a> mode 0660 contract stays pinned at
+      # PR time.
+      # v0.15.0-beta4 Lane J (#1281): the CLAUDE.md / docs/developer-
+      # handover.md / OPERATIONS.md "Working with isolated agents
+      # (iso v2)" section cross-references the iso v2 boundary
+      # contract that lives in lib/bridge-isolation-v2.sh + helpers.
+      # The J-beta4 smoke pins all three docs carry the section.
+      # Pull on every isolation-lib move so a refactor cannot silently
+      # invalidate the doc cross-link (the doc says iso UID can't read
+      # X; the matrix row is what makes that true).
+      # Issue #1297 (v0.15.0-beta5 Lane α): lib/bridge-isolation-v2-
+      # workdir-backfill.sh's call into
+      # `bridge_isolation_v2_normalize_workdir_profile_group` was gated
+      # on writes-this-pass, so the beta3 → beta4 upgrade left existing
+      # workdir files at `0600 iso-uid:controller-gid` →
+      # bridge-start.sh grep on CLAUDE.md failed EACCES → restart +
+      # rollback both failed. Lane α drops the gate so the normalize
+      # runs for every iso v2 agent on every back-fill pass. Pull
+      # α-beta5-upgrade-backfill-normalize on every isolation-lib move
+      # so the gate cannot be re-introduced + the helper's idempotency
+      # contract under the unconditional call stays pinned.
+      # Issues #1315 + #1316 (v0.15.0-beta5-2 Lane θ): extends the
+      # Lane α normalize to ALSO cover the `.claude/` directory tree
+      # (`.claude/`, `.claude/plugins/`, `.claude/session-env/` →
+      # `ab-agent-<a>:2770`) and `known_marketplaces.json` (legacy
+      # `root:ab-agent-<a> 0640` → `iso-uid:ab-agent-<a> 0660` so the
+      # iso UID's plugin-cache rename succeeds on first start). New
+      # helpers `bridge_isolation_v2_chgrp_dir_iso_group` and
+      # `bridge_isolation_v2_chown_file_iso_uid` mirror the file-iso-
+      # group helper's stat-skip idempotency contract. Pull
+      # beta5-2-theta-upgrade-backfill-perms on every isolation-lib
+      # move so the directory walk + chown call cannot regress to a
+      # files-only loop or drop the stat-skip.
+      # Issue #1329 (v0.15.0-beta5-2 Lane μ M6): same normalize fn
+      # also walks the channel state dirs (`.discord` / `.telegram`
+      # / `.teams` / `.ms365` / `.mattermost`) and their credential
+      # files (`.env`, `access.json`, `state.json`, `mcp.json`) → set
+      # group `ab-agent-<a>` + mode 0640 (group-read, world-none). The
+      # beta5-2-mu-cron-channel-creds smoke pins the fileset, the
+      # mode (0640 NOT 0644 — edge case 6), and the absence of
+      # widening tokens. Pull on every isolation-lib move so the
+      # normalize cannot regress silently.
+      # v0.15.0-beta5 Lane gamma (#1298): the stat helper
+      # `bridge_linux_normalize_isolated_home_contract` (lib/bridge-agents.sh)
+      # now emits structured per-target status lines (`denied`/`error`/
+      # `missing`/`ok`/`changed`/`failed`) on EVERY early-return path so
+      # the reconcile row dispatcher can distinguish runtime probe
+      # failure from filesystem drift. The row dispatcher
+      # (`_bridge_iso_reconcile_row_agent_home_contract` in this lib)
+      # classifies `denied`/`error` -> degraded row + rc=0 (NOT drift),
+      # `missing` -> missing row + rc=1 (drift), and the no-line branch
+      # also degrades. Additionally, `bridge_isolation_v2_apply_install_
+      # tree_matrix`'s manual-mode parity branch implicitly expands to
+      # --all-agents on `reason=manual` so `agent-bridge isolation
+      # reconcile --apply` (no --agent / no --all) reports agent-home-
+      # contract rows instead of silently returning overall_rc=0. Pull
+      # gamma-beta5-reconcile-helper-status on every isolation-lib move
+      # so a refactor at either site (helper-side per-target emit, or
+      # caller-side classifier, or manual-mode parity guard) is caught
+      # at PR time.
+      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup phase2-install-tree-reconciler phase3-agent-home-contract 1207-stale-supp-groups-allowlist A-beta4-iso-path-resolution H-beta4-iso-ownership G-beta4-watchdog-noise J-beta4-workflow-docs α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms
+      # v0.15.0-beta5-2 Lane κ (#1325 M2): lib/bridge-isolation-v2-
+      # reconcile.sh hosts the manual-mode parity branch (#1298 Gap B)
+      # that makes `agent-bridge isolation reconcile --check` AND --apply
+      # both implicitly expand to --all-agents on `reason=manual`. The
+      # Lane κ smoke functionally verifies the parity branch is
+      # mode-agnostic (does NOT gate on `mode == apply`) — gamma-beta5
+      # only static-grepped the branch. Pull on every reconcile-lib move
+      # so a future refactor cannot silently regress the --check arm
+      # back to the pre-#1298 silent-skip shape.
+      add_required beta5-2-kappa-state-audit-reconcile
+      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup phase2-install-tree-reconciler phase3-agent-home-contract 1207-stale-supp-groups-allowlist A-beta4-iso-path-resolution H-beta4-iso-ownership G-beta4-watchdog-noise J-beta4-workflow-docs α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -616,7 +1360,13 @@ select_for_path() {
       # skip-under-v2 guard (beta10 missed the 7th controller-touch
       # site). Pull its unit smoke whenever lib/bridge-skills.sh moves
       # so a future PR cannot drop the optional agent arg + guard.
-      add_required isolated-skills-sync isolation launch 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard
+      # v0.15.0-beta5-2 Lane ν (#1333 L3): lib/bridge-skills.sh:377-...
+      # gained the opt-in setpriv fallback (BRIDGE_SKILLS_USE_SETPRIV=1)
+      # + actionable warn-on-double-fail. Pull beta5-2-nu-daemon-path-
+      # quarantine on every lib/bridge-skills.sh move so a future PR
+      # cannot silently regress the opt-in gate or the diagnostic
+      # tokens back to the pre-#1333 silent skip.
+      add_required isolated-skills-sync isolation launch 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard beta5-2-nu-daemon-path-quarantine
       add_integration integration-minimal
       ;;
 
@@ -641,7 +1391,33 @@ select_for_path() {
       # row this smoke pins also governs that writer. Pull
       # 1165-track-b-sudo-escalate-and-state on every channels-lib
       # move so a marker-write regression surfaces here.
-      add_required channel-plugins bridge-notify-no-default-discord-875 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state
+      # v0.15.0-beta3 Lane A12 (#1252): lib/bridge-channels.sh's
+      # `bridge_write_idle_ready_agents` now self-heals
+      # `state/agents/<a>/` AND emits the structured `[nudge-skip]
+      # agent=<a> task=- reason=state-dir-missing evidence=<dir>` line
+      # when the self-heal fails. Pull A12-beta3 on every channels-lib
+      # move so the silent-drop class (patch's beta2 OOTB: one nudge in
+      # 75min uptime, no further log evidence) cannot regress.
+      # v0.15.0-beta5-1 Lane 3 (#1307): the MCP-liveness probe
+      # path (bridge_agent_missing_plugin_mcp_channels_csv +
+      # bridge_plugin_mcp_descendant_ready_for_item) lives in
+      # lib/bridge-agents.sh; lib/bridge-channels.sh hosts the
+      # channel-status wake/notify surface that the giveup ledger
+      # gates. A change here could shift the probe shape under
+      # process_mcp_liveness_giveup_recovery, so pull
+      # mcp-liveness-giveup-auto-clear on every channels-lib move
+      # so the recovery contract (audit emit, ledger fields,
+      # transition observer) cannot regress through a probe-shape
+      # change.
+      # v0.15.0-beta5-2 Lane ι (#1321 H3): the new MCP-recovery
+      # miss-queue drain path replays accumulated miss-notify entries
+      # through the canonical `bridge_notify_send` wake path on
+      # `plugin_mcp_liveness_recovered`. Pull
+      # beta5-2-iota-daemon-escalation-family on every channels-lib /
+      # notify move so a future PR cannot regress the redeliver +
+      # dedup_key audit emit contract (the structured signal
+      # operators correlate against `plugin_mcp_liveness_recovered`).
+      add_required channel-plugins bridge-notify-no-default-discord-875 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state A12-beta3-1246-1252-daemon-supp-group-and-state-dir mcp-liveness-giveup-auto-clear beta5-2-iota-daemon-escalation-family
       add_integration integration-minimal
       ;;
 
@@ -656,7 +1432,14 @@ select_for_path() {
       ;;
 
     hooks/pre-compact.py|bridge-memory.py|scripts/librarian-process-ingest.py)
-      add_required pre-compact-envelope-roundtrip hooks upgrade-shared-settings-propagate
+      # Issue #1217 (beta27 Track E): hooks/pre-compact.py
+      # `_write_started_marker` now wraps the marker write sequence
+      # (mkdir + tempfile + replace) in an iso-UID-gated try/except
+      # that emits audit telemetry
+      # (`hook_permission_fail_open.precompact.started_marker`) before
+      # returning. The beta27-E smoke pins both the iso-side audit
+      # path and the controller-side negative test (no audit emitted).
+      add_required pre-compact-envelope-roundtrip hooks upgrade-shared-settings-propagate beta27-E-hook-permission-fail-open-markers
       add_integration integration-minimal
       ;;
 
@@ -666,6 +1449,39 @@ select_for_path() {
       # selection. Cover the exclusion regression smoke whenever the
       # ingest orchestrator moves.
       add_required 679-wiki-ingest-exclude-precompact
+      add_integration integration-minimal
+      ;;
+
+    bootstrap-memory-system.sh)
+      # Issue #1222 (v0.15.0 Lane H): step_rebuild_one's apply path now
+      # branches on linux-user isolation. The H smoke pins:
+      #   - bridge-lib.sh sourcing (so iso helpers are available)
+      #   - bridge_agent_linux_user_isolation_effective gate
+      #   - bridge_isolation_run_as_agent_user_via_bash invocation
+      #   - the iso inline script covers the FULL rebuild/publish block
+      #     (rm + rebuild-index + validate + mkdir + mv) — wrapping
+      #     only the leading `rm` or only the trailing `mv` was the
+      #     pre-fix shape and would re-trip the Permission denied bug
+      #   - non-iso branch preserved (no regression for shared installs)
+      #   - exit codes inside the iso script stay >= 10 so the wrapper's
+      #     +2 shift on rc<3 cannot collide with its pre-flight band
+      #   - no broad `--op rm` was added to bridge_iso_run (codex
+      #     scoping correction: broad unlink is a v2 security surface)
+      # The Linux+sudo gated T8 layer additionally stands up a real
+      # `agent-bridge-h_smoke` user + ab-agent-h_smoke group, scaffolds
+      # the iso-owned `memory/` at mode 2770 with a stale
+      # `index.sqlite.rebuilding-*` file, and asserts the cross-boundary
+      # asymmetry (controller rm fails, sudo-as-iso rm succeeds) is
+      # actually reproducible on this host.
+      #
+      # v0.15.0-beta4 Lane J (#1263): bootstrap-memory-system.sh's
+      # arg-parsing block now honors the BRIDGE_WIKI_GRAPH_ENABLED env
+      # gate (default-off on fresh installs, opt-in via env=1, explicit
+      # opt-out via env=0). J-beta4-workflow-docs (T7/T8/T8b) pins the
+      # gate semantics + the `wiki_graph_skipped=1` stdout marker so a
+      # future PR cannot regress the opt-in contract or break
+      # back-compat for installs that already provisioned wiki-graph.
+      add_required H-bootstrap-memory-iso-rebuild J-beta4-workflow-docs
       add_integration integration-minimal
       ;;
 
@@ -721,7 +1537,49 @@ select_for_path() {
       # rerender / scan flow with PermissionError tracebacks (the
       # PostToolUseFailure flood that drove #1165 Gap 7). Pull
       # 1175-exhaustive-pathlib-audit on every bridge-hooks.py move.
-      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit
+      # Issue #1178 (cycle 12): bridge-hooks.py gained noqa'd mutator
+      # sites (cmd_render_isolated_home_settings, _ensure_dir_with_sudo
+      # fallback, cmd_link_shared_settings sudo-recovery loop) under
+      # the extended lint surface. Pull 1178-helper-contract-daemon-supp
+      # so the noqa contract + helper integration cannot regress.
+      # Issue #1205 (beta25 fast-follow): hooks/bridge_hook_common.py
+      # grew an iso-UID-gated try/except around save_timestamp_state's
+      # write sequence (mkdir + write + chmod + replace) plus a new
+      # public under_isolated_uid() wrapper. hooks/prompt_timestamp.py
+      # and hooks/session_start.py call save_timestamp_state transitively
+      # so the same regression smoke pins the fail-open contract for
+      # both call sites. Pull 1205-hook-iso-fail-open on every
+      # hooks/*  + bridge-hooks.* move so a future patch cannot silently
+      # weaken the gate.
+      # Issue #1212 (beta26): bridge-hooks.py
+      # `agent_bridge_development_plugin_settings` now accepts any
+      # `plugin:<name>@<marketplace>` spec (not just @agent-bridge)
+      # and emits matching `extraKnownMarketplaces` entries when the
+      # marketplace mirror dir exists. 1212-bridge-hooks-marketplace
+      # pins the filter shape + the 4 safety guards (bare spec, empty
+      # name/marketplace, unsafe id, missing mirror) + idempotency.
+      # Issue #1213 (beta26): hooks/bridge_hook_common.py drops the
+      # mode-string env-var dependency from both `_under_isolated_uid`
+      # and `current_isolated_agent` (the bash assoc-array name
+      # collision in bridge-run.sh:212 makes the export structurally
+      # impossible). 1213-iso-uid-predicate pins the UID-side predicate
+      # + grep-asserted source guard against reintroducing the
+      # BRIDGE_AGENT_ISOLATION_MODE check in either function body.
+      # Issue #1217 (beta27 Track D): hooks/bridge_hook_common.py
+      # `agent_timestamp_enabled` now reads BRIDGE_AGENT_INJECT_TIMESTAMP_
+      # RESOLVED first with a fallback to the bare name (same
+      # alias pattern as BRIDGE_AGENT_CLASS_FOR_HOOK). beta27-D-inject-
+      # timestamp-resolved pins both the bash collision repro and the
+      # Python read order.
+      # Issue #1217 (beta27 Track E): hooks/pre-compact.py
+      # `_write_started_marker` and hooks/session_start.py
+      # `_write_compact_completed_marker` now wrap their write
+      # sequences in an iso-UID-gated try/except with audit telemetry
+      # (`hook_permission_fail_open.precompact.started_marker` /
+      # `hook_permission_fail_open.session_start.completed_marker`).
+      # beta27-E-hook-permission-fail-open-markers pins both wrappers
+      # and a controller-side negative test (no audit emitted).
+      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1205-hook-iso-fail-open 1212-bridge-hooks-marketplace 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers
       add_integration integration-minimal
       ;;
 
@@ -770,7 +1628,41 @@ select_for_path() {
       # task create. Pull the regression smoke whenever the upgrade
       # entry moves so neither of those two beta8 regressions can
       # recur.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task
+      # Phase 2 (post-v0.14.5-beta16): bridge-upgrade.sh gained a
+      # post-apply-live + pre-agent-restart hook calling
+      # `lib/upgrade-helpers/isolation-v2-reconcile.sh` (D3). Pull
+      # phase2-install-tree-reconciler whenever the upgrade entry
+      # moves so a regression on the reconciler-on-every-upgrade
+      # invariant is caught at PR time.
+      # Issue #1297 (v0.15.0-beta5 Lane α): bridge-upgrade.sh's
+      # workdir-backfill stage invokes
+      # `bridge_isolation_v2_backfill_workdir_identity`, whose iso v2
+      # normalize call is no longer gated on writes-this-pass. Pull
+      # α-beta5-upgrade-backfill-normalize whenever the upgrade entry
+      # moves so the beta3 → beta4 EACCES-on-restart regression cannot
+      # be re-introduced upstream of the helper.
+      # Issues #1315 + #1316 (v0.15.0-beta5-2 Lane θ): the same
+      # backfill stage now also normalizes the `.claude/` directory
+      # tree and `known_marketplaces.json` ownership. Pull beta5-2-
+      # theta-upgrade-backfill-perms whenever the upgrade entry moves
+      # so the directory walk + chown contract cannot regress.
+      # v0.15.0-beta5 Lane gamma (#1298): bridge-upgrade.sh's iso-reconcile
+      # stage is the original surface that emitted the 4 `[failed]` rows
+      # + WARN noise. The lane gamma fix lives in lib/bridge-agents.sh
+      # (helper) + lib/bridge-isolation-v2-reconcile.sh (caller +
+      # manual-mode parity); pull the regression smoke on every
+      # bridge-upgrade.sh move so the upgrade-time iso-reconcile call site
+      # cannot regress without the smoke catching the contract drift.
+      # Issue #1328 (v0.15.0-beta5-2 Lane μ M5): bridge-upgrade.sh now
+      # invokes `bridge_cron_state_dir_verify_and_migrate` as a backfill
+      # step so an operator-relocated `BRIDGE_CRON_STATE_DIR` migrates
+      # the old tree at upgrade time. The beta5-2-mu-cron-channel-creds
+      # smoke pins the helper's edge-case matrix (no anchor, anchor
+      # matches, anchor differs + old empty, anchor differs + both
+      # populated → conflict bail) and the run_sync wiring. Pull on
+      # every bridge-upgrade.sh move so the backfill call cannot
+      # silently regress.
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds
       add_integration integration-minimal
       ;;
 
@@ -789,6 +1681,56 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
+    bridge-auth.py|bridge-auth.sh)
+      # v0.15.0-beta4 Lane F r2 — codex r1 BLOCKING #3 (2026-05-27).
+      # bridge-auth.py and bridge-auth.sh are the canonical sites for
+      # the controller-credentials aliveness gate (#1261), the
+      # per-agent aliveness propagation through the wrapper, and the
+      # token-schema (fresh / near_expiry / expired / no_expires_at).
+      # The F-beta4-oauth-bootstrap smoke pins:
+      #
+      #   - controller_credentials_aliveness pure-Python classification
+      #     across all four states (T1).
+      #   - cmd_sync_agent refuses to propagate an expired credential
+      #     (T7) — the writer-side teeth that protects every periodic
+      #     sync from distributing a stale token.
+      #   - wrapper JSON carries per-agent aliveness/remaining_ms (T10)
+      #     so daemon-side auditing can branch.
+      #
+      # daemon-periodic-token-sync covers the bridge-daemon.sh tick
+      # that consumes the wrapper output and writes the
+      # controller_credentials_aliveness audit row + near_expiry
+      # daemon_warn line.
+      add_required F-beta4-oauth-bootstrap daemon-periodic-token-sync
+      add_integration integration-minimal
+      ;;
+
+    bridge-daemon-helpers.py)
+      # v0.15.0-beta4 Lane F r2 — codex r1 BLOCKING #3.
+      # bridge-daemon-helpers.py now hosts ``sync-aliveness-parse``
+      # alongside the existing ``sync-status-parse`` subcommand. The
+      # F-beta4 smoke + daemon periodic-sync smoke both exercise the
+      # parser; pull both whenever the helper moves so a future PR
+      # cannot regress either contract.
+      #
+      # v0.15.0-beta4 Lane I (#1262 Gap 3): the new ``a2a-stuck-decide``
+      # subcommand is the decision + ledger helper for
+      # process_a2a_outbox_stuck_scan_tick. The I-beta4-a2a-3-gaps
+      # smoke exercises it directly (stuck emit, cooldown suppress,
+      # cooldown expiry re-emit, ledger pruning) so a future PR cannot
+      # silently regress the helper output or the atomic ledger
+      # rewrite.
+      # v0.15.0-beta5-1 Lane 3 (#1307): the MCP-liveness giveup
+      # recovery tick in bridge-daemon.sh consumes the existing
+      # bridge-daemon-helpers.py shape only indirectly (via the
+      # audit-write path). Register mcp-liveness-giveup-auto-clear
+      # here so a helpers refactor that subtly changes the audit
+      # subprocess contract re-exercises the recovery tick's emit
+      # path.
+      add_required F-beta4-oauth-bootstrap daemon-periodic-token-sync daemon queue I-beta4-a2a-3-gaps mcp-liveness-giveup-auto-clear
+      add_integration integration-minimal
+      ;;
+
     bridge-init.sh|lib/bridge-init-codex-pair.sh|lib/bridge-init-default-crons.sh|lib/bridge-host-profile.sh)
       # Issue #1047: bridge-init.sh's fresh-install admin `agent create`
       # runs as a subprocess (no TTY) and must mark itself an
@@ -801,7 +1743,35 @@ select_for_path() {
       # advisory (lib/bridge-host-profile.sh) carries the dev-path manual
       # recipe. Pull admin-pair-server-auto-provision whenever any of the
       # four touches so the server/dev gate matrix stays pinned.
-      add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering
+      #
+      # v0.15.0-beta1 Lane I: bridge-init.sh now lands a useful default
+      # admin description (replacing the terse `<admin> admin role`
+      # placeholder) so downstream agents reading the roster on a fresh
+      # install see a real role sentence. Pull I-agent-description-roster
+      # on every bridge-init.sh move so the default cannot regress back
+      # to the terse string.
+      # v0.15.0-beta4 Lane F (#1230): bridge-init.sh's `[init]` log lines
+      # are now stderr-routed so the `--json` contract (stdout = data
+      # only) holds end-to-end. The F-beta4-oauth-bootstrap smoke pins
+      # the stderr-routing invariant + parses the dry-run JSON to catch
+      # any future leak. Pull on every bridge-init.sh move so a regression
+      # cannot reintroduce bridge-bootstrap.sh's JSONDecodeError surface.
+      # Same lane also rewrites the install-daemon-systemd.sh mode-parsing
+      # block here, so the smoke covers that wiring too.
+      #
+      # v0.15.0-beta4 Lane G (#1266): bridge-init.sh now writes
+      # `state/agents/<admin>/onboarding-pending` after the admin create
+      # so the watchdog's first tick treats the fresh-install drift as
+      # priority=low instead of high. G-beta4-watchdog-noise pins both
+      # the marker schema (T7) and the downstream fresh_install_only
+      # downgrade path (T1).
+      # Issue #1312 (v0.15.0-beta5-2 Lane ε): bridge-init.sh now emits a
+      # startup-time refuse advisory when BRIDGE_TMUX_INJECT_SPOOL_ENABLED=0
+      # is set on an iso v2 install without the FORCE escape hatch. Pull
+      # beta5-2-epsilon-tmux-inject-busy on every bridge-init.sh move so the
+      # advisory surface cannot regress, re-opening the CRITICAL data-loss
+      # class flagged by the patch audit C6.
+      add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering I-agent-description-roster β-1231-1236-fresh-install-seed-sudoers F-beta4-oauth-bootstrap G-beta4-watchdog-noise beta5-2-epsilon-tmux-inject-busy
       add_integration integration-minimal
       ;;
 
@@ -811,7 +1781,26 @@ select_for_path() {
       # UX block to ~/.tmux.conf. Pull the idempotency / graceful-degradation
       # smoke whenever either file moves so a future PR cannot regress the
       # in-place block replacement or the version/terminfo gating.
-      add_required 1058-bootstrap-tmux-ux agent-create-caller-trust-gate
+      #
+      # v0.15.0-beta4 Lane F (#1230 + #1261): bridge-bootstrap.sh now
+      # carries the OAT advisory (#1261) AND captures bridge-init.sh's
+      # stdout via $() to parse the JSON payload — any leaked log line
+      # on the init stdout re-introduces the JSONDecodeError surface
+      # documented in #1230. F-beta4-oauth-bootstrap pins both the
+      # advisory presence and the dry-run JSON parse.
+      #
+      # v0.15.0-beta4 Lane I (#1262 Gap 1): bridge-init.sh now accepts
+      # `--enable-a2a` and emits an `a2a_status` field in the JSON
+      # payload. The smoke pins the flag wiring + JSON field + stderr
+      # routing for the `[init] --enable-a2a:` log lines so a future
+      # PR cannot silently leak them onto stdout.
+      # v0.15.0-beta4 Lane J (#1263): bridge-bootstrap.sh now also
+      # carries the wiki-graph + librarian opt-in advisory (text mode)
+      # and a structured `wiki_graph` object in the --json payload.
+      # J-beta4-workflow-docs (T7/T7b) asserts both surfaces are
+      # present; pull on every bridge-bootstrap.sh move so the
+      # advisory cannot regress to silent default.
+      add_required 1058-bootstrap-tmux-ux agent-create-caller-trust-gate F-beta4-oauth-bootstrap I-beta4-a2a-3-gaps J-beta4-workflow-docs
       add_integration integration-minimal
       ;;
 
@@ -838,7 +1827,21 @@ select_for_path() {
       # 1015-resume-claude-config-dir pins the config-root resolution
       # (trailing arg > CLAUDE_CONFIG_DIR env > daemon-HOME fallback) and
       # the backward-compatible non-isolated path.
-      add_required 1015-resume-claude-config-dir 981-restart-session-resume-snapshot
+      #
+      # v0.15.0-beta5 Lane β (#1299): these helpers read Claude Code's
+      # session JSON + transcripts which are written `0600 <iso-uid>:
+      # ab-agent-<a>`. The bash shims now wrap the python invocation in
+      # `sudo -n -u <iso-uid> -- bash -c 'exec python3 "$@"' bash …` so
+      # the read operations succeed under iso v2. Beta-beta5-session-id-
+      # detect-sudo pins the wrap shape (function-body grep + argv-
+      # capture stub) and the data-shape / back-compat contract.
+      # v0.15.0-beta5-1 (#1304): the empty-detect no-op guard inside
+      # `bridge_persist_agent_state` blocks empty-overwrites when the
+      # resolver returns rc=1 (e.g., 0600 jsonl unreadable because
+      # `bridge_resolve_agent_iso_sudo_user` returned empty for this
+      # PID). Pull the smoke whenever either helper moves so a change to
+      # the read-side contract cannot regress the write-side guard.
+      add_required 1015-resume-claude-config-dir 981-restart-session-resume-snapshot Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race
       add_integration integration-minimal
       ;;
 
@@ -850,6 +1853,21 @@ select_for_path() {
       # smoke that asserts the renderer never leaks JSONDecodeError.
       add_required cleanup-payload-empty-stdin-872 upgrade telegram-relay-residue-cleanup
       add_integration integration-minimal
+      ;;
+
+    bridge-diagnose.sh|scripts/python-helpers/admin-set-config.py)
+      # v0.15.0-beta4 Lane K:
+      #   #1283 — bridge-diagnose.sh is now a thin deprecation shim;
+      #         the `acl` subcommand exits non-zero with a notice
+      #         pointing at `agent-bridge isolation reconcile`. The
+      #         heavy ACL scanner helpers are removed.
+      #   #1247 — scripts/python-helpers/admin-set-config.py is the
+      #         file-as-argv writer for `agb admin set --auto-restart
+      #         on|off` (footgun #11 — no heredoc-stdin). Pull
+      #         K-beta4-nits whenever either file moves so a future
+      #         PR cannot revive the ACL scanner or break the admin
+      #         set CLI surface.
+      add_required K-beta4-nits
       ;;
 
     bridge-lib.sh|lib/bridge-core.sh|lib/bridge-agents.sh|agent-roster.sh|agent-roster.local.example.sh|bridge-config.sh)
@@ -872,7 +1890,23 @@ select_for_path() {
       # false-positive-reporting `missing_files: CLAUDE.md, SOUL.md, …`
       # on every cron tick. Pull 1108-watchdog-v2-workdir on every
       # watchdog move so the dual-tree confusion class stays caught.
-      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill queue
+      # v0.15.0-beta2 lane ε: #1233 adds the `watchdog rescan` verb
+      # (writes latest.md immediately, bypasses the daemon cooldown by
+      # construction); #1237 adds the engine-native Codex contract
+      # (validates AGENTS.md) and re-routes engines with no implemented
+      # contract to `unsupported_engine_contract` instead of silent OK.
+      # Pull ε-watchdog-rescan-codex on every watchdog move so a future
+      # PR cannot regress either contract or accidentally re-introduce
+      # the silent-codex / silent-unknown-engine path.
+      # v0.15.0-beta4 Lane G (#1266 + #1270 + #1254): bridge-watchdog.py
+      # gained fresh-install detection (priority=low downgrade signal),
+      # static session_type onboarding_state suppression, restart-in-
+      # progress marker reading (#1251 contract reuse), and the
+      # scan_error category split (controller-cache-stale vs
+      # iso-uid-side). Pull G-beta4-watchdog-noise on every
+      # bridge-watchdog.py move so a future refactor cannot regress any
+      # of those four contracts without the smoke catching it.
+      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise queue
       add_integration integration-minimal
       ;;
 
@@ -915,7 +1949,15 @@ select_for_path() {
       # resolver / descriptor / memory-default out of agreement. (The D3
       # template .md files are dispatched in the pre-docs-return case
       # above.)
-      add_required 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning v2-scaffold-home-and-workdir agent-doctor
+      # v0.15.0-beta5-2 Lane ξ (#1332 L2): bridge_layout_materialize_identity
+      # now performs per-file atomic chgrp+chmod inside its cp loop via
+      # bridge_isolation_v2_chgrp_file_iso_group so each materialized file
+      # is iso-UID-readable BEFORE the next loop iteration — closing the
+      # per-file race window the bulk post-materialize normalize alone
+      # could not address. Pull beta5-2-xi-misc-fixes on every layout
+      # move so the per-file pattern cannot silently regress to the
+      # pre-#1332 controller-only cp -f.
+      add_required 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning v2-scaffold-home-and-workdir agent-doctor beta5-2-xi-misc-fixes
       add_integration integration-minimal
       ;;
 
@@ -925,6 +1967,98 @@ select_for_path() {
       # so `agent create --isolate` no longer dumps a traceback. Cover the
       # channel-plugins regression smoke whenever the channel modules move.
       add_required channel-plugins channel-env-readiness
+      add_integration integration-minimal
+      ;;
+
+    bridge-plugins.sh|bridge-dev-plugin-cache.py|lib/upgrade-helpers/plugins-seed-merge-known-marketplace.py|lib/upgrade-helpers/plugins-list-json.py|lib/upgrade-helpers/plugins-list-pretty.py|lib/upgrade-helpers/plugins-marketplaces-json.py|lib/upgrade-helpers/plugins-marketplaces-pretty.py)
+      # Issues #1201/#1202 (v0.14.5-beta24): bridge-plugins.sh grew
+      # `bridge_plugins_seed_mirror_marketplace_root` so `agb plugins seed
+      # --marketplace-root <path>` creates the controller-side mirror at
+      # `$BRIDGE_SHARED_ROOT/plugins-cache/marketplaces/<id>/` that
+      # `bridge_known_marketplace_info` (lib/bridge-agents.sh:1664)
+      # consults before planting the iso UID's marketplace symlink.
+      # bridge-dev-plugin-cache.py is the sync helper that
+      # `bridge_plugins_cmd_seed` invokes — its output shape feeds the
+      # mirror's downstream catalog manifests, so any move to either
+      # callsite must re-run the regression smoke.
+      #
+      # Issue #1208 (v0.14.5-beta25): the D2 iso UID propagation in
+      # bridge-plugins.sh now passes `BRIDGE_PLUGIN_LOCK_GROUP=$agent_group`
+      # to `lib/upgrade-helpers/plugins-seed-merge-known-marketplace.py`
+      # so the sidecar `known_marketplaces.json.lock` is created (or
+      # normalized) as `root:$agent_group 0660` instead of `root:root
+      # 0600`. The shell-side post-normalizer also self-heals
+      # pre-existing beta24 bad locks. Pull
+      # 1208-lock-metadata-normalize on every bridge-plugins.sh,
+      # bridge-dev-plugin-cache.py, or helper move so the lock contract
+      # cannot regress.
+      #
+      # Issue #1236 (v0.15.0-beta2 Lane ζ): bridge-plugins.sh grew the
+      # read-only `agb plugins list [--json]` and `agb plugins
+      # marketplaces [--json]` verbs. The four
+      # `lib/upgrade-helpers/plugins-{list,marketplaces}-{json,pretty}.py`
+      # helpers are pure-reader file-as-argv subprocess callees the new
+      # verb arms invoke. Pull ζ-1236-plugins-list-marketplaces on any
+      # move to bridge-plugins.sh, the sync helper, or any of the
+      # plugins-* upgrade helpers so a helper-only change cannot
+      # regress the empty/populated/--json/-h contract without the
+      # smoke firing in required CI.
+      #
+      # Issues #1249 + #1250 (v0.15.0-beta3 Lane B): bridge-plugins.sh
+      # grew the integrated `agb plugins add-marketplace <url-or-path>
+      # [--channels ...]` verb (#1249) and a node_modules auto-install
+      # pass inside `bridge_plugins_cmd_seed` (#1250) with `--no-auto-install`
+      # opt-out. Both features touch the same dispatcher + seed flow
+      # the existing #1201/#1202/#1208/#1236 lanes pin; pull
+      # B-beta3-1249-1250-plugin-ux on every bridge-plugins.sh +
+      # dev-plugin-cache + plugins-* helper move so the new dispatcher
+      # entry, add-marketplace verb, and seed auto-install branch cannot
+      # regress without the smoke firing in required CI. The smoke also
+      # references the new lib/upgrade-helpers/plugins-seed-parse-sync-output.py
+      # helper — added below as its own trigger row so a helper-only edit
+      # still pulls the regression smoke.
+      # Issue #1278 (v0.15.0-beta4 Lane H): `bridge_plugins_seed_propagate_
+      # iso_known_marketplaces` (the D2 path) now chowns the per-UID
+      # `known_marketplaces.json` to `<iso_user>:ab-agent-<a> 0660`
+      # instead of `root:ab-agent-<a> 0640`, mirroring
+      # `bridge_write_isolated_known_marketplaces_catalog` in
+      # lib/bridge-agents.sh. The #1208 lock self-heal stays intact.
+      # Pull H-beta4-iso-ownership on every bridge-plugins.sh +
+      # dev-plugin-cache move so an inadvertent revert at either
+      # writer site immediately fails the regression contract.
+      # v0.15.0-beta4 Lane K (#1282 Surface B): bridge-dev-plugin-cache.py
+      # now reports `node_modules=not-required` (instead of `=missing`)
+      # for plugin sources that declare no deps + no lockfile, so `.mjs`
+      # proxy plugins (`cosmax-ep-approval` etc.) stop painting the
+      # operator dashboard with cosmetic noise. Pull K-beta4-nits
+      # whenever bridge-dev-plugin-cache.py moves so a future PR cannot
+      # silently revert the heuristic.
+      add_required 1201-1202-directory-marketplace-seed channel-plugins 1208-lock-metadata-normalize ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume C-beta4-logger-and-spec H-beta4-iso-ownership K-beta4-nits
+      add_integration integration-minimal
+      ;;
+
+    scripts/python-helpers/claude-plugin-manifest-has-spec.py)
+      # Issue #1274 (v0.15.0-beta4 Lane C): this standalone helper is the
+      # canonical decoder for `bridge_claude_plugin_status` →
+      # `_bridge_claude_plugin_bridge_manifest_has_spec` (the per-UID +
+      # shared-cache manifest probe). The helper now strips a `plugin:`
+      # prefix at the boundary so callers that forget to strip
+      # `${item#plugin:}` (the v0.15.0-beta3 Lane C1 restart preflight
+      # regression that landed unstripped at lib/bridge-agents.sh:7823)
+      # still produce the correct present/absent result. Any move to
+      # this helper must pull C-beta4-logger-and-spec so the boundary
+      # strip contract stays caught.
+      add_required C-beta4-logger-and-spec C1-beta3-1251-restart-preflight-rollback
+      add_integration integration-minimal
+      ;;
+
+    lib/upgrade-helpers/plugins-seed-parse-sync-output.py)
+      # Issue #1250 (v0.15.0-beta3 Lane B): the sync-output parser the
+      # seed auto-install branch invokes file-as-argv. A helper-only
+      # change (regex tightening, dep-detection extension) must still
+      # pull the parent smoke so the parser contract stays in lockstep
+      # with the seed branch that consumes its TSV rows.
+      add_required B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume
       add_integration integration-minimal
       ;;
 

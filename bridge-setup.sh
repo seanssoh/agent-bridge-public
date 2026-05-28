@@ -6,6 +6,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
+# v0.15.0-beta4 Lane B (issues #1268 / #1271): teams + ms365 channel
+# setup verbs route through an explicit interactive wizard. The shared
+# helper is sourced after bridge-lib.sh so it can use bridge_die /
+# bridge_warn / bridge_info.
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/bridge-setup-wizard.sh"
 bridge_load_roster
 
 usage() {
@@ -13,7 +19,8 @@ usage() {
 Usage:
   $(basename "$0") discord <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--channel <id>]... [--allow-from <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
-  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
+  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run] [--allow-probe-failure]
   $(basename "$0") agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start] [setup options...]
   $(basename "$0") admin <agent>
 
@@ -22,6 +29,8 @@ Examples:
   $(basename "$0") discord tester --channel-account default --channel 123456789012345678
   $(basename "$0") telegram tester --channel-account default --allow-from 123456789
   $(basename "$0") teams tester --channel-account default --allow-from 00000000-0000-0000-0000-000000000000
+  $(basename "$0") ms365 tester
+  $(basename "$0") ms365 tester --redirect-uri https://bot.example.com/auth/callback
   $(basename "$0") agent tester
   $(basename "$0") agent tester --test-start
   $(basename "$0") admin tester
@@ -46,7 +55,13 @@ EOF
     teams)
       cat <<EOF
 Usage:
-  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
+EOF
+      ;;
+    ms365)
+      cat <<EOF
+Usage:
+  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run] [--allow-probe-failure]
 EOF
       ;;
     agent)
@@ -420,6 +435,56 @@ bridge_setup_replace_agent_telegram_channel() {
   BRIDGE_AGENT_CHANNELS["$agent"]="$merged"
 }
 
+# Issue #1232: per-channel setup verbs (setup teams / discord / telegram /
+# ms365) used to call `bridge_ensure_claude_channel_plugins "$agent"` which
+# walks EVERY entry on BRIDGE_AGENT_CHANNELS[<agent>] and fails the whole
+# verb if any unrelated channel resolves to a marketplace whose source
+# isn't seeded in the bridge-owned plugin manifest. That made a successful
+# `setup teams` look like a failure when an unrelated `plugin:foo@private`
+# marketplace was on the same agent's channel list.
+#
+# This helper restricts the readiness pass to the channel the verb owns:
+# select only the matching item(s) from the agent's CSV (canonicalised
+# via `bridge_qualify_channel_item`), then run the existing
+# `bridge_ensure_claude_channel_plugins_for_csv` walker on that subset.
+#
+# Callers pass the un-suffixed plugin selector (e.g. `plugin:teams`); the
+# function matches `plugin:teams@<any-marketplace>` so an operator that
+# explicitly pinned a non-default marketplace for the channel still gets
+# the readiness pass on their selection. Unrelated channels are
+# untouched — `agent start` already enforces full channel readiness at
+# launch time, which is the correct fail-fast gate for the cross-channel
+# manifest contract.
+bridge_setup_ensure_claude_channel_plugin_for_needle() {
+  local agent="$1"
+  local needle="$2"
+  local current=""
+  local item=""
+  local filtered=""
+  local -a items=()
+
+  [[ -n "$agent" && -n "$needle" ]] || return 0
+  [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 0
+
+  current="$(bridge_agent_channels_csv "$agent")"
+  [[ -n "$current" ]] || return 0
+
+  IFS=',' read -r -a items <<<"$current"
+  for item in "${items[@]}"; do
+    item="$(bridge_trim_whitespace "$item")"
+    [[ -n "$item" ]] || continue
+    item="$(bridge_qualify_channel_item "$item")"
+    case "$item" in
+      "$needle"|"$needle"@*)
+        filtered="$(bridge_append_csv_unique "$filtered" "$item")"
+        ;;
+    esac
+  done
+
+  [[ -n "$filtered" ]] || return 0
+  bridge_ensure_claude_channel_plugins_for_csv "$filtered" "$agent"
+}
+
 bridge_setup_ensure_development_channels_launch_flag() {
   local agent="$1"
   local current=""
@@ -514,7 +579,11 @@ run_discord() {
       bridge_setup_sync_runtime_account "$runtime_config" "$compat_config" "discord" "$channel_account"
       bridge_setup_write_local_assoc "BRIDGE_AGENT_NOTIFY_ACCOUNT" "$agent" "$channel_account" >/dev/null
     fi
-    bridge_ensure_claude_channel_plugins "$agent"
+    # Issue #1232: scope plugin readiness to the channel this verb owns
+    # (plugin:discord). Unrelated channels are validated at `agent start`
+    # time, not here, so a foreign-marketplace channel cannot make
+    # `setup discord` exit non-zero even though Discord was provisioned.
+    bridge_setup_ensure_claude_channel_plugin_for_needle "$agent" "plugin:discord"
     # Issue #989: bridge_setup_add_agent_channel rewrote BRIDGE_AGENT_CHANNELS
     # in agent-roster.local.sh — refresh the isolated agent's cached
     # runtime/agent-env.sh so its launch cmd cannot keep a pre-v2 channel
@@ -586,7 +655,8 @@ run_telegram() {
       bridge_setup_sync_runtime_account "$runtime_config" "$compat_config" "telegram" "$channel_account"
       bridge_setup_write_local_assoc "BRIDGE_AGENT_NOTIFY_ACCOUNT" "$agent" "$channel_account" >/dev/null
     fi
-    bridge_ensure_claude_channel_plugins "$agent"
+    # Issue #1232: scope plugin readiness to plugin:telegram only.
+    bridge_setup_ensure_claude_channel_plugin_for_needle "$agent" "plugin:telegram"
     # Issue #989: bridge_setup_replace_agent_telegram_channel rewrote
     # BRIDGE_AGENT_CHANNELS in agent-roster.local.sh — refresh the isolated
     # agent's cached runtime/agent-env.sh. NO-OP for non-isolated agents.
@@ -615,6 +685,7 @@ run_teams() {
   runtime_config="$(bridge_compat_config_file)"
   compat_config="$(bridge_compat_config_file)"
 
+  local _allow_probe_failure=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --app-id|--app-password|--app-password-file|--tenant-id|--service-url|--messaging-endpoint|--webhook-host|--webhook-port|--ingress-port|--channel-account|--runtime-config|--allow-from|--conversation)
@@ -633,11 +704,55 @@ run_teams() {
         py_args+=("$1")
         shift
         ;;
+      --allow-probe-failure)
+        # v0.15.0-beta4 Lane B R2 escape hatch (codex r1 BLOCKING fix).
+        # Consumed by the wizard probe layer — do NOT forward to the
+        # python wizard which doesn't know the flag.
+        _allow_probe_failure=1
+        shift
+        ;;
       *)
         bridge_die "지원하지 않는 setup teams 옵션입니다: $1"
         ;;
     esac
   done
+
+  # v0.15.0-beta4 Lane B (#1268): wizard gate. Two paths:
+  #   - auto mode (`--yes` in argv) — fail loud with the enumerated list
+  #     of missing required flags so the operator sees ALL of them at
+  #     once (vs. the prior `Teams app id and app password are required`
+  #     line which only named two of the seven).
+  #   - interactive mode (no `--yes` + both stdin/stdout are TTYs) —
+  #     route through the 4-step wizard which prompts for every missing
+  #     required value with sourcing guidance, then appends `--yes` to
+  #     the python invocation. After the python wizard returns success,
+  #     print step 4 (outstanding manual action summary).
+  # Anything else (no `--yes`, no TTY) is the prior fall-through:
+  # bridge-setup.py's own interactive prompts may attempt to read stdin
+  # and surface the same legacy error if a required value is missing.
+  local _wizard_kicked_in=0
+  if bridge_setup_wizard_is_auto_mode "${py_args[@]}"; then
+    bridge_setup_wizard_validate_auto teams "${py_args[@]}"
+  elif bridge_setup_wizard_is_interactive_tty; then
+    bridge_setup_wizard_run_teams "$agent" py_args
+    _wizard_kicked_in=1
+  fi
+
+  # v0.15.0-beta4 Lane B R2 (codex r1 BLOCKING): Step 3 connectivity
+  # probes. Without this gate, the wizard exits success while Bot
+  # Framework inbound DM is still silently dropped — exactly the #1268
+  # OOTB failure surface the lane was supposed to close. Runs for BOTH
+  # auto and interactive paths (validate_auto / run_teams already
+  # confirmed the required fields are present). --dry-run skips probes
+  # because we never spawn the actual binder. --allow-probe-failure
+  # downgrades die→warn for air-gapped / pre-DNS-cutover installs.
+  if [[ $dry_run -eq 0 ]] && [[ "${BRIDGE_SETUP_WIZARD_SKIP_PROBES:-0}" != "1" ]]; then
+    local -a _probe_args=("${py_args[@]}")
+    if (( _allow_probe_failure == 1 )); then
+      _probe_args+=("--allow-probe-failure")
+    fi
+    bridge_setup_wizard_run_teams_probes "${_probe_args[@]}"
+  fi
 
   teams_dir="$(bridge_agent_teams_state_dir "$agent")"
   base_args=(
@@ -669,7 +784,10 @@ run_teams() {
       bridge_setup_sync_runtime_account "$runtime_config" "$compat_config" "teams" "$channel_account"
       bridge_setup_write_local_assoc "BRIDGE_AGENT_NOTIFY_ACCOUNT" "$agent" "$channel_account" >/dev/null
     fi
-    bridge_ensure_claude_channel_plugins "$agent"
+    # Issue #1232: scope plugin readiness to plugin:teams only — a foreign
+    # marketplace declared on the same agent must not make `setup teams`
+    # exit non-zero. `agent start` enforces full channel readiness.
+    bridge_setup_ensure_claude_channel_plugin_for_needle "$agent" "plugin:teams"
     # Issue #989: setup teams rewrote BOTH BRIDGE_AGENT_CHANNELS
     # (bridge_setup_add_agent_channel) AND BRIDGE_AGENT_LAUNCH_CMD
     # (bridge_setup_ensure_development_channels_launch_flag) in
@@ -678,6 +796,122 @@ run_teams() {
     # cmd reflects the channel add and the dev-channel launch flag.
     # NO-OP for non-isolated agents.
     bridge_refresh_isolated_agent_env_after_channel_mutation "$agent"
+  fi
+  # v0.15.0-beta4 Lane B (#1268): step 4 — outstanding manual action
+  # summary printed only when the interactive wizard ran (so explicit
+  # `--yes` automation does not get extra noise on its stdout/stderr).
+  if [[ $_wizard_kicked_in -eq 1 && $dry_run -eq 0 ]]; then
+    bridge_setup_wizard_post_summary_teams
+  fi
+}
+
+# Issue #1209: ms365 channel setup wizard. Persists MS365_REDIRECT_URI
+# (and optional CLIENT_ID/SECRET/TENANT_ID) to .ms365/.env so the
+# fail-loud `resolveRedirectUri()` in plugins/ms365/server.ts has a
+# valid value at pair_start time instead of throwing.
+run_ms365() {
+  local agent="${1:-}"
+  local ms365_dir=""
+  local teams_dir=""
+  local teams_state_file=""
+  local dry_run=0
+  local py_args=()
+  local base_args=()
+
+  shift || true
+  if [[ "$agent" == "-h" || "$agent" == "--help" || "$agent" == "help" ]]; then
+    setup_subcommand_usage "ms365"
+    return 0
+  fi
+  [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") ms365 <agent> [...]"
+  bridge_require_agent "$agent"
+  bridge_setup_require_claude_agent "$agent" "MS365"
+
+  local _allow_probe_failure=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --redirect-uri|--messaging-endpoint|--tenant-id|--client-id|--client-secret|--client-secret-file|--default-upn|--default-scopes)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        py_args+=("$1" "$2")
+        shift 2
+        ;;
+      --allow-localhost|--yes|--dry-run)
+        # PR #1220 codex r1: --allow-localhost is a value-less flag
+        # that the Python wizard records as MS365_REDIRECT_URI_ALLOW_LOCALHOST=1.
+        [[ "$1" == "--dry-run" ]] && dry_run=1
+        py_args+=("$1")
+        shift
+        ;;
+      --allow-probe-failure)
+        # v0.15.0-beta4 Lane B R2 escape hatch (codex r1 BLOCKING fix).
+        # Consumed by the wizard probe layer — do NOT forward to the
+        # python wizard which doesn't know the flag.
+        _allow_probe_failure=1
+        shift
+        ;;
+      *)
+        bridge_die "지원하지 않는 setup ms365 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  # v0.15.0-beta4 Lane B (#1271): wizard gate. Same shape as run_teams.
+  # Auto mode (--yes in argv) requires every site-specific flag
+  # (--client-id / --client-secret-file / --tenant-id / --redirect-uri /
+  # --default-scopes) — missing values fail-loud with the enumerated
+  # list. Interactive TTY runs the 4-step wizard, then the python
+  # wizard with --yes, then prints step 4 (manual action summary).
+  local _wizard_kicked_in=0
+  if bridge_setup_wizard_is_auto_mode "${py_args[@]}"; then
+    bridge_setup_wizard_validate_auto ms365 "${py_args[@]}"
+  elif bridge_setup_wizard_is_interactive_tty; then
+    bridge_setup_wizard_run_ms365 "$agent" py_args
+    _wizard_kicked_in=1
+  fi
+
+  # v0.15.0-beta4 Lane B R2 (codex r1 BLOCKING): Step 3 connectivity
+  # probe — redirect_uri must respond to a HEAD request, otherwise the
+  # OAuth pair_start will fail with a network-level error after the
+  # wizard already wrote .ms365/.env. --dry-run skips probes (no state
+  # is written anyway). --allow-probe-failure downgrades die→warn.
+  if [[ $dry_run -eq 0 ]] && [[ "${BRIDGE_SETUP_WIZARD_SKIP_PROBES:-0}" != "1" ]]; then
+    local -a _probe_args=("${py_args[@]}")
+    if (( _allow_probe_failure == 1 )); then
+      _probe_args+=("--allow-probe-failure")
+    fi
+    bridge_setup_wizard_run_ms365_probes "${_probe_args[@]}"
+  fi
+
+  ms365_dir="$(bridge_agent_ms365_state_dir "$agent")"
+  teams_dir="$(bridge_agent_teams_state_dir "$agent")"
+  teams_state_file="$teams_dir/state.json"
+
+  base_args=(
+    ms365
+    --agent "$agent"
+    --ms365-dir "$ms365_dir"
+    --teams-state-file "$teams_state_file"
+  )
+
+  bridge_setup_python "${base_args[@]}" "${py_args[@]}"
+  if [[ $dry_run -eq 0 ]]; then
+    bridge_setup_add_agent_channel "$agent" "plugin:ms365"
+    if bridge_setup_ensure_development_channels_launch_flag "$agent"; then
+      bridge_info "[info] added --dangerously-load-development-channels $(bridge_agent_dev_channels_csv "$agent") to $agent launch"
+    else
+      bridge_info "[info] $agent launch already allows development channels: $(bridge_agent_dev_channels_csv "$agent")"
+    fi
+    # Issue #1232: scope plugin readiness to plugin:ms365 only.
+    bridge_setup_ensure_claude_channel_plugin_for_needle "$agent" "plugin:ms365"
+    # Issue #989 (same as teams): refresh the isolated agent's cached
+    # runtime/agent-env.sh AFTER writes so the regenerated launch cmd
+    # reflects the channel add and the dev-channel launch flag.
+    bridge_refresh_isolated_agent_env_after_channel_mutation "$agent"
+  fi
+  # v0.15.0-beta4 Lane B (#1271): step 4 — manual action summary
+  # printed only when the interactive wizard ran. Auto mode stays quiet.
+  if [[ $_wizard_kicked_in -eq 1 && $dry_run -eq 0 ]]; then
+    bridge_setup_wizard_post_summary_ms365
   fi
 }
 
@@ -1156,6 +1390,9 @@ case "$subcommand" in
   teams)
     run_teams "$@"
     ;;
+  ms365)
+    run_ms365 "$@"
+    ;;
   agent)
     run_agent "$@"
     ;;
@@ -1168,7 +1405,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "discord telegram teams agent admin")"
+      "discord telegram teams ms365 agent admin")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 setup 명령입니다: $subcommand"
     ;;

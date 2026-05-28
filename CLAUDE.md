@@ -123,6 +123,22 @@ Acceptable: prep VERSION + CHANGELOG drafts, run codex-rescue review on a releas
 5. **Hooks / tool policy / prompt guard (`hooks/`, `bridge-hooks.py`, `bridge-guard.py`)** — containment/audit layer, not a sandbox. Changes here affect every Claude session's settings.
 6. **A2A receiver (`bridge-handoffd.py`, `bridge_a2a_common.py`)** — the only component that handles untrusted *remote* traffic. The fail-closed tailnet bind, HMAC verification, `remote_addr` check, allowlist, and dedupe are security-critical; never weaken the bind proof or expose `--skip-companion-validate` to remote peers.
 
+## Working with isolated agents (iso v2)
+
+On Linux hosts that have linux-user isolation enabled (the v0.8.0+ iso v2 stack), every agent runs as a dedicated OS user `agent-bridge-<a>` with a primary group `ab-agent-<a>`. The controller (your normal shell) is intentionally NOT a member of those groups — that boundary is what keeps one agent's credentials/runtime out of another agent's reach. The cost is a handful of "permission denied" surprises if you treat iso agents the same as shared-mode agents. Keep these rules in mind when working in or against an iso v2 agent:
+
+- **Read-restricted paths from inside an iso UID.** An iso agent cannot read the controller's `~/.agent-bridge/state/active-roster.md`, `HEARTBEAT.md`, other agents' home directories, or files under another iso UID's runtime. Anything CLAUDE.md guides "go look at active-roster.md" must be reachable through a bridge CLI verb (e.g. `agb agent list`, `agb status`) — not direct fs read.
+- **Permission dance on shared files.** Cross-class state files (per-agent metadata, shared marketplaces) use a controller-published pattern: controller writes as root with `chgrp -h ab-agent-<a>`, mode 2770 dirs / 0660 files. Use `bridge_iso_run` / `agent-bridge iso-run` for every controller→iso boundary read/write; do NOT direct-touch iso-owned paths from controller code (`KNOWN_ISSUES.md` §"iso v2 boundary").
+- **Body files cross the same boundary.** A body file written by an iso UID at mode 0660 owned by `agent-bridge-<a>` is not readable by the controller UID unless it has `ab-agent-<a>` group membership. `bridge-task.sh create --body-file <path>` and `agb a2a send --body-file <path>` automatically fall back to `sudo -n -u <owner> cat <path>` when the direct read raises `PermissionError` (Issue #1280). If that fallback also fails, the operator workaround is `sudo chmod 0644 <path>` before the send.
+- **Recommended flow for iso agents.** Use the queue (`agb task create`) for inter-agent work; use `agb a2a` for cross-bridge handoffs. Avoid direct `git checkout` into another agent's branch, avoid editing files in another agent's home, and avoid relying on `sudo` from inside an iso UID (no sudoers entry by default).
+- **Known restrictions, summarized.**
+  - No direct read of controller HOME state files (active-roster.md, HEARTBEAT.md).
+  - No direct write into another agent's home / workdir.
+  - No `git checkout <other-branch>` in the operator's primary checkout.
+  - No `sudo` from inside an iso UID without explicit operator sudoers grant.
+
+For the full design rationale see [`docs/developer-handover.md`](./docs/developer-handover.md) §"Working with isolated agents (iso v2)" and [`OPERATIONS.md`](./OPERATIONS.md) §"Iso v2 agent troubleshooting".
+
 ## Platform Notes
 
 - Requires Bash 4+ (associative arrays). macOS ships Bash 3.2 — install Homebrew Bash and put it ahead of `/bin` in `PATH`.

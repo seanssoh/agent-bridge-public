@@ -37,7 +37,7 @@ source "$SCRIPT_DIR/lib/bridge-init-codex-pair.sh"
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") [--admin <agent>] [--engine claude|codex] [--session <name>] [--workdir <path>] [--user <id[:display-name]>]... [--channels <csv>] [--discord-channel <id>]... [--allow-from <id>]... [--default-chat <id>] [--teams-app-id <id>] [--teams-app-password-file <path>] [--teams-tenant-id <id>] [--teams-allow-from <id>]... [--teams-conversation <id>]... [--channel-account <account>] [--runtime-config <path>] [--api-base-url <url>] [--profile server|dev] [--reconfigure] [--skip-validate] [--skip-send-test] [--skip-channel-setup] [--test-start] [--dry-run] [--json]
+  $(basename "$0") [--admin <agent>] [--engine claude|codex] [--session <name>] [--workdir <path>] [--user <id[:display-name]>]... [--channels <csv>] [--discord-channel <id>]... [--allow-from <id>]... [--default-chat <id>] [--teams-app-id <id>] [--teams-app-password-file <path>] [--teams-tenant-id <id>] [--teams-allow-from <id>]... [--teams-conversation <id>]... [--channel-account <account>] [--runtime-config <path>] [--api-base-url <url>] [--profile server|dev] [--reconfigure] [--skip-validate] [--skip-send-test] [--skip-channel-setup] [--test-start] [--enable-a2a] [--dry-run] [--json]
 
   The Teams client secret may also be supplied via the BRIDGE_TEAMS_APP_PASSWORD
   environment variable. --teams-app-password <secret> is still accepted but
@@ -61,13 +61,18 @@ bridge_init_emit_json() {
   local admin_saved="$9"
   local dry_run="${10}"
   local warnings_json="${11}"
+  # Issue #1262 Gap 1: A2A scaffold status — emitted as a top-level
+  # field so bridge-bootstrap.sh / orchestrator JSON consumers can branch
+  # on whether the receiver template was rendered. Defaults to "skipped"
+  # when --enable-a2a wasn't passed.
+  local a2a_status="${12:-skipped}"
 
   bridge_require_python
-  python3 - "$admin" "$engine" "$session" "$workdir" "$channels" "$created" "$channel_setup" "$preflight" "$admin_saved" "$dry_run" "$warnings_json" <<'PY'
+  python3 - "$admin" "$engine" "$session" "$workdir" "$channels" "$created" "$channel_setup" "$preflight" "$admin_saved" "$dry_run" "$warnings_json" "$a2a_status" <<'PY'
 import json
 import sys
 
-admin, engine, session, workdir, channels, created, channel_setup, preflight, admin_saved, dry_run, warnings_json = sys.argv[1:]
+admin, engine, session, workdir, channels, created, channel_setup, preflight, admin_saved, dry_run, warnings_json, a2a_status = sys.argv[1:]
 payload = {
     "admin": admin,
     "engine": engine,
@@ -80,6 +85,7 @@ payload = {
     "admin_saved": admin_saved == "1",
     "dry_run": dry_run == "1",
     "warnings": json.loads(warnings_json),
+    "a2a_status": a2a_status,
     "next_command": "agb admin" if admin_saved == "1" else "",
     "handoff_steps": [
         "Close the temporary installer session.",
@@ -114,23 +120,34 @@ bridge_init_stage_secret() {
 }
 
 bridge_init_runtime_present() {
+  # beta23 Option A: route the controller-blind probe through
+  # bridge_iso_run --op stat. The legacy `[[ -f path ]]` direct test
+  # would false-negative on an isolated workdir the controller cannot
+  # stat (#1165 Gap 5 family). The helper transparently falls back
+  # to direct stat on non-isolated agents (rc=0 vs rc=30).
   local kind="$1"
   local agent="$2"
+  local dir=""
 
   case "$kind" in
-    discord)
-      [[ -f "$(bridge_agent_discord_state_dir "$agent")/.env" && -f "$(bridge_agent_discord_state_dir "$agent")/access.json" ]]
-      ;;
-    telegram)
-      [[ -f "$(bridge_agent_telegram_state_dir "$agent")/.env" && -f "$(bridge_agent_telegram_state_dir "$agent")/access.json" ]]
-      ;;
-    teams)
-      [[ -f "$(bridge_agent_teams_state_dir "$agent")/.env" && -f "$(bridge_agent_teams_state_dir "$agent")/access.json" ]]
-      ;;
-    *)
-      return 1
-      ;;
+    discord)  dir="$(bridge_agent_discord_state_dir "$agent")"  ;;
+    telegram) dir="$(bridge_agent_telegram_state_dir "$agent")" ;;
+    teams)    dir="$(bridge_agent_teams_state_dir "$agent")"    ;;
+    *)        return 1 ;;
   esac
+  [[ -n "$dir" ]] || return 1
+
+  if declare -F bridge_iso_run >/dev/null 2>&1; then
+    bridge_iso_run --agent "$agent" --op stat --path "$dir/.env" \
+      --test file >/dev/null 2>&1 || return 1
+    bridge_iso_run --agent "$agent" --op stat --path "$dir/access.json" \
+      --test file >/dev/null 2>&1 || return 1
+    return 0
+  fi
+
+  # Legacy fallback when bridge_iso_run is not loaded yet (very early
+  # init paths before bridge-lib has sourced the helper).
+  [[ -f "$dir/.env" && -f "$dir/access.json" ]]
 }
 
 bridge_init_append_warning() {
@@ -180,6 +197,145 @@ bridge_init_ensure_live_cli() {
   bridge_init_run_step "live install deploy" "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/deploy-live-install.sh" --target "$BRIDGE_HOME"
 }
 
+# #1266 (v0.15.0-beta4 Lane G): write an ``onboarding-pending`` marker
+# under ``$BRIDGE_STATE_DIR/agents/<admin>`` so the watchdog's
+# ``detect_fresh_install`` helper recognizes this first watchdog tick as
+# a fresh-install scan and lowers the drift-task priority from ``high``
+# to ``low``. Without this, the daemon's very first scan after init
+# enqueues a high-priority ``agent profile drift`` task into the admin
+# inbox — the operator's actual first impression — because the admin
+# template ships with ``Onboarding State: pending`` by design (the
+# admin role needs to walk the operator through onboarding before
+# flipping to ``complete``).
+#
+# Contract:
+#   * Idempotent: re-running init writes the marker again with a fresh
+#     timestamp. The admin agent's onboarding completion path
+#     (``bridge-agent.sh:run_show`` / ``run_session_type``) is the only
+#     authoritative writer of the sibling ``onboarding-complete`` marker.
+#   * Skipped on ``--dry-run`` (mutation-free contract).
+#   * Skipped when the admin agent already existed before this init pass
+#     (``created=1`` is set only when this run authored the admin); a
+#     re-init over an existing admin must not regress an
+#     already-completed onboarding back to a "fresh-install" drift class.
+#   * Failure is non-fatal: a warning is appended and init continues.
+#     The marker is a hint, not a contract — without it the watchdog
+#     falls back to the agent-home mtime branch.
+bridge_init_write_onboarding_marker() {
+  local admin="$1"
+  local created="$2"
+  local dry_run_arg="$3"
+
+  [[ "$dry_run_arg" == "0" ]] || return 0
+  [[ "$created" == "1" ]] || return 0
+  [[ -n "$admin" ]] || return 0
+
+  local state_root="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  local agent_state_dir="$state_root/agents/$admin"
+  local marker="$agent_state_dir/onboarding-pending"
+
+  if ! mkdir -p "$agent_state_dir" 2>/dev/null; then
+    bridge_init_append_warning "could not create $agent_state_dir for the onboarding-pending marker; watchdog will fall back to mtime-based fresh-install detection"
+    return 0
+  fi
+  {
+    printf 'agent=%s\n' "$admin"
+    printf 'written=%s\n' "$(date +%s)"
+    printf 'reason=fresh-install\n'
+  } >"$marker" 2>/dev/null || {
+    bridge_init_append_warning "could not write $marker (watchdog will fall back to mtime-based fresh-install detection)"
+    return 0
+  }
+  chmod 0600 "$marker" 2>/dev/null || true
+}
+
+# #1266 r2 (v0.15.0-beta4 Lane G codex r1 BLOCKING #1): write the
+# sibling ``state/agents/<agent>/onboarding-complete`` marker so the
+# watchdog's ``detect_fresh_install`` returns False from the next tick
+# onward.
+#
+# Three writer paths exist on a live install:
+#   1. Operator-cued explicit completion (``agb onboarding done`` or a
+#      sibling CLI shape — not implemented in this cycle; the admin
+#      agent's onboarding-complete prompt path is the authoritative
+#      writer for now).
+#   2. The admin agent's own completion path (when it flips
+#      ``SESSION-TYPE.md`` to ``Onboarding State: complete``). The
+#      agent calls this helper via ``agb onboarding done`` once that
+#      CLI lands; until then the watchdog falls back on its
+#      SESSION-TYPE.md auto-detect (see ``_onboarding_state_is_complete``
+#      in ``bridge-watchdog.py``).
+#   3. Manual operator recovery (``state/agents/<a>/onboarding-complete``
+#      can be ``touch``-created by hand to disarm a stuck fresh-install
+#      flag).
+#
+# Contract:
+#   * Idempotent: re-running writes the marker again with a fresh
+#     ``written`` timestamp.
+#   * Removes the sibling ``onboarding-pending`` marker after a
+#     successful complete-marker write so the state-dir reflects the
+#     handshake unambiguously (the watchdog only honors the first
+#     definitive signal, but a clean state-dir is the operator-facing
+#     contract).
+#   * Failure is non-fatal: a warning is appended and the caller
+#     continues. The marker is a hint, not a contract — the watchdog
+#     also reads ``SESSION-TYPE.md`` directly as a fallback.
+bridge_init_write_onboarding_complete_marker() {
+  local agent="$1"
+  local dry_run_arg="${2:-0}"
+
+  [[ "$dry_run_arg" == "0" ]] || return 0
+  [[ -n "$agent" ]] || return 0
+
+  local state_root="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  local agent_state_dir="$state_root/agents/$agent"
+  local marker="$agent_state_dir/onboarding-complete"
+  local pending_marker="$agent_state_dir/onboarding-pending"
+
+  if ! mkdir -p "$agent_state_dir" 2>/dev/null; then
+    bridge_init_append_warning "could not create $agent_state_dir for the onboarding-complete marker; watchdog will fall back to SESSION-TYPE.md auto-detect"
+    return 0
+  fi
+  {
+    printf 'agent=%s\n' "$agent"
+    printf 'written=%s\n' "$(date +%s)"
+    printf 'reason=onboarding-complete\n'
+  } >"$marker" 2>/dev/null || {
+    bridge_init_append_warning "could not write $marker (watchdog will fall back to SESSION-TYPE.md auto-detect)"
+    return 0
+  }
+  chmod 0600 "$marker" 2>/dev/null || true
+
+  # Remove the sibling pending marker after a successful complete write
+  # so the state-dir reflects the handshake unambiguously. Best-effort:
+  # a stuck pending marker would not regress the classification (the
+  # watchdog reads the complete marker first), but a clean state-dir
+  # is the operator-facing contract.
+  if [[ -e "$pending_marker" ]]; then
+    rm -f "$pending_marker" 2>/dev/null || true
+  fi
+}
+
+# #1266 r2 (v0.15.0-beta4 Lane G codex r1 BLOCKING #1): remove the
+# ``onboarding-pending`` marker without writing the ``-complete``
+# sibling. Used when the operator wants to disarm the fresh-install
+# signal without claiming onboarding completed (e.g. they walked
+# through onboarding manually outside the admin path). Best-effort.
+bridge_init_remove_onboarding_pending_marker() {
+  local agent="$1"
+  local dry_run_arg="${2:-0}"
+
+  [[ "$dry_run_arg" == "0" ]] || return 0
+  [[ -n "$agent" ]] || return 0
+
+  local state_root="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  local marker="$state_root/agents/$agent/onboarding-pending"
+
+  if [[ -e "$marker" ]]; then
+    rm -f "$marker" 2>/dev/null || true
+  fi
+}
+
 bridge_init_warnings_json() {
   bridge_require_python
   python3 - "${WARNINGS[@]}" <<'PY'
@@ -187,6 +343,94 @@ import json
 import sys
 print(json.dumps(sys.argv[1:], ensure_ascii=False))
 PY
+}
+
+# Issue #1262 Gap 1 (v0.15.0-beta4 Lane I, 2026-05-27): scaffold A2A
+# cross-bridge handoff at install time when --enable-a2a is set.
+#
+# Behavior:
+#   1. Write $BRIDGE_HOME/handoff.local.json from
+#      $SCRIPT_DIR/handoff.local.example.json (mode 0600) IF the file is
+#      absent. Existing config is preserved — the operator may already
+#      have a tuned config, and clobbering it would be hostile.
+#   2. On Linux, render the agb-handoffd.service systemd-user unit by
+#      invoking scripts/install-handoffd-systemd.sh (without --apply, so
+#      the operator can review before activation). The actual `systemctl
+#      enable --now` is deferred to the operator's explicit action so
+#      that a config without configured peers + secret doesn't bind a
+#      service in a fail-closed state on every boot.
+#   3. Emit a stderr advisory naming the next operator action.
+#   4. Honors --dry-run (no writes) and routes log lines to stderr only
+#      (matches the #1230 stdout-is-JSON-only convention).
+#
+# Sets the global `a2a_status` to one of:
+#   skipped              — --enable-a2a not set
+#   ok                   — stub config + systemd template rendered
+#   ok-existing-config   — config already present; only systemd template rendered
+#   dry-run              — --enable-a2a + --dry-run
+#   error                — write/render failed (warning appended)
+bridge_init_scaffold_a2a() {
+  local config_path="$BRIDGE_HOME/handoff.local.json"
+  local example_path="$SCRIPT_DIR/handoff.local.example.json"
+  local config_existed=0
+  local os_name
+  os_name="$(uname -s 2>/dev/null || printf 'unknown')"
+
+  if [[ $dry_run -eq 1 ]]; then
+    a2a_status="dry-run"
+    echo "[init] --enable-a2a: would scaffold $config_path + systemd unit (skipped: --dry-run)" >&2
+    return 0
+  fi
+
+  if [[ ! -f "$example_path" ]]; then
+    a2a_status="error"
+    bridge_init_append_warning "--enable-a2a: example config not found at $example_path"
+    return 0
+  fi
+
+  if [[ -f "$config_path" ]]; then
+    config_existed=1
+    echo "[init] --enable-a2a: $config_path already exists; not overwriting" >&2
+  else
+    # Copy with mode 0600 — config carries peer HMAC secrets.
+    if ! cp "$example_path" "$config_path" 2>/dev/null; then
+      a2a_status="error"
+      bridge_init_append_warning "--enable-a2a: failed to copy example config to $config_path"
+      return 0
+    fi
+    chmod 0600 "$config_path" 2>/dev/null || true
+    echo "[init] --enable-a2a: wrote $config_path (mode 0600)" >&2
+    echo "[init] --enable-a2a: edit it to set bridge_id, listen.address (tailnet IP), and peers (with secrets). See docs/a2a-cross-bridge.md." >&2
+    # BRIDGE_A2A_TAILSCALE_CLI advisory — only required if tailscale CLI
+    # lives outside the default $PATH (e.g. /Applications/Tailscale.app/...
+    # on macOS, or a custom install path on Linux).
+    echo "[init] --enable-a2a: BRIDGE_A2A_TAILSCALE_CLI env override is optional (only set if your tailscale CLI is in a non-default location)." >&2
+  fi
+
+  # Linux: render systemd-user unit (no --apply; operator activates manually).
+  if [[ "$os_name" == "Linux" ]] && [[ -x "$SCRIPT_DIR/scripts/install-handoffd-systemd.sh" ]]; then
+    local unit_preview_file="$BRIDGE_HOME/handoff/agb-handoffd.service.preview"
+    mkdir -p "$BRIDGE_HOME/handoff" 2>/dev/null || true
+    if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/install-handoffd-systemd.sh" \
+         --bridge-home "$BRIDGE_HOME" \
+         --source-dir "$SCRIPT_DIR" \
+         >"$unit_preview_file" 2>/dev/null; then
+      chmod 0644 "$unit_preview_file" 2>/dev/null || true
+      echo "[init] --enable-a2a: systemd unit preview rendered at $unit_preview_file" >&2
+      echo "[init] --enable-a2a: to activate: bash $SCRIPT_DIR/scripts/install-handoffd-systemd.sh --bridge-home $BRIDGE_HOME --source-dir $SCRIPT_DIR --enable" >&2
+    else
+      bridge_init_append_warning "--enable-a2a: rendering systemd-user unit preview failed; run scripts/install-handoffd-systemd.sh manually"
+    fi
+  else
+    echo "[init] --enable-a2a: non-Linux host ($os_name) — no systemd unit emitted. Use 'bash $SCRIPT_DIR/bridge-handoff-daemon.sh start' or wire into your service manager." >&2
+  fi
+
+  if [[ $config_existed -eq 1 ]]; then
+    a2a_status="ok-existing-config"
+  else
+    a2a_status="ok"
+  fi
+  return 0
 }
 
 admin_agent="${BRIDGE_ADMIN_AGENT_ID:-patch}"
@@ -233,6 +477,13 @@ user_specs=()
 host_profile_reconfigure=0
 host_profile_override=""
 host_profile_chosen=""
+# Issue #1262 Gap 1 (v0.15.0-beta4 Lane I): opt-in scaffolding for the
+# A2A cross-bridge receiver. When --enable-a2a is set, init writes a
+# handoff.local.json stub (if absent) and emits an advisory pointing the
+# operator at the systemd-user template (Linux) or the manual `agb a2a`
+# lifecycle (macOS). Opt-out by default — most installs don't run A2A.
+enable_a2a=0
+a2a_status="skipped"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -421,6 +672,11 @@ while [[ $# -gt 0 ]]; do
       json_mode=1
       shift
       ;;
+    --enable-a2a)
+      # Issue #1262 Gap 1 (v0.15.0-beta4 Lane I): opt-in A2A scaffold.
+      enable_a2a=1
+      shift
+      ;;
     -h|--help|help)
       usage
       exit 0
@@ -509,7 +765,13 @@ if [[ $dry_run -eq 0 ]]; then
 fi
 
 session="${session:-$admin_agent}"
-description="${description:-$admin_agent admin role}"
+# v0.15.0-beta1 Lane I: replace the terse "<name> admin role" default with a
+# concrete role description so downstream agents reading the roster on a fresh
+# install see a useful sentence (issue: cosmax-* installs landed empty/terse
+# desc → downstream agent autonomy regressed). The example roster
+# (agent-roster.local.example.sh) carries the same boilerplate so operators
+# can lift it verbatim. See docs/agent-runtime/admin-agent-convention.md.
+description="${description:-Agent Bridge admin/coordinator for this install. Owns onboarding, roster/queue triage, upgrade/release waves, and operator-facing decisions.}"
 display_name="${display_name:-$admin_agent}"
 channels="$(bridge_normalize_channels_csv "$channels")"
 
@@ -552,6 +814,12 @@ else
   # rather than serve cached state from the earlier load above.
   bridge_roster_cache_invalidate
   bridge_load_roster
+  # #1266 (v0.15.0-beta4 Lane G): now that the admin agent's SESSION-TYPE.md
+  # exists with the template-default ``Onboarding State: pending``, drop a
+  # ``state/agents/<admin>/onboarding-pending`` marker so the next watchdog
+  # tick treats this fresh-install's drift as priority=low instead of high.
+  # See ``bridge-watchdog.py:detect_fresh_install`` (Lane G).
+  bridge_init_write_onboarding_marker "$admin_agent" "$created" "$dry_run"
 fi
 
 # Issue #1052 (reconsiders #4769, which reverted #517): the `<admin>-dev`
@@ -617,6 +885,187 @@ if [[ $dry_run -eq 0 ]]; then
   # + non-fatal — re-running init when the pair already exists is a no-op and
   # any failure is logged without blocking init.
   bridge_init_provision_admin_codex_pair "$host_profile_cli" "$admin_agent" "$host_profile_chosen" || true
+
+  # Issue #1231: idempotent bundled-marketplace seed for the v2 shared
+  # plugin catalog. Without this, `agb agent create --isolate --channels
+  # plugin:teams,plugin:ms365` on a fresh install bridge_die's with
+  # "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is
+  # not populated" because Claude never wrote installed_plugins.json
+  # there. `bridge-plugins.sh seed` is the de-facto post-fresh-install
+  # step; we make it part of init so the operator does not have to know
+  # about it.
+  #
+  # Contract:
+  #   * Idempotent — re-running over a populated catalog is a no-op
+  #     (the sync helper short-circuits when manifest entries already
+  #     match the marketplace.json declarations).
+  #   * Non-fatal on failure — init proceeds with a warning; the
+  #     agent-create fallback in lib/bridge-agents.sh
+  #     (bridge_linux_share_plugin_catalog) takes over as the
+  #     fail-closed second chance.
+  #   * Gated on v2 active — legacy installs do not have a shared
+  #     plugin catalog contract.
+  #   * Gated on the live CLI being present at $BRIDGE_HOME/agent-bridge
+  #     (bridge_init_ensure_live_cli ran above); we use the live CLI so
+  #     the seed runs against the operator-facing surface, not the
+  #     source checkout (in case those paths diverge).
+  if command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+     && bridge_isolation_v2_active 2>/dev/null \
+     && [[ -x "$host_profile_cli" ]]; then
+    _init_seed_output=""
+    _init_seed_rc=0
+    _init_seed_output="$("$BRIDGE_BASH_BIN" "$host_profile_cli" plugins seed 2>&1)" \
+      || _init_seed_rc=$?
+    if (( _init_seed_rc == 0 )); then
+      # #1230 (v0.15.0-beta4): logger output goes to stderr so the
+      # `--json` mode contract (stdout = data only) holds end-to-end.
+      # Matches the #1273 convention applied to `bridge_info` in
+      # lib/bridge-core.sh — log lines are diagnostics, not return-channel
+      # producers. `bridge-bootstrap.sh` captures stdout via `$()` and
+      # parses it as JSON; any log line on stdout poisons the parse.
+      printf '[init] plugins seed: shared catalog populated (bundled agent-bridge marketplace)\n' >&2
+    else
+      [[ -n "$_init_seed_output" ]] && printf '%s\n' "$_init_seed_output" >&2
+      bridge_init_append_warning "plugins seed failed (rc=$_init_seed_rc) — \$BRIDGE_SHARED_ROOT/plugins-cache may be empty. Re-run: agent-bridge plugins seed. \`agent create --isolate --channels plugin:*\` will attempt to self-heal via fallback seed; if that also fails, the create call will surface an actionable error."
+    fi
+  fi
+
+  # Issue #1312 (v0.15.0-beta5-2 Lane ε): refuse-at-startup advisory for the
+  # tmux inject spool. The runtime helper (lib/bridge-tmux.sh::
+  # bridge_tmux_spool_enabled) already refuses to honor =0 on iso v2 without
+  # the FORCE flag, but the operator only sees that warn when a nudge
+  # actually fires. Emit a clear startup-time warning so the
+  # misconfiguration is operator-visible at install/init time, not after
+  # the first dropped message. Non-iso installs and the FORCE escape hatch
+  # are silent here.
+  if command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+     && bridge_isolation_v2_active 2>/dev/null \
+     && [[ "${BRIDGE_TMUX_INJECT_SPOOL_ENABLED:-1}" != "1" ]] \
+     && [[ "${BRIDGE_TMUX_INJECT_SPOOL_DISABLE_FORCE:-0}" != "1" ]]; then
+    bridge_init_append_warning "BRIDGE_TMUX_INJECT_SPOOL_ENABLED=0 detected on iso v2 install — refused at runtime (would silently drop daemon nudges on busy agents). Unset the override or set BRIDGE_TMUX_INJECT_SPOOL_DISABLE_FORCE=1 to override (unsafe). See KNOWN_ISSUES.md §tmux_inject_dropped_spool_disabled."
+  fi
+
+  # Beta20 L2 Variant 3A — install the daemon-refresh sudoers drop-in on
+  # Linux server hosts so subsequent `agent create --linux-user` calls
+  # can automatically refresh the daemon's supplementary groups. The
+  # helper no-ops on macOS (skipped-non-linux), on dev hosts (operators
+  # who manage their own daemons), and on systems lacking visudo. Failure
+  # is logged but does NOT block init — the operator can re-run
+  # `agent-bridge init sudoers daemon-refresh --apply` later (or live
+  # with the queue-only-fallback footgun until they do).
+  if [[ "$host_profile_chosen" == "server" ]] \
+     && [[ "$(uname -s 2>/dev/null)" == "Linux" ]] \
+     && [[ $dry_run -eq 0 ]] \
+     && command -v bridge_daemon_control_install_sudoers >/dev/null 2>&1; then
+    # Issue #1236: gate the "installed: <path>" success line on the
+    # verifier (`bridge_daemon_control_check_sudoers` via
+    # `bridge_daemon_control_preflight_row`) actually accepting the
+    # rendered drop-in. Previously the installer wrote the file and we
+    # printed "installed at <path>" unconditionally, then the very next
+    # line emitted `daemon_group_refresh_sudoers=missing|invalid|...`
+    # when sudo/PAM refused to refresh groups (or visudo rejected the
+    # content, or the rendered + on-disk bytes diverged). Operators saw
+    # both "installed" AND "missing/invalid" in the same init output and
+    # filed #1236. The fix: capture the installer result, then probe the
+    # verifier, then print ONE line — either the success row or the
+    # `manual-required` remediation row, never both.
+    _init_sudoers_path=""
+    _init_sudoers_install_rc=0
+    _init_sudoers_install_ok=0
+    _init_sudoers_path="$(bridge_daemon_control_install_sudoers 2>&1)" \
+      || _init_sudoers_install_rc=$?
+    _init_sudoers_status=""
+    if command -v bridge_daemon_control_check_sudoers >/dev/null 2>&1; then
+      _init_sudoers_status="$(bridge_daemon_control_check_sudoers 2>/dev/null || true)"
+    fi
+    if (( _init_sudoers_install_rc == 0 )) && [[ "$_init_sudoers_status" == "ok" ]]; then
+      # #1230 (v0.15.0-beta4): logger output goes to stderr — see comment
+      # at the plugins-seed printf above for the full rationale.
+      printf '[init] daemon-refresh sudoers: installed at %s (verifier=ok)\n' "$_init_sudoers_path" >&2
+      printf '[init] daemon_group_refresh_sudoers=ok\n' >&2
+      _init_sudoers_install_ok=1
+    else
+      # Either install failed, or install succeeded but verifier rejected
+      # the result. Surface manual-required + actionable remediation.
+      # Do NOT emit an "installed" line — that is the #1236 contradiction.
+      _init_sudoers_reason="$_init_sudoers_status"
+      [[ -z "$_init_sudoers_reason" ]] && _init_sudoers_reason="missing"
+      if (( _init_sudoers_install_rc != 0 )); then
+        # Installer itself failed — surface its output for the operator.
+        [[ -n "$_init_sudoers_path" ]] && printf '[init] daemon-refresh sudoers installer output: %s\n' "$_init_sudoers_path" >&2
+        bridge_init_append_warning "daemon-refresh sudoers: manual-required (installer rc=$_init_sudoers_install_rc, verifier=$_init_sudoers_reason). Re-run: agent-bridge init sudoers daemon-refresh --apply"
+      else
+        # Install returned 0 but verifier disagrees — render+visudo mismatch
+        # or sudo/PAM refused the probe. Record the path so the operator
+        # can inspect it, but do NOT call it "installed".
+        bridge_init_append_warning "daemon-refresh sudoers: manual-required (verifier=$_init_sudoers_reason at $_init_sudoers_path). Re-run: agent-bridge init sudoers daemon-refresh --apply (Linux+visudo required) — the daemon will fall back to queue-only-fallback for supp-groups refresh until this clears."
+      fi
+      # #1230 (v0.15.0-beta4): logger output goes to stderr.
+      printf '[init] daemon-refresh sudoers: manual-required (verifier=%s)\n' "$_init_sudoers_reason" >&2
+      printf '[init] daemon_group_refresh_sudoers=%s\n' "$_init_sudoers_reason" >&2
+    fi
+
+    # Beta20 L2 Variant 3A r4 — when the daemon-refresh sudoers landed,
+    # regenerate the systemd-user unit with the sudo-wrapped ExecStart
+    # so subsequent systemd-driven daemon starts cross the PAM refresh
+    # boundary. Without this, a stale systemd-user manager re-spawns
+    # the daemon with frozen supp groups and the r3 ad-hoc sudo
+    # restart from the runtime helper would lose the race with
+    # Restart=always. The install-daemon-systemd.sh auto-detects the
+    # sudoers drop-in and renders the sudo-wrapped unit on its own;
+    # we just re-run --apply + reload + restart-if-active. Non-fatal
+    # — failure leaves the operator with the legacy direct unit and a
+    # clear remediation path.
+    if (( _init_sudoers_install_ok == 1 )) \
+       && command -v systemctl >/dev/null 2>&1; then
+      _init_systemd_rc=0
+      _init_systemd_stderr=""
+      _init_systemd_stderr_file=""
+      _init_systemd_stderr_file="$(mktemp "${TMPDIR:-/tmp}/agb-init-systemd.XXXXXX" 2>/dev/null || printf '%s' "/tmp/agb-init-systemd.$$.$RANDOM")"
+      "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/install-daemon-systemd.sh" \
+        --bridge-home "$BRIDGE_HOME" --apply \
+        2>"$_init_systemd_stderr_file" \
+        || _init_systemd_rc=$?
+      _init_systemd_stderr="$(cat "$_init_systemd_stderr_file" 2>/dev/null || printf '')"
+      # Forward captured stderr to operator-visible stderr so warnings
+      # from the helper script aren't swallowed. The mode= grep below
+      # uses the same captured buffer.
+      [[ -n "$_init_systemd_stderr" ]] && printf '%s\n' "$_init_systemd_stderr" >&2
+      rm -f "$_init_systemd_stderr_file" 2>/dev/null || true
+      # #1228 (v0.15.0-beta4): parse the machine-readable `mode=` line
+      # the helper emits so the operator-facing message reflects what
+      # was ACTUALLY written, not what we wished was written. Prior
+      # init unconditionally claimed "regenerated (sudo-self) and
+      # restarted" even when probe_sudo_self_refresh dropped the unit
+      # back to legacy ExecStart — that lie was the operator-confusion
+      # vector documented in KNOWN_ISSUES.md §28.
+      _init_systemd_mode="$(printf '%s\n' "$_init_systemd_stderr" | sed -n 's/^mode=//p' | tail -n 1)"
+      if (( _init_systemd_rc == 0 )); then
+        if systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null; then
+          systemctl --user daemon-reload || true
+          systemctl --user restart agent-bridge-daemon.service \
+            || bridge_init_append_warning "systemctl --user restart agent-bridge-daemon.service failed after unit regen — retry manually with: systemctl --user restart agent-bridge-daemon.service"
+          # #1228 + #1230 (v0.15.0-beta4): logger output to stderr,
+          # message reflects the actual mode= the helper reported.
+          if [[ "$_init_systemd_mode" == "sudo-self" ]]; then
+            printf '[init] systemd-user unit regenerated (mode=sudo-self) and restarted\n' >&2
+          else
+            printf '[init] systemd-user unit regenerated (mode=%s) and restarted — supplementary-group refresh will NOT cross PAM\n' "${_init_systemd_mode:-unknown}" >&2
+            bridge_init_append_warning "systemd-user unit landed in mode=${_init_systemd_mode:-unknown} (not sudo-self) — daemon supp-group refresh will not auto-recover after \`agent create --linux-user\`. Run: agent-bridge init sudoers daemon-refresh --apply"
+          fi
+        else
+          if [[ "$_init_systemd_mode" == "sudo-self" ]]; then
+            printf '[init] systemd-user unit regenerated (mode=sudo-self) — service not active, will pick up on next start\n' >&2
+          else
+            printf '[init] systemd-user unit regenerated (mode=%s) — service not active\n' "${_init_systemd_mode:-unknown}" >&2
+            bridge_init_append_warning "systemd-user unit landed in mode=${_init_systemd_mode:-unknown} (not sudo-self). Run: agent-bridge init sudoers daemon-refresh --apply"
+          fi
+        fi
+      else
+        bridge_init_append_warning "install-daemon-systemd.sh --apply returned rc=$_init_systemd_rc — unit may still carry legacy ExecStart. Re-run: $BRIDGE_HOME/scripts/install-daemon-systemd.sh --bridge-home $BRIDGE_HOME --apply"
+      fi
+    fi
+  fi
 
   # Track D follow-up to #713 / #809, follow-on to #833: auto-register the
   # picker-sweep bridge-native cron. The helper is idempotent (short-circuits
@@ -738,6 +1187,12 @@ bridge_init_ensure_live_cli
 # Mattermost setup steps. host_profile_chosen is already populated by that
 # call (or empty on --dry-run).
 
+# Issue #1262 Gap 1 (v0.15.0-beta4 Lane I): optional A2A scaffolding.
+# Only runs when --enable-a2a is set; otherwise a2a_status stays "skipped".
+if [[ $enable_a2a -eq 1 ]]; then
+  bridge_init_scaffold_a2a
+fi
+
 warnings_json="$(bridge_init_warnings_json)"
 
 if [[ $json_mode -eq 1 ]]; then
@@ -752,7 +1207,8 @@ if [[ $json_mode -eq 1 ]]; then
     "$preflight_status" \
     "$admin_saved" \
     "$dry_run" \
-    "$warnings_json"
+    "$warnings_json" \
+    "$a2a_status"
   exit 0
 fi
 
@@ -774,6 +1230,7 @@ printf 'created: %s\n' "$([[ $created -eq 1 ]] && echo yes || echo no)"
 printf 'channel_setup: %s\n' "$channel_setup_status"
 printf 'preflight: %s\n' "$preflight_status"
 printf 'admin_saved: %s\n' "$([[ $admin_saved -eq 1 ]] && echo yes || echo no)"
+printf 'a2a: %s\n' "$a2a_status"
 if [[ -n "$host_profile_chosen" ]]; then
   printf 'host_profile: %s\n' "$host_profile_chosen"
 fi

@@ -38,7 +38,19 @@ check_email_patterns() {
 
   matches="$(rg -n --color never -e '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "${scan_files[@]}" || true)"
   # Public plugin manifests may use non-routable placeholder contacts.
-  matches="$(printf '%s\n' "$matches" | grep -Ev '@(agent-bridge\.local|example\.com|example\.test|local\.invalid|tenant\.com)([^A-Za-z0-9.-]|$)|@odata\.(bind|id|type)' || true)"
+  #
+  # The `git@github.com:` carve-out matches the canonical SSH URL prefix
+  # GitHub publishes (e.g. `git@github.com:<org>/<repo>.git`). It is a
+  # well-known URL form, not a contact address, and appears in:
+  #   - bridge-dev-plugin-cache.py (`_GITHUB_SSH_PREFIX` constant + the
+  #     `git@github.com:<org>/<repo>.git → <org>-<repo>` docstring)
+  #   - lib/bridge-agents.sh (the inline parity validator's same constant)
+  #   - tests/isolation-plugin-sharing.sh (alias-parse parity fixture)
+  #   - CHANGELOG.md (PR-C summary listing the five URL forms parsed).
+  # The match anchors on the literal `github.com:` host + colon so it
+  # cannot mask a real Gmail/Outlook/etc. contact address that happens
+  # to contain `github` in the local-part.
+  matches="$(printf '%s\n' "$matches" | grep -Ev '@(agent-bridge\.local|example\.com|example\.test|local\.invalid|tenant\.com)([^A-Za-z0-9.-]|$)|@odata\.(bind|id|type)|\bgit@github\.com:' || true)"
   if [[ -n "$matches" ]]; then
     echo "[oss] fail: email addresses in tracked content"
     echo "$matches"
@@ -127,5 +139,40 @@ if [[ -x "$repo_root/scripts/lint-heredoc-ban.sh" ]]; then
     exit 1
   fi
 fi
+
+# beta23 Option A — controller->isolated boundary ratchet. Enforces
+# that no new raw boundary callsite is added beyond
+# scripts/baselines/iso-helper-baseline.txt. See
+# scripts/iso-helper-ratchet.sh for policy.
+if [[ -x "$repo_root/scripts/iso-helper-ratchet.sh" ]]; then
+  if ! "$repo_root/scripts/iso-helper-ratchet.sh"; then
+    echo "[oss] iso-helper boundary ratchet failed — see scripts/iso-helper-ratchet.sh policy"
+    exit 1
+  fi
+fi
+
+# Beta20 L2 Variant 3A — release-side ratchet for the daemon-refresh
+# sudoers template + helper module. The runtime preflight row
+# (daemon_group_refresh_sudoers=ok|missing|invalid|sudo-refresh-no-gid)
+# is emitted by `agent-bridge init sudoers daemon-refresh --check`; this
+# release check just makes sure the source tree carries the template +
+# helper so a fresh install can render+install the sudoers drop-in.
+if [[ ! -f "$repo_root/scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template" ]]; then
+  echo "[oss] fail: missing scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template (L2 Variant 3A)"
+  exit 1
+fi
+if [[ ! -f "$repo_root/lib/bridge-daemon-control.sh" ]]; then
+  echo "[oss] fail: missing lib/bridge-daemon-control.sh (L2 Variant 3A)"
+  exit 1
+fi
+# Belt-and-suspenders: the template must contain the three substitution
+# placeholders so an upstream edit that drops one fails the release gate
+# rather than landing a sudoers entry with a literal `{{...}}` in it.
+for _placeholder in '{{controller_user}}' '{{bash_abs}}' '{{bridge_home_abs}}'; do
+  if ! grep -qF -- "$_placeholder" "$repo_root/scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template"; then
+    echo "[oss] fail: sudoers template missing placeholder ${_placeholder}"
+    exit 1
+  fi
+done
 
 echo "[oss] preflight passed"

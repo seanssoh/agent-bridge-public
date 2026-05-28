@@ -143,6 +143,30 @@ bridge_migration_isolate() {
       bridge_warn "bridge_linux_prepare_agent_isolation failed for $agent during --reapply; refusing to mark reapply complete. Address the underlying cause (sudo policy, missing os_user, perm denied on $workdir) and re-run 'agent-bridge isolate $agent --reapply'. See acceptance runbook §2."
       return 1
     fi
+    # Beta20 L2 Variant 3A — non-fatal daemon supplementary-groups
+    # refresh after prepare. If the reapply added the controller to a
+    # new per-agent group (e.g. v2 introduced a new group since the
+    # original isolate), the daemon's pre-mutation group set won't see
+    # it; refresh so urgent-send + channel readiness work without an
+    # operator-side restart. Failure is surfaced via warn but does NOT
+    # roll back the reapply.
+    if command -v bridge_daemon_refresh_after_group_membership_change >/dev/null 2>&1 \
+       && command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+      local _reapply_v2_grp
+      _reapply_v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+      if [[ -n "$_reapply_v2_grp" ]]; then
+        local _reapply_refresh_status
+        _reapply_refresh_status="$(
+          bridge_daemon_refresh_after_group_membership_change \
+            --group "$_reapply_v2_grp" \
+            --reason "isolate-reapply:$agent" \
+            2>/dev/null || true
+        )"
+        if [[ -n "$_reapply_refresh_status" ]]; then
+          printf '  [daemon_group_refresh] %s\n' "$_reapply_refresh_status"
+        fi
+      fi
+    fi
     # Issue #544 PR3 — refresh the bridge-native skills under the
     # isolated HOME (.claude/skills/) so existing isolated agents pick
     # up new/changed skills on `--reapply` without unisolate→isolate.
@@ -274,6 +298,31 @@ bridge_migration_isolate() {
       if ! bridge_install_isolated_home_settings "$agent" "$_isolate_launch_cmd"; then
         bridge_warn "bridge_install_isolated_home_settings failed for $agent during isolate; refusing to mark isolate complete. Address the underlying cause (perm denied on settings.local.json under the isolated HOME, missing renderer deps) and re-run 'agent-bridge isolate $agent --reapply'. See OPERATIONS.md isolated-agent section."
         return 1
+      fi
+    fi
+    # Beta20 L2 Variant 3A — first-time isolate also needs the daemon
+    # refresh: prepare just added the controller to a fresh per-agent
+    # group, so the running daemon (forked from a pre-mutation shell)
+    # cannot see the new GID until restart-under-sudo refreshes its
+    # supp set. Same non-fatal contract as the --reapply branch above:
+    # any non-`ok` status prints a diagnostic but does NOT unwind the
+    # isolation prep (the prepare hard-fail above is the load-bearing
+    # gate; refresh failure is a separate UX concern).
+    if command -v bridge_daemon_refresh_after_group_membership_change >/dev/null 2>&1 \
+       && command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+      local _isolate_v2_grp
+      _isolate_v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+      if [[ -n "$_isolate_v2_grp" ]]; then
+        local _isolate_refresh_status
+        _isolate_refresh_status="$(
+          bridge_daemon_refresh_after_group_membership_change \
+            --group "$_isolate_v2_grp" \
+            --reason "isolate-first-time:$agent" \
+            2>/dev/null || true
+        )"
+        if [[ -n "$_isolate_refresh_status" ]]; then
+          printf '  [daemon_group_refresh] %s\n' "$_isolate_refresh_status"
+        fi
       fi
     fi
   fi

@@ -728,7 +728,7 @@ def render_dashboard(args: argparse.Namespace) -> str:
         )
     lines.append("")
     lines.append("Agents")
-    lines.append("  #  agent           eng     src     loop on  state     q   c   b   garden  idle  stale wake chan  nudge  load        session        workdir")
+    lines.append("  #  agent           eng     src     loop on  state           q   c   b   garden  idle  stale wake chan  nudge  load        session        workdir")
 
     active_index = 0
     for row in roster:
@@ -766,12 +766,17 @@ def render_dashboard(args: argparse.Namespace) -> str:
         # new "starting" state (tmux present, engine descendant not yet
         # spawned in pane process tree) renders without truncation
         # alongside the legacy "stopped"/"idle"/"working" values.
+        # Issue #1319 (Lane κ v0.15.0-beta5-2): bumped from 8 to 14 chars
+        # so the new "picker_blocked" state (rate-limit / summary picker
+        # detected by bridge-stall.py) renders without truncation. The
+        # header on line 731 was widened in lockstep so the column
+        # boundary stays aligned with the underlying value width.
         lines.append(
             f"{idx_label}  {agent:<15} {row['engine']:<7} "
             f"{(row.get('source') or '-')[:7]:<7} "
             f"{str(row.get('loop') or '-')[:4]:<4} "
             f"{'yes' if active else 'no ':<3} "
-            f"{activity_state:<8} "
+            f"{activity_state:<14} "
             f"{queued:>2}  {claimed:>2}  {blocked:>2}  "
             f"{garden_str:>6}  "
             f"{fmt_idle(int(activity_ts) if activity_ts else None):>4}  "

@@ -131,6 +131,129 @@ def cmd_release_alert_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release_downgrade_classify(args: argparse.Namespace) -> int:
+    """v0.15.0-beta4 Lane J (#1267).
+
+    Classify a release-monitor payload as a downgrade-skip case.
+
+    Input: the JSON envelope produced by ``bridge-release.py monitor``.
+    Output (a single tab-separated row, or empty):
+      installed_version \\t latest_version
+
+    Emits a row IFF: there is no alert AND the installed version's
+    core (major.minor.patch) is >= the latest tag's core. Empty stdout
+    otherwise. Parse errors are non-fatal and produce empty output —
+    the caller treats empty as "not a downgrade; do nothing".
+    """
+    try:
+        payload = json.loads(args.monitor_json)
+    except Exception:
+        return 0
+    alerts = payload.get("alerts") or []
+    if alerts:
+        # An alert was emitted → not a downgrade-skip case.
+        return 0
+    release = payload.get("release") or {}
+    installed = str(release.get("installed_version") or "").strip()
+    latest = str(release.get("latest_version") or "").strip()
+    if not installed or not latest:
+        return 0
+    # Issue #1267 (Lane J r2 BLOCKING from codex r1): use full semver
+    # 2.0.0 comparison including prerelease ordering. The r1 fix used
+    # core-only compare, which classified ``0.14.5-beta1`` vs
+    # ``0.14.5`` (a legitimate beta→stable upgrade) as
+    # ``installed_core >= latest_core`` → emitted
+    # ``release_notification_downgrade_skip`` and silently swallowed
+    # the upgrade prompt. Per semver 2.0.0 §11 a prerelease has LOWER
+    # precedence than the corresponding final, so the same-core
+    # beta→stable case MUST classify as "real upgrade", not downgrade.
+    #
+    # We re-implement the parser inline here so this helper has no
+    # import-side dependency on bridge-release.py (which is the
+    # producer; importing consumer-side risks a circular load order via
+    # subprocess invocation).
+    import re as _re
+    _full_re = _re.compile(
+        r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+    )
+    # Lane J r3 (codex r2 BLOCKING): mirror bridge-release.py's
+    # undotted-prerelease normalization. Project tags use the undotted
+    # ``betaN`` / ``rcN`` / ``alphaN`` form; without normalization the
+    # downstream identifier compare falls into the alphanumeric (lexical)
+    # branch and orders ``beta10 < beta9`` because "1" < "9". By rewriting
+    # ``betaN`` → ``beta.N`` (letter-run + digit-run → dotted) we surface
+    # the digit run as a numeric identifier so ``beta.9 < beta.10``
+    # compares correctly. Same logic and same regex shape as
+    # ``bridge-release.py:_normalize_prerelease_identifier`` — kept inline
+    # here for the same anti-coupling reason as the rest of this helper
+    # (no producer/consumer import cycle).
+    _undotted_ident_re = _re.compile(r"^([A-Za-z]+)(\d+)$")
+
+    def _normalize_prerelease(pre: str) -> str:
+        if not pre:
+            return pre
+        out = []
+        for p in pre.split("."):
+            m = _undotted_ident_re.match(p)
+            if m:
+                out.append(f"{m.group(1)}.{m.group(2)}")
+            else:
+                out.append(p)
+        return ".".join(out)
+
+    def _full(text: str):
+        match = _full_re.fullmatch(text)
+        if not match:
+            return None
+        major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
+        return ((major, minor, patch), _normalize_prerelease(match.group(4) or ""))
+
+    def _cmp_pre(a: str, b: str) -> int:
+        a_parts = a.split(".") if a else []
+        b_parts = b.split(".") if b else []
+        for ai, bi in zip(a_parts, b_parts):
+            a_num = ai.isdigit()
+            b_num = bi.isdigit()
+            if a_num and b_num:
+                an, bn = int(ai), int(bi)
+                if an != bn:
+                    return -1 if an < bn else 1
+                continue
+            if a_num and not b_num:
+                return -1
+            if not a_num and b_num:
+                return 1
+            if ai != bi:
+                return -1 if ai < bi else 1
+        if len(a_parts) == len(b_parts):
+            return 0
+        return -1 if len(a_parts) < len(b_parts) else 1
+
+    def _cmp(installed_v, latest_v) -> int:
+        if installed_v[0] != latest_v[0]:
+            return -1 if installed_v[0] < latest_v[0] else 1
+        ip, lp = installed_v[1], latest_v[1]
+        if ip == lp:
+            return 0
+        if not ip and lp:
+            return 1  # installed final > latest prerelease
+        if ip and not lp:
+            return -1  # installed prerelease < latest final (beta→stable upgrade)
+        return _cmp_pre(ip, lp)
+
+    installed_full = _full(installed)
+    latest_full = _full(latest)
+    if installed_full is None or latest_full is None:
+        return 0
+    if _cmp(installed_full, latest_full) >= 0:
+        # Downgrade or no-op case — emit the classification row.
+        # NOTE: same-core beta→stable (e.g. 0.14.5-beta1 vs 0.14.5)
+        # returns -1 from _cmp and FALLS THROUGH to silence here, which
+        # is correct: that pair is a real upgrade, not a downgrade.
+        print(f"{installed}\t{latest}")
+    return 0
+
+
 def cmd_backup_parse(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:1210 (process_daily_backup).
 
@@ -224,6 +347,30 @@ def cmd_watchdog_problem_count(args: argparse.Namespace) -> int:
     try:
         payload = json.loads(args.report_json)
         print(int(payload.get("problem_count", 0)))
+    except Exception:
+        print(0)
+    return 0
+
+
+def cmd_watchdog_fresh_install_only(args: argparse.Namespace) -> int:
+    """v0.15.0-beta4 Lane G #1266: emit ``1`` when every effective
+    problem row in the watchdog report is a fresh-install candidate
+    (``fresh_install=true``), ``0`` otherwise.
+
+    The daemon's ``process_watchdog_report`` reads this token to decide
+    whether to enqueue the drift task at priority=low (fresh-install
+    only) or priority=high (the existing path). Parse error / missing
+    field defaults to ``0`` so a malformed report cannot accidentally
+    downgrade real drift to low.
+    """
+    try:
+        payload = json.loads(args.report_json)
+        # ``fresh_install_only`` is True only when there is at least one
+        # effective problem AND every effective problem is fresh-install.
+        # An empty problem set (problem_count=0) reports False here; the
+        # bash side already short-circuits on problem_count=0 before
+        # reading this token.
+        print(1 if bool(payload.get("fresh_install_only", False)) else 0)
     except Exception:
         print(0)
     return 0
@@ -521,6 +668,291 @@ def cmd_sync_status_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync_aliveness_parse(args: argparse.Namespace) -> int:
+    """Codex r1 BLOCKING #1 (v0.15.0-beta4 Lane F r2, 2026-05-27).
+
+    Extracts per-agent ``aliveness`` + ``remaining_ms`` from a
+    bridge-auth.sh claude-token sync --json envelope. The wrapper now
+    produces ``agents: [{agent, aliveness, remaining_ms}, ...]`` instead
+    of a flat list of names, so the daemon's periodic-sync tick
+    (bridge-daemon.sh process_claude_token_periodic_sync_tick) can audit
+    each row's token freshness.
+
+    Output shape: one tab-separated row per agent, ``agent\\taliveness
+    \\tremaining_ms``. Empty stdout means no agents synced (skipped /
+    no_matching_claude_agents / failed-everything). Parse errors print
+    nothing — bash callsite treats that as "no rows to audit".
+
+    Backward-compat: tolerates the legacy list[str] shape (``agents``
+    being a list of names) by emitting ``agent\\t\\t0`` for each entry,
+    so a hybrid wrapper/daemon during rollout never crashes.
+    """
+    try:
+        payload = json.loads(args.sync_json)
+    except Exception:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    agents = payload.get("agents") or []
+    if not isinstance(agents, list):
+        return 0
+    for row in agents:
+        if isinstance(row, dict):
+            name = str(row.get("agent", "") or "")
+            aliveness = str(row.get("aliveness", "") or "")
+            try:
+                remaining_ms = int(row.get("remaining_ms", 0) or 0)
+            except (TypeError, ValueError):
+                remaining_ms = 0
+        elif isinstance(row, str):
+            # Legacy list[str] shape — name only, no aliveness signal.
+            name = row
+            aliveness = ""
+            remaining_ms = 0
+        else:
+            continue
+        if not name:
+            continue
+        print(f"{name}\t{aliveness}\t{remaining_ms}")
+    return 0
+
+
+def cmd_a2a_stuck_decide(args: argparse.Namespace) -> int:
+    """Original site: bridge-daemon.sh process_a2a_outbox_stuck_scan_tick.
+
+    Issue #1262 Gap 3 (v0.15.0-beta4 Lane I, 2026-05-27).
+    Codex r1 BLOCKING (v0.15.0-beta4 Lane I r2, 2026-05-27): split
+    decide vs ack/stamp so the ledger is only updated AFTER the admin
+    task has been filed successfully. Otherwise a transient
+    bridge-task.sh failure starts the reemit cooldown without any
+    admin task existing — the operator never learns about the stuck
+    row.
+
+    Decide which outbox rows have been stuck long enough to deserve an
+    admin task, honoring the per-message re-emit cooldown ledger.
+    Pure read — does NOT modify the ledger; the daemon shell calls
+    ``a2a-stuck-ack`` AFTER successfully creating the admin task to
+    stamp the ledger atomically.
+
+    Input:
+      now            — current epoch seconds (int)
+      stuck_secs     — threshold (row.age_seconds > this → candidate)
+      reemit_secs    — re-emit cooldown per message_id
+      ledger_path    — JSON file: { message_id: last_emitted_ts }
+      outbox_json_path — JSON array from `agb a2a outbox list --json`
+
+    Output (stdout, one TSV row per row to alert):
+      message_id \\t peer \\t target_agent \\t status \\t attempts \\t
+      age_seconds \\t last_error
+
+    Errors are swallowed (return 0 with no output) — the daemon tick
+    must not crash on a malformed ledger or JSON parse failure;
+    operator visibility through audit + log is the recovery path.
+    """
+    try:
+        now = int(args.now)
+        stuck_secs = int(args.stuck_secs)
+        reemit_secs = int(args.reemit_secs)
+    except Exception:
+        return 0
+
+    ledger_path = args.ledger_path
+    outbox_json_path = args.outbox_json_path
+
+    ledger: dict = {}
+    try:
+        with open(ledger_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                try:
+                    ledger[str(k)] = int(v)
+                except Exception:
+                    continue
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        ledger = {}
+
+    try:
+        with open(outbox_json_path, "r", encoding="utf-8") as fh:
+            rows = json.load(fh)
+        if not isinstance(rows, list):
+            rows = []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        rows = []
+
+    # `age_seconds` is enriched by bridge-a2a.py cmd_outbox already; we
+    # fall back to (now - created_ts) when the field is absent so the
+    # helper stays robust to upstream shape drift.
+    seen_ids = set()
+    emitted_now = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        message_id = str(row.get("message_id") or "")
+        if not message_id:
+            continue
+        seen_ids.add(message_id)
+        status = str(row.get("status") or "")
+        # Only pending/retry rows are alert-worthy. acked = success,
+        # sending = currently being attempted, dead = the retry loop
+        # already gave up — separate signal not to confuse with stuck.
+        if status not in ("pending", "retry"):
+            continue
+        try:
+            age = int(row.get("age_seconds") or 0)
+        except Exception:
+            age = 0
+        if age <= 0:
+            try:
+                created_ts = int(row.get("created_ts") or 0)
+            except Exception:
+                created_ts = 0
+            if created_ts > 0:
+                age = max(0, now - created_ts)
+        if age < stuck_secs:
+            continue
+        last_emit = ledger.get(message_id, 0)
+        if last_emit and (now - last_emit) < reemit_secs:
+            continue
+        emitted_now.append({
+            "message_id": message_id,
+            "peer": str(row.get("peer") or ""),
+            "target_agent": str(row.get("target_agent") or ""),
+            "status": status,
+            "attempts": int(row.get("attempts") or 0),
+            "age_seconds": age,
+            "last_error": str(row.get("last_error") or "").replace("\t", " ").replace("\n", " "),
+        })
+
+    for r in emitted_now:
+        print(
+            f"{r['message_id']}\t{r['peer']}\t{r['target_agent']}\t"
+            f"{r['status']}\t{r['attempts']}\t{r['age_seconds']}\t{r['last_error']}"
+        )
+
+    # NOTE (r2 split, codex r1 BLOCKING): we DO NOT modify the ledger
+    # here. The daemon shell calls ``a2a-stuck-ack`` after each
+    # successful admin task create. Ledger stamping + pruning lives
+    # in ``cmd_a2a_stuck_ack``.
+
+    return 0
+
+
+def cmd_a2a_stuck_ack(args: argparse.Namespace) -> int:
+    """Original site: bridge-daemon.sh process_a2a_outbox_stuck_scan_tick.
+
+    Issue #1262 Gap 3 / v0.15.0-beta4 Lane I r2 (codex r1 BLOCKING).
+
+    Stamp the stuck-alert ledger ONLY for outbox rows whose admin task
+    was successfully filed by the daemon shell. Without this split, a
+    transient `bridge-task.sh create` failure would advance the
+    re-emit cooldown for a row that never produced an admin task —
+    the operator silently loses the alert until the cooldown lapses.
+
+    Input (positional):
+      now              — current epoch seconds (int)
+      ledger_path      — JSON file: { message_id: last_emitted_ts }
+      row_keys_file    — UTF-8 text file with one message_id per
+                         non-empty line. The shell writes successful
+                         task-create message_ids here; empty file is
+                         legal (no rows to stamp, but pruning still
+                         runs).
+      outbox_json_path — JSON array from `agb a2a outbox list --json`
+                         used for ledger pruning (entries whose
+                         message_id is no longer in the outbox are
+                         dropped so the ledger does not grow
+                         unboundedly).
+
+    Atomic rewrite via tempfile + os.replace. Errors are swallowed —
+    worst case is a duplicate alert next tick.
+
+    rc=0 on every path so the daemon loop never crashes on a
+    malformed ledger / row-keys file.
+    """
+    try:
+        now = int(args.now)
+    except Exception:
+        return 0
+
+    ledger_path = args.ledger_path
+    row_keys_file = args.row_keys_file
+    outbox_json_path = args.outbox_json_path
+
+    ledger: dict = {}
+    try:
+        with open(ledger_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                try:
+                    ledger[str(k)] = int(v)
+                except Exception:
+                    continue
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        ledger = {}
+
+    # Successful task-create keys (one per line, blank lines skipped).
+    ack_keys: list = []
+    try:
+        with open(row_keys_file, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                key = raw.strip()
+                if key:
+                    ack_keys.append(key)
+    except (FileNotFoundError, OSError):
+        ack_keys = []
+
+    # Current outbox for pruning. Missing/malformed → skip prune (keep
+    # ledger as-is) rather than wipe entries we still care about.
+    seen_ids: set = set()
+    prune_known = False
+    try:
+        with open(outbox_json_path, "r", encoding="utf-8") as fh:
+            rows = json.load(fh)
+        if isinstance(rows, list):
+            prune_known = True
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                message_id = str(row.get("message_id") or "")
+                if message_id:
+                    seen_ids.add(message_id)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        prune_known = False
+
+    new_ledger: dict = {}
+    if prune_known:
+        for k, v in ledger.items():
+            if k in seen_ids:
+                new_ledger[k] = v
+    else:
+        new_ledger = dict(ledger)
+
+    for key in ack_keys:
+        new_ledger[str(key)] = now
+
+    # Atomic rewrite — tmp-write + os.replace so a crash mid-write
+    # cannot leave the ledger in a half-state.
+    try:
+        import os
+        import tempfile
+        ledger_dir = os.path.dirname(ledger_path) or "."
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=ledger_dir,
+            prefix=".stuck-alerts.", suffix=".tmp", delete=False,
+        ) as tmp:
+            json.dump(new_ledger, tmp, ensure_ascii=False)
+            tmp_path = tmp.name
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, ledger_path)
+    except OSError:
+        # Ledger update failure is non-fatal — worst case is a
+        # duplicate alert next tick (cooldown not respected once).
+        pass
+
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI plumbing.
 # ---------------------------------------------------------------------------
@@ -536,6 +968,12 @@ SUBCOMMANDS = {
         cmd_release_alert_parse,
         [("monitor_json", "JSON payload produced by bridge-release.py monitor")],
         "Single-row tabular extract of the first release alert (5 cols).",
+    ),
+    "release-downgrade-classify": (
+        cmd_release_downgrade_classify,
+        [("monitor_json", "JSON payload produced by bridge-release.py monitor")],
+        "Single-row downgrade-skip classification (installed \\t latest), "
+        "or empty when not a downgrade case (Issue #1267).",
     ),
     "backup-parse": (
         cmd_backup_parse,
@@ -560,6 +998,11 @@ SUBCOMMANDS = {
         cmd_watchdog_problem_count,
         [("report_json", "JSON envelope from bridge-watchdog.sh scan --json")],
         "Single integer line (problem_count), defaulting to 0 on parse error.",
+    ),
+    "watchdog-fresh-install-only": (
+        cmd_watchdog_fresh_install_only,
+        [("report_json", "JSON envelope from bridge-watchdog.sh scan --json")],
+        "Single integer line (1 = every effective problem is fresh-install; 0 otherwise).",
     ),
     "nudge-live-state": (
         cmd_nudge_live_state,
@@ -614,6 +1057,43 @@ SUBCOMMANDS = {
         cmd_sync_status_parse,
         [("sync_json", "JSON envelope from bridge-auth.sh claude-token sync --json")],
         "Single line — sync status string ('error' on parse failure).",
+    ),
+    "sync-aliveness-parse": (
+        cmd_sync_aliveness_parse,
+        [("sync_json", "JSON envelope from bridge-auth.sh claude-token sync --json")],
+        "Per-agent aliveness/remaining_ms (3 tab-separated cols / row). Empty on parse failure.",
+    ),
+    # Issue #1262 Gap 3 (v0.15.0-beta4 Lane I): outbox stuck-alert
+    # decision helper. See cmd_a2a_stuck_decide.
+    "a2a-stuck-decide": (
+        cmd_a2a_stuck_decide,
+        [
+            ("now", "current epoch seconds (int)"),
+            ("stuck_secs", "row.age_seconds threshold above which the row is candidate"),
+            ("reemit_secs", "per-message re-emit cooldown in seconds"),
+            ("ledger_path", "JSON file recording last-emitted-ts per message_id"),
+            ("outbox_json_path", "JSON file containing `agb a2a outbox list --json` output"),
+        ],
+        "One tab-separated row per stuck row that crossed the threshold and cooldown.",
+    ),
+    # Issue #1262 Gap 3 / v0.15.0-beta4 Lane I r2 (codex r1 BLOCKING):
+    # stamp the ledger ONLY after the daemon shell successfully filed
+    # the admin task. See cmd_a2a_stuck_ack.
+    "a2a-stuck-ack": (
+        cmd_a2a_stuck_ack,
+        [
+            ("now", "current epoch seconds (int)"),
+            ("ledger_path", "JSON file recording last-emitted-ts per message_id"),
+            (
+                "row_keys_file",
+                "UTF-8 text file with one successful-task-create message_id per line",
+            ),
+            (
+                "outbox_json_path",
+                "JSON file containing `agb a2a outbox list --json` output (for prune)",
+            ),
+        ],
+        "Stamp ledger for successful task-create rows + prune entries missing from outbox.",
     ),
 }
 

@@ -226,13 +226,68 @@ def emit_system_cross_agent_read(
     )
 
 
-def current_isolated_agent() -> str | None:
+def _current_agent_under_foreign_uid() -> str | None:
+    """Return the calling agent slug iff this process is actually
+    running as a non-controller UID under the agent's env.
+
+    Issue #1213 root cause: ``BRIDGE_AGENT_ISOLATION_MODE`` is declared
+    as an associative array in ``lib/bridge-agents.sh:3410`` /
+    ``lib/bridge-state.sh:1008``. When ``bridge-run.sh:212`` later runs
+    ``export BRIDGE_AGENT_ISOLATION_MODE="linux-user"``, bash silently
+    no-ops the export (a scalar export of a name bound to an assoc
+    array is structurally impossible). The variable shows up "set" in
+    the current shell, but is absent from the child process's
+    ``/proc/<pid>/environ``. The same name-collision hits
+    ``BRIDGE_AGENT_OS_USER`` (also an assoc array exported as a scalar
+    on line 213). The pre-#1213 ``current_isolated_agent`` predicate
+    gated on this missing env var → returned ``None`` under iso v2 →
+    every PermissionError fail-open in ``_under_isolated_uid`` and
+    ``queue_cli`` was silently bypassed.
+
+    The new predicate proves the iso shape from the data we *can* see:
+    ``BRIDGE_AGENT_ID`` (singular scalar, propagates fine) +
+    ``BRIDGE_CONTROLLER_UID`` (scalar) + ``os.geteuid() !=
+    controller_uid``. The UID-differs-from-controller check defends
+    against a controller process inheriting ``BRIDGE_AGENT_ID`` and
+    being mis-attributed — the original #1167 codex BLOCKING scenario
+    — strictly more rigorously than the mode-string check did, because
+    a controller re-exporting the env still runs as the controller UID.
+
+    Returns the agent slug when the process is provably under a
+    foreign UID, ``None`` otherwise (no controller UID, malformed
+    controller UID, or matching UID).
+    """
     agent = current_agent()
     if not agent:
         return None
-    if os.environ.get("BRIDGE_AGENT_ISOLATION_MODE", "").strip() != "linux-user":
+    controller_uid_raw = os.environ.get("BRIDGE_CONTROLLER_UID", "").strip()
+    if not controller_uid_raw:
+        # Fail-closed: without the controller UID we cannot prove the
+        # caller is the isolated UID. Treat as controller.
+        return None
+    try:
+        controller_uid = int(controller_uid_raw)
+    except ValueError:
+        return None
+    if os.geteuid() == controller_uid:
         return None
     return agent
+
+
+def current_isolated_agent() -> str | None:
+    # Issue #1213: use the UID-based predicate instead of the
+    # ``BRIDGE_AGENT_ISOLATION_MODE`` mode-string check. The mode-string
+    # check structurally cannot survive the bash assoc-array name
+    # collision in ``bridge-run.sh:212``; the UID check proves the
+    # same property (foreign-UID iso shape) more strictly. See
+    # :func:`_current_agent_under_foreign_uid` for the rationale.
+    #
+    # This function is consumed by ``queue_cli()`` (this file, below)
+    # to route hook queue traffic through ``bridge-queue-gateway.py``
+    # — without this fix, iso v2 sessions stayed on the controller
+    # ``bridge-queue.py`` path and could not route through the
+    # gateway, leaving hook queue commands silently misrouted.
+    return _current_agent_under_foreign_uid()
 
 
 def current_agent_workdir() -> Path:
@@ -294,40 +349,62 @@ def _acting_os_user() -> str:
 
 
 def _current_isolation_mode() -> str:
+    # Issue #1213: ``BRIDGE_AGENT_ISOLATION_MODE`` is silently absent
+    # from iso v2 child environs because of the assoc-array name
+    # collision on the bash side (see
+    # :func:`_current_agent_under_foreign_uid`). When the env var is
+    # missing but the UID-based predicate proves the foreign-UID iso
+    # shape, return ``"linux-user"`` so diagnostics (audit envelopes,
+    # status reasons) do not lie and say ``"shared"`` under a proven
+    # iso process. Operator-supplied ``BRIDGE_AGENT_ISOLATION_MODE``
+    # still wins when set (back-compat for explicit mode overrides).
     mode = os.environ.get("BRIDGE_AGENT_ISOLATION_MODE", "").strip()
-    return mode or "shared"
+    if mode:
+        return mode
+    if _current_agent_under_foreign_uid() is not None:
+        return "linux-user"
+    return "shared"
 
 
 def _under_isolated_uid() -> bool:
     """True only when the process is actually running as a non-controller
     UID under an isolated agent's env.
 
-    Issue #1165 Track C r2 (codex BLOCKING): the original Gap 7 guard
-    keyed on ``current_isolated_agent()`` alone, which only inspects env
-    (``BRIDGE_AGENT_ID`` + ``BRIDGE_AGENT_ISOLATION_MODE=linux-user``).
-    That meant any process inheriting those vars — including the
-    controller itself, e.g. an upgrade/dispatcher run that re-exported
-    them — silently swallowed audit-write failures. The contract is
-    "only the isolated UID may no-op," so we additionally verify the
-    effective UID differs from the controller UID exported by
-    ``bridge-start.sh``. When ``BRIDGE_CONTROLLER_UID`` is missing
-    (legacy session, older controller, anything that pre-dates the
-    propagation) we fail-closed and treat the process as controller —
-    a real permission regression continues to surface as before.
+    Issue #1213: keys on the UID-side predicate
+    (``_current_agent_under_foreign_uid``) rather than the
+    mode-string ``BRIDGE_AGENT_ISOLATION_MODE`` env var. The mode
+    string was previously gated through ``current_isolated_agent()``
+    but cannot survive the assoc-array name collision in
+    ``bridge-run.sh:212`` (silently no-ops the scalar export). The
+    UID-based predicate proves the same property — the caller is
+    actually running as a non-controller UID under the agent's env —
+    strictly more rigorously, since a controller process re-exporting
+    ``BRIDGE_AGENT_ID`` still runs as the controller UID.
+
+    History: this was originally codified as the #1165 Track C r2
+    codex BLOCKING fix where the env-only predicate (``BRIDGE_AGENT_ID``
+    + ``BRIDGE_AGENT_ISOLATION_MODE=linux-user``) was caught swallowing
+    controller-side failures whenever the iso env happened to be
+    inherited. The UID-side guard was already added then; #1213
+    completes the contract by removing the mode-string dependency
+    so iso v2 itself can satisfy the gate.
     """
-    if not current_isolated_agent():
-        return False
-    controller_uid_raw = os.environ.get("BRIDGE_CONTROLLER_UID", "").strip()
-    if not controller_uid_raw:
-        # Fail-closed: without the controller UID we cannot prove the
-        # caller is the isolated UID. Treat as controller so genuine
-        # permission errors still raise.
-        return False
-    try:
-        controller_uid = int(controller_uid_raw)
-    except ValueError:
-        return False
-    return os.geteuid() != controller_uid
+    return _current_agent_under_foreign_uid() is not None
+
+
+def under_isolated_uid() -> bool:
+    """Public wrapper for :func:`_under_isolated_uid`.
+
+    Hook modules outside ``bridge_hook_common`` (e.g. ``tool-policy.py``)
+    need the same effective-UID gate when they encounter a PermissionError
+    that is part of the iso v2 contract (controller-only-readable agent
+    home root, controller-only-writable state tree). Re-exporting the
+    private helper as a public symbol keeps the gate behind a single
+    SSOT — callers must NOT roll their own env-only predicate, which is
+    exactly the regression codex caught on issue #1167 (#1165 Track C r2).
+    See :func:`_under_isolated_uid` for the rationale on every branch.
+    """
+    return _under_isolated_uid()
 
 
 def write_audit(action: str, target: str, detail: dict[str, Any]) -> None:
@@ -895,17 +972,61 @@ def load_timestamp_state(agent: str) -> dict[str, int]:
 
 
 def save_timestamp_state(agent: str, payload: dict[str, int]) -> None:
+    # Issue #1205 Family B: the timestamp state path resolves to
+    # ``$BRIDGE_HOME/state/agents/<agent>/timestamp.json`` (parent mode
+    # ``drwx--x--x`` under iso v2). The isolated UID has no permission to
+    # mkdir / write into that controller-owned tree, so the entire write
+    # sequence (mkdir + temp write + chmod + replace + final chmod) can
+    # raise PermissionError or OSError at any step. Wrap the whole
+    # sequence and fail-open only when the calling UID is actually a
+    # non-controller iso UID — controller-side callers still raise so a
+    # genuine permission regression continues to surface. The advisory
+    # timestamp context (prompt_timestamp_context, remember_session_start)
+    # is intentionally non-critical; silently no-op under iso is the
+    # correct behavior until the controller-proxy gateway wave lands.
     path = timestamp_state_path(agent)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    os.chmod(path, 0o600)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+        os.chmod(path, 0o600)
+    except (PermissionError, OSError):
+        if _under_isolated_uid():
+            # Opportunistic audit attempt — best-effort, no stderr noise.
+            # write_audit() is already iso-UID-aware (#1165 Gap 7) so
+            # this call is safe to make under iso: it will no-op silently
+            # if the audit log path is also unwritable. No re-raise.
+            try:
+                write_audit(
+                    "hook_permission_fail_open.timestamp_state",
+                    str(path),
+                    {
+                        "operation": "save_timestamp_state",
+                        "isolation_mode": _current_isolation_mode(),
+                    },
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never block hooks
+                pass
+            return
+        raise
 
 
 def agent_timestamp_enabled(agent: str) -> bool:
-    raw = os.environ.get("BRIDGE_AGENT_INJECT_TIMESTAMP", "").strip().lower()
+    # Issue #1217 (beta27 Track D): bridge-run.sh exports
+    # BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED as a distinctly-named scalar
+    # alias because the bare BRIDGE_AGENT_INJECT_TIMESTAMP collides with
+    # the assoc array of the same name in lib/bridge-core.sh:867 (bash
+    # silently no-ops a scalar export of a name bound to an assoc array).
+    # Read RESOLVED first; fall back to the bare name so manual /
+    # non-bridge launches (where the collision does not exist) keep
+    # working unchanged.
+    raw = (
+        os.environ.get("BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED")
+        or os.environ.get("BRIDGE_AGENT_INJECT_TIMESTAMP")
+        or ""
+    ).strip().lower()
     if not raw:
         return True
     return raw not in {"0", "false", "no", "off"}

@@ -72,7 +72,46 @@ bridge_notify_send() {
     --detail dry_run="$dry_run" \
     --detail title="$title"
 
-  bridge_notify_python "${args[@]}"
+  # Issue #1321 (beta5-2 Lane ι) — H3 MCP recovery re-deliver miss messages.
+  #
+  # When the daemon's miss-queue helpers are sourced into this process
+  # AND the underlying notify send fails AND the agent is currently in
+  # MCP giveup state, enqueue a miss-log entry so the next recovery
+  # tick replays it via bridge_daemon_mcp_miss_queue_drain. The intent
+  # is to make the H3 semantic (queue-on-fail-during-giveup, drain-on-
+  # recovery) a property of the notify primitive itself so every
+  # existing call site in bridge-daemon.sh (admin usage warnings, stall
+  # detector, permission-timeout, crash-loop, channel-health-mismatch,
+  # …) gets the behavior without a per-site rename.
+  #
+  # Guards (codex r1 BLOCKING 1 edge cases):
+  #   1. Healthy path (rc=0) — NOT enqueued. The notify went through.
+  #   2. Non-daemon callers (bridge-task / bridge-send / smoke stubs)
+  #      do NOT have bridge_daemon_should_enqueue_mcp_miss sourced;
+  #      the `declare -F` gate makes the H3 path a pure no-op there.
+  #   3. Agent not in giveup — predicate returns 1, no enqueue.
+  #   4. Dry-run sends (dry_run=1) still go through but are unlikely
+  #      to fail; if they do and the predicate is true we still
+  #      enqueue (the operator wanted to know it would have failed).
+  #   5. The enqueue is best-effort: any helper failure is swallowed
+  #      via `|| true` so we never propagate a degraded-path error to
+  #      the caller's `|| true` wrapping at the 8 production sites.
+  local _rc=0
+  bridge_notify_python "${args[@]}" || _rc=$?
+  if (( _rc != 0 )) \
+     && declare -F bridge_daemon_should_enqueue_mcp_miss >/dev/null 2>&1 \
+     && declare -F bridge_daemon_mcp_miss_queue_enqueue >/dev/null 2>&1 \
+     && bridge_daemon_should_enqueue_mcp_miss "$agent"; then
+    bridge_daemon_mcp_miss_queue_enqueue \
+      "$agent" "$title" "$message" "$priority" "$task_id" || true
+    bridge_audit_log daemon plugin_mcp_miss_queue_enqueued "$agent" \
+      --detail title="$title" \
+      --detail priority="$priority" \
+      --detail task_id="${task_id:-none}" \
+      --detail send_rc="$_rc" \
+      2>/dev/null || true
+  fi
+  return "$_rc"
 }
 
 bridge_warn_missing_wake_channel() {

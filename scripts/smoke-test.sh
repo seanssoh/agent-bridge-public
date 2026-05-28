@@ -306,6 +306,13 @@ BRIDGE_AGENT_ENGINE["dryrun-redact-smoke"]="claude"
 BRIDGE_AGENT_SESSION["dryrun-redact-smoke"]="dryrun-redact-smoke"
 BRIDGE_AGENT_WORKDIR["dryrun-redact-smoke"]="$LAUNCH_DRYRUN_WORKDIR"
 BRIDGE_AGENT_LAUNCH_CMD["dryrun-redact-smoke"]='MS365_CLIENT_SECRET=fake-secret-XYZ MY_API_TOKEN=fake-token-ABC BRIDGE_LAYOUT_MARKER_KEY=preserve-me claude --ok'
+# v0.15.0-beta3 Lane A3 (#1248): the new bridge-run.sh --no-continue
+# vs continue=1 reconcile gate fails loud when effective continue=1
+# AND session_id is empty. This smoke is testing the launch-cmd
+# redaction path, NOT the resume contract, so pin continue=0 explicitly
+# so the gate is bypassed. Without this, the smoke fails with the
+# session_id-missing remediation instead of exercising the redactor.
+BRIDGE_AGENT_CONTINUE["dryrun-redact-smoke"]=0
 EOF
 # Unset any inherited BRIDGE_ROSTER_* / BRIDGE_*_DIR overrides so the
 # isolated BRIDGE_HOME defaults bind to LAUNCH_DRYRUN_HOME. Without this,
@@ -2092,6 +2099,14 @@ BRIDGE_AGENT_DISCORD_CHANNEL_ID["$SMOKE_AGENT"]="123456789012345678"
 BRIDGE_AGENT_NOTIFY_ACCOUNT["$SMOKE_AGENT"]="smoke"
 BRIDGE_AGENT_CHANNELS["claude-static"]="plugin:discord@claude-plugins-official"
 BRIDGE_AGENT_CONTINUE["$ROSTER_RELOAD_AGENT"]="0"
+# v0.15.0-beta3 Lane A3 (#1248): the new bridge-run.sh reconcile gate
+# fails loud when effective continue=1 AND session_id is empty. The
+# codex CLI agent below is exercised via bridge-run.sh --dry-run at
+# line 3920 to verify the launch_cmd shape (codex_hooks + fast_mode
+# features), not the resume contract — pin continue=0 so the gate is
+# bypassed. Without this, the dry-run fails with the session_id-missing
+# remediation instead of exercising the launch_cmd builder.
+BRIDGE_AGENT_CONTINUE["$CODEX_CLI_AGENT"]="0"
 BRIDGE_CRON_AGENT_TARGET["legacy-ops"]="$AUTO_START_AGENT"
 BRIDGE_AGENT_LAUNCH_CMD["$SMOKE_AGENT"]='python3 -c "import time; print(\"smoke-agent ready\", flush=True); time.sleep(30)"'
 BRIDGE_AGENT_LAUNCH_CMD["$REQUESTER_AGENT"]='python3 -c "import time; print(\"requester-agent ready\", flush=True); time.sleep(30)"'
@@ -2732,20 +2747,20 @@ assert clear_idx_agent > dry_run_idx_agent, (
 print("[ok] broken-launch clear guarded behind dry-run + preflight in both entry points")
 PY
 
-log "diagnose acl reports clean on macOS (non-Linux host)"
-DIAGNOSE_OUTPUT="$("$REPO_ROOT/agent-bridge" diagnose acl)"
-if [[ "$(uname -s)" == "Linux" ]]; then
-  # On Linux getfacl may or may not be installed; either way the
-  # scanner exits 0 with an "[ok]" or "[skip]" banner. The only thing
-  # smoke needs to assert is that it did not explode.
-  assert_contains "$DIAGNOSE_OUTPUT" "["
-else
-  assert_contains "$DIAGNOSE_OUTPUT" "non-linux"
-fi
-DIAGNOSE_JSON_OUTPUT="$("$REPO_ROOT/agent-bridge" diagnose acl --json)"
-assert_contains "$DIAGNOSE_JSON_OUTPUT" "\"findings\""
+log "diagnose acl retired in v0.15.0-beta4 (#1283) — verb now emits deprecation"
+# `agent-bridge diagnose acl` was retired in v0.15.0-beta4 (#1283).
+# ACL-based cross-UID grants are no longer the recommended isolation
+# mechanism (iso v2 uses group-based perms). The verb now exits
+# non-zero AND points operators at the iso v2 replacement.
+DIAGNOSE_ACL_RC=0
+DIAGNOSE_OUTPUT="$("$REPO_ROOT/agent-bridge" diagnose acl 2>&1)" || DIAGNOSE_ACL_RC=$?
+[[ "$DIAGNOSE_ACL_RC" -ne 0 ]] || die "diagnose acl must exit non-zero post-#1283 (got rc=0)"
+assert_contains "$DIAGNOSE_OUTPUT" "deprecated"
+assert_contains "$DIAGNOSE_OUTPUT" "isolation reconcile"
 DIAGNOSE_HELP="$("$REPO_ROOT/agent-bridge" diagnose 2>&1 || true)"
-assert_contains "$DIAGNOSE_HELP" "diagnose acl"
+# The usage banner still mentions the retirement so operators with
+# stale muscle memory find the replacement.
+assert_contains "$DIAGNOSE_HELP" "retired"
 
 log "apply-channel-policy.sh writes overlay disabling singleton channel plugins (#244)"
 CHANNEL_POLICY_HOME="$TMP_ROOT/channel-policy-home"
@@ -6167,7 +6182,11 @@ PY
   assert_contains "$(cat "$TEAMS_PLUGIN_CONFLICT_LOG")" "teams channel: http listen failed on 0.0.0.0:$TEAMS_SMOKE_PORT"
   assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "agent-bridge urgent"
   assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "spawnSync(agb, ['urgent'"
-  assert_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "ignoring deprecated TEAMS_BRIDGE_MODE"
+  # Issue #1204: TEAMS_DELIVERY_MODE was removed entirely. Lock the removal in
+  # by asserting both the env-var token and the prior delivery-mode resolver
+  # are gone from the shipped server.ts.
+  assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "TEAMS_DELIVERY_MODE"
+  assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "deliverViaBridgeQueue"
   TEAMS_CHANNEL_META_OUTPUT="$(cd "$REPO_ROOT/plugins/teams" && TEAMS_STATE_DIR="$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams" bun server.ts _smoke-channel-meta)"
   python3 "$REPO_ROOT/scripts/smoke/teams-channel-meta-assert.py" "$TEAMS_CHANNEL_META_OUTPUT"
   TEAMS_DEDUPE_OUTPUT="$(cd "$REPO_ROOT/plugins/teams" && bun -e 'import { createRecentMessageDeduper } from "./dedupe.ts"; const dedupe = createRecentMessageDeduper(2); console.log(JSON.stringify([dedupe.seen("1775901127484"), dedupe.seen("1775901127484"), dedupe.seen("1775901127485"), dedupe.seen("1775901127486"), dedupe.seen("1775901127484")]))')"
@@ -11359,6 +11378,18 @@ bash "$REPO_ROOT/scripts/smoke/dynamic-agent-shared-mode-workdir.sh"
 log "running v2-scaffold-home-and-workdir smoke (issue #686)"
 bash "$REPO_ROOT/scripts/smoke/v2-scaffold-home-and-workdir.sh"
 
+# Issue #1238 — v0.15.0-beta1 fresh `agent create --isolate` scaffolded
+# the per-agent home tree (`SOUL.md`, `CLAUDE.md`, `.claude/`, etc.)
+# under the controller's umask and `bridge_linux_prepare_agent_isolation`
+# never recursive-chowned the `home/` subtree to the iso UID. Result:
+# claude session under the iso UID could not read its own identity
+# files — boot was structurally impossible. Companion bug: `bridge_auth_
+# update_legacy_claude_config_env` ran a bare `python3 - <<PY` heredoc
+# as the un-refreshed controller and tripped `PermissionError` on
+# `path.exists()` for `<v2-root>/credentials/launch-secrets.env`.
+log "running 1238-iso-scaffold-ownership smoke (issue #1238)"
+bash "$REPO_ROOT/scripts/smoke/1238-iso-scaffold-ownership.sh"
+
 # Task #4813 — `agent-bridge --claude --name <new-dynamic> --no-attach`
 # from a project that already hosts a static role (e.g. `patch`) was
 # silently redirecting to that static role in non-TTY mode. The
@@ -11480,6 +11511,16 @@ bash "$REPO_ROOT/scripts/smoke/bridge-daemon-cron-no-deadlock.sh"
 # nudge-suppression 2026-05-17).
 log "running daemon-tick-guards-l2-l4 smoke (refs #946 L2+L4, PR #952)"
 bash "$REPO_ROOT/scripts/smoke/daemon-tick-guards-l2-l4.sh"
+
+# Issue #1234 (v0.15.0-beta2 Lane δ) — daemon auto-start loops on agents
+# with intentionally incomplete channel setup. `agent update --start-policy
+# hold|auto` adds an explicit operator affordance; the daemon also
+# auto-holds when channel_status==miss and names the actual blocker
+# (`channel-required-validator-miss: <reason>`) instead of the opaque
+# `start-command-failed`. Smoke pins the hold gate + reader normalisation +
+# validator-miss reason at the function level.
+log "running δ-1234-daemon-start-policy smoke (issue #1234, v0.15.0-beta2 Lane δ)"
+bash "$REPO_ROOT/scripts/smoke/δ-1234-daemon-start-policy.sh"
 
 # bridge-watchdog-silence.py previously truncated captured daemon
 # stop/start output to the last line, so every wedge from 2026-05-15

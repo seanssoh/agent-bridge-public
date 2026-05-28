@@ -122,6 +122,15 @@ rm() {
   fi
   command rm "\$@"
 }
+# sudo shim. The probe defines a _bridge_isolation_v2_run_root_or_sudo
+# stub below, but the lib source at the bottom overrides it. The real
+# wrapper falls back to sudo -n when the direct call returns non-zero.
+# On CI runners with passwordless sudo (the github-actions ubuntu runner
+# has it for the runner user), real sudo -n rm -rf would bypass our
+# shimmed rm entirely and silently succeed, masking the warning path
+# under test. We refuse every sudo invocation from inside the probe so
+# the wrapper returns rc=1 and bridge_warn fires.
+sudo() { printf 'SUDO_REFUSED %s\n' "\$*" >&2; return 1; }
 bridge_warn() { printf 'WARN %s\n' "\$*" >&2; }
 bridge_die()  { printf 'DIE %s\n' "\$*" >&2; exit 1; }
 

@@ -181,15 +181,46 @@ if [[ -z "${BRIDGE_CONTROLLER_UID:-}" ]]; then
       _bridge_recovery_owner="$(stat -c '%u' "$_bridge_recovery_marker" 2>/dev/null || true)"
     fi
     _bridge_recovery_current="$(id -u 2>/dev/null || true)"
+    # Phase 2 refinement: skip recovery when the marker is root-owned
+    # (#1161 contract since beta13: `chown root:ab-shared` on the
+    # marker file for validator-owner-exemption symmetry). A
+    # root-owned marker carries no controller-identity signal — using
+    # it to set BRIDGE_CONTROLLER_UID=0 makes every controller
+    # invocation look like "controller is root" downstream, which
+    # mis-resolves matrix `controller` tokens to root in the new
+    # install-tree reconciler (Phase 2 D5). The original recovery
+    # intent (iso UID reading a controller-owned marker pre-#1161)
+    # still works when the marker's owner is a real user UID.
     if [[ -n "$_bridge_recovery_owner" \
         && -n "$_bridge_recovery_current" \
-        && "$_bridge_recovery_owner" != "$_bridge_recovery_current" ]]; then
+        && "$_bridge_recovery_owner" != "$_bridge_recovery_current" \
+        && "$_bridge_recovery_owner" != "0" ]]; then
       export BRIDGE_CONTROLLER_UID="$_bridge_recovery_owner"
     fi
     unset _bridge_recovery_owner _bridge_recovery_current
   fi
   unset _bridge_recovery_home _bridge_recovery_marker
 fi
+
+# L1-N (beta21): mark this process as a queue-safe verb context BEFORE
+# sourcing bridge-lib.sh, so `bridge_load_roster` (inside the lib) can
+# fall through to the public-roster-only path when an iso UID runs an
+# `agb`-aliased queue verb (e.g. `agb show 123`, `agb done 123`) from
+# a controller-protected `BRIDGE_ROSTER_LOCAL_FILE`. The flag is only
+# set for the queue-shorthand verbs that line 1256 dispatches to
+# `bridge-task.sh` — every OTHER subcommand falls through unchanged
+# (channel/agent/admin verbs etc. still need roster_local and will
+# fail-closed on the iso-UID-without-scoped-env path).
+#
+# `task` and `inbox` skip `bridge_load_roster` at the wrapper level
+# (line 235 below) — bridge-task.sh sets the flag itself when invoked
+# directly, so they don't need to be enumerated here. The enumerated
+# tokens below mirror the dispatch table at line 1256.
+case "${1:-}" in
+  show|claim|done|cancel|update|handoff|summary|create)
+    export BRIDGE_QUEUE_SAFE_CONTEXT=1
+    ;;
+esac
 
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
@@ -221,7 +252,7 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 # (if a future patch adds the subcommand handler) does not eat the
 # roster cost either.
 case "${1:-}" in
-  version|status|daemon|agent|task|inbox|a2a|help|--help|-h|--version|-V) ;;
+  version|status|daemon|agent|task|inbox|a2a|iso-run|help|--help|-h|--version|-V) ;;
   init)
     # bridge-isolation-v2.sh's `BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"`
     # default fires during our bridge-lib.sh source above and exports the
@@ -402,6 +433,84 @@ if [[ $# -gt 0 ]]; then
     admin)
       shift
       ADMIN_AGENT="$(bridge_require_admin_agent)"
+
+      # Issue #1247 — `agb admin set <key>=<value>` CLI surface.
+      # Phase 1: persist a `auto_restart_on_membership_change` flag (on |
+      # off) into `state/admin-config.json`. Future PRs wire this flag
+      # into the post-`agent create` admin-set restart automation
+      # described in #1247's "Desired behavior" section. Keeping the
+      # flag here (not in `agent-roster.local.sh`) avoids touching the
+      # protected-mutation surface and means operators can flip it
+      # without going through `agent-bridge config set`.
+      if [[ "${1:-}" == "set" ]]; then
+        shift
+        admin_set_auto_restart=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --auto-restart)
+              [[ $# -lt 2 ]] && bridge_die "--auto-restart 뒤에 on|off를 지정하세요."
+              admin_set_auto_restart="$2"
+              shift 2
+              ;;
+            --auto-restart=*)
+              admin_set_auto_restart="${1#--auto-restart=}"
+              shift
+              ;;
+            -h|--help)
+              cat <<'ADMINSET'
+Usage:
+  agent-bridge admin set --auto-restart on|off
+
+Persist admin-set lifecycle flags. Currently exposes:
+
+  --auto-restart on|off
+      Toggle `auto_restart_on_membership_change`. When `on`, future
+      `agent create --isolate` runs will queue an admin-set restart
+      (admin + codex pair) after the daemon refresh so the new
+      `ab-agent-<new>` group lands in their supplementary set without
+      operator intervention. When `off` (default), the operator
+      restarts the admin set manually.
+
+  See issue #1247 for the desired admin-set restart sequence
+  (resume-id-carrying, sequential, single-line status per admin).
+ADMINSET
+              exit 0
+              ;;
+            *)
+              bridge_die "admin set: 알 수 없는 인자: $1"
+              ;;
+          esac
+        done
+
+        if [[ -z "$admin_set_auto_restart" ]]; then
+          bridge_die "admin set: --auto-restart on|off가 필요합니다."
+        fi
+        case "$admin_set_auto_restart" in
+          on|off) ;;
+          *)
+            bridge_die "admin set: --auto-restart 값은 on|off 중 하나여야 합니다 ('$admin_set_auto_restart' 거부)."
+            ;;
+        esac
+
+        admin_config_dir="${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}"
+        admin_config_path="$admin_config_dir/admin-config.json"
+
+        mkdir -p "$admin_config_dir" 2>/dev/null || \
+          bridge_die "admin set: state directory를 만들 수 없습니다: $admin_config_dir"
+
+        # File-as-argv per footgun #11: invoke the standalone helper
+        # with explicit flags rather than piping a heredoc into a
+        # subprocess. Keeps the bash layer thin and the JSON-write
+        # logic auditable in one place.
+        python3 "$SCRIPT_DIR/scripts/python-helpers/admin-set-config.py" \
+          set-auto-restart \
+          --admin "$ADMIN_AGENT" \
+          --config "$admin_config_path" \
+          --value "$admin_set_auto_restart" \
+          || bridge_die "admin set: admin-config.json 갱신 실패."
+        exit 0
+      fi
+
       ADMIN_ENGINE="$(bridge_agent_engine "$ADMIN_AGENT")"
       ADMIN_WORKDIR="$(bridge_agent_workdir "$ADMIN_AGENT")"
       ADMIN_SAFE_MODE=0
@@ -495,6 +604,114 @@ EOF
       ;;
     init)
       shift
+      # Beta20 L2 Variant 3A — `agent-bridge init sudoers daemon-refresh
+      # --apply|--check` intercept. Handled here BEFORE the exec to
+      # bridge-init.sh so the helper module loaded via bridge-lib.sh
+      # (sourced at the top of this file) is in-scope. The first-install
+      # path still routes through bridge-init.sh which calls the same
+      # helper after host-profile detection.
+      if [[ "${1:-}" == "sudoers" && "${2:-}" == "daemon-refresh" ]]; then
+        shift 2
+        _SUDO_REFRESH_MODE=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --apply) _SUDO_REFRESH_MODE="apply"; shift ;;
+            --check) _SUDO_REFRESH_MODE="check"; shift ;;
+            -h|--help)
+              cat <<EOF
+Usage: agent-bridge init sudoers daemon-refresh [--apply | --check]
+
+Manage the user-/install-scoped sudoers drop-in that authorizes the
+controller user to restart its own daemon for supplementary-groups
+refresh (post agent create / delete / isolate).
+
+  --apply   Render the template, validate with visudo -cf, install
+            atomically at /etc/sudoers.d/agent-bridge-daemon-refresh-<user>-<id>
+            (mode 0440 root:root). Requires sudo at install time.
+  --check   Verify the file is present, valid, and matches the expected
+            content. Probes sudo+PAM refresh via 'sudo -n -u <user> -H
+            bash -c id -G' and prints a one-line status row.
+
+Linux-only. On macOS this is a no-op and exits 0.
+
+See codex r3 spec at /tmp/agb-6270-l2-variant3a-r3.md for the security
+contract (named user, narrow command authorization, visudo validation).
+EOF
+              exit 0
+              ;;
+            *)
+              echo "[error] init sudoers daemon-refresh: unknown arg: $1" >&2
+              echo "Use --apply, --check, or --help." >&2
+              exit 2
+              ;;
+          esac
+        done
+        if [[ -z "$_SUDO_REFRESH_MODE" ]]; then
+          echo "[error] init sudoers daemon-refresh: --apply or --check required" >&2
+          exit 2
+        fi
+        # Linux gate via the helper (which no-ops on non-Linux).
+        if [[ "$(uname -s 2>/dev/null)" != "Linux" ]]; then
+          printf 'daemon_group_refresh_sudoers=skipped-non-linux\n'
+          exit 0
+        fi
+        case "$_SUDO_REFRESH_MODE" in
+          apply)
+            # Issue #1236: gate the "installed: <path>" success line on
+            # the verifier accepting the rendered drop-in. Previously
+            # we printed "installed: <path>" before the
+            # `bridge_daemon_control_check_sudoers` probe, so on a host
+            # where visudo accepts the file but sudo/PAM refuses
+            # NOPASSWD or refuses to refresh supplementary groups the
+            # operator saw both "installed: ..." AND
+            # `daemon_group_refresh_sudoers=missing|invalid|sudo-refresh-no-gid`
+            # in the same output. We now print ONE line — either the
+            # success row or the `manual-required` remediation row,
+            # never both.
+            _INSTALL_PATH=""
+            _INSTALL_RC=0
+            _INSTALL_PATH="$(bridge_daemon_control_install_sudoers 2>&1)" \
+              || _INSTALL_RC=$?
+            _CHECK_STATUS=""
+            _CHECK_STATUS="$(bridge_daemon_control_check_sudoers 2>/dev/null || true)"
+            if (( _INSTALL_RC == 0 )) && [[ "$_CHECK_STATUS" == "ok" ]]; then
+              printf 'installed: %s (verifier=ok)\n' "$_INSTALL_PATH"
+              printf 'daemon_group_refresh_sudoers=ok\n'
+              exit 0
+            fi
+            # Either install failed or verifier rejected the result.
+            # Surface manual-required + actionable remediation, never
+            # "installed".
+            _REASON="${_CHECK_STATUS:-missing}"
+            if (( _INSTALL_RC != 0 )); then
+              echo "[error] sudoers install failed (rc=$_INSTALL_RC):" >&2
+              [[ -n "$_INSTALL_PATH" ]] && printf '%s\n' "$_INSTALL_PATH" >&2
+            elif [[ -n "$_INSTALL_PATH" ]]; then
+              # Installer returned 0 but verifier disagrees — render+visudo
+              # mismatch or sudo/PAM refused the probe. Record path so
+              # the operator can inspect.
+              echo "[warning] sudoers drop-in landed at $_INSTALL_PATH but verifier rejected it (reason=$_REASON)." >&2
+            fi
+            case "$_REASON" in
+              sudo-refresh-no-gid)
+                echo "[warning] sudo invoke succeeded but PAM did NOT refresh supplementary groups." >&2
+                echo "          Verify with: sudo -n -u \"$(id -un)\" -H -- bash -c 'id -G'" >&2
+                ;;
+            esac
+            printf 'manual-required: daemon_group_refresh_sudoers=%s — re-run: agent-bridge init sudoers daemon-refresh --apply\n' "$_REASON" >&2
+            printf 'daemon_group_refresh_sudoers=%s\n' "$_REASON"
+            exit 1
+            ;;
+          check)
+            _CHECK_STATUS="$(bridge_daemon_control_check_sudoers 2>/dev/null || true)"
+            printf 'daemon_group_refresh_sudoers=%s\n' "${_CHECK_STATUS:-missing}"
+            case "$_CHECK_STATUS" in
+              ok) exit 0 ;;
+              *) exit 1 ;;
+            esac
+            ;;
+        esac
+      fi
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-init.sh" "$@"
       ;;
     version)
@@ -700,6 +917,34 @@ A2A_HELP
       fi
       bridge_list_active_agents_numbered
       exit 0
+      ;;
+    iso-run)
+      # Hidden CLI facade for the `bridge_iso_run` shell helper. Used
+      # by Python callers (`bridge_iso_paths.iso_run`) that need to
+      # invoke the unified controller->iso boundary helper from a
+      # non-shell process. Forwards argv unchanged after the
+      # `iso-run` token. See `lib/bridge-isolation-helpers.sh`
+      # header for the op catalog + structured rc band.
+      shift
+      case "${1:-}" in
+        -h|--help|help)
+          cat <<'ISO_RUN_HELP'
+Usage: agent-bridge iso-run --agent <agent> --op <op> [op-args]
+
+Hidden CLI facade for the bridge_iso_run shell helper. Used by Python
+callers that need to invoke the unified controller->iso boundary helper.
+
+Ops: stat, read-file, read-json, env-has-any-key, read-env-key,
+     mkdir-p, atomic-write, rename, state-marker-write,
+     scan-profile, publish-root-file, publish-root-symlink
+
+See lib/bridge-isolation-helpers.sh header for the full contract.
+ISO_RUN_HELP
+          exit 0
+          ;;
+      esac
+      bridge_iso_run "$@"
+      exit $?
       ;;
     status)
       shift
@@ -1006,14 +1251,99 @@ PY
           fi
           exit "$_iso_rc"
           ;;
+        reconcile)
+          # Phase 2 (post-v0.14.5-beta16): manual operator escape hatch
+          # for the declarative install-tree reconciler. Same code path
+          # the install / upgrade / agent-create triggers run, exposed
+          # standalone so an operator who hit perm drift (e.g. after an
+          # umask-077 file landed under lib/) can repair without re-
+          # running the full upgrader.
+          shift
+          _iso_recon_mode="check"
+          _iso_recon_agent=""
+          _iso_recon_all=0
+          _iso_recon_json=0
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --check)
+                _iso_recon_mode="check"
+                shift
+                ;;
+              --apply)
+                _iso_recon_mode="apply"
+                shift
+                ;;
+              --agent)
+                _iso_recon_agent="$2"
+                shift 2
+                ;;
+              --all|--all-agents)
+                _iso_recon_all=1
+                shift
+                ;;
+              --json)
+                _iso_recon_json=1
+                shift
+                ;;
+              -h|--help)
+                cat <<EOF
+Usage: $CLI_NAME isolation reconcile [--check|--apply] [--agent <name>|--all] [--json]
+
+Walk the declarative install-tree matrix for the v2 layout. Default
+mode is --check (read-only drift report).
+
+  --check         read-only; emit drift report, exit non-zero on
+                   required mismatch (default)
+  --apply         mutate filesystem state to reach canonical; idempotent
+  --agent <X>     process the named agent's rows (state-leaf scaffold,
+                   credential grant) on top of the install-scope rows
+  --all           process every isolated agent's rows
+  --json          emit machine-readable JSON instead of pipe-separated lines
+
+The reconciler is deny-by-default: only enumerated rows
+(\$BRIDGE_HOME, lib/, scripts/, hooks/, runtime/, shared/, root
+entrypoints, state/layout-marker.sh, state/agents/<a>) are touched.
+Protected paths (agent-roster*, handoff.local*, *.pem/*.key/*.token,
+state/tasks.db, etc.) are refused by the per-row protected guard.
+EOF
+                exit 0
+                ;;
+              *)
+                bridge_die "지원하지 않는 isolation reconcile 옵션입니다: $1"
+                ;;
+            esac
+          done
+
+          if ! command -v bridge_isolation_v2_apply_install_tree_matrix >/dev/null 2>&1; then
+            bridge_die "isolation reconcile: reconciler helper not loaded (BRIDGE_LAYOUT=v2 required)"
+          fi
+
+          _iso_recon_args=(--mode "$_iso_recon_mode" --reason manual)
+          if [[ -n "$_iso_recon_agent" ]]; then
+            _iso_recon_args+=(--agent "$_iso_recon_agent")
+          elif (( _iso_recon_all == 1 )); then
+            _iso_recon_args+=(--all-agents)
+          fi
+          if (( _iso_recon_json == 1 )); then
+            _iso_recon_args+=(--json)
+          fi
+
+          bridge_isolation_v2_apply_install_tree_matrix "${_iso_recon_args[@]}"
+          exit $?
+          ;;
         ""|-h|--help)
           cat <<EOF
-Usage: $CLI_NAME isolation <verify> [options]
+Usage: $CLI_NAME isolation <verify|reconcile> [options]
 
   verify --agent <X> [--json] [--strict-optional]
        Read-only verification of the v2 grant matrix for one agent.
 
-Refs #781.
+  reconcile [--check|--apply] [--agent <X>|--all] [--json]
+       Walk the declarative install-tree matrix. --check reports drift,
+       --apply converges. Operator escape hatch for the same code path
+       the install/upgrade/agent-create triggers run.
+
+Refs #781 (verify), Phase 2 (reconcile).
 EOF
           exit 0
           ;;
@@ -1091,7 +1421,7 @@ WORKTREE_HELP
     # `1115-cli-usage-drift` smoke asserts this list stays synchronized
     # with the dispatcher so a future PR cannot silently regress the
     # typo-suggestion blind spot.
-    _top_valid="a2a admin agent attach audit auth bootstrap bundle cancel claim config create cron daemon diagnose discord doctor done escalate guard handoff inbox init intake isolate isolation kill knowledge list memory migrate plugins profile review setup show skills status summary task unisolate update upgrade upstream urgent usage user version watchdog wave wiki worktree"
+    _top_valid="a2a admin agent attach audit auth bootstrap bundle cancel claim config create cron daemon diagnose discord doctor done escalate guard handoff inbox init intake iso-run isolate isolation kill knowledge list memory migrate plugins profile review setup show skills status summary task unisolate update upgrade upstream urgent usage user version watchdog wave wiki worktree"
     _hint="$(bridge_suggest_subcommand "$1" "$_top_valid")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 명령입니다: $1"

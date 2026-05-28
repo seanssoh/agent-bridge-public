@@ -14,12 +14,45 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Phase 2 lift: use the canonical isolation-aware helpers from
+# lib/bridge_iso_paths.py rather than re-implementing the lstat-owner
+# probe + sudo escalation. The local `_isolated_workdir_owner` /
+# `_sudo_test` wrappers below delegate to these names.
+_BRIDGE_WATCHDOG_LIB_DIR = Path(__file__).resolve().parent / "lib"
+if _BRIDGE_WATCHDOG_LIB_DIR.is_dir() and str(_BRIDGE_WATCHDOG_LIB_DIR) not in sys.path:  # noqa: raw-pathlib-controller-only — import-time controller-side lib dir probe
+    sys.path.insert(0, str(_BRIDGE_WATCHDOG_LIB_DIR))
+try:
+    from bridge_iso_paths import (
+        isolated_workdir_owner as _isolated_workdir_owner_canonical,
+        sudo_run_as as _sudo_run_as_canonical,
+    )
+except ImportError:
+    _isolated_workdir_owner_canonical = None
+    _sudo_run_as_canonical = None
+
 MANAGED_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
 # Claude-runtime profile files. Codex agents don't read these — see #905.
 CLAUDE_REQUIRED_FILES = ("CLAUDE.md", "SOUL.md", "MEMORY-SCHEMA.md", "MEMORY.md", "SESSION-TYPE.md")
 # Backward-compat alias: legacy callers / tests reference REQUIRED_FILES.
 REQUIRED_FILES = CLAUDE_REQUIRED_FILES
+# #1237: Codex-runtime profile contract. Codex CLI reads ``AGENTS.md`` at
+# the agent home root; it has no SOUL.md / MEMORY*.md / SESSION-TYPE.md
+# equivalent (those are Claude-only conventions). ``.codex/hooks.json`` is
+# the engine's hook-policy file when present, used as an *optional* probe
+# below (a missing hooks.json is not drift — codex agents may legitimately
+# run without hooks configured).
+CODEX_REQUIRED_FILES = ("AGENTS.md",)
+CODEX_OPTIONAL_PROBES = (".codex/hooks.json",)
+# Known engine ids the watchdog has an explicit contract for. An engine
+# string outside this set is a *truly unknown* engine — the scanner emits
+# ``status="unsupported_engine_contract"`` for those rather than silently
+# classifying them ``ok`` (the old NON_CONTRACT_ENGINES allowlist behavior
+# for codex/antigravity). #1237 r1: "If no Codex-specific check is
+# implemented yet, status must say `unsupported_engine_contract` rather
+# than silently OK." The same principle applies to any future new engine
+# until a contract is added here.
+KNOWN_ENGINE_CONTRACTS = frozenset({"claude", "codex"})
 
 
 @dataclass
@@ -55,6 +88,42 @@ class AgentWatch:
     # crashing on one isolated agent.
     error_kind: str = ""
     error_path: str = ""
+    # #1254 (v0.15.0-beta4 Lane G): split the scan_error path into two
+    # operator-actionable categories so the librarian-watchdog cron can
+    # distinguish a transient controller-side cache miss (operator runs
+    # `sg ab-agent-<a> -- $SHELL`, resolves itself on the next tick) from
+    # a real iso-UID-side filesystem failure (operator must restore the
+    # agent's workdir / re-apply isolation v2). Empty on healthy rows.
+    # Values:
+    #   - "controller-cache-stale": controller process credentials don't
+    #     include the per-agent ab-agent-<a> supplementary group (the
+    #     supp-group cache is stale on this shell). The iso UID owns the
+    #     workdir mode 2770/ab-agent-<a> and a fresh shell would read it
+    #     fine — no admin action required, operator runs `sg` or restarts
+    #     the controller shell.
+    #   - "iso-uid-side": the iso UID itself cannot read its own workdir
+    #     (mode/ownership corruption, broken ACL, missing setgid bit).
+    #     Genuine drift; admin action required.
+    error_category: str = ""
+    # #1266 (v0.15.0-beta4 Lane G, r3 quiet-by-default): fresh-install
+    # detection. True only when an explicit positive signal is present —
+    # either (a) `state/agents/<a>/onboarding-pending` marker exists with
+    # a valid `written` timestamp within
+    # BRIDGE_WATCHDOG_FRESH_INSTALL_PENDING_TTL_SECS (default 24h), or
+    # (b) `SESSION-TYPE.md` reads `Onboarding State: pending` AND the
+    # pending marker is present and valid. Absence of any positive signal
+    # → False (legacy/established installs are NOT fresh just because the
+    # home directory was recently touched). The daemon drift-task writer
+    # (process_watchdog_report) lowers the task priority to `low` when
+    # every problem row is fresh_install=True so first-run admins do not
+    # see a "high priority drift" alert as their first impression.
+    fresh_install: bool = False
+    # #1254 (v0.15.0-beta4 Lane G): set when a `state/agents/<a>/restart.
+    # in-progress` marker is active (state=in_progress, PID alive, within
+    # TTL). The daemon drops drift tasks for these rows so an agent that
+    # is currently mid-restart does not trigger a high-priority drift
+    # alert that the next tick (60s later) will obsolete anyway.
+    restart_in_progress: bool = False
 
 
 def read_text(path: Path) -> str:
@@ -259,48 +328,35 @@ def _registry_ids_from_payload(
 def _isolated_workdir_owner(workdir: Path) -> str | None:
     """Return the isolated-agent OS user that owns ``workdir``, or ``None``.
 
-    Mirrors ``bridge-hooks.py::_isolated_workdir_owner`` so the watchdog
-    can decide when to escalate to ``sudo -n -u <agent-user>``. Returns
-    ``None`` on non-Linux hosts, when ``lstat`` fails (parent likely
-    also unreadable), when the owner is the controller uid, when the
-    owner does not look like a bridge-provisioned isolated agent
-    (``agent-bridge-<slug>``), or when ``/etc/passwd`` lookup fails.
+    Phase 2: delegates to the canonical
+    ``bridge_iso_paths.isolated_workdir_owner`` so the lstat-owner +
+    pwd-lookup + `agent-bridge-` prefix probe lives in one place. The
+    canonical helper has additional recovery (gid-fallback via
+    pwd.getpwall when stat.st_uid lookup returns the controller),
+    which the watchdog now inherits for free.
+
+    Returns None when the canonical helper is unavailable (import
+    failed, non-Linux host, etc.).
     """
-    if sys.platform != "linux":
+    if _isolated_workdir_owner_canonical is None:
         return None
-    try:
-        stat_result = workdir.lstat()
-    except OSError:
-        return None
-    try:
-        import pwd
-        owner = pwd.getpwuid(stat_result.st_uid).pw_name
-    except (KeyError, ImportError):
-        return None
-    if stat_result.st_uid == os.getuid():
-        return None
-    if not owner.startswith("agent-bridge-"):
-        return None
-    return owner
+    return _isolated_workdir_owner_canonical(workdir)
 
 
 def _sudo_test(os_user: str, flag: str, path: Path) -> int | None:
     """Run ``sudo -n -u <os_user> test <flag> <path>``; return rc or ``None``.
 
-    Returns ``None`` when sudo is unavailable on the host (non-Linux
-    dev box, sudo not in PATH). Callers map ``None`` to "escalation
-    impossible — surface the structured scan_error instead". Mirrors
-    ``bridge-hooks.py::_sudo_run_as``.
+    Phase 2: delegates to canonical ``bridge_iso_paths.sudo_run_as``.
+    The wrapper translates the canonical's `rc=127 = sudo missing`
+    contract back to `None` so existing watchdog callers (which map
+    `None → structured scan_error`) keep working unchanged.
     """
-    try:
-        proc = subprocess.run(
-            ["sudo", "-n", "-u", os_user, "test", flag, str(path)],
-            check=False,
-            capture_output=True,
-        )
-    except FileNotFoundError:
+    if _sudo_run_as_canonical is None:
         return None
-    return proc.returncode
+    rc = _sudo_run_as_canonical(os_user, "test", flag, str(path))
+    if rc == 127:
+        return None
+    return rc
 
 
 def resolve_scan_path(
@@ -429,15 +485,505 @@ def heartbeat_age_seconds(agent_dir: Path) -> tuple[bool, int | None]:
 # flagging them as `warn` creates alert-fatigue on every scan.
 NON_ONBOARDING_SESSION_TYPES = frozenset({"dynamic", "cron"})
 
+# #1266 (v0.15.0-beta4 Lane G): static session types ship with the
+# template-default ``Onboarding State: complete`` (see
+# ``agents/_template/session-types/static-claude.md``) and therefore have
+# no operator-actionable onboarding signal of their own. The markdown
+# render suppresses the ``onboarding_state:`` line for these rows so the
+# operator's eyes are not pulled to a field that will always say
+# ``complete`` (or, in the SESSION-TYPE-missing edge case, ``missing`` —
+# which is then surfaced via the missing_files / managed-block paths,
+# NOT via a phantom ``onboarding_state: missing`` line). The JSON payload
+# still carries the parsed value so downstream consumers (alert rules,
+# audit) can read it.
+STATIC_SESSION_TYPES = frozenset({"static", "static-claude", "static-codex"})
 
-# Engines with no Claude-runtime profile contract at the agent home root
-# — none of these CLIs read CLAUDE.md / SOUL.md / SESSION-TYPE.md, so the
-# watchdog must not assert profile drift on them. This is an explicit
-# allowlist, NOT "anything that isn't claude": a genuinely unknown engine
-# string stays under the conservative Claude-default contract so a new
-# engine surfaces as drift (prompting a watchdog update) instead of
-# silently skipping the check. Add a new exempt engine here.
-NON_CONTRACT_ENGINES = frozenset({"codex", "antigravity"})
+
+# #1266 (v0.15.0-beta4 Lane G): fresh-install detection window. The
+# daemon's drift-task writer lowers the priority to `low` when every
+# problem row carries `fresh_install=True`, so the first watchdog tick
+# after an `agent-bridge init` does NOT enqueue a high-priority drift
+# alert as the operator's first install impression. Tunable via env.
+DEFAULT_FRESH_INSTALL_WINDOW_SECS = 600
+
+# #1266 r2: pending-marker TTL. After `bridge-init.sh` drops the
+# ``onboarding-pending`` marker, the watchdog treats every subsequent
+# drift as fresh-install (priority=low) WHILE the marker is still within
+# this window from its `written` timestamp. Past the TTL the marker is
+# stale and fresh_install=False so a long-paused install that never
+# completed onboarding is not held at priority=low forever. Default 24h.
+DEFAULT_FRESH_INSTALL_PENDING_TTL_SECS = 86400
+
+
+def fresh_install_window_secs() -> int:
+    """Resolve the fresh-install age window from the env, with a safe
+    fall-through to ``DEFAULT_FRESH_INSTALL_WINDOW_SECS``. A
+    non-integer / non-positive override is treated as the default so
+    operator typos cannot disarm the gate entirely.
+
+    .. note::
+       r3 quiet-by-default contract: this window is no longer consulted
+       by :func:`detect_fresh_install` (the home-mtime fallthrough was
+       removed — codex r2 BLOCKING). The function is retained for
+       backward compatibility with the ``BRIDGE_WATCHDOG_FRESH_INSTALL_
+       WINDOW_SECS`` env var documented in older releases; new callers
+       should rely on :func:`fresh_install_pending_ttl_secs` instead.
+    """
+    raw = os.environ.get("BRIDGE_WATCHDOG_FRESH_INSTALL_WINDOW_SECS", "")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_FRESH_INSTALL_WINDOW_SECS
+    if parsed <= 0:
+        return DEFAULT_FRESH_INSTALL_WINDOW_SECS
+    return parsed
+
+
+def fresh_install_pending_ttl_secs() -> int:
+    """Resolve the pending-marker TTL from the env, with safe fall-through
+    to ``DEFAULT_FRESH_INSTALL_PENDING_TTL_SECS`` (24h). Non-integer or
+    non-positive overrides are treated as the default so operator typos
+    cannot disarm the gate entirely. See ``detect_fresh_install`` for
+    the precedence rules."""
+    raw = os.environ.get("BRIDGE_WATCHDOG_FRESH_INSTALL_PENDING_TTL_SECS", "")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_FRESH_INSTALL_PENDING_TTL_SECS
+    if parsed <= 0:
+        return DEFAULT_FRESH_INSTALL_PENDING_TTL_SECS
+    return parsed
+
+
+def _read_marker_written_ts(marker_path: Path) -> int | None:
+    """Parse the ``written=<unix-ts>`` field from a marker file. Returns
+    the int timestamp on success, or ``None`` when the file is
+    unreadable, malformed, or the field is missing / non-integer.
+
+    Conservative on every error: a marker we cannot parse must NOT be
+    treated as ``written=0`` (instantly stale, suppresses fresh-install
+    signal entirely) or as ``written=now`` (eternally fresh). The
+    ``None`` return lets the caller fall through to a definitive
+    decision tree (see ``detect_fresh_install``).
+    """
+    try:
+        text = marker_path.read_text(encoding="utf-8", errors="ignore")
+    except (PermissionError, FileNotFoundError, OSError):
+        return None
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip() != "written":
+            continue
+        value = value.strip()
+        if not value.isdigit():
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def detect_fresh_install(
+    state_dir: Path | None,
+    agent_name: str,
+    agent_home_dir: Path,
+    session_type_search_dirs: list[Path] | None = None,
+) -> bool:
+    """Return True when this agent looks like a fresh-install candidate
+    (Lane G #1266 + r3 quiet-by-default contract).
+
+    **Quiet-by-default contract (r3)**: ``fresh_install=True`` requires
+    an explicit positive signal. Absence of every signal returns
+    ``False``. Legacy installs without a pending marker are NOT fresh —
+    they have been running and the admin has simply not authored the
+    marker file yet; that is ``priority=normal`` drift, not
+    ``priority=low``. The home-directory mtime fallthrough that r2
+    carried was a quiet-by-default violation: a freshly-touched home
+    with no markers and no SESSION-TYPE.md was reported fresh on every
+    new install regardless of whether onboarding was actually in
+    progress.
+
+    Decision matrix (evaluated in order; the first matching branch
+    decides):
+
+      1. ``state/agents/<a>/onboarding-complete`` marker EXISTS →
+         fresh_install=False. Completion takes precedence over every
+         other signal (a previously-fresh install that has since
+         completed onboarding must not regress to priority=low drift).
+         This marker is authored by the admin agent's onboarding
+         completion path (``agb onboarding done`` /
+         ``bridge_agent_mark_onboarding_complete``) as the explicit
+         "fresh install is over" handshake. A SESSION-TYPE.md
+         ``Onboarding State: complete`` reading is honored as a
+         fallback signal — if the controller can read the file and it
+         reports ``complete``, we treat the install as past the
+         fresh-install window even without an explicit complete marker.
+      2. ``state/agents/<a>/onboarding-pending`` marker EXISTS AND the
+         marker's ``written`` timestamp is within
+         ``fresh_install_pending_ttl_secs()`` (default 24h) →
+         fresh_install=True. An expired pending marker (or one whose
+         ``written`` timestamp cannot be parsed) is NOT fresh — the
+         pending signal is the entire contract; if it is malformed or
+         stale the install is not fresh-by-claim.
+      3. No complete marker, no SESSION-TYPE.md ``complete`` reading,
+         no valid pending marker → fresh_install=False (quiet). This is
+         the codex r2 BLOCKING fix: r2 fell back to the home-mtime
+         branch here and reported True on every recent home, which
+         dropped legitimate drift on legacy installs to priority=low.
+
+    Returns False when the state_dir is unknown (``None`` — caller could
+    not resolve ``$BRIDGE_HOME/state``) so the detection is conservative:
+    a missing state dir falls back to the legacy "every drift is high
+    priority" behavior rather than silently downgrading every drift.
+    """
+    if state_dir is None:
+        return False
+    agent_state_dir = state_dir / "agents" / agent_name
+    complete_marker = agent_state_dir / "onboarding-complete"
+    pending_marker = agent_state_dir / "onboarding-pending"
+    try:
+        if complete_marker.is_file():
+            # Branch 1: explicit completion marker → never fresh again.
+            return False
+    except (PermissionError, OSError):
+        # Controller cannot reach the state dir — fall through. The
+        # SESSION-TYPE.md probe below is the safety net.
+        pass
+    # SESSION-TYPE.md "Onboarding State: complete" is the equivalent
+    # signal: the admin has flipped the template to complete but a
+    # dedicated marker writer hasn't run yet. Honor it as a completion
+    # signal so the fresh-install window cannot get stuck after a
+    # successful onboarding even if the state-dir marker file is
+    # missing (older installs / dry-run recovery / iso-side workdir
+    # ownership preventing the controller from writing the marker).
+    # ``session_type_search_dirs`` lets the caller add additional
+    # candidates (typically the resolved scan path on a v2 install
+    # where SESSION-TYPE.md lives under
+    # ``<v2-root>/<a>/workdir/`` rather than under the tracked-tree
+    # home root).
+    if _onboarding_state_is_complete(agent_home_dir, session_type_search_dirs):
+        return False
+    try:
+        if pending_marker.is_file():
+            # Branch 2: pending marker present. TTL gate from the
+            # marker's `written` field. A malformed or expired marker
+            # is treated as "not fresh" (quiet-by-default contract) —
+            # the pending marker is the explicit positive signal, and
+            # absence of a valid one means there is no claim of
+            # freshness to honor.
+            written_ts = _read_marker_written_ts(pending_marker)
+            if written_ts is not None:
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                age = now_ts - written_ts
+                # Clock skew defense: a future timestamp is treated as
+                # "do not trust" rather than "eternally fresh".
+                if 0 <= age <= fresh_install_pending_ttl_secs():
+                    return True
+            # Malformed, expired, or skewed pending marker → not fresh.
+    except (PermissionError, OSError):
+        # Controller cannot reach the pending marker — treat as no
+        # signal (quiet-by-default). The complete-marker branch above
+        # already ran; if the controller cannot read pending either,
+        # there is no positive signal to honor.
+        pass
+    # r3 quiet-by-default: no complete marker, no SESSION-TYPE.md
+    # complete reading, no valid pending marker → not fresh. The r2
+    # home-mtime fallthrough was removed here (codex r2 BLOCKING) so
+    # legacy installs without a pending marker do NOT report fresh on
+    # every recent-mtime home — that path mis-flagged every legitimate
+    # priority=normal drift as priority=low.
+    return False
+
+
+_ONBOARDING_STATE_RE = re.compile(
+    r"^\s*-\s*Onboarding\s+State\s*:\s*([A-Za-z0-9._-]+)",
+    re.IGNORECASE,
+)
+
+
+def _onboarding_state_is_complete(
+    agent_home_dir: Path,
+    extra_search_dirs: list[Path] | None = None,
+) -> bool:
+    """Return True when the agent's ``SESSION-TYPE.md`` (under either
+    the workdir or the home root) reports ``Onboarding State:
+    complete``.
+
+    Used by :func:`detect_fresh_install` as a completion-marker
+    fallback so the watchdog cannot get stuck reporting
+    ``fresh_install=True`` for an agent whose operator has actually
+    finished onboarding but where the dedicated state-dir completion
+    marker is missing (older install, dry-run recovery, iso-side
+    workdir ownership preventing the controller from writing the
+    marker).
+
+    ``extra_search_dirs`` lets the caller add additional candidate
+    parent directories — typically the resolved scan path on a v2
+    install where SESSION-TYPE.md lives under
+    ``<v2-root>/<a>/workdir/`` and the legacy
+    ``<home-root>/<a>/SESSION-TYPE.md`` candidate misses.
+
+    Conservative on every error: an unreadable / missing
+    SESSION-TYPE.md returns False so the function never claims
+    completion based on a signal it could not actually read.
+    """
+    candidates: list[Path] = [
+        agent_home_dir / "workdir" / "SESSION-TYPE.md",
+        agent_home_dir / "SESSION-TYPE.md",
+    ]
+    if extra_search_dirs:
+        for extra in extra_search_dirs:
+            candidates.append(extra / "SESSION-TYPE.md")
+            candidates.append(extra / "workdir" / "SESSION-TYPE.md")
+    for candidate in candidates:
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+        for line in text.splitlines():
+            match = _ONBOARDING_STATE_RE.match(line)
+            if match:
+                if match.group(1).strip().lower() == "complete":
+                    return True
+                # Found the line but it's not complete — keep walking
+                # the candidate list (workdir may have it, then home
+                # may say something different — honor the first
+                # definitive read).
+                return False
+    return False
+
+
+def detect_restart_in_progress(
+    state_dir: Path | None,
+    agent_name: str,
+) -> bool:
+    """Return True when ``state/agents/<a>/restart.in-progress`` is
+    currently active (Lane G #1254, reusing the Lane C1 marker contract
+    from ``lib/bridge-agents.sh:bridge_agent_restart_marker_active``).
+
+    Marker schema (see ``lib/bridge-agents.sh`` §"Issue #1251"):
+      pid=<orchestrator-pid>
+      started=<unix-ts>
+      ttl=<seconds>
+      state=in_progress|rolled_back|completed
+      reason=<structured>     # populated only on state=rolled_back
+
+    Active = ``state=in_progress`` AND ``kill -0 <pid>`` succeeds AND
+    ``now < started + ttl``. A terminal marker (state=rolled_back) is
+    NOT active — the operator audit trail persists, but the drift-skip
+    window has already closed and the watchdog should re-engage.
+
+    Conservative on resolution failures: a missing state_dir, an
+    unreadable marker file, or a malformed field returns False so the
+    real drift signal is never suppressed by a false marker reading.
+    """
+    if state_dir is None:
+        return False
+    marker = state_dir / "agents" / agent_name / "restart.in-progress"
+    try:
+        if not marker.is_file():
+            return False
+        text = marker.read_text(encoding="utf-8", errors="ignore")
+    except (PermissionError, FileNotFoundError, OSError):
+        return False
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        fields[key.strip()] = value.strip()
+    if fields.get("state") != "in_progress":
+        return False
+    pid_raw = fields.get("pid", "")
+    started_raw = fields.get("started", "")
+    ttl_raw = fields.get("ttl", "")
+    if not (pid_raw.isdigit() and started_raw.isdigit() and ttl_raw.isdigit()):
+        return False
+    pid = int(pid_raw)
+    started = int(started_raw)
+    ttl = int(ttl_raw)
+    # PID liveness gate — mirror lib/bridge-agents.sh marker_active r1
+    # finding 2: a crashed orchestrator should not hold the watchdog
+    # hostage for the full TTL window.
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    return now_ts < started + ttl
+
+
+def classify_scan_error_category(
+    error_kind: str,
+    error_path: str,
+    workdir: Path | None,
+    iso_user: str | None = None,
+) -> str:
+    """Split the scan_error rows into operator-actionable buckets
+    (Lane G #1254 + r2).
+
+    Rules:
+      * Empty ``error_kind`` (= no error) → empty string.
+      * ``error_kind != "permission_denied"`` (e.g. ``not_found`` /
+        ``os_error``) → "iso-uid-side". Those are genuine filesystem
+        failures the operator must investigate; lumping them into the
+        cache-stale bucket would mask real drift.
+      * ``error_kind == "permission_denied"`` AND the controller cannot
+        even ``stat`` the workdir / its parent → "iso-uid-side". The
+        denial is structural (e.g. parent mode 0000, missing ancestor)
+        and not something a supp-group refresh will fix.
+      * ``error_kind == "permission_denied"``, workdir IS statable, AND
+        the iso UID can read the failing ``error_path`` →
+        "controller-cache-stale". This is the #1246 shape: the workdir
+        + file are chmod'd ab-agent-<a> mode 0660 but the controller
+        process's supplementary-group cache does not include that
+        group. A fresh shell would read it fine.
+      * ``error_kind == "permission_denied"``, workdir IS statable, AND
+        the iso UID ALSO cannot read the failing path → "iso-uid-side".
+        Real file-permission corruption (mode 0000, broken ownership,
+        ACL drift). A supp-group refresh will NOT fix it; admin must
+        re-apply isolation v2 on this agent.
+
+    The iso UID probe (r2 fix for codex r1 BLOCKING #2): we call
+    ``sudo -n -u <iso_user> -- test -r <error_path>`` and read the
+    exit code:
+      * rc == 0   → iso UID can read → controller-cache-stale.
+      * rc != 0   → iso UID also can't read → iso-uid-side.
+      * rc is None (sudo missing / no iso owner resolvable / probe
+        unreachable) → fall back to "controller-cache-stale" so we do
+        not regress installs without sudo-helper coverage. The previous
+        Lane G shape already treated "workdir statable + permission
+        denied inside" as controller-cache-stale; the iso UID probe
+        only DOWNGRADES that to iso-uid-side when it has a definitive
+        "iso also can't read" signal.
+
+    The ``iso_user`` parameter is the OS-account name (e.g.
+    ``agent-bridge-patch_g``) resolved from the workdir owner by the
+    caller. Passing ``None`` skips the iso UID probe and keeps the
+    legacy behavior (statable workdir → controller-cache-stale).
+    """
+    if not error_kind:
+        return ""
+    if error_kind != "permission_denied":
+        return "iso-uid-side"
+    if workdir is None:
+        return "iso-uid-side"
+    try:
+        # Can the controller see the workdir itself exist? `exists()`
+        # walks ancestor x-bits, so a workdir under a 0000-mode parent
+        # raises PermissionError or returns False — both signal
+        # iso-uid-side. A True here means the workdir is present and
+        # the parent is traversable.
+        if not workdir.exists():
+            return "iso-uid-side"
+    except (PermissionError, OSError):
+        return "iso-uid-side"
+    # Workdir statable + permission_denied. Use the iso UID readability
+    # probe to disambiguate "controller's supp-group cache is stale"
+    # (iso readable, controller not) from "real iso-side file permission
+    # corruption" (neither can read).
+    #
+    # Test seam: ``BRIDGE_WATCHDOG_TEST_ISO_PROBE_JSON`` points to a
+    # JSON file mapping ``{"<error-path>": "<readable|denied>", ...}``
+    # plus an optional ``"_iso_owner_default"`` key to stub the iso
+    # owner name. Smoke tests use this on macOS / non-Linux dev hosts
+    # where the real ``isolated_workdir_owner`` returns None and
+    # ``sudo -n -u <user>`` cannot run. The seam ONLY engages when the
+    # env var is set; production paths use the live owner+sudo probe.
+    probe = _iso_probe_test_override(error_path)
+    if probe == "readable":
+        return "controller-cache-stale"
+    if probe == "denied":
+        return "iso-uid-side"
+    iso_owner = iso_user
+    if iso_owner is None and _isolated_workdir_owner_canonical is not None:
+        try:
+            iso_owner = _isolated_workdir_owner(workdir)
+        except (PermissionError, OSError):
+            iso_owner = None
+    if iso_owner and error_path and _sudo_run_as_canonical is not None:
+        probe_rc = _sudo_test(iso_owner, "-r", Path(error_path))
+        if probe_rc == 0:
+            return "controller-cache-stale"
+        if probe_rc is not None:
+            # iso UID definitively cannot read either — real file
+            # permission corruption on the iso side.
+            return "iso-uid-side"
+        # probe_rc is None: sudo missing / canonical helper unavailable
+        # → fall through to the legacy default below.
+    # Legacy default (pre-r2): statable workdir + permission_denied
+    # inside, no iso UID probe answer available → controller-cache-
+    # stale. This keeps macOS / non-sudo dev hosts at the same
+    # behavior as v0.15.0-beta4 r1.
+    return "controller-cache-stale"
+
+
+def _iso_probe_test_override(error_path: str) -> str | None:
+    """Read the ``BRIDGE_WATCHDOG_TEST_ISO_PROBE_JSON`` test seam (r2 Lane
+    G smoke support). Returns ``"readable"`` / ``"denied"`` when the
+    seam is active and the path is mapped; ``None`` otherwise (which
+    means the live probe path is used).
+
+    Schema (JSON object):
+      {
+        "<absolute-error-path>": "readable" | "denied",
+        ...
+      }
+
+    Any other value (or a missing path) returns ``None``. The seam is
+    deliberately conservative: a malformed JSON / unreadable file
+    returns ``None`` so a misconfigured test environment never
+    silently downgrades / upgrades the real production classification.
+    """
+    override = os.environ.get("BRIDGE_WATCHDOG_TEST_ISO_PROBE_JSON", "")
+    if not override or not error_path:
+        return None
+    try:
+        with open(override, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get(error_path)
+    if value in ("readable", "denied"):
+        return value
+    return None
+
+
+# #1237: Legacy alias for the "engines that get no required-file check
+# under the Claude-default path." Pre-#1237 this set was
+# ``frozenset({"codex", "antigravity"})``; codex has moved to its own
+# engine-native contract and antigravity now surfaces as
+# ``unsupported_engine_contract`` (see ``has_known_engine_contract``).
+# Kept as an empty allowlist so any downstream import keeps resolving
+# without behaviorally bringing back the silent-OK path.
+NON_CONTRACT_ENGINES: frozenset[str] = frozenset()
+
+
+def is_claude_engine(engine: str) -> bool:
+    """True when the engine string maps to the Claude contract (Claude or
+    the conservative empty-string default kept for legacy registry rows).
+    """
+    return engine in ("", "claude")
+
+
+def is_codex_engine(engine: str) -> bool:
+    """True when the engine string maps to the Codex contract (#1237)."""
+    return engine == "codex"
+
+
+def has_known_engine_contract(engine: str) -> bool:
+    """True when the watchdog has an implemented engine-native contract for
+    ``engine``. Engines outside this set are classified as
+    ``unsupported_engine_contract`` in :func:`classify_status` rather than
+    being silently held to the Claude default or silently classified ``ok``
+    (#1237 r1).
+    """
+    return is_claude_engine(engine) or is_codex_engine(engine)
 
 
 def has_home_profile_contract(engine: str, agent_source: str) -> bool:
@@ -445,21 +991,15 @@ def has_home_profile_contract(engine: str, agent_source: str) -> bool:
     home-profile contract: the ``CLAUDE_REQUIRED_FILES`` set, the managed
     ``CLAUDE.md`` block, and the ``SESSION-TYPE.md`` onboarding state.
 
-    Issues #905 / #907 each special-cased one slice of this — codex was
-    exempted from required files, the managed block, and onboarding;
-    dynamic agents were exempted from the managed block. A third engine
-    (``antigravity``, v0.14.5) then fell through to the Claude default and
-    surfaced as a false ``status=error`` on every scan, because none of
-    those three call sites knew about it. This predicate is the single
-    gate so a known exempt engine is exempt by construction.
+    Issues #905 / #907 each special-cased one slice of this. #1237 split
+    the Codex case out into its own engine-native contract (see
+    :func:`has_codex_profile_contract`) instead of leaving codex as a
+    silent-OK allowlist entry. ``has_home_profile_contract`` now means
+    *Claude-specific* contract.
 
     The contract holds for:
 
       - Claude agents, static or unknown-source.
-      - Any *unknown* engine string, static or unknown-source — the
-        conservative legacy default (#905). An unknown engine is held to
-        the contract so it surfaces as drift; the fix is to add it to
-        ``NON_CONTRACT_ENGINES`` once the watchdog is taught about it.
 
     The contract is waived for:
 
@@ -469,25 +1009,45 @@ def has_home_profile_contract(engine: str, agent_source: str) -> bool:
         ``bridge_scaffold_agent_home``, so legitimately have no profile
         files, no managed block, and no SESSION-TYPE.md. The watchdog has
         no finer "scaffolded vs ad-hoc" signal than ``agent_source``.
-      - The known non-Claude engines in ``NON_CONTRACT_ENGINES``.
+      - Any non-Claude engine (codex has its own contract; unknown
+        engines surface as ``unsupported_engine_contract`` and do not
+        get the Claude-profile drift check overlaid on top).
     """
     if agent_source == "dynamic":
         return False
-    return engine not in NON_CONTRACT_ENGINES
+    return is_claude_engine(engine)
+
+
+def has_codex_profile_contract(engine: str, agent_source: str) -> bool:
+    """Whether the watchdog should hold this agent to the Codex contract
+    (``CODEX_REQUIRED_FILES``). Mirrors ``has_home_profile_contract`` but
+    gates on the codex engine string. Dynamic agents still get a full
+    exemption — they may legitimately be bare ad-hoc spawns (#907).
+    """
+    if agent_source == "dynamic":
+        return False
+    return is_codex_engine(engine)
 
 
 def required_profile_files(engine: str, agent_source: str = "") -> tuple[str, ...]:
     """Required profile-file set for an agent.
 
-    Returns ``CLAUDE_REQUIRED_FILES`` only for agents under the
-    home-profile contract (see :func:`has_home_profile_contract`); every
-    other agent returns an empty tuple so the missing-files check is a
-    no-op. ``agent_source`` defaults to ``""`` so a legacy positional
+    Returns the engine-appropriate required-file tuple:
+
+      - Claude under the home-profile contract → ``CLAUDE_REQUIRED_FILES``
+      - Codex under the engine-native contract (#1237) →
+        ``CODEX_REQUIRED_FILES``
+      - Anything else (dynamic source, unknown engine, antigravity) →
+        empty tuple so the missing-files check is a no-op.
+
+    ``agent_source`` defaults to ``""`` so a legacy positional
     ``required_profile_files(engine)`` call keeps the conservative
     Claude-default behavior for an unknown source.
     """
     if has_home_profile_contract(engine, agent_source):
         return CLAUDE_REQUIRED_FILES
+    if has_codex_profile_contract(engine, agent_source):
+        return CODEX_REQUIRED_FILES
     return ()
 
 
@@ -500,27 +1060,38 @@ def classify_status(
     agent_source: str = "",
     engine: str = "claude",
 ) -> str:
-    # All three drift signals — missing required files, managed-block,
-    # onboarding staleness — are gated on the home-profile contract (see
-    # has_home_profile_contract). Known non-Claude engines have no
-    # SESSION-TYPE.md / managed-CLAUDE.md / required-file contract (#905,
-    # originally codex only — now also antigravity), and dynamic agents
-    # are ad-hoc spawns that legitimately land with
-    # `missing_managed_claude_block=yes` and `onboarding_state=pending`
-    # until their first run; flagging any of these is admin alert-fatigue
-    # for a condition admin cannot resolve (#907, #303/#304/#343
-    # anti-pattern). missing_files is gated here too so classify_status is
-    # internally consistent and does not depend on the caller having
-    # pre-emptied `required` via required_profile_files.
-    contract = has_home_profile_contract(engine, agent_source)
-    if missing_files and contract:
+    # Engine routing:
+    #   - Claude under contract: required files + managed block +
+    #     onboarding staleness drive error/warn (#905 / #907 gates apply).
+    #   - Codex under contract (#1237): required Codex files drive error;
+    #     managed-CLAUDE-block and onboarding signals are not part of the
+    #     Codex contract and are ignored.
+    #   - Dynamic source (any engine): the contract is waived (#907).
+    #     Broken links still surface as warn — that is real drift, not a
+    #     fresh-provision default.
+    #   - Unknown engines with no implemented contract (e.g. antigravity
+    #     until a contract is added): return ``unsupported_engine_contract``
+    #     so the operator sees the row instead of a silent ok (#1237 r1).
+    #     A dynamic agent on an unknown engine is still reported under
+    #     ``unsupported_engine_contract`` — its mere presence is the
+    #     watchdog signal here, not a per-file drift result.
+    claude_contract = has_home_profile_contract(engine, agent_source)
+    codex_contract = has_codex_profile_contract(engine, agent_source)
+    if not has_known_engine_contract(engine):
+        # Surface broken-link drift even on unknown-engine rows; that
+        # signal is engine-agnostic and never lies.
+        if broken_links:
+            return "warn"
+        return "unsupported_engine_contract"
+    if missing_files and (claude_contract or codex_contract):
         return "error"
+    # Claude-only signals: managed block + onboarding staleness.
     onboarding_stale = (
-        contract
+        claude_contract
         and onboarding_state in {"pending", "missing"}
         and session_type not in NON_ONBOARDING_SESSION_TYPES
     )
-    effective_missing_block = missing_block if contract else False
+    effective_missing_block = missing_block if claude_contract else False
     if broken_links or effective_missing_block or onboarding_stale:
         return "warn"
     return "ok"
@@ -531,6 +1102,8 @@ def scan_agent(
     engine: str = "claude",
     agent_source: str = "",
     agent_name: str | None = None,
+    state_dir: Path | None = None,
+    fresh_install_home_dir: Path | None = None,
 ) -> AgentWatch:
     # `agent_name` (#1108) is the registry id, threaded through
     # explicitly because on v2 layouts ``agent_dir`` resolves to
@@ -540,6 +1113,27 @@ def scan_agent(
     # ``watchdog scan <agent>`` ad-hoc invocations that pass a Path
     # directly) unchanged.
     resolved_name = agent_name if agent_name is not None else agent_dir.name
+    # #1266 / #1254 (Lane G): probe the state-dir markers ONCE per agent
+    # so both the success path and the structured scan_error path below
+    # carry the same fresh_install / restart_in_progress signal. A
+    # restart-in-progress agent with a passing scan still has the marker
+    # — the daemon's task writer uses the flag to skip the drift task
+    # enqueue regardless of which row branch we took.
+    fresh_install_dir = fresh_install_home_dir if fresh_install_home_dir is not None else agent_dir
+    # On v2 installs ``agent_dir`` is ``<v2-root>/<a>/workdir`` (the
+    # resolved scan path), while ``fresh_install_dir`` is the
+    # tracked-tree home root used for the mtime fallback. The
+    # SESSION-TYPE.md auto-detect needs both candidates so an iso v2
+    # workdir's ``Onboarding State: complete`` reading is honored
+    # even when the home root does not carry a sibling
+    # SESSION-TYPE.md copy.
+    is_fresh = detect_fresh_install(
+        state_dir,
+        resolved_name,
+        fresh_install_dir,
+        session_type_search_dirs=[agent_dir] if agent_dir != fresh_install_dir else None,
+    )
+    is_restarting = detect_restart_in_progress(state_dir, resolved_name)
     # v0.8.8 #715-B / #694: linux-user-isolated agents own
     # `agents/<name>/CLAUDE.md` as `agent-bridge-<name>:<group> 0640`.
     # When the controller process credentials don't include the new
@@ -560,15 +1154,14 @@ def scan_agent(
         required = required_profile_files(engine, agent_source)
         missing_files = [name for name in required if not (agent_dir / name).exists()]
         # The `missing_managed_claude_block` FIELD records actual file
-        # state, so it is gated on engine alone, NOT the contract: any
-        # engine that could own a CLAUDE.md (Claude + unknown engines —
-        # same conservative set as the contract) gets a truthful field;
-        # the known non-Claude engines in NON_CONTRACT_ENGINES definitively
-        # don't own one. A dynamic Claude agent still gets an accurate
+        # state for engines that own a CLAUDE.md. Pre-#1237 this gated on
+        # the legacy ``NON_CONTRACT_ENGINES`` allowlist; with the codex
+        # contract now engine-native, the check is gated on the Claude
+        # engine directly. A dynamic Claude agent still gets an accurate
         # field — #907 keeps the field truthful and suppresses only the
-        # classification *signal*, which classify_status gates through
-        # has_home_profile_contract.
-        if engine not in NON_CONTRACT_ENGINES:
+        # classification *signal*, which ``classify_status`` gates through
+        # ``has_home_profile_contract``.
+        if is_claude_engine(engine):
             claude_text = read_text(agent_dir / "CLAUDE.md") if (agent_dir / "CLAUDE.md").exists() else ""
             missing_block = MANAGED_START not in claude_text or MANAGED_END not in claude_text
         else:
@@ -597,6 +1190,8 @@ def scan_agent(
             heartbeat_age_seconds=heartbeat_age,
             engine=engine or "claude",
             agent_source=agent_source,
+            fresh_install=is_fresh,
+            restart_in_progress=is_restarting,
         )
     except (PermissionError, FileNotFoundError, OSError) as exc:
         # #1119 r2: even when the outer `resolve_scan_path` sudo probe
@@ -619,6 +1214,9 @@ def scan_agent(
             f"path={error_path}",
             file=sys.stderr,
         )
+        error_category = classify_scan_error_category(
+            error_kind, str(error_path), agent_dir
+        )
         return AgentWatch(
             agent=resolved_name,
             session_type="unknown",
@@ -633,6 +1231,9 @@ def scan_agent(
             agent_source=agent_source,
             error_kind=error_kind,
             error_path=str(error_path),
+            error_category=error_category,
+            fresh_install=is_fresh,
+            restart_in_progress=is_restarting,
         )
 
 
@@ -673,7 +1274,14 @@ def render_markdown(
         if item.agent_source:
             lines.append(f"- agent_source: {item.agent_source}")
         lines.append(f"- session_type: {item.session_type}")
-        lines.append(f"- onboarding_state: {item.onboarding_state}")
+        # #1266 (v0.15.0-beta4 Lane G): suppress the onboarding_state line
+        # for static session types in the markdown render. Static-claude /
+        # static-codex ship with the template-default
+        # ``Onboarding State: complete``; surfacing the field here adds
+        # noise without operator signal. The JSON payload still carries
+        # the parsed value so downstream consumers can read it.
+        if item.session_type not in STATIC_SESSION_TYPES:
+            lines.append(f"- onboarding_state: {item.onboarding_state}")
         lines.append(f"- heartbeat_present: {'yes' if item.heartbeat_present else 'no'}")
         if item.heartbeat_age_seconds is not None:
             lines.append(f"- heartbeat_age_seconds: {item.heartbeat_age_seconds}")
@@ -689,8 +1297,21 @@ def render_markdown(
         # feeds the operator) names what went wrong and which path raised.
         if item.error_kind:
             lines.append(f"- error_kind: {item.error_kind}")
+        # #1254 (Lane G): the operator-actionable error_category split.
+        # Only emit when populated (= status=scan_error rows).
+        if item.error_category:
+            lines.append(f"- error_category: {item.error_category}")
         if item.error_path:
             lines.append(f"- error_path: {item.error_path}")
+        # #1266 / #1254 (Lane G): emit fresh_install and restart_in_progress
+        # only when true so a healthy row stays compact. The daemon's
+        # process_watchdog_report consumes these via the JSON payload, not
+        # the markdown body, so a missing line on a healthy row carries no
+        # semantic difference for downstream automation.
+        if item.fresh_install:
+            lines.append("- fresh_install: yes")
+        if item.restart_in_progress:
+            lines.append("- restart_in_progress: yes")
         if item.status == "ok":
             lines.append("- issues: none")
         lines.append("")
@@ -699,11 +1320,48 @@ def render_markdown(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("scan",))
+    # #1233: ``rescan`` is the operator-facing on-demand verb. Both
+    # commands run the same registry-anchored scanner; ``rescan`` adds
+    # report-file write-back so ``shared/watchdog/latest.md`` refreshes
+    # immediately (the daemon cooldown is in ``bridge-daemon.sh``'s
+    # ``process_watchdog_report`` and is therefore bypassed by construction
+    # when the operator drives the scanner directly). ``--agent <a>`` and
+    # ``--json`` work for both. ``scan`` is preserved as compatibility for
+    # the daemon tick + legacy ``watchdog scan <agent>`` callers.
+    parser.add_argument("command", choices=("scan", "rescan"))
     parser.add_argument("agents", nargs="*")
+    parser.add_argument(
+        "--agent",
+        action="append",
+        default=[],
+        dest="agent_flag",
+        help="scope the scan to a specific agent (repeatable; #1233)",
+    )
     parser.add_argument("--bridge-home", default=os.environ.get("BRIDGE_HOME", str(Path.home() / ".agent-bridge")))
     parser.add_argument("--agent-home-root", default=None)
+    # #1266 / #1254 (Lane G): the state directory holds the per-agent
+    # ``onboarding-pending`` / ``onboarding-complete`` markers and the
+    # ``restart.in-progress`` marker. Default to ``<bridge_home>/state``
+    # which matches ``$BRIDGE_STATE_DIR`` in ``bridge-lib.sh``; the env
+    # var override lets a CI smoke pin a fixture dir.
+    parser.add_argument(
+        "--state-dir",
+        default=os.environ.get("BRIDGE_STATE_DIR", ""),
+        help=(
+            "state directory holding state/agents/<a>/{onboarding-*,restart.in-progress} "
+            "markers (default: $BRIDGE_HOME/state; #1266 / #1254)"
+        ),
+    )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        default=None,
+        help=(
+            "write the rendered report to <bridge_home>/shared/watchdog/latest.md "
+            "(default: true for rescan, false for scan)"
+        ),
+    )
     # Refs queue #4796: registry-anchored enumeration is the default. Orphan
     # directories under $BRIDGE_AGENT_HOME_ROOT no longer drive profile_drift
     # warns; they surface in the separate `orphan_directories` bucket. Pass
@@ -734,8 +1392,40 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # #1233: ``--agent <name>`` (repeatable) is an alias for the existing
+    # positional ``agents`` selector. Merging here keeps the rest of the
+    # pipeline single-source (``args.agents``) without reshuffling the
+    # registry-anchored filter logic below.
+    if args.agent_flag:
+        args.agents = list(args.agents) + list(args.agent_flag)
+
+    # #1233: ``--apply`` defaults to True for ``rescan`` (the operator
+    # verb whose contract is "refresh latest.md right now"), and False for
+    # ``scan`` (the daemon-tick caller that already redirects stdout to
+    # the report file itself). An explicit ``--apply`` always wins.
+    if args.apply is None:
+        apply_to_report_file = args.command == "rescan"
+    else:
+        apply_to_report_file = bool(args.apply)
+
     bridge_home = Path(args.bridge_home).expanduser()
     agent_root = Path(args.agent_home_root).expanduser() if args.agent_home_root else bridge_home / "agents"
+    # #1266 / #1254 (Lane G): resolve the state-dir marker root once and
+    # pass it into each scan_agent. ``--state-dir`` (or
+    # ``$BRIDGE_STATE_DIR``) wins; default is ``<bridge_home>/state`` to
+    # match bridge-lib.sh's runtime layout. A non-existent state dir
+    # falls through to ``None`` so the detection helpers stay
+    # conservative (no false-positive fresh_install on a torn-down
+    # install).
+    state_dir: Path | None = None
+    if args.state_dir:
+        candidate = Path(args.state_dir).expanduser()
+        if candidate.is_dir():
+            state_dir = candidate
+    else:
+        candidate = bridge_home / "state"
+        if candidate.is_dir():
+            state_dir = candidate
     registry_ids: set[str] | None = None
     registry_meta: RegistryMeta = {}
     if args.registry_anchored:
@@ -786,6 +1476,19 @@ def main() -> int:
                     engine=engine,
                     agent_source=agent_source,
                     agent_name=agent_name,
+                    state_dir=state_dir,
+                    # The tracked-tree dir (`path`) is the most stable
+                    # fresh-install signal: on v2 it is created during
+                    # `bridge_scaffold_agent_home`, then the workdir
+                    # materialization step writes the runtime profile
+                    # into the v2 workdir. Both are touched in the same
+                    # `agent create` call, but `path`'s mtime is
+                    # preserved across watchdog ticks (the runtime
+                    # workdir can be re-touched by hooks). Pass `path`
+                    # explicitly so the fresh-install age window is
+                    # measured against the scaffold mtime, not the
+                    # potentially-younger materialize target.
+                    fresh_install_home_dir=path,
                 )
             )
         except (PermissionError, FileNotFoundError, OSError) as exc:
@@ -813,6 +1516,37 @@ def main() -> int:
                 f"the rest of the roster (#1119)",
                 file=sys.stderr,
             )
+            # #1254 (Lane G): classify the outer scan_error too. The
+            # workdir candidate we hand to ``classify_scan_error_category``
+            # is whichever of the registry workdir / on-disk path the
+            # caller has — neither is guaranteed reachable, so the
+            # helper itself is exception-tolerant. ``state_dir``
+            # markers are probed the same way as the success path so
+            # an agent that's mid-restart (or fresh-installed) still
+            # gets the matching flags on its scan_error row.
+            workdir_candidate: Path | None
+            workdir_str_for_check = agent_meta.get("workdir", "")
+            if workdir_str_for_check:
+                workdir_candidate = Path(workdir_str_for_check).expanduser()
+            else:
+                workdir_candidate = path
+            error_category = classify_scan_error_category(
+                error_kind, error_path, workdir_candidate
+            )
+            # Pass the registry's workdir candidate as an extra SESSION-
+            # TYPE.md search dir so the auto-detect honors an iso-v2
+            # workdir SESSION-TYPE.md (under
+            # ``<v2-root>/<a>/workdir/``) even when the home root
+            # carries no sibling copy. The probe is exception-tolerant,
+            # so an unreachable workdir simply contributes nothing.
+            extra_dirs: list[Path] | None = None
+            if workdir_candidate is not None and workdir_candidate != path:
+                extra_dirs = [workdir_candidate]
+            is_fresh = detect_fresh_install(
+                state_dir, agent_name, path,
+                session_type_search_dirs=extra_dirs,
+            )
+            is_restarting = detect_restart_in_progress(state_dir, agent_name)
             records.append(
                 AgentWatch(
                     agent=agent_name,
@@ -828,22 +1562,68 @@ def main() -> int:
                     agent_source=agent_source,
                     error_kind=error_kind,
                     error_path=error_path,
+                    error_category=error_category,
+                    fresh_install=is_fresh,
+                    restart_in_progress=is_restarting,
                 )
             )
+    # #1254 (Lane G): an agent whose `restart.in-progress` marker is
+    # active is intentionally mid-restart — the snapshot+marker contract
+    # from #1251 expects the next watchdog tick (after the TTL window) to
+    # see the fresh state. Suppress those rows from the problem count
+    # entirely so the daemon's process_watchdog_report does NOT enqueue
+    # a drift task for a transient mid-restart window. ``problem_count``
+    # remains the authoritative signal the daemon reads.
+    #
+    # #1266 (Lane G): the ``fresh_install_only`` derived flag tells the
+    # daemon "every problem row in this report is a fresh-install
+    # candidate — file at priority=low instead of high". When mixed
+    # (some fresh, some not), the high-priority path is preserved.
+    effective_problems = [
+        item for item in records
+        if item.status != "ok" and not item.restart_in_progress
+    ]
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
         "bridge_home": str(bridge_home),
         "agent_home_root": str(agent_root),
         "agent_count": len(records),
-        "problem_count": sum(1 for item in records if item.status != "ok"),
+        "problem_count": len(effective_problems),
+        "fresh_install_only": bool(effective_problems) and all(
+            item.fresh_install for item in effective_problems
+        ),
+        "restart_in_progress_count": sum(
+            1 for item in records if item.restart_in_progress
+        ),
         "orphan_directory_count": len(orphan_directories),
         "orphan_directories": orphan_directories,
         "agents": [asdict(item) for item in records],
     }
+    rendered_markdown = render_markdown(records, bridge_home, orphan_directories)
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print(render_markdown(records, bridge_home, orphan_directories), end="")
+        print(rendered_markdown, end="")
+    # #1233: write the markdown report to the canonical
+    # ``<bridge_home>/shared/watchdog/latest.md`` location so the operator
+    # who typed ``agent-bridge watchdog rescan`` sees the refresh
+    # immediately, without waiting for the next daemon tick. The daemon
+    # tick path (``bridge-daemon.sh:process_watchdog_report``) keeps
+    # writing the same file via stdout redirect, so steady-state behavior
+    # is unchanged. Existence of the parent directory is ensured here so
+    # the verb works on a fresh BRIDGE_HOME where the daemon has never
+    # ticked.
+    if apply_to_report_file:
+        report_path = bridge_home / "shared" / "watchdog" / "latest.md"
+        try:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(rendered_markdown, encoding="utf-8")
+        except OSError as exc:
+            print(
+                f"[bridge-watchdog] failed to write report file {report_path}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 

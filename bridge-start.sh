@@ -240,19 +240,85 @@ bridge_start_schedule_dev_channels_accept() {
         fi
         sleep "$poll_seconds"
       done
-      # Picker-text-trigger short-circuits the secondary foreground gate
-      # inside bridge_tmux_claude_advance_blocker (lib/bridge-tmux.sh:677).
-      # The picker text IS the direct signal — Claude has drawn the
-      # dev-channels prompt, so requiring an additional foreground match
-      # on top would just resurrect the bug this commit closes. The
-      # legacy gate is preserved for the non-picker trigger path so other
-      # callers (and non-dev-channels callers) are unaffected.
+      # Issue #1306: daemon auto-recovery via --no-attach was observed
+      # leaving the dev-channels picker hung for 23+ minutes on iso v2
+      # agents. The watcher armed and logged "controller-side Claude
+      # development-channels auto-accept armed" but the picker key was
+      # never sent. The tmux session existed and the picker text was
+      # drawn, but the chain of
+      # bridge_tmux_wait_for_prompt -> bridge_tmux_claude_advance_blocker
+      # -> bridge_tmux_wait_for_claude_foreground carries a foreground
+      # process-name gate that false-negatives in the unattended /
+      # background-daemon-spawned tmux session shape (the pane_pid
+      # comm does not reliably match the claude regex even after the
+      # picker is fully drawn). The previous fix (#825) bypassed that
+      # gate via env var only on the picker_seen path, but the indirect
+      # chain still tripped intermittently because wait_for_prompt
+      # own polling iterates bridge_tmux_session_has_prompt AND
+      # bridge_tmux_claude_blocker_state again. A transient race
+      # between picker text presence and blocker-state detection (e.g.
+      # picker drawn, but the 80-line capture window slid past the
+      # WARNING line in the brief moment between watcher poll and
+      # wait_for_prompt poll) was enough to leave the picker hanging.
+      #
+      # Root fix (per feedback-root-vs-symptom-framing): drop the
+      # foreground/attach gate entirely on the picker-text trigger path
+      # and send Enter DIRECTLY to the tmux pane the moment the picker
+      # text is observed. The picker text -- WARNING: Loading
+      # development channels + I am using this for local development
+      # -- is unique to this prompt shape and the cursor glyph is
+      # already parked on option 1, so Enter selects it. No process-tree
+      # walk, no foreground basename check, no wait_for_prompt
+      # indirection; just session-exists + picker-text-detected. This
+      # is the only auto-accept invocation contract daemon-auto-recovery
+      # (--no-attach) actually needs.
+      #
+      # The legacy foreground-trigger path is preserved verbatim for
+      # callers that reach it (Claude entered the foreground but picker
+      # has not been drawn yet). It still routes through
+      # bridge_tmux_wait_for_prompt so other blocker states the
+      # session may transition through (trust, summary) keep their
+      # existing handling.
       if (( picker_seen == 1 )); then
+        # Settle delay: capture race with the picker draw cycle. A
+        # short pause lets Claude finish painting option 1 before we
+        # send. 200ms keeps the unattended-recovery path snappy while
+        # still allowing the render to settle.
+        sleep 0.2
+        # Re-verify session existence; a session that died between
+        # picker detection and send (e.g. parent bridge-run.sh crashed
+        # on a follow-up plugin-cache error) should not be logged as
+        # "completed".
+        if bridge_tmux_session_exists "$session" \
+           && bridge_tmux_pane_has_dev_channels_picker "$session"; then
+          # Direct send — no attach gate, no foreground gate, no
+          # wait_for_prompt indirection. bridge_tmux_send_keys_with_timeout
+          # wraps tmux send-keys with the daemon-wide 10s watchdog
+          # (#265); it does NOT require an attached client.
+          if bridge_tmux_send_keys_with_timeout tmux_send_dev_channels_picker_direct \
+              -t "$(bridge_tmux_pane_target "$session")" C-m; then
+            printf "[%s] [info] controller auto-accept dev-channels completed (picker-text trigger, direct send) on session=%s agent=%s\n" \
+              "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
+            exit 0
+          else
+            printf "[%s] [warn] controller auto-accept dev-channels direct send failed on session=%s agent=%s; falling back to wait_for_prompt\n" \
+              "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" >&2
+          fi
+        else
+          printf "[%s] [warn] controller auto-accept dev-channels picker cleared between detect and send on session=%s agent=%s; skipping send\n" \
+            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" >&2
+          exit 0
+        fi
+        # Direct-send fallback path (rare): keep the legacy env-var
+        # bypass + wait_for_prompt route in case the direct send
+        # itself raises (e.g. tmux IPC failure inside the 10s
+        # watchdog). The wait_for_prompt retry loop handles up to 12
+        # Enter presses with its own picker re-detection.
         export BRIDGE_TMUX_DEV_CHANNELS_REQUIRE_CLAUDE_FOREGROUND=0
       fi
       if bridge_tmux_wait_for_prompt "$session" claude "$accept_timeout" 1; then
         if (( picker_seen == 1 )); then
-          printf "[%s] [info] controller auto-accept dev-channels completed (picker-text trigger) on session=%s agent=%s\n" \
+          printf "[%s] [info] controller auto-accept dev-channels completed (picker-text trigger, wait_for_prompt fallback) on session=%s agent=%s\n" \
             "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
         else
           printf "[%s] [info] controller auto-accept dev-channels completed (foreground trigger) on session=%s agent=%s\n" \
@@ -549,11 +615,35 @@ elif [[ $CONTINUE_EXPLICIT -eq 1 ]]; then
   EFFECTIVE_CONTINUE_MODE="$CONTINUE_MODE"
 fi
 
-# Issue #268: warn the operator when --no-continue is launching fresh but a
-# stale resume id is still persisted. Without this, an operator who used
-# --no-continue to escape a broken `claude --resume` does not realise the
-# next normal restart will pick the bad id back up.
-if [[ $CONTINUE_EXPLICIT -eq 1 && "$CONTINUE_MODE" == "0" ]]; then
+# Issue #268 + #1334 L4 (v0.14.5-beta5-2 Lane ξ): warn the operator when this
+# launch is effectively fresh (CONTINUE_MODE=0 — either operator-supplied
+# --no-continue OR controller-derived FORCE_FRESH_SESSION) but a stale
+# resume id is still persisted. The persisted id is NOT cleared by a
+# fresh-launch — only `agb agent forget-session <agent>` clears it
+# permanently — so the next normal restart will pick the bad id back up
+# without operator visibility.
+#
+# Order contract (must match bridge-run.sh:167-175 / #1334 L4): both
+# callers evaluate EFFECTIVE/explicit "continue=0" → persisted-id read →
+# warn-and-fall-through, in that sequence. The persisted id is never
+# clobbered here; FORCE_FRESH_SESSION only steers the engine launch line
+# (via --no-continue injected into SESSION_CMD), it does NOT mutate the
+# session-id persist file. That separation keeps the recovery path
+# explicit: operator must run `agb agent forget-session` to permanently
+# discard a known-bad id, and a fresh-for-this-run launch is a
+# non-destructive one-shot.
+#
+# Pre-#1334 bug: this branch checked `CONTINUE_EXPLICIT==1 && CONTINUE_MODE==0`,
+# so a controller-derived FORCE_FRESH (operator did not pass --no-continue,
+# but bridge_project_claude_guidance_needed / hook-status probes set
+# FORCE_FRESH_SESSION=1) silently skipped the warn at the bridge-start
+# layer — even though bridge-run.sh:167-175 DID warn after the injected
+# --no-continue made CONTINUE_EXPLICIT=1 there. Operators saw a single
+# bridge-run warning with no upstream context. Switching the gate to
+# EFFECTIVE_CONTINUE_MODE makes the bridge-start warn fire whenever the
+# effective state is "launch fresh + persisted id remains", matching the
+# bridge-run.sh end-state.
+if [[ "${EFFECTIVE_CONTINUE_MODE:-1}" == "0" ]]; then
   _persisted_session_id="$(bridge_agent_persisted_session_id "$AGENT")"
   if [[ -n "$_persisted_session_id" ]]; then
     bridge_warn "launched fresh for this run, but saved session_id=${_persisted_session_id} remains; next normal restart will resume it. Use 'agb agent forget-session $AGENT' to clear permanently."
@@ -573,11 +663,167 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   fi
 fi
 
+# Issue #1190/#1191 (beta22, codex r1 — 2026-05-25): idempotent start-time
+# hook for bundled plugins (plugins/teams, plugins/ms365, …) that ship a
+# `package.json`. The helper
+# `bridge_provision_bundled_plugins_node_modules` (lib/bridge-channels.sh)
+# was previously invoked only from `bridge-setup.sh run_teams()` and
+# `bridge-upgrade.sh` — meaning a fresh install path that never ran setup
+# or upgrade (e.g. operator added a plugin: channel via `agent create`
+# alone) reaches first launch with missing `node_modules`, and the MCP
+# server later fails with "Cannot find module ...".
+#
+# Runs BEFORE the isolation prep + bridge-run.sh exec so the shared
+# `plugins/<id>/node_modules` tree is in place by the time the iso-side
+# dev-plugin-cache copies it into /home/<iso>/.claude/plugins/cache/<…>.
+#
+# Idempotent: the helper's staleness check at lib/bridge-channels.sh:848-863
+# skips work when the existing node_modules is newer than both package.json
+# and bun.lock. The chmod widen always runs so iso UIDs can read.
+#
+# Fail-closed when an agent declares a plugin: channel that maps to a
+# bundled plugin (plugins/<id>) which has package.json AND bun is
+# unavailable: per brief, "don't let MCP startup fail later with
+# module-not-found". Operator guidance: install bun, or remove the
+# bundled plugin channel.
+#
+# Best-effort otherwise: a `bun install` failure inside the helper still
+# warns + returns nonzero, but we keep launching (the agent may still be
+# useful with degraded plugin functionality, and the operator can
+# recover via `agb setup teams`).
+#
+# Skips entirely when no plugin: channels are declared.
+if [[ $DRY_RUN -eq 0 ]]; then
+  _bundled_chan_csv="$(bridge_agent_channels_csv "$AGENT" 2>/dev/null || true)"
+  if [[ "$_bundled_chan_csv" == *plugin:* ]]; then
+    # Determine which bundled plugins the agent's channels actually
+    # require (have a package.json on disk). teams is covered by the
+    # teams-specific helper invoked from setup; ms365 / future bundled
+    # plugins go through bridge_provision_bundled_plugins_node_modules.
+    _bundled_required=""
+    _IFS_save="$IFS"
+    IFS=','
+    for _tok in $_bundled_chan_csv; do
+      _tok="${_tok// /}"
+      [[ "$_tok" == plugin:*@agent-bridge ]] || continue
+      _name="${_tok#plugin:}"
+      _name="${_name%@agent-bridge}"
+      # Only the bundled plugin types that actually have package.json
+      # under $BRIDGE_SCRIPT_DIR/plugins/ count toward "required".
+      if [[ -f "$BRIDGE_SCRIPT_DIR/plugins/$_name/package.json" ]]; then
+        _bundled_required="${_bundled_required:+$_bundled_required,}$_name"
+      fi
+    done
+    IFS="$_IFS_save"
+    unset _IFS_save _tok _name
+
+    if [[ -n "$_bundled_required" ]]; then
+      # bun preflight — fail closed for channel-required bundled plugins
+      # when bun is missing. The agent's declared channels would later
+      # crash the MCP servers with module-not-found if we let start
+      # proceed without node_modules.
+      _bun_bin=""
+      if declare -F bridge_resolve_bun_executable >/dev/null 2>&1; then
+        _bun_bin="$(bridge_resolve_bun_executable 2>/dev/null || true)"
+      fi
+      if [[ -z "$_bun_bin" ]]; then
+        bridge_audit_log state bundled_plugin_runtime_missing_bun "$AGENT" \
+          --field channels="$_bundled_chan_csv" \
+          --field required_bundled="$_bundled_required" >/dev/null 2>&1 || true
+        bridge_die "agent '$AGENT' declares bundled plugin channels ($_bundled_required) that require a node_modules tree under \$BRIDGE_SCRIPT_DIR/plugins/, but \`bun\` is not on PATH. Install bun (\`agb setup teams\` provisions it) or remove the bundled plugin channel(s) from this agent."
+      fi
+      # Run BOTH provisioners. The general helper SKIPS the `teams`
+      # plugin (covered by the teams-specific helper at
+      # lib/bridge-channels.sh:580), so we must invoke that separately
+      # when the agent declares plugin:teams@agent-bridge. Order matters
+      # only for log clarity — the two helpers operate on disjoint
+      # plugin trees.
+      case ",$_bundled_required," in
+        *,teams,*)
+          if declare -F bridge_install_teams_plugin_node_modules >/dev/null 2>&1; then
+            bridge_install_teams_plugin_node_modules 0 "$_bun_bin" || \
+              bridge_warn "teams plugin node_modules provisioning returned nonzero — see warns above; the agent will still launch but Teams MCP may fail until the operator runs \`agb setup teams\`."
+          fi
+          ;;
+      esac
+      if declare -F bridge_provision_bundled_plugins_node_modules >/dev/null 2>&1; then
+        bridge_provision_bundled_plugins_node_modules 0 "$_bun_bin" || \
+          bridge_warn "bundled plugin node_modules provisioning returned nonzero — see warns above; the agent will still launch but MCP for one or more bundled plugins may fail until the operator runs \`agb setup teams\`."
+      fi
+      unset _bun_bin
+    fi
+    unset _bundled_required
+  fi
+  unset _bundled_chan_csv
+fi
+
 if bridge_isolation_disabled_by_env; then
   bridge_warn "BRIDGE_DISABLE_ISOLATION=1 — skipping v2 isolation prep for '$AGENT' (security boundary disabled, agent will run as controller UID without sudo wrap or per-agent env file)"
 elif bridge_agent_linux_user_isolation_effective "$AGENT"; then
   AGENT_ENV_FILE="$(bridge_agent_linux_env_file "$AGENT")"
   bridge_write_linux_agent_env_file "$AGENT" "$AGENT_ENV_FILE"
+
+  # L1-D (beta21, codex r1 spec / PR #1196): re-derive the per-UID plugin
+  # catalog on every start/restart so an existing iso agent picks up
+  # marketplaces that were added AFTER the agent was created (via `agb
+  # plugins seed`, manual marketplace add, etc.). Without this, the
+  # per-UID `known_marketplaces.json` is only written at agent-create /
+  # reapply via `bridge_linux_prepare_agent_isolation` (lib/bridge-agents.sh:4156)
+  # and at `agb plugins seed` via the D2 merge helper (bridge-plugins.sh,
+  # PR #1189) — operator-side drift (e.g. iso HOME catalog reset, new
+  # external marketplace added to roster but no agent-recreate) leaves
+  # the iso UID with a stale catalog and dev-plugin-cache reports
+  # `marketplace-mismatch:<marketplace>` for every plugin that lives in
+  # the missing marketplace.
+  #
+  # The CANONICAL writer is `bridge_linux_share_plugin_catalog`
+  # (lib/bridge-agents.sh:2512+) — it re-derives the filtered per-UID
+  # catalog + installed_plugins.json + marketplace symlinks from the
+  # shared plugin cache and the agent's declared channels/plugins each
+  # time it runs. Stale or manually-edited per-UID state is therefore
+  # overwritten with the canonical state on every start, closing the
+  # "operator drifted existing agent" failure mode that D2 (seed-side
+  # merge) cannot reach.
+  #
+  # SUPPRESS_MISSING_CHANNELS=1 (line 568 above): the suppress-aware
+  # launcher is used when the agent is mid-onboarding and its channel
+  # runtime is incomplete. Calling the share helper here in that mode
+  # could turn a suppressed-channel recovery start into a NEW hard
+  # failure if the shared plugin cache is also absent (helper
+  # `bridge_die`s on a populated channel list but no cache). Skip the
+  # share call in that mode (codex r1 option (a)) — the agent's plugin
+  # channels are suppressed for launch anyway, so the per-UID catalog
+  # is not consulted in the launch path. The next non-suppressed start
+  # re-runs this helper and brings the catalog back to canonical.
+  #
+  # For normal starts that DO need plugin channels but lack the shared
+  # cache, the helper fails loud with its existing "run `agb plugins
+  # seed`" guidance — no silent no-op.
+  if [[ "$SUPPRESS_MISSING_CHANNELS" -eq 1 ]]; then
+    bridge_warn "BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS=1 — skipping per-UID plugin catalog re-derivation for '$AGENT' (suppress-aware launch; the next non-suppressed start re-derives)"
+  else
+    _l1d_os_user="$(bridge_agent_os_user "$AGENT" 2>/dev/null || true)"
+    if [[ -z "$_l1d_os_user" ]]; then
+      bridge_warn "bridge-start.sh L1-D: cannot resolve os_user for agent '$AGENT' — skipping per-UID plugin catalog re-derivation (the agent's plugin channels may report marketplace-mismatch on this launch; recover via \`agent-bridge isolate $AGENT\` to repair)"
+    else
+      _l1d_user_home="$(bridge_agent_linux_user_home "$_l1d_os_user")"
+      _l1d_controller_user="$(bridge_isolation_v2_controller_user 2>/dev/null || true)"
+      if [[ -z "$_l1d_controller_user" ]]; then
+        bridge_warn "bridge-start.sh L1-D: cannot resolve controller user for agent '$AGENT' — skipping per-UID plugin catalog re-derivation"
+      elif ! bridge_linux_share_plugin_catalog \
+              "$_l1d_os_user" "$_l1d_user_home" "$_l1d_controller_user" "$AGENT"; then
+        # Helper fails loud (bridge_die) on a populated channel list +
+        # absent shared cache; that path never returns here. Other
+        # failures (chown / chmod / symlink) are non-fatal for the
+        # start path — the agent may still launch with a stale (but
+        # non-empty) per-UID catalog from a prior create/seed pass.
+        # Surface a warn so the operator sees the drift.
+        bridge_warn "bridge-start.sh L1-D: per-UID plugin catalog re-derivation FAILED for agent '$AGENT' (start continues with the prior catalog; expect marketplace-mismatch reports if a marketplace was added since the last agent-create / seed)"
+      fi
+      unset _l1d_user_home _l1d_controller_user
+    fi
+    unset _l1d_os_user
+  fi
 fi
 
 SESSION_CMD="$(bridge_join_quoted "$BRIDGE_BASH_BIN" "$RUNNER" "$AGENT")"
@@ -615,6 +861,36 @@ if [[ -z "${BRIDGE_CONTROLLER_UID:-}" ]]; then
 else
   SESSION_CMD="BRIDGE_CONTROLLER_UID=$(printf '%q' "$BRIDGE_CONTROLLER_UID") ${SESSION_CMD}"
 fi
+# Issue #1330 M7 (v0.14.5-beta5-2 Lane ξ): inline BRIDGE_AGENT_ID into the
+# SESSION_CMD env prefix so child processes — Claude/Codex and any MCP
+# servers they spawn (plugins/teams, plugins/ms365, …) — see a populated
+# BRIDGE_AGENT_ID from the earliest moment.
+#
+# Why belt-and-suspenders: BRIDGE_AGENT_ID is set THREE other places:
+#   1. bridge-run.sh:140 (early — before bridge_load_roster reads the
+#      scoped roster snapshot, see #116).
+#   2. bridge-run.sh:350 (late — immediately before the engine exec).
+#   3. The per-agent env file at $BRIDGE_AGENT_ENV_FILE
+#      (lib/bridge-agents.sh:3559-3560), which is sourced inside
+#      bridge_load_roster.
+# None of these paths runs BEFORE the SESSION_CMD env prefix evaluates,
+# so MCP servers spawned by an engine path that bypasses bridge-run.sh
+# (or by an early hook like prompt_timestamp.py that reads BRIDGE_AGENT_ID
+# at source time) would see a blank scalar. The Teams MCP server's
+# activity-index write at plugins/teams/server.ts:2314 falls back to
+# "" → silent skip → PreCompact channel-route lookup later misses the
+# session-id mapping. Inlining here closes the gap at the env-prefix
+# level so every downstream consumer (including any future bare engine
+# launch that does not go through bridge-run.sh) inherits the populated
+# value.
+#
+# Quoting via printf '%q' keeps agent ids with whitespace / shell
+# metacharacters safe across the bash -lc boundary the sudo wrap uses
+# at bridge-start.sh:891. The agent id is also slug-validated at create
+# time (lib/bridge-agents.sh:bridge_validate_agent_id), so this is
+# defense-in-depth for the historical record (no current id violates
+# the slug rule).
+SESSION_CMD="BRIDGE_AGENT_ID=$(printf '%q' "$AGENT") ${SESSION_CMD}"
 # Issue #1118: resolve the engine binary's absolute path on the controller
 # and propagate it into the sudo'd child via the SESSION_CMD env prefix.
 # Without this, a v2 linux-user-isolated agent's `bash -lc "claude ..."`
@@ -669,6 +945,40 @@ if [[ $SUDO_WRAP_ACTIVE -eq 1 ]]; then
   SUDO_WRAPPED_CMD+=" -- $(printf '%q' "$BRIDGE_BASH_BIN") -lc $(printf '%q' "$SESSION_CMD")"
   SESSION_CMD="$SUDO_WRAPPED_CMD"
 elif [[ -n "$SUDO_WRAP_OS_USER" && -n "$SUDO_WRAP_FALLBACK_REASON" && $DRY_RUN -eq 0 ]]; then
+  # L1-D Part A (beta22, #1196 sequel — codex r1 root-cause re-diagnosis,
+  # 2026-05-25): when the agent declares plugin: channels, the runner
+  # binds dev-plugin-cache to /home/<iso>/.claude/plugins via the iso
+  # HOME resolved by bridge-run.sh. If sudo-wrap is unavailable here, the
+  # SESSION_CMD continues to run as the controller UID but
+  # bridge-run.sh's `BRIDGE_CLAUDE_CONFIG_DIR` resolution will still point
+  # at the iso UID's HOME — so a controller-side dev-plugin-cache write
+  # tree-walks into root-owned /home/<iso>/.claude/plugins and trips
+  # EPERM on os.rename. That is exactly the L1-D symptom (patch agent
+  # report 2026-05-24): plugin-channel iso agent first-start, no
+  # operator chmod/sudo, wedges silently on EPERM. The legacy fallback
+  # path swallowed the actual blocker into a warn and let bridge-run.sh
+  # exec the controller into the iso HOME tree.
+  #
+  # Fail closed BEFORE the launch exec when plugin channels are declared.
+  # For non-plugin channel agents (or no channels at all) the legacy
+  # warn+fall-through path is preserved — shared-mode launch is harmless
+  # if no controller process targets the iso HOME plugin tree.
+  _l1d_chan_csv="$(bridge_agent_channels_csv "$AGENT" 2>/dev/null || true)"
+  if [[ "$_l1d_chan_csv" == *plugin:* ]]; then
+    bridge_audit_log state linux_user_sudo_unavailable_plugin_channels_fail_closed "$AGENT" \
+      --field os_user="$SUDO_WRAP_OS_USER" \
+      --field reason="$SUDO_WRAP_FALLBACK_REASON" \
+      --field channels="$_l1d_chan_csv" >/dev/null 2>&1 || true
+    unset _l1d_chan_csv
+    # beta23 Option A: removed remediation option (c) "use shared-mode
+    # isolation (BRIDGE_DISABLE_ISOLATION=1)". The Option A contract
+    # rejects shared-mode as a recovery surface (it disables the
+    # security boundary). The only supported recovery is provisioning
+    # passwordless sudo for the iso UID (option a) or removing the
+    # plugin: channels declaration (option b).
+    bridge_die "linux-user isolation for '$AGENT' has plugin: channels but UID switch is unavailable: $SUDO_WRAP_FALLBACK_REASON. Continuing as the controller UID would point dev-plugin-cache at /home/<iso>/.claude/plugins and trip EPERM on os.rename (L1-D root cause, codex r1 2026-05-25). Choose ONE of: (a) enable passwordless sudo for the iso UID — run \`agent-bridge isolate $AGENT --install-sudoers\` (Linux); (b) remove plugin: channels from this agent and re-run \`agent create\`."
+  fi
+  unset _l1d_chan_csv
   bridge_warn "linux-user isolation requested for '$AGENT' but UID switch unavailable: $SUDO_WRAP_FALLBACK_REASON. Falling back to shared-mode launch. Run 'agent-bridge isolate $AGENT --install-sudoers' or configure sudoers manually (see docs/linux-host-acceptance.md)."
   bridge_audit_log state linux_user_sudo_unavailable "$AGENT" \
     --field os_user="$SUDO_WRAP_OS_USER" \
@@ -789,7 +1099,17 @@ if [[ "$ENGINE" == "claude" ]]; then
   bridge_agent_mark_idle_now "$AGENT" || true
 fi
 if [[ -z "$(bridge_agent_session_id "$AGENT")" ]]; then
-  bridge_refresh_agent_session_id "$AGENT" 12 0.25 >/dev/null 2>&1 || true
+  # Issue #1248 Lane A3 r2 (codex r1 BLOCKING): drop the
+  # `2>&1 ... || true` swallow. `bridge_refresh_agent_session_id`
+  # `bridge_die`s on persist-write failure (`state_dir_write_failed:
+  # session_id`); `bridge_die` calls `exit 1`, which the `|| true` cannot
+  # intercept — so the only practical effect of the swallow was to redirect
+  # the structured stderr reason and the `[session-id]` success breadcrumb
+  # to /dev/null while bridge-start.sh died silently. Let stderr through
+  # so the operator sees the structured reason on failure and the
+  # session_id capture breadcrumb on success. Stdout (the captured id)
+  # is still suppressed because nothing here consumes it.
+  bridge_refresh_agent_session_id "$AGENT" 12 0.25 >/dev/null
 fi
 echo "[info] 세션 '$SESSION' 시작 완료"
 

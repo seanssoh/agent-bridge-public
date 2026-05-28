@@ -237,7 +237,40 @@ def ensure_known_marketplace_for_root(root: Path, marketplace_name: str) -> tupl
 
     path = known_marketplaces_path()
     root = root.resolve()
+    # L1-D Part C (beta22, codex r1 race-safety, 2026-05-25):
+    # `merge_installed_plugins` already protects installed_plugins.json with
+    # a sidecar `installed_plugins.json.lock` flock; this writer (and the
+    # D2 seed-side `lib/upgrade-helpers/plugins-seed-merge-known-marketplace.py`)
+    # both touch the SAME per-UID `known_marketplaces.json` but had no
+    # shared lock. Concurrent runs (start hook + cron-driven seed +
+    # operator `agb plugins seed`) could lose updates — a read-modify-
+    # write race where the later writer overwrites the earlier writer's
+    # entry. Use a sidecar `known_marketplaces.json.lock` flock with the
+    # exact same convention (LOCK_EX on a same-dir lockfile, dropped on
+    # function exit). Identical writers in the seed-merge helper share
+    # the same lock path so they serialize against each other too.
+    import errno  # noqa: F401  (kept for parity with merge_installed_plugins)
+    import fcntl
+
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"mkdir-failed: {exc}"
+
+    lock_path = path.with_name(f"{path.name}.lock")
+    try:
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        return False, f"lock-open-failed: {exc}"
+
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            return False, f"flock-failed: {exc}"
+
+        # Re-read under the lock to avoid losing a concurrent update that
+        # landed between our pre-lock load and the LOCK_EX acquire.
         payload = load_known_marketplaces()
         existing = payload.get(marketplace_name)
         if _marketplace_entry_matches_root(existing, root):
@@ -248,7 +281,6 @@ def ensure_known_marketplace_for_root(root: Path, marketplace_name: str) -> tupl
             "installLocation": str(root),
             "lastUpdated": _now_iso_utc(),
         }
-        path.parent.mkdir(parents=True, exist_ok=True)
         existing_mode = 0o600
         if path.exists():
             try:
@@ -272,6 +304,11 @@ def ensure_known_marketplace_for_root(root: Path, marketplace_name: str) -> tupl
         return True, "updated"
     except OSError as exc:
         return False, f"write-failed: {exc}"
+    finally:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
 
 
 def channel_marketplace(channel: str) -> str:
@@ -635,6 +672,50 @@ def overlay_source_to_cache(
     return changed
 
 
+# Issue #1282 (Surface B) — conservative heuristic that mirrors the one
+# in `lib/upgrade-helpers/plugins-seed-parse-sync-output.py`. Used to
+# distinguish `node_modules=missing` from `node_modules=not-required`
+# so `.mjs` proxy plugins that ship without a `package.json` (e.g.
+# `cosmax-ep-approval`'s `ep-mcp-proxy.mjs` — inline-deps) do not paint
+# the seed output with cosmetic noise. Returns True when the plugin's
+# source ANY of:
+#   * declares non-empty `dependencies` / `peerDependencies` in package.json
+#   * ships a sibling lockfile (bun.lock, bun.lockb, package-lock.json,
+#     yarn.lock)
+# Any I/O error → False (steady-state benign — caller stays on the
+# legacy `missing` label so a real install gap is still surfaced).
+def _plugin_source_declares_deps(source_path: Path) -> bool:
+    try:
+        if not source_path.is_dir():
+            return False
+    except OSError:
+        return False
+    for lock in ("bun.lock", "bun.lockb", "package-lock.json", "yarn.lock"):
+        try:
+            if (source_path / lock).is_file():
+                return True
+        except OSError:
+            continue
+    pkg = source_path / "package.json"
+    try:
+        if not pkg.is_file():
+            return False
+    except OSError:
+        return False
+    try:
+        with pkg.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    for key in ("dependencies", "peerDependencies"):
+        deps = data.get(key)
+        if isinstance(deps, dict) and deps:
+            return True
+    return False
+
+
 def link_source_node_modules(source_path: Path, cache_version_path: Path) -> tuple[str, str]:
     source_node_modules = source_path / "node_modules"
     cache_node_modules = cache_version_path / "node_modules"
@@ -900,6 +981,16 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
     elif cache_node_modules.exists():
         node_modules_status = "not-directory"
         node_modules_target = str(cache_node_modules)
+    elif not _plugin_source_declares_deps(source_path):
+        # Issue #1282 (Surface B) — `.mjs` proxy plugins (e.g.
+        # `cosmax-ep-approval`'s `ep-mcp-proxy.mjs`) use Node.js inline
+        # deps and ship without a `package.json`/lockfile. The seed
+        # used to emit `node_modules=missing` for these, which painted
+        # the operator dashboard with cosmetic false-positive noise.
+        # Mark the field honestly: this plugin's source does not
+        # declare deps, so no `node_modules` directory is expected.
+        node_modules_status = "not-required"
+        node_modules_target = ""
     else:
         node_modules_status = "missing"
         node_modules_target = ""

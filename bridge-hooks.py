@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import shlex
 import subprocess
@@ -28,6 +29,14 @@ from bridge_iso_paths import (  # noqa: E402
     safe_path_check as _safe_path_check,
     safe_read_env as _safe_read_env,
     safe_load_json as _safe_load_json,
+    # Phase 2 lift: pull the canonical realpath + ensure_dir helpers
+    # from the shared module. The local `_safe_realpath` and
+    # `_ensure_dir_with_sudo` wrappers below now delegate to these
+    # canonical names instead of re-implementing the sudo + fallback
+    # logic. A future bug fix on either side lands in ONE place
+    # (lib/bridge_iso_paths.py) rather than both files at once.
+    safe_realpath as _safe_realpath_canonical,
+    ensure_dir as _ensure_dir_canonical,
 )
 
 
@@ -73,6 +82,36 @@ def resolve_managed_autocompact_window(
 
 
 def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str, Any]:
+    # Issue #1212: previously this filter required every plugin spec to
+    # end with `@agent-bridge`, which silently dropped every third-party
+    # marketplace plugin (e.g. `plugin:cosmax-crm@cosmax-crm-marketplace`)
+    # from `enabledPlugins`. The plugin still loaded via the
+    # `--dangerously-load-development-channels` argv (so tools registered)
+    # but Claude Code's plugin runtime did not load its `hooks/hooks.json`
+    # — SessionStart hooks never fired. For `cosmax-crm` this is
+    # silent-fatal because its `.mcp.json` ships with a `Bearer
+    # __CRM_TOKEN_PLACEHOLDER__` that the SessionStart hook substitutes
+    # at startup; without the hook the placeholder reaches the server
+    # and the HTTP MCP handshake fails auth with 0 tools.
+    #
+    # The new filter accepts any `plugin:<name>@<marketplace>` spec
+    # (both sides non-empty, `@` as separator). For each accepted spec
+    # we also collect its marketplace id and emit an
+    # `extraKnownMarketplaces` entry pointing at the controller-side
+    # mirror under `$BRIDGE_HOME/data/shared/plugins-cache/marketplaces/<id>`
+    # — seeded by `bridge_plugins_seed_mirror_marketplace_root` (#1201/#1202).
+    #
+    # Safety guards before emitting a third-party marketplace entry:
+    #   - marketplace id is non-empty
+    #   - marketplace id matches `[A-Za-z0-9._-]+` (no `/` or other
+    #     filesystem separators)
+    #   - marketplace id is not `.` or `..` (no parent-traversal)
+    #   - resolved mirror dir is a real directory under the marketplaces
+    #     root (`is_dir()`).
+    # When any guard fails, the marketplace entry is skipped but the
+    # plugin stays in `enabledPlugins` (Claude's dev-channels argv still
+    # loads the plugin from disk; we just decline to materialize a
+    # marketplace identity for it).
     if not launch_cmd:
         return {}
     try:
@@ -82,6 +121,8 @@ def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str
 
     plugin_specs: list[str] = []
     seen: set[str] = set()
+    marketplace_ids: list[str] = []
+    marketplace_seen: set[str] = set()
     index = 0
     while index < len(tokens):
         token = tokens[index]
@@ -95,13 +136,24 @@ def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str
         else:
             index += 1
             continue
-        if not value.startswith("plugin:") or not value.endswith("@agent-bridge"):
+        # Accept only `plugin:<spec>` where spec contains `@` and both
+        # sides are non-empty. `rsplit("@", 1)` so the marketplace id is
+        # always the rightmost segment (defensive against a plugin name
+        # that itself contains `@`, even though current naming forbids
+        # it).
+        if not value.startswith("plugin:") or "@" not in value:
             continue
         spec = value[len("plugin:") :]
+        plugin_name, _sep, marketplace_id = spec.rpartition("@")
+        if not plugin_name or not marketplace_id:
+            continue
         if spec in seen:
             continue
         seen.add(spec)
         plugin_specs.append(spec)
+        if marketplace_id not in marketplace_seen:
+            marketplace_seen.add(marketplace_id)
+            marketplace_ids.append(marketplace_id)
 
     if not plugin_specs:
         return {}
@@ -109,16 +161,48 @@ def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str
     bridge_home = os.environ.get("BRIDGE_HOME", "").strip()
     if not bridge_home:
         bridge_home = str(Path(__file__).resolve().parent)
+
+    marketplaces: dict[str, Any] = {
+        "agent-bridge": {
+            "source": {
+                "source": "directory",
+                "path": bridge_home,
+            }
+        }
+    }
+    # Third-party marketplace mirrors live under
+    # `$BRIDGE_HOME/data/shared/plugins-cache/marketplaces/<id>` — the
+    # same mirror root `bridge_plugins_seed_mirror_marketplace_root`
+    # writes to and `bridge_known_marketplace_info` reads from
+    # (lib/bridge-agents.sh:1664). Resolve relative to `bridge_home`
+    # but apply safety guards before trusting the id as a path segment.
+    marketplaces_root = Path(bridge_home) / "data" / "shared" / "plugins-cache" / "marketplaces"
+    safe_id_re = re.compile(r"^[A-Za-z0-9._-]+$")
+    for mkt_id in marketplace_ids:
+        if mkt_id == "agent-bridge":
+            continue
+        if not mkt_id or mkt_id in {".", ".."}:
+            continue
+        if not safe_id_re.match(mkt_id):
+            continue
+        candidate = marketplaces_root / mkt_id
+        try:
+            is_dir = candidate.is_dir()  # noqa: raw-pathlib-controller-only — controller-side mirror lookup; iso UID never reaches this code
+        except OSError:
+            is_dir = False
+        if not is_dir:
+            # Skip the marketplace entry but keep the plugin enabled —
+            # the dev-channels argv still loads the plugin from disk.
+            continue
+        marketplaces[mkt_id] = {
+            "source": {
+                "source": "directory",
+                "path": str(candidate),
+            }
+        }
     return {
         "enabledPlugins": {spec: True for spec in plugin_specs},
-        "extraKnownMarketplaces": {
-            "agent-bridge": {
-                "source": {
-                    "source": "directory",
-                    "path": bridge_home,
-                }
-            }
-        },
+        "extraKnownMarketplaces": marketplaces,
     }
 
 
@@ -184,7 +268,7 @@ def load_json(path: Path) -> Any:
 
 
 def save_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-owned hook scaffold; iso-routed callers stage via _ensure_dir_with_sudo upstream
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -926,7 +1010,7 @@ def cmd_status_codex_hooks(args: argparse.Namespace) -> int:
 def cmd_ensure_codex_hooks(args: argparse.Namespace) -> int:
     bridge_home = Path(args.bridge_home).expanduser()
     hooks_path = codex_hooks_path(args)
-    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — codex hooks live under ~/.codex (controller-owned), not under isolated agent tree
     session_command = session_start_hook_command(bridge_home, args.python_bin, "codex")
     stop_command = codex_stop_hook_command(bridge_home, args.python_bin)
     prompt_command = prompt_timestamp_hook_command(bridge_home, args.python_bin, "codex")
@@ -1191,7 +1275,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     agent_class = (getattr(args, "agent_class", "") or "") or None
 
     target_dir = isolated_home / ".claude"
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — render flow runs sudo-backed externally when the isolated home denies controller writes
     effective_path = target_dir / "settings.effective.json"
     settings_link = target_dir / "settings.json"
 
@@ -1264,7 +1348,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # 3. Atomic write of the effective file (mode 0644 so the isolated UID
     # can read it; ownership stays with whoever invoked us — controller
     # under the normal start path, root under sudo-backed reapply).
-    effective_path.parent.mkdir(parents=True, exist_ok=True)
+    effective_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — already-staged by target_dir.mkdir above; sudo-backed reapply caller has write access
     tmp = effective_path.with_suffix(effective_path.suffix + ".tmp")
     # E2E test on Ubuntu 24.04 VM (2026-05-16) caught a race: under
     # concurrent bootstrap (bridge-bootstrap.sh) + patch first-start +
@@ -1287,7 +1371,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         # Race window — parent dir got nuked between mkdir and replace,
         # or tmp got removed by a sibling cleanup. Retry once.
-        effective_path.parent.mkdir(parents=True, exist_ok=True)
+        effective_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — retry of the upstream mkdir; same sudo-backed-reapply contract
         try:
             _atomic_write_effective()
         except FileNotFoundError as exc:
@@ -1309,8 +1393,8 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # cannot proceed without write access; the safe-probe was only
     # there to avoid raising on the read probe).
     if _safe_path_check("is_symlink", settings_link, _settings_link_owner) or _safe_path_check("exists", settings_link, _settings_link_owner):
-        settings_link.unlink()
-    settings_link.symlink_to("settings.effective.json")
+        settings_link.unlink()  # noqa: raw-pathlib-controller-only — gated by safe_path_check above; symlink/unlink need direct write access by design (sudo-backed reapply caller has it)
+    settings_link.symlink_to("settings.effective.json")  # noqa: raw-pathlib-controller-only — paired with the .unlink() above; needs direct write access on the isolated home, sudo-backed reapply caller has it (see #1178 r2)
 
     payload = {
         "isolated_home": str(isolated_home),
@@ -1337,60 +1421,26 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
 
 
 def _ensure_dir_with_sudo(path: Path, os_user: str | None) -> None:
-    # #1120 sub-A: function name promised sudo escalation but the body
-    # only reached sudo AFTER a controller-direct `path.mkdir(...)`
-    # raised PermissionError. On v2 isolation the parent dir
-    # (`<v2-root>/<agent>/` is `root:ab-agent-<slug> 2750`) blocks
-    # controller writes, so the direct mkdir always raised and the
-    # caller printed a Python traceback before the sudo fallback even
-    # got a chance to silence it on its own line.
-    #
-    # Contract:
-    #   - If `os_user` is None, attempt a best-effort recovery via
-    #     `_isolated_workdir_owner(path)`. Callers that don't already
-    #     know the isolation owner (e.g. callers that derive the path
-    #     from a configuration field without consulting the workdir
-    #     stat) can pass None and still get sudo-first routing on
-    #     isolated trees. Returns None on non-Linux hosts and on
-    #     controller-owned paths, in which case the function preserves
-    #     the original controller-direct `mkdir` shape — byte-for-byte
-    #     unchanged for shared-mode agents.
-    #   - If `os_user` resolves to a name that is NOT the current
-    #     process user, route through `sudo -n -u <os_user> mkdir -p
-    #     <path>` FIRST. The isolated UID owns
-    #     `<v2-root>/<agent>/workdir/` (mode 2770) so creating
-    #     `<workdir>/.claude/` under it succeeds without controller
-    #     intervention. On success, return cleanly (no PermissionError
-    #     raised at all → no traceback).
-    #   - If sudo escalation is unavailable (`_sudo_run_as` rc 127,
-    #     non-Linux dev host) or fails (typically because an ancestor
-    #     dir denies group write — e.g. `<v2-root>/<agent>/` mode 2750
-    #     where the iso UID is in the group but cannot write, the
-    #     #1145 shape), fall back to a controller-direct
-    #     `path.mkdir(parents=True, exist_ok=True)`. On v2 isolation
-    #     that controller-direct mkdir will itself fail with
-    #     PermissionError — re-raise so the caller sees a real error
-    #     rather than silent partial state. The caller is responsible
-    #     for try/except OSError to surface a structured warning
-    #     (#1145, #1119 / PR #1124 pattern).
+    """`mkdir -p` with isolation awareness.
+
+    Phase 2: the sudo-first / controller-direct fallback logic moved
+    to `bridge_iso_paths.ensure_dir`. This wrapper preserves the
+    hooks-side contract where callers can pass `os_user=None` and
+    expect a best-effort `_isolated_workdir_owner(path)` recovery
+    BEFORE delegation. The canonical helper takes the resolved owner
+    as input — pre-Phase 2 the resolution happened inside the local
+    helper, which made it impossible to share with bridge-setup.py
+    (whose `_isolation_aware_mkdir` does its own
+    `_resolve_isolated_owner_for_path` walk upstream).
+
+    Behavior unchanged: on a v2 isolation tree the sudo-first route
+    succeeds without raising; on a controller-owned tree the direct
+    `mkdir` runs. PermissionError on the controller-direct fallback
+    propagates so callers can structure-warn.
+    """
     if os_user is None:
         os_user = _isolated_workdir_owner(path)
-    current_user = ""
-    try:
-        import pwd
-        current_user = pwd.getpwuid(os.getuid()).pw_name
-    except (KeyError, ImportError):
-        current_user = ""
-    if os_user is not None and os_user != current_user:
-        rc = _sudo_run_as(os_user, "mkdir", "-p", str(path))
-        if rc == 0:
-            return
-        # Fall through to controller-direct attempt. This succeeds when
-        # the path is actually controller-owned (mis-detection of iso
-        # ownership via a group-only signature on a controller-owned
-        # tree, etc.). When it fails with PermissionError we let it
-        # propagate — better surface a real error than fail silently.
-    path.mkdir(parents=True, exist_ok=True)
+    _ensure_dir_canonical(path, os_user)
 
 
 # #1175: `_safe_path_check` moved to `lib/bridge_iso_paths.py`
@@ -1407,26 +1457,14 @@ def _ensure_dir_with_sudo(path: Path, os_user: str | None) -> None:
 def _safe_realpath(path: Path, os_user: str | None) -> str:
     """PermissionError-safe `os.path.realpath` for isolated workdirs.
 
-    Companion to `_safe_path_check`. `os.path.realpath` resolves symlinks
-    by stat-ing each component; on an isolated workdir the controller
-    can hit PermissionError mid-resolution. Fall back to
-    `sudo -n -u <agent-user> readlink -f`. Returns the original path
-    string when the sudo fallback also fails (best-effort — the caller
-    compares two realpaths for equality, so falling back to the raw
-    string just forces the "not equal" branch and re-creates the link).
+    Phase 2: thin delegating wrapper around
+    `bridge_iso_paths.safe_realpath`. The canonical implementation
+    lives in `lib/bridge_iso_paths.py` so a fix to the sudo-fallback
+    shape lands in ONE place. Kept here under the historical private
+    name so existing call sites and any local stub harnesses work
+    unchanged.
     """
-    try:
-        return os.path.realpath(path)
-    except PermissionError:
-        if os_user is None:
-            raise
-        result = subprocess.run(
-            ["sudo", "-n", "-u", os_user, "readlink", "-f", str(path)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip() or str(path)
+    return _safe_realpath_canonical(path, os_user)
 
 
 def cmd_link_shared_settings(args: argparse.Namespace) -> int:
@@ -1482,7 +1520,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
                 status = "unchanged"
             else:
                 try:
-                    settings_path.unlink()
+                    settings_path.unlink()  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo rm fallback below
                 except PermissionError:
                     if os_user is None:
                         raise
@@ -1493,7 +1531,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
         elif _safe_path_check("exists", settings_path, os_user):
             backup = next_backup_path(settings_path, os_user)
             try:
-                shutil.copy2(settings_path, backup)
+                shutil.copy2(settings_path, backup)  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo cp -p fallback below
             except PermissionError:
                 if os_user is None:
                     raise
@@ -1501,7 +1539,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
                 if rc != 0:
                     raise
             try:
-                settings_path.unlink()
+                settings_path.unlink()  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo rm fallback below
             except PermissionError:
                 if os_user is None:
                     raise
@@ -1516,7 +1554,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
         if not _safe_path_check("exists", settings_path, os_user):
             rel_target = os.path.relpath(shared_path, start=settings_path.parent)
             try:
-                settings_path.symlink_to(rel_target)
+                settings_path.symlink_to(rel_target)  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo ln fallback below (mirrors the .unlink() pattern at line 1504, see #1178 r2)
             except PermissionError:
                 if os_user is None:
                     raise

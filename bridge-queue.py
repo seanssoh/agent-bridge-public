@@ -361,6 +361,168 @@ def is_ephemeral_body_path(path: Path) -> bool:
     return False
 
 
+def _audit_body_file_sudo_fallback(
+    body_path: Path,
+    iso_uid: str,
+    success: bool,
+    rc: int | None,
+    call_site: str,
+    exception: BaseException | None = None,
+) -> None:
+    """Emit a ``body_file_sudo_fallback`` audit row (Lane J r2 SHOULD-FIX
+    + r3 schema alignment).
+
+    OPERATIONS.md §"Iso v2 agent troubleshooting" promises operators
+    that the sudo-fallback path is observable via
+    ``grep body_file_sudo_fallback state/audit.jsonl``. Before this
+    commit the read path was silent; the runbook claim was a
+    docs/impl mismatch (codex r1 SHOULD-FIX on PR #1293). We emit
+    here so a follow-up "but did the fallback actually run?"
+    question has a structured answer.
+
+    Lane J r3 (codex r2 SHOULD-FIX): align the row schema with the
+    brief — the per-agent OS user field is named ``iso_uid`` (not
+    ``owner``) and exception branches log ``exception`` +
+    ``exception_type`` so the operator sees WHY the fallback failed,
+    not just an empty ``rc``.
+
+    Best-effort: any failure to emit (missing bridge-audit.py, missing
+    python interpreter, locked log file) is swallowed silently. The
+    caller path is not gated on audit success — surfacing the audit
+    write as an error would defeat the resilience the fallback is
+    trying to provide in the first place.
+    """
+    audit_path = (
+        os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+        or os.path.expanduser(os.path.join(
+            os.environ.get("BRIDGE_HOME", "").strip() or "~/.agent-bridge",
+            "logs",
+            "audit.jsonl",
+        ))
+    )
+    detail = {
+        "file_path": str(body_path),
+        "iso_uid": iso_uid,
+        "fallback_method": "sudo-read",
+        "success": success,
+        "rc": rc if rc is not None else "",
+        "call_site": call_site,
+    }
+    if exception is not None:
+        detail["exception"] = str(exception)
+        detail["exception_type"] = type(exception).__name__
+    audit_script = Path(__file__).resolve().with_name("bridge-audit.py")
+    if not audit_script.is_file():
+        return
+    cmd = [
+        sys.executable,
+        str(audit_script),
+        "write",
+        "--file",
+        audit_path,
+        "--actor",
+        "bridge-queue",
+        "--action",
+        "body_file_sudo_fallback",
+        "--target",
+        str(body_path),
+        "--detail-json",
+        json.dumps(detail, ensure_ascii=True, sort_keys=True),
+    ]
+    try:
+        Path(audit_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    try:
+        subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _sudo_read_body_file(path: Path) -> bytes | None:
+    """v0.15.0-beta4 Lane J (#1280): sudo-fallback body-file reader.
+
+    On iso v2 hosts the body file may be owned by an isolated UID
+    (``agent-bridge-<a>``, mode 0660 ``ab-agent-<a>``) while the
+    controller's bridge-queue.py process runs as the controller UID
+    without group membership. Direct ``source.read_bytes()`` then
+    raises ``PermissionError``. The pre-existing controller<->iso
+    boundary is ``sudo -n -u <owner> cat <path>`` (see
+    ``lib/bridge-isolation-helpers.sh``): the controller has
+    passwordless sudo to drop to ``agent-bridge-*`` for read-only
+    helper ops on iso v2 hosts.
+
+    Returns the file bytes on success, ``None`` on any failure
+    (sudo missing, file owner not in the ``agent-bridge-*`` namespace,
+    stat refuses, subprocess errors). Caller falls back to the original
+    ``PermissionError`` surface so the operator sees a clear failure
+    rather than a silent empty body.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    try:
+        import pwd as _pwd  # POSIX only; not present on Windows
+        ent = _pwd.getpwuid(st.st_uid)
+    except (KeyError, ImportError, OSError):
+        return None
+    owner = ent.pw_name
+    # Only attempt the fallback when the owner is an isolated agent UID.
+    # The prefix is configurable via BRIDGE_AGENT_OS_USER_PREFIX but
+    # defaults to ``agent-bridge-`` everywhere else in the codebase.
+    prefix = os.environ.get("BRIDGE_AGENT_OS_USER_PREFIX", "agent-bridge-")
+    if not owner.startswith(prefix):
+        return None
+    # Refuse to attempt sudo when we already are that UID — direct read
+    # should have worked; if it didn't, sudo will not save us.
+    try:
+        if os.geteuid() == st.st_uid:
+            return None
+    except OSError:
+        return None
+    # Resolve sudo via PATH first so smoke harnesses can stub the binary
+    # without permission to write under /usr/bin. Falls back to the
+    # canonical /usr/bin/sudo when PATH lookup fails (e.g. cron context
+    # with a minimal PATH).
+    import shutil
+    sudo_bin = shutil.which("sudo") or "/usr/bin/sudo"
+    if not Path(sudo_bin).is_file():
+        return None
+    try:
+        result = subprocess.run(
+            [sudo_bin, "-n", "-u", owner, "cat", "--", str(path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=None,
+            call_site="bridge-queue.stabilize_body_file",
+            exception=exc,
+        )
+        return None
+    if result.returncode != 0:
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=result.returncode,
+            call_site="bridge-queue.stabilize_body_file",
+        )
+        return None
+    _audit_body_file_sudo_fallback(
+        path, owner, success=True, rc=0,
+        call_site="bridge-queue.stabilize_body_file",
+    )
+    return result.stdout
+
+
 def stabilize_body_file(original: str | None) -> tuple[str | None, str | None]:
     if not original:
         return None, None
@@ -370,6 +532,20 @@ def stabilize_body_file(original: str | None) -> tuple[str | None, str | None]:
         raw = source.read_bytes()
     except FileNotFoundError as exc:
         raise SystemExit(f"body file disappeared before read: {original}") from exc
+    except PermissionError as exc:
+        # Issue #1280 (v0.15.0-beta4 Lane J): iso UID-owned body file
+        # at mode 0660 cannot be read directly by the controller
+        # because group membership is not enough on some POSIX hosts
+        # (the controller UID is in ``ab-agent-<a>`` for some agents
+        # but not all). Try the sudo-as-owner fallback before failing.
+        fallback = _sudo_read_body_file(source)
+        if fallback is None:
+            raise SystemExit(
+                f"failed to read body file {original}: {exc} "
+                f"(iso UID may own this file; chmod 0644 or run "
+                f"`sudo -u <owner> cat {original}` to verify access)"
+            ) from exc
+        raw = fallback
     except OSError as exc:
         raise SystemExit(f"failed to read body file {original}: {exc}") from exc
 
@@ -984,6 +1160,11 @@ def cmd_claim(args: argparse.Namespace) -> int:
     lease_seconds = int(args.lease_seconds)
     current_ts = now_ts()
     lease_until_ts = current_ts + lease_seconds
+    # Issue #1253 — optional --note / --note-file mirror `done` / `update`
+    # so claim-time audit context lands in the task_events log alongside
+    # the canonical `event_type=claimed` row.
+    note_text = getattr(args, "note", None)
+    note_path = normalize_path(getattr(args, "note_file", None))
 
     with closing(connect()) as conn, conn:
         task = require_task(conn, args.task_id)
@@ -1013,10 +1194,27 @@ def cmd_claim(args: argparse.Namespace) -> int:
             """,
             (agent, current_ts, lease_until_ts, current_ts, args.task_id),
         )
-        emit_event(conn, args.task_id, event_type="claimed", actor=agent, created_ts=current_ts, to_agent=agent)
+        emit_event(
+            conn,
+            args.task_id,
+            event_type="claimed",
+            actor=agent,
+            created_ts=current_ts,
+            note_text=note_text,
+            note_path=note_path,
+            to_agent=agent,
+        )
         touch_agent_activity(conn, agent, current_ts)
 
-    print(f"claimed task #{args.task_id} as {agent} (lease={lease_seconds}s)")
+    # Echo a short `claim_note=<n-chars>` summary on stdout so scripts /
+    # operator-readable transcripts can confirm the note actually landed
+    # in the event log (per #1253 acceptance criteria).
+    note_summary = ""
+    if note_text is not None:
+        note_summary = f" claim_note={len(note_text)}c"
+    elif note_path:
+        note_summary = f" claim_note=file:{note_path}"
+    print(f"claimed task #{args.task_id} as {agent} (lease={lease_seconds}s){note_summary}")
     return 0
 
 
@@ -1957,15 +2155,45 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
             )
 
         # --- Compute idle agents (used by both cron dedup and stale requeue) ---
+        # Issue #1345 r2 (Lane κ v0.15.0-beta5-2, codex r1 BLOCKING):
+        # exclude `picker_blocked` and `working` agents from the idle
+        # set. Before the fix, the gate was active + session_activity_ts
+        # age only. A picker_blocked agent (claude rate-limit / summary
+        # picker) typically has tmux activity_ts aged past
+        # --idle-threshold (the picker dialog itself does not refresh
+        # the activity_ts), so the stale-claim requeue at :2242-2285
+        # below wrongly requeued the agent's claimed task with the note
+        # "claimed for >Ns by idle agent". The agent then re-claimed
+        # the requeued task on its next wake — burning a tool turn for
+        # nothing. The daemon-step snapshot writer
+        # (lib/bridge-state.sh:bridge_write_agent_snapshot) now emits
+        # `activity_state="picker_blocked"` for agents matching the
+        # stall.env predicate. `working` is included defensively: it
+        # is not currently emitted by the daemon-step writer (only
+        # the roster/status writer computes it via a tmux capture),
+        # but if a future change pulls the full classification into
+        # the daemon path, the exclusion stays correct.
+        #
+        # Backwards compat: legacy snapshots without the
+        # `activity_state` column return "" from .get(), which is not
+        # in the exclusion set — preserves pre-fix idle classification
+        # for the upgrade window between the bash + python halves.
         max_claim_age = int(getattr(args, "max_claim_age", 900))
         idle_agents = set()
         active_agents = set()
+        _idle_excluded_states = {"picker_blocked", "working"}
         for row in snapshot_rows:
             active = 1 if str(row.get("active", "0")) == "1" else 0
             activity_ts = int(row.get("session_activity_ts") or 0)
+            activity_state = str(row.get("activity_state") or "")
             if active:
                 active_agents.add(str(row["agent"]))
-            if active and activity_ts and current_ts - activity_ts >= idle_threshold:
+            if (
+                active
+                and activity_ts
+                and current_ts - activity_ts >= idle_threshold
+                and activity_state not in _idle_excluded_states
+            ):
                 idle_agents.add(str(row["agent"]))
 
         # --- Cron-dispatch dedup ---
@@ -2421,6 +2649,12 @@ def build_parser() -> argparse.ArgumentParser:
     claim_parser.add_argument("task_id", type=int)
     claim_parser.add_argument("--agent", required=True)
     claim_parser.add_argument("--lease-seconds", default=os.environ.get("BRIDGE_TASK_LEASE_SECONDS", "900"))
+    # Issue #1253 — symmetric with `done` / `update`. --note and --note-file
+    # are mutually exclusive so the operator never accidentally double-
+    # specifies the audit text.
+    claim_note_group = claim_parser.add_mutually_exclusive_group()
+    claim_note_group.add_argument("--note")
+    claim_note_group.add_argument("--note-file")
     claim_parser.set_defaults(handler=cmd_claim)
 
     done_parser = subparsers.add_parser("done", allow_abbrev=False)

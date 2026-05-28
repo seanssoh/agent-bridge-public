@@ -163,6 +163,163 @@ bridge_cron_scheduler_state_file() {
   printf '%s/scheduler-state.json' "$BRIDGE_CRON_STATE_DIR"
 }
 
+# Issue #1328 (v0.15.0-beta5-2 Lane μ M5): cron-state-dir anchor + migrate.
+#
+# The cron state dir holds scheduler state, per-job dispatch directories,
+# per-run artifacts, locks, and the preflight cache. When the operator (or
+# an upgrade path) changes `BRIDGE_CRON_STATE_DIR` — typically by relocating
+# `BRIDGE_STATE_DIR`, by removing an `BRIDGE_CRON_STATE_DIR` env override,
+# or by editing `bridge-config.json` — the scheduler silently starts writing
+# to the new location, leaving the old location stranded with no migration
+# step. Symptoms: deduplication state lost, in-flight runs orphaned, cron
+# history gone from `agent-bridge status`.
+#
+# The anchor file records the last cron-state-dir path the helper observed.
+# On every cron entry path that opens the state dir, the verify helper
+# compares the recorded anchor against the live env and migrates (mv) the
+# old tree to the new location ONLY when the old path is non-empty AND the
+# new path is empty / absent (the safe single-source case).
+#
+# Edge-case matrix:
+#   1. First run / no anchor present
+#       → write the anchor, no migration. fresh-install no-op.
+#   2. Anchor matches current env
+#       → no-op (the common steady-state case).
+#   3. Anchor differs, old exists with content, new missing or empty
+#       → mv old → new, rewrite anchor, audit `cron_state_dir_migrated`.
+#         This is the upgrade-driven relocation case.
+#   4. Anchor differs, old missing
+#       → rewrite the anchor silently (operator already migrated, or
+#         the old path was never populated).
+#   5. Anchor differs, BOTH old and new exist with content (edge case 4)
+#       → bail with an operator-visible warning and audit
+#         `cron_state_dir_conflict`. DO NOT merge automatically — that
+#         risks silently dropping run history.
+#   6. Operator explicitly relocated the dir themselves (edge case 3)
+#       → covered by case 5 when both still have content (warn). When the
+#         operator left only the new dir populated, case 4 silently
+#         resyncs the anchor — respect the override.
+#
+# The helper is idempotent (case 2 / 4 / 6 all short-circuit), single-host
+# only (no remote state to reconcile), and best-effort: a failure to write
+# the anchor never breaks cron — it just means the next run will re-check.
+bridge_cron_state_dir_anchor_file() {
+  printf '%s/cron-state-dir-anchor.txt' "${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+}
+
+# bridge_cron_state_dir_dir_has_content <dir>
+#
+# Echoes "yes" / "no" based on whether the directory has any cron-state
+# artifacts that would matter to a migration decision. Treats a directory
+# with only the anchor file (or no children at all) as empty so a fresh
+# `$BRIDGE_CRON_STATE_DIR` that was just `mkdir -p`'d does not trip the
+# conflict gate. Internal helper.
+bridge_cron_state_dir_dir_has_content() {
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir" ]] || { printf 'no\n'; return 0; }
+  # `find -mindepth 1 -maxdepth 1 -print -quit` exits as soon as it sees
+  # one child, so this stays O(1) on a large state tree.
+  local first=""
+  first="$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || printf '')"
+  if [[ -n "$first" ]]; then
+    printf 'yes\n'
+  else
+    printf 'no\n'
+  fi
+}
+
+# bridge_cron_state_dir_verify_and_migrate
+#
+# Idempotent verifier called from cron entry paths (notably `run_sync`).
+# Returns 0 always — caller never gates on the rc. Operator-visible side
+# effects:
+#   - audit emission via `bridge_audit_log` (best-effort).
+#   - `bridge_warn` line for the conflict case.
+bridge_cron_state_dir_verify_and_migrate() {
+  local anchor_file=""
+  local recorded=""
+  local current="${BRIDGE_CRON_STATE_DIR:-}"
+  [[ -n "$current" ]] || return 0
+
+  anchor_file="$(bridge_cron_state_dir_anchor_file)"
+  local anchor_dir=""
+  anchor_dir="$(dirname "$anchor_file" 2>/dev/null || printf '')"
+  # Ensure the anchor's parent dir exists so the first-run write below
+  # never fails on a fresh install. Best-effort — silent on perm error.
+  [[ -n "$anchor_dir" && -d "$anchor_dir" ]] || mkdir -p "$anchor_dir" 2>/dev/null || true
+
+  if [[ -f "$anchor_file" ]]; then
+    recorded="$(cat "$anchor_file" 2>/dev/null | head -n1)"
+    # Strip trailing whitespace (CR / LF / space) defensively — an
+    # operator who edits the file in a text editor may add a newline.
+    recorded="${recorded%$'\r'}"
+  fi
+
+  # Case 1: no anchor yet (fresh install or first run after this change
+  # landed). Record current path; no migration.
+  if [[ -z "$recorded" ]]; then
+    printf '%s\n' "$current" >"$anchor_file" 2>/dev/null || true
+    return 0
+  fi
+
+  # Case 2: anchor matches → no-op.
+  if [[ "$recorded" == "$current" ]]; then
+    return 0
+  fi
+
+  # Anchor differs. Probe both paths.
+  local old_has="no"
+  local new_has="no"
+  old_has="$(bridge_cron_state_dir_dir_has_content "$recorded")"
+  new_has="$(bridge_cron_state_dir_dir_has_content "$current")"
+
+  # Case 5: both have content → bail with conflict warning. Operator
+  # must resolve manually before we touch either tree.
+  if [[ "$old_has" == "yes" && "$new_has" == "yes" ]]; then
+    bridge_warn "cron state dir conflict: anchor=${recorded} (non-empty) AND BRIDGE_CRON_STATE_DIR=${current} (non-empty). Refusing automatic migration. Reconcile manually and update ${anchor_file}, or unset \$BRIDGE_CRON_STATE_DIR to fall back to the canonical path."
+    if declare -F bridge_audit_log >/dev/null 2>&1; then
+      bridge_audit_log cron cron_state_dir_conflict "${BRIDGE_AGENT_ID:-controller}" \
+        --detail recorded="$recorded" \
+        --detail current="$current" \
+        --detail anchor_file="$anchor_file" 2>/dev/null || true
+    fi
+    return 0
+  fi
+
+  # Case 3: old has content, new is empty/absent → safe to migrate.
+  if [[ "$old_has" == "yes" && "$new_has" == "no" ]]; then
+    # Ensure the parent of $current exists so `mv` lands cleanly.
+    local current_parent=""
+    current_parent="$(dirname "$current" 2>/dev/null || printf '')"
+    [[ -n "$current_parent" && -d "$current_parent" ]] || mkdir -p "$current_parent" 2>/dev/null || true
+    # If the new path already exists as an empty dir, mv would fail
+    # because the target is occupied. Remove the empty target first
+    # (rmdir refuses if non-empty — safety net against the
+    # has_content "no" → empty stub case).
+    if [[ -d "$current" ]]; then
+      rmdir "$current" 2>/dev/null || true
+    fi
+    if mv "$recorded" "$current" 2>/dev/null; then
+      printf '%s\n' "$current" >"$anchor_file" 2>/dev/null || true
+      if declare -F bridge_audit_log >/dev/null 2>&1; then
+        bridge_audit_log cron cron_state_dir_migrated "${BRIDGE_AGENT_ID:-controller}" \
+          --detail from="$recorded" \
+          --detail to="$current" \
+          --detail anchor_file="$anchor_file" 2>/dev/null || true
+      fi
+      bridge_warn "cron state dir migrated: $recorded → $current (anchor refreshed)"
+      return 0
+    fi
+    bridge_warn "cron state dir migrate failed: mv $recorded → $current returned non-zero. Anchor unchanged so the next run re-attempts; reconcile manually if this persists."
+    return 0
+  fi
+
+  # Case 4 / 6: old missing, or operator already moved → silently
+  # refresh the anchor to the current path. No migration needed.
+  printf '%s\n' "$current" >"$anchor_file" 2>/dev/null || true
+  return 0
+}
+
 bridge_cron_safe_component() {
   local value="$1"
 
@@ -604,6 +761,216 @@ bridge_cron_normalize_shell_run_artifacts() {
     [[ -n "$file" && -e "$file" ]] || continue
     chmod 0600 "$file" >/dev/null 2>&1 || true
   done
+}
+
+# bridge_cron_uid_drop_cache_dir
+#
+# Cache directory for `bridge_cron_uid_drop_preflight` per-agent TTL entries.
+# Lives under the cron state root so a smoke `BRIDGE_CRON_STATE_DIR` override
+# isolates the cache from the operator's live install.
+bridge_cron_uid_drop_cache_dir() {
+  printf '%s/preflight-uid-drop' "$BRIDGE_CRON_STATE_DIR"
+}
+
+# bridge_cron_uid_drop_cache_file <agent>
+#
+# Cache key includes the value of BRIDGE_CRON_USE_SETPRIV (0/1) as a suffix
+# so a flag toggle naturally invalidates the prior entry — e.g. if the
+# operator opts setpriv in (=1) after a refusal under =0, the next preflight
+# does NOT serve the stale "refuse" decision from the wrong-policy cache.
+# Each policy gets its own cache slot; both decay via the same TTL.
+bridge_cron_uid_drop_cache_file() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  local flag_suffix="0"
+  if [[ "${BRIDGE_CRON_USE_SETPRIV:-0}" == "1" ]]; then
+    flag_suffix="1"
+  fi
+  printf '%s/%s.setpriv%s.cache' "$(bridge_cron_uid_drop_cache_dir)" "$(bridge_cron_safe_component "$agent")" "$flag_suffix"
+}
+
+# bridge_cron_uid_drop_preflight <agent>
+#
+# Issue #1314 (CRITICAL/security): the runner-internal `RuntimeError("no
+# supported UID drop helper found (sudo or setpriv)")` at
+# bridge-cron-runner.py:481 is a last-resort seal. Without a pre-flight
+# validation at dispatch time, a sudo/setpriv-misconfigured environment can
+# allow the dispatch to proceed with the controller UID — a security boundary
+# bypass for iso v2 agents.
+#
+# This helper mirrors the EXACT runner shape used by
+# `shell_command_for_execution` (bridge-cron-runner.py:463-481) so a sudoers
+# rule that allows `sudo` but rejects the precise `-n -H -u <user> env -i`
+# argv shape is caught here, not at exec time. Mirrors Lane F #1290 sudoers-
+# template precedent: shape-matching beats existence-matching.
+#
+# Result band:
+#   0 — UID drop validated for this agent. Caller may proceed with dispatch.
+#       (Non-iso agents and non-Linux hosts short-circuit to 0 — controller
+#        UID is the expected execution UID there, so no drop is required.)
+#   1 — Pre-flight refuses. Iso v2 effective AND no working UID-drop helper
+#       (sudo invocation in the exact runner shape fails AND setpriv missing).
+#       Caller MUST refuse to dispatch and emit
+#       `cron_dispatch_refused reason=iso_uid_drop_unavailable`.
+#
+# TTL cache (default 300s, override BRIDGE_CRON_UID_DROP_PREFLIGHT_TTL_SECONDS):
+# per-agent file storing `<expires_at_epoch>\t<result>`. The shell-cron
+# dispatch path runs at every cron tick (potentially every minute on a busy
+# host), so a per-dispatch `sudo -n` probe would add measurable latency. The
+# TTL cache amortizes the probe cost while staying short enough that a
+# sudoers/setpriv repair is reflected within 5 minutes.
+#
+# Cache invalidation: a 0-byte / malformed / expired entry is treated as
+# absent — the helper re-probes and rewrites. The cache is NEVER consulted
+# for `force=1` (the smoke entry point uses this). The cache file name also
+# includes the `BRIDGE_CRON_USE_SETPRIV` flag value (0/1) as a suffix so a
+# flag toggle naturally invalidates the prior decision — opting setpriv in
+# after a refusal under =0 starts at a fresh cache slot.
+#
+# setpriv opt-in (BRIDGE_CRON_USE_SETPRIV, default 0): when sudo fails AND
+# setpriv exists, pre-flight refuses unless the operator has explicitly
+# asserted `BRIDGE_CRON_USE_SETPRIV=1`. The runner (bridge-cron-runner.py
+# :492-498) gates its own setpriv branch on the same env var, so both
+# layers agree on policy. Auto-selecting setpriv would mask a sudoers
+# misconfig with an exec-time EPERM; opt-in keeps the security boundary
+# explicit. When BOTH sudo+setpriv are available and the flag is 1, sudo
+# wins (canonical iso v2 path).
+#
+# Edge cases (mirrors brief):
+#   - Non-iso agent (BRIDGE_AGENT_OS_USER empty / Linux-isolation-not-
+#     effective) → return 0 immediately; cron runs as controller UID.
+#   - macOS / non-Linux host → return 0 immediately (Linux-only iso v2).
+#   - Sudoers shape mismatch (sudo works for `id` but not `-n -H -u <user>
+#     env -i true`) → fail the probe AND consult the setpriv fallback
+#     (which requires BRIDGE_CRON_USE_SETPRIV=1 to be eligible).
+#   - setpriv missing OR BRIDGE_CRON_USE_SETPRIV unset/0 → if sudo also
+#     fails, refuse.
+#   - Both sudo + setpriv work AND flag=1 → sudo wins (matches runner's
+#     ordering at lines 492-498).
+#   - Mixed env (one agent OK, another fails) → per-agent cache file, not
+#     global. The cache is keyed by `bridge_cron_safe_component(agent)`
+#     PLUS the flag suffix.
+#
+# Audit emission is the caller's responsibility (see dispatch site).
+bridge_cron_uid_drop_preflight() {
+  local agent="$1"
+  local force="${2:-0}"
+  local cache_file=""
+  local now_ts=0
+  local cache_entry=""
+  local cache_expires=""
+  local cache_result=""
+  local ttl="${BRIDGE_CRON_UID_DROP_PREFLIGHT_TTL_SECONDS:-300}"
+  local os_user=""
+  local bash_bin="${BRIDGE_BASH_BIN:-bash}"
+
+  [[ -n "$agent" ]] || return 0
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=300
+
+  # Non-Linux host or roster lookup unavailable → short-circuit to OK
+  # (controller-UID execution is the expected/required path there).
+  if ! declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    return 0
+  fi
+
+  # Iso v2 effective but no os_user in roster → cannot prove drop is feasible.
+  # Refuse to dispatch; the request would land at the runner's RuntimeError
+  # anyway, but pre-flight gives the operator an actionable audit row instead
+  # of a runner-exit traceback.
+  os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+  if [[ -z "$os_user" ]]; then
+    return 1
+  fi
+
+  # Same-UID short-circuit: mirror bridge-cron-runner.py:473-474. If the
+  # controller (daemon) is ALREADY running as the agent's iso UID, the runner
+  # builds `env -i ... script` with no sudo/setpriv wrap. No drop is needed,
+  # so pre-flight passes. This is the per-agent isolated-daemon shape (rare
+  # but supported).
+  local current_uid="" target_uid=""
+  current_uid="$(id -u 2>/dev/null || printf '')"
+  target_uid="$(id -u "$os_user" 2>/dev/null || printf '')"
+  if [[ -n "$current_uid" && -n "$target_uid" && "$current_uid" == "$target_uid" ]]; then
+    return 0
+  fi
+
+  now_ts="$(date +%s 2>/dev/null || printf '0')"
+  [[ "$now_ts" =~ ^[0-9]+$ ]] || now_ts=0
+
+  # TTL cache lookup (skip on force=1).
+  if [[ "$force" != "1" ]]; then
+    cache_file="$(bridge_cron_uid_drop_cache_file "$agent" 2>/dev/null || printf '')"
+    if [[ -n "$cache_file" && -f "$cache_file" ]]; then
+      cache_entry="$(<"$cache_file")" 2>/dev/null || cache_entry=""
+      cache_expires="${cache_entry%%	*}"
+      cache_result="${cache_entry##*	}"
+      if [[ "$cache_expires" =~ ^[0-9]+$ \
+          && "$cache_result" =~ ^[01]$ \
+          && "$now_ts" -lt "$cache_expires" ]]; then
+        return "$cache_result"
+      fi
+    fi
+  fi
+
+  # Live probe — mirror the EXACT runner argv shape. The runner builds:
+  #   sudo -n -H -u <os_user> env -i KEY=val script args...
+  # We probe with:
+  #   sudo -n -H -u <os_user> env -i HOME=/tmp <bash_bin> -c 'exit 0'
+  # so a sudoers rule that whitelists e.g. `bash` for the os_user but rejects
+  # `-H` or `env -i` (Defaults env_reset / requiretty mismatch) trips the
+  # probe here, not at runner-exec time. Stderr suppressed unless the
+  # debug env is set; the result band is what the caller acts on.
+  local probe_rc=2
+  if command -v sudo >/dev/null 2>&1; then
+    if [[ "${BRIDGE_CRON_UID_DROP_PREFLIGHT_DEBUG:-0}" == "1" ]]; then
+      sudo -n -H -u "$os_user" env -i HOME=/tmp "$bash_bin" -c 'exit 0' && probe_rc=0 || probe_rc=$?
+    elif sudo -n -H -u "$os_user" env -i HOME=/tmp "$bash_bin" -c 'exit 0' >/dev/null 2>&1; then
+      probe_rc=0
+    else
+      probe_rc=$?
+    fi
+  fi
+
+  local result=1
+  if [[ "$probe_rc" -eq 0 ]]; then
+    # Sudo arm OK — preferred (canonical iso v2 path). This branch wins even
+    # when setpriv is also present and BRIDGE_CRON_USE_SETPRIV=1: the runner
+    # at bridge-cron-runner.py:492-498 also prefers `sudo` over `setpriv`
+    # when both are present, so pre-flight matches that ordering exactly.
+    result=0
+  elif [[ "${BRIDGE_CRON_USE_SETPRIV:-0}" == "1" ]] && command -v setpriv >/dev/null 2>&1; then
+    # The runner's setpriv fallback (line 495-497) does not actually require
+    # privilege to test — `setpriv --reuid <controller_uid> --regid <gid>` to
+    # the current UID/GID is a no-op if available. But we cannot probe a
+    # cross-UID setpriv from the controller without root; the runner's
+    # setpriv branch is unreachable unless the cron worker itself is already
+    # running as root or with CAP_SETUID/CAP_SETGID. On a standard
+    # controller-UID daemon, this branch is essentially dead — but the runner
+    # keeps it for parity with hosts that run the daemon as root. We
+    # therefore treat `setpriv present + BRIDGE_CRON_USE_SETPRIV=1` as
+    # "operator-asserted best-effort fallback may work" and pass pre-flight.
+    # Without the opt-in flag, setpriv is ignored: the runner ALSO gates its
+    # setpriv arm on the same flag (kept in lockstep), so a refusal here
+    # mirrors a runtime refusal at the runner.
+    result=0
+  fi
+
+  # Persist cache entry (best-effort).
+  cache_file="$(bridge_cron_uid_drop_cache_file "$agent" 2>/dev/null || printf '')"
+  if [[ -n "$cache_file" ]]; then
+    local cache_dir
+    cache_dir="$(dirname "$cache_file")"
+    if mkdir -p "$cache_dir" 2>/dev/null; then
+      local expires=$(( now_ts + ttl ))
+      printf '%s\t%s\n' "$expires" "$result" >"$cache_file" 2>/dev/null || true
+      chmod 0600 "$cache_file" 2>/dev/null || true
+    fi
+  fi
+
+  return "$result"
 }
 
 bridge_cron_run_dir_grant_isolation() {

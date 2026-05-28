@@ -653,6 +653,47 @@ run_enqueue() {
 
   actor="${actor:-cron:$CRON_JOB_NAME}"
   title="[cron-dispatch] $CRON_JOB_NAME ($slot)"
+
+  # Issue #1327 (v0.15.0-beta5-2 Lane μ M4): honor the operator's
+  # manual-stop intent at the dispatch site. The daemon-side
+  # `bridge_daemon_cron_dispatch_wake` already refuses to wake a
+  # manually-stopped static agent for an existing queued cron-dispatch
+  # row, but the enqueue path itself still creates the queue task —
+  # which then sits in the queue until the operator clears the
+  # manual-stop flag (or worse, an autostart later picks it up after
+  # the wake-side gate cleared). Block at enqueue so the row never
+  # exists; the wake-side gate stays as a defense-in-depth
+  # check for the auto-stop / agent-restart race (edge case 1).
+  #
+  # Distinguishes manual-stop (operator intent, honor here) from any
+  # other "agent currently down" condition (autostart backoff,
+  # broken-launch quarantine, daemon-side throttle, etc.). Those
+  # cases stay handled by the wake-side path and allow re-attempt;
+  # only manual-stop is honored at enqueue (edge case 2). The check
+  # is gated on `bridge_agent_manual_stop_active` being declared so a
+  # smoke harness that loads `bridge-cron.sh` without `bridge-state.sh`
+  # (rare path — full upgrade flow always sources both) does not
+  # surface as an undefined-function error; in that case the gate is
+  # treated as inactive and the row is enqueued normally.
+  if declare -F bridge_agent_manual_stop_active >/dev/null 2>&1 \
+      && bridge_agent_manual_stop_active "$target" 2>/dev/null; then
+    if declare -F bridge_audit_log >/dev/null 2>&1; then
+      bridge_audit_log cron cron_dispatch_skipped "$target" \
+        --detail job_name="$CRON_JOB_NAME" \
+        --detail job_id="$CRON_JOB_ID" \
+        --detail family="$CRON_JOB_FAMILY" \
+        --detail slot="$slot" \
+        --detail reason=manual_stop 2>/dev/null || true
+    fi
+    bridge_warn "cron-dispatch skipped ${target} (reason=manual_stop, job=${CRON_JOB_NAME} slot=${slot})"
+    printf 'status: skipped\n'
+    printf 'reason: manual_stop\n'
+    printf 'target: %s\n' "$target"
+    printf 'job_name: %s\n' "$CRON_JOB_NAME"
+    printf 'slot: %s\n' "$slot"
+    return 0
+  fi
+
   run_id="$(bridge_cron_run_id "$CRON_JOB_NAME" "$CRON_JOB_ID" "$slot")"
   request_file="$(bridge_cron_request_file "$CRON_JOB_NAME" "$CRON_JOB_ID" "$slot")"
   result_file="$(bridge_cron_result_file "$CRON_JOB_NAME" "$CRON_JOB_ID" "$slot")"
@@ -936,6 +977,14 @@ run_sync() {
     printf 'reason: no_native_cron_jobs_file\n'
     printf 'native_jobs_file: %s\n' "$BRIDGE_NATIVE_CRON_JOBS_FILE"
     return 0
+  fi
+
+  # Issue #1328 (v0.15.0-beta5-2 Lane μ M5): verify cron-state-dir anchor
+  # and migrate the old tree if the env-resolved path moved. Best-effort,
+  # never aborts sync. See `bridge_cron_state_dir_verify_and_migrate` for
+  # the full edge-case matrix.
+  if declare -F bridge_cron_state_dir_verify_and_migrate >/dev/null 2>&1; then
+    bridge_cron_state_dir_verify_and_migrate >/dev/null 2>&1 || true
   fi
 
   native_state_file="$(bridge_cron_scheduler_state_file)"

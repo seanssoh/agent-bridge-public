@@ -1,0 +1,20 @@
+# scripts/baselines/iso-helper-allowlist.txt
+#
+# Whole-file allowlist for scripts/iso-helper-ratchet.sh. Lines starting
+# with `#` are comments. One file relpath per line (relative to repo
+# root). Files listed here are compatibility wrappers or controller-only
+# code that the ratchet explicitly does NOT enforce on.
+#
+# The always-allowlisted internal files (helper itself, smoke, ratchet,
+# Python adapter) are hard-coded in the ratchet script and do NOT
+# need to be listed here.
+#
+# Add a file here ONLY if you have audited its mentions and confirmed
+# they are either (a) inside a function that already delegates through
+# bridge_iso_run, or (b) controller-only by design (operator-supplied
+# token files, controller-owned channels-home dotenv, in-process state
+# files that never escape into an isolated tree).
+
+# Compatibility wrappers that already delegate to bridge_iso_run /
+# bridge_iso_paths.iso_run (callers are migrated, body remains for
+# back-compat with operator-installed shims).

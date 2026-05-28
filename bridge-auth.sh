@@ -136,7 +136,6 @@ bridge_auth_prepare_credential_file() {
   local dir=""
   local user_home=""
   local os_user=""
-  local os_group=""
 
   dir="$(dirname "$file")"
   user_home="$(bridge_auth_resolved_user_home_for_agent "$agent")" || return 1
@@ -147,18 +146,25 @@ bridge_auth_prepare_credential_file() {
       printf '[error] cannot resolve isolated os_user for agent: %s\n' "$agent" >&2
       return 1
     }
-    os_group="$(id -gn "$os_user" 2>/dev/null || printf '%s' "$os_user")"
-    if ! bridge_auth_run_privileged test -d "$dir"; then
-      # PR #799 r2 codex finding 2 — verify_safe_claude_dir above already
-      # rejected pre-existing symlinks / non-dirs. The ``mkdir -p`` here is
-      # safe because the parent ``$user_home`` is the privileged-owned
-      # isolated root and ``.claude`` does not yet exist.
-      bridge_auth_run_privileged mkdir -p "$dir" || {
-        printf '[error] cannot create Claude credentials dir: %s\n' "$dir" >&2
-        return 1
-      }
-      bridge_auth_run_privileged chown "$os_user:$os_group" "$dir" || return 1
-      bridge_auth_run_privileged chmod 0700 "$dir" || return 1
+    # Phase 3 codex design: route the parent-dir contract through the
+    # shared helper so token sync, prepare, and the restart reverter
+    # all converge on the same `.claude` contract (root:ab-agent-<agent>
+    # mode 3770/2770 with sticky for integrity). The credential file
+    # itself (`.credentials.json`) is still owned by the isolated UID
+    # with mode 0600, written by the token-sync writer downstream; only
+    # the parent-dir contract goes through the helper.
+    #
+    # Previously this branch ran `mkdir/chown $os_user:$primary_group/
+    # chmod 0700`, which set the wrong primary group on `.claude` and
+    # locked the controller's harvester out of `~/.claude/projects/`
+    # after the next prepare/restart cycle (#1180 sequel: gap E).
+    # ALLOW_RUNNING=1: token sync runs against live agents; the helper
+    # is internal-caller safe here (no chmod-while-write race because
+    # the writer has not yet opened the credential file).
+    if ! BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING=1 \
+          bridge_linux_normalize_isolated_home_contract "$agent" "$os_user" "$user_home" >/dev/null; then
+      printf '[error] cannot normalize isolated home contract for agent: %s\n' "$agent" >&2
+      return 1
     fi
     return 0
   fi
@@ -184,48 +190,47 @@ bridge_auth_update_legacy_claude_config_env() {
       return 1
     }
   fi
-  python3 - "$file" "$config_dir" <<'PY'
-import os
-import sys
-import tempfile
-from pathlib import Path
-
-path = Path(sys.argv[1])
-config_dir = sys.argv[2]
-key = "CLAUDE_CODE_OAUTH_TOKEN="
-config_key = "CLAUDE_CONFIG_DIR="
-lines = path.read_text(encoding="utf-8", errors="ignore").splitlines() if path.exists() else []
-filtered = [
-    line
-    for line in lines
-    if not line.strip().startswith(key)
-    and not line.strip().startswith(config_key)
-]
-if "'" in config_dir:
-    raise SystemExit("CLAUDE_CONFIG_DIR path cannot contain single quote")
-filtered.append(f"CLAUDE_CONFIG_DIR='{config_dir}'")
-text = "\n".join(filtered)
-if text:
-    text += "\n"
-fd = -1
-tmp_name = ""
-try:
-    fd, tmp_name = tempfile.mkstemp(prefix=".launch-secrets.", suffix=".tmp", dir=str(path.parent))
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fd = -1
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp_name, path)
-finally:
-    if fd >= 0:
-        os.close(fd)
-    if tmp_name:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
-PY
+  # Issue #1238 companion bug: on iso v2 fresh installs, the controller
+  # may transiently lack supplementary-group membership for
+  # `ab-agent-<a>` (KNOWN_ISSUES §28 — login-cached group set) and the
+  # plain `python3 - "$file" "$config_dir" <<'PY'` invocation that used
+  # to live here ran as the un-refreshed controller. The Python child's
+  # first `path.exists()` then raised `PermissionError: [Errno 13]
+  # Permission denied: .../credentials/launch-secrets.env` (parent
+  # traversal needs group membership). The unhandled exception aborted
+  # `bridge_auth_sync_agents` mid-walk, so registering a setup token
+  # only ever populated `patch` (the controller-shared agent) and every
+  # iso agent — and every reviewer after the first iso failure — was
+  # silently skipped.
+  #
+  # Catching `PermissionError` and returning `False` would be wrong:
+  # that converts an inaccessible existing secret into "absent" and
+  # would let the subsequent `path.write_text(...)` clobber a
+  # controller-owned credential file. Instead route the read/write
+  # through `bridge_auth_run_privileged`, which mirrors the privileged
+  # path used by `bridge_auth_sync_agent_python` (:353-355) — direct
+  # first (works on non-isolated dev installs and on hosts where the
+  # controller already has the group), passwordless sudo otherwise.
+  # `bridge_auth_fix_legacy_secret_file_mode` (called below) then
+  # normalizes the final ownership / mode regardless of which branch
+  # wrote the file.
+  #
+  # Codex r1 BLOCKING on PR #1239: the original r1 fix used
+  # `bridge_auth_run_privileged python3 - "$file" "$config_dir" <<'PY'`,
+  # which is unsafe because `bridge_auth_run_privileged` retries on
+  # failure (direct first, then `sudo -n`). With heredoc-stdin the
+  # FIRST Python child consumes the heredoc fd before raising
+  # `PermissionError`; the sudo fallback then reads EOF and silently
+  # exits 0 with no script side effect — the wrapper reports success
+  # without executing the privileged update. The Python body was
+  # therefore extracted to `lib/upgrade-helpers/auth-legacy-claude-
+  # config-env.py` and invoked with file-as-argv (no stdin), mirroring
+  # the v0.13.9 footgun #11 extraction pattern. Every retry by the
+  # wrapper re-reads the script from disk, so the privileged fallback
+  # runs the same code as the direct attempt.
+  bridge_auth_run_privileged python3 \
+      "$SCRIPT_DIR/lib/upgrade-helpers/auth-legacy-claude-config-env.py" \
+      "$file" "$config_dir"
   bridge_auth_fix_legacy_secret_file_mode "$agent" "$file"
 }
 
@@ -415,6 +420,21 @@ bridge_auth_sync_agents() {
   local -a agents=()
   local -a synced=()
   local -a failed=()
+  # Codex r1 BLOCKING #1 (2026-05-27): per-agent aliveness/remaining_ms
+  # propagation. Inner ``bridge_auth_sync_agent_python`` (-> bridge-auth.py
+  # cmd_sync_agent) emits a JSON envelope on stdout carrying
+  # ``aliveness`` + ``remaining_ms`` fields (alongside ``status`` /
+  # ``agent`` / ``fingerprint`` etc.). The pre-r2 wrapper captured
+  # stdout+stderr into ``output`` and DISCARDED it on the success branch,
+  # so the daemon's periodic-sync tick (bridge-daemon.sh:1944-1959) only
+  # saw the wrapper's top-level ``status`` field and could not audit
+  # which agents were synced with a near-expiry token. We now carry the
+  # per-agent payload through into the final wrapper JSON so structured
+  # consumers can branch on the per-agent ``aliveness`` value. Stderr
+  # ``warning:`` lines (the near-expiry banner emitted by cmd_sync_agent)
+  # are forwarded verbatim to OUR stderr so the operator sees them via
+  # the daemon's log capture rather than being swallowed.
+  local -a synced_payloads=()
 
   selection_error="$(mktemp "${TMPDIR:-/tmp}/agb-auth-select.XXXXXX" 2>/dev/null || printf '%s' "/tmp/agb-auth-select.$$.$RANDOM")"
   if ! selection_output="$(bridge_auth_selected_agents "$spec" 2>"$selection_error")"; then
@@ -461,11 +481,39 @@ PY
       rc=1
       continue
     fi
-    if ! output="$(bridge_auth_sync_agent_python "$agent" "$registry" "$file" 2>&1)"; then
-      failed+=("$agent:$output")
+    # Codex r1 BLOCKING #1: split stdout (JSON payload) from stderr
+    # (operator-visible warnings). Stderr lines that begin with
+    # ``warning:`` are the near-expiry banner from cmd_sync_agent — we
+    # forward them to OUR stderr so the daemon's log capture preserves
+    # them; everything else stays attached to the failure path for the
+    # ``$agent:error`` row.
+    local stderr_tmp=""
+    stderr_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-auth-sync.XXXXXX" 2>/dev/null || printf '%s' "/tmp/agb-auth-sync.$$.$RANDOM")"
+    if ! output="$(bridge_auth_sync_agent_python "$agent" "$registry" "$file" 2>"$stderr_tmp")"; then
+      local stderr_body=""
+      stderr_body="$(cat "$stderr_tmp" 2>/dev/null || printf '')"
+      rm -f "$stderr_tmp"
+      # Stitch stderr into the failure row so the original ``$agent:error``
+      # contract carries the underlying message. Newlines are flattened
+      # into ' | ' so the colon-separated row stays single-line.
+      local combined=""
+      if [[ -n "$stderr_body" ]]; then
+        combined="${output:+$output | }${stderr_body//$'\n'/ | }"
+      else
+        combined="$output"
+      fi
+      failed+=("$agent:${combined:-failed}")
       rc=1
       continue
     fi
+    # Forward operator-visible warnings (near-expiry banner from
+    # cmd_sync_agent) to our stderr so they remain visible to the daemon
+    # log capture; without this the warning is invisible to anything
+    # downstream of the wrapper.
+    if [[ -s "$stderr_tmp" ]]; then
+      cat "$stderr_tmp" >&2 || true
+    fi
+    rm -f "$stderr_tmp"
     # PR #799 r3 codex finding 1 — Python's ``write_private_file_atomic``
     # writes the tempfile, chmod/chown's it (when --owner-uid/--owner-gid
     # are passed) BEFORE ``os.replace``, so .credentials.json / .claude.json
@@ -485,18 +533,82 @@ PY
       continue
     fi
     synced+=("$agent")
+    # Codex r1 BLOCKING #1: capture the inner JSON so the wrapper can
+    # surface per-agent aliveness/remaining_ms to the daemon-side audit
+    # consumer (bridge-daemon.sh sync-aliveness-parse). Empty / non-JSON
+    # is tolerated — wrapper falls back to ``aliveness=""`` for that row.
+    synced_payloads+=("${output:-}")
     [[ "$json_mode" == "1" ]] || printf 'synced: %s -> %s\n' "$agent" "$file"
   done
 
   if [[ "$json_mode" == "1" ]]; then
-    python3 - "${synced[@]}" -- "${failed[@]}" <<'PY'
+    # Codex r1 BLOCKING #1 (2026-05-27): wrapper JSON now carries
+    # per-agent ``aliveness`` + ``remaining_ms`` so the daemon's
+    # periodic-sync tick can audit token freshness per row. The argv
+    # contract is:
+    #
+    #   argv[1..N-1] = synced rows; each row is ``agent\tpayload_json``
+    #                  (tab-separated). Empty / unparseable payload is
+    #                  tolerated — fields fall back to ``""``.
+    #   argv[N]     = literal ``--``
+    #   argv[N+1..] = failed rows in ``agent:error`` shape (unchanged).
+    #
+    # The python helper splits on the tab so the embedded JSON cannot
+    # collide with the row separator (the JSON itself contains commas
+    # but never tab characters — pretty-printed by cmd_sync_agent with
+    # indent=2 but no leading whitespace before the keys).
+    local -a synced_args=()
+    local idx=0
+    for ((idx = 0; idx < ${#synced[@]}; idx++)); do
+      # Flatten newlines so the row stays single-line; the helper's
+      # json.loads handles internal whitespace before the call.
+      local row_payload="${synced_payloads[idx]:-}"
+      row_payload="${row_payload//$'\n'/ }"
+      synced_args+=("${synced[idx]}"$'\t'"$row_payload")
+    done
+    if (( ${#synced_args[@]} == 0 )); then
+      synced_args=()
+    fi
+    python3 - "${synced_args[@]}" -- "${failed[@]}" <<'PY'
 import json
 import sys
 
 items = sys.argv[1:]
 sep = items.index("--") if "--" in items else len(items)
-synced = items[:sep]
+synced_raw = items[:sep]
 failed_raw = items[sep + 1 :]
+
+# Per-agent rows now carry the inner cmd_sync_agent JSON so the daemon
+# can audit aliveness/remaining_ms. Tab-separated to avoid collision
+# with the agent name (which is the ``--name`` slug, no whitespace).
+agents = []
+synced_names = []
+for row in synced_raw:
+    if "\t" in row:
+        agent, payload_text = row.split("\t", 1)
+    else:
+        agent, payload_text = row, ""
+    inner = {}
+    aliveness = ""
+    remaining_ms = 0
+    if payload_text.strip():
+        try:
+            inner = json.loads(payload_text)
+        except Exception:
+            inner = {}
+    if isinstance(inner, dict):
+        aliveness = str(inner.get("aliveness", "") or "")
+        try:
+            remaining_ms = int(inner.get("remaining_ms", 0) or 0)
+        except (TypeError, ValueError):
+            remaining_ms = 0
+    synced_names.append(agent)
+    agents.append({
+        "agent": agent,
+        "aliveness": aliveness,
+        "remaining_ms": remaining_ms,
+    })
+
 failed = []
 for row in failed_raw:
     if ":" in row:
@@ -504,8 +616,19 @@ for row in failed_raw:
     else:
         agent, error = row, "failed"
     failed.append({"agent": agent, "error": error})
-status = "ok" if not failed else ("failed" if not synced else "partial")
-print(json.dumps({"status": status, "agents": synced, "failed": failed}, ensure_ascii=True, indent=2))
+status = "ok" if not failed else ("failed" if not synced_names else "partial")
+# Backward-compatible: ``agents`` was previously a list[str] of synced
+# names. v0.15.0-beta4 Lane F r2 promotes it to list[dict] so per-agent
+# aliveness can ride along; consumers that only need the names should
+# pull from ``agent_names`` instead. The legacy daemon-helpers
+# ``sync-status-parse`` reads ``status`` (top-level) so its contract
+# stays intact.
+print(json.dumps({
+    "status": status,
+    "agents": agents,
+    "agent_names": synced_names,
+    "failed": failed,
+}, ensure_ascii=True, indent=2))
 PY
   fi
   return "$rc"

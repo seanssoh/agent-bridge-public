@@ -32,6 +32,7 @@ from bridge_hook_common import (  # noqa: E402
     load_guard_module,
     path_within,
     truncate_text,
+    under_isolated_uid,
     write_audit,
 )
 
@@ -405,8 +406,41 @@ def other_agent_homes(agent: str) -> list[Path]:
     root = agent_home_root()
     if not root.exists():
         return homes
-    for candidate in root.iterdir():
-        if not candidate.is_dir():
+    # Issue #1205 Family A: under iso v2 the agent-home root is owned by
+    # the controller with mode ``drwx--x---`` — the isolated UID has
+    # traverse-only permission and ``iterdir()`` raises PermissionError.
+    # That is the iso v2 contract working as designed (cross-agent peer
+    # enumeration is intentionally blocked from the iso UID). Catching
+    # PermissionError + OSError and returning ``[]`` under iso is safe
+    # because the OS already enforces the cross-agent boundary;
+    # downstream consumers (`target_agent_for_*`) failing to match a
+    # peer from the iso UID is fine. Controller-side callers still
+    # raise so a genuine permission regression continues to surface.
+    try:
+        candidates = list(root.iterdir())
+    except (PermissionError, OSError):
+        if under_isolated_uid():
+            try:
+                write_audit(
+                    "hook_permission_fail_open.agent_home_enumeration",
+                    str(root),
+                    {"operation": "iterdir"},
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never block hooks
+                pass
+            return homes
+        raise
+    for candidate in candidates:
+        # ``is_dir()`` can also raise under iso (broken / dangling /
+        # cross-UID permission) — same gate: under iso skip, controller
+        # re-raises.
+        try:
+            is_dir = candidate.is_dir()
+        except (PermissionError, OSError):
+            if under_isolated_uid():
+                continue
+            raise
+        if not is_dir:
             continue
         name = candidate.name
         if not name:
@@ -618,6 +652,73 @@ _SAFE_REDIRECT_RE = re.compile(
 _NUMERIC_FD_WRITE_RE = re.compile(r"^[0-9]+>>?")
 
 
+# Issue #1255 r3/r4 — `find` mutation/exec primitive filter.
+#
+# `find` is on `_READ_INTENT_BASH_COMMANDS` because the common operator
+# diagnostics (`find <roster> -name "*.sh"`, `find <roster> -type f`)
+# are pure reads. But find has built-in mutation and exec primitives
+# that the bare leader check does not see — `find -delete` removes
+# matches in place, and `find -exec` / `-execdir` / `-ok` / `-okdir`
+# spawn arbitrary subprocesses against each match. The GNU-find file
+# actions `-fprint` / `-fprint0` / `-fprintf` / `-fls` write matches
+# (or `-ls`-style listings) to a file the operator names, which is a
+# roster-exfil channel even though no `>` token appears in the command
+# (codex PR #1294 r2 first surfaced `-fprint*`; r3 added `-fls`).
+#
+# Treat these flags as write-intent: when `find` is the stage leader
+# and any of them appears in argv, the stage falls out of the read-
+# intent classification. The output-redirection guard above already
+# catches `find -ls > somefile`; we do not need to enumerate that form
+# here.
+#
+# Comprehensive audit pass (codex PR #1294 r3, GNU find(1) actions):
+#   - `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir` — covered.
+#   - `-fprint`, `-fprint0`, `-fprintf` — covered.
+#   - `-fls` — covered (this commit).
+#   - `-ls`, `-print`, `-print0`, `-printf`, `-quit` — write stdout
+#     only; the output-redirection guard catches `> file` rebinding.
+#   - `-prune` — pure traversal control, no I/O.
+# No other GNU find action writes to a named file or spawns a child
+# without `>` redirect; the frozenset is now exhaustive for the file-
+# action + child-spawn classes.
+_FIND_MUTATION_FLAGS = frozenset(
+    {
+        "-delete",
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-fprint",
+        "-fprint0",
+        "-fprintf",
+        "-fls",
+    }
+)
+
+
+def _find_is_read_only(stage_tokens: list[str]) -> bool:
+    """Return True iff a `find` invocation is free of mutation/exec flags.
+
+    *stage_tokens* is the whitespace-split argv of a single pipeline
+    stage whose leader has already been confirmed to be `find` (or a
+    pathy equivalent like `/usr/bin/find`). Returns False as soon as
+    any token equals one of :data:`_FIND_MUTATION_FLAGS` so the caller
+    can drop the read-intent classification.
+
+    The check is exact-match per token: `-delete` matches but
+    `-deleted-files` does not, and `-delete` is rejected even when it
+    appears mid-argv (`find <path> -type f -delete`). This is the
+    flag shape `find` itself enforces — none of the mutation primitives
+    take an inline value glued to the flag (find takes them as separate
+    argv elements). See codex PR #1294 r2 for the BLOCKING-class repro
+    that motivated the filter.
+    """
+    for token in stage_tokens[1:]:  # skip the leading 'find'
+        if token in _FIND_MUTATION_FLAGS:
+            return False
+    return True
+
+
 def _is_read_intent_bash(command: str) -> bool:
     """Return True iff *command* is purely read-intent.
 
@@ -704,6 +805,16 @@ def _is_read_intent_bash(command: str) -> bool:
                 return False
             if leaf == "awk" and "-i" in stage_tokens[1:]:
                 return False
+            # `find` is whitelisted for diagnostics (`find <roster>
+            # -name "*.sh"`), but it has mutation/exec primitives
+            # (`-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`,
+            # `-fprint`, `-fprint0`, `-fprintf`) that the leader check
+            # alone does not see. Codex PR #1294 r2 demonstrated that
+            # without this filter an admin could `find <roster>
+            # -delete` or `find <roster> -exec python3
+            # /tmp/mutator.py {} \;` through the roster carve-out.
+            if leaf == "find" and not _find_is_read_only(stage_tokens):
+                return False
             continue
         # `agent-bridge config get …` / `agb config get …` are read-intent.
         if leaf in {"agent-bridge", "agb"}:
@@ -720,6 +831,54 @@ def _is_read_intent_bash(command: str) -> bool:
             return False
         return False
     return True
+
+
+# Issue #1255 r2 — admin roster carve-out is a strict whitelist.
+#
+# History: r1 shipped this as a write-intent *blacklist*
+# (`_bash_command_has_no_write_intent`) that tolerated unknown stage
+# leaders. Codex r1 review showed that posture lets an admin agent run
+# `python3 /tmp/mutator.py <roster>`, `my-mutator <roster>`, or
+# `git commit -F <roster>` — paths that bypass the
+# `agent-bridge config set` wrapper's audit chain and can leak or
+# rewrite roster secrets outside the sanctioned mutation surface.
+#
+# r2 flips the classifier to a whitelist: only the canonical read-only
+# shapes already enumerated in :data:`_READ_INTENT_BASH_COMMANDS` are
+# admitted, plus `agent-bridge config get` / `agb config get`. Unknown
+# leaders default-deny, matching the credential / queue-DB / system-
+# config gates. The whole point of #1255 unblocks operator diagnostics
+# (`cat $roster`, `grep BRIDGE $roster`, `head -10 $roster`); none of
+# those needed a blacklist — they're already on the read-intent
+# whitelist.
+#
+# The function is a thin wrapper around :func:`_is_read_intent_bash`
+# rather than a parallel implementation. That ties the admin carve-out
+# to the same write-redirection / `sed -i` / unbalanced-quote /
+# numeric-fd guards used everywhere else, so future hardening of the
+# write-detection surface flows to the admin path automatically — no
+# divergence to drift into the blacklist gap the r1 review caught.
+
+
+def _bash_command_has_read_intent(command: str) -> bool:
+    """Return True iff *command* is purely read-intent (whitelist).
+
+    Issue #1255 r2 — the admin roster carve-out at
+    :func:`protected_alias_reason` consults this function. A True
+    return means "every pipeline stage's leading command is a known
+    read-only tool (cat / grep / head / awk-no-`-i` / sed-no-`-i` /
+    `agent-bridge config get` / …) and no stage opens an output
+    redirection". False means the carve-out falls through to the
+    non-admin deny — including unknown stage leaders like
+    `python3 /tmp/mutator.py`, `my-mutator`, or `git commit -F`,
+    which the r1 blacklist incorrectly tolerated.
+
+    Delegating to :func:`_is_read_intent_bash` keeps the admin carve-
+    out and the credential/queue-DB/system-config gates aligned on the
+    same write-detection surface; we no longer maintain a parallel
+    blacklist that can drift.
+    """
+    return _is_read_intent_bash(command)
 
 
 def _is_read_intent_tool(tool_name: str, tool_input: dict[str, Any]) -> bool:
@@ -1726,6 +1885,464 @@ def _is_config_set_wrapper(text: str) -> bool:
     return tokens[1] == "config" and tokens[2] == "set"
 
 
+# Issue #6607 — anchored admin bridge-verb allowlist.
+#
+# Codex r1 rejected the original "full admin bypass" / "per-agent
+# settings-disable" proposals as broad command-injection bypasses.
+# Prescription (verbatim): "Add an anchored bridge-verb allowlist with
+# audit. Keep raw credential/env dump denies and protected secret-path
+# denies FIRST. Then allow audited admin bridge verbs for **exact
+# command shapes**." NOT regex `.*`.
+#
+# Three verb shapes:
+#   - `(agent-bridge|agb) auth claude-token (add|activate|sync|rotate) [args]`
+#     — admin-only (token mutation is operator-deputy work).
+#   - `(agent-bridge|agb) escalate question [args]`
+#     — both roles (non-admin needs this to surface blockers to admin).
+#   - `(agent-bridge|agb) a2a send [--body-file <safe-path>] [args]`
+#     — both roles. If `--body-file` is given, the value must be a safe
+#       path (no traversal, no shell metacharacters); inline `--body`
+#       text bodies are accepted as-is because the credential/env gates
+#       above already screen secret-bearing text.
+#
+# Defense shape (mirrors `_is_config_set_wrapper`):
+#   - No shell embeddings (`$(...)`, backticks, `<(...)`, `>(...)`, `<<`)
+#   - No I/O redirection beyond the safe stderr-discard forms
+#   - No multi-command separators (`;`, `&&`, `||`, `|`, `&`, newline)
+#   - shlex tokens[0] leaf is `agent-bridge` or `agb` (path prefix tolerated)
+#   - Subcommand at strict positional `tokens[1]` / `tokens[2]` / `tokens[3]`
+#
+# When the verb shape matches but the args are unsafe OR the caller's
+# role does not permit the verb, the helper returns a deny reason so
+# the gate produces an explicit deny rather than silently falling
+# through to the peer/shared check (where `--body-file ../../secret`
+# would otherwise slip past).
+_SAFE_SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_PATH_METACHAR_CHARS = frozenset("$`;|&<>*?")
+
+
+def _safe_path_arg(value: str) -> bool:
+    """True iff *value* is safe to accept as a file-path argument to a
+    bridge verb.
+
+    Safe means:
+    - non-empty
+    - no `..` path component anywhere (rejects path traversal lexically;
+      we do NOT call `os.path.normpath` first because the literal
+      traversal is itself the signal to reject)
+    - no embedded shell metacharacter — defense-in-depth in case a
+      quoted token survived shlex with metacharacters intact
+    - no NUL byte (defense-in-depth; the OS would reject it anyway, but
+      we want a clean deny shape)
+    """
+    if not value:
+        return False
+    if "\0" in value:
+        return False
+    # Normalize the separator and split into components for the `..` check.
+    parts = value.replace("\\", "/").split("/")
+    if any(part == ".." for part in parts):
+        return False
+    if any(ch in _PATH_METACHAR_CHARS for ch in value):
+        return False
+    return True
+
+
+def _safe_slug_arg(value: str) -> bool:
+    """True iff *value* is a safe identifier-ish argument (token id, csv key).
+
+    Permits `[A-Za-z0-9._-]+` only — the same alphabet `bridge-auth.sh`
+    accepts for token ids. Rejects shell metacharacters, whitespace,
+    and path separators.
+    """
+    if not value:
+        return False
+    return bool(_SAFE_SLUG_RE.match(value))
+
+
+# Distinct sentinels for `_extract_flag_value` outcomes. The earlier
+# implementation collapsed "absent" and "malformed" into a single `None`
+# return — codex r1 (PR #1243) flagged this as a security regression
+# because the a2a-send allowlist treated "no --body-file arg" and "
+# --body-file at end of argv" identically (both allowed). Three malformed
+# shapes slipped through:
+#   - `agb a2a send --body-file`                 (flag, no value)
+#   - `agb a2a send --body-file --to peer`       (next token is another flag)
+#   - `agb a2a send --body-file /tmp/x --body-file ../../secret` (duplicate)
+# We now distinguish absent (allowed) from malformed/duplicate (denied)
+# with two singleton sentinels. Callers in the bridge-verb allowlist
+# branch on identity, NOT on `is None`, so a future refactor that
+# accidentally returns `None` is caught by a type/identity mismatch in
+# review rather than silently re-opening the bypass.
+class _FlagSentinel:
+    __slots__ = ("_label",)
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<{self._label}>"
+
+
+_FLAG_ABSENT = _FlagSentinel("FLAG_ABSENT")
+_FLAG_MALFORMED = _FlagSentinel("FLAG_MALFORMED")
+
+
+def _extract_flag_value(
+    tokens: list[str], flag: str
+) -> "str | _FlagSentinel":
+    """Return the value of `--flag <value>` / `--flag=value` in *tokens*.
+
+    Three distinct outcomes:
+    - `_FLAG_ABSENT`: flag not present at all. Caller may allow the
+      command (the flag is optional in the verb shape).
+    - `_FLAG_MALFORMED`: flag present but its value is missing or
+      smuggled — codex r1 cases. Specifically:
+        * `--flag` at end of argv (no following token);
+        * `--flag` followed by another `--flag-like` token (the next
+          token starts with `-` and is not a bare `-` stdin marker);
+        * the flag appears more than once (separated or packed), even
+          if every individual occurrence carries a value. Duplicates
+          are treated as a smuggling attempt (last-wins semantics would
+          let `--body-file /tmp/ok --body-file ../../secret` slip the
+          first occurrence past the allowlist).
+      Caller MUST deny these.
+    - `str`: flag present exactly once with a non-flag value. Caller
+      validates the string with `_safe_path_arg` / `_safe_slug_arg` /
+      similar before allowing.
+    """
+    found: str | None = None
+    seen = 0
+    idx = 0
+    n = len(tokens)
+    prefix = flag + "="
+    while idx < n:
+        tok = tokens[idx]
+        if tok == flag:
+            seen += 1
+            if seen > 1:
+                return _FLAG_MALFORMED
+            if idx + 1 >= n:
+                return _FLAG_MALFORMED
+            nxt = tokens[idx + 1]
+            # A following token that looks like another flag (starts
+            # with `-` and is more than a single dash) is treated as a
+            # missing value — `agb a2a send --body-file --to peer`.
+            if nxt.startswith("-") and nxt != "-":
+                return _FLAG_MALFORMED
+            found = nxt
+            idx += 2
+            continue
+        if tok.startswith(prefix):
+            seen += 1
+            if seen > 1:
+                return _FLAG_MALFORMED
+            # `--flag=` (empty value) is malformed; `_safe_path_arg`
+            # would reject an empty string anyway, but the caller
+            # contract wants a clear deny shape.
+            value = tok[len(prefix):]
+            if value == "":
+                return _FLAG_MALFORMED
+            found = value
+        idx += 1
+    if seen == 0:
+        return _FLAG_ABSENT
+    # seen == 1 and we captured a non-flag, non-empty value above.
+    assert found is not None
+    return found
+
+
+def _emit_admin_bridge_verb_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+    verb_path: tuple[str, ...],
+) -> None:
+    """Audit row for an admin bridge-verb allowlist bypass.
+
+    Mirrors the deny-row `summary` field so a single audit consumer can
+    read allow + deny rows uniformly. `verb_path` is the matched verb
+    chain (e.g. `("auth", "claude-token", "add")`) for direct filtering.
+    """
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "verb": " ".join(verb_path),
+        "sample": truncate_text(text, 240),
+    }
+    if tool_input is not None:
+        detail["summary"] = tool_input_summary("Bash", tool_input)
+    else:
+        detail["summary"] = {
+            "command": truncate_text(text, 240),
+            "description": "",
+        }
+    write_audit(
+        "tool_policy_admin_bridge_verb_allowed",
+        agent or "unknown",
+        detail,
+    )
+
+
+def _emit_admin_bridge_verb_denied_shape_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+    verb_path: tuple[str, ...],
+    reason: str,
+) -> None:
+    """Audit row for an admin bridge-verb shape-deny (codex r1 PR #1243).
+
+    Mirrors `_emit_admin_bridge_verb_audit` so a single audit consumer
+    can grep both allow + deny shape rows uniformly. The `reason` field
+    records the specific malformed-shape failure (missing value,
+    duplicate flag, etc.) so operators can triage smuggling attempts.
+    """
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "verb": " ".join(verb_path),
+        "reason": reason,
+        "sample": truncate_text(text, 240),
+    }
+    if tool_input is not None:
+        detail["summary"] = tool_input_summary("Bash", tool_input)
+    else:
+        detail["summary"] = {
+            "command": truncate_text(text, 240),
+            "description": "",
+        }
+    write_audit(
+        "tool_policy_admin_bridge_verb_denied_shape",
+        agent or "unknown",
+        detail,
+    )
+
+
+def _admin_bridge_verb_check(
+    text: str,
+    agent: str,
+    tool_input: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """Anchored bridge-verb allowlist (issue #6607 / codex r1).
+
+    Returns ``(allowed, deny_reason)``:
+    - ``(True, None)``: the command matches one of the three allowed verb
+      shapes, the caller's role is permitted, and any safe-path argument
+      validates. An audit row has already been emitted. Caller returns
+      ``None`` (allow).
+    - ``(False, str)``: the verb shape was recognized but the caller's
+      role is not permitted (e.g. non-admin attempting
+      ``auth claude-token add``) OR a path argument failed validation
+      (e.g. ``--body-file ../../secret``). Caller returns the deny reason
+      so an explicit deny is produced rather than falling through to the
+      peer/shared gate (where a traversal path that doesn't happen to
+      reference a peer home would otherwise be silently allowed).
+    - ``(False, None)``: the command is not a recognized bridge-verb
+      invocation. Caller falls through to the normal non-admin gates.
+
+    All three negative branches in the defense block return
+    ``(False, None)`` because a command that is not structurally a single
+    safe ``agent-bridge``/``agb`` invocation has no business being
+    matched here — let it run through the regular gates.
+    """
+    if _command_has_shell_embedding(text):
+        return False, None
+    sanitized = _SAFE_REDIRECT_RE.sub(" ", text)
+    if "<" in sanitized or ">" in sanitized:
+        return False, None
+    if _COMMAND_OPERATOR_RE.search(sanitized):
+        return False, None
+    try:
+        tokens = shlex.split(sanitized, posix=True, comments=False)
+    except ValueError:
+        return False, None
+    if len(tokens) < 2:
+        return False, None
+    leaf = tokens[0].rsplit("/", 1)[-1]
+    if leaf not in {"agent-bridge", "agb"}:
+        return False, None
+
+    admin = is_admin_agent(agent)
+    verb = tokens[1]
+
+    if verb == "auth":
+        # `auth claude-token (add|activate|sync|rotate) ...`
+        if len(tokens) < 4 or tokens[2] != "claude-token":
+            return False, None
+        sub = tokens[3]
+        if sub not in {"add", "activate", "sync", "rotate"}:
+            return False, None
+        if not admin:
+            return False, (
+                "agent-bridge auth claude-token is admin-only; "
+                "non-admin agents must request token rotation through admin"
+            )
+        rest = tokens[4:]
+        if sub == "add":
+            if not _validate_auth_add_args(rest):
+                return False, "agent-bridge auth claude-token add: unsafe arguments"
+        elif sub == "activate":
+            if not rest or not _safe_slug_arg(rest[0]):
+                return False, "agent-bridge auth claude-token activate: unsafe id"
+            if not _validate_auth_flags(rest[1:]):
+                return False, "agent-bridge auth claude-token activate: unsafe arguments"
+        else:  # sync, rotate
+            if not _validate_auth_flags(rest):
+                return False, f"agent-bridge auth claude-token {sub}: unsafe arguments"
+        _emit_admin_bridge_verb_audit(
+            agent,
+            text=text,
+            tool_input=tool_input,
+            verb_path=("auth", "claude-token", sub),
+        )
+        return True, None
+
+    if verb == "escalate":
+        # `escalate question ...` — both roles. Question body is free text;
+        # the credential/env/protected-path gates above (which run before
+        # us) have already rejected secret-bearing text.
+        if len(tokens) < 3 or tokens[2] != "question":
+            return False, None
+        _emit_admin_bridge_verb_audit(
+            agent,
+            text=text,
+            tool_input=tool_input,
+            verb_path=("escalate", "question"),
+        )
+        return True, None
+
+    if verb == "a2a":
+        # `a2a send ...` with optional `--body-file <safe-path>`.
+        if len(tokens) < 3 or tokens[2] != "send":
+            return False, None
+        body_file = _extract_flag_value(tokens[3:], "--body-file")
+        if body_file is _FLAG_MALFORMED:
+            # codex r1 (PR #1243): `--body-file` alone, `--body-file
+            # --to peer`, and `--body-file /tmp/ok --body-file
+            # ../../secret` all reach here. Emit a distinct
+            # `_denied_shape` audit row (NOT the `_allowed` row) so
+            # operators can grep smuggling attempts and so the smoke
+            # counter-proofs can pin the deny shape.
+            _emit_admin_bridge_verb_denied_shape_audit(
+                agent,
+                text=text,
+                tool_input=tool_input,
+                verb_path=("a2a", "send"),
+                reason="malformed_or_duplicate_body_file",
+            )
+            return False, (
+                "agent-bridge a2a send: malformed --body-file "
+                "(missing value, smuggled flag, or duplicate)"
+            )
+        if body_file is not _FLAG_ABSENT and not _safe_path_arg(body_file):
+            return False, (
+                "agent-bridge a2a send: unsafe --body-file path "
+                "(path traversal / shell metachar / empty)"
+            )
+        _emit_admin_bridge_verb_audit(
+            agent,
+            text=text,
+            tool_input=tool_input,
+            verb_path=("a2a", "send"),
+        )
+        return True, None
+
+    return False, None
+
+
+# Flag names accepted by `agent-bridge auth claude-token <sub>` family.
+# `bridge-auth.sh` --help lists the full set; we accept the same surface
+# plus a small set of common boolean / value flags. Anything outside
+# this allowlist triggers `_validate_auth_*` to reject — the goal is to
+# anchor the verb shape so an operator cannot smuggle a `--exec`-style
+# extension flag through later.
+_AUTH_FLAGS_BOOL = frozenset(
+    {
+        "--stdin",
+        "--activate",
+        "--replace",
+        "--sync",
+        "--enable-auto-rotate",
+        "--if-auto-enabled",
+        "--json",
+    }
+)
+# Flags that take a value (separated `--flag VALUE` OR packed `--flag=VALUE`).
+# The value must satisfy a per-flag safety check:
+#   - paths → `_safe_path_arg`
+#   - slug/id-ish values → `_safe_slug_arg`
+#   - free text reason → only metachar-free strings
+_AUTH_FLAGS_PATH = frozenset({"--token-file"})
+_AUTH_FLAGS_SLUG = frozenset(
+    {
+        "--id",
+        "--agents",
+        "--threshold",
+    }
+)
+_AUTH_FLAGS_REASON = frozenset({"--reason"})
+_AUTH_FLAGS_VALUE = _AUTH_FLAGS_PATH | _AUTH_FLAGS_SLUG | _AUTH_FLAGS_REASON
+
+
+def _validate_auth_add_args(tokens: list[str]) -> bool:
+    """`auth claude-token add` accepts boolean flags + the value flags
+    in `_AUTH_FLAGS_*`. Positional args are not permitted.
+    """
+    return _validate_auth_flags(tokens)
+
+
+def _validate_auth_flags(tokens: list[str]) -> bool:
+    """Walk `tokens` accepting only flags listed in `_AUTH_FLAGS_*`.
+
+    Rejects any positional argument (anything not starting with ``--``).
+    Rejects unknown flags so we don't accidentally absorb a future
+    ``--exec`` / ``--hook`` flag added to the wrapper. Validates each
+    value flag's argument with its per-flag predicate.
+    """
+    idx = 0
+    n = len(tokens)
+    while idx < n:
+        tok = tokens[idx]
+        if tok in _AUTH_FLAGS_BOOL:
+            idx += 1
+            continue
+        if tok in _AUTH_FLAGS_VALUE:
+            if idx + 1 >= n:
+                return False
+            value = tokens[idx + 1]
+            if not _validate_auth_flag_value(tok, value):
+                return False
+            idx += 2
+            continue
+        # Packed `--flag=value` form.
+        if tok.startswith("--") and "=" in tok:
+            flag, value = tok.split("=", 1)
+            if flag in _AUTH_FLAGS_VALUE:
+                if not _validate_auth_flag_value(flag, value):
+                    return False
+                idx += 1
+                continue
+            # Packed form of a boolean flag (`--stdin=anything`) is malformed.
+            return False
+        # Positional / unknown flag — reject.
+        return False
+    return True
+
+
+def _validate_auth_flag_value(flag: str, value: str) -> bool:
+    if flag in _AUTH_FLAGS_PATH:
+        return _safe_path_arg(value)
+    if flag in _AUTH_FLAGS_SLUG:
+        return _safe_slug_arg(value)
+    if flag in _AUTH_FLAGS_REASON:
+        # Free-text reason: only reject shell metacharacters.
+        if not value:
+            return False
+        return not any(ch in _PATH_METACHAR_CHARS for ch in value)
+    return False
+
+
 def protected_alias_reason(
     text: str,
     agent: str,
@@ -1825,6 +2442,22 @@ def protected_alias_reason(
     if _bash_argv_references_path(text, roster_local_path()):
         if read_intent:
             return None
+        # Issue #1255 r2 — admin roster read carve-out is a strict
+        # read-intent whitelist (cat / grep / head / `agent-bridge
+        # config get` / …). r1 used a write-intent blacklist that
+        # tolerated unknown stage leaders; codex r1 review showed that
+        # let `python3 /tmp/mutator.py <roster>`, `my-mutator
+        # <roster>`, and `git commit -F <roster>` slip past as
+        # "non-write" while in fact mutating or leaking the roster
+        # outside the `agent-bridge config set` audit chain. The
+        # whitelist captures every shape #1255 was meant to unblock
+        # (operator diagnostics: `cat $roster`, `grep BRIDGE $roster`,
+        # `head -10 $roster`) without exposing arbitrary admin
+        # binaries that happen to take the roster as an argv element.
+        # Write paths still flow through the `agent-bridge config
+        # set` wrapper carve-out above.
+        if admin and _bash_command_has_read_intent(text):
+            return None
         # Admin no longer bypasses the roster path (codex r1 #341 CP2);
         # mutations route through `agent-bridge config set`.
         if admin:
@@ -1839,8 +2472,34 @@ def protected_alias_reason(
         if read_intent:
             return None
         return SYSTEM_CONFIG_DENY_REASON
-    if admin:
+    # Issue #6607 — anchored admin bridge-verb allowlist (replaces the
+    # previous broad `if admin: return None` bypass that codex r1
+    # rejected as a command-injection surface).
+    #
+    # The credential / env-dump / roster / queue / system-config gates
+    # above already deny secret-bearing text and protected-path argv;
+    # those denies fire BEFORE we get here, so a matched bridge verb
+    # cannot smuggle secret content through. The allowlist's job is to
+    # let admin (and, where the verb explicitly permits, non-admin) run
+    # the three sanctioned cross-agent communication / token-management
+    # verbs that legitimately reference peer agent homes inside their
+    # argv — which would otherwise trip the peer-alias substring deny
+    # below.
+    #
+    # `_admin_bridge_verb_check` returns:
+    #   - (True, None): verb shape matched + role permitted + args safe.
+    #       An audit row was emitted; allow.
+    #   - (False, str): verb shape recognized but role / arg safety
+    #       failed. Return the explicit deny reason so a traversal arg
+    #       like `--body-file ../../secret` cannot fall through to the
+    #       peer/shared check (which would silently allow it because
+    #       `../../secret` does not reference a peer agent home).
+    #   - (False, None): not a bridge-verb invocation; fall through.
+    verb_allowed, verb_deny = _admin_bridge_verb_check(text, agent, tool_input)
+    if verb_allowed:
         return None
+    if verb_deny is not None:
+        return verb_deny
 
     # Issue #539 follow-up — Stage A: shared/private/ and shared/secrets/
     # are off-limits for every non-admin agent regardless of class.

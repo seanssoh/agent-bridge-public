@@ -27,16 +27,14 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
-  rmdirSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'fs'
-import { homedir, tmpdir } from 'os'
+import { homedir } from 'os'
 import { basename, isAbsolute as pathIsAbsolute, join, resolve as pathResolve } from 'path'
 import { createRecentMessageDeduper, storedRowMatchesIncoming } from './dedupe.ts'
 
@@ -168,27 +166,6 @@ const HOST = process.env.TEAMS_WEBHOOK_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.TEAMS_WEBHOOK_PORT ?? '3978')
 const STATIC = process.env.TEAMS_ACCESS_MODE === 'static'
 
-if (process.env.TEAMS_BRIDGE_MODE === '1' || process.env.TEAMS_BRIDGE_AGENT) {
-  process.stderr.write(
-    'teams channel: legacy TEAMS_BRIDGE_MODE/TEAMS_BRIDGE_AGENT env vars are ignored; use TEAMS_DELIVERY_MODE=bridge instead\n',
-  )
-}
-
-type DeliveryMode = 'channel' | 'bridge' | 'both'
-
-// Resolve once at module load so an invalid value warns once on boot rather
-// than per inbound message. The resolved mode is reused by every
-// handleActivity call.
-const DELIVERY_MODE: DeliveryMode = (() => {
-  const raw = String(process.env.TEAMS_DELIVERY_MODE ?? '').trim().toLowerCase()
-  if (!raw) return 'channel'
-  if (raw === 'channel' || raw === 'bridge' || raw === 'both') return raw
-  process.stderr.write(
-    `teams channel: unsupported TEAMS_DELIVERY_MODE=${raw}; falling back to channel\n`,
-  )
-  return 'channel'
-})()
-
 const APP_ID = process.env.TEAMS_APP_ID ?? process.env.MicrosoftAppId
 const APP_PASSWORD = process.env.TEAMS_APP_PASSWORD ?? process.env.MicrosoftAppPassword
 const TENANT_ID = process.env.TEAMS_TENANT_ID ?? process.env.MicrosoftAppTenantId ?? ''
@@ -249,7 +226,23 @@ const parentDeathWatch = setInterval(() => {
 parentDeathWatch.unref?.()
 
 function ensureStateDir(): void {
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  // Issue #1215: STATE_DIR (the per-agent `.teams/` parent) is shared
+  // between the isolated UID and the controller's `ab-agent-<slug>`
+  // group on iso v2 hosts. Pre-#1215 the dir was created with mode
+  // `0o700` which produced `drw---S---` after the v2 chown/chgrp pass
+  // (no traversal bit for the group). The explicit `chmodSync` after
+  // `mkdirSync` self-heals an existing bad-mode dir on the next teams
+  // process startup. Match the ms365 fix shape — same family.
+  //
+  // MS365_CALLBACK_DIR stays `0o700`: only the teams plugin's listener
+  // and the controller's callback-claim helper need to read it, and
+  // both run as the same UID. The shared-callback contract is a
+  // different family (ab-shared/3770) and explicitly out of scope per
+  // the #1215 brief.
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o770 })
+  try {
+    chmodSync(STATE_DIR, 0o2770)
+  } catch {}
   mkdirSync(MS365_CALLBACK_DIR, { recursive: true, mode: 0o700 })
 }
 
@@ -517,9 +510,25 @@ export function writeTeamsActivityIndex(
       last_user_inbound_user_id: userId,
       last_user_inbound_recorded_ns: nowNs,
     }
+    // L1 beta19 (codex r1 design 2026-05-25): activity-index files are
+    // read by the controller daemon's route lookup (bridge-channels.py:
+    // 289-304) even when the file was created by an isolated UID. Mode
+    // 0600 blocks the daemon's read; widen to 0640 so the ab-shared
+    // group (which the reconciler sets via setgid on
+    // state/channels/teams/) covers the controller read path while world
+    // remains locked out.
+    //
+    // We chmod both the tmp file (in case the rename races a reader that
+    // opens by name before chmod hits) and the final file after rename
+    // (atomic-mode replace on most filesystems, but chmodSync is the
+    // belt-and-braces invariant). Keep the generic per-agent state files
+    // routed through saveJson() at mode 0600 — only the activity index
+    // needs the daemon-group read grant.
     const tmp = `${path}.tmp`
-    writeFileSync(tmp, JSON.stringify(index, null, 2) + '\n', { mode: 0o600 })
+    writeFileSync(tmp, JSON.stringify(index, null, 2) + '\n', { mode: 0o640 })
+    chmodSync(tmp, 0o640)
     renameSync(tmp, path)
+    chmodSync(path, 0o640)
   } catch (err) {
     process.stderr.write(`teams channel: activity-index write failed: ${err}\n`)
   }
@@ -1010,46 +1019,6 @@ function runPromptGuard(command: 'scan' | 'sanitize', text: string): Record<stri
   }
 }
 
-/**
- * Build the rich Teams metadata used by bridge-mode queue task bodies and
- * local replay/audit paths. Keep notifications/claude/channel on the scalar
- * projection below: Claude Code channel delivery has silently dropped some
- * notifications when nested arrays/objects are present in params.meta.
- */
-function buildChannelMeta(
-  activity: Activity,
-  stored: StoredMessage,
-  attachments: StoredAttachment[],
-): Record<string, unknown> {
-  return {
-    source: 'teams',
-    chat_id: stored.chat_id,
-    conversation_id: stored.chat_id,
-    message_id: stored.message_id,
-    user: stored.user,
-    user_id: stored.user_id,
-    aad_object_id: stored.aad_object_id,
-    tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
-    service_url: String(activity.serviceUrl ?? ''),
-    text: stored.text,
-    ts: stored.ts,
-    ...(stored.revision ? { revision: stored.revision } : {}),
-    ...(attachments.length > 0
-      ? {
-          attachment_count: String(attachments.length),
-          attachments: attachments.map(att => ({
-            name: att.name,
-            content_type: att.content_type,
-            download_status: att.download_status,
-            ...(att.local_path ? { local_path: att.local_path } : {}),
-            ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
-            ...(att.download_error ? { download_error: att.download_error } : {}),
-          })),
-        }
-      : {}),
-  }
-}
-
 function compactMetaList(values: Array<string | undefined>): string {
   const cleaned = values
     .map(value => String(value ?? '').trim())
@@ -1058,10 +1027,9 @@ function compactMetaList(values: Array<string | undefined>): string {
 }
 
 /**
- * Claude channel notification metadata must stay flat and string-only. Rich
- * attachment details remain available in buildChannelMeta for bridge-mode and
- * fetch/replay flows; this projection keeps direct channel injection from
- * depending on nested JSON support in Claude Code's notification handler.
+ * Claude channel notification metadata stays flat and string-only because
+ * Claude Code's MCP notification handler has silently dropped notifications
+ * when nested arrays/objects are present in params.meta.
  */
 function buildChannelNotificationMeta(
   activity: Activity,
@@ -1096,102 +1064,6 @@ function buildChannelNotificationMeta(
     if (downloadErrors) meta.attachment_download_errors = downloadErrors
   }
   return meta
-}
-
-/**
- * Bridge-mode delivery (issue #959): enqueue the inbound Teams message as an
- * Agent Bridge queue task via `bridge-task.sh create`. Used when
- * TEAMS_DELIVERY_MODE is `bridge` or `both`. The daemon then wakes the agent
- * through the standard inbox path, sidestepping the channel-only failure
- * mode where `await mcp.notification()` resolves but Claude Code's MCP
- * notification handler never injects the message into the session.
- *
- * Best-effort: misconfiguration or queue failure logs to stderr but never
- * throws. Throwing would force a Teams webhook retry, which the channel-mode
- * path already covers when caller selected `both`; in `bridge`-only mode the
- * operator has opted into queue-only delivery and silent loss is preferable
- * to retry storms when the queue itself is unhealthy.
- */
-function truncateForTitle(s: string, maxCodepoints: number): string {
-  // String.slice operates on UTF-16 code units, which splits surrogate pairs
-  // (any non-BMP character — most emoji, CJK extensions, etc.) and leaves a
-  // lone surrogate. Spread iterates by Unicode codepoint, so the slice
-  // boundary always falls on a complete character.
-  const codepoints = [...s]
-  if (codepoints.length <= maxCodepoints) return s
-  return codepoints.slice(0, maxCodepoints - 1).join('') + '…'
-}
-
-function deliverViaBridgeQueue(
-  activity: Activity,
-  stored: StoredMessage,
-  attachments: StoredAttachment[],
-): void {
-  const agent = String(process.env.BRIDGE_AGENT_ID ?? '').trim()
-  if (!agent) {
-    process.stderr.write(`teams channel: bridge-mode delivery skipped — BRIDGE_AGENT_ID unset, message_id=${stored.message_id}\n`)
-    return
-  }
-  const taskScript = join(BRIDGE_HOME, 'bridge-task.sh')
-  if (!existsSync(taskScript)) {
-    process.stderr.write(`teams channel: bridge-mode delivery skipped — bridge-task.sh not found at ${taskScript}, message_id=${stored.message_id}\n`)
-    return
-  }
-
-  const body = JSON.stringify(buildChannelMeta(activity, stored, attachments), null, 2)
-
-  // Tempfile delivery dodges argv length limits and shell-escaping of the
-  // arbitrary user-supplied body. mkdtemp guarantees a fresh unique directory
-  // even on same-ms collisions; opening the file with 'wx' fails fast if an
-  // attacker pre-created the path. 0o600 keeps the JSON payload (which may
-  // contain user PII / message text) off any group-readable tmp.
-  const safeMid = stored.message_id.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 80) || 'msg'
-  let bodyDir: string
-  try {
-    bodyDir = mkdtempSync(join(tmpdir(), 'teams-bridge-'))
-  } catch (err) {
-    process.stderr.write(`teams channel: bridge-mode delivery skipped — could not create body dir: ${err}, message_id=${stored.message_id}\n`)
-    return
-  }
-  const bodyFile = join(bodyDir, `${safeMid}.json`)
-  try {
-    writeFileSync(bodyFile, body, { mode: 0o600, flag: 'wx' })
-  } catch (err) {
-    process.stderr.write(`teams channel: bridge-mode delivery skipped — could not write body file: ${err}, message_id=${stored.message_id}\n`)
-    // Mirror the success-path finally: drop the file (may exist as a partial
-    // write) before rmdir so a non-empty dir doesn't leak both artifacts.
-    try { unlinkSync(bodyFile) } catch {}
-    try { rmdirSync(bodyDir) } catch {}
-    return
-  }
-
-  // Title budget: cap WHOLE title (prefix + user + text) to TITLE_MAX so a
-  // long Teams display name can't push the user-visible text off the inbox
-  // row. Single ellipsis at the end keeps the truncation obvious.
-  const TITLE_MAX = 120
-  const rawTitle = `[teams] ${stored.user || 'user'}: ${stored.text || '(attachment)'}`
-  const title = truncateForTitle(rawTitle, TITLE_MAX)
-  try {
-    const r = spawnSync(
-      'bash',
-      [
-        taskScript,
-        'create',
-        '--to', agent,
-        '--from', 'teams-channel',
-        '--title', title,
-        '--body-file', bodyFile,
-      ],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
-    )
-    if (r.status !== 0) {
-      const stderrTail = r.stderr ? r.stderr.toString().slice(0, 200) : ''
-      process.stderr.write(`teams channel: bridge-mode enqueue failed rc=${r.status}, message_id=${stored.message_id}: ${stderrTail}\n`)
-    }
-  } finally {
-    try { unlinkSync(bodyFile) } catch {}
-    try { rmdirSync(bodyDir) } catch {}
-  }
 }
 
 function recentMessages(chatId: string, limit: number): StoredMessage[] {
@@ -1722,6 +1594,262 @@ function logDuplicateDrop(chatId: string, messageId: string): void {
   duplicateDropLogs += 1
 }
 
+// Issue #1313 (CRITICAL data-loss): the prior catch block called
+// `recentMessageIds.forget(dedupeKey(...))` on mcp.notification failure and
+// re-threw. The intent was "let Teams retry the webhook", but the side
+// effect was:
+//   1. dedup state for the in-flight message is dropped,
+//   2. Teams retries the webhook,
+//   3. the retry passes the in-memory dedup check (now empty) and the
+//      log-replay dedup (no row yet — appendMessage runs *after* the
+//      MCP notification),
+//   4. MCP notification is attempted again. If MCP is still degraded,
+//      the same failure repeats and Claude never receives the message.
+//   5. Worse: a transient MCP hiccup that recovers between Teams retries
+//      can yield N notifications for the same message (the "log silently
+//      lost" symptom from the patch C7 audit).
+//
+// Fix (Option 1 — internal retry, dedup-preserving):
+//   - Try the MCP notification up to MCP_NOTIFICATION_MAX_ATTEMPTS times
+//     with exponential backoff (base MCP_NOTIFICATION_BACKOFF_MS, doubling
+//     per attempt, jitter-free for predictability under smoke harness).
+//   - If a retry succeeds, behaviour is identical to a first-try success.
+//   - If all attempts fail, emit a structured audit line to stderr
+//     (teams_mcp_notification_failed_permanent) so the operator's daemon
+//     log scraper can escalate to an admin task. Then SWALLOW the error:
+//     returning 2xx to Teams stops Bot Framework from re-driving the same
+//     webhook against a degraded MCP transport (which would loop with no
+//     net progress). The dedup entry is preserved on every code path so
+//     a Teams retry that does sneak through is dropped cleanly.
+//
+// Edge cases (per #1313 brief):
+//   - Genuine new message vs Teams retry: dedupeKey() composes chat_id +
+//     message_id + revision (line 1587). A genuine new message has a new
+//     message_id or bumped revision, so it gets a fresh entry. A retry of
+//     the same activity collides on the same key — dropped at the seen()
+//     check above the try block.
+//   - Race (two concurrent inbound webhooks for the same activity.id):
+//     recentMessageIds.seen() is a Set+Queue Set.has check; the first
+//     caller wins, the second sees true and drops. No double-deliver.
+//   - MCP recovers mid-retry: attempt 2 succeeds → audit row not emitted,
+//     dedup stays, normal success path resumes.
+//   - Claude Code restart between Teams send + MCP retry: the StdioServer
+//     transport will fail every attempt; the audit row records the
+//     permanent failure. dedup stays — once Claude reconnects the next
+//     fresh Teams message flows through, no replay of the lost message
+//     (that's a separate persistence concern, tracked in the issue body).
+//   - Perma-down (MCP transport gone): all attempts fail → one audit row
+//     per failed message; Teams stops retrying (we return 2xx); admin
+//     sees the audit lines accumulate.
+//
+// The helper is exported for the `_smoke-mcp-retry` harness so the smoke
+// can exercise the retry-and-give-up shape without spinning up a real
+// MCP transport.
+const MCP_NOTIFICATION_MAX_ATTEMPTS = 3
+const MCP_NOTIFICATION_BACKOFF_MS = 100
+
+export type DeliverNotificationResult = {
+  delivered: boolean
+  attempts: number
+  errors: string[]
+}
+
+/**
+ * Deliver an MCP notification with bounded retry-and-backoff.
+ *
+ * @param send    closure that performs the actual `mcp.notification(...)`
+ *                call. Returns void on success, throws on failure.
+ * @param sleep   injectable async sleep — tests pass a no-op so the
+ *                harness completes in ms instead of seconds.
+ * @param opts    override the default attempt count / backoff base.
+ *
+ * Contract: `delivered: true` means at least one attempt resolved with
+ * no thrown error. `delivered: false` means every attempt threw; the
+ * caller is responsible for the perma-fail audit + swallow decision.
+ * The function never throws.
+ */
+export async function deliverMcpNotificationWithRetry(
+  send: () => Promise<void>,
+  sleep: (ms: number) => Promise<void> = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  opts: { maxAttempts?: number; backoffMs?: number } = {},
+): Promise<DeliverNotificationResult> {
+  const maxAttempts = Number.isFinite(opts.maxAttempts) && (opts.maxAttempts ?? 0) > 0
+    ? Math.floor(opts.maxAttempts ?? 0)
+    : MCP_NOTIFICATION_MAX_ATTEMPTS
+  const backoffMs = Number.isFinite(opts.backoffMs) && (opts.backoffMs ?? -1) >= 0
+    ? Math.floor(opts.backoffMs ?? 0)
+    : MCP_NOTIFICATION_BACKOFF_MS
+  const errors: string[] = []
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await send()
+      return { delivered: true, attempts: attempt, errors }
+    } catch (err) {
+      errors.push(String(err))
+      if (attempt < maxAttempts) {
+        // Exponential backoff: attempt 1 → backoffMs, 2 → 2*backoffMs, …
+        await sleep(backoffMs * Math.pow(2, attempt - 1))
+      }
+    }
+  }
+  return { delivered: false, attempts: maxAttempts, errors }
+}
+
+/**
+ * Resolve the absolute path to `bridge-task.sh`. Mirrors the pattern in
+ * `bridge-memory.py` (BRIDGE_HOME-relative). `BRIDGE_SCRIPT_DIR` takes
+ * precedence when set (the daemon exports it on every isolated runner);
+ * otherwise we fall back to `BRIDGE_HOME` → `${HOME}/.agent-bridge`.
+ *
+ * Returns the resolved path even if the file does not exist on disk —
+ * the caller checks `existsSync` before spawning so the audit-row says
+ * `bridge_task_not_found` instead of crashing the plugin.
+ */
+function resolveBridgeTaskPath(): string {
+  const scriptDir = (process.env.BRIDGE_SCRIPT_DIR ?? '').trim()
+  if (scriptDir) {
+    return join(scriptDir, 'bridge-task.sh')
+  }
+  const bridgeHome = (process.env.BRIDGE_HOME ?? '').trim() || join(homedir(), '.agent-bridge')
+  return join(bridgeHome, 'bridge-task.sh')
+}
+
+/**
+ * Emit a structured permanent-failure audit line for an MCP notification
+ * that exhausted all retries, and queue an admin escalation task so the
+ * operator gets a durable, queue-tracked signal (not just a stderr line).
+ *
+ * Stderr line — operator log breadcrumb, grep-friendly:
+ *
+ *   teams channel: teams_mcp_notification_failed_permanent message_id=<id> chat_id=<id> attempts=<n> last_error=<text>
+ *
+ * Admin task — canonical operator signal. Created via the EXISTING
+ * `bridge-task.sh create` boundary (queue-first contract, CLAUDE.md
+ * §"Queue-First Is a Contract"). Routed to `$BRIDGE_ADMIN_AGENT_ID`
+ * with priority `high`. The task body carries the same fields as the
+ * stderr line plus a one-line operator action hint.
+ *
+ * Fallback ladder (each step writes its own stderr audit so the
+ * operator log shows WHY the queue task was skipped):
+ *
+ *   1. BRIDGE_ADMIN_AGENT_ID unset → stderr-only, audit reason
+ *      `admin_task_skipped reason=no_admin_configured`.
+ *   2. bridge-task.sh path missing → stderr-only, audit reason
+ *      `admin_task_skipped reason=bridge_task_not_found path=<resolved>`.
+ *   3. spawnSync nonzero exit → audit `admin_task_failed status=<n>
+ *      stderr=<truncated>`.
+ *   4. spawnSync throws (ENOENT, EACCES, …) → audit
+ *      `admin_task_exception err=<truncated>`.
+ *
+ * The function never throws — Teams webhook ack must not be blocked by
+ * a queue-create error. spawnSync timeout is 2000ms to bound the
+ * webhook-side latency hit (issue #1336 R2 brief edge-case #3).
+ *
+ * Exported for the `_smoke-mcp-retry` harness.
+ */
+export function emitMcpDeliveryFailurePermanent(
+  chatId: string,
+  messageId: string,
+  attempts: number,
+  errors: string[],
+): void {
+  const lastError = errors.length > 0 ? errors[errors.length - 1] : ''
+  // One-liner: keep grep-greppable; collapse newlines in the error to
+  // keep the audit row on a single line (downstream log parsers split
+  // on `\n`).
+  const sanitizedError = String(lastError).replace(/[\r\n]+/g, ' ').slice(0, 512)
+  process.stderr.write(
+    `teams channel: teams_mcp_notification_failed_permanent`
+      + ` message_id=${messageId}`
+      + ` chat_id=${chatId}`
+      + ` attempts=${attempts}`
+      + ` last_error=${sanitizedError}\n`,
+  )
+
+  // Admin task escalation — queue-first canonical operator signal.
+  const adminAgent = (process.env.BRIDGE_ADMIN_AGENT_ID ?? '').trim()
+  if (!adminAgent) {
+    process.stderr.write(
+      `teams channel: teams_mcp_perma_fail_admin_task_skipped`
+        + ` reason=no_admin_configured`
+        + ` message_id=${messageId}\n`,
+    )
+    return
+  }
+  const taskCli = resolveBridgeTaskPath()
+  if (!existsSync(taskCli)) {
+    process.stderr.write(
+      `teams channel: teams_mcp_perma_fail_admin_task_skipped`
+        + ` reason=bridge_task_not_found`
+        + ` path=${taskCli}`
+        + ` message_id=${messageId}\n`,
+    )
+    return
+  }
+  const taskTitle = `[teams-mcp-perma-fail] message ${messageId} undelivered after ${attempts} retries`
+  const taskBody = [
+    `Teams MCP notification failed permanently after ${attempts} retries.`,
+    ``,
+    `message_id: ${messageId}`,
+    `chat_id: ${chatId}`,
+    `attempts: ${attempts}`,
+    `last_error: ${sanitizedError}`,
+    ``,
+    `Operator action: inspect Teams channel + Claude session state.`,
+    `Manual re-deliver may be required. The dedup entry was preserved`,
+    `(beta5-2 Lane ζ contract) so a re-driven webhook will not re-fire.`,
+  ].join('\n')
+  try {
+    const result = spawnSync(
+      'bash',
+      [
+        taskCli,
+        'create',
+        '--to', adminAgent,
+        '--title', taskTitle,
+        '--body', taskBody,
+        '--priority', 'high',
+      ],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 2000,
+        encoding: 'utf8',
+      },
+    )
+    if (result.error) {
+      const errText = String(result.error).replace(/[\r\n]+/g, ' ').slice(0, 256)
+      process.stderr.write(
+        `teams channel: teams_mcp_perma_fail_admin_task_exception`
+          + ` err=${errText}`
+          + ` message_id=${messageId}\n`,
+      )
+      return
+    }
+    if (result.status !== 0) {
+      const stderrText = String(result.stderr ?? '').replace(/[\r\n]+/g, ' ').slice(0, 256)
+      process.stderr.write(
+        `teams channel: teams_mcp_perma_fail_admin_task_failed`
+          + ` status=${result.status}`
+          + ` stderr=${stderrText}`
+          + ` message_id=${messageId}\n`,
+      )
+      return
+    }
+    process.stderr.write(
+      `teams channel: teams_mcp_perma_fail_admin_task_created`
+        + ` admin=${adminAgent}`
+        + ` message_id=${messageId}\n`,
+    )
+  } catch (err) {
+    const errText = String(err).replace(/[\r\n]+/g, ' ').slice(0, 256)
+    process.stderr.write(
+      `teams channel: teams_mcp_perma_fail_admin_task_exception`
+        + ` err=${errText}`
+        + ` message_id=${messageId}\n`,
+    )
+  }
+}
+
 const mcp = new Server(
   { name: 'teams', version: '0.1.0' },
   {
@@ -2122,51 +2250,48 @@ async function handleActivity(context: TurnContext): Promise<void> {
     ...(revision ? { revision } : {}),
     ...(attachments.length > 0 ? { attachments } : {}),
   }
-  // Channel delivery and local log append are split: a channel-mode delivery
-  // failure must surface as a non-2xx so Teams retries, but a successful
-  // delivery followed by a failed log append (disk full, EACCES, …) should
-  // NOT cause Teams to retry — the message is already in the active Claude
-  // session. The only observable consequence of a log-append failure is that
-  // fetch_messages can't replay this entry from the local audit log.
+  // Channel delivery and local log append are split:
   //
-  // TEAMS_DELIVERY_MODE (issue #959): `channel` (default) preserves the
-  // existing notifications/claude/channel path; `bridge` enqueues a queue
-  // task instead (sidesteps Claude Code's silent notification-handler drop);
-  // `both` fires both for defense in depth (accepting possible duplicate
-  // delivery).
-  const mode = DELIVERY_MODE
-  let channelDelivered = false
-  let channelError: unknown = null
-  if (mode === 'channel' || mode === 'both') {
-    try {
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          content: text || (attachments.length > 0 ? '(attachment)' : ''),
-          meta: buildChannelNotificationMeta(activity, stored, attachments),
-        },
-      })
-      channelDelivered = true
-    } catch (err) {
-      channelError = err
-      process.stderr.write(`teams channel: failed to deliver inbound message_id=${messageId} via channel: ${err}\n`)
+  //   1. MCP delivery: bounded retry-with-backoff inside
+  //      deliverMcpNotificationWithRetry (issue #1313 — Lane ζ). The
+  //      dedup entry is preserved on every outcome so a Teams webhook
+  //      retry that races us is dropped at the seen() check above. On
+  //      permanent failure we emit the audit row + swallow (no throw)
+  //      so Bot Framework stops re-driving the same activity against a
+  //      degraded MCP transport (which would loop with no net progress
+  //      and previously cost the message entirely once dedup got
+  //      forgotten on the first failure).
+  //   2. Local log append: best-effort after a confirmed MCP delivery.
+  //      A failed log append (disk full, EACCES, …) only means
+  //      fetch_messages can't replay this entry from the local audit
+  //      log — the message is already in the active Claude session.
+  //
+  // Inbound messages are delivered exclusively via the MCP channel
+  // notification (issue #1204): the prior bridge-queue delivery workaround
+  // was removed because it silently dropped messages when BRIDGE_AGENT_ID
+  // was unset in the plugin's environment, masking the very bug it claimed
+  // to work around.
+  const deliverResult = await deliverMcpNotificationWithRetry(
+    () => mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: text || (attachments.length > 0 ? '(attachment)' : ''),
+        meta: buildChannelNotificationMeta(activity, stored, attachments),
+      },
+    }),
+  )
+  if (!deliverResult.delivered) {
+    // All retries exhausted. Emit the structured permanent-failure
+    // audit row so the operator's log scraper escalates to an admin
+    // task, then swallow the error: returning 2xx to Teams stops Bot
+    // Framework from re-driving the same activity webhook against a
+    // degraded MCP transport. The dedup entry stays, so any in-flight
+    // Teams retry that races us is dropped at the seen() check above.
+    for (const errText of deliverResult.errors) {
+      process.stderr.write(`teams channel: failed to deliver inbound message_id=${messageId} via channel: ${errText}\n`)
     }
-  }
-
-  if (mode === 'bridge' || mode === 'both') {
-    // Bridge-mode failures log but do not throw — operators choosing bridge
-    // or both have accepted best-effort enqueue. See deliverViaBridgeQueue.
-    deliverViaBridgeQueue(activity, stored, attachments)
-  }
-
-  // Channel-mode (and both-mode) failure surfaces to Teams so it retries; in
-  // both-mode we re-throw on channel failure even though bridge may have
-  // succeeded, so Teams's at-least-once channel delivery contract holds.
-  // Bridge-only mode never throws here — its delivery is best-effort by
-  // design.
-  if ((mode === 'channel' || mode === 'both') && !channelDelivered) {
-    recentMessageIds.forget(dedupeKey(chatId, messageId, revision))
-    throw channelError
+    emitMcpDeliveryFailurePermanent(chatId, messageId, deliverResult.attempts, deliverResult.errors)
+    return
   }
 
   try {
@@ -2218,6 +2343,65 @@ export function isInboundFromBotOrSelf(activity: Partial<Activity> & { from?: { 
   return false
 }
 
+/**
+ * L1 beta19 (codex r1 design 2026-05-25): BotFrameworkAdapter's
+ * processActivity assumes an Express-shaped response with `status()`
+ * and `send()`. Node's native http.ServerResponse only exposes
+ * `writeHead/end`, so the adapter throws TypeError on response-write
+ * paths (auth challenges, error replies). This shim adapts the
+ * native response to the Express subset the adapter actually calls.
+ *
+ * We deliberately do NOT migrate to CloudAdapter.processActivityDirect
+ * — that changes the auth/adapter semantics (CloudAdapter expects
+ * SingleTenant/MultiTenant credential resolution paths the current
+ * BotFrameworkAdapter setup does not have) and is well out of scope
+ * for an L1 stabilization fix.
+ *
+ * Exported for the shim smoke harness (server.ts `_smoke-shim`
+ * subcommand).
+ *
+ * Contract:
+ *   status(code)   → sets res.statusCode, returns the shim (chainable).
+ *   send(body)     → ends the native response exactly once.
+ *     Buffer / string  → res.end(body) as-is
+ *     object           → JSON.stringify + 'Content-Type: application/json'
+ *                        (only when no Content-Type already set)
+ *     undefined / null → res.end() with no body
+ *
+ * Second `send()` call is a no-op (defensive against the adapter
+ * accidentally double-ending on an error catch path).
+ */
+export function createExpressResponseShim(res: import('http').ServerResponse): {
+  status(code: number): any
+  send(body?: unknown): any
+} {
+  let ended = false
+  const shim: any = {
+    status(code: number) {
+      res.statusCode = code
+      return shim
+    },
+    send(body?: unknown) {
+      if (ended) return shim
+      ended = true
+      if (body === undefined || body === null) {
+        res.end()
+        return shim
+      }
+      if (Buffer.isBuffer(body) || typeof body === 'string') {
+        res.end(body)
+        return shim
+      }
+      if (!res.getHeader('Content-Type')) {
+        res.setHeader('Content-Type', 'application/json')
+      }
+      res.end(JSON.stringify(body))
+      return shim
+    },
+  }
+  return shim
+}
+
 const httpServer = createServer((req, res) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
   if (req.method === 'GET' && url.pathname === '/health') {
@@ -2231,7 +2415,8 @@ const httpServer = createServer((req, res) => {
     return
   }
   if (req.method === 'POST' && url.pathname === '/api/messages') {
-    adapter.processActivity(req, res, async context => {
+    const shim = createExpressResponseShim(res)
+    adapter.processActivity(req, shim as any, async context => {
       await handleActivity(context)
     }).catch(err => {
       process.stderr.write(`teams channel: processActivity failed: ${err}\n`)
@@ -2335,14 +2520,185 @@ if (CLI_SUBCOMMAND === 'send-managed') {
   process.exit(code)
 }
 
-// Internal smoke harness — exercised only by tests/precompact-notify/teams-mattermost-adapter.sh.
+// Internal smoke harness — exercised only by tests/precompact-notify/teams-mattermost-adapter.sh
+// and scripts/smoke/zeta-beta5-2-teams-mcp-dedup.sh.
 // `_smoke-record-activity` invokes writeTeamsActivityIndex directly so the
 // smoke can validate the activity-index file schema without spinning up a
 // full Bot Framework adapter. `_smoke-should-record` reports whether a
 // synthesized activity would be skipped by the bot-self filter.
 // `_smoke-channel-meta` asserts the direct Claude channel notification uses
-// scalar metadata, not the richer bridge queue payload. All smoke commands
-// short-circuit before httpServer.listen.
+// scalar metadata, not the richer bridge queue payload.
+// `_smoke-mcp-retry` exercises deliverMcpNotificationWithRetry +
+// emitMcpDeliveryFailurePermanent (issue #1313) without standing up a
+// real MCP transport. All smoke commands short-circuit before
+// httpServer.listen.
+if (CLI_SUBCOMMAND === '_smoke-shim') {
+  // L1 beta19 (codex r1 design 2026-05-25): exercise createExpressResponseShim
+  // with a fake http.ServerResponse that has writeHead/end but no
+  // status/send. The shim is what closes the BotFrameworkAdapter
+  // TypeError. Asserts response completes cleanly (no thrown TypeError
+  // on `res.status(...).send(...)`), and that the status + content-type
+  // + body propagated through to the underlying response. Output is
+  // a single JSON line on stdout consumed by the smoke harness.
+  const argv = process.argv.slice(3)
+  const flags: Record<string, string> = {}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (!arg.startsWith('--')) continue
+    const key = arg.slice(2)
+    const value = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : ''
+    if (value) i++
+    flags[key] = value
+  }
+  const variant = String(flags['variant'] ?? 'json').trim()
+  // Build a minimal ServerResponse stand-in: just statusCode, headers,
+  // writeHead, end, setHeader, getHeader. Express does not introspect
+  // beyond these for the status/send code paths.
+  const headers: Record<string, string | number | string[]> = {}
+  let body: any = undefined
+  let ended = false
+  let endCalls = 0
+  const fakeRes: any = {
+    statusCode: 0,
+    headersSent: false,
+    writeHead(code: number, hdrs?: Record<string, string | number>) {
+      fakeRes.statusCode = code
+      fakeRes.headersSent = true
+      if (hdrs) Object.assign(headers, hdrs)
+    },
+    setHeader(name: string, value: string | number | string[]) {
+      headers[name] = value
+    },
+    getHeader(name: string) {
+      return headers[name]
+    },
+    end(b?: any) {
+      endCalls++
+      ended = true
+      body = b
+    },
+  }
+  let threw = false
+  let errMsg = ''
+  try {
+    const shim = createExpressResponseShim(fakeRes as any)
+    if (variant === 'json') {
+      shim.status(202).send({ ok: true, smoke: 'shim' })
+    } else if (variant === 'string') {
+      shim.status(200).send('plain string body')
+    } else if (variant === 'buffer') {
+      shim.status(200).send(Buffer.from('buffer-body'))
+    } else if (variant === 'empty') {
+      shim.status(204).send()
+    } else if (variant === 'null') {
+      shim.status(204).send(null)
+    } else if (variant === 'double-send') {
+      shim.status(200).send({ first: true })
+      shim.send({ second: 'should be ignored' })
+    } else {
+      process.stderr.write(`teams _smoke-shim: unknown variant '${variant}'\n`)
+      process.exit(2)
+    }
+  } catch (e) {
+    threw = true
+    errMsg = String(e)
+  }
+  const result = {
+    variant,
+    threw,
+    err: errMsg,
+    ended,
+    endCalls,
+    statusCode: fakeRes.statusCode,
+    contentType: headers['Content-Type'] ?? null,
+    bodyKind: body === undefined
+      ? 'undefined'
+      : body === null
+        ? 'null'
+        : Buffer.isBuffer(body)
+          ? 'buffer'
+          : typeof body,
+    bodyString: body === undefined || body === null ? '' : String(body),
+  }
+  process.stdout.write(JSON.stringify(result) + '\n')
+  process.exit(0)
+}
+
+if (CLI_SUBCOMMAND === '_smoke-mcp-retry') {
+  // Issue #1313 Lane ζ (#1313): exercise deliverMcpNotificationWithRetry
+  // + emitMcpDeliveryFailurePermanent without standing up a real MCP
+  // transport. Variants:
+  //
+  //   succeed-first  — send() resolves on attempt 1.
+  //   succeed-second — send() throws on attempt 1, resolves on attempt 2
+  //                    (MCP recovers mid-retry).
+  //   all-fail       — send() throws on every attempt (perma-down).
+  //   custom         — read --attempts (N total) and --fail-until (1-based
+  //                    attempt index, exclusive — every attempt < this
+  //                    index throws; the attempt at this index resolves).
+  //                    Set --fail-until 99 with --attempts 3 for "all fail".
+  //
+  // Output is a single JSON line on stdout consumed by the smoke harness.
+  // The audit-emit helper is invoked when delivered=false so the smoke
+  // can grep the captured stderr for the structured token.
+  const argv = process.argv.slice(3)
+  const flags: Record<string, string> = {}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (!arg.startsWith('--')) continue
+    const key = arg.slice(2)
+    const value = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : ''
+    if (value) i++
+    flags[key] = value
+  }
+  const variant = String(flags['variant'] ?? 'succeed-first').trim()
+  let maxAttempts: number
+  let failUntil: number
+  if (variant === 'succeed-first') {
+    maxAttempts = 3
+    failUntil = 1
+  } else if (variant === 'succeed-second') {
+    maxAttempts = 3
+    failUntil = 2
+  } else if (variant === 'all-fail') {
+    maxAttempts = 3
+    failUntil = 99
+  } else if (variant === 'custom') {
+    maxAttempts = Number(flags['attempts'] ?? '3')
+    failUntil = Number(flags['fail-until'] ?? '99')
+  } else {
+    process.stderr.write(`teams _smoke-mcp-retry: unknown variant '${variant}'\n`)
+    process.exit(2)
+  }
+  let calls = 0
+  const send = async (): Promise<void> => {
+    calls += 1
+    if (calls < failUntil) {
+      throw new Error(`smoke-injected-failure attempt=${calls}`)
+    }
+  }
+  const sleepCalls: number[] = []
+  const fakeSleep = async (ms: number): Promise<void> => {
+    sleepCalls.push(ms)
+    // No real wait — smoke completes in milliseconds.
+  }
+  const chatId = String(flags['chat-id'] ?? 'chat-smoke').trim()
+  const messageId = String(flags['message-id'] ?? 'message-smoke').trim()
+  const result = await deliverMcpNotificationWithRetry(send, fakeSleep, { maxAttempts, backoffMs: 100 })
+  if (!result.delivered) {
+    emitMcpDeliveryFailurePermanent(chatId, messageId, result.attempts, result.errors)
+  }
+  process.stdout.write(JSON.stringify({
+    variant,
+    delivered: result.delivered,
+    attempts: result.attempts,
+    errorsCount: result.errors.length,
+    sleepCount: sleepCalls.length,
+    sleepCalls,
+  }) + '\n')
+  process.exit(0)
+}
+
 if (
   CLI_SUBCOMMAND === '_smoke-record-activity'
   || CLI_SUBCOMMAND === '_smoke-should-record'
@@ -2422,5 +2778,27 @@ sweepOutboundConsents().catch(err => {
 httpServer.listen(PORT, HOST, () => {
   process.stderr.write(`teams channel: listening on http://${HOST}:${PORT} (/api/messages, /auth/callback)\n`)
 })
+
+// Issue #1330 M7 (v0.14.5-beta5-2 Lane ξ): surface a startup warning when
+// BRIDGE_AGENT_ID is empty so the operator sees that the activity-index
+// write at line 2314 below will silently skip for the entire lifetime of
+// this MCP server. Without the warning, the missing activity-index causes
+// PreCompact channel-route lookup to miss the session-id mapping for this
+// agent, and the operator's only diagnostic is "channel dispatch fails"
+// long after the start-time root cause is forgotten.
+//
+// The warning fires once at server start, not on every inbound message.
+// The activity-index skip at line 2314 stays graceful (no per-message
+// stderr spam) because per-message logging would flood the channel when
+// the env is misconfigured at the bridge-start.sh / launch envelope
+// layer — the start-time warning is the actionable signal.
+if (!process.env.BRIDGE_AGENT_ID) {
+  process.stderr.write(
+    'teams channel: BRIDGE_AGENT_ID is empty at server start — PreCompact ' +
+    'activity-index writes will be skipped for every inbound message. ' +
+    'Verify the bridge launch envelope inlines BRIDGE_AGENT_ID (see ' +
+    'bridge-start.sh #1330 M7 / bridge-run.sh:350).\n',
+  )
+}
 
 await mcp.connect(new StdioServerTransport())
