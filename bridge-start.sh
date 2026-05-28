@@ -615,11 +615,35 @@ elif [[ $CONTINUE_EXPLICIT -eq 1 ]]; then
   EFFECTIVE_CONTINUE_MODE="$CONTINUE_MODE"
 fi
 
-# Issue #268: warn the operator when --no-continue is launching fresh but a
-# stale resume id is still persisted. Without this, an operator who used
-# --no-continue to escape a broken `claude --resume` does not realise the
-# next normal restart will pick the bad id back up.
-if [[ $CONTINUE_EXPLICIT -eq 1 && "$CONTINUE_MODE" == "0" ]]; then
+# Issue #268 + #1334 L4 (v0.14.5-beta5-2 Lane ξ): warn the operator when this
+# launch is effectively fresh (CONTINUE_MODE=0 — either operator-supplied
+# --no-continue OR controller-derived FORCE_FRESH_SESSION) but a stale
+# resume id is still persisted. The persisted id is NOT cleared by a
+# fresh-launch — only `agb agent forget-session <agent>` clears it
+# permanently — so the next normal restart will pick the bad id back up
+# without operator visibility.
+#
+# Order contract (must match bridge-run.sh:167-175 / #1334 L4): both
+# callers evaluate EFFECTIVE/explicit "continue=0" → persisted-id read →
+# warn-and-fall-through, in that sequence. The persisted id is never
+# clobbered here; FORCE_FRESH_SESSION only steers the engine launch line
+# (via --no-continue injected into SESSION_CMD), it does NOT mutate the
+# session-id persist file. That separation keeps the recovery path
+# explicit: operator must run `agb agent forget-session` to permanently
+# discard a known-bad id, and a fresh-for-this-run launch is a
+# non-destructive one-shot.
+#
+# Pre-#1334 bug: this branch checked `CONTINUE_EXPLICIT==1 && CONTINUE_MODE==0`,
+# so a controller-derived FORCE_FRESH (operator did not pass --no-continue,
+# but bridge_project_claude_guidance_needed / hook-status probes set
+# FORCE_FRESH_SESSION=1) silently skipped the warn at the bridge-start
+# layer — even though bridge-run.sh:167-175 DID warn after the injected
+# --no-continue made CONTINUE_EXPLICIT=1 there. Operators saw a single
+# bridge-run warning with no upstream context. Switching the gate to
+# EFFECTIVE_CONTINUE_MODE makes the bridge-start warn fire whenever the
+# effective state is "launch fresh + persisted id remains", matching the
+# bridge-run.sh end-state.
+if [[ "${EFFECTIVE_CONTINUE_MODE:-1}" == "0" ]]; then
   _persisted_session_id="$(bridge_agent_persisted_session_id "$AGENT")"
   if [[ -n "$_persisted_session_id" ]]; then
     bridge_warn "launched fresh for this run, but saved session_id=${_persisted_session_id} remains; next normal restart will resume it. Use 'agb agent forget-session $AGENT' to clear permanently."
@@ -837,6 +861,36 @@ if [[ -z "${BRIDGE_CONTROLLER_UID:-}" ]]; then
 else
   SESSION_CMD="BRIDGE_CONTROLLER_UID=$(printf '%q' "$BRIDGE_CONTROLLER_UID") ${SESSION_CMD}"
 fi
+# Issue #1330 M7 (v0.14.5-beta5-2 Lane ξ): inline BRIDGE_AGENT_ID into the
+# SESSION_CMD env prefix so child processes — Claude/Codex and any MCP
+# servers they spawn (plugins/teams, plugins/ms365, …) — see a populated
+# BRIDGE_AGENT_ID from the earliest moment.
+#
+# Why belt-and-suspenders: BRIDGE_AGENT_ID is set THREE other places:
+#   1. bridge-run.sh:140 (early — before bridge_load_roster reads the
+#      scoped roster snapshot, see #116).
+#   2. bridge-run.sh:350 (late — immediately before the engine exec).
+#   3. The per-agent env file at $BRIDGE_AGENT_ENV_FILE
+#      (lib/bridge-agents.sh:3559-3560), which is sourced inside
+#      bridge_load_roster.
+# None of these paths runs BEFORE the SESSION_CMD env prefix evaluates,
+# so MCP servers spawned by an engine path that bypasses bridge-run.sh
+# (or by an early hook like prompt_timestamp.py that reads BRIDGE_AGENT_ID
+# at source time) would see a blank scalar. The Teams MCP server's
+# activity-index write at plugins/teams/server.ts:2314 falls back to
+# "" → silent skip → PreCompact channel-route lookup later misses the
+# session-id mapping. Inlining here closes the gap at the env-prefix
+# level so every downstream consumer (including any future bare engine
+# launch that does not go through bridge-run.sh) inherits the populated
+# value.
+#
+# Quoting via printf '%q' keeps agent ids with whitespace / shell
+# metacharacters safe across the bash -lc boundary the sudo wrap uses
+# at bridge-start.sh:891. The agent id is also slug-validated at create
+# time (lib/bridge-agents.sh:bridge_validate_agent_id), so this is
+# defense-in-depth for the historical record (no current id violates
+# the slug rule).
+SESSION_CMD="BRIDGE_AGENT_ID=$(printf '%q' "$AGENT") ${SESSION_CMD}"
 # Issue #1118: resolve the engine binary's absolute path on the controller
 # and propagate it into the sudo'd child via the SESSION_CMD env prefix.
 # Without this, a v2 linux-user-isolated agent's `bash -lc "claude ..."`

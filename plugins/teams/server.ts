@@ -2779,4 +2779,26 @@ httpServer.listen(PORT, HOST, () => {
   process.stderr.write(`teams channel: listening on http://${HOST}:${PORT} (/api/messages, /auth/callback)\n`)
 })
 
+// Issue #1330 M7 (v0.14.5-beta5-2 Lane ξ): surface a startup warning when
+// BRIDGE_AGENT_ID is empty so the operator sees that the activity-index
+// write at line 2314 below will silently skip for the entire lifetime of
+// this MCP server. Without the warning, the missing activity-index causes
+// PreCompact channel-route lookup to miss the session-id mapping for this
+// agent, and the operator's only diagnostic is "channel dispatch fails"
+// long after the start-time root cause is forgotten.
+//
+// The warning fires once at server start, not on every inbound message.
+// The activity-index skip at line 2314 stays graceful (no per-message
+// stderr spam) because per-message logging would flood the channel when
+// the env is misconfigured at the bridge-start.sh / launch envelope
+// layer — the start-time warning is the actionable signal.
+if (!process.env.BRIDGE_AGENT_ID) {
+  process.stderr.write(
+    'teams channel: BRIDGE_AGENT_ID is empty at server start — PreCompact ' +
+    'activity-index writes will be skipped for every inbound message. ' +
+    'Verify the bridge launch envelope inlines BRIDGE_AGENT_ID (see ' +
+    'bridge-start.sh #1330 M7 / bridge-run.sh:350).\n',
+  )
+}
+
 await mcp.connect(new StdioServerTransport())

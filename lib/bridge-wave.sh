@@ -316,12 +316,19 @@ _bridge_wave_dispatch_member() {
     return 1
   fi
   local task_create_out task_id
+  # Issue #1318 part A (v0.14.5-beta5-2 Lane ξ): a freshly-spawned wave
+  # worker may not yet be reported as active by bridge_agent_is_active
+  # (tmux session-existence probe — there is a brief race between the
+  # spawn call above and the tmux registry settling). Use --force so the
+  # task lands even if the active-state probe misses; the worker
+  # consumes the queued task on its first dequeue tick.
   if ! task_create_out="$("$BRIDGE_BASH_BIN" "$BRIDGE_SCRIPT_DIR/bridge-task.sh" create \
         --to "$worker_name" \
         --from "$main_agent" \
         --priority high \
         --title "[wave $wave_id track $track] $member_id" \
-        --body-file "$brief_path" 2>&1)"; then
+        --body-file "$brief_path" \
+        --force 2>&1)"; then
     # codex r1 item 3 (atomicity): the worker was spawned successfully but
     # queue-task creation failed. Hard-killing the tmux session from here
     # would race with the operator's own attach, so we leave the worker

@@ -219,6 +219,39 @@ bridge_layout_materialize_identity() {
       && wants_claude_compat=1
   fi
 
+  # Issue #1332 L2 (v0.14.5-beta5-2 Lane ξ): atomic per-file
+  # write-then-normalize for the iso v2 layout. The controller-side
+  # ``cp -f`` below writes each file as controller-owned mode 0600 — the
+  # iso UID cannot read controller-owned 0600 files, so any concurrent
+  # iso-side reader observing the gap between the cp and the bulk
+  # post-materialize normalize (caller invokes
+  # ``bridge_isolation_v2_normalize_workdir_profile_group`` at
+  # bridge-agent.sh:3419) sees ``Permission denied``. The bulk
+  # normalize remains as a final safety net for failure paths and for
+  # the upgrade-time backfill loop in
+  # ``lib/bridge-isolation-v2-workdir-backfill.sh``, but pulling the
+  # per-file chgrp+chmod into the cp loop itself closes the per-file
+  # race window — each materialized file lands at ``iso-uid:ab-agent-<a>
+  # 0660`` before the loop advances to the next entry.
+  #
+  # Contract preserved: the chgrp helper
+  # (``bridge_isolation_v2_chgrp_file_iso_group``) is itself idempotent
+  # (stat-skip on already-correct ``%G:%a``), non-fatal on failure
+  # (returns nonzero but does not bridge_die), and a no-op outside of
+  # Linux iso v2 (gates on ``bridge_isolation_v2_enforce``). Legacy
+  # shared-mode + macOS callers see zero behavioral change because the
+  # helper short-circuits to 0 without touching the file.
+  #
+  # declare -F probe keeps the agent-layout layer loosely coupled to the
+  # isolation-v2 module — when the helper is not loaded (e.g. older
+  # bridge-lib.sh source order, or a future repackaging where layout
+  # ships standalone) the per-file normalize is skipped and the caller's
+  # bulk normalize alone keeps the invariant.
+  local _ml_can_per_file_normalize=0
+  if declare -F bridge_isolation_v2_chgrp_file_iso_group >/dev/null 2>&1; then
+    _ml_can_per_file_normalize=1
+  fi
+
   local name
   for name in \
     SOUL.md \
@@ -233,12 +266,27 @@ bridge_layout_materialize_identity() {
     [[ -f "$source_dir/$name" ]] || continue
     mkdir -p "$(dirname "$target_dir/$name")" 2>/dev/null || continue
     cp -f "$source_dir/$name" "$target_dir/$name" 2>/dev/null || true
+    if (( _ml_can_per_file_normalize == 1 )) && [[ -f "$target_dir/$name" ]]; then
+      # Atomic per-file: chgrp+chmod immediately after cp so the file is
+      # group-readable to the iso UID before the next loop iteration.
+      # 4th arg = $target_dir engages the ancestor symlink walk +
+      # canonical containment check (PR #1335 r3, codex r2 BLOCKING).
+      bridge_isolation_v2_chgrp_file_iso_group \
+        "$agent" "$target_dir/$name" 0660 "$target_dir" \
+        >/dev/null 2>&1 || true
+    fi
   done
   if [[ "$wants_claude_compat" == "1" && "$engine_entry" != "CLAUDE.md" ]]; then
     # Engine wants the CLAUDE.md compat copy alongside its native entrypoint
     # (e.g. Codex with AGENTS.md as native + CLAUDE.md as compat).
     if [[ -f "$source_dir/CLAUDE.md" ]]; then
       cp -f "$source_dir/CLAUDE.md" "$target_dir/CLAUDE.md" 2>/dev/null || true
+      if (( _ml_can_per_file_normalize == 1 )) && [[ -f "$target_dir/CLAUDE.md" ]]; then
+        # Same per-file atomic normalize as the main loop above (#1332 L2).
+        bridge_isolation_v2_chgrp_file_iso_group \
+          "$agent" "$target_dir/CLAUDE.md" 0660 "$target_dir" \
+          >/dev/null 2>&1 || true
+      fi
     fi
   fi
 
