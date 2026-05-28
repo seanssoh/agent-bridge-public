@@ -2313,6 +2313,19 @@ bridge_isolation_v2_matrix_rows_for_agent() {
       "$state_cron_root" "$shared_grp"
     printf 'state-cron-runs-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|isolated UID needs --x to reach its own per-run leaf\n' \
       "$state_cron_runs_root" "$shared_grp"
+    # Issue #1359 tactical staging delegation for `agb cron create`:
+    # iso UIDs cannot write to controller-owned cron/jobs.json, so they
+    # serialize the mutation request into this directory at mode 0660
+    # (owner=iso UID, group=ab-shared via setgid). The daemon picks up
+    # pending staging files on its cron-sync tick, validates the caller
+    # identity, applies via `bridge-cron.py native-create`, and writes
+    # a sibling result.json the iso UID poller reads. Mode 2770 +
+    # ab-shared lets every iso UID write into the shared bin while
+    # the file-level mode 0660 on each staging file keeps cross-agent
+    # read possible only via the audit/apply daemon (which checks
+    # `actor_agent` + file owner UID).
+    printf 'state-cron-staging|%s|dir|controller|%s|2770|0660|1|group_setgid|required|#1359 tactical staging dir for iso agb cron create\n' \
+      "${BRIDGE_CRON_STAGING_DIR:-${state_root}/cron-staging}" "$shared_grp"
     if [[ "$_v2_isolation_mode" == "shared" ]]; then
       # #909: state-agent-dir under shared mode is operator-owned; the
       # `ab-agent-<X>` group does not exist. write_agent_state_marker
