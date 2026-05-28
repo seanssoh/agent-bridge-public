@@ -6874,6 +6874,351 @@ bridge_agent_session_guidance_text() {
   printf -- '- fully_stop: agent-bridge kill %s\n' "$agent"
 }
 
+# bridge_agent_next_actions_tsv — issue #1360. Synthesize concrete,
+# placeholder-safe next-action hints for `agb agent show <agent>` from the
+# already-gathered channel diagnostics + session health signals.
+#
+# Output: TSV with columns
+#   run<TAB>reason<TAB>placeholder_safe
+#
+# - `run` is a verbatim shell command. Site-specific values (channel IDs,
+#   tokens, tenant ids) MUST stay as named placeholders (`<channel-id>` etc.)
+#   or be elided entirely — the caller is expected to walk the setup wizard,
+#   not paste a default from this output. `placeholder_safe=yes` means the
+#   command is exactly runnable as printed; `=no` means it contains a
+#   `<placeholder>` the caller must fill in.
+# - `reason` is a one-sentence diagnostic — what we observed that triggered
+#   the hint.
+#
+# Header row is emitted unconditionally so the consumer can detect "no
+# next_actions" by row count == 1 (header only). Empty body == "everything
+# looks ok, the operator's next move is whatever they were going to do".
+bridge_agent_next_actions_tsv() {
+  local agent="$1"
+  local diag_tsv=""
+  local channel="" provider="" plugin_spec=""
+  local plugin_status="" plugin_installed="" plugin_enabled=""
+  local launch_allowlisted="" access_status="" credentials_status=""
+  local runtime_ready="" state_dir=""
+  local isolation_mode=""
+  local channels_csv=""
+  local broken_launch_file=""
+  local restart_readiness=""
+  local loop_mode=""
+  local _tmp=""
+
+  printf 'run\treason\tplaceholder_safe\n'
+
+  channels_csv="$(bridge_agent_channels_csv "$agent")"
+  isolation_mode="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || printf 'shared')"
+  broken_launch_file="$(bridge_agent_broken_launch_file "$agent")"
+  loop_mode="$(bridge_agent_loop "$agent")"
+
+  # Highest priority: a broken-launch marker means the agent cannot start
+  # — every other action is downstream of fixing that. Surface the
+  # recovery path first so the operator does not waste a `setup` round
+  # against a quarantined agent.
+  if [[ -f "$broken_launch_file" ]]; then
+    printf 'agent-bridge agent safe-mode %s\tbroken-launch marker present (engine missing on PATH or workdir gone); recover before retrying\tyes\n' "$agent"
+  fi
+
+  # Per-channel hints. Walk the diagnostics TSV and emit one hint per
+  # row where we can synthesize a concrete recovery. The diagnostics TSV
+  # is the same producer agent show already calls — reuse it so the hint
+  # cannot drift from what the operator sees in the channel_diagnostics
+  # block.
+  if [[ -n "$channels_csv" ]]; then
+    diag_tsv="$(bridge_agent_channel_diagnostics_tsv "$agent")"
+    _tmp="$(mktemp)" || return 1
+    # shellcheck disable=SC2064
+    trap "rm -f -- '$_tmp'" RETURN
+    printf '%s\n' "$diag_tsv" > "$_tmp"
+    while IFS=$'\t' read -r channel provider plugin_spec plugin_status plugin_installed plugin_enabled launch_allowlisted access_status credentials_status runtime_ready state_dir; do
+      [[ "$channel" == "channel" ]] && continue
+      [[ -n "$channel" ]] || continue
+
+      # Plugin not installed (or partial install). For isolated agents
+      # the cause is almost always "controller-side plugin not seeded
+      # into the iso marketplace". For shared agents the cause is
+      # usually "plugin marketplace not added yet" — same recovery
+      # verb covers both.
+      if [[ "$plugin_installed" == "no" ]]; then
+        if [[ "$isolation_mode" == "linux-user" ]]; then
+          printf 'agent-bridge plugins seed --agent %s\tisolated agent missing plugin %s (controller-side install not visible to iso UID)\tyes\n' "$agent" "$plugin_spec"
+        else
+          printf 'agent-bridge plugins seed --agent %s\tagent missing plugin %s; controller marketplace seed required\tyes\n' "$agent" "$plugin_spec"
+        fi
+        continue
+      fi
+
+      # Plugin installed but disabled — engine-side enable required.
+      if [[ "$plugin_installed" == "yes" && "$plugin_enabled" == "no" ]]; then
+        printf 'agent-bridge agent show %s\tplugin %s installed but not enabled in engine; ask admin to enable\tyes\n' "$agent" "$plugin_spec"
+        continue
+      fi
+
+      # Channel credentials missing — point at the matching setup
+      # wizard. `placeholder_safe=yes` because the wizard collects the
+      # site-specific value itself; the command line carries no token.
+      #
+      # codex r1 PR #1364 BLOCKING 2: `credentials_status` also reports
+      # `unreadable` when the credential file exists but the controller
+      # cannot read it (typically iso-v2 boundary, file exists under the
+      # agent's UID, controller has no group membership). From the
+      # operator's UX perspective `unreadable` is the same first-touch
+      # state as `missing` — the next required action is to walk the
+      # setup wizard, which writes a fresh credential the agent can
+      # actually consume. The audit row could still distinguish for
+      # telemetry, but the next_actions hint must not silently fall
+      # through to the generic `start --dry-run` row below (which would
+      # tell the operator to verify a launch they cannot fix without
+      # the setup wizard). Match both states here.
+      if [[ "$credentials_status" == "missing" || "$credentials_status" == "unreadable" ]]; then
+        case "$provider" in
+          discord|telegram|teams|ms365)
+            printf 'agent-bridge setup %s %s\t%s channel configured but credentials are %s; run the setup wizard\tyes\n' "$provider" "$agent" "$provider" "$credentials_status"
+            ;;
+          *)
+            # Unknown / custom provider — generic hint. Do not invent
+            # a setup verb that may not exist for this provider.
+            printf 'agent-bridge agent show %s\tchannel %s reports credentials %s; check the plugin onboarding contract\tyes\n' "$agent" "$channel" "$credentials_status"
+            ;;
+        esac
+        continue
+      fi
+
+      # Runtime not ready despite credentials present — usually the
+      # daemon supplementary groups are stale (post create/iso scaffold)
+      # or the MCP server crashed. Generic dry-run is the safe probe.
+      if [[ "$runtime_ready" == "no" && "$credentials_status" != "controller-blind" ]]; then
+        printf 'agent-bridge agent start %s --dry-run\tchannel %s runtime not ready; verify launch + channel readiness before restart\tyes\n' "$agent" "$channel"
+        continue
+      fi
+    done < "$_tmp"
+    rm -f -- "$_tmp"
+    # Disarm the trap so a later RETURN does not double-rm. SC2064 above
+    # already pinned the path at trap-set time.
+    trap - RETURN
+  fi
+
+  # Session-health gated hints. The session_guidance text helper
+  # already computes restart_readiness; we mirror the predicate here
+  # (cheap — same getters) so the hint stays in lockstep with what
+  # `agent show` displays in session_health.
+  if [[ -f "$broken_launch_file" ]]; then
+    restart_readiness="broken-launch"
+  elif [[ "$loop_mode" == "1" ]]; then
+    if bridge_agent_should_stop_on_attached_clean_exit "$agent"; then
+      restart_readiness="onboarding-pending"
+    elif bridge_agent_channel_setup_complete "$agent"; then
+      restart_readiness="ready"
+    else
+      restart_readiness="channel-setup-incomplete"
+    fi
+  else
+    restart_readiness="not-looped"
+  fi
+
+  case "$restart_readiness" in
+    onboarding-pending)
+      printf 'agent-bridge attach %s\tagent looped but onboarding handshake pending; attach and walk the onboarding skill\tyes\n' "$agent"
+      ;;
+    channel-setup-incomplete)
+      # Already surfaced per-channel above; do not duplicate. Fall
+      # through.
+      :
+      ;;
+  esac
+}
+
+bridge_agent_next_actions_text() {
+  local agent="$1"
+  local tsv=""
+  local row_count=0
+  local run="" reason="" placeholder_safe=""
+  local _tmp=""
+
+  tsv="$(bridge_agent_next_actions_tsv "$agent")"
+  _tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$tsv" > "$_tmp"
+  while IFS=$'\t' read -r run reason placeholder_safe; do
+    [[ "$run" == "run" ]] && continue
+    [[ -n "$run" ]] || continue
+    row_count=$((row_count + 1))
+    printf -- '- run: %s\n' "$run"
+    printf '  reason: %s\n' "$reason"
+    # Only emit placeholder_safe when "no" — a stable shape needs the
+    # key on every entry, but most rows are safe and printing the
+    # default everywhere is noise.
+    if [[ "$placeholder_safe" == "no" ]]; then
+      printf '  placeholder_safe: no\n'
+    fi
+  done < "$_tmp"
+  rm -f -- "$_tmp"
+  trap - RETURN
+
+  if [[ "$row_count" == "0" ]]; then
+    printf -- '- (none — agent show diagnostics are clean)\n'
+  fi
+}
+
+bridge_agent_next_actions_json() {
+  local agent="$1"
+  local tsv=""
+  local _tmp=""
+  local _rc=0
+
+  tsv="$(bridge_agent_next_actions_tsv "$agent")"
+  bridge_require_python
+
+  # Footgun #11 (KNOWN_ISSUES.md §26): the prior r1 form used
+  # `python3 - "$tsv" <<'PY' … PY` which reintroduces the Bash 5.3.9
+  # `read_comsub` / `heredoc_write` deadlock class — the same class the
+  # `agent show` data pipeline (bridge-agent.sh:2041-2045) explicitly
+  # documents as forbidden in this hot path. Spool the TSV to a tempfile
+  # and dispatch to the standalone helper (file-as-argv), matching the
+  # show-format-json.py precedent in the same dir.
+  _tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-agent-next-actions.XXXXXX")" || return 1
+  # shellcheck disable=SC2064  # pin the path at trap-set time, not RETURN
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$tsv" > "$_tmp"
+  set +e
+  python3 "$BRIDGE_SCRIPT_DIR/lib/agent-cli-helpers/next-actions-tsv-to-json.py" "$_tmp"
+  _rc=$?
+  set -e
+  rm -f -- "$_tmp"
+  trap - RETURN
+  return "$_rc"
+}
+
+# bridge_create_next_steps_lines — issue #1360. Compute persona-aware
+# `next_steps` lines for `agb agent create` output, given the agent's
+# engine + channels + isolation mode. Output: one suggestion per line on
+# stdout, ready for the caller to format as `  - <line>` or to feed into
+# a JSON array. The order matters — the operator should walk top-to-bottom.
+#
+# Personas (mutually compatible, listed in walk order):
+#   1. ALL agents: a verify dry-run and a memory/onboarding pointer.
+#   2. Channel-wired: per-provider setup wizard hint + a re-check via
+#      `agent show`.
+#   3. Plugin-enabled isolated: plugin seed + skills list reminder.
+#   4. Linux-user isolated: iso-v2 CLI-mediated access reminder.
+#
+# Channel hints carry no site-specific defaults — they name the wizard
+# verb but stop there. The wizard collects the value.
+bridge_create_next_steps_lines() {
+  local agent="$1"
+  local engine="$2"
+  local channels="$3"
+  local isolation_mode="$4"
+  local has_discord=0
+  local has_telegram=0
+  local has_teams=0
+  local has_ms365=0
+  local has_any_plugin=0
+  local item=""
+  local _tmp=""
+
+  # Codex r2 review PR #1364 BLOCKING G (footgun #11): the original r1
+  # form used `read -r -a items <<<"$channels"` here-string split, which
+  # is the `<<<` heredoc-write variant of the Bash 5.3.9 read_comsub
+  # deadlock class (KNOWN_ISSUES.md §26, v0.13.7 PR #890 fix). Spool
+  # the CSV to a tempfile and walk it via a tab/newline read loop —
+  # matches the bridge_agent_next_actions_tsv tempfile pattern just above
+  # so a future move keeps the deadlock-safe shape.
+  if [[ -n "$channels" ]]; then
+    _tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-create-next-steps.XXXXXX")" || return 1
+    # shellcheck disable=SC2064  # pin the path at trap-set time
+    trap "rm -f -- '$_tmp'" RETURN
+    # One channel per line; the read loop below normalises whitespace.
+    printf '%s\n' "$channels" | tr ',' '\n' > "$_tmp"
+    while IFS= read -r item; do
+      item="$(bridge_trim_whitespace "$item")"
+      [[ -n "$item" ]] || continue
+      case "$item" in
+        plugin:discord|plugin:discord@*) has_discord=1 ;;
+        plugin:telegram|plugin:telegram@*) has_telegram=1 ;;
+        plugin:teams|plugin:teams@*) has_teams=1 ;;
+        plugin:ms365|plugin:ms365@*) has_ms365=1 ;;
+      esac
+      case "$item" in
+        plugin:*) has_any_plugin=1 ;;
+      esac
+    done < "$_tmp"
+    rm -f -- "$_tmp"
+    trap - RETURN
+  fi
+
+  # Persona 1 (ALL agents): the dry-run resolves the launch command and
+  # shows what the runtime will hand the engine — catches config drift
+  # before the operator attaches.
+  printf 'bash bridge-start.sh %s --dry-run\n' "$agent"
+
+  # Channel-wired hints. Each call is a *wizard* verb — no token, no
+  # channel-id default. `agent show` after the wizard re-checks
+  # channel_diagnostics + next_actions.
+  if [[ $has_discord -eq 1 ]]; then
+    printf 'agent-bridge setup discord %s\n' "$agent"
+  fi
+  if [[ $has_telegram -eq 1 ]]; then
+    printf 'agent-bridge setup telegram %s\n' "$agent"
+  fi
+  if [[ $has_teams -eq 1 || $has_ms365 -eq 1 ]]; then
+    # Teams + ms365 share an OAuth surface; emit once.
+    printf 'agent-bridge setup teams %s\n' "$agent"
+  fi
+
+  # Plugin-enabled isolated agent: the controller-side plugin install
+  # is not visible to the iso UID; seed it explicitly + verify the
+  # skill surface. This is the #1 "why is my plugin missing?" first-
+  # hour question.
+  if [[ "$isolation_mode" == "linux-user" && $has_any_plugin -eq 1 ]]; then
+    printf 'agent-bridge plugins seed --agent %s\n' "$agent"
+    printf 'agent-bridge skills list --agent %s\n' "$agent"
+  fi
+
+  # Channel re-check (only when at least one channel is wired).
+  if [[ -n "$channels" ]]; then
+    printf 'agent-bridge agent show %s\n' "$agent"
+  fi
+
+  # Terminal-only persona (no channels wired): the operator's actual
+  # next step is to start the agent + attach + walk the onboarding
+  # surface (memory wiki init + a reminder to ask the agent to read
+  # SOUL.md / CLAUDE.md / SESSION-TYPE.md before doing real work). The
+  # generic `start --dry-run` row above only validates the launch line;
+  # without these the operator is left wondering "I dry-ran, now what?"
+  # which is exactly the gap codex r1 PR #1364 BLOCKING 3 caught. Refs
+  # docs/onboarding/create-static-agent.md §"Terminal-only static agent"
+  # for the matching prose walkthrough.
+  if [[ -z "$channels" ]]; then
+    printf 'agent-bridge agent start %s\n' "$agent"
+    printf 'agent-bridge attach %s\n' "$agent"
+    printf 'agent-bridge memory init --agent %s\n' "$agent"
+  fi
+
+  # Persona 1 (ALL agents): memory/onboarding pointer. Stays last so it
+  # comes after the actionable verbs.
+  printf 'agent-bridge status --all-agents\n'
+
+  # Linux-user isolation: pin the CLI-mediated-access reminder so the
+  # operator (and any agent that reads its own scaffold output) knows
+  # not to direct-touch files across the UID boundary. Emitted as a
+  # `note:` prefix so a YAML/JSON consumer can recognise it as a
+  # non-actionable advisory line rather than a missing CLI verb. Refs
+  # CLAUDE.md §"Working with isolated agents (iso v2)" + docs/onboarding/
+  # plugin-enabled-agent.md Q5.
+  if [[ "$isolation_mode" == "linux-user" ]]; then
+    printf 'note: iso v2 — use agent-bridge CLI verbs (agent show / agent list / status) for cross-agent state; do not direct-read other agents files. See docs/onboarding/plugin-enabled-agent.md Q5.\n'
+  fi
+
+  # Quiet the "engine unused" shellcheck — engine is reserved for
+  # future persona splits (e.g. codex-specific session-id detect hints).
+  : "$engine"
+}
+
 bridge_agent_ready_channels_csv() {
   local agent="$1"
   local required=""

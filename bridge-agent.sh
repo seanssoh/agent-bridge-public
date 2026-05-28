@@ -1415,17 +1415,29 @@ emit_create_json() {
   # shell line — the python branches below own the mapping.
   local daemon_group_refresh="${17:-}"
 
-  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" "$expressed_intent" "$daemon_group_refresh" <<'PY'
+  # Issue #1360: synthesize persona-aware next_steps from the same
+  # helper the text-mode emitter uses. We pass the resulting newline-
+  # joined string through argv so the Python branch can split it back
+  # into a list — keeps the heredoc-stdin contract intact and avoids
+  # adding a separate file-as-argv hop for a 3-to-7-line synthesis.
+  local next_steps_lines=""
+  next_steps_lines="$(bridge_create_next_steps_lines "$agent" "$engine" "$channels" "$isolation_mode")"
+
+  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" "$expressed_intent" "$daemon_group_refresh" "$next_steps_lines" <<'PY'
 import json
 import sys
 
-agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user, idle_timeout_persisted, loop_persisted, expressed_intent, daemon_group_refresh = sys.argv[1:]
+agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user, idle_timeout_persisted, loop_persisted, expressed_intent, daemon_group_refresh, next_steps_lines = sys.argv[1:]
 policy = {
     "idle_timeout": idle_timeout_persisted,
     "loop": loop_persisted,
 }
 if expressed_intent:
     policy["expressed_intent"] = expressed_intent
+# Issue #1360: split the persona-aware lines back into a list. Empty
+# lines are skipped (the helper currently does not emit them, but the
+# split is defensive against future template tweaks).
+next_steps_list = [line for line in next_steps_lines.split("\n") if line.strip()]
 payload = {
     "agent": agent,
     "engine": engine,
@@ -1443,11 +1455,7 @@ payload = {
     "dry_run": dry_run == "1",
     "users": json.loads(users_json),
     "policy": policy,
-    "next_steps": [
-        f"agent-bridge setup agent {agent}",
-        f"agent-bridge status --all-agents",
-        f"bash bridge-start.sh {agent} --dry-run",
-    ],
+    "next_steps": next_steps_list,
 }
 # Beta20 L2 Variant 3A — only emit the field when refresh was actually
 # attempted (linux-user isolation on Linux). Shared-mode / macOS callers
@@ -2030,6 +2038,11 @@ run_show() {
     bridge_agent_session_health_json "$agent" >"$_show_dir/session-health.json"
     bridge_agent_alive_signals_json "$agent" >"$_show_dir/alive.json"
     bridge_agent_session_source_path "$agent" >"$_show_dir/session-source.txt"
+    # Issue #1360: synthesize next_actions from the same diagnostics
+    # + session-health signals collected above. Sixth file-as-argv
+    # input — keeps the deadlock-safe pattern (no heredoc-stdin to
+    # subprocess) intact.
+    bridge_agent_next_actions_json "$agent" >"$_show_dir/next-actions.json"
     # Issue #1357 (v0.15.0-beta5-2 Lane E): mirror the text-mode quickref in
     # --json so scripted consumers (a future MCP tool, a doctor renderer)
     # can render the same boundary mapping without re-implementing the
@@ -2052,6 +2065,7 @@ run_show() {
       "$_show_dir/session-health.json" \
       "$_show_dir/session-source.txt" \
       "$_show_dir/alive.json" \
+      "$_show_dir/next-actions.json" \
       "$_show_dir/iso-boundary-quickref.txt"
     _show_rc=$?
     set -e
@@ -2174,14 +2188,23 @@ run_show() {
     bridge_agent_channel_diagnostics_text "$agent" | sed 's/^/  /'
     printf 'session_health:\n'
     bridge_agent_session_guidance_text "$agent" | sed 's/^/  /'
+    # Issue #1360: synthesize a "what to do next" block from the same
+    # diagnostics + session-health signals we just emitted, so the
+    # operator does not have to interpret six discrete fields and
+    # remember which CLI verb maps to which fix. Each entry is a
+    # placeholder-safe `run:` line + a one-sentence `reason:`. The
+    # block is always emitted (header + body or header + `(none — …)`
+    # sentinel) so consumers can detect the section by line marker;
+    # an empty block IS information ("agent show diagnostics are
+    # clean").
+    printf 'next_actions:\n'
+    bridge_agent_next_actions_text "$agent" | sed 's/^/  /'
     # Issue #1357 (v0.15.0-beta5-2 Lane E): when the resolved agent is
     # linux-user iso effective, append the compressed boundary quickref so
     # an operator (or the agent itself, on first boot) sees the same
     # workaround mapping the CLAUDE.md table documents. Skipped for shared-
     # mode agents — the rows do not apply (no iso UID, no cross-class
-    # boundary), and surfacing them there would mislead. The helper lives
-    # in lib/bridge-agents.sh next to bridge_agent_linux_user_isolation_
-    # effective so the gate and the payload move together.
+    # boundary), and surfacing them there would mislead.
     if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
       printf 'iso_boundary_quickref:\n'
       bridge_agent_iso_boundary_quickref_text | sed 's/^/  /'
@@ -3962,9 +3985,13 @@ report and reap test-fixture agents per their pattern."
     fi
     echo "start_dry_run: $start_dry_run_status"
     echo "$start_dry_run"
+    # Issue #1360: persona-aware next_steps. Replaces the prior generic
+    # 2-line list with a walk-order list derived from engine + channels
+    # + isolation. Site-specific values stay placeholder-safe — the
+    # printed verbs are wizard verbs, not token-pasting commands.
     echo "next_steps:"
-    echo "  - agent-bridge setup agent $agent"
-    echo "  - agent-bridge status --all-agents"
+    bridge_create_next_steps_lines "$agent" "$engine" "$channels" "$isolation_mode" \
+      | sed 's/^/  - /'
   fi
 }
 

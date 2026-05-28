@@ -256,6 +256,8 @@ agb admin
 
 이것만 기억하면 됩니다. 이후 모든 것은 관리자 에이전트(패치)에게 자연어로 요청하면 됩니다.
 
+> **첫 한 시간 동안 무엇을 해야 할지 모르겠다면**: [docs/onboarding/first-install.md](./docs/onboarding/first-install.md)를 읽어주세요. 5분 요약 + 진단 흐름 + 다음 단계 (스태틱 에이전트 만들기 / 채널 붙이기 / 트러블슈팅) 분기점이 있습니다. 페르소나별 짧은 runbook 모음: [docs/onboarding/](./docs/onboarding/).
+
 ---
 
 ## Discord 연결하기
@@ -750,6 +752,7 @@ final_version=<version>, daemon=<healthy|issue>, operator-actions=<summary|none>
 
 ## 추가 문서
 
+- [docs/onboarding/](./docs/onboarding/) — 페르소나별 짧은 runbook (first-install / create-static-agent / plugin-enabled-agent / troubleshooting-auth-and-channels)
 - [UPGRADING.md](./UPGRADING.md) — 표준 업그레이드 절차 (사전조건 / dry-run / apply / troubleshooting / rollback)
 - [OPERATIONS.md](./OPERATIONS.md) — 운영 가이드 + release-specific operator follow-up sections (`picker-sweep` auto-unstick utility 포함)
 - [OPERATOR_ACTIONS_PENDING.md](./OPERATOR_ACTIONS_PENDING.md) — release-specific 후속 행동 catalog
