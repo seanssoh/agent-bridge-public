@@ -8865,6 +8865,33 @@ PY
       done <<<"$_parsed"
       [[ -n "$uuid" && -n "$actor_agent_dir" ]] || continue
 
+      # Issue #1359 codex r2 BLOCKING #1: when scan-pending tagged the
+      # row as `stale: true` (mtime age > BRIDGE_CRON_STAGING_STALE_SECONDS),
+      # do NOT apply it. The previous tick order — apply every row then
+      # run sweep-stale — would execute an abandoned request and the
+      # subsequent sweep would no-op because the apply path wrote a
+      # result.json sibling, defeating the "stale request gets discarded"
+      # contract. Sweep-first: unlink the staging file inline and emit
+      # a `cron_staging_stale_rejected` audit row. The dedicated
+      # `sweep-stale` pass below remains as a safety net for files
+      # missed between scan-pending and this branch (a race where the
+      # iso UID crashed after write but before scan).
+      if [[ "$stale" == "1" ]]; then
+        rejected_count=$(( rejected_count + 1 ))
+        local stale_path="$staging_dir/$actor_agent_dir/${uuid}.json"
+        local stale_unlink_status="ok"
+        if [[ -f "$stale_path" ]]; then
+          rm -f "$stale_path" 2>/dev/null || stale_unlink_status="unlink_failed"
+        else
+          stale_unlink_status="absent"
+        fi
+        bridge_audit_log daemon cron_staging_stale_rejected "$actor_agent_dir" \
+          --detail uuid="$uuid" \
+          --detail owner_uid="$owner_uid" \
+          --detail unlink="$stale_unlink_status" 2>/dev/null || true
+        continue
+      fi
+
       # Issue #1359 codex r1 #3: bound the per-file apply with the
       # daemon's standard timeout wrapper so a wedged native-create
       # subprocess (FIFO payload-file, slow disk) cannot stall the

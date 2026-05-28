@@ -389,6 +389,48 @@ def cmd_apply(
         sys.stderr.write(f"staging.py apply: stat failed: {exc}\n")
         return 2
 
+    # codex r2 review escalation (BLOCKING #1 race): scan-pending
+    # captured the `stale` flag at scan time; the daemon then iterates
+    # rows in sequence. A row aged just under the threshold at scan
+    # time can cross the threshold before its apply turn. Without an
+    # apply-time re-stat, that row would still be applied; the later
+    # sweep-stale pass would then no-op because we wrote a result.json
+    # sibling. Re-check the file age inside the lock holder and short-
+    # circuit as `cron_staging_stale_rejected` if it crossed the
+    # threshold, unlinking the request inline so the iso UID poller
+    # sees the explicit reject result.
+    try:
+        stale_secs = int(
+            os.environ.get("BRIDGE_CRON_STAGING_STALE_SECONDS", "300") or "300"
+        )
+    except (TypeError, ValueError):
+        stale_secs = 300
+    age_seconds = max(0, int(time.time() - st.st_mtime))
+    if age_seconds > stale_secs:
+        # Race-window stale: write the explicit reject result FIRST so
+        # the iso UID poller observes the close, then unlink the
+        # request so the next sweep-stale pass does not re-emit it.
+        # _write_result lives in the agent_dir which has setgid =
+        # ab-agent-<X>; the iso UID owner of the request can read its
+        # own result via the group bits.
+        _write_result(
+            result_path,
+            request_uuid,
+            actor_agent=canonical_actor_agent,
+            status="error",
+            cron_id=None,
+            error=(
+                "stale_at_apply: "
+                f"age_seconds={age_seconds} stale_secs={stale_secs}"
+            ),
+            audit_action="cron_staging_stale_rejected",
+        )
+        try:
+            request_path.unlink()
+        except OSError:
+            pass
+        return 5
+
     try:
         payload = json.loads(request_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -508,23 +550,47 @@ def cmd_apply(
     # to be another iso UID inside the payload — the daemon trusts the
     # filesystem owner over the payload field, but a mismatch is still
     # an integrity signal worth rejecting.
-    if (
-        payload_actor_uid is not None
-        and int(payload_actor_uid) != file_owner_uid
-    ):
-        _write_result(
-            result_path,
-            request_uuid,
-            actor_agent=actor_agent,
-            status="error",
-            cron_id=None,
-            error=(
-                "payload_actor_uid_mismatch: "
-                f"payload_uid={payload_actor_uid} file_uid={file_owner_uid}"
-            ),
-            audit_action="cron_staging_rejected",
-        )
-        return 4
+    #
+    # codex r1 BLOCKING #2: a forged `actor_uid` field that is not
+    # parseable as an int (e.g. "not-int", a list, a dict) would crash
+    # the bare `int()` cast with ValueError/TypeError. Without a result
+    # file, the iso UID poller timeouts and the daemon retries the same
+    # poison file on every tick — exactly the "daemon retry poison"
+    # foot-gun. Catch the cast failure and emit an explicit reject
+    # result with audit_action=cron_staging_rejected, reason
+    # `malformed_actor_uid`, so the poller exits cleanly and the daemon
+    # never re-applies the same file.
+    if payload_actor_uid is not None:
+        try:
+            parsed_actor_uid = int(payload_actor_uid)
+        except (TypeError, ValueError):
+            _write_result(
+                result_path,
+                request_uuid,
+                actor_agent=actor_agent,
+                status="error",
+                cron_id=None,
+                error=(
+                    "malformed_actor_uid: "
+                    f"payload_actor_uid={payload_actor_uid!r}"
+                ),
+                audit_action="cron_staging_rejected",
+            )
+            return 4
+        if parsed_actor_uid != file_owner_uid:
+            _write_result(
+                result_path,
+                request_uuid,
+                actor_agent=actor_agent,
+                status="error",
+                cron_id=None,
+                error=(
+                    "payload_actor_uid_mismatch: "
+                    f"payload_uid={payload_actor_uid} file_uid={file_owner_uid}"
+                ),
+                audit_action="cron_staging_rejected",
+            )
+            return 4
 
     # Build native-create argv. Only `create` is supported in this
     # tactical PR — `update` / `delete` follow a separate root design.

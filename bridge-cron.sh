@@ -283,54 +283,102 @@ run_create() {
   # Shell-kind cron is explicitly out of tactical scope — the runner
   # validation matrix needs controller-side script ownership that the
   # staging path cannot prove from a forged payload.
-  if [[ "$kind" == "text" ]] && _bridge_cron_create_should_stage "$opt_agent"; then
-    _bridge_cron_create_via_staging \
-      "$opt_agent" \
-      "$opt_schedule" \
-      "$opt_at" \
-      "$opt_title" \
-      "$opt_tz" \
-      "$opt_payload_set" \
-      "$opt_payload" \
-      "$opt_payload_file_set" \
-      "$opt_payload_file" \
-      "$opt_disabled" \
-      "$opt_delete_after_run"
-    return $?
+  #
+  # codex r1 BLOCKING #3: cross-agent mutation from inside an iso UID
+  # must be REJECTED, not silently downgraded to the direct write path.
+  # The previous shape returned `should_stage=1` when `--agent` did
+  # not match `BRIDGE_AGENT_ID` and then fell through to the direct
+  # bridge-cron.py invocation; on hosts where jobs.json was writable
+  # by the iso UID (e.g. opened by a misconfigured operator), this
+  # bypassed the "iso agent may mutate only its own cron" boundary.
+  #
+  # codex r2 review escalation: the reject must fire on iso-IDENTITY
+  # context (BRIDGE_AGENT_ID set + iso v2 active + non-controller UID),
+  # NOT only when staging is the chosen path. The previous shape
+  # gated the bridge_die on `_bridge_cron_create_iso_context_active`,
+  # which itself returns 1 when jobs.json is writable — so a writable
+  # jobs.json (the very misconfigured-operator case the comment names)
+  # short-circuited the guard and the direct write went through.
+  # Split: identity check fires the guard first, then the staging
+  # predicate decides stage vs direct for same-agent requests.
+  if [[ "$kind" == "text" ]]; then
+    if _bridge_cron_create_iso_identity_active; then
+      local effective_agent="${opt_agent:-${BRIDGE_AGENT_ID:-}}"
+      if [[ -n "$effective_agent" && "$effective_agent" != "${BRIDGE_AGENT_ID:-}" ]]; then
+        bridge_die "cron mutation refused: requested agent ${effective_agent} does not match BRIDGE_AGENT_ID ${BRIDGE_AGENT_ID:-<unset>} (iso agents may only mutate own cron)"
+      fi
+    fi
+    if _bridge_cron_create_iso_context_active; then
+      _bridge_cron_create_via_staging \
+        "$opt_agent" \
+        "$opt_schedule" \
+        "$opt_at" \
+        "$opt_title" \
+        "$opt_tz" \
+        "$opt_payload_set" \
+        "$opt_payload" \
+        "$opt_payload_file_set" \
+        "$opt_payload_file" \
+        "$opt_disabled" \
+        "$opt_delete_after_run"
+      return $?
+    fi
   fi
 
   bridge_cron_python "${py_args[@]}"
 }
 
-# Issue #1359 — predicate that decides whether `agb cron create` should
-# delegate to the daemon via the staging file path.
+# Issue #1359 codex r2 review escalation — narrow identity predicate
+# used by the cross-agent reject guard.
 #
-# Returns 0 (yes, stage) only when ALL of these hold:
-#   1. `BRIDGE_AGENT_ID` is exported (we have an agent identity).
-#   2. The requested `--agent` matches `BRIDGE_AGENT_ID`. An iso UID
-#      may only stage cron for itself — the daemon will reject
-#      otherwise, but rejecting here keeps the error visible to the
-#      operator instead of buried in a result file.
-#   3. iso v2 layout is active (we're on a host that even has the iso
-#      v2 boundary). Otherwise the controller-write path is the only
-#      legitimate one.
-#   4. The current UID is NOT the controller UID. The cleanest signal
-#      is "jobs.json is not writable by us" — falls back to a uid
-#      comparison when jobs.json is absent (fresh install where the
-#      first `cron create` would otherwise create it).
+# Returns 0 when this shell is running with an iso-agent IDENTITY
+# (BRIDGE_AGENT_ID set, iso v2 layout active), regardless of whether
+# jobs.json happens to be writable by the current UID. The cross-
+# agent reject in `run_create` must fire whenever this is true, so a
+# misconfigured-writable jobs.json cannot bypass the "iso agents may
+# only mutate own cron" boundary. Controller shells should never have
+# BRIDGE_AGENT_ID set in the iso-v2 deployment — that is itself the
+# identity marker we use.
+_bridge_cron_create_iso_identity_active() {
+  local agent_id="${BRIDGE_AGENT_ID:-}"
+  [[ -n "$agent_id" ]] || return 1
+  if ! declare -F bridge_isolation_v2_active >/dev/null 2>&1; then
+    return 1
+  fi
+  bridge_isolation_v2_active || return 1
+  return 0
+}
+
+# Issue #1359 — predicate that decides whether we are currently running
+# inside an iso v2 agent UID context that needs to delegate cron
+# mutations through the staging path.
 #
-# Returns 1 (no, direct write) otherwise — including when the iso UID
-# could write jobs.json directly (a defense-in-depth case where the
-# operator has explicitly opened the file's group bits).
-_bridge_cron_create_should_stage() {
-  local requested_agent="${1:-}"
+# codex r1 BLOCKING #3 (r2): the previous predicate bundled the
+# `requested_agent == BRIDGE_AGENT_ID` check into the should-stage
+# decision and silently returned "no, direct write" for cross-agent
+# requests. That allowed `bash bridge-cron.sh create --agent <peer>`
+# from inside an iso UID to fall through to the direct write path on
+# hosts where jobs.json happened to be writable by the iso UID. The
+# split-up shape now is:
+#
+#   - `_bridge_cron_create_iso_context_active` (this function):
+#       returns 0 (yes) when ALL hold — BRIDGE_AGENT_ID is set, iso v2
+#       layout is active, current UID is NOT the controller UID, and
+#       jobs.json is not writable directly. Used as the gating
+#       condition for "delegate to daemon".
+#
+#   - The caller in `run_create` decides what to do with the cross-
+#       agent case BEFORE we get here: a mismatched `--agent` raises a
+#       `bridge_die` rather than falling through to the direct write
+#       path.
+#
+# Returns 0 when iso UID context is active; 1 otherwise (including the
+# operator-on-controller case and the iso-UID-with-writable-jobs.json
+# defense-in-depth case).
+_bridge_cron_create_iso_context_active() {
   local agent_id="${BRIDGE_AGENT_ID:-}"
 
   [[ -n "$agent_id" ]] || return 1
-  # Iso UID may only stage cron for itself.
-  if [[ -n "$requested_agent" && "$requested_agent" != "$agent_id" ]]; then
-    return 1
-  fi
   # Without iso v2 layout, the staging dir cannot have iso-writable
   # mode, so the direct path is the only one that works.
   if ! declare -F bridge_isolation_v2_active >/dev/null 2>&1; then
@@ -365,6 +413,38 @@ _bridge_cron_create_should_stage() {
     fi
   fi
   return 1
+}
+
+# Issue #1359 — back-compat shim. The r1 codepath called
+# `_bridge_cron_create_should_stage` with the requested agent and
+# expected a single "yes/no stage" verdict. The r2 refactor split the
+# iso-context detection from the cross-agent reject — this shim is
+# preserved so any external caller (out-of-tree script, future-merged
+# branch) gets a verdict that PRESERVES the cross-agent security
+# boundary rather than falling through to the direct write path.
+#
+# codex r2 review escalation: the previous shim returned 1 on cross-
+# agent mismatch which lets legacy callers do `if
+# _bridge_cron_create_should_stage; then stage; else direct; fi` and
+# silently downgrade a cross-agent request to a direct write. That
+# leaks the same boundary the new call site closes. The shim now
+# bridge_die's on cross-agent identity context — any caller hitting
+# this path gets the same explicit reject as the new call site.
+_bridge_cron_create_should_stage() {
+  local requested_agent="${1:-}"
+  local agent_id="${BRIDGE_AGENT_ID:-}"
+
+  # Defense-in-depth: even outside the staging-routing branch, if we
+  # are running with an iso-agent identity and the requested agent
+  # does not match, refuse rather than letting the caller fall
+  # through to a direct write.
+  if _bridge_cron_create_iso_identity_active; then
+    if [[ -n "$requested_agent" && "$requested_agent" != "$agent_id" ]]; then
+      bridge_die "cron mutation refused: requested agent ${requested_agent} does not match BRIDGE_AGENT_ID ${agent_id:-<unset>} (iso agents may only mutate own cron)"
+    fi
+  fi
+  _bridge_cron_create_iso_context_active || return 1
+  return 0
 }
 
 # Issue #1359 — staging delegation writer + poller. Composes the JSON
