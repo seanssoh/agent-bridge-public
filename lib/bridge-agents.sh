@@ -1029,6 +1029,41 @@ bridge_agent_linux_user_isolation_effective() {
   return 0
 }
 
+# bridge_agent_iso_boundary_quickref_text
+#
+# Issue #1357 (v0.15.0-beta5-2 Lane E): emit the compressed iso v2 boundary
+# quick reference that `agent show` surfaces in text mode (and JSON mode via
+# `lib/agent-cli-helpers/show-format-json.py`) when the resolved agent is
+# linux-user iso effective.
+#
+# The full table lives in `CLAUDE.md` §"Working with isolated agents (iso v2)"
+# under "Agent's own POV: what blocks where + workaround". This helper is the
+# tactical surface — short enough to skim on first session boot, paired with
+# the docs link for the long form. The two surfaces are intentionally
+# redundant: the docs row is the contract, the quickref is the operator-
+# visible reminder at `agb agent show` time.
+#
+# Contract:
+#   - Pure stdout writer. No file IO, no roster lookup, no env reads.
+#   - Output is a 5-row indented block (key: value) the show dispatcher
+#     wraps under a `iso_boundary_quickref:` header. Each row is a single
+#     line so a future grep/awk consumer can parse without a multiline
+#     parser.
+#   - Row ordering mirrors the CLAUDE.md table so a doc reader can scan
+#     both surfaces with the same eye order.
+#
+# This helper is intentionally caller-gated (run only when
+# bridge_agent_linux_user_isolation_effective <agent> returns 0). Emitting
+# it unconditionally would mislead shared-mode agents into believing the
+# blocks apply to them — they don't.
+bridge_agent_iso_boundary_quickref_text() {
+  printf '%s\n' "body_file direct read:    blocked → use \`agb show <id>\` (body is inlined)"
+  printf '%s\n' "controller HOME files:    blocked → use \`agb agent list\`, \`agb status\`"
+  printf '%s\n' "shared/wiki/*:            ok (ab-shared group readable)"
+  printf '%s\n' "plugins-cache mcp.json:   blocked (group=ab-shared, owner=controller) → delegate \`agb plugins seed\`"
+  printf '%s\n' "cross-iso sudo:           blocked (no sudoers entry) → delegate via queue"
+}
+
 # bridge_agent_workdir_step_a_complete <agent> <workdir>
 #
 # Issue #1151 (beta9 follow-up): the PR #1149 ownership-based defer pattern
