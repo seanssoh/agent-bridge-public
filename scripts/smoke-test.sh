@@ -4248,6 +4248,11 @@ source "\$daemon_lib"
 
 export BRIDGE_AUDIT_LOG="\$audit_file"
 export BRIDGE_NUDGE_VERIFY_GRACE_SECONDS=0
+# Issue #1323 Track G: pin stage-2 grace to 0 here so the legacy
+# #331 single-stage queued/claimed contract still applies. The
+# two-stage check has its own dedicated smoke
+# (scripts/smoke/1323-nudge-eligibility-recheck-twostage.sh).
+export BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2=0
 : >"\$audit_file"
 
 daemon_info() { :; }

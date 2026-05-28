@@ -486,6 +486,94 @@ def config_drift_count(audit_log: str, window_days: int = 7) -> int:
     return count
 
 
+def nudge_recheck_observability_counts(
+    audit_log: str, window_days: int = 7
+) -> dict[str, int]:
+    """Aggregate operator-surface counters for the daemon nudge verify path
+    over the last `window_days`. Renders as the `nudge-recheck` line on the
+    `agent-bridge status` dashboard (issue #1323 Track G full-closure).
+
+    The counters surface two adjacent silent-skip / false-positive paths
+    the daemon used to bury before this PR:
+
+    - `nudge_drop_total`: total `session_nudge_dropped` rows. Pre-fix
+      operators only saw the daemon_info log line ("appears dropped after
+      2s"); now the rate is observable.
+    - `nudge_drop_stage2_used`: subset of `session_nudge_dropped` rows
+      whose `stage2_used=1` — i.e. drops that survived BOTH the stage-1
+      and stage-2 grace windows. Stage-2 drops are stronger evidence of
+      a real lost submit; stage-1-only drops are a stricter operator
+      knob (BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2=0).
+    - `recheck_timeout_total`: `nudge_eligibility_recheck_timeout` rows
+      (per #1323 H5 audit-row commit). The companion escalation row
+      `nudge_recheck_timeout_escalated` lives in the audit log itself —
+      operators following the action filter from the dashboard see both.
+
+    Returns 0 for every key when audit_log is missing/unreachable so the
+    counter stays additive on healthy / freshly installed hosts.
+    """
+    counts = {
+        "nudge_drop_total": 0,
+        "nudge_drop_stage2_used": 0,
+        "recheck_timeout_total": 0,
+    }
+    if not audit_log:
+        return counts
+    base = Path(audit_log).expanduser()
+    files = _audit_input_files(base)
+    if not files:
+        return counts
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(window_days)))
+    tracked_actions = {
+        "session_nudge_dropped",
+        "nudge_eligibility_recheck_timeout",
+    }
+    for path in files:
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    action = record.get("action")
+                    if action not in tracked_actions:
+                        continue
+                    ts_raw = record.get("ts")
+                    if not isinstance(ts_raw, str):
+                        continue
+                    try:
+                        ts_str = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
+                        ts = datetime.fromisoformat(ts_str)
+                    except ValueError:
+                        continue
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts < cutoff:
+                        continue
+                    detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+                    if action == "session_nudge_dropped":
+                        counts["nudge_drop_total"] += 1
+                        # stage2_used is a numeric "0"/"1" detail emitted
+                        # by the post-#1323 nudge_agent_session path. Pre-fix
+                        # rows have no stage2_used key — they remain in
+                        # nudge_drop_total but do NOT inflate the stage-2
+                        # subset.
+                        stage2 = detail.get("stage2_used")
+                        if str(stage2) == "1":
+                            counts["nudge_drop_stage2_used"] += 1
+                    elif action == "nudge_eligibility_recheck_timeout":
+                        counts["recheck_timeout_total"] += 1
+        except OSError:
+            continue
+    return counts
+
+
 def fetch_agent_metrics(conn: sqlite3.Connection) -> dict[str, dict[str, int | str | None]]:
     agent_state_columns = table_columns(conn, "agent_state")
     nudge_fail_expr = (
@@ -715,6 +803,21 @@ def render_dashboard(args: argparse.Namespace) -> str:
         lines.append(
             f"config-drift ({drift_window_days}d): {drift_count}"
         )
+    # Issue #1323 (v0.15.0-beta5-2 Track G follow-up) — nudge verify
+    # observability counters. Pre-fix the daemon's verify grace dropped
+    # an info-level log line per false positive and never surfaced; the
+    # operator was left guessing whether the agent was actually stalled.
+    # Render the rolling-window count when ANY of the underlying audit
+    # rows fired so a healthy host (zero of every signal) stays quiet.
+    nudge_window_days = max(1, int(args.nudge_recheck_window_days))
+    nudge_recheck = nudge_recheck_observability_counts(args.audit_log, nudge_window_days)
+    if any(v > 0 for v in nudge_recheck.values()):
+        lines.append(
+            f"nudge-recheck ({nudge_window_days}d): "
+            f"drop_total={nudge_recheck['nudge_drop_total']} "
+            f"drop_stage2_used={nudge_recheck['nudge_drop_stage2_used']} "
+            f"recheck_timeout={nudge_recheck['recheck_timeout_total']}"
+        )
     # Issue #394: pending upgrade-conflict count. The dashboard threshold
     # defaults to 1 (any pending file → warn); operators on chronically
     # drift-heavy hosts can raise it via
@@ -897,6 +1000,8 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
             "plugins": plugins_for_agent(row),
         }
 
+    nudge_window_days = max(1, int(args.nudge_recheck_window_days))
+    nudge_recheck = nudge_recheck_observability_counts(args.audit_log, nudge_window_days)
     payload = {
         "updated_at": iso_now(),
         "version": args.version,
@@ -910,6 +1015,17 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
         # count so JSON consumers (dashboard / admin-bot / smoke) can
         # observe the same number the human-facing warning line emits.
         "pending_upgrade_conflicts": pending_upgrade_conflict_count(args.bridge_home or ""),
+        # Issue #1323 Track G — same audit-derived nudge-verify counters
+        # the human-facing dashboard renders. JSON consumers (smoke
+        # `1323-nudge-eligibility-recheck-twostage.sh`, future admin-bot)
+        # observe the same numbers so the regression contract is
+        # observable end-to-end. window_days is always emitted so a
+        # consumer parsing on a fresh install with zero rows sees a
+        # well-formed payload.
+        "nudge_recheck": {
+            "window_days": nudge_window_days,
+            **nudge_recheck,
+        },
     }
     return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
 
@@ -932,6 +1048,15 @@ def main() -> int:
         type=int,
         default=7,
         help="Rolling window for the config-drift dashboard line (#345 Track C).",
+    )
+    parser.add_argument(
+        "--nudge-recheck-window-days",
+        type=int,
+        default=7,
+        help=(
+            "Rolling window for the nudge-recheck dashboard line "
+            "(#1323 Track G — drop/stage2/recheck_timeout counters)."
+        ),
     )
     parser.add_argument("--version", default="")
     parser.add_argument("--open-limit", type=int, default=8)

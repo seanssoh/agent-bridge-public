@@ -5760,28 +5760,56 @@ nudge_agent_session() {
   # submission, leaving the task `queued` while the daemon logs
   # session_nudge_sent. Use the queue itself as the delivery oracle: a
   # successful nudge causes the agent to claim within ~1s; if the task is
-  # still queued after $BRIDGE_NUDGE_VERIFY_GRACE_SECONDS (default 2s), flip
-  # the audit row to session_nudge_dropped and return non-zero so the next
-  # idle-nudge tick (post-cooldown) retries instead of leaving a stale
-  # success on the audit log. We do NOT retry inline — a tight loop on a
-  # sticky tmux race wastes ticks. Skip when we have no task_id to verify.
+  # still queued after the verify grace, flip the audit row to
+  # session_nudge_dropped and return non-zero so the next idle-nudge tick
+  # (post-cooldown) retries instead of leaving a stale success on the audit
+  # log. We do NOT retry inline — a tight loop on a sticky tmux race wastes
+  # ticks. Skip when we have no task_id to verify.
+  #
+  # Issue #1323 (v0.15.0-beta5-2 Track G follow-up, comment 2026-05-28):
+  # operator measured 4 "appears dropped (after 2s)" events on a fresh
+  # install where every one was a false positive — the next idle-nudge tick
+  # successfully picked up the same task without further intervention. The
+  # 2s threshold was too tight for real claude REPL prompt-buffer +
+  # system-reminder hook latency. Fix: two-stage check. After the
+  # configured stage-1 grace, if the task is STILL queued, wait an
+  # additional BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2 (default 5s) and
+  # re-poll. Only emit session_nudge_dropped if the SECOND check still
+  # observes status=queued. This converts the common "claude was just
+  # slow to ack" race into a no-op on stage 2 (covered by smoke T2). The
+  # legacy single-stage behavior is preserved by setting STAGE2=0.
   local nudge_grace_seconds="${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS:-2}"
+  local nudge_grace_stage2_seconds="${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2:-5}"
+  [[ "$nudge_grace_seconds" =~ ^[0-9]+$ ]] || nudge_grace_seconds=2
+  [[ "$nudge_grace_stage2_seconds" =~ ^[0-9]+$ ]] || nudge_grace_stage2_seconds=5
   local post_status=""
+  local nudge_stage2_used=0
   if [[ -n "$task_id" ]]; then
-    if [[ "$nudge_grace_seconds" =~ ^[0-9]+$ ]] && (( nudge_grace_seconds > 0 )); then
+    if (( nudge_grace_seconds > 0 )); then
       sleep "$nudge_grace_seconds"
     fi
     post_status="$(bridge_queue_task_status "$task_id" 2>/dev/null || true)"
+    if [[ "$post_status" == "queued" ]] && (( nudge_grace_stage2_seconds > 0 )); then
+      # Stage 2 recheck — give the agent another window before we call
+      # the nudge dropped. This is the false-positive-suppression bit.
+      nudge_stage2_used=1
+      sleep "$nudge_grace_stage2_seconds"
+      post_status="$(bridge_queue_task_status "$task_id" 2>/dev/null || true)"
+    fi
     if [[ "$post_status" == "queued" ]]; then
+      local _total_wait_seconds=$(( nudge_grace_seconds + (nudge_stage2_used == 1 ? nudge_grace_stage2_seconds : 0) ))
       bridge_audit_log daemon session_nudge_dropped "$agent" \
         --detail task_id="$task_id" \
         --detail reason=submit_lost_post_grace \
         --detail grace_seconds="$nudge_grace_seconds" \
+        --detail grace_seconds_stage2="$nudge_grace_stage2_seconds" \
+        --detail grace_total_seconds="$_total_wait_seconds" \
+        --detail stage2_used="$nudge_stage2_used" \
         --detail queued="$live_queued" \
         --detail claimed="$live_claimed" \
         --detail idle_seconds="$idle" \
         --detail title="$title"
-      daemon_info "nudge to ${agent} appears dropped (task #${task_id} still queued after ${nudge_grace_seconds}s); will retry on next idle-nudge tick"
+      daemon_info "nudge to ${agent} appears dropped (task #${task_id} still queued after ${_total_wait_seconds}s, stage1=${nudge_grace_seconds}s+stage2=${nudge_grace_stage2_seconds}s); will retry on next idle-nudge tick"
       return 1
     fi
   fi
