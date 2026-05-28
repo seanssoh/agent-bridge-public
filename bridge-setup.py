@@ -217,6 +217,69 @@ def _isolation_aware_save_json(path: Path, payload: Any, mode: int = 0o600) -> N
         )
 
 
+def _post_write_normalize_channel_cred_group(path: Path, agent: str | None) -> None:
+    """Post-write normalization for channel credential files (#1329, Lane μ M6).
+
+    When the iso-aware write path falls through to controller-side
+    `save_json` / `save_text` (e.g. fresh-install agent create window
+    where `_resolve_isolated_owner_for_path` returned None, or
+    no-sudo-NOPASSWD hosts where the sudo dispatch is impossible), the
+    file lands at `controller:controller-primary-group 0600`. On iso v2
+    hosts the iso UID then EACCES on read and the channel plugin fails
+    silently.
+
+    This helper performs a best-effort post-write normalize to
+    `controller:ab-agent-<agent> 0640`:
+
+      * group  →  `ab-agent-<agent>` via `chgrp` (controller is a
+        supplementary member of this group on iso v2 hosts, so direct
+        chgrp succeeds without sudo).
+      * mode   →  `0o640` (owner-rw, group-r, world-none). The brief
+        explicitly chose 0640 NOT 0644 — narrowest grant that lets the
+        iso UID read via group, no world-read widening.
+
+    No-op on:
+      * non-iso hosts (`_v2_agent_group_name` returns None).
+      * shared-mode agents (same).
+      * `agent` arg missing.
+      * file missing.
+
+    Failures are silently swallowed — the upgrade-time backfill in
+    `bridge_isolation_v2_normalize_workdir_profile_group`
+    (lib/bridge-isolation-v2.sh) is the second-line catch-all, so a
+    transient chgrp/chmod failure here does not leave the operator
+    blocked. The contract here is best-effort write-time freshness.
+    """
+    try:
+        if agent is None:
+            return
+        if not isinstance(path, Path):
+            return
+        if not path.exists():
+            return
+        group = _v2_agent_group_name(agent)
+        if not group:
+            return
+        # Best-effort chgrp + chmod. Both can fail when the controller
+        # is not a member of the agent group yet (rolling upgrade
+        # window) — the v2 reapply / upgrade backfill is the recovery
+        # path. Swallow rc != 0 so callers never abort a setup flow
+        # over a normalize miss.
+        subprocess.run(
+            ["chgrp", group, str(path)],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
+        subprocess.run(
+            ["chmod", "0640", str(path)],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
+        # All non-fatal — the upgrade backfill in
+        # bridge_isolation_v2_normalize_workdir_profile_group is the
+        # second-line recovery. Never raise out of a post-write hook.
+        return
+
+
 def load_dotenv(path: Path) -> dict[str, str]:
     # #1175: existence probe routes through the canonical safe wrapper so a
     # direct caller (kept as a public back-compat entry point even though
@@ -1260,6 +1323,11 @@ def cmd_discord(args: argparse.Namespace) -> int:
         _isolation_aware_mkdir(discord_dir, mode=0o2770, agent=args.agent)
         _isolation_aware_save_text(inspected["env_path"], f"DISCORD_BOT_TOKEN={token}\n")
         _isolation_aware_save_json(inspected["access_path"], access_doc)
+        # #1329 (v0.15.0-beta5-2 Lane μ M6): post-write normalize so a
+        # controller-side fallback write (no iso owner resolvable) does
+        # not leave the iso UID EACCESing on read.
+        _post_write_normalize_channel_cred_group(inspected["env_path"], args.agent)
+        _post_write_normalize_channel_cred_group(inspected["access_path"], args.agent)
         result["write_status"] = "ok"
 
         if args.skip_validate:
@@ -1391,6 +1459,9 @@ def cmd_telegram(args: argparse.Namespace) -> int:
         _isolation_aware_mkdir(telegram_dir, mode=0o2770, agent=args.agent)
         _isolation_aware_save_text(inspected["env_path"], f"TELEGRAM_BOT_TOKEN={token}\n")
         _isolation_aware_save_json(inspected["access_path"], access_doc)
+        # #1329 (Lane μ M6): see discord post-write normalize comment.
+        _post_write_normalize_channel_cred_group(inspected["env_path"], args.agent)
+        _post_write_normalize_channel_cred_group(inspected["access_path"], args.agent)
         result["write_status"] = "ok"
 
         if args.skip_validate:
@@ -1603,6 +1674,9 @@ def cmd_teams(args: argparse.Namespace) -> int:
             env_lines.append(f"TEAMS_SERVICE_URL={service_url}")
         _isolation_aware_save_text(inspected["env_path"], "\n".join(env_lines) + "\n")
         _isolation_aware_save_json(inspected["access_path"], access_doc)
+        # #1329 (Lane μ M6): see discord post-write normalize comment.
+        _post_write_normalize_channel_cred_group(inspected["env_path"], args.agent)
+        _post_write_normalize_channel_cred_group(inspected["access_path"], args.agent)
         credential_validation = {"status": "skipped"}
         if not args.skip_validate:
             credential_validation = validate_teams_credentials(app_id, app_password, tenant_id)
@@ -1643,6 +1717,8 @@ def cmd_teams(args: argparse.Namespace) -> int:
         validation_state["messaging_endpoint"] = messaging_endpoint
         state_doc["validation"] = validation_state
         _isolation_aware_save_json(inspected["state_path"], state_doc)
+        # #1329 (Lane μ M6): see discord post-write normalize comment.
+        _post_write_normalize_channel_cred_group(inspected["state_path"], args.agent)
         result["write_status"] = "ok"
         result["validation"] = {
             "status": validation_state["status"],
@@ -1882,6 +1958,8 @@ def cmd_ms365(args: argparse.Namespace) -> int:
         # mode=0o600 (the default). Explicit to match #1215 contract:
         # secret env files stay tight; only the parent dir gets 02770.
         _isolation_aware_save_text(inspected["env_path"], "\n".join(env_lines) + "\n", mode=0o600)
+        # #1329 (Lane μ M6): see discord post-write normalize comment.
+        _post_write_normalize_channel_cred_group(inspected["env_path"], args.agent)
         result["write_status"] = "ok"
         print_ms365_result(result)
         return 0
@@ -2085,6 +2163,10 @@ def cmd_mattermost(args: argparse.Namespace) -> int:
         _isolation_aware_save_text(env_path, env_text)
         _isolation_aware_save_json(access_path, access_doc)
         _isolation_aware_save_json(mcp_path, mcp_doc)
+        # #1329 (Lane μ M6): see discord post-write normalize comment.
+        _post_write_normalize_channel_cred_group(env_path, args.agent)
+        _post_write_normalize_channel_cred_group(access_path, args.agent)
+        _post_write_normalize_channel_cred_group(mcp_path, args.agent)
         result["write_status"] = "ok"
 
         if args.skip_validate:

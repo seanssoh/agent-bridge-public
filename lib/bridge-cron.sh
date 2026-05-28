@@ -163,6 +163,163 @@ bridge_cron_scheduler_state_file() {
   printf '%s/scheduler-state.json' "$BRIDGE_CRON_STATE_DIR"
 }
 
+# Issue #1328 (v0.15.0-beta5-2 Lane μ M5): cron-state-dir anchor + migrate.
+#
+# The cron state dir holds scheduler state, per-job dispatch directories,
+# per-run artifacts, locks, and the preflight cache. When the operator (or
+# an upgrade path) changes `BRIDGE_CRON_STATE_DIR` — typically by relocating
+# `BRIDGE_STATE_DIR`, by removing an `BRIDGE_CRON_STATE_DIR` env override,
+# or by editing `bridge-config.json` — the scheduler silently starts writing
+# to the new location, leaving the old location stranded with no migration
+# step. Symptoms: deduplication state lost, in-flight runs orphaned, cron
+# history gone from `agent-bridge status`.
+#
+# The anchor file records the last cron-state-dir path the helper observed.
+# On every cron entry path that opens the state dir, the verify helper
+# compares the recorded anchor against the live env and migrates (mv) the
+# old tree to the new location ONLY when the old path is non-empty AND the
+# new path is empty / absent (the safe single-source case).
+#
+# Edge-case matrix:
+#   1. First run / no anchor present
+#       → write the anchor, no migration. fresh-install no-op.
+#   2. Anchor matches current env
+#       → no-op (the common steady-state case).
+#   3. Anchor differs, old exists with content, new missing or empty
+#       → mv old → new, rewrite anchor, audit `cron_state_dir_migrated`.
+#         This is the upgrade-driven relocation case.
+#   4. Anchor differs, old missing
+#       → rewrite the anchor silently (operator already migrated, or
+#         the old path was never populated).
+#   5. Anchor differs, BOTH old and new exist with content (edge case 4)
+#       → bail with an operator-visible warning and audit
+#         `cron_state_dir_conflict`. DO NOT merge automatically — that
+#         risks silently dropping run history.
+#   6. Operator explicitly relocated the dir themselves (edge case 3)
+#       → covered by case 5 when both still have content (warn). When the
+#         operator left only the new dir populated, case 4 silently
+#         resyncs the anchor — respect the override.
+#
+# The helper is idempotent (case 2 / 4 / 6 all short-circuit), single-host
+# only (no remote state to reconcile), and best-effort: a failure to write
+# the anchor never breaks cron — it just means the next run will re-check.
+bridge_cron_state_dir_anchor_file() {
+  printf '%s/cron-state-dir-anchor.txt' "${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+}
+
+# bridge_cron_state_dir_dir_has_content <dir>
+#
+# Echoes "yes" / "no" based on whether the directory has any cron-state
+# artifacts that would matter to a migration decision. Treats a directory
+# with only the anchor file (or no children at all) as empty so a fresh
+# `$BRIDGE_CRON_STATE_DIR` that was just `mkdir -p`'d does not trip the
+# conflict gate. Internal helper.
+bridge_cron_state_dir_dir_has_content() {
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir" ]] || { printf 'no\n'; return 0; }
+  # `find -mindepth 1 -maxdepth 1 -print -quit` exits as soon as it sees
+  # one child, so this stays O(1) on a large state tree.
+  local first=""
+  first="$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || printf '')"
+  if [[ -n "$first" ]]; then
+    printf 'yes\n'
+  else
+    printf 'no\n'
+  fi
+}
+
+# bridge_cron_state_dir_verify_and_migrate
+#
+# Idempotent verifier called from cron entry paths (notably `run_sync`).
+# Returns 0 always — caller never gates on the rc. Operator-visible side
+# effects:
+#   - audit emission via `bridge_audit_log` (best-effort).
+#   - `bridge_warn` line for the conflict case.
+bridge_cron_state_dir_verify_and_migrate() {
+  local anchor_file=""
+  local recorded=""
+  local current="${BRIDGE_CRON_STATE_DIR:-}"
+  [[ -n "$current" ]] || return 0
+
+  anchor_file="$(bridge_cron_state_dir_anchor_file)"
+  local anchor_dir=""
+  anchor_dir="$(dirname "$anchor_file" 2>/dev/null || printf '')"
+  # Ensure the anchor's parent dir exists so the first-run write below
+  # never fails on a fresh install. Best-effort — silent on perm error.
+  [[ -n "$anchor_dir" && -d "$anchor_dir" ]] || mkdir -p "$anchor_dir" 2>/dev/null || true
+
+  if [[ -f "$anchor_file" ]]; then
+    recorded="$(cat "$anchor_file" 2>/dev/null | head -n1)"
+    # Strip trailing whitespace (CR / LF / space) defensively — an
+    # operator who edits the file in a text editor may add a newline.
+    recorded="${recorded%$'\r'}"
+  fi
+
+  # Case 1: no anchor yet (fresh install or first run after this change
+  # landed). Record current path; no migration.
+  if [[ -z "$recorded" ]]; then
+    printf '%s\n' "$current" >"$anchor_file" 2>/dev/null || true
+    return 0
+  fi
+
+  # Case 2: anchor matches → no-op.
+  if [[ "$recorded" == "$current" ]]; then
+    return 0
+  fi
+
+  # Anchor differs. Probe both paths.
+  local old_has="no"
+  local new_has="no"
+  old_has="$(bridge_cron_state_dir_dir_has_content "$recorded")"
+  new_has="$(bridge_cron_state_dir_dir_has_content "$current")"
+
+  # Case 5: both have content → bail with conflict warning. Operator
+  # must resolve manually before we touch either tree.
+  if [[ "$old_has" == "yes" && "$new_has" == "yes" ]]; then
+    bridge_warn "cron state dir conflict: anchor=${recorded} (non-empty) AND BRIDGE_CRON_STATE_DIR=${current} (non-empty). Refusing automatic migration. Reconcile manually and update ${anchor_file}, or unset \$BRIDGE_CRON_STATE_DIR to fall back to the canonical path."
+    if declare -F bridge_audit_log >/dev/null 2>&1; then
+      bridge_audit_log cron cron_state_dir_conflict "${BRIDGE_AGENT_ID:-controller}" \
+        --detail recorded="$recorded" \
+        --detail current="$current" \
+        --detail anchor_file="$anchor_file" 2>/dev/null || true
+    fi
+    return 0
+  fi
+
+  # Case 3: old has content, new is empty/absent → safe to migrate.
+  if [[ "$old_has" == "yes" && "$new_has" == "no" ]]; then
+    # Ensure the parent of $current exists so `mv` lands cleanly.
+    local current_parent=""
+    current_parent="$(dirname "$current" 2>/dev/null || printf '')"
+    [[ -n "$current_parent" && -d "$current_parent" ]] || mkdir -p "$current_parent" 2>/dev/null || true
+    # If the new path already exists as an empty dir, mv would fail
+    # because the target is occupied. Remove the empty target first
+    # (rmdir refuses if non-empty — safety net against the
+    # has_content "no" → empty stub case).
+    if [[ -d "$current" ]]; then
+      rmdir "$current" 2>/dev/null || true
+    fi
+    if mv "$recorded" "$current" 2>/dev/null; then
+      printf '%s\n' "$current" >"$anchor_file" 2>/dev/null || true
+      if declare -F bridge_audit_log >/dev/null 2>&1; then
+        bridge_audit_log cron cron_state_dir_migrated "${BRIDGE_AGENT_ID:-controller}" \
+          --detail from="$recorded" \
+          --detail to="$current" \
+          --detail anchor_file="$anchor_file" 2>/dev/null || true
+      fi
+      bridge_warn "cron state dir migrated: $recorded → $current (anchor refreshed)"
+      return 0
+    fi
+    bridge_warn "cron state dir migrate failed: mv $recorded → $current returned non-zero. Anchor unchanged so the next run re-attempts; reconcile manually if this persists."
+    return 0
+  fi
+
+  # Case 4 / 6: old missing, or operator already moved → silently
+  # refresh the anchor to the current path. No migration needed.
+  printf '%s\n' "$current" >"$anchor_file" 2>/dev/null || true
+  return 0
+}
+
 bridge_cron_safe_component() {
   local value="$1"
 

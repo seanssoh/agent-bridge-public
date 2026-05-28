@@ -2130,6 +2130,38 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
     fi
   fi
 
+  # Issue #1328 (v0.15.0-beta5-2 Lane μ M5): verify the cron-state-dir
+  # anchor and migrate the old tree if `BRIDGE_CRON_STATE_DIR` moved.
+  # Idempotent — when the anchor matches the live env, the helper is a
+  # no-op. The full edge-case matrix lives in
+  # `bridge_cron_state_dir_verify_and_migrate`'s docstring (lib/bridge-cron.sh).
+  # Run at upgrade time so the operator never observes a stale cron tree
+  # after a `BRIDGE_CRON_STATE_DIR` override change; the daemon's `sync`
+  # tick also calls the same helper for the steady-state path.
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[bridge-upgrade] plan: verify cron-state-dir anchor (idempotent; migrates stale tree if BRIDGE_CRON_STATE_DIR moved)" >&2
+  else
+    _cron_state_dir_verify_output=""
+    if ! _cron_state_dir_verify_output="$(
+      bridge_upgrade_with_target_env "$TARGET_ROOT" "$BRIDGE_BASH_BIN" -lc '
+        set -euo pipefail
+        SCRIPT_DIR="$1"
+        source "$SCRIPT_DIR/bridge-lib.sh"
+        # bridge-lib.sh sources lib/bridge-cron.sh transitively; the
+        # verify helper lives in lib/bridge-cron.sh.
+        bridge_cron_state_dir_verify_and_migrate
+      ' -- "$SOURCE_ROOT" 2>&1
+    )"; then
+      echo "[bridge-upgrade] WARN: cron-state-dir verify failed: $_cron_state_dir_verify_output" >&2
+      _upgrade_partial_failures+=("cron_state_dir_verify")
+    elif [[ -n "$_cron_state_dir_verify_output" ]]; then
+      # Helper emits human-readable bridge_warn lines on migrate/conflict;
+      # surface them to the upgrade summary so the operator sees them
+      # without grepping the audit log.
+      printf '%s\n' "$_cron_state_dir_verify_output" >&2
+    fi
+  fi
+
   # Also propagate per-agent doc sync (bridge-docs.py apply) so
   # MEMORY-SCHEMA.md / SKILLS.md / CLAUDE.md managed blocks track the
   # canonical runtime on every upgrade. Before 2026-04-19 this hook was
