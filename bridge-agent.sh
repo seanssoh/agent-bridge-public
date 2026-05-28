@@ -2030,6 +2030,16 @@ run_show() {
     bridge_agent_session_health_json "$agent" >"$_show_dir/session-health.json"
     bridge_agent_alive_signals_json "$agent" >"$_show_dir/alive.json"
     bridge_agent_session_source_path "$agent" >"$_show_dir/session-source.txt"
+    # Issue #1357 (v0.15.0-beta5-2 Lane E): mirror the text-mode quickref in
+    # --json so scripted consumers (a future MCP tool, a doctor renderer)
+    # can render the same boundary mapping without re-implementing the
+    # gate. The empty marker file is the "shared mode — skip" signal; a
+    # non-empty file is the payload to inline.
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      bridge_agent_iso_boundary_quickref_text >"$_show_dir/iso-boundary-quickref.txt"
+    else
+      : >"$_show_dir/iso-boundary-quickref.txt"
+    fi
     # codex PR #940 r2 BLOCKING: see run_list above for the RETURN-trap-
     # bypass rationale. Same explicit set +e / capture-rc / set -e pattern
     # ensures the tempdir is removed regardless of helper rc. Cleanup
@@ -2041,7 +2051,8 @@ run_show() {
       "$_show_dir/diagnostics.json" \
       "$_show_dir/session-health.json" \
       "$_show_dir/session-source.txt" \
-      "$_show_dir/alive.json"
+      "$_show_dir/alive.json" \
+      "$_show_dir/iso-boundary-quickref.txt"
     _show_rc=$?
     set -e
     rm -rf "$_show_dir"
@@ -2163,6 +2174,18 @@ run_show() {
     bridge_agent_channel_diagnostics_text "$agent" | sed 's/^/  /'
     printf 'session_health:\n'
     bridge_agent_session_guidance_text "$agent" | sed 's/^/  /'
+    # Issue #1357 (v0.15.0-beta5-2 Lane E): when the resolved agent is
+    # linux-user iso effective, append the compressed boundary quickref so
+    # an operator (or the agent itself, on first boot) sees the same
+    # workaround mapping the CLAUDE.md table documents. Skipped for shared-
+    # mode agents — the rows do not apply (no iso UID, no cross-class
+    # boundary), and surfacing them there would mislead. The helper lives
+    # in lib/bridge-agents.sh next to bridge_agent_linux_user_isolation_
+    # effective so the gate and the payload move together.
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      printf 'iso_boundary_quickref:\n'
+      bridge_agent_iso_boundary_quickref_text | sed 's/^/  /'
+    fi
   done <<<"$output"
 }
 
