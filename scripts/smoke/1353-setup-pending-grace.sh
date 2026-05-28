@@ -170,12 +170,15 @@ fi
 if ! grep -q 'bridge_agent_setup_pending_active' "$REPO_ROOT/bridge-daemon.sh"; then
   smoke_fail "bridge-daemon.sh no longer references bridge_agent_setup_pending_active anywhere — full grace surface removed"
 fi
-# At least 2 call sites: the autostart check + the channel-health miss
-# report. Single call site would mean we lost one of the two gate
-# surfaces from this PR.
+# At least 3 call sites: the autostart check (inside
+# bridge_daemon_check_channel_status_or_hold), the channel-health miss
+# report (bridge_report_channel_health_miss), AND the cron-dispatch
+# wake path (bridge_daemon_cron_dispatch_wake) which emits its own
+# warn + audit row on a generic hold and so needs its own grace probe
+# (codex r1 BLOCKING #1353).
 GRACE_REFS="$(grep -c 'bridge_agent_setup_pending_active' "$REPO_ROOT/bridge-daemon.sh" 2>/dev/null || echo 0)"
-if (( GRACE_REFS < 2 )); then
-  smoke_fail "bridge-daemon.sh references bridge_agent_setup_pending_active only $GRACE_REFS time(s); expected >=2 (autostart gate + channel-health miss report)"
+if (( GRACE_REFS < 3 )); then
+  smoke_fail "bridge-daemon.sh references bridge_agent_setup_pending_active only $GRACE_REFS time(s); expected >=3 (autostart gate + channel-health miss report + cron-dispatch wake)"
 fi
 
 # Confirm `agent create` writes the marker.

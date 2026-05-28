@@ -7695,6 +7695,30 @@ bridge_daemon_cron_dispatch_wake() {
     return 1
   fi
 
+  # Issue #1353 (v0.15.0-beta5-2 Track A) — setup-pending grace window
+  # for the cron-dispatch path too. The shared check helper below
+  # short-circuits validator misses to return 0 ("hold") regardless of
+  # whether the hold is "silent grace" or "real configuration drift",
+  # because the always-on / on-demand callers simply `continue` and
+  # don't emit. The cron-dispatch path is different: it emits both a
+  # `bridge_warn` + `cron_dispatch_wake_refused` audit row when the
+  # helper holds. Without this pre-check, a freshly-created always-on
+  # static agent with a cron job dispatched within the grace window
+  # would still see the audit + warn line burst — defeating the
+  # silent-skip contract this PR is supposed to install. Skip the cron-
+  # dispatch wake silently (no audit, no log, no throttle-state touch)
+  # during the grace window; the task stays queued for the next tick
+  # so the cron job fires the moment setup completes.
+  #
+  # codex r1 BLOCKING #1353 (catch on this exact surface) — added the
+  # explicit grace probe here so the silent-skip contract applies to
+  # all three start paths (always-on, on-demand, cron-dispatch).
+  if bridge_agent_setup_pending_active "$agent" 2>/dev/null; then
+    if [[ "${BRIDGE_DAEMON_DEBUG_SETUP_PENDING:-0}" == "1" ]]; then
+      daemon_info "cron-dispatch wake hold ${agent} (setup-pending grace, task=#${task_id})"
+    fi
+    return 1
+  fi
   # Issue #1234 (Lane δ, v0.15.0-beta2) — codex r2 BLOCKING parity:
   # mirror process_on_demand_agents' channel-required validator-miss
   # auto-hold. Without this gate, a stopped static agent with required
