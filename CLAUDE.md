@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Audience**: a code contributor (you, when editing source). This file is the **repo contributor contract** — source-vs-runtime boundaries, queue semantics, high-risk surfaces, validation/release rules.
+
+**If you are an operator / first-time installer / agent at first wake**: this is the wrong file. Read [docs/onboarding/](./docs/onboarding/) instead — persona-based runbooks for first-install, creating a static agent, plugin-enabled-agent first-session checklist, and channel/auth troubleshooting. Then come back here if you also need to edit source.
+
 ## What This Repo Is
 
 Agent Bridge is a thin local orchestration layer that wires Claude Code and Codex sessions together over `tmux` + SQLite queue + a Bash daemon. It does not implement its own agent runtime — Claude/Codex are the agents. Design priorities, in order, are **queue-first**, **daemon-safe**, and **runtime-preserving**.
