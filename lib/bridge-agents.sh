@@ -7083,13 +7083,23 @@ bridge_create_next_steps_lines() {
   local has_teams=0
   local has_ms365=0
   local has_any_plugin=0
-  local IFS=','
   local item=""
-  local -a items=()
+  local _tmp=""
 
+  # Codex r2 review PR #1364 BLOCKING G (footgun #11): the original r1
+  # form used `read -r -a items <<<"$channels"` here-string split, which
+  # is the `<<<` heredoc-write variant of the Bash 5.3.9 read_comsub
+  # deadlock class (KNOWN_ISSUES.md §26, v0.13.7 PR #890 fix). Spool
+  # the CSV to a tempfile and walk it via a tab/newline read loop —
+  # matches the bridge_agent_next_actions_tsv tempfile pattern just above
+  # so a future move keeps the deadlock-safe shape.
   if [[ -n "$channels" ]]; then
-    read -r -a items <<<"$channels"
-    for item in "${items[@]}"; do
+    _tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-create-next-steps.XXXXXX")" || return 1
+    # shellcheck disable=SC2064  # pin the path at trap-set time
+    trap "rm -f -- '$_tmp'" RETURN
+    # One channel per line; the read loop below normalises whitespace.
+    printf '%s\n' "$channels" | tr ',' '\n' > "$_tmp"
+    while IFS= read -r item; do
       item="$(bridge_trim_whitespace "$item")"
       [[ -n "$item" ]] || continue
       case "$item" in
@@ -7101,7 +7111,9 @@ bridge_create_next_steps_lines() {
       case "$item" in
         plugin:*) has_any_plugin=1 ;;
       esac
-    done
+    done < "$_tmp"
+    rm -f -- "$_tmp"
+    trap - RETURN
   fi
 
   # Persona 1 (ALL agents): the dry-run resolves the launch command and
