@@ -468,7 +468,15 @@ select_for_path() {
       # session field. Pull on every queue or task surface move so a
       # future PR cannot regress the audit-row contract that downstream
       # operator triage depends on.
-      add_required queue 1106-nudge-shell-recheck nudge-task-age-gate nudge-redundant-active-agent a2a-cross-bridge 1100-audit-since-tz 1115-cli-usage-drift J-beta4-workflow-docs K-beta4-nits beta5-2-delta-nudge-session-empty
+      # v0.15.0-beta5-2 Lane κ r2 (#1345): bridge-queue.py daemon-step
+      # now excludes `picker_blocked` / `working` activity_state values
+      # from the idle_agents set used by stale-claim requeue. The Lane
+      # κ smoke (T8/T9/T10) pins both the python-side exclusion AND the
+      # snapshot writer column ordering. Pull on every bridge-queue.py
+      # move so a future refactor cannot silently re-introduce the
+      # codex r1 BLOCKING repro (claimed task + picker_blocked + aged
+      # → wrongly requeued).
+      add_required queue 1106-nudge-shell-recheck nudge-task-age-gate nudge-redundant-active-agent a2a-cross-bridge 1100-audit-since-tz 1115-cli-usage-drift J-beta4-workflow-docs K-beta4-nits beta5-2-delta-nudge-session-empty beta5-2-kappa-state-audit-reconcile
       add_integration integration-minimal
       ;;
 
@@ -659,7 +667,16 @@ select_for_path() {
       # the fallback timer, the audit-row shape (recovered /
       # recheck_still_failed), or the re-arm semantics on recheck
       # failure.
-add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak
+      # v0.15.0-beta5-2 Lane κ r2 (#1345): lib/bridge-state.sh's
+      # bridge_write_agent_snapshot now appends the `activity_state`
+      # column so the daemon-step Python path can exclude
+      # picker_blocked agents from the idle_agents set used by
+      # stale-claim requeue. Pull beta5-2-kappa-state-audit-reconcile
+      # on every lib/bridge-state.sh or bridge-daemon.sh move so a
+      # future refactor cannot silently re-introduce the codex r1
+      # BLOCKING repro (claimed task + picker_blocked agent + aged
+      # session_activity_ts → wrongly requeued tasks).
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile
       # v0.15.0-beta5-2 Lane η (#1314, CRITICAL/security):
       # bridge-daemon.sh's `cmd_run_cron_worker` now gates shell-cron
       # dispatch on `bridge_cron_uid_drop_preflight`. The new gate emits

@@ -4185,20 +4185,49 @@ bridge_write_agent_snapshot() {
   local prompt_ready_session
   local prompt_ready_source
   local prompt_ready_file
+  local activity_state
 
   {
     # Issue #589: extended snapshot format adds three trailing columns for
     # the prompt-ready latch (timestamp, session-id, source). Older daemon
     # consumers that read only the first six columns are unaffected; the
     # python upsert path uses .get() with default empty for the new keys.
-    echo -e "agent\tengine\tsession\tworkdir\tactive\tsession_activity_ts\tprompt_ready_ts\tprompt_ready_session\tprompt_ready_source"
+    #
+    # Issue #1345 r2 (Lane κ v0.15.0-beta5-2, codex r1 BLOCKING): append
+    # `activity_state` so the daemon-step queue maintenance path can see
+    # picker_blocked agents and exclude them from the idle_agents set
+    # used by stale-claim requeue (bridge-queue.py:2157-2167 +
+    # :2242-2285). Before this column, the daemon-step snapshot only
+    # carried active + session_activity_ts age, so a picker_blocked
+    # agent whose tmux activity_ts had aged past --idle-threshold was
+    # wrongly classified as idle and had its claimed tasks requeued.
+    # The roster/status snapshot + agent-show + heartbeat path all
+    # already emit picker_blocked (PR #1345 r1), but the daemon-step
+    # snapshot is a separate writer and was missed.
+    #
+    # Cost note: the predicate is a single grep over the per-agent
+    # stall.env (already touched by the daemon stall scan), so the
+    # daemon hot path remains O(n_agents) without an extra tmux
+    # capture. The fuller "working/starting" classification stays on
+    # the roster/status writer (which already does the tmux capture
+    # for the dashboard) — the daemon-step path only needs the
+    # picker_blocked signal because the existing
+    # `session_activity_ts` age check already excludes recently-active
+    # ("working") agents from `idle_agents`. Emitting an empty
+    # activity_state column when not picker_blocked preserves the
+    # column position without forcing the expensive recent-capture.
+    echo -e "agent\tengine\tsession\tworkdir\tactive\tsession_activity_ts\tprompt_ready_ts\tprompt_ready_session\tprompt_ready_source\tactivity_state"
     for agent in "${BRIDGE_AGENT_IDS[@]}"; do
       active=0
       session="$(bridge_agent_session "$agent")"
       activity=""
+      activity_state=""
       if bridge_agent_is_active "$agent"; then
         active=1
         activity="$(bridge_tmux_session_activity_ts "$session")"
+        if bridge_agent_picker_blocked "$agent"; then
+          activity_state="picker_blocked"
+        fi
       fi
 
       prompt_ready_ts=""
@@ -4220,7 +4249,7 @@ bridge_write_agent_snapshot() {
         fi
       fi
 
-      echo -e "${agent}\t$(bridge_agent_engine "$agent")\t${session}\t$(bridge_agent_workdir "$agent")\t${active}\t${activity}\t${prompt_ready_ts}\t${prompt_ready_session}\t${prompt_ready_source}"
+      echo -e "${agent}\t$(bridge_agent_engine "$agent")\t${session}\t$(bridge_agent_workdir "$agent")\t${active}\t${activity}\t${prompt_ready_ts}\t${prompt_ready_session}\t${prompt_ready_source}\t${activity_state}"
     done
   } >"$file"
 }

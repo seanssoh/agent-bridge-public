@@ -375,5 +375,301 @@ fi
 
 smoke_log "T7 PASS — teeth proves T4.a would catch the reconcile parity regression"
 
-smoke_log "ALL PASS — beta5-2 Lane κ smoke (H1 #1319 + M1 #1324 + M2 #1325)"
+# ---------------------------------------------------------------------
+# T8 (PR #1345 r2, codex r1 BLOCKING) — daemon-step snapshot carries
+# activity_state column AND bridge-queue.py daemon-step EXCLUDES
+# picker_blocked agents from idle_agents (stale-claim requeue skipped).
+#
+# Repro from codex review: claimed task + claimed_ts aged past
+# --max-claim-age + agent session_activity_ts aged past --idle-threshold
+# + agent activity_state="picker_blocked" → task MUST stay claimed
+# (not requeued with "stale_claim_requeued" event).
+# ---------------------------------------------------------------------
+smoke_log "T8 (PR #1345 r2 BLOCKING): snapshot activity_state + queue.py picker_blocked exclude"
+
+# T8.a — static asserts on the snapshot writer + queue.py reader.
+if ! awk '/^bridge_write_agent_snapshot\(\) \{/,/^\}/' "$STATE_LIB" \
+      | grep -qE '\\tactivity_state"'; then
+  smoke_fail "T8.a: bridge_write_agent_snapshot header missing activity_state column (#1345 r2)"
+fi
+if ! awk '/^bridge_write_agent_snapshot\(\) \{/,/^\}/' "$STATE_LIB" \
+      | grep -qF 'bridge_agent_picker_blocked'; then
+  smoke_fail "T8.a: bridge_write_agent_snapshot does not call bridge_agent_picker_blocked (#1345 r2)"
+fi
+QUEUE_PY="$REPO_ROOT/bridge-queue.py"
+[[ -f "$QUEUE_PY" ]] || smoke_fail "T8.a: missing $QUEUE_PY"
+if ! grep -qF '_idle_excluded_states' "$QUEUE_PY"; then
+  smoke_fail "T8.a: bridge-queue.py missing _idle_excluded_states (picker_blocked exclude — #1345 r2)"
+fi
+if ! grep -qE 'activity_state\s*not in\s*_idle_excluded_states' "$QUEUE_PY"; then
+  smoke_fail "T8.a: bridge-queue.py idle_agents predicate does not reference activity_state exclusion (#1345 r2)"
+fi
+if ! grep -qF 'picker_blocked' "$QUEUE_PY"; then
+  smoke_fail "T8.a: bridge-queue.py missing picker_blocked literal in idle exclusion comment/set (#1345 r2)"
+fi
+
+# T8.b — functional: build a temp task DB + hand-rolled snapshot + run
+# bridge-queue.py daemon-step. Assert the claimed task stays claimed.
+T8_HOME="$SMOKE_TMP_ROOT/t8"
+mkdir -p "$T8_HOME/state"
+T8_DB="$T8_HOME/state/tasks.db"
+T8_SNAPSHOT="$T8_HOME/snapshot.tsv"
+
+# A claimed task aged past max_claim_age (use --max-claim-age 900 default).
+# Pick claimed_ts = now - 2000, session_activity_ts = now - 2000 so the
+# agent is well past --idle-threshold (default 120) AND --max-claim-age.
+T8_NOW="$(date +%s)"
+T8_AGED=$((T8_NOW - 2000))
+
+# Snapshot row with activity_state=picker_blocked. Header MUST match
+# bridge_write_agent_snapshot's output exactly so csv.DictReader maps
+# columns by name.
+{
+  printf 'agent\tengine\tsession\tworkdir\tactive\tsession_activity_ts\tprompt_ready_ts\tprompt_ready_session\tprompt_ready_source\tactivity_state\n'
+  printf 'wedged\tclaude\twedged\t/tmp\t1\t%s\t\t\t\tpicker_blocked\n' "$T8_AGED"
+} >"$T8_SNAPSHOT"
+
+# Seed the DB with a claimed task. Use sqlite3 CLI for a clean,
+# repeatable insert that doesn't depend on bridge-task.sh setup.
+sqlite3 "$T8_DB" <<SQL >/dev/null
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  assigned_to TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  priority TEXT NOT NULL DEFAULT 'normal',
+  status TEXT NOT NULL DEFAULT 'queued',
+  created_ts INTEGER NOT NULL,
+  updated_ts INTEGER NOT NULL,
+  body_text TEXT,
+  body_path TEXT,
+  claimed_by TEXT,
+  claimed_ts INTEGER,
+  lease_until_ts INTEGER,
+  closed_ts INTEGER
+);
+INSERT INTO tasks (
+  title, assigned_to, created_by, status, created_ts, updated_ts,
+  claimed_by, claimed_ts, lease_until_ts
+) VALUES (
+  'wedged-task', 'wedged', 'operator', 'claimed',
+  ${T8_AGED}, ${T8_AGED},
+  'wedged', ${T8_AGED}, NULL
+);
+SQL
+
+# Run daemon-step. The python entry runs init_db itself, so we don't
+# need to predeclare the rest of the schema.
+T8_OUT="$(
+  BRIDGE_TASK_DB="$T8_DB" \
+  BRIDGE_HOME="$T8_HOME" \
+  BRIDGE_STATE_DIR="$T8_HOME/state" \
+  python3 "$QUEUE_PY" daemon-step \
+    --snapshot "$T8_SNAPSHOT" \
+    --idle-threshold 120 \
+    --max-claim-age 900 \
+    --skip-nudges \
+    --format text 2>&1 || true
+)"
+
+# Assert task #1 is still claimed (NOT requeued).
+T8_STATUS="$(sqlite3 "$T8_DB" "SELECT status FROM tasks WHERE id=1;" 2>/dev/null || true)"
+if [[ "$T8_STATUS" != "claimed" ]]; then
+  smoke_fail "T8.b: claimed task for picker_blocked agent was wrongly requeued. status=$T8_STATUS out=$T8_OUT"
+fi
+
+# Assert no stale_claim_requeued event was emitted for task #1.
+T8_EVENT="$(sqlite3 "$T8_DB" "SELECT COUNT(*) FROM task_events WHERE task_id=1 AND event_type='stale_claim_requeued';" 2>/dev/null || echo "0")"
+if [[ "$T8_EVENT" != "0" ]]; then
+  smoke_fail "T8.b: stale_claim_requeued event emitted for picker_blocked agent (count=$T8_EVENT). Expected 0."
+fi
+
+smoke_log "T8 PASS — daemon-step snapshot carries activity_state + queue.py honors picker_blocked exclusion"
+
+# ---------------------------------------------------------------------
+# T9 (teeth for T8) — drop the activity_state column from the snapshot
+# OR drop the python-side exclusion → claimed task gets requeued. We
+# pick the python-side teeth path because it isolates the queue.py
+# change without re-running the daemon-step pipeline twice.
+#
+# Strategy: apply a working-copy patch to bridge-queue.py that removes
+# `_idle_excluded_states` from the predicate (reverts to pre-r2
+# behavior), run daemon-step against the same DB + snapshot fixture
+# from T8 (recreated to a fresh state), and assert the task IS
+# requeued. If the teeth revert fails to flip the assertion, T8 is
+# not actually catching the regression.
+# ---------------------------------------------------------------------
+smoke_log "T9 (teeth, PR #1345 r2): revert queue.py exclusion -> task requeued"
+
+T9_HOME="$SMOKE_TMP_ROOT/t9"
+mkdir -p "$T9_HOME/state"
+T9_DB="$T9_HOME/state/tasks.db"
+T9_SNAPSHOT="$T9_HOME/snapshot.tsv"
+
+T9_NOW="$(date +%s)"
+T9_AGED=$((T9_NOW - 2000))
+
+{
+  printf 'agent\tengine\tsession\tworkdir\tactive\tsession_activity_ts\tprompt_ready_ts\tprompt_ready_session\tprompt_ready_source\tactivity_state\n'
+  printf 'wedged\tclaude\twedged\t/tmp\t1\t%s\t\t\t\tpicker_blocked\n' "$T9_AGED"
+} >"$T9_SNAPSHOT"
+
+sqlite3 "$T9_DB" <<SQL >/dev/null
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  assigned_to TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  priority TEXT NOT NULL DEFAULT 'normal',
+  status TEXT NOT NULL DEFAULT 'queued',
+  created_ts INTEGER NOT NULL,
+  updated_ts INTEGER NOT NULL,
+  body_text TEXT,
+  body_path TEXT,
+  claimed_by TEXT,
+  claimed_ts INTEGER,
+  lease_until_ts INTEGER,
+  closed_ts INTEGER
+);
+INSERT INTO tasks (
+  title, assigned_to, created_by, status, created_ts, updated_ts,
+  claimed_by, claimed_ts, lease_until_ts
+) VALUES (
+  'wedged-task', 'wedged', 'operator', 'claimed',
+  ${T9_AGED}, ${T9_AGED},
+  'wedged', ${T9_AGED}, NULL
+);
+SQL
+
+# Build a reverted copy of bridge-queue.py with the exclusion removed.
+# Use awk to drop the `and activity_state not in _idle_excluded_states`
+# conjunct from the idle-set comprehension (the conjunct lives on its
+# own line inside the if-block). The conjunct is uniquely identified
+# by `_idle_excluded_states` substring.
+T9_QUEUE="$SMOKE_TMP_ROOT/bridge-queue.t9.py"
+awk '
+  /and activity_state not in _idle_excluded_states/ { next }
+  { print }
+' "$QUEUE_PY" >"$T9_QUEUE"
+
+# Sanity: the conjunct must actually be gone in the reverted copy.
+if grep -q '_idle_excluded_states' "$T9_QUEUE" | grep -v '^[[:space:]]*#' | grep -v 'set()' >/dev/null 2>&1; then
+  # Tolerate the `_idle_excluded_states = {...}` declaration still being
+  # there — that variable is dead-code in the reverted version but
+  # doesn't affect behavior. The actual exclusion line is gone.
+  :
+fi
+
+# Confirm the predicate no longer references the exclusion in the
+# active code path. We grep for the specific conjunct line.
+if grep -F 'and activity_state not in _idle_excluded_states' "$T9_QUEUE" >/dev/null; then
+  smoke_fail "T9: teeth revert failed — exclusion conjunct still present in reverted bridge-queue.py"
+fi
+
+# Pre-flight: confirm the reverted file still parses as Python.
+if ! python3 -m py_compile "$T9_QUEUE" 2>"$SMOKE_TMP_ROOT/t9-compile.err"; then
+  smoke_fail "T9: teeth-reverted bridge-queue.py failed py_compile: $(cat "$SMOKE_TMP_ROOT/t9-compile.err")"
+fi
+
+T9_OUT="$(
+  BRIDGE_TASK_DB="$T9_DB" \
+  BRIDGE_HOME="$T9_HOME" \
+  BRIDGE_STATE_DIR="$T9_HOME/state" \
+  python3 "$T9_QUEUE" daemon-step \
+    --snapshot "$T9_SNAPSHOT" \
+    --idle-threshold 120 \
+    --max-claim-age 900 \
+    --skip-nudges \
+    --format text 2>&1 || true
+)"
+
+T9_STATUS="$(sqlite3 "$T9_DB" "SELECT status FROM tasks WHERE id=1;" 2>/dev/null || true)"
+T9_EVENT="$(sqlite3 "$T9_DB" "SELECT COUNT(*) FROM task_events WHERE task_id=1 AND event_type='stale_claim_requeued';" 2>/dev/null || echo "0")"
+
+if [[ "$T9_STATUS" != "queued" ]]; then
+  smoke_fail "T9: teeth revert did NOT flip outcome — task status=$T9_STATUS (expected queued). out=$T9_OUT"
+fi
+if [[ "$T9_EVENT" -lt 1 ]]; then
+  smoke_fail "T9: teeth revert did NOT emit stale_claim_requeued event (count=$T9_EVENT). out=$T9_OUT"
+fi
+
+smoke_log "T9 PASS — teeth proves T8 would catch a regression of the picker_blocked exclusion"
+
+# ---------------------------------------------------------------------
+# T10 (PR #1345 r2 backwards compat) — legacy snapshot WITHOUT the
+# activity_state column still works (DictReader returns None → empty
+# string → exclusion set does not match → pre-r2 idle classification
+# preserved for the upgrade window between bash + python halves).
+# ---------------------------------------------------------------------
+smoke_log "T10 (PR #1345 r2 back-compat): legacy snapshot without activity_state column"
+
+T10_HOME="$SMOKE_TMP_ROOT/t10"
+mkdir -p "$T10_HOME/state"
+T10_DB="$T10_HOME/state/tasks.db"
+T10_SNAPSHOT="$T10_HOME/snapshot.tsv"
+
+T10_NOW="$(date +%s)"
+T10_AGED=$((T10_NOW - 2000))
+
+# Pre-r2 snapshot: header has 9 columns (no activity_state). This is
+# what a v0.14.5 daemon writes before the upgrade applies the bash
+# half. After the python half lands but before the bash half, the
+# snapshot rows do not carry activity_state — the .get('activity_state',
+# '') fallback in queue.py MUST treat this as legacy idle (preserves
+# pre-r2 stale-claim requeue behavior).
+{
+  printf 'agent\tengine\tsession\tworkdir\tactive\tsession_activity_ts\tprompt_ready_ts\tprompt_ready_session\tprompt_ready_source\n'
+  printf 'legacy\tclaude\tlegacy\t/tmp\t1\t%s\t\t\t\n' "$T10_AGED"
+} >"$T10_SNAPSHOT"
+
+sqlite3 "$T10_DB" <<SQL >/dev/null
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  assigned_to TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  priority TEXT NOT NULL DEFAULT 'normal',
+  status TEXT NOT NULL DEFAULT 'queued',
+  created_ts INTEGER NOT NULL,
+  updated_ts INTEGER NOT NULL,
+  body_text TEXT,
+  body_path TEXT,
+  claimed_by TEXT,
+  claimed_ts INTEGER,
+  lease_until_ts INTEGER,
+  closed_ts INTEGER
+);
+INSERT INTO tasks (
+  title, assigned_to, created_by, status, created_ts, updated_ts,
+  claimed_by, claimed_ts, lease_until_ts
+) VALUES (
+  'legacy-task', 'legacy', 'operator', 'claimed',
+  ${T10_AGED}, ${T10_AGED},
+  'legacy', ${T10_AGED}, NULL
+);
+SQL
+
+T10_OUT="$(
+  BRIDGE_TASK_DB="$T10_DB" \
+  BRIDGE_HOME="$T10_HOME" \
+  BRIDGE_STATE_DIR="$T10_HOME/state" \
+  python3 "$QUEUE_PY" daemon-step \
+    --snapshot "$T10_SNAPSHOT" \
+    --idle-threshold 120 \
+    --max-claim-age 900 \
+    --skip-nudges \
+    --format text 2>&1 || true
+)"
+
+# Legacy row → activity_state == "" → not in {picker_blocked, working}
+# → idle (pre-r2 behavior) → task gets requeued. This is the no-break
+# proof for non-iso-v2 / pre-upgrade installs.
+T10_STATUS="$(sqlite3 "$T10_DB" "SELECT status FROM tasks WHERE id=1;" 2>/dev/null || true)"
+if [[ "$T10_STATUS" != "queued" ]]; then
+  smoke_fail "T10: legacy snapshot back-compat broken — task status=$T10_STATUS (expected queued, pre-r2 behavior preserved). out=$T10_OUT"
+fi
+
+smoke_log "T10 PASS — legacy snapshot without activity_state preserves pre-r2 idle classification"
+
+smoke_log "ALL PASS — beta5-2 Lane κ smoke (H1 #1319 + M1 #1324 + M2 #1325 + r2 #1345 snapshot+queue)"
 exit 0
