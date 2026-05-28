@@ -3431,16 +3431,28 @@ bridge_agent_setup_pending_active() {
 #
 # Route through the matrix-aware writer when isolation-v2 is active so
 # the file lands with the canonical owner+mode (controller-owned write,
-# iso-side group=ab-agent-<a>, mode 0660), same shape as the manual-stop
-# / idle-since family. Falls back to a plain `touch` on legacy / non-
-# linux-user installs.
+# iso-side group=ab-agent-<a>, mode 0660). When the matrix writer fails
+# under iso-v2-active, do NOT fall through to the plain mkdir/touch
+# path — same shape as the manual-stop / idle-since helpers above (see
+# `bridge_agent_mark_idle_now` lines 3234-3248 and
+# `bridge_agent_mark_manual_stop` lines 3270-3280). The direct write
+# would land mode 0600 owner=controller, not the canonical iso-owned
+# 0660; the daemon would then see a marker that the isolated UID could
+# not delete at setup-completion time, leaving a perpetually stuck
+# grace marker after the operator finished setup. Hard-fail instead and
+# emit an audit row so operators can grep for the matrix drift via
+# `agent-bridge isolation verify --agent <X>` and run
+# `migrate isolation v2 --apply --agent <X>`.
 #
-# Caller swallows rc — this is a hint marker, not a hard contract. If
-# the touch fails (perm-denied, unwritable mount), the daemon's existing
-# backoff path applies, and the operator simply sees the prior 4-burst
-# behavior. That's the same surface they're seeing today (this issue's
-# repro) so a touch failure is a strict no-op regression, not a new
-# bug.
+# Legacy / non-iso-v2 installs continue to use the plain mkdir + `:>file`
+# path (no behavior change for the macOS dev host or pre-v0.8.0 layouts).
+#
+# Callers (setup verbs, `agent create`) continue to swallow rc — the
+# marker is a hint, not a hard contract; absence falls back to the
+# pre-#1353 4-burst surface for the first grace window, which is the
+# same surface the operator sees today. Visibility for matrix drift
+# comes from the new `setup_pending_marker_write_failed` audit row
+# (R2 codex BLOCKING 2), not from caller-side rc propagation.
 bridge_agent_mark_setup_pending() {
   local agent="$1"
   local dir
@@ -3454,12 +3466,27 @@ bridge_agent_mark_setup_pending() {
       && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
       && bridge_isolation_v2_active 2>/dev/null; then
     # The matrix-aware writer wants a body — empty string keeps the
-    # marker semantics (mtime IS the data) without adding a parser. The
-    # writer returns rc=1 when the matrix has not been applied; treat
-    # that as a soft fail (caller swallows) so we don't break `agent
-    # create` for a marker-write hiccup.
-    bridge_isolation_v2_write_agent_state_marker "$agent" "setup-pending" "" \
-      >/dev/null 2>&1 && return 0
+    # marker semantics (mtime IS the data) without adding a parser.
+    # On writer failure (rc != 0) under iso-v2-active, do NOT fall
+    # through to the noncanonical mkdir + `:>file` path: matching the
+    # `bridge_agent_mark_idle_now` / `bridge_agent_mark_manual_stop`
+    # contract (r12 codex Probe 9), a fallback write would land mode
+    # 0600 owner=controller, not canonical 0660 owner=controller
+    # group=ab-agent-<a>, so the iso-side `bridge_agent_clear_setup_
+    # pending` `rm -f` would EACCES and the grace marker would get
+    # stuck. Hard-fail + audit row so the operator can see the matrix
+    # drift via the existing isolation-verify CLI.
+    if ! bridge_isolation_v2_write_agent_state_marker "$agent" "setup-pending" "" \
+        >/dev/null 2>&1; then
+      if command -v bridge_audit_log >/dev/null 2>&1; then
+        bridge_audit_log state setup_pending_marker_write_failed "$agent" \
+          --detail reason=iso_v2_matrix_writer_rc_nonzero \
+          --detail hint="agent-bridge isolation verify --agent $agent" \
+          >/dev/null 2>&1 || true
+      fi
+      return 1
+    fi
+    return 0
   fi
   mkdir -p "$dir" >/dev/null 2>&1 || return 1
   : >"$file" 2>/dev/null || return 1

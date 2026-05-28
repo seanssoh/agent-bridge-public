@@ -543,10 +543,171 @@ step_t5_teeth_revert_grace_disabled() {
   smoke_log "T5 PASS — grace=0 teeth-revert disables silent-skip; existing backoff path applies"
 }
 
+# ---------------------------------------------------------------------------
+# T6 — R2 codex r1 BLOCKING 1 regression: every setup verb's mark call
+#      must be gated on `dry_run -eq 0` AND must appear AFTER the
+#      argument-parsing `while [[ $# -gt 0 ]]` loop (so --dry-run is
+#      actually known at the mark site). Otherwise `setup teams
+#      --dry-run` etc. silently refresh the marker on disk + never
+#      clear it, leaving the daemon silent-skipping for the grace
+#      window even though no setup occurred.
+#
+#      Source-level assertion: structurally pin the order so a future
+#      refactor that hoists the mark back to entry would fail this
+#      smoke at parse time.
+# ---------------------------------------------------------------------------
+step_t6_dry_run_no_mark() {
+  smoke_log "T6 (R2 BLOCKING 1 regression): setup verbs must not mark on --dry-run"
+
+  local verbs=(run_discord run_telegram run_teams run_ms365)
+  local verb
+  for verb in "${verbs[@]}"; do
+    # Extract the verb body and confirm:
+    #   1. There is a `while [[ \$# -gt 0 ]]` argument parse block.
+    #   2. There is a `bridge_agent_mark_setup_pending` invocation
+    #      gated on `\$dry_run -eq 0`.
+    #   3. The gated mark appears AFTER the while loop's terminating
+    #      `done` line.
+    local extracted
+    extracted="$(awk -v fn="$verb" '
+      $0 ~ "^"fn"\\(\\) \\{" { capture=1 }
+      capture { print NR": "$0 }
+      capture && /^}[[:space:]]*$/ { exit }
+    ' "$REPO_ROOT/bridge-setup.sh")"
+
+    if [[ -z "$extracted" ]]; then
+      smoke_fail "T6: could not extract $verb body from bridge-setup.sh"
+    fi
+
+    # Line numbers for the while loop's `done` and the gated mark.
+    local while_done_line
+    while_done_line="$(printf '%s\n' "$extracted" \
+      | awk '/^[0-9]+: +done$/ { print $1; exit }' \
+      | tr -d ':')"
+    if [[ -z "$while_done_line" ]]; then
+      smoke_fail "T6: $verb has no terminating 'done' for the argument-parse while loop"
+    fi
+
+    # Find the line containing `bridge_agent_mark_setup_pending` that is
+    # gated by `dry_run -eq 0`. We allow up to a 4-line lookback for the
+    # `if [[ $dry_run -eq 0 ]] \` guard preceding the mark call.
+    local gated_mark_line
+    gated_mark_line="$(printf '%s\n' "$extracted" \
+      | grep -n 'bridge_agent_mark_setup_pending' \
+      | head -n 1 \
+      | cut -d: -f1)"
+    if [[ -z "$gated_mark_line" ]]; then
+      smoke_fail "T6: $verb has no bridge_agent_mark_setup_pending call (R2 fix dropped the marker entirely?)"
+    fi
+
+    # Map gated_mark_line back to absolute line in the extracted slice
+    # — extracted lines are `NR: source`, so the Nth line of extracted
+    # gives us the source NR via field 1.
+    local mark_source_line
+    mark_source_line="$(printf '%s\n' "$extracted" \
+      | sed -n "${gated_mark_line}p" \
+      | awk -F':' '{print $1}')"
+
+    if [[ -z "$mark_source_line" || -z "$while_done_line" ]]; then
+      smoke_fail "T6: $verb internal: failed to resolve line numbers (mark='$mark_source_line' done='$while_done_line')"
+    fi
+    if (( mark_source_line < while_done_line )); then
+      smoke_fail "T6: $verb has bridge_agent_mark_setup_pending at line $mark_source_line, BEFORE the option-parse 'done' at line $while_done_line — R2 BLOCKING 1 regression (dry-run would refresh marker without clearing)"
+    fi
+
+    # Confirm the gate. Look for `dry_run -eq 0` within 4 lines before
+    # the mark line.
+    local gate_window
+    gate_window="$(printf '%s\n' "$extracted" \
+      | awk -F':' -v m="$mark_source_line" '
+          $1 >= (m - 4) && $1 <= m { for (i=2; i<=NF; i++) printf "%s%s", $i, (i<NF?":":""); print "" }
+        ')"
+    if ! printf '%s\n' "$gate_window" | grep -q 'dry_run -eq 0'; then
+      smoke_fail "T6: $verb mark at line $mark_source_line is not gated on 'dry_run -eq 0' (R2 BLOCKING 1 regression)"
+    fi
+  done
+
+  smoke_log "T6 PASS — all 4 setup verbs gate the mark on dry_run=0 + after option parsing"
+}
+
+# ---------------------------------------------------------------------------
+# T7 — R2 codex r1 BLOCKING 2 regression: when isolation-v2 is active
+#      and the matrix-aware writer fails, bridge_agent_mark_setup_pending
+#      must NOT fall through to the noncanonical mkdir + `:>file` path.
+#      A direct fallback write lands mode 0600 owner=controller, which
+#      the iso-side `bridge_agent_clear_setup_pending` `rm -f` would
+#      EACCES — the grace marker would get stuck after setup completion.
+#      Helper must return non-zero AND leave no marker file on disk.
+#      Matches the bridge_agent_mark_idle_now / mark_manual_stop
+#      contract (r12 codex Probe 9).
+# ---------------------------------------------------------------------------
+step_t7_iso_v2_writer_fail_no_fallback() {
+  smoke_log "T7 (R2 BLOCKING 2 regression): iso-v2 active + writer fail → no fallback marker"
+
+  # T7 needs an isolated active-agent dir — prior test cases (T1)
+  # legitimately leave a marker on disk under the shared
+  # $BRIDGE_ACTIVE_AGENT_DIR, which would defeat the marker=absent
+  # assertion below. Use a per-test scratch root so the only mark
+  # attempt in T7 is the one the helper makes (which must fail without
+  # a fallback write).
+  local t7_active="$SMOKE_TMP_ROOT/t7-active-agent"
+  mkdir -p "$t7_active"
+  local t7_agent="t7_agent"
+
+  local driver="$SMOKE_TMP_ROOT/t7-driver.sh"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'BRIDGE_ACTIVE_AGENT_DIR="$1"\n'
+    printf 'AGENT="$2"\n'
+    # Stub: iso-v2 is ACTIVE.
+    printf 'bridge_isolation_v2_active() { return 0; }\n'
+    # Stub: matrix writer always FAILS (rc=1) — mirrors the matrix-
+    # not-yet-applied condition that the production helper hits during
+    # a rolling upgrade window or a markerless host pre-migrate.
+    printf 'bridge_isolation_v2_write_agent_state_marker() { return 1; }\n'
+    # Stub: audit log captured to a sentinel file so we can verify the
+    # `setup_pending_marker_write_failed` row was emitted.
+    printf 'AUDIT_LOG="%s"\n' "$SMOKE_TMP_ROOT/t7-audit.log"
+    printf ': >"$AUDIT_LOG"\n'
+    printf 'bridge_audit_log() { printf "audit: %%s\\n" "$*" >>"$AUDIT_LOG"; }\n'
+    printf 'source "%s"\n' "$HELPERS_STATE"
+    # Invoke + capture rc. `|| true` swallows so set -e doesn't abort.
+    printf 'if bridge_agent_mark_setup_pending "$AGENT"; then printf "rc=0\\n"; else printf "rc=nonzero\\n"; fi\n'
+    # Echo whether the marker file landed on disk.
+    printf 'marker="$(bridge_agent_setup_pending_file "$AGENT")"\n'
+    printf 'if [[ -e "$marker" ]]; then printf "marker=present\\n"; else printf "marker=absent\\n"; fi\n'
+  } >"$driver"
+
+  local out
+  out="$("$BRIDGE_BASH" "$driver" "$t7_active" "$t7_agent")"
+
+  # Helper must return nonzero. (caller swallows; that's policy. But the
+  # contract itself must signal failure so callers that DO care — e.g.
+  # `agent create` — can propagate.)
+  smoke_assert_contains "$out" "rc=nonzero" \
+    "T7: iso-v2 active + writer fail must return nonzero from bridge_agent_mark_setup_pending"
+  # And critically, no marker on disk — otherwise the iso-side clear at
+  # setup completion EACCESes and the marker silently sticks for the
+  # grace window.
+  smoke_assert_contains "$out" "marker=absent" \
+    "T7: iso-v2 active + writer fail must NOT fall through to mkdir + :>file (would leave 0600 controller-owned stuck marker)"
+
+  # And the audit row was written so operators have a grep target for
+  # matrix-drift diagnosis.
+  if ! grep -q 'setup_pending_marker_write_failed' "$SMOKE_TMP_ROOT/t7-audit.log" 2>/dev/null; then
+    smoke_fail "T7: setup_pending_marker_write_failed audit row was not emitted"
+  fi
+
+  smoke_log "T7 PASS — iso-v2 writer fail returns non-zero + no fallback marker + audit row emitted"
+}
+
 step_t1_marker_written
 step_t2_silent_skip_during_grace
 step_t3_clear_reverts_to_normal_path
 step_t4_marker_absent_normal_backoff
 step_t5_teeth_revert_grace_disabled
+step_t6_dry_run_no_mark
+step_t7_iso_v2_writer_fail_no_fallback
 
 smoke_log "ALL PASS — #1353 setup-pending grace window contract upheld"

@@ -526,11 +526,6 @@ run_discord() {
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") discord <agent> [...]"
   bridge_require_agent "$agent"
   bridge_setup_require_claude_agent "$agent" "Discord"
-  # Issue #1353 (v0.15.0-beta5-2 Track A) — extend setup-pending grace
-  # on entry. Same shape as run_teams / run_ms365 / run_telegram.
-  if command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
-    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
-  fi
   runtime_config="$(bridge_compat_config_file)"
   compat_config="$(bridge_compat_config_file)"
 
@@ -560,6 +555,19 @@ run_discord() {
         ;;
     esac
   done
+
+  # Issue #1353 (v0.15.0-beta5-2 Track A) R2 (codex r1 BLOCKING 1):
+  # Mark setup-pending grace AFTER option parsing AND only when this is
+  # NOT a dry-run. Marking unconditionally before parsing meant
+  # `setup discord --dry-run` created/refreshed the marker on disk and
+  # never cleared it (the clear at end is dry_run=0 gated), leaving
+  # daemon auto-start silently skipping for up to the grace window even
+  # though nothing was actually set up. Same shape as run_teams /
+  # run_ms365 / run_telegram.
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
+    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
+  fi
 
   workdir="$(bridge_agent_workdir "$agent")"
   discord_dir="$(bridge_agent_discord_state_dir "$agent")"
@@ -622,11 +630,6 @@ run_telegram() {
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") telegram <agent> [...]"
   bridge_require_agent "$agent"
   bridge_setup_require_claude_agent "$agent" "Telegram"
-  # Issue #1353 (v0.15.0-beta5-2 Track A) — extend setup-pending grace
-  # on entry. Same shape as run_teams / run_ms365 / run_discord.
-  if command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
-    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
-  fi
   runtime_config="$(bridge_compat_config_file)"
   compat_config="$(bridge_compat_config_file)"
 
@@ -653,6 +656,16 @@ run_telegram() {
         ;;
     esac
   done
+
+  # Issue #1353 (v0.15.0-beta5-2 Track A) R2 (codex r1 BLOCKING 1):
+  # Mark setup-pending grace AFTER option parsing AND only when this is
+  # NOT a dry-run. See run_discord for the rationale (dry-run was
+  # creating a marker the clear path never reached). Same shape as
+  # run_teams / run_ms365 / run_discord.
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
+    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
+  fi
 
   workdir="$(bridge_agent_workdir "$agent")"
   telegram_dir="$(bridge_agent_telegram_state_dir "$agent")"
@@ -704,19 +717,6 @@ run_teams() {
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") teams <agent> [...]"
   bridge_require_agent "$agent"
   bridge_setup_require_claude_agent "$agent" "Teams"
-  # Issue #1353 (v0.15.0-beta5-2 Track A) — extend the setup-pending
-  # grace window on entry to each setup verb. `agent create` writes the
-  # initial marker at create time (15 min default grace), but a
-  # multi-channel install (`setup teams` then `setup ms365`) plus
-  # interactive wizard input can take longer than the default window.
-  # Touching the marker here refreshes its mtime so the daemon stays in
-  # silent-skip mode for another 15 min while the operator works
-  # through the wizard. No-op if the marker is absent (operator started
-  # setup after the grace expired — that's their prerogative; backoff
-  # will fire with audit signal until setup completes).
-  if command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
-    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
-  fi
   runtime_config="$(bridge_compat_config_file)"
   compat_config="$(bridge_compat_config_file)"
 
@@ -751,6 +751,27 @@ run_teams() {
         ;;
     esac
   done
+
+  # Issue #1353 (v0.15.0-beta5-2 Track A) R2 (codex r1 BLOCKING 1):
+  # Extend the setup-pending grace window AFTER option parsing AND only
+  # when this is NOT a dry-run. `agent create` writes the initial marker
+  # at create time (15 min default grace), but a multi-channel install
+  # (`setup teams` then `setup ms365`) plus interactive wizard input can
+  # take longer than the default window. Touching the marker here
+  # refreshes its mtime so the daemon stays in silent-skip mode for
+  # another 15 min while the operator works through the wizard. The
+  # `dry_run -eq 0` gate is the R2 fix: previously the mark fired on
+  # entry before --dry-run was parsed, leaving a stale marker that the
+  # end-of-function clear (also dry_run=0 gated) never reached, so
+  # `setup teams --dry-run` would silently suppress channel-status
+  # backoff bursts for up to the grace window without any actual setup.
+  # No-op if the marker is absent on entry (operator started setup
+  # after the grace expired — that's their prerogative; backoff will
+  # fire with audit signal until setup completes).
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
+    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
+  fi
 
   # v0.15.0-beta4 Lane B (#1268): wizard gate. Two paths:
   #   - auto mode (`--yes` in argv) — fail loud with the enumerated list
@@ -874,14 +895,6 @@ run_ms365() {
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") ms365 <agent> [...]"
   bridge_require_agent "$agent"
   bridge_setup_require_claude_agent "$agent" "MS365"
-  # Issue #1353 (v0.15.0-beta5-2 Track A) — refresh setup-pending grace
-  # window on entry. See run_teams for full rationale; the symmetric
-  # mark/clear bracket keeps the daemon's auto-start dispatcher
-  # silent-skipping through the ms365 wizard even when the prior
-  # `setup teams` already cleared the marker.
-  if command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
-    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
-  fi
 
   local _allow_probe_failure=0
   while [[ $# -gt 0 ]]; do
@@ -910,6 +923,20 @@ run_ms365() {
         ;;
     esac
   done
+
+  # Issue #1353 (v0.15.0-beta5-2 Track A) R2 (codex r1 BLOCKING 1):
+  # Refresh setup-pending grace window AFTER option parsing AND only
+  # when this is NOT a dry-run. See run_teams for full rationale; the
+  # symmetric mark/clear bracket keeps the daemon's auto-start
+  # dispatcher silent-skipping through the ms365 wizard even when the
+  # prior `setup teams` already cleared the marker. The `dry_run -eq 0`
+  # gate prevents `setup ms365 --dry-run` from leaving a stale marker
+  # that the end-of-function clear (also dry_run=0 gated) never
+  # reaches.
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
+    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
+  fi
 
   # v0.15.0-beta4 Lane B (#1271): wizard gate. Same shape as run_teams.
   # Auto mode (--yes in argv) requires every site-specific flag
