@@ -160,6 +160,53 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# T2b — #1355 r2 (codex r1 BLOCKING 1) — `--default-scopes ""` (explicit
+# empty) MUST error rather than silently expand to the convention
+# default. The earlier behavior treated "flag omitted" and "flag
+# supplied with empty value" identically (both became the broad
+# Mail.Read/Mail.Send/Calendars.ReadWrite/offline_access default),
+# which is a permission-bearing silent surface — an operator who
+# explicitly asked for "no scope set" got the broad default. r2 fix
+# distinguishes the two cases via an argparse sentinel and raises a
+# SetupError when the flag is supplied empty.
+# ---------------------------------------------------------------------------
+T2B_ENV_DIR="$SMOKE_DIR/t2b/.ms365"
+mkdir -p "$T2B_ENV_DIR"
+T2B_OUT="$(python3 "$BRIDGE_SETUP_PY" ms365 \
+  --agent testagent \
+  --ms365-dir "$T2B_ENV_DIR" \
+  --redirect-uri https://bot.example.com/auth/callback \
+  --tenant-id T1 --client-id C1 --client-secret S1 \
+  --default-upn user@example.com \
+  --skip-entra-probe \
+  --default-scopes "" \
+  --yes 2>&1)" || T2B_RC=$?
+T2B_RC="${T2B_RC:-0}"
+T2B_ENV="$T2B_ENV_DIR/.env"
+if [[ "$T2B_RC" -eq 0 ]]; then
+  _fail "T2b" "expected non-zero rc on --default-scopes \"\" (explicit empty must error, not silently fall back to convention default); out: $T2B_OUT"
+elif ! printf '%s\n' "$T2B_OUT" | grep -F -- "--default-scopes was supplied with an empty value" >/dev/null; then
+  _fail "T2b" "expected error message naming --default-scopes empty value; out: $T2B_OUT"
+elif [[ -f "$T2B_ENV" ]]; then
+  _fail "T2b" "explicit empty --default-scopes aborted but .env was still written (regression: error must happen BEFORE the write); .env: $(cat "$T2B_ENV")"
+else
+  _pass "T2b (#1355 r2): --default-scopes \"\" (explicit empty) errors + no .env mutation"
+fi
+
+# T2c (teeth, source-level) — codex r1 BLOCKING 1 — the argparse parser
+# MUST use a sentinel (default=None) so the cmd_ms365 branch can
+# distinguish "flag omitted" from "flag supplied empty". A future
+# patch reverting `default=None` → `default=""` would silently re-open
+# the BLOCKING 1 surface — T2c catches the source change directly so
+# the run-time T2b reproducer is not the only line of defense.
+T2C_PARSER_LINE="$(grep -nE '"--default-scopes"' "$BRIDGE_SETUP_PY" || true)"
+if printf '%s\n' "$T2C_PARSER_LINE" | grep -F "default=None" >/dev/null; then
+  _pass "T2c (teeth #1355 r2): --default-scopes argparse uses default=None sentinel"
+else
+  _fail "T2c (teeth)" "--default-scopes argparse must use default=None (sentinel) so cmd_ms365 can distinguish omitted vs explicit empty; got: $T2C_PARSER_LINE"
+fi
+
+# ---------------------------------------------------------------------------
 # T3 — #1355 — wizard required-fields enumerator no longer lists
 # `default-scopes` for ms365 (the promotion is visible at the wizard
 # layer too — auto-mode validation never flags --default-scopes as
@@ -381,23 +428,54 @@ fi
 # ---------------------------------------------------------------------------
 # T6 — #1356 — mock returns 403 Authorization_RequestDenied → wizard
 # annotates `redirect_uri_check: skipped (insufficient app permission)`
-# and DOES NOT abort.
+# and DOES NOT abort. r2 (codex r1 BLOCKING 2): also emits a durable
+# audit row to BRIDGE_AUDIT_LOG so the skip path is machine-readable,
+# not just stdout-visible.
 # ---------------------------------------------------------------------------
 printf '%s\n' '{"redirect_uris": [], "graph_status": 403, "graph_error_code": "Authorization_RequestDenied", "graph_error_message": "Insufficient privileges to complete the operation."}' >"$MOCK_CONFIG"
-T6_OUT="$(run_ms365_setup t6 \
+T6_ENV_DIR="$SMOKE_DIR/t6/.ms365"
+mkdir -p "$T6_ENV_DIR"
+T6_AUDIT_LOG="$SMOKE_DIR/t6/audit.jsonl"
+T6_OUT="$(BRIDGE_AUDIT_LOG="$T6_AUDIT_LOG" python3 "$BRIDGE_SETUP_PY" ms365 \
+  --agent testagent \
+  --ms365-dir "$T6_ENV_DIR" \
   --redirect-uri "$TARGET_URI" \
   --tenant-id T1 --client-id C1 --client-secret S1 \
-  --yes)" || T6_RC=$?
+  --yes 2>&1)" || T6_RC=$?
 T6_RC="${T6_RC:-0}"
-T6_ENV="$SMOKE_DIR/t6/.ms365/.env"
+T6_ENV="$T6_ENV_DIR/.env"
 if [[ "$T6_RC" -ne 0 ]]; then
   _fail "T6" "expected rc=0 (skip should not abort); out: $T6_OUT"
 elif ! printf '%s\n' "$T6_OUT" | grep -F "redirect_uri_check: skipped (insufficient app permission" >/dev/null; then
   _fail "T6" "missing 'skipped (insufficient app permission' marker; out: $T6_OUT"
 elif [[ ! -f "$T6_ENV" ]]; then
   _fail "T6" "expected .env to be written (skip is non-fatal); out: $T6_OUT"
+elif [[ ! -f "$T6_AUDIT_LOG" ]]; then
+  _fail "T6" "r2 BLOCKING 2: expected an audit row at $T6_AUDIT_LOG (the 403 skip path must emit a durable record); audit log not created. mock.log: $(cat "$SMOKE_DIR/mock.log" 2>/dev/null || printf '(empty)')"
+elif ! grep -F '"action": "ms365_redirect_uri_probe_skipped"' "$T6_AUDIT_LOG" >/dev/null; then
+  _fail "T6" "r2 BLOCKING 2: audit log exists but no 'ms365_redirect_uri_probe_skipped' row; audit log: $(cat "$T6_AUDIT_LOG")"
+elif ! grep -F '"reason": "insufficient_permission"' "$T6_AUDIT_LOG" >/dev/null; then
+  _fail "T6" "r2 BLOCKING 2: audit row missing reason=insufficient_permission marker; audit log: $(cat "$T6_AUDIT_LOG")"
+elif ! grep -F '"redirect_uri_sha256_prefix":' "$T6_AUDIT_LOG" >/dev/null; then
+  _fail "T6" "r2 BLOCKING 2: audit row missing redirect_uri hash prefix; audit log: $(cat "$T6_AUDIT_LOG")"
 else
-  _pass "T6 (#1356): mock returning 403 → annotated skip + write proceeds"
+  _pass "T6 (#1356 r2): mock 403 → annotated skip + write proceeds + durable audit row landed"
+fi
+
+# T6b (teeth, source-level) — codex r1 BLOCKING 2 — the audit emit
+# call site MUST be wired into the cmd_ms365 skipped branch. A future
+# patch that drops the `_audit_ms365_redirect_probe_skipped(...)` call
+# (e.g. "simplifying the skip path" without recognizing the audit
+# contract) would re-open BLOCKING 2. T6b catches the source removal
+# without needing the full mock + audit log round-trip.
+T6B_HELPER_DEFINED="$(grep -nE '^def _audit_ms365_redirect_probe_skipped' "$BRIDGE_SETUP_PY" || true)"
+T6B_HELPER_CALLED="$(grep -nE '_audit_ms365_redirect_probe_skipped\(' "$BRIDGE_SETUP_PY" | grep -v "^.*:def " || true)"
+if [[ -z "$T6B_HELPER_DEFINED" ]]; then
+  _fail "T6b (teeth)" "_audit_ms365_redirect_probe_skipped helper is not defined (function renamed/removed?); BLOCKING 2 audit emit gone"
+elif [[ -z "$T6B_HELPER_CALLED" ]]; then
+  _fail "T6b (teeth)" "_audit_ms365_redirect_probe_skipped helper is defined but never called from cmd_ms365 — BLOCKING 2 audit emit not wired"
+else
+  _pass "T6b (teeth #1356 r2): _audit_ms365_redirect_probe_skipped helper defined and wired into cmd_ms365"
 fi
 
 # ---------------------------------------------------------------------------

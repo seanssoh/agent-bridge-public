@@ -330,6 +330,82 @@ def _audit_normalize_skipped(
         return
 
 
+def _audit_ms365_redirect_probe_skipped(
+    redirect_uri: str,
+    reason: str,
+    *,
+    agent: str | None = None,
+    detail_extra: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort audit emission for an MS365 redirect-URI probe skip.
+
+    Routes through `bridge-audit.py write` so the row joins the hash
+    chain alongside `channel_cred_normalize_skipped` rows. Mirrors the
+    silent-failure contract: an audit hiccup must NEVER raise out of
+    this helper because we are on the wizard's hot path and an audit
+    write failure cannot be allowed to flip a successful ms365 setup
+    into an error.
+
+    `reason` is one of the probe's `skipped` reason codes — most
+    importantly `insufficient_permission` (Graph 403), but the
+    helper also accepts `creds_missing`, `unreachable`, `no_access_token`,
+    `app_not_found`, `token_error`, `missing_inputs`, `exception`,
+    `redirect_uri_empty`, and `probe_error`. We hash the redirect_uri
+    rather than logging it verbatim because the operator-supplied URI
+    can carry an oauth code / state parameter when typed wrong; the
+    hash is sufficient to correlate audit rows with the wizard run that
+    emitted them without leaking the URI itself.
+    """
+    try:
+        audit_path_str = os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+        if not audit_path_str:
+            log_dir = os.environ.get("BRIDGE_LOG_DIR", "").strip()
+            if log_dir:
+                audit_path_str = str(Path(log_dir).expanduser() / "audit.jsonl")
+            else:
+                home = os.environ.get("BRIDGE_HOME", "").strip()
+                if home:
+                    audit_path_str = str(Path(home).expanduser() / "logs" / "audit.jsonl")
+        if not audit_path_str:
+            return
+        actor = os.environ.get("BRIDGE_AGENT_ID", "").strip() \
+            or os.environ.get("USER", "").strip() \
+            or "unknown"
+        uri_hash = hashlib.sha256(
+            (redirect_uri or "").encode("utf-8")
+        ).hexdigest()[:16]
+        detail: dict[str, Any] = {
+            "reason": reason,
+            "redirect_uri_sha256_prefix": uri_hash,
+        }
+        if agent:
+            detail["agent"] = agent
+        if detail_extra:
+            for key, value in detail_extra.items():
+                if key in detail:
+                    continue
+                detail[key] = value
+        audit_script = Path(__file__).resolve().parent / "bridge-audit.py"
+        if not audit_script.exists():
+            return
+        target = agent or "ms365"
+        subprocess.run(
+            [
+                sys.executable,
+                str(audit_script),
+                "write",
+                "--file", audit_path_str,
+                "--actor", actor,
+                "--action", "ms365_redirect_uri_probe_skipped",
+                "--target", target,
+                "--detail-json", json.dumps(detail, ensure_ascii=True, sort_keys=True),
+            ],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return
+
+
 def _post_write_normalize_channel_cred_group(path: Path, agent: str | None) -> None:
     """Post-write normalization for channel credential files (#1329, Lane μ M6).
 
@@ -2345,32 +2421,48 @@ def cmd_ms365(args: argparse.Namespace) -> int:
         default_upn = (args.default_upn or inspected["default_upn"]).strip()
 
         # Issue #1355: protocol-convention default for --default-scopes.
-        # Precedence:
+        # Precedence (r2, codex r1 BLOCKING 1):
         #   1. --default-scopes "X Y" → flag (source: flag)
-        #   2. --default-scopes ""    → explicit empty (error — no
-        #      Graph call ever succeeds without at least one scope)
+        #   2. --default-scopes ""    → explicit empty (error — no Graph
+        #      call ever succeeds without at least one scope; silently
+        #      expanding an explicit-empty operator input to the broad
+        #      Mail.Read/Mail.Send/Calendars.ReadWrite/offline_access
+        #      default would silently grant permissions the operator
+        #      tried to refuse)
         #   3. existing .ms365/.env MS365_DEFAULT_SCOPES → preserved
         #      (source: existing:.ms365/.env)
         #   4. otherwise → MS365_CONVENTION_DEFAULT_SCOPES
         #      (source: convention-default)
-        # NOTE: argparse `default=""` means args.default_scopes is `""`
-        # whether the operator did not pass the flag OR passed
-        # `--default-scopes ""`. We treat both as "no override", which
-        # is the documented user expectation — falling back to the
-        # convention default for both cases. Operators who genuinely
-        # want to clobber the scope set need to delete the .env line
-        # by hand (matches the existing client_id / tenant_id contract).
-        flag_default_scopes = (args.default_scopes or "").strip()
+        # The argparse parser uses `default=None` as a sentinel so we
+        # can distinguish "flag omitted" (args.default_scopes is None →
+        # case 3/4) from `--default-scopes ""` (args.default_scopes is
+        # "" → case 2 error).
+        raw_default_scopes = args.default_scopes
         existing_default_scopes = inspected["default_scopes"].strip()
-        if flag_default_scopes:
+        if raw_default_scopes is None:
+            # Flag omitted entirely → fall through to existing-env or
+            # convention default.
+            if existing_default_scopes:
+                default_scopes = existing_default_scopes
+                default_scopes_source = "existing:.ms365/.env"
+            else:
+                default_scopes = MS365_CONVENTION_DEFAULT_SCOPES
+                default_scopes_source = "convention-default"
+        else:
+            # Flag supplied — distinguish explicit-empty (error) from a
+            # whitespace-only value (also error, identical reason).
+            flag_default_scopes = raw_default_scopes.strip()
+            if not flag_default_scopes:
+                raise SetupError(
+                    "--default-scopes was supplied with an empty value; "
+                    "Microsoft Graph rejects token requests with zero "
+                    "scopes. Either supply a space-separated scope list "
+                    "(e.g. --default-scopes \"https://graph.microsoft.com/Mail.Read offline_access\") "
+                    "or omit the flag to use the protocol convention "
+                    "default (Mail.Read / Mail.Send / Calendars.ReadWrite / offline_access)."
+                )
             default_scopes = flag_default_scopes
             default_scopes_source = "flag:--default-scopes"
-        elif existing_default_scopes:
-            default_scopes = existing_default_scopes
-            default_scopes_source = "existing:.ms365/.env"
-        else:
-            default_scopes = MS365_CONVENTION_DEFAULT_SCOPES
-            default_scopes_source = "convention-default"
 
         # PR #1220 codex r1: preserve the local-dev escape hatch
         # `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` across reruns.
@@ -2455,6 +2547,21 @@ def cmd_ms365(args: argparse.Namespace) -> int:
                 }
                 friendly = reason_map.get(reason, reason)
                 result["redirect_uri_check"] = f"skipped ({friendly})"
+                # Issue #1356 r2 (codex r1 BLOCKING 2): emit a durable
+                # audit row for every probe skip. The 403 (Graph
+                # `Authorization_RequestDenied`) path was previously
+                # only visible on the wizard's stdout — an operator
+                # triaging "wizard wrote .env without verifying the
+                # redirect URI" had no machine-readable trail. Wire all
+                # skipped reasons through audit so the chain stays
+                # complete; the BLOCKING surface is `insufficient_permission`
+                # but the same vocabulary is the right place to record
+                # `unreachable` / `creds_missing` / etc.
+                _audit_ms365_redirect_probe_skipped(
+                    redirect_uri,
+                    reason,
+                    agent=getattr(args, "agent", None),
+                )
             elif probe_status == "error":
                 detail = str(probe.get("detail") or "").strip()
                 # Any "error" surface from the probe layer is non-
@@ -2462,6 +2569,17 @@ def cmd_ms365(args: argparse.Namespace) -> int:
                 result["redirect_uri_check"] = "skipped (probe error)"
                 if detail:
                     warnings.append(f"Entra redirect URI probe error: {detail}")
+                # Same r2 audit emit as the skipped branch — the probe
+                # said "error" rather than "skipped", but from the
+                # operator's perspective the wizard still proceeded
+                # without a verified registration, so the audit trail
+                # must show it.
+                _audit_ms365_redirect_probe_skipped(
+                    redirect_uri,
+                    "probe_error",
+                    agent=getattr(args, "agent", None),
+                    detail_extra={"probe_detail": detail[:200]} if detail else None,
+                )
 
         if not tenant_id:
             warnings.append(
@@ -2842,7 +2960,14 @@ def build_parser() -> argparse.ArgumentParser:
     ms365_parser.add_argument("--client-secret", default="")
     ms365_parser.add_argument("--client-secret-file", default="")
     ms365_parser.add_argument("--default-upn", default="")
-    ms365_parser.add_argument("--default-scopes", default="")
+    # Issue #1355 r2 (codex r1 BLOCKING 1): argparse `default=""` cannot
+    # distinguish "flag omitted" from `--default-scopes ""` — both land
+    # as the empty string. Use `default=None` as a sentinel so the
+    # cmd_ms365 branch can tell the two apart and treat an explicit
+    # empty as an error (no Graph call ever succeeds without at least
+    # one scope) instead of silently expanding to the broad convention
+    # default. See cmd_ms365's `flag_default_scopes` branch.
+    ms365_parser.add_argument("--default-scopes", default=None)
     # PR #1220 codex r1: explicit opt-in for local-dev redirect URIs.
     # When set, persists `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` to
     # `.ms365/.env`. Without this flag, the wizard preserves any
