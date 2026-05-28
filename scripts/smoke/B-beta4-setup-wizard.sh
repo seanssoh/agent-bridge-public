@@ -197,8 +197,8 @@ T3A_OUT="$("$BRIDGE_BASH" -c '
 ' 2>&1)"
 smoke_assert_contains "$T3A_OUT" "teams_required=app-id,app-password-file,tenant-id,allow-from,messaging-endpoint,webhook-host,webhook-port" \
   "T3a teams required-fields enumerator"
-smoke_assert_contains "$T3A_OUT" "ms365_required=client-id,client-secret-file,tenant-id,redirect-uri,default-scopes" \
-  "T3a ms365 required-fields enumerator"
+smoke_assert_contains "$T3A_OUT" "ms365_required=client-id,client-secret-file,tenant-id,redirect-uri" \
+  "T3a ms365 required-fields enumerator (issue #1355: default-scopes is now protocol-convention default, not required)"
 
 # T3b — validate_auto with all teams flags present → exit 0.
 T3B_OUT=""
