@@ -5172,46 +5172,14 @@ bridge_daemon_mcp_miss_queue_enqueue() {
     return 0
   fi
 
-  # Use python json.dumps for safe escaping — title/body may contain
-  # any unicode + control char.
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/mcp-miss-queue-enqueue.py — see helper docstring.
+  # Routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
   bridge_require_python 2>/dev/null || return 0
-  python3 - "$agent" "$title" "$body" "$priority" "$task_id" "$now" "$dedup_key" "$file" <<'PY' 2>/dev/null || return 0
-import json, os, sys, tempfile
-agent, title, body, priority, task_id, ts, dedup_key, path = sys.argv[1:9]
-row = {
-    "ts": int(ts),
-    "agent": agent,
-    "title": title,
-    "body": body,
-    "priority": priority,
-    "task_id": task_id,
-    "dedup_key": dedup_key,
-}
-os.makedirs(os.path.dirname(path), exist_ok=True)
-# Hard-cap defense: if file > 500 lines, trim oldest before appending.
-hard_cap = int(os.environ.get("BRIDGE_MCP_MISS_QUEUE_HARD_CAP", "500"))
-existing = []
-if os.path.isfile(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            existing = f.readlines()
-    except OSError:
-        existing = []
-existing.append(json.dumps(row, ensure_ascii=False) + "\n")
-if hard_cap > 0 and len(existing) > hard_cap:
-    existing = existing[-hard_cap:]
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=os.path.basename(path) + ".")
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.writelines(existing)
-    os.replace(tmp, path)
-except Exception:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
-    sys.exit(1)
-PY
+  bridge_daemon_helper_python mcp-miss-queue-enqueue \
+    "$agent" "$title" "$body" "$priority" "$task_id" "$now" "$dedup_key" "$file" \
+    2>/dev/null || return 0
   return 0
 }
 
@@ -5234,6 +5202,11 @@ bridge_daemon_mcp_miss_queue_drain() {
   # TSV row (ts, title, body, priority, task_id, dedup_key); we then
   # iterate in shell + call bridge_notify_send, then rewrite the file
   # with what we did NOT successfully redeliver.
+  #
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/mcp-miss-queue-drain-parse.py — see helper
+  # docstring. Routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
   bridge_require_python 2>/dev/null || return 0
   local drained_tmp kept_tmp
   drained_tmp="$(mktemp)"
@@ -5241,54 +5214,8 @@ bridge_daemon_mcp_miss_queue_drain() {
   # shellcheck disable=SC2064
   trap "rm -f -- '$drained_tmp' '$kept_tmp'" RETURN
 
-  python3 - "$file" "$cap" "$drained_tmp" <<'PY' 2>/dev/null || return 0
-import json, sys
-path, cap_str, drained_path = sys.argv[1:4]
-cap = int(cap_str)
-rows = []
-try:
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                # Skip malformed line; print sentinel so caller audits.
-                sys.stderr.write("malformed_line_skipped\n")
-                continue
-except OSError:
-    sys.exit(0)
-# Sort oldest-first so we redeliver the OLDEST messages first.
-rows.sort(key=lambda r: int(r.get("ts", 0) or 0))
-to_drain = rows[:cap]
-to_keep = rows[cap:]
-# Write the drained list as a TSV with base64 for body to avoid newline
-# issues in the shell loop.
-import base64
-with open(drained_path, "w", encoding="utf-8") as f:
-    for r in to_drain:
-        title = r.get("title", "") or ""
-        body = r.get("body", "") or ""
-        priority = r.get("priority", "normal") or "normal"
-        task_id = r.get("task_id", "") or ""
-        dedup = r.get("dedup_key", "") or ""
-        ts = int(r.get("ts", 0) or 0)
-        title_b64 = base64.b64encode(title.encode("utf-8")).decode("ascii")
-        body_b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
-        # Use `-` sentinel for empty task_id so bash `read -r` cannot
-        # collapse adjacent IFS=$'\t' separators (default behavior for
-        # the rd_read primitive). Shell converts back to "" below.
-        task_id_field = task_id if task_id else "-"
-        f.write(f"{ts}\t{title_b64}\t{body_b64}\t{priority}\t{task_id_field}\t{dedup}\n")
-# Truncate the file to the kept tail so a parallel enqueue doesn't
-# race on a partially-drained file. The caller will re-append any
-# entries that fail re-delivery.
-with open(path, "w", encoding="utf-8") as f:
-    for r in to_keep:
-        f.write(json.dumps(r, ensure_ascii=False) + "\n")
-PY
+  bridge_daemon_helper_python mcp-miss-queue-drain-parse \
+    "$file" "$cap" "$drained_tmp" 2>/dev/null || return 0
 
   local delivered=0 failed=0
   while IFS=$'\t' read -r _ts title_b64 body_b64 priority task_id dedup_key; do
@@ -5344,39 +5271,18 @@ bridge_daemon_should_enqueue_mcp_miss() {
   bridge_agent_mcp_giveup_active "$agent"
 }
 
-# Wrapper around bridge_notify_send that enqueues a miss-log entry when
-# the underlying send fails AND the agent is in MCP giveup. Returns the
-# notify send's rc so caller-side `|| true` patterns still apply.
-#
-# Drop-in shape: same positional args as bridge_notify_send. Existing
-# call sites that opt-in just rename the function; the suppress/quiet
-# behavior on rc != 0 is unchanged.
-#
-# Edge case (brief #3): MCP recovery flood — the dedup_key in the
-# enqueue helper prevents duplicate-add when the same notify fires
-# multiple times before recovery clears the giveup ledger. The hard
-# cap (BRIDGE_MCP_MISS_QUEUE_HARD_CAP, default 500) protects against
-# a runaway producer.
-bridge_notify_send_with_miss_queue() {
-  local agent="$1"
-  local title="${2:-}"
-  local body="${3:-}"
-  local task_id="${4:-}"
-  local priority="${5:-normal}"
-  local dry_run="${6:-0}"
-  local rc=0
-  bridge_notify_send "$agent" "$title" "$body" "$task_id" "$priority" "$dry_run" >/dev/null 2>&1 || rc=$?
-  if (( rc != 0 )) && bridge_daemon_should_enqueue_mcp_miss "$agent"; then
-    bridge_daemon_mcp_miss_queue_enqueue "$agent" "$title" "$body" "$priority" "$task_id" || true
-    bridge_audit_log daemon plugin_mcp_miss_queue_enqueued "$agent" \
-      --detail title="$title" \
-      --detail priority="$priority" \
-      --detail task_id="${task_id:-none}" \
-      --detail send_rc="$rc" \
-      2>/dev/null || true
-  fi
-  return "$rc"
-}
+# Issue #1321 (beta5-2 Lane ι, codex r1 BLOCKING 1 fix — R2): the
+# original R1 ship added a `bridge_notify_send_with_miss_queue` wrapper
+# but never wired it into any of the 8 production sites in this file
+# (admin usage warnings, stall detector, permission-timeout, crash-loop,
+# channel-health-mismatch). Recovery drain therefore had nothing to
+# replay. R2 collapses the wrapper into `bridge_notify_send` itself in
+# lib/bridge-notify.sh: when the underlying send returns non-zero AND
+# the daemon helpers are sourced (declare -F gate) AND the agent is in
+# MCP giveup, the notify primitive enqueues via
+# bridge_daemon_mcp_miss_queue_enqueue. All 8 existing call sites now
+# automatically benefit without a per-site rename. The wrapper is
+# intentionally removed; do NOT reintroduce it.
 
 # Issue #1318 (beta5-2 Lane ι) — 7051-B unclaimed-queue escalation.
 #
@@ -5460,39 +5366,27 @@ process_unclaimed_queue_escalation() {
 
     # Use python to filter the JSON list into TSV rows; bash-side JSON
     # parsing is fragile.
+    #
+    # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+    # lib/daemon-helpers/unclaimed-task-filter.py — see helper docstring.
+    # Routed through bridge_daemon_helper_python for per-call
+    # BRIDGE_SCRIPT_DIR guard. Inputs flow via env (JSON payload, age
+    # threshold, now-ts) so we keep argv shape small.
     bridge_require_python 2>/dev/null || continue
     local expired_tmp
     expired_tmp="$(mktemp)"
     # shellcheck disable=SC2064
     trap "rm -f -- '$expired_tmp'" RETURN
 
-    BRIDGE_QUE_AGE_THRESHOLD="$age_threshold" \
-    BRIDGE_QUE_NOW_TS="$now_ts" \
-    BRIDGE_QUE_INPUT_JSON="$rows" \
-    python3 - <<'PY' >"$expired_tmp" 2>/dev/null || { rm -f -- "$expired_tmp"; trap - RETURN; continue; }
-import json, os, sys
-threshold = int(os.environ.get("BRIDGE_QUE_AGE_THRESHOLD", "1800"))
-now_ts = int(os.environ.get("BRIDGE_QUE_NOW_TS", "0"))
-raw = os.environ.get("BRIDGE_QUE_INPUT_JSON", "[]")
-try:
-    rows = json.loads(raw)
-except Exception:
-    rows = []
-for r in rows:
-    if not isinstance(r, dict):
-        continue
-    if (r.get("status") or "") != "queued":
-        continue
-    created_ts = int(r.get("created_ts", 0) or 0)
-    age = now_ts - created_ts
-    if age < threshold:
-        continue
-    task_id = r.get("id")
-    title = (r.get("title") or "").replace("\t", " ").replace("\n", " ")
-    created_by = (r.get("created_by") or "").replace("\t", " ")
-    priority = (r.get("priority") or "normal").replace("\t", " ")
-    print(f"{task_id}\t{age}\t{title}\t{created_by}\t{priority}")
-PY
+    if ! BRIDGE_QUE_AGE_THRESHOLD="$age_threshold" \
+         BRIDGE_QUE_NOW_TS="$now_ts" \
+         BRIDGE_QUE_INPUT_JSON="$rows" \
+         bridge_daemon_helper_python unclaimed-task-filter \
+           >"$expired_tmp" 2>/dev/null; then
+      rm -f -- "$expired_tmp"
+      trap - RETURN
+      continue
+    fi
 
     local task_id age_seconds title created_by priority marker age_minutes body_file
     while IFS=$'\t' read -r task_id age_seconds title created_by priority; do

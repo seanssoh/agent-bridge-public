@@ -123,6 +123,22 @@ daemon_source_state_file() {
 # the full preflight chain.
 bridge_require_python() { command -v python3 >/dev/null 2>&1; }
 
+# Stub bridge_resolve_script_dir_check + bridge_daemon_helper_python so
+# the lib/daemon-helpers/*.py file-as-argv extractions land at the
+# correct path. The real implementations live in lib/bridge-core.sh and
+# bridge-daemon.sh respectively; here we just point at the repo root
+# so the extracted helpers (mcp-miss-queue-enqueue.py,
+# mcp-miss-queue-drain-parse.py, unclaimed-task-filter.py) are
+# discoverable in-smoke.
+export BRIDGE_SCRIPT_DIR="$REPO_ROOT"
+bridge_resolve_script_dir_check() { return 0; }
+bridge_daemon_helper_python() {
+  local helper="${1:-}"
+  [[ -n "$helper" ]] || return 1
+  shift || true
+  python3 "$BRIDGE_SCRIPT_DIR/lib/daemon-helpers/$helper.py" "$@"
+}
+
 # bridge_notify_send — we need to test both success + failure paths.
 # Default is "fail" so T3 can exercise the enqueue branch; tests that
 # need success will override this stub locally.
@@ -182,7 +198,6 @@ WANTED_HELPERS=(
   bridge_daemon_mcp_miss_queue_enqueue
   bridge_daemon_mcp_miss_queue_drain
   bridge_daemon_should_enqueue_mcp_miss
-  bridge_notify_send_with_miss_queue
   bridge_daemon_unclaimed_escalation_state_dir
   bridge_daemon_unclaimed_escalation_marker_file
   process_unclaimed_queue_escalation
@@ -387,6 +402,97 @@ smoke_run "T3c H3 should_enqueue gated by giveup_active" : ; {
   fi
 }
 
+# --- T3d: H3 PRODUCTION PATH — bridge_notify_send wires miss-queue --
+# R2 fix (codex r1 BLOCKING 1): the R1 ship added a wrapper
+# bridge_notify_send_with_miss_queue() that was never wired in any of
+# the 8 production sites. R2 collapsed the H3 enqueue into
+# bridge_notify_send itself (lib/bridge-notify.sh) behind a `declare -F`
+# gate so every existing call site picks it up automatically. This test
+# drives that production path: it sources the real bridge_notify_send,
+# stubs the inner notify_python primitive to fail, and asserts the
+# miss-queue enqueue + audit row fire WITHOUT calling the enqueue
+# helper directly.
+smoke_run "T3d H3 PRODUCTION bridge_notify_send wires miss-queue on rc!=0+giveup" : ; {
+  # Stash the smoke's existing bridge_notify_send stub — we want the
+  # REAL one from lib/bridge-notify.sh for this test only.
+  _SMOKE_SAVED_NOTIFY="$(declare -f bridge_notify_send)"
+  unset -f bridge_notify_send
+
+  # Minimum stubs the real bridge_notify_send needs to flow through to
+  # its rc check. The body content / payload doesn't matter — only the
+  # rc + giveup_active + agent name matter for the H3 branch.
+  bridge_agent_notify_kind()    { printf 'teams'; }
+  bridge_agent_notify_target()  { printf 'channel-stub'; }
+  bridge_agent_notify_account() { printf ''; }
+  bridge_compat_config_file()   { printf '%s/runtime.json' "$SMOKE_TMP_ROOT"; }
+  bridge_die()                  { printf 'bridge_die: %s\n' "$*" >&2; return 1; }
+
+  # Source lib/bridge-notify.sh so the REAL bridge_notify_send is
+  # defined in-scope alongside the daemon helpers we already sourced
+  # via the HELPERS_SUBSET extraction.
+  # shellcheck source=/dev/null
+  source "$REPO_ROOT/lib/bridge-notify.sh"
+  # bridge_notify_python is the inner primitive bridge_notify_send
+  # calls. Force it to fail so we exercise the H3 enqueue branch.
+  # NB: this override MUST land AFTER the source — sourcing
+  # lib/bridge-notify.sh redefines bridge_notify_python and would
+  # clobber a pre-source stub.
+  bridge_notify_python() { return 99; }
+
+  _SMOKE_GIVEUP_ACTIVE[agent-h3d-prod]=1
+  miss_file="$(bridge_daemon_mcp_miss_queue_file agent-h3d-prod)"
+  rm -f "$miss_file"
+  : >"$AUDIT_LOG"
+
+  # Production call shape (matches bridge-daemon.sh:1796 / :3242 etc).
+  # Note: this `{ ... }` block executes at script-top-level (not inside
+  # a function) so we use a plain assignment rather than `local`.
+  _rc=0
+  bridge_notify_send "agent-h3d-prod" "Prod title" "Prod body" "" urgent "0" \
+    >/dev/null 2>&1 || _rc=$?
+
+  smoke_assert_eq 99 "$_rc" "T3d bridge_notify_send returns inner rc"
+  smoke_assert_file_exists "$miss_file" "T3d miss-queue file created via production path"
+
+  lines=$(wc -l <"$miss_file" | tr -d ' ')
+  smoke_assert_eq 1 "$lines" "T3d exactly one enqueue from a single failed send"
+
+  # Audit row must record the enqueue with send_rc=99.
+  enq_count=$(audit_count plugin_mcp_miss_queue_enqueued "agent-h3d-prod")
+  smoke_assert_eq 1 "$enq_count" "T3d plugin_mcp_miss_queue_enqueued audit row fired"
+  send_rc=$(audit_latest_detail plugin_mcp_miss_queue_enqueued "agent-h3d-prod" send_rc)
+  smoke_assert_eq 99 "$send_rc" "T3d audit row carries send_rc=99 from notify_python"
+
+  # Negative — healthy path: rc=0 → NO enqueue, NO audit row.
+  bridge_notify_python() { return 0; }
+  rm -f "$miss_file"
+  : >"$AUDIT_LOG"
+  bridge_notify_send "agent-h3d-prod" "Healthy" "body" "" normal "0" >/dev/null 2>&1
+  if [[ -f "$miss_file" ]]; then
+    smoke_fail "T3d healthy path must NOT enqueue miss-queue"
+  fi
+  noop=$(audit_count plugin_mcp_miss_queue_enqueued "agent-h3d-prod")
+  smoke_assert_eq 0 "$noop" "T3d healthy path emits no enqueue audit row"
+
+  # Negative — failure but NOT in giveup: rc!=0 + giveup_active=0
+  # → NO enqueue.
+  bridge_notify_python() { return 99; }
+  _SMOKE_GIVEUP_ACTIVE[agent-h3d-prod-no-giveup]=0
+  miss_file2="$(bridge_daemon_mcp_miss_queue_file agent-h3d-prod-no-giveup)"
+  rm -f "$miss_file2"
+  : >"$AUDIT_LOG"
+  bridge_notify_send "agent-h3d-prod-no-giveup" "Title" "body" "" normal "0" >/dev/null 2>&1 || true
+  if [[ -f "$miss_file2" ]]; then
+    smoke_fail "T3d non-giveup failure must NOT enqueue miss-queue"
+  fi
+
+  # Restore the smoke's earlier stub so downstream tests are unaffected.
+  unset -f bridge_notify_send bridge_notify_python
+  unset -f bridge_agent_notify_kind bridge_agent_notify_target bridge_agent_notify_account
+  unset -f bridge_compat_config_file bridge_die
+  eval "$_SMOKE_SAVED_NOTIFY"
+}
+
 # --- T4: H4 per-(agent, task_id) dedup -------------------------------
 smoke_run "T4 H4 per-task dedup window" : ; {
   rm -f "$(bridge_daemon_nudge_state_file agent-h4)"
@@ -520,6 +626,25 @@ smoke_run "T_teeth structural shape of new helpers" : ; {
     || smoke_fail "teeth: plugin_mcp_recovery_redelivered audit emit must be in bridge-daemon.sh"
   grep -q 'BRIDGE_MCP_RECOVERY_REDELIVER_CAP' "$REPO_ROOT/bridge-daemon.sh" \
     || smoke_fail "teeth: BRIDGE_MCP_RECOVERY_REDELIVER_CAP env knob must be in bridge-daemon.sh"
+
+  # H3 R2 (codex r1 BLOCKING 1) — bridge_notify_send must internally
+  # wire the miss-queue enqueue. Pre-R2 the wrapper
+  # bridge_notify_send_with_miss_queue existed but was never wired into
+  # the 8 production sites. R2 collapses the logic into the notify
+  # primitive itself. Pin both halves so a future PR cannot regress to
+  # the unwired wrapper shape.
+  grep -q 'plugin_mcp_miss_queue_enqueued' "$REPO_ROOT/lib/bridge-notify.sh" \
+    || smoke_fail "teeth: lib/bridge-notify.sh must enqueue plugin_mcp_miss_queue_enqueued (R2 production wiring)"
+  grep -q 'bridge_daemon_should_enqueue_mcp_miss' "$REPO_ROOT/lib/bridge-notify.sh" \
+    || smoke_fail "teeth: lib/bridge-notify.sh must call bridge_daemon_should_enqueue_mcp_miss (R2 declare -F gate)"
+  if grep -q '^bridge_notify_send_with_miss_queue()' "$REPO_ROOT/bridge-daemon.sh"; then
+    smoke_fail "teeth: bridge_notify_send_with_miss_queue wrapper must NOT exist (R2 collapsed into bridge_notify_send)"
+  fi
+  # H3 R2 — heredoc-stdin sites must be extracted to lib/daemon-helpers/.
+  for _helper in mcp-miss-queue-enqueue.py mcp-miss-queue-drain-parse.py unclaimed-task-filter.py; do
+    [[ -f "$REPO_ROOT/lib/daemon-helpers/$_helper" ]] \
+      || smoke_fail "teeth: lib/daemon-helpers/$_helper must exist (R2 heredoc-stdin extraction)"
+  done
 
   # H4 — per-task ts var helper + skip-nudge takes 3rd arg.
   command -v bridge_daemon_nudge_task_ts_var >/dev/null \
