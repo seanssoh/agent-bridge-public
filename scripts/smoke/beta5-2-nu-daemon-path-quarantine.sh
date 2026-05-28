@@ -381,8 +381,273 @@ t5_teeth() {
   # #1317-B helper file presence
   [[ -x "$HINT_HELPER" ]] \
     || smoke_fail "T5 teeth: broken-launch-reason-hint.py helper missing — #1317-B reverted"
+  # #1317 Lane ν R2: roster snapshot quarantine surfacing token —
+  # codex r1 BLOCKING fix in bridge_write_roster_status_snapshot. The
+  # column-11 (activity_state) surface in the snapshot feeds
+  # bridge-status.sh (agb status) + bridge-daemon.sh cron readiness;
+  # without this branch, a quarantined no-tmux agent renders as
+  # `stopped` instead of `quarantine-broken-launch`.
+  if ! awk '
+    /^bridge_write_roster_status_snapshot\(\) \{/ { in_fn = 1 }
+    in_fn && /broken-launch/ { found = 1; exit 0 }
+    in_fn && /^\}/ { in_fn = 0 }
+    END { exit (found ? 0 : 1) }
+  ' "$STATE_LIB"; then
+    smoke_fail "T5 teeth: bridge_write_roster_status_snapshot missing broken-launch marker probe — Lane ν R2 reverted"
+  fi
 }
 smoke_run "T5 teeth (all fixes pinned by source token)" t5_teeth
+
+# ---------------------------------------------------------------------
+# T6 — bridge_write_roster_status_snapshot wires quarantine state
+# (Lane ν R2 codex r1 BLOCKING fix). The snapshot feeds
+# bridge-status.sh::status_command (agb status) AND
+# bridge-daemon.sh's cron readiness path. Pre-R2, line ~4213 set
+# activity_state="stopped" for every inactive agent and never
+# consulted the broken-launch marker — so a quarantined no-tmux agent
+# was invisible at agb status + on the cron readiness path even
+# though bridge-agent.sh::bridge_agent_activity_state already
+# surfaced it correctly in list/show.
+#
+# T6 extracts bridge_write_roster_status_snapshot via awk, stubs all
+# helper functions (bridge_agent_session/engine/workdir/source/loop/
+# channels/active/etc.) to canned values, materializes a fake
+# broken-launch marker under $BRIDGE_STATE_DIR/agents/<a>/, drives the
+# function, and asserts column 11 (activity_state) of the resulting
+# TSV.
+#
+#   T6a (inactive + marker): activity_state == quarantine-broken-launch
+#       (NOT stopped). Pre-R2 baseline = stopped, so this test catches
+#       the codex r1 BLOCKING regression directly.
+#   T6b (active + marker): even when the active branch would
+#       otherwise set idle/working/starting, quarantine wins. Encodes
+#       Sean's edge-case-1 directive (operator failed to clear the
+#       marker after recovering tmux; engine health is still suspect).
+#   T6c (multi-agent: one quarantined + one normal): both rendered
+#       correctly in same snapshot (no cross-talk on the per-agent
+#       quarantined flag). Encodes Sean's edge-case-3.
+#   T6d (teeth via stub-driver): with the marker NOT present, the
+#       same code path returns "stopped" for an inactive agent —
+#       confirms the test would fail if Edit 1 were reverted to the
+#       old `activity_state="stopped"` baseline.
+# ---------------------------------------------------------------------
+# shellcheck disable=SC2329  # invoked via smoke_run
+t6_driver() {
+  local _tmp="$SMOKE_TMP_ROOT/t6"
+  local _state_dir="$_tmp/state"
+  local _driver="$_tmp/driver.sh"
+  local _bash_bin
+  _bash_bin="$(command -v bash)"
+
+  mkdir -p "$_state_dir/agents/smokeq" "$_state_dir/agents/smokenormal" "$_tmp/work"
+
+  # Materialize a synthetic broken-launch marker for smokeq. The
+  # body content does not matter — the snapshot writer only checks
+  # for file presence.
+  printf '%s\n' '{"agent":"smokeq","engine":"codex","exit_code":127}' \
+    >"$_state_dir/agents/smokeq/broken-launch"
+
+  # Extract the production function via awk and emit a driver that
+  # defines all helper stubs first, then sources the extracted
+  # function, then invokes it on a controlled BRIDGE_AGENT_IDS list.
+  awk '
+    /^bridge_write_roster_status_snapshot\(\) \{/,/^\}/ { print }
+  ' "$STATE_LIB" >"$_driver"
+  if ! grep -q '^bridge_write_roster_status_snapshot() {' "$_driver"; then
+    smoke_fail "T6: bridge_write_roster_status_snapshot extract missing (Lane ν R2 + base file out-of-sync?)"
+  fi
+
+  # Sub-test 6a: inactive + marker → quarantine-broken-launch
+  local _out_tsv="$_tmp/snapshot.tsv"
+  local _stub_driver="$_tmp/run-6a.sh"
+  cat >"$_stub_driver" <<DRIVER_EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+BRIDGE_STATE_DIR="$_state_dir"
+export BRIDGE_STATE_DIR
+
+# Helper stubs — all canned. The snapshot only reads these for
+# inactive agents to populate the row; the active branch is gated
+# behind bridge_agent_is_active.
+bridge_agent_session()                     { printf '%s' ""; }
+bridge_agent_engine()                      { printf '%s' "codex"; }
+bridge_agent_workdir()                     { printf '%s' "$_tmp/work"; }
+bridge_agent_source()                      { printf '%s' "static"; }
+bridge_agent_loop()                        { printf '%s' "ondemand"; }
+bridge_agent_channels_csv()                { printf '%s' ""; }
+bridge_agent_channel_status()              { printf '%s' "ok"; }
+bridge_agent_channel_status_reason()       { printf '%s' ""; }
+bridge_agent_channel_runtime_drift_reason(){ printf '%s' ""; }
+bridge_agent_is_active()                   { return 1; }     # not active
+bridge_agent_requires_wake_channel()       { return 1; }
+bridge_tmux_engine_requires_prompt()       { return 0; }
+bridge_capture_recent()                    { printf '%s' ""; }
+bridge_tmux_claude_blocker_state_from_text(){ printf '%s' "none"; }
+bridge_tmux_session_has_prompt_from_text() { return 1; }
+bridge_agent_engine_process_alive()        { return 1; }
+
+# shellcheck disable=SC2034  # BRIDGE_AGENT_IDS is read by the
+# extracted function under nameref.
+BRIDGE_AGENT_IDS=("smokeq")
+
+source "$_driver"
+bridge_write_roster_status_snapshot "$_out_tsv"
+DRIVER_EOF
+  chmod 0755 "$_stub_driver"
+  "$_bash_bin" "$_stub_driver"
+
+  # The roster snapshot has a header row + one row per agent.
+  # Column 11 (1-indexed) is activity_state.
+  local _row _state
+  _row="$(awk 'NR==2' "$_out_tsv")"
+  _state="$(printf '%s\n' "$_row" | cut -f11)"
+  smoke_assert_eq "quarantine-broken-launch" "$_state" \
+    "T6a: inactive+marker → activity_state column 11 must be quarantine-broken-launch (was 'stopped' pre-R2)"
+
+  # The active column (col 7) must still be 0 — the marker does not
+  # flip the active bit.
+  local _active
+  _active="$(printf '%s\n' "$_row" | cut -f7)"
+  smoke_assert_eq "0" "$_active" \
+    "T6a: active column must remain 0 (quarantine does not synthesize a session)"
+
+  # Sub-test 6b: active branch + marker → quarantine wins.
+  local _out_tsv_b="$_tmp/snapshot-active.tsv"
+  local _stub_driver_b="$_tmp/run-6b.sh"
+  cat >"$_stub_driver_b" <<DRIVER_EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+BRIDGE_STATE_DIR="$_state_dir"
+export BRIDGE_STATE_DIR
+
+bridge_agent_session()                     { printf '%s' "fake-session-smokeq"; }
+bridge_agent_engine()                      { printf '%s' "codex"; }
+bridge_agent_workdir()                     { printf '%s' "$_tmp/work"; }
+bridge_agent_source()                      { printf '%s' "static"; }
+bridge_agent_loop()                        { printf '%s' "ondemand"; }
+bridge_agent_channels_csv()                { printf '%s' ""; }
+bridge_agent_channel_status()              { printf '%s' "ok"; }
+bridge_agent_channel_status_reason()       { printf '%s' ""; }
+bridge_agent_channel_runtime_drift_reason(){ printf '%s' ""; }
+bridge_agent_is_active()                   { return 0; }     # active!
+bridge_agent_requires_wake_channel()       { return 0; }
+bridge_tmux_engine_requires_prompt()       { return 0; }
+bridge_capture_recent()                    { printf '%s' ""; }
+bridge_tmux_claude_blocker_state_from_text(){ printf '%s' "none"; }
+# This stub claims the prompt is ready — pre-R2 this would have set
+# activity_state="idle". With R2, quarantine wins.
+bridge_tmux_session_has_prompt_from_text() { return 0; }
+bridge_agent_engine_process_alive()        { return 0; }
+
+BRIDGE_AGENT_IDS=("smokeq")
+
+source "$_driver"
+bridge_write_roster_status_snapshot "$_out_tsv_b"
+DRIVER_EOF
+  chmod 0755 "$_stub_driver_b"
+  "$_bash_bin" "$_stub_driver_b"
+
+  _row="$(awk 'NR==2' "$_out_tsv_b")"
+  _state="$(printf '%s\n' "$_row" | cut -f11)"
+  smoke_assert_eq "quarantine-broken-launch" "$_state" \
+    "T6b: active+marker → quarantine wins over idle (edge case 1)"
+  # active=1 is preserved — quarantine doesn't lie about tmux.
+  _active="$(printf '%s\n' "$_row" | cut -f7)"
+  smoke_assert_eq "1" "$_active" \
+    "T6b: active column remains 1 when tmux session exists (quarantine state only overrides activity_state)"
+
+  # Sub-test 6c: multi-agent (one quarantined + one normal). Same
+  # driver but two BRIDGE_AGENT_IDS — assert each row independently.
+  local _out_tsv_c="$_tmp/snapshot-multi.tsv"
+  local _stub_driver_c="$_tmp/run-6c.sh"
+  cat >"$_stub_driver_c" <<DRIVER_EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+BRIDGE_STATE_DIR="$_state_dir"
+export BRIDGE_STATE_DIR
+
+bridge_agent_session()                     { printf '%s' ""; }
+bridge_agent_engine()                      { printf '%s' "codex"; }
+bridge_agent_workdir()                     { printf '%s' "$_tmp/work"; }
+bridge_agent_source()                      { printf '%s' "static"; }
+bridge_agent_loop()                        { printf '%s' "ondemand"; }
+bridge_agent_channels_csv()                { printf '%s' ""; }
+bridge_agent_channel_status()              { printf '%s' "ok"; }
+bridge_agent_channel_status_reason()       { printf '%s' ""; }
+bridge_agent_channel_runtime_drift_reason(){ printf '%s' ""; }
+bridge_agent_is_active()                   { return 1; }
+bridge_agent_requires_wake_channel()       { return 1; }
+bridge_tmux_engine_requires_prompt()       { return 0; }
+bridge_capture_recent()                    { printf '%s' ""; }
+bridge_tmux_claude_blocker_state_from_text(){ printf '%s' "none"; }
+bridge_tmux_session_has_prompt_from_text() { return 1; }
+bridge_agent_engine_process_alive()        { return 1; }
+
+BRIDGE_AGENT_IDS=("smokeq" "smokenormal")
+
+source "$_driver"
+bridge_write_roster_status_snapshot "$_out_tsv_c"
+DRIVER_EOF
+  chmod 0755 "$_stub_driver_c"
+  "$_bash_bin" "$_stub_driver_c"
+
+  # Row 2 (smokeq) — quarantined; Row 3 (smokenormal) — stopped.
+  local _row_q _row_n _state_q _state_n
+  _row_q="$(awk 'NR==2' "$_out_tsv_c")"
+  _row_n="$(awk 'NR==3' "$_out_tsv_c")"
+  _state_q="$(printf '%s\n' "$_row_q" | cut -f11)"
+  _state_n="$(printf '%s\n' "$_row_n" | cut -f11)"
+  smoke_assert_eq "quarantine-broken-launch" "$_state_q" \
+    "T6c: smokeq (has marker) → quarantine-broken-launch"
+  smoke_assert_eq "stopped" "$_state_n" \
+    "T6c: smokenormal (no marker) → stopped (no cross-talk)"
+
+  # Sub-test 6d (teeth): same driver as 6a but with marker absent.
+  # With Edit 1 still in place, activity_state must read "stopped".
+  rm -f "$_state_dir/agents/smokeq/broken-launch"
+  local _out_tsv_d="$_tmp/snapshot-no-marker.tsv"
+  local _stub_driver_d="$_tmp/run-6d.sh"
+  cat >"$_stub_driver_d" <<DRIVER_EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+BRIDGE_STATE_DIR="$_state_dir"
+export BRIDGE_STATE_DIR
+
+bridge_agent_session()                     { printf '%s' ""; }
+bridge_agent_engine()                      { printf '%s' "codex"; }
+bridge_agent_workdir()                     { printf '%s' "$_tmp/work"; }
+bridge_agent_source()                      { printf '%s' "static"; }
+bridge_agent_loop()                        { printf '%s' "ondemand"; }
+bridge_agent_channels_csv()                { printf '%s' ""; }
+bridge_agent_channel_status()              { printf '%s' "ok"; }
+bridge_agent_channel_status_reason()       { printf '%s' ""; }
+bridge_agent_channel_runtime_drift_reason(){ printf '%s' ""; }
+bridge_agent_is_active()                   { return 1; }
+bridge_agent_requires_wake_channel()       { return 1; }
+bridge_tmux_engine_requires_prompt()       { return 0; }
+bridge_capture_recent()                    { printf '%s' ""; }
+bridge_tmux_claude_blocker_state_from_text(){ printf '%s' "none"; }
+bridge_tmux_session_has_prompt_from_text() { return 1; }
+bridge_agent_engine_process_alive()        { return 1; }
+
+BRIDGE_AGENT_IDS=("smokeq")
+
+source "$_driver"
+bridge_write_roster_status_snapshot "$_out_tsv_d"
+DRIVER_EOF
+  chmod 0755 "$_stub_driver_d"
+  "$_bash_bin" "$_stub_driver_d"
+
+  _row="$(awk 'NR==2' "$_out_tsv_d")"
+  _state="$(printf '%s\n' "$_row" | cut -f11)"
+  smoke_assert_eq "stopped" "$_state" \
+    "T6d: no marker → stopped (canary that Edit 1 short-circuit didn't break the unmarked path)"
+}
+smoke_run "T6 bridge_write_roster_status_snapshot quarantine (Lane ν R2)" t6_driver
 
 smoke_log "PASS"
 exit 0
