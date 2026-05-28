@@ -4323,6 +4323,43 @@ bridge_daemon_check_channel_status_or_hold() {
   local _channel_status _channel_reason
   _channel_status="$(bridge_agent_channel_status "$agent" 2>/dev/null || printf '%s' "-")"
   if [[ "$_channel_status" == "miss" ]]; then
+    # Issue #1353 (v0.15.0-beta5-2 Track A) — setup-pending grace window.
+    # After `agent create --isolate --channels ...` writes the
+    # setup-pending marker, channel-required validator-miss is the
+    # EXPECTED state — the operator has declared the channels but has
+    # not yet run `setup teams|ms365|...` to populate the access files.
+    # Without this gate, the daemon's first 4 auto-start ticks emit
+    # `auto-start backoff <agent>` rows (failures=1..4) + 2
+    # `channel-health miss` audit rows in the ~80s between create and
+    # the operator's first setup command. The grace window suppresses
+    # those rows for up to BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS
+    # (default 900 = 15 min), letting the operator's normal `agent
+    # create → setup teams → setup ms365` flow proceed without log
+    # noise. After grace expires (operator never ran setup), the
+    # existing backoff path takes over with audit + failures counter
+    # intact — operator still gets the actionable signal, just not on
+    # the first second after create.
+    #
+    # Logging contract: hold is silent (`daemon_debug`, not
+    # `daemon_info`). No audit row, no backoff state file write, no
+    # failures counter increment. Hold is the marker doing its job;
+    # noise only resumes when the grace window legitimately expires.
+    #
+    # Tactical-only scope (per issue #1353 "Tactical vs Root" split):
+    # the root fix is `awaiting_channel_setup` agent state + setup hook
+    # to toggle `ready`. This gate is the tactical surface; the root
+    # work is tracked in a follow-up.
+    if bridge_agent_setup_pending_active "$agent" 2>/dev/null; then
+      # Optional debug trace — silent by default. Operators
+      # investigating "why didn't my agent auto-start?" set
+      # `BRIDGE_DAEMON_DEBUG_SETUP_PENDING=1` to see the per-tick hold
+      # line. Default-off because the grace window's whole point is
+      # log-silence during the post-create window.
+      if [[ "${BRIDGE_DAEMON_DEBUG_SETUP_PENDING:-0}" == "1" ]]; then
+        daemon_info "auto-start hold ${agent} (setup-pending grace, reason=channel-required-validator-miss)"
+      fi
+      return 0
+    fi
     _channel_reason="$(bridge_agent_channel_status_reason "$agent" 2>/dev/null || printf '')"
     [[ -n "$_channel_reason" ]] || _channel_reason="setup incomplete"
     # First-class reason string the operator can act on. Persists via
@@ -6022,6 +6059,28 @@ bridge_report_channel_health_miss() {
     return 0
   fi
 
+  # Issue #1353 (v0.15.0-beta5-2 Track A) — setup-pending grace window.
+  # Same gate as bridge_daemon_check_channel_status_or_hold: during the
+  # post-`agent create` grace window, channel-required validator-miss is
+  # the expected state. The audit row + dashboard flag below is the
+  # SAME noise surface the auto-start backoff loop produces — both fire
+  # against the same channel-status=miss source-of-truth. Without this
+  # gate the daemon would emit
+  #   [info] channel-health miss for <agent> recorded as audit +
+  #   dashboard flag (reason=missing Teams access file ...)
+  # in the same ~80s window the operator is still running `setup teams`.
+  # Skip the audit + dashboard + notify path during the grace window;
+  # the existing path takes over after the grace window expires (when a
+  # genuine config drift is the more likely diagnosis).
+  #
+  # Do NOT write or clear the channel-health state file here — the
+  # grace path is a hold, not a transition. When grace expires and the
+  # miss is still present, the state file is freshly written by the
+  # normal path on the next tick.
+  if bridge_agent_setup_pending_active "$agent" 2>/dev/null; then
+    return 0
+  fi
+
   reason="$(bridge_agent_channel_status_reason "$agent")"
   [[ -n "$reason" ]] || reason="unknown channel health mismatch"
   key="$(bridge_sha1 "${agent}|${reason}|$(bridge_agent_channels_csv "$agent")")"
@@ -7636,6 +7695,30 @@ bridge_daemon_cron_dispatch_wake() {
     return 1
   fi
 
+  # Issue #1353 (v0.15.0-beta5-2 Track A) — setup-pending grace window
+  # for the cron-dispatch path too. The shared check helper below
+  # short-circuits validator misses to return 0 ("hold") regardless of
+  # whether the hold is "silent grace" or "real configuration drift",
+  # because the always-on / on-demand callers simply `continue` and
+  # don't emit. The cron-dispatch path is different: it emits both a
+  # `bridge_warn` + `cron_dispatch_wake_refused` audit row when the
+  # helper holds. Without this pre-check, a freshly-created always-on
+  # static agent with a cron job dispatched within the grace window
+  # would still see the audit + warn line burst — defeating the
+  # silent-skip contract this PR is supposed to install. Skip the cron-
+  # dispatch wake silently (no audit, no log, no throttle-state touch)
+  # during the grace window; the task stays queued for the next tick
+  # so the cron job fires the moment setup completes.
+  #
+  # codex r1 BLOCKING #1353 (catch on this exact surface) — added the
+  # explicit grace probe here so the silent-skip contract applies to
+  # all three start paths (always-on, on-demand, cron-dispatch).
+  if bridge_agent_setup_pending_active "$agent" 2>/dev/null; then
+    if [[ "${BRIDGE_DAEMON_DEBUG_SETUP_PENDING:-0}" == "1" ]]; then
+      daemon_info "cron-dispatch wake hold ${agent} (setup-pending grace, task=#${task_id})"
+    fi
+    return 1
+  fi
   # Issue #1234 (Lane δ, v0.15.0-beta2) — codex r2 BLOCKING parity:
   # mirror process_on_demand_agents' channel-required validator-miss
   # auto-hold. Without this gate, a stopped static agent with required
