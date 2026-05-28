@@ -3347,6 +3347,159 @@ bridge_agent_clear_manual_stop() {
   fi
 }
 
+# Issue #1353 (v0.15.0-beta5-2 Track A) — setup-pending grace marker.
+#
+# `agent create --isolate --channels plugin:teams,plugin:ms365` registers
+# an always-on static role whose channel metadata is declared but whose
+# per-channel access files (.teams/access.json, .ms365/.env) won't exist
+# until the operator runs `setup teams <agent>` / `setup ms365 <agent>`.
+# Without this marker, the daemon's first auto-start tick after `agent
+# create` invokes `bridge_daemon_check_channel_status_or_hold` which sees
+# `channel-required-validator-miss` and writes a backoff state file +
+# audit row. The next 3 ticks repeat. The operator's terminal shows 4
+# bursts of `auto-start backoff <agent>` noise BEFORE they've had a
+# chance to run a single setup command.
+#
+# The grace marker is a stat-driven (mtime) file at
+# `state/agents/<agent>/setup-pending`. `agent create` writes it for any
+# channel-required agent; the daemon's auto-start dispatcher silent-skips
+# channel-validator-miss as long as the marker exists and its age is
+# within `BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS` (default 900 = 15
+# min). Each `setup <channel> <agent>` verb touches the marker on entry
+# (extending the grace) and removes it on completion (so a fully-set-up
+# agent never carries the marker).
+#
+# Marker semantics are intentionally minimal — empty file, no body
+# parsing. mtime IS the data. This mirrors the manual-stop / idle-since
+# state family above and keeps the daemon's hot path branch cheap (one
+# stat + one arithmetic compare).
+bridge_agent_setup_pending_file() {
+  local agent="$1"
+  printf '%s/setup-pending' "$(bridge_agent_idle_marker_dir "$agent")"
+}
+
+# Returns 0 (true) iff the marker exists AND its age is within the grace
+# window. Caller treats "true" as "silent skip this tick".
+#
+# Honors the `BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS` env override —
+# 0 disables the grace window entirely (the teeth-revert smoke gate; T5
+# in scripts/smoke/1353-setup-pending-grace.sh).
+#
+# Returns 1 (false) for: marker absent, marker mtime unreadable, grace
+# disabled (BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS=0), or marker age
+# exceeds the configured grace. Each of these is the normal auto-start
+# path — caller proceeds with the channel-status check.
+bridge_agent_setup_pending_active() {
+  local agent="$1"
+  local file
+  local grace="${BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS:-900}"
+  local now_ts mtime age
+
+  [[ -n "$agent" ]] || return 1
+  [[ "$grace" =~ ^[0-9]+$ ]] || grace=900
+  (( grace > 0 )) || return 1
+
+  file="$(bridge_agent_setup_pending_file "$agent")"
+  [[ -e "$file" ]] || return 1
+
+  # `stat -c %Y` (GNU) vs `stat -f %m` (BSD/macOS) — try both. The bash
+  # daemon main loop runs on both Linux and macOS (operator's dev host),
+  # so the helper must portable-stat regardless of which userland is on
+  # PATH. Either succeeds; both failing is treated as "marker
+  # unreadable" → return false so the existing backoff path applies (we
+  # never want a stat error to silently lock out the operator).
+  mtime="$(stat -c '%Y' "$file" 2>/dev/null \
+        || stat -f '%m' "$file" 2>/dev/null \
+        || printf '')"
+  [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+
+  now_ts="$(date +%s 2>/dev/null || printf '0')"
+  [[ "$now_ts" =~ ^[0-9]+$ ]] || return 1
+  (( now_ts >= mtime )) || return 1
+
+  age=$(( now_ts - mtime ))
+  (( age <= grace )) || return 1
+  return 0
+}
+
+# Touch the marker so its mtime is current. Idempotent — creates an
+# empty file on first call, refreshes mtime on subsequent calls. Called
+# from `agent create` (when the new agent declares required channels
+# whose access files do not yet exist) and from each `setup <channel>
+# <agent>` verb at entry (so a multi-channel setup sequence does not
+# expire the grace mid-flow).
+#
+# Route through the matrix-aware writer when isolation-v2 is active so
+# the file lands with the canonical owner+mode (controller-owned write,
+# iso-side group=ab-agent-<a>, mode 0660), same shape as the manual-stop
+# / idle-since family. Falls back to a plain `touch` on legacy / non-
+# linux-user installs.
+#
+# Caller swallows rc — this is a hint marker, not a hard contract. If
+# the touch fails (perm-denied, unwritable mount), the daemon's existing
+# backoff path applies, and the operator simply sees the prior 4-burst
+# behavior. That's the same surface they're seeing today (this issue's
+# repro) so a touch failure is a strict no-op regression, not a new
+# bug.
+bridge_agent_mark_setup_pending() {
+  local agent="$1"
+  local dir
+  local file
+
+  [[ -n "$agent" ]] || return 1
+  dir="$(bridge_agent_idle_marker_dir "$agent")"
+  file="$(bridge_agent_setup_pending_file "$agent")"
+
+  if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
+      && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+      && bridge_isolation_v2_active 2>/dev/null; then
+    # The matrix-aware writer wants a body — empty string keeps the
+    # marker semantics (mtime IS the data) without adding a parser. The
+    # writer returns rc=1 when the matrix has not been applied; treat
+    # that as a soft fail (caller swallows) so we don't break `agent
+    # create` for a marker-write hiccup.
+    bridge_isolation_v2_write_agent_state_marker "$agent" "setup-pending" "" \
+      >/dev/null 2>&1 && return 0
+  fi
+  mkdir -p "$dir" >/dev/null 2>&1 || return 1
+  : >"$file" 2>/dev/null || return 1
+  return 0
+}
+
+# Best-effort remove of the marker. Called at the END of each `setup
+# <channel> <agent>` verb. Idempotent — no-op if the marker is already
+# gone (multi-channel setup: the second `setup` rm finds nothing).
+#
+# Mirrors `bridge_agent_clear_manual_stop`'s iso-v2 sudo fallback so the
+# controller's plain `rm -f` failure (mode 2770 dir, controller in group
+# but file owned by iso UID with mode 0660 — controller can group-write,
+# but only if the group bit on the dir lets the entry vanish) hands off
+# to `bridge_linux_sudo_root` on linux-user-isolation hosts. Failure
+# beyond that is a `bridge_warn` because a stuck marker would cause the
+# daemon to keep silent-skipping after grace passes (within the 15-min
+# window only; after that the grace expires and the existing backoff
+# resumes — so the worst-case surface is one extra grace window of
+# silent skip, not an indefinite stuck state).
+bridge_agent_clear_setup_pending() {
+  local agent="$1"
+  local file
+
+  [[ -n "$agent" ]] || return 0
+  file="$(bridge_agent_setup_pending_file "$agent")"
+  [[ -e "$file" ]] || return 0
+
+  if rm -f "$file" 2>/dev/null; then
+    return 0
+  fi
+  if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    if bridge_linux_sudo_root rm -f "$file" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  bridge_warn "bridge_agent_clear_setup_pending: failed to remove $file (agent=$agent); grace window will self-clear in ${BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS:-900}s"
+  return 1
+}
+
 bridge_reconcile_idle_markers() {
   local agent
   local file
