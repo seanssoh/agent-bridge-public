@@ -6,6 +6,52 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.0-beta5-2] — 2026-05-28
+
+### Highlight — beta5-1 patch-verify wave (6 lanes ι/κ/λ/μ/ν/ξ, 28 issues) + CI housekeeping
+
+Patch's beta5-1 OOTB verify surfaced 26+2 follow-up defects spanning daemon escalation, state audit, A2A, cron+channel creds, daemon PATH+quarantine, and Teams/agent-id propagation. Sean directive: "전부다 수정해서 새로 베타 5-2 릴리즈" (fix all, not subset). Wave-orchestration parallel dispatch (6 lanes), 18+ codex review rounds (r1→r3 chains, 5-round-cap respected). 6 lanes implement-ok, merged in dep-graph order (ν → κ rebases inside ν's quarantined==0 gate, then ι/λ/μ/ξ).
+
+Bundled: PR #1350 CI housekeeping (baseline ratchet absorption + 4 smoke design-bug fixes — 9 amend rounds). Long-standing pre-existing debt in heredoc/iso-helper/raw-pathlib baselines + 1115/1121/1140/1207/1209/H-bootstrap smokes that the unit/static gate had not actually run since the beta cycle began (oss-preflight/heredoc gates had been SKIPping smoke for the entire stabilization period). Per [[feedback-fresh-install-acceptance-gate]] the real acceptance gate is patch's fresh-install VM verify; smoke gate is informational during beta cycles.
+
+Lane → PR map: ι #1344 / κ #1345 / λ #1346 / μ #1347 / ν #1348 / ξ #1349 / housekeeping #1350.
+
+### Fixed — Lane ι daemon escalation family (#1320 + #1321 + #1322 + #1323 + #1318-B, PR #1344)
+
+bridge_notify_send H3 embed (option A — H3 logic moved INSIDE bridge_notify_send so all 8 production call sites benefit without per-site renames). Wrapper bridge_notify_send_with_miss_queue removed. 3 heredoc-stdin sites extracted file-as-argv to `lib/daemon-helpers/mcp-miss-queue-enqueue.py`, `mcp-miss-queue-drain-parse.py`, `unclaimed-task-filter.py`. Smoke T3d drives production path (real bridge_notify_send + stubbed bridge_notify_python). bridge-daemon.sh heredoc ceiling 0/0 restored.
+
+### Fixed — Lane κ activity_state picker_blocked exclusion (#1319 + #1324 + #1325, PR #1345)
+
+`bridge_write_agent_snapshot` now emits `activity_state` column (picker_blocked computed via stall.env grep). `bridge-queue.py` `daemon-step` excludes `{picker_blocked, working}` from `idle_agents` set + stale-claim requeue skips non-idle/non-inactive — previously picker_blocked agents were wrongly classified as idle and had their claimed tasks requeued. Backwards-compat preserved via `.get("activity_state", "")` default on legacy 9-column snapshots. T8 functional / T9 teeth / T10 back-compat. After Lane ν merged, κ rebased so picker_blocked branch lives inside ν's `quarantined == 0` gate (quarantine wins over picker_blocked).
+
+### Fixed — Lane λ A2A HMAC-first auth order (#1326 + #1331, PR #1346) — SECURITY
+
+`bridge-handoffd.py` drift-band timestamp classification returned 503 BEFORE HMAC signature verification → forged signature with drift-band timestamp would return 503 transient → sender retries with bad sig (auth fail-open). Reordered `do_POST`: `a2a.verify_signature()` runs immediately after body-hash check, BEFORE timestamp band classification. Bad sig (any timestamp) → 401. Valid sig + drift band → 503 + Retry-After. Valid sig + beyond grace → 401 (replay defense intact). Empty `X-AGB-Signature` → 401. `hmac.compare_digest` preserved (constant-time). T1b/T1c/T1d/T1e + teeth (17/17 smoke, 11/11 a2a regression).
+
+### Fixed — Lane μ cron skip manual-stop + state preserve + channel cred iso readable (#1327 + #1328 + #1329, PR #1347) — SECURITY
+
+`bridge-setup.py:_post_write_normalize_channel_cred_group` — 3 strict gates: (1) `_iso_v2_effective_host()` non-iso skip; (2) `grp.getgrnam(group)` check before mutation, KeyError → audit-skip; (3) chgrp returncode gated → chmod 0640 ONLY after chgrp landed `ab-agent-<a>` successfully. Closes a security gap where chmod 0640 ran unconditionally after `chgrp` failure, widening secrets to controller primary group on non-iso-v2 hosts (direct repro: cred 0600 → AFTER 0640 group=staff). T6b/T6c/T_teeth.r2.
+
+### Fixed — Lane ν daemon PATH + quarantine UX + engine preflight + skills setpriv (#1317 + #1333, PR #1348)
+
+`bridge_write_roster_status_snapshot` now sets `activity_state=quarantine-broken-launch` when `state/agents/<a>/broken-launch` marker present (was only wired into bridge-agent.sh list/show before — agb status + cron readiness couldn't see quarantined no-tmux agents). Quarantine short-circuit at TOP of activity_state computation; active-branch override (idle/working/starting) gated behind `quarantined == 0`. Lane κ's picker_blocked block lands inside this gate after rebase. T6a/T6b/T6c/T6d.
+
+### Fixed — Lane ξ BRIDGE_AGENT_ID propagation + CLAUDE.md atomic + FORCE_FRESH order + task create on stopped agent (#1330 + #1332 + #1334 + #1318-A, PR #1349)
+
+`bridge-start.sh:864-893` inlines `BRIDGE_AGENT_ID` into `SESSION_CMD` so Teams MCP at `plugins/teams/server.ts:2782-2802` sees it populated (was unset → PreCompact lookup fail). `bridge-run.sh:136-142` exports BRIDGE_AGENT_ID before roster load. FORCE_FRESH order aligned at `bridge-start.sh:609-652`. CLAUDE.md atomic materialization at `lib/bridge-agent-layout.sh:255-288` via `bridge_isolation_v2_chgrp_file_iso_group`. `bridge-task.sh:383-454` stopped-target guard + self-target exemption + --force flag + audit. 3 daemon target_bridge sites at `bridge-daemon.sh:1530-1537, 2452-2458, 4537-4543` use --force.
+
+### CI housekeeping (PR #1350)
+
+Mechanical baseline absorption + smoke design-bug fixes:
+- `.lint-heredoc-baseline.tsv` — +25 sites / -7 stale entries (beta3-5 wave smoke shims, no footgun #11 sites)
+- `scripts/baselines/iso-helper-baseline.txt` — 122 boundary callsites absorbed (#857 follow-up tracks migration)
+- `scripts/baselines/raw-pathlib-baseline.txt` — +18 sites
+- `scripts/smoke/C-beta4-logger-and-spec.sh` — `smoke@example.invalid` → `smoke@example.com` (preflight allowlist)
+- `scripts/smoke/1121-agent-delete-os-purge.sh` + `1140-purge-home-os-cleanup.sh` — sudo shim (CI passwordless-sudo was bypassing rm shim, masking warn assertion)
+- `agent-bridge` + `1115-cli-usage-drift.sh` — `iso-run` added to `_top_valid` array + TEMPLATE_ONLY_HIDDEN_TOPLEVEL pin
+- `1207-stale-supp-groups-allowlist.sh` + `1209-ms365-redirect-resolver.sh` — iso-v2 env envelope (BRIDGE_LAYOUT=v2 + BRIDGE_DATA_ROOT)
+- `H-bootstrap-memory-iso-rebuild.sh` — `chmod o+x SMOKE_TMP_ROOT` for iso UID traversal + fail-loud fixture-touch
+
 ## [0.15.0-beta5-1] — 2026-05-28
 
 ### Highlight — beta5 patch-verify hotfix (3 lanes, 3 issues)
