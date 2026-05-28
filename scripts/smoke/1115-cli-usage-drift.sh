@@ -83,9 +83,15 @@ smoke_assert_file_exists "$CRON_DISPATCHER" "bridge-cron.sh dispatcher present"
 # Currently empty: the shorthand `create` (routes to bridge-task.sh) is
 # documented at usage.txt:71 ("__CLI_NAME__ create --to …") because
 # OPERATIONS.md and bin/agb explicitly steer operators to `agb create`.
+# `iso-run`: hidden CLI facade for the bridge_iso_run shell helper, used
+#   by Python callers (bridge_iso_paths.iso_run) that need to invoke the
+#   unified controller->iso boundary helper from a non-shell process.
+#   Documented inline at agent-bridge:921-947 + the lib header. Operators
+#   never type it; keep it dispatchable + typo-discoverable but hide from
+#   the operator-facing usage template.
 # Future template-hidden additions land here with a comment explaining
 # why operators shouldn't see them in `--help`.
-TEMPLATE_ONLY_HIDDEN_TOPLEVEL=()
+TEMPLATE_ONLY_HIDDEN_TOPLEVEL=("iso-run")
 
 INTERNAL_AGENT_SUBCOMMANDS=()
 # `finalize-run`: bridge-daemon.sh runtime callback that finalizes a

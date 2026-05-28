@@ -241,13 +241,31 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# T11/T12 invoke bridge-setup.sh as a subprocess, which sources
+# bridge-lib.sh. The layout-resolver in bridge-lib.sh refuses to run on a
+# `markerless(fresh-install-candidate)` BRIDGE_HOME (CI fresh checkout),
+# so the subprocess needs the iso-v2 env envelope before --help can render.
+# Mirrors what `smoke_setup_bridge_home` in scripts/smoke/lib.sh exports.
+_T11_BRIDGE_HOME="$SMOKE_DIR/.agent-bridge"
+_T11_DATA_ROOT="$SMOKE_DIR/data"
+mkdir -p "$_T11_BRIDGE_HOME/state" "$_T11_DATA_ROOT"
+_T11_ENV=(
+  env
+  "BRIDGE_HOME=$_T11_BRIDGE_HOME"
+  "BRIDGE_LAYOUT=v2"
+  "BRIDGE_DATA_ROOT=$_T11_DATA_ROOT"
+  "BRIDGE_STATE_DIR=$_T11_BRIDGE_HOME/state"
+  "BRIDGE_LAYOUT_MARKER_DIR=$_T11_BRIDGE_HOME/state"
+)
+
+# ---------------------------------------------------------------------------
 # T11 — bridge-setup.sh ms365 --help renders without error.
 # ---------------------------------------------------------------------------
 T11_BASH="/opt/homebrew/bin/bash"
 if [[ ! -x "$T11_BASH" ]]; then
   T11_BASH="$(command -v bash)"
 fi
-T11_OUT="$("$T11_BASH" "$BRIDGE_SETUP_SH" ms365 --help 2>&1 || true)"
+T11_OUT="$("${_T11_ENV[@]}" "$T11_BASH" "$BRIDGE_SETUP_SH" ms365 --help 2>&1 || true)"
 if printf '%s\n' "$T11_OUT" | grep -E "ms365 <agent>.*--redirect-uri" >/dev/null; then
   _pass "T11: bridge-setup.sh ms365 --help renders the ms365 subcommand usage"
 else
@@ -257,7 +275,7 @@ fi
 # ---------------------------------------------------------------------------
 # T12 — bridge-setup.sh main usage lists ms365 as a known subcommand.
 # ---------------------------------------------------------------------------
-T12_OUT="$("$T11_BASH" "$BRIDGE_SETUP_SH" --help 2>&1 || true)"
+T12_OUT="$("${_T11_ENV[@]}" "$T11_BASH" "$BRIDGE_SETUP_SH" --help 2>&1 || true)"
 if printf '%s\n' "$T12_OUT" | grep -E "ms365 <agent>" >/dev/null; then
   _pass "T12: bridge-setup.sh main usage includes ms365"
 else

@@ -42,8 +42,18 @@ TMPDIR_BASE="${TMPDIR:-/tmp}"
 SMOKE_DIR="$(mktemp -d "$TMPDIR_BASE/agb-1207-smoke.XXXXXX")"
 trap 'rm -rf "$SMOKE_DIR" 2>/dev/null' EXIT INT TERM
 
+# Provide an iso-v2 env envelope so bridge-lib.sh's layout-resolver
+# accepts the BRIDGE_HOME (otherwise on a CI fresh checkout it sees
+# `markerless(fresh-install-candidate)` and bridge_dies). Mirrors what
+# `smoke_setup_bridge_home` in scripts/smoke/lib.sh exports — we don't
+# source lib.sh here because this smoke does its own isolated setup,
+# but the resolver contract is the same.
 export BRIDGE_HOME="$SMOKE_DIR/.agent-bridge"
-mkdir -p "$BRIDGE_HOME"
+export BRIDGE_LAYOUT="v2"
+export BRIDGE_DATA_ROOT="$SMOKE_DIR/data"
+export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
+export BRIDGE_LAYOUT_MARKER_DIR="$BRIDGE_STATE_DIR"
+mkdir -p "$BRIDGE_HOME" "$BRIDGE_STATE_DIR" "$BRIDGE_DATA_ROOT"
 
 # Use a synthetic agent name; stubs below intercept the roster lookups
 # so we never need a real provisioned agent.
