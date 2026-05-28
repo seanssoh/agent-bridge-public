@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""unclaimed-task-filter.py — filter a `find-open --all --format json`
+result down to TSV rows for queued tasks whose age exceeds the
+threshold.
+
+Invocation contract:
+    sys.argv (none — all input via env)
+
+Environment:
+    BRIDGE_QUE_AGE_THRESHOLD — age threshold in seconds (default 1800).
+    BRIDGE_QUE_NOW_TS        — current epoch seconds (default 0).
+    BRIDGE_QUE_INPUT_JSON    — raw JSON list output of
+                               `bridge_queue_cli find-open --all --format json`.
+
+Output (stdout): TSV with one row per qualifying task, columns:
+    task_id<TAB>age_seconds<TAB>title<TAB>created_by<TAB>priority
+
+Notes:
+  - Title and created_by have any embedded tab/newline collapsed to a
+    single space so the bash side can `read -r` with IFS=$'\\t' without
+    field corruption.
+  - Malformed JSON produces an empty list (and exit 0). The caller
+    treats an empty output as "no expired tasks this tick".
+
+Exit 0 on success. The caller's heredoc-stdin failure-handling already
+wrapped the python invocation in `|| { ... ; continue; }`, so any
+non-zero exit is tolerated.
+
+Footgun #11 (refs queue task #4807): this body used to live as a
+`python3 - <<'PY' >"$expired_tmp"` heredoc-stdin inside
+process_unclaimed_queue_escalation. Same migration precedent as
+mcp-miss-queue-enqueue.py.
+"""
+
+import json
+import os
+import sys
+
+
+def main() -> int:
+    try:
+        threshold = int(os.environ.get("BRIDGE_QUE_AGE_THRESHOLD", "1800"))
+    except ValueError:
+        threshold = 1800
+    try:
+        now_ts = int(os.environ.get("BRIDGE_QUE_NOW_TS", "0"))
+    except ValueError:
+        now_ts = 0
+    raw = os.environ.get("BRIDGE_QUE_INPUT_JSON", "[]")
+    try:
+        rows = json.loads(raw)
+    except Exception:
+        rows = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if (r.get("status") or "") != "queued":
+            continue
+        try:
+            created_ts = int(r.get("created_ts", 0) or 0)
+        except (TypeError, ValueError):
+            created_ts = 0
+        age = now_ts - created_ts
+        if age < threshold:
+            continue
+        task_id = r.get("id")
+        title = (r.get("title") or "").replace("\t", " ").replace("\n", " ")
+        created_by = (r.get("created_by") or "").replace("\t", " ")
+        priority = (r.get("priority") or "normal").replace("\t", " ")
+        sys.stdout.write(f"{task_id}\t{age}\t{title}\t{created_by}\t{priority}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
