@@ -431,6 +431,77 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# T9 (codex-rescue catch) — #1356 — verbatim match is verbatim. The
+# Microsoft identity platform matches the sent redirect_uri against
+# the Entra `web.redirectUris` array character-for-character (including
+# query string and fragment). An earlier implementation stripped query
+# + fragment in the normalization helper "to avoid spurious mismatches",
+# which would let `https://x/cb?code=abc` pass the probe while
+# AADSTS50011 fires at runtime. Pin both directions:
+#   T9a — operator-typed URI carries a query string, Entra registered
+#         the bare URI → probe MUST say not_registered + fail-loud abort.
+#   T9b — operator-typed URI carries a fragment, Entra registered the
+#         bare URI → probe MUST say not_registered + fail-loud abort.
+# ---------------------------------------------------------------------------
+printf '%s\n' "{\"redirect_uris\": [\"$TARGET_URI\"], \"graph_status\": 200}" >"$MOCK_CONFIG"
+T9A_OUT="$(run_ms365_setup t9a \
+  --redirect-uri "${TARGET_URI}?code=abc" \
+  --tenant-id T1 --client-id C1 --client-secret S1 \
+  --yes)" || T9A_RC=$?
+T9A_RC="${T9A_RC:-0}"
+if [[ "$T9A_RC" -eq 0 ]]; then
+  _fail "T9a" "verbatim match regression: query-string suffix bypassed probe (Entra would fire AADSTS50011 at runtime). out: $T9A_OUT"
+elif ! printf '%s\n' "$T9A_OUT" | grep -F "등록돼 있지 않습니다" >/dev/null; then
+  _fail "T9a" "expected fail-loud on query-string mismatch; out: $T9A_OUT"
+else
+  _pass "T9a (#1356 codex-rescue catch): query-string suffix triggers not_registered (verbatim match holds)"
+fi
+
+T9B_OUT="$(run_ms365_setup t9b \
+  --redirect-uri "${TARGET_URI}#fragment" \
+  --tenant-id T1 --client-id C1 --client-secret S1 \
+  --yes)" || T9B_RC=$?
+T9B_RC="${T9B_RC:-0}"
+if [[ "$T9B_RC" -eq 0 ]]; then
+  _fail "T9b" "verbatim match regression: fragment suffix bypassed probe. out: $T9B_OUT"
+elif ! printf '%s\n' "$T9B_OUT" | grep -F "등록돼 있지 않습니다" >/dev/null; then
+  _fail "T9b" "expected fail-loud on fragment mismatch; out: $T9B_OUT"
+else
+  _pass "T9b (#1356 codex-rescue catch): fragment suffix triggers not_registered"
+fi
+
+# T9c — flip the other direction: Entra registered URI carries a query,
+# operator typed the bare URI → still not_registered (verbatim both ways).
+printf '%s\n' "{\"redirect_uris\": [\"${TARGET_URI}?login=1\"], \"graph_status\": 200}" >"$MOCK_CONFIG"
+T9C_OUT="$(run_ms365_setup t9c \
+  --redirect-uri "$TARGET_URI" \
+  --tenant-id T1 --client-id C1 --client-secret S1 \
+  --yes)" || T9C_RC=$?
+T9C_RC="${T9C_RC:-0}"
+if [[ "$T9C_RC" -eq 0 ]]; then
+  _fail "T9c" "verbatim match regression: Entra had a query-suffixed URI, operator typed bare, probe falsely accepted. out: $T9C_OUT"
+elif ! printf '%s\n' "$T9C_OUT" | grep -F "등록돼 있지 않습니다" >/dev/null; then
+  _fail "T9c" "expected fail-loud on inverse mismatch; out: $T9C_OUT"
+else
+  _pass "T9c (#1356 codex-rescue catch): inverse direction also verbatim (registered carries query, sent bare → not_registered)"
+fi
+
+# T9d (teeth, source-level) — verify the normalize helper does NOT strip
+# query/fragment. A future patch that re-introduces urlparse + path-only
+# would silently re-open the T9a/T9b bypass; T9d catches the source
+# change without needing the full mock loop.
+HELPER_BODY="$(awk '/^def ms365_normalize_redirect_uri_for_compare/{f=1; next} f && /^def /{exit} f' "$BRIDGE_SETUP_PY")"
+if [[ -z "$HELPER_BODY" ]]; then
+  _fail "T9d (teeth)" "could not locate ms365_normalize_redirect_uri_for_compare body (function renamed/removed?)"
+elif printf '%s\n' "$HELPER_BODY" | grep -F "urlparse" >/dev/null; then
+  _fail "T9d (teeth)" "ms365_normalize_redirect_uri_for_compare re-introduced urlparse-based stripping — query/fragment bypass is back"
+elif printf '%s\n' "$HELPER_BODY" | grep -E "parsed\.(path|netloc|scheme)" >/dev/null; then
+  _fail "T9d (teeth)" "ms365_normalize_redirect_uri_for_compare re-introduced parsed.path/netloc/scheme — query/fragment bypass is back"
+else
+  _pass "T9d (teeth #1356): ms365_normalize_redirect_uri_for_compare is verbatim (no urlparse-based strip)"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 printf '\n[summary] 1355-1356-ms365-wizard: %d tests, %d failures\n' "$TOTAL" "$FAILS"

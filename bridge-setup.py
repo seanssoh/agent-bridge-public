@@ -1004,26 +1004,23 @@ MS365_CONVENTION_DEFAULT_SCOPES = (
 def ms365_normalize_redirect_uri_for_compare(uri: str) -> str:
     """Normalize a redirect URI for Entra registration comparison.
 
-    Entra app registrations match redirect URIs verbatim against the
-    operator-registered string. The Microsoft identity platform treats
-    `https://x/cb` and `https://x/cb/` as distinct (the trailing slash
-    matters). The probe still needs a basic sanity-normalization step to
-    avoid spurious mismatches from query strings (which Microsoft
-    discards) and whitespace. Compare on the path + scheme + host only;
-    the query is intentionally NOT stripped at the Entra layer but the
-    wizard always persists a clean URL with no query.
+    The Microsoft identity platform matches redirect URIs against the
+    Entra app registration's `web.redirectUris` array verbatim — the
+    sent value (including scheme, host, port, path, **query string**,
+    and **fragment**) must equal one of the registered entries character
+    for character. AADSTS50011 fires for anything else, including a
+    `?code=abc` query added by the operator's reverse proxy or a
+    `#fragment` typo. The earlier version of this helper stripped
+    query+fragment "to avoid spurious mismatches", but that was the
+    OPPOSITE of what #1356 needs — the whole point of the probe is to
+    catch every divergence the runtime would catch.
+
+    Verbatim, with whitespace trimmed (operator input artifact). We do
+    not lower-case the host either: Entra is case-sensitive on path
+    and forgiving on host case, but the operator typed exactly what
+    they typed and the strictest probe is the safest probe.
     """
-    raw = (uri or "").strip()
-    if not raw:
-        return ""
-    parsed = urlparse(raw)
-    if not parsed.scheme or not parsed.netloc:
-        return raw
-    # Build a canonical form: scheme://netloc + path (keep trailing
-    # slash if the operator typed it; Microsoft preserves it). Drop
-    # fragment + query (Entra ignores them in match).
-    path = parsed.path or ""
-    return f"{parsed.scheme}://{parsed.netloc}{path}"
+    return (uri or "").strip()
 
 
 def ms365_acquire_graph_token(
