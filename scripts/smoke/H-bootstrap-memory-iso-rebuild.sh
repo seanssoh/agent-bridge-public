@@ -423,6 +423,12 @@ if t8_should_run; then
     smoke_skip "T8 real iso reproducer" "useradd -r $ISO_USER failed"
   else
     ISO_USER_CREATED=1
+    # SMOKE_TMP_ROOT is mktemp 0700 owned by the runner. The iso user
+    # cannot traverse that without world-exec on every ancestor up to
+    # ISO_WORKDIR. Open just enough of the path (o+x, NO o+r) so iso
+    # can chdir through but cannot list. /tmp itself is 1777 on every
+    # supported runner.
+    chmod o+x "$SMOKE_TMP_ROOT" 2>/dev/null || true
     # Scaffold workdir + memory/ owned by the iso user with the iso group
     # at mode 2770 — exactly the layout the v2 isolation contract pins.
     sudo -n mkdir -p "$ISO_WORKDIR/memory"
@@ -432,7 +438,9 @@ if t8_should_run; then
 
     # Plant a stale tmp DB exactly as the pre-fix bug observed.
     STALE_TMP="$ISO_WORKDIR/memory/index.sqlite.rebuilding-20260526-031720"
-    sudo -n -u "$ISO_USER" bash -c "touch '$STALE_TMP' && chmod 0640 '$STALE_TMP'"
+    if ! sudo -n -u "$ISO_USER" bash -c "touch '$STALE_TMP' && chmod 0640 '$STALE_TMP'"; then
+      smoke_fail "T8 fixture: iso user could not create $STALE_TMP — check SMOKE_TMP_ROOT traversal"
+    fi
 
     # T8.a — controller direct write into iso-owned memory/ MUST fail.
     # Proves the cross-boundary asymmetry is real on this host. If

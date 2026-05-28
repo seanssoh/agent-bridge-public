@@ -131,7 +131,7 @@ printf '{"name": "test-plugin", "version": "0.0.1"}\n' \
 (
   cd "$FIXTURE_MKT_SRC"
   git init -q
-  git config user.email smoke@example.invalid
+  git config user.email smoke@example.com
   git config user.name smoke
   git add -A
   git -c commit.gpgsign=false commit -q -m "fixture marketplace"
