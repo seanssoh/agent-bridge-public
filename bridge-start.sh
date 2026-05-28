@@ -1047,6 +1047,15 @@ bridge_agent_clear_prompt_ready "$AGENT"
 # is still present, `bridge-run.sh` will trip the circuit breaker again
 # and re-write the marker on the first post-unblock failure cycle.
 bridge_agent_clear_broken_launch "$AGENT"
+# Issue #1353 (v0.15.0-beta5-2 Track A) — clear setup-pending grace
+# marker. By the time we reach this point we have passed the channel-
+# plugin preflight (line 1027-1033) — so the channel validator has
+# accepted whatever the agent has set up so far, and the grace window
+# is no longer needed. An explicit operator `agent start` is also a
+# legitimate exit from the grace window: the operator has decided the
+# agent is ready, and any subsequent auto-start from the daemon should
+# use the normal (non-silent) backoff path on validator-miss.
+bridge_agent_clear_setup_pending "$AGENT" 2>/dev/null || true
 bridge_start_prepare_agent_log_files "$AGENT"
 
 # Refresh the launch window so a new session id can be detected for this run.
