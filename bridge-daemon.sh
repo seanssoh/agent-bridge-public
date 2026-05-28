@@ -7851,6 +7851,45 @@ cmd_run_cron_worker() {
   # shellcheck disable=SC1090
   source <(bridge_cron_load_run_shell "$run_id")
 
+  # Issue #1327 (v0.15.0-beta5-2 Lane μ M4) edge case 1: re-check the
+  # manual-stop marker at execute time. The enqueue-side gate in
+  # `bridge-cron.sh:run_enqueue` blocks the row from being created,
+  # but a row that was already queued BEFORE the operator stopped the
+  # agent (or a row enqueued in a window where the marker was racy)
+  # would otherwise reach this point. Honor the operator's intent the
+  # same way: refuse + audit `cron_dispatch_skipped` and emit a
+  # human-readable note via the existing followup file path, then
+  # exit the worker cleanly without invoking the runner. The
+  # `task_cancelled` audit emission goes through the existing
+  # `bridge_queue_cli done` close shape so the queue row stays
+  # accounted-for (no zombie row, no `bridge-task done` required from
+  # the operator).
+  if [[ -n "$CRON_TARGET_AGENT" ]] \
+      && declare -F bridge_agent_manual_stop_active >/dev/null 2>&1 \
+      && bridge_agent_manual_stop_active "$CRON_TARGET_AGENT" 2>/dev/null; then
+    bridge_warn "cron worker skipped task #${task_id} (target=${CRON_TARGET_AGENT} reason=manual_stop run_id=${run_id})"
+    bridge_audit_log daemon cron_dispatch_skipped "$CRON_TARGET_AGENT" \
+      --detail task_id="$task_id" \
+      --detail run_id="$run_id" \
+      --detail job_name="${CRON_JOB_NAME:-$run_id}" \
+      --detail family="${CRON_FAMILY:-}" \
+      --detail slot="${CRON_SLOT:-}" \
+      --detail reason=manual_stop \
+      --detail stage=execute 2>/dev/null || true
+    done_note_file="$(bridge_cron_dispatch_completion_note_file_by_id "$run_id")"
+    mkdir -p "$(dirname "$done_note_file")" 2>/dev/null || true
+    {
+      printf '# Cron Dispatch Result\n\n'
+      printf -- '- task_id: %s\n' "$task_id"
+      printf -- '- state: skipped\n'
+      printf -- '- reason: manual_stop\n'
+      printf -- '- run_id: %s\n' "$run_id"
+      printf -- '- target: %s\n' "$CRON_TARGET_AGENT"
+    } >"$done_note_file" 2>/dev/null || true
+    bridge_queue_cli done "$task_id" --agent "$TASK_ASSIGNED_TO" --note-file "$done_note_file" >/dev/null 2>&1 || true
+    return 0
+  fi
+
   if [[ "$CRON_RUN_STATE" != "success" || ! -f "$CRON_RESULT_FILE" ]]; then
     # Issue #1314 (beta5-2 Lane η, CRITICAL/security): pre-flight UID-drop
     # validation BEFORE invoking the runner. The runner's

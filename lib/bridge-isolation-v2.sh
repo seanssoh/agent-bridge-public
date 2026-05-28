@@ -1345,6 +1345,81 @@ bridge_isolation_v2_normalize_workdir_profile_group() {
       "$agent" "$workdir/.claude/plugins/known_marketplaces.json" 0660 "$workdir" \
       || bridge_warn "chown_file_iso_uid failed for $workdir/.claude/plugins/known_marketplaces.json (non-fatal)"
   fi
+
+  # Issue #1329 (v0.15.0-beta5-2 Lane μ M6): normalize per-channel
+  # credential files so the iso UID can read them via the per-agent
+  # group. `bridge-setup.py:save_json` / `save_text` write
+  # `.<channel>/{access.json,.env,state.json,mcp.json}` at the
+  # controller umask + explicit `os.chmod(... 0o600)` — leaving the
+  # files at `controller-primary-group 0600` even on iso v2 agents.
+  # Iso UID's plugin then EACCESes on the controller-blind read path
+  # (no sudo handoff configured) and the channel connection fails
+  # silently. Normalize:
+  #
+  #   * the channel state dir itself to `controller:ab-agent-<a> 2770`
+  #     so the iso UID can traverse + list via the per-agent group.
+  #     2770 = setgid'd group-rwx, world-none. Setgid on the dir
+  #     ensures any future controller-side `save_json` lands at
+  #     group `ab-agent-<a>` by default (POSIX setgid-inherits-group
+  #     contract).
+  #   * each known credential file to `controller:ab-agent-<a> 0640`.
+  #     The brief explicitly chose 0640 (group-read) — NOT 0644 —
+  #     because the iso UID is the only non-controller principal that
+  #     needs read access and granting world-read would be a strict
+  #     widening (edge case 6). Owner-rw is unchanged from the legacy
+  #     0600 shape.
+  #
+  # Compatibility with the v3 channel-dotenv contract
+  # (`agent-bridge migrate isolation v3 --apply` ⇒ `iso-uid:ab-agent-<a>
+  # 0600`): the chgrp helper preserves the iso UID owner if it's
+  # already there (chgrp does not change owner), and the chmod 0640
+  # is a strict superset of 0600 for group-read. A v3-migrated host
+  # ends up at `iso-uid:ab-agent-<a> 0640`; both shapes satisfy the
+  # iso-UID-can-read contract and neither widens to world. Smoke T5
+  # asserts the controller-owned 0600 → group-readable 0640
+  # transition; v3-canonical files are left semantically equivalent
+  # under the looser shape.
+  #
+  # Idempotency: each per-file helper carries stat-skip on exact
+  # `%G:%a` match (see `bridge_isolation_v2_chgrp_file_iso_group` /
+  # `bridge_isolation_v2_chgrp_dir_iso_group`). A re-run on an
+  # already-normalized credential tree performs zero chgrp/chmod
+  # syscalls (edge case 7).
+  local _iso_channel_dirs=(
+    ".discord"
+    ".telegram"
+    ".teams"
+    ".ms365"
+    ".mattermost"
+  )
+  # Per-channel credential filename list. Common entries (`.env`,
+  # `access.json`) appear in every provider; channel-specific
+  # extras (`state.json` for teams, `mcp.json` for mattermost)
+  # are included so a future channel-state file that lands at
+  # `controller 0600` is also normalized. Files absent from the
+  # specific channel dir short-circuit via the `[[ -f ]]` guard
+  # in the per-entry helper.
+  local _iso_channel_files=(
+    ".env"
+    "access.json"
+    "state.json"
+    "mcp.json"
+  )
+  local chan_dir chan_file
+  for chan_dir in "${_iso_channel_dirs[@]}"; do
+    # Skip cleanly if the agent has not set up this channel.
+    [[ -d "$workdir/$chan_dir" ]] || continue
+    bridge_isolation_v2_chgrp_dir_iso_group \
+      "$agent" "$workdir/$chan_dir" 2770 "$workdir" \
+      || bridge_warn "chgrp_dir_iso_group failed for $workdir/$chan_dir (non-fatal)"
+    for chan_file in "${_iso_channel_files[@]}"; do
+      [[ -f "$workdir/$chan_dir/$chan_file" ]] || continue
+      # Mode 0640 (group-read, world-none) — see contract comment above.
+      bridge_isolation_v2_chgrp_file_iso_group \
+        "$agent" "$workdir/$chan_dir/$chan_file" 0640 "$workdir" \
+        || bridge_warn "chgrp_file_iso_group failed for $workdir/$chan_dir/$chan_file (non-fatal)"
+    done
+  done
   return 0
 }
 
