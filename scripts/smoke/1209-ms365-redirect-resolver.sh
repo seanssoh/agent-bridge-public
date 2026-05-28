@@ -211,11 +211,14 @@ fi
 # MS365_REDIRECT_URI to .ms365/.env.
 # ---------------------------------------------------------------------------
 T9_DIR="$SMOKE_DIR/t9/.ms365"
+# Issue #1356: pass --skip-entra-probe to keep this assertion offline
+# (no Graph round-trip with fake creds T1/C1/S1).
 python3 "$BRIDGE_SETUP_PY" ms365 \
   --agent testagent \
   --ms365-dir "$T9_DIR" \
   --redirect-uri https://bot.example.com/auth/callback \
   --tenant-id T1 --client-id C1 --client-secret S1 \
+  --skip-entra-probe \
   --yes >"$SMOKE_DIR/t9.log" 2>&1 || true
 if [[ -f "$T9_DIR/.env" ]] && grep -E "^MS365_REDIRECT_URI=https://bot.example.com/auth/callback$" "$T9_DIR/.env" >/dev/null; then
   _pass "T9: bridge-setup.py ms365 writes MS365_REDIRECT_URI= to .ms365/.env"
