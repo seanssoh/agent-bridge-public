@@ -2313,20 +2313,40 @@ bridge_isolation_v2_matrix_rows_for_agent() {
       "$state_cron_root" "$shared_grp"
     printf 'state-cron-runs-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|isolated UID needs --x to reach its own per-run leaf\n' \
       "$state_cron_runs_root" "$shared_grp"
-    # Issue #1359 tactical staging delegation for `agb cron create`:
-    # iso UIDs cannot write to controller-owned cron/jobs.json, so they
-    # serialize the mutation request into this directory at mode 0660
-    # (owner=iso UID, group=ab-shared via setgid). The daemon picks up
-    # pending staging files on its cron-sync tick, validates the caller
-    # identity, applies via `bridge-cron.py native-create`, and writes
-    # a sibling result.json the iso UID poller reads. Mode 2770 +
-    # ab-shared lets every iso UID write into the shared bin while
-    # the file-level mode 0660 on each staging file keeps cross-agent
-    # read possible only via the audit/apply daemon (which checks
-    # `actor_agent` + file owner UID).
-    printf 'state-cron-staging|%s|dir|controller|%s|2770|0660|1|group_setgid|required|#1359 tactical staging dir for iso agb cron create\n' \
+    # Issue #1359 tactical staging delegation for `agb cron create`.
+    # The staging tree is per-agent rooted to defeat the cross-agent
+    # forge gap codex r1 #1 flagged: a flat staging dir under ab-shared
+    # 2770 would let any iso UID rewrite a peer's request file
+    # in-place or pre-create a peer's result.json before the daemon
+    # picks it up.
+    #
+    # Two-tier layout:
+    #   - shared root `state/cron-staging/`: dir_only_traverse mode
+    #     0711 / group=ab-shared. Every iso UID gets --x to enter,
+    #     but no read/list of peers' subdir names. The controller
+    #     (owner) can list for scan/apply/sweep.
+    #   - per-agent subdir `state/cron-staging/<X>/`: emitted in the
+    #     per-agent branch below as `state-cron-staging-agent-dir`
+    #     mode 2770 group=ab-agent-<X> so only that agent's iso UID
+    #     has group-write. Files inside inherit ab-agent-<X> via
+    #     setgid + land at mode 0660 owner=iso UID.
+    printf 'state-cron-staging-root|%s|dir_only_traverse|controller|%s|0711||0|group_setgid|required|#1359 r2: shared staging root; iso UIDs traverse only, per-agent subdir carries the write grant\n' \
       "${BRIDGE_CRON_STAGING_DIR:-${state_root}/cron-staging}" "$shared_grp"
+    # Issue #1359 r2: per-agent staging subdir. Mode 2770 +
+    # group=ab-agent-<X> (iso branch) or controller_group (shared
+    # branch) so only the named agent's iso UID has group-write — the
+    # cross-agent forge gap codex r1 #1 flagged closes here. Files
+    # inside inherit the group via setgid and land at mode 0660
+    # owner=iso UID. The daemon (controller) reads via owner of the
+    # parent + ownership of the file (after the iso UID writes it).
+    local state_cron_staging_root="${BRIDGE_CRON_STAGING_DIR:-${state_root}/cron-staging}"
+    local state_cron_staging_agent_dir="${state_cron_staging_root}/${agent}"
     if [[ "$_v2_isolation_mode" == "shared" ]]; then
+      # #909 family: shared-mode per-agent staging subdir, controller-
+      # owned with the controller's primary group. Iso UIDs don't
+      # exist in shared mode, but the controller still writes / reads.
+      printf 'state-cron-staging-agent-dir|%s|dir|controller|controller_group|2770|0660|1|group_setgid|required|#1359 r2 shared-mode per-agent staging subdir\n' \
+        "$state_cron_staging_agent_dir"
       # #909: state-agent-dir under shared mode is operator-owned; the
       # `ab-agent-<X>` group does not exist. write_agent_state_marker
       # calls ensure_matrix_path "state-agent-dir" before every idle-since
@@ -2335,6 +2355,8 @@ bridge_isolation_v2_matrix_rows_for_agent() {
       printf 'state-agent-dir|%s|dir|controller|controller_group|2770|0660|1|group_setgid|required|#909 shared-mode per-agent state leaf\n' \
         "$state_agent_dir"
     else
+      printf 'state-cron-staging-agent-dir|%s|dir|controller|%s|2770|0660|1|group_setgid|required|#1359 r2 per-agent staging subdir; only this agent has group-write\n' \
+        "$state_cron_staging_agent_dir" "$agent_grp"
       # Issue #1165 Gap 6 (r2): the per-agent state-agent-dir leaf keeps
       # its per-agent group `ab-agent-<X>` (NOT `ab-shared`). The r1 fix
       # widened to `ab-shared` so the Stop hook (running as the isolated

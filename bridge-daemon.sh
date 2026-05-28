@@ -8798,32 +8798,32 @@ process_mcp_orphan_cleanup() {
 # An iso v2 agent's `agb cron create` cannot write to controller-owned
 # `cron/jobs.json` directly (mode 0640 group=controller_group). Instead
 # the CLI drops a JSON mutation request into
-# `$BRIDGE_CRON_STAGING_DIR/<uuid>.json` (mode 0660 owner=iso UID
-# group=ab-shared via the dir's setgid bit) and waits for the daemon
-# to write a `<uuid>.result.json` sibling. This function is the
-# daemon-side apply step: per cron-sync tick it scans the staging dir,
-# delegates each pending file to `lib/cron-helpers/staging.py apply`
-# (which validates the caller identity and runs `bridge-cron.py
-# native-create` as the controller), then emits an audit row per
-# outcome and sweeps stale orphans.
+# `$BRIDGE_CRON_STAGING_DIR/<actor_agent>/<uuid>.json` (mode 0660
+# owner=iso UID, group=ab-agent-<actor_agent> via setgid) and waits for
+# the daemon to write a `<uuid>.result.json` sibling. This function is
+# the daemon-side apply step: per cron-sync tick it scans the per-agent
+# staging subdirs, delegates each pending file to
+# `lib/cron-helpers/staging.py apply` (which validates the caller
+# identity and runs `bridge-cron.py native-create` as the controller),
+# then emits an audit row per outcome and sweeps stale orphans.
 #
-# Returns 0 if any file was applied (so the daemon main loop knows
-# state changed), 1 otherwise — matches the convention used by
-# `process_memory_daily_orphan_sweep` and `process_mcp_orphan_cleanup`.
-# Failures inside the per-file apply are not propagated out: the
-# audit row carries the rejection reason, and the iso UID poller
-# surfaces the error to the caller.
+# **Return contract (codex r1 #2)**: ALWAYS returns 0, even when no
+# files were applied. The caller in `cmd_sync_cycle` wraps this in a
+# `|| daemon_warn` warning emit; a non-zero rc on the steady-state
+# empty case (no pending requests) would flood the daemon log with
+# false-positive warnings. The function logs its own internal errors
+# via `daemon_warn` directly and the audit log for per-file outcomes.
 process_cron_staging_apply() {
   local staging_dir="${BRIDGE_CRON_STAGING_DIR:-}"
   local jobs_file="${BRIDGE_NATIVE_CRON_JOBS_FILE:-}"
-  [[ -n "$staging_dir" && -d "$staging_dir" ]] || return 1
-  [[ -n "$jobs_file" ]] || return 1
+  [[ -n "$staging_dir" && -d "$staging_dir" ]] || return 0
+  [[ -n "$jobs_file" ]] || return 0
 
   if ! command -v python3 >/dev/null 2>&1; then
-    return 1
+    return 0
   fi
   if [[ ! -f "$SCRIPT_DIR/lib/cron-helpers/staging.py" ]]; then
-    return 1
+    return 0
   fi
 
   local stale_secs="${BRIDGE_CRON_STAGING_STALE_SECONDS:-300}"
@@ -8838,7 +8838,7 @@ process_cron_staging_apply() {
   if [[ -n "$scan_output" ]]; then
     while IFS= read -r row; do
       [[ -n "$row" ]] || continue
-      local uuid="" owner_uid="" stale=""
+      local uuid="" owner_uid="" stale="" actor_agent_dir=""
       # Parse the json row with python — avoid jq dependency.
       local _parsed
       _parsed="$(python3 - "$row" <<'PY'
@@ -8850,6 +8850,7 @@ try:
 except Exception:
     sys.exit(0)
 print("uuid=" + str(data.get("uuid") or ""))
+print("actor_agent=" + str(data.get("actor_agent") or ""))
 print("owner_uid=" + str(data.get("owner_uid") or ""))
 print("stale=" + ("1" if data.get("stale") else "0"))
 PY
@@ -8857,21 +8858,36 @@ PY
       while IFS= read -r _line; do
         case "$_line" in
           uuid=*) uuid="${_line#uuid=}" ;;
+          actor_agent=*) actor_agent_dir="${_line#actor_agent=}" ;;
           owner_uid=*) owner_uid="${_line#owner_uid=}" ;;
           stale=*) stale="${_line#stale=}" ;;
         esac
       done <<<"$_parsed"
-      [[ -n "$uuid" ]] || continue
+      [[ -n "$uuid" && -n "$actor_agent_dir" ]] || continue
 
+      # Issue #1359 codex r1 #3: bound the per-file apply with the
+      # daemon's standard timeout wrapper so a wedged native-create
+      # subprocess (FIFO payload-file, slow disk) cannot stall the
+      # whole cron-sync tick. The wrapper SIGTERM/SIGKILL chain is
+      # absorbed at the result-file rejection path below — `apply_rc`
+      # carries the wrapped exit code without ever propagating SIGPIPE.
       local apply_rc=0
-      python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" \
-        apply "$staging_dir" "$uuid" "$jobs_file" >/dev/null 2>&1 || apply_rc=$?
+      if declare -F bridge_with_timeout >/dev/null 2>&1; then
+        bridge_with_timeout "${BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS:-25}" \
+          cron_staging_apply python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" \
+          apply "$staging_dir" "$actor_agent_dir" "$uuid" "$jobs_file" \
+          >/dev/null 2>&1 || apply_rc=$?
+      else
+        python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" \
+          apply "$staging_dir" "$actor_agent_dir" "$uuid" "$jobs_file" \
+          >/dev/null 2>&1 || apply_rc=$?
+      fi
 
       # Parse the result file to recover status + actor_agent + reason
       # for the audit row. The staging.py apply path ALWAYS writes a
       # result.json (even on rejection), so a missing result here is a
       # logic error worth surfacing.
-      local result_path="$staging_dir/${uuid}.result.json"
+      local result_path="$staging_dir/$actor_agent_dir/${uuid}.result.json"
       local audit_action="cron_staging_unknown"
       local actor_agent="<unknown>"
       local error_detail=""
@@ -8956,7 +8972,13 @@ PY
     done <<<"$swept_output"
   fi
 
-  (( applied_count > 0 ))
+  # codex r1 #2: ALWAYS return 0 — the caller in cmd_sync_cycle wraps
+  # this with `|| daemon_warn`, so a non-zero rc on the steady-state
+  # "no applied files" case would flood daemon.log with false-positive
+  # warnings. Per-file failures are captured in the audit log
+  # (cron_staging_rejected) and surfaced to the iso UID poller via the
+  # result.json file — they don't need to bubble up here.
+  return 0
 }
 
 process_queue_gateway_requests() {

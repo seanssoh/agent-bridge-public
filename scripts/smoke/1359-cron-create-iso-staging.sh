@@ -50,10 +50,15 @@ smoke_setup_bridge_home
 CURRENT_USER="$(id -un)"
 CURRENT_UID="$(id -u)"
 JOBS_FILE="$BRIDGE_NATIVE_CRON_JOBS_FILE"
-STAGING_DIR="$BRIDGE_STATE_DIR/cron-staging"
+STAGING_ROOT="$BRIDGE_STATE_DIR/cron-staging"
 ISO_AGENT="iso-smoke"
-mkdir -p "$STAGING_DIR"
-chmod 2770 "$STAGING_DIR" 2>/dev/null || chmod 0770 "$STAGING_DIR"
+PEER_AGENT="iso-peer"
+ISO_STAGING_DIR="$STAGING_ROOT/$ISO_AGENT"
+PEER_STAGING_DIR="$STAGING_ROOT/$PEER_AGENT"
+mkdir -p "$ISO_STAGING_DIR" "$PEER_STAGING_DIR"
+chmod 0711 "$STAGING_ROOT" 2>/dev/null || true
+chmod 2770 "$ISO_STAGING_DIR" 2>/dev/null || chmod 0770 "$ISO_STAGING_DIR"
+chmod 2770 "$PEER_STAGING_DIR" 2>/dev/null || chmod 0770 "$PEER_STAGING_DIR"
 # Seed an empty jobs.json so the apply path can find it.
 printf '{"format":"agent-bridge-cron-v1","jobs":[]}\n' >"$JOBS_FILE"
 
@@ -61,7 +66,7 @@ printf '{"format":"agent-bridge-cron-v1","jobs":[]}\n' >"$JOBS_FILE"
 export BRIDGE_CRON_STAGING_TIMEOUT_SECONDS=10
 export BRIDGE_CRON_STAGING_POLL_INTERVAL_SECONDS=1
 export BRIDGE_CRON_STAGING_STALE_SECONDS=2
-export BRIDGE_CRON_STAGING_DIR="$STAGING_DIR"
+export BRIDGE_CRON_STAGING_DIR="$STAGING_ROOT"
 export BRIDGE_NATIVE_CRON_JOBS_FILE="$JOBS_FILE"
 
 # Build the agent-meta.env that lets the staging.py apply path resolve
@@ -138,23 +143,25 @@ print(json.dumps({
 PY
 )"
 
-T1_UUID="$(staging_py write-request "$STAGING_DIR" "$T1_PAYLOAD")"
+T1_UUID="$(staging_py write-request "$STAGING_ROOT" "$ISO_AGENT" "$T1_PAYLOAD")"
 T1_UUID="${T1_UUID%%$'\n'*}"
 [[ -n "$T1_UUID" ]] || smoke_fail "T1: write-request returned empty uuid"
 
-# Verify the file was written at mode 0660.
-T1_PATH="$STAGING_DIR/$T1_UUID.json"
+# Verify the file was written at mode 0660 under the per-agent subdir.
+T1_PATH="$ISO_STAGING_DIR/$T1_UUID.json"
 [[ -f "$T1_PATH" ]] || smoke_fail "T1: staging file missing: $T1_PATH"
 T1_MODE="$(stat -c '%a' "$T1_PATH" 2>/dev/null || stat -f '%Lp' "$T1_PATH" 2>/dev/null || echo '?')"
 smoke_assert_eq "660" "$T1_MODE" "T1: staging file must be mode 0660"
 
 # Simulate daemon apply directly. We do NOT spawn the full daemon —
-# the apply path is unit-testable via `staging.py apply`.
-if ! staging_py apply "$STAGING_DIR" "$T1_UUID" "$JOBS_FILE" >/dev/null 2>&1; then
+# the apply path is unit-testable via `staging.py apply`. The
+# canonical actor_agent (third arg) comes from the staging-path dirname
+# in the daemon; here we pass it explicitly.
+if ! staging_py apply "$STAGING_ROOT" "$ISO_AGENT" "$T1_UUID" "$JOBS_FILE" >/dev/null 2>&1; then
   smoke_fail "T1: staging apply returned non-zero rc"
 fi
 
-T1_RESULT="$STAGING_DIR/$T1_UUID.result.json"
+T1_RESULT="$ISO_STAGING_DIR/$T1_UUID.result.json"
 [[ -f "$T1_RESULT" ]] || smoke_fail "T1: result.json missing: $T1_RESULT"
 T1_STATUS="$(result_field "$T1_RESULT" status)"
 T1_AUDIT_ACTION="$(result_field "$T1_RESULT" audit_action)"
@@ -192,7 +199,7 @@ T2_AFTER="$(jobs_count)"
 # bridge-cron.sh create end-to-end with the file directly writable, and
 # confirm one job was added without any staging file appearing.
 T2_BEFORE_DIRECT="$(jobs_count)"
-T2_STAGING_COUNT_BEFORE="$(find "$STAGING_DIR" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+T2_STAGING_COUNT_BEFORE="$(find "$ISO_STAGING_DIR" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
 unset BRIDGE_AGENT_ID
 bash "$REPO_ROOT/bridge-cron.sh" create \
   --agent "$ISO_AGENT" \
@@ -201,7 +208,7 @@ bash "$REPO_ROOT/bridge-cron.sh" create \
   --title "$ISO_AGENT-direct-via-bridge-cron-sh" \
   --payload "direct path probe" >/dev/null
 T2_AFTER_DIRECT="$(jobs_count)"
-T2_STAGING_COUNT_AFTER="$(find "$STAGING_DIR" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
+T2_STAGING_COUNT_AFTER="$(find "$ISO_STAGING_DIR" -mindepth 1 -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')"
 [[ "$T2_AFTER_DIRECT" -eq $(( T2_BEFORE_DIRECT + 1 )) ]] || \
   smoke_fail "T2: direct bridge-cron.sh create should add 1 job (before=$T2_BEFORE_DIRECT after=$T2_AFTER_DIRECT)"
 [[ "$T2_STAGING_COUNT_AFTER" -eq "$T2_STAGING_COUNT_BEFORE" ]] || \
@@ -209,12 +216,18 @@ T2_STAGING_COUNT_AFTER="$(find "$STAGING_DIR" -mindepth 1 -maxdepth 1 -type f 2>
 smoke_log "ok: T2 — direct path unaffected; no staging file created"
 
 # ---------------------------------------------------------------------------
-# T3 — actor_agent mismatch (iso UID tries to create cron for ANOTHER agent).
+# T3 — payload.actor_agent != path dirname (cross-agent forge attempt).
 # ---------------------------------------------------------------------------
-smoke_log "T3: actor_agent != target agent → reject (cross-agent boundary)"
+smoke_log "T3: payload claims actor_agent != staging path dirname → reject"
 
+# Iso UID writes a request file claiming to be from PEER_AGENT but
+# drops it into ISO_AGENT's subdir. The matrix-grant boundary would
+# block ISO_AGENT's UID from writing into PEER_AGENT's subdir, but
+# nothing stops the iso UID from lying in its own subdir's payload.
+# The daemon recovers the canonical actor_agent from the dirname and
+# rejects the mismatch.
 T3_PAYLOAD="$(
-  "$PY_BIN" - "$ISO_AGENT" "other-agent" "$CURRENT_UID" <<'PY'
+  "$PY_BIN" - "$PEER_AGENT" "$PEER_AGENT" "$CURRENT_UID" <<'PY'
 import json
 import sys
 
@@ -228,8 +241,8 @@ print(json.dumps({
     "schedule": "0 7 * * *",
     "at": None,
     "tz": "Asia/Seoul",
-    "title": f"{target}-cross-cron",
-    "payload": "Cross-agent attempt",
+    "title": f"{target}-forged-cron",
+    "payload": "Cross-agent forge attempt",
     "payload_file": None,
     "kind": "text",
     "disabled": False,
@@ -238,22 +251,23 @@ print(json.dumps({
 PY
 )"
 
-T3_UUID="$(staging_py write-request "$STAGING_DIR" "$T3_PAYLOAD")"
+# Drop under ISO_AGENT's subdir but claim PEER_AGENT in the payload.
+T3_UUID="$(staging_py write-request "$STAGING_ROOT" "$ISO_AGENT" "$T3_PAYLOAD")"
 T3_UUID="${T3_UUID%%$'\n'*}"
 T3_BEFORE="$(jobs_count)"
 set +e
-staging_py apply "$STAGING_DIR" "$T3_UUID" "$JOBS_FILE" >/dev/null 2>&1
+staging_py apply "$STAGING_ROOT" "$ISO_AGENT" "$T3_UUID" "$JOBS_FILE" >/dev/null 2>&1
 T3_RC=$?
 set -e
 [[ "$T3_RC" -ne 0 ]] || smoke_fail "T3: apply must fail with non-zero rc"
-T3_RESULT="$STAGING_DIR/$T3_UUID.result.json"
+T3_RESULT="$ISO_STAGING_DIR/$T3_UUID.result.json"
 T3_AUDIT_ACTION="$(result_field "$T3_RESULT" audit_action)"
 T3_ERROR="$(result_field "$T3_RESULT" error)"
 smoke_assert_eq "cron_staging_rejected" "$T3_AUDIT_ACTION" "T3: audit_action must be rejected"
-smoke_assert_contains "$T3_ERROR" "actor_agent_mismatch" "T3: error must explain actor_agent_mismatch"
+smoke_assert_contains "$T3_ERROR" "payload_actor_agent_mismatch" "T3: error must explain payload_actor_agent_mismatch"
 T3_AFTER="$(jobs_count)"
 [[ "$T3_AFTER" -eq "$T3_BEFORE" ]] || smoke_fail "T3: jobs.json count must NOT change (before=$T3_BEFORE after=$T3_AFTER)"
-smoke_log "ok: T3 — cross-agent reject pinned (error=$T3_ERROR)"
+smoke_log "ok: T3 — payload-vs-dirname mismatch reject pinned (error=$T3_ERROR)"
 
 # ---------------------------------------------------------------------------
 # T4 — file owner UID does NOT match the agent's iso UID (forged staging).
@@ -309,15 +323,15 @@ print(json.dumps({
 }))
 PY
 )"
-  T4_UUID="$(staging_py write-request "$STAGING_DIR" "$T4_PAYLOAD")"
+  T4_UUID="$(staging_py write-request "$STAGING_ROOT" "$ISO_AGENT" "$T4_PAYLOAD")"
   T4_UUID="${T4_UUID%%$'\n'*}"
   T4_BEFORE="$(jobs_count)"
   set +e
-  staging_py apply "$STAGING_DIR" "$T4_UUID" "$JOBS_FILE" >/dev/null 2>&1
+  staging_py apply "$STAGING_ROOT" "$ISO_AGENT" "$T4_UUID" "$JOBS_FILE" >/dev/null 2>&1
   T4_RC=$?
   set -e
   [[ "$T4_RC" -ne 0 ]] || smoke_fail "T4: apply must fail with non-zero rc"
-  T4_RESULT="$STAGING_DIR/$T4_UUID.result.json"
+  T4_RESULT="$ISO_STAGING_DIR/$T4_UUID.result.json"
   T4_AUDIT_ACTION="$(result_field "$T4_RESULT" audit_action)"
   T4_ERROR="$(result_field "$T4_RESULT" error)"
   smoke_assert_eq "cron_staging_rejected" "$T4_AUDIT_ACTION" "T4: audit_action must be rejected"
@@ -340,7 +354,7 @@ fi
 smoke_log "T5: stale staging file (no result, age > stale_secs) → swept"
 
 T5_UUID="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '-' || "$PY_BIN" -c "import secrets; print(secrets.token_hex(16))")"
-T5_PATH="$STAGING_DIR/$T5_UUID.json"
+T5_PATH="$ISO_STAGING_DIR/$T5_UUID.json"
 printf '{"schema_version":1,"action":"create","actor_agent":"%s","actor_uid":%s,"agent":"%s","schedule":"0 9 * * *","at":null,"tz":"Asia/Seoul","title":"stale-cron","payload":"stale","payload_file":null,"kind":"text","disabled":false,"delete_after_run":false}\n' \
   "$ISO_AGENT" "$CURRENT_UID" "$ISO_AGENT" >"$T5_PATH"
 # Backdate the file by 60s so it's past the 2s stale threshold.
@@ -348,7 +362,7 @@ T5_PAST="$(date -d '60 seconds ago' '+%Y%m%d%H%M.%S' 2>/dev/null || date -v -60S
 if [[ -n "$T5_PAST" ]]; then
   touch -t "$T5_PAST" "$T5_PATH"
 fi
-T5_SWEEP_OUT="$(staging_py sweep-stale "$STAGING_DIR" "2")"
+T5_SWEEP_OUT="$(staging_py sweep-stale "$STAGING_ROOT" "2")"
 [[ -n "$T5_SWEEP_OUT" ]] || smoke_fail "T5: sweep-stale produced no output"
 smoke_assert_contains "$T5_SWEEP_OUT" "$T5_UUID" "T5: sweep output must reference uuid"
 smoke_assert_contains "$T5_SWEEP_OUT" "\"swept\": true" "T5: sweep must mark file as swept"

@@ -5,41 +5,64 @@ from an iso v2 agent UID.
 The controller owns `cron/jobs.json` (mode 0640, group=controller_group),
 so an iso v2 agent UID cannot write the file directly. This helper bridges
 the boundary by serializing the mutation request to a staging file under
-`$BRIDGE_STATE_DIR/cron-staging/<uuid>.json` (mode 0660, owner=iso UID,
-group=ab-shared). The daemon picks up staging files on its cron-sync
-tick, validates the caller, applies the mutation via
-`bridge-cron.py native-create`, and writes the result back to
-`<uuid>.result.json` for the iso UID poller.
+`$BRIDGE_STATE_DIR/cron-staging/<actor_agent>/<uuid>.json` (mode 0660,
+owner=iso UID, group=ab-agent-<actor_agent>). The daemon picks up
+staging files on its cron-sync tick, validates the caller, applies the
+mutation via `bridge-cron.py native-create`, and writes the result
+back to `<uuid>.result.json` for the iso UID poller.
 
 Root scope (daemon IPC Unix socket) is OUT OF SCOPE for this PR — a
 follow-up issue tracks the sync RPC contract.
 
+Per-agent staging boundary (codex r1 #1)
+----------------------------------------
+The staging tree is rooted per-agent: `<staging-root>/<actor_agent>/`.
+The matrix grants each per-agent subdir mode 2770 owner=controller
+group=ab-agent-<actor_agent>, so only that agent's iso UID has
+group-write. The shared dir (`<staging-root>`) is mode 2770
+group=ab-shared so every iso UID can `cd` into it to reach its own
+subdir, but inter-agent file writes (write into a peer agent's
+subdir, pre-create a peer's result.json, rewrite a peer's request
+file) are blocked at the group-write boundary.
+
+The daemon scans `<staging-root>/<agent>/*.json` and recovers the
+actor_agent from the path — not from the payload — so a payload that
+lies about actor_agent in its body still gets resolved to the
+directory-owning agent for the iso UID check.
+
 Subcommands
 -----------
-- write-request <staging-dir> <payload-json>
-    Iso UID side. Allocate a uuid, write `<staging-dir>/<uuid>.json` mode
-    0660 with the payload JSON, and print the uuid. Caller polls for the
-    `.result.json` sibling.
+- write-request <staging-root> <actor-agent> <payload-json>
+    Iso UID side. Allocate a uuid, write
+    `<staging-root>/<actor-agent>/<uuid>.json` mode 0660 with the
+    payload JSON, and print the uuid. Caller polls for the
+    `.result.json` sibling. The per-agent subdir is created if
+    missing (under iso UID umask, but the matrix-grant path tightens
+    perms idempotently).
 
-- read-result <staging-dir> <uuid>
-    Iso UID side. Print the result.json content if present, else exit
-    non-zero. The bash poller decides timeout.
+- read-result <staging-root> <actor-agent> <uuid>
+    Iso UID side. Print the result.json content if present, else
+    exit non-zero. The bash poller decides timeout.
 
-- scan-pending <staging-dir>
-    Controller / daemon side. Print one JSON object per pending staging
-    file (one per line): `{"uuid": ..., "path": ..., "owner_uid": ...,
-    "result_path": ..., "mtime_age_seconds": ...}`. Files with an
-    existing `.result.json` are skipped (already applied). Files older
-    than `BRIDGE_CRON_STAGING_STALE_SECONDS` (default 300) are emitted
+- scan-pending <staging-root>
+    Controller / daemon side. Walk every per-agent subdir and emit one
+    JSON object per pending staging file (one per line): `{"uuid": ...,
+    "actor_agent": ..., "path": ..., "owner_uid": ..., "result_path": ...,
+    "mtime_age_seconds": ..., "stale": ...}`. Files with an existing
+    `.result.json` are skipped (already applied). Files older than
+    `BRIDGE_CRON_STAGING_STALE_SECONDS` (default 300) are emitted
     with `stale: true` so the daemon can audit + sweep them.
 
-- apply <staging-dir> <uuid> <jobs-file>
+- apply <staging-root> <actor-agent> <uuid> <jobs-file>
     Controller / daemon side. Validate the staging file's owner UID
     matches the agent's iso UID (`actor_uid` in payload matches the
     file owner AND the actor_agent's roster os_user resolves to the
     same UID), then build a `bridge-cron.py native-create` argv from
     the payload, run it as a subprocess (controller permissions), and
-    write the result file. Result schema:
+    write the result file. The actor_agent is taken from the CLI
+    arg (which the daemon resolves from the staging path), so a payload
+    that contradicts the dirname is rejected with actor_agent_mismatch.
+    Result schema:
 
         {
           "schema_version": 1,
@@ -125,41 +148,76 @@ def _payload_atomic_write(path: Path, payload: Dict[str, Any], mode: int) -> Non
     os.replace(tmp, path)
 
 
-def cmd_write_request(staging_dir: str, payload_json: str) -> int:
+_AGENT_NAME_RE = None
+
+
+def _validate_agent_name(name: str) -> bool:
+    """Conservative whitelist for the per-agent subdir name. Same shape
+    as the bridge roster accepts: lowercase alnum / dot / dash / underscore,
+    1..64 chars. Rejecting weird names defeats `..` traversal and
+    accidental writes into the staging-root parent.
+    """
+    global _AGENT_NAME_RE
+    if _AGENT_NAME_RE is None:
+        import re
+
+        _AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    return bool(_AGENT_NAME_RE.match(name))
+
+
+def cmd_write_request(staging_root_arg: str, actor_agent: str, payload_json: str) -> int:
+    if not _validate_agent_name(actor_agent):
+        sys.stderr.write(f"staging.py write-request: bad actor_agent {actor_agent!r}\n")
+        return 64
     payload = json.loads(payload_json)
     payload.setdefault("schema_version", SCHEMA_VERSION)
     payload.setdefault("submitted_at", _iso_now())
     payload.setdefault("actor_uid", os.geteuid())
 
-    staging_root = Path(staging_dir).expanduser()
-    staging_root.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(staging_root_arg).expanduser()
+    agent_dir = staging_root / actor_agent
+    # The matrix-grant path is what enforces 2770 + ab-agent-<a>; the
+    # mkdir here is best-effort so a fresh-install path that hasn't
+    # run the matrix yet still allows the iso UID to drop the request.
+    # In that case the iso UID's umask 077 yields 0700; the daemon
+    # (controller) cannot list the dir but CAN traverse via the staging
+    # root + subdir name AND read the request via the parent dir's
+    # group-x grant. The result.json write back through the daemon will
+    # still land at mode 0660 owner=controller group=ab-agent-<a>.
+    agent_dir.mkdir(parents=True, exist_ok=True)
 
     request_uuid = uuid.uuid4().hex
-    request_path = staging_root / f"{request_uuid}.json"
+    request_path = agent_dir / f"{request_uuid}.json"
 
-    # Mode 0660 so the controller (in ab-shared via the per-agent
-    # grant) can read what the iso UID writes. Default umask in the iso
-    # UID context can otherwise strip group bits.
+    # Mode 0660 — group=ab-agent-<a> via setgid means only the actor
+    # agent's iso UID has group-write. Other iso UIDs do not have
+    # ab-agent-<a> membership, so cross-agent rewrites are blocked at
+    # the group boundary even though every iso UID has --x on the
+    # shared root (for traversal into its OWN subdir).
     _payload_atomic_write(request_path, payload, 0o660)
 
     print(request_uuid)
     return 0
 
 
-def cmd_read_result(staging_dir: str, request_uuid: str) -> int:
-    result_path = Path(staging_dir).expanduser() / f"{request_uuid}.result.json"
+def cmd_read_result(staging_root_arg: str, actor_agent: str, request_uuid: str) -> int:
+    if not _validate_agent_name(actor_agent):
+        sys.stderr.write(f"staging.py read-result: bad actor_agent {actor_agent!r}\n")
+        return 64
+    result_path = Path(staging_root_arg).expanduser() / actor_agent / f"{request_uuid}.result.json"
     if not result_path.is_file():
         return 2
-    sys.stdout.write(result_path.read_text(encoding="utf-8"))
-    if not str(result_path.read_text(encoding="utf-8")).endswith("\n"):
+    body = result_path.read_text(encoding="utf-8")
+    sys.stdout.write(body)
+    if not body.endswith("\n"):
         sys.stdout.write("\n")
     return 0
 
 
-def _staging_files(staging_dir: Path):
-    if not staging_dir.is_dir():
+def _staging_files(agent_dir: Path):
+    if not agent_dir.is_dir():
         return
-    for entry in sorted(staging_dir.iterdir()):
+    for entry in sorted(agent_dir.iterdir()):
         if entry.suffix != ".json":
             continue
         if entry.name.endswith(".result.json"):
@@ -173,30 +231,46 @@ def _staging_files(staging_dir: Path):
         yield entry
 
 
-def cmd_scan_pending(staging_dir: str) -> int:
-    staging_root = Path(staging_dir).expanduser()
+def cmd_scan_pending(staging_root_arg: str) -> int:
+    staging_root = Path(staging_root_arg).expanduser()
     stale_secs = int(os.environ.get("BRIDGE_CRON_STAGING_STALE_SECONDS", "300") or "300")
     now = time.time()
-    for entry in _staging_files(staging_root):
-        request_uuid = entry.stem
-        result_path = staging_root / f"{request_uuid}.result.json"
-        if result_path.exists():
-            # Already applied — caller can skip.
+    if not staging_root.is_dir():
+        return 0
+    for agent_entry in sorted(staging_root.iterdir()):
+        if not agent_entry.is_dir():
             continue
-        try:
-            st = entry.stat()
-        except FileNotFoundError:
+        actor_agent = agent_entry.name
+        if not _validate_agent_name(actor_agent):
+            # Surface an audit-visible hint when the daemon picks up a
+            # subdir name that fails the validator (operator created
+            # it manually, fresh-install drift). We don't emit a
+            # pending row for it.
+            sys.stderr.write(
+                f"staging.py scan-pending: skipping non-conforming agent dir {agent_entry}\n"
+            )
             continue
-        age = max(0, int(now - st.st_mtime))
-        row = {
-            "uuid": request_uuid,
-            "path": str(entry),
-            "owner_uid": int(st.st_uid),
-            "result_path": str(result_path),
-            "mtime_age_seconds": age,
-            "stale": age > stale_secs,
-        }
-        print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+        for entry in _staging_files(agent_entry):
+            request_uuid = entry.stem
+            result_path = agent_entry / f"{request_uuid}.result.json"
+            if result_path.exists():
+                # Already applied — caller can skip.
+                continue
+            try:
+                st = entry.stat()
+            except FileNotFoundError:
+                continue
+            age = max(0, int(now - st.st_mtime))
+            row = {
+                "uuid": request_uuid,
+                "actor_agent": actor_agent,
+                "path": str(entry),
+                "owner_uid": int(st.st_uid),
+                "result_path": str(result_path),
+                "mtime_age_seconds": age,
+                "stale": age > stale_secs,
+            }
+            print(json.dumps(row, ensure_ascii=False, sort_keys=True))
     return 0
 
 
@@ -277,13 +351,30 @@ def _write_result(
     _payload_atomic_write(result_path, payload, 0o660)
 
 
-def cmd_apply(staging_dir: str, request_uuid: str, jobs_file: str) -> int:
+def cmd_apply(
+    staging_root_arg: str,
+    canonical_actor_agent: str,
+    request_uuid: str,
+    jobs_file: str,
+) -> int:
     """Validate + apply the staged mutation. Caller emits audit on the
     audit_action field in the result.
+
+    The caller (daemon) recovers `canonical_actor_agent` from the
+    staging path (dirname). The payload's `actor_agent` field MUST
+    match — a payload that claims to be from agent X but sits in
+    agent Y's subdir is the symptom of a forge attempt or a buggy
+    writer and gets rejected at the actor_agent_mismatch gate.
     """
-    staging_root = Path(staging_dir).expanduser()
-    request_path = staging_root / f"{request_uuid}.json"
-    result_path = staging_root / f"{request_uuid}.result.json"
+    if not _validate_agent_name(canonical_actor_agent):
+        sys.stderr.write(
+            f"staging.py apply: bad actor_agent {canonical_actor_agent!r}\n"
+        )
+        return 64
+    staging_root = Path(staging_root_arg).expanduser()
+    agent_dir = staging_root / canonical_actor_agent
+    request_path = agent_dir / f"{request_uuid}.json"
+    result_path = agent_dir / f"{request_uuid}.result.json"
 
     if not request_path.is_file():
         # Caller raced — surface to stderr but do not bail the whole
@@ -306,7 +397,7 @@ def cmd_apply(staging_dir: str, request_uuid: str, jobs_file: str) -> int:
         _write_result(
             result_path,
             request_uuid,
-            actor_agent="<unparseable>",
+            actor_agent=canonical_actor_agent,
             status="error",
             cron_id=None,
             error=f"unparseable_payload: {exc!r}",
@@ -323,7 +414,7 @@ def cmd_apply(staging_dir: str, request_uuid: str, jobs_file: str) -> int:
         _write_result(
             result_path,
             request_uuid,
-            actor_agent=actor_agent or "<unknown>",
+            actor_agent=canonical_actor_agent,
             status="error",
             cron_id=None,
             error=f"unsupported_schema_version: {payload.get('schema_version')!r}",
@@ -334,10 +425,31 @@ def cmd_apply(staging_dir: str, request_uuid: str, jobs_file: str) -> int:
         _write_result(
             result_path,
             request_uuid,
-            actor_agent="<missing>",
+            actor_agent=canonical_actor_agent,
             status="error",
             cron_id=None,
             error="missing_actor_agent",
+            audit_action="cron_staging_rejected",
+        )
+        return 4
+
+    # Validation 1b (codex r1 #1): payload's actor_agent MUST match the
+    # path-derived canonical actor_agent. The canonical comes from the
+    # dirname of the staging file (`<root>/<actor_agent>/<uuid>.json`)
+    # which the matrix grants exclusively to `ab-agent-<actor_agent>`,
+    # so a payload that lies about the actor field gets rejected here
+    # — protecting against the cross-agent forge path.
+    if actor_agent != canonical_actor_agent:
+        _write_result(
+            result_path,
+            request_uuid,
+            actor_agent=canonical_actor_agent,
+            status="error",
+            cron_id=None,
+            error=(
+                "payload_actor_agent_mismatch: "
+                f"payload={actor_agent!r} dirname={canonical_actor_agent!r}"
+            ),
             audit_action="cron_staging_rejected",
         )
         return 4
@@ -569,39 +681,48 @@ def cmd_apply(staging_dir: str, request_uuid: str, jobs_file: str) -> int:
     return 0
 
 
-def cmd_sweep_stale(staging_dir: str, stale_seconds: str) -> int:
-    staging_root = Path(staging_dir).expanduser()
+def cmd_sweep_stale(staging_root_arg: str, stale_seconds: str) -> int:
+    staging_root = Path(staging_root_arg).expanduser()
     try:
         stale_secs = int(stale_seconds)
     except (TypeError, ValueError):
         stale_secs = 300
     now = time.time()
-    for entry in _staging_files(staging_root):
-        request_uuid = entry.stem
-        result_path = staging_root / f"{request_uuid}.result.json"
-        # Only sweep when there is no result yet — if a result exists,
-        # the iso UID may still be polling. The daemon should clean
-        # those up via a separate retention pass.
-        if result_path.exists():
+    if not staging_root.is_dir():
+        return 0
+    for agent_entry in sorted(staging_root.iterdir()):
+        if not agent_entry.is_dir():
             continue
-        try:
-            age = max(0, int(now - entry.stat().st_mtime))
-        except FileNotFoundError:
+        actor_agent = agent_entry.name
+        if not _validate_agent_name(actor_agent):
             continue
-        if age <= stale_secs:
-            continue
-        row = {
-            "uuid": request_uuid,
-            "path": str(entry),
-            "mtime_age_seconds": age,
-        }
-        try:
-            entry.unlink()
-        except OSError:
-            row["sweep_error"] = "unlink_failed"
-        else:
-            row["swept"] = True
-        print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+        for entry in _staging_files(agent_entry):
+            request_uuid = entry.stem
+            result_path = agent_entry / f"{request_uuid}.result.json"
+            # Only sweep when there is no result yet — if a result
+            # exists, the iso UID may still be polling. The daemon
+            # should clean those up via a separate retention pass.
+            if result_path.exists():
+                continue
+            try:
+                age = max(0, int(now - entry.stat().st_mtime))
+            except FileNotFoundError:
+                continue
+            if age <= stale_secs:
+                continue
+            row = {
+                "uuid": request_uuid,
+                "actor_agent": actor_agent,
+                "path": str(entry),
+                "mtime_age_seconds": age,
+            }
+            try:
+                entry.unlink()
+            except OSError:
+                row["sweep_error"] = "unlink_failed"
+            else:
+                row["swept"] = True
+            print(json.dumps(row, ensure_ascii=False, sort_keys=True))
     return 0
 
 
@@ -611,14 +732,14 @@ def main() -> int:
         return 64
     sub = sys.argv[1]
     args = sys.argv[2:]
-    if sub == "write-request" and len(args) == 2:
-        return cmd_write_request(args[0], args[1])
-    if sub == "read-result" and len(args) == 2:
-        return cmd_read_result(args[0], args[1])
+    if sub == "write-request" and len(args) == 3:
+        return cmd_write_request(args[0], args[1], args[2])
+    if sub == "read-result" and len(args) == 3:
+        return cmd_read_result(args[0], args[1], args[2])
     if sub == "scan-pending" and len(args) == 1:
         return cmd_scan_pending(args[0])
-    if sub == "apply" and len(args) == 3:
-        return cmd_apply(args[0], args[1], args[2])
+    if sub == "apply" and len(args) == 4:
+        return cmd_apply(args[0], args[1], args[2], args[3])
     if sub == "sweep-stale" and len(args) == 2:
         return cmd_sweep_stale(args[0], args[1])
     sys.stderr.write(f"staging.py: unsupported subcommand or arity: {sub} {args}\n")

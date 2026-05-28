@@ -461,9 +461,12 @@ PY
   local payload_json_body
   payload_json_body="$(cat "$_payload_json_tmp")"
 
+  local actor_agent="${BRIDGE_AGENT_ID:-}"
+  [[ -n "$actor_agent" ]] || bridge_die "BRIDGE_AGENT_ID unset; cannot route iso cron create"
+
   local request_uuid
   if ! request_uuid="$(python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/staging.py" \
-        write-request "$staging_dir" "$payload_json_body")"; then
+        write-request "$staging_dir" "$actor_agent" "$payload_json_body")"; then
     bridge_die "cron-staging write-request failed (BRIDGE_CRON_STAGING_DIR=$staging_dir)"
   fi
   request_uuid="${request_uuid%%$'\n'*}"
@@ -482,7 +485,7 @@ PY
   local timeout="${BRIDGE_CRON_STAGING_TIMEOUT_SECONDS:-30}"
   [[ "$interval" =~ ^[0-9]+$ ]] || interval=1
   [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=30
-  local result_path="$staging_dir/${request_uuid}.result.json"
+  local result_path="$staging_dir/$actor_agent/${request_uuid}.result.json"
   while (( elapsed < timeout )); do
     if [[ -f "$result_path" ]]; then
       break
@@ -494,8 +497,8 @@ PY
   if [[ ! -f "$result_path" ]]; then
     printf 'error: cron-staging timed out after %ss waiting for daemon to apply %s\n' \
       "$timeout" "$request_uuid" >&2
-    printf '       (daemon may be down; staging file: %s/%s.json)\n' \
-      "$staging_dir" "$request_uuid" >&2
+    printf '       (daemon may be down; staging file: %s/%s/%s.json)\n' \
+      "$staging_dir" "$actor_agent" "$request_uuid" >&2
     return 4
   fi
 
