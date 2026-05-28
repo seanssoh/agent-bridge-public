@@ -429,6 +429,31 @@ class HandoffHandler(BaseHTTPRequestHandler):
             self._reply(401, {"ok": False, "error": "body hash mismatch"})
             return
 
+        # #1346 (PR r2): HMAC verification is the auth boundary and MUST run
+        # BEFORE any timestamp-band classification. Verifying timestamp first
+        # leaks an unauthenticated "transient vs permanent" 503/401 split to
+        # any caller — an attacker who supplies a bad signature with a
+        # drift-band timestamp would receive 503 (retryable) instead of the
+        # 401 their unauthenticated request deserves. That is auth fail-open:
+        # the receiver classifies forged traffic as "retry later" instead of
+        # rejecting it outright. By verifying the HMAC first we collapse all
+        # unauthenticated responses to 401 regardless of timestamp value, and
+        # only authenticated requests reach the drift / replay-window
+        # classification below. `verify_signature` uses `hmac.compare_digest`
+        # internally so this remains a constant-time comparison even with
+        # the new placement (Sean directive: don't leak signature validity
+        # via early-return timing).
+        canonical = a2a.canonical_string(
+            "POST", self.path, peer_id, message_id, timestamp, computed_hash)
+        if not a2a.verify_signature(secrets, canonical, signature):
+            audit("reject_bad_signature", peer=peer_id, client=client_ip,
+                  message_id=message_id, security=True)
+            self._reply(401, {"ok": False, "error": "signature verification failed"})
+            return
+
+        # Signature is authentic past this point. Now classify the
+        # timestamp delta — drift band returns 503 (sender retries after
+        # clock-sync), beyond grace returns 401 (replay defense).
         skew = int(cfg.get("timestamp_skew_seconds", a2a.DEFAULT_TIMESTAMP_SKEW_SECONDS))
         # #1326: timestamps inside (skew, grace_skew] are treated as
         # transient clock drift (503 + Retry-After). Beyond grace_skew the
@@ -449,6 +474,8 @@ class HandoffHandler(BaseHTTPRequestHandler):
         try:
             req_ts = int(timestamp)
         except (TypeError, ValueError):
+            # A signed-but-unparseable timestamp is a protocol violation by
+            # the sender. Permanent 401 — clients should not retry blindly.
             audit("reject_bad_timestamp", peer=peer_id, client=client_ip, security=True)
             self._reply(401, {"ok": False, "error": "bad timestamp"})
             return
@@ -494,14 +521,6 @@ class HandoffHandler(BaseHTTPRequestHandler):
                 # has stayed put and the next attempt will still 503.
                 extra_headers={"Retry-After": str(max(1, skew))},
             )
-            return
-
-        canonical = a2a.canonical_string(
-            "POST", self.path, peer_id, message_id, timestamp, computed_hash)
-        if not a2a.verify_signature(secrets, canonical, signature):
-            audit("reject_bad_signature", peer=peer_id, client=client_ip,
-                  message_id=message_id, security=True)
-            self._reply(401, {"ok": False, "error": "signature verification failed"})
             return
 
         # --- parse envelope ---

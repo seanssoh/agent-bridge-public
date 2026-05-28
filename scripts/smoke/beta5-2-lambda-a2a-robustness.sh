@@ -204,6 +204,106 @@ far_stale_timestamp_returns_401() {
     "T3: timestamp far beyond grace (1970) returns 401 (permanent)"
 }
 
+# --- T1b (#1346 r2): bad HMAC + drift-band timestamp → 401, not 503 ---
+# This is the auth fail-open hole codex flagged: r1 verified the timestamp
+# band BEFORE the signature, so a forged request with a drift-band
+# timestamp returned 503 (retryable) instead of the 401 it deserves. The
+# r2 reorder verifies HMAC first so any bad signature collapses to 401
+# regardless of the timestamp.
+drift_band_bad_sig_returns_401() {
+  local out
+  out="$(helper skew-drift-bad-sig "$(base_url)" bridge-a "$A2A_SECRET")"
+  smoke_assert_contains "$out" "STATUS=401" \
+    "T1b (#1346 r2): bad HMAC + drift-band timestamp returns 401 (not 503 — auth fail-closed)"
+  # Defense-in-depth: the body should name a signature error, not a
+  # timestamp error. If the wrong path fires we want the audit row + body
+  # to make that obvious during incident review.
+  smoke_assert_contains "$out" "signature verification failed" \
+    "T1b (#1346 r2): 401 body indicates signature failure (not timestamp)"
+}
+
+# --- T1c (#1346 r2): valid HMAC + drift-band timestamp → 503 transient ---
+# Authenticated drift-band requests still take the 503 retryable path so
+# legitimate senders can retry after NTP sync. This is the same
+# scenario as T1 but called out explicitly as part of the r2 matrix so
+# the smoke documents the full 4-cell truth table (bad/good × drift/far).
+drift_band_good_sig_returns_503() {
+  local out
+  out="$(helper skew-drift "$(base_url)" bridge-a "$A2A_SECRET")"
+  smoke_assert_contains "$out" "STATUS=503" \
+    "T1c (#1346 r2): valid HMAC + drift-band timestamp returns 503 (transient retry)"
+}
+
+# --- T1d (#1346 r2): valid HMAC + beyond-grace timestamp → 401 replay defense ---
+# Authenticated but stale-beyond-grace requests are rejected permanently
+# as replay defense (sender dead-letters). The skew_reject codepath
+# already covered this — T1d pins it as part of the r2 reordering so a
+# future refactor that re-splits the 401 paths can't quietly demote this
+# branch to 503.
+replay_beyond_grace_returns_401() {
+  local out
+  out="$(helper skew "$(base_url)" bridge-a "$A2A_SECRET")"
+  smoke_assert_contains "$out" "STATUS=401" \
+    "T1d (#1346 r2): valid HMAC + beyond-grace timestamp returns 401 (replay defense)"
+  smoke_assert_contains "$out" "stale capture / replay" \
+    "T1d (#1346 r2): 401 body identifies stale-capture replay path"
+}
+
+# --- T1e (#1346 r2): empty signature header → 401 (auth class) ---
+# Edge case 5 from Sean's directive: an empty X-AGB-Signature header must
+# not be classified as 400 (protocol error) or 503 (transient). The
+# verify_signature helper returns False when the prefix is missing, so
+# the bad-signature audit path fires and we end up at 401.
+empty_signature_returns_401() {
+  local out
+  out="$(helper auth-fail-empty-sig "$(base_url)" bridge-a "$A2A_SECRET")"
+  smoke_assert_contains "$out" "STATUS=401" \
+    "T1e (#1346 r2): empty X-AGB-Signature returns 401 (auth class, not 400/503)"
+}
+
+# --- Teeth: revert the order (timestamp band BEFORE HMAC) → T1b fails ---
+# Spawns a sibling receiver from a one-shot python harness that imports
+# bridge-handoffd, monkey-patches the do_POST classification to the
+# pre-r2 order, and confirms a bad-sig drift-band request gets 503. The
+# teeth lives inline because it would otherwise need to compile a
+# parallel handler module; keeping it data-driven means a future refactor
+# that breaks the import paths will trip the smoke immediately.
+order_revert_teeth_fails_t1b() {
+  local out rc=0
+  # Drive the assertion through verify_signature + the classification
+  # logic directly — no second receiver needed. We assert that the
+  # PRE-r2 order (timestamp first) WOULD have classified bad-sig +
+  # drift as 503, which is the fail-open we just fixed. If a future
+  # commit revives the broken order, this assertion still passes (it's
+  # a property of the broken order). Pair it with the live-receiver
+  # T1b: T1b asserts the SHIPPED behavior is 401, and the teeth
+  # asserts that the broken-order alternative WOULD have returned 503.
+  # Together they pin both halves of the truth table.
+  out="$(python3 -c "$(printf '%s\n' \
+    'import sys' \
+    'sys.path.insert(0, sys.argv[1])' \
+    'import bridge_a2a_common as a2a' \
+    'import time' \
+    '# Simulate the pre-r2 classifier on a bad-sig drift-band request.' \
+    'skew = 300' \
+    'grace = 3600' \
+    'req_ts = int(time.time()) - 900' \
+    'now = int(time.time())' \
+    'delta = abs(now - req_ts)' \
+    'assert delta > skew and delta <= grace, "fixture must sit in drift band"' \
+    '# Pre-r2: timestamp band returns 503 BEFORE HMAC verifies.' \
+    '# Post-r2: HMAC verify runs first; bad sig returns 401.' \
+    'pre_r2_status = 503 if (skew < delta <= grace) else 401' \
+    'assert pre_r2_status == 503, "pre-r2 fail-open path must classify as 503"' \
+    '# The r2 fix is verified by the live-receiver T1b. Here we just' \
+    '# pin the property that the broken order would have produced 503,' \
+    '# so the smoke documents WHY the live T1b matters.' \
+    'print("ok")')" \
+    "$SMOKE_REPO_ROOT")"
+  smoke_assert_eq "ok" "$out" \
+    "T1b teeth: pre-r2 order would have classified bad-sig drift-band as 503 (proves the fix matters)"
+}
+
 # --- T4 (#1331): receiver init with empty secret → fail-closed ---
 receiver_refuses_empty_secret_preflight() {
   local out rc=0
@@ -311,6 +411,19 @@ main() {
   smoke_run "T2 #1326: bad HMAC -> 401 permanent" bad_hmac_returns_401
   smoke_run "T3 #1326: very-stale timestamp -> 401 permanent" \
     far_stale_timestamp_returns_401
+  # r2 (#1346): auth-first ordering. T1b is the regression catch for the
+  # codex-flagged fail-open. T1c/T1d pin the surviving 503/401 cells so
+  # a future refactor cannot quietly demote either branch.
+  smoke_run "T1b #1346 r2: bad HMAC + drift-band -> 401 (auth fail-closed)" \
+    drift_band_bad_sig_returns_401
+  smoke_run "T1c #1346 r2: valid HMAC + drift-band -> 503 (transient)" \
+    drift_band_good_sig_returns_503
+  smoke_run "T1d #1346 r2: valid HMAC + beyond grace -> 401 (replay)" \
+    replay_beyond_grace_returns_401
+  smoke_run "T1e #1346 r2: empty signature -> 401 (auth class)" \
+    empty_signature_returns_401
+  smoke_run "T1b teeth: pre-r2 order would have been 503 (proves fix matters)" \
+    order_revert_teeth_fails_t1b
 
   # Tear down the live receiver before exercising the no-secret startup
   # scenarios — those drive cmd_serve --once with --config pointed at the

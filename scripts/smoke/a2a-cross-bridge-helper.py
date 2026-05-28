@@ -180,6 +180,55 @@ def main(argv: list[str]) -> int:
         env = envelope("bridge-a:skew-drift-1", "reviewer", "drift", "x")
         status, text = post(url=url, path=path, peer_id=peer_id, secret=secret,
                              envelope=env, timestamp_override=drift_ts)
+    elif scenario == "skew-drift-bad-sig":
+        # #1346 (PR r2): bad HMAC signature with a drift-band timestamp
+        # MUST return 401 (auth fail-closed), not 503 (transient). The
+        # previous ordering verified the timestamp band first and would
+        # 503 a forged signature, letting the attacker keep retrying.
+        import time as _t
+        drift_ts = str(int(_t.time()) - 900)
+        env = envelope("bridge-a:skew-drift-bad-sig-1", "reviewer",
+                       "drift bad sig", "x")
+        status, text = post(url=url, path=path, peer_id=peer_id, secret=secret,
+                             envelope=env, bad_signature=True,
+                             timestamp_override=drift_ts)
+    elif scenario == "skew-far-bad-sig":
+        # #1346 (PR r2): bad HMAC + far-stale timestamp (beyond grace) is
+        # 401 either way today, but pin it explicitly so the smoke catches
+        # a regression where a refactor split the two 401 paths into
+        # different status codes.
+        env = envelope("bridge-a:skew-far-bad-sig-1", "reviewer",
+                       "far stale bad sig", "x")
+        status, text = post(url=url, path=path, peer_id=peer_id, secret=secret,
+                             envelope=env, bad_signature=True,
+                             timestamp_override="100")
+    elif scenario == "auth-fail-empty-sig":
+        # #1346 (PR r2): empty X-AGB-Signature header must classify as 401
+        # (auth class) — verify_signature returns False on missing prefix,
+        # so the bad-signature audit path fires regardless of timestamp.
+        env = envelope("bridge-a:auth-fail-empty-sig-1", "reviewer",
+                       "empty sig", "x")
+        # Compose a request with an empty signature header by abusing
+        # bad_signature plus a manual override.
+        body = json.dumps(env, ensure_ascii=False).encode("utf-8")
+        message_id = env["message_id"]
+        timestamp = str(a2a.now_ts())
+        body_hash = a2a.body_sha256(body)
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("X-AGB-Protocol", a2a.PROTOCOL_VERSION)
+        req.add_header("X-AGB-Peer", peer_id)
+        req.add_header("X-AGB-Message-Id", message_id)
+        req.add_header("X-AGB-Timestamp", timestamp)
+        req.add_header("X-AGB-Body-SHA256", body_hash)
+        req.add_header("X-AGB-Signature", "")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                status, text = resp.status, resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            status, text = exc.code, (exc.read() or b"").decode("utf-8", "replace")
+        except urllib.error.URLError as exc:
+            status, text = -1, str(exc)
     else:
         print(f"unknown scenario: {scenario}", file=sys.stderr)
         return 2
