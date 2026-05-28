@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import grp
 import hashlib
 import json
 import os
@@ -217,6 +218,118 @@ def _isolation_aware_save_json(path: Path, payload: Any, mode: int = 0o600) -> N
         )
 
 
+def _iso_v2_effective_host() -> bool:
+    """Return True iff the host is iso-v2 effective right now.
+
+    Mirrors `_bridge_isolation_discriminator_primitives_ready` in
+    lib/bridge-isolation-discriminator.sh — the canonical v2 primitives-
+    ready signal is the existence of the `ab-shared` POSIX group, which
+    `agent-bridge migrate isolation v2 --apply` creates and which is
+    absent on:
+      * macOS dev hosts (v2 is a no-op there per the discriminator).
+      * Linux fresh installs that have not yet run v2 migrate.
+      * Any host where the operator explicitly disabled isolation.
+
+    The optional `BRIDGE_ISO_V2_EFFECTIVE_OVERRIDE` env hook lets the
+    smoke harness synth-iso2 the host without provisioning real POSIX
+    groups; values `yes` / `1` / `true` force True, `no` / `0` / `false`
+    force False, anything else falls through to the group probe. The
+    override exists only for unit smokes and is intentionally not
+    documented as a public knob.
+
+    Returns False on non-Linux to match the bash discriminator's
+    auto-resolve. A False return is the safe default: the caller skips
+    any cred-mutation entirely and the file stays at controller-owned
+    0600 (correct posture on a non-iso host).
+    """
+    override = os.environ.get("BRIDGE_ISO_V2_EFFECTIVE_OVERRIDE", "").strip().lower()
+    if override in {"yes", "1", "true"}:
+        return True
+    if override in {"no", "0", "false"}:
+        return False
+    if sys.platform != "linux":
+        return False
+    shared_group = os.environ.get("BRIDGE_SHARED_GROUP", "").strip() or "ab-shared"
+    try:
+        grp.getgrnam(shared_group)
+    except KeyError:
+        return False
+    except OSError:
+        # /etc/group unreadable / NSS service down — conservative skip.
+        return False
+    return True
+
+
+def _audit_normalize_skipped(
+    path: Path,
+    agent: str,
+    reason: str,
+    group: str | None = None,
+    *,
+    rc: int | None = None,
+    stderr: str | None = None,
+) -> None:
+    """Best-effort audit emission for a channel-cred normalize skip.
+
+    Routes through `bridge-audit.py write` so the row joins the hash
+    chain alongside `cron.*` / `daemon.*` rows. Mirrors the silent-
+    failure contract documented in `bridge-cron.py:emit_cron_mutation_audit`
+    — a failed audit write NEVER raises out of this helper, because we
+    are sitting on the post-write security path and an audit hiccup
+    must not flip the file's mode.
+
+    `reason` is one of `non_iso_v2_host` / `group_missing` /
+    `chgrp_failed`. The detail payload records the path, agent, group
+    name (where resolved), and chgrp rc / stderr (where applicable) so
+    an operator triaging "iso UID cannot read .teams/.env" has a
+    machine-readable trail.
+    """
+    try:
+        audit_path_str = os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+        if not audit_path_str:
+            log_dir = os.environ.get("BRIDGE_LOG_DIR", "").strip()
+            if log_dir:
+                audit_path_str = str(Path(log_dir).expanduser() / "audit.jsonl")
+            else:
+                home = os.environ.get("BRIDGE_HOME", "").strip()
+                if home:
+                    audit_path_str = str(Path(home).expanduser() / "logs" / "audit.jsonl")
+        if not audit_path_str:
+            return
+        actor = os.environ.get("BRIDGE_AGENT_ID", "").strip() \
+            or os.environ.get("USER", "").strip() \
+            or "unknown"
+        detail = {
+            "path": str(path),
+            "agent": agent,
+            "reason": reason,
+        }
+        if group is not None:
+            detail["group"] = group
+        if rc is not None:
+            detail["rc"] = rc
+        if stderr:
+            detail["stderr"] = stderr[:200]
+        audit_script = Path(__file__).resolve().parent / "bridge-audit.py"
+        if not audit_script.exists():
+            return
+        subprocess.run(
+            [
+                sys.executable,
+                str(audit_script),
+                "write",
+                "--file", audit_path_str,
+                "--actor", actor,
+                "--action", "channel_cred_normalize_skipped",
+                "--target", agent,
+                "--detail-json", json.dumps(detail, ensure_ascii=True, sort_keys=True),
+            ],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return
+
+
 def _post_write_normalize_channel_cred_group(path: Path, agent: str | None) -> None:
     """Post-write normalization for channel credential files (#1329, Lane μ M6).
 
@@ -238,17 +351,38 @@ def _post_write_normalize_channel_cred_group(path: Path, agent: str | None) -> N
         explicitly chose 0640 NOT 0644 — narrowest grant that lets the
         iso UID read via group, no world-read widening.
 
+    Security contract (r2, codex r1 BLOCKING):
+
+      The chmod 0640 widening is only safe AFTER a successful chgrp to
+      the per-agent `ab-agent-<a>` group. If chgrp fails — because the
+      host is not iso-v2 effective, the agent group does not exist
+      yet, the controller is not a supplementary member of it, or any
+      other ENOENT/EPERM — running chmod 0640 alone would widen secrets
+      to the controller's primary group (`staff` on macOS dev hosts,
+      a per-user group on Linux, etc.). r2 enforces strict gating:
+
+        1. iso-v2 effective host (`ab-shared` group exists) — else skip.
+        2. `ab-agent-<a>` group resolvable AND exists on host — else
+           audit skip + return WITHOUT chmod.
+        3. chgrp returncode is 0 — else audit skip + return WITHOUT chmod.
+
+      Any gate failure leaves the file at its prior mode (caller wrote
+      it at 0600). The controller-side fallback fileset on a non-iso-v2
+      install therefore stays at 0600, matching the controller-only
+      threat model on that host class.
+
     No-op on:
-      * non-iso hosts (`_v2_agent_group_name` returns None).
-      * shared-mode agents (same).
+      * non-iso-v2 hosts (no `ab-shared` group).
+      * shared-mode agents (no `ab-agent-<a>` group).
       * `agent` arg missing.
       * file missing.
 
-    Failures are silently swallowed — the upgrade-time backfill in
+    Failures past the gates (chmod errors after a successful chgrp) are
+    silently swallowed — the upgrade-time backfill in
     `bridge_isolation_v2_normalize_workdir_profile_group`
     (lib/bridge-isolation-v2.sh) is the second-line catch-all, so a
-    transient chgrp/chmod failure here does not leave the operator
-    blocked. The contract here is best-effort write-time freshness.
+    transient chmod failure here does not leave the operator blocked.
+    The contract here is best-effort write-time freshness.
     """
     try:
         if agent is None:
@@ -257,18 +391,47 @@ def _post_write_normalize_channel_cred_group(path: Path, agent: str | None) -> N
             return
         if not path.exists():
             return
+        # Gate 1: iso-v2 effective host. Skipping here leaves the file
+        # at its caller-written 0600 — correct posture on non-iso-v2.
+        if not _iso_v2_effective_host():
+            return
         group = _v2_agent_group_name(agent)
         if not group:
             return
-        # Best-effort chgrp + chmod. Both can fail when the controller
-        # is not a member of the agent group yet (rolling upgrade
-        # window) — the v2 reapply / upgrade backfill is the recovery
-        # path. Swallow rc != 0 so callers never abort a setup flow
-        # over a normalize miss.
-        subprocess.run(
+        # Gate 2: target ab-agent-<a> group must exist on host. Without
+        # it `chgrp` would either fail or — worse, on platforms that
+        # tolerate a name-to-gid miss — leave the file at the controller
+        # primary group, and the subsequent chmod 0640 would widen
+        # secrets. Skip + audit.
+        try:
+            grp.getgrnam(group)
+        except KeyError:
+            _audit_normalize_skipped(path, agent, "group_missing", group)
+            return
+        except OSError as exc:
+            _audit_normalize_skipped(
+                path, agent, "group_lookup_oserror", group,
+                stderr=str(exc),
+            )
+            return
+        # Gate 3: chgrp must succeed before any chmod widening. A
+        # failed chgrp here is the codex r1 BLOCKING case — running
+        # chmod 0640 alone would widen secrets to the controller's
+        # primary group (e.g. `staff` on macOS / `<user>` on Linux).
+        proc = subprocess.run(
             ["chgrp", group, str(path)],
             check=False, capture_output=True, text=True, timeout=5,
         )
+        if proc.returncode != 0:
+            _audit_normalize_skipped(
+                path, agent, "chgrp_failed", group,
+                rc=proc.returncode,
+                stderr=(proc.stderr or "").strip(),
+            )
+            return
+        # chgrp landed `ab-agent-<a>` — safe to widen mode to 0640.
+        # chmod failure here is non-fatal; the v2 upgrade backfill
+        # picks it up on the next reapply pass.
         subprocess.run(
             ["chmod", "0640", str(path)],
             check=False, capture_output=True, text=True, timeout=5,

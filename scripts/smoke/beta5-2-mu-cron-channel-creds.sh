@@ -360,6 +360,146 @@ for handler in cmd_discord cmd_telegram cmd_teams cmd_ms365 cmd_mattermost; do
 done
 
 # ---------------------------------------------------------------------
+# T6b / T6c (R2, codex r1 BLOCKING security) — exercise
+# `_post_write_normalize_channel_cred_group` directly through a Python
+# harness and assert the file mode is UNCHANGED at 0600 when:
+#
+#   T6b  non-iso-v2 host (no `ab-shared` group) → gate 1 trips, no
+#        mutation. The 0600 default is the correct posture there.
+#   T6c  iso-v2 effective host with the per-agent `ab-agent-<X>` group
+#        missing (agent not yet provisioned) → gate 2 trips, audit row
+#        emitted, no mutation.
+#
+# Both cases use the `BRIDGE_ISO_V2_EFFECTIVE_OVERRIDE` env hook so the
+# smoke does not require real POSIX groups. The pre-r2 codepath wrote
+# `chgrp` then unconditional `chmod 0640` — the regression check below
+# is the same shape codex used to demonstrate the original BLOCKING.
+#
+# T_teeth security: revert the gate (override=yes + an agent whose
+# resolved group name doesn't exist anywhere on host) and confirm the
+# helper at HEAD still refuses to widen. If the future refactor drops
+# the group_exists check, the teeth case files at 0640.
+# ---------------------------------------------------------------------
+T6BC_HARNESS="$SMOKE_TMP_ROOT/t6bc-normalize.py"
+cat >"$T6BC_HARNESS" <<'PY'
+"""Direct call into bridge-setup.py:_post_write_normalize_channel_cred_group.
+
+Invoked from the smoke fixture with three argv slots:
+  argv[1]  REPO_ROOT  — path to checkout root (bridge-setup.py lives at root).
+  argv[2]  PATH       — channel cred file to normalize. Pre-seeded by caller
+                        at mode 0600.
+  argv[3]  AGENT      — agent name passed to the helper.
+
+The helper writes nothing on a gate trip; the caller asserts the file is
+still at 0600 and (for T6c) that an audit row was emitted.
+"""
+import importlib.util
+import os
+import stat
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+target = Path(sys.argv[2])
+agent = sys.argv[3]
+
+spec = importlib.util.spec_from_file_location("bridge_setup", repo / "bridge-setup.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+before = stat.S_IMODE(target.lstat().st_mode)
+module._post_write_normalize_channel_cred_group(target, agent)
+after = stat.S_IMODE(target.lstat().st_mode)
+print(f"BEFORE={before:04o} AFTER={after:04o}")
+PY
+
+t6_normalize_run() {
+  # $1: label, $2: override (yes/no/empty), $3: agent name, $4: expected mode
+  # ($5: optional extra env in `KEY=val KEY=val` form).
+  local label="$1"
+  local override="$2"
+  local agent="$3"
+  local expected="$4"
+  local extra_env="${5:-}"
+  local target="$SMOKE_TMP_ROOT/${label}-cred.env"
+  local audit_log="$SMOKE_TMP_ROOT/${label}-audit.jsonl"
+  : >"$audit_log"
+  printf 'TOKEN=redacted\n' >"$target"
+  chmod 0600 "$target"
+  local before_mode
+  before_mode="$(stat -f '%Lp' "$target" 2>/dev/null || stat -c '%a' "$target")"
+  if [[ "$before_mode" != "600" ]]; then
+    smoke_fail "${label}: precondition file mode=${before_mode} expected 600"
+  fi
+  local override_env=()
+  if [[ -n "$override" ]]; then
+    override_env=("BRIDGE_ISO_V2_EFFECTIVE_OVERRIDE=${override}")
+  fi
+  # shellcheck disable=SC2086  # intentional word-split on extra_env
+  env -i HOME="$HOME" PATH="$PATH" \
+    BRIDGE_AUDIT_LOG="$audit_log" \
+    "${override_env[@]}" \
+    $extra_env \
+    python3 "$T6BC_HARNESS" "$REPO_ROOT" "$target" "$agent" \
+    >"$SMOKE_TMP_ROOT/${label}.out" 2>&1
+  local rc=$?
+  if (( rc != 0 )); then
+    smoke_fail "${label}: harness rc=${rc} out=$(cat "$SMOKE_TMP_ROOT/${label}.out")"
+  fi
+  local after_mode
+  after_mode="$(stat -f '%Lp' "$target" 2>/dev/null || stat -c '%a' "$target")"
+  if [[ "$after_mode" != "$expected" ]]; then
+    smoke_fail "${label}: file mode=${after_mode} expected=${expected} (file widened — codex r1 BLOCKING regression)"
+  fi
+  echo "$audit_log"
+}
+
+# T6b: non-iso-v2 host (override=no) → gate 1, file STAYS 0600, no audit.
+T6B_AUDIT="$(t6_normalize_run "t6b-noniso" "no" "samplenoniso" "600")"
+if [[ -s "$T6B_AUDIT" ]]; then
+  # Gate 1 returns early before audit; an audit row would indicate the
+  # gate ran AFTER the chgrp path which is the exact BLOCKING shape.
+  smoke_fail "T6b: unexpected audit emission on non-iso-v2 skip (audit=$(cat "$T6B_AUDIT"))"
+fi
+smoke_log "ok: T6b non-iso-v2 host: file UNCHANGED at 0600"
+
+# T6c: iso-v2 effective (override=yes) but the resolved `ab-agent-<a>`
+# group does not exist on host (random uuid-style agent name guarantees
+# no collision with a real provisioned group) → gate 2, audit row
+# `channel_cred_normalize_skipped` with reason=group_missing.
+T6C_AGENT="t6c$(date +%s)abc"
+T6C_AUDIT="$(t6_normalize_run "t6c-isomissing" "yes" "$T6C_AGENT" "600")"
+if [[ ! -s "$T6C_AUDIT" ]]; then
+  smoke_fail "T6c: missing audit row on iso-v2 + group-missing skip"
+fi
+if ! grep -q 'channel_cred_normalize_skipped' "$T6C_AUDIT"; then
+  smoke_fail "T6c: audit row missing channel_cred_normalize_skipped action (audit=$(cat "$T6C_AUDIT"))"
+fi
+if ! grep -q '"reason": "group_missing"\|"reason":"group_missing"' "$T6C_AUDIT"; then
+  smoke_fail "T6c: audit row missing reason=group_missing (audit=$(cat "$T6C_AUDIT"))"
+fi
+smoke_log "ok: T6c iso-v2 host + group missing: file UNCHANGED at 0600 + audit emitted"
+
+# T_teeth (security): revert the post-r2 gate by stripping the source
+# of the iso-v2 + group_exists checks, then re-run with override=yes +
+# nonexistent agent. The pre-r2 codepath chmod-widened to 0640 here.
+# This teeth is a source-level grep: any HEAD that lacks BOTH the
+# `_iso_v2_effective_host()` guard AND the `grp.getgrnam(group)`
+# probe in `_post_write_normalize_channel_cred_group` would re-introduce
+# the BLOCKING shape.
+smoke_run "T6.teeth.r2: _iso_v2_effective_host gate present" \
+  smoke_assert_grep_found "$REPO_ROOT/bridge-setup.py" 'if not _iso_v2_effective_host\(\):' \
+  "bridge-setup.py: r2 iso-v2 effective gate stripped — chmod-widen regression"
+
+smoke_run "T6.teeth.r2: grp.getgrnam group_exists probe present" \
+  smoke_assert_grep_found "$REPO_ROOT/bridge-setup.py" 'grp\.getgrnam\(group\)' \
+  "bridge-setup.py: r2 group_exists probe stripped — chmod-widen regression"
+
+smoke_run "T6.teeth.r2: chgrp rc gate guards chmod" \
+  smoke_assert_grep_found "$REPO_ROOT/bridge-setup.py" 'proc\.returncode != 0' \
+  "bridge-setup.py: r2 chgrp-rc gate stripped — chmod can widen on chgrp failure"
+
+# ---------------------------------------------------------------------
 # Bash syntax check on the modified files (defense in depth — the
 # project-level `bash -n` smoke also covers this but a per-PR smoke
 # saves a round trip).
@@ -375,4 +515,3 @@ smoke_log "ALL OK"
 # helpers used above (defined here to keep the test plan readable above)
 # ---------------------------------------------------------------------
 :
-
