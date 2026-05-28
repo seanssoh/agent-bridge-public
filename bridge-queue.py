@@ -2155,15 +2155,45 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
             )
 
         # --- Compute idle agents (used by both cron dedup and stale requeue) ---
+        # Issue #1345 r2 (Lane κ v0.15.0-beta5-2, codex r1 BLOCKING):
+        # exclude `picker_blocked` and `working` agents from the idle
+        # set. Before the fix, the gate was active + session_activity_ts
+        # age only. A picker_blocked agent (claude rate-limit / summary
+        # picker) typically has tmux activity_ts aged past
+        # --idle-threshold (the picker dialog itself does not refresh
+        # the activity_ts), so the stale-claim requeue at :2242-2285
+        # below wrongly requeued the agent's claimed task with the note
+        # "claimed for >Ns by idle agent". The agent then re-claimed
+        # the requeued task on its next wake — burning a tool turn for
+        # nothing. The daemon-step snapshot writer
+        # (lib/bridge-state.sh:bridge_write_agent_snapshot) now emits
+        # `activity_state="picker_blocked"` for agents matching the
+        # stall.env predicate. `working` is included defensively: it
+        # is not currently emitted by the daemon-step writer (only
+        # the roster/status writer computes it via a tmux capture),
+        # but if a future change pulls the full classification into
+        # the daemon path, the exclusion stays correct.
+        #
+        # Backwards compat: legacy snapshots without the
+        # `activity_state` column return "" from .get(), which is not
+        # in the exclusion set — preserves pre-fix idle classification
+        # for the upgrade window between the bash + python halves.
         max_claim_age = int(getattr(args, "max_claim_age", 900))
         idle_agents = set()
         active_agents = set()
+        _idle_excluded_states = {"picker_blocked", "working"}
         for row in snapshot_rows:
             active = 1 if str(row.get("active", "0")) == "1" else 0
             activity_ts = int(row.get("session_activity_ts") or 0)
+            activity_state = str(row.get("activity_state") or "")
             if active:
                 active_agents.add(str(row["agent"]))
-            if active and activity_ts and current_ts - activity_ts >= idle_threshold:
+            if (
+                active
+                and activity_ts
+                and current_ts - activity_ts >= idle_threshold
+                and activity_state not in _idle_excluded_states
+            ):
                 idle_agents.add(str(row["agent"]))
 
         # --- Cron-dispatch dedup ---

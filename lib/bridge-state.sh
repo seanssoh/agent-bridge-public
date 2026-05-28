@@ -2758,6 +2758,50 @@ bridge_agent_stall_state_file() {
   printf '%s/stall.env' "$(bridge_agent_runtime_state_dir "$agent")"
 }
 
+# Issue #1319 (Lane κ v0.15.0-beta5-2): expose the "is this agent currently
+# blocked on an interactive picker?" predicate for the activity_state
+# resolvers in `bridge_write_roster_status_snapshot` (daemon snapshot
+# writer) and `bridge_agent_activity_state` (CLI / `agb agent show`).
+#
+# The daemon writes `STALL_ACTIVE_CLASSIFICATION=interactive_picker` to
+# `stall.env` (`bridge_note_stall_state` in bridge-daemon.sh) when
+# `bridge-stall.py` detects the rate-limit / summary picker pattern. The
+# matching `bridge_clear_stall_state` rm's the file on recovery, so the
+# predicate naturally returns false again once the picker is resolved —
+# no explicit transition handling required at the call sites.
+#
+# Returns 0 (true) when the file exists AND the classification is
+# `interactive_picker`. Read uses a grep + parameter-expansion split to
+# avoid `source`ing the file (the stall.env carries values already
+# wrapped by `printf %q`, and source-ing it from inside a function would
+# leak STALL_* into the caller scope — the existing daemon path already
+# does that under controlled conditions; the read path here is for
+# status emit only and must stay leak-free).
+#
+# Returns 1 (false) otherwise — file missing, classification empty,
+# classification != interactive_picker, or read failure.
+bridge_agent_picker_blocked() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  local state_file
+  state_file="$(bridge_agent_stall_state_file "$agent" 2>/dev/null)"
+  [[ -n "$state_file" && -f "$state_file" ]] || return 1
+  local line classification=""
+  # Grep the line, strip the `STALL_ACTIVE_CLASSIFICATION=` prefix, then
+  # let bash unquote (the writer used `printf %q`, so a bare bareword
+  # like `interactive_picker` shows up literal; quoted forms like
+  # `''\''X'\'''` would round-trip via eval but `interactive_picker`
+  # has no shell-meta and is safe to compare literally).
+  line="$(grep -m1 '^STALL_ACTIVE_CLASSIFICATION=' "$state_file" 2>/dev/null || true)"
+  [[ -n "$line" ]] || return 1
+  classification="${line#STALL_ACTIVE_CLASSIFICATION=}"
+  # Strip any leading/trailing single quotes from `printf %q` output.
+  classification="${classification#\'}"
+  classification="${classification%\'}"
+  [[ "$classification" == "interactive_picker" ]] || return 1
+  return 0
+}
+
 bridge_agent_stall_report_file() {
   local agent="$1"
   local classification="${2:-unknown}"
@@ -4141,20 +4185,49 @@ bridge_write_agent_snapshot() {
   local prompt_ready_session
   local prompt_ready_source
   local prompt_ready_file
+  local activity_state
 
   {
     # Issue #589: extended snapshot format adds three trailing columns for
     # the prompt-ready latch (timestamp, session-id, source). Older daemon
     # consumers that read only the first six columns are unaffected; the
     # python upsert path uses .get() with default empty for the new keys.
-    echo -e "agent\tengine\tsession\tworkdir\tactive\tsession_activity_ts\tprompt_ready_ts\tprompt_ready_session\tprompt_ready_source"
+    #
+    # Issue #1345 r2 (Lane κ v0.15.0-beta5-2, codex r1 BLOCKING): append
+    # `activity_state` so the daemon-step queue maintenance path can see
+    # picker_blocked agents and exclude them from the idle_agents set
+    # used by stale-claim requeue (bridge-queue.py:2157-2167 +
+    # :2242-2285). Before this column, the daemon-step snapshot only
+    # carried active + session_activity_ts age, so a picker_blocked
+    # agent whose tmux activity_ts had aged past --idle-threshold was
+    # wrongly classified as idle and had its claimed tasks requeued.
+    # The roster/status snapshot + agent-show + heartbeat path all
+    # already emit picker_blocked (PR #1345 r1), but the daemon-step
+    # snapshot is a separate writer and was missed.
+    #
+    # Cost note: the predicate is a single grep over the per-agent
+    # stall.env (already touched by the daemon stall scan), so the
+    # daemon hot path remains O(n_agents) without an extra tmux
+    # capture. The fuller "working/starting" classification stays on
+    # the roster/status writer (which already does the tmux capture
+    # for the dashboard) — the daemon-step path only needs the
+    # picker_blocked signal because the existing
+    # `session_activity_ts` age check already excludes recently-active
+    # ("working") agents from `idle_agents`. Emitting an empty
+    # activity_state column when not picker_blocked preserves the
+    # column position without forcing the expensive recent-capture.
+    echo -e "agent\tengine\tsession\tworkdir\tactive\tsession_activity_ts\tprompt_ready_ts\tprompt_ready_session\tprompt_ready_source\tactivity_state"
     for agent in "${BRIDGE_AGENT_IDS[@]}"; do
       active=0
       session="$(bridge_agent_session "$agent")"
       activity=""
+      activity_state=""
       if bridge_agent_is_active "$agent"; then
         active=1
         activity="$(bridge_tmux_session_activity_ts "$session")"
+        if bridge_agent_picker_blocked "$agent"; then
+          activity_state="picker_blocked"
+        fi
       fi
 
       prompt_ready_ts=""
@@ -4176,7 +4249,7 @@ bridge_write_agent_snapshot() {
         fi
       fi
 
-      echo -e "${agent}\t$(bridge_agent_engine "$agent")\t${session}\t$(bridge_agent_workdir "$agent")\t${active}\t${activity}\t${prompt_ready_ts}\t${prompt_ready_session}\t${prompt_ready_source}"
+      echo -e "${agent}\t$(bridge_agent_engine "$agent")\t${session}\t$(bridge_agent_workdir "$agent")\t${active}\t${activity}\t${prompt_ready_ts}\t${prompt_ready_session}\t${prompt_ready_source}\t${activity_state}"
     done
   } >"$file"
 }
@@ -4250,25 +4323,26 @@ bridge_write_roster_status_snapshot() {
             esac
           fi
         fi
-        # Issue #1317 Lane ν R2: when the broken-launch marker is
-        # present, the activity_state already reads
-        # `quarantine-broken-launch` — do NOT overwrite it with the
-        # active-branch outcome. The active=1 / wake fields are still
-        # computed honestly because they describe tmux/channel state,
-        # not engine-health state.
+        # Issue #1317 Lane ν R2 + Lane κ #1319 (merged ν → κ rebase):
+        # quarantine wins over active-branch outcome. Inside the
+        # non-quarantined gate, picker_blocked wins over starting/working
+        # so a wedged agent never masks as `working` on `agb status`.
         if (( quarantined == 0 )); then
           if bridge_tmux_session_has_prompt_from_text "$engine" "$recent"; then
             activity_state="idle"
           else
+            # Lane κ #1319: picker-blocked detection. The daemon stall
+            # scan writes STALL_ACTIVE_CLASSIFICATION=interactive_picker
+            # to per-agent stall.env when bridge-stall.py detects the
+            # rate-limit / summary picker — same evidence that triggers
+            # the admin escalation branch in bridge-daemon.sh.
+            if bridge_agent_picker_blocked "$agent"; then
+              activity_state="picker_blocked"
             # Issue #835 Wave B: distinguish "engine running, no prompt yet"
             # (working) from "tmux exists but engine never spawned"
-            # (starting). Before this gate, the operator's 2026-05-14 wedge
-            # (bridge-run.sh patch --continue stuck in launch-cmd heredoc
-            # expansion, no `claude` child) rendered as `working`, hiding
-            # the failure mode from `agb status`. The helper is defined only
-            # for claude/codex (other engine shapes fall through to
-            # "working", preserving legacy behavior).
-            if bridge_tmux_engine_requires_prompt "$engine" \
+            # (starting). The helper is defined only for claude/codex
+            # (other engine shapes fall through to "working").
+            elif bridge_tmux_engine_requires_prompt "$engine" \
                 && ! bridge_agent_engine_process_alive "$agent" "$engine"; then
               activity_state="starting"
             else

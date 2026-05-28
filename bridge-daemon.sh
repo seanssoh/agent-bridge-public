@@ -596,6 +596,22 @@ bridge_agent_heartbeat_activity_state() {
     return 0
   fi
 
+  # Issue #1319 (Lane κ v0.15.0-beta5-2): picker-blocked agents are NOT
+  # making progress. Surface a distinct heartbeat state so downstream
+  # consumers (bridge-queue priority, bridge-doctor diagnostics,
+  # dashboard renderers, and the MCP liveness giveup observer at
+  # process_mcp_liveness_giveup_recovery which compares prev/cur state)
+  # see the same shape across snapshot / agent-show / heartbeat paths.
+  # The observer's idle-transition trigger treats `picker_blocked` as
+  # "not idle" (correctly — picker is blocking work), so an agent
+  # cleared via admin keypress + classifier-clear naturally fires the
+  # idle-transition recheck on the next tick.
+  if command -v bridge_agent_picker_blocked >/dev/null 2>&1 \
+      && bridge_agent_picker_blocked "$agent"; then
+    printf '%s' "picker_blocked"
+    return 0
+  fi
+
   # Issue #835 Wave B: distinguish "tmux up, engine never spawned"
   # (starting) from "engine present mid-turn" (working). The heartbeat
   # path persists activity_state into agent_state, which downstream
