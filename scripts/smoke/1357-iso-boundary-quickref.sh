@@ -167,11 +167,17 @@ if ! grep -q "body_file direct read" "$CLAUDE_MD"; then
 fi
 
 # ---------------------------------------------------------------------------
-# T5 (teeth) — toggling the helper or the call site breaks T1 / T2.
+# T5 (teeth) — toggling the helper or the call site re-runs the T1 / T2
+# contract assertions against the stripped copies and confirms they FAIL.
+# This is the real teeth: a future refactor that drops the helper or its
+# call site must trip the same checks T1/T2 use, not just produce a file
+# that lacks the literal token.
 # ---------------------------------------------------------------------------
-smoke_log "T5 (teeth): remove helper → T1 contract breaks; remove call site → T2 contract breaks"
+smoke_log "T5 (teeth): re-run T1/T2 contract against stripped copies and assert they fail"
 
-# Teeth A: nuke the helper in a temp copy and rerun the T1 grep contract.
+# Teeth A: nuke the helper in a temp copy and re-run the T1 contract checks
+# against it. They must fail (any T1 assertion firing means the contract
+# would catch a regression that drops the helper).
 T5_LIB_COPY="$SMOKE_TMP_ROOT/lib-bridge-agents.no-helper.sh"
 awk '
   /^bridge_agent_iso_boundary_quickref_text\(\) \{/ { skip = 1; next }
@@ -180,13 +186,47 @@ awk '
   { print }
 ' "$LIB_AGENTS" >"$T5_LIB_COPY"
 
+# Re-run T1 step 1: signature grep against the stripped copy. Must NOT match.
 if grep -qE '^bridge_agent_iso_boundary_quickref_text\(\) \{' "$T5_LIB_COPY"; then
-  smoke_fail "T5 (teeth A): nuked copy still defines the helper — awk strip drifted"
+  smoke_fail "T5 (teeth A.1): stripped copy still defines the helper — awk strip drifted"
+fi
+
+# Re-run T1 step 2: parse the (now-empty) helper body and confirm the
+# required-rows grep would fail. We expect zero captured lines.
+T5_BODY_AFTER="$SMOKE_TMP_ROOT/t5-helper-body-after.txt"
+awk '
+  /^bridge_agent_iso_boundary_quickref_text\(\) \{/ { in_fn = 1; next }
+  in_fn && /^\}/ { exit }
+  in_fn { print }
+' "$T5_LIB_COPY" >"$T5_BODY_AFTER"
+
+if [[ -s "$T5_BODY_AFTER" ]]; then
+  smoke_fail "T5 (teeth A.2): stripped copy still has a helper body — T1 parse would not fail"
+fi
+
+# Re-run T1 step 3: the required-rows grep against the empty body. Each row
+# would fire smoke_fail in T1; here we confirm at least one row's grep does
+# fail (i.e. T1 would catch the regression).
+T5_TEETH_A_CAUGHT=0
+for key in "${T1_REQUIRED_KEYS[@]}"; do
+  if ! grep -qE "$key" "$T5_BODY_AFTER"; then
+    T5_TEETH_A_CAUGHT=1
+    break
+  fi
+done
+
+if (( T5_TEETH_A_CAUGHT == 0 )); then
+  smoke_fail "T5 (teeth A.3): T1 required-rows grep would still pass against stripped copy — teeth not engaged"
+fi
+
+# Re-run T1 step 4: printf count must also fall below the contract floor.
+T5_PRINTF_COUNT_AFTER="$(grep -cE "^[[:space:]]+printf " "$T5_BODY_AFTER" || true)"
+if (( T5_PRINTF_COUNT_AFTER >= 5 )); then
+  smoke_fail "T5 (teeth A.4): printf count ($T5_PRINTF_COUNT_AFTER) still >= 5 — T1 row count check would not fail"
 fi
 
 # Teeth B: drop the call site from a temp copy of bridge-agent.sh and
-# re-grep run_show. The expected post-teeth state has no helper invocation
-# inside run_show body.
+# re-run the T2 contract checks against it. They must fail.
 T5_DISPATCHER_COPY="$SMOKE_TMP_ROOT/bridge-agent.no-call.sh"
 grep -v "bridge_agent_iso_boundary_quickref_text" "$DISPATCHER" >"$T5_DISPATCHER_COPY"
 
@@ -197,8 +237,16 @@ awk '
   in_fn { print }
 ' "$T5_DISPATCHER_COPY" >"$T5_RUN_SHOW_AFTER"
 
+# Re-run T2 step 1: run_show body must have been captured (parse shape
+# unchanged), otherwise our teeth would mask a real regression.
+if [[ ! -s "$T5_RUN_SHOW_AFTER" ]]; then
+  smoke_fail "T5 (teeth B.1): run_show parse on stripped copy returned 0 lines — strip damaged function shape"
+fi
+
+# Re-run T2 step 2: the helper-invocation grep on run_show body must NOT
+# match (this is the T2 assertion that would fire smoke_fail in production).
 if grep -q "bridge_agent_iso_boundary_quickref_text" "$T5_RUN_SHOW_AFTER"; then
-  smoke_fail "T5 (teeth B): stripped copy still references the helper — grep strip drifted"
+  smoke_fail "T5 (teeth B.2): stripped run_show still references the helper — T2 grep would not fail"
 fi
 
 smoke_log "passed"
