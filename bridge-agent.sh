@@ -2043,6 +2043,16 @@ run_show() {
     # input — keeps the deadlock-safe pattern (no heredoc-stdin to
     # subprocess) intact.
     bridge_agent_next_actions_json "$agent" >"$_show_dir/next-actions.json"
+    # Issue #1357 (v0.15.0-beta5-2 Lane E): mirror the text-mode quickref in
+    # --json so scripted consumers (a future MCP tool, a doctor renderer)
+    # can render the same boundary mapping without re-implementing the
+    # gate. The empty marker file is the "shared mode — skip" signal; a
+    # non-empty file is the payload to inline.
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      bridge_agent_iso_boundary_quickref_text >"$_show_dir/iso-boundary-quickref.txt"
+    else
+      : >"$_show_dir/iso-boundary-quickref.txt"
+    fi
     # codex PR #940 r2 BLOCKING: see run_list above for the RETURN-trap-
     # bypass rationale. Same explicit set +e / capture-rc / set -e pattern
     # ensures the tempdir is removed regardless of helper rc. Cleanup
@@ -2055,7 +2065,8 @@ run_show() {
       "$_show_dir/session-health.json" \
       "$_show_dir/session-source.txt" \
       "$_show_dir/alive.json" \
-      "$_show_dir/next-actions.json"
+      "$_show_dir/next-actions.json" \
+      "$_show_dir/iso-boundary-quickref.txt"
     _show_rc=$?
     set -e
     rm -rf "$_show_dir"
@@ -2188,6 +2199,16 @@ run_show() {
     # clean").
     printf 'next_actions:\n'
     bridge_agent_next_actions_text "$agent" | sed 's/^/  /'
+    # Issue #1357 (v0.15.0-beta5-2 Lane E): when the resolved agent is
+    # linux-user iso effective, append the compressed boundary quickref so
+    # an operator (or the agent itself, on first boot) sees the same
+    # workaround mapping the CLAUDE.md table documents. Skipped for shared-
+    # mode agents — the rows do not apply (no iso UID, no cross-class
+    # boundary), and surfacing them there would mislead.
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      printf 'iso_boundary_quickref:\n'
+      bridge_agent_iso_boundary_quickref_text | sed 's/^/  /'
+    fi
   done <<<"$output"
 }
 
@@ -3696,6 +3717,36 @@ report and reap test-fixture agents per their pattern."
       if ! bridge_agent_state_dir_self_heal "$agent"; then
         bridge_die "agent create: cannot create state-agent-dir for '$agent' — daemon writes would fail and nudges would silently drop (#1252). Inspect parent permissions on '$BRIDGE_ACTIVE_AGENT_DIR' and retry, or 'agb agent delete $agent --force --purge-home' to roll back."
       fi
+    fi
+    # Issue #1353 (v0.15.0-beta5-2 Track A) — setup-pending grace marker.
+    #
+    # When the operator runs `agent create --isolate --channels
+    # plugin:teams,plugin:ms365` (the OOTB-blocker reproducer from
+    # cm-prod-AgentWorkflow-vm01), the new always-on static role declares
+    # required channels whose per-channel access files (.teams/access.json,
+    # .ms365/.env) won't exist until the operator runs `setup teams
+    # <agent>` / `setup ms365 <agent>` later. Without this marker, the
+    # daemon's first 4 auto-start ticks (~80s) emit `auto-start backoff
+    # <agent>` rows + `channel-health miss` audit rows for an EXPECTED
+    # pre-setup state, masking real errors and confusing first-time
+    # installs.
+    #
+    # The marker is written for any agent whose roster `channels` field
+    # is non-empty AND always_on=1 — those are the agents the daemon
+    # auto-start dispatcher will attempt to start the moment the next
+    # tick fires. Channels-empty agents (free-form, no validator) and
+    # always_on=0 agents (queue-driven wake) don't trip the
+    # validator-miss path so they don't need the marker.
+    #
+    # bridge_agent_state_dir_self_heal above guarantees the parent dir
+    # (state/agents/<a>/) exists at canonical mode+group, so the marker
+    # write below lands in a known-good leaf. Failure is best-effort —
+    # see bridge_agent_mark_setup_pending header comment for the worst-
+    # case-no-marker fallback (operator sees the pre-#1353 4-burst log
+    # surface, no regression).
+    if [[ -n "$channels" ]] && [[ $always_on -eq 1 ]] \
+        && command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
+      bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
     fi
     # Issue #680: bridge-start.sh --dry-run is purely informational here — its
     # output is reprinted to the user as `start_dry_run:` for diagnostic
