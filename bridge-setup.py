@@ -15,7 +15,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -837,7 +837,7 @@ def load_claude_plugin_channel_token(kind: str) -> str:
 def read_secret_value(
     flag_value: str,
     flag_name: str,
-    file_path: str,
+    file_path: Optional[str],
     env_name: str,
     stdin_flag: bool = False,
     stdin_flag_name: str = "",
@@ -858,7 +858,21 @@ def read_secret_value(
     `/dev/fd/63` is a character device. We now try-open-and-read; if the read
     fails we surface a hint that names the process-substitution + sudo subshell
     interaction and the `--<name>-stdin` / tempfile alternatives.
+
+    Mutex defense (Issue #1354 R2): the argparse layer guards the
+    common-case `--<name>-file FOO --<name>-stdin`. This handler-side
+    check is a belt-and-suspenders second line in case a future caller
+    (programmatic invocation, refactor that drops the mutex group)
+    reaches this function with both signals set. Non-empty file_path +
+    stdin_flag both being live is unambiguously a mis-use.
     """
+    if stdin_flag and file_path:
+        file_flag = f"{flag_name}-file"
+        stdin_flag_label = stdin_flag_name or f"{flag_name}-stdin"
+        raise SetupError(
+            f"{file_flag} and {stdin_flag_label} are mutually exclusive — "
+            f"pass only one."
+        )
     if stdin_flag:
         # stdin path: read everything once. Single trailing newline (the shape
         # tools like `printf %s\\n` and `cat` produce) is stripped; any embedded
@@ -2509,8 +2523,16 @@ def build_parser() -> argparse.ArgumentParser:
     # preferred stdin and dropped the file value (precedence in
     # `read_secret_value`), making it possible to leak the wrong secret
     # without any signal to the operator.
+    #
+    # `default=None` (not `default=""`) so argparse can distinguish "user
+    # passed `--app-password-file ''`" from "user did not pass the flag
+    # at all". With `default=""`, argparse treats an explicit empty
+    # value as a no-op and lets `--app-password-file '' --app-password-stdin`
+    # bypass the mutex group (codex r2 review surfaced this argparse
+    # quirk). `read_secret_value` already treats `None` and `""` as the
+    # same "no file path" signal downstream.
     teams_password_source = teams_parser.add_mutually_exclusive_group()
-    teams_password_source.add_argument("--app-password-file", default="")
+    teams_password_source.add_argument("--app-password-file", default=None)
     # Issue #1354: explicit stdin path for the secret. Bash process
     # substitution `<(...)` lands as `/dev/fd/N` which is portable when the
     # wizard does NOT cross a sudo boundary, but breaks when it does.
@@ -2551,9 +2573,10 @@ def build_parser() -> argparse.ArgumentParser:
     ms365_parser.add_argument("--client-secret", default="")
     # Issue #1354 R2 (codex r1 BLOCKING #1): `--client-secret-file` and
     # `--client-secret-stdin` are mutually exclusive. See teams parser
-    # `--app-password-*` mutex for rationale.
+    # `--app-password-*` mutex for rationale (including the `default=None`
+    # choice that avoids the argparse default-equivalence quirk).
     ms365_secret_source = ms365_parser.add_mutually_exclusive_group()
-    ms365_secret_source.add_argument("--client-secret-file", default="")
+    ms365_secret_source.add_argument("--client-secret-file", default=None)
     # Issue #1354: explicit stdin path for the secret. See teams parser
     # `--app-password-stdin` for rationale (process substitution + sudo
     # subshell drops the `/dev/fd/N` mapping).

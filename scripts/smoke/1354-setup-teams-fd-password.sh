@@ -380,4 +380,33 @@ else
   smoke_fail "T8: handler-level .strip() on secret arg would silently truncate secrets. Output: $T8_OUT"
 fi
 
+# ----------------------------------------------------------------------------
+# T9 (R2 — codex r2 review): argparse mutex must fire even with the
+# explicit empty-string file value. Before R2, `default=""` made
+# argparse treat `--app-password-file ''` as a no-op (equivalent to not
+# passing the flag), so the mutex group missed `--app-password-file ''
+# --app-password-stdin` and the wizard silently preferred stdin. R2
+# switches to `default=None` so argparse properly tracks "user passed"
+# vs "default."
+# ----------------------------------------------------------------------------
+smoke_log "T9 (R2): empty-string --app-password-file + --app-password-stdin must still fail-loud"
+T9_RC=0
+T9_OUT="$(printf '%s' "stdin-value" | "$BRIDGE_BASH" "$BRIDGE_SETUP_SH" teams fd-test \
+  --app-id "test-app-id" \
+  --app-password-file "" \
+  --app-password-stdin \
+  --tenant-id "test-tenant" \
+  --allow-from "user-aad-1" \
+  --messaging-endpoint "https://bot.example.com/api/messages" \
+  --webhook-host "0.0.0.0" \
+  --webhook-port "3978" \
+  --skip-validate --skip-send-test \
+  --yes --dry-run 2>&1)" || T9_RC=$?
+if (( T9_RC != 0 )); then
+  smoke_log "T9 ok: empty-string file value still triggers mutex (rc=$T9_RC)"
+  smoke_assert_contains "$T9_OUT" "not allowed with" "T9 argparse mutex error fires on empty-string file value"
+else
+  smoke_fail "T9: --app-password-file '' --app-password-stdin must fail-loud (argparse default=None contract); out: $T9_OUT"
+fi
+
 smoke_log "all tests PASS"
