@@ -84,9 +84,11 @@ _BRIDGE_SETUP_WIZARD_REQUIRED_TEAMS=(
   webhook-port
 )
 
-# Required ms365 fields — issue #1271 explicit list. Names match the
-# operator-facing CLI flags in `bridge-setup.py:ms365_parser` so a
-# missing-value report names the exact `--<flag>` the operator types:
+# Required ms365 fields — issue #1271 explicit list, refined by
+# issue #1355 (default-scopes moved to protocol-convention default).
+# Names match the operator-facing CLI flags in
+# `bridge-setup.py:ms365_parser` so a missing-value report names the
+# exact `--<flag>` the operator types:
 #   client-id           — Entra App registration Application (client) ID
 #   client-secret-file  — secret material, never on argv
 #   tenant-id           — Azure Entra tenant
@@ -94,17 +96,23 @@ _BRIDGE_SETUP_WIZARD_REQUIRED_TEAMS=(
 #                         Cannot be derived for arbitrary deployments —
 #                         operator must know the URL the Entra app
 #                         expects.
-#   default-scopes      — MS Graph scopes (sent at OAuth pair_start). The
-#                         wizard surfaces the prompt with a documented
-#                         default rather than baking one in so operators
-#                         with non-default Graph permissions know to
-#                         override.
+#
+# Removed in #1355 (now protocol-convention default in cmd_ms365):
+#   default-scopes      — MS Graph minimal scope set
+#                         (Mail.Read / Mail.Send / Calendars.ReadWrite /
+#                         offline_access) is the de-facto MS365 baseline,
+#                         not a site-specific value. Auto-mode now falls
+#                         back to `MS365_CONVENTION_DEFAULT_SCOPES` with
+#                         `default_scopes_source: convention-default` on
+#                         the wizard summary; operators with non-default
+#                         Graph permissions can still override with
+#                         `--default-scopes "..."`. See bridge-setup.py
+#                         MS365_CONVENTION_DEFAULT_SCOPES.
 _BRIDGE_SETUP_WIZARD_REQUIRED_MS365=(
   client-id
   client-secret-file
   tenant-id
   redirect-uri
-  default-scopes
 )
 
 bridge_setup_wizard_required_fields() {
@@ -429,17 +437,29 @@ bridge_setup_wizard_run_ms365() {
       ;;
   esac
 
+  # Issue #1355: --default-scopes is now protocol-convention default
+  # (Mail+Calendar minimal baseline lives in bridge-setup.py's
+  # MS365_CONVENTION_DEFAULT_SCOPES). Empty input falls back to the
+  # python wizard's convention default; a non-empty override is
+  # forwarded as `--default-scopes "$scope"`. The interactive prompt
+  # still surfaces the canonical baseline so operators see what they
+  # are accepting by pressing Enter.
   local scope
-  scope="$(_bridge_setup_wizard_prompt "MS Graph scope (공백으로 구분, default: openid profile offline_access Mail.Read Calendars.Read)" "openid profile offline_access Mail.Read Calendars.Read")"
-  if [[ -z "$scope" ]]; then
-    bridge_die "[setup ms365] scope는 필수입니다."
+  scope="$(_bridge_setup_wizard_prompt "MS Graph scope (공백으로 구분, default: MS Graph minimal — Mail.Read Mail.Send Calendars.ReadWrite offline_access)" "")"
+
+  # Build the argv. --default-scopes is conditional now.
+  local -a _ms365_extra=()
+  if [[ -n "$scope" ]]; then
+    _ms365_extra=(--default-scopes "$scope")
   fi
 
+  # Disable SC2207 / quoting style noise — we splice the extra array
+  # in-place using bash's positional array expansion.
   eval "${out_array_name}+=(--client-id \"\$client_id\" \
                             --client-secret-file \"\$client_secret_file\" \
                             --tenant-id \"\$tenant_id\" \
                             --redirect-uri \"\$redirect_uri\" \
-                            --default-scopes \"\$scope\" \
+                            \"\${_ms365_extra[@]}\" \
                             --yes)"
 
   _BRIDGE_SETUP_WIZARD_LAST_MS365_REDIRECT_URI="$redirect_uri"

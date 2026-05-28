@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Audience**: a code contributor (you, when editing source). This file is the **repo contributor contract** — source-vs-runtime boundaries, queue semantics, high-risk surfaces, validation/release rules.
+
+**If you are an operator / first-time installer / agent at first wake**: this is the wrong file. Read [docs/onboarding/](./docs/onboarding/) instead — persona-based runbooks for first-install, creating a static agent, plugin-enabled-agent first-session checklist, and channel/auth troubleshooting. Then come back here if you also need to edit source.
+
 ## What This Repo Is
 
 Agent Bridge is a thin local orchestration layer that wires Claude Code and Codex sessions together over `tmux` + SQLite queue + a Bash daemon. It does not implement its own agent runtime — Claude/Codex are the agents. Design priorities, in order, are **queue-first**, **daemon-safe**, and **runtime-preserving**.
@@ -136,6 +140,24 @@ On Linux hosts that have linux-user isolation enabled (the v0.8.0+ iso v2 stack)
   - No direct write into another agent's home / workdir.
   - No `git checkout <other-branch>` in the operator's primary checkout.
   - No `sudo` from inside an iso UID without explicit operator sudoers grant.
+
+### Agent's own POV: what blocks where + workaround
+
+The rules above are written from the controller's perspective. If you are the iso v2 agent itself (running under `agent-bridge-<a>` on a Linux host with v2 isolation active), here is the same boundary expressed as the paper-cuts you will actually hit on a fresh session, with the supported workaround for each. The compressed five-row form lives in `agb agent show <a>` output as the `iso_boundary_quickref:` section; this table is the long form with concrete commands and error strings. Common paper-cuts catalogued: body_file direct read, controller HOME files, shared/wiki reads, plugins-cache mcp.json edits, cross-iso sudo, and cross-branch git checkout in the operator's primary checkout. Test ground truth: `v0.15.0-beta5-2` `test_clean` fresh-install observation (Issue #1357).
+
+| Attempt | What you'll see | Workaround |
+|---|---|---|
+| `cat <bridge_home>/state/queue/bodies/<id>.md` (path printed by `agb show <id>`) | `Permission denied` (body owned by `<controller-user>:ab-shared`, you are group member but not owner; controller-side queue paths also restrict at the directory boundary) | The body is already inlined in `agb show <id>` output — read it from there. The `body_file:` row is for the controller's own scripting, not for you. |
+| `cat <bridge_home>/state/active-roster.md` | `Permission denied` | `agb agent list`, `agb status` |
+| `cat <bridge_home>/state/HEARTBEAT.md` | `Permission denied` | `agb status` (same surface, daemon-rendered) |
+| `cat <bridge_home>/shared/wiki/...` | `OK` (`ab-shared` group readable) | Direct read is fine; no CLI verb required |
+| Edit `<bridge_home>/plugins-cache/<marketplace>/<plugin>/.mcp.json` | `EACCES` (mode 0640 `<controller-user>:ab-shared`, you are group member but not owner) | Ask the operator to run controller-side `agb plugins seed` (or the marketplace-specific seed) and then restart you. Most plugins ship as stdio proxies that look up tokens at call time, so direct `.mcp.json` edits are rarely the right answer anyway. |
+| Plugin call returns `401` / `Authentication required` on first use | (no traceback, just the API error) | The plugin's own onboarding skill is the source of truth (e.g. `cosmax-crm:onboarding` for CRM, `plugin:teams:configure` for Teams). If unclear, surface the 401 to the operator via the queue — do not hand-fabricate auth state. |
+| `sudo -u <other-iso> ...` from inside your UID | `sudo: a password is required` / `not in sudoers` | Not supported — delegate to the controller via the queue (`agb task create --to <controller-admin>`). No iso UID is in `sudoers` by default. |
+| `git checkout <other-branch>` in the operator's primary checkout | Branch state collision, file ownership mismatch, possible WIP loss in the operator's working tree | Use a worktree under your own `<agent_home>/.claude/worktrees/...` or delegate to the controller. Never `git checkout` in `/Users/<op>/Projects/<repo>` or equivalent — that is the operator's working copy. |
+| Read another iso agent's home (`<bridge_home>/agents/<other>/...` or its dispatched workdir) | `Permission denied` | Cross-agent work goes through the queue (`agb task create --to <other>`); no read-through is supported. |
+
+If you see one of these on a fresh boot and you are tempted to "work around" it locally (e.g. by `sudo`-escalating or by reading a different copy you guessed at), stop — the workaround column is the only contract we hold across upgrades. The controller-side fixes (seeding caches, granting groups, plumbing new shared paths) live in `OPERATIONS.md` §"Iso v2 agent troubleshooting"; surface the symptom to the operator if the listed workaround does not apply to your specific case.
 
 For the full design rationale see [`docs/developer-handover.md`](./docs/developer-handover.md) §"Working with isolated agents (iso v2)" and [`OPERATIONS.md`](./OPERATIONS.md) §"Iso v2 agent troubleshooting".
 
