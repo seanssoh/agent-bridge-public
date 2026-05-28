@@ -6925,15 +6925,28 @@ bridge_agent_next_actions_tsv() {
       # Channel credentials missing — point at the matching setup
       # wizard. `placeholder_safe=yes` because the wizard collects the
       # site-specific value itself; the command line carries no token.
-      if [[ "$credentials_status" == "missing" ]]; then
+      #
+      # codex r1 PR #1364 BLOCKING 2: `credentials_status` also reports
+      # `unreadable` when the credential file exists but the controller
+      # cannot read it (typically iso-v2 boundary, file exists under the
+      # agent's UID, controller has no group membership). From the
+      # operator's UX perspective `unreadable` is the same first-touch
+      # state as `missing` — the next required action is to walk the
+      # setup wizard, which writes a fresh credential the agent can
+      # actually consume. The audit row could still distinguish for
+      # telemetry, but the next_actions hint must not silently fall
+      # through to the generic `start --dry-run` row below (which would
+      # tell the operator to verify a launch they cannot fix without
+      # the setup wizard). Match both states here.
+      if [[ "$credentials_status" == "missing" || "$credentials_status" == "unreadable" ]]; then
         case "$provider" in
           discord|telegram|teams|ms365)
-            printf 'agent-bridge setup %s %s\t%s channel configured but credentials are missing; run the setup wizard\tyes\n' "$provider" "$agent" "$provider"
+            printf 'agent-bridge setup %s %s\t%s channel configured but credentials are %s; run the setup wizard\tyes\n' "$provider" "$agent" "$provider" "$credentials_status"
             ;;
           *)
             # Unknown / custom provider — generic hint. Do not invent
             # a setup verb that may not exist for this provider.
-            printf 'agent-bridge agent show %s\tchannel %s reports credentials missing; check the plugin onboarding contract\tyes\n' "$agent" "$channel"
+            printf 'agent-bridge agent show %s\tchannel %s reports credentials %s; check the plugin onboarding contract\tyes\n' "$agent" "$channel" "$credentials_status"
             ;;
         esac
         continue
@@ -7019,28 +7032,30 @@ bridge_agent_next_actions_text() {
 bridge_agent_next_actions_json() {
   local agent="$1"
   local tsv=""
+  local _tmp=""
+  local _rc=0
 
   tsv="$(bridge_agent_next_actions_tsv "$agent")"
   bridge_require_python
-  python3 - "$tsv" <<'PY'
-import csv
-import io
-import json
-import sys
 
-rows = list(csv.DictReader(io.StringIO(sys.argv[1]), delimiter="\t"))
-
-payload = []
-for row in rows:
-    entry = {
-        "run": row["run"],
-        "reason": row["reason"],
-        "placeholder_safe": row["placeholder_safe"] == "yes",
-    }
-    payload.append(entry)
-
-print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-PY
+  # Footgun #11 (KNOWN_ISSUES.md §26): the prior r1 form used
+  # `python3 - "$tsv" <<'PY' … PY` which reintroduces the Bash 5.3.9
+  # `read_comsub` / `heredoc_write` deadlock class — the same class the
+  # `agent show` data pipeline (bridge-agent.sh:2041-2045) explicitly
+  # documents as forbidden in this hot path. Spool the TSV to a tempfile
+  # and dispatch to the standalone helper (file-as-argv), matching the
+  # show-format-json.py precedent in the same dir.
+  _tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-agent-next-actions.XXXXXX")" || return 1
+  # shellcheck disable=SC2064  # pin the path at trap-set time, not RETURN
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$tsv" > "$_tmp"
+  set +e
+  python3 "$BRIDGE_SCRIPT_DIR/lib/agent-cli-helpers/next-actions-tsv-to-json.py" "$_tmp"
+  _rc=$?
+  set -e
+  rm -f -- "$_tmp"
+  trap - RETURN
+  return "$_rc"
 }
 
 # bridge_create_next_steps_lines — issue #1360. Compute persona-aware
@@ -7120,6 +7135,21 @@ bridge_create_next_steps_lines() {
   # Channel re-check (only when at least one channel is wired).
   if [[ -n "$channels" ]]; then
     printf 'agent-bridge agent show %s\n' "$agent"
+  fi
+
+  # Terminal-only persona (no channels wired): the operator's actual
+  # next step is to start the agent + attach + walk the onboarding
+  # surface (memory wiki init + a reminder to ask the agent to read
+  # SOUL.md / CLAUDE.md / SESSION-TYPE.md before doing real work). The
+  # generic `start --dry-run` row above only validates the launch line;
+  # without these the operator is left wondering "I dry-ran, now what?"
+  # which is exactly the gap codex r1 PR #1364 BLOCKING 3 caught. Refs
+  # docs/onboarding/create-static-agent.md §"Terminal-only static agent"
+  # for the matching prose walkthrough.
+  if [[ -z "$channels" ]]; then
+    printf 'agent-bridge agent start %s\n' "$agent"
+    printf 'agent-bridge attach %s\n' "$agent"
+    printf 'agent-bridge memory init --agent %s\n' "$agent"
   fi
 
   # Persona 1 (ALL agents): memory/onboarding pointer. Stays last so it
