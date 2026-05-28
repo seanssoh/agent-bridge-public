@@ -215,6 +215,24 @@ run_create() {
   local kind="text"
   local run_as_agent=""
   local script_path=""
+  # Issue #1359 — collect the args we need to re-emit into a staging
+  # payload when the caller is an iso v2 UID. Direct fields are the
+  # canonical native-create surface; --actor / --kind=shell / shell
+  # options never go through staging (kind=text only, tactical scope).
+  local opt_agent=""
+  local opt_schedule=""
+  local opt_at=""
+  local opt_title=""
+  local opt_payload=""
+  local opt_payload_file=""
+  local opt_tz=""
+  local opt_disabled=0
+  local opt_delete_after_run=0
+  # Sentinel so the staging serializer can distinguish "operator did
+  # not pass --payload" from "operator passed empty string". JSON null
+  # tells the helper to skip emitting the flag entirely.
+  local opt_payload_set=0
+  local opt_payload_file_set=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -224,11 +242,22 @@ run_create() {
           --kind) kind="$2" ;;
           --run-as-agent) run_as_agent="$2" ;;
           --script) script_path="$2" ;;
+          --agent) opt_agent="$2" ;;
+          --schedule) opt_schedule="$2" ;;
+          --at) opt_at="$2" ;;
+          --title) opt_title="$2" ;;
+          --payload) opt_payload="$2"; opt_payload_set=1 ;;
+          --payload-file) opt_payload_file="$2"; opt_payload_file_set=1 ;;
+          --tz) opt_tz="$2" ;;
         esac
         py_args+=("$1" "$2")
         shift 2
         ;;
       --disabled|--delete-after-run)
+        case "$1" in
+          --disabled) opt_disabled=1 ;;
+          --delete-after-run) opt_delete_after_run=1 ;;
+        esac
         py_args+=("$1")
         shift
         ;;
@@ -242,11 +271,373 @@ run_create() {
     esac
   done
 
+  # Issue #1359 tactical staging delegation. When the caller is an iso
+  # v2 UID (`BRIDGE_AGENT_ID` set + current uid != controller uid +
+  # cron/jobs.json not writable by the iso UID), route through the
+  # `state/cron-staging/<uuid>.json` file delegation path so the
+  # controller daemon applies the mutation on the iso UID's behalf.
+  # Shell-kind cron is explicitly out of tactical scope — the runner
+  # validation matrix needs controller-side script ownership that the
+  # staging path cannot prove from a forged payload.
+  #
+  # codex r1 BLOCKING #3: cross-agent mutation from inside an iso UID
+  # must be REJECTED, not silently downgraded to the direct write path.
+  # The previous shape returned `should_stage=1` when `--agent` did
+  # not match `BRIDGE_AGENT_ID` and then fell through to the direct
+  # bridge-cron.py invocation; on hosts where jobs.json was writable
+  # by the iso UID (e.g. opened by a misconfigured operator), this
+  # bypassed the "iso agent may mutate only its own cron" boundary.
+  #
+  # codex r2 review escalation: the reject must fire on iso-IDENTITY
+  # context (BRIDGE_AGENT_ID set + iso v2 active + non-controller UID),
+  # NOT only when staging is the chosen path. The previous shape
+  # gated the bridge_die on `_bridge_cron_create_iso_context_active`,
+  # which itself returns 1 when jobs.json is writable — so a writable
+  # jobs.json (the very misconfigured-operator case the comment names)
+  # short-circuited the guard and the direct write went through.
+  # Split: identity check fires the guard first, then the staging
+  # predicate decides stage vs direct for same-agent requests.
+  #
+  # codex r2 self-review BLOCKING: the previous shape gated the
+  # bridge_die on `kind == text`. A `--kind shell` request from inside
+  # an iso UID with writable jobs.json would skip the guard entirely
+  # and fall through to `bridge_cron_python` which accepts shell
+  # payloads and writes the job for `args.agent`. The reject must fire
+  # on identity context regardless of kind — shell-kind staging
+  # delegation is still out of scope (the runner needs controller-side
+  # script ownership the staging path cannot prove), but the boundary
+  # "iso agents may only mutate own cron" applies to ALL kinds. After
+  # this guard, only same-agent or non-iso-identity requests proceed,
+  # and shell-kind same-agent requests still hit the direct write path
+  # (which is correct: a same-agent shell cron is the iso UID writing
+  # its own job, no boundary violation).
+  #
+  # NOTE on ordering: this guard MUST fire BEFORE
+  # `bridge_cron_validate_shell_run_config` below. The shell-kind
+  # validator rejects on missing `--run-as-agent` / `--script` with a
+  # different bridge_die that would mask the identity reject — and an
+  # attacker can satisfy both by passing `--kind shell --script foo
+  # --run-as-agent <peer>`. The identity reject must be the first thing
+  # an iso-context shell with cross-agent intent hits, regardless of
+  # what other args it carries.
+  if _bridge_cron_create_iso_identity_active; then
+    local effective_agent="${opt_agent:-${BRIDGE_AGENT_ID:-}}"
+    if [[ -n "$effective_agent" && "$effective_agent" != "${BRIDGE_AGENT_ID:-}" ]]; then
+      bridge_die "cron mutation refused: requested agent ${effective_agent} does not match BRIDGE_AGENT_ID ${BRIDGE_AGENT_ID:-<unset>} (iso agents may only mutate own cron)"
+    fi
+  fi
+
   if [[ "$kind" == "shell" ]]; then
     bridge_cron_validate_shell_run_config "$run_as_agent" "$script_path"
   fi
 
+  if [[ "$kind" == "text" ]]; then
+    if _bridge_cron_create_iso_context_active; then
+      _bridge_cron_create_via_staging \
+        "$opt_agent" \
+        "$opt_schedule" \
+        "$opt_at" \
+        "$opt_title" \
+        "$opt_tz" \
+        "$opt_payload_set" \
+        "$opt_payload" \
+        "$opt_payload_file_set" \
+        "$opt_payload_file" \
+        "$opt_disabled" \
+        "$opt_delete_after_run"
+      return $?
+    fi
+  fi
+
   bridge_cron_python "${py_args[@]}"
+}
+
+# Issue #1359 codex r2 review escalation — narrow identity predicate
+# used by the cross-agent reject guard.
+#
+# Returns 0 when this shell is running with an iso-agent IDENTITY
+# (BRIDGE_AGENT_ID set, iso v2 layout active), regardless of whether
+# jobs.json happens to be writable by the current UID. The cross-
+# agent reject in `run_create` must fire whenever this is true, so a
+# misconfigured-writable jobs.json cannot bypass the "iso agents may
+# only mutate own cron" boundary. Controller shells should never have
+# BRIDGE_AGENT_ID set in the iso-v2 deployment — that is itself the
+# identity marker we use.
+_bridge_cron_create_iso_identity_active() {
+  local agent_id="${BRIDGE_AGENT_ID:-}"
+  [[ -n "$agent_id" ]] || return 1
+  if ! declare -F bridge_isolation_v2_active >/dev/null 2>&1; then
+    return 1
+  fi
+  bridge_isolation_v2_active || return 1
+  return 0
+}
+
+# Issue #1359 — predicate that decides whether we are currently running
+# inside an iso v2 agent UID context that needs to delegate cron
+# mutations through the staging path.
+#
+# codex r1 BLOCKING #3 (r2): the previous predicate bundled the
+# `requested_agent == BRIDGE_AGENT_ID` check into the should-stage
+# decision and silently returned "no, direct write" for cross-agent
+# requests. That allowed `bash bridge-cron.sh create --agent <peer>`
+# from inside an iso UID to fall through to the direct write path on
+# hosts where jobs.json happened to be writable by the iso UID. The
+# split-up shape now is:
+#
+#   - `_bridge_cron_create_iso_context_active` (this function):
+#       returns 0 (yes) when ALL hold — BRIDGE_AGENT_ID is set, iso v2
+#       layout is active, current UID is NOT the controller UID, and
+#       jobs.json is not writable directly. Used as the gating
+#       condition for "delegate to daemon".
+#
+#   - The caller in `run_create` decides what to do with the cross-
+#       agent case BEFORE we get here: a mismatched `--agent` raises a
+#       `bridge_die` rather than falling through to the direct write
+#       path.
+#
+# Returns 0 when iso UID context is active; 1 otherwise (including the
+# operator-on-controller case and the iso-UID-with-writable-jobs.json
+# defense-in-depth case).
+_bridge_cron_create_iso_context_active() {
+  local agent_id="${BRIDGE_AGENT_ID:-}"
+
+  [[ -n "$agent_id" ]] || return 1
+  # Without iso v2 layout, the staging dir cannot have iso-writable
+  # mode, so the direct path is the only one that works.
+  if ! declare -F bridge_isolation_v2_active >/dev/null 2>&1; then
+    return 1
+  fi
+  bridge_isolation_v2_active || return 1
+
+  local cur_uid jobs_file
+  cur_uid="$(id -u 2>/dev/null || printf '')"
+  [[ -n "$cur_uid" ]] || return 1
+  jobs_file="${BRIDGE_NATIVE_CRON_JOBS_FILE:-}"
+
+  if [[ -n "$jobs_file" && -e "$jobs_file" ]]; then
+    # If we can already write the file directly, no need to stage.
+    if [[ -w "$jobs_file" ]]; then
+      return 1
+    fi
+    return 0
+  fi
+
+  # jobs.json absent → compare current UID to the controller UID. We
+  # cannot know the controller UID with certainty in this branch
+  # (no marker yet), so we fall back to "differ from the parent
+  # directory owner if reachable". Best-effort: when the parent dir
+  # is missing OR matches our UID, treat as not-iso and skip staging.
+  local cron_home_dir cron_home_owner
+  cron_home_dir="${BRIDGE_CRON_HOME_DIR:-}"
+  if [[ -n "$cron_home_dir" && -d "$cron_home_dir" ]]; then
+    cron_home_owner="$(stat -c '%u' "$cron_home_dir" 2>/dev/null || stat -f '%u' "$cron_home_dir" 2>/dev/null || true)"
+    if [[ -n "$cron_home_owner" && "$cron_home_owner" != "$cur_uid" ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Issue #1359 — back-compat shim. The r1 codepath called
+# `_bridge_cron_create_should_stage` with the requested agent and
+# expected a single "yes/no stage" verdict. The r2 refactor split the
+# iso-context detection from the cross-agent reject — this shim is
+# preserved so any external caller (out-of-tree script, future-merged
+# branch) gets a verdict that PRESERVES the cross-agent security
+# boundary rather than falling through to the direct write path.
+#
+# codex r2 review escalation: the previous shim returned 1 on cross-
+# agent mismatch which lets legacy callers do `if
+# _bridge_cron_create_should_stage; then stage; else direct; fi` and
+# silently downgrade a cross-agent request to a direct write. That
+# leaks the same boundary the new call site closes. The shim now
+# bridge_die's on cross-agent identity context — any caller hitting
+# this path gets the same explicit reject as the new call site.
+_bridge_cron_create_should_stage() {
+  local requested_agent="${1:-}"
+  local agent_id="${BRIDGE_AGENT_ID:-}"
+
+  # Defense-in-depth: even outside the staging-routing branch, if we
+  # are running with an iso-agent identity and the requested agent
+  # does not match, refuse rather than letting the caller fall
+  # through to a direct write.
+  if _bridge_cron_create_iso_identity_active; then
+    if [[ -n "$requested_agent" && "$requested_agent" != "$agent_id" ]]; then
+      bridge_die "cron mutation refused: requested agent ${requested_agent} does not match BRIDGE_AGENT_ID ${agent_id:-<unset>} (iso agents may only mutate own cron)"
+    fi
+  fi
+  _bridge_cron_create_iso_context_active || return 1
+  return 0
+}
+
+# Issue #1359 — staging delegation writer + poller. Composes the JSON
+# payload from the parsed --agent / --schedule / --title / --payload-*
+# / --tz / --disabled / --delete-after-run options, writes a staging
+# file via the staging.py helper, then polls for the daemon-written
+# result.json sibling. Prints native-create's success line (or surfaces
+# the daemon's error to stderr) so existing operator workflows keep
+# parsing the cron id from stdout.
+_bridge_cron_create_via_staging() {
+  local agent="$1"
+  local schedule="$2"
+  local at="$3"
+  local title="$4"
+  local tz="$5"
+  local payload_set="$6"
+  local payload="$7"
+  local payload_file_set="$8"
+  local payload_file="$9"
+  local disabled="${10}"
+  local delete_after_run="${11}"
+
+  bridge_require_python
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+
+  local staging_dir="${BRIDGE_CRON_STAGING_DIR:-}"
+  [[ -n "$staging_dir" ]] || bridge_die "BRIDGE_CRON_STAGING_DIR unset; cannot route iso cron create"
+
+  # Build the canonical payload JSON via python (avoids bash quoting
+  # gymnastics around --payload bodies that contain newlines, quotes,
+  # or json metacharacters). Stdin to the python child is a small env
+  # dump with the parsed values — no heredoc-stdin to subprocess
+  # (footgun #11) since the python builds the JSON and prints it to
+  # stdout for capture below.
+  local payload_json=""
+  local actor_uid
+  actor_uid="$(id -u 2>/dev/null || printf '0')"
+  # shellcheck disable=SC2155
+  local _payload_json_tmp
+  _payload_json_tmp="$(mktemp -t agb-cron-staging-payload.XXXXXX)" || \
+    bridge_die "cannot mktemp cron-staging payload buffer"
+  trap 'rm -f "$_payload_json_tmp"' RETURN
+
+  AGB_STAGE_AGENT="$agent" \
+  AGB_STAGE_SCHEDULE="$schedule" \
+  AGB_STAGE_AT="$at" \
+  AGB_STAGE_TITLE="$title" \
+  AGB_STAGE_TZ="$tz" \
+  AGB_STAGE_PAYLOAD_SET="$payload_set" \
+  AGB_STAGE_PAYLOAD="$payload" \
+  AGB_STAGE_PAYLOAD_FILE_SET="$payload_file_set" \
+  AGB_STAGE_PAYLOAD_FILE="$payload_file" \
+  AGB_STAGE_DISABLED="$disabled" \
+  AGB_STAGE_DELETE_AFTER_RUN="$delete_after_run" \
+  AGB_STAGE_ACTOR_AGENT="${BRIDGE_AGENT_ID:-}" \
+  AGB_STAGE_ACTOR_UID="$actor_uid" \
+  python3 - "$_payload_json_tmp" <<'PY'
+import json
+import os
+import sys
+
+out_path = sys.argv[1]
+payload = {
+    "schema_version": 1,
+    "action": "create",
+    "actor_agent": os.environ.get("AGB_STAGE_ACTOR_AGENT", ""),
+    "actor_uid": int(os.environ.get("AGB_STAGE_ACTOR_UID", "0") or 0),
+    "agent": os.environ.get("AGB_STAGE_AGENT", ""),
+    "title": os.environ.get("AGB_STAGE_TITLE", ""),
+    "tz": os.environ.get("AGB_STAGE_TZ", "") or None,
+    "kind": "text",
+    "disabled": os.environ.get("AGB_STAGE_DISABLED", "0") == "1",
+    "delete_after_run": os.environ.get("AGB_STAGE_DELETE_AFTER_RUN", "0") == "1",
+}
+sched = os.environ.get("AGB_STAGE_SCHEDULE", "")
+at = os.environ.get("AGB_STAGE_AT", "")
+payload["schedule"] = sched if sched else None
+payload["at"] = at if at else None
+if os.environ.get("AGB_STAGE_PAYLOAD_SET", "0") == "1":
+    payload["payload"] = os.environ.get("AGB_STAGE_PAYLOAD", "")
+else:
+    payload["payload"] = None
+if os.environ.get("AGB_STAGE_PAYLOAD_FILE_SET", "0") == "1":
+    payload["payload_file"] = os.environ.get("AGB_STAGE_PAYLOAD_FILE", "")
+else:
+    payload["payload_file"] = None
+with open(out_path, "w", encoding="utf-8") as fh:
+    json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+PY
+
+  # shellcheck disable=SC2155
+  local payload_json_body
+  payload_json_body="$(cat "$_payload_json_tmp")"
+
+  local actor_agent="${BRIDGE_AGENT_ID:-}"
+  [[ -n "$actor_agent" ]] || bridge_die "BRIDGE_AGENT_ID unset; cannot route iso cron create"
+
+  local request_uuid
+  if ! request_uuid="$(python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/staging.py" \
+        write-request "$staging_dir" "$actor_agent" "$payload_json_body")"; then
+    bridge_die "cron-staging write-request failed (BRIDGE_CRON_STAGING_DIR=$staging_dir)"
+  fi
+  request_uuid="${request_uuid%%$'\n'*}"
+  [[ -n "$request_uuid" ]] || bridge_die "cron-staging write-request returned empty uuid"
+
+  # Stderr advisory so the operator sees the staging mode. Stdout
+  # remains the cron-id line the existing operator workflow expects.
+  printf '[cron-staging] iso UID delegate: queued staging request %s; awaiting daemon apply (timeout %ss)\n' \
+    "$request_uuid" "$BRIDGE_CRON_STAGING_TIMEOUT_SECONDS" >&2
+
+  # Poll the result.json sibling. Bound by
+  # BRIDGE_CRON_STAGING_TIMEOUT_SECONDS so a wedged / down daemon does
+  # not hang the operator's terminal.
+  local elapsed=0
+  local interval="${BRIDGE_CRON_STAGING_POLL_INTERVAL_SECONDS:-1}"
+  local timeout="${BRIDGE_CRON_STAGING_TIMEOUT_SECONDS:-30}"
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=1
+  [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=30
+  local result_path="$staging_dir/$actor_agent/${request_uuid}.result.json"
+  while (( elapsed < timeout )); do
+    if [[ -f "$result_path" ]]; then
+      break
+    fi
+    sleep "$interval"
+    elapsed=$(( elapsed + interval ))
+  done
+
+  if [[ ! -f "$result_path" ]]; then
+    printf 'error: cron-staging timed out after %ss waiting for daemon to apply %s\n' \
+      "$timeout" "$request_uuid" >&2
+    printf '       (daemon may be down; staging file: %s/%s/%s.json)\n' \
+      "$staging_dir" "$actor_agent" "$request_uuid" >&2
+    return 4
+  fi
+
+  # Parse the result.json status / cron_id / error.
+  local result_status="" result_cron_id="" result_error=""
+  # shellcheck disable=SC2034
+  local _parsed
+  _parsed="$(python3 - "$result_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+print("status=" + (data.get("status") or ""))
+print("cron_id=" + (data.get("cron_id") or ""))
+print("error=" + (data.get("error") or ""))
+PY
+)" || bridge_die "cron-staging cannot parse $result_path"
+
+  while IFS= read -r _line; do
+    case "$_line" in
+      status=*) result_status="${_line#status=}" ;;
+      cron_id=*) result_cron_id="${_line#cron_id=}" ;;
+      error=*) result_error="${_line#error=}" ;;
+    esac
+  done <<<"$_parsed"
+
+  if [[ "$result_status" == "ok" ]]; then
+    # Match native-create's stdout shape so existing parsers
+    # (e.g. cron-mutation-audit smoke) continue to work.
+    printf 'created native cron job %s for %s\n' "$result_cron_id" "$agent"
+    return 0
+  fi
+  printf 'error: cron-staging apply failed: %s\n' "${result_error:-unknown_error}" >&2
+  return 5
 }
 
 run_update() {
