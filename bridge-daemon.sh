@@ -4075,21 +4075,38 @@ bridge_daemon_note_autostart_failure() {
   local next_retry_ts=0
   local delay=5
   local now=0
+  local last_escalated_count=0
+  local last_escalated_ts=0
+  # Declare the escalation marker vars as locals so dynamic-scoping
+  # lookups from the helper (which assigns via `printf -v` / direct
+  # assignment under bash's dynamic-scoping rules) update THIS
+  # function's scope, not the helper's local frame. Pre-fix the helper's
+  # assignment would have shadowed in its own frame, the cat >"$file"
+  # below would always write `AUTO_START_LAST_ESCALATED_TS=0`, and the
+  # cooldown gate would re-fire on every tick.
+  local AUTO_START_LAST_ESCALATED_COUNT=""
+  local AUTO_START_LAST_ESCALATED_TS=""
 
   file="$(bridge_daemon_autostart_state_file "$agent")"
   mkdir -p "$(dirname "$file")"
   if [[ -f "$file" ]]; then
     daemon_source_state_file "$file" "autostart/$agent" 1 "AUTO_START_NEXT_RETRY_TS" \
-        "AUTO_START_FAIL_COUNT AUTO_START_LAST_REASON" \
+        "AUTO_START_FAIL_COUNT AUTO_START_LAST_REASON AUTO_START_LAST_ESCALATED_COUNT AUTO_START_LAST_ESCALATED_TS" \
       || true
   else
     # No state file means a fresh agent or a cleared backoff — wipe any
     # AUTO_START_* values left over from a different agent in this same
     # daemon process so the new fail_count counter starts at 0. (#576 r3)
     unset AUTO_START_FAIL_COUNT AUTO_START_NEXT_RETRY_TS AUTO_START_LAST_REASON
+    AUTO_START_LAST_ESCALATED_COUNT=""
+    AUTO_START_LAST_ESCALATED_TS=""
   fi
   AUTO_START_FAIL_COUNT="${AUTO_START_FAIL_COUNT:-0}"
   [[ "$AUTO_START_FAIL_COUNT" =~ ^[0-9]+$ ]] || AUTO_START_FAIL_COUNT=0
+  last_escalated_count="${AUTO_START_LAST_ESCALATED_COUNT:-0}"
+  [[ "$last_escalated_count" =~ ^[0-9]+$ ]] || last_escalated_count=0
+  last_escalated_ts="${AUTO_START_LAST_ESCALATED_TS:-0}"
+  [[ "$last_escalated_ts" =~ ^[0-9]+$ ]] || last_escalated_ts=0
   fail_count=$(( AUTO_START_FAIL_COUNT + 1 ))
   now="$(date +%s)"
   if (( fail_count >= 10 )); then
@@ -4100,10 +4117,35 @@ bridge_daemon_note_autostart_failure() {
     delay=30
   fi
   next_retry_ts=$(( now + delay ))
+
+  # Issue #1320 (beta5-2 Lane ι) — H2 always-on launch-failure escalation.
+  # Before this fix, fail_count >= 10 only adjusted the retry delay; the
+  # agent stayed in a 5min backoff loop with no operator-visible signal
+  # beyond the daemon log line. Now: when the fail counter crosses the
+  # escalation threshold (env: BRIDGE_ALWAYS_ON_FAIL_ESCALATE_AFTER,
+  # default 10), file an admin task + emit a structured audit row, then
+  # re-arm the cooldown so the loop does NOT abandon retry. The
+  # escalation fires once per cooldown window
+  # (BRIDGE_ALWAYS_ON_ESCALATE_COOLDOWN_SECS, default 1800s) so a stable
+  # always-on flap does not spam admin tasks. Backoff continues unchanged.
+  #
+  # Edge case (brief #2): a transient flap (10 fails recovered on 11th)
+  # files ONE admin task but the retry loop keeps trying. The
+  # recovery path (bridge_daemon_clear_autostart_failure on a successful
+  # launch) wipes the escalation marker so a FUTURE flap can re-escalate.
+  bridge_daemon_maybe_escalate_always_on_fail \
+    "$agent" "$reason" "$fail_count" "$now" \
+    "$last_escalated_count" "$last_escalated_ts" || true
+
+  # Re-read the escalation markers in case the helper bumped them — the
+  # helper writes via printf -v on the same scope vars so we pick up the
+  # new values without round-tripping through the file.
   cat >"$file" <<EOF
 AUTO_START_FAIL_COUNT=$fail_count
 AUTO_START_NEXT_RETRY_TS=$next_retry_ts
 AUTO_START_LAST_REASON=$(printf '%q' "$reason")
+AUTO_START_LAST_ESCALATED_COUNT=${AUTO_START_LAST_ESCALATED_COUNT:-0}
+AUTO_START_LAST_ESCALATED_TS=${AUTO_START_LAST_ESCALATED_TS:-0}
 EOF
   daemon_info "auto-start backoff ${agent} (failures=${fail_count}, retry_in=${delay}s, reason=${reason})"
 }
@@ -4111,6 +4153,150 @@ EOF
 bridge_daemon_clear_autostart_failure() {
   local agent="$1"
   rm -f "$(bridge_daemon_autostart_state_file "$agent")"
+}
+
+# Issue #1320 (beta5-2 Lane ι) — H2 always-on launch-failure escalation.
+#
+# Files a high-priority admin task once the always-on launch fail counter
+# crosses BRIDGE_ALWAYS_ON_FAIL_ESCALATE_AFTER (default 10), AND
+# BRIDGE_ALWAYS_ON_ESCALATE_COOLDOWN_SECS (default 1800s) has elapsed
+# since the last escalation. The cooldown re-arm prevents one wedged
+# always-on agent from filing a fresh task every 5 minutes (one per
+# backoff window after fail_count >= 10).
+#
+# Side effects:
+#   - Sets AUTO_START_LAST_ESCALATED_COUNT / _TS env vars in the caller's
+#     scope so bridge_daemon_note_autostart_failure picks them up and
+#     persists them to the backoff state file.
+#   - Files a `bridge-task create` to admin (no-op if admin unset or
+#     CLI unreachable — never crash the daemon).
+#   - Emits a `always_on_launch_failure_escalated` audit row.
+#
+# Does NOT change the retry/backoff delay — the caller still re-arms the
+# next_retry_ts via its existing ladder. Returns 0 always (failures
+# inside the helper must never propagate to the daemon main loop).
+#
+# Edge cases honored:
+#   - admin agent itself wedged (BRIDGE_ADMIN_AGENT_ID == $agent): skip
+#     the admin-task create (avoid feedback loop) but still emit audit.
+#   - admin agent unconfigured: audit row only, no task.
+#   - cooldown bumped but escalation never fired (e.g. file was
+#     pre-populated with future _TS): we trust the recorded markers and
+#     do not double-escalate.
+bridge_daemon_maybe_escalate_always_on_fail() {
+  local agent="$1"
+  local reason="$2"
+  local fail_count="$3"
+  local now_ts="$4"
+  local last_count="$5"
+  local last_ts="$6"
+
+  local threshold="${BRIDGE_ALWAYS_ON_FAIL_ESCALATE_AFTER:-10}"
+  [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=10
+  (( threshold > 0 )) || threshold=10
+
+  local cooldown="${BRIDGE_ALWAYS_ON_ESCALATE_COOLDOWN_SECS:-1800}"
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=1800
+  (( cooldown >= 0 )) || cooldown=1800
+
+  # Threshold gate — below it, leave markers untouched.
+  (( fail_count >= threshold )) || return 0
+
+  # Cooldown gate — already escalated and the window has not elapsed.
+  # last_ts > now_ts is the clock-skew/restored-backup case; treat it as
+  # "freshly escalated" so we don't accidentally double-fire when the
+  # state file came from a future-dated host.
+  if (( last_ts > 0 )); then
+    if (( last_ts > now_ts )) || (( now_ts - last_ts < cooldown )); then
+      return 0
+    fi
+  fi
+
+  # Mark BEFORE we attempt the side effects so a partial failure (e.g.
+  # bridge-task CLI not yet executable on a fresh install) still updates
+  # the marker and respects the cooldown — the audit row alone is the
+  # secondary operator-visible signal.
+  AUTO_START_LAST_ESCALATED_COUNT="$fail_count"
+  AUTO_START_LAST_ESCALATED_TS="$now_ts"
+
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local hostname_short=""
+  hostname_short="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+
+  bridge_audit_log daemon always_on_launch_failure_escalated "$agent" \
+    --detail fail_count="$fail_count" \
+    --detail threshold="$threshold" \
+    --detail cooldown_secs="$cooldown" \
+    --detail reason="$reason" \
+    --detail admin="${admin:-none}" \
+    2>/dev/null || true
+
+  [[ -n "$admin" ]] || return 0
+  # Feedback-loop guard: the admin agent itself is the one wedged. Skip
+  # the task create — the queued task would just add load against the
+  # very agent that cannot launch. Audit row already captures the
+  # signal; an operator-visible queue task is meaningless against a
+  # wedged admin.
+  [[ "$agent" != "$admin" ]] || return 0
+
+  local target_bridge=""
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  else
+    return 0
+  fi
+
+  local body_file
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-always-on-fail.md.XXXXXX")"
+  cat >"$body_file" <<EOF
+# Always-on launch-failure loop for ${agent}
+
+The always-on auto-start loop for \`${agent}\` has accumulated
+\`${fail_count}\` consecutive failures (threshold ${threshold}). The
+agent remains in the daemon's backoff loop and the retry budget has NOT
+been abandoned, but operator-visible action is required.
+
+- agent: ${agent}
+- fail_count: ${fail_count}
+- threshold: ${threshold}
+- last reason: ${reason}
+- cooldown_secs: ${cooldown}
+- host: ${hostname_short}
+
+Likely causes (in order of frequency):
+
+1. Engine CLI missing from PATH (\`engine-cli-missing:<engine>\` reason
+   indicates this) — install the engine or fix PATH.
+2. Channel-required validator miss — the agent's setup is incomplete.
+   Run \`agent-bridge setup <channel>\` for the missing channel.
+3. State-dir self-heal failed — permissions issue inside the agent's
+   \`state/agents/<a>/\` runtime home (often iso v2 ownership drift).
+4. Session exits within ~1s — the engine launched but immediately
+   crashed; check stderr captures in \`logs/\` for repro.
+
+Next steps:
+
+- \`agent-bridge agent show ${agent}\` — review channel/engine status.
+- \`agent-bridge audit follow --action always_on_launch_failure_escalated\`
+  — confirm cadence + reason history.
+- If repaired: \`agent-bridge agent start ${agent}\` clears the backoff
+  state and resumes immediately (instead of waiting on the 300s retry).
+
+This is the operator-visible audit signal for issue #1320. Retry
+continues in the background; this task fires at most once per
+${cooldown}s cooldown window per agent.
+EOF
+
+  if ! "$target_bridge" task create \
+       --to "$admin" --priority high --from daemon \
+       --title "[always-on-launch-failure] ${agent} stuck (${fail_count} fails) on ${hostname_short}" \
+       --body-file "$body_file" >/dev/null 2>&1; then
+    daemon_warn "failed to file [always-on-launch-failure] task for ${agent} to admin=${admin}; audit row recorded"
+  fi
+  rm -f "$body_file" >/dev/null 2>&1 || true
+  return 0
 }
 
 # Issue #1234 (Lane δ, v0.15.0-beta2) — codex r1 BLOCKING parity fix:
@@ -4205,14 +4391,36 @@ bridge_dashboard_post_if_changed() {
   rm -f "$summary_file"
 }
 
-# --- Inbox-nudge dedup (issue #767) -----------------------------------------
-# Suppress repeat inbox nudges when the agent's pending-task fingerprint has
+# --- Inbox-nudge dedup (issue #767, #1322) ---------------------------------
+# Suppress repeat inbox nudges when an agent's pending-task fingerprint has
 # not changed AND a recent nudge was already delivered. Without this, an
 # agent that's mid-tool-call (e.g., a long bash invocation) accumulates
 # identical "ACTION REQUIRED" payloads in its transcript every daemon tick
-# until the bash returns. Per-agent state lives in
-# $BRIDGE_STATE_DIR/daemon-nudge-state/<agent>.env. The companion
-# busy-aware gate (defer while pane is IN_TOOL_USE) is a follow-up.
+# until the bash returns.
+#
+# Issue #1322 (beta5-2 Lane ι) — H4 per-(agent, task_id) dedup. The pre-fix
+# fingerprint was a sha1 over the FULL sorted set of queued task ids,
+# stored at the per-agent grain. When a new task arrives the fingerprint
+# changes; the dedup record is overwritten; the next tick treats the new
+# composite as a fresh signal and re-fires. BUT the side effect was that
+# the per-task "I was just nudged" timing was lost — task#1 (originally
+# nudged at t0) and task#3 (added at t5) end up sharing the t5 timestamp
+# in the LAST_NUDGE_TS field, so task#1's individual redelivery window
+# resets too. With per-task tracking each task_id has its own window:
+# task#1 keeps its t0 mark, task#3 gets a fresh t5 mark, and adding/
+# removing siblings does NOT slide either window.
+#
+# State layout: per-agent .env file at
+#   $BRIDGE_STATE_DIR/daemon-nudge-state/<agent>.env
+# Contains:
+#   LAST_NUDGE_FINGERPRINT  — composite sha1 (legacy, kept for back-compat
+#                              audit detail emit)
+#   LAST_NUDGE_TS           — composite ts (legacy, kept for audit emit)
+#   NUDGE_TASK_TS_<id>      — per-task last-nudge timestamp (new)
+# Backward compatibility: existing files without NUDGE_TASK_TS_* entries
+# fall back to the composite LAST_NUDGE_TS the first tick after upgrade.
+# The composite fields are still updated so an operator reading the
+# state file directly sees a sensible last-seen value.
 bridge_daemon_nudge_state_file() {
   local agent="$1"
   local dir="$BRIDGE_STATE_DIR/daemon-nudge-state"
@@ -4234,42 +4442,154 @@ bridge_daemon_compute_nudge_fingerprint() {
   printf '%s\n' "${id_csv//,/$'\n'}" | sort -n | sha1sum | cut -d' ' -f1
 }
 
-# Return 0 (skip) when the recorded fingerprint matches the incoming one AND
-# the recorded timestamp is within the redelivery window. Any other condition
-# (missing file, mismatched fingerprint, expired window, unreadable state)
-# returns non-zero so the caller proceeds to fire the nudge. Setting
+# Build the mangled var name for a per-task NUDGE_TASK_TS_<id> entry.
+# Sanitize non-[A-Za-z0-9_] chars defensively even though task ids are
+# expected to be numeric (sqlite rowid).
+bridge_daemon_nudge_task_ts_var() {
+  local task_id="$1"
+  local sanitized
+  # shellcheck disable=SC2001  # bash parameter expansion lacks regex class
+  sanitized="$(printf '%s' "$task_id" | sed 's/[^A-Za-z0-9_]/_/g')"
+  printf 'NUDGE_TASK_TS_%s' "$sanitized"
+}
+
+# Issue #1322 — load per-task state into the caller's scope. Sets
+# NUDGE_TASK_TS_<id> globals (plus the legacy composite fields) and
+# returns 0. Caller is responsible for calling
+# bridge_daemon_nudge_dedup_reset_scope before EACH load so values
+# from a previous agent's load cannot leak across iterations.
+bridge_daemon_nudge_dedup_load() {
+  local agent="$1"
+  local file
+  file="$(bridge_daemon_nudge_state_file "$agent")"
+  [[ -f "$file" ]] || return 0
+  # shellcheck source=/dev/null
+  source "$file" 2>/dev/null || true
+}
+
+# Issue #1322 — clear any NUDGE_TASK_TS_* / LAST_NUDGE_* vars currently
+# in scope. Mirrors the deferred-counter sanitize pattern so an earlier
+# agent's per-task timestamps cannot leak into the next iteration's
+# decision. Does NOT touch the on-disk file.
+bridge_daemon_nudge_dedup_reset_scope() {
+  local var
+  for var in $(compgen -v NUDGE_TASK_TS_ 2>/dev/null); do
+    unset "$var"
+  done
+  unset LAST_NUDGE_FINGERPRINT LAST_NUDGE_TS 2>/dev/null || true
+}
+
+# Return 0 (skip) when EVERY queued task id in the incoming live set was
+# nudged within the redelivery window. Per-(agent, task_id) granular.
+# A single new task id (no recorded timestamp) breaks the dedup and the
+# caller proceeds to fire the nudge. Setting
 # BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS=0 disables dedup entirely.
+#
+# Backward-compat: legacy state files that pre-date the per-task entries
+# fall back to the composite LAST_NUDGE_FINGERPRINT + LAST_NUDGE_TS pair
+# the first tick post-upgrade (so an in-flight redelivery window is not
+# discarded on the daemon restart). Subsequent ticks re-fingerprint per
+# task naturally as bridge_daemon_record_nudge writes the new entries.
+#
+# Edge case (brief #1): healthy agent with rapid task add/complete —
+# task#1 nudged at t0, claimed at t1, done at t2. task#3 arrives at t3.
+# task#3's NUDGE_TASK_TS_3 is unset → return non-zero → fire nudge.
+# task#1's NUDGE_TASK_TS_1 lingers in the file but does not affect the
+# decision (the live set no longer contains #1). Pruning the stale
+# entries is handled by bridge_daemon_record_nudge on every write.
 bridge_daemon_should_skip_nudge() {
   local agent="$1"
   local fingerprint="$2"
+  local id_csv="${3:-}"
   local redelivery="${BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS:-60}"
   [[ "$redelivery" =~ ^[0-9]+$ ]] || redelivery=60
   (( redelivery > 0 )) || return 1
   local file
   file="$(bridge_daemon_nudge_state_file "$agent")"
   [[ -f "$file" ]] || return 1
-  local LAST_NUDGE_FINGERPRINT="" LAST_NUDGE_TS="0"
-  daemon_source_state_file "$file" "nudge-dedup" 0 || return 1
-  [[ "$LAST_NUDGE_FINGERPRINT" == "$fingerprint" ]] || return 1
-  [[ "$LAST_NUDGE_TS" =~ ^[0-9]+$ ]] || return 1
+
+  bridge_daemon_nudge_dedup_reset_scope
+  bridge_daemon_nudge_dedup_load "$agent" || return 1
+
   local now
   now="$(date +%s)"
-  (( LAST_NUDGE_TS <= now )) || return 1  # clock-skew guard: future TS makes signed Bash arithmetic falsely skip
+
+  # Per-task path: when id_csv is non-empty, require every id to have a
+  # recent NUDGE_TASK_TS_<id> entry. A single missing id (new task) or a
+  # single expired window short-circuits to "fire nudge".
+  if [[ -n "$id_csv" ]]; then
+    # Check at least one per-task entry exists; if NONE exist, the file
+    # pre-dates the per-task migration and we fall back to composite.
+    local has_per_task=0
+    local var
+    for var in $(compgen -v NUDGE_TASK_TS_ 2>/dev/null); do
+      has_per_task=1
+      break
+    done
+    if (( has_per_task == 1 )); then
+      local id ts ts_var
+      # shellcheck disable=SC2001
+      local ids_nl
+      ids_nl="$(printf '%s' "$id_csv" | tr ',' '\n')"
+      while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        ts_var="$(bridge_daemon_nudge_task_ts_var "$id")"
+        ts="${!ts_var:-}"
+        [[ -n "$ts" && "$ts" =~ ^[0-9]+$ ]] || return 1
+        (( ts <= now )) || return 1   # clock-skew guard
+        (( now - ts < redelivery )) || return 1
+      done <<<"$ids_nl"
+      return 0
+    fi
+  fi
+
+  # Composite-fallback path (legacy state file or empty id_csv).
+  [[ "${LAST_NUDGE_FINGERPRINT:-}" == "$fingerprint" ]] || return 1
+  [[ "${LAST_NUDGE_TS:-0}" =~ ^[0-9]+$ ]] || return 1
+  (( LAST_NUDGE_TS <= now )) || return 1
   (( now - LAST_NUDGE_TS < redelivery )) || return 1
   return 0
 }
 
-# Atomic write so a concurrent reader never sees a half-flushed file.
+# Atomic write — also prunes stale NUDGE_TASK_TS_<id> entries whose id
+# is no longer in the live id_csv (the agent finished those tasks). This
+# keeps the state file bounded; otherwise a long-lived high-turnover
+# agent's file would grow without limit.
+#
+# id_csv="" preserves the legacy composite-only write so callers without
+# a concrete id list (older code paths, tests) still work.
 bridge_daemon_record_nudge() {
   local agent="$1"
   local fingerprint="$2"
+  local id_csv="${3:-}"
   local file tmp now
   file="$(bridge_daemon_nudge_state_file "$agent")"
   now="$(date +%s)"
   tmp="$(mktemp "${file}.XXXXXX")" || return 1
+
+  # Build the set of "live" ids so we know which NUDGE_TASK_TS_* to keep.
+  # Footgun: `printf "%s" "$id_csv" | tr "," "\n"` produces no trailing
+  # newline, so `read -r` ends on EOF before consuming the final id.
+  # Use `read -r id || [[ -n $id ]]` to read past the last separator.
+  declare -A _NUDGE_LIVE_IDS=()
+  if [[ -n "$id_csv" ]]; then
+    local id
+    while IFS= read -r id || [[ -n "$id" ]]; do
+      [[ -n "$id" ]] || continue
+      _NUDGE_LIVE_IDS["$id"]=1
+    done < <(printf '%s' "$id_csv" | tr ',' '\n')
+  fi
+
   {
     printf 'LAST_NUDGE_FINGERPRINT=%q\n' "$fingerprint"
     printf 'LAST_NUDGE_TS=%q\n' "$now"
+    if [[ -n "$id_csv" ]]; then
+      local id ts_var
+      for id in "${!_NUDGE_LIVE_IDS[@]}"; do
+        ts_var="$(bridge_daemon_nudge_task_ts_var "$id")"
+        printf '%s=%q\n' "$ts_var" "$now"
+      done
+    fi
   } > "$tmp"
   mv "$tmp" "$file"
 }
@@ -4553,6 +4873,760 @@ EOF
   return 0
 }
 
+# Issue #1323 (beta5-2 Lane ι) — H5 recheck-timeout retry + escalation.
+#
+# Pre-fix: nudge_agent_session's eligibility-recheck timeout (15s) caused
+# the call to return 0 (interpreted as success), the task was skipped
+# this tick, and the next tick proceeded normally. Under sustained load
+# (sqlite contention, daemon-helpers wedge, etc.) a task could stall
+# indefinitely with no operator-visible signal beyond the generic
+# `daemon_subprocess_timeout` row — which says "the call timed out" but
+# does NOT name the affected task. The fix:
+#
+#   1. Emit a SECOND audit row (`nudge_eligibility_recheck_timeout`)
+#      named to the (agent, task_id) pair so an operator filtering by
+#      action can find every affected task without correlating against
+#      the generic timeout row.
+#   2. Track per-(agent, task_id) consecutive timeouts on disk so the
+#      next-tick retry is invisible only as long as the helper recovers
+#      quickly. After M consecutive (env
+#      BRIDGE_NUDGE_RECHECK_TIMEOUT_ESCALATE_AFTER, default 5), file an
+#      admin task + emit `nudge_recheck_timeout_escalated`. Cooldown is
+#      implicit (admin task fires once per pair, cleared by a verified
+#      successful send via `bridge_daemon_nudge_recheck_timeout_clear`).
+#   3. The task remains queued — the caller's `return 0` keeps the
+#      next-tick natural retry intact.
+#
+# State layout: per-agent .env file at
+#   $BRIDGE_STATE_DIR/daemon-nudge-recheck-timeout/<agent>.env
+# Contains:
+#   _RECHECK_TIMEOUT_COUNT_<task_id>     — per-task consecutive timeouts
+#   _RECHECK_TIMEOUT_ESCALATED_<task_id> — at-most-once admin-task marker
+bridge_daemon_nudge_recheck_timeout_state_file() {
+  local agent="$1"
+  local dir="$BRIDGE_STATE_DIR/daemon-nudge-recheck-timeout"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s' "$dir/${agent}.env"
+}
+
+bridge_daemon_nudge_recheck_timeout_load() {
+  local agent="$1"
+  local file
+  file="$(bridge_daemon_nudge_recheck_timeout_state_file "$agent")"
+  [[ -f "$file" ]] || return 0
+  # shellcheck source=/dev/null
+  source "$file" 2>/dev/null || true
+}
+
+bridge_daemon_nudge_recheck_timeout_save() {
+  local agent="$1"
+  local file tmp var
+  file="$(bridge_daemon_nudge_recheck_timeout_state_file "$agent")"
+  tmp="$(mktemp "${file}.XXXXXX")" || return 1
+  {
+    for var in $(compgen -v _RECHECK_TIMEOUT_COUNT_ 2>/dev/null); do
+      printf '%s=%q\n' "$var" "${!var}"
+    done
+    for var in $(compgen -v _RECHECK_TIMEOUT_ESCALATED_ 2>/dev/null); do
+      printf '%s=%q\n' "$var" "${!var}"
+    done
+  } > "$tmp"
+  mv "$tmp" "$file"
+}
+
+bridge_daemon_nudge_recheck_timeout_reset_scope() {
+  local var
+  for var in $(compgen -v _RECHECK_TIMEOUT_COUNT_ 2>/dev/null); do
+    unset "$var"
+  done
+  for var in $(compgen -v _RECHECK_TIMEOUT_ESCALATED_ 2>/dev/null); do
+    unset "$var"
+  done
+}
+
+# Clear ALL per-task recheck-timeout state for an agent. Called from
+# nudge_agent_session after a verified successful nudge so a recovered
+# agent (helper returned in time) does not carry stale counters forward.
+bridge_daemon_nudge_recheck_timeout_clear() {
+  local agent="$1"
+  local file
+  file="$(bridge_daemon_nudge_recheck_timeout_state_file "$agent")"
+  [[ -f "$file" ]] || return 0
+  rm -f "$file" >/dev/null 2>&1 || true
+  bridge_daemon_nudge_recheck_timeout_reset_scope
+}
+
+# Increment the per-(agent, task_id) consecutive-timeout counter; emit
+# the structured audit row; and — when the threshold is crossed AND we
+# have not already escalated this pair — file an admin task + emit
+# `nudge_recheck_timeout_escalated`. Always returns 0.
+#
+# task_id="none" is the canonical sentinel when live_nudge_key was empty
+# (which would itself indicate an upstream race since the eligibility
+# recheck only runs after live_queued > 0). Escalation still proceeds
+# under task=none so the operator sees the signal.
+bridge_daemon_nudge_recheck_timeout_track() {
+  local agent="$1"
+  local task_id="${2:-none}"
+  local timeout_secs="${3:-15}"
+  local exit_code="${4:-124}"
+  local queued="${5:-0}"
+
+  [[ -n "$agent" ]] || return 0
+
+  local threshold="${BRIDGE_NUDGE_RECHECK_TIMEOUT_ESCALATE_AFTER:-5}"
+  [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=5
+  (( threshold > 0 )) || threshold=5
+
+  bridge_daemon_nudge_recheck_timeout_reset_scope
+  bridge_daemon_nudge_recheck_timeout_load "$agent"
+
+  local count_var escalated_var
+  count_var="$(bridge_daemon_nudge_deferred_var_name _RECHECK_TIMEOUT_COUNT_ "$task_id")"
+  escalated_var="$(bridge_daemon_nudge_deferred_var_name _RECHECK_TIMEOUT_ESCALATED_ "$task_id")"
+
+  local prev_count="${!count_var:-0}"
+  [[ "$prev_count" =~ ^[0-9]+$ ]] || prev_count=0
+  local new_count=$(( prev_count + 1 ))
+  # shellcheck disable=SC2229,SC1083
+  printf -v "$count_var" '%s' "$new_count"
+  bridge_daemon_nudge_recheck_timeout_save "$agent" || true
+
+  bridge_audit_log daemon nudge_eligibility_recheck_timeout "$agent" \
+    --detail task_id="${task_id:-none}" \
+    --detail consecutive="$new_count" \
+    --detail threshold="$threshold" \
+    --detail timeout_secs="$timeout_secs" \
+    --detail exit_code="$exit_code" \
+    --detail queued="$queued" \
+    2>/dev/null || true
+
+  local already_escalated="${!escalated_var:-0}"
+  [[ "$already_escalated" =~ ^[0-9]+$ ]] || already_escalated=0
+  if (( new_count >= threshold )) && (( already_escalated == 0 )); then
+    # shellcheck disable=SC2229,SC1083
+    printf -v "$escalated_var" '%s' "1"
+    bridge_daemon_nudge_recheck_timeout_save "$agent" || true
+    bridge_daemon_nudge_emit_recheck_timeout_admin_task \
+      "$agent" "$task_id" "$new_count" "$threshold" "$timeout_secs" "$queued" || true
+    bridge_audit_log daemon nudge_recheck_timeout_escalated "$agent" \
+      --detail task_id="${task_id:-none}" \
+      --detail consecutive="$new_count" \
+      --detail threshold="$threshold" \
+      --detail timeout_secs="$timeout_secs" \
+      --detail queued="$queued" \
+      2>/dev/null || true
+  fi
+  return 0
+}
+
+# Best-effort admin task for sustained recheck-timeout escalation. Same
+# no-feedback-loop + missing-bridge guards as the deferred variant.
+bridge_daemon_nudge_emit_recheck_timeout_admin_task() {
+  local agent="$1"
+  local task_id="${2:-none}"
+  local consecutive="${3:-0}"
+  local threshold="${4:-5}"
+  local timeout_secs="${5:-15}"
+  local queued="${6:-0}"
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local target_bridge=""
+  local body_file=""
+  local hostname_short=""
+
+  [[ -n "$admin" ]] || return 0
+  [[ "$agent" != "$admin" ]] || return 0
+
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  else
+    return 0
+  fi
+
+  hostname_short="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-recheck-timeout.md.XXXXXX")"
+  cat >"$body_file" <<EOF
+# Nudge eligibility recheck timeout ${consecutive}× for ${agent}
+
+The daemon's per-tick eligibility recheck (15s ceiling on the
+\`bridge-daemon-helpers.py nudge-eligibility-recheck\` call) has timed
+out ${consecutive} consecutive times (threshold ${threshold}) while
+trying to nudge \`${agent}\`. The candidate task remains queued — the
+next tick will retry naturally — but operator-visible action may be
+required if the timeout pattern persists.
+
+- agent: ${agent}
+- task id: ${task_id}
+- consecutive timeouts: ${consecutive}
+- timeout_secs: ${timeout_secs}
+- queued (live): ${queued}
+- host: ${hostname_short}
+
+Likely causes:
+
+1. Sqlite contention on the queue DB (heavy concurrent writers).
+2. \`bridge-daemon-helpers.py\` wedged on a slow query (no index hit).
+3. python3 cold-start latency under low memory / high CPU load.
+4. Filesystem stall (NFS, iso v2 sudo wrapper) on the helper read path.
+
+Next steps:
+
+- \`agent-bridge audit follow --action nudge_eligibility_recheck_timeout\`
+  — confirm the cadence + which task ids are affected.
+- \`bridge-daemon.sh status\` — confirm the daemon itself is healthy.
+- \`agent-bridge agent show ${agent}\` — confirm the agent's queue
+  shape is what you expect.
+
+The task remains queued throughout. This task fires at most once per
+(agent, task_id) pair until a verified successful nudge clears the
+counter via \`bridge_daemon_nudge_recheck_timeout_clear\`.
+EOF
+
+  if ! "$target_bridge" task create \
+       --to "$admin" --priority high --from daemon \
+       --title "[nudge-recheck-timeout] ${agent} task=${task_id} (${consecutive}× timeouts) on ${hostname_short}" \
+       --body-file "$body_file" >/dev/null 2>&1; then
+    daemon_warn "failed to file [nudge-recheck-timeout] task for ${agent} to admin=${admin}; check the admin id and try again"
+  fi
+  rm -f "$body_file" >/dev/null 2>&1 || true
+  return 0
+}
+
+# Issue #1321 (beta5-2 Lane ι) — H3 MCP recovery re-deliver miss messages.
+#
+# Background: while an agent's MCP-liveness is in giveup state, any
+# bridge_notify_send invocation against that agent typically fails
+# (channel transport is down). Pre-fix the failed notify was logged to
+# the audit row + stderr but the message itself was lost — when
+# `plugin_mcp_liveness_recovered` fired, the daemon only restarted MCP;
+# it did NOT replay the missed notifications, so user-facing messages
+# (e.g. Teams notifications during a transient outage) stayed
+# perpetually undelivered.
+#
+# Fix: enqueue a per-agent jsonl miss-log every time a notify fails
+# AND the agent is currently in giveup state. On
+# `plugin_mcp_liveness_recovered` the daemon drains up to N entries
+# (env: BRIDGE_MCP_RECOVERY_REDELIVER_CAP, default 50) and retries via
+# the canonical bridge_notify_send path. Each entry carries a stable
+# dedup key (sha1 of agent|title|body) so a retried delivery that
+# itself fails does not cause a double-deliver on the next recovery.
+#
+# State layout: append-only jsonl at
+#   $BRIDGE_STATE_DIR/mcp-miss-queue/<agent>.jsonl
+# Each line is a single JSON object:
+#   { "ts": int, "title": str, "body": str, "priority": str,
+#     "task_id": str, "dedup_key": sha1 }
+# After a successful re-delivery the entry is removed via an atomic
+# rewrite (drop the consumed lines, keep the unconsumed tail). Entries
+# whose redelivery itself fails are kept in place so the NEXT recovery
+# tick gets another attempt.
+#
+# Cap honored: drain at most BRIDGE_MCP_RECOVERY_REDELIVER_CAP entries
+# per recovery tick. Surplus entries stay in the file for the next
+# recovery (or the next manual cron-triggered drain).
+#
+# Edge cases honored:
+#   - Cap = 0 disables redelivery entirely (no-op, keep log).
+#   - Recovery tick called for an agent with no miss log → no-op.
+#   - File corruption (non-JSON line) → log audit warning + skip the
+#     malformed entry, continue with the rest.
+#   - File grew unbounded (operator never investigated) → tail-trim to
+#     BRIDGE_MCP_MISS_QUEUE_HARD_CAP entries (default 500). Drops the
+#     OLDEST entries so the newest are most likely retried.
+bridge_daemon_mcp_miss_queue_file() {
+  local agent="$1"
+  local dir="$BRIDGE_STATE_DIR/mcp-miss-queue"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s' "$dir/${agent}.jsonl"
+}
+
+# Enqueue a miss entry. Best-effort: silent no-op on python failure
+# (the caller is already in a degraded path, must not propagate).
+# Caller: bridge_notify_send + analogues that detect a giveup-window
+# delivery failure.
+bridge_daemon_mcp_miss_queue_enqueue() {
+  local agent="$1"
+  local title="${2:-}"
+  local body="${3:-}"
+  local priority="${4:-normal}"
+  local task_id="${5:-}"
+  local file now dedup_key
+
+  [[ -n "$agent" ]] || return 0
+  file="$(bridge_daemon_mcp_miss_queue_file "$agent")"
+  now="$(date +%s)"
+
+  # Stable dedup key — same (agent, title, body) on a re-fire won't
+  # duplicate-enqueue across multiple retry rounds. body is hashed
+  # with sha1 to keep the on-disk size bounded even for long bodies.
+  dedup_key="$(printf '%s|%s|%s' "$agent" "$title" "$body" | sha1sum | cut -d' ' -f1)"
+
+  # Skip if the dedup_key is already present in the file (de-dupe the
+  # enqueue itself). Lightweight grep — the file is per-agent and
+  # bounded by the hard cap. Match the bare 40-char hex hash so we
+  # are insensitive to JSON whitespace style ("key":"v" vs "key": "v")
+  # produced by different python json.dumps configurations.
+  if [[ -f "$file" ]] && grep -F "$dedup_key" "$file" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Use python json.dumps for safe escaping — title/body may contain
+  # any unicode + control char.
+  bridge_require_python 2>/dev/null || return 0
+  python3 - "$agent" "$title" "$body" "$priority" "$task_id" "$now" "$dedup_key" "$file" <<'PY' 2>/dev/null || return 0
+import json, os, sys, tempfile
+agent, title, body, priority, task_id, ts, dedup_key, path = sys.argv[1:9]
+row = {
+    "ts": int(ts),
+    "agent": agent,
+    "title": title,
+    "body": body,
+    "priority": priority,
+    "task_id": task_id,
+    "dedup_key": dedup_key,
+}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+# Hard-cap defense: if file > 500 lines, trim oldest before appending.
+hard_cap = int(os.environ.get("BRIDGE_MCP_MISS_QUEUE_HARD_CAP", "500"))
+existing = []
+if os.path.isfile(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            existing = f.readlines()
+    except OSError:
+        existing = []
+existing.append(json.dumps(row, ensure_ascii=False) + "\n")
+if hard_cap > 0 and len(existing) > hard_cap:
+    existing = existing[-hard_cap:]
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=os.path.basename(path) + ".")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.writelines(existing)
+    os.replace(tmp, path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    sys.exit(1)
+PY
+  return 0
+}
+
+# Drain at most $cap entries from the miss queue and re-deliver each.
+# Entries that re-fail are KEPT (rewrite the file with the un-drained
+# tail + the failed re-attempts). The drain is bounded by both $cap
+# AND BRIDGE_MCP_MISS_QUEUE_HARD_CAP so a corrupted file does not
+# loop forever.
+bridge_daemon_mcp_miss_queue_drain() {
+  local agent="$1"
+  local cap="${2:-50}"
+  local file
+  [[ -n "$agent" ]] || return 0
+  file="$(bridge_daemon_mcp_miss_queue_file "$agent")"
+  [[ -f "$file" ]] || return 0
+  [[ "$cap" =~ ^[0-9]+$ ]] || cap=50
+  (( cap > 0 )) || return 0
+
+  # Parse the JSONL via a python helper that prints each entry as a
+  # TSV row (ts, title, body, priority, task_id, dedup_key); we then
+  # iterate in shell + call bridge_notify_send, then rewrite the file
+  # with what we did NOT successfully redeliver.
+  bridge_require_python 2>/dev/null || return 0
+  local drained_tmp kept_tmp
+  drained_tmp="$(mktemp)"
+  kept_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$drained_tmp' '$kept_tmp'" RETURN
+
+  python3 - "$file" "$cap" "$drained_tmp" <<'PY' 2>/dev/null || return 0
+import json, sys
+path, cap_str, drained_path = sys.argv[1:4]
+cap = int(cap_str)
+rows = []
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                # Skip malformed line; print sentinel so caller audits.
+                sys.stderr.write("malformed_line_skipped\n")
+                continue
+except OSError:
+    sys.exit(0)
+# Sort oldest-first so we redeliver the OLDEST messages first.
+rows.sort(key=lambda r: int(r.get("ts", 0) or 0))
+to_drain = rows[:cap]
+to_keep = rows[cap:]
+# Write the drained list as a TSV with base64 for body to avoid newline
+# issues in the shell loop.
+import base64
+with open(drained_path, "w", encoding="utf-8") as f:
+    for r in to_drain:
+        title = r.get("title", "") or ""
+        body = r.get("body", "") or ""
+        priority = r.get("priority", "normal") or "normal"
+        task_id = r.get("task_id", "") or ""
+        dedup = r.get("dedup_key", "") or ""
+        ts = int(r.get("ts", 0) or 0)
+        title_b64 = base64.b64encode(title.encode("utf-8")).decode("ascii")
+        body_b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
+        # Use `-` sentinel for empty task_id so bash `read -r` cannot
+        # collapse adjacent IFS=$'\t' separators (default behavior for
+        # the rd_read primitive). Shell converts back to "" below.
+        task_id_field = task_id if task_id else "-"
+        f.write(f"{ts}\t{title_b64}\t{body_b64}\t{priority}\t{task_id_field}\t{dedup}\n")
+# Truncate the file to the kept tail so a parallel enqueue doesn't
+# race on a partially-drained file. The caller will re-append any
+# entries that fail re-delivery.
+with open(path, "w", encoding="utf-8") as f:
+    for r in to_keep:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+PY
+
+  local delivered=0 failed=0
+  while IFS=$'\t' read -r _ts title_b64 body_b64 priority task_id dedup_key; do
+    [[ -n "$title_b64" || -n "$body_b64" ]] || continue
+    # Convert the `-` sentinel back to empty (python helper writes `-`
+    # for empty task_id so bash `read -r` cannot collapse adjacent
+    # IFS=$'\t' separators).
+    [[ "$task_id" == "-" ]] && task_id=""
+    local title body
+    title="$(printf '%s' "$title_b64" | base64 -d 2>/dev/null || printf '')"
+    body="$(printf '%s' "$body_b64" | base64 -d 2>/dev/null || printf '')"
+    if bridge_notify_send "$agent" "$title" "$body" "$task_id" "$priority" \
+         "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" >/dev/null 2>&1; then
+      delivered=$(( delivered + 1 ))
+      bridge_audit_log daemon plugin_mcp_recovery_redelivered "$agent" \
+        --detail dedup_key="$dedup_key" \
+        --detail title="$title" \
+        --detail priority="$priority" \
+        --detail task_id="${task_id:-none}" \
+        2>/dev/null || true
+    else
+      failed=$(( failed + 1 ))
+      # Re-append to the file so the next recovery tick retries.
+      # bridge_daemon_mcp_miss_queue_enqueue handles dedup so we won't
+      # double-add.
+      bridge_daemon_mcp_miss_queue_enqueue "$agent" "$title" "$body" "$priority" "$task_id" || true
+      bridge_audit_log daemon plugin_mcp_recovery_redeliver_failed "$agent" \
+        --detail dedup_key="$dedup_key" \
+        --detail title="$title" \
+        --detail priority="$priority" \
+        2>/dev/null || true
+    fi
+  done < "$drained_tmp"
+
+  if (( delivered > 0 )) || (( failed > 0 )); then
+    daemon_info "MCP recovery redeliver for ${agent}: delivered=${delivered} failed=${failed} cap=${cap}"
+    bridge_audit_log daemon plugin_mcp_recovery_redeliver_summary "$agent" \
+      --detail delivered="$delivered" \
+      --detail failed="$failed" \
+      --detail cap="$cap" \
+      2>/dev/null || true
+  fi
+  return 0
+}
+
+# Convenience predicate: returns 0 (zero exit / "true") when the
+# notify path should also enqueue a miss-log entry. Used by both the
+# inline notify failures (e.g. bridge_notify_send wrappers in this
+# file) and external callers.
+bridge_daemon_should_enqueue_mcp_miss() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  bridge_agent_mcp_giveup_active "$agent"
+}
+
+# Wrapper around bridge_notify_send that enqueues a miss-log entry when
+# the underlying send fails AND the agent is in MCP giveup. Returns the
+# notify send's rc so caller-side `|| true` patterns still apply.
+#
+# Drop-in shape: same positional args as bridge_notify_send. Existing
+# call sites that opt-in just rename the function; the suppress/quiet
+# behavior on rc != 0 is unchanged.
+#
+# Edge case (brief #3): MCP recovery flood — the dedup_key in the
+# enqueue helper prevents duplicate-add when the same notify fires
+# multiple times before recovery clears the giveup ledger. The hard
+# cap (BRIDGE_MCP_MISS_QUEUE_HARD_CAP, default 500) protects against
+# a runaway producer.
+bridge_notify_send_with_miss_queue() {
+  local agent="$1"
+  local title="${2:-}"
+  local body="${3:-}"
+  local task_id="${4:-}"
+  local priority="${5:-normal}"
+  local dry_run="${6:-0}"
+  local rc=0
+  bridge_notify_send "$agent" "$title" "$body" "$task_id" "$priority" "$dry_run" >/dev/null 2>&1 || rc=$?
+  if (( rc != 0 )) && bridge_daemon_should_enqueue_mcp_miss "$agent"; then
+    bridge_daemon_mcp_miss_queue_enqueue "$agent" "$title" "$body" "$priority" "$task_id" || true
+    bridge_audit_log daemon plugin_mcp_miss_queue_enqueued "$agent" \
+      --detail title="$title" \
+      --detail priority="$priority" \
+      --detail task_id="${task_id:-none}" \
+      --detail send_rc="$rc" \
+      2>/dev/null || true
+  fi
+  return "$rc"
+}
+
+# Issue #1318 (beta5-2 Lane ι) — 7051-B unclaimed-queue escalation.
+#
+# Pre-fix: tasks queued against a stopped / wedged agent stay queued
+# silently. The audit log shows nothing; the operator only notices
+# when they manually run `agent-bridge inbox <agent>`. Operationally
+# this was the patch-dev "stopped + queued 75min" repro from task
+# #157 in audit 7051.
+#
+# Fix: on every daemon tick, scan tasks whose age exceeds
+# BRIDGE_QUEUE_UNCLAIMED_ESCALATE_SECS (default 1800s) AND have not
+# yet been claimed. For each such task, file an admin task + emit
+# `task_unclaimed_escalated`. Re-arm cooldown
+# (BRIDGE_QUEUE_UNCLAIMED_ESCALATE_COOLDOWN_SECS, default 1800s) per
+# task to avoid spam — the marker file persists so a re-tick within
+# the cooldown window is a no-op.
+#
+# Coordination with the #1106 task-age gate (already in place): the
+# age gate suppresses NUDGES for fresh tasks. This escalation looks
+# at OLDER tasks (>30min) that haven't been picked up at all — the
+# concerns are disjoint. The escalation runs ONCE-per-task; subsequent
+# nudge attempts continue normally if/when the agent comes back.
+#
+# Edge case (brief #6): admin agent stopped/wedged → escalation tasks
+# queue but don't crash daemon. Same feedback-loop guard as the other
+# escalations: skip the task create when the affected agent IS the
+# admin (the admin's own queue task would have nowhere to go).
+#
+# Edge case (brief #5): #1106 age-gate overlap — that gate looks at
+# tasks NEWER than $redelivery (default 60s) and suppresses nudge
+# dispatch. We look at tasks OLDER than 1800s. The two windows are
+# non-overlapping; double-alert is structurally impossible.
+bridge_daemon_unclaimed_escalation_state_dir() {
+  printf '%s/unclaimed-escalations' "$BRIDGE_STATE_DIR"
+}
+
+bridge_daemon_unclaimed_escalation_marker_file() {
+  local task_id="$1"
+  printf '%s/%s.ts' "$(bridge_daemon_unclaimed_escalation_state_dir)" "$task_id"
+}
+
+process_unclaimed_queue_escalation() {
+  local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local age_threshold="${BRIDGE_QUEUE_UNCLAIMED_ESCALATE_SECS:-1800}"
+  local cooldown="${BRIDGE_QUEUE_UNCLAIMED_ESCALATE_COOLDOWN_SECS:-1800}"
+
+  [[ -n "$admin_agent" ]] || return 1
+  bridge_agent_exists "$admin_agent" || return 1
+  [[ "$age_threshold" =~ ^[0-9]+$ ]] || age_threshold=1800
+  (( age_threshold > 0 )) || return 1
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=1800
+
+  local target_bridge=""
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  else
+    return 1
+  fi
+
+  # Scan ALL agents' open tasks via the daemon-step output is not feasible
+  # here (the daemon-step only emits nudge candidates). Instead we ask the
+  # queue CLI for every task in status='queued' AND whose assigned_to is
+  # an existing agent — we filter age + claim status in this loop.
+  local now_ts state_dir
+  now_ts="$(date +%s)"
+  state_dir="$(bridge_daemon_unclaimed_escalation_state_dir)"
+  mkdir -p "$state_dir" 2>/dev/null || true
+
+  # Discover the per-agent unclaimed task list by iterating the in-process
+  # roster — same iteration pattern as process_crash_reports / etc.
+  local agent rows row_count=0 changed=1
+  for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+    [[ -n "$agent" ]] || continue
+    bridge_agent_exists "$agent" || continue
+    # The find-open --all --format json shape provides created_ts +
+    # status. Filter to status='queued' AND age >= threshold in shell.
+    rows="$(bridge_queue_cli find-open --agent "$agent" --all --format json 2>/dev/null || true)"
+    [[ -n "$rows" && "$rows" != "[]" ]] || continue
+
+    # Use python to filter the JSON list into TSV rows; bash-side JSON
+    # parsing is fragile.
+    bridge_require_python 2>/dev/null || continue
+    local expired_tmp
+    expired_tmp="$(mktemp)"
+    # shellcheck disable=SC2064
+    trap "rm -f -- '$expired_tmp'" RETURN
+
+    BRIDGE_QUE_AGE_THRESHOLD="$age_threshold" \
+    BRIDGE_QUE_NOW_TS="$now_ts" \
+    BRIDGE_QUE_INPUT_JSON="$rows" \
+    python3 - <<'PY' >"$expired_tmp" 2>/dev/null || { rm -f -- "$expired_tmp"; trap - RETURN; continue; }
+import json, os, sys
+threshold = int(os.environ.get("BRIDGE_QUE_AGE_THRESHOLD", "1800"))
+now_ts = int(os.environ.get("BRIDGE_QUE_NOW_TS", "0"))
+raw = os.environ.get("BRIDGE_QUE_INPUT_JSON", "[]")
+try:
+    rows = json.loads(raw)
+except Exception:
+    rows = []
+for r in rows:
+    if not isinstance(r, dict):
+        continue
+    if (r.get("status") or "") != "queued":
+        continue
+    created_ts = int(r.get("created_ts", 0) or 0)
+    age = now_ts - created_ts
+    if age < threshold:
+        continue
+    task_id = r.get("id")
+    title = (r.get("title") or "").replace("\t", " ").replace("\n", " ")
+    created_by = (r.get("created_by") or "").replace("\t", " ")
+    priority = (r.get("priority") or "normal").replace("\t", " ")
+    print(f"{task_id}\t{age}\t{title}\t{created_by}\t{priority}")
+PY
+
+    local task_id age_seconds title created_by priority marker age_minutes body_file
+    while IFS=$'\t' read -r task_id age_seconds title created_by priority; do
+      [[ "$task_id" =~ ^[0-9]+$ ]] || continue
+      marker="$(bridge_daemon_unclaimed_escalation_marker_file "$task_id")"
+      if [[ -f "$marker" ]]; then
+        # Cooldown gate — re-escalate only when the window has elapsed.
+        local _marker_ts
+        _marker_ts="$(head -n1 "$marker" 2>/dev/null || printf '0')"
+        [[ "$_marker_ts" =~ ^[0-9]+$ ]] || _marker_ts=0
+        if (( _marker_ts > 0 )) && (( now_ts - _marker_ts < cooldown )); then
+          continue
+        fi
+      fi
+
+      age_minutes=$(( age_seconds / 60 ))
+
+      # Feedback-loop guard: if the affected agent IS the admin, skip
+      # task create (admin can't queue a task to itself if it's
+      # stopped) but still emit audit so an operator scanning the log
+      # sees the signal.
+      if [[ "$agent" == "$admin_agent" ]]; then
+        bridge_audit_log daemon task_unclaimed_escalated "$admin_agent" \
+          --detail task_id="$task_id" \
+          --detail target_agent="$agent" \
+          --detail age_seconds="$age_seconds" \
+          --detail created_by="${created_by:-unknown}" \
+          --detail priority="$priority" \
+          --detail title="$title" \
+          --detail action=audit_only_admin_target \
+          2>/dev/null || true
+        printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+        changed=0
+        continue
+      fi
+
+      body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-unclaimed-task.md.XXXXXX")"
+      cat >"$body_file" <<EOF
+# Unclaimed task #${task_id} on ${agent} (${age_minutes}m+)
+
+Task \`#${task_id}\` has been queued against \`${agent}\` for
+\`${age_minutes}\` minutes without being claimed. The agent may be
+stopped, wedged, or its inbox-nudge dispatch may be silently failing.
+
+- task id: ${task_id}
+- target agent: ${agent}
+- age: ${age_seconds}s (${age_minutes}m)
+- created by: ${created_by:-unknown}
+- priority: ${priority}
+- title: ${title}
+
+Next steps:
+
+- \`agent-bridge agent show ${agent}\` — confirm the agent is active.
+- \`agent-bridge inbox ${agent}\` — confirm the task is visible to it.
+- \`agent-bridge audit follow --action session_nudge_dropped\` — check
+  for inbox-nudge delivery failures against this agent.
+- If the agent is intentionally offline: \`agent-bridge task reassign\`
+  the task to a different agent, or \`agent-bridge task cancel ${task_id}\`.
+- If the agent should be running: \`agent-bridge agent start ${agent}\`
+  clears any backoff state and resumes the daemon's autostart loop.
+
+This task fires at most once per ${cooldown}s cooldown window per
+queued task id. Issue #1318-B operator-visible audit signal.
+EOF
+
+      if "$target_bridge" task create \
+           --to "$admin_agent" --priority high --from daemon \
+           --title "[unclaimed-task] #${task_id} on ${agent} (${age_minutes}m)" \
+           --body-file "$body_file" >/dev/null 2>&1; then
+        bridge_audit_log daemon task_unclaimed_escalated "$admin_agent" \
+          --detail task_id="$task_id" \
+          --detail target_agent="$agent" \
+          --detail age_seconds="$age_seconds" \
+          --detail created_by="${created_by:-unknown}" \
+          --detail priority="$priority" \
+          --detail title="$title" \
+          --detail cooldown_secs="$cooldown" \
+          2>/dev/null || true
+        printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+        changed=0
+      else
+        daemon_warn "failed to file [unclaimed-task] escalation for task=${task_id} agent=${agent}"
+      fi
+      rm -f "$body_file" >/dev/null 2>&1 || true
+      row_count=$(( row_count + 1 ))
+    done < "$expired_tmp"
+
+    rm -f -- "$expired_tmp"
+    trap - RETURN
+  done
+
+  return "$changed"
+}
+
+# Issue #1318 — sweep stale markers (cleanup): when a task is done /
+# cancelled / reassigned, the marker file lingers. Drop markers whose
+# corresponding task is no longer in status='queued'. Idempotent.
+# Called periodically (every N ticks) from the daemon main loop.
+bridge_daemon_sweep_stale_unclaimed_markers() {
+  local state_dir
+  state_dir="$(bridge_daemon_unclaimed_escalation_state_dir)"
+  [[ -d "$state_dir" ]] || return 1
+  local changed=1 file task_id status
+
+  shopt -s nullglob
+  for file in "$state_dir"/*.ts; do
+    task_id="$(basename "$file" .ts)"
+    [[ "$task_id" =~ ^[0-9]+$ ]] || { rm -f "$file" 2>/dev/null || true; continue; }
+    status="$(bridge_queue_task_status "$task_id" 2>/dev/null || printf '')"
+    case "$status" in
+      queued|"")
+        # Still queued OR could not determine — leave the marker in
+        # place. (Empty status means the task vanished; the next
+        # find-open scan will not return it so this state file is
+        # already orphaned. Drop it.)
+        if [[ -z "$status" ]]; then
+          rm -f "$file" 2>/dev/null || true
+          changed=0
+        fi
+        ;;
+      *)
+        # claimed / done / cancelled / blocked — clear the marker so a
+        # future re-queue under the same task id is not silenced.
+        rm -f "$file" 2>/dev/null || true
+        changed=0
+        ;;
+    esac
+  done
+  shopt -u nullglob
+
+  return "$changed"
+}
+
 nudge_agent_session() {
   local agent="$1"
   local _session="$2"
@@ -4681,13 +5755,32 @@ nudge_agent_session() {
         return 0
       fi
     elif (( eligibility_rc == 124 || eligibility_rc == 137 )); then
+      # Issue #1323 (beta5-2 Lane ι) — H5 recheck timeout retry +
+      # escalation. Pre-fix the timeout returned 0 and the task was
+      # silently skipped on subsequent ticks; repeated timeouts could
+      # stall a task forever with no operator-visible signal beyond a
+      # generic daemon_subprocess_timeout row.
+      #
+      # Now: emit a SECOND structured row
+      # (`nudge_eligibility_recheck_timeout`) that names the task id +
+      # consecutive count, track per-(agent, task_id) consecutive
+      # timeouts on disk, and after M consecutive
+      # (BRIDGE_NUDGE_RECHECK_TIMEOUT_ESCALATE_AFTER, default 5) escalate
+      # to an admin task. The task remains queued — return 0 keeps the
+      # next tick's natural retry intact. The composite
+      # daemon_subprocess_timeout row is preserved for back-compat with
+      # existing audit consumers / dashboards (line below).
+      local _h5_first_task_id="${live_nudge_key%%,*}"
+      [[ -n "$_h5_first_task_id" ]] || _h5_first_task_id="none"
       bridge_audit_log daemon daemon_subprocess_timeout "$agent" \
         --detail call_site=nudge_eligibility_recheck \
         --detail target_agent="$agent" \
         --detail timeout_seconds=15 \
         --detail exit_code="$eligibility_rc" \
         --detail action=skip_this_tick
-      daemon_warn "nudge eligibility recheck for ${agent} timed out (rc=${eligibility_rc}); skipping nudge this tick"
+      bridge_daemon_nudge_recheck_timeout_track \
+        "$agent" "$_h5_first_task_id" 15 "$eligibility_rc" "$live_queued" || true
+      daemon_warn "nudge eligibility recheck for ${agent} timed out (rc=${eligibility_rc}); skipping nudge this tick (task ${_h5_first_task_id} remains queued)"
       return 0
     fi
   fi
@@ -4701,7 +5794,11 @@ nudge_agent_session() {
   # still re-fires on the next tick.
   local nudge_fingerprint
   nudge_fingerprint="$(bridge_daemon_compute_nudge_fingerprint "${live_nudge_key:-$nudge_key}")"
-  if bridge_daemon_should_skip_nudge "$agent" "$nudge_fingerprint"; then
+  # Issue #1322 (beta5-2 Lane ι) — pass the live id csv so the dedup
+  # decision is made per-(agent, task_id), not on the composite
+  # fingerprint. A new task arriving alongside an in-window task gets a
+  # fresh nudge without sliding the existing task's window.
+  if bridge_daemon_should_skip_nudge "$agent" "$nudge_fingerprint" "${live_nudge_key:-$nudge_key}"; then
     bridge_audit_log daemon session_nudge_deduped "$agent" \
       --detail fingerprint="$nudge_fingerprint" \
       --detail queued="$live_queued" \
@@ -4788,7 +5885,9 @@ nudge_agent_session() {
   # Issue #767: record AFTER the verified send so a submit that was lost
   # post-grace (returned non-zero above) leaves the prior fingerprint in
   # place and the next idle-nudge tick re-fires unconditionally.
-  bridge_daemon_record_nudge "$agent" "$nudge_fingerprint" || true
+  # Issue #1322: also pass the live id csv so the per-task NUDGE_TASK_TS_*
+  # entries get refreshed atomically with the composite fields.
+  bridge_daemon_record_nudge "$agent" "$nudge_fingerprint" "${live_nudge_key:-$nudge_key}" || true
 
   bridge_audit_log daemon session_nudge_sent "$agent" \
     --detail queued="$live_queued" \
@@ -4807,6 +5906,13 @@ nudge_agent_session() {
   # the escalation threshold. Always best-effort; failures here do not
   # break the success path.
   bridge_daemon_nudge_deferred_clear "$agent" || true
+  # v0.15.0-beta5-2 Lane ι (#1323): same recovery contract for the H5
+  # recheck-timeout counter. If the helper had been timing out and a
+  # subsequent tick succeeded (the helper finally returned in time), the
+  # accumulated consecutive-timeout count must reset so a FUTURE
+  # single-timeout event does not spuriously trip the escalation
+  # threshold. Always best-effort.
+  bridge_daemon_nudge_recheck_timeout_clear "$agent" || true
 }
 
 reconcile_prompt_ready_latches() {
@@ -5579,6 +6685,18 @@ process_mcp_liveness_giveup_recovery() {
         --detail activity_state="$cur_state" || true
       bridge_agent_mcp_giveup_clear "$agent" || true
       daemon_info "plugin MCP liveness recovered for ${agent} (trigger=${trigger}); cleared giveup, restored restart budget" || true
+      # Issue #1321 (beta5-2 Lane ι) — H3 drain accumulated miss-queue
+      # entries. Cap is env-tunable; default 50 mirrors the brief. Skip
+      # entirely when cap=0 (operator opt-out). The drain helper is
+      # internally bounded (oldest-first, atomic rewrite of unsent
+      # tail, failed deliveries re-enqueue for next recovery). Always
+      # `|| true`-guarded so a drain failure cannot break the daemon
+      # tick or leak a non-zero rc to the wrapping subshell.
+      local _h3_cap="${BRIDGE_MCP_RECOVERY_REDELIVER_CAP:-50}"
+      [[ "$_h3_cap" =~ ^[0-9]+$ ]] || _h3_cap=50
+      if (( _h3_cap > 0 )); then
+        bridge_daemon_mcp_miss_queue_drain "$agent" "$_h3_cap" || true
+      fi
     else
       missing="$(bridge_agent_missing_plugin_mcp_channels_csv "$agent" 2>/dev/null || printf '')"
       bridge_audit_log daemon plugin_mcp_liveness_recheck_still_failed "$agent" \
@@ -8351,6 +9469,19 @@ cmd_sync_cycle() {
   if process_permission_task_timeout_fanout; then
     changed=0
   fi
+  # Issue #1318 (beta5-2 Lane ι) — 7051-B unclaimed-queue escalation.
+  # Scans every roster agent's open tasks; for tasks queued > N min
+  # (BRIDGE_QUEUE_UNCLAIMED_ESCALATE_SECS, default 1800s) without a
+  # claim, files an admin task + emits a structured audit row. Cooldown
+  # per task id (BRIDGE_QUEUE_UNCLAIMED_ESCALATE_COOLDOWN_SECS, default
+  # 1800s) prevents spam. Edge case #5 (overlap with #1106 task-age
+  # gate): structurally non-overlapping — that gate looks at NEW tasks
+  # (<60s), we look at OLD tasks (>1800s). Subshell-isolated per the
+  # Lane π defense-in-depth pattern (#1338).
+  BRIDGE_DAEMON_LAST_STEP="unclaimed_queue_escalation"
+  ( process_unclaimed_queue_escalation ) && changed=0 || true
+  BRIDGE_DAEMON_LAST_STEP="unclaimed_marker_sweep"
+  ( bridge_daemon_sweep_stale_unclaimed_markers ) && changed=0 || true
   BRIDGE_DAEMON_LAST_STEP="context_pressure_scan"
   if [[ -n "$summary_output" ]] && process_context_pressure_reports "$summary_output"; then
     changed=0
