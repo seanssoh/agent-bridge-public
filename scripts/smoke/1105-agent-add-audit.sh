@@ -192,6 +192,17 @@ test_no_audit_row_on_failed_create() {
 
 main() {
   smoke_setup_bridge_home "$SMOKE_NAME"
+  # CI runners / clean test hosts ship no engine npm package; `agent add
+  # --engine <e>` runs a `command -v <e>` pre-flight (#1317-C) that hard-dies
+  # otherwise. Seed executable engine stubs + prepend to PATH (the agent-doctor
+  # #1397 pattern) so the create reaches the audit logic under test.
+  _stub_engine_dir="$SMOKE_TMP_ROOT/stub-engine-bin"
+  mkdir -p "$_stub_engine_dir"
+  for _eng in claude codex; do
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$_stub_engine_dir/$_eng"
+    chmod +x "$_stub_engine_dir/$_eng"
+  done
+  export PATH="$_stub_engine_dir:$PATH"
   smoke_run "agent add emits system_config_mutation row" test_audit_row_emitted_on_create
   smoke_run "policy flags surface in audit detail"        test_audit_row_carries_policy_flags
   smoke_run "--always-on maps to after_idle_timeout=0"    test_audit_row_for_always_on
