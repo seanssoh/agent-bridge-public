@@ -8080,7 +8080,7 @@ cp "$READ_REPO/helper.txt" "$READ_ROOT/helper.txt"
 chmod 0600 "$READ_ROOT/helper.txt"
 READ_JSON="$(python3 "$REPO_ROOT/bridge-upgrade.py" apply-live --source-root "$READ_REPO" --target-root "$READ_ROOT" --base-ref "$READ_BASE")"
 assert_contains "$READ_JSON" "\"files_mode_synced\": 1"
-mode_read="$(stat -f '%Lp' "$READ_ROOT/helper.txt" 2>/dev/null || stat -c '%a' "$READ_ROOT/helper.txt")"
+mode_read="$(stat -c '%a' "$READ_ROOT/helper.txt" 2>/dev/null || stat -f '%Lp' "$READ_ROOT/helper.txt")"
 [[ "$mode_read" == "644" ]] || die "expected helper.txt to be 644 after read-mode sync, got $mode_read"
 
 log "smart upgrade trusts git index mode over working-tree stat"
