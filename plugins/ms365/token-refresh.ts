@@ -262,11 +262,17 @@ export function refreshFailureAuditLine(args: {
   const sanitizedDesc = scrubSecretShapedText(
     String(args.description).replace(/[\r\n]+/g, ' '),
   ).slice(0, 300)
+  // r4: the top-level OAuth `error` code is also scrubbed. An honest
+  // Entra response keeps `error` a short code (invalid_grant), but a
+  // compromised IdP/proxy could smuggle a token here — the exact threat
+  // scrubSecretShapedText exists to neutralize. Scrub for model
+  // consistency; a real error code (no token shape) round-trips intact.
+  const sanitizedError = scrubSecretShapedText(String(args.oauthError || 'unknown')).slice(0, 120)
   return (
     `ms365 channel: ms365_refresh_failed` +
     ` upn=${args.upn}` +
     ` kind=${args.kind}` +
-    ` error=${args.oauthError || 'unknown'}` +
+    ` error=${sanitizedError}` +
     ` refresh_token_present=${args.refreshTokenPresent}` +
     ` description=${sanitizedDesc}\n`
   )

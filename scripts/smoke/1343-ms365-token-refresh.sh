@@ -62,6 +62,12 @@
 #   T13 (runtime) — a JWT smuggled under the non-secret error_description
 #                   key is value-scrubbed (key-based redaction alone would
 #                   miss it); surrounding prose survives.
+#   T14 (runtime, r4) — a token smuggled into the TOP-LEVEL OAuth `error`
+#                   code field is scrubbed in ALL sinks: the refresh audit
+#                   row + thrown message, the exchangeAuthCode /
+#                   pair_poll-visible error field, AND the independent
+#                   graph() helper error (the second fetch path). Honest
+#                   error codes (invalid_grant, AADSTS*) round-trip intact.
 #
 # Footgun #11: pipe/argv stdin only.
 
@@ -127,8 +133,18 @@ fi
 if ! grep -E "scrubSecretShapedText" "$MS365_TS" >/dev/null; then
   T0_ERRORS+="server.ts does not value-scrub error_description sinks (JWT-under-benign-key bypass); "
 fi
+# r4: the graph() helper is the SECOND fetch sink (its thrown error flows
+# to the tool-handler catch → textResult, agent-visible). Its error string
+# must pass through scrubSecretShapedText. Extract the graph() throw and
+# assert it wraps the message text.
+if ! awk '/async function graph\(/{f=1} f&&/throw new Error\(/{g=1} f&&g&&/scrubSecretShapedText/{print "yes"; exit} /^}/{if(f&&NR>1)f=f}' "$MS365_TS" | grep -q yes; then
+  # Fallback: line-scoped grep — the graph throw line references scrub.
+  if ! grep -E "graph \\$\{method\} \\$\{path\} failed.*scrubSecretShapedText" "$MS365_TS" >/dev/null; then
+    T0_ERRORS+="graph() error sink does not scrub (second fetch path bypass); "
+  fi
+fi
 if [[ -z "$T0_ERRORS" ]]; then
-  _pass "T0: server.ts wires single-flight/classify/audit/status + redactResponseBody on BOTH malformed sinks + value-scrub"
+  _pass "T0: server.ts wires single-flight/classify/audit/status + redactResponseBody on BOTH malformed sinks + value-scrub on all sinks (incl. graph())"
 else
   _fail "T0" "$T0_ERRORS"
 fi
@@ -148,16 +164,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Runtime tests (T1-T6, T8-T13). These need bun. They exercise the REAL
+# Runtime tests (T1-T6, T8-T14). These need bun. They exercise the REAL
 # token-refresh.ts helper (single-flight + classify + redact +
 # redactResponseBody + scrubSecretShapedText + audit builders) wired into
-# the same doRefresh/getAccessToken/exchangeAuthCode/file-IO glue that
-# server.ts ships, against a mock token endpoint and a temp state dir.
-# T0 + T7 guard that server.ts keeps that glue, so the runtime harness
-# cannot silently drift from the shipped code.
+# the same doRefresh/getAccessToken/exchangeAuthCode/graph/file-IO glue
+# that server.ts ships, against a mock token endpoint and a temp state
+# dir. T0 + T7 guard that server.ts keeps that glue, so the runtime
+# harness cannot silently drift from the shipped code.
 # ---------------------------------------------------------------------------
 if ! command -v bun >/dev/null 2>&1; then
-  for t in T1 T2 T3 T4 T5 T6 T8 T9 T10 T11 T12 T13; do
+  for t in T1 T2 T3 T4 T5 T6 T8 T9 T10 T11 T12 T13 T14; do
     _skip "$t: runtime refresh behavior (bun not available)"
   done
 else
@@ -168,7 +184,8 @@ import {
 } from 'fs'
 import { join } from 'path'
 import {
-  classifyRefreshError, redactResponseBody, refreshSuccessAuditLine, refreshFailureAuditLine,
+  classifyRefreshError, redactResponseBody, scrubSecretShapedText,
+  refreshSuccessAuditLine, refreshFailureAuditLine,
   SingleFlight, type RefreshErrorKind,
 } from '$HELPER_TS'
 
@@ -226,9 +243,26 @@ async function postForm(_url: string, _body: Record<string,string>): Promise<any
   // exchangeAuthCode malformed branch surfaces this to pair_poll
   // (agent-visible stdout) and must redact it.
   if (mode === 'exchange_malformed_secret') return { refresh_token: 'RT_SECRET', id_token: 'ID_SECRET', token_type: 'Bearer' }
+  // r4: a compromised IdP/proxy smuggles a JWT into the TOP-LEVEL error
+  // code field (not just error_description). Must be scrubbed in all
+  // three sinks: audit row, thrown message, exchangeAuthCode textResult.
+  if (mode === 'error_field_token') return { error: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJFUlJfU0VDUkVUIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c', error_description: 'see error code' }
   // success
   await new Promise(r => setTimeout(r, 10))
   return { access_token: 'NEW_ACCESS_' + grantCalls, refresh_token: 'NEW_REFRESH_' + grantCalls, expires_in: 3600, scope: 'User.Read' }
+}
+
+// r4: graph() helper — the SECOND fetch path (independent of postForm).
+// Builds its own _raw envelope on non-JSON, throws a message that flows
+// to the tool-handler catch → textResult (agent-visible). Mirrors
+// server.ts:graph() error sink (scrubSecretShapedText wrap).
+function graphError(rawBody: string, status = 401): string {
+  const data: any = (() => { try { return JSON.parse(rawBody) } catch { return { _raw: rawBody } } })()
+  const err = data?.error?.message ?? data?._raw ?? ('HTTP ' + status)
+  // NB: string concatenation (no \${} template) — the harness heredoc uses
+  // an unquoted delimiter so it can interpolate \$HELPER_TS, which means a
+  // bash \${...} in the TS body would be shell-expanded and break.
+  return 'graph GET /me failed (' + status + '): ' + scrubSecretShapedText(String(err)).slice(0, 500)
 }
 
 const refreshInFlight = new SingleFlight<TokenFile>()
@@ -248,9 +282,13 @@ async function doRefresh(upn: string): Promise<TokenFile> {
   }
   if (data && data.error) {
     const kind = classifyRefreshError(data.error, data.error_description)
+    // refreshFailureAuditLine scrubs oauthError + description internally.
     process.stderr.write(refreshFailureAuditLine({ upn, kind, oauthError: String(data.error), description: String(data.error_description ?? ''), refreshTokenPresent: true }))
-    if (kind === 'permanent') markTokenExpired(upn, data.error + ': ' + String(data.error_description ?? ''))
-    throw new RefreshError(kind, String(data.error), 'refresh failed: ' + data.error)
+    // r4: scrub the top-level error code too (status marker + thrown msg).
+    const scrubbedError = scrubSecretShapedText(String(data.error))
+    const scrubbedDesc = scrubSecretShapedText(String(data.error_description ?? ''))
+    if (kind === 'permanent') markTokenExpired(upn, scrubbedError + ': ' + scrubbedDesc.slice(0, 200))
+    throw new RefreshError(kind, scrubbedError, 'refresh failed: ' + scrubbedError + ' — ' + scrubbedDesc.slice(0, 300))
   }
   if (!data || !data.access_token) {
     const status = data?._status
@@ -289,7 +327,8 @@ type ExchangeResult = { status: 'success' } | { status: 'error'; error: string; 
 async function exchangeAuthCode(): Promise<ExchangeResult> {
   const data: any = await postForm('url', { grant_type: 'authorization_code', code: 'CB_CODE' })
   if (data.error) {
-    return { status: 'error', error: data.error, description: JSON.stringify(redactResponseBody(data)).slice(0, 400) }
+    // r4: scrub the top-level error code too (agent-visible textResult).
+    return { status: 'error', error: scrubSecretShapedText(String(data.error)).slice(0, 120), description: JSON.stringify(redactResponseBody(data)).slice(0, 400) }
   }
   if (!data.access_token) {
     return { status: 'error', error: 'malformed_response', description: JSON.stringify(redactResponseBody(data)).slice(0, 400) }
@@ -374,6 +413,24 @@ function fileMode(p: string): string { return (statSync(p).mode & 0o777).toStrin
     const r = await exchangeAuthCode()
     console.log('exchange_status=' + r.status)
     console.log('exchange_desc=' + (r.status === 'error' ? r.description : ''))
+  } else if (scenario === 'error_field_token_refresh') {
+    // r4: token smuggled into top-level error code on the refresh path.
+    // Check audit row (stderr) + thrown message both scrubbed.
+    seed(-60, 'RT_VALID')
+    let threw = ''
+    try { await getAccessToken(upn) } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+    console.log('threw=' + threw)
+  } else if (scenario === 'error_field_token_exchange') {
+    // r4: same token-in-error-code on the auth-code path → pair_poll
+    // textResult error field must be scrubbed.
+    const r = await exchangeAuthCode()
+    console.log('exchange_status=' + r.status)
+    console.log('exchange_error=' + (r.status === 'error' ? r.error : ''))
+  } else if (scenario === 'graph_raw_token') {
+    // r4: graph() second fetch path — non-JSON _raw body carrying a
+    // bearer-shaped token → thrown graph error must be scrubbed.
+    const msg = graphError('access_token=' + 'A'.repeat(60) + '&foo=bar', 401)
+    console.log('graph_error=' + msg)
   } else {
     console.log('unknown scenario')
     process.exit(2)
@@ -542,6 +599,35 @@ HARNESS_EOF
     _pass "T13: JWT under error_description value-scrubbed (no eyJ marker; prose preserved)"
   else
     _fail "T13" "expected scrubbed audit row preserving prose; got: $(cat "$T13_ERR" 2>/dev/null | tr '\n' '|')"
+  fi
+
+  # T14 (r4) — a token smuggled into the TOP-LEVEL OAuth `error` code field
+  # must be scrubbed in ALL THREE refresh sinks (audit row + thrown
+  # message), the exchangeAuthCode/pair_poll-visible error field, AND the
+  # independent graph() helper error. The marker is the JWT header eyJ...
+  # / the planted ERR_SECRET subject / the long base64 graph token.
+  T14_ERRORS=""
+  # 14a: refresh path — audit row (stderr) + thrown message scrubbed.
+  T14A_OUT="$(run_scn error_field_token_refresh error_field_token)"
+  T14A_ERR="$SMOKE_DIR/error_field_token_refresh.err"
+  if grep -E 'eyJhbGci|ERR_SECRET' "$T14A_ERR" >/dev/null 2>&1 \
+     || printf '%s\n' "$T14A_OUT" | grep -E 'eyJhbGci|ERR_SECRET' >/dev/null 2>&1; then
+    T14_ERRORS+="refresh-path error-code token leaked (audit or thrown msg); "
+  fi
+  # 14b: auth-code path — pair_poll-visible error field scrubbed.
+  T14B_OUT="$(run_scn error_field_token_exchange error_field_token)"
+  if printf '%s\n' "$T14B_OUT" | grep -E 'eyJhbGci|ERR_SECRET' >/dev/null 2>&1; then
+    T14_ERRORS+="exchangeAuthCode error-code token leaked into textResult; "
+  fi
+  # 14c: graph() helper — thrown graph error scrubbed.
+  T14C_OUT="$(run_scn graph_raw_token success)"
+  if printf '%s\n' "$T14C_OUT" | grep -E 'access_token=A{40}|AAAAAAAAAAAAAAAAAAAA' >/dev/null 2>&1; then
+    T14_ERRORS+="graph() _raw bearer-shaped token leaked into thrown error; "
+  fi
+  if [[ -z "$T14_ERRORS" ]]; then
+    _pass "T14: top-level error-code token scrubbed in refresh audit+throw, exchange textResult, AND graph() error (all sinks)"
+  else
+    _fail "T14" "$T14_ERRORS (14a:$(printf '%s' "$T14A_OUT" | tr '\n' '|') 14b:$(printf '%s' "$T14B_OUT" | tr '\n' '|') 14c:$(printf '%s' "$T14C_OUT" | tr '\n' '|'))"
   fi
 fi
 

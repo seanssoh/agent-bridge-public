@@ -428,7 +428,9 @@ async function exchangeAuthCode(
   if (cb.error) {
     try { unlinkSync(callbackPath(pending.state)) } catch {}
     try { unlinkSync(pendingPath(upn)) } catch {}
-    return { status: 'error', error: cb.error, description: scrubSecretShapedText(String(cb.error_description ?? '')).slice(0, 500) }
+    // r4: scrub the error code too (the callback file's `error` is
+    // attacker-influenceable — it comes off the OAuth redirect query).
+    return { status: 'error', error: scrubSecretShapedText(String(cb.error)).slice(0, 120), description: scrubSecretShapedText(String(cb.error_description ?? '')).slice(0, 500) }
   }
   if (!cb.code) {
     return { status: 'error', error: 'empty_code', description: 'callback file had no code' }
@@ -452,10 +454,11 @@ async function exchangeAuthCode(
   )
   if (data.error) {
     // pair_poll surfaces this via textResult (agent-visible). Scrub any
-    // token-shaped substring smuggled into error_description.
+    // token-shaped substring smuggled into error OR error_description
+    // (r4: top-level error code scrubbed for model consistency).
     return {
       status: 'error',
-      error: data.error,
+      error: scrubSecretShapedText(String(data.error)).slice(0, 120),
       description: scrubSecretShapedText(String(data.error_description ?? '')).slice(0, 500),
     }
   }
@@ -561,19 +564,23 @@ async function doRefresh(upn: string): Promise<TokenFile> {
         refreshTokenPresent: true,
       }),
     )
-    // Scrub error_description before it reaches the status marker
-    // (pair_status, agent-visible) or the thrown error message
-    // (re-thrown to the tool-handler catch on the transient path).
+    // Scrub BOTH the error code and the description before they reach the
+    // status marker (pair_status, agent-visible), the RefreshError.oauthError
+    // (surfaced in getAccessToken's permanent re-auth message), or the
+    // thrown error message (re-thrown to the tool-handler catch on the
+    // transient path). r4: a compromised IdP/proxy could smuggle a token
+    // into the top-level `error` field too — scrub for model consistency.
+    const scrubbedError = scrubSecretShapedText(String(data.error))
     const scrubbedDesc = scrubSecretShapedText(String(data.error_description ?? ''))
     if (kind === 'permanent') {
-      markTokenExpired(upn, `${data.error}: ${scrubbedDesc.slice(0, 200)}`)
+      markTokenExpired(upn, `${scrubbedError}: ${scrubbedDesc.slice(0, 200)}`)
     }
     // Transient errors leave the stored token untouched (no saveJson) so a
     // subsequent call retries with the same still-valid refresh_token.
     throw new RefreshError(
       kind,
-      String(data.error),
-      `refresh failed for ${upn}: ${data.error} — ${scrubbedDesc.slice(0, 300)}`,
+      scrubbedError,
+      `refresh failed for ${upn}: ${scrubbedError} — ${scrubbedDesc.slice(0, 300)}`,
     )
   }
 
@@ -691,8 +698,19 @@ async function graph(
   let data: any = null
   try { data = text ? JSON.parse(text) : null } catch { data = { _raw: text } }
   if (!res.ok) {
+    // r4 (adversarial sweep): this is the SECOND fetch path (independent
+    // of postForm) and builds its own `_raw` envelope on non-JSON bodies.
+    // The error is thrown → tool-handler catch → textResult (agent-
+    // visible). access_token is the only secret reachable here
+    // (refresh_token never travels to graph.microsoft.com), but a Graph
+    // 4xx that echoes a bearer-shaped string still flows out. Route the
+    // message text through the same scrub so this sink shares the
+    // single choke-point. Graph error prose (e.g. "Insufficient
+    // privileges") has no token shape and round-trips intact.
     const err = data?.error?.message ?? data?._raw ?? `HTTP ${res.status}`
-    throw new Error(`graph ${method} ${path} failed (${res.status}): ${String(err).slice(0, 500)}`)
+    throw new Error(
+      `graph ${method} ${path} failed (${res.status}): ${scrubSecretShapedText(String(err)).slice(0, 500)}`,
+    )
   }
   return data
 }
