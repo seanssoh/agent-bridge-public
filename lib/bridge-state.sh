@@ -3727,14 +3727,21 @@ bridge_persist_agent_state() {
 
 # Issue #1015: resolve the Claude config dir to hand the session-id
 # helpers — but ONLY when `agent` is a genuinely registered agent whose
-# computed config dir actually exists on disk. For test / unregistered /
-# non-isolated callers, `bridge_agent_claude_config_dir` still returns a
-# *derived* path (e.g. `$BRIDGE_AGENT_HOME_ROOT/<name>/.claude`) that does
-# not exist; passing that to the helper would OVERRIDE the per-call
-# `HOME` the caller relies on and search the wrong tree. Returning empty
-# in that case lets the helper fall back to `CLAUDE_CONFIG_DIR` env /
-# `HOME` / `~` exactly as on `main`. Echoes the config dir on stdout, or
-# nothing when no isolated config dir is in play.
+# linux-user isolation is *effective* AND whose computed config dir
+# actually exists on disk. For test / unregistered / non-isolated callers,
+# `bridge_agent_claude_config_dir` still returns a *derived* path (e.g.
+# `$BRIDGE_AGENT_HOME_ROOT/<name>/.claude`); passing that to the helper
+# would OVERRIDE the per-call `HOME` the caller relies on and search the
+# wrong tree. Returning empty in that case lets the helper fall back to
+# `CLAUDE_CONFIG_DIR` env / `HOME` / `~` exactly as on `main`. Echoes the
+# config dir on stdout, or nothing when no isolated config dir is in play.
+#
+# Issue #1370 (beta5-2 #1316 regression): the iso-effective gate below is
+# the real defense — beta5-2's Lane θ ".claude tree normalize" backfill
+# scaffolds an (empty) `<agent-home>/.claude` for shared-mode agents too,
+# so the `-d` guard alone no longer filters them out. Without the gate the
+# derived empty dir shadows the controller HOME and blocks `--continue`
+# resume for the admin / every non-Linux host. See the issue thread.
 bridge_resolve_agent_claude_config_dir() {
   local agent="$1"
   local config_dir=""
@@ -3746,6 +3753,18 @@ bridge_resolve_agent_claude_config_dir() {
   # to the helper's daemon-HOME fallback.
   if command -v bridge_agent_exists >/dev/null 2>&1; then
     bridge_agent_exists "$agent" || return 0
+  fi
+  # Issue #1370 (beta5-2 #1316 regression): only agents whose linux-user
+  # isolation is *effective* (iso v2 active on a Linux host with an os_user)
+  # own a private Claude config dir. Shared-mode agents — including the admin,
+  # and every agent on non-Linux hosts where iso is never effective — write
+  # their session JSON / transcripts under the controller HOME (~/.claude).
+  # Returning a derived agent-home path for those makes session-id detection
+  # look in an empty scaffolded `<agent-home>/.claude` and block --continue
+  # resume. Fall through (empty) so the detect helper uses its daemon-HOME
+  # fallback. See bridge_detect_claude_session_id / Issue #1015.
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then
+    bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || return 0
   fi
   config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
   # A derived-but-absent path means the agent is not actually isolated on
