@@ -3607,6 +3607,33 @@ bridge_isolation_v2_reap_isolated_agent_account() {
   return 0
 }
 
+_bridge_isolation_v2_state_marker_trace() {
+  # Opt-in path/rc trace for the state-marker writer (#1342). Silent by
+  # default; emits to stderr only when BRIDGE_ISOLATION_STATE_MARKER_DEBUG=1.
+  # Diagnostic only — never alters control flow, never a return-channel
+  # producer (stderr, matching bridge_warn). Operators/codex on cm-prod set
+  # the env var to capture which Path (A0/A/B) fired and each fall-through rc
+  # without re-introducing per-stop warning noise.
+  [[ "${BRIDGE_ISOLATION_STATE_MARKER_DEBUG:-0}" == "1" ]] || return 0
+  printf '[trace] write_agent_state_marker: %s\n' "$*" >&2
+}
+
+_bridge_isolation_v2_state_marker_can_repair_as_root() {
+  # Returns 0 when the caller can perform the canonical chown/chmod repair
+  # of the state-agent-dir leaf — i.e. is root, or has a passwordless sudo
+  # grant. This mirrors the privilege model of
+  # `_bridge_isolation_v2_run_root_or_sudo` (direct-as-root OR `sudo -n`),
+  # which `ensure_matrix_path`'s apply path already uses. The state-marker
+  # writer (#1342) consults this ONLY to disambiguate a failed
+  # ensure_matrix_path: a privileged failure is genuine drift (hard-fail),
+  # an unprivileged one is the iso-UID-no-sudoers case (best-effort skip).
+  [[ "$(id -u 2>/dev/null)" == "0" ]] && return 0
+  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
 bridge_isolation_v2_write_agent_state_marker() {
   # Atomic-ish writer for daemon-side per-agent state markers
   # (idle-since, manual-stop, missing-marker-retries, etc.).
@@ -3668,6 +3695,11 @@ bridge_isolation_v2_write_agent_state_marker() {
     || dir="${BRIDGE_ACTIVE_AGENT_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state/agents}/$agent"
   local target="$dir/$marker_name"
 
+  local _current_user
+  _current_user="$(id -un 2>/dev/null || true)"
+  _bridge_isolation_v2_state_marker_trace \
+    "entry agent=$agent marker=$marker_name euid_user=${_current_user:-<unknown>} target=$target"
+
   # ---- Path (A0): euid already matches target → direct write, no sudo ----
   #
   # The Stop hook from an isolated Claude/Codex session runs as
@@ -3685,52 +3717,78 @@ bridge_isolation_v2_write_agent_state_marker() {
   # marker will see id-un=agent-bridge-X, target os_user=agent-bridge-Y,
   # equality fails, fall through to Path A — which in turn fails because
   # the sudoers rule does not cross agent boundaries either.
+  #
+  # #1342 root cause: the equality gate consulted ONLY the roster-resolved
+  # `bridge_agent_os_user "$agent"`. When the Stop hook runs inside the iso
+  # UID (`agent-bridge-<X>`) but its scoped roster snapshot did not populate
+  # `BRIDGE_AGENT_OS_USER[<X>]` — or `bridge_agent_isolation_mode` came back
+  # indeterminate (#1048) — `_target_os_user` is empty, A0 is skipped, AND
+  # Path A's `bridge_agent_linux_user_isolation_effective` also returns 1
+  # (it requires a non-empty os_user, see bridge-agents.sh:1028). Both
+  # isolation paths fall through to Path B, whose `ensure_matrix_path` then
+  # tries a chown/chmod the iso UID cannot perform → the per-stop
+  # "ensure_matrix_path failed … marker=idle-since" warning.
+  #
+  # Fix: derive the EXPECTED iso UID purely from the canonical construction
+  # `${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}` (the same string
+  # `matrix_rows_for_agent` uses for `iso_user`) when the roster lookup is
+  # empty. The euid==target equality is then driven by the runtime context
+  # (`id -un`), not by a roster snapshot that may not have loaded. The
+  # cross-agent guard is unchanged in strength: A0 still fires only when the
+  # current user IS this agent's own iso UID — an agent-X process writing
+  # agent-Y's marker still sees `id-un=agent-bridge-X` ≠ derived
+  # `agent-bridge-Y` and falls through.
+  local _target_os_user=""
   if command -v bridge_agent_os_user >/dev/null 2>&1; then
-    local _target_os_user
     _target_os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
-    if [[ -n "$_target_os_user" ]]; then
-      local _current_user
-      _current_user="$(id -un 2>/dev/null || true)"
-      if [[ -n "$_current_user" && "$_current_user" == "$_target_os_user" ]]; then
-        # Ensure the parent dir exists (best-effort — we already own it
-        # when euid==target_os_user under iso v2). Do NOT call
-        # ensure_matrix_path: same rationale as Path A — chown/chmod
-        # escalation is the controller's job, not the per-write hook.
-        mkdir -p "$dir" 2>/dev/null || {
-          bridge_warn "write_agent_state_marker: Path A0 cannot create $dir"
-          return 1
-        }
-        local _tmp
-        _tmp="$(mktemp "$target.XXXXXX" 2>/dev/null)" || {
-          bridge_warn "write_agent_state_marker: Path A0 mktemp failed under $dir"
-          return 1
-        }
-        printf '%s\n' "$content" >"$_tmp" || {
-          rm -f "$_tmp" 2>/dev/null || true
-          bridge_warn "write_agent_state_marker: Path A0 write failed: $_tmp"
-          return 1
-        }
-        # r4 codex BLOCKING — soft-fail chmod was a state-drift trap.
-        # mktemp leaves 0600 owner-only by default; if the chmod 0660
-        # silently failed, the controller/daemon (member of the
-        # ab-agent-<X> group, not the iso UID) could no longer read
-        # the published marker. Match the sudo-as-iso helper (exit 8)
-        # and Path B (`return 1` after bridge_warn) contracts: cleanup
-        # the temp file, warn, hard-fail. Same parity rationale as the
-        # adjacent `|| true → return 1` comments on r11/r14.
-        chmod 0660 "$_tmp" 2>/dev/null || {
-          rm -f "$_tmp" 2>/dev/null || true
-          bridge_warn "write_agent_state_marker: Path A0 chmod 0660 failed: $_tmp"
-          return 1
-        }
-        mv -f "$_tmp" "$target" || {
-          rm -f "$_tmp" 2>/dev/null || true
-          bridge_warn "write_agent_state_marker: Path A0 rename failed: $_tmp → $target"
-          return 1
-        }
-        return 0
-      fi
-    fi
+  fi
+  local _target_os_user_src="roster"
+  if [[ -z "$_target_os_user" ]]; then
+    _target_os_user="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}"
+    _target_os_user_src="derived"
+  fi
+  _bridge_isolation_v2_state_marker_trace \
+    "PathA0 check target_os_user=$_target_os_user (src=$_target_os_user_src) current_user=${_current_user:-<unknown>}"
+  if [[ -n "$_current_user" && "$_current_user" == "$_target_os_user" ]]; then
+    _bridge_isolation_v2_state_marker_trace "PathA0 selected (euid==target, no sudo)"
+    # Ensure the parent dir exists (best-effort — we already own it
+    # when euid==target_os_user under iso v2). Do NOT call
+    # ensure_matrix_path: same rationale as Path A — chown/chmod
+    # escalation is the controller's job, not the per-write hook.
+    mkdir -p "$dir" 2>/dev/null || {
+      bridge_warn "write_agent_state_marker: Path A0 cannot create $dir"
+      return 1
+    }
+    local _tmp
+    _tmp="$(mktemp "$target.XXXXXX" 2>/dev/null)" || {
+      bridge_warn "write_agent_state_marker: Path A0 mktemp failed under $dir"
+      return 1
+    }
+    printf '%s\n' "$content" >"$_tmp" || {
+      rm -f "$_tmp" 2>/dev/null || true
+      bridge_warn "write_agent_state_marker: Path A0 write failed: $_tmp"
+      return 1
+    }
+    # r4 codex BLOCKING — soft-fail chmod was a state-drift trap.
+    # mktemp leaves 0600 owner-only by default; if the chmod 0660
+    # silently failed, the controller/daemon (member of the
+    # ab-agent-<X> group, not the iso UID) could no longer read
+    # the published marker. Match the sudo-as-iso helper (exit 8)
+    # and Path B (`return 1` after bridge_warn) contracts: cleanup
+    # the temp file, warn, hard-fail. Same parity rationale as the
+    # adjacent `|| true → return 1` comments on r11/r14.
+    chmod 0660 "$_tmp" 2>/dev/null || {
+      rm -f "$_tmp" 2>/dev/null || true
+      bridge_warn "write_agent_state_marker: Path A0 chmod 0660 failed: $_tmp"
+      return 1
+    }
+    mv -f "$_tmp" "$target" || {
+      rm -f "$_tmp" 2>/dev/null || true
+      bridge_warn "write_agent_state_marker: Path A0 rename failed: $_tmp → $target"
+      return 1
+    }
+    _bridge_isolation_v2_state_marker_trace "PathA0 success target=$target"
+    return 0
   fi
 
   # ---- Path (A): sudo-escalate as the agent's own iso UID ----
@@ -3749,10 +3807,12 @@ bridge_isolation_v2_write_agent_state_marker() {
   if command -v bridge_isolation_write_file_as_agent_user_via_bash >/dev/null 2>&1 \
       && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
       && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    _bridge_isolation_v2_state_marker_trace "PathA selected (sudo-as-iso writer)"
     local _sudo_rc=0
     printf '%s\n' "$content" \
       | bridge_isolation_write_file_as_agent_user_via_bash "$agent" "$target" "0660" \
       || _sudo_rc=$?
+    _bridge_isolation_v2_state_marker_trace "PathA sudo-as-iso rc=$_sudo_rc"
     case "$_sudo_rc" in
       0)
         return 0
@@ -3771,6 +3831,7 @@ bridge_isolation_v2_write_agent_state_marker() {
   fi
 
   # ---- Path (B): controller direct write (legacy / non-iso) ----
+  _bridge_isolation_v2_state_marker_trace "PathB selected (controller direct write)"
   #
   # r11 codex BUG #4 — was `|| true`. Same anti-pattern as the other
   # apply/check paths: ensure_matrix_path failure was swallowed, so the
@@ -3779,10 +3840,44 @@ bridge_isolation_v2_write_agent_state_marker() {
   # wrong group, then verify rejected. Hard fail propagates to the
   # daemon writer's caller. Suppress only the per-call stderr because
   # bridge_warn from inside ensure_matrix_path already logged.
-  bridge_isolation_v2_ensure_matrix_path "state-agent-dir" "$agent" 2>/dev/null || {
-    bridge_warn "write_agent_state_marker: ensure_matrix_path failed for agent=$agent marker=$marker_name"
-    return 1
-  }
+  #
+  # #1342: ensure_matrix_path can fail for two distinct reasons —
+  #   (a) the caller has root/sudo and the chown/chmod genuinely failed
+  #       (a real matrix-apply error worth surfacing), OR
+  #   (b) the caller is an iso UID with NO sudoers grant to chown the
+  #       `controller:ab-agent-<X>:2770` leaf. In case (b) the iso UID is
+  #       still a MEMBER of `ab-agent-<X>` (its primary group), so it can
+  #       legitimately write the 0660 marker file into the existing 2770
+  #       leaf — it just cannot repair ownership/mode. The pre-#1342
+  #       behavior hard-failed on (b) too, producing the per-stop
+  #       "ensure_matrix_path failed … marker=idle-since" warning even
+  #       though the marker write would have succeeded.
+  #
+  # Fix: ensure_matrix_path's `apply` already escalates its chown/chmod via
+  # `_bridge_isolation_v2_run_root_or_sudo`, so a failure means one of:
+  #   (a) we HAVE root/sudo and the canonical repair genuinely failed — a
+  #       real matrix-apply error; preserve the pre-#1342 hard-fail so the
+  #       controller-context drift still surfaces loudly, OR
+  #   (b) we have NO privileged path (iso UID, no sudoers chown grant) — the
+  #       only thing missing is the ability to chown a leaf the controller
+  #       already owns; the iso UID can still write the 0660 marker into the
+  #       existing 2770 group-writable leaf. In (b) drop the spurious
+  #       per-stop warning and continue best-effort to the direct write,
+  #       which remains the authoritative hard-fail if the leaf is truly
+  #       not writable.
+  # We never widen the leaf group or cross agent boundaries here — only
+  # repair-or-skip the existing per-agent leaf.
+  if ! bridge_isolation_v2_ensure_matrix_path "state-agent-dir" "$agent" 2>/dev/null; then
+    if _bridge_isolation_v2_state_marker_can_repair_as_root; then
+      # Case (a): privileged repair was available to ensure_matrix_path's
+      # apply path yet still failed → genuine drift. Hard-fail as before.
+      bridge_warn "write_agent_state_marker: ensure_matrix_path failed for agent=$agent marker=$marker_name"
+      return 1
+    fi
+    # Case (b): no root/sudo — best-effort continue. Trace only.
+    _bridge_isolation_v2_state_marker_trace \
+      "PathB ensure_matrix_path unrepairable (no root/sudo) — best-effort direct write for agent=$agent marker=$marker_name"
+  fi
   mkdir -p "$dir" 2>/dev/null \
     || _bridge_isolation_v2_run_root_or_sudo mkdir -p "$dir" \
     || {
