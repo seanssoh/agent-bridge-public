@@ -6,6 +6,28 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.0-beta5-5] — 2026-05-29
+
+### Highlight — beta5-4 fresh-install verify v2 fixup + admin liveness recovery
+
+patch's beta5-4 fresh-install verify v2 (clean Linux VM, 22h+ controller session = max stale-group exposure) confirmed **N #1378 GREEN** (fresh iso agent start completes end-to-end) and **O #1379's core GREEN** (daemon reads the iso-staged cron request + creates the job), but surfaced a residual on the result-write leg. Separately, the live `patch` admin agent went down after beta5-4 and couldn't self-recover, which finally realized the long-deferred **J #1370** as a concrete daemon fix. beta5-5 closes both. `-beta5-5` prerelease, tag `v0.15.0-beta5-5`, GitHub **Pre-release**.
+
+Lane → PR map: P #1385 (#1383) / Q #1384 (#1384, J #1370).
+
+### Fixed — Track P: iso cron result.json is daemon→iso readable (#1383, PR #1385)
+
+O #1379 fixed the iso→daemon *request*-read leg; this closes the daemon→iso *result*-read leg. On the fresh-install path the per-agent staging subdir has no setgid bit yet, so the daemon wrote `<uuid>.result.json` in the controller's own default group → the iso UID hit `PermissionError [Errno 13]` reading its own cron result (the cron job ran, but the result-feedback was unreadable). New `_resolve_result_gid` (controller-side twin of `_resolve_staging_gid`: actor-name-only canonical gate, rejects the controller egid + `ab-shared`, root-aware `_writer_can_chown`) + `_resolve_result_gid`-driven `chgrp ab-agent-<a>` 0660. The result write is **fail-loud-but-publish** (loud stderr on chgrp/verify failure but always publishes) — deliberately distinct from the request leg's fail-loud-refuse, because the result file is the only channel back to the iso poller and refusing would strand it. #1379 request leg AST-unchanged; #1359/#1379 isolation preserved.
+
+### Fixed — Track Q: recover admin autostart on resume-state failure (#1384, J #1370)
+
+The live admin agent could not self-recover after a daemon-managed start failed (e.g. an empty/invalid persisted resume session id), leaving the operator without an admin surface. New `bridge_daemon_start_agent_with_recovery()` wraps both always-on warm starts and on-demand queued wakes: after a single base start attempt, if the agent **is the admin** (`bridge_admin_agent_id` gate) it repairs empty resume state, retries `--no-continue`, then `--safe-mode --no-continue`, auditing every attempt. Non-admin agents fall straight through — exactly one start attempt + existing backoff, byte-equivalent warning behavior (no recovery ladder, no extra attempts). Realizes the deferred J #1370. Authored by patch-dev (cm-prod). Live raw-VM admin-kill E2E is patch's post-merge verify.
+
+### Known carry-over / pending verify
+
+- **Live re-verify pending**: P #1383 (patch confirms the iso UID now reads its own `.result.json`), Q #1384 (patch's raw-VM admin-kill E2E — code-cleared by codex, not yet live-tested), M #1343 (MS365 token refresh — patch monitors test_clean's natural ~1h expiry).
+- **Stable-prep lint sweep** (deferred, beta-informational): the `lint-heredoc-ban --baseline-check` CI job stays red on 2 INHERITED C1 heredoc-in-capture sites in `scripts/smoke/1379-iso-cron-staging-group.sh:254/318` (from beta5-4's #1379, not deadlocking in practice). A full `lint-heredoc-ban` + `iso-helper-baseline` sweep should bundle into the stable cut. oss-preflight itself is green.
+- Inherited: β-1231-1236 T5 stderr/stdout, #1367 (Track F root), #1353 root (awaiting_channel_setup), #1359 root (daemon IPC socket).
+
 ## [0.15.0-beta5-4] — 2026-05-29
 
 ### Highlight — beta5-3 fresh-install verify fixup (2 OOTB blockers)
