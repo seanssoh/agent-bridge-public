@@ -31,7 +31,7 @@ bridge-agent.sh	5103	C1	a9fc8ebeff76410ff071ebf09f5452b39e55a68feb485a6e604f255d
 bridge-agent.sh	5290	C3	924679e48aea308abd6dc02be9a6699171635564c6027867e8ef8a13851dc96f	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-agent.sh	5669	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-agent.sh	5771	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-audit.sh	60	H3	967276bccff3eae7ab3fe0ebb717d60a4a3793d2edc085f88df3c7390b65841f	here-string/procsub, non-interpreter consumer		
+bridge-audit.sh	60	H3	967276bccff3eae7ab3fe0ebb717d60a4a3793d2edc085f88df3c7390b65841f	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 bridge-auth.sh	390	H3	25a1d9fe293aaa39b67439a679addbb8a932f1e79d870356616753d39d6e5a08	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-auth.sh	442	C3	26443b7bc9716cdb116dce6dcd63dd687bd143618b70fe1ff1de15489812eb22	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-auth.sh	458	H3	a1c5db1d093ea6fe1580b441f1100a60d3519709bc349b16f9d611a6d957a72e	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -44,9 +44,9 @@ bridge-bootstrap.sh	342	C1	651e7839c3b224ee71c7b1becc614957612b81b00a666ad1a0fac
 bridge-bundle.sh	215	C1	552e8aefc9e1f31895071e48d57b3565a72a1cdd8b0d56cdaef1c02184a45e98	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
 bridge-bundle.sh	221	C1	f1f45712a9bcd402065e58e8bc5a9172757ca57130c83d06746b9b2ae440fd42	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
 bridge-bundle.sh	269	C3	6f0f0de39b34583f95ce0bd957987db4c62f2151e97dd99e5d22df148d7b8939	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-cron.sh	530	C3	35bf08c1746beb25096af392cdf619a71a18accd642079ee44bbc0a848744b06	interpreter heredoc, no capture		
-bridge-cron.sh	613	C1	4f756bc179dcd5f0404ce31380799bff509a43374fa6fbe388550b7bac286dbb	interpreter heredoc in capture (deadlock class)		
-bridge-cron.sh	631	H3	c104cda332585e4f2d7df0e51102bf5bdabb4ce97949f306cfe8c7237cf579d2	here-string/procsub, non-interpreter consumer		
+bridge-cron.sh	530	C3	35bf08c1746beb25096af392cdf619a71a18accd642079ee44bbc0a848744b06	interpreter heredoc, no capture	claude	beta3-5 wave (baseline housekeeping)
+bridge-cron.sh	613	C1	4f756bc179dcd5f0404ce31380799bff509a43374fa6fbe388550b7bac286dbb	interpreter heredoc in capture (deadlock class)	claude	beta3-5 wave (baseline housekeeping)
+bridge-cron.sh	631	H3	c104cda332585e4f2d7df0e51102bf5bdabb4ce97949f306cfe8c7237cf579d2	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 bridge-cron.sh	884	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-cron.sh	1457	C3	e922c8981a5dc87928344cdc8dc56501cf7cfdad8d360c59e7754c66f1600478	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-daemon.sh	772	H3	f1c1630f31d4bc24ae47602958be739975b927a70ec87c7bf819402ad94b9b0f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -55,19 +55,19 @@ bridge-daemon.sh	1852	H3	23c0313bf8a6711cc33242c92c06468b8b19bc33e2b16b421f3bc60
 bridge-daemon.sh	2130	H3	16ff48070939ced82df89c9c5a5aee6d60abfa8ce48e66cbc1affbe12e89db37	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-daemon.sh	2569	H3	257b2ce4f7caaf094cf6907c8feb0e4a062b7814511498ba862c60690873b494	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 bridge-daemon.sh	2578	H3	f423c7e06b3b4c0cddc08ab8d3564f61837e3c8ad7db470ce969c038eeecfea9	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	4585	H3	c51e2b2b973e1a4393154f6026975ad42f54ad3ccfa391681a495eab7e56c60b	here-string/procsub, non-interpreter consumer		
-bridge-daemon.sh	4624	H3	737170da22d42ecbba251ec57277ad99cf371d82d03466091a4c314eb2f52259	here-string/procsub, non-interpreter consumer		
+bridge-daemon.sh	4585	H3	c51e2b2b973e1a4393154f6026975ad42f54ad3ccfa391681a495eab7e56c60b	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
+bridge-daemon.sh	4624	H3	737170da22d42ecbba251ec57277ad99cf371d82d03466091a4c314eb2f52259	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 bridge-daemon.sh	5618	H3	82396450ad2047810650fbf7be3229b2838ced50ff8db7c1bcc7ec17a03469ab	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-daemon.sh	6788	H3	80372715b714b8d52d32ef0bc620d9647fb08253c6721eead53477ed2e1b86af	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-daemon.sh	8600	H3	47703942eaf8af97fb67249b0328bddd3d275c6ff6c808f6e0180036f1beb4a3	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-daemon.sh	8671	H3	80372715b714b8d52d32ef0bc620d9647fb08253c6721eead53477ed2e1b86af	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-daemon.sh	8733	H3	efed83d847aea81244ff9ae53de03d93bc2da5b37093fdf0b28bdb4a5d314bd1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-daemon.sh	8918	H3	c01d23cff987c3906cdba09639c4aed6e981b89ab017d5ffba6c964e6e5a2775	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	9010	H3	c104cda332585e4f2d7df0e51102bf5bdabb4ce97949f306cfe8c7237cf579d2	here-string/procsub, non-interpreter consumer		
-bridge-daemon.sh	9081	H3	10962d57620bbe08630a830ad05c2bc409a9f6a469fa7c76d87482ec591bef38	here-string/procsub, non-interpreter consumer		
-bridge-daemon.sh	9098	H3	7895a010d149b7d0dce4311df9bbdcb4482813d5ae53f61efcb4d18790bd6ec3	here-string/procsub, non-interpreter consumer		
-bridge-daemon.sh	9120	H3	22934966de6a27751ea674fa1e6bfa437a185be02c4a64e308294463728df4f6	here-string/procsub, non-interpreter consumer		
-bridge-daemon.sh	9125	H3	ef251fdec96d3d76a27631243f309aa27460156653c99cd5636be8ad5525fa1d	here-string/procsub, non-interpreter consumer		
+bridge-daemon.sh	9010	H3	c104cda332585e4f2d7df0e51102bf5bdabb4ce97949f306cfe8c7237cf579d2	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
+bridge-daemon.sh	9081	H3	10962d57620bbe08630a830ad05c2bc409a9f6a469fa7c76d87482ec591bef38	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
+bridge-daemon.sh	9098	H3	7895a010d149b7d0dce4311df9bbdcb4482813d5ae53f61efcb4d18790bd6ec3	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
+bridge-daemon.sh	9120	H3	22934966de6a27751ea674fa1e6bfa437a185be02c4a64e308294463728df4f6	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
+bridge-daemon.sh	9125	H3	ef251fdec96d3d76a27631243f309aa27460156653c99cd5636be8ad5525fa1d	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 bridge-daemon.sh	10517	H3	29559f61586cbb5244c6adbfc937edcd6e5181587de3c51a92a101df4fcdeb6b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-daemon.sh	10596	H3	32e64212066ea50d5c52673c6ab72d46a3979164ed4d30276da8e54651fe5ed5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-discord-relay.sh	35	H3	b7fa996e0677d162d0061308f4f1561a488c85997ab55a095544e4d61e676bee	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -483,19 +483,19 @@ scripts/smoke-test.sh	11074	C3	9a0596bb486fe5caca52edaca74c9f7c696f1fa7b8d963999
 scripts/smoke-test.sh	11091	C3	11cbfaf88e84998d813a1eaf6709ad3906475c4ae20d8ae011e68c22560bfc93	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	11142	C1	7127f83126ea2276ef915af63d277558b0b02ebbea55335d0fa21665b117295e	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	process-boundary-safe
 scripts/smoke/1238-iso-scaffold-ownership.sh	307	C3	64a0196b0ecf8c6543f4cb529ae9ada9da7e35e40a8f48d30879570cceff607f	interpreter heredoc, no capture	claude	beta3-5 wave (baseline housekeeping)
-scripts/smoke/1354-setup-teams-fd-password.sh	233	C1	62bd02b1810b3dd169232c4f8e1de46f95c16d6e9bc0c037cd668c02fdb651ac	interpreter heredoc in capture (deadlock class)		
-scripts/smoke/1354-setup-teams-fd-password.sh	336	C1	b9d9d83f7a41f5563218691360dbb126dd59e604a4e357c1631155edb4bac7ad	interpreter heredoc in capture (deadlock class)		
-scripts/smoke/1358-admin-credential-routine-exempt.sh	312	H3	49f80dd966936ecfd2b93fce99922c40b62547ebd98f95e540f7c606d619f977	here-string/procsub, non-interpreter consumer		
-scripts/smoke/1358-admin-credential-routine-exempt.sh	356	H3	37903e4c2b0f922f61447b3d8c4863595602231fd88100f3cf848204c74dfa4e	here-string/procsub, non-interpreter consumer		
-scripts/smoke/1358-admin-credential-routine-exempt.sh	361	H3	4cc258e6f18872c851afb752b724041110120594b91007a917d6d1df7d7d5642	here-string/procsub, non-interpreter consumer		
-scripts/smoke/1358-admin-credential-routine-exempt.sh	366	H3	be505cb327c2ce9a71f83ad152deb5f299858eda3f0575641495055a751c34b5	here-string/procsub, non-interpreter consumer		
-scripts/smoke/1358-admin-credential-routine-exempt.sh	371	C1	84dfaf7cc0d2a9129d2afb4a44cd058363569c4af6d4268b48c23d3bdcd46d56	heredoc in capture		
-scripts/smoke/1359-cron-create-iso-staging.sh	135	C1	8cde01b984fb3ecf10c01263630964c5834dfd273c4c803e5577db33d21ccc30	heredoc in capture (cross-line capture)		
-scripts/smoke/1359-cron-create-iso-staging.sh	243	C1	047d4be233b009ae847db510a8b5a9577f2411878185aa40400cfcf74315b1fe	heredoc in capture (cross-line capture)		
-scripts/smoke/1359-cron-create-iso-staging.sh	316	C1	8cde01b984fb3ecf10c01263630964c5834dfd273c4c803e5577db33d21ccc30	heredoc in capture (cross-line capture)		
-scripts/smoke/1359-cron-create-iso-staging.sh	436	C1	e37d8b400a3174d7733d7268cf2afb4fa30e481e1d5045993a83d91f57130fe1	heredoc in capture		
-scripts/smoke/1359-cron-create-iso-staging.sh	455	H3	c104cda332585e4f2d7df0e51102bf5bdabb4ce97949f306cfe8c7237cf579d2	here-string/procsub, non-interpreter consumer		
-scripts/smoke/1359-cron-create-iso-staging.sh	468	H3	d744500e011b6c9a95549bbb822a709f323cbadf8bb63eb6b0ae214abccfe08a	here-string/procsub, non-interpreter consumer		
+scripts/smoke/1354-setup-teams-fd-password.sh	233	C1	62bd02b1810b3dd169232c4f8e1de46f95c16d6e9bc0c037cd668c02fdb651ac	interpreter heredoc in capture (deadlock class)	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1354-setup-teams-fd-password.sh	336	C1	b9d9d83f7a41f5563218691360dbb126dd59e604a4e357c1631155edb4bac7ad	interpreter heredoc in capture (deadlock class)	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1358-admin-credential-routine-exempt.sh	312	H3	49f80dd966936ecfd2b93fce99922c40b62547ebd98f95e540f7c606d619f977	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1358-admin-credential-routine-exempt.sh	356	H3	37903e4c2b0f922f61447b3d8c4863595602231fd88100f3cf848204c74dfa4e	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1358-admin-credential-routine-exempt.sh	361	H3	4cc258e6f18872c851afb752b724041110120594b91007a917d6d1df7d7d5642	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1358-admin-credential-routine-exempt.sh	366	H3	be505cb327c2ce9a71f83ad152deb5f299858eda3f0575641495055a751c34b5	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1358-admin-credential-routine-exempt.sh	371	C1	84dfaf7cc0d2a9129d2afb4a44cd058363569c4af6d4268b48c23d3bdcd46d56	heredoc in capture	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1359-cron-create-iso-staging.sh	135	C1	8cde01b984fb3ecf10c01263630964c5834dfd273c4c803e5577db33d21ccc30	heredoc in capture (cross-line capture)	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1359-cron-create-iso-staging.sh	243	C1	047d4be233b009ae847db510a8b5a9577f2411878185aa40400cfcf74315b1fe	heredoc in capture (cross-line capture)	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1359-cron-create-iso-staging.sh	316	C1	8cde01b984fb3ecf10c01263630964c5834dfd273c4c803e5577db33d21ccc30	heredoc in capture (cross-line capture)	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1359-cron-create-iso-staging.sh	436	C1	e37d8b400a3174d7733d7268cf2afb4fa30e481e1d5045993a83d91f57130fe1	heredoc in capture	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1359-cron-create-iso-staging.sh	455	H3	c104cda332585e4f2d7df0e51102bf5bdabb4ce97949f306cfe8c7237cf579d2	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/1359-cron-create-iso-staging.sh	468	H3	d744500e011b6c9a95549bbb822a709f323cbadf8bb63eb6b0ae214abccfe08a	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 scripts/smoke/835-static-admin-launch.sh	156	H3	07d40500dcb55ba9f5212423fd3d97cdac9ac8951f10bee4f43c7d08ed54ebd7	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 scripts/smoke/A3-beta3-1248-restart-session-id-resume.sh	553	H3	26439e5e8b4eae960257fd95ef06ed88440c1bce46e57effcd0fb42fbc2039db	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 scripts/smoke/H-beta4-iso-ownership.sh	370	H3	31af0b3404c5e86f422e3eee5f844b339a7adf6fe41ea75806a7024f978c6b05	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
@@ -557,9 +557,9 @@ scripts/smoke/beta5-1-session-id-detect-race.sh	524	H3	c13c7149e8a88a32d7167c51b
 scripts/smoke/beta5-1-session-id-detect-race.sh	527	H3	703382fd04d10a35c799add8e85757fc733a7b23933628207a14c839c43e0c52	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 scripts/smoke/beta5-1-session-id-detect-race.sh	530	H3	225a59d23240983bdc4fd200ffca0e80dab317616a8b376290f0122361e8f711	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 scripts/smoke/beta5-2-delta-nudge-session-empty.sh	227	H3	3df6fdda9773584c31c1c77bec9303a343f38797461f0008f8a61c7fad43aad9	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
-scripts/smoke/beta5-2-iota-daemon-escalation-family.sh	276	H3	3df6fdda9773584c31c1c77bec9303a343f38797461f0008f8a61c7fad43aad9	here-string/procsub, non-interpreter consumer		
-scripts/smoke/beta5-2-iota-daemon-escalation-family.sh	295	C2	1c824d25c7d35d4129ea17680a76dd81a89ac9bd4939b91a874d4e0e2cbe2cd1	cat heredoc in capture		
-scripts/smoke/beta5-2-mu-cron-channel-creds.sh	94	C3	40b9e8f5cb628be5a86c5e119e38ed4692539f840233a6bab113aef74ba94643	interpreter heredoc, no capture		
+scripts/smoke/beta5-2-iota-daemon-escalation-family.sh	276	H3	3df6fdda9773584c31c1c77bec9303a343f38797461f0008f8a61c7fad43aad9	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/beta5-2-iota-daemon-escalation-family.sh	295	C2	1c824d25c7d35d4129ea17680a76dd81a89ac9bd4939b91a874d4e0e2cbe2cd1	cat heredoc in capture	claude	beta3-5 wave (baseline housekeeping)
+scripts/smoke/beta5-2-mu-cron-channel-creds.sh	94	C3	40b9e8f5cb628be5a86c5e119e38ed4692539f840233a6bab113aef74ba94643	interpreter heredoc, no capture	claude	beta3-5 wave (baseline housekeeping)
 scripts/smoke/beta5-2-zeta-teams-mcp-dedup.sh	245	C2	2f25d0c3623dd96b0d99035b953772500a6f51de561589a226ec816bc99aec8d	cat heredoc in capture	claude	beta3-5 wave (baseline housekeeping)
 scripts/smoke/beta5-2-zeta-teams-mcp-dedup.sh	353	C2	5467975a8b38bf391e68b682681799aaf67d31a213584f1ca4b2272f0c9cbbc5	cat heredoc in capture	claude	beta3-5 wave (baseline housekeeping)
 scripts/smoke/bridge-export-prefix-no-stale-layout.sh	72	H3	88187ba6826d04a8329e6dd79b3b314261349e65bdb5d68dceb2b6525af9a9df	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
