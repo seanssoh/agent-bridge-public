@@ -129,43 +129,87 @@ export function redactToken(token: string | undefined | null): string {
 // `device_code`, etc. are all caught.
 const SECRET_KEY_PATTERN = /(refresh_token|access_token|id_token|token|secret|client_secret|code|assertion|password)/i
 
+// Issue #1343 (adversarial sweep BLOCKING #1, defense-in-depth): scrub
+// token-SHAPED substrings out of any string value, regardless of the key
+// it lives under. This catches secrets smuggled under a non-secret key —
+// e.g. a JWT embedded in `error_description`, or a token endpoint that
+// returns a form-encoded body whose text lands in `_raw`. The patterns
+// are deliberately TIGHT so ordinary error prose is not mangled:
+//
+//   1. JWT — three base64url segments separated by dots, `eyJ...` header.
+//   2. OAuth form-encoded credential params: `<param>=<value>` where the
+//      param name is a known secret key and the value is a non-trivial
+//      token run (8+ chars of token alphabet). Matches the
+//      `refresh_token=...&grant_type=...` body shape.
+//   3. Long base64url runs (40+ chars) that look like opaque bearer
+//      tokens. 40 is above any realistic English word / GUID-with-dashes
+//      so prose survives; AADSTS codes (`AADSTS700082`) are far shorter.
+//
+// Each match is replaced with the match's sha256:12 fingerprint so ops
+// can still correlate a repeated leak without seeing the secret.
+const JWT_RE = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g
+const FORM_CRED_RE = /\b(refresh_token|access_token|id_token|code|assertion)=([A-Za-z0-9._~+/=%-]{8,})/gi
+const LONG_B64URL_RE = /\b[A-Za-z0-9_-]{40,}\b/g
+
+export function scrubSecretShapedText(input: string): string {
+  let s = String(input)
+  s = s.replace(JWT_RE, m => redactToken(m))
+  s = s.replace(FORM_CRED_RE, (_m, param: string, value: string) => `${param}=${redactToken(value)}`)
+  s = s.replace(LONG_B64URL_RE, m => redactToken(m))
+  return s
+}
+
 /**
- * Issue #1343 (codex r1 BLOCKING #1): deep-redact a token-endpoint
- * response body before it is stringified into an audit row or error
- * message.
+ * Issue #1343 (codex r1 BLOCKING #1 + adversarial sweep BLOCKING #1):
+ * deep-redact a token-endpoint response body before it is stringified
+ * into an audit row, a thrown error, OR an agent-visible textResult.
  *
  * The malformed-response fallback used to `JSON.stringify(data)` the raw
- * body. If the token endpoint (or an upstream proxy) returned a malformed
- * JSON object that still carried a `refresh_token` / `access_token` /
- * `id_token`, the raw bearer secret leaked into the audit line. This
- * walks the object recursively and replaces any value under a
- * secret-looking key with the value's sha256:12 fingerprint (so ops can
- * still correlate without exposure), returning a SAFE COPY — the original
- * `data` is never mutated.
+ * body. Two leak classes follow from that:
+ *   - a malformed JSON object that still carried a `refresh_token` /
+ *     `access_token` / `id_token` (closed by key-based redaction); and
+ *   - the `postForm` non-JSON envelope `{ _raw: <text>, _status }`, whose
+ *     `_raw` is NOT a secret key, so a token endpoint / proxy that
+ *     returns a form-encoded or HTML body carrying tokens leaked the raw
+ *     text (the adversarial-sweep bypass).
  *
- * - String secret values → `redactToken(value)` (sha256:12 fp).
- * - Non-string secret values (number/bool/object) → `'<redacted>'`
- *   (we don't fingerprint non-strings; they shouldn't be secrets anyway,
- *   and stringify-then-hash could itself leak structure).
- * - Arrays and nested objects are walked element-by-element.
- * - Non-object input (string / number / null) is returned unchanged —
- *   a top-level string body carries no key context to redact by, and the
- *   callers truncate it; but to be safe the caller passes the parsed
- *   object, and a bare string `_raw` is itself keyed under `_raw` (not a
- *   secret key) so it is preserved for triage.
+ * This walks the object recursively and returns a SAFE COPY (the original
+ * `data` is never mutated):
+ *   - `_raw` is NEVER emitted as text — it is summarized to
+ *     `{ _raw_len, _raw_sha256 }` (status + length + fingerprint is enough
+ *     for ops triage; the unparseable body's diagnostic value does not
+ *     justify the leak risk).
+ *   - Values under a secret-looking key → `redactToken` (string) or
+ *     `'<redacted>'` (non-string).
+ *   - Every OTHER string value is run through `scrubSecretShapedText` so a
+ *     token smuggled under a benign key (JWT in `error_description`, etc.)
+ *     is still neutralized.
+ *   - Arrays and nested objects are walked element-by-element.
+ *   - Non-object input: a top-level string is scrubbed; other primitives
+ *     pass through.
  *
  * A depth guard bounds pathological/cyclic inputs.
  */
 export function redactResponseBody(data: unknown, depth = 0): unknown {
   if (depth > 8) return '<max-depth>'
-  if (data === null || typeof data !== 'object') return data
+  if (data === null) return null
+  if (typeof data === 'string') return scrubSecretShapedText(data)
+  if (typeof data !== 'object') return data
   if (Array.isArray(data)) {
     return data.map(item => redactResponseBody(item, depth + 1))
   }
   const out: Record<string, unknown> = {}
   for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
-    if (SECRET_KEY_PATTERN.test(key)) {
+    if (key === '_raw') {
+      // postForm's non-JSON envelope. Never emit the raw text — a proxy /
+      // endpoint can stuff a tokened form-encoded or HTML body here.
+      const raw = String(value ?? '')
+      out._raw_len = raw.length
+      out._raw_sha256 = redactToken(raw)
+    } else if (SECRET_KEY_PATTERN.test(key)) {
       out[key] = typeof value === 'string' ? redactToken(value) : '<redacted>'
+    } else if (typeof value === 'string') {
+      out[key] = scrubSecretShapedText(value)
     } else if (value !== null && typeof value === 'object') {
       out[key] = redactResponseBody(value, depth + 1)
     } else {
@@ -200,8 +244,13 @@ export function refreshSuccessAuditLine(args: {
  * Build the grep-friendly stderr audit line for a failed refresh.
  * `kind` distinguishes transient (token kept, will retry) from permanent
  * (token_expired, re-auth required). The OAuth error + a truncated,
- * newline-collapsed description are included for triage — neither field
- * ever carries the token itself.
+ * newline-collapsed description are included for triage.
+ *
+ * The description is value-content-scrubbed at this sink (adversarial
+ * sweep, defense-in-depth): even if a caller passes a description that
+ * smuggled a token-shaped substring (a JWT in error_description, a raw
+ * network-error string echoing a URL with a token), it is neutralized
+ * here so the audit line can never carry a bearer secret.
  */
 export function refreshFailureAuditLine(args: {
   upn: string
@@ -210,7 +259,9 @@ export function refreshFailureAuditLine(args: {
   description: string
   refreshTokenPresent: boolean
 }): string {
-  const sanitizedDesc = String(args.description).replace(/[\r\n]+/g, ' ').slice(0, 300)
+  const sanitizedDesc = scrubSecretShapedText(
+    String(args.description).replace(/[\r\n]+/g, ' '),
+  ).slice(0, 300)
   return (
     `ms365 channel: ms365_refresh_failed` +
     ` upn=${args.upn}` +

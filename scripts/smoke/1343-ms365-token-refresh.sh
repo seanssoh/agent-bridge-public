@@ -49,6 +49,19 @@
 #                   (refresh_token / id_token) is DEEP-REDACTED before it
 #                   reaches the audit row; the raw secret appears nowhere
 #                   in stderr (distinct from T6's seeded-mock-token check).
+#   T11 (runtime, adversarial sweep BLOCKING #1) — postForm's
+#                   { _raw, _status } envelope carrying a tokened non-JSON
+#                   body is summarized to _raw_len + _raw_sha256; the raw
+#                   form-encoded refresh_token=/access_token= text appears
+#                   nowhere in the audit row (the _raw key-bypass).
+#   T12 (runtime, adversarial sweep BLOCKING #2) — exchangeAuthCode /
+#                   pair_poll path: a no-access_token body carrying
+#                   refresh_token / id_token surfaces via textResult
+#                   (agent-visible stdout); result.description must be
+#                   redacted (the twin sink the r2 fix missed).
+#   T13 (runtime) — a JWT smuggled under the non-secret error_description
+#                   key is value-scrubbed (key-based redaction alone would
+#                   miss it); surrounding prose survives.
 #
 # Footgun #11: pipe/argv stdin only.
 
@@ -97,8 +110,25 @@ fi
 if ! grep -E "markTokenExpired" "$MS365_TS" >/dev/null; then
   T0_ERRORS+="server.ts does not persist token_expired status marker; "
 fi
+# Adversarial sweep BLOCKING #1 + #2: BOTH malformed-response sinks
+# (doRefresh + exchangeAuthCode) must wrap the body in redactResponseBody
+# before stringifying, and there must be NO bare JSON.stringify(data) of a
+# response body anywhere (the choke-point invariant).
+if [[ "$(grep -cE "JSON\.stringify\(redactResponseBody\(data" "$MS365_TS")" -lt 2 ]]; then
+  T0_ERRORS+="server.ts has <2 redactResponseBody-wrapped malformed sinks (exchangeAuthCode twin or doRefresh missing); "
+fi
+if grep -E "JSON\.stringify\(data( |\)|,)" "$MS365_TS" | grep -v "redactResponseBody" >/dev/null; then
+  # Allowlist: the Graph request body builder + textResult renderer are
+  # not response-body→log sinks. Flag only response-body stringify leaks.
+  if grep -nE "description:.*JSON\.stringify\(data\b" "$MS365_TS" | grep -v "redactResponseBody" >/dev/null; then
+    T0_ERRORS+="server.ts has a raw JSON.stringify(data) in a description sink (choke-point bypass); "
+  fi
+fi
+if ! grep -E "scrubSecretShapedText" "$MS365_TS" >/dev/null; then
+  T0_ERRORS+="server.ts does not value-scrub error_description sinks (JWT-under-benign-key bypass); "
+fi
 if [[ -z "$T0_ERRORS" ]]; then
-  _pass "T0: server.ts imports token-refresh helper + wires single-flight/classify/audit/status"
+  _pass "T0: server.ts wires single-flight/classify/audit/status + redactResponseBody on BOTH malformed sinks + value-scrub"
 else
   _fail "T0" "$T0_ERRORS"
 fi
@@ -118,16 +148,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Runtime tests (T1-T6, T8, T9, T10). These need bun. They exercise the
-# REAL token-refresh.ts helper (single-flight + classify + redact +
-# redactResponseBody + audit builders) wired into the same
-# doRefresh/getAccessToken/file-IO glue that server.ts ships, against a
-# mock token endpoint and a temp state dir. T0 + T7 guard that server.ts
-# keeps that glue, so the runtime harness cannot silently drift from the
-# shipped code.
+# Runtime tests (T1-T6, T8-T13). These need bun. They exercise the REAL
+# token-refresh.ts helper (single-flight + classify + redact +
+# redactResponseBody + scrubSecretShapedText + audit builders) wired into
+# the same doRefresh/getAccessToken/exchangeAuthCode/file-IO glue that
+# server.ts ships, against a mock token endpoint and a temp state dir.
+# T0 + T7 guard that server.ts keeps that glue, so the runtime harness
+# cannot silently drift from the shipped code.
 # ---------------------------------------------------------------------------
 if ! command -v bun >/dev/null 2>&1; then
-  for t in T1 T2 T3 T4 T5 T6 T8 T9 T10; do
+  for t in T1 T2 T3 T4 T5 T6 T8 T9 T10 T11 T12 T13; do
     _skip "$t: runtime refresh behavior (bun not available)"
   done
 else
@@ -184,7 +214,18 @@ async function postForm(_url: string, _body: Record<string,string>): Promise<any
   // access_token in the parsed shape) that STILL carries bearer secrets.
   // The malformed-response fallback must deep-redact before logging.
   if (mode === 'malformed_secret') return { refresh_token: 'RT_SECRET', access_token: '', id_token: 'ID_SECRET', _status: 200 }
+  // adversarial sweep BLOCKING #1: non-JSON body carrying tokens, wrapped
+  // by postForm into the { _raw, _status } envelope (here we simulate
+  // postForm having already wrapped a form-encoded tokened body).
+  if (mode === 'raw_envelope') return { _raw: 'refresh_token=RT_SECRET&grant_type=refresh_token&access_token=AT_SECRET', _status: 502 }
+  // T13: a JWT smuggled under the non-secret error_description key.
+  if (mode === 'jwt_in_desc') return { error: 'invalid_grant', error_description: 'token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJSVF9TRUNSRVQifQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c is invalid' }
   if (mode === 'perm') return { error: 'invalid_grant', error_description: 'AADSTS700082: refresh token expired due to inactivity' }
+  // adversarial sweep BLOCKING #2: auth-code exchange returns a body with
+  // NO access_token but carrying refresh_token / id_token. The
+  // exchangeAuthCode malformed branch surfaces this to pair_poll
+  // (agent-visible stdout) and must redact it.
+  if (mode === 'exchange_malformed_secret') return { refresh_token: 'RT_SECRET', id_token: 'ID_SECRET', token_type: 'Bearer' }
   // success
   await new Promise(r => setTimeout(r, 10))
   return { access_token: 'NEW_ACCESS_' + grantCalls, refresh_token: 'NEW_REFRESH_' + grantCalls, expires_in: 3600, scope: 'User.Read' }
@@ -238,6 +279,22 @@ async function getAccessToken(upn: string): Promise<string> {
     if (e instanceof RefreshError && e.kind === 'permanent') throw new Error('token_expired re-auth required (' + e.oauthError + ')')
     throw e
   }
+}
+
+// exchangeAuthCode glue — mirrors server.ts's auth-code malformed branch
+// (adversarial sweep BLOCKING #2). Returns the same result shape that
+// pair_poll renders via textResult (agent-visible). The malformed branch
+// MUST run redactResponseBody before stringifying.
+type ExchangeResult = { status: 'success' } | { status: 'error'; error: string; description: string }
+async function exchangeAuthCode(): Promise<ExchangeResult> {
+  const data: any = await postForm('url', { grant_type: 'authorization_code', code: 'CB_CODE' })
+  if (data.error) {
+    return { status: 'error', error: data.error, description: JSON.stringify(redactResponseBody(data)).slice(0, 400) }
+  }
+  if (!data.access_token) {
+    return { status: 'error', error: 'malformed_response', description: JSON.stringify(redactResponseBody(data)).slice(0, 400) }
+  }
+  return { status: 'success' }
 }
 
 // ---- scenario dispatcher --------------------------------------------------
@@ -298,6 +355,25 @@ function fileMode(p: string): string { return (statSync(p).mode & 0o777).toStrin
     let threw = ''
     try { await getAccessToken(upn) } catch (e) { threw = e instanceof Error ? e.message : String(e) }
     console.log('threw=' + threw)
+  } else if (scenario === 'raw_envelope') {
+    // refresh hits a non-JSON {_raw,_status} body carrying tokens.
+    seed(-60, 'RT_VALID')
+    let threw = ''
+    try { await getAccessToken(upn) } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+    console.log('threw=' + threw) // assertions are on stderr (audit row)
+  } else if (scenario === 'jwt_in_desc') {
+    // refresh fails with a JWT smuggled under error_description.
+    seed(-60, 'RT_VALID')
+    let threw = ''
+    try { await getAccessToken(upn) } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+    console.log('threw=' + threw)
+    console.log('status_reason=' + (loadStatus(upn)?.reason ?? 'none'))
+  } else if (scenario === 'exchange_malformed_secret') {
+    // auth-code exchange returns no access_token but carries tokens →
+    // pair_poll-visible result.description must be redacted.
+    const r = await exchangeAuthCode()
+    console.log('exchange_status=' + r.status)
+    console.log('exchange_desc=' + (r.status === 'error' ? r.description : ''))
   } else {
     console.log('unknown scenario')
     process.exit(2)
@@ -422,6 +498,50 @@ HARNESS_EOF
     _pass "T10: malformed response carrying secrets → deep-redacted in audit (no raw RT/ID secret; sha256 fp present)"
   else
     _fail "T10" "expected a redacted ms365_refresh_failed audit row with sha256 fp; got: $(cat "$T10_ERR" 2>/dev/null | tr '\n' '|')"
+  fi
+
+  # T11 (adversarial sweep BLOCKING #1) — postForm's { _raw, _status }
+  # envelope carrying a tokened non-JSON body must NOT emit the raw text.
+  # _raw is summarized to _raw_len + _raw_sha256; the form-encoded
+  # refresh_token=/access_token= values appear NOWHERE in the audit row.
+  run_scn raw_envelope raw_envelope >/dev/null
+  T11_ERR="$SMOKE_DIR/raw_envelope.err"
+  if grep -E 'RT_SECRET|AT_SECRET' "$T11_ERR" >/dev/null 2>&1; then
+    _fail "T11" "raw _raw text leaked tokens into audit (SECURITY): $(cat "$T11_ERR" 2>/dev/null | tr '\n' '|')"
+  elif grep -Eq '"_raw_sha256":"sha256:' "$T11_ERR" 2>/dev/null \
+       && grep -Eq '"_raw_len":' "$T11_ERR" 2>/dev/null; then
+    _pass "T11: _raw envelope summarized to _raw_len + _raw_sha256 (no raw tokened body text)"
+  else
+    _fail "T11" "expected _raw_len + _raw_sha256 summary; got: $(cat "$T11_ERR" 2>/dev/null | tr '\n' '|')"
+  fi
+
+  # T12 (adversarial sweep BLOCKING #2) — exchangeAuthCode / pair_poll path:
+  # a no-access_token body carrying refresh_token / id_token surfaces via
+  # textResult (agent-visible stdout). The result.description must be
+  # redacted — neither raw secret appears.
+  T12_OUT="$(run_scn exchange_malformed_secret exchange_malformed_secret)"
+  if printf '%s\n' "$T12_OUT" | grep -E 'RT_SECRET|ID_SECRET' >/dev/null 2>&1; then
+    _fail "T12" "raw token leaked into pair_poll-visible exchange description (SECURITY): $(printf '%s' "$T12_OUT" | tr '\n' '|')"
+  elif printf '%s\n' "$T12_OUT" | grep -q 'exchange_status=error' \
+       && printf '%s\n' "$T12_OUT" | grep -q 'sha256:'; then
+    _pass "T12: exchangeAuthCode malformed-secret body → redacted in pair_poll-visible description (no raw token)"
+  else
+    _fail "T12" "expected error status + sha256 fp, no raw token; got: $(printf '%s' "$T12_OUT" | tr '\n' '|')"
+  fi
+
+  # T13 — a JWT smuggled under the non-secret error_description key must be
+  # value-scrubbed (key-based redaction alone would miss it). Assert the
+  # JWT header marker (eyJ...) appears nowhere in the audit row or the
+  # token_expired status reason, while the surrounding prose survives.
+  run_scn jwt_in_desc jwt_in_desc >/dev/null
+  T13_ERR="$SMOKE_DIR/jwt_in_desc.err"
+  if grep -E 'eyJhbGci|eyJzdWIi' "$T13_ERR" >/dev/null 2>&1; then
+    _fail "T13" "JWT under error_description leaked (value-scrub missing): $(cat "$T13_ERR" 2>/dev/null | tr '\n' '|')"
+  elif grep -q 'ms365_refresh_failed' "$T13_ERR" 2>/dev/null \
+       && grep -q 'is invalid' "$T13_ERR" 2>/dev/null; then
+    _pass "T13: JWT under error_description value-scrubbed (no eyJ marker; prose preserved)"
+  else
+    _fail "T13" "expected scrubbed audit row preserving prose; got: $(cat "$T13_ERR" 2>/dev/null | tr '\n' '|')"
   fi
 fi
 

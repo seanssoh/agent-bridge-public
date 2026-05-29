@@ -72,6 +72,7 @@ import {
 import {
   classifyRefreshError,
   redactResponseBody,
+  scrubSecretShapedText,
   refreshSuccessAuditLine,
   refreshFailureAuditLine,
   SingleFlight,
@@ -427,7 +428,7 @@ async function exchangeAuthCode(
   if (cb.error) {
     try { unlinkSync(callbackPath(pending.state)) } catch {}
     try { unlinkSync(pendingPath(upn)) } catch {}
-    return { status: 'error', error: cb.error, description: String(cb.error_description ?? '').slice(0, 500) }
+    return { status: 'error', error: cb.error, description: scrubSecretShapedText(String(cb.error_description ?? '')).slice(0, 500) }
   }
   if (!cb.code) {
     return { status: 'error', error: 'empty_code', description: 'callback file had no code' }
@@ -450,17 +451,24 @@ async function exchangeAuthCode(
     },
   )
   if (data.error) {
+    // pair_poll surfaces this via textResult (agent-visible). Scrub any
+    // token-shaped substring smuggled into error_description.
     return {
       status: 'error',
       error: data.error,
-      description: String(data.error_description ?? '').slice(0, 500),
+      description: scrubSecretShapedText(String(data.error_description ?? '')).slice(0, 500),
     }
   }
   if (!data.access_token) {
+    // codex adversarial-sweep BLOCKING #2: this description flows up to
+    // pair_poll's textResult (agent-visible stdout) — even more exposed
+    // than an audit row. A token endpoint that returns a no-access_token
+    // body still carrying refresh_token / id_token must NOT leak it.
+    // redactResponseBody is _raw-aware + value-content-scrubbed.
     return {
       status: 'error',
       error: 'malformed_response',
-      description: JSON.stringify(data).slice(0, 400),
+      description: JSON.stringify(redactResponseBody(data)).slice(0, 400),
     }
   }
   const token: TokenFile = {
@@ -527,7 +535,9 @@ async function doRefresh(upn: string): Promise<TokenFile> {
   } catch (e) {
     // fetch() rejected — DNS/TCP/TLS failure. Always transient: keep the
     // existing token, do NOT mark token_expired, let the next call retry.
-    const msg = e instanceof Error ? e.message : String(e)
+    // Scrub the exception text — re-thrown to the tool-handler catch
+    // (agent-visible) and the audit builder scrubs its own copy too.
+    const msg = scrubSecretShapedText(e instanceof Error ? e.message : String(e))
     process.stderr.write(
       refreshFailureAuditLine({
         upn,
@@ -551,15 +561,19 @@ async function doRefresh(upn: string): Promise<TokenFile> {
         refreshTokenPresent: true,
       }),
     )
+    // Scrub error_description before it reaches the status marker
+    // (pair_status, agent-visible) or the thrown error message
+    // (re-thrown to the tool-handler catch on the transient path).
+    const scrubbedDesc = scrubSecretShapedText(String(data.error_description ?? ''))
     if (kind === 'permanent') {
-      markTokenExpired(upn, `${data.error}: ${String(data.error_description ?? '').slice(0, 200)}`)
+      markTokenExpired(upn, `${data.error}: ${scrubbedDesc.slice(0, 200)}`)
     }
     // Transient errors leave the stored token untouched (no saveJson) so a
     // subsequent call retries with the same still-valid refresh_token.
     throw new RefreshError(
       kind,
       String(data.error),
-      `refresh failed for ${upn}: ${data.error} — ${String(data.error_description ?? '').slice(0, 300)}`,
+      `refresh failed for ${upn}: ${data.error} — ${scrubbedDesc.slice(0, 300)}`,
     )
   }
 
