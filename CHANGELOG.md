@@ -6,6 +6,28 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.0-beta5-4] — 2026-05-29
+
+### Highlight — beta5-3 fresh-install verify fixup (2 OOTB blockers)
+
+patch's beta5-3 fresh-install acceptance verify on a clean Linux VM (cm-prod-agentworkflow-vm01) returned **8 lanes GREEN** (K/A/CD/L/E/I + OAT) but surfaced two OOTB blockers that only a brand-new iso v2 agent on a long-running controller session hits — neither reproduces on an existing iso agent (regression on an existing agent is necessary but not sufficient; this is exactly why the fresh-install acceptance gate exists). Both are the same iso v2 controller-stale-supplementary-group class (a `usermod -aG` does not refresh the live controller/daemon process's group set, so a freshly-created agent's `ab-agent-<a>` GID is absent until re-login — confirmed by patch's `/proc/<pid>/status` diagnosis). `-beta5-4` prerelease, tag `v0.15.0-beta5-4`, GitHub **Pre-release**.
+
+Lane → PR map: N #1380 (#1378) / O #1381 (#1379).
+
+### Fixed — Track N: fresh iso agent start no longer fails on session.lock (#1378, PR #1380) — OOTB blocker
+
+A freshly-created iso v2 agent (`agent create <new> --isolate && agent start <new>`) aborted with `session.lock: Permission denied` — `bridge_agent_session_lock_file` resolved into the iso DATA tree `data/agents/<a>/runtime/` (`root:ab-agent-<a>` 2750/2770), which the controller (whose live process has a stale supplementary-group set after `usermod -aG`, the #1025 class) cannot open. The lock is a controller-only serialization primitive (the agent UID never flocks it), so it now anchors on the controller-OWNED state leaf `bridge_agent_idle_marker_dir` (→ `state/agents/<a>/`, emitted `controller:ab-agent-<a>` 2770) — the controller writes it via OWNER bits, independent of the stale group. Shared/non-iso lock path is byte-identical; Track L idle-markers coexist in the same setgid leaf.
+
+### Fixed — Track O: iso cron staging file is daemon-readable (#1379, PR #1381) — #1359 follow-up
+
+`agb cron create` from an iso v2 agent staged a file the daemon couldn't read (group was the iso UID's user-private `agent-bridge-<a>`, not the shared `ab-agent-<a>`) → 30s pickup timeout → silent cron-create failure. The staging writer now `chgrp`s the file to the canonical actor group (`ab-agent-<a>`, 0660) + self-heals the per-agent subdir to 2770+setgid. Hardened over two review rounds: `AGB_STAGE_FILE_GROUP` is an untrusted gid-selection hint (the allow-list is actor-name-derived only — `ab-shared`/other groups are rejected, closing a cross-agent surface), and the chgrp is fail-loud (post-stat `st_gid` verify; on mismatch it unlinks + errors `rc 73` with no uuid instead of silently publishing the un-readable file). #1359 per-agent ownership isolation preserved.
+
+### Known carry-over / pending verify
+
+- **Deferred from beta5-3 verify (not blockers)**: M #1343 (MS365 token refresh — patch monitors test_clean's natural ~1h token expiry), J #1370 (shared-mode admin auto-restart — needs a raw-VM admin role, not patch's own session). Both code-cleared; awaiting natural/raw-VM verification.
+- The broader iso v2 controller/daemon stale-supplementary-group ROOT (a `usermod -aG` doesn't refresh a live process): Track N sidesteps it for the lock via a controller-owned path; the daemon-side group-refresh complement is added only if patch's beta5-4 end-to-end re-verify shows a stale-group barrier remaining past the lock.
+- Inherited: β-1231-1236 T5 stderr/stdout (informational), #1367 (Track F root), #1353 root (awaiting_channel_setup), #1359 root (daemon IPC socket).
+
 ## [0.15.0-beta5-3] — 2026-05-29
 
 ### Highlight — beta5-2 OOTB-followup wave (12 lanes A–M, ~13 issues) + #1370 regression + CI housekeeping
