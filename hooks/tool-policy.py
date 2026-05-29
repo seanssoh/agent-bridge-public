@@ -2208,7 +2208,11 @@ def _credential_routine_command_sha256(text: str) -> str:
 #
 # The OAuth setup-token prefix is `sk-ant-o`; tokens continue with
 # `[A-Za-z0-9_-]`. Collapse the run to the prefix + `<REDACTED>`.
-_CREDENTIAL_TOKEN_VALUE_RE = re.compile(r"sk-ant-o[A-Za-z0-9_-]*")
+# Issue #1358 r6 (codex r5 BLOCKING): idempotent — the (?!<REDACTED>)
+# lookahead keeps a second redaction pass (or the Layer 1 write_audit
+# choke-point re-running over this writer's output) a no-op instead of
+# producing ``sk-ant-o<REDACTED><REDACTED>``.
+_CREDENTIAL_TOKEN_VALUE_RE = re.compile(r"sk-ant-o(?!<REDACTED>)[A-Za-z0-9_-]*")
 
 
 def _redact_credential_token_values(text: str) -> str:

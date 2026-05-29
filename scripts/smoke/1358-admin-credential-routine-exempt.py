@@ -858,6 +858,33 @@ def main() -> int:
             "surfaces; paths / non-credential text preserved"
         )
 
+    # Codex r5 BLOCKING (r6, 2026-05-29) — redactor MUST be idempotent.
+    # Layer 2 writers emit an already-collapsed marker BEFORE the Layer 1
+    # write_audit choke-point runs; without the (?!<REDACTED>) lookahead a
+    # second pass produced `sk-ant-o<REDACTED><REDACTED>`. Assert (1) the
+    # marker is a fixed point, (2) a raw run collapses to exactly one
+    # marker, (3) a double pass equals a single pass.
+    idem_ok = True
+    marker = "sk-ant-" + "o" + "<REDACTED>"
+    raw = "denied " + ("sk-ant-" + "o") + "RAWTOKEN123 via layer2"
+    once = redact(raw)
+    twice = redact(once)
+    if redact(marker) != marker:
+        failures.append(f"  FAIL  [idempotent] marker not a fixed point: {redact(marker)!r}")
+        idem_ok = False
+    if once != twice:
+        failures.append(f"  FAIL  [idempotent] double pass != single: once={once!r} twice={twice!r}")
+        idem_ok = False
+    if once.count("<REDACTED>") != 1 or twice.count("<REDACTED>") != 1:
+        failures.append(f"  FAIL  [idempotent] not exactly one marker: once={once!r} twice={twice!r}")
+        idem_ok = False
+    if idem_ok:
+        print(
+            "  PASS  [idempotent] redactor is a fixed point — raw run -> "
+            "exactly one marker, marker -> unchanged, double pass == single "
+            "(no sk-ant-o<REDACTED><REDACTED> compounding)"
+        )
+
     if failures:
         print(f"\n{len(failures)} failure(s):", file=sys.stderr)
         for f in failures:
@@ -868,7 +895,7 @@ def main() -> int:
     # + token-value
     total = (
         len(cases) + len(strict_cases) + 1 + 1 + len(hash_cases) + 1
-        + len(broad_cases) + 1 + 1 + 1
+        + len(broad_cases) + 1 + 1 + 1 + 1
     )
     print(
         f"\n[smoke:1358-admin-credential-routine-exempt] "

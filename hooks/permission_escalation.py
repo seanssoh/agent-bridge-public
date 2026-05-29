@@ -120,7 +120,11 @@ def _credential_command_sha256(text: str) -> str:
 # AND the `[PERMISSION]` admin-task body. Redact the token-shaped run as
 # a final pass after `sanitize_text`. Mirrors
 # ``tool-policy.py:_redact_credential_token_values``.
-_CREDENTIAL_TOKEN_VALUE_RE = re.compile(r"sk-ant-o[A-Za-z0-9_-]*")
+# Issue #1358 r6 (codex r5 BLOCKING): idempotent — the (?!<REDACTED>)
+# lookahead keeps a double redaction pass (this source-redact feeding the
+# Layer 1 write_audit choke-point) a no-op instead of compounding the
+# marker into ``sk-ant-o<REDACTED><REDACTED>`` in the audit detail.reason.
+_CREDENTIAL_TOKEN_VALUE_RE = re.compile(r"sk-ant-o(?!<REDACTED>)[A-Za-z0-9_-]*")
 
 
 def _redact_credential_token_values(text: str) -> str:

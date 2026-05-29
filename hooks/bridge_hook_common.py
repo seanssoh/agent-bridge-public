@@ -415,7 +415,14 @@ def under_isolated_uid() -> bool:
 # ``permission_escalation.py``. Defined here so it can guard EVERY audit
 # row at the single write point regardless of which hook module emitted
 # it (#1358 r4 class closure).
-_AUDIT_CREDENTIAL_TOKEN_VALUE_RE = re.compile(r"sk-ant-o[A-Za-z0-9_-]*")
+# Issue #1358 r6 (codex r5 BLOCKING): the redactor MUST be idempotent.
+# Layer 2 writers (tool-policy.py / permission_escalation.py) emit values
+# already collapsed to ``sk-ant-o<REDACTED>`` BEFORE this Layer 1
+# choke-point runs. Without the negative lookahead, the bare prefix inside
+# an already-redacted marker re-matches and yields ``sk-ant-o<REDACTED><REDACTED>``.
+# The ``(?!<REDACTED>)`` guard skips an already-collapsed marker so a
+# double pass is a no-op (raw run -> single marker; marker -> unchanged).
+_AUDIT_CREDENTIAL_TOKEN_VALUE_RE = re.compile(r"sk-ant-o(?!<REDACTED>)[A-Za-z0-9_-]*")
 
 
 def _redact_audit_detail_credentials(value: Any) -> Any:
