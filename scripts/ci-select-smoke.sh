@@ -782,15 +782,27 @@ select_for_path() {
       # at-most-once admin escalation; (e) the unclaimed-queue daemon
       # tick + per-task marker cooldown contract.
       add_required beta5-2-iota-daemon-escalation-family
-      # v0.15.0-beta5-2 Track G (#1323 r2): bridge-daemon.sh's
-      # nudge_agent_session verify-grace block now does a two-stage
-      # check (stage_2 = TOTAL elapsed-time gate, not additional
-      # sleep). Pull 1323-nudge-eligibility-recheck-twostage on every
-      # bridge-daemon.sh move so a future PR cannot silently regress
-      # the two-stage shape, the env-knob fallbacks
-      # (BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS / _STAGE_2_SECONDS), or
-      # the rapid-succession dedup that prevents a same-agent second
-      # nudge from spawning a parallel verify window.
+      # v0.15.0-beta5-2 Track G (#1323 r3): bridge-daemon.sh's
+      # nudge_agent_session verify-grace block does a two-stage check
+      # (stage_2 = TOTAL elapsed-time gate, not additional sleep), and
+      # consults the per-(agent, task_id) dedup gate
+      # (bridge_daemon_should_skip_nudge / bridge_daemon_record_nudge)
+      # before/after the verify window. The 1323 smoke pins: the
+      # two-stage shape + env-knob fallbacks
+      # (BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS / _STAGE_2_SECONDS); and,
+      # via its T4a-T4d cases (r3), the REAL dedup path — it sources
+      # bridge_daemon_should_skip_nudge / bridge_daemon_record_nudge
+      # straight from the daemon and drives same-task in-window SKIP,
+      # different-task fire, window-expiry, and a faithful cross-tick
+      # rapid-succession scenario (a `nudge_once` wrapper mirroring the
+      # daemon's skip-check → verify → record-after-verified-send order;
+      # nudge 1 delivered in a `( ... ) &` subshell then waited for,
+      # modelling the daemon's at-most-once-per-tick guarantee, then
+      # nudge 2 inline) proving a same-agent second nudge is deduped —
+      # exactly one session_nudge_sent, no double-counter — rather than
+      # spawning a second verify window. Pull on every bridge-daemon.sh
+      # move so neither the two-stage shape nor the dedup-gate wiring can
+      # regress silently.
       add_required 1323-nudge-eligibility-recheck-twostage
       # v0.15.0-beta5-2 Lane μ (#1327 / #1328): bridge-daemon.sh's
       # `cmd_run_cron_worker` now re-checks the manual-stop marker at

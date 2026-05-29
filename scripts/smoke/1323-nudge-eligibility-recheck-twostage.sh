@@ -47,17 +47,43 @@
 #       → `session_nudge_dropped` row emitted with stage2_used=1,
 #         grace_total_seconds=stage_2_total=5, return 1. (Pre-r2
 #         this was 7s — see codex r1 BLOCKING 1.)
-#   T4: rapid succession (two nudges to the same agent for the same
-#       task within the verify window) — codex r1 BLOCKING 3.
-#       T4a: first nudge at t=0; stage 1 (2s) sees queued.
-#       T4b: second nudge fires at t=3s while first is still mid-verify;
-#            ack lands at t=2.5s on first nudge — both verify windows
-#            see the task transition to claimed.
-#       → No double `session_nudge_dropped` row, no spurious counter,
-#         both shim invocations return 0. This proves the verify-grace
-#         block alone tolerates rapid succession (the in-source dedup
-#         gate `bridge_daemon_should_skip_nudge` is exercised by the
-#         sibling iota smoke; here we pin the per-call audit-row math).
+#   T4: rapid succession — REAL dedup path (codex r1 BLOCKING 3, fully
+#       closed at r3). The daemon consults `bridge_daemon_should_skip_
+#       nudge` BEFORE the verify-grace block (bridge-daemon.sh:5705) and
+#       `bridge_daemon_record_nudge` AFTER a verified send (:5864). A
+#       second nudge for the same (agent, task) inside the redelivery
+#       window must be deduped — never spawning a parallel verify window.
+#       The r1/r2 smoke only drove a synthetic verify-grace timeline and
+#       never called the dedup helpers, so the rapid-succession claim was
+#       unproven. r3 sources the real helpers from the daemon and drives:
+#       T4a: record nudge for (agentA, #1) → should_skip same (agentA, #1)
+#            inside window → SKIP (dedup holds; no second verify window).
+#       T4b: record nudge for (agentA, #1) → should_skip (agentA, #2)
+#            (DIFFERENT task) → NOT skip (a genuinely new task fires).
+#       T4c: record nudge for (agentA, #1) → window expires (redelivery=2,
+#            real 3s sleep) → should_skip → NOT skip (window slid past).
+#       T4d: rapid-succession through the FAITHFUL daemon order. A
+#            `nudge_once` wrapper mirrors nudge_agent_session exactly:
+#            skip-check (bridge-daemon.sh:5705) → if not skip, verify-grace
+#            block → and ONLY if verify returns 0 (task left queued =
+#            delivered) record + emit `session_nudge_sent`
+#            (bridge-daemon.sh:5836-5864 — a dropped nudge `return 1`s
+#            BEFORE record, so a drop never records). Nudge 1 is a
+#            successful delivery (timeline queued→claimed) spawned in a
+#            `( ... ) &` subshell; we then `wait` for it (the daemon
+#            processes each agent at most once per tick — two nudges to the
+#            same agent are consecutive ticks, never overlapping verify
+#            windows; the dedup helpers carry NO lock, so the real
+#            cross-tick guarantee IS the sequencing, which `wait` models).
+#            Nudge 2 then runs inline through the same wrapper and hits the
+#            now-populated dedup gate. The daemon `return 0`s on the dedup
+#            path (bridge-daemon.sh:5723), so the dedup is asserted via the
+#            audit rows, NOT the rc: exactly ONE `session_nudge_sent` total
+#            (the dedup prevented a second send — the real no-double-counter
+#            invariant; counting state-file lines can't prove this because
+#            record_nudge overwrites atomically), exactly one
+#            `session_nudge_deduped` row from nudge 2, and ZERO
+#            `session_nudge_dropped` (nudge 1 succeeded).
 #   T5_teeth: bridge-status.py renders the `nudge-recheck` line + JSON
 #       `nudge_recheck` block when an audit row exists, and the
 #       counter SQL distinguishes stage2_used=1 drops from legacy
@@ -236,6 +262,93 @@ verify_grace_shim() {
   return 0
 }
 
+# --- Source the REAL in-source dedup gate from bridge-daemon.sh --------
+# r3 (codex r2 BLOCKING): T4 must exercise the actual rapid-succession
+# dedup path (`bridge_daemon_should_skip_nudge` / `bridge_daemon_record_
+# nudge`) that `nudge_agent_session` consults BEFORE entering the
+# verify-grace block (bridge-daemon.sh:5705 — skip-check; :5864 — record).
+# The r1/r2 smoke only drove the synthetic verify-grace timeline and never
+# called the dedup helpers, so the ci-select claim of "rapid-succession
+# dedup that prevents a same-agent second nudge from spawning a parallel
+# verify window" was unproven. We extract the two dedup entry points
+# (`bridge_daemon_should_skip_nudge` / `bridge_daemon_record_nudge`) plus
+# their five state-file / fingerprint dependencies straight from the
+# daemon source so the smoke bites if either side drifts. Extraction
+# pattern is the one the sibling iota smoke
+# (beta5-2-iota-daemon-escalation-family) already proves: a python pass
+# that captures each wanted `name() {` block up to its column-0 `}`,
+# skipping over inner heredoc bodies whose lines may themselves start
+# with `}`.
+#
+# Footgun #11 (no python3 heredoc-stdin to a subprocess): the extractor
+# program is WRITTEN to a standalone file on disk (a heredoc-to-FILE
+# redirect, which is fine) and then invoked with BOTH the source path and
+# the wanted-CSV passed as argv — the python3 subprocess reads nothing
+# from stdin. This mirrors the AUDIT_DETAIL_HELPER / PARSE_HELPER pattern
+# already used below in this smoke.
+DEDUP_HELPERS_SUBSET="$SMOKE_TMP_ROOT/daemon-dedup-helpers.sh"
+DEDUP_EXTRACT_HELPER="$SMOKE_TMP_ROOT/extract-dedup-helpers.py"
+DEDUP_WANTED_HELPERS=(
+  bridge_daemon_nudge_state_file
+  bridge_daemon_compute_nudge_fingerprint
+  bridge_daemon_nudge_task_ts_var
+  bridge_daemon_nudge_dedup_load
+  bridge_daemon_nudge_dedup_reset_scope
+  bridge_daemon_should_skip_nudge
+  bridge_daemon_record_nudge
+)
+DEDUP_WANTED_CSV="$(IFS=,; echo "${DEDUP_WANTED_HELPERS[*]}")"
+cat >"$DEDUP_EXTRACT_HELPER" <<'PYEOF'
+import re, sys
+src_path = sys.argv[1]
+wanted = set(sys.argv[2].split(","))
+with open(src_path, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+out = []
+i = 0
+fn_start_re = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\(\) \{')
+heredoc_re = re.compile(r"<<[-']?([A-Za-z_][A-Za-z0-9_]*)'?")
+while i < len(lines):
+    line = lines[i]
+    m = fn_start_re.match(line)
+    if m and m.group(1) in wanted:
+        block = [line]
+        heredoc_term = None
+        j = i + 1
+        while j < len(lines):
+            cur = lines[j]
+            block.append(cur)
+            if heredoc_term is None:
+                hm = heredoc_re.search(cur)
+                if hm:
+                    heredoc_term = hm.group(1)
+            else:
+                if cur.rstrip("\n") == heredoc_term:
+                    heredoc_term = None
+                j += 1
+                continue
+            if cur == "}\n" or cur == "}":
+                break
+            j += 1
+        out.extend(block)
+        out.append("\n")
+        i = j + 1
+        continue
+    i += 1
+sys.stdout.write("".join(out))
+PYEOF
+python3 "$DEDUP_EXTRACT_HELPER" "$REPO_ROOT/bridge-daemon.sh" "$DEDUP_WANTED_CSV" >"$DEDUP_HELPERS_SUBSET"
+
+# All seven helpers must have been captured — a rename/move in the daemon
+# would silently shrink this subset and make the dedup tests below vacuous.
+for _fn in "${DEDUP_WANTED_HELPERS[@]}"; do
+  grep -q "^${_fn}() {" "$DEDUP_HELPERS_SUBSET" \
+    || smoke_fail "dedup-extract: bridge-daemon.sh no longer defines ${_fn}() (T4 dedup gate would be vacuous)"
+done
+
+# shellcheck source=/dev/null
+source "$DEDUP_HELPERS_SUBSET"
+
 # audit_count action target → integer count of matching rows.
 audit_count() {
   local action="$1" target="$2"
@@ -341,47 +454,161 @@ smoke_run "T3 both-stages-queued: emit drop with stage2_used=1" : ; {
   smoke_assert_contains "$(cat "$DAEMON_INFO_LOG")" "stage1=2s stage2_total=5s" "T3 log cites stage_1 + stage_2_total"
 }
 
-# --- T4: rapid succession — codex r1 BLOCKING 3 -------------------
-# T4a: nudge 1 at t=0; stage 1 (2s) sees queued.
-# T4b: ack lands at t=2.5s on first nudge; stage 2 poll sees claimed.
-# T4c: nudge 2 fires at t=3s (operator-overlapping idle-nudge tick or
-#      a new task surfacing on the same agent within the same verify
-#      window). Both stage-1 and stage-2 polls of nudge 2 see the
-#      task as claimed (it was acked at t=2.5s).
-#
-# Assertion: zero `session_nudge_dropped` rows total; both shim
-# invocations return 0; no double-counter. This pins the per-call
-# audit-row math under rapid succession — the in-source dedup gate
-# `bridge_daemon_should_skip_nudge` is exercised by the sibling iota
-# smoke (beta5-2-iota-daemon-escalation-family).
-smoke_run "T4 rapid succession: no double-audit, no double-counter, sane return" : ; {
+# --- T4: rapid succession — REAL dedup path (codex r1 BLOCKING 3, r3) --
+# These tests drive the actual in-source helpers extracted above, NOT the
+# synthetic verify-grace timeline. They prove the dedup gate the daemon
+# consults at bridge-daemon.sh:5705 before any verify window opens.
+
+# T4a: same (agent, task) inside the window → dedup SKIP.
+smoke_run "T4a same-task in-window → should_skip returns SKIP (dedup)" : ; {
+  : >"$AUDIT_LOG"
+  rm -f "$(bridge_daemon_nudge_state_file agent-t4a)"
+  export BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS=600
+  fp="$(bridge_daemon_compute_nudge_fingerprint "1")"
+  bridge_daemon_record_nudge "agent-t4a" "$fp" "1"
+  state_file="$(bridge_daemon_nudge_state_file agent-t4a)"
+  smoke_assert_file_exists "$state_file" "T4a state file written by record_nudge"
+  grep -q "^NUDGE_TASK_TS_1=" "$state_file" || smoke_fail "T4a NUDGE_TASK_TS_1 missing after record"
+  if bridge_daemon_should_skip_nudge "agent-t4a" "$fp" "1"; then
+    : # skip == dedup held
+  else
+    smoke_fail "T4a should_skip must return SKIP for same (agent, task) inside window"
+  fi
+  unset BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS
+}
+
+# T4b: same agent, DIFFERENT task → a genuinely new task must fire.
+smoke_run "T4b same-agent different-task → should_skip returns OK (fire)" : ; {
+  : >"$AUDIT_LOG"
+  rm -f "$(bridge_daemon_nudge_state_file agent-t4b)"
+  export BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS=600
+  bridge_daemon_record_nudge "agent-t4b" "$(bridge_daemon_compute_nudge_fingerprint "1")" "1"
+  # Task #2 has no NUDGE_TASK_TS_2 entry → dedup must break for the new id.
+  if bridge_daemon_should_skip_nudge "agent-t4b" "$(bridge_daemon_compute_nudge_fingerprint "2")" "2"; then
+    smoke_fail "T4b should_skip must NOT skip a different task (#2) on the same agent"
+  else
+    : # not-skip == new task fires
+  fi
+  unset BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS
+}
+
+# T4c: window expiry — after the redelivery window slides past, the same
+# (agent, task) is eligible again. Uses a real 2s sleep against a 1s
+# redelivery window so the elapsed-time math is exercised, not faked.
+# The window is 2s (not 1s): with a 1s window the record's `now=N` and an
+# immediate recheck at `now=N+1` would compute `(( 1 < 1 ))` = not-skip and
+# flake. 2s gives the in-window recheck a full second of slack; the expiry
+# sleep is then 3s (> 2s window + 1s clock granularity). The immediate
+# in-window skip is already pinned by T4a, so the load-bearing assertion
+# here is the post-expiry not-skip.
+smoke_run "T4c window expiry → should_skip returns OK after window slides past" : ; {
+  : >"$AUDIT_LOG"
+  rm -f "$(bridge_daemon_nudge_state_file agent-t4c)"
+  export BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS=2
+  fp="$(bridge_daemon_compute_nudge_fingerprint "1")"
+  bridge_daemon_record_nudge "agent-t4c" "$fp" "1"
+  # Inside the 2s window → skip (slack guards against clock granularity).
+  if bridge_daemon_should_skip_nudge "agent-t4c" "$fp" "1"; then
+    : # in-window skip
+  else
+    smoke_fail "T4c should_skip must SKIP immediately after record (inside 2s window)"
+  fi
+  # Wait past the 2s redelivery window (3s = window + 1s granularity).
+  sleep 3
+  if bridge_daemon_should_skip_nudge "agent-t4c" "$fp" "1"; then
+    smoke_fail "T4c should_skip must NOT skip after the redelivery window expires"
+  else
+    : # window slid past → eligible again
+  fi
+  unset BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS
+}
+
+# nudge_once — faithful 1:1 of nudge_agent_session's dedup→verify→record
+# sequence (bridge-daemon.sh:5705 skip-check, :5820-5856 verify-grace,
+# :5864 record-after-verified-send, :5866 session_nudge_sent). A dropped
+# nudge `return 1`s at :5855 BEFORE the record at :5864, so a drop never
+# records and never emits session_nudge_sent — exactly the contract a
+# rapid second nudge relies on. The verify side is delegated to the same
+# verify_grace_shim the rest of this smoke pins, so the two-stage shape
+# and the dedup gate are exercised together (the gap codex r1/r2 flagged).
+nudge_once() {
+  local agent="$1" task_id="$2" id_csv="$3" title="$4"
+  local fp
+  fp="$(bridge_daemon_compute_nudge_fingerprint "$id_csv")"
+  # Skip-check FIRST — a same-(agent,task) nudge inside the redelivery
+  # window short-circuits here, never opening a verify window. The daemon
+  # emits session_nudge_deduped and `return 0`s on this path
+  # (bridge-daemon.sh:5706-5723) — faithfully mirrored, including the rc.
+  # T4d distinguishes the dedup outcome via the audit rows
+  # (session_nudge_deduped present, session_nudge_sent absent), not the rc.
+  if bridge_daemon_should_skip_nudge "$agent" "$fp" "$id_csv"; then
+    bridge_audit_log daemon session_nudge_deduped "$agent" --detail task_id="$task_id"
+    return 0
+  fi
+  # Capture verify_grace_shim's rc via an `if` so we neither trip the
+  # caller's `set -e` nor leak a `set +e`/`set -e` toggle out of this
+  # function (a leaked errexit flip aborts a backgrounding subshell
+  # before it can stash $? — footgun confirmed during r3 negative-control
+  # testing). A non-zero rc means the nudge was dropped: return BEFORE
+  # the record, mirroring nudge_agent_session's `return 1` at
+  # bridge-daemon.sh:5855 (a dropped nudge must NOT record, so the next
+  # idle-nudge tick re-fires unconditionally — issue #767).
+  if verify_grace_shim "$agent" "$task_id" 1 0 0 "$title"; then
+    bridge_daemon_record_nudge "$agent" "$fp" "$id_csv"
+    bridge_audit_log daemon session_nudge_sent "$agent" --detail task_id="$task_id"
+    return 0
+  fi
+  return 1
+}
+
+# T4d: rapid succession through the faithful daemon order. Nudge 1 is a
+# successful delivery in a `( ... ) &` subshell; we wait for it (the daemon
+# processes an agent at most once per tick — rapid succession is across
+# consecutive ticks, never overlapping verify windows; the dedup helpers
+# carry no lock so the sequencing IS the guarantee). Nudge 2 then hits the
+# populated gate inline and must dedup. Invariant: exactly one
+# session_nudge_sent, nudge 2 deduped, zero drops.
+smoke_run "T4d rapid succession (faithful order): nudge 2 deduped, one send, no double-counter" : ; {
   : >"$AUDIT_LOG"
   : >"$DAEMON_INFO_LOG"
-
-  # Nudge 1 timeline: stage 1 queued → stage 2 claimed (ack at t=2.5s).
-  timeline_set 404 queued claimed
+  rm -f "$(bridge_daemon_nudge_state_file agent-t4d)"
+  export BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS=600
   export BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS=2
   export BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS=5
-  set +e
-  verify_grace_shim "agent-t4" "404" 1 0 0 "t4-nudge-1"
-  rc1=$?
-  set -e
-  smoke_assert_eq 0 "$rc1" "T4 nudge 1 returns 0 (stage 2 sees ack)"
-  drop_after_n1="$(audit_count session_nudge_dropped agent-t4)"
-  smoke_assert_eq 0 "$drop_after_n1" "T4 nudge 1: no session_nudge_dropped row"
 
-  # Nudge 2 timeline: task already acked → both polls see claimed.
-  timeline_set 404 claimed claimed
-  set +e
-  verify_grace_shim "agent-t4" "404" 1 0 0 "t4-nudge-2"
-  rc2=$?
-  set -e
+  # Nudge 1 delivers: stage 1 queued, stage 2 claimed → verify returns 0 →
+  # records + emits session_nudge_sent.
+  timeline_set 1 queued claimed
+  RACE_RC_FILE="$SMOKE_TMP_ROOT/t4d-nudge1.rc"
+  (
+    set +e
+    nudge_once "agent-t4d" "1" "1" "t4d-nudge-1"
+    printf '%s' "$?" >"$RACE_RC_FILE"
+  ) &
+  race_pid=$!
+  wait "$race_pid"
+  rc1="$(cat "$RACE_RC_FILE" 2>/dev/null || printf 'X')"
+  smoke_assert_eq 0 "$rc1" "T4d nudge 1 delivered (verify ok → recorded + sent)"
+
+  # Nudge 2 fires inline (next tick) for the SAME (agent, task) inside the
+  # window → the dedup gate short-circuits it. The daemon `return 0`s on the
+  # dedup path, so the outcome is asserted via the audit rows below, NOT the
+  # rc (session_nudge_deduped present, no second session_nudge_sent).
+  timeline_set 1 queued claimed
+  nudge_once "agent-t4d" "1" "1" "t4d-nudge-2"
   unset BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS
-  smoke_assert_eq 0 "$rc2" "T4 nudge 2 returns 0 (task already claimed)"
+  unset BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS
 
-  drop_total="$(audit_count session_nudge_dropped agent-t4)"
-  smoke_assert_eq 0 "$drop_total" "T4 no double-audit (zero drops across both nudges)"
-  smoke_assert_not_contains "$(cat "$DAEMON_INFO_LOG")" "appears dropped" "T4 no 'appears dropped' log on either nudge"
+  # The no-double-counter invariant: exactly ONE session_nudge_sent across
+  # both nudges (the second was deduped before it could send/record), and
+  # exactly one session_nudge_deduped row from nudge 2.
+  sent_total="$(audit_count session_nudge_sent agent-t4d)"
+  smoke_assert_eq 1 "$sent_total" "T4d exactly one session_nudge_sent (dedup blocked the second nudge)"
+  deduped_total="$(audit_count session_nudge_deduped agent-t4d)"
+  smoke_assert_eq 1 "$deduped_total" "T4d exactly one session_nudge_deduped row (nudge 2 short-circuited at the gate)"
+  # Nudge 1 succeeded → no drop on either nudge.
+  drop_total="$(audit_count session_nudge_dropped agent-t4d)"
+  smoke_assert_eq 0 "$drop_total" "T4d zero session_nudge_dropped (nudge 1 delivered, nudge 2 deduped)"
 }
 
 # --- T4_legacy: STAGE2 fallback path still disables stage 2 -------
@@ -502,6 +729,23 @@ smoke_run "T5_teeth structural shape in bridge-daemon.sh + bridge-status.py" : ;
     || smoke_fail "teeth: bridge-daemon.sh must emit grace_total_seconds detail"
   grep -q 'grace_stage2_total_seconds' "$daemon_sh" \
     || smoke_fail "teeth: bridge-daemon.sh must emit grace_stage2_total_seconds detail (r2)"
+
+  # r3 BLOCKING: the rapid-succession dedup that T4 now exercises lives in
+  # nudge_agent_session, which must consult bridge_daemon_should_skip_nudge
+  # BEFORE the verify window and bridge_daemon_record_nudge AFTER the send.
+  # If a future PR drops either call, the dedup gate (and thus T4's claim)
+  # silently regresses — these greps make that a smoke failure.
+  grep -q 'bridge_daemon_should_skip_nudge ' "$daemon_sh" \
+    || smoke_fail "teeth: bridge-daemon.sh must call bridge_daemon_should_skip_nudge (rapid-succession dedup gate)"
+  grep -q 'bridge_daemon_record_nudge ' "$daemon_sh" \
+    || smoke_fail "teeth: bridge-daemon.sh must call bridge_daemon_record_nudge (post-send dedup record)"
+  # The nudge_once wrapper in T4d models the daemon's audit shape: a
+  # deduped nudge emits session_nudge_deduped, a verified send emits
+  # session_nudge_sent. Pin both so the wrapper stays faithful.
+  grep -q 'session_nudge_deduped' "$daemon_sh" \
+    || smoke_fail "teeth: bridge-daemon.sh must emit session_nudge_deduped on the dedup path"
+  grep -q 'session_nudge_sent' "$daemon_sh" \
+    || smoke_fail "teeth: bridge-daemon.sh must emit session_nudge_sent on a verified send"
 
   grep -q 'nudge_recheck_observability_counts' "$status_py" \
     || smoke_fail "teeth: bridge-status.py must define nudge_recheck_observability_counts"
