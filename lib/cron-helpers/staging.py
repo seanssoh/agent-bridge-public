@@ -86,6 +86,27 @@ Subcommands
     daemon to bound runaway disk usage when an iso UID writes a payload
     and crashes before reading the result.
 
+- parse-row <json-string>
+    Controller / daemon side. Parse a `scan-pending` JSON row and print
+    the `uuid=`/`actor_agent=`/`owner_uid=`/`stale=` lines the daemon's
+    apply loop greps for. Extracted from the inline heredoc-stdin at
+    bridge-daemon.sh:8997 (footgun #11). Emits nothing + exit 0 on a
+    parse error so the bash `|| continue` skips the row.
+
+- parse-result <result-path>
+    Controller / daemon side. Parse a `<uuid>.result.json` file and print
+    the `audit_action=`/`actor_agent=`/`status=`/`cron_id=`/`error=` lines
+    the daemon's audit emitter greps for. Extracted from the inline
+    heredoc-stdin at bridge-daemon.sh:9077 (footgun #11). Emits nothing +
+    exit 0 on a read/parse error so the bash `|| _result_parsed=""` holds.
+
+- parse-swept <json-string>
+    Controller / daemon side. Parse a `sweep-stale` JSON row and print
+    the `uuid=`/`age=` lines (age from `mtime_age_seconds`) the daemon's
+    sweep audit emitter greps for. Extracted from the inline heredoc-stdin
+    at bridge-daemon.sh:9130 (footgun #11). Emits nothing + exit 0 on a
+    parse error so the bash `|| continue` skips the row.
+
 Payload schema (canonical, schema_version=1)
 --------------------------------------------
 {
@@ -792,6 +813,70 @@ def cmd_sweep_stale(staging_root_arg: str, stale_seconds: str) -> int:
     return 0
 
 
+def cmd_parse_row(row_json: str) -> int:
+    """Parse a `scan-pending` JSON row and emit the `key=value` lines the
+    daemon's apply loop greps for. Extracted from the inline
+    `python3 - <<'PY'` heredoc-stdin at bridge-daemon.sh:8997 to clear
+    footgun #11 (Bash 5.3.9 heredoc-stdin + command-sub deadlock).
+
+    Output contract (byte-identical to the prior heredoc body): one line
+    each for uuid / actor_agent / owner_uid / stale. On a parse error,
+    emit NOTHING and exit 0 — the caller does `|| continue`, so a silent
+    empty parse skips the row exactly as the heredoc's `sys.exit(0)` did.
+    """
+    try:
+        data = json.loads(row_json)
+    except Exception:
+        return 0
+    print("uuid=" + str(data.get("uuid") or ""))
+    print("actor_agent=" + str(data.get("actor_agent") or ""))
+    print("owner_uid=" + str(data.get("owner_uid") or ""))
+    print("stale=" + ("1" if data.get("stale") else "0"))
+    return 0
+
+
+def cmd_parse_result(result_path_arg: str) -> int:
+    """Parse a `<uuid>.result.json` file and emit the `key=value` lines the
+    daemon's audit emitter greps for. Extracted from the inline
+    `python3 - <<'PY'` heredoc-stdin at bridge-daemon.sh:9077.
+
+    Output contract (byte-identical to the prior heredoc body): one line
+    each for audit_action / actor_agent / status / cron_id / error. On a
+    read or parse error, emit NOTHING and exit 0 — the caller does
+    `|| _result_parsed=""`, matching the heredoc's `sys.exit(0)`.
+    """
+    try:
+        with open(result_path_arg, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return 0
+    print("audit_action=" + str(data.get("audit_action") or ""))
+    print("actor_agent=" + str(data.get("actor_agent") or ""))
+    print("status=" + str(data.get("status") or ""))
+    print("cron_id=" + str(data.get("cron_id") or ""))
+    print("error=" + str(data.get("error") or ""))
+    return 0
+
+
+def cmd_parse_swept(row_json: str) -> int:
+    """Parse a `sweep-stale` JSON row and emit the `key=value` lines the
+    daemon's sweep audit emitter greps for. Extracted from the inline
+    `python3 - <<'PY'` heredoc-stdin at bridge-daemon.sh:9130.
+
+    Output contract (byte-identical to the prior heredoc body): one line
+    each for uuid / age (sourced from `mtime_age_seconds`). On a parse
+    error, emit NOTHING and exit 0 — the caller does `|| continue`,
+    matching the heredoc's `sys.exit(0)`.
+    """
+    try:
+        data = json.loads(row_json)
+    except Exception:
+        return 0
+    print("uuid=" + str(data.get("uuid") or ""))
+    print("age=" + str(data.get("mtime_age_seconds") or ""))
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         sys.stderr.write("usage: staging.py <subcommand> [args]\n")
@@ -808,6 +893,12 @@ def main() -> int:
         return cmd_apply(args[0], args[1], args[2], args[3])
     if sub == "sweep-stale" and len(args) == 2:
         return cmd_sweep_stale(args[0], args[1])
+    if sub == "parse-row" and len(args) == 1:
+        return cmd_parse_row(args[0])
+    if sub == "parse-result" and len(args) == 1:
+        return cmd_parse_result(args[0])
+    if sub == "parse-swept" and len(args) == 1:
+        return cmd_parse_swept(args[0])
     sys.stderr.write(f"staging.py: unsupported subcommand or arity: {sub} {args}\n")
     return 64
 

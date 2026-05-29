@@ -311,7 +311,10 @@ def _audit_normalize_skipped(
         if stderr:
             detail["stderr"] = stderr[:200]
         audit_script = Path(__file__).resolve().parent / "bridge-audit.py"
-        if not audit_script.exists():
+        # Controller-only: audit_script is repo-resident (next to this
+        # file via __file__), never under an isolated agent's tree, so a
+        # raw exists() cannot trip the iso PermissionError class.
+        if not audit_script.exists():  # noqa: raw-pathlib-controller-only
             return
         subprocess.run(
             [
@@ -386,7 +389,10 @@ def _audit_ms365_redirect_probe_skipped(
                     continue
                 detail[key] = value
         audit_script = Path(__file__).resolve().parent / "bridge-audit.py"
-        if not audit_script.exists():
+        # Controller-only: audit_script is repo-resident (next to this
+        # file via __file__), never under an isolated agent's tree, so a
+        # raw exists() cannot trip the iso PermissionError class.
+        if not audit_script.exists():  # noqa: raw-pathlib-controller-only
             return
         target = agent or "ms365"
         subprocess.run(
@@ -465,7 +471,16 @@ def _post_write_normalize_channel_cred_group(path: Path, agent: str | None) -> N
             return
         if not isinstance(path, Path):
             return
-        if not path.exists():
+        # The channel-cred file may live under an isolated agent's tree
+        # (the docstring's iso-v2 case), so a raw `path.exists()` could
+        # trip PermissionError before the gates below run. Route through
+        # the canonical safe wrapper — same pattern as `load_dotenv`
+        # (line ~530) — so the controller gets the proactive sudo
+        # `test -e` escalation instead of relying on the outer
+        # PermissionError swallow to mask a path it could have observed.
+        if not _safe_path_check(
+            "exists", path, _resolve_isolated_owner_for_path(path)
+        ):
             return
         # Gate 1: iso-v2 effective host. Skipping here leaves the file
         # at its caller-written 0600 — correct posture on non-iso-v2.
