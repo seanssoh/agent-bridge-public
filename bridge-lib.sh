@@ -334,6 +334,20 @@ bridge_prepend_path_entry() {
   esac
 }
 
+# Issue #1352 (beta5-3 Track K, codex r1 BLOCKING): true iff the given
+# directory holds an executable engine CLI (`codex` or `claude`). nvm
+# multi-version installs commonly leave several `versions/node/<v>/bin`
+# dirs where only the version the operator `npm i -g`'d into actually has
+# the engine; prepending an engine-less dir is a false fix (PATH grows but
+# `command -v codex` stays empty → exit 127 persists). bridge-lib.sh runs
+# this at lib-load time before we know which engine the launching agent
+# uses, so either binary qualifies a candidate.
+bridge_dir_has_engine_cli() {
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir" ]] || return 1
+  [[ -x "$dir/codex" || -x "$dir/claude" ]]
+}
+
 bridge_prepend_path_entry "$HOME/.local/bin"
 bridge_prepend_path_entry "$HOME/.nix-profile/bin"
 bridge_prepend_path_entry "$HOME/bin"
@@ -377,31 +391,76 @@ bridge_augment_engine_path() {
   # override wins.
 
   # 2. Auto-detect — nvm
-  if [[ -n "${NVM_DIR:-}" && -d "$NVM_DIR/versions/node" ]]; then
-    # `nvm alias default` writes a name file under $NVM_DIR/alias/default
-    # pointing at the version dir; honor that when present.
+  #
+  # Issue #1352 (beta5-3 Track K): unlike pyenv/rbenv/asdf/fnm below, nvm
+  # only exports $NVM_DIR from the operator's shellrc (`nvm.sh` sources it
+  # in a login/interactive shell). The daemon — and therefore every
+  # bridge-start.sh / bridge-run.sh launch it spawns, shared OR iso — runs
+  # in a systemd-user non-login shell where $NVM_DIR is unset, so the
+  # auto-detect below was a no-op and the canonical default install
+  # ($HOME/.nvm/versions/node/vX/bin/codex) never reached the launch PATH.
+  # That left `bridge_resolve_engine_binary` (= `command -v codex`)
+  # returning empty → BRIDGE_ENGINE_BIN unset → no launch-cmd token rewrite
+  # → bare `codex` → exit 127 on the auto-provisioned <admin>-dev codex
+  # pair (isolation_mode: shared). Mirror the canonical-fallback pattern
+  # the other managers already use so a default nvm install resolves
+  # without the operator having to export $NVM_DIR for the daemon.
+  local _nvm_root="${NVM_DIR:-}"
+  if [[ -z "$_nvm_root" && -d "$HOME/.nvm/versions/node" ]]; then
+    _nvm_root="$HOME/.nvm"
+  fi
+  if [[ -n "$_nvm_root" && -d "$_nvm_root/versions/node" ]]; then
+    # Selection contract (codex r1 BLOCKING fixes):
+    #   1. semver-aware ordering — `sort -V`, NEVER lexicographic. A
+    #      lexicographic `sort` ranks `v9.99.0` after `v24.16.0`, so the
+    #      "latest" fallback would pick a stale/wrong version.
+    #   2. engine-presence — only a `versions/node/<v>/bin` dir that
+    #      actually holds `codex`/`claude` is a candidate. A multi-version
+    #      install where the engine lives in just one version dir must not
+    #      have an engine-less dir prepended (that grows PATH but leaves
+    #      `command -v codex` empty → exit 127 persists).
+    # Priority: the `nvm alias default` version IF its bin has an engine;
+    # otherwise the highest-semver engine-bearing version; otherwise no
+    # prepend (graceful — never a false positive).
     local _nvm_default_alias=""
-    if [[ -r "$NVM_DIR/alias/default" ]]; then
-      _nvm_default_alias="$(cat "$NVM_DIR/alias/default" 2>/dev/null || true)"
+    if [[ -r "$_nvm_root/alias/default" ]]; then
+      _nvm_default_alias="$(cat "$_nvm_root/alias/default" 2>/dev/null || true)"
       _nvm_default_alias="${_nvm_default_alias#v}"
     fi
-    if [[ -n "$_nvm_default_alias" \
-          && -d "$NVM_DIR/versions/node/v$_nvm_default_alias/bin" ]]; then
-      bridge_prepend_path_entry "$NVM_DIR/versions/node/v$_nvm_default_alias/bin"
+    local _nvm_chosen_bin=""
+    if [[ -n "$_nvm_default_alias" ]] \
+        && bridge_dir_has_engine_cli "$_nvm_root/versions/node/v$_nvm_default_alias/bin"; then
+      _nvm_chosen_bin="$_nvm_root/versions/node/v$_nvm_default_alias/bin"
     else
-      # Fall back to the lexicographically-last version dir. `ls -1v`
-      # would be ideal for version-sort but isn't portable across macOS
-      # /Linux without GNU coreutils; the lexicographic last is close
-      # enough for `v24.16.0`-style names and matches operator intent
-      # ("most recent installed").
-      local _nvm_latest=""
-      # shellcheck disable=SC2012  # nvm version dirs are predictable
-      # `v24.16.0`-style names — ls + sort is intentional for lex-sort
-      # last; find -printf is non-portable on macOS BSD find.
-      _nvm_latest="$(ls -1 "$NVM_DIR/versions/node" 2>/dev/null | sort | tail -n1)"
-      if [[ -n "$_nvm_latest" && -d "$NVM_DIR/versions/node/$_nvm_latest/bin" ]]; then
-        bridge_prepend_path_entry "$NVM_DIR/versions/node/$_nvm_latest/bin"
+      # Highest-semver engine-bearing version dir. List version dir names,
+      # sort -V (version sort) descending, and take the first whose bin
+      # holds an engine CLI. `ls -1v` is not portable to macOS BSD ls, but
+      # `sort -V` is available on both GNU coreutils and BSD/macOS sort.
+      #
+      # Footgun #11 (lint-heredoc-ban H3): the version list is staged into a
+      # tempfile read via plain `< "$_tmpf"` rather than a `< <(...)`
+      # process substitution — the project bans `< <(`, `<<<`, and
+      # heredoc-stdin (Bash 5.3.9 read_comsub/heredoc_write deadlock class).
+      # The tempfile is removed immediately after the loop.
+      local _nvm_ver="" _nvm_verfile=""
+      _nvm_verfile="$(mktemp 2>/dev/null || true)"
+      if [[ -n "$_nvm_verfile" ]]; then
+        # shellcheck disable=SC2012  # nvm version dirs are predictable
+        # `v24.16.0`-style names; ls + sort -V is intentional (find -printf
+        # is non-portable on macOS BSD find).
+        ls -1 "$_nvm_root/versions/node" 2>/dev/null | sort -Vr >"$_nvm_verfile"
+        while IFS= read -r _nvm_ver; do
+          [[ -n "$_nvm_ver" ]] || continue
+          if bridge_dir_has_engine_cli "$_nvm_root/versions/node/$_nvm_ver/bin"; then
+            _nvm_chosen_bin="$_nvm_root/versions/node/$_nvm_ver/bin"
+            break
+          fi
+        done <"$_nvm_verfile"
+        rm -f "$_nvm_verfile"
       fi
+    fi
+    if [[ -n "$_nvm_chosen_bin" ]]; then
+      bridge_prepend_path_entry "$_nvm_chosen_bin"
     fi
   fi
 
@@ -438,7 +497,17 @@ bridge_augment_engine_path() {
     bridge_prepend_path_entry "$HOME/.local/share/fnm/aliases/default/bin"
   fi
 
-  # 7. Operator override last (becomes leftmost on PATH).
+  # 7. Auto-detect — volta (issue #1352: same daemon non-login-shell gap as
+  # nvm — $VOLTA_HOME is only exported by the operator's shellrc, so honor
+  # it when set and fall back to the canonical $HOME/.volta/bin install dir
+  # the daemon can find without it).
+  if [[ -n "${VOLTA_HOME:-}" && -d "$VOLTA_HOME/bin" ]]; then
+    bridge_prepend_path_entry "$VOLTA_HOME/bin"
+  elif [[ -d "$HOME/.volta/bin" ]]; then
+    bridge_prepend_path_entry "$HOME/.volta/bin"
+  fi
+
+  # 8. Operator override last (becomes leftmost on PATH).
   if [[ -n "$_override_path" ]]; then
     # Honor colon-separated multi-dir overrides. Iterate from last to
     # first so the first entry in BRIDGE_ENGINE_PATH ends up leftmost
