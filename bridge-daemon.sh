@@ -8992,22 +8992,14 @@ process_cron_staging_apply() {
     while IFS= read -r row; do
       [[ -n "$row" ]] || continue
       local uuid="" owner_uid="" stale="" actor_agent_dir=""
-      # Parse the json row with python — avoid jq dependency.
+      # Parse the json row with python — avoid jq dependency. Footgun #11
+      # (Bash 5.3.9 heredoc-stdin + command-sub deadlock): the parse body
+      # lives in staging.py `parse-row` (file-as-argv) instead of an
+      # inline `python3 - <<'PY'`. The helper emits the same
+      # uuid=/actor_agent=/owner_uid=/stale= lines and exits 0 with no
+      # output on a parse error, so the `|| continue` still skips the row.
       local _parsed
-      _parsed="$(python3 - "$row" <<'PY'
-import json
-import sys
-
-try:
-    data = json.loads(sys.argv[1])
-except Exception:
-    sys.exit(0)
-print("uuid=" + str(data.get("uuid") or ""))
-print("actor_agent=" + str(data.get("actor_agent") or ""))
-print("owner_uid=" + str(data.get("owner_uid") or ""))
-print("stale=" + ("1" if data.get("stale") else "0"))
-PY
-)" || continue
+      _parsed="$(python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" parse-row "$row")" || continue
       while IFS= read -r _line; do
         case "$_line" in
           uuid=*) uuid="${_line#uuid=}" ;;
@@ -9073,23 +9065,12 @@ PY
       local error_detail=""
       local cron_id=""
       if [[ -f "$result_path" ]]; then
+        # Footgun #11: parse body extracted to staging.py `parse-result`
+        # (file-as-argv). Same audit_action=/actor_agent=/status=/cron_id=/
+        # error= lines; exits 0 with no output on a read/parse error so the
+        # `|| _result_parsed=""` fallback still holds.
         local _result_parsed
-        _result_parsed="$(python3 - "$result_path" <<'PY'
-import json
-import sys
-
-try:
-    with open(sys.argv[1], "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-except Exception:
-    sys.exit(0)
-print("audit_action=" + str(data.get("audit_action") or ""))
-print("actor_agent=" + str(data.get("actor_agent") or ""))
-print("status=" + str(data.get("status") or ""))
-print("cron_id=" + str(data.get("cron_id") or ""))
-print("error=" + str(data.get("error") or ""))
-PY
-)" || _result_parsed=""
+        _result_parsed="$(python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" parse-result "$result_path")" || _result_parsed=""
         while IFS= read -r _line; do
           case "$_line" in
             audit_action=*) audit_action="${_line#audit_action=}" ;;
@@ -9126,19 +9107,11 @@ PY
     while IFS= read -r row; do
       [[ -n "$row" ]] || continue
       local _swept_uuid="" _swept_age=""
+      # Footgun #11: parse body extracted to staging.py `parse-swept`
+      # (file-as-argv). Same uuid=/age= lines (age from mtime_age_seconds);
+      # exits 0 with no output on a parse error so the `|| continue` skips.
       local _swept_parsed
-      _swept_parsed="$(python3 - "$row" <<'PY'
-import json
-import sys
-
-try:
-    data = json.loads(sys.argv[1])
-except Exception:
-    sys.exit(0)
-print("uuid=" + str(data.get("uuid") or ""))
-print("age=" + str(data.get("mtime_age_seconds") or ""))
-PY
-)" || continue
+      _swept_parsed="$(python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" parse-swept "$row")" || continue
       while IFS= read -r _line; do
         case "$_line" in
           uuid=*) _swept_uuid="${_line#uuid=}" ;;
