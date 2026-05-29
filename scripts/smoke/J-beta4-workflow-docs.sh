@@ -411,9 +411,21 @@ smoke_log "T7 ok: fresh install short-circuit fired with structured marker + adv
 # T7b: bridge-bootstrap.sh --dry-run --json carries the wiki_graph object.
 T7B_OUT=""
 T7B_RC=0
+# bridge-bootstrap.sh runs the engine-presence preflight
+# (bridge_init_require_command "$engine" → `command -v`). The Linux CI
+# host has no real `claude` binary on PATH (the macOS dev host does,
+# which is why this passed locally but failed on CI). --dry-run --json
+# never invokes the engine — it only needs it to resolve as present —
+# so stub the engine on PATH for this one invocation.
+T7B_STUB_DIR="$SMOKE_TMP_ROOT/t7b-engine-stub"
+mkdir -p "$T7B_STUB_DIR"
+for _eng in claude codex; do
+  printf '#!/bin/sh\necho "%s 0.0.0-smoke-stub"\nexit 0\n' "$_eng" >"$T7B_STUB_DIR/$_eng"
+  chmod +x "$T7B_STUB_DIR/$_eng"
+done
 # We pass --skip-* flags to keep the dry-run hermetic in the smoke
 # tmpdir; --json is the structured surface we assert on.
-T7B_OUT="$(BRIDGE_BOOTSTRAP_OS=Linux "$BRIDGE_BASH_BIN" "$REPO_ROOT/bridge-bootstrap.sh" \
+T7B_OUT="$(PATH="$T7B_STUB_DIR:$PATH" BRIDGE_BOOTSTRAP_OS=Linux "$BRIDGE_BASH_BIN" "$REPO_ROOT/bridge-bootstrap.sh" \
   --skip-shell-integration --skip-tmux-ux --skip-daemon \
   --skip-launchagent --skip-systemd --skip-liveness \
   --skip-watchdog-silence \
