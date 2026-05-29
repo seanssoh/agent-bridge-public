@@ -72,6 +72,17 @@ Subcommands
     write the result file. The actor_agent is taken from the CLI
     arg (which the daemon resolves from the staging path), so a payload
     that contradicts the dirname is rejected with actor_agent_mismatch.
+
+    #1383: the daemon-written `<uuid>.result.json` is explicitly
+    `chgrp`-ed to the canonical `ab-agent-<actor>` group (mode 0660)
+    before the atomic rename, so the iso UID owner of the request can
+    read its OWN result. Without this the controller's write lands in the
+    controller's default group on a fresh-install path (no setgid on the
+    subdir yet) and the iso UID gets `PermissionError [Errno 13]`. The
+    result-leg chgrp is fail-loud-but-publish (logs loud on a verify
+    failure but still publishes — the result file is the only channel
+    back to the iso poller; refusing to write it would strand the poller
+    and turn the request into a poison-retry).
     Result schema:
 
         {
@@ -222,6 +233,67 @@ def _payload_atomic_write(
             raise StagingGroupError(
                 f"chgrp staging file verify mismatch: requested gid={gid} "
                 f"observed gid={applied_gid}"
+            )
+    os.replace(tmp, path)
+
+
+def _result_atomic_write(
+    path: Path, payload: Dict[str, Any], mode: int, gid: Optional[int] = None
+) -> None:
+    """Atomic write for the daemon→iso `<uuid>.result.json` leg (Issue
+    #1383). Like `_payload_atomic_write` it chgrp+verifies before the
+    rename, BUT the fail-loud contract is different by design:
+
+    - Request leg (`_payload_atomic_write`, #1379): a chgrp failure raises
+      StagingGroupError and REFUSES to publish — the iso caller sees the
+      error directly and never polls a daemon-unreadable request.
+
+    - Result leg (here): the result file is the ONLY channel back to the
+      iso poller. Refusing to publish would (a) strand the poller until
+      its 30s timeout AND (b) leave the request file un-applied so the
+      daemon re-applies the same payload every tick (the "daemon retry
+      poison" foot-gun). So when the canonical-group chgrp cannot be
+      applied + verified we log LOUD to stderr (the daemon surfaces it in
+      its tick log / audit) but STILL publish the result so the poller
+      terminates. The loud log — not a silent best-effort no-op — is the
+      #1383 fail-loud signal: a controller-grouped result that the iso UID
+      cannot read is a defect worth a visible warning, but it must not
+      escalate into a stranded poller + poison-retry loop.
+
+    When `gid is None` (non-iso / shared mode / no canonical group) the
+    write is plain best-effort, identical to the pre-#1383 behavior — the
+    controller-owned result file is fine when there is no iso reader."""
+    tmp = path.parent / (path.name + ".tmp." + str(os.getpid()))
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.chmod(tmp, mode)
+    if gid is not None:
+        # Fail-loud-but-publish: a chgrp/verify failure logs LOUD to stderr
+        # (the #1383 signal) but we deliberately fall through to publish in
+        # EVERY branch below — never raise, never skip the os.replace — so
+        # the iso poller is not stranded and the request does not become a
+        # poison-retry. Contrast _payload_atomic_write (request leg), which
+        # raises StagingGroupError and refuses to publish.
+        try:
+            os.chown(tmp, -1, gid)
+            # chown may clear setgid/setuid bits on some platforms.
+            os.chmod(tmp, mode)
+            applied_gid = int(os.stat(tmp).st_gid)
+            if applied_gid != gid:
+                sys.stderr.write(
+                    "staging.py write-result: chgrp result file verify "
+                    f"mismatch (requested gid={gid} observed gid={applied_gid}) "
+                    f"for {path.name} — iso UID may be unable to read its "
+                    "result (Issue #1383). Publishing anyway to avoid a "
+                    "stranded poller + poison-retry loop.\n"
+                )
+        except OSError as exc:
+            sys.stderr.write(
+                "staging.py write-result: chgrp result file to "
+                f"gid={gid} failed: {exc!r} for {path.name} — iso UID may be "
+                "unable to read its result (Issue #1383). Publishing anyway "
+                "to avoid a stranded poller + poison-retry loop.\n"
             )
     os.replace(tmp, path)
 
@@ -392,6 +464,120 @@ def _resolve_staging_gid(actor_agent: str, agent_dir: Path) -> Optional[int]:
     accepted = _accept(_gid_for_group_name(f"{prefix}{actor_agent}"))
     if accepted is not None:
         return accepted
+
+    return None
+
+
+def _writer_can_chown(gid: int) -> bool:
+    """True when the CURRENT process can `os.chown(..., -1, gid)`. The
+    daemon (controller) side differs from the iso UID side: in iso v2 the
+    daemon usually runs as root, which can chgrp a file to ANY group
+    regardless of membership; a non-root controller (shared-mode install,
+    test harness) can only chgrp to a group it is a member of. We accept
+    both — root (euid 0) unconditionally, others only when they are a
+    member — so the canonical-group chgrp is not pre-rejected for the
+    privileged daemon yet does not attempt a guaranteed-to-fail chown for
+    an unprivileged controller (the membership check mirrors
+    `_writer_in_group`)."""
+    try:
+        if os.geteuid() == 0:
+            return True
+    except OSError:
+        pass
+    return _writer_in_group(gid)
+
+
+def _resolve_result_gid(actor_agent: str, agent_dir: Path) -> Optional[int]:
+    """Resolve the GID the daemon-written `<uuid>.result.json` MUST carry
+    so the iso UID owner of the matching request can read its OWN result:
+    the actor's per-agent cross-class group `ab-agent-<actor>` — the SAME
+    canonical group #1379 forces onto the request file, NEVER the
+    controller's default/user-private group and NEVER `ab-shared`.
+
+    Issue #1383 (daemon→iso result-read leg, follow-up to #1379's
+    iso→daemon request-read leg): the daemon writes the result file as the
+    controller. On the fresh-install path the per-agent staging subdir has
+    no setgid bit yet, so the controller's write lands with the
+    controller's own default group (e.g. `awfmanager:awfmanager`), which
+    the iso UID is neither owner nor member of → `PermissionError [Errno
+    13]` when the iso poller reads its result. Mirroring #1379, we chgrp
+    the result file to the canonical actor group.
+
+    This is the controller-side twin of `_resolve_staging_gid`. It shares
+    the SAME security gate (`_canonical_actor_group_names` — purely
+    actor-name-derived, so `ab-shared` / any other group is rejected) and
+    the SAME candidate priority, but with TWO daemon-side differences:
+      - The "writer's user-private group" exclusion is replaced by the
+        controller's own default group (`os.getegid()`): the daemon must
+        not leave the result file in the controller group — that IS the
+        #1383 bug — so a candidate equal to the controller's egid is
+        rejected (it is never the canonical actor group anyway, but the
+        explicit guard documents intent).
+      - Membership is checked with `_writer_can_chown` (root → always
+        accepted; non-root controller → must be a member) instead of
+        `_writer_in_group`, because the iso v2 daemon is normally root and
+        root can chgrp to a non-member group.
+
+    Returns None when no safe candidate is found (shared-mode / non-iso /
+    fresh install before groupadd) — the caller then leaves the result
+    file in the controller-owned group (best-effort, matching the
+    pre-#1383 behavior). gid=None is a legitimate non-iso outcome, NOT an
+    error: there is no iso reader to strand."""
+    controller_gid = _user_private_gid()  # the daemon's own egid here
+    canonical_names = _canonical_actor_group_names(actor_agent)
+
+    def _accept(gid: Optional[int]) -> Optional[int]:
+        if gid is None:
+            return None
+        if controller_gid is not None and gid == controller_gid:
+            # The controller's own group is exactly the #1383 bug group —
+            # never the canonical actor group, reject explicitly.
+            return None
+        if not _writer_can_chown(gid):
+            return None
+        # Security gate (shared with the request leg): the gid's group
+        # name MUST be the actor's own per-agent group, never a shared
+        # group — preserves the #1359/#1379 per-agent boundary.
+        name = _gid_to_group_name(gid)
+        if name is None or name not in canonical_names:
+            return None
+        return gid
+
+    # (1) the per-agent dir's current group, when it is the actor's own
+    # (the setgid target on a matrix-applied install).
+    try:
+        dir_gid = int(agent_dir.stat().st_gid)
+    except OSError:
+        dir_gid = None
+    accepted = _accept(dir_gid)
+    if accepted is not None:
+        return accepted
+
+    # (2) derive `<prefix><actor_agent>` (un-truncated common case + the
+    # hash-truncated Linux variant resolved inside _gid_for_group_name via
+    # the canonical-name set membership check).
+    prefix = os.environ.get("BRIDGE_AGENT_GROUP_PREFIX", "ab-agent-")
+    accepted = _accept(_gid_for_group_name(f"{prefix}{actor_agent}"))
+    if accepted is not None:
+        return accepted
+
+    # (3) the hash-truncated canonical name (long agent names, Linux
+    # groupadd 32-char cap). `_canonical_actor_group_names` already
+    # computed it; resolve each remaining canonical name to a gid.
+    for cand_name in canonical_names:
+        accepted = _accept(_gid_for_group_name(cand_name))
+        if accepted is not None:
+            return accepted
+
+    # (4) `AGB_STAGE_FILE_GROUP` hint LAST (the daemon does not normally
+    # set it, but accept it symmetrically with the request leg; the
+    # canonical-name gate still decides accept/reject, so a stray
+    # `AGB_STAGE_FILE_GROUP=ab-shared` cannot widen the result group).
+    explicit = os.environ.get("AGB_STAGE_FILE_GROUP", "").strip()
+    if explicit:
+        accepted = _accept(_gid_for_group_name(explicit))
+        if accepted is not None:
+            return accepted
 
     return None
 
@@ -641,9 +827,29 @@ def _write_result(
         "audit_action": audit_action,
     }
     # Mode 0660 so the iso UID owner of the request file can read it.
-    # The owner=controller distinction means the iso UID falls through
-    # to the group bits — group=ab-shared via the parent dir's setgid.
-    _payload_atomic_write(result_path, payload, 0o660)
+    # The owner=controller distinction means the iso UID falls through to
+    # the group bits — which MUST be the canonical `ab-agent-<actor>`.
+    #
+    # Issue #1383 (follow-up to #1379, daemon→iso result-read leg): the
+    # daemon writes the result as the controller. On a fresh-install path
+    # the per-agent staging subdir has no setgid bit yet, so the write
+    # lands in the controller's OWN default group (e.g.
+    # `awfmanager:awfmanager`) — which the iso UID is neither owner nor
+    # member of → `PermissionError [Errno 13]` when the iso poller reads
+    # its result. Mirror #1379's request-write chgrp onto the result file:
+    # resolve the canonical actor group (purely actor-name-derived, NEVER
+    # `ab-shared`) and chgrp+verify before the atomic rename.
+    #
+    # _resolve_result_gid returns None for non-iso / shared-mode / fresh
+    # install before groupadd — in that case the result stays
+    # controller-owned, which is fine (no iso reader to strand). When a
+    # canonical gid IS resolved, the chgrp is fail-loud-but-publish (see
+    # _result_atomic_write): a verify failure logs LOUD to stderr (daemon
+    # surfaces it) but still publishes, so the iso poller never strands and
+    # the request never becomes a poison-retry.
+    agent_dir = result_path.parent
+    result_gid = _resolve_result_gid(actor_agent, agent_dir)
+    _result_atomic_write(result_path, payload, 0o660, gid=result_gid)
 
 
 def cmd_apply(
