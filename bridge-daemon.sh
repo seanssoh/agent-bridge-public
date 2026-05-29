@@ -4236,9 +4236,15 @@ bridge_daemon_start_agent_with_recovery() {
   local agent="$1"
   local trigger="$2"
   local session=""
+  local admin_agent=""
 
   BRIDGE_DAEMON_START_FAILURE_REASON=""
 
+  # Base single-attempt start. For every agent this is byte-equivalent to the
+  # pre-recovery daemon path: one bridge-start.sh invocation, then check the
+  # session came up. The failure reason recorded here (`session-exited-quickly`
+  # vs `start-command-failed`) is exactly the base reason, so non-admin callers
+  # preserve base note/warn semantics downstream.
   if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
     session="$(bridge_agent_session "$agent")"
     sleep 1
@@ -4250,8 +4256,16 @@ bridge_daemon_start_agent_with_recovery() {
     BRIDGE_DAEMON_START_FAILURE_REASON="start-command-failed"
   fi
 
-  if bridge_daemon_admin_autostart_recover "$agent" "$trigger" "$BRIDGE_DAEMON_START_FAILURE_REASON"; then
-    return 0
+  # Admin-only recovery ladder. Gate the ENTIRE retry ladder (resume-state
+  # repair + --no-continue / --safe-mode retries) at the wrapper so a non-admin
+  # agent never enters it: no extra bridge-start.sh attempts, no resume repair,
+  # no recovery audit events. A non-admin agent falls straight through with the
+  # base failure reason intact, matching the pre-recovery daemon byte-for-byte.
+  admin_agent="$(bridge_admin_agent_id 2>/dev/null || true)"
+  if [[ -n "$admin_agent" && "$agent" == "$admin_agent" ]]; then
+    if bridge_daemon_admin_autostart_recover "$agent" "$trigger" "$BRIDGE_DAEMON_START_FAILURE_REASON"; then
+      return 0
+    fi
   fi
 
   return 1
@@ -8609,8 +8623,15 @@ process_on_demand_agents() {
           daemon_info "ensured always-on ${agent}"
           changed=0
         else
-          bridge_daemon_note_autostart_failure "$agent" "${BRIDGE_DAEMON_START_FAILURE_REASON:-start-command-failed}"
-          bridge_warn "always-on auto-start failed: ${agent}"
+          local _aos_reason="${BRIDGE_DAEMON_START_FAILURE_REASON:-start-command-failed}"
+          bridge_daemon_note_autostart_failure "$agent" "$_aos_reason"
+          # Base warning parity: a transient session-exited-quickly is
+          # note-only (no warn); start-command-failed and admin-recovery-failed
+          # are operator-actionable and warn.
+          if [[ "$_aos_reason" != "session-exited-quickly" ]]; then
+            bridge_warn "always-on auto-start failed: ${agent}"
+          fi
+          unset _aos_reason
         fi
       elif [[ "$queued" =~ ^[0-9]+$ ]] && (( queued > 0 )) && ! bridge_agent_is_active "$agent"; then
         # Issue #1234 (Lane δ): same hold gate as the always-on branch.
@@ -8662,8 +8683,15 @@ process_on_demand_agents() {
           daemon_info "auto-started ${agent} (queued=${queued}, timeout=${timeout}s)"
           changed=0
         else
-          bridge_daemon_note_autostart_failure "$agent" "${BRIDGE_DAEMON_START_FAILURE_REASON:-start-command-failed}"
-          bridge_warn "on-demand auto-start failed: ${agent}"
+          local _od_reason="${BRIDGE_DAEMON_START_FAILURE_REASON:-start-command-failed}"
+          bridge_daemon_note_autostart_failure "$agent" "$_od_reason"
+          # Base warning parity: a transient session-exited-quickly is
+          # note-only (no warn); start-command-failed and admin-recovery-failed
+          # are operator-actionable and warn.
+          if [[ "$_od_reason" != "session-exited-quickly" ]]; then
+            bridge_warn "on-demand auto-start failed: ${agent}"
+          fi
+          unset _od_reason
         fi
       fi
       continue

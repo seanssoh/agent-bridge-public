@@ -124,6 +124,50 @@ rm -f "$TMP_ROOT/start.log" "$TMP_ROOT/events.log"
   fi
   [[ "$(wc -l <"$START_LOG")" == "1" ]] || smoke_fail "non-admin recovery invoked extra start attempts"
   [[ ! -f "$TMP_ROOT/events.log" ]] || smoke_fail "non-admin recovery emitted admin repair events"
+  # Base warning parity: a non-admin start-command failure must surface the
+  # exact base reason (`start-command-failed`) so the daemon call site warns
+  # byte-equivalently to the pre-recovery path.
+  [[ "$BRIDGE_DAEMON_START_FAILURE_REASON" == "start-command-failed" ]] || \
+    smoke_fail "non-admin start failure reason drifted from base (got: $BRIDGE_DAEMON_START_FAILURE_REASON)"
+)
+
+smoke_log "T7: non-admin session-exited-quickly stays note-only (no recovery, base reason)"
+rm -f "$TMP_ROOT/start.log" "$TMP_ROOT/events.log"
+cat >"$TMP_ROOT/bridge-start.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$START_LOG"
+exit 0
+STUB
+chmod +x "$TMP_ROOT/bridge-start.sh"
+# shellcheck disable=SC2031
+(
+  set -euo pipefail
+  export BRIDGE_HOME="$TMP_ROOT/home3"
+  export START_LOG="$TMP_ROOT/start.log"
+  mkdir -p "$BRIDGE_HOME"
+  # shellcheck source=/dev/null
+  source "$PARTIAL_DAEMON"
+  SCRIPT_DIR="$TMP_ROOT"
+  BRIDGE_BASH_BIN="$(command -v bash)"
+  bridge_admin_agent_id() { printf '%s' "patch"; }
+  bridge_agent_session() { printf '%s' "$1"; }
+  bridge_agent_continue() { printf '%s' "1"; }
+  bridge_agent_session_id() { printf '%s' ""; }
+  bridge_clear_persisted_session_id() { printf '%s\n' "clear:$1" >>"$TMP_ROOT/events.log"; }
+  bridge_audit_log() { printf '%s\n' "audit:$*" >>"$TMP_ROOT/events.log"; }
+  daemon_info() { printf '%s\n' "info:$*" >>"$TMP_ROOT/events.log"; }
+  # Start command succeeds but the session never comes up.
+  bridge_tmux_session_exists() { return 1; }
+
+  if bridge_daemon_start_agent_with_recovery worker on_demand; then
+    smoke_fail "non-admin worker unexpectedly recovered on session-exited-quickly"
+  fi
+  [[ "$(wc -l <"$START_LOG")" == "1" ]] || smoke_fail "non-admin session-exited-quickly invoked extra start attempts"
+  [[ ! -f "$TMP_ROOT/events.log" ]] || smoke_fail "non-admin session-exited-quickly emitted admin repair events"
+  # Base parity: reason is the transient note-only reason, so the call site
+  # records the note WITHOUT a warning (matching the pre-recovery daemon).
+  [[ "$BRIDGE_DAEMON_START_FAILURE_REASON" == "session-exited-quickly" ]] || \
+    smoke_fail "non-admin session-exited-quickly reason drifted from base (got: $BRIDGE_DAEMON_START_FAILURE_REASON)"
 )
 
 smoke_log "ok: $SMOKE_NAME"
