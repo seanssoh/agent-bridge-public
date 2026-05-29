@@ -212,7 +212,20 @@ fi
 # layer too — auto-mode validation never flags --default-scopes as
 # missing).
 # ---------------------------------------------------------------------------
-T3_OUT="$("$BRIDGE_BASH" -c '
+# Clean-CI vs macOS: sourcing bridge-lib.sh auto-runs the v0.8.0 layout
+# resolver (lib/bridge-layout-resolver.sh), which hard-dies "requires
+# isolation-v2" on a markerless BRIDGE_HOME unless BRIDGE_LAYOUT=v2 +
+# an absolute BRIDGE_DATA_ROOT pin the env-override branch. On macOS the
+# resolver is a no-op so the bare `bash -c` subshell inherits nothing and
+# still passes; on a clean Linux CI runner the resolver's `bridge_die`
+# calls `exit 1`, killing the subshell BEFORE `$WIZARD_LIB` is sourced —
+# so `bridge_setup_wizard_required_fields` is never defined and T3 saw
+# empty output. Pin the v2 layout env-override into the subshell (pattern
+# matches the agent-doctor / 1380 daemon-recovery smokes). The `|| true`
+# on the source line cannot rescue an `exit`, hence the env pin is the fix.
+T3_DATA_ROOT="$SMOKE_DIR/t3-data-root"
+mkdir -p "$T3_DATA_ROOT"
+T3_OUT="$(BRIDGE_LAYOUT=v2 BRIDGE_DATA_ROOT="$T3_DATA_ROOT" "$BRIDGE_BASH" -c '
   set -uo pipefail
   source "'"$REPO_ROOT"'/bridge-lib.sh" >/dev/null 2>&1 || true
   source "'"$WIZARD_LIB"'"
