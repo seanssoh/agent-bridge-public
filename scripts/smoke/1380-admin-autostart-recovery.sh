@@ -78,6 +78,15 @@ chmod +x "$TMP_ROOT/bridge-start.sh"
   export BRIDGE_HOME="$TMP_ROOT/home"
   export START_LOG="$TMP_ROOT/start.log"
   mkdir -p "$BRIDGE_HOME"
+  # Sourcing the daemon defs runs the v0.8.0 layout resolver. On Linux a
+  # markerless fresh BRIDGE_HOME hard-dies with "requires isolation-v2"
+  # (on macOS the resolver is a no-op, which is why this passed on the
+  # dev host but failed on the Linux CI host). This test exercises the
+  # admin recovery helper, not the layout resolver, so take the env-
+  # override branch (bridge_layout_resolver_validate_env) by pinning a
+  # valid v2 layout — same pattern as 1207/1067.
+  export BRIDGE_LAYOUT="v2"
+  export BRIDGE_DATA_ROOT="$TMP_ROOT/data"
   # shellcheck source=/dev/null
   source "$PARTIAL_DAEMON"
   SCRIPT_DIR="$TMP_ROOT"
@@ -106,6 +115,10 @@ rm -f "$TMP_ROOT/start.log" "$TMP_ROOT/events.log"
   export BRIDGE_HOME="$TMP_ROOT/home2"
   export START_LOG="$TMP_ROOT/start.log"
   mkdir -p "$BRIDGE_HOME"
+  # Pin a valid v2 layout so the resolver takes the env-override branch
+  # instead of hard-dying on a markerless Linux home (see T5 note).
+  export BRIDGE_LAYOUT="v2"
+  export BRIDGE_DATA_ROOT="$TMP_ROOT/data2"
   # shellcheck source=/dev/null
   source "$PARTIAL_DAEMON"
   SCRIPT_DIR="$TMP_ROOT"
@@ -147,6 +160,10 @@ chmod +x "$TMP_ROOT/bridge-start.sh"
   export BRIDGE_HOME="$TMP_ROOT/home3"
   export START_LOG="$TMP_ROOT/start.log"
   mkdir -p "$BRIDGE_HOME"
+  # Pin a valid v2 layout so the resolver takes the env-override branch
+  # instead of hard-dying on a markerless Linux home (see T5 note).
+  export BRIDGE_LAYOUT="v2"
+  export BRIDGE_DATA_ROOT="$TMP_ROOT/data3"
   # shellcheck source=/dev/null
   source "$PARTIAL_DAEMON"
   SCRIPT_DIR="$TMP_ROOT"
