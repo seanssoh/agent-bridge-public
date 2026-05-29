@@ -244,7 +244,9 @@ fi
 if ! grep -F 'BRIDGE_DAEMON_LAST_STEP="a2a_deliver_tick"' "$DAEMON_SH" >/dev/null; then
   T4_FAILS+="cmd_sync_cycle does not set LAST_STEP=a2a_deliver_tick; "
 fi
-if ! grep -F 'process_a2a_deliver_tick || true' "$DAEMON_SH" >/dev/null; then
+# Tolerate the Issue #1338 defense-in-depth subshell-isolate form
+# `( process_a2a_deliver_tick ) || true` as well as the bare invocation.
+if ! grep -E '\(?[[:space:]]*process_a2a_deliver_tick[[:space:]]*\)?[[:space:]]*\|\|[[:space:]]*true' "$DAEMON_SH" >/dev/null; then
   T4_FAILS+="process_a2a_deliver_tick not invoked from cmd_sync_cycle; "
 fi
 
@@ -363,7 +365,8 @@ fi
 if ! grep -F 'BRIDGE_DAEMON_LAST_STEP="a2a_stuck_scan_tick"' "$DAEMON_SH" >/dev/null; then
   T6_FAILS+="cmd_sync_cycle does not set LAST_STEP=a2a_stuck_scan_tick; "
 fi
-if ! grep -F 'process_a2a_outbox_stuck_scan_tick || true' "$DAEMON_SH" >/dev/null; then
+# Tolerate the Issue #1338 subshell-isolate form `( … ) || true`.
+if ! grep -E '\(?[[:space:]]*process_a2a_outbox_stuck_scan_tick[[:space:]]*\)?[[:space:]]*\|\|[[:space:]]*true' "$DAEMON_SH" >/dev/null; then
   T6_FAILS+="stuck scan tick not invoked from cmd_sync_cycle; "
 fi
 # T6d — audit row name `a2a_outbox_stuck_alert_emitted` present.
