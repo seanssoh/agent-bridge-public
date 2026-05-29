@@ -1797,11 +1797,30 @@ bridge_write_dynamic_agent_file() {
 # bridge_agent_session_lock_file — per-agent lock that serialises mutations of
 # the persisted AGENT_SESSION_ID across the dynamic-agent env, the static
 # history env, and (when present) the linux-user-scoped agent-env.sh overlay.
-# Lives under BRIDGE_ACTIVE_AGENT_DIR/<agent>/ alongside the other per-agent
-# runtime markers; created lazily by callers that need to take it.
+# Lives under BRIDGE_ACTIVE_AGENT_DIR/<agent>/ (state/agents/<agent>/) alongside
+# the other per-agent runtime markers; created lazily by callers that need it.
+#
+# Issue #1378: this lock is a CONTROLLER-ONLY serialisation primitive — the
+# agent UID never flocks it (the only consumers are bridge_persist_agent_state
+# and bridge_clear_persisted_session_id, both controller-side). It therefore
+# anchors on the controller-owned state leaf (bridge_agent_idle_marker_dir →
+# state/agents/<agent>/, owner=controller mode 2770) and NOT on
+# bridge_agent_runtime_state_dir, which for iso-v2 agents resolves into the iso
+# DATA tree (data/agents/<a>/runtime/, group=ab-agent-<a> mode 2770, under the
+# per-agent root data/agents/<a>/ at 2750 root:ab-agent-<a>). The controller
+# is NOT the owner of those iso-DATA-tree leaves (it has only group bits), and
+# a fresh iso agent's controller process has a stale supplementary-group set
+# after `usermod -aG` — it cannot traverse the 2750 parent nor open the 2770
+# lock until a re-login / daemon group-refresh lands (same #1025 class). So
+# opening the lock in the data tree fails with `session.lock: Permission
+# denied` and the agent never starts. The controller-owned state leaf, by
+# contrast, has controller OWNER rwx, so the controller can always create +
+# flock it regardless of its live group set. For non-iso/shared agents this is a no-op:
+# bridge_agent_runtime_state_dir already returns bridge_agent_idle_marker_dir
+# there, so the resolved path is byte-identical to the prior behaviour.
 bridge_agent_session_lock_file() {
   local agent="$1"
-  printf '%s/session.lock' "$(bridge_agent_runtime_state_dir "$agent")"
+  printf '%s/session.lock' "$(bridge_agent_idle_marker_dir "$agent")"
 }
 
 # bridge_agent_session_id_file_paths — emit the absolute paths of every
