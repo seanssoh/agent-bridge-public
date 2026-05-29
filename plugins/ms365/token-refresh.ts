@@ -123,6 +123,58 @@ export function redactToken(token: string | undefined | null): string {
   return 'sha256:' + createHash('sha256').update(s).digest('hex').slice(0, 12)
 }
 
+// Keys whose VALUES are bearer secrets / authorization material and must
+// never reach a log, audit row, or error string in cleartext. Matched
+// case-insensitively as a substring so `client_secret`, `id_token`,
+// `device_code`, etc. are all caught.
+const SECRET_KEY_PATTERN = /(refresh_token|access_token|id_token|token|secret|client_secret|code|assertion|password)/i
+
+/**
+ * Issue #1343 (codex r1 BLOCKING #1): deep-redact a token-endpoint
+ * response body before it is stringified into an audit row or error
+ * message.
+ *
+ * The malformed-response fallback used to `JSON.stringify(data)` the raw
+ * body. If the token endpoint (or an upstream proxy) returned a malformed
+ * JSON object that still carried a `refresh_token` / `access_token` /
+ * `id_token`, the raw bearer secret leaked into the audit line. This
+ * walks the object recursively and replaces any value under a
+ * secret-looking key with the value's sha256:12 fingerprint (so ops can
+ * still correlate without exposure), returning a SAFE COPY — the original
+ * `data` is never mutated.
+ *
+ * - String secret values → `redactToken(value)` (sha256:12 fp).
+ * - Non-string secret values (number/bool/object) → `'<redacted>'`
+ *   (we don't fingerprint non-strings; they shouldn't be secrets anyway,
+ *   and stringify-then-hash could itself leak structure).
+ * - Arrays and nested objects are walked element-by-element.
+ * - Non-object input (string / number / null) is returned unchanged —
+ *   a top-level string body carries no key context to redact by, and the
+ *   callers truncate it; but to be safe the caller passes the parsed
+ *   object, and a bare string `_raw` is itself keyed under `_raw` (not a
+ *   secret key) so it is preserved for triage.
+ *
+ * A depth guard bounds pathological/cyclic inputs.
+ */
+export function redactResponseBody(data: unknown, depth = 0): unknown {
+  if (depth > 8) return '<max-depth>'
+  if (data === null || typeof data !== 'object') return data
+  if (Array.isArray(data)) {
+    return data.map(item => redactResponseBody(item, depth + 1))
+  }
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+    if (SECRET_KEY_PATTERN.test(key)) {
+      out[key] = typeof value === 'string' ? redactToken(value) : '<redacted>'
+    } else if (value !== null && typeof value === 'object') {
+      out[key] = redactResponseBody(value, depth + 1)
+    } else {
+      out[key] = value
+    }
+  }
+  return out
+}
+
 /**
  * Build the grep-friendly stderr audit line for a successful refresh.
  * Mirrors the Teams plugin convention: `<channel> channel: <event> k=v`.

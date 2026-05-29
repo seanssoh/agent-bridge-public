@@ -71,6 +71,7 @@ import {
 } from './disclosure.ts'
 import {
   classifyRefreshError,
+  redactResponseBody,
   refreshSuccessAuditLine,
   refreshFailureAuditLine,
   SingleFlight,
@@ -566,15 +567,21 @@ async function doRefresh(upn: string): Promise<TokenFile> {
   // missing access_token as transient (server hiccup), keep the token.
   if (!data || !data.access_token) {
     const status = data?._status
+    // codex r1 BLOCKING #1: deep-redact the body before stringifying it
+    // into the audit row. A malformed response that still carried a
+    // refresh_token / access_token / id_token would otherwise leak the
+    // raw bearer secret. redactResponseBody replaces secret-keyed values
+    // with a sha256 fp (or <redacted>) on a safe copy — never the raw.
     process.stderr.write(
       refreshFailureAuditLine({
         upn,
         kind: 'transient',
         oauthError: status ? `http_${status}` : 'malformed_response',
-        description: JSON.stringify(data ?? {}).slice(0, 200),
+        description: JSON.stringify(redactResponseBody(data ?? {})).slice(0, 200),
         refreshTokenPresent: true,
       }),
     )
+    // The thrown message carries only the status — never the body.
     throw new RefreshError(
       'transient',
       status ? `http_${status}` : 'malformed_response',

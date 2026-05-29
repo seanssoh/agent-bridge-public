@@ -44,6 +44,11 @@
 #                   (no clobber) + NO token_expired marker (edge case #2).
 #   T9  (runtime) — concurrent getAccessToken on an expired token issues
 #                   exactly ONE refresh grant (single-flight, edge #3).
+#   T10 (runtime, codex r1 BLOCKING #1) — a malformed token-endpoint
+#                   response that still carries bearer secrets
+#                   (refresh_token / id_token) is DEEP-REDACTED before it
+#                   reaches the audit row; the raw secret appears nowhere
+#                   in stderr (distinct from T6's seeded-mock-token check).
 #
 # Footgun #11: pipe/argv stdin only.
 
@@ -113,15 +118,16 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Runtime tests (T1-T6, T8, T9). These need bun. They exercise the REAL
-# token-refresh.ts helper (single-flight + classify + redact + audit
-# builders) wired into the same doRefresh/getAccessToken/file-IO glue that
-# server.ts ships, against a mock token endpoint and a temp state dir. T0
-# + T7 guard that server.ts keeps that glue, so the runtime harness cannot
-# silently drift from the shipped code.
+# Runtime tests (T1-T6, T8, T9, T10). These need bun. They exercise the
+# REAL token-refresh.ts helper (single-flight + classify + redact +
+# redactResponseBody + audit builders) wired into the same
+# doRefresh/getAccessToken/file-IO glue that server.ts ships, against a
+# mock token endpoint and a temp state dir. T0 + T7 guard that server.ts
+# keeps that glue, so the runtime harness cannot silently drift from the
+# shipped code.
 # ---------------------------------------------------------------------------
 if ! command -v bun >/dev/null 2>&1; then
-  for t in T1 T2 T3 T4 T5 T6 T8 T9; do
+  for t in T1 T2 T3 T4 T5 T6 T8 T9 T10; do
     _skip "$t: runtime refresh behavior (bun not available)"
   done
 else
@@ -132,7 +138,7 @@ import {
 } from 'fs'
 import { join } from 'path'
 import {
-  classifyRefreshError, refreshSuccessAuditLine, refreshFailureAuditLine,
+  classifyRefreshError, redactResponseBody, refreshSuccessAuditLine, refreshFailureAuditLine,
   SingleFlight, type RefreshErrorKind,
 } from '$HELPER_TS'
 
@@ -174,6 +180,10 @@ async function postForm(_url: string, _body: Record<string,string>): Promise<any
   const mode = process.env.HARNESS_MOCK!
   if (mode === 'network') throw new Error('getaddrinfo ENOTFOUND login.microsoftonline.com')
   if (mode === 'http503') return { _raw: 'Service Unavailable', _status: 503 }
+  // codex r1 BLOCKING #1 repro: a malformed JSON body (no usable
+  // access_token in the parsed shape) that STILL carries bearer secrets.
+  // The malformed-response fallback must deep-redact before logging.
+  if (mode === 'malformed_secret') return { refresh_token: 'RT_SECRET', access_token: '', id_token: 'ID_SECRET', _status: 200 }
   if (mode === 'perm') return { error: 'invalid_grant', error_description: 'AADSTS700082: refresh token expired due to inactivity' }
   // success
   await new Promise(r => setTimeout(r, 10))
@@ -203,7 +213,10 @@ async function doRefresh(upn: string): Promise<TokenFile> {
   }
   if (!data || !data.access_token) {
     const status = data?._status
-    process.stderr.write(refreshFailureAuditLine({ upn, kind: 'transient', oauthError: status ? 'http_' + status : 'malformed', description: JSON.stringify(data ?? {}).slice(0,200), refreshTokenPresent: true }))
+    // Matches server.ts: deep-redact the body before stringifying it into
+    // the audit row so a malformed response carrying bearer secrets cannot
+    // leak the raw token (codex r1 BLOCKING #1).
+    process.stderr.write(refreshFailureAuditLine({ upn, kind: 'transient', oauthError: status ? 'http_' + status : 'malformed', description: JSON.stringify(redactResponseBody(data ?? {})).slice(0,200), refreshTokenPresent: true }))
     throw new RefreshError('transient', status ? 'http_' + status : 'malformed', 'no access_token')
   }
   const now = Math.floor(Date.now()/1000)
@@ -276,6 +289,15 @@ function fileMode(p: string): string { return (statSync(p).mode & 0o777).toStrin
     console.log('a=' + a)
     console.log('b=' + b)
     console.log('grant_calls=' + grantCalls)
+  } else if (scenario === 'malformed_secret') {
+    // expired token; refresh returns a malformed body carrying secrets.
+    // getAccessToken returns the (barely-valid? no — hard expired) → it
+    // re-throws the transient error; we only care that the audit row in
+    // stderr does NOT contain the raw secret values.
+    seed(-60, 'RT_VALID')
+    let threw = ''
+    try { await getAccessToken(upn) } catch (e) { threw = e instanceof Error ? e.message : String(e) }
+    console.log('threw=' + threw)
   } else {
     console.log('unknown scenario')
     process.exit(2)
@@ -383,6 +405,23 @@ HARNESS_EOF
     _pass "T9: two concurrent getAccessToken on expired token → single refresh grant (single-flight)"
   else
     _fail "T9" "out: $(printf '%s' "$T9_OUT" | tr '\n' '|') err: $(cat "$SMOKE_DIR/concurrent.err" 2>/dev/null | tr '\n' '|')"
+  fi
+
+  # T10 (codex r1 BLOCKING #1) — a malformed token-endpoint response that
+  # carries bearer secrets must be DEEP-REDACTED before it reaches the
+  # audit row. Drive the malformed_secret scenario and assert that the
+  # raw secret values (RT_SECRET / ID_SECRET) appear NOWHERE in stderr
+  # (the audit row + any error output). Distinct from T6 (which covers
+  # the seeded mock tokens RT_VALID / NEW_REFRESH_*).
+  run_scn malformed_secret malformed_secret >/dev/null
+  T10_ERR="$SMOKE_DIR/malformed_secret.err"
+  if grep -E 'RT_SECRET|ID_SECRET' "$T10_ERR" >/dev/null 2>&1; then
+    _fail "T10" "raw bearer secret leaked from malformed response into audit/error (SECURITY): $(cat "$T10_ERR" 2>/dev/null | tr '\n' '|')"
+  elif grep -q 'ms365_refresh_failed' "$T10_ERR" 2>/dev/null \
+       && grep -q 'sha256:' "$T10_ERR" 2>/dev/null; then
+    _pass "T10: malformed response carrying secrets → deep-redacted in audit (no raw RT/ID secret; sha256 fp present)"
+  else
+    _fail "T10" "expected a redacted ms365_refresh_failed audit row with sha256 fp; got: $(cat "$T10_ERR" 2>/dev/null | tr '\n' '|')"
   fi
 fi
 
