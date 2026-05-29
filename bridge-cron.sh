@@ -568,8 +568,22 @@ PY
   local actor_agent="${BRIDGE_AGENT_ID:-}"
   [[ -n "$actor_agent" ]] || bridge_die "BRIDGE_AGENT_ID unset; cannot route iso cron create"
 
+  # #1379: resolve the shared cross-class group name the staging file
+  # must carry (`ab-agent-<actor_agent>`, hash-truncated for long agent
+  # names) so the controller/daemon can read it — the iso UID's own
+  # `mkdir`+write would otherwise leave the file in the user-private
+  # group `agent-bridge-<a>`, which the controller is not a member of.
+  # Resolving the (possibly hash-truncated) name on the bash side is
+  # authoritative; staging.py also has a self-contained fallback chain,
+  # so this is best-effort — an empty value just defers to that chain.
+  local staging_file_group=""
+  if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+    staging_file_group="$(bridge_isolation_v2_agent_group_name "$actor_agent" 2>/dev/null || printf '')"
+  fi
+
   local request_uuid
-  if ! request_uuid="$(python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/staging.py" \
+  if ! request_uuid="$(AGB_STAGE_FILE_GROUP="$staging_file_group" \
+        python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/staging.py" \
         write-request "$staging_dir" "$actor_agent" "$payload_json_body")"; then
     bridge_die "cron-staging write-request failed (BRIDGE_CRON_STAGING_DIR=$staging_dir)"
   fi

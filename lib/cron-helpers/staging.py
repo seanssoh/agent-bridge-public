@@ -40,6 +40,16 @@ Subcommands
     missing (under iso UID umask, but the matrix-grant path tightens
     perms idempotently).
 
+    #1379: the staging file is explicitly `chgrp`-ed to the shared
+    cross-class group `ab-agent-<actor-agent>` (resolved from the
+    optional `AGB_STAGE_FILE_GROUP` env the matrix-aware bash caller
+    sets, the per-agent dir's own group, or `<BRIDGE_AGENT_GROUP_PREFIX>
+    <actor-agent>`) BEFORE the atomic rename, and the per-agent subdir
+    is self-healed to 2770+setgid. Without this the file lands with the
+    iso UID's user-private group `agent-bridge-<a>` (fresh-install path,
+    no setgid on the dir), the controller is not a member, and the
+    daemon's read is denied → 30s pickup timeout → silent skip.
+
 - read-result <staging-root> <actor-agent> <uuid>
     Iso UID side. Print the result.json content if present, else
     exit non-zero. The bash poller decides timeout.
@@ -160,13 +170,199 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _payload_atomic_write(path: Path, payload: Dict[str, Any], mode: int) -> None:
+def _payload_atomic_write(
+    path: Path, payload: Dict[str, Any], mode: int, gid: Optional[int] = None
+) -> None:
     tmp = path.parent / (path.name + ".tmp." + str(os.getpid()))
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
         fh.write("\n")
     os.chmod(tmp, mode)
+    # #1379: chgrp the temp file BEFORE the atomic rename so the final
+    # file is never visible to a scanner with the wrong (user-private)
+    # group. Best-effort: an unprivileged chgrp to a group the writer is
+    # not a member of raises PermissionError — the caller pre-checks
+    # membership in `_resolve_staging_gid`, so this only fires for a
+    # group we can actually set. Keep -1 for uid (no owner change).
+    if gid is not None:
+        try:
+            os.chown(tmp, -1, gid)
+            # chown may clear the setgid/setuid bits on some platforms;
+            # re-assert the requested mode.
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
     os.replace(tmp, path)
+
+
+def _user_private_gid() -> Optional[int]:
+    """The writer's user-private GID — the group a fresh useradd assigns
+    as the primary group (e.g. `agent-bridge-<a>`). A staging file that
+    lands with THIS group is exactly the #1379 bug: the controller is
+    not a member, so the daemon's read is denied. Returns the effective
+    GID, or None if it cannot be resolved.
+    """
+    try:
+        return os.getegid()
+    except OSError:
+        return None
+
+
+def _gid_for_group_name(group_name: str) -> Optional[int]:
+    """Resolve a group NAME to its GID via the group database. Returns
+    None when the group does not exist (fresh-install before groupadd)
+    or `grp` is unavailable (non-POSIX). Pure lookup — no privilege."""
+    if not group_name:
+        return None
+    try:
+        import grp
+
+        return grp.getgrnam(group_name).gr_gid
+    except KeyError:
+        return None
+    except Exception:
+        return None
+
+
+def _writer_in_group(gid: int) -> bool:
+    """True when the current process is a member of `gid` (primary or
+    supplementary). `os.chgrp`/`os.chown` to a group succeeds only when
+    the unprivileged caller is a member of the target group, so we
+    pre-check membership to avoid a guaranteed-to-fail chown that would
+    surface a confusing PermissionError."""
+    try:
+        if os.getegid() == gid or os.getgid() == gid:
+            return True
+    except OSError:
+        pass
+    try:
+        return gid in os.getgroups()
+    except OSError:
+        return False
+
+
+def _gid_to_group_name(gid: int) -> Optional[int]:
+    """Resolve a GID back to its group NAME (for the actor-specific
+    name gate). Returns None when the gid has no group entry."""
+    try:
+        import grp
+
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return None
+    except Exception:
+        return None
+
+
+def _allowed_actor_group_names(actor_agent: str) -> set:
+    """The set of group NAMES that are legitimately the actor's OWN
+    per-agent group — and ONLY that group. This is the security gate
+    (codex r1 BLOCKING): a candidate GID is accepted only when its
+    group name is in this set, so a SHARED group the iso UID also
+    belongs to (`ab-shared`) can never be selected. Selecting `ab-shared`
+    for the per-agent staging leaf would reopen the cross-agent
+    write/read surface the matrix avoids (lib/bridge-isolation-v2.sh
+    grants the per-agent subdir `ab-agent-<a>` 2770, NOT `ab-shared`).
+
+    Members:
+    - `AGB_STAGE_FILE_GROUP` (the matrix-aware bash caller's
+      `bridge_isolation_v2_agent_group_name` output — already the
+      authoritative, possibly hash-truncated, actor-specific name).
+    - `<prefix><actor_agent>` (the un-truncated common case).
+    - the hash-truncated form mirroring
+      `bridge_isolation_v2_agent_group_name` on Linux (`<prefix>
+      <first-N>-<7-char-sha256(actor)>` clamped to 32 chars), so a long
+      agent name still matches even when the env was not passed.
+    """
+    prefix = os.environ.get("BRIDGE_AGENT_GROUP_PREFIX", "ab-agent-")
+    names = set()
+    explicit = os.environ.get("AGB_STAGE_FILE_GROUP", "").strip()
+    if explicit:
+        names.add(explicit)
+    names.add(f"{prefix}{actor_agent}")
+    # Hash-truncated variant — mirror bridge_isolation_v2_agent_group_name
+    # (Linux groupadd 32-char cap: `<prefix><head>-<7-hex-sha256>`).
+    composed = f"{prefix}{actor_agent}"
+    if len(composed) > 32:
+        avail = 32 - len(prefix)
+        if avail >= 9:
+            import hashlib
+
+            short = hashlib.sha256(actor_agent.encode("utf-8")).hexdigest()[:7]
+            keep = avail - 1 - 7
+            names.add(f"{prefix}{actor_agent[:keep]}-{short}")
+    return names
+
+
+def _resolve_staging_gid(actor_agent: str, agent_dir: Path) -> Optional[int]:
+    """Resolve the GID the staging file MUST carry so the controller
+    (daemon) can read it: the actor's OWN per-agent cross-class group
+    `ab-agent-<actor>` (NOT the writer's user-private group, and NOT any
+    OTHER group the writer happens to belong to such as `ab-shared`).
+
+    Candidate sources, in priority order:
+    1. `AGB_STAGE_FILE_GROUP` — the group name the matrix-aware bash
+       caller resolved (authoritative, handles the >32-char hash-
+       truncated name the iso UID cannot recompute).
+    2. The per-agent dir's OWN group (setgid inheritance target) — useful
+       on a matrix-applied install; we still chgrp the file explicitly to
+       repair fresh-install files written before the matrix ran.
+    3. `ab-agent-<actor_agent>` derived from `BRIDGE_AGENT_GROUP_PREFIX`.
+
+    Each candidate is accepted ONLY when ALL hold:
+      (a) it resolves to a real GID;
+      (b) it differs from the writer's user-private GID;
+      (c) the writer is a member of it (an unprivileged chgrp to a
+          non-member group fails); AND
+      (d) **its group NAME is the actor's own per-agent group** (codex r1
+          BLOCKING security gate) — this is what rejects `ab-shared` and
+          any other shared/supplementary group the iso UID belongs to,
+          preserving the #1359 per-agent write boundary.
+
+    Returns None when no safe candidate is found — the caller then leaves
+    the setgid-inherited group in place (best-effort, matching the
+    pre-#1379 behavior on the matrix-applied path)."""
+    private_gid = _user_private_gid()
+    allowed_names = _allowed_actor_group_names(actor_agent)
+
+    def _accept(gid: Optional[int]) -> Optional[int]:
+        if gid is None:
+            return None
+        if private_gid is not None and gid == private_gid:
+            return None
+        if not _writer_in_group(gid):
+            return None
+        # Security gate: the gid's group name MUST be the actor's own
+        # per-agent group, never a shared group the writer also belongs
+        # to (e.g. ab-shared).
+        name = _gid_to_group_name(gid)
+        if name is None or name not in allowed_names:
+            return None
+        return gid
+
+    # (1) explicit group name from the matrix-aware bash caller.
+    explicit = os.environ.get("AGB_STAGE_FILE_GROUP", "").strip()
+    if explicit:
+        accepted = _accept(_gid_for_group_name(explicit))
+        if accepted is not None:
+            return accepted
+
+    # (2) the per-agent dir's current group, when it is the actor's own.
+    try:
+        dir_gid = int(agent_dir.stat().st_gid)
+    except OSError:
+        dir_gid = None
+    accepted = _accept(dir_gid)
+    if accepted is not None:
+        return accepted
+
+    # (3) derive `<prefix><actor_agent>` (un-truncated common case).
+    prefix = os.environ.get("BRIDGE_AGENT_GROUP_PREFIX", "ab-agent-")
+    accepted = _accept(_gid_for_group_name(f"{prefix}{actor_agent}"))
+    if accepted is not None:
+        return accepted
+
+    return None
 
 
 _AGENT_NAME_RE = None
@@ -207,15 +403,45 @@ def cmd_write_request(staging_root_arg: str, actor_agent: str, payload_json: str
     # still land at mode 0660 owner=controller group=ab-agent-<a>.
     agent_dir.mkdir(parents=True, exist_ok=True)
 
+    # #1379: resolve the shared cross-class group the staging file MUST
+    # carry so the controller (daemon) can read it. Without this, a file
+    # created on the fresh-install path (subdir made by the iso UID's
+    # `mkdir` under umask 077, no setgid, user-private group) lands with
+    # group `agent-bridge-<a>` — which the controller is NOT a member of
+    # → daemon read denied → 30s pickup timeout → silent skip.
+    staging_gid = _resolve_staging_gid(actor_agent, agent_dir)
+
+    # Best-effort: self-heal the per-agent subdir so future files inherit
+    # the shared group via setgid (2770) rather than the user-private
+    # group. The matrix grant does this canonically at agent prepare;
+    # repeating it here closes the fresh-install gap idempotently. An
+    # unprivileged caller can chgrp/chmod a dir it owns; failures are
+    # swallowed (the explicit per-file chgrp below is the load-bearing
+    # fix, the dir setgid is the belt-and-suspenders).
+    if staging_gid is not None:
+        try:
+            st_dir = agent_dir.stat()
+            if int(st_dir.st_gid) != staging_gid:
+                os.chown(agent_dir, -1, staging_gid)
+            # 2770 + setgid: owner+group rwx, setgid so children inherit
+            # the dir group. Mirrors the matrix `state-cron-staging-
+            # agent-dir` row (2770 group_setgid).
+            os.chmod(agent_dir, 0o2770)
+        except OSError:
+            pass
+
     request_uuid = uuid.uuid4().hex
     request_path = agent_dir / f"{request_uuid}.json"
 
-    # Mode 0660 — group=ab-agent-<a> via setgid means only the actor
-    # agent's iso UID has group-write. Other iso UIDs do not have
-    # ab-agent-<a> membership, so cross-agent rewrites are blocked at
-    # the group boundary even though every iso UID has --x on the
-    # shared root (for traversal into its OWN subdir).
-    _payload_atomic_write(request_path, payload, 0o660)
+    # Mode 0660 — group=ab-agent-<a> (explicit chgrp via `staging_gid`,
+    # NOT merely setgid-inherited) means the controller can read the
+    # staged file even on a fresh-install path where the dir setgid
+    # has not yet been applied. Only the actor agent's iso UID has
+    # group-write; other iso UIDs lack ab-agent-<a> membership, so
+    # cross-agent rewrites stay blocked at the group boundary even
+    # though every iso UID has --x on the shared root (for traversal
+    # into its OWN subdir).
+    _payload_atomic_write(request_path, payload, 0o660, gid=staging_gid)
 
     print(request_uuid)
     return 0
