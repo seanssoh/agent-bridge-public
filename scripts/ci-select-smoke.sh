@@ -803,7 +803,17 @@ select_for_path() {
       # future refactor cannot silently re-introduce the codex r1
       # BLOCKING repro (claimed task + picker_blocked agent + aged
       # session_activity_ts → wrongly requeued tasks).
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging
+      # v0.15.0-beta5-5 Track Q (#1370): bridge-daemon.sh now hosts the
+      # admin-only autostart recovery wrapper
+      # (bridge_daemon_start_agent_with_recovery /
+      # bridge_daemon_admin_autostart_recover). The 1380 smoke pins the
+      # admin gate at the wrapper (non-admin agents never enter the
+      # --no-continue/--safe-mode retry ladder, T6) and the base warning
+      # parity (note-only on session-exited-quickly, T7). Pull
+      # 1380-admin-autostart-recovery on every bridge-daemon.sh move so a
+      # future PR cannot silently re-leak non-admin agents into the
+      # recovery ladder or regress the non-admin byte-equivalence.
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery
       # v0.15.0-beta5-2 Lane η (#1314, CRITICAL/security):
       # bridge-daemon.sh's `cmd_run_cron_worker` now gates shell-cron
       # dispatch on `bridge_cron_uid_drop_preflight`. The new gate emits
