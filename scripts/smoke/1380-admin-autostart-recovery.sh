@@ -122,7 +122,9 @@ rm -f "$TMP_ROOT/start.log" "$TMP_ROOT/events.log"
   if bridge_daemon_start_agent_with_recovery worker always_on; then
     smoke_fail "non-admin worker unexpectedly recovered"
   fi
-  [[ "$(wc -l <"$START_LOG")" == "1" ]] || smoke_fail "non-admin recovery invoked extra start attempts"
+  # Normalize the line count with arithmetic ($(( ... ))) so BSD/macOS `wc -l`
+  # leading-space padding (e.g. "       1") does not false-fail the comparison.
+  [[ "$(( $(wc -l <"$START_LOG") ))" -eq 1 ]] || smoke_fail "non-admin recovery invoked extra start attempts"
   [[ ! -f "$TMP_ROOT/events.log" ]] || smoke_fail "non-admin recovery emitted admin repair events"
   # Base warning parity: a non-admin start-command failure must surface the
   # exact base reason (`start-command-failed`) so the daemon call site warns
@@ -162,7 +164,9 @@ chmod +x "$TMP_ROOT/bridge-start.sh"
   if bridge_daemon_start_agent_with_recovery worker on_demand; then
     smoke_fail "non-admin worker unexpectedly recovered on session-exited-quickly"
   fi
-  [[ "$(wc -l <"$START_LOG")" == "1" ]] || smoke_fail "non-admin session-exited-quickly invoked extra start attempts"
+  # Normalize the line count with arithmetic ($(( ... ))) so BSD/macOS `wc -l`
+  # leading-space padding (e.g. "       1") does not false-fail the comparison.
+  [[ "$(( $(wc -l <"$START_LOG") ))" -eq 1 ]] || smoke_fail "non-admin session-exited-quickly invoked extra start attempts"
   [[ ! -f "$TMP_ROOT/events.log" ]] || smoke_fail "non-admin session-exited-quickly emitted admin repair events"
   # Base parity: reason is the transient note-only reason, so the call site
   # records the note WITHOUT a warning (matching the pre-recovery daemon).
