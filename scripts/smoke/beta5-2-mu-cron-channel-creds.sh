@@ -427,7 +427,12 @@ t6_normalize_run() {
   printf 'TOKEN=redacted\n' >"$target"
   chmod 0600 "$target"
   local before_mode
-  before_mode="$(stat -f '%Lp' "$target" 2>/dev/null || stat -c '%a' "$target")"
+  # Read the octal file MODE portably. GNU coreutils `stat -c '%a'` first
+  # (on Linux `-f` means --file-system and prints multiline FS info with a
+  # zero exit, so a BSD-first `-f` ordering never reaches the `-c` branch
+  # and compares an FS report to "600"); fall back to BSD `stat -f '%Lp'`
+  # on macOS where `-c` is rejected.
+  before_mode="$(stat -c '%a' "$target" 2>/dev/null || stat -f '%Lp' "$target")"
   if [[ "$before_mode" != "600" ]]; then
     smoke_fail "${label}: precondition file mode=${before_mode} expected 600"
   fi
@@ -447,7 +452,9 @@ t6_normalize_run() {
     smoke_fail "${label}: harness rc=${rc} out=$(cat "$SMOKE_TMP_ROOT/${label}.out")"
   fi
   local after_mode
-  after_mode="$(stat -f '%Lp' "$target" 2>/dev/null || stat -c '%a' "$target")"
+  # Portable octal mode read — GNU `-c '%a'` first, BSD `-f '%Lp'` fallback
+  # (see the before_mode note above for why BSD-first breaks on Linux).
+  after_mode="$(stat -c '%a' "$target" 2>/dev/null || stat -f '%Lp' "$target")"
   if [[ "$after_mode" != "$expected" ]]; then
     smoke_fail "${label}: file mode=${after_mode} expected=${expected} (file widened — codex r1 BLOCKING regression)"
   fi

@@ -509,10 +509,13 @@ _bridge_cron_create_via_staging() {
   local actor_uid
   actor_uid="$(id -u 2>/dev/null || printf '0')"
   # shellcheck disable=SC2155
-  local _payload_json_tmp
+  # #1387: initialize to "" so the cleanup trap is robust under `set -u`
+  # regardless of which path set it (the trap also guards with `:-` in
+  # case it fires before the mktemp assignment completes).
+  local _payload_json_tmp=""
+  trap 'rm -f "${_payload_json_tmp:-}"' RETURN
   _payload_json_tmp="$(mktemp -t agb-cron-staging-payload.XXXXXX)" || \
     bridge_die "cannot mktemp cron-staging payload buffer"
-  trap 'rm -f "$_payload_json_tmp"' RETURN
 
   AGB_STAGE_AGENT="$agent" \
   AGB_STAGE_SCHEDULE="$schedule" \
