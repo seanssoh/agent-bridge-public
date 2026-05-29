@@ -466,6 +466,14 @@ if smoke_is_linux; then
     printf 'set -uo pipefail\n'
     printf 'export BRIDGE_ROSTER_CACHE_DISABLE=1\n'
     printf 'source "%s/bridge-lib.sh"\n' "$REPO_ROOT"
+    # The roster assoc maps are only declared by bridge_load_roster /
+    # bridge_reset_roster_maps; sourcing bridge-lib.sh alone (cache
+    # disabled, no load) leaves them undeclared. Under `set -u` an
+    # undeclared-assoc subscript assignment (`MAP[h_smoke]=`) is parsed as
+    # an ARITHMETIC subscript and dies with `h_smoke: unbound variable`.
+    # Declare them idempotently (mirrors bridge-lib.sh cold-iso fallback).
+    printf 'declare -gA BRIDGE_AGENT_OS_USER 2>/dev/null || true\n'
+    printf 'declare -ga BRIDGE_AGENT_IDS 2>/dev/null || true\n'
     printf 'BRIDGE_AGENT_IDS+=(h_smoke aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa manual_explicit)\n'
     printf 'BRIDGE_AGENT_OS_USER[h_smoke]=""\n'
     printf 'BRIDGE_AGENT_OS_USER[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]=""\n'

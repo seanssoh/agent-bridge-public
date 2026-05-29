@@ -107,22 +107,39 @@ smoke_assert_file_exists "$HINT_HELPER" "broken-launch-reason-hint.py helper pre
 t1_driver() {
   local _tmp="$SMOKE_TMP_ROOT/t1"
   mkdir -p "$_tmp/override-bin" "$_tmp/nvm-root/versions/node/v24.16.0/bin"
+  # beta5-3 #1352/#1317 engine-presence gate: bridge_augment_engine_path
+  # only prepends an nvm version bin dir that actually holds a `codex` or
+  # `claude` executable (an engine-less dir grows PATH without fixing
+  # `command -v codex` → exit 127 persists). Seed a stub engine binary so
+  # the T1b nvm auto-detect precondition matches a real nvm install.
+  printf '#!/usr/bin/env bash\nexit 0\n' \
+    >"$_tmp/nvm-root/versions/node/v24.16.0/bin/codex"
+  chmod +x "$_tmp/nvm-root/versions/node/v24.16.0/bin/codex"
 
   # Build a tiny standalone driver that defines bridge_prepend_path_entry
-  # + bridge_augment_engine_path inline (extracted from bridge-lib.sh
-  # via awk). Source-then-call into an isolated PATH so the smoke
-  # cannot be contaminated by the operator's real shell.
+  # + bridge_dir_has_engine_cli + bridge_augment_engine_path inline
+  # (extracted from bridge-lib.sh via awk). Source-then-call into an
+  # isolated PATH so the smoke cannot be contaminated by the operator's
+  # real shell. bridge_dir_has_engine_cli is a dependency of
+  # bridge_augment_engine_path (beta5-3 #1317 nvm/fnm auto-detect) and
+  # must be extracted too or the call dies with `command not found`.
   local _driver="$_tmp/driver.sh"
   awk '
     /^bridge_prepend_path_entry\(\) \{/,/^\}/ { print }
   ' "$LIB_SH" >"$_driver"
   awk '
+    /^bridge_dir_has_engine_cli\(\) \{/,/^\}/ { print }
+  ' "$LIB_SH" >>"$_driver"
+  awk '
     /^bridge_augment_engine_path\(\) \{/,/^\}/ { print }
   ' "$LIB_SH" >>"$_driver"
 
-  # Sanity: both function openers must be present.
+  # Sanity: all three function openers must be present.
   if ! grep -q '^bridge_prepend_path_entry() {' "$_driver"; then
     smoke_fail "T1: bridge_prepend_path_entry extract missing"
+  fi
+  if ! grep -q '^bridge_dir_has_engine_cli() {' "$_driver"; then
+    smoke_fail "T1: bridge_dir_has_engine_cli extract missing (augment dependency)"
   fi
   if ! grep -q '^bridge_augment_engine_path() {' "$_driver"; then
     smoke_fail "T1: bridge_augment_engine_path extract missing (likely fix reverted)"
