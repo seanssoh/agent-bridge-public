@@ -4206,7 +4206,9 @@ bridge_daemon_admin_autostart_recover() {
       --detail mode="$mode" \
       --detail initial_reason="$initial_reason" 2>/dev/null || true
 
-    if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "${start_args[@]}" >/dev/null 2>&1; then
+    # Issue #1388: launch with the daemon singleton-lock fd closed for the
+    # child so the spawned tmux server does not inherit (and later pin) it.
+    if bridge_daemon_run_without_singleton_lock "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "${start_args[@]}" >/dev/null 2>&1; then
       sleep 1
       if bridge_tmux_session_exists "$session"; then
         bridge_audit_log daemon admin_autostart_recovery_success "$agent" \
@@ -4245,7 +4247,9 @@ bridge_daemon_start_agent_with_recovery() {
   # session came up. The failure reason recorded here (`session-exited-quickly`
   # vs `start-command-failed`) is exactly the base reason, so non-admin callers
   # preserve base note/warn semantics downstream.
-  if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
+  # Issue #1388: close the daemon singleton-lock fd for the child so the
+  # spawned tmux server cannot inherit (and later pin) it.
+  if bridge_daemon_run_without_singleton_lock "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
     session="$(bridge_agent_session "$agent")"
     sleep 1
     if [[ -n "$session" ]] && bridge_tmux_session_exists "$session"; then
@@ -7952,7 +7956,9 @@ bridge_daemon_cron_dispatch_wake() {
     fi
   fi
 
-  if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
+  # Issue #1388: cron-dispatch wake is a daemon-initiated launch — close the
+  # singleton-lock fd for the child so the tmux server does not inherit it.
+  if bridge_daemon_run_without_singleton_lock "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
     daemon_info "auto-waked ${agent} (trigger=cron-dispatch #${task_id} family=${family})"
     bridge_audit_log daemon cron_dispatch_wake "$agent" \
       --detail task_id="$task_id" \
