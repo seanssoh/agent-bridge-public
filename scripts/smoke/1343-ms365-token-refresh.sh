@@ -337,7 +337,7 @@ async function exchangeAuthCode(): Promise<ExchangeResult> {
 }
 
 // ---- scenario dispatcher --------------------------------------------------
-const upn = 'agent@contoso.com'
+const upn = 'agent@example.com'
 const scenario = process.argv[2]
 function seed(expiresOffsetSec: number, refresh: string | undefined) {
   saveJson(tokenPath(upn), { upn, access_token: 'OLD_ACCESS', refresh_token: refresh, expires_at: Math.floor(Date.now()/1000) + expiresOffsetSec, scope: 'User.Read', saved_at: Math.floor(Date.now()/1000) })
@@ -485,7 +485,7 @@ HARNESS_EOF
   fi
 
   # T5 — token file mode stays 0600 after refresh rewrite (from T1's run).
-  T5_TOKEN="$SMOKE_DIR/state-expired/tokens/agent_contoso.com.json"
+  T5_TOKEN="$SMOKE_DIR/state-expired/tokens/agent_example.com.json"
   if [[ -f "$T5_TOKEN" ]]; then
     T5_MODE_LINUX="$(stat -c '%a' "$T5_TOKEN" 2>/dev/null || true)"
     T5_MODE_MACOS="$(stat -f '%Lp' "$T5_TOKEN" 2>/dev/null || true)"
