@@ -247,13 +247,15 @@ else
   T1S_AGENT="iso-shared-gate"
   T1S_DIR="$STAGING_ROOT/$T1S_AGENT"
   mkdir -p "$T1S_DIR"
-  T1S_OUT="$(
-    AGB_T1S_DIR="$T1S_DIR" AGB_T1S_AGENT="$T1S_AGENT" \
-    AGB_T1S_SHARED="${SHARED_GROUP_NAME}" AGB_T1S_MEMBER="$MEMBER_GROUP_NAME" \
-    AGB_T1S_MEMBER_GID="$MEMBER_GID" \
-    "$PY_BIN" - <<PY
+  # footgun #11: the python body is written to a FILE (cat > file <<'PY',
+  # a SAFE write-to-file heredoc) and run file-as-argv ("$PY_BIN" "$_pyf")
+  # instead of feeding the interpreter's stdin from a heredoc inside the
+  # T1S_OUT="$( ... )" capture (which would be a C1 deadlock site). The
+  # quoted <<'PY' means $REPO_ROOT is passed through AGB_REPO_ROOT env.
+  T1S_PYF="$(mktemp "${TMPDIR:-/tmp}/1379-t1s-XXXXXX.py")"
+  cat >"$T1S_PYF" <<'PY'
 import os, sys
-sys.path.insert(0, os.path.join("$REPO_ROOT", "lib", "cron-helpers"))
+sys.path.insert(0, os.path.join(os.environ["AGB_REPO_ROOT"], "lib", "cron-helpers"))  # noqa: iso-helper-boundary (os.environ read, not a .env file callsite)
 import staging
 from pathlib import Path
 
@@ -288,7 +290,14 @@ os.environ["AGB_STAGE_FILE_GROUP"] = member
 canon = staging._resolve_staging_gid(member, d)  # agent == member group name
 print("canonical=" + ("None" if canon is None else str(canon)))
 PY
+  T1S_OUT="$(
+    AGB_REPO_ROOT="$REPO_ROOT" \
+    AGB_T1S_DIR="$T1S_DIR" AGB_T1S_AGENT="$T1S_AGENT" \
+    AGB_T1S_SHARED="${SHARED_GROUP_NAME}" AGB_T1S_MEMBER="$MEMBER_GROUP_NAME" \
+    AGB_T1S_MEMBER_GID="$MEMBER_GID" \
+    "$PY_BIN" "$T1S_PYF"
   )"
+  rm -f "$T1S_PYF"
   T1S_FORGE_SHARED="$(printf '%s\n' "$T1S_OUT" | sed -n 's/^forge_shared=//p')"
   T1S_FORGE_MEMBER="$(printf '%s\n' "$T1S_OUT" | sed -n 's/^forge_member=//p')"
   T1S_CANON="$(printf '%s\n' "$T1S_OUT" | sed -n 's/^canonical=//p')"
@@ -310,14 +319,15 @@ PY
   smoke_log "T1f (fail-loud): chgrp cannot be applied/verified → no publish, no uuid, non-zero rc"
   T1F_AGENT="$MEMBER_GROUP_NAME"   # canonical group resolvable (prefix="")
   T1F_DIR="$STAGING_ROOT/$T1F_AGENT"
-  T1F_OUT="$(
-    AGB_T1F_ROOT="$STAGING_ROOT" AGB_T1F_AGENT="$T1F_AGENT" \
-    AGB_T1F_MEMBER="$MEMBER_GROUP_NAME" AGB_T1F_UID="$CURRENT_UID" \
-    AGB_T1F_PRIMARY_GID="$EFFECTIVE_GID" \
-    AGB_STAGE_FILE_GROUP="$MEMBER_GROUP_NAME" BRIDGE_AGENT_GROUP_PREFIX="" \
-    "$PY_BIN" - <<PY
+  # footgun #11: same file-as-argv extraction as T1s — the python body is a
+  # SAFE write-to-file heredoc (cat > file <<'PY'), then run as
+  # "$PY_BIN" "$_pyf" inside the T1F_OUT="$( ... )" capture (no
+  # heredoc-fed interpreter stdin inside the capture). $REPO_ROOT crosses
+  # via AGB_REPO_ROOT so the body stays a quoted <<'PY'.
+  T1F_PYF="$(mktemp "${TMPDIR:-/tmp}/1379-t1f-XXXXXX.py")"
+  cat >"$T1F_PYF" <<'PY'
 import json, os, sys
-sys.path.insert(0, os.path.join("$REPO_ROOT", "lib", "cron-helpers"))
+sys.path.insert(0, os.path.join(os.environ["AGB_REPO_ROOT"], "lib", "cron-helpers"))  # noqa: iso-helper-boundary (os.environ read, not a .env file callsite)
 import staging
 
 root = os.environ["AGB_T1F_ROOT"]
@@ -377,7 +387,15 @@ finally:
 after = _requests()
 print("new_published=" + str(len(after - before)))
 PY
+  T1F_OUT="$(
+    AGB_REPO_ROOT="$REPO_ROOT" \
+    AGB_T1F_ROOT="$STAGING_ROOT" AGB_T1F_AGENT="$T1F_AGENT" \
+    AGB_T1F_MEMBER="$MEMBER_GROUP_NAME" AGB_T1F_UID="$CURRENT_UID" \
+    AGB_T1F_PRIMARY_GID="$EFFECTIVE_GID" \
+    AGB_STAGE_FILE_GROUP="$MEMBER_GROUP_NAME" BRIDGE_AGENT_GROUP_PREFIX="" \
+    "$PY_BIN" "$T1F_PYF"
   )"
+  rm -f "$T1F_PYF"
   T1F_RESOLVED="$(printf '%s\n' "$T1F_OUT" | sed -n 's/^resolved=//p')"
   T1F_RC="$(printf '%s\n' "$T1F_OUT" | sed -n 's/^rc=//p')"
   T1F_STDOUT_LEN="$(printf '%s\n' "$T1F_OUT" | sed -n 's/^stdout_len=//p')"
