@@ -19,8 +19,8 @@ usage() {
 Usage:
   $(basename "$0") discord <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--channel <id>]... [--allow-from <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
-  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
-  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run] [--allow-probe-failure]
+  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--app-password-stdin] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
+  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--client-secret-stdin] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--skip-entra-probe] [--yes] [--dry-run] [--allow-probe-failure]
   $(basename "$0") agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start] [setup options...]
   $(basename "$0") admin <agent>
 
@@ -55,13 +55,13 @@ EOF
     teams)
       cat <<EOF
 Usage:
-  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
+  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--app-password-stdin] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
 EOF
       ;;
     ms365)
       cat <<EOF
 Usage:
-  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run] [--allow-probe-failure]
+  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--client-secret-stdin] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--skip-entra-probe] [--yes] [--dry-run] [--allow-probe-failure]
 EOF
       ;;
     agent)
@@ -556,6 +556,19 @@ run_discord() {
     esac
   done
 
+  # Issue #1353 (v0.15.0-beta5-2 Track A) R2 (codex r1 BLOCKING 1):
+  # Mark setup-pending grace AFTER option parsing AND only when this is
+  # NOT a dry-run. Marking unconditionally before parsing meant
+  # `setup discord --dry-run` created/refreshed the marker on disk and
+  # never cleared it (the clear at end is dry_run=0 gated), leaving
+  # daemon auto-start silently skipping for up to the grace window even
+  # though nothing was actually set up. Same shape as run_teams /
+  # run_ms365 / run_telegram.
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
+    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
+  fi
+
   workdir="$(bridge_agent_workdir "$agent")"
   discord_dir="$(bridge_agent_discord_state_dir "$agent")"
   suggested_channel="$(bridge_agent_discord_channel_id "$agent")"
@@ -589,6 +602,12 @@ run_discord() {
     # runtime/agent-env.sh so its launch cmd cannot keep a pre-v2 channel
     # state path. NO-OP for non-isolated agents.
     bridge_refresh_isolated_agent_env_after_channel_mutation "$agent"
+  fi
+  # Issue #1353 (v0.15.0-beta5-2 Track A) — clear the setup-pending
+  # marker at the END of a non-dry-run setup. Same shape as run_teams.
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_clear_setup_pending >/dev/null 2>&1; then
+    bridge_agent_clear_setup_pending "$agent" >/dev/null 2>&1 || true
   fi
 }
 
@@ -638,6 +657,16 @@ run_telegram() {
     esac
   done
 
+  # Issue #1353 (v0.15.0-beta5-2 Track A) R2 (codex r1 BLOCKING 1):
+  # Mark setup-pending grace AFTER option parsing AND only when this is
+  # NOT a dry-run. See run_discord for the rationale (dry-run was
+  # creating a marker the clear path never reached). Same shape as
+  # run_teams / run_ms365 / run_discord.
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
+    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
+  fi
+
   workdir="$(bridge_agent_workdir "$agent")"
   telegram_dir="$(bridge_agent_telegram_state_dir "$agent")"
   base_args=(
@@ -661,6 +690,12 @@ run_telegram() {
     # BRIDGE_AGENT_CHANNELS in agent-roster.local.sh — refresh the isolated
     # agent's cached runtime/agent-env.sh. NO-OP for non-isolated agents.
     bridge_refresh_isolated_agent_env_after_channel_mutation "$agent"
+  fi
+  # Issue #1353 (v0.15.0-beta5-2 Track A) — clear the setup-pending
+  # marker at the END of a non-dry-run setup. Same shape as run_teams.
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_clear_setup_pending >/dev/null 2>&1; then
+    bridge_agent_clear_setup_pending "$agent" >/dev/null 2>&1 || true
   fi
 }
 
@@ -699,7 +734,13 @@ run_teams() {
         py_args+=("$1" "$2")
         shift 2
         ;;
-      --require-mention|--skip-validate|--skip-send-test|--yes|--dry-run)
+      --require-mention|--skip-validate|--skip-send-test|--yes|--dry-run|--app-password-stdin)
+        # Issue #1354: `--app-password-stdin` is a value-less flag forwarded
+        # to the python wizard. The wizard reads sys.stdin once and uses
+        # the result as the secret. Process-substitution `<(...)` is the
+        # documented alternative for non-stdin cases but it does not
+        # survive the sudo-subshell wrapper run_teams puts around the
+        # python invocation; --app-password-stdin is the portable path.
         [[ "$1" == "--dry-run" ]] && dry_run=1
         py_args+=("$1")
         shift
@@ -716,6 +757,27 @@ run_teams() {
         ;;
     esac
   done
+
+  # Issue #1353 (v0.15.0-beta5-2 Track A) R2 (codex r1 BLOCKING 1):
+  # Extend the setup-pending grace window AFTER option parsing AND only
+  # when this is NOT a dry-run. `agent create` writes the initial marker
+  # at create time (15 min default grace), but a multi-channel install
+  # (`setup teams` then `setup ms365`) plus interactive wizard input can
+  # take longer than the default window. Touching the marker here
+  # refreshes its mtime so the daemon stays in silent-skip mode for
+  # another 15 min while the operator works through the wizard. The
+  # `dry_run -eq 0` gate is the R2 fix: previously the mark fired on
+  # entry before --dry-run was parsed, leaving a stale marker that the
+  # end-of-function clear (also dry_run=0 gated) never reached, so
+  # `setup teams --dry-run` would silently suppress channel-status
+  # backoff bursts for up to the grace window without any actual setup.
+  # No-op if the marker is absent on entry (operator started setup
+  # after the grace expired — that's their prerogative; backoff will
+  # fire with audit signal until setup completes).
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
+    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
+  fi
 
   # v0.15.0-beta4 Lane B (#1268): wizard gate. Two paths:
   #   - auto mode (`--yes` in argv) — fail loud with the enumerated list
@@ -803,6 +865,19 @@ run_teams() {
   if [[ $_wizard_kicked_in -eq 1 && $dry_run -eq 0 ]]; then
     bridge_setup_wizard_post_summary_teams
   fi
+  # Issue #1353 (v0.15.0-beta5-2 Track A) — clear the setup-pending
+  # grace marker at the END of a non-dry-run setup. Multi-channel agents
+  # (`plugin:teams,plugin:ms365`) have a per-verb mark+clear cycle: this
+  # `setup teams` clears, then `setup ms365`'s entry-side mark refreshes
+  # the marker for the next setup. The brief gap between teams clear
+  # and ms365 mark IS a window where backoff can fire — that's by
+  # design (the brief calls it out as acceptable cost of tactical
+  # scope). The root fix (`awaiting_channel_setup` state with explicit
+  # ready toggle) closes this remaining gap in a follow-up.
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_clear_setup_pending >/dev/null 2>&1; then
+    bridge_agent_clear_setup_pending "$agent" >/dev/null 2>&1 || true
+  fi
 }
 
 # Issue #1209: ms365 channel setup wizard. Persists MS365_REDIRECT_URI
@@ -835,9 +910,14 @@ run_ms365() {
         py_args+=("$1" "$2")
         shift 2
         ;;
-      --allow-localhost|--yes|--dry-run)
+      --allow-localhost|--yes|--dry-run|--client-secret-stdin|--skip-entra-probe)
         # PR #1220 codex r1: --allow-localhost is a value-less flag
         # that the Python wizard records as MS365_REDIRECT_URI_ALLOW_LOCALHOST=1.
+        # Issue #1354: --client-secret-stdin is the value-less companion to
+        # --client-secret-file — the wizard reads the secret from stdin
+        # (portable across sudo subshell wrappers, unlike `<(...)`).
+        # Issue #1356: --skip-entra-probe opts out of the redirect URI
+        # registration probe (forwarded verbatim to bridge-setup.py).
         [[ "$1" == "--dry-run" ]] && dry_run=1
         py_args+=("$1")
         shift
@@ -854,6 +934,20 @@ run_ms365() {
         ;;
     esac
   done
+
+  # Issue #1353 (v0.15.0-beta5-2 Track A) R2 (codex r1 BLOCKING 1):
+  # Refresh setup-pending grace window AFTER option parsing AND only
+  # when this is NOT a dry-run. See run_teams for full rationale; the
+  # symmetric mark/clear bracket keeps the daemon's auto-start
+  # dispatcher silent-skipping through the ms365 wizard even when the
+  # prior `setup teams` already cleared the marker. The `dry_run -eq 0`
+  # gate prevents `setup ms365 --dry-run` from leaving a stale marker
+  # that the end-of-function clear (also dry_run=0 gated) never
+  # reaches.
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
+    bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
+  fi
 
   # v0.15.0-beta4 Lane B (#1271): wizard gate. Same shape as run_teams.
   # Auto mode (--yes in argv) requires every site-specific flag
@@ -912,6 +1006,12 @@ run_ms365() {
   # printed only when the interactive wizard ran. Auto mode stays quiet.
   if [[ $_wizard_kicked_in -eq 1 && $dry_run -eq 0 ]]; then
     bridge_setup_wizard_post_summary_ms365
+  fi
+  # Issue #1353 (v0.15.0-beta5-2 Track A) — clear setup-pending marker
+  # at the end of a non-dry-run setup. Symmetric with run_teams.
+  if [[ $dry_run -eq 0 ]] \
+      && command -v bridge_agent_clear_setup_pending >/dev/null 2>&1; then
+    bridge_agent_clear_setup_pending "$agent" >/dev/null 2>&1 || true
   fi
 }
 

@@ -107,7 +107,7 @@ add_live() {
 
 add_all_required_static() {
 
-add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent 1323-nudge-eligibility-recheck-twostage tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift phase2-install-tree-reconciler phase3-agent-home-contract 1201-1202-directory-marketplace-seed 1205-hook-iso-fail-open 1207-stale-supp-groups-allowlist 1208-lock-metadata-normalize 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1214-channel-validator-iso-fallback 1215-ms365-dir-mode beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers G-channel-spec-resolution F-daemon-supp-groups-mock F-daemon-supp-groups-real H-bootstrap-memory-iso-rebuild I-agent-description-roster ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers 6607-hook-admin-allowlist γ-cli-consistency δ-1234-daemon-start-policy B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir C-beta4-logger-and-spec B-beta4-setup-wizard A-beta4-iso-path-resolution D-beta4-daemon-lifecycle E-beta4-fresh-install-gate-state-dir H-beta4-iso-ownership F-beta4-oauth-bootstrap G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs K-beta4-nits Beta-beta5-session-id-detect-sudo α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-zeta-teams-mcp-dedup beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-eta-cron-iso-uid-preflight beta5-2-delta-nudge-session-empty beta5-2-theta-upgrade-backfill-perms beta5-2-nu-daemon-path-quarantine beta5-2-kappa-state-audit-reconcile beta5-2-iota-daemon-escalation-family beta5-2-lambda-a2a-robustness beta5-2-mu-cron-channel-creds beta5-2-xi-misc-fixes
+add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent 1323-nudge-eligibility-recheck-twostage tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift phase2-install-tree-reconciler phase3-agent-home-contract 1201-1202-directory-marketplace-seed 1205-hook-iso-fail-open 1207-stale-supp-groups-allowlist 1208-lock-metadata-normalize 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1214-channel-validator-iso-fallback 1215-ms365-dir-mode beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers G-channel-spec-resolution F-daemon-supp-groups-mock F-daemon-supp-groups-real H-bootstrap-memory-iso-rebuild I-agent-description-roster ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers 6607-hook-admin-allowlist γ-cli-consistency δ-1234-daemon-start-policy B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir C-beta4-logger-and-spec B-beta4-setup-wizard A-beta4-iso-path-resolution D-beta4-daemon-lifecycle E-beta4-fresh-install-gate-state-dir H-beta4-iso-ownership F-beta4-oauth-bootstrap G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs K-beta4-nits Beta-beta5-session-id-detect-sudo α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-zeta-teams-mcp-dedup beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-eta-cron-iso-uid-preflight beta5-2-delta-nudge-session-empty beta5-2-theta-upgrade-backfill-perms beta5-2-nu-daemon-path-quarantine beta5-2-kappa-state-audit-reconcile beta5-2-iota-daemon-escalation-family beta5-2-lambda-a2a-robustness beta5-2-mu-cron-channel-creds beta5-2-xi-misc-fixes 1359-cron-create-iso-staging 1354-setup-teams-fd-password 1360-onboarding-next-actions-persona 1353-setup-pending-grace 1355-1356-ms365-wizard 1357-iso-boundary-quickref
 
 
 }
@@ -198,6 +198,19 @@ select_for_path() {
       # it anyway, but this explicit pre-case keeps the smoke gate
       # consistent if the trigger ever flips into the docs path.
       add_required I-agent-description-roster
+      ;;
+    CLAUDE.md)
+      # v0.15.0-beta5-2 Lane E (#1357): the project-root CLAUDE.md carries
+      # the long-form "Agent's own POV: what blocks where + workaround"
+      # sub-section that the `agb agent show` iso_boundary_quickref:
+      # block mirrors in compressed form. The contract spans docs + code
+      # — pull the 1357 smoke when either side moves so the table header,
+      # the verbatim 'body_file direct read' row name, and the parent
+      # header anchor stay in lockstep. The file is .md, so the
+      # is_docs_only_path early-return below would otherwise select only
+      # the global required smokes; this pre-case lifts it ahead of the
+      # short-circuit.
+      add_required 1357-iso-boundary-quickref
       ;;
   esac
 
@@ -375,6 +388,16 @@ select_for_path() {
       # every bridge-setup.py / bridge-setup.sh / wizard move so a
       # future refactor cannot silently regress the audit family.
       add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership
+      # Issue #1354 (v0.15.0-beta5-2 Track B): bridge-setup.py's
+      # `read_secret_value` ingests `--app-password-file` / `--client-secret-file`
+      # via try-open-and-read so `/dev/fd/N` (Bash process substitution
+      # `<(...)`), named pipes, and character/socket specials work. Also
+      # adds `--app-password-stdin` / `--client-secret-stdin` first-class
+      # flags. Pull 1354-setup-teams-fd-password on every bridge-setup.py
+      # / bridge-setup.sh / wizard move so a future PR cannot silently
+      # re-introduce the `Path.is_file()` gate that broke the documented
+      # process-substitution shape in the patch reproducer.
+      add_required 1354-setup-teams-fd-password
       # v0.15.0-beta5-2 Lane κ (#1319 H1): bridge-status.py's `state`
       # column width must accommodate the new `picker_blocked` value
       # (14 chars). Pull beta5-2-kappa-state-audit-reconcile on every
@@ -391,7 +414,33 @@ select_for_path() {
       # presence of the call in each handler. Pull on every
       # bridge-setup.py move so a future PR cannot silently drop the
       # post-write hook from any single handler.
+      add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership beta5-2-mu-cron-channel-creds 1354-setup-teams-fd-password
       add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership beta5-2-mu-cron-channel-creds
+      # Issue #1353 (v0.15.0-beta5-2 Track A): bridge-setup.sh's
+      # `run_discord` / `run_telegram` / `run_teams` / `run_ms365`
+      # each touch the setup-pending grace marker on entry (extends
+      # grace) and clear it on completion (marks setup as done). The
+      # 1353-setup-pending-grace smoke registers >=4 mark/clear sites
+      # in bridge-setup.sh — pull on every bridge-setup.sh move so a
+      # future refactor cannot drop one of the four verbs from the
+      # mark/clear contract.
+      add_required 1353-setup-pending-grace
+      # Issues #1355 + #1356 (v0.15.0-beta5-2 followup): bridge-setup.py's
+      # cmd_ms365 now (a) falls back to MS365_CONVENTION_DEFAULT_SCOPES
+      # when no --default-scopes flag/existing value is present (#1355
+      # protocol-convention default), surfacing the choice via
+      # `default_scopes_source: convention-default|flag|existing`; and
+      # (b) probes the Entra app registration's `web.redirectUris` via
+      # Microsoft Graph before writing `.ms365/.env`, fail-loud aborting
+      # on a verified non-match (#1356 root) and gracefully annotating
+      # `redirect_uri_check: skipped` for missing-creds / 403 /
+      # unreachable / --skip-entra-probe paths. lib/bridge-setup-wizard.sh
+      # removed `default-scopes` from `_BRIDGE_SETUP_WIZARD_REQUIRED_MS365`
+      # to match (#1355). Pull on every bridge-setup.py /
+      # bridge-setup.sh / lib/bridge-setup-wizard.sh move so the
+      # convention-default constant + probe wiring + required-fields
+      # list cannot silently regress.
+      add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode 1355-1356-ms365-wizard G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership beta5-2-mu-cron-channel-creds
       add_integration integration-minimal
       ;;
 
@@ -445,7 +494,22 @@ select_for_path() {
       # beta5-2-xi-misc-fixes on every teams/server.ts touch so the
       # startup-warning guard cannot silently come back as a silent
       # skip.
-      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
+      # Issue #1354 R2 (codex r1 SHOULD-FIX): the teams/ms365 plugin
+      # servers consume the credentials that the setup wizard plants in
+      # `.teams/.env` / `.ms365/.env`. A future change to either server
+      # that loosens credential parsing could mask a regression in the
+      # wizard's FD/stdin ingestion path (#1354). Pull
+      # 1354-setup-teams-fd-password on every plugins/teams/server.ts or
+      # plugins/ms365/server.ts touch so the wizard's secret-ingestion
+      # contract stays exercised end-to-end.
+      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes 1354-setup-teams-fd-password
+      # Issues #1355 + #1356 (v0.15.0-beta5-2 followup): plugins/ms365/server.ts
+      # is not directly touched, but the convention-default scope set
+      # in bridge-setup.py is the value persisted to MS365_DEFAULT_SCOPES
+      # which server.ts reads at boot. A future patch that re-shapes the
+      # plugin's DEFAULT_SCOPES baseline must also re-check the wizard's
+      # convention default (cross-validated by 1355-1356-ms365-wizard T1).
+      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode 1355-1356-ms365-wizard beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
       add_integration integration-minimal
       ;;
 
@@ -717,7 +781,7 @@ select_for_path() {
       # future refactor cannot silently re-introduce the codex r1
       # BLOCKING repro (claimed task + picker_blocked agent + aged
       # session_activity_ts → wrongly requeued tasks).
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging
       # v0.15.0-beta5-2 Lane η (#1314, CRITICAL/security):
       # bridge-daemon.sh's `cmd_run_cron_worker` now gates shell-cron
       # dispatch on `bridge_cron_uid_drop_preflight`. The new gate emits
@@ -729,7 +793,7 @@ select_for_path() {
       # move so the gate (including the CRON_PAYLOAD_KIND=="shell" scope,
       # the audit-row name, and the refusal-side state propagation) cannot
       # regress silently.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-eta-cron-iso-uid-preflight
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging
       # v0.15.0-beta5-2 Lane δ (#1311): bridge-daemon.sh's nudge
       # fanout loop (inside `cmd_sync_cycle`) used to silently drop
       # any candidate row whose `$session` was empty or whose tmux
@@ -749,7 +813,7 @@ select_for_path() {
       # soft-skip pattern, drop the per-task counter isolation, or
       # regress the recovery-clears-counter contract that long-lived
       # healthy agents depend on.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-delta-nudge-session-empty
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-delta-nudge-session-empty 1359-cron-create-iso-staging
       # v0.15.0-beta5-2 Lane ν (#1317 A/B/C + #1333 L3): the daemon's
       # always-on auto-start engine pre-flight + bridge-state.sh's
       # broken-launch writer (now with reason_hint payload) + the
@@ -815,7 +879,21 @@ select_for_path() {
       # anchor-write contract, and the conflict-bail behaviour. Pull
       # on every move of these files so the gates cannot regress
       # silently.
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-mu-cron-channel-creds 1359-cron-create-iso-staging
       add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-mu-cron-channel-creds
+      # Issue #1353 (v0.15.0-beta5-2 Track A): bridge-daemon.sh's
+      # `bridge_daemon_check_channel_status_or_hold` + `bridge_report_
+      # channel_health_miss` now consult `bridge_agent_setup_pending_
+      # active` (defined in lib/bridge-state.sh) and silent-skip the
+      # backoff / audit-row paths when the setup-pending marker is
+      # present within the grace window. The 1353-setup-pending-grace
+      # smoke pins both gate call sites + the marker contract (mark,
+      # active, clear) + the teeth-revert under
+      # BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS=0. Pull on every
+      # bridge-daemon.sh / lib/bridge-state.sh move so a future PR
+      # cannot regress back to the pre-#1353 4-burst noise surface
+      # that masks real errors during fresh-install OOTB.
+      add_required 1353-setup-pending-grace
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -871,7 +949,12 @@ select_for_path() {
       # flight uses to scope shell-cron refusals. Pull the same regression
       # smokes as bridge-cron-runner.py so a refactor of these helpers
       # cannot silently regress the dispatch contract.
-      add_required cron-run-artifacts-retention cron-shell-runner beta5-2-eta-cron-iso-uid-preflight queue
+      # Issue #1359 (v0.15.0-beta5-2 Track H): lib/cron-helpers/staging.py
+      # is the new tactical iso-staging entry point; pin its smoke on
+      # every helper-tree move so a future heredoc-extraction refactor
+      # cannot silently regress the staging apply / actor_agent /
+      # owner-UID validation contract.
+      add_required cron-run-artifacts-retention cron-shell-runner beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging queue
       add_integration integration-minimal
       ;;
 
@@ -903,7 +986,12 @@ select_for_path() {
       # so a future PR cannot silently downgrade the RuntimeError to a
       # warning (which would re-open the iso v2 controller-UID
       # fallthrough class).
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight
+      # Issue #1359 (v0.15.0-beta5-2 Track H): bridge-cron.py is the
+      # apply-side subprocess invoked by `lib/cron-helpers/staging.py
+      # apply` — moving native-create's argv shape silently regresses
+      # the iso staging delegation. Pin 1359-cron-create-iso-staging
+      # alongside the canonical cron-mutation-audit smoke.
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging
       add_integration integration-minimal
       ;;
 
@@ -1035,7 +1123,7 @@ select_for_path() {
       # silently drift the dispatch shape (e.g. by passing `--reason
       # install` instead of `--reason manual`, which would bypass the
       # parity guard).
-add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1028-isolated-workdir-check 1118-v2-engine-binary-path v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning 1115-cli-usage-drift 1151-step-a-helper 1155-bootstrap-skill-guard 1158-marker-load-order 1165-track-a-scaffold-modes 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved I-agent-description-roster γ-cli-consistency C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir K-beta4-nits α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-epsilon-tmux-inject-busy beta5-2-theta-upgrade-backfill-perms
+add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1028-isolated-workdir-check 1118-v2-engine-binary-path v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning 1115-cli-usage-drift 1151-step-a-helper 1155-bootstrap-skill-guard 1158-marker-load-order 1165-track-a-scaffold-modes 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved I-agent-description-roster γ-cli-consistency C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir K-beta4-nits α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-epsilon-tmux-inject-busy beta5-2-theta-upgrade-backfill-perms 1360-onboarding-next-actions-persona
       # v0.15.0-beta5-2 Lane ν (#1317-B/-C): bridge-agent.sh now hosts
       # the engine-CLI pre-flight at `agent create` (refuses with
       # actionable error when the engine binary is not on PATH; opt-out
@@ -1061,7 +1149,36 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # beta5-2-xi-misc-fixes whenever either bridge-start.sh or
       # bridge-run.sh moves so the env-prefix inline and the warn-order
       # alignment cannot silently regress.
+      # Issue #1360 (v0.15.0-beta5-2 Track I): bridge-agent.sh's `agent
+      # show` data pipeline now synthesizes a `.next_actions` array (refs
+      # bridge-agent.sh:2041-2045 + lib/bridge-agents.sh
+      # bridge_agent_next_actions_tsv/_text/_json) and `agent create`'s
+      # `next_steps:` block is now persona-aware
+      # (bridge_create_next_steps_lines). Pull
+      # 1360-onboarding-next-actions-persona on every bridge-agent.sh
+      # move so the credentials-missing/unreadable wizard mapping, the
+      # terminal-only attach + memory init checklist, and the iso v2
+      # plugin seed + note advisory cannot silently regress (codex r1
+      # PR #1364 BLOCKING 1/2/3).
+add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1028-isolated-workdir-check 1118-v2-engine-binary-path v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning 1115-cli-usage-drift 1151-step-a-helper 1155-bootstrap-skill-guard 1158-marker-load-order 1165-track-a-scaffold-modes 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved I-agent-description-roster γ-cli-consistency C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir K-beta4-nits α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-epsilon-tmux-inject-busy beta5-2-theta-upgrade-backfill-perms beta5-2-xi-misc-fixes 1360-onboarding-next-actions-persona
+      # v0.15.0-beta5-2 Lane E (#1357): bridge-agent.sh::run_show appends
+      # an `iso_boundary_quickref:` block when
+      # bridge_agent_linux_user_isolation_effective <agent> returns 0 so
+      # the agent (or operator inspecting it) sees the same paper-cut
+      # mapping the CLAUDE.md "Agent's own POV" table documents. Pull
+      # 1357-iso-boundary-quickref on every bridge-agent.sh move so a
+      # future refactor cannot silently drop either the call site or its
+      # iso-effective gate.
+      add_required 1357-iso-boundary-quickref
 add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1028-isolated-workdir-check 1118-v2-engine-binary-path v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning 1115-cli-usage-drift 1151-step-a-helper 1155-bootstrap-skill-guard 1158-marker-load-order 1165-track-a-scaffold-modes 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved I-agent-description-roster γ-cli-consistency C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir K-beta4-nits α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-epsilon-tmux-inject-busy beta5-2-theta-upgrade-backfill-perms beta5-2-xi-misc-fixes
+      # Issue #1353 (v0.15.0-beta5-2 Track A): bridge-agent.sh's
+      # `run_create` writes the setup-pending marker for any
+      # channel-required always-on agent; bridge-start.sh clears the
+      # marker on operator-driven start. The 1353 smoke confirms the
+      # mark site in bridge-agent.sh and the clear site in
+      # bridge-start.sh — pull on every move of either so a refactor
+      # cannot drop the create-side mark or the start-side clear.
+      add_required 1353-setup-pending-grace
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -1354,7 +1471,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # so a future refactor cannot silently regress the --check arm
       # back to the pre-#1298 silent-skip shape.
       add_required beta5-2-kappa-state-audit-reconcile
-      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup phase2-install-tree-reconciler phase3-agent-home-contract 1207-stale-supp-groups-allowlist A-beta4-iso-path-resolution H-beta4-iso-ownership G-beta4-watchdog-noise J-beta4-workflow-docs α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds
+      # Issue #1359 (Track H): lib/bridge-isolation-v2.sh now emits the
+      # `state-cron-staging` matrix row (mode 2770 group=ab-shared) that
+      # gives every iso UID group-write access to the new staging dir.
+      # Pull 1359-cron-create-iso-staging on every isolation-lib move so
+      # a row-reordering or scope-gate change cannot silently regress the
+      # iso staging delegation contract.
+      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup phase2-install-tree-reconciler phase3-agent-home-contract 1207-stale-supp-groups-allowlist A-beta4-iso-path-resolution H-beta4-iso-ownership G-beta4-watchdog-noise J-beta4-workflow-docs α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms 1359-cron-create-iso-staging
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -1963,6 +2086,28 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_integration integration-minimal
       ;;
 
+    lib/agent-cli-helpers/show-format-json.py|lib/agent-cli-helpers/next-actions-tsv-to-json.py)
+      # Issue #1360 (v0.15.0-beta5-2 Track I): show-format-json.py is the
+      # `agent show --json` envelope assembler that now reads a 6th
+      # file-as-argv input (`next-actions.json`) emitted by the
+      # standalone next-actions-tsv-to-json.py helper. Both helpers
+      # constitute the show-data pipeline downstream of
+      # bridge_agent_next_actions_tsv. Pull the regression smoke
+      # whenever either helper moves so the envelope shape
+      # (.next_actions list of {run, reason, placeholder_safe: bool})
+      # and the TSV→JSON boolean encoding cannot silently regress.
+      #
+      # v0.15.0-beta5-2 Lane E (#1357): show-format-json.py was also
+      # extended with the iso_boundary_quickref payload (null for
+      # shared-mode agents, list of rows for iso v2 effective agents).
+      # Pull 1357-iso-boundary-quickref whenever the helper moves so a
+      # future PR cannot silently regress the argv contract (5 args →
+      # 6 args → 7 args) or drop the null/list dichotomy that downstream
+      # consumers depend on.
+      add_required 1360-onboarding-next-actions-persona 1357-iso-boundary-quickref
+      add_integration integration-minimal
+      ;;
+
     lib/bridge-agent-layout.sh|lib/bridge-engine-descriptor.sh|scripts/daily-note-reconcile.py)
       # Issue #1060: the typed agent-layout resolver + minimal engine
       # descriptor + the D4 memory-tooling default. All three feed the
@@ -1988,7 +2133,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # remove-webhook-server now catches PermissionError/OSError quietly
       # so `agent create --isolate` no longer dumps a traceback. Cover the
       # channel-plugins regression smoke whenever the channel modules move.
-      add_required channel-plugins channel-env-readiness
+      # Issue #1354 R2 (codex r1 SHOULD-FIX): the channel module path
+      # owns `.<channel>/.env` write/read semantics that the setup
+      # wizard's FD/stdin secret ingestion (#1354) plants secrets into.
+      # Pull 1354-setup-teams-fd-password on every bridge-channels move
+      # so a future channel-side refactor cannot silently regress the
+      # wizard-to-channel credential contract.
+      add_required channel-plugins channel-env-readiness 1354-setup-teams-fd-password
       add_integration integration-minimal
       ;;
 
