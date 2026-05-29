@@ -6,6 +6,72 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.0-beta5-3] — 2026-05-29
+
+### Highlight — beta5-2 OOTB-followup wave (12 lanes A–M, ~13 issues) + #1370 regression + CI housekeeping
+
+patch's beta5-2 fresh-install + cosmax-channel bring-up surfaced an OOTB regression/UX-gap backlog (6 issues + 1 comment), then 2 more lanes folded in (cron-iso #1359, onboarding meta #1360), plus a beta5-2 #1316 regression (#1370) caught on the operator's macOS shared-admin host. wave-orchestration: parallel fixer dispatch off `feat/wave-beta5-2-followup-integration`, per-lane codex pair-review (r1→r6 chains on the security lane), integration-branch burn-in, then this release cut. cross-bridge: #1370's fix originated as cross-fork PR #1371 from `patch@hoon-mac`, independently verified (workflow 4-lens + codex pair, teeth proven) and absorbed as Track J with the required smoke update. A second sub-wave then folded in three more out-of-scope issues the operator flagged — shared-mode codex-pair PATH (#1352, Track K), iso-v2 state-marker (#1342, Track L), and MS365 refresh-token resilience (#1343, Track M) — the last hardened through two read-only adversarial secret-leak sweeps on top of codex pair-review (key-name redaction alone missed a `_raw` free-text envelope + the auth-code-path twin sink + the top-level OAuth `error` field). `-beta5-3` prerelease, tag `v0.15.0-beta5-3`, GitHub **Pre-release**.
+
+Lane → PR map: A #1366 / B #1363 / CD #1365 / E #1362 / F #1368 / G #1369 / H #1361 / I #1364 / J #1372 / K #1377 / L #1376 / M #1375 / housekeeping #1373.
+
+### Fixed — Track A: setup-pending grace window (#1353, PR #1366)
+
+`agent create --isolate --channels … always_on=yes` no longer floods the daemon log with 4× channel-validator-miss auto-start backoff before the operator runs `setup`. A `state/agents/<a>/setup-pending` marker (grace `BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS`, default 900s) makes the daemon silently skip pre-setup validator misses; the setup verbs clear it. Tactical scope — `awaiting_channel_setup` state machine is the follow-up root. Dry-run no longer leaks the marker; iso-v2 marker-write failure hard-fails (no noncanonical fallback).
+
+### Fixed — Track B: setup teams FD-aware `--app-password-file` (#1354, PR #1363)
+
+`setup teams --app-password-file <(…)` process-substitution path (`/dev/fd/63`) now reads via try-open-and-read instead of a stat-gate; added first-class `--app-password-stdin` / `--client-secret-stdin` (mutually exclusive with the `--*-file` flag). Single-trailing-newline strip preserved (handler-level greedy `.strip()` removed). Error message names the process-substitution + tempfile/stdin alternatives.
+
+### Fixed — Track CD: ms365 wizard default scopes + redirect-URI Entra probe (#1355 + #1356, PR #1365)
+
+`--yes` mode no longer requires `--default-scopes` — the Graph minimal convention set (Mail.Read/Mail.Send/Calendars.ReadWrite/offline_access) is the documented default with `default_scopes_source: convention-default` in output; explicit empty `--default-scopes ""` is a fail-loud error (argparse `default=None` sentinel), not a silent fallback to broad scopes. redirect-URI is probed against the Entra app registration via Graph (fail-loud if unregistered, audited skip on insufficient app permission). Verbatim URI compare (no query/fragment stripping).
+
+### Fixed — Track E: iso v2 boundary docs + `agent show` quickref (#1357, PR #1362) — docs
+
+CLAUDE.md "Working with isolated agents (iso v2)" gains an agent's-own-POV table (what blocks where + the CLI-verb workaround), and `agb agent show` (iso-effective agents only) emits an `iso_boundary_quickref` section (text + `--json` list). Generic `<controller-user>` placeholder, no host-specific account names.
+
+### Fixed — Track F: admin credential-routine carve-out + audit token-leak class closure (#1358, PR #1368) — SECURITY
+
+Admin agents can run the rotation routine `bash bridge-auth.sh claude-token add --stdin` (strict-prefix carve-out, env+roster admin agreement required) without the OAuth-credential tool-policy guard blocking it. Six review rounds closed the entire credential-text audit-leak class with a two-layer defense: a Layer-1 SSOT choke-point (`bridge_hook_common.write_audit` recursively redacts every audit `detail`, so all current/future writers inherit it) + Layer-2 at-source redaction in the tool-policy writers, the `permission_escalation` deny `reason` (→ audit + `[PERMISSION]` queue task body), and the `system_config_mutation` non-Bash operation. Redactor is idempotent (negative-lookahead, no `<REDACTED><REDACTED>` compounding). Root sealed-paste path → follow-up #1367.
+
+### Fixed — Track G: nudge eligibility 2-stage recheck + audit surface (#1323, PR #1369)
+
+`nudge appears dropped` false-positive rate cut: eligibility recheck is now a 2-stage check (stage 1 at 2s, stage 2 at 5s total — not 2+5) before the drop verdict; silent skip now emits an audit row + `agb status` counter (operator surface). Real rapid-succession dedup race covered (T4 sources the actual `bridge_daemon_should_skip_nudge` / `record_nudge` path).
+
+### Fixed — Track H: agb cron create iso-agent staging delegation (#1359, PR #1361)
+
+iso v2 agents can `agb cron create` without the controller-owned `jobs.json` `PermissionError` (no more system-crontab workaround + bridge-native double-fire race). iso UID stages the mutation to `state/cron-staging/<uuid>.json` (mode 660 ab-shared); the daemon applies it under controller privilege + writes a result file. Per-agent ownership isolation enforced controller-side (actor must match filename + caller uid). Stale-staging swept before apply; malformed actor_uid rejected (no crash); cross-agent mutation rejected for all kinds. Tactical — daemon-IPC socket is the follow-up root.
+
+### Fixed — Track I: persona-based onboarding runbooks + agent next-actions (#1360, PR #1364)
+
+`docs/onboarding/{first-install,create-static-agent,plugin-enabled-agent,troubleshooting-auth-and-channels}.md` give first-installer / static-agent-creator / plugin-agent personas a short action-oriented route. `agb agent show` gains a `next_actions` section (missing channel creds → setup, missing plugin seed, broken session → dry-run); `agent create` completion is engine/channel/isolation-persona-aware. CLAUDE.md scoped back to the contributor contract. No site-specific secrets in public docs.
+
+### Fixed — Track J: shared-mode agents fall through to HOME for session detect (#1370, PR #1372) — beta5-2 #1316 regression
+
+`bridge_resolve_agent_claude_config_dir` now gates on `bridge_agent_linux_user_isolation_effective`: shared-mode agents (incl. admin) and every agent on non-Linux hosts fall through to empty so `--continue` session-id detect uses the controller HOME `~/.claude` (the #1073 design intent). beta5-2 Lane θ #1316 (.claude dir-tree normalize) had scaffolded an empty `<agent-home>/.claude` that passed the `-d` guard, sending detect to an empty tree → empty session-id → `bridge-start.sh` `set -e` silent exit → admin always-on auto-restart failure. The stale `1015-resume-claude-config-dir` smoke T7/T8 was re-modeled iso-effective with shared-mode negative controls. Originally authored by patch@hoon-mac (cross-fork PR #1371), absorbed here with the required smoke update.
+
+### Fixed — Track K: shared-mode codex pair PATH — daemon engine resolver (#1352, PR #1377)
+
+Auto-provisioned shared-mode codex pairs (e.g. `<admin>-dev`) on nvm/pyenv/volta/asdf user-local Node no longer die `codex: command not found` (exit 127 → circuit-breaker → escalation flood). Root: beta5-2's `bridge_augment_engine_path` resolver gated its nvm branch entirely on `$NVM_DIR` (never exported by a systemd-user non-login daemon) with no `$HOME/.nvm` fallback. Fix unifies the shared launch codepath (`bridge-run.sh`) with the resolver, derives the nvm root from `$NVM_DIR` OR `$HOME/.nvm`, adds a volta branch, and selects the version bin dir semver-aware (`sort -V`) AND engine-presence-verified (`bridge_dir_has_engine_cli`: default-if-engine → highest-semver-with-engine → graceful no-op) so a multi-version install never prepends a stale or engine-less dir. iso sudo-wrap PATH unchanged.
+
+### Fixed — Track L: write_agent_state_marker A0-derive + Path B best-effort (#1342, PR #1376)
+
+iso v2 agent stop no longer logs `ensure_matrix_path failed … marker=idle-since` on every stop. The Stop hook runs inside the iso UID but both fast paths gated on the roster-resolved `os_user`; when empty/indeterminate (#1048) they fell through to a Path B chown the iso UID cannot do. `bridge_isolation_v2_write_agent_state_marker` now derives the expected iso UID from the agent name (matching `matrix_rows_for_agent` / the Track J fallback) when the roster lookup is empty, and Path B distinguishes privileged genuine-drift (hard-fail, preserved) from unprivileged best-effort (idle marker is best-effort: direct write + chmod stay authoritative). #1165 Gap 6 completion; Track A/J in `bridge-state.sh` untouched (different file).
+
+### Fixed — Track M: MS365 refresh_token resilient auto-refresh (#1343, PR #1375) — SECURITY
+
+MS365 OAuth no longer outages ~1h after setup. Auto-refresh was partially wired; the real causes were its failure modes: a concurrent-refresh race clobbered the rotating refresh_token, transient and permanent failures were indistinguishable, and there was zero audit. Fix adds per-UPN single-flight, transient/permanent classification (keep-and-retry on transient; `token_expired` marker + actionable re-auth on permanent), and redacted `ms365_token_refreshed`/`ms365_refresh_failed` audit. The redaction was hardened beyond codex pair-review through two read-only adversarial sweeps: a deep `redactResponseBody` (key-layer + value-shape `scrubSecretShapedText`) is the single choke-point from any response/resource body to any sink (audit + thrown + pair_poll textResult + status marker + graph helper); the `_raw` non-JSON envelope is summarized to `{_raw_len,_raw_sha256}`; the top-level OAuth `error` field is scrubbed everywhere `error_description` is. Live token persistence stays verbatim (no over-redaction); honest OAuth codes / AADSTS / GUID / state / nonce round-trip. TokenFile schema + `.env` vars unchanged (no Track CD drift); token files 0600.
+
+### CI housekeeping (PR #1373)
+
+bridge-daemon.sh footgun #11 ×3 (Track H staging-row/result/swept JSON parsers) extracted to `lib/cron-helpers/staging.py` `parse-row`/`parse-result`/`parse-swept` file-as-argv subcommands (output byte-identical). raw-pathlib drift resolved by `_safe_path_check` wrap + noqa (ceiling held at 0, no baseline bump). iso-helper + lint-heredoc baselines re-synced.
+
+### Known carry-over
+
+- β-1231-1236-fresh-install-seed-sudoers T5: `daemon_group_refresh_sudoers=missing` printed to stderr where the smoke expects stdout (bridge-init.sh) — inherited, beta-cycle informational, follow-up.
+- #1367 (admin sealed-paste `agb auth claude-token receive`) — Track F root, deferred.
+- #1353 root (`awaiting_channel_setup` state machine for Track A) — deferred.
+
 ## [0.15.0-beta5-2] — 2026-05-28
 
 ### Highlight — beta5-1 patch-verify wave (6 lanes ι/κ/λ/μ/ν/ξ, 28 issues) + CI housekeeping
