@@ -30,6 +30,18 @@
 #   (E) ARGV    — arguments with spaces / `;` / `$(...)` survive the
 #                 wrapper unmangled on BOTH branches (the `eval`-built
 #                 redirection that was rejected mangled these).
+#   (F) WORKER  — issue #1390: the daemon's supp-groups-refresh worker is
+#                 launched DETACHED/disowned (`( … & disown )`) so it
+#                 outlives the daemon restart it triggers. The #1389 helper
+#                 closes the fd only for its inner child, which is
+#                 INSUFFICIENT here — backgrounding the helper leaves the
+#                 waiting subshell holding the fd. The fix closes the fd
+#                 for the SUBSHELL ITSELF (`exec {var}>&-` inside `( )`).
+#                 F scans /proc (Linux) for any non-daemon process holding
+#                 the lockfile while the worker is alive: with the close
+#                 the daemon is the only holder (FIX), without it the
+#                 subshell/worker leak it (TEETH). #1389's A/B/C only
+#                 proved the synchronous tmux shape, not this leak.
 #
 # Cross-platform: fd-inheritance is detected with the portable `<&N`
 # open-test (no /proc dependency), so the deterministic fd-close logic
@@ -189,6 +201,169 @@ if command -v flock >/dev/null 2>&1 && exec {LOCK_FD2}>"$LOCK_PATH" 2>/dev/null 
   BRIDGE_DAEMON_SINGLETON_LOCK_FD=""
 else
   printf '[note] flock not available — skipping E2 (close-for-child argv branch)\n'
+fi
+
+# ---------------------------------------------------------------------------
+# (F) DETACHED WORKER LAUNCH SHAPE (issue #1390)
+#
+# The daemon's supp-groups-refresh worker is NOT launched synchronously
+# like the tmux sites (A/B/C). It is launched DETACHED inside a
+# backgrounded subshell and disowned, SPECIFICALLY so it survives the
+# daemon restart it itself triggers:
+#
+#     (
+#       if [[ "$BRIDGE_DAEMON_SINGLETON_LOCK_FD" =~ ^[0-9]+$ ]]; then
+#         exec {BRIDGE_DAEMON_SINGLETON_LOCK_FD}>&- || true
+#       fi
+#       "$bash_abs" "$daemon_script" supp-refresh-worker "$name" \
+#         >>"$worker_log" 2>&1 &
+#       disown 2>/dev/null || true
+#     ) 2>/dev/null || true
+#
+# Why NOT the #1389 helper here: `bridge_daemon_run_without_singleton_lock`
+# closes the fd only for its inner `"$@"` child. If the helper invocation
+# is the thing being `&`-backgrounded, the backgrounded SUBSHELL that hosts
+# the helper stays alive `wait`ing on the external worker and KEEPS the
+# inherited fd open the whole time — and that waiting subshell can outlive
+# the daemon (the worker restarts it) and pin the flock. So a child-only
+# close is insufficient for the detached shape. The fix closes the fd for
+# the SUBSHELL ITSELF (`exec {var}>&-`, inside the `( )`), so neither the
+# subshell nor anything it forks (the worker) holds the descriptor.
+#
+# Teeth therefore cannot just probe the worker's own fd (codex #1390
+# re-review: that false-passes while a surviving subshell still holds it).
+# Instead each variant launches an external worker that SLEEPS, then scans
+# /proc for ANY non-daemon process holding the lockfile WHILE the worker is
+# alive:
+#   (F1) FIX   — with the subshell-level close, the ONLY holder is the
+#                daemon (no subshell, no worker).
+#   (F2) TEETH — with the close REMOVED (the literal #1390 leak), at least
+#                one non-daemon process (the waiting subshell and/or the
+#                worker) holds the lockfile → a regression is caught.
+#   (F3/F4)    — the daemon (parent) keeps its own fd + flock throughout.
+#
+# Requires /proc (Linux). The live restart-cycle is a Linux-only gate
+# anyway (file header); on macOS dev hosts the mkdir-lock fallback has no
+# fd to leak, so this whole section is skipped.
+# ---------------------------------------------------------------------------
+_await_file() {
+  local path="$1" i
+  for i in $(seq 1 50); do
+    [[ -s "$path" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# Count LIVE processes that hold an open fd on $LOCK_PATH, by scanning
+# /proc/<pid>/fd symlinks. Prints the count.
+#
+# Excludes BOTH $$ (the smoke shell, the legitimate daemon stand-in that
+# holds the recorded lock fd) AND $BASHPID. $BASHPID matters because this
+# function is invoked in a `$(...)` command substitution, which forks a
+# subshell with a DIFFERENT pid that inherits the smoke shell's fd table —
+# including the lock fd — and would otherwise count ITSELF as a spurious
+# holder. (The fd close in the FIX path applies to the worker's detached
+# subshell, not to this measurement subshell.) After excluding the smoke
+# shell and the measurement subshell, any remaining holder is a genuine
+# leaked descriptor in the worker's process tree.
+_count_nondaemon_lock_holders() {
+  local n=0 piddir pid fdlink tgt
+  for piddir in /proc/[0-9]*; do
+    pid="${piddir##*/}"
+    [[ "$pid" == "$$" ]] && continue
+    [[ "$pid" == "$BASHPID" ]] && continue
+    for fdlink in "$piddir"/fd/*; do
+      tgt="$(readlink -f "$fdlink" 2>/dev/null || true)"
+      if [[ "$tgt" == "$LOCK_PATH" ]]; then
+        n=$((n + 1))
+        break
+      fi
+    done
+  done
+  printf '%s\n' "$n"
+}
+
+LOCK_FD3=""
+if [[ ! -d /proc ]]; then
+  printf '[note] /proc not present — skipping F (detached worker launch shape, #1390; Linux-only gate)\n'
+elif command -v flock >/dev/null 2>&1 && exec {LOCK_FD3}>"$LOCK_PATH" 2>/dev/null && flock -n "$LOCK_FD3" 2>/dev/null; then
+  BRIDGE_DAEMON_SINGLETON_LOCK_FD="$LOCK_FD3"
+
+  # External worker that records its pid then sleeps, so we can inspect the
+  # process tree while it (and any waiting subshell) is alive. Mirrors the
+  # real worker: an external `bash <daemon> supp-refresh-worker` process.
+  WORKER_SH="$SMOKE_DIR/worker-sleep.sh"
+  printf '#!/usr/bin/env bash\nprintf "%%s" "$$" > "%s"\nsleep 3\n' "$SMOKE_DIR/worker.pid" >"$WORKER_SH"
+  chmod +x "$WORKER_SH"
+  F_LOG="$SMOKE_DIR/worker.log"
+
+  # (F1) FIX: subshell-level close before the detached launch. While the
+  # worker is alive, the daemon must be the ONLY holder of the lockfile.
+  rm -f "$SMOKE_DIR/worker.pid" "$F_LOG"
+  (
+    if [[ "${BRIDGE_DAEMON_SINGLETON_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
+      exec {BRIDGE_DAEMON_SINGLETON_LOCK_FD}>&- || true
+    fi
+    bash "$WORKER_SH" >>"$F_LOG" 2>&1 &
+    disown 2>/dev/null || true
+  ) 2>/dev/null || true
+  if _await_file "$SMOKE_DIR/worker.pid"; then
+    holders="$(_count_nondaemon_lock_holders)"
+    if [[ "$holders" == "0" ]]; then
+      _pass "F1: detached worker launch (subshell-level close) — no non-daemon process holds the lock fd"
+    else
+      _fail "F1: detached worker launch (subshell-level close)" \
+        "$holders non-daemon process(es) hold the lock fd (expected 0 — #1390 leak via subshell/worker)"
+    fi
+  else
+    _fail "F1: detached worker launch (subshell-level close)" "worker never started (detachment broke?)"
+  fi
+  wait 2>/dev/null || true
+
+  # (F2) TEETH: the SAME detached shape WITHOUT the close. This is the
+  # literal #1390 leak — the waiting subshell (and/or the worker) inherits
+  # and holds the fd, outliving the daemon and pinning the flock. If a
+  # future refactor drops the subshell-level close, F1 flips to >0 holders
+  # and is caught; F2 proves the scan actually observes the leak.
+  rm -f "$SMOKE_DIR/worker.pid" "$F_LOG"
+  (
+    bash "$WORKER_SH" >>"$F_LOG" 2>&1 &
+    disown 2>/dev/null || true
+  ) 2>/dev/null || true
+  if _await_file "$SMOKE_DIR/worker.pid"; then
+    holders="$(_count_nondaemon_lock_holders)"
+    if (( holders > 0 )); then
+      _pass "F2: teeth — un-closed detached launch leaks the fd ($holders non-daemon holder(s); #1390 regression caught)"
+    else
+      _fail "F2: teeth — un-closed detached launch leaks the fd" \
+        "0 non-daemon holders (expected >0 — if 0 the test has no teeth)"
+    fi
+  else
+    _fail "F2: teeth — un-closed detached launch" "worker never started"
+  fi
+  wait 2>/dev/null || true
+
+  # (F3) PARENT: the daemon still holds the fd AND the flock throughout.
+  if { true; } <&"$LOCK_FD3" 2>/dev/null; then
+    _pass "F3: parent retains the singleton lock fd after the detached worker launches"
+  else
+    _fail "F3: parent retains the singleton lock fd" "parent fd $LOCK_FD3 is closed"
+  fi
+  BUSY_FD3=""
+  if exec {BUSY_FD3}>"$LOCK_PATH" 2>/dev/null; then
+    if flock -n "$BUSY_FD3" 2>/dev/null; then
+      _fail "F4: singleton guarantee intact after worker fork" "a competing flock -n succeeded — lock was released"
+    else
+      _pass "F4: singleton guarantee intact after worker fork — competing flock -n still fails"
+    fi
+    exec {BUSY_FD3}>&- 2>/dev/null || true
+  fi
+
+  eval "exec ${LOCK_FD3}>&-" 2>/dev/null || true
+  BRIDGE_DAEMON_SINGLETON_LOCK_FD=""
+else
+  printf '[note] flock not available — skipping F (detached worker launch shape, #1390)\n'
 fi
 
 # ---------------------------------------------------------------------------
