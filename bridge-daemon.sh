@@ -5797,28 +5797,98 @@ nudge_agent_session() {
   # submission, leaving the task `queued` while the daemon logs
   # session_nudge_sent. Use the queue itself as the delivery oracle: a
   # successful nudge causes the agent to claim within ~1s; if the task is
-  # still queued after $BRIDGE_NUDGE_VERIFY_GRACE_SECONDS (default 2s), flip
-  # the audit row to session_nudge_dropped and return non-zero so the next
-  # idle-nudge tick (post-cooldown) retries instead of leaving a stale
-  # success on the audit log. We do NOT retry inline — a tight loop on a
-  # sticky tmux race wastes ticks. Skip when we have no task_id to verify.
-  local nudge_grace_seconds="${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS:-2}"
+  # still queued after the verify grace, flip the audit row to
+  # session_nudge_dropped and return non-zero so the next idle-nudge tick
+  # (post-cooldown) retries instead of leaving a stale success on the audit
+  # log. We do NOT retry inline — a tight loop on a sticky tmux race wastes
+  # ticks. Skip when we have no task_id to verify.
+  #
+  # Issue #1323 (v0.15.0-beta5-2 Track G follow-up, comment 2026-05-28):
+  # operator measured 4 "appears dropped (after 2s)" events on a fresh
+  # install where every one was a false positive — the next idle-nudge tick
+  # successfully picked up the same task without further intervention. The
+  # 2s threshold was too tight for real claude REPL prompt-buffer +
+  # system-reminder hook latency. Fix: two-stage check.
+  #
+  # r2 (codex r1 BLOCKING 1): stage 2 is a TOTAL elapsed-time gate from
+  # the start of the verify window, NOT an additional sleep on top of
+  # stage 1. After the stage-1 grace, if the task is STILL queued, sleep
+  # the REMAINDER (max(stage_2_total - stage_1, 0)) and re-poll. Only
+  # emit session_nudge_dropped if the SECOND check still observes
+  # status=queued. This converts the common "claude was just slow to
+  # ack" race into a no-op on stage 2 (covered by smoke T2) with a
+  # total wait of stage_2_total seconds (default 5s), NOT
+  # stage_1 + stage_2_total (which would have been 7s under r1's
+  # mis-implementation).
+  #
+  # Env knobs (r2-renamed):
+  #   BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS  default 2 (stage-1 sleep)
+  #   BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS  default 5 (TOTAL elapsed
+  #                                          window from the start of
+  #                                          the verify; not an
+  #                                          additional sleep)
+  #
+  # Setting BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS to a value <=
+  # BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS (canonical: 0) disables stage 2
+  # — the legacy #331 single-stage queued-after-grace contract.
+  #
+  # Backward compat: the pre-r2 env names BRIDGE_NUDGE_VERIFY_GRACE_SECONDS
+  # and BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2 are honored as fallbacks
+  # so smoke harnesses written against r1 keep working. The legacy STAGE2
+  # value was an ADDITIONAL sleep; when the new STAGE_2_SECONDS knob is
+  # unset, we synthesise stage_2_total = stage_1 + legacy_stage2 so the
+  # old "STAGE2=0 disables stage 2" semantic also survives.
+  local nudge_grace_seconds="${BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS:-${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS:-2}}"
+  [[ "$nudge_grace_seconds" =~ ^[0-9]+$ ]] || nudge_grace_seconds=2
+  local nudge_grace_stage2_total
+  if [[ -n "${BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS:-}" ]]; then
+    nudge_grace_stage2_total="${BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS}"
+    [[ "$nudge_grace_stage2_total" =~ ^[0-9]+$ ]] || nudge_grace_stage2_total=5
+  elif [[ -n "${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2:-}" ]]; then
+    # Legacy r1 var = ADDITIONAL stage-2 sleep. Convert to TOTAL.
+    local _legacy_stage2_add="${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2}"
+    [[ "$_legacy_stage2_add" =~ ^[0-9]+$ ]] || _legacy_stage2_add=5
+    nudge_grace_stage2_total=$(( nudge_grace_seconds + _legacy_stage2_add ))
+  else
+    nudge_grace_stage2_total=5
+  fi
   local post_status=""
+  local nudge_stage2_used=0
   if [[ -n "$task_id" ]]; then
-    if [[ "$nudge_grace_seconds" =~ ^[0-9]+$ ]] && (( nudge_grace_seconds > 0 )); then
+    if (( nudge_grace_seconds > 0 )); then
       sleep "$nudge_grace_seconds"
     fi
     post_status="$(bridge_queue_task_status "$task_id" 2>/dev/null || true)"
+    # Stage 2 is enabled when the TOTAL window strictly exceeds the
+    # stage-1 window — i.e. there is still time left to wait.
+    if [[ "$post_status" == "queued" ]] && (( nudge_grace_stage2_total > nudge_grace_seconds )); then
+      # Stage 2 recheck — give the agent the remainder of the
+      # stage_2_total window before we call the nudge dropped. This is
+      # the false-positive-suppression bit.
+      nudge_stage2_used=1
+      local _stage2_remainder=$(( nudge_grace_stage2_total - nudge_grace_seconds ))
+      sleep "$_stage2_remainder"
+      post_status="$(bridge_queue_task_status "$task_id" 2>/dev/null || true)"
+    fi
     if [[ "$post_status" == "queued" ]]; then
+      local _total_wait_seconds
+      if (( nudge_stage2_used == 1 )); then
+        _total_wait_seconds=$nudge_grace_stage2_total
+      else
+        _total_wait_seconds=$nudge_grace_seconds
+      fi
       bridge_audit_log daemon session_nudge_dropped "$agent" \
         --detail task_id="$task_id" \
         --detail reason=submit_lost_post_grace \
         --detail grace_seconds="$nudge_grace_seconds" \
+        --detail grace_stage2_total_seconds="$nudge_grace_stage2_total" \
+        --detail grace_total_seconds="$_total_wait_seconds" \
+        --detail stage2_used="$nudge_stage2_used" \
         --detail queued="$live_queued" \
         --detail claimed="$live_claimed" \
         --detail idle_seconds="$idle" \
         --detail title="$title"
-      daemon_info "nudge to ${agent} appears dropped (task #${task_id} still queued after ${nudge_grace_seconds}s); will retry on next idle-nudge tick"
+      daemon_info "nudge to ${agent} appears dropped (task #${task_id} still queued after ${_total_wait_seconds}s, stage1=${nudge_grace_seconds}s stage2_total=${nudge_grace_stage2_total}s); will retry on next idle-nudge tick"
       return 1
     fi
   fi
