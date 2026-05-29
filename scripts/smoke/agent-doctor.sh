@@ -40,6 +40,23 @@ trap cleanup EXIT
 
 smoke_setup_bridge_home "agent-doctor"
 
+# Issue #1317-C (beta5-2 Lane ν): `agent create` (which the doctor's
+# 7-step CRUD self-check drives via child invocations) now pre-flights
+# the engine CLI with `command -v <engine>` and refuses if neither
+# claude nor codex resolves on PATH. CI runners and clean test hosts do
+# not ship the engine npm packages, so seed executable stubs and prepend
+# them to PATH — mirroring an operator with the engine installed, which
+# is the precondition the doctor fixture assumes. Without this the
+# create step dies ("engine CLI 'codex' not found on PATH") and every
+# downstream step fails ("not present in the local roster").
+STUB_ENGINE_DIR="$SMOKE_TMP_ROOT/stub-engine-bin"
+mkdir -p "$STUB_ENGINE_DIR"
+for _eng in claude codex; do
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$STUB_ENGINE_DIR/$_eng"
+  chmod +x "$STUB_ENGINE_DIR/$_eng"
+done
+export PATH="$STUB_ENGINE_DIR:$PATH"
+
 # Force v2 layout for the doctor smoke — release/v0.8.0 refuses legacy
 # layout. We seed BRIDGE_DATA_ROOT inside the temp BRIDGE_HOME so all
 # v2 paths land in the isolated tree.

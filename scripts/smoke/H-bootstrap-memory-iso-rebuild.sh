@@ -457,10 +457,15 @@ if t8_should_run; then
     # failure shape (rm: Permission denied on $home/memory/
     # index.sqlite.rebuilding-...). The probe asserts the fixture
     # really exhibits the bug we are fixing.
-    if rm -f "$STALE_TMP" 2>/dev/null && [[ ! -e "$STALE_TMP" ]]; then
+    if rm -f "$STALE_TMP" 2>/dev/null && ! sudo -n test -e "$STALE_TMP"; then
       smoke_fail "T8.b controller direct rm succeeded — fixture is NOT iso-owned"
     fi
-    [[ -e "$STALE_TMP" ]] \
+    # Existence must be confirmed with root (`sudo -n test -e`), NOT a
+    # controller-side `[[ -e ]]`: the file lives inside a 2770 iso-owned
+    # `memory/` dir the controller has no group membership in, so a
+    # controller `[[ -e ]]` returns false on a file that genuinely exists
+    # (the same boundary T8.a just proved) — a false "disappeared".
+    sudo -n test -e "$STALE_TMP" \
       || smoke_fail "T8.b stale tmp disappeared between fixture create and assert"
     smoke_log "ok: T8.b controller direct rm fails (pre-fix shape reproduced)"
 
@@ -470,7 +475,10 @@ if t8_should_run; then
     if ! sudo -n -u "$ISO_USER" bash -c "rm -f '$STALE_TMP'"; then
       smoke_fail "T8.c sudo-as-iso rm rc=$? — post-fix path is broken on this host"
     fi
-    [[ ! -e "$STALE_TMP" ]] \
+    # Confirm removal with root, NOT controller-side `[[ ! -e ]]`: the
+    # controller cannot stat into the 2770 iso dir, so `[[ ! -e ]]` would
+    # report "removed" even if the unlink had failed (false pass).
+    ! sudo -n test -e "$STALE_TMP" \
       || smoke_fail "T8.c sudo-as-iso rm reported success but file remains"
     smoke_log "ok: T8.c sudo-as-iso rm succeeds (post-fix path works)"
   fi

@@ -21,11 +21,15 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib.sh"
 
 HANDOFFD_PID=""
+REVIEWER_SESSION=""
 
 cleanup() {
   if [[ -n "$HANDOFFD_PID" ]]; then
     kill "$HANDOFFD_PID" >/dev/null 2>&1 || true
     wait "$HANDOFFD_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$REVIEWER_SESSION" ]]; then
+    tmux kill-session -t "=${REVIEWER_SESSION}" >/dev/null 2>&1 || true
   fi
   smoke_cleanup_temp_root
 }
@@ -33,6 +37,11 @@ trap cleanup EXIT
 
 A2A_PORT=""
 A2A_SECRET="smoke-shared-secret-do-not-use-in-prod-0123456789"
+# Unique tmux session name for the 'reviewer' fixture so a pre-existing
+# session on the host can neither mask our setup nor be killed by cleanup.
+# The same value is written into the roster (BRIDGE_AGENT_SESSION[reviewer])
+# so bridge_agent_is_active resolves it.
+REVIEWER_SESSION_NAME="a2a-smoke-reviewer-$$-${RANDOM}"
 
 pick_free_port() {
   python3 "$SCRIPT_DIR/a2a-cross-bridge-helper.py" free-port
@@ -46,12 +55,30 @@ BRIDGE_ADMIN_AGENT_ID="reviewer"
 bridge_add_agent_id_if_missing "reviewer"
 BRIDGE_AGENT_DESC["reviewer"]="A2A smoke reviewer"
 BRIDGE_AGENT_ENGINE["reviewer"]="shell"
-BRIDGE_AGENT_SESSION["reviewer"]="a2a-smoke-session"
+BRIDGE_AGENT_SESSION["reviewer"]="$REVIEWER_SESSION_NAME"
 BRIDGE_AGENT_WORKDIR["reviewer"]="$workdir"
 BRIDGE_AGENT_LAUNCH_CMD["reviewer"]="bash -lc 'echo reviewer'"
 BRIDGE_AGENT_LOOP["reviewer"]=0
 BRIDGE_AGENT_CONTINUE["reviewer"]=0
 EOF
+}
+
+# Bring the 'reviewer' target up so bridge-task.sh's #1318 stopped-target
+# guard treats it as a live reader. In production an inbound a2a handoff
+# targets a running agent; the receiver enqueues through the EXISTING
+# bridge-task.sh create boundary, which refuses (`task create refused —
+# no reader to dequeue`) when the target has no tmux session. We start a
+# detached session named exactly BRIDGE_AGENT_SESSION["reviewer"]
+# (REVIEWER_SESSION_NAME, unique per run) so bridge_agent_is_active
+# "reviewer" returns true, mirroring real usage. Torn down in cleanup().
+start_reviewer_session() {
+  REVIEWER_SESSION="$REVIEWER_SESSION_NAME"
+  if ! tmux new-session -d -s "$REVIEWER_SESSION" "sleep 600" 2>/dev/null; then
+    smoke_fail "reviewer tmux new-session '$REVIEWER_SESSION' failed"
+  fi
+  if ! tmux has-session -t "=${REVIEWER_SESSION}" 2>/dev/null; then
+    smoke_fail "reviewer tmux session '$REVIEWER_SESSION' did not come up"
+  fi
 }
 
 write_a2a_config() {
@@ -433,8 +460,12 @@ conn.close()
 
 main() {
   smoke_require_cmd python3
+  smoke_require_cmd tmux
   smoke_setup_bridge_home "a2a-cross-bridge"
   write_a2a_roster
+  # #1318: the receiver's bridge-task.sh create refuses a stopped target.
+  # Bring 'reviewer' up (live tmux session) before any enqueue assertion.
+  start_reviewer_session
 
   smoke_run "receiver fail-closed on wildcard bind" fail_closed_wildcard
   smoke_run "receiver fail-closed when tailscale CLI absent" fail_closed_without_tailscale_cli
