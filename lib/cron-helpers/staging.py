@@ -170,6 +170,15 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class StagingGroupError(Exception):
+    """Raised when the requested staging-file group could not be applied
+    AND verified before publish (#1379 codex r2 BLOCKING). The caller
+    must surface this as an explicit error rather than printing a
+    success uuid — a file published with the wrong (user-private) group
+    reproduces the very daemon-read-denied pickup-timeout this fix
+    closes, but silently."""
+
+
 def _payload_atomic_write(
     path: Path, payload: Dict[str, Any], mode: int, gid: Optional[int] = None
 ) -> None:
@@ -180,18 +189,40 @@ def _payload_atomic_write(
     os.chmod(tmp, mode)
     # #1379: chgrp the temp file BEFORE the atomic rename so the final
     # file is never visible to a scanner with the wrong (user-private)
-    # group. Best-effort: an unprivileged chgrp to a group the writer is
-    # not a member of raises PermissionError — the caller pre-checks
-    # membership in `_resolve_staging_gid`, so this only fires for a
-    # group we can actually set. Keep -1 for uid (no owner change).
+    # group. The caller pre-checks membership in `_resolve_staging_gid`,
+    # so the chown should succeed; but a chgrp can still fail or no-op
+    # under an NSS/group race, a read-only/odd FS, or a stale group.
+    #
+    # codex r2 BLOCKING: this MUST be fail-loud, NOT best-effort. If the
+    # chown raises OR the post-chown stat does not confirm the requested
+    # gid, raise StagingGroupError and unlink the temp WITHOUT publishing
+    # — otherwise the file lands with the user-private group and the
+    # caller still prints a success uuid, silently re-creating the
+    # 30s pickup-timeout bug this fix exists to close.
     if gid is not None:
         try:
             os.chown(tmp, -1, gid)
             # chown may clear the setgid/setuid bits on some platforms;
             # re-assert the requested mode.
             os.chmod(tmp, mode)
-        except OSError:
-            pass
+            applied_gid = int(os.stat(tmp).st_gid)
+        except OSError as exc:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise StagingGroupError(
+                f"chgrp staging file to gid={gid} failed: {exc!r}"
+            ) from exc
+        if applied_gid != gid:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise StagingGroupError(
+                f"chgrp staging file verify mismatch: requested gid={gid} "
+                f"observed gid={applied_gid}"
+            )
     os.replace(tmp, path)
 
 
@@ -254,32 +285,28 @@ def _gid_to_group_name(gid: int) -> Optional[int]:
         return None
 
 
-def _allowed_actor_group_names(actor_agent: str) -> set:
-    """The set of group NAMES that are legitimately the actor's OWN
-    per-agent group — and ONLY that group. This is the security gate
-    (codex r1 BLOCKING): a candidate GID is accepted only when its
-    group name is in this set, so a SHARED group the iso UID also
-    belongs to (`ab-shared`) can never be selected. Selecting `ab-shared`
-    for the per-agent staging leaf would reopen the cross-agent
-    write/read surface the matrix avoids (lib/bridge-isolation-v2.sh
-    grants the per-agent subdir `ab-agent-<a>` 2770, NOT `ab-shared`).
+def _canonical_actor_group_names(actor_agent: str) -> set:
+    """The set of group NAMES that ARE the actor's OWN per-agent group —
+    derived PURELY from the actor name + the group-name prefix, NEVER
+    from any caller-supplied env value. This is the security allow-list
+    (codex r2 BLOCKING): `AGB_STAGE_FILE_GROUP` is treated as a candidate
+    *hint* for which gid to look up, but the gid's resolved group name
+    must still equal one of THESE canonical names to be accepted. An iso
+    process that sets `AGB_STAGE_FILE_GROUP=ab-shared` (a group it is a
+    member of) therefore cannot smuggle a shared group past the gate —
+    `ab-shared` is not in this set. Selecting `ab-shared` for the
+    per-agent staging leaf would reopen the cross-agent write/read
+    surface the matrix avoids (lib/bridge-isolation-v2.sh grants the
+    per-agent subdir `ab-agent-<a>` 2770, NOT `ab-shared`).
 
-    Members:
-    - `AGB_STAGE_FILE_GROUP` (the matrix-aware bash caller's
-      `bridge_isolation_v2_agent_group_name` output — already the
-      authoritative, possibly hash-truncated, actor-specific name).
+    Members (mirroring `bridge_isolation_v2_agent_group_name`):
     - `<prefix><actor_agent>` (the un-truncated common case).
-    - the hash-truncated form mirroring
-      `bridge_isolation_v2_agent_group_name` on Linux (`<prefix>
-      <first-N>-<7-char-sha256(actor)>` clamped to 32 chars), so a long
-      agent name still matches even when the env was not passed.
+    - the hash-truncated Linux form `<prefix><first-N>-<7-hex-sha256
+      (actor)>` clamped to 32 chars (groupadd cap), so a long agent name
+      still matches the bash-resolved name.
     """
     prefix = os.environ.get("BRIDGE_AGENT_GROUP_PREFIX", "ab-agent-")
-    names = set()
-    explicit = os.environ.get("AGB_STAGE_FILE_GROUP", "").strip()
-    if explicit:
-        names.add(explicit)
-    names.add(f"{prefix}{actor_agent}")
+    names = {f"{prefix}{actor_agent}"}
     # Hash-truncated variant — mirror bridge_isolation_v2_agent_group_name
     # (Linux groupadd 32-char cap: `<prefix><head>-<7-hex-sha256>`).
     composed = f"{prefix}{actor_agent}"
@@ -301,9 +328,10 @@ def _resolve_staging_gid(actor_agent: str, agent_dir: Path) -> Optional[int]:
     OTHER group the writer happens to belong to such as `ab-shared`).
 
     Candidate sources, in priority order:
-    1. `AGB_STAGE_FILE_GROUP` — the group name the matrix-aware bash
-       caller resolved (authoritative, handles the >32-char hash-
-       truncated name the iso UID cannot recompute).
+    1. `AGB_STAGE_FILE_GROUP` — a group-name HINT (the matrix-aware bash
+       caller passes the resolved actor group, possibly hash-truncated).
+       Treated as untrusted: it only selects WHICH gid to look up; the
+       resolved name must still pass the canonical-name gate below.
     2. The per-agent dir's OWN group (setgid inheritance target) — useful
        on a matrix-applied install; we still chgrp the file explicitly to
        repair fresh-install files written before the matrix ran.
@@ -314,16 +342,17 @@ def _resolve_staging_gid(actor_agent: str, agent_dir: Path) -> Optional[int]:
       (b) it differs from the writer's user-private GID;
       (c) the writer is a member of it (an unprivileged chgrp to a
           non-member group fails); AND
-      (d) **its group NAME is the actor's own per-agent group** (codex r1
-          BLOCKING security gate) — this is what rejects `ab-shared` and
-          any other shared/supplementary group the iso UID belongs to,
-          preserving the #1359 per-agent write boundary.
+      (d) **its resolved group NAME is in `_canonical_actor_group_names`**
+          (codex r2 BLOCKING security gate) — purely actor-derived, never
+          env-derived, so `ab-shared` / any other group the iso UID
+          belongs to is rejected, preserving the #1359 per-agent write
+          boundary.
 
     Returns None when no safe candidate is found — the caller then leaves
     the setgid-inherited group in place (best-effort, matching the
     pre-#1379 behavior on the matrix-applied path)."""
     private_gid = _user_private_gid()
-    allowed_names = _allowed_actor_group_names(actor_agent)
+    canonical_names = _canonical_actor_group_names(actor_agent)
 
     def _accept(gid: Optional[int]) -> Optional[int]:
         if gid is None:
@@ -333,14 +362,16 @@ def _resolve_staging_gid(actor_agent: str, agent_dir: Path) -> Optional[int]:
         if not _writer_in_group(gid):
             return None
         # Security gate: the gid's group name MUST be the actor's own
-        # per-agent group, never a shared group the writer also belongs
-        # to (e.g. ab-shared).
+        # per-agent group (actor-derived, NOT env-derived), never a
+        # shared group the writer also belongs to (e.g. ab-shared).
         name = _gid_to_group_name(gid)
-        if name is None or name not in allowed_names:
+        if name is None or name not in canonical_names:
             return None
         return gid
 
-    # (1) explicit group name from the matrix-aware bash caller.
+    # (1) `AGB_STAGE_FILE_GROUP` hint — only used to pick a gid; the
+    # canonical-name gate still decides accept/reject, so a forged
+    # `AGB_STAGE_FILE_GROUP=ab-shared` cannot widen the file group.
     explicit = os.environ.get("AGB_STAGE_FILE_GROUP", "").strip()
     if explicit:
         accepted = _accept(_gid_for_group_name(explicit))
@@ -441,7 +472,24 @@ def cmd_write_request(staging_root_arg: str, actor_agent: str, payload_json: str
     # cross-agent rewrites stay blocked at the group boundary even
     # though every iso UID has --x on the shared root (for traversal
     # into its OWN subdir).
-    _payload_atomic_write(request_path, payload, 0o660, gid=staging_gid)
+    #
+    # codex r2 BLOCKING: when we resolved a `staging_gid`, the chgrp is
+    # fail-loud — if it cannot be applied + verified, _payload_atomic_write
+    # raises StagingGroupError and does NOT publish. Surface it as an
+    # explicit error (no uuid on stdout) so the iso caller sees a clear
+    # failure instead of polling a file the daemon can never read (the
+    # silent 30s pickup-timeout class). When staging_gid is None (no
+    # canonical group resolvable — fresh install before groupadd, or the
+    # writer's effective group already IS the actor group) the write is
+    # best-effort, matching the pre-#1379 inherited-group behavior.
+    try:
+        _payload_atomic_write(request_path, payload, 0o660, gid=staging_gid)
+    except StagingGroupError as exc:
+        sys.stderr.write(
+            "staging.py write-request: refusing to publish staging request "
+            f"for actor_agent={actor_agent!r} — {exc}\n"
+        )
+        return 73  # EX_CANTCREAT-class: could not create a usable file
 
     print(request_uuid)
     return 0
