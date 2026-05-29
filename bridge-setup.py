@@ -15,7 +15,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -311,7 +311,10 @@ def _audit_normalize_skipped(
         if stderr:
             detail["stderr"] = stderr[:200]
         audit_script = Path(__file__).resolve().parent / "bridge-audit.py"
-        if not audit_script.exists():
+        # Controller-only: audit_script is repo-resident (next to this
+        # file via __file__), never under an isolated agent's tree, so a
+        # raw exists() cannot trip the iso PermissionError class.
+        if not audit_script.exists():  # noqa: raw-pathlib-controller-only
             return
         subprocess.run(
             [
@@ -322,6 +325,85 @@ def _audit_normalize_skipped(
                 "--actor", actor,
                 "--action", "channel_cred_normalize_skipped",
                 "--target", agent,
+                "--detail-json", json.dumps(detail, ensure_ascii=True, sort_keys=True),
+            ],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return
+
+
+def _audit_ms365_redirect_probe_skipped(
+    redirect_uri: str,
+    reason: str,
+    *,
+    agent: str | None = None,
+    detail_extra: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort audit emission for an MS365 redirect-URI probe skip.
+
+    Routes through `bridge-audit.py write` so the row joins the hash
+    chain alongside `channel_cred_normalize_skipped` rows. Mirrors the
+    silent-failure contract: an audit hiccup must NEVER raise out of
+    this helper because we are on the wizard's hot path and an audit
+    write failure cannot be allowed to flip a successful ms365 setup
+    into an error.
+
+    `reason` is one of the probe's `skipped` reason codes — most
+    importantly `insufficient_permission` (Graph 403), but the
+    helper also accepts `creds_missing`, `unreachable`, `no_access_token`,
+    `app_not_found`, `token_error`, `missing_inputs`, `exception`,
+    `redirect_uri_empty`, and `probe_error`. We hash the redirect_uri
+    rather than logging it verbatim because the operator-supplied URI
+    can carry an oauth code / state parameter when typed wrong; the
+    hash is sufficient to correlate audit rows with the wizard run that
+    emitted them without leaking the URI itself.
+    """
+    try:
+        audit_path_str = os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+        if not audit_path_str:
+            log_dir = os.environ.get("BRIDGE_LOG_DIR", "").strip()
+            if log_dir:
+                audit_path_str = str(Path(log_dir).expanduser() / "audit.jsonl")
+            else:
+                home = os.environ.get("BRIDGE_HOME", "").strip()
+                if home:
+                    audit_path_str = str(Path(home).expanduser() / "logs" / "audit.jsonl")
+        if not audit_path_str:
+            return
+        actor = os.environ.get("BRIDGE_AGENT_ID", "").strip() \
+            or os.environ.get("USER", "").strip() \
+            or "unknown"
+        uri_hash = hashlib.sha256(
+            (redirect_uri or "").encode("utf-8")
+        ).hexdigest()[:16]
+        detail: dict[str, Any] = {
+            "reason": reason,
+            "redirect_uri_sha256_prefix": uri_hash,
+        }
+        if agent:
+            detail["agent"] = agent
+        if detail_extra:
+            for key, value in detail_extra.items():
+                if key in detail:
+                    continue
+                detail[key] = value
+        audit_script = Path(__file__).resolve().parent / "bridge-audit.py"
+        # Controller-only: audit_script is repo-resident (next to this
+        # file via __file__), never under an isolated agent's tree, so a
+        # raw exists() cannot trip the iso PermissionError class.
+        if not audit_script.exists():  # noqa: raw-pathlib-controller-only
+            return
+        target = agent or "ms365"
+        subprocess.run(
+            [
+                sys.executable,
+                str(audit_script),
+                "write",
+                "--file", audit_path_str,
+                "--actor", actor,
+                "--action", "ms365_redirect_uri_probe_skipped",
+                "--target", target,
                 "--detail-json", json.dumps(detail, ensure_ascii=True, sort_keys=True),
             ],
             check=False, capture_output=True, text=True, timeout=10,
@@ -389,7 +471,16 @@ def _post_write_normalize_channel_cred_group(path: Path, agent: str | None) -> N
             return
         if not isinstance(path, Path):
             return
-        if not path.exists():
+        # The channel-cred file may live under an isolated agent's tree
+        # (the docstring's iso-v2 case), so a raw `path.exists()` could
+        # trip PermissionError before the gates below run. Route through
+        # the canonical safe wrapper — same pattern as `load_dotenv`
+        # (line ~530) — so the controller gets the proactive sudo
+        # `test -e` escalation instead of relying on the outer
+        # PermissionError swallow to mask a path it could have observed.
+        if not _safe_path_check(
+            "exists", path, _resolve_isolated_owner_for_path(path)
+        ):
             return
         # Gate 1: iso-v2 effective host. Skipping here leaves the file
         # at its caller-written 0600 — correct posture on non-iso-v2.
@@ -834,20 +925,113 @@ def load_claude_plugin_channel_token(kind: str) -> str:
     return extract_token_from_text(env_path.read_text(encoding="utf-8"), kind)
 
 
-def read_secret_value(flag_value: str, flag_name: str, file_path: str, env_name: str) -> str:
+def read_secret_value(
+    flag_value: str,
+    flag_name: str,
+    file_path: Optional[str],
+    env_name: str,
+    stdin_flag: bool = False,
+    stdin_flag_name: str = "",
+) -> str:
     """Resolve a channel secret without requiring it on the command line.
 
-    Precedence: a `--<name>-file <path>` (a path is safe to pass in argv) wins,
-    then the env var, then the legacy `--<name> <secret>` flag. Passing the
-    secret as a bare argv value still works for compatibility but emits a
-    one-line warning, since it then lands in shell history and the process
-    table (`ps`, `/proc/<pid>/cmdline`).
+    Precedence: `--<name>-stdin` (read once from process stdin) wins, then
+    `--<name>-file <path>` (a path is safe to pass in argv), then the env var,
+    then the legacy `--<name> <secret>` flag. Passing the secret as a bare argv
+    value still works for compatibility but emits a one-line warning, since it
+    then lands in shell history and the process table (`ps`, `/proc/<pid>/cmdline`).
+
+    FD-aware file ingestion (Issue #1354): `--<name>-file` accepts any path the
+    process can open and read — regular files, `/dev/fd/N` (Bash process
+    substitution `<(...)`), named pipes (FIFOs), and character/socket specials.
+    The old `Path.is_file()` gate refused everything except regular files,
+    which broke the documented `<(printf '%s' "$secret")` pattern because
+    `/dev/fd/63` is a character device. We now try-open-and-read; if the read
+    fails we surface a hint that names the process-substitution + sudo subshell
+    interaction and the `--<name>-stdin` / tempfile alternatives.
+
+    Mutex defense (Issue #1354 R2): the argparse layer guards the
+    common-case `--<name>-file FOO --<name>-stdin`. This handler-side
+    check is a belt-and-suspenders second line in case a future caller
+    (programmatic invocation, refactor that drops the mutex group)
+    reaches this function with both signals set. Non-empty file_path +
+    stdin_flag both being live is unambiguously a mis-use.
     """
+    if stdin_flag and file_path:
+        file_flag = f"{flag_name}-file"
+        stdin_flag_label = stdin_flag_name or f"{flag_name}-stdin"
+        raise SetupError(
+            f"{file_flag} and {stdin_flag_label} are mutually exclusive — "
+            f"pass only one."
+        )
+    if stdin_flag:
+        # stdin path: read everything once. Single trailing newline (the shape
+        # tools like `printf %s\\n` and `cat` produce) is stripped; any embedded
+        # newlines AND any second trailing newline stay verbatim so multi-line
+        # key material and operator-meaningful trailing whitespace are preserved.
+        data = sys.stdin.read()
+        if data.endswith("\n"):
+            secret = data[:-1]
+        else:
+            secret = data
+        if not secret:
+            stdin_label = stdin_flag_name or f"{flag_name}-stdin"
+            raise SetupError(
+                f"{stdin_label} read an empty secret from stdin "
+                f"(no input received before EOF — check the producer wrote bytes)."
+            )
+        return secret
     if file_path:
         path = Path(file_path).expanduser()
-        if not path.is_file():  # noqa: raw-pathlib-controller-only — operator-supplied secret-file path
-            raise SetupError(f"Secret file not found: {file_path}")
-        return path.read_text(encoding="utf-8").strip()
+        # File-path companion flag is always `<flag_name>-file`; the
+        # stdin companion is `<flag_name>-stdin`. Naming both in the
+        # error keeps the operator from re-typing the bare `<flag_name>`
+        # form (which lands the secret in argv).
+        file_flag = f"{flag_name}-file"
+        stdin_flag_label = stdin_flag_name or f"{flag_name}-stdin"
+        # noqa: raw-pathlib-controller-only — operator-supplied secret-file path.
+        # Issue #1354: try-open-and-read instead of stat-fail-then-abort so
+        # `/dev/fd/N` (Bash process substitution `<(...)`), named pipes, and
+        # character/socket specials all work. The error path below names the
+        # process-substitution + sudo-subshell interaction as the most common
+        # cause and points at the regular-file / stdin alternatives.
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = handle.read()
+        except FileNotFoundError as exc:
+            raise SetupError(
+                f"{file_flag} path stat failed: {file_path} "
+                f"(file does not exist; use {file_flag} <regular-file> "
+                f"or {stdin_flag_label} and pipe the secret on stdin). "
+                "Note: process substitution `<(...)` → /dev/fd/N is not "
+                "preserved across sudo / subshell wrappers."
+            ) from exc
+        except (PermissionError, OSError) as exc:
+            # Includes EACCES, EISDIR, ENXIO (FIFO closed), and the
+            # process-substitution-across-sudo case where `/dev/fd/63`
+            # exists in the parent shell but not inside the sudo subshell
+            # the wizard wraps the python call in.
+            hint = (
+                f"{file_flag} path could not be opened: {file_path} "
+                f"({exc.__class__.__name__}: {exc}). "
+                "Process substitution (`<(...)` → /dev/fd/N) is not preserved across sudo / subshell "
+                f"wrappers; use {file_flag} <regular-file> or "
+                f"{stdin_flag_label} and pipe the secret on stdin."
+            )
+            raise SetupError(hint) from exc
+        # Single trailing newline strip (some tools add it); leave interior
+        # whitespace and any second trailing newline alone so multi-line keys
+        # and operator-meaningful trailing whitespace are preserved.
+        if data.endswith("\n"):
+            secret = data[:-1]
+        else:
+            secret = data
+        if not secret:
+            raise SetupError(
+                f"{file_flag} path opened but yielded an empty secret: {file_path} "
+                f"(producer wrote zero bytes before EOF)."
+            )
+        return secret
     env_value = os.environ.get(env_name, "").strip()
     if env_value:
         return env_value
@@ -983,6 +1167,269 @@ def derive_ms365_redirect_uri(messaging_endpoint: str) -> str:
             f"Cannot derive MS365_REDIRECT_URI from messaging endpoint (must be a full http(s) URL): {raw}"
         )
     return f"{parsed.scheme}://{parsed.netloc}/auth/callback"
+
+
+# Issue #1355: protocol-convention default scope set for MS Graph.
+# Mail+Calendar are the de-facto MS365/Graph baseline — keeping this as
+# wizard-required cost wizard friction with no default benefit. Site-
+# specific values (client-id, secret, tenant, redirect-uri, default-upn)
+# stay wizard-required; default-scopes is the lone protocol-convention
+# exception and gets surfaced with `default_scopes_source: convention-default`
+# so the operator can see exactly what was applied without digging into
+# `.ms365/.env`.
+MS365_CONVENTION_DEFAULT_SCOPES = (
+    "https://graph.microsoft.com/Mail.Read "
+    "https://graph.microsoft.com/Mail.Send "
+    "https://graph.microsoft.com/Calendars.ReadWrite "
+    "offline_access"
+)
+
+
+def ms365_normalize_redirect_uri_for_compare(uri: str) -> str:
+    """Normalize a redirect URI for Entra registration comparison.
+
+    The Microsoft identity platform matches redirect URIs against the
+    Entra app registration's `web.redirectUris` array verbatim — the
+    sent value (including scheme, host, port, path, **query string**,
+    and **fragment**) must equal one of the registered entries character
+    for character. AADSTS50011 fires for anything else, including a
+    `?code=abc` query added by the operator's reverse proxy or a
+    `#fragment` typo. The earlier version of this helper stripped
+    query+fragment "to avoid spurious mismatches", but that was the
+    OPPOSITE of what #1356 needs — the whole point of the probe is to
+    catch every divergence the runtime would catch.
+
+    Verbatim, with whitespace trimmed (operator input artifact). We do
+    not lower-case the host either: Entra is case-sensitive on path
+    and forgiving on host case, but the operator typed exactly what
+    they typed and the strictest probe is the safest probe.
+    """
+    return (uri or "").strip()
+
+
+def ms365_acquire_graph_token(
+    tenant_id: str,
+    client_id: str,
+    client_secret: str,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Acquire a client_credentials access_token for Microsoft Graph.
+
+    Issue #1356: the redirect URI probe needs an app-only Graph token
+    (Application.Read.All or Directory.Read.All) to list the Entra
+    application's `web.redirectUris`. Returns a structured payload:
+
+      {"status": "ok",   "access_token": "..."}
+      {"status": "skipped", "reason": "creds_missing"|"unreachable"|...}
+      {"status": "error", "detail": "<message>"}
+
+    Caller is responsible for surfacing the skip reason in the wizard
+    output. This function NEVER raises — every transport or
+    application-layer failure routes through the structured return so
+    `cmd_ms365` can decide whether to fail-loud or annotate skipped.
+    """
+    tenant = (tenant_id or "").strip()
+    cid = (client_id or "").strip()
+    secret = (client_secret or "").strip()
+    if not tenant or not cid or not secret:
+        return {"status": "skipped", "reason": "creds_missing"}
+
+    base = os.environ.get(
+        "BRIDGE_MS365_LOGIN_BASE_URL", teams_login_base_url()
+    ).rstrip("/")
+    token_url = f"{base}/{tenant}/oauth2/v2.0/token"
+    body = urlencode(
+        {
+            "client_id": cid,
+            "client_secret": secret,
+            "grant_type": "client_credentials",
+            "scope": "https://graph.microsoft.com/.default",
+        }
+    ).encode("utf-8")
+    request = Request(
+        token_url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "agent-bridge-setup/ms365-redirect-probe",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        try:
+            parsed = json.loads(exc.read().decode("utf-8", errors="replace") or "{}")
+        except json.JSONDecodeError:
+            parsed = {}
+        return {
+            "status": "error",
+            "detail": str(parsed.get("error_description") or parsed.get("error") or exc.reason or "").strip(),
+            "http_status": int(exc.code or 0),
+        }
+    except URLError as exc:
+        return {"status": "skipped", "reason": "unreachable", "detail": str(exc.reason)}
+    except Exception as exc:  # noqa: BLE001 — best-effort probe, never bubble
+        return {"status": "skipped", "reason": "exception", "detail": repr(exc)}
+
+    access_token = str(payload.get("access_token") or "").strip()
+    if not access_token:
+        return {"status": "skipped", "reason": "no_access_token"}
+    return {"status": "ok", "access_token": access_token}
+
+
+def ms365_fetch_entra_redirect_uris(
+    access_token: str,
+    client_id: str,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """List the Entra application's registered `web.redirectUris`.
+
+    Microsoft Graph endpoint:
+      GET /v1.0/applications?$filter=appId eq '<client_id>'&$select=appId,web
+
+    Returns:
+      {"status": "ok",       "redirect_uris": [...]}
+      {"status": "skipped",  "reason": "insufficient_permission"|"unreachable"|...}
+      {"status": "error",    "detail": "<message>"}
+
+    A 403 with `Authorization_RequestDenied` or `Insufficient privileges`
+    surfaces as `skipped: insufficient_permission` so the wizard can
+    annotate `redirect_uri_check: skipped (insufficient app permission)`
+    instead of fail-loud. Any other transport/HTTP failure returns
+    `skipped` so the operator never gets blocked by a probe issue.
+    """
+    cid = (client_id or "").strip()
+    token = (access_token or "").strip()
+    if not cid or not token:
+        return {"status": "skipped", "reason": "missing_inputs"}
+
+    base = os.environ.get(
+        "BRIDGE_MS365_GRAPH_BASE_URL", "https://graph.microsoft.com"
+    ).rstrip("/")
+    filt = urlencode({"$filter": f"appId eq '{cid}'", "$select": "appId,web"})
+    url = f"{base}/v1.0/applications?{filt}"
+    request = Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "agent-bridge-setup/ms365-redirect-probe",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(body or "{}")
+        except json.JSONDecodeError:
+            parsed = {}
+            body = ""
+        code = int(exc.code or 0)
+        error_obj = parsed.get("error") if isinstance(parsed, dict) else None
+        error_code = ""
+        error_msg = ""
+        if isinstance(error_obj, dict):
+            error_code = str(error_obj.get("code") or "").strip()
+            error_msg = str(error_obj.get("message") or "").strip()
+        if code in {401, 403} or error_code in {
+            "Authorization_RequestDenied",
+            "Authorization_IdentityNotFound",
+            "Forbidden",
+        }:
+            return {
+                "status": "skipped",
+                "reason": "insufficient_permission",
+                "detail": (error_msg or body)[:240],
+            }
+        return {
+            "status": "error",
+            "http_status": code,
+            "detail": (error_msg or body or str(exc.reason))[:240],
+        }
+    except URLError as exc:
+        return {"status": "skipped", "reason": "unreachable", "detail": str(exc.reason)}
+    except Exception as exc:  # noqa: BLE001 — best-effort probe, never bubble
+        return {"status": "skipped", "reason": "exception", "detail": repr(exc)}
+
+    values = []
+    if isinstance(payload, dict):
+        items = payload.get("value")
+        if isinstance(items, list):
+            values = items
+    # The filter is an equality match, so the array is either empty
+    # (app not found in this tenant — the app-id is wrong, or the app
+    # registration lives in a different tenant) or one element.
+    if not values:
+        return {"status": "skipped", "reason": "app_not_found"}
+    first = values[0]
+    redirect_uris: list[str] = []
+    if isinstance(first, dict):
+        web = first.get("web")
+        if isinstance(web, dict):
+            raw_uris = web.get("redirectUris")
+            if isinstance(raw_uris, list):
+                redirect_uris = [str(u) for u in raw_uris if isinstance(u, str)]
+    return {"status": "ok", "redirect_uris": redirect_uris}
+
+
+def ms365_check_redirect_uri_registered(
+    redirect_uri: str,
+    tenant_id: str,
+    client_id: str,
+    client_secret: str,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Combined token + Graph fetch + verbatim match. Issue #1356.
+
+    Returns one of:
+      {"status": "registered",   "redirect_uris": [...]}
+      {"status": "not_registered","redirect_uris": [...]}
+      {"status": "skipped",       "reason": "<reason>", "detail"?: "..."}
+      {"status": "error",         "detail": "..."}
+
+    "skipped" is the safe default whenever a transport, permission, or
+    credential precondition prevents the lookup; callers annotate
+    `redirect_uri_check: skipped` and continue (do not abort the
+    wizard). "not_registered" is the only fail-loud signal.
+    """
+    target = (redirect_uri or "").strip()
+    if not target:
+        return {"status": "skipped", "reason": "redirect_uri_empty"}
+
+    token_result = ms365_acquire_graph_token(
+        tenant_id, client_id, client_secret, timeout=timeout
+    )
+    if token_result.get("status") != "ok":
+        # Map "error" → skipped for the wizard surface (the probe is
+        # best-effort; an Entra token failure should not block setup).
+        if token_result.get("status") == "error":
+            return {
+                "status": "skipped",
+                "reason": "token_error",
+                "detail": str(token_result.get("detail") or ""),
+            }
+        return token_result
+
+    fetch_result = ms365_fetch_entra_redirect_uris(
+        token_result["access_token"], client_id, timeout=timeout
+    )
+    if fetch_result.get("status") != "ok":
+        return fetch_result
+
+    registered = list(fetch_result.get("redirect_uris") or [])
+    target_norm = ms365_normalize_redirect_uri_for_compare(target)
+    registered_norm = {ms365_normalize_redirect_uri_for_compare(u) for u in registered}
+    if target_norm in registered_norm or target in registered:
+        return {"status": "registered", "redirect_uris": registered}
+    return {"status": "not_registered", "redirect_uris": registered}
 
 
 def teams_login_base_url() -> str:
@@ -1706,15 +2153,31 @@ def cmd_teams(args: argparse.Namespace) -> int:
             flag_name="--app-password",
             file_path=args.app_password_file,
             env_name="BRIDGE_TEAMS_APP_PASSWORD",
+            stdin_flag=bool(getattr(args, "app_password_stdin", False)),
+            stdin_flag_name="--app-password-stdin",
         )
-        app_password = str(
-            app_password_arg
-            or account_cfg.get("appPassword")
-            or account_cfg.get("app_password")
-            or account_cfg.get("clientSecret")
-            or account_cfg.get("client_secret")
-            or inspected["app_password"]
-        ).strip()
+        # Issue #1354 R2 (codex r1 BLOCKING #2): do NOT `.strip()` the
+        # secret here. `read_secret_value` already strips at most one
+        # trailing newline (the canonical contract — multi-line key
+        # material and operator-meaningful trailing whitespace are
+        # preserved). A handler-level `.strip()` greedily removes leading
+        # AND trailing whitespace including a second trailing newline,
+        # silently truncating valid secrets. The fallback paths
+        # (account_cfg, inspected) are configuration JSON / existing .env
+        # values; preserve them verbatim too — if `appPassword` in the
+        # account JSON has stray trailing whitespace the operator put it
+        # there and the .env round-trip already preserves it.
+        if app_password_arg:
+            app_password = app_password_arg
+        else:
+            app_password = (
+                account_cfg.get("appPassword")
+                or account_cfg.get("app_password")
+                or account_cfg.get("clientSecret")
+                or account_cfg.get("client_secret")
+                or inspected["app_password"]
+                or ""
+            )
         tenant_id = str(args.tenant_id or account_cfg.get("tenantId") or account_cfg.get("tenant_id") or inspected["tenant_id"]).strip()
         service_url = str(args.service_url or account_cfg.get("serviceUrl") or account_cfg.get("service_url") or inspected["service_url"]).strip()
         webhook_host = str(args.webhook_host or inspected["webhook_host"] or "127.0.0.1").strip()
@@ -1909,6 +2372,19 @@ def print_ms365_result(result: dict[str, Any], *, stream: Any = sys.stdout) -> N
     else:
         print("redirect_uri: (unset)", file=stream)
     print(f"redirect_uri_source: {result['redirect_uri_source']}", file=stream)
+    # Issue #1356: tactical first-line elevation — the warning printer
+    # below puts the "Register this redirect URI" cue dead-last in the
+    # output, after every other field. Operators piping stdout into a
+    # log usually only see the LAST few lines and miss the call to
+    # action. Surface the Entra-registration verification status
+    # IMMEDIATELY after the redirect URI so the action lives next to
+    # the value it applies to.
+    redirect_uri_check = result.get("redirect_uri_check") or ""
+    if redirect_uri_check:
+        print(f"redirect_uri_check: {redirect_uri_check}", file=stream)
+    redirect_uri_registered = result.get("redirect_uri_registered") or ""
+    if redirect_uri_registered:
+        print(f"redirect_uri_registered: {redirect_uri_registered}", file=stream)
     if result["messaging_endpoint"]:
         print(f"messaging_endpoint: {result['messaging_endpoint']}", file=stream)
     if result.get("tenant_id"):
@@ -1917,6 +2393,16 @@ def print_ms365_result(result: dict[str, Any], *, stream: Any = sys.stdout) -> N
         print(f"client_id: {result['client_id']}", file=stream)
     if result.get("default_upn"):
         print(f"default_upn: {result['default_upn']}", file=stream)
+    # Issue #1355: surface the chosen scope set + its source so an
+    # operator can tell at a glance whether the wizard applied the
+    # protocol-convention default, preserved an existing value, or
+    # used an explicit --default-scopes flag.
+    default_scopes = result.get("default_scopes") or ""
+    default_scopes_source = result.get("default_scopes_source") or ""
+    if default_scopes:
+        print(f"default_scopes: {default_scopes}", file=stream)
+    if default_scopes_source:
+        print(f"default_scopes_source: {default_scopes_source}", file=stream)
     # PR #1220 codex r1: surface the allow-localhost state so an
     # operator who set the local-dev escape hatch can see at a glance
     # that the wizard preserved it on rerun.
@@ -1957,6 +2443,17 @@ def cmd_ms365(args: argparse.Namespace) -> int:
         "client_id": "",
         "default_upn": "",
         "allow_localhost": "",
+        # Issue #1355: default_scopes + provenance — when the operator
+        # neither passes --default-scopes nor has an existing value,
+        # the wizard applies MS365_CONVENTION_DEFAULT_SCOPES and
+        # surfaces `default_scopes_source: convention-default`.
+        "default_scopes": "",
+        "default_scopes_source": "",
+        # Issue #1356: redirect URI Entra-registration probe. Both
+        # fields are empty when --skip-entra-probe is in effect (the
+        # operator opted out of the Graph round-trip).
+        "redirect_uri_check": "",
+        "redirect_uri_registered": "",
         "write_status": "pending",
         "warnings": warnings,
     }
@@ -2043,10 +2540,63 @@ def cmd_ms365(args: argparse.Namespace) -> int:
             flag_name="--client-secret",
             file_path=args.client_secret_file,
             env_name="BRIDGE_MS365_CLIENT_SECRET",
+            stdin_flag=bool(getattr(args, "client_secret_stdin", False)),
+            stdin_flag_name="--client-secret-stdin",
         )
-        client_secret = (client_secret_arg or inspected["client_secret"]).strip()
+        # Issue #1354 R2 (codex r1 BLOCKING #2): same shape as the teams
+        # handler — do NOT `.strip()` the secret. read_secret_value
+        # already does the canonical single-trailing-newline strip;
+        # handler-level `.strip()` would greedily eat operator-meaningful
+        # trailing whitespace and a legitimate second newline.
+        if client_secret_arg:
+            client_secret = client_secret_arg
+        else:
+            client_secret = inspected["client_secret"] or ""
         default_upn = (args.default_upn or inspected["default_upn"]).strip()
-        default_scopes = (args.default_scopes or inspected["default_scopes"]).strip()
+
+        # Issue #1355: protocol-convention default for --default-scopes.
+        # Precedence (r2, codex r1 BLOCKING 1):
+        #   1. --default-scopes "X Y" → flag (source: flag)
+        #   2. --default-scopes ""    → explicit empty (error — no Graph
+        #      call ever succeeds without at least one scope; silently
+        #      expanding an explicit-empty operator input to the broad
+        #      Mail.Read/Mail.Send/Calendars.ReadWrite/offline_access
+        #      default would silently grant permissions the operator
+        #      tried to refuse)
+        #   3. existing .ms365/.env MS365_DEFAULT_SCOPES → preserved
+        #      (source: existing:.ms365/.env)
+        #   4. otherwise → MS365_CONVENTION_DEFAULT_SCOPES
+        #      (source: convention-default)
+        # The argparse parser uses `default=None` as a sentinel so we
+        # can distinguish "flag omitted" (args.default_scopes is None →
+        # case 3/4) from `--default-scopes ""` (args.default_scopes is
+        # "" → case 2 error).
+        raw_default_scopes = args.default_scopes
+        existing_default_scopes = inspected["default_scopes"].strip()
+        if raw_default_scopes is None:
+            # Flag omitted entirely → fall through to existing-env or
+            # convention default.
+            if existing_default_scopes:
+                default_scopes = existing_default_scopes
+                default_scopes_source = "existing:.ms365/.env"
+            else:
+                default_scopes = MS365_CONVENTION_DEFAULT_SCOPES
+                default_scopes_source = "convention-default"
+        else:
+            # Flag supplied — distinguish explicit-empty (error) from a
+            # whitespace-only value (also error, identical reason).
+            flag_default_scopes = raw_default_scopes.strip()
+            if not flag_default_scopes:
+                raise SetupError(
+                    "--default-scopes was supplied with an empty value; "
+                    "Microsoft Graph rejects token requests with zero "
+                    "scopes. Either supply a space-separated scope list "
+                    "(e.g. --default-scopes \"https://graph.microsoft.com/Mail.Read offline_access\") "
+                    "or omit the flag to use the protocol convention "
+                    "default (Mail.Read / Mail.Send / Calendars.ReadWrite / offline_access)."
+                )
+            default_scopes = flag_default_scopes
+            default_scopes_source = "flag:--default-scopes"
 
         # PR #1220 codex r1: preserve the local-dev escape hatch
         # `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` across reruns.
@@ -2070,6 +2620,100 @@ def cmd_ms365(args: argparse.Namespace) -> int:
         result["client_id"] = client_id
         result["default_upn"] = default_upn
         result["allow_localhost"] = allow_localhost
+        result["default_scopes"] = default_scopes
+        result["default_scopes_source"] = default_scopes_source
+
+        # Issue #1356 root: run the Entra Graph probe BEFORE warnings
+        # so a confirmed mismatch fails fast and the operator gets a
+        # clean abort instead of a "wrote .env, now go fix Entra"
+        # confused tail. Probe respects --skip-entra-probe and any
+        # missing credential precondition (which short-circuits to
+        # `skipped: creds_missing`) so OOTB / air-gapped / CI runs
+        # never see a network call. --dry-run also skips the probe to
+        # match the existing dry-run contract of "no external state
+        # is touched".
+        skip_probe = bool(getattr(args, "skip_entra_probe", False)) or bool(args.dry_run)
+        if skip_probe:
+            # Distinguish "operator opted out" from "dry-run" for the
+            # audit surface, but use one stable `redirect_uri_check`
+            # vocabulary so smoke pins stay stable.
+            if args.dry_run:
+                result["redirect_uri_check"] = "skipped (dry-run)"
+            else:
+                result["redirect_uri_check"] = "skipped (--skip-entra-probe)"
+        else:
+            probe = ms365_check_redirect_uri_registered(
+                redirect_uri, tenant_id, client_id, client_secret
+            )
+            probe_status = str(probe.get("status") or "")
+            if probe_status == "registered":
+                result["redirect_uri_check"] = "ok"
+                result["redirect_uri_registered"] = "yes"
+            elif probe_status == "not_registered":
+                # Fail-loud: this is the whole point of #1356. Surface
+                # the list Entra DID return so the operator can spot a
+                # typo (trailing slash, wrong host, http vs https).
+                registered = probe.get("redirect_uris") or []
+                listing = ", ".join(registered) if registered else "(none registered)"
+                result["redirect_uri_check"] = "not_registered"
+                result["redirect_uri_registered"] = "no"
+                raise SetupError(
+                    "redirect URI가 Entra app에 등록돼 있지 않습니다. "
+                    "Authentication → Redirect URIs에 추가한 뒤 다시 실행하세요. "
+                    f"(target: {redirect_uri}; 조회 결과: [{listing}]) "
+                    "Probe를 건너뛰려면 --skip-entra-probe."
+                )
+            elif probe_status == "skipped":
+                reason = str(probe.get("reason") or "unknown")
+                # Map the internal skip reasons to a single operator-
+                # facing line that names the root cause without leaking
+                # the full Graph error body.
+                reason_map = {
+                    "creds_missing": "missing credentials (client_id/secret/tenant)",
+                    "unreachable": "Graph endpoint unreachable",
+                    "insufficient_permission": "insufficient app permission (need Application.Read.All)",
+                    "no_access_token": "token endpoint returned no access_token",
+                    "app_not_found": "appId not found in tenant",
+                    "token_error": "client_credentials token request failed",
+                    "missing_inputs": "internal: missing inputs to fetch",
+                    "exception": "transport exception",
+                    "redirect_uri_empty": "redirect_uri unresolved",
+                }
+                friendly = reason_map.get(reason, reason)
+                result["redirect_uri_check"] = f"skipped ({friendly})"
+                # Issue #1356 r2 (codex r1 BLOCKING 2): emit a durable
+                # audit row for every probe skip. The 403 (Graph
+                # `Authorization_RequestDenied`) path was previously
+                # only visible on the wizard's stdout — an operator
+                # triaging "wizard wrote .env without verifying the
+                # redirect URI" had no machine-readable trail. Wire all
+                # skipped reasons through audit so the chain stays
+                # complete; the BLOCKING surface is `insufficient_permission`
+                # but the same vocabulary is the right place to record
+                # `unreachable` / `creds_missing` / etc.
+                _audit_ms365_redirect_probe_skipped(
+                    redirect_uri,
+                    reason,
+                    agent=getattr(args, "agent", None),
+                )
+            elif probe_status == "error":
+                detail = str(probe.get("detail") or "").strip()
+                # Any "error" surface from the probe layer is non-
+                # fatal — best-effort contract. Annotate and continue.
+                result["redirect_uri_check"] = "skipped (probe error)"
+                if detail:
+                    warnings.append(f"Entra redirect URI probe error: {detail}")
+                # Same r2 audit emit as the skipped branch — the probe
+                # said "error" rather than "skipped", but from the
+                # operator's perspective the wizard still proceeded
+                # without a verified registration, so the audit trail
+                # must show it.
+                _audit_ms365_redirect_probe_skipped(
+                    redirect_uri,
+                    "probe_error",
+                    agent=getattr(args, "agent", None),
+                    detail_extra={"probe_detail": detail[:200]} if detail else None,
+                )
 
         if not tenant_id:
             warnings.append(
@@ -2087,10 +2731,27 @@ def cmd_ms365(args: argparse.Namespace) -> int:
                 "MS365_CLIENT_SECRET is present in .ms365/.env."
             )
 
-        warnings.append(
+        # Issue #1356 tactical: when the probe was registered, the
+        # "register this URI" cue would only confuse. When it wasn't,
+        # the SetupError above already aborted. The cue is only useful
+        # in the skipped + no-write paths. Always emit it (the no-op
+        # cost on the registered path is trivial — one extra line),
+        # but insert it at the FRONT of the warning list so the
+        # operator-facing "next action" lives above the
+        # MS365_TENANT_ID-unset family of plugin-readiness reminders.
+        warnings.insert(
+            0,
             "Register this redirect URI on the Entra app's Authentication → "
-            f"Redirect URIs page: {redirect_uri}"
+            f"Redirect URIs page: {redirect_uri}",
         )
+        # And surface the explicit verification-skipped reminder when
+        # the probe did not return a positive "registered" signal so
+        # the operator knows the wizard could not auto-verify.
+        if result.get("redirect_uri_registered") != "yes":
+            warnings.append(
+                "verification: Entra Authentication 페이지에서 redirect URI 등록 여부를 확인하세요. "
+                "미등록 상태라면 다음 pair_start가 redirect_uri_mismatch로 실패합니다."
+            )
 
         if args.dry_run:
             result["write_status"] = "dry_run"
@@ -2398,7 +3059,28 @@ def build_parser() -> argparse.ArgumentParser:
     teams_parser.add_argument("--channel-account")
     teams_parser.add_argument("--app-id", default="")
     teams_parser.add_argument("--app-password", default="")
-    teams_parser.add_argument("--app-password-file", default="")
+    # Issue #1354 R2 (codex r1 BLOCKING #1): `--app-password-file` and
+    # `--app-password-stdin` are mutually exclusive. argparse raises a
+    # non-zero exit when both are passed; pre-R2 the wizard silently
+    # preferred stdin and dropped the file value (precedence in
+    # `read_secret_value`), making it possible to leak the wrong secret
+    # without any signal to the operator.
+    #
+    # `default=None` (not `default=""`) so argparse can distinguish "user
+    # passed `--app-password-file ''`" from "user did not pass the flag
+    # at all". With `default=""`, argparse treats an explicit empty
+    # value as a no-op and lets `--app-password-file '' --app-password-stdin`
+    # bypass the mutex group (codex r2 review surfaced this argparse
+    # quirk). `read_secret_value` already treats `None` and `""` as the
+    # same "no file path" signal downstream.
+    teams_password_source = teams_parser.add_mutually_exclusive_group()
+    teams_password_source.add_argument("--app-password-file", default=None)
+    # Issue #1354: explicit stdin path for the secret. Bash process
+    # substitution `<(...)` lands as `/dev/fd/N` which is portable when the
+    # wizard does NOT cross a sudo boundary, but breaks when it does.
+    # `--app-password-stdin` is the unambiguous escape hatch — pipe the
+    # secret into stdin and the wizard reads it once.
+    teams_password_source.add_argument("--app-password-stdin", action="store_true")
     teams_parser.add_argument("--tenant-id", default="")
     teams_parser.add_argument("--service-url", default="")
     teams_parser.add_argument("--messaging-endpoint", default="")
@@ -2431,9 +3113,25 @@ def build_parser() -> argparse.ArgumentParser:
     ms365_parser.add_argument("--tenant-id", default="")
     ms365_parser.add_argument("--client-id", default="")
     ms365_parser.add_argument("--client-secret", default="")
-    ms365_parser.add_argument("--client-secret-file", default="")
+    # Issue #1354 R2 (codex r1 BLOCKING #1): `--client-secret-file` and
+    # `--client-secret-stdin` are mutually exclusive. See teams parser
+    # `--app-password-*` mutex for rationale (including the `default=None`
+    # choice that avoids the argparse default-equivalence quirk).
+    ms365_secret_source = ms365_parser.add_mutually_exclusive_group()
+    ms365_secret_source.add_argument("--client-secret-file", default=None)
+    # Issue #1354: explicit stdin path for the secret. See teams parser
+    # `--app-password-stdin` for rationale (process substitution + sudo
+    # subshell drops the `/dev/fd/N` mapping).
+    ms365_secret_source.add_argument("--client-secret-stdin", action="store_true")
     ms365_parser.add_argument("--default-upn", default="")
-    ms365_parser.add_argument("--default-scopes", default="")
+    # Issue #1355 r2 (codex r1 BLOCKING 1): argparse `default=""` cannot
+    # distinguish "flag omitted" from `--default-scopes ""` — both land
+    # as the empty string. Use `default=None` as a sentinel so the
+    # cmd_ms365 branch can tell the two apart and treat an explicit
+    # empty as an error (no Graph call ever succeeds without at least
+    # one scope) instead of silently expanding to the broad convention
+    # default. See cmd_ms365's `flag_default_scopes` branch.
+    ms365_parser.add_argument("--default-scopes", default=None)
     # PR #1220 codex r1: explicit opt-in for local-dev redirect URIs.
     # When set, persists `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` to
     # `.ms365/.env`. Without this flag, the wizard preserves any
@@ -2442,6 +3140,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-localhost",
         action="store_true",
         help="Persist MS365_REDIRECT_URI_ALLOW_LOCALHOST=1 (local-dev opt-in; the runtime plugin rejects localhost redirect URIs without this flag).",
+    )
+    # Issue #1356: opt out of the Entra Graph round-trip that verifies
+    # the operator-supplied redirect URI is registered on the Entra app
+    # registration. Useful for OOTB / air-gapped / CI runs where the
+    # Graph endpoint is unreachable or the app lacks Application.Read.All.
+    # The probe ALREADY short-circuits on missing credentials so an
+    # OOTB operator without client-id/secret never sees a Graph call;
+    # this flag is for the rarer "have credentials, do not call Graph"
+    # case (CI smoke).
+    ms365_parser.add_argument(
+        "--skip-entra-probe",
+        action="store_true",
+        help="Skip the Entra app redirect URI registration probe (#1356).",
     )
     ms365_parser.add_argument("--yes", action="store_true")
     ms365_parser.add_argument("--dry-run", action="store_true")

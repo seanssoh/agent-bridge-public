@@ -55,6 +55,12 @@ fi
 #       resolves the session under the agent's <agent-home>/.claude/.
 #   T8. bridge_resolve_resume_session_id for the same registered isolated
 #       agent accepts the candidate (rc=0).
+#   T7b. (Issue #1370) a REGISTERED shared-mode agent (iso_effective=0) with
+#        a Lane θ-scaffolded empty <agent-home>/.claude resolves EMPTY — the
+#        derived path must never shadow the controller HOME for shared mode.
+#   T7c. (Issue #1370) a REGISTERED linux-user agent on a non-Linux host
+#        (iso never effective) likewise resolves EMPTY despite a scaffolded
+#        <agent-home>/.claude — the admin's actual macOS shape.
 #   T9. bridge_detect_claude_session_id for an UNREGISTERED agent with a
 #       per-call HOME does NOT shadow that HOME — the guard returns empty
 #       and the helper finds the fixture under the per-call HOME
@@ -214,17 +220,32 @@ declare -F bridge_resolve_agent_claude_config_dir >/dev/null \
 declare -F bridge_reset_roster_maps >/dev/null \
   || smoke_fail "bridge_reset_roster_maps not defined"
 
-# Register one isolated agent. Its config dir resolves to
-# $BRIDGE_AGENT_ROOT_V2/<agent>/home/.claude (bridge_agent_claude_config_dir
-# under the v2 layout that smoke_setup_bridge_home installs). Seed the
-# fixture there so the guard's "registered AND dir exists" check passes.
+# Register one isolated agent. Issue #1370 (beta5-2 #1316 regression): the
+# resolver now gates on `bridge_agent_linux_user_isolation_effective` BEFORE
+# the on-disk `-d` check, so a registered agent only earns a private config
+# dir when its linux-user isolation is genuinely effective — linux-user mode
+# + Linux host + non-empty os_user (lib/bridge-agents.sh:1023). Model all
+# three so the fixture is iso-effective even on a macOS CI runner:
+#   * BRIDGE_HOST_PLATFORM_OVERRIDE=Linux       (host predicate)
+#   * BRIDGE_AGENT_ISOLATION_MODE=linux-user    (mode predicate)
+#   * BRIDGE_AGENT_OS_USER=<probe-user>          (os_user predicate)
+# Point BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT at a writable temp dir so the
+# resolved config dir (`<root>/<os_user>/.claude`) lands somewhere the smoke
+# can actually seed, rather than the production `/home/<os_user>/.claude`.
 bridge_reset_roster_maps
 
 ISO_AGENT="rcd-1015"
+ISO_OS_USER="agent-bridge-rcd-1015"
 ISO_WORKDIR="$SMOKE_TMP_ROOT/iso-workdir"
 ISO_SESSION_ID="def67890-1015-iso-fixture"
-mkdir -p "$ISO_WORKDIR"
+ISO_HOME_ROOT="$SMOKE_TMP_ROOT/iso-home-root"
+mkdir -p "$ISO_WORKDIR" "$ISO_HOME_ROOT"
 ISO_WORKDIR="$(cd -P "$ISO_WORKDIR" && pwd -P)"
+ISO_HOME_ROOT="$(cd -P "$ISO_HOME_ROOT" && pwd -P)"
+
+# iso-effective predicate inputs (see comment above).
+export BRIDGE_HOST_PLATFORM_OVERRIDE="Linux"
+export BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT="$ISO_HOME_ROOT"
 
 BRIDGE_AGENT_IDS=("$ISO_AGENT")
 BRIDGE_AGENT_DESC["$ISO_AGENT"]="$ISO_AGENT smoke fixture"
@@ -236,6 +257,11 @@ BRIDGE_AGENT_CONTINUE["$ISO_AGENT"]="1"
 BRIDGE_AGENT_SOURCE["$ISO_AGENT"]="static"
 BRIDGE_AGENT_CREATED_AT["$ISO_AGENT"]="$(date +%s)"
 BRIDGE_AGENT_SESSION_ID["$ISO_AGENT"]=""
+BRIDGE_AGENT_ISOLATION_MODE["$ISO_AGENT"]="linux-user"
+BRIDGE_AGENT_OS_USER["$ISO_AGENT"]="$ISO_OS_USER"
+
+bridge_agent_linux_user_isolation_effective "$ISO_AGENT" \
+  || smoke_fail "fixture not iso-effective for $ISO_AGENT (predicate inputs wrong)"
 
 ISO_CONFIG_DIR="$(bridge_agent_claude_config_dir "$ISO_AGENT")"
 [[ -n "$ISO_CONFIG_DIR" ]] \
@@ -268,6 +294,79 @@ test_shim_resolve_isolated_agent() {
     "T8 shim resolve rc=0 for registered isolated agent"
   smoke_assert_eq "$ISO_SESSION_ID" "$resolved" \
     "T8 shim resolve accepts the isolated agent's live session id"
+}
+
+# --- Issue #1370 negative controls: shared-mode agents fall through ------
+#
+# beta5-2's Lane θ ".claude tree normalize" backfill scaffolds an (empty)
+# `<agent-home>/.claude` for shared-mode agents too, so the resolver's
+# `-d` guard alone no longer filters them out — the new iso-effective gate
+# is what keeps a shared-mode (admin / non-Linux) agent from shadowing the
+# controller HOME and blocking `--continue` resume. These two cases are the
+# regression-prevention teeth for #1370: a REGISTERED agent whose `.claude`
+# EXISTS on disk but whose isolation is NOT effective MUST resolve empty.
+
+# Register a shared-mode (iso_effective=0) sibling on the same Linux host:
+# mode=shared, no os_user → predicate fails on the requested-mode check.
+SHARED_AGENT="rcd-1015-shared"
+BRIDGE_AGENT_IDS+=("$SHARED_AGENT")
+BRIDGE_AGENT_DESC["$SHARED_AGENT"]="$SHARED_AGENT shared-mode negative control"
+BRIDGE_AGENT_ENGINE["$SHARED_AGENT"]="claude"
+BRIDGE_AGENT_SESSION["$SHARED_AGENT"]="$SHARED_AGENT"
+BRIDGE_AGENT_WORKDIR["$SHARED_AGENT"]="$ISO_WORKDIR"
+BRIDGE_AGENT_SOURCE["$SHARED_AGENT"]="static"
+BRIDGE_AGENT_CREATED_AT["$SHARED_AGENT"]="$(date +%s)"
+BRIDGE_AGENT_SESSION_ID["$SHARED_AGENT"]=""
+BRIDGE_AGENT_ISOLATION_MODE["$SHARED_AGENT"]="shared"
+# Scaffold the empty agent-home `.claude` (what Lane θ #1316 backfill leaves
+# behind) so the on-disk `-d` guard would otherwise pass.
+SHARED_SCAFFOLD_DIR="$(bridge_agent_claude_config_dir "$SHARED_AGENT")"
+mkdir -p "$SHARED_SCAFFOLD_DIR/projects" "$SHARED_SCAFFOLD_DIR/sessions"
+
+# Register a linux-user agent that is iso-INeffective because the host is
+# non-Linux (Darwin) — the admin's actual macOS shape. Same scaffolded dir.
+DARWIN_AGENT="rcd-1015-darwin"
+BRIDGE_AGENT_IDS+=("$DARWIN_AGENT")
+BRIDGE_AGENT_DESC["$DARWIN_AGENT"]="$DARWIN_AGENT non-Linux negative control"
+BRIDGE_AGENT_ENGINE["$DARWIN_AGENT"]="claude"
+BRIDGE_AGENT_SESSION["$DARWIN_AGENT"]="$DARWIN_AGENT"
+BRIDGE_AGENT_WORKDIR["$DARWIN_AGENT"]="$ISO_WORKDIR"
+BRIDGE_AGENT_SOURCE["$DARWIN_AGENT"]="static"
+BRIDGE_AGENT_CREATED_AT["$DARWIN_AGENT"]="$(date +%s)"
+BRIDGE_AGENT_SESSION_ID["$DARWIN_AGENT"]=""
+BRIDGE_AGENT_ISOLATION_MODE["$DARWIN_AGENT"]="linux-user"
+BRIDGE_AGENT_OS_USER["$DARWIN_AGENT"]="agent-bridge-rcd-1015-darwin"
+
+# T7b — shared-mode agent on a Linux host: iso_effective=0 even with the
+# Lane θ-scaffolded `.claude` present → resolver returns empty so detect
+# falls back to the controller HOME (the #1370 fix contract).
+test_shared_mode_resolves_empty() {
+  bridge_agent_linux_user_isolation_effective "$SHARED_AGENT" 2>/dev/null \
+    && smoke_fail "T7b fixture should NOT be iso-effective (mode=shared)"
+  [[ -d "$SHARED_SCAFFOLD_DIR" ]] \
+    || smoke_fail "T7b scaffolded agent-home .claude should exist on disk"
+  local resolved=""
+  resolved="$(bridge_resolve_agent_claude_config_dir "$SHARED_AGENT")"
+  smoke_assert_eq "" "$resolved" \
+    "T7b shared-mode agent resolves empty despite scaffolded .claude (#1370)"
+}
+
+# T7c — linux-user agent on a non-Linux (Darwin) host: iso never effective,
+# so even the scaffolded `.claude` must not shadow the controller HOME.
+# Flip the host platform override only for the duration of this assertion.
+test_non_linux_host_resolves_empty() {
+  local resolved="" _saved_platform="${BRIDGE_HOST_PLATFORM_OVERRIDE:-}"
+  export BRIDGE_HOST_PLATFORM_OVERRIDE="Darwin"
+  bridge_agent_linux_user_isolation_effective "$DARWIN_AGENT" 2>/dev/null \
+    && { export BRIDGE_HOST_PLATFORM_OVERRIDE="$_saved_platform"; \
+         smoke_fail "T7c fixture should NOT be iso-effective on a Darwin host"; }
+  local scaffold_dir=""
+  scaffold_dir="$(bridge_agent_claude_config_dir "$DARWIN_AGENT")"
+  mkdir -p "$scaffold_dir/projects" "$scaffold_dir/sessions"
+  resolved="$(bridge_resolve_agent_claude_config_dir "$DARWIN_AGENT")"
+  export BRIDGE_HOST_PLATFORM_OVERRIDE="$_saved_platform"
+  smoke_assert_eq "" "$resolved" \
+    "T7c non-Linux-host agent resolves empty despite scaffolded .claude (#1370)"
 }
 
 # T9 — bridge_detect_claude_session_id for an UNREGISTERED agent with a
@@ -314,6 +413,8 @@ smoke_run "T5 resolve accepts via CLAUDE_CONFIG_DIR"      test_resolve_via_env
 smoke_run "T6 resolve fallback rejects candidate"         test_resolve_fallback_rejects
 smoke_run "T7 shim detect for registered isolated agent"  test_shim_detect_isolated_agent
 smoke_run "T8 shim resolve for registered isolated agent" test_shim_resolve_isolated_agent
+smoke_run "T7b shared-mode agent resolves empty (#1370)"  test_shared_mode_resolves_empty
+smoke_run "T7c non-Linux host resolves empty (#1370)"     test_non_linux_host_resolves_empty
 smoke_run "T9 shim detect honours per-call HOME"          test_shim_detect_unregistered_home_fallback
 smoke_run "T10 shim resolve honours per-call HOME"        test_shim_resolve_unregistered_home_fallback
 

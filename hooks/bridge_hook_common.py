@@ -407,8 +407,79 @@ def under_isolated_uid() -> bool:
     return _under_isolated_uid()
 
 
+# Issue #1358 — SSOT audit-detail credential choke-point.
+#
+# The OAuth setup-token prefix is `sk-ant-o`; the run continues with
+# `[A-Za-z0-9_-]`. This is the SAME regex carried locally in
+# ``tool-policy.py`` (`_CREDENTIAL_TOKEN_VALUE_RE`) and
+# ``permission_escalation.py``. Defined here so it can guard EVERY audit
+# row at the single write point regardless of which hook module emitted
+# it (#1358 r4 class closure).
+# Issue #1358 r6 (codex r5 BLOCKING): the redactor MUST be idempotent.
+# Layer 2 writers (tool-policy.py / permission_escalation.py) emit values
+# already collapsed to ``sk-ant-o<REDACTED>`` BEFORE this Layer 1
+# choke-point runs. Without the negative lookahead, the bare prefix inside
+# an already-redacted marker re-matches and yields ``sk-ant-o<REDACTED><REDACTED>``.
+# The ``(?!<REDACTED>)`` guard skips an already-collapsed marker so a
+# double pass is a no-op (raw run -> single marker; marker -> unchanged).
+_AUDIT_CREDENTIAL_TOKEN_VALUE_RE = re.compile(r"sk-ant-o(?!<REDACTED>)[A-Za-z0-9_-]*")
+
+
+def _redact_audit_detail_credentials(value: Any) -> Any:
+    """Recursively collapse OAuth token runs in any audit-detail value.
+
+    Issue #1358 r4 (2026-05-29) — class closure. R1–R3 sealed the token
+    leak at three individual audit writers in ``tool-policy.py``
+    (``agent_tool_denied``, the PostToolUse rows, the credential-routine
+    exemption row) and in ``permission_escalation.py``. R3's codex review
+    then found a FOURTH independent writer — ``system_config_mutation``
+    via ``_write_system_config_audit_row`` — whose non-Bash ``operation``
+    JSON embedded the raw ``tool_input`` values (e.g. an admin ``Write``
+    to ``agent-roster.local.sh`` with ``content`` carrying an
+    ``sk-ant-o…`` token) without passing through any redactor.
+
+    Rather than whack-a-mole each writer, this is the **single
+    choke-point**: ``write_audit`` runs every ``detail`` dict through
+    here before persisting, so any current OR future audit writer that
+    embeds ``tool_input``-derived text inherits the token-value scrub for
+    free. The contract for new audit writers is therefore: *you do not
+    need to remember to redact token values — the write point already
+    does it.* Writers that need a STRONGER guarantee (hash-only command
+    substitution, where even the redacted command text must not survive)
+    still apply that substitution at their own call site BEFORE calling
+    ``write_audit``; this pass only collapses ``sk-ant-o…`` runs, so a
+    hash-only ``detail`` (which carries no token run) is untouched.
+
+    The redaction is surgical and value-only: it replaces the
+    ``sk-ant-o…`` run with ``sk-ant-o<REDACTED>`` and leaves the
+    surrounding structure (credential file paths, grep pattern
+    skeletons, dict keys) intact so the audit row keeps its forensic
+    anchor. Walks dicts, lists, and tuples recursively; non-string
+    scalars pass through unchanged.
+    """
+    if isinstance(value, str):
+        return _AUDIT_CREDENTIAL_TOKEN_VALUE_RE.sub("sk-ant-o<REDACTED>", value)
+    if isinstance(value, dict):
+        return {key: _redact_audit_detail_credentials(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_audit_detail_credentials(item) for item in value]
+    return value
+
+
 def write_audit(action: str, target: str, detail: dict[str, Any]) -> None:
     path = audit_log_path()
+    # Issue #1358 r4: final-line defense — collapse any OAuth token run
+    # in the detail dict regardless of which writer built it. Individual
+    # writers in tool-policy.py / permission_escalation.py still redact at
+    # source (explicit + hash-only where required); this choke-point
+    # guarantees no audit row can persist a raw token even if a writer
+    # forgot, used a new field, or is added later. Best-effort: a malformed
+    # detail must never block the audit append, so fall back to the raw
+    # detail on any unexpected error.
+    try:
+        detail = _redact_audit_detail_credentials(detail)
+    except Exception:  # noqa: BLE001 — never let redaction break audit emit
+        pass
     record = {
         "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "actor": "hook",

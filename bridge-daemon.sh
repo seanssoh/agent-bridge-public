@@ -4323,6 +4323,43 @@ bridge_daemon_check_channel_status_or_hold() {
   local _channel_status _channel_reason
   _channel_status="$(bridge_agent_channel_status "$agent" 2>/dev/null || printf '%s' "-")"
   if [[ "$_channel_status" == "miss" ]]; then
+    # Issue #1353 (v0.15.0-beta5-2 Track A) — setup-pending grace window.
+    # After `agent create --isolate --channels ...` writes the
+    # setup-pending marker, channel-required validator-miss is the
+    # EXPECTED state — the operator has declared the channels but has
+    # not yet run `setup teams|ms365|...` to populate the access files.
+    # Without this gate, the daemon's first 4 auto-start ticks emit
+    # `auto-start backoff <agent>` rows (failures=1..4) + 2
+    # `channel-health miss` audit rows in the ~80s between create and
+    # the operator's first setup command. The grace window suppresses
+    # those rows for up to BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS
+    # (default 900 = 15 min), letting the operator's normal `agent
+    # create → setup teams → setup ms365` flow proceed without log
+    # noise. After grace expires (operator never ran setup), the
+    # existing backoff path takes over with audit + failures counter
+    # intact — operator still gets the actionable signal, just not on
+    # the first second after create.
+    #
+    # Logging contract: hold is silent (`daemon_debug`, not
+    # `daemon_info`). No audit row, no backoff state file write, no
+    # failures counter increment. Hold is the marker doing its job;
+    # noise only resumes when the grace window legitimately expires.
+    #
+    # Tactical-only scope (per issue #1353 "Tactical vs Root" split):
+    # the root fix is `awaiting_channel_setup` agent state + setup hook
+    # to toggle `ready`. This gate is the tactical surface; the root
+    # work is tracked in a follow-up.
+    if bridge_agent_setup_pending_active "$agent" 2>/dev/null; then
+      # Optional debug trace — silent by default. Operators
+      # investigating "why didn't my agent auto-start?" set
+      # `BRIDGE_DAEMON_DEBUG_SETUP_PENDING=1` to see the per-tick hold
+      # line. Default-off because the grace window's whole point is
+      # log-silence during the post-create window.
+      if [[ "${BRIDGE_DAEMON_DEBUG_SETUP_PENDING:-0}" == "1" ]]; then
+        daemon_info "auto-start hold ${agent} (setup-pending grace, reason=channel-required-validator-miss)"
+      fi
+      return 0
+    fi
     _channel_reason="$(bridge_agent_channel_status_reason "$agent" 2>/dev/null || printf '')"
     [[ -n "$_channel_reason" ]] || _channel_reason="setup incomplete"
     # First-class reason string the operator can act on. Persists via
@@ -5760,28 +5797,98 @@ nudge_agent_session() {
   # submission, leaving the task `queued` while the daemon logs
   # session_nudge_sent. Use the queue itself as the delivery oracle: a
   # successful nudge causes the agent to claim within ~1s; if the task is
-  # still queued after $BRIDGE_NUDGE_VERIFY_GRACE_SECONDS (default 2s), flip
-  # the audit row to session_nudge_dropped and return non-zero so the next
-  # idle-nudge tick (post-cooldown) retries instead of leaving a stale
-  # success on the audit log. We do NOT retry inline — a tight loop on a
-  # sticky tmux race wastes ticks. Skip when we have no task_id to verify.
-  local nudge_grace_seconds="${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS:-2}"
+  # still queued after the verify grace, flip the audit row to
+  # session_nudge_dropped and return non-zero so the next idle-nudge tick
+  # (post-cooldown) retries instead of leaving a stale success on the audit
+  # log. We do NOT retry inline — a tight loop on a sticky tmux race wastes
+  # ticks. Skip when we have no task_id to verify.
+  #
+  # Issue #1323 (v0.15.0-beta5-2 Track G follow-up, comment 2026-05-28):
+  # operator measured 4 "appears dropped (after 2s)" events on a fresh
+  # install where every one was a false positive — the next idle-nudge tick
+  # successfully picked up the same task without further intervention. The
+  # 2s threshold was too tight for real claude REPL prompt-buffer +
+  # system-reminder hook latency. Fix: two-stage check.
+  #
+  # r2 (codex r1 BLOCKING 1): stage 2 is a TOTAL elapsed-time gate from
+  # the start of the verify window, NOT an additional sleep on top of
+  # stage 1. After the stage-1 grace, if the task is STILL queued, sleep
+  # the REMAINDER (max(stage_2_total - stage_1, 0)) and re-poll. Only
+  # emit session_nudge_dropped if the SECOND check still observes
+  # status=queued. This converts the common "claude was just slow to
+  # ack" race into a no-op on stage 2 (covered by smoke T2) with a
+  # total wait of stage_2_total seconds (default 5s), NOT
+  # stage_1 + stage_2_total (which would have been 7s under r1's
+  # mis-implementation).
+  #
+  # Env knobs (r2-renamed):
+  #   BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS  default 2 (stage-1 sleep)
+  #   BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS  default 5 (TOTAL elapsed
+  #                                          window from the start of
+  #                                          the verify; not an
+  #                                          additional sleep)
+  #
+  # Setting BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS to a value <=
+  # BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS (canonical: 0) disables stage 2
+  # — the legacy #331 single-stage queued-after-grace contract.
+  #
+  # Backward compat: the pre-r2 env names BRIDGE_NUDGE_VERIFY_GRACE_SECONDS
+  # and BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2 are honored as fallbacks
+  # so smoke harnesses written against r1 keep working. The legacy STAGE2
+  # value was an ADDITIONAL sleep; when the new STAGE_2_SECONDS knob is
+  # unset, we synthesise stage_2_total = stage_1 + legacy_stage2 so the
+  # old "STAGE2=0 disables stage 2" semantic also survives.
+  local nudge_grace_seconds="${BRIDGE_NUDGE_RECHECK_STAGE_1_SECONDS:-${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS:-2}}"
+  [[ "$nudge_grace_seconds" =~ ^[0-9]+$ ]] || nudge_grace_seconds=2
+  local nudge_grace_stage2_total
+  if [[ -n "${BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS:-}" ]]; then
+    nudge_grace_stage2_total="${BRIDGE_NUDGE_RECHECK_STAGE_2_SECONDS}"
+    [[ "$nudge_grace_stage2_total" =~ ^[0-9]+$ ]] || nudge_grace_stage2_total=5
+  elif [[ -n "${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2:-}" ]]; then
+    # Legacy r1 var = ADDITIONAL stage-2 sleep. Convert to TOTAL.
+    local _legacy_stage2_add="${BRIDGE_NUDGE_VERIFY_GRACE_SECONDS_STAGE2}"
+    [[ "$_legacy_stage2_add" =~ ^[0-9]+$ ]] || _legacy_stage2_add=5
+    nudge_grace_stage2_total=$(( nudge_grace_seconds + _legacy_stage2_add ))
+  else
+    nudge_grace_stage2_total=5
+  fi
   local post_status=""
+  local nudge_stage2_used=0
   if [[ -n "$task_id" ]]; then
-    if [[ "$nudge_grace_seconds" =~ ^[0-9]+$ ]] && (( nudge_grace_seconds > 0 )); then
+    if (( nudge_grace_seconds > 0 )); then
       sleep "$nudge_grace_seconds"
     fi
     post_status="$(bridge_queue_task_status "$task_id" 2>/dev/null || true)"
+    # Stage 2 is enabled when the TOTAL window strictly exceeds the
+    # stage-1 window — i.e. there is still time left to wait.
+    if [[ "$post_status" == "queued" ]] && (( nudge_grace_stage2_total > nudge_grace_seconds )); then
+      # Stage 2 recheck — give the agent the remainder of the
+      # stage_2_total window before we call the nudge dropped. This is
+      # the false-positive-suppression bit.
+      nudge_stage2_used=1
+      local _stage2_remainder=$(( nudge_grace_stage2_total - nudge_grace_seconds ))
+      sleep "$_stage2_remainder"
+      post_status="$(bridge_queue_task_status "$task_id" 2>/dev/null || true)"
+    fi
     if [[ "$post_status" == "queued" ]]; then
+      local _total_wait_seconds
+      if (( nudge_stage2_used == 1 )); then
+        _total_wait_seconds=$nudge_grace_stage2_total
+      else
+        _total_wait_seconds=$nudge_grace_seconds
+      fi
       bridge_audit_log daemon session_nudge_dropped "$agent" \
         --detail task_id="$task_id" \
         --detail reason=submit_lost_post_grace \
         --detail grace_seconds="$nudge_grace_seconds" \
+        --detail grace_stage2_total_seconds="$nudge_grace_stage2_total" \
+        --detail grace_total_seconds="$_total_wait_seconds" \
+        --detail stage2_used="$nudge_stage2_used" \
         --detail queued="$live_queued" \
         --detail claimed="$live_claimed" \
         --detail idle_seconds="$idle" \
         --detail title="$title"
-      daemon_info "nudge to ${agent} appears dropped (task #${task_id} still queued after ${nudge_grace_seconds}s); will retry on next idle-nudge tick"
+      daemon_info "nudge to ${agent} appears dropped (task #${task_id} still queued after ${_total_wait_seconds}s, stage1=${nudge_grace_seconds}s stage2_total=${nudge_grace_stage2_total}s); will retry on next idle-nudge tick"
       return 1
     fi
   fi
@@ -6019,6 +6126,28 @@ bridge_report_channel_health_miss() {
   # do not leak a "still firing" signal once the operator fixes ACLs.
   if [[ "$status" != "miss" ]]; then
     bridge_clear_channel_health_state "$agent"
+    return 0
+  fi
+
+  # Issue #1353 (v0.15.0-beta5-2 Track A) — setup-pending grace window.
+  # Same gate as bridge_daemon_check_channel_status_or_hold: during the
+  # post-`agent create` grace window, channel-required validator-miss is
+  # the expected state. The audit row + dashboard flag below is the
+  # SAME noise surface the auto-start backoff loop produces — both fire
+  # against the same channel-status=miss source-of-truth. Without this
+  # gate the daemon would emit
+  #   [info] channel-health miss for <agent> recorded as audit +
+  #   dashboard flag (reason=missing Teams access file ...)
+  # in the same ~80s window the operator is still running `setup teams`.
+  # Skip the audit + dashboard + notify path during the grace window;
+  # the existing path takes over after the grace window expires (when a
+  # genuine config drift is the more likely diagnosis).
+  #
+  # Do NOT write or clear the channel-health state file here — the
+  # grace path is a hold, not a transition. When grace expires and the
+  # miss is still present, the state file is freshly written by the
+  # normal path on the next tick.
+  if bridge_agent_setup_pending_active "$agent" 2>/dev/null; then
     return 0
   fi
 
@@ -7636,6 +7765,30 @@ bridge_daemon_cron_dispatch_wake() {
     return 1
   fi
 
+  # Issue #1353 (v0.15.0-beta5-2 Track A) — setup-pending grace window
+  # for the cron-dispatch path too. The shared check helper below
+  # short-circuits validator misses to return 0 ("hold") regardless of
+  # whether the hold is "silent grace" or "real configuration drift",
+  # because the always-on / on-demand callers simply `continue` and
+  # don't emit. The cron-dispatch path is different: it emits both a
+  # `bridge_warn` + `cron_dispatch_wake_refused` audit row when the
+  # helper holds. Without this pre-check, a freshly-created always-on
+  # static agent with a cron job dispatched within the grace window
+  # would still see the audit + warn line burst — defeating the
+  # silent-skip contract this PR is supposed to install. Skip the cron-
+  # dispatch wake silently (no audit, no log, no throttle-state touch)
+  # during the grace window; the task stays queued for the next tick
+  # so the cron job fires the moment setup completes.
+  #
+  # codex r1 BLOCKING #1353 (catch on this exact surface) — added the
+  # explicit grace probe here so the silent-skip contract applies to
+  # all three start paths (always-on, on-demand, cron-dispatch).
+  if bridge_agent_setup_pending_active "$agent" 2>/dev/null; then
+    if [[ "${BRIDGE_DAEMON_DEBUG_SETUP_PENDING:-0}" == "1" ]]; then
+      daemon_info "cron-dispatch wake hold ${agent} (setup-pending grace, task=#${task_id})"
+    fi
+    return 1
+  fi
   # Issue #1234 (Lane δ, v0.15.0-beta2) — codex r2 BLOCKING parity:
   # mirror process_on_demand_agents' channel-required validator-miss
   # auto-hold. Without this gate, a stopped static agent with required
@@ -8793,6 +8946,194 @@ process_mcp_orphan_cleanup() {
   (( killed_count > 0 ))
 }
 
+# Issue #1359 — process cron-staging files dropped by iso v2 agents.
+#
+# An iso v2 agent's `agb cron create` cannot write to controller-owned
+# `cron/jobs.json` directly (mode 0640 group=controller_group). Instead
+# the CLI drops a JSON mutation request into
+# `$BRIDGE_CRON_STAGING_DIR/<actor_agent>/<uuid>.json` (mode 0660
+# owner=iso UID, group=ab-agent-<actor_agent> via setgid) and waits for
+# the daemon to write a `<uuid>.result.json` sibling. This function is
+# the daemon-side apply step: per cron-sync tick it scans the per-agent
+# staging subdirs, delegates each pending file to
+# `lib/cron-helpers/staging.py apply` (which validates the caller
+# identity and runs `bridge-cron.py native-create` as the controller),
+# then emits an audit row per outcome and sweeps stale orphans.
+#
+# **Return contract (codex r1 #2)**: ALWAYS returns 0, even when no
+# files were applied. The caller in `cmd_sync_cycle` wraps this in a
+# `|| daemon_warn` warning emit; a non-zero rc on the steady-state
+# empty case (no pending requests) would flood the daemon log with
+# false-positive warnings. The function logs its own internal errors
+# via `daemon_warn` directly and the audit log for per-file outcomes.
+process_cron_staging_apply() {
+  local staging_dir="${BRIDGE_CRON_STAGING_DIR:-}"
+  local jobs_file="${BRIDGE_NATIVE_CRON_JOBS_FILE:-}"
+  [[ -n "$staging_dir" && -d "$staging_dir" ]] || return 0
+  [[ -n "$jobs_file" ]] || return 0
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ ! -f "$SCRIPT_DIR/lib/cron-helpers/staging.py" ]]; then
+    return 0
+  fi
+
+  local stale_secs="${BRIDGE_CRON_STAGING_STALE_SECONDS:-300}"
+  [[ "$stale_secs" =~ ^[0-9]+$ ]] || stale_secs=300
+
+  local applied_count=0
+  local rejected_count=0
+  local scan_output=""
+  scan_output="$(python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" \
+    scan-pending "$staging_dir" 2>/dev/null || printf '')"
+
+  if [[ -n "$scan_output" ]]; then
+    while IFS= read -r row; do
+      [[ -n "$row" ]] || continue
+      local uuid="" owner_uid="" stale="" actor_agent_dir=""
+      # Parse the json row with python — avoid jq dependency. Footgun #11
+      # (Bash 5.3.9 heredoc-stdin + command-sub deadlock): the parse body
+      # lives in staging.py `parse-row` (file-as-argv) instead of an
+      # inline `python3 - <<'PY'`. The helper emits the same
+      # uuid=/actor_agent=/owner_uid=/stale= lines and exits 0 with no
+      # output on a parse error, so the `|| continue` still skips the row.
+      local _parsed
+      _parsed="$(python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" parse-row "$row")" || continue
+      while IFS= read -r _line; do
+        case "$_line" in
+          uuid=*) uuid="${_line#uuid=}" ;;
+          actor_agent=*) actor_agent_dir="${_line#actor_agent=}" ;;
+          owner_uid=*) owner_uid="${_line#owner_uid=}" ;;
+          stale=*) stale="${_line#stale=}" ;;
+        esac
+      done <<<"$_parsed"
+      [[ -n "$uuid" && -n "$actor_agent_dir" ]] || continue
+
+      # Issue #1359 codex r2 BLOCKING #1: when scan-pending tagged the
+      # row as `stale: true` (mtime age > BRIDGE_CRON_STAGING_STALE_SECONDS),
+      # do NOT apply it. The previous tick order — apply every row then
+      # run sweep-stale — would execute an abandoned request and the
+      # subsequent sweep would no-op because the apply path wrote a
+      # result.json sibling, defeating the "stale request gets discarded"
+      # contract. Sweep-first: unlink the staging file inline and emit
+      # a `cron_staging_stale_rejected` audit row. The dedicated
+      # `sweep-stale` pass below remains as a safety net for files
+      # missed between scan-pending and this branch (a race where the
+      # iso UID crashed after write but before scan).
+      if [[ "$stale" == "1" ]]; then
+        rejected_count=$(( rejected_count + 1 ))
+        local stale_path="$staging_dir/$actor_agent_dir/${uuid}.json"
+        local stale_unlink_status="ok"
+        if [[ -f "$stale_path" ]]; then
+          rm -f "$stale_path" 2>/dev/null || stale_unlink_status="unlink_failed"
+        else
+          stale_unlink_status="absent"
+        fi
+        bridge_audit_log daemon cron_staging_stale_rejected "$actor_agent_dir" \
+          --detail uuid="$uuid" \
+          --detail owner_uid="$owner_uid" \
+          --detail unlink="$stale_unlink_status" 2>/dev/null || true
+        continue
+      fi
+
+      # Issue #1359 codex r1 #3: bound the per-file apply with the
+      # daemon's standard timeout wrapper so a wedged native-create
+      # subprocess (FIFO payload-file, slow disk) cannot stall the
+      # whole cron-sync tick. The wrapper SIGTERM/SIGKILL chain is
+      # absorbed at the result-file rejection path below — `apply_rc`
+      # carries the wrapped exit code without ever propagating SIGPIPE.
+      local apply_rc=0
+      if declare -F bridge_with_timeout >/dev/null 2>&1; then
+        bridge_with_timeout "${BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS:-25}" \
+          cron_staging_apply python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" \
+          apply "$staging_dir" "$actor_agent_dir" "$uuid" "$jobs_file" \
+          >/dev/null 2>&1 || apply_rc=$?
+      else
+        python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" \
+          apply "$staging_dir" "$actor_agent_dir" "$uuid" "$jobs_file" \
+          >/dev/null 2>&1 || apply_rc=$?
+      fi
+
+      # Parse the result file to recover status + actor_agent + reason
+      # for the audit row. The staging.py apply path ALWAYS writes a
+      # result.json (even on rejection), so a missing result here is a
+      # logic error worth surfacing.
+      local result_path="$staging_dir/$actor_agent_dir/${uuid}.result.json"
+      local audit_action="cron_staging_unknown"
+      local actor_agent="<unknown>"
+      local error_detail=""
+      local cron_id=""
+      if [[ -f "$result_path" ]]; then
+        # Footgun #11: parse body extracted to staging.py `parse-result`
+        # (file-as-argv). Same audit_action=/actor_agent=/status=/cron_id=/
+        # error= lines; exits 0 with no output on a read/parse error so the
+        # `|| _result_parsed=""` fallback still holds.
+        local _result_parsed
+        _result_parsed="$(python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" parse-result "$result_path")" || _result_parsed=""
+        while IFS= read -r _line; do
+          case "$_line" in
+            audit_action=*) audit_action="${_line#audit_action=}" ;;
+            actor_agent=*) actor_agent="${_line#actor_agent=}" ;;
+            cron_id=*) cron_id="${_line#cron_id=}" ;;
+            error=*) error_detail="${_line#error=}" ;;
+          esac
+        done <<<"$_result_parsed"
+      fi
+
+      if [[ "$audit_action" == "cron_staging_applied" ]]; then
+        applied_count=$(( applied_count + 1 ))
+        bridge_audit_log daemon cron_staging_applied "$actor_agent" \
+          --detail uuid="$uuid" \
+          --detail owner_uid="$owner_uid" \
+          --detail cron_id="$cron_id" 2>/dev/null || true
+      else
+        rejected_count=$(( rejected_count + 1 ))
+        bridge_audit_log daemon cron_staging_rejected "$actor_agent" \
+          --detail uuid="$uuid" \
+          --detail owner_uid="$owner_uid" \
+          --detail rc="$apply_rc" \
+          --detail reason="$error_detail" 2>/dev/null || true
+      fi
+    done <<<"$scan_output"
+  fi
+
+  # Sweep stale orphan staging files (iso UID wrote, then crashed
+  # before reading result). Bounded by BRIDGE_CRON_STAGING_STALE_SECONDS.
+  local swept_output=""
+  swept_output="$(python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" \
+    sweep-stale "$staging_dir" "$stale_secs" 2>/dev/null || printf '')"
+  if [[ -n "$swept_output" ]]; then
+    while IFS= read -r row; do
+      [[ -n "$row" ]] || continue
+      local _swept_uuid="" _swept_age=""
+      # Footgun #11: parse body extracted to staging.py `parse-swept`
+      # (file-as-argv). Same uuid=/age= lines (age from mtime_age_seconds);
+      # exits 0 with no output on a parse error so the `|| continue` skips.
+      local _swept_parsed
+      _swept_parsed="$(python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" parse-swept "$row")" || continue
+      while IFS= read -r _line; do
+        case "$_line" in
+          uuid=*) _swept_uuid="${_line#uuid=}" ;;
+          age=*) _swept_age="${_line#age=}" ;;
+        esac
+      done <<<"$_swept_parsed"
+      [[ -n "$_swept_uuid" ]] || continue
+      bridge_audit_log daemon cron_staging_stale_swept "controller" \
+        --detail uuid="$_swept_uuid" \
+        --detail mtime_age_seconds="$_swept_age" 2>/dev/null || true
+    done <<<"$swept_output"
+  fi
+
+  # codex r1 #2: ALWAYS return 0 — the caller in cmd_sync_cycle wraps
+  # this with `|| daemon_warn`, so a non-zero rc on the steady-state
+  # "no applied files" case would flood daemon.log with false-positive
+  # warnings. Per-file failures are captured in the audit log
+  # (cron_staging_rejected) and surfaced to the iso UID poller via the
+  # result.json file — they don't need to bubble up here.
+  return 0
+}
+
 process_queue_gateway_requests() {
   local processed=0
 
@@ -9495,6 +9836,20 @@ cmd_sync_cycle() {
     BRIDGE_DAEMON_LAST_STEP="post_sync"
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true
   fi
+
+  # Issue #1359 — process pending cron-staging files from iso v2 agents
+  # BEFORE the scheduler tick so a freshly-staged create is visible to
+  # `agb cron list` etc within one tick. Runs in the foreground (no
+  # background fork) because the apply path is bounded (per-file
+  # `bridge-cron.py native-create` subprocess, no I/O loop) and the
+  # operator's iso UID is actively polling for the result file — a
+  # backgrounded apply would surface results AFTER the next sync tick,
+  # blowing the 30s default staging timeout in the iso UID poller.
+  # Failures here MUST NOT abort the rest of the tick; the apply path
+  # never aborts on a single file, so this wrapper just absorbs an
+  # unexpected non-zero rc with a warn line.
+  BRIDGE_DAEMON_LAST_STEP="cron_staging_apply"
+  process_cron_staging_apply || daemon_warn "cron-staging apply step failed"
 
   # Cron sync runs LAST, in the background with a timeout, so it never blocks
   # relay/auto-start above.  Only one sync runs at a time (PID-file guard).

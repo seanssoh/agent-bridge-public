@@ -3347,6 +3347,186 @@ bridge_agent_clear_manual_stop() {
   fi
 }
 
+# Issue #1353 (v0.15.0-beta5-2 Track A) — setup-pending grace marker.
+#
+# `agent create --isolate --channels plugin:teams,plugin:ms365` registers
+# an always-on static role whose channel metadata is declared but whose
+# per-channel access files (.teams/access.json, .ms365/.env) won't exist
+# until the operator runs `setup teams <agent>` / `setup ms365 <agent>`.
+# Without this marker, the daemon's first auto-start tick after `agent
+# create` invokes `bridge_daemon_check_channel_status_or_hold` which sees
+# `channel-required-validator-miss` and writes a backoff state file +
+# audit row. The next 3 ticks repeat. The operator's terminal shows 4
+# bursts of `auto-start backoff <agent>` noise BEFORE they've had a
+# chance to run a single setup command.
+#
+# The grace marker is a stat-driven (mtime) file at
+# `state/agents/<agent>/setup-pending`. `agent create` writes it for any
+# channel-required agent; the daemon's auto-start dispatcher silent-skips
+# channel-validator-miss as long as the marker exists and its age is
+# within `BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS` (default 900 = 15
+# min). Each `setup <channel> <agent>` verb touches the marker on entry
+# (extending the grace) and removes it on completion (so a fully-set-up
+# agent never carries the marker).
+#
+# Marker semantics are intentionally minimal — empty file, no body
+# parsing. mtime IS the data. This mirrors the manual-stop / idle-since
+# state family above and keeps the daemon's hot path branch cheap (one
+# stat + one arithmetic compare).
+bridge_agent_setup_pending_file() {
+  local agent="$1"
+  printf '%s/setup-pending' "$(bridge_agent_idle_marker_dir "$agent")"
+}
+
+# Returns 0 (true) iff the marker exists AND its age is within the grace
+# window. Caller treats "true" as "silent skip this tick".
+#
+# Honors the `BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS` env override —
+# 0 disables the grace window entirely (the teeth-revert smoke gate; T5
+# in scripts/smoke/1353-setup-pending-grace.sh).
+#
+# Returns 1 (false) for: marker absent, marker mtime unreadable, grace
+# disabled (BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS=0), or marker age
+# exceeds the configured grace. Each of these is the normal auto-start
+# path — caller proceeds with the channel-status check.
+bridge_agent_setup_pending_active() {
+  local agent="$1"
+  local file
+  local grace="${BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS:-900}"
+  local now_ts mtime age
+
+  [[ -n "$agent" ]] || return 1
+  [[ "$grace" =~ ^[0-9]+$ ]] || grace=900
+  (( grace > 0 )) || return 1
+
+  file="$(bridge_agent_setup_pending_file "$agent")"
+  [[ -e "$file" ]] || return 1
+
+  # `stat -c %Y` (GNU) vs `stat -f %m` (BSD/macOS) — try both. The bash
+  # daemon main loop runs on both Linux and macOS (operator's dev host),
+  # so the helper must portable-stat regardless of which userland is on
+  # PATH. Either succeeds; both failing is treated as "marker
+  # unreadable" → return false so the existing backoff path applies (we
+  # never want a stat error to silently lock out the operator).
+  mtime="$(stat -c '%Y' "$file" 2>/dev/null \
+        || stat -f '%m' "$file" 2>/dev/null \
+        || printf '')"
+  [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+
+  now_ts="$(date +%s 2>/dev/null || printf '0')"
+  [[ "$now_ts" =~ ^[0-9]+$ ]] || return 1
+  (( now_ts >= mtime )) || return 1
+
+  age=$(( now_ts - mtime ))
+  (( age <= grace )) || return 1
+  return 0
+}
+
+# Touch the marker so its mtime is current. Idempotent — creates an
+# empty file on first call, refreshes mtime on subsequent calls. Called
+# from `agent create` (when the new agent declares required channels
+# whose access files do not yet exist) and from each `setup <channel>
+# <agent>` verb at entry (so a multi-channel setup sequence does not
+# expire the grace mid-flow).
+#
+# Route through the matrix-aware writer when isolation-v2 is active so
+# the file lands with the canonical owner+mode (controller-owned write,
+# iso-side group=ab-agent-<a>, mode 0660). When the matrix writer fails
+# under iso-v2-active, do NOT fall through to the plain mkdir/touch
+# path — same shape as the manual-stop / idle-since helpers above (see
+# `bridge_agent_mark_idle_now` lines 3234-3248 and
+# `bridge_agent_mark_manual_stop` lines 3270-3280). The direct write
+# would land mode 0600 owner=controller, not the canonical iso-owned
+# 0660; the daemon would then see a marker that the isolated UID could
+# not delete at setup-completion time, leaving a perpetually stuck
+# grace marker after the operator finished setup. Hard-fail instead and
+# emit an audit row so operators can grep for the matrix drift via
+# `agent-bridge isolation verify --agent <X>` and run
+# `migrate isolation v2 --apply --agent <X>`.
+#
+# Legacy / non-iso-v2 installs continue to use the plain mkdir + `:>file`
+# path (no behavior change for the macOS dev host or pre-v0.8.0 layouts).
+#
+# Callers (setup verbs, `agent create`) continue to swallow rc — the
+# marker is a hint, not a hard contract; absence falls back to the
+# pre-#1353 4-burst surface for the first grace window, which is the
+# same surface the operator sees today. Visibility for matrix drift
+# comes from the new `setup_pending_marker_write_failed` audit row
+# (R2 codex BLOCKING 2), not from caller-side rc propagation.
+bridge_agent_mark_setup_pending() {
+  local agent="$1"
+  local dir
+  local file
+
+  [[ -n "$agent" ]] || return 1
+  dir="$(bridge_agent_idle_marker_dir "$agent")"
+  file="$(bridge_agent_setup_pending_file "$agent")"
+
+  if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
+      && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+      && bridge_isolation_v2_active 2>/dev/null; then
+    # The matrix-aware writer wants a body — empty string keeps the
+    # marker semantics (mtime IS the data) without adding a parser.
+    # On writer failure (rc != 0) under iso-v2-active, do NOT fall
+    # through to the noncanonical mkdir + `:>file` path: matching the
+    # `bridge_agent_mark_idle_now` / `bridge_agent_mark_manual_stop`
+    # contract (r12 codex Probe 9), a fallback write would land mode
+    # 0600 owner=controller, not canonical 0660 owner=controller
+    # group=ab-agent-<a>, so the iso-side `bridge_agent_clear_setup_
+    # pending` `rm -f` would EACCES and the grace marker would get
+    # stuck. Hard-fail + audit row so the operator can see the matrix
+    # drift via the existing isolation-verify CLI.
+    if ! bridge_isolation_v2_write_agent_state_marker "$agent" "setup-pending" "" \
+        >/dev/null 2>&1; then
+      if command -v bridge_audit_log >/dev/null 2>&1; then
+        bridge_audit_log state setup_pending_marker_write_failed "$agent" \
+          --detail reason=iso_v2_matrix_writer_rc_nonzero \
+          --detail hint="agent-bridge isolation verify --agent $agent" \
+          >/dev/null 2>&1 || true
+      fi
+      return 1
+    fi
+    return 0
+  fi
+  mkdir -p "$dir" >/dev/null 2>&1 || return 1
+  : >"$file" 2>/dev/null || return 1
+  return 0
+}
+
+# Best-effort remove of the marker. Called at the END of each `setup
+# <channel> <agent>` verb. Idempotent — no-op if the marker is already
+# gone (multi-channel setup: the second `setup` rm finds nothing).
+#
+# Mirrors `bridge_agent_clear_manual_stop`'s iso-v2 sudo fallback so the
+# controller's plain `rm -f` failure (mode 2770 dir, controller in group
+# but file owned by iso UID with mode 0660 — controller can group-write,
+# but only if the group bit on the dir lets the entry vanish) hands off
+# to `bridge_linux_sudo_root` on linux-user-isolation hosts. Failure
+# beyond that is a `bridge_warn` because a stuck marker would cause the
+# daemon to keep silent-skipping after grace passes (within the 15-min
+# window only; after that the grace expires and the existing backoff
+# resumes — so the worst-case surface is one extra grace window of
+# silent skip, not an indefinite stuck state).
+bridge_agent_clear_setup_pending() {
+  local agent="$1"
+  local file
+
+  [[ -n "$agent" ]] || return 0
+  file="$(bridge_agent_setup_pending_file "$agent")"
+  [[ -e "$file" ]] || return 0
+
+  if rm -f "$file" 2>/dev/null; then
+    return 0
+  fi
+  if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    if bridge_linux_sudo_root rm -f "$file" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  bridge_warn "bridge_agent_clear_setup_pending: failed to remove $file (agent=$agent); grace window will self-clear in ${BRIDGE_AGENT_SETUP_PENDING_GRACE_SECONDS:-900}s"
+  return 1
+}
+
 bridge_reconcile_idle_markers() {
   local agent
   local file
@@ -3547,14 +3727,21 @@ bridge_persist_agent_state() {
 
 # Issue #1015: resolve the Claude config dir to hand the session-id
 # helpers — but ONLY when `agent` is a genuinely registered agent whose
-# computed config dir actually exists on disk. For test / unregistered /
-# non-isolated callers, `bridge_agent_claude_config_dir` still returns a
-# *derived* path (e.g. `$BRIDGE_AGENT_HOME_ROOT/<name>/.claude`) that does
-# not exist; passing that to the helper would OVERRIDE the per-call
-# `HOME` the caller relies on and search the wrong tree. Returning empty
-# in that case lets the helper fall back to `CLAUDE_CONFIG_DIR` env /
-# `HOME` / `~` exactly as on `main`. Echoes the config dir on stdout, or
-# nothing when no isolated config dir is in play.
+# linux-user isolation is *effective* AND whose computed config dir
+# actually exists on disk. For test / unregistered / non-isolated callers,
+# `bridge_agent_claude_config_dir` still returns a *derived* path (e.g.
+# `$BRIDGE_AGENT_HOME_ROOT/<name>/.claude`); passing that to the helper
+# would OVERRIDE the per-call `HOME` the caller relies on and search the
+# wrong tree. Returning empty in that case lets the helper fall back to
+# `CLAUDE_CONFIG_DIR` env / `HOME` / `~` exactly as on `main`. Echoes the
+# config dir on stdout, or nothing when no isolated config dir is in play.
+#
+# Issue #1370 (beta5-2 #1316 regression): the iso-effective gate below is
+# the real defense — beta5-2's Lane θ ".claude tree normalize" backfill
+# scaffolds an (empty) `<agent-home>/.claude` for shared-mode agents too,
+# so the `-d` guard alone no longer filters them out. Without the gate the
+# derived empty dir shadows the controller HOME and blocks `--continue`
+# resume for the admin / every non-Linux host. See the issue thread.
 bridge_resolve_agent_claude_config_dir() {
   local agent="$1"
   local config_dir=""
@@ -3566,6 +3753,18 @@ bridge_resolve_agent_claude_config_dir() {
   # to the helper's daemon-HOME fallback.
   if command -v bridge_agent_exists >/dev/null 2>&1; then
     bridge_agent_exists "$agent" || return 0
+  fi
+  # Issue #1370 (beta5-2 #1316 regression): only agents whose linux-user
+  # isolation is *effective* (iso v2 active on a Linux host with an os_user)
+  # own a private Claude config dir. Shared-mode agents — including the admin,
+  # and every agent on non-Linux hosts where iso is never effective — write
+  # their session JSON / transcripts under the controller HOME (~/.claude).
+  # Returning a derived agent-home path for those makes session-id detection
+  # look in an empty scaffolded `<agent-home>/.claude` and block --continue
+  # resume. Fall through (empty) so the detect helper uses its daemon-HOME
+  # fallback. See bridge_detect_claude_session_id / Issue #1015.
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then
+    bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || return 0
   fi
   config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
   # A derived-but-absent path means the agent is not actually isolated on

@@ -5,7 +5,16 @@
  * - Per-UPN delegated token storage via OAuth authorization code flow with a
  *   local HTTPS redirect (the Teams plugin multiplexes /auth/callback through
  *   its existing webhook listener and writes the code to a shared directory).
- * - Auto refresh with refresh_token.
+ * - Auto refresh with refresh_token (issue #1343): every Graph pre-call
+ *   refreshes when the access_token is expired or within 5 minutes of
+ *   expiry. Refreshes are single-flighted per UPN so concurrent calls do
+ *   not double-consume the rotating refresh_token. Transient failures
+ *   (network / 5xx / throttle) keep the stored token and retry; a
+ *   permanently-dead refresh_token (90-day cap / revoke / consent
+ *   withdrawn) persists a `token_expired` status marker and surfaces an
+ *   actionable re-auth request instead of an opaque Graph 401. Both paths
+ *   emit a redacted `ms365_token_refreshed` / `ms365_refresh_failed`
+ *   audit row to stderr (never the raw token).
  * - Tools for Mail, Calendar, People, User, Directory.
  *
  * Env (loaded from $MS365_STATE_DIR/.env if present):
@@ -60,11 +69,25 @@ import {
   markChatDisclaimerSent,
   prependHumanOutboundDisclaimer,
 } from './disclosure.ts'
+import {
+  classifyRefreshError,
+  redactResponseBody,
+  scrubSecretShapedText,
+  refreshSuccessAuditLine,
+  refreshFailureAuditLine,
+  SingleFlight,
+  type RefreshErrorKind,
+} from './token-refresh.ts'
 
 const STATE_DIR = process.env.MS365_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'ms365')
 const ENV_FILE = join(STATE_DIR, '.env')
 const TOKENS_DIR = join(STATE_DIR, 'tokens')
 const PENDING_DIR = join(STATE_DIR, 'pending')
+// Issue #1343: per-UPN channel status marker. When the refresh_token is
+// permanently dead (90-day cap, revoke, consent withdrawn) we persist a
+// `token_expired` status here so `pair_status` and the operator can see
+// the channel needs re-auth, distinct from a transient network blip.
+const STATUS_DIR = join(STATE_DIR, 'status')
 const HUMAN_OUTBOUND_DISCLOSURE_FILE = join(STATE_DIR, 'human-outbound-disclosures.json')
 
 const BRIDGE_HOME = process.env.BRIDGE_HOME ?? join(homedir(), '.agent-bridge')
@@ -98,6 +121,11 @@ function ensureDirs(): void {
   } catch {}
   mkdirSync(TOKENS_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
+  // Issue #1343: status markers are not secrets (they hold no token
+  // material — only a `token_expired` flag + timestamp + redacted
+  // fingerprint), but they live under the per-UPN private tree, so keep
+  // the dir at 0o700 alongside tokens/pending for consistency.
+  mkdirSync(STATUS_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(MS365_CALLBACK_DIR, { recursive: true, mode: 0o700 })
 }
 
@@ -213,6 +241,32 @@ type PendingFile = {
   authorize_url: string
 }
 
+// Issue #1343: persisted per-UPN channel status. `token_expired` is set
+// only when the refresh_token is *permanently* dead (re-auth required);
+// a transient refresh failure leaves no marker so the next call retries.
+type StatusFile = {
+  upn: string
+  status: 'token_expired'
+  reason: string
+  needs_reauth: boolean
+  updated_at: number
+}
+
+// Issue #1343: a refresh failure that carries its transient/permanent
+// classification so getAccessToken can decide whether to keep retrying
+// with the existing token (transient) or surface a re-auth request
+// (permanent). The message NEVER contains the refresh_token itself.
+class RefreshError extends Error {
+  readonly kind: RefreshErrorKind
+  readonly oauthError: string
+  constructor(kind: RefreshErrorKind, oauthError: string, message: string) {
+    super(message)
+    this.name = 'RefreshError'
+    this.kind = kind
+    this.oauthError = oauthError
+  }
+}
+
 type CallbackFile = {
   state: string
   code: string
@@ -231,6 +285,47 @@ function tokenPath(upn: string): string {
 
 function pendingPath(upn: string): string {
   return join(PENDING_DIR, `${slugUpn(upn)}.json`)
+}
+
+// Issue #1343 -----------------------------------------------------------
+function statusPath(upn: string): string {
+  return join(STATUS_DIR, `${slugUpn(upn)}.json`)
+}
+
+// Single-flight refresh coordinator: two concurrent Graph calls that both
+// cross the expiry threshold share ONE refresh round-trip, so the
+// rotating refresh_token is consumed exactly once (no double-grant race).
+const refreshInFlight = new SingleFlight<TokenFile>()
+
+function loadStatus(upn: string): StatusFile | null {
+  return loadJson<StatusFile>(statusPath(upn))
+}
+
+// Persist a `token_expired` marker (re-auth required). Best-effort: a
+// failure to write the marker must not mask the underlying refresh error.
+function markTokenExpired(upn: string, reason: string): void {
+  const status: StatusFile = {
+    upn,
+    status: 'token_expired',
+    reason: String(reason).replace(/[\r\n]+/g, ' ').slice(0, 300),
+    needs_reauth: true,
+    updated_at: Math.floor(Date.now() / 1000),
+  }
+  try {
+    saveJson(statusPath(upn), status)
+  } catch {
+    /* best-effort; the audit row + thrown RefreshError still surface */
+  }
+}
+
+// Clear a stale `token_expired` marker once a refresh (or re-pair)
+// succeeds, so a recovered channel does not keep reporting needs_reauth.
+function clearTokenExpired(upn: string): void {
+  try {
+    unlinkSync(statusPath(upn))
+  } catch {
+    /* no marker present — nothing to clear */
+  }
 }
 
 function saveJson(path: string, payload: unknown): void {
@@ -333,7 +428,9 @@ async function exchangeAuthCode(
   if (cb.error) {
     try { unlinkSync(callbackPath(pending.state)) } catch {}
     try { unlinkSync(pendingPath(upn)) } catch {}
-    return { status: 'error', error: cb.error, description: String(cb.error_description ?? '').slice(0, 500) }
+    // r4: scrub the error code too (the callback file's `error` is
+    // attacker-influenceable — it comes off the OAuth redirect query).
+    return { status: 'error', error: scrubSecretShapedText(String(cb.error)).slice(0, 120), description: scrubSecretShapedText(String(cb.error_description ?? '')).slice(0, 500) }
   }
   if (!cb.code) {
     return { status: 'error', error: 'empty_code', description: 'callback file had no code' }
@@ -356,17 +453,25 @@ async function exchangeAuthCode(
     },
   )
   if (data.error) {
+    // pair_poll surfaces this via textResult (agent-visible). Scrub any
+    // token-shaped substring smuggled into error OR error_description
+    // (r4: top-level error code scrubbed for model consistency).
     return {
       status: 'error',
-      error: data.error,
-      description: String(data.error_description ?? '').slice(0, 500),
+      error: scrubSecretShapedText(String(data.error)).slice(0, 120),
+      description: scrubSecretShapedText(String(data.error_description ?? '')).slice(0, 500),
     }
   }
   if (!data.access_token) {
+    // codex adversarial-sweep BLOCKING #2: this description flows up to
+    // pair_poll's textResult (agent-visible stdout) — even more exposed
+    // than an audit row. A token endpoint that returns a no-access_token
+    // body still carrying refresh_token / id_token must NOT leak it.
+    // redactResponseBody is _raw-aware + value-content-scrubbed.
     return {
       status: 'error',
       error: 'malformed_response',
-      description: JSON.stringify(data).slice(0, 400),
+      description: JSON.stringify(redactResponseBody(data)).slice(0, 400),
     }
   }
   const token: TokenFile = {
@@ -378,40 +483,155 @@ async function exchangeAuthCode(
     saved_at: now,
   }
   saveJson(tokenPath(upn), token)
+  // Issue #1343: a fresh successful pairing clears any prior
+  // token_expired marker so the channel stops reporting needs_reauth.
+  clearTokenExpired(upn)
   try { unlinkSync(pendingPath(upn)) } catch {}
   try { unlinkSync(callbackPath(pending.state)) } catch {}
   return { status: 'success', token }
 }
 
+// Issue #1343: perform the refresh_token grant. Single-flighted by UPN so
+// concurrent Graph calls do not both consume the rotating refresh_token
+// (edge case #3). On a network/5xx/throttle failure the existing token is
+// left untouched and a `transient` RefreshError is thrown (edge case #2:
+// keep token, retry on next call). On a permanent failure (90-day cap,
+// revoke, consent withdrawn) a `token_expired` status marker is persisted
+// and a `permanent` RefreshError is thrown so the agent gets an
+// actionable re-auth request instead of an opaque Graph 401. Both paths
+// emit a grep-friendly audit row to stderr — never the raw token.
 async function refreshToken(upn: string): Promise<TokenFile> {
+  return refreshInFlight.run(upn, () => doRefresh(upn))
+}
+
+async function doRefresh(upn: string): Promise<TokenFile> {
   const cur = loadJson<TokenFile>(tokenPath(upn))
   if (!cur) throw new Error(`no token for ${upn}; run pair_start + pair_poll`)
-  if (!cur.refresh_token) throw new Error(`no refresh_token for ${upn}; re-pair`)
-  const data = await postForm(
-    `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
-    {
-      grant_type: 'refresh_token',
-      client_id: CLIENT_ID,
-      refresh_token: cur.refresh_token,
-      scope: cur.scope || DEFAULT_SCOPES,
-      ...(CLIENT_SECRET ? { client_secret: CLIENT_SECRET } : {}),
-    },
-  )
-  if (data.error) {
-    throw new Error(
-      `refresh failed for ${upn}: ${data.error} — ${String(data.error_description ?? '').slice(0, 300)}`,
+  if (!cur.refresh_token) {
+    // No refresh_token at all is structurally identical to a dead one:
+    // re-auth is the only fix. Mark token_expired so pair_status reports it.
+    markTokenExpired(upn, 'no refresh_token stored; re-pair required')
+    process.stderr.write(
+      refreshFailureAuditLine({
+        upn,
+        kind: 'permanent',
+        oauthError: 'no_refresh_token',
+        description: 'token file has no refresh_token',
+        refreshTokenPresent: false,
+      }),
+    )
+    throw new RefreshError('permanent', 'no_refresh_token', `no refresh_token for ${upn}; re-pair`)
+  }
+
+  let data: any
+  try {
+    data = await postForm(
+      `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
+      {
+        grant_type: 'refresh_token',
+        client_id: CLIENT_ID,
+        refresh_token: cur.refresh_token,
+        scope: cur.scope || DEFAULT_SCOPES,
+        ...(CLIENT_SECRET ? { client_secret: CLIENT_SECRET } : {}),
+      },
+    )
+  } catch (e) {
+    // fetch() rejected — DNS/TCP/TLS failure. Always transient: keep the
+    // existing token, do NOT mark token_expired, let the next call retry.
+    // Scrub the exception text — re-thrown to the tool-handler catch
+    // (agent-visible) and the audit builder scrubs its own copy too.
+    const msg = scrubSecretShapedText(e instanceof Error ? e.message : String(e))
+    process.stderr.write(
+      refreshFailureAuditLine({
+        upn,
+        kind: 'transient',
+        oauthError: 'network_error',
+        description: msg,
+        refreshTokenPresent: true,
+      }),
+    )
+    throw new RefreshError('transient', 'network_error', `refresh network error for ${upn}: ${msg}`)
+  }
+
+  if (data && data.error) {
+    const kind = classifyRefreshError(data.error, data.error_description)
+    process.stderr.write(
+      refreshFailureAuditLine({
+        upn,
+        kind,
+        oauthError: String(data.error),
+        description: String(data.error_description ?? ''),
+        refreshTokenPresent: true,
+      }),
+    )
+    // Scrub BOTH the error code and the description before they reach the
+    // status marker (pair_status, agent-visible), the RefreshError.oauthError
+    // (surfaced in getAccessToken's permanent re-auth message), or the
+    // thrown error message (re-thrown to the tool-handler catch on the
+    // transient path). r4: a compromised IdP/proxy could smuggle a token
+    // into the top-level `error` field too — scrub for model consistency.
+    const scrubbedError = scrubSecretShapedText(String(data.error))
+    const scrubbedDesc = scrubSecretShapedText(String(data.error_description ?? ''))
+    if (kind === 'permanent') {
+      markTokenExpired(upn, `${scrubbedError}: ${scrubbedDesc.slice(0, 200)}`)
+    }
+    // Transient errors leave the stored token untouched (no saveJson) so a
+    // subsequent call retries with the same still-valid refresh_token.
+    throw new RefreshError(
+      kind,
+      scrubbedError,
+      `refresh failed for ${upn}: ${scrubbedError} — ${scrubbedDesc.slice(0, 300)}`,
     )
   }
+
+  // A 5xx with a non-JSON body comes back as { _raw, _status }. Treat any
+  // missing access_token as transient (server hiccup), keep the token.
+  if (!data || !data.access_token) {
+    const status = data?._status
+    // codex r1 BLOCKING #1: deep-redact the body before stringifying it
+    // into the audit row. A malformed response that still carried a
+    // refresh_token / access_token / id_token would otherwise leak the
+    // raw bearer secret. redactResponseBody replaces secret-keyed values
+    // with a sha256 fp (or <redacted>) on a safe copy — never the raw.
+    process.stderr.write(
+      refreshFailureAuditLine({
+        upn,
+        kind: 'transient',
+        oauthError: status ? `http_${status}` : 'malformed_response',
+        description: JSON.stringify(redactResponseBody(data ?? {})).slice(0, 200),
+        refreshTokenPresent: true,
+      }),
+    )
+    // The thrown message carries only the status — never the body.
+    throw new RefreshError(
+      'transient',
+      status ? `http_${status}` : 'malformed_response',
+      `refresh returned no access_token for ${upn} (status=${status ?? 'n/a'})`,
+    )
+  }
+
   const now = Math.floor(Date.now() / 1000)
+  const newRefreshToken = data.refresh_token ?? cur.refresh_token
   const next: TokenFile = {
     upn,
     access_token: data.access_token,
-    refresh_token: data.refresh_token ?? cur.refresh_token,
+    refresh_token: newRefreshToken,
     expires_at: now + Number(data.expires_in ?? 3600),
     scope: String(data.scope ?? cur.scope),
     saved_at: now,
   }
   saveJson(tokenPath(upn), next)
+  // A successful refresh clears any prior token_expired marker (recovery).
+  clearTokenExpired(upn)
+  process.stderr.write(
+    refreshSuccessAuditLine({
+      upn,
+      expiresInSeconds: next.expires_at - now,
+      refreshTokenRotated: newRefreshToken !== cur.refresh_token,
+      oldRefreshToken: cur.refresh_token,
+      newRefreshToken,
+    }),
+  )
   return next
 }
 
@@ -419,9 +639,30 @@ async function getAccessToken(upn: string): Promise<string> {
   const cur = loadJson<TokenFile>(tokenPath(upn))
   if (!cur) throw new Error(`no token for ${upn}; run pair_start then pair_poll to authenticate`)
   const now = Math.floor(Date.now() / 1000)
+  // Pre-call expiry check: refresh when expired OR within the 5-minute
+  // near-expiry margin (preemptive — avoids a mid-call 401).
   if (cur.expires_at - now > 300) return cur.access_token
-  const refreshed = await refreshToken(upn)
-  return refreshed.access_token
+  try {
+    const refreshed = await refreshToken(upn)
+    return refreshed.access_token
+  } catch (e) {
+    if (e instanceof RefreshError && e.kind === 'transient' && cur.expires_at - now > 0) {
+      // Edge case #2: refresh hit a transient failure but the current
+      // access_token is still (barely) valid — use it rather than hard-
+      // failing the call. The next call will retry the refresh.
+      return cur.access_token
+    }
+    if (e instanceof RefreshError && e.kind === 'permanent') {
+      // Graceful 90-day-expiry fallback: surface an actionable re-auth
+      // request, not a crash or an opaque Graph error (fix point #3).
+      throw new Error(
+        `MS365 token for ${upn} is expired and cannot be refreshed (${e.oauthError}). ` +
+          `Re-authenticate: run pair_start then pair_poll (or 'agent-bridge setup ms365 <agent>'). ` +
+          `Channel status: token_expired.`,
+      )
+    }
+    throw e
+  }
 }
 
 async function graph(
@@ -457,8 +698,19 @@ async function graph(
   let data: any = null
   try { data = text ? JSON.parse(text) : null } catch { data = { _raw: text } }
   if (!res.ok) {
+    // r4 (adversarial sweep): this is the SECOND fetch path (independent
+    // of postForm) and builds its own `_raw` envelope on non-JSON bodies.
+    // The error is thrown → tool-handler catch → textResult (agent-
+    // visible). access_token is the only secret reachable here
+    // (refresh_token never travels to graph.microsoft.com), but a Graph
+    // 4xx that echoes a bearer-shaped string still flows out. Route the
+    // message text through the same scrub so this sink shares the
+    // single choke-point. Graph error prose (e.g. "Insufficient
+    // privileges") has no token shape and round-trips intact.
     const err = data?.error?.message ?? data?._raw ?? `HTTP ${res.status}`
-    throw new Error(`graph ${method} ${path} failed (${res.status}): ${String(err).slice(0, 500)}`)
+    throw new Error(
+      `graph ${method} ${path} failed (${res.status}): ${scrubSecretShapedText(String(err)).slice(0, 500)}`,
+    )
   }
   return data
 }
@@ -474,7 +726,7 @@ const mcp = new Server(
       'Before any mail/calendar/people call, ensure the target UPN has a paired token.',
       'Pair flow (authorization code): call pair_start → give the user the authorize_url → user signs in and approves → call pair_poll (status=success|pending|expired|error) until success.',
       'Default UPN may be bound via MS365_DEFAULT_UPN env; otherwise pass upn explicitly to every tool.',
-      'Tokens auto-refresh when within 5 minutes of expiry. Call logout to delete a token.',
+      'Tokens auto-refresh when expired or within 5 minutes of expiry, using the stored refresh_token (single-flighted so concurrent calls share one grant). Transient refresh failures keep the existing token and retry; a permanently-dead refresh_token (90-day cap / revoke) sets pair_status.status=token_expired and asks you to re-run pair_start. Call logout to delete a token.',
     ].join('\n'),
   },
 )
@@ -609,7 +861,17 @@ const tools: ToolDef[] = [
     handler: async args => {
       const upn = resolveUpn(args.upn)
       const cur = loadJson<TokenFile>(tokenPath(upn))
-      if (!cur) return textResult({ upn, paired: false })
+      // Issue #1343: surface a persisted token_expired marker so the
+      // operator (and the agent) can tell "re-auth required" apart from
+      // a transient blip without re-deriving it from a failed call.
+      const status = loadStatus(upn)
+      if (!cur) {
+        return textResult({
+          upn,
+          paired: false,
+          ...(status ? { status: status.status, needs_reauth: status.needs_reauth, reason: status.reason } : {}),
+        })
+      }
       const now = Math.floor(Date.now() / 1000)
       return textResult({
         upn,
@@ -618,6 +880,9 @@ const tools: ToolDef[] = [
         has_refresh_token: Boolean(cur.refresh_token),
         scope: cur.scope,
         saved_at_iso: new Date(cur.saved_at * 1000).toISOString(),
+        ...(status
+          ? { status: status.status, needs_reauth: status.needs_reauth, reason: status.reason }
+          : { status: 'ok', needs_reauth: false }),
       })
     },
   },
@@ -627,6 +892,9 @@ const tools: ToolDef[] = [
     schema: { type: 'object', properties: { upn: { type: 'string' } } },
     handler: async args => {
       const upn = resolveUpn(args.upn)
+      // Issue #1343: clear any token_expired marker on logout so a
+      // re-pair starts from a clean status.
+      clearTokenExpired(upn)
       try {
         unlinkSync(tokenPath(upn))
         return textResult({ upn, removed: true })
