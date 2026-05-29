@@ -346,7 +346,22 @@ if [[ -n "${BRIDGE_RUN_PENDING_FRESH_MARKER:-}" ]]; then
   unset BRIDGE_RUN_PENDING_FRESH_MARKER
 fi
 
-export PATH="$HOME/.local/bin:$HOME/.nix-profile/bin:/usr/local/bin:$PATH"
+# Issue #1352 (beta5-3 Track K): re-augment the launch shell PATH with the
+# resolved engine-manager dirs (nvm/pyenv/rbenv/asdf/fnm + BRIDGE_ENGINE_PATH)
+# rather than a hard-coded `~/.local/bin:~/.nix-profile/bin:/usr/local/bin`
+# list. bridge-lib.sh already ran bridge_augment_engine_path at source time
+# (above), so this is normally a no-op — but it removes the iso-only special
+# case (the shared codex pair, isolation_mode: shared, is what every admin
+# install auto-provisions, and it never reached the iso sudo-wrap PATH
+# injection at lib/bridge-agents.sh:3699-3723). Calling the same canonical
+# resolver here guarantees the bare `codex`/`claude` token in LAUNCH_CMD
+# resolves on user-local Node managers (nvm/pyenv/volta/asdf/fnm) whichever
+# codepath the agent took, and stays manager-rotation-proof (no pinned Node
+# version). The three legacy dirs are already covered by the lib-load-time
+# bridge_prepend_path_entry block, so dropping the inline literal loses
+# nothing. Idempotent (bridge_prepend_path_entry skips dirs already on PATH).
+bridge_augment_engine_path
+export PATH
 export BRIDGE_AGENT_ID="$AGENT"
 export BRIDGE_ADMIN_AGENT_ID="$(bridge_admin_agent_id)"
 export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
