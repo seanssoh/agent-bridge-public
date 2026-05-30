@@ -3406,7 +3406,10 @@ bridge_write_linux_agent_env_file() {
   idle_timeout="$(bridge_agent_idle_timeout "$agent")"
   session_id="$(bridge_agent_session_id "$agent")"
   history_key="${BRIDGE_AGENT_HISTORY_KEY[$agent]-}"
-  created_at="${BRIDGE_AGENT_CREATED_AT[$agent]-}"
+  # #1407 D2 (PR #1410): safe read via accessor — non-assoc map degrades
+  # to empty instead of aborting under `set -u` (same class as the persist
+  # path; this composer runs on the agent-start surface #1407 reproduces).
+  created_at="$(bridge_agent_created_at "$agent")"
   updated_at="${BRIDGE_AGENT_UPDATED_AT[$agent]-}"
   isolation_mode="$(bridge_agent_isolation_mode "$agent")"
   os_user="$(bridge_agent_os_user "$agent")"
@@ -9359,6 +9362,15 @@ bridge_agent_uses_legacy_launch_flags() {
 
 bridge_agent_session_id() {
   local agent="$1"
+  # #1407 D1: if BRIDGE_AGENT_SESSION_ID is not an associative array
+  # (unset / clobbered to scalar), an indexed read under `set -u` would
+  # arithmetic-index the agent id and abort with `<agent>: unbound variable`.
+  # Degrade to empty instead of aborting. Per-function declare-guard avoids
+  # the #1213 scalar-vs-`declare -g -A` collision class — do NOT redeclare.
+  if ! declare -p BRIDGE_AGENT_SESSION_ID 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_SESSION_ID[$agent]-}"
 }
 
@@ -9370,6 +9382,25 @@ bridge_agent_meta_file() {
 bridge_agent_history_key() {
   local agent="$1"
   printf '%s' "${BRIDGE_AGENT_HISTORY_KEY[$agent]-}"
+}
+
+# #1407 D2 (follow-up, PR #1410): centralized safe read of
+# BRIDGE_AGENT_CREATED_AT. When the map is not associative (unset, or
+# clobbered to a scalar in a session-resume edge), an indexed read under
+# `set -u` arithmetic-indexes the agent id and aborts with
+# `<agent>: unbound variable`. Degrade to the caller-supplied default
+# instead of aborting. The `-$default_val` (not `:-`) preserves prior
+# call-site semantics: a key *set* to empty stays empty; only an *unset*
+# key falls back. Per-function declare-guard avoids the #1213
+# scalar-vs-`declare -g -A` collision class — do NOT redeclare the map.
+bridge_agent_created_at() {
+  local agent="$1"
+  local default_val="${2-}"
+  if declare -p BRIDGE_AGENT_CREATED_AT 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+    printf '%s' "${BRIDGE_AGENT_CREATED_AT[$agent]-$default_val}"
+  else
+    printf '%s' "$default_val"
+  fi
 }
 
 bridge_agent_action() {
