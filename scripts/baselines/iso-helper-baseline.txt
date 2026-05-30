@@ -7,7 +7,7 @@
 # the moment of capture; the ratchet refuses new sites beyond this
 # count without an explicit baseline regeneration commit.
 
-bridge-a2a.py=4
+bridge-a2a.py=5
 bridge-agent.sh=19
 bridge-audit.py=2
 bridge-auth.py=7
