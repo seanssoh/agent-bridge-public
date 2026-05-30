@@ -185,11 +185,26 @@ check_healthz_detects_wedged() {
     "healthz reports healthz_timeout for a bound-but-not-accepting socket"
 }
 
-# --- Check 3: auto-restart re-runs the FULL fail-closed bind proof ---
-# kill -9 the receiver (process_gone), capture the old pid, run ONE daemon
-# sync, and assert a NEW pid is in the pidfile AND the log shows a fresh
-# preflight/listening line (proves resolve-then-prove ran on restart).
-check_auto_restart_reproves_bind() {
+# --- Check 3: supervised restart does NOT propagate the insecure-bind env ---
+# SECURITY (#1414 codex r1): the supervisor must scrub BRIDGE_A2A_ALLOW_TEST_BIND
+# / BRIDGE_A2A_DEV_INSECURE_BIND from its restart + healthz subprocesses, so a
+# daemon that inherited those vars cannot auto-restart the receiver under a
+# degraded loopback bind / secret-bypass contract. This smoke EXPORTS
+# BRIDGE_A2A_ALLOW_TEST_BIND=1 (top of file), so the daemon process genuinely
+# carries the var — exactly the scenario the supervisor must defang.
+#
+# We cannot test a *successful* supervised loopback restart: any bind-weakener
+# that survived the scrub would reintroduce the very hole this guards. So the
+# proof is non-propagation — kill the loopback receiver, run one supervised
+# sync, and assert the supervised restart REFUSED the inherited loopback
+# test-bind: the receiver stays down, the handoffd log shows no "(test mode)"
+# loopback line, and supervise.env records a bind_proof_failed restart attempt
+# (the supervisor DID try — it just correctly ran under the production bind
+# contract and the fail-closed proof rejected loopback).
+#
+# Pre-fix (no scrub): the supervised restart inherits ALLOW_TEST_BIND, binds
+# loopback, logs "(test mode)" and comes up — so all three assertions FAIL.
+check_auto_restart_scrubs_insecure_bind() {
   local old_pid
   old_pid="$(receiver_pid_now)"
   [[ -n "$old_pid" ]] || smoke_fail "no receiver pid for restart test"
@@ -203,32 +218,42 @@ check_auto_restart_reproves_bind() {
     (( waited > 50 )) && break
   done
 
-  # Mark the log boundary so we assert a FRESH preflight/listening after sync.
+  # Fresh restart counter so this single sync yields exactly one attempt.
+  rm -f "$(supervise_state)" 2>/dev/null || true
+  # Mark the log boundary so we inspect only THIS restart's handoffd output.
   local log_before
   log_before="$(wc -l < "$(handoffd_log)" 2>/dev/null || printf '0')"
 
   run_sync >/dev/null
 
-  # Wait for the supervisor-launched receiver to publish a new pid + listen.
+  # Give the supervised start a beat to (attempt to) come up, then assert it
+  # did NOT — the loopback bind must be refused because the scrub stripped
+  # ALLOW_TEST_BIND from the restart child.
   waited=0
-  while (( waited < 50 )); do
+  while (( waited < 20 )); do
     python3 "$SCRIPT_DIR/a2a-cross-bridge-helper.py" wait-port "$A2A_PORT" 2>/dev/null && break
     sleep 0.1
     waited=$((waited + 1))
   done
+  local port_rc=0
+  python3 "$SCRIPT_DIR/a2a-cross-bridge-helper.py" wait-port "$A2A_PORT" 2>/dev/null || port_rc=$?
+  smoke_assert_match "$port_rc" '^[1-9]' \
+    "supervised restart left the receiver DOWN — inherited loopback test-bind correctly refused"
 
-  local new_pid
-  new_pid="$(receiver_pid_now)"
-  smoke_assert_match "$new_pid" '^[0-9]+$' "restart published a new receiver pid"
-  [[ "$new_pid" != "$old_pid" ]] || smoke_fail "restart pid ($new_pid) equals the killed pid ($old_pid)"
-
-  # The fresh tail of the log must show the receiver listening again — proof
-  # the restart went through serve's bind path (which only runs AFTER the
-  # fail-closed preflight in bridge_a2a_receiver_start).
+  # The smoking gun: the handoffd log for this restart must NOT contain the
+  # ALLOW_TEST_BIND loopback success line. Its presence would prove the var
+  # leaked into the restart child.
   local fresh_tail
   fresh_tail="$(tail -n +"$((log_before + 1))" "$(handoffd_log)" 2>/dev/null || true)"
-  smoke_assert_contains "$fresh_tail" "listening" \
-    "restart re-ran the bind proof and the receiver is listening again"
+  smoke_assert_not_contains "$fresh_tail" "(test mode)" \
+    "supervised restart did NOT honor inherited BRIDGE_A2A_ALLOW_TEST_BIND (no loopback test-mode bind)"
+
+  # The supervisor DID attempt the restart (not a silent no-op) and recorded the
+  # fail-closed refusal as bind_proof_failed.
+  local state
+  state="$(cat "$(supervise_state)" 2>/dev/null || true)"
+  smoke_assert_match "$state" "A2A_RECEIVER_LAST_REASON=('?)bind_proof_failed" \
+    "supervised restart attempt recorded bind_proof_failed (production bind contract enforced)"
 }
 
 # --- Check 5: exit-cause captured (run before crash-loop reuses the config) --
@@ -393,7 +418,7 @@ main() {
 
   smoke_run "healthz subcommand is green against a live receiver" check_healthz_green
   smoke_run "healthz detects a wedged (SIGSTOP) serve loop" check_healthz_detects_wedged
-  smoke_run "auto-restart re-runs the fail-closed bind proof" check_auto_restart_reproves_bind
+  smoke_run "supervised restart scrubs inherited insecure-bind env (no propagation)" check_auto_restart_scrubs_insecure_bind
   smoke_run "exit-cause record captured on death" check_exit_cause_captured
   smoke_run "systemd-defer: probe+alarm only, no restart" check_systemd_defer
   smoke_run "crash-loop cap + alarm + admin task + no launch past cap" check_crashloop_cap_and_alarm

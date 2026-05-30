@@ -2732,8 +2732,16 @@ process_a2a_receiver_supervise_tick() {
     reason="process_gone"
   else
     # --- stage 2: serve probe (only when the process gate passed) ---
+    # SECURITY (#1414 codex r1): scrub the smoke-only insecure-bind escape
+    # hatches from EVERY supervisor-owned subprocess. If the daemon itself was
+    # launched with BRIDGE_A2A_ALLOW_TEST_BIND / BRIDGE_A2A_DEV_INSECURE_BIND in
+    # its env (e.g. a test harness), a plain child would inherit them — letting
+    # an auto-restart bring the receiver up on a loopback bind or with the
+    # peer-secret gate bypassed. The supervisor must never propagate them; the
+    # production bind/auth contract is non-negotiable for a daemon-driven action.
     local probe_out probe_rc=0
     probe_out="$(bridge_with_timeout 10 a2a_receiver_healthz \
+      env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
       python3 "$SCRIPT_DIR/bridge-handoffd.py" healthz \
         --config "$config" --timeout "$healthz_timeout" 2>/dev/null)" || probe_rc=$?
     # The reason word is the LAST stdout line (healthy / healthz_timeout /
@@ -2883,8 +2891,14 @@ process_a2a_receiver_supervise_tick() {
   # itself was launched with them, i.e. a smoke harness). `start` re-runs the
   # synchronous preflight (resolve_bind -> tailnet proof -> peer-secret gate).
   daemon_log_event "[a2a_receiver_supervise] receiver DOWN (reason=$reason); restarting via bridge-handoff-daemon.sh start (attempt $((restart_count + 1))/${max_restarts})"
+  # SECURITY (#1414 codex r1): scrub the smoke-only insecure-bind escape hatches
+  # so an auto-restart cannot inherit BRIDGE_A2A_ALLOW_TEST_BIND /
+  # BRIDGE_A2A_DEV_INSECURE_BIND from the daemon's env and bring the receiver up
+  # under a degraded loopback bind / secret-bypass contract. `start` re-runs the
+  # full preflight; this guarantees it runs against the PRODUCTION env.
   local start_rc=0
   bridge_with_timeout 60 a2a_receiver_restart \
+    env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
     bash "$SCRIPT_DIR/bridge-handoff-daemon.sh" start >/dev/null 2>&1 || start_rc=$?
 
   restart_count=$((restart_count + 1))
