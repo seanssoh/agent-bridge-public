@@ -125,8 +125,9 @@ the leap-path safe on Bash 5.3.9 hosts:
 
 ```bash
 cd <source-checkout>
-git fetch origin
-git checkout "$(git tag -l 'v0.14.5-beta*' | sort -V | tail -1)"
+git fetch origin --tags
+# Pin to the latest STABLE tag (vX.Y.Z, no -beta/-rc suffix) — currently v0.15.0.
+git checkout "$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
 ./agent-bridge upgrade --apply
 ```
 
