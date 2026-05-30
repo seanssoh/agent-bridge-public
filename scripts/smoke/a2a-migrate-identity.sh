@@ -278,4 +278,15 @@ run_migrate "$CFG4" --apply --drop-address >/dev/null
   || fail "(i) stale peer address dropped despite no migration"
 pass "(i) --drop-address removes migrated address, leaves untouched entries alone"
 
+# ---------------------------------------------------------------------------
+# (j) mid-write tightness: the secret-bearing temp is NEVER wider than 0600
+#     during the write+fsync window (even if the target pre-exists at 0644).
+#     Uses a python FILE helper (footgun #11 ban: no `python3 - <<PY` capture).
+# ---------------------------------------------------------------------------
+note "(j) temp never wider than 0600 mid-write"
+MIDWRITE_HELPER="$REPO_ROOT/scripts/smoke/a2a-migrate-identity-midwrite-helper.py"
+MW_OUT="$(python3 "$MIDWRITE_HELPER" "$CLI")" \
+  || fail "(j) mid-write temp leaked group/other bits: $MW_OUT"
+pass "(j) mid-write temp tight: $MW_OUT"
+
 echo "[$SMOKE_NAME] ALL PASS"
