@@ -435,6 +435,123 @@ def pending_upgrade_conflict_count(bridge_home: str) -> int:
     return count
 
 
+def _parse_shell_env(path: str) -> dict[str, str]:
+    """Parse a daemon-written `KEY=value` shell-state file into a dict.
+
+    Read-only, controller-local; uses os.path.isfile + builtin open (NOT
+    pathlib probes) so it adds no new lint-raw-pathlib site. Values may be
+    `printf %q`-quoted (the daemon writes them that way); we strip a single
+    pair of surrounding single quotes and unescape the `\\` form %q uses for a
+    plain token. Only KEY=value lines are honored; anything else is skipped.
+    Returns {} on a missing/unreadable file.
+    """
+    out: dict[str, str] = {}
+    if not path or not os.path.isfile(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return out
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip()
+        # %q single-quotes a value containing shell-special chars; a bare
+        # token (e.g. an integer) is emitted unquoted.
+        if len(val) >= 2 and val[0] == "'" and val[-1] == "'":
+            val = val[1:-1]
+        out[key] = val
+    return out
+
+
+def read_handoffd_health(state_dir: str, bridge_home: str) -> dict[str, object]:
+    """Read the A2A receiver supervisor's view for the status dashboard (#1405).
+
+    Returns a dict the renderers consume:
+      {
+        "configured": bool,    # handoff.local.json present (gates rendering —
+                               # the row is SILENT on non-A2A installs)
+        "state": str,          # running | stopped | crashloop | disabled
+        "restart_count": int,
+        "max_restarts": int,
+        "alarm": str,          # "" | "crashloop" | "bind_proof_failed"
+        "last_reason": str,    # "" | healthy | process_gone | healthz_* | ...
+        "last_exit_event": str,# terminal audit event mined at last death
+        "last_pid": str,       # from receiver-exit.json when down
+        "has_exit_cause": bool,# receiver-exit.json present
+      }
+
+    Pure read over state/handoff/receiver-supervise.env (+ receiver-exit.json),
+    written by the daemon's process_a2a_receiver_supervise_tick. No python-in-
+    python, no daemon coupling — the daemon owns the writes, status only reads.
+    Tolerant of every-file-absent (fresh install / never-died receiver).
+    """
+    # config presence — env override mirrors bridge_a2a_config_path() in the
+    # shell so a non-default BRIDGE_A2A_CONFIG path is honored.
+    config_path = os.environ.get("BRIDGE_A2A_CONFIG", "")
+    if not config_path and bridge_home:
+        config_path = os.path.join(os.path.expanduser(bridge_home), "handoff.local.json")
+    configured = bool(config_path) and os.path.isfile(config_path)
+
+    handoff_dir = os.path.join(state_dir, "handoff") if state_dir else ""
+    supervise_file = os.path.join(handoff_dir, "receiver-supervise.env") if handoff_dir else ""
+    exit_json = os.path.join(handoff_dir, "receiver-exit.json") if handoff_dir else ""
+
+    env = _parse_shell_env(supervise_file)
+    try:
+        restart_count = int(env.get("A2A_RECEIVER_RESTART_COUNT", "0") or 0)
+    except ValueError:
+        restart_count = 0
+    alarm = env.get("A2A_RECEIVER_ALARM", "") or ""
+    last_reason = env.get("A2A_RECEIVER_LAST_REASON", "") or ""
+    last_exit_event = env.get("A2A_RECEIVER_LAST_EXIT_EVENT", "") or ""
+
+    max_restarts_env = os.environ.get("BRIDGE_A2A_RECEIVER_MAX_RESTARTS", "5")
+    try:
+        max_restarts = int(max_restarts_env)
+    except ValueError:
+        max_restarts = 5
+
+    last_pid = ""
+    has_exit_cause = bool(exit_json) and os.path.isfile(exit_json)
+    if has_exit_cause:
+        try:
+            with open(exit_json, "r", encoding="utf-8", errors="replace") as fh:
+                cause = json.load(fh)
+            if isinstance(cause, dict):
+                last_pid = str(cause.get("last_pid", "") or "")
+        except (OSError, ValueError):
+            pass
+
+    # Derive a coarse state. The supervise.env LAST_REASON is the authoritative
+    # signal (the daemon writes "healthy" on a green probe and the failure
+    # reason on a death). Absence of a supervise.env means the supervisor has
+    # not yet run a non-trivial tick (treat as running if configured — the
+    # receiver may simply be healthy and never observed down).
+    if alarm:
+        state = "crashloop"
+    elif last_reason and last_reason != "healthy":
+        state = "stopped"
+    else:
+        state = "running"
+
+    return {
+        "configured": configured,
+        "state": state,
+        "restart_count": restart_count,
+        "max_restarts": max_restarts,
+        "alarm": alarm,
+        "last_reason": last_reason,
+        "last_exit_event": last_exit_event,
+        "last_pid": last_pid,
+        "has_exit_cause": has_exit_cause,
+    }
+
+
 def config_drift_count(audit_log: str, window_days: int = 7) -> int:
     """Count `cron_human_config_drift` and `channel_health_miss` audit rows
     over the last `window_days`. Renders as the `config-drift` line on the
@@ -721,6 +838,17 @@ def render_dashboard(args: argparse.Namespace) -> str:
         for row in roster
         if row.get("channels") == "miss"
     ]
+    # #1405: A2A receiver supervisor health. Read-only over the daemon-written
+    # supervise state; rendered only on A2A-configured installs (silent
+    # otherwise). `a2a_flag` is the header summary token (ALARM/DOWN), empty
+    # when healthy/disabled so non-A2A hosts stay quiet.
+    handoffd_health = read_handoffd_health(args.bridge_state_dir, args.bridge_home or "")
+    a2a_flag = ""
+    if handoffd_health["configured"]:
+        if handoffd_health["state"] == "crashloop":
+            a2a_flag = " | a2a=ALARM"
+        elif handoffd_health["state"] == "stopped":
+            a2a_flag = " | a2a=DOWN"
 
     for row in roster:
         metric = metrics.get(row["agent"], {})
@@ -768,7 +896,7 @@ def render_dashboard(args: argparse.Namespace) -> str:
     lines.append(
         f"updated {iso_now()} | daemon {'running' if daemon_running else 'stopped'} pid={daemon_pid} | "
         f"active {full_active_count}/{full_total_agents} | shown {visible_agents} | "
-        f"health warn={health_warn_count} crit={health_critical_count} | wake miss={wake_missing_count} | channel miss={channel_missing_count} | zombie={zombie_count} | db {queue_db}"
+        f"health warn={health_warn_count} crit={health_critical_count} | wake miss={wake_missing_count} | channel miss={channel_missing_count} | zombie={zombie_count}{a2a_flag} | db {queue_db}"
     )
     lines.append("")
     lines.append(
@@ -924,6 +1052,30 @@ def render_dashboard(args: argparse.Namespace) -> str:
         if len(plugin_lines) > 12:
             lines.append(f"- ... +{len(plugin_lines) - 12} more")
 
+    # #1405: A2A receiver health row — rendered only when handoff.local.json
+    # exists (silent on non-A2A installs, the common case). Surfaces the
+    # silent "send-OK / receive-dead" half state the issue reported.
+    if handoffd_health["configured"]:
+        lines.append("")
+        lines.append("A2A Receiver")
+        hh = handoffd_health
+        if hh["state"] == "crashloop":
+            window = os.environ.get("BRIDGE_A2A_RECEIVER_RESTART_WINDOW_SECONDS", "600")
+            lines.append(
+                f"  A2A receiver  !! ALARM crash-loop "
+                f"({hh['restart_count']} restarts/{window}s) — "
+                f"auto-restart STOPPED; see receiver-exit.json"
+            )
+        elif hh["state"] == "stopped":
+            last_exit = f" last_exit={hh['last_exit_event']}" if hh["last_exit_event"] else ""
+            pid_note = f" (last pid {hh['last_pid']})" if hh["last_pid"] else ""
+            lines.append(
+                f"  A2A receiver  !! DOWN — reason={hh['last_reason'] or 'unknown'}"
+                f"{last_exit} restarts={hh['restart_count']}/{hh['max_restarts']}{pid_note}"
+            )
+        else:
+            lines.append("  A2A receiver  running healthy")
+
     lines.append("")
     lines.append("Open Tasks")
     if not open_tasks:
@@ -1016,6 +1168,10 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
         # count so JSON consumers (dashboard / admin-bot / smoke) can
         # observe the same number the human-facing warning line emits.
         "pending_upgrade_conflicts": pending_upgrade_conflict_count(args.bridge_home or ""),
+        # Issue #1405: A2A receiver supervisor health. JSON consumers (the
+        # 1405 smoke, admin-bot) observe the same state the human dashboard
+        # renders. Always emitted; `configured: false` on non-A2A installs.
+        "a2a_receiver": read_handoffd_health(args.bridge_state_dir, args.bridge_home or ""),
         # Issue #1323 Track G — same audit-derived nudge-verify counters
         # the human-facing dashboard renders. JSON consumers (smoke
         # `1323-nudge-eligibility-recheck-twostage.sh`, future admin-bot)

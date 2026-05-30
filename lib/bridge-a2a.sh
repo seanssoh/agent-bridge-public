@@ -208,6 +208,21 @@ bridge_a2a_deliver_tick() {
   python3 "$repo_root/bridge-a2a.py" deliver "$@"
 }
 
+# Thin wrapper around `bridge-handoffd.py healthz` (#1405) — read-only serve
+# liveness probe via GET /healthz against the configured (resolve_bind-proven)
+# bind. Prints the reason word on stdout, returns the python exit code. Never
+# binds/serves. Used by `agb a2a daemon healthz` and surfaced in status.
+bridge_a2a_receiver_healthz() {
+  local repo_root config
+  repo_root="$(bridge_a2a_repo_root)"
+  config="$(bridge_a2a_config_path)"
+  if [[ ! -f "$config" ]]; then
+    echo "[a2a][error] config not found: $config" >&2
+    return 1
+  fi
+  python3 "$repo_root/bridge-handoffd.py" healthz --config "$config" "$@"
+}
+
 bridge_a2a_status() {
   local config
   config="$(bridge_a2a_config_path)"
@@ -220,6 +235,38 @@ bridge_a2a_status() {
     echo "receiver      : stopped"
   fi
   echo "log           : $(bridge_a2a_log_file)"
+
+  # #1405: surface the daemon supervisor's view — restart counter, alarm, and
+  # last-exit cause — so `agb a2a daemon status` shows the supervised health,
+  # not just the bare pid state. The supervise.env is the daemon-written
+  # state file (all scalar, A2A_RECEIVER_*-namespaced; sourced safely here).
+  local supervise_file
+  supervise_file="$(bridge_a2a_handoff_dir)/receiver-supervise.env"
+  if [[ -f "$supervise_file" ]]; then
+    # Subshell-source so the A2A_RECEIVER_* vars never leak into the caller's
+    # scope (and a malformed file cannot poison it).
+    (
+      # shellcheck source=/dev/null
+      # shellcheck disable=SC1090
+      source "$supervise_file" 2>/dev/null || exit 0
+      local rc="${A2A_RECEIVER_RESTART_COUNT:-0}"
+      local alarm="${A2A_RECEIVER_ALARM:-}"
+      local reason="${A2A_RECEIVER_LAST_REASON:-}"
+      local exit_event="${A2A_RECEIVER_LAST_EXIT_EVENT:-}"
+      if [[ -n "$alarm" ]]; then
+        printf 'supervise     : ALARM=%s restarts=%s last_reason=%s\n' \
+          "$alarm" "$rc" "${reason:-unknown}"
+      elif [[ -n "$reason" && "$reason" != "healthy" ]]; then
+        printf 'supervise     : restarts=%s last_reason=%s\n' "$rc" "$reason"
+      else
+        printf 'supervise     : healthy (restarts=%s)\n' "$rc"
+      fi
+      [[ -n "$exit_event" ]] && printf 'last_exit     : %s\n' "$exit_event"
+    )
+  fi
+  local exit_json
+  exit_json="$(bridge_a2a_handoff_dir)/receiver-exit.json"
+  [[ -f "$exit_json" ]] && echo "exit_cause    : $exit_json"
 }
 
 # Trigger + preview one receiver self-heal reconcile (P-self-heal-1, #1403).
