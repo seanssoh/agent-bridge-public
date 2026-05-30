@@ -1730,7 +1730,12 @@ bridge_write_agent_state_file() {
   continue_mode="$(bridge_agent_continue "$agent")"
   session_id="$(bridge_agent_session_id "$agent")"
   history_key="$(bridge_agent_history_key "$agent")"
-  created_at="${BRIDGE_AGENT_CREATED_AT[$agent]-$(date +%s)}"
+  # #1407 D2 (PR #1410): codex flagged this persist-path read as the
+  # remaining unguarded sibling of the bridge_refresh_agent_session_id
+  # guard — reached via detect -> bridge_persist_agent_state. Route through
+  # the safe accessor so a non-assoc BRIDGE_AGENT_CREATED_AT degrades to
+  # now() instead of aborting under `set -u`.
+  created_at="$(bridge_agent_created_at "$agent" "$(date +%s)")"
   updated_at="$(bridge_now_iso)"
 
   BRIDGE_AGENT_UPDATED_AT["$agent"]="$updated_at"
@@ -4099,13 +4104,11 @@ bridge_refresh_agent_session_id() {
   # #1407 D2: if BRIDGE_AGENT_CREATED_AT is not an associative array
   # (unset / clobbered to scalar), an indexed read under `set -u` would
   # arithmetic-index the agent id and abort with `<agent>: unbound variable`.
-  # Fall back to now() instead of aborting. Per-function declare-guard avoids
-  # the #1213 scalar-vs-`declare -g -A` collision class — do NOT redeclare.
-  if declare -p BRIDGE_AGENT_CREATED_AT 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
-    since_hint="${BRIDGE_AGENT_CREATED_AT[$agent]-$(date +%s)}"
-  else
-    since_hint="$(date +%s)"
-  fi
+  # Route through the centralized safe accessor (bridge_agent_created_at),
+  # which carries the declare-guard once and degrades to the default — here
+  # now() — instead of aborting. Keeps a single source of truth shared with
+  # the persist path (bridge_write_agent_state_file).
+  since_hint="$(bridge_agent_created_at "$agent" "$(date +%s)")"
   local _quarantine_csv=""
   local quarantine_id
   local -a quarantine_ids=()

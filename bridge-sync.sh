@@ -51,7 +51,7 @@ prune_missing_dynamic_agents() {
       continue
     fi
 
-    created_at="${BRIDGE_AGENT_CREATED_AT[$agent]-0}"
+    created_at="$(bridge_agent_created_at "$agent" 0)"
     now_epoch="$(date +%s)"
     if [[ "$created_at" =~ ^[0-9]+$ ]]; then
       age=$((now_epoch - created_at))
@@ -128,7 +128,7 @@ refresh_missing_session_ids() {
       excluded+=("$key")
     done
     exclude_csv="$(IFS=,; echo "${excluded[*]}")"
-    created_at="${BRIDGE_AGENT_CREATED_AT[$agent]-0}"
+    created_at="$(bridge_agent_created_at "$agent" 0)"
     if [[ -z "$created_at" ]]; then
       created_at="0"
     fi

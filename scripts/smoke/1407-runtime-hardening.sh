@@ -9,8 +9,12 @@
 #       BRIDGE_AGENT_SESSION_ID when it is not an associative array (unset /
 #       clobbered to scalar) → arithmetic-indexes the agent id under `set -u`
 #       → `<agent>: unbound variable` abort.
-#   D2  bridge_refresh_agent_session_id() (lib/bridge-state.sh): same non-assoc
-#       failure on BRIDGE_AGENT_CREATED_AT via the `since_hint` read.
+#   D2  created-at indexed reads of BRIDGE_AGENT_CREATED_AT — same non-assoc
+#       failure as D1. Originally surfaced via bridge_refresh_agent_session_id's
+#       `since_hint` read; codex (PR #1410 r1) found the detect->persist path
+#       (bridge_write_agent_state_file) carried the same unguarded read. All
+#       such reads now route through ONE central guarded accessor,
+#       bridge_agent_created_at() (lib/bridge-agents.sh).
 #   D3  process_a2a_outbox_stuck_scan_tick() (bridge-daemon.sh): markdown-bullet
 #       `printf '- ...'` lines — bash printf parses the leading `-` as an option
 #       → `printf: - : invalid option`.
@@ -79,42 +83,86 @@ else
 	fail "D1 bridge_agent_session_id did not return empty as expected"
 fi
 
-# --- D2: bridge_refresh_agent_session_id `since_hint` declare-guard ----------
-# The since_hint read of BRIDGE_AGENT_CREATED_AT (lib/bridge-state.sh) is the
-# #1407 D2 site. We pin the fixed branch directly: the full surrounding function
-# walks BRIDGE_AGENT_IDS and a long detect/persist plumbing chain that is not
-# the regression target and is awkward to stub deterministically, so the assert
-# below exercises ONLY the declare-guard the fix added — the exact lines that,
-# pre-fix, arithmetic-indexed the agent id under `set -u` and aborted with
-# `<agent>: unbound variable`. A source-presence guard (D2-src) additionally
-# confirms the guarded form is the one that ships in lib/bridge-state.sh.
-d2_out="$(
+# --- D2-accessor: bridge_agent_created_at degrades to default on non-assoc ----
+# The #1407 D2 created-at reads now route through ONE central guarded accessor
+# (bridge_agent_created_at, lib/bridge-agents.sh). codex (PR #1410 r1) showed
+# the original per-site guard was incomplete (the detect->persist path stayed
+# unguarded), so we now assert the accessor's behavior directly: with
+# BRIDGE_AGENT_CREATED_AT clobbered to a scalar under `set -u`, it must return
+# the caller default instead of aborting with `<agent>: unbound variable`.
+d2acc_out="$(
 	"$BASH4" -c '
 		set -u
+		source "'"$SCRIPT_DIR"'/lib/bridge-core.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-state.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-agents.sh" 2>/dev/null || true
 		unset BRIDGE_AGENT_CREATED_AT 2>/dev/null || true
-		agent="some-agent"
-		if declare -p BRIDGE_AGENT_CREATED_AT 2>/dev/null | grep -q "declare -[A-Za-z]*A"; then
-			since_hint="${BRIDGE_AGENT_CREATED_AT[$agent]-$(date +%s)}"
-		else
-			since_hint="$(date +%s)"
-		fi
-		printf "SINCE=[%s]\n" "$since_hint"
+		BRIDGE_AGENT_CREATED_AT=scalar
+		printf "D2ACC=[%s]\n" "$(bridge_agent_created_at some-agent 99)"
 	' 2>&1
 )" || true
-printf '%s\n' "$d2_out"
-if printf '%s' "$d2_out" | grep -q 'unbound variable'; then
-	fail "D2 since_hint declare-guard aborted with 'unbound variable' on unset assoc array"
-elif printf '%s' "$d2_out" | grep -qE 'SINCE=\[[0-9]+\]'; then
-	pass "D2 since_hint declare-guard yields a numeric date-default on unset assoc array (no abort)"
+printf '%s\n' "$d2acc_out"
+if printf '%s' "$d2acc_out" | grep -q 'unbound variable'; then
+	fail "D2-accessor bridge_agent_created_at aborted with 'unbound variable' on non-assoc map"
+elif printf '%s' "$d2acc_out" | grep -q 'D2ACC=\[99\]'; then
+	pass "D2-accessor bridge_agent_created_at degrades to caller default on non-assoc map (no abort)"
 else
-	fail "D2 since_hint declare-guard did not yield a numeric fallback"
+	fail "D2-accessor bridge_agent_created_at did not return the caller default"
 fi
 
-# --- D2-src: the guarded since_hint form is what ships in lib/bridge-state.sh -
-if grep -q "declare -p BRIDGE_AGENT_CREATED_AT" "$SCRIPT_DIR/lib/bridge-state.sh"; then
-	pass "D2-src lib/bridge-state.sh contains the BRIDGE_AGENT_CREATED_AT declare-guard"
+# --- D2-persist: codex's exact repro — the detect->persist created-at read ----
+# bridge_write_agent_state_file (lib/bridge-state.sh) is reached via
+# bridge_refresh_agent_session_id -> bridge_persist_agent_state on a successful
+# detect. Pre-fix it carried an UNGUARDED `${BRIDGE_AGENT_CREATED_AT[$agent]-…}`
+# read that still aborted on the same non-assoc state D2 is meant to tolerate.
+# Drive that function directly under a scalar-clobbered map; pre-fix signature
+# is `<agent>: unbound variable`.
+d2per_out="$(
+	"$BASH4" -c '
+		set -u
+		source "'"$SCRIPT_DIR"'/lib/bridge-core.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-state.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-agents.sh" 2>/dev/null || true
+		bridge_reset_roster_maps 2>/dev/null || true
+		agent=some-agent
+		BRIDGE_AGENT_IDS=("$agent")
+		BRIDGE_AGENT_DESC["$agent"]="$agent"
+		BRIDGE_AGENT_ENGINE["$agent"]="claude"
+		BRIDGE_AGENT_SESSION["$agent"]="sess"
+		BRIDGE_AGENT_WORKDIR["$agent"]="/tmp"
+		BRIDGE_AGENT_SOURCE["$agent"]="static"
+		BRIDGE_AGENT_LOOP["$agent"]="1"
+		BRIDGE_AGENT_CONTINUE["$agent"]="1"
+		BRIDGE_AGENT_SESSION_ID["$agent"]="sid"
+		unset BRIDGE_AGENT_CREATED_AT
+		BRIDGE_AGENT_CREATED_AT=scalar
+		bridge_write_agent_state_file "$agent" "$(mktemp "${TMPDIR:-/tmp}/agb-1407-state.XXXXXX")" \
+			&& printf "D2PER=ok\n"
+	' 2>&1
+)" || true
+printf '%s\n' "$d2per_out"
+if printf '%s' "$d2per_out" | grep -q 'unbound variable'; then
+	fail "D2-persist bridge_write_agent_state_file aborted on non-assoc CREATED_AT (the r1 BLOCKING site)"
 else
-	fail "D2-src lib/bridge-state.sh missing the BRIDGE_AGENT_CREATED_AT declare-guard"
+	pass "D2-persist bridge_write_agent_state_file tolerates non-assoc CREATED_AT (detect->persist path)"
+fi
+
+# --- D2-class: every indexed CREATED_AT read routes through the accessor ------
+# The only permitted indexed `BRIDGE_AGENT_CREATED_AT[$agent]-` read is the
+# accessor's own `-$default_val}` form (behind its declare-guard). Any other is
+# an unguarded reintroduction of the #1407 D2 abort class.
+d2cls_hits="$(
+	grep -rnF 'BRIDGE_AGENT_CREATED_AT[$agent]-' \
+		"$SCRIPT_DIR/lib/bridge-agents.sh" \
+		"$SCRIPT_DIR/lib/bridge-state.sh" \
+		"$SCRIPT_DIR/bridge-sync.sh" 2>/dev/null \
+	| grep -vF -- '-$default_val}' || true
+)"
+if [ -z "$d2cls_hits" ]; then
+	pass "D2-class all indexed CREATED_AT reads route through the guarded accessor"
+else
+	fail "D2-class unguarded indexed CREATED_AT reads remain:"
+	printf '%s\n' "$d2cls_hits"
 fi
 
 # --- D3: stuck-scan markdown bullets emit literal `- ...` (no invalid option) -
