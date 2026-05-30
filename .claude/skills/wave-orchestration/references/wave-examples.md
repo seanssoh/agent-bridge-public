@@ -119,7 +119,7 @@ $EDITOR /tmp/agb-302-codex-review.md
 Agent({
   description: "Codex review of PR #302 ACL plugin sharing",
   subagent_type: "codex:codex-rescue",
-  prompt: `Code review PR #302 of SYRS-AI/agent-bridge-public — "isolate: channel-ownership-aware plugin sharing for isolated UIDs".
+  prompt: `Code review PR #302 of seanssoh/agent-bridge-public — "isolate: channel-ownership-aware plugin sharing for isolated UIDs".
 
 Codex CLI is installed and ready. If your first probe disagrees, re-check via:
 PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" codex --version

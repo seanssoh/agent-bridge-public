@@ -318,7 +318,7 @@ For background, these Bridge-side closures are the symmetric fixes to what this 
 - `#1214` — Bridge's channel validator routes through the iso-side read fallback, no `sg` wrap needed (closed beta26)
 - `#1215` — Bridge creates plugin state dirs (`.teams/`, `.ms365/`) with `02770` mode so iso UID can write (closed beta26)
 
-If you observe a Bridge-side issue while authoring your plugin (env var that should propagate but doesn't, path your plugin can't traverse but should be able to), file at https://github.com/SYRS-AI/agent-bridge-public/issues so it can be addressed in a Bridge release.
+If you observe a Bridge-side issue while authoring your plugin (env var that should propagate but doesn't, path your plugin can't traverse but should be able to), file at https://github.com/seanssoh/agent-bridge-public/issues so it can be addressed in a Bridge release.
 
 ## 6. Minimum viable iso v2 plugin checklist
 
@@ -342,7 +342,7 @@ If your plugin passes this checklist, it should be safe to ship into a Bridge-ma
 - Bridge runtime layout: `ARCHITECTURE.md`
 - Live install behavior: `OPERATIONS.md`
 - Known live-session quirks: `KNOWN_ISSUES.md`
-- File issues: https://github.com/SYRS-AI/agent-bridge-public/issues
+- File issues: https://github.com/seanssoh/agent-bridge-public/issues
 
 ---
 

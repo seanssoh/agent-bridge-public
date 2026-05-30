@@ -170,7 +170,7 @@ cat >&2 <<'DIE'
 Agent Bridge v0.8.0 requires isolation-v2 (POSIX group + setgid).
   current_layout=markerless(existing-install)
   remediation: run `agent-bridge upgrade --apply` to migrate this install to v2, or roll back to v0.7.x.
-  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details.
+  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/seanssoh/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details.
 DIE
 exit 1
 FAKE

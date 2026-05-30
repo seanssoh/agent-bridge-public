@@ -42,7 +42,7 @@ Admin's queue grows monotonically when alerts that admin cannot resolve land in 
 
 For the inverse case — admin should *not* push outbound nudges/maintenance to dynamic agents whose operators are already at the agent's TUI — see the same family of issues #304 and #343.
 
-[#303]: https://github.com/SYRS-AI/agent-bridge-public/issues/303
+[#303]: https://github.com/seanssoh/agent-bridge-public/issues/303
 
 ## Admin First-Run Onboarding Defaults
 

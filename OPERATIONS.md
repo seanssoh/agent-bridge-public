@@ -116,17 +116,18 @@ without guessing.
 
 표준 upgrade 절차는 [`UPGRADING.md`](UPGRADING.md) 에 정리되어 있다. 모든 install 에서 동일한 명령으로 진행한다:
 
-**Current target**: upgrade to the latest **`v0.14.5-betaN`** release. The
-v0.14.5 line is an ongoing prerelease series with no separate stable tag, so
-the latest `v0.14.5-betaN` tag is the current target. A single
+**Current target**: upgrade to **`v0.15.0`** (stable). It supersedes the
+`v0.15.0-rc1` / `v0.15.0-betaN` / `v0.14.5-betaN` prereleases, so the latest
+stable tag is the current target. A single
 `agent-bridge upgrade --apply` lands there from any v0.7.x+ source; the
 v0.13.7-v0.13.9 heredoc-chain fixes (extracted to `lib/upgrade-helpers/`) keep
 the leap-path safe on Bash 5.3.9 hosts:
 
 ```bash
 cd <source-checkout>
-git fetch origin
-git checkout "$(git tag -l 'v0.14.5-beta*' | sort -V | tail -1)"
+git fetch origin --tags
+# Pin to the latest STABLE tag (vX.Y.Z, no -beta/-rc suffix) — currently v0.15.0.
+git checkout "$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
 ./agent-bridge upgrade --apply
 ```
 
@@ -197,7 +198,7 @@ For per-stage detail, see `CHANGELOG.md` `[0.14.0]`. For the stabilization roadm
 
 ### v0.13.x hotfix wave (2026-05-15) — historical context
 
-**Current recommendation**: upgrade to the current target (the latest `v0.14.5-betaN` — see the top of the Upgrade section). This section is preserved as historical context for the leap-path blockers that v0.13.7-v0.13.10 resolved.
+**Current recommendation**: upgrade to the current target (`v0.15.0` stable — see the top of the Upgrade section). This section is preserved as historical context for the leap-path blockers that v0.13.7-v0.13.10 resolved.
 
 The v0.13.7-v0.13.10 cycle fixed a four-stage `agent-bridge upgrade --apply` blocker that affected the v0.7.x → v0.13.x leap on Bash 5.3.9 hosts (matched by recent Linux distros). Operators on macOS were similarly affected by a markerless-existing-install layout reject. The v0.14.x line carries those fixes forward — operators can leap directly from v0.7.x/v0.8.x/v0.9.x/v0.10.x/v0.11.x/v0.12.x to the current target in a single `agent-bridge upgrade --apply` step.
 
@@ -849,8 +850,8 @@ different support targets for multi-tenant isolation:
   `BRIDGE_AGENT_ISOLATION_MODE=linux-user` enforces per-agent UID
   separation and is required when agents hold delegated credentials or
   handle untrusted external input. See issues
-  [#68](https://github.com/SYRS-AI/agent-bridge-public/issues/68) and
-  [#85](https://github.com/SYRS-AI/agent-bridge-public/issues/85).
+  [#68](https://github.com/seanssoh/agent-bridge-public/issues/68) and
+  [#85](https://github.com/seanssoh/agent-bridge-public/issues/85).
 
 On macOS the `linux-user` mode falls back to shared silently (see
 `bridge_agent_linux_user_isolation_effective` in
@@ -875,7 +876,7 @@ controller-side path. Direct sqlite access from the isolated UID stays
 blocked by the `BRIDGE_TASK_DB` ACL strip; gateway routing is selected
 explicitly via the `BRIDGE_GATEWAY_PROXY=1` flag the scoped env writer
 emits when `BRIDGE_AGENT_ISOLATION_MODE=linux-user`. See issue
-[#294](https://github.com/SYRS-AI/agent-bridge-public/issues/294).
+[#294](https://github.com/seanssoh/agent-bridge-public/issues/294).
 
 > **Upgrading from <0.6.13:** the gateway-proxy gate now requires
 > `BRIDGE_GATEWAY_PROXY=1` in the scoped env. Restart isolated agents

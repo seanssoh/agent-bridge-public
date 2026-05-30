@@ -194,13 +194,13 @@ bridge_layout_resolver_validate_env() {
       bridge_die "Agent Bridge v0.8.0 requires isolation-v2 (POSIX group + setgid).
   current_layout=${layout}
   remediation: run \`agent-bridge upgrade --apply\` to migrate, or roll back to v0.7.x.
-  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
+  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/seanssoh/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
       ;;
     *)
       bridge_die "Agent Bridge v0.8.0 requires isolation-v2 (POSIX group + setgid).
   current_layout=${layout}
   remediation: unset BRIDGE_LAYOUT or set BRIDGE_LAYOUT=v2 (only accepted value).
-  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
+  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/seanssoh/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
       ;;
   esac
 }
@@ -385,7 +385,7 @@ bridge_resolve_layout() {
   current_layout=${BRIDGE_LAYOUT}
   marker=${marker_path}
   remediation: run \`agent-bridge upgrade --apply\` to migrate, or roll back to v0.7.x.
-  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
+  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/seanssoh/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
       fi
     fi
     # Marker is on disk but failed validation — bridge_warn already fired
@@ -406,7 +406,7 @@ bridge_resolve_layout() {
     bridge_die "Agent Bridge v0.8.0 requires isolation-v2 (POSIX group + setgid).
   current_layout=markerless(existing-install)
   remediation: run \`agent-bridge upgrade --apply\` to migrate this install to v2, or roll back to v0.7.x.
-  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
+  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/seanssoh/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
   fi
 
   # Fresh install candidate. Pre-v0.8.0 this branch left BRIDGE_LAYOUT
@@ -439,7 +439,7 @@ bridge_resolve_layout() {
   bridge_die "Agent Bridge v0.8.0 requires isolation-v2 (POSIX group + setgid).
   current_layout=markerless(${BRIDGE_LAYOUT_SOURCE})
   remediation: run \`agent-bridge upgrade --apply\` to migrate this install to v2, or roll back to v0.7.x.
-  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
+  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/seanssoh/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
 }
 
 # ---------------------------------------------------------------------------

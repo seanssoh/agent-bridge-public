@@ -138,7 +138,7 @@ This walks the live roster (so dynamic agents are not silently hidden) and print
 
 ### Background
 
-Issue [#507](https://github.com/SYRS-AI/agent-bridge-public/issues/507) documented a chain of three bugs in the daily-backup system that, together, fill the host disk with orphaned `*.tgz.tmp.*` files (~1.9 GB each), corrupt `~/.claude.json`, and render every `claude -p` subagent inoperable. The same upgrade also addresses two adjacent problems Sean surfaced in the same diagnosis pass: `state/tasks.db` was being bundled into every daily tarball as a raw, ~uncompressible binary (so 30-day retention multiplied it ~30× with near-zero dedup), and `backups/upgrade-*/` snapshots had no prune logic at all.
+Issue [#507](https://github.com/seanssoh/agent-bridge-public/issues/507) documented a chain of three bugs in the daily-backup system that, together, fill the host disk with orphaned `*.tgz.tmp.*` files (~1.9 GB each), corrupt `~/.claude.json`, and render every `claude -p` subagent inoperable. The same upgrade also addresses two adjacent problems Sean surfaced in the same diagnosis pass: `state/tasks.db` was being bundled into every daily tarball as a raw, ~uncompressible binary (so 30-day retention multiplied it ~30× with near-zero dedup), and `backups/upgrade-*/` snapshots had no prune logic at all.
 
 v0.7.2 ships:
 

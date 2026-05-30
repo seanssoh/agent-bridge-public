@@ -5319,7 +5319,7 @@ All changes auto-apply on the first `agent-bridge upgrade --apply` to v0.7.6+. E
 
 ### Highlight — admin codex pair as a standard install asset (#517)
 
-`v0.7.4` ships [#517](https://github.com/SYRS-AI/agent-bridge-public/issues/517) (operator approved 2026-05-03): every admin agent now gets a sibling `<admin>-dev` codex agent automatically, and the admin's CLAUDE.md gains a managed block codifying the pair-programming SOP — so the `AGENTS.md` "Multi-Agent Collaboration" workflow is a real install asset rather than relying on per-install custom edits or operator memory.
+`v0.7.4` ships [#517](https://github.com/seanssoh/agent-bridge-public/issues/517) (operator approved 2026-05-03): every admin agent now gets a sibling `<admin>-dev` codex agent automatically, and the admin's CLAUDE.md gains a managed block codifying the pair-programming SOP — so the `AGENTS.md` "Multi-Agent Collaboration" workflow is a real install asset rather than relying on per-install custom edits or operator memory.
 
 ### Added (#517 — PR #521)
 
@@ -5339,7 +5339,7 @@ All changes auto-apply on the first `agent-bridge upgrade --apply` to v0.7.6+. E
 
 ### Highlight — issue #509 closed (compact recovery + skill discovery migration), `agb doctor` admin self-healing, `#516` settings gating
 
-`v0.7.3` ships the full plan from [#509](https://github.com/SYRS-AI/agent-bridge-public/issues/509) (Sean's "stop SKILLS.md from re-emitting itself every session + don't drop SOUL/MEMORY on auto-compaction" candidate), the [#511](https://github.com/SYRS-AI/agent-bridge-public/issues/511) `agb doctor` read-only command for admin self-healing, and the [#516](https://github.com/SYRS-AI/agent-bridge-public/issues/516) static-only gate on shared `autoCompactWindow=400000` propagation. A small UX bundle bundled with #516 closes three smaller paper-cuts surfaced from the #509 wave handoff.
+`v0.7.3` ships the full plan from [#509](https://github.com/seanssoh/agent-bridge-public/issues/509) (Sean's "stop SKILLS.md from re-emitting itself every session + don't drop SOUL/MEMORY on auto-compaction" candidate), the [#511](https://github.com/seanssoh/agent-bridge-public/issues/511) `agb doctor` read-only command for admin self-healing, and the [#516](https://github.com/seanssoh/agent-bridge-public/issues/516) static-only gate on shared `autoCompactWindow=400000` propagation. A small UX bundle bundled with #516 closes three smaller paper-cuts surfaced from the #509 wave handoff.
 
 ### Added (compact recovery — #509 P3 / C3+C4 — PR #510, deployment fix #512)
 
@@ -5385,7 +5385,7 @@ All changes auto-apply on the first `agent-bridge upgrade --apply` to v0.7.6+. E
 
 ### Highlight — daily-backup death-spiral root-cause + auto-cleanup migration
 
-`v0.7.2` fixes the chain of bugs documented in [#507](https://github.com/SYRS-AI/agent-bridge-public/issues/507) — orphaned `*.tgz.tmp.*` files filling host disks (~110 GB observed in a single overnight window across two hosts), no preflight free-space check, and a 30-day retention default that compounded the problem. The same release addresses two adjacent issues Sean surfaced during diagnosis: `state/tasks.db` was bundled raw into every daily tarball (uncompressible, ~30× multiplier under retention), and `backups/upgrade-*/` snapshots had no prune at all.
+`v0.7.2` fixes the chain of bugs documented in [#507](https://github.com/seanssoh/agent-bridge-public/issues/507) — orphaned `*.tgz.tmp.*` files filling host disks (~110 GB observed in a single overnight window across two hosts), no preflight free-space check, and a 30-day retention default that compounded the problem. The same release addresses two adjacent issues Sean surfaced during diagnosis: `state/tasks.db` was bundled raw into every daily tarball (uncompressible, ~30× multiplier under retention), and `backups/upgrade-*/` snapshots had no prune at all.
 
 ### Fixed (#507)
 

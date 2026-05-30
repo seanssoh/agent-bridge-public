@@ -89,8 +89,8 @@ system-wide daemon. Shipping a half-working macOS variant would create
 the illusion of isolation without the guarantees, which is strictly
 worse than documenting macOS as shared-mode-only.
 
-See [#68](https://github.com/SYRS-AI/agent-bridge-public/issues/68) for
-the full threat model and rationale, and [#85](https://github.com/SYRS-AI/agent-bridge-public/issues/85)
+See [#68](https://github.com/seanssoh/agent-bridge-public/issues/68) for
+the full threat model and rationale, and [#85](https://github.com/seanssoh/agent-bridge-public/issues/85)
 for the Linux-only migration helper.
 
 ## Recommendations

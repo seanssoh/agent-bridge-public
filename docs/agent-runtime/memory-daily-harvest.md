@@ -417,7 +417,7 @@ invocation.
 
 ## 12. Static-only contract
 
-Per [issue #376](https://github.com/SYRS-AI/agent-bridge-public/issues/376),
+Per [issue #376](https://github.com/seanssoh/agent-bridge-public/issues/376),
 the `memory-daily-<agent>` cron + `memory-daily-harvest.sh` harvester pipeline
 is intentionally scoped to **static** agents only.
 

@@ -413,7 +413,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_common(cmd: argparse.ArgumentParser) -> None:
-        cmd.add_argument("--repo", default=os.environ.get("BRIDGE_RELEASE_REPO", "SYRS-AI/agent-bridge-public"))
+        cmd.add_argument("--repo", default=os.environ.get("BRIDGE_RELEASE_REPO", "seanssoh/agent-bridge-public"))
         cmd.add_argument("--installed-version", default=os.environ.get("BRIDGE_RELEASE_INSTALLED_VERSION", ""))
         cmd.add_argument("--api-url", default=os.environ.get("BRIDGE_RELEASE_API_URL", ""))
         cmd.add_argument("--mock-json-file", default="")
