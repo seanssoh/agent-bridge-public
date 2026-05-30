@@ -5071,11 +5071,31 @@ bridge_agent_onboarding_state() {
   # `setup agent` correctly flagged the half-scaffold. Marker probe
   # uses the same controller-first / iso-UID fallback trust path as
   # the SESSION-TYPE.md read above.
+  #
+  # Field-line anchor (parser-trap hardening): the SESSION-TYPE.md
+  # templates carry the real state on a top-block metadata line
+  # ``- Onboarding State: <state>`` (see
+  # ``agents/_template/session-types/*.md`` line ~4) AND, in the admin
+  # / static-codex / dynamic / cron checklist bodies, documentation
+  # lines that quote the literal string ``Onboarding State: pending``
+  # as instruction text (e.g. ``- If `Onboarding State: pending` when
+  # the first user message arrives, …``). The earlier
+  # ``Onboarding State:`` substring grep matched the checklist body
+  # too, and ``head -n 1`` only happened to win because the metadata
+  # line precedes the body in the shipped templates — a fragile
+  # accident that breaks the moment a template reorders or an operator
+  # edits one. Anchor both the grep and the BASH_REMATCH to the field
+  # line: ``^`` + optional whitespace + optional ``- `` markdown list
+  # marker + ``Onboarding State:``. A body line that has prose before
+  # the quoted string can never match, so the parser reads the real
+  # field regardless of line order. Mirrors the anchored regex
+  # ``bridge-upgrade.py:detect_prior_onboarding_complete`` already
+  # uses (``^-?\s*Onboarding State:``).
   for path in "$(bridge_agent_workdir "$agent")/SESSION-TYPE.md" "$(bridge_agent_default_home "$agent")/SESSION-TYPE.md"; do
     parsed_state=""
     if [[ -f "$path" ]]; then
-      line="$(grep -E 'Onboarding State:[[:space:]]*[A-Za-z0-9._-]+' "$path" 2>/dev/null | head -n 1 || true)"
-      if [[ "$line" =~ Onboarding[[:space:]]+State:[[:space:]]*([A-Za-z0-9._-]+) ]]; then
+      line="$(grep -E '^[[:space:]]*-?[[:space:]]*Onboarding State:[[:space:]]*[A-Za-z0-9._-]+' "$path" 2>/dev/null | head -n 1 || true)"
+      if [[ "$line" =~ ^[[:space:]]*-?[[:space:]]*Onboarding[[:space:]]+State:[[:space:]]*([A-Za-z0-9._-]+) ]]; then
         parsed_state="${BASH_REMATCH[1]}"
       else
         # File readable but no matching line — treat as a true "missing"
@@ -5092,11 +5112,11 @@ bridge_agent_onboarding_state() {
 file="$1"
 [[ -f "$file" ]] || exit 2
 [[ -r "$file" ]] || exit 2
-grep -E "Onboarding State:[[:space:]]*[A-Za-z0-9._-]+" "$file" 2>/dev/null | head -n 1
+grep -E "^[[:space:]]*-?[[:space:]]*Onboarding State:[[:space:]]*[A-Za-z0-9._-]+" "$file" 2>/dev/null | head -n 1
 ' "$path" 2>/dev/null)" || sudo_rc=$?
       case "$sudo_rc" in
         0)
-          if [[ "$line" =~ Onboarding[[:space:]]+State:[[:space:]]*([A-Za-z0-9._-]+) ]]; then
+          if [[ "$line" =~ ^[[:space:]]*-?[[:space:]]*Onboarding[[:space:]]+State:[[:space:]]*([A-Za-z0-9._-]+) ]]; then
             parsed_state="${BASH_REMATCH[1]}"
           else
             # iso UID read the file but no matching line — keep walking

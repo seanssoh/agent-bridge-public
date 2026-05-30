@@ -16,4 +16,4 @@
 - Confirm the immediate task scope.
 - Confirm whether this session should write back into the memory wiki or stay ephemeral.
 - Confirm who should receive the handoff when work is done.
-- Update this file if needed, then set `Onboarding State: complete`.
+- Update this file if needed, then set the Onboarding State field above to `complete`.

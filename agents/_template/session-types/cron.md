@@ -16,4 +16,4 @@
 - Confirm the cron family or responsibility of this role.
 - Confirm where success and failure should be reported.
 - Confirm whether memory updates are needed after successful runs.
-- Update this file if needed, then set `Onboarding State: complete`.
+- Update this file if needed, then set the Onboarding State field above to `complete`.
