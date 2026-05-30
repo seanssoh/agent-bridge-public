@@ -232,6 +232,73 @@ Receiver fail-closed validation **order** (every reject is audited with
    **hot-reloads** the live config (the same fail-closed `swap_cfg` the
    reconcile uses) so the change takes effect with **no restart**.
 
+## Receiver supervision (watchdog liveness + auto-restart) (#1405)
+
+The self-heal reconcile above keeps a *running* receiver healed; it does
+nothing when the process is **dead**. The receiver had no supervisor, so a
+silent exit (no log line, no traceback) left the listen port unbound with no
+auto-restart and no alarm — a "send-OK / receive-dead" half state the sender
+retries into forever. The daemon now supervises the receiver as one more
+managed lifecycle, alongside agents, cron workers, MCP liveness, and the two
+existing A2A ticks.
+
+Each `bridge-daemon` sync cycle runs a supervise tick (no-op without
+`handoff.local.json`):
+
+1. **Process gate** — `bridge_a2a_receiver_running` (pid + cmdline bound to
+   this install's pidfile). Fail → dead, reason `process_gone`.
+2. **Serve probe** — only when the process gate passes:
+   `bridge-handoffd.py healthz` issues a read-only `GET /healthz` against the
+   `resolve_bind`-proven address. Catches "pid alive but socket wedged /
+   `serve_forever` deadlocked". One transient unhealthy probe is tolerated;
+   two consecutive → dead (reason `healthz_timeout` / `healthz_status:<code>`).
+
+On confirmed-dead, the supervisor captures an **exit-cause record** to
+`state/handoff/receiver-exit.json` (mode 0600: the reason, last pid, a
+secret-free tail of `logs/a2a-handoffd.log`, and the last terminal audit event
+mined from `logs/a2a-handoff.jsonl`), emits an `a2a_receiver_died` audit row,
+then **restarts via `bridge-handoff-daemon.sh start`** — which re-runs the
+FULL fail-closed bind proof (synchronous preflight → `resolve_bind` → tailnet
+membership → peer-secret gate). Restart NEVER shortcuts to a raw `serve`, so
+resolve-then-prove cannot be bypassed, and the supervisor never sets the
+`BRIDGE_A2A_ALLOW_TEST_BIND` / `BRIDGE_A2A_DEV_INSECURE_BIND` smoke-only
+escape hatches.
+
+**Alarm-and-hold, never hammer.** Two distinct give-up paths:
+
+- **Crash-loop**: once restarts reach `BRIDGE_A2A_RECEIVER_MAX_RESTARTS`
+  (default 5) within `BRIDGE_A2A_RECEIVER_RESTART_WINDOW_SECONDS` (default
+  600), auto-restart **STOPS**, the `crashloop` alarm is set, an
+  `a2a_receiver_crashloop` audit row is emitted, and ONE cooldown-gated admin
+  task is filed (`BRIDGE_A2A_RECEIVER_CRASHLOOP_ADMIN_COOLDOWN_SECONDS`,
+  default 1800). A healthy probe (or the restart window elapsing) resets the
+  counter and clears the alarm.
+- **Persistent bind-proof failure**: if `bridge-handoff-daemon.sh start`
+  returns non-zero (tailnet down, bind unresolvable, peer secret missing), the
+  failure is a NON-retryable hold with the distinct `bind_proof_failed` reason
+  — it counts toward the cap and stops, rather than re-probing Tailscale every
+  30s.
+
+**systemd defer.** On hosts where the `agb-handoffd.service` user unit owns
+restart (`Restart=on-failure`; see `scripts/install-handoffd-systemd.sh`), the
+supervisor detects the active unit and downgrades to **probe + alarm only** —
+it never restarts, so two restart authorities can't fight over the pidfile.
+
+The supervised state surfaces in `agent-bridge status` (an `A2A Receiver` row +
+an `a2a=DOWN` / `a2a=ALARM` header flag, rendered only on A2A-configured
+installs) and in `agb a2a daemon status` (restart count, alarm, last-exit
+cause). `agb a2a daemon healthz` runs the same read-only probe by hand.
+
+**Supervision env vars:**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `BRIDGE_A2A_RECEIVER_SUPERVISE_INTERVAL_SECONDS` | `30` | Supervise-tick cadence. `0` disables supervision entirely (e.g. a host running the receiver under systemd that doesn't even want the daemon to probe). |
+| `BRIDGE_A2A_RECEIVER_MAX_RESTARTS` | `5` | Restarts allowed within the window before the crash-loop alarm holds. |
+| `BRIDGE_A2A_RECEIVER_RESTART_WINDOW_SECONDS` | `600` | Rolling window for the restart counter; elapsing it resets the counter + alarm. |
+| `BRIDGE_A2A_RECEIVER_CRASHLOOP_ADMIN_COOLDOWN_SECONDS` | `1800` | Minimum gap between crash-loop admin tasks (the alarm itself stays set). |
+| `BRIDGE_A2A_RECEIVER_HEALTHZ_TIMEOUT_SECONDS` | `3` | `GET /healthz` connect/read timeout. |
+
 ## Protocol — envelope
 
 ```json
@@ -304,6 +371,7 @@ backpressure: over quota → `429` with `Retry-After`.
 | Situation | Mitigation |
 |-----------|-----------|
 | Receiver asleep / unreachable | sender outbox retry with backoff |
+| Receiver silently dead / serve wedged | daemon supervise tick auto-restarts via the fail-closed `start`; crash-loop → alarm-and-hold + admin task + `status` flag (#1405) |
 | Sender sleeps post-enqueue | resumes on the next `a2a deliver` tick |
 | Duplicate POST / lost ACK | `message_id` dedupe → idempotent `200` |
 | Replay | HMAC + timestamp window + dedupe |
@@ -322,7 +390,7 @@ backpressure: over quota → `429` with `Retry-After`.
 - `agent-bridge a2a peers list|test <peer>`
 - `agent-bridge a2a deliver` — drain the outbox once
 - `agent-bridge a2a announce-identity [--peer <id>] [--dry-run] [--timeout <s>]` — push a signed `peer-identity-update` to peers after an IP change
-- `agent-bridge a2a daemon start|stop|restart|status|tick` — receiver lifecycle
+- `agent-bridge a2a daemon start|stop|restart|status|healthz|tick` — receiver lifecycle (`healthz` = read-only serve-liveness probe via `GET /healthz`)
 
 The delivery runner can be daemon-driven or cron-driven (`a2a daemon
 tick` ensures the receiver is up, then drains the outbox once).

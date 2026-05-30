@@ -2544,6 +2544,377 @@ process_a2a_outbox_stuck_scan_tick() {
   return 0
 }
 
+# Issue #1405 (v0.15.0 self-heal stack): A2A receiver supervision.
+#
+# The A2A receiver (`bridge-handoffd.py serve`) is the ONLY component that
+# handles untrusted REMOTE traffic, and it had NO supervisor: a silent exit
+# left 8787 unbound with no log line, no auto-restart, and no alarm — a
+# "send-OK / receive-dead" black hole the sender retries into forever (the
+# crm-dev multi-IP-change incident). The self-heal reconcile stack (#1401 /
+# #1403 / #1404) all assume the daemon is RUNNING; none of it fires when the
+# process is dead. This tick closes that gap.
+#
+# Design: daemon-as-supervisor (ONE supervisor). The daemon is already the
+# single lifecycle owner for agents, cron workers, MCP liveness, and the two
+# existing A2A ticks; a parallel self-supervisor would create two restart
+# authorities racing over one pidfile. Two-stage liveness (cheap-first):
+#   1. process gate  — lib/bridge-a2a.sh:bridge_a2a_receiver_running (pid +
+#                      cmdline bound to THIS install's pidfile). Fail => dead
+#                      (reason process_gone).
+#   2. serve probe   — only if the process gate passes: `bridge-handoffd.py
+#                      healthz` (read-only GET /healthz via resolve_bind).
+#                      Catches "pid alive but socket wedged / serve_forever
+#                      deadlocked". One transient unhealthy is tolerated
+#                      (consec_unhealthy counter); two consecutive => dead.
+#
+# Restart goes through `bridge-handoff-daemon.sh start` ONLY — which calls
+# lib/bridge-a2a.sh:bridge_a2a_receiver_start and RE-RUNS the full fail-closed
+# bind proof (synchronous preflight -> resolve_bind -> tailnet membership ->
+# validate_config_peer_secrets) before any relaunch. NEVER a raw `serve`, so
+# resolve-then-prove can never be bypassed on restart, and the supervisor
+# NEVER sets BRIDGE_A2A_ALLOW_TEST_BIND / BRIDGE_A2A_DEV_INSECURE_BIND (those
+# are smoke-only escape hatches).
+#
+# Crash-loop give-up: RESTART_COUNT caps at BRIDGE_A2A_RECEIVER_MAX_RESTARTS
+# (default 5) within BRIDGE_A2A_RECEIVER_RESTART_WINDOW_SECONDS (default 600);
+# at the cap we STOP restarting, set the alarm, emit a2a_receiver_crashloop
+# audit, and file ONE cooldown-gated admin task. A persistent BIND-PROOF
+# failure (bridge_a2a_receiver_start returns non-zero — tailnet down, bind
+# unresolvable) is a NON-retryable hold: it counts toward the cap with the
+# distinct `bind_proof_failed` reason and we stop, rather than re-probing
+# tailscale every 30s (alarm-and-hold, not hammer). A healthy probe resets the
+# counter. On systemd hosts the agb-handoffd.service unit owns restart
+# (Restart=on-failure) — the supervisor DEFERS to probe+alarm-only there to
+# avoid two restart authorities fighting over the pidfile.
+#
+# State (counters + alarm + last exit) lives in scalar, A2A_RECEIVER_*-
+# namespaced vars in state/handoff/receiver-supervise.env (sourced like
+# deliver-tick.env; #1213 collision-safety — never an assoc array).
+# No-ops silently when handoff.local.json is absent (non-A2A installs).
+
+# True when the systemd-user unit agb-handoffd.service is the active lifecycle
+# owner — in which case the supervisor must NOT restart (the unit's
+# Restart=on-failure does), only probe + alarm. BRIDGE_A2A_RECEIVER_SYSTEMD_OWNER
+# is a test/override hook: "1" forces the deferral path (smoke mock), "0"
+# forces the self-supervise path even if a unit happens to exist on the host.
+bridge_a2a_receiver_systemd_active() {
+  case "${BRIDGE_A2A_RECEIVER_SYSTEMD_OWNER:-auto}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl --user is-active --quiet agb-handoffd.service 2>/dev/null
+}
+
+# Persist supervise state. All vars SCALAR + A2A_RECEIVER_*-namespaced so the
+# file stays `source`-safe (#1213): no assoc-array collision with a
+# BRIDGE_AGENT_* family. printf %q-quotes every value.
+bridge_a2a_write_supervise_state() {
+  local state_file="$1" restart_count="$2" last_restart_ts="$3" \
+    consec_unhealthy="$4" alarm="$5" last_reason="$6" last_exit_event="$7" \
+    last_exit_detail="$8" last_admin_task_ts="$9"
+  {
+    printf 'A2A_RECEIVER_RESTART_COUNT=%s\n' "$(printf '%q' "$restart_count")"
+    printf 'A2A_RECEIVER_LAST_RESTART_TS=%s\n' "$(printf '%q' "$last_restart_ts")"
+    printf 'A2A_RECEIVER_CONSEC_UNHEALTHY=%s\n' "$(printf '%q' "$consec_unhealthy")"
+    printf 'A2A_RECEIVER_ALARM=%s\n' "$(printf '%q' "$alarm")"
+    printf 'A2A_RECEIVER_LAST_REASON=%s\n' "$(printf '%q' "$last_reason")"
+    printf 'A2A_RECEIVER_LAST_EXIT_EVENT=%s\n' "$(printf '%q' "$last_exit_event")"
+    printf 'A2A_RECEIVER_LAST_EXIT_DETAIL=%s\n' "$(printf '%q' "$last_exit_detail")"
+    printf 'A2A_RECEIVER_LAST_ADMIN_TASK_TS=%s\n' "$(printf '%q' "$last_admin_task_ts")"
+  } >"$state_file" 2>/dev/null || true
+  chmod 0600 "$state_file" 2>/dev/null || true
+}
+
+process_a2a_receiver_supervise_tick() {
+  local interval_str="${BRIDGE_A2A_RECEIVER_SUPERVISE_INTERVAL_SECONDS:-30}"
+  local interval
+  if [[ "$interval_str" =~ ^[0-9]+$ ]]; then
+    interval="$interval_str"
+  else
+    daemon_warn "[a2a_receiver_supervise] invalid BRIDGE_A2A_RECEIVER_SUPERVISE_INTERVAL_SECONDS=$interval_str (must be a non-negative integer); skipping"
+    return 1
+  fi
+  # 0 disables the tick entirely (operator opt-out; e.g. a host that runs the
+  # receiver under systemd and does not want the daemon to even probe).
+  (( interval == 0 )) && return 1
+
+  # No-op silently when handoff.local.json is absent — the normal-install
+  # path. Logging here would spam every tick on hosts that never configured
+  # A2A. (regression guard, smoke check 7.)
+  local config="${BRIDGE_A2A_CONFIG:-${BRIDGE_HOME:-$HOME/.agent-bridge}/handoff.local.json}"
+  [[ -f "$config" ]] || return 1
+
+  local max_restarts="${BRIDGE_A2A_RECEIVER_MAX_RESTARTS:-5}"
+  local restart_window="${BRIDGE_A2A_RECEIVER_RESTART_WINDOW_SECONDS:-600}"
+  local admin_cooldown="${BRIDGE_A2A_RECEIVER_CRASHLOOP_ADMIN_COOLDOWN_SECONDS:-1800}"
+  local healthz_timeout="${BRIDGE_A2A_RECEIVER_HEALTHZ_TIMEOUT_SECONDS:-3}"
+  [[ "$max_restarts" =~ ^[0-9]+$ ]] || max_restarts=5
+  [[ "$restart_window" =~ ^[0-9]+$ ]] || restart_window=600
+  [[ "$admin_cooldown" =~ ^[0-9]+$ ]] || admin_cooldown=1800
+  [[ "$healthz_timeout" =~ ^[0-9.]+$ ]] || healthz_timeout=3
+
+  local handoff_dir="$BRIDGE_STATE_DIR/handoff"
+  mkdir -p "$handoff_dir" 2>/dev/null || true
+  local tick_state="$handoff_dir/receiver-supervise-tick.env"
+  local state_file="$handoff_dir/receiver-supervise.env"
+  local exit_json="$handoff_dir/receiver-exit.json"
+
+  local now next=0
+  now="$(date +%s)"
+  # Throttle: separate tick-cadence file (mirrors deliver-tick.env), so the
+  # durable supervise.env keeps counters across ticks without being rewritten
+  # purely for cadence.
+  if [[ -f "$tick_state" ]]; then
+    # shellcheck source=/dev/null
+    # shellcheck disable=SC1090
+    source "$tick_state" 2>/dev/null || true
+    next="${A2A_RECEIVER_SUPERVISE_NEXT_TS:-0}"
+  fi
+  if [[ "$next" =~ ^[0-9]+$ ]] && (( now < next )); then
+    return 1
+  fi
+  # Stamp cadence immediately so an error path below cannot busy-spin.
+  printf 'A2A_RECEIVER_SUPERVISE_LAST_TS=%s\nA2A_RECEIVER_SUPERVISE_NEXT_TS=%s\n' \
+    "$now" "$((now + interval))" >"$tick_state" 2>/dev/null || true
+
+  # Load durable supervise state (all scalar; defaults for a fresh file).
+  local A2A_RECEIVER_RESTART_COUNT="" A2A_RECEIVER_LAST_RESTART_TS="" \
+    A2A_RECEIVER_CONSEC_UNHEALTHY="" A2A_RECEIVER_ALARM="" \
+    A2A_RECEIVER_LAST_REASON="" A2A_RECEIVER_LAST_EXIT_EVENT="" \
+    A2A_RECEIVER_LAST_EXIT_DETAIL="" A2A_RECEIVER_LAST_ADMIN_TASK_TS=""
+  if [[ -f "$state_file" ]]; then
+    daemon_source_state_file "$state_file" "a2a-receiver-supervise" 0 "" \
+      "A2A_RECEIVER_RESTART_COUNT A2A_RECEIVER_LAST_RESTART_TS A2A_RECEIVER_CONSEC_UNHEALTHY A2A_RECEIVER_ALARM A2A_RECEIVER_LAST_REASON A2A_RECEIVER_LAST_EXIT_EVENT A2A_RECEIVER_LAST_EXIT_DETAIL A2A_RECEIVER_LAST_ADMIN_TASK_TS" \
+      || true
+  fi
+  local restart_count="${A2A_RECEIVER_RESTART_COUNT:-0}"
+  local last_restart_ts="${A2A_RECEIVER_LAST_RESTART_TS:-0}"
+  local consec_unhealthy="${A2A_RECEIVER_CONSEC_UNHEALTHY:-0}"
+  local alarm="${A2A_RECEIVER_ALARM:-}"
+  local last_reason="${A2A_RECEIVER_LAST_REASON:-}"
+  local last_exit_event="${A2A_RECEIVER_LAST_EXIT_EVENT:-}"
+  local last_exit_detail="${A2A_RECEIVER_LAST_EXIT_DETAIL:-}"
+  local last_admin_task_ts="${A2A_RECEIVER_LAST_ADMIN_TASK_TS:-}"
+  [[ "$restart_count" =~ ^[0-9]+$ ]] || restart_count=0
+  [[ "$last_restart_ts" =~ ^[0-9]+$ ]] || last_restart_ts=0
+  [[ "$consec_unhealthy" =~ ^[0-9]+$ ]] || consec_unhealthy=0
+  [[ "$last_admin_task_ts" =~ ^[0-9]+$ ]] || last_admin_task_ts=0
+
+  # Restart-window reset: if the last restart is older than the window, the
+  # counter (and any alarm) is stale — a fresh window starts clean. A healthy
+  # probe below ALSO resets, but this covers a long-quiet host that crossed
+  # the window with the alarm still set.
+  if (( restart_count > 0 )) && (( now - last_restart_ts >= restart_window )); then
+    restart_count=0
+    alarm=""
+  fi
+
+  # --- stage 1: process gate (cheap; no new code, reuse the lib helper) ---
+  # Source the lifecycle lib in THIS subshell only (the tick already runs in a
+  # `( ... ) || true` subshell in cmd_sync_cycle). bridge_a2a_receiver_running
+  # binds the match to THIS install's pidfile (pid + cmdline + --pidfile token).
+  # shellcheck source=lib/bridge-a2a.sh
+  source "$SCRIPT_DIR/lib/bridge-a2a.sh" 2>/dev/null || {
+    daemon_warn "[a2a_receiver_supervise] could not source lib/bridge-a2a.sh; skipping"
+    return 1
+  }
+
+  local process_alive=0 healthz_reason="" reason="" last_pid=""
+  if bridge_a2a_receiver_running; then
+    process_alive=1
+    last_pid="$(bridge_a2a_receiver_pid)"
+  fi
+
+  local dead=0
+  if (( process_alive == 0 )); then
+    dead=1
+    reason="process_gone"
+  else
+    # --- stage 2: serve probe (only when the process gate passed) ---
+    local probe_out probe_rc=0
+    probe_out="$(bridge_with_timeout 10 a2a_receiver_healthz \
+      python3 "$SCRIPT_DIR/bridge-handoffd.py" healthz \
+        --config "$config" --timeout "$healthz_timeout" 2>/dev/null)" || probe_rc=$?
+    # The reason word is the LAST stdout line (healthy / healthz_timeout /
+    # healthz_status:<code> / bind_unresolved / healthz_badbody).
+    healthz_reason="$(printf '%s\n' "$probe_out" | grep -E '^(healthy|healthz_timeout|healthz_status:|healthz_badbody|bind_unresolved)' | tail -1)"
+    if (( probe_rc == 0 )) && [[ "$healthz_reason" == "healthy" ]]; then
+      # Healthy — reset the consec-unhealthy counter, clear any alarm, and
+      # reset the restart counter so a recovered receiver starts clean.
+      if (( consec_unhealthy != 0 )) || (( restart_count != 0 )) || [[ -n "$alarm" ]]; then
+        daemon_log_event "[a2a_receiver_supervise] receiver healthy (pid ${last_pid:-?}); clearing counters"
+      fi
+      consec_unhealthy=0
+      restart_count=0
+      alarm=""
+      last_reason="healthy"
+      bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+        "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts"
+      return 0
+    fi
+    # Unhealthy probe: tolerate ONE transient (the #946 L4 idiom). Two
+    # consecutive unhealthy probes => confirmed dead.
+    consec_unhealthy=$((consec_unhealthy + 1))
+    if (( consec_unhealthy < 2 )); then
+      daemon_log_event "[a2a_receiver_supervise] transient unhealthy probe (${healthz_reason:-unknown}); tolerating one (consec=$consec_unhealthy)"
+      bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+        "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts"
+      return 0
+    fi
+    dead=1
+    reason="${healthz_reason:-healthz_timeout}"
+  fi
+
+  # --- confirmed dead: capture exit-cause, then decide restart vs hold ---
+  consec_unhealthy=0
+  local log_file
+  log_file="${BRIDGE_LOG_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/logs}/a2a-handoffd.log"
+  local jsonl_file
+  jsonl_file="${BRIDGE_LOG_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/logs}/a2a-handoff.jsonl"
+  # Exit-cause record (file paths as argv — footgun #11: no heredoc-stdin /
+  # here-string to a captured subprocess; the helper writes JSON to exit_json
+  # AND prints a one-line `event<TAB>detail` TSV summary on stdout, which we
+  # capture to a tmp file and read via `done < "$file"` — never `<<<`). This
+  # keeps ALL multi-line python (jsonl scan + log tail + summary) inside the
+  # standalone helper, so bridge-daemon.sh stays heredoc/here-string-free.
+  local exit_event="" exit_detail="" mine_tmp=""
+  mine_tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-receiver-exit.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-receiver-exit.$$.$RANDOM")"
+  bridge_with_timeout 10 a2a_receiver_exit_cause \
+    python3 "$SCRIPT_DIR/lib/daemon-helpers/a2a-receiver-exit-cause.py" \
+      "$exit_json" "$log_file" "$jsonl_file" "$reason" "${last_pid:-}" "$now" 20 \
+      >"$mine_tmp" 2>/dev/null || true
+  while IFS=$'\t' read -r _ev _detail; do
+    exit_event="$_ev"
+    exit_detail="$_detail"
+  done <"$mine_tmp"
+  rm -f "$mine_tmp" 2>/dev/null || true
+  last_exit_event="$exit_event"
+  last_exit_detail="$exit_detail"
+
+  bridge_audit_log daemon a2a_receiver_died daemon \
+    --detail reason="$reason" \
+    --detail last_pid="${last_pid:-}" \
+    --detail last_exit_event="$exit_event" \
+    --detail systemd_owner="$(bridge_a2a_receiver_systemd_active && printf 'yes' || printf 'no')" \
+    >/dev/null 2>&1 || true
+
+  # systemd-defer: the unit owns restart. Probe + alarm only — never restart.
+  if bridge_a2a_receiver_systemd_active; then
+    daemon_warn "[a2a_receiver_supervise] receiver DOWN (reason=$reason) but agb-handoffd.service is active — deferring restart to systemd (probe+alarm only)"
+    last_reason="$reason"
+    bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+      "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+      "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts"
+    return 0
+  fi
+
+  # --- crash-loop give-up cap ---
+  if (( restart_count >= max_restarts )); then
+    alarm="crashloop"
+    last_reason="$reason"
+    daemon_warn "[a2a_receiver_supervise] crash-loop: ${restart_count}/${max_restarts} restarts within ${restart_window}s — auto-restart STOPPED (alarm set); see $exit_json"
+    bridge_audit_log daemon a2a_receiver_crashloop daemon \
+      --detail restart_count="$restart_count" \
+      --detail max_restarts="$max_restarts" \
+      --detail window_seconds="$restart_window" \
+      --detail last_reason="$reason" >/dev/null 2>&1 || true
+    # File ONE cooldown-gated admin task (mirror the stuck-scan + daily-backup
+    # admin-task pattern: live CLI preferred, --force so a stopped admin still
+    # gets the wake trigger).
+    local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+    if [[ -n "$admin" ]] && (( now - last_admin_task_ts >= admin_cooldown )); then
+      local target_bridge=""
+      if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+        target_bridge="$BRIDGE_HOME/agent-bridge"
+      elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+        target_bridge="$SCRIPT_DIR/agent-bridge"
+      fi
+      if [[ -n "$target_bridge" ]]; then
+        local body_file
+        body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-receiver-crashloop.md.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-receiver-crashloop.$$.$RANDOM")"
+        {
+          printf '# A2A receiver crash-loop — auto-restart STOPPED\n\n'
+          printf 'The A2A receiver daemon (bridge-handoffd.py) restarted\n'
+          printf '%s time(s) within %ss and is now held — the daemon supervisor\n' "$restart_count" "$restart_window"
+          printf 'has STOPPED auto-restarting it to avoid a hot crash loop.\n\n'
+          printf '## State\n\n'
+          printf -- '- last_reason: `%s`\n' "$reason"
+          if [[ -n "$exit_event" ]]; then
+            printf -- '- last_exit_event: `%s`\n' "$exit_event"
+          fi
+          if [[ -n "$exit_detail" ]]; then
+            printf -- '- last_exit_detail: `%s`\n' "$exit_detail"
+          fi
+          printf -- '- restarts: %s/%s within %ss\n' "$restart_count" "$max_restarts" "$restart_window"
+          printf '\n## Next steps\n\n'
+          printf '1. Inspect the captured exit cause:\n'
+          printf '   `%s`\n' "$exit_json"
+          printf '2. Check the receiver log tail:\n'
+          printf '   `%s`\n' "$log_file"
+          printf '3. If the bind is unprovable (tailnet down / IP drift),\n'
+          printf '   confirm `agb a2a daemon reconcile` resolves a valid bind,\n'
+          printf '   then `agb a2a daemon restart`.\n'
+          printf '4. The supervisor resumes auto-restart on a healthy probe\n'
+          printf '   or once the %ss restart window elapses.\n' "$restart_window"
+        } >"$body_file"
+        if "$target_bridge" task create \
+             --to "$admin" --priority high --from daemon \
+             --title "[A2A] receiver crash-loop — auto-restart stopped" \
+             --body-file "$body_file" --force >/dev/null 2>&1; then
+          last_admin_task_ts="$now"
+        else
+          daemon_warn "[a2a_receiver_supervise] crash-loop admin task-create failed; will retry after cooldown"
+        fi
+        rm -f "$body_file" 2>/dev/null || true
+      fi
+    fi
+    bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+      "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+      "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts"
+    return 0
+  fi
+
+  # --- restart via bridge-handoff-daemon.sh start (FULL fail-closed proof) ---
+  # NEVER a raw `serve`; NEVER pass BRIDGE_A2A_ALLOW_TEST_BIND/DEV_INSECURE_BIND
+  # (the supervisor does not set them — they only reach the child if the daemon
+  # itself was launched with them, i.e. a smoke harness). `start` re-runs the
+  # synchronous preflight (resolve_bind -> tailnet proof -> peer-secret gate).
+  daemon_log_event "[a2a_receiver_supervise] receiver DOWN (reason=$reason); restarting via bridge-handoff-daemon.sh start (attempt $((restart_count + 1))/${max_restarts})"
+  local start_rc=0
+  bridge_with_timeout 60 a2a_receiver_restart \
+    bash "$SCRIPT_DIR/bridge-handoff-daemon.sh" start >/dev/null 2>&1 || start_rc=$?
+
+  restart_count=$((restart_count + 1))
+  last_restart_ts="$now"
+
+  if (( start_rc != 0 )); then
+    # Persistent BIND-PROOF failure: the fail-closed preflight refused to bring
+    # the receiver up (tailnet down, bind unresolvable, peer secret missing).
+    # This is a NON-retryable hold — alarm-and-hold, do NOT hammer tailscale
+    # every 30s. Count toward the cap with the distinct bind_proof_failed
+    # reason and stop; once at the cap the crash-loop branch above takes over.
+    reason="bind_proof_failed"
+    last_reason="$reason"
+    alarm="bind_proof_failed"
+    daemon_warn "[a2a_receiver_supervise] restart FAILED bind proof (rc=$start_rc); alarm-and-hold (restart_count=$restart_count/${max_restarts}); not hammering"
+    bridge_audit_log daemon a2a_receiver_bind_proof_failed daemon \
+      --detail rc="$start_rc" \
+      --detail restart_count="$restart_count" \
+      --detail max_restarts="$max_restarts" >/dev/null 2>&1 || true
+  else
+    last_reason="$reason"
+    daemon_log_event "[a2a_receiver_supervise] restart succeeded (restart_count=$restart_count/${max_restarts})"
+  fi
+
+  bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+    "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+    "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts"
+  return 0
+}
+
 process_release_monitor() {
   local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
   local monitor_json=""
@@ -9792,6 +10163,17 @@ cmd_sync_cycle() {
   # Issue #1338 defense-in-depth: subshell-isolate (rationale above).
   BRIDGE_DAEMON_LAST_STEP="a2a_stuck_scan_tick"
   ( process_a2a_outbox_stuck_scan_tick ) || true
+
+  # Issue #1405 (v0.15.0 self-heal stack): A2A receiver supervision. Pairs
+  # with the two A2A ticks above. Two-stage liveness (process gate -> healthz
+  # serve probe), auto-restart via bridge-handoff-daemon.sh start (re-runs the
+  # full fail-closed bind proof), crash-loop cap + alarm-and-hold, exit-cause
+  # capture, and an admin alarm. Defers to systemd when agb-handoffd.service
+  # owns restart. No-op silently without handoff.local.json; throttled by
+  # BRIDGE_A2A_RECEIVER_SUPERVISE_INTERVAL_SECONDS (default 30s).
+  # Issue #1338 defense-in-depth: subshell-isolate (rationale above).
+  BRIDGE_DAEMON_LAST_STEP="a2a_receiver_supervise_tick"
+  ( process_a2a_receiver_supervise_tick ) || true
 
   BRIDGE_DAEMON_LAST_STEP="nudge_agents"
   printf '%s\n' "$nudge_output" > "$_nudge_tmp"

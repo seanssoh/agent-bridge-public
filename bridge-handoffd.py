@@ -31,6 +31,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
@@ -1436,6 +1438,79 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_healthz(args: argparse.Namespace) -> int:
+    """Probe a RUNNING receiver's serve liveness via GET /healthz.
+
+    Read-only liveness check for the daemon supervisor (#1405). Resolves the
+    configured bind address/port through the SAME `resolve_bind` proof the
+    daemon uses (so the probe targets the exact tailnet socket the receiver
+    serves on), then issues a single unauthenticated `GET /healthz` — the
+    receiver's existing read-only health endpoint (do_GET, line ~722). Healthy
+    iff HTTP 200 AND the JSON body's `service` field is `a2a-handoffd`.
+
+    This subcommand NEVER binds or serves and carries no POST-path auth
+    surface: it only resolves+connects+reads. resolve_bind itself stays
+    fail-closed (refuses wildcard/loopback/non-tailnet); a resolve failure
+    here means the bind is unprovable, which the supervisor treats distinctly
+    from a wedged-but-bound serve loop.
+
+    Exit 0 + `healthy` on stdout when the serve loop is accepting; non-zero
+    with a single reason WORD on stdout otherwise:
+      - `bind_unresolved` : resolve_bind could not prove the bind (Tailscale
+                            down / address not in `tailscale ip`). The process
+                            gate already ran in the supervisor; this is the
+                            socket-side proof.
+      - `healthz_timeout` : connect/read timed out OR the socket refused — the
+                            pid is alive but the serve loop is not accepting
+                            (the wedged / deadlocked case this probe exists to
+                            catch).
+      - `healthz_status:<code>` : reachable but returned a non-200 status.
+      - `healthz_badbody` : 200 but the body was not the a2a-handoffd health
+                            envelope (something else is on the port).
+    """
+    try:
+        cfg = a2a.load_config(Path(args.config) if args.config else None)
+        bind, port = resolve_bind(cfg)
+    except a2a.A2AError as exc:
+        print("bind_unresolved")
+        log(f"healthz: bind unresolved ({exc.code})")
+        return 2
+
+    timeout = float(getattr(args, "timeout", 3) or 3)
+    healthz_path = cfg.get("listen", {}).get("healthz_path", "/healthz")
+    # IPv6 literals need bracketing in a URL authority.
+    host = f"[{bind}]" if ":" in bind else bind
+    url = f"http://{host}:{port}{healthz_path}"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            body = resp.read(4096)
+    except urllib.error.HTTPError as exc:
+        # Reachable, but a non-2xx status. Report the code so the supervisor
+        # exit-cause logger can record `healthz_status:<code>`.
+        print(f"healthz_status:{exc.code}")
+        return 4
+    except (urllib.error.URLError, OSError, ValueError):
+        # Connection refused / timed out / reset: pid alive but socket not
+        # accepting (the wedged-serve case). Bucketed as a timeout reason.
+        print("healthz_timeout")
+        return 3
+
+    if status != 200:
+        print(f"healthz_status:{status}")
+        return 4
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        payload = {}
+    if payload.get("service") == "a2a-handoffd" and payload.get("ok") is True:
+        print("healthy")
+        return 0
+    print("healthz_badbody")
+    return 5
+
+
 def _write_pidfile(path: str) -> None:
     """Record the calling process's pid to `path` (atomic replace)."""
     pid_path = Path(path)
@@ -1718,6 +1793,18 @@ def build_parser() -> argparse.ArgumentParser:
              "validate config) without touching a running daemon")
     p_rec.add_argument("--config", default=None)
     p_rec.set_defaults(func=cmd_reconcile)
+
+    # #1405: read-only serve-liveness probe for the daemon supervisor. Reuses
+    # resolve_bind (never binds/serves) and the receiver's existing read-only
+    # GET /healthz endpoint. Exit 0 healthy / non-zero + reason word on stdout.
+    p_health = sub.add_parser(
+        "healthz",
+        help="probe a running receiver's serve liveness via GET /healthz "
+             "(read-only; exit 0 healthy / non-zero + reason word)")
+    p_health.add_argument("--config", default=None)
+    p_health.add_argument("--timeout", type=float, default=3.0,
+                          help="connect/read timeout in seconds (default 3)")
+    p_health.set_defaults(func=cmd_healthz)
 
     return parser
 

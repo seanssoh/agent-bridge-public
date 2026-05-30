@@ -19,6 +19,7 @@ Usage:
   bash $SCRIPT_DIR/bridge-handoff-daemon.sh stop         # stop the receiver
   bash $SCRIPT_DIR/bridge-handoff-daemon.sh restart
   bash $SCRIPT_DIR/bridge-handoff-daemon.sh status
+  bash $SCRIPT_DIR/bridge-handoff-daemon.sh healthz [--timeout S]   # serve-liveness probe (read-only GET /healthz)
   bash $SCRIPT_DIR/bridge-handoff-daemon.sh deliver [--batch N] [--timeout S]
   bash $SCRIPT_DIR/bridge-handoff-daemon.sh reconcile     # self-heal: re-resolve+rebind + config reload
   bash $SCRIPT_DIR/bridge-handoff-daemon.sh tick         # receiver-ensure + reconcile + deliver
@@ -45,6 +46,13 @@ case "${1:-}" in
     ;;
   status)
     bridge_a2a_status
+    ;;
+  healthz)
+    # #1405: read-only serve-liveness probe (GET /healthz). Prints the reason
+    # word; exit 0 healthy / non-zero otherwise. Same probe the daemon
+    # supervisor uses.
+    shift
+    bridge_a2a_receiver_healthz "$@"
     ;;
   deliver)
     shift
