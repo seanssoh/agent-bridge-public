@@ -621,7 +621,7 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/install-handoffd-systemd.sh)
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the
@@ -647,7 +647,18 @@ select_for_path() {
       # paired BRIDGE_A2A_DEV_INSECURE_BIND + BRIDGE_A2A_ALLOW_TEST_BIND
       # test-only escape hatch). beta5-2-lambda-a2a-robustness pins the
       # contract on both halves.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness
+      # A2A Setup Wizard P0 (design §8): peers + `listen` may carry an
+      # optional Tailscale identity (`tailscale_name` / `node_id`) resolved
+      # to the current IP at use-time via `tailscale status --json`, with
+      # the legacy raw `address` as the back-compat fallback. The shared
+      # resolver lives in bridge_a2a_common.py; the sender (bridge-a2a.py)
+      # and the receiver bind proof (bridge-handoffd.py) both call it.
+      # a2a-tailscale-identity-resolve pins resolve-by-name/node_id, raw-IP
+      # back-compat, resolve-failure fail-closed, tailscale-unavailable
+      # fail-closed, AND the security invariant that the receiver bind proof
+      # still REJECTS a resolved candidate not in `tailscale ip` (resolution
+      # must never weaken the fail-closed bind proof).
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)

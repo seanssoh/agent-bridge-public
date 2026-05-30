@@ -551,10 +551,21 @@ def cmd_peers(args: argparse.Namespace) -> int:
             peer = a2a.find_peer(cfg, args.peer)
         except a2a.A2AError as exc:
             return die(str(exc)) or 1
-        address = peer.get("address", "")
+        # P0: resolve the peer's CURRENT tailnet IP. If the peer carries a
+        # Tailscale identity (`node_id` / `tailscale_name`) it is resolved
+        # live via `tailscale status --json`; otherwise the literal
+        # `address` is used (legacy back-compat). A resolve failure is a
+        # hard error with an actionable message — we never probe a
+        # possibly-stale stored IP behind an identity's back.
+        try:
+            address = a2a.resolve_peer_address(peer)
+        except a2a.A2AError as exc:
+            return die(f"cannot resolve address for peer {args.peer}: {exc} "
+                       f"({exc.code})") or 1
         port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
         if not address:
-            return die(f"peer {args.peer} has no 'address'") or 1
+            return die(f"peer {args.peer} has no 'address' (and no resolvable "
+                       "tailscale identity)") or 1
         info(f"probing {address}:{port} (TCP connect only — no enqueue) ...")
         try:
             with socket.create_connection((address, port), timeout=5.0):
@@ -628,11 +639,31 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
         _mark_dead(conn, message_id, f"peer config missing: {exc}")
         return "dead(config)"
 
-    address = peer.get("address", "")
+    # P0: resolve the peer's CURRENT tailnet IP. A peer carrying a Tailscale
+    # identity (`node_id` / `tailscale_name`) is resolved live via
+    # `tailscale status --json`; otherwise the literal `address` is used
+    # (legacy back-compat). A resolve failure (Tailscale temporarily
+    # unavailable, or the peer/identity not yet visible in the tailnet) is
+    # treated as TRANSIENT and scheduled for retry — NOT dead-lettered —
+    # because nothing stores a resolved IP, so the next tick self-heals once
+    # Tailscale / the peer is reachable again. This is the inherent self-heal
+    # of identity-keyed config (today's stale-IP incident cannot recur). The
+    # max-attempts ceiling still eventually dead-letters a permanently-bad
+    # identity, so an unresolvable peer does not wedge the outbox forever.
+    attempts = int(row["attempts"]) + 1
+    try:
+        address = a2a.resolve_peer_address(peer)
+    except a2a.A2AError as exc:
+        return _schedule_retry(
+            conn, message_id, attempts, cfg,
+            f"address resolve failed: {exc} ({exc.code})",
+        )
     port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
     path = peer.get("enqueue_path", "/enqueue")
     if not address:
-        _mark_dead(conn, message_id, "peer has no address")
+        # No identity AND no literal address — a permanent misconfiguration.
+        _mark_dead(conn, message_id, "peer has no address (and no resolvable "
+                                     "tailscale identity)")
         return "dead(noaddr)"
 
     body_path = Path(row["body_path"])
@@ -647,7 +678,6 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
         _mark_dead(conn, message_id, str(exc))
         return "dead(nosecret)"
 
-    attempts = int(row["attempts"]) + 1
     try:
         status, headers, resp_body = _post_envelope(
             address=address, port=port, path=path,
