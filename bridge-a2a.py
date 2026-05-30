@@ -9,6 +9,9 @@ Subcommands (surfaced through `agent-bridge a2a ...`):
   peers         list | test <peer> — inspect configured peers.
   deliver       Drain the outbox: sign + POST each pending entry over the
                 tailnet, with retry/backoff/jitter and dead-lettering.
+  reconcile     Trigger + preview one receiver self-heal reconcile.
+  migrate-identity  Rewrite raw-IP peers/listen to Tailscale identity keying
+                so today's raw-`address` configs self-heal (dry-run default).
 
 The receiver daemon lives in a separate file (`bridge-handoffd.py`).
 """
@@ -959,6 +962,382 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# migrate-identity (P-self-heal-2): rewrite raw-IP entries to Tailscale identity
+# --------------------------------------------------------------------------
+#
+# A peer (or listen) entry that carries only a raw `address` (today's configs)
+# still goes STALE when the underlying node's Tailscale IP changes — only an
+# identity-keyed entry (node_id / tailscale_name) self-heals via the P0 runtime
+# resolver. This command performs the one-shot raw -> identity migration:
+# reverse-resolve each raw `address` to its Tailscale node (via a single
+# `tailscale status --json`) and, when EXACTLY one node owns that IP, record the
+# node's StableID (`node_id`) + name (`tailscale_name`) on the entry. The raw
+# `address` is KEPT as a fallback by default (resolver precedence is node_id >
+# tailscale_name > address). Dry-run is the default; --apply writes atomically.
+#
+# Fail-closed + conservative (NEVER guess):
+#   - tailscale status unavailable  -> exit nonzero, write nothing.
+#   - IP matches 0 nodes (stale)    -> leave untouched, warn.
+#   - IP matches >1 nodes (ambig)   -> leave untouched, warn.
+#   - already identity-keyed        -> no-op (idempotent).
+#   - secret/secret_next/inbound_allowlist/caps/port/bridge_id NEVER touched.
+
+
+def warn(msg: str) -> None:
+    print(f"[a2a][warn] {msg}", file=sys.stderr)
+
+
+def _migrate_entry(
+    entry: dict[str, Any], status: dict[str, Any], label: str,
+    *, drop_address: bool,
+) -> "Optional[dict[str, Any]]":
+    """Plan an identity migration for a single peer/listen entry.
+
+    Returns a change record (for reporting) when the entry would be migrated,
+    or None when it is left untouched (already-keyed / no raw address / zero or
+    ambiguous match). MUTATES `entry` in place with the new identity fields when
+    a change is planned — callers run this on a working copy and only persist on
+    --apply. Only `node_id` / `tailscale_name` (and, with --drop-address, the
+    `address`) are ever modified; every other key is left byte-identical.
+    """
+    if not isinstance(entry, dict):
+        return None
+    has_node_id = isinstance(entry.get("node_id"), str) and entry["node_id"].strip()
+    has_ts_name = isinstance(entry.get("tailscale_name"), str) and entry["tailscale_name"].strip()
+    if has_node_id or has_ts_name:
+        # Already identity-keyed -> idempotent no-op (regardless of address).
+        return None
+    address = entry.get("address")
+    if not isinstance(address, str) or not address.strip():
+        # Nothing to reverse-resolve.
+        return None
+    raw = address.strip()
+
+    resolved = a2a.reverse_resolve_ip(status, raw)
+    if resolved is None:
+        n = len(a2a.nodes_owning_ip(status, raw))
+        if n == 0:
+            warn(
+                f"{label}: address {raw} matches NO Tailscale node in "
+                "'tailscale status --json' (stale/offline?) — left untouched, "
+                "not guessing."
+            )
+        else:
+            warn(
+                f"{label}: address {raw} matches {n} Tailscale nodes "
+                "(ambiguous) — left untouched, not guessing."
+            )
+        return None
+
+    node_id, ts_name = resolved
+    if not node_id and not ts_name:
+        warn(
+            f"{label}: address {raw} resolved to a node with neither a "
+            "StableID nor a name — left untouched, not guessing."
+        )
+        return None
+
+    before = {
+        "node_id": entry.get("node_id", ""),
+        "tailscale_name": entry.get("tailscale_name", ""),
+        "address": entry.get("address", ""),
+    }
+    if node_id:
+        entry["node_id"] = node_id
+    if ts_name:
+        entry["tailscale_name"] = ts_name
+    if drop_address:
+        entry.pop("address", None)
+    after = {
+        "node_id": entry.get("node_id", ""),
+        "tailscale_name": entry.get("tailscale_name", ""),
+        "address": entry.get("address", "<dropped>" if drop_address else ""),
+    }
+    return {"entry": label, "before": before, "after": after}
+
+
+def _write_config_atomic(path: Path, cfg: dict[str, Any], mode: int) -> None:
+    """Write `cfg` as pretty JSON to `path` atomically, preserving `mode`."""
+    tmp = path.with_name(path.name + ".tmp")
+    text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    try:
+        os.chmod(tmp, mode)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def cmd_migrate_identity(args: argparse.Namespace) -> int:
+    """Rewrite raw-`address` peers/listen to Tailscale identity keying.
+
+    Dry-run by default (prints the before->after plan, writes nothing).
+    Pass --apply to write the migrated config atomically (mode preserved).
+    """
+    cfg_path = a2a.config_path()
+    try:
+        cfg = a2a.load_config()
+    except a2a.A2AError as exc:
+        return die(str(exc)) or 1
+    # Capture the original file mode so --apply preserves it (default 0600).
+    try:
+        orig_mode = cfg_path.stat().st_mode & 0o777
+    except OSError:
+        orig_mode = 0o600
+
+    # Single tailscale status parse, shared across every entry. Fail closed:
+    # if the tailnet cannot be queried we exit nonzero and change NOTHING.
+    try:
+        status = a2a.tailscale_status_json()
+    except a2a.TailscaleUnavailable as exc:
+        return die(
+            f"cannot query 'tailscale status --json' ({exc}) — refusing to "
+            "migrate without a live tailnet view. Nothing was changed.",
+            code=3,
+        ) or 3
+
+    changes: list[dict[str, Any]] = []
+
+    listen = cfg.get("listen")
+    if isinstance(listen, dict):
+        rec = _migrate_entry(
+            listen, status, "listen", drop_address=args.drop_address,
+        )
+        if rec is not None:
+            changes.append(rec)
+
+    peers = cfg.get("peers", [])
+    if isinstance(peers, list):
+        for peer in peers:
+            if not isinstance(peer, dict):
+                continue
+            label = f"peer {peer.get('id') or '(no id)'}"
+            rec = _migrate_entry(
+                peer, status, label, drop_address=args.drop_address,
+            )
+            if rec is not None:
+                changes.append(rec)
+
+    if not changes:
+        info("no raw-address entries to migrate — config already identity-keyed "
+             "(or no resolvable matches).")
+        return 0
+
+    # Report the plan (before -> after) for every changed entry.
+    for rec in changes:
+        info(f"{rec['entry']}:")
+        for field in ("node_id", "tailscale_name", "address"):
+            b = rec["before"].get(field, "")
+            a = rec["after"].get(field, "")
+            if b != a:
+                print(f"    {field}: {b!r} -> {a!r}")
+
+    if not args.apply:
+        info(
+            f"DRY-RUN: {len(changes)} entry(ies) would be migrated. "
+            "Re-run with --apply to write. (address kept as fallback unless "
+            "--drop-address.)"
+        )
+        return 0
+
+    _write_config_atomic(cfg_path, cfg, orig_mode)
+    info(f"APPLIED: migrated {len(changes)} entry(ies); wrote {cfg_path} "
+         f"(mode {orig_mode:04o} preserved).")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# migrate-identity (P-self-heal-2): rewrite raw-IP entries to Tailscale identity
+# --------------------------------------------------------------------------
+#
+# A peer (or listen) entry that carries only a raw `address` (today's configs)
+# still goes STALE when the underlying node's Tailscale IP changes — only an
+# identity-keyed entry (node_id / tailscale_name) self-heals via the P0 runtime
+# resolver. This command performs the one-shot raw -> identity migration:
+# reverse-resolve each raw `address` to its Tailscale node (via a single
+# `tailscale status --json`) and, when EXACTLY one node owns that IP, record the
+# node's StableID (`node_id`) + name (`tailscale_name`) on the entry. The raw
+# `address` is KEPT as a fallback by default (resolver precedence is node_id >
+# tailscale_name > address). Dry-run is the default; --apply writes atomically.
+#
+# Fail-closed + conservative (NEVER guess):
+#   - tailscale status unavailable  -> exit nonzero, write nothing.
+#   - IP matches 0 nodes (stale)    -> leave untouched, warn.
+#   - IP matches >1 nodes (ambig)   -> leave untouched, warn.
+#   - already identity-keyed        -> no-op (idempotent).
+#   - secret/secret_next/inbound_allowlist/caps/port/bridge_id NEVER touched.
+
+
+def warn(msg: str) -> None:
+    print(f"[a2a][warn] {msg}", file=sys.stderr)
+
+
+def _migrate_entry(
+    entry: dict[str, Any], status: dict[str, Any], label: str,
+    *, drop_address: bool,
+) -> "Optional[dict[str, Any]]":
+    """Plan an identity migration for a single peer/listen entry.
+
+    Returns a change record (for reporting) when the entry would be migrated,
+    or None when it is left untouched (already-keyed / no raw address / zero or
+    ambiguous match). MUTATES `entry` in place with the new identity fields when
+    a change is planned — callers run this on a working copy and only persist on
+    --apply. Only `node_id` / `tailscale_name` (and, with --drop-address, the
+    `address`) are ever modified; every other key is left byte-identical.
+    """
+    if not isinstance(entry, dict):
+        return None
+    has_node_id = isinstance(entry.get("node_id"), str) and entry["node_id"].strip()
+    has_ts_name = isinstance(entry.get("tailscale_name"), str) and entry["tailscale_name"].strip()
+    if has_node_id or has_ts_name:
+        # Already identity-keyed -> idempotent no-op (regardless of address).
+        return None
+    address = entry.get("address")
+    if not isinstance(address, str) or not address.strip():
+        # Nothing to reverse-resolve.
+        return None
+    raw = address.strip()
+
+    resolved = a2a.reverse_resolve_ip(status, raw)
+    if resolved is None:
+        n = len(a2a.nodes_owning_ip(status, raw))
+        if n == 0:
+            warn(
+                f"{label}: address {raw} matches NO Tailscale node in "
+                "'tailscale status --json' (stale/offline?) — left untouched, "
+                "not guessing."
+            )
+        else:
+            warn(
+                f"{label}: address {raw} matches {n} Tailscale nodes "
+                "(ambiguous) — left untouched, not guessing."
+            )
+        return None
+
+    node_id, ts_name = resolved
+    if not node_id and not ts_name:
+        warn(
+            f"{label}: address {raw} resolved to a node with neither a "
+            "StableID nor a name — left untouched, not guessing."
+        )
+        return None
+
+    before = {
+        "node_id": entry.get("node_id", ""),
+        "tailscale_name": entry.get("tailscale_name", ""),
+        "address": entry.get("address", ""),
+    }
+    if node_id:
+        entry["node_id"] = node_id
+    if ts_name:
+        entry["tailscale_name"] = ts_name
+    if drop_address:
+        entry.pop("address", None)
+    after = {
+        "node_id": entry.get("node_id", ""),
+        "tailscale_name": entry.get("tailscale_name", ""),
+        "address": entry.get("address", "<dropped>" if drop_address else ""),
+    }
+    return {"entry": label, "before": before, "after": after}
+
+
+def _write_config_atomic(path: Path, cfg: dict[str, Any], mode: int) -> None:
+    """Write `cfg` as pretty JSON to `path` atomically, preserving `mode`."""
+    tmp = path.with_name(path.name + ".tmp")
+    text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    try:
+        os.chmod(tmp, mode)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def cmd_migrate_identity(args: argparse.Namespace) -> int:
+    """Rewrite raw-`address` peers/listen to Tailscale identity keying.
+
+    Dry-run by default (prints the before->after plan, writes nothing).
+    Pass --apply to write the migrated config atomically (mode preserved).
+    """
+    cfg_path = a2a.config_path()
+    try:
+        cfg = a2a.load_config()
+    except a2a.A2AError as exc:
+        return die(str(exc)) or 1
+    # Capture the original file mode so --apply preserves it (default 0600).
+    try:
+        orig_mode = cfg_path.stat().st_mode & 0o777
+    except OSError:
+        orig_mode = 0o600
+
+    # Single tailscale status parse, shared across every entry. Fail closed:
+    # if the tailnet cannot be queried we exit nonzero and change NOTHING.
+    try:
+        status = a2a.tailscale_status_json()
+    except a2a.TailscaleUnavailable as exc:
+        return die(
+            f"cannot query 'tailscale status --json' ({exc}) — refusing to "
+            "migrate without a live tailnet view. Nothing was changed.",
+            code=3,
+        ) or 3
+
+    changes: list[dict[str, Any]] = []
+
+    listen = cfg.get("listen")
+    if isinstance(listen, dict):
+        rec = _migrate_entry(
+            listen, status, "listen", drop_address=args.drop_address,
+        )
+        if rec is not None:
+            changes.append(rec)
+
+    peers = cfg.get("peers", [])
+    if isinstance(peers, list):
+        for peer in peers:
+            if not isinstance(peer, dict):
+                continue
+            label = f"peer {peer.get('id') or '(no id)'}"
+            rec = _migrate_entry(
+                peer, status, label, drop_address=args.drop_address,
+            )
+            if rec is not None:
+                changes.append(rec)
+
+    if not changes:
+        info("no raw-address entries to migrate — config already identity-keyed "
+             "(or no resolvable matches).")
+        return 0
+
+    # Report the plan (before -> after) for every changed entry.
+    for rec in changes:
+        info(f"{rec['entry']}:")
+        for field in ("node_id", "tailscale_name", "address"):
+            b = rec["before"].get(field, "")
+            a = rec["after"].get(field, "")
+            if b != a:
+                print(f"    {field}: {b!r} -> {a!r}")
+
+    if not args.apply:
+        info(
+            f"DRY-RUN: {len(changes)} entry(ies) would be migrated. "
+            "Re-run with --apply to write. (address kept as fallback unless "
+            "--drop-address.)"
+        )
+        return 0
+
+    _write_config_atomic(cfg_path, cfg, orig_mode)
+    info(f"APPLIED: migrated {len(changes)} entry(ies); wrote {cfg_path} "
+         f"(mode {orig_mode:04o} preserved).")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # argument parsing
 # --------------------------------------------------------------------------
 
@@ -1013,6 +1392,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="trigger + preview one receiver self-heal reconcile "
              "(re-resolve+prove bind, config hot-reload via SIGHUP)")
     p_reconcile.set_defaults(func=cmd_reconcile)
+
+    p_migrate = sub.add_parser(
+        "migrate-identity",
+        help="rewrite raw-IP peers/listen to Tailscale identity keying",
+        description=(
+            "Reverse-resolve each raw `address` in handoff.local.json to its "
+            "Tailscale node and record the node's StableID (node_id) + name "
+            "(tailscale_name) so the entry self-heals on IP change. Dry-run by "
+            "default; pass --apply to write. The raw `address` is kept as a "
+            "fallback unless --drop-address. Fail-closed: needs a live "
+            "`tailscale status --json`; zero/ambiguous IP matches are left "
+            "untouched; secret/allowlist/caps are never modified."
+        ),
+    )
+    p_migrate.add_argument(
+        "--apply", action="store_true",
+        help="write the migrated config (default: dry-run, no write)",
+    )
+    p_migrate.add_argument(
+        "--drop-address", action="store_true",
+        help="remove the raw `address` after keying on identity "
+             "(default: keep it as a fallback)",
+    )
+    p_migrate.set_defaults(func=cmd_migrate_identity)
 
     return parser
 

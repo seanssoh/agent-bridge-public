@@ -507,6 +507,77 @@ def resolve_peer_address(entry: dict[str, Any]) -> str:
 
 
 # --------------------------------------------------------------------------
+# Reverse resolution: a raw Tailscale IP -> the node that owns it.
+# --------------------------------------------------------------------------
+#
+# The forward resolver (`resolve_peer_address`) maps a stored identity to the
+# live IP. The MIGRATION direction is the inverse: given a config entry that
+# still carries only a raw `address`, find the Tailscale node whose
+# `TailscaleIPs` contains that literal IP, so we can record its stable
+# identity (StableID + HostName/MagicDNS name). This shares the SAME
+# `tailscale status --json` parse as the forward resolver so sender, receiver,
+# and migrate never diverge on how the tailnet is read.
+
+
+def _node_owns_ip(node: dict[str, Any], ip: str) -> bool:
+    """True if `ip` is one of the node's TailscaleIPs (exact, trimmed match)."""
+    want = ip.strip()
+    if not want:
+        return False
+    ips = node.get("TailscaleIPs")
+    if isinstance(ips, list):
+        for cand in ips:
+            if isinstance(cand, str) and cand.strip() == want:
+                return True
+    return False
+
+
+def node_name(node: dict[str, Any]) -> str:
+    """Best human/MagicDNS name for a node: full DNSName, else short HostName.
+
+    Returns the MagicDNS FQDN with any trailing dot stripped (so it round-trips
+    cleanly through `_name_matches`), falling back to the short HostName. Empty
+    string if neither is present.
+    """
+    dns = str(node.get("DNSName", "")).strip().rstrip(".")
+    if dns:
+        return dns
+    return str(node.get("HostName", "")).strip().rstrip(".")
+
+
+def nodes_owning_ip(status: dict[str, Any], ip: str) -> list[dict[str, Any]]:
+    """All Self/Peer nodes from a status doc whose TailscaleIPs contain `ip`.
+
+    Returns 0, 1, or >1 nodes. The migration treats:
+      - 0 matches  -> stale/offline IP, leave untouched (do NOT guess);
+      - 1 match    -> unambiguous, safe to identity-key;
+      - >1 matches -> ambiguous, leave untouched (do NOT guess).
+    Pure parse over the caller-supplied status document — performs no
+    subprocess of its own, so a single `tailscale_status_json()` call can be
+    reused across every peer + the listen entry.
+    """
+    return [node for node in _status_nodes(status) if _node_owns_ip(node, ip)]
+
+
+def reverse_resolve_ip(
+    status: dict[str, Any], ip: str,
+) -> Optional[tuple[str, str]]:
+    """Map a raw Tailscale IP to (node_id, node_name) iff exactly one node owns it.
+
+    Returns None on zero matches OR multiple matches (the ambiguous case) —
+    the caller MUST treat None as "leave the entry untouched, do not guess".
+    `node_name` may be "" if the matched node has no HostName/DNSName; the
+    caller can still record `node_id` (the StableID) in that case.
+    """
+    matches = nodes_owning_ip(status, ip)
+    if len(matches) != 1:
+        return None
+    node = matches[0]
+    node_id = str(node.get("ID", "")).strip()
+    return node_id, node_name(node)
+
+
+# --------------------------------------------------------------------------
 # HMAC signing
 # --------------------------------------------------------------------------
 
