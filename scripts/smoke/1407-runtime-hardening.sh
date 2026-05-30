@@ -173,10 +173,20 @@ fi
 # to associative (bridge_ensure_roster_maps_assoc) right after `source "$file"`.
 # This drives codex's EXACT repro through the real loader; pre-fix signature is
 # `<id>: unbound variable`.
+#
+# Source the granular libs (core+state+agents) like D2-accessor/D2-persist above,
+# NOT the full bridge-lib.sh: in a markerless CI/test home, bridge-lib.sh's
+# isolation-v2 layout gate (v0.8.0) `exit`s before bridge_load_dynamic_agent_file
+# is defined, so the loader would never run and D2DYN would be blank. The granular
+# libs define the loader + bridge_reset_roster_maps + bridge_ensure_roster_maps_assoc
+# + bridge_add_agent_id_if_missing without tripping the layout resolver. (codex
+# PR #1412 r1 caught this CI-only fixture bug; reproduced markerless on Ubuntu.)
 d2dyn_out="$(
 	"$BASH4" -c '
 		set -u
-		source "'"$SCRIPT_DIR"'/bridge-lib.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-core.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-state.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-agents.sh" 2>/dev/null || true
 		bridge_reset_roster_maps 2>/dev/null || true
 		agent=some-agent
 		bridge_add_agent_id_if_missing "$agent"
