@@ -846,19 +846,22 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     """Trigger + preview one receiver self-heal reconcile (P-self-heal-1, #1403).
 
     Two parts:
-      1. PREVIEW (always): validate the config + re-resolve the listen
-         identity through the SAME resolver the running daemon uses (the
-         daemon then RE-PROVES the candidate against `tailscale ip` before
-         binding — candidate ∈ set; refuse wildcard/loopback; refuse if
-         Tailscale unavailable). Lets the wizard/operator confirm the current
-         Tailscale identity resolves before/after an IP change.
+      1. PREVIEW (always): validate the config, then run the SAME fail-closed
+         bind proof the receiver daemon performs at bind time by delegating to
+         `bridge-handoffd.py reconcile` (config load + `resolve_bind()`:
+         candidate ∈ `tailscale ip` set; refuse wildcard/loopback; refuse if
+         Tailscale unavailable). The preview therefore RE-PROVES the listen
+         candidate rather than merely resolving it — an out-of-tailnet-set
+         `listen.address` prints a `bind_not_tailnet` failure and exits
+         nonzero, exactly matching the daemon (codex r1 BLOCKING 2).
       2. TRIGGER (if a daemon is running): send SIGHUP to the receiver pid so
          the LIVE daemon runs an immediate reconcile (auto-rebind on local-IP
          drift + config hot-reload) with no `bridge-handoff-daemon.sh restart`.
 
-    The preview never weakens the proof — a resolve failure is reported, not
-    silently bound. The running daemon keeps serving on its current proven
-    bind + last-good config on any reconcile failure (see bridge-handoffd.py).
+    The preview never weakens the proof — it shares the daemon's proof code as
+    its single source, so the CLI can never drift looser. The running daemon
+    keeps serving on its current proven bind + last-good config on any
+    reconcile failure (see bridge-handoffd.py).
     """
     try:
         cfg = a2a.load_config()
@@ -875,24 +878,60 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             "its last-good config (fail-closed)")
         rc = 1
 
-    # --- preview: listen identity resolution (same resolver as the daemon) ---
-    try:
-        listen = cfg.get("listen", {})
-        if isinstance(listen, dict):
-            bind = a2a.resolve_peer_address(listen)
-            port = int(listen.get("port", 8787))
-        else:
-            bind, port = "", 8787
-        if bind:
-            info(f"listen resolves to {bind}:{port} (the running daemon "
-                 "RE-PROVES this against `tailscale ip` before binding)")
-        else:
-            info("listen has no explicit address; the daemon auto-selects + "
-                 "proves a tailnet IP at bind time")
-    except a2a.A2AError as exc:
-        err(f"listen identity does not resolve: {exc} ({exc.code}) — a running "
-            "daemon would keep its current proven bind")
+    # --- preview: bind proof (DELEGATE to the receiver's real proof) ---
+    # codex r1 BLOCKING 2: this preview must run the SAME fail-closed bind
+    # proof the daemon performs at bind time — NOT a bare
+    # `resolve_peer_address`, which resolves the listen identity but never
+    # RE-PROVES the candidate is in this node's `tailscale ip` set. A bare
+    # resolve would print "listen resolves to <addr>" and exit 0 even for an
+    # address NOT in the tailnet set, contradicting the daemon's
+    # `bind_not_tailnet` refusal and weakening the "performs/prints one safe
+    # pass" claim. We delegate to `bridge-handoffd.py reconcile`, which loads
+    # the same config + runs the UNCHANGED `resolve_bind()` proof (candidate ∈
+    # `tailscale ip`; refuse wildcard/loopback; refuse if Tailscale
+    # unavailable) and exits nonzero with the structured failure. Single source
+    # of the proof — the CLI can never drift looser than the daemon.
+    handoffd = Path(__file__).resolve().parent / "bridge-handoffd.py"
+    if not handoffd.is_file():
+        err(f"cannot locate receiver bind-proof helper at {handoffd}; "
+            "skipping bind preview (a running daemon still RE-PROVES at "
+            "bind time)")
         rc = 1
+    else:
+        import subprocess  # noqa: PLC0415 (only this path needs it)
+        cmd = [sys.executable, str(handoffd), "reconcile"]
+        # Thread an explicit --config through ONLY when the caller pinned one
+        # via BRIDGE_A2A_CONFIG, so the child resolves the identical config
+        # the parent's a2a.load_config() did. Otherwise let the child run its
+        # own default resolution (same code path).
+        cfg_override = os.environ.get("BRIDGE_A2A_CONFIG")
+        if cfg_override:
+            cmd += ["--config", cfg_override]
+        try:
+            proof = subprocess.run(  # noqa: PLW1510 (rc handled below)
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as exc:
+            err(f"could not run receiver bind proof ({handoffd.name}): {exc}")
+            rc = 1
+        else:
+            # Surface the receiver's own proof output verbatim (it carries the
+            # `bind proven: ...` line or the `bind FAIL: ... (bind_not_tailnet)`
+            # refusal). Route its stdout through info and stderr through err so
+            # the failure stays on the error stream + nonzero propagates.
+            for line in (proof.stdout or "").splitlines():
+                if line.strip():
+                    info(line)
+            for line in (proof.stderr or "").splitlines():
+                if line.strip():
+                    err(line)
+            if proof.returncode != 0:
+                # The daemon refuses to bind (e.g. bind_not_tailnet); the CLI
+                # preview must mirror that fail-closed verdict, not exit 0.
+                rc = 1
 
     # --- trigger: SIGHUP the running receiver, if any ---
     pid_file = a2a.handoff_dir() / "handoffd.pid"
