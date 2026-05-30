@@ -460,8 +460,22 @@ def parse_session_type(agent_dir: Path) -> tuple[str, str]:
     if not path.exists():
         return session_type, onboarding_state
     text = read_text(path)
-    session_match = re.search(r"Session Type:\s*([A-Za-z0-9._-]+)", text)
-    onboarding_match = re.search(r"Onboarding State:\s*([A-Za-z0-9._-]+)", text)
+    # Anchor both fields to the top-block metadata line shape
+    # (``^`` + optional ``- `` markdown list marker + field). The
+    # SESSION-TYPE.md checklist bodies quote the literal string
+    # ``Onboarding State: pending`` as instruction text (admin /
+    # static-codex / dynamic / cron templates); an unanchored
+    # substring match could pick up that body line if it ever precedes
+    # the real metadata line. Mirrors the anchored grep in
+    # ``lib/bridge-agents.sh:bridge_agent_onboarding_state`` and the
+    # ``^-?\s*Onboarding State:`` regex in
+    # ``bridge-upgrade.py:detect_prior_onboarding_complete``.
+    session_match = re.search(
+        r"^[ \t]*-?[ \t]*Session Type:\s*([A-Za-z0-9._-]+)", text, re.MULTILINE
+    )
+    onboarding_match = re.search(
+        r"^[ \t]*-?[ \t]*Onboarding State:\s*([A-Za-z0-9._-]+)", text, re.MULTILINE
+    )
     if session_match:
         session_type = session_match.group(1).strip()
     if onboarding_match:

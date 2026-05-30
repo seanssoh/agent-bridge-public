@@ -16,4 +16,4 @@
 - Confirm the role description and working style.
 - Confirm which repos or work areas this role owns.
 - Confirm whether it should stay always-on or only wake on demand.
-- Update `SOUL.md` and this file, then set `Onboarding State: complete`.
+- Update `SOUL.md` and this file, then set the Onboarding State field above to `complete`.
