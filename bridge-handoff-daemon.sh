@@ -20,11 +20,15 @@ Usage:
   bash $SCRIPT_DIR/bridge-handoff-daemon.sh restart
   bash $SCRIPT_DIR/bridge-handoff-daemon.sh status
   bash $SCRIPT_DIR/bridge-handoff-daemon.sh deliver [--batch N] [--timeout S]
-  bash $SCRIPT_DIR/bridge-handoff-daemon.sh tick         # receiver-ensure + deliver
+  bash $SCRIPT_DIR/bridge-handoff-daemon.sh reconcile     # self-heal: re-resolve+rebind + config reload
+  bash $SCRIPT_DIR/bridge-handoff-daemon.sh tick         # receiver-ensure + reconcile + deliver
 
 The receiver binds to the configured tailnet IP only and fails closed at
-startup otherwise (see docs/a2a-cross-bridge.md). Config lives in the
-git-ignored data-only file handoff.local.json (mode 0600).
+startup otherwise (see docs/a2a-cross-bridge.md). It self-heals a local-IP
+change (after a tailnet re-login) and config edits without a restart — on
+its own timer (BRIDGE_A2A_RECONCILE_INTERVAL, default 45s), on SIGHUP, and
+on the reconcile/tick subcommands. Config lives in the git-ignored data-only
+file handoff.local.json (mode 0600).
 EOF
 }
 
@@ -46,12 +50,20 @@ case "${1:-}" in
     shift
     bridge_a2a_deliver_tick "$@"
     ;;
+  reconcile)
+    # Self-heal: re-resolve + re-prove the bind (auto-rebind on local-IP
+    # drift) + config hot-reload, via SIGHUP to the running daemon + a
+    # fail-closed preview. No restart needed.
+    bridge_a2a_reconcile
+    ;;
   tick)
-    # Ensure the receiver is up, then drain the outbox. Suitable for a
-    # cron-driven cadence on installs without an always-on daemon.
+    # Ensure the receiver is up, run a self-heal reconcile (so a cron-driven
+    # cadence on installs without an always-on daemon also picks up local-IP
+    # drift + config edits), then drain the outbox.
     if ! bridge_a2a_receiver_running; then
       bridge_a2a_receiver_start || true
     fi
+    bridge_a2a_reconcile || true
     bridge_a2a_deliver_tick
     ;;
   -h|--help|help|"")

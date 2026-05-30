@@ -63,6 +63,34 @@ Three fixed decisions shape the design:
   `BRIDGE_A2A_TAILSCALE_CLI` to an explicit path for a non-standard
   install. `remote_addr == configured peer tailnet IP` is enforced
   before the request body is read.
+- **Self-heal (no manual restart on IP churn).** A running receiver
+  re-resolves its own bind and re-reads `handoff.local.json` on a periodic
+  reconcile (and on `SIGHUP`), so a local Tailscale-IP change (after a
+  tailnet re-login) and config edits take effect **without** a
+  `bridge-handoff-daemon.sh restart`:
+  - **Bind reconcile (auto-rebind on local-IP drift).** When the proven
+    bind address changes, the listener is torn down and re-created on the
+    new address — through the **same** fail-closed proof as startup (the
+    candidate must be in this node's `tailscale ip` set; wildcard/loopback
+    and a Tailscale-unavailable query are refused). A reconcile that cannot
+    re-prove a new bind **keeps the current proven bind** (never an unproven
+    one) and logs a warning; the daemon does not crash. An actual rebind
+    emits an audit line `rebind old=<addr>:<port> new=<addr>:<port>`.
+  - **Config hot-reload.** A newly-added/removed peer, allowlist entry, or
+    cap edit is picked up live. Hot-reload is fail-closed: a malformed or
+    unprovisioned-peer reload is rejected, the last-good config is kept, and
+    a warning is logged — the allowlist / peer table is never replaced by a
+    half-parsed config.
+  - **Cadence + trigger.** The reconcile interval defaults to 45s,
+    overridable via `BRIDGE_A2A_RECONCILE_INTERVAL` (seconds; `0` disables
+    the timer — `SIGHUP` still works). `agent-bridge a2a reconcile` (and
+    `bridge-handoff-daemon.sh reconcile` / `tick`) trigger an immediate
+    reconcile and print a fail-closed preview of what the daemon would
+    bind/reload.
+  - Per-request inbound source-address auth already resolves an
+    identity-keyed peer's current IP, so inbound self-heals for identity-
+    keyed peers with no restart; this reconcile additionally closes the
+    local-bind-drift and added/removed-peer cases.
 - **HMAC-signed requests** (not raw bearer tokens — avoids replayable
   strings in process/log surfaces). The peer-pair secret is the HMAC key.
   - Headers: `X-AGB-Protocol: a2a-enqueue-v1`, `X-AGB-Peer`,

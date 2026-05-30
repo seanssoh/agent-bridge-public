@@ -621,7 +621,7 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/install-handoffd-systemd.sh)
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the

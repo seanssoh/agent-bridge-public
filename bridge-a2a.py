@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import random
+import signal
 import socket
 import sys
 import time
@@ -838,6 +839,87 @@ def cmd_deliver(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# a2a reconcile (self-heal trigger + preview, P-self-heal-1, #1403)
+# --------------------------------------------------------------------------
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    """Trigger + preview one receiver self-heal reconcile (P-self-heal-1, #1403).
+
+    Two parts:
+      1. PREVIEW (always): validate the config + re-resolve the listen
+         identity through the SAME resolver the running daemon uses (the
+         daemon then RE-PROVES the candidate against `tailscale ip` before
+         binding — candidate ∈ set; refuse wildcard/loopback; refuse if
+         Tailscale unavailable). Lets the wizard/operator confirm the current
+         Tailscale identity resolves before/after an IP change.
+      2. TRIGGER (if a daemon is running): send SIGHUP to the receiver pid so
+         the LIVE daemon runs an immediate reconcile (auto-rebind on local-IP
+         drift + config hot-reload) with no `bridge-handoff-daemon.sh restart`.
+
+    The preview never weakens the proof — a resolve failure is reported, not
+    silently bound. The running daemon keeps serving on its current proven
+    bind + last-good config on any reconcile failure (see bridge-handoffd.py).
+    """
+    try:
+        cfg = a2a.load_config()
+    except a2a.A2AError as exc:
+        return die(str(exc)) or 1
+
+    rc = 0
+    # --- preview: config validity (fail-closed report) ---
+    try:
+        a2a.validate_config_peer_secrets(cfg, side="receiver")
+        info(f"config OK: {len(cfg.get('peers', []))} peer(s) configured")
+    except a2a.A2AError as exc:
+        err(f"config invalid: {exc} ({exc.code}) — a running daemon would keep "
+            "its last-good config (fail-closed)")
+        rc = 1
+
+    # --- preview: listen identity resolution (same resolver as the daemon) ---
+    try:
+        listen = cfg.get("listen", {})
+        if isinstance(listen, dict):
+            bind = a2a.resolve_peer_address(listen)
+            port = int(listen.get("port", 8787))
+        else:
+            bind, port = "", 8787
+        if bind:
+            info(f"listen resolves to {bind}:{port} (the running daemon "
+                 "RE-PROVES this against `tailscale ip` before binding)")
+        else:
+            info("listen has no explicit address; the daemon auto-selects + "
+                 "proves a tailnet IP at bind time")
+    except a2a.A2AError as exc:
+        err(f"listen identity does not resolve: {exc} ({exc.code}) — a running "
+            "daemon would keep its current proven bind")
+        rc = 1
+
+    # --- trigger: SIGHUP the running receiver, if any ---
+    pid_file = a2a.handoff_dir() / "handoffd.pid"
+    pid: Optional[int] = None
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pid = None
+    if pid is not None:
+        try:
+            os.kill(pid, signal.SIGHUP)
+            info(f"sent SIGHUP to running receiver (pid {pid}) — immediate "
+                 "reconcile (auto-rebind on local-IP drift + config "
+                 "hot-reload); no restart needed")
+        except ProcessLookupError:
+            info("no running receiver (stale pidfile) — start it with "
+                 "`agent-bridge handoff start`; it self-heals on its own timer")
+        except OSError as exc:
+            err(f"could not signal receiver pid {pid}: {exc}")
+    else:
+        info("no running receiver pidfile — start it with "
+             "`agent-bridge handoff start`; the daemon self-heals on its timer")
+    return rc
+
+
+# --------------------------------------------------------------------------
 # argument parsing
 # --------------------------------------------------------------------------
 
@@ -886,6 +968,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_deliver.add_argument("--lease", type=int, default=None)
     p_deliver.add_argument("--timeout", type=float, default=None)
     p_deliver.set_defaults(func=cmd_deliver)
+
+    p_reconcile = sub.add_parser(
+        "reconcile",
+        help="trigger + preview one receiver self-heal reconcile "
+             "(re-resolve+prove bind, config hot-reload via SIGHUP)")
+    p_reconcile.set_defaults(func=cmd_reconcile)
 
     return parser
 
