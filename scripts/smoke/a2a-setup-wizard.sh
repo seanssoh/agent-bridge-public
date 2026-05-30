@@ -368,6 +368,57 @@ EOF
     "(7) the config is unchanged after a fail-closed resolve error"
 }
 
+# --- (8) --peer WITHOUT --peer-secret-env is fail-closed before any write ---
+# codex #1418 r1 BLOCKING-2: a MISSING --peer-secret-env flag (not just an empty
+# value) used to bypass the secret guard and strand a secretless peer on disk.
+# The guard now fires on a missing flag too, BEFORE any cfg mutation/write.
+case_8_peer_without_secret_flag() {
+  local nf_cfg="$BRIDGE_HOME/handoff-noflag.json"
+  local out rc=0
+  out="$(BRIDGE_A2A_CONFIG="$nf_cfg" setup \
+    --bridge-id "$SELF_BRIDGE_ID" --listen-port "$A2A_PORT" \
+    --peer "$SELF_BRIDGE_ID" --inbound-allowlist reviewer 2>&1)" || rc=$?
+  smoke_assert_eq "1" "$rc" \
+    "(8) --peer with NO --peer-secret-env -> non-zero exit (fail-closed)"
+  smoke_assert_contains "$out" "peer_no_secret" \
+    "(8) the failure is peer_no_secret (missing flag, not just empty value)"
+  smoke_assert_not_contains "$out" "wrote " \
+    "(8) NO config written when --peer-secret-env is absent"
+  smoke_assert_eq "1" "$([[ -f "$nf_cfg" ]] && echo 0 || echo 1)" \
+    "(8) no config file created at all (refused before persist)"
+}
+
+# --- (9) un-keyed unresolvable peer is REFUSED at the write stage ---
+# codex #1418 r1 BLOCKING-1: `--peer <ghost>` where ghost is NOT among the
+# Online mock nodes AND has no pre-placed address used to be WRITTEN (with a
+# secret) + reported S2-done + activatable while skipping S6. The wizard must
+# now hard-error (peer_unresolvable) BEFORE persisting anything.
+case_9_unkeyed_peer_refused() {
+  local uk_cfg="$BRIDGE_HOME/handoff-unkeyed.json"
+  local out rc=0
+  # ghost-peer is not in the mock `tailscale status` and the config does not
+  # exist yet (no pre-placed address) -> must be refused.
+  out="$(BRIDGE_A2A_CONFIG="$uk_cfg" setup \
+    --bridge-id "$SELF_BRIDGE_ID" --listen-port "$A2A_PORT" \
+    --peer ghost-peer --peer-secret-env A2A_PEER_SECRET \
+    --inbound-allowlist reviewer 2>&1)" || rc=$?
+  smoke_assert_eq "1" "$rc" \
+    "(9) un-keyed unresolvable --peer -> non-zero exit (fail-closed)"
+  smoke_assert_contains "$out" "peer_unresolvable" \
+    "(9) the failure is peer_unresolvable (no secret-bearing dead peer written)"
+  smoke_assert_not_contains "$out" "wrote " \
+    "(9) NO config written for an unresolvable un-keyed peer"
+  smoke_assert_eq "1" "$([[ -f "$uk_cfg" ]] && echo 0 || echo 1)" \
+    "(9) no config file created (the dead un-keyed peer never persisted)"
+  # And there is NO way to then activate it: a follow-up --yes with no --peer
+  # against a config that was never written must not start a receiver for a
+  # ghost peer (the config simply does not exist -> S5 has nothing to activate).
+  rc=0
+  out="$(BRIDGE_A2A_CONFIG="$uk_cfg" setup --yes 2>&1)" || rc=$?
+  smoke_assert_not_contains "$out" "S5 OK" \
+    "(9) --yes cannot activate a receiver off the never-written ghost config"
+}
+
 main() {
   smoke_require_cmd python3
   smoke_require_cmd tmux
@@ -393,6 +444,8 @@ main() {
   smoke_run "(5) S6 handshake acked (live loopback)"    case_5_s6_handshake
   smoke_run "(6) idempotent re-run no-op"               case_6_idempotent
   smoke_run "(7) fail-closed unresolvable peer"         case_7_unresolvable_peer
+  smoke_run "(8) --peer without --peer-secret-env"      case_8_peer_without_secret_flag
+  smoke_run "(9) un-keyed peer refused at write"        case_9_unkeyed_peer_refused
 
   smoke_log "PASS"
 }

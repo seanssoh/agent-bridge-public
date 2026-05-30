@@ -1522,19 +1522,40 @@ def _setup_probe_s2(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, 
     if want:
         for peer in peers:
             if isinstance(peer, dict) and peer.get("id") == want:
-                # Already configured — must have a usable secret to count.
-                if a2a.peer_secrets(peer):
+                # Already configured — to COUNT as done it must be both
+                # secret-bearing AND resolvable (identity-keyed or a pre-placed
+                # raw address). A peer with a secret but no node_id/
+                # tailscale_name/address is not actually usable (it cannot
+                # resolve to a tailnet IP) — reporting it "done" was the
+                # #1418 codex r1 BLOCKING-1 gap. Require both.
+                has_secret = bool(a2a.peer_secrets(peer))
+                resolvable = bool(peer.get("node_id")
+                                  or peer.get("tailscale_name")
+                                  or peer.get("address"))
+                if has_secret and resolvable:
                     return _setup_result(
                         "S2", done=True, action="",
-                        detail={"peer": want, "secret_configured": True},
+                        detail={"peer": want, "secret_configured": True,
+                                "resolvable": True},
+                    )
+                if not has_secret:
+                    return _setup_result(
+                        "S2", done=False,
+                        action=f"Peer {want} is configured but has no secret. "
+                               "Re-run with --peer-secret-env <ENVVAR> set to a "
+                               "long random shared secret (>=32 bytes).",
+                        needs=["--peer-secret-env"],
+                        detail={"peer": want, "secret_configured": False},
                     )
                 return _setup_result(
                     "S2", done=False,
-                    action=f"Peer {want} is configured but has no secret. "
-                           "Re-run with --peer-secret-env <ENVVAR> set to a "
-                           "long random shared secret (>=32 bytes).",
-                    needs=["--peer-secret-env"],
-                    detail={"peer": want, "secret_configured": False},
+                    action=f"Peer {want} is configured but unresolvable (no "
+                           "node_id/tailscale_name/address). Bring that node "
+                           "Online so `tailscale status` lists it (then re-run "
+                           "with --peer to re-key), or pre-place a raw `address`.",
+                    needs=["--peer"],
+                    detail={"peer": want, "secret_configured": True,
+                            "resolvable": False},
                 )
         # Not yet configured — list discoverable peers to relay the pick.
         return _setup_result(
@@ -1803,21 +1824,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # ===== S2 discover: write/refresh the chosen peer entry =====
     s2_changed = False
     if args.peer:
-        # Fail-closed BEFORE any in-memory mutation (#1418 sweep hardening):
-        # the empty-secret guard used to sit after the peers[].append below, so
-        # an empty --peer-secret-env left a half-formed {"id": ...} peer in the
-        # in-memory cfg before die() returned. It never persisted (die precedes
-        # the only write), but the in-memory/on-disk invariants should match so
-        # a future intermediate write can't strand a secretless peer. Refuse the
-        # empty secret here, before touching cfg.
-        if args.peer_secret_env and not secret:
-            return die(
-                f"--peer-secret-env {args.peer_secret_env} is empty/unset. "
-                "Export a long random shared secret (>=32 bytes) into that "
-                "env var, e.g. `export "
-                f"{args.peer_secret_env}=$(openssl rand -hex 32)`, then "
-                "re-run. Refusing to write an empty secret (fail-closed).",
-                code="peer_no_secret") or 1
+        # ===== S2 fail-closed PRE-FLIGHT — validate EVERYTHING before any cfg
+        # mutation or write (#1418 codex r1, both BLOCKINGs). The peer entry is
+        # only written once it is (a) secret-bearing AND (b) resolvable — either
+        # identity-keyed from a discovered Online node, or carrying a
+        # pre-placed raw `address`. A peer that fails either check must NEVER be
+        # persisted (no secretless peer on disk; no secret-bearing-but-dead
+        # un-keyed peer that _setup_probe_s2 would then report as "done" and
+        # that `setup --yes` without --peer could activate while skipping S6).
+
+        # Locate any existing entry first (an operator may have pre-placed a raw
+        # `address`, or a prior run already wrote an identity + secret, for a
+        # peer that is not currently Online — back-compat / re-run).
         peers = cfg.get("peers", [])
         if not isinstance(peers, list):
             peers = []
@@ -1827,22 +1845,66 @@ def cmd_setup(args: argparse.Namespace) -> int:
             if isinstance(peer, dict) and peer.get("id") == args.peer:
                 existing = peer
                 break
-        if existing is None:
-            existing = {"id": args.peer}
-            peers.append(existing)
-            s2_changed = True
-        # Resolve the peer's Tailscale identity so the entry is identity-keyed
-        # (self-heals on the peer's IP change). --peer is the operator's choice
-        # relayed as the id; if a discovered Online node's node_id / MagicDNS
-        # name / HostName equals it, key on that node's identity. Otherwise the
-        # operator may pre-place a raw `address` (back-compat) and the entry is
-        # left un-keyed (P1 does not invent an identity it cannot observe).
+
+        # (1) Secret is MANDATORY — but it may come from --peer-secret-env
+        #     (non-empty) OR an already-on-disk secret on the existing entry
+        #     (so re-running `setup --peer X` to re-key/handshake an
+        #     already-configured peer does not force re-supplying the secret).
+        #     A NEW or secretless peer with no usable secret source is a hard
+        #     fail-closed error BEFORE any mutation. (Pre-fix the guard was
+        #     gated on `args.peer_secret_env` being PRESENT, so a MISSING flag
+        #     bypassed it and stranded a secretless peer — codex r1 BLOCKING-2.)
+        if args.peer_secret_env and not secret:
+            return die(
+                f"--peer-secret-env {args.peer_secret_env} is empty/unset. "
+                "Export a long random shared secret (>=32 bytes) into that env "
+                "var, e.g. `export "
+                f"{args.peer_secret_env}=$(openssl rand -hex 32)`, then re-run. "
+                "Refusing to write an empty secret (fail-closed).",
+                code="peer_no_secret") or 1
+        has_existing_secret = bool(existing and a2a.peer_secrets(existing))
+        if not secret and not has_existing_secret:
+            return die(
+                "--peer requires a shared secret: pass --peer-secret-env "
+                "<ENVVAR> (a non-empty long random secret >=32 bytes, e.g. "
+                "`export A2A_PEER_SECRET=$(openssl rand -hex 32)`), or re-run "
+                "against a config where this peer already has one. Refusing to "
+                "write a peer without a secret (fail-closed).",
+                code="peer_no_secret") or 1
+
+        # (2) Resolve the peer's Tailscale identity. --peer is the operator's
+        #     choice relayed as the id; if a discovered Online node's
+        #     node_id / MagicDNS name / HostName equals it, we key on that
+        #     node's identity (self-heals on the peer's IP change).
         match = None
         for node in _setup_discover_peers():
             if args.peer in (node.get("tailscale_name"), node.get("host_name"),
                              node.get("node_id")):
                 match = node
                 break
+
+        # (3) The peer MUST be resolvable: either we matched a live tailnet
+        #     identity, OR an existing entry already carries an identity / raw
+        #     address. If neither, REFUSE — do not persist a secret-bearing but
+        #     unresolvable un-keyed peer (codex r1 BLOCKING-1). P1 does not
+        #     invent an identity it cannot observe.
+        has_prior_resolvable = bool(existing and (
+            existing.get("node_id") or existing.get("tailscale_name")
+            or existing.get("address")))
+        if match is None and not has_prior_resolvable:
+            return die(
+                f"peer {args.peer!r} is not among the Online Tailscale nodes "
+                "and has no pre-placed `address`. Refusing to write an "
+                "unresolvable peer (fail-closed). Bring that node Online so "
+                "`tailscale status` lists it, or pre-place a raw `address` for "
+                "it in handoff.local.json, then re-run.",
+                code="peer_unresolvable") or 1
+
+        # ===== all checks passed — now mutate the cfg =====
+        if existing is None:
+            existing = {"id": args.peer}
+            peers.append(existing)
+            s2_changed = True
         if match:
             if match.get("node_id") and existing.get("node_id") != match["node_id"]:
                 existing["node_id"] = match["node_id"]
@@ -1851,18 +1913,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
                     existing.get("tailscale_name") != match["tailscale_name"]:
                 existing["tailscale_name"] = match["tailscale_name"]
                 s2_changed = True
-        elif not existing.get("node_id") and not existing.get("tailscale_name") \
-                and not existing.get("address"):
-            # No Online tailnet node matched --peer and no raw address is
-            # pre-placed (#1418 sweep UX hardening): surface it HERE rather than
-            # letting it first appear as an S6 `setup_s6_noaddr` failure a step
-            # later. The entry is still written (the operator may bring the node
-            # Online or pre-place a raw `address`), but it will not resolve yet.
+        else:
+            # No live match but a prior entry is resolvable (pre-placed address
+            # or previously-keyed identity) — keep it, note we did not re-key.
             info(
-                f"peer {args.peer!r} not found among Online tailnet nodes; "
-                "entry left un-keyed (no node_id/tailscale_name/address). It "
-                "will not resolve until that node is Online or a raw `address` "
-                "is set in handoff.local.json.")
+                f"peer {args.peer!r} not currently Online; keeping its existing "
+                "identity/address (not re-keyed this run).")
         existing.setdefault("port", int(listen.get("port", 8787)))
         existing.setdefault("enqueue_path", "/enqueue")
         if args.inbound_allowlist is not None:
@@ -1871,10 +1927,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
             if existing.get("inbound_allowlist") != allow:
                 existing["inbound_allowlist"] = allow
                 s2_changed = True
-        # The secret comes from --peer-secret-env ONLY. The empty-value
-        # fail-closed guard ran at the top of this block (before any mutation);
-        # here we only persist a non-empty secret.
-        if args.peer_secret_env and existing.get("secret") != secret:
+        # Persist a NEWLY-supplied non-empty secret. When `secret` is empty we
+        # only reach here because the existing entry already has one (validated
+        # above) — do NOT clobber that good on-disk secret with an empty value.
+        if secret and existing.get("secret") != secret:
             existing["secret"] = secret
             s2_changed = True
 
