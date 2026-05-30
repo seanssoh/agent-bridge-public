@@ -629,6 +629,30 @@ bridge_agent_launch_cmd() {
   printf '%s' "$launch_cmd"
 }
 
+# #1407 (PR #1410 follow-up): the dynamic env file sourced by
+# bridge_load_dynamic_agent_file can clobber a BRIDGE_AGENT_* roster map to a
+# scalar (e.g. a stray `BRIDGE_AGENT_CREATED_AT=` line in an old/malformed env
+# file). After that, every indexed read AND write of the map below aborts under
+# `set -u` with `<id>: unbound variable` — note the WRITE aborts too, so routing
+# the read through an accessor is NOT sufficient (empirically confirmed). A
+# scalar map carries no per-agent data, so redeclaring it as an empty
+# associative array is loss-free; the per-map declare-guard makes this a no-op
+# for the normal (already-associative) case, which also keeps the #1213
+# scalar-vs-`declare -g -A` collision class from re-triggering.
+bridge_ensure_roster_maps_assoc() {
+  local _m
+  for _m in BRIDGE_AGENT_DESC BRIDGE_AGENT_ENGINE BRIDGE_AGENT_SESSION \
+            BRIDGE_AGENT_WORKDIR BRIDGE_AGENT_SOURCE BRIDGE_AGENT_META_FILE \
+            BRIDGE_AGENT_PROVENANCE BRIDGE_AGENT_LOOP BRIDGE_AGENT_CONTINUE \
+            BRIDGE_AGENT_SESSION_ID BRIDGE_AGENT_HISTORY_KEY \
+            BRIDGE_AGENT_CREATED_AT BRIDGE_AGENT_UPDATED_AT; do
+    if ! declare -p "$_m" 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+      unset "$_m"
+      declare -gA "$_m=()"
+    fi
+  done
+}
+
 bridge_load_dynamic_agent_file() {
   local file="$1"
   local AGENT_ID=""
@@ -645,6 +669,11 @@ bridge_load_dynamic_agent_file() {
 
   # shellcheck source=/dev/null
   source "$file"
+
+  # #1407: repair any roster map the sourced file may have clobbered to a
+  # scalar BEFORE the indexed reads/writes below (which would otherwise abort
+  # under `set -u`). Loss-free + no-op when already associative.
+  bridge_ensure_roster_maps_assoc
 
   if [[ -z "$AGENT_ID" || -z "$AGENT_ENGINE" || -z "$AGENT_SESSION" || -z "$AGENT_WORKDIR" ]]; then
     return 0

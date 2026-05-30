@@ -165,6 +165,64 @@ else
 	printf '%s\n' "$d2cls_hits"
 fi
 
+# --- D2-dynload: codex (PR #1410 r2) found the static-collision branch of -----
+# bridge_load_dynamic_agent_file STILL aborts on a scalar-clobbered roster map.
+# That branch does an assoc WRITE `BRIDGE_AGENT_CREATED_AT["$AGENT_ID"]=…` — and
+# empirically the WRITE itself aborts on a scalar map, so routing only the RHS
+# read through the accessor is NOT enough. The fix repairs any clobbered map back
+# to associative (bridge_ensure_roster_maps_assoc) right after `source "$file"`.
+# This drives codex's EXACT repro through the real loader; pre-fix signature is
+# `<id>: unbound variable`.
+#
+# Source the granular libs (core+state+agents) like D2-accessor/D2-persist above,
+# NOT the full bridge-lib.sh: in a markerless CI/test home, bridge-lib.sh's
+# isolation-v2 layout gate (v0.8.0) `exit`s before bridge_load_dynamic_agent_file
+# is defined, so the loader would never run and D2DYN would be blank. The granular
+# libs define the loader + bridge_reset_roster_maps + bridge_ensure_roster_maps_assoc
+# + bridge_add_agent_id_if_missing without tripping the layout resolver. (codex
+# PR #1412 r1 caught this CI-only fixture bug; reproduced markerless on Ubuntu.)
+d2dyn_out="$(
+	"$BASH4" -c '
+		set -u
+		source "'"$SCRIPT_DIR"'/lib/bridge-core.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-state.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-agents.sh" 2>/dev/null || true
+		bridge_reset_roster_maps 2>/dev/null || true
+		agent=some-agent
+		bridge_add_agent_id_if_missing "$agent"
+		BRIDGE_AGENT_SOURCE["$agent"]="static"
+		BRIDGE_AGENT_ENGINE["$agent"]="claude"
+		BRIDGE_AGENT_SESSION["$agent"]="sess"
+		BRIDGE_AGENT_WORKDIR["$agent"]="/tmp"
+		BRIDGE_AGENT_SESSION_ID["$agent"]=""
+		unset BRIDGE_AGENT_CREATED_AT
+		BRIDGE_AGENT_CREATED_AT=scalar
+		bridge_resolve_resume_session_id() { printf ""; return 1; }
+		f="$(mktemp "${TMPDIR:-/tmp}/agb-1407-dyn.XXXXXX")"
+		printf "%s\n" "AGENT_ID=$agent" "AGENT_ENGINE=claude" "AGENT_SESSION=sess2" "AGENT_WORKDIR=/tmp" >"$f"
+		bridge_load_dynamic_agent_file "$f" && printf "D2DYN=ok\n"
+		rm -f "$f"
+	' 2>&1
+)" || true
+printf '%s\n' "$d2dyn_out"
+if printf '%s' "$d2dyn_out" | grep -q 'unbound variable'; then
+	fail "D2-dynload bridge_load_dynamic_agent_file aborted on scalar-clobbered roster map (codex r2 site)"
+elif printf '%s' "$d2dyn_out" | grep -q 'D2DYN=ok'; then
+	pass "D2-dynload bridge_load_dynamic_agent_file tolerates scalar-clobbered roster map (static-collision branch)"
+else
+	fail "D2-dynload did not reach the loaded-ok marker: $d2dyn_out"
+fi
+
+# --- D2-repair: the loader must repair clobbered maps right after `source` -----
+# Static-presence guard for the fix above: bridge_load_dynamic_agent_file calls
+# bridge_ensure_roster_maps_assoc, and the helper redeclares (not just reads).
+if grep -q 'bridge_ensure_roster_maps_assoc' "$SCRIPT_DIR/lib/bridge-state.sh" \
+	&& grep -q 'declare -gA "\$_m=()"' "$SCRIPT_DIR/lib/bridge-state.sh"; then
+	pass "D2-repair bridge_ensure_roster_maps_assoc present + redeclares maps in lib/bridge-state.sh"
+else
+	fail "D2-repair bridge_ensure_roster_maps_assoc missing or does not redeclare maps"
+fi
+
 # --- D3: stuck-scan markdown bullets emit literal `- ...` (no invalid option) -
 # Exercise the exact printf form used by process_a2a_outbox_stuck_scan_tick.
 d3_out="$(
