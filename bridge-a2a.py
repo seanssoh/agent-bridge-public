@@ -1803,6 +1803,21 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # ===== S2 discover: write/refresh the chosen peer entry =====
     s2_changed = False
     if args.peer:
+        # Fail-closed BEFORE any in-memory mutation (#1418 sweep hardening):
+        # the empty-secret guard used to sit after the peers[].append below, so
+        # an empty --peer-secret-env left a half-formed {"id": ...} peer in the
+        # in-memory cfg before die() returned. It never persisted (die precedes
+        # the only write), but the in-memory/on-disk invariants should match so
+        # a future intermediate write can't strand a secretless peer. Refuse the
+        # empty secret here, before touching cfg.
+        if args.peer_secret_env and not secret:
+            return die(
+                f"--peer-secret-env {args.peer_secret_env} is empty/unset. "
+                "Export a long random shared secret (>=32 bytes) into that "
+                "env var, e.g. `export "
+                f"{args.peer_secret_env}=$(openssl rand -hex 32)`, then "
+                "re-run. Refusing to write an empty secret (fail-closed).",
+                code="peer_no_secret") or 1
         peers = cfg.get("peers", [])
         if not isinstance(peers, list):
             peers = []
@@ -1836,6 +1851,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
                     existing.get("tailscale_name") != match["tailscale_name"]:
                 existing["tailscale_name"] = match["tailscale_name"]
                 s2_changed = True
+        elif not existing.get("node_id") and not existing.get("tailscale_name") \
+                and not existing.get("address"):
+            # No Online tailnet node matched --peer and no raw address is
+            # pre-placed (#1418 sweep UX hardening): surface it HERE rather than
+            # letting it first appear as an S6 `setup_s6_noaddr` failure a step
+            # later. The entry is still written (the operator may bring the node
+            # Online or pre-place a raw `address`), but it will not resolve yet.
+            info(
+                f"peer {args.peer!r} not found among Online tailnet nodes; "
+                "entry left un-keyed (no node_id/tailscale_name/address). It "
+                "will not resolve until that node is Online or a raw `address` "
+                "is set in handoff.local.json.")
         existing.setdefault("port", int(listen.get("port", 8787)))
         existing.setdefault("enqueue_path", "/enqueue")
         if args.inbound_allowlist is not None:
@@ -1844,20 +1871,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
             if existing.get("inbound_allowlist") != allow:
                 existing["inbound_allowlist"] = allow
                 s2_changed = True
-        # The secret comes from --peer-secret-env ONLY. An empty value is a
-        # hard fail-closed error — never write an empty secret.
-        if args.peer_secret_env:
-            if not secret:
-                return die(
-                    f"--peer-secret-env {args.peer_secret_env} is empty/unset. "
-                    "Export a long random shared secret (>=32 bytes) into that "
-                    "env var, e.g. `export "
-                    f"{args.peer_secret_env}=$(openssl rand -hex 32)`, then "
-                    "re-run. Refusing to write an empty secret (fail-closed).",
-                    code="peer_no_secret") or 1
-            if existing.get("secret") != secret:
-                existing["secret"] = secret
-                s2_changed = True
+        # The secret comes from --peer-secret-env ONLY. The empty-value
+        # fail-closed guard ran at the top of this block (before any mutation);
+        # here we only persist a non-empty secret.
+        if args.peer_secret_env and existing.get("secret") != secret:
+            existing["secret"] = secret
+            s2_changed = True
 
     # ===== persist the config atomically at 0600 if anything changed =====
     if s1_changed or s2_changed:
