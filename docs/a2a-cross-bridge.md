@@ -390,6 +390,7 @@ backpressure: over quota → `429` with `Retry-After`.
 - `agent-bridge a2a peers list|test <peer>`
 - `agent-bridge a2a deliver` — drain the outbox once
 - `agent-bridge a2a announce-identity [--peer <id>] [--dry-run] [--timeout <s>]` — push a signed `peer-identity-update` to peers after an IP change
+- `agent-bridge a2a setup [--show-state [--json]] [--bridge-id <id>] [--peer <id>] [--peer-secret-env <ENVVAR>] [--listen-port <n>] [--inbound-allowlist a,b] [--yes] [--live-handshake]` — agent-driven setup wizard (see "Setup wizard" below)
 - `agent-bridge a2a daemon start|stop|restart|status|healthz|tick` — receiver lifecycle (`healthz` = read-only serve-liveness probe via `GET /healthz`)
 
 The delivery runner can be daemon-driven or cron-driven (`a2a daemon
@@ -403,6 +404,108 @@ job is not durable from such shells. The detached process owns the pid
 file, so `a2a daemon status` reflects the real long-lived listener. A
 fail-closed bind error still surfaces synchronously as a non-zero exit
 from `start` (the bind happens before the detach).
+
+## Setup wizard (`agb a2a setup`)
+
+`agb a2a setup` is an **agent-driven, decision-gated, idempotent/resumable**
+wizard that produces the SAME `handoff.local.json` + receiver state the manual
+"Quick start" runbook does — it introduces **no new wire protocol** and **no
+new bind/HMAC/allowlist path**. It only sequences the existing self-heal
+helpers (identity resolution, the 0600 atomic config write, the raw-IP →
+identity migration) plus the `bridge-handoff-daemon.sh start` lifecycle verb.
+
+It automates everything except the two things only a human can do: the
+Tailscale browser login, and the trust decisions (which peer, which allowlist,
+approving activation). P1 keeps the **manual secret** (out-of-band) — the
+automatic secret pairing (design §4d) and roster exchange (§4e) land in later
+phases.
+
+### State machine (P1 implements S0/S1/S2/S5/S6)
+
+```
+S0  preflight   : tailscale present + authenticated? (browser login = the one human gate)
+S1  self-config : write bridge_id + an identity-keyed `listen` (from `tailscale status --json` Self)
+S2  discover    : list Online tailnet peers → human picks → write an identity-keyed peers[] entry
+S5  activate    : validate secrets (fail-closed) → `bridge-handoff-daemon.sh start` (bind preflight, then detach)
+S6  handshake   : resolve+probe the peer + dry-run send; --live-handshake also does a real send+deliver+ack
+```
+
+S3 (secret pairing) and S4 (roster/allowlist exchange) are deferred; P1 takes
+the allowlist via `--inbound-allowlist` and the secret via `--peer-secret-env`.
+
+### No state file — the S-state is derived from observable facts
+
+The wizard stores **no** `setup-wizard.state` file (a second source of truth
+that can go stale). On every run it re-derives the current state from
+observable facts — `tailscale status --json`, the on-disk `handoff.local.json`,
+the live receiver pid — so a re-run asks "already true?" per state and is
+inherently a no-op once setup is complete. The only persistent artifact is
+`handoff.local.json` (atomic, mode 0600).
+
+### Flag surface (the agent-driven contract)
+
+The flag path is the complete contract — an admin agent relays its human's
+decisions as flags and re-runs. (TTY prompts, where present, are convenience
+only; they are never the sole path.)
+
+- `--show-state [--json]` — report the detected S-state + next action + needed
+  inputs, then exit (no mutation). This is the linchpin of the agent-driven
+  loop: the agent calls `--show-state --json`, relays the `needs` to its human,
+  and re-runs with the answers as flags.
+- `--bridge-id <id>` — this bridge's id (S1).
+- `--peer <id>` — the peer bridge id to connect to (S2).
+- `--peer-secret-env <ENVVAR>` — the **NAME of an env var** holding the peer's
+  HMAC secret. The secret is read from the environment, **never** passed on the
+  command line (a plaintext `--secret` flag would leak through the process
+  table and shell history). An empty/unset env var is a **hard fail-closed
+  error** — the config is not written and the receiver is not started.
+- `--listen-port <n>` — receiver listen port (default 8787; S1).
+- `--inbound-allowlist a,b,c` — local agent ids this peer may enqueue to (S2;
+  exact match, no wildcard).
+- `--yes` — confirm activation (S5 starts the receiver).
+- `--live-handshake` — S6 does a real send + deliver and asserts a 2xx ack
+  (which creates an inbox task on the peer). The default is a dry-run +
+  GREEN-on-reachable, so a setup never injects a task on the peer unless asked.
+
+### Security invariants
+
+- The config is written **only** via the shared 0600 atomic writer
+  (`write_config_atomic`); the secret-bearing JSON is never group/world
+  readable, even during the write window.
+- The secret is **never** a command-line argument (`--peer-secret-env` reads it
+  from the environment); an **empty secret is a hard fail-closed error**
+  (`peer_no_secret`) and the daemon is NOT started in that state.
+- S5 activates the receiver via `bash bridge-handoff-daemon.sh start`, which
+  runs the **unchanged fail-closed bind preflight** (`resolve_bind`: the
+  candidate must be in this node's `tailscale ip` set; wildcard/loopback
+  refused; refuses if Tailscale is unavailable) **before** any detach. The
+  wizard never binds a socket itself, never runs a raw `bridge-handoffd.py
+  serve`, and adds **no** new wildcard/loopback bypass — the only loopback path
+  remains the pre-existing `BRIDGE_A2A_ALLOW_TEST_BIND` test-only escape hatch.
+- The `listen` + peer entries are keyed on the Tailscale **identity**
+  (`node_id` / `tailscale_name`) so an IP change after a re-login self-heals;
+  an existing raw-IP `listen` is migrated via the same helper as `agb a2a
+  migrate-identity` (the raw `address` is kept as a fallback).
+
+### Example
+
+```bash
+# Agent: what's the current state + what do I need from my human?
+agb a2a setup --show-state --json
+
+# Human relays the decisions; the agent re-runs with flags. The secret is
+# exported into an env var (never on the command line):
+export A2A_PEER_SECRET=$(openssl rand -hex 32)   # exchanged out-of-band with the peer
+agb a2a setup \
+  --bridge-id bridge-a \
+  --peer bridge-b \
+  --peer-secret-env A2A_PEER_SECRET \
+  --inbound-allowlist reviewer \
+  --yes                       # confirm S5 (start the receiver)
+
+# Verify the handshake (dry-run by default; --live-handshake for a real ack):
+agb a2a setup --peer bridge-b --live-handshake
+```
 
 ## Configuration
 

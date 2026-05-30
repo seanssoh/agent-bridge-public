@@ -12,6 +12,9 @@ Subcommands (surfaced through `agent-bridge a2a ...`):
   reconcile     Trigger + preview one receiver self-heal reconcile.
   migrate-identity  Rewrite raw-IP peers/listen to Tailscale identity keying
                 so today's raw-`address` configs self-heal (dry-run default).
+  setup         Agent-driven A2A setup wizard (S0/S1/S2/S5/S6, manual secret,
+                idempotent/resumable). `--show-state [--json]` reports the
+                derived state; the secret comes from `--peer-secret-env`.
 
 The receiver daemon lives in a separate file (`bridge-handoffd.py`).
 """
@@ -1344,6 +1347,673 @@ def cmd_migrate_identity(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# setup wizard (P1, design §5/§6/§7; umbrella #1226, plan #1405-P1)
+# --------------------------------------------------------------------------
+#
+# `agb a2a setup` — an agent-driven, decision-gated, idempotent/resumable
+# orchestrator that produces the SAME handoff.local.json + receiver state the
+# manual runbook does. It introduces NO new wire protocol, NO new bind/HMAC/
+# allowlist path — it only sequences the merged self-heal helpers
+# (resolve_tailscale_cli / tailscale_status_json / node_name / reverse_resolve_ip
+# / write_config_atomic 0600 / validate_config_peer_secrets / _migrate_entry)
+# plus the in-process peers/send/deliver and the `bridge-handoff-daemon.sh
+# start` lifecycle verb (NEVER a raw `bridge-handoffd.py serve`).
+#
+# SECURITY-CRITICAL (it writes the config for + starts the receiver, the only
+# untrusted-remote-traffic surface):
+#   - The config is written ONLY via a2a.write_config_atomic at 0o600.
+#   - The peer HMAC secret comes from `--peer-secret-env <ENVVAR>` (never a
+#     plaintext flag — that leaks through the process table + shell history).
+#     An empty/unset env var is a hard, fail-closed error (`peer_no_secret`);
+#     the daemon is NOT started in that state.
+#   - S5 activation shells to `bash bridge-handoff-daemon.sh start`, which runs
+#     the UNCHANGED fail-closed bind preflight (`resolve_bind`: candidate ∈
+#     `tailscale ip`; refuse wildcard/loopback; refuse if Tailscale
+#     unavailable) before any detach. The wizard never binds itself and never
+#     weakens that proof. The only loopback path is the pre-existing
+#     `BRIDGE_A2A_ALLOW_TEST_BIND` escape hatch (smoke-only), inherited
+#     verbatim — the wizard adds no new wildcard/loopback bypass.
+#
+# Resume / idempotency: there is NO setup-wizard.state file (a 2nd source of
+# truth that can lie). The current S-state is DERIVED purely from observable
+# facts each run, so a re-run asks "already true?" per state and is inherently
+# a no-op once setup is complete. The only persistent artifact is
+# handoff.local.json (atomic, 0600).
+
+# The ordered state ids the wizard reasons about. S3 (secret-pairing) and S4
+# (roster/allowlist exchange) are DEFERRED to P2/P3 — P1 keeps the manual
+# secret (via --peer-secret-env) and takes the allowlist via flag.
+_SETUP_STATES = ("S0", "S1", "S2", "S5", "S6", "DONE")
+
+
+def _setup_result(
+    state: str, *, done: bool, action: str, needs: Optional[list[str]] = None,
+    detail: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """A single state probe's verdict.
+
+    `state`  — the state id this probe covers (S0/S1/S2/S5/S6).
+    `done`   — True iff this state's observable post-condition already holds.
+    `action` — the next human/agent action when not done (empty when done).
+    `needs`  — the flags/inputs required to advance (for the agent-driven loop).
+    `detail` — optional structured facts (e.g. discovered peers) for --json.
+    """
+    return {
+        "state": state,
+        "done": done,
+        "action": action,
+        "needs": needs or [],
+        "detail": detail or {},
+    }
+
+
+def _setup_load_cfg_or_empty() -> dict[str, Any]:
+    """Load handoff.local.json, or return an empty skeleton when absent.
+
+    A missing config is the early-install state — the wizard's whole job is to
+    PRODUCE it, so "not found" is not an error here. A config that EXISTS but
+    is group/world-readable is still a hard error (the 0600 contract): we
+    re-raise so the operator fixes the mode rather than have the wizard
+    silently overwrite a misperm'd secret-bearing file.
+    """
+    cfg_path = a2a.config_path()
+    if not cfg_path.exists():  # noqa: raw-pathlib-controller-only
+        return {"bridge_id": "", "listen": {}, "peers": []}
+    return a2a.load_config(cfg_path)
+
+
+def _setup_tailscale_self() -> "Optional[dict[str, Any]]":
+    """Return the Tailscale Self node dict, or None if Tailscale is unavailable.
+
+    Probe-only: callers in the wizard treat None as "S0 not satisfied" rather
+    than raising, so `--show-state` can report S0 without crashing on a host
+    that has no Tailscale yet. The ACT path (S0/S1) re-queries and DOES fail
+    closed on TailscaleUnavailable so nothing is written without a tailnet view.
+    """
+    try:
+        status = a2a.tailscale_status_json()
+    except a2a.TailscaleUnavailable:
+        return None
+    self_node = status.get("Self")
+    if isinstance(self_node, dict):
+        return self_node
+    return None
+
+
+def _setup_listen_has_identity(cfg: dict[str, Any]) -> bool:
+    """True iff `listen` carries a resolvable Tailscale identity OR an address."""
+    listen = cfg.get("listen")
+    if not isinstance(listen, dict):
+        return False
+    for key in ("node_id", "tailscale_name", "address"):
+        val = listen.get(key)
+        if isinstance(val, str) and val.strip():
+            return True
+    return False
+
+
+def _setup_probe_s0(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, Any]:
+    """S0 preflight: is the Tailscale CLI present + the node authenticated?"""
+    cli = a2a.resolve_tailscale_cli()
+    if cli is None:
+        return _setup_result(
+            "S0", done=False,
+            action="Install Tailscale (human-confirmed) and run `tailscale up` "
+                   "to log in (browser auth — the one human-only step), then "
+                   "re-run `agb a2a setup`.",
+            needs=["tailscale-cli", "tailscale-login"],
+            detail={"tailscale_cli": None},
+        )
+    self_node = _setup_tailscale_self()
+    if self_node is None:
+        return _setup_result(
+            "S0", done=False,
+            action="Tailscale CLI found but `tailscale status --json` has no "
+                   "authenticated Self node — run `tailscale up` to log in, "
+                   "then re-run.",
+            needs=["tailscale-login"],
+            detail={"tailscale_cli": cli, "authenticated": False},
+        )
+    return _setup_result(
+        "S0", done=True, action="",
+        detail={
+            "tailscale_cli": cli,
+            "authenticated": True,
+            "self_node_id": str(self_node.get("ID", "")).strip(),
+            "self_name": a2a.node_name(self_node),
+            "self_ip": a2a._node_first_ip(self_node) or "",
+        },
+    )
+
+
+def _setup_probe_s1(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, Any]:
+    """S1 self-config: is bridge_id set + listen identity-keyed (or addressed)?"""
+    bridge_id = str(cfg.get("bridge_id", "")).strip()
+    has_listen = _setup_listen_has_identity(cfg)
+    if bridge_id and has_listen:
+        return _setup_result(
+            "S1", done=True, action="",
+            detail={"bridge_id": bridge_id},
+        )
+    return _setup_result(
+        "S1", done=False,
+        action="Write this bridge's id + an identity-keyed `listen` to "
+               "handoff.local.json (0600). Provide --bridge-id <id>; the "
+               "listen identity is auto-derived from `tailscale status --json` "
+               "Self.",
+        needs=["--bridge-id"],
+        detail={"bridge_id": bridge_id, "listen_configured": has_listen},
+    )
+
+
+def _setup_probe_s2(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, Any]:
+    """S2 discover: is the chosen peer present in peers[] (with a secret)?
+
+    When `--peer` names a peer that is not yet configured, the probe lists the
+    Online tailnet peers (so the agent can relay the pick) and reports the
+    flags needed to add it. When no `--peer` is given but peers already exist,
+    S2 is considered satisfied (the operator can add more peers by re-running
+    with --peer).
+    """
+    peers = cfg.get("peers", [])
+    if not isinstance(peers, list):
+        peers = []
+    want = getattr(args, "peer", None)
+    if want:
+        for peer in peers:
+            if isinstance(peer, dict) and peer.get("id") == want:
+                # Already configured — must have a usable secret to count.
+                if a2a.peer_secrets(peer):
+                    return _setup_result(
+                        "S2", done=True, action="",
+                        detail={"peer": want, "secret_configured": True},
+                    )
+                return _setup_result(
+                    "S2", done=False,
+                    action=f"Peer {want} is configured but has no secret. "
+                           "Re-run with --peer-secret-env <ENVVAR> set to a "
+                           "long random shared secret (>=32 bytes).",
+                    needs=["--peer-secret-env"],
+                    detail={"peer": want, "secret_configured": False},
+                )
+        # Not yet configured — list discoverable peers to relay the pick.
+        return _setup_result(
+            "S2", done=False,
+            action=f"Add peer {want}: discover its Tailscale identity, then "
+                   "write a peers[] entry keyed on node_id+tailscale_name with "
+                   "--inbound-allowlist + the secret from --peer-secret-env.",
+            needs=["--peer", "--peer-secret-env", "--inbound-allowlist"],
+            detail={"peer": want, "discovered": _setup_discover_peers()},
+        )
+    if peers:
+        return _setup_result(
+            "S2", done=True, action="",
+            detail={"peer_count": len(peers)},
+        )
+    return _setup_result(
+        "S2", done=False,
+        action="No peer chosen and none configured. Pick a peer from the "
+               "discovered Online tailnet nodes and re-run with --peer <id> "
+               "--peer-secret-env <ENVVAR> [--inbound-allowlist a,b].",
+        needs=["--peer", "--peer-secret-env"],
+        detail={"discovered": _setup_discover_peers()},
+    )
+
+
+def _setup_discover_peers() -> list[dict[str, Any]]:
+    """List Online tailnet peers for the agent to relay the human pick.
+
+    Probe-only: returns [] when Tailscale is unavailable (S0 handles that). The
+    fields are the identity-decision inputs the human needs (HostName, the
+    MagicDNS name, the live IPs, OS, StableID, Online)."""
+    try:
+        status = a2a.tailscale_status_json()
+    except a2a.TailscaleUnavailable:
+        return []
+    out: list[dict[str, Any]] = []
+    raw_peers = status.get("Peer")
+    if not isinstance(raw_peers, dict):
+        return out
+    for node in raw_peers.values():
+        if not isinstance(node, dict):
+            continue
+        if not node.get("Online"):
+            continue
+        out.append({
+            "node_id": str(node.get("ID", "")).strip(),
+            "tailscale_name": a2a.node_name(node),
+            "host_name": str(node.get("HostName", "")).strip(),
+            "tailscale_ips": [ip for ip in (node.get("TailscaleIPs") or [])
+                              if isinstance(ip, str)],
+            "os": str(node.get("OS", "")).strip(),
+            "online": True,
+        })
+    return out
+
+
+def _setup_probe_s5(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, Any]:
+    """S5 activate: is the receiver running + does the config pass the secret check?"""
+    secret_ok = True
+    secret_detail = ""
+    try:
+        a2a.validate_config_peer_secrets(cfg, side="receiver")
+    except a2a.A2AError as exc:
+        secret_ok = False
+        secret_detail = f"{exc} ({exc.code})"
+    running = _setup_receiver_running()
+    if secret_ok and running:
+        return _setup_result(
+            "S5", done=True, action="",
+            detail={"receiver_running": True, "secret_ok": True},
+        )
+    if not secret_ok:
+        return _setup_result(
+            "S5", done=False,
+            action="Refuse to activate: a peer has no secret (fail-closed). "
+                   "Set --peer-secret-env to a long random shared secret and "
+                   "re-run. The receiver will NOT be started in this state.",
+            needs=["--peer-secret-env"],
+            detail={"receiver_running": running, "secret_ok": False,
+                    "secret_error": secret_detail},
+        )
+    return _setup_result(
+        "S5", done=False,
+        action="Start the receiver via `bridge-handoff-daemon.sh start` "
+               "(runs the fail-closed tailnet bind preflight, then detaches). "
+               "Re-run with --yes to confirm activation.",
+        needs=["--yes"],
+        detail={"receiver_running": False, "secret_ok": True},
+    )
+
+
+def _setup_receiver_running() -> bool:
+    """True iff a receiver pid file points at a live process.
+
+    Mirrors the lifecycle helper's pid-file model (state/handoff/handoffd.pid)
+    without importing the bash. A stale pid file (process gone) reads as
+    not-running, which is exactly what S5 should re-activate."""
+    pid_file = a2a.handoff_dir() / "handoffd.pid"
+    if not pid_file.exists():  # noqa: raw-pathlib-controller-only
+        return False
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but owned by another uid — treat as running.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _setup_probe_s6(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, Any]:
+    """S6 handshake: this state is only ever 'done' transiently after a run.
+
+    There is no durable observable for "the last handshake acked" (and we do
+    NOT store one — no state file), so --show-state reports S6 as the final
+    pending action once S0–S5 hold. cmd_setup runs the actual handshake
+    (peers test + dry-run send, and a live send when --live-handshake)."""
+    return _setup_result(
+        "S6", done=False,
+        action="Run the handshake: `agb a2a peers test <peer>` + a dry-run "
+               "send. Pass --live-handshake to also do a real send+deliver and "
+               "assert a 2xx ack (creates an inbox task on the peer).",
+        needs=[],
+        detail={},
+    )
+
+
+def _setup_detect_state(
+    args: argparse.Namespace, cfg: dict[str, Any],
+) -> "tuple[str, list[dict[str, Any]]]":
+    """Run the ordered probes and return (current_state, all_probe_results).
+
+    The current state is the FIRST state whose probe is not done; if S0–S5 all
+    hold, the current state is S6 (the handshake is the last pending action);
+    only after a successful handshake within `cmd_setup` is DONE reported.
+    """
+    probes = [
+        _setup_probe_s0(args, cfg),
+        _setup_probe_s1(args, cfg),
+        _setup_probe_s2(args, cfg),
+        _setup_probe_s5(args, cfg),
+        _setup_probe_s6(args, cfg),
+    ]
+    for probe in probes:
+        if not probe["done"]:
+            return probe["state"], probes
+    return "DONE", probes
+
+
+def _setup_show_state(args: argparse.Namespace) -> int:
+    """`--show-state` — report the detected S-state + next action + needed inputs.
+
+    The agent-driven loop linchpin + the headless smoke driver: derive the
+    state from observable facts (no state file), print the current state, the
+    next action, and the flags needed to advance. `--json` emits the machine
+    form (current_state + the full ordered probe list)."""
+    try:
+        cfg = _setup_load_cfg_or_empty()
+    except a2a.A2AError as exc:
+        return die(str(exc)) or 1
+    current, probes = _setup_detect_state(args, cfg)
+    by_state = {p["state"]: p for p in probes}
+    if args.json:
+        print(json.dumps({
+            "current_state": current,
+            "states": probes,
+        }, ensure_ascii=False, indent=2))
+        return 0
+    print(f"current state: {current}")
+    if current == "DONE":
+        print("  A2A setup is complete (S0–S6 satisfied). Nothing to do.")
+        return 0
+    probe = by_state.get(current, {})
+    action = probe.get("action", "")
+    needs = probe.get("needs", [])
+    if action:
+        print(f"  next action: {action}")
+    if needs:
+        print(f"  needs: {', '.join(needs)}")
+    return 0
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """`agb a2a setup` — the P1 wizard (S0/S1/S2/S5/S6, manual secret).
+
+    Decision-gated + idempotent/resumable. With --show-state it only REPORTS
+    the derived state (no mutation). Otherwise it advances each state in order,
+    gated by the supplied flags + --yes, writing the config atomically at 0600
+    and starting the receiver only after a fail-closed bind preflight. The
+    secret is read from --peer-secret-env (never a plaintext flag); an empty
+    secret is a hard fail-closed error and the daemon is NOT started."""
+    if args.show_state:
+        return _setup_show_state(args)
+
+    # --- resolve the secret from the named env var (fail-closed if empty) ---
+    secret = ""
+    if args.peer_secret_env:
+        secret = os.environ.get(args.peer_secret_env, "")
+        # Note: we do NOT echo the secret anywhere — only its presence.
+
+    try:
+        cfg = _setup_load_cfg_or_empty()
+    except a2a.A2AError as exc:
+        return die(str(exc)) or 1
+
+    # ===== S0 preflight =====
+    s0 = _setup_probe_s0(args, cfg)
+    if not s0["done"]:
+        info(f"S0 preflight: {s0['action']}")
+        return die("S0 not satisfied — Tailscale must be installed + logged in "
+                   "before the wizard can write a config or start the "
+                   "receiver (fail-closed).", code="setup_s0") or 1
+    info(f"S0 OK: tailscale authenticated (self ip "
+         f"{s0['detail'].get('self_ip', '?')})")
+
+    # ===== S1 self-config: bridge_id + identity-keyed listen =====
+    s1_changed = False
+    if args.bridge_id:
+        if str(cfg.get("bridge_id", "")).strip() != args.bridge_id:
+            cfg["bridge_id"] = args.bridge_id
+            s1_changed = True
+    if not str(cfg.get("bridge_id", "")).strip():
+        return die("S1 needs --bridge-id (this bridge's id; the receiver "
+                   "matches it against a peer's inbound allowlist).",
+                   code="setup_s1") or 1
+
+    listen = cfg.get("listen")
+    if not isinstance(listen, dict):
+        listen = {}
+        cfg["listen"] = listen
+    if args.listen_port:
+        if int(listen.get("port", 0) or 0) != int(args.listen_port):
+            listen["port"] = int(args.listen_port)
+            s1_changed = True
+    listen.setdefault("port", 8787)
+    # Identity-key the listen on this node's Tailscale Self (never a raw IP).
+    if not _setup_listen_has_identity(cfg) or args.bridge_id:
+        self_node_id = s0["detail"].get("self_node_id", "")
+        self_name = s0["detail"].get("self_name", "")
+        if self_node_id and not listen.get("node_id"):
+            listen["node_id"] = self_node_id
+            s1_changed = True
+        if self_name and not listen.get("tailscale_name"):
+            listen["tailscale_name"] = self_name
+            s1_changed = True
+    # Migrate a pre-existing raw-IP listen to identity keying (kept address as
+    # a fallback) using the SAME helper migrate-identity uses.
+    if isinstance(listen, dict) and listen.get("address") and not (
+            listen.get("node_id") or listen.get("tailscale_name")):
+        try:
+            status = a2a.tailscale_status_json()
+            rec = _migrate_entry(listen, status, "listen", drop_address=False)
+            if rec is not None:
+                s1_changed = True
+        except a2a.A2AError:
+            pass  # leave as-is; the raw address still binds (back-compat)
+
+    # ===== S2 discover: write/refresh the chosen peer entry =====
+    s2_changed = False
+    if args.peer:
+        peers = cfg.get("peers", [])
+        if not isinstance(peers, list):
+            peers = []
+            cfg["peers"] = peers
+        existing = None
+        for peer in peers:
+            if isinstance(peer, dict) and peer.get("id") == args.peer:
+                existing = peer
+                break
+        if existing is None:
+            existing = {"id": args.peer}
+            peers.append(existing)
+            s2_changed = True
+        # Resolve the peer's Tailscale identity so the entry is identity-keyed
+        # (self-heals on the peer's IP change). --peer is the operator's choice
+        # relayed as the id; if a discovered Online node's node_id / MagicDNS
+        # name / HostName equals it, key on that node's identity. Otherwise the
+        # operator may pre-place a raw `address` (back-compat) and the entry is
+        # left un-keyed (P1 does not invent an identity it cannot observe).
+        match = None
+        for node in _setup_discover_peers():
+            if args.peer in (node.get("tailscale_name"), node.get("host_name"),
+                             node.get("node_id")):
+                match = node
+                break
+        if match:
+            if match.get("node_id") and existing.get("node_id") != match["node_id"]:
+                existing["node_id"] = match["node_id"]
+                s2_changed = True
+            if match.get("tailscale_name") and \
+                    existing.get("tailscale_name") != match["tailscale_name"]:
+                existing["tailscale_name"] = match["tailscale_name"]
+                s2_changed = True
+        existing.setdefault("port", int(listen.get("port", 8787)))
+        existing.setdefault("enqueue_path", "/enqueue")
+        if args.inbound_allowlist is not None:
+            allow = [a.strip() for a in args.inbound_allowlist.split(",")
+                     if a.strip()]
+            if existing.get("inbound_allowlist") != allow:
+                existing["inbound_allowlist"] = allow
+                s2_changed = True
+        # The secret comes from --peer-secret-env ONLY. An empty value is a
+        # hard fail-closed error — never write an empty secret.
+        if args.peer_secret_env:
+            if not secret:
+                return die(
+                    f"--peer-secret-env {args.peer_secret_env} is empty/unset. "
+                    "Export a long random shared secret (>=32 bytes) into that "
+                    "env var, e.g. `export "
+                    f"{args.peer_secret_env}=$(openssl rand -hex 32)`, then "
+                    "re-run. Refusing to write an empty secret (fail-closed).",
+                    code="peer_no_secret") or 1
+            if existing.get("secret") != secret:
+                existing["secret"] = secret
+                s2_changed = True
+
+    # ===== persist the config atomically at 0600 if anything changed =====
+    if s1_changed or s2_changed:
+        cfg_path = a2a.config_path()
+        try:
+            orig_mode = cfg_path.stat().st_mode & 0o777  # noqa: raw-pathlib-controller-only
+        except OSError:
+            orig_mode = 0o600
+        a2a.write_config_atomic(cfg_path, cfg, orig_mode)
+        info(f"wrote {cfg_path} (mode 0600; "
+             f"S1{'*' if s1_changed else ''} S2{'*' if s2_changed else ''})")
+    else:
+        info("config already current (no changes written)")
+
+    # ===== S5 activate: validate secrets (fail-closed) then start receiver ==
+    try:
+        a2a.validate_config_peer_secrets(cfg, side="receiver")
+    except a2a.A2AError as exc:
+        return die(f"S5 refuses to activate: {exc} ({exc.code}). The receiver "
+                   "was NOT started.", code="setup_s5_secret") or 1
+
+    if not _setup_receiver_running():
+        if not args.yes:
+            info("S5: receiver not running. Re-run with --yes to start it "
+                 "(`bridge-handoff-daemon.sh start` — fail-closed bind "
+                 "preflight, then detach).")
+            return 0
+        rc = _setup_start_receiver()
+        if rc != 0:
+            return die("S5: receiver failed to start (bind preflight or "
+                       "detach failed) — see the daemon log.",
+                       code="setup_s5_start") or 1
+        info("S5 OK: receiver started")
+    else:
+        info("S5 OK: receiver already running")
+
+    # ===== S6 handshake: peers test + dry-run; live send behind --live-handshake
+    if not args.peer:
+        info("S6: no --peer given; skipping the handshake (S0–S5 satisfied).")
+        return 0
+    return _setup_handshake(cfg, args)
+
+
+def _setup_start_receiver() -> int:
+    """Shell to `bash bridge-handoff-daemon.sh start` — NEVER raw serve.
+
+    The lifecycle verb runs the UNCHANGED fail-closed bind preflight
+    (resolve_bind: candidate ∈ `tailscale ip`; refuse wildcard/loopback; refuse
+    if Tailscale unavailable) BEFORE any detach, then double-fork detaches the
+    durable listener. Returns the subprocess exit code (non-zero = bind
+    preflight failed / no durable listener)."""
+    import subprocess  # noqa: PLC0415 (only this path needs it)
+    daemon = Path(__file__).resolve().parent / "bridge-handoff-daemon.sh"
+    if not daemon.is_file():  # noqa: raw-pathlib-controller-only
+        err(f"cannot locate {daemon}")
+        return 1
+    bash = os.environ.get("BRIDGE_BASH_BIN", "bash")
+    try:
+        proc = subprocess.run(  # noqa: PLW1510 (rc handled by caller)
+            [bash, str(daemon), "start"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    except OSError as exc:
+        err(f"could not run {daemon.name} start: {exc}")
+        return 1
+    for line in (proc.stdout or "").splitlines():
+        if line.strip():
+            info(line)
+    for line in (proc.stderr or "").splitlines():
+        if line.strip():
+            err(line)
+    return proc.returncode
+
+
+def _setup_handshake(cfg: dict[str, Any], args: argparse.Namespace) -> int:
+    """S6: resolve+probe the peer, dry-run a send, and (opt-in) a live send.
+
+    DEFAULT = GREEN-on-reachable: resolve the peer to its current IP, TCP-probe
+    it, and validate a dry-run send envelope — WITHOUT creating an inbox task
+    on the peer. `--live-handshake` additionally stages a real send, drains it
+    once, and asserts a 2xx ack carrying a remote task id."""
+    peer_id = args.peer
+    try:
+        peer = a2a.find_peer(cfg, peer_id)
+    except a2a.A2AError as exc:
+        return die(f"S6: {exc}", code="setup_s6_peer") or 1
+    # Resolve the peer's CURRENT tailnet IP (identity-keyed → live resolve;
+    # fail-closed if unresolvable — never probe a stale stored IP).
+    try:
+        address = a2a.resolve_peer_address(peer)
+    except a2a.A2AError as exc:
+        return die(f"S6: cannot resolve peer {peer_id}: {exc} ({exc.code})",
+                   code=exc.code) or 1
+    if not address:
+        return die(f"S6: peer {peer_id} has no resolvable address",
+                   code="setup_s6_noaddr") or 1
+    port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
+    info(f"S6: peer {peer_id} resolves to {address}:{port}")
+    # TCP-probe (reachability) — mirrors `peers test` (no enqueue).
+    try:
+        with socket.create_connection((address, port), timeout=5.0):
+            pass
+    except OSError as exc:
+        return die(f"S6: peer {peer_id} not reachable at {address}:{port}: "
+                   f"{exc}", code="setup_s6_unreachable") or 1
+    info(f"S6: peer {peer_id} reachable (TCP) at {address}:{port}")
+
+    if not args.live_handshake:
+        info("S6 OK (dry-run): peer resolved + reachable. Pass "
+             "--live-handshake to do a real send+deliver ack.")
+        return 0
+
+    # --- live handshake: real send + deliver + assert a 2xx ack ---
+    sender_agent = (os.environ.get("BRIDGE_AGENT_ID")
+                    or os.environ.get("USER") or "setup-wizard")
+    target = ""
+    allow = peer.get("inbound_allowlist")
+    if isinstance(allow, list) and allow:
+        target = str(allow[0])
+    if not target:
+        return die("S6 --live-handshake needs a target agent in the peer's "
+                   "inbound_allowlist (set --inbound-allowlist).",
+                   code="setup_s6_no_target") or 1
+    send_ns = argparse.Namespace(
+        peer=peer_id, to=target, from_agent=sender_agent,
+        title="a2a setup handshake", body="A2A setup wizard live handshake.",
+        body_file=None, priority="normal", allow_empty_body=False,
+        dry_run=False,
+    )
+    rc = cmd_send(send_ns)
+    if rc != 0:
+        return die("S6 --live-handshake: staging the send failed.",
+                   code="setup_s6_send") or 1
+    deliver_ns = argparse.Namespace(batch=10, lease=60, timeout=10.0)
+    cmd_deliver(deliver_ns)
+    # Assert the row acked (carrying a remote task id).
+    conn = a2a.open_outbox()
+    try:
+        row = conn.execute(
+            "SELECT status, acked_remote_task_id FROM outbox "
+            "WHERE peer=? ORDER BY created_ts DESC LIMIT 1", (peer_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return die("S6 --live-handshake: no outbox row after send.",
+                   code="setup_s6_norow") or 1
+    if row["status"] != "acked":
+        return die(f"S6 --live-handshake: send did not ack (status="
+                   f"{row['status']}).", code="setup_s6_noack") or 1
+    info(f"S6 OK (live): handshake acked (remote task "
+         f"{row['acked_remote_task_id'] or '?'}) — GREEN.")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # argument parsing
 # --------------------------------------------------------------------------
 
@@ -1445,6 +2115,62 @@ def build_parser() -> argparse.ArgumentParser:
              "(default: keep it as a fallback)",
     )
     p_migrate.set_defaults(func=cmd_migrate_identity)
+
+    p_setup = sub.add_parser(
+        "setup",
+        help="agent-driven A2A setup wizard (S0/S1/S2/S5/S6, manual secret, "
+             "idempotent/resumable)",
+        description=(
+            "Agent-driven, decision-gated, idempotent/resumable wizard that "
+            "produces the SAME handoff.local.json + receiver state the manual "
+            "runbook does — no new wire protocol. Flag path is the contract "
+            "(the agent relays human decisions as flags + re-runs); --show-state "
+            "[--json] reports the derived S-state + next action + needed inputs "
+            "(the agent-driven loop linchpin). There is NO state file — the "
+            "S-state is derived from observable facts each run, so a re-run is a "
+            "no-op once complete. SECURITY: the config is written 0600; the peer "
+            "HMAC secret comes from --peer-secret-env (NEVER a plaintext flag); "
+            "an empty secret is a hard fail-closed error and the receiver is NOT "
+            "started; S5 starts the receiver via `bridge-handoff-daemon.sh "
+            "start`, which runs the unchanged fail-closed tailnet bind preflight."
+        ),
+    )
+    p_setup.add_argument("--bridge-id", default=None,
+                         help="this bridge's id (the authenticated sender "
+                              "identity; S1)")
+    p_setup.add_argument("--peer", default=None,
+                         help="the peer bridge id to connect to (S2)")
+    p_setup.add_argument(
+        "--peer-secret-env", default=None,
+        help="NAME of the env var holding the peer's HMAC secret (read from "
+             "the environment, never the command line — avoids the "
+             "process-table/shell-history leak of a plaintext flag). "
+             "Empty/unset is a hard fail-closed error.",
+    )
+    p_setup.add_argument("--listen-port", type=int, default=None,
+                         help="receiver listen port (default 8787; S1)")
+    p_setup.add_argument("--inbound-allowlist", default=None,
+                         help="comma-separated local agent ids this peer may "
+                              "enqueue to (S2; exact match, no wildcard)")
+    p_setup.add_argument(
+        "--install", action="store_true",
+        help="(reserved) confirm an automated Tailscale install in S0 — P1 "
+             "surfaces the install instruction; it does not auto-install.",
+    )
+    p_setup.add_argument("--show-state", action="store_true",
+                         help="report the detected S-state + next action + "
+                              "needed inputs, then exit (no mutation)")
+    p_setup.add_argument("--json", action="store_true",
+                         help="with --show-state, emit the machine-readable "
+                              "state document")
+    p_setup.add_argument("--yes", action="store_true",
+                         help="confirm activation (S5 starts the receiver)")
+    p_setup.add_argument(
+        "--live-handshake", action="store_true",
+        help="S6: do a REAL send+deliver and assert a 2xx ack (creates an "
+             "inbox task on the peer). Default is dry-run + GREEN-on-reachable.",
+    )
+    p_setup.set_defaults(func=cmd_setup)
 
     return parser
 

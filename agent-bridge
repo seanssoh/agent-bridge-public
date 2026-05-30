@@ -889,6 +889,8 @@ Usage: agent-bridge a2a <command> [args]
   inbox-dedupe  list | gc — inspect/prune the receiver dedupe ledger.
   peers         list | test <peer> — inspect configured peers.
   deliver       Drain the outbox once (sender delivery runner).
+  setup         Agent-driven setup wizard (S0/S1/S2/S5/S6). --show-state
+                [--json] reports the derived state; secret via --peer-secret-env.
   daemon        start | stop | restart | status | healthz | tick — receiver
                 daemon lifecycle (bridge-handoff-daemon.sh). `healthz` is a
                 read-only serve-liveness probe (GET /healthz).
