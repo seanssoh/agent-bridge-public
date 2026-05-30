@@ -2893,13 +2893,21 @@ process_a2a_receiver_supervise_tick() {
   if (( start_rc != 0 )); then
     # Persistent BIND-PROOF failure: the fail-closed preflight refused to bring
     # the receiver up (tailnet down, bind unresolvable, peer secret missing).
-    # This is a NON-retryable hold — alarm-and-hold, do NOT hammer tailscale
-    # every 30s. Count toward the cap with the distinct bind_proof_failed
-    # reason and stop; once at the cap the crash-loop branch above takes over.
+    # Tagged with the distinct bind_proof_failed reason+alarm and counted toward
+    # the crash-loop cap. Retry is BOUNDED, not unbounded re-probing: each tick
+    # re-runs the full proof, but once restart_count reaches max_restarts
+    # (default 5, ~2.5min at the 30s cadence) the crash-loop branch above latches
+    # the alarm and auto-restart STOPS. So a host that lost its tailnet IP
+    # re-probes at most max_restarts times and then holds — it does not hammer
+    # tailscale forever.
+    # NOTE (codex/operator judgment): whether bind_proof_failed should HOLD on
+    # the FIRST failure (zero retries) instead of the current bounded
+    # cap-then-hold is a deliberate behavior question, not a bug — see PR #1414
+    # review. Current semantics: bounded cap-then-hold.
     reason="bind_proof_failed"
     last_reason="$reason"
     alarm="bind_proof_failed"
-    daemon_warn "[a2a_receiver_supervise] restart FAILED bind proof (rc=$start_rc); alarm-and-hold (restart_count=$restart_count/${max_restarts}); not hammering"
+    daemon_warn "[a2a_receiver_supervise] restart FAILED bind proof (rc=$start_rc); bounded retry toward cap (restart_count=$restart_count/${max_restarts}), holds at cap"
     bridge_audit_log daemon a2a_receiver_bind_proof_failed daemon \
       --detail rc="$start_rc" \
       --detail restart_count="$restart_count" \
