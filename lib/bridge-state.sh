@@ -4096,7 +4096,16 @@ bridge_refresh_agent_session_id() {
     IFS=',' read -r -a extra_excluded <<<"$extra_exclude_csv"
   fi
 
-  since_hint="${BRIDGE_AGENT_CREATED_AT[$agent]-$(date +%s)}"
+  # #1407 D2: if BRIDGE_AGENT_CREATED_AT is not an associative array
+  # (unset / clobbered to scalar), an indexed read under `set -u` would
+  # arithmetic-index the agent id and abort with `<agent>: unbound variable`.
+  # Fall back to now() instead of aborting. Per-function declare-guard avoids
+  # the #1213 scalar-vs-`declare -g -A` collision class — do NOT redeclare.
+  if declare -p BRIDGE_AGENT_CREATED_AT 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+    since_hint="${BRIDGE_AGENT_CREATED_AT[$agent]-$(date +%s)}"
+  else
+    since_hint="$(date +%s)"
+  fi
   local _quarantine_csv=""
   local quarantine_id
   local -a quarantine_ids=()

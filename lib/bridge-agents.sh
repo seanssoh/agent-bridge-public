@@ -9359,6 +9359,15 @@ bridge_agent_uses_legacy_launch_flags() {
 
 bridge_agent_session_id() {
   local agent="$1"
+  # #1407 D1: if BRIDGE_AGENT_SESSION_ID is not an associative array
+  # (unset / clobbered to scalar), an indexed read under `set -u` would
+  # arithmetic-index the agent id and abort with `<agent>: unbound variable`.
+  # Degrade to empty instead of aborting. Per-function declare-guard avoids
+  # the #1213 scalar-vs-`declare -g -A` collision class — do NOT redeclare.
+  if ! declare -p BRIDGE_AGENT_SESSION_ID 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_SESSION_ID[$agent]-}"
 }
 
