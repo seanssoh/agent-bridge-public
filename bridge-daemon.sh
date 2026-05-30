@@ -2473,14 +2473,14 @@ process_a2a_outbox_stuck_scan_tick() {
       printf 'longer than the configured threshold without being\n'
       printf 'acknowledged by the destination peer.\n\n'
       printf '## Entry\n\n'
-      printf '- message_id: `%s`\n' "$message_id"
-      printf '- peer: `%s`\n' "$peer"
-      printf '- target_agent: `%s`\n' "$target_agent"
-      printf '- status: `%s`\n' "$status"
-      printf '- attempts: %s\n' "$attempts"
-      printf '- age: %ss\n' "$age_seconds"
+      printf '%s\n' "- message_id: \`$message_id\`"
+      printf '%s\n' "- peer: \`$peer\`"
+      printf '%s\n' "- target_agent: \`$target_agent\`"
+      printf '%s\n' "- status: \`$status\`"
+      printf '%s\n' "- attempts: $attempts"
+      printf '%s\n' "- age: ${age_seconds}s"
       if [[ -n "$last_error" ]]; then
-        printf '- last_error: `%s`\n' "$last_error"
+        printf '%s\n' "- last_error: \`$last_error\`"
       fi
       printf '\n## Next steps\n\n'
       printf '1. Check `agb a2a outbox list` for context.\n'

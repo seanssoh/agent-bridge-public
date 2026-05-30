@@ -1693,16 +1693,30 @@ def latest_event_ts(conn: sqlite3.Connection, task_id: int, event_type: str) -> 
     return int(value or 0)
 
 
+def _escape_like(value: str) -> str:
+    # Codex r1 finding #1: title_prefix is interpolated into a SQL LIKE
+    # pattern. Without escaping, a prefix containing LIKE metacharacters
+    # (`%`, `_`) would over-match and collapse unrelated open alerts —
+    # e.g. a dedupe prefix derived from a peer/agent id that contains `_`
+    # could refresh a different agent's task. Escape the backslash escape
+    # char first, then the two LIKE wildcards, and pair with ESCAPE '\'.
+    return (
+        value.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
 def find_open_task_by_prefix(conn: sqlite3.Connection, agent: str, title_prefix: str) -> sqlite3.Row | None:
     placeholders = ",".join(["?"] * len(OPEN_STATUSES))
-    params: list[object] = [agent, *OPEN_STATUSES, f"{title_prefix}%"]
+    params: list[object] = [agent, *OPEN_STATUSES, f"{_escape_like(title_prefix)}%"]
     return conn.execute(
         f"""
         SELECT *
         FROM tasks
         WHERE assigned_to = ?
           AND status IN ({placeholders})
-          AND title LIKE ?
+          AND title LIKE ? ESCAPE '\\'
         ORDER BY
           CASE priority
             WHEN 'urgent' THEN 0

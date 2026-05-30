@@ -1270,6 +1270,41 @@ expect_idle "no prompt glyph anywhere" \
   $'just text, nothing composable'
 BASH_UT
 
+log "tmux mid-turn detection: claude 'esc to interrupt' footer (issue #1409)"
+# Self-contained coverage for bridge_tmux_claude_is_generating_from_text.
+# Codex r1 finding #2: the hint must only trip from the live footer/status
+# region (last non-empty lines), never from a transcript-body mention.
+"$BASH4_BIN" -s "$REPO_ROOT" <<'GEN_UT'
+set -u
+repo="$1"
+# shellcheck disable=SC1090
+source "$repo/bridge-lib.sh"
+fail() { printf '[smoke][error] mid-turn: %s\n' "$*" >&2; exit 1; }
+expect_gen() {
+  local label="$1" text="$2"
+  if bridge_tmux_claude_is_generating_from_text "$text"; then
+    printf '[smoke]   [ok] %s\n' "$label"
+  else
+    fail "expected GENERATING for: $label"
+  fi
+}
+expect_not_gen() {
+  local label="$1" text="$2"
+  if bridge_tmux_claude_is_generating_from_text "$text"; then
+    fail "expected NOT generating for: $label"
+  else
+    printf '[smoke]   [ok] %s\n' "$label"
+  fi
+}
+expect_gen "mid-turn footer carries the interrupt hint" \
+  $'\xc2\xb7 Imagining\xe2\x80\xa6 (10m 41s)\n  \xe2\x8f\xb5\xe2\x8f\xb5 bypass permissions on (shift+tab to cycle) \xc2\xb7 esc to interrupt'
+expect_not_gen "clean prompt footer lacks the hint" \
+  $'some agent output\n> \n  \xe2\x8f\xb5\xe2\x8f\xb5 bypass permissions on (shift+tab to cycle)'
+expect_not_gen "transcript-body mention is ignored (not in last lines)" \
+  $'we were debugging the esc to interrupt drop earlier\nmore output line\nyet more output\n> \n  \xe2\x8f\xb5\xe2\x8f\xb5 accept edits on (shift+tab to cycle)'
+expect_not_gen "empty capture" ""
+GEN_UT
+
 log "injection metadata-only payload format (issue #132b)"
 # Self-contained coverage for bridge_format_injection_meta and the opt-in
 # flag. Placed early alongside the other #132* regressions.

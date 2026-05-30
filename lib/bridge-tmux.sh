@@ -661,12 +661,36 @@ bridge_tmux_claude_is_generating() {
   # the C-m is dropped, and the operator has to press Enter manually
   # (audit: session_nudge_dropped reason=submit_lost_post_grace,
   # idle_seconds=0). has_pending_input only sees composer text, not this
-  # mid-turn state, so the busy-gate needs an explicit check. Pure
-  # substring match on a short recent capture.
+  # mid-turn state, so the busy-gate needs an explicit check.
+  #
+  # Codex r1 finding #2: a bare substring scan across the whole recent
+  # capture false-positives whenever "esc to interrupt" appears in the
+  # transcript body (a pasted log, a comment, or — as in this very session
+  # — a discussion of the bug). A false positive pins inject_busy true and
+  # the flush re-prepends until the phrase scrolls away, blocking delivery.
+  # The hint only ever lives in the live footer/status region at the BOTTOM
+  # of the pane, so restrict the check to the last few non-empty lines
+  # (spinner/footer/composer); transcript-body mentions sit above and are
+  # ignored. A composer holding the phrase as typed input is already caught
+  # upstream by has_pending_input.
   local session="$1"
   local recent
-  recent="$(bridge_capture_recent "$session" 12 2>/dev/null || true)"
-  [[ "$recent" == *"esc to interrupt"* ]]
+  recent="$(bridge_capture_recent "$session" 6 2>/dev/null || true)"
+  bridge_tmux_claude_is_generating_from_text "$recent"
+}
+
+bridge_tmux_claude_is_generating_from_text() {
+  # Pure-text core of bridge_tmux_claude_is_generating — split out so the
+  # mid-turn detection can be exercised without a live pane (smoke-test.sh
+  # feeds canned clean-prompt / mid-turn / transcript-mention captures).
+  # Matches the codebase's existing *_from_text convention. Returns 0 only
+  # when the live footer/status region (last 3 non-empty lines) carries the
+  # "esc to interrupt" hint.
+  local text="$1"
+  local tail_lines
+  [[ -n "$text" ]] || return 1
+  tail_lines="$(printf '%s\n' "$text" | grep -v '^[[:space:]]*$' | tail -n 3)"
+  [[ "$tail_lines" == *"esc to interrupt"* ]]
 }
 
 bridge_tmux_session_inject_busy() {
