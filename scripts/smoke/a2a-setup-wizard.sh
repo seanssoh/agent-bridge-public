@@ -419,6 +419,54 @@ case_9_unkeyed_peer_refused() {
     "(9) --yes cannot activate a receiver off the never-written ghost config"
 }
 
+# --- (10) hand-edited secret-bearing UNRESOLVABLE peer: probe not-done + S5 refuses ---
+# codex #1418 r2 BLOCKING: the no-`--peer` --show-state path used `if peers:
+# done=True` without a resolvability check, so a pre-existing/hand-edited config
+# with a secret-bearing-but-unresolvable peer (no node_id/tailscale_name/address)
+# reported S5/done and `setup --yes` (no --peer) activated the receiver while
+# skipping S6. Probe now requires a USABLE peer; S5 has an independent
+# resolvability gate. This drives codex's exact repro.
+case_10_handedited_unresolvable_peer() {
+  local he_cfg="$BRIDGE_HOME/handoff-handedited.json"
+  cat >"$he_cfg" <<EOF
+{
+  "bridge_id": "$SELF_BRIDGE_ID",
+  "listen": { "node_id": "selfStableID111", "tailscale_name": "my-host", "port": $A2A_PORT },
+  "peers": [
+    {
+      "id": "ghost-peer",
+      "port": $A2A_PORT,
+      "enqueue_path": "/enqueue",
+      "secret": "$PEER_SECRET_VALUE",
+      "inbound_allowlist": ["reviewer"]
+    }
+  ]
+}
+EOF
+  chmod 0600 "$he_cfg"
+
+  # (a) --show-state must NOT report S5/done: S2 is not satisfied (no usable peer).
+  local state
+  state="$(BRIDGE_A2A_CONFIG="$he_cfg" BRIDGE_A2A_TAILSCALE_CLI="$MOCK_CLI" \
+    python3 "$SMOKE_REPO_ROOT/bridge-a2a.py" setup --show-state --json 2>/dev/null \
+    | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["current_state"])')"
+  smoke_assert_eq "S2" "$state" \
+    "(10) --show-state reports S2 (not S5/done) for a secret-bearing unresolvable peer"
+
+  # (b) setup --yes must REFUSE to activate (independent S5 resolvability gate),
+  #     start NO receiver, and NOT print the S6-skip success line.
+  local out rc=0
+  out="$(BRIDGE_A2A_CONFIG="$he_cfg" setup --yes 2>&1)" || rc=$?
+  smoke_assert_eq "1" "$rc" \
+    "(10) setup --yes on an unresolvable-peer config exits non-zero (fail-closed)"
+  smoke_assert_contains "$out" "setup_s5_unresolvable_peers" \
+    "(10) S5 refuses to activate against an unresolvable peer set"
+  smoke_assert_not_contains "$out" "S5 OK" \
+    "(10) the receiver is NOT started for an unresolvable peer config"
+  smoke_assert_not_contains "$out" "skipping the handshake" \
+    "(10) it never reaches the S6-skip (refused at S5, not activated-then-skipped)"
+}
+
 main() {
   smoke_require_cmd python3
   smoke_require_cmd tmux
@@ -446,6 +494,7 @@ main() {
   smoke_run "(7) fail-closed unresolvable peer"         case_7_unresolvable_peer
   smoke_run "(8) --peer without --peer-secret-env"      case_8_peer_without_secret_flag
   smoke_run "(9) un-keyed peer refused at write"        case_9_unkeyed_peer_refused
+  smoke_run "(10) hand-edited unresolvable peer: probe+S5 fail-closed" case_10_handedited_unresolvable_peer
 
   smoke_log "PASS"
 }

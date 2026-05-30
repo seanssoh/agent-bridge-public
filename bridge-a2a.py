@@ -1567,9 +1567,46 @@ def _setup_probe_s2(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, 
             detail={"peer": want, "discovered": _setup_discover_peers()},
         )
     if peers:
+        # S2 (no --peer) counts as done only if at least one peer is USABLE:
+        # both secret-bearing AND resolvable (node_id / tailscale_name /
+        # address). A secret-bearing-but-unresolvable peer (hand-edited or
+        # pre-existing config with the identity dropped) must NOT report done —
+        # otherwise --show-state says S5/done and `setup --yes` (no --peer)
+        # would activate the receiver against a dead peer while skipping S6.
+        # (#1418 codex r2 BLOCKING — the no-peer branch was missing the
+        # resolvability gate the --peer branch already has.)
+        def _peer_usable(p: dict[str, Any]) -> bool:
+            return bool(isinstance(p, dict) and a2a.peer_secrets(p) and (
+                p.get("node_id") or p.get("tailscale_name") or p.get("address")))
+        usable = [p for p in peers if _peer_usable(p)]
+        if usable:
+            return _setup_result(
+                "S2", done=True, action="",
+                detail={"peer_count": len(peers), "usable_peer_count": len(usable)},
+            )
+        # Peers exist but NONE is usable — report the specific defect per peer
+        # so the agent can relay it, and keep S2 not-done (blocks S5 activation
+        # of a dead config).
+        defects = []
+        for p in peers:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id", "<no-id>")
+            if not a2a.peer_secrets(p):
+                defects.append(f"{pid}: no secret")
+            elif not (p.get("node_id") or p.get("tailscale_name")
+                      or p.get("address")):
+                defects.append(f"{pid}: unresolvable (no node_id/tailscale_name/address)")
         return _setup_result(
-            "S2", done=True, action="",
-            detail={"peer_count": len(peers)},
+            "S2", done=False,
+            action="Configured peer(s) are not usable (" + "; ".join(defects)
+                   + "). Re-run `setup --peer <id> --peer-secret-env <ENVVAR>` "
+                   "with that node Online (to identity-key it), or pre-place a "
+                   "raw `address`, so the peer resolves. S5 will not activate "
+                   "against an unusable peer set.",
+            needs=["--peer", "--peer-secret-env"],
+            detail={"peer_count": len(peers), "usable_peer_count": 0,
+                    "defects": defects},
         )
     return _setup_result(
         "S2", done=False,
@@ -1953,6 +1990,26 @@ def cmd_setup(args: argparse.Namespace) -> int:
     except a2a.A2AError as exc:
         return die(f"S5 refuses to activate: {exc} ({exc.code}). The receiver "
                    "was NOT started.", code="setup_s5_secret") or 1
+
+    # Resolvability gate (#1418 codex r2 BLOCKING, defense-in-depth): refuse to
+    # activate a config that HAS peers but NONE is resolvable (no node_id /
+    # tailscale_name / address). This is independent of --show-state's probe, so
+    # a `setup --yes` (no --peer) against a hand-edited / pre-existing dead
+    # config cannot start a receiver that would skip S6 against an unreachable
+    # peer set. A peer becomes resolvable by bringing its node Online (re-key
+    # via `setup --peer`) or pre-placing a raw `address`.
+    s5_peers = cfg.get("peers", []) if isinstance(cfg.get("peers"), list) else []
+    if s5_peers and not any(
+            isinstance(p, dict) and (p.get("node_id") or p.get("tailscale_name")
+                                     or p.get("address"))
+            for p in s5_peers):
+        return die(
+            "S5 refuses to activate: the config has peer(s) but NONE is "
+            "resolvable (no node_id/tailscale_name/address). The receiver was "
+            "NOT started. Re-run `setup --peer <id> --peer-secret-env <ENVVAR>` "
+            "with that node Online to identity-key it, or pre-place a raw "
+            "`address`, then re-run.",
+            code="setup_s5_unresolvable_peers") or 1
 
     if not _setup_receiver_running():
         if not args.yes:
