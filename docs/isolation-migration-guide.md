@@ -641,7 +641,7 @@ keep a notebook, and treat each agent as an independent unit of work.
   across two agents (the cross-agent checks in §1 and §2.2 require
   two isolated agents side by side). Note in the resulting report that
   §3 (audit attribution) is expected to partially fail until
-  [#103](https://github.com/SYRS-AI/agent-bridge-public/issues/103)
+  [#103](https://github.com/seanssoh/agent-bridge-public/issues/103)
   lands.
 - **Admin last.** Once the rest of the fleet is clean, migrate the
   admin agent using the same steps. Keep an alternate terminal ready
@@ -656,6 +656,6 @@ keep a notebook, and treat each agent as an independent unit of work.
 - Migration helper implementation: [`lib/bridge-migration.sh`](../lib/bridge-migration.sh)
 - Validation checklist: [isolation-acceptance-runbook.md](./isolation-acceptance-runbook.md)
 - Scope and macOS exclusion: [platform-support.md](./platform-support.md)
-- Runtime UID-switch gap: [#103](https://github.com/SYRS-AI/agent-bridge-public/issues/103)
-- Migration helper CLI issue: [#85](https://github.com/SYRS-AI/agent-bridge-public/issues/85)
-- Parent isolation issue: [#68](https://github.com/SYRS-AI/agent-bridge-public/issues/68)
+- Runtime UID-switch gap: [#103](https://github.com/seanssoh/agent-bridge-public/issues/103)
+- Migration helper CLI issue: [#85](https://github.com/seanssoh/agent-bridge-public/issues/85)
+- Parent isolation issue: [#68](https://github.com/seanssoh/agent-bridge-public/issues/68)

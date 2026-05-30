@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 
-UPSTREAM_REPO="${BRIDGE_UPSTREAM_REPO:-SYRS-AI/agent-bridge-public}"
+UPSTREAM_REPO="${BRIDGE_UPSTREAM_REPO:-seanssoh/agent-bridge-public}"
 UPSTREAM_CANDIDATE_DIR="${BRIDGE_UPSTREAM_CANDIDATE_DIR:-$BRIDGE_SHARED_DIR/upstream-candidates}"
 
 usage() {

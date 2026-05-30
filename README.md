@@ -1,6 +1,6 @@
 # Agent Bridge
 
-[![CI](https://github.com/SYRS-AI/agent-bridge-public/actions/workflows/ci.yml/badge.svg)](https://github.com/SYRS-AI/agent-bridge-public/actions/workflows/ci.yml)
+[![CI](https://github.com/seanssoh/agent-bridge-public/actions/workflows/ci.yml/badge.svg)](https://github.com/seanssoh/agent-bridge-public/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
 **AI 에이전트 팀을 만들어서 회사 업무를 자동화하세요.**
@@ -10,11 +10,11 @@ Agent Bridge는 Claude Code와 Codex 같은 AI 코딩 에이전트를 "직원"�
 > 5명이 할 일을 에이전트 20명이 대신합니다.
 > 설정부터 유지보수까지 전부 자연어로.
 
-**Current version**: v0.14.5-beta5 (2026-05-23) — fresh-install bug-fix wave (13 issues), on top of v0.14.5-beta4's A2A cross-bridge task handoff. The v0.14.5 line is an ongoing prerelease series; there is no separate stable tag, so treat the latest `v0.14.5-betaN` as current.
-- Recommended upgrade target. The v0.14.x line rolled up v0.14.0's platform discriminator, the #946 daemon-hang 5-layer root-cause fix, the footgun #11 (`read_comsub` / heredoc-stdin) CI ratchet + helper extraction, the Teams plugin file-attachment work, agent-lifecycle cleanup, and the Linux-specific layout-resolver / `ARG_MAX` regressions found in OrbStack VM E2E.
-- v0.7.x → v0.14.x leap path: **direct `agent-bridge upgrade --apply` to the latest `v0.14.5-betaN`** is the current recommended path — the v0.13.7-v0.13.10 cycle fixed the Bash 5.3.9 heredoc-stdin deadlock chain by extracting leap-path bodies to `lib/upgrade-helpers/`, so the leap is single-atomic from any v0.7.x/v0.8.x/v0.9.x/v0.10.x/v0.11.x/v0.12.x/v0.13.x source. v0.13.10 is the minimum-safe fallback if you're pinned below v0.14.x or troubleshooting an in-flight leap. See [OPERATIONS.md §"Upgrade"](./OPERATIONS.md#upgrade) for recipe + follow-up notes.
+**Current version**: v0.15.0 (2026-05-31) — the first **stable** tag on the 0.15.0 line. Headline: A2A cross-bridge self-heal (peer/own Tailscale IP churn no longer needs a human), handoffd receiver supervision (liveness probe + auto-restart + status alarm), the `agb a2a setup` wizard (P1 skeleton), and the full 0.15.0 fresh-install / upgrade OOTB-acceptance + iso-v2 hardening campaign promoted from `v0.15.0-rc1`. See [CHANGELOG.md](./CHANGELOG.md#0150--2026-05-31) for the full list.
+- **Recommended upgrade target.** `v0.15.0` supersedes the `v0.15.0-rc1` / `v0.15.0-betaN` / `v0.14.5-betaN` prereleases — treat the latest stable tag as current.
+- v0.7.x → v0.15.0 leap path: **direct `agent-bridge upgrade --apply` to `v0.15.0`** is the current recommended path — the v0.13.7-v0.13.10 cycle fixed the Bash 5.3.9 heredoc-stdin deadlock chain by extracting leap-path bodies to `lib/upgrade-helpers/`, so the leap is single-atomic from any v0.7.x/v0.8.x/v0.9.x/v0.10.x/v0.11.x/v0.12.x/v0.13.x/v0.14.x source. v0.13.10 is the minimum-safe fallback if you're pinned below v0.14.x or troubleshooting an in-flight leap. See [OPERATIONS.md §"Upgrade"](./OPERATIONS.md#upgrade) for recipe + follow-up notes.
 - macOS: works in shared-mode (default). Linux-user isolation is Linux-only — v0.14.0's platform discriminator + v0.14.1's primitives-readiness check make the gate explicit (`BRIDGE_ISOLATION_REQUIRED=auto|yes|no`).
-- Stabilization roadmap: [`docs/stabilization-plan-2026-05-15.md`](./docs/stabilization-plan-2026-05-15.md). the v0.14.x line cleared S0–S3 + S5 Track A + parts of S7 (footgun #11 ratchet, daemon-hang hardening); S4 (Bash 3.2 cleanup), S5 B/C/D, S6, S8–S10 remain.
+- Stabilization roadmap: [`docs/stabilization-plan-2026-05-15.md`](./docs/stabilization-plan-2026-05-15.md). the 0.14.x/0.15.0 line cleared S0–S3 + S5 Track A + parts of S7 (footgun #11 ratchet, daemon-hang hardening); S4 (Bash 3.2 cleanup), S5 B/C/D, S6, S8–S10 remain.
 
 ---
 
@@ -141,7 +141,7 @@ claude
 Claude Code가 열리면 이렇게 말합니다:
 
 ```text
-https://raw.githubusercontent.com/SYRS-AI/agent-bridge-public/main/README.md 를 읽고 Agent Bridge를 설치해줘.
+https://raw.githubusercontent.com/seanssoh/agent-bridge-public/main/README.md 를 읽고 Agent Bridge를 설치해줘.
 CLAUDE_INSTALLER_STEPS 블록을 찾아서 그 단계만 그대로 실행해.
 저장소 구조를 추측해서 설치하지 말고, README에 설치 단계가 없다고 판단하지 마.
 ```
@@ -164,7 +164,7 @@ If you think this README has no concrete install steps, stop and reread this `CL
    Keep the source checkout hidden at `~/.agent-bridge-source`. If an older visible checkout exists at `~/agent-bridge-public`, move it automatically only when it is clean and points to this public repository. If you intentionally keep the source checkout elsewhere, such as `~/Projects/agent-bridge-public`, set `AGENT_BRIDGE_SOURCE_DIR` or pass `agent-bridge upgrade --source /path/to/agent-bridge-public` when upgrading from the live install.
 
    ```bash
-   REPO_URL="https://github.com/SYRS-AI/agent-bridge-public"
+   REPO_URL="https://github.com/seanssoh/agent-bridge-public"
    SOURCE_DIR="${AGENT_BRIDGE_SOURCE_DIR:-$HOME/.agent-bridge-source}"
    LEGACY_SOURCE_DIR="$HOME/agent-bridge-public"
 
@@ -175,7 +175,11 @@ If you think this README has no concrete install steps, stop and reread this `CL
 
    if [ ! -d "$SOURCE_DIR/.git" ] && [ -d "$LEGACY_SOURCE_DIR/.git" ]; then
      legacy_origin="$(git -C "$LEGACY_SOURCE_DIR" remote get-url origin 2>/dev/null || true)"
-     if printf '%s\n' "$legacy_origin" | grep -q 'SYRS-AI/agent-bridge-public'; then
+     # Match BOTH the historical `SYRS-AI/...` origin (existing checkouts still
+     # point there after the repo transfer) and the current `seanssoh/...` so
+     # the relocate works either way. Do NOT narrow this to seanssoh-only — that
+     # would skip migrating the very SYRS-AI checkouts this transition targets.
+     if printf '%s\n' "$legacy_origin" | grep -qE '(SYRS-AI|seanssoh)/agent-bridge-public'; then
        if git -C "$LEGACY_SOURCE_DIR" diff --quiet && git -C "$LEGACY_SOURCE_DIR" diff --cached --quiet; then
          mv "$LEGACY_SOURCE_DIR" "$SOURCE_DIR"
        else
@@ -695,7 +699,7 @@ Claude Code가 띄운 MCP 서버는 tmux 세션 종료 후에도 orphan으로 �
 
 `--apply` 는 atomic 명령이다. daemon stop → 새 source 복사 → daemon restart → 영향받는 agent 재기동 까지 한 번에. 절대 `daemon stop` 을 분리 실행하지 말 것 (#314, #315).
 
-최신 `v0.14.5-betaN` 이 현재 권장 target 이다. v0.7.x / v0.8.x / v0.9.x / v0.10.x / v0.11.x / v0.12.x / v0.13.x 어디서든 단일 `upgrade --apply` 한 번으로 최신 betaN 까지 올라간다 (v0.13.7-v0.13.9 가 Bash 5.3.9 heredoc-chain 을 풀어놨기 때문에 중간 hop 불필요).
+`v0.15.0` (stable) 이 현재 권장 target 이다. v0.7.x / v0.8.x / v0.9.x / v0.10.x / v0.11.x / v0.12.x / v0.13.x / v0.14.x 어디서든 단일 `upgrade --apply` 한 번으로 `v0.15.0` 까지 올라간다 (v0.13.7-v0.13.9 가 Bash 5.3.9 heredoc-chain 을 풀어놨기 때문에 중간 hop 불필요).
 
 자세한 release-specific 절차 + troubleshooting 은:
 
@@ -712,7 +716,7 @@ queue task 또는 외부 채널로 그쪽 admin 한테 그대로 보내면 됨 (
 ````markdown
 # [upgrade-action] agent-bridge upgrade
 
-이 host 를 현재 권장 target (v0.14.1 이상) 까지 올린다. 끝나면 done note 한 줄 요약으로 보고.
+이 host 를 현재 권장 target (`v0.15.0` 이상) 까지 올린다. 끝나면 done note 한 줄 요약으로 보고.
 
 ## 절차
 
@@ -743,9 +747,9 @@ final_version=<version>, daemon=<healthy|issue>, operator-actions=<summary|none>
 절대 `daemon stop` 분리 실행 금지 (#314, #315). `upgrade --apply` 가 atomic.
 
 ## Reference
-- 표준 절차: [`UPGRADING.md`](https://github.com/SYRS-AI/agent-bridge-public/blob/main/UPGRADING.md)
-- Release section: [`OPERATIONS.md §"Upgrade"`](https://github.com/SYRS-AI/agent-bridge-public/blob/main/OPERATIONS.md#upgrade)
-- Latest release: https://github.com/SYRS-AI/agent-bridge-public/releases/latest
+- 표준 절차: [`UPGRADING.md`](https://github.com/seanssoh/agent-bridge-public/blob/main/UPGRADING.md)
+- Release section: [`OPERATIONS.md §"Upgrade"`](https://github.com/seanssoh/agent-bridge-public/blob/main/OPERATIONS.md#upgrade)
+- Latest release: https://github.com/seanssoh/agent-bridge-public/releases/latest
 ````
 
 ---

@@ -39,7 +39,7 @@ stable releases unless they explicitly opt into `--channel dev`.
    ```
 
 3. Commit and push private `main`.
-4. Mirror the public-safe commit to `SYRS-AI/agent-bridge-public`.
+4. Mirror the public-safe commit to `seanssoh/agent-bridge-public`.
 5. Tag the public release:
 
    ```bash

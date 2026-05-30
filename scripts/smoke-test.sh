@@ -10685,12 +10685,12 @@ cat >"$FAKE_RELEASE_JSON" <<'EOF'
 {
   "tag_name": "v9.9.9",
   "name": "Agent Bridge v9.9.9",
-  "html_url": "https://github.com/SYRS-AI/agent-bridge-public/releases/tag/v9.9.9",
+  "html_url": "https://github.com/seanssoh/agent-bridge-public/releases/tag/v9.9.9",
   "published_at": "2026-04-10T14:18:41Z",
   "body": "## Highlights\n- Stable release smoke fixture\n- Release notes carried into daemon task body"
 }
 EOF
-RELEASE_MONITOR_FIRST="$(python3 "$REPO_ROOT/bridge-release.py" monitor --repo SYRS-AI/agent-bridge-public --installed-version "$EXPECTED_VERSION" --state-file "$FAKE_RELEASE_STATE" --mock-json-file "$FAKE_RELEASE_JSON" --json)"
+RELEASE_MONITOR_FIRST="$(python3 "$REPO_ROOT/bridge-release.py" monitor --repo seanssoh/agent-bridge-public --installed-version "$EXPECTED_VERSION" --state-file "$FAKE_RELEASE_STATE" --mock-json-file "$FAKE_RELEASE_JSON" --json)"
 python3 - "$RELEASE_MONITOR_FIRST" <<'PY'
 import json, sys
 payload = json.loads(sys.argv[1])
@@ -10698,7 +10698,7 @@ alerts = payload["alerts"]
 assert len(alerts) == 1, alerts
 assert alerts[0]["latest_tag"] == "v9.9.9", alerts
 PY
-RELEASE_MONITOR_SECOND="$(python3 "$REPO_ROOT/bridge-release.py" monitor --repo SYRS-AI/agent-bridge-public --installed-version "$EXPECTED_VERSION" --state-file "$FAKE_RELEASE_STATE" --mock-json-file "$FAKE_RELEASE_JSON" --json)"
+RELEASE_MONITOR_SECOND="$(python3 "$REPO_ROOT/bridge-release.py" monitor --repo seanssoh/agent-bridge-public --installed-version "$EXPECTED_VERSION" --state-file "$FAKE_RELEASE_STATE" --mock-json-file "$FAKE_RELEASE_JSON" --json)"
 python3 - "$RELEASE_MONITOR_SECOND" <<'PY'
 import json, sys
 payload = json.loads(sys.argv[1])
@@ -10708,7 +10708,7 @@ BRIDGE_RELEASE_CHECK_ENABLED=1 \
 BRIDGE_RELEASE_CHECK_INTERVAL_SECONDS=0 \
 BRIDGE_RELEASE_CHECK_STATE_FILE="$FAKE_RELEASE_DAEMON_STATE" \
 BRIDGE_RELEASE_MOCK_JSON_FILE="$FAKE_RELEASE_JSON" \
-BRIDGE_RELEASE_REPO="SYRS-AI/agent-bridge-public" \
+BRIDGE_RELEASE_REPO="seanssoh/agent-bridge-public" \
 BRIDGE_HOME="$BRIDGE_HOME" \
 BRIDGE_STATE_DIR="$BRIDGE_STATE_DIR" \
 BRIDGE_SHARED_DIR="$BRIDGE_SHARED_DIR" \
@@ -10729,7 +10729,7 @@ BRIDGE_RELEASE_CHECK_ENABLED=1 \
 BRIDGE_RELEASE_CHECK_INTERVAL_SECONDS=0 \
 BRIDGE_RELEASE_CHECK_STATE_FILE="$FAKE_RELEASE_DAEMON_STATE" \
 BRIDGE_RELEASE_MOCK_JSON_FILE="$FAKE_RELEASE_JSON" \
-BRIDGE_RELEASE_REPO="SYRS-AI/agent-bridge-public" \
+BRIDGE_RELEASE_REPO="seanssoh/agent-bridge-public" \
 BRIDGE_HOME="$BRIDGE_HOME" \
 BRIDGE_STATE_DIR="$BRIDGE_STATE_DIR" \
 BRIDGE_SHARED_DIR="$BRIDGE_SHARED_DIR" \
@@ -10743,7 +10743,7 @@ BRIDGE_RELEASE_CHECK_ENABLED=1 \
 BRIDGE_RELEASE_CHECK_INTERVAL_SECONDS=0 \
 BRIDGE_RELEASE_CHECK_STATE_FILE="$FAKE_RELEASE_DAEMON_STATE" \
 BRIDGE_RELEASE_MOCK_JSON_FILE="$FAKE_RELEASE_JSON" \
-BRIDGE_RELEASE_REPO="SYRS-AI/agent-bridge-public" \
+BRIDGE_RELEASE_REPO="seanssoh/agent-bridge-public" \
 BRIDGE_HOME="$BRIDGE_HOME" \
 BRIDGE_STATE_DIR="$BRIDGE_STATE_DIR" \
 BRIDGE_SHARED_DIR="$BRIDGE_SHARED_DIR" \

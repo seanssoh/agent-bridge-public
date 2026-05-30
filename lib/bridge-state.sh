@@ -1288,7 +1288,7 @@ bridge_load_roster() {
   : "${BRIDGE_RELEASE_CHECK_ENABLED:=1}"
   : "${BRIDGE_RELEASE_CHECK_INTERVAL_SECONDS:=86400}"
   : "${BRIDGE_RELEASE_CHECK_STATE_FILE:=$BRIDGE_STATE_DIR/release-check/monitor-state.json}"
-  : "${BRIDGE_RELEASE_REPO:=SYRS-AI/agent-bridge-public}"
+  : "${BRIDGE_RELEASE_REPO:=seanssoh/agent-bridge-public}"
   : "${BRIDGE_STALL_SCAN_ENABLED:=1}"
   : "${BRIDGE_STALL_SCAN_INTERVAL_SECONDS:=30}"
   : "${BRIDGE_STALL_CAPTURE_LINES:=120}"

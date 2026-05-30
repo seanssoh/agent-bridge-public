@@ -8,7 +8,7 @@ The goal is not to copy private runtime files into the public repository.
 The goal is to extract the reusable product pattern, remove team-specific
 details, and implement coherent public features.
 
-Related meta issue: https://github.com/SYRS-AI/agent-bridge-public/issues/9
+Related meta issue: https://github.com/seanssoh/agent-bridge-public/issues/9
 
 ## Rules
 

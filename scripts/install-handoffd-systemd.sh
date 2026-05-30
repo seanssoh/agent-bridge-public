@@ -130,7 +130,7 @@ CONFIG_PATH="$BRIDGE_HOME_TARGET/handoff.local.json"
 UNIT_CONTENT="$(cat <<EOF
 [Unit]
 Description=Agent Bridge A2A handoff receiver
-Documentation=https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/a2a-cross-bridge.md
+Documentation=https://github.com/seanssoh/agent-bridge-public/blob/main/docs/a2a-cross-bridge.md
 After=network-online.target tailscaled.service
 Wants=network-online.target
 
