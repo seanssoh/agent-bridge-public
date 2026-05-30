@@ -158,15 +158,16 @@ start_receiver() {
 
 base_url() { printf 'http://127.0.0.1:%s' "$A2A_PORT"; }
 
-# Resolve the cfg-reader helper path at CALL time (SMOKE_TMP_ROOT is only set
-# after smoke_setup_bridge_home runs — a parse-time assignment would expand to
-# an empty root).
-cfg_helper_path() { printf '%s/cfg-get.py' "$SMOKE_TMP_ROOT"; }
-cfg_get() { python3 "$(cfg_helper_path)" "$@"; }
+# Path to the cfg-reader helper. Assigned from SMOKE_TMP_ROOT in main() AFTER
+# smoke_setup_bridge_home runs (a parse-time assignment would expand to an
+# empty root). Kept as a plain variable — NOT a $(...) command-substitution in
+# a heredoc redirect target — so lint-heredoc-ban does not false-trigger C2.
+CFG_HELPER=""
+cfg_get() { python3 "$CFG_HELPER" "$@"; }
 
 # --- config field reader (tiny, file-as-argv) -------------------------------
 write_cfg_helper() {
-  cat >"$(cfg_helper_path)" <<'PYEOF'
+  cat >"$CFG_HELPER" <<'PYEOF'
 import json, sys
 cfg = json.load(open(sys.argv[1]))
 expr = sys.argv[2]
@@ -250,6 +251,44 @@ case_e_replay() {
   smoke_assert_contains "$out" '"duplicate": true' "(e) replay flagged duplicate"
   after="$(cfg_get "$cfg" peer:cm-prod.node_id)"
   smoke_assert_eq "$before" "$after" "(e) replay does not double-update"
+}
+
+# --- (i) SECURITY: EMPTY message_id is rejected before dedupe/mutation -------
+# A peer holding the shared secret signs a request with an EMPTY
+# X-AGB-Message-Id (the empty id is baked into the canonical so the HMAC still
+# verifies). Pre-fix (8148f12) this skipped dedupe AND let the bridge_id
+# corroboration be bypassed. The receiver MUST reject it (400) with no
+# mutation. (#1406 codex r1 SECURITY)
+case_i_empty_message_id() {
+  local out cfg="$BRIDGE_HOME/handoff.local.json" before after
+  before="$(cfg_get "$cfg" peer:cm-prod.node_id)"
+  out="$(python3 "$HELPER" post "$(base_url)" cm-prod "$A2A_SECRET" emptyid)"
+  smoke_assert_contains "$out" "STATUS=400" \
+    "(i) SECURITY: signed request with EMPTY message_id -> 400 reject"
+  smoke_assert_contains "$out" "message id required" \
+    "(i) 400 reports message id required"
+  after="$(cfg_get "$cfg" peer:cm-prod.node_id)"
+  smoke_assert_eq "$before" "$after" \
+    "(i) SECURITY: empty-message_id request does NOT mutate the peer identity"
+}
+
+# --- (j) SECURITY: cross-peer bridge_id mismatch rejected unconditionally ----
+# A peer signs a VALID, non-empty-id request whose body bridge_id claims a
+# DIFFERENT peer (announcing about someone else). Pre-fix the bridge_id check
+# was conditional on a non-empty id, but even with a non-empty id the check
+# MUST fire (unconditional). The receiver MUST reject it (422) with no
+# mutation. (#1406 codex r1 SECURITY)
+case_j_bridge_id_mismatch() {
+  local out cfg="$BRIDGE_HOME/handoff.local.json" before after
+  before="$(cfg_get "$cfg" peer:cm-prod.node_id)"
+  out="$(python3 "$HELPER" post "$(base_url)" cm-prod "$A2A_SECRET" bridgemismatch)"
+  smoke_assert_contains "$out" "STATUS=422" \
+    "(j) SECURITY: signed body bridge_id != authenticated peer -> 422 reject"
+  smoke_assert_contains "$out" "bridge_id does not match authenticated peer" \
+    "(j) 422 reports bridge_id mismatch"
+  after="$(cfg_get "$cfg" peer:cm-prod.node_id)"
+  smoke_assert_eq "$before" "$after" \
+    "(j) SECURITY: a cross-peer announce does NOT mutate the peer identity"
 }
 
 # --- (g) the update never touched secret/allowlist/caps/other peers ---------
@@ -343,6 +382,7 @@ MOCK
 main() {
   smoke_require_cmd python3
   smoke_setup_bridge_home "$SMOKE_NAME"
+  CFG_HELPER="$SMOKE_TMP_ROOT/cfg-get.py"
   write_cfg_helper
 
   smoke_run "start loopback receiver (mock tailscale)"   start_receiver
@@ -351,6 +391,8 @@ main() {
   smoke_run "(c) bad HMAC -> 401"                         case_c_badhmac
   smoke_run "(d) unpaired peer -> 403"                   case_d_unpaired
   smoke_run "(e) replay -> idempotent, no double-update" case_e_replay
+  smoke_run "(i) SECURITY: empty message_id -> 400"      case_i_empty_message_id
+  smoke_run "(j) SECURITY: bridge_id mismatch -> 422"    case_j_bridge_id_mismatch
   smoke_run "(g) scope: secret/allowlist/caps/peers kept" case_g_scope_preserved
   smoke_run "(h) 0600 preserved on write"                case_h_mode_preserved
   smoke_run "(f) remote_addr mismatch -> 403 before body" case_f_addr_mismatch

@@ -22,6 +22,18 @@ Kept as a standalone FILE (file-as-argv, never heredoc-stdin) per footgun
           badhmac       sign with the wrong secret -> 401
           replay        re-send the SAME signed message (same message_id +
                         body) -> idempotent 200 duplicate
+          emptyid       VALID signature but an EMPTY X-AGB-Message-Id header
+                        (and empty id baked into the canonical string so the
+                        HMAC still verifies) -> must be REJECTED (400) BEFORE
+                        any dedupe/mutation (#1406 codex r1 SECURITY: an empty
+                        id previously skipped dedupe AND let the bridge_id
+                        corroboration be bypassed).
+          bridgemismatch VALID signature, NON-empty id, but the signed body
+                        claims a bridge_id != the authenticated X-AGB-Peer
+                        (announcing about a DIFFERENT peer) -> must be REJECTED
+                        (422) unconditionally (#1406 codex r1 SECURITY: the
+                        body bridge_id MUST always equal the authenticated
+                        peer; a peer may only announce about ITSELF).
         The message_id is deterministic per (peer_id, case) so `replay`
         reuses the `ok` id.
 
@@ -76,15 +88,22 @@ def _sign(secret: str, canonical: str) -> str:
 def _post(base_url: str, peer_id: str, secret: str, case: str) -> int:
     # Deterministic message_id so `replay` reuses the `ok` id (and a
     # distinct id per other case so dedupe never cross-talks).
-    mid_case = "ok" if case == "replay" else case
-    message_id = f"{peer_id}:smoke-identity-{mid_case}"
+    # `emptyid` deliberately sends an EMPTY message_id (header + canonical) to
+    # prove the receiver rejects it BEFORE dedupe/mutation (#1406 SECURITY).
+    if case == "emptyid":
+        message_id = ""
+    else:
+        mid_case = "ok" if case == "replay" else case
+        message_id = f"{peer_id}:smoke-identity-{mid_case}"
 
     # Body: the sender's CLAIM about its own identity. For `ok`/`replay` the
     # claim names the node the receiver's mock corroborates for this peer
     # (StableID peerStableID999 / cm-prod-... / 127.0.0.1). For `spoof` the
     # claim names a DIFFERENT real node (otherStableID / other-host) that the
     # receiver's status has, but which is NOT this peer's paired node — the
-    # corroboration same-node anchor must reject it.
+    # corroboration same-node anchor must reject it. For `bridgemismatch` the
+    # claim names a DIFFERENT peer's bridge_id (cross-peer announce) — must be
+    # rejected unconditionally (#1406 SECURITY).
     if case == "spoof":
         body = {
             "protocol": a2a.IDENTITY_UPDATE_ENVELOPE_PROTOCOL,
@@ -92,6 +111,16 @@ def _post(base_url: str, peer_id: str, secret: str, case: str) -> int:
             "node_id": "otherStableID",
             "tailscale_name": "other-host",
             "tailscale_ip": "127.0.0.9",
+        }
+    elif case == "bridgemismatch":
+        body = {
+            "protocol": a2a.IDENTITY_UPDATE_ENVELOPE_PROTOCOL,
+            # The signed body claims a DIFFERENT peer than the authenticated
+            # X-AGB-Peer — a cross-peer announce the receiver must refuse.
+            "bridge_id": f"{peer_id}-impersonated-other",
+            "node_id": "peerStableID999",
+            "tailscale_name": "cm-prod-agentworkflow-vm01",
+            "tailscale_ip": "127.0.0.1",
         }
     else:
         body = {

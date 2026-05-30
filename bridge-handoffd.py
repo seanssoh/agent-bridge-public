@@ -1115,6 +1115,18 @@ class HandoffHandler(BaseHTTPRequestHandler):
             self._reply(400, {"ok": False, "error": "unsupported protocol"})
             return
 
+        # --- message_id REQUIRED (non-empty) for this endpoint ---
+        # A non-empty message_id is mandatory: it anchors durable dedupe (d)
+        # AND is part of the signed canonical string. An empty id would skip
+        # dedupe entirely and previously let the bridge_id corroboration be
+        # bypassed (#1406 codex r1 SECURITY). Reject BEFORE any body read or
+        # mutation; fail-closed.
+        if not message_id:
+            audit("identity_update_reject", reason="missing_message_id",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(400, {"ok": False, "error": "message id required"})
+            return
+
         # --- f. peer must be ALREADY PAIRED (not a discovery channel) ---
         try:
             peer = a2a.find_peer(cfg, peer_id)
@@ -1230,9 +1242,13 @@ class HandoffHandler(BaseHTTPRequestHandler):
                   message_id=message_id)
             self._reply(422, {"ok": False, "error": str(exc)})
             return
-        if message_id and claim.get("bridge_id") != peer_id:
+        if claim.get("bridge_id") != peer_id:
             # The claimed bridge_id must match the authenticated peer (the
             # signed X-AGB-Peer). A peer may only announce about ITSELF.
+            # UNCONDITIONAL: message_id is guaranteed non-empty above, but this
+            # corroboration check must NEVER be skipped regardless (#1406 codex
+            # r1 SECURITY — empty-id no longer reaches here, and the body
+            # bridge_id can never bypass the authenticated-peer match).
             audit("identity_update_reject", reason="bridge_id_mismatch",
                   peer=peer_id, client=client_ip,
                   claimed=claim.get("bridge_id"), security=True)
