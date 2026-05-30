@@ -364,8 +364,23 @@ class HandoffHandler(BaseHTTPRequestHandler):
             self._reply(403, {"ok": False, "error": "unknown peer"})
             return
 
-        # --- remote_addr == configured peer (checked before body read) ---
-        peer_addr = peer.get("address", "")
+        # --- remote_addr == authenticated peer's CURRENT address (before body) ---
+        # Resolve the configured SENDER peer (the authenticated X-AGB-Peer we
+        # just looked up) to its live Tailscale IP rather than trusting a
+        # literal/stale `address`. A peer keyed on `node_id`/`tailscale_name`
+        # would otherwise be rejected here as a source-address mismatch even
+        # though the sender delivered correctly — and, worse, a stale stored
+        # `address` would remain the inbound auth anchor (the very class P0
+        # exists to close). FAIL CLOSED: any resolver / TailscaleUnavailable
+        # error rejects the request (we never fall through to accept) and the
+        # check stays BEFORE the body is read off the socket.
+        try:
+            peer_addr = a2a.resolve_peer_address(peer)
+        except a2a.A2AError as exc:
+            audit("reject_addr_unresolved", peer=peer_id, client=client_ip,
+                  reason=getattr(exc, "code", "resolve_error"), security=True)
+            self._reply(403, {"ok": False, "error": "source address mismatch"})
+            return
         if not peer_addr or client_ip != peer_addr:
             audit("reject_addr_mismatch", peer=peer_id, client=client_ip,
                   expected=peer_addr, security=True)

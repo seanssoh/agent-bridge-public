@@ -22,6 +22,11 @@
 #   (f) Tailscale unavailable + identity                     -> fail closed
 #   (g) bind happy-path: identity resolves to an in-set IP   -> bind allowed
 #   (h) legacy raw-address bind unchanged (in-set ok / out-of-set rejected)
+#   (i) RECEIVER inbound source-address gate (do_POST):           <-- security
+#       identity-only / identity-vs-stale peer resolves live; a request
+#       from the resolved IP is ACCEPTED, the stale literal address is
+#       NOT used (a request from it is REJECTED), and a resolver failure
+#       FAILS CLOSED (rejects) — never falls through to accept.
 
 set -euo pipefail
 
@@ -117,6 +122,11 @@ _resolve() {
 _bind() {
   BRIDGE_A2A_TAILSCALE_CLI="$MOCK_CLI" python3 "$HELPER" bind "$1"
 }
+# _recv_auth <client_ip> <peer-json> — drive do_POST's inbound source-address
+# gate (resolve sender peer -> compare to request source -> fail closed).
+_recv_auth() {
+  BRIDGE_A2A_TAILSCALE_CLI="$MOCK_CLI" python3 "$HELPER" recv-auth "$1" "$2"
+}
 
 # --- (a) resolve-by-tailscale_name ---
 case_a_name() {
@@ -209,6 +219,57 @@ case_h_bind_legacy_unchanged() {
     "(h) legacy raw-address listen NOT in the set is still rejected (unchanged)"
 }
 
+# --- (i) RECEIVER inbound source-address gate (do_POST) ---
+# THE inbound security assertion. The receiver must authenticate the source
+# IP against the sender peer's CURRENT resolved Tailscale IP, not a stored
+# literal. The mock resolves the peer to 100.76.208.4 while the config also
+# carries a STALE literal address 9.9.9.9.
+case_i_recv_source_auth() {
+  local got
+  # (i.1) identity-only peer (no literal address), request from the resolved
+  #       IP -> ACCEPT. Proves identity-only inbound config is now usable.
+  got="$(_recv_auth '100.76.208.4' '{"id":"cm-prod","tailscale_name":"cm-prod-agentworkflow-vm01"}')"
+  smoke_assert_eq "ACCEPT" "$got" \
+    "(i) identity-only peer: request from the resolved IP is accepted (identity-only inbound is usable)"
+
+  # (i.2) identity resolves to X (100.76.208.4) while a STALE literal
+  #       address Y (9.9.9.9) is also configured; request source == X -> ACCEPT.
+  #       Proves the receiver uses the RESOLVED current IP, not the stale literal.
+  got="$(_recv_auth '100.76.208.4' '{"id":"cm-prod","node_id":"peerStableID999","address":"9.9.9.9"}')"
+  smoke_assert_eq "ACCEPT" "$got" \
+    "(i) identity-vs-stale: request from the live-resolved IP is accepted (stale literal is NOT the anchor)"
+
+  # (i.3) SECURITY: request from the STALE literal address (9.9.9.9) is
+  #       REJECTED — the stale stored IP must never authenticate inbound.
+  got="$(_recv_auth '9.9.9.9' '{"id":"cm-prod","node_id":"peerStableID999","address":"9.9.9.9"}')"
+  smoke_assert_eq "REJECT:addr_mismatch" "$got" \
+    "(i) SECURITY: request from the STALE literal address is rejected (inbound stale-IP class closed)"
+
+  # (i.4) a request from an unrelated IP is REJECTED.
+  got="$(_recv_auth '203.0.113.7' '{"id":"cm-prod","node_id":"peerStableID999"}')"
+  smoke_assert_eq "REJECT:addr_mismatch" "$got" \
+    "(i) request from an unrelated source IP is rejected"
+
+  # (i.5) FAIL CLOSED: an identity that does not resolve -> REJECT (never
+  #       falls through to accept, even though a stale literal == client_ip).
+  got="$(_recv_auth '9.9.9.9' '{"id":"cm-prod","node_id":"doesNotExist","address":"9.9.9.9"}')"
+  smoke_assert_eq "REJECT:resolve_node_id_unknown" "$got" \
+    "(i) FAIL CLOSED: unresolvable identity rejects inbound even when the stale literal would match client_ip"
+
+  # (i.6) FAIL CLOSED: Tailscale unavailable + identity -> REJECT.
+  got="$(BRIDGE_A2A_TAILSCALE_CLI="$SMOKE_TMP_ROOT/no-such-tailscale" \
+    python3 "$HELPER" recv-auth '100.76.208.4' \
+    '{"id":"cm-prod","node_id":"peerStableID999","address":"100.76.208.4"}')"
+  smoke_assert_eq "REJECT:tailscale_unavailable" "$got" \
+    "(i) FAIL CLOSED: Tailscale unavailable + identity rejects inbound (no fall-through to the literal)"
+
+  # (i.7) legacy raw-address peer (no identity): request from the literal
+  #       address is ACCEPTED, unchanged back-compat for the inbound gate.
+  got="$(_recv_auth '100.64.0.20' '{"id":"legacy","address":"100.64.0.20"}')"
+  smoke_assert_eq "ACCEPT" "$got" \
+    "(i) legacy raw-address peer: inbound source-address gate unchanged (back-compat)"
+}
+
 main() {
   smoke_require_cmd python3
   smoke_setup_bridge_home "$SMOKE_NAME"
@@ -232,6 +293,7 @@ main() {
   smoke_run "(f) tailscale unavailable -> fail closed"      case_f_unavailable
   smoke_run "(g) bind identity happy-path"                  case_g_bind_identity_ok
   smoke_run "(h) legacy raw-address bind unchanged"         case_h_bind_legacy_unchanged
+  smoke_run "(i) receiver inbound source-auth (security)"   case_i_recv_source_auth
 
   smoke_log "PASS"
 }

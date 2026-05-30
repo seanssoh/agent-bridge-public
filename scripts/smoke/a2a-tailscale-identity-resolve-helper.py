@@ -13,6 +13,18 @@ Subcommands:
   bind <json-cfg>           print "<ip>:<port>", or ERR:<code> (runs the
                             FULL fail-closed bind proof — this is what
                             proves resolution did not weaken the proof)
+  recv-auth <client_ip> <json-peer>
+                            drive the receiver's do_POST() inbound
+                            source-address gate against the configured
+                            SENDER peer: resolve the peer's CURRENT
+                            Tailscale IP and compare it to the request's
+                            source IP. Prints "ACCEPT" when the resolved
+                            address equals client_ip, "REJECT:addr_mismatch"
+                            when it does not, or "REJECT:<code>" when the
+                            resolver fails (fail-closed). This mirrors the
+                            exact resolve + compare + fail-closed logic in
+                            bridge-handoffd.do_POST so the inbound stale-IP
+                            rejection is covered, not just the resolver.
 """
 from __future__ import annotations
 
@@ -61,6 +73,30 @@ def main(argv: list[str]) -> int:
             print(f"{bind}:{port}")
         except a2a.A2AError as exc:
             print(f"ERR:{exc.code}")
+        return 0
+
+    if cmd == "recv-auth":
+        # Exercise the receiver's inbound source-address gate exactly as
+        # bridge-handoffd.do_POST does: resolve the authenticated SENDER
+        # peer to its CURRENT Tailscale IP (NOT a stored/stale literal
+        # `address`) and compare to the request's source IP. FAIL CLOSED on
+        # any resolver error — never fall through to ACCEPT. This is the
+        # same three lines do_POST runs before reading the body; keeping it
+        # in lock-step here is what gives the smoke teeth on the inbound
+        # stale-IP class (resolve_peer_address resolving to X must accept a
+        # request from X and reject one from the stale literal Y).
+        client_ip = argv[1]
+        peer = json.loads(argv[2])
+        try:
+            peer_addr = a2a.resolve_peer_address(peer)
+        except a2a.A2AError as exc:
+            # fail-closed: resolver/Tailscale error -> reject the request
+            print(f"REJECT:{exc.code}")
+            return 0
+        if not peer_addr or client_ip != peer_addr:
+            print("REJECT:addr_mismatch")
+            return 0
+        print("ACCEPT")
         return 0
 
     print(f"unknown subcommand: {cmd}", file=sys.stderr)
