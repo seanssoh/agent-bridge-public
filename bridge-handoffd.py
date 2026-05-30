@@ -26,8 +26,10 @@ import argparse
 import ipaddress
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -39,6 +41,27 @@ import bridge_a2a_common as a2a
 # any parsing. Larger than the per-peer cap so an oversized body is
 # rejected with a clean 413 rather than truncated.
 ABSOLUTE_MAX_REQUEST_BYTES = 4 * 1024 * 1024
+
+# P-self-heal phase 1 (#1403): how often the running receiver re-resolves
+# its own bind + re-reads the config so a local-IP drift (after a tailnet
+# re-login) or a config edit (added/removed peer, allowlist/caps change)
+# is applied with NO manual `bridge-handoff-daemon.sh restart`. Overridable
+# via BRIDGE_A2A_RECONCILE_INTERVAL (seconds); 0 disables the periodic timer
+# (a SIGHUP-triggered reconcile still works). Default 45s — the middle of
+# the 30-60s band.
+DEFAULT_RECONCILE_INTERVAL_SECONDS = 45
+
+
+def _reconcile_interval() -> int:
+    """Resolve the reconcile cadence (seconds). 0 disables the timer."""
+    raw = os.environ.get("BRIDGE_A2A_RECONCILE_INTERVAL", "")
+    if raw == "":
+        return DEFAULT_RECONCILE_INTERVAL_SECONDS
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_RECONCILE_INTERVAL_SECONDS
+    return max(0, val)
 
 
 def log(msg: str) -> None:
@@ -223,6 +246,138 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
 
 
 # --------------------------------------------------------------------------
+# Self-heal reconcile (P-self-heal phase 1, #1403)
+# --------------------------------------------------------------------------
+#
+# A running receiver caches its config + binds its socket at startup. Two
+# things then go stale until a manual restart:
+#   1. The LOCAL node's Tailscale IP changes (after a tailnet re-login) →
+#      the socket is stranded on the dead IP. This is the 2026-05-30 incident
+#      (100.76.208.4 → 100.83.90.26): inbound from the peer kept getting
+#      rejected until a manual `bridge-handoff-daemon.sh restart`.
+#   2. A config edit (added/removed peer, allowlist/caps change, identity
+#      migration) is not seen by the daemon, which cached the config at boot.
+#
+# The reconcile closes both, FAIL-CLOSED:
+#   - Re-load + validate the config; on ANY error keep the last-good config
+#     (never drop the allowlist / peer table to a half-parsed value).
+#   - Re-resolve + RE-PROVE the bind through the UNCHANGED resolve_bind()
+#     proof (candidate ∈ `tailscale ip` set; refuse wildcard/loopback;
+#     refuse if Tailscale unavailable). If the proven bind changed, signal a
+#     rebind; the serve loop tears down the old socket and re-creates the
+#     listener on the NEW (already-proven) address. A rebind that fails to
+#     bind keeps the current (proven) listener.
+#
+# The rebind goes through the SAME fail-closed proof as startup — there is
+# no path here that binds an address not proven in `tailscale ip`'s set, and
+# a reconcile failure always falls back to "keep serving on the current
+# proven bind", never to an unproven one.
+
+
+class ReconcileResult:
+    """Outcome of one reconcile pass — for logging + the manual CLI."""
+
+    def __init__(self) -> None:
+        self.config_reloaded = False
+        self.config_error: str = ""
+        self.want_rebind = False
+        self.old_bind: str = ""
+        self.old_port: int = 0
+        self.new_bind: str = ""
+        self.new_port: int = 0
+        self.bind_error: str = ""
+
+    def summary(self) -> str:
+        parts: list[str] = []
+        if self.config_reloaded:
+            parts.append("config=reloaded")
+        elif self.config_error:
+            parts.append(f"config=kept-last-good({self.config_error})")
+        else:
+            parts.append("config=unchanged")
+        if self.want_rebind:
+            parts.append(
+                f"rebind old={self.old_bind}:{self.old_port} "
+                f"new={self.new_bind}:{self.new_port}")
+        elif self.bind_error:
+            parts.append(
+                f"bind=kept-current({self.bind_error}) "
+                f"current={self.old_bind}:{self.old_port}")
+        else:
+            parts.append(f"bind=unchanged({self.old_bind}:{self.old_port})")
+        return " ".join(parts)
+
+    def changed(self) -> bool:
+        return self.config_reloaded or self.want_rebind
+
+
+def reconcile_once(server: "HandoffServer",
+                   config_path: Optional[Path]) -> ReconcileResult:
+    """Run one self-heal reconcile decision against a live `server`.
+
+    This is a PURE decision step — it does NOT itself swap the socket (that
+    must happen in the serve loop, which owns serve_forever). It:
+      1. Re-loads + validates the config; on success the validated config is
+         published to the handlers via server.swap_cfg (hot-reload). On any
+         failure the last-good config is kept (fail-closed) and the error is
+         recorded + audited.
+      2. Re-resolves + RE-PROVES the bind via resolve_bind(); if the proven
+         bind differs from the live socket's address, sets want_rebind +
+         new_bind/new_port. On any proof failure (Tailscale unavailable,
+         candidate not in the tailnet set, …) it keeps the current bind and
+         records the error — NEVER an unproven address.
+
+    Never raises for an operational failure; the daemon keeps serving.
+    """
+    result = ReconcileResult()
+    result.old_bind = server.bound_address
+    result.old_port = server.bound_port
+
+    # --- 1. config hot-reload (fail-closed) ---
+    new_cfg: Optional[dict[str, Any]] = None
+    try:
+        candidate = a2a.load_config(config_path)
+        # Re-run the SAME startup secret gate: a reload that introduces an
+        # unprovisioned peer must NOT silently disarm HMAC. Keep last-good.
+        a2a.validate_config_peer_secrets(candidate, side="receiver")
+        new_cfg = candidate
+    except a2a.A2AError as exc:
+        result.config_error = exc.code
+        audit("reconcile_config_kept", code=exc.code, detail=str(exc)[:200],
+              security=True)
+
+    # --- 2. re-resolve + RE-PROVE the bind (fail-closed) ---
+    # Use the freshly-validated config when available, else the live one (so a
+    # bad config reload never blocks the bind self-heal from re-proving the
+    # bind against the last-good config).
+    proof_cfg = new_cfg if new_cfg is not None else server.cfg
+    try:
+        proven_bind, proven_port = resolve_bind(proof_cfg)
+        result.new_bind = proven_bind
+        result.new_port = proven_port
+        if proven_bind != server.bound_address or proven_port != server.bound_port:
+            result.want_rebind = True
+    except a2a.A2AError as exc:
+        # Bind could not be re-proven (Tailscale unavailable, resolved
+        # candidate not in `tailscale ip`, …) → KEEP the current already-proven
+        # bind. We never bind to an address that did not pass the proof.
+        result.bind_error = exc.code
+        result.new_bind = server.bound_address
+        result.new_port = server.bound_port
+        audit("reconcile_bind_kept", code=exc.code, detail=str(exc)[:200],
+              current_bind=server.bound_address, security=True)
+
+    # --- 3. publish the validated config LAST ---
+    # Done after the bind decision so both used a consistent snapshot. Only
+    # swap when the reload succeeded; a malformed reload keeps last-good.
+    if new_cfg is not None:
+        server.swap_cfg(new_cfg)
+        result.config_reloaded = True
+
+    return result
+
+
+# --------------------------------------------------------------------------
 # Enqueue boundary — call the EXISTING bridge-task.sh create
 # --------------------------------------------------------------------------
 
@@ -302,7 +457,30 @@ class HandoffServer(ThreadingHTTPServer):
 
     def __init__(self, addr, handler, cfg: dict[str, Any]) -> None:
         super().__init__(addr, handler)
+        # `cfg` is read per request by do_POST via `self.server.cfg`. The
+        # reconcile path swaps it atomically (a single attribute rebind is
+        # atomic under CPython, so an in-flight do_POST always sees either the
+        # whole old config or the whole new one — never a half-applied table).
+        # `_cfg_lock` guards only the validate-then-swap so a malformed reload
+        # can never replace the live allowlist / caps with a half-parsed dict.
         self.cfg = cfg
+        self._cfg_lock = threading.Lock()
+        # The address/port this socket is actually bound to. The reconcile
+        # compares the freshly-resolved+proven bind against this to detect a
+        # local-IP drift; set from the real bound address by cmd_serve.
+        self.bound_address: str = addr[0]
+        self.bound_port: int = addr[1]
+
+    def swap_cfg(self, new_cfg: dict[str, Any]) -> None:
+        """Publish an ALREADY-VALIDATED config to the request handlers.
+
+        The caller (reconcile_once) only reaches here after load_config +
+        validate_config_peer_secrets succeed, so the live allowlist / caps /
+        peer table is never replaced by a half-parsed or unprovisioned
+        config. The swap itself is a single atomic attribute rebind.
+        """
+        with self._cfg_lock:
+            self.cfg = new_cfg
 
 
 class HandoffHandler(BaseHTTPRequestHandler):
@@ -703,6 +881,38 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    """Preview one reconcile pass without touching a running daemon.
+
+    Loads + validates the config (fail-closed report) and re-resolves +
+    RE-PROVES the bind via the same resolve_bind() proof the running daemon
+    uses. Prints what a live reconcile WOULD do — useful for the setup wizard
+    + operators to confirm the current Tailscale identity resolves to an
+    in-set bind before/after an IP change. The running daemon self-heals on
+    its own timer (and on SIGHUP); this is the visibility surface.
+    """
+    config_path = Path(args.config) if args.config else None
+    # --- config validity (fail-closed report) ---
+    try:
+        cfg = a2a.load_config(config_path)
+        a2a.validate_config_peer_secrets(cfg, side="receiver")
+        peers = len(cfg.get("peers", []))
+        print(f"[handoffd][reconcile] config OK: {peers} peer(s) configured")
+    except a2a.A2AError as exc:
+        print(f"[handoffd][reconcile] config FAIL: {exc} ({exc.code}) — a "
+              "running daemon would keep its last-good config", file=sys.stderr)
+        return 1
+    # --- bind re-prove (same proof as the running daemon) ---
+    try:
+        bind, port = resolve_bind(cfg)
+        print(f"[handoffd][reconcile] bind proven: would serve on {bind}:{port}")
+    except a2a.A2AError as exc:
+        print(f"[handoffd][reconcile] bind FAIL: {exc} ({exc.code}) — a "
+              "running daemon would keep its current proven bind", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _write_pidfile(path: str) -> None:
     """Record the calling process's pid to `path` (atomic replace)."""
     pid_path = Path(path)
@@ -786,11 +996,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     audit("listening", address=bind, port=port,
           peers=len(cfg.get("peers", [])), pid=os.getpid())
     log(f"A2A receiver listening on {bind}:{port}")
+    config_path = Path(args.config) if args.config else None
     try:
         if args.once:
+            # Single-request test mode: no reconcile supervisor (the smoke
+            # drives reconcile_once directly).
             server.handle_request()
         else:
-            server.serve_forever()
+            serve_with_reconcile(server, config_path)
     except KeyboardInterrupt:
         log("interrupted")
     finally:
@@ -804,6 +1017,106 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 pass
         audit("stopped")
     return 0
+
+
+def serve_with_reconcile(server: "HandoffServer",
+                         config_path: Optional[Path]) -> None:
+    """Run the receiver with the periodic + SIGHUP self-heal reconcile.
+
+    `serve_forever()` runs on a worker thread so the main thread can wake on
+    the reconcile cadence (and on SIGHUP) to call `reconcile_once`. When a
+    reconcile proves a NEW bind, the old listener is shut down and a fresh
+    HandoffServer is created on the new (already-proven) address; the new
+    server inherits the swapped config. A rebind that cannot bind the new
+    socket keeps the old listener (fail-safe).
+    """
+    interval = _reconcile_interval()
+    wake = threading.Event()
+
+    # SIGHUP triggers an immediate reconcile (operator / wizard `kill -HUP`).
+    # Only install the handler on the main thread (signals can only be set
+    # from the main thread); the detached daemon's serve loop IS the main
+    # thread here.
+    def _on_sighup(_signum: int, _frame: Any) -> None:
+        wake.set()
+    try:
+        signal.signal(signal.SIGHUP, _on_sighup)
+    except (ValueError, OSError):
+        # Not on the main thread or platform without SIGHUP — periodic timer
+        # still works; just no signal trigger.
+        pass
+
+    # Hold the live server in a one-element list so the rebind can replace it
+    # for both the worker thread and this loop.
+    holder: list[HandoffServer] = [server]
+
+    def _run_forever(srv: HandoffServer) -> None:
+        try:
+            srv.serve_forever()
+        except Exception as exc:  # noqa: BLE001 - worker guard, surfaced via log
+            log(f"serve_forever exited unexpectedly: {exc}")
+
+    worker = threading.Thread(target=_run_forever, args=(server,),
+                              name="a2a-serve", daemon=True)
+    worker.start()
+
+    if interval <= 0:
+        log("reconcile timer disabled (BRIDGE_A2A_RECONCILE_INTERVAL=0); "
+            "SIGHUP still triggers a reconcile")
+
+    while True:
+        # Wake on the interval OR an immediate SIGHUP. When the timer is
+        # disabled, block until a SIGHUP sets the event.
+        if interval > 0:
+            wake.wait(timeout=interval)
+        else:
+            wake.wait()
+        wake.clear()
+
+        cur = holder[0]
+        if not worker.is_alive():
+            # The listener thread died (should not happen) — stop cleanly so
+            # the supervisor (cron/launchd) can relaunch.
+            log("serve worker is no longer alive; stopping reconcile loop")
+            break
+
+        result = reconcile_once(cur, config_path)
+        if result.changed() or result.bind_error or result.config_error:
+            audit("reconcile", summary=result.summary())
+            log(f"reconcile: {result.summary()}")
+
+        if not result.want_rebind:
+            continue
+
+        # --- perform the actual socket swap on the new (proven) bind ---
+        old = holder[0]
+        new_addr, new_port = result.new_bind, result.new_port
+        try:
+            new_server = HandoffServer((new_addr, new_port),
+                                       old.RequestHandlerClass, old.cfg)
+        except OSError as exc:
+            # New address not bindable yet (e.g. not plumbed) → KEEP the old
+            # listener. We never end up unbound or on an unproven address.
+            audit("rebind_fail", address=new_addr, port=new_port,
+                  detail=str(exc)[:200], current_bind=old.bound_address,
+                  security=True)
+            log(f"rebind to {new_addr}:{new_port} failed ({exc}); "
+                f"keeping current bind {old.bound_address}:{old.bound_port}")
+            continue
+
+        # Bring up the new listener BEFORE tearing the old one down so there is
+        # no window with zero listeners.
+        new_worker = threading.Thread(target=_run_forever, args=(new_server,),
+                                      name="a2a-serve", daemon=True)
+        new_worker.start()
+        holder[0] = new_server
+        worker = new_worker
+        audit("rebind", old=f"{old.bound_address}:{old.bound_port}",
+              new=f"{new_addr}:{new_port}")
+        log(f"rebind old={old.bound_address}:{old.bound_port} "
+            f"new={new_addr}:{new_port}")
+        old.shutdown()
+        old.server_close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -828,6 +1141,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_pre = sub.add_parser("preflight", help="validate bind + config, then exit")
     p_pre.add_argument("--config", default=None)
     p_pre.set_defaults(func=cmd_preflight)
+
+    p_rec = sub.add_parser(
+        "reconcile",
+        help="preview one self-heal reconcile pass (resolve+prove bind, "
+             "validate config) without touching a running daemon")
+    p_rec.add_argument("--config", default=None)
+    p_rec.set_defaults(func=cmd_reconcile)
 
     return parser
 

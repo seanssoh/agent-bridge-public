@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import random
+import signal
 import socket
 import sys
 import time
@@ -838,6 +839,126 @@ def cmd_deliver(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# a2a reconcile (self-heal trigger + preview, P-self-heal-1, #1403)
+# --------------------------------------------------------------------------
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    """Trigger + preview one receiver self-heal reconcile (P-self-heal-1, #1403).
+
+    Two parts:
+      1. PREVIEW (always): validate the config, then run the SAME fail-closed
+         bind proof the receiver daemon performs at bind time by delegating to
+         `bridge-handoffd.py reconcile` (config load + `resolve_bind()`:
+         candidate ∈ `tailscale ip` set; refuse wildcard/loopback; refuse if
+         Tailscale unavailable). The preview therefore RE-PROVES the listen
+         candidate rather than merely resolving it — an out-of-tailnet-set
+         `listen.address` prints a `bind_not_tailnet` failure and exits
+         nonzero, exactly matching the daemon (codex r1 BLOCKING 2).
+      2. TRIGGER (if a daemon is running): send SIGHUP to the receiver pid so
+         the LIVE daemon runs an immediate reconcile (auto-rebind on local-IP
+         drift + config hot-reload) with no `bridge-handoff-daemon.sh restart`.
+
+    The preview never weakens the proof — it shares the daemon's proof code as
+    its single source, so the CLI can never drift looser. The running daemon
+    keeps serving on its current proven bind + last-good config on any
+    reconcile failure (see bridge-handoffd.py).
+    """
+    try:
+        cfg = a2a.load_config()
+    except a2a.A2AError as exc:
+        return die(str(exc)) or 1
+
+    rc = 0
+    # --- preview: config validity (fail-closed report) ---
+    try:
+        a2a.validate_config_peer_secrets(cfg, side="receiver")
+        info(f"config OK: {len(cfg.get('peers', []))} peer(s) configured")
+    except a2a.A2AError as exc:
+        err(f"config invalid: {exc} ({exc.code}) — a running daemon would keep "
+            "its last-good config (fail-closed)")
+        rc = 1
+
+    # --- preview: bind proof (DELEGATE to the receiver's real proof) ---
+    # codex r1 BLOCKING 2: this preview must run the SAME fail-closed bind
+    # proof the daemon performs at bind time — NOT a bare
+    # `resolve_peer_address`, which resolves the listen identity but never
+    # RE-PROVES the candidate is in this node's `tailscale ip` set. A bare
+    # resolve would print "listen resolves to <addr>" and exit 0 even for an
+    # address NOT in the tailnet set, contradicting the daemon's
+    # `bind_not_tailnet` refusal and weakening the "performs/prints one safe
+    # pass" claim. We delegate to `bridge-handoffd.py reconcile`, which loads
+    # the same config + runs the UNCHANGED `resolve_bind()` proof (candidate ∈
+    # `tailscale ip`; refuse wildcard/loopback; refuse if Tailscale
+    # unavailable) and exits nonzero with the structured failure. Single source
+    # of the proof — the CLI can never drift looser than the daemon.
+    handoffd = Path(__file__).resolve().parent / "bridge-handoffd.py"
+    if not handoffd.is_file():
+        err(f"cannot locate receiver bind-proof helper at {handoffd}; "
+            "skipping bind preview (a running daemon still RE-PROVES at "
+            "bind time)")
+        rc = 1
+    else:
+        import subprocess  # noqa: PLC0415 (only this path needs it)
+        cmd = [sys.executable, str(handoffd), "reconcile"]
+        # Thread an explicit --config through ONLY when the caller pinned one
+        # via BRIDGE_A2A_CONFIG, so the child resolves the identical config
+        # the parent's a2a.load_config() did. Otherwise let the child run its
+        # own default resolution (same code path).
+        cfg_override = os.environ.get("BRIDGE_A2A_CONFIG")
+        if cfg_override:
+            cmd += ["--config", cfg_override]
+        try:
+            proof = subprocess.run(  # noqa: PLW1510 (rc handled below)
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as exc:
+            err(f"could not run receiver bind proof ({handoffd.name}): {exc}")
+            rc = 1
+        else:
+            # Surface the receiver's own proof output verbatim (it carries the
+            # `bind proven: ...` line or the `bind FAIL: ... (bind_not_tailnet)`
+            # refusal). Route its stdout through info and stderr through err so
+            # the failure stays on the error stream + nonzero propagates.
+            for line in (proof.stdout or "").splitlines():
+                if line.strip():
+                    info(line)
+            for line in (proof.stderr or "").splitlines():
+                if line.strip():
+                    err(line)
+            if proof.returncode != 0:
+                # The daemon refuses to bind (e.g. bind_not_tailnet); the CLI
+                # preview must mirror that fail-closed verdict, not exit 0.
+                rc = 1
+
+    # --- trigger: SIGHUP the running receiver, if any ---
+    pid_file = a2a.handoff_dir() / "handoffd.pid"
+    pid: Optional[int] = None
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pid = None
+    if pid is not None:
+        try:
+            os.kill(pid, signal.SIGHUP)
+            info(f"sent SIGHUP to running receiver (pid {pid}) — immediate "
+                 "reconcile (auto-rebind on local-IP drift + config "
+                 "hot-reload); no restart needed")
+        except ProcessLookupError:
+            info("no running receiver (stale pidfile) — start it with "
+                 "`agent-bridge handoff start`; it self-heals on its own timer")
+        except OSError as exc:
+            err(f"could not signal receiver pid {pid}: {exc}")
+    else:
+        info("no running receiver pidfile — start it with "
+             "`agent-bridge handoff start`; the daemon self-heals on its timer")
+    return rc
+
+
+# --------------------------------------------------------------------------
 # argument parsing
 # --------------------------------------------------------------------------
 
@@ -886,6 +1007,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_deliver.add_argument("--lease", type=int, default=None)
     p_deliver.add_argument("--timeout", type=float, default=None)
     p_deliver.set_defaults(func=cmd_deliver)
+
+    p_reconcile = sub.add_parser(
+        "reconcile",
+        help="trigger + preview one receiver self-heal reconcile "
+             "(re-resolve+prove bind, config hot-reload via SIGHUP)")
+    p_reconcile.set_defaults(func=cmd_reconcile)
 
     return parser
 

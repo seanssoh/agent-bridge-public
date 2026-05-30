@@ -221,3 +221,35 @@ bridge_a2a_status() {
   fi
   echo "log           : $(bridge_a2a_log_file)"
 }
+
+# Trigger + preview one receiver self-heal reconcile (P-self-heal-1, #1403).
+# Sends SIGHUP to the running receiver so the LIVE daemon runs an immediate
+# reconcile (auto-rebind on local-IP drift + config hot-reload) with no
+# restart, then prints a preview of what a reconcile would resolve/prove via
+# `bridge-handoffd.py reconcile` (re-resolve + RE-PROVE the bind through the
+# unchanged fail-closed proof; validate the config). Both stay fail-closed:
+# a resolve/prove failure is reported, never silently bound; the running
+# daemon keeps its current proven bind + last-good config on any failure.
+bridge_a2a_reconcile() {
+  local repo_root config pid
+  repo_root="$(bridge_a2a_repo_root)"
+  config="$(bridge_a2a_config_path)"
+  if [[ ! -f "$config" ]]; then
+    echo "[a2a][error] config not found: $config" >&2
+    return 1
+  fi
+  if bridge_a2a_receiver_running; then
+    pid="$(bridge_a2a_receiver_pid)"
+    if kill -HUP "$pid" 2>/dev/null; then
+      echo "[a2a] sent SIGHUP to receiver (pid $pid) — immediate reconcile" \
+           "(auto-rebind on local-IP drift + config hot-reload); no restart"
+    else
+      echo "[a2a][warn] could not signal receiver pid $pid" >&2
+    fi
+  else
+    echo "[a2a] receiver not running — it self-heals on its own timer once started"
+  fi
+  # Preview the reconcile decision (fail-closed report) using the same proof
+  # the running daemon uses.
+  python3 "$repo_root/bridge-handoffd.py" reconcile --config "$config"
+}
