@@ -651,12 +651,38 @@ bridge_tmux_session_recent_keypress() {
   (( now - last_input < threshold ))
 }
 
+bridge_tmux_claude_is_generating() {
+  # Issue #1409 (upstream): true when a Claude Code session is mid-turn.
+  # Claude renders an "esc to interrupt" status line (alongside the spinner
+  # word + token counter, e.g. "· Imagining… (10m · ↓ 36.0k tokens)") ONLY
+  # while a turn is in flight; at a clean prompt the footer lacks it. A
+  # daemon nudge that lands in the composer while Claude is generating is
+  # NOT submitted — Claude Code holds the text until the current turn ends,
+  # the C-m is dropped, and the operator has to press Enter manually
+  # (audit: session_nudge_dropped reason=submit_lost_post_grace,
+  # idle_seconds=0). has_pending_input only sees composer text, not this
+  # mid-turn state, so the busy-gate needs an explicit check. Pure
+  # substring match on a short recent capture.
+  local session="$1"
+  local recent
+  recent="$(bridge_capture_recent "$session" 12 2>/dev/null || true)"
+  [[ "$recent" == *"esc to interrupt"* ]]
+}
+
 bridge_tmux_session_inject_busy() {
   local session="$1"
   local engine="$2"
   local grace="${3:-3}"
 
   if bridge_tmux_session_has_pending_input "$session" "$engine"; then
+    return 0
+  fi
+
+  # Issue #1409 (upstream): treat a mid-turn Claude session as busy so the
+  # send path spools/defers the nudge instead of injecting onto a composer
+  # Claude will not submit until the turn finishes. Re-delivery happens on
+  # a later pass once the session is back at a clean prompt.
+  if [[ "$engine" == "claude" ]] && bridge_tmux_claude_is_generating "$session"; then
     return 0
   fi
 

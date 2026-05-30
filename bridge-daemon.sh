@@ -2499,6 +2499,7 @@ process_a2a_outbox_stuck_scan_tick() {
     if "$target_bridge" task create \
          --to "$admin" --priority high --from daemon \
          --title "[A2A] outbox stuck: ${peer}:${target_agent} (${message_id:0:8})" \
+         --dedupe-prefix "[A2A] outbox stuck: ${peer}:${target_agent}" \
          --body-file "$body_file" --force >/dev/null 2>&1; then
       emitted=$((emitted + 1))
       # Codex r1 BLOCKING fix: stamp the ledger via ack helper at the
@@ -5644,6 +5645,7 @@ EOF
       if "$target_bridge" task create \
            --to "$admin_agent" --priority high --from daemon \
            --title "[unclaimed-task] #${task_id} on ${agent} (${age_minutes}m)" \
+           --dedupe-prefix "[unclaimed-task] #${task_id} on ${agent}" \
            --body-file "$body_file" >/dev/null 2>&1; then
         bridge_audit_log daemon task_unclaimed_escalated "$admin_agent" \
           --detail task_id="$task_id" \

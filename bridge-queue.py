@@ -907,6 +907,50 @@ def cmd_create(args: argparse.Namespace) -> int:
         if body_text is None:
             body_text = inline_text
 
+    dedupe_prefix = getattr(args, "dedupe_prefix", None)
+    if dedupe_prefix:
+        # Issue #1408 (upstream): refresh-or-create a single OPEN alert
+        # keyed on title prefix instead of creating a duplicate every
+        # cooldown window. The daemon's A2A-stuck and unclaimed-task
+        # families used plain create, so a condition that persisted for
+        # hours (peer offline over a weekend, transiently-unclaimed task)
+        # accumulated dozens-to-hundreds of duplicate admin tasks. The
+        # blocked-aging family already dedupes this way via
+        # upsert_open_task(); route alert creates through the same path.
+        # Body is inlined as text (refresh clears body_path), which is
+        # fine for the small alert bodies these families emit.
+        with closing(connect()) as conn, conn:
+            task_id, created = upsert_open_task(
+                conn,
+                agent=args.assigned_to,
+                title_prefix=dedupe_prefix,
+                title=args.title.strip(),
+                priority=args.priority,
+                actor=actor,
+                body_text=body_text or "",
+                current_ts=created_ts,
+                refresh_note=f"daemon refreshed open alert ({dedupe_prefix})",
+            )
+        if args.format == "shell":
+            fields = {
+                "TASK_ID": task_id,
+                "TASK_TITLE": args.title.strip(),
+                "TASK_ASSIGNED_TO": args.assigned_to,
+                "TASK_CREATED_BY": actor,
+                "TASK_PRIORITY": args.priority,
+                "TASK_BODY_PATH": "",
+                "TASK_BODY_TEXT": body_text or "",
+            }
+            for key, value in fields.items():
+                print(f"{key}={shlex.quote(str(value))}")
+            return 0
+        verb = "created" if created else "refreshed"
+        print(
+            f"{verb} task #{task_id} for {args.assigned_to} "
+            f"[{args.priority}] {args.title.strip()}"
+        )
+        return 0
+
     with closing(connect()) as conn, conn:
         cursor = conn.execute(
             """
@@ -2608,6 +2652,17 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--priority", choices=PRIORITY_CHOICES, default="normal")
     create_parser.add_argument("--format", choices=("text", "shell"), default="text")
     create_parser.add_argument("--allow-empty-body", action="store_true")
+    create_parser.add_argument(
+        "--dedupe-prefix",
+        dest="dedupe_prefix",
+        default=None,
+        help=(
+            "If set, refresh an existing OPEN task for --to whose title "
+            "starts with this prefix instead of creating a duplicate "
+            "(Issue #1408: keeps daemon alert families to one live admin "
+            "alert per condition instead of flooding the inbox)."
+        ),
+    )
     body_group = create_parser.add_mutually_exclusive_group()
     body_group.add_argument("--body")
     body_group.add_argument("--body-file")

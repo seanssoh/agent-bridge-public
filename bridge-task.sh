@@ -31,7 +31,7 @@ ensure_roster_loaded() {
 usage() {
   cat <<EOF
 Usage:
-  bash $SCRIPT_DIR/bridge-task.sh create --to <agent> --title <title> [--body <text> | --body-file <path>] [--allow-empty-body] [--from <agent>] [--priority low|normal|high|urgent] [--force]
+  bash $SCRIPT_DIR/bridge-task.sh create --to <agent> --title <title> [--body <text> | --body-file <path>] [--allow-empty-body] [--from <agent>] [--priority low|normal|high|urgent] [--force] [--dedupe-prefix <prefix>]
   bash $SCRIPT_DIR/bridge-task.sh inbox [agent] [--all]
   bash $SCRIPT_DIR/bridge-task.sh show <task-id>
   bash $SCRIPT_DIR/bridge-task.sh claim <task-id> [--agent <agent>] [--lease <seconds>] [--note <text> | --note-file <path>]
@@ -327,6 +327,7 @@ cmd_create() {
   local allow_empty_body=0
   local skip_companion_validate=0
   local force=0
+  local dedupe_prefix=""
   local guard_threshold=""
   local guard_shell=""
   local severity=""
@@ -390,6 +391,16 @@ cmd_create() {
         # downtime, etc.) — the audit log still records the create.
         force=1
         shift
+        ;;
+      --dedupe-prefix)
+        # Issue #1408 (upstream): when set, refresh an existing OPEN task
+        # for --to whose title starts with this prefix instead of creating
+        # a duplicate. Used by the daemon's A2A-stuck and unclaimed-task
+        # alert families so a persistent condition keeps a single live
+        # admin alert (refresh-in-place) rather than flooding the inbox.
+        [[ $# -lt 2 ]] && bridge_die "--dedupe-prefix 뒤에 prefix를 지정하세요."
+        dedupe_prefix="$2"
+        shift 2
         ;;
       -h|--help)
         usage
@@ -540,6 +551,9 @@ Bypass with --skip-companion-validate (or BRIDGE_TASK_SKIP_COMPANION_VALIDATE=1)
   fi
   if [[ "$allow_empty_body" -eq 1 ]]; then
     args+=(--allow-empty-body)
+  fi
+  if [[ -n "$dedupe_prefix" ]]; then
+    args+=(--dedupe-prefix "$dedupe_prefix")
   fi
 
   bridge_queue_source_shell "${args[@]}" --format shell
