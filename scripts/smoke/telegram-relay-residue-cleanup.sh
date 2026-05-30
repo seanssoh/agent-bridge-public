@@ -163,7 +163,7 @@ assert_symlink_safety() {
   rm -f "$BRIDGE_HOME/lib/telegram-relay.py"
   ln -s /etc/passwd "$BRIDGE_HOME/lib/telegram-relay.py"
   # Snapshot inode so we can prove /etc/passwd was not deleted/replaced.
-  target_passwd="$(stat -f '%i' /etc/passwd 2>/dev/null || stat -c '%i' /etc/passwd)"
+  target_passwd="$(stat -c '%i' /etc/passwd 2>/dev/null || stat -f '%i' /etc/passwd)"
 
   json="$(python3 "$CLEANUP_PY" --target-root "$BRIDGE_HOME" --json)"
   skipped="$(json_field "$json" 'payload["prune_skipped"]')"
@@ -172,7 +172,7 @@ assert_symlink_safety() {
   [[ -L "$BRIDGE_HOME/lib/telegram-relay.py" ]] || smoke_fail "symlink must still exist (refused, not deleted)"
   [[ -r /etc/passwd ]] || smoke_fail "/etc/passwd must remain readable"
   local now_inode
-  now_inode="$(stat -f '%i' /etc/passwd 2>/dev/null || stat -c '%i' /etc/passwd)"
+  now_inode="$(stat -c '%i' /etc/passwd 2>/dev/null || stat -f '%i' /etc/passwd)"
   smoke_assert_eq "$target_passwd" "$now_inode" "/etc/passwd inode unchanged"
 
   # Cleanup the symlink so subsequent assertions start from a known shape.

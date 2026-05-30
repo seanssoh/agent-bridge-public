@@ -84,6 +84,16 @@ smoke_require_cmd python3
 smoke_setup_bridge_home "$SMOKE_NAME"
 REPO_ROOT="$SMOKE_REPO_ROOT"
 
+# BRIDGE_BASH_BIN is used by T7/T7b/T8/T8b to invoke child scripts but was
+# never defined here — under `set -u` the first expansion died inside the
+# `$(...)` subshell (exit 1, empty output), surfacing as the misleading
+# "T7: bootstrap-memory-system.sh --apply rc=1 out:" with no stderr. The
+# smoke already re-execs into a bash 4+ interpreter at the top, so the
+# running `bash` on PATH is the right child interpreter. Honor an inherited
+# override, else resolve it (sibling pattern: B-beta4-setup-wizard.sh).
+BRIDGE_BASH_BIN="${BRIDGE_BASH_BIN:-$(command -v bash)}"
+export BRIDGE_BASH_BIN
+
 # ----------------------------------------------------------------------------
 # T1 (#1280 positive): bridge-queue.py:stabilize_body_file falls back to
 # `_sudo_read_body_file` on PermissionError. We exercise the helper
@@ -374,6 +384,19 @@ fi
 # BRIDGE_WIKI_GRAPH_ENABLED but the operator's shell may have leaked
 # it). With no env and no prior report, the gate fires.
 unset BRIDGE_WIKI_GRAPH_ENABLED
+
+# smoke_setup_bridge_home leaves agent-roster.local.sh empty. Any real
+# install reaching bootstrap-memory-system.sh has an admin set (init
+# writes it), and the script's admin-discovery does
+# `grep ... BRIDGE_ADMIN_AGENT_ID | head | sed` under `set -euo
+# pipefail` — on an empty roster the grep finds nothing, exits 1, and
+# pipefail+set-e abort the whole script (rc=1, zero output → the
+# misleading "T7 ... rc=1 out:"). Seed a minimal admin so the roster
+# matches a real install. (See report: bootstrap-memory-system.sh:60 is
+# also fragile on a genuinely admin-less roster — flagged as a separate
+# product robustness follow-up, not changed on the stable cut.)
+printf 'BRIDGE_ADMIN_AGENT_ID="patch"\n' >"$BRIDGE_ROSTER_LOCAL_FILE"
+
 T7_OUT=""
 T7_RC=0
 T7_OUT="$("$BRIDGE_BASH_BIN" "$REPO_ROOT/bootstrap-memory-system.sh" --apply 2>&1)" || T7_RC=$?
@@ -388,9 +411,21 @@ smoke_log "T7 ok: fresh install short-circuit fired with structured marker + adv
 # T7b: bridge-bootstrap.sh --dry-run --json carries the wiki_graph object.
 T7B_OUT=""
 T7B_RC=0
+# bridge-bootstrap.sh runs the engine-presence preflight
+# (bridge_init_require_command "$engine" → `command -v`). The Linux CI
+# host has no real `claude` binary on PATH (the macOS dev host does,
+# which is why this passed locally but failed on CI). --dry-run --json
+# never invokes the engine — it only needs it to resolve as present —
+# so stub the engine on PATH for this one invocation.
+T7B_STUB_DIR="$SMOKE_TMP_ROOT/t7b-engine-stub"
+mkdir -p "$T7B_STUB_DIR"
+for _eng in claude codex; do
+  printf '#!/bin/sh\necho "%s 0.0.0-smoke-stub"\nexit 0\n' "$_eng" >"$T7B_STUB_DIR/$_eng"
+  chmod +x "$T7B_STUB_DIR/$_eng"
+done
 # We pass --skip-* flags to keep the dry-run hermetic in the smoke
 # tmpdir; --json is the structured surface we assert on.
-T7B_OUT="$(BRIDGE_BOOTSTRAP_OS=Linux "$BRIDGE_BASH_BIN" "$REPO_ROOT/bridge-bootstrap.sh" \
+T7B_OUT="$(PATH="$T7B_STUB_DIR:$PATH" BRIDGE_BOOTSTRAP_OS=Linux "$BRIDGE_BASH_BIN" "$REPO_ROOT/bridge-bootstrap.sh" \
   --skip-shell-integration --skip-tmux-ux --skip-daemon \
   --skip-launchagent --skip-systemd --skip-liveness \
   --skip-watchdog-silence \

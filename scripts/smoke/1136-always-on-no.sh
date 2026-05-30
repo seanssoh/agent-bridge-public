@@ -356,6 +356,17 @@ main() {
   smoke_require_cmd python3
   smoke_require_cmd bash
   smoke_setup_bridge_home "$SMOKE_NAME"
+  # CI runners / clean test hosts ship no engine npm package; `agent add
+  # --engine <e>` runs a `command -v <e>` pre-flight (#1317-C) that hard-dies
+  # otherwise. Seed executable engine stubs + prepend to PATH (the agent-doctor
+  # #1397 pattern) so the create reaches the always-on/intent logic under test.
+  _stub_engine_dir="$SMOKE_TMP_ROOT/stub-engine-bin"
+  mkdir -p "$_stub_engine_dir"
+  for _eng in claude codex; do
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$_stub_engine_dir/$_eng"
+    chmod +x "$_stub_engine_dir/$_eng"
+  done
+  export PATH="$_stub_engine_dir:$PATH"
   smoke_run "T1: --always-on no + --idle-timeout 900 persists + intent" test_t1_always_on_no_with_positive_idle_timeout
   smoke_run "T2: --always-on no without --idle-timeout rejects"         test_t2_always_on_no_requires_idle_timeout
   smoke_run "T3: --always-on no + --idle-timeout 0 rejects"             test_t3_always_on_no_zero_idle_timeout_rejected

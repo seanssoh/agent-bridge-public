@@ -321,7 +321,7 @@ _psw_rotation_lock_dir() {
 _psw_rotation_lock_mtime() {
     local path="$1" mtime=0
     if [[ -e "$path" ]]; then
-        mtime="$(stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null || printf '0')"
+        mtime="$(stat -c %Y "$path" 2>/dev/null || stat -f %m "$path" 2>/dev/null || printf '0')"
     fi
     [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
     printf '%s' "$mtime"

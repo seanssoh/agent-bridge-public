@@ -265,10 +265,21 @@ if [[ "$T5_ALL" != *"manual-required"* ]]; then
   smoke_fail "T5: expected 'manual-required' line in init output, got: $T5_ALL"
 fi
 
-# Assert: verifier reason is exposed in stdout.
-if [[ "$T5_STDOUT_CONTENT" != *"daemon_group_refresh_sudoers=missing"* ]]; then
-  printf '%s\n' "$T5_STDOUT_CONTENT" >&2
-  smoke_fail "T5: expected 'daemon_group_refresh_sudoers=missing' status row in init stdout"
+# Assert: verifier reason is exposed on STDERR. bridge-init.sh routes the
+# entire `[init]` diagnostic block (including the
+# `daemon_group_refresh_sudoers=<status>` row) to stderr by the #1230
+# (v0.15.0-beta4) contract: bridge-bootstrap.sh captures bridge-init.sh
+# stdout via `$()` and parses it as JSON (`bridge-bootstrap.sh:180`), so any
+# non-JSON line on stdout poisons that parse. The sibling success row
+# (`daemon_group_refresh_sudoers=ok`) and the human-readable
+# `manual-required` line are all on stderr too — this token is a diagnostic,
+# not a stdout return-channel value here. (Contrast T6: the `agent-bridge`
+# CLI apply/check path deliberately emits this token on STDOUT as its
+# machine-readable return channel, and routes only the human remediation to
+# stderr — two different, intentional contracts for two entry points.)
+if [[ "$T5_STDERR_CONTENT" != *"daemon_group_refresh_sudoers=missing"* ]]; then
+  printf '%s\n' "$T5_STDERR_CONTENT" >&2
+  smoke_fail "T5: expected 'daemon_group_refresh_sudoers=missing' status row in init stderr"
 fi
 
 smoke_log "T5 ok: bridge-init.sh sudoers gating prints manual-required + NO 'installed' contradiction"

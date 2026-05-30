@@ -244,7 +244,16 @@ fi
 if ! grep -F 'BRIDGE_DAEMON_LAST_STEP="a2a_deliver_tick"' "$DAEMON_SH" >/dev/null; then
   T4_FAILS+="cmd_sync_cycle does not set LAST_STEP=a2a_deliver_tick; "
 fi
-if ! grep -F 'process_a2a_deliver_tick || true' "$DAEMON_SH" >/dev/null; then
+# Issue #1338 wrapped the deliver-tick call in a defense-in-depth subshell:
+# `( process_a2a_deliver_tick ) || true` (matching the sibling
+# start_cron_dispatch_workers / process_a2a_outbox_stuck_scan_tick calls).
+# Accept either the bare or subshell-wrapped invocation so this assertion
+# tracks the wiring (tick runs each sync cycle) rather than the exact
+# syntax. Anchor to the start of an executable line (`^[[:space:]]*` with
+# the call token immediately after) so a commented-out or echo'd mention
+# (e.g. `# ( process_a2a_deliver_tick ) || true`) does NOT satisfy it —
+# deleting OR commenting the real wiring must still trip the assertion.
+if ! grep -Eq '^[[:space:]]*\(?[[:space:]]*process_a2a_deliver_tick[[:space:]]*\)?[[:space:]]*\|\|[[:space:]]*true' "$DAEMON_SH"; then
   T4_FAILS+="process_a2a_deliver_tick not invoked from cmd_sync_cycle; "
 fi
 
@@ -363,7 +372,13 @@ fi
 if ! grep -F 'BRIDGE_DAEMON_LAST_STEP="a2a_stuck_scan_tick"' "$DAEMON_SH" >/dev/null; then
   T6_FAILS+="cmd_sync_cycle does not set LAST_STEP=a2a_stuck_scan_tick; "
 fi
-if ! grep -F 'process_a2a_outbox_stuck_scan_tick || true' "$DAEMON_SH" >/dev/null; then
+# Issue #1338 wrapped the stuck-scan-tick call in a defense-in-depth subshell:
+# `( process_a2a_outbox_stuck_scan_tick ) || true` (same pattern as the
+# deliver-tick T4 assertion above). Accept either the bare or subshell-
+# wrapped invocation so this tracks the wiring rather than the exact
+# syntax. Anchored to the start of an executable line (see T4) so a
+# commented-out/echo'd mention does NOT satisfy the assertion.
+if ! grep -Eq '^[[:space:]]*\(?[[:space:]]*process_a2a_outbox_stuck_scan_tick[[:space:]]*\)?[[:space:]]*\|\|[[:space:]]*true' "$DAEMON_SH"; then
   T6_FAILS+="stuck scan tick not invoked from cmd_sync_cycle; "
 fi
 # T6d — audit row name `a2a_outbox_stuck_alert_emitted` present.

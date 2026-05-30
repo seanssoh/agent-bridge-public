@@ -62,6 +62,13 @@ if [[ -n "${_BRIDGE_DAEMON_CONTROL_SOURCED:-}" ]]; then
 fi
 _BRIDGE_DAEMON_CONTROL_SOURCED=1
 
+# Issue #1388: the singleton-lock fd number, recorded by
+# bridge_daemon_ensure_singleton on a successful flock acquire so the
+# daemon's agent-launch path can close it for the spawned tmux server
+# (close-for-child) without ever releasing the daemon's own hold. Empty
+# until acquired, and on the mkdir-fallback backend (no fd to leak).
+BRIDGE_DAEMON_SINGLETON_LOCK_FD="${BRIDGE_DAEMON_SINGLETON_LOCK_FD:-}"
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -1081,13 +1088,36 @@ _bridge_daemon_singleton_cmdline() {
 #
 # Process-lifetime hold + nohup'd children: the lock fd is opened with
 # `exec {lock_fd}>...` so it is inherited by `nohup &` children
-# (silence-watchdog, queue-gateway-socket-listener). The brief accepts
-# this — those children's lifetime is intentionally bounded by the
-# daemon process (they exit when the daemon exits), so the lock is
-# released no later than the daemon process exits. Any child that
-# outlives the daemon is a separate bug class (orphan reaper) and
-# would block the next daemon start until the orphan is reaped — that
-# is the correct safety behavior for the daemon-singleton contract.
+# (silence-watchdog, queue-gateway-socket-listener). Those children's
+# lifetime is intentionally bounded by the daemon process (they exit
+# when the daemon exits), so the lock is released no later than the
+# daemon process exits.
+#
+# Issue #1388 — the dangerous exception is the agent-launch path. When
+# the daemon spawns an agent via `bridge-start.sh`, the chain ends in
+# `tmux new-session`, and the tmux SERVER process daemonizes (reparents
+# to PPID 1) and lives FOREVER, independent of this daemon. Bash does
+# not set close-on-exec on `exec {lock_fd}>` descriptors (verified on
+# Linux bash 5.2), so without intervention the immortal tmux server
+# inherits the singleton lock fd. After this daemon dies (e.g. a
+# systemd RestartSec cycle), the orphaned tmux keeps the flock held, so
+# every respawned daemon hits `flock -n` busy → `daemon_spawn_lock_busy`
+# → exit 1 → restart-loop. The fix: the fd number is recorded in the
+# global $BRIDGE_DAEMON_SINGLETON_LOCK_FD on a successful acquire, and
+# the daemon's agent-launch sites run through
+# `bridge_daemon_run_without_singleton_lock`, which closes that fd FOR
+# THE CHILD ONLY (`{var}>&-`) so the spawned tmux server never inherits
+# it. This daemon keeps the fd + flock for its full lifetime; only the
+# exec'd agent children are denied the descriptor. (Bash has no
+# FD_CLOEXEC builtin and a subprocess cannot mutate a parent's fd flags,
+# so per-launch close-for-child is the portable, argv-safe mechanism;
+# the `eval`-based form was rejected because it mangles arguments with
+# spaces — `{var}>&-` is eval-free and preserves argv exactly.)
+#
+# Any child that outlives the daemon (other than via the now-fixed
+# agent-launch path) is a separate bug class (orphan reaper) and would
+# block the next daemon start until the orphan is reaped — that is the
+# correct safety behavior for the daemon-singleton contract.
 #
 # wrapper detection precedence:
 #   1. BRIDGE_DAEMON_WRAPPER env (caller-injected: "sudo-self" /
@@ -1176,6 +1206,16 @@ bridge_daemon_ensure_singleton() {
       return 1
     fi
     lock_backend="flock"
+    # Issue #1388: record the held fd number so the daemon's agent-launch
+    # path can close it FOR THE SPAWNED CHILD (tmux server) only. This
+    # daemon keeps the fd open (kernel holds the flock for our lifetime);
+    # we only deny the descriptor to exec'd children that would otherwise
+    # outlive us and pin the lock. Set ONLY in the flock backend — the
+    # mkdir fallback (macOS dev hosts without flock(1)) has no fd to leak,
+    # so the global stays empty and the launch wrapper is a no-op there.
+    if [[ "$lock_fd" =~ ^[0-9]+$ ]]; then
+      BRIDGE_DAEMON_SINGLETON_LOCK_FD="$lock_fd"
+    fi
   else
     # No flock(1) — fall back to mkdir-as-lock. Less robust but still
     # serializes the local critical section. This branch matters on
@@ -1244,6 +1284,10 @@ bridge_daemon_ensure_singleton() {
         if [[ "$lock_fd" =~ ^[0-9]+$ ]]; then
           eval "exec ${lock_fd}>&-" 2>/dev/null || true
         fi
+        # Issue #1388: this fd is being closed (half-claimed start
+        # failed), so clear the recorded number — the agent-launch
+        # wrapper must not reference a closed descriptor.
+        BRIDGE_DAEMON_SINGLETON_LOCK_FD=""
         ;;
       mkdir)
         if [[ -n "${lock_dir:-}" && -d "$lock_dir" ]]; then
@@ -1331,6 +1375,35 @@ bridge_daemon_ensure_singleton() {
   # `daemon_spawn_lock_busy` (does NOT evict us — this is the r2 fix
   # vs the r1 last-spawn-wins eviction race).
   return 0
+}
+
+# bridge_daemon_run_without_singleton_lock — run a command (typically a
+# daemon-initiated `bridge-start.sh <agent>` launch) with the singleton
+# lock fd CLOSED FOR THE CHILD ONLY, so a long-lived grandchild (the
+# `tmux new-session` server, which reparents to PPID 1 and outlives this
+# daemon) cannot inherit the descriptor and pin the flock after we exit.
+# See Issue #1388 + the bridge_daemon_ensure_singleton header.
+#
+# Mechanics: bash has no FD_CLOEXEC builtin, and a subprocess cannot
+# mutate a parent's fd flags, so close-on-exec at open time is not
+# available in pure bash. Instead we close the recorded fd in the
+# forked child via the `{var}>&-` redirection — when $var already holds
+# a numeric fd, `{var}>&-` closes THAT fd for the child instead of
+# allocating a new one, and it leaves the parent's copy (and the flock)
+# untouched. The `{var}>&-` form is eval-free and argv-safe (verified on
+# Linux bash 5.2 with arguments containing spaces / `;` / `$(...)`),
+# unlike an `eval`-built redirection which mangles such arguments.
+#
+# When the fd was never recorded (mkdir-lock fallback on hosts without
+# flock(1), or the lock was not acquired), this is a transparent
+# pass-through: the command runs exactly as `"$@"` would.
+bridge_daemon_run_without_singleton_lock() {
+  local fd="${BRIDGE_DAEMON_SINGLETON_LOCK_FD:-}"
+  if [[ "$fd" =~ ^[0-9]+$ ]]; then
+    "$@" {BRIDGE_DAEMON_SINGLETON_LOCK_FD}>&-
+  else
+    "$@"
+  fi
 }
 
 # bridge_daemon_self_check — periodic R3 visibility helper. Called
