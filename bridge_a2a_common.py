@@ -32,6 +32,25 @@ PROTOCOL_VERSION = "a2a-enqueue-v1"
 ENVELOPE_PROTOCOL = "agent-bridge.a2a.enqueue.v1"
 SIGNATURE_PREFIX = "v1="
 
+# P-self-heal-3 (design §9.6): the signed `peer-identity-update` control
+# message. A node whose reconcile (P-self-heal-1) detects its OWN Tailscale
+# IP changed pushes this to every configured peer so the peer auto-updates
+# THIS node's stored identity/address — closing the bidirectional-sync gap
+# (today an IP change needs a manual edit+restart on BOTH sides).
+#
+# It is DELIBERATELY a distinct protocol from the enqueue path so the
+# receiver routes it to a SEPARATE handler with its own fail-closed stack
+# (it never reaches the enqueue/allowlist/queue boundary). The receiver
+# NEVER trusts the wire-asserted IP: it re-resolves the claim against its
+# OWN `tailscale status --json` view, and only updates an ALREADY-PAIRED
+# peer — this is NOT a discovery/trust-bootstrap channel.
+IDENTITY_UPDATE_PROTOCOL_VERSION = "a2a-identity-update-v1"
+IDENTITY_UPDATE_ENVELOPE_PROTOCOL = "agent-bridge.a2a.identity-update.v1"
+# The receiver path for the control message — distinct from the enqueue
+# path so a misrouted enqueue can never land in the identity-update handler
+# and vice versa.
+IDENTITY_UPDATE_PATH = "/peer-identity-update"
+
 # Default per-peer caps. Receiver config may override per peer.
 DEFAULT_MAX_BODY_BYTES = 256 * 1024
 DEFAULT_MAX_TITLE_BYTES = 1024
@@ -273,6 +292,42 @@ def peer_cap(peer: dict[str, Any], key: str, default: Any) -> Any:
     if isinstance(caps, dict) and key in caps:
         return caps[key]
     return default
+
+
+def write_config_atomic(path: Path, cfg: dict[str, Any], mode: int = 0o600) -> None:
+    """Write `cfg` as pretty JSON to `path` atomically, at mode `mode`.
+
+    The config carries peer-pair HMAC secrets, so the temp file is created
+    at 0o600 FROM THE START via os.open (never the umask default) so the
+    secret-bearing JSON is never group/world-readable during the write+fsync
+    window. `mode` (default 0o600) is re-applied to the temp before the
+    atomic replace, so the final file preserves the caller's intended mode
+    while the worst case during the window is tighter, never wider.
+
+    Single source of the 0600-atomic write for the sender CLI
+    (`bridge-a2a.py migrate-identity`) and the receiver
+    (`bridge-handoffd.py` peer-identity-update apply) so the two paths can
+    never diverge on the secret-on-disk guarantee.
+    """
+    tmp = path.with_name(path.name + ".tmp")  # noqa: raw-pathlib-controller-only
+    text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        try:
+            os.unlink(tmp)  # noqa: raw-pathlib-controller-only
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(tmp, mode)
+    except OSError:
+        pass
+    os.replace(tmp, path)  # noqa: raw-pathlib-controller-only
 
 
 # --------------------------------------------------------------------------
@@ -678,6 +733,95 @@ def parse_envelope(raw: bytes) -> dict[str, Any]:
     if priority not in VALID_PRIORITIES:
         raise A2AError(f"invalid priority: {priority!r}", code="bad_priority")
     return env
+
+
+# --------------------------------------------------------------------------
+# peer-identity-update control message (P-self-heal-3, design §9.6)
+# --------------------------------------------------------------------------
+#
+# The body the sender signs + the receiver re-corroborates. It carries the
+# SENDER's own identity claim (bridge_id + node StableID + MagicDNS name +
+# the new TailscaleIP it believes it now has). The receiver treats EVERY
+# field as untrusted — the claim only PROMPTS a re-resolution the receiver
+# independently verifies against its OWN `tailscale status --json`. The
+# wire-asserted `tailscale_ip` is informational/audit only; it is NEVER
+# written to the peer table on the strength of the wire alone.
+
+
+def build_identity_update(
+    *,
+    bridge_id: str,
+    node_id: str = "",
+    tailscale_name: str = "",
+    tailscale_ip: str = "",
+) -> dict[str, Any]:
+    """Build the peer-identity-update control body.
+
+    `bridge_id` is REQUIRED — it is the authenticated sender identity (what
+    the receiver looks up in its peer table; it must match the signed
+    X-AGB-Peer header). The identity fields (`node_id` / `tailscale_name` /
+    `tailscale_ip`) are the sender's CLAIM about its own node; the receiver
+    corroborates them against its own Tailscale view before applying.
+    """
+    return {
+        "protocol": IDENTITY_UPDATE_ENVELOPE_PROTOCOL,
+        "bridge_id": bridge_id,
+        "node_id": node_id,
+        "tailscale_name": tailscale_name,
+        "tailscale_ip": tailscale_ip,
+    }
+
+
+def parse_identity_update(raw: bytes) -> dict[str, Any]:
+    """Parse + shape-validate a peer-identity-update control body.
+
+    Validates only the WIRE shape (it is a JSON object with the right
+    protocol tag and a non-empty `bridge_id`); it does NOT trust any
+    identity field — corroboration against the receiver's own tailnet view
+    is the caller's job. At least one of `node_id` / `tailscale_name` must
+    be present (an update with neither has nothing for the receiver to
+    corroborate and would be a no-op at best).
+    """
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise A2AError(
+            f"identity-update is not valid JSON: {exc}", code="bad_identity_update",
+        ) from exc
+    if not isinstance(body, dict):
+        raise A2AError(
+            "identity-update root must be a JSON object", code="bad_identity_update",
+        )
+    if body.get("protocol") != IDENTITY_UPDATE_ENVELOPE_PROTOCOL:
+        raise A2AError(
+            f"unsupported identity-update protocol: {body.get('protocol')!r}",
+            code="bad_identity_update_protocol",
+        )
+    bridge_id = body.get("bridge_id")
+    if not isinstance(bridge_id, str) or not bridge_id:
+        raise A2AError(
+            "identity-update missing required string field: bridge_id",
+            code="bad_identity_update",
+        )
+    node_id = body.get("node_id", "")
+    ts_name = body.get("tailscale_name", "")
+    ts_ip = body.get("tailscale_ip", "")
+    for field, val in (("node_id", node_id),
+                       ("tailscale_name", ts_name),
+                       ("tailscale_ip", ts_ip)):
+        if not isinstance(val, str):
+            raise A2AError(
+                f"identity-update field {field} must be a string",
+                code="bad_identity_update",
+            )
+    if not node_id.strip() and not ts_name.strip():
+        # Nothing to corroborate / apply — refuse rather than silently no-op.
+        raise A2AError(
+            "identity-update must carry at least one of node_id / "
+            "tailscale_name",
+            code="bad_identity_update",
+        )
+    return body
 
 
 # --------------------------------------------------------------------------

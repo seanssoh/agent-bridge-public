@@ -378,6 +378,212 @@ def reconcile_once(server: "HandoffServer",
 
 
 # --------------------------------------------------------------------------
+# peer-identity-update apply (P-self-heal-3, design §9.6)
+# --------------------------------------------------------------------------
+#
+# THE most security-sensitive A2A surface: it MUTATES the receiver's stored
+# peer identity/address in handoff.local.json in response to UNTRUSTED
+# remote traffic. The hard rule is: NEVER trust the wire-asserted IP /
+# identity. The control message only PROMPTS a re-resolution the receiver
+# independently verifies against its OWN `tailscale status --json` view.
+#
+# By the time these helpers run, do_POST has ALREADY enforced, in order:
+#   a. tailnet-only bind (guaranteed at startup),
+#   b. remote_addr == the authenticated sender peer's CURRENT resolved
+#      Tailscale IP (resolve_peer_address on the configured peer), BEFORE
+#      the body was read,
+#   c. HMAC signature verify against that peer's secret(s) (401 on bad sig),
+#   d. message_id durable dedupe (replay-safe),
+#   e. clock-skew window,
+#   f. peer is ALREADY PAIRED (find_peer succeeded; unknown -> 403),
+#      with a matching secret.
+# The remaining job here is the CRITICAL corroboration (g) + the scoped,
+# idempotent, 0600-atomic apply (h) that touches ONLY this peer's identity.
+
+
+class CorroborationResult:
+    """Outcome of corroborating an identity-update claim against the receiver's
+    OWN `tailscale status --json` view (never the wire-asserted values)."""
+
+    def __init__(self) -> None:
+        self.ok = False
+        self.code = ""
+        # The receiver-VERIFIED identity to record (from the receiver's own
+        # status doc — NOT copied from the wire). node_id is the StableID,
+        # name the MagicDNS/HostName, ip the live TailscaleIP.
+        self.node_id = ""
+        self.name = ""
+        self.ip = ""
+
+
+def _identity_update_corroborate(
+    claim: dict[str, Any], peer: dict[str, Any],
+) -> CorroborationResult:
+    """Corroborate the sender's identity claim against THIS receiver's own
+    Tailscale view. Returns CorroborationResult(ok=True, ...) only when the
+    receiver's own `tailscale status --json` independently agrees the sender
+    peer's node now has the claimed identity; otherwise ok=False + a code.
+
+    NEVER trusts the wire. The wire claim only selects WHICH node to look up
+    in the receiver's own status doc (by StableID first, then MagicDNS /
+    HostName). The recorded node_id / name / ip are read from the receiver's
+    OWN status node, not copied from the message.
+
+    Additional anchor: the resolved node MUST be the SAME node the receiver
+    already has paired for this peer (when the peer is already identity-keyed,
+    the resolved StableID must equal the stored node_id; when the peer still
+    carries a raw `address`, the resolved node must own that stored address).
+    This stops a valid-signature peer from re-pointing its OWN entry at a
+    DIFFERENT tailnet node it does not control. A peer with neither a stored
+    identity nor a resolvable stored address (pure id-only, never migrated)
+    is corroborated on the receiver's status match alone — it is already
+    paired (find_peer + secret), and the receiver's own view is the anchor.
+    """
+    result = CorroborationResult()
+
+    claimed_node_id = str(claim.get("node_id", "")).strip()
+    claimed_name = str(claim.get("tailscale_name", "")).strip()
+
+    # Read the receiver's OWN tailnet view. Fail closed on any query error.
+    try:
+        status = a2a.tailscale_status_json()
+    except a2a.A2AError as exc:
+        result.code = getattr(exc, "code", "tailscale_unavailable")
+        return result
+
+    nodes = a2a._status_nodes(status)
+
+    # Locate the node the CLAIM refers to, but only inside the receiver's own
+    # status doc — the claim is just a selector, never the source of truth.
+    matched: Optional[dict[str, Any]] = None
+    if claimed_node_id:
+        for node in nodes:
+            if str(node.get("ID", "")).strip() == claimed_node_id:
+                matched = node
+                break
+    if matched is None and claimed_name:
+        for node in nodes:
+            if a2a._name_matches(node, claimed_name):
+                matched = node
+                break
+    if matched is None:
+        # The receiver's own view does NOT corroborate the claimed identity.
+        result.code = "claim_not_in_status"
+        return result
+
+    verified_node_id = str(matched.get("ID", "")).strip()
+    verified_name = a2a.node_name(matched)
+    verified_ip = a2a._node_first_ip(matched) or ""
+    if not verified_ip:
+        result.code = "no_ip_for_node"
+        return result
+
+    # Same-node anchor: the corroborated node must be the SAME peer node the
+    # receiver already has paired — a signed peer may only move its OWN
+    # entry, never re-point it at a different node.
+    stored_node_id = str(peer.get("node_id", "")).strip()
+    stored_name = str(peer.get("tailscale_name", "")).strip()
+    stored_address = str(peer.get("address", "")).strip()
+    if stored_node_id:
+        if verified_node_id != stored_node_id:
+            result.code = "node_id_anchor_mismatch"
+            return result
+    elif stored_name:
+        if not a2a._name_matches(matched, stored_name):
+            result.code = "name_anchor_mismatch"
+            return result
+    elif stored_address:
+        # Raw-IP peer not yet migrated: the corroborated node must currently
+        # OWN the stored address (i.e. the IP has NOT moved to a different
+        # node). If the stored IP no longer belongs to this node, refuse —
+        # we will not blindly re-key an entry whose anchor we cannot verify.
+        if not a2a._node_owns_ip(matched, stored_address):
+            result.code = "address_anchor_mismatch"
+            return result
+    # else: pure id-only peer (no stored identity/address). It is already
+    # paired (find_peer + secret); the receiver's own status match is the
+    # anchor. Recording the receiver-verified identity strengthens it.
+
+    result.ok = True
+    result.node_id = verified_node_id
+    result.name = verified_name
+    result.ip = verified_ip
+    return result
+
+
+def _identity_update_apply(
+    cfg_path: Optional[Path], peer_id: str, corr: CorroborationResult,
+) -> tuple[bool, str]:
+    """Update ONLY `peer_id`'s identity in handoff.local.json to the
+    receiver-VERIFIED values, atomically at 0600. Idempotent (no-op write is
+    skipped). Returns (changed, code). NEVER touches secret / secret_next /
+    secrets / inbound_allowlist / caps / port / other peers / listen.
+
+    Re-loads the on-disk config (not the live cached one) so the write is a
+    minimal, race-narrow read-modify-write against the canonical file; the
+    daemon's reconcile/hot-reload then picks up the change. Fail-closed: any
+    load/validate/write error returns (False, code) and changes nothing.
+    """
+    try:
+        disk_cfg = a2a.load_config(cfg_path)
+    except a2a.A2AError as exc:
+        return False, getattr(exc, "code", "config_load_failed")
+
+    peers = disk_cfg.get("peers")
+    if not isinstance(peers, list):
+        return False, "config_shape"
+
+    target: Optional[dict[str, Any]] = None
+    for p in peers:
+        if isinstance(p, dict) and p.get("id") == peer_id:
+            target = p
+            break
+    if target is None:
+        # The peer vanished from disk between the live lookup and now — do
+        # NOT create it (this is not a discovery channel). No-op.
+        return False, "peer_absent_on_disk"
+
+    # Compute the desired identity fields from the receiver-verified values.
+    new_node_id = corr.node_id
+    new_name = corr.name
+    cur_node_id = str(target.get("node_id", "")).strip()
+    cur_name = str(target.get("tailscale_name", "")).strip()
+
+    changed = False
+    if new_node_id and cur_node_id != new_node_id:
+        target["node_id"] = new_node_id
+        changed = True
+    if new_name and cur_name != new_name:
+        target["tailscale_name"] = new_name
+        changed = True
+    # We do NOT write the resolved IP into a stored `address` — the whole
+    # point of identity keying is that the IP is resolved live. We leave any
+    # existing legacy `address` untouched (it stays a fallback). Idempotent:
+    # if the entry is already identity-keyed to the verified node, no write.
+
+    if not changed:
+        return False, "noop"
+
+    # Re-validate the secret gate on the about-to-be-written config so a
+    # concurrent edit that dropped a secret cannot ride out on our write.
+    try:
+        a2a.validate_config_peer_secrets(disk_cfg, side="receiver")
+    except a2a.A2AError as exc:
+        return False, getattr(exc, "code", "secret_gate")
+
+    cfg_file = cfg_path or a2a.config_path()
+    try:
+        orig_mode = cfg_file.stat().st_mode & 0o777  # noqa: raw-pathlib-controller-only
+    except OSError:
+        orig_mode = 0o600
+    try:
+        a2a.write_config_atomic(cfg_file, disk_cfg, orig_mode)
+    except OSError as exc:
+        return False, f"write_failed:{exc}"[:64]
+    return True, "applied"
+
+
+# --------------------------------------------------------------------------
 # Enqueue boundary — call the EXISTING bridge-task.sh create
 # --------------------------------------------------------------------------
 
@@ -470,6 +676,10 @@ class HandoffServer(ThreadingHTTPServer):
         # local-IP drift; set from the real bound address by cmd_serve.
         self.bound_address: str = addr[0]
         self.bound_port: int = addr[1]
+        # The config file path the peer-identity-update apply re-loads +
+        # rewrites (None = the default resolution). Set by cmd_serve so the
+        # control-message handler mutates the SAME file the daemon loaded.
+        self.config_path: Optional[Path] = None
 
     def swap_cfg(self, new_cfg: dict[str, Any]) -> None:
         """Publish an ALREADY-VALIDATED config to the request handlers.
@@ -517,6 +727,17 @@ class HandoffHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - http.server API
         cfg: dict[str, Any] = self.server.cfg  # type: ignore[attr-defined]
         enqueue_path = cfg.get("listen", {}).get("enqueue_path", "/enqueue")
+        # P-self-heal-3 (design §9.6): the signed peer-identity-update control
+        # message is routed to a SEPARATE handler so it never reaches the
+        # enqueue/allowlist/queue boundary. Both handlers share the same
+        # fail-closed auth preamble (remote_addr -> HMAC -> dedupe -> skew),
+        # but the control message's terminal action is a scoped config update,
+        # not a queue insert.
+        identity_update_path = cfg.get("listen", {}).get(
+            "identity_update_path", a2a.IDENTITY_UPDATE_PATH)
+        if self.path == identity_update_path:
+            self._handle_identity_update(cfg)
+            return
         if self.path != enqueue_path:
             self._reply(404, {"ok": False, "error": "not found"})
             return
@@ -854,6 +1075,308 @@ class HandoffHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _handle_identity_update(self, cfg: dict[str, Any]) -> None:
+        """Receiver branch for the signed peer-identity-update control message
+        (P-self-heal-3, design §9.6).
+
+        Fail-closed validation ORDER (mirrors do_POST; security=True audit on
+        every reject; NO mutation until ALL pass):
+          a. tailnet-only bind — guaranteed at startup (resolve_bind).
+          b. remote_addr == the authenticated sender peer's CURRENT resolved
+             Tailscale IP — checked BEFORE the body is read off the socket.
+          c. HMAC signature verify against that peer's secret(s) — 401 on
+             mismatch (body hash + signature, constant-time).
+          d. message_id durable dedupe — replay-safe (idempotent re-apply).
+          e. clock-skew window — transient drift 503, far-stale 401.
+          f. peer ALREADY PAIRED — find_peer succeeded above; an unknown /
+             unpaired peer was already 403'd. NOT a discovery channel.
+          g. CRITICAL corroboration — the claimed (StableID / MagicDNS / IP)
+             MUST match what THIS receiver sees in its OWN
+             `tailscale status --json` for that peer's node, AND must resolve
+             to the SAME node the receiver already has paired. NEVER trust the
+             wire-asserted IP/identity; if the receiver's own status does not
+             corroborate -> REJECT (fail-closed), no mutation.
+          h. apply — update ONLY this peer's identity/address in
+             handoff.local.json via the 0600-atomic write; NEVER touch
+             secret/allowlist/caps/other peers; idempotent; then hot-reload
+             (swap_cfg) so it takes effect with no restart.
+        """
+        client_ip = self._client_ip()
+        peer_id = self.headers.get("X-AGB-Peer", "")
+        message_id = self.headers.get("X-AGB-Message-Id", "")
+        timestamp = self.headers.get("X-AGB-Timestamp", "")
+        body_hash_hdr = self.headers.get("X-AGB-Body-SHA256", "")
+        signature = self.headers.get("X-AGB-Signature", "")
+        protocol = self.headers.get("X-AGB-Protocol", "")
+
+        if protocol != a2a.IDENTITY_UPDATE_PROTOCOL_VERSION:
+            audit("identity_update_reject", reason="bad_protocol",
+                  peer=peer_id, client=client_ip, got=protocol)
+            self._reply(400, {"ok": False, "error": "unsupported protocol"})
+            return
+
+        # --- message_id REQUIRED (non-empty) for this endpoint ---
+        # A non-empty message_id is mandatory: it anchors durable dedupe (d)
+        # AND is part of the signed canonical string. An empty id would skip
+        # dedupe entirely and previously let the bridge_id corroboration be
+        # bypassed (#1406 codex r1 SECURITY). Reject BEFORE any body read or
+        # mutation; fail-closed.
+        if not message_id:
+            audit("identity_update_reject", reason="missing_message_id",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(400, {"ok": False, "error": "message id required"})
+            return
+
+        # --- f. peer must be ALREADY PAIRED (not a discovery channel) ---
+        try:
+            peer = a2a.find_peer(cfg, peer_id)
+        except a2a.A2AError:
+            audit("identity_update_reject", reason="unknown_peer",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(403, {"ok": False, "error": "unknown peer"})
+            return
+
+        # --- b. remote_addr == authenticated peer's CURRENT address (before body) ---
+        # Resolve the SENDER peer to its live Tailscale IP rather than trusting
+        # a stale stored `address`. FAIL CLOSED: any resolver / Tailscale error
+        # rejects BEFORE the body is read. (Identical anchor to do_POST.)
+        try:
+            peer_addr = a2a.resolve_peer_address(peer)
+        except a2a.A2AError as exc:
+            audit("identity_update_reject", reason=getattr(exc, "code",
+                  "resolve_error"), peer=peer_id, client=client_ip,
+                  security=True)
+            self._reply(403, {"ok": False, "error": "source address mismatch"})
+            return
+        if not peer_addr or client_ip != peer_addr:
+            audit("identity_update_reject", reason="addr_mismatch",
+                  peer=peer_id, client=client_ip, expected=peer_addr,
+                  security=True)
+            self._reply(403, {"ok": False, "error": "source address mismatch"})
+            return
+
+        # --- size guard before reading the body ---
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = -1
+        if content_length < 0:
+            self._reply(411, {"ok": False, "error": "length required"})
+            return
+        # The control body is tiny; cap it tightly (independent of the
+        # per-peer enqueue body cap) so an oversized payload is refused early.
+        max_body = 8 * 1024
+        if content_length > max_body:
+            audit("identity_update_reject", reason="oversize",
+                  peer=peer_id, client=client_ip, declared=content_length)
+            self._reply(413, {"ok": False, "error": "body too large"})
+            return
+        raw = self.rfile.read(content_length) if content_length else b""
+
+        # --- c. HMAC: secret present, body hash, signature (auth boundary) ---
+        secrets = a2a.peer_secrets(peer)
+        if not secrets:
+            audit("identity_update_reject", reason="no_secret",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(403, {"ok": False, "error": "peer not provisioned"})
+            return
+        computed_hash = a2a.body_sha256(raw)
+        if body_hash_hdr != computed_hash:
+            audit("identity_update_reject", reason="body_hash",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(401, {"ok": False, "error": "body hash mismatch"})
+            return
+        # HMAC FIRST (before any timestamp-band classification) so an
+        # unauthenticated request never receives a transient/permanent split
+        # that leaks signature validity (same ordering rationale as do_POST,
+        # #1346). The path is part of the canonical string, so an enqueue
+        # signature cannot be replayed against this control endpoint.
+        canonical = a2a.canonical_string(
+            "POST", self.path, peer_id, message_id, timestamp, computed_hash)
+        if not a2a.verify_signature(secrets, canonical, signature):
+            audit("identity_update_reject", reason="bad_signature",
+                  peer=peer_id, client=client_ip, message_id=message_id,
+                  security=True)
+            self._reply(401, {"ok": False, "error": "signature verification failed"})
+            return
+
+        # --- e. clock-skew window (authenticated past this point) ---
+        skew = int(cfg.get("timestamp_skew_seconds",
+                           a2a.DEFAULT_TIMESTAMP_SKEW_SECONDS))
+        grace_skew = int(cfg.get("timestamp_skew_grace_seconds",
+                                 a2a.DEFAULT_TIMESTAMP_SKEW_GRACE_SECONDS))
+        if grace_skew < skew:
+            grace_skew = skew
+        receiver_now = a2a.now_ts()
+        try:
+            req_ts = int(timestamp)
+        except (TypeError, ValueError):
+            audit("identity_update_reject", reason="bad_timestamp",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(401, {"ok": False, "error": "bad timestamp"})
+            return
+        ts_delta = abs(receiver_now - req_ts)
+        if ts_delta > grace_skew:
+            audit("identity_update_reject", reason="clock_skew_permanent",
+                  peer=peer_id, client=client_ip, delta_seconds=ts_delta,
+                  security=True)
+            self._reply(401, {"ok": False,
+                              "error": "timestamp far outside skew window",
+                              "receiver_ts": receiver_now})
+            return
+        if ts_delta > skew:
+            audit("identity_update_reject", reason="clock_skew_transient",
+                  peer=peer_id, client=client_ip, delta_seconds=ts_delta)
+            self._reply(503, {"ok": False,
+                              "error": "timestamp outside skew window — retry",
+                              "receiver_ts": receiver_now},
+                        extra_headers={"Retry-After": str(max(1, skew))})
+            return
+
+        # --- parse the control body (shape only; never trusts identity) ---
+        try:
+            claim = a2a.parse_identity_update(raw)
+        except a2a.A2AError as exc:
+            audit("identity_update_reject", reason=getattr(exc, "code",
+                  "bad_identity_update"), peer=peer_id, client=client_ip,
+                  message_id=message_id)
+            self._reply(422, {"ok": False, "error": str(exc)})
+            return
+        if claim.get("bridge_id") != peer_id:
+            # The claimed bridge_id must match the authenticated peer (the
+            # signed X-AGB-Peer). A peer may only announce about ITSELF.
+            # UNCONDITIONAL: message_id is guaranteed non-empty above, but this
+            # corroboration check must NEVER be skipped regardless (#1406 codex
+            # r1 SECURITY — empty-id no longer reaches here, and the body
+            # bridge_id can never bypass the authenticated-peer match).
+            audit("identity_update_reject", reason="bridge_id_mismatch",
+                  peer=peer_id, client=client_ip,
+                  claimed=claim.get("bridge_id"), security=True)
+            self._reply(422, {"ok": False,
+                              "error": "bridge_id does not match authenticated peer"})
+            return
+
+        # --- d. durable dedupe (replay-safe; idempotent re-apply) ---
+        # Reuse the same inbox_dedupe ledger as the enqueue path. The body
+        # hash anchors idempotency: same id + same body -> idempotent 200;
+        # same id + different body -> 409 security event (id reuse).
+        try:
+            dup = self._identity_update_dedupe_gate(
+                peer_id, message_id, computed_hash, client_ip)
+        except Exception as exc:  # noqa: BLE001 - last-resort guard
+            audit("identity_update_error", reason="dedupe_error",
+                  peer=peer_id, client=client_ip, detail=str(exc)[:200])
+            self._reply(500, {"ok": False, "error": "internal error"})
+            return
+        if dup == "duplicate":
+            audit("identity_update_accept", reason="duplicate",
+                  peer=peer_id, client=client_ip, message_id=message_id)
+            self._reply(200, {"ok": True, "duplicate": True})
+            return
+        if dup == "conflict":
+            audit("identity_update_reject", reason="hash_conflict",
+                  peer=peer_id, client=client_ip, message_id=message_id,
+                  security=True)
+            self._reply(409, {"ok": False,
+                              "error": "message id reused with different body"})
+            return
+
+        # --- g. CRITICAL: corroborate against the receiver's OWN tailnet view ---
+        corr = _identity_update_corroborate(claim, peer)
+        if not corr.ok:
+            # The receiver's own `tailscale status --json` does NOT
+            # independently agree — REJECT, fail-closed, NO mutation. This is
+            # the anti-spoof gate: a valid-signature peer cannot move its
+            # entry to an IP/node the receiver's own view does not confirm.
+            audit("identity_update_reject", reason=corr.code or "corroboration_failed",
+                  peer=peer_id, client=client_ip, message_id=message_id,
+                  security=True)
+            self._reply(409, {"ok": False,
+                              "error": ("identity not corroborated by this "
+                                        "receiver's own tailscale status")})
+            return
+
+        # --- h. scoped, idempotent, 0600-atomic apply + hot-reload ---
+        config_path = self.server.config_path  # type: ignore[attr-defined]
+        changed, code = _identity_update_apply(config_path, peer_id, corr)
+        if code.startswith("write_failed") or code in (
+                "config_load_failed", "config_shape", "secret_gate"):
+            audit("identity_update_error", reason=code, peer=peer_id,
+                  client=client_ip, message_id=message_id, security=True)
+            self._reply(500, {"ok": False, "error": "apply failed"})
+            return
+
+        # Hot-reload the live config so the new identity takes effect with no
+        # restart (mirrors the reconcile config swap). Re-validate before the
+        # swap so a concurrent bad edit can never disarm the live allowlist.
+        if changed:
+            try:
+                fresh = a2a.load_config(config_path)
+                a2a.validate_config_peer_secrets(fresh, side="receiver")
+                self.server.swap_cfg(fresh)  # type: ignore[attr-defined]
+            except a2a.A2AError as exc:
+                # The write succeeded but the reload failed validation — keep
+                # the live (last-good) config; the periodic reconcile will
+                # retry the hot-reload. Do NOT fail the request (the durable
+                # apply landed).
+                audit("identity_update_reload_kept",
+                      reason=getattr(exc, "code", "reload_failed"),
+                      peer=peer_id, client=client_ip, security=True)
+
+        audit("identity_update_accept",
+              reason="applied" if changed else "noop",
+              peer=peer_id, client=client_ip, message_id=message_id,
+              node_id=corr.node_id, resolved_ip=corr.ip)
+        self._reply(200, {"ok": True, "applied": changed,
+                          "node_id": corr.node_id})
+
+    def _identity_update_dedupe_gate(
+        self, peer_id: str, message_id: str, body_hash: str, client_ip: str,
+    ) -> str:
+        """Durable dedupe for the identity-update control message, sharing the
+        inbox_dedupe ledger. Returns "new" | "duplicate" | "conflict".
+
+        A "new" id is INSERTED here (created_task_id stays NULL — there is no
+        local task for a control message) so a replay of the SAME signed
+        message is idempotent even across daemon restarts. The body hash
+        anchors idempotency: same id + same body -> duplicate; same id +
+        different body -> conflict (security event).
+        """
+        a2a.ensure_handoff_dirs()
+        conn = a2a.open_inbox()
+        try:
+            existing = conn.execute(
+                "SELECT body_sha256 FROM inbox_dedupe WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["body_sha256"] == body_hash:
+                    conn.execute(
+                        "UPDATE inbox_dedupe SET last_seen_ts=?, "
+                        "delivery_count=delivery_count+1 WHERE message_id=?",
+                        (a2a.now_ts(), message_id),
+                    )
+                    conn.commit()
+                    return "duplicate"
+                conn.execute(
+                    "UPDATE inbox_dedupe SET last_seen_ts=?, "
+                    "delivery_count=delivery_count+1 WHERE message_id=?",
+                    (a2a.now_ts(), message_id),
+                )
+                conn.commit()
+                return "conflict"
+            now = a2a.now_ts()
+            conn.execute(
+                "INSERT INTO inbox_dedupe (message_id, peer, body_sha256, "
+                "created_task_id, first_seen_ts, last_seen_ts, delivery_count) "
+                "VALUES (?, ?, ?, NULL, ?, ?, 1)",
+                (message_id, peer_id, body_hash, now, now),
+            )
+            conn.commit()
+            return "new"
+        finally:
+            conn.close()
+
 
 # --------------------------------------------------------------------------
 # entry points
@@ -969,12 +1492,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return 1
 
     a2a.ensure_handoff_dirs()
+    config_path = Path(args.config) if args.config else None
     try:
         server = HandoffServer((bind, port), HandoffHandler, cfg)
     except OSError as exc:
         log(f"FATAL: cannot bind {bind}:{port}: {exc}")
         audit("bind_fail", address=bind, port=port, detail=str(exc))
         return 1
+    # The peer-identity-update apply re-loads + rewrites this same file.
+    server.config_path = config_path
 
     # Bind succeeded — fail-closed preflight is satisfied. Now (optionally)
     # detach into our own session so the receiver outlives the launching
@@ -996,7 +1522,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
     audit("listening", address=bind, port=port,
           peers=len(cfg.get("peers", [])), pid=os.getpid())
     log(f"A2A receiver listening on {bind}:{port}")
-    config_path = Path(args.config) if args.config else None
     try:
         if args.once:
             # Single-request test mode: no reconcile supervisor (the smoke
@@ -1094,6 +1619,9 @@ def serve_with_reconcile(server: "HandoffServer",
         try:
             new_server = HandoffServer((new_addr, new_port),
                                        old.RequestHandlerClass, old.cfg)
+            # Carry the config path so the rebound server's identity-update
+            # apply still rewrites the same on-disk config.
+            new_server.config_path = old.config_path
         except OSError as exc:
             # New address not bindable yet (e.g. not plumbed) → KEEP the old
             # listener. We never end up unbound or on an unproven address.
@@ -1117,6 +1645,48 @@ def serve_with_reconcile(server: "HandoffServer",
             f"new={new_addr}:{new_port}")
         old.shutdown()
         old.server_close()
+
+        # P-self-heal-3 (design §9.6): a rebind means THIS node's own
+        # Tailscale IP changed — the single-flight trigger for the
+        # peer-identity-update announce. Push the signed control message to
+        # every configured peer so they auto-update OUR stored identity with
+        # no manual edit+restart on their side (closes the bidirectional gap).
+        # Best-effort + non-blocking: failures are logged, never crash the
+        # daemon (each peer re-corroborates against its own view anyway, and
+        # the per-request inbound resolver already self-heals identity-keyed
+        # peers — the announce is a fast-convergence optimization).
+        _announce_identity_after_rebind(config_path)
+
+
+def _announce_identity_after_rebind(config_path: Optional[Path]) -> None:
+    """Fire `bridge-a2a.py announce-identity` after a local-IP rebind so peers
+    converge on this node's new identity without manual intervention.
+
+    Runs the sender CLI as an argv array (never heredoc-stdin; footgun #11),
+    fully detached + timeout-bounded so a slow/unreachable peer can never
+    stall the reconcile loop. Best-effort: any failure is audited, not raised.
+    """
+    cli = Path(__file__).resolve().parent / "bridge-a2a.py"
+    if not cli.is_file():  # noqa: raw-pathlib-controller-only
+        return
+    argv = [sys.executable, str(cli), "announce-identity", "--timeout", "10"]
+    env = dict(os.environ)
+    if config_path is not None:
+        env["BRIDGE_A2A_CONFIG"] = str(config_path)
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=90, env=env,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        audit("identity_announce_failed", reason="invoke_error",
+              detail=str(exc)[:200])
+        return
+    if proc.returncode != 0:
+        audit("identity_announce_partial", rc=proc.returncode,
+              detail=(proc.stderr or proc.stdout or "").strip()[-200:])
+    else:
+        audit("identity_announce_sent",
+              detail=(proc.stdout or "").strip()[-200:])
 
 
 def build_parser() -> argparse.ArgumentParser:
