@@ -26,7 +26,6 @@ import argparse
 import ipaddress
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -65,52 +64,15 @@ def audit(event: str, **fields: Any) -> None:
 # Tailscale address discovery + bind validation (fail-closed)
 # --------------------------------------------------------------------------
 
-class TailscaleUnavailable(a2a.A2AError):
-    """The local Tailscale address set could not be determined.
-
-    Distinct from "Tailscale is up but reports no addresses" — the bind
-    validation MUST fail closed when this is raised (we cannot prove the
-    bind address is a real local Tailscale interface).
-    """
-
-    def __init__(self, message: str) -> None:
-        super().__init__(message, code="tailscale_unavailable")
-
-
-# Well-known absolute locations for the `tailscale` CLI, probed when it
-# is not on PATH. A receiver started from cron / launchd / systemd often
-# has a minimal PATH that omits /opt/homebrew/bin, so PATH-only discovery
-# would fail closed on a macOS host that DOES have Tailscale installed
-# (e.g. via Homebrew). Probing these does not weaken the bind proof — the
-# resolved binary is still run and its `tailscale ip` output is still the
-# only thing trusted.
-_TAILSCALE_FALLBACK_PATHS = (
-    "/opt/homebrew/bin/tailscale",                            # Homebrew (Apple Silicon)
-    "/usr/local/bin/tailscale",                               # Homebrew (Intel) / manual
-    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",   # macOS App Store app
-    "/usr/bin/tailscale",                                     # Linux package
-    "/usr/sbin/tailscale",
-)
-
-
-def resolve_tailscale_cli() -> Optional[str]:
-    """Locate the `tailscale` CLI: PATH first, then well-known locations.
-
-    `BRIDGE_A2A_TAILSCALE_CLI` overrides discovery entirely (an explicit
-    path for non-standard installs; also lets the smoke exercise the
-    genuinely-absent path deterministically). Returns the resolved path,
-    or None when no candidate exists — the caller fails closed on None.
-    """
-    override = os.environ.get("BRIDGE_A2A_TAILSCALE_CLI")
-    if override:
-        return override
-    found = shutil.which("tailscale")
-    if found:
-        return found
-    for cand in _TAILSCALE_FALLBACK_PATHS:
-        if os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand
-    return None
+# The Tailscale-CLI locate logic + the TailscaleUnavailable error live in
+# the shared module (bridge_a2a_common) so the sender's identity resolver
+# and the receiver's bind proof never diverge on where the CLI is or what
+# "unavailable" means. We alias them here so existing references in this
+# file (and the `from bridge_handoffd import TailscaleUnavailable`-style
+# call sites in the smokes) keep working unchanged.
+TailscaleUnavailable = a2a.TailscaleUnavailable
+resolve_tailscale_cli = a2a.resolve_tailscale_cli
+_TAILSCALE_FALLBACK_PATHS = a2a._TAILSCALE_FALLBACK_PATHS
 
 
 def tailscale_addresses() -> list[str]:
@@ -180,8 +142,19 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
     listen = cfg.get("listen", {})
     if not isinstance(listen, dict):
         raise a2a.A2AError("config 'listen' must be an object", code="bind_config")
-    bind = listen.get("address", "").strip()
     port = int(listen.get("port", 8787))
+
+    # P0: if `listen` carries a Tailscale identity (`node_id` /
+    # `tailscale_name`), resolve it to the node's CURRENT TailscaleIP via
+    # `tailscale status --json`. Resolution ONLY produces a candidate IP —
+    # the fail-closed proof below (candidate ∈ `tailscale ip` set) is
+    # unchanged and still independently proves the candidate is a real local
+    # Tailscale interface. When `listen` has only a raw `address` (legacy),
+    # resolve_peer_address returns it verbatim and behavior is exactly as
+    # before. A resolution failure (identity given but not resolvable, or
+    # Tailscale unavailable) propagates as an A2AError / TailscaleUnavailable
+    # and the daemon fails closed — it never silently binds a stale address.
+    bind = a2a.resolve_peer_address(listen).strip()
 
     if not bind:
         # Auto-select fails closed: tailscale_addresses() raises

@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Helper for scripts/smoke/a2a-tailscale-identity-resolve.sh.
+
+Drives the P0 Tailscale-identity resolver (`resolve_peer_address` in
+bridge_a2a_common) and the receiver bind proof (`resolve_bind` in
+bridge-handoffd) directly, against a MOCK `tailscale` CLI selected via
+BRIDGE_A2A_TAILSCALE_CLI. Each subcommand prints a single deterministic
+result token (or `ERR:<code>`) that the bash smoke asserts on. The real
+tailnet is never touched.
+
+Subcommands:
+  resolve <json-entry>      print the resolved address, or ERR:<code>
+  bind <json-cfg>           print "<ip>:<port>", or ERR:<code> (runs the
+                            FULL fail-closed bind proof — this is what
+                            proves resolution did not weaken the proof)
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _load(mod_name: str, filename: str):
+    spec = importlib.util.spec_from_file_location(
+        mod_name, str(REPO_ROOT / filename))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def main(argv: list[str]) -> int:
+    a2a = _load("bridge_a2a_common", "bridge_a2a_common.py")
+
+    if not argv:
+        print("usage: helper resolve|bind <json>", file=sys.stderr)
+        return 2
+    cmd = argv[0]
+
+    if cmd == "resolve":
+        entry = json.loads(argv[1])
+        try:
+            print(a2a.resolve_peer_address(entry))
+        except a2a.A2AError as exc:
+            print(f"ERR:{exc.code}")
+        return 0
+
+    if cmd == "bind":
+        # Import the receiver daemon so its aliased resolver + the
+        # unchanged fail-closed proof both run. The module filename has a
+        # dash, so load it by path.
+        hd = _load("bridge_handoffd", "bridge-handoffd.py")
+        cfg = json.loads(argv[1])
+        try:
+            bind, port = hd.resolve_bind(cfg)
+            print(f"{bind}:{port}")
+        except a2a.A2AError as exc:
+            print(f"ERR:{exc.code}")
+        return 0
+
+    print(f"unknown subcommand: {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

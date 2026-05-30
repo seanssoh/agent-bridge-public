@@ -20,7 +20,9 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -61,6 +63,19 @@ class A2AError(Exception):
     def __init__(self, message: str, code: str = "a2a_error") -> None:
         super().__init__(message)
         self.code = code
+
+
+class TailscaleUnavailable(A2AError):
+    """The local Tailscale CLI / status could not be queried.
+
+    Distinct from "Tailscale is up but reports no matching node" — every
+    caller MUST fail closed when this is raised (we cannot prove anything
+    about the tailnet). The receiver's bind proof in particular treats
+    this as "refuse to serve", never "guess from a CIDR shape".
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="tailscale_unavailable")
 
 
 # --------------------------------------------------------------------------
@@ -258,6 +273,237 @@ def peer_cap(peer: dict[str, Any], key: str, default: Any) -> Any:
     if isinstance(caps, dict) and key in caps:
         return caps[key]
     return default
+
+
+# --------------------------------------------------------------------------
+# Tailscale identity resolution (P0 — runtime resolve, no stored IP)
+# --------------------------------------------------------------------------
+#
+# A peer (and `listen`) MAY carry an optional Tailscale identity in addition
+# to the legacy raw `address`:
+#   - `tailscale_name`: a MagicDNS hostname or short HostName.
+#   - `node_id`:        a Tailscale StableID (the `ID` field in `tailscale
+#                       status --json`).
+# At use-time the identity is resolved to the node's CURRENT TailscaleIP via
+# `tailscale status --json`. There is no stored resolved IP, so an IP change
+# after a tailnet re-login is picked up transparently on the next send/bind —
+# the stale-IP class simply cannot occur when keyed on an identity. If no
+# identity is present, `resolve_peer_address` falls back to the literal
+# `address` (full back-compat with today's raw-IP configs).
+#
+# Security note: this only PRODUCES a candidate address. The receiver bind
+# proof (`tailscale ip` membership check in bridge-handoffd.py) is unchanged
+# and still independently proves the resolved candidate is a real local
+# Tailscale interface before binding.
+
+# Well-known absolute locations for the `tailscale` CLI, probed when it is
+# not on PATH. A receiver/sender invoked from cron / launchd / systemd often
+# has a minimal PATH that omits /opt/homebrew/bin, so PATH-only discovery
+# would fail on a macOS host that DOES have Tailscale installed (e.g. via
+# Homebrew). Probing these does not weaken any proof — the resolved binary's
+# output is still the only thing trusted.
+_TAILSCALE_FALLBACK_PATHS = (
+    "/opt/homebrew/bin/tailscale",                            # Homebrew (Apple Silicon)
+    "/usr/local/bin/tailscale",                               # Homebrew (Intel) / manual
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",   # macOS App Store app
+    "/usr/bin/tailscale",                                     # Linux package
+    "/usr/sbin/tailscale",
+)
+
+
+def resolve_tailscale_cli() -> Optional[str]:
+    """Locate the `tailscale` CLI: PATH first, then well-known locations.
+
+    `BRIDGE_A2A_TAILSCALE_CLI` overrides discovery entirely (an explicit
+    path for non-standard installs; also lets the smoke exercise the
+    genuinely-absent path deterministically). Returns the resolved path,
+    or None when no candidate exists — the caller fails closed on None.
+
+    This is the single source of truth for CLI location; bridge-handoffd.py
+    imports it so the sender + receiver never diverge on where Tailscale is.
+    """
+    override = os.environ.get("BRIDGE_A2A_TAILSCALE_CLI")
+    if override:
+        return override
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    for cand in _TAILSCALE_FALLBACK_PATHS:
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def tailscale_status_json() -> dict[str, Any]:
+    """Return the parsed `tailscale status --json` document.
+
+    Raises TailscaleUnavailable if the CLI cannot be located, the call
+    fails, exits non-zero, or the output is not a JSON object — callers
+    MUST fail closed in those cases rather than guessing.
+    """
+    cli = resolve_tailscale_cli()
+    if cli is None:
+        raise TailscaleUnavailable(
+            "the 'tailscale' CLI was not found on PATH or in any standard "
+            "install location (/opt/homebrew/bin, /usr/local/bin, "
+            "/Applications/Tailscale.app/Contents/MacOS, /usr/bin) — cannot "
+            "resolve a Tailscale identity to its current IP. Install "
+            "Tailscale or set BRIDGE_A2A_TAILSCALE_CLI to its path."
+        )
+    try:
+        out = subprocess.run(
+            [cli, "status", "--json"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError as exc:
+        raise TailscaleUnavailable(
+            f"the 'tailscale' CLI path {cli!r} does not exist or is not "
+            "executable — cannot resolve a Tailscale identity."
+        ) from exc
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise TailscaleUnavailable(
+            f"'tailscale status --json' failed to run: {exc}"
+        ) from exc
+    if out.returncode != 0:
+        raise TailscaleUnavailable(
+            f"'tailscale status --json' exited {out.returncode}: "
+            f"{(out.stderr or '').strip()[:200]}"
+        )
+    try:
+        doc = json.loads(out.stdout)
+    except json.JSONDecodeError as exc:
+        raise TailscaleUnavailable(
+            f"'tailscale status --json' produced non-JSON output: {exc}"
+        ) from exc
+    if not isinstance(doc, dict):
+        raise TailscaleUnavailable(
+            "'tailscale status --json' root is not a JSON object"
+        )
+    return doc
+
+
+def _status_nodes(status: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten the Self + Peer node records from a status document."""
+    nodes: list[dict[str, Any]] = []
+    self_node = status.get("Self")
+    if isinstance(self_node, dict):
+        nodes.append(self_node)
+    peers = status.get("Peer")
+    if isinstance(peers, dict):
+        for node in peers.values():
+            if isinstance(node, dict):
+                nodes.append(node)
+    return nodes
+
+
+def _node_first_ip(node: dict[str, Any]) -> Optional[str]:
+    """Return a node's first TailscaleIP (IPv4 is listed first by Tailscale)."""
+    ips = node.get("TailscaleIPs")
+    if isinstance(ips, list):
+        for ip in ips:
+            if isinstance(ip, str) and ip.strip():
+                return ip.strip()
+    return None
+
+
+def _name_matches(node: dict[str, Any], name: str) -> bool:
+    """True if `name` matches a node's HostName or (DNS/Magic)DNSName.
+
+    Matches are case-insensitive. `DNSName` in status output is the fully
+    qualified MagicDNS name with a trailing dot (e.g.
+    `host.tailnet.ts.net.`); we accept the FQDN with or without the trailing
+    dot, and the bare short label (the leftmost component) so a config can
+    carry either the short HostName or the full MagicDNS name.
+    """
+    want = name.strip().rstrip(".").lower()
+    if not want:
+        return False
+    hostname = str(node.get("HostName", "")).strip().rstrip(".").lower()
+    if hostname and want == hostname:
+        return True
+    dns = str(node.get("DNSName", "")).strip().rstrip(".").lower()
+    if dns:
+        if want == dns:
+            return True
+        # Allow the short label of the FQDN to match a short config value.
+        if want == dns.split(".", 1)[0]:
+            return True
+    return False
+
+
+def resolve_peer_address(entry: dict[str, Any]) -> str:
+    """Resolve a peer or `listen` dict to a current Tailscale IP (or literal).
+
+    Precedence (matches the design §8):
+      1. `node_id`  (Tailscale StableID) → match on a node's `ID`.
+      2. `tailscale_name` (MagicDNS/HostName) → match on HostName / DNSName.
+      3. legacy `address` → returned verbatim (full back-compat).
+
+    When an identity (`node_id` / `tailscale_name`) is present it is resolved
+    live via `tailscale status --json`; a failure to resolve is a HARD error
+    (TailscaleUnavailable if Tailscale cannot be queried at all, otherwise
+    A2AError) — we deliberately do NOT silently fall back to a possibly-stale
+    `address`, because the whole point of keying on an identity is to avoid
+    trusting a stored IP.
+    """
+    if not isinstance(entry, dict):
+        raise A2AError("address entry must be an object", code="resolve_shape")
+
+    node_id = entry.get("node_id")
+    ts_name = entry.get("tailscale_name")
+    has_node_id = isinstance(node_id, str) and node_id.strip()
+    has_ts_name = isinstance(ts_name, str) and ts_name.strip()
+
+    if not has_node_id and not has_ts_name:
+        # Legacy raw-IP path — no identity to resolve, return the literal.
+        address = entry.get("address", "")
+        if not isinstance(address, str):
+            raise A2AError("'address' must be a string", code="resolve_shape")
+        return address.strip()
+
+    # An identity is present → resolve live. Any query failure propagates
+    # (TailscaleUnavailable) so the caller fails closed.
+    status = tailscale_status_json()
+    nodes = _status_nodes(status)
+
+    if has_node_id:
+        want = node_id.strip()
+        for node in nodes:
+            if str(node.get("ID", "")).strip() == want:
+                ip = _node_first_ip(node)
+                if ip:
+                    return ip
+                raise A2AError(
+                    f"Tailscale node_id {want!r} resolved to a node with no "
+                    "TailscaleIP — refusing to fall back to a stored address.",
+                    code="resolve_no_ip",
+                )
+        raise A2AError(
+            f"Tailscale node_id {want!r} not found in 'tailscale status "
+            "--json' (Self/Peer) — refusing to fall back to a possibly-stale "
+            "'address'. Re-check the StableID or peer connectivity.",
+            code="resolve_node_id_unknown",
+        )
+
+    # tailscale_name path.
+    want = ts_name.strip()
+    for node in nodes:
+        if _name_matches(node, want):
+            ip = _node_first_ip(node)
+            if ip:
+                return ip
+            raise A2AError(
+                f"Tailscale name {want!r} resolved to a node with no "
+                "TailscaleIP — refusing to fall back to a stored address.",
+                code="resolve_no_ip",
+            )
+    raise A2AError(
+        f"Tailscale name {want!r} not found in 'tailscale status --json' "
+        "(HostName/DNSName of Self/Peer) — refusing to fall back to a "
+        "possibly-stale 'address'. Re-check the MagicDNS name or peer "
+        "connectivity.",
+        code="resolve_name_unknown",
+    )
 
 
 # --------------------------------------------------------------------------
