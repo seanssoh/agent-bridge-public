@@ -143,7 +143,7 @@ def _sudo_read_text(path: Path) -> str | None:
     Returns the decoded text on success, ``None`` on any failure.
     """
     try:
-        st = path.stat()
+        st = path.stat()  # noqa: raw-pathlib-controller-only
     except OSError:
         return None
     try:
@@ -331,7 +331,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         body_path = a2a.outgoing_dir() / f"{message_id.replace(':', '_').replace('/', '_')}.json"
         body_path.write_bytes(envelope_bytes)
         try:
-            os.chmod(body_path, 0o600)
+            os.chmod(body_path, 0o600)  # noqa: raw-pathlib-controller-only
         except OSError:
             pass
 
@@ -895,7 +895,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     # unavailable) and exits nonzero with the structured failure. Single source
     # of the proof — the CLI can never drift looser than the daemon.
     handoffd = Path(__file__).resolve().parent / "bridge-handoffd.py"
-    if not handoffd.is_file():
+    if not handoffd.is_file():  # noqa: raw-pathlib-controller-only
         err(f"cannot locate receiver bind-proof helper at {handoffd}; "
             "skipping bind preview (a running daemon still RE-PROVES at "
             "bind time)")
@@ -939,7 +939,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     # --- trigger: SIGHUP the running receiver, if any ---
     pid_file = a2a.handoff_dir() / "handoffd.pid"
     pid: Optional[int] = None
-    if pid_file.exists():
+    if pid_file.exists():  # noqa: raw-pathlib-controller-only
         try:
             pid = int(pid_file.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
@@ -958,6 +958,204 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     else:
         info("no running receiver pidfile — start it with "
              "`agent-bridge handoff start`; the daemon self-heals on its timer")
+    return rc
+
+
+# --------------------------------------------------------------------------
+# announce-identity (P-self-heal-3, design §9.6): push a signed
+# peer-identity-update to every configured peer so they auto-update THIS
+# node's stored identity/address after an IP change — closing the
+# bidirectional-sync gap (no manual edit+restart on the peer side).
+# --------------------------------------------------------------------------
+#
+# THIS NODE's identity is resolved from its OWN `tailscale status --json`
+# (the Self node) — never a stored/asserted value. The control body is then
+# HMAC-signed with the EXISTING per-pair secret and POSTed to each peer's
+# /peer-identity-update endpoint, where the peer independently re-corroborates
+# the claim against ITS own tailnet view before applying. This is NOT a
+# discovery channel: it only reaches peers ALREADY in our config.
+
+
+def _resolve_self_identity() -> "tuple[str, str, str]":
+    """Resolve THIS node's (node_id, tailscale_name, tailscale_ip) from its
+    OWN `tailscale status --json` Self record. Raises A2AError /
+    TailscaleUnavailable on any failure (the caller fails closed — we never
+    announce a guessed/stale identity)."""
+    status = a2a.tailscale_status_json()
+    self_node = status.get("Self")
+    if not isinstance(self_node, dict):
+        raise a2a.A2AError(
+            "'tailscale status --json' has no Self node — cannot resolve this "
+            "node's identity to announce.",
+            code="self_no_node",
+        )
+    node_id = str(self_node.get("ID", "")).strip()
+    name = a2a.node_name(self_node)
+    ip = a2a._node_first_ip(self_node) or ""
+    if not node_id and not name:
+        raise a2a.A2AError(
+            "this node's Tailscale Self record has neither a StableID nor a "
+            "name — cannot build an identity-update.",
+            code="self_no_identity",
+        )
+    if not ip:
+        raise a2a.A2AError(
+            "this node's Tailscale Self record has no TailscaleIP.",
+            code="self_no_ip",
+        )
+    return node_id, name, ip
+
+
+def _post_identity_update(
+    *,
+    address: str,
+    port: int,
+    path: str,
+    local_bridge_id: str,
+    secret: str,
+    body_bytes: bytes,
+    timeout: float,
+) -> "tuple[int, dict[str, str], bytes]":
+    """Sign + POST one peer-identity-update attempt. Mirrors `_post_envelope`:
+    `X-AGB-Peer` + the canonical-string peer field carry the SENDER's own
+    bridge_id (the authenticated identity the receiver looks up). The path is
+    the control endpoint, so the signature domain is separate from enqueue."""
+    timestamp = str(a2a.now_ts())
+    message_id = a2a.new_message_id(local_bridge_id)
+    body_hash = a2a.body_sha256(body_bytes)
+    canonical = a2a.canonical_string(
+        "POST", path, local_bridge_id, message_id, timestamp, body_hash)
+    signature = a2a.sign(secret, canonical)
+    url = f"http://{address}:{port}{path}"
+    req = urllib.request.Request(url, data=body_bytes, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("X-AGB-Protocol", a2a.IDENTITY_UPDATE_PROTOCOL_VERSION)
+    req.add_header("X-AGB-Peer", local_bridge_id)
+    req.add_header("X-AGB-Message-Id", message_id)
+    req.add_header("X-AGB-Timestamp", timestamp)
+    req.add_header("X-AGB-Body-SHA256", body_hash)
+    req.add_header("X-AGB-Signature", signature)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, dict(resp.headers), resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, dict(exc.headers or {}), exc.read() or b""
+
+
+def announce_identity(
+    cfg: dict[str, Any],
+    *,
+    dry_run: bool,
+    timeout: float,
+    only_peer: Optional[str] = None,
+) -> "tuple[int, list[str]]":
+    """Resolve THIS node's identity and push a signed peer-identity-update to
+    every configured peer (or just `only_peer`). Returns (rc, lines) where
+    `lines` are human-readable per-peer results. Single-flight + idempotent is
+    the CALLER's concern (the reconcile trigger only fires on actual IP
+    change); a manual `announce-identity` always sends.
+
+    Fail-closed: a failure to resolve THIS node's own identity is a hard
+    error (rc=1, nothing sent) — we never announce a guessed identity."""
+    local_bridge_id = cfg.get("bridge_id", "").strip()
+    if not local_bridge_id:
+        return 1, ["config has no 'bridge_id' — cannot announce identity "
+                   "(the receiver matches it against its peer table)."]
+    try:
+        node_id, name, ip = _resolve_self_identity()
+    except a2a.A2AError as exc:
+        return 1, [f"cannot resolve this node's Tailscale identity: {exc} "
+                   f"({exc.code}) — nothing announced (fail-closed)."]
+
+    body = a2a.build_identity_update(
+        bridge_id=local_bridge_id, node_id=node_id,
+        tailscale_name=name, tailscale_ip=ip)
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+    lines = [f"self identity: node_id={node_id or '-'} "
+             f"name={name or '-'} ip={ip}"]
+
+    peers = cfg.get("peers", [])
+    if not isinstance(peers, list):
+        peers = []
+    targets = [p for p in peers if isinstance(p, dict)
+               and (only_peer is None or p.get("id") == only_peer)]
+    if only_peer is not None and not targets:
+        return 1, lines + [f"peer not configured: {only_peer}"]
+    if not targets:
+        return 0, lines + ["(no peers configured — nothing to announce)"]
+
+    rc = 0
+    for peer in targets:
+        pid = peer.get("id", "?")
+        # Resolve the DESTINATION peer's current IP (identity-keyed peers
+        # self-heal here too) + its signing secret. A resolve / secret failure
+        # is per-peer non-fatal: report it and continue to the others.
+        try:
+            address = a2a.resolve_peer_address(peer)
+        except a2a.A2AError as exc:
+            rc = 1
+            lines.append(f"  {pid}: SKIP (address resolve failed: {exc.code})")
+            continue
+        if not address:
+            rc = 1
+            lines.append(f"  {pid}: SKIP (no resolvable address)")
+            continue
+        try:
+            secret = a2a.peer_send_secret(peer)
+        except a2a.A2AError:
+            rc = 1
+            lines.append(f"  {pid}: SKIP (no secret configured)")
+            continue
+        port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
+        path = a2a.IDENTITY_UPDATE_PATH
+
+        if dry_run:
+            lines.append(f"  {pid}: would POST {path} to {address}:{port} "
+                         f"(node_id={node_id or '-'} ip={ip})")
+            continue
+        try:
+            status, _headers, resp = _post_identity_update(
+                address=address, port=port, path=path,
+                local_bridge_id=local_bridge_id, secret=secret,
+                body_bytes=body_bytes, timeout=timeout)
+        except (urllib.error.URLError, socket.timeout, OSError) as exc:
+            rc = 1
+            lines.append(f"  {pid}: FAIL (transport: {exc})")
+            continue
+        detail = ""
+        try:
+            detail = resp.decode("utf-8", "replace")[:160]
+        except Exception:  # noqa: BLE001 - defensive only
+            detail = ""
+        if 200 <= status < 300:
+            applied = '"applied": true' in detail or '"applied":true' in detail
+            lines.append(f"  {pid}: OK ({status}; "
+                         f"{'applied' if applied else 'no-op/duplicate'})")
+        else:
+            rc = 1
+            lines.append(f"  {pid}: FAIL (HTTP {status}: {detail})")
+    return rc, lines
+
+
+def cmd_announce_identity(args: argparse.Namespace) -> int:
+    """Push a signed peer-identity-update to peers (preview with --dry-run).
+
+    For the setup wizard + operators after a Tailscale IP change. The
+    reconcile path (P-self-heal-1) calls `announce_identity` directly when it
+    detects THIS node's own IP drifted; this CLI is the manual entry point."""
+    try:
+        cfg = a2a.load_config()
+        a2a.validate_config_peer_secrets(cfg, side="sender")
+    except a2a.A2AError as exc:
+        return die(str(exc)) or 1
+    rc, lines = announce_identity(
+        cfg, dry_run=args.dry_run, timeout=float(args.timeout or 10.0),
+        only_peer=args.peer)
+    for line in lines:
+        info(line)
+    if args.dry_run:
+        info("DRY-RUN: nothing was sent. Re-run without --dry-run to announce.")
     return rc
 
 
@@ -1057,29 +1255,14 @@ def _migrate_entry(
 
 
 def _write_config_atomic(path: Path, cfg: dict[str, Any], mode: int) -> None:
-    """Write `cfg` as pretty JSON to `path` atomically, preserving `mode`."""
-    tmp = path.with_name(path.name + ".tmp")
-    text = json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
-    # Create the temp at 0o600 from the start so the HMAC-secret-bearing JSON
-    # is never world/group-readable during the write+fsync window. os.open
-    # honors 0o600 minus umask, so the worst case is tighter, never wider.
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    try:
-        os.chmod(tmp, mode)
-    except OSError:
-        pass
-    os.replace(tmp, path)
+    """Write `cfg` as pretty JSON to `path` atomically, preserving `mode`.
+
+    Thin wrapper over the shared `a2a.write_config_atomic` so the sender
+    CLI and the receiver's peer-identity-update apply share ONE copy of the
+    secret-bearing 0600-atomic write (no fork of the os.open-0600-from-start
+    guarantee).
+    """
+    a2a.write_config_atomic(path, cfg, mode)
 
 
 def cmd_migrate_identity(args: argparse.Namespace) -> int:
@@ -1095,7 +1278,7 @@ def cmd_migrate_identity(args: argparse.Namespace) -> int:
         return die(str(exc)) or 1
     # Capture the original file mode so --apply preserves it (default 0600).
     try:
-        orig_mode = cfg_path.stat().st_mode & 0o777
+        orig_mode = cfg_path.stat().st_mode & 0o777  # noqa: raw-pathlib-controller-only
     except OSError:
         orig_mode = 0o600
 
@@ -1215,6 +1398,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="trigger + preview one receiver self-heal reconcile "
              "(re-resolve+prove bind, config hot-reload via SIGHUP)")
     p_reconcile.set_defaults(func=cmd_reconcile)
+
+    p_announce = sub.add_parser(
+        "announce-identity",
+        help="push a signed peer-identity-update to peers after an IP change "
+             "(so they auto-update this node's identity; --dry-run to preview)",
+        description=(
+            "Resolve THIS node's current Tailscale identity (node_id + "
+            "MagicDNS name + IP) from its OWN `tailscale status --json` and "
+            "push an HMAC-signed peer-identity-update to every configured peer "
+            "(or just --peer <id>). Each peer independently re-corroborates "
+            "the claim against ITS own tailscale status before applying — the "
+            "wire-asserted IP is never trusted. Only reaches ALREADY-PAIRED "
+            "peers (not a discovery channel). Dry-run with --dry-run."
+        ),
+    )
+    p_announce.add_argument("--peer", default=None,
+                            help="announce to a single configured peer "
+                                 "(default: all peers)")
+    p_announce.add_argument("--dry-run", action="store_true",
+                            help="resolve + show what would be sent, send nothing")
+    p_announce.add_argument("--timeout", type=float, default=None,
+                            help="per-peer HTTP timeout seconds (default 10)")
+    p_announce.set_defaults(func=cmd_announce_identity)
 
     p_migrate = sub.add_parser(
         "migrate-identity",

@@ -91,6 +91,14 @@ Three fixed decisions shape the design:
     identity-keyed peer's current IP, so inbound self-heals for identity-
     keyed peers with no restart; this reconcile additionally closes the
     local-bind-drift and added/removed-peer cases.
+  - **Bidirectional sync via a signed `peer-identity-update`.** A node whose
+    bind reconciles (its own IP changed) pushes a signed control message to
+    its peers so they auto-update that node's stored identity — closing the
+    "peers don't know" gap. The receiver **re-corroborates the claim against
+    its OWN `tailscale status --json` and never trusts the wire-asserted IP**,
+    and only updates an **already-paired** peer. See
+    "Signed `peer-identity-update` control message" below for the full
+    fail-closed validation order.
 - **HMAC-signed requests** (not raw bearer tokens — avoids replayable
   strings in process/log surfaces). The peer-pair secret is the HMAC key.
   - Headers: `X-AGB-Protocol: a2a-enqueue-v1`, `X-AGB-Peer`,
@@ -154,6 +162,75 @@ Fail-closed and conservative — it never guesses:
 - It **never** touches `secret` / `secret_next` / `inbound_allowlist` / `caps`
   / `port` / `bridge_id` — only the identity fields (and, with `--drop-address`,
   the migrated `address`) change.
+
+## Signed `peer-identity-update` control message (`agb a2a announce-identity`)
+
+Even with identity-keyed configs + per-request resolution, the
+**first-contact / not-yet-migrated** gap remains: a peer that still has your
+*raw IP* (or doesn't yet have your identity) won't self-heal, and **neither
+side is notified** when the other's IP changes. The signed `peer-identity-update`
+control message closes the bidirectional-sync gap — when a node's IP changes it
+**notifies its peers**, and each peer auto-updates that peer's stored identity
+**with no manual edit+restart on either side**.
+
+```bash
+agb a2a announce-identity              # push a signed update to ALL peers
+agb a2a announce-identity --peer <id>  # to one peer
+agb a2a announce-identity --dry-run    # resolve + show what would be sent, send nothing
+```
+
+The receiver daemon ALSO fires this automatically: when its self-heal reconcile
+rebinds (i.e. this node's own Tailscale IP changed), it pushes the announce to
+every configured peer as a fast-convergence step. This is the **single-flight
+trigger** — the announce fires only on an actual local-IP change, not every tick.
+
+**This is the A2A receiver's most security-sensitive surface — it MUTATES
+stored peer identity in response to untrusted remote traffic.** It is built
+strictly fail-closed:
+
+- **Distinct protocol + endpoint.** The control message uses
+  `X-AGB-Protocol: a2a-identity-update-v1` and is POSTed to a SEPARATE path
+  (`/peer-identity-update`), routed to a dedicated receiver handler that never
+  reaches the enqueue / allowlist / queue boundary. The signing path is part
+  of the HMAC canonical string, so an enqueue signature can never be replayed
+  against this endpoint and vice versa.
+- **The receiver NEVER trusts the wire-asserted IP/identity.** The message only
+  *prompts* a re-resolution the receiver independently verifies. The receiver's
+  own `tailscale status --json` is the source of truth.
+
+Receiver fail-closed validation **order** (every reject is audited with
+`security=True`; **no mutation until all pass**):
+
+1. **tailnet-only bind** — guaranteed at startup (`resolve_bind`).
+2. **`remote_addr` == the authenticated sender peer's CURRENT resolved
+   Tailscale IP** — resolved from the receiver's own view, checked **before the
+   body is read** off the socket.
+3. **HMAC signature verify** against that peer's secret(s) — `401` on mismatch
+   (body-hash + constant-time signature compare, HMAC checked before any
+   timestamp classification).
+4. **`message_id` durable dedupe** (shared `inbox.db` ledger) — replay-safe;
+   same id + same body → idempotent `200`; same id + different body → `409`.
+5. **clock-skew window** — transient drift `503`, far-stale `401`.
+6. **peer ALREADY PAIRED** — the sender must already be in the receiver's peer
+   table with a matching secret; an unknown/unpaired peer → `403`. **This is
+   NOT a discovery / trust-bootstrap channel.** The claimed `bridge_id` must
+   match the authenticated `X-AGB-Peer` (a peer may only announce about itself).
+7. **CRITICAL — corroborate against the receiver's OWN tailnet view.** The
+   claimed (StableID / MagicDNS / IP) **must match what THIS receiver sees in
+   its OWN `tailscale status --json`** for that peer's node, AND must resolve to
+   the **same node** the receiver already has paired (the resolved StableID must
+   equal the stored `node_id`; or, for a not-yet-migrated raw-IP peer, the
+   resolved node must currently own the stored `address`). If the receiver's own
+   status doesn't corroborate → **REJECT** (`409`, audited, fail-closed). The
+   wire-asserted IP is never written on the strength of the wire alone.
+8. **Scoped, idempotent, 0600-atomic apply.** On all checks passing, the
+   receiver updates **only that peer's** identity in `handoff.local.json` to the
+   **receiver-verified** values (read from its own status node, not copied from
+   the wire), via the os.open-0600-from-start atomic write. It **never** touches
+   `secret` / `secret_next` / `inbound_allowlist` / `caps` / `port` / other
+   peers / `listen`. No-op when already current (idempotent). Then it
+   **hot-reloads** the live config (the same fail-closed `swap_cfg` the
+   reconcile uses) so the change takes effect with **no restart**.
 
 ## Protocol — envelope
 
@@ -244,6 +321,7 @@ backpressure: over quota → `429` with `Retry-After`.
 - `agent-bridge a2a inbox-dedupe list|gc`
 - `agent-bridge a2a peers list|test <peer>`
 - `agent-bridge a2a deliver` — drain the outbox once
+- `agent-bridge a2a announce-identity [--peer <id>] [--dry-run] [--timeout <s>]` — push a signed `peer-identity-update` to peers after an IP change
 - `agent-bridge a2a daemon start|stop|restart|status|tick` — receiver lifecycle
 
 The delivery runner can be daemon-driven or cron-driven (`a2a daemon
