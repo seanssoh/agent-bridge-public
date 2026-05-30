@@ -124,6 +124,37 @@ Three fixed decisions shape the design:
   with peer id, target, message id, reason, local task id. The secret,
   signature key material, and full body are never logged.
 
+## Migrating existing raw-IP configs (`agb a2a migrate-identity`)
+
+Configs written before identity keying (and the `listen` / peer entries in
+today's `handoff.local.json`) key on a bare `address`, so they do **not**
+self-heal — only an identity-keyed entry does. `agb a2a migrate-identity`
+rewrites them in place so the runtime resolution above actually applies:
+
+```bash
+agb a2a migrate-identity            # DRY-RUN (default): prints before->after, writes nothing
+agb a2a migrate-identity --apply    # write the migrated config (mode 0600 preserved)
+agb a2a migrate-identity --apply --drop-address   # also remove the now-redundant raw IP
+```
+
+It queries `tailscale status --json` once and, for each entry that has a raw
+`address` but no identity, **reverse-resolves** that IP to its Tailscale node
+(matching the IP against each node's `TailscaleIPs`). When **exactly one** node
+owns the IP it records that node's `node_id` (StableID) + `tailscale_name`
+(MagicDNS / HostName). The raw `address` is **kept as a fallback** by default
+(resolver precedence stays `node_id` > `tailscale_name` > `address`); pass
+`--drop-address` to remove it.
+
+Fail-closed and conservative — it never guesses:
+
+- `tailscale status --json` unavailable → **exits nonzero, changes nothing**.
+- An IP that matches **zero** nodes (stale/offline) is left untouched (warns).
+- An IP that matches **multiple** nodes (ambiguous) is left untouched (warns).
+- It is **idempotent**: re-running on an already-identity-keyed config is a no-op.
+- It **never** touches `secret` / `secret_next` / `inbound_allowlist` / `caps`
+  / `port` / `bridge_id` — only the identity fields (and, with `--drop-address`,
+  the migrated `address`) change.
+
 ## Protocol — envelope
 
 ```json
