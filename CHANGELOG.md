@@ -6,6 +6,29 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.1] — 2026-05-31
+
+A stabilization batch on top of `0.15.0` plus one opt-in feature. Every item below is on `main`, CI-green (unit/static + oss-preflight + lint-heredoc-ban + lint + syntax + integration), and codex pair-reviewed.
+
+### Added
+
+- **`agb setup template-sync` — seed new agents from a reference agent (#1427).** An opt-in wizard that reads a reference agent's roster config (model, effort, permission_mode, skills, plugins, channels) and writes a controller-owned defaults profile into `agent-roster.local.sh`; `agent create` then materializes those as **explicit per-agent roster fields**, so a freshly-installed bridge's new agents no longer come up bare (Sonnet / low-effort / no plugins). Reference read is **roster-only** (never introspects the reference's `~/.claude`, plugin cache, or MCP runtime) and **never copies credentials/tokens/MCP secrets** — channels are carried as declarations only (re-run the per-channel `setup` wizards for creds); `permission_mode=legacy` is never propagated. The whole command is gated on the same operator-tui / operator-trusted-id boundary as `agent create`, and the roster-write verbs (`agent roster materialize-fields` / `write-template-profile`) are independently gated + audited — an agent-direct caller cannot mutate the roster through any path, including caller-controlled writer-command overrides. The live accessors are unchanged, so old rosters with unset fields keep the legacy-launch contract. See `docs/template-sync-design.md`. *(Pre-flight: verify a live admin-session run before relying on it in production.)*
+
+### Fixed
+
+- **Text crons 100% failed on a fresh `0.15.0` non-iso single-user macOS host (#1421).** Under the daemon's process-wide `umask 077`, every cron run dir landed `0700/0600` (the group-widening that marks non-shell runs is iso-gated), so `shell_artifact_route` mis-classified text crons as the controller-private shell route and aborted them as `request_artifact_tampered`. `cmd_run` now peeks the controller-private body and only commits to the shell path for an actual shell payload. Also: `claude_config_dir_for_request` falls back to the first existing per-agent `.claude` dir when no `.credentials.json` exists (macOS Keychain / API-key hosts) instead of returning `None`.
+- **Daemon nudge/alert hygiene — external-contributor reports (#1408, #1409, #1411 via #1424).** A2A outbox-stuck + unclaimed-task admin alerts now refresh a **single** open task per stable prefix via an atomic `bridge-queue.py upsert-open` (was ~116 duplicate high-priority tasks for ~6 real conditions); the Claude busy-gate detects the mid-turn `Working` / `esc to interrupt` banner so daemon nudges to a busy agent are spooled + re-delivered instead of stranded as `submit_lost_post_grace`; and the queued-task "ACTION REQUIRED" nudge gains an `attached`-session skip so an attached admin session no longer accumulates `[deferred]` replays.
+- **iso-v2 active shared-tree split-brain on v2 migrate (#1431).** The v2 migration now relocates the active shared tree, resolving a `0.15` split-brain.
+- **`bridge-cron --kind shell` dead-end on macOS / non-iso (#1426 via #1433).** `--help` and the create-time error now state the iso-v2 / Linux-only requirement up front and point to the supported scheduled-shell fallbacks (OS crontab, or a `--kind text` cron running `bash <script>`); documented in `OPERATIONS.md` with `pgrep` portability guidance. (Non-iso controller-shell execution was deliberately deferred — it would weaken the iso-v2 boundary.)
+
+### Changed
+
+- Built-in launch default model `claude-opus-4-7` → `claude-opus-4-8` (with #1432) — applies to new-shape launch rows only; existing explicit roster entries are untouched and there is no silent upgrade.
+
+### Docs
+
+- `0.15.0` stable version references + public repo URL migration to `seanssoh/agent-bridge-public` (#1420).
+
 ## [0.15.0] — 2026-05-31
 
 Promotes `0.15.0-rc1` to **stable**, plus the A2A cross-bridge self-heal stack, the handoffd supervision layer, and two fresh-install/managed-agent hardening fixes that landed and were verified after the rc. Everything in `0.15.0-rc1` (the minor bump for OS-state risk separation, the hardened iso-v2 isolation stack, and the full fresh-install/upgrade OOTB-acceptance campaign — see that section below) carries forward unchanged. Each item below is on `main`, CI-green (unit/static + oss-preflight + lint-heredoc-ban + lint + syntax + integration), and codex pair-reviewed; the security-critical A2A surfaces additionally went through adversarial-verify sweeps + codex security review (which caught real bind-env-propagation and fail-closed-contract gaps the sweeps rated clean — the layered review earned its keep).
