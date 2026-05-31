@@ -78,6 +78,10 @@ tmux_submit_key_dispatch_contract() {
   smoke_assert_contains "$(cat "$calls_file")" "submit-legacy -t =fake-session: C-m" "Claude legacy submit override keeps C-m"
 
   : >"$calls_file"
+  BRIDGE_TMUX_CLAUDE_SUBMIT_KEY_MODE=csi-u bridge_tmux_send_submit_key submit-requested-legacy fake-session claude legacy
+  smoke_assert_contains "$(cat "$calls_file")" "submit-requested-legacy -t =fake-session: C-m" "Claude requested legacy mode overrides default"
+
+  : >"$calls_file"
   bridge_tmux_send_submit_key submit-codex fake-session codex
   smoke_assert_contains "$(cat "$calls_file")" "submit-codex -t =fake-session: C-m" "non-Claude submit remains C-m"
 }
