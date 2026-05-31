@@ -1630,7 +1630,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # Pull 1359-cron-create-iso-staging on every isolation-lib move so
       # a row-reordering or scope-gate change cannot silently regress the
       # iso staging delegation contract.
-      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup phase2-install-tree-reconciler phase3-agent-home-contract 1207-stale-supp-groups-allowlist A-beta4-iso-path-resolution H-beta4-iso-ownership G-beta4-watchdog-noise J-beta4-workflow-docs α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds 1359-cron-create-iso-staging
+      # v0.15 split-brain fix: lib/bridge-isolation-v2-migrate.sh gained
+      # bridge_isolation_v2_migrate_shared_backfill (the platform-agnostic
+      # shared-tree data move that runs before every apply_for_upgrade skip
+      # branch) + its sentinel writer, and lib/bridge-isolation-v2.sh gained
+      # the sentinel-gated BRIDGE_SHARED_DIR resolver flip. Pull
+      # isolation-v2-shared-mover on every isolation-lib + migrate move so a
+      # future revert of the early backfill call (which would re-strand the
+      # active shared tree at the legacy path on macOS) or the sentinel gate
+      # is caught at PR time.
+      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup phase2-install-tree-reconciler phase3-agent-home-contract 1207-stale-supp-groups-allowlist A-beta4-iso-path-resolution H-beta4-iso-ownership G-beta4-watchdog-noise J-beta4-workflow-docs α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds 1359-cron-create-iso-staging isolation-v2-shared-mover
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;

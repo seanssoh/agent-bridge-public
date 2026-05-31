@@ -1299,6 +1299,25 @@ otherwise):
    Edit `agent-roster.local.sh` (via `agent-bridge config set`) to align
    the override and re-run, or unset it and re-run.
 
+   **Shared-tree relocation + `.v2-shared-mirror.sentinel`.** Before any
+   skip branch returns, apply real-copy mirrors the *active* shared tree
+   (`$BRIDGE_HOME/shared` — wiki, cron artifacts, users, docs: everything
+   `BRIDGE_SHARED_DIR` points at) into `<data_root>/shared` and drops a
+   `<data_root>/.v2-shared-mirror.sentinel`. This runs on every path,
+   including the macOS skip branches (marker-only-no-isolated-roster and
+   macos-shared-agent) that otherwise relocate no data — without it the v2
+   marker flips while the real shared tree stays stranded at the legacy path
+   (the v2 wiki indexer then scans an empty `data/shared/wiki`). The legacy
+   tree is **preserved** (`delete_eligible=0`); the resolver flip — not
+   deletion — cuts `BRIDGE_SHARED_DIR` over to `<data_root>/shared`, and
+   that flip is gated on the sentinel, so a marker-flipped-but-data-not-yet-
+   mirrored install keeps reading the legacy content until the mirror
+   completes. The step is idempotent (sentinel present → no-op) and
+   self-repairing: re-running apply on an already-marker-flipped install
+   that lacks the sentinel backfills the stranded tree. A mirror failure is
+   warn-and-continue — the sentinel stays absent, the resolver stays on the
+   legacy path, and the install keeps working.
+
 3. **soak** — operate on v2 for as long as you want to be sure things
    work. Rollback is cheap (legacy tree is intact until commit).
 
