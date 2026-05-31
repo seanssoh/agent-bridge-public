@@ -729,25 +729,8 @@ bridge_run_claude_keychain_free_preflight() {
   [[ -f "$settings_file" ]] \
     || bridge_die "Claude keychain-free auth is enabled but settings.json is missing: $settings_file"
 
-  if ! python3 - "$settings_file" "$helper_path" <<'PY'; then
-import json
-import sys
-from pathlib import Path
-
-settings_path = Path(sys.argv[1])
-expected = Path(sys.argv[2]).expanduser().resolve(strict=False)
-payload = json.loads(settings_path.read_text(encoding="utf-8"))
-if not isinstance(payload, dict):
-    raise SystemExit(1)
-actual_raw = payload.get("apiKeyHelper")
-if not isinstance(actual_raw, str) or not actual_raw:
-    raise SystemExit(1)
-actual = Path(actual_raw).expanduser()
-if not actual.is_absolute():
-    raise SystemExit(1)
-if actual.resolve(strict=False) != expected:
-    raise SystemExit(1)
-PY
+  if ! python3 "$SCRIPT_DIR/scripts/python-helpers/validate-claude-apikeyhelper-settings.py" \
+      "$settings_file" "$helper_path"; then
     bridge_die "Claude keychain-free auth is enabled but settings.json does not point at apiKeyHelper: $settings_file"
   fi
 

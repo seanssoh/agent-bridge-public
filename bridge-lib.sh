@@ -336,24 +336,8 @@ bridge_bool_is_true() {
 bridge_runtime_config_value() {
   local key="$1"
   [[ -n "$key" && -f "${BRIDGE_RUNTIME_CONFIG_FILE:-}" ]] || return 1
-  python3 - "$BRIDGE_RUNTIME_CONFIG_FILE" "$key" <<'PY' 2>/dev/null
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-key = sys.argv[2]
-payload = json.loads(path.read_text(encoding="utf-8"))
-if not isinstance(payload, dict) or key not in payload:
-    raise SystemExit(1)
-value = payload[key]
-if isinstance(value, bool):
-    print("true" if value else "false")
-elif value is None:
-    raise SystemExit(1)
-else:
-    print(str(value))
-PY
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/read-json-key.py" \
+    "$BRIDGE_RUNTIME_CONFIG_FILE" "$key" 2>/dev/null
 }
 
 bridge_config_bool_enabled() {

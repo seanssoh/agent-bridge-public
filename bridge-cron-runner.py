@@ -196,7 +196,7 @@ def bridge_home() -> Path | None:
 
 
 def host_platform() -> str:
-    override = os.environ.get("BRIDGE_HOST_PLATFORM_OVERRIDE", "").strip()
+    override = os.environ.get("BRIDGE_HOST_PLATFORM_OVERRIDE", "").strip()  # noqa: iso-helper-boundary - controller host-platform override
     if override:
         return override
     return platform.system()
@@ -207,11 +207,11 @@ def env_truthy(value: str | None) -> bool:
 
 
 def runtime_config_path() -> Path | None:
-    explicit = os.environ.get("BRIDGE_RUNTIME_CONFIG_FILE", "").strip()
+    explicit = os.environ.get("BRIDGE_RUNTIME_CONFIG_FILE", "").strip()  # noqa: iso-helper-boundary - controller runtime config path
     if explicit:
         return Path(explicit).expanduser()
 
-    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()
+    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()  # noqa: iso-helper-boundary - controller runtime root
     if runtime_root:
         root = Path(runtime_root).expanduser()
     else:
@@ -252,7 +252,7 @@ def runtime_config_truthy(key: str) -> bool:
 
 
 def claude_keychain_free_auth_enabled() -> bool:
-    override = os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH")
+    override = os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH")  # noqa: iso-helper-boundary - controller feature gate
     if override is not None and override.strip():
         return env_truthy(override)
     return runtime_config_truthy(KEYCHAIN_FREE_CONFIG_KEY)
@@ -267,7 +267,7 @@ def _absolute_repo_path(raw: str) -> Path:
 
 def claude_api_key_helper_path() -> Path:
     raw = (
-        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER", "").strip()
+        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER", "").strip()  # noqa: iso-helper-boundary - controller helper override
         or str(runtime_config_value(API_KEY_HELPER_CONFIG_KEY) or "").strip()
         or str(ROOT / "scripts" / "claude-oat-api-key-helper.sh")
     )
@@ -276,7 +276,7 @@ def claude_api_key_helper_path() -> Path:
 
 def claude_api_key_helper_ttl_ms() -> str:
     raw = (
-        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER_TTL_MS", "").strip()
+        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER_TTL_MS", "").strip()  # noqa: iso-helper-boundary - controller helper TTL
         or str(runtime_config_value(API_KEY_HELPER_TTL_CONFIG_KEY) or "").strip()
     )
     try:
@@ -287,13 +287,13 @@ def claude_api_key_helper_ttl_ms() -> str:
 
 
 def claude_token_registry_path() -> Path:
-    explicit = os.environ.get("BRIDGE_CLAUDE_TOKEN_REGISTRY", "").strip()
+    explicit = os.environ.get("BRIDGE_CLAUDE_TOKEN_REGISTRY", "").strip()  # noqa: iso-helper-boundary - controller token registry path
     if explicit:
         return Path(explicit).expanduser()
-    secrets_dir = os.environ.get("BRIDGE_RUNTIME_SECRETS_DIR", "").strip()
+    secrets_dir = os.environ.get("BRIDGE_RUNTIME_SECRETS_DIR", "").strip()  # noqa: iso-helper-boundary - controller secrets root
     if secrets_dir:
         return Path(secrets_dir).expanduser() / "claude-oauth-tokens.json"
-    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()
+    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()  # noqa: iso-helper-boundary - controller runtime root
     if runtime_root:
         return Path(runtime_root).expanduser() / "secrets" / "claude-oauth-tokens.json"
     home = bridge_home()

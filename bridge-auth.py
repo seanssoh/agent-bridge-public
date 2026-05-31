@@ -95,15 +95,15 @@ def env_truthy(value: str | None) -> bool:
 
 
 def runtime_config_path() -> Path | None:
-    explicit = os.environ.get("BRIDGE_RUNTIME_CONFIG_FILE", "").strip()
+    explicit = os.environ.get("BRIDGE_RUNTIME_CONFIG_FILE", "").strip()  # noqa: iso-helper-boundary - controller runtime config path
     if explicit:
         return Path(explicit).expanduser()
 
-    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()
+    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()  # noqa: iso-helper-boundary - controller runtime root
     if runtime_root:
         root = Path(runtime_root).expanduser()
     else:
-        bridge_home = os.environ.get("BRIDGE_HOME", "").strip()
+        bridge_home = os.environ.get("BRIDGE_HOME", "").strip()  # noqa: iso-helper-boundary - controller bridge home fallback
         if not bridge_home:
             return None
         root = Path(bridge_home).expanduser() / "runtime"
@@ -140,7 +140,7 @@ def runtime_config_truthy(key: str) -> bool:
 
 
 def claude_keychain_free_auth_enabled() -> bool:
-    override = os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH")
+    override = os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH")  # noqa: iso-helper-boundary - controller feature gate
     if override is not None and override.strip():
         return env_truthy(override)
     return runtime_config_truthy(KEYCHAIN_FREE_CONFIG_KEY)
@@ -148,7 +148,7 @@ def claude_keychain_free_auth_enabled() -> bool:
 
 def claude_api_key_helper_path() -> str:
     raw = (
-        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER", "").strip()
+        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER", "").strip()  # noqa: iso-helper-boundary - controller helper override
         or str(runtime_config_value(API_KEY_HELPER_CONFIG_KEY) or "").strip()
         or str(ROOT / "scripts" / "claude-oat-api-key-helper.sh")
     )
@@ -160,7 +160,7 @@ def claude_api_key_helper_path() -> str:
 
 def claude_api_key_helper_ttl_ms() -> int:
     raw = (
-        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER_TTL_MS", "").strip()
+        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER_TTL_MS", "").strip()  # noqa: iso-helper-boundary - controller helper TTL
         or str(runtime_config_value(API_KEY_HELPER_TTL_CONFIG_KEY) or "").strip()
     )
     try:
