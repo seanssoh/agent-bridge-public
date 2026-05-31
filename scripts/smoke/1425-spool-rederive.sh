@@ -49,11 +49,18 @@ failed=0
 # ============================================================
 # R1–R4 — rederive helper contract (sourced lib stack)
 # ============================================================
-# Source bridge-lib.sh under an isolated BRIDGE_HOME (same env block the
-# in-tree spool unit test in scripts/smoke-test.sh uses) so the rederive
-# helper's dependencies (bridge_with_timeout, bridge_queue_cli,
-# bridge_queue_attention_*, bridge_compose_notification_text) are defined,
-# and so the helper's nudge-live-state subprocess reads our seeded DB.
+# Set up the isolated v2 BRIDGE_HOME (env + layout marker) BEFORE sourcing
+# bridge-lib.sh, so on a clean CI runner with no inherited v2 env/marker the
+# source does not abort with the isolation-v2 markerless error
+# ("requires isolation-v2 ... markerless(fresh-install-candidate)") — r3
+# codex CI fix. scripts/smoke/lib.sh::smoke_setup_bridge_home is the
+# canonical helper (writes state/layout-marker.sh with BRIDGE_LAYOUT=v2 and
+# exports the full isolated env); a passing sibling like
+# scripts/smoke/1409-claude-midturn-busy-gate.sh sources lib.sh BEFORE
+# bridge-lib.sh for exactly this reason. The rederive helper's dependencies
+# (bridge_with_timeout, bridge_queue_cli, bridge_queue_attention_*,
+# bridge_compose_notification_text) are defined by bridge-lib.sh; its
+# nudge-live-state subprocess reads the BRIDGE_TASK_DB the helper sets.
 #
 # Footgun #11: stage the inner script in a tempfile and run it by path
 # rather than piping a heredoc into `bash -s` stdin (avoids the Bash 5.3.9
@@ -63,18 +70,16 @@ cat > "$REDERIVE_UT" <<'REDERIVE_UT_BODY'
 set -u
 repo="$1"
 scratch="$2"
+export SMOKE_NAME="1425-spool-rederive"
+# shellcheck disable=SC1090
+source "$repo/scripts/smoke/lib.sh"
+# Isolated v2 BRIDGE_HOME + layout marker — MUST run before bridge-lib.sh.
+smoke_setup_bridge_home "1425-spool-rederive"
+trap 'smoke_cleanup_temp_root' EXIT
 # shellcheck disable=SC1090
 source "$repo/bridge-lib.sh"
 
 fail() { printf '[smoke][error] rederive: %s\n' "$*" >&2; exit 1; }
-
-export BRIDGE_HOME="$scratch/home"
-export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
-export BRIDGE_ACTIVE_AGENT_DIR="$BRIDGE_STATE_DIR/agents"
-export BRIDGE_LOG_DIR="$BRIDGE_HOME/logs"
-export BRIDGE_SHARED_DIR="$BRIDGE_HOME/shared"
-mkdir -p "$BRIDGE_STATE_DIR"
-export BRIDGE_TASK_DB="$BRIDGE_STATE_DIR/tasks.db"
 
 agent="rederive-agent"
 
