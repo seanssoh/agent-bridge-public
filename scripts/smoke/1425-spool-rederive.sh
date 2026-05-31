@@ -142,6 +142,37 @@ case "$rendered3" in
 esac
 printf '[smoke]   [ok] R2: rederive reflects LIVE count (3) after a task is added\n'
 
+# ---- R2b: top-task metadata comes from ONE bounded read --------------------
+# r2 codex BLOCKING: the rederive must not do a SECOND, unbounded queue read
+# for the top-task header. nudge-live-state with_top_task=1 returns the count
+# AND the highest-priority queued task in the SAME bounded call. Assert the
+# 6-column shape and that the top task is the urgent one (highest priority),
+# and that the legacy 2-arg call still yields exactly 3 columns (backward
+# compat for the daemon's existing nudge_agent_session caller).
+live6="$(python3 "$repo/bridge-daemon-helpers.py" nudge-live-state "$BRIDGE_TASK_DB" "$agent" 1)"
+col_count6="$(printf '%s' "$live6" | awk -F'\t' '{print NF}')"
+[[ "$col_count6" == "6" ]] || fail "R2b: with_top_task=1 must emit 6 cols, got ${col_count6}: ${live6}"
+top_id6="$(printf '%s' "$live6" | awk -F'\t' '{print $4}')"
+top_pri6="$(printf '%s' "$live6" | awk -F'\t' '{print $5}')"
+[[ "$top_id6" == "$id_top" ]] || fail "R2b: top_id must be the urgent task #${id_top}, got #${top_id6}"
+[[ "$top_pri6" == "urgent" ]] || fail "R2b: top_priority must be urgent, got ${top_pri6}"
+live3="$(python3 "$repo/bridge-daemon-helpers.py" nudge-live-state "$BRIDGE_TASK_DB" "$agent")"
+col_count3="$(printf '%s' "$live3" | awk -F'\t' '{print NF}')"
+[[ "$col_count3" == "3" ]] || fail "R2b: legacy 2-arg call must stay 3 cols, got ${col_count3}: ${live3}"
+# Structural: the rederive helper must call nudge-live-state with the
+# with_top_task flag and must NOT issue a second find-open / bridge_queue_cli
+# queue read (which would be unbounded on the daemon/flusher path).
+tmux_src="$repo/lib/bridge-tmux.sh"
+helper_body="$(awk '/^bridge_tmux_pending_attention_rederive_queue_nudge\(\)/{f=1} f{print} /^}/{if(f)exit}' "$tmux_src")"
+case "$helper_body" in
+  *'nudge-live-state'*'"$agent" 1'*) : ;;
+  *) fail "R2b: rederive helper does not call nudge-live-state with with_top_task=1" ;;
+esac
+if printf '%s' "$helper_body" | grep -q "bridge_queue_cli\|find-open"; then
+  fail "R2b: rederive helper still issues an unbounded second queue read (find-open/bridge_queue_cli)"
+fi
+printf '[smoke]   [ok] R2b: top-task folded into ONE bounded read (6 cols, urgent top), legacy 3-col preserved, no 2nd unbounded read\n'
+
 # ---- R3: drained queue → rc=2 (drop) --------------------------------------
 # Close every queued task; a CONFIRMED count==0 must return rc=2 so the
 # flusher drops the spooled entry.
@@ -156,10 +187,12 @@ set -e
 (( rc_empty == 2 )) || fail "R3: confirmed-empty queue must return rc=2 (drop), got rc=$rc_empty"
 printf '[smoke]   [ok] R3: confirmed count==0 returns rc=2 (drop)\n'
 
-# ---- R4: simulated read failure → rc=1 (preserve), NOT rc=2 ----------------
-# Point the live-count read at a corrupt DB so nudge-live-state exits
-# non-zero. A transient read failure must FAIL SAFE (rc=1 preserve), never
-# be mistaken for count==0 (rc=2 drop).
+# ---- R4: simulated read wedge/failure → rc=1 (preserve), NOT rc=2 ----------
+# Point the single bounded read (nudge-live-state with_top_task=1) at a
+# corrupt DB so it exits non-zero — this stands in for a wedged/timed-out
+# queue read. Because the count AND the top-task metadata now come from that
+# ONE bounded call, a failure of EITHER part is covered here: it must FAIL
+# SAFE (rc=1 preserve), never be mistaken for count==0 (rc=2 drop).
 corrupt_db="$scratch/corrupt.db"
 printf 'this is not a sqlite database' > "$corrupt_db"
 set +e
@@ -171,7 +204,7 @@ if (( rc_fail == 2 )); then
   fail "R4: a read failure was treated as count==0 (rc=2 drop) — FAIL-SAFE violated"
 fi
 (( rc_fail == 1 )) || fail "R4: expected rc=1 (preserve) on read failure, got rc=$rc_fail"
-printf '[smoke]   [ok] R4: read failure returns rc=1 (preserve), never rc=2\n'
+printf '[smoke]   [ok] R4: bounded read wedge/failure (count+top-task) returns rc=1 (preserve), never rc=2\n'
 
 # ---- R5: nudge detection is anchored to the producer header ----------------
 # Positive: the two real producer shapes must be recognized.

@@ -1633,21 +1633,29 @@ bridge_tmux_pending_attention_rederive_queue_nudge() {
   local agent="$1"
   local live_state=""
   local live_state_rc=0
+  local live_state_tmp=""
   local live_queued=""
-  local open_task_shell=""
+  local live_claimed=""
+  local live_csv=""
   local task_id=""
-  local task_title=""
   local task_priority="normal"
+  local task_title=""
   local title=""
   local message=""
 
   [[ -n "$agent" ]] || return 1
 
-  # Live count + queued ids — same helper + 15s ceiling the daemon nudge
-  # path uses (bridge-daemon.sh::nudge_agent_session). The flusher runs on
-  # the daemon's per-sync path, so the read MUST be timeout-bounded to avoid
-  # stalling the flush loop. rc=124/137 (timeout) and any non-zero rc fall
-  # through to fail-safe preserve (rc=1), NOT to drop.
+  # Single bounded queue read — the live count AND the highest-priority
+  # queued task's id/priority/title come back from ONE
+  # `nudge-live-state … with_top_task=1` call (Issue #1425 r2 codex
+  # BLOCKING). This is the same helper + 15s ceiling the daemon nudge path
+  # uses (bridge-daemon.sh::nudge_agent_session); the flusher runs on the
+  # daemon's per-sync path, so EVERY queue read here MUST be timeout-bounded
+  # to avoid stalling the flush loop. There is deliberately NO second,
+  # unbounded queue-CLI/gateway call for the top-task metadata — folding it
+  # into the bounded read is what keeps the whole rederive path bounded.
+  # rc=124/137 (timeout) and any non-zero rc fall through to fail-safe
+  # preserve (rc=1), NOT to drop.
   if ! command -v bridge_with_timeout >/dev/null 2>&1; then
     return 1
   fi
@@ -1657,12 +1665,22 @@ bridge_tmux_pending_attention_rederive_queue_nudge() {
   # back and clobber the caller's errexit state (Issue #1425 r1 self-review).
   live_state="$(bridge_with_timeout 15 spool_rederive_live_state \
     python3 "$BRIDGE_SCRIPT_DIR/bridge-daemon-helpers.py" \
-    nudge-live-state "$BRIDGE_TASK_DB" "$agent" 2>/dev/null)" || live_state_rc=$?
+    nudge-live-state "$BRIDGE_TASK_DB" "$agent" 1 2>/dev/null)" || live_state_rc=$?
   (( live_state_rc == 0 )) || return 1
   [[ -n "$live_state" ]] || return 1
-  # Output is `queued_count<TAB>claimed_count<TAB>csv_ids`. Parse the leading
-  # field via parameter expansion (footgun #11: avoid `read … <<<"$row"`).
-  live_queued="${live_state%%$'\t'*}"
+
+  # Output (with_top_task=1) is a single TSV row:
+  #   queued_count <TAB> claimed_count <TAB> csv_ids <TAB>
+  #   top_id <TAB> top_priority <TAB> top_title
+  # Parse via `read` from a tempfile (footgun #11: avoid `read … <<<"$row"`
+  # here-string). The title is python-sanitized of tab/newline so the 6th
+  # field is well-formed; `read -r` lets the last field absorb any spaces.
+  live_state_tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$live_state_tmp'" RETURN
+  printf '%s\n' "$live_state" > "$live_state_tmp"
+  IFS=$'\t' read -r live_queued live_claimed live_csv task_id task_priority task_title < "$live_state_tmp"
+  : "${live_claimed:=}" "${live_csv:=}"
   [[ "$live_queued" =~ ^[0-9]+$ ]] || return 1
 
   # CONFIRMED empty → drop. Only a successful query that proves count==0
@@ -1671,31 +1689,10 @@ bridge_tmux_pending_attention_rederive_queue_nudge() {
     return 2
   fi
 
-  # Highest-priority open task for the header line — same source the daemon
-  # uses to render the nudge (bridge-daemon.sh:6354 calls find-open directly,
-  # unwrapped, for the same reason). A missing/odd result is non-fatal: the
-  # count line is still live, so re-render with an empty top-task rather than
-  # preserving a stale id. bridge_queue_cli is a bash function (it may route
-  # through the queue gateway) so it cannot go through bridge_with_timeout,
-  # which execs an external `timeout` binary; the drop-deciding count read
-  # above is the external, timeout-bounded read.
-  # `|| true` keeps a non-zero find-open (no open task) from tripping a
-  # caller's errexit without touching global `set -e` state.
-  open_task_shell="$(bridge_queue_cli find-open --agent "$agent" --format shell 2>/dev/null)" || true
-  if [[ -n "$open_task_shell" ]]; then
-    local _open_task_tmp=""
-    _open_task_tmp="$(mktemp)" || return 1
-    # shellcheck disable=SC2064
-    trap "rm -f -- '$_open_task_tmp'" RETURN
-    printf '%s\n' "$open_task_shell" > "$_open_task_tmp"
-    # shellcheck disable=SC1090
-    source "$_open_task_tmp" 2>/dev/null || true
-    if [[ "${TASK_STATUS:-}" == "queued" && -n "${TASK_ID:-}" && -n "${TASK_TITLE:-}" ]]; then
-      task_id="$TASK_ID"
-      task_title="$TASK_TITLE"
-      task_priority="${TASK_PRIORITY:-normal}"
-    fi
-  fi
+  # Normalize the top-task fields (empty when nothing resolvable — the count
+  # line is still live, so re-render with an empty top-task rather than
+  # preserving a stale id). A blank priority defaults to normal.
+  [[ -n "$task_priority" ]] || task_priority="normal"
 
   title="$(bridge_queue_attention_title "$live_queued")"
   message="$(bridge_queue_attention_message "$agent" "$live_queued" "$task_id" "$task_priority" "$task_title")"
