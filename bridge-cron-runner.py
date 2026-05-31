@@ -1697,13 +1697,30 @@ def claude_config_dir_for_request(request: dict[str, Any]) -> Path | None:
     if from_launch_env is not None:
         return from_launch_env
 
-    for candidate in _shared_agent_claude_config_candidates(agent):
+    candidates = _shared_agent_claude_config_candidates(agent)
+    # Prefer a candidate that carries an explicit file-based credential: the
+    # Linux / file-cred layout where each agent has its own ``.credentials.json``
+    # and we must pick the dir that actually holds it.
+    for candidate in candidates:
         if (candidate / ".credentials.json").is_file():
             return candidate
 
     isolated_user = _isolated_user_for_agent(agent)
     if isolated_user is not None:
         return Path(isolated_user.pw_dir) / ".claude"
+
+    # No file-based credential anywhere. This is normal on hosts where Claude
+    # Code does not persist a ``.credentials.json`` at all — most notably macOS,
+    # where the claude.ai OAuth token lives in the login Keychain, and any host
+    # authed via ANTHROPIC_API_KEY / apiKeyHelper. Fall back to the canonical
+    # per-agent config dir the interactive launcher uses
+    # (``bridge_run_agent_claude_root`` => ``<agent-home>/.claude``); auth is
+    # then resolved by Claude itself at launch. Without this fallback every cron
+    # run on such a host aborts with "Claude config dir not found" even though
+    # the agent's interactive sessions authenticate fine.
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
     return None
 
 
@@ -1777,10 +1794,19 @@ def apply_claude_agent_env(env: dict[str, str], request: dict[str, Any], request
         env["CRON_REQUEST_DIR"] = str(request_file.parent)
 
     sudo_user = claude_run_as_user_for_request(request, config_dir)
-    if sudo_user is None and not os.access(config_dir / ".credentials.json", os.R_OK):
+    # File-based ``.credentials.json`` is only one of Claude Code's auth
+    # backends. macOS keeps the claude.ai OAuth token in the login Keychain and
+    # writes no cred file; ANTHROPIC_API_KEY / apiKeyHelper are also valid. Only
+    # assert *file* readability when the file actually exists — that preserves
+    # the original guard's purpose (catch a per-agent cred file the cron runner
+    # cannot read, e.g. an iso-perms regression) without rejecting hosts that
+    # legitimately have no cred file. When absent, defer to Claude's own auth
+    # resolution rather than abort with a misleading "not readable" error.
+    cred_file = config_dir / ".credentials.json"
+    if sudo_user is None and cred_file.exists() and not os.access(cred_file, os.R_OK):
         raise RuntimeError(
-            f"Claude credentials for target agent {agent} are not readable by the cron runner: "
-            f"{config_dir / '.credentials.json'}"
+            f"Claude credentials file for target agent {agent} exists but is not readable "
+            f"by the cron runner: {cred_file}"
         )
     return sudo_user
 
