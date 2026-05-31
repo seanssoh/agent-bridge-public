@@ -2556,7 +2556,34 @@ def cmd_run(args: argparse.Namespace) -> int:
         # The corrupted-JSON / non-dict / payload_kind cross-check
         # path now runs inside the flock so a body swap between
         # validate and exec must contend with the lock.
-        return cmd_run_shell(request_file, args)
+        #
+        # Controller-private perms (run_dir 0700 + request.json 0600) are
+        # NECESSARY for a shell payload but not SUFFICIENT to prove the payload
+        # IS shell. `shell_artifact_route` classifies by perms alone, before
+        # reading the body. On hosts where the daemon runs under umask 077
+        # (bridge-lib.sh sets it process-wide; non-iso single-user macOS never
+        # reaches the `bridge_cron_run_dir_grant_isolation` group-widening,
+        # which is gated to linux-user-iso targets) EVERY run dir lands
+        # 0700/0600 — including text/claude crons. Routing those to the shell
+        # handler makes `is_shell_request_payload` fail under the flock and
+        # aborts the run as `request_artifact_tampered`, silently breaking 100%
+        # of text crons. Peek the body here (safe: an owner-private dir is
+        # controller-written, never attacker-writable) and only commit to the
+        # shell path when the payload is actually shell. A non-shell payload in
+        # a private dir is benign — fall through to the text path below, which
+        # re-reads + re-validates under its own untrusted-body model and still
+        # rejects any cross-route shell payload. A corrupted/non-dict body also
+        # stays on the shell path so its existing flocked error handling runs.
+        try:
+            shell_peek: Any = read_json(request_file)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            shell_peek = None
+        benign_text_in_private_dir = (
+            isinstance(shell_peek, dict)
+            and not is_shell_request_payload(shell_peek)
+        )
+        if not benign_text_in_private_dir:
+            return cmd_run_shell(request_file, args)
 
     # Non-shell route: legacy text path. The artifacts are not
     # controller-private here, so we treat the body as untrusted —
