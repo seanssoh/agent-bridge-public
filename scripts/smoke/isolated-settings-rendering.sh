@@ -278,6 +278,50 @@ EOF
     "skipDangerousModePermissionPrompt survives second render through symlink dereference"
 }
 
+assert_apikeyhelper_disable_state_not_resurrected() {
+  # #1444 BLOCKING 1 companion: the gate (bridge-auth.py) removes the
+  # bridge-managed apiKeyHelper from a per-agent settings.json when
+  # keychain-free auth is disabled. The isolated-home renderer must not
+  # re-introduce it — its preserve allowlist only carries forward what the
+  # prior settings already held. Build a fresh isolated home whose
+  # settings.json has NO apiKeyHelper (the post-disable state) and confirm
+  # the rendered effective file also has none.
+  local helper="$SMOKE_REPO_ROOT/scripts/python-helpers/claude-settings-gate-test.py"
+  local stage_root="$SMOKE_TMP_ROOT/stage-disable-state"
+  local stage_home="$stage_root/isolated-home"
+  mkdir -p "$stage_home/.claude"
+  cat >"$stage_home/.claude/settings.json" <<'EOF'
+{
+  "enabledPlugins": ["foo"],
+  "skipDangerousModePermissionPrompt": true
+}
+EOF
+  python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" render-isolated-home-settings \
+    --isolated-home "$stage_home" \
+    --base-settings-file "$FIXTURE_BRIDGE_HOME/agents/.claude/settings.json" \
+    --overlay-settings-file "$FIXTURE_BRIDGE_HOME/agents/.claude/settings.local.json" \
+    --launch-cmd "" >/dev/null
+  python3 "$helper" assert-apikeyhelper \
+    --settings "$stage_home/.claude/settings.effective.json" --absent \
+    || smoke_fail "isolated renderer fabricated an apiKeyHelper from a disabled-state settings.json"
+  smoke_log "PASS: isolated renderer keeps apiKeyHelper absent for disabled-state input"
+
+  # Inverse: an operator-owned apiKeyHelper still round-trips into effective.
+  python3 "$helper" set-apikeyhelper \
+    --settings "$stage_home/.claude/settings.json" \
+    --value "/opt/operator/iso-own-helper.sh"
+  python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" render-isolated-home-settings \
+    --isolated-home "$stage_home" \
+    --base-settings-file "$FIXTURE_BRIDGE_HOME/agents/.claude/settings.json" \
+    --overlay-settings-file "$FIXTURE_BRIDGE_HOME/agents/.claude/settings.local.json" \
+    --launch-cmd "" >/dev/null
+  python3 "$helper" assert-apikeyhelper \
+    --settings "$stage_home/.claude/settings.effective.json" \
+    --equals "/opt/operator/iso-own-helper.sh" \
+    || smoke_fail "isolated renderer dropped an operator-owned apiKeyHelper"
+  smoke_log "PASS: isolated renderer preserves an operator-owned apiKeyHelper"
+}
+
 main() {
   build_fixture
 
@@ -293,6 +337,8 @@ main() {
     assert_user_key_update_propagates
   smoke_run "symlink-aware preservation across consecutive renders" \
     assert_symlink_aware_preservation
+  smoke_run "apiKeyHelper disabled-state not resurrected; operator value preserved (#1444)" \
+    assert_apikeyhelper_disable_state_not_resurrected
 
   smoke_log "PASS"
 }
