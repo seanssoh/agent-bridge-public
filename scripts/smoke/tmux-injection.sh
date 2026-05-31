@@ -60,6 +60,32 @@ tmux_attention_payload_contract() {
   smoke_assert_eq "0" "$newline_count" "metadata-only queue attention payload stays single-line/no trailing newline"
 }
 
+tmux_submit_key_dispatch_contract() {
+  local calls_file
+
+  calls_file="$SMOKE_TMP_ROOT/submit-key-calls.txt"
+  : >"$calls_file"
+
+  bridge_tmux_send_keys_with_timeout() {
+    printf '%s\n' "$*" >>"$calls_file"
+  }
+
+  bridge_tmux_send_submit_key submit-claude fake-session claude
+  smoke_assert_contains "$(cat "$calls_file")" "submit-claude -t =fake-session: -H 1b 5b 31 33 75" "Claude submit defaults to CSI-u Enter"
+
+  : >"$calls_file"
+  BRIDGE_TMUX_CLAUDE_SUBMIT_KEY_MODE=legacy bridge_tmux_send_submit_key submit-legacy fake-session claude
+  smoke_assert_contains "$(cat "$calls_file")" "submit-legacy -t =fake-session: C-m" "Claude legacy submit override keeps C-m"
+
+  : >"$calls_file"
+  BRIDGE_TMUX_CLAUDE_SUBMIT_KEY_MODE=csi-u bridge_tmux_send_submit_key submit-requested-legacy fake-session claude legacy
+  smoke_assert_contains "$(cat "$calls_file")" "submit-requested-legacy -t =fake-session: C-m" "Claude requested legacy mode overrides default"
+
+  : >"$calls_file"
+  bridge_tmux_send_submit_key submit-codex fake-session codex
+  smoke_assert_contains "$(cat "$calls_file")" "submit-codex -t =fake-session: C-m" "non-Claude submit remains C-m"
+}
+
 tmux_pending_spool_contract() {
   local agent drained count head
 
@@ -87,6 +113,7 @@ main() {
   source_bridge_lib
   smoke_run "pending input classifier" tmux_pending_input_detection
   smoke_run "queue attention payload formats" tmux_attention_payload_contract
+  smoke_run "submit key dispatch" tmux_submit_key_dispatch_contract
   smoke_run "pending attention spool" tmux_pending_spool_contract
   smoke_log "passed"
 }
