@@ -6,6 +6,12 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.2] — 2026-05-31
+
+### Fixed
+
+- **Claude Code 2.1.158 submit compatibility — CSI-u Enter with legacy retry fallback.** Claude Code 2.1.158 can receive the physical Enter key as CSI-u (`ESC [ 13 u`) under enhanced keyboard protocols, while raw `C-m` no longer reliably submits the composer. Agent Bridge now routes Claude submit keystrokes through a centralized helper that sends CSI-u by default, while the `has_pending_input`-gated retry falls back to legacy `C-m` so older Claude builds self-heal without version probing. The same submit helper is used by type, paste, and blocker-advance paths, preserving the `0.15.1` mid-turn busy gate: busy Claude sessions still spool nudges, and idle Claude sessions submit immediately. Originated from `fix/claude-2158-csiu-submit`.
+
 ## [0.15.1] — 2026-05-31
 
 A stabilization batch on top of `0.15.0` plus one opt-in feature. Every item below is on `main`, CI-green (unit/static + oss-preflight + lint-heredoc-ban + lint + syntax + integration), and codex pair-reviewed.
