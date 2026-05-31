@@ -283,11 +283,25 @@ if [[ "$_resume_gate_enabled" == "1" && $SAFE_MODE -eq 0 ]]; then
       unset _gate_launch_history
     else
       unset _gate_launch_history
-      bridge_audit_log state session_id_missing_resume_blocked "$AGENT" \
+      # Lost-state: the agent HAS launched before (launch.history present) but
+      # its persisted session_id is gone — a #1246 daemon supp-group write
+      # failure, state churn, an operator rm, or a prior crash-loop that never
+      # captured one. The original behavior bridge_die'd here. Under the
+      # daemon's always-on restart loop that BRICKS the agent permanently:
+      # every relaunch hard-fails identically, so the agent can never recover
+      # on its own (the daemon's plugin-MCP-liveness watchdog then restarts it
+      # forever). A missing session_id is recoverable — degrade THIS launch to
+      # a fresh session (no --resume), exactly like the fresh-first-wake path
+      # above, but emit a loud warn so it stays ops-visible. The launch
+      # captures a fresh session_id on start and normal resume returns next
+      # launch. Genuine persistence/write errors still hard-fail loud in
+      # bridge_refresh_agent_session_id (bridge_die), so the #1248 fail-loud
+      # contract for actual write failures is preserved.
+      bridge_warn "[run] lost-state: continue=1 but session_id empty (agent=$AGENT) — degrading to a fresh session for this launch; a new id is captured on start and normal resume returns next launch"
+      bridge_audit_log run session_id_missing_resume_degraded "$AGENT" \
         --detail continue_mode="$_gate_continue" \
-        --detail reason=session_id_empty_with_continue_1 \
+        --detail reason=lost_state_session_id_empty_degraded_to_fresh \
         2>/dev/null || true
-      bridge_die "session_id missing; one of: (a) run agent first interactively to capture, (b) set continue=0 explicitly, (c) check #1246 daemon supp-group state (agent=$AGENT continue=$_gate_continue session_id=empty)"
     fi
   fi
   unset _gate_continue _gate_session_id

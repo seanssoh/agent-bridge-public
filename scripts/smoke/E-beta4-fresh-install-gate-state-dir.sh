@@ -34,8 +34,12 @@
 #   T1  fresh agent (no launch.history) + continue=1 + session_id="" ->
 #       fresh-state branch (no `--resume`, no die) + history touched.
 #   T2  post-launch agent (launch.history present) + continue=1 +
-#       session_id="" -> die with (a)/(b)/(c) remediation (lost-state
-#       preserved).
+#       session_id="" -> DEGRADE to a fresh session (rc=0 + warn +
+#       session_id_missing_resume_degraded audit), not die. #1439 replaced
+#       the old fleet-bricking bridge_die with warn-and-degrade; the
+#       lost-state observation still surfaces loud, but the launch proceeds
+#       fresh so the daemon's restart loop can self-recover. Genuine
+#       persist/state-dir-write failures still hard-fail (unchanged).
 #   T3  continue=0 / --no-continue -> no resume verb (gate not entered).
 #   T4  daemon wake call site self-heals state dir absent state — grep
 #       proof in bridge-daemon.sh on all three wake sites (always-on
@@ -202,10 +206,13 @@ test_fresh_first_wake_no_die() {
 
 # ---------------------------------------------------------------------
 # T2 — post-launch agent (launch.history present) + continue=1 +
-#      session_id="" -> die with (a)/(b)/(c) remediation. This is the
-#      genuine #1248 lost-state path; Lane E must NOT regress it.
+#      session_id="" -> DEGRADE to a fresh session (#1439), not die. The
+#      lost-state observation must still be loud (warn + audit row) but the
+#      launch proceeds rc=0 so the daemon's always-on restart loop can
+#      self-recover instead of bricking. The old bridge_die path
+#      (#1248/Lane E) is gone; T5-style teeth pin its absence.
 # ---------------------------------------------------------------------
-test_lost_state_still_fails_loud() {
+test_lost_state_degrades_to_fresh() {
   local agent="e-T2-lost"
   write_dryrun_roster "$agent" 1 ""
 
@@ -214,6 +221,11 @@ test_lost_state_still_fails_loud() {
   mkdir -p "$(dirname "$marker")"
   : >"$marker"
 
+  # Truncate the audit log so the runtime audit-row assertion sees only this
+  # test's rows (the dry-run inherits BRIDGE_AUDIT_LOG from the smoke env).
+  mkdir -p "$(dirname "$BRIDGE_AUDIT_LOG")"
+  : >"$BRIDGE_AUDIT_LOG"
+
   local out=""
   local rc=0
   set +e
@@ -221,17 +233,26 @@ test_lost_state_still_fails_loud() {
   rc=$?
   set -e
 
-  if (( rc == 0 )); then
-    smoke_fail "T2 expected non-zero rc from bridge-run.sh when post-launch agent + continue=1 + session_id empty, got rc=0; out=$out"
+  # #1439: degrade-to-fresh (rc=0), not the old fleet-bricking die.
+  if (( rc != 0 )); then
+    smoke_fail "T2 expected rc=0 (degrade-to-fresh) from bridge-run.sh when post-launch agent + continue=1 + session_id empty, got rc=$rc; out=$out"
   fi
-  smoke_assert_contains "$out" "session_id missing" \
-    "T2 lost-state error message present"
-  smoke_assert_contains "$out" "(a) run agent first interactively to capture" \
-    "T2 remediation (a) preserved"
-  smoke_assert_contains "$out" "(b) set continue=0 explicitly" \
-    "T2 remediation (b) preserved"
-  smoke_assert_contains "$out" "(c) check #1246 daemon supp-group state" \
-    "T2 remediation (c) preserved"
+  smoke_assert_contains "$out" "lost-state: continue=1 but session_id empty" \
+    "T2 lost-state warn line present (ops-visible degrade)"
+  smoke_assert_contains "$out" "degrading to a fresh session" \
+    "T2 warn says it is degrading to a fresh session (#1439)"
+  smoke_assert_not_contains "$out" "session_id missing; one of" \
+    "T2 the old bridge_die remediation text is gone (#1439)"
+  smoke_assert_not_contains "$out" "--resume" \
+    "T2 degraded launch carries no synthesized --resume verb"
+
+  # Runtime audit-row: the degrade action is emitted, the old die action is not.
+  local audit_body=""
+  audit_body="$(cat "$BRIDGE_AUDIT_LOG" 2>/dev/null || true)"
+  smoke_assert_contains "$audit_body" "session_id_missing_resume_degraded" \
+    "T2 degrade emits the session_id_missing_resume_degraded audit row at runtime"
+  smoke_assert_not_contains "$audit_body" "session_id_missing_resume_blocked" \
+    "T2 the old blocked/die audit action is not emitted at runtime (#1439)"
 }
 
 # ---------------------------------------------------------------------
@@ -378,8 +399,8 @@ test_teeth_daemon_self_heal_sites_present() {
 #   step 3: simulated real launch        => marker created (touch
 #                                            simulates the post-dry-run
 #                                            real-launch block)
-#   step 4: post-launch dry-run with     => rc != 0, lost-state die
-#           empty session_id                (#1248 gate path preserved)
+#   step 4: post-launch dry-run with     => rc=0, lost-state DEGRADE-to-fresh
+#           empty session_id                (#1439 — was die, now warn+degrade)
 #
 # Step 3 simulates the real-launch marker write rather than spawning
 # claude (the smoke does not have an engine). Step 4 covers the
@@ -461,11 +482,11 @@ test_dry_run_sequence_side_effect_free() {
   smoke_assert_file_exists "$marker" \
     "T_dry_run_seq step 3: production real-launch path created the canonical marker at $marker"
 
-  # Step 4: post-launch dry-run with empty session_id => lost-state die.
-  # Same gate path as T2, but exercised on the same agent's lifecycle so
-  # the whole sequence (fresh -> fresh -> launched -> lost) is covered
-  # end-to-end. Switch back to the dry-run roster (engine=claude) so
-  # this path matches T2's setup.
+  # Step 4: post-launch dry-run with empty session_id => lost-state
+  # DEGRADE-to-fresh (#1439, was die). Same gate path as T2, exercised on
+  # the same agent's lifecycle so the whole sequence
+  # (fresh -> fresh -> launched -> lost) is covered end-to-end. Switch back
+  # to the dry-run roster (engine=claude) so this path matches T2's setup.
   write_dryrun_roster "$agent" 1 ""
 
   local out4=""
@@ -474,11 +495,13 @@ test_dry_run_sequence_side_effect_free() {
   out4="$(bash "$REPO_ROOT/bridge-run.sh" "$agent" --continue --dry-run 2>&1)"
   rc4=$?
   set -e
-  if (( rc4 == 0 )); then
-    smoke_fail "T_dry_run_seq step 4: expected non-zero rc from post-launch lost-state dry-run, got rc=0; out=$out4"
+  if (( rc4 != 0 )); then
+    smoke_fail "T_dry_run_seq step 4: expected rc=0 (degrade-to-fresh) from post-launch lost-state dry-run, got rc=$rc4; out=$out4"
   fi
-  smoke_assert_contains "$out4" "session_id missing" \
-    "T_dry_run_seq step 4: lost-state die fires once marker is present (#1248 gate preserved)"
+  smoke_assert_contains "$out4" "degrading to a fresh session" \
+    "T_dry_run_seq step 4: lost-state degrades to fresh once marker is present (#1439)"
+  smoke_assert_not_contains "$out4" "session_id missing; one of" \
+    "T_dry_run_seq step 4: old die remediation gone (#1439)"
 }
 
 # ---------------------------------------------------------------------
@@ -622,7 +645,7 @@ test_teeth_dry_run_marker_deferred() {
 }
 
 smoke_run "T1 fresh first-wake skips die + dry-run leaves no marker (R2)" test_fresh_first_wake_no_die
-smoke_run "T2 lost-state still fails loud with (a)/(b)/(c)"          test_lost_state_still_fails_loud
+smoke_run "T2 lost-state degrades to fresh (rc=0 + warn + audit) (#1439)" test_lost_state_degrades_to_fresh
 smoke_run "T3 continue=0 / --no-continue gate not entered"           test_continue0_unchanged
 smoke_run "T4 daemon wake self_heal wired at all 3 sites"            test_daemon_wake_self_heal_grep
 smoke_run "T5 teeth: bridge-run.sh fresh-state branch present"       test_teeth_fresh_state_branch_present

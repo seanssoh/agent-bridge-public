@@ -1118,7 +1118,20 @@ if [[ -z "$(bridge_agent_session_id "$AGENT")" ]]; then
   # so the operator sees the structured reason on failure and the
   # session_id capture breadcrumb on success. Stdout (the captured id)
   # is still suppressed because nothing here consumes it.
-  bridge_refresh_agent_session_id "$AGENT" 12 0.25 >/dev/null
+  #
+  # BUT under `set -euo pipefail` (top of this script) a benign detect-empty
+  # `return 1` from bridge_refresh_agent_session_id aborts bridge-start.sh,
+  # which the restart helper treats as launch-failed and ROLLS BACK — killing
+  # a perfectly healthy session that simply had not written its session
+  # artifact within the 12×0.25s detection window yet (e.g. a slower Claude
+  # CLI `--continue` boot with plugins/MCP). detect-empty is explicitly "a
+  # safety-net visibility hook, not an error" (see the tail comment in
+  # bridge_refresh_agent_session_id); the daemon backfills the id on its next
+  # sync. Re-add `|| true` so the empty return is non-fatal. This does NOT
+  # mask bridge_die persist-failures (those `exit 1` directly, which `|| true`
+  # cannot intercept) and does NOT redirect stderr, so the #1248 visibility
+  # intent is fully preserved.
+  bridge_refresh_agent_session_id "$AGENT" 12 0.25 >/dev/null || true
 fi
 echo "[info] 세션 '$SESSION' 시작 완료"
 
