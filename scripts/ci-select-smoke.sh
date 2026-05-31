@@ -1410,7 +1410,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # tool-policy.py moves so a future PR cannot regress the admin
       # carve-out back to a blacklist or widen it into a write/leak
       # surface.
-      add_required hooks agent-update v2-cross-class-read admin-hook-exemption tool-policy-roster-read-classify 1205-hook-iso-fail-open 6607-hook-admin-allowlist K-beta4-nits 1358-admin-credential-routine-exempt
+      # Issue #1442: PROTECTED_GLOBS in lib/system_config_paths.py now
+      # covers the v2 per-agent-workdir layout
+      # (data/agents/*/workdir/.discord|.telegram/access.json) alongside
+      # the pre-v2 globs, so the #341 operator-gated `config get/set`
+      # wrapper can actually edit per-agent channel-access files on a v2
+      # install. Pull the v2-glob smoke whenever the wrapper or the
+      # protected-path module moves so a future edit cannot regress the
+      # v2 path back to `deny: path not in system-config protected list`
+      # or drop the pre-v2 globs.
+      add_required hooks agent-update v2-cross-class-read admin-hook-exemption tool-policy-roster-read-classify 1205-hook-iso-fail-open 6607-hook-admin-allowlist K-beta4-nits 1358-admin-credential-routine-exempt 1442-config-protected-globs-v2
       add_integration integration-minimal
       ;;
 
