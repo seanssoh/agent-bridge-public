@@ -1318,6 +1318,42 @@ run_subagent() {
   bridge_cron_runner_python "${args[@]}"
 }
 
+# #1437 — reactive re-dispatch entry. Invoked by bridge-cron-runner.py after a
+# *successful* reactive Claude OAT rotation (the active token hit its limit,
+# the runner rotated to a healthy alternate). It re-enqueues the SAME job for a
+# fresh slot so the work runs again on the now-healthy token. The per-job
+# attempt cap + cooldown that prevents an infinite loop on a persistent global
+# quota is enforced by the runner BEFORE it calls this — this entry just
+# re-enqueues. Reuses `run_enqueue` so the full dispatch plumbing (request
+# artifact, queue task, isolation grants) is shared, not reimplemented.
+run_reactive_redispatch() {
+  local run_id="${1:-}"
+  shift || true
+  [[ -n "$run_id" ]] || bridge_die "Usage: $(basename "$0") reactive-redispatch <run-id>"
+
+  local request_file
+  request_file="$(bridge_cron_request_file_by_id "$run_id")"
+  [[ -f "$request_file" ]] || bridge_die "cron run request를 찾지 못했습니다: $run_id"
+
+  # Extract the job id (job_id is the stable enqueue key; fall back to
+  # job_name). `python3 -c "<arg>"` keeps us clear of the Bash 5.3.9
+  # heredoc-stdin deadlock (footgun #11).
+  local job_ref=""
+  job_ref="$("${BRIDGE_PYTHON:-python3}" -c 'import json,sys
+try:
+  d=json.load(open(sys.argv[1]))
+  print(d.get("job_id") or d.get("job_name") or "")
+except Exception:
+  print("")' "$request_file" 2>/dev/null || echo "")"
+  [[ -n "$job_ref" ]] || bridge_die "reactive-redispatch: request에 job_id/job_name이 없습니다: $run_id"
+
+  local reactive_slot
+  reactive_slot="reactive-$(date -u +%Y%m%dT%H%M%SZ)"
+
+  bridge_info "cron reactive-redispatch job=${job_ref} new_slot=${reactive_slot} (after OAT rotation, src_run=${run_id})"
+  run_enqueue "$job_ref" --slot "$reactive_slot" --from "cron-reactive"
+}
+
 run_finalize() {
   local run_id="${1:-}"
   local json_output=0
@@ -1771,6 +1807,9 @@ case "$subcommand" in
     ;;
   run-subagent)
     run_subagent "$@"
+    ;;
+  reactive-redispatch)
+    run_reactive_redispatch "$@"
     ;;
   finalize-run)
     run_finalize "$@"

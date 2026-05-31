@@ -51,6 +51,24 @@ DIRECT_SEND_MARKERS = (
 )
 MARKER_EXCERPT_LIMIT = 80
 
+# #1437 — reactive Claude OAT rotation on a live cron run that hit the usage
+# limit / 429. These markers are a fast PRE-FILTER only: the authoritative
+# classification is delegated to ``claude-token classify-output`` (which reuses
+# bridge-auth.py:classify_probe and its QUOTA_LIMIT_MARKERS), so this list is
+# never the single source of truth and a miss here only means we skip the
+# (cheap) classify subprocess. Keep it broad and in sync with classify_probe.
+CLAUDE_QUOTA_PREFILTER_MARKERS = (
+    "429",
+    "hit your limit",
+    "usage limit",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "quota",
+)
+REACTIVE_REDISPATCH_DEFAULT_MAX_ATTEMPTS = 1
+REACTIVE_REDISPATCH_DEFAULT_COOLDOWN_SECONDS = 300
+
 RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1117,6 +1135,455 @@ def emit_legacy_key_audit(request: dict[str, Any], run_id: str, *, target_agent:
         run_id=run_id,
         details={"keys": ",".join(flagged)},
     )
+
+
+# ---------------------------------------------------------------------------
+# #1437 — reactive Claude OAT rotation on a headless cron 429.
+#
+# The daemon's *proactive* rotation trigger reads Claude usage from
+# claude-hud's `.usage-cache.json`, which never exists on a statusLine-less
+# headless cron host, so rotation never fires there. This reactive path runs
+# entirely on the live cron run: after a claude `-p` run's stdout+stderr are
+# captured, we detect a usage-limit/429, ROTATE FIRST (so `claude-token
+# rotate` still sees >=2 enabled tokens), THEN deterministically disable the
+# vacated quota-hit token, and re-dispatch the failed job ONCE under a
+# persisted per-job attempt cap + cooldown.
+# ---------------------------------------------------------------------------
+
+
+def reactive_rotation_enabled() -> bool:
+    # Default ON; opt-out for hosts that explicitly disable the reactive path.
+    return env_truthy(os.environ.get("BRIDGE_CRON_REACTIVE_ROTATION", "1"))  # noqa: iso-helper-boundary — plain env read (os.environ), not a .env file
+
+
+def env_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def claude_token_cmd() -> list[str]:
+    """Resolve the `claude-token` CLI invocation.
+
+    Tests override the whole command via BRIDGE_CLAUDE_TOKEN_CMD (shlex-split)
+    so the reactive chain can run against a fake token pool with no live
+    OAuth. Production resolves the sibling `bridge-auth.sh claude-token`.
+    """
+    override = os.environ.get("BRIDGE_CLAUDE_TOKEN_CMD", "").strip()  # noqa: iso-helper-boundary — plain env read (os.environ), not a .env file
+    if override:
+        return shlex.split(override)
+    auth_script = Path(__file__).resolve().parent / "bridge-auth.sh"
+    return ["bash", str(auth_script), "claude-token"]
+
+
+def _run_token_cli(args: list[str], timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [*claude_token_cmd(), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+        env=runner_env(),
+    )
+
+
+def _parse_json_stdout(text: str) -> dict[str, Any]:
+    text = (text or "").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        # rotate --sync emits a combined object; tolerate a trailing object.
+        try:
+            payload = json.loads(text.splitlines()[-1])
+        except (json.JSONDecodeError, IndexError):
+            return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def classify_run_output(
+    stdout_log: Path,
+    stderr_log: Path,
+    returncode: int,
+) -> tuple[str, dict[str, Any]]:
+    """Authoritatively classify a captured run via `claude-token classify-output`.
+
+    Files (never stdin) are passed to the classifier to stay clear of the
+    Bash 5.3.9 heredoc-stdin deadlock (footgun #11). Reuses
+    bridge-auth.py:classify_probe so the marker list is not forked.
+    """
+    args = [
+        "classify-output",
+        "--returncode",
+        str(returncode),
+    ]
+    if stdout_log.is_file():  # noqa: raw-pathlib-controller-only — controller-owned cron run log; runner reads its own captured output
+        args += ["--stdout-file", str(stdout_log)]
+    if stderr_log.is_file():  # noqa: raw-pathlib-controller-only — controller-owned cron run log; runner reads its own captured output
+        args += ["--stderr-file", str(stderr_log)]
+    try:
+        completed = _run_token_cli(args, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return "failed", {}
+    detail = _parse_json_stdout(completed.stdout)
+    return str(detail.get("status") or "failed"), detail
+
+
+def quota_prefilter_hit(stdout_text: str, stderr_text: str) -> bool:
+    """Cheap pre-filter over BOTH streams before the classify subprocess."""
+    blob = f"{stdout_text}\n{stderr_text}".lower()
+    return any(marker in blob for marker in CLAUDE_QUOTA_PREFILTER_MARKERS)
+
+
+def token_registry_state() -> dict[str, Any]:
+    try:
+        completed = _run_token_cli(["list", "--json"], timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return _parse_json_stdout(completed.stdout)
+
+
+def token_is_enabled(token_id: str) -> bool:
+    """Authoritatively read whether `token_id` is currently enabled.
+
+    Used to VERIFY the mark-quota disable actually took (the hard requirement
+    that the old quota-hit token never stays enabled after a successful
+    rotate). On any read error we conservatively report True (still enabled) so
+    the caller fails closed — i.e. skips re-dispatch rather than re-running with
+    a possibly-still-enabled quota token.
+    """
+    state = token_registry_state()
+    rows = state.get("tokens")
+    if not isinstance(rows, list):
+        return True
+    for row in rows:
+        if isinstance(row, dict) and str(row.get("id") or "") == token_id:
+            return bool(row.get("enabled", True))
+    # Token not found → it cannot be in the enabled pool; treat as not enabled.
+    return False
+
+
+def reactive_attempt_state_file(run_dir: Path, job_id: str) -> Path:
+    """Per-JOB attempt-cap state, persisted under the cron state root.
+
+    Lives next to other cron state so a smoke `BRIDGE_CRON_STATE_DIR`
+    override scopes it, and so a persistent global quota cannot create an
+    infinite re-dispatch loop across daemon ticks. Keyed by job_id (not
+    run_id) because each slot is a fresh run_id; the cap is per JOB.
+    """
+    state_dir = cron_state_dir_from_env(run_dir) / "reactive-rotation"
+    safe_job = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in (job_id or "job"))
+    return state_dir / f"{safe_job or 'job'}.json"
+
+
+def load_reactive_attempt_state(state_file: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def reactive_redispatch_allowed(
+    state_file: Path,
+    *,
+    max_attempts: int,
+    cooldown_seconds: int,
+    now: datetime,
+) -> tuple[bool, str]:
+    """Return (allowed, reason). Enforces the persisted per-job cap + cooldown."""
+    state = load_reactive_attempt_state(state_file)
+    attempts = int(state.get("attempts") or 0)
+    if attempts >= max_attempts:
+        return False, "attempt_cap_reached"
+    last_at = iso_to_dt(str(state.get("last_redispatch_at") or ""))
+    if last_at is not None and cooldown_seconds > 0:
+        elapsed = (now - last_at).total_seconds()
+        if elapsed < cooldown_seconds:
+            return False, "cooldown_active"
+    return True, "ok"
+
+
+def record_reactive_redispatch(state_file: Path, *, run_id: str, now: datetime) -> None:
+    state = load_reactive_attempt_state(state_file)
+    state["attempts"] = int(state.get("attempts") or 0) + 1
+    state["last_redispatch_at"] = now.isoformat(timespec="seconds")
+    state["last_run_id"] = run_id
+    state_file.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-owned cron-state attempt-cap dir; never iso-routed
+    tmp = state_file.with_name(state_file.name + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, state_file)
+
+
+def iso_to_dt(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def fire_reactive_redispatch(run_id: str, timeout: int = 60) -> tuple[bool, str]:
+    """Invoke the cron re-dispatch entry for `run_id`.
+
+    Tests override the command via BRIDGE_CRON_REACTIVE_REDISPATCH_CMD so the
+    re-dispatch can be observed without a daemon. Production calls the sibling
+    `bridge-cron.sh reactive-redispatch <run_id>`.
+    """
+    override = os.environ.get("BRIDGE_CRON_REACTIVE_REDISPATCH_CMD", "").strip()  # noqa: iso-helper-boundary — plain env read (os.environ), not a .env file
+    if override:
+        cmd = [*shlex.split(override), run_id]
+    else:
+        cron_script = Path(__file__).resolve().parent / "bridge-cron.sh"
+        cmd = ["bash", str(cron_script), "reactive-redispatch", run_id]
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=runner_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"redispatch_invoke_error: {exc!r}"
+    if completed.returncode != 0:
+        tail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        return False, f"redispatch_failed_rc={completed.returncode}: {tail[-1] if tail else ''}"
+    return True, "ok"
+
+
+def maybe_reactive_rotate(
+    *,
+    request: dict[str, Any],
+    run_id: str,
+    run_dir: Path,
+    stdout_log: Path,
+    stderr_log: Path,
+    stdout_text: str,
+    stderr_text: str,
+    returncode: int,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    target_agent: str,
+) -> dict[str, Any] | None:
+    """Reactive Claude OAT rotation on a headless cron 429. Best-effort.
+
+    Returns an audit-summary dict when the path engaged (for the run result),
+    or None when no quota condition was detected / the path is disabled. Never
+    raises — any failure is logged into the returned summary and the run still
+    finalizes as the (failed) run it was.
+    """
+    if not reactive_rotation_enabled():
+        return None
+
+    # Cheap pre-filter over BOTH stdout and stderr (429 frequently goes to
+    # stderr). Only spend the classify subprocess when something looks like a
+    # limit hit.
+    if not quota_prefilter_hit(stdout_text, stderr_text):
+        return None
+
+    status, detail = classify_run_output(stdout_log, stderr_log, returncode)
+    if status != "quota_limited":
+        return None
+
+    truncated = bool(stdout_truncated or stderr_truncated)
+    summary: dict[str, Any] = {
+        "detected": True,
+        "truncated": truncated,
+        "reset_at": str(detail.get("reset_at") or ""),
+        "rotated": False,
+        "redispatched": False,
+    }
+
+    emit_audit_row(
+        action="cron_quota_detected",
+        actor="cron-runner",
+        target_agent=target_agent or "daemon",
+        run_id=run_id,
+        details={
+            "api_error_status": str(detail.get("api_error_status") or ""),
+            "truncated": str(truncated).lower(),
+            "reset_at": summary["reset_at"],
+        },
+    )
+
+    # Snapshot the active id BEFORE rotating so we can (a) assert rotate
+    # advanced away from it and (b) target the disable at the right token.
+    pre = token_registry_state()
+    old_active = str(pre.get("active_token_id") or "")
+    summary["old_active"] = old_active
+
+    # ROTATE FIRST. `rotate --if-auto-enabled` is a no-op (status=skipped) when
+    # auto-rotate is disabled OR there is no enabled alternate — in which case
+    # we leave the quota-hit token as-is and DO NOT re-dispatch (fail normally).
+    rotate_args = [
+        "rotate",
+        "--if-auto-enabled",
+        "--sync",
+        "--agents",
+        "all",
+        "--reason",
+        "cron_reactive_quota",
+        "--json",
+    ]
+    try:
+        rotate_completed = _run_token_cli(rotate_args, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        summary["rotate_error"] = f"{exc!r}"
+        return summary
+    rotate_payload = _parse_json_stdout(rotate_completed.stdout)
+    rotate_status = str(rotate_payload.get("status") or "")
+    new_active = str(rotate_payload.get("active_token_id") or "")
+    summary["rotate_status"] = rotate_status
+    summary["new_active"] = new_active
+
+    if rotate_status != "rotated":
+        # no_alternate_token / auto_rotate_disabled → clean no-op, no loop.
+        summary["rotate_skip_reason"] = str(rotate_payload.get("reason") or rotate_status or "skipped")
+        return summary
+
+    # If the PRE-rotation registry read failed (token_registry_state returned
+    # {}), `old_active` is empty — but the rotate payload authoritatively
+    # reports the id it rotated away from. Recover from it so we can still
+    # identify and retire the quota-hit token (fail-closed: if we still cannot
+    # identify the old token below, we refuse to re-dispatch).
+    if not old_active:
+        old_active = str(rotate_payload.get("old_active_token_id") or "")
+        summary["old_active"] = old_active
+
+    if old_active and new_active and new_active == old_active:
+        # Defensive: rotate reported success but did not advance. Do not
+        # disable a still-active token; bail without re-dispatch.
+        summary["rotate_error"] = "rotate_did_not_advance"
+        return summary
+
+    summary["rotated"] = True
+
+    # The registry-level rotation succeeded (active advanced), but the wrapper's
+    # `--agents all` sync runs AFTER the rotate JSON is emitted and surfaces its
+    # own failure via a NONZERO exit code (bridge-auth.sh exits sync_rc). Record
+    # the sync outcome so AC1's "sync all agents" claim is honest — we do NOT
+    # silently treat a partial sync as a clean all-agents propagation. We still
+    # retire the old token + emit the rotation audit (the registry IS rotated;
+    # the daemon's periodic token sync re-propagates to any agent the inline
+    # `--agents all` pass missed).
+    sync_ok = rotate_completed.returncode == 0
+    summary["agents_synced"] = sync_ok
+    if not sync_ok:
+        summary["sync_rc"] = rotate_completed.returncode
+
+    # THEN deterministically retire the vacated quota-hit token. We do NOT rely
+    # on `check --disable-on-quota` (a network re-probe that can be
+    # inconclusive and leave the token enabled → next rotation picks it back).
+    # `mark-quota` disables it with no probe; `recover-due` re-enables it once
+    # the limit resets. HARD REQUIREMENT: after a successful rotate the old
+    # quota-hit token must NEVER remain enabled. So we check mark-quota's exit
+    # code AND verify the registry actually shows it disabled; if it is still
+    # enabled we do NOT re-dispatch (re-running with the quota token still in the
+    # enabled pool risks the next rotation picking it straight back).
+    summary["old_disabled"] = False
+    if old_active:
+        mark_args = ["mark-quota", old_active, "--json"]
+        if summary["reset_at"]:
+            mark_args += ["--reset-at", summary["reset_at"]]
+        try:
+            mark_completed = _run_token_cli(mark_args, timeout=30)
+            if mark_completed.returncode != 0:
+                summary["mark_quota_rc"] = mark_completed.returncode
+        except (OSError, subprocess.SubprocessError) as exc:
+            summary["mark_quota_error"] = f"{exc!r}"
+        # Authoritatively confirm the old token is no longer enabled, regardless
+        # of how mark-quota exited.
+        summary["old_disabled"] = not token_is_enabled(old_active)
+
+    emit_audit_row(
+        action="claude_token_rotation",
+        actor="cron-runner",
+        target_agent=target_agent or "daemon",
+        run_id=run_id,
+        details={
+            "reason": "cron_reactive_quota",
+            "from": old_active or "-",
+            "to": new_active or "-",
+            "agents": "all",
+            "agents_synced": str(sync_ok).lower(),
+            "old_disabled": str(summary["old_disabled"]).lower(),
+            "truncated": str(truncated).lower(),
+        },
+    )
+
+    # Loop-safety guard (FAIL CLOSED): only re-dispatch when we positively
+    # identified the old quota-hit token AND proved it is now disabled. If we
+    # could not even identify it (both the pre-rotation read AND the rotate
+    # payload's old_active_token_id were empty) we must NOT re-dispatch — a
+    # re-run with an unidentified/undisabled quota token still in the enabled
+    # pool risks the next rotation cycling straight back into it.
+    if not old_active:
+        summary["redispatch_decision"] = "old_token_unidentified"
+        return summary
+    if not summary["old_disabled"]:
+        summary["redispatch_decision"] = "old_token_still_enabled"
+        return summary
+
+    # Re-dispatch the failed job ONCE, under a persisted per-job attempt cap +
+    # cooldown so a persistent global quota cannot loop forever.
+    max_attempts = env_int(
+        "BRIDGE_CRON_REACTIVE_MAX_ATTEMPTS", REACTIVE_REDISPATCH_DEFAULT_MAX_ATTEMPTS
+    )
+    cooldown_seconds = env_int(
+        "BRIDGE_CRON_REACTIVE_COOLDOWN_SECONDS", REACTIVE_REDISPATCH_DEFAULT_COOLDOWN_SECONDS
+    )
+    job_id = str(request.get("job_id") or run_id)
+    state_file = reactive_attempt_state_file(run_dir, job_id)
+    now = now_utc()
+    allowed, reason = reactive_redispatch_allowed(
+        state_file,
+        max_attempts=max_attempts,
+        cooldown_seconds=cooldown_seconds,
+        now=now,
+    )
+    summary["redispatch_decision"] = reason
+    if not allowed:
+        return summary
+
+    # Record the attempt BEFORE firing so a crash mid-redispatch still counts
+    # against the cap (fail-closed against loops).
+    try:
+        record_reactive_redispatch(state_file, run_id=run_id, now=now)
+    except OSError as exc:
+        summary["redispatch_state_error"] = f"{exc!r}"
+        return summary
+
+    ok, redispatch_reason = fire_reactive_redispatch(run_id)
+    summary["redispatched"] = ok
+    summary["redispatch_reason"] = redispatch_reason
+    emit_audit_row(
+        action="cron_reactive_redispatch",
+        actor="cron-runner",
+        target_agent=target_agent or "daemon",
+        run_id=run_id,
+        details={"fired": str(ok).lower(), "reason": redispatch_reason},
+    )
+    return summary
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()  # noqa: iso-helper-boundary — plain env read (os.environ), not a .env file
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
 
 
 def apply_reporting_policy(result: dict[str, Any], policy: str) -> tuple[dict[str, Any], str | None]:
@@ -2855,6 +3322,32 @@ def cmd_run(args: argparse.Namespace) -> int:
         or child_status_error
     )
 
+    # #1437 — reactive Claude OAT rotation. Headless cron hosts have no
+    # claude-hud `.usage-cache.json`, so the daemon's proactive usage-driven
+    # rotation never fires; this run-path is the host-agnostic second source.
+    # Detection runs AFTER stdout+stderr are captured and BEFORE result/status
+    # finalization, scanning BOTH streams (429 often goes to stderr). On a
+    # detected quota hit we ROTATE FIRST, then disable the vacated token, then
+    # re-dispatch the failed job once (persisted per-job cap + cooldown).
+    reactive_summary: dict[str, Any] | None = None
+    if engine == "claude" and run_failed:
+        try:
+            reactive_summary = maybe_reactive_rotate(
+                request=request,
+                run_id=run_id,
+                run_dir=run_dir,
+                stdout_log=stdout_log,
+                stderr_log=stderr_log,
+                stdout_text=completed.stdout or "",
+                stderr_text=completed.stderr or "",
+                returncode=completed.returncode,
+                stdout_truncated=bool(getattr(completed, "stdout_truncated", False)),
+                stderr_truncated=bool(getattr(completed, "stderr_truncated", False)),
+                target_agent=target_agent,
+            )
+        except Exception as exc:  # noqa: BLE001 — reactive path must never break the run
+            reactive_summary = {"detected": True, "error": f"reactive_rotate_failed: {exc!r}"}
+
     if not run_failed and delivery_intent != "silent":
         write_followup_body(
             followup_body_path,
@@ -2966,6 +3459,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         result_payload["sidecar_error_note"] = sidecar_error_note
     if error_message:
         result_payload["runner_error"] = error_message
+    if reactive_summary is not None:
+        # #1437 — surface the reactive-rotation outcome on the run result so
+        # operators (and the smoke) can inspect detect→rotate→disable→redispatch.
+        result_payload["claude_reactive_rotation"] = reactive_summary
 
     write_json(result_file, result_payload)
     write_status(
