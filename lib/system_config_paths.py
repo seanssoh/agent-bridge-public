@@ -31,12 +31,48 @@ import os
 from pathlib import Path
 
 
+def _glob_matches(relative: str, pattern: str) -> bool:
+    """Segment-aware glob match: a `*` matches within ONE path segment.
+
+    `fnmatch.fnmatchcase` treats `*` as "any run of chars INCLUDING `/`", so
+    a pattern like ``data/agents/*/workdir/.discord/access.json`` would also
+    match a deeper path such as
+    ``data/agents/<a>/nested/workdir/.discord/access.json`` — widening the
+    protected set beyond the intended per-agent slot (issue #1442 codex r1).
+    We match segment-by-segment instead so each `*` is bounded by `/`,
+    exactly the "any direct child" semantics the glob list documents. A
+    pattern and a path only match when they have the same number of
+    segments and every segment pair matches under `fnmatch.fnmatchcase`.
+    """
+    rel_parts = relative.split("/")
+    pat_parts = pattern.split("/")
+    if len(rel_parts) != len(pat_parts):
+        return False
+    return all(
+        fnmatch.fnmatchcase(rel_seg, pat_seg)
+        for rel_seg, pat_seg in zip(rel_parts, pat_parts)
+    )
+
+
 # The canonical glob list. Each pattern is matched against the path made
 # relative to BRIDGE_HOME. `agents/*/...` means "any direct child agent".
 # This is the list called out in issue #341 §"Protected paths".
+#
+# Per-agent channel-access globs are listed for BOTH layouts (issue #1442):
+#   - pre-v2  : `agents/<agent>/.discord/access.json`
+#   - v2      : `data/agents/<agent>/workdir/.discord/access.json`
+# On a v2 install the live per-agent `.discord/`/`.telegram/` trees the
+# channel relays read/write live under `data/agents/<agent>/workdir/`
+# (BRIDGE_AGENT_ROOT_V2 = $BRIDGE_DATA_ROOT/agents = $BRIDGE_HOME/data/agents;
+# the workspace layer is `<agent>/workdir`, see lib/bridge-agent-layout.sh).
+# The pre-v2 globs never matched that path, so the #341 operator-gated
+# `config get/set` wrapper denied every per-agent access.json edit on v2.
+# Both forms are kept so legacy and mixed installs continue to match.
 PROTECTED_GLOBS: tuple[str, ...] = (
     "agents/*/.discord/access.json",
     "agents/*/.telegram/access.json",
+    "data/agents/*/workdir/.discord/access.json",
+    "data/agents/*/workdir/.telegram/access.json",
     "agent-roster.local.sh",
     "cron/jobs.json",
     "runtime/openclaw.json",
@@ -97,7 +133,7 @@ def is_protected_path(path: Path) -> bool:
     home = bridge_home_dir()
     for relative in _candidate_relatives(path, home):
         for pattern in PROTECTED_GLOBS:
-            if fnmatch.fnmatchcase(relative, pattern):
+            if _glob_matches(relative, pattern):
                 return True
     return False
 
@@ -111,7 +147,7 @@ def matched_pattern(path: Path) -> str | None:
     home = bridge_home_dir()
     for relative in _candidate_relatives(path, home):
         for pattern in PROTECTED_GLOBS:
-            if fnmatch.fnmatchcase(relative, pattern):
+            if _glob_matches(relative, pattern):
                 return pattern
     return None
 

@@ -31,8 +31,8 @@ Trust model (issue #341):
 
 Examples:
   $(basename "$0") list-protected
-  $(basename "$0") get  --path \$BRIDGE_HOME/agents/foo/.discord/access.json
-  $(basename "$0") set  --path \$BRIDGE_HOME/agents/foo/.discord/access.json \\
+  $(basename "$0") get  --path \$BRIDGE_HOME/data/agents/foo/workdir/.discord/access.json
+  $(basename "$0") set  --path \$BRIDGE_HOME/data/agents/foo/workdir/.discord/access.json \\
                          --change groups.append=12345
 EOF
 }

@@ -164,8 +164,8 @@ Examples:
   __CLI_NAME__ intake show 20260411T130000+0900-mail --json
   __CLI_NAME__ knowledge search --query "primary operator"
   __CLI_NAME__ config list-protected
-  __CLI_NAME__ config get --path $BRIDGE_HOME/agents/foo/.discord/access.json
-  __CLI_NAME__ config set --path $BRIDGE_HOME/agents/foo/.discord/access.json --change groups.append=12345
+  __CLI_NAME__ config get --path $BRIDGE_HOME/data/agents/foo/workdir/.discord/access.json
+  __CLI_NAME__ config set --path $BRIDGE_HOME/data/agents/foo/workdir/.discord/access.json --change groups.append=12345
   __CLI_NAME__ list
   __CLI_NAME__ kill 1
   __CLI_NAME__ kill all
