@@ -695,6 +695,31 @@ tail -n 80 ~/.agent-bridge/state/daemon.log
 tail -n 80 ~/.agent-bridge/logs/bridge-$(date +%Y%m%d).log
 ```
 
+### Codex `codex_apps` / MCP `token_invalidated` warning is not an Agent Bridge path
+
+A Codex session may print a startup warning like
+`MCP client for codex_apps failed to start … token_invalidated … 401`.
+This is a **global `~/.codex` MCP configuration** issue — an MCP server that the
+operator (or a prior `codex` install) registered in `~/.codex/config.toml` has a
+stale/invalid auth token. **Agent Bridge injects no MCP config into Codex**: the
+only `[features]` flags it pins are `features.hooks=true` and
+`features.fast_mode=true` (see `lib/bridge-state.sh` / the
+`scripts/python-helpers/launch-cmd-codex-hooks.py` re-materialization helper), so
+no agent-bridge code path can be the source of this 401.
+
+Resolve it globally in Codex, independent of Agent Bridge:
+
+- Re-authenticate the MCP server: `codex mcp login` (or the server-specific
+  login flow), or
+- Remove the unused MCP entry from `~/.codex/config.toml` if it is no longer
+  needed.
+
+(Distinct from the renamed hooks feature flag: codex-cli 0.135.0 renamed the
+`[features]` flag `codex_hooks` → `hooks`. Agent Bridge pins the new `hooks`
+name; if you still see `[features].codex_hooks is deprecated`, an old roster
+launch_cmd has not yet re-materialized — it converges to the warning-free name
+on the agent's next wake.)
+
 ### Scheduled shell scripts without iso v2 (macOS / non-iso installs)
 
 `agb cron create --kind shell --run-as-agent <agent>` runs a script under a

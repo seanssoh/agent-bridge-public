@@ -1044,8 +1044,10 @@ def cmd_ensure_codex_hooks(args: argparse.Namespace) -> int:
     # Companion-role hooks (Codex). Both ship audit-only by default; operators
     # promote to blocking via BRIDGE_CODEX_TASK_MODE_POLICY=block /
     # BRIDGE_CODEX_OUTPUT_SHAPE_ENFORCE=block in agent-roster.local.sh after
-    # observing audit logs. Codex CLIs predating PreToolUse / Stop support
-    # the entries cleanly: unknown event keys are ignored without hard-fail.
+    # observing audit logs. Current Codex (verified codex-cli 0.135.0) natively
+    # supports the PreToolUse / Stop hook events used here; older CLIs that
+    # predated them ignored the unknown event keys without hard-failing, so the
+    # entries are safe to write either way.
     task_mode_command = codex_task_mode_policy_hook_command(bridge_home, args.python_bin)
     output_shape_command = codex_review_output_shape_hook_command(bridge_home, args.python_bin)
     changed = ensure_command_hook(

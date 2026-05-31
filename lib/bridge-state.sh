@@ -108,9 +108,9 @@ bridge_build_dynamic_launch_cmd() {
   case "$engine" in
     codex)
       if [[ "$continue_mode" == "1" && -n "$session_id" ]]; then
-        bridge_join_quoted codex resume "$session_id" -c "features.codex_hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+        bridge_join_quoted codex resume "$session_id" -c "features.hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
       else
-        bridge_join_quoted codex -c "features.codex_hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+        bridge_join_quoted codex -c "features.hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
       fi
       ;;
     claude)
@@ -158,7 +158,7 @@ bridge_build_resume_launch_cmd() {
 
   case "$engine" in
     codex)
-      bridge_join_quoted codex resume "$session_id" -c "features.codex_hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+      bridge_join_quoted codex resume "$session_id" -c "features.hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
       ;;
     claude)
       original_cmd="${BRIDGE_AGENT_LAUNCH_CMD[$agent]-}"

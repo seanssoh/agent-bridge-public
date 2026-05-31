@@ -3926,12 +3926,15 @@ CODEX_HOOK_STATUS_OUTPUT="$(python3 "$REPO_ROOT/bridge-hooks.py" status-codex-ho
 assert_contains "$CODEX_HOOK_STATUS_OUTPUT" "status: present"
 assert_contains "$CODEX_HOOK_STATUS_OUTPUT" "prompt_hook: present"
 CODEX_LAUNCH_DRY_RUN="$("$REPO_ROOT/bridge-run.sh" "$CODEX_CLI_AGENT" --dry-run)"
-assert_contains "$CODEX_LAUNCH_DRY_RUN" "launch=codex -c features.codex_hooks=true"
+assert_contains "$CODEX_LAUNCH_DRY_RUN" "launch=codex -c features.hooks=true"
+# codex-cli 0.135.0 renamed the [features] flag codex_hooks → hooks; the
+# launch builders + re-materialization helper now pin features.hooks=true.
 # v0.8.6 hotfix: every codex launch now also pins features.fast_mode=true so
 # admin-pair backfill, isolated agent create, and v0.7→v0.8 migration all
 # carry the same flag. The injection helper guards against duplicate flags
-# so a roster with only codex_hooks (pre-hotfix default) gets fast_mode
-# auto-injected on next wake; this assertion locks the post-hotfix shape.
+# and rewrites the legacy codex_hooks token, so a roster with only the old
+# hooks flag (pre-hotfix default) gets fast_mode auto-injected and converges
+# to the warning-free name on next wake; this assertion locks the post-hotfix shape.
 assert_contains "$CODEX_LAUNCH_DRY_RUN" "features.fast_mode=true"
 # #1068 HOOKS-SSOT: the renderer installs the direct `session-start.py
 # --format codex` spelling; the legacy `codex-session-start.py` wrapper
