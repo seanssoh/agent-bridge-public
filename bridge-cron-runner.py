@@ -1719,7 +1719,7 @@ def claude_config_dir_for_request(request: dict[str, Any]) -> Path | None:
     # run on such a host aborts with "Claude config dir not found" even though
     # the agent's interactive sessions authenticate fine.
     for candidate in candidates:
-        if candidate.is_dir():
+        if candidate.is_dir():  # noqa: raw-pathlib-controller-only — controller-side shared-mode fallback; iso agents resolve via pw_dir above and never reach this
             return candidate
     return None
 
@@ -1803,7 +1803,7 @@ def apply_claude_agent_env(env: dict[str, str], request: dict[str, Any], request
     # legitimately have no cred file. When absent, defer to Claude's own auth
     # resolution rather than abort with a misleading "not readable" error.
     cred_file = config_dir / ".credentials.json"
-    if sudo_user is None and cred_file.exists() and not os.access(cred_file, os.R_OK):
+    if sudo_user is None and cred_file.exists() and not os.access(cred_file, os.R_OK):  # noqa: raw-pathlib-controller-only — controller-side cred-file probe; only runs when sudo_user is None (no iso UID drop)
         raise RuntimeError(
             f"Claude credentials file for target agent {agent} exists but is not readable "
             f"by the cron runner: {cred_file}"
