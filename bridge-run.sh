@@ -3,7 +3,132 @@
 
 set -uo pipefail
 
-SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# #1444 BLOCKING 1 (credential safety, DEFINITIVE design — mirror of PR #1443's
+# bridge-usage.sh r12). The env-source credential vars (CLAUDE_CODE_OAUTH_TOKEN,
+# ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN) must never reach ANY child process —
+# not via env var, not via on-disk path, not via inherited fd, and not via an
+# exported-function shadow. Across codex Phase-4 rounds every transit that had to
+# CROSS bridge-lib.sh's Bash-3.2→4+ re-exec proved attackable (forgeable env
+# sentinel; an inherited fd/path readable + drainable by bridge-lib.sh's
+# source-time `dirname`; helper children observing the path var). The root fix:
+# ELIMINATE the cross-re-exec transit. We self-re-exec to Bash 4+ OURSELVES FIRST
+# (builtins only, in an already-token-free env), so bridge-lib.sh never re-execs
+# (we are already Bash 4+); the token is captured exactly once, lives ONLY in
+# NON-exported shell vars across `source bridge-lib.sh`, and is re-exported into
+# the child env only on the legacy auth path AFTER the source. Nothing to plant,
+# nothing for a source-time/helper child to read.
+
+# Exported-function shadow defense (codex Phase-4 last-class): a same-UID caller
+# can `export -f printf`/`read`/`mktemp`/`chmod`/`rm`/`cat`/`dirname`/`cd`/`pwd`
+# so that an UNQUALIFIED invocation runs the caller's function IN OUR shell,
+# reading our non-exported credential vars. Drop any such inherited functions up
+# front (before any credential is reachable), and below use `builtin` for
+# builtins + hardcoded-absolute paths for externals so name resolution can never
+# reach a function. (`[[`, `unset`, parameter expansion cannot be shadowed.)
+unset -f printf read echo mktemp chmod rm cat dirname cd pwd command builtin \
+         exec trap export local 2>/dev/null || true
+
+# Unset all bridge-private transit names unconditionally (value + export attr) so
+# a caller-injected value can never be trusted on entry.
+unset _bridge_run_tok_oat _bridge_run_tok_anthropic_key _bridge_run_tok_anthropic_auth \
+      _bridge_run_fd_payload 2>/dev/null || true
+
+# SCRIPT_DIR via Bash builtins only (no `dirname` subprocess). Must stay ABSOLUTE
+# (used as `python3 "$SCRIPT_DIR/..."` after this script cd's into WORK_DIR); when
+# BASH_SOURCE[0] is relative, anchor to the launch CWD ($PWD) captured before any
+# cd. Parameter expansion cannot be function-shadowed.
+_bridge_run_src="${BASH_SOURCE[0]}"
+if [[ "$_bridge_run_src" == */* ]]; then
+  SCRIPT_DIR="${_bridge_run_src%/*}"
+else
+  SCRIPT_DIR="."
+fi
+if [[ "$SCRIPT_DIR" != /* ]]; then
+  SCRIPT_DIR="$PWD/$SCRIPT_DIR"
+fi
+unset _bridge_run_src
+
+# Bind the externals that run while a credential is reachable (mktemp/chmod/rm
+# during the optional self-re-exec transit) to HARDCODED ABSOLUTE paths — a
+# PATH-planted `mktemp`/`chmod`/`rm` must never run near the live token, and an
+# absolute path cannot be a function name. `[[ -x ]]` is a builtin (no subprocess).
+_bridge_run_pick() { local _n; for _n in "$@"; do [[ -x "$_n" ]] && { builtin printf '%s' "$_n"; return 0; }; done; builtin printf '%s' "${1##*/}"; }
+_BR_MKTEMP="$(_bridge_run_pick /usr/bin/mktemp /bin/mktemp /opt/homebrew/bin/mktemp)"
+_BR_CHMOD="$(_bridge_run_pick /bin/chmod /usr/bin/chmod)"
+_BR_RM="$(_bridge_run_pick /bin/rm /usr/bin/rm)"
+unset -f _bridge_run_pick
+
+# A fixed (non-secret) magic prefix proving an inherited fd 9 was written by US,
+# not pre-opened by a caller — used only across OUR self-re-exec.
+_BR_FD_MAGIC="agb-run-cred-fd-v1"
+
+# STEP A (UNCONDITIONAL, builtins only — runs before ANY external command, so no
+# PATH-planted helper ever runs while the ambient token is in the env): capture
+# the three credential VALUES into NON-exported shell vars and UNSET them from
+# the environment. A forged inbound env var cannot skip this.
+_bridge_run_tok_oat="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+_bridge_run_tok_anthropic_key="${ANTHROPIC_API_KEY:-}"
+_bridge_run_tok_anthropic_auth="${ANTHROPIC_AUTH_TOKEN:-}"
+unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+
+# Self-re-exec to Bash 4+ ONLY when we are Bash 3.2 (so bridge-lib.sh below never
+# re-execs). The env is ALREADY token-free here, so the candidate-version probe
+# and `exec` cannot leak the token. The captured values ride OUR self-re-exec on
+# fd 9 (unlinked 0600 file, magic-prefixed) and the Bash-4+ pass reads + closes
+# it BEFORE sourcing bridge-lib.sh — so bridge-lib.sh's dirname never inherits a
+# readable token fd.
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+  _bridge_run_self="${BASH_SOURCE[0]}"
+  if [[ -f "$_bridge_run_self" ]]; then
+    if [[ -n "$_bridge_run_tok_oat$_bridge_run_tok_anthropic_key$_bridge_run_tok_anthropic_auth" ]]; then
+      if _bridge_run_fd_file="$("$_BR_MKTEMP" "${TMPDIR:-/tmp}/agb-run-cred.XXXXXX" 2>/dev/null)"; then
+        "$_BR_CHMOD" 600 "$_bridge_run_fd_file" 2>/dev/null || true
+        # builtin printf so an exported printf() function cannot intercept the
+        # token write. NUL-delimited NAME=VALUE records (safe for newlines/`=`).
+        {
+          builtin printf '%s\0' "$_BR_FD_MAGIC"
+          [[ -n "$_bridge_run_tok_oat" ]] && builtin printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\0' "$_bridge_run_tok_oat"
+          [[ -n "$_bridge_run_tok_anthropic_key" ]] && builtin printf 'ANTHROPIC_API_KEY=%s\0' "$_bridge_run_tok_anthropic_key"
+          [[ -n "$_bridge_run_tok_anthropic_auth" ]] && builtin printf 'ANTHROPIC_AUTH_TOKEN=%s\0' "$_bridge_run_tok_anthropic_auth"
+        } >"$_bridge_run_fd_file"
+        exec 9<"$_bridge_run_fd_file" 2>/dev/null || true
+        "$_BR_RM" -f -- "$_bridge_run_fd_file" 2>/dev/null || true
+        unset _bridge_run_fd_file
+      fi
+      # Drop the in-shell copies; the values ride fd 9 across the exec.
+      unset _bridge_run_tok_oat _bridge_run_tok_anthropic_key _bridge_run_tok_anthropic_auth
+    fi
+    for _bridge_run_cand in /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
+      if [[ -x "$_bridge_run_cand" ]] && "$_bridge_run_cand" -c '((${BASH_VERSINFO[0]:-0}>=4))' 2>/dev/null; then
+        exec "$_bridge_run_cand" "$_bridge_run_self" "$@"
+      fi
+    done
+  fi
+  echo "[bridge-run] Agent Bridge requires Bash 4+ (current: ${BASH_VERSION:-unknown}). Put a Bash 4+ on PATH." >&2
+  exit 1
+fi
+
+# Bash 4+ now. If we were re-exec'd from Bash 3.2, the values ride fd 9 — read the
+# NUL-delimited records (magic-verified) into the NON-exported shell vars, then
+# CLOSE fd 9 so bridge-lib.sh's source-time dirname / helpers never inherit it.
+if [[ -z "$_bridge_run_tok_oat$_bridge_run_tok_anthropic_key$_bridge_run_tok_anthropic_auth" ]] \
+   && [[ -r /dev/fd/9 ]]; then
+  _bridge_run_fd_magic_seen=""
+  while IFS= builtin read -r -d '' _bridge_run_fd_payload <&9; do
+    if [[ -z "$_bridge_run_fd_magic_seen" ]]; then
+      [[ "$_bridge_run_fd_payload" == "$_BR_FD_MAGIC" ]] && _bridge_run_fd_magic_seen=1
+      continue
+    fi
+    case "$_bridge_run_fd_payload" in
+      CLAUDE_CODE_OAUTH_TOKEN=*) _bridge_run_tok_oat="${_bridge_run_fd_payload#*=}" ;;
+      ANTHROPIC_API_KEY=*) _bridge_run_tok_anthropic_key="${_bridge_run_fd_payload#*=}" ;;
+      ANTHROPIC_AUTH_TOKEN=*) _bridge_run_tok_anthropic_auth="${_bridge_run_fd_payload#*=}" ;;
+    esac
+  done
+  exec 9<&- 2>/dev/null || true
+  unset _bridge_run_fd_payload _bridge_run_fd_magic_seen
+fi
+unset _BR_FD_MAGIC _BR_MKTEMP _BR_CHMOD _BR_RM
 
 # Issue #1101: defensive unset of stale BRIDGE_LAYOUT/BRIDGE_DATA_ROOT before
 # sourcing bridge-lib.sh. This is the launch envelope tmux runs as the pane's
@@ -33,6 +158,35 @@ unset _bridge_run_layout_marker
 
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
+
+# #1444 BLOCKING 1 (codex Phase-4): we are past `source bridge-lib.sh`, which did
+# NOT re-exec (we self-re-exec'd to Bash 4+ above), so its `:33` dirname ran in a
+# token-free env with NO transit fd/path/var to read — the captured credential
+# values live ONLY in the NON-exported _bridge_run_tok_* shell vars. Now decide
+# whether to restore them into the environment for the launched Claude:
+#   - LEGACY auth path (NOT keychain-free, or not on Darwin where the feature
+#     applies): the ambient env token may legitimately be the child Claude's auth
+#     source, so RESTORE — preserving pre-#1444 behavior.
+#   - KEYCHAIN-FREE on Darwin: the child authenticates via the apiKeyHelper /
+#     .credentials.json, never the env token, so DO NOT restore.
+# The mode-decision helpers (bridge_claude_keychain_free_auth_enabled may fork
+# python3; bridge_host_platform may fork uname) run in the already-token-free env
+# with no transit artifact present, so their children inherit nothing.
+if [[ -n "$_bridge_run_tok_oat$_bridge_run_tok_anthropic_key$_bridge_run_tok_anthropic_auth" ]]; then
+  _bridge_run_restore_creds=1
+  if bridge_claude_keychain_free_auth_enabled 2>/dev/null; then
+    _bridge_run_platform="$(bridge_host_platform 2>/dev/null || builtin printf '')"
+    [[ "$_bridge_run_platform" == "Darwin" ]] && _bridge_run_restore_creds=0
+    unset _bridge_run_platform
+  fi
+  if [[ "$_bridge_run_restore_creds" == "1" ]]; then
+    [[ -n "$_bridge_run_tok_oat" ]] && export CLAUDE_CODE_OAUTH_TOKEN="$_bridge_run_tok_oat"
+    [[ -n "$_bridge_run_tok_anthropic_key" ]] && export ANTHROPIC_API_KEY="$_bridge_run_tok_anthropic_key"
+    [[ -n "$_bridge_run_tok_anthropic_auth" ]] && export ANTHROPIC_AUTH_TOKEN="$_bridge_run_tok_anthropic_auth"
+  fi
+  unset _bridge_run_restore_creds
+fi
+unset _bridge_run_tok_oat _bridge_run_tok_anthropic_key _bridge_run_tok_anthropic_auth
 
 # PR-E (revised): linux-user isolation requires umask 0007 in both
 # legacy ACL-backed isolation and v2 group/setgid isolation. Without
@@ -732,6 +886,16 @@ bridge_run_claude_keychain_free_preflight() {
 
   platform="$(bridge_host_platform 2>/dev/null || uname -s 2>/dev/null || printf '')"
   [[ "$platform" == "Darwin" ]] || return 0
+
+  # #1444 BLOCKING 1 (defense-in-depth): the credential vars were already
+  # captured + unset at the top of this script BEFORE `source bridge-lib.sh`, and
+  # the post-source restore block deliberately did NOT restore them on this
+  # keychain-free + Darwin path — so they are already absent here. This redundant
+  # unset is a belt-and-suspenders guard in case any code between source and this
+  # preflight re-introduced one of them; it keeps the keychain-free child env
+  # provably clean (the launched Claude authenticates via the apiKeyHelper /
+  # .credentials.json, never the ambient env token).
+  unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 
   bridge_require_python
   helper_path="$(bridge_claude_api_key_helper_path)"

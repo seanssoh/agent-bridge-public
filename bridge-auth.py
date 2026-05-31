@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 import pwd
 import re
 import stat
@@ -139,6 +140,29 @@ def runtime_config_truthy(key: str) -> bool:
     return env_truthy(str(value) if value is not None else "")
 
 
+def host_platform() -> str:
+    override = os.environ.get("BRIDGE_HOST_PLATFORM_OVERRIDE", "").strip()  # noqa: iso-helper-boundary - controller host-platform override
+    if override:
+        return override
+    return platform.system()
+
+
+def keychain_free_apikeyhelper_supported() -> bool:
+    """True only where the keychain-free apiKeyHelper feature actually applies.
+
+    #1444 BLOCKING 3 (Linux/iso-v2 leak): the apiKeyHelper feature is a
+    macOS-keychain-only mechanism, and the cron-runner/bridge-run.sh preflights
+    are already Darwin-gated. The settings WRITER
+    (``ensure_claude_settings_file``) was NOT, so on Linux it rendered a
+    controller helper path into an agent's ``settings.json`` — and under iso v2
+    that controller path is not even reachable from the agent UID. Gate the
+    write on the SAME platform check the preflights use so a non-Darwin agent
+    never receives a controller helper path. ``BRIDGE_HOST_PLATFORM_OVERRIDE``
+    lets the smoke drive both the Darwin and non-Darwin branches deterministically.
+    """
+    return host_platform() == "Darwin"
+
+
 def claude_keychain_free_auth_enabled() -> bool:
     override = os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH")  # noqa: iso-helper-boundary - controller feature gate
     if override is not None and override.strip():
@@ -164,10 +188,23 @@ def apikeyhelper_value_is_bridge_managed(value: Any) -> bool:
     Used by the disable/rollback path: when the keychain-free gate is turned
     off we must REMOVE the managed helper so Claude falls back to its normal
     keychain auth — but we must NEVER clobber an operator-owned helper. We
-    only treat a value as "ours" when it resolves to the same path
-    ``claude_api_key_helper_path()`` would write, or to the in-repo default
-    helper (``scripts/claude-oat-api-key-helper.sh``). Anything else is
-    operator state we leave untouched.
+    only treat a value as "ours" when it equals the path
+    ``claude_api_key_helper_path()`` would write, or the in-repo default helper
+    (``scripts/claude-oat-api-key-helper.sh``). Anything else is operator state
+    we leave untouched.
+
+    #1444 SHOULD-FIX 4 (symlink edge): the comparison is on the RAW (absolutized
+    but NOT symlink-resolved) value, deliberately. The value we WRITE on enable
+    is already canonical (``claude_api_key_helper_path()`` calls
+    ``resolve(strict=False)``), so a raw-vs-canonical comparison still matches
+    our own writes and the disable cleanup stays idempotent. The contract we
+    are choosing: an operator who points ``apiKeyHelper`` at *their own symlink*
+    that happens to resolve onto the managed helper KEEPS that value across a
+    disable — we only ever remove the literal managed path we wrote, never an
+    operator-introduced symlink that merely dereferences to it. (The prior
+    ``resolve()`` form removed such a symlink, surprising the operator.) Both
+    ``current`` and the candidate set are absolutized via the same builtin
+    ``ROOT``-anchoring, so a relative settings value still matches.
     """
     if not isinstance(value, str) or not value.strip():
         return False
@@ -175,7 +212,10 @@ def apikeyhelper_value_is_bridge_managed(value: Any) -> bool:
         current = Path(value).expanduser()
         if not current.is_absolute():
             current = ROOT / current
-        current = current.resolve(strict=False)
+        # RAW comparison (no resolve()): absolutize via os.path.normpath so a
+        # relative or ``..``-laden value normalizes, but an operator symlink is
+        # NOT dereferenced — it survives disable.
+        current = Path(os.path.normpath(str(current)))
     except (OSError, ValueError):
         return False
     managed_candidates = {claude_api_key_helper_path()}
@@ -1522,16 +1562,25 @@ def ensure_claude_settings_file(
             raise ValueError(f"Claude settings file must contain a JSON object: {path}")
         payload = parsed
     payload.setdefault("skipDangerousModePermissionPrompt", True)
-    if claude_keychain_free_auth_enabled():
+    # #1444 BLOCKING 3 (Linux/iso-v2 leak): only RENDER the managed apiKeyHelper
+    # when the gate is enabled AND we are on the platform the feature targets
+    # (macOS — matching the Darwin-gated cron-runner/bridge-run.sh preflights).
+    # On Linux/iso-v2 the controller helper path is wrong for the agent (and
+    # under iso v2 not even reachable from the agent UID), so we must NEVER
+    # write it there. The cleanup branch below still runs on non-Darwin so a
+    # stale managed value (e.g. left by a pre-fix sync, or after the gate is
+    # turned off) gets removed regardless of platform.
+    if claude_keychain_free_auth_enabled() and keychain_free_apikeyhelper_supported():
         payload["apiKeyHelper"] = claude_api_key_helper_path()
     elif apikeyhelper_value_is_bridge_managed(payload.get("apiKeyHelper")):
-        # Disable/rollback cleanup: the gate is off but a prior sync left our
-        # managed helper in settings.json. Claude would still invoke it, and
-        # the helper now exits "disabled" — breaking the intended fallback to
-        # normal keychain auth. Remove ONLY our managed value; an operator's
-        # own apiKeyHelper is preserved (apikeyhelper_value_is_bridge_managed
-        # returns False for it). Idempotent: once removed, the key is absent
-        # so this branch is a no-op on the next sync.
+        # Disable/rollback/non-Darwin cleanup: the gate is off (or we are not on
+        # a supported platform) but a prior sync left our managed helper in
+        # settings.json. Claude would still invoke it, and the helper now exits
+        # "disabled" — breaking the intended fallback to normal keychain auth.
+        # Remove ONLY our managed value; an operator's own apiKeyHelper is
+        # preserved (apikeyhelper_value_is_bridge_managed returns False for it).
+        # Idempotent: once removed, the key is absent so this branch is a no-op
+        # on the next sync.
         payload.pop("apiKeyHelper", None)
     # PR #799 r4 codex finding 1 — always route through write_private_file_atomic.
     # The previous "payload == before" fast path returned without atomic rewrite,

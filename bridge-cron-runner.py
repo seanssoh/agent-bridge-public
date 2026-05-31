@@ -348,6 +348,17 @@ def validate_claude_keychain_free_auth(config_dir: Path) -> None:
             f"Claude keychain-free auth settings point at an unexpected apiKeyHelper: {settings_file}"
         )
 
+    # #1444 BLOCKING 2 (inherited-env leak): this status-only preflight
+    # (``--check``) must NOT inherit the cron runner's ambient OAuth/API
+    # credentials. Without an explicit ``env=`` the subprocess inherits
+    # ``os.environ`` — including a ``CLAUDE_CODE_OAUTH_TOKEN`` the runner only
+    # pops from the *eventual Claude child* env dict (see ``apply_claude_agent_env``),
+    # not from its own process env. The preflight reads the active OAT from the
+    # locked registry, never from env, so scrub all three well-known credential
+    # vars before spawning.
+    preflight_env = os.environ.copy()
+    for _cred_var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        preflight_env.pop(_cred_var, None)
     completed = subprocess.run(
         [
             sys.executable,
@@ -362,6 +373,7 @@ def validate_claude_keychain_free_auth(config_dir: Path) -> None:
         text=True,
         timeout=15,
         check=False,
+        env=preflight_env,
     )
     if completed.returncode != 0:
         raise RuntimeError(
