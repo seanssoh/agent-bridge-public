@@ -611,6 +611,107 @@ bridge_tmux_session_has_pending_input_from_text() {
   return 1
 }
 
+bridge_tmux_capture_has_working_banner() {
+  # Issue #1409: pure-text substring predicate. Claude Code (and codex)
+  # render a mid-turn status line while a turn is generating / a tool is
+  # running — the spinner "Working" / "Imagining…" banner with an "esc to
+  # interrupt" hint. This helper is the single owner of that literal
+  # banner-string match so the two callers below cannot drift.
+  #
+  # Scope note: this is a *substring* match over the whole input — it does
+  # NOT care where the banner appears. That is correct for the codex
+  # submit-landed path (bridge_tmux_codex_submit_landed), which feeds a
+  # tight post-C-m capture where the banner appearing at all means the
+  # submission was consumed. The claude busy-gate must NOT use this helper
+  # directly on a wide 40-line scrollback capture — a stale banner sitting
+  # in scrollback above a now-clean composer would false-positive busy and
+  # strand legitimate nudges forever (codex review #1409 r1). The claude
+  # gate uses bridge_tmux_claude_capture_is_midturn, which adds the
+  # region check on top of this primitive.
+  #
+  # Input: $1 an ANSI-preserving pane capture (or plain text — the match
+  # is on the literal banner words, which survive ANSI stripping).
+  local ansi_text="$1"
+  [[ -n "$ansi_text" ]] || return 1
+  if [[ "$ansi_text" == *"Working"* || "$ansi_text" == *"esc to interrupt"* ]]; then
+    return 0
+  fi
+  return 1
+}
+
+bridge_tmux_claude_line_is_composer_prompt() {
+  # Issue #1409: does this (whitespace-trimmed, ANSI-stripped) line look
+  # like Claude Code's interactive composer prompt? The composer renders in
+  # two forms across Claude versions / terminal widths:
+  #   - bare glyph at the line start:   `❯ ...`  or  `> ...`
+  #   - inside a box frame:             `│ > ... │`  (the rounded input box)
+  # Either form, appearing BELOW a spinner banner, means the turn has ended
+  # and the banner above is stale scrollback. Keep this narrow: a box line
+  # only counts when the glyph immediately follows the box border, so prose
+  # like "│ note │" or a quoted ">" deep in a response line does not match.
+  local trimmed="$1"
+  case "$trimmed" in
+    ❯*|'>'*) return 0 ;;            # bare composer glyph
+    '│ ❯'*|'│ >'*) return 0 ;;      # boxed composer glyph (│ + space + glyph)
+    '│❯'*|'│>'*) return 0 ;;        # boxed composer glyph, no inner space
+  esac
+  return 1
+}
+
+bridge_tmux_claude_capture_is_midturn() {
+  # Issue #1409 (codex review r1): region-aware mid-turn detector for the
+  # Claude busy-gate. Returns 0 (mid-turn → busy) only when the spinner /
+  # "esc to interrupt" banner is the LIVE tail status, not stale scrollback.
+  #
+  # Claude Code's TUI layout: while a turn is generating, the spinner +
+  # interrupt-hint banner is rendered at the bottom of the pane and there is
+  # no clean composer prompt below it. The moment the turn finishes, the
+  # composer prompt box (the `❯ ` / `> ` glyph line) is redrawn as the last
+  # interactive line and the banner scrolls up into history. So a banner is
+  # only "live" if NO clean composer prompt line appears after the last
+  # banner line in the capture. This mirrors the existing scrollback-safe
+  # "evaluate the LAST prompt-glyph line only" pattern in
+  # bridge_tmux_session_has_pending_input_from_text (issue #132).
+  #
+  # Input: $1 a plain-text (ANSI-stripped) pane capture. The spinner /
+  # interrupt banner and the `❯`/`>` composer glyph all survive ANSI
+  # stripping, so the region walk runs on plain text — no SGR parsing.
+  local recent="$1"
+  [[ -n "$recent" ]] || return 1
+  # Cheap reject: no banner anywhere → definitely not mid-turn.
+  bridge_tmux_capture_has_working_banner "$recent" || return 1
+
+  local line=""
+  local trimmed=""
+  # Default to not-mid-turn; flip to 0 on a banner line, back to 1 when a
+  # clean composer prompt is seen below it.
+  local result=1
+  # Issue #815 Wave A: stage the capture through a tempfile rather than a
+  # here-string to avoid the Bash 5.3.9 heredoc_write deadlock (footgun #11).
+  local _tmp
+  _tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$recent" > "$_tmp"
+  while IFS= read -r line; do
+    line="${line//$'\r'/}"
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ "$trimmed" == *"Working"* || "$trimmed" == *"esc to interrupt"* ]]; then
+      # A banner line — provisionally the live tail until a clean composer
+      # prompt is seen below it.
+      result=0
+    elif bridge_tmux_claude_line_is_composer_prompt "$trimmed"; then
+      # A clean Claude composer prompt line appears AFTER a banner → the
+      # banner is stale scrollback and the session is back at an idle
+      # prompt. Reset so only a later live banner can re-arm busy.
+      result=1
+    fi
+  done < "$_tmp"
+
+  return "$result"
+}
+
 bridge_tmux_session_has_pending_input() {
   local session="$1"
   local engine="$2"
@@ -658,6 +759,30 @@ bridge_tmux_session_inject_busy() {
 
   if bridge_tmux_session_has_pending_input "$session" "$engine"; then
     return 0
+  fi
+
+  # Issue #1409: Claude Code will not submit a new message while a turn is
+  # already generating / a tool is running — typing the nudge + C-m leaves
+  # the text stranded in the composer (logged `submit_lost_post_grace`).
+  # The composer-pending and recent-keypress gates above do NOT see that
+  # mid-turn state, so detect Claude's spinner banner ("Working" / "esc to
+  # interrupt") directly and report busy. The caller then spools the nudge
+  # for re-delivery once the session returns to a clean prompt. Codex's
+  # own submit path already handles its banner at submit-landed time, so
+  # this gate stays claude-specific.
+  #
+  # The detection is region-aware (codex review #1409 r1): a stale banner
+  # in scrollback above a now-clean composer must NOT report busy, or
+  # legitimate nudges would be spooled forever. bridge_tmux_claude_capture_
+  # is_midturn only treats the banner as live when no clean composer prompt
+  # appears below it. Use the same -J joined plain capture window (40 lines)
+  # the pending-input gate uses.
+  if [[ "$engine" == "claude" ]]; then
+    local recent=""
+    recent="$(bridge_capture_recent "$session" 40 join 2>/dev/null || true)"
+    if bridge_tmux_claude_capture_is_midturn "$recent"; then
+      return 0
+    fi
   fi
 
   local attached="0"
@@ -950,7 +1075,7 @@ bridge_tmux_codex_submit_landed() {
   [[ -n "$ansi_text" ]] || return 1
   [[ -n "$signature" ]] || return 1
 
-  if [[ "$ansi_text" == *"Working"* || "$ansi_text" == *"esc to interrupt"* ]]; then
+  if bridge_tmux_capture_has_working_banner "$ansi_text"; then
     return 0
   fi
 
