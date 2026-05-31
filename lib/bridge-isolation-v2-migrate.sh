@@ -845,6 +845,128 @@ bridge_isolation_v2_migrate_mirror_all() {
 }
 
 # ---------------------------------------------------------------------------
+# 5b. shared-tree data backfill (platform-agnostic)
+# ---------------------------------------------------------------------------
+#
+# The v0.15 data/-prefixed layout makes $BRIDGE_DATA_ROOT/shared the
+# canonical shared root, but the ACTIVE shared tree — wiki, cron artifacts,
+# users, docs: everything BRIDGE_SHARED_DIR points at — lives at the legacy
+# $BRIDGE_HOME/shared. The original migrate plan only mapped the (usually
+# empty) runtime/shared tree (`runtime_shared` global row), and on
+# macOS/no-isolated hosts the skip branches in apply_for_upgrade returned
+# before ANY data move — flipping the v2 marker while stranding the real
+# shared content at the legacy path. The result is split-brain: the v2 wiki
+# indexer scans an empty data/shared/wiki (files_scanned:0) while every
+# legacy BRIDGE_SHARED_DIR consumer still reads $BRIDGE_HOME/shared.
+#
+# This backfill is the platform-agnostic data relocation that must run on
+# EVERY path (Linux full-migrate, macOS/no-isolated skip, marker-only
+# fast-path, and marker-present-but-sentinel-missing repair). It mirrors the
+# active shared tree into the v2 layout and drops a sentinel that the
+# resolver (lib/bridge-isolation-v2.sh) keys off to flip BRIDGE_SHARED_DIR.
+#
+# Safety:
+#   * delete_eligible=0 semantics — legacy $BRIDGE_HOME/shared is PRESERVED
+#     (rsync without --delete; no hardlinks). The resolver flip, not
+#     deletion, cuts consumers over, so a failed/rolled-back migration
+#     leaves the real content untouched at the legacy path.
+#   * Idempotent — no-op once the sentinel exists.
+#   * Sentinel-gated, not "data/shared non-empty" — a fresh v2 data/shared
+#     already carries _index/_audit skeletons + plugins-cache, so emptiness
+#     is not a reliable "not yet migrated" signal.
+bridge_isolation_v2_migrate_shared_backfill() {
+  local data_root="$1" target_root="$2"
+  local legacy_shared="$target_root/shared"
+  local v2_shared="$data_root/shared"
+  local sentinel="$data_root/.v2-shared-mirror.sentinel"
+
+  # Already mirrored on a prior run.
+  [[ -f "$sentinel" ]] && return 0
+
+  # Markerless installs keep data_root == target_root, so legacy and v2
+  # shared coincide — nothing to relocate; record completion so the resolver
+  # treats the single shared tree as canonical.
+  if [[ "$legacy_shared" == "$v2_shared" ]]; then
+    bridge_isolation_v2_migrate_shared_sentinel_write \
+      "$sentinel" "$legacy_shared" "$v2_shared" "coincident" || return 1
+    return 0
+  fi
+
+  mkdir -p "$v2_shared" 2>/dev/null || {
+    bridge_warn "shared_backfill: mkdir $v2_shared failed"
+    return 1
+  }
+
+  # No legacy content to relocate (fresh install): data/shared is canonical
+  # by default; mark done so the resolver flips to it.
+  if [[ ! -d "$legacy_shared" ]] || [[ -z "$(ls -A "$legacy_shared" 2>/dev/null || true)" ]]; then
+    bridge_isolation_v2_migrate_shared_sentinel_write \
+      "$sentinel" "$legacy_shared" "$v2_shared" "no-legacy-content" || return 1
+    return 0
+  fi
+
+  # Real-copy mirror legacy -> v2. Prefer the same high-fidelity flags the
+  # rest of the migrate uses (`-aHX --numeric-ids`: perms/times, xattrs, and
+  # numeric ownership for the Linux isolation model — see mirror_one), but
+  # fall back to plain `-a` when the local rsync rejects them. macOS ships
+  # openrsync, which implements neither `-X` nor `--numeric-ids`; this
+  # backfill is the FIRST rsync the migrate runs on macOS (mirror_one is
+  # skipped on the macos-shared-agent path), so it must degrade gracefully
+  # instead of failing the whole relocation. A `-n` dry-run probes flag
+  # support without touching the tree.
+  #
+  # No `--delete`: preserve any v2-side skeleton/_index + plugins-cache.
+  # rsync never hardlinks dest to source, so the destination inodes are
+  # independent of the legacy tree (a later chgrp/chmod on data/shared can
+  # not mutate legacy inodes); the section-6 group-ensure pass re-applies
+  # the canonical shared group/mode afterward.
+  local -a _rsync_flags=(-aHX --numeric-ids)
+  if ! rsync "${_rsync_flags[@]}" -n "$legacy_shared"/ "$v2_shared"/ >/dev/null 2>&1; then
+    _rsync_flags=(-a)
+  fi
+  if ! rsync "${_rsync_flags[@]}" "$legacy_shared"/ "$v2_shared"/ 2>/dev/null; then
+    bridge_warn "shared_backfill: rsync $legacy_shared -> $v2_shared failed"
+    return 1
+  fi
+
+  # Verify the destination actually received content before recording the
+  # sentinel — never flip the resolver onto an empty tree.
+  if [[ -z "$(ls -A "$v2_shared" 2>/dev/null || true)" ]]; then
+    bridge_warn "shared_backfill: $v2_shared still empty after mirror"
+    return 1
+  fi
+
+  bridge_isolation_v2_migrate_shared_sentinel_write \
+    "$sentinel" "$legacy_shared" "$v2_shared" "mirrored" || return 1
+  return 0
+}
+
+# Write the shared-mirror sentinel atomically. The resolver only checks for
+# file existence; the body is operator-facing provenance. A write failure is
+# fatal to the backfill so the resolver never flips without a recorded
+# mirror.
+bridge_isolation_v2_migrate_shared_sentinel_write() {
+  local sentinel="$1" legacy_shared="$2" v2_shared="$3" reason="$4"
+  local tmp="${sentinel}.tmp.$$"
+  {
+    printf '# v2 shared-tree mirror sentinel\n'
+    printf 'reason=%s\n' "$reason"
+    printf 'legacy_shared=%s\n' "$legacy_shared"
+    printf 'v2_shared=%s\n' "$v2_shared"
+    printf 'written_at=%s\n' "$(date -Iseconds 2>/dev/null || date 2>/dev/null || printf 'unknown')"
+  } > "$tmp" 2>/dev/null || {
+    bridge_warn "shared_sentinel_write: write to $tmp failed"
+    return 1
+  }
+  mv -f "$tmp" "$sentinel" 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null
+    bridge_warn "shared_sentinel_write: mv to $sentinel failed"
+    return 1
+  }
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # 6. group ensure + post-flight probe
 # ---------------------------------------------------------------------------
 
@@ -1910,6 +2032,23 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
   local marker_path
   marker_path="$(bridge_isolation_v2_marker_path 2>/dev/null || \
     printf '%s/state/layout-marker.sh' "$target_root")"
+
+  # Platform-agnostic shared-tree backfill — MUST run before any skip
+  # branch below. The original bug: the macOS marker-only fast-path and the
+  # macos-shared-agent skip both `return 0` here without relocating the
+  # active shared tree ($BRIDGE_HOME/shared) into the v2 layout
+  # ($data_root/shared), so the v2 marker flips while the real wiki/cron/
+  # users content is stranded at the legacy path (split-brain: v2 indexer
+  # scans an empty data/shared/wiki). Unlike the UID/group/chmod work the
+  # skip branches legitimately bypass on non-Linux, this data relocation is
+  # platform-independent and required on EVERY path. It is delete_eligible=0
+  # (legacy preserved) and writes a sentinel the resolver keys off; a
+  # failure is warn-and-continue, never fatal — if the mirror fails the
+  # sentinel is absent, the resolver stays on the legacy path, and the
+  # install keeps working exactly as before this migrate ran.
+  if ! bridge_isolation_v2_migrate_shared_backfill "$data_root" "$target_root"; then
+    bridge_warn "apply_for_upgrade: shared-tree backfill did not complete; resolver will keep using the legacy shared path (no split-brain, but data/shared not yet canonical — rerun \`agent-bridge upgrade --apply\` after addressing the warned cause)"
+  fi
 
   # v0.13.10: markerless-existing-install + no-isolated-roster fast-path.
   #

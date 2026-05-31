@@ -101,6 +101,32 @@ BRIDGE_SHARED_ROOT="${BRIDGE_SHARED_ROOT:-${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/
 BRIDGE_AGENT_ROOT_V2="${BRIDGE_AGENT_ROOT_V2:-${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/agents}}"
 BRIDGE_CONTROLLER_STATE_ROOT="${BRIDGE_CONTROLLER_STATE_ROOT:-${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/state}}"
 
+# v2 shared-dir resolver flip (gated on the migrate shared-mirror sentinel).
+#
+# BRIDGE_SHARED_DIR is the variable the daemon and nearly every CLI
+# (knowledge/wiki search, bundle, intake, task notes) read for the active
+# shared tree; its legacy default ($BRIDGE_HOME/shared) is applied lazily in
+# bridge_load_roster (lib/bridge-state.sh), which is too late for callers
+# that snapshot BRIDGE_SHARED_DIR right after sourcing bridge-lib.sh
+# (bridge-bundle.sh, bridge-intake.sh). Resolve it HERE — at source time,
+# after BRIDGE_DATA_ROOT is known from the layout marker and before any of
+# those callers snapshot it — so daemon and CLIs agree.
+#
+# The flip is gated on a dedicated sentinel written by the migrate's shared
+# backfill (bridge_isolation_v2_migrate_shared_backfill), NOT on
+# "$BRIDGE_DATA_ROOT/shared exists / is non-empty": a fresh v2 data/shared
+# already carries _index/_audit skeletons and plugins-cache, so emptiness is
+# not a reliable "not yet migrated" signal. Until the real shared tree has
+# been mirrored into the data/-prefixed layout, BRIDGE_SHARED_DIR stays
+# legacy so a marker-flipped-but-data-not-moved install keeps reading real
+# content (avoids the v0.15 split-brain). An explicit env override always
+# wins (the -z guard).
+if [[ "$BRIDGE_LAYOUT" == "v2" && -n "$BRIDGE_DATA_ROOT" \
+      && -z "${BRIDGE_SHARED_DIR:-}" \
+      && -f "$BRIDGE_DATA_ROOT/.v2-shared-mirror.sentinel" ]]; then
+  BRIDGE_SHARED_DIR="$BRIDGE_DATA_ROOT/shared"
+fi
+
 # Group names. Operator may override via env to fit local naming policy.
 BRIDGE_SHARED_GROUP="${BRIDGE_SHARED_GROUP:-ab-shared}"
 BRIDGE_CONTROLLER_GROUP="${BRIDGE_CONTROLLER_GROUP:-ab-controller}"
