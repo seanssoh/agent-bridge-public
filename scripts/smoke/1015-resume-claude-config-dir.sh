@@ -61,6 +61,14 @@ fi
 #   T7c. (Issue #1370) a REGISTERED linux-user agent on a non-Linux host
 #        (iso never effective) likewise resolves EMPTY despite a scaffolded
 #        <agent-home>/.claude — the admin's actual macOS shape.
+#   T7d. (Issue #1439, Bug-1) a REGISTERED shared-mode per-agent-HOME agent
+#        whose <agent-home>/.claude/projects/<slug>/ is POPULATED resolves to
+#        <agent-home>/.claude — the live recovery. The resolver discriminates
+#        an empty #1316 scaffold (T7b/T7c, resolve empty) from a live
+#        per-agent home (this, resolve the dir) by whether projects/ holds a
+#        directory; pinning both polarities catches a flip in either
+#        direction. Runs AFTER T7b so its populate cannot pollute T7b's
+#        empty-scaffold assertion (same SHARED_AGENT fixture).
 #   T9. bridge_detect_claude_session_id for an UNREGISTERED agent with a
 #       per-call HOME does NOT shadow that HOME — the guard returns empty
 #       and the helper finds the fixture under the per-call HOME
@@ -369,6 +377,37 @@ test_non_linux_host_resolves_empty() {
     "T7c non-Linux-host agent resolves empty despite scaffolded .claude (#1370)"
 }
 
+# T7d — (Issue #1439, Bug-1) a REGISTERED shared-mode agent launched with its
+# OWN HOME (per-agent-HOME layout, e.g. macOS / non-Linux) whose
+# <agent-home>/.claude/projects/<slug>/ is POPULATED with live session data
+# MUST resolve to <agent-home>/.claude — NOT empty. This is the live-recovery
+# the #1439 fix restored: the old #1370 gate discarded the per-agent home for
+# any non-iso-effective agent, so bridge_detect_claude_session_id scanned the
+# stale controller HOME, found no fresh transcript, returned 1, and the
+# restart helper rolled back every just-launched session (whole-fleet
+# crash-loop). The resolver now discriminates an empty #1316 scaffold (T7b /
+# T7c — resolve empty) from a LIVE per-agent home (this case — resolve the
+# dir) by whether projects/ holds a directory. Same fixture shape as T7b but
+# with a populated projects/<slug>/ so the polarity is pinned in both
+# directions: a flip back to the old gate fails BOTH T7b (empty re-breaks
+# #1370) and T7d (populated re-breaks #1439 Bug-1).
+test_per_agent_home_populated_resolves_dir() {
+  bridge_agent_linux_user_isolation_effective "$SHARED_AGENT" 2>/dev/null \
+    && smoke_fail "T7d fixture should NOT be iso-effective (mode=shared)"
+
+  # Populate projects/<slug>/ with a live session dir (the discriminator the
+  # resolver uses: a directory under projects/, not just the scaffold).
+  local slug="${ISO_WORKDIR//\//-}"
+  mkdir -p "$SHARED_SCAFFOLD_DIR/projects/$slug"
+  printf '{"sessionId":"t7d-live"}\n' \
+    >"$SHARED_SCAFFOLD_DIR/projects/$slug/t7d-live.jsonl"
+
+  local resolved=""
+  resolved="$(bridge_resolve_agent_claude_config_dir "$SHARED_AGENT")"
+  smoke_assert_eq "$SHARED_SCAFFOLD_DIR" "$resolved" \
+    "T7d shared-mode per-agent-HOME with populated projects/ resolves the dir (#1439 Bug-1)"
+}
+
 # T9 — bridge_detect_claude_session_id for an UNREGISTERED agent with a
 # per-call HOME must NOT shadow that HOME. The guard returns empty (agent
 # not in the roster) so the helper falls back to HOME/.claude — where the
@@ -415,6 +454,7 @@ smoke_run "T7 shim detect for registered isolated agent"  test_shim_detect_isola
 smoke_run "T8 shim resolve for registered isolated agent" test_shim_resolve_isolated_agent
 smoke_run "T7b shared-mode agent resolves empty (#1370)"  test_shared_mode_resolves_empty
 smoke_run "T7c non-Linux host resolves empty (#1370)"     test_non_linux_host_resolves_empty
+smoke_run "T7d per-agent-HOME populated resolves dir (#1439)" test_per_agent_home_populated_resolves_dir
 smoke_run "T9 shim detect honours per-call HOME"          test_shim_detect_unregistered_home_fallback
 smoke_run "T10 shim resolve honours per-call HOME"        test_shim_resolve_unregistered_home_fallback
 

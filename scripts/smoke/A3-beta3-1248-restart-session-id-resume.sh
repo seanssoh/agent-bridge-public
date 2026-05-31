@@ -34,9 +34,23 @@
 #   T3: `bridge-run.sh --dry-run` with continue=1 + session_id present
 #       emits a resume verb in the launch_cmd (claude `--resume <id>`
 #       or codex `resume <id>`).
-#   T4: `bridge-run.sh --dry-run` with continue=1 + session_id empty
-#       fails loud with the exact remediation message ((a)/(b)/(c)
-#       option list).
+#   T4: `bridge-run.sh --dry-run` with continue=1 + session_id empty AND a
+#       launch.history marker present (the #1248 lost-state case) DEGRADES to
+#       a fresh session instead of dying. #1439 deliberately replaced the old
+#       bridge_die with a warn-and-degrade so the daemon's always-on restart
+#       loop can no longer brick a whole fleet on a missing session_id: assert
+#       rc=0, the `bridge_warn` "degrading to a fresh session" line, the
+#       `session_id_missing_resume_degraded` audit label, and that the
+#       degraded launch carries NO `--resume` verb. Genuine persist/state-dir
+#       write failures STILL hard-fail in bridge_refresh_agent_session_id
+#       (covered by T1), so the #1248 fail-loud contract for real write
+#       failures is preserved.
+#   T4b (resume-safety pin — what the old #1248 die actually protected):
+#       drive the launch-cmd builder directly and assert the resume verb is
+#       chosen correctly: continue=1 + session_id present -> `--resume <id>`;
+#       continue_fallback=1 (a resumable transcript exists but no persisted
+#       id) -> `--continue` (NEVER `--resume ""`, NEVER a bare fresh launch);
+#       genuinely no transcript -> fresh (no `--resume`, no `--continue`).
 #   T5: `bridge-run.sh --dry-run --no-continue` (and roster continue=0)
 #       emits NO resume verb in the launch_cmd. Includes the equivalent
 #       case where the CLI override flips a roster continue=1 to 0.
@@ -45,10 +59,14 @@
 #       text (`state_dir_write_failed:session_id`) is present in
 #       lib/bridge-state.sh — if a future PR removes the fix, this
 #       teeth check fails citing #1248.
-#   T7 (teeth): revert the reconcile gate in `bridge-run.sh` and assert
-#       T4's contract no longer holds. Asserts the structured remediation
-#       text is present in bridge-run.sh — if removed, fails citing
-#       #1248.
+#   T7 (teeth): pin the #1439 degrade contract in `bridge-run.sh`. Asserts
+#       the warn-and-degrade markers are present (the `bridge_warn`
+#       "degrading to a fresh session" line + the
+#       `session_id_missing_resume_degraded` audit action) AND that the old
+#       fail-loud `bridge_die` remediation ("session_id missing; one of" /
+#       `session_id_missing_resume_blocked`) is GONE — if a future PR
+#       reverts to the bricking die path, this teeth check fails citing
+#       #1439 (and #1248 for the underlying lost-state surface).
 #   T8 (r2, codex r1 BLOCKING): `bridge-start.sh`'s post-startup
 #       `bridge_refresh_agent_session_id` call must NOT swallow stderr or
 #       use `|| true`. The function `bridge_die`s on persist-write
@@ -294,27 +312,37 @@ test_continue1_with_session_id_emits_resume() {
 }
 
 # ---------------------------------------------------------------------
-# T4 — continue=1 + session_id empty -> fail-loud with the exact
-#      remediation message. This is the #1248 surface.
+# T4 — continue=1 + session_id empty + launch.history present (the #1248
+#      lost-state case) -> DEGRADE to a fresh session, not die. This is the
+#      #1439 fix: the old bridge_die bricked whole fleets under the daemon's
+#      always-on restart loop because every relaunch hard-failed identically.
 #
 #      Lane E PR #1259 (issue #1265) split the gate into two branches:
-#      `state/agents/<a>/launch.history` absent => fresh-first-wake
-#      bypass (legitimate fresh install); present => genuine #1248
-#      lost-state die. To preserve T4's lost-state contract on top of
-#      Lane E, the marker is pre-touched here so the gate routes the
-#      empty-session_id observation into the die branch instead of the
-#      fresh-state bypass.
+#      `state/agents/<a>/launch.history` absent => fresh-first-wake bypass
+#      (legitimate fresh install); present => lost-state. #1439 changes the
+#      lost-state branch from bridge_die to warn-and-degrade. The marker is
+#      pre-touched here so the gate routes the empty-session_id observation
+#      into the lost-state branch (not the fresh-first-wake bypass), exactly
+#      reproducing the path #1439 changed.
 # ---------------------------------------------------------------------
-test_continue1_empty_session_id_fails_loud() {
+test_continue1_empty_session_id_degrades_to_fresh() {
   local agent="a3-T4"
   write_dryrun_roster "$agent" 1 ""
 
   # Pre-touch launch.history so the Lane E (#1265) gate routes this
-  # empty-session_id observation into the lost-state die branch (#1248)
+  # empty-session_id observation into the lost-state branch (#1248/#1439)
   # rather than the fresh-first-wake bypass branch.
   local marker="$BRIDGE_STATE_DIR/agents/$agent/launch.history"
   mkdir -p "$(dirname "$marker")"
   : >"$marker"
+
+  # Truncate the audit log so the runtime audit-row assertion below sees only
+  # this test's rows (the dry-run inherits BRIDGE_AUDIT_LOG from the smoke env,
+  # so the degrade row lands here). Codex review: T4 must assert the audit row
+  # is actually EMITTED AT RUNTIME, not just source-grepped (T7) — a misplaced
+  # or never-executed emit would otherwise still pass behaviorally.
+  mkdir -p "$(dirname "$BRIDGE_AUDIT_LOG")"
+  : >"$BRIDGE_AUDIT_LOG"
 
   local out=""
   local rc=0
@@ -323,19 +351,106 @@ test_continue1_empty_session_id_fails_loud() {
   rc=$?
   set -e
 
-  if (( rc == 0 )); then
-    smoke_fail "T4 expected non-zero rc from bridge-run.sh when continue=1 + session_id empty, got rc=0; out=$out"
+  # #1439: the lost-state path now degrades to a fresh session (rc=0), it no
+  # longer dies. A whole-fleet crash-loop on a missing session_id was the bug.
+  if (( rc != 0 )); then
+    smoke_fail "T4 expected rc=0 (degrade-to-fresh) from bridge-run.sh when continue=1 + session_id empty + launch.history present, got rc=$rc; out=$out"
   fi
-  smoke_assert_contains "$out" "session_id missing" \
-    "T4 error message starts with session_id missing"
-  smoke_assert_contains "$out" "(a) run agent first interactively to capture" \
-    "T4 remediation (a) present"
-  smoke_assert_contains "$out" "(b) set continue=0 explicitly" \
-    "T4 remediation (b) present"
-  smoke_assert_contains "$out" "(c) check #1246 daemon supp-group state" \
-    "T4 remediation (c) cites #1246"
+  smoke_assert_contains "$out" "lost-state: continue=1 but session_id empty" \
+    "T4 emits the lost-state warn line (ops-visible degrade)"
+  smoke_assert_contains "$out" "degrading to a fresh session" \
+    "T4 warn says it is degrading to a fresh session (#1439)"
   smoke_assert_contains "$out" "agent=$agent" \
-    "T4 message carries the agent name"
+    "T4 warn carries the agent name"
+  # The old fail-loud remediation must NOT appear — its removal is the fix.
+  smoke_assert_not_contains "$out" "session_id missing; one of" \
+    "T4 the old bridge_die remediation text is gone (#1439)"
+  # The degraded launch must be fresh: no resume verb is forced by the gate.
+  # (The static fixture launch_cmd never carries --resume; the assertion pins
+  # that the degrade path does not synthesize one.)
+  smoke_assert_not_contains "$out" "--resume" \
+    "T4 degraded launch carries no --resume verb"
+
+  # Runtime audit-row assertion (codex review): the degrade path must actually
+  # write the `session_id_missing_resume_degraded` row to the audit log when it
+  # runs — and the OLD `session_id_missing_resume_blocked` action must NOT be
+  # emitted. `grep -F` on the JSONL is footgun-#11 safe (no heredoc-stdin); the
+  # action is a fixed literal in the audit envelope.
+  local audit_body=""
+  audit_body="$(cat "$BRIDGE_AUDIT_LOG" 2>/dev/null || true)"
+  smoke_assert_contains "$audit_body" "session_id_missing_resume_degraded" \
+    "T4 degrade emits the session_id_missing_resume_degraded audit row at runtime"
+  smoke_assert_not_contains "$audit_body" "session_id_missing_resume_blocked" \
+    "T4 the old blocked/die audit action is not emitted at runtime (#1439)"
+}
+
+# ---------------------------------------------------------------------
+# T4b — resume-safety pin (what the old #1248 fail-loud die actually
+#      protected). Drive the launch-cmd builder directly so the assertion is
+#      deterministic and binary-free. The contract
+#      (bridge_claude_dynamic_launch_cmd, lib/bridge-state.sh:56-60):
+#        effective_continue=1 && session_id non-empty -> `--resume <id>`
+#        continue_fallback=1                           -> `--continue`
+#        neither                                       -> fresh (no verb)
+#      The degrade path is only safe BECAUSE the builder still emits
+#      `--continue` when a resumable transcript exists — a polarity flip to
+#      `--resume ""` or to a bare fresh launch would silently re-break #1248
+#      resume preservation. Pin all three branches.
+# ---------------------------------------------------------------------
+test_resume_safety_launch_verbs() {
+  declare -F bridge_claude_dynamic_launch_cmd >/dev/null \
+    || smoke_fail "T4b bridge_claude_dynamic_launch_cmd not defined"
+
+  # The launch builder reads BRIDGE_AGENT_MODEL/EFFORT/PERMISSION_MODE via
+  # `${arr[$agent]-}`. Those assoc arrays may be undeclared in this sourced
+  # context after bridge_reset_roster_maps; an undeclared array makes bash
+  # parse the `[$agent]` subscript as ARITHMETIC, so a hyphenated id like
+  # `a3-T4b` becomes `a3 - T4b` and trips `set -u`. Declare them as
+  # associative (idempotent, the same guard bridge-lib.sh uses) so the
+  # subscript is a string key. set -u safe.
+  declare -g -A BRIDGE_AGENT_MODEL 2>/dev/null || true
+  declare -g -A BRIDGE_AGENT_EFFORT 2>/dev/null || true
+  declare -g -A BRIDGE_AGENT_PERMISSION_MODE 2>/dev/null || true
+
+  local agent="a3-T4b"
+  BRIDGE_AGENT_IDS+=("$agent")
+  BRIDGE_AGENT_DESC["$agent"]="$agent launch-verb fixture"
+  BRIDGE_AGENT_ENGINE["$agent"]="claude"
+  BRIDGE_AGENT_SESSION["$agent"]="$agent"
+  BRIDGE_AGENT_WORKDIR["$agent"]="$WORKDIR"
+  BRIDGE_AGENT_LOOP["$agent"]="1"
+  BRIDGE_AGENT_CONTINUE["$agent"]="1"
+  BRIDGE_AGENT_SOURCE["$agent"]="static"
+  BRIDGE_AGENT_CREATED_AT["$agent"]="$(date +%s)"
+  BRIDGE_AGENT_SESSION_ID["$agent"]=""
+
+  local sid="bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+
+  # Case 1 — continue=1 + session_id present -> --resume <id> (resume preserved).
+  local cmd_resume=""
+  cmd_resume="$(bridge_claude_dynamic_launch_cmd "$agent" 1 0 "$sid")"
+  smoke_assert_contains "$cmd_resume" "--resume $sid" \
+    "T4b continue=1 + session_id present emits --resume <id>"
+  smoke_assert_not_contains "$cmd_resume" "--continue" \
+    "T4b --resume case does not also emit --continue"
+
+  # Case 2 — continue_fallback=1 (resumable transcript exists, no persisted
+  # id) -> --continue. This is the resume-preservation the degrade depends on:
+  # NOT --resume "" and NOT a bare fresh launch.
+  local cmd_continue=""
+  cmd_continue="$(bridge_claude_dynamic_launch_cmd "$agent" 0 1 "")"
+  smoke_assert_contains "$cmd_continue" "--continue" \
+    "T4b continue_fallback=1 emits --continue (resume preserved)"
+  smoke_assert_not_contains "$cmd_continue" "--resume" \
+    "T4b continue_fallback case never emits --resume (esp. not --resume \"\")"
+
+  # Case 3 — neither (genuinely no transcript) -> fresh launch, no resume verb.
+  local cmd_fresh=""
+  cmd_fresh="$(bridge_claude_dynamic_launch_cmd "$agent" 0 0 "")"
+  smoke_assert_not_contains "$cmd_fresh" "--resume" \
+    "T4b no-transcript case emits no --resume verb"
+  smoke_assert_not_contains "$cmd_fresh" "--continue" \
+    "T4b no-transcript case emits no --continue verb (fresh is acceptable)"
 }
 
 # ---------------------------------------------------------------------
@@ -406,30 +521,38 @@ test_teeth_layer2_fix_present() {
 }
 
 # ---------------------------------------------------------------------
-# T7 (teeth) — revert the reconcile gate in `bridge-run.sh` and the T4
-# contract no longer holds. Asserts the structured remediation text is
-# present in bridge-run.sh so a future PR that removes the gate triggers
-# this smoke citing #1248.
+# T7 (teeth) — pin the #1439 warn-and-degrade contract in `bridge-run.sh`.
+# Asserts (a) the degrade markers are present so a future PR that drops the
+# lost-state branch trips this check, and (b) the old fail-loud bridge_die
+# remediation is GONE so a regression back to the fleet-bricking die path is
+# caught citing #1439.
 # ---------------------------------------------------------------------
-test_teeth_layer3_gate_present() {
+test_teeth_layer3_degrade_present() {
   local runner="$REPO_ROOT/bridge-run.sh"
   smoke_assert_file_exists "$runner" \
     "T7 teeth: bridge-run.sh exists"
 
   local hit=""
-  hit="$(grep -F 'session_id missing' "$runner" || true)"
+  # (a) the degrade-to-fresh warn line must be present.
+  hit="$(grep -F 'degrading to a fresh session' "$runner" || true)"
   if [[ -z "$hit" ]]; then
-    smoke_fail "T7 teeth: the Layer-3 reconcile gate remediation text 'session_id missing' is missing from $runner — issue #1248 regressed"
+    smoke_fail "T7 teeth: the #1439 'degrading to a fresh session' warn is missing from $runner — the lost-state degrade path regressed (would re-brick fleets)"
   fi
 
-  hit="$(grep -F '(c) check #1246 daemon supp-group state' "$runner" || true)"
+  hit="$(grep -F 'session_id_missing_resume_degraded' "$runner" || true)"
   if [[ -z "$hit" ]]; then
-    smoke_fail "T7 teeth: the Layer-3 reconcile gate remediation (c) is missing from $runner — issue #1248 regressed"
+    smoke_fail "T7 teeth: the #1439 audit action 'session_id_missing_resume_degraded' is missing from $runner — the degrade path regressed"
+  fi
+
+  # (b) the old fail-loud die remediation must NOT be present anymore.
+  hit="$(grep -F 'session_id missing; one of' "$runner" || true)"
+  if [[ -n "$hit" ]]; then
+    smoke_fail "T7 teeth: the old fail-loud 'session_id missing; one of' bridge_die remediation reappeared in $runner — #1439 regressed (this bricked whole fleets under the daemon restart loop)"
   fi
 
   hit="$(grep -F 'session_id_missing_resume_blocked' "$runner" || true)"
-  if [[ -z "$hit" ]]; then
-    smoke_fail "T7 teeth: the Layer-3 audit action 'session_id_missing_resume_blocked' is missing from $runner — issue #1248 regressed"
+  if [[ -n "$hit" ]]; then
+    smoke_fail "T7 teeth: the old audit action 'session_id_missing_resume_blocked' reappeared in $runner — #1439 regressed"
   fi
 }
 
@@ -556,10 +679,11 @@ test_teeth_bridge_start_no_swallow() {
 smoke_run "T1 persist-write failure fails loud"               test_persist_failure_fails_loud
 smoke_run "T2 successful persist emits [session-id]"          test_success_emits_breadcrumb
 smoke_run "T3 continue=1 + sid present -> --resume verb"      test_continue1_with_session_id_emits_resume
-smoke_run "T4 continue=1 + sid empty -> fail-loud + remediation" test_continue1_empty_session_id_fails_loud
+smoke_run "T4 continue=1 + sid empty -> degrade-to-fresh (#1439)" test_continue1_empty_session_id_degrades_to_fresh
+smoke_run "T4b resume-safety: --resume/--continue/fresh verbs" test_resume_safety_launch_verbs
 smoke_run "T5 continue=0 / --no-continue -> no resume verb"   test_continue0_emits_no_resume_verb
 smoke_run "T6 teeth: Layer-2 fail-loud fix present"           test_teeth_layer2_fix_present
-smoke_run "T7 teeth: Layer-3 reconcile gate present"          test_teeth_layer3_gate_present
+smoke_run "T7 teeth: Layer-3 degrade contract present (#1439)" test_teeth_layer3_degrade_present
 smoke_run "T8 bridge-start.sh stderr no longer swallowed"     test_bridge_start_no_swallow_on_exit
 smoke_run "T9 teeth: bridge-start.sh has no 2>&1+|| true swallow" test_teeth_bridge_start_no_swallow
 
