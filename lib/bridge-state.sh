@@ -3807,22 +3807,49 @@ bridge_resolve_agent_claude_config_dir() {
   if command -v bridge_agent_exists >/dev/null 2>&1; then
     bridge_agent_exists "$agent" || return 0
   fi
-  # Issue #1370 (beta5-2 #1316 regression): only agents whose linux-user
-  # isolation is *effective* (iso v2 active on a Linux host with an os_user)
-  # own a private Claude config dir. Shared-mode agents — including the admin,
-  # and every agent on non-Linux hosts where iso is never effective — write
-  # their session JSON / transcripts under the controller HOME (~/.claude).
-  # Returning a derived agent-home path for those makes session-id detection
-  # look in an empty scaffolded `<agent-home>/.claude` and block --continue
-  # resume. Fall through (empty) so the detect helper uses its daemon-HOME
-  # fallback. See bridge_detect_claude_session_id / Issue #1015.
-  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then
-    bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || return 0
-  fi
   config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
   # A derived-but-absent path means the agent is not actually isolated on
   # this host; do not let it shadow the caller's HOME.
   [[ -n "$config_dir" && -d "$config_dir" ]] || return 0
+
+  # Issue #1370 (beta5-2 #1316 regression) gated this purely on linux-user
+  # isolation being *effective*: when it is NOT (every non-Linux host, and
+  # shared-mode Linux agents) the agent USUALLY shares the controller HOME
+  # ~/.claude, so a derived <agent-home>/.claude is an empty #1316 scaffold
+  # that must NOT shadow the controller HOME (it would block --continue
+  # resume).
+  #
+  # But that assumption is false on installs where each agent is launched with
+  # its OWN HOME (<agent-home>) even in shared mode — e.g. per-agent-HOME
+  # layouts on macOS/non-Linux hosts. There Claude writes its session JSON
+  # under <agent-home>/.claude/projects, which IS the live session location.
+  # The old gate discarded it, so bridge_detect_claude_session_id was handed
+  # an empty config dir, scanned the stale controller HOME, found no fresh
+  # transcript, returned 1, and the restart helper rolled back every
+  # just-launched session — a whole-fleet crash-loop (surfaced when Claude CLI
+  # boot grew slower than the session-id detect window). Discriminate an empty
+  # #1316 scaffold from a live per-agent home by whether projects/ holds data.
+  #
+  # iso-effective Linux agents own a private config dir unconditionally and
+  # skip the scaffold check (the controller cannot stat their iso-UID
+  # projects/ tree anyway). Everyone else — shared-mode, non-Linux, AND any
+  # context where the helper is absent (standalone / minimal / smoke) — runs
+  # the scaffold check. Treating a missing helper as "not effective" is the
+  # safe default: it keeps running the check instead of blindly returning the
+  # dir, preserving the #1370 protection where the helper is unavailable.
+  local _iso_effective=0
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+     && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    _iso_effective=1
+  fi
+  if [[ "$_iso_effective" != "1" ]]; then
+    # `-type d`: a live per-agent home has projects/<workdir-slug>/ DIRECTORIES;
+    # an empty #1316 scaffold has none. Matching only directories ignores stray
+    # files (e.g. a macOS projects/.DS_Store) that would otherwise read as live.
+    if [[ -z "$(find "$config_dir/projects" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)" ]]; then
+      return 0
+    fi
+  fi
   printf '%s' "$config_dir"
 }
 
