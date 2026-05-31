@@ -702,6 +702,64 @@ bridge_run_agent_claude_root() {
   fi
 }
 
+bridge_run_claude_keychain_free_preflight() {
+  local platform=""
+  local helper_path=""
+  local config_dir=""
+  local settings_file=""
+  local registry_path=""
+  local ttl_ms=""
+
+  [[ "$ENGINE" == "claude" ]] || return 0
+  [[ $SAFE_MODE -eq 0 ]] || return 0
+  bridge_claude_keychain_free_auth_enabled || return 0
+  ttl_ms="$(bridge_claude_api_key_helper_ttl_ms)"
+  export CLAUDE_CODE_API_KEY_HELPER_TTL_MS="$ttl_ms"
+
+  platform="$(bridge_host_platform 2>/dev/null || uname -s 2>/dev/null || printf '')"
+  [[ "$platform" == "Darwin" ]] || return 0
+
+  bridge_require_python
+  helper_path="$(bridge_claude_api_key_helper_path)"
+  [[ -f "$helper_path" && -x "$helper_path" ]] \
+    || bridge_die "Claude keychain-free auth is enabled but apiKeyHelper is not executable: $helper_path"
+
+  config_dir="$(bridge_run_agent_claude_root)"
+  settings_file="$config_dir/settings.json"
+  [[ -f "$settings_file" ]] \
+    || bridge_die "Claude keychain-free auth is enabled but settings.json is missing: $settings_file"
+
+  if ! python3 - "$settings_file" "$helper_path" <<'PY'; then
+import json
+import sys
+from pathlib import Path
+
+settings_path = Path(sys.argv[1])
+expected = Path(sys.argv[2]).expanduser().resolve(strict=False)
+payload = json.loads(settings_path.read_text(encoding="utf-8"))
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+actual_raw = payload.get("apiKeyHelper")
+if not isinstance(actual_raw, str) or not actual_raw:
+    raise SystemExit(1)
+actual = Path(actual_raw).expanduser()
+if not actual.is_absolute():
+    raise SystemExit(1)
+if actual.resolve(strict=False) != expected:
+    raise SystemExit(1)
+PY
+    bridge_die "Claude keychain-free auth is enabled but settings.json does not point at apiKeyHelper: $settings_file"
+  fi
+
+  registry_path="$(bridge_claude_token_registry_path)"
+  if ! python3 "$SCRIPT_DIR/bridge-auth.py" \
+      --registry "$registry_path" \
+      api-key-helper --check >/dev/null; then
+    bridge_die "Claude keychain-free auth is enabled but no active registry OAT is available"
+  fi
+
+}
+
 bridge_run_ensure_claude_launch_channel_plugins() {
   local agent_claude_root=""
   local agent_home=""
@@ -1037,6 +1095,7 @@ while true; do
   local_launch_cmd_display="$(bridge_redact_inline_env_secrets "$LAUNCH_CMD")"
 
   if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
+    bridge_run_claude_keychain_free_preflight
     # v0.9.7 RC6 (refs #781): channel-required plugin sync failure must
     # block the launch — the agent is being started for that channel
     # and an isolated-UID-unreadable cache directory means MCP servers

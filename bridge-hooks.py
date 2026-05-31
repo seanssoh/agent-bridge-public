@@ -1127,6 +1127,7 @@ def next_backup_path(path: Path, os_user: str | None = None) -> Path:
 PRESERVED_USER_KEYS = (
     "enabledPlugins",
     "extraKnownMarketplaces",
+    "apiKeyHelper",
     "skipDangerousModePermissionPrompt",
 )
 

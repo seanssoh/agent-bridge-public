@@ -324,6 +324,83 @@ export BRIDGE_TMUX_PROMPT_WAIT_SECONDS
 export BRIDGE_MCP_ORPHAN_CLEANUP_ENABLED BRIDGE_MCP_ORPHAN_CLEANUP_INTERVAL_SECONDS BRIDGE_MCP_ORPHAN_MIN_AGE_SECONDS
 export BRIDGE_MCP_ORPHAN_SESSION_STOP_MIN_AGE_SECONDS BRIDGE_MCP_ORPHAN_NOTIFY_THRESHOLD BRIDGE_MCP_ORPHAN_PATTERNS
 
+bridge_bool_is_true() {
+  local value="${1:-}"
+  value="${value,,}"
+  case "$value" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+bridge_runtime_config_value() {
+  local key="$1"
+  [[ -n "$key" && -f "${BRIDGE_RUNTIME_CONFIG_FILE:-}" ]] || return 1
+  python3 - "$BRIDGE_RUNTIME_CONFIG_FILE" "$key" <<'PY' 2>/dev/null
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+payload = json.loads(path.read_text(encoding="utf-8"))
+if not isinstance(payload, dict) or key not in payload:
+    raise SystemExit(1)
+value = payload[key]
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif value is None:
+    raise SystemExit(1)
+else:
+    print(str(value))
+PY
+}
+
+bridge_config_bool_enabled() {
+  local key="$1"
+  local value=""
+  value="$(bridge_runtime_config_value "$key" 2>/dev/null || true)"
+  bridge_bool_is_true "$value"
+}
+
+bridge_claude_keychain_free_auth_enabled() {
+  if [[ -n "${BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH:-}" ]]; then
+    bridge_bool_is_true "$BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH"
+    return $?
+  fi
+  bridge_config_bool_enabled "claude_keychain_free_auth"
+}
+
+bridge_claude_api_key_helper_path() {
+  local path=""
+  if [[ -n "${BRIDGE_CLAUDE_API_KEY_HELPER:-}" ]]; then
+    path="$BRIDGE_CLAUDE_API_KEY_HELPER"
+  else
+    path="$(bridge_runtime_config_value "claude_api_key_helper" 2>/dev/null || true)"
+    [[ -n "$path" ]] || path="$BRIDGE_SCRIPT_DIR/scripts/claude-oat-api-key-helper.sh"
+  fi
+  case "$path" in
+    /*) printf '%s' "$path" ;;
+    *) printf '%s/%s' "$BRIDGE_SCRIPT_DIR" "$path" ;;
+  esac
+}
+
+bridge_claude_token_registry_path() {
+  printf '%s' "${BRIDGE_CLAUDE_TOKEN_REGISTRY:-$BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json}"
+}
+
+bridge_claude_api_key_helper_ttl_ms() {
+  local value="${BRIDGE_CLAUDE_API_KEY_HELPER_TTL_MS:-}"
+  if [[ -z "$value" ]]; then
+    value="$(bridge_runtime_config_value "claude_api_key_helper_ttl_ms" 2>/dev/null || true)"
+  fi
+  if [[ "$value" =~ ^[0-9]+$ ]] && (( 10#$value > 0 )); then
+    printf '%s' "$value"
+  else
+    printf '%s' "60000"
+  fi
+}
+
 bridge_prepend_path_entry() {
   local entry="$1"
   [[ -n "$entry" ]] || return 0

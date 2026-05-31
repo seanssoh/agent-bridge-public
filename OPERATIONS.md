@@ -1147,7 +1147,9 @@ seeds the sibling `.claude/.claude.json` bootstrap file when missing, because
 interactive Claude Code sessions require both files to skip first-run login
 prompts. It also preserves `settings.json` while adding Claude's
 `skipDangerousModePermissionPrompt` user setting for bridge-managed agents
-that are launched with `--dangerously-skip-permissions`.
+that are launched with `--dangerously-skip-permissions`. When keychain-free
+auth is explicitly enabled, sync also renders an `apiKeyHelper` path into the
+same settings file.
 
 ```bash
 claude setup-token
@@ -1192,8 +1194,31 @@ modes (see PR #799 r2-of-Path-A):
 
 Same-UID FS readability of the credential file is documented as a
 defense-in-depth residual in [`KNOWN_ISSUES.md` §25](./KNOWN_ISSUES.md#25-claude-oauth-credential--same-uid-fs-readability-residual-799-r2-of-path-a).
-A credential-helper enhancement is planned to close that gap in a
-follow-up PR.
+On headless macOS hosts that must avoid Claude Code's native login-Keychain
+fallback, enable the default-off helper path in runtime config:
+
+```json
+{
+  "claude_keychain_free_auth": true,
+  "claude_api_key_helper_ttl_ms": 60000
+}
+```
+
+After changing the flag, run `agent-bridge auth claude-token sync --agents ...`
+so each selected agent's `settings.json` includes the managed `apiKeyHelper`
+path. The helper (`scripts/claude-oat-api-key-helper.sh`) reads the locked
+OAT registry and prints only the active token to stdout for Claude Code; no
+OAuth token is placed in `launch-secrets.env` or `CLAUDE_CODE_OAUTH_TOKEN`.
+`CLAUDE_CODE_API_KEY_HELPER_TTL_MS` is exported as non-secret launch metadata
+and defaults to 60000 ms so active-id rotation is picked up promptly.
+
+On Darwin, `bridge-run.sh` and `bridge-cron-runner.py` fail closed before
+launching `claude` when `claude_keychain_free_auth` is enabled but the helper,
+settings entry, or active registry OAT is unavailable. This avoids falling
+through to the operator user's default Keychain on headless rotation hosts.
+The helper remains a same-UID oracle by design: any process running as the
+agent UID can execute it, but the token is no longer readable from a file that
+normal Bash/tool subprocesses inherit by default.
 
 #### claude.ai OAuth fallback (#1075)
 

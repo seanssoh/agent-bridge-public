@@ -15,13 +15,31 @@ ROOT="$(mktemp -d -t agb-claude-token-rotation.XXXXXX)"
 trap 'rm -rf "$ROOT"' EXIT
 
 BRIDGE_HOME="$ROOT/home"
+BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
+BRIDGE_ACTIVE_AGENT_DIR="$BRIDGE_STATE_DIR/agents"
+BRIDGE_HISTORY_DIR="$BRIDGE_STATE_DIR/history"
+BRIDGE_WORKTREE_META_DIR="$BRIDGE_STATE_DIR/worktrees"
+BRIDGE_LOG_DIR="$BRIDGE_HOME/logs"
+BRIDGE_SHARED_DIR="$BRIDGE_HOME/shared"
 BRIDGE_DATA_ROOT="$ROOT/data"
+BRIDGE_SHARED_ROOT="$BRIDGE_DATA_ROOT/shared"
+BRIDGE_AGENT_ROOT_V2="$BRIDGE_DATA_ROOT/agents"
+BRIDGE_AGENT_HOME_ROOT="$BRIDGE_HOME/agents"
+BRIDGE_CONTROLLER_STATE_ROOT="$BRIDGE_DATA_ROOT/state"
+BRIDGE_LAYOUT_MARKER_DIR="$BRIDGE_HOME/state"
 BRIDGE_ROSTER_FILE="$ROOT/agent-roster.sh"
 BRIDGE_ROSTER_LOCAL_FILE="$ROOT/agent-roster.local.sh"
 BRIDGE_CLAUDE_TOKEN_REGISTRY="$ROOT/runtime/secrets/claude-oauth-tokens.json"
+BRIDGE_RUNTIME_ROOT="$ROOT/runtime"
+BRIDGE_RUNTIME_CREDENTIALS_DIR="$ROOT/runtime/credentials"
 BRIDGE_RUNTIME_SECRETS_DIR="$ROOT/runtime/secrets"
-export BRIDGE_HOME BRIDGE_DATA_ROOT BRIDGE_ROSTER_FILE BRIDGE_ROSTER_LOCAL_FILE
-export BRIDGE_CLAUDE_TOKEN_REGISTRY BRIDGE_RUNTIME_SECRETS_DIR
+BRIDGE_RUNTIME_CONFIG_FILE="$ROOT/runtime/bridge-config.json"
+export BRIDGE_HOME BRIDGE_STATE_DIR BRIDGE_ACTIVE_AGENT_DIR BRIDGE_HISTORY_DIR BRIDGE_WORKTREE_META_DIR
+export BRIDGE_LOG_DIR BRIDGE_SHARED_DIR BRIDGE_DATA_ROOT BRIDGE_SHARED_ROOT
+export BRIDGE_AGENT_ROOT_V2 BRIDGE_AGENT_HOME_ROOT BRIDGE_CONTROLLER_STATE_ROOT
+export BRIDGE_LAYOUT_MARKER_DIR BRIDGE_ROSTER_FILE BRIDGE_ROSTER_LOCAL_FILE
+export BRIDGE_CLAUDE_TOKEN_REGISTRY BRIDGE_RUNTIME_ROOT BRIDGE_RUNTIME_CREDENTIALS_DIR
+export BRIDGE_RUNTIME_SECRETS_DIR BRIDGE_RUNTIME_CONFIG_FILE
 export BRIDGE_LAYOUT=v2
 
 TOKEN_A="fake-claude-oauth-token-a"
@@ -33,8 +51,13 @@ CLAUDE_CONFIG_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/home/.claude/.claude.json"
 CLAUDE_SETTINGS_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/home/.claude/settings.json"
 CLAUDE_SETTINGS_EFFECTIVE_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/home/.claude/settings.effective.json"
 LEGACY_SECRET_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/credentials/launch-secrets.env"
+HELPER_SCRIPT="$REPO_ROOT/scripts/claude-oat-api-key-helper.sh"
 
-mkdir -p "$BRIDGE_HOME" "$BRIDGE_DATA_ROOT" "$ROOT/runtime/secrets" "$ROOT/workdir" "$ROOT/bin"
+mkdir -p "$BRIDGE_HOME" "$BRIDGE_STATE_DIR" "$BRIDGE_ACTIVE_AGENT_DIR" "$BRIDGE_HISTORY_DIR" \
+  "$BRIDGE_WORKTREE_META_DIR" "$BRIDGE_LOG_DIR" "$BRIDGE_SHARED_DIR" "$BRIDGE_DATA_ROOT" \
+  "$BRIDGE_SHARED_ROOT" "$BRIDGE_AGENT_ROOT_V2" "$BRIDGE_AGENT_HOME_ROOT" \
+  "$BRIDGE_CONTROLLER_STATE_ROOT" "$BRIDGE_LAYOUT_MARKER_DIR" \
+  "$BRIDGE_RUNTIME_CREDENTIALS_DIR" "$ROOT/runtime/secrets" "$ROOT/workdir" "$ROOT/bin"
 : >"$BRIDGE_ROSTER_FILE"
 cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<ROSTER
 BRIDGE_ADMIN_AGENT_ID="$AGENT"
@@ -49,6 +72,9 @@ ROSTER
 
 cat >"$ROOT/bin/claude" <<'FAKE_CLAUDE'
 #!/usr/bin/env bash
+if [[ -n "${FAKE_CLAUDE_MARKER:-}" ]]; then
+  : >"$FAKE_CLAUDE_MARKER"
+fi
 if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
   printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500,"result":"token env should not be inherited"}'
   exit 1
@@ -61,9 +87,37 @@ if [[ -n "${CLAUDE_CONFIG_DIR:-}" && ! -f "$CLAUDE_CONFIG_DIR/.credentials.json"
   printf '%s\n' '{"type":"result","is_error":true,"api_error_status":401,"result":"missing credential file"}'
   exit 1
 fi
+if [[ "${FAKE_CLAUDE_REQUIRE_API_KEY_HELPER:-0}" == "1" ]]; then
+  if [[ -z "${CLAUDE_CODE_API_KEY_HELPER_TTL_MS:-}" ]]; then
+    printf '%s\n' '{"type":"result","is_error":true,"api_error_status":401,"result":"missing apiKeyHelper TTL"}'
+    exit 1
+  fi
+  if [[ -z "${CLAUDE_CONFIG_DIR:-}" || -z "${EXPECTED_API_KEY_HELPER:-}" ]]; then
+    printf '%s\n' '{"type":"result","is_error":true,"api_error_status":401,"result":"missing apiKeyHelper inputs"}'
+    exit 1
+  fi
+  if ! python3 - "$CLAUDE_CONFIG_DIR/settings.json" "$EXPECTED_API_KEY_HELPER" >/dev/null 2>&1 <<'PY'
+import json
+import sys
+from pathlib import Path
+
+settings = Path(sys.argv[1])
+expected = Path(sys.argv[2]).resolve(strict=False)
+payload = json.loads(settings.read_text(encoding="utf-8"))
+actual = payload.get("apiKeyHelper")
+if not isinstance(actual, str):
+    raise SystemExit(1)
+if Path(actual).resolve(strict=False) != expected:
+    raise SystemExit(1)
+PY
+  then
+    printf '%s\n' '{"type":"result","is_error":true,"api_error_status":401,"result":"bad apiKeyHelper settings"}'
+    exit 1
+  fi
+fi
 case "${FAKE_CLAUDE_MODE:-ok}" in
   structured)
-    printf '%s\n' '{"type":"result","is_error":false,"structured_output":{"status":"completed","summary":"OK","findings":[],"actions_taken":[],"needs_human_followup":false,"recommended_next_steps":[],"artifacts":[],"confidence":"high","delivery_intent":"silent"}}'
+    printf '%s\n' '{"type":"result","is_error":false,"structured_output":{"status":"completed","summary":"OK","findings":[],"actions_taken":[],"needs_human_followup":false,"recommended_next_steps":[],"artifacts":[],"confidence":"high","delivery_intent":"silent","forward_target":null,"summary_short":null,"channel_relay":null}}'
     ;;
   quota)
     printf '%s\n' '{"type":"result","is_error":true,"api_error_status":429,"result":"You'\''ve hit your limit - resets May 13, 3am (UTC)"}'
@@ -90,6 +144,7 @@ fail() {
 }
 
 json_assert() {
+  local label="$1"
   "$PYTHON" - "$@" <<'PY'
 import json
 import sys
@@ -100,6 +155,7 @@ expr = sys.argv[3]
 if not eval(expr, {"payload": payload}):
     raise SystemExit(f"{label}: assertion failed: {expr}; payload={payload!r}")
 PY
+  [[ $? -eq 0 ]] || fail "$label assertion failed"
 }
 
 ADD_JSON="$(printf '%s' "$TOKEN_A" | "$REPO_ROOT/agent-bridge" auth claude-token add --id first --stdin --activate --sync --json)"
@@ -149,12 +205,57 @@ from pathlib import Path
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 if payload.get("skipDangerousModePermissionPrompt") is not True:
     raise SystemExit("Claude settings bootstrap did not accept agent bypass-permission launch mode")
+if "apiKeyHelper" in payload:
+    raise SystemExit("apiKeyHelper rendered while keychain-free auth flag is off")
 PY
 [[ $? -eq 0 ]] || fail "Claude settings bootstrap missing bypass-permission state"
 [[ -f "$LEGACY_SECRET_FILE" ]] || fail "legacy launch env file with CLAUDE_CONFIG_DIR was not created"
 ! grep -Fq "CLAUDE_CODE_OAUTH_TOKEN" "$LEGACY_SECRET_FILE" || fail "legacy launch secret still contains token env"
 grep -Fq "CLAUDE_CONFIG_DIR='$(dirname "$CREDENTIAL_FILE")'" "$LEGACY_SECRET_FILE" || fail "legacy launch env did not point Claude at per-agent config dir"
 pass "add --sync writes Claude credential/config files without leaking token env"
+
+"$PYTHON" - "$BRIDGE_RUNTIME_CONFIG_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps({
+    "claude_keychain_free_auth": True,
+    "claude_api_key_helper_ttl_ms": 60000,
+}, indent=2) + "\n", encoding="utf-8")
+PY
+SYNC_KEYCHAIN_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token sync --agents "$AGENT" --json)" \
+  || fail "keychain-free sync failed"
+[[ "$SYNC_KEYCHAIN_JSON" != *"$TOKEN_A"* ]] || fail "keychain-free sync output leaked token"
+"$PYTHON" - "$CLAUDE_SETTINGS_FILE" "$HELPER_SCRIPT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = Path(sys.argv[2]).resolve(strict=False)
+actual = payload.get("apiKeyHelper")
+if not isinstance(actual, str):
+    raise SystemExit("apiKeyHelper missing after enabling keychain-free auth")
+if Path(actual).resolve(strict=False) != expected:
+    raise SystemExit("apiKeyHelper path mismatch after enabling keychain-free auth")
+PY
+[[ $? -eq 0 ]] || fail "keychain-free settings render did not add apiKeyHelper"
+! grep -Fq "CLAUDE_CODE_OAUTH_TOKEN" "$LEGACY_SECRET_FILE" || fail "keychain-free sync reintroduced token env"
+HELPER_TOKEN_BEFORE="$ROOT/helper-before.txt"
+"$HELPER_SCRIPT" >"$HELPER_TOKEN_BEFORE" || fail "apiKeyHelper did not return an active token"
+"$PYTHON" - "$HELPER_TOKEN_BEFORE" "$TOKEN_A" <<'PY'
+import sys
+from pathlib import Path
+
+actual = Path(sys.argv[1]).read_text(encoding="utf-8").rstrip("\n")
+if actual != sys.argv[2]:
+    raise SystemExit("apiKeyHelper did not read the active token")
+PY
+[[ $? -eq 0 ]] || fail "apiKeyHelper did not read active token"
+pass "keychain-free sync renders apiKeyHelper and helper reads active registry token"
 
 CRON_RUN_DIR="$ROOT/cron-runner-claude-config"
 mkdir -p "$CRON_RUN_DIR"
@@ -202,7 +303,58 @@ credential_file = Path(sys.argv[3])
 if not credential_file.is_file():
     raise SystemExit("credential file missing after cron runner smoke")
 PY
+[[ $? -eq 0 ]] || fail "cron runner did not inject Claude config"
 pass "cron runner injects per-agent CLAUDE_CONFIG_DIR for claude -p"
+
+CRON_HELPER_RUN_DIR="$ROOT/cron-runner-keychain-free"
+mkdir -p "$CRON_HELPER_RUN_DIR"
+cat >"$CRON_HELPER_RUN_DIR/payload.txt" <<'PAYLOAD'
+Smoke-test cron runner keychain-free apiKeyHelper injection.
+PAYLOAD
+"$PYTHON" - "$CRON_HELPER_RUN_DIR" "$ROOT/workdir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+run_dir = Path(sys.argv[1])
+workdir = Path(sys.argv[2])
+payload = {
+    "run_id": "cron-runner-keychain-free-smoke",
+    "job_name": "cron-runner-keychain-free-smoke",
+    "family": "smoke",
+    "target_agent": "patch",
+    "target_engine": "claude",
+    "target_workdir": str(workdir),
+    "payload_file": str(run_dir / "payload.txt"),
+    "result_file": str(run_dir / "result.json"),
+    "status_file": str(run_dir / "status.json"),
+    "stdout_log": str(run_dir / "stdout.log"),
+    "stderr_log": str(run_dir / "stderr.log"),
+}
+(run_dir / "request.json").write_text(json.dumps(payload), encoding="utf-8")
+PY
+PATH="$ROOT/bin:$PATH" \
+  BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin \
+  FAKE_CLAUDE_MODE=structured \
+  FAKE_CLAUDE_REQUIRE_CONFIG=1 \
+  FAKE_CLAUDE_REQUIRE_API_KEY_HELPER=1 \
+  EXPECTED_API_KEY_HELPER="$HELPER_SCRIPT" \
+  "$PYTHON" "$REPO_ROOT/bridge-cron-runner.py" run --request-file "$CRON_HELPER_RUN_DIR/request.json" >/dev/null
+"$PYTHON" - "$CRON_HELPER_RUN_DIR/status.json" "$CRON_HELPER_RUN_DIR/stdout.log" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if status.get("state") != "success":
+    raise SystemExit(f"keychain-free cron runner did not succeed: {status!r}")
+stdout = Path(sys.argv[2]).read_text(encoding="utf-8")
+for needle in ("missing apiKeyHelper TTL", "bad apiKeyHelper settings"):
+    if needle in stdout:
+        raise SystemExit(f"keychain-free cron runner did not inject helper env: {stdout!r}")
+PY
+[[ $? -eq 0 ]] || fail "cron runner did not inject keychain-free helper env"
+pass "cron runner preflights keychain-free auth and exports apiKeyHelper TTL"
 
 ADD_SECOND_JSON="$(printf '%s' "$TOKEN_B" | "$REPO_ROOT/agent-bridge" auth claude-token add --id second --stdin --json)"
 [[ "$ADD_SECOND_JSON" != *"$TOKEN_B"* ]] || fail "add output leaked token B"
@@ -224,11 +376,53 @@ actual = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("claudeAi
 if actual != sys.argv[2]:
     raise SystemExit("credential file did not rotate to token B")
 PY
+[[ $? -eq 0 ]] || fail "credential file did not rotate to token B"
 ! grep -Fq "CLAUDE_CODE_OAUTH_TOKEN" "$LEGACY_SECRET_FILE" || fail "legacy launch secret reintroduced token env"
 grep -Fq "CLAUDE_CONFIG_DIR='$(dirname "$CREDENTIAL_FILE")'" "$LEGACY_SECRET_FILE" || fail "legacy launch env lost CLAUDE_CONFIG_DIR"
 [[ -L "$CLAUDE_SETTINGS_FILE" ]] || fail "Claude settings symlink was replaced during sync"
 [[ "$(readlink "$CLAUDE_SETTINGS_FILE")" == "settings.effective.json" ]] || fail "Claude settings symlink target changed during sync"
+"$HELPER_SCRIPT" >"$ROOT/helper-after.txt" || fail "apiKeyHelper failed after token rotation"
+"$PYTHON" - "$HELPER_TOKEN_BEFORE" "$ROOT/helper-after.txt" "$TOKEN_B" <<'PY'
+import sys
+from pathlib import Path
+
+before = Path(sys.argv[1]).read_text(encoding="utf-8").rstrip("\n")
+after = Path(sys.argv[2]).read_text(encoding="utf-8").rstrip("\n")
+expected = sys.argv[3]
+if after != expected:
+    raise SystemExit("apiKeyHelper did not pick up the rotated active token")
+if before == after:
+    raise SystemExit("apiKeyHelper returned the same token before and after rotation")
+PY
+[[ $? -eq 0 ]] || fail "apiKeyHelper did not pick up rotated active token"
 pass "rotate --sync advances Claude credential file"
+
+PREFLIGHT_REGISTRY_BACKUP="$ROOT/preflight-registry-backup.json"
+cp "$BRIDGE_CLAUDE_TOKEN_REGISTRY" "$PREFLIGHT_REGISTRY_BACKUP"
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["active_token_id"] = ""
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+PREFLIGHT_MARKER="$ROOT/fake-claude-launched"
+rm -f "$PREFLIGHT_MARKER"
+if PATH="$ROOT/bin:$PATH" \
+    BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin \
+    FAKE_CLAUDE_MARKER="$PREFLIGHT_MARKER" \
+    "$REPO_ROOT/bridge-run.sh" "$AGENT" --once --no-continue \
+      >"$ROOT/keychain-free-preflight.out" 2>"$ROOT/keychain-free-preflight.err"; then
+  fail "keychain-free preflight allowed launch without an active token"
+fi
+[[ ! -e "$PREFLIGHT_MARKER" ]] || fail "keychain-free preflight launched claude despite missing token"
+grep -Fq "keychain-free auth" "$ROOT/keychain-free-preflight.err" \
+  || fail "keychain-free preflight failure did not identify the auth gate"
+mv "$PREFLIGHT_REGISTRY_BACKUP" "$BRIDGE_CLAUDE_TOKEN_REGISTRY"
+pass "bridge-run keychain-free preflight fails closed before launching claude"
 
 # PR #799 r4 codex finding 1 — the bridge-auth.py unchanged-content fast paths
 # at ensure_claude_config_file (.claude.json) and ensure_claude_settings_file
@@ -389,7 +583,7 @@ PY
 )
   BRIDGE_AGENT_ID="$AGENT" \
     BRIDGE_HOME="$BRIDGE_HOME" \
-    BRIDGE_ADMIN_AGENT_ID="$AGENT" \
+    BRIDGE_ADMIN_AGENT_ID="admin" \
     "$PYTHON" "$REPO_ROOT/hooks/tool-policy.py" <<<"$payload"
 }
 

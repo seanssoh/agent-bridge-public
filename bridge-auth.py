@@ -29,6 +29,12 @@ TOKEN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 CLAUDE_OAUTH_EXPIRES_AT_MS = 4102444800000
 CLAUDE_OAUTH_SCOPES = ["user:inference", "user:profile"]
 CLAUDE_CONFIG_MIGRATION_VERSION = 13
+ROOT = Path(__file__).resolve().parent
+KEYCHAIN_FREE_CONFIG_KEY = "claude_keychain_free_auth"
+API_KEY_HELPER_CONFIG_KEY = "claude_api_key_helper"
+API_KEY_HELPER_TTL_CONFIG_KEY = "claude_api_key_helper_ttl_ms"
+DEFAULT_API_KEY_HELPER_TTL_MS = 60000
+TRUE_STRINGS = {"1", "true", "yes", "on"}
 MONTHS = {
     "january": 1,
     "february": 2,
@@ -82,6 +88,86 @@ def fail(message: str, json_mode: bool = False, rc: int = 1) -> int:
     else:
         print(f"[error] {message}", file=sys.stderr)
     return rc
+
+
+def env_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in TRUE_STRINGS
+
+
+def runtime_config_path() -> Path | None:
+    explicit = os.environ.get("BRIDGE_RUNTIME_CONFIG_FILE", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+
+    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()
+    if runtime_root:
+        root = Path(runtime_root).expanduser()
+    else:
+        bridge_home = os.environ.get("BRIDGE_HOME", "").strip()
+        if not bridge_home:
+            return None
+        root = Path(bridge_home).expanduser() / "runtime"
+
+    canonical = root / "bridge-config.json"
+    legacy = root / "openclaw.json"
+    if canonical.is_file():
+        return canonical
+    if legacy.is_file():
+        return legacy
+    return canonical
+
+
+def load_runtime_config() -> dict[str, Any]:
+    path = runtime_config_path()
+    if path is None or not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def runtime_config_value(key: str) -> Any:
+    return load_runtime_config().get(key)
+
+
+def runtime_config_truthy(key: str) -> bool:
+    value = runtime_config_value(key)
+    if isinstance(value, bool):
+        return value
+    return env_truthy(str(value) if value is not None else "")
+
+
+def claude_keychain_free_auth_enabled() -> bool:
+    override = os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH")
+    if override is not None and override.strip():
+        return env_truthy(override)
+    return runtime_config_truthy(KEYCHAIN_FREE_CONFIG_KEY)
+
+
+def claude_api_key_helper_path() -> str:
+    raw = (
+        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER", "").strip()
+        or str(runtime_config_value(API_KEY_HELPER_CONFIG_KEY) or "").strip()
+        or str(ROOT / "scripts" / "claude-oat-api-key-helper.sh")
+    )
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    return str(path.resolve(strict=False))
+
+
+def claude_api_key_helper_ttl_ms() -> int:
+    raw = (
+        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER_TTL_MS", "").strip()
+        or str(runtime_config_value(API_KEY_HELPER_TTL_CONFIG_KEY) or "").strip()
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_API_KEY_HELPER_TTL_MS
+    return value if value > 0 else DEFAULT_API_KEY_HELPER_TTL_MS
 
 
 def token_fingerprint(token: str) -> str:
@@ -318,6 +404,20 @@ def find_token(registry: dict[str, Any], token_id: str) -> dict[str, Any] | None
         if row.get("id") == token_id:
             return row
     return None
+
+
+def active_registry_token(registry: dict[str, Any]) -> tuple[str, str]:
+    active_id = str(registry.get("active_token_id") or "")
+    if not active_id:
+        raise ValueError("no active Claude OAuth token registered")
+    row = find_token(registry, active_id)
+    if row is None:
+        raise ValueError("active Claude OAuth token id is missing from registry")
+    if not bool(row.get("enabled", True)):
+        raise ValueError("active Claude OAuth token is disabled")
+    token = str(row.get("token") or "")
+    validate_token(token)
+    return active_id, token
 
 
 def public_token_row(row: dict[str, Any], active_id: str) -> dict[str, Any]:
@@ -1391,6 +1491,8 @@ def ensure_claude_settings_file(
             raise ValueError(f"Claude settings file must contain a JSON object: {path}")
         payload = parsed
     payload.setdefault("skipDangerousModePermissionPrompt", True)
+    if claude_keychain_free_auth_enabled():
+        payload["apiKeyHelper"] = claude_api_key_helper_path()
     # PR #799 r4 codex finding 1 — always route through write_private_file_atomic.
     # The previous "payload == before" fast path returned without atomic rewrite,
     # doing final-path os.chown on a path the agent UID can swap to a symlink
@@ -1409,6 +1511,34 @@ def ensure_claude_settings_file(
         owner_gid=owner_gid,
     )
     return path
+
+
+def cmd_api_key_helper(args: argparse.Namespace) -> int:
+    json_mode = bool(args.json)
+    if json_mode and not bool(args.check):
+        return fail("--json is only supported with --check", json_mode)
+    if not claude_keychain_free_auth_enabled():
+        return fail("Claude keychain-free auth is disabled", json_mode)
+
+    registry_path = Path(args.registry).expanduser()
+    try:
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            active_id, token = active_registry_token(registry)
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+
+    if bool(args.check):
+        payload = {"status": "ok", "active_token_id": active_id}
+        if json_mode:
+            json_dump(payload)
+        else:
+            print("ok: active Claude OAuth token available")
+        return 0
+
+    sys.stdout.write(token)
+    sys.stdout.write("\n")
+    return 0
 
 
 def cmd_sync_agent(args: argparse.Namespace) -> int:
@@ -1574,6 +1704,9 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
         "aliveness": aliveness,
         "remaining_ms": remaining_ms,
     }
+    if claude_keychain_free_auth_enabled():
+        payload["api_key_helper"] = claude_api_key_helper_path()
+        payload["api_key_helper_ttl_ms"] = claude_api_key_helper_ttl_ms()
     if json_mode:
         json_dump(payload)
     else:
@@ -1645,6 +1778,11 @@ def build_parser() -> argparse.ArgumentParser:
     auto_parser.add_argument("--threshold", type=float)
     auto_parser.add_argument("--json", action="store_true")
     auto_parser.set_defaults(handler=cmd_auto_rotate)
+
+    helper_parser = sub.add_parser("api-key-helper")
+    helper_parser.add_argument("--check", action="store_true")
+    helper_parser.add_argument("--json", action="store_true")
+    helper_parser.set_defaults(handler=cmd_api_key_helper)
 
     sync_parser = sub.add_parser("sync-agent")
     sync_parser.add_argument("--agent", required=True)
