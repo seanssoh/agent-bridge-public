@@ -30,6 +30,37 @@ bridge_tmux_send_keys_with_timeout() {
   bridge_with_timeout "$secs" "$label" tmux send-keys "$@"
 }
 
+bridge_tmux_send_submit_key() {
+  local label="$1"
+  local session="$2"
+  local engine="${3:-}"
+  local pane_target
+  local mode
+  pane_target="$(bridge_tmux_pane_target "$session")"
+
+  if [[ "$engine" == "claude" ]]; then
+    # Claude Code 2.1.158 switched Enter handling under enhanced keyboard
+    # protocols: a raw C-m can remain in edit/newline handling, while the
+    # physical Enter arrives as CSI-u (ESC [ 13 u). tmux's -H path sends the
+    # same bytes without going through key-name translation.
+    mode="${BRIDGE_TMUX_CLAUDE_SUBMIT_KEY_MODE:-csi-u}"
+    case "$mode" in
+      legacy|c-m|C-m|enter|Enter)
+        bridge_tmux_send_keys_with_timeout "$label" -t "$pane_target" C-m
+        ;;
+      csi-u|csiu|CSI-u|CSIU)
+        bridge_tmux_send_keys_with_timeout "$label" -t "$pane_target" -H 1b 5b 31 33 75
+        ;;
+      *)
+        bridge_tmux_send_keys_with_timeout "$label" -t "$pane_target" -H 1b 5b 31 33 75
+        ;;
+    esac
+    return
+  fi
+
+  bridge_tmux_send_keys_with_timeout "$label" -t "$pane_target" C-m
+}
+
 bridge_tmux_session_exists() {
   local session="$1"
   tmux has-session -t "$(bridge_tmux_session_target "$session")" 2>/dev/null
@@ -815,8 +846,7 @@ bridge_tmux_claude_advance_blocker() {
   fi
   case "$state" in
     trust|summary)
-      bridge_tmux_send_keys_with_timeout "tmux_send_advance_blocker_${state}" \
-        -t "$(bridge_tmux_pane_target "$session")" C-m
+      bridge_tmux_send_submit_key "tmux_send_advance_blocker_${state}" "$session" claude
       sleep 0.3
       return 0
       ;;
@@ -827,8 +857,7 @@ bridge_tmux_claude_advance_blocker() {
           [[ "$settle_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]] || settle_seconds="0.2"
           sleep "$settle_seconds"
         fi
-        bridge_tmux_send_keys_with_timeout tmux_send_advance_blocker_devchannels \
-          -t "$(bridge_tmux_pane_target "$session")" C-m
+        bridge_tmux_send_submit_key tmux_send_advance_blocker_devchannels "$session" claude
         sleep 0.3
         return 0
       fi
@@ -1187,13 +1216,11 @@ bridge_tmux_paste_and_submit() {
   # an empty input line and the paste stays buffered. Warm sessions land
   # instantly; the retry branch only fires under the observed race.
   sleep 0.05
-  bridge_tmux_send_keys_with_timeout tmux_send_paste_submit \
-    -t "$pane_target" C-m
+  bridge_tmux_send_submit_key tmux_send_paste_submit "$session" "$engine"
   sleep 0.1
   if bridge_tmux_session_has_pending_input "$session" "$engine"; then
     sleep 0.15
-    bridge_tmux_send_keys_with_timeout tmux_send_paste_submit_retry \
-      -t "$pane_target" C-m
+    bridge_tmux_send_submit_key tmux_send_paste_submit_retry "$session" "$engine"
   fi
 
   # Issue #331 Track B: codex post-submit state-machine verification. The
@@ -1236,6 +1263,14 @@ bridge_tmux_type_and_submit() {
   local pane_target
   pane_target="$(bridge_tmux_pane_target "$session")"
 
+  # Claude Code 2.1.158 treats Enter inside a multi-line composer as editing
+  # rather than submit. Daemon nudges are notifications, not prose drafts, so
+  # flatten them before typing to keep C-m on the single-line submit path.
+  if [[ "$engine" == "claude" ]]; then
+    text="${text//$'\r'/ }"
+    text="${text//$'\n'/ }"
+  fi
+
   # Issue #815 Wave A: $text can be a multi-line operator nudge; stage
   # through a tempfile to avoid `heredoc_write` hangs on stale runtimes.
   local _tmp
@@ -1255,27 +1290,21 @@ bridge_tmux_type_and_submit() {
     first_line=0
   done < "$_tmp"
 
-  # Issue #146: the previous implementation used a fixed 50ms grace
-  # before C-m. Under load, Claude's TUI occasionally took longer to
-  # absorb the typed keystrokes, so the submit arrived on an empty
-  # input line and the handoff was silently dropped. The input stayed
-  # populated with the typed text — operators saw "typed but never
-  # submitted." Keep the fast-path latency unchanged (one 50ms grace
-  # + one C-m) and add a verify/retry: if the input line still reports
-  # pending content after the submit, resend C-m once with a wider
-  # grace. Doing this unconditionally for every send would block the
-  # helper on slow captures; the verify step only reads the last 20
-  # lines of scrollback and the retry only fires when we actually
-  # observe the race symptom.
-  sleep 0.05
-  bridge_tmux_send_keys_with_timeout tmux_send_type_submit \
-    -t "$pane_target" C-m
-  sleep 0.1
-  if bridge_tmux_session_has_pending_input "$session" "$engine"; then
-    sleep 0.15
-    bridge_tmux_send_keys_with_timeout tmux_send_type_submit_retry \
-      -t "$pane_target" C-m
-  fi
+  # Issue #146 + Claude Code 2.1.158 regression: verify after submit and retry
+  # while the composer still holds text. For Claude, bridge_tmux_send_submit_key
+  # sends CSI-u Enter by default; raw C-m can now remain in edit/newline mode.
+  local _submit_grace="${BRIDGE_TMUX_SUBMIT_GRACE_SECONDS:-0.15}"
+  local _submit_retries="${BRIDGE_TMUX_SUBMIT_MAX_RETRIES:-5}"
+  [[ "$_submit_retries" =~ ^[0-9]+$ ]] || _submit_retries=5
+  local _submit_attempt=0
+  sleep "$_submit_grace"
+  bridge_tmux_send_submit_key tmux_send_type_submit "$session" "$engine"
+  while (( _submit_attempt < _submit_retries )); do
+    sleep "$_submit_grace"
+    bridge_tmux_session_has_pending_input "$session" "$engine" || break
+    bridge_tmux_send_submit_key tmux_send_type_submit_retry "$session" "$engine"
+    _submit_attempt=$(( _submit_attempt + 1 ))
+  done
 }
 
 bridge_tmux_send_and_submit() {
