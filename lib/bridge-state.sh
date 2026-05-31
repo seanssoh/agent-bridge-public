@@ -65,7 +65,7 @@ bridge_claude_dynamic_launch_cmd() {
     model="$(bridge_agent_model "$agent")"
     effort="$(bridge_agent_effort "$agent")"
     pm="$(bridge_agent_permission_mode "$agent")"
-    [[ -n "$model" ]] || model="claude-opus-4-7"
+    [[ -n "$model" ]] || model="claude-opus-4-8"
     [[ -n "$effort" ]] || effort="xhigh"
     [[ -n "$pm" ]] || pm="auto"
     argv+=(--model "$model" --effort "$effort" --permission-mode "$pm" --name "$agent")

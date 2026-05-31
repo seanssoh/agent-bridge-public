@@ -454,7 +454,7 @@ generated `claude` invocation:
 
 | field | default when opted in | flag |
 |---|---|---|
-| `BRIDGE_AGENT_MODEL` | `claude-opus-4-7` | `--model` |
+| `BRIDGE_AGENT_MODEL` | `claude-opus-4-8` | `--model` |
 | `BRIDGE_AGENT_EFFORT` | `xhigh` | `--effort` |
 | `BRIDGE_AGENT_PERMISSION_MODE` | `auto` | `--permission-mode` |
 
@@ -465,6 +465,57 @@ one field opts the agent into the new shape; remaining fields fall back to
 the defaults above. Set `BRIDGE_AGENT_PERMISSION_MODE["agent"]="legacy"`
 to explicitly pin the historical blanket-bypass shape (e.g. for sandboxed
 offline roles).
+
+### Seeding new agents from a reference agent (template-sync, issue #1427)
+
+On a fresh install, a newly-created non-admin agent comes up like a brand-new
+Claude Code — Sonnet, low effort, no plugins/skills — because its config tree
+is disjoint from the operator's `~/.claude` and from the admin agent. The
+`template-sync` wizard is the opt-in way to seed new (and selected existing)
+agents from a reference agent's roster fields:
+
+```bash
+agb setup template-sync [--from patch] [--exclude <csv>] [--dry-run] [--targets <csv>] [--yes]
+```
+
+(The wizard is interactive by default; the flags below are the non-interactive
+shortcuts. The exact flag set is finalized by the wizard implementation — run
+`agb setup template-sync --help` for the authoritative list on your install.)
+
+- `--from <agent>` — the reference agent to read defaults from (default: the
+  admin agent). The read is **roster-only**: model, effort, permission_mode,
+  plugins, skills, channels. No live `~/.claude`, settings, env, or MCP runtime
+  is introspected.
+- `--exclude <csv>` — dimensions to drop (`model,effort,permission_mode,plugins,skills,channels`).
+  The wizard is opt-out: it accepts every dimension by default and lets you
+  exclude per-dimension / per-item.
+- `--dry-run` — show the before/after diff (including the adjacent built-in
+  launch-default refresh `claude-opus-4-7` → `claude-opus-4-8`) and write
+  nothing.
+- `--targets <csv>` — existing agents to backfill (defaults to none — new
+  agents only). Existing agents are never touched until you name them here and
+  confirm.
+- `--yes` — skip the interactive confirm and accept the computed candidate
+  (still subject to the dimension excludes and the legacy/secret refusals).
+
+What the wizard writes is a controller-managed **defaults profile** block in
+`agent-roster.local.sh` (do not hand-edit it — re-run the wizard). `agent
+create <new>` then materializes those defaults as explicit per-agent roster
+rows on the new role. Two operator-facing caveats:
+
+- **Channels carry declarations only.** A synced channel such as
+  `plugin:teams@mkt` copies the *declaration*, never the credentials. Re-run
+  the per-channel setup wizard (`agb setup teams <agent>`, `agb setup ms365
+  <agent>`, etc.) to populate tokens for the new agent. No secrets, `.env`,
+  `access.json`, or refresh tokens are ever copied.
+- **Restart to apply.** Roster fields are read at agent startup with no live
+  reload, so launch/plugin/skill/channel changes from a backfill take effect
+  only after `agb agent restart <agent>`. The wizard reports
+  `restart_required=true` for runtime-affecting fields.
+
+`permission_mode=legacy` is never inherited (the wizard refuses/omits it and
+warns). Full design and security invariants:
+[`docs/template-sync-design.md`](./docs/template-sync-design.md).
 
 ### Admin agent CRUD policy
 

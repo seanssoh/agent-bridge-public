@@ -137,7 +137,7 @@ BRIDGE_AGENT_LAUNCH_CMD["codex-developer"]='codex --dangerously-bypass-approvals
 # <mode> --name <agent>`; any field still unset on that agent falls back to
 # the fleet defaults shown below.
 #
-# BRIDGE_AGENT_MODEL["developer"]="claude-opus-4-7"            # default: claude-opus-4-7
+# BRIDGE_AGENT_MODEL["developer"]="claude-opus-4-8"            # default: claude-opus-4-8
 # BRIDGE_AGENT_EFFORT["developer"]="xhigh"                      # default: xhigh
 # BRIDGE_AGENT_PERMISSION_MODE["developer"]="auto"              # default: auto
 #
@@ -145,6 +145,39 @@ BRIDGE_AGENT_LAUNCH_CMD["codex-developer"]='codex --dangerously-bypass-approvals
 # offline role) without removing the model/effort hints, set permission_mode
 # explicitly to "legacy":
 # BRIDGE_AGENT_PERMISSION_MODE["sandboxed"]="legacy"
+
+# Template-sync defaults profile (issue #1427, controller-managed — do NOT hand-edit).
+#
+# `agb setup template-sync [--from <ref>]` writes a delimited, controller-owned
+# block into agent-roster.local.sh that seeds NEW agents created afterward (and
+# any existing agents you explicitly backfill) from a reference agent's roster
+# fields. `agent create <new>` reads this profile and MATERIALIZES the included
+# dimensions as EXPLICIT per-agent roster rows on the new role — it is not a
+# live accessor fallback, so existing agents with unset fields keep their
+# intentional legacy-launch contract until you explicitly backfill them.
+# Precedence: explicit per-agent fields > materialized defaults > the built-in
+# inline launch defaults (claude-opus-4-8 / xhigh / auto, new-shape rows only).
+#
+# The block is managed by the wizard; this is what it looks like (do not copy a
+# real one by hand — re-run the wizard instead). It is the literal Contract-I
+# format from docs/template-sync-design.md §"Shared contracts (I)": the leading
+# meta comment carries NO secrets (source agent, timestamp, the included/excluded
+# dimension lists, and a hash of the redacted candidate summary only), and ONLY
+# the included dimensions are emitted as vars — excluded dimensions are omitted,
+# not written as empty vars. Available vars: BRIDGE_TEMPLATE_DEFAULT_{MODEL,
+# EFFORT,PERMISSION_MODE,PLUGINS,SKILLS,CHANNELS}.
+#
+# # === agb:template-defaults v1 (managed by `setup template-sync`) ===
+# # source_agent=patch updated_at=2026-05-31T12:00:00Z included=model,effort,plugins,skills excluded=channels,permission_mode hash=<sha256-of-redacted-summary>
+# BRIDGE_TEMPLATE_DEFAULT_MODEL="claude-opus-4-8"
+# BRIDGE_TEMPLATE_DEFAULT_EFFORT="xhigh"
+# BRIDGE_TEMPLATE_DEFAULT_PLUGINS="cosmax-crm,playwright"
+# BRIDGE_TEMPLATE_DEFAULT_SKILLS="agent-db"
+# # permission_mode intentionally omitted (legacy is NEVER inherited)
+# # channels intentionally omitted here; when included, channels carry the
+# # declaration only (e.g. plugin:teams@mkt) — re-run `setup teams <agent>` to
+# # populate credentials, then restart the agent to apply.
+# # === end agb:template-defaults ===
 
 # Optional: auto-stop timeout in seconds. Set this only for roles you
 # explicitly want the daemon to stop after inactivity. An explicit `0` marks a
