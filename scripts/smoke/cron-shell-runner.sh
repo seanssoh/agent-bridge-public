@@ -117,6 +117,57 @@ PY
   printf '%s/request.json' "$run_dir"
 }
 
+# Build a TEXT/claude cron request in an owner-private run dir (0700 dir /
+# 0600 request.json) — the exact artifact shape a non-iso single-user host
+# produces under `umask 077`, which `shell_artifact_route` classifies as the
+# controller-private "shell" route by permissions alone (#1421). Only the
+# 5 path keys the text path dereferences before its --dry-run early return
+# are required; no shell payload marker is set so the body is a genuine text
+# cron.
+write_text_request() {
+  local run_id="$1"
+  local job_id="$2"
+  local run_dir="$BRIDGE_CRON_STATE_DIR/runs/$run_id"
+  mkdir -p "$run_dir"
+  chmod 0700 "$run_dir"
+  # Built via `python3 -c` (argv-passed), NOT a `<<PY` heredoc-stdin: the latter
+  # would register a new unbaselined site against scripts/lint-heredoc-ban.sh
+  # (footgun #11 ratchet). Argv keeps the request-builder off that baseline.
+  python3 -c '
+import json
+import os
+import sys
+
+request_file, run_id, job_id = sys.argv[1:]
+run_dir = os.path.dirname(request_file)
+payload = {
+    "run_id": run_id,
+    "job_id": job_id,
+    "job_name": job_id,
+    "family": "smoke",
+    "source_agent": "smoke-agent",
+    "target_agent": "smoke-target",
+    "target_engine": "claude",
+    "payload_kind": "text",
+    "target_workdir": run_dir,
+    "slot": "manual",
+    "dispatch_task_id": 0,
+    "created_at": "2026-05-06T00:00:00+00:00",
+    "payload_file": os.path.join(run_dir, "payload.md"),
+    "result_file": os.path.join(run_dir, "result.json"),
+    "status_file": os.path.join(run_dir, "status.json"),
+    "stdout_log": os.path.join(run_dir, "stdout.log"),
+    "stderr_log": os.path.join(run_dir, "stderr.log"),
+    "payload": {"kind": "text", "prompt": "smoke text cron"},
+}
+with open(request_file, "w", encoding="utf-8") as fh:
+    json.dump(payload, fh, ensure_ascii=True, indent=2)
+    fh.write("\n")
+os.chmod(request_file, 0o600)
+' "$run_dir/request.json" "$run_id" "$job_id"
+  printf '%s/request.json' "$run_dir"
+}
+
 json_field() {
   local file="$1"
   local expr="$2"
@@ -574,6 +625,56 @@ PY
   smoke_assert_contains "$(json_field "$status" runner_error)" "script_validation_failed:" "T39d env terminal runner_error"
 }
 
+smoke_t40_umask077_text_route_not_tampered() {
+  # Regression guard (#1421): under `umask 077` a non-iso single-user host
+  # creates EVERY cron run dir at 0700/0600 — the group-widening that would
+  # mark non-shell runs is iso-gated — so `shell_artifact_route` classifies a
+  # text cron as the controller-private "shell" route by permissions alone.
+  # `cmd_run` must peek the body and, finding no shell marker, route to the
+  # TEXT path. Pre-fix it handed the text body straight to `cmd_run_shell`,
+  # whose flocked validation rejected it as `request_artifact_tampered`,
+  # silently failing 100% of text crons. --dry-run discriminates cleanly: the
+  # text route prints `engine: claude`; a mis-route to shell prints
+  # `engine: shell` (cmd_run_shell's dry-run early-return precedes its tamper
+  # check, so asserting "status: dry_run" alone is NOT sufficient).
+  local request out rc
+  request="$(umask 077; write_text_request t40-text-run t40-text-job)"
+  rc=0
+  out="$(python3 "$SMOKE_REPO_ROOT/bridge-cron-runner.py" run --request-file "$request" --dry-run 2>&1)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    smoke_fail "T40 text cron in owner-private (0700/0600) dir must route to text dry-run, rc=$rc: $out"
+  fi
+  case "$out" in
+    *request_artifact_tampered*)
+      smoke_fail "T40 text cron mis-routed to shell handler (request_artifact_tampered): $out" ;;
+    *"engine: shell"*)
+      smoke_fail "T40 text cron mis-routed to shell handler (engine: shell): $out" ;;
+  esac
+  case "$out" in
+    *"status: dry_run"*) : ;;
+    *) smoke_fail "T40 expected 'status: dry_run' from text route: $out" ;;
+  esac
+  case "$out" in
+    *"engine: claude"*) : ;;
+    *) smoke_fail "T40 expected 'engine: claude' (text route), got: $out" ;;
+  esac
+}
+
+smoke_t41_umask077_shell_route_preserved() {
+  # Companion to T40: the body-peek must NOT divert a genuine SHELL cron away
+  # from `cmd_run_shell`. A shell payload in the same owner-private (0700/0600)
+  # dir still routes to the shell handler and executes to success.
+  local script_path request status
+  script_path="$(make_script t41.sh '#!/usr/bin/env bash
+exit 0')"
+  request="$(umask 077; write_request t41-shell-run t41-shell-job "$script_path")"
+  if ! run_runner "$request" >/tmp/cron-shell-t41.out 2>&1; then
+    smoke_fail "T41 shell cron under umask 077 must still execute: $(cat /tmp/cron-shell-t41.out 2>/dev/null)"
+  fi
+  status="${request%/*}/status.json"
+  smoke_assert_eq "success" "$(json_field "$status" state)" "T41 shell route preserved under umask 077"
+}
+
 smoke_run "T30 schema + update preservation" smoke_t30_schema_and_update
 smoke_run "T35 argv injection rejection" smoke_t35_reject_argv_injection
 smoke_run "T31 UID-drop access contract" smoke_t31_uid_drop_access_contract
@@ -589,5 +690,7 @@ smoke_run "T39b invalid JSON tamper writes terminal status" smoke_t39b_invalid_j
 smoke_run "T39c update revalidates shell script" smoke_t39c_update_revalidates_shell_script
 smoke_run "T39d validation failure writes terminal status" smoke_t39d_validation_failure_terminal
 smoke_run "T39e corrupted controller-private JSON writes terminal status" smoke_t39e_corrupted_controller_private_json_terminal
+smoke_run "T40 umask-077 text cron routes to text path, not shell tamper (#1421)" smoke_t40_umask077_text_route_not_tampered
+smoke_run "T41 umask-077 shell cron still routes to shell handler (#1421)" smoke_t41_umask077_shell_route_preserved
 
 smoke_log "all cron shell runner checks passed"
