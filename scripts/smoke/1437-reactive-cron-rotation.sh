@@ -60,12 +60,30 @@ REDISPATCH_LOG="$SMOKE_TMP_ROOT/redispatch-invocations.log"
 #       registry read) fails, forcing old_active to be recovered from the rotate
 #       payload's old_active_token_id. Subsequent `list` calls succeed (a
 #       per-run counter file under SMOKE_TMP_ROOT tracks which call we're on).
+#   FAKE_ROTATE_AMBIGUOUS=1 — `rotate` returns status=rotated but an AMBIGUOUS
+#       payload (NO active_token_id / old_active_token_id), WITHOUT touching the
+#       real registry. Models a rotate whose advancement cannot be confirmed →
+#       the runner must fail closed (no disable, no re-dispatch, state intact).
+#   FAKE_ROTATE_NO_OLD_ID=1 — `rotate` returns status=rotated WITH a new
+#       active_token_id but NO old_active_token_id, WITHOUT touching the
+#       registry. Even when the pre-read SUCCEEDS, the runner must judge
+#       advancement from the payload alone and fail closed (a missing payload
+#       old-id is ambiguous regardless of what the pre-read saw).
 LIST_CALL_COUNTER="$SMOKE_TMP_ROOT/list-call-counter"
 ROTATE_ARGV_LOG="$SMOKE_TMP_ROOT/rotate-argv.log"
 {
   printf '#!/usr/bin/env bash\n'
   printf 'set -uo pipefail\n'
   printf 'if [[ "${1:-}" == "rotate" ]]; then printf "%%s\\n" "$*" >>%q; fi\n' "$ROTATE_ARGV_LOG"
+  # ambiguous-rotate injection: claim rotated but emit NO ids and DO NOT touch
+  # the registry, so advancement cannot be confirmed (fail-closed test).
+  printf 'if [[ "${1:-}" == "rotate" && "${FAKE_ROTATE_AMBIGUOUS:-0}" == "1" ]]; then\n'
+  printf '  printf "%%s\\n" "{\\"status\\":\\"rotated\\"}"; exit 0\n'
+  printf 'fi\n'
+  # missing-old-id injection: rotated + new id but NO old id; registry untouched.
+  printf 'if [[ "${1:-}" == "rotate" && "${FAKE_ROTATE_NO_OLD_ID:-0}" == "1" ]]; then\n'
+  printf '  printf "%%s\\n" "{\\"status\\":\\"rotated\\",\\"active_token_id\\":\\"tokB\\"}"; exit 0\n'
+  printf 'fi\n'
   # first-list failure injection: fail only the runner's pre-rotation read.
   printf 'if [[ "${1:-}" == "list" && "${FAKE_LIST_FAIL_FIRST:-0}" == "1" ]]; then\n'
   printf '  n=0; [[ -f %q ]] && n=$(cat %q); n=$((n+1)); printf "%%s" "$n" >%q\n' \
@@ -408,44 +426,133 @@ smoke_assert_eq "0" "$(redispatch_count)" "case4.redispatch.count_zero"
 smoke_log "case 4 OK"
 
 # ===========================================================================
-# Case 5 — pre-rotation registry read FAILS. `old_active` cannot be read up
-# front, but the rotate payload reports `old_active_token_id`. The runner must
-# recover the old token id from the payload, still disable it, and (since it is
-# now provably disabled) re-dispatch. Guards the fail-open hole where an empty
-# old_active would skip the disable + loop-safety guard.
+# Case 5a — pre-rotation registry read FAILS but rotate ACTUALLY advances
+# (payload reports old_active_token_id + a different active_token_id). The
+# runner recovers the old id from the rotate payload, confirms new != old, still
+# disables the old token, and (since it is provably disabled) re-dispatches.
+# Guards the fail-open hole where an empty pre-read old_active would skip the
+# disable + loop-safety guard.
 # ===========================================================================
-smoke_log "case 5: pre-rotation read fails -> recover old id from rotate payload"
+smoke_log "case 5a: pre-read fails + rotate advances -> recover old id, disable, one re-dispatch"
 
 write_registry 1
 : >"$REDISPATCH_LOG"
 : >"$ROTATE_ARGV_LOG"
 rm -f "$LIST_CALL_COUNTER"
 
-RUN_DIR_5="$BRIDGE_CRON_STATE_DIR/runs/run-c5"
-mkdir -p "$RUN_DIR_5"
-STDOUT_5="$RUN_DIR_5/stdout.log"
-STDERR_5="$RUN_DIR_5/stderr.log"
-inject_429_output "$STDOUT_5" "$STDERR_5"
+RUN_DIR_5A="$BRIDGE_CRON_STATE_DIR/runs/run-c5a"
+mkdir -p "$RUN_DIR_5A"
+STDOUT_5A="$RUN_DIR_5A/stdout.log"
+STDERR_5A="$RUN_DIR_5A/stderr.log"
+inject_429_output "$STDOUT_5A" "$STDERR_5A"
 
-SUMMARY_5="$SMOKE_TMP_ROOT/summary-c5.json"
+SUMMARY_5A="$SMOKE_TMP_ROOT/summary-c5a.json"
 FAKE_LIST_FAIL_FIRST=1 "$PY_BIN" "$HELPER" \
-  --run-dir "$RUN_DIR_5" \
-  --run-id "run-c5" \
+  --run-dir "$RUN_DIR_5A" \
+  --run-id "run-c5a" \
   --job-id "job-1437-prereadfail" \
-  --stdout-file "$STDOUT_5" \
-  --stderr-file "$STDERR_5" \
-  --returncode 1 >"$SUMMARY_5"
+  --stdout-file "$STDOUT_5A" \
+  --stderr-file "$STDERR_5A" \
+  --returncode 1 >"$SUMMARY_5A"
 
-smoke_log "case 5 summary: $(cat "$SUMMARY_5")"
+smoke_log "case 5a summary: $(cat "$SUMMARY_5A")"
 
 # Old id recovered from the rotate payload, token disabled, re-dispatch fired.
-smoke_assert_eq "tokA" "$(summary_field "$SUMMARY_5" old_active)" "case5.old_active_recovered"
-smoke_assert_eq "tokB" "$(summary_field "$SUMMARY_5" new_active)" "case5.new_active"
-smoke_assert_eq "True" "$(summary_field "$SUMMARY_5" rotated)" "case5.rotated"
-smoke_assert_eq "False" "$(token_attr tokA enabled)" "case5.tokA.disabled"
-smoke_assert_eq "True" "$(summary_field "$SUMMARY_5" old_disabled)" "case5.old_disabled"
-smoke_assert_eq "1" "$(redispatch_count)" "case5.redispatch.count"
+smoke_assert_eq "tokA" "$(summary_field "$SUMMARY_5A" old_active)" "case5a.old_active_recovered"
+smoke_assert_eq "tokB" "$(summary_field "$SUMMARY_5A" new_active)" "case5a.new_active"
+smoke_assert_eq "True" "$(summary_field "$SUMMARY_5A" rotated)" "case5a.rotated"
+smoke_assert_eq "False" "$(token_attr tokA enabled)" "case5a.tokA.disabled"
+smoke_assert_eq "True" "$(summary_field "$SUMMARY_5A" old_disabled)" "case5a.old_disabled"
+smoke_assert_eq "1" "$(redispatch_count)" "case5a.redispatch.count"
 
-smoke_log "case 5 OK"
+smoke_log "case 5a OK"
+
+# ===========================================================================
+# Case 5b — pre-rotation read FAILS and rotate is AMBIGUOUS (status=rotated but
+# no ids in the payload, registry untouched). Advancement cannot be confirmed
+# (new != old unprovable), so the runner must FAIL CLOSED: NO disable, NO
+# re-dispatch, token state left exactly as it was (tokA still active + enabled).
+# ===========================================================================
+smoke_log "case 5b: pre-read fails + rotate ambiguous -> NO disable, NO re-dispatch (fail closed)"
+
+write_registry 1
+: >"$REDISPATCH_LOG"
+: >"$ROTATE_ARGV_LOG"
+rm -f "$LIST_CALL_COUNTER"
+ROTATION_AUDIT_BEFORE_5B="$(audit_count claude_token_rotation)"
+
+RUN_DIR_5B="$BRIDGE_CRON_STATE_DIR/runs/run-c5b"
+mkdir -p "$RUN_DIR_5B"
+STDOUT_5B="$RUN_DIR_5B/stdout.log"
+STDERR_5B="$RUN_DIR_5B/stderr.log"
+inject_429_output "$STDOUT_5B" "$STDERR_5B"
+
+SUMMARY_5B="$SMOKE_TMP_ROOT/summary-c5b.json"
+FAKE_LIST_FAIL_FIRST=1 FAKE_ROTATE_AMBIGUOUS=1 "$PY_BIN" "$HELPER" \
+  --run-dir "$RUN_DIR_5B" \
+  --run-id "run-c5b" \
+  --job-id "job-1437-ambiguous" \
+  --stdout-file "$STDOUT_5B" \
+  --stderr-file "$STDERR_5B" \
+  --returncode 1 >"$SUMMARY_5B"
+
+smoke_log "case 5b summary: $(cat "$SUMMARY_5B")"
+
+# Fail closed: never marked rotated, never disabled, registry untouched.
+smoke_assert_eq "False" "$(summary_field "$SUMMARY_5B" rotated)" "case5b.not_rotated"
+smoke_assert_eq "rotate_advance_unconfirmed" "$(summary_field "$SUMMARY_5B" rotate_error)" "case5b.rotate_error"
+smoke_assert_eq "tokA" "$(registry_active)" "case5b.registry.active_unchanged"
+smoke_assert_eq "True" "$(token_attr tokA enabled)" "case5b.tokA.still_enabled"
+smoke_assert_eq "True" "$(token_attr tokB enabled)" "case5b.tokB.still_enabled"
+# ZERO re-dispatch and no new rotation audit row.
+smoke_assert_eq "0" "$(redispatch_count)" "case5b.redispatch.count_zero"
+smoke_assert_eq "$ROTATION_AUDIT_BEFORE_5B" "$(audit_count claude_token_rotation)" "case5b.audit.no_new_rotation"
+
+smoke_log "case 5b OK"
+
+# ===========================================================================
+# Case 5c — pre-rotation read SUCCEEDS (old_active known) but the rotate payload
+# is missing `old_active_token_id` (it only reports a new active_token_id).
+# Advancement must be judged from the PAYLOAD alone: a missing payload old-id is
+# ambiguous regardless of what the pre-read saw, so the runner must fail closed
+# (no disable, no re-dispatch, registry untouched). Guards the exact gap where
+# pre-read old + payload new were wrongly treated as confirmed advancement.
+# ===========================================================================
+smoke_log "case 5c: pre-read OK but payload missing old id -> fail closed"
+
+write_registry 1
+: >"$REDISPATCH_LOG"
+: >"$ROTATE_ARGV_LOG"
+rm -f "$LIST_CALL_COUNTER"
+ROTATION_AUDIT_BEFORE_5C="$(audit_count claude_token_rotation)"
+
+RUN_DIR_5C="$BRIDGE_CRON_STATE_DIR/runs/run-c5c"
+mkdir -p "$RUN_DIR_5C"
+STDOUT_5C="$RUN_DIR_5C/stdout.log"
+STDERR_5C="$RUN_DIR_5C/stderr.log"
+inject_429_output "$STDOUT_5C" "$STDERR_5C"
+
+SUMMARY_5C="$SMOKE_TMP_ROOT/summary-c5c.json"
+FAKE_ROTATE_NO_OLD_ID=1 "$PY_BIN" "$HELPER" \
+  --run-dir "$RUN_DIR_5C" \
+  --run-id "run-c5c" \
+  --job-id "job-1437-noOldId" \
+  --stdout-file "$STDOUT_5C" \
+  --stderr-file "$STDERR_5C" \
+  --returncode 1 >"$SUMMARY_5C"
+
+smoke_log "case 5c summary: $(cat "$SUMMARY_5C")"
+
+# Fail closed even though the pre-read knew old_active=tokA: the payload itself
+# did not confirm what it rotated away from.
+smoke_assert_eq "False" "$(summary_field "$SUMMARY_5C" rotated)" "case5c.not_rotated"
+smoke_assert_eq "rotate_advance_unconfirmed" "$(summary_field "$SUMMARY_5C" rotate_error)" "case5c.rotate_error"
+smoke_assert_eq "tokA" "$(registry_active)" "case5c.registry.active_unchanged"
+smoke_assert_eq "True" "$(token_attr tokA enabled)" "case5c.tokA.still_enabled"
+smoke_assert_eq "True" "$(token_attr tokB enabled)" "case5c.tokB.still_enabled"
+smoke_assert_eq "0" "$(redispatch_count)" "case5c.redispatch.count_zero"
+smoke_assert_eq "$ROTATION_AUDIT_BEFORE_5C" "$(audit_count claude_token_rotation)" "case5c.audit.no_new_rotation"
+
+smoke_log "case 5c OK"
 
 smoke_log "PASS"

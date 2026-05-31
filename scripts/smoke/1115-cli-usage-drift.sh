@@ -98,7 +98,13 @@ INTERNAL_AGENT_SUBCOMMANDS=()
 #   dispatched cron run record (see bridge-daemon.sh:5459). Operators never
 #   invoke it directly — keep it dispatchable but hide from the
 #   typo-suggestion candidate list so operators don't reverse-engineer it.
-INTERNAL_CRON_SUBCOMMANDS=("finalize-run")
+# `reactive-redispatch`: #1437 runtime callback invoked by the reactive
+#   Claude-OAT-rotation path in bridge-cron-runner.py (maybe_reactive_rotate)
+#   after a successful rotation, to re-enqueue the quota-failed cron job once.
+#   Operators never invoke it directly — same internal contract as
+#   finalize-run: dispatchable + honors `--help` (1117) but hidden from the
+#   usage template and the typo-suggestion candidate list.
+INTERNAL_CRON_SUBCOMMANDS=("finalize-run" "reactive-redispatch")
 
 # ---------------------------------------------------------------------------
 # Parsers.

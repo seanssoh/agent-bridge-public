@@ -1437,7 +1437,14 @@ def maybe_reactive_rotate(
         return summary
     rotate_payload = _parse_json_stdout(rotate_completed.stdout)
     rotate_status = str(rotate_payload.get("status") or "")
-    new_active = str(rotate_payload.get("active_token_id") or "")
+    # Advancement is judged SOLELY from the rotate payload's own ids — the
+    # payload is the authoritative record of what the registry actually did.
+    # The pre-rotation read is only a hint and must NOT be substituted in for a
+    # missing payload id (an ambiguous payload must fail closed regardless of
+    # what the pre-read saw).
+    payload_old = str(rotate_payload.get("old_active_token_id") or "")
+    payload_new = str(rotate_payload.get("active_token_id") or "")
+    new_active = payload_new
     summary["rotate_status"] = rotate_status
     summary["new_active"] = new_active
 
@@ -1446,20 +1453,25 @@ def maybe_reactive_rotate(
         summary["rotate_skip_reason"] = str(rotate_payload.get("reason") or rotate_status or "skipped")
         return summary
 
-    # If the PRE-rotation registry read failed (token_registry_state returned
-    # {}), `old_active` is empty — but the rotate payload authoritatively
-    # reports the id it rotated away from. Recover from it so we can still
-    # identify and retire the quota-hit token (fail-closed: if we still cannot
-    # identify the old token below, we refuse to re-dispatch).
-    if not old_active:
-        old_active = str(rotate_payload.get("old_active_token_id") or "")
-        summary["old_active"] = old_active
-
-    if old_active and new_active and new_active == old_active:
-        # Defensive: rotate reported success but did not advance. Do not
-        # disable a still-active token; bail without re-dispatch.
-        summary["rotate_error"] = "rotate_did_not_advance"
+    # FAIL CLOSED on truly-uncertain state. We only disable the old token and
+    # re-dispatch when rotate ACTUALLY advanced — i.e. the rotate payload itself
+    # carries BOTH the old and new active id AND they differ. If EITHER payload
+    # id is missing (ambiguous payload) or they are equal, we cannot prove the
+    # active token moved off the quota-hit one, so we leave token state untouched
+    # and do NOT re-dispatch (fail the run normally) — even if the pre-rotation
+    # read happened to give us an old id.
+    rotate_advanced = bool(payload_old) and bool(payload_new) and payload_new != payload_old
+    if not rotate_advanced:
+        summary["rotate_error"] = "rotate_advance_unconfirmed"
         return summary
+
+    # Advancement confirmed from the payload. The authoritative id to retire is
+    # the one the payload says we rotated away from. Cross-check the pre-read for
+    # an audit-visible signal but trust the payload.
+    if old_active and old_active != payload_old:
+        summary["old_active_preread_mismatch"] = old_active
+    old_active = payload_old
+    summary["old_active"] = old_active
 
     summary["rotated"] = True
 
@@ -1476,29 +1488,29 @@ def maybe_reactive_rotate(
     if not sync_ok:
         summary["sync_rc"] = rotate_completed.returncode
 
-    # THEN deterministically retire the vacated quota-hit token. We do NOT rely
-    # on `check --disable-on-quota` (a network re-probe that can be
-    # inconclusive and leave the token enabled → next rotation picks it back).
-    # `mark-quota` disables it with no probe; `recover-due` re-enables it once
-    # the limit resets. HARD REQUIREMENT: after a successful rotate the old
-    # quota-hit token must NEVER remain enabled. So we check mark-quota's exit
-    # code AND verify the registry actually shows it disabled; if it is still
-    # enabled we do NOT re-dispatch (re-running with the quota token still in the
-    # enabled pool risks the next rotation picking it straight back).
-    summary["old_disabled"] = False
-    if old_active:
-        mark_args = ["mark-quota", old_active, "--json"]
-        if summary["reset_at"]:
-            mark_args += ["--reset-at", summary["reset_at"]]
-        try:
-            mark_completed = _run_token_cli(mark_args, timeout=30)
-            if mark_completed.returncode != 0:
-                summary["mark_quota_rc"] = mark_completed.returncode
-        except (OSError, subprocess.SubprocessError) as exc:
-            summary["mark_quota_error"] = f"{exc!r}"
-        # Authoritatively confirm the old token is no longer enabled, regardless
-        # of how mark-quota exited.
-        summary["old_disabled"] = not token_is_enabled(old_active)
+    # THEN deterministically retire the vacated quota-hit token (we proved
+    # advancement above, so `old_active` is non-empty and is no longer the
+    # active token). We do NOT rely on `check --disable-on-quota` (a network
+    # re-probe that can be inconclusive and leave the token enabled → next
+    # rotation picks it back). `mark-quota` disables it with no probe;
+    # `recover-due` re-enables it once the limit resets. HARD REQUIREMENT: after
+    # a successful rotate the old quota-hit token must NEVER remain enabled. So
+    # we check mark-quota's exit code AND verify the registry actually shows it
+    # disabled; if it is still enabled we do NOT re-dispatch (re-running with the
+    # quota token still in the enabled pool risks the next rotation picking it
+    # straight back).
+    mark_args = ["mark-quota", old_active, "--json"]
+    if summary["reset_at"]:
+        mark_args += ["--reset-at", summary["reset_at"]]
+    try:
+        mark_completed = _run_token_cli(mark_args, timeout=30)
+        if mark_completed.returncode != 0:
+            summary["mark_quota_rc"] = mark_completed.returncode
+    except (OSError, subprocess.SubprocessError) as exc:
+        summary["mark_quota_error"] = f"{exc!r}"
+    # Authoritatively confirm the old token is no longer enabled, regardless of
+    # how mark-quota exited.
+    summary["old_disabled"] = not token_is_enabled(old_active)
 
     emit_audit_row(
         action="claude_token_rotation",
@@ -1516,15 +1528,11 @@ def maybe_reactive_rotate(
         },
     )
 
-    # Loop-safety guard (FAIL CLOSED): only re-dispatch when we positively
-    # identified the old quota-hit token AND proved it is now disabled. If we
-    # could not even identify it (both the pre-rotation read AND the rotate
-    # payload's old_active_token_id were empty) we must NOT re-dispatch — a
-    # re-run with an unidentified/undisabled quota token still in the enabled
-    # pool risks the next rotation cycling straight back into it.
-    if not old_active:
-        summary["redispatch_decision"] = "old_token_unidentified"
-        return summary
+    # Loop-safety guard (FAIL CLOSED): only re-dispatch when the old quota-hit
+    # token is PROVEN disabled. `token_is_enabled` fails closed (reports still
+    # enabled on any read error), so a flaky registry read here suppresses the
+    # re-dispatch rather than re-running with a possibly-still-enabled quota
+    # token (which the next rotation could cycle straight back into).
     if not summary["old_disabled"]:
         summary["redispatch_decision"] = "old_token_still_enabled"
         return summary

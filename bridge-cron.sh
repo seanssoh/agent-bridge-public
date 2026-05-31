@@ -1327,6 +1327,16 @@ run_subagent() {
 # re-enqueues. Reuses `run_enqueue` so the full dispatch plumbing (request
 # artifact, queue task, isolation grants) is shared, not reimplemented.
 run_reactive_redispatch() {
+  # Universal --help contract (#1117 T2): honor -h/--help BEFORE treating the
+  # first arg as a run id, so `reactive-redispatch --help` exits 0 with help
+  # text rather than failing on a "--help" run-id lookup.
+  case "${1:-}" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+  esac
+
   local run_id="${1:-}"
   shift || true
   [[ -n "$run_id" ]] || bridge_die "Usage: $(basename "$0") reactive-redispatch <run-id>"
