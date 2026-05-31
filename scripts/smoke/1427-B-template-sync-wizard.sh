@@ -236,7 +236,7 @@ VALIDATE_DRIVER="$SMOKE_TMP_ROOT/validate-driver.sh"
   printf 'source %q\n' "$WIZARD_LIB"
   printf 'bridge_setup_wizard_validate_auto template-sync template-sync --roster-file /tmp/x --yes\n'
 } >"$VALIDATE_DRIVER"
-val_out="$(/opt/homebrew/bin/bash "$VALIDATE_DRIVER" 2>&1)"
+val_out="$("$BASH" "$VALIDATE_DRIVER" 2>&1)"
 val_rc=$?
 smoke_assert_eq "$val_rc" "3" "T4: validate_auto dies (rc=3) when --from missing"
 smoke_assert_contains "$val_out" "--from" "T4: structured die names the missing --from flag"
@@ -253,7 +253,7 @@ VALIDATE_OK="$SMOKE_TMP_ROOT/validate-ok.sh"
   printf 'bridge_setup_wizard_validate_auto template-sync template-sync --from patch --roster-file /tmp/x --yes\n'
   printf 'echo VALIDATE_OK\n'
 } >"$VALIDATE_OK"
-val_ok_out="$(/opt/homebrew/bin/bash "$VALIDATE_OK" 2>&1)"
+val_ok_out="$("$BASH" "$VALIDATE_OK" 2>&1)"
 smoke_assert_contains "$val_ok_out" "VALIDATE_OK" "T4: validate_auto passes when --from present"
 
 # ---------------------------------------------------------------------------
@@ -303,7 +303,7 @@ SOURCE_PROBE="$SMOKE_TMP_ROOT/source-probe.sh"
   printf 'source %q\n' "$ROSTER_T6"
   printf 'printf "%%s|%%s|%%s\\n" "${BRIDGE_TEMPLATE_DEFAULT_MODEL:-}" "${BRIDGE_TEMPLATE_DEFAULT_PLUGINS:-}" "${BRIDGE_TEMPLATE_DEFAULT_PERMISSION_MODE:-NONE}"\n'
 } >"$SOURCE_PROBE"
-probe_out="$(/opt/homebrew/bin/bash "$SOURCE_PROBE" 2>&1)"
+probe_out="$("$BASH" "$SOURCE_PROBE" 2>&1)"
 smoke_assert_eq "$probe_out" "claude-opus-4-8|cosmax-crm@cosmax|NONE" \
   "T6: profile sources to the expected values (no permission_mode var)"
 
