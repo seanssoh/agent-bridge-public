@@ -110,16 +110,16 @@ def runtime_config_path() -> Path | None:
 
     canonical = root / "bridge-config.json"
     legacy = root / "openclaw.json"
-    if canonical.is_file():
+    if canonical.is_file():  # noqa: raw-pathlib-controller-only - controller runtime config probe
         return canonical
-    if legacy.is_file():
+    if legacy.is_file():  # noqa: raw-pathlib-controller-only - controller runtime config probe
         return legacy
     return canonical
 
 
 def load_runtime_config() -> dict[str, Any]:
     path = runtime_config_path()
-    if path is None or not path.is_file():
+    if path is None or not path.is_file():  # noqa: raw-pathlib-controller-only - controller runtime config read
         return {}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
