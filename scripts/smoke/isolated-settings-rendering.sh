@@ -12,7 +12,7 @@
 # 2. `<isolated-home>/.claude/settings.json` is a symlink pointing at
 #    the relative path `settings.effective.json`.
 # 3. Pre-existing user keys (`enabledPlugins`, `extraKnownMarketplaces`,
-#    `skipDangerousModePermissionPrompt`) from the prior regular
+#    `apiKeyHelper`, `skipDangerousModePermissionPrompt`) from the prior regular
 #    `settings.json` are preserved into the rendered effective file.
 # 4. Re-running the renderer is idempotent — same SHA256 on the
 #    effective file across two consecutive invocations with no changes.
@@ -70,13 +70,14 @@ build_fixture() {
   # `{}` for empty content too.
   : >"$FIXTURE_BRIDGE_HOME/agents/.claude/settings.local.json"
 
-  # Pre-existing isolated UID settings.json with the three preserved
+  # Pre-existing isolated UID settings.json with preserved
   # user keys, plus an extraneous key (`unrelatedSetting`) the renderer
   # MUST drop — only the documented allowlist is propagated.
   cat >"$FIXTURE_ISOLATED_HOME/.claude/settings.json" <<'EOF'
 {
   "enabledPlugins": ["foo", "bar"],
   "extraKnownMarketplaces": {"acme": {"source": "github:acme/marketplace"}},
+  "apiKeyHelper": "/tmp/agent-bridge/claude-oat-api-key-helper.sh",
   "skipDangerousModePermissionPrompt": true,
   "unrelatedSetting": "should-not-leak-into-effective"
 }
@@ -165,6 +166,8 @@ assert_user_keys_preserved() {
     "enabledPlugins preserved into effective"
   smoke_assert_contains "$content" '"extraKnownMarketplaces"' \
     "extraKnownMarketplaces preserved into effective"
+  smoke_assert_contains "$content" '"apiKeyHelper"' \
+    "apiKeyHelper preserved into effective"
   smoke_assert_contains "$content" '"skipDangerousModePermissionPrompt"' \
     "skipDangerousModePermissionPrompt preserved into effective"
   smoke_assert_contains "$content" '"foo"' \
@@ -201,6 +204,7 @@ assert_user_key_update_propagates() {
 {
   "enabledPlugins": ["foo", "bar", "baz-new"],
   "extraKnownMarketplaces": {"acme": {"source": "github:acme/marketplace-v2"}},
+  "apiKeyHelper": "/tmp/agent-bridge/claude-oat-api-key-helper-v2.sh",
   "skipDangerousModePermissionPrompt": false
 }
 EOF
@@ -216,6 +220,8 @@ EOF
     "updated enabledPlugins entry propagates on re-render"
   smoke_assert_contains "$content" 'marketplace-v2' \
     "updated extraKnownMarketplaces value propagates"
+  smoke_assert_contains "$content" 'claude-oat-api-key-helper-v2.sh' \
+    "updated apiKeyHelper value propagates"
   # The boolean flip must take effect — JSON serializer writes lowercase.
   smoke_assert_contains "$content" '"skipDangerousModePermissionPrompt": false' \
     "boolean flip on skipDangerousModePermissionPrompt propagates"
@@ -243,6 +249,7 @@ assert_symlink_aware_preservation() {
   "autoDreamEnabled": true,
   "enabledPlugins": ["plugin-from-prior-render"],
   "extraKnownMarketplaces": {"prior": {"source": "github:prior/marketplace"}},
+  "apiKeyHelper": "/tmp/agent-bridge/prior-helper.sh",
   "skipDangerousModePermissionPrompt": true,
   "hooks": {}
 }
@@ -265,6 +272,8 @@ EOF
     "enabledPlugins survives second render through symlink dereference"
   smoke_assert_contains "$content" 'github:prior/marketplace' \
     "extraKnownMarketplaces survives second render through symlink dereference"
+  smoke_assert_contains "$content" 'prior-helper.sh' \
+    "apiKeyHelper survives second render through symlink dereference"
   smoke_assert_contains "$content" '"skipDangerousModePermissionPrompt": true' \
     "skipDangerousModePermissionPrompt survives second render through symlink dereference"
 }

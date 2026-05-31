@@ -7,6 +7,7 @@ import argparse
 import fcntl
 import json
 import os
+import platform
 import pwd
 import shlex
 import shutil
@@ -19,6 +20,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+KEYCHAIN_FREE_CONFIG_KEY = "claude_keychain_free_auth"
+API_KEY_HELPER_CONFIG_KEY = "claude_api_key_helper"
+API_KEY_HELPER_TTL_CONFIG_KEY = "claude_api_key_helper_ttl_ms"
+DEFAULT_API_KEY_HELPER_TTL_MS = 60000
+TRUE_STRINGS = {"1", "true", "yes", "on"}
 
 
 # PR1 (cron inbox-only reporting) — RESULT_SCHEMA carries the structured
@@ -184,6 +193,176 @@ def bridge_home() -> Path | None:
     if not value:
         return None
     return Path(value).expanduser().resolve()
+
+
+def host_platform() -> str:
+    override = os.environ.get("BRIDGE_HOST_PLATFORM_OVERRIDE", "").strip()  # noqa: iso-helper-boundary - controller host-platform override
+    if override:
+        return override
+    return platform.system()
+
+
+def env_truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in TRUE_STRINGS
+
+
+def runtime_config_path() -> Path | None:
+    explicit = os.environ.get("BRIDGE_RUNTIME_CONFIG_FILE", "").strip()  # noqa: iso-helper-boundary - controller runtime config path
+    if explicit:
+        return Path(explicit).expanduser()
+
+    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()  # noqa: iso-helper-boundary - controller runtime root
+    if runtime_root:
+        root = Path(runtime_root).expanduser()
+    else:
+        home = bridge_home()
+        if home is None:
+            return None
+        root = home / "runtime"
+
+    canonical = root / "bridge-config.json"
+    legacy = root / "openclaw.json"
+    if canonical.is_file():  # noqa: raw-pathlib-controller-only - controller runtime config probe
+        return canonical
+    if legacy.is_file():  # noqa: raw-pathlib-controller-only - controller runtime config probe
+        return legacy
+    return canonical
+
+
+def load_runtime_config() -> dict[str, Any]:
+    path = runtime_config_path()
+    if path is None or not path.is_file():  # noqa: raw-pathlib-controller-only - controller runtime config read
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def runtime_config_value(key: str) -> Any:
+    return load_runtime_config().get(key)
+
+
+def runtime_config_truthy(key: str) -> bool:
+    value = runtime_config_value(key)
+    if isinstance(value, bool):
+        return value
+    return env_truthy(str(value) if value is not None else "")
+
+
+def claude_keychain_free_auth_enabled() -> bool:
+    override = os.environ.get("BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH")  # noqa: iso-helper-boundary - controller feature gate
+    if override is not None and override.strip():
+        return env_truthy(override)
+    return runtime_config_truthy(KEYCHAIN_FREE_CONFIG_KEY)
+
+
+def _absolute_repo_path(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    return path.resolve(strict=False)
+
+
+def claude_api_key_helper_path() -> Path:
+    raw = (
+        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER", "").strip()  # noqa: iso-helper-boundary - controller helper override
+        or str(runtime_config_value(API_KEY_HELPER_CONFIG_KEY) or "").strip()
+        or str(ROOT / "scripts" / "claude-oat-api-key-helper.sh")
+    )
+    return _absolute_repo_path(raw)
+
+
+def claude_api_key_helper_ttl_ms() -> str:
+    raw = (
+        os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER_TTL_MS", "").strip()  # noqa: iso-helper-boundary - controller helper TTL
+        or str(runtime_config_value(API_KEY_HELPER_TTL_CONFIG_KEY) or "").strip()
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return str(DEFAULT_API_KEY_HELPER_TTL_MS)
+    return str(value if value > 0 else DEFAULT_API_KEY_HELPER_TTL_MS)
+
+
+def claude_token_registry_path() -> Path:
+    explicit = os.environ.get("BRIDGE_CLAUDE_TOKEN_REGISTRY", "").strip()  # noqa: iso-helper-boundary - controller token registry path
+    if explicit:
+        return Path(explicit).expanduser()
+    secrets_dir = os.environ.get("BRIDGE_RUNTIME_SECRETS_DIR", "").strip()  # noqa: iso-helper-boundary - controller secrets root
+    if secrets_dir:
+        return Path(secrets_dir).expanduser() / "claude-oauth-tokens.json"
+    runtime_root = os.environ.get("BRIDGE_RUNTIME_ROOT", "").strip()  # noqa: iso-helper-boundary - controller runtime root
+    if runtime_root:
+        return Path(runtime_root).expanduser() / "secrets" / "claude-oauth-tokens.json"
+    home = bridge_home()
+    if home is not None:
+        return home / "runtime" / "secrets" / "claude-oauth-tokens.json"
+    return Path("claude-oauth-tokens.json")
+
+
+def validate_claude_keychain_free_auth(config_dir: Path) -> None:
+    if host_platform() != "Darwin" or not claude_keychain_free_auth_enabled():
+        return
+
+    helper_path = claude_api_key_helper_path()
+    if not helper_path.is_file() or not os.access(helper_path, os.X_OK):  # noqa: raw-pathlib-controller-only - controller helper preflight
+        raise RuntimeError(
+            f"Claude keychain-free auth is enabled but apiKeyHelper is not executable: {helper_path}"
+        )
+
+    settings_file = config_dir / "settings.json"
+    if not settings_file.is_file():  # noqa: raw-pathlib-controller-only - controller settings preflight
+        raise RuntimeError(
+            f"Claude keychain-free auth is enabled but settings.json is missing: {settings_file}"
+        )
+    try:
+        settings = json.loads(settings_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Claude keychain-free auth settings are not valid JSON: {settings_file}"
+        ) from exc
+    if not isinstance(settings, dict):
+        raise RuntimeError(
+            f"Claude keychain-free auth settings must contain a JSON object: {settings_file}"
+        )
+    actual_raw = settings.get("apiKeyHelper")
+    if not isinstance(actual_raw, str) or not actual_raw:
+        raise RuntimeError(
+            f"Claude keychain-free auth is enabled but settings.json lacks apiKeyHelper: {settings_file}"
+        )
+    actual = Path(actual_raw).expanduser()
+    if not actual.is_absolute() or actual.resolve(strict=False) != helper_path:
+        raise RuntimeError(
+            f"Claude keychain-free auth settings point at an unexpected apiKeyHelper: {settings_file}"
+        )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "bridge-auth.py"),
+            "--registry",
+            str(claude_token_registry_path()),
+            "api-key-helper",
+            "--check",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Claude keychain-free auth is enabled but no active registry OAT is available"
+        )
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Claude keychain-free auth preflight returned invalid JSON") from exc
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        raise RuntimeError("Claude keychain-free auth preflight did not confirm an active OAT")
 
 
 def rel_for_output(path_value: str) -> str:
@@ -1790,6 +1969,9 @@ def apply_claude_agent_env(env: dict[str, str], request: dict[str, Any], request
         env["BRIDGE_AGENT_ENV_FILE"] = str(agent_env_file)
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
     env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    validate_claude_keychain_free_auth(config_dir)
+    if claude_keychain_free_auth_enabled():
+        env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"] = claude_api_key_helper_ttl_ms()
     if request_file is not None:
         env["CRON_REQUEST_DIR"] = str(request_file.parent)
 
@@ -1818,6 +2000,7 @@ def command_for_run_as_user(command: list[str], sudo_user: str | None, env: dict
     explicit_keys = (
         "PATH",
         "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
         "CRON_REQUEST_DIR",
         "BRIDGE_HOME",
         "BRIDGE_AGENT_ID",

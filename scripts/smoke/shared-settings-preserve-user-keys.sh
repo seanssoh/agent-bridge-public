@@ -8,7 +8,8 @@
 # Background (issue #613): the shared renderer used to overwrite the
 # effective file from `managed defaults < base < overlay` on every call
 # and silently dropped per-agent edits to `enabledPlugins`,
-# `extraKnownMarketplaces`, `skipDangerousModePermissionPrompt`. Operators
+# `extraKnownMarketplaces`, `apiKeyHelper`,
+# `skipDangerousModePermissionPrompt`. Operators
 # who disabled heavy plugins per-agent saw their edits reverted on the
 # next `agent restart`, `agent rerender-settings --apply`, `bridge-init.sh`
 # run, or `agb upgrade propagate`. The fix extracted a shared
@@ -18,7 +19,7 @@
 # Sub-tests:
 #   1. Fresh render produces an effective file with no user keys
 #      (preservation is a no-op when there's nothing to preserve).
-#   2. After an operator edits the effective file with the three preserved
+#   2. After an operator edits the effective file with the preserved
 #      keys, the next render keeps them verbatim.
 #   3. Rerender is idempotent — same SHA256 across two consecutive runs.
 #   4. Non-allowlisted operator keys do NOT round-trip — only the
@@ -85,6 +86,8 @@ assert_fresh_render_has_no_user_keys() {
     "fresh render: no enabledPlugins preserved (nothing to preserve yet)"
   smoke_assert_not_contains "$content" '"extraKnownMarketplaces"' \
     "fresh render: no extraKnownMarketplaces preserved"
+  smoke_assert_not_contains "$content" '"apiKeyHelper"' \
+    "fresh render: no apiKeyHelper preserved"
   smoke_assert_not_contains "$content" '"skipDangerousModePermissionPrompt"' \
     "fresh render: no skipDangerousModePermissionPrompt preserved"
 }
@@ -103,6 +106,7 @@ payload["enabledPlugins"] = {"context7@claude-plugins-official": False}
 payload["extraKnownMarketplaces"] = {
     "acme": {"source": {"type": "github", "repo": "acme/marketplace"}}
 }
+payload["apiKeyHelper"] = "/tmp/agent-bridge/claude-oat-api-key-helper.sh"
 payload["skipDangerousModePermissionPrompt"] = True
 payload["unrelatedSetting"] = "should-not-leak-into-effective"
 path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -116,6 +120,8 @@ PY
     "enabledPlugins preserved with operator-disabled value"
   smoke_assert_contains "$content" '"acme"' \
     "extraKnownMarketplaces preserved with operator value"
+  smoke_assert_contains "$content" '"apiKeyHelper": "/tmp/agent-bridge/claude-oat-api-key-helper.sh"' \
+    "apiKeyHelper preserved with operator value"
   smoke_assert_contains "$content" '"skipDangerousModePermissionPrompt": true' \
     "skipDangerousModePermissionPrompt preserved"
   smoke_assert_not_contains "$content" "unrelatedSetting" \

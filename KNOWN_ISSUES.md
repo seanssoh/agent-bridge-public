@@ -656,11 +656,14 @@ file-based design contains the leak surface to deliberate
 `Path.home()`-relative reads, which is hook-deny-able in the literal
 case and rotation-recoverable in the deliberate case.
 
-Planned future enhancement: tracked in issue #810 — a credential-helper
-pattern (setuid/setgid helper, separate launcher identity, or per-launch
-ephemeral delivery). The design discussion is open in the issue body;
-no implementation PR is queued. This would close the same-UID
-readability gap without re-introducing env injection.
+Optional mitigation: `claude_keychain_free_auth` renders a Claude Code
+`apiKeyHelper` that reads the locked OAT registry instead of relying on
+Claude Code's macOS login-Keychain fallback. This avoids token env injection
+and keeps normal launch-secret files token-free, but it is still a same-UID
+oracle: any process running as the agent UID can execute the helper. A
+setuid/setgid helper, separate launcher identity, or per-launch ephemeral
+delivery would be needed to fully close the same-UID readability gap without
+re-introducing env injection.
 
 Operator guidance: this is a defense-in-depth limit, not a fundamental
 break. For high-trust deployments where the same-UID readability is
