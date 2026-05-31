@@ -60,9 +60,28 @@ fi
 
 # --- harness helpers ---------------------------------------------------------
 
-# uname + sudo shim. uname reports the requested kernel so the macOS skip
-# branch can be exercised on any runner; sudo records calls and exits
-# non-zero so an accidental escalation turns into a loud failure.
+# sudo recorder shim — logs each call and exits non-zero so any accidental
+# escalation in the skip / backfill path turns into a loud test failure.
+build_sudo_shim() {
+  local shim_dir="$1" sudo_log="$2"
+  mkdir -p "$shim_dir"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf 'LOG=%q\n' "$sudo_log"
+    printf '%s\n' 'printf "[sudo-shim] %s\n" "$*" >>"$LOG"'
+    printf '%s\n' 'exit 99'
+  } >"$shim_dir/sudo"
+  chmod +x "$shim_dir/sudo"
+}
+
+# Fake-platform uname shim + sudo recorder. The uname shim reports the
+# requested kernel so the macOS-only skip branch (uname != Linux) can be
+# exercised on any runner. Use this ONLY for cases that genuinely need a
+# fake platform (macos-shared-agent skip); platform-agnostic cases
+# (marker-only) must use the REAL host uname so platform-gated helpers run
+# consistently with the host kernel (a fake Darwin uname on a Linux runner
+# leaves the marker-only branch's host-dependent steps in an inconsistent
+# state — see T3).
 build_platform_shim() {
   local shim_dir="$1" fake_uname="$2" sudo_log="$3"
   mkdir -p "$shim_dir"
@@ -82,22 +101,18 @@ build_platform_shim() {
     printf '%s\n' 'done'
   } >"$shim_dir/uname"
   chmod +x "$shim_dir/uname"
-  {
-    printf '%s\n' '#!/usr/bin/env bash'
-    printf 'LOG=%q\n' "$sudo_log"
-    printf '%s\n' 'printf "[sudo-shim] %s\n" "$*" >>"$LOG"'
-    printf '%s\n' 'exit 99'
-  } >"$shim_dir/sudo"
-  chmod +x "$shim_dir/sudo"
+  build_sudo_shim "$shim_dir" "$sudo_log"
 }
 
 # Symlink PATH essentials into the shim dir so the driver subshell keeps
 # access when we replace PATH wholesale. NOTE: rsync is included — the
 # shared backfill's real-copy mirror needs it (the macos-skip smoke omits
-# rsync because its apply_for_upgrade path never copies data).
+# rsync because its apply_for_upgrade path never copies data). uname is
+# included too so REAL-platform cases resolve the host kernel (fake-platform
+# cases write their own $shim_dir/uname first, which this loop then skips).
 populate_basic_path() {
   local shim_dir="$1" cmd target
-  for cmd in bash mkdir rm cat tr grep sed awk printf id stat tee chmod dirname env date mktemp readlink ls cp mv touch wc head tail find sort uniq true false python3 git tmux jq sqlite3 sha256sum md5 rsync; do
+  for cmd in bash mkdir rm cat tr grep sed awk printf id stat tee chmod dirname env date mktemp readlink ls cp mv touch wc head tail find sort uniq true false python3 git tmux jq sqlite3 sha256sum md5 rsync uname; do
     target="$(command -v "$cmd" 2>/dev/null || true)"
     [[ -n "$target" && "${target:0:1}" == "/" ]] || continue
     [[ -L "$shim_dir/$cmd" || -e "$shim_dir/$cmd" ]] && continue
@@ -128,7 +143,7 @@ seed_legacy_shared() {
 # Emits the wrapper JSON to out_file. The home_dir layout mirrors a live
 # install: legacy shared at $home_dir/shared, v2 data at $home_dir/data.
 run_apply_for_upgrade() {
-  local fake_uname="$1"      # Darwin | Linux
+  local fake_uname="$1"      # Darwin | Linux | REAL (use the host kernel)
   local roster_kind="$2"     # shared | isolated
   local upgrade_ctx="$3"     # 0 | 1
   local home_dir="$4"
@@ -137,7 +152,12 @@ run_apply_for_upgrade() {
   local shim_dir="$home_dir/shim-bin"
   local sudo_log="$home_dir/sudo-calls.log"
   : >"$sudo_log"
-  build_platform_shim "$shim_dir" "$fake_uname" "$sudo_log"
+  if [[ "$fake_uname" == "REAL" ]]; then
+    # sudo recorder only; populate_basic_path symlinks the host uname.
+    build_sudo_shim "$shim_dir" "$sudo_log"
+  else
+    build_platform_shim "$shim_dir" "$fake_uname" "$sudo_log"
+  fi
   populate_basic_path "$shim_dir"
 
   mkdir -p "$home_dir/state" "$home_dir/logs" \
@@ -162,6 +182,7 @@ run_apply_for_upgrade() {
     'cd "$REPO_ROOT"' \
     'export BRIDGE_HOME="$HOME_DIR"' \
     'export BRIDGE_STATE_DIR="$HOME_DIR/state"' \
+    'export BRIDGE_LAYOUT_MARKER_DIR="$HOME_DIR/state"' \
     'export BRIDGE_LOG_DIR="$HOME_DIR/logs"' \
     'export BRIDGE_SHARED_DIR="$HOME_DIR/shared"' \
     'export BRIDGE_DATA_ROOT="$HOME_DIR/data"' \
@@ -176,6 +197,7 @@ run_apply_for_upgrade() {
     HOME_DIR="$home_dir" \
     BRIDGE_HOME="$home_dir" \
     BRIDGE_STATE_DIR="$home_dir/state" \
+    BRIDGE_LAYOUT_MARKER_DIR="$home_dir/state" \
     BRIDGE_LOG_DIR="$home_dir/logs" \
     BRIDGE_SHARED_DIR="$home_dir/shared" \
     BRIDGE_DATA_ROOT="$home_dir/data" \
@@ -249,12 +271,18 @@ smoke_log "T2 PASS: sentinel-gated idempotency holds"
 
 # --- T3: marker-only-no-isolated skip also relocates -------------------------
 
-smoke_log "T3: Darwin marker-only-no-isolated skip (UPGRADE_CONTEXT=1) also relocates"
+# The marker-only fast-path is platform-agnostic (it fires before the
+# macos-shared-agent skip whenever UPGRADE_CONTEXT=1 + no-isolated-roster +
+# no valid marker, on any kernel). Use the REAL host uname here — a fake
+# Darwin uname on a Linux runner leaves the branch's host-dependent steps
+# inconsistent (empty output on CI). The backfill runs FIRST regardless, so
+# its effects are the primary assertion; the skip JSON is asserted too.
+smoke_log "T3: marker-only-no-isolated skip (UPGRADE_CONTEXT=1, real uname) also relocates"
 T3_HOME="$SMOKE_TMP_ROOT/t3"
 mkdir -p "$T3_HOME/shared"
 seed_legacy_shared "$T3_HOME/shared"
 T3_OUT="$T3_HOME/out.txt"
-run_apply_for_upgrade Darwin shared 1 "$T3_HOME" "$T3_OUT"
+run_apply_for_upgrade REAL shared 1 "$T3_HOME" "$T3_OUT"
 T3_PAYLOAD="$(cat "$T3_OUT")"
 smoke_assert_contains "$T3_PAYLOAD" '"reason":"marker-only-no-isolated-roster"' \
   "T3: marker-only-no-isolated skip JSON emitted"
