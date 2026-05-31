@@ -269,6 +269,31 @@ bridge_queue_attention_message() {
   printf 'Queue DB is source of truth.\n'
 }
 
+bridge_compose_notification_text() {
+  # Compose the final injected payload from a (title, message, task_id,
+  # priority) tuple. Extracted from bridge_dispatch_notification (Issue
+  # #1425) so the daemon's flush-time spool rederive
+  # (bridge_tmux_pending_attention_flush) can produce byte-identical text
+  # to a fresh nudge without re-running the engine-specific delivery path.
+  #
+  # Issue #132b followup: compute the payload so the passthrough gate
+  # (metadata-only mode + payload already carries the [Agent Bridge] event=
+  # header) applies uniformly to claude AND non-claude engines. Only skip
+  # the legacy header wrapping when the message already has the metadata
+  # header verbatim; otherwise wrap so messages from
+  # bridge-task/send/intake/review/bundle still get the legacy header.
+  local title="$1"
+  local message="$2"
+  local task_id="${3:-}"
+  local priority="${4:-normal}"
+  if bridge_inject_metadata_only_enabled \
+     && [[ "$message" == "[Agent Bridge] event="* ]]; then
+    printf '%s' "$message"
+  else
+    bridge_notification_text "$title" "$message" "$task_id" "$priority"
+  fi
+}
+
 bridge_dispatch_notification() {
   local agent="$1"
   local title="$2"
@@ -282,22 +307,9 @@ bridge_dispatch_notification() {
   engine="$(bridge_agent_engine "$agent")"
 
   # Issue #132b followup: compute the payload BEFORE the engine-specific
-  # dispatch so the passthrough gate (metadata-only mode + payload already
-  # carries the [Agent Bridge] event= header) applies uniformly to claude
-  # AND non-claude engines. The previous implementation gated only the
-  # claude branch, so a Codex agent's wake would get the legacy header
-  # wrapping reapplied even when $message was already a complete metadata
-  # payload — producing two-event injection text. Comment context: the
-  # gate matters because bridge_dispatch_notification is the shared helper
-  # called from bridge-task/send/intake/review/bundle with plain messages
-  # that still need the legacy header; only skip wrapping when the message
-  # has the metadata header verbatim.
-  if bridge_inject_metadata_only_enabled \
-     && [[ "$message" == "[Agent Bridge] event="* ]]; then
-    text="$message"
-  else
-    text="$(bridge_notification_text "$title" "$message" "$task_id" "$priority")"
-  fi
+  # dispatch so the passthrough gate applies uniformly to claude AND
+  # non-claude engines (see bridge_compose_notification_text).
+  text="$(bridge_compose_notification_text "$title" "$message" "$task_id" "$priority")"
 
   case "$engine" in
     claude)

@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# scripts/smoke/1425-spool-rederive.sh — regression for issue #1425
+# (#1411 follow-up, deferred secondary 1: stale pending-attention spool
+# snapshots).
+#
+# The pending-attention spooler freezes the RENDERED queued-task nudge text
+# at spool time — the `(N)` count and `#<task-id>` never re-derive from the
+# live queue. The flusher used to replay that frozen text verbatim, so a
+# `[deferred]` replay could show a stale count/id after the queue drained.
+#
+# The #1425 fix re-derives the live count + highest-priority task from the
+# queue at flush time and re-renders the nudge — FAIL-SAFE:
+#   - the live-count read is timeout-bounded (bridge_with_timeout);
+#   - on ANY rederive failure (timeout / query error / unresolvable) the
+#     original frozen entry is PRESERVED (never silently dropped);
+#   - the entry is DROPPED only when the live queue is CONFIRMED count==0.
+#
+# This smoke covers the rederive helper contract directly:
+#   R1 — live queue has N>0 queued tasks → rederive returns rc=0 and the
+#        re-rendered nudge carries the LIVE count and the top task id.
+#   R2 — live count differs from a stale snapshot → rederive reflects the
+#        LIVE count, not the frozen one.
+#   R3 — drained queue (count==0) → rederive returns rc=2 (drop).
+#   R4 — simulated read failure (corrupt DB) → rederive returns rc=1
+#        (preserve), NOT rc=2. A transient failure must never look like
+#        count==0.
+#   R5 — non-nudge payload → is_queue_nudge returns false (verbatim replay).
+#   S1 — in-source wiring: the flusher calls the rederive, drops on rc=2,
+#        preserves on rc=1. Static grep (the flusher is coupled to the
+#        daemon main loop, same pattern as 1106-nudge-shell-recheck S1).
+#
+# Footgun #11: no python3 heredoc-stdin / `<<<` here-string at the point of
+# a python3 subprocess. DB seeding uses bridge-queue.py --format shell +
+# tempfile source (matches 1106-nudge-shell-recheck).
+
+set -euo pipefail
+
+SMOKE_NAME="1425-spool-rederive"
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd -P)"
+
+echo "[smoke:${SMOKE_NAME}] starting"
+
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agb-1425-rederive.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+failed=0
+
+# ============================================================
+# R1–R4 — rederive helper contract (sourced lib stack)
+# ============================================================
+# Source bridge-lib.sh under an isolated BRIDGE_HOME (same env block the
+# in-tree spool unit test in scripts/smoke-test.sh uses) so the rederive
+# helper's dependencies (bridge_with_timeout, bridge_queue_cli,
+# bridge_queue_attention_*, bridge_compose_notification_text) are defined,
+# and so the helper's nudge-live-state subprocess reads our seeded DB.
+#
+# Footgun #11: stage the inner script in a tempfile and run it by path
+# rather than piping a heredoc into `bash -s` stdin (avoids the Bash 5.3.9
+# heredoc_write deadlock class — KNOWN_ISSUES.md §26).
+REDERIVE_UT="$TMP_DIR/rederive-ut.sh"
+cat > "$REDERIVE_UT" <<'REDERIVE_UT_BODY'
+set -u
+repo="$1"
+scratch="$2"
+# shellcheck disable=SC1090
+source "$repo/bridge-lib.sh"
+
+fail() { printf '[smoke][error] rederive: %s\n' "$*" >&2; exit 1; }
+
+export BRIDGE_HOME="$scratch/home"
+export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
+export BRIDGE_ACTIVE_AGENT_DIR="$BRIDGE_STATE_DIR/agents"
+export BRIDGE_LOG_DIR="$BRIDGE_HOME/logs"
+export BRIDGE_SHARED_DIR="$BRIDGE_HOME/shared"
+mkdir -p "$BRIDGE_STATE_DIR"
+export BRIDGE_TASK_DB="$BRIDGE_STATE_DIR/tasks.db"
+
+agent="rederive-agent"
+
+create_task() {
+  local title="$1" priority="${2:-normal}"
+  local out
+  out="$(python3 "$repo/bridge-queue.py" create \
+    --to "$agent" --from requester \
+    --title "$title" --body "b" --priority "$priority" \
+    --format shell)"
+  local tmp
+  tmp="$(mktemp)"
+  printf '%s\n' "$out" > "$tmp"
+  # shellcheck disable=SC1090
+  source "$tmp"
+  rm -f "$tmp"
+  printf '%s' "${TASK_ID:-}"
+  unset TASK_ID
+}
+
+# Seed: 2 queued tasks, the higher-priority one is the expected top.
+id_low="$(create_task "low one" low)"
+id_top="$(create_task "urgent one" urgent)"
+[[ -n "$id_low" && -n "$id_top" ]] || fail "seed: task ids empty (low=$id_low top=$id_top)"
+
+# ---- R1: rederive against a live N=2 queue --------------------------------
+set +e
+rendered="$(bridge_tmux_pending_attention_rederive_queue_nudge "$agent")"
+rc=$?
+set -e
+if (( rc != 0 )); then
+  fail "R1: expected rc=0 for live queue, got rc=$rc"
+fi
+# Default (legacy) render carries the count title and the top task id.
+case "$rendered" in
+  *"queued tasks (2)"*) : ;;
+  *) fail "R1: re-rendered nudge missing live count '(2)': $rendered" ;;
+esac
+case "$rendered" in
+  *"#${id_top}"*|*"Task #${id_top}"*) : ;;
+  *) fail "R1: re-rendered nudge missing top task id #${id_top}: $rendered" ;;
+esac
+# Round-trip: the re-rendered output must itself be header-detectable as a
+# queue nudge — proving the anchored detector matches the real producer
+# output (and would re-derive again on a subsequent flush rather than replay
+# stale text).
+if ! bridge_tmux_pending_attention_is_queue_nudge "$rendered"; then
+  fail "R1: re-rendered nudge is not recognized by the header-anchored detector: $rendered"
+fi
+printf '[smoke]   [ok] R1: rederive returns rc=0 and carries live count (2) + top task #%s (header round-trips)\n' "$id_top"
+
+# ---- R2: live count reflects the queue, not a stale snapshot ---------------
+# Add a third queued task; rederive must now report (3), proving it reads the
+# LIVE queue rather than any frozen number.
+id_extra="$(create_task "extra one" normal)"
+[[ -n "$id_extra" ]] || fail "R2: extra task id empty"
+set +e
+rendered3="$(bridge_tmux_pending_attention_rederive_queue_nudge "$agent")"
+rc3=$?
+set -e
+(( rc3 == 0 )) || fail "R2: expected rc=0, got rc=$rc3"
+case "$rendered3" in
+  *"queued tasks (3)"*) : ;;
+  *) fail "R2: re-rendered nudge did not reflect new live count '(3)': $rendered3" ;;
+esac
+printf '[smoke]   [ok] R2: rederive reflects LIVE count (3) after a task is added\n'
+
+# ---- R3: drained queue → rc=2 (drop) --------------------------------------
+# Close every queued task; a CONFIRMED count==0 must return rc=2 so the
+# flusher drops the spooled entry.
+for tid in "$id_low" "$id_top" "$id_extra"; do
+  python3 "$repo/bridge-queue.py" claim "$tid" --agent "$agent" >/dev/null
+  python3 "$repo/bridge-queue.py" done "$tid" --agent "$agent" --note "resolved" >/dev/null
+done
+set +e
+bridge_tmux_pending_attention_rederive_queue_nudge "$agent" >/dev/null
+rc_empty=$?
+set -e
+(( rc_empty == 2 )) || fail "R3: confirmed-empty queue must return rc=2 (drop), got rc=$rc_empty"
+printf '[smoke]   [ok] R3: confirmed count==0 returns rc=2 (drop)\n'
+
+# ---- R4: simulated read failure → rc=1 (preserve), NOT rc=2 ----------------
+# Point the live-count read at a corrupt DB so nudge-live-state exits
+# non-zero. A transient read failure must FAIL SAFE (rc=1 preserve), never
+# be mistaken for count==0 (rc=2 drop).
+corrupt_db="$scratch/corrupt.db"
+printf 'this is not a sqlite database' > "$corrupt_db"
+set +e
+BRIDGE_TASK_DB="$corrupt_db" \
+  bridge_tmux_pending_attention_rederive_queue_nudge "$agent" >/dev/null
+rc_fail=$?
+set -e
+if (( rc_fail == 2 )); then
+  fail "R4: a read failure was treated as count==0 (rc=2 drop) — FAIL-SAFE violated"
+fi
+(( rc_fail == 1 )) || fail "R4: expected rc=1 (preserve) on read failure, got rc=$rc_fail"
+printf '[smoke]   [ok] R4: read failure returns rc=1 (preserve), never rc=2\n'
+
+# ---- R5: nudge detection is anchored to the producer header ----------------
+# Positive: the two real producer shapes must be recognized.
+if ! bridge_tmux_pending_attention_is_queue_nudge "[Agent Bridge] event=inbox agent=x count=2 top=7"; then
+  fail "R5: a metadata-only inbox nudge was NOT recognized"
+fi
+if ! bridge_tmux_pending_attention_is_queue_nudge $'[Agent Bridge]: ACTION REQUIRED — queued tasks (2)\n[Agent Bridge] 2 pending task(s) for x.'; then
+  fail "R5: a legacy queued-tasks nudge was NOT recognized"
+fi
+# Negative: a plain non-nudge inject must not match.
+if bridge_tmux_pending_attention_is_queue_nudge "[Agent Bridge] urgent: a human typed this"; then
+  fail "R5: an urgent/non-nudge payload was misclassified as a queue nudge"
+fi
+# Negative (codex r1 BLOCKING): an urgent send whose own TITLE/BODY quotes a
+# nudge string must NOT match — the detector is header-anchored, so a quoted
+# string in the message body or a non-matching header cannot trip it.
+# Otherwise the flusher could DROP this non-nudge on a confirmed-empty
+# rederive (rc=2), violating the never-silently-drop guarantee.
+if bridge_tmux_pending_attention_is_queue_nudge $'[Agent Bridge]: heads up from ops\nplease handle: ACTION REQUIRED — queued tasks (5) per the runbook'; then
+  fail "R5: a non-nudge whose BODY quotes 'ACTION REQUIRED — queued tasks (' was misclassified"
+fi
+if bridge_tmux_pending_attention_is_queue_nudge "[Agent Bridge] urgent: see [Agent Bridge] event=inbox example in the docs"; then
+  fail "R5: a non-nudge that MENTIONS 'event=inbox ' mid-text was misclassified"
+fi
+# event=inbox-bootstrap must NOT match (distinct producer, bridge-run.sh).
+if bridge_tmux_pending_attention_is_queue_nudge "[Agent Bridge] event=inbox-bootstrap agent=x top=7"; then
+  fail "R5: event=inbox-bootstrap was wrongly matched as a queue nudge"
+fi
+printf '[smoke]   [ok] R5: header-anchored detection — recognizes real nudges, rejects body-quoted false positives + inbox-bootstrap\n'
+
+printf '[smoke]   [ok] rederive helper block passed\n'
+REDERIVE_UT_BODY
+
+if "${BASH:-bash}" "$REDERIVE_UT" "$REPO_ROOT" "$TMP_DIR"; then
+  :
+else
+  echo "[smoke][error] ${SMOKE_NAME}: rederive helper block FAILED" >&2
+  failed=1
+fi
+
+# ============================================================
+# S1 — in-source wiring (static grep)
+# ============================================================
+tmux_sh="$REPO_ROOT/lib/bridge-tmux.sh"
+
+if ! grep -q "bridge_tmux_pending_attention_rederive_queue_nudge" "$tmux_sh"; then
+  echo "[smoke][error] S1: flusher does not define/call the rederive helper" >&2
+  failed=1
+else
+  echo "[smoke]   [ok] S1: rederive helper is defined in lib/bridge-tmux.sh"
+fi
+
+# The flusher must drop on rc=2 (continue) and fall through to preserve on
+# rc=1 — assert the flush loop references the rederive helper and the
+# drop/preserve branches.
+if ! grep -q "bridge_tmux_pending_attention_is_queue_nudge" "$tmux_sh"; then
+  echo "[smoke][error] S1: flusher does not gate the rederive on the nudge detector" >&2
+  failed=1
+else
+  echo "[smoke]   [ok] S1: flusher gates rederive on is_queue_nudge"
+fi
+
+if ! grep -Eq 'rederive_rc == 2' "$tmux_sh"; then
+  echo "[smoke][error] S1: flusher does not drop on confirmed-empty (rc=2)" >&2
+  failed=1
+else
+  echo "[smoke]   [ok] S1: flusher drops the entry on rc=2 (confirmed count==0)"
+fi
+
+if (( failed )); then
+  exit 1
+fi
+echo "[smoke:${SMOKE_NAME}] all checks passed"

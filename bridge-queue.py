@@ -962,6 +962,15 @@ def cmd_upsert_open(args: argparse.Namespace) -> int:
     # bypasses the single-writer contract; this routes both families through
     # the same upsert_open_task() the blocked-aging family uses.
     #
+    # DEDUPE CONTRACT (#1425): the re-bind is via find_open_task_by_prefix(),
+    # which matches OPEN statuses only (queued/claimed/blocked). `claim`
+    # HOLDS dedupe — a claimed row still matches the prefix lookup, so the
+    # next scan refreshes it instead of minting a new id. `done` RELEASES it
+    # — a closed row drops out of the lookup, so if the underlying condition
+    # is still live the next scan mints a FRESH task-id and re-nudges. For a
+    # genuinely-stuck peer, `claim` (or leave the row open) rather than `done`
+    # until the condition is actually resolved. See KNOWN_ISSUES.md §30.
+    #
     # ATOMICITY (codex r1 BLOCKING): upsert_open_task() does a SELECT
     # (find_open_task_by_prefix) and only then an INSERT-or-UPDATE. Python's
     # sqlite3 in its default isolation mode does NOT take a write lock before a
@@ -1720,6 +1729,15 @@ def latest_event_ts(conn: sqlite3.Connection, task_id: int, event_type: str) -> 
 
 
 def find_open_task_by_prefix(conn: sqlite3.Connection, agent: str, title_prefix: str) -> sqlite3.Row | None:
+    # Dedupe lookup for recurring daemon alerts (upsert-open) and the
+    # blocked-aging reminder/escalation upserts. Matches OPEN_STATUSES only
+    # (queued/claimed/blocked) — a `done` row is intentionally NOT matched.
+    # Consequence (#1425): `claim` holds dedupe (the row still matches, so the
+    # next scan re-binds the same task-id); `done` releases it (a fresh id is
+    # minted on the next scan if the condition is still live). Do NOT widen
+    # this to a recent-`done` window here — it is shared by the blocked-aging
+    # upserts, so that would change close semantics outside daemon alerts.
+    # See KNOWN_ISSUES.md §30.
     placeholders = ",".join(["?"] * len(OPEN_STATUSES))
     params: list[object] = [agent, *OPEN_STATUSES, f"{title_prefix}%"]
     return conn.execute(

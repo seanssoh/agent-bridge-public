@@ -817,3 +817,35 @@ class. Only use this for diagnostic runs in an isolated `BRIDGE_HOME`.
 
 Non-iso (legacy) installs are unaffected: `=0` remains a no-op-style
 toggle for them since the data-loss vector is iso-v2-specific.
+
+## 30. Closing a daemon attention/outbox-stuck alert with `done` re-mints a fresh task-id (#1425)
+
+The daemon's recurring single-task alerts — the A2A outbox-stuck scan and
+the blocked-aging reminder/escalation family — dedupe by **re-binding to an
+existing OPEN task with a stable title prefix** (`agb`'s `upsert-open`, which
+uses `find_open_task_by_prefix` in `bridge-queue.py`). That prefix lookup
+matches **open statuses only** (`queued`, `claimed`, `blocked`). So whichever
+way you acknowledge the alert decides whether dedupe holds:
+
+- **`claim`** (or leaving the row open / `blocked`) keeps the row in the
+  open-prefix pool, so the next daemon scan **re-binds to the same task-id**
+  instead of minting a new one. The alert stops churning while the condition
+  persists.
+- **`done`** releases the row from the open-prefix pool. If the underlying
+  condition is *still live* (e.g. a peer that has been offline since Friday),
+  the next scan finds no open row for that prefix and **mints a fresh
+  task-id**, re-nudging you. Acknowledging-by-`done` is therefore
+  counter-productive for a genuinely-stuck condition — it produces task-id
+  churn, not silence.
+
+**Operator guidance:** while the condition is unresolved, `claim` the alert
+(or leave it open) so dedupe holds. Use `done` only once the underlying
+condition is actually resolved — that is the signal that the alert *should*
+disappear and a future occurrence *should* get a new id.
+
+This is documented rather than code-changed on purpose: `find_open_task_by_prefix`
+is shared by the blocked-aging upserts, so widening it with a global
+"recently-done" window would change close semantics outside the daemon
+alerts. A code-side churn suppressor (a daemon-alert-specific `upsert-open`
+mode that reuses recently-closed *alerts* without reopening them) would be a
+separate, narrowly-scoped follow-up.

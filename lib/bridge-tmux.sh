@@ -1581,6 +1581,131 @@ bridge_tmux_session_ring_bell() {
     >/dev/null 2>&1 || true
 }
 
+# Issue #1425: detect whether a spooled payload is a queued-task
+# "ACTION REQUIRED" attention nudge (the only spool entry whose `(N)` count
+# and `#<task-id>` are rendered against the live queue at spool time and so
+# can go stale before the flush replays it). The two producer shapes both
+# come from bridge_queue_attention_* via bridge_compose_notification_text
+# (lib/bridge-notify.sh):
+#   - metadata-only mode: the WHOLE payload is
+#       `[Agent Bridge] event=inbox agent=… count=N top=ID …`
+#   - legacy mode: the FIRST LINE is
+#       `[Agent Bridge]: ACTION REQUIRED — queued tasks (N)`
+#     (these nudges always dispatch at priority=normal with no task-id in
+#     the header, so the header line is fixed; the message body follows).
+#
+# Detection is ANCHORED to the producer HEADER, NOT a substring scan of the
+# whole payload (codex r1 BLOCKING). A substring scan would misclassify an
+# urgent send / new-task inject whose own title or body text happens to
+# quote one of these strings — and then the flusher could DROP that
+# non-nudge on a confirmed-empty rederive (rc=2), violating the never-
+# silently-drop guarantee. Anchoring to the header (prefix for metadata,
+# first-line prefix for legacy) keeps user-controlled message body text from
+# ever tripping the detector. The `event=inbox ` trailing space also keeps
+# the distinct `event=inbox-bootstrap` payload (bridge-run.sh) from matching.
+bridge_tmux_pending_attention_is_queue_nudge() {
+  local decoded="$1"
+  # Metadata-only: the payload starts with the event header verbatim.
+  if [[ "$decoded" == "[Agent Bridge] event=inbox "* ]]; then
+    return 0
+  fi
+  # Legacy: the FIRST LINE is the fixed ACTION-REQUIRED header. Strip from
+  # the first newline so body text on subsequent lines can never match.
+  local first_line="${decoded%%$'\n'*}"
+  if [[ "$first_line" == "[Agent Bridge]: ACTION REQUIRED — queued tasks ("* ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Issue #1425: re-derive a queued-task attention nudge against the LIVE queue
+# at flush time and re-render it, so a `[deferred]` replay never shows a
+# count/task-id frozen at spool time. Echoes the re-rendered payload on
+# stdout. FAIL-SAFE contract (pair-reviewer r1 #5 hard requirement):
+#   rc=0  → stdout holds the freshly re-rendered nudge (replay this).
+#   rc=2  → live queue CONFIRMED count==0 (drop this entry; condition gone).
+#   rc=1  → rederive could not be confirmed (timeout / query error / no
+#           top-task resolvable) → caller MUST preserve the original frozen
+#           text (NEVER silently drop). A transient read failure is rc=1,
+#           never rc=2.
+# Read-only: queries the queue and re-renders; never claims/mutates a task.
+bridge_tmux_pending_attention_rederive_queue_nudge() {
+  local agent="$1"
+  local live_state=""
+  local live_state_rc=0
+  local live_queued=""
+  local open_task_shell=""
+  local task_id=""
+  local task_title=""
+  local task_priority="normal"
+  local title=""
+  local message=""
+
+  [[ -n "$agent" ]] || return 1
+
+  # Live count + queued ids — same helper + 15s ceiling the daemon nudge
+  # path uses (bridge-daemon.sh::nudge_agent_session). The flusher runs on
+  # the daemon's per-sync path, so the read MUST be timeout-bounded to avoid
+  # stalling the flush loop. rc=124/137 (timeout) and any non-zero rc fall
+  # through to fail-safe preserve (rc=1), NOT to drop.
+  if ! command -v bridge_with_timeout >/dev/null 2>&1; then
+    return 1
+  fi
+  # Capture rc via the `|| rc=$?` idiom (left operand of `||` is exempt from
+  # errexit) rather than toggling `set +e`/`set -e`. The flusher calls this
+  # helper from inside its own `set +e` region; a `set -e` here would leak
+  # back and clobber the caller's errexit state (Issue #1425 r1 self-review).
+  live_state="$(bridge_with_timeout 15 spool_rederive_live_state \
+    python3 "$BRIDGE_SCRIPT_DIR/bridge-daemon-helpers.py" \
+    nudge-live-state "$BRIDGE_TASK_DB" "$agent" 2>/dev/null)" || live_state_rc=$?
+  (( live_state_rc == 0 )) || return 1
+  [[ -n "$live_state" ]] || return 1
+  # Output is `queued_count<TAB>claimed_count<TAB>csv_ids`. Parse the leading
+  # field via parameter expansion (footgun #11: avoid `read … <<<"$row"`).
+  live_queued="${live_state%%$'\t'*}"
+  [[ "$live_queued" =~ ^[0-9]+$ ]] || return 1
+
+  # CONFIRMED empty → drop. Only a successful query that proves count==0
+  # reaches this branch; a transient failure already returned 1 above.
+  if (( live_queued == 0 )); then
+    return 2
+  fi
+
+  # Highest-priority open task for the header line — same source the daemon
+  # uses to render the nudge (bridge-daemon.sh:6354 calls find-open directly,
+  # unwrapped, for the same reason). A missing/odd result is non-fatal: the
+  # count line is still live, so re-render with an empty top-task rather than
+  # preserving a stale id. bridge_queue_cli is a bash function (it may route
+  # through the queue gateway) so it cannot go through bridge_with_timeout,
+  # which execs an external `timeout` binary; the drop-deciding count read
+  # above is the external, timeout-bounded read.
+  # `|| true` keeps a non-zero find-open (no open task) from tripping a
+  # caller's errexit without touching global `set -e` state.
+  open_task_shell="$(bridge_queue_cli find-open --agent "$agent" --format shell 2>/dev/null)" || true
+  if [[ -n "$open_task_shell" ]]; then
+    local _open_task_tmp=""
+    _open_task_tmp="$(mktemp)" || return 1
+    # shellcheck disable=SC2064
+    trap "rm -f -- '$_open_task_tmp'" RETURN
+    printf '%s\n' "$open_task_shell" > "$_open_task_tmp"
+    # shellcheck disable=SC1090
+    source "$_open_task_tmp" 2>/dev/null || true
+    if [[ "${TASK_STATUS:-}" == "queued" && -n "${TASK_ID:-}" && -n "${TASK_TITLE:-}" ]]; then
+      task_id="$TASK_ID"
+      task_title="$TASK_TITLE"
+      task_priority="${TASK_PRIORITY:-normal}"
+    fi
+  fi
+
+  title="$(bridge_queue_attention_title "$live_queued")"
+  message="$(bridge_queue_attention_message "$agent" "$live_queued" "$task_id" "$task_priority" "$task_title")"
+  # Wrap exactly as bridge_dispatch_notification would (metadata-only
+  # passthrough vs legacy header), so a rederived replay is byte-identical
+  # to a fresh daemon nudge.
+  bridge_compose_notification_text "$title" "$message" "" "normal"
+  return 0
+}
+
 bridge_tmux_pending_attention_flush() {
   local session="$1"
   local engine="$2"
@@ -1613,19 +1738,48 @@ bridge_tmux_pending_attention_flush() {
   # shellcheck disable=SC2064
   trap "rm -f -- '$_tmp'" RETURN
   printf '%s\n' "$drained" > "$_tmp"
+  local deferred_marker=0
+  local rederived=""
+  local rederive_rc=0
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     ts="${line%%$'\t'*}"
     escaped="${line#*$'\t'}"
     decoded="$(bridge_tmux_pending_attention_unescape "$escaped")"
+    deferred_marker=0
     if [[ "$ts" =~ ^[0-9]+$ ]]; then
       age=$((now - ts))
       if (( age > max_defer )); then
-        decoded="[deferred] $decoded"
+        deferred_marker=1
       fi
     else
       # Unknown age — safer to warn the operator that the replay is stale
       # than to present it as a live signal.
+      deferred_marker=1
+    fi
+
+    # Issue #1425: a queued-task attention nudge freezes its `(N)` count and
+    # `#<task-id>` at spool time. Before replaying, re-derive both from the
+    # LIVE queue and re-render. FAIL-SAFE: drop ONLY when the queue is
+    # CONFIRMED count==0 (rc=2); on ANY rederive failure (rc=1: timeout /
+    # query error / unresolvable) replay the original frozen text — never
+    # silently drop. Non-nudge payloads are replayed verbatim.
+    if bridge_tmux_pending_attention_is_queue_nudge "$decoded"; then
+      set +e
+      rederived="$(bridge_tmux_pending_attention_rederive_queue_nudge "$agent")"
+      rederive_rc=$?
+      set -e
+      if (( rederive_rc == 2 )); then
+        # Live queue drained — the underlying condition no longer holds.
+        # Drop this entry (skip the send) and move to the next.
+        continue
+      elif (( rederive_rc == 0 )) && [[ -n "$rederived" ]]; then
+        decoded="$rederived"
+      fi
+      # rc=1 (or empty rc=0) → fall through with the original frozen text.
+    fi
+
+    if (( deferred_marker == 1 )); then
       decoded="[deferred] $decoded"
     fi
 
