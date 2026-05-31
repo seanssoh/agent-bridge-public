@@ -695,6 +695,58 @@ tail -n 80 ~/.agent-bridge/state/daemon.log
 tail -n 80 ~/.agent-bridge/logs/bridge-$(date +%Y%m%d).log
 ```
 
+### Scheduled shell scripts without iso v2 (macOS / non-iso installs)
+
+`agb cron create --kind shell --run-as-agent <agent>` runs a script under a
+**dedicated isolated OS UID**. That UID only exists on Linux hosts with
+linux-user isolation (iso v2) active, so **`--kind shell` is unavailable on
+macOS and on any non-iso install** — create refuses with a message pointing
+back here. There is no unguarded "run as the controller user" mode: executing
+an operator script with the controller's full privileges on a schedule is a
+different security posture than the iso-UID sandbox `--kind shell` promises,
+so it is intentionally not offered as a silent fallback.
+
+To run a script on a schedule without iso v2, pick one of:
+
+1. **OS crontab (recommended).** The OS scheduler invokes the script as a plain
+   bash process, completely bypassing claude/codex and the bridge daemon. This
+   is the simplest path for health checks and other plain-shell tasks:
+
+   ```cron
+   0 */3 * * * /full/path/to/health-check.sh >> /full/path/.agent-bridge/logs/health-check.log 2>&1
+   ```
+
+   (The crontab entry must be one physical line — `crontab(5)` does not honor
+   backslash continuation. If the inline form is unwieldy, crontab a small
+   wrapper script instead; see the picker-sweep §A example below.)
+
+2. **Bridge-native `--kind text` cron against a non-Claude (codex) agent.** A
+   text-kind cron wraps its payload in `claude -p` / `codex exec`, so the
+   payload can `bash` your script. Target a Codex agent so the turn is not
+   itself blocked on a Claude picker:
+
+   ```bash
+   agb cron create \
+       --agent <codex-agent> \
+       --schedule '0 */3 * * *' \
+       --title health-check \
+       --payload 'bash $BRIDGE_HOME/scripts/health-check.sh'
+   ```
+
+   This keeps the schedule and the run history inside the bridge cron
+   inventory (`agb cron inventory`, `agb cron errors report`) while still
+   executing your shell script.
+
+**`pgrep -c` portability.** Health-check scripts frequently count processes
+with `pgrep -c <pattern>`, but `-c` is a Linux extension — macOS `pgrep` does
+not support it and the script will error. Use a portable count instead:
+
+```bash
+count="$(pgrep -f '<pattern>' | wc -l)"
+# or, when pgrep itself is unavailable:
+count="$(ps aux | grep -c '[<]pattern>')"
+```
+
 ## Safe Cleanup
 
 Kill active bridge sessions:

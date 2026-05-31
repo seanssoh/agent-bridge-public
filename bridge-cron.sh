@@ -25,6 +25,14 @@ Usage:
   $(basename "$0") errors report [--agent <agent>] [--family <family>] [--limit <count>] [--json]
   $(basename "$0") cleanup report [--mode expired-one-shot] [--json]
   $(basename "$0") cleanup prune [--mode expired-one-shot] [--dry-run]
+
+Notes:
+  --kind shell (with --run-as-agent) runs a script under a dedicated isolated
+  OS UID and REQUIRES a linux-user isolated agent (iso v2 — Linux only). It is
+  unavailable on macOS / non-iso installs. To run a script on a schedule
+  without iso, use OS crontab (recommended) or a --kind text cron whose payload
+  runs 'bash <script>' against a non-Claude (codex) agent. See OPERATIONS.md
+  "Scheduled shell scripts without iso v2".
 EOF
 }
 
@@ -170,8 +178,18 @@ bridge_cron_validate_shell_run_config() {
   [[ -n "$run_as_agent" ]] || bridge_die "--run-as-agent is required for --kind shell"
   bridge_load_roster
   bridge_require_agent "$run_as_agent"
+  # Issue #1426: `--kind shell` runs a script under a dedicated isolated OS
+  # UID, which only exists on Linux hosts with linux-user isolation (iso v2)
+  # active. On macOS / non-iso installs there is no per-agent UID to drop to,
+  # so this kind is structurally unavailable. Point the author at the
+  # supported scheduled-shell paths instead of leaving them at a dead end
+  # after they have already written and tested a script.
   bridge_agent_linux_user_isolation_effective "$run_as_agent" \
-    || bridge_die "--run-as-agent must name a linux-user isolated agent: $run_as_agent"
+    || bridge_die "$(printf '%s\n%s\n%s\n%s' \
+        "--kind shell requires a linux-user isolated agent (iso v2); '$run_as_agent' is not one." \
+        "iso v2 is Linux-only — on macOS / non-iso installs --kind shell is unavailable." \
+        "To run a script on a schedule without iso, use one of:" \
+        "  1) OS crontab (recommended; bypasses claude/codex entirely), or 2) a --kind text cron whose payload runs 'bash <script>' against a non-Claude (codex) agent. See OPERATIONS.md \"Scheduled shell scripts without iso v2\".")"
 
   local os_user
   os_user="$(bridge_agent_os_user "$run_as_agent")"
