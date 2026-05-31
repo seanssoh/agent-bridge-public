@@ -21,6 +21,7 @@ Usage:
   $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--app-password-stdin] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run] [--allow-probe-failure]
   $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--client-secret-stdin] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--skip-entra-probe] [--yes] [--dry-run] [--allow-probe-failure]
+  $(basename "$0") template-sync [--from <reference-agent default admin>] [--exclude <csv>] [--targets <csv-existing-agents>] [--dry-run] [--yes]
   $(basename "$0") agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start] [setup options...]
   $(basename "$0") admin <agent>
 
@@ -31,6 +32,7 @@ Examples:
   $(basename "$0") teams tester --channel-account default --allow-from 00000000-0000-0000-0000-000000000000
   $(basename "$0") ms365 tester
   $(basename "$0") ms365 tester --redirect-uri https://bot.example.com/auth/callback
+  $(basename "$0") template-sync --from patch --dry-run
   $(basename "$0") agent tester
   $(basename "$0") agent tester --test-start
   $(basename "$0") admin tester
@@ -62,6 +64,16 @@ EOF
       cat <<EOF
 Usage:
   $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--client-secret-stdin] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--skip-entra-probe] [--yes] [--dry-run] [--allow-probe-failure]
+EOF
+      ;;
+    template-sync)
+      cat <<EOF
+Usage:
+  $(basename "$0") template-sync [--from <reference-agent default admin>] [--exclude <csv-dims-or-dim:item>] [--targets <csv-existing-agents>] [--dry-run] [--yes]
+
+Seeds new (and optionally existing) agents from a reference agent's
+roster config. Roster-only read; channels are copied as declarations
+only (never credentials); permission_mode=legacy is never inherited.
 EOF
       ;;
     agent)
@@ -1477,6 +1489,149 @@ run_admin() {
   echo "next_command: agb admin"
 }
 
+# Issue #1427 Lane B: `setup template-sync` — seed new (and optionally
+# existing) agents from a reference agent's roster-resident config.
+#
+# Stage 0 (here): parse flags, validate the reference is an existing
+# Claude agent, read its RAW per-dimension `BRIDGE_AGENT_*` roster values
+# (sourced already by `bridge_load_roster`), then route through the
+# two-stage wizard the same way run_teams / run_ms365 do. The reference
+# read is ROSTER-ONLY — we forward the raw declarations to the python
+# wizard via `--ref-*`; nothing reaches into the reference's $HOME/.claude
+# or any channel secret file. A dimension the reference never declared is
+# simply NOT forwarded (python treats the absent `--ref-*` as "unset /
+# reference missing" and never guesses).
+run_template_sync() {
+  local ref_agent="${1:-}"
+  local dry_run=0
+  local exclude_csv=""
+  local targets_csv=""
+  local yes_flag=0
+  local explicit_exclude=0
+
+  shift || true
+  if [[ "$ref_agent" == "-h" || "$ref_agent" == "--help" || "$ref_agent" == "help" ]]; then
+    setup_subcommand_usage "template-sync"
+    return 0
+  fi
+  # `template-sync` takes the reference via `--from` (default patch),
+  # NOT as a positional. If the first token is a flag, there is no
+  # positional reference — restore it for the option loop and default the
+  # reference to the admin agent (patch on a standard install).
+  if [[ "$ref_agent" == --* || -z "$ref_agent" ]]; then
+    [[ -n "$ref_agent" ]] && set -- "$ref_agent" "$@"
+    ref_agent=""
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        ref_agent="$2"
+        shift 2
+        ;;
+      --exclude)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        exclude_csv="$2"
+        explicit_exclude=1
+        shift 2
+        ;;
+      --targets)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        targets_csv="$2"
+        shift 2
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --yes)
+        yes_flag=1
+        shift
+        ;;
+      *)
+        bridge_die "지원하지 않는 setup template-sync 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  # Default the reference to the admin agent when omitted.
+  if [[ -z "$ref_agent" ]]; then
+    ref_agent="${BRIDGE_ADMIN_AGENT_ID:-patch}"
+  fi
+  bridge_require_agent "$ref_agent"
+  bridge_setup_require_claude_agent "$ref_agent" "template-sync"
+
+  # Read the reference's RAW per-dimension roster values. Use the `+set`
+  # test so an unset array key forwards NOTHING (python => "unset /
+  # reference missing"), distinct from a declared-empty value.
+  local -a py_args=(template-sync --from "$ref_agent" --roster-file "$BRIDGE_ROSTER_LOCAL_FILE")
+  py_args+=(--ref-engine "$(bridge_agent_engine "$ref_agent")")
+
+  local ref_model="" ref_effort="" ref_permission_mode=""
+  local ref_plugins="" ref_skills="" ref_channels=""
+  if [[ -n "${BRIDGE_AGENT_MODEL[$ref_agent]+set}" ]]; then
+    ref_model="${BRIDGE_AGENT_MODEL[$ref_agent]}"
+    py_args+=(--ref-model "$ref_model")
+  fi
+  if [[ -n "${BRIDGE_AGENT_EFFORT[$ref_agent]+set}" ]]; then
+    ref_effort="${BRIDGE_AGENT_EFFORT[$ref_agent]}"
+    py_args+=(--ref-effort "$ref_effort")
+  fi
+  if [[ -n "${BRIDGE_AGENT_PERMISSION_MODE[$ref_agent]+set}" ]]; then
+    ref_permission_mode="${BRIDGE_AGENT_PERMISSION_MODE[$ref_agent]}"
+    py_args+=(--ref-permission-mode "$ref_permission_mode")
+  fi
+  if [[ -n "${BRIDGE_AGENT_PLUGINS[$ref_agent]+set}" ]]; then
+    ref_plugins="${BRIDGE_AGENT_PLUGINS[$ref_agent]}"
+    py_args+=(--ref-plugins "$ref_plugins")
+  fi
+  if [[ -n "${BRIDGE_AGENT_SKILLS[$ref_agent]+set}" ]]; then
+    ref_skills="${BRIDGE_AGENT_SKILLS[$ref_agent]}"
+    py_args+=(--ref-skills "$ref_skills")
+  fi
+  # Channels: declarations only — read the raw BRIDGE_AGENT_CHANNELS entry,
+  # NOT the inferred-from-launch-cmd fallback (which could surface dev
+  # channels the operator never declared). No credential bytes here.
+  if [[ -n "${BRIDGE_AGENT_CHANNELS[$ref_agent]+set}" ]]; then
+    ref_channels="${BRIDGE_AGENT_CHANNELS[$ref_agent]}"
+    py_args+=(--ref-channels "$ref_channels")
+  fi
+
+  # Two-stage wizard gate (same shape as run_teams / run_ms365):
+  #   auto mode (--yes) → validate_auto requires --from (already present)
+  #   interactive TTY   → run the opt-out exclude wizard, then --yes
+  local -a wizard_args=()
+  if [[ $yes_flag -eq 1 ]]; then
+    py_args+=(--yes)
+    bridge_setup_wizard_validate_auto template-sync "${py_args[@]}"
+  elif bridge_setup_wizard_is_interactive_tty && [[ $explicit_exclude -eq 0 ]]; then
+    bridge_setup_wizard_run_template_sync \
+      "$ref_agent" wizard_args \
+      "$ref_model" "$ref_effort" "$ref_permission_mode" \
+      "$ref_plugins" "$ref_skills" "$ref_channels"
+    py_args+=("${wizard_args[@]}")
+  else
+    # Non-interactive without --yes, or an explicit --exclude was given in
+    # a non-TTY context: append --yes so the python wizard does not block
+    # on stdin. The required-field validator still guards --from.
+    py_args+=(--yes)
+    bridge_setup_wizard_validate_auto template-sync "${py_args[@]}"
+  fi
+
+  if [[ -n "$exclude_csv" ]]; then
+    py_args+=(--exclude "$exclude_csv")
+  fi
+  if [[ -n "$targets_csv" ]]; then
+    py_args+=(--targets "$targets_csv")
+  fi
+  if [[ $dry_run -eq 1 ]]; then
+    py_args+=(--dry-run)
+  fi
+
+  bridge_setup_python "${py_args[@]}"
+}
+
 subcommand="${1:-}"
 shift || true
 
@@ -1493,6 +1648,9 @@ case "$subcommand" in
   ms365)
     run_ms365 "$@"
     ;;
+  template-sync)
+    run_template_sync "$@"
+    ;;
   agent)
     run_agent "$@"
     ;;
@@ -1505,7 +1663,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "discord telegram teams ms365 agent admin")"
+      "discord telegram teams ms365 template-sync agent admin")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 setup 명령입니다: $subcommand"
     ;;
