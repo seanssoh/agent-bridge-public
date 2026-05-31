@@ -3010,6 +3010,512 @@ def cmd_mattermost(args: argparse.Namespace) -> int:
         return 1
 
 
+# ---------------------------------------------------------------------------
+# Issue #1427 Lane B — `setup template-sync`.
+#
+# Seed new (and optionally existing) agents from a reference agent's
+# ROSTER-resident config. The hard contracts (see docs/template-sync-
+# design.md):
+#   * Reference read is ROSTER-ONLY — this command consumes the reference
+#     agent's raw `BRIDGE_AGENT_*` values that the bash dispatch sourced
+#     and forwarded via `--ref-*`. It never opens the reference's
+#     $HOME/.claude, plugin cache, settings, env, .mcp.json, or any channel
+#     secret file.
+#   * Hard security redaction — channels are copied as DECLARATIONS only
+#     (`plugin:teams@mkt`); no creds/tokens/MCP secrets/.env/access.json
+#     ever appear in the candidate, diff, profile, or metadata.
+#   * `permission_mode=legacy` is NEVER inherited — refused + omitted + warn.
+#   * No guessing — a dimension the reference never set is surfaced as
+#     "unset / reference missing", not a fabricated default.
+# ---------------------------------------------------------------------------
+
+# Canonical dimension order. model/effort/permission_mode are scalar;
+# plugins/skills/channels are token lists (space/comma separated in the
+# roster, normalized to a sorted, de-duped list here for determinism).
+_TEMPLATE_SYNC_DIMENSIONS = (
+    "model",
+    "effort",
+    "permission_mode",
+    "plugins",
+    "skills",
+    "channels",
+)
+
+_TEMPLATE_SYNC_LIST_DIMENSIONS = frozenset({"plugins", "skills", "channels"})
+
+# Roster variable name per dimension (Contract-I).
+_TEMPLATE_SYNC_PROFILE_VARS = {
+    "model": "BRIDGE_TEMPLATE_DEFAULT_MODEL",
+    "effort": "BRIDGE_TEMPLATE_DEFAULT_EFFORT",
+    "permission_mode": "BRIDGE_TEMPLATE_DEFAULT_PERMISSION_MODE",
+    "plugins": "BRIDGE_TEMPLATE_DEFAULT_PLUGINS",
+    "skills": "BRIDGE_TEMPLATE_DEFAULT_SKILLS",
+    "channels": "BRIDGE_TEMPLATE_DEFAULT_CHANNELS",
+}
+
+# Runtime-affecting dimensions — any change to these on an existing agent
+# requires a restart for the launch/plugin/skill/channel materialization to
+# take effect.
+_TEMPLATE_SYNC_RESTART_DIMENSIONS = frozenset(_TEMPLATE_SYNC_DIMENSIONS)
+
+_TEMPLATE_SYNC_BEGIN_MARKER = "# === agb:template-defaults v1 (managed by `setup template-sync`) ==="
+_TEMPLATE_SYNC_END_MARKER = "# === end agb:template-defaults ==="
+
+
+def _template_sync_normalize_list(raw: str) -> list[str]:
+    """Split a roster list value (space/comma separated) into a sorted,
+    de-duped token list. Order is normalized so the candidate hash and
+    diff are deterministic regardless of the reference's token order."""
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for chunk in re.split(r"[\s,]+", raw.strip()):
+        token = chunk.strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return sorted(tokens)
+
+
+def _template_sync_channel_setup_hint(channel_decl: str) -> str | None:
+    """Map a channel declaration (`plugin:teams@mkt`, `plugin:ms365`) to its
+    per-channel setup-pending next-action. Declarations only — the operator
+    re-populates credentials via the per-channel `setup` wizard. Returns
+    None for declarations with no known credential wizard."""
+    label = channel_decl
+    if label.startswith("plugin:"):
+        label = label[len("plugin:"):]
+    # Strip the `@marketplace` qualifier.
+    label = label.split("@", 1)[0].strip().lower()
+    known = {"teams", "ms365", "discord", "telegram", "mattermost"}
+    if label in known:
+        return f"agb setup {label} <agent>"
+    return None
+
+
+def _template_sync_build_candidate(args: argparse.Namespace) -> dict[str, Any]:
+    """Compute the redacted sync candidate from the reference's raw roster
+    values (forwarded via `--ref-*`). Each dimension entry records:
+      value   — the redacted candidate value (scalar str or token list)
+      source  — "reference" | "bridge-default" | "unset"
+      status  — "ok" | "unset / reference missing" | "refused: legacy"
+    No secret material is ever read or emitted — channels stay declarations.
+    """
+    raw = {
+        "model": args.ref_model,
+        "effort": args.ref_effort,
+        "permission_mode": args.ref_permission_mode,
+        "plugins": args.ref_plugins,
+        "skills": args.ref_skills,
+        "channels": args.ref_channels,
+    }
+    candidate: dict[str, Any] = {}
+    warnings: list[str] = []
+
+    for dim in _TEMPLATE_SYNC_DIMENSIONS:
+        ref_val = raw[dim]
+        # `None` (the argparse sentinel) == reference never declared this
+        # dimension. An explicit empty string == declared-but-empty, also
+        # treated as "unset" (no token / no scalar to inherit).
+        if ref_val is None or ref_val.strip() == "":
+            if dim == "model":
+                # Only model has a meaningful built-in default to fall back
+                # to (the new-shape launch default). effort/pm/lists do not
+                # — a missing list is genuinely empty, not "the default".
+                candidate[dim] = {
+                    "value": args.default_model,
+                    "source": "bridge-default",
+                    "status": "ok",
+                }
+            elif dim == "effort":
+                candidate[dim] = {
+                    "value": args.default_effort,
+                    "source": "bridge-default",
+                    "status": "ok",
+                }
+            else:
+                candidate[dim] = {
+                    "value": [] if dim in _TEMPLATE_SYNC_LIST_DIMENSIONS else "",
+                    "source": "unset",
+                    "status": "unset / reference missing",
+                }
+            continue
+
+        if dim == "permission_mode" and ref_val.strip().lower() == "legacy":
+            # Hard invariant: legacy is NEVER inherited.
+            candidate[dim] = {
+                "value": "",
+                "source": "reference",
+                "status": "refused: legacy",
+            }
+            warnings.append(
+                "permission_mode=legacy on the reference agent is NEVER "
+                "inherited — dimension omitted from the defaults profile."
+            )
+            continue
+
+        if dim in _TEMPLATE_SYNC_LIST_DIMENSIONS:
+            tokens = _template_sync_normalize_list(ref_val)
+            candidate[dim] = {
+                "value": tokens,
+                "source": "reference",
+                "status": "ok" if tokens else "unset / reference missing",
+            }
+        else:
+            candidate[dim] = {
+                "value": ref_val.strip(),
+                "source": "reference",
+                "status": "ok",
+            }
+
+    return {"dimensions": candidate, "warnings": warnings}
+
+
+def _template_sync_parse_exclude(exclude_csv: str) -> tuple[set[str], dict[str, set[str]]]:
+    """Parse `--exclude` into (excluded-dimensions, per-item-excludes).
+    Entries: `model` (whole dimension) or `plugins:foo@mkt` (single item).
+    Unknown dimension names raise SetupError so a typo never silently
+    includes a dimension the operator meant to drop."""
+    dims_out: set[str] = set()
+    items_out: dict[str, set[str]] = {}
+    for chunk in exclude_csv.split(","):
+        entry = chunk.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            dim, item = entry.split(":", 1)
+            dim = dim.strip()
+            item = item.strip()
+            if dim not in _TEMPLATE_SYNC_DIMENSIONS:
+                raise SetupError(f"--exclude references unknown dimension: {dim!r}")
+            if dim not in _TEMPLATE_SYNC_LIST_DIMENSIONS:
+                raise SetupError(
+                    f"--exclude per-item form (dim:item) only applies to "
+                    f"list dimensions {sorted(_TEMPLATE_SYNC_LIST_DIMENSIONS)}; "
+                    f"got {entry!r}"
+                )
+            items_out.setdefault(dim, set()).add(item)
+        else:
+            if entry not in _TEMPLATE_SYNC_DIMENSIONS:
+                raise SetupError(f"--exclude references unknown dimension: {entry!r}")
+            dims_out.add(entry)
+    return dims_out, items_out
+
+
+def _template_sync_apply_exclude(
+    candidate: dict[str, Any],
+    excluded_dims: set[str],
+    excluded_items: dict[str, set[str]],
+) -> tuple[dict[str, Any], list[str]]:
+    """Apply the opt-out exclude set to the candidate. Returns the included
+    map (dim -> entry, only dims that survive with a usable value) plus the
+    ordered list of excluded dimension names (for metadata)."""
+    included: dict[str, Any] = {}
+    excluded_order: list[str] = []
+    for dim in _TEMPLATE_SYNC_DIMENSIONS:
+        entry = candidate["dimensions"][dim]
+        if dim in excluded_dims:
+            excluded_order.append(dim)
+            continue
+        # Drop dimensions with nothing usable: unset scalars/lists and the
+        # legacy-refused permission_mode never reach the profile.
+        if entry["status"].startswith("unset") or entry["status"].startswith("refused"):
+            excluded_order.append(dim)
+            continue
+        if dim in _TEMPLATE_SYNC_LIST_DIMENSIONS:
+            drop = excluded_items.get(dim, set())
+            kept = [tok for tok in entry["value"] if tok not in drop]
+            if not kept:
+                excluded_order.append(dim)
+                continue
+            included[dim] = {**entry, "value": kept}
+        else:
+            included[dim] = entry
+    return included, excluded_order
+
+
+def _template_sync_candidate_hash(included: dict[str, Any]) -> str:
+    """Stable hash of the REDACTED candidate summary (dimension -> value).
+    Channels are declarations only, so this hash carries no secret bytes —
+    it is safe to persist in the profile metadata."""
+    parts = []
+    for dim in _TEMPLATE_SYNC_DIMENSIONS:
+        if dim not in included:
+            continue
+        val = included[dim]["value"]
+        if isinstance(val, list):
+            rendered = " ".join(val)
+        else:
+            rendered = str(val)
+        parts.append(f"{dim}={rendered}")
+    payload = "\n".join(parts)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _template_sync_render_profile(
+    source_agent: str,
+    included: dict[str, Any],
+    excluded_order: list[str],
+    updated_at: str,
+    candidate_hash: str,
+) -> str:
+    """Render the Contract-I defaults-profile block (sourceable bash +
+    machine-parseable). Only included dimensions emit a var; excluded /
+    legacy-refused dimensions are documented in the meta line + a comment."""
+    included_names = [d for d in _TEMPLATE_SYNC_DIMENSIONS if d in included]
+    lines = [
+        _TEMPLATE_SYNC_BEGIN_MARKER,
+        (
+            f"# meta: source_agent={source_agent} updated_at={updated_at} "
+            f"included={','.join(included_names) or '(none)'} "
+            f"excluded={','.join(excluded_order) or '(none)'} "
+            f"hash={candidate_hash}"
+        ),
+    ]
+    for dim in _TEMPLATE_SYNC_DIMENSIONS:
+        var = _TEMPLATE_SYNC_PROFILE_VARS[dim]
+        if dim not in included:
+            continue
+        val = included[dim]["value"]
+        if isinstance(val, list):
+            rendered = " ".join(val)
+        else:
+            rendered = str(val)
+        lines.append(f'{var}="{rendered}"')
+    if "permission_mode" in excluded_order:
+        lines.append("# permission_mode intentionally omitted (legacy refused / excluded)")
+    lines.append(_TEMPLATE_SYNC_END_MARKER)
+    return "\n".join(lines) + "\n"
+
+
+def _template_sync_read_existing_block(roster_text: str) -> str:
+    """Extract the current template-defaults block from roster text (for the
+    before/after diff). Empty string when no block exists yet."""
+    start = roster_text.find(_TEMPLATE_SYNC_BEGIN_MARKER)
+    if start == -1:
+        return ""
+    end = roster_text.find(_TEMPLATE_SYNC_END_MARKER, start)
+    if end == -1:
+        return ""
+    return roster_text[start:end + len(_TEMPLATE_SYNC_END_MARKER)] + "\n"
+
+
+def _template_sync_splice_block(roster_text: str, new_block: str) -> str:
+    """Replace an existing template-defaults block in place, or append it.
+    Idempotent shape: the markers always delimit exactly one block."""
+    start = roster_text.find(_TEMPLATE_SYNC_BEGIN_MARKER)
+    if start != -1:
+        end = roster_text.find(_TEMPLATE_SYNC_END_MARKER, start)
+        if end != -1:
+            end_full = end + len(_TEMPLATE_SYNC_END_MARKER)
+            # Swallow a single trailing newline so re-splicing does not
+            # accumulate blank lines.
+            if end_full < len(roster_text) and roster_text[end_full] == "\n":
+                end_full += 1
+            return roster_text[:start] + new_block + roster_text[end_full:]
+    base = roster_text
+    if base and not base.endswith("\n"):
+        base += "\n"
+    if base and not base.endswith("\n\n"):
+        base += "\n"
+    return base + new_block
+
+
+def _template_sync_materialize_cmd() -> list[str]:
+    """Resolve the Contract-II writer command. Defaults to Lane A's
+    `agent-bridge roster materialize-fields`; overridable via
+    BRIDGE_TEMPLATE_SYNC_MATERIALIZE_CMD so the unit smoke can stub the
+    not-yet-landed Lane A verb without an end-to-end roster mutation."""
+    override = os.environ.get("BRIDGE_TEMPLATE_SYNC_MATERIALIZE_CMD", "").strip()  # noqa: iso-helper-boundary — plain env read (os.environ matches the `.env` ratchet pattern), not an iso file access
+    if override:
+        return override.split()
+    agb = os.environ.get("BRIDGE_AGENT_BRIDGE_BIN", "").strip() or "agent-bridge"  # noqa: iso-helper-boundary — plain env read (os.environ matches the `.env` ratchet pattern), not an iso file access
+    return [agb, "roster", "materialize-fields"]
+
+
+def _template_sync_backfill_target(
+    target: str,
+    included: dict[str, Any],
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Apply the included defaults to an existing agent via Contract-II.
+    Builds the materialize-fields argv from the included dimensions (legacy
+    is already excluded upstream), invokes the writer, and reports the
+    structured result + restart-required flag. Never writes settings.json —
+    the writer is a roster-only contract."""
+    cmd = _template_sync_materialize_cmd()
+    cmd += [target]
+    for dim in _TEMPLATE_SYNC_DIMENSIONS:
+        if dim not in included:
+            continue
+        val = included[dim]["value"]
+        rendered = " ".join(val) if isinstance(val, list) else str(val)
+        cmd += [f"--{dim.replace('_', '-')}", rendered]
+    if dry_run:
+        cmd.append("--dry-run")
+    cmd.append("--json")
+    restart_required = any(
+        dim in _TEMPLATE_SYNC_RESTART_DIMENSIONS for dim in included
+    )
+    entry: dict[str, Any] = {
+        "agent": target,
+        "restart_required": restart_required,
+        "writer_cmd": cmd[0],
+    }
+    try:
+        proc = subprocess.run(  # noqa: raw-subprocess — Contract-II writer call
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        entry["status"] = "writer_missing"
+        entry["error"] = str(exc)
+        return entry
+    entry["rc"] = proc.returncode
+    entry["status"] = "ok" if proc.returncode == 0 else "error"
+    if proc.returncode != 0:
+        entry["error"] = (proc.stderr or proc.stdout or "").strip()
+    return entry
+
+
+def _template_sync_print_result(result: dict[str, Any], *, stream: Any = sys.stdout) -> None:
+    """Structured result to stdout (machine-parseable JSON). The human
+    before/after summary is written separately to stderr by the caller so
+    the stdout stream stays clean for the admin agent to parse."""
+    print(json.dumps(result, ensure_ascii=False, indent=2), file=stream)
+
+
+def cmd_template_sync(args: argparse.Namespace) -> int:
+    source_agent = args.from_agent
+    result: dict[str, Any] = {
+        "command": "template-sync",
+        "source_agent": source_agent,
+        "roster_file": args.roster_file,
+        "write_status": "pending",
+        "dry_run": bool(args.dry_run),
+    }
+    try:
+        # v1 Claude-only. A non-claude reference cannot supply these
+        # dimensions in a portable way (codex-engine launch semantics
+        # differ), so fail loud rather than synthesize a bogus candidate.
+        ref_engine = (args.ref_engine or "").strip().lower()
+        if ref_engine and ref_engine != "claude":
+            raise SetupError(
+                f"template-sync v1 supports Claude reference agents only; "
+                f"reference '{source_agent}' engine is {ref_engine!r}."
+            )
+
+        excluded_dims, excluded_items = _template_sync_parse_exclude(args.exclude)
+
+        candidate = _template_sync_build_candidate(args)
+        result["warnings"] = candidate["warnings"]
+        # Surface the full per-dimension candidate (redacted) so the
+        # operator/admin sees reference-vs-default and unset status.
+        result["candidate"] = {
+            dim: {
+                "value": candidate["dimensions"][dim]["value"],
+                "source": candidate["dimensions"][dim]["source"],
+                "status": candidate["dimensions"][dim]["status"],
+            }
+            for dim in _TEMPLATE_SYNC_DIMENSIONS
+        }
+
+        included, excluded_order = _template_sync_apply_exclude(
+            candidate, excluded_dims, excluded_items
+        )
+        result["included_dimensions"] = [
+            d for d in _TEMPLATE_SYNC_DIMENSIONS if d in included
+        ]
+        result["excluded_dimensions"] = excluded_order
+
+        # Per-channel setup-pending next-actions (declarations only).
+        channel_next_actions: list[dict[str, str]] = []
+        if "channels" in included:
+            for decl in included["channels"]["value"]:
+                hint = _template_sync_channel_setup_hint(decl)
+                channel_next_actions.append(
+                    {
+                        "channel": decl,
+                        "next_action": hint or "(no credential wizard — declaration only)",
+                        "state": "setup-pending",
+                    }
+                )
+        result["channel_next_actions"] = channel_next_actions
+
+        updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        candidate_hash = _template_sync_candidate_hash(included)
+        result["candidate_hash"] = candidate_hash
+
+        new_block = _template_sync_render_profile(
+            source_agent, included, excluded_order, updated_at, candidate_hash
+        )
+        result["profile_block"] = new_block
+
+        roster_path = Path(args.roster_file)
+        if _safe_path_check("exists", roster_path, _resolve_isolated_owner_for_path(roster_path)):
+            roster_text = roster_path.read_text(encoding="utf-8")
+        else:
+            roster_text = "#!/usr/bin/env bash\n# shellcheck shell=bash disable=SC2034\n"
+        existing_block = _template_sync_read_existing_block(roster_text)
+        result["before_block"] = existing_block
+        result["after_block"] = new_block
+
+        # Before/after human summary to STDERR (stdout stays structured).
+        _template_sync_emit_summary(result, stream=sys.stderr)
+
+        targets = [t.strip() for t in args.targets.split(",") if t.strip()]
+        result["targets"] = targets
+
+        if args.dry_run:
+            result["write_status"] = "dry_run"
+            result["backfill"] = [
+                _template_sync_backfill_target(t, included, dry_run=True)
+                for t in targets
+            ]
+            _template_sync_print_result(result)
+            return 0
+
+        new_roster_text = _template_sync_splice_block(roster_text, new_block)
+        _isolation_aware_save_text(roster_path, new_roster_text, mode=0o600)
+        result["write_status"] = "ok"
+
+        # Apply to existing --targets via Contract-II (Lane A's writer).
+        result["backfill"] = [
+            _template_sync_backfill_target(t, included, dry_run=False)
+            for t in targets
+        ]
+
+        _template_sync_print_result(result)
+        return 0
+    except SetupError as exc:
+        result["error"] = str(exc)
+        if result["write_status"] == "pending":
+            result["write_status"] = "skipped"
+        _template_sync_print_result(result, stream=sys.stderr)
+        return 1
+
+
+def _template_sync_emit_summary(result: dict[str, Any], *, stream: Any = sys.stderr) -> None:
+    """Human before/after summary to stderr."""
+    print("[setup template-sync] candidate (reference: "
+          f"{result['source_agent']})", file=stream)
+    for dim in _TEMPLATE_SYNC_DIMENSIONS:
+        entry = result["candidate"][dim]
+        val = entry["value"]
+        rendered = " ".join(val) if isinstance(val, list) else (val or "(empty)")
+        included = dim in result.get("included_dimensions", [])
+        mark = "include" if included else "exclude"
+        print(f"  [{mark}] {dim}: {rendered}  ({entry['source']} / {entry['status']})",
+              file=stream)
+    for warning in result.get("warnings", []):
+        print(f"  ! {warning}", file=stream)
+    for action in result.get("channel_next_actions", []):
+        print(f"  channel {action['channel']}: {action['state']} -> {action['next_action']}",
+              file=stream)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bridge-setup.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -3171,6 +3677,46 @@ def build_parser() -> argparse.ArgumentParser:
     mattermost_parser.add_argument("--skip-validate", action="store_true")
     mattermost_parser.add_argument("--dry-run", action="store_true")
     mattermost_parser.set_defaults(handler=cmd_mattermost)
+
+    # Issue #1427 Lane B: `setup template-sync` — seed new (and optionally
+    # existing) agents from a reference agent's roster-resident config.
+    # The bash dispatch sources the roster and passes the reference
+    # agent's RAW `BRIDGE_AGENT_*` values via `--ref-*`. Stage 2 computes
+    # the redacted candidate, diffs it against the existing defaults
+    # profile, applies the opt-out exclude set, writes the Contract-I
+    # block into agent-roster.local.sh, and (for --targets) calls Lane A's
+    # `agent-bridge roster materialize-fields` per target.
+    #
+    # `--ref-*` use `default=None` (not "") as the sentinel so the
+    # candidate compute can tell "reference did not set this dimension"
+    # (→ "unset / reference missing", never guessed) apart from an
+    # explicit empty value. The reference read is ROSTER-ONLY by
+    # contract: this command NEVER opens the reference's $HOME/.claude,
+    # plugin cache, settings, env, .mcp.json, or any channel secret file.
+    template_sync_parser = subparsers.add_parser("template-sync")
+    template_sync_parser.add_argument("--from", dest="from_agent", required=True)
+    template_sync_parser.add_argument("--roster-file", required=True)
+    template_sync_parser.add_argument("--ref-engine", default=None)
+    template_sync_parser.add_argument("--ref-model", default=None)
+    template_sync_parser.add_argument("--ref-effort", default=None)
+    template_sync_parser.add_argument("--ref-permission-mode", default=None)
+    template_sync_parser.add_argument("--ref-plugins", default=None)
+    template_sync_parser.add_argument("--ref-skills", default=None)
+    template_sync_parser.add_argument("--ref-channels", default=None)
+    # Built-in bridge defaults (new-shape launch fallback) — surfaced so
+    # the candidate can label a value "reference" vs "bridge default" and
+    # so dim 1's opus-4-7->opus-4-8 refresh shows up in the dry-run diff.
+    template_sync_parser.add_argument("--default-model", default="claude-opus-4-8")
+    template_sync_parser.add_argument("--default-effort", default="xhigh")
+    # CSV of dimension names (model,effort,permission_mode,plugins,skills,
+    # channels) and/or `dim:item` per-item exclusions (opt-out wizard auto
+    # mode). Accept-all is the default when omitted.
+    template_sync_parser.add_argument("--exclude", default="")
+    # CSV of EXISTING agents to backfill via Contract-II.
+    template_sync_parser.add_argument("--targets", default="")
+    template_sync_parser.add_argument("--yes", action="store_true")
+    template_sync_parser.add_argument("--dry-run", action="store_true")
+    template_sync_parser.set_defaults(handler=cmd_template_sync)
 
     return parser
 
