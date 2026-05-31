@@ -3568,6 +3568,25 @@ def cmd_template_sync(args: argparse.Namespace) -> int:
             _template_sync_print_result(result)
             return 0
 
+        # Gate EVERY non-dry-run roster mutation (profile write + --targets
+        # backfill) in the wizard's main path, BEFORE resolving any
+        # BRIDGE_TEMPLATE_SYNC_{PROFILE_WRITER,MATERIALIZE}_CMD override — a
+        # caller-controlled override must not be able to substitute an
+        # un-gated writer to bypass the boundary (#1432 review BLOCKING). Same
+        # operator-tui/operator-trusted-id contract the write verbs enforce as
+        # defense-in-depth; agent-direct is denied here, before any writer
+        # command is built or run.
+        caller_source = _detect_operator_caller_source()
+        if caller_source not in {"operator-tui", "operator-trusted-id"}:
+            result["write_status"] = "denied"
+            result["error"] = (
+                f"deny: caller source {caller_source} is not allowed to "
+                "mutate system config (need operator-tui or "
+                "operator-trusted-id)"
+            )
+            _template_sync_print_result(result, stream=sys.stderr)
+            return 1
+
         # The profile write goes through the gated+audited
         # `agent-bridge agent roster write-template-profile` verb — the same
         # operator-tui / operator-trusted-id system-config boundary that

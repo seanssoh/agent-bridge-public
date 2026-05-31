@@ -438,4 +438,35 @@ t11_rc=$?
 t11_status="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("write_status",""))' <"$TS_STDOUT" 2>/dev/null || echo "")"
 smoke_assert_eq "$t11_status" "backfill_error" "T11: write_status flags backfill_error"
 
-smoke_log "PASS: all template-sync wizard assertions (T1-T11)"
+# T12 — the wizard's main-path caller-source gate denies an agent-direct
+# caller EVEN WHEN it controls BRIDGE_TEMPLATE_SYNC_PROFILE_WRITER_CMD (#1432
+# review BLOCKING). A caller-controlled override pointing at an un-gated
+# writer must not bypass the boundary: the gate runs in cmd_template_sync's
+# main path BEFORE any writer command is resolved/run, so the override writer
+# below (which WOULD splice the block) never executes and the roster is
+# untouched. (Built with printf, no heredoc — footgun #11.)
+BYPASS_WRITER="$SMOKE_TMP_ROOT/bypass-writer.sh"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'rf=""; bf=""\n'
+  printf 'while [[ $# -gt 0 ]]; do case "$1" in --roster-file) rf="$2"; shift 2;; --block-file) bf="$2"; shift 2;; *) shift;; esac; done\n'
+  printf '[[ -n "$rf" && -n "$bf" ]] && cat "$bf" >>"$rf"\n'
+  printf 'exit 0\n'
+} >"$BYPASS_WRITER"
+T12_ROSTER="$SMOKE_TMP_ROOT/roster-t12.sh"
+: >"$T12_ROSTER"
+T12_OUT="$SMOKE_TMP_ROOT/t12-out.txt"
+T12_ERR="$SMOKE_TMP_ROOT/t12-err.txt"
+BRIDGE_CALLER_SOURCE="agent-direct" \
+  BRIDGE_TEMPLATE_SYNC_PROFILE_WRITER_CMD="bash $BYPASS_WRITER" \
+  python3 "$SETUP_PY" template-sync --from patch --roster-file "$T12_ROSTER" \
+    --ref-engine claude --ref-model claude-opus-4-8 --yes \
+    >"$T12_OUT" 2>"$T12_ERR"
+t12_rc=$?
+[[ "$t12_rc" -ne 0 ]] || smoke_fail "T12: agent-direct must be denied even with a writer-cmd override (got rc=0)"
+smoke_assert_contains "$(cat "$T12_OUT" "$T12_ERR")" "deny" \
+  "T12: deny surfaced for agent-direct caller despite the override"
+smoke_assert_not_contains "$(cat "$T12_ROSTER")" 'agb:template-defaults' \
+  "T12: the override writer never ran — roster left untouched"
+
+smoke_log "PASS: all template-sync wizard assertions (T1-T12)"
