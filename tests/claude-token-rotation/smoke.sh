@@ -257,6 +257,95 @@ PY
 [[ $? -eq 0 ]] || fail "apiKeyHelper did not read active token"
 pass "keychain-free sync renders apiKeyHelper and helper reads active registry token"
 
+# ---------------------------------------------------------------------------
+# #1444 BLOCKING 1 — disable/rollback must REMOVE the bridge-managed
+# apiKeyHelper so Claude falls back to its normal keychain auth. Before the
+# fix, ``ensure_claude_settings_file`` only ADDED the helper on enable and
+# never removed it on disable, so flipping the flag off left a stale managed
+# helper that exits "disabled" and breaks the intended fallback.
+# ---------------------------------------------------------------------------
+GATE_HELPER="$REPO_ROOT/scripts/python-helpers/claude-settings-gate-test.py"
+
+# (a) Sanity: the prior enable left the MANAGED helper in settings.json.
+"$PYTHON" "$GATE_HELPER" assert-apikeyhelper \
+  --settings "$CLAUDE_SETTINGS_FILE" --equals "$HELPER_SCRIPT" \
+  || fail "precondition: managed apiKeyHelper not present before disable"
+
+# (b) Disable the gate via runtime config, then sync — managed helper must go.
+"$PYTHON" "$GATE_HELPER" set-runtime-flag \
+  --config "$BRIDGE_RUNTIME_CONFIG_FILE" --key claude_keychain_free_auth --value false \
+  || fail "could not flip keychain-free flag off"
+"$REPO_ROOT/agent-bridge" auth claude-token sync --agents "$AGENT" --json >/dev/null \
+  || fail "disable sync failed"
+"$PYTHON" "$GATE_HELPER" assert-apikeyhelper \
+  --settings "$CLAUDE_SETTINGS_FILE" --absent \
+  || fail "disable sync did not remove the bridge-managed apiKeyHelper"
+
+# (c) Idempotent: a second disabled sync stays clean (no re-add, no error).
+"$REPO_ROOT/agent-bridge" auth claude-token sync --agents "$AGENT" --json >/dev/null \
+  || fail "second disabled sync failed"
+"$PYTHON" "$GATE_HELPER" assert-apikeyhelper \
+  --settings "$CLAUDE_SETTINGS_FILE" --absent \
+  || fail "second disabled sync re-introduced apiKeyHelper (not idempotent)"
+
+# (d) Re-enable + sync re-adds the managed helper (round-trips cleanly).
+"$PYTHON" "$GATE_HELPER" set-runtime-flag \
+  --config "$BRIDGE_RUNTIME_CONFIG_FILE" --key claude_keychain_free_auth --value true \
+  --also-set claude_api_key_helper_ttl_ms=60000 \
+  || fail "could not re-enable keychain-free flag"
+"$REPO_ROOT/agent-bridge" auth claude-token sync --agents "$AGENT" --json >/dev/null \
+  || fail "re-enable sync failed"
+"$PYTHON" "$GATE_HELPER" assert-apikeyhelper \
+  --settings "$CLAUDE_SETTINGS_FILE" --equals "$HELPER_SCRIPT" \
+  || fail "re-enable sync did not re-add the managed apiKeyHelper"
+pass "keychain-free disable removes the managed apiKeyHelper, idempotent, re-enable re-adds"
+
+# (e) An operator-owned (non-managed) apiKeyHelper must survive disable —
+# the disable cleanup only ever removes OUR managed path, never an operator's
+# own helper.
+OPERATOR_HELPER="$ROOT/operator-owned-api-key-helper.sh"
+: >"$OPERATOR_HELPER"
+"$PYTHON" "$GATE_HELPER" set-apikeyhelper \
+  --settings "$CLAUDE_SETTINGS_FILE" --value "$OPERATOR_HELPER" \
+  || fail "could not seed operator-owned apiKeyHelper"
+"$PYTHON" "$GATE_HELPER" set-runtime-flag \
+  --config "$BRIDGE_RUNTIME_CONFIG_FILE" --key claude_keychain_free_auth --value false \
+  || fail "could not flip keychain-free flag off for operator-preserve check"
+"$REPO_ROOT/agent-bridge" auth claude-token sync --agents "$AGENT" --json >/dev/null \
+  || fail "operator-preserve disable sync failed"
+"$PYTHON" "$GATE_HELPER" assert-apikeyhelper \
+  --settings "$CLAUDE_SETTINGS_FILE" --equals "$OPERATOR_HELPER" \
+  || fail "disable clobbered an operator-owned apiKeyHelper"
+# A second disabled sync must still preserve it (idempotent on operator value).
+"$REPO_ROOT/agent-bridge" auth claude-token sync --agents "$AGENT" --json >/dev/null \
+  || fail "operator-preserve second disabled sync failed"
+"$PYTHON" "$GATE_HELPER" assert-apikeyhelper \
+  --settings "$CLAUDE_SETTINGS_FILE" --equals "$OPERATOR_HELPER" \
+  || fail "second disabled sync clobbered the operator-owned apiKeyHelper"
+pass "disable preserves an operator-owned (non-managed) apiKeyHelper"
+
+# Restore the enabled gate state so downstream sub-tests see the same
+# keychain-free environment the prior block established. Re-enable the flag,
+# drop the operator helper override (so the managed path is what renders),
+# and run a real sync — leaving settings.json byte-identical to the
+# post-enable-sync state the cron-runner sub-test below depends on.
+"$PYTHON" "$GATE_HELPER" set-runtime-flag \
+  --config "$BRIDGE_RUNTIME_CONFIG_FILE" --key claude_keychain_free_auth --value true \
+  --also-set claude_api_key_helper_ttl_ms=60000 \
+  || fail "could not restore keychain-free flag after operator-preserve check"
+"$PYTHON" "$GATE_HELPER" assert-apikeyhelper \
+  --settings "$CLAUDE_SETTINGS_FILE" --equals "$OPERATOR_HELPER" \
+  || fail "operator helper unexpectedly changed before restore sync"
+# Remove the operator override so the gate renders the managed helper again.
+"$PYTHON" "$GATE_HELPER" set-apikeyhelper \
+  --settings "$CLAUDE_SETTINGS_FILE" --value "$HELPER_SCRIPT" \
+  || fail "could not reset apiKeyHelper to managed path before restore sync"
+"$REPO_ROOT/agent-bridge" auth claude-token sync --agents "$AGENT" --json >/dev/null \
+  || fail "restore sync failed"
+"$PYTHON" "$GATE_HELPER" assert-apikeyhelper \
+  --settings "$CLAUDE_SETTINGS_FILE" --equals "$HELPER_SCRIPT" \
+  || fail "restore sync did not re-render the managed apiKeyHelper"
+
 CRON_RUN_DIR="$ROOT/cron-runner-claude-config"
 mkdir -p "$CRON_RUN_DIR"
 cat >"$CRON_RUN_DIR/payload.txt" <<'PAYLOAD'

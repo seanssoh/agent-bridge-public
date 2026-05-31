@@ -158,6 +158,37 @@ def claude_api_key_helper_path() -> str:
     return str(path.resolve(strict=False))
 
 
+def apikeyhelper_value_is_bridge_managed(value: Any) -> bool:
+    """Return True if a settings.json ``apiKeyHelper`` value is one agent-bridge renders.
+
+    Used by the disable/rollback path: when the keychain-free gate is turned
+    off we must REMOVE the managed helper so Claude falls back to its normal
+    keychain auth — but we must NEVER clobber an operator-owned helper. We
+    only treat a value as "ours" when it resolves to the same path
+    ``claude_api_key_helper_path()`` would write, or to the in-repo default
+    helper (``scripts/claude-oat-api-key-helper.sh``). Anything else is
+    operator state we leave untouched.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        current = Path(value).expanduser()
+        if not current.is_absolute():
+            current = ROOT / current
+        current = current.resolve(strict=False)
+    except (OSError, ValueError):
+        return False
+    managed_candidates = {claude_api_key_helper_path()}
+    # The in-repo default, independent of any operator override — so a value
+    # we previously rendered with the default still matches after an operator
+    # later points ``claude_api_key_helper`` at a custom path.
+    default_helper = (ROOT / "scripts" / "claude-oat-api-key-helper.sh").resolve(
+        strict=False
+    )
+    managed_candidates.add(str(default_helper))
+    return str(current) in managed_candidates
+
+
 def claude_api_key_helper_ttl_ms() -> int:
     raw = (
         os.environ.get("BRIDGE_CLAUDE_API_KEY_HELPER_TTL_MS", "").strip()  # noqa: iso-helper-boundary - controller helper TTL
@@ -1493,6 +1524,15 @@ def ensure_claude_settings_file(
     payload.setdefault("skipDangerousModePermissionPrompt", True)
     if claude_keychain_free_auth_enabled():
         payload["apiKeyHelper"] = claude_api_key_helper_path()
+    elif apikeyhelper_value_is_bridge_managed(payload.get("apiKeyHelper")):
+        # Disable/rollback cleanup: the gate is off but a prior sync left our
+        # managed helper in settings.json. Claude would still invoke it, and
+        # the helper now exits "disabled" — breaking the intended fallback to
+        # normal keychain auth. Remove ONLY our managed value; an operator's
+        # own apiKeyHelper is preserved (apikeyhelper_value_is_bridge_managed
+        # returns False for it). Idempotent: once removed, the key is absent
+        # so this branch is a no-op on the next sync.
+        payload.pop("apiKeyHelper", None)
     # PR #799 r4 codex finding 1 — always route through write_private_file_atomic.
     # The previous "payload == before" fast path returned without atomic rewrite,
     # doing final-path os.chown on a path the agent UID can swap to a symlink
