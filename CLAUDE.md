@@ -111,6 +111,8 @@ bash ./scripts/oss-preflight.sh
 
 Acceptable: prep VERSION + CHANGELOG drafts, run codex-rescue review on a release branch, leave the PR open for operator to merge. NOT acceptable: squash-merge the release PR or push the `vX.Y.Z` tag without an explicit "go release" or equivalent from the operator.
 
+**A release is not done at the tag — sync the docs index in the same session** (operator directive 2026-05-31). After the `vX.Y.Z` tag lands, update `README.md`'s top block to the new version: the `**Current version**` line, the one-line **Headline** (name the release's marquee feature + notable fixes), and the `Recommended upgrade target` + leap-path. Then confirm any new feature's usage docs are current (`OPERATIONS.md`, `docs/developer-handover.md`, `docs/<feature>-design.md`). This is a **separate `docs/vX.Y.Z-...` PR** — the release PR itself stays VERSION + CHANGELOG only (see "Working With Codex Reviewers" point 3). Why it matters: installing agents and patch read the README headline + feature docs — *not* the CHANGELOG — to discover and correctly use new capabilities, so a stale README ships new features invisible (v0.15.1's `agb setup template-sync` had 0 README refs right after the cut until PR #1435).
+
 ## Environment Variables Worth Knowing
 
 - `BRIDGE_HOME` — override live runtime root; essential for isolated tests.
