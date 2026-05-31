@@ -34,6 +34,7 @@ bridge_tmux_send_submit_key() {
   local label="$1"
   local session="$2"
   local engine="${3:-}"
+  local requested_mode="${4:-}"
   local pane_target
   local mode
   pane_target="$(bridge_tmux_pane_target "$session")"
@@ -43,7 +44,7 @@ bridge_tmux_send_submit_key() {
     # protocols: a raw C-m can remain in edit/newline handling, while the
     # physical Enter arrives as CSI-u (ESC [ 13 u). tmux's -H path sends the
     # same bytes without going through key-name translation.
-    mode="${BRIDGE_TMUX_CLAUDE_SUBMIT_KEY_MODE:-csi-u}"
+    mode="${requested_mode:-${BRIDGE_TMUX_CLAUDE_SUBMIT_KEY_MODE:-csi-u}}"
     case "$mode" in
       legacy|c-m|C-m|enter|Enter)
         bridge_tmux_send_keys_with_timeout "$label" -t "$pane_target" C-m
@@ -773,6 +774,10 @@ bridge_tmux_claude_advance_blocker() {
     trust|summary)
       bridge_tmux_send_submit_key "tmux_send_advance_blocker_${state}" "$session" claude
       sleep 0.3
+      if [[ "$(bridge_tmux_claude_blocker_state "$session")" == "$state" ]]; then
+        bridge_tmux_send_submit_key "tmux_send_advance_blocker_${state}_legacy_retry" "$session" claude legacy
+        sleep 0.3
+      fi
       return 0
       ;;
     devchannels)
@@ -784,6 +789,10 @@ bridge_tmux_claude_advance_blocker() {
         fi
         bridge_tmux_send_submit_key tmux_send_advance_blocker_devchannels "$session" claude
         sleep 0.3
+        if [[ "$(bridge_tmux_claude_blocker_state "$session")" == "devchannels" ]]; then
+          bridge_tmux_send_submit_key tmux_send_advance_blocker_devchannels_legacy_retry "$session" claude legacy
+          sleep 0.3
+        fi
         return 0
       fi
       return 1
@@ -1145,7 +1154,11 @@ bridge_tmux_paste_and_submit() {
   sleep 0.1
   if bridge_tmux_session_has_pending_input "$session" "$engine"; then
     sleep 0.15
-    bridge_tmux_send_submit_key tmux_send_paste_submit_retry "$session" "$engine"
+    if [[ "$engine" == "claude" ]]; then
+      bridge_tmux_send_submit_key tmux_send_paste_submit_retry "$session" "$engine" legacy
+    else
+      bridge_tmux_send_submit_key tmux_send_paste_submit_retry "$session" "$engine"
+    fi
   fi
 
   # Issue #331 Track B: codex post-submit state-machine verification. The
@@ -1216,8 +1229,9 @@ bridge_tmux_type_and_submit() {
   done < "$_tmp"
 
   # Issue #146 + Claude Code 2.1.158 regression: verify after submit and retry
-  # while the composer still holds text. For Claude, bridge_tmux_send_submit_key
-  # sends CSI-u Enter by default; raw C-m can now remain in edit/newline mode.
+  # while the composer still holds text. For Claude, the first submit uses
+  # CSI-u Enter by default for 2.1.158+, while the gated retry falls back to
+  # legacy C-m so older Claude builds self-heal without version detection.
   local _submit_grace="${BRIDGE_TMUX_SUBMIT_GRACE_SECONDS:-0.15}"
   local _submit_retries="${BRIDGE_TMUX_SUBMIT_MAX_RETRIES:-5}"
   [[ "$_submit_retries" =~ ^[0-9]+$ ]] || _submit_retries=5
@@ -1227,7 +1241,11 @@ bridge_tmux_type_and_submit() {
   while (( _submit_attempt < _submit_retries )); do
     sleep "$_submit_grace"
     bridge_tmux_session_has_pending_input "$session" "$engine" || break
-    bridge_tmux_send_submit_key tmux_send_type_submit_retry "$session" "$engine"
+    if [[ "$engine" == "claude" ]]; then
+      bridge_tmux_send_submit_key tmux_send_type_submit_retry "$session" "$engine" legacy
+    else
+      bridge_tmux_send_submit_key tmux_send_type_submit_retry "$session" "$engine"
+    fi
     _submit_attempt=$(( _submit_attempt + 1 ))
   done
 }
