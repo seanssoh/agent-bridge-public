@@ -168,7 +168,7 @@ BRIDGE_AGENT_LAUNCH_CMD["codex-developer"]='codex --dangerously-bypass-approvals
 # EFFORT,PERMISSION_MODE,PLUGINS,SKILLS,CHANNELS}.
 #
 # # === agb:template-defaults v1 (managed by `setup template-sync`) ===
-# # source_agent=patch updated_at=2026-05-31T12:00:00Z included=model,effort,plugins,skills excluded=channels,permission_mode hash=<sha256-of-redacted-summary>
+# # meta: source_agent=patch updated_at=2026-05-31T12:00:00Z included=model,effort,plugins,skills excluded=channels,permission_mode hash=<sha256-of-redacted-summary>
 # BRIDGE_TEMPLATE_DEFAULT_MODEL="claude-opus-4-8"
 # BRIDGE_TEMPLATE_DEFAULT_EFFORT="xhigh"
 # BRIDGE_TEMPLATE_DEFAULT_PLUGINS="cosmax-crm,playwright"

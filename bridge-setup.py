@@ -13,6 +13,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -3321,16 +3322,106 @@ def _template_sync_splice_block(roster_text: str, new_block: str) -> str:
     return base + new_block
 
 
+def _template_sync_splice_into_roster_file(roster_path: Path, new_block: str) -> None:
+    """Read the roster file (or seed a fresh shebang header when absent),
+    splice the template-defaults block in place, and write the result via
+    the isolation-aware save path. The single splice+write implementation
+    shared by the wizard's gated `roster write-template-profile` call and
+    any direct invocation — so the idempotent block shape (T8) can never
+    drift between callers."""
+    if _safe_path_check("exists", roster_path, _resolve_isolated_owner_for_path(roster_path)):
+        roster_text = roster_path.read_text(encoding="utf-8")
+    else:
+        roster_text = "#!/usr/bin/env bash\n# shellcheck shell=bash disable=SC2034\n"
+    new_roster_text = _template_sync_splice_block(roster_text, new_block)
+    _isolation_aware_save_text(roster_path, new_roster_text, mode=0o600)
+
+
+def _detect_operator_caller_source() -> str:
+    """Resolve the caller's trust bucket — the SAME contract as the bash
+    `bridge_agent_update_caller_source` (lib/bridge-agent-update.sh) and the
+    python `bridge-config.py:detect_caller_source`. Returns one of
+    operator-tui / operator-trusted-id / agent-direct.
+
+    `BRIDGE_CALLER_SOURCE` is the documented explicit override a verified
+    channel handler (or the gated bash verb, after its own check) declares;
+    an admin session whose BRIDGE_AGENT_ID == BRIDGE_ADMIN_AGENT_ID is
+    auto-promoted (issue #1122); an interactive TTY is operator-tui;
+    everything else is agent-direct."""
+    explicit = os.environ.get("BRIDGE_CALLER_SOURCE", "").strip().lower()  # noqa: iso-helper-boundary — plain env read (trust-bucket override), not an iso file access
+    if explicit in {"operator-tui", "operator-trusted-id"}:
+        return explicit
+    if explicit:
+        return "agent-direct"
+    session_agent = os.environ.get("BRIDGE_AGENT_ID", "").strip()  # noqa: iso-helper-boundary — plain env read, not an iso file access
+    admin_agent = os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()  # noqa: iso-helper-boundary — plain env read, not an iso file access
+    if session_agent and admin_agent and session_agent == admin_agent:
+        return "operator-trusted-id"
+    try:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            return "operator-tui"
+    except (OSError, ValueError):
+        pass
+    return "agent-direct"
+
+
+def cmd_template_profile_write(args: argparse.Namespace) -> int:
+    """Splice a pre-rendered template-defaults block into the roster file.
+
+    This is the WRITE half of `setup template-sync`, deliberately split out
+    so it is reached only through the gated+audited
+    `agent-bridge agent roster write-template-profile` bash verb — which
+    captures the before/after sha + emits the system_config_mutation audit
+    row. The block text is rendered upstream by `cmd_template_sync` and
+    handed over via --block-file; this command performs no candidate logic
+    and never inspects a reference agent.
+
+    Defense-in-depth: this command independently enforces the SAME
+    operator-tui / operator-trusted-id caller-source gate the bash verb
+    applies (via the canonical BRIDGE_CALLER_SOURCE / admin-session / TTY
+    contract — NOT a forgeable bespoke sentinel), so a direct
+    `python3 bridge-setup.py template-profile-write ...` invocation by an
+    agent-direct caller is denied and CANNOT mutate the roster un-gated."""
+    caller_source = _detect_operator_caller_source()
+    if caller_source not in {"operator-tui", "operator-trusted-id"}:
+        print(
+            f"deny: caller source {caller_source} is not allowed to mutate "
+            "system config (need operator-tui or operator-trusted-id). "
+            "Invoke `agent-bridge agent roster write-template-profile`.",
+            file=sys.stderr,
+        )
+        return 1
+    roster_path = Path(args.roster_file)
+    block_text = Path(args.block_file).read_text(encoding="utf-8")
+    _template_sync_splice_into_roster_file(roster_path, block_text)
+    return 0
+
+
+def _template_sync_profile_writer_cmd() -> list[str]:
+    """Resolve the gated profile-write verb. Defaults to the canonical
+    `agent-bridge agent roster write-template-profile` (the same `agent
+    roster` sub-dispatch that hosts materialize-fields); overridable via
+    BRIDGE_TEMPLATE_SYNC_PROFILE_WRITER_CMD for tests that need to point at
+    an absolute bridge-agent.sh path."""
+    override = os.environ.get("BRIDGE_TEMPLATE_SYNC_PROFILE_WRITER_CMD", "").strip()  # noqa: iso-helper-boundary — plain env read (os.environ matches the `.env` ratchet pattern), not an iso file access
+    if override:
+        return override.split()
+    agb = os.environ.get("BRIDGE_AGENT_BRIDGE_BIN", "").strip() or "agent-bridge"  # noqa: iso-helper-boundary — plain env read (os.environ matches the `.env` ratchet pattern), not an iso file access
+    return [agb, "agent", "roster", "write-template-profile"]
+
+
 def _template_sync_materialize_cmd() -> list[str]:
     """Resolve the Contract-II writer command. Defaults to Lane A's
-    `agent-bridge roster materialize-fields`; overridable via
+    canonical `agent-bridge agent roster materialize-fields` verb (the
+    `roster` sub-dispatch lives under the `agent` subcommand — there is no
+    top-level `agent-bridge roster`); overridable via
     BRIDGE_TEMPLATE_SYNC_MATERIALIZE_CMD so the unit smoke can stub the
-    not-yet-landed Lane A verb without an end-to-end roster mutation."""
+    writer without an end-to-end roster mutation."""
     override = os.environ.get("BRIDGE_TEMPLATE_SYNC_MATERIALIZE_CMD", "").strip()  # noqa: iso-helper-boundary — plain env read (os.environ matches the `.env` ratchet pattern), not an iso file access
     if override:
         return override.split()
     agb = os.environ.get("BRIDGE_AGENT_BRIDGE_BIN", "").strip() or "agent-bridge"  # noqa: iso-helper-boundary — plain env read (os.environ matches the `.env` ratchet pattern), not an iso file access
-    return [agb, "roster", "materialize-fields"]
+    return [agb, "agent", "roster", "materialize-fields"]
 
 
 def _template_sync_backfill_target(
@@ -3477,8 +3568,44 @@ def cmd_template_sync(args: argparse.Namespace) -> int:
             _template_sync_print_result(result)
             return 0
 
-        new_roster_text = _template_sync_splice_block(roster_text, new_block)
-        _isolation_aware_save_text(roster_path, new_roster_text, mode=0o600)
+        # The profile write goes through the gated+audited
+        # `agent-bridge agent roster write-template-profile` verb — the same
+        # operator-tui / operator-trusted-id system-config boundary that
+        # `agent create` enforces, plus a system-config audit row. The
+        # profile drives every future `agent create`, so it must NOT be a
+        # weaker write path than the per-agent materialize writer.
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", suffix=".block", delete=False
+        ) as block_fh:
+            block_fh.write(new_block)
+            block_path = block_fh.name
+        try:
+            writer_cmd = _template_sync_profile_writer_cmd()
+            writer_cmd += [
+                "--source-agent", source_agent,
+                "--roster-file", str(roster_path),
+                "--block-file", block_path,
+            ]
+            proc = subprocess.run(  # noqa: raw-subprocess — gated profile-write verb call
+                writer_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        finally:
+            try:
+                os.unlink(block_path)  # noqa: raw-pathlib-controller-only — controller-owned tempfile in TMPDIR, never an isolated tree
+            except OSError:
+                pass
+        if proc.returncode != 0:
+            result["write_status"] = "profile_write_error"
+            result["error"] = (
+                "profile write verb failed (rc="
+                f"{proc.returncode}): "
+                + ((proc.stderr or proc.stdout or "").strip() or "(no output)")
+            )
+            _template_sync_print_result(result, stream=sys.stderr)
+            return 1
         result["write_status"] = "ok"
 
         # Apply to existing --targets via Contract-II (Lane A's writer).
@@ -3486,6 +3613,24 @@ def cmd_template_sync(args: argparse.Namespace) -> int:
             _template_sync_backfill_target(t, included, dry_run=False)
             for t in targets
         ]
+
+        # A backfill writer failure (non-zero rc, writer missing) must NOT
+        # be swallowed: the profile block landed, but one or more selected
+        # existing agents were NOT materialized. Surface it as a non-zero
+        # exit so an operator/admin sees the partial failure instead of
+        # trusting a rc=0 that contradicts the per-target JSON.
+        failed = [
+            entry for entry in result["backfill"]
+            if entry.get("status") != "ok"
+        ]
+        if failed:
+            result["write_status"] = "backfill_error"
+            result["error"] = (
+                "backfill writer failed for: "
+                + ", ".join(str(entry.get("agent", "?")) for entry in failed)
+            )
+            _template_sync_print_result(result)
+            return 1
 
         _template_sync_print_result(result)
         return 0
@@ -3685,7 +3830,7 @@ def build_parser() -> argparse.ArgumentParser:
     # the redacted candidate, diffs it against the existing defaults
     # profile, applies the opt-out exclude set, writes the Contract-I
     # block into agent-roster.local.sh, and (for --targets) calls Lane A's
-    # `agent-bridge roster materialize-fields` per target.
+    # `agent-bridge agent roster materialize-fields` per target.
     #
     # `--ref-*` use `default=None` (not "") as the sentinel so the
     # candidate compute can tell "reference did not set this dimension"
@@ -3717,6 +3862,13 @@ def build_parser() -> argparse.ArgumentParser:
     template_sync_parser.add_argument("--yes", action="store_true")
     template_sync_parser.add_argument("--dry-run", action="store_true")
     template_sync_parser.set_defaults(handler=cmd_template_sync)
+
+    # Internal write half of template-sync, reached only via the gated
+    # `agent-bridge agent roster write-template-profile` bash verb.
+    template_profile_write_parser = subparsers.add_parser("template-profile-write")
+    template_profile_write_parser.add_argument("--roster-file", required=True)
+    template_profile_write_parser.add_argument("--block-file", required=True)
+    template_profile_write_parser.set_defaults(handler=cmd_template_profile_write)
 
     return parser
 

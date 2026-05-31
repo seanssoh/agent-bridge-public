@@ -11,7 +11,7 @@ On a fresh bridge install, newly-created non-admin agents come up like a brand-n
 Three disjoint config planes. **model/effort/permission_mode are ROSTER-driven launch flags, never persisted to `settings.json`** (`bridge_build_static_launch_cmd`, lib/bridge-state.sh:53-75). Writing model into settings.json is a no-op — launch flags from argv win.
 
 - **Plane A — Roster** (`agent-roster.local.sh`, git-ignored; accessors lib/bridge-agents.sh:8948-9083): model, effort, permission_mode, skills, plugins, channels. Read at **startup** (no live reload → restart to apply).
-- **Plane B — Launch cmd** (derived from A at launch). Empty roster fields → `bridge_agent_uses_legacy_launch_flags` true → legacy shape `claude --dangerously-skip-permissions --name <a>` with **no `--model`** → Claude's own Sonnet default. Otherwise → `claude --model <m> --effort <e> --permission-mode <pm>` with inline defaults model=`claude-opus-4-7`, effort=xhigh, pm=auto (bridge-state.sh:68-70).
+- **Plane B — Launch cmd** (derived from A at launch). Empty roster fields → `bridge_agent_uses_legacy_launch_flags` true → legacy shape `claude --dangerously-skip-permissions --name <a>` with **no `--model`** → Claude's own Sonnet default. Otherwise → `claude --model <m> --effort <e> --permission-mode <pm>` with inline defaults model=`claude-opus-4-8`, effort=xhigh, pm=auto (bridge-state.sh:68-70).
 - **Plane C — `.claude/settings.json`** + managed render (bridge-hooks.py:209): autoCompact/prompt-flags/hooks only — **NO model/plugins/skills/MCP**. Out of scope for sync.
 
 **Sync target = the ROSTER (explicit per-agent fields), never settings.json or a template file.**
@@ -53,7 +53,7 @@ Three disjoint config planes. **model/effort/permission_mode are ROSTER-driven l
 **(I) Defaults-profile format** in `agent-roster.local.sh` — a delimited, controller-owned block, e.g.:
 ```
 # === agb:template-defaults v1 (managed by `setup template-sync`) ===
-# source_agent=patch updated_at=<iso> included=model,effort,plugins,skills excluded=channels,permission_mode
+# meta: source_agent=patch updated_at=<iso> included=model,effort,plugins,skills excluded=channels,permission_mode hash=<sha256-of-redacted-summary>
 BRIDGE_TEMPLATE_DEFAULT_MODEL="claude-opus-4-8"
 BRIDGE_TEMPLATE_DEFAULT_EFFORT="xhigh"
 BRIDGE_TEMPLATE_DEFAULT_PLUGINS="cosmax-crm,playwright"
@@ -63,7 +63,7 @@ BRIDGE_TEMPLATE_DEFAULT_SKILLS="..."
 ```
 (Final var names/format are Lane A+B+C's shared contract — Lane A reads it in `agent create`, Lane B writes it from the wizard, Lane C documents it in the example file. Whoever lands first pins it; the others match. Keep it sourceable bash + machine-parseable.)
 
-**(II) Roster materialize interface** — Lane A exposes a callable, audited, multi-field-atomic writer (a new internal verb e.g. `agent-bridge roster materialize-fields <agent> --model .. --effort .. --permission-mode .. --plugins <csv> --skills <csv> --channels <csv> [--dry-run] [--json]`, or an equivalently-contracted function) that Lane B's wizard invokes to apply. It: writes ONLY roster fields, never settings.json; refuses `legacy`; emits a structured diff + audit; is idempotent (no-change = no-op). Lane B codes against this interface and stubs it in its own unit smoke; end-to-end apply is verified at integration.
+**(II) Roster materialize interface** — Lane A exposes a callable, audited, multi-field-atomic writer (the canonical verb `agent-bridge agent roster materialize-fields <agent> --model .. --effort .. --permission-mode .. --plugins <csv> --skills <csv> --channels <csv> [--dry-run] [--json]` — the `roster` sub-dispatch lives under the `agent` subcommand of `bridge-agent.sh`; there is no top-level `agent-bridge roster`) that Lane B's wizard invokes to apply. It: writes ONLY roster fields, never settings.json; refuses `legacy`; emits a structured diff + audit; is idempotent (no-change = no-op). Lane B codes against this interface and stubs it in its own unit smoke; end-to-end apply is verified at integration.
 
 ## Tests (8 required smokes — orchestrator registers in ci-select via integration commit)
 1. Dry-run from a fixture roster writes nothing + deterministic candidate/diff.

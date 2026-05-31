@@ -7170,18 +7170,131 @@ else:
 ' "$dry_run"
 }
 
+# run_roster_write_template_profile — template-sync (#1427) gated+audited
+# writer for the controller-owned `agb:template-defaults` block in
+# agent-roster.local.sh. The Lane B `setup template-sync` wizard renders
+# the block in python, then routes the actual file mutation through THIS
+# verb so the profile write crosses the SAME system-config boundary as
+# `agent create` (operator-tui / operator-trusted-id) and lands a
+# system-config audit row. The defaults profile drives every future
+# `agent create`, so it must never be a weaker write path than the
+# per-agent materialize writer. The splice itself is delegated to
+# `bridge-setup.py template-profile-write` (the single idempotent splice
+# implementation) so the block shape cannot drift between callers.
+# `--dry-run` gates but writes nothing and emits no audit.
+run_roster_write_template_profile() {
+  local source_agent=""
+  local roster_file=""
+  local block_file=""
+  local dry_run=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --source-agent)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        source_agent="$2"
+        shift 2
+        ;;
+      --roster-file)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        roster_file="$2"
+        shift 2
+        ;;
+      --block-file)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        block_file="$2"
+        shift 2
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *)
+        bridge_die "지원하지 않는 roster write-template-profile 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$roster_file" ]] || bridge_die "Usage: $(basename "$0") roster write-template-profile --source-agent <a> --roster-file <path> --block-file <path> [--dry-run]"
+  [[ -n "$block_file" ]] || bridge_die "roster write-template-profile: --block-file is required"
+  [[ -f "$block_file" ]] || bridge_die "roster write-template-profile: block file not found: $block_file"
+
+  # Same system-config mutation boundary as `agent create` and the
+  # materialize-fields writer above. Applies to --dry-run too so an
+  # agent-direct caller cannot even probe the write path.
+  local caller_source
+  caller_source="$(bridge_agent_update_caller_source)"
+  if [[ "$caller_source" != "operator-tui" && "$caller_source" != "operator-trusted-id" ]]; then
+    bridge_die "deny: caller source $caller_source is not allowed to mutate system config (need operator-tui or operator-trusted-id)"
+  fi
+
+  if [[ $dry_run -eq 1 ]]; then
+    return 0
+  fi
+
+  local before_sha
+  before_sha="$(bridge_agent_update_file_sha256 "$roster_file")"
+
+  # The python splice half (`bridge-setup.py template-profile-write`)
+  # independently re-enforces the SAME caller-source gate via the canonical
+  # BRIDGE_CALLER_SOURCE contract. Propagate the source THIS verb already
+  # verified so the child does not have to re-derive it across the piped
+  # stdio of the wizard->verb->python chain (the TTY signal is lost once the
+  # wizard captures the verb's stdout). This is the documented
+  # "verified caller declares its source" mechanism, not a bespoke sentinel
+  # — a direct agent-direct python call (no operator source) is still denied.
+  bridge_require_python
+  BRIDGE_CALLER_SOURCE="$caller_source" \
+    python3 "$SCRIPT_DIR/bridge-setup.py" template-profile-write \
+    --roster-file "$roster_file" --block-file "$block_file" \
+    || bridge_die "roster write-template-profile: splice/write failed for $roster_file"
+
+  local after_sha
+  after_sha="$(bridge_agent_update_file_sha256 "$roster_file")"
+
+  if [[ "$before_sha" != "$after_sha" ]]; then
+    bridge_roster_cache_invalidate
+    bridge_load_roster
+    local caller_actor="$caller_source"
+    [[ "$caller_actor" == "operator-tui" ]] && caller_actor="operator"
+    bridge_agent_update_emit_audit \
+      "roster-write-template-profile" \
+      "$caller_actor" \
+      "$caller_source" \
+      "${source_agent:-(template-defaults)}" \
+      "$roster_file" \
+      "$before_sha" \
+      "$after_sha" \
+      "template_defaults_profile source_agent=${source_agent:-unknown}" \
+      "" \
+      "" \
+      "" \
+      "" \
+      "" \
+      "[]"
+  fi
+}
+
 # run_roster — template-sync (#1427) roster sub-dispatch. Hosts the
-# Contract-II materialize-fields writer. Reached via
-# `agent-bridge agent roster <action>` (the `agent` verb execs this
-# script with the roster subcommand). Exposed as a distinct verb so the
-# Lane B wizard and the create-side profile consumption share one audited
-# write path rather than duplicating roster-line surgery.
+# Contract-II materialize-fields writer and the gated template-defaults
+# profile writer. Reached via `agent-bridge agent roster <action>` (the
+# `agent` verb execs this script with the roster subcommand). Exposed as a
+# distinct verb so the Lane B wizard and the create-side profile
+# consumption share one audited write path rather than duplicating
+# roster-line surgery.
 run_roster() {
   local action="${1:-}"
   shift || true
   case "$action" in
     materialize-fields)
       run_roster_materialize_fields "$@"
+      ;;
+    write-template-profile)
+      run_roster_write_template_profile "$@"
       ;;
     ""|-h|--help|help)
       usage

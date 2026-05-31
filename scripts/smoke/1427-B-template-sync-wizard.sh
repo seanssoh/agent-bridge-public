@@ -12,10 +12,13 @@
 # template-sync`) directly for the candidate/diff/redaction/profile-write
 # assertions, the Stage-1 bash required-fields validator
 # (`bridge_setup_wizard_validate_auto template-sync`) for the auto-mode
-# fail-loud contract, and STUBS Lane A's Contract-II writer
-# (`agent-bridge roster materialize-fields`) for the --targets backfill
-# call (the end-to-end apply is verified at integration; Lane A may not
-# have landed yet).
+# fail-loud contract. T1-T8 STUB the Contract-II materialize writer for the
+# --targets backfill call (unit-level), but the profile write is routed
+# through the REAL gated `roster write-template-profile` verb. T9-T11 then
+# drive a fully NON-STUBBED end-to-end pass against the live smoke roster:
+# the real Contract-II materialize verb mutates a real target's fields, the
+# gate denies a non-operator caller, and a backfill writer failure
+# propagates to a non-zero wizard exit.
 #
 # Tests:
 #   T1 (dry-run):  --dry-run from a fixture roster writes NOTHING and emits
@@ -41,6 +44,16 @@
 #                  backfill result reports restart_required.
 #   T8 (idempotent): re-running splices the block in place (exactly one
 #                  block) rather than appending a duplicate.
+#   T9 (e2e write):  the REAL Contract-II materialize verb backfills a real
+#                  target agent — explicit model/effort land in its roster
+#                  block; the gated profile block also lands in the live
+#                  roster.
+#   T10 (gate):    the gated `roster write-template-profile` verb DENIES a
+#                  non-operator (agent-direct) caller and leaves the roster
+#                  untouched.
+#   T11 (fail):    a backfill writer failure (unknown target agent) makes
+#                  `setup template-sync` exit non-zero (write_status=
+#                  backfill_error) instead of swallowing the failure.
 #
 # Footgun #11: no `<<EOF` / `<<'PY'` to subprocess; python is driven via
 # `python3 -c '<script>' <argv>` or by reading roster files written with
@@ -88,8 +101,9 @@ smoke_assert_file_exists "$WIZARD_LIB" "lib/bridge-setup-wizard.sh present"
 SECRET_CANARY="SK-DEADBEEFc0ffee0123456789abcdefSECRET"
 
 # Stub for Lane A's Contract-II writer. Records its argv to a file and
-# emits a JSON ack so the python backfill path can be exercised before the
-# real `agent-bridge roster materialize-fields` verb lands.
+# emits a JSON ack so the python backfill path can be exercised at the unit
+# level without the real `agent-bridge agent roster materialize-fields` verb
+# (the real verb is exercised non-stubbed in the T9-T11 e2e cases below).
 MATERIALIZE_LOG="$SMOKE_TMP_ROOT/materialize-calls.log"
 MATERIALIZE_STUB="$SMOKE_TMP_ROOT/materialize-stub.sh"
 {
@@ -101,11 +115,22 @@ MATERIALIZE_STUB="$SMOKE_TMP_ROOT/materialize-stub.sh"
 chmod +x "$MATERIALIZE_STUB"
 
 # Helper: run the python wizard. Splits stdout/stderr so redaction
-# assertions can check both streams independently.
+# assertions can check both streams independently. The non-dry-run profile
+# write is routed through the REAL gated `roster write-template-profile`
+# verb (BRIDGE_TEMPLATE_SYNC_PROFILE_WRITER_CMD points at bridge-agent.sh)
+# with an operator-trusted caller source so the gate admits the write —
+# this exercises the gated+audited path end-to-end rather than a stub.
 TS_STDOUT="$SMOKE_TMP_ROOT/ts.out"
 TS_STDERR="$SMOKE_TMP_ROOT/ts.err"
+# bridge-agent.sh dispatches `roster` as its own $1 (the `agent` prefix is
+# added only by the top-level `agent-bridge` wrapper, which execs
+# `bridge-agent.sh roster …`). Calling the dispatcher directly skips that
+# prefix.
+PROFILE_WRITER_CMD="bash $SMOKE_REPO_ROOT/bridge-agent.sh roster write-template-profile"
 run_ts() {
-  python3 "$SETUP_PY" template-sync "$@" >"$TS_STDOUT" 2>"$TS_STDERR"
+  BRIDGE_CALLER_SOURCE="operator-tui" \
+  BRIDGE_TEMPLATE_SYNC_PROFILE_WRITER_CMD="$PROFILE_WRITER_CMD" \
+    python3 "$SETUP_PY" template-sync "$@" >"$TS_STDOUT" 2>"$TS_STDERR"
 }
 
 # ---------------------------------------------------------------------------
@@ -317,4 +342,100 @@ smoke_assert_eq "$end_count" "1" "T8: exactly one end marker after re-run"
 smoke_assert_contains "$(cat "$ROSTER_T8")" 'BRIDGE_TEMPLATE_DEFAULT_MODEL="claude-opus-4-8"' \
   "T8: re-run updated the model value in place"
 
-smoke_log "PASS: all template-sync wizard assertions (T1-T8)"
+# ---------------------------------------------------------------------------
+# T9-T11 — NON-STUBBED end-to-end: the wizard drives the REAL gated profile
+# writer AND the REAL Contract-II materialize verb against the live smoke
+# roster. T7 stubs the writer; these cases prove the wired-up path actually
+# mutates a target's roster fields, that the gate denies a non-operator
+# caller, and that a backfill writer failure propagates to a non-zero exit.
+# ---------------------------------------------------------------------------
+# CI runners ship no engine npm package; `agent create --engine claude`
+# runs a `command -v claude` pre-flight (#1317-C) that hard-dies otherwise.
+# Seed executable engine stubs + prepend to PATH (the 1427-A pattern).
+E2E_STUB_BIN="$SMOKE_TMP_ROOT/e2e-stub-bin"
+mkdir -p "$E2E_STUB_BIN"
+for _eng in claude codex; do
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$E2E_STUB_BIN/$_eng"
+  chmod +x "$E2E_STUB_BIN/$_eng"
+done
+export PATH="$E2E_STUB_BIN:$PATH"
+
+# Extract a single managed-role field value from the live smoke roster.
+e2e_roster_field() {
+  local agent="$1" var="$2"
+  python3 -c '
+import re, shlex, sys
+path, agent, var = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(path, encoding="utf-8").read()
+m = re.search(rf"^# BEGIN AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n(.*?)^# END AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n", text, re.M | re.S)
+body = m.group(1) if m else ""
+fm = re.search(rf"^{re.escape(var)}\[\"{re.escape(agent)}\"\]=(.*)$", body, re.M)
+if not fm:
+    print("")
+else:
+    try:
+        parts = shlex.split(fm.group(1))
+        print(parts[0] if parts else "")
+    except ValueError:
+        print(fm.group(1))
+' "$BRIDGE_ROSTER_LOCAL_FILE" "$agent" "$var"
+}
+
+# Reset the live smoke roster + create a real target agent to backfill.
+: >"$BRIDGE_ROSTER_LOCAL_FILE"
+BRIDGE_CALLER_SOURCE="operator-tui" \
+  bash "$SMOKE_REPO_ROOT/bridge-agent.sh" create e2etgt --engine claude >/dev/null 2>&1
+
+# Real materialize + real profile writer, both operator-gated, against the
+# LIVE roster (not a per-test temp file) so we exercise the wired path.
+REAL_MATERIALIZE_CMD="bash $SMOKE_REPO_ROOT/bridge-agent.sh roster materialize-fields"
+run_ts_e2e() {
+  BRIDGE_CALLER_SOURCE="operator-tui" \
+  BRIDGE_TEMPLATE_SYNC_PROFILE_WRITER_CMD="$PROFILE_WRITER_CMD" \
+  BRIDGE_TEMPLATE_SYNC_MATERIALIZE_CMD="$REAL_MATERIALIZE_CMD" \
+    python3 "$SETUP_PY" template-sync "$@" >"$TS_STDOUT" 2>"$TS_STDERR"
+}
+
+# T9 — real backfill writes the target's explicit roster fields.
+run_ts_e2e --from patch --roster-file "$BRIDGE_ROSTER_LOCAL_FILE" --ref-engine claude \
+  --ref-model claude-opus-4-8 --ref-effort xhigh \
+  --targets e2etgt --yes
+e2e_rc=$?
+smoke_assert_eq "$e2e_rc" "0" "T9: real materialize backfill exits 0"
+smoke_assert_eq "$(e2e_roster_field e2etgt BRIDGE_AGENT_MODEL)" "claude-opus-4-8" \
+  "T9: real backfill wrote explicit model into the target's roster block"
+smoke_assert_eq "$(e2e_roster_field e2etgt BRIDGE_AGENT_EFFORT)" "xhigh" \
+  "T9: real backfill wrote explicit effort into the target's roster block"
+# The controller-owned defaults profile also landed in the live roster.
+smoke_assert_contains "$(cat "$BRIDGE_ROSTER_LOCAL_FILE")" 'agb:template-defaults v1' \
+  "T9: defaults profile block landed in the live roster via the gated verb"
+
+# T10 — the gated profile-write verb DENIES a non-operator caller.
+DENY_BLOCK="$SMOKE_TMP_ROOT/deny-block.txt"
+printf '# === agb:template-defaults v1 (managed by `setup template-sync`) ===\n# meta: source_agent=patch\n# === end agb:template-defaults ===\n' >"$DENY_BLOCK"
+DENY_ROSTER="$SMOKE_TMP_ROOT/deny-roster.sh"
+: >"$DENY_ROSTER"
+deny_out="$(BRIDGE_CALLER_SOURCE="agent-direct" \
+  bash "$SMOKE_REPO_ROOT/bridge-agent.sh" roster write-template-profile \
+  --source-agent patch --roster-file "$DENY_ROSTER" --block-file "$DENY_BLOCK" 2>&1)"
+deny_rc=$?
+[[ "$deny_rc" -ne 0 ]] || smoke_fail "T10: non-operator caller must be denied (got rc=0)"
+smoke_assert_contains "$deny_out" "deny" "T10: deny message surfaced for agent-direct caller"
+# The denied write left the roster untouched (no profile block written).
+smoke_assert_not_contains "$(cat "$DENY_ROSTER")" 'agb:template-defaults' \
+  "T10: denied write left the roster untouched"
+
+# T11 — a backfill writer failure propagates to a non-zero wizard exit.
+# `nope-not-an-agent` is not in the roster → the materialize verb's
+# bridge_require_agent rejects it non-zero → the wizard must exit non-zero.
+ROSTER_T11="$SMOKE_TMP_ROOT/roster-t11.sh"
+: >"$ROSTER_T11"
+run_ts_e2e --from patch --roster-file "$ROSTER_T11" --ref-engine claude \
+  --ref-model claude-opus-4-8 \
+  --targets nope-not-an-agent --yes
+t11_rc=$?
+[[ "$t11_rc" -ne 0 ]] || smoke_fail "T11: backfill writer failure must yield non-zero exit (got rc=0)"
+t11_status="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("write_status",""))' <"$TS_STDOUT" 2>/dev/null || echo "")"
+smoke_assert_eq "$t11_status" "backfill_error" "T11: write_status flags backfill_error"
+
+smoke_log "PASS: all template-sync wizard assertions (T1-T11)"
