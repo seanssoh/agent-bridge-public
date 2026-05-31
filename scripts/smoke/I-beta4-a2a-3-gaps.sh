@@ -385,12 +385,35 @@ fi
 if ! grep -F 'a2a_outbox_stuck_alert_emitted' "$DAEMON_SH" >/dev/null; then
   T6_FAILS+="audit row a2a_outbox_stuck_alert_emitted missing; "
 fi
-# T6e — admin task creation via target_bridge task create.
-if ! grep -F '"$target_bridge" task create' "$DAEMON_SH" >/dev/null; then
-  T6_FAILS+="stuck scan does not create admin task via target_bridge; "
+# T6e — admin alert filed via `bridge_queue_cli upsert-open`, SCOPED to the
+# stuck-scan function body. Issue #1408 migrated the stuck-scan filing path
+# from `"$target_bridge" task create` (always-insert) to the atomic
+# `bridge_queue_cli upsert-open` (refresh-or-create one open task per stuck
+# message_id). A whole-file grep would be VACUOUS — 5 UNRELATED daemon
+# functions (daily-backup, release alerts, etc.) still legitimately call
+# `"$target_bridge" task create`, so it would pass even if the stuck-scan
+# filing broke. Extract just the function body (same awk boundary the driver
+# uses: from the `() {` line to the first column-0 `}`) and assert against
+# THAT, so the check actually tracks the stuck-scan path.
+T6E_FN_BODY="$(awk '/^process_a2a_outbox_stuck_scan_tick\(\) \{/,/^\}$/' "$DAEMON_SH")"
+# Sanity: the extraction must be non-vacuous (non-empty, bounded to the
+# function — not the whole file). The closing `}` and the function's unique
+# scan-label string prove we captured the body, not a runaway range.
+if [[ -z "$T6E_FN_BODY" ]] \
+   || ! printf '%s' "$T6E_FN_BODY" | grep -q '^process_a2a_outbox_stuck_scan_tick() {' \
+   || ! printf '%s' "$T6E_FN_BODY" | grep -Fq '[a2a_stuck_scan]'; then
+  T6_FAILS+="could not extract process_a2a_outbox_stuck_scan_tick() body for scoped T6e; "
+elif ! printf '%s' "$T6E_FN_BODY" | grep -Fq 'bridge_queue_cli upsert-open'; then
+  T6_FAILS+="stuck scan does not file admin alert via 'bridge_queue_cli upsert-open' (#1408); "
+elif printf '%s' "$T6E_FN_BODY" | grep -Eq '"\$target_bridge"[[:space:]]+task[[:space:]]+create'; then
+  # Pin the migration: the OLD always-insert `"$target_bridge" task create`
+  # CALL must be gone from the stuck-scan body (it now refreshes-or-creates
+  # via upsert-open). Match the call form specifically — a bare `task create`
+  # substring would false-match the descriptive comments still in the body.
+  T6_FAILS+="stuck scan still contains a '\"\$target_bridge\" task create' filing call; #1408 migration not pinned; "
 fi
 # T6f — v0.15.0-beta4 Lane I r2 (codex r1 BLOCKING) wiring: daemon
-# follows up with a2a-stuck-ack helper after the task-create loop,
+# follows up with a2a-stuck-ack helper after the upsert-open filing loop,
 # and that helper is registered in bridge-daemon-helpers.py.
 if ! grep -F 'a2a-stuck-ack' "$DAEMON_SH" >/dev/null; then
   T6_FAILS+="daemon does not call a2a-stuck-ack helper; "
@@ -412,18 +435,19 @@ smoke_log "T6 PASS — cooldown expiry re-emits, ledger prunes dropped rows, dec
 # T_stuck_task_create_failure_preserves_ledger — v0.15.0-beta4 Lane I
 # r2 (codex r1 BLOCKING).
 #
-# Contract: if `$target_bridge task create` fails (transient), the
-# daemon shell must NOT advance the reemit cooldown for that row.
+# Contract: if the alert-filing step fails (transient) — `bridge_queue_cli
+# upsert-open` since Issue #1408, previously `$target_bridge task create` —
+# the daemon shell must NOT advance the reemit cooldown for that row.
 # Otherwise the operator silently loses the alert until cooldown
 # lapses. The split is enforced by:
 #   - cmd_a2a_stuck_decide: pure read, no ledger writes
 #   - daemon shell loop: append message_id to ack-keys only on
-#     task-create success (skip on failure)
+#     upsert-open success (skip on failure)
 #   - cmd_a2a_stuck_ack: stamp ledger only for keys in ack-keys file
 #
 # We exercise the failure path by:
 #   - calling decide (no ledger write)
-#   - simulating task-create failure: do NOT add message_id to ack
+#   - simulating an alert-filing failure: do NOT add message_id to ack
 #     keys
 #   - calling ack with empty (or no-msg) ack-keys
 #   - asserting ledger does not contain msg-stuck-001
@@ -493,39 +517,39 @@ smoke_log "T_stuck_task_create_failure_preserves_ledger PASS — failed task-cre
 # Mocks:
 #   - `bridge-a2a.py outbox list --json` → fixture file (driver overrides
 #     `bridge_with_timeout` for label `a2a_outbox_list`).
-#   - `$BRIDGE_HOME/agent-bridge task create` → wrapper shim whose rc
-#     reads from `BRIDGE_A2A_TEST_TASK_CREATE_RC` (0/1) per tick. Daemon
-#     prefers `$BRIDGE_HOME/agent-bridge` over `$SCRIPT_DIR/agent-bridge`
-#     (bridge-daemon.sh:2342-2349), so the shim wins.
+#   - `bridge_queue_cli upsert-open` → driver stub whose rc reads from
+#     `BRIDGE_A2A_TEST_TASK_CREATE_RC` (0/1) per tick. Issue #1408 replaced
+#     the prior `$BRIDGE_HOME/agent-bridge task create` filing path with the
+#     atomic `bridge-queue.py upsert-open` subcommand (refresh-or-create one
+#     open task per stuck message_id), so the mock moved from the
+#     agent-bridge shim to the driver's bridge_queue_cli stub.
 #
-# Acceptance (r3 codex r2 TEST GAP closure):
-#   1. tick #1 with task_create rc=1:
+# Acceptance (r3 codex r2 TEST GAP closure; Issue #1408 path update):
+#   1. tick #1 with alert-filing rc=1:
 #        - decide emits the stuck row
-#        - daemon's task-create branch fails
-#        - daemon_warn at bridge-daemon.sh:2468 fires
-#          ("task-create failed for stuck …")
-#        - ack helper runs with EMPTY ack-keys (production line 2456
-#          appends ONLY inside the success branch) → ledger remains
+#        - daemon's `bridge_queue_cli upsert-open` branch fails
+#        - daemon_warn fires ("upsert-open failed for stuck …")
+#        - ack helper runs with EMPTY ack-keys (production appends to
+#          ack_tmp ONLY inside the upsert success branch) → ledger remains
 #          unstamped for the stuck message_id
 #        - throttle: next scan must NOT be skipped (we manually clear
 #          tick_state between runs to keep the test deterministic)
-#   2. tick #2 with task_create rc=0 (mock toggled, throttle state
+#   2. tick #2 with alert-filing rc=0 (mock toggled, throttle state
 #      cleared, retry-after window honored implicitly since we control
 #      `BRIDGE_A2A_STUCK_ALERT_SCAN_INTERVAL_SECONDS=0` would skip the
 #      tick — instead we remove the tick_state file between runs):
 #        - decide emits the same stuck row (ledger never stamped)
-#        - daemon's task-create branch succeeds
+#        - daemon's `bridge_queue_cli upsert-open` branch succeeds
 #        - ack helper stamps the ledger
 #        - ledger NOW carries `"msg-stuck-real-001"`
 #
 # Teeth (regression vectors documented + exercised by tick #1):
-#   V1. Move bridge-daemon.sh:2456 (`printf '%s\n' "$message_id" >>
-#       "$ack_tmp"`) OUTSIDE the success branch (i.e. unconditionally
-#       after the if-else). The smoke will then see ledger stamped on
-#       failure → tick #2's pre-condition `ledger empty` fails →
-#       assertion fires.
+#   V1. Move the `printf '%s\n' "$message_id" >> "$ack_tmp"` line OUTSIDE
+#       the upsert-open success branch (i.e. unconditionally after the
+#       if-else). The smoke will then see ledger stamped on failure →
+#       tick #2's pre-condition `ledger empty` fails → assertion fires.
 #   V2. Reorder helper calls so `a2a-stuck-ack` runs BEFORE the
-#       task-create loop (or the loop appends to ack_tmp before the
+#       upsert-open loop (or the loop appends to ack_tmp before the
 #       success rc is known). Same shape — ledger stamped on failure
 #       → assertion fires.
 #
@@ -551,29 +575,12 @@ cat >"$DAEMON_TEST_OUTBOX" <<'JSON'
 ]
 JSON
 
-# Mock agent-bridge shim. Daemon prefers $BRIDGE_HOME/agent-bridge over
-# $SCRIPT_DIR/agent-bridge (see daemon function, lines 2342-2349). Reads
-# rc from $BRIDGE_A2A_TEST_TASK_CREATE_RC.
-DAEMON_TEST_AGB_SHIM="$DAEMON_TEST_HOME/agent-bridge"
-cat >"$DAEMON_TEST_AGB_SHIM" <<'SHIM'
-#!/usr/bin/env bash
-# Mock for v0.15.0-beta4 Lane I r3 smoke. Returns rc from env var.
-rc="${BRIDGE_A2A_TEST_TASK_CREATE_RC:-0}"
-case "${1:-}" in
-  task)
-    if [[ "$rc" == "1" ]]; then
-      printf 'mock-agent-bridge: task create failed (BRIDGE_A2A_TEST_TASK_CREATE_RC=1)\n' >&2
-      exit 1
-    fi
-    exit 0
-    ;;
-  *)
-    # Any other subcommand: no-op success.
-    exit 0
-    ;;
-esac
-SHIM
-chmod +x "$DAEMON_TEST_AGB_SHIM"
+# Issue #1408: the alert-filing mock is no longer an `$BRIDGE_HOME/agent-bridge`
+# shim — production now files via `bridge_queue_cli upsert-open`, and the
+# daemon no longer resolves a `$target_bridge` wrapper at all. The filing rc
+# (BRIDGE_A2A_TEST_TASK_CREATE_RC) is honored by the driver's bridge_queue_cli
+# stub (scripts/smoke/I-beta4-helpers/run-stuck-scan-tick.sh). Nothing to seed
+# in $DAEMON_TEST_HOME here.
 
 DAEMON_TEST_WARN_LOG="$SMOKE_TMP_ROOT/daemon-test-warn.log"
 DAEMON_TEST_EVENT_LOG="$SMOKE_TMP_ROOT/daemon-test-event.log"
@@ -585,8 +592,9 @@ DAEMON_TEST_TICK="$DAEMON_TEST_HOME/state/handoff/stuck-scan-tick.env"
 
 # Driver script — invokes the actual production
 # process_a2a_outbox_stuck_scan_tick function from bridge-daemon.sh
-# with mocks for `bridge-a2a.py outbox list --json` and `agent-bridge
-# task create`. See run-stuck-scan-tick.sh for the mock contract.
+# with mocks for `bridge-a2a.py outbox list --json` and
+# `bridge_queue_cli upsert-open`. See run-stuck-scan-tick.sh for the
+# mock contract.
 DAEMON_TEST_DRIVER="$REPO_ROOT/scripts/smoke/I-beta4-helpers/run-stuck-scan-tick.sh"
 if [[ ! -x "$DAEMON_TEST_DRIVER" ]]; then
   smoke_fail "T_daemon_scan_tick_handles_create_failure: missing driver $DAEMON_TEST_DRIVER"
@@ -610,25 +618,28 @@ env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
   bash "$DAEMON_TEST_DRIVER" \
     >"$SMOKE_TMP_ROOT/daemon-test-tick1.out" 2>"$SMOKE_TMP_ROOT/daemon-test-tick1.err" || true
 
-# Assert 1: daemon_warn at bridge-daemon.sh:2468 fired ("task-create failed").
-if ! grep -F '[a2a_stuck_scan] task-create failed for stuck msg-stuck-real-001' \
+# Assert 1: daemon_warn fired on the upsert-open failure path
+# (bridge-daemon.sh, "[a2a_stuck_scan] upsert-open failed for stuck …").
+# Issue #1408 replaced the old `task create` filing path with
+# `bridge_queue_cli upsert-open`; the warn text changed accordingly.
+if ! grep -F '[a2a_stuck_scan] upsert-open failed for stuck msg-stuck-real-001' \
      "$DAEMON_TEST_WARN_LOG" >/dev/null; then
-  smoke_fail "T_daemon_scan_tick_handles_create_failure: tick #1 did not emit task-create-failed warn (warn log: $(cat "$DAEMON_TEST_WARN_LOG"); stderr: $(cat "$SMOKE_TMP_ROOT/daemon-test-tick1.err"))"
+  smoke_fail "T_daemon_scan_tick_handles_create_failure: tick #1 did not emit upsert-open-failed warn (warn log: $(cat "$DAEMON_TEST_WARN_LOG"); stderr: $(cat "$SMOKE_TMP_ROOT/daemon-test-tick1.err"))"
 fi
 
-# Assert 2: ledger unstamped for msg-stuck-real-001 (production code path:
-# line 2456 only appends to ack_tmp inside the success branch).
+# Assert 2: ledger unstamped for msg-stuck-real-001 (production only appends
+# to ack_tmp inside the upsert-open success branch).
 if [[ ! -f "$DAEMON_TEST_LEDGER" ]]; then
   smoke_fail "T_daemon_scan_tick_handles_create_failure: tick #1 did not create ledger file"
 fi
 if grep -F 'msg-stuck-real-001' "$DAEMON_TEST_LEDGER" >/dev/null; then
-  smoke_fail "T_daemon_scan_tick_handles_create_failure: tick #1 stamped ledger despite task-create failure — regression of bridge-daemon.sh:2456 ack_tmp-append-on-success contract (ledger: $(cat "$DAEMON_TEST_LEDGER"))"
+  smoke_fail "T_daemon_scan_tick_handles_create_failure: tick #1 stamped ledger despite upsert-open failure — regression of the ack_tmp-append-on-success contract (ledger: $(cat "$DAEMON_TEST_LEDGER"))"
 fi
 
 smoke_log "T_daemon_scan_tick_handles_create_failure tick #1 PASS — warn emitted, ledger unstamped on rc=1"
 
-# Tick #2 — task_create rc=0 (success path). Clear throttle so the
-# function runs again rather than gating on `now < next`.
+# Tick #2 — alert-filing rc=0 (upsert-open success path). Clear throttle so
+# the function runs again rather than gating on `now < next`.
 rm -f "$DAEMON_TEST_TICK"
 env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
   SCRIPT_DIR="$REPO_ROOT" \
@@ -653,7 +664,7 @@ if ! grep -F 'msg-stuck-real-001' "$DAEMON_TEST_LEDGER" >/dev/null; then
 fi
 
 # Assert 4: event log shows the daemon's emitted-count line — confirms
-# task-create success path ran end-to-end.
+# the upsert-open success path ran end-to-end.
 if ! grep -F '[a2a_stuck_scan] emitted 1 stuck-outbox admin task' "$DAEMON_TEST_EVENT_LOG" >/dev/null; then
   smoke_fail "T_daemon_scan_tick_handles_create_failure: tick #2 did not log success emission (event log: $(cat "$DAEMON_TEST_EVENT_LOG"))"
 fi

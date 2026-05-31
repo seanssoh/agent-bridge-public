@@ -6,8 +6,11 @@
 # Exercises the actual `process_a2a_outbox_stuck_scan_tick` shell function
 # from bridge-daemon.sh in isolation, with mocks for:
 #   - `bridge-a2a.py outbox list --json` (returns fixture JSON path)
-#   - `$BRIDGE_HOME/agent-bridge task create` (rc controlled by
-#     `BRIDGE_A2A_TEST_TASK_CREATE_RC` env var)
+#   - `bridge_queue_cli upsert-open` (rc controlled by
+#     `BRIDGE_A2A_TEST_TASK_CREATE_RC` env var). Issue #1408 replaced the
+#     prior `$BRIDGE_HOME/agent-bridge task create` filing path with the
+#     atomic upsert-open subcommand; the env var name is kept for harness
+#     compatibility (it still means "the alert-filing rc for this tick").
 #
 # This driver:
 #   1. Extracts the `process_a2a_outbox_stuck_scan_tick` function body
@@ -20,7 +23,9 @@
 #      `a2a_outbox_list` reads from a fixture file (mock), while the
 #      `a2a_stuck_decide` / `a2a_stuck_ack` calls pass through to the
 #      real `bridge-daemon-helpers.py`.
-#   4. Invokes the function once.
+#   4. Stubs `bridge_queue_cli` so the `upsert-open` alert-filing call
+#      returns the rc selected by `BRIDGE_A2A_TEST_TASK_CREATE_RC`.
+#   5. Invokes the function once.
 #
 # Inputs (env):
 #   - SCRIPT_DIR          : repo root (so daemon function can find
@@ -88,6 +93,31 @@ bridge_audit_log() {
   # many helper dependencies. Test asserts the warning + ledger state,
   # not audit rows.
   return 0
+}
+
+# Issue #1408: the production function now files the stuck alert via
+# `bridge_queue_cli upsert-open` (refresh-or-create one open task per stuck
+# message_id) instead of `$BRIDGE_HOME/agent-bridge task create`. Mock the
+# CLI so the test still controls the alert-filing rc per tick: the
+# `upsert-open` subcommand returns rc from BRIDGE_A2A_TEST_TASK_CREATE_RC
+# (0 = success, 1 = failure), exactly as the old agent-bridge shim did.
+# Any other subcommand (e.g. a future find-open) no-ops with success so the
+# stub never silently masks a different call path.
+# shellcheck disable=SC2329
+bridge_queue_cli() {
+  local rc="${BRIDGE_A2A_TEST_TASK_CREATE_RC:-0}"
+  case "${1:-}" in
+    upsert-open)
+      if [[ "$rc" == "1" ]]; then
+        printf 'mock-bridge_queue_cli: upsert-open failed (BRIDGE_A2A_TEST_TASK_CREATE_RC=1)\n' >&2
+        return 1
+      fi
+      return 0
+      ;;
+    *)
+      return 0
+      ;;
+  esac
 }
 
 # bridge_with_timeout signature: bridge_with_timeout <secs> <label> <cmd...>

@@ -2386,15 +2386,9 @@ process_a2a_outbox_stuck_scan_tick() {
     return 1
   fi
 
-  # Live install's CLI preferred — see process_daily_backup_failure_task.
-  local target_bridge=""
-  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
-    target_bridge="$BRIDGE_HOME/agent-bridge"
-  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
-    target_bridge="$SCRIPT_DIR/agent-bridge"
-  else
-    return 1
-  fi
+  # Issue #1408: stuck alerts now file via `bridge_queue_cli upsert-open`
+  # (controller-direct to bridge-queue.py), so no `agent-bridge` wrapper
+  # resolution is needed here.
 
   # Ledger of last-alerted timestamps per message_id (JSON dict). A bash
   # associative array would be ideal but we'd lose it across daemon
@@ -2493,13 +2487,28 @@ process_a2a_outbox_stuck_scan_tick() {
       printf '`BRIDGE_A2A_STUCK_ALERT_REEMIT_SECS` (default 1h).\n'
     } >"$body_file"
 
-    # Issue #1318 part A (v0.14.5-beta5-2 Lane ξ): A2A stuck-outbox
-    # alerts to admin must enqueue when admin is stopped — the alert IS
-    # the trigger to wake admin.
-    if "$target_bridge" task create \
+    # Issue #1408: refresh ONE open alert PER stuck message_id instead of
+    # minting a new admin task each reemit window. Routes through the atomic
+    # `bridge-queue.py upsert-open` subcommand (single-writer, one SQLite
+    # transaction) which reuses the same upsert_open_task() the blocked-aging
+    # family uses — find-open matches only OPEN statuses and the refresh
+    # preserves `status`, so an unread alert is refreshed in place rather than
+    # duplicated. The match prefix is per (peer, target_agent, message-prefix)
+    # so each distinct stuck message keeps its own refreshable task (no
+    # aggregate-into-one-body evidence loss). upsert-open always enqueues
+    # (the stopped-target gate lives in bridge-task.sh, not bridge-queue.py),
+    # preserving the Issue #1318 part A "enqueue when admin is stopped"
+    # behavior without needing --force.
+    local a2a_title a2a_filed=0
+    a2a_title="[A2A] outbox stuck: ${peer}:${target_agent} (${message_id:0:8})"
+    if bridge_queue_cli upsert-open \
          --to "$admin" --priority high --from daemon \
-         --title "[A2A] outbox stuck: ${peer}:${target_agent} (${message_id:0:8})" \
-         --body-file "$body_file" --force >/dev/null 2>&1; then
+         --title-prefix "$a2a_title" --title "$a2a_title" \
+         --refresh-note "daemon refreshed A2A outbox-stuck alert" \
+         --body-file "$body_file" >/dev/null 2>&1; then
+      a2a_filed=1
+    fi
+    if (( a2a_filed == 1 )); then
       emitted=$((emitted + 1))
       # Codex r1 BLOCKING fix: stamp the ledger via ack helper at the
       # end of the loop, ONLY for rows whose admin task we actually
@@ -2514,9 +2523,9 @@ process_a2a_outbox_stuck_scan_tick() {
         --detail age_seconds="$age_seconds" >/dev/null 2>&1 || true
     else
       # Codex r1 BLOCKING fix: do NOT advance the reemit cooldown
-      # ledger when task create fails. The next scan will re-evaluate
+      # ledger when the upsert fails. The next scan will re-evaluate
       # this row and try again.
-      daemon_warn "[a2a_stuck_scan] task-create failed for stuck $message_id; ledger preserved, will retry next scan"
+      daemon_warn "[a2a_stuck_scan] upsert-open failed for stuck $message_id; ledger preserved, will retry next scan"
     fi
     rm -f "$body_file" 2>/dev/null || true
   done <"$emit_tmp"
@@ -5916,14 +5925,9 @@ process_unclaimed_queue_escalation() {
   (( age_threshold > 0 )) || return 1
   [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=1800
 
-  local target_bridge=""
-  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
-    target_bridge="$BRIDGE_HOME/agent-bridge"
-  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
-    target_bridge="$SCRIPT_DIR/agent-bridge"
-  else
-    return 1
-  fi
+  # Issue #1408: the escalation now files via `bridge_queue_cli upsert-open`
+  # (controller-direct to bridge-queue.py) rather than the `agent-bridge`
+  # wrapper, so no $target_bridge resolution is needed here.
 
   # Scan ALL agents' open tasks via the daemon-step output is not feasible
   # here (the daemon-step only emits nudge candidates). Instead we ask the
@@ -6034,9 +6038,20 @@ This task fires at most once per ${cooldown}s cooldown window per
 queued task id. Issue #1318-B operator-visible audit signal.
 EOF
 
-      if "$target_bridge" task create \
+      # Issue #1408: refresh ONE open escalation per task id instead of
+      # minting a new admin task each cooldown window. Routes through the
+      # atomic `bridge-queue.py upsert-open` subcommand (single-writer, one
+      # SQLite transaction) reusing the blocked-aging upsert_open_task().
+      # The (${age_minutes}m) age suffix stays in the displayed title but
+      # is NOT in the match prefix, so the same task id refreshes one open
+      # row across cooldown windows even as its age grows.
+      local unclaimed_title unclaimed_prefix
+      unclaimed_title="[unclaimed-task] #${task_id} on ${agent} (${age_minutes}m)"
+      unclaimed_prefix="[unclaimed-task] #${task_id} on ${agent} "
+      if bridge_queue_cli upsert-open \
            --to "$admin_agent" --priority high --from daemon \
-           --title "[unclaimed-task] #${task_id} on ${agent} (${age_minutes}m)" \
+           --title-prefix "$unclaimed_prefix" --title "$unclaimed_title" \
+           --refresh-note "daemon refreshed unclaimed-task escalation" \
            --body-file "$body_file" >/dev/null 2>&1; then
         bridge_audit_log daemon task_unclaimed_escalated "$admin_agent" \
           --detail task_id="$task_id" \
@@ -6104,7 +6119,7 @@ bridge_daemon_sweep_stale_unclaimed_markers() {
 
 nudge_agent_session() {
   local agent="$1"
-  local _session="$2"
+  local session="$2"
   local queued="$3"
   local claimed="$4"
   local idle="$5"
@@ -6291,6 +6306,47 @@ nudge_agent_session() {
     [[ -n "$_dd_skip_task_id" ]] || _dd_skip_task_id="none"
     daemon_info "[nudge-skip] agent=${agent} task=${_dd_skip_task_id} reason=dedup-cooldown evidence=fingerprint=${nudge_fingerprint:0:8},queued=${live_queued}"
     daemon_info "skipped duplicate nudge for ${agent} (fingerprint=${nudge_fingerprint:0:8}, queued=${live_queued})"
+    return 0
+  fi
+
+  # Issue #1411: skip the ACTION-REQUIRED inject when a human is attached to
+  # the target session. On an attached interactive session the composer is
+  # ~always busy, so the keystroke inject cannot auto-submit → it spools into
+  # pending-attention.env and replays as a `[deferred]` line needing a manual
+  # Enter. Mirror the sibling attached-gates (plugin-MCP-liveness restart
+  # `plugin_mcp_liveness_attached_skip` at ~L7067, stall-scan `attached==0` at
+  # ~L3563): when attached, the operator (and the agent at its own turn
+  # boundaries) drives the inbox, so the daemon must not inject. We reuse the
+  # same `bridge_tmux_session_attached_count` probe the siblings use; $session
+  # is the validated tmux session the caller already proved exists.
+  #
+  # Rate-limit the skip audit (course correction #3): emit it at most once per
+  # redelivery window per task-set, keyed by the same fingerprint the dedup
+  # gate uses. We are only here because should_skip returned false (first-seen
+  # / window expired), so record the window now and return WITHOUT injecting.
+  # We deliberately do NOT call bridge_task_note_nudge / bridge_daemon_record
+  # a successful nudge — no inject happened — but we DO arm the fingerprint
+  # window via bridge_daemon_record_nudge so the next tick's should_skip
+  # suppresses a duplicate attached-skip audit on a permanently-attached
+  # session.
+  local attached=0
+  attached="$(bridge_tmux_session_attached_count "$session" 2>/dev/null || printf '0')"
+  [[ "$attached" =~ ^[0-9]+$ ]] || attached=0
+  if (( attached > 0 )); then
+    local _att_skip_task_id="${live_nudge_key%%,*}"
+    [[ -n "$_att_skip_task_id" ]] || _att_skip_task_id="none"
+    bridge_audit_log daemon queue_attention_attached_skip "$agent" \
+      --detail fingerprint="$nudge_fingerprint" \
+      --detail queued="$live_queued" \
+      --detail claimed="$live_claimed" \
+      --detail attached="$attached" \
+      --detail session="$session" \
+      --detail task_id="$_att_skip_task_id" \
+      --detail redelivery_seconds="${BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS:-60}" \
+      2>/dev/null || true
+    daemon_info "[nudge-skip] agent=${agent} task=${_att_skip_task_id} reason=attached-session evidence=attached=${attached},queued=${live_queued}"
+    daemon_info "skipped queued-task nudge for attached session ${agent} (attached=${attached}, queued=${live_queued})"
+    bridge_daemon_record_nudge "$agent" "$nudge_fingerprint" "${live_nudge_key:-$nudge_key}" || true
     return 0
   fi
 
