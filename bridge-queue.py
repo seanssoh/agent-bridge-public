@@ -1129,13 +1129,26 @@ def cmd_find_open(args: argparse.Namespace) -> int:
             print(json.dumps([], ensure_ascii=False))
         return 1
 
+    # Issue #1199: default open set is queued|claimed|blocked (back-compat).
+    # --status-filter narrows it so the ACTION REQUIRED "Highest priority"
+    # line can be restricted to genuinely-queued tasks. De-dup while
+    # preserving caller order; fall back to the full open set when omitted.
+    status_filter = getattr(args, "status_filter", None)
+    if status_filter:
+        seen: set[str] = set()
+        statuses = [s for s in status_filter if not (s in seen or seen.add(s))]
+    else:
+        statuses = ["queued", "claimed", "blocked"]
+
     params: list[object] = [args.agent]
-    sql = """
+    placeholders = ", ".join("?" for _ in statuses)
+    sql = f"""
         SELECT *
         FROM tasks
         WHERE assigned_to = ?
-          AND status IN ('queued', 'claimed', 'blocked')
+          AND status IN ({placeholders})
     """
+    params.extend(statuses)
     if args.title_prefix:
         sql += " AND title LIKE ?"
         params.append(f"{args.title_prefix}%")
@@ -2714,6 +2727,18 @@ def build_parser() -> argparse.ArgumentParser:
     find_open_parser = subparsers.add_parser("find-open", allow_abbrev=False)
     find_open_parser.add_argument("--agent", required=True)
     find_open_parser.add_argument("--title-prefix")
+    find_open_parser.add_argument(
+        "--status-filter",
+        choices=("queued", "claimed", "blocked"),
+        action="append",
+        default=None,
+        help=(
+            "Restrict the open-task search to the given status(es). Repeatable. "
+            "Default (omitted) matches the legacy open set: queued, claimed, "
+            "blocked. Issue #1199 uses --status-filter queued so the ACTION "
+            "REQUIRED 'Highest priority' line never cites a claimed/blocked task."
+        ),
+    )
     find_open_parser.add_argument("--format", choices=("id", "text", "shell", "json"), default="id")
     find_open_parser.add_argument(
         "--all",
