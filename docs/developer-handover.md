@@ -485,6 +485,52 @@ same contract internally and remain in place because their
 catalog-filtering work is non-trivial. New callsites that need a
 root-published per-agent manifest write should call `bridge_iso_run`.
 
+### 9. template-sync — reference 에이전트에서 새 에이전트 시드 (issue #1427)
+
+`agb setup template-sync`는 한 reference 에이전트(보통 `patch`)의 roster
+필드를 가져와 이후 생성되는 새 에이전트(그리고 명시적으로 backfill 하는
+기존 에이전트)의 model/effort/permission_mode/plugins/skills/channels를
+시드한다. 설계 전문은 [`docs/template-sync-design.md`](./template-sync-design.md)
+에 있다 — 새 에이전트가 fresh Claude Code처럼 Sonnet/low-effort/no-plugin으로
+올라오는 문제를 opt-in 위저드로 해결한다.
+
+이 영역을 만질 때 반드시 기억할 두 가지 함정:
+
+- **Sync 대상은 ROSTER이지 `settings.json`이 아니다.** model/effort/
+  permission_mode는 `bridge_build_static_launch_cmd`
+  (lib/bridge-state.sh:53-75)가 roster에서 읽어 launch argv로 넘기는
+  값이다. `settings.json`에 model을 써도 launch flag가 이기므로 no-op이다.
+  동기화는 항상 `agent-roster.local.sh`의 명시적 per-agent 필드를 쓴다.
+- **Materialize-not-fallback.** `setup template-sync`가 쓰는
+  defaults-profile 블록은 create/backfill 시점에만 소비되어 명시적 필드를
+  **물질화(materialize)** 한다. 접근자(`bridge_agent_model/effort/...`)가
+  global default를 반환하도록 바꾸면 안 된다 — 그렇게 하면 필드 미설정
+  상태로 legacy-launch 계약에 있던 모든 기존 roster가 조용히 새 launch
+  shape로 뒤집힌다. 우선순위: 명시적 per-agent 필드 > 물질화된 defaults
+  (= create/backfill 후의 명시적 필드) > 빌트인 inline launch default
+  (`claude-opus-4-8` / xhigh / auto, new-shape 행 한정, 최후 수단).
+
+보안 불변식 (설계 doc §"Hard security invariants"):
+
+- secret은 절대 복사하지 않는다 — MCP/plugin secret, `.mcp.json` env,
+  `.teams`/`.ms365`/`.env`/`access.json`, refresh token, app password,
+  client secret. **이름/스키마만** 동기화하고 운영자가 per-channel `setup`
+  위저드로 재투입한다. channels는 선언(`plugin:teams@mkt`)만 운반한다.
+- `permission_mode=legacy`는 절대 자동 전파하지 않는다.
+- silent model upgrade 없음 — dry-run / before-after diff + 운영자 확인.
+  기존 에이전트는 명시적 backfill 전까지 건드리지 않는다.
+- reference 읽기는 **roster-only**. patch의 live `$HOME/.claude`, 설치된
+  plugin 캐시, settings, env, MCP 런타임을 introspect 하지 않는다
+  (isolation으로도 막혀 있다).
+
+defaults-profile 블록의 정확한 포맷(Contract I)은 설계 doc
+§"Shared contracts (I)"가 pin이며, 같은 포맷의 copy-pasteable 예시가
+`agent-roster.local.example.sh` 주석에 있다 (excluded 차원은 빈 var가 아니라
+아예 생략된다). 빌트인 last-resort
+launch default는 이 작업과 함께 `claude-opus-4-7`에서 `claude-opus-4-8`로
+갱신됐다(lib/bridge-state.sh:68); 기존 명시적 roster 항목은 건드리지 않는
+adjacent 변경이며 dry-run에 노출된다.
+
 ## 6. 개발할 때의 기본 작업 흐름
 
 ### 상태 파악

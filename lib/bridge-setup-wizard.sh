@@ -115,11 +115,23 @@ _BRIDGE_SETUP_WIZARD_REQUIRED_MS365=(
   redirect-uri
 )
 
+# Required template-sync field — issue #1427. The only value the wizard
+# cannot pick a sensible default for is the reference agent. Everything
+# else (exclude set, targets) is opt-out / optional. Auto-mode (`--yes`)
+# therefore requires `--from <agent>`; missing it fails loud BEFORE the
+# python wizard so the operator never sees an opaque argparse error.
+_BRIDGE_SETUP_WIZARD_REQUIRED_TEMPLATE_SYNC=(
+  from
+)
+
 bridge_setup_wizard_required_fields() {
   local channel="${1:-}"
   case "$channel" in
     teams)
       printf '%s\n' "${_BRIDGE_SETUP_WIZARD_REQUIRED_TEAMS[@]}"
+      ;;
+    template-sync)
+      printf '%s\n' "${_BRIDGE_SETUP_WIZARD_REQUIRED_TEMPLATE_SYNC[@]}"
       ;;
     ms365)
       printf '%s\n' "${_BRIDGE_SETUP_WIZARD_REQUIRED_MS365[@]}"
@@ -221,6 +233,9 @@ bridge_setup_wizard_validate_auto() {
       ;;
     ms365)
       required=("${_BRIDGE_SETUP_WIZARD_REQUIRED_MS365[@]}")
+      ;;
+    template-sync)
+      required=("${_BRIDGE_SETUP_WIZARD_REQUIRED_TEMPLATE_SYNC[@]}")
       ;;
     *)
       bridge_die "[setup wizard] 알 수 없는 채널: ${channel}"
@@ -466,6 +481,87 @@ bridge_setup_wizard_run_ms365() {
   _BRIDGE_SETUP_WIZARD_LAST_MS365_CLIENT_ID="$client_id"
   export _BRIDGE_SETUP_WIZARD_LAST_MS365_REDIRECT_URI \
          _BRIDGE_SETUP_WIZARD_LAST_MS365_CLIENT_ID
+}
+
+# --------------------------------------------------------------------
+# Issue #1427 Lane B — template-sync interactive wizard (Stage 1).
+#
+# Mirrors the teams/ms365 two-stage contract. Unlike those channels,
+# template-sync does not gather site-specific secrets — its job is the
+# opt-OUT exclude step: every dimension the reference agent declares is
+# accepted by default, and the operator deselects what they do not want
+# seeded. The reference's raw per-dimension values are gathered by the
+# bash dispatch (which has already sourced the roster) and handed in as
+# positional args so this helper never re-reads the roster itself.
+#
+# Output: appends `--exclude <csv>` (only if the operator excluded
+# anything) plus `--yes` to the caller's argv-out array. The caller has
+# already appended `--from <ref>` and the `--ref-*` raw values; this
+# helper only contributes the operator's exclude choices.
+# --------------------------------------------------------------------
+
+# _bridge_setup_wizard_ts_dimension_prompt <dim-label> <current-value>
+#   Returns 0 to INCLUDE (default), 1 to EXCLUDE. An empty current value
+#   is auto-skipped (nothing to include) and reported as such.
+_bridge_setup_wizard_ts_dimension_prompt() {
+  local label="$1"
+  local current="$2"
+  if [[ -z "$current" ]]; then
+    printf '  - %s: (unset on reference — nothing to seed)\n' "$label" >&2
+    return 1
+  fi
+  local reply
+  reply="$(_bridge_setup_wizard_prompt "  include ${label} = '${current}'? [Y/n]" "Y")"
+  case "$reply" in
+    n|N|no|NO|No) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+bridge_setup_wizard_run_template_sync() {
+  local ref_agent="${1:-}"
+  local out_array_name="${2:-}"
+  local ref_model="${3:-}"
+  local ref_effort="${4:-}"
+  local ref_permission_mode="${5:-}"
+  local ref_plugins="${6:-}"
+  local ref_skills="${7:-}"
+  local ref_channels="${8:-}"
+  [[ -n "$ref_agent" ]] || bridge_die "[setup wizard] reference agent name required"
+  [[ -n "$out_array_name" ]] || bridge_die "[setup wizard] out array name required"
+
+  _bridge_setup_wizard_section "template-sync 인터랙티브 셋업 (reference=${ref_agent})"
+  printf '  step 1: 참조 에이전트의 각 dimension을 포함/제외 선택 (기본 = 포함)\n' >&2
+  printf '  보안: 채널은 declaration만 복사됩니다 (자격증명/토큰/MCP secret은 절대 복사 안 함).\n' >&2
+
+  local -a excludes=()
+
+  # permission_mode=legacy is NEVER inheritable — surface + force-exclude
+  # before the operator even sees a prompt for it.
+  if [[ "$ref_permission_mode" == "legacy" ]]; then
+    bridge_warn "[setup template-sync] reference permission_mode=legacy는 절대 상속되지 않습니다 — 제외합니다."
+    excludes+=("permission_mode")
+    ref_permission_mode=""
+  fi
+
+  _bridge_setup_wizard_ts_dimension_prompt "model" "$ref_model" || excludes+=("model")
+  _bridge_setup_wizard_ts_dimension_prompt "effort" "$ref_effort" || excludes+=("effort")
+  if [[ "$ref_permission_mode" != "legacy" && -n "$ref_permission_mode" ]]; then
+    _bridge_setup_wizard_ts_dimension_prompt "permission_mode" "$ref_permission_mode" || excludes+=("permission_mode")
+  fi
+  _bridge_setup_wizard_ts_dimension_prompt "plugins" "$ref_plugins" || excludes+=("plugins")
+  _bridge_setup_wizard_ts_dimension_prompt "skills" "$ref_skills" || excludes+=("skills")
+  _bridge_setup_wizard_ts_dimension_prompt "channels" "$ref_channels" || excludes+=("channels")
+
+  # Assemble the exclude CSV (only when non-empty) + --yes. We can't use
+  # `local -n` portably, so use `eval` with the array name (matches the
+  # teams/ms365 helpers).
+  if (( ${#excludes[@]} > 0 )); then
+    local exclude_csv
+    exclude_csv="$(IFS=,; printf '%s' "${excludes[*]}")"
+    eval "${out_array_name}+=(--exclude \"\$exclude_csv\")"
+  fi
+  eval "${out_array_name}+=(--yes)"
 }
 
 # --------------------------------------------------------------------

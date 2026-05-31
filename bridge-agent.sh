@@ -18,6 +18,29 @@ if [[ "${1:-}" == "registry" ]]; then
   export BRIDGE_REGISTRY_READ_ONLY=1
 fi
 
+# template-sync (#1427): ensure the three roster dimensions the
+# materialize-fields writer persists (model / effort / permission_mode)
+# are declared as ASSOCIATIVE arrays before the first roster load.
+# bridge_reset_roster_maps (lib/bridge-core.sh) declares + resets
+# channels/plugins/skills but NOT these three (historically harmless
+# because no writer emitted BRIDGE_AGENT_MODEL/EFFORT/PERMISSION_MODE
+# lines). Once this script writes those lines, a roster reload that
+# sources `BRIDGE_AGENT_MODEL["<a>"]=...` against an undeclared name
+# arithmetic-indexes the subscript under `set -u` and aborts with
+# `<a>: unbound variable` (the #1213/#1407 scalar-vs-assoc class). The
+# reset never UNSETs these names, so a one-time `-A` declaration here
+# survives every subsequent bridge_reset_roster_maps pass. Guard against
+# re-declaring an already-associative var (the #1213 collision class):
+# only declare when the name is not yet an `-A` array.
+for _ts_dim_var in BRIDGE_AGENT_MODEL BRIDGE_AGENT_EFFORT BRIDGE_AGENT_PERMISSION_MODE; do
+  if ! declare -p "$_ts_dim_var" 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+    # `declare -g -A "$name"` (no `=()` initializer — the dynamic-name
+    # form does not parse with one) creates an empty associative array.
+    declare -g -A "$_ts_dim_var"
+  fi
+done
+unset _ts_dim_var
+
 bridge_load_roster
 
 usage() {
@@ -38,6 +61,7 @@ Subcommands:
   reclassify         Promote a runtime-detected admin to a static role.
   doctor             Run a 7-step CRUD self-check (create/update/registry/
                      show/reclassify/retire/delete) against an isolated fixture.
+  roster             Roster-field surgery (materialize-fields writer, #1427).
   rerender-settings  Re-render per-agent settings.effective.json.
   start              Launch <agent> in tmux.
   safe-mode          Launch <agent> in safe-mode (no auto-resume).
@@ -57,6 +81,7 @@ Examples:
   $(basename "$0") registry --json
   $(basename "$0") show reviewer --json
   $(basename "$0") describe reviewer
+  $(basename "$0") roster materialize-fields reviewer --model claude-opus-4-8 --effort xhigh --dry-run
   $(basename "$0") reclassify --apply
   $(basename "$0") rerender-settings --apply
   $(basename "$0") start reviewer --dry-run
@@ -113,6 +138,11 @@ Create options:
   --session-type <type>        admin|static-claude|static-codex|dynamic|cron
   --user <id[:display-name]>   scaffold one user memory partition (repeatable; defaults to shared users)
   --launch-cmd <cmd>           explicit launch command
+  --model <name>               explicit BRIDGE_AGENT_MODEL (#1427); wins over the defaults profile
+  --effort <level>             explicit BRIDGE_AGENT_EFFORT (#1427)
+  --permission-mode <mode>     explicit BRIDGE_AGENT_PERMISSION_MODE (#1427); 'legacy' is refused
+  --plugins <csv>              explicit BRIDGE_AGENT_PLUGINS allowlist (#1427)
+  --skills <csv>               explicit BRIDGE_AGENT_SKILLS extra-skills list (#1427)
   --channels <csv>             required Claude channels metadata
   --discord-channel <id>       primary Discord channel metadata
   --notify-kind <kind>         out-of-band notify transport metadata
@@ -137,6 +167,21 @@ Create options:
                                provisioning automation). Without this,
                                \`create\` refuses when the engine binary
                                is not on PATH.
+
+Roster materialize-fields (template-sync Contract II, #1427). Multi-field
+atomic, audited writer for the six roster dimensions. Writes ONLY roster
+fields (never .claude/settings.json); empty value = leave unset; refuses
+--permission-mode legacy; idempotent (no-change = no-op). Same operator-tui
+/ operator-trusted-id mutation boundary as 'agent create'. Reachable as
+'agent-bridge agent roster materialize-fields <agent> ...'.
+  --model <name>               write BRIDGE_AGENT_MODEL
+  --effort <level>             write BRIDGE_AGENT_EFFORT
+  --permission-mode <mode>     write BRIDGE_AGENT_PERMISSION_MODE ('legacy' refused)
+  --plugins <csv>              write BRIDGE_AGENT_PLUGINS
+  --skills <csv>               write BRIDGE_AGENT_SKILLS
+  --channels <csv>             write BRIDGE_AGENT_CHANNELS
+  --dry-run                    print the structured before/after diff; write nothing
+  --json                       emit the machine-readable diff JSON
 
 Policy: admin operates exclusively through these typed verbs. Direct edits
 to protected-roster files (\$BRIDGE_ROSTER_LOCAL_FILE) are intentionally
@@ -1298,6 +1343,221 @@ path.write_text(text, encoding="utf-8")
 PY
 }
 
+# bridge_roster_materialize_fields_python — template-sync Contract II
+# (#1427). Field-surgical writer for the six roster dimensions
+# model / effort / permission_mode / plugins / skills / channels. Unlike
+# bridge_write_role_block (which regenerates the WHOLE managed block from
+# a fixed positional set that does NOT even include model/effort/pm/
+# plugins/skills), this writer mutates ONLY the named field lines inside
+# an EXISTING managed block and preserves every other line byte-for-byte.
+#
+# Field encoding: argv carries six `<VAR>\x1f<present>\x1f<value>`
+# triples. `present==0` means "leave the dimension unset — do not write
+# the line and do not remove an existing one"; `present==1` means
+# "upsert BRIDGE_AGENT_<DIM>["<agent>"]=<shlex-quoted-value> inside the
+# block". An empty value is only ever passed with present==0 (the verb
+# maps `--dim ''` to "leave unset"), so this writer never emits an empty
+# managed field line. It never touches `.claude/settings.json` — the
+# roster file is its sole write target.
+#
+# Output: a single JSON object on stdout describing the before/after
+# value of each named field and whether the block changed. The caller
+# uses this for the structured diff (--json / --dry-run) and to detect
+# the idempotent no-op (changed=false → exit 0, no write).
+bridge_roster_materialize_fields_python() {
+  local agent="$1"
+  local roster_file="$2"
+  local apply="$3"   # "1" = write, "0" = dry-run (compute diff only)
+  shift 3
+  bridge_agent_manage_python "$roster_file" "$agent" "$apply" "$@" <<'PY'
+import json
+import re
+import shlex
+import sys
+
+path_str = sys.argv[1]
+agent = sys.argv[2]
+apply = sys.argv[3] == "1"
+triples = sys.argv[4:]
+
+US = "\x1f"
+
+# Canonical dimension order: short name -> roster array var.
+DIMS = [
+    ("model", "BRIDGE_AGENT_MODEL"),
+    ("effort", "BRIDGE_AGENT_EFFORT"),
+    ("permission_mode", "BRIDGE_AGENT_PERMISSION_MODE"),
+    ("plugins", "BRIDGE_AGENT_PLUGINS"),
+    ("skills", "BRIDGE_AGENT_SKILLS"),
+    ("channels", "BRIDGE_AGENT_CHANNELS"),
+]
+var_by_dim = {dim: var for dim, var in DIMS}
+
+requested = {}
+for raw in triples:
+    var, present, value = raw.split(US, 2)
+    requested[var] = (present == "1", value)
+
+from pathlib import Path
+
+p = Path(path_str)
+if not p.exists():
+    raise SystemExit(f"roster file does not exist: {path_str}")
+text = p.read_text(encoding="utf-8")
+
+begin = f"# BEGIN AGENT BRIDGE MANAGED ROLE: {agent}"
+end = f"# END AGENT BRIDGE MANAGED ROLE: {agent}"
+block_re = re.compile(
+    rf"^(?P<begin># BEGIN AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n)"
+    rf"(?P<body>.*?)"
+    rf"(?P<end>^# END AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n)",
+    flags=re.MULTILINE | re.DOTALL,
+)
+m = block_re.search(text)
+if not m:
+    raise SystemExit(f"no managed role block for {agent} in {path_str}")
+
+body = m.group("body")
+body_lines = body.splitlines(keepends=True)
+
+def field_re(var):
+    return re.compile(rf'^{re.escape(var)}\["{re.escape(agent)}"\]=.*$')
+
+def parse_value(line):
+    # line shape: VAR["agent"]=<shlex-quoted-or-bare>
+    eq = line.split("=", 1)
+    if len(eq) != 2:
+        return ""
+    rhs = eq[1].rstrip("\n")
+    try:
+        parts = shlex.split(rhs)
+        return parts[0] if parts else ""
+    except ValueError:
+        return rhs
+
+# Snapshot current (before) values for every named dimension.
+before = {}
+for dim, var in DIMS:
+    if var not in requested:
+        continue
+    cur = ""
+    for line in body_lines:
+        if field_re(var).match(line.rstrip("\n")):
+            cur = parse_value(line)
+            break
+    before[dim] = cur
+
+# Apply requested upserts to the body line list.
+new_lines = list(body_lines)
+after = {}
+for dim, var in DIMS:
+    if var not in requested:
+        continue
+    present, value = requested[var]
+    if not present:
+        # Leave unset: report the unchanged before value, touch nothing.
+        after[dim] = before[dim]
+        continue
+    rendered = f'{var}["{agent}"]={shlex.quote(value)}\n'
+    replaced = False
+    for i, line in enumerate(new_lines):
+        if field_re(var).match(line.rstrip("\n")):
+            new_lines[i] = rendered
+            replaced = True
+            break
+    if not replaced:
+        new_lines.append(rendered)
+    after[dim] = value
+
+new_body = "".join(new_lines)
+changed = new_body != body
+
+result = {
+    "agent": agent,
+    "changed": changed,
+    "fields": {
+        dim: {
+            "before": before[dim],
+            "after": after[dim],
+            "changed": before[dim] != after[dim],
+        }
+        for dim, _ in DIMS
+        if var_by_dim[dim] in requested
+    },
+}
+
+if apply and changed:
+    new_text = text[: m.start("body")] + new_body + text[m.end("body") :]
+    p.write_text(new_text, encoding="utf-8")
+
+print(json.dumps(result))
+PY
+}
+
+# bridge_template_defaults_profile_read — template-sync Contract I
+# (#1427). Parse the controller-owned defaults-profile block out of
+# agent-roster.local.sh and emit the six BRIDGE_TEMPLATE_DEFAULT_* values
+# as a shell-eval-able stream of `present\x1fvalue` lines (one per
+# dimension, in canonical order model/effort/permission_mode/plugins/
+# skills/channels). Only dimensions that emit a var inside the delimited
+# block are reported present. Extraction is delimiter-bounded (NOT a
+# source/eval of the block) so a malformed roster cannot run arbitrary
+# code through this reader — the create-side consumer that calls it is
+# already gated, but parse-don't-eval keeps the reader itself inert.
+#
+# Block format (the shared cross-lane contract):
+#   # === agb:template-defaults v1 (...) ===
+#   BRIDGE_TEMPLATE_DEFAULT_MODEL="..."
+#   ...
+#   # === end agb:template-defaults ===
+#
+# Prints nothing (and returns 0) when no profile block is present, so the
+# caller treats "no profile" and "profile with no dims" identically.
+bridge_template_defaults_profile_read() {
+  local roster_file="$1"
+  [[ -f "$roster_file" ]] || return 0
+  bridge_agent_manage_python "$roster_file" <<'PY'
+import re
+import shlex
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8", errors="ignore")
+
+block_re = re.compile(
+    r"^# === agb:template-defaults v1.*?^# === end agb:template-defaults ===",
+    flags=re.MULTILINE | re.DOTALL,
+)
+m = block_re.search(text)
+block = m.group(0) if m else ""
+
+DIMS = [
+    ("model", "BRIDGE_TEMPLATE_DEFAULT_MODEL"),
+    ("effort", "BRIDGE_TEMPLATE_DEFAULT_EFFORT"),
+    ("permission_mode", "BRIDGE_TEMPLATE_DEFAULT_PERMISSION_MODE"),
+    ("plugins", "BRIDGE_TEMPLATE_DEFAULT_PLUGINS"),
+    ("skills", "BRIDGE_TEMPLATE_DEFAULT_SKILLS"),
+    ("channels", "BRIDGE_TEMPLATE_DEFAULT_CHANNELS"),
+]
+US = "\x1f"
+for _dim, var in DIMS:
+    present = 0
+    value = ""
+    if block:
+        vm = re.search(rf"^{re.escape(var)}=(.*)$", block, flags=re.MULTILINE)
+        if vm:
+            rhs = vm.group(1).strip()
+            try:
+                parts = shlex.split(rhs)
+                value = parts[0] if parts else ""
+            except ValueError:
+                value = rhs
+            present = 1
+    sys.stdout.write(f"{present}{US}{value}\n")
+PY
+}
+
 bridge_agent_reclassify_static_admin() {
   local agent="$1"
   local old_source="$2"
@@ -1414,6 +1674,13 @@ emit_create_json() {
   # envelope also carries `manual_command` with the exact recovery
   # shell line — the python branches below own the mapping.
   local daemon_group_refresh="${17:-}"
+  # template-sync (#1427): a JSON object of the EXPLICIT roster
+  # dimensions the new agent will get (create flags + resolved defaults
+  # profile). "{}" / empty = a plain legacy-launch create with no
+  # materialized fields. Surfaced as the `materialize` envelope key so
+  # `agent create --json [--dry-run]` shows the explicit model/effort/pm/
+  # plugins/skills rows the agent will launch with.
+  local materialize_json="${18:-}"
 
   # Issue #1360: synthesize persona-aware next_steps from the same
   # helper the text-mode emitter uses. We pass the resulting newline-
@@ -1423,11 +1690,11 @@ emit_create_json() {
   local next_steps_lines=""
   next_steps_lines="$(bridge_create_next_steps_lines "$agent" "$engine" "$channels" "$isolation_mode")"
 
-  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" "$expressed_intent" "$daemon_group_refresh" "$next_steps_lines" <<'PY'
+  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" "$expressed_intent" "$daemon_group_refresh" "$next_steps_lines" "$materialize_json" <<'PY'
 import json
 import sys
 
-agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user, idle_timeout_persisted, loop_persisted, expressed_intent, daemon_group_refresh, next_steps_lines = sys.argv[1:]
+agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user, idle_timeout_persisted, loop_persisted, expressed_intent, daemon_group_refresh, next_steps_lines, materialize_json = sys.argv[1:]
 policy = {
     "idle_timeout": idle_timeout_persisted,
     "loop": loop_persisted,
@@ -1457,6 +1724,16 @@ payload = {
     "policy": policy,
     "next_steps": next_steps_list,
 }
+# template-sync (#1427): include the materialized EXPLICIT roster
+# dimensions when any are present. Emitted only when non-empty so a
+# plain create's envelope stays byte-stable for callers that did not opt
+# into template-sync.
+try:
+    _materialize = json.loads(materialize_json) if materialize_json else {}
+except json.JSONDecodeError:
+    _materialize = {}
+if _materialize:
+    payload["materialize"] = _materialize
 # Beta20 L2 Variant 3A — only emit the field when refresh was actually
 # attempted (linux-user isolation on Linux). Shared-mode / macOS callers
 # see a byte-stable envelope without the new key. r4 added the systemd-
@@ -2926,6 +3203,18 @@ run_create() {
   local role_text=""
   local launch_cmd=""
   local channels=""
+  # template-sync (#1427): per-dimension EXPLICIT roster fields the
+  # operator passed on `agent create`. Presence drives "explicit wins"
+  # over the defaults-profile (Contract I) materialization below: a
+  # dimension the operator set explicitly is never overwritten by the
+  # profile. permission_mode=legacy is rejected at parse time (the
+  # blanket --dangerously-skip-permissions pin is the legacy-launch
+  # contract, not a value to stamp onto a fresh managed role).
+  local model_present=0 model_value=""
+  local effort_present=0 effort_value=""
+  local pm_present=0 pm_value=""
+  local plugins_present=0 plugins_value=""
+  local skills_present=0 skills_value=""
   local discord_channel=""
   local notify_kind=""
   local notify_target=""
@@ -3057,6 +3346,41 @@ run_create() {
       --channels)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
         channels="$2"
+        shift 2
+        ;;
+      --model)
+        # template-sync (#1427): explicit per-agent model. Wins over the
+        # defaults-profile (Contract I) materialization below.
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        model_present=1
+        model_value="$2"
+        shift 2
+        ;;
+      --effort)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        effort_present=1
+        effort_value="$2"
+        shift 2
+        ;;
+      --permission-mode)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        if [[ "$2" == "legacy" ]]; then
+          bridge_die "refuse: --permission-mode legacy is not a materializable managed-role value (omit it to use the legacy-launch contract)."
+        fi
+        pm_present=1
+        pm_value="$2"
+        shift 2
+        ;;
+      --plugins)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        plugins_present=1
+        plugins_value="$2"
+        shift 2
+        ;;
+      --skills)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        skills_present=1
+        skills_value="$2"
         shift 2
         ;;
       --discord-channel)
@@ -3370,6 +3694,75 @@ report and reap test-fixture agents per their pattern."
   role_text="${role_text:-Long-lived agent role}"
   launch_cmd="${launch_cmd:-$(bridge_agent_default_launch_cmd "$engine")}"
   channels="$(bridge_normalize_channels_csv "$channels")"
+  # template-sync (#1427): resolve the defaults-profile (Contract I)
+  # against the operator's explicit create flags. Precedence per
+  # dimension: EXPLICIT create flag wins > profile default > unset. The
+  # profile is consumed ONLY here at create-time to MATERIALIZE explicit
+  # roster fields — it is never read by the live accessors (the safety
+  # invariant: an old roster with unset fields keeps hitting the
+  # legacy-launch path). permission_mode=legacy from the profile is
+  # never materialized. Channels resolve into $channels here so the role
+  # block writer emits them directly; the other five dims are written by
+  # the materialize-fields writer after the block lands.
+  local _ts_prof_model_present=0 _ts_prof_model_value=""
+  local _ts_prof_effort_present=0 _ts_prof_effort_value=""
+  local _ts_prof_pm_present=0 _ts_prof_pm_value=""
+  local _ts_prof_plugins_present=0 _ts_prof_plugins_value=""
+  local _ts_prof_skills_present=0 _ts_prof_skills_value=""
+  local _ts_prof_channels_present=0 _ts_prof_channels_value=""
+  local _ts_profile_stream=""
+  _ts_profile_stream="$(bridge_template_defaults_profile_read "$BRIDGE_ROSTER_LOCAL_FILE")"
+  if [[ -n "$_ts_profile_stream" ]]; then
+    local _ts_us=$'\x1f'
+    local -a _ts_rows=()
+    # footgun #11: feed the row stream via a temp file (`< file`), NOT a
+    # `<<<` here-string — the Bash 5.3.9 heredoc_write class also trips on
+    # here-strings (KNOWN_ISSUES #26 / lint-heredoc-ban H3). `printf '%s\n'`
+    # matches the here-string's trailing-newline behavior.
+    local _ts_line="" _ts_rows_tmp=""
+    _ts_rows_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-ts-rows.XXXXXX")"
+    printf '%s\n' "$_ts_profile_stream" >"$_ts_rows_tmp"
+    while IFS= read -r _ts_line; do
+      _ts_rows+=("$_ts_line")
+    done <"$_ts_rows_tmp"
+    rm -f "$_ts_rows_tmp"
+    # Rows are emitted in canonical dim order: model, effort,
+    # permission_mode, plugins, skills, channels.
+    if [[ ${#_ts_rows[@]} -ge 6 ]]; then
+      _ts_prof_model_present="${_ts_rows[0]%%"$_ts_us"*}";       _ts_prof_model_value="${_ts_rows[0]#*"$_ts_us"}"
+      _ts_prof_effort_present="${_ts_rows[1]%%"$_ts_us"*}";      _ts_prof_effort_value="${_ts_rows[1]#*"$_ts_us"}"
+      _ts_prof_pm_present="${_ts_rows[2]%%"$_ts_us"*}";          _ts_prof_pm_value="${_ts_rows[2]#*"$_ts_us"}"
+      _ts_prof_plugins_present="${_ts_rows[3]%%"$_ts_us"*}";     _ts_prof_plugins_value="${_ts_rows[3]#*"$_ts_us"}"
+      _ts_prof_skills_present="${_ts_rows[4]%%"$_ts_us"*}";      _ts_prof_skills_value="${_ts_rows[4]#*"$_ts_us"}"
+      _ts_prof_channels_present="${_ts_rows[5]%%"$_ts_us"*}";    _ts_prof_channels_value="${_ts_rows[5]#*"$_ts_us"}"
+    fi
+  fi
+  # Resolve each dimension into the materialize set. Explicit create
+  # flags (model_present etc.) win; otherwise the profile value (if any).
+  if [[ $model_present -eq 0 && "$_ts_prof_model_present" == "1" && -n "$_ts_prof_model_value" ]]; then
+    model_present=1; model_value="$_ts_prof_model_value"
+  fi
+  if [[ $effort_present -eq 0 && "$_ts_prof_effort_present" == "1" && -n "$_ts_prof_effort_value" ]]; then
+    effort_present=1; effort_value="$_ts_prof_effort_value"
+  fi
+  # permission_mode=legacy is never materialized — drop it from the
+  # profile resolution (the reader should already omit it, but guard).
+  if [[ $pm_present -eq 0 && "$_ts_prof_pm_present" == "1" && -n "$_ts_prof_pm_value" && "$_ts_prof_pm_value" != "legacy" ]]; then
+    pm_present=1; pm_value="$_ts_prof_pm_value"
+  fi
+  if [[ $plugins_present -eq 0 && "$_ts_prof_plugins_present" == "1" && -n "$_ts_prof_plugins_value" ]]; then
+    plugins_present=1; plugins_value="$_ts_prof_plugins_value"
+  fi
+  if [[ $skills_present -eq 0 && "$_ts_prof_skills_present" == "1" && -n "$_ts_prof_skills_value" ]]; then
+    skills_present=1; skills_value="$_ts_prof_skills_value"
+  fi
+  # Channels: only adopt the profile default when the operator passed no
+  # explicit --channels (empty $channels at this point). Feed it into
+  # $channels so bridge_write_role_block emits the BRIDGE_AGENT_CHANNELS
+  # line directly (no second writer pass for channels).
+  if [[ -z "$channels" && "$_ts_prof_channels_present" == "1" && -n "$_ts_prof_channels_value" ]]; then
+    channels="$(bridge_normalize_channels_csv "$_ts_prof_channels_value")"
+  fi
   users_json="$(bridge_normalize_user_specs_json "${user_specs[@]}")"
   if [[ "$isolation_mode" == "linux-user" ]]; then
     if [[ "$(bridge_host_platform)" != "Linux" ]]; then
@@ -3641,6 +4034,37 @@ report and reap test-fixture agents per their pattern."
     # next load re-reads disk instead of replaying the pre-create map.
     bridge_roster_cache_invalidate
     bridge_load_roster
+    # template-sync (#1427): materialize the resolved EXPLICIT roster
+    # dimensions (model / effort / permission_mode / plugins / skills)
+    # into the freshly-written managed block. channels was already
+    # emitted by bridge_write_role_block via $channels above, so it is
+    # NOT re-written here (avoids a redundant second writer pass). The
+    # block exists now (write + reload above), so the field-surgical
+    # writer can locate it. Each dimension is materialized only when
+    # present (explicit create flag OR resolved profile default); an
+    # unset dimension writes no line, so an agent created with no model/
+    # effort/pm flags and no profile keeps the legacy-launch contract
+    # (bridge_agent_uses_legacy_launch_flags stays true). Skipped when
+    # none of the five dims is present (the common no-profile case) so
+    # the byte emission for a plain `agent create` is unchanged.
+    if [[ $model_present -eq 1 || $effort_present -eq 1 || $pm_present -eq 1 \
+          || $plugins_present -eq 1 || $skills_present -eq 1 ]]; then
+      local _ts_mat_us=$'\x1f'
+      bridge_roster_materialize_fields_python \
+        "$agent" "$BRIDGE_ROSTER_LOCAL_FILE" "1" \
+        "BRIDGE_AGENT_MODEL${_ts_mat_us}${model_present}${_ts_mat_us}${model_value}" \
+        "BRIDGE_AGENT_EFFORT${_ts_mat_us}${effort_present}${_ts_mat_us}${effort_value}" \
+        "BRIDGE_AGENT_PERMISSION_MODE${_ts_mat_us}${pm_present}${_ts_mat_us}${pm_value}" \
+        "BRIDGE_AGENT_PLUGINS${_ts_mat_us}${plugins_present}${_ts_mat_us}${plugins_value}" \
+        "BRIDGE_AGENT_SKILLS${_ts_mat_us}${skills_present}${_ts_mat_us}${skills_value}" \
+        "BRIDGE_AGENT_CHANNELS${_ts_mat_us}0${_ts_mat_us}" >/dev/null
+      # Refresh the after-sha + reload so the create-side audit row below
+      # reflects the materialized fields, and bridge_load_roster sees the
+      # explicit values for any downstream step.
+      _create_audit_after_sha="$(bridge_agent_update_file_sha256 "$_create_audit_roster_path")"
+      bridge_roster_cache_invalidate
+      bridge_load_roster
+    fi
     if [[ "$engine" == "claude" ]]; then
       # Issue #570: managed autoCompactWindow default is unconditionally
       # 1_000_000; launch_cmd is forwarded only for caller-signature parity
@@ -3892,12 +4316,39 @@ report and reap test-fixture agents per their pattern."
     elif [[ $loop_mode -eq 1 ]]; then
       _emit_loop="yes"
     fi
+    # template-sync (#1427): pre-serialize the EXPLICIT roster dimensions
+    # the new agent will get (create flags + resolved profile) into one
+    # JSON object so the envelope carries a `materialize` block without
+    # widening emit_create_json's positional list per-dimension. Only
+    # present dimensions are included; an empty object means "plain
+    # legacy-launch create".
+    local _emit_materialize_json
+    _emit_materialize_json="$(
+      python3 -c '
+import json, sys
+# argv pairs: present, value per dimension (model/effort/pm/plugins/skills).
+a = sys.argv[1:]
+dims = ["model", "effort", "permission_mode", "plugins", "skills"]
+out = {}
+for i, dim in enumerate(dims):
+    present = a[i * 2]
+    value = a[i * 2 + 1]
+    if present == "1":
+        out[dim] = value
+print(json.dumps(out))
+' \
+        "$model_present" "$model_value" \
+        "$effort_present" "$effort_value" \
+        "$pm_present" "$pm_value" \
+        "$plugins_present" "$plugins_value" \
+        "$skills_present" "$skills_value"
+    )"
     emit_create_json \
       "$agent" "$engine" "$session" "$workdir" "$profile_home" \
       "$launch_cmd" "$channels" "$BRIDGE_ROSTER_LOCAL_FILE" "$dry_run" \
       "$users_json" "$session_type" "$isolation_mode" "$os_user" \
       "$_emit_idle_timeout" "$_emit_loop" "$always_on_intent" \
-      "$daemon_group_refresh_status"
+      "$daemon_group_refresh_status" "$_emit_materialize_json"
     exit 0
   fi
 
@@ -3913,6 +4364,28 @@ report and reap test-fixture agents per their pattern."
   printf 'users: %s\n' "$users_json"
   if [[ -n "$channels" ]]; then
     printf 'channels: %s\n' "$channels"
+  fi
+  # template-sync (#1427): surface the EXPLICIT roster dimensions the new
+  # agent will get (from create flags and/or the resolved defaults
+  # profile). Printed for both dry-run and apply so the operator can see
+  # the agent will launch with the materialized model/effort/pm/plugins/
+  # skills rows, NOT the implicit legacy-launch fallback. channels is
+  # already printed above. Suppressed entirely when no dimension is
+  # present (plain create / no profile) to keep output minimal.
+  if [[ $model_present -eq 1 ]]; then
+    printf 'materialize_model: %s\n' "$model_value"
+  fi
+  if [[ $effort_present -eq 1 ]]; then
+    printf 'materialize_effort: %s\n' "$effort_value"
+  fi
+  if [[ $pm_present -eq 1 ]]; then
+    printf 'materialize_permission_mode: %s\n' "$pm_value"
+  fi
+  if [[ $plugins_present -eq 1 ]]; then
+    printf 'materialize_plugins: %s\n' "$plugins_value"
+  fi
+  if [[ $skills_present -eq 1 ]]; then
+    printf 'materialize_skills: %s\n' "$skills_value"
   fi
   printf 'isolation_mode: %s\n' "$isolation_mode"
   if [[ -n "$os_user" ]]; then
@@ -6472,6 +6945,366 @@ run_handoff() {
   bridge_admin_maintenance_dispatch handoff "$agent" "$note"
 }
 
+# run_roster_materialize_fields — template-sync Contract II (#1427). The
+# multi-field atomic roster writer that `setup template-sync` (Lane B) and
+# `agent create`'s defaults-profile consumption (below) both call. Writes
+# ONLY the six named roster dimensions (model / effort / permission_mode /
+# plugins / skills / channels) into the agent's existing managed-role
+# block, preserving every other field byte-for-byte. Never touches
+# .claude/settings.json. Refuses --permission-mode legacy (the blanket
+# --dangerously-skip-permissions pin must never be materialized onto a
+# managed role). Empty value for a dimension = "leave unset / don't
+# write". Idempotent (no-change → no-op, exit 0). Gated on the SAME
+# system-config mutation boundary as `agent create` (operator-tui /
+# operator-trusted-id) and audited through the same emit path.
+run_roster_materialize_fields() {
+  local agent="${1:-}"
+  shift || true
+
+  case "$agent" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+  esac
+
+  [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") roster materialize-fields <agent> [--model ..] [--effort ..] [--permission-mode ..] [--plugins <csv>] [--skills <csv>] [--channels <csv>] [--dry-run] [--json]"
+  bridge_require_agent "$agent"
+
+  # Per-dimension presence + value. Presence drives whether the writer
+  # emits/replaces the field line; an unpassed flag leaves the dimension
+  # untouched (NOT cleared). Mirrors the typed-flag tri-state shape the
+  # `agent update` path uses.
+  local model_present=0 model_value=""
+  local effort_present=0 effort_value=""
+  local pm_present=0 pm_value=""
+  local plugins_present=0 plugins_value=""
+  local skills_present=0 skills_value=""
+  local channels_present=0 channels_value=""
+  local dry_run=0
+  local json_mode=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        model_present=1
+        model_value="$2"
+        shift 2
+        ;;
+      --effort)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        effort_present=1
+        effort_value="$2"
+        shift 2
+        ;;
+      --permission-mode)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        pm_present=1
+        pm_value="$2"
+        shift 2
+        ;;
+      --plugins)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        plugins_present=1
+        plugins_value="$2"
+        shift 2
+        ;;
+      --skills)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        skills_present=1
+        skills_value="$2"
+        shift 2
+        ;;
+      --channels)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        channels_present=1
+        channels_value="$2"
+        shift 2
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *)
+        bridge_die "지원하지 않는 roster materialize-fields 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  # Refuse permission_mode=legacy unconditionally. Materializing the
+  # `legacy` pin onto a managed role would silently re-attach the blanket
+  # --dangerously-skip-permissions launch shape — exactly what the
+  # design's hard security invariant #2 forbids.
+  if [[ $pm_present -eq 1 && "$pm_value" == "legacy" ]]; then
+    bridge_die "refuse: permission_mode=legacy is never materialized onto a managed role (omit the dimension)."
+  fi
+
+  # Same system-config mutation boundary as `agent create`
+  # (bridge-agent.sh run_create §#1047 gate): the source must be
+  # operator-tui / operator-trusted-id. An agent-direct caller is denied
+  # here just as it is for create / update / delete. Applies to --dry-run
+  # too, mirroring the create-side gate.
+  local caller_source
+  caller_source="$(bridge_agent_update_caller_source)"
+  if [[ "$caller_source" != "operator-tui" && "$caller_source" != "operator-trusted-id" ]]; then
+    bridge_die "deny: caller source $caller_source is not allowed to mutate system config (need operator-tui or operator-trusted-id)"
+  fi
+
+  # An empty value for a present dimension means "leave unset" — collapse
+  # it to present=0 so the writer never emits an empty managed field line.
+  [[ $model_present -eq 1 && -z "$model_value" ]] && model_present=0
+  [[ $effort_present -eq 1 && -z "$effort_value" ]] && effort_present=0
+  [[ $pm_present -eq 1 && -z "$pm_value" ]] && pm_present=0
+  [[ $plugins_present -eq 1 && -z "$plugins_value" ]] && plugins_present=0
+  [[ $skills_present -eq 1 && -z "$skills_value" ]] && skills_present=0
+  [[ $channels_present -eq 1 && -z "$channels_value" ]] && channels_present=0
+
+  local us=$'\x1f'
+  local roster_path="$BRIDGE_ROSTER_LOCAL_FILE"
+  local before_sha
+  before_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
+  local before_channels
+  before_channels="$(bridge_agent_channels_csv "$agent")"
+
+  local apply=1
+  [[ $dry_run -eq 1 ]] && apply=0
+
+  local result_json
+  result_json="$(bridge_roster_materialize_fields_python \
+    "$agent" "$roster_path" "$apply" \
+    "BRIDGE_AGENT_MODEL${us}${model_present}${us}${model_value}" \
+    "BRIDGE_AGENT_EFFORT${us}${effort_present}${us}${effort_value}" \
+    "BRIDGE_AGENT_PERMISSION_MODE${us}${pm_present}${us}${pm_value}" \
+    "BRIDGE_AGENT_PLUGINS${us}${plugins_present}${us}${plugins_value}" \
+    "BRIDGE_AGENT_SKILLS${us}${skills_present}${us}${skills_value}" \
+    "BRIDGE_AGENT_CHANNELS${us}${channels_present}${us}${channels_value}")"
+
+  local changed
+  changed="$(printf '%s' "$result_json" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("changed") else "0")')"
+
+  if [[ $apply -eq 1 && "$changed" == "1" ]]; then
+    # The roster file changed on disk; invalidate the per-process cache so
+    # a subsequent in-process read re-reads it. (Each CLI invocation is its
+    # own process, but keep the contract identical to create / update.)
+    bridge_roster_cache_invalidate
+    local after_sha after_channels operation
+    after_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
+    bridge_load_roster
+    after_channels="$(bridge_agent_channels_csv "$agent")"
+    operation="$(bridge_roster_materialize_operation_summary "$result_json")"
+    local caller_actor="$caller_source"
+    [[ "$caller_actor" == "operator-tui" ]] && caller_actor="operator"
+    bridge_agent_update_emit_audit \
+      "roster-materialize-apply" \
+      "$caller_actor" \
+      "$caller_source" \
+      "$agent" \
+      "$roster_path" \
+      "$before_sha" \
+      "$after_sha" \
+      "roster_materialize_fields $operation" \
+      "" \
+      "" \
+      "" \
+      "$before_channels" \
+      "$after_channels" \
+      "[]"
+  fi
+
+  if [[ $json_mode -eq 1 ]]; then
+    printf '%s\n' "$result_json"
+    return 0
+  fi
+
+  bridge_roster_materialize_print_diff "$result_json" "$dry_run"
+}
+
+# bridge_roster_materialize_operation_summary — derive a comma-joined
+# `<dim>=<after>` summary for the audit `operation` field from the writer's
+# result JSON, listing only the dimensions that actually changed.
+bridge_roster_materialize_operation_summary() {
+  local result_json="$1"
+  printf '%s' "$result_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+parts = []
+for dim, fv in d.get("fields", {}).items():
+    if fv.get("changed"):
+        after = fv.get("after", "")
+        parts.append(dim + "=" + str(after))
+print(",".join(parts))
+'
+}
+
+# bridge_roster_materialize_print_diff — human-readable before/after diff
+# for the non-JSON path. Lists every requested dimension with its
+# before→after transition; marks the dry-run / no-op cases explicitly.
+bridge_roster_materialize_print_diff() {
+  local result_json="$1"
+  local dry_run="$2"
+  printf '%s' "$result_json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+dry = sys.argv[1] == "1"
+print("agent: " + str(d.get("agent", "")))
+for dim, fv in d.get("fields", {}).items():
+    b = fv.get("before", "")
+    a = fv.get("after", "")
+    mark = " (changed)" if fv.get("changed") else ""
+    print("  {}: {!r} -> {!r}{}".format(dim, b, a, mark))
+if dry:
+    print("dry_run: yes")
+elif d.get("changed"):
+    print("materialize: ok")
+else:
+    print("materialize: no-op")
+' "$dry_run"
+}
+
+# run_roster_write_template_profile — template-sync (#1427) gated+audited
+# writer for the controller-owned `agb:template-defaults` block in
+# agent-roster.local.sh. The Lane B `setup template-sync` wizard renders
+# the block in python, then routes the actual file mutation through THIS
+# verb so the profile write crosses the SAME system-config boundary as
+# `agent create` (operator-tui / operator-trusted-id) and lands a
+# system-config audit row. The defaults profile drives every future
+# `agent create`, so it must never be a weaker write path than the
+# per-agent materialize writer. The splice itself is delegated to
+# `bridge-setup.py template-profile-write` (the single idempotent splice
+# implementation) so the block shape cannot drift between callers.
+# `--dry-run` gates but writes nothing and emits no audit.
+run_roster_write_template_profile() {
+  local source_agent=""
+  local roster_file=""
+  local block_file=""
+  local dry_run=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --source-agent)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        source_agent="$2"
+        shift 2
+        ;;
+      --roster-file)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        roster_file="$2"
+        shift 2
+        ;;
+      --block-file)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        block_file="$2"
+        shift 2
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *)
+        bridge_die "지원하지 않는 roster write-template-profile 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$roster_file" ]] || bridge_die "Usage: $(basename "$0") roster write-template-profile --source-agent <a> --roster-file <path> --block-file <path> [--dry-run]"
+  [[ -n "$block_file" ]] || bridge_die "roster write-template-profile: --block-file is required"
+  [[ -f "$block_file" ]] || bridge_die "roster write-template-profile: block file not found: $block_file"
+
+  # Same system-config mutation boundary as `agent create` and the
+  # materialize-fields writer above. Applies to --dry-run too so an
+  # agent-direct caller cannot even probe the write path.
+  local caller_source
+  caller_source="$(bridge_agent_update_caller_source)"
+  if [[ "$caller_source" != "operator-tui" && "$caller_source" != "operator-trusted-id" ]]; then
+    bridge_die "deny: caller source $caller_source is not allowed to mutate system config (need operator-tui or operator-trusted-id)"
+  fi
+
+  if [[ $dry_run -eq 1 ]]; then
+    return 0
+  fi
+
+  local before_sha
+  before_sha="$(bridge_agent_update_file_sha256 "$roster_file")"
+
+  # The python splice half (`bridge-setup.py template-profile-write`)
+  # independently re-enforces the SAME caller-source gate via the canonical
+  # BRIDGE_CALLER_SOURCE contract. Propagate the source THIS verb already
+  # verified so the child does not have to re-derive it across the piped
+  # stdio of the wizard->verb->python chain (the TTY signal is lost once the
+  # wizard captures the verb's stdout). This is the documented
+  # "verified caller declares its source" mechanism, not a bespoke sentinel
+  # — a direct agent-direct python call (no operator source) is still denied.
+  bridge_require_python
+  BRIDGE_CALLER_SOURCE="$caller_source" \
+    python3 "$SCRIPT_DIR/bridge-setup.py" template-profile-write \
+    --roster-file "$roster_file" --block-file "$block_file" \
+    || bridge_die "roster write-template-profile: splice/write failed for $roster_file"
+
+  local after_sha
+  after_sha="$(bridge_agent_update_file_sha256 "$roster_file")"
+
+  if [[ "$before_sha" != "$after_sha" ]]; then
+    bridge_roster_cache_invalidate
+    bridge_load_roster
+    local caller_actor="$caller_source"
+    [[ "$caller_actor" == "operator-tui" ]] && caller_actor="operator"
+    bridge_agent_update_emit_audit \
+      "roster-write-template-profile" \
+      "$caller_actor" \
+      "$caller_source" \
+      "${source_agent:-(template-defaults)}" \
+      "$roster_file" \
+      "$before_sha" \
+      "$after_sha" \
+      "template_defaults_profile source_agent=${source_agent:-unknown}" \
+      "" \
+      "" \
+      "" \
+      "" \
+      "" \
+      "[]"
+  fi
+}
+
+# run_roster — template-sync (#1427) roster sub-dispatch. Hosts the
+# Contract-II materialize-fields writer and the gated template-defaults
+# profile writer. Reached via `agent-bridge agent roster <action>` (the
+# `agent` verb execs this script with the roster subcommand). Exposed as a
+# distinct verb so the Lane B wizard and the create-side profile
+# consumption share one audited write path rather than duplicating
+# roster-line surgery.
+run_roster() {
+  local action="${1:-}"
+  shift || true
+  case "$action" in
+    materialize-fields)
+      run_roster_materialize_fields "$@"
+      ;;
+    write-template-profile)
+      run_roster_write_template_profile "$@"
+      ;;
+    ""|-h|--help|help)
+      usage
+      ;;
+    *)
+      bridge_die "지원하지 않는 roster 명령입니다: $action"
+      ;;
+  esac
+}
+
 subcommand="${1:-}"
 shift || true
 
@@ -6504,6 +7337,11 @@ case "$subcommand" in
     ;;
   reclassify)
     run_reclassify "$@"
+    ;;
+  roster)
+    # template-sync (#1427): roster-field surgery sub-dispatch. Hosts the
+    # Contract-II `materialize-fields` writer.
+    run_roster "$@"
     ;;
   doctor)
     bridge_doctor_run "$@"
@@ -6544,7 +7382,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create update delete retire list registry show describe reclassify doctor rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
+      "create update delete retire list registry show describe reclassify roster doctor rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;
