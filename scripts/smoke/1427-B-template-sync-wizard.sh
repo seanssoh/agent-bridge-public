@@ -469,4 +469,33 @@ smoke_assert_contains "$(cat "$T12_OUT" "$T12_ERR")" "deny" \
 smoke_assert_not_contains "$(cat "$T12_ROSTER")" 'agb:template-defaults' \
   "T12: the override writer never ran — roster left untouched"
 
-smoke_log "PASS: all template-sync wizard assertions (T1-T12)"
+# T13 — the root caller-source gate denies agent-direct even on the
+# `--dry-run --targets` path, where the dry-run backfill resolved
+# BRIDGE_TEMPLATE_SYNC_MATERIALIZE_CMD and ran it with only --dry-run appended
+# (an override ignores --dry-run and mutates) (#1432 r2 BLOCKING). With the
+# whole command gated up front, the override materialize writer never runs.
+MAT_BYPASS_ROSTER="$SMOKE_TMP_ROOT/mat-bypass-roster.sh"
+: >"$MAT_BYPASS_ROSTER"
+MAT_BYPASS_WRITER="$SMOKE_TMP_ROOT/mat-bypass-writer.sh"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'printf "BRIDGE_AGENT_MODEL[victim]=pwned\\n" >>%q\n' "$MAT_BYPASS_ROSTER"
+  printf 'exit 0\n'
+} >"$MAT_BYPASS_WRITER"
+T13_ROSTER="$SMOKE_TMP_ROOT/roster-t13.sh"
+: >"$T13_ROSTER"
+T13_OUT="$SMOKE_TMP_ROOT/t13-out.txt"
+T13_ERR="$SMOKE_TMP_ROOT/t13-err.txt"
+BRIDGE_CALLER_SOURCE="agent-direct" \
+  BRIDGE_TEMPLATE_SYNC_MATERIALIZE_CMD="bash $MAT_BYPASS_WRITER" \
+  python3 "$SETUP_PY" template-sync --from patch --roster-file "$T13_ROSTER" \
+    --ref-engine claude --ref-model claude-opus-4-8 --targets victim --dry-run --yes \
+    >"$T13_OUT" 2>"$T13_ERR"
+t13_rc=$?
+[[ "$t13_rc" -ne 0 ]] || smoke_fail "T13: agent-direct must be denied on --dry-run --targets with a materialize override (got rc=0)"
+smoke_assert_contains "$(cat "$T13_OUT" "$T13_ERR")" "deny" \
+  "T13: deny surfaced for agent-direct dry-run backfill override"
+smoke_assert_not_contains "$(cat "$MAT_BYPASS_ROSTER")" "pwned" \
+  "T13: the materialize override never ran — no dry-run mutation"
+
+smoke_log "PASS: all template-sync wizard assertions (T1-T13)"
