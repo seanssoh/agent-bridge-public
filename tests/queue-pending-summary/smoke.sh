@@ -1,17 +1,27 @@
 #!/usr/bin/env bash
-# queue-pending-summary smoke — issue #509 D1 follow-up.
+# queue-pending-summary smoke — issue #509 D1 follow-up, updated for #1199.
 #
-# Asserts that hooks/bridge_hook_common.queue_summary excludes blocked-state
-# tasks from the `pending` count. The SessionStart hook only nudges with
-# `[Agent Bridge] N pending task(s) … ACTION REQUIRED` when at least one
-# queued or claimed task exists — operator-set blocked-with-reason tasks
-# are waiting on external unblock and must not re-fire the nudge after
-# every `bridge-task update --status blocked`.
+# Asserts that hooks/bridge_hook_common.queue_summary counts ONLY queued
+# tasks in the ACTION REQUIRED `pending`. The Stop/SessionStart hook only
+# nudges with `[Agent Bridge] N pending task(s) … ACTION REQUIRED` when at
+# least one genuinely-queued task exists:
+#   - blocked tasks (issue #509) wait on external unblock; counting them
+#     re-fired the nudge after every `bridge-task update --status blocked`.
+#   - claimed tasks (issue #1199) are already being handled; counting them
+#     re-fired the nudge the instant an agent/operator ran `agb claim` on a
+#     just-delivered `[task-complete]` task — the "immediate re-nudge after
+#     claim" symptom. The codex Stop-hook anti-abandonment gate ("continue
+#     your open claimed work") is preserved separately in check_inbox.py via
+#     open_claimed_count / top_claimed_row — it is NOT this ACTION REQUIRED
+#     pending count.
 #
 # Cases:
-#   D1a — 1 queued + 1 blocked + 0 claimed → pending=1 (NOT 2)
+#   D1a — 1 queued + 1 blocked + 0 claimed → pending=1 (blocked excluded)
 #   D1b — 0 queued + 2 blocked + 0 claimed → pending=0 (no nudge, row None)
-#   D1c — 0 queued + 1 blocked + 1 claimed → pending=1
+#   D1c — 0 queued + 1 blocked + 1 claimed → pending=0 (#1199: claimed
+#         excluded; no immediate re-nudge after claim, row None)
+#   D1d — 2 queued + 0 blocked + 1 claimed → pending=2 (only the queued
+#         tasks count; the claimed one does not inflate N)
 #
 # Stubs queue_cli via a monkeypatched function in-process so the test does
 # not need a real SQLite queue.
@@ -68,10 +78,18 @@ def fake_queue_cli(args):
         }
         return FakeProc(json.dumps([row]))
     if args[:1] == ["find-open"]:
-        # Return a top-priority queued task only when queued > 0; for
-        # claimed-only setups the daemon would still surface a row, so
-        # mirror that.
-        if int(queued) + int(claimed) > 0:
+        # Issue #1199: queue_summary now fetches the "Highest priority" row
+        # with `find-open --status-filter queued`, so the row exists iff a
+        # genuinely-queued task exists. A claimed task never surfaces a row
+        # for the ACTION REQUIRED line.
+        if "--status-filter" in args:
+            sf = args[args.index("--status-filter") + 1]
+            available = int(queued) if sf == "queued" else (
+                int(claimed) if sf == "claimed" else int(blocked)
+            )
+        else:
+            available = int(queued) + int(claimed) + int(blocked)
+        if available > 0:
             return FakeProc(json.dumps({"id": 42, "priority": "normal", "title": "x"}))
         return FakeProc("")
     return FakeProc("", returncode=1)
@@ -107,11 +125,20 @@ else
   fail "D1b: $(cat err.tmp)"
 fi
 
-# D1c — 0 queued + 1 blocked + 1 claimed → pending=1 (claimed counts)
-if run_case 0 1 1 1 0 2>err.tmp; then
-  pass "D1c: queued=0 blocked=1 claimed=1 → pending=1"
+# D1c — 0 queued + 1 blocked + 1 claimed → pending=0, row None (#1199:
+# claimed excluded → no immediate re-nudge after claim)
+if run_case 0 1 1 0 1 2>err.tmp; then
+  pass "D1c: queued=0 blocked=1 claimed=1 → pending=0, no nudge (#1199)"
 else
   fail "D1c: $(cat err.tmp)"
+fi
+
+# D1d — 2 queued + 0 blocked + 1 claimed → pending=2 (only queued counts;
+# the claimed task does not inflate the ACTION REQUIRED N)
+if run_case 2 0 1 2 0 2>err.tmp; then
+  pass "D1d: queued=2 blocked=0 claimed=1 → pending=2 (claimed not counted)"
+else
+  fail "D1d: $(cat err.tmp)"
 fi
 
 rm -f err.tmp

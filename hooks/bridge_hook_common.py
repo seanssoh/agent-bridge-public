@@ -1204,6 +1204,31 @@ def session_start_context(agent: str) -> str:
 
 
 def queue_summary(agent: str) -> tuple[int, dict[str, Any] | None]:
+    """Return (queued_pending, top_queued_row) for the ACTION REQUIRED nudge.
+
+    Issue #1199: the ACTION REQUIRED nudge is a "you have QUEUED work — claim
+    the highest-priority one now" call-to-action. It must count ONLY
+    `status == 'queued'` tasks. A `claimed` task is already being handled by
+    the agent, and a `blocked` task waits on an external unblock — neither is
+    actionable-via-claim, so neither belongs in the pending count or the
+    "Highest priority" line.
+
+    Before this fix `pending` summed queued + claimed, so the moment an agent
+    (or the operator) ran `agb claim` on a freshly-delivered `[task-complete]`
+    task, the very next turn-boundary Stop hook (`mark-idle.sh` →
+    `check-inbox.py --format text`) re-injected
+    `… ACTION REQUIRED … claim the first one immediately` for the task it had
+    JUST claimed — the operator's exact "immediate re-nudge after claim"
+    symptom. `blocked` was already excluded (PR #516/#518) to stop
+    block-update re-fires; this drops the residual `claimed` term.
+
+    The "Highest priority" row is now fetched with `--status-filter queued`
+    so it can never cite a claimed/blocked task even when one outranks the
+    queued head by priority. The codex Stop-hook anti-abandonment gate ("you
+    still have open claimed work, continue it") is preserved separately in
+    `check_inbox.py` via `open_claimed_count` — it is NOT an ACTION REQUIRED
+    nudge and does not tell the agent to re-claim.
+    """
     summary_proc = queue_cli(["summary", "--agent", agent, "--format", "json"])
     if summary_proc.returncode != 0 or not summary_proc.stdout.strip():
         return 0, None
@@ -1216,16 +1241,13 @@ def queue_summary(agent: str) -> tuple[int, dict[str, Any] | None]:
     row = rows[0] if isinstance(rows[0], dict) else None
     if not row:
         return 0, None
-    # `blocked` tasks intentionally excluded — they wait on external unblock,
-    # not on the agent acting now. Admin agents still see blocked-task counts
-    # via `admin_blocked_self_cleanup_context` above. Without this exclusion,
-    # every `bridge-task update --status blocked` re-fires the SessionStart
-    # `[Agent Bridge] N pending task(s) … ACTION REQUIRED` nudge.
-    pending = int(row.get("queued_count", 0)) + int(row.get("claimed_count", 0))
+    pending = int(row.get("queued_count", 0))
     if pending <= 0:
         return 0, None
 
-    top_proc = queue_cli(["find-open", "--agent", agent, "--format", "json"])
+    top_proc = queue_cli(
+        ["find-open", "--agent", agent, "--status-filter", "queued", "--format", "json"]
+    )
     if top_proc.returncode != 0 or not top_proc.stdout.strip():
         return pending, None
     try:
@@ -1235,6 +1257,45 @@ def queue_summary(agent: str) -> tuple[int, dict[str, Any] | None]:
     if not isinstance(top_row, dict):
         return pending, None
     return pending, top_row
+
+
+def open_claimed_count(agent: str) -> int:
+    """Return the number of tasks currently `claimed` by ``agent``.
+
+    Used by the codex Stop hook to keep its anti-abandonment gate — "you
+    still have open claimed work, continue it instead of ending the session" —
+    after issue #1199 dropped `claimed` from the ACTION REQUIRED pending
+    count. This is intentionally NOT an ACTION REQUIRED nudge: it never tells
+    the agent to re-claim a task it already holds.
+    """
+    summary_proc = queue_cli(["summary", "--agent", agent, "--format", "json"])
+    if summary_proc.returncode != 0 or not summary_proc.stdout.strip():
+        return 0
+    try:
+        rows = json.loads(summary_proc.stdout)
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return 0
+    return int(rows[0].get("claimed_count", 0) or 0)
+
+
+def top_claimed_row(agent: str) -> dict[str, Any] | None:
+    """Return the highest-priority open `claimed` task row for ``agent``.
+
+    Companion to ``open_claimed_count`` for the codex Stop-hook "continue your
+    claimed work" message. Returns None when the agent holds no claimed task.
+    """
+    top_proc = queue_cli(
+        ["find-open", "--agent", agent, "--status-filter", "claimed", "--format", "json"]
+    )
+    if top_proc.returncode != 0 or not top_proc.stdout.strip():
+        return None
+    try:
+        top_row = json.loads(top_proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    return top_row if isinstance(top_row, dict) else None
 
 
 def queue_attention_message(agent: str, pending: int, row: dict[str, Any] | None) -> str:
