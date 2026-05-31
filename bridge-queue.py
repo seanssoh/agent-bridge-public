@@ -955,6 +955,76 @@ def cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_upsert_open(args: argparse.Namespace) -> int:
+    # Issue #1408: atomic refresh-or-create for daemon-generated recurring
+    # alerts (A2A outbox-stuck, unclaimed-task escalation). A shell
+    # find-open-then-update/create sequence races between daemon ticks and
+    # bypasses the single-writer contract; this routes both families through
+    # the same upsert_open_task() the blocked-aging family uses.
+    #
+    # ATOMICITY (codex r1 BLOCKING): upsert_open_task() does a SELECT
+    # (find_open_task_by_prefix) and only then an INSERT-or-UPDATE. Python's
+    # sqlite3 in its default isolation mode does NOT take a write lock before a
+    # SELECT, and WAL allows concurrent readers, so two simultaneous ticks
+    # could both miss the row and both INSERT — the exact race we are closing.
+    # There is no unique-key on the open-alert prefix in the shared `tasks`
+    # schema (adding one is a riskier migration). So we acquire the RESERVED
+    # write lock with an explicit `BEGIN IMMEDIATE` BEFORE the SELECT, which
+    # serializes concurrent upserts against this and every other queue writer.
+    # `busy_timeout` makes a contending writer wait rather than fail, and we
+    # retry a bounded number of times on the rare residual "database is locked".
+    actor = args.actor or os.environ.get("USER", "unknown")
+    body_text = args.body
+    if args.body_file is not None:
+        inline_text, _stable_path = stabilize_body_file(normalize_path(args.body_file))
+        body_text = inline_text
+    if body_text is None:
+        body_text = ""
+
+    attempts = 0
+    max_attempts = 5
+    while True:
+        attempts += 1
+        current_ts = now_ts()
+        with closing(connect()) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            try:
+                # BEGIN IMMEDIATE is inside the try so a lock timeout while
+                # ACQUIRING the RESERVED lock is also covered by the retry
+                # ladder (codex r2 nit), not just contention during the write.
+                conn.execute("BEGIN IMMEDIATE")
+                task_id, created = upsert_open_task(
+                    conn,
+                    agent=args.assigned_to,
+                    title_prefix=args.title_prefix,
+                    title=args.title.strip(),
+                    priority=args.priority,
+                    actor=actor,
+                    body_text=body_text,
+                    current_ts=current_ts,
+                    refresh_note=args.refresh_note or "daemon refreshed recurring alert",
+                )
+                conn.commit()
+            except sqlite3.OperationalError as exc:
+                conn.rollback()
+                if "locked" in str(exc).lower() and attempts < max_attempts:
+                    continue
+                raise
+            except BaseException:
+                conn.rollback()
+                raise
+        break
+
+    if args.format == "shell":
+        print(f"TASK_ID={shlex.quote(str(task_id))}")
+        print(f"TASK_CREATED={shlex.quote('1' if created else '0')}")
+        return 0
+
+    verb = "created" if created else "refreshed"
+    print(f"{verb} task #{task_id} for {args.assigned_to} [{args.priority}] {args.title.strip()}")
+    return 0
+
+
 def cmd_inbox(args: argparse.Namespace) -> int:
     statuses = list(args.status or [])
     if args.all:
@@ -2612,6 +2682,23 @@ def build_parser() -> argparse.ArgumentParser:
     body_group.add_argument("--body")
     body_group.add_argument("--body-file")
     create_parser.set_defaults(handler=cmd_create)
+
+    # Issue #1408: atomic refresh-or-create keyed by a stable title prefix.
+    # Daemon-internal (controller-direct); used by the A2A outbox-stuck scan
+    # and the unclaimed-task escalation to keep a SINGLE open admin task per
+    # recurring condition instead of minting a new task each cooldown window.
+    upsert_parser = subparsers.add_parser("upsert-open", allow_abbrev=False)
+    upsert_parser.add_argument("--to", dest="assigned_to", required=True)
+    upsert_parser.add_argument("--title-prefix", required=True)
+    upsert_parser.add_argument("--title", required=True)
+    upsert_parser.add_argument("--from", dest="actor")
+    upsert_parser.add_argument("--priority", choices=PRIORITY_CHOICES, default="normal")
+    upsert_parser.add_argument("--refresh-note")
+    upsert_parser.add_argument("--format", choices=("text", "shell"), default="text")
+    upsert_body_group = upsert_parser.add_mutually_exclusive_group()
+    upsert_body_group.add_argument("--body")
+    upsert_body_group.add_argument("--body-file")
+    upsert_parser.set_defaults(handler=cmd_upsert_open)
 
     inbox_parser = subparsers.add_parser("inbox", allow_abbrev=False)
     inbox_parser.add_argument("--agent", required=True)
