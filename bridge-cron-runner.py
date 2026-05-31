@@ -303,17 +303,27 @@ def claude_token_registry_path() -> Path:
 
 
 def validate_claude_keychain_free_auth(config_dir: Path) -> None:
+    # Darwin-gated. The keychain-free apiKeyHelper feature only does work on
+    # macOS — and macOS never carries Linux-user (iso v2) agents, so
+    # ``_isolated_user_for_agent`` returns None there and ``config_dir`` is
+    # always a controller-readable shared-mode path. That gate is what makes
+    # the ``settings_file.is_file()`` probe below controller-only safe: on
+    # Linux (where ``config_dir`` could be an iso-UID ~/.claude the controller
+    # cannot stat) this function returns before touching the filesystem. Do
+    # NOT relocate these probes outside the Darwin gate without routing them
+    # through the iso-safe pathlib helpers — that would reintroduce the
+    # blind-iso-path stat the raw-pathlib ratchet guards against.
     if host_platform() != "Darwin" or not claude_keychain_free_auth_enabled():
         return
 
     helper_path = claude_api_key_helper_path()
-    if not helper_path.is_file() or not os.access(helper_path, os.X_OK):  # noqa: raw-pathlib-controller-only - controller helper preflight
+    if not helper_path.is_file() or not os.access(helper_path, os.X_OK):  # noqa: raw-pathlib-controller-only - controller helper preflight (in-repo helper path; Darwin-only)
         raise RuntimeError(
             f"Claude keychain-free auth is enabled but apiKeyHelper is not executable: {helper_path}"
         )
 
     settings_file = config_dir / "settings.json"
-    if not settings_file.is_file():  # noqa: raw-pathlib-controller-only - controller settings preflight
+    if not settings_file.is_file():  # noqa: raw-pathlib-controller-only - controller settings preflight (Darwin-only ⇒ no iso UID ⇒ controller-readable config_dir)
         raise RuntimeError(
             f"Claude keychain-free auth is enabled but settings.json is missing: {settings_file}"
         )

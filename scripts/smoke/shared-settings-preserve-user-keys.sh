@@ -151,6 +151,32 @@ assert_idempotent() {
     "shared renderer is idempotent across consecutive renders"
 }
 
+assert_renderer_does_not_resurrect_removed_apikeyhelper() {
+  # #1444 BLOCKING 1 companion: the gate (bridge-auth.py) removes the
+  # bridge-managed apiKeyHelper from settings.json when keychain-free auth
+  # is disabled. The shared renderer must NOT silently resurrect it — its
+  # preserve allowlist only carries forward whatever the effective file
+  # already holds, so once the gate has dropped the key, a re-render keeps
+  # it dropped. Mirror the post-disable state (apiKeyHelper absent) and
+  # confirm the renderer leaves it absent.
+  local helper="$SMOKE_REPO_ROOT/scripts/python-helpers/claude-settings-gate-test.py"
+  python3 "$helper" remove-apikeyhelper --settings "$EFFECTIVE"
+  invoke_renderer >/dev/null
+  python3 "$helper" assert-apikeyhelper --settings "$EFFECTIVE" --absent \
+    || smoke_fail "renderer resurrected a removed apiKeyHelper (would undo disable cleanup)"
+  smoke_log "PASS: renderer does not resurrect a gate-removed apiKeyHelper"
+
+  # And the inverse: an operator-owned apiKeyHelper still round-trips, so
+  # the renderer never clobbers an operator value the gate left in place.
+  python3 "$helper" set-apikeyhelper --settings "$EFFECTIVE" \
+    --value "/opt/operator/my-own-helper.sh"
+  invoke_renderer >/dev/null
+  python3 "$helper" assert-apikeyhelper --settings "$EFFECTIVE" \
+    --equals "/opt/operator/my-own-helper.sh" \
+    || smoke_fail "renderer dropped an operator-owned apiKeyHelper"
+  smoke_log "PASS: renderer preserves an operator-owned apiKeyHelper"
+}
+
 main() {
   build_fixture
 
@@ -162,6 +188,8 @@ main() {
     assert_idempotent
   smoke_run "Agent Bridge dev plugin settings rendered from launch command" \
     assert_agent_bridge_plugin_settings_rendered
+  smoke_run "renderer does not resurrect a gate-removed apiKeyHelper (#1444)" \
+    assert_renderer_does_not_resurrect_removed_apikeyhelper
 
   smoke_log "PASS"
 }
