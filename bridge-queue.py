@@ -973,7 +973,7 @@ def cmd_upsert_open(args: argparse.Namespace) -> int:
     # serializes concurrent upserts against this and every other queue writer.
     # `busy_timeout` makes a contending writer wait rather than fail, and we
     # retry a bounded number of times on the rare residual "database is locked".
-    actor = args.actor or os.environ.get("USER", "unknown")
+    actor = args.actor or os.environ.get("USER", "unknown")  # noqa: iso-helper-boundary — os.environ (.environ) false-matches the .env boundary pattern; not an isolated-artifact reference
     body_text = args.body
     if args.body_file is not None:
         inline_text, _stable_path = stabilize_body_file(normalize_path(args.body_file))
