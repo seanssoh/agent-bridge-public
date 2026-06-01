@@ -320,6 +320,62 @@ def codex_snapshots(
     return snapshots
 
 
+# Issue #1437 PRIMARY: the native usage probe writes a controller-side cache
+# tagged with this sentinel agent id so its snapshots latch on an independent
+# key (provider::account::window::agent) and never collide with a real agent's
+# per-agent latch. It is an ADDITIVE source — it represents the
+# controller/non-isolated account's usage and must reach rotation even when
+# per-agent (isolated) caches are present, without re-introducing the #831
+# blind spot (isolated agents stay independently monitored).
+NATIVE_PROBE_AGENT = "__native__"
+NATIVE_PROBE_SOURCE = "native-oauth-probe"
+
+
+def _cache_is_native_probe(path: Path) -> bool:
+    """True only when the cache on disk was written BY the native probe.
+
+    Codex r2 BLOCKING: the additive native source must consume ONLY a cache the
+    native probe actually produced (``_source == native-oauth-probe``). A
+    statusLine/stdin-tap cache (``_source == stdin-tap``) — or any other cache
+    the probe left untouched after fail-opening — must NOT be read as the native
+    source, otherwise it reintroduces the #831 legacy-controller fallback through
+    the new arg (a stale 99% stdin-tap cache would spuriously rotate even when
+    every selected per-agent cache is present=false). Absent/unreadable/foreign
+    caches return False so the additive source contributes nothing.
+    """
+    if not path.is_file():
+        return False
+    try:
+        payload = load_json(path)
+    except Exception:
+        return False
+    return isinstance(payload, dict) and payload.get("_source") == NATIVE_PROBE_SOURCE
+
+
+def native_snapshots(
+    path: Path,
+    warn: float,
+    critical: float,
+    elevated: float | None = None,
+) -> list[dict[str, Any]]:
+    """Read the native-probe controller cache and tag it as the native source.
+
+    ONLY reads a cache whose ``_source == native-oauth-probe`` (see
+    ``_cache_is_native_probe``) — a foreign/stale cache is ignored so the
+    additive source cannot re-create the #831 legacy-controller fallback. On a
+    match, reuses the standard cache parser and stamps ``agent=__native__`` /
+    ``source=native-oauth-probe`` so the monitor latches it independently of any
+    per-agent snapshot. Returns [] when the file is absent/unreadable/foreign.
+    """
+    if not _cache_is_native_probe(path):
+        return []
+    snaps = claude_snapshots(path, warn, critical, elevated=elevated)
+    for snap in snaps:
+        snap["agent"] = NATIVE_PROBE_AGENT
+        snap["source"] = NATIVE_PROBE_SOURCE
+    return snaps
+
+
 def collect_snapshots(args: argparse.Namespace) -> list[dict[str, Any]]:
     warn = float(args.warn_threshold)
     critical = float(args.critical_threshold)
@@ -338,6 +394,7 @@ def collect_snapshots(args: argparse.Namespace) -> list[dict[str, Any]]:
     # is absent (true legacy invocation, e.g. an older operator script).
     per_agent_path_raw = getattr(args, "per_agent_cache_json", None)
     per_agent_mode_active = False
+    per_agent_resolved_paths: set[str] = set()
     if per_agent_path_raw:
         per_agent_path = Path(per_agent_path_raw).expanduser()
         per_agent_mode_active = _per_agent_payload_is_present(per_agent_path)
@@ -346,20 +403,73 @@ def collect_snapshots(args: argparse.Namespace) -> list[dict[str, Any]]:
                 per_agent_path, warn, critical, elevated=elevated
             )
             snapshots.extend(per_agent_snaps)
+            per_agent_resolved_paths = _per_agent_cache_paths(per_agent_path)
 
     if not per_agent_mode_active:
         # True legacy single-controller cache (back-compat). `--legacy-single-path`
         # is accepted as a synonym for `--claude-usage-cache` so the wrapper
-        # can always pass both without disturbing existing semantics.
+        # can always pass both without disturbing existing semantics. In this
+        # mode the legacy path already reads the controller cache the native
+        # probe wrote, so #1437's native signal flows without extra wiring.
         legacy_raw = getattr(args, "legacy_single_path", None) or args.claude_usage_cache
         snapshots.extend(
             claude_snapshots(Path(legacy_raw).expanduser(), warn, critical, elevated=elevated)
         )
 
+    # Issue #1437 PRIMARY: in per-agent mode the controller/native cache is
+    # otherwise suppressed (the #831 isolation guard). Read it ADDITIVELY here
+    # as its own `__native__`-tagged source so a headless host's native probe
+    # signal reaches rotation in the DEFAULT `--agents static` daemon path —
+    # without weakening the #831 per-agent suppression (isolated agents are
+    # still independently monitored above). Dedupe against any per-agent path
+    # that already resolved to the same file (a non-isolated agent's cache IS
+    # the controller cache), so we never double-count the same window.
+    native_raw = getattr(args, "native_usage_cache", None)
+    if per_agent_mode_active and native_raw:
+        native_path = Path(native_raw).expanduser()
+        if _resolve_str(native_path) not in per_agent_resolved_paths:
+            snapshots.extend(
+                native_snapshots(native_path, warn, critical, elevated=elevated)
+            )
+
     snapshots.extend(
         codex_snapshots(Path(args.codex_sessions_dir).expanduser(), warn, critical, elevated=elevated)
     )
     return snapshots
+
+
+def _resolve_str(path: Path) -> str:
+    """Best-effort absolute-path string for dedupe (does not require existence)."""
+    try:
+        return str(path.resolve())
+    except Exception:
+        return str(path)
+
+
+def _per_agent_cache_paths(per_agent_path: Path) -> set[str]:
+    """Resolved set of cache file paths the per-agent payload already consumed.
+
+    Used by #1437 to avoid double-counting the controller cache when a
+    non-isolated agent's resolved cache path IS the controller/native path.
+    Only ``present`` entries count — an absent per-agent cache did not
+    contribute a snapshot, so the native cache is not a duplicate of it.
+    """
+    paths: set[str] = set()
+    try:
+        entries = load_json(per_agent_path)
+    except Exception:
+        return paths
+    if not isinstance(entries, list):
+        return paths
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("present"):
+            continue
+        raw = entry.get("path")
+        if isinstance(raw, str) and raw.strip():
+            paths.add(_resolve_str(Path(raw).expanduser()))
+    return paths
 
 
 def _parse_elevated(args: argparse.Namespace, warn: float, critical: float) -> float:
@@ -660,6 +770,10 @@ def build_parser() -> argparse.ArgumentParser:
         # empty.
         cmd.add_argument("--per-agent-cache-json", default=None, **common_kwargs)
         cmd.add_argument("--legacy-single-path", default=None, **common_kwargs)
+        # Issue #1437 PRIMARY: the native-probe controller cache, read
+        # additively in per-agent mode (deduped against per-agent paths) so the
+        # native usage signal reaches rotation in the default daemon path.
+        cmd.add_argument("--native-usage-cache", default=None, **common_kwargs)
 
     status_parser = sub.add_parser("status")
     add_source_args(status_parser)

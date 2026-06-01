@@ -1293,6 +1293,72 @@ Manual fallback:
 agent-bridge auth claude-token rotate --reason manual --sync
 ```
 
+#### Native usage probe — proactive rotation on headless hosts (#1437)
+
+Auto-rotation needs a Claude `used_percent` signal. The original source was
+claude-hud's `.usage-cache.json`, written by a Claude Code **statusLine**
+process via `scripts/hud-usage-tap.py`. On a **headless cron host** there is
+no statusLine, so the cache is never written, the usage monitor sees no
+Claude window, and the OAuth token is never rotated **before** the account
+hard-limits — the operator only finds out when a 429 lands.
+
+The native usage probe (`bridge-usage-probe.py`) gives Agent Bridge its own
+percentage-driven source, **decoupled from claude-hud**. It performs a direct
+`GET https://api.anthropic.com/api/oauth/usage` with the **currently-active
+OAT** (read from the rotation registry; falling back to
+`CLAUDE_CODE_OAUTH_TOKEN` or `~/.claude/.credentials.json`), maps the
+response's `five_hour.utilization` / `seven_day.utilization` (a 0–100 scale)
+into the **same** `.usage-cache.json` shape the monitor already consumes
+(`data.fiveHour` / `sevenDay` / `fiveHourResetAt` / `sevenDayResetAt`), and
+atomically writes the controller cache. The rotation/threshold logic is
+**unchanged** — this is a new *source* that writes the cache the daemon
+already reads. claude-hud is no longer required for proactive rotation; where
+a live statusLine is present it remains an optional source.
+
+```bash
+# Manual one-shot (refreshes the controller .usage-cache.json):
+bash bridge-usage.sh probe --json
+```
+
+The daemon runs the probe automatically inside its usage-monitor tick
+(`bridge-usage.sh monitor`). To keep the daemon honest:
+
+- **Feature flag** `BRIDGE_USAGE_PROBE_ENABLED` (default `1`) — set to `0` to
+  disable the native probe entirely (e.g. if you rely solely on a live
+  claude-hud statusLine).
+- **Cache ≥5 min** `BRIDGE_USAGE_PROBE_MAX_AGE` (default `300` s) — the probe
+  serves the existing native cache within this window instead of re-hitting
+  the endpoint, so it does **not** make a network call on every tick.
+- **Cooldown after failure** `BRIDGE_USAGE_PROBE_COOLDOWN` (default `60` s) —
+  after any failed probe it serves the stale cache and skips re-probing until
+  the cooldown elapses. A `429` `Retry-After` is honored once (capped at ~5 s),
+  then it serves stale.
+- **HTTP timeout** `BRIDGE_USAGE_PROBE_HTTP_TIMEOUT` (default `10` s).
+
+> **Undocumented / internal endpoint.** `api/oauth/usage` is **not a public,
+> documented Anthropic API** (`anthropics/claude-code#31021` was closed
+> "not planned"). It requires the `anthropic-beta: oauth-2025-04-20` header
+> and a `User-Agent: claude-code/<version>` header (omitting the User-Agent
+> triggers aggressive `429`s — Agent Bridge always sends it, detecting the
+> version via `claude --version` with a built-in fallback). The shape and
+> availability may change without notice; the probe is **best-effort and
+> fail-open** — any failure leaves the existing cache untouched and never
+> blocks or crashes the daemon's usage pass.
+
+> **`user:profile` scope required.** The active OAT must carry the
+> `user:profile` scope for the endpoint to return usage windows. When the
+> token lacks it the endpoint returns empty/null windows; the probe detects
+> this (it does **not** fabricate a `0%` cache that could mask a real
+> rotation trigger), logs a one-line hint, and degrades. Re-issue the token
+> with the usage scope to enable native proactive rotation.
+
+> **Credential handling.** The OAT is read into memory and used **only** in
+> the `Authorization` header. It is never logged, never written to any file
+> by the probe, and never exported into a subprocess env (the probe makes the
+> request in-process via `urllib`, so there is no subprocess env-leak
+> surface). This is the same containment posture as the rest of the
+> token-rotation path.
+
 ### v0.7 → v0.8 migration runbook
 
 For an isolated agent that drifted across the v0.7 → v0.8 cut:

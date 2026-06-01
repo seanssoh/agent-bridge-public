@@ -383,12 +383,24 @@ def cmd_nudge_live_state(args: argparse.Namespace) -> int:
     queued/claimed counts. Output (single row):
       queued_count \\t claimed_count \\t comma_separated_queued_ids
 
+    With ``with_top_task=1`` (Issue #1425): three more columns are appended
+    in the SAME bounded read so the flush-time spool rederive
+    (lib/bridge-tmux.sh) needs exactly ONE timeout-bounded queue read for
+    both the count and the highest-priority queued task's header metadata —
+    no second, unbounded queue CLI call on the daemon/flusher path:
+      … \\t top_id \\t top_priority \\t top_title
+    The top task is the highest-priority QUEUED task (urgent>high>normal>low,
+    then lowest id), matching the queued set the count is computed over.
+    top_id/top_priority/top_title are empty strings when nothing is queued.
+    The title is sanitized of tab/newline so the TSV row stays single-line.
+
     sqlite errors fall through to a non-zero exit so the bash callsite's
     ``|| true`` keeps the loop intact; the wrapper applies a 15s timeout
     with audit-only fallback (no inline retry — next tick retries naturally).
     """
     db_path = args.db_path
     agent = args.agent
+    with_top_task = str(getattr(args, "with_top_task", "0")) == "1"
     with sqlite3.connect(db_path) as conn:
         queued_ids = [
             str(row[0])
@@ -408,7 +420,48 @@ def cmd_nudge_live_state(args: argparse.Namespace) -> int:
             "SELECT COUNT(*) FROM tasks WHERE claimed_by = ? AND status = 'claimed'",
             (agent,),
         ).fetchone()[0]
-    print(f"{len(queued_ids)}\t{claimed_count}\t{','.join(queued_ids)}")
+        top_id = ""
+        top_priority = ""
+        top_title = ""
+        if with_top_task:
+            top_row = conn.execute(
+                """
+                SELECT id, priority, title
+                FROM tasks
+                WHERE assigned_to = ?
+                  AND status = 'queued'
+                  AND title NOT LIKE '[cron-dispatch]%'
+                ORDER BY
+                  CASE priority
+                    WHEN 'urgent' THEN 0
+                    WHEN 'high'   THEN 1
+                    WHEN 'normal' THEN 2
+                    WHEN 'low'    THEN 3
+                    ELSE 4
+                  END,
+                  id
+                LIMIT 1
+                """,
+                (agent,),
+            ).fetchone()
+            if top_row is not None:
+                top_id = str(top_row[0])
+                top_priority = str(top_row[1] or "normal")
+                # Sanitize the title so an embedded tab/newline cannot
+                # corrupt the TSV row the bash caller parses by tab.
+                top_title = (
+                    str(top_row[2] or "")
+                    .replace("\t", " ")
+                    .replace("\r", " ")
+                    .replace("\n", " ")
+                )
+    if with_top_task:
+        print(
+            f"{len(queued_ids)}\t{claimed_count}\t{','.join(queued_ids)}"
+            f"\t{top_id}\t{top_priority}\t{top_title}"
+        )
+    else:
+        print(f"{len(queued_ids)}\t{claimed_count}\t{','.join(queued_ids)}")
     return 0
 
 
@@ -1009,8 +1062,17 @@ SUBCOMMANDS = {
         [
             ("db_path", "path to the queue sqlite DB"),
             ("agent", "agent id to query"),
+            (
+                "with_top_task",
+                "1 = also append the highest-priority queued task's "
+                "id/priority/title (3 extra cols) in the SAME bounded read; "
+                "0 (default) keeps the legacy 3-col output",
+                "0",
+            ),
         ],
-        "Single tab-separated row: queued_count, claimed_count, csv queued ids.",
+        "Single tab-separated row: queued_count, claimed_count, csv queued "
+        "ids. With with_top_task=1, three more cols are appended: top_id, "
+        "top_priority, top_title.",
     ),
     "nudge-eligibility-recheck": (
         cmd_nudge_eligibility_recheck,
@@ -1112,8 +1174,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name, (handler, positional, help_text) in SUBCOMMANDS.items():
         sub = subparsers.add_parser(name, help=help_text)
-        for arg_name, arg_help in positional:
-            sub.add_argument(arg_name, help=arg_help)
+        for spec in positional:
+            # 2-tuple (name, help) → required positional (the common case).
+            # 3-tuple (name, help, default) → OPTIONAL trailing positional
+            # with a default, so a new arg can be appended to an existing
+            # subcommand without breaking callers that omit it (e.g. the
+            # daemon's existing `nudge-live-state <db> <agent>` invocation).
+            arg_name, arg_help = spec[0], spec[1]
+            if len(spec) >= 3:
+                sub.add_argument(
+                    arg_name, help=arg_help, nargs="?", default=spec[2]
+                )
+            else:
+                sub.add_argument(arg_name, help=arg_help)
         sub.set_defaults(_handler=handler)
 
     return parser

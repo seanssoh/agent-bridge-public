@@ -1799,6 +1799,21 @@ process_usage_monitor() {
   bridge_agent_exists "$admin_agent" || return 1
   bridge_usage_due || return 1
 
+  # Issue #1437 PRIMARY (native proactive rotation): on a headless host there
+  # is no claude-hud statusLine → no stdin tap → no controller .usage-cache.json,
+  # so the rotation monitor never sees a Claude `used_percent` and never rotates
+  # the OAT before the account hard-limits. Refresh the controller cache via the
+  # native Anthropic OAuth usage probe FIRST (self-gated on a >=5min cache +
+  # cooldown, so this is a no-op on most ticks and never makes a per-tick
+  # network call). The probe writes the SAME .usage-cache.json shape the monitor
+  # below already consumes — it is a new SOURCE, not a new consumer. It is
+  # best-effort: it always exits 0 and leaves any existing cache untouched on
+  # failure, so a probe issue can never block or crash the usage pass. Feature
+  # flag BRIDGE_USAGE_PROBE_ENABLED (default 1) gates it; claude-hud remains an
+  # optional source where a live statusLine is present. The embedded call inside
+  # `bridge-usage.sh monitor` (below) is the single canonical probe site, kept
+  # atomic with the cache read; we route it through the same timeout budget.
+  #
   # Issue #831: read each Claude agent's own usage cache, not just the
   # controller's $HOME. Default scope mirrors bridge-auth.sh sync (static
   # Claude roster). Operators can broaden via BRIDGE_USAGE_MONITOR_AGENTS.

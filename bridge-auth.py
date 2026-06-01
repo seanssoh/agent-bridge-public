@@ -27,6 +27,13 @@ from typing import Any, Iterator
 REGISTRY_VERSION = 1
 TOKEN_ENV_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
 TOKEN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+# #1437 — single source of truth for the usage-limit/429 substrings. Used by
+# both ``classify_probe`` (the token-recovery probe) and the new
+# ``classify-output`` subcommand the cron runner calls on a live run's
+# captured stdout/stderr, so the reactive cron rotation path never forks the
+# marker list.
+QUOTA_LIMIT_MARKERS = ("hit your limit", "usage limit")
+AUTH_FAILED_MARKERS = ("invalid api key", "unauthorized")
 CLAUDE_OAUTH_EXPIRES_AT_MS = 4102444800000
 CLAUDE_OAUTH_SCOPES = ["user:inference", "user:profile"]
 CLAUDE_CONFIG_MIGRATION_VERSION = 13
@@ -612,9 +619,9 @@ def classify_probe(stdout: str, stderr: str, returncode: int) -> tuple[str, dict
         "returncode": returncode,
     }
 
-    if api_status_text == "429" or "hit your limit" in lower or "usage limit" in lower:
+    if api_status_text == "429" or any(marker in lower for marker in QUOTA_LIMIT_MARKERS):
         return "quota_limited", detail
-    if api_status_text in {"401", "403"} or "invalid api key" in lower or "unauthorized" in lower:
+    if api_status_text in {"401", "403"} or any(marker in lower for marker in AUTH_FAILED_MARKERS):
         return "auth_failed", detail
 
     if payload is not None:
@@ -976,6 +983,86 @@ def cmd_check(args: argparse.Namespace) -> int:
         else:
             reset = f" reset_at={payload['reset_at']}" if payload["reset_at"] else ""
             print(f"{payload['status']}: {args.id}{reset}")
+    return 0
+
+
+def cmd_classify_output(args: argparse.Namespace) -> int:
+    """#1437 — classify a *live run's* captured output (no network probe).
+
+    The cron runner feeds the already-captured stdout/stderr (and the child
+    exit code) of a real ``claude -p`` run here, via files to stay clear of
+    the Bash 5.3.9 heredoc-stdin deadlock (footgun #11). We reuse the exact
+    ``classify_probe`` logic — the same ``QUOTA_LIMIT_MARKERS`` /
+    ``"429"`` markers the recovery probe uses — so the reactive cron rotation
+    path never forks the marker list. Output is JSON only:
+    ``{"status": "quota_limited"|"auth_failed"|"available"|"failed", ...}``.
+    """
+    def _read(path: str | None) -> str:
+        if not path:
+            return ""
+        try:
+            return Path(path).expanduser().read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    stdout = _read(args.stdout_file)
+    stderr = _read(args.stderr_file)
+    returncode = int(args.returncode)
+    status, detail = classify_probe(stdout, stderr, returncode)
+    detail["status"] = status
+    json_dump(detail)
+    return 0
+
+
+def cmd_mark_quota(args: argparse.Namespace) -> int:
+    """#1437 — explicitly force a token to ``quota_limited`` / disabled.
+
+    The reactive cron path rotates FIRST (so ``rotate`` still sees >=2 enabled
+    tokens), then must guarantee the vacated quota-hit token does NOT stay
+    ``enabled``. ``check --disable-on-quota`` re-probes the network and can be
+    inconclusive (timeout / transient error), which would leave the token
+    enabled and let the next rotation pick it straight back. This deterministic
+    helper disables it without a network probe so the existing recovery sweep
+    (``recover-due``) is the only thing that re-enables it once the limit
+    resets.
+    """
+    json_mode = bool(args.json)
+    registry_path = Path(args.registry).expanduser()
+    reset_at = str(args.reset_at or "")
+    retry_seconds = int(args.retry_seconds or 1800)
+    try:
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            row = find_token(registry, args.id)
+            if row is None:
+                raise ValueError(f"unknown token id: {args.id}")
+            timestamp = now_iso()
+            row["enabled"] = False
+            row["disabled_reason"] = "quota_limited"
+            row["last_checked_at"] = timestamp
+            row["last_check_status"] = "quota_limited"
+            if reset_at:
+                row["disabled_until"] = reset_at
+                row["next_check_at"] = reset_at
+            else:
+                row["next_check_at"] = (
+                    now_utc() + timedelta(seconds=retry_seconds)
+                ).isoformat(timespec="seconds")
+            row["updated_at"] = timestamp
+            save_registry(registry_path, registry)
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+    active_id = str(registry.get("active_token_id") or "")
+    payload = {
+        "status": "quota_limited",
+        "id": args.id,
+        "active_token_id": active_id,
+        "reset_at": reset_at,
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(f"quota_limited: {args.id}")
     return 0
 
 
@@ -1855,6 +1942,23 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser.add_argument("--retry-seconds", type=int, default=1800)
     check_parser.add_argument("--json", action="store_true")
     check_parser.set_defaults(handler=cmd_check)
+
+    # #1437 — classify a live cron run's captured output (no network probe).
+    classify_parser = sub.add_parser("classify-output")
+    classify_parser.add_argument("--stdout-file", default=None)
+    classify_parser.add_argument("--stderr-file", default=None)
+    classify_parser.add_argument("--returncode", type=int, default=0)
+    classify_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    classify_parser.set_defaults(handler=cmd_classify_output)
+
+    # #1437 — deterministically disable a quota-hit token (inconclusive-check
+    # fallback for the reactive cron rotation path).
+    mark_quota_parser = sub.add_parser("mark-quota")
+    mark_quota_parser.add_argument("id")
+    mark_quota_parser.add_argument("--reset-at", default="")
+    mark_quota_parser.add_argument("--retry-seconds", type=int, default=1800)
+    mark_quota_parser.add_argument("--json", action="store_true")
+    mark_quota_parser.set_defaults(handler=cmd_mark_quota)
 
     recover_parser = sub.add_parser("recover-due")
     recover_parser.add_argument("--timeout", type=int, default=45)
