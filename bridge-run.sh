@@ -4,34 +4,130 @@
 set -uo pipefail
 
 # #1444 BLOCKING 1 (credential safety, DEFINITIVE design — mirror of PR #1443's
-# bridge-usage.sh r12). The env-source credential vars (CLAUDE_CODE_OAUTH_TOKEN,
+# bridge-usage.sh r13). The env-source credential vars (CLAUDE_CODE_OAUTH_TOKEN,
 # ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN) must never reach ANY child process —
-# not via env var, not via on-disk path, not via inherited fd, and not via an
-# exported-function shadow. Across codex Phase-4 rounds every transit that had to
-# CROSS bridge-lib.sh's Bash-3.2→4+ re-exec proved attackable (forgeable env
-# sentinel; an inherited fd/path readable + drainable by bridge-lib.sh's
-# source-time `dirname`; helper children observing the path var). The root fix:
-# ELIMINATE the cross-re-exec transit. We self-re-exec to Bash 4+ OURSELVES FIRST
-# (builtins only, in an already-token-free env), so bridge-lib.sh never re-execs
-# (we are already Bash 4+); the token is captured exactly once, lives ONLY in
-# NON-exported shell vars across `source bridge-lib.sh`, and is re-exported into
-# the child env only on the legacy auth path AFTER the source. Nothing to plant,
-# nothing for a source-time/helper child to read.
+# not via env var, not via on-disk path, not via inherited fd, not via an
+# exported-function shadow, and not via a caller BASH_ENV/ENV startup-file hook.
+# The flow, in order (each step runs before any external/child that could observe
+# the credential):
+#   A. Strip interceptor function shadows (exec/source/command/builtin/unset/…)
+#      and `builtin unset BASH_ENV ENV BASH_XTRACEFD` so neither a function shadow
+#      nor a caller startup-file can run in a child THIS script forks.
+#   B. Capture+scrub (the "STEP A" block below, builtins only): move the three
+#      credential VALUES into NON-exported shell vars and UNSET them from the ENV —
+#      so from here on the environment is TOKEN-FREE for every subprocess we spawn.
+#   C. UNIFIED re-exec to a PRIVILEGED Bash 4+ shell (`exec ... -p <bash4+>`) when
+#      we are not already privileged OR not Bash 4+. Privileged Bash imports NO env
+#      functions and ignores BASH_ENV/ENV — so the WHOLE exported-function-shadow
+#      class (incl. `python3` forked by the keychain-free gate's
+#      `bridge_runtime_config_value`, `uname` by `bridge_host_platform`, or names a
+#      per-`unset -f` list would miss) AND the BASH_ENV/ENV hook class are closed
+#      at the root, not per-name. Because this runs AFTER step B, the
+#      candidate-version probe and the `exec` run in a token-free env — NO child of
+#      bridge-run.sh inherits the credential. The captured values cross OUR re-exec
+#      on fd 9 (unlinked 0600 file, magic-prefixed), and the privileged pass reads
+#      + CLOSES fd 9 BEFORE `source bridge-lib.sh` — so bridge-lib.sh's source-time
+#      dirname never inherits a readable token fd either. The single `-p` re-exec
+#      satisfies BOTH privileged-mode and the Bash-4+ requirement, so bridge-lib.sh
+#      never re-execs.
+#   D. The values live ONLY in NON-exported shell vars across `source
+#      bridge-lib.sh`, and are re-exported into the child env only on the legacy
+#      auth path AFTER the source. Nothing to plant, nothing for a child to read.
+# Residual (deferred #1454): the bash STARTUP of the very first `bash
+# bridge-run.sh` process itself sources BASH_ENV before line 1 — our step-A unset
+# is too late for that single process; launching privileged (`bash -p
+# bridge-run.sh`) closes even that. Same boundary as bridge-lib.sh's own startup
+# and a caller shadowing exec/builtin/unset to no-ops (caller who controls the
+# launch env already holds the token). The per-name `unset -f` strips are kept
+# belt-and-suspenders.
 
-# Exported-function shadow defense (codex Phase-4 last-class): a same-UID caller
-# can `export -f printf`/`read`/`mktemp`/`chmod`/`rm`/`cat`/`dirname`/`cd`/`pwd`
-# so that an UNQUALIFIED invocation runs the caller's function IN OUR shell,
-# reading our non-exported credential vars. Drop any such inherited functions up
-# front (before any credential is reachable), and below use `builtin` for
-# builtins + hardcoded-absolute paths for externals so name resolution can never
-# reach a function. (`[[`, `unset`, parameter expansion cannot be shadowed.)
-unset -f printf read echo mktemp chmod rm cat dirname cd pwd command builtin \
-         exec trap export local 2>/dev/null || true
+# Exported-function shadow defense — ROOT fix adopted from PR #1443's
+# bridge-usage.sh head 05666c0. A same-UID caller can `export -f` Bash FUNCTIONS
+# named after ANY command we invoke (printf/read/mktemp/chmod/python3/uname/… —
+# the per-`unset -f` approach was whack-a-mole, codex kept finding the next missed
+# name). Bash resolves an exported function BEFORE the external/builtin, so an
+# UNQUALIFIED invocation would run the caller's function IN OUR shell and read our
+# non-exported credential vars. The `bash -p` re-exec (step C) strips the ENTIRE
+# class in one shot; the per-name `unset -f` here is belt-and-suspenders and also
+# guards the re-exec line itself.
+
+# Best-effort interceptor removal for the re-exec line ITSELF (FIRST, so the
+# `builtin`/`unset` we rely on below are the real builtins): the `exec`/`unset`
+# /`builtin` keywords on the very first pass could be shadowed functions. If THOSE
+# special builtins are shadowed the caller already controls our process
+# environment entirely (same-UID-controls-invocation-env — the deferred boundary
+# tracked as #1454, same class as bridge-lib.sh's own re-exec). This strips the
+# common cases.
+builtin unset -f exec source command builtin unset printf read echo mktemp chmod \
+         rm cat dirname cd pwd trap export local python3 python uname env \
+         claude codex head readlink bash sh true false 2>/dev/null || builtin true
+
+# Caller startup-file + xtrace hooks (#1444 BLOCKING, codex round-3 / parallel
+# #1443): BASH_ENV / ENV name a file that EVERY non-interactive non-privileged
+# bash SOURCES at startup, and BASH_XTRACEFD redirects `set -x` trace output to a
+# caller-chosen fd. A same-UID caller can point BASH_ENV at a script that dumps a
+# leaked credential the moment we fork a non-privileged child. We never use these
+# hooks, so drop them HERE — before any child this script forks can run. Defense
+# in depth: the STEP A capture+scrub below removes the credential from the env
+# BEFORE the candidate-bash version probe runs (so the probe child inherits NO
+# token), and the probe + re-exec additionally run under `bash -p` (privileged
+# ignores BASH_ENV/ENV).
+# `builtin unset` (the `unset` shadow was just stripped above) so a residual
+# `unset()` function cannot no-op this. (The bash STARTUP of the very first `bash
+# bridge-run.sh` process itself sources BASH_ENV before line 1 runs — that single
+# sourcing is the deferred #1454 boundary; the `-p` re-exec keeps the WORKING
+# shell + all its children clean.)
+builtin unset BASH_ENV ENV BASH_XTRACEFD 2>/dev/null || builtin true
 
 # Unset all bridge-private transit names unconditionally (value + export attr) so
 # a caller-injected value can never be trusted on entry.
 unset _bridge_run_tok_oat _bridge_run_tok_anthropic_key _bridge_run_tok_anthropic_auth \
       _bridge_run_fd_payload 2>/dev/null || true
+
+# Inherited fd 9 defense (#1444 BLOCKING, codex round-3 fourth-pass): a same-UID
+# caller can PRE-OPEN fd 9 to a file of their choosing before launching us. That
+# caller-controlled fd would otherwise be inherited by every child this script
+# forks (the `_bridge_run_pick` `$()` subshells, the candidate-version probes). We
+# use fd 9 ONLY as OUR OWN transit across OUR re-exec, proven by a PER-PROCESS
+# RANDOM NONCE (not a fixed public magic) that we generate AFTER closing any
+# inherited fd 9 and write as the fd-9 record's first field; the re-exec'd pass
+# accepts fd 9 ONLY when the inbound `_BRIDGE_RUN_FD9_NONCE` env value matches that
+# first field. Because the nonce is generated in the parent AFTER the inherited fd
+# 9 was closed, a caller cannot have pre-opened fd 9 with our nonce.
+#   - OUR re-exec'd pass (nonce PRESENT): CONSUME fd 9 RIGHT HERE — read the
+#     NUL-delimited records (builtins only, no fork) into the NON-exported shell
+#     vars and CLOSE fd 9 — so fd 9 is gone BEFORE the first `$(...)` subshell
+#     below ever forks (no child of the re-exec'd pass inherits the token fd).
+#   - INITIAL pass (nonce ABSENT, or a caller-forged nonce that cannot match a fd 9
+#     we have not written): CLOSE any inherited fd 9 before the first child fork.
+if [[ -n "${_BRIDGE_RUN_FD9_NONCE:-}" ]] && [[ -r /dev/fd/9 ]]; then
+  _bridge_run_fd_magic_seen=""
+  while IFS= builtin read -r -d '' _bridge_run_fd_payload <&9; do
+    if [[ -z "$_bridge_run_fd_magic_seen" ]]; then
+      # First record must equal the per-process nonce the parent set. A
+      # caller-preopened fd 9 cannot reproduce it (generated after the inherited
+      # fd 9 was closed); a mismatch means this fd 9 is not ours — abandon it.
+      [[ "$_bridge_run_fd_payload" == "$_BRIDGE_RUN_FD9_NONCE" ]] && _bridge_run_fd_magic_seen=1
+      [[ -z "$_bridge_run_fd_magic_seen" ]] && break
+      continue
+    fi
+    case "$_bridge_run_fd_payload" in
+      CLAUDE_CODE_OAUTH_TOKEN=*) _bridge_run_tok_oat="${_bridge_run_fd_payload#*=}" ;;
+      ANTHROPIC_API_KEY=*) _bridge_run_tok_anthropic_key="${_bridge_run_fd_payload#*=}" ;;
+      ANTHROPIC_AUTH_TOKEN=*) _bridge_run_tok_anthropic_auth="${_bridge_run_fd_payload#*=}" ;;
+    esac
+  done
+  unset _bridge_run_fd_payload _bridge_run_fd_magic_seen
+fi
+# Always close fd 9 now: in the re-exec'd pass it has been consumed above; in the
+# initial pass this drops any caller-preopened fd 9 before the first child fork.
+# Brace-group the redirect so `2>/dev/null` scopes to the close ONLY — a bare
+# `exec 9<&- 2>/dev/null` (exec with no command) would make `2>/dev/null`
+# PERMANENT and swallow all later stderr (incl. bridge_die diagnostics).
+{ exec 9<&-; } 2>/dev/null || builtin true
+# The nonce has served its purpose (handoff proven); drop it from the env so no
+# later child sees it.
+unset _BRIDGE_RUN_FD9_NONCE 2>/dev/null || true
 
 # SCRIPT_DIR via Bash builtins only (no `dirname` subprocess). Must stay ABSOLUTE
 # (used as `python3 "$SCRIPT_DIR/..."` after this script cd's into WORK_DIR); when
@@ -48,87 +144,130 @@ if [[ "$SCRIPT_DIR" != /* ]]; then
 fi
 unset _bridge_run_src
 
-# Bind the externals that run while a credential is reachable (mktemp/chmod/rm
-# during the optional self-re-exec transit) to HARDCODED ABSOLUTE paths — a
-# PATH-planted `mktemp`/`chmod`/`rm` must never run near the live token, and an
-# absolute path cannot be a function name. `[[ -x ]]` is a builtin (no subprocess).
+# STEP A (UNCONDITIONAL, builtins + parameter expansion ONLY — runs before ANY
+# external command AND before any `$(...)` command-substitution subshell, so no
+# child of bridge-run.sh ever inherits the ambient token in its env): capture the
+# three credential VALUES into NON-exported shell vars and UNSET them from the
+# environment. A forged inbound env var cannot skip this. (codex round-3 BLOCKING:
+# the `_bridge_run_pick` `$()` subshells below would otherwise fork while the token
+# is still in env — so the scrub MUST precede them.) In OUR re-exec'd pass the
+# values were already restored from fd 9 at the top; `${var:-${ENV:-}}` PRESERVES
+# the restored value (and the env is already token-free there anyway).
+_bridge_run_tok_oat="${_bridge_run_tok_oat:-${CLAUDE_CODE_OAUTH_TOKEN:-}}"
+_bridge_run_tok_anthropic_key="${_bridge_run_tok_anthropic_key:-${ANTHROPIC_API_KEY:-}}"
+_bridge_run_tok_anthropic_auth="${_bridge_run_tok_anthropic_auth:-${ANTHROPIC_AUTH_TOKEN:-}}"
+unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+
+# Bind the externals that run while the captured credential is reachable
+# (mktemp/chmod/rm during the optional self-re-exec transit) to HARDCODED ABSOLUTE
+# paths — a PATH-planted `mktemp`/`chmod`/`rm` must never run near the live token,
+# and an absolute path cannot be a function name. `[[ -x ]]` is a builtin (no
+# subprocess). The `$(...)` command-substitution subshells here run AFTER STEP A,
+# so the env is already TOKEN-FREE — these forks inherit no credential.
 _bridge_run_pick() { local _n; for _n in "$@"; do [[ -x "$_n" ]] && { builtin printf '%s' "$_n"; return 0; }; done; builtin printf '%s' "${1##*/}"; }
 _BR_MKTEMP="$(_bridge_run_pick /usr/bin/mktemp /bin/mktemp /opt/homebrew/bin/mktemp)"
 _BR_CHMOD="$(_bridge_run_pick /bin/chmod /usr/bin/chmod)"
 _BR_RM="$(_bridge_run_pick /bin/rm /usr/bin/rm)"
 unset -f _bridge_run_pick
 
-# A fixed (non-secret) magic prefix proving an inherited fd 9 was written by US,
-# not pre-opened by a caller — used only across OUR self-re-exec.
-_BR_FD_MAGIC="agb-run-cred-fd-v1"
+# PER-PROCESS RANDOM NONCE proving an inherited fd 9 was written by US, not
+# pre-opened by a caller (replaces the old fixed PUBLIC magic — codex round-3
+# fourth-pass). Generated HERE, AFTER the inherited-fd-9 close above, so a caller
+# cannot have pre-opened fd 9 with this value. Two independent entropy sources
+# combined (SRANDOM is unguessable on Bash 5.1+; $RANDOM/PID/EPOCHSECONDS fall back
+# on older Bash) — builtins only, no subprocess, no PATH/function exposure. Written
+# as the fd-9 record's first field AND exported as _BRIDGE_RUN_FD9_NONCE for the
+# re-exec'd pass to match before it trusts fd 9.
+_BR_FD_MAGIC="agb-run-cred-fd-v2:${SRANDOM:-}:${RANDOM}${RANDOM}${RANDOM}:${BASHPID:-$$}:${EPOCHSECONDS:-0}"
 
-# STEP A (UNCONDITIONAL, builtins only — runs before ANY external command, so no
-# PATH-planted helper ever runs while the ambient token is in the env): capture
-# the three credential VALUES into NON-exported shell vars and UNSET them from
-# the environment. A forged inbound env var cannot skip this.
-_bridge_run_tok_oat="${CLAUDE_CODE_OAUTH_TOKEN:-}"
-_bridge_run_tok_anthropic_key="${ANTHROPIC_API_KEY:-}"
-_bridge_run_tok_anthropic_auth="${ANTHROPIC_AUTH_TOKEN:-}"
-unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-
-# Self-re-exec to Bash 4+ ONLY when we are Bash 3.2 (so bridge-lib.sh below never
-# re-execs). The env is ALREADY token-free here, so the candidate-version probe
-# and `exec` cannot leak the token. The captured values ride OUR self-re-exec on
-# fd 9 (unlinked 0600 file, magic-prefixed) and the Bash-4+ pass reads + closes
-# it BEFORE sourcing bridge-lib.sh — so bridge-lib.sh's dirname never inherits a
-# readable token fd.
-if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+# UNIFIED re-exec to a PRIVILEGED Bash 4+ shell. We re-exec when EITHER we are not
+# privileged (`$-` lacks `p` — privileged Bash imports no env functions and ignores
+# BASH_ENV/ENV) OR we are not yet Bash 4+. A single `exec ... -p <bash4+>` satisfies
+# both, so bridge-lib.sh below never re-execs (we are already Bash 4+) and the
+# working shell + every child it forks is function-free + BASH_ENV-free.
+#
+# CRITICAL (codex round-3 BLOCKING): this runs AFTER STEP A scrubbed the credential
+# from the ENV, so the candidate-version probe and the `exec` run in a TOKEN-FREE
+# env — no child of bridge-run.sh inherits the credential in its environment. AND
+# (codex round-3 second-pass): we SELECT the Bash-4+ candidate FIRST (the probe
+# children fork while fd 9 is NOT yet open), and open the token-bearing fd 9 ONLY
+# after a candidate is chosen — immediately before `exec` — so the credential fd is
+# inherited ONLY by the final re-exec target, never by a probe child. The post-
+# re-exec pass reads + CLOSES fd 9 BEFORE sourcing bridge-lib.sh, so bridge-lib.sh's
+# source-time dirname never inherits a readable token fd either. Nothing to plant,
+# nothing for a child to read.
+if [[ "$-" != *p* ]] || (( ${BASH_VERSINFO[0]:-0} < 4 )); then
   _bridge_run_self="${BASH_SOURCE[0]}"
   if [[ -f "$_bridge_run_self" ]]; then
-    if [[ -n "$_bridge_run_tok_oat$_bridge_run_tok_anthropic_key$_bridge_run_tok_anthropic_auth" ]]; then
-      if _bridge_run_fd_file="$("$_BR_MKTEMP" "${TMPDIR:-/tmp}/agb-run-cred.XXXXXX" 2>/dev/null)"; then
-        "$_BR_CHMOD" 600 "$_bridge_run_fd_file" 2>/dev/null || true
-        # builtin printf so an exported printf() function cannot intercept the
-        # token write. NUL-delimited NAME=VALUE records (safe for newlines/`=`).
-        {
-          builtin printf '%s\0' "$_BR_FD_MAGIC"
-          [[ -n "$_bridge_run_tok_oat" ]] && builtin printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\0' "$_bridge_run_tok_oat"
-          [[ -n "$_bridge_run_tok_anthropic_key" ]] && builtin printf 'ANTHROPIC_API_KEY=%s\0' "$_bridge_run_tok_anthropic_key"
-          [[ -n "$_bridge_run_tok_anthropic_auth" ]] && builtin printf 'ANTHROPIC_AUTH_TOKEN=%s\0' "$_bridge_run_tok_anthropic_auth"
-        } >"$_bridge_run_fd_file"
-        exec 9<"$_bridge_run_fd_file" 2>/dev/null || true
-        "$_BR_RM" -f -- "$_bridge_run_fd_file" 2>/dev/null || true
-        unset _bridge_run_fd_file
-      fi
-      # Drop the in-shell copies; the values ride fd 9 across the exec.
-      unset _bridge_run_tok_oat _bridge_run_tok_anthropic_key _bridge_run_tok_anthropic_auth
-    fi
+    # 1. SELECT the candidate FIRST — probe each absolute-path Bash under `-p`
+    #    (token-free env, NO fd 9 open yet, so the probe children inherit neither
+    #    the credential env nor a readable token fd). `-p` also makes the probe
+    #    ignore BASH_ENV/ENV + imported functions.
+    _bridge_run_chosen=""
     for _bridge_run_cand in /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
-      if [[ -x "$_bridge_run_cand" ]] && "$_bridge_run_cand" -c '((${BASH_VERSINFO[0]:-0}>=4))' 2>/dev/null; then
-        exec "$_bridge_run_cand" "$_bridge_run_self" "$@"
+      if [[ -x "$_bridge_run_cand" ]] && "$_bridge_run_cand" -p -c '((${BASH_VERSINFO[0]:-0}>=4))' 2>/dev/null; then
+        _bridge_run_chosen="$_bridge_run_cand"
+        break
       fi
     done
+    if [[ -n "$_bridge_run_chosen" ]]; then
+      # 2. Now that a candidate is chosen and NO more probe children will fork,
+      #    stash the captured values on fd 9 (unlinked 0600 file, magic-prefixed;
+      #    `exec`/`-p` preserve fd inheritance). Only the `exec` target below
+      #    inherits fd 9.
+      if [[ -n "$_bridge_run_tok_oat$_bridge_run_tok_anthropic_key$_bridge_run_tok_anthropic_auth" ]]; then
+        if _bridge_run_fd_file="$("$_BR_MKTEMP" "${TMPDIR:-/tmp}/agb-run-cred.XXXXXX" 2>/dev/null)"; then
+          "$_BR_CHMOD" 600 "$_bridge_run_fd_file" 2>/dev/null || true
+          # builtin printf so an exported printf() function cannot intercept the
+          # token write. NUL-delimited NAME=VALUE records (safe for newlines/`=`).
+          {
+            builtin printf '%s\0' "$_BR_FD_MAGIC"
+            [[ -n "$_bridge_run_tok_oat" ]] && builtin printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\0' "$_bridge_run_tok_oat"
+            [[ -n "$_bridge_run_tok_anthropic_key" ]] && builtin printf 'ANTHROPIC_API_KEY=%s\0' "$_bridge_run_tok_anthropic_key"
+            [[ -n "$_bridge_run_tok_anthropic_auth" ]] && builtin printf 'ANTHROPIC_AUTH_TOKEN=%s\0' "$_bridge_run_tok_anthropic_auth"
+          } >"$_bridge_run_fd_file"
+          # Brace-group the redirect: a bare `exec 9<file 2>/dev/null` (exec with
+          # redirections but no command) would make `2>/dev/null` PERMANENT and
+          # the re-exec'd child below would inherit a /dev/null stderr.
+          { exec 9<"$_bridge_run_fd_file"; } 2>/dev/null || true
+          "$_BR_RM" -f -- "$_bridge_run_fd_file" 2>/dev/null || true
+          unset _bridge_run_fd_file
+        fi
+        # Drop the in-shell copies; the values ride fd 9 across the exec.
+        unset _bridge_run_tok_oat _bridge_run_tok_anthropic_key _bridge_run_tok_anthropic_auth
+        # Hand the nonce to the re-exec'd pass so it can prove fd 9 is OURS (it
+        # keeps fd 9 open + validates the first record == this nonce). Only set
+        # when we actually opened fd 9 with a token.
+        export _BRIDGE_RUN_FD9_NONCE="$_BR_FD_MAGIC"
+      fi
+      # 3. Re-exec into the chosen privileged Bash 4+ shell.
+      exec "$_bridge_run_chosen" -p "$_bridge_run_self" "$@"
+    fi
   fi
-  echo "[bridge-run] Agent Bridge requires Bash 4+ (current: ${BASH_VERSION:-unknown}). Put a Bash 4+ on PATH." >&2
-  exit 1
+  # Reached only if we are not privileged/Bash-4+ AND found no Bash-4+ candidate to
+  # re-exec into. The per-name `unset -f` strip above is the residual defense.
+  if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+    echo "[bridge-run] Agent Bridge requires Bash 4+ (current: ${BASH_VERSION:-unknown}). Put a Bash 4+ on PATH." >&2
+    exit 1
+  fi
+  unset _bridge_run_chosen _bridge_run_cand _bridge_run_self 2>/dev/null || true
 fi
 
-# Bash 4+ now. If we were re-exec'd from Bash 3.2, the values ride fd 9 — read the
-# NUL-delimited records (magic-verified) into the NON-exported shell vars, then
-# CLOSE fd 9 so bridge-lib.sh's source-time dirname / helpers never inherit it.
-if [[ -z "$_bridge_run_tok_oat$_bridge_run_tok_anthropic_key$_bridge_run_tok_anthropic_auth" ]] \
-   && [[ -r /dev/fd/9 ]]; then
-  _bridge_run_fd_magic_seen=""
-  while IFS= builtin read -r -d '' _bridge_run_fd_payload <&9; do
-    if [[ -z "$_bridge_run_fd_magic_seen" ]]; then
-      [[ "$_bridge_run_fd_payload" == "$_BR_FD_MAGIC" ]] && _bridge_run_fd_magic_seen=1
-      continue
-    fi
-    case "$_bridge_run_fd_payload" in
-      CLAUDE_CODE_OAUTH_TOKEN=*) _bridge_run_tok_oat="${_bridge_run_fd_payload#*=}" ;;
-      ANTHROPIC_API_KEY=*) _bridge_run_tok_anthropic_key="${_bridge_run_fd_payload#*=}" ;;
-      ANTHROPIC_AUTH_TOKEN=*) _bridge_run_tok_anthropic_auth="${_bridge_run_fd_payload#*=}" ;;
-    esac
-  done
-  exec 9<&- 2>/dev/null || true
-  unset _bridge_run_fd_payload _bridge_run_fd_magic_seen
-fi
-unset _BR_FD_MAGIC _BR_MKTEMP _BR_CHMOD _BR_RM
+# Privileged Bash 4+ now. The fd-9 token transit (if any) was already consumed +
+# closed at the TOP (before any `$(...)` subshell forked), so the captured values
+# live ONLY in the NON-exported _bridge_run_tok_* shell vars here. Drop the transit
+# binaries (the nonce was already unset at the top).
+unset _BR_FD_MAGIC _BR_MKTEMP _BR_CHMOD _BR_RM 2>/dev/null || true
+
+# Belt-and-suspenders on the privileged working pass (privileged mode already
+# prevented function import across the re-exec, so this is normally a no-op): the
+# captured secret is now live in the NON-exported _bridge_run_tok_* vars again, so
+# re-strip any command-named function shadow before bridge-lib.sh is sourced and
+# the keychain-free gate forks python3 / uname. Belt: commands near the live token
+# also use `builtin`/`command`/absolute qualification.
+builtin unset -f printf read echo mktemp chmod rm cat dirname cd pwd command \
+         builtin exec source trap export local python3 python uname env claude \
+         codex head readlink bash sh true false 2>/dev/null || builtin true
 
 # Issue #1101: defensive unset of stale BRIDGE_LAYOUT/BRIDGE_DATA_ROOT before
 # sourcing bridge-lib.sh. This is the launch envelope tmux runs as the pane's
@@ -169,9 +308,17 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 #     source, so RESTORE — preserving pre-#1444 behavior.
 #   - KEYCHAIN-FREE on Darwin: the child authenticates via the apiKeyHelper /
 #     .credentials.json, never the env token, so DO NOT restore.
-# The mode-decision helpers (bridge_claude_keychain_free_auth_enabled may fork
-# python3; bridge_host_platform may fork uname) run in the already-token-free env
-# with no transit artifact present, so their children inherit nothing.
+# The mode-decision helpers run while the captured secret is still live in the
+# NON-exported _bridge_run_tok_* vars, so their UNQUALIFIED command invocations
+# matter: bridge_claude_keychain_free_auth_enabled -> bridge_runtime_config_value
+# forks `python3` (the config-file-backed gate path; the env
+# BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 short-circuit skips it), and
+# bridge_host_platform forks `uname`. A caller-exported `python3()`/`uname()`
+# function would otherwise run IN OUR shell and read _bridge_run_tok_*. The
+# top-of-script `bash -p` privileged re-exec stripped ALL imported functions, so
+# those forks resolve to the real external — not a caller's shadow. Their child
+# processes also inherit a token-free env (the secret lives only in our shell vars,
+# never exported here), so nothing leaks via env/fd/path either.
 if [[ -n "$_bridge_run_tok_oat$_bridge_run_tok_anthropic_key$_bridge_run_tok_anthropic_auth" ]]; then
   _bridge_run_restore_creds=1
   if bridge_claude_keychain_free_auth_enabled 2>/dev/null; then

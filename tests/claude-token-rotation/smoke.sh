@@ -335,7 +335,8 @@ _bridge_run_forged_cases=(
 )
 for _forged in "${_bridge_run_forged_cases[@]}"; do
   : >"$CANARY_REC/leaks.txt"
-  # shellcheck disable=SC2086 - intentional word-split of the forged env assignment list
+  # Intentional word-split of the forged env assignment list (handed to `env`).
+  # shellcheck disable=SC2086
   PATH="$CANARY_BIN:$PATH" \
     BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
     BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin \
@@ -348,15 +349,30 @@ unset _forged _bridge_run_forged_cases
 pass "a forged transit sentinel (path-var, path+OWNED, or stale fd marker) does NOT bypass the unconditional pre-source scrub"
 
 # #1444 BLOCKING 1 (codex Phase-4 last-class) — EXPORTED-FUNCTION SHADOW: a
-# same-UID caller can `export -f printf`/`read`/`dirname`/`mktemp`/`chmod` so an
+# same-UID caller can `export -f` Bash FUNCTIONS named after ANY command
+# bridge-run.sh invokes (printf/read/dirname/mktemp/chmod AND — the names a
+# per-`unset -f` list kept missing — `python3`, `uname`, `cat`, `head`, …) so an
 # UNQUALIFIED invocation runs the caller's function IN bridge-run.sh's shell,
 # where it can read the non-exported credential shell-vars even after the env is
-# scrubbed. bridge-run.sh defends by `unset -f`-ing those names up front and using
-# `builtin`/`command`/absolute-path qualification for every command that runs
-# while a credential is reachable. This canary exports malicious shadow functions
-# that record if they ever observe a credential, then runs the REAL
-# `bridge-run.sh --list` keychain-free + Darwin with a MOCK token (and a forged
-# transit sentinel). The shadow functions must record NOTHING.
+# scrubbed. The codex round-3 miss: the keychain-free gate decision
+# `bridge_claude_keychain_free_auth_enabled -> bridge_runtime_config_value` forks
+# UNQUALIFIED `python3` (bridge-lib.sh) while the captured secret is still live in
+# _bridge_run_tok_oat — but ONLY on the CONFIG-FILE-backed gate path (the env
+# `BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1` short-circuit skips
+# bridge_runtime_config_value entirely, which is why the env-flag canary below
+# missed it). bridge-run.sh now defends at the ROOT: a `bash -p` privileged-mode
+# re-exec at the very top strips the WHOLE exported-function class in one shot
+# (privileged Bash imports no env functions), so EVERY shadow name — including
+# python3/uname — is gone before the secret is captured. This canary exports a
+# broad set of malicious shadow functions (printf/read/dirname/mktemp/chmod PLUS
+# python3/uname/cat/head/cd/pwd) that record if they EVER observe a credential,
+# then runs the REAL `bridge-run.sh --list` keychain-free + Darwin with a MOCK
+# token across BOTH gate paths:
+#   (a) env-flag path  (BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1; no python3 fork), and
+#   (b) CONFIG-FILE path (flag in $BRIDGE_RUNTIME_CONFIG_FILE, env var UNSET — so
+#       bridge_runtime_config_value DOES fork python3 with the secret live).
+# In both, the shadow functions must record NOTHING (0 invocations) — proving the
+# `bash -p` re-exec stripped them, not that python3 specifically was unset.
 SHADOW_WRAP="$ROOT/shadow-wrap.sh"
 SHADOW_REC="$CANARY_REC/shadow.txt"
 {
@@ -368,10 +384,18 @@ SHADOW_REC="$CANARY_REC/shadow.txt"
   printf 'dirname() { _saw && command printf "func:dirname\\n" >>"$REC"; command dirname "$@"; }\n'
   printf 'mktemp()  { _saw && command printf "func:mktemp\\n"  >>"$REC"; command mktemp "$@"; }\n'
   printf 'chmod()   { _saw && command printf "func:chmod\\n"   >>"$REC"; command chmod "$@"; }\n'
-  printf 'export -f printf read dirname mktemp chmod _saw\n'
+  printf 'python3() { _saw && command printf "func:python3\\n" >>"$REC"; command python3 "$@"; }\n'
+  printf 'uname()   { _saw && command printf "func:uname\\n"   >>"$REC"; command uname "$@"; }\n'
+  printf 'cat()     { _saw && command printf "func:cat\\n"     >>"$REC"; command cat "$@"; }\n'
+  printf 'head()    { _saw && command printf "func:head\\n"    >>"$REC"; command head "$@"; }\n'
+  printf 'export -f printf read dirname mktemp chmod python3 uname cat head _saw\n'
   printf 'exec %q "$@"\n' "$REPO_ROOT/bridge-run.sh"
 } > "$SHADOW_WRAP"
 chmod +x "$SHADOW_WRAP"
+
+# (a) env-flag gate path (historic case — keep): the env short-circuit means
+# bridge_runtime_config_value (and its python3 fork) is NOT reached, but the
+# other shadows (printf/read/dirname/mktemp/chmod) still must never fire.
 : >"$SHADOW_REC"
 BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
   BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin \
@@ -379,8 +403,128 @@ BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
   env _BRIDGE_RUN_CRED_FILE=/tmp/agb-forged-cred _BRIDGE_RUN_CRED_OWNED=1 \
     "$SHADOW_WRAP" --list >/dev/null 2>&1 || true
 [[ ! -s "$SHADOW_REC" ]] \
-  || fail "BLOCKING 1 (codex Phase-4): an exported shadow function observed a credential ($(sort -u "$SHADOW_REC" | tr '\n' ' '))"
-pass "exported-function shadows (printf/read/dirname/mktemp/chmod) never observe a credential in bridge-run.sh"
+  || fail "BLOCKING 1 (codex Phase-4, env-flag path): an exported shadow function observed a credential ($(sort -u "$SHADOW_REC" | tr '\n' ' '))"
+
+# (b) CONFIG-FILE gate path (codex round-3): UNSET the env flag so the
+# keychain-free decision flows through bridge_runtime_config_value -> UNQUALIFIED
+# `python3` with the secret live. $BRIDGE_RUNTIME_CONFIG_FILE already holds
+# {"claude_keychain_free_auth": true, ...} (written above), and it is exported
+# into the env, so the SHADOW_WRAP's `exec` carries it through. The python3()
+# shadow MUST still record nothing — the `bash -p` re-exec removed it. Explicitly
+# pass BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH= (empty) via `env -u` to guarantee the
+# env short-circuit cannot fire even if an outer export leaked in.
+[[ -f "$BRIDGE_RUNTIME_CONFIG_FILE" ]] \
+  && grep -Fq '"claude_keychain_free_auth": true' "$BRIDGE_RUNTIME_CONFIG_FILE" \
+  || fail "config-file canary precondition: runtime config does not enable keychain-free auth"
+: >"$SHADOW_REC"
+env -u BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH \
+  BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin \
+  CLAUDE_CODE_OAUTH_TOKEN="MOCK-CANARY-NOT-A-REAL-TOKEN" \
+  "$SHADOW_WRAP" --list >/dev/null 2>&1 || true
+[[ ! -s "$SHADOW_REC" ]] \
+  || fail "BLOCKING 1 (codex Phase-4 round-3, config-file path): an exported shadow function (e.g. python3 via bridge_runtime_config_value) observed a credential ($(sort -u "$SHADOW_REC" | tr '\n' ' '))"
+pass "exported-function shadows (incl. python3/uname via the config-file keychain-free gate) never observe a credential in bridge-run.sh — bash -p strips the whole class"
+
+# #1444 BLOCKING 1 (codex round-3 / parallel #1443) — BASH_ENV / ENV STARTUP-FILE
+# HOOK: a same-UID caller can point BASH_ENV (or ENV) at a script that EVERY
+# non-interactive non-privileged bash SOURCES at startup, and BASH_XTRACEFD
+# redirects `set -x` trace output to a caller-chosen fd. The danger is that any
+# child bridge-run.sh forks (the candidate-bash version probe, helper subshells,
+# the re-exec'd working shell) could SOURCE the caller's BASH_ENV with the
+# ambient token still reachable, leaking it.
+#
+# bridge-run.sh closes every vector it controls:
+#   1. `builtin unset BASH_ENV ENV BASH_XTRACEFD` near the top, before any child
+#      THIS script forks.
+#   2. The credential is captured + SCRUBBED from the env (STEP A) BEFORE the
+#      candidate-bash version probe runs, so the probe child inherits NO token in
+#      its env at all; the probe + re-exec also run under `bash -p` (privileged
+#      ignores BASH_ENV/ENV + imported functions).
+#   3. The re-exec into `bash -p` means the WORKING shell (the one that sources
+#      bridge-lib.sh, forks helpers, decides the restore) is privileged — so it
+#      and all ITS children never source BASH_ENV regardless of env.
+# The ONE sourcing bridge-run.sh cannot prevent is the bash STARTUP of the very
+# first `bash bridge-run.sh` process itself: bash reads BASH_ENV before line 1
+# executes, so our line-1 `unset` is already too late for that single process.
+# That is the deferred "caller controls the initial invocation environment"
+# boundary (#1454) — identical in kind to bridge-lib.sh's own startup and to a
+# caller shadowing `exec`/`builtin`/`unset`; a caller who controls bridge-run.sh's
+# launch env already holds the token. The robust closure is to launch privileged
+# (`bash -p bridge-run.sh`), which this canary asserts goes FULLY ABSENT, plus a
+# non-privileged sub-case that bounds the residual to exactly that single initial
+# startup and proves NO helper/probe/working-shell child amplifies it.
+# Resolve a Bash binary for the launch sub-cases below. Prefer the bash running
+# this smoke ($BASH — guaranteed Bash 4+ on CI); fall back to PATH. `-p` on (c0)
+# needs a real bash that honors privileged mode.
+BRIDGE_BASH="${BASH:-$(command -v bash || echo /bin/bash)}"
+BASH_ENV_REC="$CANARY_REC/bashenv.txt"
+BASH_ENV_FILE="$ROOT/evil-bash-env.sh"
+{
+  printf '#!/usr/bin/env bash\n'
+  # Record the pid + privileged-flag of any bash that sources us WITH the
+  # credential visible. At bash STARTUP, BASH_ENV is sourced with $0 = the shell
+  # binary (not the script), so we key on the sourcing PROCESS: the unavoidable
+  # initial bridge-run.sh startup is a single non-privileged process; any SECOND
+  # distinct pid (a deeper probe/helper/working-shell child) would be the real
+  # amplification leak. `$-` lets us also confirm the sourcing shell was the
+  # non-privileged initial pass (a privileged shell never sources BASH_ENV).
+  printf 'if printenv CLAUDE_CODE_OAUTH_TOKEN >/dev/null 2>&1; then printf "pid=%%s flags=%%s\\n" "$$" "$-" >>%q; fi\n' "$BASH_ENV_REC"
+} > "$BASH_ENV_FILE"
+chmod +x "$BASH_ENV_FILE"
+
+# (c0) PRIVILEGED launch (the hardened invocation contract) — must be FULLY
+# ABSENT. Proves bridge-run.sh's re-exec + unset close BASH_ENV end-to-end when
+# the initial process is itself privileged.
+: >"$BASH_ENV_REC"
+env -u BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH \
+  PATH="$CANARY_BIN:$PATH" \
+  BASH_ENV="$BASH_ENV_FILE" \
+  BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin \
+  CLAUDE_CODE_OAUTH_TOKEN="MOCK-CANARY-NOT-A-REAL-TOKEN" \
+  "$BRIDGE_BASH" -p "$REPO_ROOT/bridge-run.sh" --list >/dev/null 2>&1 || true
+[[ ! -s "$BASH_ENV_REC" ]] \
+  || fail "BLOCKING 1 (codex round-3, BASH_ENV privileged launch): a child sourced a hostile BASH_ENV with the token in env ($(sort -u "$BASH_ENV_REC" | tr '\n' ' '))"
+
+# Helper: assert the BASH_ENV sourcings are ONLY the single unavoidable initial
+# bridge-run.sh startup process — i.e. NO probe/helper/working-shell child
+# amplified the exposure. Distinguisher is the sourcing PROCESS (pid): the
+# initial startup is one non-privileged pid; any SECOND distinct pid = a deeper
+# child leak. We also assert no PRIVILEGED shell ever sourced it (a privileged
+# shell must never source BASH_ENV; if one did, the `-p` hardening is broken).
+_assert_bashenv_residual_only_initial() {
+  local label="$1" rec="$2"
+  local pids
+  if grep -q 'flags=[^ ]*p' "$rec" 2>/dev/null; then
+    fail "BLOCKING 1 (codex round-3, BASH_ENV $label): a PRIVILEGED shell sourced BASH_ENV ($(sort -u "$rec" | tr '\n' ' ')) — -p hardening broken"
+  fi
+  pids="$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' "$rec" | sort -u | grep -c . || true)"
+  [[ "${pids:-0}" -le 1 ]] \
+    || fail "BLOCKING 1 (codex round-3, BASH_ENV $label): BASH_ENV sourced by >1 process ($(sort -u "$rec" | tr '\n' ' ')) — a probe/helper/working-shell child amplified the deferred initial-startup residual"
+}
+
+# (c1) env-flag keychain-free path, NON-privileged launch (production `bash
+# bridge-run.sh`). The single initial-startup sourcing is the deferred-boundary
+# residual; assert NO deeper child amplifies it.
+: >"$BASH_ENV_REC"
+PATH="$CANARY_BIN:$PATH" \
+  BASH_ENV="$BASH_ENV_FILE" \
+  BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
+  BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin \
+  CLAUDE_CODE_OAUTH_TOKEN="MOCK-CANARY-NOT-A-REAL-TOKEN" \
+  "$BRIDGE_BASH" "$REPO_ROOT/bridge-run.sh" --list >/dev/null 2>&1 || true
+_assert_bashenv_residual_only_initial "env-flag path" "$BASH_ENV_REC"
+
+# (c2) config-file keychain-free path (env flag UNSET), NON-privileged launch.
+: >"$BASH_ENV_REC"
+env -u BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH \
+  PATH="$CANARY_BIN:$PATH" \
+  BASH_ENV="$BASH_ENV_FILE" \
+  BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin \
+  CLAUDE_CODE_OAUTH_TOKEN="MOCK-CANARY-NOT-A-REAL-TOKEN" \
+  "$BRIDGE_BASH" "$REPO_ROOT/bridge-run.sh" --list >/dev/null 2>&1 || true
+_assert_bashenv_residual_only_initial "config-file path" "$BASH_ENV_REC"
+unset -f _assert_bashenv_residual_only_initial
+pass "hostile BASH_ENV: ABSENT under privileged launch; under non-privileged launch only the single unavoidable bridge-run.sh startup sources it (deferred #1454) — no probe/helper/working-shell child amplifies it"
 
 # ---------------------------------------------------------------------------
 # #1444 BLOCKING 1 — disable/rollback must REMOVE the bridge-managed
