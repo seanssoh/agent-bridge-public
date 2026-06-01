@@ -856,6 +856,12 @@ bridge_agent_desc() {
 
 bridge_agent_engine() {
   local agent="$1"
+  # #1407/#1213: guard the read without redeclaring; scalar-clobbered maps
+  # arithmetic-index agent ids under `set -u` and abort.
+  if ! declare -p BRIDGE_AGENT_ENGINE 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+    printf '%s' 'unknown'
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_ENGINE[$agent]-unknown}"
 }
 
@@ -5282,7 +5288,12 @@ bridge_agent_mattermost_state_dir() {
 
 bridge_agent_workdir() {
   local agent="$1"
-  local explicit="${BRIDGE_AGENT_WORKDIR[$agent]-}"
+  local explicit=""
+  # #1407/#1213: if the map is unset or scalar-clobbered, fall through to
+  # existing v2/default resolution instead of aborting under `set -u`.
+  if declare -p BRIDGE_AGENT_WORKDIR 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+    explicit="${BRIDGE_AGENT_WORKDIR[$agent]-}"
+  fi
 
   # v2 anchor precedence is conditional on isolation mode (issue #895,
   # ymprince WSL2 report, v0.13.8):

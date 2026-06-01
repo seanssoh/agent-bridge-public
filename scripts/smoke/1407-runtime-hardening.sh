@@ -9,6 +9,9 @@
 #       BRIDGE_AGENT_SESSION_ID when it is not an associative array (unset /
 #       clobbered to scalar) → arithmetic-indexes the agent id under `set -u`
 #       → `<agent>: unbound variable` abort.
+#   D1b bridge_agent_engine() / bridge_agent_workdir() (lib/bridge-agents.sh):
+#       the same non-assoc map read class on BRIDGE_AGENT_ENGINE and
+#       BRIDGE_AGENT_WORKDIR.
 #   D2  created-at indexed reads of BRIDGE_AGENT_CREATED_AT — same non-assoc
 #       failure as D1. Originally surfaced via bridge_refresh_agent_session_id's
 #       `since_hint` read; codex (PR #1410 r1) found the detect->persist path
@@ -21,7 +24,7 @@
 #
 # This smoke asserts the post-fix behavior, under `set -u`, with the
 # associative arrays UNSET:
-#   (a) D1/D2 degrade to empty / date-default with NO `unbound variable` abort;
+#   (a) D1/D1b/D2 degrade to empty / unknown / default with NO abort;
 #   (b) D3 emits the literal `- ...` bullets with NO `invalid option`.
 set -euo pipefail
 
@@ -81,6 +84,40 @@ elif printf '%s' "$d1_out" | grep -q 'D1_RESULT=\[\]'; then
 	pass "D1 bridge_agent_session_id degrades to empty on unset assoc array (no abort)"
 else
 	fail "D1 bridge_agent_session_id did not return empty as expected"
+fi
+
+# --- D1b: BRIDGE_AGENT_ENGINE/WORKDIR unset or scalar-clobbered --------------
+# The 2026-06-01 Telegram wedge RCA found two more #1407-class reads:
+# bridge_agent_engine and bridge_agent_workdir indexed their maps directly under
+# `set -u`. Engine must degrade to unknown. Workdir must ignore the invalid
+# explicit map and continue through the existing default resolver.
+d1b_out="$(
+	"$BASH4" -c '
+		set -u
+		source "'"$SCRIPT_DIR"'/lib/bridge-core.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-state.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-agents.sh" 2>/dev/null || true
+		BRIDGE_AGENT_ROOT_V2=
+		BRIDGE_AGENT_HOME_ROOT="/tmp/agb-1407-home"
+		unset BRIDGE_AGENT_ENGINE BRIDGE_AGENT_WORKDIR 2>/dev/null || true
+		printf "D1B_ENGINE_UNSET=[%s]\n" "$(bridge_agent_engine some-agent)"
+		printf "D1B_WORKDIR_UNSET=[%s]\n" "$(bridge_agent_workdir some-agent)"
+		BRIDGE_AGENT_ENGINE=scalar
+		BRIDGE_AGENT_WORKDIR=scalar
+		printf "D1B_ENGINE_SCALAR=[%s]\n" "$(bridge_agent_engine some-agent)"
+		printf "D1B_WORKDIR_SCALAR=[%s]\n" "$(bridge_agent_workdir some-agent)"
+	' 2>&1
+)" || true
+printf '%s\n' "$d1b_out"
+if printf '%s' "$d1b_out" | grep -q 'unbound variable'; then
+	fail "D1b bridge_agent_engine/workdir aborted with 'unbound variable' on unset/scalar maps"
+elif printf '%s' "$d1b_out" | grep -q 'D1B_ENGINE_UNSET=\[unknown\]' \
+	&& printf '%s' "$d1b_out" | grep -q 'D1B_ENGINE_SCALAR=\[unknown\]' \
+	&& printf '%s' "$d1b_out" | grep -q 'D1B_WORKDIR_UNSET=\[/tmp/agb-1407-home/some-agent\]' \
+	&& printf '%s' "$d1b_out" | grep -q 'D1B_WORKDIR_SCALAR=\[/tmp/agb-1407-home/some-agent\]'; then
+	pass "D1b bridge_agent_engine/workdir tolerate unset and scalar-clobbered maps"
+else
+	fail "D1b bridge_agent_engine/workdir did not return the expected fallback values"
 fi
 
 # --- D2-accessor: bridge_agent_created_at degrades to default on non-assoc ----
