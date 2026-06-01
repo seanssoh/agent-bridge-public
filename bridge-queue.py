@@ -1161,6 +1161,10 @@ def cmd_find_open(args: argparse.Namespace) -> int:
     if args.title_prefix:
         sql += " AND title LIKE ?"
         params.append(f"{args.title_prefix}%")
+    for excluded_prefix in getattr(args, "exclude_title_prefix", []) or []:
+        if excluded_prefix:
+            sql += " AND title NOT LIKE ?"
+            params.append(f"{excluded_prefix}%")
     sql += """
         ORDER BY
           CASE priority
@@ -1627,6 +1631,14 @@ def cmd_validate_companion_body(args: argparse.Namespace) -> int:
 
 
 def cmd_cron_ready(args: argparse.Namespace) -> int:
+    limit = max(0, int(args.limit))
+    scan_limit = max(limit, int(args.scan_limit))
+    if limit <= 0:
+        return 0
+
+    # SQL LIMIT used to be the worker-slot count. That let one deferred
+    # memory-daily row hide later runnable cron-dispatch rows when the daemon
+    # was configured with BRIDGE_CRON_DISPATCH_MAX_PARALLEL=1.
     sql = """
         SELECT id, assigned_to, priority, title, body_path, created_ts
         FROM tasks
@@ -1637,7 +1649,7 @@ def cmd_cron_ready(args: argparse.Namespace) -> int:
     """
 
     with closing(connect()) as conn:
-        rows = conn.execute(sql, (int(args.limit),)).fetchall()
+        rows = conn.execute(sql, (scan_limit,)).fetchall()
 
     status_by_agent = load_roster_status(args.status_snapshot) if args.status_snapshot else {}
     defer_seconds = max(0, int(args.memory_daily_defer_seconds))
@@ -1661,7 +1673,7 @@ def cmd_cron_ready(args: argparse.Namespace) -> int:
             rank = 0 if (not active or activity_state != "working") else 2
         ranked_rows.append((rank, int(row["id"]), row))
 
-    rows = [row for _, _, row in sorted(ranked_rows, key=lambda item: (item[0], item[1]))]
+    rows = [row for _, _, row in sorted(ranked_rows, key=lambda item: (item[0], item[1]))][:limit]
 
     if args.format == "tsv":
         for row in rows:
@@ -2757,6 +2769,12 @@ def build_parser() -> argparse.ArgumentParser:
             "REQUIRED 'Highest priority' line never cites a claimed/blocked task."
         ),
     )
+    find_open_parser.add_argument(
+        "--exclude-title-prefix",
+        action="append",
+        default=[],
+        help="exclude open tasks whose title starts with this prefix",
+    )
     find_open_parser.add_argument("--format", choices=("id", "text", "shell", "json"), default="id")
     find_open_parser.add_argument(
         "--all",
@@ -2847,6 +2865,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     cron_ready_parser = subparsers.add_parser("cron-ready", allow_abbrev=False)
     cron_ready_parser.add_argument("--limit", type=int, default=50)
+    cron_ready_parser.add_argument("--scan-limit", type=int, default=50)
     cron_ready_parser.add_argument("--format", choices=("text", "tsv"), default="tsv")
     cron_ready_parser.add_argument("--status-snapshot")
     cron_ready_parser.add_argument("--memory-daily-defer-seconds", type=int, default=10800)
