@@ -4,9 +4,9 @@
 
 ## Recommended target
 
-**v0.14.1 이상**. v0.14.1 은 v0.14.0 의 clean-install 문제 6 개 + audit-A 백로그 2 개를 모두 닫은 completeness release 다. 모든 v0.7.x / v0.8.x / v0.9.x / v0.10.x / v0.11.x / v0.12.x / v0.13.x 설치에서 단일 `agent-bridge upgrade --apply` 한 번으로 v0.14.1 까지 올라간다 (v0.13.7-v0.13.9 가 Bash 5.3.9 heredoc-chain 을 풀어놨기 때문에 중간 hop 불필요).
+**v0.15.2 (현재 stable)**. 모든 v0.7.x / v0.8.x / v0.9.x / v0.10.x / v0.11.x / v0.12.x / v0.13.x / v0.14.x 설치에서 단일 `agent-bridge upgrade --apply` 한 번으로 v0.15.2 까지 올라간다 (v0.13.7-v0.13.10 가 Bash 5.3.9 heredoc-chain 을 풀어놨기 때문에 중간 hop 불필요). v0.13.10 은 v0.14.x 미만에 pin 되어 있거나 in-flight leap 을 troubleshooting 할 때의 minimum-safe fallback 이다.
 
-v0.13.x 환경에서 에러가 발생하는 호스트 (예: `current_layout=markerless(existing-install)` hard-die, stop-hook `ensure_matrix_path failed` spam, always-on auto-start retry loop) 는 v0.14.1 로 올라오면 모두 닫힌다. 자세한 background 는 `OPERATIONS.md §"v0.14.1 completeness pass"` 참고.
+(역사적 floor) v0.14.1 은 v0.14.0 의 clean-install 문제 6 개 + audit-A 백로그 2 개를 모두 닫은 completeness release 였다. v0.13.x 환경에서 에러가 발생하던 호스트 (예: `current_layout=markerless(existing-install)` hard-die, stop-hook `ensure_matrix_path failed` spam, always-on auto-start retry loop) 는 v0.14.1 이상으로 올라오면 모두 닫힌다. 자세한 background 는 `OPERATIONS.md §"v0.14.1 completeness pass"` 참고.
 
 ## TL;DR
 

@@ -6,6 +6,33 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.2] — 2026-06-01
+
+A stabilization + headless-hardening batch on top of `0.15.1`. Every item is on `main`, CI-green (syntax + unit/static + oss-preflight + lint-heredoc-ban + lint + integration smoke), and codex pair-reviewed. The marquee items are headless Claude OAT self-rotation (proactive native probe + reactive 429), a Darwin-gated macOS Claude `apiKeyHelper` auth path with a deep inherited-env credential-leak hardening pass, a whole-fleet crash-loop fix on per-agent-HOME installs, and the long-standing daemon "ACTION REQUIRED" nudge double-fire fix.
+
+### Added
+
+- **Native Anthropic usage probe for headless proactive OAT rotation (#1437 / #1443).** On a headless cron host with no `claude-hud`, the daemon can now source utilization directly from the Anthropic `api/oauth/usage` endpoint with the active OAT and map it into the existing `.usage-cache.json` shape, so the proactive rotation/threshold path fires *before* a 429. Additive `--native-usage-cache` source, consumed only when `_source==native-oauth-probe` (the per-agent #831 guard stays intact). Credential transit is hardened: the OAT is never placed in a forgeable env var or on-disk path — it is delivered to the probe over an inherited fd on an unlinked `0600` file, the probe self-re-execs under `bash -p` (privileged mode imports no environment functions), and `BASH_ENV` / `ENV` / `BASH_XTRACEFD` are unset, closing the exported-function and startup-file-hook credential-leak classes. See `OPERATIONS.md` §"Native usage probe". *(Pre-flight: the live `api/oauth/usage` GET is verified on the operator's headless host before relying on it in production — the endpoint is undocumented/internal.)*
+- **Gated macOS Claude `apiKeyHelper` auth (#1444 / #1449 / #1452).** A Darwin-only, operator-gated path that serves the Claude OAT to a macOS host via a managed `apiKeyHelper` script (Keychain-free), with the same comprehensive inherited-env credential-leak hardening as the usage probe (`bash -p` re-exec, `BASH_ENV` / `ENV` / `BASH_XTRACEFD` unset, per-process-random-nonce-gated fd transit on an unlinked `0600` file). The settings writer is Darwin-gated so non-Darwin (iso-v2 Linux) never writes or leaks a controller `apiKeyHelper` path; `disable` removes only the genuinely managed value, so an operator's own symlink survives (raw-value compare). See `OPERATIONS.md` §"macOS apiKeyHelper".
+
+### Fixed
+
+- **Whole-fleet agent crash-loop on per-agent-HOME installs (#1439).** When the Claude CLI boot outpaced the session-id detect window on a per-agent-HOME install, the whole fleet could crash-loop; the detect path now degrades to a fresh session instead of fail-looping.
+- **Daemon "ACTION REQUIRED" nudge double-fire (#1199 / #1451).** The queued-task Stop-hook re-injected an "ACTION REQUIRED … claim immediately" nudge for a task the agent had *just claimed*, because the queue summary counted `queued + claimed`. It now counts only genuinely-`queued` tasks, and a just-claimed task no longer triggers an immediate re-nudge. (Codex Stop-hook anti-abandonment is preserved separately via the open-claimed count.)
+- **Reactive Claude OAT rotation on a headless cron 429 (#1437 / #1441).** A cron run that hits an Anthropic 429 now triggers an OAT rotation reactively on headless hosts (the complement to the proactive #1443 probe — together they complete #1437).
+- **Fail-safe daemon spool rederive + dedupe-on-claim (#1425).** The daemon's spool rederive is now fail-safe (a malformed/partial spool entry no longer wedges the rederive pass), with dedupe-on-claim semantics documented.
+- **Codex launch flag `features.codex_hooks` → `features.hooks` (#1446).** codex-cli 0.135.0 deprecated `features.codex_hooks`; the launch flag now emits `features.hooks` (recognizing the legacy form as already satisfying hooks — dedup, no double-pin), clearing the `[features].codex_hooks deprecated` boot warning.
+- **v2 per-agent-workdir layout covered by protected globs (#1448).** The system-config protected globs now cover the v2 `data/agents/*/workdir/.discord|.telegram/access.json` layout, with segment-aware matching (each `*` bounded to a single path segment).
+- **Claude submit via CSI-u Enter for Claude Code 2.1.158+ (#1450 — external contributor: Jong Ko).** Claude Code 2.1.158+ changed Enter handling so the legacy `C-m` no longer submitted; the tmux submit path now emits a CSI-u Enter for Claude engines (Codex / non-Claude unchanged), mode overridable via `BRIDGE_TMUX_CLAUDE_SUBMIT_KEY_MODE`, with a gated fallback to legacy `C-m`.
+
+### Security
+
+- **`apiKeyHelper` inherited-env credential-leak hardening (#1452, relates to #1444).** A retro Phase-4 security review of the early-merged #1444 found inherited-env credential-leak vectors in `bridge-run.sh` + the helper wrapper. The credential is now captured and the well-known env vars unset *unconditionally before any external command or subshell*; `bridge-run.sh` re-execs under `bash -p` (privileged mode imports no environment functions, closing the exported-function-shadow class in one shot); `BASH_ENV` / `ENV` / `BASH_XTRACEFD` are unset; and the legacy-path credential survives the re-exec only over a per-process-nonce-gated fd on an unlinked `0600` file. Cron keychain-free preflight gets an explicit scrubbed `env=`. Out-of-scope residuals (initial-process `BASH_ENV` startup sourcing, a same-UID caller forging the nonce, the shared `bridge-lib.sh` re-exec) are tracked in #1454.
+
+### Docs
+
+- README index + CLAUDE.md release-ritual sync (#1435 / #1436), `OPERATIONS.md` §"Native usage probe" / §"macOS apiKeyHelper", and `KNOWN_ISSUES.md` CSI-u / apiKeyHelper notes, all carried to `v0.15.2`.
+
 ## [0.15.1] — 2026-05-31
 
 A stabilization batch on top of `0.15.0` plus one opt-in feature. Every item below is on `main`, CI-green (unit/static + oss-preflight + lint-heredoc-ban + lint + syntax + integration), and codex pair-reviewed.
