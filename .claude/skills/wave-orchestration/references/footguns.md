@@ -32,11 +32,11 @@ Each footgun below has cost a real session of recovery. Read this file before di
 
 **Symptom**: `gh pr create` fails with `failed to create pull request: GraphQL: createPullRequest: ... must have push access to the repository`. PR isn't created. Fixer blocks waiting for an owner to grant access.
 
-**Root cause**: Multiple `gh` accounts logged in (e.g., `seanssoh` for fork + `SYRS-AI` for upstream). Active account is the fork; the fork has READ permission on upstream, not write. `gh pr create` from the fork account fails to open a PR against upstream.
+**Root cause**: Multiple `gh` accounts logged in (e.g., `<fork-account>` for fork + `<upstream-account>` for upstream). Active account is the fork; the fork has READ permission on upstream, not write. `gh pr create` from the fork account fails to open a PR against upstream.
 
-**Fix**: Brief must include `gh auth switch --user SYRS-AI` (or whichever account has write) **before** any `gh pr create`. Verify via `gh auth status | head -10` showing the right account as Active.
+**Fix**: Brief must include `gh auth switch --user <upstream-account>` (or whichever account has write) **before** any `gh pr create`. Verify via `gh auth status | head -10` showing the right account as Active.
 
-For cross-fork PRs (PR head is `seanssoh:branch`, base is `SYRS-AI:main`), also pass `--no-maintainer-edit` to `gh pr create`. Without it, fork-to-upstream PRs from accounts that don't have collaborator edit access fail.
+For cross-fork PRs (PR head is `<fork-account>:branch`, base is `<upstream-account>:main`), also pass `--no-maintainer-edit` to `gh pr create`. Without it, fork-to-upstream PRs from accounts that don't have collaborator edit access fail.
 
 ## Footgun 4 — VERSION/CHANGELOG bleeding into feature PRs
 
@@ -88,7 +88,7 @@ Verify before claiming done that the function returns the expected output. If th
 
 ## Footgun 7 — Cross-fork PR push from fork account
 
-**Symptom**: A PR sits on someone else's fork (e.g., `seanssoh:fix/foo`). The original author can't iterate quickly. You want to push fix commits to that branch.
+**Symptom**: A PR sits on someone else's fork (e.g., `<fork-account>:fix/foo`). The original author can't iterate quickly. You want to push fix commits to that branch.
 
 **Workflow**:
 
@@ -137,26 +137,24 @@ That single line changes the dispatch from async to sync. The reviewer's full re
 Also: before dispatching, verify codex is set up:
 
 ```bash
-codex --version 2>/dev/null && command -v codex   # confirm codex CLI is installed and on PATH
+node "~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs" setup --json
 ```
 
-If `codex` isn't on the agent's PATH (homebrew installs to `/opt/homebrew/bin` on macOS, `/usr/local/bin` on Linux, neither of which subagent shells always include), the agent reports "Codex CLI is not installed" even when the binary exists. **Re-probing alone is not always enough** — the codex-rescue runtime can still fail to invoke codex from its sandboxed shell. When this happens, re-dispatch with **explicit PATH guidance + absolute-path fallback** in the prompt:
+Look for `"ready": true`. If `codex` isn't on the agent's PATH (homebrew installs to `/opt/homebrew/bin`, which subagent shells may not include), the agent reports "Codex CLI is not installed" even when the binary exists. **Re-probing via the companion script alone is not always enough** — the codex-rescue runtime can still fail to invoke codex from its sandboxed shell. When this happens, re-dispatch with **explicit PATH guidance + absolute-path fallback** in the prompt:
 
 ```
 **Codex CLI is INSTALLED and READY on this machine.** Verified directly:
-$ command -v codex
-/opt/homebrew/bin/codex
-$ codex --version
-codex 1.x.x
+$ node "~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs" setup --json
+{ "ready": true, "codex": { "available": true } ... }
 
 If your sandboxed shell reports "Codex CLI is not installed", the issue is the
-shell's PATH not picking up the package-manager bin directory. Retry with:
+shell's PATH not picking up `/opt/homebrew/bin/`. Retry the probe with:
 
-  PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" codex --version
+  PATH="/opt/homebrew/bin:$PATH" node ".../codex-companion.mjs" setup --json
 
-Or invoke codex directly via the absolute path the orchestrator captured
-above. Do NOT abort with "Codex CLI is not installed" if the orchestrator
-(me) confirmed codex is reachable. Proceed with the review.
+Or invoke codex directly via the absolute path `/opt/homebrew/bin/codex`. Do NOT
+abort with "Codex CLI is not installed" if the orchestrator (me) confirmed
+codex is reachable. Proceed with the review.
 ```
 
 This forceful guidance has worked when the simpler "re-probe via companion script" guidance failed. The codex-rescue agent will still try to invoke codex, but the explicit PATH override + the operator-affirmation lets it persist past the false-negative probe.
@@ -210,64 +208,41 @@ Otherwise: parallel.
 
 If a fixer trips footguns 1, 2, and 4 in the same PR, the PR (a) mutates the operator's primary checkout, (b) auto-closes the parent issue, and (c) bumps VERSION concurrent with an open release PR. Recovery is a manual revert + amend + reopen + comment + roster reset. Don't let this happen — every brief should explicitly call out all three. The cost of a 3-line footgun callout in the brief is much smaller than the cost of recovery.
 
-## Footgun 11 — Bash heredoc / here-string deadlock against a slow consumer
+## Footgun 11 — PR opened against `main` instead of the integration branch
 
-**Symptom**: A bash hot path that feeds bash-side data into a `while read` loop or `python3 - <<'PY'` subprocess via heredoc / here-string silently wedges with no output and no progress. `pstack` / `lldb` on the bash frame shows it stuck inside `heredoc_write → __wait4`. Sometimes never times out (the canonical #800 case was a 34h daemon hang). Sometimes only reproduces past a threshold input size (multi-record git porcelain, a few KB+).
+**Symptom**: Fixer opens a PR with `--base main` even though the wave plan said all PRs go through `feat/wave-N-integration`. PR shows the entire integration branch's history as "additions" against main, or the PR merge prematurely lands work on main before Phase 5 QA.
 
-**Root cause**: Bash heredoc / here-string plumbing puts the **producer** (bash writing the heredoc body) and the **consumer** (subprocess stdin or `while read` reader) on the same pipe pair. If the consumer blocks even briefly during processing (slow `python3` startup, slow line-by-line work) AND the producer's data exceeds the pipe buffer, both ends wedge. The producer waits for the consumer to drain; the consumer waits for the producer to finish; nothing breaks the deadlock.
+**Root cause**: `gh pr create` defaults to `--base main` (or the repo's default branch) if you don't pass `--base`. Fixers reading the brief sometimes skip the PR-opening section and run their muscle-memory `gh pr create` command.
 
-The bug class covers at least three syntactic variants — all share the same root:
+**Fix**:
+1. Brief's "PR opening" section MUST spell out the exact command including `--base <integration-branch-name>`. Don't make the fixer infer.
+2. After fixer returns the PR number, orchestrator verifies: `gh pr view <N> --json baseRefName --jq .baseRefName`. If wrong, retarget before review: `gh pr edit <N> --base <integration-branch-name>`.
+3. If the fixer already merged against main by accident (catastrophic): revert the squash commit immediately, then carry the diff forward into the integration branch via a fresh fixer.
 
-```bash
-# Variant A — heredoc into subprocess stdin (the #800 / PR #801 / PR #806 case):
-result="$(python3 - <<'PY'
-... multi-line python body ...
-PY
-)"
+**Real instance**: First-time bite expected on the rollout of the integration-branch workflow (2026-05-19 forward). Pre-empt it with brief discipline rather than waiting for recovery.
 
-# Variant B — here-string into `while read` loop (the 2026-05-13 worktree-doctor case):
-while IFS= read -r line; do
-    process "$line"        # if slow, deadlocks on multi-record input
-done <<<"$porcelain"
+## Footgun 12 — Stale integration branch
 
-# Variant C — `<<EOF ... EOF` heredoc to any pipe-pair consumer:
-some_cmd <<EOF
-... multi-line body ...
-EOF
-```
+**Symptom**: Phase 5 release PR (integration → main) has dozens of merge conflicts. The wave took several days, main moved 30+ commits in unrelated areas, and the integration branch's last rebase was 5 days ago.
 
-**Fix** — route the producer through a tempfile so the bash heredoc-write step finishes before the consumer ever runs:
+**Root cause**: Long-running integration branches accumulate divergence from main. Each fixer PR is small and rebases cleanly into the integration branch, but the integration branch itself drifts away from main while waiting for all wave PRs to land.
 
-```bash
-# Producer/consumer decoupled via tempfile:
-local tmp
-tmp="$(mktemp)"
-trap "rm -f '$tmp'" RETURN
-printf '%s\n' "$porcelain" > "$tmp"
+**Fix**:
+1. Orchestrator rebases the integration branch on `origin/main` periodically during the wave (rule of thumb: if main has moved >10 commits since the last rebase, rebase before the next Phase 4 PR merge).
+2. The rebase is `git pull --rebase origin main` from the integration branch, then `git push --force-with-lease origin <integration-branch>` (force is acceptable here because the integration branch is short-lived and orchestrator-owned; fixer worktrees branched off it will need to rebase too).
+3. Coordinate the rebase with in-flight fixers — announce it before pushing so they can pause + rebase their fixer branches after.
 
-# Now the consumer reads from a real file; no back-pressure interaction.
-while IFS= read -r line; do
-    process "$line"
-done < "$tmp"
-```
+**Recovery**: If the integration branch is already a conflict mess at release time, the cheapest fix is usually to cherry-pick the merged-to-integration commits onto a fresh integration branch branched from current main, then open the release PR from there. Update fixer worktrees that were branched off the stale integration ref.
 
-For the `python3 - <<'PY'` variant, write the script to a tempfile and exec it:
+## Footgun 13 — Worktree accumulation
 
-```bash
-local tmp
-tmp="$(mktemp --suffix=.py)"
-trap "rm -f '$tmp'" RETURN
-cat > "$tmp" <<'PY'
-... multi-line python body ...
-PY
-result="$(python3 "$tmp")"
-```
+**Symptom**: `.claude/worktrees/` directory has 60+ entries on a busy install. `git worktree list` is paginated. Disk space pressure on the operator's checkout. Operator notices and asks why stale worktrees aren't cleaned up.
 
-**Apply rule for brief writers**: when the task involves bash that pipes bash-side data into ANY pipe-pair consumer (subprocess stdin, `while read`, an embedded interpreter), default to **`mktemp + < file`** instead of heredoc / here-string. Threshold heuristic: anything over a single short value (a SHA, a single path, a flag) should go via tempfile. Cheap to write, prevents the deadlock class entirely.
+**Root cause**: Orchestrator forgot Phase 4 worktree cleanup at squash-merge time. Each fixer's worktree survives past its PR's merge because the orchestrator didn't run `git worktree remove -f -f <path>` while the path was fresh in mind.
 
-**Real instances**:
-- #800 (closed 2026-05-12) — 34h daemon hang traced to nested `$(python3 - <<'PY')` in `bridge-daemon.sh` rotation / recovery paths. Fixed in PR #801 + #806 by wrapping production callsites.
-- 2026-05-13 — worktree-doctor fixer's smoke setup deadlocked in `<<<"$porcelain"` against multi-record `git worktree list --porcelain` output on Bash 5.3.9. Same `heredoc_write` frame as #800.
-- PR #809 body (this wave) — operator notes `./scripts/smoke-test.sh` hangs on a `cat` heredoc on the orchestrator's host. Same class; pre-existing on `main`, not introduced by #809.
+**Fix**:
+1. Phase 4 squash-merge and worktree cleanup are a **single transaction in the orchestrator's mental model**. Never end a Phase 4 step without the cleanup.
+2. End-of-wave sweep: `find <repo>/.claude/worktrees -maxdepth 1 -type d -mtime +1` → reconcile against `gh pr list --state open --json headRefName`. Any worktree dir whose branch is not in the open-PR list is stale and safe to remove.
+3. If you find yourself with 30+ stale worktrees, do a bulk cleanup but cross-check each against open PRs first — `git worktree remove` on a worktree with uncommitted changes refuses without `-f`; never use `-f -f` on a worktree you haven't verified is stale, since that bypasses the dirty-state guard.
 
-**Escalation trigger**: if a third *new* surface trips this class (i.e., outside the already-wrapped daemon hot paths), open a repo-wide audit issue and grep every `<<<` and `<<'`/`<<\"` site in `lib/`, `scripts/`, and root `bridge-*.sh` for producer-consumer pairs above the threshold. Until then, fix at the encounter site and call this footgun out in the next bash-heavy brief.
+**Real instance**: Mentioned by operator on 2026-05-19 — `.claude/worktrees/` had ~60 entries on the agent-bridge-public checkout, evidence of orchestrator skipping Phase 4 cleanup across multiple recent waves.

@@ -242,25 +242,3 @@ The schema lives in `agents/_template/CLAUDE.md` line 54. Standard across waves.
 A working brief is **150-300 lines markdown**. Less = sketchy spec, fixer guesses; more = brief is doing the fixer's job and you should just write the code yourself.
 
 If your brief is approaching 400 lines, the work is too big for one wave. Split it.
-
-## When the work touches bash hot paths — name footgun #11 explicitly
-
-If the change involves writing bash that pipes bash-side data into a subprocess (`python3 - <<'PY'`), a `while read` loop (`<<<"$var"`), or any heredoc-stdin consumer, the brief MUST call out **footgun #11** (heredoc / here-string deadlock against a slow consumer) and require the fixer to route producer data through a tempfile (`mktemp + < file`) rather than heredoc.
-
-Concrete brief snippet to drop into section 10 (Reminders) when the work qualifies:
-
-```markdown
-- **Footgun #11 — heredoc / here-string deadlock**. If your edit pipes
-  multi-record bash data into a subprocess (`python3 - <<'PY' ... PY`),
-  a `while IFS= read -r ... <<<"$var"` loop, or any `cmd <<EOF ... EOF`
-  consumer, route via tempfile instead:
-
-      local tmp; tmp="$(mktemp)"; trap "rm -f '$tmp'" RETURN
-      printf '%s\n' "$data" > "$tmp"
-      while IFS= read -r line; do ...; done < "$tmp"
-
-  Threshold: anything over a single short value (SHA / path / flag).
-  See `references/footguns.md` Footgun 11 for the full root cause.
-```
-
-Don't paraphrase the footgun callout — paste the snippet verbatim into the brief. Fixers skim, and the verbatim recipe is what survives the skim.
