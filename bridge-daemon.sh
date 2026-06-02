@@ -1127,6 +1127,19 @@ refresh_agent_heartbeats() {
     changed=0
   done
 
+  # Issue #1473: publish the world-readable all-agent state aggregate every
+  # tick (NOT gated on heartbeat_due) so an isolated agent UID always sees
+  # a fresh `updated_at` and current active/state for `agb agent list`.
+  # The daemon runs as the controller UID, so the tmux probes inside the
+  # writer are authoritative. Cheap (reuses the probes already run above);
+  # failures inside the writer are swallowed there so a write hiccup never
+  # changes the heartbeat return contract. Does not flip `changed` — the
+  # aggregate is a derived view, not a queue-state change a sync needs to
+  # observe.
+  if command -v bridge_write_agents_aggregate_state >/dev/null 2>&1; then
+    bridge_write_agents_aggregate_state || true
+  fi
+
   return "$changed"
 }
 

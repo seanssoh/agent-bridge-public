@@ -4761,3 +4761,207 @@ bridge_render_active_roster() {
   mv "$tmp_tsv" "$BRIDGE_ACTIVE_ROSTER_TSV"
   mv "$tmp_md" "$BRIDGE_ACTIVE_ROSTER_MD"
 }
+
+# Issue #1473: publish a world-readable (0644) all-agent live-state
+# aggregate so an isolated agent UID can answer `agb agent list` without
+# reaching the controller's per-UID tmux socket or the 0600 active-roster.
+#
+# WHY this artifact exists: `bridge_agent_is_active` probes tmux directly
+# (`tmux has-session`). tmux servers are per-UID, so from inside an iso
+# agent's UID every probe returns "absent" → `agb agent list` falsely
+# renders every agent as `stopped`. The per-agent HEARTBEAT.md / 0600
+# active-roster are NOT iso-readable across agents either (group
+# `ab-agent-<a>` is private to each agent). This aggregate is the one
+# controller-published, all-agent, iso-readable snapshot.
+#
+# SECURITY: only non-secret observational columns are written —
+# `agent` (already public), `active` (1/0), `activity_state` (a short
+# enum token: idle/working/stopped/starting/picker_blocked/...),
+# `updated_at` (ISO-8601). NO session ids, workdirs, channel ids, tokens,
+# or paths. The 0644 mode is justified by that content boundary; keep it
+# that way (the codex review for #1473 gates on "no secret in the 0644
+# aggregate"). `updated_at` lets a reader detect staleness rather than
+# trusting a daemon-down snapshot as fresh.
+#
+# ALL registered agents are listed (active AND stopped) — unlike
+# `bridge_render_active_roster`, which filters to active only. A `list`
+# consumer that dropped stopped rows would make them vanish entirely from
+# an iso view, which is the opposite of the fix.
+#
+# The daemon runs as the controller UID, so the tmux probe inside
+# `bridge_agent_is_active` / `bridge_agent_activity_state` is authoritative
+# here. Atomic write (mktemp in BRIDGE_STATE_DIR → chmod → mv) keeps a
+# concurrent reader from ever seeing a half-written file.
+bridge_write_agents_aggregate_state() {
+  local target="${BRIDGE_AGENTS_AGGREGATE_TSV:-}"
+  [[ -n "$target" ]] || return 0
+  declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 || return 0
+
+  local state_dir
+  state_dir="$(dirname "$target")"
+  mkdir -p "$state_dir" 2>/dev/null || return 0
+
+  local tmp updated agent active activity
+  # mktemp inside the same dir guarantees the final `mv` is an atomic
+  # same-filesystem rename (a cross-fs mv would copy+unlink, which is not
+  # atomic for a concurrent reader).
+  tmp="$(mktemp "${target}.XXXXXX")" || return 0
+
+  # ISO-8601 local-with-offset. Prefer bridge_now_iso (the same renderer
+  # bridge_render_active_roster uses on this exact daemon tick — one fork
+  # per tick, not per agent, so the cost is already paid alongside) for a
+  # colon-offset form. Fall back to date(1) with %z (the BASIC numeric
+  # offset, which BOTH BSD and GNU date support — `%:z` is GNU-only and
+  # BSD date prints a literal `:z`, footgun the smoke pins).
+  if command -v bridge_now_iso >/dev/null 2>&1; then
+    updated="$(bridge_now_iso 2>/dev/null || true)"
+  fi
+  if [[ -z "${updated:-}" ]]; then
+    updated="$(date +%Y-%m-%dT%H:%M:%S%z 2>/dev/null || true)"
+  fi
+  [[ -n "${updated:-}" ]] || updated="-"
+
+  # activity_state source: prefer the daemon-side computation
+  # (bridge_agent_heartbeat_activity_state, defined in bridge-daemon.sh and
+  # the function the daemon already uses for per-agent heartbeats) since
+  # the writer's primary caller is the daemon tick. Fall back to the CLI's
+  # bridge_agent_activity_state (bridge-agent.sh) when the writer runs from
+  # a CLI process that sourced it, else the `unknown` sentinel. Both
+  # compute the same enum tokens; selecting by availability avoids a
+  # hard dependency on either root script being sourced.
+  local _state_fn=""
+  if command -v bridge_agent_heartbeat_activity_state >/dev/null 2>&1; then
+    _state_fn="bridge_agent_heartbeat_activity_state"
+  elif command -v bridge_agent_activity_state >/dev/null 2>&1; then
+    _state_fn="bridge_agent_activity_state"
+  fi
+
+  {
+    printf 'agent\tactive\tactivity_state\tupdated_at\n'
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      [[ -n "$agent" ]] || continue
+      if bridge_agent_is_active "$agent"; then
+        active=1
+      else
+        active=0
+      fi
+      # Quarantine wins over the heartbeat/CLI state fn, mirroring the
+      # short-circuit in bridge-agent.sh::bridge_agent_activity_state and
+      # bridge_write_roster_status_snapshot. The daemon-side
+      # bridge_agent_heartbeat_activity_state does NOT check the
+      # broken-launch marker (it returns `stopped` for a quarantined,
+      # tmux-less agent), so without this check the aggregate — and the iso
+      # fallback that reads it — would regress a quarantined agent to
+      # `stopped` and drop the operator's recovery signal (#1317-B).
+      if [[ -f "$(bridge_agent_broken_launch_file "$agent" 2>/dev/null)" ]]; then
+        activity="quarantine-broken-launch"
+      elif [[ -n "$_state_fn" ]]; then
+        activity="$("$_state_fn" "$agent" 2>/dev/null || printf 'unknown')"
+      else
+        activity="unknown"
+      fi
+      # Defensive: collapse any stray tab/newline so the TSV stays
+      # single-line-per-agent (activity_state is a fixed enum, but never
+      # trust an upstream helper to stay shape-clean).
+      activity="${activity//$'\t'/ }"
+      activity="${activity//$'\n'/ }"
+      printf '%s\t%s\t%s\t%s\n' "$agent" "$active" "${activity:-unknown}" "$updated"
+    done
+  } >"$tmp" 2>/dev/null || {
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 0
+  }
+
+  chmod 0644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$target" 2>/dev/null || {
+    rm -f -- "$tmp" 2>/dev/null || true
+    return 0
+  }
+  return 0
+}
+
+# Issue #1473 (read side): is the current process a non-controller reader
+# that should consult the daemon-published aggregate instead of the live
+# tmux probe? True when ALL of:
+#   (a) the aggregate exists,
+#   (b) it is owned by a UID OTHER than our real UID — i.e. the controller
+#       (daemon) published it and we are some other UID (an isolated
+#       agent). On the controller the daemon writes it as the controller
+#       UID, so owner == us → false → the controller keeps its pure-live
+#       tmux behavior and never trusts a possibly-stale aggregate over a
+#       fresh probe, AND
+#   (c) it is FRESH — its mtime is within BRIDGE_AGENTS_AGGREGATE_MAX_AGE_
+#       SECONDS. The daemon rewrites it every tick; once the daemon is
+#       down/wedged the file stops updating, and an iso UID must NOT keep
+#       trusting an indefinitely-stale snapshot (#1473 codex r1: gate 5).
+#       Beyond the ceiling we fall back to the historical probe-miss
+#       answer (stopped) rather than reporting an agent live from a
+#       snapshot that may be hours old. Default ceiling = 3× the heartbeat
+#       interval (the writer runs every tick, so 3 missed ticks is a
+#       confident "daemon not publishing"), overridable via the env.
+bridge_agents_aggregate_should_consult() {
+  local target="${BRIDGE_AGENTS_AGGREGATE_TSV:-}"
+  [[ -n "$target" ]] || return 1
+  [[ -f "$target" ]] || return 1
+
+  local owner_uid self_uid
+  owner_uid="$(bridge_marker_stat_uid "$target" 2>/dev/null || true)"
+  [[ "$owner_uid" =~ ^[0-9]+$ ]] || return 1
+  self_uid="$(id -u 2>/dev/null || true)"
+  [[ "$self_uid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$owner_uid" != "$self_uid" ]] || return 1
+
+  # Freshness gate. Resolve the ceiling: explicit env wins; else 3× the
+  # heartbeat interval (default 300s → 900s).
+  local max_age interval mtime now_ts
+  max_age="${BRIDGE_AGENTS_AGGREGATE_MAX_AGE_SECONDS:-}"
+  if ! [[ "$max_age" =~ ^[0-9]+$ ]]; then
+    interval="${BRIDGE_HEARTBEAT_INTERVAL_SECONDS:-300}"
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=300
+    (( interval > 0 )) || interval=300
+    max_age=$(( interval * 3 ))
+  fi
+  # max_age=0 disables the freshness gate (consult regardless of age).
+  if (( max_age > 0 )); then
+    # Portable mtime: `stat -c %Y` (GNU) vs `stat -f %m` (BSD/macOS).
+    mtime="$(stat -c '%Y' "$target" 2>/dev/null \
+          || stat -f '%m' "$target" 2>/dev/null \
+          || printf '')"
+    [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+    now_ts="$(date +%s 2>/dev/null || printf '0')"
+    [[ "$now_ts" =~ ^[0-9]+$ ]] || return 1
+    # Future-dated mtime (clock skew) is treated as fresh, not stale.
+    if (( now_ts > mtime )) && (( now_ts - mtime > max_age )); then
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+# Issue #1473: look up one column for one agent in the published
+# aggregate. `column` is 2 (active) or 3 (activity_state). Returns 0 and
+# prints the value on a hit; returns 1 (prints nothing) when the file is
+# missing or the agent is absent. Read-only — never calls
+# bridge_agent_is_active (which would recurse).
+bridge_agents_aggregate_lookup() {
+  local agent="$1"
+  local column="$2"
+  local target="${BRIDGE_AGENTS_AGGREGATE_TSV:-}"
+
+  [[ -n "$agent" && -n "$target" ]] || return 1
+  [[ -f "$target" ]] || return 1
+  [[ "$column" == "2" || "$column" == "3" ]] || return 1
+
+  local row val
+  # First exact match on the agent column. The header row's first field is
+  # the literal "agent", which can only collide if someone names an agent
+  # "agent"; the active/state columns there are "active"/"activity_state",
+  # which the numeric / enum consumers reject, so a header collision is
+  # self-correcting. Bound to one read of a small file.
+  row="$(awk -F'\t' -v a="$agent" 'NR>1 && $1==a {print; exit}' "$target" 2>/dev/null || true)"
+  [[ -n "$row" ]] || return 1
+  val="$(printf '%s' "$row" | cut -f"$column")"
+  [[ -n "$val" ]] || return 1
+  printf '%s' "$val"
+}
