@@ -116,6 +116,11 @@ add_required 1473-agent-list-iso-state-fallback
 # scripts/smoke/* catch-all → add_all_required_static — still re-runs the
 # coalesce smoke.
 add_required 8807-cron-backfill-coalesce
+# Incident #8807 P0b: in the full static suite so a change to the reaper helper
+# (scripts/smoke/8807-mcp-reaper-patterns-helper.py) — which hits the
+# scripts/smoke/* catch-all → add_all_required_static — still re-runs the
+# reaper-pattern smoke.
+add_required 8807-mcp-reaper-patterns
 
 
 }
@@ -1099,9 +1104,14 @@ select_for_path() {
       # Incident #8807 P0b: the MCP-orphan reaper's DEFAULT_PATTERNS (tightened
       # to bridge-owned identities/paths + extended to the missing bridge MCP
       # signatures, never matching Pencil.app's mcp-server-darwin-arm64 or live
-      # `codex resume` agents) and the PID-reuse revalidation in kill_pid. Pull
-      # 8807-mcp-reaper-patterns on every move so the positive/negative control
-      # matrix and the pre-TERM/pre-KILL revalidation cannot regress.
+      # `codex resume` agents) and the PID-reuse revalidation in kill_pid. The
+      # r2 control matrix + spawn fixtures live in the file-as-argv helper
+      # (8807-mcp-reaper-patterns-helper.py, extracted to drop heredoc-stdin);
+      # a change to that helper hits the `scripts/smoke/*` catch-all above,
+      # which runs the full static suite (where 8807-mcp-reaper-patterns is
+      # also registered). Pull 8807-mcp-reaper-patterns on every reaper move so
+      # the control matrix and the pre-TERM/pre-KILL revalidation cannot
+      # regress.
       add_required 8807-mcp-reaper-patterns
       ;;
 

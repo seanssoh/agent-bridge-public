@@ -26,6 +26,9 @@ source "$SCRIPT_DIR/lib.sh"
 
 REAPER_PY="$SMOKE_REPO_ROOT/bridge-mcp-cleanup.py"
 DAEMON_SH="$SMOKE_REPO_ROOT/bridge-daemon.sh"
+# Helper carries the python bodies file-as-argv (no heredoc-stdin — lint-
+# heredoc-ban C3 ban; see KNOWN_ISSUES.md §26).
+HELPER_PY="$SCRIPT_DIR/8807-mcp-reaper-patterns-helper.py"
 
 smoke_log "A1: bridge-mcp-cleanup.py compiles"
 python3 -c "import py_compile; py_compile.compile('$REAPER_PY', doraise=True)" || \
@@ -39,97 +42,16 @@ bash -n "$DAEMON_SH" || smoke_fail "bridge-daemon.sh failed bash -n"
 # (lethal collateral MUST NOT match), driven against the REAL DEFAULT_PATTERNS.
 # ---------------------------------------------------------------------------
 smoke_log "B: DEFAULT_PATTERNS positive + negative control matrix"
-python3 - "$REAPER_PY" <<'PY' || smoke_fail "DEFAULT_PATTERNS control matrix failed"
-import ast, re, sys
-src = open(sys.argv[1]).read()
-tree = ast.parse(src)
-patterns = None
-for node in ast.walk(tree):
-    if isinstance(node, ast.Assign):
-        for t in node.targets:
-            if isinstance(t, ast.Name) and t.id == "DEFAULT_PATTERNS":
-                patterns = [ast.literal_eval(e) for e in node.value.elts]
-assert patterns, "could not extract DEFAULT_PATTERNS"
-pats = [re.compile(p) for p in patterns]
-def hit(cmd): return any(p.search(cmd) for p in pats)
-
-POSITIVE = [
-    "npm exec @upstash/context7-mcp",
-    "npm exec @playwright/mcp@latest",
-    "npm exec @shopify/dev-mcp@latest",
-    "node /Users/x/.npm/_npx/abc/node_modules/.bin/shopify-dev-mcp",
-    "node /Users/x/.npm/_npx/abc/node_modules/@shopify/dev-mcp/dist/index.js",
-    "node /Users/x/.claude/plugins/cache/cosmax-marketplace/cosmax-crm/0.19.3-3/scripts/crm-mcp-proxy.mjs",
-    "node /home/u/.npm/_npx/abc/node_modules/.bin/context7-mcp",
-    "bun /home/u/.agent-bridge/plugins/teams/server.ts",
-    "bun run --cwd /home/u/.agent-bridge/plugins/telegram --silent start",
-    "bun run --cwd /home/u/.bun/install/claude-plugins-official/telegram/0.0.6 start",
-]
-NEGATIVE = [
-    # Lethal collateral on the live host — none are Agent Bridge MCP servers.
-    "/Applications/Pencil.app/Contents/Resources/mcp-server-darwin-arm64 --stdio",
-    "/usr/local/bin/mcp-server --port 9000",
-    "/Applications/Telegram.app/Contents/MacOS/Telegram",
-    "/Applications/Microsoft Teams.app/Contents/MacOS/MSTeams",
-    "/Applications/Figma.app/Contents/MacOS/Figma",
-    # Bare interpreters / unrelated same-uid projects.
-    "node /Users/x/code/myapp/index.js",
-    "/home/u/.bun/bin/bun server.ts",
-    "bun /Users/x/Projects/mywebapp/src/server.ts",
-    "bun run --cwd /home/user/myproject build",
-    # codex orphans are NOT reaped by the MCP cleaner.
-    "codex resume 9f3a2b1c --cwd /home/agent",
-    "codex exec --ephemeral --skip-git-repo-check -C crm-dev",
-]
-bad = []
-for c in POSITIVE:
-    if not hit(c):
-        bad.append(("MISS positive", c))
-for c in NEGATIVE:
-    if hit(c):
-        bad.append(("LETHAL negative", c))
-if bad:
-    for kind, c in bad:
-        print(f"{kind}: {c}", file=sys.stderr)
-    sys.exit(1)
-print(f"[ok] {len(POSITIVE)} positive + {len(NEGATIVE)} negative controls correct")
-PY
+python3 "$HELPER_PY" pattern-matrix "$REAPER_PY" || \
+  smoke_fail "DEFAULT_PATTERNS control matrix failed"
 
 # ---------------------------------------------------------------------------
 # PID-reuse revalidation — the kill path must refuse a pid whose live identity
 # changed since classification.
 # ---------------------------------------------------------------------------
 smoke_log "C: PID-reuse revalidation (pre-TERM + pre-KILL guards)"
-python3 - "$REAPER_PY" <<'PY' || smoke_fail "PID-reuse revalidation failed"
-import importlib.util, re, subprocess, sys, time
-spec = importlib.util.spec_from_file_location("bridge_mcp_cleanup", sys.argv[1])
-mod = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = mod
-spec.loader.exec_module(mod)
-
-child = subprocess.Popen(["/bin/sleep", "30"])
-try:
-    for _ in range(50):
-        if mod.read_proc_identity(child.pid) is not None:
-            break
-        time.sleep(0.05)
-    ident = mod.read_proc_identity(child.pid)
-    assert ident is not None, "could not read live child identity"
-    cmd, ppid, age = ident
-    sp = re.compile(r"sleep")
-    assert mod.still_killable(child.pid, cmd, sp, ppid, 0), "exact identity must be killable"
-    assert not mod.still_killable(child.pid, cmd, re.compile("nomatch"), ppid, 0), "pattern-mismatch must refuse"
-    assert not mod.still_killable(child.pid, "different", sp, ppid, 0), "command-change must refuse"
-    assert not mod.still_killable(child.pid, cmd, sp, ppid + 99999, 0), "ppid-change must refuse"
-    assert not mod.still_killable(child.pid, cmd, sp, ppid, age + 100000), "younger-than-snapshot must refuse"
-    child.terminate(); child.wait()
-    ok, status = mod.kill_pid(child.pid, 0.2, cmd, sp, ppid, 0)
-    assert ok and status == "skipped-pid-reuse", f"vanished pid must skip, got ({ok},{status})"
-    print("[ok] PID-reuse revalidation enforced")
-finally:
-    if child.poll() is None:
-        child.kill(); child.wait()
-PY
+python3 "$HELPER_PY" pid-reuse "$REAPER_PY" || \
+  smoke_fail "PID-reuse revalidation failed"
 
 # ---------------------------------------------------------------------------
 # Runtime control: a Pencil.app-style mcp-server name survives a real
@@ -137,19 +59,14 @@ PY
 # dry-run kills nothing.
 # ---------------------------------------------------------------------------
 smoke_log "D: runtime default-pattern kill — Pencil.app survives, bridge orphan reaped, dry-run kills none"
+# NOTE the positive-control argv embeds `.claude/plugins/` so it matches the
+# r2 bridge-scoped crm pattern (`\.claude/plugins/.*crm-mcp-proxy\.mjs`); a
+# bare `/tmp/.../crm-mcp-proxy.mjs` would (correctly) NO LONGER match.
 TMP_D="$(mktemp -d "${TMPDIR:-/tmp}/agb-8807p0b-XXXXXX")"
 neg_argv="/Applications/Pencil.app/Contents/Resources/mcp-server-darwin-arm64-smoke-$$"
-pos_argv="node /tmp/agent-bridge-8807-smoke-$$/crm-mcp-proxy.mjs"
+pos_argv="node /tmp/agb-8807-smoke-$$/.claude/plugins/cache/cosmax-marketplace/cosmax-crm/0.0.0/scripts/crm-mcp-proxy.mjs"
 spawn_argv() {
-  python3 - "$1" "$2" <<'PY'
-import subprocess, sys
-from pathlib import Path
-argv0, pid_file = sys.argv[1], sys.argv[2]
-proc = subprocess.Popen([argv0, "600"], executable="/bin/sleep",
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        start_new_session=True)
-Path(pid_file).write_text(str(proc.pid), encoding="utf-8")
-PY
+  python3 "$HELPER_PY" spawn "$1" "$2"
 }
 spawn_argv "$neg_argv" "$TMP_D/neg.pid"
 spawn_argv "$pos_argv" "$TMP_D/pos.pid"
