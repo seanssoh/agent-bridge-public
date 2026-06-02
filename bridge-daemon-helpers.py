@@ -465,6 +465,47 @@ def cmd_nudge_live_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_task_status(args: argparse.Namespace) -> int:
+    """Read one task status from the queue DB.
+
+    Original site: lib/bridge-tmux.sh::bridge_tmux_pending_attention_flush
+    (#1952). The pending-attention flusher uses this to decide whether a
+    spooled ``[task-complete]`` notification task is already closed and can be
+    dropped instead of replayed later as a stale deferred interrupt.
+
+    Output: the task status string.
+
+    Fail-safe contract: missing DB, invalid id, missing row, sqlite errors,
+    and any other read failure exit non-zero so the shell caller preserves the
+    original spooled payload. The DB is opened read-only so a bad path cannot
+    create a fresh empty queue DB while trying to classify a replay.
+    """
+    try:
+        task_id = int(args.task_id)
+    except (TypeError, ValueError):
+        return 1
+    if task_id <= 0:
+        return 1
+
+    db_path = Path(args.db_path)
+    if not db_path.is_file():
+        return 1
+
+    uri = f"file:{db_path}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    if row is None:
+        return 1
+    status = str(row[0] or "").strip()
+    if not status:
+        return 1
+    print(status)
+    return 0
+
+
 def cmd_nudge_eligibility_recheck(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh::nudge_agent_session (issue #1106).
 
@@ -1289,6 +1330,14 @@ SUBCOMMANDS = {
         "Single tab-separated row: queued_count, claimed_count, csv queued "
         "ids. With with_top_task=1, three more cols are appended: top_id, "
         "top_priority, top_title.",
+    ),
+    "task-status": (
+        cmd_task_status,
+        [
+            ("db_path", "path to the queue sqlite DB"),
+            ("task_id", "task id to query"),
+        ],
+        "Single line: task status. Non-zero when the status cannot be confirmed.",
     ),
     "nudge-eligibility-recheck": (
         cmd_nudge_eligibility_recheck,

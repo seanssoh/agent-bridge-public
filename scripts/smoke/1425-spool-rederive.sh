@@ -25,9 +25,14 @@
 #        (preserve), NOT rc=2. A transient failure must never look like
 #        count==0.
 #   R5 — non-nudge payload → is_queue_nudge returns false (verbatim replay).
+#   R6 — task-complete detection is anchored to the producer header and
+#        extracts only the notification task id.
+#   R7 — stale task-complete status check drops only confirmed done rows and
+#        preserves on queued/missing/read-failure cases.
 #   S1 — in-source wiring: the flusher calls the rederive, drops on rc=2,
-#        preserves on rc=1. Static grep (the flusher is coupled to the
-#        daemon main loop, same pattern as 1106-nudge-shell-recheck S1).
+#        preserves on rc=1, and gates task-complete stale drops on a bounded
+#        task-status read. Static grep (the flusher is coupled to the daemon
+#        main loop, same pattern as 1106-nudge-shell-recheck S1).
 #
 # Footgun #11: no python3 heredoc-stdin / `<<<` here-string at the point of
 # a python3 subprocess. DB seeding uses bridge-queue.py --format shell +
@@ -240,6 +245,50 @@ if bridge_tmux_pending_attention_is_queue_nudge "[Agent Bridge] event=inbox-boot
 fi
 printf '[smoke]   [ok] R5: header-anchored detection — recognizes real nudges, rejects body-quoted false positives + inbox-bootstrap\n'
 
+# ---- R6: task-complete detection is anchored to the producer header --------
+complete_id="$(create_task "[task-complete] worker finished" high)"
+[[ -n "$complete_id" ]] || fail "R6: completion task id empty"
+complete_high_payload="[Agent Bridge] high task #${complete_id}: [task-complete] worker finished"$'\n'"agb inbox ${agent}"
+parsed_complete_id="$(bridge_tmux_pending_attention_task_complete_id "$complete_high_payload")" \
+  || fail "R6: high-priority task-complete payload was not recognized"
+[[ "$parsed_complete_id" == "$complete_id" ]] \
+  || fail "R6: parsed high-priority completion id ${parsed_complete_id}, expected ${complete_id}"
+complete_normal_payload="[Agent Bridge] task #${complete_id}: [task-complete] worker finished"$'\n'"agb inbox ${agent}"
+parsed_normal_id="$(bridge_tmux_pending_attention_task_complete_id "$complete_normal_payload")" \
+  || fail "R6: normal-priority task-complete payload was not recognized"
+[[ "$parsed_normal_id" == "$complete_id" ]] \
+  || fail "R6: parsed normal-priority completion id ${parsed_normal_id}, expected ${complete_id}"
+if bridge_tmux_pending_attention_task_complete_id $'[Agent Bridge]: heads up from ops\n[Agent Bridge] high task #777: [task-complete] quoted in the body' >/dev/null; then
+  fail "R6: body-quoted task-complete payload was misclassified"
+fi
+if bridge_tmux_pending_attention_task_complete_id "[Agent Bridge] high task #${complete_id}: ordinary title" >/dev/null; then
+  fail "R6: non-completion task header was misclassified"
+fi
+printf '[smoke]   [ok] R6: task-complete detector extracts header task id and rejects body/title false positives\n'
+
+# ---- R7: stale task-complete status check is done-only and fail-safe -------
+if bridge_tmux_pending_attention_task_complete_is_done "$complete_id"; then
+  fail "R7: queued task-complete notification was treated as stale/done"
+fi
+python3 "$repo/bridge-queue.py" claim "$complete_id" --agent "$agent" >/dev/null
+if bridge_tmux_pending_attention_task_complete_is_done "$complete_id"; then
+  fail "R7: claimed task-complete notification was treated as stale/done"
+fi
+python3 "$repo/bridge-queue.py" done "$complete_id" --agent "$agent" --note "seen" >/dev/null
+if ! bridge_tmux_pending_attention_task_complete_is_done "$complete_id"; then
+  fail "R7: done task-complete notification was not classified as stale/done"
+fi
+if bridge_tmux_pending_attention_task_complete_is_done "99999999"; then
+  fail "R7: missing task id was treated as stale/done"
+fi
+if BRIDGE_TASK_DB="$corrupt_db" bridge_tmux_pending_attention_task_complete_is_done "$complete_id"; then
+  fail "R7: corrupt DB/read failure was treated as stale/done"
+fi
+task_status="$(python3 "$repo/bridge-daemon-helpers.py" task-status "$BRIDGE_TASK_DB" "$complete_id")" \
+  || fail "R7: task-status helper failed for completed task"
+[[ "$task_status" == "done" ]] || fail "R7: task-status helper returned ${task_status}, expected done"
+printf '[smoke]   [ok] R7: task-complete stale check drops only confirmed done rows and preserves on open/missing/read failure\n'
+
 printf '[smoke]   [ok] rederive helper block passed\n'
 REDERIVE_UT_BODY
 
@@ -254,6 +303,7 @@ fi
 # S1 — in-source wiring (static grep)
 # ============================================================
 tmux_sh="$REPO_ROOT/lib/bridge-tmux.sh"
+flush_body="$(awk '/^bridge_tmux_pending_attention_flush\(\)/{f=1} f{print} /^}/{if(f)exit}' "$tmux_sh")"
 
 if ! grep -q "bridge_tmux_pending_attention_rederive_queue_nudge" "$tmux_sh"; then
   echo "[smoke][error] S1: flusher does not define/call the rederive helper" >&2
@@ -265,18 +315,46 @@ fi
 # The flusher must drop on rc=2 (continue) and fall through to preserve on
 # rc=1 — assert the flush loop references the rederive helper and the
 # drop/preserve branches.
-if ! grep -q "bridge_tmux_pending_attention_is_queue_nudge" "$tmux_sh"; then
+if ! printf '%s' "$flush_body" | grep -q "bridge_tmux_pending_attention_is_queue_nudge"; then
   echo "[smoke][error] S1: flusher does not gate the rederive on the nudge detector" >&2
   failed=1
 else
   echo "[smoke]   [ok] S1: flusher gates rederive on is_queue_nudge"
 fi
 
-if ! grep -Eq 'rederive_rc == 2' "$tmux_sh"; then
+if ! printf '%s' "$flush_body" | grep -Eq 'rederive_rc == 2'; then
   echo "[smoke][error] S1: flusher does not drop on confirmed-empty (rc=2)" >&2
   failed=1
 else
   echo "[smoke]   [ok] S1: flusher drops the entry on rc=2 (confirmed count==0)"
+fi
+
+if ! grep -q "bridge_tmux_pending_attention_task_complete_id" "$tmux_sh"; then
+  echo "[smoke][error] S1: lib/bridge-tmux.sh does not define the task-complete detector" >&2
+  failed=1
+else
+  echo "[smoke]   [ok] S1: task-complete detector is defined in lib/bridge-tmux.sh"
+fi
+
+if ! printf '%s' "$flush_body" | grep -q "bridge_tmux_pending_attention_task_complete_id"; then
+  echo "[smoke][error] S1: flusher does not gate on the task-complete detector" >&2
+  failed=1
+else
+  echo "[smoke]   [ok] S1: flusher gates non-nudge completion payloads on task-complete detector"
+fi
+
+if ! printf '%s' "$flush_body" | grep -q "bridge_tmux_pending_attention_task_complete_is_done"; then
+  echo "[smoke][error] S1: flusher does not call the task-complete stale checker" >&2
+  failed=1
+else
+  echo "[smoke]   [ok] S1: flusher gates task-complete drops on the stale checker"
+fi
+
+if ! grep -q "task-status" "$REPO_ROOT/bridge-daemon-helpers.py"; then
+  echo "[smoke][error] S1: bridge-daemon-helpers.py is missing the bounded task-status helper" >&2
+  failed=1
+else
+  echo "[smoke]   [ok] S1: task-status helper is registered for bounded status reads"
 fi
 
 if (( failed )); then
