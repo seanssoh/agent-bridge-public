@@ -111,6 +111,11 @@ add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-
 add_required 1425-cron-dispatch-nudge-scope
 add_required 1936-forward-followup-attached-escalation
 add_required 1473-agent-list-iso-state-fallback
+# Incident #8807 P1: in the full static suite so a change to the coalesce smoke
+# helper (scripts/smoke/8807-cron-backfill-coalesce-helper.py) — which hits the
+# scripts/smoke/* catch-all → add_all_required_static — still re-runs the
+# coalesce smoke.
+add_required 8807-cron-backfill-coalesce
 
 
 }
