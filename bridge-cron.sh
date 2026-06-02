@@ -1570,6 +1570,16 @@ run_sync() {
     fi
     native_json="$tmp_dir/native.json"
 
+    # State-file roles (documented per incident #8807 P1):
+    #   - `scheduler-state.json` (native_state_file, from
+    #     bridge_cron_scheduler_state_file) is the CANONICAL state the native
+    #     scheduler reads + writes via `--state-file`. It holds the catch-up
+    #     cursor (`last_sync_key`) the scheduler advances each sync.
+    #   - `native-scheduler-state.json` (compat_native_state_file) is a
+    #     READ-ONLY COMPAT COPY for older tooling that looked for that name. It
+    #     is mirrored from the canonical file AFTER a successful sync; the
+    #     scheduler never reads it. These are NOT two active schedulers — only
+    #     scheduler-state.json drives enqueue/cursor decisions.
     if [[ $dry_run -eq 0 && -f "$native_state_file" && "$compat_native_state_file" != "$native_state_file" ]]; then
       cp "$native_state_file" "$compat_native_state_file"
     fi
