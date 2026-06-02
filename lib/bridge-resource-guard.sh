@@ -82,45 +82,17 @@ bridge_resource_guard_proc_pressured() {
   return 1
 }
 
-# Memory pressure — reuse the #263 helper if it has been sourced, else inline a
-# byte-for-byte equivalent so this module is usable standalone.
+# Memory pressure — delegate to the #263 `bridge_check_memory_pressure`
+# (lib/bridge-cron.sh), which bridge-lib.sh always sources BEFORE this module.
+# We intentionally do NOT inline a duplicate sysctl/awk parser: that re-introduced
+# the here-string footgun #11 surface (PR #1479 r1 ratchet) and duplicated the
+# single source of truth. If the helper is somehow unavailable (a standalone
+# source without bridge-cron.sh), skip the memory check and return not-pressured
+# — that is fail-open by design; the per-uid proc-count gate still guards.
 bridge_resource_guard_mem_pressured() {
-  if declare -F bridge_check_memory_pressure >/dev/null 2>&1; then
-    # bridge_check_memory_pressure returns 1 when pressured, 0 when healthy.
-    bridge_check_memory_pressure && return 1 || return 0
-  fi
-  local kind; kind="$(uname -s 2>/dev/null || true)"
-  case "$kind" in
-    Darwin)
-      local usage_line used_raw total_raw used_int total_int pct
-      local limit="${BRIDGE_CRON_SWAP_PCT_LIMIT:-80}"
-      [[ "$limit" =~ ^[0-9]+$ ]] || limit=80
-      usage_line="$(sysctl -n vm.swapusage 2>/dev/null || true)"
-      [[ -n "$usage_line" ]] || return 1
-      used_raw="$(awk '{ for (i=1;i<=NF;i++) if ($i=="used") print $(i+2) }' <<<"$usage_line")"
-      total_raw="$(awk '{ for (i=1;i<=NF;i++) if ($i=="total") print $(i+2) }' <<<"$usage_line")"
-      used_int="${used_raw%%.*}"; total_int="${total_raw%%.*}"
-      [[ "$used_int" =~ ^[0-9]+$ && "$total_int" =~ ^[0-9]+$ ]] || return 1
-      (( total_int > 0 )) || return 1
-      pct=$(( used_int * 100 / total_int ))
-      (( pct >= limit )) && return 0
-      return 1
-      ;;
-    Linux)
-      local avail_kb threshold_mb threshold_kb
-      threshold_mb="${BRIDGE_CRON_MIN_AVAIL_MB:-512}"
-      [[ "$threshold_mb" =~ ^[0-9]+$ ]] || threshold_mb=512
-      threshold_kb=$(( threshold_mb * 1024 ))
-      [[ -r /proc/meminfo ]] || return 1
-      avail_kb="$(awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo 2>/dev/null || true)"
-      [[ "$avail_kb" =~ ^[0-9]+$ ]] || return 1
-      (( avail_kb < threshold_kb )) && return 0
-      return 1
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+  declare -F bridge_check_memory_pressure >/dev/null 2>&1 || return 1
+  # bridge_check_memory_pressure returns 1 when pressured, 0 when healthy.
+  bridge_check_memory_pressure && return 1 || return 0
 }
 
 # bridge_resource_guard_should_defer [context-label]
