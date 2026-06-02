@@ -1059,6 +1059,13 @@ select_for_path() {
       # bridge-cron.sh move so a future PR cannot regress the help/error
       # clarity contract back to the bare dead-end message.
       add_required 1426-cron-shell-noniso-help
+      # Incident #8807 P1: root bridge-cron.sh's native-sync path documents
+      # scheduler-state.json as canonical and native-scheduler-state.json as a
+      # read-only compat copy (single active scheduler). The
+      # 8807-cron-backfill-coalesce smoke pins that documentation alongside the
+      # scheduler-side catch-up coalesce; pull it on every bridge-cron.sh move
+      # so the compat-copy clarification cannot be silently dropped.
+      add_required 8807-cron-backfill-coalesce
       # Issue #1353 (v0.15.0-beta5-2 Track A): bridge-daemon.sh's
       # `bridge_daemon_check_channel_status_or_hold` + `bridge_report_
       # channel_health_miss` now consult `bridge_agent_setup_pending_
@@ -1197,7 +1204,14 @@ select_for_path() {
       # Issue #1383 (result-read leg): the apply path's _write_result is the
       # daemon-written `<uuid>.result.json` site; pin its smoke too so an
       # argv/result-shape change is co-verified against the result group fix.
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group
+      # Incident #8807 P1: bridge-cron-scheduler.py's enumerate_due_runs now
+      # coalesces the catch-up backlog for idempotent / picker-sweep families
+      # (cap at BRIDGE_CRON_COALESCE_CATCHUP_MAX, default 1) BEFORE enqueue so
+      # a restart after downtime fires the job once instead of replaying a
+      # 12-occurrence queue burst. Pull 8807-cron-backfill-coalesce on every
+      # scheduler move so the coalesce-family scope, the keep-latest behaviour,
+      # and the env overrides cannot regress.
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce
       add_integration integration-minimal
       ;;
 

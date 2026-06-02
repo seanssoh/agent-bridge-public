@@ -31,6 +31,55 @@ FAMILY_RULES = (
     "event-reminder",
     "weekly-review",
 )
+
+# Incident #8807 P1 — catch-up coalescing for idempotent / picker-sweep job
+# families. After daemon downtime, enumerate_due_runs() would replay up to
+# BRIDGE_CRON_MAX_CATCHUP_OCCURRENCES_PER_JOB (default 12) missed occurrences
+# per job, all enqueued at once — the "inbox flooding" burst. For jobs whose
+# latest occurrence SUBSUMES the missed ones (running the sweep / refresh once
+# now is equivalent to running it for every skipped slot), replaying the
+# backlog is pure noise. These families/names get their catch-up capped at 1
+# (keep only the most recent occurrence) BEFORE enqueue, so a restart after
+# downtime fires the job once, not N times.
+#
+# Membership is by classify_family() result OR exact job name. `picker-sweep`
+# is the canonical case (a `*/10 * * * *` auto-unstick sweep; see OPERATIONS.md
+# §picker-sweep). Distinct-occurrence families (event-reminder, the briefing /
+# digest / highlights families where each missed slot is a separate
+# user-facing message) are intentionally NOT coalesced — a missed 8am briefing
+# is not the same as a missed 9am one. Operators can extend/override the set
+# via BRIDGE_CRON_COALESCE_CATCHUP_FAMILIES (comma-separated). The cap value
+# itself is BRIDGE_CRON_COALESCE_CATCHUP_MAX (default 1).
+COALESCE_CATCHUP_FAMILIES = ("picker-sweep",)
+
+
+def _coalesce_catchup_families() -> frozenset[str]:
+    raw = os.environ.get("BRIDGE_CRON_COALESCE_CATCHUP_FAMILIES")
+    if raw is None:
+        return frozenset(COALESCE_CATCHUP_FAMILIES)
+    names = {part.strip() for part in raw.split(",") if part.strip()}
+    return frozenset(names)
+
+
+def _coalesce_catchup_cap() -> int:
+    raw = os.environ.get("BRIDGE_CRON_COALESCE_CATCHUP_MAX", "1")
+    try:
+        cap = int(raw)
+    except (TypeError, ValueError):
+        cap = 1
+    return cap if cap >= 1 else 1
+
+
+def job_coalesces_catchup(job: dict[str, Any], family: str) -> bool:
+    """True when this job's missed-occurrence backlog should collapse to the
+    most recent occurrence (idempotent / picker-sweep families)."""
+    members = _coalesce_catchup_families()
+    if family in members:
+        return True
+    name = str(job.get("name", "") or "")
+    return name in members
+
+
 STATUS_CREATED = "created"
 STATUS_ALREADY = "already_enqueued"
 STATUS_SKIPPED = "skipped"
@@ -345,12 +394,26 @@ def enumerate_due_runs(
             continue
 
         counters["eligible"] += 1
+        family = classify_family(job.get("name", ""))
+
+        # Incident #8807 P1: coalesce the catch-up backlog for idempotent /
+        # picker-sweep families to the most recent occurrence(s) BEFORE the
+        # generic per-job truncation. This collapses a post-downtime burst
+        # (e.g. 12 missed `picker-sweep` slots) into a single fire instead of
+        # flooding the queue. Applied first so it also bounds the work the
+        # generic cap below would otherwise have to truncate.
+        if occurrences and job_coalesces_catchup(job, family):
+            coalesce_cap = _coalesce_catchup_cap()
+            if len(occurrences) > coalesce_cap:
+                counters["coalesced_jobs"] += 1
+                counters["coalesced_occurrences"] += len(occurrences) - coalesce_cap
+                occurrences = occurrences[-coalesce_cap:]
+
         if per_job_limit > 0 and len(occurrences) > per_job_limit:
             counters["truncated_jobs"] += 1
             counters["truncated_occurrences"] += len(occurrences) - per_job_limit
             occurrences = occurrences[-per_job_limit:]
 
-        family = classify_family(job.get("name", ""))
         for occurrence in occurrences:
             due_runs.append(
                 DueRun(
