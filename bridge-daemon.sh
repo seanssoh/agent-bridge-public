@@ -5960,8 +5960,10 @@ process_unclaimed_queue_escalation() {
     [[ -n "$agent" ]] || continue
     bridge_agent_exists "$agent" || continue
     # The find-open --all --format json shape provides created_ts +
-    # status. Filter to status='queued' AND age >= threshold in shell.
-    rows="$(bridge_queue_cli find-open --agent "$agent" --all --format json 2>/dev/null || true)"
+    # status. Cron-dispatch rows are worker-queue backlog, not human
+    # inbox nudges, so keep them out of the generic unclaimed-task alarm.
+    # Filter to status='queued' AND age >= threshold in shell.
+    rows="$(bridge_queue_cli find-open --agent "$agent" --status-filter queued --exclude-title-prefix '[cron-dispatch]' --all --format json 2>/dev/null || true)"
     [[ -n "$rows" && "$rows" != "[]" ]] || continue
 
     # Use python to filter the JSON list into TSV rows; bash-side JSON
@@ -6366,7 +6368,12 @@ nudge_agent_session() {
   fi
 
   title="$(bridge_queue_attention_title "$live_queued")"
-  open_task_shell="$(bridge_queue_cli find-open --agent "$agent" --format shell 2>/dev/null || true)"
+  # The live-state helpers already exclude cron-dispatch rows. Use the same
+  # task set for message details and post-submit verification; otherwise a
+  # queued cron-dispatch row can be blamed for a human-task nudge.
+  task_id="${live_nudge_key%%,*}"
+  [[ "$task_id" =~ ^[0-9]+$ ]] || task_id=""
+  open_task_shell="$(bridge_queue_cli find-open --agent "$agent" --status-filter queued --exclude-title-prefix '[cron-dispatch]' --format shell 2>/dev/null || true)"
   if [[ -n "$open_task_shell" ]]; then
     # Footgun #11 (refs #815 Wave B): tempfile-route the `source` of the
     # find-open shell output to avoid sourcing /dev/stdin heredoc_write.
