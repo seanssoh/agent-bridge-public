@@ -536,6 +536,173 @@ def cmd_nudge_eligibility_recheck(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tsv_clean(value: object) -> str:
+    return str(value or "").replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def _read_task_body(row: sqlite3.Row) -> str:
+    body_text = row["body_text"]
+    if body_text:
+        return str(body_text)
+
+    body_path = str(row["body_path"] or "").strip()
+    if not body_path:
+        return ""
+    try:
+        return Path(body_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _parse_cron_followup_frontmatter(body: str) -> dict[str, object] | None:
+    lines = body.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    end_index = -1
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            end_index = index
+            break
+    if end_index <= 1:
+        return None
+    try:
+        payload = json.loads("\n".join(lines[1:end_index]))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != 1:
+        return None
+    if payload.get("kind") != "cron-followup":
+        return None
+    return payload
+
+
+def _legacy_needs_human_followup(body: str) -> bool:
+    normalized = "".join(str(body or "").lower().split())
+    return (
+        "needs_human_followup=true" in normalized
+        or '"needs_human_followup":true' in normalized
+        or "'needs_human_followup':true" in normalized
+        or "delivery_intent=forward_to_user" in normalized
+        or '"delivery_intent":"forward_to_user"' in normalized
+    )
+
+
+def _parse_id_csv(id_csv: str) -> list[int]:
+    ids: list[int] = []
+    seen: set[int] = set()
+    for item in str(id_csv or "").split(","):
+        item = item.strip()
+        if not item.isdigit():
+            continue
+        task_id = int(item)
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        ids.append(task_id)
+    return ids
+
+
+def cmd_human_followup_queued_state(args: argparse.Namespace) -> int:
+    """Classify queued tasks that need human-facing followup.
+
+    Issue #1936 / gap #4: attached live-idle sessions deliberately skip tmux
+    nudge injection (#1411), but `[cron-followup]` tasks with
+    `delivery_intent=forward_to_user` are human-facing and should trigger a
+    faster operator-visible escalation than the generic unclaimed-task sweep.
+
+    Output (single TSV row, always):
+      count \\t first_id \\t csv_ids \\t first_title \\t first_created_ts
+            \\t intent \\t channel \\t target_ref \\t format
+    """
+    db_path = args.db_path
+    agent = args.agent
+    input_csv = str(getattr(args, "queued_ids_csv", "") or "")
+    queued_ids = _parse_id_csv(input_csv)
+    if input_csv.strip() and not queued_ids:
+        print("0\t\t\t\t\t\t\t\t")
+        return 0
+
+    where = [
+        "assigned_to = ?",
+        "status = 'queued'",
+        "title NOT LIKE '[cron-dispatch]%'",
+    ]
+    params: list[object] = [agent]
+    if queued_ids:
+        placeholders = ",".join("?" for _ in queued_ids)
+        where.append(f"id IN ({placeholders})")
+        params.extend(queued_ids)
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT id, title, created_ts, body_text, body_path
+            FROM tasks
+            WHERE {' AND '.join(where)}
+            ORDER BY id
+            """,
+            params,
+        ).fetchall()
+
+    matches: list[dict[str, object]] = []
+    for row in rows:
+        title = str(row["title"] or "")
+        if not title.startswith("[cron-followup]"):
+            continue
+        body = _read_task_body(row)
+        payload = _parse_cron_followup_frontmatter(body)
+        intent = ""
+        forward_target: dict[str, object] = {}
+        if payload is not None:
+            intent = str(payload.get("delivery_intent") or "")
+            if intent != "forward_to_user":
+                continue
+            raw_target = payload.get("forward_target")
+            if isinstance(raw_target, dict):
+                forward_target = raw_target
+        elif _legacy_needs_human_followup(body):
+            intent = "legacy_needs_human_followup"
+        else:
+            continue
+
+        matches.append(
+            {
+                "id": int(row["id"]),
+                "title": title,
+                "created_ts": int(row["created_ts"] or 0),
+                "intent": intent,
+                "channel": forward_target.get("channel", ""),
+                "target_ref": forward_target.get("target_ref", ""),
+                "format": forward_target.get("format", ""),
+            }
+        )
+
+    if not matches:
+        print("0\t\t\t\t\t\t\t\t")
+        return 0
+
+    first = matches[0]
+    print(
+        "\t".join(
+            [
+                str(len(matches)),
+                str(first["id"]),
+                ",".join(str(match["id"]) for match in matches),
+                _tsv_clean(first["title"]),
+                str(first["created_ts"]),
+                _tsv_clean(first["intent"]),
+                _tsv_clean(first["channel"]),
+                _tsv_clean(first["target_ref"]),
+                _tsv_clean(first["format"]),
+            ]
+        )
+    )
+    return 0
+
+
 def cmd_memory_daily_orphan_scan(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:4840 (process_memory_daily_orphan_sweep).
 
@@ -1085,6 +1252,19 @@ SUBCOMMANDS = {
             ),
         ],
         "Single tab-separated row: eligible_count, csv eligible queued ids.",
+    ),
+    "human-followup-queued-state": (
+        cmd_human_followup_queued_state,
+        [
+            ("db_path", "path to the queue sqlite DB"),
+            ("agent", "agent id to query"),
+            (
+                "queued_ids_csv",
+                "optional comma-separated queued task ids to restrict classification",
+                "",
+            ),
+        ],
+        "Single tab-separated row describing queued human-facing cron followups.",
     ),
     "memory-daily-orphan-scan": (
         cmd_memory_daily_orphan_scan,
