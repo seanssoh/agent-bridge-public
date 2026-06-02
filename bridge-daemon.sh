@@ -5478,6 +5478,158 @@ EOF
   return 0
 }
 
+# Issue #1936 / gap #4: attached live-idle sessions deliberately skip the
+# queued-task tmux inject (#1411), but human-facing cron followups
+# (`delivery_intent=forward_to_user`, or legacy `needs_human_followup=true`)
+# should not wait for the generic 30m unclaimed-task sweep. Track a separate
+# cooldown per original followup task id and file a refreshable admin alert.
+bridge_daemon_attached_human_followup_marker_file() {
+  local task_id="${1:-none}"
+  local dir="$BRIDGE_STATE_DIR/daemon-attached-human-followup"
+  mkdir -p "$dir" 2>/dev/null || true
+  # shellcheck disable=SC2001  # bash parameter expansion lacks regex class
+  task_id="$(printf '%s' "$task_id" | sed 's/[^A-Za-z0-9_]/_/g')"
+  printf '%s/%s.marker' "$dir" "$task_id"
+}
+
+bridge_daemon_attached_human_followup_escalate() {
+  local agent="$1"
+  local session="$2"
+  local attached="$3"
+  local task_id="$4"
+  local task_ids_csv="$5"
+  local task_title="$6"
+  local created_ts="$7"
+  local intent="$8"
+  local forward_channel="$9"
+  local forward_target_ref="${10}"
+  local forward_format="${11}"
+  local live_queued="${12}"
+  local live_claimed="${13}"
+
+  [[ "$task_id" =~ ^[0-9]+$ ]] || return 0
+
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  [[ -n "$admin" ]] || return 0
+  bridge_agent_exists "$admin" || return 0
+
+  local cooldown="${BRIDGE_FORWARD_FOLLOWUP_ATTACHED_ESCALATE_COOLDOWN_SECS:-300}"
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=300
+  (( cooldown > 0 )) || cooldown=300
+
+  local now_ts marker marker_ts
+  now_ts="$(date +%s)"
+  marker="$(bridge_daemon_attached_human_followup_marker_file "$task_id")"
+  marker_ts="$(head -n1 "$marker" 2>/dev/null || printf '0')"
+  [[ "$marker_ts" =~ ^[0-9]+$ ]] || marker_ts=0
+  if (( marker_ts > 0 )) && (( now_ts - marker_ts < cooldown )); then
+    return 0
+  fi
+
+  local age_seconds=0 age_minutes=0 hostname_short=""
+  [[ "$created_ts" =~ ^[0-9]+$ ]] || created_ts=0
+  if (( created_ts > 0 && now_ts >= created_ts )); then
+    age_seconds=$(( now_ts - created_ts ))
+    age_minutes=$(( age_seconds / 60 ))
+  fi
+  hostname_short="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+
+  local alert_title
+  alert_title="[forward-followup-stranded] #${task_id} on ${agent} (${age_minutes}m)"
+
+  # Feedback-loop guard: if the affected agent is also the admin, an admin
+  # queue task would land in the same inbox that is already stranded. Emit the
+  # audit + best-effort external notify only.
+  if [[ "$agent" == "$admin" ]]; then
+    bridge_audit_log daemon queue_attention_attached_human_followup "$agent" \
+      --detail task_id="$task_id" \
+      --detail followup_ids="${task_ids_csv:-$task_id}" \
+      --detail attached="$attached" \
+      --detail session="$session" \
+      --detail intent="${intent:-unknown}" \
+      --detail forward_channel="${forward_channel:-}" \
+      --detail forward_target_ref="${forward_target_ref:-}" \
+      --detail action=audit_only_admin_target \
+      2>/dev/null || true
+    bridge_notify_send "$admin" "$alert_title" \
+      "Human-facing cron followup #${task_id} is queued on attached admin session ${agent}; drain ${agent}'s inbox." \
+      "$task_id" high "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" >/dev/null 2>&1 || true
+    printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+    return 0
+  fi
+
+  local body_file
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-forward-followup-stranded.md.XXXXXX")" || return 0
+  {
+    printf '# Human-facing cron followup stranded on %s\n\n' "$agent"
+    printf 'The daemon detected a queued `[cron-followup]` that needs user-facing delivery, but `%s` is attached and the queued-task nudge path correctly skips raw tmux injection for attached sessions (#1411).\n\n' "$agent"
+    printf -- '- source task: #%s\n' "$task_id"
+    printf -- '- target agent: %s\n' "$agent"
+    printf -- '- session: %s\n' "$session"
+    printf -- '- attached clients: %s\n' "$attached"
+    printf -- '- age: %ss (%sm)\n' "$age_seconds" "$age_minutes"
+    printf -- '- live queued: %s\n' "$live_queued"
+    printf -- '- live claimed: %s\n' "$live_claimed"
+    printf -- '- human followup ids: %s\n' "${task_ids_csv:-$task_id}"
+    printf -- '- title: %s\n' "${task_title:-<empty>}"
+    printf -- '- intent: %s\n' "${intent:-unknown}"
+    printf -- '- forward target channel: %s\n' "${forward_channel:-<unknown>}"
+    printf -- '- forward target ref: %s\n' "${forward_target_ref:-<unknown>}"
+    printf -- '- forward format: %s\n' "${forward_format:-<unknown>}"
+    printf -- '- host: %s\n\n' "$hostname_short"
+    printf 'Next steps:\n\n'
+    printf -- '- `agent-bridge inbox %s` — confirm the stranded followup is still queued.\n' "$agent"
+    printf -- '- `agent-bridge urgent %s "drain your inbox; human-facing cron followup #%s is waiting"` — wake the parent agent to claim and forward it.\n' "$agent" "$task_id"
+    printf -- '- Keep #1411 intact: do not bypass the attached-session nudge gate with raw daemon injection.\n\n'
+    printf 'This alert is refreshable via `bridge-queue.py upsert-open` and is rate-limited for %ss per source task id by `BRIDGE_FORWARD_FOLLOWUP_ATTACHED_ESCALATE_COOLDOWN_SECS`.\n' "$cooldown"
+  } >"$body_file"
+
+  local title_prefix="[forward-followup-stranded] #${task_id} on ${agent} "
+  local upsert_shell=""
+  local TASK_ID=""
+  local TASK_CREATED=""
+  upsert_shell="$(bridge_queue_cli upsert-open \
+    --to "$admin" --priority high --from daemon \
+    --title-prefix "$title_prefix" --title "$alert_title" \
+    --refresh-note "daemon refreshed attached human-followup escalation" \
+    --format shell --body-file "$body_file" 2>/dev/null || true)"
+  rm -f "$body_file" >/dev/null 2>&1 || true
+
+  if [[ -n "$upsert_shell" ]]; then
+    local upsert_tmp
+    upsert_tmp="$(mktemp)"
+    printf '%s\n' "$upsert_shell" >"$upsert_tmp"
+    # shellcheck disable=SC1090
+    source "$upsert_tmp" 2>/dev/null || true
+    rm -f -- "$upsert_tmp"
+  fi
+
+  if [[ "$TASK_ID" =~ ^[0-9]+$ ]]; then
+    bridge_audit_log daemon queue_attention_attached_human_followup "$agent" \
+      --detail task_id="$task_id" \
+      --detail followup_ids="${task_ids_csv:-$task_id}" \
+      --detail attached="$attached" \
+      --detail session="$session" \
+      --detail intent="${intent:-unknown}" \
+      --detail forward_channel="${forward_channel:-}" \
+      --detail forward_target_ref="${forward_target_ref:-}" \
+      --detail admin_agent="$admin" \
+      --detail admin_task_id="$TASK_ID" \
+      --detail admin_task_created="${TASK_CREATED:-0}" \
+      --detail cooldown_secs="$cooldown" \
+      --detail action=admin_task_upserted \
+      2>/dev/null || true
+    bridge_notify_send "$admin" "$alert_title" \
+      "Human-facing cron followup #${task_id} is queued on attached idle agent ${agent}. Admin task #${TASK_ID} has drain instructions." \
+      "$TASK_ID" high "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" >/dev/null 2>&1 || true
+    printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+  else
+    daemon_warn "failed to file [forward-followup-stranded] task for source task=${task_id} agent=${agent}"
+  fi
+
+  return 0
+}
+
 # Issue #1323 (beta5-2 Lane ι) — H5 recheck-timeout retry + escalation.
 #
 # Pre-fix: nudge_agent_session's eligibility-recheck timeout (15s) caused
@@ -6352,6 +6504,33 @@ nudge_agent_session() {
   if (( attached > 0 )); then
     local _att_skip_task_id="${live_nudge_key%%,*}"
     [[ -n "$_att_skip_task_id" ]] || _att_skip_task_id="none"
+    # Issue #1936 / gap #4: attached-session skip is correct for raw tmux
+    # injection (#1411), but human-facing cron followups should not wait for
+    # the generic unclaimed-task escalation. Classify the live queued set and
+    # file a refreshable admin alert when a forward_to_user / legacy
+    # needs_human_followup task is stranded behind the attached gate.
+    local _human_row="" _human_rc=0
+    set +e
+    _human_row="$(bridge_with_timeout 15 human_followup_queued_state python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" human-followup-queued-state "$BRIDGE_TASK_DB" "$agent" "${live_nudge_key:-$nudge_key}" 2>/dev/null)"
+    _human_rc=$?
+    set -e
+    if (( _human_rc == 0 )) && [[ -n "$_human_row" ]]; then
+      local _human_count=0 _human_task_id="" _human_ids="" _human_title="" _human_created_ts=0
+      local _human_intent="" _human_channel="" _human_target_ref="" _human_format=""
+      local _human_tmp
+      _human_tmp="$(mktemp)"
+      printf '%s\n' "$_human_row" >"$_human_tmp"
+      IFS=$'\t' read -r _human_count _human_task_id _human_ids _human_title _human_created_ts _human_intent _human_channel _human_target_ref _human_format <"$_human_tmp" || true
+      rm -f -- "$_human_tmp"
+      [[ "$_human_count" =~ ^[0-9]+$ ]] || _human_count=0
+      if (( _human_count > 0 )); then
+        bridge_daemon_attached_human_followup_escalate \
+          "$agent" "$session" "$attached" "$_human_task_id" "$_human_ids" \
+          "$_human_title" "$_human_created_ts" "$_human_intent" \
+          "$_human_channel" "$_human_target_ref" "$_human_format" \
+          "$live_queued" "$live_claimed" || true
+      fi
+    fi
     bridge_audit_log daemon queue_attention_attached_skip "$agent" \
       --detail fingerprint="$nudge_fingerprint" \
       --detail queued="$live_queued" \

@@ -140,6 +140,10 @@ Task body는 strict JSON-frontmatter 다음에 markdown body가 따라온다:
 - 정식 channel plugin (`plugin:telegram@claude-plugins-official` / `plugin:discord@...` 등) 으로 전달한다. cron child가 직접 접근하는 경로는 PR1에서 차단됐다.
 - task 닫기: `agb done <id> --note "decision: forwarded channel=<ch> ts=<iso>"`.
 
+#### Wake 후 inbox sweep
+
+cron-dispatch, urgent wake, daemon nudge 등으로 깨어나 한 task를 처리한 뒤 idle로 돌아가기 전에는 자기 inbox를 한 번 더 확인한다. 특히 `[cron-followup]` 잔여 task 중 `delivery_intent = forward_to_user` 또는 레거시 `needs_human_followup=true` 단서가 있는 항목은 사람-facing 알림이므로 먼저 claim → forward → done까지 처리한다. 이는 attached/live-idle 세션에서 데몬 nudge가 의도적으로 skip되는 경우(#1411)에도 followup이 오래 stranded되지 않게 하기 위한 parent-agent 책임이다.
+
 #### `delivery_intent = silent`
 
 - runner는 silent 결정 시 inbox task를 만들지 않으므로 이 case가 부모에 닿는 일은 정상적으로 없어야 한다. 닿았다면 노이즈로 보고 그냥 닫는다: `agb done <id> --note "decision: silent (no-op)"`.
