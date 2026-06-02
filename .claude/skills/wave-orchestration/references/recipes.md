@@ -27,14 +27,14 @@ grep -rn "<unique substring>" <repo>/lib/ <repo>/scripts/
 
 ```bash
 # Always run before dispatching codex-rescue.
-codex --version 2>/dev/null && command -v codex
+node "~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs" setup --json
 ```
 
-A non-empty version line + a path means codex is installed and reachable.
+Look for `"ready": true` in the output.
 
-If `command -v codex` returns nothing but `which codex` shows a binary, the agent is running with a stripped PATH. Re-dispatch the codex-rescue agent with explicit `PATH` guidance, or invoke codex directly via its absolute path.
+If you see `"available": false` for codex but `which codex` shows a binary, the agent is running with a stripped PATH. Re-dispatch the codex-rescue agent with explicit instructions to re-probe via the companion script before declaring codex unavailable.
 
-If codex prints "Not logged in" or similar on a real call, ask the operator to run `!codex login`.
+If `"loggedIn": false`, ask the operator to run `!codex login`.
 
 ## Recipe — codex-rescue dispatch (sync, with wait line)
 
@@ -45,8 +45,8 @@ Agent({
   prompt: `Code review PR #<N> of <owner>/<repo>.
 
 Codex CLI is installed and ready. If your first probe disagrees, re-check via:
-PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" codex --version
-which should print a version line on this machine.
+node "~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs" setup --json
+That should return "ready": true on this machine.
 
 **Read this brief in full first**: /tmp/<topic>-codex-review.md
 

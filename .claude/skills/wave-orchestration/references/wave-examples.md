@@ -2,6 +2,8 @@
 
 Four worked waves from a single session that landed 11 PRs with zero regressions. Each example shows the issue, the brief decision, the dispatch shape, the review path, and the merge note.
 
+> **⚠️ Historical record (2026-04-25) — review-path decisions are SUPERSEDED.** These waves predate the mandatory-pair-review contract. Where an example below shows a *"direct review (no codex-rescue)"* or *"self-review + direct merge"* path for docs-only / mid-size work, that LOC-based carve-out is **no longer valid** — see SKILL.md §"Phase 4" and footgun #10: **every** PR now requires the long-lived `agb-dev-codex` Phase-4 pair-review before merge, with no `<300 LOC` exception (a taken-over wedge-recovery PR is not an exception either — Phase 3.5). Keep these examples for their **brief-writing, dispatch-shape, and merge-note structure** — not their review-path choices.
+
 ## Wave example 1 — combined Track A's docs PR
 
 **Issue context**: #303 + #304 both proposed adding admin role spec sections to `agents/_template/CLAUDE.md`. Both Track A's were docs-only. Bundling them into one PR was cheaper than two separate PRs because they touched the same file in the same area.
@@ -94,7 +96,7 @@ gh pr create --base main --head fix/283-trackC-cli-suggestions --title "..." --b
 
 ## Wave example 4 — codex-rescue review of complex PR
 
-**Issue context**: PR #302 — 583 LOC change, Linux ACL semantics, isolated UID plugin sharing. Specialized domain (ACL ordering, sudo wrap, traverse chain). Authored by `seanssoh` (operator's fork account) on his other Claude session; opened against upstream `SYRS-AI:main`.
+**Issue context**: PR #302 — 583 LOC change, Linux ACL semantics, isolated UID plugin sharing. Specialized domain (ACL ordering, sudo wrap, traverse chain). Authored by `<fork-account>` (operator's fork account) on his other Claude session; opened against upstream `<upstream-account>:main`.
 
 **Decision**: >300 LOC + specialized → **codex-rescue review**, not direct.
 
@@ -102,8 +104,8 @@ gh pr create --base main --head fix/283-trackC-cli-suggestions --title "..." --b
 
 ```bash
 # Verify codex setup
-codex --version 2>/dev/null && command -v codex
-# Both should print: a version line and a binary path
+node "~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs" setup --json
+# Look for "ready": true
 
 # Fetch the diff to a known path
 gh pr diff 302 > /tmp/pr-302.diff
@@ -119,11 +121,11 @@ $EDITOR /tmp/agb-302-codex-review.md
 Agent({
   description: "Codex review of PR #302 ACL plugin sharing",
   subagent_type: "codex:codex-rescue",
-  prompt: `Code review PR #302 of seanssoh/agent-bridge-public — "isolate: channel-ownership-aware plugin sharing for isolated UIDs".
+  prompt: `Code review PR #302 of <upstream-account>/agent-bridge-public — "isolate: channel-ownership-aware plugin sharing for isolated UIDs".
 
 Codex CLI is installed and ready. If your first probe disagrees, re-check via:
-PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" codex --version
-which should print a version line on this machine.
+node "~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs" setup --json
+That returns "ready": true on this machine.
 
 Read this brief in full first: /tmp/agb-302-codex-review.md
 Diff is at /tmp/pr-302.diff (637 lines).
@@ -140,7 +142,7 @@ Wait for completion in your final assistant message. Do not return a thread id a
 
 **Footgun-8 instance**: first dispatch returned "Codex CLI is not installed" because the subagent shell had a stripped PATH. Operator confirmed codex was in fact installed; orchestrator re-dispatched with explicit guidance to re-probe via the companion script. Second dispatch succeeded.
 
-**Outcome**: review posted as PR comment. PR #302 stayed open awaiting r2 fixes from the author side. (Subsequent recipe: cross-fork push from `seanssoh` account — see `references/recipes.md` "Cross-fork PR push".)
+**Outcome**: review posted as PR comment. PR #302 stayed open awaiting r2 fixes from the author side. (Subsequent recipe: cross-fork push from `<fork-account>` account — see `references/recipes.md` "Cross-fork PR push".)
 
 ## Cross-cutting observations from these waves
 
