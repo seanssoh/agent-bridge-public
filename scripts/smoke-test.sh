@@ -4529,6 +4529,13 @@ cases_should_not_match = [
     "/Applications/Telegram.app/Contents/MacOS/Telegram",
     "/Applications/Microsoft Teams.app/Contents/MacOS/MSTeams",
     "node /Users/x/code/myapp/index.js",
+    # Incident #8807 P0b r2 (codex CRITICAL): the crm + shopify matchers are
+    # bridge-scoped — an unrelated same-uid node running a like-named script
+    # OUTSIDE the bridge plugin-cache / node_modules must NOT be reaped.
+    "node /tmp/unrelated/crm-mcp-proxy.mjs",
+    "node /Users/x/Projects/myproj/scripts/crm-mcp-proxy.mjs",
+    "node /tmp/foo/shopify-dev-mcp",
+    "node /Users/x/code/app/bin/shopify-dev-mcp",
     # codex orphans are deliberately NOT reaped by the MCP cleaner. A
     # `codex resume <hash>` is a LIVE agent pair; a `codex exec --ephemeral`
     # worker is deferred to a follow-up. Neither may match here.
@@ -4705,35 +4712,18 @@ log "MCP cleanup default-pattern controls: Pencil.app-style + bridge orphan (inc
 MCP_NEG_PID_FILE="$TMP_ROOT/mcp-neg.pid"
 MCP_POS_PID_FILE="$TMP_ROOT/mcp-pos.pid"
 # argv[0] strings: the negative control must NOT match any default pattern; the
-# positive control embeds the crm-mcp-proxy.mjs signature verbatim.
-# Both argv[0] strings are presented verbatim to ps (we exec /bin/sleep, so
+# positive control embeds the bridge-scoped crm-mcp-proxy.mjs signature. Both
+# argv[0] strings are presented verbatim to ps (the helper execs /bin/sleep, so
 # argv[0] is the only displayed token and "600" is the sleep duration). The
-# crm-mcp-proxy.mjs signature is embedded with spaces in argv[0] so the
-# `\bnode\b.*crm-mcp-proxy\.mjs` default pattern matches the stitched command.
+# spawn helper is file-as-argv (no heredoc-stdin — lint-heredoc-ban C3 ban).
+# r2: the positive argv embeds `.claude/plugins/` so it matches the
+# bridge-scoped crm pattern `\.claude/plugins/.*crm-mcp-proxy\.mjs`; a bare
+# `/tmp/.../crm-mcp-proxy.mjs` would (correctly) no longer match.
+MCP_SPAWN_HELPER="$REPO_ROOT/scripts/smoke/8807-mcp-reaper-patterns-helper.py"
 MCP_NEG_ARGV="/Applications/Pencil.app/Contents/Resources/mcp-server-darwin-arm64-smoke-$SESSION_NAME"
-MCP_POS_ARGV="node /tmp/agent-bridge-smoke-$SESSION_NAME/crm-mcp-proxy.mjs"
-python3 - "$MCP_NEG_ARGV" "$MCP_NEG_PID_FILE" <<'PY'
-import subprocess, sys
-from pathlib import Path
-argv0, pid_file = sys.argv[1], sys.argv[2]
-proc = subprocess.Popen([argv0, "600"], executable="/bin/sleep",
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        start_new_session=True)
-Path(pid_file).write_text(str(proc.pid), encoding="utf-8")
-PY
-python3 - "$MCP_POS_ARGV" "$MCP_POS_PID_FILE" <<'PY'
-import subprocess, sys
-from pathlib import Path
-# Keep the whole signature as a single argv[0] (spaces included) so /bin/sleep
-# receives exactly ["<signature>", "600"] — ps then shows
-# "node /tmp/.../crm-mcp-proxy.mjs 600" and the default pattern matches, while
-# sleep still gets a single numeric duration.
-argv0, pid_file = sys.argv[1], sys.argv[2]
-proc = subprocess.Popen([argv0, "600"], executable="/bin/sleep",
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        start_new_session=True)
-Path(pid_file).write_text(str(proc.pid), encoding="utf-8")
-PY
+MCP_POS_ARGV="node /tmp/agent-bridge-smoke-$SESSION_NAME/.claude/plugins/cache/cosmax-marketplace/cosmax-crm/0.0.0/scripts/crm-mcp-proxy.mjs"
+python3 "$MCP_SPAWN_HELPER" spawn "$MCP_NEG_ARGV" "$MCP_NEG_PID_FILE"
+python3 "$MCP_SPAWN_HELPER" spawn "$MCP_POS_ARGV" "$MCP_POS_PID_FILE"
 MCP_NEG_PID="$(cat "$MCP_NEG_PID_FILE")"
 MCP_POS_PID="$(cat "$MCP_POS_PID_FILE")"
 for _ in {1..20}; do

@@ -40,16 +40,24 @@ DEFAULT_PATTERNS = [
     r"\bnode\b.*context7.*mcp",
     r"\bnode\b.*playwright.*mcp",
     r"\bnode\b.*firebase.*mcp",
-    # Incident #8807 P0b: Shopify dev MCP. Both the npm-exec launcher form
-    # and the resolved node entrypoint are matched (live provenance:
-    # `npm exec @shopify/dev-mcp` and `node …/@shopify/dev-mcp/…`).
+    # Incident #8807 P0b (r2): Shopify dev MCP. Three forms, all anchored to
+    # bridge/npx provenance so an unrelated same-uid `node` never matches:
+    #   - `npm exec @shopify/dev-mcp` (launcher) and `node …/@shopify/dev-mcp/…`
+    #     (scoped-package path) are inherently scoped by the package name.
+    #   - the bare-basename `shopify-dev-mcp` form (live:
+    #     `node …/.npm/_npx/<hash>/node_modules/.bin/shopify-dev-mcp`) is
+    #     anchored on `node_modules/` so a developer's own
+    #     `/tmp/.../shopify-dev-mcp` script is NOT reaped (codex r2).
     r"npm(\s+exec)?\s+@shopify/dev-mcp",
     r"\bnode\b.*@shopify/dev-mcp",
-    r"\bnode\b.*shopify-dev-mcp",
-    # Incident #8807 P0b: cosmax-crm MCP stdio proxy (live provenance:
-    # `node …/crm-mcp-proxy.mjs`). Anchored on the exact entrypoint file so
-    # an unrelated same-uid `node` never matches.
-    r"\bnode\b.*crm-mcp-proxy\.mjs",
+    r"\bnode\b.*node_modules/.*shopify-dev-mcp",
+    # Incident #8807 P0b (r2): cosmax-crm MCP stdio proxy. Anchored on the
+    # bridge plugin-cache provenance (live:
+    # `node …/.claude/plugins/cache/cosmax-marketplace/cosmax-crm/<ver>/
+    # scripts/crm-mcp-proxy.mjs`) — the prior `\bnode\b.*crm-mcp-proxy\.mjs`
+    # was too broad and would have matched an unrelated same-uid
+    # `node /tmp/x/crm-mcp-proxy.mjs` (codex r1 CRITICAL).
+    r"\.claude/plugins/.*crm-mcp-proxy\.mjs",
     # Issue #223 + Incident #8807 P0b: bun plugin roots accumulate as PID-1
     # orphans across agent restarts (shared-mode + tmux-kill-session +
     # daemon reconcile all leave them reparented). The original
