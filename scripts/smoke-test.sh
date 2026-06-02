@@ -4494,7 +4494,16 @@ cases_should_match = [
     # still see the plugin-root fragment.
     "bun run --cwd /Users/Space User/.agent-bridge/plugins/teams --silent start",
     "bun run --cwd /Users/Space User/.bun/install/claude-plugins-official/telegram/0.0.6 start",
-    "/home/ec2-user/.bun/bin/bun server.ts",
+    # Incident #8807 P0b: the bare `bun … server.ts` rule was tightened to a
+    # bridge-plugin-path anchor, so a bun server.ts MUST carry the plugin
+    # path to match.
+    "/home/u/.bun/bin/bun /home/u/.agent-bridge/plugins/teams/server.ts",
+    "bun /Users/x/.bun/install/claude-plugins-official/telegram/0.0.6/server.ts",
+    # Incident #8807 P0b: the newly-extended bridge MCP signatures.
+    "npm exec @shopify/dev-mcp@latest",
+    "node /Users/x/.npm/_npx/abc/node_modules/.bin/shopify-dev-mcp",
+    "node /Users/x/.npm/_npx/abc/node_modules/@shopify/dev-mcp/dist/index.js",
+    "node /Users/x/.claude/plugins/cache/cosmax-marketplace/cosmax-crm/0.19.3-3/scripts/crm-mcp-proxy.mjs",
 ]
 for cmd in cases_should_match:
     matched = mod.matched_pattern(proc(10, cmd), patterns)
@@ -4507,6 +4516,24 @@ cases_should_not_match = [
     "bun run --cwd /tmp/foo test",
     "bun run dev",
     "node server.ts",  # without the bun word-boundary the server.ts-only rule must not false-positive
+    # Incident #8807 P0b: the bare `bun … server.ts` rule was tightened —
+    # an unrelated same-uid bun server.ts (a developer's own project) must
+    # NOT match now that the plugin-path anchor is required.
+    "/home/u/.bun/bin/bun server.ts",
+    "bun /Users/x/Projects/mywebapp/src/server.ts",
+    # Incident #8807 P0b CRITICAL negative controls — lethal collateral on
+    # the live host. None of these are Agent Bridge MCP servers and MUST
+    # never be reaped:
+    "/Applications/Pencil.app/Contents/Resources/mcp-server-darwin-arm64 --stdio",
+    "/usr/local/bin/mcp-server --port 9000",
+    "/Applications/Telegram.app/Contents/MacOS/Telegram",
+    "/Applications/Microsoft Teams.app/Contents/MacOS/MSTeams",
+    "node /Users/x/code/myapp/index.js",
+    # codex orphans are deliberately NOT reaped by the MCP cleaner. A
+    # `codex resume <hash>` is a LIVE agent pair; a `codex exec --ephemeral`
+    # worker is deferred to a follow-up. Neither may match here.
+    "codex resume 9f3a2b1c --cwd /home/agent",
+    "codex exec --ephemeral --skip-git-repo-check -C crm-dev",
 ]
 for cmd in cases_should_not_match:
     matched = mod.matched_pattern(proc(20, cmd), patterns)
@@ -4525,6 +4552,52 @@ assert matches[101], "server.ts child must match"
 assert mod.is_orphan_candidate(procs[100], procs, matches, 0), "plugin root ppid=1 must be orphan"
 assert mod.is_orphan_candidate(procs[101], procs, matches, 0), "server.ts child must chain through matched orphan parent"
 print("[ok] bun plugin orphan patterns + chain")
+
+# Incident #8807 P0b finding #4: PID-reuse revalidation. still_killable() must
+# refuse to signal a pid whose live identity no longer matches the orphan we
+# classified. Drive a real short-lived child so read_proc_identity() reads a
+# genuine process, then assert the four guards.
+import os as _os, re as _re, signal as _sig, subprocess as _sp, time as _time
+
+child = _sp.Popen(["/bin/sleep", "30"])
+try:
+    # Settle so ps can see it.
+    for _ in range(50):
+        if mod.read_proc_identity(child.pid) is not None:
+            break
+        _time.sleep(0.05)
+    ident = mod.read_proc_identity(child.pid)
+    assert ident is not None, "read_proc_identity could not read a live child"
+    live_cmd, live_ppid, live_age = ident
+    sleep_pat = _re.compile(r"sleep")
+
+    # (a) exact identity → killable.
+    assert mod.still_killable(child.pid, live_cmd, sleep_pat, live_ppid, 0), \
+        "still_killable rejected the exact same live process"
+    # (b) command no longer matches the pattern → refuse.
+    assert not mod.still_killable(child.pid, live_cmd, _re.compile(r"this-will-never-match"), live_ppid, 0), \
+        "still_killable signalled a process whose command no longer matches the pattern"
+    # (c) expected command string differs (pid was reused by another program) → refuse.
+    assert not mod.still_killable(child.pid, "totally different command", sleep_pat, live_ppid, 0), \
+        "still_killable signalled a process whose command string changed (pid-reuse)"
+    # (d) parent changed (orphan chain no longer holds) → refuse.
+    assert not mod.still_killable(child.pid, live_cmd, sleep_pat, live_ppid + 99999, 0), \
+        "still_killable signalled a process whose ppid changed"
+    # (e) live process is younger than our snapshot age (reused pid) → refuse.
+    assert not mod.still_killable(child.pid, live_cmd, sleep_pat, live_ppid, live_age + 100000), \
+        "still_killable signalled a process younger than the snapshot (pid-reuse)"
+
+    # A gone pid → kill_pid short-circuits to skipped-pid-reuse (no signal sent).
+    child.terminate()
+    child.wait()
+    ok, status = mod.kill_pid(child.pid, 0.2, live_cmd, sleep_pat, live_ppid, 0)
+    assert ok and status == "skipped-pid-reuse", \
+        f"kill_pid on a vanished pid must skip, got ok={ok} status={status}"
+    print("[ok] PID-reuse revalidation (pre-TERM + pre-KILL guards)")
+finally:
+    if child.poll() is None:
+        child.kill()
+        child.wait()
 PY
 
 log "cleaning orphan MCP processes conservatively"
@@ -4620,6 +4693,70 @@ kill "$MCP_ATTACHED_PARENT_PID" >/dev/null 2>&1 || true
 wait "$MCP_ATTACHED_PARENT_PID" >/dev/null 2>&1 || true
 MCP_ATTACHED_CHILD_PID=""
 MCP_ATTACHED_PARENT_PID=""
+
+log "MCP cleanup default-pattern controls: Pencil.app-style + bridge orphan (incident #8807 P0b)"
+# Run the cleanup with the REAL DEFAULT_PATTERNS (no --pattern override) so the
+# tightened/extended pattern set itself is exercised. Spawn two PPID=1 orphans:
+#   (neg) a process whose argv looks like Pencil.app's mcp-server-darwin-arm64
+#         — lethal collateral if a bare mcp-server pattern were ever added.
+#   (pos) a process whose argv matches a real bridge default pattern
+#         (crm-mcp-proxy.mjs) under a temp path.
+# Both are launched via /bin/sleep with a crafted argv[0]; min-age 0; kill on.
+MCP_NEG_PID_FILE="$TMP_ROOT/mcp-neg.pid"
+MCP_POS_PID_FILE="$TMP_ROOT/mcp-pos.pid"
+# argv[0] strings: the negative control must NOT match any default pattern; the
+# positive control embeds the crm-mcp-proxy.mjs signature verbatim.
+# Both argv[0] strings are presented verbatim to ps (we exec /bin/sleep, so
+# argv[0] is the only displayed token and "600" is the sleep duration). The
+# crm-mcp-proxy.mjs signature is embedded with spaces in argv[0] so the
+# `\bnode\b.*crm-mcp-proxy\.mjs` default pattern matches the stitched command.
+MCP_NEG_ARGV="/Applications/Pencil.app/Contents/Resources/mcp-server-darwin-arm64-smoke-$SESSION_NAME"
+MCP_POS_ARGV="node /tmp/agent-bridge-smoke-$SESSION_NAME/crm-mcp-proxy.mjs"
+python3 - "$MCP_NEG_ARGV" "$MCP_NEG_PID_FILE" <<'PY'
+import subprocess, sys
+from pathlib import Path
+argv0, pid_file = sys.argv[1], sys.argv[2]
+proc = subprocess.Popen([argv0, "600"], executable="/bin/sleep",
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True)
+Path(pid_file).write_text(str(proc.pid), encoding="utf-8")
+PY
+python3 - "$MCP_POS_ARGV" "$MCP_POS_PID_FILE" <<'PY'
+import subprocess, sys
+from pathlib import Path
+# Keep the whole signature as a single argv[0] (spaces included) so /bin/sleep
+# receives exactly ["<signature>", "600"] — ps then shows
+# "node /tmp/.../crm-mcp-proxy.mjs 600" and the default pattern matches, while
+# sleep still gets a single numeric duration.
+argv0, pid_file = sys.argv[1], sys.argv[2]
+proc = subprocess.Popen([argv0, "600"], executable="/bin/sleep",
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True)
+Path(pid_file).write_text(str(proc.pid), encoding="utf-8")
+PY
+MCP_NEG_PID="$(cat "$MCP_NEG_PID_FILE")"
+MCP_POS_PID="$(cat "$MCP_POS_PID_FILE")"
+for _ in {1..20}; do
+  kill -0 "$MCP_NEG_PID" >/dev/null 2>&1 && kill -0 "$MCP_POS_PID" >/dev/null 2>&1 && break
+  sleep 0.1
+done
+kill -0 "$MCP_NEG_PID" >/dev/null 2>&1 || die "negative-control MCP process did not start"
+kill -0 "$MCP_POS_PID" >/dev/null 2>&1 || die "positive-control MCP process did not start"
+# Dry-run first: audits the positive control but kills nothing.
+MCP_DEFAULT_DRYRUN_JSON="$(python3 "$REPO_ROOT/bridge-mcp-cleanup.py" cleanup --dry-run --min-age 0 --json)"
+assert_contains "$MCP_DEFAULT_DRYRUN_JSON" "\"killed_count\": 0"
+kill -0 "$MCP_POS_PID" >/dev/null 2>&1 || die "dry-run killed the positive control (must audit-only)"
+# Real kill with the default pattern set.
+python3 "$REPO_ROOT/bridge-mcp-cleanup.py" cleanup --kill --min-age 0 --json >/dev/null
+sleep 0.3
+kill -0 "$MCP_NEG_PID" >/dev/null 2>&1 || die "default cleanup killed the Pencil.app-style mcp-server process (lethal collateral!)"
+if kill -0 "$MCP_POS_PID" >/dev/null 2>&1; then
+  die "default cleanup did NOT kill the bridge crm-mcp-proxy orphan"
+fi
+log "[ok] default cleanup: Pencil.app-style survived, bridge orphan reaped, dry-run killed none"
+kill "$MCP_NEG_PID" >/dev/null 2>&1 || true
+MCP_NEG_PID=""
+MCP_POS_PID=""
 
 log "cleaning orphan MCP processes immediately before bridge-run relaunch"
 MCP_RESTART_AGENT="mcp-restart-$SESSION_NAME"

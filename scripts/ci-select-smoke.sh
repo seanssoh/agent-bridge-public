@@ -1094,6 +1094,13 @@ select_for_path() {
       # PR cannot silently drop a guard site or regress the fail-OPEN / leave-
       # queued / throttled-warn contract that prevents the fork-storm reboot.
       add_required 8807-resource-guard-defer
+      # Incident #8807 P0b: bridge-daemon.sh moved the periodic MCP-orphan
+      # cleanup (process_mcp_orphan_cleanup) to the TOP of cmd_sync_cycle so
+      # it relieves process-pressure before the spawn-heavy surfaces. Pull
+      # 8807-mcp-reaper-patterns on every bridge-daemon.sh move so the
+      # pressure-relief ordering and the single-invocation invariant cannot
+      # silently regress.
+      add_required 8807-mcp-reaper-patterns
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -1104,6 +1111,16 @@ select_for_path() {
       # every move of the guard lib so the proc-count/memory probe, the
       # fail-OPEN contract, and the throttled-warn bookkeeping cannot regress.
       add_required 8807-resource-guard-defer
+      ;;
+
+    bridge-mcp-cleanup.py)
+      # Incident #8807 P0b: the MCP-orphan reaper's DEFAULT_PATTERNS (tightened
+      # to bridge-owned identities/paths + extended to the missing bridge MCP
+      # signatures, never matching Pencil.app's mcp-server-darwin-arm64 or live
+      # `codex resume` agents) and the PID-reuse revalidation in kill_pid. Pull
+      # 8807-mcp-reaper-patterns on every move so the positive/negative control
+      # matrix and the pre-TERM/pre-KILL revalidation cannot regress.
+      add_required 8807-mcp-reaper-patterns
       ;;
 
     lib/bridge-daemon-control.sh|scripts/install-daemon-systemd.sh|scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template)

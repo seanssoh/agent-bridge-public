@@ -10404,6 +10404,18 @@ cmd_sync_cycle() {
   bridge_roster_cache_invalidate
   bridge_load_roster
 
+  # Incident #8807 P0b: periodic MCP-orphan cleanup runs EARLY — before every
+  # spawn-heavy surface in this cycle (start_cron_dispatch_workers,
+  # process_on_demand_agents, the wake paths) — so it relieves process /
+  # memory pressure ahead of new forks rather than after them. The fork-storm
+  # incident showed orphaned MCP servers accumulating faster than the
+  # post-spawn cleanup could reclaim; reaping first gives the spawn surfaces
+  # (now also resource-guarded by P0a) headroom. The cleanup's own 300s
+  # throttle keeps the cadence identical; subshell-isolated + `|| true` so a
+  # cleanup error can never abort the tick.
+  BRIDGE_DAEMON_LAST_STEP="mcp_orphan_cleanup_early"
+  ( process_mcp_orphan_cleanup ) || true
+
   # Discord relay runs FIRST — lowest-latency path for DM wake.
   # Issue #1338 defense-in-depth: subshell-isolate (see note above
   # mcp_liveness_giveup_recovery for rationale).
@@ -10756,10 +10768,12 @@ cmd_sync_cycle() {
   if reap_idle_orphan_sessions; then
     changed=0
   fi
-  BRIDGE_DAEMON_LAST_STEP="mcp_orphan_cleanup"
-  if process_mcp_orphan_cleanup; then
-    changed=0
-  fi
+  # Incident #8807 P0b: the periodic MCP-orphan cleanup was moved to the TOP
+  # of this cycle (BRIDGE_DAEMON_LAST_STEP=mcp_orphan_cleanup_early) so it
+  # relieves process-pressure BEFORE the spawn-heavy surfaces
+  # (start_cron_dispatch_workers, process_on_demand_agents). The internal
+  # 300s throttle is unchanged, so the cadence is identical — only the
+  # in-cycle ordering moved. The late call here is intentionally removed.
   if [[ "$changed" == "0" ]]; then
     BRIDGE_DAEMON_LAST_STEP="post_sync"
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true
