@@ -689,6 +689,9 @@ bridge_source_module "bridge-profiles.sh"
 bridge_source_module "bridge-agent-layout.sh"
 bridge_source_module "bridge-engine-descriptor.sh"
 bridge_source_module "bridge-cron.sh"
+# Incident #8807 P0a: resource-guard reuses bridge-cron.sh's
+# bridge_check_memory_pressure, so it must source AFTER bridge-cron.sh.
+bridge_source_module "bridge-resource-guard.sh"
 bridge_source_module "bridge-discord.sh"
 bridge_source_module "bridge-notify.sh"
 bridge_source_module "bridge-migration.sh"
