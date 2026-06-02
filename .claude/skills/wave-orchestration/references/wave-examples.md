@@ -2,6 +2,8 @@
 
 Four worked waves from a single session that landed 11 PRs with zero regressions. Each example shows the issue, the brief decision, the dispatch shape, the review path, and the merge note.
 
+> **⚠️ Historical record (2026-04-25) — review-path decisions are SUPERSEDED.** These waves predate the mandatory-pair-review contract. Where an example below shows a *"direct review (no codex-rescue)"* or *"self-review + direct merge"* path for docs-only / mid-size work, that LOC-based carve-out is **no longer valid** — see SKILL.md §"Phase 4" and footgun #10: **every** PR now requires the long-lived `agb-dev-codex` Phase-4 pair-review before merge, with no `<300 LOC` exception (a taken-over wedge-recovery PR is not an exception either — Phase 3.5). Keep these examples for their **brief-writing, dispatch-shape, and merge-note structure** — not their review-path choices.
+
 ## Wave example 1 — combined Track A's docs PR
 
 **Issue context**: #303 + #304 both proposed adding admin role spec sections to `agents/_template/CLAUDE.md`. Both Track A's were docs-only. Bundling them into one PR was cheaper than two separate PRs because they touched the same file in the same area.

@@ -163,7 +163,7 @@ Output-file mtime stale (no change for ~15+ min) **AND** no commits **AND** no P
 2. **Kill + take over** (when it barely started / the change is trivial, < ~50 LOC): `TaskStop` the agent, then do the edit yourself in a **dedicated temp worktree** (`git worktree add -b <branch> /tmp/<slug> origin/main`) — never in the operator's primary checkout.
 3. **CRITICAL — taking over does NOT skip review (operator directive 2026-06-03).** When a fixer wedges on its *internal* codex review and you finish the work yourself, the PR has now had **zero** codex review. You MUST still queue the **`agb-dev-codex` Phase-4 pair-review** (Phase 4 below) and merge ONLY on `implement-ok`. The wedged internal review was the fixer's self-check; the Phase-4 pair-review is the real merge gate and is mandatory for EVERY PR — a taken-over PR is not an exception. Never push-and-merge a wedge-recovery PR on your own say-so.
 
-See memory `feedback_fixer_internal_codex_review_wedge`.
+**Field evidence**: in one wave, 3/3 dispatched fixers wedged at the internal codex-rescue step — each had finished its edits + verification matrix, then stalled at "now invoke the codex rescue subagent". The edits sat intact in the worktree the whole time; only the commit/push/PR stage never ran. Take-over recovered all of them with zero lost work. Note the wedge is specifically the *fixer-internal* codex-rescue handoff (Phase 3), not the long-lived `agb-dev-codex` queue review (Phases 1/4/5).
 
 ---
 
