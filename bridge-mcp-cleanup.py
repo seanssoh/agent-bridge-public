@@ -20,22 +20,45 @@ from dataclasses import dataclass
 from typing import Iterable
 
 
+# Incident #8807 P0b — provenance rules for every DEFAULT_PATTERN:
+#   * Each pattern MUST be specific to an Agent Bridge MCP server identity —
+#     a plugin npm/bun package name OR a bridge plugin-cache PATH. A bare
+#     interpreter name (`node`, `bun`, `mcp-server`) is FORBIDDEN: this host
+#     runs same-uid non-bridge processes that share interpreters, and
+#     `mcp-server-darwin-arm64` on this fleet is Pencil.app (lethal
+#     collateral if matched). When adding a signature, derive it from live
+#     `ps -axo command=` provenance for the actual bridge MCP, not a guess.
+#   * codex orphans are deliberately NOT reaped here (see incident notes):
+#     `codex resume <hash>` is a LIVE agent pair and must never be killed,
+#     and the disposable `codex exec --ephemeral` workers are a smaller
+#     multiplier than the MCP fleet — codex reaping is deferred to a
+#     follow-up with its own exact signature + negative control.
 DEFAULT_PATTERNS = [
     r"npm(\s+exec)?\s+@upstash/context7-mcp",
     r"npm(\s+exec)?\s+@playwright/mcp",
     r"npm(\s+exec)?.*firebase-tools.*mcp",
-    r"\bbun\b.*server\.ts",
     r"\bnode\b.*context7.*mcp",
     r"\bnode\b.*playwright.*mcp",
     r"\bnode\b.*firebase.*mcp",
-    # Issue #223: bun plugin roots accumulate as PID-1 orphans across
-    # agent restarts (shared-mode + tmux-kill-session + daemon reconcile
-    # all leave them reparented). Matching only `bun server.ts` was not
-    # enough — its parent `bun run --cwd .../plugins/<kind>` is
-    # unmatched, so the chain check in is_orphan_candidate() refused the
-    # server.ts child too. Restrict the patterns to Agent Bridge plugin
-    # paths so a developer's own `bun run --cwd ./myapp build` never
-    # matches.
+    # Incident #8807 P0b: Shopify dev MCP. Both the npm-exec launcher form
+    # and the resolved node entrypoint are matched (live provenance:
+    # `npm exec @shopify/dev-mcp` and `node …/@shopify/dev-mcp/…`).
+    r"npm(\s+exec)?\s+@shopify/dev-mcp",
+    r"\bnode\b.*@shopify/dev-mcp",
+    r"\bnode\b.*shopify-dev-mcp",
+    # Incident #8807 P0b: cosmax-crm MCP stdio proxy (live provenance:
+    # `node …/crm-mcp-proxy.mjs`). Anchored on the exact entrypoint file so
+    # an unrelated same-uid `node` never matches.
+    r"\bnode\b.*crm-mcp-proxy\.mjs",
+    # Issue #223 + Incident #8807 P0b: bun plugin roots accumulate as PID-1
+    # orphans across agent restarts (shared-mode + tmux-kill-session +
+    # daemon reconcile all leave them reparented). The original
+    # `\bbun\b.*server\.ts` was too broad — it matched an unrelated same-uid
+    # `bun … server.ts` (a developer's own project). Anchor the server.ts
+    # match on the bridge plugin-cache path so only Agent Bridge plugin
+    # servers qualify; the parent `bun run --cwd .../plugins/<kind>` chain
+    # patterns below keep is_orphan_candidate()'s parent-match happy.
+    r"\bbun\b.*(?:\.agent-bridge/plugins/|/claude-plugins-official/).*server\.ts",
     r"\bbun\s+run\s+--cwd\s+.+?\.agent-bridge/plugins/",
     r"\bbun\s+run\s+--cwd\s+.+?/claude-plugins-official/",
 ]
@@ -171,7 +194,86 @@ def alive(pid: int) -> bool:
         return True
 
 
-def kill_pid(pid: int, grace_seconds: float) -> tuple[bool, str]:
+def read_proc_identity(pid: int) -> tuple[str, int, int] | None:
+    """Re-read a single pid's (command, ppid, age_seconds) directly from ps.
+
+    Returns None if the pid is gone or unreadable. Used for PID-reuse
+    revalidation immediately before each signal so we never kill a process
+    that has been replaced (same numeric pid, different program) since the
+    snapshot that classified it as an orphan.
+    """
+    for age_flag, age_is_seconds in (("etimes=", True), ("etime=", False)):
+        try:
+            completed = subprocess.run(
+                ["ps", "-p", str(pid), "-o", f"ppid=,{age_flag},command="],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError:
+            # Non-zero exit on the first (etimes) form may mean "no such
+            # process" OR "unsupported field"; try the etime fallback before
+            # concluding the process is gone.
+            if age_is_seconds:
+                continue
+            return None
+        line = completed.stdout.strip()
+        if not line:
+            return None
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            return None
+        try:
+            ppid = int(parts[0])
+        except ValueError:
+            return None
+        age = int(parts[1]) if age_is_seconds else parse_etime(parts[1])
+        return parts[2], ppid, age
+    return None
+
+
+def still_killable(
+    pid: int,
+    expected_command: str,
+    expected_pattern: re.Pattern[str],
+    expected_ppid: int,
+    min_observed_age: int,
+) -> bool:
+    """PID-reuse guard: confirm the pid is still the same orphan we classified.
+
+    Requires that the live process at `pid` (a) still exists, (b) still
+    matches the same pattern, (c) has the same parent (so the orphan chain is
+    unchanged), and (d) is at least as old as when we first saw it (a reused
+    pid would be YOUNGER). Any mismatch → refuse to signal it.
+    """
+    identity = read_proc_identity(pid)
+    if identity is None:
+        return False
+    command, ppid, age = identity
+    if not expected_pattern.search(command):
+        return False
+    if command != expected_command:
+        return False
+    if ppid != expected_ppid:
+        return False
+    # A reused pid is a fresh process → strictly younger than our snapshot.
+    if age < min_observed_age:
+        return False
+    return True
+
+
+def kill_pid(
+    pid: int,
+    grace_seconds: float,
+    expected_command: str,
+    expected_pattern: re.Pattern[str],
+    expected_ppid: int,
+    min_observed_age: int,
+) -> tuple[bool, str]:
+    # PID-reuse revalidation IMMEDIATELY before SIGTERM.
+    if not still_killable(pid, expected_command, expected_pattern, expected_ppid, min_observed_age):
+        return True, "skipped-pid-reuse"
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -185,6 +287,10 @@ def kill_pid(pid: int, grace_seconds: float) -> tuple[bool, str]:
             return True, "terminated"
         time.sleep(0.05)
 
+    # PID-reuse revalidation AGAIN before the escalation to SIGKILL — the pid
+    # may have exited and been recycled during the grace window.
+    if not still_killable(pid, expected_command, expected_pattern, expected_ppid, min_observed_age):
+        return True, "skipped-pid-reuse-pre-kill"
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -218,15 +324,37 @@ def build_report(args: argparse.Namespace) -> dict[str, object]:
     # Kill children before their orphan MCP parents.
     orphans.sort(key=lambda item: int(item["pid"]), reverse=True)
 
+    # Map each pattern string back to its compiled object so the kill path can
+    # re-match the (possibly re-read) command during PID-reuse revalidation.
+    pattern_by_str = {pattern.pattern: pattern for pattern in patterns}
+
     killed = []
     errors = []
+    skipped = []
     if args.kill:
         for item in orphans:
             pid = int(item["pid"])
-            ok, status = kill_pid(pid, args.grace_seconds)
+            expected_pattern = pattern_by_str.get(str(item["pattern"]))
+            if expected_pattern is None:
+                # Should not happen (item["pattern"] came from this set), but
+                # never signal a pid we cannot revalidate against a pattern.
+                enriched = dict(item)
+                enriched["kill_status"] = "skipped-no-pattern"
+                skipped.append(enriched)
+                continue
+            ok, status = kill_pid(
+                pid,
+                args.grace_seconds,
+                str(item["command"]),
+                expected_pattern,
+                int(item["ppid"]),
+                int(item["age_seconds"]),
+            )
             enriched = dict(item)
             enriched["kill_status"] = status
-            if ok:
+            if status.startswith("skipped-"):
+                skipped.append(enriched)
+            elif ok:
                 killed.append(enriched)
             else:
                 errors.append(enriched)
@@ -239,10 +367,12 @@ def build_report(args: argparse.Namespace) -> dict[str, object]:
         "matched_count": len(matched),
         "orphan_count": len(orphans),
         "killed_count": len(killed),
+        "skipped_count": len(skipped),
         "freed_mb_estimate": round(killed_rss_kb / 1024, 1),
         "matched": matched,
         "orphans": orphans,
         "killed": killed,
+        "skipped": skipped,
         "errors": errors,
     }
 
