@@ -9529,7 +9529,31 @@ bridge_agent_is_active() {
   local session
 
   session="$(bridge_agent_session "$agent")"
-  [[ -n "$session" ]] && bridge_tmux_session_exists "$session"
+  # PRIMARY path: the live tmux probe. Correct + freshest wherever the
+  # caller's UID can reach the agent's tmux server (the controller, and
+  # shared-mode non-iso installs where everything runs under one UID).
+  if [[ -n "$session" ]] && bridge_tmux_session_exists "$session"; then
+    return 0
+  fi
+
+  # Issue #1473 FALLBACK: a probe miss from a NON-controller UID is
+  # ambiguous — the agent may genuinely be stopped, or our UID simply
+  # cannot see the controller's per-UID tmux socket (the iso v2 case,
+  # where every probe falsely reads "absent"). Only when we are NOT the
+  # controller (the daemon-published aggregate is owned by another UID)
+  # do we consult that aggregate. On the controller the gate is false, so
+  # a genuine stop reads stopped and we never trust a stale aggregate over
+  # a fresh local probe. Graceful: missing/own-UID aggregate → fall
+  # through to the historical "probe miss == not active" answer.
+  if command -v bridge_agents_aggregate_should_consult >/dev/null 2>&1 \
+      && bridge_agents_aggregate_should_consult; then
+    local agg_active
+    if agg_active="$(bridge_agents_aggregate_lookup "$agent" 2)"; then
+      [[ "$agg_active" == "1" ]] && return 0
+    fi
+  fi
+
+  return 1
 }
 
 bridge_list_agents() {

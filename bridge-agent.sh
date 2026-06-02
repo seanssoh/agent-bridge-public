@@ -1802,6 +1802,24 @@ bridge_agent_activity_state() {
     return 0
   fi
 
+  # Issue #1473: from a NON-controller UID (an isolated agent) the tmux
+  # probes below are all blind — they would mislabel a live agent as
+  # `working` (the final fallthrough) or, via bridge_agent_is_active,
+  # `stopped`. When the daemon-published aggregate is the authoritative
+  # source for this UID, take the activity_state token straight from it so
+  # the human-facing state agrees with the `active` column (which
+  # bridge_agent_is_active also resolves from the same aggregate). On the
+  # controller `_should_consult` is false → this whole block is skipped and
+  # the live tmux ladder below runs unchanged (no shared-mode regression).
+  if command -v bridge_agents_aggregate_should_consult >/dev/null 2>&1 \
+      && bridge_agents_aggregate_should_consult; then
+    local agg_state
+    if agg_state="$(bridge_agents_aggregate_lookup "$agent" 3)"; then
+      printf '%s' "$agg_state"
+      return 0
+    fi
+  fi
+
   if ! bridge_agent_is_active "$agent"; then
     printf '%s' "stopped"
     return 0

@@ -181,6 +181,18 @@ BRIDGE_HISTORY_DIR="${BRIDGE_HISTORY_DIR:-$BRIDGE_STATE_DIR/history}"
 BRIDGE_WORKTREE_META_DIR="${BRIDGE_WORKTREE_META_DIR:-$BRIDGE_STATE_DIR/worktrees}"
 BRIDGE_ACTIVE_ROSTER_TSV="${BRIDGE_ACTIVE_ROSTER_TSV:-$BRIDGE_STATE_DIR/active-roster.tsv}"
 BRIDGE_ACTIVE_ROSTER_MD="${BRIDGE_ACTIVE_ROSTER_MD:-$BRIDGE_STATE_DIR/active-roster.md}"
+# Issue #1473: world-readable (0644) all-agent live-state aggregate the
+# daemon (controller UID) publishes each tick so an isolated agent UID —
+# which cannot reach the controller's per-UID tmux socket and cannot read
+# the 0600 active-roster — can still resolve every agent's active/state in
+# `agb agent list`. Carries ONLY non-secret observational fields
+# (agent / active / activity_state / updated_at). See lib/bridge-state.sh
+# bridge_write_agents_aggregate_state + lib/bridge-agents.sh fallback.
+# BRIDGE_AGENTS_AGGREGATE_MAX_AGE_SECONDS (read inline in
+# bridge_agents_aggregate_should_consult) bounds how stale the aggregate
+# may be before a non-controller reader stops trusting it (daemon-down
+# safety); unset → 3× the heartbeat interval, 0 → disable the gate.
+BRIDGE_AGENTS_AGGREGATE_TSV="${BRIDGE_AGENTS_AGGREGATE_TSV:-$BRIDGE_STATE_DIR/agents-aggregate.tsv}"
 BRIDGE_DAEMON_PID_FILE="${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}"
 # Issue #590 / PR #599 r2: prefer the installer-written launchagent.config
 # marker so custom --label/--plist/--log-path installs resolve correctly.
