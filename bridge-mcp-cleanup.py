@@ -56,8 +56,10 @@ DEFAULT_PATTERNS = [
     # `node …/.claude/plugins/cache/cosmax-marketplace/cosmax-crm/<ver>/
     # scripts/crm-mcp-proxy.mjs`) — the prior `\bnode\b.*crm-mcp-proxy\.mjs`
     # was too broad and would have matched an unrelated same-uid
-    # `node /tmp/x/crm-mcp-proxy.mjs` (codex r1 CRITICAL).
-    r"\.claude/plugins/.*crm-mcp-proxy\.mjs",
+    # `node /tmp/x/crm-mcp-proxy.mjs` (codex r1 CRITICAL). r2 (codex): anchor on
+    # the `/cache/` segment so a user's project-local `.claude/plugins/local/...`
+    # dev tree is NOT reaped either.
+    r"\.claude/plugins/cache/.*crm-mcp-proxy\.mjs",
     # Issue #223 + Incident #8807 P0b: bun plugin roots accumulate as PID-1
     # orphans across agent restarts (shared-mode + tmux-kill-session +
     # daemon reconcile all leave them reparented). The original

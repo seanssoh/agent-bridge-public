@@ -86,6 +86,9 @@ def cmd_pattern_matrix(reaper_path: str) -> int:
         # same-uid node running a like-named script must NOT match.
         "node /tmp/unrelated/crm-mcp-proxy.mjs",
         "node /Users/x/Projects/myproj/scripts/crm-mcp-proxy.mjs",
+        # #1480 r2 (codex): a project-local .claude/plugins/LOCAL tree is NOT
+        # the bridge plugin-cache and must NOT match the cache-anchored pattern.
+        "node /Users/alice/project/.claude/plugins/local/scripts/crm-mcp-proxy.mjs",
         "node /tmp/foo/shopify-dev-mcp",
         "node /Users/x/code/app/bin/shopify-dev-mcp",
         # codex orphans are NOT reaped by the MCP cleaner.
