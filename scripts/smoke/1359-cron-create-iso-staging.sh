@@ -958,20 +958,15 @@ T7_AFTER_JOBS="$(jobs_count)"
 [[ "$T7_AFTER_JOBS" -eq $(( T7_BEFORE_JOBS + 1 )) ]] || \
   smoke_fail "T7: exactly one job must be added (before=$T7_BEFORE_JOBS after=$T7_AFTER_JOBS)"
 # The created cron MUST belong to the TARGET, not the admin actor.
-T7_TARGET_OWNED="$("$PY_BIN" - "$JOBS_FILE" "$PEER_AGENT" "$T7_CRON_ID" <<'PY'
-import json
-import sys
-
-jobs = json.load(open(sys.argv[1]))["jobs"]
-target, cron_id = sys.argv[2], sys.argv[3]
-for j in jobs:
-    if j.get("id") == cron_id or j.get("name") == cron_id:
-        print("yes" if j.get("agent") == target else f"no:{j.get('agent')}")
-        break
-else:
-    print("missing")
-PY
-)"
+# Footgun #11: use `python3 -c <script> argv...` (NOT a heredoc-in-
+# command-substitution) so this assertion does not add a new C1 site to
+# .lint-heredoc-baseline.tsv.
+T7_OWNER_PROBE='import json,sys
+jobs=json.load(open(sys.argv[1]))["jobs"]
+target,cron_id=sys.argv[2],sys.argv[3]
+hit=next((j for j in jobs if j.get("id")==cron_id or j.get("name")==cron_id),None)
+print("missing" if hit is None else ("yes" if hit.get("agent")==target else "no:"+str(hit.get("agent"))))'
+T7_TARGET_OWNED="$("$PY_BIN" -c "$T7_OWNER_PROBE" "$JOBS_FILE" "$PEER_AGENT" "$T7_CRON_ID")"
 smoke_assert_eq "yes" "$T7_TARGET_OWNED" "T7: created cron must be owned by the TARGET agent ($PEER_AGENT), not the admin"
 smoke_log "ok: T7 — admin cross-agent provision applied for target (cron_id=$T7_CRON_ID)"
 
