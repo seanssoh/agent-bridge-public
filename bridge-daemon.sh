@@ -9593,6 +9593,25 @@ process_cron_staging_apply() {
   local stale_secs="${BRIDGE_CRON_STAGING_STALE_SECONDS:-300}"
   [[ "$stale_secs" =~ ^[0-9]+$ ]] || stale_secs=300
 
+  # Issue #1474: build the registered cron-delivery-target allowlist from
+  # the daemon's OWN roster (controller-side, authoritative — never the
+  # iso agent's payload). staging.py uses it to confine the admin cross-
+  # agent exemption to REAL registered targets so a (genuine) admin
+  # cannot stage a `memory-daily-<ghost>` cron for a non-existent agent.
+  # Newline-delimited; empty when no roster is loaded (the helper then
+  # falls back to syntactic validation only — same as the controller-
+  # direct path, no regression). codex r1 BLOCKING (target abuse).
+  local cron_target_allowlist=""
+  if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 \
+      && declare -F bridge_agent_is_cron_delivery_target >/dev/null 2>&1; then
+    local _ct_agent
+    for _ct_agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      if bridge_agent_is_cron_delivery_target "$_ct_agent" 2>/dev/null; then
+        cron_target_allowlist+="${_ct_agent}"$'\n'
+      fi
+    done
+  fi
+
   local applied_count=0
   local rejected_count=0
   local scan_output=""
@@ -9654,13 +9673,24 @@ process_cron_staging_apply() {
       # whole cron-sync tick. The wrapper SIGTERM/SIGKILL chain is
       # absorbed at the result-file rejection path below — `apply_rc`
       # carries the wrapped exit code without ever propagating SIGPIPE.
+      # Issue #1474: pass the daemon's roster-resolved admin agent id to
+      # the apply helper so it can authorize the genuine admin's cross-
+      # agent text-cron provisioning. This value comes from the daemon's
+      # OWN `bridge_load_roster` (controller-side, authoritative) — it is
+      # NOT read from the iso agent's staging payload, so it cannot be
+      # forged. When unset (no admin configured), the helper falls back to
+      # the strict same-agent-only contract.
       local apply_rc=0
       if declare -F bridge_with_timeout >/dev/null 2>&1; then
+        AGB_CRON_STAGING_ADMIN_AGENT="${BRIDGE_ADMIN_AGENT_ID:-}" \
+        AGB_CRON_STAGING_TARGET_ALLOWLIST="$cron_target_allowlist" \
         bridge_with_timeout "${BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS:-25}" \
           cron_staging_apply python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" \
           apply "$staging_dir" "$actor_agent_dir" "$uuid" "$jobs_file" \
           >/dev/null 2>&1 || apply_rc=$?
       else
+        AGB_CRON_STAGING_ADMIN_AGENT="${BRIDGE_ADMIN_AGENT_ID:-}" \
+        AGB_CRON_STAGING_TARGET_ALLOWLIST="$cron_target_allowlist" \
         python3 "$SCRIPT_DIR/lib/cron-helpers/staging.py" \
           apply "$staging_dir" "$actor_agent_dir" "$uuid" "$jobs_file" \
           >/dev/null 2>&1 || apply_rc=$?

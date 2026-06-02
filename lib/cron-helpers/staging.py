@@ -806,6 +806,61 @@ def _resolve_agent_iso_uid(agent: str, jobs_file: str) -> Optional[int]:
         return None
 
 
+def _staging_admin_agent() -> str:
+    """Issue #1474 — resolve the registered admin agent id for the
+    cross-agent provisioning exemption.
+
+    SECURITY-CRITICAL provenance: this value MUST come only from a
+    controller-side, non-forgeable source — it is consulted by
+    `cmd_apply` (which runs in the DAEMON / controller process) to
+    decide whether the request's `actor_agent` is the operator-trusted
+    admin and may therefore provision crons for OTHER agents.
+
+    The daemon passes its OWN `bridge_load_roster`-resolved
+    `BRIDGE_ADMIN_AGENT_ID` via `AGB_CRON_STAGING_ADMIN_AGENT` at the
+    `staging.py apply` invocation. That value originates in the
+    controller's roster (`agent-roster.local.sh`, 0600 owner=controller)
+    and is set inside the daemon's own process — the iso agent that
+    dropped the staging request never enters this process and cannot
+    inject env into it. The staging PAYLOAD is never consulted for the
+    admin id (a payload-supplied admin claim would be forgeable).
+
+    Returns "" when no admin is configured → the exemption is disabled
+    and `cmd_apply` keeps the strict same-agent-only contract.
+    """
+    return (os.environ.get("AGB_CRON_STAGING_ADMIN_AGENT") or "").strip()
+
+
+def _staging_target_allowlist() -> Optional[set]:
+    """Issue #1474 — the set of registered cron-delivery-target agents the
+    admin cross-agent exemption may provision for.
+
+    Same controller-side provenance guarantee as `_staging_admin_agent`:
+    `bridge-daemon.sh` enumerates this from its OWN roster
+    (`BRIDGE_AGENT_IDS` filtered by `bridge_agent_is_cron_delivery_target`)
+    and passes it via `AGB_CRON_STAGING_TARGET_ALLOWLIST` (newline-
+    delimited). The iso agent's payload never contributes to it.
+
+    Returns:
+    - a non-empty `set[str]` when the daemon supplied a roster → the
+      admin's cross-agent target MUST be a member (defense-in-depth
+      against provisioning crons for ghost/unregistered agents — codex
+      r1 BLOCKING, target abuse), OR
+    - None when the env is unset/empty (no roster loaded, or invoked
+      outside the daemon) → the caller falls back to syntactic-only
+      target validation, matching the controller-direct
+      `bridge-cron.py native-create` path, which also does not gate on
+      registration. This keeps behavior unchanged for non-daemon callers
+      and never fails the legitimate admin path closed on a degraded
+      roster.
+    """
+    raw = os.environ.get("AGB_CRON_STAGING_TARGET_ALLOWLIST")
+    if raw is None:
+        return None
+    names = {line.strip() for line in raw.splitlines() if line.strip()}
+    return names or None
+
+
 def _write_result(
     result_path: Path,
     request_uuid: str,
@@ -999,7 +1054,70 @@ def cmd_apply(
 
     # Validation 2: actor_agent == target agent. An iso UID may not
     # mutate cron for another agent. This is the per-issue 격리 보장.
-    if target_agent != actor_agent:
+    #
+    # Issue #1474 admin exemption: the REGISTERED admin agent may
+    # provision crons for OTHER agents (bootstrap-memory-system.sh's
+    # `memory-daily-<peer>` set). `admin_agent` comes from the daemon's
+    # own controller-side roster (see `_staging_admin_agent` docstring) —
+    # NEVER from the payload — so a regular iso agent cannot name itself
+    # admin. The cross-agent grant is gated on ALL of:
+    #   - actor_agent == the registered admin (controller-resolved), AND
+    #   - the actor's claimed identity is proven non-forgeably by
+    #     Validation 1b (payload actor_agent == path dirname, matrix-
+    #     enforced per-agent write) + Validation 3 (file owner UID ==
+    #     the admin's iso UID from controller-owned agent-meta.env) +
+    #     Validation 4 (payload actor_uid == file owner UID), all still
+    #     enforced below, AND
+    #   - target_agent is a syntactically valid agent name.
+    # A regular iso agent `evil` forging `actor_agent=<admin>` in its
+    # payload is rejected at Validation 1b (its file lives in `evil/`,
+    # dirname != <admin>); it cannot write into `<admin>/`'s subdir
+    # (matrix grants only `ab-agent-<admin>` group-write there); and even
+    # a hypothetical mislabeled file is caught at Validation 3 because
+    # the file is owned by `agent-bridge-evil`, not the admin's iso UID.
+    admin_agent = _staging_admin_agent()
+    is_admin_cross_agent = bool(
+        admin_agent
+        and actor_agent == admin_agent
+        and target_agent != actor_agent
+    )
+    if is_admin_cross_agent and not _validate_agent_name(target_agent):
+        # Admin tried to provision for a syntactically invalid target.
+        _write_result(
+            result_path,
+            request_uuid,
+            actor_agent=actor_agent,
+            status="error",
+            cron_id=None,
+            error=f"admin_cross_agent_bad_target: target={target_agent!r}",
+            audit_action="cron_staging_rejected",
+        )
+        return 4
+    # codex r1 BLOCKING (target abuse): confine the admin cross-agent
+    # exemption to REGISTERED cron-delivery targets. The daemon supplies
+    # the roster-derived allowlist (controller-side, non-forgeable); when
+    # present, the target MUST be a member so even a genuine admin cannot
+    # stage a cron for a ghost/unregistered agent. When the allowlist is
+    # absent (no roster / non-daemon caller) we fall back to the syntactic
+    # check above — matching the controller-direct native-create path,
+    # which also does not gate on registration (no regression).
+    if is_admin_cross_agent:
+        target_allowlist = _staging_target_allowlist()
+        if target_allowlist is not None and target_agent not in target_allowlist:
+            _write_result(
+                result_path,
+                request_uuid,
+                actor_agent=actor_agent,
+                status="error",
+                cron_id=None,
+                error=(
+                    "admin_cross_agent_unregistered_target: "
+                    f"target={target_agent!r}"
+                ),
+                audit_action="cron_staging_rejected",
+            )
+            return 4
+    if target_agent != actor_agent and not is_admin_cross_agent:
         _write_result(
             result_path,
             request_uuid,
@@ -1108,6 +1226,11 @@ def cmd_apply(
         )
         return 4
 
+    # Issue #1474: for the admin cross-agent exemption the cron is created
+    # for the TARGET agent, not the admin actor. For the normal same-agent
+    # path these are identical, so this is a no-op there.
+    create_agent = target_agent if is_admin_cross_agent else actor_agent
+
     repo_root = Path(__file__).resolve().parent.parent.parent
     cron_py = repo_root / "bridge-cron.py"
     argv = [
@@ -1117,7 +1240,7 @@ def cmd_apply(
         "--jobs-file",
         jobs_file,
         "--agent",
-        actor_agent,
+        create_agent,
         "--title",
         str(payload.get("title") or "").strip(),
     ]

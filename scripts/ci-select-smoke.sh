@@ -1833,7 +1833,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # gate semantics + the `wiki_graph_skipped=1` stdout marker so a
       # future PR cannot regress the opt-in contract or break
       # back-compat for installs that already provisioned wiki-graph.
-      add_required H-bootstrap-memory-iso-rebuild J-beta4-workflow-docs
+      #
+      # Issue #1474: bootstrap-memory-system.sh's per-agent
+      # `cron create --agent <peer>` is the cross-agent provisioning path
+      # the admin exemption serves. Pull 1359-cron-create-iso-staging (it
+      # now carries the #1474 admin-exemption + env-forgery-refused
+      # security cases) so a future bootstrap change re-runs the gate.
+      add_required H-bootstrap-memory-iso-rebuild J-beta4-workflow-docs 1359-cron-create-iso-staging
       add_integration integration-minimal
       ;;
 

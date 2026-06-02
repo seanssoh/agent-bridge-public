@@ -1327,17 +1327,32 @@ PY
     return 0
   fi
 
+  # Issue #1474: when this agent differs from the admin running the
+  # bootstrap, this is a cross-agent provision that routes through the
+  # #1359 staging delegation and the daemon applies it. Capture stderr so
+  # a failure (staging timeout / daemon down / a reject reason) surfaces
+  # in the record instead of an opaque empty `register-failed` that lets
+  # drift silently stick at 2-3 forever (the symptom #1474 reports).
+  local _cron_create_err
+  _cron_create_err="$(mktemp -t agb-bootstrap-cron-create.XXXXXX 2>/dev/null || printf '')"
   if "$BRIDGE_AGB" cron create --agent "$agent" \
         --schedule "$sched" \
         --tz "$tz" \
         --title "$title" \
         --payload "$payload" \
-        >/dev/null 2>&1; then
+        >/dev/null 2>"${_cron_create_err:-/dev/null}"; then
     record "$agent" "cron:$title" "registered" "$sched $tz"
   else
-    record "$agent" "cron:$title" "register-failed" ""
+    local _err_tail=""
+    if [[ -n "$_cron_create_err" && -s "$_cron_create_err" ]]; then
+      # Single-line, bounded tail so the TSV record stays parseable
+      # (strip both newlines and tabs — the record file is tab-delimited).
+      _err_tail="$(tr '\n\t' '  ' <"$_cron_create_err" | cut -c1-300)"
+    fi
+    record "$agent" "cron:$title" "register-failed" "$_err_tail"
     note_drift
   fi
+  [[ -n "$_cron_create_err" ]] && rm -f "$_cron_create_err" 2>/dev/null || true
 }
 
 # -----------------------------------------------------------------------------
