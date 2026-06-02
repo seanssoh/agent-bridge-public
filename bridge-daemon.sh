@@ -346,6 +346,17 @@ bridge_daemon_supp_groups_poll_and_dispatch() {
     return 0
   fi
 
+  # Incident #8807 P0a: resource-guard before forking the detached supp-refresh
+  # worker (which itself drives a daemon restart). Placed AFTER the
+  # should_refresh throttle check but BEFORE the dispatch throttle-write, so a
+  # deferral does not record a phantom "dispatched" state — the next poll
+  # re-evaluates pressure and re-detects the same stale group. Return 0
+  # (poll-loop callers must never abort on this path). Fails OPEN.
+  if declare -F bridge_resource_guard_defer_or_proceed >/dev/null 2>&1 \
+      && bridge_resource_guard_defer_or_proceed "supp-refresh:${first_name}"; then
+    return 0
+  fi
+
   # Resolve the bridge home + bash for the detached worker invocation.
   # SCRIPT_DIR is set at the top of bridge-daemon.sh; bash is the
   # interpreter currently running this code.
@@ -8455,6 +8466,15 @@ start_cron_worker() {
   local task_id="$1"
   local log_file
 
+  # Incident #8807 P0a: resource-guard pre-flight before forking the cron
+  # worker. On host pressure the row is NOT claimed-and-stranded here — the
+  # caller (start_cron_dispatch_workers) already guards before the claim, so
+  # this is a defense-in-depth seal at the fork itself. Fails OPEN.
+  if declare -F bridge_resource_guard_defer_or_proceed >/dev/null 2>&1 \
+      && bridge_resource_guard_defer_or_proceed "cron-worker:#${task_id}"; then
+    return 1
+  fi
+
   log_file="$(bridge_cron_worker_log_file "$task_id")"
   mkdir -p "$(dirname "$log_file")"
   bridge_require_python
@@ -8617,6 +8637,17 @@ bridge_daemon_cron_dispatch_wake() {
     return 1
   fi
 
+  # Incident #8807 P0a: defense-in-depth resource-guard BEFORE the wake spawns
+  # a fresh bridge-start.sh session. Placed ahead of the throttle-window
+  # check/write below so a deferral does NOT consume the cron-dispatch
+  # throttle slot (mirrors the setup-pending / channel-required holds above,
+  # which return 1 without touching throttle state). The caller treats rc=1
+  # as "skip this row this pass" and leaves it queued. Fails OPEN.
+  if declare -F bridge_resource_guard_defer_or_proceed >/dev/null 2>&1 \
+      && bridge_resource_guard_defer_or_proceed "cron-dispatch-wake:${agent}"; then
+    return 1
+  fi
+
   now_ts="$(date +%s 2>/dev/null || echo 0)"
   state_file="$(bridge_daemon_cron_dispatch_wake_state_file "$agent")"
   if [[ -f "$state_file" ]]; then
@@ -8708,6 +8739,17 @@ start_cron_dispatch_workers() {
   while IFS=$'\t' read -r task_id agent _priority title _body_path; do
     [[ -n "$task_id" && -n "$agent" ]] || continue
     (( running_count < max_parallel )) || break
+
+    # Incident #8807 P0a: resource-guard gate BEFORE the cron CLAIM. A
+    # deferred dispatch must leave the row queued/unclaimed (not
+    # claimed-then-stranded), so the gate sits ahead of both the wake
+    # (bridge_daemon_cron_dispatch_wake, which can spawn bridge-start.sh)
+    # and claim_cron_task_with_retry below. Skip this row this pass; the
+    # next tick re-evaluates pressure. Fails OPEN.
+    if declare -F bridge_resource_guard_defer_or_proceed >/dev/null 2>&1 \
+        && bridge_resource_guard_defer_or_proceed "cron-dispatch:#${task_id}"; then
+      continue
+    fi
 
     # Issue #1096: when the dispatch's target is a stopped static agent,
     # wake it before claiming. The wake gate checks the same operator-
@@ -8856,6 +8898,21 @@ cmd_run_cron_worker() {
       printf -- '- target: %s\n' "$CRON_TARGET_AGENT"
     } >"$done_note_file" 2>/dev/null || true
     bridge_queue_cli done "$task_id" --agent "$TASK_ASSIGNED_TO" --note-file "$done_note_file" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # Incident #8807 P0a: resource-guard pre-flight BEFORE the run-subagent fork
+  # (the heaviest spawn on this path — it launches a fresh claude/codex
+  # subprocess). The row is already claimed by this worker, so on deferral we
+  # hand it BACK to the queue (handoff --to the assigned agent) instead of
+  # marking it failed — the next ready-rows pass re-dispatches it once
+  # pressure clears. Mirrors the start-cron-worker-failure handoff above.
+  # Fails OPEN: a probe glitch proceeds to the runner.
+  if [[ "$CRON_RUN_STATE" != "success" ]] \
+      && declare -F bridge_resource_guard_defer_or_proceed >/dev/null 2>&1 \
+      && bridge_resource_guard_defer_or_proceed "run-cron-worker:#${task_id}"; then
+    bridge_queue_cli handoff "$task_id" --to "$TASK_ASSIGNED_TO" --from daemon \
+      --note "cron worker deferred: host near resource ceiling (incident #8807 resource-guard)" >/dev/null 2>&1 || true
     return 0
   fi
 
@@ -9314,6 +9371,17 @@ process_on_demand_agents() {
             continue
           fi
         fi
+        # Incident #8807 P0a: resource-guard before the always-on auto-start
+        # spawn. Mirror the hold / channel-miss gates above — `continue`
+        # without recording an autostart FAILURE (a deferral is not a
+        # failure; recording one would arm the backoff and could mask a real
+        # start problem once pressure clears). The audit + throttled warn are
+        # emitted by the guard helper. The agent stays stopped this tick and
+        # is re-evaluated next pass. Fails OPEN.
+        if declare -F bridge_resource_guard_defer_or_proceed >/dev/null 2>&1 \
+            && bridge_resource_guard_defer_or_proceed "always-on:${agent}"; then
+          continue
+        fi
         if bridge_daemon_start_agent_with_recovery "$agent" "always_on"; then
           session="$(bridge_agent_session "$agent")"
           bridge_daemon_clear_autostart_failure "$agent"
@@ -9370,6 +9438,15 @@ process_on_demand_agents() {
               --detail trigger=on_demand_wake 2>/dev/null || true
             continue
           fi
+        fi
+        # Incident #8807 P0a: resource-guard before the queued-on-demand
+        # auto-start spawn. Same contract as the always-on branch above:
+        # `continue` without recording an autostart failure; the queued work
+        # stays in the queue and the agent is re-evaluated next tick. The
+        # guard helper owns the audit + throttled warn. Fails OPEN.
+        if declare -F bridge_resource_guard_defer_or_proceed >/dev/null 2>&1 \
+            && bridge_resource_guard_defer_or_proceed "on-demand:${agent}"; then
+          continue
         fi
         if bridge_daemon_start_agent_with_recovery "$agent" "on_demand"; then
           session="$(bridge_agent_session "$agent")"

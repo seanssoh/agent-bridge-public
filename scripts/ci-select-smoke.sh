@@ -1072,8 +1072,26 @@ select_for_path() {
       # cannot regress back to the pre-#1353 4-burst noise surface
       # that masks real errors during fresh-install OOTB.
       add_required 1353-setup-pending-grace
+      # Incident #8807 P0a: bridge-daemon.sh now wires the resource-guard
+      # (lib/bridge-resource-guard.sh) at every disposable-child spawn site —
+      # start_cron_worker, the cron-dispatch claim/wake path
+      # (start_cron_dispatch_workers + bridge_daemon_cron_dispatch_wake),
+      # cmd_run_cron_worker's run-subagent fork, the supp-refresh worker, and
+      # the always-on / queued-on-demand auto-start. Pull
+      # 8807-resource-guard-defer on every bridge-daemon.sh move so a future
+      # PR cannot silently drop a guard site or regress the fail-OPEN / leave-
+      # queued / throttled-warn contract that prevents the fork-storm reboot.
+      add_required 8807-resource-guard-defer
       add_integration integration-minimal
       add_live live-tmux-daemon
+      ;;
+
+    lib/bridge-resource-guard.sh)
+      # Incident #8807 P0a: the resource-guard primitive + the daemon-side
+      # defer/audit/throttled-warn wrapper. Pull 8807-resource-guard-defer on
+      # every move of the guard lib so the proc-count/memory probe, the
+      # fail-OPEN contract, and the throttled-warn bookkeeping cannot regress.
+      add_required 8807-resource-guard-defer
       ;;
 
     lib/bridge-daemon-control.sh|scripts/install-daemon-systemd.sh|scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template)

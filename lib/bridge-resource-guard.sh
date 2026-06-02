@@ -143,3 +143,69 @@ bridge_resource_guard_should_defer() {
   fi
   return 1
 }
+
+# --- throttle state for the deferral warning ----------------------------------
+# A pressured host fans out many spawn attempts per daemon tick across several
+# sites. We must NOT emit a warn line (let alone a channel-bound one) per
+# attempt — that re-creates the very log/inbox flood this incident is about.
+# Throttle to one warn per BRIDGE_RESOURCE_GUARD_WARN_THROTTLE_SECONDS (default
+# 300s) across all sites, keyed off a single state file. The audit row is
+# always written (forensic trail, file-only, no channel side effect); only the
+# operator-visible warn is throttled.
+bridge_resource_guard_warn_throttle_path() {
+  local dir="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  printf '%s/resource-guard.warn.ts' "$dir"
+}
+
+# Returns 0 (emit) when the throttle window has elapsed (and records now),
+# 1 (suppress) when still within the window. Fails OPEN toward "emit" on any
+# state-file glitch — a throttle bookkeeping error must never silence a real
+# pressure warning, and an over-emit is harmless relative to under-emit.
+bridge_resource_guard_warn_should_emit() {
+  local now_ts last_ts window path tmp
+  window="${BRIDGE_RESOURCE_GUARD_WARN_THROTTLE_SECONDS:-300}"
+  [[ "$window" =~ ^[0-9]+$ ]] || window=300
+  now_ts="$(date +%s 2>/dev/null || printf '0')"
+  [[ "$now_ts" =~ ^[0-9]+$ ]] || return 0
+  path="$(bridge_resource_guard_warn_throttle_path)"
+  if [[ -f "$path" ]]; then
+    last_ts="$(<"$path")" 2>/dev/null || last_ts=0
+    [[ "$last_ts" =~ ^[0-9]+$ ]] || last_ts=0
+    (( now_ts - last_ts < window )) && return 1
+  fi
+  mkdir -p "$(dirname "$path")" 2>/dev/null || return 0
+  tmp="${path}.tmp.$$"
+  if printf '%s' "$now_ts" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# bridge_resource_guard_defer_or_proceed <ctx>
+#   The single call every daemon spawn site makes. On host pressure it:
+#     - writes a `resource_guard_deferred` audit row (file-only, always), and
+#     - emits ONE throttled `bridge_warn` line (no channel spam),
+#     then returns 0 so the caller skips the spawn and leaves work queued.
+#   On a healthy host / disabled guard / unknown platform / probe glitch it
+#   returns 1 (PROCEED) — fail OPEN, never wedge the daemon.
+# Side effects (audit + warn) are each `|| true`-guarded so a logging error
+# cannot leak a non-zero rc back into the daemon poll loop.
+bridge_resource_guard_defer_or_proceed() {
+  local ctx="${1:-dispatch}"
+  bridge_resource_guard_should_defer "$ctx" || return 1
+
+  local stats reason="resource_pressure"
+  stats="$(bridge_resource_guard_proc_stats 2>/dev/null || true)"
+  if declare -F bridge_audit_log >/dev/null 2>&1; then
+    bridge_audit_log daemon resource_guard_deferred daemon \
+      --detail context="$ctx" \
+      --detail proc_stats="${stats:-unknown}" \
+      --detail reason="$reason" >/dev/null 2>&1 || true
+  fi
+  if bridge_resource_guard_warn_should_emit; then
+    if declare -F bridge_warn >/dev/null 2>&1; then
+      bridge_warn "resource-guard: deferred spawn (${ctx}) — host near resource ceiling (${stats:-?}); leaving work queued" || true
+    fi
+  fi
+  return 0
+}
