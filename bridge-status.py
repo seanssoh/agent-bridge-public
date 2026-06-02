@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -25,6 +26,7 @@ PRIORITY_ORDER = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
 # at 3 days" rendering degrades to plain text).
 GARDEN_STALE_SECONDS = 86400        # 1 day — yellow tier; below this, render `-`
 GARDEN_CRITICAL_SECONDS = 86400 * 3  # 3 days — red tier (informational only)
+CRON_ACTIVITY_WINDOW_SECONDS = 36 * 3600
 
 
 def iso_now() -> str:
@@ -109,6 +111,168 @@ def classify_stale(
     if warn_seconds > 0 and age >= warn_seconds:
         return "warn"
     return "ok"
+
+
+def int_ts(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        ts = int(value)
+    except (TypeError, ValueError):
+        return None
+    return ts if ts > 0 else None
+
+
+def session_activity_ts(metric: dict[str, object]) -> int | None:
+    return int_ts(metric.get("session_activity_ts")) or int_ts(metric.get("last_seen_ts"))
+
+
+def effective_activity_ts(metric: dict[str, object]) -> int | None:
+    base = session_activity_ts(metric)
+    cron = int_ts(metric.get("last_cron_run_ts"))
+    if base and cron:
+        return max(base, cron)
+    return cron or base
+
+
+def classify_agent_stale(
+    active: bool,
+    metric: dict[str, object],
+    warn_seconds: int,
+    critical_seconds: int,
+    source: str | None = None,
+) -> str:
+    if not active:
+        return "-"
+    if source == "dynamic":
+        return "-"
+    if int_ts(metric.get("last_cron_run_ts")):
+        return "ok"
+    return classify_stale(
+        active,
+        session_activity_ts(metric),
+        warn_seconds,
+        critical_seconds,
+        source=source,
+    )
+
+
+def cron_run_timestamp_from_name(run_name: str) -> int | None:
+    if "--" not in run_name:
+        return None
+    stamp = run_name.rsplit("--", 1)[1]
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", stamp):
+            dt = datetime.strptime(stamp, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        match = re.fullmatch(
+            r"(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})(?:-(\d{2})-(\d{2}))?",
+            stamp,
+        )
+        if not match:
+            return None
+        year, month, day, hour, minute, offset_hour, offset_minute = match.groups()
+        tz = timezone.utc
+        if offset_hour is not None and offset_minute is not None:
+            # Run ids sanitize ISO offsets by replacing punctuation/signs with
+            # dashes, e.g. +09:00 -> -09-00. Current local/UTC run ids use
+            # non-negative suffixes, so treat the suffix as a positive offset.
+            tz = timezone(timedelta(hours=int(offset_hour), minutes=int(offset_minute)))
+        dt = datetime(
+            int(year),
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            tzinfo=tz,
+        )
+        return int(dt.timestamp())
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def cron_job_agent_keys(bridge_home: str) -> list[tuple[str, str]]:
+    if not bridge_home:
+        return []
+    jobs_path = Path(bridge_home) / "cron" / "jobs.json"
+    try:
+        payload = json.loads(jobs_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(payload, list):
+        jobs = payload
+    elif isinstance(payload, dict):
+        jobs = payload.get("jobs", payload.get("items", []))
+    else:
+        return []
+    keys: list[tuple[str, str]] = []
+    if not isinstance(jobs, list):
+        return keys
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        agent = str(job.get("agent") or job.get("agentId") or "").strip()
+        if not agent:
+            continue
+        for raw_key in (job.get("family"), job.get("name"), job.get("id")):
+            key = str(raw_key or "").strip()
+            if key:
+                keys.append((key, agent))
+    keys.sort(key=lambda item: len(item[0]), reverse=True)
+    return keys
+
+
+def agent_for_cron_run_prefix(prefix: str, keys: list[tuple[str, str]]) -> str | None:
+    for key, agent in keys:
+        if prefix == key or prefix.startswith(f"{key}-"):
+            return agent
+    return None
+
+
+def last_cron_run_by_agent(
+    bridge_home: str,
+    bridge_state_dir: str,
+    critical_seconds: int,
+) -> dict[str, int]:
+    runs_dir = (
+        Path(bridge_state_dir) / "cron" / "runs"
+        if bridge_state_dir
+        else Path(bridge_home) / "state" / "cron" / "runs"
+    )
+    keys = cron_job_agent_keys(bridge_home)
+    if not keys or not runs_dir.is_dir():
+        return {}
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    window_seconds = max(CRON_ACTIVITY_WINDOW_SECONDS, int(critical_seconds or 0))
+    cutoff = now_ts - window_seconds
+    out: dict[str, int] = {}
+    try:
+        entries = list(runs_dir.iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        ts = cron_run_timestamp_from_name(entry.name)
+        if ts is None or ts < cutoff or ts > now_ts + 300:
+            continue
+        if not entry.is_dir():
+            continue
+        prefix = entry.name.rsplit("--", 1)[0]
+        agent = agent_for_cron_run_prefix(prefix, keys)
+        if not agent:
+            continue
+        if ts > out.get(agent, 0):
+            out[agent] = ts
+    return out
+
+
+def add_cron_activity_to_metrics(
+    metrics: dict[str, dict[str, int | str | None]],
+    bridge_home: str,
+    bridge_state_dir: str,
+    critical_seconds: int,
+) -> None:
+    for agent, ts in last_cron_run_by_agent(bridge_home, bridge_state_dir, critical_seconds).items():
+        metrics.setdefault(agent, {})["last_cron_run_ts"] = ts
 
 
 def short_path(path: str) -> str:
@@ -825,6 +989,12 @@ def render_dashboard(args: argparse.Namespace) -> str:
             metrics = fetch_agent_metrics(conn)
             totals = fetch_totals(conn)
             open_tasks = fetch_open_tasks(conn, args.open_limit)
+    add_cron_activity_to_metrics(
+        metrics,
+        args.bridge_home or "",
+        args.bridge_state_dir,
+        args.stale_critical_seconds,
+    )
 
     full_total_agents = len(roster)
     full_active_count = sum(1 for row in roster if str(row.get("active", "0")) == "1")
@@ -853,10 +1023,9 @@ def render_dashboard(args: argparse.Namespace) -> str:
     for row in roster:
         metric = metrics.get(row["agent"], {})
         active = str(row.get("active", "0")) == "1"
-        activity_ts = metric.get("session_activity_ts") or metric.get("last_seen_ts")
-        stale = classify_stale(
+        stale = classify_agent_stale(
             active,
-            int(activity_ts) if activity_ts else None,
+            metric,
             args.stale_warn_seconds,
             args.stale_critical_seconds,
             source=str(row.get("source", "")) or None,
@@ -980,14 +1149,14 @@ def render_dashboard(args: argparse.Namespace) -> str:
             blocked,
             int(oldest_blocked_ts) if oldest_blocked_ts else None,
         )
-        activity_ts = metric.get("session_activity_ts") or metric.get("last_seen_ts")
+        activity_ts = session_activity_ts(metric)
         last_nudge_ts = metric.get("last_nudge_ts")
         zombie = int(metric.get("zombie", 0) or 0)
         activity_state = row.get("activity_state") or ("stopped" if not active else "working")
         channel_state = row.get("channels") or "-"
-        stale = classify_stale(
+        stale = classify_agent_stale(
             active,
-            int(activity_ts) if activity_ts else None,
+            metric,
             args.stale_warn_seconds,
             args.stale_critical_seconds,
             source=str(row.get("source", "")) or None,
@@ -1113,13 +1282,19 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
         with db_connect(str(queue_db)) as conn:
             metrics = fetch_agent_metrics(conn)
             totals = fetch_totals(conn)
+    add_cron_activity_to_metrics(
+        metrics,
+        args.bridge_home or "",
+        args.bridge_state_dir,
+        args.stale_critical_seconds,
+    )
 
     agents: dict[str, object] = {}
     for row in roster:
         agent = row["agent"]
         metric = metrics.get(agent, {})
         active = str(row.get("active", "0")) == "1"
-        activity_ts = metric.get("session_activity_ts") or metric.get("last_seen_ts")
+        activity_ts = effective_activity_ts(metric)
         agents[agent] = {
             "agent": agent,
             "engine": row.get("engine") or "",
@@ -1142,9 +1317,11 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
                 "last_seen_ts": metric.get("last_seen_ts"),
                 "last_heartbeat_ts": metric.get("last_heartbeat_ts"),
                 "session_activity_ts": metric.get("session_activity_ts"),
-                "stale": classify_stale(
+                "last_cron_run_ts": metric.get("last_cron_run_ts"),
+                "effective_activity_ts": activity_ts,
+                "stale": classify_agent_stale(
                     active,
-                    int(activity_ts) if activity_ts else None,
+                    metric,
                     args.stale_warn_seconds,
                     args.stale_critical_seconds,
                     source=str(row.get("source", "")) or None,
