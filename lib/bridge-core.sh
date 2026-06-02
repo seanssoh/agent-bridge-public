@@ -498,10 +498,10 @@ bridge_require_python() {
 
 bridge_now_iso() {
   bridge_require_python
-  python3 - <<'PY'
-from datetime import datetime, timezone
-print(datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"))
-PY
+  # #1466: python3 -c one-liner (was an interpreter heredoc-stdin form) —
+  # avoids the Bash 5.3.9 read_comsub/heredoc_write deadlock class (footgun #11).
+  python3 -c 'from datetime import datetime, timezone
+print(datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"))'
 }
 
 bridge_runtime_id() {
@@ -564,11 +564,9 @@ bridge_queue_gateway_runtime_ensure() {
 
 bridge_nonce() {
   bridge_require_python
-  python3 - <<'PY'
-import secrets
-
-print(secrets.token_hex(8))
-PY
+  # #1466: python3 -c one-liner (was an interpreter heredoc-stdin form) — footgun #11.
+  python3 -c 'import secrets
+print(secrets.token_hex(8))'
 }
 
 bridge_queue_gateway_root() {

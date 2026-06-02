@@ -705,6 +705,12 @@ DAILY_BACKUP_PATH_PART_EXCLUDES: tuple[str, ...] = (
     "__pycache__",
     "node_modules",
     "plugins/cache",
+    # Issue #1462: regenerable per-agent trees that otherwise blow the walk
+    # timeout on multi-agent installs (same any-depth mechanism as #974).
+    # The agent-sdk venv is rebuilt on demand; the claude CLI versions cache
+    # is re-downloaded — neither is restore-critical.
+    ".claude/security/agent-sdk-venv",
+    ".local/share/claude/versions",
 )
 
 # Raw sqlite databases that must never enter the tarball — they're handled
