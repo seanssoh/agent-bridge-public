@@ -341,7 +341,16 @@ run_create() {
   if _bridge_cron_create_iso_identity_active; then
     local effective_agent="${opt_agent:-${BRIDGE_AGENT_ID:-}}"
     if [[ -n "$effective_agent" && "$effective_agent" != "${BRIDGE_AGENT_ID:-}" ]]; then
-      bridge_die "cron mutation refused: requested agent ${effective_agent} does not match BRIDGE_AGENT_ID ${BRIDGE_AGENT_ID:-<unset>} (iso agents may only mutate own cron)"
+      # Issue #1474: the registered admin agent may provision text crons
+      # for OTHER agents (bootstrap-memory-system.sh). Let that cross-
+      # agent request PROCEED to the #1359 staging path instead of dying
+      # here; the daemon (staging.py cmd_apply) is the real authorization
+      # gate and re-validates with non-forgeable filesystem signals. Every
+      # other iso-identity cross-agent request (including shell-kind, and
+      # any regular iso agent) still hits the hard reject below.
+      if ! _bridge_cron_create_admin_cross_agent_allowed "$kind" "$effective_agent"; then
+        bridge_die "cron mutation refused: requested agent ${effective_agent} does not match BRIDGE_AGENT_ID ${BRIDGE_AGENT_ID:-<unset>} (iso agents may only mutate own cron)"
+      fi
     fi
   fi
 
@@ -388,6 +397,61 @@ _bridge_cron_create_iso_identity_active() {
     return 1
   fi
   bridge_isolation_v2_active || return 1
+  return 0
+}
+
+# Issue #1474 — admin cross-agent cron provisioning exemption (CLI leg).
+#
+# Background: `bootstrap-memory-system.sh`, run from the admin agent's
+# session (which legitimately carries BRIDGE_AGENT_ID=<admin>), registers
+# `memory-daily-<peer>` text crons for OTHER agents. The #1359 cross-agent
+# reject above fires on it because it cannot tell the operator-trusted
+# admin from a regular iso agent forging `--agent <peer>`.
+#
+# This predicate is ONLY a friendly early-pass on the CLI side: it lets a
+# cross-agent `--kind text` create from the admin agent PROCEED to the
+# #1359 staging path instead of `bridge_die`-ing here. It is NOT the
+# security gate — the security gate is the daemon (`staging.py cmd_apply`),
+# which runs as the controller and re-validates the request with the
+# non-forgeable filesystem signals (file-owner UID == the actor's iso UID
+# resolved from controller-owned `agent-meta.env`, dirname match, and the
+# registered-admin check resolved from the daemon's own controller env).
+#
+# WHY the CLI side cannot be trusted alone: every signal available here
+# (BRIDGE_AGENT_ID, BRIDGE_ADMIN_AGENT_ID, BRIDGE_CALLER_SOURCE,
+# BRIDGE_CONTROLLER_UID) is forgeable by an iso agent in its own shell.
+# A regular iso agent CAN make this predicate return 0 by exporting
+# BRIDGE_AGENT_ID=<admin> — but doing so cannot win: the staging file it
+# drops is owned by its OWN iso UID and lands in its OWN per-agent staging
+# subdir (matrix-enforced), so the daemon's owner-UID + dirname checks
+# reject it. The CLI exemption only widens the set of requests that REACH
+# the daemon; it never decides cross-agent authorization.
+#
+# Scope: text-kind only. Shell-kind cross-agent staging stays out of
+# scope (the runner needs controller-side script ownership the staging
+# path cannot prove from a forged payload — same boundary #1359 kept).
+_bridge_cron_create_admin_cross_agent_allowed() {
+  local kind="${1:-text}"
+  local effective_agent="${2:-}"
+  local agent_id="${BRIDGE_AGENT_ID:-}"
+
+  # Only text-kind cross-agent is exempt; shell-kind keeps the hard reject.
+  [[ "$kind" == "text" ]] || return 1
+  # Caller must have an iso identity (the admin agent session does).
+  [[ -n "$agent_id" ]] || return 1
+  # Only a genuine cross-agent request needs the exemption.
+  [[ -n "$effective_agent" && "$effective_agent" != "$agent_id" ]] || return 1
+  # The caller's declared identity must be the registered admin agent.
+  # This is a forgeable env check on the CLI side BY DESIGN — see the
+  # function comment: the daemon re-derives the admin id from its own
+  # controller env and re-validates the actor's real iso UID, so a forged
+  # BRIDGE_AGENT_ID=<admin> cannot reach cross-agent application.
+  if ! declare -F bridge_admin_agent_id >/dev/null 2>&1; then
+    return 1
+  fi
+  local admin_agent=""
+  admin_agent="$(bridge_admin_agent_id 2>/dev/null || printf '')"
+  [[ -n "$admin_agent" && "$agent_id" == "$admin_agent" ]] || return 1
   return 0
 }
 
@@ -480,6 +544,14 @@ _bridge_cron_create_should_stage() {
   # are running with an iso-agent identity and the requested agent
   # does not match, refuse rather than letting the caller fall
   # through to a direct write.
+  #
+  # Issue #1474: this shim deliberately does NOT carry the admin cross-
+  # agent exemption that the live `run_create` guard does. The shim has
+  # no `kind` argument, so it cannot distinguish a text-kind admin
+  # provisioning request (exempt) from a shell-kind one (always blocked).
+  # Fail closed: any out-of-tree caller routing through this back-compat
+  # shim gets the hard reject. The supported admin cross-agent path goes
+  # through `run_create` → `_bridge_cron_create_via_staging`, never here.
   if _bridge_cron_create_iso_identity_active; then
     if [[ -n "$requested_agent" && "$requested_agent" != "$agent_id" ]]; then
       bridge_die "cron mutation refused: requested agent ${requested_agent} does not match BRIDGE_AGENT_ID ${agent_id:-<unset>} (iso agents may only mutate own cron)"

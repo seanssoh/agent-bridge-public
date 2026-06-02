@@ -42,6 +42,40 @@
 #        forced unwritable but no staging helper available), the iso-
 #        UID create fails — proves the staging path is what closes the
 #        PermissionError.
+#
+#   Issue #1474 — admin cross-agent cron provisioning exemption. The
+#   #1359 boundary blocks ALL cross-agent cron mutation; #1474 carves
+#   out the genuine controller/admin (bootstrap-memory-system.sh) while
+#   keeping every regular iso agent — and every env-forging attacker —
+#   blocked. The exemption is gated on the daemon's controller-resolved
+#   admin id (AGB_CRON_STAGING_ADMIN_AGENT, never the payload) PLUS the
+#   non-forgeable file-owner-UID + dirname checks already in #1359.
+#   T7 — POSITIVE: admin (=AGB_CRON_STAGING_ADMIN_AGENT) stages a
+#        cross-agent text cron → daemon applies it FOR THE TARGET agent.
+#   T7b — bridge-cron.sh entry path: admin BRIDGE_AGENT_ID + cross-agent
+#        --kind text must NOT 'cron mutation refused' (proceeds to
+#        staging); a NON-admin id + the SAME command still refuses.
+#   T8 — SECURITY (env-forgery still refused): a regular iso agent that
+#        forges actor_agent=<admin> inside its OWN staging subdir is
+#        rejected at the dirname gate — the admin name in the payload
+#        cannot move the file out of the attacker's own subdir.
+#   T8b — SECURITY (file-owner backstop): even granting a payload that
+#        claims actor_agent=<admin> with a matching dirname, a file
+#        owned by the WRONG UID (not the admin's iso UID) is rejected
+#        at file_owner_uid_mismatch — the kernel UID is the proof.
+#   T8c — SECURITY (admin-unset): with AGB_CRON_STAGING_ADMIN_AGENT
+#        unset/empty the exemption is fully disabled — even a real
+#        admin-named cross-agent request falls back to the strict
+#        same-agent-only reject. No env in the apply process other than
+#        the daemon-supplied admin id can open the cross-agent path.
+#   T8d — SECURITY (shell-kind stays blocked): an admin cross-agent
+#        request with --kind shell must STILL be refused at the CLI
+#        guard — shell staging is out of scope, #1474 only widens text.
+#   T8e — SECURITY (target abuse): even the genuine admin may not
+#        provision a cron for an UNREGISTERED target. The daemon-supplied
+#        roster allowlist (AGB_CRON_STAGING_TARGET_ALLOWLIST) confines
+#        the exemption to real cron-delivery agents; a ghost target is
+#        rejected with admin_cross_agent_unregistered_target.
 
 set -euo pipefail
 
@@ -843,5 +877,358 @@ chmod 0700 "$T6_DIR"
 T6_ERR="$(cat "$T6_ERR_FILE" 2>/dev/null || true)"
 smoke_assert_contains "$T6_ERR" "Permission" "T6: native-create must surface PermissionError-class failure"
 smoke_log "ok: T6 — bypass path fails (rc=$T6_RC), proving staging is what closes the gap"
+
+# ===========================================================================
+# Issue #1474 — admin cross-agent cron provisioning exemption.
+# ===========================================================================
+# We reuse ISO_AGENT (meta.env → CURRENT_USER, so its "iso UID" resolves
+# to our own UID and apply proceeds) as the stand-in ADMIN, and PEER_AGENT
+# as the cross-agent target. The exemption is authorized ONLY when the
+# daemon-supplied AGB_CRON_STAGING_ADMIN_AGENT equals the request's
+# (path-derived) actor_agent. The payload never names the admin.
+ADMIN_AGENT="$ISO_AGENT"
+# Restore the canonical (CURRENT_USER) meta.env in case T4 left it flipped
+# for a skipped path — defensive; T4 already restores on its taken branch.
+cat >"$META_DIR/agent-meta.env" <<EOF
+BRIDGE_AGENT_OS_USER=$CURRENT_USER
+BRIDGE_AGENT_ISOLATION_MODE=linux-user
+BRIDGE_AGENT_ENGINE=claude
+BRIDGE_AGENT_HOME=$BRIDGE_HOME
+EOF
+
+# Helper to build a staging payload (actor, target).
+mk_1474_payload() {
+  local actor="$1" target="$2"
+  "$PY_BIN" - "$actor" "$target" "$CURRENT_UID" <<'PY'
+import json
+import sys
+
+actor, target, uid = sys.argv[1], sys.argv[2], int(sys.argv[3])
+print(json.dumps({
+    "schema_version": 1,
+    "action": "create",
+    "actor_agent": actor,
+    "actor_uid": uid,
+    "agent": target,
+    "schedule": "0 3 * * *",
+    "at": None,
+    "tz": "Asia/Seoul",
+    "title": f"memory-daily-{target}",
+    "payload": "Run the daily memory harvest.",
+    "payload_file": None,
+    "kind": "text",
+    "disabled": False,
+    "delete_after_run": False,
+}))
+PY
+}
+
+# ---------------------------------------------------------------------------
+# T7 — POSITIVE: genuine admin cross-agent text cron → daemon applies it
+# FOR THE TARGET agent.
+# ---------------------------------------------------------------------------
+smoke_log "T7: admin cross-agent staging request → daemon applies cron FOR THE TARGET"
+
+T7_BEFORE_JOBS="$(jobs_count)"
+T7_UUID="$(staging_py write-request "$STAGING_ROOT" "$ADMIN_AGENT" "$(mk_1474_payload "$ADMIN_AGENT" "$PEER_AGENT")")"
+T7_UUID="${T7_UUID%%$'\n'*}"
+[[ -n "$T7_UUID" ]] || smoke_fail "T7: write-request returned empty uuid"
+
+# Apply WITH the daemon-supplied admin id + registered-target allowlist
+# (mirrors bridge-daemon.sh r1474 passing BRIDGE_ADMIN_AGENT_ID + the
+# roster-derived cron-delivery-target set). The third arg is the
+# canonical actor (path dirname) the daemon recovers — here ADMIN_AGENT.
+T7_ALLOWLIST="$PEER_AGENT"$'\n'"$ADMIN_AGENT"
+set +e
+AGB_CRON_STAGING_ADMIN_AGENT="$ADMIN_AGENT" \
+AGB_CRON_STAGING_TARGET_ALLOWLIST="$T7_ALLOWLIST" \
+  staging_py apply "$STAGING_ROOT" "$ADMIN_AGENT" "$T7_UUID" "$JOBS_FILE" >/dev/null 2>&1
+T7_RC=$?
+set -e
+[[ "$T7_RC" -eq 0 ]] || smoke_fail "T7: admin cross-agent apply must succeed (rc=$T7_RC)"
+T7_RESULT="$ISO_STAGING_DIR/$T7_UUID.result.json"
+[[ -f "$T7_RESULT" ]] || smoke_fail "T7: result.json missing: $T7_RESULT"
+T7_STATUS="$(result_field "$T7_RESULT" status)"
+T7_AUDIT="$(result_field "$T7_RESULT" audit_action)"
+T7_CRON_ID="$(result_field "$T7_RESULT" cron_id)"
+smoke_assert_eq "ok" "$T7_STATUS" "T7: result status must be ok"
+smoke_assert_eq "cron_staging_applied" "$T7_AUDIT" "T7: audit_action must be cron_staging_applied"
+[[ -n "$T7_CRON_ID" ]] || smoke_fail "T7: result missing cron_id"
+T7_AFTER_JOBS="$(jobs_count)"
+[[ "$T7_AFTER_JOBS" -eq $(( T7_BEFORE_JOBS + 1 )) ]] || \
+  smoke_fail "T7: exactly one job must be added (before=$T7_BEFORE_JOBS after=$T7_AFTER_JOBS)"
+# The created cron MUST belong to the TARGET, not the admin actor.
+# Footgun #11: use `python3 -c <script> argv...` (NOT a heredoc-in-
+# command-substitution) so this assertion does not add a new C1 site to
+# .lint-heredoc-baseline.tsv.
+T7_OWNER_PROBE='import json,sys
+jobs=json.load(open(sys.argv[1]))["jobs"]
+target,cron_id=sys.argv[2],sys.argv[3]
+hit=next((j for j in jobs if j.get("id")==cron_id or j.get("name")==cron_id),None)
+print("missing" if hit is None else ("yes" if hit.get("agent")==target else "no:"+str(hit.get("agent"))))'
+T7_TARGET_OWNED="$("$PY_BIN" -c "$T7_OWNER_PROBE" "$JOBS_FILE" "$PEER_AGENT" "$T7_CRON_ID")"
+smoke_assert_eq "yes" "$T7_TARGET_OWNED" "T7: created cron must be owned by the TARGET agent ($PEER_AGENT), not the admin"
+smoke_log "ok: T7 — admin cross-agent provision applied for target (cron_id=$T7_CRON_ID)"
+
+# ---------------------------------------------------------------------------
+# T7b — bridge-cron.sh entry path: admin BRIDGE_AGENT_ID + cross-agent
+# --kind text must NOT be rejected at the CLI guard (proceeds to staging);
+# a NON-admin id running the same command IS rejected.
+# ---------------------------------------------------------------------------
+smoke_log "T7b: bridge-cron.sh admin cross-agent text → proceeds to staging (NOT refused); non-admin → refused"
+
+T7B_HOME="$BRIDGE_HOME/t7b"
+T7B_JOBS_DIR="$T7B_HOME/cron"
+T7B_JOBS_FILE="$T7B_JOBS_DIR/jobs.json"
+mkdir -p "$T7B_JOBS_DIR"
+printf '{"format":"agent-bridge-cron-v1","jobs":[]}\n' >"$T7B_JOBS_FILE"
+# Non-writable so the iso-context branch routes through staging.
+chmod 0400 "$T7B_JOBS_FILE"
+[[ ! -w "$T7B_JOBS_FILE" ]] || smoke_fail "T7b: setup error — jobs.json must be non-writable"
+
+# Admin case: BRIDGE_AGENT_ID == BRIDGE_ADMIN_AGENT_ID == ADMIN_AGENT.
+# Staging will queue then time out fast (no daemon in this smoke), but the
+# crucial assertion is that we did NOT hit 'cron mutation refused'.
+T7B_STDERR="$SMOKE_TMP_ROOT/t7b-admin-stderr.log"
+T7B_RC=0
+set +e
+BRIDGE_LAYOUT=v2 \
+BRIDGE_DATA_ROOT="$BRIDGE_HOME" \
+BRIDGE_AGENT_ID="$ADMIN_AGENT" \
+BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
+BRIDGE_NATIVE_CRON_JOBS_FILE="$T7B_JOBS_FILE" \
+BRIDGE_CRON_STAGING_DIR="$STAGING_ROOT" \
+BRIDGE_CRON_STAGING_TIMEOUT_SECONDS=2 \
+BRIDGE_CRON_STAGING_POLL_INTERVAL_SECONDS=1 \
+bash "$REPO_ROOT/bridge-cron.sh" create \
+  --agent "$PEER_AGENT" \
+  --schedule "0 3 * * *" \
+  --tz "Asia/Seoul" \
+  --title "memory-daily-$PEER_AGENT" \
+  --payload "admin cross-agent provision" >/dev/null 2>"$T7B_STDERR"
+T7B_RC=$?
+set -e
+T7B_ERR="$(cat "$T7B_STDERR" 2>/dev/null || true)"
+smoke_assert_not_contains "$T7B_ERR" "cron mutation refused" \
+  "T7b: admin cross-agent text must NOT be refused at the CLI guard"
+smoke_assert_contains "$T7B_ERR" "cron-staging" \
+  "T7b: admin cross-agent text must route through the staging path"
+
+# Non-admin case: SAME command, BRIDGE_AGENT_ID != admin → must refuse.
+T7B_NA_STDERR="$SMOKE_TMP_ROOT/t7b-nonadmin-stderr.log"
+T7B_NA_RC=0
+set +e
+BRIDGE_LAYOUT=v2 \
+BRIDGE_DATA_ROOT="$BRIDGE_HOME" \
+BRIDGE_AGENT_ID="$PEER_AGENT" \
+BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
+BRIDGE_NATIVE_CRON_JOBS_FILE="$T7B_JOBS_FILE" \
+BRIDGE_CRON_STAGING_DIR="$STAGING_ROOT" \
+bash "$REPO_ROOT/bridge-cron.sh" create \
+  --agent "$ISO_AGENT" \
+  --schedule "0 3 * * *" \
+  --tz "Asia/Seoul" \
+  --title "memory-daily-$ISO_AGENT" \
+  --payload "non-admin cross-agent attempt" >/dev/null 2>"$T7B_NA_STDERR"
+T7B_NA_RC=$?
+set -e
+chmod 0600 "$T7B_JOBS_FILE"
+[[ "$T7B_NA_RC" -ne 0 ]] || smoke_fail "T7b: non-admin cross-agent MUST exit non-zero"
+T7B_NA_ERR="$(cat "$T7B_NA_STDERR" 2>/dev/null || true)"
+smoke_assert_contains "$T7B_NA_ERR" "cron mutation refused" \
+  "T7b: non-admin cross-agent must be refused even when an admin is configured"
+smoke_log "ok: T7b — CLI guard exempts admin text, still refuses non-admin"
+
+# ---------------------------------------------------------------------------
+# T8 — SECURITY: env-forgery still refused. A regular iso agent forging
+# actor_agent=<admin> inside its OWN staging subdir is rejected at the
+# dirname gate. This is the heart of the non-forgeability guarantee.
+# ---------------------------------------------------------------------------
+smoke_log "T8: iso agent forges actor_agent=<admin> in its OWN subdir → rejected (dirname gate)"
+
+# PEER_AGENT (the attacker) drops a request into its OWN subdir but lies
+# in the payload claiming to be the admin (ADMIN_AGENT) and targeting a
+# third agent. Even with AGB_CRON_STAGING_ADMIN_AGENT=<admin> set, the
+# daemon recovers the canonical actor from the dirname (PEER_AGENT) and
+# rejects the payload's admin claim.
+T8_BEFORE_JOBS="$(jobs_count)"
+T8_UUID="$(staging_py write-request "$STAGING_ROOT" "$PEER_AGENT" "$(mk_1474_payload "$ADMIN_AGENT" "victim-agent")")"
+T8_UUID="${T8_UUID%%$'\n'*}"
+set +e
+AGB_CRON_STAGING_ADMIN_AGENT="$ADMIN_AGENT" \
+  staging_py apply "$STAGING_ROOT" "$PEER_AGENT" "$T8_UUID" "$JOBS_FILE" >/dev/null 2>&1
+T8_RC=$?
+set -e
+[[ "$T8_RC" -ne 0 ]] || smoke_fail "T8: forged-admin cross-agent apply MUST fail"
+T8_RESULT="$PEER_STAGING_DIR/$T8_UUID.result.json"
+T8_AUDIT="$(result_field "$T8_RESULT" audit_action)"
+T8_ERROR="$(result_field "$T8_RESULT" error)"
+smoke_assert_eq "cron_staging_rejected" "$T8_AUDIT" "T8: audit_action must be rejected"
+smoke_assert_contains "$T8_ERROR" "payload_actor_agent_mismatch" \
+  "T8: forged admin-in-payload must be caught at the dirname gate"
+T8_AFTER_JOBS="$(jobs_count)"
+[[ "$T8_AFTER_JOBS" -eq "$T8_BEFORE_JOBS" ]] || smoke_fail "T8: jobs.json must NOT change"
+smoke_log "ok: T8 — payload admin-forgery rejected at dirname gate (error=$T8_ERROR)"
+
+# ---------------------------------------------------------------------------
+# T8b — SECURITY: file-owner backstop. Even when the payload claims
+# actor_agent=<admin> AND the dirname matches <admin>, a staging file
+# whose OWNER UID is not the admin's iso UID is rejected. The kernel UID
+# is the non-forgeable proof — an attacker cannot make the OS report its
+# file as owned by the admin's UID. We simulate by pointing the admin's
+# agent-meta.env at a DIFFERENT OS user than the smoke's own UID (which
+# owns the file), so file_owner_uid != resolved-admin-iso-uid.
+# ---------------------------------------------------------------------------
+smoke_log "T8b: admin-named request whose file is owned by the WRONG UID → file_owner_uid_mismatch"
+
+# Find a real second user (as T4 does) to stand in as the "admin's iso UID".
+T8B_OTHER_USER=""
+T8B_OTHER_UID=""
+while IFS=: read -r u _ id_ _; do
+  if [[ "$u" != "$CURRENT_USER" && -n "$id_" && "$id_" =~ ^[0-9]+$ && "$id_" != "$CURRENT_UID" ]]; then
+    T8B_OTHER_USER="$u"
+    T8B_OTHER_UID="$id_"
+    break
+  fi
+done </etc/passwd
+
+if [[ -z "$T8B_OTHER_USER" || -z "$T8B_OTHER_UID" ]]; then
+  smoke_log "T8b: skip — no second resolvable user on /etc/passwd to stand in as the admin iso UID"
+else
+  # Flip ADMIN_AGENT's meta.env to the other user → its resolved iso UID
+  # is T8B_OTHER_UID, but the file the smoke writes is owned by CURRENT_UID.
+  cat >"$META_DIR/agent-meta.env" <<EOF
+BRIDGE_AGENT_OS_USER=$T8B_OTHER_USER
+BRIDGE_AGENT_ISOLATION_MODE=linux-user
+BRIDGE_AGENT_ENGINE=claude
+BRIDGE_AGENT_HOME=$BRIDGE_HOME
+EOF
+  T8B_BEFORE_JOBS="$(jobs_count)"
+  T8B_UUID="$(staging_py write-request "$STAGING_ROOT" "$ADMIN_AGENT" "$(mk_1474_payload "$ADMIN_AGENT" "$PEER_AGENT")")"
+  T8B_UUID="${T8B_UUID%%$'\n'*}"
+  set +e
+  AGB_CRON_STAGING_ADMIN_AGENT="$ADMIN_AGENT" \
+    staging_py apply "$STAGING_ROOT" "$ADMIN_AGENT" "$T8B_UUID" "$JOBS_FILE" >/dev/null 2>&1
+  T8B_RC=$?
+  set -e
+  [[ "$T8B_RC" -ne 0 ]] || smoke_fail "T8b: wrong-owner admin request MUST fail"
+  T8B_RESULT="$ISO_STAGING_DIR/$T8B_UUID.result.json"
+  T8B_AUDIT="$(result_field "$T8B_RESULT" audit_action)"
+  T8B_ERROR="$(result_field "$T8B_RESULT" error)"
+  smoke_assert_eq "cron_staging_rejected" "$T8B_AUDIT" "T8b: audit_action must be rejected"
+  smoke_assert_contains "$T8B_ERROR" "file_owner_uid_mismatch" \
+    "T8b: wrong-owner admin request must be caught by the kernel-UID backstop"
+  T8B_AFTER_JOBS="$(jobs_count)"
+  [[ "$T8B_AFTER_JOBS" -eq "$T8B_BEFORE_JOBS" ]] || smoke_fail "T8b: jobs.json must NOT change"
+  smoke_log "ok: T8b — file-owner backstop holds even for an admin-named request (error=$T8B_ERROR)"
+  # Restore canonical meta.env for the remaining case.
+  cat >"$META_DIR/agent-meta.env" <<EOF
+BRIDGE_AGENT_OS_USER=$CURRENT_USER
+BRIDGE_AGENT_ISOLATION_MODE=linux-user
+BRIDGE_AGENT_ENGINE=claude
+BRIDGE_AGENT_HOME=$BRIDGE_HOME
+EOF
+fi
+
+# ---------------------------------------------------------------------------
+# T8c — SECURITY: with the daemon-supplied admin id unset/empty, the
+# exemption is fully disabled — even a real admin-named cross-agent
+# request falls back to the strict same-agent-only reject. Proves no
+# other env in the apply process can open the cross-agent path.
+# ---------------------------------------------------------------------------
+smoke_log "T8c: AGB_CRON_STAGING_ADMIN_AGENT unset → admin exemption disabled (strict reject)"
+
+T8C_BEFORE_JOBS="$(jobs_count)"
+T8C_UUID="$(staging_py write-request "$STAGING_ROOT" "$ADMIN_AGENT" "$(mk_1474_payload "$ADMIN_AGENT" "$PEER_AGENT")")"
+T8C_UUID="${T8C_UUID%%$'\n'*}"
+set +e
+# Explicitly empty admin id (and ensure no inherited value leaks in).
+env -u AGB_CRON_STAGING_ADMIN_AGENT \
+  "$PY_BIN" "$REPO_ROOT/lib/cron-helpers/staging.py" \
+  apply "$STAGING_ROOT" "$ADMIN_AGENT" "$T8C_UUID" "$JOBS_FILE" >/dev/null 2>&1
+T8C_RC=$?
+set -e
+[[ "$T8C_RC" -ne 0 ]] || smoke_fail "T8c: with no admin configured, cross-agent apply MUST fail"
+T8C_RESULT="$ISO_STAGING_DIR/$T8C_UUID.result.json"
+T8C_AUDIT="$(result_field "$T8C_RESULT" audit_action)"
+T8C_ERROR="$(result_field "$T8C_RESULT" error)"
+smoke_assert_eq "cron_staging_rejected" "$T8C_AUDIT" "T8c: audit_action must be rejected"
+smoke_assert_contains "$T8C_ERROR" "actor_agent_mismatch" \
+  "T8c: admin-unset must fall back to the strict same-agent reject"
+T8C_AFTER_JOBS="$(jobs_count)"
+[[ "$T8C_AFTER_JOBS" -eq "$T8C_BEFORE_JOBS" ]] || smoke_fail "T8c: jobs.json must NOT change"
+smoke_log "ok: T8c — exemption disabled when no admin id is supplied (error=$T8C_ERROR)"
+
+# ---------------------------------------------------------------------------
+# T8d — SECURITY: shell-kind admin cross-agent stays blocked at the CLI
+# guard. #1474 only widens TEXT cross-agent; shell staging is out of
+# scope (the runner needs controller-side script ownership the staging
+# path cannot prove from a forged payload).
+# ---------------------------------------------------------------------------
+smoke_log "T8d: admin cross-agent --kind shell → STILL refused at the CLI guard"
+
+T8D_HOME="$BRIDGE_HOME/t8d"
+T8D_JOBS_DIR="$T8D_HOME/cron"
+T8D_JOBS_FILE="$T8D_JOBS_DIR/jobs.json"
+mkdir -p "$T8D_JOBS_DIR"
+printf '{"format":"agent-bridge-cron-v1","jobs":[]}\n' >"$T8D_JOBS_FILE"
+chmod 0600 "$T8D_JOBS_FILE"
+T8D_HASH_BEFORE="$("$PY_BIN" -c "import hashlib,sys;print(hashlib.sha1(open(sys.argv[1],'rb').read()).hexdigest())" "$T8D_JOBS_FILE")"
+T8D_STDERR="$SMOKE_TMP_ROOT/t8d-stderr.log"
+T8D_RC=0
+set +e
+BRIDGE_LAYOUT=v2 \
+BRIDGE_DATA_ROOT="$BRIDGE_HOME" \
+BRIDGE_AGENT_ID="$ADMIN_AGENT" \
+BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
+BRIDGE_NATIVE_CRON_JOBS_FILE="$T8D_JOBS_FILE" \
+bash "$REPO_ROOT/bridge-cron.sh" create \
+  --kind shell \
+  --agent "$PEER_AGENT" \
+  --schedule "0 3 * * *" \
+  --tz "Asia/Seoul" \
+  --title "$PEER_AGENT-admin-shell-attempt" \
+  --payload "echo should be refused" >/dev/null 2>"$T8D_STDERR"
+T8D_RC=$?
+set -e
+[[ "$T8D_RC" -ne 0 ]] || smoke_fail "T8d: admin cross-agent --kind shell MUST exit non-zero"
+T8D_ERR="$(cat "$T8D_STDERR" 2>/dev/null || true)"
+smoke_assert_contains "$T8D_ERR" "cron mutation refused" \
+  "T8d: admin shell-kind cross-agent must still be refused (text-only exemption)"
+T8D_HASH_AFTER="$("$PY_BIN" -c "import hashlib,sys;print(hashlib.sha1(open(sys.argv[1],'rb').read()).hexdigest())" "$T8D_JOBS_FILE")"
+smoke_assert_eq "$T8D_HASH_BEFORE" "$T8D_HASH_AFTER" "T8d: jobs.json must be unchanged"
+smoke_log "ok: T8d — shell-kind admin cross-agent still refused (rc=$T8D_RC)"
+
+# ---------------------------------------------------------------------------
+# T8e — SECURITY (target abuse, codex r1 BLOCKING): even the genuine admin
+# may not provision a cron for an UNREGISTERED target. The daemon supplies
+# the roster-derived cron-delivery-target allowlist; a target that is
+# syntactically valid but NOT in the allowlist is rejected. This confines
+# the exemption to real agents and prevents ghost-cron creation.
+# ---------------------------------------------------------------------------
+smoke_log "T8e: admin cross-agent to an UNREGISTERED target → rejected (allowlist gate)"
+
+T8E_GHOST="ghost-unregistered-agent"
+T8E_BEFORE_JOBS="$(jobs_count)"
+T8E_UUID="$(staging_py write-request "$STAGING_ROOT" "$ADMIN_AGENT" "$(mk_1474_payload "$ADMIN_AGENT" "$T8E_GHOST")")"
+T8E_UUID="${T8E_UUID%%$'\n'*}"
+set +e
+# Admin id supplied AND the file owner check would pass (ADMIN_AGENT meta
+# → CURRENT_USER), but the allowlist deliberately EXCLUDES the ghost target.
+AGB_CRON_STAGING_ADMIN_AGENT="$ADMIN_AGENT" \
+AGB_CRON_STAGING_TARGET_ALLOWLIST="$PEER_AGENT"$'\n'"$ADMIN_AGENT" \
+  staging_py apply "$STAGING_ROOT" "$ADMIN_AGENT" "$T8E_UUID" "$JOBS_FILE" >/dev/null 2>&1
+T8E_RC=$?
+set -e
+[[ "$T8E_RC" -ne 0 ]] || smoke_fail "T8e: admin cross-agent to a ghost target MUST fail"
+T8E_RESULT="$ISO_STAGING_DIR/$T8E_UUID.result.json"
+T8E_AUDIT="$(result_field "$T8E_RESULT" audit_action)"
+T8E_ERROR="$(result_field "$T8E_RESULT" error)"
+smoke_assert_eq "cron_staging_rejected" "$T8E_AUDIT" "T8e: audit_action must be rejected"
+smoke_assert_contains "$T8E_ERROR" "admin_cross_agent_unregistered_target" \
+  "T8e: ghost target must be caught by the registered-target allowlist"
+T8E_AFTER_JOBS="$(jobs_count)"
+[[ "$T8E_AFTER_JOBS" -eq "$T8E_BEFORE_JOBS" ]] || smoke_fail "T8e: jobs.json must NOT change"
+smoke_log "ok: T8e — unregistered admin cross-agent target rejected (error=$T8E_ERROR)"
 
 smoke_log "all 1359-cron-create-iso-staging cases passed"
