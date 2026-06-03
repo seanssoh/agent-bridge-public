@@ -160,6 +160,16 @@ add_required codex-slash-commands codex-permission-profiles
 # lib/bridge-agents.sh, bridge-init-codex-pair.sh, and bridge-init.sh
 # selectors below also reach it transitively via the static catch-all).
 add_required 1492-admin-dev-pair-workspace-v2
+# A2A rooms P1a: the single-node rooms control plane + the FROZEN schema /
+# envelope / receiver-seam contract (bridge_rooms_common.py, bridge-rooms.py,
+# the room_scoped_check seam in bridge-handoffd.py, the optional room_id/
+# room_epoch envelope fields in bridge_a2a_common.py). In the full static
+# suite so a scripts/smoke/*, bridge_rooms_common.py, bridge-rooms.py,
+# bridge-handoffd.py, bridge_a2a_common.py, or agent-bridge dispatcher change
+# re-runs it via the catch-all / per-file arms below. Pins the lifecycle +
+# epoch + leader-auth + token-hash + rotate/--once + adopt-all + envelope
+# back-compat + receiver fail-closed teeth, and the rooms.db 0600 hygiene.
+add_required a2a-rooms-p1a
 
 
 }
@@ -417,7 +427,11 @@ select_for_path() {
       # v0.15.0-beta1 Lane I: the template now advertises
       # `agent describe <agent>`. Pull I-agent-description-roster on
       # every template edit so the row + dispatcher arm cannot drift.
-      add_required 1115-cli-usage-drift 1117-cli-help-universal-gate I-agent-description-roster
+      #
+      # A2A rooms P1a: the template now advertises `room <create|...>`. Pull
+      # a2a-rooms-p1a on every template edit so the `room` row + its
+      # dispatcher arm (the `room)` case in agent-bridge) cannot drift apart.
+      add_required 1115-cli-usage-drift 1117-cli-help-universal-gate I-agent-description-roster a2a-rooms-p1a
       ;;
 
     bridge-setup.py|bridge-setup.sh|bridge-status.py|bridge-status.sh|lib/bridge-setup-wizard.sh)
@@ -770,7 +784,7 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/install-handoffd-systemd.sh)
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the
@@ -827,7 +841,15 @@ select_for_path() {
       # a future PR cannot regress the wizard into writing an empty secret,
       # starting a secretless receiver, or persisting a config on a resolve
       # failure.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard
+      # A2A rooms P1a: the envelope contract (optional room_id/room_epoch +
+      # back-compat) lives in bridge_a2a_common.py and the receiver-check
+      # seam (room_scoped_check, fail-closed) lives in bridge-handoffd.py, so
+      # any move to those shared files must re-run a2a-rooms-p1a to confirm
+      # the envelope change does not regress the room round-trip / v1
+      # back-compat and the seam's fail-closed contract still holds. The
+      # rooms control-plane modules (bridge-rooms.py / bridge_rooms_common.py)
+      # and the rooms helper route here too via the path alternation above.
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)

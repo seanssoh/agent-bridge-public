@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+"""Shared helpers for Agent Bridge A2A *rooms* (the control plane).
+
+This module is the single source of truth for the rooms SQLite schema, the
+leader-authoritative membership model, the monotonic per-room `epoch`, and
+the canonical (sorted-members) roster a leader signs per-node in P4. It is
+imported by the `agb room` CLI (`bridge-rooms.py`), by the receiver daemon's
+room-scoped check seam (`bridge-handoffd.py`), and — in P1b — by the queue
+membership gate. It NEVER runs anything on import and has no third-party
+dependencies.
+
+Design contract (see docs/design/a2a-rooms-design.md §6, §14 R2/R6):
+- A ROOM has a LEADER (`agent@node`), a ROSTER (member `agent@node` list),
+  and a monotonic `epoch` that bumps on EVERY membership change
+  (join-approve / leave / kick). The epoch is the split-brain tiebreaker
+  and the freshness signal the receiver seam (P4) enforces.
+- Invite tokens are stored as `sha256(token)` ONLY. The raw token rides in
+  the `agbroom://` link; verification hashes-and-compares. The raw token is
+  NEVER persisted.
+- `roster_for(room_id)` is the canonical roster: `{room_id, epoch, members}`
+  with members deterministically sorted by `(agent, node)`. P1a computes it;
+  P4 signs it with the leader-node↔member-node pairwise HMAC and broadcasts.
+- The db is 0600 (it indexes who-can-talk-to-whom + invite-token hashes),
+  WAL-journaled, and lives next to the A2A outbox/inbox under state/handoff/.
+
+Scope (P1a): SINGLE NODE. Leader-authorized mutations assume caller-agent ==
+`leader_agent` (cross-node leader-auth over the node-link is P4). The schema,
+the epoch contract, and the canonical roster shape are FROZEN here so P1b–P4
+add behavior without a schema rewrite.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import secrets
+import sqlite3
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+
+# Membership roles. A room has exactly one leader row (role='leader'); every
+# admitted member is role='member'.
+ROLE_LEADER = "leader"
+ROLE_MEMBER = "member"
+
+# Join-request lifecycle.
+JOIN_PENDING = "pending"
+JOIN_APPROVED = "approved"
+JOIN_DENIED = "denied"
+
+# Room status. `active` is the only status P1a sets; the column is frozen so a
+# future `archived`/`disbanded` lifecycle (Phase-2 backlog) needs no rewrite.
+ROOM_ACTIVE = "active"
+
+# rooms_acl mode (design §7 / R1). Default off — P1a does NOT enforce; P1b
+# reads this through `rooms_acl_mode()`.
+ACL_OFF = "off"
+ACL_ENFORCE = "enforce"
+_ACL_CONFIG_KEY = "rooms_acl"
+
+# The invite-link scheme. The link carries the RAW token; the db stores only
+# its sha256. Leader approval is the real admission gate (token => request).
+INVITE_LINK_SCHEME = "agbroom"
+
+# Per-token join rate limit (design §14 R3): a leaked reusable token must not
+# let a source spam pending rows. P1a enforces a simple per-token attempt
+# counter; the window is advisory (single-node, no clock-coupled reset).
+DEFAULT_JOIN_RATE_LIMIT_PER_TOKEN = 50
+
+
+class RoomsError(Exception):
+    """A rooms control-plane failure with a machine-readable code."""
+
+    def __init__(self, message: str, code: str = "rooms_error") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# --------------------------------------------------------------------------
+# Paths — reuse the A2A handoff dir so rooms.db sits beside outbox/inbox.db
+# --------------------------------------------------------------------------
+
+def bridge_home() -> Path:
+    return Path(os.environ.get("BRIDGE_HOME", str(Path.home() / ".agent-bridge")))
+
+
+def state_dir() -> Path:
+    explicit = os.environ.get("BRIDGE_STATE_DIR")
+    if explicit:
+        return Path(explicit)
+    return bridge_home() / "state"
+
+
+def handoff_dir() -> Path:
+    """`$BRIDGE_STATE_DIR/handoff` — shared with the A2A outbox/inbox."""
+    return state_dir() / "handoff"
+
+
+def rooms_db_path() -> Path:
+    override = os.environ.get("BRIDGE_A2A_ROOMS_DB")
+    if override:
+        return Path(override)
+    return handoff_dir() / "rooms.db"
+
+
+# --------------------------------------------------------------------------
+# Schema (FROZEN — design §14 R2/R6)
+# --------------------------------------------------------------------------
+
+_ROOMS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS rooms (
+  room_id            TEXT PRIMARY KEY,
+  name               TEXT NOT NULL DEFAULT '',
+  leader_agent       TEXT NOT NULL,
+  leader_node        TEXT NOT NULL DEFAULT '',
+  epoch              INTEGER NOT NULL DEFAULT 0,
+  invite_token_sha256 TEXT,
+  invite_token_ts    INTEGER NOT NULL DEFAULT 0,
+  invite_once        INTEGER NOT NULL DEFAULT 0,
+  status             TEXT NOT NULL DEFAULT 'active',
+  created_ts         INTEGER NOT NULL,
+  updated_ts         INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS room_members (
+  room_id    TEXT NOT NULL,
+  agent      TEXT NOT NULL,
+  node       TEXT NOT NULL DEFAULT '',
+  role       TEXT NOT NULL DEFAULT 'member',
+  joined_ts  INTEGER NOT NULL,
+  PRIMARY KEY (room_id, agent, node)
+);
+CREATE INDEX IF NOT EXISTS idx_room_members_agent ON room_members(agent, node);
+
+CREATE TABLE IF NOT EXISTS room_join_requests (
+  room_id      TEXT NOT NULL,
+  agent        TEXT NOT NULL,
+  node         TEXT NOT NULL DEFAULT '',
+  requested_ts INTEGER NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'pending',
+  PRIMARY KEY (room_id, agent, node)
+);
+
+CREATE TABLE IF NOT EXISTS room_roster_cache (
+  room_id      TEXT PRIMARY KEY,
+  epoch        INTEGER NOT NULL DEFAULT 0,
+  members_json TEXT NOT NULL DEFAULT '[]',
+  from_node    TEXT NOT NULL DEFAULT '',
+  mac          TEXT NOT NULL DEFAULT '',
+  fetched_ts   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS rooms_acl_config (
+  k TEXT PRIMARY KEY,
+  v TEXT NOT NULL
+);
+
+-- Per-(token-hash, source) join attempt counter. A leaked reusable token
+-- cannot spam the leader's pending queue beyond the configured ceiling.
+CREATE TABLE IF NOT EXISTS room_join_rate (
+  token_sha256 TEXT NOT NULL,
+  source       TEXT NOT NULL DEFAULT '',
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  first_ts     INTEGER NOT NULL,
+  last_ts      INTEGER NOT NULL,
+  PRIMARY KEY (token_sha256, source)
+);
+"""
+
+
+def now_ts() -> int:
+    return int(time.time())
+
+
+def _connect(path: Path, schema: str) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(schema)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return conn
+
+
+def open_rooms() -> sqlite3.Connection:
+    """Open (creating if absent) the rooms.db at 0600 with the frozen schema."""
+    return _connect(rooms_db_path(), _ROOMS_SCHEMA)
+
+
+def open_rooms_readonly() -> Optional[sqlite3.Connection]:
+    """Open an EXISTING rooms.db read-only; return None when it is absent.
+
+    Used by read paths (the receiver seam, P1b's membership lookup) that must
+    DEGRADE gracefully when no rooms have ever been defined — they must not
+    create the db as a side effect of a lookup. A present-but-unreadable db
+    raises RoomsError so a real fault is never silently treated as "no rooms".
+    """
+    path = rooms_db_path()
+    if not path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True, timeout=30.0,
+        )
+    except sqlite3.Error as exc:
+        raise RoomsError(
+            f"rooms.db present but cannot be opened: {exc}", code="rooms_db_unreadable",
+        ) from exc
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# --------------------------------------------------------------------------
+# Identity helpers
+# --------------------------------------------------------------------------
+
+def mint_room_id() -> str:
+    """`room-<short-rand>` — globally-unique-enough for invite links."""
+    return "room-" + secrets.token_hex(5)
+
+
+def mint_invite_token() -> str:
+    """A fresh, URL-safe room invite token (the raw secret in the link)."""
+    return secrets.token_urlsafe(24)
+
+
+def hash_token(token: str) -> str:
+    """sha256 of the raw token — the ONLY form persisted in rooms.db."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def make_invite_link(room_id: str, leader_node: str, token: str,
+                     reach: str = "") -> str:
+    """Build the `agbroom://join?...` link the leader hands out ONCE.
+
+    The raw token is in the link, never stored. `reach` is an optional
+    transport hint (P2+); empty in single-node P1a.
+    """
+    from urllib.parse import urlencode
+
+    params = {"room": room_id, "leader": leader_node, "t": token}
+    if reach:
+        params["reach"] = reach
+    return f"{INVITE_LINK_SCHEME}://join?" + urlencode(params)
+
+
+def parse_invite_link(link: str) -> dict[str, str]:
+    """Parse an `agbroom://join?...` link into {room, leader, t, reach}.
+
+    Accepts either a full link or a bare room_id (the CLI lets `join` take
+    `<link|room_id>`). A bare room_id yields {"room": <id>} with no token.
+    """
+    from urllib.parse import parse_qs, urlsplit
+
+    if not link.startswith(f"{INVITE_LINK_SCHEME}://"):
+        # Treat as a bare room id — no token carried.
+        return {"room": link.strip()}
+    parts = urlsplit(link)
+    if parts.netloc and parts.netloc != "join":
+        # `agbroom://join?...` puts `join` in netloc; tolerate `agbroom://?...`
+        # too, but reject a different host so a malformed link fails loud.
+        raise RoomsError(
+            f"unsupported invite link host: {parts.netloc!r} "
+            f"(expected '{INVITE_LINK_SCHEME}://join?...')",
+            code="bad_invite_link",
+        )
+    q = parse_qs(parts.query)
+    out: dict[str, str] = {}
+    for key in ("room", "leader", "t", "reach"):
+        vals = q.get(key)
+        if vals:
+            out[key] = vals[0]
+    if "room" not in out:
+        raise RoomsError(
+            "invite link missing required 'room' parameter", code="bad_invite_link",
+        )
+    return out
+
+
+# --------------------------------------------------------------------------
+# Room CRUD
+# --------------------------------------------------------------------------
+
+def get_room(conn: sqlite3.Connection, room_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM rooms WHERE room_id=?", (room_id,)
+    ).fetchone()
+
+
+def require_room(conn: sqlite3.Connection, room_id: str) -> sqlite3.Row:
+    row = get_room(conn, room_id)
+    if row is None:
+        raise RoomsError(f"room not found: {room_id}", code="room_unknown")
+    return row
+
+
+def list_rooms(conn: sqlite3.Connection,
+               owned_node: Optional[str] = None) -> list[sqlite3.Row]:
+    """All rooms, or only rooms whose `leader_node` == `owned_node`.
+
+    `list --owned` is the leader-node's registry view (design §6 "관리용
+    방 목록"): rooms this node leads.
+    """
+    if owned_node is not None:
+        return conn.execute(
+            "SELECT * FROM rooms WHERE leader_node=? ORDER BY created_ts",
+            (owned_node,),
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM rooms ORDER BY created_ts"
+    ).fetchall()
+
+
+def create_room(conn: sqlite3.Connection, *, name: str, leader_agent: str,
+                leader_node: str, token: str,
+                once: bool = False) -> str:
+    """Create a room led by `leader_agent@leader_node`; seed leader member row.
+
+    `epoch` starts at 0. The leader row is role='leader'. Only the token HASH
+    is stored. Returns the minted room_id. The caller is responsible for
+    printing the one-time invite link (it holds the raw token).
+    """
+    room_id = mint_room_id()
+    ts = now_ts()
+    conn.execute(
+        "INSERT INTO rooms (room_id, name, leader_agent, leader_node, epoch, "
+        "invite_token_sha256, invite_token_ts, invite_once, status, "
+        "created_ts, updated_ts) "
+        "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+        (room_id, name, leader_agent, leader_node, hash_token(token), ts,
+         1 if once else 0, ROOM_ACTIVE, ts, ts),
+    )
+    conn.execute(
+        "INSERT INTO room_members (room_id, agent, node, role, joined_ts) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (room_id, leader_agent, leader_node, ROLE_LEADER, ts),
+    )
+    conn.commit()
+    _recompute_roster_cache(conn, room_id)
+    return room_id
+
+
+def is_leader(room: sqlite3.Row, caller_agent: str,
+              caller_node: Optional[str] = None) -> bool:
+    """Single-node leader-auth (P1a): caller_agent == room.leader_agent.
+
+    `caller_node`, when supplied, must also match `leader_node` — this keeps
+    the predicate correct the moment P4 makes node meaningful, without a
+    later signature change. In single-node P1a `caller_node` is usually the
+    local node so the node check is a no-op.
+    """
+    if caller_agent != room["leader_agent"]:
+        return False
+    if caller_node is not None and room["leader_node"]:
+        return caller_node == room["leader_node"]
+    return True
+
+
+def require_leader(room: sqlite3.Row, caller_agent: str,
+                   caller_node: Optional[str] = None) -> None:
+    if not is_leader(room, caller_agent, caller_node):
+        raise RoomsError(
+            f"leader-only action on room {room['room_id']}: caller "
+            f"{caller_agent!r} is not the leader ({room['leader_agent']!r})",
+            code="not_leader",
+        )
+
+
+# --------------------------------------------------------------------------
+# Invite tokens
+# --------------------------------------------------------------------------
+
+def set_invite_token(conn: sqlite3.Connection, room_id: str, token: str,
+                     once: bool = False) -> None:
+    """Store a fresh token hash, INVALIDATING any prior token for the room."""
+    ts = now_ts()
+    conn.execute(
+        "UPDATE rooms SET invite_token_sha256=?, invite_token_ts=?, "
+        "invite_once=?, updated_ts=? WHERE room_id=?",
+        (hash_token(token), ts, 1 if once else 0, ts, room_id),
+    )
+    # A rotated token invalidates prior rate-counters too (fresh budget).
+    conn.execute(
+        "DELETE FROM room_join_rate WHERE token_sha256 NOT IN "
+        "(SELECT invite_token_sha256 FROM rooms WHERE invite_token_sha256 IS NOT NULL)"
+    )
+    conn.commit()
+
+
+def verify_invite_token(room: sqlite3.Row, token: str) -> bool:
+    """Constant-time compare of `sha256(token)` against the room's stored hash."""
+    stored = room["invite_token_sha256"]
+    if not stored:
+        return False
+    import hmac as _hmac
+
+    return _hmac.compare_digest(stored, hash_token(token))
+
+
+def burn_invite_token(conn: sqlite3.Connection, room_id: str) -> None:
+    """Clear the token after a `--once` single-use join is approved."""
+    conn.execute(
+        "UPDATE rooms SET invite_token_sha256=NULL, invite_once=0, "
+        "updated_ts=? WHERE room_id=?",
+        (now_ts(), room_id),
+    )
+    conn.commit()
+
+
+def record_join_attempt(conn: sqlite3.Connection, token: str, source: str,
+                        limit: int = DEFAULT_JOIN_RATE_LIMIT_PER_TOKEN) -> int:
+    """Increment + return the per-(token-hash, source) attempt count.
+
+    Raises RoomsError(code='rate_limited') once the count exceeds `limit`.
+    Single-node P1a uses the joining agent id as `source`; P4 uses the
+    source node. The counter is keyed on the token HASH so a rotate (which
+    deletes stale counters) resets the budget.
+    """
+    th = hash_token(token)
+    ts = now_ts()
+    row = conn.execute(
+        "SELECT attempts FROM room_join_rate WHERE token_sha256=? AND source=?",
+        (th, source),
+    ).fetchone()
+    attempts = (int(row["attempts"]) if row else 0) + 1
+    if row:
+        conn.execute(
+            "UPDATE room_join_rate SET attempts=?, last_ts=? "
+            "WHERE token_sha256=? AND source=?",
+            (attempts, ts, th, source),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO room_join_rate (token_sha256, source, attempts, "
+            "first_ts, last_ts) VALUES (?, ?, ?, ?, ?)",
+            (th, source, attempts, ts, ts),
+        )
+    conn.commit()
+    if attempts > limit:
+        raise RoomsError(
+            f"join rate limit exceeded for this invite token "
+            f"(source={source!r}, {attempts} attempts > {limit})",
+            code="rate_limited",
+        )
+    return attempts
+
+
+# --------------------------------------------------------------------------
+# Membership + join requests + epoch
+# --------------------------------------------------------------------------
+
+def bump_epoch(conn: sqlite3.Connection, room_id: str) -> int:
+    """Monotonically increment a room's epoch; return the NEW value.
+
+    Called on EVERY membership change (join-approve / leave / kick). This is
+    the freshness signal the P4 receiver seam enforces and the split-brain
+    tiebreaker — never reset, never reused.
+    """
+    require_room(conn, room_id)
+    conn.execute(
+        "UPDATE rooms SET epoch = epoch + 1, updated_ts=? WHERE room_id=?",
+        (now_ts(), room_id),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT epoch FROM rooms WHERE room_id=?", (room_id,)
+    ).fetchone()
+    return int(row["epoch"])
+
+
+def is_member(conn: sqlite3.Connection, room_id: str, agent: str,
+              node: str = "") -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM room_members WHERE room_id=? AND agent=? AND node=?",
+        (room_id, agent, node),
+    ).fetchone()
+    return row is not None
+
+
+def add_member(conn: sqlite3.Connection, room_id: str, agent: str,
+               node: str = "", role: str = ROLE_MEMBER) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO room_members (room_id, agent, node, role, "
+        "joined_ts) VALUES (?, ?, ?, ?, ?)",
+        (room_id, agent, node, role, now_ts()),
+    )
+    conn.commit()
+
+
+def remove_member(conn: sqlite3.Connection, room_id: str, agent: str,
+                  node: str = "") -> bool:
+    """Remove a member; return True if a row was deleted.
+
+    The leader row cannot be removed (leave/kick of the leader is out of
+    scope for P1a — a room without a leader has no control plane).
+    """
+    room = require_room(conn, room_id)
+    if agent == room["leader_agent"] and node == (room["leader_node"] or ""):
+        raise RoomsError(
+            f"cannot remove the leader ({agent}@{node}) from room {room_id}",
+            code="cannot_remove_leader",
+        )
+    cur = conn.execute(
+        "DELETE FROM room_members WHERE room_id=? AND agent=? AND node=?",
+        (room_id, agent, node),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def members_for(conn: sqlite3.Connection, agent: str,
+                node: str = "") -> list[str]:
+    """Every room_id `agent@node` is a member of (for P1b uid->agent lookup)."""
+    rows = conn.execute(
+        "SELECT room_id FROM room_members WHERE agent=? AND node=? "
+        "ORDER BY room_id",
+        (agent, node),
+    ).fetchall()
+    return [r["room_id"] for r in rows]
+
+
+# Back-compat alias spelled the way the brief named it.
+def room_members_for(conn: sqlite3.Connection, agent: str,
+                     node: str = "") -> list[str]:
+    return members_for(conn, agent, node)
+
+
+def shared_rooms(conn: sqlite3.Connection, agent1: str, node1: str,
+                 agent2: str, node2: str) -> list[str]:
+    """Room ids that BOTH `agent1@node1` and `agent2@node2` belong to.
+
+    This is the predicate P1b's queue ACL gates `create --to` on (a create
+    is allowed iff actor and target share at least one room). Frozen here so
+    P1b consumes it without a schema rewrite.
+    """
+    a = set(members_for(conn, agent1, node1))
+    b = set(members_for(conn, agent2, node2))
+    return sorted(a & b)
+
+
+def post_join_request(conn: sqlite3.Connection, room_id: str, agent: str,
+                      node: str = "") -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO room_join_requests (room_id, agent, node, "
+        "requested_ts, status) VALUES (?, ?, ?, ?, ?)",
+        (room_id, agent, node, now_ts(), JOIN_PENDING),
+    )
+    conn.commit()
+
+
+def list_join_requests(conn: sqlite3.Connection, room_id: str,
+                       status: Optional[str] = None) -> list[sqlite3.Row]:
+    if status is not None:
+        return conn.execute(
+            "SELECT * FROM room_join_requests WHERE room_id=? AND status=? "
+            "ORDER BY requested_ts",
+            (room_id, status),
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM room_join_requests WHERE room_id=? ORDER BY requested_ts",
+        (room_id,),
+    ).fetchall()
+
+
+def set_join_request_status(conn: sqlite3.Connection, room_id: str, agent: str,
+                            node: str, status: str) -> bool:
+    cur = conn.execute(
+        "UPDATE room_join_requests SET status=? WHERE room_id=? AND agent=? "
+        "AND node=?",
+        (status, room_id, agent, node),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+# --------------------------------------------------------------------------
+# Canonical roster (the thing a leader MACs per-node in P4)
+# --------------------------------------------------------------------------
+
+def _sorted_members(conn: sqlite3.Connection,
+                    room_id: str) -> list[dict[str, str]]:
+    """Members of a room, deterministically sorted by (agent, node).
+
+    The sort is the CANONICAL ordering — P4 signs over exactly this byte
+    sequence so any verifier recomputes the same MAC. Never reorder.
+    """
+    rows = conn.execute(
+        "SELECT agent, node, role FROM room_members WHERE room_id=? "
+        "ORDER BY agent, node",
+        (room_id,),
+    ).fetchall()
+    return [
+        {"agent": r["agent"], "node": r["node"] or "", "role": r["role"]}
+        for r in rows
+    ]
+
+
+def roster_for(conn: sqlite3.Connection, room_id: str) -> dict[str, Any]:
+    """The canonical roster: {room_id, epoch, members(sorted)}.
+
+    P1a computes it (for `agb room show`, the receiver seam, P1b lookups).
+    P4 signs this exact structure with the leader-node↔member-node pairwise
+    HMAC and broadcasts it. The `members` list is canonically sorted so the
+    signed bytes are reproducible.
+    """
+    room = require_room(conn, room_id)
+    return {
+        "room_id": room_id,
+        "epoch": int(room["epoch"]),
+        "members": _sorted_members(conn, room_id),
+    }
+
+
+def canonical_roster_bytes(roster: dict[str, Any]) -> bytes:
+    """Deterministic JSON encoding of a roster — the P4 MAC input.
+
+    Frozen here (sorted keys, no spaces) so the sender that signs and the
+    receiver that verifies in P4 never diverge on the byte sequence.
+    """
+    return json.dumps(roster, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _recompute_roster_cache(conn: sqlite3.Connection, room_id: str) -> None:
+    """Refresh the local roster cache row for a room from current membership.
+
+    Single-node P1a writes the leader's own authoritative view (from_node =
+    leader_node, mac empty — there is no cross-node link to sign with yet).
+    P4 replaces this with the leader-MAC'd roster received over the node-link.
+    """
+    roster = roster_for(conn, room_id)
+    room = require_room(conn, room_id)
+    conn.execute(
+        "INSERT OR REPLACE INTO room_roster_cache (room_id, epoch, "
+        "members_json, from_node, mac, fetched_ts) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            room_id,
+            roster["epoch"],
+            json.dumps(roster["members"], separators=(",", ":")),
+            room["leader_node"] or "",
+            "",
+            now_ts(),
+        ),
+    )
+    conn.commit()
+
+
+def approve_join(conn: sqlite3.Connection, room_id: str, agent: str,
+                 node: str = "") -> int:
+    """Admit a member: add row, bump epoch, recompute roster. Returns new epoch.
+
+    The leader-auth check is the CLI's responsibility (it has the caller
+    identity); this helper performs the state transition atomically once
+    authorized.
+    """
+    require_room(conn, room_id)
+    add_member(conn, room_id, agent, node, role=ROLE_MEMBER)
+    set_join_request_status(conn, room_id, agent, node, JOIN_APPROVED)
+    epoch = bump_epoch(conn, room_id)
+    _recompute_roster_cache(conn, room_id)
+    return epoch
+
+
+def remove_and_bump(conn: sqlite3.Connection, room_id: str, agent: str,
+                    node: str = "") -> int:
+    """Remove a member (leave/kick), bump epoch, recompute roster.
+
+    Returns the new epoch. Raises RoomsError(code='not_member') if the
+    target was not a member (so leave/kick of a non-member is loud, not a
+    silent epoch bump).
+    """
+    require_room(conn, room_id)
+    removed = remove_member(conn, room_id, agent, node)
+    if not removed:
+        raise RoomsError(
+            f"{agent}@{node} is not a member of {room_id}", code="not_member",
+        )
+    epoch = bump_epoch(conn, room_id)
+    _recompute_roster_cache(conn, room_id)
+    return epoch
+
+
+# --------------------------------------------------------------------------
+# rooms_acl config (P1a parses + exposes; P1b enforces)
+# --------------------------------------------------------------------------
+
+def set_acl_mode(conn: sqlite3.Connection, mode: str) -> None:
+    if mode not in (ACL_OFF, ACL_ENFORCE):
+        raise RoomsError(
+            f"invalid rooms_acl mode: {mode!r} (expected off|enforce)",
+            code="bad_acl_mode",
+        )
+    conn.execute(
+        "INSERT OR REPLACE INTO rooms_acl_config (k, v) VALUES (?, ?)",
+        (_ACL_CONFIG_KEY, mode),
+    )
+    conn.commit()
+
+
+def rooms_acl_mode(conn: Optional[sqlite3.Connection] = None) -> str:
+    """Return the configured rooms_acl mode (default 'off').
+
+    P1a never enforces — this is the read-only accessor P1b's queue gate
+    consumes. When no db exists (no rooms ever defined) the mode is 'off'
+    (back-compat: the ACL only engages once an operator opts in).
+    """
+    own = False
+    if conn is None:
+        conn = open_rooms_readonly()
+        if conn is None:
+            return ACL_OFF
+        own = True
+    try:
+        row = conn.execute(
+            "SELECT v FROM rooms_acl_config WHERE k=?", (_ACL_CONFIG_KEY,)
+        ).fetchone()
+    except sqlite3.Error:
+        return ACL_OFF
+    finally:
+        if own:
+            conn.close()
+    if row is None:
+        return ACL_OFF
+    val = str(row["v"]).strip().lower()
+    return val if val in (ACL_OFF, ACL_ENFORCE) else ACL_OFF

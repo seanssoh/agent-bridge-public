@@ -252,7 +252,7 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 # (if a future patch adds the subcommand handler) does not eat the
 # roster cost either.
 case "${1:-}" in
-  version|status|daemon|agent|task|inbox|a2a|iso-run|help|--help|-h|--version|-V) ;;
+  version|status|daemon|agent|task|inbox|a2a|room|iso-run|help|--help|-h|--version|-V) ;;
   init)
     # bridge-isolation-v2.sh's `BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"`
     # default fires during our bridge-lib.sh source above and exports the
@@ -905,6 +905,42 @@ A2A_HELP
           ;;
       esac
       ;;
+    room)
+      # A2A rooms control plane (design docs/design/a2a-rooms-design.md
+      # §6, §14 R2/R6). The structured CLI is bridge-rooms.py (parallel to
+      # bridge-a2a.py). Single-node P1a: create/list/show/invite/
+      # rotate-invite/join/approve/deny/kick/leave/adopt-all/acl.
+      shift
+      bridge_require_python
+      case "${1:-}" in
+        -h|--help|help|"")
+          cat <<'ROOM_HELP'
+Usage: agent-bridge room <command> [args]
+
+  create        Create a room (you are leader); prints the invite link ONCE.
+                  agent-bridge room create --name <n> [--as <agent>]
+  list          List rooms (--owned = only rooms this node leads).
+  show          Show a room's roster + epoch + pending join requests.
+                  agent-bridge room show <room_id>
+  invite        Mint a fresh invite token (--once = single-use).
+                  agent-bridge room invite <room_id> [--once]
+  rotate-invite Rotate the invite token, invalidating the old one.
+  join          Post a join request (token-bearing agbroom:// link).
+                  agent-bridge room join <link> [--as <agent>]
+  approve|deny  Leader-only: approve/deny a join request (agent or agent@node).
+  kick|leave    Remove a member (leader kick / self leave) — bumps epoch.
+  adopt-all     Create a default room with every current roster agent.
+  acl           Show/set rooms_acl mode (off|enforce). P1a does NOT enforce.
+
+Data: state/handoff/rooms.db (0600). See docs/design/a2a-rooms-design.md.
+ROOM_HELP
+          exit 0
+          ;;
+        *)
+          exec python3 "$SCRIPT_DIR/bridge-rooms.py" "$@"
+          ;;
+      esac
+      ;;
     list)
       # Issue #1114: short-circuit -h/--help/help before the arity
       # check so `agb list --help` prints usage instead of failing the
@@ -1424,7 +1460,7 @@ WORKTREE_HELP
     # `1115-cli-usage-drift` smoke asserts this list stays synchronized
     # with the dispatcher so a future PR cannot silently regress the
     # typo-suggestion blind spot.
-    _top_valid="a2a admin agent attach audit auth bootstrap bundle cancel claim config create cron daemon diagnose discord doctor done escalate guard handoff inbox init intake iso-run isolate isolation kill knowledge list memory migrate plugins profile review setup show skills status summary task unisolate update upgrade upstream urgent usage user version watchdog wave wiki worktree"
+    _top_valid="a2a admin agent attach audit auth bootstrap bundle cancel claim config create cron daemon diagnose discord doctor done escalate guard handoff inbox init intake iso-run isolate isolation kill knowledge list memory migrate plugins profile review room setup show skills status summary task unisolate update upgrade upstream urgent usage user version watchdog wave wiki worktree"
     _hint="$(bridge_suggest_subcommand "$1" "$_top_valid")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 명령입니다: $1"
