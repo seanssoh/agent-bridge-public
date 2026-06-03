@@ -854,8 +854,33 @@ bridge_agent_desc() {
   printf '%s' "${BRIDGE_AGENT_DESC[$agent]-}"
 }
 
+# bridge_var_is_assoc <varname> — return 0 iff <varname> is currently a set
+# associative array. The test is ANCHORED to the `declare -p` flag field (the
+# token between `declare -` and the variable name) so a scalar/indexed variable
+# whose VALUE merely contains the text "declare -A" cannot false-positive
+# (#1457 codex r1: an unanchored `grep 'declare -[A-Za-z]*A'` over the full
+# `declare -p` output matched `BRIDGE_AGENT_ENGINE="declare -A"` and fell through
+# to the aborting indexed read). Safe under `set -u`.
+bridge_var_is_assoc() {
+  local _decl _flags
+  _decl="$(declare -p "$1" 2>/dev/null)" || return 1
+  _flags="${_decl#declare -}"   # `declare -A name=(...)` -> `A name=(...)`
+  _flags="${_flags%% *}"        # keep only the flag token   -> `A` / `-` / `ax`
+  case "$_flags" in
+    *A*) return 0 ;;
+    *)   return 1 ;;
+  esac
+}
+
 bridge_agent_engine() {
   local agent="$1"
+  # #1407/#1213: scalar-clobbered maps arithmetic-index agent ids under `set -u`
+  # and abort. Guard with the flag-field anchored check (#1457 r1) so a scalar/
+  # indexed value containing the text "declare -A" can't slip into the read.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_ENGINE; then
+    printf '%s' 'unknown'
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_ENGINE[$agent]-unknown}"
 }
 
@@ -5280,9 +5305,64 @@ bridge_agent_mattermost_state_dir() {
   bridge_agent_default_mattermost_state_dir "$agent"
 }
 
+# Issue #1492 — admin-pair workspace alignment predicate.
+#
+# Return 0 only for the documented co-located `<admin>-dev` codex pair whose
+# raw roster workdir points at the admin's old/base shared cwd (the value
+# captured at provisioning time by bridge-init-codex-pair.sh, which becomes
+# the admin's *base* dir after the v2 anchor split rewrites the admin to
+# <admin>/workdir). For that exact shape the caller follows the admin's
+# RESOLVED workdir so the shared-workspace pair-review contract holds.
+#
+# All conditions must hold (mirrors the migration preflight whitelist
+# `_bridge_isolation_v2_migrate_is_admin_pair_override`):
+#   - agent is named `<admin>-dev` (and the admin half is non-empty),
+#   - the admin half is the configured BRIDGE_ADMIN_AGENT_ID,
+#   - the admin is not the agent itself (no self-follow / recursion),
+#   - the pair's raw explicit workdir equals one of the admin's old/base
+#     shared cwds: the admin's v2 base ($BRIDGE_AGENT_ROOT_V2/<admin>),
+#     legacy base ($BRIDGE_AGENT_HOME_ROOT/<admin>), or default home.
+#
+# An empty explicit, an unrelated `*-dev` whose base is not the admin, or a
+# `<admin>-dev` pointing at a genuinely custom path all return 1 (preserved).
+_bridge_agent_workdir_admin_pair_aligns() {
+  local agent="$1"
+  local explicit="$2"
+
+  [[ -n "$explicit" ]] || return 1
+  case "$agent" in
+    *-dev) ;;
+    *) return 1 ;;
+  esac
+
+  local _admin="${agent%-dev}"
+  [[ -n "$_admin" && "$_admin" != "$agent" ]] || return 1
+
+  local _configured_admin=""
+  _configured_admin="$(bridge_admin_agent_id 2>/dev/null || true)"
+  [[ -n "$_configured_admin" && "$_admin" == "$_configured_admin" ]] || return 1
+
+  local _admin_v2_base="$BRIDGE_AGENT_ROOT_V2/$_admin"
+  local _admin_legacy_base="$BRIDGE_AGENT_HOME_ROOT/$_admin"
+  local _admin_default_home=""
+  _admin_default_home="$(bridge_agent_default_home "$_admin")"
+
+  [[ "$explicit" == "$_admin_v2_base" \
+    || "$explicit" == "$_admin_legacy_base" \
+    || "$explicit" == "$_admin_default_home" ]] || return 1
+  return 0
+}
+
 bridge_agent_workdir() {
   local agent="$1"
-  local explicit="${BRIDGE_AGENT_WORKDIR[$agent]-}"
+  local explicit=""
+  # #1407/#1213: if the map is unset or scalar-clobbered, fall through to
+  # existing v2/default resolution instead of aborting under `set -u`. Use the
+  # flag-field anchored check (#1457 r1) so a scalar/indexed value containing the
+  # text "declare -A" can't false-positive into the aborting indexed read.
+  if bridge_var_is_assoc BRIDGE_AGENT_WORKDIR; then
+    explicit="${BRIDGE_AGENT_WORKDIR[$agent]-}"
+  fi
 
   # v2 anchor precedence is conditional on isolation mode (issue #895,
   # ymprince WSL2 report, v0.13.8):
@@ -5317,6 +5397,24 @@ bridge_agent_workdir() {
     # dynamic agents and static project overrides; only align legacy
     # default-home static rows to the existing v2 workdir.
     if [[ "$(bridge_agent_source "$agent")" == "static" ]]; then
+      # Issue #1492: the documented `<admin>-dev` codex pair co-locates with
+      # its admin's *workspace* (shared SOUL/MEMORY/CLAUDE.md so two models
+      # review the same tree). The pair's raw roster workdir was captured at
+      # provisioning time (bridge-init-codex-pair.sh) from the admin's THEN
+      # workdir — the admin's old/base shared cwd. After the v2 anchor split
+      # rewrote the admin to <admin>/workdir, that raw value points at the
+      # admin's *base* dir, not the pair's own home, so the generic
+      # legacy-default-home alignment below does NOT fire and the pair drifts
+      # to the admin's pre-v2 base while the admin runs under <admin>/workdir.
+      # Detect the genuine admin-pair shape and follow the admin's RESOLVED
+      # workdir so the shared-workspace pair-review contract holds. Identity,
+      # home (<admin>-dev/home), and hooks stay distinct — only the cwd is
+      # shared. Tight to the pair pattern: an unrelated static `*-dev` row, or
+      # a `<admin>-dev` pointing at a genuinely custom path, is NOT realigned.
+      if _bridge_agent_workdir_admin_pair_aligns "$agent" "$explicit"; then
+        bridge_agent_workdir "${agent%-dev}"
+        return 0
+      fi
       local _legacy_v2_workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
       local _default_home=""
       local _legacy_base_home="$BRIDGE_AGENT_HOME_ROOT/$agent"

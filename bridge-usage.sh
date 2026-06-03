@@ -605,6 +605,14 @@ bridge_usage_native_probe() {
 
   probe_args=(probe --cache-path "$cache_path" --registry-path "$registry_path")
   [[ -n "$ua_version" ]] && probe_args+=(--user-agent-version "$ua_version")
+  # Issue #1468 §5 (observability): ask the probe for its token-free `--json`
+  # result so we can emit a `usage_probe` audit row on a 429 near-limit signal
+  # or a probe failure (the path was previously a silent best-effort `exit 0`,
+  # so a defeated proactive probe was invisible without replaying the HTTP call).
+  # We CAPTURE the probe's stdout into a variable below — it must NOT leak onto
+  # this function's stdout, which (in the embedded monitor pre-refresh path) is
+  # part of the captured monitor JSON.
+  probe_args+=(--json)
 
   # Deliberate env-token delivery (r12 BLOCKING fix): if the env source WAS set,
   # hand it to the probe via an INHERITED fd on an UNLINKED 0600 file — NOT a
@@ -645,12 +653,58 @@ bridge_usage_native_probe() {
   # `command python3` bypasses any caller-(re-)exported `python3` function (which
   # would run in our shell with fd 8 inherited) — r13 BLOCKING, belt on top of
   # the top-of-script `unset -f python3`.
-  command python3 "$SCRIPT_DIR/bridge-usage-probe.py" "${probe_args[@]}" "$@" || builtin true
+  #
+  # Issue #1468: CAPTURE the probe's token-free `--json` result. The probe's
+  # stderr (its `_log` lines) stays on stderr; only the single JSON line lands
+  # on stdout, which we grab here so it never pollutes the monitor JSON the
+  # daemon captures from this function's stdout.
+  local _probe_result=""
+  _probe_result="$(command python3 "$SCRIPT_DIR/bridge-usage-probe.py" "${probe_args[@]}" "$@" 2>/dev/null || builtin true)"
 
   # Close fd 8 so no later sibling inherits it.
   if [[ "$_pf_have_fd" -eq 1 ]]; then
     exec 8<&- 2>/dev/null || true
   fi
+
+  # Issue #1468 §5: emit a `usage_probe` audit row on a noteworthy outcome (429
+  # near-limit signal / suppressed-idempotent / probe failure). The parser emits
+  # a row ONLY for those statuses (empty on fresh/written/cooldown), so the
+  # common no-op tick stays audit-silent. Best-effort: a parse/audit failure
+  # must never abort the surrounding status/monitor command.
+  bridge_usage_probe_audit "$_probe_result" || builtin true
+}
+
+# bridge_usage_probe_audit <probe-json>
+#   Issue #1468 §5 (observability): translate the native probe's token-free
+#   `--json` result into a `usage_probe` audit row when the outcome is
+#   noteworthy. Silent on the healthy fresh/written/cooldown ticks. The probe
+#   result is token-free by construction (the probe never echoes the OAT).
+bridge_usage_probe_audit() {
+  local probe_json="${1:-}"
+  [[ -n "$probe_json" ]] || return 0
+  local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
+  [[ -n "$admin_agent" ]] || return 0
+  command -v bridge_audit_log >/dev/null 2>&1 || return 0
+  local row=""
+  row="$(command python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" usage-probe-result-parse "$probe_json" 2>/dev/null || builtin true)"
+  [[ -n "$row" ]] || return 0
+  local p_status p_reset p_retry p_http
+  # #1468: split the tab-separated probe row WITHOUT a here-string (footgun #11
+  # / lint-heredoc-ban H3). The row is token-free (status/reset/retry/http) and
+  # we read it back from a temp file so `read`'s field semantics are preserved
+  # exactly (verified byte-identical to the prior here-string parse).
+  local _row_tmp=""
+  _row_tmp="$(command mktemp "${TMPDIR:-/tmp}/agb-usage-probe-row.XXXXXX" 2>/dev/null)" || return 0
+  printf '%s\n' "$row" >"$_row_tmp" 2>/dev/null || { command rm -f "$_row_tmp"; return 0; }
+  IFS=$'\t' read -r p_status p_reset p_retry p_http <"$_row_tmp"
+  command rm -f "$_row_tmp"
+  [[ -n "$p_status" ]] || return 0
+  bridge_audit_log daemon usage_probe "$admin_agent" \
+    --detail status="$p_status" \
+    --detail reset_at="$p_reset" \
+    --detail retry_after="$p_retry" \
+    --detail http_status="$p_http" \
+    --detail source="native-oauth-probe" >/dev/null 2>&1 || builtin true
 }
 
 case "$command" in

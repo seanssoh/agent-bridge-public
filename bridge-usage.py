@@ -150,6 +150,15 @@ def _claude_snapshots_from_payload(
 
     snapshots: list[dict[str, Any]] = []
     plan = data.get("planName") or "subscription"
+    # Issue #1468: a native 429-signal cache carries `_signal_token` — the
+    # one-way digest of the OAT that 429'd. It lets the rotation latch
+    # distinguish one limited token's signal from the next so the daemon can
+    # rotate ONCE PER newly-active token (walk A→B→C until a non-limited token)
+    # even when a counting-down Retry-After lands two tokens on the SAME
+    # reset_at. Absent on a real reading (None) → the latch keys on reset_at
+    # only, exactly as before (no behavior change off the 429-signal path).
+    signal_token = payload.get("_signal_token")
+    signal_token = str(signal_token) if isinstance(signal_token, str) and signal_token else None
     windows = [
         ("5h", data.get("fiveHour"), data.get("fiveHourResetAt")),
         ("weekly", data.get("sevenDay"), data.get("sevenDayResetAt")),
@@ -170,6 +179,8 @@ def _claude_snapshots_from_payload(
         }
         if agent is not None:
             entry["agent"] = agent
+        if signal_token is not None:
+            entry["signal_token"] = signal_token
         snapshots.append(entry)
     return snapshots
 
@@ -613,6 +624,10 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         previous_latch = previous.get("last_alert_bucket")
         rotation_triggered_at = previous.get("rotation_triggered_at")
         rotation_triggered_reset_at = previous.get("rotation_triggered_reset_at")
+        rotation_triggered_signal_token = previous.get("rotation_triggered_signal_token")
+        # Issue #1468: identity of the OAT behind a native 429-signal snapshot
+        # (token-free one-way digest). None on a real reading.
+        signal_token = snapshot.get("signal_token")
 
         # Cycle rollover: if reset_at has moved forward by more than the grace
         # window, this is a new cycle — clear the latch so alerts can fire again.
@@ -621,6 +636,24 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         if reset_cycle_advanced(previous_reset, reset_at):
             previous_latch = None
         if reset_cycle_advanced(rotation_triggered_reset_at, reset_at):
+            rotation_triggered_at = None
+            rotation_triggered_reset_at = None
+        # Issue #1468 (codex r3+r4): a native 429-signal whose token DIFFERS from
+        # the one we last rotated on must clear the rotation latch so the newly-
+        # active token rotates ONCE — even when a counting-down Retry-After lands
+        # the new token on the SAME reset_at (so reset_cycle_advanced does not
+        # fire). We only require the CURRENT snapshot to be a 429-signal
+        # (signal_token present); a prior latch with no signal token (it was
+        # triggered by a REAL reading → rotation_triggered_signal_token is None)
+        # still differs from an actual token digest, so the clear must fire there
+        # too (codex r4: otherwise B is wrongly suppressed after a real-reading
+        # rotation at the same reset_at). The probe bounds this to one signal per
+        # token per incident, so this cannot loop: a loop-back to an
+        # already-signalled token is suppressed at the probe (no fresh cache), so
+        # the monitor never re-sees a stale token's signal. Real readings carry no
+        # signal_token (None) → this whole branch is skipped → #215/#831 latch
+        # behavior is unchanged off the 429-signal path.
+        if signal_token is not None and signal_token != rotation_triggered_signal_token:
             rotation_triggered_at = None
             rotation_triggered_reset_at = None
 
@@ -672,9 +705,14 @@ def cmd_monitor(args: argparse.Namespace) -> int:
                 rotation_candidates.append(candidate)
                 rotation_triggered_at = now_iso()
                 rotation_triggered_reset_at = reset_at
+                # #1468: remember which token's signal this rotation was for, so
+                # a later DIFFERENT-token 429-signal clears the latch (rotate the
+                # new token once) even at the same reset_at.
+                rotation_triggered_signal_token = signal_token
         elif snapshot.get("provider") == "claude":
             rotation_triggered_at = None
             rotation_triggered_reset_at = None
+            rotation_triggered_signal_token = None
 
         entries[key] = {
             "last_alert_bucket": next_latch,
@@ -683,6 +721,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             "alerted_at": alerted_at,
             "rotation_triggered_at": rotation_triggered_at,
             "rotation_triggered_reset_at": rotation_triggered_reset_at,
+            "rotation_triggered_signal_token": rotation_triggered_signal_token,
         }
 
     state["updated_at"] = now_iso()

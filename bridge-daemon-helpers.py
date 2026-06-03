@@ -465,6 +465,47 @@ def cmd_nudge_live_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_task_status(args: argparse.Namespace) -> int:
+    """Read one task status from the queue DB.
+
+    Original site: lib/bridge-tmux.sh::bridge_tmux_pending_attention_flush
+    (#1952). The pending-attention flusher uses this to decide whether a
+    spooled ``[task-complete]`` notification task is already closed and can be
+    dropped instead of replayed later as a stale deferred interrupt.
+
+    Output: the task status string.
+
+    Fail-safe contract: missing DB, invalid id, missing row, sqlite errors,
+    and any other read failure exit non-zero so the shell caller preserves the
+    original spooled payload. The DB is opened read-only so a bad path cannot
+    create a fresh empty queue DB while trying to classify a replay.
+    """
+    try:
+        task_id = int(args.task_id)
+    except (TypeError, ValueError):
+        return 1
+    if task_id <= 0:
+        return 1
+
+    db_path = Path(args.db_path)
+    if not db_path.is_file():  # noqa: raw-pathlib-controller-only — db_path is always the controller's central queue DB ($BRIDGE_TASK_DB), passed only by the daemon-side pending-attention flusher (bridge-daemon.sh::flush_pending_attention_spools → lib/bridge-tmux.sh); never an iso-agent path.
+        return 1
+
+    uri = f"file:{db_path}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    if row is None:
+        return 1
+    status = str(row[0] or "").strip()
+    if not status:
+        return 1
+    print(status)
+    return 0
+
+
 def cmd_nudge_eligibility_recheck(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh::nudge_agent_session (issue #1106).
 
@@ -810,6 +851,55 @@ def cmd_usage_rotation_candidates_parse(args: argparse.Namespace) -> int:
                 ]
             )
         )
+    return 0
+
+
+def cmd_usage_probe_result_parse(args: argparse.Namespace) -> int:
+    """Issue #1468: classify the native usage-probe `--json` result for audit.
+
+    Input: the token-free JSON result dict printed by `bridge-usage-probe.py
+    probe --json`. Output: a SINGLE tab-separated row IFF the outcome is
+    NOTEWORTHY (worth an audit row) — empty stdout otherwise (so the daemon /
+    wrapper emits nothing on the common fresh/written/cooldown ticks):
+      status \\t reset_at \\t retry_after \\t http_status
+
+    Noteworthy statuses:
+      - rate-limited-signal     — a genuine 429 → proactive near-limit signal
+                                  persisted (the #1468 catch-22 break).
+      - rate-limited-suppressed — a genuine 429 already signalled this window
+                                  (idempotent; no re-rotate).
+      - degraded / scope-degraded / no-token — a probe FAILURE (was silent
+                                  best-effort; now observable per #1468 §5).
+
+    fresh / written / cooldown are the healthy/no-op ticks and produce empty
+    output. A parse error produces empty output (the wrapper emits no audit).
+    """
+    try:
+        payload = json.loads(args.probe_json)
+    except Exception:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    status = str(payload.get("status") or "")
+    noteworthy = {
+        "rate-limited-signal",
+        "rate-limited-suppressed",
+        "degraded",
+        "scope-degraded",
+        "no-token",
+    }
+    if status not in noteworthy:
+        return 0
+    print(
+        "\t".join(
+            [
+                status,
+                str(payload.get("reset_at") or ""),
+                str(payload.get("retry_after") if payload.get("retry_after") is not None else ""),
+                str(payload.get("http_status") if payload.get("http_status") is not None else ""),
+            ]
+        )
+    )
     return 0
 
 
@@ -1241,6 +1331,14 @@ SUBCOMMANDS = {
         "ids. With with_top_task=1, three more cols are appended: top_id, "
         "top_priority, top_title.",
     ),
+    "task-status": (
+        cmd_task_status,
+        [
+            ("db_path", "path to the queue sqlite DB"),
+            ("task_id", "task id to query"),
+        ],
+        "Single line: task status. Non-zero when the status cannot be confirmed.",
+    ),
     "nudge-eligibility-recheck": (
         cmd_nudge_eligibility_recheck,
         [
@@ -1289,6 +1387,12 @@ SUBCOMMANDS = {
         cmd_rotation_status_parse,
         [("rotate_json", "JSON envelope from bridge-auth.sh claude-token rotate --json")],
         "Single-row rotation outcome: status / reason / from / to / sync_status (5 cols).",
+    ),
+    # Issue #1468: classify a native usage-probe --json result for an audit row.
+    "usage-probe-result-parse": (
+        cmd_usage_probe_result_parse,
+        [("probe_json", "JSON result from bridge-usage-probe.py probe --json")],
+        "Single noteworthy-outcome row (status/reset_at/retry_after/http_status) or empty.",
     ),
     "recovery-status-parse": (
         cmd_recovery_status_parse,
