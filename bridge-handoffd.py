@@ -1035,19 +1035,13 @@ class HandoffHandler(BaseHTTPRequestHandler):
                               "error": f"target '{target}' not in allowlist for peer"})
             return
 
-        # --- room-scoped membership (A2A rooms, design §14 R2 — FAIL CLOSED) ---
-        # ADDED AFTER the existing HMAC/allowlist auth; it can only further
-        # restrict a room-scoped message, never relax a non-room one. P1a is
-        # single-node so production traffic is not room-scoped yet (this is
-        # the frozen seam P4 activates on the cross-node path).
-        room_ok, room_reason = room_scoped_check(env, cfg)
-        if not room_ok:
-            audit("reject_room_membership", peer=peer_id, client=client_ip,
-                  target=target, room_id=env.get("room_id"),
-                  reason=room_reason, message_id=message_id, security=True)
-            self._reply(403, {"ok": False,
-                              "error": f"room-scoped enqueue denied: {room_reason}"})
-            return
+        # NOTE: the room-scoped membership check (A2A rooms, design §14 R2)
+        # runs INSIDE _handle_dedupe_and_enqueue, AFTER the durable dedupe
+        # duplicate/hash-conflict handling and BEFORE staging/enqueue — so a
+        # room-scoped idempotent retry still resolves to its original task id
+        # and a hash-conflict is still recorded as the 409 security event,
+        # rather than being masked by a membership 403. It only gates a NEW
+        # room-scoped enqueue. See _handle_dedupe_and_enqueue.
 
         # --- title size cap ---
         max_title = int(a2a.peer_cap(peer, "max_title_bytes", a2a.DEFAULT_MAX_TITLE_BYTES))
@@ -1104,6 +1098,24 @@ class HandoffHandler(BaseHTTPRequestHandler):
                       message_id=message_id, security=True)
                 self._reply(409, {"ok": False,
                                   "error": "message id reused with different body"})
+                return
+
+            # --- room-scoped membership (A2A rooms, design §14 R2 — FAIL CLOSED) ---
+            # Runs AFTER the existing HMAC/source-addr/allowlist auth AND after
+            # the durable dedupe duplicate/hash-conflict handling above (so an
+            # idempotent room-scoped retry already returned its original task
+            # id, and a hash-conflict already 409'd) — it gates ONLY a NEW
+            # room-scoped enqueue, and can only ADD a denial, never relax a
+            # non-room message. P1a is single-node so production traffic is not
+            # room-scoped yet; this is the frozen seam P4 activates on the
+            # cross-node path with the leader-MAC'd roster verify.
+            room_ok, room_reason = room_scoped_check(env, cfg)
+            if not room_ok:
+                audit("reject_room_membership", peer=peer_id, client=client_ip,
+                      target=env.get("target_agent"), room_id=env.get("room_id"),
+                      reason=room_reason, message_id=message_id, security=True)
+                self._reply(403, {"ok": False,
+                                  "error": f"room-scoped enqueue denied: {room_reason}"})
                 return
 
             # --- backpressure: max open remote tasks per peer/target ---
