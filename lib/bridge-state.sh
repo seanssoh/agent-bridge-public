@@ -1302,6 +1302,31 @@ bridge_load_roster() {
   : "${BRIDGE_STALL_NETWORK_ESCALATE_SECONDS:=600}"
   : "${BRIDGE_STALL_UNKNOWN_ESCALATE_SECONDS:=600}"
   : "${BRIDGE_ADMIN_AGENT_ID:=}"
+  # Issue #1474 (v0.15.3 wrapper-path regression): EXPORT the resolved admin
+  # id so it survives an `exec` into a child process. The roster source above
+  # (controller `agent-roster.local.sh`, OR the iso UID's scoped
+  # `runtime/agent-env.sh` — both via plain assignment, never `export`) sets
+  # BRIDGE_ADMIN_AGENT_ID as a NON-exported shell var. The `agent-bridge`/`agb`
+  # wrapper runs `bridge_load_roster` then `exec`s `bridge-cron.sh create`
+  # (agent-bridge:cron dispatch); without this export the non-exported value
+  # is dropped across `exec`, and `run_create` never re-loads the roster — so
+  # `bridge_admin_agent_id()` returns "" in the child and the #1474 admin
+  # cross-agent cron exemption (`_bridge_cron_create_admin_cross_agent_allowed`)
+  # can never pass via the wrapper path (it works on a DIRECT `bash
+  # bridge-cron.sh` call only because the caller's session already exported the
+  # value — bridge-run.sh's `export BRIDGE_ADMIN_AGENT_ID="$(bridge_admin_agent_id)"`).
+  # This mirrors that runtime-path export so the load/wrapper path matches.
+  #
+  # SECURITY (does NOT weaken the #1359 iso/non-admin gate): the export only
+  # ever carries what THIS process's own roster scope resolved. A controller /
+  # admin session resolves the real admin id; an iso/non-admin agent's scope
+  # resolves either empty or the admin id from its scoped snapshot — but the
+  # gate is `BRIDGE_AGENT_ID == BRIDGE_ADMIN_AGENT_ID`, and a non-admin agent's
+  # BRIDGE_AGENT_ID is its OWN id (never the admin's), so the exemption still
+  # rejects it. (The CLI exemption is a friendly early-pass anyway; the real
+  # authorization gate is the daemon's controller-side staging.py re-validation
+  # with non-forgeable filesystem signals — see bridge-cron.sh.)
+  export BRIDGE_ADMIN_AGENT_ID
   if bridge_cron_sync_enabled; then
     BRIDGE_CRON_SYNC_ENABLED=1
   else
