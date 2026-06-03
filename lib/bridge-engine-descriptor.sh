@@ -38,6 +38,30 @@ bridge_engine_is_supported() {
   esac
 }
 
+# bridge_engine_binary_name <engine>
+#
+# Engine → CLI binary name. The engine identifier in the descriptor
+# (used by `bridge_agent_engine`, the roster, and the layout helpers)
+# is not always the same string as the binary the host PATH resolves.
+# Today the asymmetry is `antigravity`, which ships its CLI under
+# `agy`; tomorrow more engines may diverge the same way. All callers
+# that need to PATH-check or exec an engine binary should route
+# through this helper rather than assuming engine-name == binary-name.
+#
+# Prints the binary name on stdout and returns 0 for known engines;
+# prints nothing and returns 1 for unknown engines so callers can
+# fall back to legacy bare-engine-name behavior (the current
+# autostart gate does exactly that — see bridge-daemon.sh).
+bridge_engine_binary_name() {
+  local engine="${1:-}"
+  case "$engine" in
+    claude) printf 'claude' ;;
+    codex) printf 'codex' ;;
+    antigravity) printf 'agy' ;;
+    *) return 1 ;;
+  esac
+}
+
 # bridge_engine_entrypoint_filename <engine>
 #
 # The engine's primary instruction-file name.

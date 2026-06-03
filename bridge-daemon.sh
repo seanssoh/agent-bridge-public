@@ -9345,11 +9345,25 @@ process_on_demand_agents() {
         # not a daemon bug.
         local _agent_engine
         _agent_engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
-        if [[ -n "$_agent_engine" ]] && ! command -v "$_agent_engine" >/dev/null 2>&1; then
-          bridge_daemon_note_autostart_failure "$agent" "engine-cli-missing:$_agent_engine"
-          daemon_info "auto-start skipped ${agent} — engine CLI '$_agent_engine' not on PATH"
-          unset _agent_engine
-          continue
+        if [[ -n "$_agent_engine" ]]; then
+          # Engine identifier (descriptor key) and the actual launched
+          # binary are not always the same string — e.g. `antigravity`
+          # ships its CLI as `agy`. Route the PATH probe through the
+          # engine→binary mapping so non-default engines are not
+          # permanently skipped with `engine-cli-missing` when the
+          # binary is installed under its real name. Fall back to the
+          # engine token itself (legacy behavior) when the descriptor
+          # does not know the engine, so new/unmapped engines still
+          # get a best-effort gate instead of silently passing.
+          local _agent_engine_bin
+          _agent_engine_bin="$(bridge_engine_binary_name "$_agent_engine" 2>/dev/null || printf '%s' "$_agent_engine")"
+          if ! command -v "$_agent_engine_bin" >/dev/null 2>&1; then
+            bridge_daemon_note_autostart_failure "$agent" "engine-cli-missing:$_agent_engine_bin"
+            daemon_info "auto-start skipped ${agent} — engine binary '$_agent_engine_bin' (engine='$_agent_engine') not on PATH"
+            unset _agent_engine _agent_engine_bin
+            continue
+          fi
+          unset _agent_engine_bin
         fi
         unset _agent_engine
         # Issue #1269 (v0.15.0-beta4 Lane E): self-heal the per-agent
