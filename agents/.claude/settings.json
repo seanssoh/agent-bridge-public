@@ -65,17 +65,6 @@
         ]
       }
     ],
-    "PermissionDenied": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.agent-bridge/hooks/permission_escalation.py",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
     "PreCompact": [
       {
         "hooks": [

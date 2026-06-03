@@ -284,8 +284,9 @@ bridge_migration_isolate() {
     fi
     # Issue #544 PR2 — install bridge hook entries into the freshly
     # provisioned isolated HOME so SessionStart, UserPromptSubmit, Stop,
-    # PermissionDenied, PreToolUse/PostToolUse all fire from first
-    # session.
+    # PreCompact, PreToolUse/PostToolUse all fire from first session.
+    # (#1495: the legacy PermissionDenied hook is gone — Claude Code
+    # rejects that event name and skips the whole settings file.)
     # Issue #752 W3c (M9) — settings install is load-bearing on a fresh
     # isolate: without it, the agent can start under linux-user isolation
     # without bridge hooks rendered into its .claude/settings.local.json.
