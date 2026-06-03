@@ -111,6 +111,10 @@ add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-
 add_required 1425-cron-dispatch-nudge-scope
 add_required 1936-forward-followup-attached-escalation
 add_required 1473-agent-list-iso-state-fallback
+# #8945 Track B: expanded Codex hook coverage (PreCompact / PostCompact /
+# SubagentStart / SubagentStop / PermissionRequest). All audit-only by default;
+# the permission-request smoke pins the security contract.
+add_required codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook
 # Incident #8807 P1: in the full static suite so a change to the coalesce smoke
 # helper (scripts/smoke/8807-cron-backfill-coalesce-helper.py) — which hits the
 # scripts/smoke/* catch-all → add_all_required_static — still re-runs the
@@ -121,6 +125,21 @@ add_required 8807-cron-backfill-coalesce
 # scripts/smoke/* catch-all → add_all_required_static — still re-runs the
 # reaper-pattern smoke.
 add_required 8807-mcp-reaper-patterns
+# #8945 Track A: the engine-aware urgent-nudge-body smoke. In the full static
+# suite so a scripts/smoke/* or lib/bridge-agents.sh change re-runs it via the
+# catch-all. (1067-codex-provisioning is already listed above.)
+add_required codex-nudge-body
+# #8945 Track D: availability-gated `codex doctor` smoke (graceful SKIP when
+# codex is absent — the CI default — so a codex-less host is never a false
+# release blocker) + the bridge-upgrade.sh codex-version advisory surface.
+# In the full static suite so a scripts/smoke/*, bridge-watchdog.py, or
+# bridge-upgrade.sh change re-runs them via the catch-all / default arm.
+add_required codex-doctor codex-version-surface
+# #8945 Track C: agent-scoped Codex slash-command + permission-profile
+# provisioning. In the full static suite so a scripts/smoke/*, lib/bridge-
+# agents.sh, bridge-agent.sh, or assets/codex/* change re-runs them via the
+# catch-all / arm-specific selection below.
+add_required codex-slash-commands codex-permission-profiles
 
 
 }
@@ -200,6 +219,33 @@ select_for_path() {
       # the global required smokes. This case precedes that return so a
       # template-text drift still pulls the #1060 layout smokes.
       add_required 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning
+      ;;
+    agents/_template/codex/AGENTS.md)
+      # #8945 Track A: the dedicated Codex entrypoint template carries the
+      # explicit Task Processing Protocol that bridge_scaffold_codex_entrypoint
+      # renders into a Codex agent's AGENTS.md (the Claude CLAUDE.md leaves the
+      # protocol implicit — the #8945 wedge). It is a .md file, so the
+      # is_docs_only_path early-return below would otherwise select only the
+      # global required smokes. This case precedes that return so a drift in the
+      # protocol marker, the managed-marker comment, or the placeholder set
+      # still pulls the codex-provisioning smoke (which asserts the rendered
+      # AGENTS.md contains the protocol + the agb-done close step).
+      add_required 1067-codex-provisioning
+      ;;
+    assets/codex/prompts/*|assets/codex/profiles/*)
+      # #8945 Track C: the agent-scoped Codex slash-command prompt templates and
+      # the bridge-role permission profiles (real <role>.config.toml files that
+      # `codex -p bridge-<role>` layers). bridge_ensure_codex_agent_slash_commands
+      # renders these into <agent_home>/.codex/ (never the controller ~/.codex).
+      # The prompt files are .md and the profiles are non-.sh, so the
+      # is_docs_only_path early-return below would otherwise select only the
+      # global required smokes. This pre-case lifts ahead of the short-circuit so
+      # a drift in the managed marker, an agb verb/flag, the <agent-id>/<agent-
+      # home>/<bridge-home> placeholder set, a sandbox_mode, or a role-profile
+      # filename still pulls the Track C smokes (which assert the rendered assets
+      # land agent-scoped, carry valid agb verbs + real loadable config profiles,
+      # are idempotent, and never touch the controller ~/.codex).
+      add_required codex-slash-commands codex-permission-profiles
       ;;
     agent-roster.local.example.sh)
       # v0.15.0-beta1 Lane I: the example roster is operator-facing copy.
@@ -1459,6 +1505,21 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # bridge-start.sh — pull on every move of either so a refactor
       # cannot drop the create-side mark or the start-side clear.
       add_required 1353-setup-pending-grace
+      # #8945 Track A: bridge-send.sh hosts urgent_nudge_body — the engine-aware
+      # urgent-nudge body branch (Codex gets the explicit multi-step protocol,
+      # Claude keeps the one-liner, unknown engine fail-safes to the one-liner).
+      # Pull codex-nudge-body on every bridge-send.sh move so a refactor cannot
+      # silently collapse the branch back to the engine-blind one-liner that
+      # wedged the Codex patch-dev. (1067-codex-provisioning is already pulled
+      # by this arm's add_required block above.)
+      add_required codex-nudge-body
+      # #8945 Track C: bridge-agent.sh's run_create calls
+      # bridge_ensure_codex_agent_slash_commands (next to bridge_ensure_codex_
+      # agent_hooks, gated on engine==codex) to deploy the agb-* slash commands
+      # + bridge-role permission profiles into the agent-scoped .codex/ tree.
+      # Pull the Track C smokes on every bridge-agent.sh move so a refactor
+      # cannot drop the wire-up or let it leak into the controller ~/.codex.
+      add_required codex-slash-commands codex-permission-profiles
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -1957,6 +2018,20 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_integration integration-minimal
       ;;
 
+    hooks/codex-pre-compact.py|hooks/codex-post-compact.py|hooks/codex-subagent-start.py|hooks/codex-subagent-stop.py|hooks/codex-permission-request.py)
+      # #8945 Track B — expanded Codex hook coverage (PreCompact /
+      # PostCompact / SubagentStart / SubagentStop / PermissionRequest), all
+      # audit-only by default. Each new hook has a focused smoke; the
+      # PermissionRequest smoke additionally pins the security contract
+      # (redaction, dedupe/throttle, no-default-side-effect, and the
+      # auto-queue teeth). codex-companion-hooks is pulled too because it is
+      # the source-of-truth for the ensure-codex-hooks render wiring these
+      # events extend. This arm precedes the generic hooks/* catch-all so a
+      # change to one of these hooks runs the targeted Track B smokes.
+      add_required codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook codex-companion-hooks hooks
+      add_integration integration-minimal
+      ;;
+
     hooks/*|bridge-hooks.py|lib/bridge-hooks.sh)
       # Issue #544 PR2 — bridge-hooks.py grew the
       # `render-isolated-home-settings` subcommand and lib/bridge-hooks.sh
@@ -2048,7 +2123,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # top_claimed_row. Pull 1199-action-required-claimed-skip on every
       # hooks/* move so a future patch cannot re-add claimed to the ACTION
       # REQUIRED count or drop the codex continue-claimed-work block.
-      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1205-hook-iso-fail-open 1212-bridge-hooks-marketplace 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers 1358-admin-credential-routine-exempt 1199-action-required-claimed-skip
+      # #8945 Track B: bridge-hooks.py's cmd_ensure_codex_hooks now renders 5
+      # additional Codex events (PreCompact / PostCompact / SubagentStart /
+      # SubagentStop / PermissionRequest) at hooks/codex-*.py. Pull the Track B
+      # per-hook smokes so a change to the renderer re-runs the render-wiring +
+      # PermissionRequest security (redaction / throttle / no-side-effect / teeth)
+      # assertions.
+      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1205-hook-iso-fail-open 1212-bridge-hooks-marketplace 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers 1358-admin-credential-routine-exempt 1199-action-required-claimed-skip codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook
       add_integration integration-minimal
       ;;
 
@@ -2131,7 +2212,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # populated → conflict bail) and the run_sync wiring. Pull on
       # every bridge-upgrade.sh move so the backfill call cannot
       # silently regress.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds
+      # #8945 Track D: bridge-upgrade.sh gained
+      # bridge_upgrade_emit_codex_version_advisory — records codex --version
+      # into state/upgrade/codex-version.last and surfaces a NON-fatal
+      # operator advisory on a major/minor change (skips silently when codex
+      # is absent). Pull codex-version-surface on every upgrade-entry move so
+      # the first-seen / patch-bump / major-minor / suppress / dry-run matrix
+      # cannot regress (and the extraction seam stays bound to the live
+      # function body).
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor
       add_integration integration-minimal
       ;;
 
@@ -2383,7 +2472,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # iso-uid-side). Pull G-beta4-watchdog-noise on every
       # bridge-watchdog.py move so a future refactor cannot regress any
       # of those four contracts without the smoke catching it.
-      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise queue
+      # #8945 Track D: ε-watchdog-rescan-codex now also pins the shared-
+      # workdir AGENTS.md home fall-back (a Codex `<admin>-dev` pair layered
+      # onto a shared workdir materializes its per-agent AGENTS.md into its
+      # agent_home, not the scanned workdir — the watchdog must treat the
+      # entrypoint as present in EITHER location, while a genuinely missing
+      # AGENTS.md still surfaces as drift). codex-doctor is pulled too so the
+      # availability-gated codex env/auth smoke rides along on watchdog moves
+      # that touch the codex contract surface.
+      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise codex-doctor queue
       add_integration integration-minimal
       ;;
 

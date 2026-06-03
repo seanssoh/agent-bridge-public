@@ -3900,14 +3900,18 @@ report and reap test-fixture agents per their pattern."
     # in-roster lookup inside scaffold would short-circuit the sudo path
     # — see the comment on `bridge_scaffold_agent_home`'s signature.
     bridge_scaffold_agent_home "$agent" "$scaffold_target" "$display_name" "$role_text" "$engine" "$session_type" "$isolation_mode" "$os_user"
-    # Issue #1067 S03: create the engine-native instruction-file entrypoint
-    # in the identity source. The template scaffold loop places CLAUDE.md for
-    # every engine; for Codex (entrypoint=AGENTS.md) this step copies that
-    # payload to AGENTS.md so the Codex runtime finds its role contract under
-    # the canonical filename. bridge_layout_materialize_identity (below) then
-    # delivers AGENTS.md into the workspace. No-op for Claude (entrypoint is
-    # already CLAUDE.md).
-    bridge_scaffold_codex_entrypoint "$scaffold_target" "$engine" 2>/dev/null || true
+    # Issue #1067 S03 + #8945 Track A: create the engine-native instruction-
+    # file entrypoint in the identity source. For Codex (entrypoint=AGENTS.md)
+    # this renders the dedicated `agents/_template/codex/AGENTS.md` protocol
+    # template (with the same per-agent substitution the CLAUDE.md scaffold
+    # uses) so the Codex runtime finds an explicit claim→process→done Task
+    # Processing Protocol — not the implicit Claude CLAUDE.md, which depends
+    # on the Claude skill to expand a one-line nudge (the #8945 wedge). Falls
+    # back to the CLAUDE.md → AGENTS.md copy when the codex template is absent.
+    # bridge_layout_materialize_identity (below) then delivers AGENTS.md into
+    # the workspace. No-op for Claude (entrypoint is already CLAUDE.md).
+    bridge_scaffold_codex_entrypoint "$scaffold_target" "$engine" \
+      "$agent" "$display_name" "$role_text" "$session_type" 2>/dev/null || true
     # Per-user partitions (`users/<id>/USER.md`) are per-agent identity,
     # so they are scaffolded into the IDENTITY SOURCE alongside the rest
     # of the authored identity — the `users/` skeleton template lands
@@ -3997,6 +4001,15 @@ report and reap test-fixture agents per their pattern."
     # the descriptor owns for future engines).
     if [[ "$engine" == "codex" ]]; then
       bridge_ensure_codex_agent_hooks "$agent" "$scaffold_target" >/dev/null 2>&1 || true
+      # #8945 Track C: deploy the agent-bridge Codex custom slash commands
+      # (/agb-inbox, /agb-claim, /agb-done, /agb-handoff) + bridge-role
+      # permission profiles into the SAME agent-scoped .codex/ tree as the
+      # hooks above (<scaffold_target>/.codex/), never the controller ~/.codex.
+      # Idempotent: re-runs refresh only bridge-managed assets.
+      if declare -F bridge_ensure_codex_agent_slash_commands >/dev/null 2>&1; then
+        bridge_ensure_codex_agent_slash_commands "$agent" "$scaffold_target" \
+          >/dev/null 2>&1 || true
+      fi
     fi
     # Issue #1105: capture the roster-file sha BEFORE the write so the
     # system_config_mutation audit row emitted below carries a real

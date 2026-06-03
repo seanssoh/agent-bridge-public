@@ -6,21 +6,32 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.3] — 2026-06-03
+
+A process-stability + Codex-provisioning batch on top of `0.15.2`. Every item is codex pair-reviewed and CI-green (syntax + unit/static + oss-preflight + lint-heredoc-ban + lint + integration smoke). The marquee items are the incident-#8807 process-explosion fail-safes (resource guard + MCP-orphan reaper + cron-backfill coalesce) and the Codex provisioning upgrade wave (#8945: AGENTS.md task-protocol template + engine-aware nudge, 5 new audit-only hooks, availability-gated doctor + watchdog contract fix, agent-scoped slash commands + permission profiles).
+
+### Added
+
+- **Codex provisioning upgrade wave (#8945, 4 tracks).** Brings the bridge's Codex provisioning up to codex-cli 0.135/0.136 capability:
+  - **Track A — Codex AGENTS.md template + engine-aware nudge (#1484).** A dedicated `agents/_template/codex/AGENTS.md` with an explicit Task Processing Protocol (claim→process→done, full `agb` paths, literal-nudge interpretation) so a Codex agent stops interpreting a one-line nudge as a single command; `bridge_scaffold_codex_entrypoint` now prefers the Codex template for Codex engines (Claude unchanged, fallback preserved); and the urgent nudge body in `bridge-send.sh` is engine-aware (Claude one-liner, Codex explicit multi-step, fail-safe on unknown engine).
+  - **Track B — Codex hook expansion (#1485).** Five new audit-only-by-default Codex hooks — PreCompact, PostCompact, SubagentStart, SubagentStop, PermissionRequest — rendered by `bridge-hooks.py ensure-codex-hooks`. The PermissionRequest hook is bounded/redacted (an allowlist of known Codex tool identifiers + the `mcp__server__tool` shape persist; everything else collapses to `redacted-tool` + a one-way `tool_sha256`), deduped/throttled, fail-open and recursion-guarded, with no allow/deny side effect unless an explicit enforcement env is set.
+  - **Track C — agent-scoped Codex slash commands + permission profiles (#1487).** Four custom-prompt templates (`agb-inbox/claim/done/handoff`) and three real Codex config profiles (`bridge-reviewer` read-only, `bridge-worker` workspace-write, `bridge-admin`) installed **agent-scoped** under `<agent_home>/.codex/` (selected via `codex -p bridge-<role>`), never the controller's global `~/.codex`.
+  - **Track D — availability-gated `codex doctor` + watchdog AGENTS.md contract + version surface (#1486).** A `codex doctor` smoke that gracefully skips when the `codex` CLI is absent (no false release blockers); a watchdog fix so a Codex agent's `AGENTS.md` is recognized in either the workdir or the agent home (eliminates the `--allow-shared-workdir` false drift); and a non-fatal operator advisory on a `codex --version` major/minor change.
+
 ### Fixed
 
-- **Engine→binary mapping for the daemon autostart gate.** The always-on
-  auto-start gate in `bridge-daemon.sh` probed `command -v <engine>`
-  against the engine identifier, so a roster entry with `engine=antigravity`
-  (CLI binary `agy`) was permanently skipped with
-  `engine-cli-missing:antigravity` even when the binary was installed under
-  its real name. A new `bridge_engine_binary_name()` helper in
-  `lib/bridge-engine-descriptor.sh` maps engine identifier → CLI binary
-  (`claude→claude`, `codex→codex`, `antigravity→agy`); the daemon gate
-  now routes its PATH probe through that helper and the audit reason
-  reports the real binary (`engine-cli-missing:agy`) for traceability,
-  with a legacy bare-engine fallback for unknown engines. On the
-  operator's `sean-mac`, the `patch-agy` static agent had 94 consecutive
-  false-positive failures before this fix.
+- **Incident #8807 — process-explosion fail-safes.** A wave fan-out (each fixer ≈ a full Claude + MCP fleet) accumulated orphaned processes until memory exhaustion made `fork()` fail and forced a host reboot. Three structural fail-safes:
+  - **Resource guard at every daemon spawn site (#1479, P0a).** `lib/bridge-resource-guard.sh` fail-OPEN pre-flight defers a disposable-child spawn (leaving the work queued) when memory is pressured or per-uid process count crosses a threshold; wired at every `bridge-daemon.sh` spawn site (cron worker, cron-dispatch, supp-refresh, auto-start) with throttled audit/warn.
+  - **MCP-orphan reaper patterns tightened + extended (#1482, P0b).** The periodic MCP-orphan reaper's `DEFAULT_PATTERNS` are tightened to bridge-owned provenance (plugin-cache-anchored crm/shopify/bun matchers) and extended to the missing signatures, with a PID-reuse revalidation before TERM/KILL and an early sweep at the top of the sync cycle. Deliberately never matches Pencil.app's `mcp-server-darwin-arm64` or live `codex resume` pairs.
+  - **Cron backfill coalesce (#1481, P1).** A daemon restart after downtime no longer replays a burst of missed picker-sweep/idempotent occurrences into the inbox; catch-up is coalesced (keep-latest, cap 1) before enqueue.
+- **Engine→binary mapping for the daemon autostart gate (#1483).** The always-on auto-start gate in `bridge-daemon.sh` probed `command -v <engine>` against the engine identifier, so a roster entry with `engine=antigravity` (CLI binary `agy`) was permanently skipped with `engine-cli-missing:antigravity` even when the binary was installed under its real name. A new `bridge_engine_binary_name()` helper in `lib/bridge-engine-descriptor.sh` maps engine identifier → CLI binary (`claude→claude`, `codex→codex`, `antigravity→agy`); the daemon gate now routes its PATH probe through that helper and the audit reason reports the real binary (`engine-cli-missing:agy`) for traceability, with a legacy bare-engine fallback for unknown engines. On the operator's `sean-mac`, the `patch-agy` static agent had 94 consecutive false-positive failures before this fix.
+- **`bridge-core.sh` heredoc-stdin → `python3 -c` + daily-backup excludes (#1466 / #1462, #1478).** Removes two footgun-#11 heredoc-stdin sites in `bridge_now_iso`/`bridge_nonce`, and excludes regenerable per-agent trees (`.claude/security/agent-sdk-venv`, `.local/share/claude/versions`) from the daily backup so the walk+gzip stops blowing the timeout on multi-agent installs.
+- **A2A iso-boundary fixes (#1473 / #1474).** `agb agent list` no longer false-reports a stopped agent from inside an iso UID (iso-readable all-agent state aggregate), and genuine controller/admin cross-agent cron provisioning is allowed via a non-forgeable daemon-staging gate.
+- **Daemon cron-nudge hygiene (#1458 / #1471).** Cron backlog is kept out of human "ACTION REQUIRED" nudges, and attached human cron followups are escalated correctly.
+
+### Changed
+
+- **wave-orchestration skill synced to the repo (#1477).** The repo-tracked `.claude/skills/wave-orchestration/SKILL.md` now matches the evolved 5-phase skill, including Phase 3.5 (monitor dispatched fixers — wedge detection + the rule that a taken-over wedge-recovery PR still gets a Phase-4 pair-review).
 
 ## [0.15.2] — 2026-06-01
 

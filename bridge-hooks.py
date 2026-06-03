@@ -372,6 +372,34 @@ def codex_review_output_shape_hook_command(bridge_home: Path, python_bin: str) -
     return shell_command(python_bin, shell_path(hook_path))
 
 
+# #8945 Track B — expanded Codex hook coverage (PreCompact/PostCompact/
+# SubagentStart/SubagentStop/PermissionRequest). All audit-only by default;
+# any enforcement is env-gated inside the hook scripts themselves.
+def codex_pre_compact_hook_command(bridge_home: Path, python_bin: str) -> str:
+    hook_path = bridge_home / "hooks" / "codex-pre-compact.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
+def codex_post_compact_hook_command(bridge_home: Path, python_bin: str) -> str:
+    hook_path = bridge_home / "hooks" / "codex-post-compact.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
+def codex_subagent_start_hook_command(bridge_home: Path, python_bin: str) -> str:
+    hook_path = bridge_home / "hooks" / "codex-subagent-start.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
+def codex_subagent_stop_hook_command(bridge_home: Path, python_bin: str) -> str:
+    hook_path = bridge_home / "hooks" / "codex-subagent-stop.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
+def codex_permission_request_hook_command(bridge_home: Path, python_bin: str) -> str:
+    hook_path = bridge_home / "hooks" / "codex-permission-request.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
 def resolve_settings_path(args: argparse.Namespace) -> Path:
     settings_file = getattr(args, "settings_file", None)
     if settings_file:
@@ -471,6 +499,28 @@ def is_codex_task_mode_policy_hook(command: str) -> bool:
 
 def is_codex_review_output_shape_hook(command: str) -> bool:
     return "codex-review-output-shape.py" in str(command)
+
+
+# #8945 Track B predicates — match the new Codex hook commands so re-render
+# rewrites in place rather than appending duplicates.
+def is_codex_pre_compact_hook(command: str) -> bool:
+    return "codex-pre-compact.py" in str(command)
+
+
+def is_codex_post_compact_hook(command: str) -> bool:
+    return "codex-post-compact.py" in str(command)
+
+
+def is_codex_subagent_start_hook(command: str) -> bool:
+    return "codex-subagent-start.py" in str(command)
+
+
+def is_codex_subagent_stop_hook(command: str) -> bool:
+    return "codex-subagent-stop.py" in str(command)
+
+
+def is_codex_permission_request_hook(command: str) -> bool:
+    return "codex-permission-request.py" in str(command)
 
 
 def find_command_hook(
@@ -976,8 +1026,28 @@ def cmd_status_codex_hooks(args: argparse.Namespace) -> int:
     _prompt_group, prompt_hook = find_command_hook(prompt_hooks, is_codex_prompt_hook)
     _task_mode_group, task_mode_hook = find_command_hook(pretool_hooks, is_codex_task_mode_policy_hook)
     _output_shape_group, output_shape_hook = find_command_hook(stop_hooks, is_codex_review_output_shape_hook)
+    # #8945 Track B — expanded event coverage.
+    pre_compact_hooks = hooks_list(settings, "PreCompact")
+    post_compact_hooks = hooks_list(settings, "PostCompact")
+    subagent_start_hooks = hooks_list(settings, "SubagentStart")
+    subagent_stop_hooks = hooks_list(settings, "SubagentStop")
+    permission_request_hooks = hooks_list(settings, "PermissionRequest")
+    _pc_group, pre_compact_hook = find_command_hook(pre_compact_hooks, is_codex_pre_compact_hook)
+    _poc_group, post_compact_hook = find_command_hook(post_compact_hooks, is_codex_post_compact_hook)
+    _ss_group, subagent_start_hook = find_command_hook(subagent_start_hooks, is_codex_subagent_start_hook)
+    _sx_group, subagent_stop_hook = find_command_hook(subagent_stop_hooks, is_codex_subagent_stop_hook)
+    _pr_group, permission_request_hook = find_command_hook(
+        permission_request_hooks, is_codex_permission_request_hook
+    )
     core_present = bool(session_hook and stop_hook and prompt_hook)
     companion_present = bool(task_mode_hook and output_shape_hook)
+    expanded_present = bool(
+        pre_compact_hook
+        and post_compact_hook
+        and subagent_start_hook
+        and subagent_stop_hook
+        and permission_request_hook
+    )
     payload = {
         "CODEX_HOOKS_FILE": str(hooks_path),
         "CODEX_HOOK_STATUS": "present" if core_present else "missing",
@@ -987,11 +1057,22 @@ def cmd_status_codex_hooks(args: argparse.Namespace) -> int:
         "CODEX_TASK_MODE_POLICY_HOOK": "present" if task_mode_hook else "missing",
         "CODEX_REVIEW_OUTPUT_SHAPE_HOOK": "present" if output_shape_hook else "missing",
         "CODEX_COMPANION_HOOKS_STATUS": "present" if companion_present else "missing",
+        "CODEX_PRE_COMPACT_HOOK": "present" if pre_compact_hook else "missing",
+        "CODEX_POST_COMPACT_HOOK": "present" if post_compact_hook else "missing",
+        "CODEX_SUBAGENT_START_HOOK": "present" if subagent_start_hook else "missing",
+        "CODEX_SUBAGENT_STOP_HOOK": "present" if subagent_stop_hook else "missing",
+        "CODEX_PERMISSION_REQUEST_HOOK": "present" if permission_request_hook else "missing",
+        "CODEX_EXPANDED_HOOKS_STATUS": "present" if expanded_present else "missing",
         "CODEX_SESSION_START_COMMAND": str(session_hook.get("command") or "") if session_hook else "",
         "CODEX_STOP_COMMAND": str(stop_hook.get("command") or "") if stop_hook else "",
         "CODEX_PROMPT_COMMAND": str(prompt_hook.get("command") or "") if prompt_hook else "",
         "CODEX_TASK_MODE_POLICY_COMMAND": str(task_mode_hook.get("command") or "") if task_mode_hook else "",
         "CODEX_REVIEW_OUTPUT_SHAPE_COMMAND": str(output_shape_hook.get("command") or "") if output_shape_hook else "",
+        "CODEX_PRE_COMPACT_COMMAND": str(pre_compact_hook.get("command") or "") if pre_compact_hook else "",
+        "CODEX_POST_COMPACT_COMMAND": str(post_compact_hook.get("command") or "") if post_compact_hook else "",
+        "CODEX_SUBAGENT_START_COMMAND": str(subagent_start_hook.get("command") or "") if subagent_start_hook else "",
+        "CODEX_SUBAGENT_STOP_COMMAND": str(subagent_stop_hook.get("command") or "") if subagent_stop_hook else "",
+        "CODEX_PERMISSION_REQUEST_COMMAND": str(permission_request_hook.get("command") or "") if permission_request_hook else "",
     }
     print_codex_payload(payload, args.format)
     if args.format != "shell":
@@ -1004,6 +1085,11 @@ def cmd_status_codex_hooks(args: argparse.Namespace) -> int:
         print(f"review_output_shape_hook: {'present' if output_shape_hook else 'missing'}")
         if output_shape_hook:
             print(f"review_output_shape_command: {str(output_shape_hook.get('command') or '')}")
+        print(f"pre_compact_hook: {'present' if pre_compact_hook else 'missing'}")
+        print(f"post_compact_hook: {'present' if post_compact_hook else 'missing'}")
+        print(f"subagent_start_hook: {'present' if subagent_start_hook else 'missing'}")
+        print(f"subagent_stop_hook: {'present' if subagent_stop_hook else 'missing'}")
+        print(f"permission_request_hook: {'present' if permission_request_hook else 'missing'}")
     return 0 if core_present else 1
 
 
@@ -1067,6 +1153,65 @@ def cmd_ensure_codex_hooks(args: argparse.Namespace) -> int:
         status_message="Validating Codex review output shape",
     ) or changed
 
+    # #8945 Track B — expanded event coverage. Codex CLI 0.135.0/0.136.0
+    # supports 10 hook events; the bridge previously rendered only 5
+    # (SessionStart / Stop×2 / UserPromptSubmit / PreToolUse). These five
+    # add compaction, subagent fan-out, and permission-request coverage.
+    # ALL audit-only by default; enforcement (if any) is env-gated inside
+    # each hook script. The PermissionRequest hook is the security-sensitive
+    # one — it is bounded, redacted, deduped/throttled, and emits NO
+    # allow/deny decision by default (operators opt into the queue-task
+    # surface via BRIDGE_CODEX_PERMISSION_AUTO_QUEUE=on). Older Codex CLIs
+    # that predate these events ignore the unknown event keys without
+    # hard-failing, so the entries are safe to write either way.
+    pre_compact_command = codex_pre_compact_hook_command(bridge_home, args.python_bin)
+    post_compact_command = codex_post_compact_hook_command(bridge_home, args.python_bin)
+    subagent_start_command = codex_subagent_start_hook_command(bridge_home, args.python_bin)
+    subagent_stop_command = codex_subagent_stop_hook_command(bridge_home, args.python_bin)
+    permission_request_command = codex_permission_request_hook_command(
+        bridge_home, args.python_bin
+    )
+    changed = ensure_command_hook(
+        hooks_path,
+        "PreCompact",
+        pre_compact_command,
+        is_codex_pre_compact_hook,
+        timeout=20,
+        status_message="Snapshotting Agent Bridge canonical context",
+    ) or changed
+    changed = ensure_command_hook(
+        hooks_path,
+        "PostCompact",
+        post_compact_command,
+        is_codex_post_compact_hook,
+        timeout=5,
+        status_message="Restoring Agent Bridge queue context",
+    ) or changed
+    changed = ensure_command_hook(
+        hooks_path,
+        "SubagentStart",
+        subagent_start_command,
+        is_codex_subagent_start_hook,
+        timeout=3,
+        status_message="Recording Agent Bridge subagent fan-out",
+    ) or changed
+    changed = ensure_command_hook(
+        hooks_path,
+        "SubagentStop",
+        subagent_stop_command,
+        is_codex_subagent_stop_hook,
+        timeout=3,
+        status_message="Recording Agent Bridge subagent completion",
+    ) or changed
+    changed = ensure_command_hook(
+        hooks_path,
+        "PermissionRequest",
+        permission_request_command,
+        is_codex_permission_request_hook,
+        timeout=5,
+        status_message="Recording Agent Bridge permission request",
+    ) or changed
+
     payload = {
         "CODEX_HOOKS_FILE": str(hooks_path),
         "CODEX_HOOK_STATUS": "updated" if changed else "unchanged",
@@ -1075,11 +1220,21 @@ def cmd_ensure_codex_hooks(args: argparse.Namespace) -> int:
         "CODEX_PROMPT_HOOK": "present",
         "CODEX_TASK_MODE_POLICY_HOOK": "present",
         "CODEX_REVIEW_OUTPUT_SHAPE_HOOK": "present",
+        "CODEX_PRE_COMPACT_HOOK": "present",
+        "CODEX_POST_COMPACT_HOOK": "present",
+        "CODEX_SUBAGENT_START_HOOK": "present",
+        "CODEX_SUBAGENT_STOP_HOOK": "present",
+        "CODEX_PERMISSION_REQUEST_HOOK": "present",
         "CODEX_SESSION_START_COMMAND": session_command,
         "CODEX_STOP_COMMAND": stop_command,
         "CODEX_PROMPT_COMMAND": prompt_command,
         "CODEX_TASK_MODE_POLICY_COMMAND": task_mode_command,
         "CODEX_REVIEW_OUTPUT_SHAPE_COMMAND": output_shape_command,
+        "CODEX_PRE_COMPACT_COMMAND": pre_compact_command,
+        "CODEX_POST_COMPACT_COMMAND": post_compact_command,
+        "CODEX_SUBAGENT_START_COMMAND": subagent_start_command,
+        "CODEX_SUBAGENT_STOP_COMMAND": subagent_stop_command,
+        "CODEX_PERMISSION_REQUEST_COMMAND": permission_request_command,
     }
     print_codex_payload(payload, args.format)
     if args.format != "shell":

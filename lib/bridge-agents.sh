@@ -10164,18 +10164,37 @@ bridge_upsert_env_value() {
   mv "$tmp_file" "$env_file"
 }
 
-# bridge_scaffold_codex_entrypoint <home> <engine>
+# bridge_scaffold_codex_entrypoint <home> <engine> [agent] [display_name] [role_text] [session_type]
 #
-# Issue #1067 S03: write AGENTS.md as the engine-native entrypoint for a
-# Codex agent into its identity source (agent_home). The template scaffold
-# loop places CLAUDE.md for every engine (the template only has CLAUDE.md);
-# for Codex the native instruction-file convention is AGENTS.md. This
-# function creates AGENTS.md as a copy of CLAUDE.md in the same directory
-# so the Codex runtime finds its role contract under the canonical filename,
-# and bridge_layout_materialize_identity then delivers AGENTS.md into the
+# Issue #1067 S03 + #8945 Track A: write AGENTS.md as the engine-native
+# entrypoint for a Codex agent into its identity source (agent_home). The
+# template scaffold loop places CLAUDE.md for every engine (the shared
+# template only has CLAUDE.md); for Codex the native instruction-file
+# convention is AGENTS.md, and Codex needs an explicit Task Processing
+# Protocol that the Claude CLAUDE.md leaves implicit (it relies on the
+# agent-bridge Claude skill to expand a one-line `agb inbox` nudge into the
+# full claim→process→done workflow — Codex interprets that line literally and
+# stops after listing the inbox, the #8945 wedge).
+#
+# Source selection (engine-aware):
+#   * Codex: prefer the dedicated `agents/_template/codex/AGENTS.md` template
+#     (an explicit, linear protocol document). When present it is rendered
+#     with the same per-agent placeholder substitution the CLAUDE.md scaffold
+#     uses and written as the agent's AGENTS.md.
+#   * Fallback (codex template absent, e.g. an older source tree): copy the
+#     already-rendered CLAUDE.md to AGENTS.md — the pre-#8945 behavior, so
+#     there is no regression on trees that predate the codex template.
+#
+# bridge_layout_materialize_identity then delivers AGENTS.md into the
 # workspace (the descriptor already lists the engine entrypoint in its copy
 # set). Safe to call for any engine — it is a no-op when the descriptor
-# entrypoint is CLAUDE.md (i.e., not Codex).
+# entrypoint is CLAUDE.md (i.e., not Codex). The Claude path is untouched.
+#
+# The trailing per-agent args are optional: when omitted (e.g. a lib-only
+# smoke driver or an internal caller that has not threaded identity), the
+# template is rendered with a self-contained best-effort substitution and any
+# unresolved cosmetic placeholders simply remain — the protocol body itself
+# carries no per-agent placeholders, so it stays correct either way.
 #
 # Called from bridge-agent.sh (post-scaffold, before materialize) and
 # available from lib so smoke drivers sourcing bridge-lib.sh can assert
@@ -10183,13 +10202,183 @@ bridge_upsert_env_value() {
 bridge_scaffold_codex_entrypoint() {
   local home="$1"
   local engine="$2"
+  local agent="${3:-}"
+  local display_name="${4:-}"
+  local role_text="${5:-}"
+  local session_type="${6:-}"
   [[ -n "$home" && -n "$engine" ]] || return 0
   local entrypoint=""
   if declare -F bridge_engine_entrypoint_filename >/dev/null 2>&1; then
     entrypoint="$(bridge_engine_entrypoint_filename "$engine" 2>/dev/null || printf '')"
   fi
   [[ -n "$entrypoint" && "$entrypoint" != "CLAUDE.md" ]] || return 0
-  [[ -f "$home/CLAUDE.md" ]] || return 0
   [[ -f "$home/$entrypoint" ]] && return 0
+
+  # Engine-aware source: prefer the dedicated codex template.
+  local codex_template=""
+  if [[ -n "${BRIDGE_SCRIPT_DIR:-}" ]]; then
+    codex_template="$BRIDGE_SCRIPT_DIR/agents/_template/codex/AGENTS.md"
+  fi
+  if [[ -n "$codex_template" && -f "$codex_template" ]]; then
+    # Full-fidelity render when the bridge-agent.sh renderer is available
+    # (the real `agent create` path). Mirrors the CLAUDE.md scaffold so the
+    # codex AGENTS.md gets the identical per-agent placeholder substitution.
+    if declare -F bridge_render_template_string >/dev/null 2>&1; then
+      bridge_render_template_string \
+        "$codex_template" "$agent" "$display_name" "$role_text" \
+        "$engine" "$session_type" >"$home/$entrypoint" 2>/dev/null && return 0
+    fi
+    # Self-contained fallback render (lib-only contexts without the
+    # bridge-agent.sh renderer): copy the template and apply the same
+    # cosmetic placeholder substitutions in pure Bash. Unresolved
+    # placeholders are harmless — the protocol body carries none.
+    local runtime="Codex CLI"
+    [[ "$engine" == "claude" ]] && runtime="Claude Code CLI"
+    local rendered=""
+    if rendered="$(cat "$codex_template" 2>/dev/null)"; then
+      rendered="${rendered//<Agent Name>/${display_name:-$agent}}"
+      rendered="${rendered//<agent-id>/$agent}"
+      rendered="${rendered//<Role>/${role_text:-}}"
+      rendered="${rendered//<Runtime>/$runtime}"
+      rendered="${rendered//<한 줄 역할 설명>/${role_text:-}}"
+      rendered="${rendered//<표시 이름>/${display_name:-$agent}}"
+      rendered="${rendered//<핵심 책임>/${role_text:-}}"
+      rendered="${rendered//<주 요청자>/관리자 에이전트}"
+      rendered="${rendered//<반드시 지킬 운영 규칙>/큐를 source of truth로 삼고, claim/done note를 생략하지 않는다.}"
+      rendered="${rendered//<위험 작업 제한>/크리티컬 변경 전에는 dry-run 또는 관련 상태 확인을 먼저 수행한다.}"
+      rendered="${rendered//<보고 방식>/결과는 요청자 채널 또는 task queue로 반드시 남긴다.}"
+      printf '%s' "$rendered" >"$home/$entrypoint" 2>/dev/null && return 0
+    fi
+  fi
+
+  # Fallback (codex template absent): pre-#8945 CLAUDE.md → AGENTS.md copy.
+  [[ -f "$home/CLAUDE.md" ]] || return 0
   cp -f "$home/CLAUDE.md" "$home/$entrypoint" 2>/dev/null || true
+}
+
+# bridge_codex_managed_asset_marker — the literal marker line that stamps an
+# agent-bridge-managed Codex prompt / permission asset. Re-runs of the
+# scaffolder replace ONLY files carrying this marker; any prompt an agent
+# authored itself (no marker) is left untouched. Kept as a single function so
+# the smoke drivers and the writer agree on the exact token.
+bridge_codex_managed_asset_marker() {
+  printf 'agent-bridge:managed'
+}
+
+# bridge_codex_render_managed_asset <src> <dst> <agent> <agent_home> [bridge_home]
+#
+# Idempotent writer for a single agent-bridge-managed Codex asset (a prompt
+# template or the permissions profile file). Applies the per-agent placeholder
+# substitution in pure Bash (<agent-id>, <agent-home>, <bridge-home>) — the
+# same self-contained convention bridge_scaffold_codex_entrypoint's fallback
+# render uses — then writes to <dst> ONLY when:
+#   * <dst> does not yet exist, OR
+#   * <dst> already carries the agent-bridge:managed marker (a prior managed
+#     write we are entitled to refresh).
+# A file at <dst> WITHOUT the marker is an agent's own customization and is
+# left in place (return 0, no write). The source asset must itself carry the
+# marker or this function refuses to treat it as managed (defensive: never
+# stamp an unmarked source over an agent file).
+bridge_codex_render_managed_asset() {
+  local src="$1"
+  local dst="$2"
+  local agent="$3"
+  local agent_home="$4"
+  local bridge_home="${5:-}"
+  local marker
+  marker="$(bridge_codex_managed_asset_marker)"
+
+  [[ -n "$src" && -n "$dst" && -f "$src" ]] || return 0
+  # Defensive: only manage assets that declare themselves managed.
+  grep -q "$marker" "$src" 2>/dev/null || return 0
+
+  # Idempotency / no-clobber: if the destination exists and is NOT one of ours,
+  # it is an agent customization — leave it untouched.
+  if [[ -e "$dst" ]] && ! grep -q "$marker" "$dst" 2>/dev/null; then
+    return 0
+  fi
+
+  local rendered=""
+  rendered="$(cat "$src" 2>/dev/null)" || return 0
+  rendered="${rendered//<agent-id>/$agent}"
+  rendered="${rendered//<agent-home>/$agent_home}"
+  rendered="${rendered//<bridge-home>/$bridge_home}"
+
+  mkdir -p "$(dirname "$dst")" 2>/dev/null || return 0
+  printf '%s' "$rendered" >"$dst" 2>/dev/null || return 0
+}
+
+# bridge_ensure_codex_agent_slash_commands <agent> <agent_home>
+#
+# #8945 Track C: deploy the agent-bridge Codex custom slash commands
+# (agb-claim / agb-done / agb-handoff / agb-inbox) and the bridge-role
+# permission profiles into the agent's OWN Codex config tree
+# (<agent_home>/.codex/), so a Codex bridge agent can run `/agb-inbox`,
+# `/agb-claim <id>`, etc. instead of typing the full `~/.agent-bridge/agb …`
+# path, and start a session with a role-scoped sandbox via `-p bridge-<role>`.
+#
+# CRITICAL scope contract: everything is rooted at the caller-provided
+# <agent_home>/.codex (the same agent-scoped dir bridge_ensure_codex_agent_hooks
+# writes hooks.json into) — NEVER the controller/operator global ~/.codex.
+# Codex reads per-agent config because the bridge launch sets HOME to the agent
+# home before engine start. This function NEVER touches $HOME/.codex of the
+# controller.
+#
+# Source assets live in the source checkout at assets/codex/ (BRIDGE_SCRIPT_DIR).
+# Each is idempotent: a re-run replaces only files carrying the
+# agent-bridge:managed marker and leaves an agent's own prompts alone.
+#
+# Called from bridge-agent.sh (codex engine create path) next to
+# bridge_ensure_codex_agent_hooks. Exported from lib so smoke drivers sourcing
+# bridge-lib.sh can assert the Track C contract directly. No-op (return 0) when
+# the asset source dir is absent (older source tree) or args are missing.
+bridge_ensure_codex_agent_slash_commands() {
+  local agent="$1"
+  local agent_home="$2"
+  [[ -n "$agent" && -n "$agent_home" ]] || return 0
+
+  local assets_dir=""
+  if [[ -n "${BRIDGE_SCRIPT_DIR:-}" ]]; then
+    assets_dir="$BRIDGE_SCRIPT_DIR/assets/codex"
+  fi
+  [[ -n "$assets_dir" && -d "$assets_dir" ]] || return 0
+
+  local bridge_home="${BRIDGE_HOME:-${BRIDGE_SCRIPT_DIR:-}}"
+
+  # 1) Custom slash-command prompts → <agent_home>/.codex/prompts/<name>.md.
+  #    The file basename (minus .md) is the slash-command name in Codex, so
+  #    agb-inbox.md becomes /agb-inbox.
+  local prompts_src="$assets_dir/prompts"
+  if [[ -d "$prompts_src" ]]; then
+    local prompts_dst="$agent_home/.codex/prompts"
+    local prompt_file=""
+    for prompt_file in "$prompts_src"/agb-*.md; do
+      [[ -f "$prompt_file" ]] || continue
+      bridge_codex_render_managed_asset \
+        "$prompt_file" "$prompts_dst/$(basename "$prompt_file")" \
+        "$agent" "$agent_home" "$bridge_home"
+    done
+  fi
+
+  # 2) Permission profiles → <agent_home>/.codex/bridge-<role>.config.toml.
+  #    Codex's `-p, --profile <name>` flag layers $CODEX_HOME/<name>.config.toml
+  #    on top of the base user config (verified against codex-cli 0.135.0), so
+  #    the file Codex actually loads is `<name>.config.toml` — NOT a standalone
+  #    `permissions.toml` (which Codex ignores). We install one real profile file
+  #    per role so `codex -p bridge-<role>` selects the role's sandbox/network
+  #    settings. Each is bridge-managed + per-agent substituted, never clobbering
+  #    an agent's own <name>.config.toml. CODEX_HOME resolves to <agent_home>/
+  #    .codex because the bridge launch sets HOME to the agent home — agent-
+  #    scoped, never the controller ~/.codex.
+  local profiles_src="$assets_dir/profiles"
+  if [[ -d "$profiles_src" ]]; then
+    local profile_dst="$agent_home/.codex"
+    local profile_file=""
+    for profile_file in "$profiles_src"/bridge-*.config.toml; do
+      [[ -f "$profile_file" ]] || continue
+      bridge_codex_render_managed_asset \
+        "$profile_file" "$profile_dst/$(basename "$profile_file")" \
+        "$agent" "$agent_home" "$bridge_home"
+    done
+  fi
 }

@@ -125,6 +125,20 @@ BRIDGE_AGENT_SESSION[codex-recipient]="codex-recipient"
 BRIDGE_AGENT_SESSION[claude-recipient]="claude-recipient"
 BRIDGE_AGENT_WORKDIR[codex-recipient]="$BRIDGE_HOME"
 BRIDGE_AGENT_WORKDIR[claude-recipient]="$BRIDGE_HOME"
+# #1318 interaction: Test 2 exercises the COMPANION BODY-VALIDATION gate, not
+# the #1318 stopped-target gate. bridge-task.sh refuses `create` against a
+# target whose tmux session is absent (and these fixture recipients have none),
+# which would short-circuit every subtest before the validator runs. Stub
+# bridge_agent_is_active to report the fixture recipients as running so the
+# create proceeds to body validation — modelling the "agent up, can dequeue"
+# state these tests assume. (The dedicated #1318 stopped-gate behavior is
+# covered elsewhere; pinning it here would conflate two gates.)
+bridge_agent_is_active() {
+  case "$1" in
+    codex-recipient|claude-recipient) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 ROSTER
 
 # Initialize tasks DB (cmd_create writes through bridge-queue.py).

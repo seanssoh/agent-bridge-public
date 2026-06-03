@@ -317,10 +317,25 @@ def _registry_ids_from_payload(
         # ($BRIDGE_HOME/agents/<a>/) on v2 and reported every runtime
         # .md as `missing_files`. Empty string falls back to the legacy
         # `<root>/<name>` path so the v1 / no-registry path is unchanged.
+        # `home` (#8945 Track D): the agent's identity-source root
+        # (`bridge_agent_default_home` — on v2 that is
+        # `$BRIDGE_DATA_ROOT/agents/<a>/home`). Distinct from `workdir`:
+        # for a Codex agent layered onto a *shared* workdir (the admin's
+        # `<admin>-dev` pair created with `--allow-shared-workdir`), the
+        # per-agent AGENTS.md is materialized into `home`, NOT the shared
+        # workdir — `bridge_layout_materialize_identity` deliberately
+        # declines to stamp per-agent identity into a foreign/shared
+        # workspace. The watchdog scans `workdir`, so without this signal
+        # it reported a phantom `missing_files: AGENTS.md` for every such
+        # pair (today's patch-dev false drift). `scan_agent` uses `home`
+        # ONLY as a fall-back location for the engine entrypoint when it is
+        # absent from the scanned dir — a genuinely missing AGENTS.md
+        # (absent from BOTH) still surfaces as drift.
         meta[agent_id] = {
             "engine": str(row.get("engine") or "").strip(),
             "agent_source": str(row.get("agent_source") or "").strip(),
             "workdir": str(row.get("workdir") or "").strip(),
+            "home": str(row.get("home") or "").strip(),
         }
     return ids, meta
 
@@ -990,6 +1005,22 @@ def is_codex_engine(engine: str) -> bool:
     return engine == "codex"
 
 
+def engine_entrypoint_filename(engine: str) -> str:
+    """The engine's native instruction-file name — the watchdog mirror of
+    ``bridge_engine_entrypoint_filename`` (lib/bridge-engine-descriptor.sh).
+
+    #8945 Track D: used to identify *which* required file a Codex agent's
+    per-agent identity materializes as (``AGENTS.md``) so the shared-workdir
+    home fall-back in :func:`scan_agent` applies only to that entrypoint and
+    never relaxes any other required file.
+    """
+    if is_codex_engine(engine):
+        return "AGENTS.md"
+    if is_claude_engine(engine):
+        return "CLAUDE.md"
+    return ""
+
+
 def has_known_engine_contract(engine: str) -> bool:
     """True when the watchdog has an implemented engine-native contract for
     ``engine``. Engines outside this set are classified as
@@ -1118,6 +1149,7 @@ def scan_agent(
     agent_name: str | None = None,
     state_dir: Path | None = None,
     fresh_install_home_dir: Path | None = None,
+    agent_home_dir: Path | None = None,
 ) -> AgentWatch:
     # `agent_name` (#1108) is the registry id, threaded through
     # explicitly because on v2 layouts ``agent_dir`` resolves to
@@ -1166,7 +1198,50 @@ def scan_agent(
     # unchanged (no new `AgentWatch` fields, per spec).
     try:
         required = required_profile_files(engine, agent_source)
-        missing_files = [name for name in required if not (agent_dir / name).exists()]
+        # #8945 Track D: shared-workdir home fall-back for the engine's
+        # native instruction entrypoint. A Codex agent layered onto a
+        # *shared* workdir (the admin's `<admin>-dev` pair created with
+        # `--allow-shared-workdir`) has its per-agent AGENTS.md materialized
+        # into its `agent_home` identity source, not the shared workdir —
+        # `bridge_layout_materialize_identity`'s shared-workspace guard
+        # deliberately declines to stamp per-agent identity into a foreign
+        # workspace. The watchdog scans the workdir, so a present-in-home
+        # AGENTS.md was being reported as `missing_files: AGENTS.md` (the
+        # patch-dev false drift this fix removes). We treat the entrypoint
+        # as present when it exists in EITHER the scanned dir OR the
+        # agent_home. A genuinely-missing AGENTS.md (absent from BOTH) still
+        # surfaces as drift — no real-missing-file is masked. The fall-back
+        # is scoped to the engine entrypoint only: every other required file
+        # (the Claude profile set) is unaffected and still checked against
+        # the scanned dir alone.
+        entrypoint = engine_entrypoint_filename(engine)
+        missing_files = []
+        for name in required:
+            if (agent_dir / name).exists():
+                continue
+            if (
+                name == entrypoint
+                and entrypoint
+                and agent_home_dir is not None
+                and agent_home_dir != agent_dir
+                and (agent_home_dir / name).exists()  # noqa: raw-pathlib-controller-only
+            ):
+                # Present in the agent_home identity source (shared-workdir
+                # materialization target) — not drift.
+                #
+                # noqa rationale: this entrypoint home fall-back probe is a
+                # deliberate controller-side metadata check. On a v2-isolated
+                # host it can raise PermissionError when the controller is not
+                # in the agent's supplementary group, but it runs inside the
+                # SAME ``scan_agent`` try/except that already maps the sibling
+                # ``(agent_dir / name).exists()`` probe (and every other
+                # per-file read in this block) to a structured ``scan_error``
+                # row (#1119). The watchdog is the diagnostic of last resort:
+                # routing this one probe through a sudo-escalating helper is
+                # unnecessary because the fail-soft path already preserves the
+                # "never crash the whole pass" contract.
+                continue
+            missing_files.append(name)
         # The `missing_managed_claude_block` FIELD records actual file
         # state for engines that own a CLAUDE.md. Pre-#1237 this gated on
         # the legacy ``NON_CONTRACT_ENGINES`` allowlist; with the codex
@@ -1482,6 +1557,14 @@ def main() -> int:
         agent_meta = registry_meta.get(agent_name, {})
         engine = agent_meta.get("engine") or "claude"
         agent_source = agent_meta.get("agent_source", "")
+        # #8945 Track D: the registry `home` field (identity source). When
+        # the scan target is a *shared* workdir, the codex agent's
+        # per-agent AGENTS.md lives here instead. Threaded into scan_agent
+        # purely as the engine-entrypoint home fall-back (see scan_agent).
+        # Empty/missing → None, so the legacy single-tree check is
+        # unchanged for v1 installs and registry rows without a home field.
+        agent_home_str = agent_meta.get("home", "")
+        agent_home_dir = Path(agent_home_str).expanduser() if agent_home_str else None
         try:
             target = resolve_scan_path(agent_name, path, registry_meta)
             records.append(
@@ -1491,6 +1574,7 @@ def main() -> int:
                     agent_source=agent_source,
                     agent_name=agent_name,
                     state_dir=state_dir,
+                    agent_home_dir=agent_home_dir,
                     # The tracked-tree dir (`path`) is the most stable
                     # fresh-install signal: on v2 it is created during
                     # `bridge_scaffold_agent_home`, then the workdir

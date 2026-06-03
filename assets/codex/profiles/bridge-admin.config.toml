@@ -1,0 +1,23 @@
+# agent-bridge:managed profile=bridge-admin
+# Managed by agent-bridge. Regenerated on scaffold/upgrade; edits are replaced.
+#
+# Codex config-profile FILE. Codex loads this when you start a session with
+#   codex -p bridge-admin   (equivalently --profile bridge-admin)
+# which layers $CODEX_HOME/bridge-admin.config.toml on top of the base user
+# config (verified against codex-cli 0.135.0). Each profile file is a full
+# config layer — Codex config profiles have no `extends`/inherit key, so this
+# restates the worker settings and widens the writable roots.
+#
+# bridge-admin — highest trust, for the admin/orchestrator agent only.
+# Workspace-write sandbox with the agent home AND the bridge runtime root
+# writable so the admin can manage roster/state through the supported `agb`
+# paths. Still NOT danger-full-access — admin work goes through bridge CLI
+# verbs, not a blanket host write.
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[sandbox_workspace_write]
+# <agent-home> / <bridge-home> are substituted with resolved paths at install
+# time (benign non-existent paths if left raw).
+network_access = true
+writable_roots = ["<agent-home>", "<bridge-home>"]
