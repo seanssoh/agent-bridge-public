@@ -95,16 +95,78 @@ _BRIDGE_SECRET_SCRUB_SH_LOADED=1
 # `bash` function here is moot — the re-exec uses an absolute path which can
 # never resolve to a function. Keeping `bash`/`sh` out also avoids any surprise
 # in callers that legitimately define wrapper functions of those names.
-_bridge_secret_scrub_interceptors='exec source command builtin unset printf read echo mktemp chmod rm cat dirname cd pwd trap export local python3 python uname env claude codex head readlink true false'
+# `set`, `.` (the POSIX `source` synonym), `eval`, `local` and `trap` are all
+# included so the shadow-proof seed in bridge_secret_scrub_harden_hooks strips
+# them too — a caller can `export -f .` / `export -f set` / `export -f local`
+# just as easily as `source` (codex Phase-4 r2 caught a `local()` shadow that
+# fired before the original seed, and a `set -T` DEBUG-trap re-install path).
+_bridge_secret_scrub_interceptors='exec source . command builtin unset set eval printf read echo mktemp chmod rm cat dirname cd pwd trap export local python3 python uname env claude codex head readlink true false'
 
 # Harden the child-startup hook classes before the first fork. Builtin-only.
 bridge_secret_scrub_harden_hooks() {
-  # Strip exported-function shadows of the interceptor command names FIRST, so
-  # the `builtin unset` / `set` below are the genuine builtins. `builtin unset`
-  # (not bare `unset`) defeats an `unset()` function shadow on the very first
-  # pass.
+  # SHADOW-PROOF SEED (#1491 / #1454 gap, hardened in Phase-4 r2). `builtin
+  # unset -f …` is NOT self-healing: a same-UID caller can `export -f builtin`
+  # so that the very `builtin` token is eaten by a `builtin()` function shadow
+  # (verified on bash 5.3.9 + macOS /bin/bash 3.2 — a function OUTRANKS the
+  # builtin of the same name in command lookup). The one lever a caller cannot
+  # intercept is a plain VARIABLE ASSIGNMENT: assigning `POSIXLY_CORRECT=1` turns
+  # POSIX mode ON mid-shell, and in POSIX mode the special builtins (`unset`,
+  # `set`, `trap`, …) OUTRANK same-named function shadows.
+  #
+  # The seed therefore uses ONLY: (a) unshadowable assignments, and (b) special
+  # builtins invoked AFTER POSIX mode is on. Three subtleties codex Phase-4 r2
+  # surfaced, all handled below:
+  #   - NO `local`/`declare` before the seed: `local` is itself shadowable, so
+  #     reading the prior POSIX state into `local` vars would run a `local()`
+  #     shadow with the secret still live. We snapshot into specifically-named
+  #     GLOBAL vars via plain assignment (unshadowable) and `unset` them after.
+  #   - CLEAR DEBUG/RETURN/ERR traps + functrace BEFORE the strip: a `set -T`
+  #     DEBUG trap fires before every simple command and could RE-INSTALL a
+  #     shadow AFTER we unset it. Clearing the trap first guarantees nothing
+  #     re-shadows post-strip.
+  #   - SECOND strip pass in non-POSIX mode: on macOS /bin/bash 3.2, `unset -f .`
+  #     does not remove a `.()` function while POSIX mode is on, but does once
+  #     it is off.
+  # The caller's exact prior POSIX state (POSIXLY_CORRECT set/value + `posix`
+  # shopt) is restored at the end — this module is sourced into the caller's
+  # option set (see header), so a consumer that legitimately runs under
+  # `set -o posix` must be unaffected. Pure-bash, builtin-only, no fork, Bash
+  # 3.2-safe, idempotent.
+  #
+  # Snapshot prior POSIX state via parameter expansion (an unshadowable read)
+  # into GLOBALs assigned WITHOUT `local`/`declare` (a plain assignment invokes
+  # no function). `$SHELLOPTS` is a bash builtin variable a function cannot
+  # intercept.
+  _BRIDGE_SCRUB_PC_WAS_SET=0
+  _BRIDGE_SCRUB_PC_VAL=""
+  _BRIDGE_SCRUB_POSIX_WAS_ON=0
+  if [[ -n "${POSIXLY_CORRECT+x}" ]]; then _BRIDGE_SCRUB_PC_WAS_SET=1; _BRIDGE_SCRUB_PC_VAL="$POSIXLY_CORRECT"; fi
+  case ":${SHELLOPTS}:" in *:posix:*) _BRIDGE_SCRUB_POSIX_WAS_ON=1 ;; esac
+
+  POSIXLY_CORRECT=1
+  # Kill functrace/errtrace + DEBUG/RETURN/ERR traps FIRST so nothing can
+  # re-install a shadow after the strip (genuine special builtins in POSIX mode).
+  set +T +E 2>/dev/null || true
+  trap - DEBUG RETURN ERR 2>/dev/null || true
+  # Strip every interceptor function shadow (genuine `unset` in POSIX mode).
+  # shellcheck disable=SC2086  # word-split the space-separated name list intentionally
+  unset -f $_bridge_secret_scrub_interceptors 2>/dev/null || true
+  # Leave POSIX mode UNCONDITIONALLY for the second strip pass (codex Phase-4
+  # r2 finding 3): on macOS /bin/bash 3.2, `unset -f .` removes a `.()` function
+  # only when POSIX mode is OFF. This second pass must NOT run in the caller's
+  # restored mode — if the caller was in POSIX mode the `.()` strip would no-op
+  # on 3.2. `unset`/`builtin` here are genuine (their shadows were stripped above
+  # and the trap can no longer re-install them).
+  set +o posix 2>/dev/null || true
   # shellcheck disable=SC2086  # word-split the space-separated name list intentionally
   builtin unset -f $_bridge_secret_scrub_interceptors 2>/dev/null || builtin true
+  # Restore the caller's prior POSIX state EXACTLY, shopt FIRST then the var
+  # value LAST (codex Phase-4 r2): on bash 3.2 `set -o posix` rewrites
+  # POSIXLY_CORRECT to `y`, so the var must be restored AFTER the shopt to land
+  # on the caller's exact prior value.
+  if (( _BRIDGE_SCRUB_POSIX_WAS_ON )); then set -o posix 2>/dev/null || true; else set +o posix 2>/dev/null || true; fi
+  if (( _BRIDGE_SCRUB_PC_WAS_SET )); then POSIXLY_CORRECT="$_BRIDGE_SCRUB_PC_VAL"; else unset POSIXLY_CORRECT 2>/dev/null || true; fi
+  unset _BRIDGE_SCRUB_PC_WAS_SET _BRIDGE_SCRUB_PC_VAL _BRIDGE_SCRUB_POSIX_WAS_ON 2>/dev/null || true
   # BASH_ENV / ENV name a file every non-interactive (resp. POSIX) bash SOURCES
   # at startup; BASH_XTRACEFD redirects `set -x` trace to a caller-chosen fd.
   # The bridge uses none of these — drop them before any child fork.

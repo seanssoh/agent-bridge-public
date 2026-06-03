@@ -50,6 +50,84 @@
 # Everything in THIS block must be Bash 3.2-safe (it runs on macOS /bin/bash
 # 3.2 BEFORE the re-exec). The primitive is written to that bar.
 
+# ---------------------------------------------------------------------------
+# SHADOW-PROOF PRE-SOURCE SEED (#1491 / #1454 gap — bootstrap interception).
+# ---------------------------------------------------------------------------
+# THE GAP this seed closes (codex Phase-4 BLOCKING, proven on the PR head):
+# the primitive load below was historically a BARE `source` that ran WHILE an
+# exported `source()` (or `.()`) function shadow could still be active. A
+# same-UID caller that did
+#     source() { printf '%s\n' "$CLAUDE_CODE_OAUTH_TOKEN" >>"$leak"; command source "$@"; }
+#     export -f source
+# before invoking a bridge entry point would have its shadow run — reading the
+# live ambient secret — at the very moment we tried to load the de-fang
+# primitive. Hardening (`bridge_secret_scrub_harden_hooks`) only ran AFTER that
+# source, so the de-fang primitive itself was loaded through a compromised
+# `source`. The re-exec gate was therefore NOT fail-closed against caller-env
+# influence.
+#
+# THE SEED OF TRUST. Every command token a caller could intercept — `builtin`,
+# `command`, `source`, `.`, `unset`, `set`, `exec`, `eval` — can be shadowed by
+# a same-named exported FUNCTION, and in bash's command lookup a function
+# OUTRANKS the builtin of the same name (verified empirically on bash 5.3.9 AND
+# the macOS /bin/bash 3.2 pre-re-exec shell: even `builtin unset -f builtin` is
+# eaten by a `builtin()` function shadow). So no command-token-based de-fang is
+# self-healing on its own.
+#
+# The one lever a caller CANNOT shadow is a plain VARIABLE ASSIGNMENT — it is
+# not a command lookup. Assigning `POSIXLY_CORRECT=1` dynamically activates
+# POSIX mode mid-shell, and in POSIX mode the POSIX *special* builtins
+# (`unset`, `set`, `export`, `exec`, `eval`, …) OUTRANK same-named function
+# shadows. So:
+#   1. `POSIXLY_CORRECT=1`     — unshadowable assignment, turns POSIX mode ON.
+#   2. `set +T +E` + `trap -`  — kill functrace/errtrace and any DEBUG/RETURN/ERR
+#                                trap FIRST, BEFORE the strip. A `set -T` DEBUG
+#                                trap fires before every simple command and
+#                                could RE-INSTALL a `builtin()`/`source()` shadow
+#                                AFTER we unset it; clearing the trap first
+#                                guarantees nothing re-shadows post-strip.
+#                                (#1491 Phase-4 r2, codex finding 2.)
+#   3. `unset -f <names>`      — now the REAL special builtin `unset` (POSIX
+#                                mode); strips every interceptor function shadow
+#                                (including `source`, `.`, `builtin`, `command`,
+#                                `local`, `trap`, and `unset`/`set` themselves).
+#   4. `set +o posix`          — restore the historical non-POSIX semantics the
+#                                rest of bridge-lib.sh parses/runs under.
+#   5. `unset -f <names>` AGAIN — a SECOND strip in non-POSIX mode. On macOS
+#                                /bin/bash 3.2, `unset -f .` does NOT remove a
+#                                `.()` function while POSIX mode is on, but it
+#                                DOES once POSIX mode is off; the second pass
+#                                closes that 3.2 quirk. (#1491 Phase-4 r2,
+#                                codex finding 3.) `unset` here is the genuine
+#                                builtin — its shadow was stripped in step 3 and
+#                                the trap can no longer re-install it.
+#   6. `unset POSIXLY_CORRECT` — leave no posix-mode residue for children.
+# After the strips the genuine `source`/`builtin` builtins are reachable, so the
+# primitive load below (now `builtin source`, not a bare `source`) cannot be
+# intercepted. This block is pure-bash, builtin-only, no fork, and Bash
+# 3.2-safe — it runs on macOS /bin/bash 3.2 BEFORE the re-exec.
+#
+# `POSIXLY_CORRECT` is a plain (non-exported) shell var here; we unset it again
+# in step 6 so it is never inherited by the candidate-probe / re-exec children.
+# bridge-lib.sh itself requires non-POSIX mode (it uses arrays + `[[ ]]`), so
+# unconditionally landing in `set +o posix` is the correct end state here (the
+# shared primitive's harden_hooks, by contrast, restores the caller's exact
+# prior POSIX state — see lib/bridge-secret-scrub.sh).
+POSIXLY_CORRECT=1
+set +T +E 2>/dev/null || true
+trap - DEBUG RETURN ERR 2>/dev/null || true
+# shellcheck disable=SC2086  # intentional word-split of the name list
+unset -f source . unset set export exec eval command builtin printf read echo \
+  dirname cd pwd trap local mktemp chmod rm cat readlink true false \
+  2>/dev/null || true
+set +o posix 2>/dev/null || true
+# shellcheck disable=SC2086  # intentional word-split (2nd pass closes the bash-3.2 `unset -f .` quirk)
+unset -f source . unset set export exec eval command builtin printf read echo \
+  dirname cd pwd trap local mktemp chmod rm cat readlink true false \
+  2>/dev/null || true
+unset POSIXLY_CORRECT 2>/dev/null || true
+# ---------------------------------------------------------------------------
+
 # Derive the primitive's path with a parameter-expansion builtin (NO `dirname`
 # command-substitution child — that fork must not run while a secret could be
 # live). This mirrors the BRIDGE_SCRIPT_DIR derivation below but only needs the
@@ -60,12 +138,18 @@ else
   _BRIDGE_LIB_SELF_DIR="."
 fi
 if [[ -f "$_BRIDGE_LIB_SELF_DIR/lib/bridge-secret-scrub.sh" ]]; then
+  # Load via `builtin source` (NOT a bare `source`): the seed above already
+  # stripped any `source()`/`.()` function shadow, and `builtin source` cannot
+  # resolve to a function shadow even if a residual one survived. So the de-fang
+  # primitive is loaded through an un-interceptable path.
   # shellcheck source=lib/bridge-secret-scrub.sh
-  source "$_BRIDGE_LIB_SELF_DIR/lib/bridge-secret-scrub.sh"
+  builtin source "$_BRIDGE_LIB_SELF_DIR/lib/bridge-secret-scrub.sh"
   bridge_secret_scrub_harden_hooks
 else
   # Primitive missing (truncated checkout): fall back to a minimal inline hook
   # scrub so we never regress to running the re-exec with BASH_ENV/ENV live.
+  # The seed above already de-fanged the command tokens, so these `builtin`
+  # calls reach the genuine builtins.
   builtin unset -f exec source command builtin unset printf read dirname cd pwd \
     2>/dev/null || builtin true
   builtin unset BASH_ENV ENV BASH_XTRACEFD 2>/dev/null || builtin true
