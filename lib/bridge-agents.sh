@@ -5305,6 +5305,54 @@ bridge_agent_mattermost_state_dir() {
   bridge_agent_default_mattermost_state_dir "$agent"
 }
 
+# Issue #1492 — admin-pair workspace alignment predicate.
+#
+# Return 0 only for the documented co-located `<admin>-dev` codex pair whose
+# raw roster workdir points at the admin's old/base shared cwd (the value
+# captured at provisioning time by bridge-init-codex-pair.sh, which becomes
+# the admin's *base* dir after the v2 anchor split rewrites the admin to
+# <admin>/workdir). For that exact shape the caller follows the admin's
+# RESOLVED workdir so the shared-workspace pair-review contract holds.
+#
+# All conditions must hold (mirrors the migration preflight whitelist
+# `_bridge_isolation_v2_migrate_is_admin_pair_override`):
+#   - agent is named `<admin>-dev` (and the admin half is non-empty),
+#   - the admin half is the configured BRIDGE_ADMIN_AGENT_ID,
+#   - the admin is not the agent itself (no self-follow / recursion),
+#   - the pair's raw explicit workdir equals one of the admin's old/base
+#     shared cwds: the admin's v2 base ($BRIDGE_AGENT_ROOT_V2/<admin>),
+#     legacy base ($BRIDGE_AGENT_HOME_ROOT/<admin>), or default home.
+#
+# An empty explicit, an unrelated `*-dev` whose base is not the admin, or a
+# `<admin>-dev` pointing at a genuinely custom path all return 1 (preserved).
+_bridge_agent_workdir_admin_pair_aligns() {
+  local agent="$1"
+  local explicit="$2"
+
+  [[ -n "$explicit" ]] || return 1
+  case "$agent" in
+    *-dev) ;;
+    *) return 1 ;;
+  esac
+
+  local _admin="${agent%-dev}"
+  [[ -n "$_admin" && "$_admin" != "$agent" ]] || return 1
+
+  local _configured_admin=""
+  _configured_admin="$(bridge_admin_agent_id 2>/dev/null || true)"
+  [[ -n "$_configured_admin" && "$_admin" == "$_configured_admin" ]] || return 1
+
+  local _admin_v2_base="$BRIDGE_AGENT_ROOT_V2/$_admin"
+  local _admin_legacy_base="$BRIDGE_AGENT_HOME_ROOT/$_admin"
+  local _admin_default_home=""
+  _admin_default_home="$(bridge_agent_default_home "$_admin")"
+
+  [[ "$explicit" == "$_admin_v2_base" \
+    || "$explicit" == "$_admin_legacy_base" \
+    || "$explicit" == "$_admin_default_home" ]] || return 1
+  return 0
+}
+
 bridge_agent_workdir() {
   local agent="$1"
   local explicit=""
@@ -5349,6 +5397,24 @@ bridge_agent_workdir() {
     # dynamic agents and static project overrides; only align legacy
     # default-home static rows to the existing v2 workdir.
     if [[ "$(bridge_agent_source "$agent")" == "static" ]]; then
+      # Issue #1492: the documented `<admin>-dev` codex pair co-locates with
+      # its admin's *workspace* (shared SOUL/MEMORY/CLAUDE.md so two models
+      # review the same tree). The pair's raw roster workdir was captured at
+      # provisioning time (bridge-init-codex-pair.sh) from the admin's THEN
+      # workdir — the admin's old/base shared cwd. After the v2 anchor split
+      # rewrote the admin to <admin>/workdir, that raw value points at the
+      # admin's *base* dir, not the pair's own home, so the generic
+      # legacy-default-home alignment below does NOT fire and the pair drifts
+      # to the admin's pre-v2 base while the admin runs under <admin>/workdir.
+      # Detect the genuine admin-pair shape and follow the admin's RESOLVED
+      # workdir so the shared-workspace pair-review contract holds. Identity,
+      # home (<admin>-dev/home), and hooks stay distinct — only the cwd is
+      # shared. Tight to the pair pattern: an unrelated static `*-dev` row, or
+      # a `<admin>-dev` pointing at a genuinely custom path, is NOT realigned.
+      if _bridge_agent_workdir_admin_pair_aligns "$agent" "$explicit"; then
+        bridge_agent_workdir "${agent%-dev}"
+        return 0
+      fi
       local _legacy_v2_workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
       local _default_home=""
       local _legacy_base_home="$BRIDGE_AGENT_HOME_ROOT/$agent"

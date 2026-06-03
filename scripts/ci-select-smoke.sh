@@ -151,6 +151,15 @@ add_required codex-doctor codex-version-surface
 # agents.sh, bridge-agent.sh, or assets/codex/* change re-runs them via the
 # catch-all / arm-specific selection below.
 add_required codex-slash-commands codex-permission-profiles
+# Issue #1492: bridge_agent_workdir now aligns the documented `<admin>-dev`
+# codex pair's RESOLVED workspace to the admin's effective v2 workdir
+# (`<admin>/workdir`) instead of leaving it drifted at the admin's old/base
+# shared cwd, while keeping the pair's identity/home/hooks distinct. In the
+# full static suite so a scripts/smoke/* or lib/bridge-agents.sh change
+# re-runs it via the catch-all → add_all_required_static (the
+# lib/bridge-agents.sh, bridge-init-codex-pair.sh, and bridge-init.sh
+# selectors below also reach it transitively via the static catch-all).
+add_required 1492-admin-dev-pair-workspace-v2
 
 
 }
@@ -2382,7 +2391,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # beta5-2-epsilon-tmux-inject-busy on every bridge-init.sh move so the
       # advisory surface cannot regress, re-opening the CRITICAL data-loss
       # class flagged by the patch audit C6.
-      add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering I-agent-description-roster β-1231-1236-fresh-install-seed-sudoers F-beta4-oauth-bootstrap G-beta4-watchdog-noise beta5-2-epsilon-tmux-inject-busy
+      # Issue #1492: lib/bridge-init-codex-pair.sh captures the admin's
+      # workdir into the `<admin>-dev` pair's raw roster row at provisioning
+      # time, which is the value bridge_agent_workdir later aligns to the
+      # admin's effective v2 workdir. Pull 1492-admin-dev-pair-workspace-v2
+      # whenever the pair-provisioning or init wiring moves so a future PR
+      # cannot regress the documented shared-workspace pair-review contract.
+      add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering I-agent-description-roster β-1231-1236-fresh-install-seed-sudoers F-beta4-oauth-bootstrap G-beta4-watchdog-noise beta5-2-epsilon-tmux-inject-busy 1492-admin-dev-pair-workspace-v2
       add_integration integration-minimal
       ;;
 
