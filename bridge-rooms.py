@@ -84,14 +84,78 @@ def local_node() -> str:
     return str(cfg.get("bridge_id", "") or "").strip()
 
 
+def resolve_actor(args: argparse.Namespace) -> rooms.ActorAuth:
+    """Resolve the trusted acting agent from the PROCESS OS identity (§14 R1).
+
+    The acting identity is NEVER taken from `--as`/`BRIDGE_AGENT_ID` for an
+    iso agent — it is derived from `os.getuid()`. `--as` is passed through as
+    the `requested` override that only the CONTROLLER / SHARED_ADVISORY
+    regimes honor (an iso agent's `--as` is ignored for the decision).
+    """
+    requested = getattr(args, "as_agent", None)
+    return rooms.resolve_os_actor(requested)
+
+
 def caller_agent(args: argparse.Namespace) -> str:
-    """The acting agent: explicit `--as`, else BRIDGE_AGENT_ID, else $USER."""
-    explicit = getattr(args, "as_agent", None)
-    if explicit:
-        return str(explicit).strip()
-    return (os.environ.get("BRIDGE_AGENT_ID")
-            or os.environ.get("USER")
-            or "unknown")
+    """The acting agent id (trusted OS-derived; see resolve_actor).
+
+    Used as the identity for self-service verbs (create/join/leave) and as the
+    audit actor. Leader-only verbs additionally enforce the regime via
+    `require_leader_actor`. Falls back to a best-effort env id only in the
+    advisory/controller regimes where that is the documented behavior.
+    """
+    actor = resolve_actor(args)
+    if actor.agent:
+        return actor.agent
+    # UNRESOLVED (iso map present, this uid unmapped): no trusted identity.
+    # Self-service verbs still need *some* id for the row; use a sentinel the
+    # leader-auth path will reject, never another agent's name.
+    return os.environ.get("USER") or "unknown"
+
+
+def require_leader_actor(args: argparse.Namespace, room: Any) -> str:
+    """Enforce leader-auth on a control-plane mutation per the §14 R1 regime.
+
+    Returns the resolved actor agent on success. Raises RoomsError on a hard
+    denial. Regimes:
+      - ISO_ENFORCED  : HARD — the uid-derived actor MUST be the room leader.
+      - UNRESOLVED    : HARD fail-closed — no trusted actor could be derived.
+      - CONTROLLER    : a proven operator shell — allowed (operator override),
+                        honoring `--as` for the recorded leader identity.
+      - SHARED_ADVISORY: the OS cannot separate agents → ADVISORY. If the
+                        best-effort actor is not the leader, WARN + audit but
+                        DO NOT hard-block (per §14 R1; a real boundary needs a
+                        trusted session gateway, a documented Phase-2 opt-in).
+    """
+    actor = resolve_actor(args)
+    if actor.regime == rooms.ACTOR_ISO_ENFORCED:
+        if not rooms.is_leader(room, actor.agent, caller_node=local_node()):
+            raise rooms.RoomsError(
+                f"leader-only action on room {room['room_id']}: OS-authenticated "
+                f"actor {actor.agent!r} (uid {actor.uid}) is not the leader "
+                f"({room['leader_agent']!r}); --as is ignored under iso "
+                "enforcement",
+                code="not_leader",
+            )
+        return actor.agent
+    if actor.regime == rooms.ACTOR_UNRESOLVED:
+        raise rooms.RoomsError(
+            f"leader-only action on room {room['room_id']}: could not establish "
+            f"a trusted OS actor for uid {actor.uid} (iso isolation is active "
+            "but this uid maps to no agent) — failing closed",
+            code="actor_unresolved",
+        )
+    if actor.regime == rooms.ACTOR_CONTROLLER:
+        # Proven operator shell: honor --as as the leader identity override.
+        return actor.agent or room["leader_agent"]
+    # SHARED_ADVISORY: advisory only — warn but allow.
+    if not rooms.is_leader(room, actor.agent, caller_node=local_node()):
+        info(f"WARNING (advisory): shared-mode install cannot OS-authenticate "
+             f"the actor; '{actor.agent}' is not the recorded leader "
+             f"('{room['leader_agent']}') of {room['room_id']}. Leader-auth is "
+             "ADVISORY in shared mode (no per-agent OS uid). For a hard team "
+             "boundary, run agents under linux-user isolation (iso v2).")
+    return actor.agent
 
 
 def split_agent_node(spec: str, default_node: str) -> tuple[str, str]:
@@ -265,8 +329,14 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 def _require_leader_conn(conn: Any, room_id: str,
                          args: argparse.Namespace) -> Any:
+    """Load a room + enforce leader-auth via the trusted OS actor (§14 R1).
+
+    Leader-auth is derived from the PROCESS OS identity, NOT from `--as`/env —
+    so a managed iso agent cannot pass `--as <leader>` to satisfy it. See
+    require_leader_actor for the per-regime contract.
+    """
     room = rooms.require_room(conn, room_id)
-    rooms.require_leader(room, caller_agent(args), caller_node=local_node())
+    require_leader_actor(args, room)
     return room
 
 
@@ -456,9 +526,12 @@ def cmd_adopt_all(args: argparse.Namespace) -> int:
                 continue  # already the leader row
             rooms.add_member(conn, room_id, ag, node, role=rooms.ROLE_MEMBER)
             added += 1
+        # bump_epoch re-persists room_roster_cache at the new epoch with the
+        # full member set (F2). When no members were added beyond the leader,
+        # create_room already wrote the epoch-0 cache, so the cache is fresh
+        # either way.
         if added:
             rooms.bump_epoch(conn, room_id)
-        # Recompute the roster cache after the bulk add.
         roster = rooms.roster_for(conn, room_id)
     finally:
         conn.close()
@@ -509,8 +582,15 @@ def _add_common(p: argparse.ArgumentParser, *, with_as: bool = True) -> None:
     p.add_argument("--json", action="store_true",
                    help="machine-readable JSON output")
     if with_as:
-        p.add_argument("--as", dest="as_agent", default=None,
-                       help="acting agent id (default $BRIDGE_AGENT_ID/$USER)")
+        p.add_argument(
+            "--as", dest="as_agent", default=None,
+            help="operator override for the acting agent id. Honored ONLY "
+                 "from a proven controller/operator shell or in shared-mode "
+                 "(advisory). Under linux-user isolation (iso v2) the acting "
+                 "agent is derived from the process OS uid and --as is IGNORED "
+                 "for leader-auth — it cannot be used to impersonate the "
+                 "leader.",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:

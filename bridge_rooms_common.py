@@ -36,9 +36,10 @@ import json
 import os
 import secrets
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 # --------------------------------------------------------------------------
 # Constants
@@ -80,6 +81,195 @@ class RoomsError(Exception):
     def __init__(self, message: str, code: str = "rooms_error") -> None:
         super().__init__(message)
         self.code = code
+
+
+# --------------------------------------------------------------------------
+# Actor-auth boundary (design §14 R1) — the trusted, OS-derived ACL actor
+# --------------------------------------------------------------------------
+#
+# Leader-authorized control-plane mutations (approve/deny/kick/invite/
+# rotate-invite) MUST NOT trust a client-supplied agent id. `--as` and
+# `BRIDGE_AGENT_ID` are env/flag values a managed process can set freely, so
+# basing leader-auth on them is forgeable (codex Phase-4 F1: a process whose
+# env agent was `mallory` passed `--as alice` and approved a member). The
+# trusted actor is derived from the PROCESS's OS identity (`os.getuid()`),
+# mapped to a roster agent the SAME way bridge-queue-gateway.py does — never
+# from caller-set env.
+#
+# Three enforcement regimes, per design §14 R1:
+#   - ISO_ENFORCED  : `os.getuid()` maps to an iso agent (agent-bridge-<a>).
+#       That uid-derived agent IS the trusted actor; leader-auth is HARD and
+#       `--as`/env are ignored for the decision. An iso agent cannot act as
+#       another uid, so it cannot impersonate another agent.
+#   - CONTROLLER    : `os.getuid()` is the controller/operator uid (it owns
+#       the bridge home) and does NOT map to any iso agent → a proven operator
+#       shell. `--as` is honored here as an explicit operator override.
+#   - SHARED_ADVISORY: no per-agent uid map exists (shared-mode install, all
+#       agents share one uid) → the OS cannot distinguish agents, so a hard
+#       team boundary is not a real control. Leader-auth is ADVISORY: honor
+#       the best-effort agent id (`--as`/env) but WARN + audit, never claim a
+#       hard block. (Matches §14 R1 "default = audit/warn, no hard block".)
+#   - UNRESOLVED    : an iso uid map exists but THIS uid is neither a mapped
+#       iso agent nor the controller → the trusted actor cannot be
+#       established → leader-auth FAILS CLOSED.
+
+ACTOR_ISO_ENFORCED = "iso-enforced"
+ACTOR_CONTROLLER = "controller"
+ACTOR_SHARED_ADVISORY = "shared-advisory"
+ACTOR_UNRESOLVED = "unresolved"
+
+
+class ActorAuth(NamedTuple):
+    """The resolved control-plane actor + how its leader-auth is enforced.
+
+    `agent` is the trusted actor for ISO_ENFORCED (uid-derived). For
+    CONTROLLER / SHARED_ADVISORY it is the best-effort caller-supplied agent
+    (an override the regime explicitly permits). For UNRESOLVED it is "".
+    `regime` is one of the ACTOR_* constants. `uid` is the process uid.
+    `hard` is True only when leader-auth is a real security control
+    (ISO_ENFORCED) — callers use it to decide block vs warn.
+    """
+
+    agent: str
+    regime: str
+    uid: int
+    hard: bool
+
+
+def _uid_agent_map() -> dict[int, str]:
+    """uid -> iso agent map, the SAME source bridge-queue-gateway.py uses.
+
+    Precedence:
+      1. `BRIDGE_ROOMS_UID_MAP` (controller-owned "uid:agent,uid:agent" CSV) —
+         an explicit, un-spoofable test/override seam. It is read from the
+         process env, but it only ever MAPS a uid to an agent; the ACTOR is
+         still `os.getuid()` indexing INTO this map, so a managed agent cannot
+         name itself the leader by setting it (it would have to forge its own
+         uid's row, and even then it can only claim the agent its uid already
+         is). In production this is empty and the roster probe is used.
+      2. The roster probe: for each agent with effective linux-user isolation,
+         `bridge_agent_os_user` -> uid -> agent. Identical to the gateway's
+         `_peer_map_from_roster`.
+    An empty map means "no per-agent uid isolation" => shared-mode.
+    """
+    raw = os.environ.get("BRIDGE_ROOMS_UID_MAP", "").strip()
+    if raw:
+        out: dict[int, str] = {}
+        for item in raw.split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            uid_s, agent = item.split(":", 1)
+            uid_s, agent = uid_s.strip(), agent.strip()
+            if uid_s.isdigit() and agent:
+                out[int(uid_s)] = agent
+        return out
+    return _uid_agent_map_from_roster()
+
+
+def _uid_agent_map_from_roster() -> dict[int, str]:
+    """Probe the roster for uid->agent over linux-user-isolated agents.
+
+    Mirrors bridge-queue-gateway.py `_peer_map_from_roster` so rooms leader-
+    auth and the queue gateway never diverge on the trusted mapping. Any probe
+    failure yields an EMPTY map (treated as shared-mode → advisory), never a
+    guessed identity.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    lib = os.path.join(here, "bridge-lib.sh")
+    if not os.path.isfile(lib):
+        return {}
+    bash = os.environ.get("BRIDGE_BASH_BIN", "bash")
+    probe = (
+        'source "$1/bridge-lib.sh"\n'
+        'bridge_load_roster 2>/dev/null || exit 0\n'
+        'for agent in "${BRIDGE_AGENT_IDS[@]}"; do\n'
+        '  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null '
+        '|| continue\n'
+        '  os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"\n'
+        '  [ -n "$os_user" ] || continue\n'
+        '  uid="$(id -u "$os_user" 2>/dev/null || true)"\n'
+        '  [ -n "$uid" ] || continue\n'
+        '  printf "%s\\t%s\\n" "$uid" "$agent"\n'
+        'done\n'
+    )
+    try:
+        proc = subprocess.run(
+            [bash, "-c", probe, "probe", here],
+            text=True, capture_output=True, timeout=30, check=False,
+            env=os.environ.copy(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    out: dict[int, str] = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and parts[0].strip().isdigit() and parts[1].strip():
+            out[int(parts[0].strip())] = parts[1].strip()
+    return out
+
+
+def _controller_uid() -> Optional[int]:
+    """The controller/operator uid: BRIDGE_CONTROLLER_UID, else bridge-home owner.
+
+    Used to recognize a proven operator shell (which may use `--as`). Returns
+    None when it cannot be established.
+    """
+    raw = os.environ.get("BRIDGE_CONTROLLER_UID", "").strip()
+    if raw.isdigit():
+        return int(raw)
+    try:
+        return os.stat(str(bridge_home())).st_uid
+    except OSError:
+        return None
+
+
+def resolve_os_actor(requested: Optional[str] = None) -> ActorAuth:
+    """Resolve the trusted control-plane actor from the PROCESS OS identity.
+
+    `requested` is the caller-supplied agent (`--as`/env). It is honored ONLY
+    in the regimes that explicitly permit it (CONTROLLER, SHARED_ADVISORY) and
+    is IGNORED for the leader-auth decision under ISO_ENFORCED.
+
+    See the section header for the four regimes. This is the single chokepoint
+    the CLI's leader-only verbs call; it never trusts caller-set env for an iso
+    agent.
+    """
+    uid = os.getuid()
+    uid_map = _uid_agent_map()
+
+    if not uid_map:
+        # No per-agent uid isolation anywhere → shared-mode. Best-effort agent,
+        # advisory enforcement (warn, never hard-block).
+        agent = (requested
+                 or os.environ.get("BRIDGE_AGENT_ID")
+                 or os.environ.get("USER")
+                 or "")
+        return ActorAuth(agent=str(agent).strip(), regime=ACTOR_SHARED_ADVISORY,
+                         uid=uid, hard=False)
+
+    mapped = uid_map.get(uid)
+    if mapped:
+        # This uid IS an iso agent → that agent is the trusted actor; --as
+        # ignored. Unspoofable: a managed agent cannot run as another uid.
+        return ActorAuth(agent=mapped, regime=ACTOR_ISO_ENFORCED,
+                         uid=uid, hard=True)
+
+    controller = _controller_uid()
+    if controller is not None and uid == controller:
+        # Proven operator shell — --as is an explicit operator override.
+        agent = (requested
+                 or os.environ.get("BRIDGE_AGENT_ID")
+                 or os.environ.get("USER")
+                 or "")
+        return ActorAuth(agent=str(agent).strip(), regime=ACTOR_CONTROLLER,
+                         uid=uid, hard=False)
+
+    # An iso map exists but this uid is neither a mapped iso agent nor the
+    # controller → cannot establish a trusted actor → fail closed.
+    return ActorAuth(agent="", regime=ACTOR_UNRESOLVED, uid=uid, hard=True)
 
 
 # --------------------------------------------------------------------------
@@ -461,11 +651,19 @@ def record_join_attempt(conn: sqlite3.Connection, token: str, source: str,
 # --------------------------------------------------------------------------
 
 def bump_epoch(conn: sqlite3.Connection, room_id: str) -> int:
-    """Monotonically increment a room's epoch; return the NEW value.
+    """Monotonically increment a room's epoch + RE-PERSIST the roster cache.
 
     Called on EVERY membership change (join-approve / leave / kick). This is
     the freshness signal the P4 receiver seam enforces and the split-brain
     tiebreaker — never reset, never reused.
+
+    The roster-cache recompute is CENTRALIZED here (codex Phase-4 F2): every
+    mutation that changes membership MUST go through bump_epoch, and bump_epoch
+    atomically re-writes `room_roster_cache` to the new (epoch, canonical
+    sorted members) so no caller can leave the cache stale. The frozen
+    roster-cache contract P4 consumes (epoch == rooms.epoch, members == the
+    canonical sorted roster) thus holds after every verb, not just the ones
+    that happened to call `_recompute_roster_cache` explicitly.
     """
     require_room(conn, room_id)
     conn.execute(
@@ -476,6 +674,9 @@ def bump_epoch(conn: sqlite3.Connection, room_id: str) -> int:
     row = conn.execute(
         "SELECT epoch FROM rooms WHERE room_id=?", (room_id,)
     ).fetchone()
+    # Re-persist the cache against the POST-bump membership + epoch so the
+    # cache row can never lag behind rooms.epoch.
+    _recompute_roster_cache(conn, room_id)
     return int(row["epoch"])
 
 
@@ -666,9 +867,9 @@ def approve_join(conn: sqlite3.Connection, room_id: str, agent: str,
     require_room(conn, room_id)
     add_member(conn, room_id, agent, node, role=ROLE_MEMBER)
     set_join_request_status(conn, room_id, agent, node, JOIN_APPROVED)
-    epoch = bump_epoch(conn, room_id)
-    _recompute_roster_cache(conn, room_id)
-    return epoch
+    # bump_epoch re-persists room_roster_cache atomically (centralized in F2),
+    # so no explicit _recompute_roster_cache call is needed here.
+    return bump_epoch(conn, room_id)
 
 
 def remove_and_bump(conn: sqlite3.Connection, room_id: str, agent: str,
@@ -685,9 +886,8 @@ def remove_and_bump(conn: sqlite3.Connection, room_id: str, agent: str,
         raise RoomsError(
             f"{agent}@{node} is not a member of {room_id}", code="not_member",
         )
-    epoch = bump_epoch(conn, room_id)
-    _recompute_roster_cache(conn, room_id)
-    return epoch
+    # bump_epoch re-persists room_roster_cache atomically (centralized in F2).
+    return bump_epoch(conn, room_id)
 
 
 # --------------------------------------------------------------------------

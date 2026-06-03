@@ -43,8 +43,27 @@ smoke_setup_bridge_home "$SMOKE_NAME"
 export BRIDGE_A2A_ROOMS_DB="$BRIDGE_STATE_DIR/handoff/rooms.db"
 unset BRIDGE_A2A_CONFIG || true
 
+# §14 R1 actor-auth: the trusted acting agent is derived from the process OS
+# uid, NOT from --as/env. To exercise the iso-enforced regime hermetically,
+# BRIDGE_ROOMS_UID_MAP maps THIS test process's real uid to a chosen agent —
+# the same un-spoofable seam shape bridge-queue-gateway.py uses. `room_cli_as`
+# runs one CLI invocation as if it came from <agent>'s OS uid (so the smoke,
+# running under one real uid, can act as alice/bob/carol/... in turn exactly
+# like distinct iso UIDs would). The map is set INLINE on each call (never
+# exported) so no managed-process leak can occur. Real iso installs derive the
+# same mapping from the roster probe; --as is ignored under iso enforcement.
+MY_UID="$(python3 -c 'import os; print(os.getuid())')"
+
 room_cli() {
+  # Default: no uid map -> shared-advisory regime (honors best-effort id).
   python3 "$ROOMS_CLI" "$@"
+}
+
+room_cli_as() {
+  # room_cli_as <agent> <args...> — run as if from <agent>'s OS uid
+  # (iso-enforced regime: the uid-derived actor IS <agent>).
+  local who="$1"; shift
+  BRIDGE_ROOMS_UID_MAP="${MY_UID}:${who}" python3 "$ROOMS_CLI" "$@"
 }
 
 json_field() {
@@ -75,45 +94,47 @@ ROOM=""
 LINK=""
 
 test_create() {
+  # alice's OS uid creates the room → leader is the uid-derived 'alice'.
   local out
-  out="$(room_cli create --name team-a --as alice --json 2>/dev/null)"
+  out="$(room_cli_as alice create --name team-a --json 2>/dev/null)"
   ROOM="$(json_field room_id "$out")"
   LINK="$(json_field invite_link "$out")"
   [[ -n "$ROOM" ]] || smoke_fail "create did not return a room_id"
   smoke_assert_eq "0" "$(json_field epoch "$out")" "new room starts at epoch 0"
+  smoke_assert_contains "$out" '"leader": "alice@"' \
+    "leader is the OS-uid-derived actor (alice), not a --as value"
   smoke_assert_contains "$LINK" "agbroom://join?room=$ROOM" "invite link carries room id"
   smoke_assert_contains "$LINK" "t=" "invite link carries a token"
 }
 
 test_join_pending_then_approve_bumps_epoch() {
-  room_cli join "$LINK" --as bob >/dev/null 2>&1 \
+  # bob's uid posts the join → request is recorded as bob (uid-derived).
+  room_cli_as bob join "$LINK" >/dev/null 2>&1 \
     || smoke_fail "valid join should succeed"
-  # pending shows in `show`
   local showed
   showed="$(room_cli show "$ROOM" --json 2>/dev/null)"
   smoke_assert_contains "$showed" '"agent": "bob"' "bob appears as pending join"
-  # approve as leader → epoch 0 → 1 + member added
+  # alice's uid (the leader) approves → epoch 0 → 1 + member added.
   local approved epoch
-  approved="$(room_cli approve "$ROOM" bob --as alice --json 2>/dev/null)"
+  approved="$(room_cli_as alice approve "$ROOM" bob --json 2>/dev/null)"
   epoch="$(json_field epoch "$approved")"
   smoke_assert_eq "1" "$epoch" "approve bumps epoch 0 -> 1"
   showed="$(room_cli show "$ROOM" --json 2>/dev/null)"
   python3 "$HELPER" assert-member "$showed" bob \
     || smoke_fail "roster must include bob after approve"
-  # pending cleared
   python3 "$HELPER" assert-no-pending "$showed" bob \
     || smoke_fail "bob should no longer be a pending request after approve"
 }
 
 test_leave_and_kick_bump_epoch_and_exclude() {
   # add a second member (carol) so we can kick one and leave another
-  room_cli join "$LINK" --as carol >/dev/null 2>&1
-  room_cli approve "$ROOM" carol --as alice --json >/dev/null 2>&1
+  room_cli_as carol join "$LINK" >/dev/null 2>&1
+  room_cli_as alice approve "$ROOM" carol --json >/dev/null 2>&1
   local before
   before="$(json_field epoch "$(room_cli show "$ROOM" --json 2>/dev/null)")"
-  # bob leaves → epoch bump + roster excludes bob
+  # bob (his own uid) leaves → epoch bump + roster excludes bob
   local after_leave
-  after_leave="$(json_field epoch "$(room_cli leave "$ROOM" --as bob --json 2>/dev/null)")"
+  after_leave="$(json_field epoch "$(room_cli_as bob leave "$ROOM" --json 2>/dev/null)")"
   python3 "$HELPER" assert-gt "$after_leave" "$before" \
     || smoke_fail "leave must bump epoch ($before -> $after_leave)"
   local showed
@@ -121,9 +142,9 @@ test_leave_and_kick_bump_epoch_and_exclude() {
   if python3 "$HELPER" assert-member "$showed" bob 2>/dev/null; then
     smoke_fail "roster must EXCLUDE bob after leave"
   fi
-  # carol kicked → another epoch bump + roster excludes carol
+  # carol kicked by the leader → another epoch bump + roster excludes carol
   local after_kick
-  after_kick="$(json_field epoch "$(room_cli kick "$ROOM" carol --as alice --json 2>/dev/null)")"
+  after_kick="$(json_field epoch "$(room_cli_as alice kick "$ROOM" carol --json 2>/dev/null)")"
   python3 "$HELPER" assert-gt "$after_kick" "$after_leave" \
     || smoke_fail "kick must bump epoch again ($after_leave -> $after_kick)"
   showed="$(room_cli show "$ROOM" --json 2>/dev/null)"
@@ -133,32 +154,65 @@ test_leave_and_kick_bump_epoch_and_exclude() {
 }
 
 # ---------------------------------------------------------------------------
-# TEETH
+# TEETH — §14 R1 actor-auth (the F1 security contract)
 # ---------------------------------------------------------------------------
-test_teeth_approve_without_leader_auth_rejected() {
-  room_cli join "$LINK" --as dave >/dev/null 2>&1
-  if room_cli approve "$ROOM" dave --as mallory >/dev/null 2>&1; then
-    smoke_fail "TEETH: approve by a non-leader must be rejected"
+test_teeth_iso_leader_auth_unspoofable() {
+  # The exact codex F1 exploit: a non-leader process passing --as <leader>.
+  # Under iso enforcement the actor is the process OS uid (here mapped to
+  # 'mallory'); --as alice must be IGNORED and approve/kick REJECTED.
+  room_cli_as dave join "$LINK" >/dev/null 2>&1
+  if BRIDGE_ROOMS_UID_MAP="${MY_UID}:mallory" \
+       python3 "$ROOMS_CLI" approve "$ROOM" dave --as alice >/dev/null 2>&1; then
+    smoke_fail "TEETH F1: approve by uid=mallory must be REJECTED even with --as alice (iso)"
   fi
-  # the leader CAN approve
-  room_cli approve "$ROOM" dave --as alice >/dev/null 2>&1 \
-    || smoke_fail "leader approve should succeed"
+  if BRIDGE_ROOMS_UID_MAP="${MY_UID}:mallory" \
+       python3 "$ROOMS_CLI" kick "$ROOM" bob --as alice >/dev/null 2>&1; then
+    smoke_fail "TEETH F1: kick by uid=mallory must be REJECTED even with --as alice (iso)"
+  fi
+  # Positive: the leader's uid CAN approve (proves it is not a blanket deny).
+  room_cli_as alice approve "$ROOM" dave >/dev/null 2>&1 \
+    || smoke_fail "leader-uid approve must succeed"
+}
+
+test_teeth_iso_unmapped_uid_fails_closed() {
+  # An iso map exists but THIS uid maps to no agent and is not the controller
+  # → no trusted actor → leader-auth FAILS CLOSED (not advisory). Use a uid
+  # value that is neither our uid nor any agent, and force a non-controller
+  # context by pointing BRIDGE_CONTROLLER_UID at a different uid.
+  if BRIDGE_ROOMS_UID_MAP="999999:somebodyelse" BRIDGE_CONTROLLER_UID="999998" \
+       python3 "$ROOMS_CLI" approve "$ROOM" eve --as alice >/dev/null 2>&1; then
+    smoke_fail "TEETH F1: an unmapped uid under active iso must FAIL CLOSED on leader-auth"
+  fi
+}
+
+test_advisory_shared_mode_is_honest() {
+  # Shared-mode (no uid map at all): leader-auth is ADVISORY — a non-leader
+  # actor is WARNED, not hard-blocked (design §14 R1 default). This documents
+  # the honest contract: shared mode is not a hard boundary.
+  room_cli_as frank join "$LINK" >/dev/null 2>&1
+  local err
+  # No BRIDGE_ROOMS_UID_MAP -> shared-advisory. --as mallory (non-leader).
+  err="$(python3 "$ROOMS_CLI" approve "$ROOM" frank --as mallory 2>&1)"
+  local rc=$?
+  smoke_assert_eq "0" "$rc" "shared-mode advisory approve is allowed (not hard-blocked)"
+  smoke_assert_contains "$err" "advisory" \
+    "shared-mode non-leader approve must emit the advisory WARNING (honest contract)"
 }
 
 test_teeth_wrong_token_hash_rejected() {
-  if room_cli join "agbroom://join?room=$ROOM&t=DEFINITELY-WRONG-TOKEN" --as eve >/dev/null 2>&1; then
+  if room_cli_as eve join "agbroom://join?room=$ROOM&t=DEFINITELY-WRONG-TOKEN" >/dev/null 2>&1; then
     smoke_fail "TEETH: join with a wrong token hash must be rejected"
   fi
 }
 
 test_teeth_cannot_kick_leader() {
-  if room_cli kick "$ROOM" alice --as alice >/dev/null 2>&1; then
+  if room_cli_as alice kick "$ROOM" alice >/dev/null 2>&1; then
     smoke_fail "TEETH: the leader must not be kickable (room would lose control plane)"
   fi
 }
 
 test_teeth_leave_non_member_is_loud() {
-  if room_cli leave "$ROOM" --as nobody-here >/dev/null 2>&1; then
+  if room_cli_as nobodyhere leave "$ROOM" >/dev/null 2>&1; then
     smoke_fail "TEETH: leave of a non-member must fail loud, not silently bump epoch"
   fi
 }
@@ -177,51 +231,70 @@ test_invite_token_sha256_only() {
 
 test_rotate_invalidates_old_token() {
   local rot newlink
-  rot="$(room_cli rotate-invite "$ROOM" --as alice --json 2>/dev/null)"
+  rot="$(room_cli_as alice rotate-invite "$ROOM" --json 2>/dev/null)"
   newlink="$(json_field invite_link "$rot")"
   # old link join must now FAIL
-  if room_cli join "$LINK" --as frank >/dev/null 2>&1; then
+  if room_cli_as frank join "$LINK" >/dev/null 2>&1; then
     smoke_fail "rotate-invite must invalidate the OLD token"
   fi
   # new link join must SUCCEED
-  room_cli join "$newlink" --as frank >/dev/null 2>&1 \
+  room_cli_as frank join "$newlink" >/dev/null 2>&1 \
     || smoke_fail "rotate-invite must mint a working NEW token"
   LINK="$newlink"
 }
 
 test_once_token_burns_after_one_approval() {
   local once oncelink
-  once="$(room_cli invite "$ROOM" --once --as alice --json 2>/dev/null)"
+  once="$(room_cli_as alice invite "$ROOM" --once --json 2>/dev/null)"
   oncelink="$(json_field invite_link "$once")"
-  room_cli join "$oncelink" --as grace >/dev/null 2>&1 \
+  room_cli_as grace join "$oncelink" >/dev/null 2>&1 \
     || smoke_fail "once-link first join should succeed"
-  # approve burns the token
+  # leader approve burns the token
   local approved burned
-  approved="$(room_cli approve "$ROOM" grace --as alice --json 2>/dev/null)"
+  approved="$(room_cli_as alice approve "$ROOM" grace --json 2>/dev/null)"
   burned="$(json_field invite_burned "$approved")"
   smoke_assert_eq "True" "$burned" "--once token burns on the approval"
   # a second join with the burned link must FAIL
-  if room_cli join "$oncelink" --as heidi >/dev/null 2>&1; then
+  if room_cli_as heidi join "$oncelink" >/dev/null 2>&1; then
     smoke_fail "TEETH: a burned --once token must reject subsequent joins"
   fi
 }
 
 # ---------------------------------------------------------------------------
-# adopt-all: default room with every roster agent
+# adopt-all: default room with every roster agent + roster-cache freshness
 # ---------------------------------------------------------------------------
 test_adopt_all() {
-  # Seed a small roster so `agent-bridge list` (which adopt-all consults)
-  # returns deterministic agents in this isolated home.
+  # Seed a small roster so `agent-bridge agent list --json` (which adopt-all
+  # consults) returns deterministic agents in this isolated home.
   python3 "$HELPER" write-roster "$BRIDGE_ROSTER_LOCAL_FILE" alpha beta gamma
   # Fresh rooms.db for a clean adopt-all assertion.
   local adopt_db="$BRIDGE_STATE_DIR/handoff/adopt-rooms.db"
   local out members
-  out="$(BRIDGE_A2A_ROOMS_DB="$adopt_db" room_cli adopt-all --name default --as alpha --json 2>/dev/null)"
+  out="$(BRIDGE_A2A_ROOMS_DB="$adopt_db" room_cli_as alpha adopt-all --name default --json 2>/dev/null)"
   members="$(python3 "$HELPER" members-csv "$out")"
   # alpha (leader) + beta + gamma all present
   for ag in alpha beta gamma; do
     smoke_assert_contains ",$members," ",$ag," "adopt-all includes roster agent $ag"
   done
+  # F2: the PERSISTED room_roster_cache row must be fresh — epoch ==
+  # rooms.epoch AND members == the full set (NOT just the leader). codex
+  # proved adopt-all left cache_epoch=0, cache_members=[leader] before the fix.
+  local room_id
+  room_id="$(json_field room_id "$out")"
+  python3 "$HELPER" assert-cache-fresh "$adopt_db" "$room_id" \
+    || smoke_fail "F2: adopt-all must leave room_roster_cache fresh (epoch + full members)"
+}
+
+# ---------------------------------------------------------------------------
+# F2: every epoch-bumping mutation persists a fresh room_roster_cache row
+# ---------------------------------------------------------------------------
+test_roster_cache_fresh_after_every_mutation() {
+  # The lifecycle room ($ROOM) has been through create/approve/leave/kick.
+  # Assert its persisted cache row matches rooms.epoch + the current members
+  # — proving bump_epoch centralizes the cache write so no verb leaves it
+  # stale (codex F2). assert-cache-fresh reads the actual SQLite row.
+  python3 "$HELPER" assert-cache-fresh "$BRIDGE_A2A_ROOMS_DB" "$ROOM" \
+    || smoke_fail "F2: room_roster_cache must be fresh after the lifecycle mutations"
 }
 
 # ---------------------------------------------------------------------------
@@ -252,17 +325,20 @@ test_db_mode_0600() {
 # run
 # ---------------------------------------------------------------------------
 smoke_run "absent-db reads degrade gracefully" test_absent_db_reads_degrade
-smoke_run "create (epoch 0, invite link once)" test_create
+smoke_run "create (epoch 0, OS-uid-derived leader, invite link once)" test_create
 smoke_run "join pending → approve bumps epoch + adds member" test_join_pending_then_approve_bumps_epoch
 smoke_run "leave/kick bump epoch + exclude from roster" test_leave_and_kick_bump_epoch_and_exclude
-smoke_run "TEETH: approve without leader-auth rejected" test_teeth_approve_without_leader_auth_rejected
+smoke_run "TEETH F1: iso leader-auth unspoofable (--as <leader> ignored)" test_teeth_iso_leader_auth_unspoofable
+smoke_run "TEETH F1: unmapped uid under iso fails closed" test_teeth_iso_unmapped_uid_fails_closed
+smoke_run "shared-mode leader-auth is advisory + honest (warns, not blocks)" test_advisory_shared_mode_is_honest
 smoke_run "TEETH: wrong token-hash rejected" test_teeth_wrong_token_hash_rejected
 smoke_run "TEETH: leader cannot be kicked" test_teeth_cannot_kick_leader
 smoke_run "TEETH: leave of a non-member is loud" test_teeth_leave_non_member_is_loud
 smoke_run "invite token stored as sha256 only (raw never in db)" test_invite_token_sha256_only
 smoke_run "rotate-invite invalidates the old token" test_rotate_invalidates_old_token
 smoke_run "--once token burns after one approval" test_once_token_burns_after_one_approval
-smoke_run "adopt-all creates a room with every roster agent" test_adopt_all
+smoke_run "adopt-all creates a room with every roster agent + fresh cache" test_adopt_all
+smoke_run "F2: roster-cache fresh after every epoch-bumping mutation" test_roster_cache_fresh_after_every_mutation
 smoke_run "envelope contract round-trip + v1 back-compat" test_envelope_contract
 smoke_run "receiver seam fail-closed contract" test_receiver_seam
 smoke_run "rooms.db mode 0600" test_db_mode_0600

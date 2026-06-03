@@ -239,6 +239,58 @@ def cmd_receiver_seam(repo_root: str) -> int:
     return 0
 
 
+def cmd_assert_cache_fresh(db: str, room_id: str) -> int:
+    """Exit 0 iff the PERSISTED room_roster_cache row is fresh for room_id.
+
+    Fresh = cache.epoch == rooms.epoch AND the cache's members_json equals the
+    canonical current membership (same agent@node set). This is the F2
+    contract: bump_epoch must re-persist room_roster_cache so no verb leaves it
+    stale. Reads the actual SQLite rows — not roster_for()'s return value.
+    """
+    conn = sqlite3.connect(db)
+    try:
+        rooms_row = conn.execute(
+            "SELECT epoch FROM rooms WHERE room_id=?", (room_id,)
+        ).fetchone()
+        cache_row = conn.execute(
+            "SELECT epoch, members_json FROM room_roster_cache WHERE room_id=?",
+            (room_id,),
+        ).fetchone()
+        members_rows = conn.execute(
+            "SELECT agent, node FROM room_members WHERE room_id=? "
+            "ORDER BY agent, node", (room_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    if rooms_row is None:
+        print(f"room {room_id} not in rooms table", file=sys.stderr)
+        return 1
+    if cache_row is None:
+        print(f"room {room_id} has NO room_roster_cache row (stale/missing)",
+              file=sys.stderr)
+        return 1
+    rooms_epoch = int(rooms_row[0])
+    cache_epoch = int(cache_row[0])
+    if cache_epoch != rooms_epoch:
+        print(f"cache epoch {cache_epoch} != rooms epoch {rooms_epoch} (STALE)",
+              file=sys.stderr)
+        return 1
+    try:
+        cache_members = json.loads(cache_row[1])
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"cache members_json not parseable: {exc}", file=sys.stderr)
+        return 1
+    cache_agents = sorted(
+        (m.get("agent"), m.get("node", "")) for m in cache_members
+    )
+    live_agents = sorted((r[0], r[1] or "") for r in members_rows)
+    if cache_agents != live_agents:
+        print(f"cache members {cache_agents} != live members {live_agents} "
+              "(STALE)", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_file_mode(path: str) -> int:
     mode = os.stat(path).st_mode & 0o777
     print(format(mode, "o"))
@@ -271,6 +323,8 @@ def main(argv: list[str]) -> int:
         return cmd_envelope_contract()
     if cmd == "receiver-seam":
         return cmd_receiver_seam(rest[0])
+    if cmd == "assert-cache-fresh":
+        return cmd_assert_cache_fresh(rest[0], rest[1])
     if cmd == "file-mode":
         return cmd_file_mode(rest[0])
     print(f"unknown subcommand: {cmd}", file=sys.stderr)
