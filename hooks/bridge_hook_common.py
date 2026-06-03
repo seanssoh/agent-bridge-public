@@ -113,10 +113,114 @@ def agent_root_v2() -> Path | None:
     return None
 
 
+def _resolved_env_path(*env_names: str) -> Path | None:
+    """Return the first non-empty `*_RESOLVED`-style env var as a Path.
+
+    Issue #1497 (P1): bash is the authoritative path resolver. `bridge-run.sh`
+    exports collision-free scalar aliases — ``BRIDGE_AGENT_WORKDIR_RESOLVED``
+    (workdir) and ``BRIDGE_AGENT_HOME_RESOLVED`` (identity home) — that carry
+    the exact v2-aware tree the bash launch/state layer computes. Python reads
+    these FIRST so it never re-derives path math and can never diverge from
+    bash on a v2-split install. Centralizing the read here keeps the home and
+    workdir resolvers from drifting (they shared the same hand-rolled
+    `os.environ.get(...).strip()` ladder before).
+
+    The bare ``BRIDGE_AGENT_WORKDIR`` name is included as a legacy alias only
+    for manual / non-bridge launches where the assoc-array collision that
+    motivated the ``_RESOLVED`` suffix does not exist; there is no bare-name
+    HOME alias because ``BRIDGE_AGENT_HOME_RESOLVED`` was born without an
+    assoc-array collision (see bridge-run.sh).
+    """
+    # The marker stays inline on each read for parity with the prior
+    # hand-rolled call sites: these are bash→Python scalar channels, not a
+    # controller-side read of an iso UID's runtime path.
+    for name in env_names:
+        value = os.environ.get(name, "").strip()  # noqa: iso-helper-boundary
+        if value:
+            return Path(value).expanduser()
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _resolve_home_via_roster(agent: str) -> Path | None:
+    """Best-effort lookup of an agent's identity home via the roster CLI.
+
+    Issue #1497 (P1): the authoritative fallback channel, mirroring
+    :func:`_resolve_workdir_via_roster` for the home dimension. ``agent show
+    --json`` now emits a resolver-derived ``agent_home`` (it was absent —
+    effectively ``None`` — before P1). Used by :func:`agent_default_home` when
+    the exported ``BRIDGE_AGENT_HOME_RESOLVED`` scalar is unavailable (cron /
+    external invocations that lack the env bridge-run.sh would export) so the
+    NEXT-SESSION.md candidate list resolves the v2 identity tree instead of a
+    stale legacy ``agents/<a>`` dir.
+
+    Any subprocess / parse / lookup failure returns ``None`` so the caller can
+    fall back to the prior v2/legacy computation. Memoised for the hook
+    process lifetime.
+    """
+    cli = bridge_script_dir() / "agent-bridge"
+    try:
+        proc = subprocess.run(
+            [str(cli), "agent", "list", "--json"],
+            cwd=str(bridge_script_dir()),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    rows: list[dict[str, Any]]
+    if isinstance(payload, list):
+        rows = [row for row in payload if isinstance(row, dict)]
+    elif isinstance(payload, dict):
+        candidates = payload.get("agents") or payload.get("rows") or []
+        rows = [row for row in candidates if isinstance(row, dict)]
+    else:
+        return None
+    for row in rows:
+        if row.get("agent") != agent:
+            continue
+        home = row.get("agent_home")
+        if isinstance(home, str) and home.strip():
+            return Path(home).expanduser()
+    return None
+
+
 def agent_default_home(agent: str) -> Path:
+    # Issue #1497 (P1): bash-authoritative resolution order. The exported
+    # scalar wins first; then the v2-aware computation; then the roster CLI
+    # fallback; then legacy. Critically, a stale legacy ``agents/<a>`` dir
+    # (which physically survives a v2 migration) must NOT short-circuit ahead
+    # of v2 — the v2 path is returned whenever a v2 signal is present, even if
+    # the legacy dir still exists on disk (the split-brain immunity the issue
+    # calls out). On a legacy install (no v2 signal) behaviour is unchanged:
+    # ``agent_home_root()/agent``.
+    explicit = _resolved_env_path("BRIDGE_AGENT_HOME_RESOLVED")
+    if explicit is not None:
+        return explicit
     root_v2 = agent_root_v2()
     if root_v2 is not None and agent:
-        return root_v2 / agent / "home"
+        v2_home = root_v2 / agent / "home"
+        if v2_home.is_dir():
+            return v2_home
+        # v2 signal present but the home tree is not on disk under this
+        # controller view (e.g. iso v2, where the real home lives in the iso
+        # UID's Linux home). Recover the authoritative path via the roster CLI
+        # before falling back to the computed v2 path — and NEVER reach down to
+        # the legacy ``agents/<a>`` tree from here (that is the split-brain
+        # short-circuit #1497 removes).
+        roster_home = _resolve_home_via_roster(agent)
+        if roster_home is not None:
+            return roster_home
+        return v2_home
+    # Legacy install (no v2 signal): unchanged from before P1.
     return agent_home_root() / agent
 
 
@@ -180,12 +284,14 @@ def _resolve_workdir_via_roster(agent: str) -> Path | None:
 
 
 def agent_workdir(agent: str) -> Path:
-    explicit = os.environ.get("BRIDGE_AGENT_WORKDIR_RESOLVED", "").strip()  # noqa: iso-helper-boundary
-    if explicit:
-        return Path(explicit).expanduser()
-    explicit = os.environ.get("BRIDGE_AGENT_WORKDIR", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
+    # Issue #1497 (P1): RESOLVED scalar first (bash-authoritative), then the
+    # bare-name legacy alias for manual launches — shared with the home
+    # resolver via _resolved_env_path so the two channels cannot drift.
+    explicit = _resolved_env_path(
+        "BRIDGE_AGENT_WORKDIR_RESOLVED", "BRIDGE_AGENT_WORKDIR"
+    )
+    if explicit is not None:
+        return explicit
     v2_workdir = agent_workdir_v2(agent)
     if v2_workdir is not None:
         if v2_workdir.is_dir():
@@ -330,11 +436,12 @@ def current_agent_workdir() -> Path:
 
 def queue_cli_cwd() -> Path:
     candidates: list[Path] = []
-    explicit_workdir = os.environ.get("BRIDGE_AGENT_WORKDIR_RESOLVED", "").strip()  # noqa: iso-helper-boundary
-    if not explicit_workdir:
-        explicit_workdir = os.environ.get("BRIDGE_AGENT_WORKDIR", "").strip()
-    if explicit_workdir:
-        candidates.append(Path(explicit_workdir).expanduser())
+    # Issue #1497 (P1): shared RESOLVED-first env read (see _resolved_env_path).
+    explicit_workdir = _resolved_env_path(
+        "BRIDGE_AGENT_WORKDIR_RESOLVED", "BRIDGE_AGENT_WORKDIR"
+    )
+    if explicit_workdir is not None:
+        candidates.append(explicit_workdir)
 
     agent = current_agent()
     if agent:
