@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import os
 import re
@@ -26,7 +27,30 @@ PRIORITY_ORDER = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
 # at 3 days" rendering degrades to plain text).
 GARDEN_STALE_SECONDS = 86400        # 1 day — yellow tier; below this, render `-`
 GARDEN_CRITICAL_SECONDS = 86400 * 3  # 3 days — red tier (informational only)
+# Upper bound on how far back the run-dir scan looks for a mapped cron run.
+# It must be wide enough to find the *legitimate* last run of a low-frequency
+# job (a weekly job last ran ~7d ago, a monthly one ~30d ago) so those agents
+# are not mis-flagged as stale. The effective lookback is widened further at
+# runtime to `max(this, slowest_job_cadence * CRON_CADENCE_GRACE_MULTIPLE)`.
 CRON_ACTIVITY_WINDOW_SECONDS = 36 * 3600
+
+# Cadence-aware staleness (issue #1464): a mapped cron run only counts as a
+# health signal when it is recent *relative to the owning job's cadence*. An
+# hourly job whose last run was 35h ago is badly overdue and must classify
+# stale, while a daily job 20h ago or a weekly job 3d ago is healthy. The
+# allowed gap is `cadence * CRON_CADENCE_GRACE_MULTIPLE`, floored at
+# CRON_CADENCE_MIN_WINDOW_SECONDS so very high-frequency jobs (e.g. */1) keep
+# a sane grace and do not flap stale seconds after a run.
+CRON_CADENCE_GRACE_MULTIPLE = 2.0
+CRON_CADENCE_MIN_WINDOW_SECONDS = 2 * 3600
+# Cadence is derived from the first scheduled occurrence AFTER the run being
+# judged. The matcher is walked over expanding windows so frequent jobs
+# (hourly/daily) resolve in a 2-day walk while sparse ones (monthly-on-the-31st,
+# annual) keep expanding up to CRON_CADENCE_MAX_PROBE_DAYS — large enough that a
+# `0 9 31 * *` job (whose next valid run can be ~61d out) and an annual job
+# (~366d) still resolve instead of falling back to false-stale.
+CRON_CADENCE_PROBE_STEPS_DAYS = (2, 40, 400)
+CRON_CADENCE_MAX_PROBE_DAYS = 400
 
 
 def iso_now() -> str:
@@ -146,7 +170,14 @@ def classify_agent_stale(
         return "-"
     if source == "dynamic":
         return "-"
-    if int_ts(metric.get("last_cron_run_ts")):
+    # Issue #1464: a static agent whose recurring cron fired *within its
+    # cadence* is doing its scheduled work even though its interactive session
+    # is idle — classify ok. But a mapped cron run that is overdue relative to
+    # the job's cadence (e.g. an hourly job last run 35h ago) is NOT a health
+    # signal; it must fall through to session-based staleness so a genuinely
+    # stuck schedule-driven agent is still surfaced. The cadence gate replaces
+    # the earlier blanket "any recent cron run → ok" that masked overdue jobs.
+    if int_ts(metric.get("last_cron_run_ts")) and bool(metric.get("cron_in_cadence")):
         return "ok"
     return classify_stale(
         active,
@@ -155,6 +186,172 @@ def classify_agent_stale(
         critical_seconds,
         source=source,
     )
+
+
+_CRON_SCHEDULER_MODULE: object | None = None
+_CRON_SCHEDULER_LOAD_FAILED = False
+
+
+def _load_cron_scheduler_module() -> object | None:
+    # Reuse the canonical cron occurrence walker from bridge-cron-scheduler.py
+    # rather than hand-rolling a second cron parser (the brief's explicit
+    # constraint). Hyphenated-filename sibling import mirrors the pattern in
+    # bridge-memory.py / bridge-migrate.py. Cached; a load/parse failure is
+    # remembered so the dashboard never repeatedly tries (and never crashes —
+    # cadence simply falls back to None, i.e. the session-based path).
+    global _CRON_SCHEDULER_MODULE, _CRON_SCHEDULER_LOAD_FAILED
+    if _CRON_SCHEDULER_MODULE is not None:
+        return _CRON_SCHEDULER_MODULE
+    if _CRON_SCHEDULER_LOAD_FAILED:
+        return None
+    script = Path(__file__).resolve().parent / "bridge-cron-scheduler.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_bridge_cron_scheduler_status", str(script))
+        if spec is None or spec.loader is None:
+            _CRON_SCHEDULER_LOAD_FAILED = True
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["_bridge_cron_scheduler_status"] = module
+        spec.loader.exec_module(module)
+    except Exception:
+        _CRON_SCHEDULER_LOAD_FAILED = True
+        return None
+    _CRON_SCHEDULER_MODULE = module
+    return module
+
+
+def _next_cron_occurrence_after(schedule: dict[str, object], anchor: datetime) -> datetime | None:
+    """First scheduled occurrence strictly after `anchor`, or None.
+
+    Reuses bridge-cron-scheduler.py's canonical `enumerate_cron_occurrences`
+    over expanding windows so frequent jobs stop after a cheap 2-day walk while
+    sparse ones (monthly-on-the-31st, annual) keep expanding up to
+    CRON_CADENCE_MAX_PROBE_DAYS before giving up.
+    """
+    module = _load_cron_scheduler_module()
+    if module is None or not hasattr(module, "enumerate_cron_occurrences"):
+        return None
+    job = {"name": "_status_cadence_probe", "schedule": schedule}
+    for window_days in CRON_CADENCE_PROBE_STEPS_DAYS:
+        try:
+            occurrences = module.enumerate_cron_occurrences(  # type: ignore[attr-defined]
+                job, anchor, anchor + timedelta(days=window_days)
+            )
+        except Exception:
+            return None
+        if occurrences:
+            return occurrences[0]
+    return None
+
+
+def cron_schedule_next_due_and_interval(
+    schedule: dict[str, object] | None,
+    after_ts: int,
+) -> tuple[int | None, int | None]:
+    """``(next_due_ts, interval_seconds)`` for the fire AFTER ``after_ts``.
+
+    - ``next_due_ts``: epoch of the first scheduled occurrence strictly after
+      ``after_ts`` (for a cron run this is when the job was NEXT supposed to
+      fire). Needed for the overdue check — an agent is healthy only while
+      ``now`` has not blown well past this.
+    - ``interval_seconds``: the cadence used to size the grace, derived as the
+      gap between the next two occurrences (``occ2 - occ1``) so it is robust to
+      anchor misalignment. `every` schedules use ``everyMs`` directly.
+
+    Returns ``(None, None)`` for one-shot (`at`) / unknown / unparseable
+    schedules, which callers treat as "no cadence signal" (session fallback).
+    """
+    if not isinstance(schedule, dict):
+        return None, None
+    kind = schedule.get("kind")
+    if kind == "every":
+        try:
+            every_ms = int(schedule.get("everyMs") or 0)
+        except (TypeError, ValueError):
+            return None, None
+        if every_ms <= 0:
+            return None, None
+        interval = every_ms // 1000
+        return after_ts + interval, interval
+    if kind != "cron":
+        return None, None
+    expr = str(schedule.get("expr") or "").strip()
+    if not expr:
+        return None, None
+    anchor = datetime.fromtimestamp(int(after_ts), tz=timezone.utc)
+    occ1 = _next_cron_occurrence_after(schedule, anchor)
+    if occ1 is None:
+        return None, None
+    occ2 = _next_cron_occurrence_after(schedule, occ1)
+    interval = int((occ2 - occ1).total_seconds()) if occ2 is not None else None
+    if interval is not None and interval <= 0:
+        interval = None
+    return int(occ1.timestamp()), interval
+
+
+def cron_run_in_cadence(
+    schedule: dict[str, object] | None,
+    run_ts: int,
+    now_ts: int,
+) -> tuple[bool, int | None]:
+    """Is a cron run still on-schedule? -> ``(in_cadence, interval_seconds)``.
+
+    A run is in cadence while ``now`` has not blown past the job's NEXT due fire
+    (after the run) by more than the grace slack ``interval * (grace - 1)``
+    (floored at CRON_CADENCE_MIN_WINDOW_SECONDS). This catches an overdue job
+    even when the inter-occurrence interval is short relative to the elapsed
+    idle: an hourly job last run 35h ago is past its next due by 34h ≫ slack →
+    stale; an irregular ``0 9,17 * * *`` job that has missed both its next slots
+    → stale; while a daily-20h / weekly-3d / monthly-on-the-31st run that has
+    not yet reached (or only just passed) its next due → healthy. Returns
+    ``(False, interval)`` / ``(False, None)`` when no cadence can be derived so
+    the caller falls back to session-based staleness (never masks).
+    """
+    next_due_ts, interval = cron_schedule_next_due_and_interval(schedule, run_ts)
+    if next_due_ts is None or not interval or interval <= 0:
+        return False, interval
+    slack = max(int(interval * (CRON_CADENCE_GRACE_MULTIPLE - 1.0)), CRON_CADENCE_MIN_WINDOW_SECONDS)
+    return now_ts <= next_due_ts + slack, interval
+
+
+def cron_schedule_scan_window_hint_seconds(schedule: dict[str, object] | None) -> int:
+    """Cheap upper-bound interval (seconds) for sizing the run-dir lookback.
+
+    Sizing the run-dir scan window from the *precise* cadence would cost a full
+    occurrence walk per job — wasteful when all we need is "look back far enough
+    to find this job's last legitimate run". This derives a conservative bound
+    from the cron fields by inspection (no occurrence walk):
+
+      - a constrained month field  -> annual-ish (the job may fire once a year)
+      - a constrained day-of-month  -> ~2 months (e.g. `0 9 31 * *`)
+      - a constrained day-of-week   -> ~1 week
+      - otherwise (hour/minute only)-> ~1 day
+
+    `every` schedules return their exact interval. Unknown/`at` schedules
+    return 0 (no hint; callers floor on CRON_ACTIVITY_WINDOW_SECONDS).
+    """
+    if not isinstance(schedule, dict):
+        return 0
+    kind = schedule.get("kind")
+    if kind == "every":
+        try:
+            every_ms = int(schedule.get("everyMs") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return every_ms // 1000 if every_ms > 0 else 0
+    if kind != "cron":
+        return 0
+    fields = str(schedule.get("expr") or "").split()
+    if len(fields) != 5:
+        return 0
+    _minute, _hour, dom, month, dow = fields
+    if month.strip() != "*":
+        return CRON_CADENCE_MAX_PROBE_DAYS * 86400
+    if dom.strip() != "*":
+        return 62 * 86400
+    if dow.strip() != "*":
+        return 7 * 86400
+    return 86400
 
 
 def cron_run_timestamp_from_name(run_name: str) -> int | None:
@@ -191,7 +388,16 @@ def cron_run_timestamp_from_name(run_name: str) -> int | None:
         return None
 
 
-def cron_job_agent_keys(bridge_home: str) -> list[tuple[str, str]]:
+def cron_job_agent_keys(
+    bridge_home: str,
+) -> list[tuple[str, str, dict[str, object] | None]]:
+    """Map cron run-id prefixes to (owning agent, schedule).
+
+    The schedule travels with the key so the run-dir scan can compute the
+    cadence of the specific job a run belongs to (issue #1464). Keys are
+    sorted longest-first so the most specific prefix wins in
+    `agent_for_cron_run_prefix`.
+    """
     if not bridge_home:
         return []
     jobs_path = Path(bridge_home) / "cron" / "jobs.json"
@@ -205,7 +411,7 @@ def cron_job_agent_keys(bridge_home: str) -> list[tuple[str, str]]:
         jobs = payload.get("jobs", payload.get("items", []))
     else:
         return []
-    keys: list[tuple[str, str]] = []
+    keys: list[tuple[str, str, dict[str, object] | None]] = []
     if not isinstance(jobs, list):
         return keys
     for job in jobs:
@@ -214,18 +420,22 @@ def cron_job_agent_keys(bridge_home: str) -> list[tuple[str, str]]:
         agent = str(job.get("agent") or job.get("agentId") or "").strip()
         if not agent:
             continue
+        schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else None
         for raw_key in (job.get("family"), job.get("name"), job.get("id")):
             key = str(raw_key or "").strip()
             if key:
-                keys.append((key, agent))
+                keys.append((key, agent, schedule))
     keys.sort(key=lambda item: len(item[0]), reverse=True)
     return keys
 
 
-def agent_for_cron_run_prefix(prefix: str, keys: list[tuple[str, str]]) -> str | None:
-    for key, agent in keys:
+def agent_for_cron_run_prefix(
+    prefix: str,
+    keys: list[tuple[str, str, dict[str, object] | None]],
+) -> tuple[str, dict[str, object] | None] | None:
+    for key, agent, schedule in keys:
         if prefix == key or prefix.startswith(f"{key}-"):
-            return agent
+            return agent, schedule
     return None
 
 
@@ -233,35 +443,91 @@ def last_cron_run_by_agent(
     bridge_home: str,
     bridge_state_dir: str,
     critical_seconds: int,
-) -> dict[str, int]:
+) -> dict[str, dict[str, int | bool | None]]:
+    """Per-agent best (most in-cadence) recent cron run.
+
+    For each agent we keep the run that minimises ``age / cadence`` — i.e. the
+    strongest "this scheduled work is firing on time" signal across all of the
+    agent's jobs. The returned record carries:
+
+    - ``last_cron_run_ts``: epoch seconds of that best run.
+    - ``cron_cadence_seconds``: the cadence of the job that produced it (or
+      None when the schedule was unparseable / one-shot).
+    - ``cron_in_cadence``: True when that best run is within
+      ``cadence * grace`` (issue #1464); a stale/overdue cron leaves this
+      False so the agent falls back to session-based staleness instead of
+      being masked ``ok``.
+
+    The run-dir lookback is widened (via a cheap field-based hint) to cover the
+    slowest job's cadence so a legitimate weekly/monthly job's last run is still
+    found rather than aged out of the scan window.
+    """
     runs_dir = (
         Path(bridge_state_dir) / "cron" / "runs"
         if bridge_state_dir
         else Path(bridge_home) / "state" / "cron" / "runs"
     )
     keys = cron_job_agent_keys(bridge_home)
-    if not keys or not runs_dir.is_dir():
+    # The dashboard render is controller-only — it reads its own
+    # ~/.agent-bridge/state/cron/runs; isolated agent UIDs never run the status
+    # dashboard, so this scan never crosses an iso boundary.
+    if not keys or not runs_dir.is_dir():  # noqa: raw-pathlib-controller-only — controller-side run-dir probe; iso UIDs never reach the dashboard
         return {}
     now_ts = int(datetime.now(timezone.utc).timestamp())
-    window_seconds = max(CRON_ACTIVITY_WINDOW_SECONDS, int(critical_seconds or 0))
+    # Lookback must outlast the slowest job's cadence (a weekly job legitimately
+    # ran ~7d ago, a monthly one ~31d) or that agent would be mis-flagged stale.
+    # Size the window from a CHEAP field-based hint (no occurrence walk) — the
+    # precise per-run cadence is computed later only for runs actually found.
+    max_hint = 0
+    for _key, _agent, schedule in keys:
+        hint = cron_schedule_scan_window_hint_seconds(schedule)
+        if hint > max_hint:
+            max_hint = hint
+    hint_lookback = int(max_hint * CRON_CADENCE_GRACE_MULTIPLE) if max_hint else 0
+    window_seconds = max(CRON_ACTIVITY_WINDOW_SECONDS, int(critical_seconds or 0), hint_lookback)
     cutoff = now_ts - window_seconds
-    out: dict[str, int] = {}
+    # Aggregate per agent: latch in_cadence True if any owned job fired on
+    # schedule, keep the most recent run timestamp, and record an interval for
+    # the observability column (preferring an in-cadence run's interval).
+    best: dict[str, dict[str, int | bool | None]] = {}
     try:
         entries = list(runs_dir.iterdir())
     except OSError:
-        return out
+        return {}
     for entry in entries:
         ts = cron_run_timestamp_from_name(entry.name)
         if ts is None or ts < cutoff or ts > now_ts + 300:
             continue
-        if not entry.is_dir():
+        if not entry.is_dir():  # noqa: raw-pathlib-controller-only — controller-owned run dir; iso UIDs never reach the dashboard render
             continue
         prefix = entry.name.rsplit("--", 1)[0]
-        agent = agent_for_cron_run_prefix(prefix, keys)
-        if not agent:
+        match = agent_for_cron_run_prefix(prefix, keys)
+        if not match:
             continue
-        if ts > out.get(agent, 0):
-            out[agent] = ts
+        agent, schedule = match
+        in_cadence, interval = cron_run_in_cadence(schedule, ts, now_ts)
+        record = best.setdefault(
+            agent,
+            {"last_cron_run_ts": 0, "cron_cadence_seconds": None, "cron_in_cadence": False},
+        )
+        # An agent is cron-healthy if ANY of its jobs fired on schedule. Latch
+        # in_cadence True across runs; surface the most recent run's timestamp;
+        # prefer the interval of an in-cadence run for the observability column.
+        if ts > int(record["last_cron_run_ts"] or 0):
+            record["last_cron_run_ts"] = ts
+        if in_cadence:
+            record["cron_in_cadence"] = True
+            record["cron_cadence_seconds"] = interval
+        elif record["cron_cadence_seconds"] is None:
+            record["cron_cadence_seconds"] = interval
+    out: dict[str, dict[str, int | bool | None]] = {}
+    for agent, record in best.items():
+        cadence = record["cron_cadence_seconds"]
+        out[agent] = {
+            "last_cron_run_ts": int(record["last_cron_run_ts"]),
+            "cron_cadence_seconds": int(cadence) if cadence is not None else None,
+            "cron_in_cadence": bool(record["cron_in_cadence"]),
+        }
     return out
 
 
@@ -271,8 +537,13 @@ def add_cron_activity_to_metrics(
     bridge_state_dir: str,
     critical_seconds: int,
 ) -> None:
-    for agent, ts in last_cron_run_by_agent(bridge_home, bridge_state_dir, critical_seconds).items():
-        metrics.setdefault(agent, {})["last_cron_run_ts"] = ts
+    for agent, record in last_cron_run_by_agent(
+        bridge_home, bridge_state_dir, critical_seconds
+    ).items():
+        metric = metrics.setdefault(agent, {})
+        metric["last_cron_run_ts"] = record["last_cron_run_ts"]
+        metric["cron_cadence_seconds"] = record["cron_cadence_seconds"]
+        metric["cron_in_cadence"] = record["cron_in_cadence"]
 
 
 def short_path(path: str) -> str:
@@ -1318,6 +1589,8 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
                 "last_heartbeat_ts": metric.get("last_heartbeat_ts"),
                 "session_activity_ts": metric.get("session_activity_ts"),
                 "last_cron_run_ts": metric.get("last_cron_run_ts"),
+                "cron_cadence_seconds": metric.get("cron_cadence_seconds"),
+                "cron_in_cadence": metric.get("cron_in_cadence"),
                 "effective_activity_ts": activity_ts,
                 "stale": classify_agent_stale(
                     active,
