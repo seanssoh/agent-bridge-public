@@ -55,6 +55,23 @@
 #       bridge-lib.sh (the git-base version) MUST leak, proving the original
 #       canary still has teeth.
 #
+# OUT OF SCOPE (the launch-environment-control boundary — NOT tested here,
+# documented so this canary's contract is honest about what it does and does
+# not prove; see lib/bridge-secret-scrub.sh "THREAT MODEL"):
+#   - Inherited `SHELLOPTS=xtrace` + a `PS4` carrying a command-substitution.
+#     Bash evaluates `PS4` BEFORE the first command of any script, so the `PS4`
+#     `$(...)` runs while the secret is live ahead of bridge-lib.sh's first
+#     executable line — no pure-Bash code at the bridge-lib.sh root can pre-empt
+#     it from inside the script.
+#   - A DEBUG trap installed by the invoking shell (e.g. `BASH_ENV` + `set -T`)
+#     that fires before the seed assignment itself.
+#   Both require the attacker to control the invoking shell's options/startup on
+#   a token-bearing launch — the same "already controls the launch environment"
+#   position as a same-UID attacker who can scrape `/proc`/the filesystem (who
+#   already holds the secret). This is the #1443-consistent boundary, not a
+#   primitive defect. (Cases G / TEETH-TRAP below cover only the IN-scope
+#   POST-seed DEBUG-trap re-shadow, not this pre-seed startup window.)
+#
 # lint-heredoc-ban: this smoke uses heredoc-TO-FILE (writing attack wrappers to
 # tempfiles) which is allowed; it never feeds a heredoc to a subprocess stdin
 # (`bash -s <<EOF` / `python3 - <<PY`) and never uses `<<<` or `< <(...)`. Leak

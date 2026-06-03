@@ -17,13 +17,35 @@
 # THREAT MODEL (the in-scope window this primitive defends):
 #   A same-UID caller that, before invoking a bridge script, exports a Bash
 #   FUNCTION named after a command the script invokes unqualified (`export -f
-#   dirname`), plants such a binary earlier on PATH, points BASH_ENV/ENV at a
-#   leak script, or sets SHELLOPTS=xtrace + a malicious PS4 — any of which would
-#   otherwise run IN the script's shell (or a child it forks) WHILE an ambient
-#   secret env var is still live, and exfiltrate it.
-#   OUT of scope (per the #1443 ruling): a same-UID attacker who can already
-#   arbitrarily scrape the operator's filesystem / `/proc` — they already hold
-#   the secret; nothing this primitive does helps or hurts that case.
+#   dirname`, including the `source`/`.`/`builtin`/`command`/`local` builtins —
+#   neutralized via the un-shadowable `POSIXLY_CORRECT=1` seed), or plants such
+#   a binary earlier on PATH — any of which would otherwise run IN the script's
+#   shell (or a child it forks) WHILE an ambient secret env var is still live,
+#   and exfiltrate it. The primitive also `unset`s `BASH_ENV ENV BASH_XTRACEFD`,
+#   `set +x`, and `unset PS4` in `harden_hooks` so none of those caller-planted
+#   child-startup hooks fire in any subshell/fork the bridge spawns AFTER
+#   hardening (the re-exec and every later `$(...)`).
+#
+#   OUT of scope — the launch-environment-control boundary (consistent with the
+#   #1443 ruling). Two related classes are explicitly NOT defended because they
+#   execute attacker code BEFORE this primitive's first line can run, and both
+#   require the attacker to control the *invoking shell's options/startup* on a
+#   token-bearing launch — the same "already controls the launch environment"
+#   position as a same-UID attacker who can scrape `/proc`/the filesystem (who
+#   already holds the secret):
+#     (a) Inherited `SHELLOPTS=xtrace` + a `PS4` carrying a command-substitution:
+#         Bash evaluates `PS4` BEFORE the first command of any script, so the
+#         `PS4` `$(...)` runs while the secret is live before bridge-lib.sh's
+#         first executable line — no pure-Bash code at the bridge-lib.sh root
+#         can pre-empt it from inside the script.
+#     (b) A DEBUG trap installed by the invoking shell (e.g. via `BASH_ENV` +
+#         `set -T`) fires before the seed assignment itself.
+#   These are the launch-env-control boundary, not a defect in this primitive;
+#   defending them would require trusting the invoking shell's pre-exec state,
+#   which is exactly what a same-UID launch-environment attacker controls. The
+#   matching boundary still holds: a same-UID attacker who can already
+#   arbitrarily scrape the operator's filesystem / `/proc` already holds the
+#   secret; nothing this primitive does helps or hurts that case.
 #
 # CONSUMER CONTRACT (what each helper guarantees / requires):
 #
