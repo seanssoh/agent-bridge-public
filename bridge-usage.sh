@@ -689,7 +689,15 @@ bridge_usage_probe_audit() {
   row="$(command python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" usage-probe-result-parse "$probe_json" 2>/dev/null || builtin true)"
   [[ -n "$row" ]] || return 0
   local p_status p_reset p_retry p_http
-  IFS=$'\t' read -r p_status p_reset p_retry p_http <<<"$row"
+  # #1468: split the tab-separated probe row WITHOUT a here-string (footgun #11
+  # / lint-heredoc-ban H3). The row is token-free (status/reset/retry/http) and
+  # we read it back from a temp file so `read`'s field semantics are preserved
+  # exactly (verified byte-identical to the prior here-string parse).
+  local _row_tmp=""
+  _row_tmp="$(command mktemp "${TMPDIR:-/tmp}/agb-usage-probe-row.XXXXXX" 2>/dev/null)" || return 0
+  printf '%s\n' "$row" >"$_row_tmp" 2>/dev/null || { command rm -f "$_row_tmp"; return 0; }
+  IFS=$'\t' read -r p_status p_reset p_retry p_http <"$_row_tmp"
+  command rm -f "$_row_tmp"
   [[ -n "$p_status" ]] || return 0
   bridge_audit_log daemon usage_probe "$admin_agent" \
     --detail status="$p_status" \
