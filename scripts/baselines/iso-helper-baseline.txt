@@ -135,6 +135,7 @@ scripts/smoke/1383-iso-cron-result-json-group.sh=25
 scripts/smoke/1405-handoffd-supervision.sh=8
 scripts/smoke/1427-B-template-sync-wizard.sh=4
 scripts/smoke/1495-settings-invalid-hook-key.sh=6
+scripts/smoke/1506-isolate-normalize.sh=5
 scripts/smoke/4494-integrated-dynamic-recovery.sh=4
 scripts/smoke/857-pr1-isolation-write-helper.sh=9
 scripts/smoke/857-pr6-isolation-v3-channel-dotenv-migrate.sh=25
