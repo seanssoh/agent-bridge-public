@@ -44,33 +44,32 @@ export BRIDGE_A2A_ROOMS_DB="$BRIDGE_STATE_DIR/handoff/rooms.db"
 unset BRIDGE_A2A_CONFIG || true
 
 # §14 R1 actor-auth: the trusted acting agent is derived from the process OS
-# uid, NOT from --as/env. In production the uid->agent map comes ONLY from the
-# controller-owned roster probe; the BRIDGE_ROOMS_UID_MAP env CSV is a TEST
-# seam consulted ONLY behind the PAIRED test flag (BRIDGE_ROOMS_ALLOW_TEST_
-# UID_MAP=1 AND BRIDGE_A2A_ALLOW_TEST_BIND=1). The smoke sets both so it can
-# simulate distinct iso UIDs from one real uid (acting as alice/bob/... in
-# turn). A managed agent in production sets NEITHER flag, so it cannot spoof
-# its identity through the env map (codex Phase-4 r3 F1). The flags are set
-# INLINE per call (never exported) so nothing leaks.
+# USERNAME (a passwd fact), NOT from --as/env or any roster probe. Leader-auth
+# compares the process's OS username against the expected iso OS user for the
+# room leader (default_os_user_slug). The ONLY test seam is the paired-flag
+# BRIDGE_ROOMS_TEST_ISO_USER override (gated by BRIDGE_ROOMS_ALLOW_TEST_UID_MAP
+# =1 AND BRIDGE_A2A_ALLOW_TEST_BIND=1) which lets the smoke simulate the
+# process OS username; production sets NEITHER flag so it is never honored.
+# room_cli_as <agent> runs as if the process OS user were agent-bridge-<agent>
+# (a distinct iso UID), so one real uid can act as alice/bob/... in turn. Flags
+# are set INLINE (never exported) so nothing leaks.
 MY_UID="$(python3 -c 'import os; print(os.getuid())')"
 # Paired test-seam flags, applied only by room_cli_as / the F1 teeth.
 ROOMS_TEST_FLAGS=("BRIDGE_ROOMS_ALLOW_TEST_UID_MAP=1" "BRIDGE_A2A_ALLOW_TEST_BIND=1")
 
 room_cli() {
-  # Default: NO test flags + no uid map -> roster probe (empty on macOS / a
-  # non-iso isolated home) -> shared-advisory regime (honors best-effort id).
+  # Default: NO test flags -> real pwd.getpwuid (non-iso on macOS) + no iso
+  # users on host -> shared-advisory regime (honors best-effort id).
   python3 "$ROOMS_CLI" "$@"
 }
 
 room_cli_as() {
-  # room_cli_as <agent> <args...> — run as if from <agent>'s iso OS uid
-  # (iso-enforced regime). Sets the paired test flags + the test uid map
-  # (this uid -> <agent>) + the test iso-user (agent-bridge-<agent>) so the
-  # un-spoofable iso-OS-user anchor recognizes us as an iso agent and the
-  # hardened probe resolves <agent>. Mirrors a real distinct iso UID.
+  # room_cli_as <agent> <args...> — run as if the process OS user were the iso
+  # user agent-bridge-<agent> (iso-enforced regime). The un-spoofable OS-user
+  # anchor recognizes us as that iso agent; leader-auth compares against the
+  # room leader's expected OS user. Mirrors a real distinct iso UID.
   local who="$1"; shift
   env "${ROOMS_TEST_FLAGS[@]}" \
-      "BRIDGE_ROOMS_UID_MAP=${MY_UID}:${who}" \
       "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-${who}" \
     python3 "$ROOMS_CLI" "$@"
 }
@@ -165,115 +164,65 @@ test_leave_and_kick_bump_epoch_and_exclude() {
 # ---------------------------------------------------------------------------
 # TEETH — §14 R1 actor-auth (the F1 security contract)
 # ---------------------------------------------------------------------------
-# iso_env <iso-user> <uid-map> [extra KEY=VAL ...] — emit an `env` argv that
-# simulates an iso OS user (the un-spoofable anchor) with a chosen uid map.
-iso_env_run() {
-  local isouser="$1" uidmap="$2"; shift 2
-  env "${ROOMS_TEST_FLAGS[@]}" \
-      "BRIDGE_ROOMS_TEST_ISO_USER=${isouser}" \
-      "BRIDGE_ROOMS_UID_MAP=${uidmap}" "$@" \
-    python3 "$ROOMS_CLI"
-}
-
 test_teeth_iso_leader_auth_unspoofable() {
   # The exact codex F1 exploit: a non-leader iso agent passing --as <leader>.
-  # The actor is the OS-uid-derived agent (here the iso user 'mallory'); --as
-  # alice must be IGNORED and approve/kick REJECTED.
+  # The trusted actor is the process OS USERNAME (agent-bridge-mallory here);
+  # leader-auth compares it to the leader's expected OS user (agent-bridge-
+  # alice). --as alice must be IGNORED and approve/kick REJECTED.
   room_cli_as dave join "$LINK" >/dev/null 2>&1
-  if iso_env_run "agent-bridge-mallory" "${MY_UID}:mallory" \
-       approve "$ROOM" dave --as alice >/dev/null 2>&1; then
-    smoke_fail "TEETH F1: approve by iso uid=mallory must be REJECTED even with --as alice"
+  if env "${ROOMS_TEST_FLAGS[@]}" "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-mallory" \
+       python3 "$ROOMS_CLI" approve "$ROOM" dave --as alice >/dev/null 2>&1; then
+    smoke_fail "TEETH F1: approve by iso user mallory must be REJECTED even with --as alice"
   fi
-  if iso_env_run "agent-bridge-mallory" "${MY_UID}:mallory" \
-       kick "$ROOM" bob --as alice >/dev/null 2>&1; then
-    smoke_fail "TEETH F1: kick by iso uid=mallory must be REJECTED even with --as alice"
+  if env "${ROOMS_TEST_FLAGS[@]}" "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-mallory" \
+       python3 "$ROOMS_CLI" kick "$ROOM" bob --as alice >/dev/null 2>&1; then
+    smoke_fail "TEETH F1: kick by iso user mallory must be REJECTED even with --as alice"
   fi
-  # Positive: the leader's uid CAN approve (proves it is not a blanket deny).
+  # Positive: the leader's OS user CAN approve (proves it is not a blanket deny).
   room_cli_as alice approve "$ROOM" dave >/dev/null 2>&1 \
-    || smoke_fail "leader-uid approve must succeed"
+    || smoke_fail "leader OS user approve must succeed"
 }
 
-test_teeth_iso_probe_sabotage_fails_closed() {
-  # THE r4 DOWNGRADE attack: an iso agent (un-spoofable OS user) breaks the
-  # roster probe to empty -> MUST fail closed, NOT downgrade to advisory where
-  # --as is honored. Simulate an iso OS user with an EMPTY uid map (probe found
-  # nothing). resolve-regime must be UNRESOLVED, and a leader-only verb with
-  # --as <leader> must be REJECTED.
-  local got
-  got="$(env "${ROOMS_TEST_FLAGS[@]}" \
-             "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-mallory" \
-             "BRIDGE_ROOMS_UID_MAP=" \
-         python3 "$HELPER" resolve-regime 2>/dev/null)"
-  smoke_assert_contains "$got" "regime=unresolved" \
-    "TEETH F1 r4: an iso OS user with an empty/sabotaged probe must be UNRESOLVED, not advisory"
-  smoke_assert_not_contains "$got" "shared-advisory" \
-    "TEETH F1 r4: iso OS user must NEVER downgrade to shared-advisory"
+test_teeth_no_roster_probe_on_security_path() {
+  # The r5/r6 roster-injection class is structurally eliminated: leader-auth is
+  # a PURE comparison of the process OS username vs default_os_user_slug(leader)
+  # with NO roster lookup / probe / subprocess. Prove a hostile BRIDGE_HOME (an
+  # agent-writable fake home that, under the OLD probe, could inject a forged
+  # uid->leader row) has ZERO effect: the iso user 'mallory' with a hostile
+  # BRIDGE_HOME still cannot approve as the leader 'alice'.
+  local evil="$SMOKE_TMP_ROOT/evil-home2"
+  mkdir -p "$evil"
+  : >"$evil/agent-roster.sh"
+  : >"$evil/agent-roster.local.sh"
   if env "${ROOMS_TEST_FLAGS[@]}" \
          "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-mallory" \
-         "BRIDGE_ROOMS_UID_MAP=" \
-       python3 "$ROOMS_CLI" approve "$ROOM" eve --as alice >/dev/null 2>&1; then
-    smoke_fail "TEETH F1 r4: iso agent with a sabotaged probe must FAIL CLOSED on --as <leader>"
+         "BRIDGE_HOME=$evil" "BRIDGE_ROSTER_FILE=$evil/agent-roster.sh" \
+         "BRIDGE_BASH_BIN=/bin/false" \
+       python3 "$ROOMS_CLI" approve "$ROOM" dave --as alice >/dev/null 2>&1; then
+    smoke_fail "TEETH F1 r6: a hostile BRIDGE_HOME/roster/BASH_BIN must NOT let a non-leader iso user approve"
   fi
-}
-
-test_teeth_forged_roster_home_rejected() {
-  # THE r5 BRIDGE_HOME-injection attack: an iso agent points BRIDGE_HOME at an
-  # agent-WRITABLE fake home with a forged roster. The probe's ownership gate
-  # must REJECT a roster owned by the calling uid → empty map → an iso OS user
-  # then FAILS CLOSED (UNRESOLVED), not iso-enforced-as-the-forged-leader.
-  local evil="$SMOKE_TMP_ROOT/evil-home"
-  mkdir -p "$evil"
-  : >"$evil/agent-roster.sh"          # owned by us (the "agent")
-  : >"$evil/agent-roster.local.sh"
+  # And resolve-regime is unaffected by the hostile env (still iso-enforced as
+  # mallory, the OS user — NOT alice).
   local got
-  # Simulate the iso OS user, NO env uid map (force the real probe), hostile
-  # BRIDGE_HOME. The probe reads our-owned roster -> rejected -> empty -> the
-  # iso anchor makes us UNRESOLVED.
   got="$(env "${ROOMS_TEST_FLAGS[@]}" \
              "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-mallory" \
-             "BRIDGE_HOME=$evil" "BRIDGE_ROOMS_UID_MAP=" \
+             "BRIDGE_HOME=$evil" "BRIDGE_BASH_BIN=/bin/false" \
            python3 "$HELPER" resolve-regime 2>/dev/null)"
-  smoke_assert_contains "$got" "regime=unresolved" \
-    "TEETH F1 r5: a forged agent-owned roster under a hostile BRIDGE_HOME must be REJECTED (UNRESOLVED)"
-  smoke_assert_not_contains "$got" "iso-enforced" \
-    "TEETH F1 r5: forged-roster injection must NOT grant iso-enforced leadership"
-}
-
-test_teeth_env_uid_map_ignored_in_prod() {
-  # WITHOUT the paired test flags, BRIDGE_ROOMS_UID_MAP must be IGNORED — a
-  # production managed agent cannot set it to become the leader. With only the
-  # env var (no flags), resolution uses the roster probe (empty here). To prove
-  # the env map is inert we run resolve-regime with the map set but NO flags;
-  # the actor must NOT be 'alice' iso-enforced.
-  local got
-  got="$(BRIDGE_ROOMS_UID_MAP="${MY_UID}:alice" \
-         python3 "$HELPER" resolve-regime 2>/dev/null)"
-  smoke_assert_not_contains "$got" "iso-enforced" \
-    "TEETH F1: unflagged BRIDGE_ROOMS_UID_MAP must be IGNORED (no iso spoof)"
-  smoke_assert_not_contains "$got" "agent=alice" \
-    "TEETH F1: unflagged env map must NOT make the actor 'alice'"
-}
-
-test_teeth_iso_unmapped_uid_fails_closed() {
-  # An iso OS user whose uid maps to no agent → no trusted actor → FAIL CLOSED
-  # (not advisory). iso user present, but the map points at a DIFFERENT uid.
-  if env "${ROOMS_TEST_FLAGS[@]}" \
-         "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-ghost" \
-         "BRIDGE_ROOMS_UID_MAP=999999:somebodyelse" \
-       python3 "$ROOMS_CLI" approve "$ROOM" eve --as alice >/dev/null 2>&1; then
-    smoke_fail "TEETH F1: an unmapped iso uid must FAIL CLOSED on leader-auth"
-  fi
+  smoke_assert_contains "$got" "regime=iso-enforced" \
+    "iso OS user stays iso-enforced regardless of hostile env (no probe to break)"
+  smoke_assert_contains "$got" "agent=mallory" \
+    "TEETH F1 r6: actor is the OS-user slug (mallory), never a forged-roster leader"
 }
 
 test_teeth_env_controller_uid_not_trusted() {
   # BRIDGE_CONTROLLER_UID from env must NOT grant the controller regime. A
-  # NON-iso, NON-controller process (we force the test controller uid elsewhere
-  # AND there are other iso agents via the map) that sets BRIDGE_CONTROLLER_UID
-  # =$(id -u) must still be UNRESOLVED (fail closed), not controller. Force a
-  # non-iso OS user (empty test iso user) so we take the controller/shared path.
+  # NON-iso, NON-controller process on an ISO host (test-host-has-iso=1) that
+  # sets BRIDGE_CONTROLLER_UID=$(id -u) must still be UNRESOLVED (fail closed),
+  # not controller. (env BRIDGE_CONTROLLER_UID is ignored; the controller is the
+  # bridge-home owner / the gated test override pointed elsewhere.)
   if env "${ROOMS_TEST_FLAGS[@]}" \
          "BRIDGE_ROOMS_TEST_ISO_USER=" \
-         "BRIDGE_ROOMS_UID_MAP=999999:somebodyelse" \
+         "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
          "BRIDGE_ROOMS_TEST_CONTROLLER_UID=999998" \
          "BRIDGE_CONTROLLER_UID=${MY_UID}" \
        python3 "$ROOMS_CLI" approve "$ROOM" eve --as alice >/dev/null 2>&1; then
@@ -281,14 +230,28 @@ test_teeth_env_controller_uid_not_trusted() {
   fi
 }
 
+test_teeth_non_iso_on_iso_host_fails_closed() {
+  # On an ISO host, a stray NON-iso NON-controller process must FAIL CLOSED for
+  # a leader-only action — it cannot fall to advisory (where --as is honored).
+  local got
+  got="$(env "${ROOMS_TEST_FLAGS[@]}" \
+             "BRIDGE_ROOMS_TEST_ISO_USER=" \
+             "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
+             "BRIDGE_ROOMS_TEST_CONTROLLER_UID=999998" \
+           python3 "$HELPER" resolve-regime 2>/dev/null)"
+  smoke_assert_contains "$got" "regime=unresolved" \
+    "TEETH F1: non-iso non-controller process on an iso host must be UNRESOLVED (fail closed)"
+}
+
 test_advisory_shared_mode_is_honest() {
-  # GENUINE shared-mode: NOT an iso OS user AND no uid map at all → advisory.
-  # A non-leader actor is WARNED, not hard-blocked (design §14 R1 default).
+  # GENUINE shared-mode: NOT an iso OS user, NOT the controller, AND no iso
+  # users on the host -> advisory. A non-leader actor is WARNED, not
+  # hard-blocked (design §14 R1 default).
   room_cli_as frank join "$LINK" >/dev/null 2>&1
   local err rc
-  # Force non-iso OS user + empty map -> shared-advisory. --as mallory.
   err="$(env "${ROOMS_TEST_FLAGS[@]}" \
-             "BRIDGE_ROOMS_TEST_ISO_USER=" "BRIDGE_ROOMS_UID_MAP=" \
+             "BRIDGE_ROOMS_TEST_ISO_USER=" \
+             "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=0" \
              "BRIDGE_ROOMS_TEST_CONTROLLER_UID=999998" \
            python3 "$ROOMS_CLI" approve "$ROOM" frank --as mallory 2>&1)"
   rc=$?
@@ -427,11 +390,9 @@ smoke_run "create (epoch 0, OS-uid-derived leader, invite link once)" test_creat
 smoke_run "join pending → approve bumps epoch + adds member" test_join_pending_then_approve_bumps_epoch
 smoke_run "leave/kick bump epoch + exclude from roster" test_leave_and_kick_bump_epoch_and_exclude
 smoke_run "TEETH F1: iso leader-auth unspoofable (--as <leader> ignored)" test_teeth_iso_leader_auth_unspoofable
-smoke_run "TEETH F1: iso probe-sabotage downgrade fails closed (r4)" test_teeth_iso_probe_sabotage_fails_closed
-smoke_run "TEETH F1: forged-roster hostile BRIDGE_HOME rejected (r5)" test_teeth_forged_roster_home_rejected
-smoke_run "TEETH F1: unflagged env uid-map is IGNORED (no prod spoof)" test_teeth_env_uid_map_ignored_in_prod
-smoke_run "TEETH F1: unmapped uid under iso fails closed" test_teeth_iso_unmapped_uid_fails_closed
+smoke_run "TEETH F1: no roster-probe on the security path (hostile env inert)" test_teeth_no_roster_probe_on_security_path
 smoke_run "TEETH F1: env BRIDGE_CONTROLLER_UID is NOT trusted" test_teeth_env_controller_uid_not_trusted
+smoke_run "TEETH F1: non-iso process on an iso host fails closed" test_teeth_non_iso_on_iso_host_fails_closed
 smoke_run "shared-mode leader-auth is advisory + honest (warns, not blocks)" test_advisory_shared_mode_is_honest
 smoke_run "TEETH: wrong token-hash rejected" test_teeth_wrong_token_hash_rejected
 smoke_run "TEETH: leader cannot be kicked" test_teeth_cannot_kick_leader

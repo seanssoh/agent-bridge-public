@@ -135,31 +135,41 @@ def require_leader_actor(args: argparse.Namespace, room: Any) -> str:
 
     Returns the resolved actor agent on success. Raises RoomsError on a hard
     denial. Regimes:
-      - ISO_ENFORCED  : HARD — the uid-derived actor MUST be the room leader.
-      - UNRESOLVED    : HARD fail-closed — no trusted actor could be derived.
+      - ISO_ENFORCED  : HARD — the process's ACTUAL OS username (a passwd fact)
+                        MUST equal the expected iso OS user for the room's
+                        leader (`default_os_user_slug(leader_agent)`). This is a
+                        pure comparison with NO roster/probe/env on the security
+                        path, so a managed agent cannot influence it (codex
+                        Phase-4 r5/r6 closed the roster-injection class by
+                        removing the probe entirely).
+      - UNRESOLVED    : HARD fail-closed — no trusted actor could be derived
+                        (iso active on host but this process is neither an iso
+                        agent nor the controller).
       - CONTROLLER    : a proven operator shell — allowed (operator override),
                         honoring `--as` for the recorded leader identity.
       - SHARED_ADVISORY: the OS cannot separate agents → ADVISORY. If the
                         best-effort actor is not the leader, WARN + audit but
-                        DO NOT hard-block (per §14 R1; a real boundary needs a
-                        trusted session gateway, a documented Phase-2 opt-in).
+                        DO NOT hard-block (per §14 R1).
     """
     actor = resolve_actor(args)
     if actor.regime == rooms.ACTOR_ISO_ENFORCED:
-        if not rooms.is_leader(room, actor.agent, caller_node=local_node()):
+        my_os_user = rooms.process_os_user()
+        expected = rooms.default_os_user_slug(str(room["leader_agent"]))
+        if my_os_user != expected:
             raise rooms.RoomsError(
-                f"leader-only action on room {room['room_id']}: OS-authenticated "
-                f"actor {actor.agent!r} (uid {actor.uid}) is not the leader "
-                f"({room['leader_agent']!r}); --as is ignored under iso "
-                "enforcement",
+                f"leader-only action on room {room['room_id']}: this process's "
+                f"OS user {my_os_user!r} (uid {actor.uid}) is not the leader's "
+                f"OS user {expected!r} (leader {room['leader_agent']!r}); --as "
+                "is ignored under iso enforcement",
                 code="not_leader",
             )
-        return actor.agent
+        return str(room["leader_agent"])
     if actor.regime == rooms.ACTOR_UNRESOLVED:
         raise rooms.RoomsError(
             f"leader-only action on room {room['room_id']}: could not establish "
-            f"a trusted OS actor for uid {actor.uid} (iso isolation is active "
-            "but this uid maps to no agent) — failing closed",
+            f"a trusted OS actor for uid {actor.uid} (linux-user isolation is "
+            "active on this host but this process is neither an iso agent nor "
+            "the controller) — failing closed",
             code="actor_unresolved",
         )
     if actor.regime == rooms.ACTOR_CONTROLLER:
