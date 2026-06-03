@@ -695,8 +695,20 @@ def build_envelope(
     body: str,
     reply_peer: str = "",
     reply_agent: str = "",
+    room_id: str = "",
+    room_epoch: Optional[int] = None,
 ) -> dict[str, Any]:
-    return {
+    """Build the A2A enqueue envelope.
+
+    A2A rooms P1a (design §14 R2/R6): `room_id` + `room_epoch` are OPTIONAL
+    room-scope markers. They are emitted ONLY when the message is room-scoped
+    (a non-empty `room_id` is supplied); a non-room message omits both fields
+    entirely so a v1 envelope is byte-for-byte unchanged (back-compat). When
+    present, `room_epoch` is the sender's view of the room epoch the receiver
+    seam (P4) validates against the leader-MAC'd roster. P1a builds + parses
+    them but does not yet enforce on the cross-node path.
+    """
+    env: dict[str, Any] = {
         "protocol": ENVELOPE_PROTOCOL,
         "message_id": message_id,
         "sender": {"bridge": sender_bridge, "agent": sender_agent},
@@ -709,6 +721,23 @@ def build_envelope(
             "agent": reply_agent or sender_agent,
         },
     }
+    if room_id:
+        env["room_id"] = room_id
+        # room_epoch defaults to 0 when room-scoped but unspecified — the
+        # receiver treats epoch 0 as "stale, refresh before deciding" (P4).
+        env["room_epoch"] = int(room_epoch) if room_epoch is not None else 0
+    return env
+
+
+def envelope_is_room_scoped(env: dict[str, Any]) -> bool:
+    """True iff the envelope carries a non-empty `room_id` (room-scoped).
+
+    The single predicate the receiver seam keys its room-scoped fail-closed
+    contract on, so the sender (build) and receiver (check) never diverge on
+    what "room-scoped" means.
+    """
+    rid = env.get("room_id")
+    return isinstance(rid, str) and bool(rid)
 
 
 def parse_envelope(raw: bytes) -> dict[str, Any]:
@@ -732,6 +761,33 @@ def parse_envelope(raw: bytes) -> dict[str, Any]:
     priority = env.get("priority", "normal")
     if priority not in VALID_PRIORITIES:
         raise A2AError(f"invalid priority: {priority!r}", code="bad_priority")
+    # A2A rooms P1a (design §14 R2/R6): OPTIONAL room scope. A v1 envelope
+    # carries NEITHER field and parses unchanged (back-compat). When
+    # room-scoped, `room_id` must be a non-empty string and `room_epoch` a
+    # non-negative int — both validated here so a malformed room marker is
+    # rejected at the wire boundary, never half-trusted downstream. Presence
+    # of one without the other is a malformed envelope.
+    has_room_id = "room_id" in env
+    has_room_epoch = "room_epoch" in env
+    if has_room_id or has_room_epoch:
+        rid = env.get("room_id")
+        if not isinstance(rid, str) or not rid:
+            raise A2AError(
+                "room-scoped envelope requires a non-empty string room_id",
+                code="bad_room_scope",
+            )
+        if not has_room_epoch:
+            raise A2AError(
+                "room-scoped envelope (room_id present) requires room_epoch",
+                code="bad_room_scope",
+            )
+        epoch = env.get("room_epoch")
+        # Reject bool explicitly (bool is an int subclass) and any non-int.
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            raise A2AError(
+                "room_epoch must be a non-negative integer",
+                code="bad_room_scope",
+            )
     return env
 
 

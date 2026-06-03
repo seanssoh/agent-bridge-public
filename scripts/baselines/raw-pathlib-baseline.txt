@@ -29,6 +29,7 @@ bridge-queue-gateway.py:22
 bridge-queue.py:12
 bridge-relay-cleanup.py:27
 bridge-release.py:2
+bridge-rooms.py:0
 bridge-runtime-inventory.py:23
 bridge-setup.py:0
 bridge-stall.py:0

@@ -39,6 +39,16 @@ from typing import Any, Optional
 
 import bridge_a2a_common as a2a
 
+try:
+    # A2A rooms (design §6, §14 R2/R6): the room-scoped receiver-check seam
+    # consults the rooms membership model. Imported best-effort so a node
+    # that has never defined a room (no rooms.db) still starts — the seam
+    # then sees rooms_acl=off and no membership and passes non-room traffic
+    # unchanged.
+    import bridge_rooms_common as rooms
+except ImportError:  # pragma: no cover - the module ships beside this file
+    rooms = None  # type: ignore[assignment]
+
 # Hard cap on a request body the server will read off the socket before
 # any parsing. Larger than the per-peer cap so an oversized body is
 # rejected with a clean 413 rather than truncated.
@@ -586,6 +596,76 @@ def _identity_update_apply(
 
 
 # --------------------------------------------------------------------------
+# Room-scoped receiver check seam (A2A rooms — design §14 R2/R6)
+# --------------------------------------------------------------------------
+#
+# This is the FROZEN fail-closed contract the cross-node room enforcement
+# (P4) fills in. The signature `(env, cfg) -> (ok, reason)` is the binding
+# seam — P2/P3/P4 add behavior WITHOUT changing it.
+#
+# P1a semantics (single-node + additive):
+#   - NON-room-scoped message (no room_id) -> (True, "not_room_scoped"). This
+#     is the unconditional no-op pass that keeps the existing enqueue path
+#     byte-for-byte unchanged. The seam NEVER weakens the already-applied
+#     HMAC / source-addr / allowlist / dedupe auth — it runs AFTER them and
+#     can only ADD a deny for a room-scoped message.
+#   - ROOM-scoped message -> the fail-closed membership decision against the
+#     local rooms.db: the enqueue is allowed ONLY if BOTH the sender
+#     (sender_agent@sender_node) AND the target (target_agent@<this_node>)
+#     are current members of the room. Any of {rooms module unavailable,
+#     rooms.db absent/unreadable, room unknown, either party not a member}
+#     -> FAIL CLOSED (deny). Because P1a is single-node and the receiver only
+#     ever handles cross-node traffic, no production message is room-scoped
+#     yet — so this branch is wired + unit-tested but off the hot path. P4
+#     replaces the raw membership read with a leader-MAC'd roster verify +
+#     freshness (roster_max_age / epoch refresh) WITHOUT touching this
+#     signature or the fail-closed default.
+
+def room_scoped_check(env: dict[str, Any],
+                      cfg: dict[str, Any]) -> tuple[bool, str]:
+    """Frozen fail-closed room-membership seam. Returns (ok, reason).
+
+    See the section header for the full contract. `cfg` is the loaded A2A
+    config (carries this node's `bridge_id`); it is the authenticated peer
+    config the caller already validated — the seam does NOT re-derive trust
+    from it, it only reads the local node id.
+    """
+    if not a2a.envelope_is_room_scoped(env):
+        return True, "not_room_scoped"
+
+    room_id = str(env.get("room_id") or "")
+    sender = env.get("sender", {})
+    sender_agent = str(sender.get("agent") or "") if isinstance(sender, dict) else ""
+    sender_node = str(sender.get("bridge") or "") if isinstance(sender, dict) else ""
+    target_agent = str(env.get("target_agent") or "")
+    this_node = str(cfg.get("bridge_id") or "")
+
+    if rooms is None:
+        return False, "rooms_module_unavailable"
+
+    try:
+        conn = rooms.open_rooms_readonly()
+    except rooms.RoomsError:
+        # Present-but-unreadable db is a real fault, not "no rooms" -> deny.
+        return False, "rooms_db_unreadable"
+    if conn is None:
+        # No rooms.db at all: a room-scoped message cannot be validated -> deny.
+        return False, "no_rooms_db"
+
+    try:
+        room = rooms.get_room(conn, room_id)
+        if room is None:
+            return False, "room_unknown"
+        if not rooms.is_member(conn, room_id, sender_agent, sender_node):
+            return False, "sender_not_member"
+        if not rooms.is_member(conn, room_id, target_agent, this_node):
+            return False, "target_not_member"
+    finally:
+        conn.close()
+    return True, "members_ok"
+
+
+# --------------------------------------------------------------------------
 # Enqueue boundary — call the EXISTING bridge-task.sh create
 # --------------------------------------------------------------------------
 
@@ -955,6 +1035,14 @@ class HandoffHandler(BaseHTTPRequestHandler):
                               "error": f"target '{target}' not in allowlist for peer"})
             return
 
+        # NOTE: the room-scoped membership check (A2A rooms, design §14 R2)
+        # runs INSIDE _handle_dedupe_and_enqueue, AFTER the durable dedupe
+        # duplicate/hash-conflict handling and BEFORE staging/enqueue — so a
+        # room-scoped idempotent retry still resolves to its original task id
+        # and a hash-conflict is still recorded as the 409 security event,
+        # rather than being masked by a membership 403. It only gates a NEW
+        # room-scoped enqueue. See _handle_dedupe_and_enqueue.
+
         # --- title size cap ---
         max_title = int(a2a.peer_cap(peer, "max_title_bytes", a2a.DEFAULT_MAX_TITLE_BYTES))
         if len(title.encode("utf-8")) > max_title:
@@ -1010,6 +1098,24 @@ class HandoffHandler(BaseHTTPRequestHandler):
                       message_id=message_id, security=True)
                 self._reply(409, {"ok": False,
                                   "error": "message id reused with different body"})
+                return
+
+            # --- room-scoped membership (A2A rooms, design §14 R2 — FAIL CLOSED) ---
+            # Runs AFTER the existing HMAC/source-addr/allowlist auth AND after
+            # the durable dedupe duplicate/hash-conflict handling above (so an
+            # idempotent room-scoped retry already returned its original task
+            # id, and a hash-conflict already 409'd) — it gates ONLY a NEW
+            # room-scoped enqueue, and can only ADD a denial, never relax a
+            # non-room message. P1a is single-node so production traffic is not
+            # room-scoped yet; this is the frozen seam P4 activates on the
+            # cross-node path with the leader-MAC'd roster verify.
+            room_ok, room_reason = room_scoped_check(env, cfg)
+            if not room_ok:
+                audit("reject_room_membership", peer=peer_id, client=client_ip,
+                      target=env.get("target_agent"), room_id=env.get("room_id"),
+                      reason=room_reason, message_id=message_id, security=True)
+                self._reply(403, {"ok": False,
+                                  "error": f"room-scoped enqueue denied: {room_reason}"})
                 return
 
             # --- backpressure: max open remote tasks per peer/target ---
