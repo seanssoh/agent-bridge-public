@@ -1880,7 +1880,15 @@ bridge_agent_records_tsv() {
   local -A blocked_counts=()
 
   bridge_agent_queue_maps queued_counts claimed_counts blocked_counts
-  echo -e "agent\tdescription\tengine\tsource\tsession\tsession_id\tworkdir\tprofile_home\tprofile_source\tactive\tactivity_state\tloop\tcontinue\talways_on\tidle_timeout\twake_status\tnotify_status\tchannel_status\tchannels\tnotify_kind\tnotify_target\tnotify_account\tdiscord_channel_id\tisolation_mode\tos_user\tqueue_queued\tqueue_claimed\tqueue_blocked\tactions\tadmin"
+  # Issue #1497 (P1): `agent_home` is appended as the LAST column so the
+  # existing positional `_fields[N]` indices in the text emitter stay stable
+  # (the 30-column guard there is bumped to 31 in lockstep). It carries the
+  # v2-aware identity home (`bridge_layout_agent_home` → `bridge_agent_default_home`),
+  # which the Python hook consumes via `agent show --json` as the authoritative
+  # CLI fallback when the exported BRIDGE_AGENT_HOME_RESOLVED scalar is absent
+  # (cron / external invocations). Before this it was missing from the JSON
+  # entirely (effectively None).
+  echo -e "agent\tdescription\tengine\tsource\tsession\tsession_id\tworkdir\tprofile_home\tprofile_source\tactive\tactivity_state\tloop\tcontinue\talways_on\tidle_timeout\twake_status\tnotify_status\tchannel_status\tchannels\tnotify_kind\tnotify_target\tnotify_account\tdiscord_channel_id\tisolation_mode\tos_user\tqueue_queued\tqueue_claimed\tqueue_blocked\tactions\tadmin\tagent_home"
 
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
     if [[ -n "$selected_agent" && "$agent" != "$selected_agent" ]]; then
@@ -1912,7 +1920,7 @@ bridge_agent_records_tsv() {
       admin="yes"
     fi
 
-    echo -e "${agent}\t$(bridge_agent_desc "$agent")\t$(bridge_agent_engine "$agent")\t$(bridge_agent_source "$agent")\t$(bridge_agent_session "$agent")\t$(bridge_agent_session_id "$agent")\t$(bridge_agent_workdir "$agent")\t${profile_home}\t${profile_source}\t${active}\t$(bridge_agent_activity_state "$agent")\t$(bridge_agent_loop "$agent")\t$(bridge_agent_continue "$agent")\t${always_on}\t$(bridge_agent_idle_timeout "$agent")\t$(bridge_agent_wake_status "$agent")\t$(bridge_agent_notify_status "$agent")\t$(bridge_agent_channel_status "$agent")\t$(bridge_agent_channels_csv "$agent")\t$(bridge_agent_notify_kind "$agent")\t$(bridge_agent_notify_target "$agent")\t$(bridge_agent_notify_account "$agent")\t$(bridge_agent_discord_channel_id "$agent")\t$(bridge_agent_isolation_mode "$agent")\t$(bridge_agent_os_user_display "$agent")\t${queued_counts[$agent]-0}\t${claimed_counts[$agent]-0}\t${blocked_counts[$agent]-0}\t$(bridge_agent_actions_csv "$agent")\t${admin}"
+    echo -e "${agent}\t$(bridge_agent_desc "$agent")\t$(bridge_agent_engine "$agent")\t$(bridge_agent_source "$agent")\t$(bridge_agent_session "$agent")\t$(bridge_agent_session_id "$agent")\t$(bridge_agent_workdir "$agent")\t${profile_home}\t${profile_source}\t${active}\t$(bridge_agent_activity_state "$agent")\t$(bridge_agent_loop "$agent")\t$(bridge_agent_continue "$agent")\t${always_on}\t$(bridge_agent_idle_timeout "$agent")\t$(bridge_agent_wake_status "$agent")\t$(bridge_agent_notify_status "$agent")\t$(bridge_agent_channel_status "$agent")\t$(bridge_agent_channels_csv "$agent")\t$(bridge_agent_notify_kind "$agent")\t$(bridge_agent_notify_target "$agent")\t$(bridge_agent_notify_account "$agent")\t$(bridge_agent_discord_channel_id "$agent")\t$(bridge_agent_isolation_mode "$agent")\t$(bridge_agent_os_user_display "$agent")\t${queued_counts[$agent]-0}\t${claimed_counts[$agent]-0}\t${blocked_counts[$agent]-0}\t$(bridge_agent_actions_csv "$agent")\t${admin}\t$(bridge_layout_agent_home "$agent")"
   done
 }
 
@@ -1994,6 +2002,10 @@ def convert_row(row: dict) -> dict:
         },
         "actions": [] if converted["actions"] in ("", "-") else converted["actions"].split(","),
         "admin": converted["admin"],
+        # Issue #1497 (P1): resolver-derived v2-aware identity home. Consumed
+        # by hooks/bridge_hook_common.py::_resolve_home_via_roster as the
+        # authoritative CLI fallback when BRIDGE_AGENT_HOME_RESOLVED is unset.
+        "agent_home": converted.get("agent_home", ""),
     }
 
 payload = [convert_row(row) for row in rows]
@@ -2384,12 +2396,15 @@ run_show() {
     _fields=()
     IFS="$_tsv_sep" read -r -a _fields <<<"${_tsv_line//$'\t'/$_tsv_sep}"
     # Guard against producer/consumer drift. The header in
-    # bridge_agent_records_tsv emits exactly 30 columns; any other
-    # count means a schema change landed in the producer without an
-    # update here — bail loudly rather than print shifted garbage
-    # (the very class of bug this fix repairs).
-    if (( ${#_fields[@]} != 30 )); then
-      bridge_die "agent show: unexpected TSV column count (${#_fields[@]} != 30); refusing to render"
+    # bridge_agent_records_tsv emits exactly 31 columns (Issue #1497 P1
+    # appended `agent_home` as the last column); any other count means a
+    # schema change landed in the producer without an update here — bail
+    # loudly rather than print shifted garbage (the very class of bug this
+    # fix repairs). The text emitter ignores the new trailing column — it
+    # renders agent_home from bridge_layout_agent_home directly (see below) —
+    # so only the count guard needs the bump, not the positional indices.
+    if (( ${#_fields[@]} != 31 )); then
+      bridge_die "agent show: unexpected TSV column count (${#_fields[@]} != 31); refusing to render"
     fi
     row_agent="${_fields[0]}"
     description="${_fields[1]}"

@@ -683,6 +683,18 @@ export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
 # Issue #1497: the bare name collides with BRIDGE_AGENT_WORKDIR[] in
 # lib/bridge-agents.sh, so hooks consume this scalar alias first.
 export BRIDGE_AGENT_WORKDIR_RESOLVED="$WORK_DIR"
+# Issue #1497 (P1): identity-home companion to the workdir scalar above.
+# bridge_agent_default_home is v2-aware (`$BRIDGE_AGENT_ROOT_V2/<a>/home`
+# on a v2 install, legacy `$BRIDGE_AGENT_HOME_ROOT/<a>` otherwise), so this
+# carries the SAME tree the bash launch/state layer uses. The Python hook
+# (hooks/bridge_hook_common.py::agent_default_home) reads this scalar FIRST,
+# which is what prevents the v2-blind legacy short-circuit that silently
+# dropped the NEXT-SESSION.md handoff for v2-split agents. There is no
+# assoc-array named BRIDGE_AGENT_HOME_RESOLVED, so unlike the workdir case
+# this name does not strictly need the _RESOLVED suffix — but keeping the
+# parallel naming makes the bash→Python channel a single recognizable
+# pattern (mirrors BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED, #1217).
+export BRIDGE_AGENT_HOME_RESOLVED="$(bridge_agent_default_home "$AGENT")"
 # Issue #1213 / #1217 (beta27): BRIDGE_AGENT_ISOLATION_MODE,
 # BRIDGE_AGENT_OS_USER, and BRIDGE_AGENT_INJECT_TIMESTAMP all share
 # their names with associative arrays declared in
@@ -830,6 +842,13 @@ bridge_run_refresh_roster_if_changed() {
   # re-introducing the handoff misrouting this fix removes.
   export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
   export BRIDGE_AGENT_WORKDIR_RESOLVED="$WORK_DIR"
+  # Issue #1497 (P1): mirror the workdir re-export above for the identity
+  # home. A roster-refresh relaunch must not leave child hooks inheriting a
+  # STALE BRIDGE_AGENT_HOME_RESOLVED from initial startup — the Python hook
+  # reads it before the v2/legacy computation, so a stale value would
+  # re-introduce the home mis-resolution this fix removes. Recomputed via the
+  # same v2-aware resolver after the roster reload.
+  export BRIDGE_AGENT_HOME_RESOLVED="$(bridge_agent_default_home "$AGENT")"
   cd "$WORK_DIR" || bridge_die "$WORK_DIR 디렉토리가 없습니다."
   if [[ -n "$BRIDGE_RUN_ROSTER_SIGNATURE" ]]; then
     log_line "[info] roster changed on disk; reloading before next relaunch"
