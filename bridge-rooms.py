@@ -574,6 +574,37 @@ def cmd_adopt_all(args: argparse.Namespace) -> int:
     return 0
 
 
+def require_controller_actor(args: argparse.Namespace, action: str) -> None:
+    """Gate a config mutation (acl flip) to a proven controller/operator shell.
+
+    Flipping rooms_acl is an OPERATOR control-plane action, not an agent one
+    (design §14 R1 deliverable 5: only the controller/leader may flip it). The
+    actor-auth follows the same regime model as leader-auth:
+      - ISO_ENFORCED   : a managed iso agent is NOT the operator -> HARD deny
+                         (it must not be able to turn enforcement off/on).
+      - UNRESOLVED     : iso host, no trusted actor -> HARD deny (fail closed).
+      - CONTROLLER     : the proven operator shell (owns the rooms db) -> allow.
+      - SHARED_ADVISORY: no OS boundary exists anyway -> allow (the install has
+                         no hard agent separation to protect).
+    """
+    actor = rooms.resolve_os_actor(getattr(args, "as_agent", None))
+    if actor.regime == rooms.ACTOR_ISO_ENFORCED:
+        raise rooms.RoomsError(
+            f"{action} is an operator action: a managed iso agent "
+            f"(uid {actor.uid}) cannot change the rooms_acl mode — run it from "
+            "the controller/operator shell",
+            code="not_controller",
+        )
+    if actor.regime == rooms.ACTOR_UNRESOLVED:
+        raise rooms.RoomsError(
+            f"{action}: could not establish a trusted controller actor for uid "
+            f"{actor.uid} (linux-user isolation is active but this process is "
+            "neither an iso agent nor the controller) — failing closed",
+            code="actor_unresolved",
+        )
+    # CONTROLLER (proven operator) or SHARED_ADVISORY (no OS boundary) -> allow.
+
+
 def cmd_acl(args: argparse.Namespace) -> int:
     if args.mode is None:
         mode = rooms.rooms_acl_mode()
@@ -581,8 +612,36 @@ def cmd_acl(args: argparse.Namespace) -> int:
             out(json.dumps({"rooms_acl": mode}))
         else:
             info(f"rooms_acl mode: {mode} "
-                 "(P1a does not enforce; P1b consumes this)")
+                 "(enforced by the queue gate in P1b)")
         return 0
+    try:
+        require_controller_actor(args, "setting rooms_acl")
+    except rooms.RoomsError as exc:
+        return die(str(exc), code=1)
+    # Migration safety (design §14 R1 / deliverable 4): flipping to enforce with
+    # NO rooms defined would silently wall every inter-agent create. That is an
+    # operator-config error, not a valid state — refuse loudly and point at
+    # adopt-all, unless --force is given (an operator who really wants a fully
+    # locked-down install with only controller/daemon traffic).
+    if args.mode == rooms.ACL_ENFORCE and not getattr(args, "force", False):
+        ro = rooms.open_rooms_readonly()
+        has_room = False
+        if ro is not None:
+            try:
+                has_room = ro.execute("SELECT 1 FROM rooms LIMIT 1").fetchone() is not None
+            except Exception:  # noqa: BLE001
+                has_room = False
+            finally:
+                ro.close()
+        if not has_room:
+            return die(
+                "refusing to set rooms_acl=enforce with NO rooms defined: this "
+                "would block every inter-agent create. Run `agb room adopt-all` "
+                "first (creates a default room with every roster agent so no "
+                "agent is stranded), or pass --force to lock down anyway "
+                "(controller/daemon traffic still flows).",
+                code=1,
+            )
     conn = rooms.open_rooms()
     try:
         rooms.set_acl_mode(conn, args.mode)
@@ -597,7 +656,9 @@ def cmd_acl(args: argparse.Namespace) -> int:
     if args.json:
         out(json.dumps({"rooms_acl": args.mode}))
     else:
-        info(f"rooms_acl set to {args.mode} (not enforced in P1a)")
+        info(f"rooms_acl set to {args.mode} "
+             "(enforced by the queue gate: same-room creates allowed, "
+             "cross-room blocked under iso v2 / advisory in shared mode)")
     return 0
 
 
@@ -695,7 +756,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_acl = sub.add_parser("acl", help="show/set rooms_acl mode (off|enforce)")
     p_acl.add_argument("mode", nargs="?", choices=[rooms.ACL_OFF, rooms.ACL_ENFORCE],
                        default=None, help="set the mode; omit to show")
-    _add_common(p_acl, with_as=False)
+    p_acl.add_argument(
+        "--force", action="store_true",
+        help="allow setting enforce with no rooms defined (locks down all "
+             "inter-agent creates; controller/daemon traffic still flows)")
+    _add_common(p_acl)  # --as: honored only for controller/shared (iso ignored)
     p_acl.set_defaults(func=cmd_acl)
 
     return parser

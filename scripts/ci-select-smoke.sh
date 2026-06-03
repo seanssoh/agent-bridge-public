@@ -170,6 +170,16 @@ add_required 1492-admin-dev-pair-workspace-v2
 # epoch + leader-auth + token-hash + rotate/--once + adopt-all + envelope
 # back-compat + receiver fail-closed teeth, and the rooms.db 0600 hygiene.
 add_required a2a-rooms-p1a
+# A2A rooms P1b: the internal-queue ACL ENFORCEMENT (design §14 R1). Gates an
+# inter-agent durable create on shared-room membership when rooms_acl=enforce,
+# using the OS-enforced sender (gateway SO_PEERCRED / resolve_os_actor), with a
+# default-off no-op. Lives in bridge_rooms_common.py (acl_create_decision),
+# bridge-queue-gateway.py (the primary iso gate), bridge-queue.py cmd_create
+# (defense-in-depth + non-gateway paths), and bridge-rooms.py (the controller-
+# gated acl flip). Pins the default-off no-op, same-room ALLOW, cross-room DENY,
+# the --from SPOOF rejection (both paths), fail-closed, controller exemption,
+# shared-mode advisory, and adopt-all->enforce strands-nobody teeth.
+add_required a2a-rooms-p1b-acl
 
 
 }
@@ -431,7 +441,7 @@ select_for_path() {
       # A2A rooms P1a: the template now advertises `room <create|...>`. Pull
       # a2a-rooms-p1a on every template edit so the `room` row + its
       # dispatcher arm (the `room)` case in agent-bridge) cannot drift apart.
-      add_required 1115-cli-usage-drift 1117-cli-help-universal-gate I-agent-description-roster a2a-rooms-p1a
+      add_required 1115-cli-usage-drift 1117-cli-help-universal-gate I-agent-description-roster a2a-rooms-p1a a2a-rooms-p1b-acl
       ;;
 
     bridge-setup.py|bridge-setup.sh|bridge-status.py|bridge-status.sh|lib/bridge-setup-wizard.sh)
@@ -751,6 +761,12 @@ select_for_path() {
       # on every bridge-queue.py move so a refactor cannot drift any of the six
       # call-sites' resulting paths off the canonical SSOT (byte-identical teeth).
       add_required 1497-p2-operator-home
+      # A2A rooms P1b (#1505 follow-on): bridge-queue.py cmd_create now carries
+      # the rooms ACL defense-in-depth + non-gateway gate (the direct create
+      # path). Pull a2a-rooms-p1b-acl on every bridge-queue.py move so the
+      # default-off no-op, the cross-room deny, and the --from spoof rejection
+      # on the direct create path cannot silently regress.
+      add_required a2a-rooms-p1b-acl
       add_integration integration-minimal
       ;;
 
@@ -791,7 +807,15 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/install-handoffd-systemd.sh)
+    bridge-queue-gateway.py)
+      # A2A rooms P1b: the queue gateway's authorize_and_rewrite now applies the
+      # PRIMARY (iso-v2 SO_PEERCRED) rooms ACL gate to `create`. Any move to the
+      # gateway authorizer must re-run the queue suite + the P1b ACL teeth (the
+      # --from spoof rejection at the gateway is the security crux).
+      add_required queue a2a-rooms-p1b-acl
+      ;;
+
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the
@@ -856,7 +880,7 @@ select_for_path() {
       # back-compat and the seam's fail-closed contract still holds. The
       # rooms control-plane modules (bridge-rooms.py / bridge_rooms_common.py)
       # and the rooms helper route here too via the path alternation above.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)

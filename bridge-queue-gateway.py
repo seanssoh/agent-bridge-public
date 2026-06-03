@@ -99,6 +99,13 @@ _PUBLIC_REASON_MAP: dict[str, str] = {
     "cancel_not_owner": "not_authorized",
     "update_not_owner": "not_authorized",
     "handoff_not_owner": "not_authorized",
+    # Rooms ACL (P1b): a cross-room / fail-closed create denial. Collapsed to
+    # not_authorized so a peer cannot enumerate which agents share which rooms
+    # by probing create targets — the detailed acl_* code is still logged
+    # server-side via gateway_log() for operator triage.
+    "acl_denied": "not_authorized",
+    "acl_fail_closed": "not_authorized",
+    "rooms_acl_unavailable": "internal_error",
     "exception": "internal_error",
 }
 
@@ -125,6 +132,107 @@ def _socket_transport_supported() -> bool:
     recognizable error rather than silently bypass peer auth.
     """
     return sys.platform.startswith("linux") and hasattr(socket, "SO_PEERCRED")
+
+
+def _load_rooms_common() -> Any:
+    """Import bridge_rooms_common from this script's dir (lazy, optional).
+
+    Returns the module, or None if it cannot be imported (a pre-P1a install
+    or a stripped deployment). The rooms ACL gate degrades to a no-op pass
+    when the module is unavailable — never failing a legitimate create just
+    because the rooms control plane is absent.
+    """
+    import importlib.util
+
+    here = Path(__file__).resolve().parent
+    path = here / "bridge_rooms_common.py"
+    if not path.exists():  # noqa: raw-pathlib-controller-only — gateway runs as the controller daemon; this probes a sibling SOURCE file, not an isolated-agent artifact
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("bridge_rooms_common", str(path))
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:  # noqa: BLE001 - any import fault -> no-op (fail open to pre-P1b behavior)
+        return None
+
+
+# The value-consuming flags of `bridge-queue.py create` (each takes the NEXT
+# token). Used by _create_target so a `--to` appearing INSIDE another flag's
+# value (e.g. `--title "... --to fake"`) is never misread as the recipient.
+# Keep in sync with the create subparser in bridge-queue.py. `--body-file` /
+# `--note-file` are gated upstream by _has_file_arg and never reach here.
+_CREATE_VALUE_FLAGS = frozenset({
+    "--to", "--title", "--from", "--priority", "--format", "--body",
+})
+
+
+def _create_target(argv: list[str]) -> str:
+    """Extract the `--to <agent>` recipient from a `create` argv (or '')."""
+    skip = False
+    for idx, token in enumerate(argv[1:], start=1):
+        if skip:
+            skip = False
+            continue
+        if token == "--to":
+            return argv[idx + 1].strip() if idx + 1 < len(argv) else ""
+        if token.startswith("--to="):
+            return token.split("=", 1)[1].strip()
+        flag_name = token.split("=", 1)[0]
+        if token.startswith("--") and flag_name in _CREATE_VALUE_FLAGS and "=" not in token:
+            # `--flag value` consumes the next token; `--flag=value` does not.
+            skip = True
+    return ""
+
+
+def _rooms_acl_gate_create(home: str, peer_agent: str, argv: list[str]) -> tuple[bool, str]:
+    """Apply the rooms ACL to an iso-v2 (gateway) `create`. Returns (ok, reason).
+
+    `peer_agent` is the SO_PEERCRED OS-trusted actor (the gateway already
+    rewrote --from to it), so the ACL decision uses an un-spoofable sender —
+    the client-supplied --from/BRIDGE_AGENT_ID can never grant another agent's
+    room membership. Degrades to an ALLOW pass when:
+      - the rooms module is unavailable (pre-P1a / stripped install),
+      - rooms_acl is off (default — true no-op),
+      - no rooms are defined (back-compat),
+      - the create is exempt (self-message / target-unroomed).
+    A cross-room or fail-closed verdict returns (False, <acl reason>).
+    """
+    rooms = _load_rooms_common()
+    if rooms is None:
+        return True, "ok"
+    # The gateway peer is ALWAYS an OS-enforced iso actor, so this is a HARD path:
+    # read the mode STRICTLY. A genuinely ABSENT rooms.db -> off (back-compat). A
+    # present-but-UNREADABLE/corrupt rooms.db must NOT degrade to 'off' (that
+    # would silently drop a previously-enforced boundary — codex r1 BLOCKING);
+    # it fails CLOSED here.
+    try:
+        mode = rooms.rooms_acl_mode_strict()
+    except Exception:  # noqa: BLE001 - present-but-unreadable rooms.db under a hard actor
+        return False, "acl_fail_closed"
+    if mode != rooms.ACL_ENFORCE:
+        return True, "ok"
+    target = _create_target(argv)
+    if not target:
+        # No --to to gate (e.g. a malformed create); let the inner parser
+        # reject it normally rather than inventing an ACL denial.
+        return True, "ok"
+    try:
+        decision = rooms.acl_create_decision(
+            mode=mode,
+            # The gateway peer is an OS-enforced iso agent (SO_PEERCRED).
+            regime=rooms.ACTOR_ISO_ENFORCED,
+            actor=peer_agent,
+            target=target,
+            node="",
+        )
+    except Exception:  # noqa: BLE001 - decision fault under enforce -> fail closed
+        return False, "rooms_acl_unavailable"
+    if decision.outcome == "deny":
+        return False, decision.reason
+    return True, "ok"
 
 
 def now_iso() -> str:
@@ -262,10 +370,25 @@ def iter_requests(root: Path) -> list[Path]:
     return files
 
 
-def run_queue(queue_script: Path, argv: list[str], cwd: str | None) -> dict[str, Any]:
+def run_queue(
+    queue_script: Path,
+    argv: list[str],
+    cwd: str | None,
+    trusted_actor: str | None = None,
+) -> dict[str, Any]:
     child_env = os.environ.copy()
     child_env["BRIDGE_QUEUE_GATEWAY_SERVER"] = "1"
     child_env.pop("BRIDGE_GATEWAY_PROXY", None)
+    # Rooms ACL (P1b): pass the OS-derived trusted actor to the queue child as an
+    # env var the CLIENT cannot set (this is the gateway-server's own child env).
+    # bridge-queue.py:cmd_create uses BRIDGE_QUEUE_GATEWAY_ACTOR as the ISO-
+    # enforced sender, NEVER the client --from. We always (re)set it so a stale
+    # value inherited from the gateway process env cannot leak across requests:
+    # a real authenticated actor is set, an unauthenticated one is cleared.
+    if trusted_actor:
+        child_env["BRIDGE_QUEUE_GATEWAY_ACTOR"] = trusted_actor
+    else:
+        child_env.pop("BRIDGE_QUEUE_GATEWAY_ACTOR", None)
 
     proc = subprocess.run(
         [sys.executable, str(queue_script), *argv],
@@ -281,6 +404,31 @@ def run_queue(queue_script: Path, argv: list[str], cwd: str | None) -> dict[str,
         "stderr": proc.stderr,
         "processed_at": now_iso(),
     }
+
+
+def _file_request_owner_agent(path: Path) -> str:
+    """Map the request file's OWNER UID -> agent for the file transport (P1b).
+
+    The file transport's OS boundary is request-file OWNERSHIP: an iso agent can
+    only create request files it owns under its own per-agent requests/ dir
+    (mode 2770, owned by the iso UID). So the trusted actor is the file OWNER's
+    uid mapped through the roster uid->agent table — NOT the client-supplied
+    `agent`/`--from` field in the JSON (which an iso agent could forge to a room
+    peer). Returns '' when the owner uid maps to no iso agent (controller-owned
+    request, or roster probe unavailable) — the caller then withholds the
+    trusted-actor signal so cmd_create fails closed under enforce rather than
+    trusting a client id.
+    """
+    try:
+        owner_uid = path.stat().st_uid  # noqa: raw-pathlib-controller-only — controller-side gateway server reads the request-file owner uid (the file transport's OS boundary)
+    except OSError:
+        return ""
+    script_dir = Path(__file__).resolve().parent
+    try:
+        peer_map = _peer_map_from_roster(script_dir)
+    except SystemExit:
+        return ""
+    return peer_map.get(owner_uid, "")
 
 
 def handle_request(path: Path, queue_script: Path) -> int:
@@ -314,7 +462,36 @@ def handle_request(path: Path, queue_script: Path) -> int:
         return 1
 
     response = {"id": str(request.get("id", path.name.split(".", 1)[0]))}
-    response.update(run_queue(queue_script, argv, cwd))
+    # Rooms ACL (P1b) for the FILE transport: the trusted actor is the request
+    # file's OWNER uid (the file transport's OS boundary), NOT the client `agent`
+    # field. For a `create`, run the same authorize_and_rewrite the socket path
+    # uses so --from is rewritten to the owner-derived actor AND the rooms ACL
+    # gate fires; then hand that owner actor to the queue child as the trusted
+    # actor. When the owner maps to no iso agent (controller-owned request or no
+    # roster probe), we DO authorize as the controller-side `agent` for back-
+    # compat with the existing file transport, but withhold the trusted-actor
+    # signal so cmd_create's own resolve_os_actor / fail-closed contract applies.
+    trusted_actor: str | None = None
+    run_argv = argv
+    if argv and argv[0] == "create":
+        owner_agent = _file_request_owner_agent(path)
+        if owner_agent:
+            ok, reason, rewritten = authorize_and_rewrite(bridge_home(), owner_agent, argv)
+            if not ok:
+                response.update({
+                    "exit_code": 2,
+                    "stdout": "",
+                    "stderr": "queue gateway denied\n",
+                    "decision": "deny",
+                    "reason_code": _public_reason_code(reason),
+                    "processed_at": now_iso(),
+                })
+                atomic_write_json(path.parent.parent / "responses" / f"{response['id']}.json", response)
+                path.unlink(missing_ok=True)  # noqa: raw-pathlib-controller-only — controller-side gateway server consumes its own request file (mirrors the existing unlink below)
+                return 0
+            run_argv = rewritten
+            trusted_actor = owner_agent
+    response.update(run_queue(queue_script, run_argv, cwd, trusted_actor=trusted_actor))
     atomic_write_json(path.parent.parent / "responses" / f"{response['id']}.json", response)
     path.unlink(missing_ok=True)
     return 0
@@ -1056,6 +1233,13 @@ def authorize_and_rewrite(home: str, peer_agent: str, argv: list[str]) -> tuple[
         return False, "file_arg_denied", argv
 
     if subcmd == "create":
+        # Rooms ACL (P1b): gate the inter-agent create on shared-room membership
+        # when rooms_acl=enforce. The actor is the SO_PEERCRED peer_agent (NOT
+        # the client --from), so an iso agent cannot send as another room
+        # member. Default-off / no-rooms / exempt -> pass (no behavior change).
+        acl_ok, acl_reason = _rooms_acl_gate_create(home, peer_agent, argv)
+        if not acl_ok:
+            return False, acl_reason, argv
         return True, "ok", _set_option(argv, "--from", peer_agent)
     if subcmd in {"inbox", "find-open", "claim", "done"}:
         rewritten = _set_option(argv, "--agent", peer_agent)
@@ -1174,7 +1358,10 @@ def _handle_socket_request(
             return
         gateway_log(subcmd, peer_uid, peer_agent, "allow", reason, request_id)
         response = {"id": request_id}
-        response.update(run_queue(queue_script, rewritten, cwd))
+        # peer_agent is the SO_PEERCRED-authenticated actor; hand it to the queue
+        # child as the rooms-ACL trusted actor (P1b). For non-create subcommands
+        # this is harmless (cmd_create is the only consumer).
+        response.update(run_queue(queue_script, rewritten, cwd, trusted_actor=peer_agent))
         _safe_send_json(conn, response)
     except ValueError as exc:
         reason = "oversize_payload" if str(exc) == "oversize" else "invalid_payload"
