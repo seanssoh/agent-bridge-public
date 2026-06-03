@@ -111,6 +111,11 @@ add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-
 add_required 1425-cron-dispatch-nudge-scope
 add_required 1936-forward-followup-attached-escalation
 add_required 1473-agent-list-iso-state-fallback
+# Issue #1474 (v0.15.3 wrapper-path regression): bridge_load_roster must EXPORT
+# the resolved BRIDGE_ADMIN_AGENT_ID so the admin cross-agent cron exemption
+# survives `exec` into the bridge-cron.sh child via the agent-bridge/agb wrapper
+# — without weakening the #1359 iso/non-admin reject.
+add_required 1474-wrapper-admin-cron-exemption
 # #8945 Track B: expanded Codex hook coverage (PreCompact / PostCompact /
 # SubagentStart / SubagentStop / PermissionRequest). All audit-only by default;
 # the permission-request smoke pins the security contract.
@@ -348,6 +353,16 @@ select_for_path() {
         # invariant, the no-secret column boundary, or the controller
         # no-regression gate.
         add_required 1473-agent-list-iso-state-fallback
+        # Issue #1474 (v0.15.3 wrapper-path regression): lib/bridge-state.sh's
+        # bridge_load_roster now EXPORTs BRIDGE_ADMIN_AGENT_ID so the resolved
+        # admin id survives `exec` into the bridge-cron.sh child spawned by the
+        # agent-bridge/agb wrapper — that is what lets the #1474 admin
+        # cross-agent cron exemption pass on the wrapper path (it already
+        # worked on a DIRECT bridge-cron.sh call). Pull the smoke on every
+        # bridge-state.sh move so a refactor cannot silently drop the export
+        # (which would re-break the wrapper path) OR start leaking a non-admin
+        # agent's BRIDGE_AGENT_ID==admin (which would weaken the #1359 gate).
+        add_required 1474-wrapper-admin-cron-exemption
       fi
       ;;
   esac
