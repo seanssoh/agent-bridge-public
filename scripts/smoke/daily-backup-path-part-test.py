@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Issue #974 regression — exercise `should_skip_daily_backup_relpath`.
+"""Issue #974 / #1462 regression — exercise `should_skip_daily_backup_relpath`.
 
 Standalone helper for `scripts/smoke/daily-backup.sh::step_path_part_excludes_multicomponent`.
 Extracted to its own file to keep the smoke script free of
@@ -47,6 +47,48 @@ CASES: list[tuple[str, bool, str]] = [
     ("state/cache/plugins/x.txt", False, "reversed order (kept)"),
     ("random/plugins/cache_other/x", False, "cache_other != cache (kept)"),
     ("plugins-archive/cache/x", False, "plugins-archive != plugins (kept)"),
+    # Issue #1462 — regenerable per-agent trees, same any-depth path-part
+    # mechanism as #974. Both are rebuilt/re-downloaded on demand, so the
+    # daily backup must skip them regardless of the agent-name segment. TEETH:
+    # if the two `DAILY_BACKUP_PATH_PART_EXCLUDES` entries are removed from
+    # bridge-upgrade.py, these `True` cases flip to got=False and the smoke
+    # fails.
+    (
+        "agents/patch/home/.claude/security/agent-sdk-venv/bin/python",
+        True,
+        "#1462 agent-sdk venv (excluded)",
+    ),
+    (
+        "agents/worker-a/home/.claude/security/agent-sdk-venv",
+        True,
+        "#1462 agent-sdk venv, no trailing seg, other agent (excluded)",
+    ),
+    (
+        "agents/patch/home/.local/share/claude/versions/1.2.3/cli",
+        True,
+        "#1462 claude CLI versions cache (excluded)",
+    ),
+    (
+        "agents/worker-a/home/.local/share/claude/versions",
+        True,
+        "#1462 claude versions, no trailing seg, other agent (excluded)",
+    ),
+    # #1462 keep-cases: sibling/adjacent paths that must NOT be swept up.
+    (
+        "agents/patch/home/.claude/security/credentials.json",
+        False,
+        "#1462 security/ sibling, not agent-sdk-venv (kept)",
+    ),
+    (
+        "agents/patch/home/.local/share/claude/settings.json",
+        False,
+        "#1462 claude/ data, not versions (kept)",
+    ),
+    (
+        "agents/patch/home/.local/share/claude/versions-archive/x",
+        False,
+        "#1462 versions-archive != versions (kept)",
+    ),
 ]
 
 

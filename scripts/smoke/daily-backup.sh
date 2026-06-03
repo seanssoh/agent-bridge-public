@@ -305,14 +305,15 @@ step_timeout_resolution() {
   smoke_log "timeout_resolution OK (5/5 cases + rc=124 detail wiring)"
 }
 
-# issue #974 — multi-component path-part exclude (`plugins/cache`)
+# issue #974 / #1462 — multi-component path-part exclude (`plugins/cache`,
+# `.claude/security/agent-sdk-venv`, `.local/share/claude/versions`)
 # must match a consecutive subsequence anywhere in the relpath, must NOT
 # false-positive on (a) the components alone, (b) the components in the
-# wrong order, or (c) substring-only matches like `cache_other`. Legacy
-# single-component entries (`__pycache__`, `node_modules`) must keep the
-# fast-path `in parts` behaviour.
+# wrong order, or (c) substring-only matches like `cache_other` /
+# `versions-archive`. Legacy single-component entries (`__pycache__`,
+# `node_modules`) must keep the fast-path `in parts` behaviour.
 step_path_part_excludes_multicomponent() {
-  smoke_log "step 8: path-part subsequence matcher (#974 regression)"
+  smoke_log "step 8: path-part subsequence matcher (#974/#1462 regression)"
   # Helper extracted to its own .py file to avoid heredoc-in-command-
   # substitution (Footgun #11 ratchet — see lib/upgrade-helpers/).
   local result
