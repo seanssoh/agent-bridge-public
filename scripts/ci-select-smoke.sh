@@ -135,6 +135,11 @@ add_required codex-nudge-body
 # In the full static suite so a scripts/smoke/*, bridge-watchdog.py, or
 # bridge-upgrade.sh change re-runs them via the catch-all / default arm.
 add_required codex-doctor codex-version-surface
+# #8945 Track C: agent-scoped Codex slash-command + permission-profile
+# provisioning. In the full static suite so a scripts/smoke/*, lib/bridge-
+# agents.sh, bridge-agent.sh, or assets/codex/* change re-runs them via the
+# catch-all / arm-specific selection below.
+add_required codex-slash-commands codex-permission-profiles
 
 
 }
@@ -226,6 +231,19 @@ select_for_path() {
       # still pulls the codex-provisioning smoke (which asserts the rendered
       # AGENTS.md contains the protocol + the agb-done close step).
       add_required 1067-codex-provisioning
+      ;;
+    assets/codex/prompts/*|assets/codex/permissions.toml)
+      # #8945 Track C: the agent-scoped Codex slash-command prompt templates and
+      # the bridge-role permission profiles. bridge_ensure_codex_agent_slash_
+      # commands renders these into <agent_home>/.codex/ (never the controller
+      # ~/.codex). The prompt files are .md and permissions.toml is non-.sh, so
+      # the is_docs_only_path early-return below would otherwise select only the
+      # global required smokes. This pre-case lifts ahead of the short-circuit so
+      # a drift in the managed marker, an agb verb/flag, the <agent-id>/<agent-
+      # home> placeholder set, or a role-profile name still pulls the Track C
+      # smokes (which assert the rendered assets land agent-scoped, carry valid
+      # agb verbs, are idempotent, and never touch the controller ~/.codex).
+      add_required codex-slash-commands codex-permission-profiles
       ;;
     agent-roster.local.example.sh)
       # v0.15.0-beta1 Lane I: the example roster is operator-facing copy.
@@ -1493,6 +1511,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # wedged the Codex patch-dev. (1067-codex-provisioning is already pulled
       # by this arm's add_required block above.)
       add_required codex-nudge-body
+      # #8945 Track C: bridge-agent.sh's run_create calls
+      # bridge_ensure_codex_agent_slash_commands (next to bridge_ensure_codex_
+      # agent_hooks, gated on engine==codex) to deploy the agb-* slash commands
+      # + bridge-role permission profiles into the agent-scoped .codex/ tree.
+      # Pull the Track C smokes on every bridge-agent.sh move so a refactor
+      # cannot drop the wire-up or let it leak into the controller ~/.codex.
+      add_required codex-slash-commands codex-permission-profiles
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
