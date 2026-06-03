@@ -41,6 +41,11 @@ import time
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+try:
+    import pwd  # POSIX-only; used for the un-spoofable iso OS-user check.
+except ImportError:  # pragma: no cover - non-POSIX (Windows); not a target host
+    pwd = None  # type: ignore[assignment]
+
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
@@ -96,27 +101,47 @@ class RoomsError(Exception):
 # mapped to a roster agent the SAME way bridge-queue-gateway.py does — never
 # from caller-set env.
 #
-# Three enforcement regimes, per design §14 R1:
-#   - ISO_ENFORCED  : `os.getuid()` maps to an iso agent (agent-bridge-<a>).
-#       That uid-derived agent IS the trusted actor; leader-auth is HARD and
-#       `--as`/env are ignored for the decision. An iso agent cannot act as
-#       another uid, so it cannot impersonate another agent.
-#   - CONTROLLER    : `os.getuid()` is the controller/operator uid (it owns
-#       the bridge home) and does NOT map to any iso agent → a proven operator
-#       shell. `--as` is honored here as an explicit operator override.
-#   - SHARED_ADVISORY: no per-agent uid map exists (shared-mode install, all
-#       agents share one uid) → the OS cannot distinguish agents, so a hard
-#       team boundary is not a real control. Leader-auth is ADVISORY: honor
-#       the best-effort agent id (`--as`/env) but WARN + audit, never claim a
-#       hard block. (Matches §14 R1 "default = audit/warn, no hard block".)
-#   - UNRESOLVED    : an iso uid map exists but THIS uid is neither a mapped
-#       iso agent nor the controller → the trusted actor cannot be
-#       established → leader-auth FAILS CLOSED.
+# Whether THIS process runs under linux-user isolation is decided
+# UN-SPOOFABLY from the process's OS *username* (`pwd.getpwuid(os.getuid())`):
+# an iso agent runs as `agent-bridge-<slug>`, a passwd-database fact the agent
+# cannot change via env. This is the anti-DOWNGRADE anchor (codex Phase-4 r4):
+# a managed iso agent must NOT be able to break/empty the roster probe (e.g.
+# `BRIDGE_BASH_BIN=/bin/false`, or redirecting the roster file) to fall back
+# into the advisory regime where `--as <leader>` is honored. If the OS user
+# says we are an iso agent, we are NEVER advisory — we either resolve the
+# trusted agent or FAIL CLOSED.
+#
+# Four enforcement regimes, per design §14 R1:
+#   - ISO_ENFORCED  : the process OS user is `agent-bridge-<slug>` AND the
+#       (hardened) roster probe maps this uid to an agent. That uid-derived
+#       agent IS the trusted actor; leader-auth is HARD and `--as`/env are
+#       ignored. An iso agent cannot act as another uid, so it cannot
+#       impersonate another agent.
+#   - CONTROLLER    : the process is NOT an iso OS user AND `os.getuid()` owns
+#       the bridge home → a proven operator shell. `--as` is honored as an
+#       explicit operator override.
+#   - SHARED_ADVISORY: the process is NOT an iso OS user AND is not the
+#       controller → a shared-mode install (agents share one uid). The OS
+#       cannot distinguish agents, so a hard team boundary is not a real
+#       control. Leader-auth is ADVISORY: honor the best-effort agent id but
+#       WARN + audit, never hard-block. (§14 R1 "default = audit/warn".)
+#   - UNRESOLVED    : the process IS an iso OS user but the trusted agent
+#       cannot be established (probe failed/empty/this uid unmapped), OR a
+#       per-agent uid map exists but this uid is unmapped and not the
+#       controller → the trusted actor cannot be established → FAILS CLOSED.
+#       Critically, an iso OS user with a broken probe lands HERE, not in
+#       SHARED_ADVISORY, closing the downgrade attack.
 
 ACTOR_ISO_ENFORCED = "iso-enforced"
 ACTOR_CONTROLLER = "controller"
 ACTOR_SHARED_ADVISORY = "shared-advisory"
 ACTOR_UNRESOLVED = "unresolved"
+
+# The OS-user prefix an iso agent runs as. A build constant (NOT read from
+# env) so a managed agent cannot change the iso-active determination by
+# clearing/altering `BRIDGE_AGENT_OS_USER_PREFIX`. Mirrors the install default
+# (lib/bridge-agents.sh `agent-bridge-` / bridge_agent_default_os_user).
+ISO_OS_USER_PREFIX = "agent-bridge-"
 
 
 class ActorAuth(NamedTuple):
@@ -152,6 +177,52 @@ def _test_uid_map_allowed() -> bool:
     )
 
 
+def _process_iso_user() -> Optional[str]:
+    """Return THIS process's iso OS-user name iff it is `agent-bridge-<slug>`.
+
+    Un-spoofable: derived from `pwd.getpwuid(os.getuid())` (the passwd
+    database), NOT from env. A managed iso agent runs as `agent-bridge-<slug>`
+    and cannot change its own username, so this is the anti-downgrade anchor —
+    a broken/empty roster probe can no longer make an iso agent look like a
+    shared-mode (advisory) caller.
+
+    Returns the username when it has the iso prefix, else None (not an iso OS
+    user → controller or shared-mode). A paired-flag test override
+    (`BRIDGE_ROOMS_TEST_ISO_USER`) lets the smoke simulate an iso OS user; it
+    is NEVER honored in production.
+    """
+    if _test_uid_map_allowed():
+        forced = os.environ.get("BRIDGE_ROOMS_TEST_ISO_USER", "").strip()
+        if forced:
+            return forced if forced.startswith(ISO_OS_USER_PREFIX) else None
+        # An explicit empty override means "force NOT an iso user" for tests
+        # that need the controller/shared path; fall through only if unset.
+        if "BRIDGE_ROOMS_TEST_ISO_USER" in os.environ:
+            return None
+    if pwd is None:
+        return None
+    try:
+        name = pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError):
+        return None
+    return name if name.startswith(ISO_OS_USER_PREFIX) else None
+
+
+# Caller-controllable env vars that could redirect/sabotage the roster probe
+# (point the roster at an agent-written file, or break the shell). They are
+# stripped from the hardened probe environment so a managed agent cannot
+# inject a forged uid->agent row or force the probe empty (codex Phase-4 r4).
+_PROBE_ENV_STRIP = (
+    "BRIDGE_ROSTER_FILE",
+    "BRIDGE_ROSTER_LOCAL_FILE",
+    "BRIDGE_AGENT_ENV_FILE",
+    "BRIDGE_AGENT_ID",
+    "BRIDGE_BASH_BIN",
+    "BASH_ENV",
+    "ENV",
+)
+
+
 def _uid_agent_map() -> dict[int, str]:
     """uid -> iso agent map from a TRUSTED source (never client env).
 
@@ -181,19 +252,41 @@ def _uid_agent_map() -> dict[int, str]:
     return _uid_agent_map_from_roster()
 
 
+def _probe_bash_bin() -> str:
+    """A FIXED bash for the probe — never the caller's `BRIDGE_BASH_BIN`.
+
+    A managed agent setting `BRIDGE_BASH_BIN=/bin/false` (or a shim) could
+    force the probe empty → downgrade to advisory. We pick a trusted absolute
+    bash from well-known locations, falling back to PATH `bash` only if none
+    exist. (The empty-probe-as-downgrade hole is independently closed by the
+    iso-OS-user anchor in resolve_os_actor, but using a fixed bash removes the
+    easiest sabotage lever too.)
+    """
+    for cand in ("/opt/homebrew/bin/bash", "/usr/local/bin/bash",
+                 "/bin/bash", "/usr/bin/bash"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return "bash"
+
+
 def _uid_agent_map_from_roster() -> dict[int, str]:
     """Probe the roster for uid->agent over linux-user-isolated agents.
 
     Mirrors bridge-queue-gateway.py `_peer_map_from_roster` so rooms leader-
-    auth and the queue gateway never diverge on the trusted mapping. Any probe
-    failure yields an EMPTY map (treated as shared-mode → advisory), never a
-    guessed identity.
+    auth and the queue gateway never diverge on the trusted mapping. The probe
+    runs with a HARDENED environment (codex Phase-4 r4): caller-controllable
+    roster-redirect / shell-injection vars (`BRIDGE_ROSTER_LOCAL_FILE`,
+    `BRIDGE_AGENT_ENV_FILE`, `BRIDGE_AGENT_ID`, `BRIDGE_BASH_BIN`, `BASH_ENV`,
+    …) are stripped so a managed agent cannot inject a forged uid->agent row or
+    break the probe. A probe failure yields an EMPTY map; the empty map is only
+    treated as shared-mode when the caller is NOT an iso OS user (see
+    resolve_os_actor) — an iso agent with a failed probe fails CLOSED.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     lib = os.path.join(here, "bridge-lib.sh")
     if not os.path.isfile(lib):
         return {}
-    bash = os.environ.get("BRIDGE_BASH_BIN", "bash")
+    bash = _probe_bash_bin()
     probe = (
         'source "$1/bridge-lib.sh"\n'
         'bridge_load_roster 2>/dev/null || exit 0\n'
@@ -207,11 +300,13 @@ def _uid_agent_map_from_roster() -> dict[int, str]:
         '  printf "%s\\t%s\\n" "$uid" "$agent"\n'
         'done\n'
     )
+    probe_env = {k: v for k, v in os.environ.items()
+                 if k not in _PROBE_ENV_STRIP}
     try:
         proc = subprocess.run(
             [bash, "-c", probe, "probe", here],
             text=True, capture_output=True, timeout=30, check=False,
-            env=os.environ.copy(),
+            env=probe_env,
         )
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -260,33 +355,29 @@ def resolve_os_actor(requested: Optional[str] = None) -> ActorAuth:
     in the regimes that explicitly permit it (CONTROLLER, SHARED_ADVISORY) and
     is IGNORED for the leader-auth decision under ISO_ENFORCED.
 
-    See the section header for the four regimes. This is the single chokepoint
-    the CLI's leader-only verbs call; it never trusts caller-set env for an iso
-    agent.
+    The decision is ANCHORED on the un-spoofable OS username (`_process_iso_
+    user`), NOT on the roster probe's success, so a managed iso agent cannot
+    sabotage the probe (`BRIDGE_BASH_BIN`, roster redirect) to downgrade itself
+    into the advisory regime (codex Phase-4 r4). See the section header for the
+    four regimes.
     """
     uid = os.getuid()
-    uid_map = _uid_agent_map()
+    iso_user = _process_iso_user()
 
-    if not uid_map:
-        # No per-agent uid isolation anywhere → shared-mode. Best-effort agent,
-        # advisory enforcement (warn, never hard-block).
-        agent = (requested
-                 or os.environ.get("BRIDGE_AGENT_ID")
-                 or os.environ.get("USER")
-                 or "")
-        return ActorAuth(agent=str(agent).strip(), regime=ACTOR_SHARED_ADVISORY,
-                         uid=uid, hard=False)
+    if iso_user is not None:
+        # We ARE an iso agent (passwd fact). The trusted actor is THIS uid's
+        # mapped agent from the hardened probe. If the probe cannot map this
+        # uid (broken/sabotaged/empty), we FAIL CLOSED — never advisory.
+        mapped = _uid_agent_map().get(uid)
+        if mapped:
+            return ActorAuth(agent=mapped, regime=ACTOR_ISO_ENFORCED,
+                             uid=uid, hard=True)
+        return ActorAuth(agent="", regime=ACTOR_UNRESOLVED, uid=uid, hard=True)
 
-    mapped = uid_map.get(uid)
-    if mapped:
-        # This uid IS an iso agent → that agent is the trusted actor; --as
-        # ignored. Unspoofable: a managed agent cannot run as another uid.
-        return ActorAuth(agent=mapped, regime=ACTOR_ISO_ENFORCED,
-                         uid=uid, hard=True)
-
+    # NOT an iso OS user → either the controller/operator or a shared-mode
+    # install. The bridge-home owner (a filesystem fact) is the controller.
     controller = _controller_uid()
     if controller is not None and uid == controller:
-        # Proven operator shell — --as is an explicit operator override.
         agent = (requested
                  or os.environ.get("BRIDGE_AGENT_ID")
                  or os.environ.get("USER")
@@ -294,9 +385,18 @@ def resolve_os_actor(requested: Optional[str] = None) -> ActorAuth:
         return ActorAuth(agent=str(agent).strip(), regime=ACTOR_CONTROLLER,
                          uid=uid, hard=False)
 
-    # An iso map exists but this uid is neither a mapped iso agent nor the
-    # controller → cannot establish a trusted actor → fail closed.
-    return ActorAuth(agent="", regime=ACTOR_UNRESOLVED, uid=uid, hard=True)
+    # Not an iso OS user and not the controller. If a per-agent uid map exists
+    # (other iso agents on the host) and this uid is unmapped, we still cannot
+    # establish a trusted actor for a leader-only action → fail closed. With NO
+    # uid map at all this is a genuine shared-mode install → advisory.
+    if _uid_agent_map():
+        return ActorAuth(agent="", regime=ACTOR_UNRESOLVED, uid=uid, hard=True)
+    agent = (requested
+             or os.environ.get("BRIDGE_AGENT_ID")
+             or os.environ.get("USER")
+             or "")
+    return ActorAuth(agent=str(agent).strip(), regime=ACTOR_SHARED_ADVISORY,
+                     uid=uid, hard=False)
 
 
 # --------------------------------------------------------------------------
