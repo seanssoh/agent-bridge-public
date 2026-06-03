@@ -4001,6 +4001,15 @@ report and reap test-fixture agents per their pattern."
     # the descriptor owns for future engines).
     if [[ "$engine" == "codex" ]]; then
       bridge_ensure_codex_agent_hooks "$agent" "$scaffold_target" >/dev/null 2>&1 || true
+      # #8945 Track C: deploy the agent-bridge Codex custom slash commands
+      # (/agb-inbox, /agb-claim, /agb-done, /agb-handoff) + bridge-role
+      # permission profiles into the SAME agent-scoped .codex/ tree as the
+      # hooks above (<scaffold_target>/.codex/), never the controller ~/.codex.
+      # Idempotent: re-runs refresh only bridge-managed assets.
+      if declare -F bridge_ensure_codex_agent_slash_commands >/dev/null 2>&1; then
+        bridge_ensure_codex_agent_slash_commands "$agent" "$scaffold_target" \
+          >/dev/null 2>&1 || true
+      fi
     fi
     # Issue #1105: capture the roster-file sha BEFORE the write so the
     # system_config_mutation audit row emitted below carries a real

@@ -1,0 +1,20 @@
+# agent-bridge:managed profile=bridge-worker
+# Managed by agent-bridge. Regenerated on scaffold/upgrade; edits are replaced.
+#
+# Codex config-profile FILE. Codex loads this when you start a session with
+#   codex -p bridge-worker   (equivalently --profile bridge-worker)
+# which layers $CODEX_HOME/bridge-worker.config.toml on top of the base user
+# config (verified against codex-cli 0.135.0).
+#
+# bridge-worker — default fixer/worker. Workspace-write sandbox: read all files,
+# write inside the workspace (cwd) and the agent home, run `agb` queue commands.
+# Network is enabled but the trust boundary stays at the workspace; widen
+# writable_roots / tighten network per install as needed.
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[sandbox_workspace_write]
+# Read all, write inside cwd + these roots. <agent-home> is substituted with the
+# resolved agent home at install time (a benign non-existent path if left raw).
+network_access = true
+writable_roots = ["<agent-home>"]
