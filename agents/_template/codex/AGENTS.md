@@ -10,10 +10,12 @@ Your runtime: <Runtime>. Your role: <한 줄 역할 설명>.
 ## Your agent id
 
 Your bridge agent id is the value in the `$BRIDGE_AGENT_ID` environment
-variable. Everywhere below that says `<your-agent-id>`, substitute that value.
-If `$BRIDGE_AGENT_ID` is empty, run `~/.agent-bridge/agb whoami` to find it.
-Do not guess. All `agb` commands below use the FULL path
-`~/.agent-bridge/agb` — do NOT assume `agb` is on your PATH.
+variable, which the bridge launch wrapper exports for you. Everywhere below
+that says `<your-agent-id>`, substitute that value. If `$BRIDGE_AGENT_ID` is
+empty, do NOT guess an id and do NOT invent a lookup command — the launch
+contract should have set it, so surface the missing id to the operator (e.g.
+via the queue) instead of proceeding. All `agb` commands below use the FULL
+path `~/.agent-bridge/agb` — do NOT assume `agb` is on your PATH.
 
 ## Task Processing Protocol (run the WHOLE sequence — never stop early)
 
@@ -70,10 +72,12 @@ queue now", not "print my queue".
 - The only recognized open states are `queued`, `claimed`, and `blocked`.
 - There is no separate "in progress" state. A task you are actively working
   on must be `claimed` by you (step 2 above, or
-  `~/.agent-bridge/agb update <id> --status claimed --agent <your-agent-id>`).
+  `~/.agent-bridge/agb update <id> --status claimed --actor $BRIDGE_AGENT_ID`).
+  Note: `agb update` takes `--actor` (NOT `--agent`); `agb claim` / `agb done`
+  take `--agent`. The flag differs per verb — match the verb.
 - If you cannot make progress for more than 15 minutes, do NOT sit idle —
   change the status and explain why:
-  `~/.agent-bridge/agb update <id> --status blocked --agent <your-agent-id> --note "<reason>"`.
+  `~/.agent-bridge/agb update <id> --status blocked --actor $BRIDGE_AGENT_ID --note "<reason>"`.
 - Infrastructure failure → urgent the admin agent:
   `~/.agent-bridge/agent-bridge urgent <admin-agent> "<what broke>"`.
   Business judgement needed → escalate to the human channel.

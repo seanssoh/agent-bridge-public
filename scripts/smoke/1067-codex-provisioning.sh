@@ -239,4 +239,55 @@ fi
 
 smoke_log "T3_UPGRADE_PROPAGATE: hooks.json created at $UPGRADE_HOOK_PATH"
 
-smoke_log "all tests PASS — issue #1067 CODEX-PROV: S02/S03/S08 full provisioning + upgrade propagation"
+# ---- T4 (#8945 Track A): every agb verb/flag in the codex AGENTS.md template
+#      must match the real CLI contract ----
+#
+# The codex AGENTS.md template is the literal command source a Codex agent
+# copy-pastes. A non-existent verb (e.g. the removed `agb whoami`) or a
+# wrong-per-verb flag (e.g. `agb update --agent` — update takes `--actor`,
+# while claim/done take `--agent`) makes the agent's recovery commands fail at
+# runtime. This block pins the contract against the SAME template the scaffold
+# ships, so a future edit that re-introduces an unsupported verb or the wrong
+# flag fails CI at PR time. The contract is hardcoded (hermetic — CI has no
+# live `agb`), validated against `agb <verb> --help` while authoring #8945
+# Track A r2.
+CODEX_TEMPLATE="$REPO_ROOT/agents/_template/codex/AGENTS.md"
+smoke_assert_file_exists "$CODEX_TEMPLATE" "T4: codex AGENTS.md template must exist"
+
+# T4a: the removed verb `agb whoami` must never reappear (it does not exist;
+# `agb whoami` → `[오류] 지원하지 않는 명령입니다: whoami`). The id source is
+# the $BRIDGE_AGENT_ID env var, not a lookup verb.
+if grep -nE '\bagb[[:space:]]+whoami\b' "$CODEX_TEMPLATE" >/dev/null 2>&1; then
+  smoke_fail "T4a (#8945 A): codex AGENTS.md references the non-existent 'agb whoami' verb — use \$BRIDGE_AGENT_ID instead"
+fi
+
+# T4b: `agb update` takes `--actor`, NOT `--agent`. Flag a same-line pairing of
+# an `agb update ...` invocation with `--agent` (the exact codex-flagged bug).
+if grep -nE '\bagb[[:space:]]+update\b[^`]*--agent\b' "$CODEX_TEMPLATE" >/dev/null 2>&1; then
+  smoke_fail "T4b (#8945 A): codex AGENTS.md uses 'agb update ... --agent' — update takes --actor (claim/done take --agent)"
+fi
+
+# T4c: every agb verb invoked in the template must be a real agb verb. The
+# allowlist is the documented queue + task surface a worker legitimately uses.
+# An unknown verb (typo or a renamed CLI) fails here. `agb task <sub>` is
+# validated as the `task` verb (the sub-verb is task's own arg).
+T4_VALID_AGB_VERBS=" inbox show claim done update task handoff summary create cancel "
+# shellcheck disable=SC2013
+# Extract `agb <verb>` pairs from fenced/inline command spans. We scan the raw
+# file; the "Note:" prose line that names verbs descriptively (agb claim / agb
+# done / agb update) is covered too — those are all valid verbs, so it passes.
+T4_BAD_VERBS=""
+while IFS= read -r verb; do
+  [[ -n "$verb" ]] || continue
+  case "$T4_VALID_AGB_VERBS" in
+    *" $verb "*) ;;
+    *) T4_BAD_VERBS="$T4_BAD_VERBS $verb" ;;
+  esac
+done < <(grep -oE '\bagb[[:space:]]+[a-z][a-z-]*' "$CODEX_TEMPLATE" | awk '{print $2}' | sort -u)
+if [[ -n "$T4_BAD_VERBS" ]]; then
+  smoke_fail "T4c (#8945 A): codex AGENTS.md invokes unknown agb verb(s):$T4_BAD_VERBS (not in: $T4_VALID_AGB_VERBS)"
+fi
+
+smoke_log "T4_AGB_CONTRACT: all agb verbs/flags in codex AGENTS.md match the CLI contract"
+
+smoke_log "all tests PASS — issue #1067 CODEX-PROV: S02/S03/S08 full provisioning + upgrade propagation + #8945 A agb-contract"
