@@ -11761,4 +11761,11 @@ bash "$REPO_ROOT/scripts/smoke/1076-create-atomicity-and-purge.sh"
 log "running audit-since-tz smoke (issue #1100)"
 bash "$REPO_ROOT/scripts/smoke/1100-audit-since-tz.sh"
 
+# Engine→binary mapping: bridge_engine_binary_name() resolves the real
+# CLI name (e.g. antigravity → agy) so the daemon autostart gate does
+# not permanently skip non-default engines with an `engine-cli-missing`
+# reason when the binary is installed under its real name.
+log "running engine-binary-mapping smoke"
+bash "$REPO_ROOT/scripts/smoke/engine-binary-mapping.sh"
+
 log "smoke test passed"

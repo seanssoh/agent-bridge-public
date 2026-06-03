@@ -6,6 +6,22 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Engine→binary mapping for the daemon autostart gate.** The always-on
+  auto-start gate in `bridge-daemon.sh` probed `command -v <engine>`
+  against the engine identifier, so a roster entry with `engine=antigravity`
+  (CLI binary `agy`) was permanently skipped with
+  `engine-cli-missing:antigravity` even when the binary was installed under
+  its real name. A new `bridge_engine_binary_name()` helper in
+  `lib/bridge-engine-descriptor.sh` maps engine identifier → CLI binary
+  (`claude→claude`, `codex→codex`, `antigravity→agy`); the daemon gate
+  now routes its PATH probe through that helper and the audit reason
+  reports the real binary (`engine-cli-missing:agy`) for traceability,
+  with a legacy bare-engine fallback for unknown engines. On the
+  operator's `sean-mac`, the `patch-agy` static agent had 94 consecutive
+  false-positive failures before this fix.
+
 ## [0.15.2] — 2026-06-01
 
 A stabilization + headless-hardening batch on top of `0.15.1`. Every item is on `main`, CI-green (syntax + unit/static + oss-preflight + lint-heredoc-ban + lint + integration smoke), and codex pair-reviewed. The marquee items are headless Claude OAT self-rotation (proactive native probe + reactive 429), a Darwin-gated macOS Claude `apiKeyHelper` auth path with a deep inherited-env credential-leak hardening pass, a whole-fleet crash-loop fix on per-agent-HOME installs, and the long-standing daemon "ACTION REQUIRED" nudge double-fire fix.
