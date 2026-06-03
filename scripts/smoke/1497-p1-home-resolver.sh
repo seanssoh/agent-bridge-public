@@ -77,36 +77,27 @@ bash_agent_default_home() {
 }
 
 # ----- E1: export integrity (scalar reaches child, non-empty) ------------
-# Mirror the bridge-run.sh export expression and verify a child process reads
-# the value back. This is the regression guard for the #1213/#1217 class where
-# `export NAME=...` silently no-ops when NAME collides with an assoc array.
+# Compute the v2 home with the inline resolver, export it exactly as
+# bridge-run.sh does, and verify a child shell reads it back. Pure-bash on
+# purpose: the regression class this guards (#1213/#1217 — `export NAME=...`
+# silently no-ops when NAME collides with a `declare -A NAME`) is a bash-level
+# failure, so the child-env round-trip is most faithful in bash. Keeping it in
+# bash also keeps the smoke free of an environment-dict probe (iso-helper
+# boundary ratchet) and a heredoc-stdin Python invocation (lint-heredoc-ban).
 e1_root="$(mktemp -d -t agb-1497-e1.XXXXXX)"
-e1_child="$(
-  BRIDGE_AGENT_ROOT_V2="$e1_root/data/agents" \
-    BRIDGE_AGENT_HOME_ROOT="$e1_root/bridge-home/agents" \
-    "$PYTHON" - "$REPO_ROOT" <<'PY' 2>&1 || true
-import os
-import subprocess
-import sys
-
-agent = "patch"
-root_v2 = os.environ["BRIDGE_AGENT_ROOT_V2"]
-# Compute exactly as bash bridge_agent_default_home would (v2 branch).
-resolved = f"{root_v2}/{agent}/home"
-child = dict(os.environ)
-child["BRIDGE_AGENT_HOME_RESOLVED"] = resolved
-out = subprocess.run(
-    [sys.executable, "-c",
-     "import os;print(os.environ.get('BRIDGE_AGENT_HOME_RESOLVED','UNSET'))"],
-    env=child, capture_output=True, text=True, check=False,
-)
-print(out.stdout.strip())
-PY
+e1_v2_root="$e1_root/data/agents"
+e1_expected="$e1_v2_root/patch/home"
+e1_resolved="$(
+  BRIDGE_AGENT_ROOT_V2="$e1_v2_root" bash_agent_default_home patch
 )"
-if [[ -n "$e1_child" && "$e1_child" != "UNSET" && "$e1_child" == "$e1_root/data/agents/patch/home" ]]; then
+e1_child="$(
+  BRIDGE_AGENT_HOME_RESOLVED="$e1_resolved" \
+    bash -c 'printf "%s" "${BRIDGE_AGENT_HOME_RESOLVED:-UNSET}"'
+)"
+if [[ -n "$e1_child" && "$e1_child" != "UNSET" && "$e1_child" == "$e1_expected" ]]; then
   pass "E1: BRIDGE_AGENT_HOME_RESOLVED reaches child env, non-empty"
 else
-  fail "E1: export integrity broken — child saw: [$e1_child]"
+  fail "E1: export integrity broken — child saw: [$e1_child] expected: [$e1_expected]"
 fi
 rm -rf "$e1_root"
 
@@ -197,8 +188,10 @@ rm -rf "$p3_root"
 j1_root="$(mktemp -d -t agb-1497-j1.XXXXXX)"
 j1_home="/data/agents/show-a/home"
 j1_tsv="$(printf 'agent\tdescription\tengine\tsource\tsession\tsession_id\tworkdir\tprofile_home\tprofile_source\tactive\tactivity_state\tloop\tcontinue\talways_on\tidle_timeout\twake_status\tnotify_status\tchannel_status\tchannels\tnotify_kind\tnotify_target\tnotify_account\tdiscord_channel_id\tisolation_mode\tos_user\tqueue_queued\tqueue_claimed\tqueue_blocked\tactions\tadmin\tagent_home\nshow-a\tdesc\tclaude\troster\t-\t-\t/data/agents/show-a/workdir\t-\tno\tyes\tidle\t0\t0\tno\t0\tok\tok\tok\t-\t-\t-\t-\t-\tshared\t-\t0\t0\t0\t-\tno\t%s\n' "$j1_home")"
-j1_out="$(
-  "$PYTHON" - show "$j1_tsv" "v2-active" <<'PY' 2>&1 || true
+# Write the converter to a temp file and invoke it by path — lint-heredoc-ban
+# permits `cat > file <<EOF` but not heredoc-stdin into `python3 -`.
+j1_py="$(mktemp -t agb-1497-j1.XXXXXX.py)"
+cat > "$j1_py" <<'PY'
 import csv, io, json, sys
 mode = sys.argv[1]
 rows = list(csv.DictReader(io.StringIO(sys.argv[2]), delimiter="\t"))
@@ -226,7 +219,10 @@ payload = [convert_row(r) for r in rows]
 rec = payload[0] if mode == "show" else payload
 print(json.dumps(rec.get("agent_home", None)))
 PY
+j1_out="$(
+  "$PYTHON" "$j1_py" show "$j1_tsv" "v2-active" 2>&1 || true
 )"
+rm -f "$j1_py"
 if [[ "$j1_out" == "\"$j1_home\"" ]]; then
   pass "J1: agent show --json emits v2-correct agent_home ($j1_home)"
 else
@@ -292,9 +288,11 @@ t1_resolved="$t1_root/explicit-home"
 mkdir -p "$t1_overlay" "$t1_agent_root/dyn-t/home" "$t1_resolved"
 cp "$REPO_ROOT/hooks/bridge_hook_common.py" "$t1_overlay/bridge_hook_common.py"
 # Neutralize the HOME-RESOLVED fast path: rewrite the env name it reads so the
-# exported scalar is ignored and the resolver falls through to v2.
-"$PYTHON" - "$t1_overlay/bridge_hook_common.py" <<'PY'
-import re, sys
+# exported scalar is ignored and the resolver falls through to v2. Mutator goes
+# to a temp file (lint-heredoc-ban forbids heredoc-stdin into `python3 -`).
+t1_mutator="$(mktemp -t agb-1497-t1.XXXXXX.py)"
+cat > "$t1_mutator" <<'PY'
+import sys
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
 # Only touch the agent_default_home fast-path read, not the workdir resolver.
@@ -307,6 +305,8 @@ if patched == text:
     raise SystemExit("TEETH setup error: HOME-RESOLVED read marker not found")
 open(path, "w", encoding="utf-8").write(patched)
 PY
+"$PYTHON" "$t1_mutator" "$t1_overlay/bridge_hook_common.py"
+rm -f "$t1_mutator"
 t1_py="$(
   BRIDGE_DATA_ROOT="$t1_data" \
     BRIDGE_AGENT_ROOT_V2="$t1_agent_root" \
