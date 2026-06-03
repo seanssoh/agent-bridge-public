@@ -30,6 +30,28 @@ import fnmatch
 import os
 from pathlib import Path
 
+# operator_home lives next to this module in lib/. Load it by its EXACT path via
+# importlib — NOT through sys.path — so a same-named `operator_home` module
+# elsewhere on the path can never shadow it and redirect the system-config home
+# (#1507 r2: a bare `from operator_home import` does NOT raise if some other
+# operator_home is importable). When the sibling file is absent (exotic loader
+# placed only this file) the inline fallback is byte-identical to operator_home().
+_OPERATOR_HOME_PY = Path(__file__).resolve().parent / "operator_home.py"
+operator_home = None
+if _OPERATOR_HOME_PY.is_file():
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_agb_operator_home", str(_OPERATOR_HOME_PY))
+    if _spec is not None and _spec.loader is not None:
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        operator_home = getattr(_mod, "operator_home", None)
+if not callable(operator_home):  # sibling absent — byte-identical inline SSOT
+    def operator_home() -> Path:
+        explicit = os.environ.get("BRIDGE_HOME", "").strip()
+        if explicit:
+            return Path(explicit).expanduser()
+        return Path.home() / ".agent-bridge"
+
 
 def _glob_matches(relative: str, pattern: str) -> bool:
     """Segment-aware glob match: a `*` matches within ONE path segment.
@@ -83,16 +105,16 @@ PROTECTED_GLOBS: tuple[str, ...] = (
 
 
 def bridge_home_dir() -> Path:
-    """Mirror of bridge_hook_common.bridge_home_dir() for in-tree use.
+    """Operator bridge home — delegates to the canonical SSOT (issue #1497 P2).
 
-    Duplicated here so this module has zero imports from `hooks/`; the
-    wrapper (`bridge-config.py`) lives at the repo root and would otherwise
-    have to set sys.path before importing.
+    Kept as a thin same-name wrapper so existing callers (`bridge-config.py`,
+    `hooks/tool-policy.py`) need no change; the resolution logic now lives in
+    `lib/operator_home.py::operator_home()` and is shared with the other
+    former duplicates. `operator_home` is imported at module top (lib/ is on
+    sys.path whenever this module is importable). Byte-identical to the
+    previous strip()+expanduser()+`~/.agent-bridge`-fallback body.
     """
-    explicit = os.environ.get("BRIDGE_HOME", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    return Path.home() / ".agent-bridge"
+    return operator_home()
 
 
 def _candidate_relatives(path: Path, home: Path) -> list[str]:

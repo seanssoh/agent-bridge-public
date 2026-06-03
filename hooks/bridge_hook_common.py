@@ -17,6 +17,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+# Operator-home SSOT (issue #1497 P2). `lib/` is a sibling of `hooks/` in both
+# the source tree and the deployed runtime (`~/.agent-bridge/{hooks,lib}/`), so
+# the canonical resolver is `<this>/../lib/operator_home.py`. This module is
+# imported every session and must be self-sufficient. Load operator_home() by
+# its EXACT path via importlib — NOT through sys.path — so a same-named
+# `operator_home` module elsewhere on the path can never shadow it and redirect
+# the hook home (#1507 r2: a bare `from operator_home import` does NOT raise when
+# lib/ is absent if some other operator_home is importable). When the exact file
+# is absent (partial deploy / test overlay) the inline fallback is byte-identical.
+_OPERATOR_HOME_PY = Path(__file__).resolve().parent.parent / "lib" / "operator_home.py"
+operator_home = None
+if _OPERATOR_HOME_PY.is_file():
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_agb_operator_home", str(_OPERATOR_HOME_PY))
+    if _spec is not None and _spec.loader is not None:
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        operator_home = getattr(_mod, "operator_home", None)
+if not callable(operator_home):  # exact file absent — byte-identical inline SSOT
+    def operator_home() -> Path:
+        explicit = os.environ.get("BRIDGE_HOME", "").strip()  # noqa: iso-helper-boundary — os.environ (.environ) false-matches the .env boundary pattern; BRIDGE_HOME is the operator runtime root, not an isolated artifact
+        if explicit:
+            return Path(explicit).expanduser()
+        return Path.home() / ".agent-bridge"
+
 PRIORITY_ORDER = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
 
 # Exact keys from bridge_render_template_string (bridge-agent.sh) that are
@@ -76,10 +101,9 @@ def bridge_active_agent_dir() -> Path:
 
 
 def bridge_home_dir() -> Path:
-    explicit = os.environ.get("BRIDGE_HOME", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    return Path.home() / ".agent-bridge"
+    # Operator bridge home — delegates to the canonical SSOT (issue #1497 P2).
+    # Byte-identical to the previous inline strip()+expanduser()+default body.
+    return operator_home()
 
 
 def bridge_script_dir() -> Path:

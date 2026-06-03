@@ -93,6 +93,14 @@ except ImportError:  # pragma: no cover — keep pre-compact resilient if
 
 
 def _bridge_home() -> Path:
+    # NOTE (issue #1497 P2): intentionally NOT delegated to the canonical
+    # operator_home() SSOT. This wrapper's fallback is load-bearing and
+    # DIFFERENT from operator_home(): when BRIDGE_HOME is unset it returns the
+    # script's own location (<this>/.. = where the hook is actually deployed),
+    # not ~/.agent-bridge. That walk-up is how PreCompact locates its home under
+    # a non-standard / live-runtime layout; swapping it for the default-home
+    # SSOT would be a behavior change, not a pure dedup. Deferred to P3 (same
+    # reason bridge_a2a_common.bridge_home() is deferred — divergent form).
     env_home = os.environ.get("BRIDGE_HOME")
     if env_home:
         return Path(env_home)

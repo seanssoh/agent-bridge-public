@@ -6,9 +6,34 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# Operator-home SSOT (issue #1497 P2). This module lives at the repo root (and
+# `~/.agent-bridge/` root in the deployed runtime), so the canonical resolver is
+# `<this>/lib/operator_home.py`. Load it by its EXACT path via importlib — NOT
+# through sys.path — so a same-named `operator_home` module elsewhere on the path
+# can never shadow it and redirect the guard home (#1507 r2: a bare
+# `from operator_home import` does NOT raise when lib/ is absent if some other
+# operator_home is importable). When the exact file is absent (partial deploy /
+# test overlay) the inline fallback is byte-identical to operator_home().
+_OPERATOR_HOME_PY = Path(__file__).resolve().parent / "lib" / "operator_home.py"
+operator_home = None
+if _OPERATOR_HOME_PY.is_file():
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_agb_operator_home", str(_OPERATOR_HOME_PY))
+    if _spec is not None and _spec.loader is not None:
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        operator_home = getattr(_mod, "operator_home", None)
+if not callable(operator_home):  # exact file absent — byte-identical inline SSOT
+    def operator_home() -> Path:
+        explicit = os.environ.get("BRIDGE_HOME", "").strip()  # noqa: iso-helper-boundary — os.environ (.environ) false-matches the .env boundary pattern; BRIDGE_HOME is the operator runtime root, not an isolated artifact
+        if explicit:
+            return Path(explicit).expanduser()
+        return Path.home() / ".agent-bridge"
 
 SEVERITY_ORDER = {
     "safe": 0,
@@ -175,10 +200,9 @@ def severity_at_least(value: str, threshold: str) -> bool:
 
 
 def bridge_home_dir() -> Path:
-    explicit = os.environ.get("BRIDGE_HOME", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    return Path.home() / ".agent-bridge"
+    # Operator bridge home — delegates to the canonical SSOT (issue #1497 P2).
+    # Byte-identical to the previous inline strip()+expanduser()+default body.
+    return operator_home()
 
 
 def _host_profile_is_dev() -> bool:
