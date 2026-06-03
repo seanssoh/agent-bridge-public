@@ -272,18 +272,24 @@ fi
 # An unknown verb (typo or a renamed CLI) fails here. `agb task <sub>` is
 # validated as the `task` verb (the sub-verb is task's own arg).
 T4_VALID_AGB_VERBS=" inbox show claim done update task handoff summary create cancel "
-# shellcheck disable=SC2013
-# Extract `agb <verb>` pairs from fenced/inline command spans. We scan the raw
+# Extract `agb <verb>` pairs from fenced/inline command spans into a temp file,
+# then read from that file. We deliberately avoid a `< <(...)` process
+# substitution here: lint-heredoc-ban (H3) flags a here-string/procsub feeding
+# a non-interpreter consumer (footgun #11 family). The temp file honors $TMPDIR
+# via mktemp and is cleaned up immediately after the loop. We scan the raw
 # file; the "Note:" prose line that names verbs descriptively (agb claim / agb
 # done / agb update) is covered too — those are all valid verbs, so it passes.
 T4_BAD_VERBS=""
+T4_VERBS_TMP="$(mktemp "${TMPDIR:-/tmp}/codex-agb-verbs.XXXXXX")"
+grep -oE '\bagb[[:space:]]+[a-z][a-z-]*' "$CODEX_TEMPLATE" | awk '{print $2}' | sort -u >"$T4_VERBS_TMP"
 while IFS= read -r verb; do
   [[ -n "$verb" ]] || continue
   case "$T4_VALID_AGB_VERBS" in
     *" $verb "*) ;;
     *) T4_BAD_VERBS="$T4_BAD_VERBS $verb" ;;
   esac
-done < <(grep -oE '\bagb[[:space:]]+[a-z][a-z-]*' "$CODEX_TEMPLATE" | awk '{print $2}' | sort -u)
+done <"$T4_VERBS_TMP"
+rm -f "$T4_VERBS_TMP"
 if [[ -n "$T4_BAD_VERBS" ]]; then
   smoke_fail "T4c (#8945 A): codex AGENTS.md invokes unknown agb verb(s):$T4_BAD_VERBS (not in: $T4_VALID_AGB_VERBS)"
 fi
