@@ -300,6 +300,41 @@ def _controller_uid() -> Optional[int]:
         return None
 
 
+def host_has_iso_users() -> bool:
+    """Public: True iff the host has any `agent-bridge-*` OS user (an iso-v2 host).
+
+    An un-spoofable passwd fact (wraps `_host_has_iso_users`). Used by the queue
+    gate to tell a genuine iso-v2 host (a hard team boundary exists) from a
+    shared-mode install (no iso users → no OS separation → ACL is advisory).
+    On a shared-mode host the gateway never legitimately runs, so even a forged
+    gateway-child env must be treated as advisory (§14 R1: shared-mode stays
+    advisory either way), never a hard block.
+    """
+    return _host_has_iso_users()
+
+
+def is_controller_process() -> bool:
+    """True iff THIS process runs as the controller (the rooms.db OWNER uid).
+
+    The un-forgeable anchor for "was this process spawned BY the controller?"
+    (P1b r2): the queue gateway runs as the controller and spawns the queue
+    child IN-PROCESS (no uid drop), so a gateway-spawned `bridge-queue.py` has
+    `os.getuid() == _controller_uid()`. A DIRECT managed-agent invocation runs
+    as the agent uid (`agent-bridge-<a>`), which is NOT the controller — so it
+    CANNOT forge gateway-child status by merely exporting
+    `BRIDGE_QUEUE_GATEWAY_SERVER`/`BRIDGE_QUEUE_GATEWAY_ACTOR`. The controller
+    identity is anchored to the rooms.db owner (`_controller_uid`), the same
+    un-spoofable anchor P1a uses (a managed agent cannot chown the controller-
+    owned rooms.db).
+
+    Returns False when the controller uid cannot be established (no rooms.db)
+    — a fail-closed default: an un-anchored process is never treated as the
+    controller.
+    """
+    controller = _controller_uid()
+    return controller is not None and os.getuid() == controller
+
+
 def default_os_user_slug(agent: str) -> str:
     """The default iso OS-user for `agent` — `agent-bridge-<slug>`.
 

@@ -183,6 +183,35 @@ def _rooms_acl_mode_or_fail_closed(rooms, hard: bool) -> str:
         return rooms.ACL_ENFORCE if hard else rooms.ACL_OFF
 
 
+def _rooms_is_controller_process(rooms) -> bool:
+    """True iff this process runs as the controller (the rooms.db owner uid).
+
+    Wraps rooms.is_controller_process() (P1b r2: the un-forgeable proof that the
+    queue child was spawned BY the controller-run gateway, since the gateway does
+    not drop uid). Fails CLOSED (False) on any fault or if the module predates the
+    helper — an un-anchored process must never be treated as a gateway child.
+    """
+    try:
+        return bool(rooms.is_controller_process())
+    except Exception:  # noqa: BLE001 - missing helper / stat fault -> not the controller
+        return False
+
+
+def _rooms_host_has_iso_users(rooms) -> bool:
+    """True iff the host has iso OS users (a genuine iso-v2 host, hard boundary).
+
+    Wraps rooms.host_has_iso_users(). On a fault / missing helper, fail CLOSED to
+    True (treat as a hard iso host): a hard regime under enforce denies cross-room
+    rather than silently advising — the safe default for the gateway path. (The
+    gateway only runs for iso agents, so True is also the common-case correct
+    answer.)
+    """
+    try:
+        return bool(rooms.host_has_iso_users())
+    except Exception:  # noqa: BLE001 - missing helper / passwd fault -> assume iso host (fail closed)
+        return True
+
+
 def _rooms_acl_check_create(actor: str, target: str) -> None:
     """Rooms ACL (P1b) defense-in-depth + non-gateway gate for cmd_create.
 
@@ -212,31 +241,47 @@ def _rooms_acl_check_create(actor: str, target: str) -> None:
     # than silently reading 'off'. This closes the BLOCKING fail-open where a
     # previously-enforced DB that becomes unreadable/corrupt would be treated as
     # ACL-off (codex r1). The actor source is NEVER the client --from.
-    under_gateway = _running_under_queue_gateway_server()
+    # CRITICAL (P1b r2): the gateway-child env signal is only TRUSTWORTHY when
+    # THIS process actually runs as the controller. The queue gateway runs as the
+    # controller and spawns the queue child in-process (no uid drop), so a genuine
+    # gateway child has os.getuid() == controller. A DIRECT managed-agent
+    # invocation runs as the AGENT uid and can set BRIDGE_QUEUE_GATEWAY_SERVER /
+    # BRIDGE_QUEUE_GATEWAY_ACTOR in its OWN env — but it is NOT the controller, so
+    # we MUST NOT trust those ambient env vars from it (that was the codex r2
+    # impersonation bypass). Gate the gateway branch on the un-forgeable
+    # rooms.db-owner controller anchor; a non-controller process falls through to
+    # resolve_os_actor() = its REAL OS identity and cannot impersonate.
+    under_gateway = (
+        _running_under_queue_gateway_server() and _rooms_is_controller_process(rooms)
+    )
     if under_gateway:
-        # The gateway authenticated the actor (socket: SO_PEERCRED; file: request
-        # file owner uid) and passed it in BRIDGE_QUEUE_GATEWAY_ACTOR — an env var
-        # the CLIENT cannot set (it is the gateway-server's own child env). Use
-        # THAT as the ISO-enforced actor, NEVER the client --from (args.actor):
-        # the gateway is the only component that knows the real OS identity, so a
-        # managed agent passing --from <peer> cannot influence the decision.
-        gateway_actor = os.environ.get("BRIDGE_QUEUE_GATEWAY_ACTOR", "").strip()  # noqa: iso-helper-boundary — gateway-server child env, not an isolated-agent artifact
+        # We ARE the controller AND the gateway flag is set, so the gateway
+        # authenticated the actor (socket: SO_PEERCRED; file: request-file owner
+        # uid) and passed it in BRIDGE_QUEUE_GATEWAY_ACTOR (its own child env).
+        # Use it as the actor, NEVER the client --from (args.actor). The REGIME is
+        # the host's OS-separation fact: a genuine iso-v2 host (un-spoofable
+        # passwd users) -> ISO_ENFORCED (hard); a shared-mode host (no iso users,
+        # where the gateway never legitimately runs) -> SHARED_ADVISORY, so even a
+        # controller-uid process with a forged gateway env cannot hard-block
+        # cross-team traffic (§14 R1: shared-mode stays advisory either way).
+        gateway_hard = _rooms_host_has_iso_users(rooms)
+        gateway_actor = os.environ.get("BRIDGE_QUEUE_GATEWAY_ACTOR", "").strip()  # noqa: iso-helper-boundary — gateway-server child env (controller-anchored), not an isolated-agent artifact
         if not gateway_actor:
             # Under the gateway server but NO authenticated actor was established
             # (e.g. the file transport could not map the request-file owner to an
-            # iso agent). Do NOT fall back to the client --from. We must still
-            # learn whether enforcement is on: a missing actor + enforce -> fail
-            # closed; off -> pass. Read the mode strictly so an unreadable DB also
-            # fails closed for this un-authenticated gateway create.
-            mode = _rooms_acl_mode_or_fail_closed(rooms, hard=True)
-            if mode == rooms.ACL_ENFORCE:
-                raise SystemExit(
-                    "rooms ACL: create denied (gateway could not establish a "
-                    "trusted OS actor for this request — failing closed) "
-                    "[rooms_acl=enforce]"
-                )
+            # iso agent). Do NOT fall back to the client --from. On an iso host
+            # this fails CLOSED under enforce; on a shared-mode host there is no
+            # hard boundary, so it is a no-op pass (advisory regime never blocks).
+            if gateway_hard:
+                mode = _rooms_acl_mode_or_fail_closed(rooms, hard=True)
+                if mode == rooms.ACL_ENFORCE:
+                    raise SystemExit(
+                        "rooms ACL: create denied (gateway could not establish a "
+                        "trusted OS actor for this request — failing closed) "
+                        "[rooms_acl=enforce]"
+                    )
             return
-        regime = rooms.ACTOR_ISO_ENFORCED
+        regime = rooms.ACTOR_ISO_ENFORCED if gateway_hard else rooms.ACTOR_SHARED_ADVISORY
         decision_actor = gateway_actor
     else:
         # Not behind the gateway: resolve the actor from the PROCESS OS identity
