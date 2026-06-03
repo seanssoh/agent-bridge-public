@@ -6,6 +6,14 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.16.0-beta2] — 2026-06-04
+
+A **beta hotfix** on `0.16.0-beta1` — fixes a launch-blocking isolation bug (#1513) surfaced during beta1 Linux validation, so a freshly-provisioned isolated agent with a `plugin:teams` channel starts correctly. Same `agb upgrade` path; no schema/contract change vs beta1.
+
+### Fixed
+
+- **Isolated `plugin:teams` agent aborts at launch on a 0700 legacy mirror (#1513, via #1514).** A sibling facet of #1506/#1508 on the tree that fix did not cover. `bridge-run.sh` runs the legacy Teams-MCP prune **as the iso user** against the legacy `$BRIDGE_AGENT_HOME_ROOT/<a>` mirror; on a freshly-created isolated agent that mirror dir was scaffolded `0700` (controller umask), so the iso user can't traverse it and `Path.is_file()` raises `EACCES` — which Python 3.10's `is_file()` does **not** swallow — crashing the prune with an uncaught traceback that `bridge-run.sh` hardened into `aborting launch: stale Teams MCP cleanup failed` (the webhook port never binds). Two-layer fix: **(1)** `prune-legacy-teams-mcp.py::prune_file()` now catches the existence-probe `OSError` and returns a non-fatal `skipped … reason=stat-failed:<errno>` (a prune helper that can't *read* a stale-entry candidate must never abort a launch; genuine prune-action failures still fail loud); **(2)** the isolate path (`bridge_linux_prepare_agent_isolation`, beside the #1506 normalization) now sets the "other" traverse bit on the legacy mirror **dir** (`0755` dir only — inner `0600` files and owner/group untouched), covering both `create --isolate` and `isolate`/`--reapply`. Linux iso v2 only.
+
 ## [0.16.0-beta1] — 2026-06-04
 
 A **beta** introducing **A2A Rooms** — a new room / leader (방장) / join-on-approval model that unifies internal-team messaging and cross-bridge A2A under one membership boundary, replacing all-to-all internal A2A and the N²-edge external pairing. Shipped on a beta tag for live testing; this cut lands the **single-node** foundation (control plane + iso-enforced ACL). Also lands the **#1497 HOME/path SSOT** (Phase 1+2) and the **#1506 isolate group/mode normalization** fix. Every item is codex pair-reviewed; the A2A security boundary went through multiple adversarial review rounds (the iso-actor trust model is the load-bearing piece).
