@@ -120,6 +120,45 @@ else
 	fail "D1b bridge_agent_engine/workdir did not return the expected fallback values"
 fi
 
+# --- D1c: marker-bearing scalar/indexed values (the #1457 r1 false-positive) --
+# codex (PR #1457 r1) showed an UNANCHORED `declare -p | grep 'declare -A'` also
+# matched a scalar/indexed variable whose VALUE merely contains the text
+# "declare -A" — re-introducing the very `set -u` abort the guard prevents. The
+# flag-field anchored bridge_var_is_assoc must treat these as NON-assoc: engine
+# degrades to unknown, workdir falls through to the default resolver, no abort.
+d1c_out="$(
+	"$BASH4" -c '
+		set -u
+		source "'"$SCRIPT_DIR"'/lib/bridge-core.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-state.sh" 2>/dev/null || true
+		source "'"$SCRIPT_DIR"'/lib/bridge-agents.sh" 2>/dev/null || true
+		BRIDGE_AGENT_ROOT_V2=
+		BRIDGE_AGENT_HOME_ROOT="/tmp/agb-1407-home"
+		# scalar whose VALUE contains the associative flag text
+		BRIDGE_AGENT_ENGINE="declare -A"
+		BRIDGE_AGENT_WORKDIR="declare -A"
+		printf "D1C_ENGINE_SCALARMARK=[%s]\n" "$(bridge_agent_engine some-agent)"
+		printf "D1C_WORKDIR_SCALARMARK=[%s]\n" "$(bridge_agent_workdir some-agent)"
+		# indexed array whose element contains the associative flag text
+		unset BRIDGE_AGENT_ENGINE BRIDGE_AGENT_WORKDIR 2>/dev/null || true
+		declare -a BRIDGE_AGENT_ENGINE=("declare -A")
+		declare -a BRIDGE_AGENT_WORKDIR=("declare -A")
+		printf "D1C_ENGINE_INDEXMARK=[%s]\n" "$(bridge_agent_engine some-agent)"
+		printf "D1C_WORKDIR_INDEXMARK=[%s]\n" "$(bridge_agent_workdir some-agent)"
+	' 2>&1
+)" || true
+printf '%s\n' "$d1c_out"
+if printf '%s' "$d1c_out" | grep -q 'unbound variable'; then
+	fail "D1c engine/workdir aborted on a marker-bearing scalar/indexed value (#1457 r1 false-positive)"
+elif printf '%s' "$d1c_out" | grep -q 'D1C_ENGINE_SCALARMARK=\[unknown\]' \
+	&& printf '%s' "$d1c_out" | grep -q 'D1C_ENGINE_INDEXMARK=\[unknown\]' \
+	&& printf '%s' "$d1c_out" | grep -q 'D1C_WORKDIR_SCALARMARK=\[/tmp/agb-1407-home/some-agent\]' \
+	&& printf '%s' "$d1c_out" | grep -q 'D1C_WORKDIR_INDEXMARK=\[/tmp/agb-1407-home/some-agent\]'; then
+	pass "D1c bridge_var_is_assoc rejects marker-bearing scalar/indexed values (#1457 r1)"
+else
+	fail "D1c marker-bearing scalar/indexed did not degrade to unknown/default"
+fi
+
 # --- D2-accessor: bridge_agent_created_at degrades to default on non-assoc ----
 # The #1407 D2 created-at reads now route through ONE central guarded accessor
 # (bridge_agent_created_at, lib/bridge-agents.sh). codex (PR #1410 r1) showed

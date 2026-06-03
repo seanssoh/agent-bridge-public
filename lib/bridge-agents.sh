@@ -854,11 +854,30 @@ bridge_agent_desc() {
   printf '%s' "${BRIDGE_AGENT_DESC[$agent]-}"
 }
 
+# bridge_var_is_assoc <varname> — return 0 iff <varname> is currently a set
+# associative array. The test is ANCHORED to the `declare -p` flag field (the
+# token between `declare -` and the variable name) so a scalar/indexed variable
+# whose VALUE merely contains the text "declare -A" cannot false-positive
+# (#1457 codex r1: an unanchored `grep 'declare -[A-Za-z]*A'` over the full
+# `declare -p` output matched `BRIDGE_AGENT_ENGINE="declare -A"` and fell through
+# to the aborting indexed read). Safe under `set -u`.
+bridge_var_is_assoc() {
+  local _decl _flags
+  _decl="$(declare -p "$1" 2>/dev/null)" || return 1
+  _flags="${_decl#declare -}"   # `declare -A name=(...)` -> `A name=(...)`
+  _flags="${_flags%% *}"        # keep only the flag token   -> `A` / `-` / `ax`
+  case "$_flags" in
+    *A*) return 0 ;;
+    *)   return 1 ;;
+  esac
+}
+
 bridge_agent_engine() {
   local agent="$1"
-  # #1407/#1213: guard the read without redeclaring; scalar-clobbered maps
-  # arithmetic-index agent ids under `set -u` and abort.
-  if ! declare -p BRIDGE_AGENT_ENGINE 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+  # #1407/#1213: scalar-clobbered maps arithmetic-index agent ids under `set -u`
+  # and abort. Guard with the flag-field anchored check (#1457 r1) so a scalar/
+  # indexed value containing the text "declare -A" can't slip into the read.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_ENGINE; then
     printf '%s' 'unknown'
     return 0
   fi
@@ -5290,8 +5309,10 @@ bridge_agent_workdir() {
   local agent="$1"
   local explicit=""
   # #1407/#1213: if the map is unset or scalar-clobbered, fall through to
-  # existing v2/default resolution instead of aborting under `set -u`.
-  if declare -p BRIDGE_AGENT_WORKDIR 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+  # existing v2/default resolution instead of aborting under `set -u`. Use the
+  # flag-field anchored check (#1457 r1) so a scalar/indexed value containing the
+  # text "declare -A" can't false-positive into the aborting indexed read.
+  if bridge_var_is_assoc BRIDGE_AGENT_WORKDIR; then
     explicit="${BRIDGE_AGENT_WORKDIR[$agent]-}"
   fi
 
