@@ -111,6 +111,10 @@ add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-
 add_required 1425-cron-dispatch-nudge-scope
 add_required 1936-forward-followup-attached-escalation
 add_required 1473-agent-list-iso-state-fallback
+# #8945 Track B: expanded Codex hook coverage (PreCompact / PostCompact /
+# SubagentStart / SubagentStop / PermissionRequest). All audit-only by default;
+# the permission-request smoke pins the security contract.
+add_required codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook
 # Incident #8807 P1: in the full static suite so a change to the coalesce smoke
 # helper (scripts/smoke/8807-cron-backfill-coalesce-helper.py) — which hits the
 # scripts/smoke/* catch-all → add_all_required_static — still re-runs the
@@ -1957,6 +1961,20 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_integration integration-minimal
       ;;
 
+    hooks/codex-pre-compact.py|hooks/codex-post-compact.py|hooks/codex-subagent-start.py|hooks/codex-subagent-stop.py|hooks/codex-permission-request.py)
+      # #8945 Track B — expanded Codex hook coverage (PreCompact /
+      # PostCompact / SubagentStart / SubagentStop / PermissionRequest), all
+      # audit-only by default. Each new hook has a focused smoke; the
+      # PermissionRequest smoke additionally pins the security contract
+      # (redaction, dedupe/throttle, no-default-side-effect, and the
+      # auto-queue teeth). codex-companion-hooks is pulled too because it is
+      # the source-of-truth for the ensure-codex-hooks render wiring these
+      # events extend. This arm precedes the generic hooks/* catch-all so a
+      # change to one of these hooks runs the targeted Track B smokes.
+      add_required codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook codex-companion-hooks hooks
+      add_integration integration-minimal
+      ;;
+
     hooks/*|bridge-hooks.py|lib/bridge-hooks.sh)
       # Issue #544 PR2 — bridge-hooks.py grew the
       # `render-isolated-home-settings` subcommand and lib/bridge-hooks.sh
@@ -2048,7 +2066,13 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # top_claimed_row. Pull 1199-action-required-claimed-skip on every
       # hooks/* move so a future patch cannot re-add claimed to the ACTION
       # REQUIRED count or drop the codex continue-claimed-work block.
-      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1205-hook-iso-fail-open 1212-bridge-hooks-marketplace 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers 1358-admin-credential-routine-exempt 1199-action-required-claimed-skip
+      # #8945 Track B: bridge-hooks.py's cmd_ensure_codex_hooks now renders 5
+      # additional Codex events (PreCompact / PostCompact / SubagentStart /
+      # SubagentStop / PermissionRequest) at hooks/codex-*.py. Pull the Track B
+      # per-hook smokes so a change to the renderer re-runs the render-wiring +
+      # PermissionRequest security (redaction / throttle / no-side-effect / teeth)
+      # assertions.
+      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1205-hook-iso-fail-open 1212-bridge-hooks-marketplace 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers 1358-admin-credential-routine-exempt 1199-action-required-claimed-skip codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook
       add_integration integration-minimal
       ;;
 
