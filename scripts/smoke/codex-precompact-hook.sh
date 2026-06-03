@@ -32,11 +32,20 @@ REPO_ROOT="$SMOKE_REPO_ROOT"
 PYTHON_BIN="$(command -v python3)"
 HOOKS_DIR="$REPO_ROOT/hooks"
 TEST_AGENT="codex-precompact-smoke"
+# scripts/smoke/lib.sh sets a v2 split-layout env (BRIDGE_AGENT_ROOT_V2), so the
+# v2-aware hook layer (#1497/#1501) resolves the agent identity home to
+# <root_v2>/<a>/home — mirroring bash bridge_agent_default_home, which returns
+# the v2 path unconditionally when BRIDGE_AGENT_ROOT_V2 is set. Seed the canonical
+# files at BOTH the v2 identity home (what the hook reads here) and the legacy
+# path (so the smoke is robust if the harness ever drops the v2 signal).
+AGENT_HOME_V2="${BRIDGE_AGENT_ROOT_V2:-$BRIDGE_HOME/data/agents}/$TEST_AGENT/home"
 AGENT_HOME="$BRIDGE_HOME/agents/$TEST_AGENT"
-mkdir -p "$AGENT_HOME"
-printf '# soul\nload-bearing identity anchor\n' >"$AGENT_HOME/SOUL.md"
-printf '# memory\nremember this\n' >"$AGENT_HOME/MEMORY.md"
-printf '# handoff\nread me first\n' >"$AGENT_HOME/NEXT-SESSION.md"
+mkdir -p "$AGENT_HOME_V2" "$AGENT_HOME"
+for _dst in "$AGENT_HOME_V2" "$AGENT_HOME"; do
+  printf '# soul\nload-bearing identity anchor\n' >"$_dst/SOUL.md"
+  printf '# memory\nremember this\n' >"$_dst/MEMORY.md"
+  printf '# handoff\nread me first\n' >"$_dst/NEXT-SESSION.md"
+done
 
 # ---------------------------------------------------------------------------
 # Test 1 — ensure-codex-hooks wires PreCompact
