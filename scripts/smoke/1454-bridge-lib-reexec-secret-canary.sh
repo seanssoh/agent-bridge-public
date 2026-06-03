@@ -624,6 +624,17 @@ elif base_sha="$(git -C "$REPO_ROOT" merge-base HEAD origin/main 2>/dev/null)" &
      && git -C "$REPO_ROOT" show "$base_sha:bridge-lib.sh" > "$VULN_LIB" 2>/dev/null && [[ -s "$VULN_LIB" ]]; then
   got_base=1
 fi
+# Moving-base guard: once #1454 is merged to origin/main, the "git base" copy
+# of bridge-lib.sh IS the FIXED version, not a vulnerable pre-fix one — using it
+# as the TEETH reference would (correctly) NOT leak and falsely "break" the
+# teeth on every PR that selects this static suite. Only treat $VULN_LIB as a
+# valid pre-fix reference if it actually LACKS the #1454 hardening (the
+# bridge-secret-scrub primitive source). If the base is already fixed, skip this
+# plain TEETH — the synthesized TEETH-GAP/TRAP/LOCAL cases (which revert the fix
+# from the CURRENT tree, no moving-base dependency) already prove the teeth.
+if (( got_base )) && grep -q 'bridge-secret-scrub' "$VULN_LIB" 2>/dev/null; then
+  got_base=0
+fi
 if (( got_base )); then
   # The vuln copy lives in $WORK, not the repo root, so its self-dir resolves to
   # $WORK and it won't find lib/bridge-secret-scrub.sh — which is correct: the
@@ -641,7 +652,7 @@ if (( got_base )); then
   rm -f "$VULN_IN_TREE"
   trap cleanup EXIT
 else
-  echo "  SKIP  TEETH — could not obtain a pre-fix bridge-lib.sh (no origin/main); A/B/C still assert the fix"
+  echo "  SKIP  TEETH — no usable pre-fix bridge-lib.sh (origin/main absent, or already carries the #1454 fix so it is not a vulnerable reference); A/B/C/D/E/F/G/H assert the fix and the synthesized TEETH-GAP/TRAP/LOCAL prove the teeth without a moving-base dependency"
 fi
 
 if (( failed )); then
