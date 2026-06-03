@@ -66,13 +66,31 @@ write_driver() {
     'CODEX_HOME="$BRIDGE_AGENT_ROOT_V2/$CODEX_AGENT/home"' \
     'CLAUDE_HOME="$BRIDGE_AGENT_ROOT_V2/$CLAUDE_AGENT/home"' \
     'mkdir -p "$CODEX_HOME" "$CLAUDE_HOME"' \
-    '# ---- T1: S03 — AGENTS.md scaffolded for codex, not for claude ----' \
+    '# ---- T1: S03 + #8945 Track A — AGENTS.md scaffolded for codex from the' \
+    '#       dedicated codex template (explicit Task Processing Protocol),' \
+    '#       not for claude ----' \
     '# Codex identity source: place CLAUDE.md (as scaffold does), then call entrypoint helper.' \
     'printf "%s\n" "# codex role contract" > "$CODEX_HOME/CLAUDE.md"' \
     'bridge_scaffold_codex_entrypoint "$CODEX_HOME" codex 2>/dev/null || true' \
     'if [[ -f "$CODEX_HOME/AGENTS.md" ]]; then echo "T1_CODEX_AGENTS_MD: present"; else echo "T1_CODEX_AGENTS_MD: missing"; fi' \
-    '# T1 verify content: AGENTS.md must match CLAUDE.md (same canonical payload).' \
-    'if [[ -f "$CODEX_HOME/AGENTS.md" ]] && diff -q "$CODEX_HOME/CLAUDE.md" "$CODEX_HOME/AGENTS.md" >/dev/null 2>&1; then echo "T1_AGENTS_MD_CONTENT_MATCH: yes"; else echo "T1_AGENTS_MD_CONTENT_MATCH: no"; fi' \
+    '# #8945 Track A: AGENTS.md now comes from agents/_template/codex/AGENTS.md,' \
+    '# so it must carry the explicit Task Processing Protocol marker (the Claude' \
+    '# CLAUDE.md leaves the protocol implicit — the exact wedge this closes).' \
+    'if [[ -f "$CODEX_HOME/AGENTS.md" ]] && grep -qF "Task Processing Protocol" "$CODEX_HOME/AGENTS.md" 2>/dev/null; then echo "T1_AGENTS_MD_HAS_PROTOCOL: yes"; else echo "T1_AGENTS_MD_HAS_PROTOCOL: no"; fi' \
+    'if [[ -f "$CODEX_HOME/AGENTS.md" ]] && grep -qF "agb done" "$CODEX_HOME/AGENTS.md" 2>/dev/null; then echo "T1_AGENTS_MD_HAS_DONE: yes"; else echo "T1_AGENTS_MD_HAS_DONE: no"; fi' \
+    '# #8945 Track A: from the codex template, AGENTS.md is the protocol doc,' \
+    '# NOT a byte copy of the role-stub CLAUDE.md.' \
+    'if [[ -f "$CODEX_HOME/AGENTS.md" ]] && ! diff -q "$CODEX_HOME/CLAUDE.md" "$CODEX_HOME/AGENTS.md" >/dev/null 2>&1; then echo "T1_AGENTS_MD_FROM_TEMPLATE: yes"; else echo "T1_AGENTS_MD_FROM_TEMPLATE: no"; fi' \
+    '# T1 teeth-check: with the codex template hidden (BRIDGE_SCRIPT_DIR pointed' \
+    '# at a templateless tree), the helper falls back to the CLAUDE.md -> AGENTS.md' \
+    '# copy (pre-#8945 behavior preserved on older source trees).' \
+    'FALLBACK_HOME="$BRIDGE_AGENT_ROOT_V2/fallback-codex/home"' \
+    'mkdir -p "$FALLBACK_HOME"' \
+    'printf "%s\n" "# fallback codex role contract" > "$FALLBACK_HOME/CLAUDE.md"' \
+    'NO_TEMPLATE_ROOT="$DRIVER_TMP_DIR/no-template-root"' \
+    'mkdir -p "$NO_TEMPLATE_ROOT"' \
+    '( BRIDGE_SCRIPT_DIR="$NO_TEMPLATE_ROOT"; bridge_scaffold_codex_entrypoint "$FALLBACK_HOME" codex 2>/dev/null || true )' \
+    'if [[ -f "$FALLBACK_HOME/AGENTS.md" ]] && diff -q "$FALLBACK_HOME/CLAUDE.md" "$FALLBACK_HOME/AGENTS.md" >/dev/null 2>&1; then echo "T1_FALLBACK_COPY: yes"; else echo "T1_FALLBACK_COPY: no"; fi' \
     '# Claude identity source: place CLAUDE.md but do NOT call entrypoint helper (no-op for claude).' \
     'printf "%s\n" "# claude role contract" > "$CLAUDE_HOME/CLAUDE.md"' \
     'bridge_scaffold_codex_entrypoint "$CLAUDE_HOME" claude 2>/dev/null || true' \
@@ -137,11 +155,17 @@ if [[ $RC -ne 0 ]]; then
 $OUT"
 fi
 
-# T1: S03 assertions.
+# T1: S03 + #8945 Track A assertions.
 smoke_assert_eq "present" "$(extract_line "$OUT" "T1_CODEX_AGENTS_MD")" \
   "T1: AGENTS.md present in codex identity source after bridge_scaffold_codex_entrypoint"
-smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_AGENTS_MD_CONTENT_MATCH")" \
-  "T1: AGENTS.md content matches CLAUDE.md (same canonical role payload)"
+smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_AGENTS_MD_HAS_PROTOCOL")" \
+  "T1 (#8945 A): AGENTS.md carries the explicit Task Processing Protocol marker (from codex template)"
+smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_AGENTS_MD_HAS_DONE")" \
+  "T1 (#8945 A): AGENTS.md encodes the 'agb done' close step"
+smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_AGENTS_MD_FROM_TEMPLATE")" \
+  "T1 (#8945 A): AGENTS.md is the protocol doc, not a byte copy of the role-stub CLAUDE.md"
+smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_FALLBACK_COPY")" \
+  "T1 teeth (#8945 A): codex template absent => helper falls back to CLAUDE.md -> AGENTS.md copy"
 smoke_assert_eq "missing" "$(extract_line "$OUT" "T1_CLAUDE_AGENTS_MD")" \
   "T1: AGENTS.md NOT written for claude agent (no-op for claude engine)"
 
@@ -215,4 +239,61 @@ fi
 
 smoke_log "T3_UPGRADE_PROPAGATE: hooks.json created at $UPGRADE_HOOK_PATH"
 
-smoke_log "all tests PASS — issue #1067 CODEX-PROV: S02/S03/S08 full provisioning + upgrade propagation"
+# ---- T4 (#8945 Track A): every agb verb/flag in the codex AGENTS.md template
+#      must match the real CLI contract ----
+#
+# The codex AGENTS.md template is the literal command source a Codex agent
+# copy-pastes. A non-existent verb (e.g. the removed `agb whoami`) or a
+# wrong-per-verb flag (e.g. `agb update --agent` — update takes `--actor`,
+# while claim/done take `--agent`) makes the agent's recovery commands fail at
+# runtime. This block pins the contract against the SAME template the scaffold
+# ships, so a future edit that re-introduces an unsupported verb or the wrong
+# flag fails CI at PR time. The contract is hardcoded (hermetic — CI has no
+# live `agb`), validated against `agb <verb> --help` while authoring #8945
+# Track A r2.
+CODEX_TEMPLATE="$REPO_ROOT/agents/_template/codex/AGENTS.md"
+smoke_assert_file_exists "$CODEX_TEMPLATE" "T4: codex AGENTS.md template must exist"
+
+# T4a: the removed verb `agb whoami` must never reappear (it does not exist;
+# `agb whoami` → `[오류] 지원하지 않는 명령입니다: whoami`). The id source is
+# the $BRIDGE_AGENT_ID env var, not a lookup verb.
+if grep -nE '\bagb[[:space:]]+whoami\b' "$CODEX_TEMPLATE" >/dev/null 2>&1; then
+  smoke_fail "T4a (#8945 A): codex AGENTS.md references the non-existent 'agb whoami' verb — use \$BRIDGE_AGENT_ID instead"
+fi
+
+# T4b: `agb update` takes `--actor`, NOT `--agent`. Flag a same-line pairing of
+# an `agb update ...` invocation with `--agent` (the exact codex-flagged bug).
+if grep -nE '\bagb[[:space:]]+update\b[^`]*--agent\b' "$CODEX_TEMPLATE" >/dev/null 2>&1; then
+  smoke_fail "T4b (#8945 A): codex AGENTS.md uses 'agb update ... --agent' — update takes --actor (claim/done take --agent)"
+fi
+
+# T4c: every agb verb invoked in the template must be a real agb verb. The
+# allowlist is the documented queue + task surface a worker legitimately uses.
+# An unknown verb (typo or a renamed CLI) fails here. `agb task <sub>` is
+# validated as the `task` verb (the sub-verb is task's own arg).
+T4_VALID_AGB_VERBS=" inbox show claim done update task handoff summary create cancel "
+# Extract `agb <verb>` pairs from fenced/inline command spans into a temp file,
+# then read from that file. We deliberately avoid a `< <(...)` process
+# substitution here: lint-heredoc-ban (H3) flags a here-string/procsub feeding
+# a non-interpreter consumer (footgun #11 family). The temp file honors $TMPDIR
+# via mktemp and is cleaned up immediately after the loop. We scan the raw
+# file; the "Note:" prose line that names verbs descriptively (agb claim / agb
+# done / agb update) is covered too — those are all valid verbs, so it passes.
+T4_BAD_VERBS=""
+T4_VERBS_TMP="$(mktemp "${TMPDIR:-/tmp}/codex-agb-verbs.XXXXXX")"
+grep -oE '\bagb[[:space:]]+[a-z][a-z-]*' "$CODEX_TEMPLATE" | awk '{print $2}' | sort -u >"$T4_VERBS_TMP"
+while IFS= read -r verb; do
+  [[ -n "$verb" ]] || continue
+  case "$T4_VALID_AGB_VERBS" in
+    *" $verb "*) ;;
+    *) T4_BAD_VERBS="$T4_BAD_VERBS $verb" ;;
+  esac
+done <"$T4_VERBS_TMP"
+rm -f "$T4_VERBS_TMP"
+if [[ -n "$T4_BAD_VERBS" ]]; then
+  smoke_fail "T4c (#8945 A): codex AGENTS.md invokes unknown agb verb(s):$T4_BAD_VERBS (not in: $T4_VALID_AGB_VERBS)"
+fi
+
+smoke_log "T4_AGB_CONTRACT: all agb verbs/flags in codex AGENTS.md match the CLI contract"
+
+smoke_log "all tests PASS — issue #1067 CODEX-PROV: S02/S03/S08 full provisioning + upgrade propagation + #8945 A agb-contract"

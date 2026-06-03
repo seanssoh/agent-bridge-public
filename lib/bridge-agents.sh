@@ -10164,18 +10164,37 @@ bridge_upsert_env_value() {
   mv "$tmp_file" "$env_file"
 }
 
-# bridge_scaffold_codex_entrypoint <home> <engine>
+# bridge_scaffold_codex_entrypoint <home> <engine> [agent] [display_name] [role_text] [session_type]
 #
-# Issue #1067 S03: write AGENTS.md as the engine-native entrypoint for a
-# Codex agent into its identity source (agent_home). The template scaffold
-# loop places CLAUDE.md for every engine (the template only has CLAUDE.md);
-# for Codex the native instruction-file convention is AGENTS.md. This
-# function creates AGENTS.md as a copy of CLAUDE.md in the same directory
-# so the Codex runtime finds its role contract under the canonical filename,
-# and bridge_layout_materialize_identity then delivers AGENTS.md into the
+# Issue #1067 S03 + #8945 Track A: write AGENTS.md as the engine-native
+# entrypoint for a Codex agent into its identity source (agent_home). The
+# template scaffold loop places CLAUDE.md for every engine (the shared
+# template only has CLAUDE.md); for Codex the native instruction-file
+# convention is AGENTS.md, and Codex needs an explicit Task Processing
+# Protocol that the Claude CLAUDE.md leaves implicit (it relies on the
+# agent-bridge Claude skill to expand a one-line `agb inbox` nudge into the
+# full claim→process→done workflow — Codex interprets that line literally and
+# stops after listing the inbox, the #8945 wedge).
+#
+# Source selection (engine-aware):
+#   * Codex: prefer the dedicated `agents/_template/codex/AGENTS.md` template
+#     (an explicit, linear protocol document). When present it is rendered
+#     with the same per-agent placeholder substitution the CLAUDE.md scaffold
+#     uses and written as the agent's AGENTS.md.
+#   * Fallback (codex template absent, e.g. an older source tree): copy the
+#     already-rendered CLAUDE.md to AGENTS.md — the pre-#8945 behavior, so
+#     there is no regression on trees that predate the codex template.
+#
+# bridge_layout_materialize_identity then delivers AGENTS.md into the
 # workspace (the descriptor already lists the engine entrypoint in its copy
 # set). Safe to call for any engine — it is a no-op when the descriptor
-# entrypoint is CLAUDE.md (i.e., not Codex).
+# entrypoint is CLAUDE.md (i.e., not Codex). The Claude path is untouched.
+#
+# The trailing per-agent args are optional: when omitted (e.g. a lib-only
+# smoke driver or an internal caller that has not threaded identity), the
+# template is rendered with a self-contained best-effort substitution and any
+# unresolved cosmetic placeholders simply remain — the protocol body itself
+# carries no per-agent placeholders, so it stays correct either way.
 #
 # Called from bridge-agent.sh (post-scaffold, before materialize) and
 # available from lib so smoke drivers sourcing bridge-lib.sh can assert
@@ -10183,13 +10202,56 @@ bridge_upsert_env_value() {
 bridge_scaffold_codex_entrypoint() {
   local home="$1"
   local engine="$2"
+  local agent="${3:-}"
+  local display_name="${4:-}"
+  local role_text="${5:-}"
+  local session_type="${6:-}"
   [[ -n "$home" && -n "$engine" ]] || return 0
   local entrypoint=""
   if declare -F bridge_engine_entrypoint_filename >/dev/null 2>&1; then
     entrypoint="$(bridge_engine_entrypoint_filename "$engine" 2>/dev/null || printf '')"
   fi
   [[ -n "$entrypoint" && "$entrypoint" != "CLAUDE.md" ]] || return 0
-  [[ -f "$home/CLAUDE.md" ]] || return 0
   [[ -f "$home/$entrypoint" ]] && return 0
+
+  # Engine-aware source: prefer the dedicated codex template.
+  local codex_template=""
+  if [[ -n "${BRIDGE_SCRIPT_DIR:-}" ]]; then
+    codex_template="$BRIDGE_SCRIPT_DIR/agents/_template/codex/AGENTS.md"
+  fi
+  if [[ -n "$codex_template" && -f "$codex_template" ]]; then
+    # Full-fidelity render when the bridge-agent.sh renderer is available
+    # (the real `agent create` path). Mirrors the CLAUDE.md scaffold so the
+    # codex AGENTS.md gets the identical per-agent placeholder substitution.
+    if declare -F bridge_render_template_string >/dev/null 2>&1; then
+      bridge_render_template_string \
+        "$codex_template" "$agent" "$display_name" "$role_text" \
+        "$engine" "$session_type" >"$home/$entrypoint" 2>/dev/null && return 0
+    fi
+    # Self-contained fallback render (lib-only contexts without the
+    # bridge-agent.sh renderer): copy the template and apply the same
+    # cosmetic placeholder substitutions in pure Bash. Unresolved
+    # placeholders are harmless — the protocol body carries none.
+    local runtime="Codex CLI"
+    [[ "$engine" == "claude" ]] && runtime="Claude Code CLI"
+    local rendered=""
+    if rendered="$(cat "$codex_template" 2>/dev/null)"; then
+      rendered="${rendered//<Agent Name>/${display_name:-$agent}}"
+      rendered="${rendered//<agent-id>/$agent}"
+      rendered="${rendered//<Role>/${role_text:-}}"
+      rendered="${rendered//<Runtime>/$runtime}"
+      rendered="${rendered//<한 줄 역할 설명>/${role_text:-}}"
+      rendered="${rendered//<표시 이름>/${display_name:-$agent}}"
+      rendered="${rendered//<핵심 책임>/${role_text:-}}"
+      rendered="${rendered//<주 요청자>/관리자 에이전트}"
+      rendered="${rendered//<반드시 지킬 운영 규칙>/큐를 source of truth로 삼고, claim/done note를 생략하지 않는다.}"
+      rendered="${rendered//<위험 작업 제한>/크리티컬 변경 전에는 dry-run 또는 관련 상태 확인을 먼저 수행한다.}"
+      rendered="${rendered//<보고 방식>/결과는 요청자 채널 또는 task queue로 반드시 남긴다.}"
+      printf '%s' "$rendered" >"$home/$entrypoint" 2>/dev/null && return 0
+    fi
+  fi
+
+  # Fallback (codex template absent): pre-#8945 CLAUDE.md → AGENTS.md copy.
+  [[ -f "$home/CLAUDE.md" ]] || return 0
   cp -f "$home/CLAUDE.md" "$home/$entrypoint" 2>/dev/null || true
 }

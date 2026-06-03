@@ -72,6 +72,31 @@ urgent_task_body() {
   printf '%s' "$message"
 }
 
+# urgent_nudge_body <target> <engine>
+#
+# Issue #8945 Track A: the engine-aware urgent-nudge body.
+#
+# A Claude target auto-expands the concise one-line `agb inbox <id>` body into
+# the full claim→process→done workflow via the agent-bridge Claude skill, so
+# the terse form is correct (and preserves the historical behavior). A Codex
+# target interprets that one line literally — it prints the inbox and returns
+# idle without claiming/processing/closing the task (the #8945 patch-dev wedge
+# → repeated watchdog escalation). For Codex we emit an explicit multi-step
+# body that names every step so the literal reading still runs the whole
+# protocol. Engine resolution is fail-safe: an unresolved engine ("unknown" /
+# empty / anything but "codex") falls back to the historical one-line body so
+# a roster gap can never break the nudge.
+urgent_nudge_body() {
+  local target="$1"
+  local engine="$2"
+  if [[ "$engine" == "codex" ]]; then
+    printf 'Queue task waiting. Run the full protocol, do not stop after step 1: (1) ~/.agent-bridge/agb inbox %s  (2) ~/.agent-bridge/agb claim <id> --agent %s (top queued task)  (3) ~/.agent-bridge/agb show <id> and read its body  (4) do the work  (5) ~/.agent-bridge/agb done <id> --agent %s --note "<result>" (--note required).' \
+      "$target" "$target" "$target"
+  else
+    printf 'agb inbox %s' "$target"
+  fi
+}
+
 LIST_ONLY=0
 URGENT_ONLY=0
 TARGET=""
@@ -153,7 +178,12 @@ fi
 bridge_queue_source_shell "${CREATE_ARGS[@]}"
 
 SESSION="$(bridge_agent_session "$TARGET")"
-NOTICE_MESSAGE="agb inbox ${TARGET}"
+
+# Issue #8945 Track A: resolve the target engine (fail-safe — an unresolvable
+# agent yields "unknown", which urgent_nudge_body maps to the historical
+# one-line body) and compute the engine-aware nudge body.
+TARGET_ENGINE="$(bridge_agent_engine "$TARGET" 2>/dev/null || printf 'unknown')"
+NOTICE_MESSAGE="$(urgent_nudge_body "$TARGET" "$TARGET_ENGINE")"
 
 mkdir -p "$BRIDGE_LOG_DIR"
 TIMESTAMP="$(date '+%H:%M:%S')"
