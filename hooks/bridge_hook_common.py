@@ -218,6 +218,19 @@ def agent_workdir(agent: str) -> Path:
             v2_workdir = root_v2 / agent / "workdir"
             if v2_workdir.is_dir():
                 return v2_workdir
+            # #1501 r1: v2 is signalled but <root_v2>/<a>/workdir does NOT
+            # exist — this is a dynamic / shared-mode agent whose real workdir
+            # is a project directory resolved via the roster, NOT the identity
+            # home. We must NOT let the legacy `default.is_dir()` short-circuit
+            # below win here: under v2 `agent_default_home` returns
+            # <root_v2>/<a>/home, which ALWAYS exists, so it would return the
+            # identity home and the roster fallback (the only path that finds
+            # <project-workdir>/NEXT-SESSION.md) would never run. Consult the
+            # roster FIRST, then degrade to the identity home as a last resort.
+            roster_workdir = _resolve_workdir_via_roster(agent)
+            if roster_workdir is not None:
+                return roster_workdir
+            return agent_default_home(agent)
     default = agent_default_home(agent)
     if default.is_dir():
         return default

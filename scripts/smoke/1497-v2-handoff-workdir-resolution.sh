@@ -81,13 +81,21 @@ fi
 FIX="$SMOKE_DIR/bridge"
 V2_AGENT="patchy"
 LEGACY_AGENT="lego"
+# DYN_AGENT reproduces the v2 dynamic / shared-mode shape: its v2 IDENTITY HOME
+# exists but it has NO <root_v2>/<a>/workdir on disk — its real workdir is a
+# project directory resolved via the roster CLI (#1501 r1 / #509 D wave).
+DYN_AGENT="dyna"
+DYN_PROJECT_WORKDIR="$FIX/projects/dyna-checkout"
 mkdir -p \
   "$FIX/data/agents/$V2_AGENT/home" \
   "$FIX/data/agents/$V2_AGENT/workdir" \
   "$FIX/agents/$V2_AGENT" \
-  "$FIX/agents/$LEGACY_AGENT"
+  "$FIX/agents/$LEGACY_AGENT" \
+  "$FIX/data/agents/$DYN_AGENT/home" \
+  "$DYN_PROJECT_WORKDIR"
 printf 'v2 handoff payload\n' >"$FIX/data/agents/$V2_AGENT/workdir/NEXT-SESSION.md"
 printf 'legacy handoff payload\n' >"$FIX/agents/$LEGACY_AGENT/NEXT-SESSION.md"
+printf 'dynamic project handoff payload\n' >"$DYN_PROJECT_WORKDIR/NEXT-SESSION.md"
 
 # Driver loads the resolver module (path from DRIVER_HOOK_COMMON_PATH) and
 # prints WORKDIR=/HOME=/HANDOFF= lines for the requested agent. The smoke env
@@ -113,6 +121,11 @@ DRIVER="$SMOKE_DIR/driver.py"
   printf '%s\n' 'def main() -> int:'
   printf '%s\n' '    common_path = Path(os.environ["DRIVER_HOOK_COMMON_PATH"])'  # noqa: iso-helper-boundary
   printf '%s\n' '    module = load_module(common_path)'
+  # #1501 r1: optionally stub the roster fallback so the v2 dynamic/shared-mode
+  # case (no on-disk v2 workdir) can be exercised without a live agent-bridge CLI.
+  printf '%s\n' '    roster_wd = os.environ.get("DRIVER_ROSTER_WORKDIR", "").strip()'  # noqa: iso-helper-boundary
+  printf '%s\n' '    if roster_wd:'
+  printf '%s\n' '        module._resolve_workdir_via_roster = lambda a, _p=Path(roster_wd): _p'
   printf '%s\n' '    agent = os.environ.get("DRIVER_AGENT", "patchy")'  # noqa: iso-helper-boundary
   printf '%s\n' '    wd = module.agent_workdir(agent)'
   printf '%s\n' '    dh = module.agent_default_home(agent)'
@@ -301,6 +314,34 @@ elif [[ "$RESOLVED_LINE" -lt "$SHORTCIRCUIT_LINE" ]]; then
   _pass "T6: source guard — agent_workdir reads RESOLVED before the legacy short-circuit"
 else
   _fail "T6" "agent_workdir reads RESOLVED (line $RESOLVED_LINE) AFTER the legacy short-circuit (line $SHORTCIRCUIT_LINE)"
+fi
+
+# ---------------------------------------------------------------------------
+# T7 — v2 dynamic / shared-mode: the roster fallback MUST stay reachable.
+# v2 signalled, RESOLVED unset, the agent's v2 IDENTITY HOME exists but it has
+# NO <root_v2>/<a>/workdir on disk (its real workdir is a project dir resolved
+# via the roster). agent_workdir must consult the roster and return the project
+# workdir — NOT short-circuit to the identity home. (#1501 r1 BLOCKING: the v2
+# branch returned <root_v2>/<a>/home and the roster fallback never ran, so a
+# dynamic agent's <project>/NEXT-SESSION.md handoff was missed.)
+# ---------------------------------------------------------------------------
+T7_OUT="$(env -i \
+  PATH="$PATH" \
+  DRIVER_HOOK_COMMON_PATH="$HOOK_COMMON" \
+  DRIVER_AGENT="$DYN_AGENT" \
+  DRIVER_ROSTER_WORKDIR="$DYN_PROJECT_WORKDIR" \
+  BRIDGE_HOME="$FIX" \
+  BRIDGE_AGENT_HOME_ROOT="$FIX/agents" \
+  BRIDGE_AGENT_ROOT_V2="$FIX/data/agents" \
+  python3 "$DRIVER" 2>&1)"
+T7_WD="$(printf '%s\n' "$T7_OUT" | _field WORKDIR)"
+T7_HANDOFF="$(printf '%s\n' "$T7_OUT" | _field HANDOFF)"
+if [[ "$T7_WD" == "$DYN_PROJECT_WORKDIR" \
+   && "$T7_HANDOFF" == "$DYN_PROJECT_WORKDIR/NEXT-SESSION.md" \
+   && "$T7_WD" != "$FIX/data/agents/$DYN_AGENT/home" ]]; then
+  _pass "T7: v2 dynamic/shared-mode — roster fallback reached, project workdir handoff found"
+else
+  _fail "T7" "v2 roster fallback unreachable: WORKDIR=[$T7_WD] HANDOFF=[$T7_HANDOFF] (expected project workdir, not the identity home)"
 fi
 
 printf '[%s] %d/%d passed\n' "$(basename "$0")" "$((TOTAL - FAILS))" "$TOTAL"
