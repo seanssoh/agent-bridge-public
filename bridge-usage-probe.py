@@ -53,6 +53,7 @@ and NEVER touch the network.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -60,7 +61,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,27 @@ CACHE_SOURCE = "native-oauth-probe"
 # failure) so the cooldown can be honored without re-reading the main cache's
 # semantics. Never contains the token.
 PROBE_STATE_BASENAME = ".usage-probe-state.json"
+
+# Issue #1468: a GENUINE usage-endpoint 429 (rate_limit_error, valid request /
+# UA present) is itself strong evidence the ACTIVE account is rate-limited —
+# the catch-22 is that the endpoint refuses the usage reading precisely when the
+# account is near/at its limit. Treat that 429 as a POSITIVE near-limit signal:
+# persist a synthetic near-limit cache (at the AT-LIMIT mark, so it clears any
+# reasonable rotation threshold) carrying the standard native-oauth-probe source
+# marker so the existing monitor/rotation path consumes it and rotates the OAT
+# proactively — instead of writing nothing and going blind. The marker fields
+# below distinguish a 429-signal cache from a real reading for observability.
+RATE_LIMIT_ERROR_TYPE = "rate_limit_error"
+# The synthetic near-limit utilization. 100.0 == AT-LIMIT: >= any sane rotation
+# threshold (default 99) without assuming the probe knows the operator's knob.
+RATE_LIMIT_SIGNAL_PERCENT = 100.0
+# Floor for the synthetic window when Retry-After is absent/unparseable: a
+# 429 with no honored Retry-After still means "limited now" — anchor the window
+# a conservative span out so the monitor has a stable reset_at to latch on.
+RATE_LIMIT_SIGNAL_FALLBACK_WINDOW_SECONDS = 300
+# Marker keys written into the cache + probe-state so a 429-signal is auditable
+# and idempotent (see _signal_window_key / run_probe).
+SIGNAL_MARKER = "rate_limit_429"
 
 TOKEN_ENV_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
 
@@ -371,6 +393,97 @@ def map_payload_to_cache(payload: Any) -> dict[str, Any] | None:
 
 
 # --------------------------------------------------------------------------- #
+# Issue #1468 — usage-endpoint 429 as a POSITIVE near-limit rotation signal
+# --------------------------------------------------------------------------- #
+def is_rate_limit_429(exc: "ProbeHTTPError") -> bool:
+    """True only for a GENUINE rate-limit 429 we should act on as near-limit.
+
+    We always send the mandatory User-Agent, so a 429 whose body is the
+    endpoint's ``error.type == rate_limit_error`` is a real rate-limit (the
+    account is near/at its limit) — NOT the missing-UA / malformed 429 the
+    helper docstring warns about. A 401, a 429 with a non-rate-limit body, or a
+    body we cannot parse is a probe FAILURE (audited but NOT a rotation signal),
+    so this returns False there and the caller degrades / serves stale.
+    """
+    if exc.status != 429:
+        return False
+    body = exc.body or ""
+    if not body.strip():
+        # A 429 with an empty body is indistinguishable from a malformed /
+        # missing-UA reject — do NOT treat it as a near-limit signal.
+        return False
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+    return str(error.get("type") or "") == RATE_LIMIT_ERROR_TYPE
+
+
+def _token_signal_digest(token: str) -> str:
+    """Token-free, one-way digest used ONLY to dedupe the 429-signal per token.
+
+    A SHA-256 hex prefix — irreversible and carrying NO token material (unlike
+    bridge-auth's fingerprint, which appends the last 4 chars). Persisted into
+    the probe-state sidecar so we never write token bytes to disk.
+    """
+    if not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+def _signal_reset_at(retry_after: float | None, now: float) -> str:
+    """Derive the synthetic window ``reset_at`` from a 429 Retry-After.
+
+    Quantized to whole seconds (drop sub-second jitter) so the SAME limit window
+    yields a STABLE reset_at across ticks — the monitor's reset-cycle latch
+    (RESET_FORWARD_GRACE_SECONDS) must not see per-tick drift as a new cycle and
+    re-fire rotation. Absent/unparseable Retry-After falls back to a conservative
+    fixed span (still "limited now").
+    """
+    span = retry_after if (retry_after is not None and retry_after >= 0) else None
+    if span is None:
+        span = float(RATE_LIMIT_SIGNAL_FALLBACK_WINDOW_SECONDS)
+    reset_epoch = int(now) + int(span)
+    return datetime.fromtimestamp(reset_epoch, tz=timezone.utc).isoformat()
+
+
+def build_rate_limit_signal_cache(reset_at: str, token_digest: str = "") -> dict[str, Any]:
+    """Build the synthetic near-limit ``.usage-cache.json`` for a 429 signal.
+
+    Matches the EXACT shape the monitor consumes (``data.fiveHour`` etc., 0–100)
+    with ``_source == native-oauth-probe`` so the existing rotation path latches
+    it — plus ``_signal`` markers so this is auditable as a 429-derived signal
+    (not a real reading). The five-hour window carries the AT-LIMIT mark; the
+    seven-day window mirrors it (we have no granular split from a 429, and the
+    monitor rotates on either window crossing the threshold).
+
+    ``_signal_token`` carries the one-way digest of the OAT that 429'd (token-
+    FREE — a SHA-256 prefix, NO token bytes). The monitor uses it to rotate ONCE
+    PER newly-active token even when a counting-down Retry-After lands two tokens
+    on the same reset_at (#1468 codex r3). The probe's per-token suppression
+    bounds it to one signal per token per incident, so this cannot loop.
+    """
+    return {
+        "data": {
+            "planName": "subscription",
+            "fiveHour": RATE_LIMIT_SIGNAL_PERCENT,
+            "sevenDay": RATE_LIMIT_SIGNAL_PERCENT,
+            "fiveHourResetAt": reset_at,
+            "sevenDayResetAt": reset_at,
+        },
+        "_source": CACHE_SOURCE,
+        "_signal": SIGNAL_MARKER,
+        "_signal_token": token_digest,
+        "_written_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Atomic cache write (same path + temp-then-replace as hud-usage-tap.py)
 # --------------------------------------------------------------------------- #
 def default_cache_path() -> Path:
@@ -425,14 +538,17 @@ def _probe_state_path(cache_path: Path) -> Path:
     return cache_path.parent / PROBE_STATE_BASENAME
 
 
-def _read_last_attempt(cache_path: Path) -> float | None:
+def _read_probe_state(cache_path: Path) -> dict[str, Any]:
+    """Read the whole probe-state sidecar dict (token-free); {} on any error."""
     try:
         payload = json.loads(_probe_state_path(cache_path).read_text(encoding="utf-8"))
     except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    ts = payload.get("last_attempt_epoch")
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _read_last_attempt(cache_path: Path) -> float | None:
+    ts = _read_probe_state(cache_path).get("last_attempt_epoch")
     try:
         return float(ts)
     except (TypeError, ValueError):
@@ -442,15 +558,131 @@ def _read_last_attempt(cache_path: Path) -> float | None:
 def _record_attempt(cache_path: Path, now: float, outcome: str) -> None:
     """Persist the last-attempt epoch (success or failure) for cooldown.
 
-    Token-free: stores only an epoch + a coarse outcome string.
+    Token-free: stores only an epoch + a coarse outcome string. The 429-signal
+    idempotence block (``signal_429``, see _read_signal_state) is PRESERVED
+    across attempts so a success/failure does not erase the per-window dedupe —
+    a successful probe on the NEW token after rotation clears it explicitly via
+    _clear_signal_state, not as a side effect of recording the attempt.
     """
+    state = _read_probe_state(cache_path)
+    state["last_attempt_epoch"] = now
+    state["outcome"] = outcome
     try:
-        _atomic_write_json(
-            _probe_state_path(cache_path),
-            {"last_attempt_epoch": now, "outcome": outcome},
-        )
+        _atomic_write_json(_probe_state_path(cache_path), state)
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Issue #1468 — PER-TOKEN 429-signal idempotence (token-free, on the sidecar)
+# --------------------------------------------------------------------------- #
+# State shape: ``signal_429: {"windows": {<token_digest>: <reset_at_iso>}}``.
+# One window per ENABLED token (keyed by its one-way digest). This is the design
+# that satisfies BOTH halves of the #1468 over-rotation contract simultaneously
+# (codex r1+r2):
+#   - Each DISTINCT token that 429s anchors ITS OWN window once, so the monitor
+#     (which rotates when a window's reset_at advances) rotates ONCE PER NEW
+#     token — the daemon can walk A→B→C until it lands on a non-limited token.
+#   - The SAME token re-signalling (its window still in the future) is SUPPRESSED
+#     — including under a CONSTANT Retry-After where `now + Retry-After` would
+#     otherwise drift forward (codex r1). So a token rotates at most once per
+#     incident, and looping back to an already-signalled token stops (codex r2).
+# Elapsed windows are pruned on every write, so a genuinely NEW incident
+# re-signals each token once. A clean reading clears the whole block.
+def _read_signal_state(cache_path: Path) -> dict[str, Any]:
+    block = _read_probe_state(cache_path).get("signal_429")
+    return block if isinstance(block, dict) else {}
+
+
+def _signal_windows(cache_path: Path) -> dict[str, str]:
+    block = _read_signal_state(cache_path)
+    windows = block.get("windows")
+    if not isinstance(windows, dict):
+        return {}
+    return {str(k): str(v) for k, v in windows.items() if isinstance(v, str)}
+
+
+def _reset_in_future(reset_at: str, now: float) -> bool:
+    try:
+        reset_dt = datetime.fromisoformat(reset_at)
+    except Exception:
+        return False
+    now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    return reset_dt > now_dt
+
+
+def signal_already_emitted(cache_path: Path, token_digest: str, now: float) -> bool:
+    """True when THIS token already has a still-future 429-signal window.
+
+    The loop-stopper (#1468 over-rotation guard). A token whose recorded window
+    is still in the FUTURE has already been signalled for the current incident
+    and must NOT re-emit a fresh near-limit cache (which would re-trip the
+    monitor). This bounds each token to one signal per incident — and once the
+    pool loops back to an already-signalled token it is suppressed, so the pool
+    is traversed at most once. An ELAPSED window (or none) is not a current
+    signal → returns False so a new incident re-signals.
+    """
+    win = _signal_windows(cache_path).get(token_digest)
+    if not win:
+        return False
+    return _reset_in_future(win, now)
+
+
+def resolve_token_window(
+    cache_path: Path, token_digest: str, retry_after: float | None, now: float
+) -> str:
+    """Resolve the STABLE per-token window reset_at for a 429-signal.
+
+    If THIS token already has a recorded window still in the FUTURE, REUSE it —
+    so a CONSTANT Retry-After (which would drift `now + Retry-After` forward each
+    tick) cannot move this token's window and re-rotate it (codex r1). Otherwise
+    anchor a FRESH window from the current Retry-After (a new incident for this
+    token). A DISTINCT token has no recorded window (or an elapsed one) → it
+    anchors its OWN window, so the monitor rotates once per new token.
+    """
+    win = _signal_windows(cache_path).get(token_digest)
+    if win and _reset_in_future(win, now):
+        return win
+    return _signal_reset_at(retry_after, now)
+
+
+def record_signal_emitted(
+    cache_path: Path, token_digest: str, reset_at: str, now: float
+) -> None:
+    """Record this token's 429-signal window; prune elapsed windows.
+
+    Token-free: persists only the one-way digest → reset_at map. Pruning every
+    elapsed window on write keeps the map bounded (≤ pool size) and lets a
+    genuinely new incident (all prior windows elapsed) re-signal each token once.
+    """
+    state = _read_probe_state(cache_path)
+    windows = _signal_windows(cache_path)
+    # Prune windows whose reset has already passed (stale incidents).
+    windows = {d: r for d, r in windows.items() if _reset_in_future(r, now)}
+    if token_digest:
+        windows[token_digest] = reset_at
+    state["signal_429"] = {"windows": windows, "last_signal_epoch": now}
+    try:
+        _atomic_write_json(_probe_state_path(cache_path), state)
+    except Exception:
+        pass
+
+
+def _clear_signal_state(cache_path: Path) -> None:
+    """Drop the 429-signal dedupe block (called after a clean usage reading).
+
+    A normal reading on the active token means it is NOT limited, so its window
+    no longer applies. We clear the whole block — a clean reading is strong
+    evidence the incident is over for the active account. Best-effort; never
+    raises.
+    """
+    state = _read_probe_state(cache_path)
+    if "signal_429" in state:
+        state.pop("signal_429", None)
+        try:
+            _atomic_write_json(_probe_state_path(cache_path), state)
+        except Exception:
+            pass
 
 
 def in_cooldown(cache_path: Path, cooldown_seconds: float, now: float) -> bool:
@@ -482,11 +714,12 @@ def run_probe(
 ) -> dict[str, Any]:
     """Refresh the native usage cache when due; otherwise serve stale.
 
-    Returns a token-free result dict describing what happened
-    (``status`` ∈ fresh/written/cooldown/degraded/no-token/scope-degraded).
-    NEVER raises into the caller — every failure path degrades and returns.
-    The existing cache is only ever REPLACED on a successful, parseable probe;
-    any failure leaves whatever cache is on disk untouched (serve stale).
+    Returns a token-free result dict describing what happened (``status`` ∈
+    fresh/written/cooldown/degraded/no-token/scope-degraded/rate-limited-signal/
+    rate-limited-suppressed). NEVER raises into the caller — every failure path
+    degrades and returns. The existing cache is only ever REPLACED on a
+    successful, parseable probe OR a genuine 429 near-limit signal (#1468); any
+    other failure leaves whatever cache is on disk untouched (serve stale).
     """
     now = time.time() if now is None else now
 
@@ -514,11 +747,15 @@ def run_probe(
 
     headers = _build_headers(token, user_agent_version)
 
-    # 4. Probe with a single Retry-After-bounded retry on 429.
+    # 4. Probe with a single Retry-After-bounded retry on 429. We retain the
+    # last HTTPError so the #1468 429-signal path can inspect it after the
+    # bounded retry has been exhausted.
     body: str | None = None
+    last_http_error: ProbeHTTPError | None = None
     try:
         body = http_get(USAGE_ENDPOINT, headers, http_timeout)
     except ProbeHTTPError as exc:
+        last_http_error = exc
         if exc.status == 429:
             wait = exc.retry_after
             if wait is not None and 0 <= wait <= retry_after_cap:
@@ -526,10 +763,14 @@ def run_probe(
                 time.sleep(wait)
                 try:
                     body = http_get(USAGE_ENDPOINT, headers, http_timeout)
+                    last_http_error = None
+                except ProbeHTTPError as exc2:
+                    last_http_error = exc2
+                    body = None
                 except Exception:
                     body = None
             else:
-                _log("[usage-probe] 429; Retry-After absent/too-long, serving stale")
+                _log("[usage-probe] 429; Retry-After absent/too-long")
         else:
             _log(f"[usage-probe] HTTP {exc.status}; serving stale cache")
     except Exception:
@@ -539,8 +780,66 @@ def run_probe(
         body = None
 
     if body is None:
+        # #1468: a GENUINE rate_limit 429 (valid request, UA present) is a
+        # POSITIVE near-limit signal — the catch-22 break. Persist a synthetic
+        # near-limit cache so proactive rotation fires, instead of going blind.
+        # Idempotent per (active-token, window): rotate AT MOST once per token
+        # per limit window (no pool-loop). A non-rate-limit 429, a 401, or a
+        # transport error is a probe FAILURE — audited, but NOT a rotation
+        # signal — so we fall through to the degrade path below.
+        if last_http_error is not None and is_rate_limit_429(last_http_error):
+            token_digest = _token_signal_digest(token)
+            # Suppress if THIS token already has a still-future signal window:
+            # rotate this token at most once per incident, and stop on a pool
+            # loop-back (codex r1+r2). A DISTINCT (rotated-to) token has no
+            # still-future window → it falls through and signals once.
+            if signal_already_emitted(cache_path, token_digest, now):
+                _record_attempt(cache_path, now, "rate_limited")
+                _log(
+                    "[usage-probe] 429 rate_limit_error; this token already has a "
+                    "live near-limit signal window — suppressing re-rotate"
+                )
+                return {
+                    "status": "rate-limited-suppressed",
+                    "cache_path": str(cache_path),
+                    "retry_after": last_http_error.retry_after,
+                    "reset_at": _signal_windows(cache_path).get(token_digest, ""),
+                }
+            # Resolve a STABLE per-token window (reuse this token's still-future
+            # window so a constant Retry-After cannot drift it; otherwise anchor
+            # fresh — a new token / new incident). #1468 idempotence.
+            reset_at = resolve_token_window(
+                cache_path, token_digest, last_http_error.retry_after, now
+            )
+            signal_cache = build_rate_limit_signal_cache(reset_at, token_digest)
+            try:
+                _atomic_write_json(cache_path, signal_cache)
+            except Exception:
+                _record_attempt(cache_path, now, "failure")
+                _log("[usage-probe] 429 signal cache write failed; serving stale")
+                return {"status": "degraded", "cache_path": str(cache_path)}
+            record_signal_emitted(cache_path, token_digest, reset_at, now)
+            _record_attempt(cache_path, now, "rate_limited")
+            _log(
+                "[usage-probe] 429 rate_limit_error on a valid request — the active "
+                f"account is rate-limited; persisting a near-limit signal (reset_at={reset_at}) "
+                "to trigger PROACTIVE rotation (#1468)"
+            )
+            return {
+                "status": "rate-limited-signal",
+                "cache_path": str(cache_path),
+                "fiveHour": RATE_LIMIT_SIGNAL_PERCENT,
+                "sevenDay": RATE_LIMIT_SIGNAL_PERCENT,
+                "retry_after": last_http_error.retry_after,
+                "reset_at": reset_at,
+            }
+        # Not a near-limit signal: a malformed/missing-UA 429, a 401, or a
+        # transport error → probe FAILURE. Audited by the wrapper; serve stale.
         _record_attempt(cache_path, now, "failure")
-        return {"status": "degraded", "cache_path": str(cache_path)}
+        result: dict[str, Any] = {"status": "degraded", "cache_path": str(cache_path)}
+        if last_http_error is not None:
+            result["http_status"] = last_http_error.status
+        return result
 
     # 5. Parse + map defensively.
     try:
@@ -571,6 +870,9 @@ def run_probe(
         return {"status": "degraded", "cache_path": str(cache_path)}
 
     _record_attempt(cache_path, now, "success")
+    # #1468: a clean reading means the active token is NOT limited → drop the
+    # per-window 429-signal dedupe so a later genuine limit window can re-signal.
+    _clear_signal_state(cache_path)
     return {
         "status": "written",
         "cache_path": str(cache_path),

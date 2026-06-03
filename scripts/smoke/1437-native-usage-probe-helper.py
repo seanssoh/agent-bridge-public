@@ -189,26 +189,35 @@ def main() -> int:
         check(written["data"]["fiveHour"] is None, "fiveHour is null (skipped)")
         check(written["data"]["sevenDay"] == 5.0, "sevenDay carried through")
 
-    # ---- (d) 429 → cooldown / stale served / no crash --------------------
-    print("[d] 429 body → backoff/cooldown, stale cache served, no crash")
+    # ---- (d) genuine 429 rate_limit_error → near-limit SIGNAL (#1468) -----
+    # Behavior change (#1468): a 429 whose body is a genuine `rate_limit_error`
+    # (valid request, UA present) is no longer "serve stale / give up" — it is a
+    # POSITIVE near-limit signal. The probe PERSISTS a synthetic near-limit cache
+    # (AT-LIMIT, _source native-oauth-probe) so proactive rotation fires, instead
+    # of going blind (the catch-22 break). The cooldown still applies after the
+    # signalled attempt. The dedicated 1468 smoke covers idempotence + the
+    # failure-class teeth; here we pin the core contract + the cooldown.
+    print("[d] 429 rate_limit_error → near-limit SIGNAL persisted, cooldown holds (#1468)")
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         reg = _registry_with_active(tmp, MOCK_TOKEN)
-        # Seed a stale native cache so "serve stale" is observable.
+        # Seed a stale low-% native cache; the 429 signal must OVERWRITE it with
+        # the at-limit reading (it is now evidence the account is limited).
         cache_path = tmp / "plugins" / "claude-hud" / ".usage-cache.json"
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         stale = {"data": {"fiveHour": 10.0, "sevenDay": 1.0}, "_source": "native-oauth-probe"}
         cache_path.write_text(json.dumps(stale), encoding="utf-8")
-        # Age the seeded cache relative to the synthetic clock so the freshness
-        # gate sees it as stale (real wall-clock mtime would skew the synthetic
-        # `now`). With max_age=0 any non-negative age is stale.
         os.utime(cache_path, (1900.0, 1900.0))
-        # 429 with NO usable Retry-After → serve stale, record a failure attempt.
+        # 429 with NO usable Retry-After → still a genuine rate_limit_error →
+        # near-limit signal with a fallback window.
         get429, _ = _stub_429(retry_after=None)
         res = _run(tmp, http_get=get429, registry=reg, now=2000.0, max_age=0.0)
-        check(res["status"] == "degraded", "429-no-retry-after degrades")
+        check(res["status"] == "rate-limited-signal", "429 rate_limit_error → rate-limited-signal")
         after = json.loads(cache_path.read_text())
-        check(after["data"]["fiveHour"] == 10.0, "stale cache left untouched on 429")
+        check(after["data"]["fiveHour"] == 100.0, "near-limit (100%) signal cache persisted on 429")
+        check(after["_source"] == "native-oauth-probe", "signal cache carries the native source marker")
+        check(after["_signal"] == "rate_limit_429", "signal cache marked as a 429 signal")
+        check(bool(after["data"]["fiveHourResetAt"]), "signal cache carries a reset_at window")
         # Now a SECOND probe within the cooldown window must NOT re-probe.
         marker = {"called": False}
 

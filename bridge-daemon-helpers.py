@@ -813,6 +813,55 @@ def cmd_usage_rotation_candidates_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_usage_probe_result_parse(args: argparse.Namespace) -> int:
+    """Issue #1468: classify the native usage-probe `--json` result for audit.
+
+    Input: the token-free JSON result dict printed by `bridge-usage-probe.py
+    probe --json`. Output: a SINGLE tab-separated row IFF the outcome is
+    NOTEWORTHY (worth an audit row) — empty stdout otherwise (so the daemon /
+    wrapper emits nothing on the common fresh/written/cooldown ticks):
+      status \\t reset_at \\t retry_after \\t http_status
+
+    Noteworthy statuses:
+      - rate-limited-signal     — a genuine 429 → proactive near-limit signal
+                                  persisted (the #1468 catch-22 break).
+      - rate-limited-suppressed — a genuine 429 already signalled this window
+                                  (idempotent; no re-rotate).
+      - degraded / scope-degraded / no-token — a probe FAILURE (was silent
+                                  best-effort; now observable per #1468 §5).
+
+    fresh / written / cooldown are the healthy/no-op ticks and produce empty
+    output. A parse error produces empty output (the wrapper emits no audit).
+    """
+    try:
+        payload = json.loads(args.probe_json)
+    except Exception:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    status = str(payload.get("status") or "")
+    noteworthy = {
+        "rate-limited-signal",
+        "rate-limited-suppressed",
+        "degraded",
+        "scope-degraded",
+        "no-token",
+    }
+    if status not in noteworthy:
+        return 0
+    print(
+        "\t".join(
+            [
+                status,
+                str(payload.get("reset_at") or ""),
+                str(payload.get("retry_after") if payload.get("retry_after") is not None else ""),
+                str(payload.get("http_status") if payload.get("http_status") is not None else ""),
+            ]
+        )
+    )
+    return 0
+
+
 def cmd_rotation_status_parse(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:1128 (process_usage_monitor rotate branch).
 
@@ -1289,6 +1338,12 @@ SUBCOMMANDS = {
         cmd_rotation_status_parse,
         [("rotate_json", "JSON envelope from bridge-auth.sh claude-token rotate --json")],
         "Single-row rotation outcome: status / reason / from / to / sync_status (5 cols).",
+    ),
+    # Issue #1468: classify a native usage-probe --json result for an audit row.
+    "usage-probe-result-parse": (
+        cmd_usage_probe_result_parse,
+        [("probe_json", "JSON result from bridge-usage-probe.py probe --json")],
+        "Single noteworthy-outcome row (status/reset_at/retry_after/http_status) or empty.",
     ),
     "recovery-status-parse": (
         cmd_recovery_status_parse,
