@@ -16,11 +16,26 @@
 #   - a `$(cd -P "$(dirname …)" && pwd -P)` command-substitution to compute
 #     BRIDGE_SCRIPT_DIR (the `dirname` fork).
 # A same-UID caller that `export -f`'d a function named after any of those
-# commands (e.g. `dirname()`), planted such a binary on PATH, or pointed
-# BASH_ENV/ENV at a leak script could have its code run IN this shell / a child
+# commands (e.g. `dirname()`, incl. the `source`/`.`/`builtin`/`command`/`local`
+# builtins — neutralized via the un-shadowable `POSIXLY_CORRECT=1` seed) or
+# planted such a binary on PATH could have its code run IN this shell / a child
 # of it while the secret was readable, and exfiltrate it. PRs #1443
 # (bridge-usage.sh) and #1452/#1444 (bridge-run.sh) each closed this IN THEIR
 # OWN LANE; #1454 closes the re-exec at the shared bridge-lib.sh root.
+#
+# OUT OF SCOPE — the launch-environment-control boundary (#1443-consistent; see
+# lib/bridge-secret-scrub.sh "THREAT MODEL"): startup state the INVOKING shell
+# controls that runs BEFORE bridge-lib.sh's first executable line — an
+# initial-shell `BASH_ENV`/`ENV` startup file, an inherited `SHELLOPTS=xtrace`
+# with a command-substitution `PS4` (Bash evaluates `PS4` before the first
+# command), or an invoking-shell DEBUG trap. No pure-Bash code at the
+# bridge-lib.sh root can pre-empt these, and they require the attacker to
+# control the invoking shell's options/startup on a token-bearing launch — the
+# same position as a same-UID attacker who can already scrape `/proc`/the
+# filesystem. The harden step below DOES `unset BASH_ENV/ENV/BASH_XTRACEFD` +
+# `set +x` + drop `PS4`, so those hooks cannot fire in any CHILD/re-exec the
+# bridge forks AFTER hardening — only the initial-shell pre-first-line window
+# is out of scope.
 #
 # The fix closes the window WITHOUT changing the resolved BRIDGE_SCRIPT_DIR
 # value or the Bash-upgrade behavior:
@@ -39,10 +54,13 @@
 #      re-exec with `exec "$cand" -p …` so the re-exec'd process is likewise
 #      function-free + hook-free.
 # bridge-lib.sh itself does NOT capture/scrub the operator's ambient secret env
-# (that would change survival semantics for consumers): the steps above already
-# defeat the exported-function / PATH-shadow / startup-file interception class,
-# so the probe/re-exec children — which run only our own literal code under
-# `-p` — cannot be hijacked even though they inherit the (now-unhookable) env.
+# (that would change survival semantics for consumers): the steps above defeat
+# the exported-function / PATH-shadow classes and the startup-file hooks for the
+# CHILD/re-exec processes it forks (BASH_ENV/ENV/BASH_XTRACEFD/PS4 are unset
+# before the first fork) — NOT the initial-shell pre-first-line startup window
+# (out of scope, see the boundary note above). So the probe/re-exec children —
+# which run only our own literal code under `-p` — cannot be hijacked even
+# though they inherit the (now-unhookable) env.
 # The capture/scrub + nonce-gated fd-transit helpers are PROVIDED by the shared
 # primitive for consumers that need them (the #1443/#1452 lanes can adopt them
 # in a follow-up); bridge-lib.sh does not wire them onto those consumers here.
