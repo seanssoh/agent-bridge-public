@@ -488,7 +488,7 @@ def cmd_task_status(args: argparse.Namespace) -> int:
         return 1
 
     db_path = Path(args.db_path)
-    if not db_path.is_file():
+    if not db_path.is_file():  # noqa: raw-pathlib-controller-only — db_path is always the controller's central queue DB ($BRIDGE_TASK_DB), passed only by the daemon-side pending-attention flusher (bridge-daemon.sh::flush_pending_attention_spools → lib/bridge-tmux.sh); never an iso-agent path.
         return 1
 
     uri = f"file:{db_path}?mode=ro"
