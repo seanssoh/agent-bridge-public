@@ -116,6 +116,11 @@ add_required 1473-agent-list-iso-state-fallback
 # scripts/smoke/* catch-all → add_all_required_static — still re-runs the
 # coalesce smoke.
 add_required 8807-cron-backfill-coalesce
+# Incident #8807 P0b: in the full static suite so a change to the reaper helper
+# (scripts/smoke/8807-mcp-reaper-patterns-helper.py) — which hits the
+# scripts/smoke/* catch-all → add_all_required_static — still re-runs the
+# reaper-pattern smoke.
+add_required 8807-mcp-reaper-patterns
 
 
 }
@@ -1094,6 +1099,13 @@ select_for_path() {
       # PR cannot silently drop a guard site or regress the fail-OPEN / leave-
       # queued / throttled-warn contract that prevents the fork-storm reboot.
       add_required 8807-resource-guard-defer
+      # Incident #8807 P0b: bridge-daemon.sh moved the periodic MCP-orphan
+      # cleanup (process_mcp_orphan_cleanup) to the TOP of cmd_sync_cycle so
+      # it relieves process-pressure before the spawn-heavy surfaces. Pull
+      # 8807-mcp-reaper-patterns on every bridge-daemon.sh move so the
+      # pressure-relief ordering and the single-invocation invariant cannot
+      # silently regress.
+      add_required 8807-mcp-reaper-patterns
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -1104,6 +1116,21 @@ select_for_path() {
       # every move of the guard lib so the proc-count/memory probe, the
       # fail-OPEN contract, and the throttled-warn bookkeeping cannot regress.
       add_required 8807-resource-guard-defer
+      ;;
+
+    bridge-mcp-cleanup.py)
+      # Incident #8807 P0b: the MCP-orphan reaper's DEFAULT_PATTERNS (tightened
+      # to bridge-owned identities/paths + extended to the missing bridge MCP
+      # signatures, never matching Pencil.app's mcp-server-darwin-arm64 or live
+      # `codex resume` agents) and the PID-reuse revalidation in kill_pid. The
+      # r2 control matrix + spawn fixtures live in the file-as-argv helper
+      # (8807-mcp-reaper-patterns-helper.py, extracted to drop heredoc-stdin);
+      # a change to that helper hits the `scripts/smoke/*` catch-all above,
+      # which runs the full static suite (where 8807-mcp-reaper-patterns is
+      # also registered). Pull 8807-mcp-reaper-patterns on every reaper move so
+      # the control matrix and the pre-TERM/pre-KILL revalidation cannot
+      # regress.
+      add_required 8807-mcp-reaper-patterns
       ;;
 
     lib/bridge-daemon-control.sh|scripts/install-daemon-systemd.sh|scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template)
