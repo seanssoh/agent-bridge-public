@@ -39,6 +39,11 @@
 #   T1 — TEETH: a system_config_paths copy with the delegation reverted to a
 #        BROKEN body must FAIL the parity assertion (proves delegation is
 #        load-bearing — a hollow no-op would still "pass").
+#   S1 — TEETH (#1507 r2): the import seam loads lib/operator_home.py by EXACT
+#        path (not via sys.path), so a same-named `operator_home` SHADOW module
+#        cannot hijack a consumer's resolver — neither with lib/ present (real
+#        wins) nor on a partial deploy with lib/ absent (inline fallback wins,
+#        NOT the shadow). Covers the every-session hook AND the queue DB path.
 
 set -uo pipefail
 
@@ -356,6 +361,95 @@ if [[ "$t1_got" == "TEETH_BIT" ]]; then
   pass "T1: TEETH — reverted delegation breaks parity (delegation is load-bearing)"
 else
   fail "T1: TEETH did not bite — reverted delegation still matched canonical: [$t1_got]"
+fi
+
+# ----- S1: TEETH — import seam is shadow-proof (#1507 r2) ------------------
+# A same-named operator_home module on sys.path must NEVER hijack a consumer's
+# resolver. The seam loads lib/operator_home.py by EXACT path via importlib, so
+# (A/C) with lib present a shadow loses, and (B/D) on a partial deploy (lib
+# absent) the consumer takes its byte-identical inline fallback — NOT the shadow.
+# Covers the every-session hook (bridge_hook_common) AND the queue DB path
+# (bridge-queue.get_db_path). Driver writes the shadow itself and reads no
+# environment dict directly; the shell sets HOME to a tmp dir (mkdir-hermetic for
+# get_db_path) and unsets BRIDGE_HOME so the expected answer is HOME/.agent-bridge.
+s1_home="$(mktemp -d -t agb-1497-p2-s1home.XXXXXX)"
+s1_driver="$(mktemp -t agb-1497-p2-s1.XXXXXX.py)"
+cat > "$s1_driver" <<'PY'
+import importlib.util
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+repo = Path(sys.argv[1]).resolve()
+SENTINEL = "/tmp/AGB-P2-SHADOW-DO-NOT-USE"
+ok = True
+
+
+def load_by_path(name, path):
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def write_shadow(dirpath):
+    body = (
+        "from pathlib import Path\n"
+        "def operator_home():\n"
+        f"    return Path({SENTINEL!r})\n"
+    )
+    Path(dirpath, "operator_home.py").write_text(body, encoding="utf-8")
+
+
+def bad(tag, got):
+    global ok
+    ok = False
+    print(f"{tag} got={got}")
+
+
+# A: hook, real lib present + shadow on sys.path -> real lib wins.
+shadow_a = tempfile.mkdtemp()
+write_shadow(shadow_a)
+sys.path.insert(0, shadow_a)
+got = str(load_by_path("bhc_s1a", repo / "hooks" / "bridge_hook_common.py").operator_home())
+if "SHADOW" in got or not got.endswith("/.agent-bridge"):
+    bad("A_HOOK_HIJACK", got)
+
+# B: hook, partial deploy (no co-located lib) + shadow -> inline fallback.
+root_b = tempfile.mkdtemp()
+hooks_b = Path(root_b, "hooks")
+hooks_b.mkdir()
+shutil.copy(str(repo / "hooks" / "bridge_hook_common.py"), str(hooks_b / "bridge_hook_common.py"))
+write_shadow(str(hooks_b))   # shadow co-located; root_b/lib/operator_home.py absent
+sys.path.insert(0, str(hooks_b))
+got = str(load_by_path("bhc_s1b", hooks_b / "bridge_hook_common.py").operator_home())
+if "SHADOW" in got or not got.endswith("/.agent-bridge"):
+    bad("B_HOOK_PARTIAL_HIJACK", got)
+
+# C: queue DB, real lib present + shadow on sys.path -> real lib wins.
+got = str(load_by_path("bq_s1c", repo / "bridge-queue.py").get_db_path())
+if "SHADOW" in got or "/.agent-bridge/state/tasks.db" not in got:
+    bad("C_QUEUE_HIJACK", got)
+
+# D: queue DB, partial deploy (no co-located lib) + shadow -> inline fallback.
+root_d = tempfile.mkdtemp()
+shutil.copy(str(repo / "bridge-queue.py"), str(Path(root_d, "bridge-queue.py")))
+write_shadow(root_d)         # shadow co-located; root_d/lib/operator_home.py absent
+sys.path.insert(0, root_d)
+got = str(load_by_path("bq_s1d", Path(root_d, "bridge-queue.py")).get_db_path())
+if "SHADOW" in got or "/.agent-bridge/state/tasks.db" not in got:
+    bad("D_QUEUE_PARTIAL_HIJACK", got)
+
+print("SHADOW_REJECTED_OK" if ok else "SHADOW_HIJACK")
+PY
+s1_out="$(env -u BRIDGE_HOME HOME="$s1_home" "$PYTHON" "$s1_driver" "$REPO_ROOT" 2>&1)"
+rm -f "$s1_driver"
+rm -rf "$s1_home"
+if printf '%s' "$s1_out" | grep -q 'SHADOW_REJECTED_OK'; then
+  pass "S1: import seam shadow-proof — exact-path load beats a sys.path shadow (hook + queue DB, lib-present + partial-deploy) (#1507 r2)"
+else
+  fail "S1: import seam shadowable — $s1_out"
 fi
 
 # ----- Summary -----------------------------------------------------------

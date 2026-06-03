@@ -12,18 +12,23 @@ from pathlib import Path
 from typing import Any
 
 # Operator-home SSOT (issue #1497 P2). This module lives at the repo root (and
-# `~/.agent-bridge/` root in the deployed runtime), so `lib/` is `<this>/lib`.
-# Set it up here so the module is self-sufficient regardless of whether the
-# importer (`bridge-guard.py` direct-import, `hooks/tool-policy.py` importlib
-# load) put lib/ on sys.path first. Mirrors the guarded, dedup'd insert that
-# `hooks/tool-policy.py` uses for system_config_paths.
-_LIB_DIR = Path(__file__).resolve().parent / "lib"
-if _LIB_DIR.is_dir() and str(_LIB_DIR) not in sys.path:
-    sys.path.insert(0, str(_LIB_DIR))
-
-try:
-    from operator_home import operator_home  # noqa: E402
-except ImportError:  # pragma: no cover — lib/ not co-located (partial/overlay)
+# `~/.agent-bridge/` root in the deployed runtime), so the canonical resolver is
+# `<this>/lib/operator_home.py`. Load it by its EXACT path via importlib — NOT
+# through sys.path — so a same-named `operator_home` module elsewhere on the path
+# can never shadow it and redirect the guard home (#1507 r2: a bare
+# `from operator_home import` does NOT raise when lib/ is absent if some other
+# operator_home is importable). When the exact file is absent (partial deploy /
+# test overlay) the inline fallback is byte-identical to operator_home().
+_OPERATOR_HOME_PY = Path(__file__).resolve().parent / "lib" / "operator_home.py"
+operator_home = None
+if _OPERATOR_HOME_PY.is_file():
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_agb_operator_home", str(_OPERATOR_HOME_PY))
+    if _spec is not None and _spec.loader is not None:
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        operator_home = getattr(_mod, "operator_home", None)
+if not callable(operator_home):  # exact file absent — byte-identical inline SSOT
     def operator_home() -> Path:
         explicit = os.environ.get("BRIDGE_HOME", "").strip()  # noqa: iso-helper-boundary — os.environ (.environ) false-matches the .env boundary pattern; BRIDGE_HOME is the operator runtime root, not an isolated artifact
         if explicit:

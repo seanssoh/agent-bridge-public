@@ -30,13 +30,22 @@ import fnmatch
 import os
 from pathlib import Path
 
-# operator_home lives next to this module in lib/. Importing this module at all
-# requires lib/ to be reachable, so the bare import normally succeeds; the
-# try/except keeps the module loadable under an exotic loader that placed only
-# this file on the path. Fallback is byte-identical to operator_home().
-try:
-    from operator_home import operator_home
-except ImportError:  # pragma: no cover — operator_home not co-located
+# operator_home lives next to this module in lib/. Load it by its EXACT path via
+# importlib — NOT through sys.path — so a same-named `operator_home` module
+# elsewhere on the path can never shadow it and redirect the system-config home
+# (#1507 r2: a bare `from operator_home import` does NOT raise if some other
+# operator_home is importable). When the sibling file is absent (exotic loader
+# placed only this file) the inline fallback is byte-identical to operator_home().
+_OPERATOR_HOME_PY = Path(__file__).resolve().parent / "operator_home.py"
+operator_home = None
+if _OPERATOR_HOME_PY.is_file():
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_agb_operator_home", str(_OPERATOR_HOME_PY))
+    if _spec is not None and _spec.loader is not None:
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        operator_home = getattr(_mod, "operator_home", None)
+if not callable(operator_home):  # sibling absent — byte-identical inline SSOT
     def operator_home() -> Path:
         explicit = os.environ.get("BRIDGE_HOME", "").strip()
         if explicit:
