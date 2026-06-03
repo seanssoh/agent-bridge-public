@@ -1288,6 +1288,32 @@ PRESERVED_USER_KEYS = (
     "skipDangerousModePermissionPrompt",
 )
 
+# Issue #1495: Claude Code skips the ENTIRE settings.json (every key —
+# enabledPlugins, skipDangerousModePermissionPrompt, the lot) when the
+# `hooks` record carries an event name the CLI does not recognize
+# ("PermissionDenied: Invalid key in record" → plugins/MCP/channel bots
+# go offline). The legacy `PermissionDenied` block (commit 83c03c28, #93)
+# is no longer a valid CC hook event — CC v2.1.87 rejects it — and the
+# render `merge_settings` preserves existing keys, so a once-dirty
+# settings.json keeps the broken key across every rerender. The render
+# path actively prunes any `hooks.<event>` outside this allowlist so a
+# fresh render is clean AND an existing dirty file is repaired on the
+# next upgrade/restart. The set is the documented CC hook-event surface;
+# `PermissionDenied`/`PermissionRequest` are intentionally NOT included.
+VALID_CLAUDE_HOOK_EVENTS = frozenset(
+    {
+        "PreToolUse",
+        "PostToolUse",
+        "UserPromptSubmit",
+        "Notification",
+        "Stop",
+        "SubagentStop",
+        "PreCompact",
+        "SessionStart",
+        "SessionEnd",
+    }
+)
+
 
 def _bridge_home_from_base_settings(base_path: Path) -> Path | None:
     expanded = base_path.expanduser()
@@ -1326,6 +1352,48 @@ def _normalize_bridge_hook_paths(settings: dict[str, Any], bridge_home: Path | N
                 command = hook.get("command")
                 if isinstance(command, str) and old_prefix in command:
                     hook["command"] = command.replace(old_prefix, new_prefix)
+
+
+def _prune_invalid_hook_keys(settings: dict[str, Any]) -> list[str]:
+    """Drop any `hooks.<event>` not in the valid Claude Code event allowlist.
+
+    Issue #1495: Claude Code rejects the WHOLE settings.json (silently
+    skipping plugins, MCP, skipDangerousModePermissionPrompt, every key)
+    when the `hooks` record carries an unrecognized event name. The
+    render `merge_settings` preserves existing keys, so a once-dirty
+    settings.json (e.g. the legacy `PermissionDenied` block shipped by
+    the tracked base before this fix) survives every rerender. Running
+    this prune on the merged payload right before write means a fresh
+    render is clean AND an existing dirty file is repaired on the next
+    upgrade/restart.
+
+    Returns the sorted list of dropped event names so the caller can emit
+    a single `[warn]` to stderr. Stdout stays untouched here — the
+    `--json` render/rerender paths must keep stdout pure JSON.
+    """
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return []
+    dropped = [event for event in hooks if event not in VALID_CLAUDE_HOOK_EVENTS]
+    for event in dropped:
+        del hooks[event]
+    return sorted(dropped)
+
+
+def _warn_dropped_hook_keys(dropped: list[str], context: str) -> None:
+    """Emit a single stderr `[warn]` line for pruned invalid hook keys.
+
+    Kept off stdout so the `--json`/`--format shell` render paths stay
+    machine-parseable (#1495).
+    """
+    if not dropped:
+        return
+    sys.stderr.write(
+        "[warn] bridge-hooks: dropped invalid Claude Code hook "
+        f"event(s) {', '.join(dropped)} from {context} — Claude Code "
+        "rejects the entire settings file on an unknown hook key "
+        "(#1495)\n"
+    )
 
 
 def _load_preserved_user_keys(effective_path: Path) -> dict[str, Any]:
@@ -1382,6 +1450,11 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     if preserved:
         merged = merge_settings(merged, preserved)
     _normalize_bridge_hook_paths(merged, _bridge_home_from_base_settings(base_path))
+    # #1495: strip any non-allowlisted hook event so a once-dirty
+    # effective file (e.g. the legacy PermissionDenied block) is repaired
+    # on this rerender — merge_settings preserves it otherwise — and a
+    # fresh render never ships a key Claude Code would reject.
+    _warn_dropped_hook_keys(_prune_invalid_hook_keys(merged), str(effective_path))
     save_json(effective_path, merged)
 
     # #1175: report-only `overlay_present` probe routes through the
@@ -1502,6 +1575,12 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     if preserved:
         merged = merge_settings(merged, preserved)
     _normalize_bridge_hook_paths(merged, _bridge_home_from_base_settings(base_path))
+    # #1495: strip any non-allowlisted hook event so an isolated home's
+    # once-dirty effective file (e.g. the legacy PermissionDenied block)
+    # is repaired on this rerender — merge_settings preserves it
+    # otherwise — and a fresh render never ships a key Claude Code would
+    # reject (which would skip the WHOLE settings file → plugins/MCP off).
+    _warn_dropped_hook_keys(_prune_invalid_hook_keys(merged), str(effective_path))
 
     # 3. Atomic write of the effective file (mode 0644 so the isolated UID
     # can read it; ownership stays with whoever invoked us — controller

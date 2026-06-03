@@ -5,10 +5,12 @@
 # renderer against a stub isolated home. Exercises seven sub-tests:
 #
 # 1. The rendered `<isolated-home>/.claude/settings.effective.json`
-#    contains the full bridge hook suite (Stop / UserPromptSubmit /
-#    SessionStart / PermissionDenied / PreCompact / PreToolUse /
-#    PostToolUse — the seven event types managed by the shared base
-#    agents/.claude/settings.json after PR #561 r2).
+#    contains the bridge hook suite (Stop / UserPromptSubmit /
+#    SessionStart / PreCompact / PreToolUse / PostToolUse — the six
+#    event types managed by the shared base agents/.claude/settings.json
+#    after #1495 dropped the invalid PermissionDenied event) and carries
+#    NO PermissionDenied key (Claude Code skips the entire settings file
+#    on an unrecognized hook event).
 # 2. `<isolated-home>/.claude/settings.json` is a symlink pointing at
 #    the relative path `settings.effective.json`.
 # 3. Pre-existing user keys (`enabledPlugins`, `extraKnownMarketplaces`,
@@ -114,13 +116,15 @@ assert_hook_entries_present() {
     "UserPromptSubmit event present"
   smoke_assert_contains "$content" '"SessionStart"' \
     "SessionStart event present"
-  smoke_assert_contains "$content" '"PermissionDenied"' \
-    "PermissionDenied event present"
-  # PR #561 r2 — the shared base now carries the full 7-hook suite.
-  # PreCompact / PreToolUse / PostToolUse were missing from the isolated
-  # render before this commit because they were absent from the shared
-  # base; the renderer composes from base, so adding them there flows
-  # straight into the isolated effective file.
+  # #1495 — the invalid PermissionDenied event was dropped from the
+  # shared base (Claude Code rejects it and skips the whole settings
+  # file). It must NOT appear in the rendered effective file.
+  smoke_assert_not_contains "$content" '"PermissionDenied"' \
+    "PermissionDenied event NOT present (Claude Code rejects it — #1495)"
+  # PR #561 r2 — the shared base carries the PreCompact / PreToolUse /
+  # PostToolUse hooks (in addition to Stop / UserPromptSubmit /
+  # SessionStart). The renderer composes from base so they flow straight
+  # into the isolated effective file.
   smoke_assert_contains "$content" '"PreCompact"' \
     "PreCompact event present"
   smoke_assert_contains "$content" '"PreToolUse"' \
@@ -141,10 +145,10 @@ assert_hook_entries_present() {
     "SessionStart points at session-start.py"
   smoke_assert_contains "$content" 'prompt_timestamp.py' \
     "UserPromptSubmit includes prompt_timestamp.py"
-  smoke_assert_contains "$content" 'permission_escalation.py' \
-    "PermissionDenied points at permission_escalation.py"
-  smoke_assert_contains "$content" "$FIXTURE_BRIDGE_HOME/hooks/permission_escalation.py" \
-    "PermissionDenied hook uses an absolute bridge-home path"
+  # #1495 — the legacy permission_escalation.py wiring lived under the
+  # now-removed PermissionDenied event, so it must NOT be rendered.
+  smoke_assert_not_contains "$content" 'permission_escalation.py' \
+    "permission_escalation.py NOT wired (dead PermissionDenied event — #1495)"
   # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
   smoke_assert_not_contains "$content" "~/.agent-bridge/hooks" \
     "rendered hook commands do not depend on runtime HOME"
