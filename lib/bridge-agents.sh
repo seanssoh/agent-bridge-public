@@ -4529,6 +4529,39 @@ bridge_linux_prepare_agent_isolation() {
     done
   fi
 
+  # Issue #1513: the legacy per-agent tracked-profile mirror dir at
+  # `$BRIDGE_AGENT_HOME_ROOT/<agent>/` (e.g. `~/.agent-bridge/agents/<a>/`)
+  # must be traversable ("other" x-bit) by the isolated UID. On the
+  # create-shared-then-isolate path it was scaffolded by the plain
+  # controller `mkdir -p` under `umask 077` (mode 0700, group=<controller>),
+  # so the iso UID — not the owner, not in the owning group — cannot
+  # traverse it. `bridge-run.sh` runs scripts/python-helpers/prune-legacy-
+  # teams-mcp.py AS the iso UID against `--agent-root
+  # $BRIDGE_AGENT_HOME_ROOT/<a>`; `Path('.../<a>/.mcp.json').is_file()`
+  # then raises `PermissionError` (EACCES, which Python 3.10's is_file()
+  # does NOT swallow), the prune exits non-zero, and the launch aborts
+  # with `stale Teams MCP cleanup failed`. A healthy/older agent's legacy
+  # root is `0755`, so the same prune returns False cleanly.
+  #
+  # The scaffold-time fix (bridge-agent.sh #1165 Gap 4) only fires when
+  # isolation is active AT `agent create`; the create-shared-then-isolate
+  # path leaves this dir 0700. Normalize the dir NODE traverse bit here
+  # (in the shared prepare path used by both create-isolate and
+  # isolate/reapply) so it is `drwxr-xr-x` like a healthy agent's. This
+  # is a single-node `chmod 0755` (NOT recursive): the 0600 files inside
+  # — non-secret JSON mirrors; channel secrets live under
+  # `workdir/.<channel>/` with their own ACLs — are untouched, and
+  # owner/group are unchanged. Idempotent; Linux-gated via
+  # `bridge_host_platform` at the top of prepare. Mirrors the
+  # bridge-agent.sh:#1165 scaffold-path recipe (mkdir/chown/chmod 0755).
+  if [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" ]]; then
+    local _v2_legacy_mirror_dir="$BRIDGE_AGENT_HOME_ROOT/$agent"
+    if bridge_linux_sudo_root test -d "$_v2_legacy_mirror_dir"; then
+      bridge_linux_sudo_root chmod 0755 "$_v2_legacy_mirror_dir" \
+        || bridge_warn "isolation v2 (#1513): could not set traverse bit on legacy mirror dir '$_v2_legacy_mirror_dir' for agent '$agent'; the iso-UID Teams MCP prune may abort the launch with EACCES. Manual fix: \`sudo chmod 0755 $_v2_legacy_mirror_dir\`."
+    fi
+  fi
+
   # Isolated-home POSIX contract (HOME + .claude + .claude/plugins +
   # .claude/session-env). Phase 3 codex design: one shared helper at
   # three call sites so the prepare path, the restart reverter

@@ -64,7 +64,25 @@ def write_json_in_place(path: Path, payload: dict[str, Any]) -> None:
 
 
 def prune_file(path: Path, agent: str) -> str:
-    if not path.is_file():
+    # Issue #1513: `Path.is_file()` only swallows ENOENT/ENOTDIR/EBADF/
+    # ELOOP — NOT EACCES. When this helper runs as an isolated UID
+    # (bridge-run.sh launches it as `agent-bridge-<a>`) against a legacy
+    # `$BRIDGE_AGENT_HOME_ROOT/<a>/` mirror that was scaffolded 0700
+    # (controller umask), the iso UID cannot traverse the parent dir, so
+    # `is_file()` raises `PermissionError` (errno 13). An uncaught raise
+    # exits the helper non-zero and `bridge-run.sh` hardens that into
+    # `aborting launch: stale Teams MCP cleanup failed` — killing a launch
+    # over an UNREADABLE prune candidate. A prune that cannot even stat a
+    # stale-entry candidate must skip it non-fatally, never abort. Catch
+    # PermissionError/OSError here (and around any other stat that runs
+    # before we have established the file is readable) and return a
+    # logged-but-non-fatal `skipped` line; the helper exit stays 0.
+    try:
+        exists_as_file = path.is_file()
+    except OSError as exc:
+        errno = getattr(exc, "errno", None)
+        return f"skipped path={path} reason=stat-failed:{errno}"
+    if not exists_as_file:
         return f"absent path={path}"
 
     try:
