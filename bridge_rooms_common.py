@@ -136,34 +136,48 @@ class ActorAuth(NamedTuple):
     hard: bool
 
 
-def _uid_agent_map() -> dict[int, str]:
-    """uid -> iso agent map, the SAME source bridge-queue-gateway.py uses.
+def _test_uid_map_allowed() -> bool:
+    """Paired test-only flag gating the BRIDGE_ROOMS_UID_MAP env seam.
 
-    Precedence:
-      1. `BRIDGE_ROOMS_UID_MAP` (controller-owned "uid:agent,uid:agent" CSV) —
-         an explicit, un-spoofable test/override seam. It is read from the
-         process env, but it only ever MAPS a uid to an agent; the ACTOR is
-         still `os.getuid()` indexing INTO this map, so a managed agent cannot
-         name itself the leader by setting it (it would have to forge its own
-         uid's row, and even then it can only claim the agent its uid already
-         is). In production this is empty and the roster probe is used.
-      2. The roster probe: for each agent with effective linux-user isolation,
-         `bridge_agent_os_user` -> uid -> agent. Identical to the gateway's
-         `_peer_map_from_roster`.
+    BOTH `BRIDGE_ROOMS_ALLOW_TEST_UID_MAP=1` AND `BRIDGE_A2A_ALLOW_TEST_BIND=1`
+    must be set. Mirrors the existing paired-flag escape hatches
+    (`_allow_insecure_no_secret`, `BRIDGE_A2A_ALLOW_TEST_BIND`) so a single
+    stray env var cannot relax the contract. The smoke sets both; production
+    sets neither, so the env map is NEVER consulted in a real deployment and a
+    managed agent cannot spoof its identity through it (codex Phase-4 r3 F1).
+    """
+    return (
+        os.environ.get("BRIDGE_ROOMS_ALLOW_TEST_UID_MAP") == "1"
+        and os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") == "1"
+    )
+
+
+def _uid_agent_map() -> dict[int, str]:
+    """uid -> iso agent map from a TRUSTED source (never client env).
+
+    The AUTHORITATIVE source is the roster probe (`_uid_agent_map_from_roster`,
+    the SAME mapping bridge-queue-gateway.py derives from `bridge_agent_os_user`
+    — controller-owned roster data a managed agent cannot forge). The
+    `BRIDGE_ROOMS_UID_MAP` env CSV is a TEST-ONLY seam consulted ONLY behind the
+    paired `_test_uid_map_allowed()` flag; in production it is ignored, so a
+    managed agent cannot set `BRIDGE_ROOMS_UID_MAP="$(id -u):<leader>"` to
+    impersonate the leader (the original r2 hole codex caught).
+
     An empty map means "no per-agent uid isolation" => shared-mode.
     """
-    raw = os.environ.get("BRIDGE_ROOMS_UID_MAP", "").strip()
-    if raw:
-        out: dict[int, str] = {}
-        for item in raw.split(","):
-            item = item.strip()
-            if not item or ":" not in item:
-                continue
-            uid_s, agent = item.split(":", 1)
-            uid_s, agent = uid_s.strip(), agent.strip()
-            if uid_s.isdigit() and agent:
-                out[int(uid_s)] = agent
-        return out
+    if _test_uid_map_allowed():
+        raw = os.environ.get("BRIDGE_ROOMS_UID_MAP", "").strip()
+        if raw:
+            out: dict[int, str] = {}
+            for item in raw.split(","):
+                item = item.strip()
+                if not item or ":" not in item:
+                    continue
+                uid_s, agent = item.split(":", 1)
+                uid_s, agent = uid_s.strip(), agent.strip()
+                if uid_s.isdigit() and agent:
+                    out[int(uid_s)] = agent
+            return out
     return _uid_agent_map_from_roster()
 
 
@@ -212,16 +226,29 @@ def _uid_agent_map_from_roster() -> dict[int, str]:
 
 
 def _controller_uid() -> Optional[int]:
-    """The controller/operator uid: BRIDGE_CONTROLLER_UID, else bridge-home owner.
+    """The controller/operator uid — the bridge-home OWNER (a filesystem fact).
 
-    Used to recognize a proven operator shell (which may use `--as`). Returns
-    None when it cannot be established.
+    Deliberately does NOT trust `BRIDGE_CONTROLLER_UID` from the process env:
+    that is caller-settable, so honoring it would let an unmapped managed agent
+    set `BRIDGE_CONTROLLER_UID="$(id -u)"` to enter the controller regime where
+    `--as` is honored (the r2->r3 hole codex caught). The bridge home is owned
+    by the controller/operator and a non-root managed agent cannot chown it, so
+    its owner uid is an unforgeable controller identity. Returns None when it
+    cannot be stat'd → the controller bypass is then simply unavailable
+    (fail-closed for an unmapped uid, which is the safe default).
+
+    A `BRIDGE_ROOMS_TEST_CONTROLLER_UID` override exists ONLY behind the paired
+    test flag (`_test_uid_map_allowed()`), so a smoke can force a
+    non-controller context to exercise the UNRESOLVED fail-closed path. It is
+    NEVER honored in production (no flag) — identical gating to the test uid
+    map.
     """
-    raw = os.environ.get("BRIDGE_CONTROLLER_UID", "").strip()
-    if raw.isdigit():
-        return int(raw)
+    if _test_uid_map_allowed():
+        raw = os.environ.get("BRIDGE_ROOMS_TEST_CONTROLLER_UID", "").strip()
+        if raw.lstrip("-").isdigit():
+            return int(raw)
     try:
-        return os.stat(str(bridge_home())).st_uid
+        return os.stat(str(bridge_home())).st_uid  # noqa: raw-pathlib-controller-only
     except OSError:
         return None
 
@@ -536,8 +563,10 @@ def create_room(conn: sqlite3.Connection, *, name: str, leader_agent: str,
         "VALUES (?, ?, ?, ?, ?)",
         (room_id, leader_agent, leader_node, ROLE_LEADER, ts),
     )
+    # Seed the epoch-0 roster cache in the SAME transaction as the room +
+    # leader rows so a reader never sees a room with no cache row.
+    _recompute_roster_cache(conn, room_id, commit=False)
     conn.commit()
-    _recompute_roster_cache(conn, room_id)
     return room_id
 
 
@@ -666,17 +695,20 @@ def bump_epoch(conn: sqlite3.Connection, room_id: str) -> int:
     that happened to call `_recompute_roster_cache` explicitly.
     """
     require_room(conn, room_id)
+    # Single transaction: the epoch UPDATE and the room_roster_cache write
+    # commit together (codex Phase-4 r3 F2 nit) so a reader/crash can never
+    # observe a bumped rooms.epoch with a stale cache row, nor vice versa.
     conn.execute(
         "UPDATE rooms SET epoch = epoch + 1, updated_ts=? WHERE room_id=?",
         (now_ts(), room_id),
     )
-    conn.commit()
     row = conn.execute(
         "SELECT epoch FROM rooms WHERE room_id=?", (room_id,)
     ).fetchone()
-    # Re-persist the cache against the POST-bump membership + epoch so the
-    # cache row can never lag behind rooms.epoch.
-    _recompute_roster_cache(conn, room_id)
+    # Recompute against the POST-bump membership + epoch WITHOUT an intermediate
+    # commit, then commit both writes atomically.
+    _recompute_roster_cache(conn, room_id, commit=False)
+    conn.commit()
     return int(row["epoch"])
 
 
@@ -832,12 +864,17 @@ def canonical_roster_bytes(roster: dict[str, Any]) -> bytes:
     return json.dumps(roster, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _recompute_roster_cache(conn: sqlite3.Connection, room_id: str) -> None:
+def _recompute_roster_cache(conn: sqlite3.Connection, room_id: str,
+                            commit: bool = True) -> None:
     """Refresh the local roster cache row for a room from current membership.
 
     Single-node P1a writes the leader's own authoritative view (from_node =
     leader_node, mac empty — there is no cross-node link to sign with yet).
     P4 replaces this with the leader-MAC'd roster received over the node-link.
+
+    `commit=False` lets bump_epoch fold the cache write into the SAME
+    transaction as the epoch increment (atomic — codex Phase-4 r3 F2 nit). The
+    create_room path keeps commit=True (it is a standalone epoch-0 cache seed).
     """
     roster = roster_for(conn, room_id)
     room = require_room(conn, room_id)
@@ -853,7 +890,8 @@ def _recompute_roster_cache(conn: sqlite3.Connection, room_id: str) -> None:
             now_ts(),
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def approve_join(conn: sqlite3.Connection, room_id: str, agent: str,

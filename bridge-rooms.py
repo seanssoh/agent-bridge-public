@@ -97,20 +97,37 @@ def resolve_actor(args: argparse.Namespace) -> rooms.ActorAuth:
 
 
 def caller_agent(args: argparse.Namespace) -> str:
-    """The acting agent id (trusted OS-derived; see resolve_actor).
+    """The trusted acting agent id for self-service verbs (create/join/leave).
 
-    Used as the identity for self-service verbs (create/join/leave) and as the
-    audit actor. Leader-only verbs additionally enforce the regime via
-    `require_leader_actor`. Falls back to a best-effort env id only in the
-    advisory/controller regimes where that is the documented behavior.
+    Used as the identity a self-service verb records (the join requester, the
+    leaver, the room creator) and as the audit actor. It is the OS-derived
+    trusted actor (see resolve_actor):
+      - ISO_ENFORCED   : the uid-derived agent (unspoofable).
+      - CONTROLLER     : the proven operator's `--as`/best-effort id.
+      - SHARED_ADVISORY: the best-effort caller id (advisory mode).
+      - UNRESOLVED     : iso is active but this uid maps to no agent and is not
+                         the controller → there is NO legitimate identity, so
+                         we FAIL CLOSED rather than fall back to a
+                         caller-controlled `$USER` (which would let a spoofed
+                         join/leave identity through — codex Phase-4 r3 F1 #3).
     """
     actor = resolve_actor(args)
+    if actor.regime == rooms.ACTOR_UNRESOLVED:
+        raise rooms.RoomsError(
+            f"cannot establish a trusted actor for uid {actor.uid}: "
+            "linux-user isolation is active but this uid maps to no agent and "
+            "is not the controller — refusing to act under an untrusted "
+            "identity",
+            code="actor_unresolved",
+        )
     if actor.agent:
         return actor.agent
-    # UNRESOLVED (iso map present, this uid unmapped): no trusted identity.
-    # Self-service verbs still need *some* id for the row; use a sentinel the
-    # leader-auth path will reject, never another agent's name.
-    return os.environ.get("USER") or "unknown"
+    # ISO/CONTROLLER/SHARED with an empty best-effort id (e.g. no $USER): refuse
+    # rather than invent "unknown" — a mutation needs a real actor.
+    raise rooms.RoomsError(
+        "could not resolve an acting agent id (no OS-trusted actor and no "
+        "best-effort identity available)", code="actor_unresolved",
+    )
 
 
 def require_leader_actor(args: argparse.Namespace, room: Any) -> str:

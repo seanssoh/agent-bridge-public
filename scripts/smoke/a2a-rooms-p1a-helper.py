@@ -291,6 +291,18 @@ def cmd_assert_cache_fresh(db: str, room_id: str) -> int:
     return 0
 
 
+def cmd_resolve_regime() -> int:
+    """Print the resolved actor-auth regime + agent for the current process env.
+
+    Used by the F1 teeth to prove the env uid-map / controller-uid seams are
+    inert WITHOUT the paired test flags (a managed agent cannot spoof its
+    identity). Output shape: "regime=<r> agent=<a> hard=<bool>".
+    """
+    a = rooms.resolve_os_actor(None)
+    print(f"regime={a.regime} agent={a.agent} hard={a.hard}")
+    return 0
+
+
 def cmd_file_mode(path: str) -> int:
     mode = os.stat(path).st_mode & 0o777
     print(format(mode, "o"))
@@ -325,6 +337,8 @@ def main(argv: list[str]) -> int:
         return cmd_receiver_seam(rest[0])
     if cmd == "assert-cache-fresh":
         return cmd_assert_cache_fresh(rest[0], rest[1])
+    if cmd == "resolve-regime":
+        return cmd_resolve_regime()
     if cmd == "file-mode":
         return cmd_file_mode(rest[0])
     print(f"unknown subcommand: {cmd}", file=sys.stderr)
