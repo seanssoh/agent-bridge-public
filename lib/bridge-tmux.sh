@@ -1750,6 +1750,50 @@ bridge_tmux_pending_attention_rederive_queue_nudge() {
   return 0
 }
 
+# Issue #1952: detect the task id for a spooled `[task-complete]`
+# notification. Producer shape comes from bridge-task.sh::notify_task_requester
+# via bridge_compose_notification_text (lib/bridge-notify.sh):
+#   [Agent Bridge] task #123: [task-complete] ...
+#   [Agent Bridge] high task #123: [task-complete] ...
+#
+# Detection is anchored to the FIRST LINE header, not the body. Completion
+# titles and note text are user-controlled enough that a broad substring scan
+# would risk suppressing an unrelated send that merely quotes a completion
+# payload. Echoes the notification task id on stdout and returns 0 only for a
+# producer-shaped completion notification.
+bridge_tmux_pending_attention_task_complete_id() {
+  local decoded="$1"
+  local first_line="${decoded%%$'\n'*}"
+  if [[ "$first_line" =~ ^\[Agent\ Bridge\]([[:space:]][^[:space:]]+)?[[:space:]]task[[:space:]]#([0-9]+):[[:space:]]\[task-complete\] ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+# Issue #1952: completion notifications spooled during a busy window can be
+# replayed long after the requester already opened and closed the
+# `[task-complete]` task. Drop ONLY when a bounded read confirms the
+# notification task status is exactly `done`. Any parse/read/timeout failure
+# returns non-zero so the caller preserves the original payload.
+bridge_tmux_pending_attention_task_complete_is_done() {
+  local task_id="$1"
+  local status=""
+  local status_rc=0
+
+  [[ "$task_id" =~ ^[0-9]+$ ]] || return 1
+  if ! command -v bridge_with_timeout >/dev/null 2>&1; then
+    return 1
+  fi
+
+  status="$(bridge_with_timeout 15 spool_task_complete_status \
+    python3 "$BRIDGE_SCRIPT_DIR/bridge-daemon-helpers.py" \
+    task-status "$BRIDGE_TASK_DB" "$task_id" 2>/dev/null)" || status_rc=$?
+  (( status_rc == 0 )) || return 1
+  [[ "$status" == "done" ]] || return 1
+  return 0
+}
+
 bridge_tmux_pending_attention_flush() {
   local session="$1"
   local engine="$2"
@@ -1785,6 +1829,7 @@ bridge_tmux_pending_attention_flush() {
   local deferred_marker=0
   local rederived=""
   local rederive_rc=0
+  local task_complete_id=""
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     ts="${line%%$'\t'*}"
@@ -1807,7 +1852,12 @@ bridge_tmux_pending_attention_flush() {
     # LIVE queue and re-render. FAIL-SAFE: drop ONLY when the queue is
     # CONFIRMED count==0 (rc=2); on ANY rederive failure (rc=1: timeout /
     # query error / unresolvable) replay the original frozen text — never
-    # silently drop. Non-nudge payloads are replayed verbatim.
+    # silently drop.
+    #
+    # Issue #1952: a non-nudge `[task-complete]` notification can also go
+    # stale while spooled. Drop ONLY when a bounded DB read confirms the
+    # completion notification task is already done; otherwise preserve the
+    # original payload. Other non-nudge payloads still replay verbatim.
     if bridge_tmux_pending_attention_is_queue_nudge "$decoded"; then
       set +e
       rederived="$(bridge_tmux_pending_attention_rederive_queue_nudge "$agent")"
@@ -1821,6 +1871,11 @@ bridge_tmux_pending_attention_flush() {
         decoded="$rederived"
       fi
       # rc=1 (or empty rc=0) → fall through with the original frozen text.
+    elif task_complete_id="$(bridge_tmux_pending_attention_task_complete_id "$decoded")"; then
+      if bridge_tmux_pending_attention_task_complete_is_done "$task_complete_id"; then
+        # Requester already handled the completion notification task.
+        continue
+      fi
     fi
 
     if (( deferred_marker == 1 )); then

@@ -25,9 +25,19 @@
 #        (preserve), NOT rc=2. A transient failure must never look like
 #        count==0.
 #   R5 — non-nudge payload → is_queue_nudge returns false (verbatim replay).
+#   R6 — task-complete detection is anchored to the producer header and
+#        extracts only the notification task id.
+#   R7 — stale task-complete status check drops only confirmed done rows and
+#        preserves on queued/missing/read-failure cases.
+#   R8 — REAL flush teeth: drive bridge_tmux_pending_attention_flush end-to-end
+#        with a recording send stub and assert a DONE [task-complete] entry is
+#        DROPPED (no send) while QUEUED / MISSING / read-failure completion
+#        entries REPLAY (send fires). Reverting the drop `continue` in the
+#        flusher makes R8a fail.
 #   S1 — in-source wiring: the flusher calls the rederive, drops on rc=2,
-#        preserves on rc=1. Static grep (the flusher is coupled to the
-#        daemon main loop, same pattern as 1106-nudge-shell-recheck S1).
+#        preserves on rc=1, and gates task-complete stale drops on a bounded
+#        task-status read. Static grep (the flusher is coupled to the daemon
+#        main loop, same pattern as 1106-nudge-shell-recheck S1).
 #
 # Footgun #11: no python3 heredoc-stdin / `<<<` here-string at the point of
 # a python3 subprocess. DB seeding uses bridge-queue.py --format shell +
@@ -240,6 +250,127 @@ if bridge_tmux_pending_attention_is_queue_nudge "[Agent Bridge] event=inbox-boot
 fi
 printf '[smoke]   [ok] R5: header-anchored detection — recognizes real nudges, rejects body-quoted false positives + inbox-bootstrap\n'
 
+# ---- R6: task-complete detection is anchored to the producer header --------
+complete_id="$(create_task "[task-complete] worker finished" high)"
+[[ -n "$complete_id" ]] || fail "R6: completion task id empty"
+complete_high_payload="[Agent Bridge] high task #${complete_id}: [task-complete] worker finished"$'\n'"agb inbox ${agent}"
+parsed_complete_id="$(bridge_tmux_pending_attention_task_complete_id "$complete_high_payload")" \
+  || fail "R6: high-priority task-complete payload was not recognized"
+[[ "$parsed_complete_id" == "$complete_id" ]] \
+  || fail "R6: parsed high-priority completion id ${parsed_complete_id}, expected ${complete_id}"
+complete_normal_payload="[Agent Bridge] task #${complete_id}: [task-complete] worker finished"$'\n'"agb inbox ${agent}"
+parsed_normal_id="$(bridge_tmux_pending_attention_task_complete_id "$complete_normal_payload")" \
+  || fail "R6: normal-priority task-complete payload was not recognized"
+[[ "$parsed_normal_id" == "$complete_id" ]] \
+  || fail "R6: parsed normal-priority completion id ${parsed_normal_id}, expected ${complete_id}"
+if bridge_tmux_pending_attention_task_complete_id $'[Agent Bridge]: heads up from ops\n[Agent Bridge] high task #777: [task-complete] quoted in the body' >/dev/null; then
+  fail "R6: body-quoted task-complete payload was misclassified"
+fi
+if bridge_tmux_pending_attention_task_complete_id "[Agent Bridge] high task #${complete_id}: ordinary title" >/dev/null; then
+  fail "R6: non-completion task header was misclassified"
+fi
+printf '[smoke]   [ok] R6: task-complete detector extracts header task id and rejects body/title false positives\n'
+
+# ---- R7: stale task-complete status check is done-only and fail-safe -------
+if bridge_tmux_pending_attention_task_complete_is_done "$complete_id"; then
+  fail "R7: queued task-complete notification was treated as stale/done"
+fi
+python3 "$repo/bridge-queue.py" claim "$complete_id" --agent "$agent" >/dev/null
+if bridge_tmux_pending_attention_task_complete_is_done "$complete_id"; then
+  fail "R7: claimed task-complete notification was treated as stale/done"
+fi
+python3 "$repo/bridge-queue.py" done "$complete_id" --agent "$agent" --note "seen" >/dev/null
+if ! bridge_tmux_pending_attention_task_complete_is_done "$complete_id"; then
+  fail "R7: done task-complete notification was not classified as stale/done"
+fi
+if bridge_tmux_pending_attention_task_complete_is_done "99999999"; then
+  fail "R7: missing task id was treated as stale/done"
+fi
+if BRIDGE_TASK_DB="$corrupt_db" bridge_tmux_pending_attention_task_complete_is_done "$complete_id"; then
+  fail "R7: corrupt DB/read failure was treated as stale/done"
+fi
+task_status="$(python3 "$repo/bridge-daemon-helpers.py" task-status "$BRIDGE_TASK_DB" "$complete_id")" \
+  || fail "R7: task-status helper failed for completed task"
+[[ "$task_status" == "done" ]] || fail "R7: task-status helper returned ${task_status}, expected done"
+printf '[smoke]   [ok] R7: task-complete stale check drops only confirmed done rows and preserves on open/missing/read failure\n'
+
+# ---- R8: REAL flush drop/replay teeth --------------------------------------
+# R6/R7 exercise the predicates in isolation; R8 drives the ACTUAL
+# bridge_tmux_pending_attention_flush loop end-to-end and asserts the observable
+# effect: a DONE [task-complete] entry is DROPPED (send_and_submit is NOT
+# called for it), while QUEUED / MISSING / read-failure completion entries
+# REPLAY (send_and_submit IS called). TEETH: reverting the drop `continue` at
+# lib/bridge-tmux.sh::bridge_tmux_pending_attention_flush makes the DONE-drop
+# assertion fail (the entry would then be sent).
+#
+# Mechanism: stub bridge_tmux_send_and_submit to RECORD the decoded payload it
+# was handed (no real tmux) and return 0 (success → entry not re-spooled). The
+# flusher hands the verbatim completion payload as $3.
+sent_log="$scratch/r8-sent.log"
+bridge_tmux_send_and_submit() {
+  # $1=session $2=engine $3=decoded payload. Record the payload, succeed.
+  printf '%s\n' "$3" >> "$sent_log"
+  return 0
+}
+# Spool helpers append/flush against the live agent spool file; ensure a clean
+# slate per scenario so each assertion is unambiguous.
+flush_agent="r8-flush-agent"
+reset_spool() {
+  : > "$sent_log"
+  local sf
+  sf="$(bridge_agent_pending_attention_file "$flush_agent")"
+  mkdir -p "$(dirname "$sf")"
+  : > "$sf"
+}
+sent_count() { awk 'END{print NR+0}' "$sent_log"; }
+sent_contains() { grep -qF -- "$1" "$sent_log"; }
+
+# R8a: DONE completion notification → DROPPED (no send). complete_id is `done`
+# (closed in R7). Seed exactly that producer-shaped payload and flush.
+reset_spool
+done_payload="[Agent Bridge] task #${complete_id}: [task-complete] worker finished"$'\n'"agb inbox ${agent}"
+bridge_tmux_pending_attention_append "$flush_agent" "$done_payload"
+bridge_tmux_pending_attention_flush "r8-session" claude "$flush_agent" || true
+if (( "$(sent_count)" != 0 )); then
+  fail "R8a: a DONE [task-complete] entry was REPLAYED (send_and_submit called $(sent_count)x) — the stale drop did not fire. If the drop \`continue\` at bridge_tmux_pending_attention_flush is reverted, this is exactly the regression."
+fi
+printf '[smoke]   [ok] R8a: DONE [task-complete] is DROPPED by the real flush (no send)\n'
+
+# R8b: QUEUED (open) completion notification → REPLAYED (send fired). Fresh
+# task, never claimed/closed.
+reset_spool
+queued_id="$(create_task "[task-complete] still open" high)"
+[[ -n "$queued_id" ]] || fail "R8b: queued completion task id empty"
+queued_payload="[Agent Bridge] task #${queued_id}: [task-complete] still open"$'\n'"agb inbox ${agent}"
+bridge_tmux_pending_attention_append "$flush_agent" "$queued_payload"
+bridge_tmux_pending_attention_flush "r8-session" claude "$flush_agent" || true
+(( "$(sent_count)" >= 1 )) || fail "R8b: a QUEUED [task-complete] entry was DROPPED — it must replay (send_and_submit not called)"
+sent_contains "[task-complete] still open" || fail "R8b: queued completion payload not handed to send_and_submit: $(cat "$sent_log")"
+printf '[smoke]   [ok] R8b: QUEUED [task-complete] is REPLAYED by the real flush (send fired)\n'
+
+# R8c: MISSING/unknown completion task → REPLAYED (fail-safe preserve). Use a
+# task id that does not exist in the queue DB.
+reset_spool
+missing_payload="[Agent Bridge] task #99999999: [task-complete] unknown task"$'\n'"agb inbox ${agent}"
+bridge_tmux_pending_attention_append "$flush_agent" "$missing_payload"
+bridge_tmux_pending_attention_flush "r8-session" claude "$flush_agent" || true
+(( "$(sent_count)" >= 1 )) || fail "R8c: a MISSING-task [task-complete] entry was DROPPED — an unconfirmable status must preserve (replay), never drop"
+sent_contains "[task-complete] unknown task" || fail "R8c: missing-task completion payload not handed to send_and_submit: $(cat "$sent_log")"
+printf '[smoke]   [ok] R8c: MISSING [task-complete] is REPLAYED (fail-safe preserve)\n'
+
+# R8d: task-status READ FAILURE (corrupt DB) → REPLAYED (fail-safe preserve).
+# A queued id whose status read cannot complete must NEVER look like done.
+reset_spool
+readfail_payload="[Agent Bridge] task #${queued_id}: [task-complete] read failure case"$'\n'"agb inbox ${agent}"
+bridge_tmux_pending_attention_append "$flush_agent" "$readfail_payload"
+BRIDGE_TASK_DB="$corrupt_db" \
+  bridge_tmux_pending_attention_flush "r8-session" claude "$flush_agent" || true
+(( "$(sent_count)" >= 1 )) || fail "R8d: a task-status READ-FAILURE [task-complete] entry was DROPPED — a read failure must FAIL-SAFE to replay, never be mistaken for done"
+sent_contains "[task-complete] read failure case" || fail "R8d: read-failure completion payload not handed to send_and_submit: $(cat "$sent_log")"
+printf '[smoke]   [ok] R8d: task-status READ-FAILURE [task-complete] is REPLAYED (fail-safe preserve)\n'
+
+unset -f bridge_tmux_send_and_submit
+
 printf '[smoke]   [ok] rederive helper block passed\n'
 REDERIVE_UT_BODY
 
@@ -254,6 +385,7 @@ fi
 # S1 — in-source wiring (static grep)
 # ============================================================
 tmux_sh="$REPO_ROOT/lib/bridge-tmux.sh"
+flush_body="$(awk '/^bridge_tmux_pending_attention_flush\(\)/{f=1} f{print} /^}/{if(f)exit}' "$tmux_sh")"
 
 if ! grep -q "bridge_tmux_pending_attention_rederive_queue_nudge" "$tmux_sh"; then
   echo "[smoke][error] S1: flusher does not define/call the rederive helper" >&2
@@ -265,18 +397,46 @@ fi
 # The flusher must drop on rc=2 (continue) and fall through to preserve on
 # rc=1 — assert the flush loop references the rederive helper and the
 # drop/preserve branches.
-if ! grep -q "bridge_tmux_pending_attention_is_queue_nudge" "$tmux_sh"; then
+if ! printf '%s' "$flush_body" | grep -q "bridge_tmux_pending_attention_is_queue_nudge"; then
   echo "[smoke][error] S1: flusher does not gate the rederive on the nudge detector" >&2
   failed=1
 else
   echo "[smoke]   [ok] S1: flusher gates rederive on is_queue_nudge"
 fi
 
-if ! grep -Eq 'rederive_rc == 2' "$tmux_sh"; then
+if ! printf '%s' "$flush_body" | grep -Eq 'rederive_rc == 2'; then
   echo "[smoke][error] S1: flusher does not drop on confirmed-empty (rc=2)" >&2
   failed=1
 else
   echo "[smoke]   [ok] S1: flusher drops the entry on rc=2 (confirmed count==0)"
+fi
+
+if ! grep -q "bridge_tmux_pending_attention_task_complete_id" "$tmux_sh"; then
+  echo "[smoke][error] S1: lib/bridge-tmux.sh does not define the task-complete detector" >&2
+  failed=1
+else
+  echo "[smoke]   [ok] S1: task-complete detector is defined in lib/bridge-tmux.sh"
+fi
+
+if ! printf '%s' "$flush_body" | grep -q "bridge_tmux_pending_attention_task_complete_id"; then
+  echo "[smoke][error] S1: flusher does not gate on the task-complete detector" >&2
+  failed=1
+else
+  echo "[smoke]   [ok] S1: flusher gates non-nudge completion payloads on task-complete detector"
+fi
+
+if ! printf '%s' "$flush_body" | grep -q "bridge_tmux_pending_attention_task_complete_is_done"; then
+  echo "[smoke][error] S1: flusher does not call the task-complete stale checker" >&2
+  failed=1
+else
+  echo "[smoke]   [ok] S1: flusher gates task-complete drops on the stale checker"
+fi
+
+if ! grep -q "task-status" "$REPO_ROOT/bridge-daemon-helpers.py"; then
+  echo "[smoke][error] S1: bridge-daemon-helpers.py is missing the bounded task-status helper" >&2
+  failed=1
+else
+  echo "[smoke]   [ok] S1: task-status helper is registered for bounded status reads"
 fi
 
 if (( failed )); then
