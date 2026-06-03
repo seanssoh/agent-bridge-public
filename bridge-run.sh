@@ -680,6 +680,9 @@ export PATH
 export BRIDGE_AGENT_ID="$AGENT"
 export BRIDGE_ADMIN_AGENT_ID="$(bridge_admin_agent_id)"
 export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
+# Issue #1497: the bare name collides with BRIDGE_AGENT_WORKDIR[] in
+# lib/bridge-agents.sh, so hooks consume this scalar alias first.
+export BRIDGE_AGENT_WORKDIR_RESOLVED="$WORK_DIR"
 # Issue #1213 / #1217 (beta27): BRIDGE_AGENT_ISOLATION_MODE,
 # BRIDGE_AGENT_OS_USER, and BRIDGE_AGENT_INJECT_TIMESTAMP all share
 # their names with associative arrays declared in
@@ -819,6 +822,14 @@ bridge_run_refresh_roster_if_changed() {
   ENGINE="$(bridge_agent_engine "$AGENT")"
   SESSION="$(bridge_agent_session "$AGENT")"
   [[ -n "$WORK_DIR" ]] || bridge_die "'$AGENT'의 workdir가 비어 있습니다."
+  # Issue #1497 (#1498 r1): re-export the resolved-workdir scalar on the
+  # roster-refresh relaunch path too. Without this, a relaunch that recomputes
+  # WORK_DIR (e.g. the roster workdir changed) would leave child hooks
+  # inheriting the STALE BRIDGE_AGENT_WORKDIR_RESOLVED from initial startup,
+  # which hooks/bridge_hook_common.py prefers over the fresh roster/v2 answer —
+  # re-introducing the handoff misrouting this fix removes.
+  export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
+  export BRIDGE_AGENT_WORKDIR_RESOLVED="$WORK_DIR"
   cd "$WORK_DIR" || bridge_die "$WORK_DIR 디렉토리가 없습니다."
   if [[ -n "$BRIDGE_RUN_ROSTER_SIGNATURE" ]]; then
     log_line "[info] roster changed on disk; reloading before next relaunch"

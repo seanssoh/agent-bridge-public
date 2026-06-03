@@ -155,6 +155,147 @@ else
 fi
 rm -rf "$sce3_root"
 
+# ----- C4: v2 split-brain prefers data/agents/<a>/workdir ---------------
+sce4_root="$(mktemp -d -t agb-c4.XXXXXX)"
+sce4_home="$sce4_root/bridge-home"
+sce4_data="$sce4_root/data"
+sce4_agent_root="$sce4_data/agents"
+sce4_v2_workdir="$sce4_agent_root/v2-c4/workdir"
+sce4_v2_home="$sce4_agent_root/v2-c4/home"
+sce4_legacy_home="$sce4_home/agents/v2-c4"
+mkdir -p "$sce4_v2_workdir" "$sce4_v2_home" "$sce4_legacy_home"
+
+cat >"$sce4_v2_workdir/NEXT-SESSION.md" <<'MD'
+# Handoff (C4 v2)
+Read v2 workdir first.
+MD
+cat >"$sce4_legacy_home/NEXT-SESSION.md" <<'MD'
+# Handoff (C4 legacy)
+This must not win in v2 mode.
+MD
+
+sce4_out="$(
+  BRIDGE_HOME="$sce4_home" \
+    BRIDGE_DATA_ROOT="$sce4_data" \
+    BRIDGE_AGENT_ROOT_V2="$sce4_agent_root" \
+    BRIDGE_AGENT_ID=v2-c4 \
+    "$PYTHON" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/hooks')
+import bridge_hook_common as bhc
+print('WORKDIR=' + str(bhc.agent_workdir('v2-c4')))
+print('HOME=' + str(bhc.agent_default_home('v2-c4')))
+print(bhc.bootstrap_artifact_context('v2-c4'))
+" 2>&1 || true
+)"
+if [[ "$sce4_out" == *"WORKDIR=$sce4_v2_workdir"* \
+   && "$sce4_out" == *"HOME=$sce4_v2_home"* \
+   && "$sce4_out" == *"Handoff present: NEXT-SESSION.md exists at $sce4_v2_workdir/NEXT-SESSION.md"* ]]; then
+  pass "C4: v2 workdir/home beat existing legacy home"
+else
+  fail "C4: v2 split-brain resolver failed — output: $sce4_out"
+fi
+rm -rf "$sce4_root"
+
+# ----- C5: BRIDGE_AGENT_WORKDIR_RESOLVED beats bare workdir -------------
+sce5_root="$(mktemp -d -t agb-c5.XXXXXX)"
+sce5_home="$sce5_root/bridge-home"
+sce5_resolved="$sce5_root/resolved-workdir"
+sce5_bare="$sce5_root/bare-workdir"
+mkdir -p "$sce5_home/agents" "$sce5_resolved" "$sce5_bare"
+
+cat >"$sce5_resolved/NEXT-SESSION.md" <<'MD'
+# Handoff (C5 resolved)
+Resolved env must win.
+MD
+cat >"$sce5_bare/NEXT-SESSION.md" <<'MD'
+# Handoff (C5 bare)
+Bare env must not win when RESOLVED is present.
+MD
+
+sce5_out="$(
+  BRIDGE_HOME="$sce5_home" \
+    BRIDGE_AGENT_WORKDIR_RESOLVED="$sce5_resolved" \
+    BRIDGE_AGENT_WORKDIR="$sce5_bare" \
+    BRIDGE_AGENT_ID=dyn-c5 \
+    "$PYTHON" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/hooks')
+import bridge_hook_common as bhc
+print('WORKDIR=' + str(bhc.agent_workdir('dyn-c5')))
+print(bhc.bootstrap_artifact_context('dyn-c5'))
+" 2>&1 || true
+)"
+if [[ "$sce5_out" == *"WORKDIR=$sce5_resolved"* \
+   && "$sce5_out" == *"Handoff present: NEXT-SESSION.md exists at $sce5_resolved/NEXT-SESSION.md"* ]]; then
+  pass "C5: BRIDGE_AGENT_WORKDIR_RESOLVED wins over bare env"
+else
+  fail "C5: RESOLVED workdir did not win — output: $sce5_out"
+fi
+rm -rf "$sce5_root"
+
+# ----- C6: v2 signalled, NO on-disk v2 workdir → roster fallback ---------
+# The v2 dynamic / shared-mode shape (#1498 r1 BLOCKING gap): v2 is signalled
+# and the v2 IDENTITY HOME exists, but <root_v2>/<a>/workdir does NOT — the
+# agent's real workdir is a project dir resolved via the roster CLI.
+# agent_workdir must consult _resolve_workdir_via_roster() and return the
+# project workdir, NOT short-circuit to the v2 home/identity path. TEETH: if
+# the v2 branch skipped the roster call (returning the non-existent v2 workdir),
+# the project handoff would be missed and this assertion fails.
+sce6_root="$(mktemp -d -t agb-c6.XXXXXX)"
+sce6_home="$sce6_root/bridge-home"
+sce6_data="$sce6_root/data"
+sce6_agent_root="$sce6_data/agents"
+sce6_v2_home="$sce6_agent_root/dyn-c6/home"        # v2 identity home EXISTS
+sce6_project="$sce6_root/project-checkout"          # real workdir (via roster)
+sce6_overlay="$sce6_root/overlay-source"
+# deliberately do NOT create "$sce6_agent_root/dyn-c6/workdir"
+mkdir -p "$sce6_home/agents" "$sce6_v2_home" "$sce6_project" "$sce6_overlay/hooks"
+
+cp "$REPO_ROOT/hooks/bridge_hook_common.py" "$sce6_overlay/hooks/bridge_hook_common.py"
+cat >"$sce6_overlay/agent-bridge" <<EOF
+#!/usr/bin/env bash
+# fake agent-bridge for C6 smoke — roster returns the project workdir
+if [[ "\$1" == "agent" && "\$2" == "list" && "\$3" == "--json" ]]; then
+  cat <<JSON
+[
+  {"agent":"dyn-c6","engine":"claude","source":"dynamic","workdir":"$sce6_project"}
+]
+JSON
+  exit 0
+fi
+echo "fake agent-bridge: unsupported invocation: \$*" >&2
+exit 1
+EOF
+chmod +x "$sce6_overlay/agent-bridge"
+
+cat >"$sce6_project/NEXT-SESSION.md" <<'MD'
+# Handoff (C6 v2 dynamic)
+Real workdir is a project dir resolved via the roster.
+MD
+
+sce6_out="$(
+  BRIDGE_HOME="$sce6_home" \
+    BRIDGE_DATA_ROOT="$sce6_data" \
+    BRIDGE_AGENT_ROOT_V2="$sce6_agent_root" \
+    BRIDGE_AGENT_ID=dyn-c6 \
+    "$PYTHON" -c "
+import sys
+sys.path.insert(0, '$sce6_overlay/hooks')
+import bridge_hook_common as bhc
+print('WORKDIR=' + str(bhc.agent_workdir('dyn-c6')))
+print(bhc.bootstrap_artifact_context('dyn-c6'))
+" 2>&1 || true
+)"
+if [[ "$sce6_out" == *"WORKDIR=$sce6_project"* \
+   && "$sce6_out" == *"Handoff present: NEXT-SESSION.md exists at $sce6_project/NEXT-SESSION.md"* \
+   && "$sce6_out" != *"WORKDIR=$sce6_agent_root/dyn-c6"* ]]; then
+  pass "C6: v2 + no on-disk v2 workdir → roster fallback reached (project workdir handoff)"
+else
+  fail "C6: v2 dynamic roster fallback unreachable — output: $sce6_out"
+fi
+rm -rf "$sce6_root"
+
 # ----- Summary -----------------------------------------------------------
 printf '\n[smoke] dynamic-agent-handoff: %d pass, %d fail\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
