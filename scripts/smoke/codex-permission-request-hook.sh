@@ -244,56 +244,81 @@ task_after="$(python3 -c "import sqlite3; print(sqlite3.connect('$BRIDGE_TASK_DB
 smoke_assert_eq "$task_before" "$task_after" "8 no task created under recursion guard"
 
 # ---------------------------------------------------------------------------
-# Test 9 — TOOL_NAME LEAK CLASS (codex Phase-4 BLOCKING): a hostile tool_name
-# that smuggles a path + secret must be sanitized to a canonical token BEFORE
-# it reaches EITHER the audit row OR the queue task (title + body). The raw
-# path/secret must appear in NEITHER. Teeth: reverting the sanitizer (so
-# tool_name is persisted verbatim) makes the NEITHER-leaks assertions fail.
+# Test 9 — TOOL_NAME LEAK CLASS (codex Phase-4 BLOCKING, r3 hardening). The
+# tool_name field is a security sink: it must be ALLOWLISTED, not
+# leading-token-extracted. A hostile tool_name (path/secret in ANY position,
+# including the FIRST token) must NEVER reach the audit row OR the queue task
+# (title + body) — it collapses to `redacted-tool` + a one-way hash. A
+# LEGITIMATE tool name (a real Codex built-in, or the mcp__server__tool shape)
+# IS persisted as-is. Teeth both directions: reverting the allowlist sanitizer
+# makes the hostile-leak assertions fail; over-redacting a legitimate name
+# makes the positive assertions fail.
 # ---------------------------------------------------------------------------
-smoke_log "9. tool_name leak class — sanitized in audit AND queue task"
+smoke_log "9. tool_name allowlist — hostile redacted, legitimate persisted"
 
-# Use a fresh agent so its (agent,tool) throttle is clean, and an event whose
-# *tool_name* (not tool_input) carries the path+secret.
-LEAK_AGENT="codex-perm-leak-smoke"
-HOSTILE_TOOL="Write $RAW_PATH $RAW_SECRET"
-LEAK_EVENT="{\"tool_name\":\"$HOSTILE_TOOL\",\"tool_input\":{}}"
-: >"$AUDIT_LOG"
-out="$(printf '%s' "$LEAK_EVENT" | env -u BRIDGE_ADMIN_AGENT_ID \
-  BRIDGE_HOME="$BRIDGE_HOME" BRIDGE_STATE_DIR="$BRIDGE_STATE_DIR" \
-  BRIDGE_LOG_DIR="$BRIDGE_LOG_DIR" BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
-  BRIDGE_TASK_DB="$BRIDGE_TASK_DB" BRIDGE_AGENT_HOME_ROOT="$BRIDGE_HOME/agents" \
-  BRIDGE_AGENT_ID="$LEAK_AGENT" BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
-  BRIDGE_CODEX_PERMISSION_AUTO_QUEUE=on BRIDGE_CODEX_PERMISSION_QUEUE_THROTTLE_SECONDS=600 \
-  python3 "$HOOK")"
-smoke_assert_contains "$out" '"hookEventName": "PermissionRequest"' "9 envelope event name"
-
-# The audit row must carry only the sanitized token + a redaction marker, and
-# NEITHER the raw path NOR the secret.
-audit_content="$(cat "$AUDIT_LOG")"
-smoke_assert_contains "$audit_content" '"tool": "Write"' "9 audit tool sanitized to canonical token"
-smoke_assert_contains "$audit_content" '"tool_name_redacted": true' "9 audit flags redaction"
-smoke_assert_contains "$audit_content" "tool_sha256" "9 audit carries raw-name hash anchor"
-smoke_assert_not_contains "$audit_content" "$RAW_PATH" "9 path NOT in audit (tool_name)"
-smoke_assert_not_contains "$audit_content" "$RAW_SECRET" "9 secret NOT in audit (tool_name)"
-
-# The queued [PERMISSION] task title + body must also be sanitized.
-python3 -c "
+# Helper: run the hook for a given (agent, tool_name) with auto-queue on, then
+# return the concatenated audit-row + queued-task (title+body) blob so a single
+# leak assertion covers every persistence sink at once.
+collect_perm_sinks() {
+  # args: <agent> <tool_name_json_escaped>
+  local probe_agent="$1" tool_json="$2"
+  : >"$AUDIT_LOG"
+  printf '%s' "{\"tool_name\":\"$tool_json\",\"tool_input\":{}}" | env -u BRIDGE_ADMIN_AGENT_ID \
+    BRIDGE_HOME="$BRIDGE_HOME" BRIDGE_STATE_DIR="$BRIDGE_STATE_DIR" \
+    BRIDGE_LOG_DIR="$BRIDGE_LOG_DIR" BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
+    BRIDGE_TASK_DB="$BRIDGE_TASK_DB" BRIDGE_AGENT_HOME_ROOT="$BRIDGE_HOME/agents" \
+    BRIDGE_AGENT_ID="$probe_agent" BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
+    BRIDGE_CODEX_PERMISSION_AUTO_QUEUE=on BRIDGE_CODEX_PERMISSION_QUEUE_THROTTLE_SECONDS=600 \
+    python3 "$HOOK" >/dev/null
+  python3 -c "
 import sqlite3
+blob=open('$AUDIT_LOG').read()
 c=sqlite3.connect('$BRIDGE_TASK_DB'); c.row_factory=sqlite3.Row
-rows=c.execute(\"SELECT title, body_text, body_path FROM tasks WHERE assigned_to=? AND title LIKE '[PERMISSION]%'\", ('$ADMIN_AGENT',)).fetchall()
-blob=''
-for r in rows:
+for r in c.execute(\"SELECT title, body_text, body_path FROM tasks WHERE created_by=? AND title LIKE '[PERMISSION]%'\", ('$probe_agent',)).fetchall():
     blob += (r['title'] or '')
     b = r['body_text'] or ''
     if (not b) and r['body_path']:
         try: b=open(r['body_path']).read()
         except OSError: b=''
     blob += b
-open('$SMOKE_TMP_ROOT/leak-task-blob.txt','w').write(blob)
+import sys; sys.stdout.write(blob)
 "
-leak_blob="$(cat "$SMOKE_TMP_ROOT/leak-task-blob.txt")"
-smoke_assert_contains "$leak_blob" "needs approval for Write" "9 task title sanitized to canonical token"
-smoke_assert_not_contains "$leak_blob" "$RAW_PATH" "9 path NOT in queue task (title/body)"
-smoke_assert_not_contains "$leak_blob" "$RAW_SECRET" "9 secret NOT in queue task (title/body)"
+}
+
+# 9a. HOSTILE: secret is NOT the first token (the original r2 case). Whole
+# value is unrecognized → fully redacted in every sink.
+sinks_9a="$(collect_perm_sinks codex-leak-9a "Write $RAW_PATH $RAW_SECRET")"
+smoke_assert_contains "$sinks_9a" "redacted-tool" "9a unrecognized tool redacted"
+smoke_assert_not_contains "$sinks_9a" "$RAW_PATH" "9a path NOT in any sink"
+smoke_assert_not_contains "$sinks_9a" "$RAW_SECRET" "9a secret NOT in any sink"
+smoke_assert_not_contains "$sinks_9a" "needs approval for Write" "9a leading 'Write' token NOT persisted"
+
+# 9b. HOSTILE — SECRET-FIRST / arbitrary-token-first (the r3 bypass the
+# leading-token extractor missed): the secret IS the first token. Must still
+# redact everywhere — proves we do NOT preserve an arbitrary first token.
+sinks_9b="$(collect_perm_sinks codex-leak-9b "$RAW_SECRET $RAW_PATH")"
+smoke_assert_contains "$sinks_9b" "redacted-tool" "9b secret-first redacted"
+smoke_assert_not_contains "$sinks_9b" "$RAW_SECRET" "9b secret (first token) NOT in any sink"
+smoke_assert_not_contains "$sinks_9b" "$RAW_PATH" "9b path NOT in any sink"
+# Audit still carries the redaction marker + a one-way hash, never the raw name.
+smoke_assert_contains "$(cat "$AUDIT_LOG")" '"tool_name_redacted": true' "9b audit flags redaction"
+smoke_assert_contains "$(cat "$AUDIT_LOG")" "tool_sha256" "9b audit carries raw-name hash anchor"
+
+# 9c. HOSTILE — bare secret as the sole token (no path). A lone unrecognized
+# token must NOT be persisted (the core of the r3 fix).
+sinks_9c="$(collect_perm_sinks codex-leak-9c "$RAW_SECRET")"
+smoke_assert_contains "$sinks_9c" "redacted-tool" "9c lone secret redacted"
+smoke_assert_not_contains "$sinks_9c" "$RAW_SECRET" "9c lone secret NOT in any sink"
+
+# 9d. POSITIVE — a legitimate Codex built-in IS persisted verbatim.
+sinks_9d="$(collect_perm_sinks codex-ok-9d "shell")"
+smoke_assert_contains "$sinks_9d" "needs approval for shell" "9d builtin 'shell' persisted in task title"
+smoke_assert_contains "$sinks_9d" '"tool": "shell"' "9d builtin 'shell' persisted in audit"
+smoke_assert_contains "$sinks_9d" '"tool_name_redacted": false' "9d builtin NOT flagged redacted"
+
+# 9e. POSITIVE — a legitimate MCP tool (mcp__server__tool shape) IS persisted.
+sinks_9e="$(collect_perm_sinks codex-ok-9e "mcp__cosmax-crm__quote_request_list")"
+smoke_assert_contains "$sinks_9e" "mcp__cosmax-crm__quote_request_list" "9e MCP tool persisted"
+smoke_assert_contains "$sinks_9e" '"tool_name_redacted": false' "9e MCP tool NOT flagged redacted"
 
 smoke_log "PASS: $SMOKE_NAME"

@@ -80,16 +80,54 @@ _DEFAULT_THROTTLE_SECONDS = 600
 # itself fires hooks. Never re-enter.
 _RECURSION_ENV = "BRIDGE_HOOK_CODEX_PERMISSION_ACTIVE"
 
-# A legitimate tool name is a single canonical identifier: alnum plus a closed
-# set of separators (`_`, `.`, `:`, `-`). It must NEVER carry a path, argv, or
-# arbitrary free text. The sanitizer below extracts the leading canonical token
-# and discards everything else, so a hostile payload like
-# `Write /Users/op/keys.txt sk-...` cannot smuggle a path/secret through the
-# tool-NAME field into the audit row or the [PERMISSION] queue task (codex
-# Phase-4 BLOCKING — the tool_name leak class, sibling to the tool_input
-# redaction already in place).
-_TOOL_NAME_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
-_TOOL_NAME_MAX_LEN = 64
+# Tool-name sanitization is a SECURITY SINK: the value reaches the audit row,
+# the [PERMISSION] queue task title/body, and the throttle/context keys. The
+# tool name is fully caller-controlled (an untrusted hook payload), so we must
+# NOT trust "any leading token" — a hostile payload can put a path or secret as
+# the FIRST token (`<secret> /Users/op/keys.txt`) and a leading-token extractor
+# would persist it verbatim (codex r3 BLOCKING).
+#
+# Instead we ALLOWLIST: persist the value ONLY when it matches a recognized
+# Codex tool identifier; redact everything else to ``redacted-tool`` (the raw
+# value never survives — a one-way SHA-256 anchor preserves correlation).
+#
+# Two recognized shapes:
+#  1. A closed set of Codex 0.135 built-in tool names. Enumerated empirically
+#     from the codex-cli 0.135.0 binary's tool registry / tool-call event
+#     vocabulary (the `experimental_supported_tools` region + the
+#     *ToolCall*/*Tool* event names): shell, apply_patch, update_plan,
+#     exec_command, unified_exec, view_image, web_search, read_file,
+#     write_file, list_files, search. A few common forward-compat variants
+#     (read, write, edit_file, local_shell) are included defensively — every
+#     entry is still a fixed identifier, never free text. Unknown built-ins
+#     err toward redaction, which is the correct default for a security sink.
+#  2. The MCP fully-qualified shape ``mcp__<server>__<tool>`` (double-underscore
+#     separator, ``[A-Za-z0-9_-]+`` segments), confirmed from real codex MCP
+#     tool names in the binary (e.g. ``mcp__openaiDeveloperDocs__fetch_openai_doc``).
+#
+# Anything else (a path, a secret, arbitrary free text, an unrecognized
+# identifier) → ``redacted-tool``. A length cap bounds the MCP shape.
+_CODEX_BUILTIN_TOOLS = frozenset({
+    "shell",
+    "apply_patch",
+    "update_plan",
+    "exec_command",
+    "unified_exec",
+    "view_image",
+    "web_search",
+    "read_file",
+    "write_file",
+    "list_files",
+    "search",
+    # forward-compat variants (still fixed identifiers, not free text)
+    "read",
+    "write",
+    "edit_file",
+    "local_shell",
+})
+# Fully-qualified MCP tool shape: mcp__<server>__<tool>.
+_MCP_TOOL_RE = re.compile(r"^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+\Z")
+_TOOL_NAME_MAX_LEN = 96
 _REDACTED_TOOL_NAME = "redacted-tool"
 
 
@@ -135,31 +173,39 @@ def _raw_tool_name(event: dict[str, Any]) -> str:
 
 
 def _sanitize_tool_name(raw: str) -> str:
-    """Reduce an untrusted tool-name string to a SAFE canonical token.
+    """Reduce an untrusted tool-name string to a SAFE, RECOGNIZED identifier.
 
-    Extracts the leading ``[A-Za-z0-9_.:-]+`` token (the legitimate tool
-    identifier shape) and discards everything after it — so a hostile
-    ``Write /Users/op/keys.txt sk-…`` collapses to ``Write`` and no path /
-    argv / secret survives. The token is length-capped. A value with no
-    canonical leading token (e.g. starts with a path separator) yields
-    ``redacted-tool``; an empty/missing name yields ``unknown``.
+    ALLOWLIST, not leading-token extraction (codex r3 BLOCKING). The value is
+    persisted ONLY when the WHOLE string is a recognized Codex tool identifier:
+
+      * an exact match against the ``_CODEX_BUILTIN_TOOLS`` allowlist, or
+      * the MCP fully-qualified shape ``mcp__<server>__<tool>``
+        (``_MCP_TOOL_RE``), bounded by ``_TOOL_NAME_MAX_LEN``.
+
+    Anything else — a path, a secret, arbitrary free text, a multi-token blob,
+    OR an unrecognized single identifier — collapses to ``redacted-tool``. This
+    closes the secret-first / arbitrary-token-first bypass: a hostile
+    ``<secret> /path`` no longer survives because ``<secret>`` is not a
+    recognized tool name and the whole value fails both shapes. An empty /
+    missing name yields ``unknown``.
 
     This is the SINGLE source of the tool name for ALL persistence paths
     (audit ``detail.tool``, the ``[PERMISSION]`` task title/body, and the
-    throttle/context keys), mirroring the redaction discipline already
-    applied to ``tool_input``.
+    throttle/context keys), mirroring the redaction discipline applied to
+    ``tool_input``. Erring toward redaction is the correct default for a
+    security sink — a redacted legitimate-but-unknown tool is a cosmetic loss;
+    a persisted secret is a breach.
     """
     raw = (raw or "").strip()
     if not raw:
         return "unknown"
-    match = _TOOL_NAME_TOKEN_RE.match(raw)
-    if match is None:
-        # No canonical token at the start → the whole value is hostile
-        # free-text (e.g. a leading "/path" or quoted blob). Persist nothing
-        # from it; the SHA-256 anchor on the raw value preserves correlation.
+    if len(raw) > _TOOL_NAME_MAX_LEN:
         return _REDACTED_TOOL_NAME
-    token = match.group(0)[:_TOOL_NAME_MAX_LEN]
-    return token or _REDACTED_TOOL_NAME
+    if raw in _CODEX_BUILTIN_TOOLS:
+        return raw
+    if _MCP_TOOL_RE.match(raw):
+        return raw
+    return _REDACTED_TOOL_NAME
 
 
 def _tool_name(event: dict[str, Any]) -> str:
