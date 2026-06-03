@@ -822,6 +822,14 @@ bridge_run_refresh_roster_if_changed() {
   ENGINE="$(bridge_agent_engine "$AGENT")"
   SESSION="$(bridge_agent_session "$AGENT")"
   [[ -n "$WORK_DIR" ]] || bridge_die "'$AGENT'의 workdir가 비어 있습니다."
+  # Issue #1497 (#1498 r1): re-export the resolved-workdir scalar on the
+  # roster-refresh relaunch path too. Without this, a relaunch that recomputes
+  # WORK_DIR (e.g. the roster workdir changed) would leave child hooks
+  # inheriting the STALE BRIDGE_AGENT_WORKDIR_RESOLVED from initial startup,
+  # which hooks/bridge_hook_common.py prefers over the fresh roster/v2 answer —
+  # re-introducing the handoff misrouting this fix removes.
+  export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
+  export BRIDGE_AGENT_WORKDIR_RESOLVED="$WORK_DIR"
   cd "$WORK_DIR" || bridge_die "$WORK_DIR 디렉토리가 없습니다."
   if [[ -n "$BRIDGE_RUN_ROSTER_SIGNATURE" ]]; then
     log_line "[info] roster changed on disk; reloading before next relaunch"
