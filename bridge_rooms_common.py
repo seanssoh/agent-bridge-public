@@ -326,8 +326,23 @@ def resolve_os_actor(requested: Optional[str] = None) -> ActorAuth:
         return ActorAuth(agent=slug, regime=ACTOR_ISO_ENFORCED,
                          uid=uid, hard=True)
 
-    # NOT an iso OS user → either the controller/operator or a shared-mode
-    # install. The bridge-home owner (a filesystem fact) is the controller.
+    # NOT an iso OS user. On an ISO HOST (any `agent-bridge-*` user exists in
+    # the passwd DB — an un-spoofable fact), we must NOT grant CONTROLLER from
+    # the bridge-home owner, because `bridge_home()` is BRIDGE_HOME-env-derived
+    # and a custom-`--os-user` agent could point BRIDGE_HOME at a dir it owns to
+    # make `uid == stat(BRIDGE_HOME).st_uid` and self-promote to controller
+    # (codex Phase-4 r7). So on an iso host a non-iso-OS-user process FAILS
+    # CLOSED (UNRESOLVED) — the forgeable-BRIDGE_HOME controller bypass is
+    # disabled there. The legitimate operator on an iso host acts through an
+    # admin iso agent or controller-side tooling, not this ambiguous path.
+    if _host_has_iso_users():
+        return ActorAuth(agent="", regime=ACTOR_UNRESOLVED, uid=uid, hard=True)
+
+    # No iso users on the host → a genuine shared-mode / single-user install,
+    # which has NO hard team boundary anyway (leader-auth is advisory here). The
+    # bridge-home owner is the operator; a forged BRIDGE_HOME at most lets a
+    # same-host user reach the ADVISORY controller path (no hard grant — it only
+    # honors --as with a warning), which is acceptable in shared mode.
     controller = _controller_uid()
     if controller is not None and uid == controller:
         agent = (requested
@@ -336,14 +351,6 @@ def resolve_os_actor(requested: Optional[str] = None) -> ActorAuth:
                  or "")
         return ActorAuth(agent=str(agent).strip(), regime=ACTOR_CONTROLLER,
                          uid=uid, hard=False)
-
-    # Not an iso OS user and not the controller. If iso is active on this host
-    # (any `agent-bridge-*` user exists in the passwd DB — an un-spoofable
-    # fact, NOT env/roster-derived), a stray non-iso non-controller process is
-    # anomalous → fail CLOSED for a leader-only action. With NO iso users at
-    # all this is a genuine shared-mode install → advisory (warn, never block).
-    if _host_has_iso_users():
-        return ActorAuth(agent="", regime=ACTOR_UNRESOLVED, uid=uid, hard=True)
     agent = (requested
              or os.environ.get("BRIDGE_AGENT_ID")
              or os.environ.get("USER")

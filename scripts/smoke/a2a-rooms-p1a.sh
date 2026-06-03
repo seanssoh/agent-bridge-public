@@ -243,6 +243,25 @@ test_teeth_non_iso_on_iso_host_fails_closed() {
     "TEETH F1: non-iso non-controller process on an iso host must be UNRESOLVED (fail closed)"
 }
 
+test_teeth_iso_host_bridge_home_controller_bypass_closed() {
+  # THE r7 hole: a custom-os-user (non-iso-prefix) process on an ISO host sets
+  # BRIDGE_HOME to a dir IT OWNS so stat(BRIDGE_HOME).st_uid == its uid, trying
+  # to self-promote to CONTROLLER (where --as is honored). On an iso host the
+  # forgeable-BRIDGE_HOME controller bypass is DISABLED → it must be UNRESOLVED.
+  local selfhome="$SMOKE_TMP_ROOT/self-home"
+  mkdir -p "$selfhome"   # owned by us — the controller-uid check would match
+  local got
+  got="$(env "${ROOMS_TEST_FLAGS[@]}" \
+             "BRIDGE_ROOMS_TEST_ISO_USER=" \
+             "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
+             "BRIDGE_HOME=$selfhome" \
+           python3 "$HELPER" resolve-regime 2>/dev/null)"
+  smoke_assert_contains "$got" "regime=unresolved" \
+    "TEETH F1 r7: a self-owned BRIDGE_HOME must NOT grant controller on an iso host"
+  smoke_assert_not_contains "$got" "regime=controller" \
+    "TEETH F1 r7: the forgeable-BRIDGE_HOME controller bypass is disabled on iso hosts"
+}
+
 test_advisory_shared_mode_is_honest() {
   # GENUINE shared-mode: NOT an iso OS user, NOT the controller, AND no iso
   # users on the host -> advisory. A non-leader actor is WARNED, not
@@ -393,6 +412,7 @@ smoke_run "TEETH F1: iso leader-auth unspoofable (--as <leader> ignored)" test_t
 smoke_run "TEETH F1: no roster-probe on the security path (hostile env inert)" test_teeth_no_roster_probe_on_security_path
 smoke_run "TEETH F1: env BRIDGE_CONTROLLER_UID is NOT trusted" test_teeth_env_controller_uid_not_trusted
 smoke_run "TEETH F1: non-iso process on an iso host fails closed" test_teeth_non_iso_on_iso_host_fails_closed
+smoke_run "TEETH F1: BRIDGE_HOME controller-bypass disabled on iso host (r7)" test_teeth_iso_host_bridge_home_controller_bypass_closed
 smoke_run "shared-mode leader-auth is advisory + honest (warns, not blocks)" test_advisory_shared_mode_is_honest
 smoke_run "TEETH: wrong token-hash rejected" test_teeth_wrong_token_hash_rejected
 smoke_run "TEETH: leader cannot be kicked" test_teeth_cannot_kick_leader
