@@ -1,0 +1,14 @@
+# agent-bridge:managed profile=bridge-reviewer
+# Managed by agent-bridge. Regenerated on scaffold/upgrade; edits are replaced.
+#
+# Codex config-profile FILE. Codex loads this when you start a session with
+#   codex -p bridge-reviewer   (equivalently --profile bridge-reviewer)
+# which layers $CODEX_HOME/bridge-reviewer.config.toml on top of the base user
+# config (verified against codex-cli 0.135.0: `-p, --profile <name>` =>
+# "Layer $CODEX_HOME/<name>.config.toml on top of the base user config").
+#
+# bridge-reviewer — least privilege, for code/queue review sessions. Read-only
+# sandbox: inspect diffs, read the repo and the agent home, run read-only `agb`
+# queries. No file writes; network stays off.
+sandbox_mode = "read-only"
+approval_policy = "on-request"

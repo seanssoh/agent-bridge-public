@@ -232,17 +232,19 @@ select_for_path() {
       # AGENTS.md contains the protocol + the agb-done close step).
       add_required 1067-codex-provisioning
       ;;
-    assets/codex/prompts/*|assets/codex/permissions.toml)
+    assets/codex/prompts/*|assets/codex/profiles/*)
       # #8945 Track C: the agent-scoped Codex slash-command prompt templates and
-      # the bridge-role permission profiles. bridge_ensure_codex_agent_slash_
-      # commands renders these into <agent_home>/.codex/ (never the controller
-      # ~/.codex). The prompt files are .md and permissions.toml is non-.sh, so
-      # the is_docs_only_path early-return below would otherwise select only the
+      # the bridge-role permission profiles (real <role>.config.toml files that
+      # `codex -p bridge-<role>` layers). bridge_ensure_codex_agent_slash_commands
+      # renders these into <agent_home>/.codex/ (never the controller ~/.codex).
+      # The prompt files are .md and the profiles are non-.sh, so the
+      # is_docs_only_path early-return below would otherwise select only the
       # global required smokes. This pre-case lifts ahead of the short-circuit so
       # a drift in the managed marker, an agb verb/flag, the <agent-id>/<agent-
-      # home> placeholder set, or a role-profile name still pulls the Track C
-      # smokes (which assert the rendered assets land agent-scoped, carry valid
-      # agb verbs, are idempotent, and never touch the controller ~/.codex).
+      # home>/<bridge-home> placeholder set, a sandbox_mode, or a role-profile
+      # filename still pulls the Track C smokes (which assert the rendered assets
+      # land agent-scoped, carry valid agb verbs + real loadable config profiles,
+      # are idempotent, and never touch the controller ~/.codex).
       add_required codex-slash-commands codex-permission-profiles
       ;;
     agent-roster.local.example.sh)

@@ -2,18 +2,26 @@
 # shellcheck shell=bash
 # scripts/smoke/codex-permission-profiles.sh — #8945 Track C permissions smoke.
 #
-# Pins the agent-scoped Codex permission-profile provisioning contract:
+# Pins the agent-scoped Codex permission-profile provisioning contract. The
+# profiles ship as REAL Codex config-profile files: `codex -p, --profile <name>`
+# layers $CODEX_HOME/<name>.config.toml on top of the base user config (verified
+# against codex-cli 0.135.0). So the file Codex actually loads is
+# `bridge-<role>.config.toml` — NOT a standalone `permissions.toml` (which Codex
+# ignores). This smoke asserts the real profile files are installed:
 #
-#   T1: bridge_ensure_codex_agent_slash_commands deploys permissions.toml into
-#       <scaffold_target>/.codex/ with the agent-bridge:managed marker.
-#   T2: all three role profiles land — [permissions.bridge-admin],
-#       [permissions.bridge-worker], [permissions.bridge-reviewer] — and the
-#       file is valid, parseable TOML.
+#   T1: bridge_ensure_codex_agent_slash_commands deploys the three role profile
+#       files — bridge-reviewer.config.toml, bridge-worker.config.toml,
+#       bridge-admin.config.toml — into <scaffold_target>/.codex/ each carrying
+#       the agent-bridge:managed marker.
+#   T2: each profile file is valid, parseable TOML and carries a recognized
+#       `sandbox_mode` (read-only for reviewer, workspace-write for worker/admin)
+#       — i.e. real config Codex layers, not an inert `[permissions.*]` table.
+#       The driver also asserts NO inert `permissions.toml` is shipped.
 #   T3: per-agent <agent-home> / <bridge-home> substitution applied; the raw
-#       tokens are gone; idempotent re-run; an agent's own permissions.toml
+#       tokens are gone; idempotent re-run; an agent's own <role>.config.toml
 #       (no marker) is never clobbered.
-#   T4 (CRITICAL): the controller/operator global ~/.codex (real $HOME/.codex)
-#       is neither created nor mutated. Snapshot before/after.
+#   T4 (CRITICAL): the controller/operator global ~/.codex ($HOME/.codex) is
+#       neither created nor mutated (proven via a pinned clean FAKE_HOME).
 #
 # Footgun #11 / lint-heredoc-ban H3: driver emitted via printf-to-file; loops
 # read from temp files (no heredoc-stdin, no process substitution).
@@ -76,10 +84,12 @@ DRIVER_DIR="$SMOKE_TMP_ROOT/driver"
 mkdir -p "$DRIVER_DIR"
 DRIVER="$DRIVER_DIR/driver.sh"
 
-# Standalone TOML parser helper (file-as-argv; no heredoc-stdin). Exit codes:
-#   0 = parsed OK and all three bridge-* profiles present
+# Standalone TOML parser helper (file-as-argv; no heredoc-stdin).
+# Usage: toml-parse.py <profile.config.toml> <expected_sandbox_mode>
+# Exit codes:
+#   0 = parsed OK and top-level sandbox_mode == expected
 #   3 = no tomllib/tomli available (caller treats as skip)
-#   4 = parse error or a required profile is missing
+#   4 = parse error, missing sandbox_mode, or wrong sandbox_mode
 TOML_HELPER="$DRIVER_DIR/toml-parse.py"
 write_toml_helper() {
   local out="$1"
@@ -99,9 +109,13 @@ write_toml_helper() {
     '        data = t.load(fh)' \
     'except Exception:' \
     '    sys.exit(4)' \
-    'perms = data.get("permissions", {})' \
-    'need = {"bridge-admin", "bridge-worker", "bridge-reviewer"}' \
-    'sys.exit(0 if need.issubset(set(perms)) else 4)'
+    'expected = sys.argv[2] if len(sys.argv) > 2 else None' \
+    'mode = data.get("sandbox_mode")' \
+    'if mode is None:' \
+    '    sys.exit(4)' \
+    'if expected is not None and mode != expected:' \
+    '    sys.exit(4)' \
+    'sys.exit(0)'
   do
     printf '%s\n' "$line" >>"$out"
   done
@@ -123,43 +137,55 @@ write_driver() {
     'AGENT="probe-codex"' \
     'AGENT_HOME="$BRIDGE_AGENT_ROOT_V2/$AGENT/home"' \
     'mkdir -p "$AGENT_HOME"' \
-    'PERMS="$AGENT_HOME/.codex/permissions.toml"' \
+    'CODEX_DIR="$AGENT_HOME/.codex"' \
     'MARKER="$(bridge_codex_managed_asset_marker)"' \
-    '# ---- T1: deploy the permission profiles into agent-scoped .codex ----' \
+    '# ---- T1: deploy the three REAL <role>.config.toml profile files ----' \
     'bridge_ensure_codex_agent_slash_commands "$AGENT" "$AGENT_HOME" 2>/dev/null || true' \
-    'if [[ -f "$PERMS" ]]; then echo "T1_PERMS_FILE: present"; else echo "T1_PERMS_FILE: missing"; fi' \
-    'if [[ -f "$PERMS" ]] && grep -qF "$MARKER" "$PERMS" 2>/dev/null; then echo "T1_PERMS_MARKER: yes"; else echo "T1_PERMS_MARKER: no"; fi' \
-    '# ---- T2: all three role profiles present ----' \
-    'for role in bridge-admin bridge-worker bridge-reviewer; do' \
-    '  if [[ -f "$PERMS" ]] && grep -qF "[permissions.$role]" "$PERMS" 2>/dev/null; then echo "T2_PROFILE_${role}: yes"; else echo "T2_PROFILE_${role}: no"; fi' \
+    '# expected sandbox_mode per role: reviewer=read-only, worker/admin=workspace-write.' \
+    'for role in bridge-reviewer bridge-worker bridge-admin; do' \
+    '  f="$CODEX_DIR/$role.config.toml"' \
+    '  if [[ -f "$f" ]]; then echo "T1_PROFILE_${role}: present"; else echo "T1_PROFILE_${role}: missing"; fi' \
+    '  if [[ -f "$f" ]] && grep -qF "$MARKER" "$f" 2>/dev/null; then echo "T1_MARKER_${role}: yes"; else echo "T1_MARKER_${role}: no"; fi' \
     'done' \
-    '# T2: the TOML must actually parse + carry the three profiles. The parser' \
-    '# helper is a standalone file invoked with file-as-argv (no heredoc-stdin,' \
-    '# per footgun #11 / lint-heredoc-ban H3). It exits 0=ok, 3=no toml lib' \
-    '# (skip), 4=parse/profile failure.' \
-    'TOML_OK="skip"' \
-    'if command -v python3 >/dev/null 2>&1 && [[ -f "$TOML_HELPER" ]]; then' \
-    '  python3 "$TOML_HELPER" "$PERMS" >/dev/null 2>&1; trc=$?' \
-    '  if [[ $trc -eq 0 ]]; then TOML_OK="yes"; elif [[ $trc -eq 3 ]]; then TOML_OK="skip"; else TOML_OK="no"; fi' \
-    'fi' \
-    'echo "T2_TOML_PARSE: $TOML_OK"' \
+    '# T1: there must be NO inert permissions.toml shipped (Codex would ignore it).' \
+    'if [[ -e "$CODEX_DIR/permissions.toml" ]]; then echo "T1_NO_INERT_PERMS: present"; else echo "T1_NO_INERT_PERMS: absent"; fi' \
+    '# ---- T2: each profile is valid TOML with the right sandbox_mode ----' \
+    '# The parser helper is a standalone file invoked file-as-argv (no heredoc-' \
+    '# stdin, per footgun #11 / lint-heredoc-ban H3). exit 0=ok, 3=no toml lib' \
+    '# (skip), 4=parse/sandbox_mode failure.' \
+    'for spec in "bridge-reviewer read-only" "bridge-worker workspace-write" "bridge-admin workspace-write"; do' \
+    '  role="${spec%% *}"; want="${spec##* }"' \
+    '  f="$CODEX_DIR/$role.config.toml"' \
+    '  TOML_OK="skip"' \
+    '  if command -v python3 >/dev/null 2>&1 && [[ -f "$TOML_HELPER" && -f "$f" ]]; then' \
+    '    python3 "$TOML_HELPER" "$f" "$want" >/dev/null 2>&1; trc=$?' \
+    '    if [[ $trc -eq 0 ]]; then TOML_OK="yes"; elif [[ $trc -eq 3 ]]; then TOML_OK="skip"; else TOML_OK="no"; fi' \
+    '  fi' \
+    '  echo "T2_TOML_${role}: $TOML_OK"' \
+    '  # grep-level sandbox_mode assertion (always enforced, even when parse skips).' \
+    '  if [[ -f "$f" ]] && grep -qE "^sandbox_mode = \"$want\"" "$f" 2>/dev/null; then echo "T2_MODE_${role}: yes"; else echo "T2_MODE_${role}: no"; fi' \
+    'done' \
     '# ---- T3: per-agent substitution + idempotent + no-clobber ----' \
-    'if [[ -f "$PERMS" ]] && grep -qF "$AGENT_HOME" "$PERMS" 2>/dev/null; then echo "T3_SUBST_HOME: yes"; else echo "T3_SUBST_HOME: no"; fi' \
-    'if [[ -f "$PERMS" ]] && grep -qF "<agent-home>" "$PERMS" 2>/dev/null; then echo "T3_RAW_TOKEN: yes"; else echo "T3_RAW_TOKEN: no"; fi' \
+    'WORKER="$CODEX_DIR/bridge-worker.config.toml"' \
+    'ADMIN="$CODEX_DIR/bridge-admin.config.toml"' \
+    '# worker has <agent-home>; admin has <agent-home> AND <bridge-home>.' \
+    'if [[ -f "$WORKER" ]] && grep -qF "$AGENT_HOME" "$WORKER" 2>/dev/null; then echo "T3_SUBST_HOME: yes"; else echo "T3_SUBST_HOME: no"; fi' \
+    'if grep -qF "<agent-home>" "$CODEX_DIR"/bridge-*.config.toml 2>/dev/null; then echo "T3_RAW_AGENT_TOKEN: yes"; else echo "T3_RAW_AGENT_TOKEN: no"; fi' \
+    'if grep -qF "<bridge-home>" "$CODEX_DIR"/bridge-*.config.toml 2>/dev/null; then echo "T3_RAW_BRIDGE_TOKEN: yes"; else echo "T3_RAW_BRIDGE_TOKEN: no"; fi' \
     'bridge_ensure_codex_agent_slash_commands "$AGENT" "$AGENT_HOME" 2>/dev/null; RC2=$?' \
     'echo "T3_RERUN_RC: $RC2"' \
-    '# Replace the managed file with unmarked agent content; the installer must leave it.' \
-    'printf "%s\n" "# my own permissions, no marker" > "$PERMS"' \
-    'OWN_SHA_BEFORE="$(cksum "$PERMS" 2>/dev/null | awk "{print \$1}")"' \
+    '# Replace a managed profile with unmarked agent content; the installer must leave it.' \
+    'printf "%s\n" "# my own profile, no marker" > "$WORKER"' \
+    'OWN_SHA_BEFORE="$(cksum "$WORKER" 2>/dev/null | awk "{print \$1}")"' \
     'bridge_ensure_codex_agent_slash_commands "$AGENT" "$AGENT_HOME" 2>/dev/null || true' \
-    'OWN_SHA_AFTER="$(cksum "$PERMS" 2>/dev/null | awk "{print \$1}")"' \
+    'OWN_SHA_AFTER="$(cksum "$WORKER" 2>/dev/null | awk "{print \$1}")"' \
     'if [[ "$OWN_SHA_BEFORE" == "$OWN_SHA_AFTER" ]]; then echo "T3_OWN_PRESERVED: yes"; else echo "T3_OWN_PRESERVED: no"; fi' \
     '# ---- T4 teeth: agent-scoped, not under controller HOME ----' \
-    'case "$PERMS" in' \
-    '  "$HOME/.codex"/*) echo "T4_SCOPED_UNDER_CONTROLLER: yes" ;;' \
+    'case "$CODEX_DIR" in' \
+    '  "$HOME/.codex"|"$HOME/.codex"/*) echo "T4_SCOPED_UNDER_CONTROLLER: yes" ;;' \
     '  *) echo "T4_SCOPED_UNDER_CONTROLLER: no" ;;' \
     'esac' \
-    'echo "T4_PERMS_PATH: $PERMS"'
+    'echo "T4_CODEX_DIR: $CODEX_DIR"'
   do
     printf '%s\n' "$line" >>"$out"
   done
@@ -206,37 +232,44 @@ if [[ $RC -ne 0 ]]; then
 $OUT"
 fi
 
-# --- T1 assertions ---
-smoke_assert_eq "present" "$(extract_line "$OUT" "T1_PERMS_FILE")" \
-  "T1: permissions.toml deployed into agent-scoped .codex/"
-smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_PERMS_MARKER")" \
-  "T1: permissions.toml carries the agent-bridge:managed marker"
-
-# --- T2 assertions ---
-for role in bridge-admin bridge-worker bridge-reviewer; do
-  smoke_assert_eq "yes" "$(extract_line "$OUT" "T2_PROFILE_${role}")" \
-    "T2: [permissions.$role] profile present"
+# --- T1 assertions: the three real <role>.config.toml files land, marked ---
+for role in bridge-reviewer bridge-worker bridge-admin; do
+  smoke_assert_eq "present" "$(extract_line "$OUT" "T1_PROFILE_${role}")" \
+    "T1: $role.config.toml deployed into agent-scoped .codex/ (the file 'codex -p $role' loads)"
+  smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_MARKER_${role}")" \
+    "T1: $role.config.toml carries the agent-bridge:managed marker"
 done
-TOML_PARSE="$(extract_line "$OUT" "T2_TOML_PARSE")"
-case "$TOML_PARSE" in
-  yes) smoke_log "T2: permissions.toml is valid TOML and contains all three role profiles" ;;
-  skip) smoke_log "T2: TOML parse skipped (no tomllib/tomli available); grep-level profile checks still enforced" ;;
-  *) smoke_fail "T2: permissions.toml failed TOML parse / missing required profiles (got '$TOML_PARSE')" ;;
-esac
+smoke_assert_eq "absent" "$(extract_line "$OUT" "T1_NO_INERT_PERMS")" \
+  "T1: NO inert permissions.toml shipped (Codex never reads it; -p loads <name>.config.toml)"
+
+# --- T2 assertions: each profile is valid TOML with the right sandbox_mode ---
+for spec in "bridge-reviewer read-only" "bridge-worker workspace-write" "bridge-admin workspace-write"; do
+  role="${spec%% *}"; want="${spec##* }"
+  TOML_PARSE="$(extract_line "$OUT" "T2_TOML_${role}")"
+  case "$TOML_PARSE" in
+    yes) smoke_log "T2: $role.config.toml is valid TOML with sandbox_mode='$want'" ;;
+    skip) smoke_log "T2: $role.config.toml TOML parse skipped (no tomllib/tomli); grep-level sandbox_mode check still enforced" ;;
+    *) smoke_fail "T2: $role.config.toml failed TOML parse or sandbox_mode != '$want' (got '$TOML_PARSE')" ;;
+  esac
+  smoke_assert_eq "yes" "$(extract_line "$OUT" "T2_MODE_${role}")" \
+    "T2: $role.config.toml declares sandbox_mode = \"$want\""
+done
 
 # --- T3 assertions ---
 smoke_assert_eq "yes" "$(extract_line "$OUT" "T3_SUBST_HOME")" \
   "T3: <agent-home> substituted with the resolved agent home path"
-smoke_assert_eq "no" "$(extract_line "$OUT" "T3_RAW_TOKEN")" \
-  "T3: the raw <agent-home> token was substituted away"
+smoke_assert_eq "no" "$(extract_line "$OUT" "T3_RAW_AGENT_TOKEN")" \
+  "T3: the raw <agent-home> token was substituted away in all profiles"
+smoke_assert_eq "no" "$(extract_line "$OUT" "T3_RAW_BRIDGE_TOKEN")" \
+  "T3: the raw <bridge-home> token was substituted away in all profiles"
 smoke_assert_eq "0" "$(extract_line "$OUT" "T3_RERUN_RC")" \
   "T3: re-running the installer exits 0 (idempotent)"
 smoke_assert_eq "yes" "$(extract_line "$OUT" "T3_OWN_PRESERVED")" \
-  "T3: an agent's own (unmarked) permissions.toml is never clobbered"
+  "T3: an agent's own (unmarked) <role>.config.toml is never clobbered"
 
 # --- T4 assertions ---
 smoke_assert_eq "no" "$(extract_line "$OUT" "T4_SCOPED_UNDER_CONTROLLER")" \
-  "T4: permissions.toml is NOT under the controller \$HOME/.codex"
+  "T4: the installed .codex profile tree is NOT under the controller \$HOME/.codex"
 
 SNAP_AFTER="$SMOKE_TMP_ROOT/controller-codex-after.txt"
 snapshot_controller_codex "$SNAP_AFTER"
@@ -249,4 +282,4 @@ $(cat "$SNAP_AFTER")"
 fi
 smoke_log "T4 CRITICAL: controller \$HOME/.codex unchanged (snapshot identical before/after)"
 
-smoke_log "all tests PASS — #8945 Track C codex permission profiles: agent-scoped install, 3 role profiles, idempotent, controller ~/.codex untouched"
+smoke_log "all tests PASS — #8945 Track C codex permission profiles: 3 real <role>.config.toml files (codex -p bridge-<role>), valid sandbox_mode, no inert permissions.toml, idempotent, controller ~/.codex untouched"

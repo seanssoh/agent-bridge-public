@@ -10360,13 +10360,25 @@ bridge_ensure_codex_agent_slash_commands() {
     done
   fi
 
-  # 2) Permission profiles → <agent_home>/.codex/permissions.toml. Standalone
-  #    managed asset (not merged into config.toml, which the engine/operator
-  #    owns) so re-runs never clobber an agent's config.toml. Select a role at
-  #    session start with `-p bridge-<role>` once referenced from config.toml.
-  if [[ -f "$assets_dir/permissions.toml" ]]; then
-    bridge_codex_render_managed_asset \
-      "$assets_dir/permissions.toml" "$agent_home/.codex/permissions.toml" \
-      "$agent" "$agent_home" "$bridge_home"
+  # 2) Permission profiles → <agent_home>/.codex/bridge-<role>.config.toml.
+  #    Codex's `-p, --profile <name>` flag layers $CODEX_HOME/<name>.config.toml
+  #    on top of the base user config (verified against codex-cli 0.135.0), so
+  #    the file Codex actually loads is `<name>.config.toml` — NOT a standalone
+  #    `permissions.toml` (which Codex ignores). We install one real profile file
+  #    per role so `codex -p bridge-<role>` selects the role's sandbox/network
+  #    settings. Each is bridge-managed + per-agent substituted, never clobbering
+  #    an agent's own <name>.config.toml. CODEX_HOME resolves to <agent_home>/
+  #    .codex because the bridge launch sets HOME to the agent home — agent-
+  #    scoped, never the controller ~/.codex.
+  local profiles_src="$assets_dir/profiles"
+  if [[ -d "$profiles_src" ]]; then
+    local profile_dst="$agent_home/.codex"
+    local profile_file=""
+    for profile_file in "$profiles_src"/bridge-*.config.toml; do
+      [[ -f "$profile_file" ]] || continue
+      bridge_codex_render_managed_asset \
+        "$profile_file" "$profile_dst/$(basename "$profile_file")" \
+        "$agent" "$agent_home" "$bridge_home"
+    done
   fi
 }
