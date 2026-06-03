@@ -408,6 +408,26 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_compare(args: argparse.Namespace) -> int:
+    """Print the full semver 2.0.0 ordering of two versions.
+
+    Used by ``bridge-upgrade.sh`` (Issue #1516) to decide whether a
+    resolved upgrade TARGET would move the install BACKWARD relative to
+    the currently-installed version. Prints ``-1`` / ``0`` / ``1`` for
+    ``left < right`` / ``left == right`` / ``left > right`` and exits 0.
+
+    When either side is unparseable, prints nothing and exits 2 so the
+    caller treats the comparison as "unknown" and proceeds (it must NOT
+    fabricate a downgrade verdict from a malformed VERSION file — a
+    forward upgrade should never be blocked by an unreadable version).
+    """
+    result = compare_semver(args.left, args.right)
+    if result is None:
+        return 2
+    print(result)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -428,6 +448,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(monitor_parser)
     monitor_parser.add_argument("--state-file", required=True)
     monitor_parser.set_defaults(handler=cmd_monitor)
+
+    # Issue #1516: a thin, network-free comparator so bridge-upgrade.sh can
+    # detect a backward (downgrade) target before applying. Reuses the same
+    # compare_semver the release-notification path uses so the two agree.
+    compare_parser = sub.add_parser("compare")
+    compare_parser.add_argument("left")
+    compare_parser.add_argument("right")
+    compare_parser.set_defaults(handler=cmd_compare)
 
     return parser
 
