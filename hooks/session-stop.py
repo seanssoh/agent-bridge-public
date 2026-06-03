@@ -73,6 +73,16 @@ def _bridge_home() -> Path | None:
        r1 review on PR #450.
 
     Returning None signals main() to fast-path return 0.
+
+    NOTE (issue #1497 P2): intentionally NOT delegated to the canonical
+    operator_home() SSOT. This wrapper returns ``Path | None`` and its fallback
+    is load-bearing and DIFFERENT from operator_home(): when BRIDGE_HOME is
+    unset it returns the script's own location only when that location actually
+    looks like a bridge home (has scripts/ + agents/), else None so main()
+    fast-path-no-ops. operator_home() never returns None and always defaults to
+    ~/.agent-bridge, so swapping it in would fire reconcile from arbitrary
+    locations — a behavior change, not a pure dedup. Deferred to P3 (same reason
+    bridge_a2a_common.bridge_home() is deferred — divergent form / return type).
     """
     env_home = os.environ.get("BRIDGE_HOME")
     if env_home:

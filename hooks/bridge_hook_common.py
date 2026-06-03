@@ -17,6 +17,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+# Operator-home SSOT (issue #1497 P2). `lib/` is a sibling of `hooks/` in both
+# the source tree and the deployed runtime (`~/.agent-bridge/{hooks,lib}/`), so
+# `<this>/../lib` reaches `operator_home.py`. Set it up here rather than relying
+# on each importer (pre-compact / session-stop / tool-policy) to have done so —
+# this module is imported every session and must be self-sufficient. Mirrors the
+# guarded, dedup'd insert that `hooks/tool-policy.py` uses for system_config_paths.
+# The import is wrapped in try/except so a hook copy deployed WITHOUT its lib/
+# sibling (partial deploy, test overlay) still loads — the inline fallback is
+# byte-identical to operator_home() (strip()+expanduser()+default + guard).
+_LIB_DIR = Path(__file__).resolve().parent.parent / "lib"
+if _LIB_DIR.is_dir() and str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+try:
+    from operator_home import operator_home  # noqa: E402
+except ImportError:  # pragma: no cover — lib/ not co-deployed (partial/overlay)
+    def operator_home() -> Path:
+        explicit = os.environ.get("BRIDGE_HOME", "").strip()  # noqa: iso-helper-boundary — os.environ (.environ) false-matches the .env boundary pattern; BRIDGE_HOME is the operator runtime root, not an isolated artifact
+        if explicit:
+            return Path(explicit).expanduser()
+        return Path.home() / ".agent-bridge"
+
 PRIORITY_ORDER = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
 
 # Exact keys from bridge_render_template_string (bridge-agent.sh) that are
@@ -76,10 +98,9 @@ def bridge_active_agent_dir() -> Path:
 
 
 def bridge_home_dir() -> Path:
-    explicit = os.environ.get("BRIDGE_HOME", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    return Path.home() / ".agent-bridge"
+    # Operator bridge home — delegates to the canonical SSOT (issue #1497 P2).
+    # Byte-identical to the previous inline strip()+expanduser()+default body.
+    return operator_home()
 
 
 def bridge_script_dir() -> Path:

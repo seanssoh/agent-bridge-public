@@ -30,6 +30,19 @@ import fnmatch
 import os
 from pathlib import Path
 
+# operator_home lives next to this module in lib/. Importing this module at all
+# requires lib/ to be reachable, so the bare import normally succeeds; the
+# try/except keeps the module loadable under an exotic loader that placed only
+# this file on the path. Fallback is byte-identical to operator_home().
+try:
+    from operator_home import operator_home
+except ImportError:  # pragma: no cover — operator_home not co-located
+    def operator_home() -> Path:
+        explicit = os.environ.get("BRIDGE_HOME", "").strip()
+        if explicit:
+            return Path(explicit).expanduser()
+        return Path.home() / ".agent-bridge"
+
 
 def _glob_matches(relative: str, pattern: str) -> bool:
     """Segment-aware glob match: a `*` matches within ONE path segment.
@@ -83,16 +96,16 @@ PROTECTED_GLOBS: tuple[str, ...] = (
 
 
 def bridge_home_dir() -> Path:
-    """Mirror of bridge_hook_common.bridge_home_dir() for in-tree use.
+    """Operator bridge home — delegates to the canonical SSOT (issue #1497 P2).
 
-    Duplicated here so this module has zero imports from `hooks/`; the
-    wrapper (`bridge-config.py`) lives at the repo root and would otherwise
-    have to set sys.path before importing.
+    Kept as a thin same-name wrapper so existing callers (`bridge-config.py`,
+    `hooks/tool-policy.py`) need no change; the resolution logic now lives in
+    `lib/operator_home.py::operator_home()` and is shared with the other
+    former duplicates. `operator_home` is imported at module top (lib/ is on
+    sys.path whenever this module is importable). Byte-identical to the
+    previous strip()+expanduser()+`~/.agent-bridge`-fallback body.
     """
-    explicit = os.environ.get("BRIDGE_HOME", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    return Path.home() / ".agent-bridge"
+    return operator_home()
 
 
 def _candidate_relatives(path: Path, home: Path) -> list[str]:

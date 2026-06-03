@@ -6,9 +6,29 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# Operator-home SSOT (issue #1497 P2). This module lives at the repo root (and
+# `~/.agent-bridge/` root in the deployed runtime), so `lib/` is `<this>/lib`.
+# Set it up here so the module is self-sufficient regardless of whether the
+# importer (`bridge-guard.py` direct-import, `hooks/tool-policy.py` importlib
+# load) put lib/ on sys.path first. Mirrors the guarded, dedup'd insert that
+# `hooks/tool-policy.py` uses for system_config_paths.
+_LIB_DIR = Path(__file__).resolve().parent / "lib"
+if _LIB_DIR.is_dir() and str(_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(_LIB_DIR))
+
+try:
+    from operator_home import operator_home  # noqa: E402
+except ImportError:  # pragma: no cover — lib/ not co-located (partial/overlay)
+    def operator_home() -> Path:
+        explicit = os.environ.get("BRIDGE_HOME", "").strip()  # noqa: iso-helper-boundary — os.environ (.environ) false-matches the .env boundary pattern; BRIDGE_HOME is the operator runtime root, not an isolated artifact
+        if explicit:
+            return Path(explicit).expanduser()
+        return Path.home() / ".agent-bridge"
 
 SEVERITY_ORDER = {
     "safe": 0,
@@ -175,10 +195,9 @@ def severity_at_least(value: str, threshold: str) -> bool:
 
 
 def bridge_home_dir() -> Path:
-    explicit = os.environ.get("BRIDGE_HOME", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    return Path.home() / ".agent-bridge"
+    # Operator bridge home — delegates to the canonical SSOT (issue #1497 P2).
+    # Byte-identical to the previous inline strip()+expanduser()+default body.
+    return operator_home()
 
 
 def _host_profile_is_dev() -> bool:
