@@ -168,32 +168,87 @@ def _load_rooms_common():
         return None
 
 
-def _rooms_acl_mode_or_fail_closed(rooms, hard: bool) -> str:
-    """Read the rooms_acl mode; on a present-but-unreadable db, fail closed iff hard.
+def _canonical_rooms_db_path() -> Path:
+    """The rooms.db CANONICALLY co-located with the REAL task DB being written.
+
+    SECURITY (P1b r3): the rooms ACL enforcement DB must be derived from the SAME
+    home as the task DB this create actually mutates — NOT from an independent,
+    caller-redirectable `BRIDGE_A2A_ROOMS_DB`. Otherwise a managed agent could
+    keep the task-DB env REAL while pointing the rooms-DB env at a self-owned fake
+    (seeded so it shares a room with the target) and drive the real queue past the
+    gate. By pinning the enforcement rooms.db to `<task_db_dir>/handoff/rooms.db`
+    (the layout `rooms_db_path()` uses for the default home), a fake rooms-DB env
+    can never be paired with a real task DB. Mirrors the live layout: the task DB
+    lives at `<state>/tasks.db` and rooms.db at `<state>/handoff/rooms.db`.
+    """
+    return get_db_path().parent / "handoff" / "rooms.db"
+
+
+def _rooms_acl_mode_or_fail_closed(rooms, hard: bool, db_path: Path) -> str:
+    """Read the rooms_acl mode from `db_path`; on unreadable, fail closed iff hard.
 
     `hard` is True for an OS-enforced (iso) or unresolved actor — for those, a
     present-but-unreadable rooms.db must be treated as ENFORCE (fail closed), NOT
     silently 'off' (the BLOCKING fail-open codex r1 flagged). For controller/
     shared regimes (no hard boundary) a db fault degrades to 'off' (controller is
     exempt anyway; shared is advisory). A genuinely ABSENT db is 'off' for all.
+    `db_path` is the CANONICAL rooms.db (r3) — never a caller-redirected one.
     """
     try:
-        return rooms.rooms_acl_mode_strict()
+        return rooms.rooms_acl_mode_strict(db_path)
     except Exception:  # noqa: BLE001 - present-but-unreadable rooms.db
         return rooms.ACL_ENFORCE if hard else rooms.ACL_OFF
 
 
-def _rooms_is_controller_process(rooms) -> bool:
-    """True iff this process runs as the controller (the rooms.db owner uid).
+def _queue_is_controller_process() -> bool:
+    """True iff this process OWNS the REAL task DB being written (the controller).
 
-    Wraps rooms.is_controller_process() (P1b r2: the un-forgeable proof that the
-    queue child was spawned BY the controller-run gateway, since the gateway does
-    not drop uid). Fails CLOSED (False) on any fault or if the module predates the
-    helper — an un-anchored process must never be treated as a gateway child.
+    SECURITY ANCHOR (P1b r3): the un-forgeable proof that the queue child was
+    spawned BY the controller-run gateway. The thing a queue create MUTATES is the
+    TASK DB, so the controller proof is anchored to the owner of THAT db
+    (`os.stat(get_db_path()).st_uid`), NOT the rooms.db (which is selectable via
+    `BRIDGE_A2A_ROOMS_DB` — the codex r3 bypass). The gateway runs as the
+    controller and spawns the queue child in-process (no uid drop), so a genuine
+    child owns the controller's task DB. A direct managed agent runs as the agent
+    uid and CANNOT chown the controller-owned task DB; pointing `BRIDGE_TASK_DB`
+    at a self-owned fake makes it "controller" of a fake queue with ZERO real
+    effect (the P1a invariant applied to the db actually being mutated).
+
+    Fails CLOSED (False) on any stat fault — an un-anchored process is never the
+    controller.
+
+    When the task DB does not yet exist (first create on a fresh install), anchor
+    to the owner of the directory it WILL be created in: the create writes the db
+    there, so its owner is the effective controller for this queue. A managed
+    agent cannot write into the controller-owned `<state>/` dir, so it cannot
+    satisfy this for the real task DB; pointing BRIDGE_TASK_DB at a self-owned dir
+    yields a fake queue with zero real effect.
+
+    TEST SEAM (structurally prod-inert): on a single-uid test host the smoke
+    cannot create a foreign-owned task DB, so a paired-flag override
+    (BRIDGE_QUEUE_TEST_NOT_CONTROLLER=1) lets it simulate a NON-controller managed
+    agent. It is honored ONLY behind the same proven-inert paired-flag gate the
+    rooms actor-auth seams use (rooms._test_uid_map_allowed: BRIDGE_ROOMS_ALLOW_
+    TEST_UID_MAP=1 AND BRIDGE_A2A_ALLOW_TEST_BIND=1 AND the process owns the
+    rooms.db) — production sets none of these, so it is never honored there.
     """
+    if os.environ.get("BRIDGE_QUEUE_TEST_NOT_CONTROLLER") == "1":
+        rooms = _load_rooms_common()
+        if rooms is not None:
+            try:
+                if rooms._test_uid_map_allowed():
+                    return False
+            except Exception:  # noqa: BLE001 - missing helper -> ignore the test override
+                pass
+    me = os.getuid()
+    db = get_db_path()
     try:
-        return bool(rooms.is_controller_process())
-    except Exception:  # noqa: BLE001 - missing helper / stat fault -> not the controller
+        return os.stat(str(db)).st_uid == me  # noqa: raw-pathlib-controller-only — controller anchor: owner of the REAL task DB being mutated
+    except OSError:
+        pass
+    try:
+        return os.stat(str(db.parent)).st_uid == me  # noqa: raw-pathlib-controller-only — task DB absent: anchor to the dir it will be created in
+    except OSError:
         return False
 
 
@@ -236,34 +291,40 @@ def _rooms_acl_check_create(actor: str, target: str) -> None:
     if rooms is None:
         return
 
+    # The CANONICAL enforcement rooms.db, derived from the REAL task-DB home — NOT
+    # a caller-redirectable BRIDGE_A2A_ROOMS_DB (codex r3): a managed agent could
+    # otherwise pair a real task DB with a self-owned fake rooms DB (seeded so it
+    # shares a room with the target) and drive the real queue past the gate. Every
+    # security read below (mode + membership) reads THIS db, never the env one.
+    canonical_rooms_db = _canonical_rooms_db_path()
+
     # Resolve the OS-enforced actor + regime FIRST (before the mode read), so a
     # present-but-unreadable rooms.db can fail CLOSED for a real iso actor rather
-    # than silently reading 'off'. This closes the BLOCKING fail-open where a
-    # previously-enforced DB that becomes unreadable/corrupt would be treated as
-    # ACL-off (codex r1). The actor source is NEVER the client --from.
-    # CRITICAL (P1b r2): the gateway-child env signal is only TRUSTWORTHY when
-    # THIS process actually runs as the controller. The queue gateway runs as the
-    # controller and spawns the queue child in-process (no uid drop), so a genuine
-    # gateway child has os.getuid() == controller. A DIRECT managed-agent
-    # invocation runs as the AGENT uid and can set BRIDGE_QUEUE_GATEWAY_SERVER /
-    # BRIDGE_QUEUE_GATEWAY_ACTOR in its OWN env — but it is NOT the controller, so
-    # we MUST NOT trust those ambient env vars from it (that was the codex r2
-    # impersonation bypass). Gate the gateway branch on the un-forgeable
-    # rooms.db-owner controller anchor; a non-controller process falls through to
-    # resolve_os_actor() = its REAL OS identity and cannot impersonate.
+    # than silently reading 'off' (codex r1). The actor source is NEVER the client
+    # --from.
+    # CRITICAL (P1b r2+r3): the gateway-child env signal is only TRUSTWORTHY when
+    # THIS process is the controller, anchored to the owner of the REAL TASK DB
+    # being written (the thing a queue create mutates) — NOT the rooms.db owner
+    # (which is selectable via BRIDGE_A2A_ROOMS_DB; that was the r3 bypass). The
+    # gateway runs as the controller and spawns the queue child in-process (no uid
+    # drop), so a genuine child owns the controller's task DB. A direct managed
+    # agent runs as the AGENT uid, cannot chown the controller-owned task DB, and
+    # so fails this anchor → falls to resolve_os_actor() = its REAL OS identity →
+    # cannot impersonate. Pointing BRIDGE_TASK_DB at a self-owned fake makes it
+    # "controller" of a fake queue with zero real effect (the P1a invariant).
     under_gateway = (
-        _running_under_queue_gateway_server() and _rooms_is_controller_process(rooms)
+        _running_under_queue_gateway_server() and _queue_is_controller_process()
     )
     if under_gateway:
-        # We ARE the controller AND the gateway flag is set, so the gateway
-        # authenticated the actor (socket: SO_PEERCRED; file: request-file owner
-        # uid) and passed it in BRIDGE_QUEUE_GATEWAY_ACTOR (its own child env).
-        # Use it as the actor, NEVER the client --from (args.actor). The REGIME is
-        # the host's OS-separation fact: a genuine iso-v2 host (un-spoofable
-        # passwd users) -> ISO_ENFORCED (hard); a shared-mode host (no iso users,
-        # where the gateway never legitimately runs) -> SHARED_ADVISORY, so even a
-        # controller-uid process with a forged gateway env cannot hard-block
-        # cross-team traffic (§14 R1: shared-mode stays advisory either way).
+        # We ARE the controller (own the real task DB) AND the gateway flag is set,
+        # so the gateway authenticated the actor (socket: SO_PEERCRED; file:
+        # request-file owner uid) and passed it in BRIDGE_QUEUE_GATEWAY_ACTOR (its
+        # own child env). Use it as the actor, NEVER the client --from (args.actor).
+        # The REGIME is the host's OS-separation fact: a genuine iso-v2 host
+        # (un-spoofable passwd users) -> ISO_ENFORCED (hard); a shared-mode host
+        # (no iso users, where the gateway never legitimately runs) ->
+        # SHARED_ADVISORY, so even a controller-uid process with a forged gateway
+        # env cannot hard-block cross-team traffic (§14 R1: advisory either way).
         gateway_hard = _rooms_host_has_iso_users(rooms)
         gateway_actor = os.environ.get("BRIDGE_QUEUE_GATEWAY_ACTOR", "").strip()  # noqa: iso-helper-boundary — gateway-server child env (controller-anchored), not an isolated-agent artifact
         if not gateway_actor:
@@ -273,7 +334,7 @@ def _rooms_acl_check_create(actor: str, target: str) -> None:
             # this fails CLOSED under enforce; on a shared-mode host there is no
             # hard boundary, so it is a no-op pass (advisory regime never blocks).
             if gateway_hard:
-                mode = _rooms_acl_mode_or_fail_closed(rooms, hard=True)
+                mode = _rooms_acl_mode_or_fail_closed(rooms, hard=True, db_path=canonical_rooms_db)
                 if mode == rooms.ACL_ENFORCE:
                     raise SystemExit(
                         "rooms ACL: create denied (gateway could not establish a "
@@ -293,16 +354,63 @@ def _rooms_acl_check_create(actor: str, target: str) -> None:
             return
         regime = auth.regime
         decision_actor = auth.agent
+        # SECURITY (P1b r4): resolve_os_actor()'s CONTROLLER verdict anchors to the
+        # owner of the ENV-selected rooms.db (`_controller_uid` -> stat(rooms_db_
+        # path())), which honors BRIDGE_A2A_ROOMS_DB. A managed agent could point
+        # that env at a SELF-OWNED/absent fake rooms.db so resolve_os_actor returns
+        # CONTROLLER (with agent == the caller-supplied --from), and
+        # acl_create_decision short-circuits to allow BEFORE any canonical
+        # membership read (the codex r4 bypass). Re-anchor the controller exemption
+        # to the REAL TASK DB owner (the db this create mutates, NOT env-selectable):
+        # the genuine controller (daemon/operator) owns the real task DB; a managed
+        # agent does not. If the CONTROLLER verdict is NOT backed by task-DB
+        # ownership it is forged — discard it AND the caller-supplied agent
+        # (auth.agent carried the requested --from), and decide by the REAL OS facts:
+        #   - iso host  -> the create can only be a managed iso agent or an
+        #                  unresolved process. Re-resolve with requested=None so no
+        #                  --from override leaks in; an iso agent is then decided by
+        #                  its real (OS-derived) membership, anything else is
+        #                  UNRESOLVED -> fail closed. Never a controller bypass.
+        #   - shared host-> SHARED_ADVISORY (no OS boundary; warn, never block).
+        if regime == rooms.ACTOR_CONTROLLER and not _queue_is_controller_process():
+            if _rooms_host_has_iso_users(rooms):
+                try:
+                    reauth = rooms.resolve_os_actor(None)  # NO requested override
+                except Exception:  # noqa: BLE001 - resolver fault -> fail closed below
+                    reauth = None
+                if reauth is not None and reauth.regime == rooms.ACTOR_ISO_ENFORCED:
+                    regime = rooms.ACTOR_ISO_ENFORCED
+                    decision_actor = reauth.agent  # the real OS-derived slug, not --from
+                else:
+                    regime = rooms.ACTOR_UNRESOLVED
+                    decision_actor = ""
+            else:
+                regime = rooms.ACTOR_SHARED_ADVISORY
 
     # A hard regime (iso/unresolved) demands a fail-closed mode read: a present-
     # but-unreadable rooms.db must NOT degrade to 'off'. Controller/shared regimes
     # have no hard boundary, so a db fault there degrades to a no-op (controller
-    # is exempt anyway; shared is advisory).
+    # is exempt anyway; shared is advisory). Read the CANONICAL db (r3).
     hard = regime in (rooms.ACTOR_ISO_ENFORCED, rooms.ACTOR_UNRESOLVED)
-    mode = _rooms_acl_mode_or_fail_closed(rooms, hard=hard)
+    mode = _rooms_acl_mode_or_fail_closed(rooms, hard=hard, db_path=canonical_rooms_db)
     if mode != rooms.ACL_ENFORCE:
         return
 
+    # The membership lookup reads the CANONICAL rooms.db (r3), opened here and
+    # passed explicitly so acl_create_decision cannot fall back to the env path.
+    try:
+        conn = rooms.open_rooms_readonly(canonical_rooms_db)
+    except Exception:  # noqa: BLE001 - present-but-unreadable canonical db
+        conn = None
+        if hard:
+            raise SystemExit(
+                "rooms ACL: create denied (canonical rooms.db unreadable under "
+                "enforce — failing closed) [rooms_acl=enforce]"
+            )
+        return
+    if conn is None:
+        # No canonical rooms.db -> no rooms in the REAL home -> back-compat allow.
+        return
     try:
         decision = rooms.acl_create_decision(
             mode=mode,
@@ -310,6 +418,7 @@ def _rooms_acl_check_create(actor: str, target: str) -> None:
             actor=decision_actor,
             target=(target or "").strip(),
             node="",
+            conn=conn,
         )
     except Exception:  # noqa: BLE001 - decision fault: fail closed only on a hard path
         if regime in (rooms.ACTOR_ISO_ENFORCED, rooms.ACTOR_UNRESOLVED):
@@ -318,6 +427,12 @@ def _rooms_acl_check_create(actor: str, target: str) -> None:
                 "under enforce — failing closed)"
             )
         return
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     if decision.outcome == "deny":
         if decision.reason == rooms.ACL_DENY_FAIL_CLOSED:

@@ -533,15 +533,23 @@ def open_rooms() -> sqlite3.Connection:
     return _connect(rooms_db_path(), _ROOMS_SCHEMA)
 
 
-def open_rooms_readonly() -> Optional[sqlite3.Connection]:
+def open_rooms_readonly(
+    db_path: Optional[Path] = None,
+) -> Optional[sqlite3.Connection]:
     """Open an EXISTING rooms.db read-only; return None when it is absent.
 
     Used by read paths (the receiver seam, P1b's membership lookup) that must
     DEGRADE gracefully when no rooms have ever been defined — they must not
     create the db as a side effect of a lookup. A present-but-unreadable db
     raises RoomsError so a real fault is never silently treated as "no rooms".
+
+    `db_path` lets a SECURITY-sensitive caller pin the EXACT rooms.db to read
+    (P1b r3): the queue gate derives a CANONICAL rooms.db from the real task-DB
+    home and passes it here, so a caller-supplied `BRIDGE_A2A_ROOMS_DB` override
+    cannot point the enforcement lookup at a self-owned fake. When omitted, the
+    env-derived `rooms_db_path()` is used (the back-compat default).
     """
-    path = rooms_db_path()
+    path = db_path if db_path is not None else rooms_db_path()
     if not path.exists():
         return None
     try:
@@ -1091,7 +1099,7 @@ def rooms_acl_mode(conn: Optional[sqlite3.Connection] = None) -> str:
     return val if val in (ACL_OFF, ACL_ENFORCE) else ACL_OFF
 
 
-def rooms_acl_mode_strict() -> str:
+def rooms_acl_mode_strict(db_path: Optional[Path] = None) -> str:
     """Return the rooms_acl mode, but RAISE on a present-but-unreadable db.
 
     The lenient `rooms_acl_mode()` collapses every fault to ACL_OFF (back-compat
@@ -1103,8 +1111,12 @@ def rooms_acl_mode_strict() -> str:
       - db present + readable             -> the stored mode.
       - db present + UNREADABLE/corrupt   -> raises RoomsError so the queue gate
                                              can fail CLOSED for a real iso actor.
+
+    `db_path` pins the EXACT rooms.db (P1b r3): the queue gate passes the CANONICAL
+    rooms.db derived from the real task-DB home so a caller-redirected
+    `BRIDGE_A2A_ROOMS_DB` cannot point the mode read at a self-owned fake.
     """
-    conn = open_rooms_readonly()  # raises RoomsError on present-but-unreadable
+    conn = open_rooms_readonly(db_path)  # raises RoomsError on present-but-unreadable
     if conn is None:
         return ACL_OFF  # no db at all -> no rooms -> off (back-compat)
     try:

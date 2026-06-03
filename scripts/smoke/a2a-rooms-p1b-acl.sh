@@ -57,9 +57,6 @@ unset BRIDGE_A2A_CONFIG || true
 # Paired test-seam flags, applied INLINE only by the *_as helpers (never exported).
 ROOMS_TEST_FLAGS=("BRIDGE_ROOMS_ALLOW_TEST_UID_MAP=1" "BRIDGE_A2A_ALLOW_TEST_BIND=1")
 MY_UID="$(python3 -c 'import os; print(os.getuid())')"
-# A controller uid the current process is NOT (so is_controller_process() is
-# False for a simulated non-controller managed agent in the r2 forgery test).
-NOT_MY_UID="999998"
 
 room_cli_as() {
   # room_cli_as <agent> <args...> — run the rooms CLI as if the process OS user
@@ -194,36 +191,127 @@ test_spoof_from_rejected_direct() {
 # ---------------------------------------------------------------------------
 # r2 NEGATIVE CONTROL (the codex Phase-4 r2 BLOCKING): the gateway-child env
 # signal (BRIDGE_QUEUE_GATEWAY_SERVER / _ACTOR) is FORGEABLE by a direct managed
-# agent. cmd_create must trust it ONLY when this process is the controller (the
-# rooms.db owner uid) — the gateway runs as the controller and spawns the queue
-# child in-process (no uid drop), so a genuine child is the controller; a direct
-# managed (non-controller) agent that exports the flags is NOT, and must be
-# decided as its REAL OS actor. Without this, carol could impersonate bob.
+# agent. cmd_create must trust it ONLY when this process is the controller —
+# anchored (r3) to the owner of the REAL TASK DB being written. The gateway runs
+# as the controller and spawns the queue child in-process (no uid drop), so a
+# genuine child owns the task DB; a direct managed (non-controller) agent that
+# exports the flags does NOT, and must be decided as its REAL OS actor. The
+# paired-flag BRIDGE_QUEUE_TEST_NOT_CONTROLLER=1 simulates a non-controller agent
+# on a single-uid test host (production sets none of the paired flags).
 # ---------------------------------------------------------------------------
 test_r2_forged_gateway_env_rejected() {
-  # Simulate a direct iso agent 'carol' (NOT the controller: controller uid is a
-  # DIFFERENT uid) forging SERVER=1 + ACTOR=bob (bob shares team-a with the
-  # target alice; carol does not). The forged actor MUST be ignored -> decided as
-  # carol -> cross-room with alice -> DENIED. This is the full impersonation
-  # bypass codex r2 hermetically reproduced; it must now fail closed.
+  # Simulate a direct iso agent 'carol' (NOT the controller via the paired-flag
+  # seam) forging SERVER=1 + ACTOR=bob (bob shares team-a with the target alice;
+  # carol does not). The forged actor MUST be ignored -> decided as carol ->
+  # cross-room with alice -> DENIED. The impersonation bypass, reproduced.
   local err
   if err="$(env "${ROOMS_TEST_FLAGS[@]}" \
+               "BRIDGE_QUEUE_TEST_NOT_CONTROLLER=1" \
                "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-carol" \
                "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
-               "BRIDGE_ROOMS_TEST_CONTROLLER_UID=${NOT_MY_UID}" \
                "BRIDGE_QUEUE_GATEWAY_SERVER=1" "BRIDGE_QUEUE_GATEWAY_ACTOR=bob" \
              python3 "$QUEUE_CLI" create --to alice --from bob --title t --body b 2>&1)"; then
     smoke_fail "r2 TEETH: a non-controller agent forging the gateway env MUST NOT impersonate (carol->alice via forged ACTOR=bob)"
   fi
   smoke_assert_contains "$err" "acl_denied" "r2: forged gateway env is ignored -> cross-room deny"
   smoke_assert_contains "$err" "'carol'" "r2: decided as the REAL OS actor (carol), not the forged ACTOR=bob"
-  # Positive control: the SAME process, but as the controller uid, IS trusted ->
-  # ACTOR=alice -> bob (shared) ALLOWED. Proves the gate is not a blanket deny.
+  # Positive control: the SAME process AS THE CONTROLLER (owns the real task DB)
+  # IS trusted -> ACTOR=alice -> bob (shared) ALLOWED. Not a blanket deny.
   env "${ROOMS_TEST_FLAGS[@]}" \
-      "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" "BRIDGE_ROOMS_TEST_CONTROLLER_UID=${MY_UID}" \
+      "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
       "BRIDGE_QUEUE_GATEWAY_SERVER=1" "BRIDGE_QUEUE_GATEWAY_ACTOR=alice" \
     python3 "$QUEUE_CLI" create --to bob --from carol --title t --body b >/dev/null 2>&1 \
-    || smoke_fail "r2 control: a GENUINE gateway child (controller uid) must trust the gateway actor (alice->bob ALLOW)"
+    || smoke_fail "r2 control: a GENUINE gateway child (owns the task DB) must trust the gateway actor (alice->bob ALLOW)"
+}
+
+# ---------------------------------------------------------------------------
+# r3 NEGATIVE CONTROL (the codex Phase-4 r3 BLOCKING): the controller anchor and
+# the membership lookup must read the rooms.db CANONICALLY co-located with the
+# REAL task DB — NOT a caller-redirectable BRIDGE_A2A_ROOMS_DB. Otherwise a
+# managed agent keeps the task-DB env REAL while pointing the rooms-DB env at a
+# self-owned FAKE (seeded so it shares a room with the target) and drives the
+# real queue past the gate.
+# ---------------------------------------------------------------------------
+test_r3_fake_rooms_db_ignored() {
+  # Build a self-owned FAKE rooms.db where carol DOES share a room with alice
+  # (the exploit bait). Then a gateway create with the REAL task-DB env but the
+  # FAKE rooms-DB env: the gate must read the CANONICAL rooms.db (co-located with
+  # the real task DB, where carol does NOT share alice) -> DENIED. If the fake
+  # were honored this would be ALLOWED (the codex r3 bypass).
+  local fake_db="$SMOKE_TMP_ROOT/fake-rooms.db"
+  rm -f "$fake_db"
+  local fk fl
+  fk="$(env "${ROOMS_TEST_FLAGS[@]}" "BRIDGE_A2A_ROOMS_DB=$fake_db" \
+         "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-carol" \
+         python3 "$ROOMS_CLI" create --name fakeroom --json 2>/dev/null)"
+  local fr; fr="$(json_field room_id "$fk")"; fl="$(json_field invite_link "$fk")"
+  env "${ROOMS_TEST_FLAGS[@]}" "BRIDGE_A2A_ROOMS_DB=$fake_db" \
+      "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-alice" \
+    python3 "$ROOMS_CLI" join "$fl" >/dev/null 2>&1
+  env "${ROOMS_TEST_FLAGS[@]}" "BRIDGE_A2A_ROOMS_DB=$fake_db" \
+      "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-carol" \
+    python3 "$ROOMS_CLI" approve "$fr" alice >/dev/null 2>&1
+  env "${ROOMS_TEST_FLAGS[@]}" "BRIDGE_A2A_ROOMS_DB=$fake_db" \
+    python3 "$ROOMS_CLI" acl enforce >/dev/null 2>&1
+  # Exploit: real task DB (the smoke's, which the runner owns = controller) +
+  # FAKE rooms-DB env + gateway create as carol -> alice. Canonical read denies.
+  local err
+  if err="$(env "${ROOMS_TEST_FLAGS[@]}" \
+               "BRIDGE_A2A_ROOMS_DB=$fake_db" \
+               "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
+               "BRIDGE_QUEUE_GATEWAY_SERVER=1" "BRIDGE_QUEUE_GATEWAY_ACTOR=carol" \
+             python3 "$QUEUE_CLI" create --to alice --from carol --title t --body b 2>&1)"; then
+    smoke_fail "r3 TEETH: a self-owned FAKE rooms-DB env (carol shares alice) must NOT drive the real queue gate (carol->alice)"
+  fi
+  smoke_assert_contains "$err" "acl_denied" \
+    "r3: the enforcement rooms.db is the CANONICAL one (real home), not the redirected fake"
+  smoke_assert_contains "$err" "'carol'" "r3: decided against the canonical rooms.db (carol not sharing alice)"
+}
+
+# ---------------------------------------------------------------------------
+# r4 NEGATIVE CONTROL (the codex Phase-4 r4 BLOCKING): the DIRECT (non-gateway)
+# fallback can self-promote to ACTOR_CONTROLLER through resolve_os_actor(), whose
+# controller verdict anchors to the ENV-selected rooms.db owner (BRIDGE_A2A_ROOMS_
+# DB). A managed agent points the rooms-DB env at a self-owned/absent fake →
+# resolve_os_actor returns CONTROLLER → acl_create_decision short-circuits to
+# allow BEFORE the canonical membership read. The fix re-anchors the controller
+# exemption to the REAL TASK DB owner: a non-task-DB-owner CONTROLLER verdict is
+# forged → discarded (and the caller-supplied --from with it) → decided by the
+# REAL OS facts against the canonical rooms.db.
+# ---------------------------------------------------------------------------
+test_r4_direct_fallback_fake_controller_rejected() {
+  # Managed iso 'carol' (NOT the real task-DB owner) on the DIRECT path (no
+  # gateway flag) points the rooms-DB env at an ABSENT fake and passes --from bob.
+  # resolve_os_actor would return CONTROLLER off the fake rooms-DB owner; the fix
+  # re-anchors to the real task DB → not owned → forged controller discarded →
+  # re-resolved as the REAL OS actor (carol) → canonical: carol not in alice's
+  # room → DENIED. The forged --from bob is NOT honored.
+  local err
+  if err="$(env "${ROOMS_TEST_FLAGS[@]}" \
+               "BRIDGE_QUEUE_TEST_NOT_CONTROLLER=1" \
+               "BRIDGE_A2A_ROOMS_DB=$SMOKE_TMP_ROOT/r4-absent/fake.db" \
+               "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-carol" \
+               "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
+             python3 "$QUEUE_CLI" create --to alice --from bob --title t --body b 2>&1)"; then
+    smoke_fail "r4 TEETH: a direct managed agent forging CONTROLLER via a fake rooms-DB must NOT bypass (carol->alice)"
+  fi
+  smoke_assert_contains "$err" "acl_denied" \
+    "r4: a forged CONTROLLER (fake rooms-DB owner) is discarded; decided by real OS membership"
+  smoke_assert_contains "$err" "'carol'" "r4: decided as the REAL OS actor (carol), not the forged --from bob"
+  # Non-iso force-controller variant: resolve returns CONTROLLER via the gated
+  # test controller-uid match + non-iso, but the task DB is not owned -> the
+  # forged controller is discarded -> UNRESOLVED -> fail closed (DENY).
+  if err="$(env "${ROOMS_TEST_FLAGS[@]}" \
+               "BRIDGE_QUEUE_TEST_NOT_CONTROLLER=1" \
+               "BRIDGE_A2A_ROOMS_DB=$SMOKE_TMP_ROOT/r4-self/fake.db" \
+               "BRIDGE_ROOMS_TEST_ISO_USER=" \
+               "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
+               "BRIDGE_ROOMS_TEST_CONTROLLER_UID=${MY_UID}" \
+             python3 "$QUEUE_CLI" create --to alice --from bob --title t --body b 2>&1)"; then
+    smoke_fail "r4 TEETH: a non-iso forged CONTROLLER without task-DB ownership must FAIL CLOSED"
+  fi
+  smoke_assert_contains "$err" "fail" \
+    "r4: a non-iso forged controller -> UNRESOLVED fail-closed (no membership bypass)"
 }
 
 test_r2_shared_mode_forged_env_advisory() {
@@ -233,7 +321,7 @@ test_r2_shared_mode_forged_env_advisory() {
   # The create SUCCEEDS (advisory regime warns, never blocks).
   env "${ROOMS_TEST_FLAGS[@]}" \
       "BRIDGE_ROOMS_TEST_ISO_USER=" \
-      "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=0" "BRIDGE_ROOMS_TEST_CONTROLLER_UID=${MY_UID}" \
+      "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=0" \
       "BRIDGE_QUEUE_GATEWAY_SERVER=1" "BRIDGE_QUEUE_GATEWAY_ACTOR=bob" \
     python3 "$QUEUE_CLI" create --to carol --from bob --title t --body b >/dev/null 2>&1 \
     || smoke_fail "r2 shared-mode: a forged gateway env on a non-iso host must stay ADVISORY (no hard block)"
@@ -245,15 +333,15 @@ test_r2_shared_mode_forged_env_advisory() {
 # This closes the file-transport spoof: the file gateway does NOT rewrite
 # --from, so cmd_create must NOT trust args.actor — only the gateway env var.
 # ---------------------------------------------------------------------------
-# A GENUINE gateway child: this process IS the controller (controller uid ==
-# MY_UID, the rooms.db owner) on an iso host. Only then is the gateway-child env
-# signal trusted (r2). queue_create_gw_child <gateway_actor|""> <create-args...>.
+# A GENUINE gateway child: this process IS the controller — it owns the REAL task
+# DB (the smoke runner created it), the r3 anchor. On an iso host the gateway-
+# child env signal is then trusted. queue_create_gw_child <gw_actor|""> <args...>.
 queue_create_gw_child() {
   local gw_actor="$1"; shift
   local actor_env=()
   [[ -n "$gw_actor" ]] && actor_env=("BRIDGE_QUEUE_GATEWAY_ACTOR=${gw_actor}")
   env "${ROOMS_TEST_FLAGS[@]}" \
-      "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" "BRIDGE_ROOMS_TEST_CONTROLLER_UID=${MY_UID}" \
+      "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
       "BRIDGE_QUEUE_GATEWAY_SERVER=1" "${actor_env[@]}" \
     python3 "$QUEUE_CLI" create "$@"
 }
@@ -295,7 +383,7 @@ test_gateway_server_corrupt_db_fails_closed() {
   printf 'corrupt not-sqlite %.0s' {1..60} >"$corrupt_home/state/handoff/rooms.db"
   local err
   if err="$(env "${ROOMS_TEST_FLAGS[@]}" \
-               "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" "BRIDGE_ROOMS_TEST_CONTROLLER_UID=${MY_UID}" \
+               "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
                "BRIDGE_QUEUE_GATEWAY_SERVER=1" "BRIDGE_QUEUE_GATEWAY_ACTOR=alice" \
                BRIDGE_HOME="$corrupt_home" BRIDGE_STATE_DIR="$corrupt_home/state" \
                BRIDGE_TASK_DB="$corrupt_home/state/tasks.db" \
@@ -437,6 +525,8 @@ smoke_run "enforce cross-room DENY (fail-closed, audited reason; gateway + direc
 smoke_run "SPOOF teeth: --from rejected at the gateway (OS peer decides)" test_spoof_from_rejected_gateway
 smoke_run "SPOOF teeth: --from rejected on the direct path (resolve_os_actor)" test_spoof_from_rejected_direct
 smoke_run "r2 TEETH: forged gateway env by a non-controller agent is IGNORED (impersonation bypass closed)" test_r2_forged_gateway_env_rejected
+smoke_run "r3 TEETH: a self-owned FAKE rooms-DB env cannot drive the real queue gate (canonical rooms.db)" test_r3_fake_rooms_db_ignored
+smoke_run "r4 TEETH: direct-fallback forged CONTROLLER via fake rooms-DB is rejected (task-DB-owner anchor)" test_r4_direct_fallback_fake_controller_rejected
 smoke_run "r2: shared-mode forged gateway env stays ADVISORY (no hard block)" test_r2_shared_mode_forged_env_advisory
 smoke_run "gateway-server uses BRIDGE_QUEUE_GATEWAY_ACTOR, NOT client --from (file-xport spoof closed)" test_gateway_server_trusted_actor_env
 smoke_run "gateway-server with NO trusted actor FAILS CLOSED under enforce (file-xport BLOCKING)" test_gateway_server_no_actor_fails_closed
