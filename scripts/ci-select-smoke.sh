@@ -116,6 +116,12 @@ add_required 1473-agent-list-iso-state-fallback
 # survives `exec` into the bridge-cron.sh child via the agent-bridge/agb wrapper
 # — without weakening the #1359 iso/non-admin reject.
 add_required 1474-wrapper-admin-cron-exemption
+# #1454: security canary for the bridge-lib.sh Bash-3.2→4+ re-exec — the
+# ambient-secret exposure window (exported-function / PATH-shadow / BASH_ENV
+# during the re-exec). In the static suite so any bridge-lib.sh /
+# lib/bridge-secret-scrub.sh / scripts/smoke/* change re-runs it; the per-file
+# cases below also pull it directly.
+add_required 1454-bridge-lib-reexec-secret-canary
 # #8945 Track B: expanded Codex hook coverage (PreCompact / PostCompact /
 # SubagentStart / SubagentStop / PermissionRequest). All audit-only by default;
 # the permission-request smoke pins the security contract.
@@ -2449,6 +2455,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       #         PR cannot revive the ACL scanner or break the admin
       #         set CLI surface.
       add_required K-beta4-nits
+      ;;
+
+    lib/bridge-secret-scrub.sh)
+      # #1454: the shared ambient-secret scrub/transit primitive. Pull the
+      # bridge-lib.sh re-exec security canary on every change to it. (A change
+      # to bridge-lib.sh itself already pulls the canary via the full static
+      # suite below.)
+      add_required 1454-bridge-lib-reexec-secret-canary
       ;;
 
     bridge-lib.sh|lib/bridge-core.sh|lib/bridge-agents.sh|agent-roster.sh|agent-roster.local.example.sh|bridge-config.sh)
