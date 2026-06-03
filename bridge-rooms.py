@@ -256,6 +256,17 @@ def _roster_agents() -> list[str]:
 # --------------------------------------------------------------------------
 
 def cmd_create(args: argparse.Namespace) -> int:
+    # #1517: on a fresh iso host the canonical rooms.db does not exist yet, so
+    # the controller anchor (`_controller_uid` = stat(rooms.db).st_uid) has
+    # nothing to anchor to and even the genuine controller's first `create`
+    # would resolve to ACTOR_UNRESOLVED. Controller-only auto-bootstrap seeds
+    # the canonical controller-owned db FIRST (no-op if it already exists or if
+    # the caller is not the proven controller of the canonical location), so the
+    # actor resolution below anchors to it. A managed iso agent does NOT own the
+    # canonical state dir → bootstrap is refused → it STILL fails closed (the
+    # P1b invariant is preserved). The bootstrap never honors a caller-redirected
+    # BRIDGE_A2A_ROOMS_DB (canonical path only).
+    rooms.maybe_bootstrap_rooms_db()
     node = local_node()
     leader = caller_agent(args)
     token = rooms.mint_invite_token()
@@ -535,6 +546,12 @@ def cmd_leave(args: argparse.Namespace) -> int:
 
 
 def cmd_adopt_all(args: argparse.Namespace) -> int:
+    # #1517: adopt-all is also a first-use room-minting path — apply the same
+    # controller-only canonical bootstrap so the very first `adopt-all` on a
+    # fresh iso host does not fail closed with actor_unresolved. Same invariant:
+    # a managed iso agent cannot self-bootstrap (canonical state dir is
+    # controller-owned), and the bootstrap never follows BRIDGE_A2A_ROOMS_DB.
+    rooms.maybe_bootstrap_rooms_db()
     node = local_node()
     leader = caller_agent(args)
     agents = _roster_agents()

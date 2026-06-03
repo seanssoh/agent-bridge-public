@@ -444,6 +444,72 @@ def rooms_db_path() -> Path:
     return handoff_dir() / "rooms.db"
 
 
+def canonical_rooms_db_path() -> Path:
+    """The CANONICAL rooms.db location — `state/handoff/rooms.db` under the
+    real bridge home, IGNORING the caller-redirectable `BRIDGE_A2A_ROOMS_DB`.
+
+    This is the ONLY path the controller-bootstrap (`maybe_bootstrap_rooms_db`)
+    is permitted to create. `rooms_db_path()` honors `BRIDGE_A2A_ROOMS_DB` so a
+    managed agent could point it at a self-owned dir; the bootstrap must NOT
+    follow that override (else a managed agent could seed a self-owned rooms.db
+    and become "controller" — the P1b bypass class). It still resolves
+    `BRIDGE_STATE_DIR`/`BRIDGE_HOME` (the legitimate isolated-install knobs),
+    consistent with the `_controller_uid` r2 model: a managed agent that forges
+    those to a self-owned tree only ever owns a FAKE db that mutates no real
+    room (and on a real iso-v2 host it cannot own the controller-owned state
+    dir at all → the ownership gate below fails closed).
+    """
+    return handoff_dir() / "rooms.db"
+
+
+def _caller_owns_canonical_controller_location() -> bool:
+    """True iff THIS process's uid owns the CANONICAL controller location.
+
+    The un-spoofable bootstrap gate: on a fresh host (no rooms.db yet,
+    `_controller_uid()` cannot anchor) we still need to know whether the caller
+    is the genuine controller before seeding the controller-owned rooms.db. The
+    proof is OS-derived: `os.getuid()` must own the nearest EXISTING ancestor of
+    the canonical rooms.db (the handoff dir, else the state dir, else the bridge
+    home). In iso-v2 those dirs are controller-owned (a managed `agent-bridge-*`
+    UID cannot own/create them), so a managed agent fails this check and STILL
+    fails closed — it cannot bootstrap a self-owned db to become controller. In
+    shared-mode the single user owns the whole tree, so the check passes for
+    that user (consistent with the shared-mode-advisory regime).
+
+    The positive (ALLOW) proof is STRICTLY OS-derived — there is NO env seam
+    that can force it open. A paired-flag test override
+    (`BRIDGE_ROOMS_TEST_OWNS_CANON=0`) may only force-DENY (to drive the
+    managed-agent fail-closed leg on a host where the real uid would otherwise
+    own the temp tree); a `1` is IGNORED and falls through to the real stat, so
+    no env can ever GRANT this gate. Never honored in production (the paired
+    flags are unset there).
+    """
+    if _test_uid_map_allowed():
+        forced = os.environ.get("BRIDGE_ROOMS_TEST_OWNS_CANON", "").strip()
+        if forced == "0":
+            # Force-DENY only — used by the smoke to simulate a managed agent
+            # that does NOT own the controller-owned canonical state dir. A
+            # value of "1" is deliberately NOT honored: the ALLOW path must stay
+            # OS-derived so the bootstrap gate cannot be opened by env.
+            return False
+    canon = canonical_rooms_db_path()
+    me = os.getuid()
+    # Walk up from the canonical db's parent to the first ancestor that exists
+    # and stat its owner. The bootstrap creates the db (and any missing parent
+    # dirs) under that ancestor, so owning it is the right "can I write here as
+    # the controller" proof.
+    probe = canon.parent
+    for _ in range(64):  # bounded; canonical paths are shallow
+        try:
+            return os.stat(str(probe)).st_uid == me  # noqa: raw-pathlib-controller-only
+        except OSError:
+            parent = probe.parent
+            if parent == probe:  # reached filesystem root
+                return False
+            probe = parent
+    return False
+
+
 # --------------------------------------------------------------------------
 # Schema (FROZEN — design §14 R2/R6)
 # --------------------------------------------------------------------------
@@ -531,6 +597,65 @@ def _connect(path: Path, schema: str) -> sqlite3.Connection:
 def open_rooms() -> sqlite3.Connection:
     """Open (creating if absent) the rooms.db at 0600 with the frozen schema."""
     return _connect(rooms_db_path(), _ROOMS_SCHEMA)
+
+
+def maybe_bootstrap_rooms_db() -> bool:
+    """Controller-only auto-bootstrap of the CANONICAL rooms.db on first use.
+
+    Closes the fresh-iso chicken-and-egg (#1517): the controller anchor
+    (`_controller_uid`) stats the rooms.db OWNER, but on a brand-new install the
+    db does not exist yet, so even the genuine controller's first
+    `agb room create` resolves to ACTOR_UNRESOLVED (`actor_unresolved`) and is
+    denied — there is no db to anchor to. This seeds the controller-owned db the
+    controller then anchors to, so the very first `create` succeeds.
+
+    Returns True iff it created the canonical db on this call (False when the db
+    already exists or the caller is not the proven controller of the canonical
+    location). Idempotent: a present db is left untouched (no re-bootstrap /
+    clobber).
+
+    SECURITY (the load-bearing invariant — do NOT weaken):
+      - The db is created ONLY at the CANONICAL path (`canonical_rooms_db_path`,
+        which ignores `BRIDGE_A2A_ROOMS_DB`). A caller cannot redirect the
+        bootstrap to a self-owned location via that env override.
+      - The bootstrap runs ONLY when `os.getuid()` owns the canonical controller
+        location (`_caller_owns_canonical_controller_location`). On an iso-v2
+        host the canonical `state/handoff` tree is controller-owned, so a
+        managed `agent-bridge-*` UID does NOT own it → the bootstrap is refused
+        and the agent STILL fails closed (it can never seed a self-owned db at
+        the canonical path to become "controller"). In shared-mode the single
+        owning user passes (consistent with shared-mode-advisory).
+      - This NEVER relaxes a control-plane decision: `resolve_os_actor` still
+        derives the regime from un-spoofable OS facts AFTER the (now-present) db
+        anchors `_controller_uid`. A managed agent that somehow reached here on
+        a fresh host gains nothing — it cannot pass the ownership gate, and even
+        a forged `BRIDGE_STATE_DIR` self-owned tree yields a FAKE db that
+        mutates no real room (the `_controller_uid` r2 model).
+    """
+    canon = canonical_rooms_db_path()
+    # Only bootstrap for the path this invocation will actually anchor to: when
+    # a caller redirects `BRIDGE_A2A_ROOMS_DB` elsewhere, `open_rooms()` /
+    # `_controller_uid()` already use THAT path (the existing isolated-install /
+    # r2 model — `_connect` creates it, the owner anchors the controller). We do
+    # NOT seed a stray canonical db in that case; bootstrap is strictly for the
+    # canonical first-use path.
+    if rooms_db_path() != canon:
+        return False
+    try:
+        if canon.exists():  # noqa: raw-pathlib-controller-only
+            return False
+    except OSError:
+        return False
+    if not _caller_owns_canonical_controller_location():
+        # NOT the canonical controller (e.g. a managed iso agent) → refuse to
+        # seed. The caller stays fail-closed (UNRESOLVED) exactly as before.
+        return False
+    # Create the canonical, controller-owned rooms.db (frozen schema, 0600).
+    # We pin _connect to the CANONICAL path (not rooms_db_path()) so a
+    # caller-supplied BRIDGE_A2A_ROOMS_DB cannot relocate the bootstrap.
+    conn = _connect(canon, _ROOMS_SCHEMA)
+    conn.close()
+    return True
 
 
 def open_rooms_readonly(
