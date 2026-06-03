@@ -93,9 +93,14 @@ import json
 import sys
 
 path, context = sys.argv[1], sys.argv[2]
+# MUST mirror bridge-hooks.py VALID_CLAUDE_HOOK_EVENTS — the complete set of
+# bridge-managed hook events the prune keeps (incl. the bridge-wired
+# PostToolUseFailure + the #8945 PostCompact/PermissionRequest/SubagentStart).
+# PermissionDenied is intentionally absent (legacy, pruned).
 valid = {
-    "PreToolUse", "PostToolUse", "UserPromptSubmit", "Notification",
-    "Stop", "SubagentStop", "PreCompact", "SessionStart", "SessionEnd",
+    "PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit",
+    "Notification", "Stop", "SubagentStart", "SubagentStop", "PreCompact",
+    "PostCompact", "PermissionRequest", "SessionStart", "SessionEnd",
 }
 with open(path, encoding="utf-8") as handle:
     data = json.load(handle)  # raises on malformed -> smoke fails loudly
@@ -167,11 +172,30 @@ EOF
   mkdir -p "$dirty_bridge/agents/.claude"
   cp "$SMOKE_REPO_ROOT/agents/.claude/settings.json" \
     "$dirty_bridge/agents/.claude/settings.json"
+  # The overlay carries BOTH the invalid legacy event (PermissionDenied,
+  # must be stripped) AND four genuinely bridge-wired events that the prune
+  # MUST keep: PostToolUseFailure (wired by ensure-tool-policy-hooks at
+  # start/upgrade, independent of the render path) plus the #8945 Codex-
+  # coverage trio (PostCompact / PermissionRequest / SubagentStart). #1499
+  # codex r1 caught that an incomplete allowlist pruned PostToolUseFailure
+  # → the tool-policy failure hook silently vanished on isolated render.
   cat >"$dirty_bridge/agents/.claude/settings.local.json" <<'EOF'
 {
   "hooks": {
     "PermissionDenied": [
       {"hooks": [{"type": "command", "command": "python3 ~/.agent-bridge/hooks/permission_escalation.py", "timeout": 10}]}
+    ],
+    "PostToolUseFailure": [
+      {"hooks": [{"type": "command", "command": "python3 ~/.agent-bridge/hooks/tool-policy.py", "timeout": 10}]}
+    ],
+    "PostCompact": [
+      {"hooks": [{"type": "command", "command": "python3 ~/.agent-bridge/hooks/pre-compact.py", "timeout": 10}]}
+    ],
+    "PermissionRequest": [
+      {"hooks": [{"type": "command", "command": "python3 ~/.agent-bridge/hooks/tool-policy.py", "timeout": 10}]}
+    ],
+    "SubagentStart": [
+      {"hooks": [{"type": "command", "command": "python3 ~/.agent-bridge/hooks/check-inbox.py", "timeout": 10}]}
     ]
   }
 }
@@ -224,6 +248,21 @@ EOF
     "dirty render preserves the valid Stop hook event"
   smoke_assert_contains "$content" '"PreToolUse"' \
     "dirty render preserves the base PreToolUse hook event"
+
+  # #1499 codex r1 regression guard: the prune must NOT drop a bridge-owned
+  # hook event. These four are wired by the bridge itself (PostToolUseFailure
+  # via ensure-tool-policy-hooks; PostCompact/PermissionRequest/SubagentStart
+  # via #8945 Codex coverage) and are all valid CC events, so they MUST
+  # survive the prune. Reverting the allowlist to its r1 (9-event) form makes
+  # these four assertions fail — the exact bug codex caught.
+  smoke_assert_contains "$content" '"PostToolUseFailure"' \
+    "dirty render PRESERVES the bridge-wired PostToolUseFailure hook (#1499 r1)"
+  smoke_assert_contains "$content" '"PostCompact"' \
+    "dirty render preserves the #8945 PostCompact hook event"
+  smoke_assert_contains "$content" '"PermissionRequest"' \
+    "dirty render preserves the #8945 PermissionRequest hook event"
+  smoke_assert_contains "$content" '"SubagentStart"' \
+    "dirty render preserves the #8945 SubagentStart hook event"
 
   assert_valid_cc_settings "$effective" \
     "dirty render is valid Claude Code settings after repair"

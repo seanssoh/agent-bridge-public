@@ -1298,17 +1298,31 @@ PRESERVED_USER_KEYS = (
 # settings.json keeps the broken key across every rerender. The render
 # path actively prunes any `hooks.<event>` outside this allowlist so a
 # fresh render is clean AND an existing dirty file is repaired on the
-# next upgrade/restart. The set is the documented CC hook-event surface;
-# `PermissionDenied`/`PermissionRequest` are intentionally NOT included.
+# next upgrade/restart.
+#
+# This set MUST contain EVERY hook event the bridge itself wires (the
+# `hooks_list(settings, "<event>")` sites in cmd_ensure_tool_policy_hooks +
+# managed_claude_settings_defaults), or the prune would delete a live
+# bridge-owned hook (#1499 codex r1: `PostToolUseFailure` was omitted → the
+# tool-policy failure hook got pruned on isolated render). The #8945
+# Codex-coverage events (`PostCompact` / `PermissionRequest` / `SubagentStart`)
+# are bridge-wired and stay IN. The ONLY thing intentionally excluded is the
+# legacy `PermissionDenied` (the #93 escalation block, no longer wired by the
+# bridge and rejected by CC v2.1.87 as an invalid key) — so the prune strips
+# it from stale settings while preserving every bridge-managed event.
 VALID_CLAUDE_HOOK_EVENTS = frozenset(
     {
         "PreToolUse",
         "PostToolUse",
+        "PostToolUseFailure",
         "UserPromptSubmit",
         "Notification",
         "Stop",
+        "SubagentStart",
         "SubagentStop",
         "PreCompact",
+        "PostCompact",
+        "PermissionRequest",
         "SessionStart",
         "SessionEnd",
     }
