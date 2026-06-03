@@ -121,6 +121,10 @@ add_required 8807-cron-backfill-coalesce
 # scripts/smoke/* catch-all → add_all_required_static — still re-runs the
 # reaper-pattern smoke.
 add_required 8807-mcp-reaper-patterns
+# #8945 Track A: the engine-aware urgent-nudge-body smoke. In the full static
+# suite so a scripts/smoke/* or lib/bridge-agents.sh change re-runs it via the
+# catch-all. (1067-codex-provisioning is already listed above.)
+add_required codex-nudge-body
 
 
 }
@@ -200,6 +204,18 @@ select_for_path() {
       # the global required smokes. This case precedes that return so a
       # template-text drift still pulls the #1060 layout smokes.
       add_required 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning
+      ;;
+    agents/_template/codex/AGENTS.md)
+      # #8945 Track A: the dedicated Codex entrypoint template carries the
+      # explicit Task Processing Protocol that bridge_scaffold_codex_entrypoint
+      # renders into a Codex agent's AGENTS.md (the Claude CLAUDE.md leaves the
+      # protocol implicit — the #8945 wedge). It is a .md file, so the
+      # is_docs_only_path early-return below would otherwise select only the
+      # global required smokes. This case precedes that return so a drift in the
+      # protocol marker, the managed-marker comment, or the placeholder set
+      # still pulls the codex-provisioning smoke (which asserts the rendered
+      # AGENTS.md contains the protocol + the agb-done close step).
+      add_required 1067-codex-provisioning
       ;;
     agent-roster.local.example.sh)
       # v0.15.0-beta1 Lane I: the example roster is operator-facing copy.
@@ -1459,6 +1475,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # bridge-start.sh — pull on every move of either so a refactor
       # cannot drop the create-side mark or the start-side clear.
       add_required 1353-setup-pending-grace
+      # #8945 Track A: bridge-send.sh hosts urgent_nudge_body — the engine-aware
+      # urgent-nudge body branch (Codex gets the explicit multi-step protocol,
+      # Claude keeps the one-liner, unknown engine fail-safes to the one-liner).
+      # Pull codex-nudge-body on every bridge-send.sh move so a refactor cannot
+      # silently collapse the branch back to the engine-blind one-liner that
+      # wedged the Codex patch-dev. (1067-codex-provisioning is already pulled
+      # by this arm's add_required block above.)
+      add_required codex-nudge-body
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;

@@ -66,13 +66,31 @@ write_driver() {
     'CODEX_HOME="$BRIDGE_AGENT_ROOT_V2/$CODEX_AGENT/home"' \
     'CLAUDE_HOME="$BRIDGE_AGENT_ROOT_V2/$CLAUDE_AGENT/home"' \
     'mkdir -p "$CODEX_HOME" "$CLAUDE_HOME"' \
-    '# ---- T1: S03 — AGENTS.md scaffolded for codex, not for claude ----' \
+    '# ---- T1: S03 + #8945 Track A — AGENTS.md scaffolded for codex from the' \
+    '#       dedicated codex template (explicit Task Processing Protocol),' \
+    '#       not for claude ----' \
     '# Codex identity source: place CLAUDE.md (as scaffold does), then call entrypoint helper.' \
     'printf "%s\n" "# codex role contract" > "$CODEX_HOME/CLAUDE.md"' \
     'bridge_scaffold_codex_entrypoint "$CODEX_HOME" codex 2>/dev/null || true' \
     'if [[ -f "$CODEX_HOME/AGENTS.md" ]]; then echo "T1_CODEX_AGENTS_MD: present"; else echo "T1_CODEX_AGENTS_MD: missing"; fi' \
-    '# T1 verify content: AGENTS.md must match CLAUDE.md (same canonical payload).' \
-    'if [[ -f "$CODEX_HOME/AGENTS.md" ]] && diff -q "$CODEX_HOME/CLAUDE.md" "$CODEX_HOME/AGENTS.md" >/dev/null 2>&1; then echo "T1_AGENTS_MD_CONTENT_MATCH: yes"; else echo "T1_AGENTS_MD_CONTENT_MATCH: no"; fi' \
+    '# #8945 Track A: AGENTS.md now comes from agents/_template/codex/AGENTS.md,' \
+    '# so it must carry the explicit Task Processing Protocol marker (the Claude' \
+    '# CLAUDE.md leaves the protocol implicit — the exact wedge this closes).' \
+    'if [[ -f "$CODEX_HOME/AGENTS.md" ]] && grep -qF "Task Processing Protocol" "$CODEX_HOME/AGENTS.md" 2>/dev/null; then echo "T1_AGENTS_MD_HAS_PROTOCOL: yes"; else echo "T1_AGENTS_MD_HAS_PROTOCOL: no"; fi' \
+    'if [[ -f "$CODEX_HOME/AGENTS.md" ]] && grep -qF "agb done" "$CODEX_HOME/AGENTS.md" 2>/dev/null; then echo "T1_AGENTS_MD_HAS_DONE: yes"; else echo "T1_AGENTS_MD_HAS_DONE: no"; fi' \
+    '# #8945 Track A: from the codex template, AGENTS.md is the protocol doc,' \
+    '# NOT a byte copy of the role-stub CLAUDE.md.' \
+    'if [[ -f "$CODEX_HOME/AGENTS.md" ]] && ! diff -q "$CODEX_HOME/CLAUDE.md" "$CODEX_HOME/AGENTS.md" >/dev/null 2>&1; then echo "T1_AGENTS_MD_FROM_TEMPLATE: yes"; else echo "T1_AGENTS_MD_FROM_TEMPLATE: no"; fi' \
+    '# T1 teeth-check: with the codex template hidden (BRIDGE_SCRIPT_DIR pointed' \
+    '# at a templateless tree), the helper falls back to the CLAUDE.md -> AGENTS.md' \
+    '# copy (pre-#8945 behavior preserved on older source trees).' \
+    'FALLBACK_HOME="$BRIDGE_AGENT_ROOT_V2/fallback-codex/home"' \
+    'mkdir -p "$FALLBACK_HOME"' \
+    'printf "%s\n" "# fallback codex role contract" > "$FALLBACK_HOME/CLAUDE.md"' \
+    'NO_TEMPLATE_ROOT="$DRIVER_TMP_DIR/no-template-root"' \
+    'mkdir -p "$NO_TEMPLATE_ROOT"' \
+    '( BRIDGE_SCRIPT_DIR="$NO_TEMPLATE_ROOT"; bridge_scaffold_codex_entrypoint "$FALLBACK_HOME" codex 2>/dev/null || true )' \
+    'if [[ -f "$FALLBACK_HOME/AGENTS.md" ]] && diff -q "$FALLBACK_HOME/CLAUDE.md" "$FALLBACK_HOME/AGENTS.md" >/dev/null 2>&1; then echo "T1_FALLBACK_COPY: yes"; else echo "T1_FALLBACK_COPY: no"; fi' \
     '# Claude identity source: place CLAUDE.md but do NOT call entrypoint helper (no-op for claude).' \
     'printf "%s\n" "# claude role contract" > "$CLAUDE_HOME/CLAUDE.md"' \
     'bridge_scaffold_codex_entrypoint "$CLAUDE_HOME" claude 2>/dev/null || true' \
@@ -137,11 +155,17 @@ if [[ $RC -ne 0 ]]; then
 $OUT"
 fi
 
-# T1: S03 assertions.
+# T1: S03 + #8945 Track A assertions.
 smoke_assert_eq "present" "$(extract_line "$OUT" "T1_CODEX_AGENTS_MD")" \
   "T1: AGENTS.md present in codex identity source after bridge_scaffold_codex_entrypoint"
-smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_AGENTS_MD_CONTENT_MATCH")" \
-  "T1: AGENTS.md content matches CLAUDE.md (same canonical role payload)"
+smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_AGENTS_MD_HAS_PROTOCOL")" \
+  "T1 (#8945 A): AGENTS.md carries the explicit Task Processing Protocol marker (from codex template)"
+smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_AGENTS_MD_HAS_DONE")" \
+  "T1 (#8945 A): AGENTS.md encodes the 'agb done' close step"
+smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_AGENTS_MD_FROM_TEMPLATE")" \
+  "T1 (#8945 A): AGENTS.md is the protocol doc, not a byte copy of the role-stub CLAUDE.md"
+smoke_assert_eq "yes" "$(extract_line "$OUT" "T1_FALLBACK_COPY")" \
+  "T1 teeth (#8945 A): codex template absent => helper falls back to CLAUDE.md -> AGENTS.md copy"
 smoke_assert_eq "missing" "$(extract_line "$OUT" "T1_CLAUDE_AGENTS_MD")" \
   "T1: AGENTS.md NOT written for claude agent (no-op for claude engine)"
 
