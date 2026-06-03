@@ -4489,6 +4489,46 @@ bridge_linux_prepare_agent_isolation() {
   bridge_linux_sudo_root chown -R "$os_user" "$runtime_state_dir" "$log_dir"
   bridge_linux_sudo_root chown "$os_user" "$audit_file" "$history_file"
 
+  # Issue #1506: the `chown -R "$os_user"` passes above transfer OWNER
+  # only. On the create-shared-then-isolate path the pre-existing
+  # scaffolded files under `home/` and `$workdir/` retain their
+  # controller-time `group=<controller>` `mode 0600/0700` — `chown`
+  # changed only the user, and the setgid parent dirs apply only to
+  # files created AFTER isolation. The result is
+  # `-rw------- agent-bridge-<a> <controller> CLAUDE.md` instead of the
+  # iso v2 contract `-rw-rw---- agent-bridge-<a> ab-agent-<a>` (0660).
+  # The controller (incl. bridge-watchdog) — even as a member of
+  # `ab-agent-<a>` — cannot read a `0600 group=<controller>` file, so
+  # the next watchdog scan emits a high-pri `scan_error` profile-drift
+  # false-positive.
+  #
+  # Normalize the EXISTING read-write content subtrees to the contract
+  # via the shared exec-bit-preserving / symlink-safe recursive helper
+  # (NOT a naive blanket `chmod 0660 -R`, which would strip the +x bit
+  # off plugin scripts — see lib/bridge-isolation-v2.sh:~1521). The
+  # helper is idempotent (self-verifies + a no-op when already
+  # canonical) and a silent no-op off Linux / when v2 primitives are
+  # not initialized (`bridge_isolation_v2_enforce`), so this is safe to
+  # run on every prepare/reapply. Mirrors the recipe in
+  # bridge_isolation_v2_migrate_normalize_layout (workdir excludes the
+  # v3 channel state dirs whose dotenv/state files stay 0600/iso-UID).
+  if command -v bridge_isolation_v2_chgrp_setgid_recursive >/dev/null 2>&1; then
+    local _v2_norm_sub
+    for _v2_norm_sub in "$_v2_agent_root/home" "$workdir" \
+                        "$runtime_state_dir" "$log_dir"; do
+      [[ -n "$_v2_norm_sub" && -d "$_v2_norm_sub" ]] || continue
+      local -a _v2_norm_excl=()
+      if [[ "$_v2_norm_sub" == "$workdir" ]]; then
+        _v2_norm_excl=(--exclude-subdir .teams --exclude-subdir .ms365
+                       --exclude-subdir .discord --exclude-subdir .telegram
+                       --exclude-subdir .mattermost)
+      fi
+      bridge_isolation_v2_chgrp_setgid_recursive \
+        "$_v2_agent_group" 2770 0660 "$_v2_norm_sub" "${_v2_norm_excl[@]}" \
+        || bridge_warn "isolation v2 (#1506): group/mode normalization of '$_v2_norm_sub' returned non-zero for agent '$agent'; controller-side reads (watchdog scan) may still see drift. Re-run \`agent-bridge isolate $agent --reapply\`."
+    done
+  fi
+
   # Isolated-home POSIX contract (HOME + .claude + .claude/plugins +
   # .claude/session-env). Phase 3 codex design: one shared helper at
   # three call sites so the prepare path, the restart reverter
