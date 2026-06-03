@@ -161,21 +161,36 @@ class ActorAuth(NamedTuple):
 
 
 def _test_uid_map_allowed() -> bool:
-    """Paired test-only flag gating the rooms actor-auth test overrides.
+    """Gate for the rooms actor-auth TEST overrides — structurally prod-inert.
 
-    BOTH `BRIDGE_ROOMS_ALLOW_TEST_UID_MAP=1` AND `BRIDGE_A2A_ALLOW_TEST_BIND=1`
-    must be set. Mirrors the existing paired-flag escape hatches
-    (`_allow_insecure_no_secret`, `BRIDGE_A2A_ALLOW_TEST_BIND`) so a single
-    stray env var cannot relax the contract. The smoke sets both; production
-    sets neither, so the test overrides (`BRIDGE_ROOMS_TEST_ISO_USER`,
-    `BRIDGE_ROOMS_TEST_CONTROLLER_UID`, `BRIDGE_ROOMS_TEST_HOST_HAS_ISO`) are
-    NEVER consulted in a real deployment — a managed agent cannot spoof its
-    identity through them (codex Phase-4 r3-r6 F1).
+    Three conditions, ALL required:
+      1. BOTH `BRIDGE_ROOMS_ALLOW_TEST_UID_MAP=1` AND `BRIDGE_A2A_ALLOW_TEST_
+         BIND=1` (paired flag; a single stray var cannot relax the contract).
+      2. The current process uid OWNS the rooms DB, OR the rooms DB does not
+         exist yet. This is the STRUCTURAL prod-inert gate (codex Phase-4 r2
+         finding 2): the test overrides (`BRIDGE_ROOMS_TEST_ISO_USER`,
+         `_CONTROLLER_UID`, `_HOST_HAS_ISO`) directly override the security
+         decision, so flags alone (which a managed agent CAN set) are not
+         enough. In a real iso-v2 deployment the rooms DB is controller-owned
+         and a managed agent (`agent-bridge-<a>`, a different uid) does NOT own
+         it → this returns False → the test overrides are IGNORED → the agent
+         falls through to the real, un-spoofable OS-fact checks. In the smoke
+         the test runner owns the DB it created, so the overrides are honored.
+    A non-existent DB allows the overrides so the smoke can drive the
+    pre-create / create paths; an attacker pointing at a self-owned fake DB to
+    pass this gate gains nothing — it can only override decisions about a fake
+    DB that has zero effect on any real room.
     """
-    return (
-        os.environ.get("BRIDGE_ROOMS_ALLOW_TEST_UID_MAP") == "1"
-        and os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") == "1"
-    )
+    if (os.environ.get("BRIDGE_ROOMS_ALLOW_TEST_UID_MAP") != "1"
+            or os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") != "1"):
+        return False
+    try:
+        return os.stat(str(rooms_db_path())).st_uid == os.getuid()  # noqa: raw-pathlib-controller-only
+    except OSError:
+        # DB absent → allow (pre-create/create test paths); a real managed
+        # agent on an iso host with an existing controller-owned DB is gated out
+        # by the ownership check above.
+        return True
 
 
 def _process_iso_user() -> Optional[str]:
@@ -254,30 +269,34 @@ def _host_has_iso_users() -> bool:
 
 
 def _controller_uid() -> Optional[int]:
-    """The controller/operator uid — the bridge-home OWNER (a filesystem fact).
+    """The controller/operator uid — the OWNER OF THE ACTUAL rooms DB.
 
-    Deliberately does NOT trust `BRIDGE_CONTROLLER_UID` from the process env:
-    that is caller-settable, so honoring it would let an unmapped managed agent
-    set `BRIDGE_CONTROLLER_UID="$(id -u)"` to enter the controller regime where
-    `--as` is honored (the r2->r3 hole codex caught). The bridge home is owned
-    by the controller/operator and a non-root managed agent cannot chown it, so
-    its owner uid is an unforgeable controller identity. Returns None when it
-    cannot be stat'd → the controller bypass is then simply unavailable
-    (fail-closed for an unmapped uid, which is the safe default).
+    Anchored to `os.stat(rooms_db_path()).st_uid`, NOT to `bridge_home()`
+    (codex Phase-4 r2 BLOCK). Rationale: to affect a real room you MUST operate
+    on the real rooms.db, which in iso-v2 lives under `state/handoff/` and is
+    controller-owned (a non-root managed agent cannot chown it). A managed
+    agent that forges `BRIDGE_HOME` to a self-owned dir while pinning the real
+    DB via `BRIDGE_A2A_ROOMS_DB`/`BRIDGE_STATE_DIR` no longer passes this check
+    (the real DB is not theirs); and if it instead points the DB at a self-
+    owned fake, it becomes "controller" of a DB that has ZERO effect on the
+    real room. Either way the BRIDGE_HOME spoof is dead. A genuine operator who
+    owns the real DB still gets the controller bypass.
 
-    A `BRIDGE_ROOMS_TEST_CONTROLLER_UID` override exists ONLY behind the paired
-    test flag (`_test_uid_map_allowed()`), so a smoke can force a
-    non-controller context to exercise the UNRESOLVED fail-closed path. It is
-    NEVER honored in production (no flag) — identical gating to the test uid
-    map.
+    Deliberately does NOT trust `BRIDGE_CONTROLLER_UID` from env (caller-set).
+    Returns None when the DB does not exist or cannot be stat'd → the
+    controller bypass is then unavailable (fail-closed safe default). A
+    `BRIDGE_ROOMS_TEST_CONTROLLER_UID` override exists ONLY behind the paired
+    test flag — NEVER honored in production.
     """
     if _test_uid_map_allowed():
         raw = os.environ.get("BRIDGE_ROOMS_TEST_CONTROLLER_UID", "").strip()
         if raw.lstrip("-").isdigit():
             return int(raw)
+    db = rooms_db_path()
     try:
-        return os.stat(str(bridge_home())).st_uid  # noqa: raw-pathlib-controller-only
+        return os.stat(str(db)).st_uid  # noqa: raw-pathlib-controller-only
     except OSError:
+        # DB absent (e.g. first `create`) or unreadable → no controller bypass.
         return None
 
 
@@ -326,23 +345,14 @@ def resolve_os_actor(requested: Optional[str] = None) -> ActorAuth:
         return ActorAuth(agent=slug, regime=ACTOR_ISO_ENFORCED,
                          uid=uid, hard=True)
 
-    # NOT an iso OS user. On an ISO HOST (any `agent-bridge-*` user exists in
-    # the passwd DB — an un-spoofable fact), we must NOT grant CONTROLLER from
-    # the bridge-home owner, because `bridge_home()` is BRIDGE_HOME-env-derived
-    # and a custom-`--os-user` agent could point BRIDGE_HOME at a dir it owns to
-    # make `uid == stat(BRIDGE_HOME).st_uid` and self-promote to controller
-    # (codex Phase-4 r7). So on an iso host a non-iso-OS-user process FAILS
-    # CLOSED (UNRESOLVED) — the forgeable-BRIDGE_HOME controller bypass is
-    # disabled there. The legitimate operator on an iso host acts through an
-    # admin iso agent or controller-side tooling, not this ambiguous path.
-    if _host_has_iso_users():
-        return ActorAuth(agent="", regime=ACTOR_UNRESOLVED, uid=uid, hard=True)
-
-    # No iso users on the host → a genuine shared-mode / single-user install,
-    # which has NO hard team boundary anyway (leader-auth is advisory here). The
-    # bridge-home owner is the operator; a forged BRIDGE_HOME at most lets a
-    # same-host user reach the ADVISORY controller path (no hard grant — it only
-    # honors --as with a warning), which is acceptable in shared mode.
+    # NOT an iso OS user. The CONTROLLER check is now anchored to the owner of
+    # the ACTUAL rooms DB (`_controller_uid` -> stat(rooms_db_path)), which a
+    # managed agent cannot forge: to affect a real room you must operate on the
+    # real (controller-owned) DB; a self-owned fake DB mutates nothing real
+    # (codex Phase-4 r2). So the controller grant is un-spoofable here even
+    # though BRIDGE_HOME is env-derived — the old forged-BRIDGE_HOME bypass is
+    # dead. We check it FIRST so a genuine operator (who owns the real DB) is
+    # recognized regardless of the iso-host classification.
     controller = _controller_uid()
     if controller is not None and uid == controller:
         agent = (requested
@@ -351,6 +361,19 @@ def resolve_os_actor(requested: Optional[str] = None) -> ActorAuth:
                  or "")
         return ActorAuth(agent=str(agent).strip(), regime=ACTOR_CONTROLLER,
                          uid=uid, hard=False)
+
+    # Not the DB owner. On an ISO HOST (any `agent-bridge-*` user exists in the
+    # passwd DB — an un-spoofable fact), a non-iso non-DB-owner process is
+    # anomalous → FAIL CLOSED (UNRESOLVED); it must not fall to advisory (which
+    # honors --as with only a warning). _host_has_iso_users() failing safe to
+    # False on a passwd error is now acceptable because the controller grant
+    # above already requires owning the real DB — a passwd-error downgrade can
+    # at most reach the advisory path below, never a false controller ALLOW.
+    if _host_has_iso_users():
+        return ActorAuth(agent="", regime=ACTOR_UNRESOLVED, uid=uid, hard=True)
+
+    # No iso users on the host → a genuine shared-mode / single-user install,
+    # which has NO hard team boundary anyway → advisory (warn, never block).
     agent = (requested
              or os.environ.get("BRIDGE_AGENT_ID")
              or os.environ.get("USER")

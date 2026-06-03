@@ -303,6 +303,19 @@ def cmd_resolve_regime() -> int:
     return 0
 
 
+def cmd_controller_uid() -> int:
+    """Print the resolved controller uid (anchored to the real rooms DB owner).
+
+    Used by the r2 teeth to prove _controller_uid() reads the DB path, not
+    BRIDGE_HOME — when the DB is absent it returns 'none' even though a
+    self-owned BRIDGE_HOME exists (the OLD code would have returned the
+    bridge-home owner). Output: "controller_uid=<int|none>".
+    """
+    cu = rooms._controller_uid()
+    print(f"controller_uid={'none' if cu is None else cu}")
+    return 0
+
+
 def cmd_file_mode(path: str) -> int:
     mode = os.stat(path).st_mode & 0o777
     print(format(mode, "o"))
@@ -339,6 +352,8 @@ def main(argv: list[str]) -> int:
         return cmd_assert_cache_fresh(rest[0], rest[1])
     if cmd == "resolve-regime":
         return cmd_resolve_regime()
+    if cmd == "controller-uid":
+        return cmd_controller_uid()
     if cmd == "file-mode":
         return cmd_file_mode(rest[0])
     print(f"unknown subcommand: {cmd}", file=sys.stderr)

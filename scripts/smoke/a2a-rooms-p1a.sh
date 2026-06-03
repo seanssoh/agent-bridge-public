@@ -244,22 +244,63 @@ test_teeth_non_iso_on_iso_host_fails_closed() {
 }
 
 test_teeth_iso_host_bridge_home_controller_bypass_closed() {
-  # THE r7 hole: a custom-os-user (non-iso-prefix) process on an ISO host sets
-  # BRIDGE_HOME to a dir IT OWNS so stat(BRIDGE_HOME).st_uid == its uid, trying
-  # to self-promote to CONTROLLER (where --as is honored). On an iso host the
-  # forgeable-BRIDGE_HOME controller bypass is DISABLED → it must be UNRESOLVED.
+  # On an ISO HOST, a non-iso non-DB-owner process that forges a self-owned
+  # BRIDGE_HOME must NOT reach CONTROLLER. With the DB-owner anchor (r2) the
+  # controller is the rooms-DB owner, NOT stat(BRIDGE_HOME); simulate the
+  # attacker NOT owning the real DB via the gated controller-uid override (a
+  # different uid). Result: neither DB-owner nor iso user -> UNRESOLVED.
   local selfhome="$SMOKE_TMP_ROOT/self-home"
-  mkdir -p "$selfhome"   # owned by us — the controller-uid check would match
+  mkdir -p "$selfhome"
   local got
   got="$(env "${ROOMS_TEST_FLAGS[@]}" \
              "BRIDGE_ROOMS_TEST_ISO_USER=" \
              "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
+             "BRIDGE_ROOMS_TEST_CONTROLLER_UID=999998" \
              "BRIDGE_HOME=$selfhome" \
            python3 "$HELPER" resolve-regime 2>/dev/null)"
   smoke_assert_contains "$got" "regime=unresolved" \
-    "TEETH F1 r7: a self-owned BRIDGE_HOME must NOT grant controller on an iso host"
+    "TEETH F1: a non-DB-owner with a self-owned BRIDGE_HOME must NOT grant controller on an iso host"
   smoke_assert_not_contains "$got" "regime=controller" \
-    "TEETH F1 r7: the forgeable-BRIDGE_HOME controller bypass is disabled on iso hosts"
+    "TEETH F1: the forgeable-BRIDGE_HOME controller bypass is disabled (controller = DB owner)"
+}
+
+test_teeth_controller_anchored_to_real_db_not_bridge_home() {
+  # THE codex Phase-4 r2 exploit: a managed process pins the REAL rooms DB
+  # (BRIDGE_A2A_ROOMS_DB / BRIDGE_STATE_DIR) but points BRIDGE_HOME at a
+  # self-owned dir so the OLD stat(bridge_home()) controller check matched its
+  # own uid -> false controller allow with --as <leader>. The fix anchors
+  # _controller_uid() to the owner of the ACTUAL rooms DB, not BRIDGE_HOME.
+  #
+  # Proof the anchor MOVED: with a self-owned BRIDGE_HOME present but the rooms
+  # DB ABSENT, the OLD code returned the bridge-home owner (a uid) — the NEW
+  # code returns 'none' (no DB to own -> no controller bypass). This is only
+  # possible if _controller_uid reads the DB path, not BRIDGE_HOME.
+  local selfhome="$SMOKE_TMP_ROOT/r2-self-home"
+  mkdir -p "$selfhome"   # self-owned BRIDGE_HOME
+  local got
+  got="$(env "${ROOMS_TEST_FLAGS[@]}" \
+             "BRIDGE_HOME=$selfhome" \
+             "BRIDGE_A2A_ROOMS_DB=$SMOKE_TMP_ROOT/r2-absent/rooms.db" \
+           python3 "$HELPER" controller-uid 2>/dev/null)"
+  smoke_assert_eq "controller_uid=none" "$got" \
+    "TEETH F1 r2: _controller_uid must anchor to the rooms DB (absent DB -> none), NOT a self-owned BRIDGE_HOME"
+
+  # End-to-end on a REAL ISO HOST: a non-iso managed process forges a self-owned
+  # BRIDGE_HOME and pins the real room DB ($ROOM lives in $BRIDGE_A2A_ROOMS_DB),
+  # but is NOT the DB owner (simulated by the gated test controller-uid override
+  # pointing at a DIFFERENT uid — standing in for the Linux iso-v2 fact that the
+  # real state/handoff/rooms.db is controller-owned, not stattable-as-mine by a
+  # managed agent). On an iso host the attacker is neither the DB owner nor an
+  # iso user -> UNRESOLVED -> approve REJECTED even with --as <leader>. The OLD
+  # forged-BRIDGE_HOME controller bypass would have approved here.
+  if env "${ROOMS_TEST_FLAGS[@]}" \
+         "BRIDGE_ROOMS_TEST_ISO_USER=" \
+         "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
+         "BRIDGE_ROOMS_TEST_CONTROLLER_UID=999998" \
+         "BRIDGE_HOME=$selfhome" \
+       python3 "$ROOMS_CLI" approve "$ROOM" frank --as alice >/dev/null 2>&1; then
+    smoke_fail "TEETH F1 r2: a non-DB-owner with forged BRIDGE_HOME + --as <leader> must be REJECTED"
+  fi
 }
 
 test_advisory_shared_mode_is_honest() {
@@ -413,6 +454,7 @@ smoke_run "TEETH F1: no roster-probe on the security path (hostile env inert)" t
 smoke_run "TEETH F1: env BRIDGE_CONTROLLER_UID is NOT trusted" test_teeth_env_controller_uid_not_trusted
 smoke_run "TEETH F1: non-iso process on an iso host fails closed" test_teeth_non_iso_on_iso_host_fails_closed
 smoke_run "TEETH F1: BRIDGE_HOME controller-bypass disabled on iso host (r7)" test_teeth_iso_host_bridge_home_controller_bypass_closed
+smoke_run "TEETH F1: controller anchored to real rooms-DB owner, not BRIDGE_HOME (r2)" test_teeth_controller_anchored_to_real_db_not_bridge_home
 smoke_run "shared-mode leader-auth is advisory + honest (warns, not blocks)" test_advisory_shared_mode_is_honest
 smoke_run "TEETH: wrong token-hash rejected" test_teeth_wrong_token_hash_rejected
 smoke_run "TEETH: leader cannot be kicked" test_teeth_cannot_kick_leader
