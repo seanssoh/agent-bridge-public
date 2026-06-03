@@ -613,6 +613,25 @@ overrides discovery for a non-standard install.
 bodies) are live-only operator-owned state — preserved across `agb upgrade`
 like `state/`, `logs/`, and the local roster.
 
+## A2A Rooms (beta, single-node)
+
+A2A **Rooms** (v0.16.0-beta1) is a room / leader(방장) / join-on-approval
+membership model that unifies internal-team and (in beta2) cross-bridge agent
+messaging, plus an opt-in internal-queue ACL (`rooms_acl`, default **off**) that
+restricts inter-agent queue creates to shared-room members — OS-enforced under
+linux-user isolation (iso v2). The control plane (`agb room create|join|approve|
+list|show|kick|leave|invite|rotate-invite|adopt-all|acl`) and its `rooms.db` live
+under `state/handoff/` (preserved across `agb upgrade`).
+
+beta1 is **single-node**: rooms and the ACL operate on one install's roster.
+Multi-node transport (Tailscale / Cloudflare Zero Trust), node-link bootstrap,
+and cross-node roster relay are **beta2**.
+
+Full operator usage — lifecycle, the `adopt-all` → `enforce` migration, the
+acting-identity (`--as`) regimes, and the honest security model — is in
+[`docs/a2a-rooms.md`](./docs/a2a-rooms.md). Design rationale + schema:
+[`docs/design/a2a-rooms-design.md`](./docs/design/a2a-rooms-design.md).
+
 ## Status And Debugging
 
 Use these first:
