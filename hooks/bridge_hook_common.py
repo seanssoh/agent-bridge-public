@@ -103,8 +103,28 @@ def agent_home_root() -> Path:
     return bridge_home_dir() / "agents"
 
 
+def agent_root_v2() -> Path | None:
+    explicit = os.environ.get("BRIDGE_AGENT_ROOT_V2", "").strip()  # noqa: iso-helper-boundary
+    if explicit:
+        return Path(explicit).expanduser()
+    data_root = os.environ.get("BRIDGE_DATA_ROOT", "").strip()  # noqa: iso-helper-boundary
+    if data_root:
+        return Path(data_root).expanduser() / "agents"
+    return None
+
+
 def agent_default_home(agent: str) -> Path:
+    root_v2 = agent_root_v2()
+    if root_v2 is not None and agent:
+        return root_v2 / agent / "home"
     return agent_home_root() / agent
+
+
+def agent_workdir_v2(agent: str) -> Path | None:
+    root_v2 = agent_root_v2()
+    if root_v2 is not None and agent:
+        return root_v2 / agent / "workdir"
+    return None
 
 
 @functools.lru_cache(maxsize=None)
@@ -160,9 +180,20 @@ def _resolve_workdir_via_roster(agent: str) -> Path | None:
 
 
 def agent_workdir(agent: str) -> Path:
+    explicit = os.environ.get("BRIDGE_AGENT_WORKDIR_RESOLVED", "").strip()  # noqa: iso-helper-boundary
+    if explicit:
+        return Path(explicit).expanduser()
     explicit = os.environ.get("BRIDGE_AGENT_WORKDIR", "").strip()
     if explicit:
         return Path(explicit).expanduser()
+    v2_workdir = agent_workdir_v2(agent)
+    if v2_workdir is not None:
+        if v2_workdir.is_dir():
+            return v2_workdir
+        roster_workdir = _resolve_workdir_via_roster(agent)
+        if roster_workdir is not None:
+            return roster_workdir
+        return v2_workdir
     default = agent_default_home(agent)
     if default.is_dir():
         return default
@@ -299,12 +330,15 @@ def current_agent_workdir() -> Path:
 
 def queue_cli_cwd() -> Path:
     candidates: list[Path] = []
-    explicit_workdir = os.environ.get("BRIDGE_AGENT_WORKDIR", "").strip()
+    explicit_workdir = os.environ.get("BRIDGE_AGENT_WORKDIR_RESOLVED", "").strip()  # noqa: iso-helper-boundary
+    if not explicit_workdir:
+        explicit_workdir = os.environ.get("BRIDGE_AGENT_WORKDIR", "").strip()
     if explicit_workdir:
         candidates.append(Path(explicit_workdir).expanduser())
 
     agent = current_agent()
     if agent:
+        candidates.append(agent_workdir(agent))
         candidates.append(agent_default_home(agent))
 
     try:

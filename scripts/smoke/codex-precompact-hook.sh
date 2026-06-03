@@ -32,11 +32,12 @@ REPO_ROOT="$SMOKE_REPO_ROOT"
 PYTHON_BIN="$(command -v python3)"
 HOOKS_DIR="$REPO_ROOT/hooks"
 TEST_AGENT="codex-precompact-smoke"
-AGENT_HOME="$BRIDGE_HOME/agents/$TEST_AGENT"
-mkdir -p "$AGENT_HOME"
+AGENT_HOME="$BRIDGE_AGENT_ROOT_V2/$TEST_AGENT/home"
+AGENT_WORKDIR="$BRIDGE_AGENT_ROOT_V2/$TEST_AGENT/workdir"
+mkdir -p "$AGENT_HOME" "$AGENT_WORKDIR"
 printf '# soul\nload-bearing identity anchor\n' >"$AGENT_HOME/SOUL.md"
 printf '# memory\nremember this\n' >"$AGENT_HOME/MEMORY.md"
-printf '# handoff\nread me first\n' >"$AGENT_HOME/NEXT-SESSION.md"
+printf '# handoff\nread me first\n' >"$AGENT_WORKDIR/NEXT-SESSION.md"
 
 # ---------------------------------------------------------------------------
 # Test 1 — ensure-codex-hooks wires PreCompact

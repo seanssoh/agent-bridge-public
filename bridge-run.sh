@@ -680,6 +680,9 @@ export PATH
 export BRIDGE_AGENT_ID="$AGENT"
 export BRIDGE_ADMIN_AGENT_ID="$(bridge_admin_agent_id)"
 export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
+# Issue #1497: the bare name collides with BRIDGE_AGENT_WORKDIR[] in
+# lib/bridge-agents.sh, so hooks consume this scalar alias first.
+export BRIDGE_AGENT_WORKDIR_RESOLVED="$WORK_DIR"
 # Issue #1213 / #1217 (beta27): BRIDGE_AGENT_ISOLATION_MODE,
 # BRIDGE_AGENT_OS_USER, and BRIDGE_AGENT_INJECT_TIMESTAMP all share
 # their names with associative arrays declared in
