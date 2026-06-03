@@ -1,6 +1,181 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash disable=SC2034
 
+# ===========================================================================
+# AMBIENT-SECRET HARDENING for the Bash-3.2→4+ re-exec (issue #1454 — the
+# SHARED ROOT of the inherited-env credential-exposure class).
+# ===========================================================================
+#
+# bridge-lib.sh is sourced by essentially every entry point. Its Bash-3.2→4+
+# re-exec (below) historically ran EXTERNAL commands WHILE the operator's
+# ambient secret env (e.g. the Claude OAuth token) could still be live and an
+# attacker-controlled hook could intercept them:
+#   - a `$(command -v bash …)` command-substitution child in the candidate list,
+#   - a candidate-version probe invoked with `-lc` (a LOGIN shell — it sources
+#     the operator's profile AND honors BASH_ENV), and
+#   - a `$(cd -P "$(dirname …)" && pwd -P)` command-substitution to compute
+#     BRIDGE_SCRIPT_DIR (the `dirname` fork).
+# A same-UID caller that `export -f`'d a function named after any of those
+# commands (e.g. `dirname()`, incl. the `source`/`.`/`builtin`/`command`/`local`
+# builtins — neutralized via the un-shadowable `POSIXLY_CORRECT=1` seed) or
+# planted such a binary on PATH could have its code run IN this shell / a child
+# of it while the secret was readable, and exfiltrate it. PRs #1443
+# (bridge-usage.sh) and #1452/#1444 (bridge-run.sh) each closed this IN THEIR
+# OWN LANE; #1454 closes the re-exec at the shared bridge-lib.sh root.
+#
+# OUT OF SCOPE — the launch-environment-control boundary (#1443-consistent; see
+# lib/bridge-secret-scrub.sh "THREAT MODEL"): startup state the INVOKING shell
+# controls that runs BEFORE bridge-lib.sh's first executable line — an
+# initial-shell `BASH_ENV`/`ENV` startup file, an inherited `SHELLOPTS=xtrace`
+# with a command-substitution `PS4` (Bash evaluates `PS4` before the first
+# command), or an invoking-shell DEBUG trap. No pure-Bash code at the
+# bridge-lib.sh root can pre-empt these, and they require the attacker to
+# control the invoking shell's options/startup on a token-bearing launch — the
+# same position as a same-UID attacker who can already scrape `/proc`/the
+# filesystem. The harden step below DOES `unset BASH_ENV/ENV/BASH_XTRACEFD` +
+# `set +x` + drop `PS4`, so those hooks cannot fire in any CHILD/re-exec the
+# bridge forks AFTER hardening — only the initial-shell pre-first-line window
+# is out of scope.
+#
+# The fix closes the window WITHOUT changing the resolved BRIDGE_SCRIPT_DIR
+# value or the Bash-upgrade behavior:
+#   1. harden hooks FIRST (unset -f interceptor function shadows, unset
+#      BASH_ENV/ENV/BASH_XTRACEFD, set +x, drop PS4) — builtin-only, before any
+#      fork. This is a no-op for normal operation (the bridge never uses those
+#      hooks). The shared primitive (lib/bridge-secret-scrub.sh) provides it.
+#   2. compute BRIDGE_SCRIPT_DIR with a BUILTIN parameter expansion
+#      (`${BASH_SOURCE[0]%/*}`, no `dirname` fork). `cd -P`/`pwd -P` are
+#      builtins, so the canonicalized value is byte-identical to before.
+#   3. select the Bash-4+ candidate from HARDCODED-ABSOLUTE paths (+ a single
+#      `builtin command -v bash` qualified fallback — `builtin command` cannot
+#      resolve to a function shadow), probe each under `-p -c` (PRIVILEGED, not
+#      `-lc`: privileged mode imports no environment functions and ignores
+#      BASH_ENV/ENV; `-c` is not a login shell so no profile is sourced), and
+#      re-exec with `exec "$cand" -p …` so the re-exec'd process is likewise
+#      function-free + hook-free.
+# bridge-lib.sh itself does NOT capture/scrub the operator's ambient secret env
+# (that would change survival semantics for consumers): the steps above defeat
+# the exported-function / PATH-shadow classes and the startup-file hooks for the
+# CHILD/re-exec processes it forks (BASH_ENV/ENV/BASH_XTRACEFD/PS4 are unset
+# before the first fork) — NOT the initial-shell pre-first-line startup window
+# (out of scope, see the boundary note above). So the probe/re-exec children —
+# which run only our own literal code under `-p` — cannot be hijacked even
+# though they inherit the (now-unhookable) env.
+# The capture/scrub + nonce-gated fd-transit helpers are PROVIDED by the shared
+# primitive for consumers that need them (the #1443/#1452 lanes can adopt them
+# in a follow-up); bridge-lib.sh does not wire them onto those consumers here.
+#
+# Everything in THIS block must be Bash 3.2-safe (it runs on macOS /bin/bash
+# 3.2 BEFORE the re-exec). The primitive is written to that bar.
+
+# ---------------------------------------------------------------------------
+# SHADOW-PROOF PRE-SOURCE SEED (#1491 / #1454 gap — bootstrap interception).
+# ---------------------------------------------------------------------------
+# THE GAP this seed closes (codex Phase-4 BLOCKING, proven on the PR head):
+# the primitive load below was historically a BARE `source` that ran WHILE an
+# exported `source()` (or `.()`) function shadow could still be active. A
+# same-UID caller that did
+#     source() { printf '%s\n' "$CLAUDE_CODE_OAUTH_TOKEN" >>"$leak"; command source "$@"; }
+#     export -f source
+# before invoking a bridge entry point would have its shadow run — reading the
+# live ambient secret — at the very moment we tried to load the de-fang
+# primitive. Hardening (`bridge_secret_scrub_harden_hooks`) only ran AFTER that
+# source, so the de-fang primitive itself was loaded through a compromised
+# `source`. The re-exec gate was therefore NOT fail-closed against caller-env
+# influence.
+#
+# THE SEED OF TRUST. Every command token a caller could intercept — `builtin`,
+# `command`, `source`, `.`, `unset`, `set`, `exec`, `eval` — can be shadowed by
+# a same-named exported FUNCTION, and in bash's command lookup a function
+# OUTRANKS the builtin of the same name (verified empirically on bash 5.3.9 AND
+# the macOS /bin/bash 3.2 pre-re-exec shell: even `builtin unset -f builtin` is
+# eaten by a `builtin()` function shadow). So no command-token-based de-fang is
+# self-healing on its own.
+#
+# The one lever a caller CANNOT shadow is a plain VARIABLE ASSIGNMENT — it is
+# not a command lookup. Assigning `POSIXLY_CORRECT=1` dynamically activates
+# POSIX mode mid-shell, and in POSIX mode the POSIX *special* builtins
+# (`unset`, `set`, `export`, `exec`, `eval`, …) OUTRANK same-named function
+# shadows. So:
+#   1. `POSIXLY_CORRECT=1`     — unshadowable assignment, turns POSIX mode ON.
+#   2. `set +T +E` + `trap -`  — kill functrace/errtrace and any DEBUG/RETURN/ERR
+#                                trap FIRST, BEFORE the strip. A `set -T` DEBUG
+#                                trap fires before every simple command and
+#                                could RE-INSTALL a `builtin()`/`source()` shadow
+#                                AFTER we unset it; clearing the trap first
+#                                guarantees nothing re-shadows post-strip.
+#                                (#1491 Phase-4 r2, codex finding 2.)
+#   3. `unset -f <names>`      — now the REAL special builtin `unset` (POSIX
+#                                mode); strips every interceptor function shadow
+#                                (including `source`, `.`, `builtin`, `command`,
+#                                `local`, `trap`, and `unset`/`set` themselves).
+#   4. `set +o posix`          — restore the historical non-POSIX semantics the
+#                                rest of bridge-lib.sh parses/runs under.
+#   5. `unset -f <names>` AGAIN — a SECOND strip in non-POSIX mode. On macOS
+#                                /bin/bash 3.2, `unset -f .` does NOT remove a
+#                                `.()` function while POSIX mode is on, but it
+#                                DOES once POSIX mode is off; the second pass
+#                                closes that 3.2 quirk. (#1491 Phase-4 r2,
+#                                codex finding 3.) `unset` here is the genuine
+#                                builtin — its shadow was stripped in step 3 and
+#                                the trap can no longer re-install it.
+#   6. `unset POSIXLY_CORRECT` — leave no posix-mode residue for children.
+# After the strips the genuine `source`/`builtin` builtins are reachable, so the
+# primitive load below (now `builtin source`, not a bare `source`) cannot be
+# intercepted. This block is pure-bash, builtin-only, no fork, and Bash
+# 3.2-safe — it runs on macOS /bin/bash 3.2 BEFORE the re-exec.
+#
+# `POSIXLY_CORRECT` is a plain (non-exported) shell var here; we unset it again
+# in step 6 so it is never inherited by the candidate-probe / re-exec children.
+# bridge-lib.sh itself requires non-POSIX mode (it uses arrays + `[[ ]]`), so
+# unconditionally landing in `set +o posix` is the correct end state here (the
+# shared primitive's harden_hooks, by contrast, restores the caller's exact
+# prior POSIX state — see lib/bridge-secret-scrub.sh).
+POSIXLY_CORRECT=1
+set +T +E 2>/dev/null || true
+trap - DEBUG RETURN ERR 2>/dev/null || true
+# shellcheck disable=SC2086  # intentional word-split of the name list
+unset -f source . unset set export exec eval command builtin printf read echo \
+  dirname cd pwd trap local mktemp chmod rm cat readlink true false \
+  2>/dev/null || true
+set +o posix 2>/dev/null || true
+# shellcheck disable=SC2086  # intentional word-split (2nd pass closes the bash-3.2 `unset -f .` quirk)
+unset -f source . unset set export exec eval command builtin printf read echo \
+  dirname cd pwd trap local mktemp chmod rm cat readlink true false \
+  2>/dev/null || true
+unset POSIXLY_CORRECT 2>/dev/null || true
+# ---------------------------------------------------------------------------
+
+# Derive the primitive's path with a parameter-expansion builtin (NO `dirname`
+# command-substitution child — that fork must not run while a secret could be
+# live). This mirrors the BRIDGE_SCRIPT_DIR derivation below but only needs the
+# directory to source the primitive.
+if [[ "${BASH_SOURCE[0]}" == */* ]]; then
+  _BRIDGE_LIB_SELF_DIR="${BASH_SOURCE[0]%/*}"
+else
+  _BRIDGE_LIB_SELF_DIR="."
+fi
+if [[ -f "$_BRIDGE_LIB_SELF_DIR/lib/bridge-secret-scrub.sh" ]]; then
+  # Load via `builtin source` (NOT a bare `source`): the seed above already
+  # stripped any `source()`/`.()` function shadow, and `builtin source` cannot
+  # resolve to a function shadow even if a residual one survived. So the de-fang
+  # primitive is loaded through an un-interceptable path.
+  # shellcheck source=lib/bridge-secret-scrub.sh
+  builtin source "$_BRIDGE_LIB_SELF_DIR/lib/bridge-secret-scrub.sh"
+  bridge_secret_scrub_harden_hooks
+else
+  # Primitive missing (truncated checkout): fall back to a minimal inline hook
+  # scrub so we never regress to running the re-exec with BASH_ENV/ENV live.
+  # The seed above already de-fanged the command tokens, so these `builtin`
+  # calls reach the genuine builtins.
+  builtin unset -f exec source command builtin unset printf read dirname cd pwd \
+    2>/dev/null || builtin true
+  builtin unset BASH_ENV ENV BASH_XTRACEFD 2>/dev/null || builtin true
+  builtin set +x 2>/dev/null || builtin true
+  builtin unset PS4 2>/dev/null || builtin true
+fi
+unset _BRIDGE_LIB_SELF_DIR
+
 # Resolve the re-exec target before any guard logic, since $0 is unreliable
 # under macOS /bin/bash invocations like `bash -lc '...' _ args` (where $0
 # is the placeholder `_`). Prefer the caller script that sourced us
@@ -15,12 +190,26 @@ if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
   # fall through to the "requires Bash 4+" message rather than handing the
   # candidate shell a path it cannot open.
   if [[ -f "$_BRIDGE_LIB_REEXEC_TARGET" ]]; then
-    for bridge_candidate_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null || true)"; do
+    # #1454: candidate list is hardcoded-absolute first, then a single
+    # `builtin command -v bash` fallback. `builtin command` cannot resolve to
+    # an exported function shadow (so a `bash()`/`command()` function cannot
+    # hijack the lookup); the absolute paths cannot be function names at all.
+    bridge_candidate_bash_fallback="$(builtin command -v bash 2>/dev/null || true)"
+    for bridge_candidate_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "$bridge_candidate_bash_fallback"; do
       [[ -n "$bridge_candidate_bash" && -x "$bridge_candidate_bash" ]] || continue
-      if "$bridge_candidate_bash" -lc '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
-        exec "$bridge_candidate_bash" "$_BRIDGE_LIB_REEXEC_TARGET" "$@"
+      # Probe under `-p -c` (PRIVILEGED + non-login): privileged Bash imports no
+      # environment functions and ignores BASH_ENV/ENV, and `-c` (not `-lc`)
+      # sources no profile — so the probe child cannot run attacker code while
+      # it inherits the env. (The old `-lc` sourced the operator's login
+      # profile, which a caller could have planted.)
+      if "$bridge_candidate_bash" -p -c '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
+        # Re-exec PRIVILEGED so the re-exec'd bridge-lib (and every child it
+        # forks) is likewise function-free + BASH_ENV/ENV-free.
+        unset bridge_candidate_bash_fallback
+        exec "$bridge_candidate_bash" -p "$_BRIDGE_LIB_REEXEC_TARGET" "$@"
       fi
     done
+    unset bridge_candidate_bash_fallback
   fi
 
   echo "[bridge-lib] Agent Bridge requires Bash 4+ (current: ${BASH_VERSION:-unknown}). Re-run with a Bash 4+ shell on PATH (e.g. \`/opt/homebrew/bin/bash <script>\`)." >&2
@@ -30,7 +219,21 @@ fi
 # Keep bridge-owned runtime files private by default.
 umask 077
 
-BRIDGE_SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# #1454: compute BRIDGE_SCRIPT_DIR via a BUILTIN parameter expansion for the
+# dirname (no `dirname` fork — that external command must not run where an
+# exported-function shadow could intercept it while a secret could be live).
+# `cd -P` + `pwd -P` are builtins and preserve the exact symlink-canonicalized
+# absolute value the previous `$(dirname …)` form produced. Handle the
+# no-slash (`bridge-lib.sh` with no directory) and root-level (`/foo`) cases the
+# way `dirname` did: `.` and `/` respectively.
+if [[ "${BASH_SOURCE[0]}" == */* ]]; then
+  _BRIDGE_SCRIPT_DIR_RAW="${BASH_SOURCE[0]%/*}"
+  [[ -n "$_BRIDGE_SCRIPT_DIR_RAW" ]] || _BRIDGE_SCRIPT_DIR_RAW="/"
+else
+  _BRIDGE_SCRIPT_DIR_RAW="."
+fi
+BRIDGE_SCRIPT_DIR="$(cd -P "$_BRIDGE_SCRIPT_DIR_RAW" && pwd -P)"
+unset _BRIDGE_SCRIPT_DIR_RAW
 
 # Startup validation: if the source checkout that BRIDGE_SCRIPT_DIR resolved
 # to has been removed or is incomplete, fail loud and fast rather than fan
