@@ -243,4 +243,57 @@ smoke_assert_contains "$out" '"hookEventName": "PermissionRequest"' "8 well-form
 task_after="$(python3 -c "import sqlite3; print(sqlite3.connect('$BRIDGE_TASK_DB').execute(\"SELECT COUNT(*) FROM tasks WHERE assigned_to=? AND title LIKE '[PERMISSION]%'\", ('$ADMIN_AGENT',)).fetchone()[0])")"
 smoke_assert_eq "$task_before" "$task_after" "8 no task created under recursion guard"
 
+# ---------------------------------------------------------------------------
+# Test 9 — TOOL_NAME LEAK CLASS (codex Phase-4 BLOCKING): a hostile tool_name
+# that smuggles a path + secret must be sanitized to a canonical token BEFORE
+# it reaches EITHER the audit row OR the queue task (title + body). The raw
+# path/secret must appear in NEITHER. Teeth: reverting the sanitizer (so
+# tool_name is persisted verbatim) makes the NEITHER-leaks assertions fail.
+# ---------------------------------------------------------------------------
+smoke_log "9. tool_name leak class — sanitized in audit AND queue task"
+
+# Use a fresh agent so its (agent,tool) throttle is clean, and an event whose
+# *tool_name* (not tool_input) carries the path+secret.
+LEAK_AGENT="codex-perm-leak-smoke"
+HOSTILE_TOOL="Write $RAW_PATH $RAW_SECRET"
+LEAK_EVENT="{\"tool_name\":\"$HOSTILE_TOOL\",\"tool_input\":{}}"
+: >"$AUDIT_LOG"
+out="$(printf '%s' "$LEAK_EVENT" | env -u BRIDGE_ADMIN_AGENT_ID \
+  BRIDGE_HOME="$BRIDGE_HOME" BRIDGE_STATE_DIR="$BRIDGE_STATE_DIR" \
+  BRIDGE_LOG_DIR="$BRIDGE_LOG_DIR" BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
+  BRIDGE_TASK_DB="$BRIDGE_TASK_DB" BRIDGE_AGENT_HOME_ROOT="$BRIDGE_HOME/agents" \
+  BRIDGE_AGENT_ID="$LEAK_AGENT" BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
+  BRIDGE_CODEX_PERMISSION_AUTO_QUEUE=on BRIDGE_CODEX_PERMISSION_QUEUE_THROTTLE_SECONDS=600 \
+  python3 "$HOOK")"
+smoke_assert_contains "$out" '"hookEventName": "PermissionRequest"' "9 envelope event name"
+
+# The audit row must carry only the sanitized token + a redaction marker, and
+# NEITHER the raw path NOR the secret.
+audit_content="$(cat "$AUDIT_LOG")"
+smoke_assert_contains "$audit_content" '"tool": "Write"' "9 audit tool sanitized to canonical token"
+smoke_assert_contains "$audit_content" '"tool_name_redacted": true' "9 audit flags redaction"
+smoke_assert_contains "$audit_content" "tool_sha256" "9 audit carries raw-name hash anchor"
+smoke_assert_not_contains "$audit_content" "$RAW_PATH" "9 path NOT in audit (tool_name)"
+smoke_assert_not_contains "$audit_content" "$RAW_SECRET" "9 secret NOT in audit (tool_name)"
+
+# The queued [PERMISSION] task title + body must also be sanitized.
+python3 -c "
+import sqlite3
+c=sqlite3.connect('$BRIDGE_TASK_DB'); c.row_factory=sqlite3.Row
+rows=c.execute(\"SELECT title, body_text, body_path FROM tasks WHERE assigned_to=? AND title LIKE '[PERMISSION]%'\", ('$ADMIN_AGENT',)).fetchall()
+blob=''
+for r in rows:
+    blob += (r['title'] or '')
+    b = r['body_text'] or ''
+    if (not b) and r['body_path']:
+        try: b=open(r['body_path']).read()
+        except OSError: b=''
+    blob += b
+open('$SMOKE_TMP_ROOT/leak-task-blob.txt','w').write(blob)
+"
+leak_blob="$(cat "$SMOKE_TMP_ROOT/leak-task-blob.txt")"
+smoke_assert_contains "$leak_blob" "needs approval for Write" "9 task title sanitized to canonical token"
+smoke_assert_not_contains "$leak_blob" "$RAW_PATH" "9 path NOT in queue task (title/body)"
+smoke_assert_not_contains "$leak_blob" "$RAW_SECRET" "9 secret NOT in queue task (title/body)"
+
 smoke_log "PASS: $SMOKE_NAME"

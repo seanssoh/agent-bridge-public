@@ -52,6 +52,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -78,6 +79,18 @@ _DEFAULT_THROTTLE_SECONDS = 600
 # Recursion guard env: queue task creation drives `agb task create`, which
 # itself fires hooks. Never re-enter.
 _RECURSION_ENV = "BRIDGE_HOOK_CODEX_PERMISSION_ACTIVE"
+
+# A legitimate tool name is a single canonical identifier: alnum plus a closed
+# set of separators (`_`, `.`, `:`, `-`). It must NEVER carry a path, argv, or
+# arbitrary free text. The sanitizer below extracts the leading canonical token
+# and discards everything else, so a hostile payload like
+# `Write /Users/op/keys.txt sk-...` cannot smuggle a path/secret through the
+# tool-NAME field into the audit row or the [PERMISSION] queue task (codex
+# Phase-4 BLOCKING — the tool_name leak class, sibling to the tool_input
+# redaction already in place).
+_TOOL_NAME_TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
+_TOOL_NAME_MAX_LEN = 64
+_REDACTED_TOOL_NAME = "redacted-tool"
 
 
 def _read_event() -> dict[str, Any]:
@@ -107,12 +120,57 @@ def _throttle_window_seconds() -> int:
     return value if value > 0 else _DEFAULT_THROTTLE_SECONDS
 
 
-def _tool_name(event: dict[str, Any]) -> str:
+def _raw_tool_name(event: dict[str, Any]) -> str:
+    """Return the caller-supplied tool name VERBATIM (untrusted).
+
+    Used ONLY to derive a one-way SHA-256 correlation anchor. The raw value
+    must never be persisted directly — every persistence path uses the
+    sanitized ``_tool_name`` instead.
+    """
     for key in ("tool_name", "toolName", "tool"):
         value = event.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    return "unknown"
+    return ""
+
+
+def _sanitize_tool_name(raw: str) -> str:
+    """Reduce an untrusted tool-name string to a SAFE canonical token.
+
+    Extracts the leading ``[A-Za-z0-9_.:-]+`` token (the legitimate tool
+    identifier shape) and discards everything after it — so a hostile
+    ``Write /Users/op/keys.txt sk-…`` collapses to ``Write`` and no path /
+    argv / secret survives. The token is length-capped. A value with no
+    canonical leading token (e.g. starts with a path separator) yields
+    ``redacted-tool``; an empty/missing name yields ``unknown``.
+
+    This is the SINGLE source of the tool name for ALL persistence paths
+    (audit ``detail.tool``, the ``[PERMISSION]`` task title/body, and the
+    throttle/context keys), mirroring the redaction discipline already
+    applied to ``tool_input``.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return "unknown"
+    match = _TOOL_NAME_TOKEN_RE.match(raw)
+    if match is None:
+        # No canonical token at the start → the whole value is hostile
+        # free-text (e.g. a leading "/path" or quoted blob). Persist nothing
+        # from it; the SHA-256 anchor on the raw value preserves correlation.
+        return _REDACTED_TOOL_NAME
+    token = match.group(0)[:_TOOL_NAME_MAX_LEN]
+    return token or _REDACTED_TOOL_NAME
+
+
+def _tool_name(event: dict[str, Any]) -> str:
+    """SAFE canonical tool name — the only tool-name value any persistence
+    path may use. See :func:`_sanitize_tool_name`."""
+    return _sanitize_tool_name(_raw_tool_name(event))
+
+
+def _tool_name_sha256(raw: str) -> str:
+    """One-way correlation anchor for the RAW (untrusted) tool name."""
+    return hashlib.sha256((raw or "").encode("utf-8", errors="replace")).hexdigest()
 
 
 def _normalize_tool_for_key(tool: str) -> str:
@@ -141,7 +199,10 @@ def _context_hash(event: dict[str, Any]) -> str:
         canonical = json.dumps(tool_input, ensure_ascii=True, sort_keys=True, default=str)
     except (TypeError, ValueError):
         canonical = str(tool_input)
-    payload = f"{_tool_name(event)}\x00{canonical}"
+    # Hash over the RAW tool name (one-way; no leak) so two identical
+    # underlying requests — including identical hostile payloads — produce the
+    # same anchor for operator correlation.
+    payload = f"{_raw_tool_name(event)}\x00{canonical}"
     return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
 
 
@@ -304,7 +365,15 @@ def main() -> int:
             _emit_envelope()
             return 0
 
-        tool = _tool_name(event)
+        # `tool` is the SANITIZED canonical token — the ONLY tool-name value
+        # that reaches any persistence path (audit detail.tool, the
+        # [PERMISSION] task title/body, the throttle/context keys). The raw
+        # (untrusted) name is read only to derive a one-way correlation hash
+        # and to detect whether sanitization actually dropped anything.
+        raw_tool = _raw_tool_name(event)
+        tool = _sanitize_tool_name(raw_tool)
+        tool_name_redacted = raw_tool != tool
+        tool_sha256 = _tool_name_sha256(raw_tool) if tool_name_redacted else ""
         tool_key = _normalize_tool_for_key(tool)
         context_hash = _context_hash(event)
         now = int(time.time())
@@ -337,7 +406,16 @@ def main() -> int:
                     "codex_permission_request",
                     agent,
                     {
+                        # SANITIZED canonical tool token ONLY — never the raw
+                        # caller-supplied tool-name string.
                         "tool": tool,
+                        # Whether the raw tool name carried more than the
+                        # canonical token (a path/argv/secret smuggle attempt).
+                        "tool_name_redacted": tool_name_redacted,
+                        # One-way anchor for the RAW tool name; emitted ONLY when
+                        # sanitization dropped something, so an operator can
+                        # correlate without the raw value ever being persisted.
+                        "tool_sha256": tool_sha256,
                         # Redacted forensic anchor ONLY. No path / argv / reason.
                         "context_sha256": context_hash,
                         "auto_queue": auto_queue,
