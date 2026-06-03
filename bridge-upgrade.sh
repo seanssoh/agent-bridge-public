@@ -872,6 +872,112 @@ print("" if value is None else str(value))
 PY
 }
 
+# #8945 Track D: record the Codex CLI version across upgrades and surface a
+# NON-FATAL operator advisory when the MAJOR or MINOR component changes.
+# Codex CLI capability (hooks, AGENTS.md, slash commands, permission
+# profiles) grows between minor releases; an operator who jumped Codex
+# versions should re-check the bridge's Codex provisioning (hook list,
+# AGENTS.md protocol, `codex doctor`) against the new CLI.
+#
+# Strictly advisory + best-effort:
+#   - Missing codex CLI → skip silently (same non-fatal precedent as the
+#     admin codex-pair auto-provisioning, lib/bridge-init-codex-pair.sh).
+#   - First time we ever see a codex version → record it, no advisory
+#     (there is no prior version to compare against).
+#   - MAJOR.MINOR unchanged → record (patch bumps are quiet), no advisory.
+#   - MAJOR or MINOR changed → print the advisory to stderr, then record
+#     the new version so the advisory fires once per major/minor change.
+# Never fails the upgrade: every branch returns 0.
+#
+# State file: $TARGET_ROOT/state/upgrade/codex-version.last (a single line,
+# the raw `codex --version` token, e.g. "codex-cli 0.135.0"). Parsing is
+# pure shell + awk — NO heredoc-stdin to a subprocess (bridge-upgrade.sh is
+# at the lint-heredoc-ban ceiling; footgun #11). The advisory text uses a
+# `cat >&2 <<` fd-redirect heredoc, which is NOT a subprocess interpreter
+# site and is not counted by the ratchet.
+bridge_upgrade_emit_codex_version_advisory() {
+  local target_root="$1"
+  local dry_run="${2:-0}"
+  local advisory_mode="${BRIDGE_CODEX_VERSION_ADVISORY:-1}"
+
+  if [[ "$advisory_mode" == "0" ]]; then
+    return 0
+  fi
+
+  if ! command -v codex >/dev/null 2>&1; then
+    # Non-fatal: a codex-less host has nothing to advise on.
+    return 0
+  fi
+
+  if [[ "$dry_run" == "1" ]]; then
+    echo "[bridge-upgrade] plan: record codex --version + advise on a major/minor change (non-fatal, one-shot per change)" >&2
+    return 0
+  fi
+
+  # Capture the raw version token. Best-effort: a codex that errors on
+  # --version is treated as unknown and skipped.
+  #
+  # errexit safety (codex internal-review r1): bridge-upgrade.sh runs under
+  # `set -euo pipefail`. Every capture below MUST carry a `|| var=""`
+  # fallback so a nonzero in the command substitution (codex --version
+  # exiting nonzero, a no-match `grep -oE` returning 1, or a pipefail
+  # member failing) does NOT abort the whole upgrade. The advisory is
+  # strictly non-fatal — an unparseable / failing codex is "unknown and
+  # skipped", never an upgrade blocker.
+  local current_raw=""
+  current_raw="$(codex --version 2>/dev/null | head -n 1 | tr -d '\r')" || current_raw=""
+  [[ -n "$current_raw" ]] || return 0
+
+  # Extract the first dotted numeric token (e.g. "0.135.0") from the raw
+  # line, then its MAJOR.MINOR. grep -oE keeps this portable across the
+  # "codex-cli 0.135.0" / "codex 0.135.0" surface variants. `grep -oE`
+  # exits 1 on no-match — the `|| current_ver=""` keeps that from tripping
+  # errexit, and the empty-guard below then returns 0.
+  local current_ver=""
+  current_ver="$(printf '%s\n' "$current_raw" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)" || current_ver=""
+  [[ -n "$current_ver" ]] || return 0
+  local current_mm=""
+  current_mm="$(printf '%s\n' "$current_ver" | awk -F. '{print $1"."$2}')" || current_mm=""
+
+  local state_dir="$target_root/state/upgrade"
+  local state_file="$state_dir/codex-version.last"
+
+  local prev_raw=""
+  if [[ -f "$state_file" ]]; then
+    prev_raw="$(head -n 1 "$state_file" 2>/dev/null | tr -d '\r')" || prev_raw=""
+  fi
+
+  # Record helper (best-effort; failure to record is non-fatal — the next
+  # upgrade just re-evaluates).
+  mkdir -p "$state_dir" 2>/dev/null || true
+
+  if [[ -z "$prev_raw" ]]; then
+    # First observation — no baseline to compare. Record silently.
+    printf '%s\n' "$current_raw" >"$state_file" 2>/dev/null || true
+    return 0
+  fi
+
+  local prev_ver=""
+  prev_ver="$(printf '%s\n' "$prev_raw" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1)" || prev_ver=""
+  local prev_mm=""
+  prev_mm="$(printf '%s\n' "$prev_ver" | awk -F. '{print $1"."$2}')" || prev_mm=""
+
+  if [[ -n "$prev_mm" && "$prev_mm" != "$current_mm" ]]; then
+    cat >&2 <<ADVISORY
+[bridge-upgrade] ADVISORY: Codex CLI changed ${prev_ver:-$prev_raw} -> ${current_ver:-$current_raw} (major/minor).
+[bridge-upgrade] Codex capabilities (hooks, AGENTS.md protocol, slash commands, permission profiles) can change across minor releases.
+[bridge-upgrade] Recommended: re-check Codex agents with 'codex doctor', and confirm the bridge's Codex hook list + AGENTS.md protocol still match the new CLI.
+[bridge-upgrade] This advisory fires once per major/minor change. Suppress with BRIDGE_CODEX_VERSION_ADVISORY=0.
+ADVISORY
+  fi
+
+  # Record the new version regardless of whether the advisory fired so a
+  # patch-only bump updates the baseline and a major/minor advisory does
+  # not repeat on the next upgrade.
+  printf '%s\n' "$current_raw" >"$state_file" 2>/dev/null || true
+  return 0
+}
+
 # Issue #4769 (reverts #517): when a host carries the auto-created
 # `admin` + `admin-dev` pair from a previous v0.14.x upgrade, emit a
 # non-destructive advisory describing the explicit-setup contract and
@@ -2084,6 +2190,10 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   # explicit setup/retire recipe — but no destructive action runs here.
 
   bridge_upgrade_emit_admin_pair_advisory "$TARGET_ROOT" "$ADMIN_AGENT_ID" "$DRY_RUN"
+
+  # #8945 Track D: record codex --version + surface a non-fatal advisory on
+  # a major/minor change. No-op when codex is absent (non-fatal precedent).
+  bridge_upgrade_emit_codex_version_advisory "$TARGET_ROOT" "$DRY_RUN"
 
   # Issue #833 r2: backfill the picker-sweep cron on every upgrade.
   # bridge-init.sh registers it on fresh install, but existing installs that

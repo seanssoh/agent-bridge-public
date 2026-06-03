@@ -187,4 +187,85 @@ fi
 run_watchdog scan --json --apply --agent claude-ok --agent-registry-json "$REGISTRY_JSON" >/dev/null
 [[ -f "$REPORT_FILE" ]] || smoke_fail "T6b: scan --apply did not write $REPORT_FILE"
 
+# --- T7 / T8 — #8945 Track D: shared-workdir AGENTS.md home fall-back -----
+# A Codex agent layered onto a *shared* workdir (the admin's `<admin>-dev`
+# pair created with `--allow-shared-workdir`) has its per-agent AGENTS.md
+# materialized into its `agent_home` identity source, NOT the shared
+# workdir — `bridge_layout_materialize_identity`'s shared-workspace guard
+# declines to stamp per-agent identity into a foreign workspace. The
+# watchdog scans the workdir, so before this fix it reported a phantom
+# `missing_files: AGENTS.md` for every such pair (the patch-dev false
+# drift). The registry `home` field now lets the watchdog treat the
+# entrypoint as present when it exists in EITHER the scanned dir OR the
+# agent_home.
+#
+#   T7: codex agent — AGENTS.md absent from the (shared) workdir but
+#       PRESENT in `home` → status ok, missing_files empty. No false drift.
+#   T8 (teeth): codex agent — AGENTS.md absent from BOTH the workdir AND
+#       `home` → status error, missing_files [AGENTS.md]. A genuinely
+#       missing entrypoint is NOT masked by the fall-back.
+smoke_log "T7-T8: codex shared-workdir AGENTS.md home fall-back (no false drift; genuine-missing still fires)"
+
+# Shared workdir holds a *foreign* CLAUDE.md (the admin's), no AGENTS.md.
+SHARED_WD="$SMOKE_TMP_ROOT/shared-admin-workdir"
+mkdir -p "$SHARED_WD"
+printf '%s\n' "# admin (claude) — shared project workdir" >"$SHARED_WD/CLAUDE.md"
+
+# T7 agent: per-agent AGENTS.md materialized into the agent_home, not the
+# shared workdir.
+CODEX_SHARED_HOME="$AGENTS_ROOT/codex-shared/home"
+mkdir -p "$CODEX_SHARED_HOME"
+: >"$CODEX_SHARED_HOME/AGENTS.md"
+
+# T8 agent: AGENTS.md absent everywhere (shared workdir + empty home).
+CODEX_SHARED_MISSING_HOME="$AGENTS_ROOT/codex-shared-missing/home"
+mkdir -p "$CODEX_SHARED_MISSING_HOME"
+
+REGISTRY_SHARED_JSON="$SMOKE_TMP_ROOT/registry-shared.json"
+{
+  printf '['
+  printf '{"id":"codex-shared","class":"static","agent_source":"static","engine":"codex","workdir":"%s","home":"%s"},' \
+    "$SHARED_WD" "$CODEX_SHARED_HOME"
+  printf '{"id":"codex-shared-missing","class":"static","agent_source":"static","engine":"codex","workdir":"%s","home":"%s"}' \
+    "$SHARED_WD" "$CODEX_SHARED_MISSING_HOME"
+  printf ']'
+} >"$REGISTRY_SHARED_JSON"
+
+SHARED_SCAN_JSON="$(run_watchdog scan --json --registry-anchored --agent-registry-json "$REGISTRY_SHARED_JSON")"
+# Assertion driver as a temp FILE (not heredoc-stdin / procsub into the
+# interpreter — lint-heredoc-ban H3 family). Written via printf, invoked
+# as `python3 <file> <json>`.
+SHARED_ASSERT_PY="$SMOKE_TMP_ROOT/shared-assert.py"
+printf '%s\n' \
+  'import json, sys' \
+  'payload = json.loads(sys.argv[1])' \
+  'rows = {row["agent"]: row for row in payload["agents"]}' \
+  '# T7: AGENTS.md present in home (not the shared workdir) -> ok, no drift.' \
+  'row = rows.get("codex-shared")' \
+  'assert row is not None, "T7: codex-shared row missing: %s" % sorted(rows)' \
+  'assert row["engine"] == "codex", row' \
+  'status = row["status"]' \
+  'missing = row["missing_files"]' \
+  'assert status == "ok", (' \
+  '    "T7: shared-workdir codex with AGENTS.md in home must be ok "' \
+  '    "(false-drift regression), got %s / %s" % (status, missing)' \
+  ')' \
+  'assert missing == [], (' \
+  '    "T7: AGENTS.md present in home must not be reported missing: %s" % missing' \
+  ')' \
+  '# T8 (teeth): AGENTS.md absent from BOTH workdir and home -> error.' \
+  'row = rows.get("codex-shared-missing")' \
+  'assert row is not None, "T8: codex-shared-missing row missing: %s" % sorted(rows)' \
+  'status = row["status"]' \
+  'missing = row["missing_files"]' \
+  'assert status == "error", (' \
+  '    "T8 teeth: a genuinely missing AGENTS.md (absent from workdir AND home) "' \
+  '    "must still be drift, got %s" % status' \
+  ')' \
+  'assert missing == ["AGENTS.md"], (' \
+  '    "T8 teeth: expected [AGENTS.md], got %s" % missing' \
+  ')' \
+  >"$SHARED_ASSERT_PY"
+"$PY_BIN" "$SHARED_ASSERT_PY" "$SHARED_SCAN_JSON"
+
 smoke_log "PASS"

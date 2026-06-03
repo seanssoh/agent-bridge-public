@@ -125,6 +125,12 @@ add_required 8807-mcp-reaper-patterns
 # suite so a scripts/smoke/* or lib/bridge-agents.sh change re-runs it via the
 # catch-all. (1067-codex-provisioning is already listed above.)
 add_required codex-nudge-body
+# #8945 Track D: availability-gated `codex doctor` smoke (graceful SKIP when
+# codex is absent — the CI default — so a codex-less host is never a false
+# release blocker) + the bridge-upgrade.sh codex-version advisory surface.
+# In the full static suite so a scripts/smoke/*, bridge-watchdog.py, or
+# bridge-upgrade.sh change re-runs them via the catch-all / default arm.
+add_required codex-doctor codex-version-surface
 
 
 }
@@ -2155,7 +2161,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # populated → conflict bail) and the run_sync wiring. Pull on
       # every bridge-upgrade.sh move so the backfill call cannot
       # silently regress.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds
+      # #8945 Track D: bridge-upgrade.sh gained
+      # bridge_upgrade_emit_codex_version_advisory — records codex --version
+      # into state/upgrade/codex-version.last and surfaces a NON-fatal
+      # operator advisory on a major/minor change (skips silently when codex
+      # is absent). Pull codex-version-surface on every upgrade-entry move so
+      # the first-seen / patch-bump / major-minor / suppress / dry-run matrix
+      # cannot regress (and the extraction seam stays bound to the live
+      # function body).
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor
       add_integration integration-minimal
       ;;
 
@@ -2407,7 +2421,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # iso-uid-side). Pull G-beta4-watchdog-noise on every
       # bridge-watchdog.py move so a future refactor cannot regress any
       # of those four contracts without the smoke catching it.
-      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise queue
+      # #8945 Track D: ε-watchdog-rescan-codex now also pins the shared-
+      # workdir AGENTS.md home fall-back (a Codex `<admin>-dev` pair layered
+      # onto a shared workdir materializes its per-agent AGENTS.md into its
+      # agent_home, not the scanned workdir — the watchdog must treat the
+      # entrypoint as present in EITHER location, while a genuinely missing
+      # AGENTS.md still surfaces as drift). codex-doctor is pulled too so the
+      # availability-gated codex env/auth smoke rides along on watchdog moves
+      # that touch the codex contract surface.
+      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise codex-doctor queue
       add_integration integration-minimal
       ;;
 
