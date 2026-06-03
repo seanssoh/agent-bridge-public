@@ -111,6 +111,13 @@ add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-
 add_required 1425-cron-dispatch-nudge-scope
 add_required 1936-forward-followup-attached-escalation
 add_required 1473-agent-list-iso-state-fallback
+# Issue #1497 (concrete handoff-drop): the v2-split Python hook layer must
+# resolve agent workdir/home via the v2 root (BRIDGE_AGENT_WORKDIR_RESOLVED /
+# BRIDGE_AGENT_ROOT_V2) so the NEXT-SESSION.md handoff is delivered, with the
+# legacy tree preserved when no v2 signal is present. In the static base set so
+# any change re-runs it; the bridge-run.sh + hooks/* per-file cases below also
+# pull it directly.
+add_required 1497-v2-handoff-workdir-resolution
 # Issue #1474 (v0.15.3 wrapper-path regression): bridge_load_roster must EXPORT
 # the resolved BRIDGE_ADMIN_AGENT_ID so the admin cross-agent cron exemption
 # survives `exec` into the bridge-cron.sh child via the agent-bridge/agb wrapper
@@ -1469,7 +1476,15 @@ select_for_path() {
       # silently drift the dispatch shape (e.g. by passing `--reason
       # install` instead of `--reason manual`, which would bypass the
       # parity guard).
-add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1028-isolated-workdir-check 1118-v2-engine-binary-path v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning 1115-cli-usage-drift 1151-step-a-helper 1155-bootstrap-skill-guard 1158-marker-load-order 1165-track-a-scaffold-modes 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved I-agent-description-roster γ-cli-consistency C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir K-beta4-nits α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-epsilon-tmux-inject-busy beta5-2-theta-upgrade-backfill-perms 1360-onboarding-next-actions-persona 1409-claude-midturn-busy-gate
+      # Issue #1497 (concrete handoff-drop): bridge-run.sh now exports
+      # BRIDGE_AGENT_WORKDIR_RESOLVED as a distinctly-named scalar alias next
+      # to the bare-name export (the bare BRIDGE_AGENT_WORKDIR silently no-ops
+      # because of the assoc-array name collision at lib/bridge-agents.sh:3628,
+      # same class as the #1213/#1217 fixes), and re-exports it on the
+      # roster-reload relaunch path. 1497-v2-handoff-workdir-resolution pins
+      # the bash export + the Python hook's v2-aware resolution so a future
+      # bridge-run.sh move cannot regress the v2-split handoff delivery.
+add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1028-isolated-workdir-check 1118-v2-engine-binary-path v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning 1115-cli-usage-drift 1151-step-a-helper 1155-bootstrap-skill-guard 1158-marker-load-order 1165-track-a-scaffold-modes 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved I-agent-description-roster γ-cli-consistency C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir K-beta4-nits α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-epsilon-tmux-inject-busy beta5-2-theta-upgrade-backfill-perms 1360-onboarding-next-actions-persona 1409-claude-midturn-busy-gate 1497-v2-handoff-workdir-resolution
       # v0.15.0-beta5-2 Lane ν (#1317-B/-C): bridge-agent.sh now hosts
       # the engine-CLI pre-flight at `agent create` (refuses with
       # actionable error when the engine binary is not on PATH; opt-out
@@ -2159,7 +2174,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # per-hook smokes so a change to the renderer re-runs the render-wiring +
       # PermissionRequest security (redaction / throttle / no-side-effect / teeth)
       # assertions.
-      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering 1495-settings-invalid-hook-key per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1205-hook-iso-fail-open 1212-bridge-hooks-marketplace 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers 1358-admin-credential-routine-exempt 1199-action-required-claimed-skip codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook
+      # Issue #1497 (concrete handoff-drop): hooks/bridge_hook_common.py's
+      # agent_default_home / agent_workdir (and the new agent_root_v2 helper)
+      # are now v2-aware — they consult BRIDGE_AGENT_WORKDIR_RESOLVED /
+      # BRIDGE_AGENT_ROOT_V2 / BRIDGE_DATA_ROOT and prefer the v2 workdir over
+      # the legacy `.is_dir()` short-circuit on split-brain installs, while
+      # preserving the legacy tree when no v2 signal is present. Pull
+      # 1497-v2-handoff-workdir-resolution on every hooks/* move so the v2
+      # resolution + the legacy no-regression contract cannot silently revert
+      # (the NEXT-SESSION.md handoff delivery depends on this resolver).
+      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering 1495-settings-invalid-hook-key per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1205-hook-iso-fail-open 1212-bridge-hooks-marketplace 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers 1358-admin-credential-routine-exempt 1199-action-required-claimed-skip codex-precompact-hook codex-postcompact-hook codex-subagent-hooks codex-permission-request-hook 1497-v2-handoff-workdir-resolution
       add_integration integration-minimal
       ;;
 

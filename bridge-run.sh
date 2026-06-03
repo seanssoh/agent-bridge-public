@@ -680,6 +680,18 @@ export PATH
 export BRIDGE_AGENT_ID="$AGENT"
 export BRIDGE_ADMIN_AGENT_ID="$(bridge_admin_agent_id)"
 export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
+# Issue #1497: BRIDGE_AGENT_WORKDIR is ALSO the name of an associative
+# array (declare -g -A at lib/bridge-agents.sh:3628), so the bare-name
+# export above silently no-ops exactly like the #1213/#1217 cases below —
+# the child env never receives it, and the Python hook layer
+# (hooks/bridge_hook_common.py::agent_workdir) sees an empty
+# BRIDGE_AGENT_WORKDIR and falls back to the legacy v1 tree. On a v2
+# split layout that mis-resolves the workdir and the NEXT-SESSION.md
+# handoff is silently dropped. Mirror the #1217 *_RESOLVED scalar-alias
+# pattern: surface the already-resolved $WORK_DIR (computed via the
+# authoritative bridge_agent_workdir at line 612, v2/iso/admin-pair
+# aware) under a distinctly-named scalar the Python hook reads first.
+export BRIDGE_AGENT_WORKDIR_RESOLVED="$WORK_DIR"
 # Issue #1213 / #1217 (beta27): BRIDGE_AGENT_ISOLATION_MODE,
 # BRIDGE_AGENT_OS_USER, and BRIDGE_AGENT_INJECT_TIMESTAMP all share
 # their names with associative arrays declared in
@@ -819,6 +831,10 @@ bridge_run_refresh_roster_if_changed() {
   ENGINE="$(bridge_agent_engine "$AGENT")"
   SESSION="$(bridge_agent_session "$AGENT")"
   [[ -n "$WORK_DIR" ]] || bridge_die "'$AGENT'의 workdir가 비어 있습니다."
+  # Issue #1497: a mid-loop roster change can move the resolved workdir,
+  # so refresh the scalar alias the Python hook reads (set at line ~682
+  # for the first launch) to keep bash↔Python in sync on relaunch.
+  export BRIDGE_AGENT_WORKDIR_RESOLVED="$WORK_DIR"
   cd "$WORK_DIR" || bridge_die "$WORK_DIR 디렉토리가 없습니다."
   if [[ -n "$BRIDGE_RUN_ROSTER_SIGNATURE" ]]; then
     log_line "[info] roster changed on disk; reloading before next relaunch"

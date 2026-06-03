@@ -103,7 +103,38 @@ def agent_home_root() -> Path:
     return bridge_home_dir() / "agents"
 
 
+def agent_root_v2() -> Path | None:
+    """The v2 split-layout per-agent root (``data/agents``), if active.
+
+    Issue #1497: on a v2 split layout install the bash launcher exports
+    ``BRIDGE_AGENT_ROOT_V2`` (= ``$BRIDGE_DATA_ROOT/agents``) into every
+    agent session, and ``bridge_agent_default_home`` (lib/bridge-agents.sh)
+    resolves an agent's identity home to ``$BRIDGE_AGENT_ROOT_V2/<a>/home``
+    — NOT the legacy ``$BRIDGE_AGENT_HOME_ROOT/<a>``. The Python hook layer
+    was v2-blind and read only the legacy root, so it mis-resolved the home
+    (and, downstream, the NEXT-SESSION.md handoff candidate list) to the
+    stale legacy tree. Honour the same signal bash uses, with the same
+    ``BRIDGE_DATA_ROOT`` fallback the bash anchor uses
+    (lib/bridge-isolation-v2.sh:101). Returns ``None`` when no v2 signal is
+    present so callers fall back to the exact legacy behaviour.
+    """
+    root = os.environ.get("BRIDGE_AGENT_ROOT_V2", "").strip()
+    if root:
+        return Path(root).expanduser()
+    data_root = os.environ.get("BRIDGE_DATA_ROOT", "").strip()
+    if data_root:
+        return Path(data_root).expanduser() / "agents"
+    return None
+
+
 def agent_default_home(agent: str) -> Path:
+    # Issue #1497: mirror bash bridge_agent_default_home exactly — on a v2
+    # split layout the identity home is <root_v2>/<agent>/home; only fall
+    # back to the legacy <home_root>/<agent> when no v2 signal is present.
+    if agent:
+        root_v2 = agent_root_v2()
+        if root_v2 is not None:
+            return root_v2 / agent / "home"
     return agent_home_root() / agent
 
 
@@ -160,9 +191,33 @@ def _resolve_workdir_via_roster(agent: str) -> Path | None:
 
 
 def agent_workdir(agent: str) -> Path:
+    # Issue #1497 (fast path): bridge-run.sh exports the already-resolved
+    # workdir under the distinctly-named BRIDGE_AGENT_WORKDIR_RESOLVED
+    # scalar (the bare BRIDGE_AGENT_WORKDIR is the name of a bash
+    # associative array, so its scalar export silently no-ops — mirroring
+    # the #1217 BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED fix). $WORK_DIR was
+    # computed via the authoritative bridge_agent_workdir, so this is the
+    # exact v2/iso/admin-pair-aware answer. Read it first; fall back to the
+    # legacy bare name for manual / non-bridge launches.
+    resolved = os.environ.get("BRIDGE_AGENT_WORKDIR_RESOLVED", "").strip()
+    if resolved:
+        return Path(resolved).expanduser()
     explicit = os.environ.get("BRIDGE_AGENT_WORKDIR", "").strip()
     if explicit:
         return Path(explicit).expanduser()
+    # Issue #1497 (split-brain immunity): on a migrated v2 install the
+    # legacy agents/<a> dir physically still exists, so the legacy-default
+    # .is_dir() short-circuit below would win and return the stale legacy
+    # tree BEFORE the roster fallback recovers the real workdir. When a v2
+    # signal is present, prefer the v2 workdir <root_v2>/<a>/workdir if it
+    # exists on disk — matching the bash bridge_agent_workdir v2 anchor —
+    # ahead of the legacy short-circuit.
+    if agent:
+        root_v2 = agent_root_v2()
+        if root_v2 is not None:
+            v2_workdir = root_v2 / agent / "workdir"
+            if v2_workdir.is_dir():
+                return v2_workdir
     default = agent_default_home(agent)
     if default.is_dir():
         return default
