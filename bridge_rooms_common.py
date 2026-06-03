@@ -1054,3 +1054,201 @@ def rooms_acl_mode(conn: Optional[sqlite3.Connection] = None) -> str:
         return ACL_OFF
     val = str(row["v"]).strip().lower()
     return val if val in (ACL_OFF, ACL_ENFORCE) else ACL_OFF
+
+
+def rooms_acl_mode_strict() -> str:
+    """Return the rooms_acl mode, but RAISE on a present-but-unreadable db.
+
+    The lenient `rooms_acl_mode()` collapses every fault to ACL_OFF (back-compat
+    for read paths that must degrade). That is a FAIL-OPEN for the P1b queue gate:
+    a previously-enforced rooms.db that becomes unreadable/corrupt would read
+    'off' and silently drop enforcement (codex r1 BLOCKING). This strict variant
+    distinguishes:
+      - db ABSENT (no rooms ever defined) -> ACL_OFF (legitimate back-compat).
+      - db present + readable             -> the stored mode.
+      - db present + UNREADABLE/corrupt   -> raises RoomsError so the queue gate
+                                             can fail CLOSED for a real iso actor.
+    """
+    conn = open_rooms_readonly()  # raises RoomsError on present-but-unreadable
+    if conn is None:
+        return ACL_OFF  # no db at all -> no rooms -> off (back-compat)
+    try:
+        row = conn.execute(
+            "SELECT v FROM rooms_acl_config WHERE k=?", (_ACL_CONFIG_KEY,)
+        ).fetchone()
+    except sqlite3.Error as exc:
+        # db opened read-only but the query failed (corrupt schema/page) -> a real
+        # fault, NOT "no rooms". Surface it so the gate fails closed.
+        raise RoomsError(
+            f"rooms.db present but rooms_acl_config is unreadable: {exc}",
+            code="rooms_acl_unreadable",
+        ) from exc
+    finally:
+        conn.close()
+    if row is None:
+        return ACL_OFF
+    val = str(row["v"]).strip().lower()
+    return val if val in (ACL_OFF, ACL_ENFORCE) else ACL_OFF
+
+
+# --------------------------------------------------------------------------
+# P1b — internal-queue rooms ACL decision (design §7 / §14 R1)
+# --------------------------------------------------------------------------
+#
+# This is the SINGLE source of truth for "may sender S create a durable queue
+# task addressed to recipient R?". It is consumed at the two real create
+# paths so the security logic lives in ONE tested place:
+#
+#   1. The iso-v2 queue GATEWAY (bridge-queue-gateway.py:authorize_and_rewrite)
+#      — the PRIMARY, OS-enforced gate. There `actor` is the SO_PEERCRED
+#      uid->agent (un-spoofable); the client-supplied --from/BRIDGE_AGENT_ID
+#      have already been rewritten away. regime = ACTOR_ISO_ENFORCED.
+#   2. bridge-queue.py:cmd_create — defense-in-depth + the NON-gateway paths
+#      (controller/daemon/cron creates that run as the controller UID; genuine
+#      shared-mode single-UID installs). There the actor + regime come from
+#      resolve_os_actor() (the OS identity), NEVER from a client flag.
+#
+# The decision is a PURE function of (mode, regime, actor, target, rooms.db).
+# It performs NO env/roster probing on the security path beyond the membership
+# lookup against the controller-owned rooms.db.
+
+# Audit reason codes (stable, public-safe — surfaced in gateway/queue logs).
+ACL_ALLOW_MODE_OFF = "acl_off"                  # default no-op pass
+ACL_ALLOW_CONTROLLER = "acl_controller_bypass"  # operator/daemon/cron/receiver
+ACL_ALLOW_SELF = "acl_self_message"             # actor == target
+ACL_ALLOW_NO_ROOMS = "acl_no_rooms"             # enforce but no rooms exist
+ACL_ALLOW_TARGET_UNROOMED = "acl_target_unroomed"  # target in no enforced room
+ACL_ALLOW_SHARED_ROOM = "acl_shared_room"       # actor+target co-inhabit a room
+ACL_DENY_CROSS_ROOM = "acl_denied"              # no shared room (hard block)
+ACL_DENY_FAIL_CLOSED = "acl_fail_closed"        # actor un-establishable / db fault
+ACL_ADVISORY_CROSS_ROOM = "acl_advisory_cross_room"  # shared-mode: warn, no block
+
+
+class AclDecision(NamedTuple):
+    """The rooms-ACL verdict for one `create --to <target>`.
+
+    `outcome` is one of "allow" | "deny" | "advisory":
+      - "allow"    : let the create proceed.
+      - "deny"     : HARD block (fail-closed) — only ever returned for a real,
+                     OS-enforced sender (ISO_ENFORCED) or an un-establishable
+                     trusted actor under enforce. Never returned in shared mode.
+      - "advisory" : shared-mode cross-room — audit/warn, but DO NOT block
+                     (same-UID agents are not OS-separable, §14 R1).
+    `reason` is one of the ACL_* codes above (audit + stderr). `shared` carries
+    the room ids actor+target co-inhabit (for the allow audit line).
+    """
+
+    outcome: str
+    reason: str
+    shared: list[str]
+
+
+def acl_create_decision(
+    *,
+    mode: str,
+    regime: str,
+    actor: str,
+    target: str,
+    node: str = "",
+    conn: Optional[sqlite3.Connection] = None,
+) -> AclDecision:
+    """Decide whether sender `actor` may `create --to target` under the rooms ACL.
+
+    Pure decision (design §14 R1). The caller MUST pass an OS-derived `actor` +
+    `regime` (resolve_os_actor / the gateway SO_PEERCRED peer). A client-supplied
+    --from/BRIDGE_AGENT_ID is NEVER an input here — that is the whole point.
+
+      - mode == off                  -> allow (true no-op; zero behavior change).
+      - regime == ACTOR_CONTROLLER   -> allow (operator/daemon/cron/receiver run
+                                        as the controller UID; non-spoofable —
+                                        this is the system/daemon exemption).
+      - regime == ACTOR_UNRESOLVED   -> deny, fail-closed (iso host but the actor
+                                        could not be OS-established).
+      - actor == target              -> allow (self-message).
+      - no enforced room exists      -> allow (back-compat; adopt-all is the
+                                        operator's migration to make this engage).
+      - target is in NO enforced room-> allow + audit (target is a non-room
+                                        participant; the gate is roster↔roster).
+      - actor+target share a room    -> allow.
+      - otherwise (cross-room):
+          * ISO_ENFORCED             -> deny (the hard team boundary).
+          * SHARED_ADVISORY          -> advisory (warn + audit, NO block).
+
+    `rooms.db` unreadable/absent under enforce for a real roster-agent actor
+    (ISO_ENFORCED) -> fail CLOSED (deny). For shared mode a db fault degrades to
+    advisory (no hard boundary is claimed there anyway).
+    """
+    if mode != ACL_ENFORCE:
+        return AclDecision("allow", ACL_ALLOW_MODE_OFF, [])
+
+    # Exemption 1: the controller / daemon / cron / receiver. All of these run
+    # as the controller OS UID (they own the rooms.db), so ACTOR_CONTROLLER is
+    # an OS fact, NOT a `--from daemon`/`cron:x` string a managed agent could
+    # type. This is the system/daemon/operator exemption, kept minimal + non-
+    # spoofable by construction (§14 R1 trusted-call-path bypass).
+    if regime == ACTOR_CONTROLLER:
+        return AclDecision("allow", ACL_ALLOW_CONTROLLER, [])
+
+    # Fail-closed: an iso host where the actor could not be OS-established. We
+    # must NOT fall back to a client-supplied id (that would be the spoof).
+    if regime == ACTOR_UNRESOLVED or not actor:
+        return AclDecision("deny", ACL_DENY_FAIL_CLOSED, [])
+
+    # Self-message is always fine (an agent talking to itself is not cross-team).
+    if actor == target:
+        return AclDecision("allow", ACL_ALLOW_SELF, [])
+
+    advisory = (regime == ACTOR_SHARED_ADVISORY)
+
+    own = False
+    if conn is None:
+        try:
+            conn = open_rooms_readonly()
+        except RoomsError:
+            # rooms.db present but unreadable -> a real fault. For an OS-enforced
+            # roster agent under enforce, fail CLOSED (never fall open). Shared
+            # mode has no hard boundary -> degrade to advisory.
+            if advisory:
+                return AclDecision("advisory", ACL_DENY_FAIL_CLOSED, [])
+            return AclDecision("deny", ACL_DENY_FAIL_CLOSED, [])
+        if conn is None:
+            # No rooms.db at all -> no rooms ever defined -> back-compat open.
+            return AclDecision("allow", ACL_ALLOW_NO_ROOMS, [])
+        own = True
+    try:
+        actor_rooms = members_for(conn, actor, node)
+        if not actor_rooms:
+            # The actor belongs to NO enforced room. With ≥1 room defined this
+            # is an operator-config gap (the actor was never adopted). Under
+            # enforce that is a loud config error for a real roster agent, not a
+            # silent allow: a room-less iso agent must not freely reach roomed
+            # agents. Shared mode stays advisory.
+            target_rooms_chk = members_for(conn, target, node)
+            if not target_rooms_chk:
+                # Neither party is in any room — the whole install has no rooms
+                # touching this pair -> back-compat open (nothing to enforce).
+                return AclDecision("allow", ACL_ALLOW_NO_ROOMS, [])
+            if advisory:
+                return AclDecision(
+                    "advisory", ACL_ADVISORY_CROSS_ROOM, [])
+            return AclDecision("deny", ACL_DENY_CROSS_ROOM, [])
+        target_rooms = members_for(conn, target, node)
+        if not target_rooms:
+            # The target participates in NO room (e.g. a system/admin agent that
+            # was never adopted). The gate is roster-agent <-> roster-agent; a
+            # non-room target is not a team peer to be walled off -> allow but
+            # audit so an operator can spot an un-adopted recipient.
+            return AclDecision("allow", ACL_ALLOW_TARGET_UNROOMED, [])
+        shared = sorted(set(actor_rooms) & set(target_rooms))
+        if shared:
+            return AclDecision("allow", ACL_ALLOW_SHARED_ROOM, shared)
+        if advisory:
+            return AclDecision("advisory", ACL_ADVISORY_CROSS_ROOM, [])
+        return AclDecision("deny", ACL_DENY_CROSS_ROOM, [])
+    except sqlite3.Error:
+        if advisory:
+            return AclDecision("advisory", ACL_DENY_FAIL_CLOSED, [])
+        return AclDecision("deny", ACL_DENY_FAIL_CLOSED, [])
+    finally:
+        if own and conn is not None:
+            conn.close()

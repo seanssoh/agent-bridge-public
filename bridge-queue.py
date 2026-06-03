@@ -144,6 +144,161 @@ def _gateway_server_authorize(task: sqlite3.Row, actor: str, op: str) -> None:
         )
 
 
+def _load_rooms_common():
+    """Import bridge_rooms_common from this script's dir (lazy, optional).
+
+    Returns the module or None. Loaded by EXACT path via importlib (mirroring
+    the operator_home SSOT loader) so a same-named module on sys.path cannot
+    shadow it. None when the rooms control plane is absent (pre-P1a / stripped
+    deploy) — the ACL gate then degrades to a no-op pass.
+    """
+    path = Path(__file__).resolve().parent / "bridge_rooms_common.py"
+    if not path.is_file():  # noqa: raw-pathlib-controller-only — exact-file import probe
+        return None
+    import importlib.util as _ilu
+
+    try:
+        spec = _ilu.spec_from_file_location("_agb_rooms_common", str(path))
+        if spec is None or spec.loader is None:
+            return None
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:  # noqa: BLE001 - any fault -> no-op (pre-P1b behavior)
+        return None
+
+
+def _rooms_acl_mode_or_fail_closed(rooms, hard: bool) -> str:
+    """Read the rooms_acl mode; on a present-but-unreadable db, fail closed iff hard.
+
+    `hard` is True for an OS-enforced (iso) or unresolved actor — for those, a
+    present-but-unreadable rooms.db must be treated as ENFORCE (fail closed), NOT
+    silently 'off' (the BLOCKING fail-open codex r1 flagged). For controller/
+    shared regimes (no hard boundary) a db fault degrades to 'off' (controller is
+    exempt anyway; shared is advisory). A genuinely ABSENT db is 'off' for all.
+    """
+    try:
+        return rooms.rooms_acl_mode_strict()
+    except Exception:  # noqa: BLE001 - present-but-unreadable rooms.db
+        return rooms.ACL_ENFORCE if hard else rooms.ACL_OFF
+
+
+def _rooms_acl_check_create(actor: str, target: str) -> None:
+    """Rooms ACL (P1b) defense-in-depth + non-gateway gate for cmd_create.
+
+    The PRIMARY iso-v2 gate is the queue gateway (it derives the actor from
+    SO_PEERCRED and re-checks there). This function is the SECOND line + the
+    gate for the create paths that do NOT traverse the gateway:
+
+      - The gateway-server child (BRIDGE_QUEUE_GATEWAY_SERVER=1): `actor` is the
+        gateway-rewritten --from (the OS-trusted iso agent). We re-decide under
+        ISO_ENFORCED so a future gateway-authorizer bypass still cannot land a
+        cross-room create (mirrors _gateway_server_authorize for cancel/update).
+      - Direct creates (controller/daemon/cron, genuine shared-mode single-UID):
+        the OS actor + regime come from resolve_os_actor() — controller/daemon
+        creates are CONTROLLER (bypass), shared-mode is ADVISORY (warn, never
+        block), an un-establishable actor on an iso host is UNRESOLVED (deny).
+
+    Raises SystemExit on a HARD deny (cross-room under iso enforcement, or
+    fail-closed). Emits an advisory warning (no block) for shared-mode cross-
+    room. A no-op when rooms_acl is off / no rooms exist / the module is absent.
+    """
+    rooms = _load_rooms_common()
+    if rooms is None:
+        return
+
+    # Resolve the OS-enforced actor + regime FIRST (before the mode read), so a
+    # present-but-unreadable rooms.db can fail CLOSED for a real iso actor rather
+    # than silently reading 'off'. This closes the BLOCKING fail-open where a
+    # previously-enforced DB that becomes unreadable/corrupt would be treated as
+    # ACL-off (codex r1). The actor source is NEVER the client --from.
+    under_gateway = _running_under_queue_gateway_server()
+    if under_gateway:
+        # The gateway authenticated the actor (socket: SO_PEERCRED; file: request
+        # file owner uid) and passed it in BRIDGE_QUEUE_GATEWAY_ACTOR — an env var
+        # the CLIENT cannot set (it is the gateway-server's own child env). Use
+        # THAT as the ISO-enforced actor, NEVER the client --from (args.actor):
+        # the gateway is the only component that knows the real OS identity, so a
+        # managed agent passing --from <peer> cannot influence the decision.
+        gateway_actor = os.environ.get("BRIDGE_QUEUE_GATEWAY_ACTOR", "").strip()  # noqa: iso-helper-boundary — gateway-server child env, not an isolated-agent artifact
+        if not gateway_actor:
+            # Under the gateway server but NO authenticated actor was established
+            # (e.g. the file transport could not map the request-file owner to an
+            # iso agent). Do NOT fall back to the client --from. We must still
+            # learn whether enforcement is on: a missing actor + enforce -> fail
+            # closed; off -> pass. Read the mode strictly so an unreadable DB also
+            # fails closed for this un-authenticated gateway create.
+            mode = _rooms_acl_mode_or_fail_closed(rooms, hard=True)
+            if mode == rooms.ACL_ENFORCE:
+                raise SystemExit(
+                    "rooms ACL: create denied (gateway could not establish a "
+                    "trusted OS actor for this request — failing closed) "
+                    "[rooms_acl=enforce]"
+                )
+            return
+        regime = rooms.ACTOR_ISO_ENFORCED
+        decision_actor = gateway_actor
+    else:
+        # Not behind the gateway: resolve the actor from the PROCESS OS identity
+        # (never from --from / BRIDGE_AGENT_ID). Controller/daemon -> bypass;
+        # shared-mode -> advisory; iso-host-unresolved -> fail closed.
+        try:
+            auth = rooms.resolve_os_actor(actor or None)
+        except Exception:  # noqa: BLE001 - resolver fault -> no-op (avoid breaking direct creates)
+            return
+        regime = auth.regime
+        decision_actor = auth.agent
+
+    # A hard regime (iso/unresolved) demands a fail-closed mode read: a present-
+    # but-unreadable rooms.db must NOT degrade to 'off'. Controller/shared regimes
+    # have no hard boundary, so a db fault there degrades to a no-op (controller
+    # is exempt anyway; shared is advisory).
+    hard = regime in (rooms.ACTOR_ISO_ENFORCED, rooms.ACTOR_UNRESOLVED)
+    mode = _rooms_acl_mode_or_fail_closed(rooms, hard=hard)
+    if mode != rooms.ACL_ENFORCE:
+        return
+
+    try:
+        decision = rooms.acl_create_decision(
+            mode=mode,
+            regime=regime,
+            actor=decision_actor,
+            target=(target or "").strip(),
+            node="",
+        )
+    except Exception:  # noqa: BLE001 - decision fault: fail closed only on a hard path
+        if regime in (rooms.ACTOR_ISO_ENFORCED, rooms.ACTOR_UNRESOLVED):
+            raise SystemExit(
+                "rooms ACL: create denied (rooms control plane unavailable "
+                "under enforce — failing closed)"
+            )
+        return
+
+    if decision.outcome == "deny":
+        if decision.reason == rooms.ACL_DENY_FAIL_CLOSED:
+            raise SystemExit(
+                f"rooms ACL: create --to {target!r} denied ({decision.reason}): "
+                f"could not read the rooms membership for sender "
+                f"{decision_actor!r} under enforce (rooms.db unreadable / actor "
+                f"un-establishable) — failing closed. [rooms_acl=enforce]"
+            )
+        raise SystemExit(
+            f"rooms ACL: create --to {target!r} denied ({decision.reason}): "
+            f"sender {decision_actor!r} shares no enforced room with the "
+            f"recipient. Join a shared room (agb room) or have the operator "
+            f"run `agb room adopt-all`. [rooms_acl=enforce]"
+        )
+    if decision.outcome == "advisory":
+        print(
+            f"warning (rooms ACL advisory): create --to {target!r} from "
+            f"{decision_actor!r} crosses rooms; shared-mode installs cannot "
+            f"OS-authenticate the sender so this is NOT blocked. Run agents "
+            f"under linux-user isolation (iso v2) for a hard team boundary. "
+            f"[{decision.reason}]",
+            file=sys.stderr,
+        )
+
+
 def queue_gateway_float_env(name: str, default: str) -> str:
     raw = os.environ.get(name, default).strip()
     try:
@@ -908,6 +1063,12 @@ def maybe_cancel_cron_run(task: sqlite3.Row, current_ts: int) -> None:
 
 def cmd_create(args: argparse.Namespace) -> int:
     actor = args.actor or os.environ.get("USER", "unknown")
+    # Rooms ACL (P1b): gate the inter-agent create on shared-room membership
+    # when rooms_acl=enforce. No-op when off / no rooms / exempt (default-off
+    # is a true no-op). The actor used for the decision is OS-derived (the
+    # gateway-rewritten --from under the gateway-server, else resolve_os_actor)
+    # — never a raw client --from/BRIDGE_AGENT_ID.
+    _rooms_acl_check_create(actor, args.assigned_to)
     body_path = normalize_path(args.body_file)
     body_text = args.body
     created_ts = now_ts()
