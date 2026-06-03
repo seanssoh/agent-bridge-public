@@ -287,9 +287,20 @@ def _uid_agent_map_from_roster() -> dict[int, str]:
     if not os.path.isfile(lib):
         return {}
     bash = _probe_bash_bin()
+    # The probe emits the resolved roster file paths (prefixed `ROSTER\t`) so
+    # the PARENT can verify they are controller-owned (codex Phase-4 r5 BLOCK):
+    # a managed iso agent could otherwise point BRIDGE_HOME at an agent-
+    # writable fake home with a FORGED roster mapping its own uid -> <leader>.
+    # We trust a uid->agent row ONLY if every roster file it could have come
+    # from is owned by a uid OTHER than the calling (agent) uid — a forged
+    # roster the agent wrote is owned by the agent's own uid and is rejected,
+    # collapsing the map to empty → an iso user then FAILS CLOSED.
     probe = (
         'source "$1/bridge-lib.sh"\n'
         'bridge_load_roster 2>/dev/null || exit 0\n'
+        'for f in "${BRIDGE_ROSTER_FILE:-}" "${BRIDGE_ROSTER_LOCAL_FILE:-}"; do\n'
+        '  [ -n "$f" ] && printf "ROSTER\\t%s\\n" "$f"\n'
+        'done\n'
         'for agent in "${BRIDGE_AGENT_IDS[@]}"; do\n'
         '  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null '
         '|| continue\n'
@@ -297,7 +308,7 @@ def _uid_agent_map_from_roster() -> dict[int, str]:
         '  [ -n "$os_user" ] || continue\n'
         '  uid="$(id -u "$os_user" 2>/dev/null || true)"\n'
         '  [ -n "$uid" ] || continue\n'
-        '  printf "%s\\t%s\\n" "$uid" "$agent"\n'
+        '  printf "MAP\\t%s\\t%s\\n" "$uid" "$agent"\n'
         'done\n'
     )
     probe_env = {k: v for k, v in os.environ.items()
@@ -312,12 +323,29 @@ def _uid_agent_map_from_roster() -> dict[int, str]:
         return {}
     if proc.returncode != 0:
         return {}
-    out: dict[int, str] = {}
+    my_uid = os.getuid()
+    roster_files: list[str] = []
+    raw_map: dict[int, str] = {}
     for line in proc.stdout.splitlines():
-        parts = line.split("\t", 1)
-        if len(parts) == 2 and parts[0].strip().isdigit() and parts[1].strip():
-            out[int(parts[0].strip())] = parts[1].strip()
-    return out
+        parts = line.split("\t")
+        if parts[0] == "ROSTER" and len(parts) == 2 and parts[1].strip():
+            roster_files.append(parts[1].strip())
+        elif parts[0] == "MAP" and len(parts) == 3 \
+                and parts[1].strip().isdigit() and parts[2].strip():
+            raw_map[int(parts[1].strip())] = parts[2].strip()
+    # Ownership gate: every roster file that fed the map must be owned by a uid
+    # OTHER than ours (the agent's). A roster owned by the calling agent (or
+    # unstattable) is untrusted → reject the whole map (fail closed for an iso
+    # user). root- or controller-owned rosters pass.
+    for rf in roster_files:
+        try:
+            owner = os.stat(rf).st_uid  # noqa: raw-pathlib-controller-only
+        except OSError:
+            return {}
+        if owner == my_uid:
+            # A roster the calling agent could have written — do NOT trust it.
+            return {}
+    return raw_map
 
 
 def _controller_uid() -> Optional[int]:

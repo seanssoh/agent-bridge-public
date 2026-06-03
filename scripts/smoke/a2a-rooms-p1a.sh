@@ -216,6 +216,29 @@ test_teeth_iso_probe_sabotage_fails_closed() {
   fi
 }
 
+test_teeth_forged_roster_home_rejected() {
+  # THE r5 BRIDGE_HOME-injection attack: an iso agent points BRIDGE_HOME at an
+  # agent-WRITABLE fake home with a forged roster. The probe's ownership gate
+  # must REJECT a roster owned by the calling uid → empty map → an iso OS user
+  # then FAILS CLOSED (UNRESOLVED), not iso-enforced-as-the-forged-leader.
+  local evil="$SMOKE_TMP_ROOT/evil-home"
+  mkdir -p "$evil"
+  : >"$evil/agent-roster.sh"          # owned by us (the "agent")
+  : >"$evil/agent-roster.local.sh"
+  local got
+  # Simulate the iso OS user, NO env uid map (force the real probe), hostile
+  # BRIDGE_HOME. The probe reads our-owned roster -> rejected -> empty -> the
+  # iso anchor makes us UNRESOLVED.
+  got="$(env "${ROOMS_TEST_FLAGS[@]}" \
+             "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-mallory" \
+             "BRIDGE_HOME=$evil" "BRIDGE_ROOMS_UID_MAP=" \
+           python3 "$HELPER" resolve-regime 2>/dev/null)"
+  smoke_assert_contains "$got" "regime=unresolved" \
+    "TEETH F1 r5: a forged agent-owned roster under a hostile BRIDGE_HOME must be REJECTED (UNRESOLVED)"
+  smoke_assert_not_contains "$got" "iso-enforced" \
+    "TEETH F1 r5: forged-roster injection must NOT grant iso-enforced leadership"
+}
+
 test_teeth_env_uid_map_ignored_in_prod() {
   # WITHOUT the paired test flags, BRIDGE_ROOMS_UID_MAP must be IGNORED — a
   # production managed agent cannot set it to become the leader. With only the
@@ -405,6 +428,7 @@ smoke_run "join pending → approve bumps epoch + adds member" test_join_pending
 smoke_run "leave/kick bump epoch + exclude from roster" test_leave_and_kick_bump_epoch_and_exclude
 smoke_run "TEETH F1: iso leader-auth unspoofable (--as <leader> ignored)" test_teeth_iso_leader_auth_unspoofable
 smoke_run "TEETH F1: iso probe-sabotage downgrade fails closed (r4)" test_teeth_iso_probe_sabotage_fails_closed
+smoke_run "TEETH F1: forged-roster hostile BRIDGE_HOME rejected (r5)" test_teeth_forged_roster_home_rejected
 smoke_run "TEETH F1: unflagged env uid-map is IGNORED (no prod spoof)" test_teeth_env_uid_map_ignored_in_prod
 smoke_run "TEETH F1: unmapped uid under iso fails closed" test_teeth_iso_unmapped_uid_fails_closed
 smoke_run "TEETH F1: env BRIDGE_CONTROLLER_UID is NOT trusted" test_teeth_env_controller_uid_not_trusted
