@@ -98,7 +98,7 @@ chmod +x "$FAKE_BIN/stat"
 # in for the GNU statvfs-blob trap). If it ever did, the test would be
 # vacuous.
 # ---------------------------------------------------------------------
-sanity_target="$SMOKE_TMP_ROOT/sanity.env"
+sanity_target="$SMOKE_TMP_ROOT/sanity.state"
 : >"$sanity_target"
 chmod 0600 "$sanity_target"
 fake_f_out="$(PATH="$FAKE_BIN:$PATH" stat -f '%Lp' "$sanity_target" 2>/dev/null || true)"
@@ -115,7 +115,7 @@ smoke_log "sanity: fake GNU 'stat -f' is non-clean as expected (out='${fake_f_ou
 test_mode_preserved_gnu_first() {
   smoke_log "T1: mode round-trips through _bridge_rewrite_session_id_in_file under GNU-shaped stat"
 
-  local target="$SMOKE_TMP_ROOT/active.env"
+  local target="$SMOKE_TMP_ROOT/active.state"
   cat >"$target" <<'ENV'
 AGENT_SESSION_ID='abc123'
 AGENT_ENGINE='claude'
