@@ -180,6 +180,18 @@ add_required a2a-rooms-p1a
 # the --from SPOOF rejection (both paths), fail-closed, controller exemption,
 # shared-mode advisory, and adopt-all->enforce strands-nobody teeth.
 add_required a2a-rooms-p1b-acl
+# A2A rooms #1517: the controller-only auto-bootstrap of the canonical rooms.db
+# on the first room mutation (create/adopt-all) on a fresh iso host. Without it
+# the controller's first `agb room create` fails closed (actor_unresolved) — no
+# rooms.db exists, so the controller anchor (_controller_uid = stat(rooms.db)
+# .st_uid) cannot anchor. Lives in bridge_rooms_common.py (maybe_bootstrap_
+# rooms_db / canonical_rooms_db_path / _caller_owns_canonical_controller_
+# location) + bridge-rooms.py (the create/adopt-all call site). Pins the
+# bootstrap PASS (controller seeds a 0600 controller-owned canonical db), the
+# P1b teeth (a managed non-controller agent cannot self-bootstrap to become
+# controller), the env-redirect teeth (BRIDGE_A2A_ROOMS_DB does NOT relocate
+# the bootstrap), and idempotency (a 2nd create does not re-bootstrap/clobber).
+add_required a2a-rooms-1517-bootstrap
 
 
 }
@@ -815,7 +827,7 @@ select_for_path() {
       add_required queue a2a-rooms-p1b-acl
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/install-handoffd-systemd.sh)
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the
@@ -880,7 +892,7 @@ select_for_path() {
       # back-compat and the seam's fail-closed contract still holds. The
       # rooms control-plane modules (bridge-rooms.py / bridge_rooms_common.py)
       # and the rooms helper route here too via the path alternation above.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)
