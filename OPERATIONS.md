@@ -757,6 +757,41 @@ megabytes (default `512`). A deferred run writes `state=deferred` to the run's
 `status.json`, emits a `cron_dispatch_deferred` audit row, and pings the
 admin agent; the next scheduler tick re-fires the slot.
 
+### cron-dispatch worker-pool size (`BRIDGE_CRON_DISPATCH_MAX_PARALLEL`, issue #1461)
+
+When a single cron slot fans out several jobs at the same minute, the daemon
+drains them through a bounded worker pool. The pool size is
+`BRIDGE_CRON_DISPATCH_MAX_PARALLEL`, resolved with this precedence (highest
+wins):
+
+1. **`BRIDGE_CRON_DISPATCH_MAX_PARALLEL` environment variable** — the explicit
+   override (e.g. the daemon LaunchAgent/systemd unit env). Wins outright when
+   set to a positive integer.
+2. **`cron_dispatch_max_parallel` in the runtime `bridge-config.json`** — the
+   sanctioned, audit-chained, upgrade-safe path. This is the recommended way to
+   tune it, because it survives daemon-unit regeneration and is written through
+   the operator-gated config wrapper rather than by hand-editing
+   `agent-roster.local.sh` (which `agb config set` cannot touch — the roster is
+   a shell file):
+
+   ```bash
+   agb config set --path runtime/bridge-config.json \
+     --change cron_dispatch_max_parallel=4
+   bash bridge-daemon.sh restart   # re-source bridge-lib.sh so the daemon picks it up
+   ```
+
+3. **Host-profile-scaled default** — `host_profile=server` hosts (the
+   cron-heavy case) default to `3`; `dev` / small-RAM / unknown hosts keep the
+   conservative serial `1` baseline (issue #579). The host profile is recorded
+   in `state/install/host-profile.json` (chosen at install time, or re-asked
+   with `bridge-init.sh --reconfigure [--profile server|dev]`).
+
+A malformed or absent config / profile file never raises — resolution falls
+through to the serial `1` floor, so a corrupt tunable can never wedge the
+daemon. Higher values raise throughput on cron-heavy installs but increase
+peak RAM (each worker spawns a disposable engine child); the per-tick memory
+guard above still gates each individual spawn.
+
 Inspect runtime state directly when needed:
 
 ```bash
