@@ -1611,6 +1611,67 @@ def get_roster_cache(conn: sqlite3.Connection,
     ).fetchone()
 
 
+def list_roster_cache(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """All member-local cached roster rows (every room this node has joined).
+
+    The read-only counterpart to `get_roster_cache` for `agb room list` on a
+    NON-leader node: a member node holds a `room_roster_cache` row per room it
+    was admitted into (written by P4.2), but no `rooms` row (it does not LEAD
+    them). `list_rooms` only sees led rooms; this surfaces the joined-but-not-led
+    ones so they are visible alongside. Ordered by room_id for a stable view.
+    """
+    return conn.execute(
+        "SELECT room_id, epoch, members_json, from_node, mac, fetched_ts "
+        "FROM room_roster_cache ORDER BY room_id"
+    ).fetchall()
+
+
+def cached_roster_members(row: sqlite3.Row) -> Optional[list[dict[str, str]]]:
+    """Parse a roster-cache row's `members_json` for DISPLAY (keeps `role`).
+
+    Unlike `_cached_members` (the talk gate, which deliberately drops `role`
+    so the membership comparison only keys on agent+node), this preserves the
+    cached `role` so `room show`/`room list` can render a member-side view that
+    matches what a leader node shows. Returns None on a corrupt cache (caller
+    surfaces that read-only, never fabricates).
+    """
+    try:
+        parsed = json.loads(str(row["members_json"] or "[]"))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    out: list[dict[str, str]] = []
+    for m in parsed:
+        if not isinstance(m, dict):
+            return None
+        out.append({
+            "agent": str(m.get("agent", "")),
+            "node": str(m.get("node", "")),
+            "role": str(m.get("role", "member")) or "member",
+        })
+    return out
+
+
+def cached_leader(row: sqlite3.Row) -> str:
+    """Best-effort `leader_agent@leader_node` from a roster-cache row.
+
+    The cache stores the leader's NODE (`from_node`) but not the leader agent
+    name as a top-level field — so the leader agent is recovered from the cached
+    member whose `role == 'leader'` (the leader is always a roster member). If no
+    leader member is present (corrupt/partial cache), only the node is shown —
+    we never invent a leader agent the cache does not actually contain.
+    """
+    members = cached_roster_members(row)
+    leader_node = str(row["from_node"] or "")
+    if members:
+        for m in members:
+            if m["role"] == "leader":
+                node = m["node"] or leader_node
+                return f"{m['agent']}@{node}" if node else m["agent"]
+    return f"?@{leader_node}" if leader_node else "?"
+
+
 # --------------------------------------------------------------------------
 # Member-side room-scoped TALK gate (A2A Rooms P4.3, design §11)
 # --------------------------------------------------------------------------

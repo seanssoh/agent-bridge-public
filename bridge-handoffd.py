@@ -690,6 +690,32 @@ def room_scoped_check(env: dict[str, Any],
 # Enqueue boundary — call the EXISTING bridge-task.sh create
 # --------------------------------------------------------------------------
 
+def _peer_safe_enqueue_detail(target: str, raw_detail: str) -> str:
+    """A TERSE, peer-facing reason for an enqueue rejection (P4.5 info-hygiene).
+
+    The raw `bridge-task.sh create` stdout/stderr is for the LOCAL audit only —
+    on an unknown target it carries the full `agb list` roster dump (every
+    agent's engine/session/workdir/source), which must NEVER be echoed back to a
+    remote authenticated peer. This collapses any rejection to a short reason
+    that names ONLY the target the peer already chose:
+
+      - unknown/unregistered target  -> "unknown target '<agent>'"
+      - anything else                -> "enqueue rejected"
+
+    The unknown-target case is recognized by the roster-dump fingerprint the
+    `bridge_require_agent` failure prints (the `engine=`/`workdir=`/`source=`
+    columns of `bridge_list_agents`) — a structural marker, not a translatable
+    sentence, so it survives wording/locale changes. We never reflect any
+    substring of `raw_detail` into the returned string.
+    """
+    lowered = (raw_detail or "").lower()
+    roster_dump = ("engine=" in lowered and "workdir=" in lowered
+                   and "source=" in lowered)
+    if roster_dump:
+        return f"unknown target '{target}'"
+    return "enqueue rejected"
+
+
 def enqueue_via_bridge_task(
     *,
     target: str,
@@ -698,11 +724,13 @@ def enqueue_via_bridge_task(
     priority: str,
     title: str,
     body_file: Path,
-) -> tuple[bool, str, str]:
+) -> tuple[bool, str, str, str]:
     """Invoke `bridge-task.sh create` as an argv array (never a shell string).
 
-    Returns (ok, task_id, detail). On failure `detail` carries the stderr
-    tail and `task_id` is empty.
+    Returns (ok, task_id, audit_detail, peer_detail). On failure `audit_detail`
+    carries the full stderr/stdout tail (LOCAL audit/log only) and `peer_detail`
+    is a TERSE, roster-leak-free reason safe to return to the remote peer (P4.5).
+    On success `task_id` is the created id and the detail fields carry stdout.
     """
     script = Path(__file__).resolve().parent / "bridge-task.sh"
     bash = os.environ.get("BRIDGE_BASH_BIN", "bash")
@@ -731,11 +759,14 @@ def enqueue_via_bridge_task(
             argv, capture_output=True, text=True, timeout=120,
         )
     except (subprocess.SubprocessError, OSError) as exc:
-        return False, "", f"bridge-task.sh invocation failed: {exc}"
+        invoke_detail = f"bridge-task.sh invocation failed: {exc}"
+        return False, "", invoke_detail, "enqueue rejected"
 
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[-400:]
-        return False, "", detail or f"bridge-task.sh exited {proc.returncode}"
+        audit_detail = detail or f"bridge-task.sh exited {proc.returncode}"
+        peer_detail = _peer_safe_enqueue_detail(target, audit_detail)
+        return False, "", audit_detail, peer_detail
 
     # Parse `created task #<id> for <agent> ...`.
     task_id = ""
@@ -743,7 +774,8 @@ def enqueue_via_bridge_task(
         if token.startswith("#") and token[1:].isdigit():
             task_id = token[1:]
             break
-    return True, task_id, (proc.stdout or "").strip()
+    stdout_detail = (proc.stdout or "").strip()
+    return True, task_id, stdout_detail, stdout_detail
 
 
 def staged_body_text(env: dict[str, Any]) -> str:
@@ -1268,7 +1300,7 @@ class HandoffHandler(BaseHTTPRequestHandler):
                 peer_id, message_id, staged_body_text(env))
 
             sender = env.get("sender", {})
-            ok, task_id, detail = enqueue_via_bridge_task(
+            ok, task_id, audit_detail, peer_detail = enqueue_via_bridge_task(
                 target=env["target_agent"],
                 sender_bridge=sender.get("bridge", "unknown"),
                 sender_agent=sender.get("agent", "unknown"),
@@ -1278,21 +1310,24 @@ class HandoffHandler(BaseHTTPRequestHandler):
             )
             if not ok:
                 # Distinguish a transient lock failure (retryable 503) from
-                # a permanent validation/guard/allowlist rejection (422).
-                lowered = detail.lower()
+                # a permanent validation/guard/allowlist rejection (422). The
+                # rejection status + the LOCAL audit detail are unchanged; only
+                # the PEER-FACING `error` is terse — `audit_detail` (which on an
+                # unknown target carries the full `agb list` roster dump) goes to
+                # the local audit/log ONLY, never back to the remote peer (P4.5).
+                lowered = audit_detail.lower()
                 transient = any(s in lowered for s in
                                 ("locked", "database is locked", "timeout",
                                  "temporarily"))
                 if transient:
                     audit("enqueue_transient_fail", peer=peer_id,
-                          message_id=message_id, detail=detail[:200])
+                          message_id=message_id, detail=audit_detail[:200])
                     self._reply(503, {"ok": False, "error": "queue busy, retry"},
                                 extra_headers={"Retry-After": "30"})
                 else:
                     audit("enqueue_permanent_fail", peer=peer_id,
-                          message_id=message_id, detail=detail[:200])
-                    self._reply(422, {"ok": False,
-                                      "error": f"enqueue rejected: {detail[:200]}"})
+                          message_id=message_id, detail=audit_detail[:200])
+                    self._reply(422, {"ok": False, "error": peer_detail})
                 return
 
             now = a2a.now_ts()

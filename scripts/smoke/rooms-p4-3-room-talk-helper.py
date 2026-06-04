@@ -282,7 +282,8 @@ def cmd_deliver_talk_to_receiver(repo_root: str, cfg_json: str, captured: str,
             "target": target, "sender_bridge": sender_bridge,
             "sender_agent": sender_agent, "priority": priority, "title": title,
         })
-        return True, "9999", "created task #9999"
+        # 4-tuple (ok, task_id, audit_detail, peer_detail) per P4.5.
+        return True, "9999", "created task #9999", "created task #9999"
 
     hd.enqueue_via_bridge_task = _fake_enqueue  # type: ignore[assignment]
 
@@ -509,7 +510,8 @@ def cmd_staged_race_unit(repo_root: str, cfg_a_json: str, cfg_b_json: str) -> in
         captured["sender_bridge"] = sender_bridge
         captured["sender_agent"] = sender_agent
         captured["body_file"] = str(body_file)
-        return True, "9999", "created task #9999"
+        # 4-tuple (ok, task_id, audit_detail, peer_detail) per P4.5.
+        return True, "9999", "created task #9999", "created task #9999"
 
     hd.enqueue_via_bridge_task = _racing_enqueue  # type: ignore[assignment]
 

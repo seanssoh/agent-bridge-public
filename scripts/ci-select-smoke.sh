@@ -240,6 +240,18 @@ add_required rooms-p4-2-roster-broadcast
 # membership), a hostile --from/env cannot impersonate, a replay is deduped /
 # same-id-diff-body is 409, and the auth preamble is unreachable pre-auth.
 add_required rooms-p4-3-room-talk
+# A2A rooms P4.5 (design §11): two polish follow-ups from the P4.4 VM acceptance.
+# FIX 1 (UX completeness): a NON-leader node that joined a room now sees it via
+# `room show`/`room list` — cmd_show/cmd_list (bridge-rooms.py) fall back to the
+# member-side room_roster_cache (list_roster_cache / cached_roster_members /
+# cached_leader in bridge_rooms_common.py) instead of "not found". FIX 2 (info-
+# hygiene): enqueue_via_bridge_task (bridge-handoffd.py) returns a TERSE peer-
+# facing 422 detail ("unknown target '<agent>'") instead of echoing the
+# `bridge-task.sh` roster dump (agb-list engine/workdir/source columns) — the
+# full reason stays in the LOCAL audit only. Pins both teeth sets: member-side
+# show/list surfaces the cache, leader rooms unchanged, no-room/no-cache still
+# 404; unknown target -> 422 with no roster leak + full local audit recorded.
+add_required rooms-p4-5-polish
 
 
 }
@@ -905,7 +917,7 @@ select_for_path() {
       add_required queue a2a-rooms-p1b-acl
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/smoke/rooms-p4-2-roster-broadcast-helper.py|scripts/smoke/rooms-p4-2-post-hook.sh|scripts/smoke/rooms-p4-3-room-talk-helper.py|scripts/smoke/rooms-p4-3-post-hook.sh|scripts/install-handoffd-systemd.sh)
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/smoke/rooms-p4-2-roster-broadcast-helper.py|scripts/smoke/rooms-p4-2-post-hook.sh|scripts/smoke/rooms-p4-3-room-talk-helper.py|scripts/smoke/rooms-p4-3-post-hook.sh|scripts/smoke/rooms-p4-5-polish.sh|scripts/smoke/rooms-p4-5-helper.py|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the
@@ -1015,7 +1027,17 @@ select_for_path() {
       # rejected, unknown room rejected, missing room_id/epoch 422, plain message
       # not room talk, hostile --from cannot impersonate, replay dedupe /
       # same-id-diff-body 409, auth preamble unreachable pre-auth). Pull on move.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk
+      # A2A Rooms P4.5 (design §11): two follow-ups from the P4.4 VM acceptance.
+      # FIX 1 (UX): `cmd_show`/`cmd_list` in bridge-rooms.py now fall back to the
+      # member-side room_roster_cache (via list_roster_cache / cached_roster_
+      # members / cached_leader in bridge_rooms_common.py) so a NON-leader node
+      # sees a room it joined instead of "not found". FIX 2 (info-hygiene):
+      # enqueue_via_bridge_task in bridge-handoffd.py returns a TERSE peer-facing
+      # detail (no `agb list` roster dump) while the full reason stays in the
+      # local audit only. rooms-p4-5-polish pins both: member show/list surfaces
+      # the cache, leader rooms unchanged, unknown-room still 404; an unknown
+      # target -> terse 422 with no engine/workdir/source leak + full local audit.
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk rooms-p4-5-polish
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)

@@ -148,6 +148,17 @@ def main(argv: list[str]) -> int:
         env = envelope("bridge-a:allowlist-1", "not-allowed", "blocked", "x")
         status, text = post(url=url, path=path, peer_id=peer_id, secret=secret,
                              envelope=env)
+    elif scenario == "unknown-target":
+        # P4.5 info-hygiene: a target that PASSES the inbound allowlist but is
+        # NOT in the local roster. The allowlist preamble admits it, then
+        # `bridge-task.sh create` fails with the full `agb list` roster dump on
+        # stderr. The receiver MUST return a TERSE 422 detail, never that dump.
+        # The target name is taken from argv[4] so the smoke can assert on it.
+        unknown = argv[4] if len(argv) > 4 else "ghost-agent"
+        env = envelope("bridge-a:unknown-target-1", unknown,
+                       "to an unknown target", "the body")
+        status, text = post(url=url, path=path, peer_id=peer_id, secret=secret,
+                             envelope=env)
     elif scenario == "ok":
         env = envelope("bridge-a:ok-1", "reviewer", "a2a smoke ok", "the body")
         status, text = post(url=url, path=path, peer_id=peer_id, secret=secret,
