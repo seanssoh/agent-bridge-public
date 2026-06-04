@@ -3796,6 +3796,20 @@ report and reap test-fixture agents per their pattern."
   if [[ -z "$channels" && "$_ts_prof_channels_present" == "1" && -n "$_ts_prof_channels_value" ]]; then
     channels="$(bridge_normalize_channels_csv "$_ts_prof_channels_value")"
   fi
+  # Generic plugin `requires` expansion (patch cm-prod Part 1): a plugin
+  # manifest may declare a `"requires"` array of channel specs it depends on;
+  # transitively pull that closure into $channels here, AFTER channel
+  # normalization (explicit + profile defaults resolved) and BEFORE the dry-run
+  # gate below, so `--dry-run` and real create both show + commit the expanded
+  # set. Zero domain hardcoding — bridge_expand_channel_requires only reads
+  # whatever specs the manifests declare, dedupes, detects cycles, caps depth,
+  # and warns-and-continues on an unresolvable dependency (create is never
+  # blocked). A no-requires channel set returns byte-identical, preserving the
+  # legacy contract. The expanded $channels flows into bridge_write_role_block
+  # and the roster unchanged.
+  if [[ -n "$channels" ]]; then
+    channels="$(bridge_expand_channel_requires "$channels")"
+  fi
   users_json="$(bridge_normalize_user_specs_json "${user_specs[@]}")"
   if [[ "$isolation_mode" == "linux-user" ]]; then
     if [[ "$(bridge_host_platform)" != "Linux" ]]; then
