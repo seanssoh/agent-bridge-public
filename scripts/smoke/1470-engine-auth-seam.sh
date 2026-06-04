@@ -323,4 +323,42 @@ assert_engine_default_writes() {
 smoke_run "C3 default engine (claude) still writes — gate did not break happy path" \
   assert_engine_default_writes
 
+# C4: --engine "" (EXPLICIT empty string) MUST be refused, not coerced to
+# the Claude default (codex r2 BLOCKING). The destination is a
+# `.codex/auth.json` path to model the exact cross-engine
+# credential-misdelivery hole: a Phase-2 caller passing an empty engine
+# var must NOT write a Claude credential into the Codex dest. Asserts:
+# non-zero/refused status, the response does NOT report engine:claude or
+# status:synced, and NO file is written at the Codex dest.
+CODEX_DEST_DIR="$SMOKE_TMP_ROOT/codex-home/.codex"
+CODEX_DEST_FILE="$CODEX_DEST_DIR/auth.json"
+mkdir -p "$CODEX_DEST_DIR"
+
+assert_empty_engine_refused() {
+  local engine_value="$1"
+  local context="$2"
+  local out rc
+  rm -f "$CODEX_DEST_FILE"
+  set +e
+  out="$(BRIDGE_AUTH_CRED_STATE_FILE="$SMOKE_TMP_ROOT/c-cred-state.json" \
+    python3 "$REPO_ROOT/bridge-auth.py" --registry "$REG_FILE" sync-agent \
+      --agent smoke --file "$CODEX_DEST_FILE" --engine "$engine_value" \
+      --allowed-root "$SMOKE_TMP_ROOT/codex-home" --json 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -ne 0 ]] || smoke_fail "$context: expected non-zero rc, got 0; out=$out"
+  smoke_assert_not_contains "$out" '"status": "synced"' "$context: not synced"
+  smoke_assert_not_contains "$out" '"engine": "claude"' "$context: no claude engine"
+  smoke_assert_not_contains "$out" "claude_credentials_file" "$context: no Claude delivery"
+  [[ ! -e "$CODEX_DEST_FILE" ]] || smoke_fail "$context: a credential WAS written into the Codex dest for engine='$engine_value'"
+}
+
+# C4: explicit empty string → refused, nothing written to the Codex dest.
+smoke_run "C4 sync-agent --engine '' refused (no Claude write into Codex dest)" \
+  assert_empty_engine_refused "" "C4"
+
+# C5: whitespace-only → same refusal (no truthiness/strip bypass).
+smoke_run "C5 sync-agent --engine '   ' refused (no Claude write into Codex dest)" \
+  assert_empty_engine_refused "   " "C5"
+
 smoke_log "smoke test passed"

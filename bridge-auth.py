@@ -1989,7 +1989,29 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
     # Claude write body for another engine (codex r1 BLOCKING). An unknown
     # engine raises through engine_auth_descriptor; a known-but-non-Claude
     # engine is refused here with an explicit "Phase 2" message.
-    engine = getattr(args, "engine", None) or DEFAULT_AUTH_ENGINE
+    #
+    # codex r2 BLOCKING: distinguish OMITTED from EXPLICITLY-EMPTY. The
+    # argparse default is None (NOT DEFAULT_AUTH_ENGINE), so:
+    #   --engine omitted entirely → args.engine is None → Claude (allowed).
+    #   --engine "" / "   "       → args.engine is a blank string → REJECT.
+    # Using `args.engine or DEFAULT_AUTH_ENGINE` would coerce the explicit
+    # empty string back to Claude (falsy `""` collapses to the default),
+    # which is exactly the cross-engine credential-misdelivery hole codex
+    # found: Phase 2 passing an empty engine var would write a Claude
+    # credential into the Codex dest. Treat None (omitted) as Claude;
+    # treat a provided-but-blank value as an explicit, refused engine.
+    raw_engine = getattr(args, "engine", None)
+    if raw_engine is None:
+        engine = DEFAULT_AUTH_ENGINE
+    else:
+        engine = raw_engine.strip()
+        if not engine:
+            return fail(
+                "sync-agent --engine was given an empty/whitespace value; "
+                "omit --engine for the default Claude credential sync or "
+                "pass an explicit engine name",
+                json_mode,
+            )
     try:
         engine_auth_descriptor(engine)  # raises ValueError on unknown engine
     except ValueError as exc:
@@ -2299,11 +2321,14 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--agent", required=True)
     sync_parser.add_argument("--file", required=True)
     # Fleet-credential Phase 1 (#1470): which engine descriptor row this
-    # sync runs for. Defaults to `claude` so every existing caller
-    # (bridge-auth.sh, the daemon tick) is byte-compatible — they invoke
-    # sync-agent with no --engine and get the historical Claude behavior.
+    # sync runs for. The default is None (NOT DEFAULT_AUTH_ENGINE) so
+    # cmd_sync_agent's fail-closed gate can distinguish "--engine omitted"
+    # (→ Claude, every existing caller is byte-compatible) from "--engine
+    # given an empty string" (→ refused). codex r2 BLOCKING: a literal
+    # default of `claude` here combined with `args.engine or DEFAULT` in
+    # the gate let an explicit `--engine ""` collapse back to Claude.
     # Phase 2's Codex adapter passes `--engine codex`.
-    sync_parser.add_argument("--engine", default=DEFAULT_AUTH_ENGINE)
+    sync_parser.add_argument("--engine", default=None)
     sync_parser.add_argument("--workdir", action="append", default=[])
     sync_parser.add_argument(
         "--owner-uid",
