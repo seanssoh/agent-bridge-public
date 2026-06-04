@@ -47,10 +47,19 @@
 #       only is `publish-gap` (NOT controller-cache-stale); a file
 #       matching the published contract + iso-readable stays
 #       `controller-cache-stale` (no false-positive regression); the
-#       HEARTBEAT.md negative control is never `publish-gap`.
+#       HEARTBEAT.md negative control is never `publish-gap`. Includes the
+#       C11 LONG-name regression guard: the expected group is anchored to
+#       the workdir DIR's own group (setgid contract), so a long agent name
+#       whose OS user (32-char trunc) and group (hash-trunc) DIVERGE is not
+#       misclassified — the old prefix-swap derivation would have misfired.
+#   C8  TOCTOU / no-follow PROPERTY: the root mutation is fd-based (open
+#       O_NOFOLLOW + fchown/fchmod on the OPEN FD) so a profile basename
+#       swapped for a symlink AFTER prepare's `chown -R` cannot redirect the
+#       root chgrp/chmod; the lib publish fn no longer re-resolves a
+#       profile pathname for a path-based root chgrp/chmod.
 #
 # Teeth (regression-revert simulation):
-#   C1-teeth.  Drop the chmod 0660 from the publish helper and C1's
+#   C1-teeth.  Drop the fchmod 0660 from the publish helper and C1's
 #              group-read assertion fails (the dir-level shape would have
 #              false-passed).
 #   C2-teeth.  Add HEARTBEAT.md to the helper's basename list and C2
@@ -59,6 +68,9 @@
 #              and C6's "returns 0" assertion fails.
 #   C7-teeth.  Move the publish-gap metadata check AFTER the iso-probe
 #              and C7's wrong-group case regresses to cache-stale.
+#   C8-teeth.  Revert the root mutation to a path-based
+#              `bridge_linux_sudo_root chgrp/chmod <path>` (or drop the
+#              O_NOFOLLOW open) and C8 fails — the TOCTOU window reopens.
 #
 # Footgun #11 mitigation: zero heredoc-stdin to a subprocess; every
 # python assertion runs via `python3 <file>` with argv-only arguments.
@@ -231,15 +243,14 @@ smoke_log "C5 PASS — re-publish is idempotent (files stay 0660)"
 C6_WD="$SMOKE_TMP_ROOT/c6-workdir"
 make_fixture "$C6_WD"
 C6_LOG="$SMOKE_TMP_ROOT/c6.log"
-# Stub bridge_linux_sudo_root so the chgrp/chmod (and the test/stat
-# probes) FAIL — but `test -e` must succeed (so we reach the mutation)
-# while chgrp fails. Emulate: `test`/`stat` pass through to the real
-# command; chgrp/chmod return 1.
-C6_STUB='bridge_linux_sudo_root() { case "$1" in test|stat) command "$@";; chgrp|chmod) return 1;; *) command "$@";; esac; }'
+# The root mutation now runs via `bridge_linux_sudo_root python3 <helper>`.
+# Force the helper invocation to FAIL (return non-zero) so the lib helper
+# takes its non-fatal warn+audit path. Pass-through everything else.
+C6_STUB='bridge_linux_sudo_root() { case "$1" in python3|python|*/python3|*/python) return 1;; *) command "$@";; esac; }'
 : >"$BRIDGE_AUDIT_LOG"
 run_publish "$C6_WD" 0 "$OPERATOR_GROUP" "$C6_STUB" >"$C6_LOG" 2>&1
 smoke_assert_contains "$(cat "$C6_LOG")" "rc=0" "C6 forced-failure helper still returns 0 (non-fatal)"
-smoke_assert_contains "$(cat "$C6_LOG")" "chgrp" "C6 non-silent warn on publish failure"
+smoke_assert_contains "$(cat "$C6_LOG")" "publish helper failed" "C6 non-silent warn on publish failure"
 # The G3 contract also emits a `profile_publish_failed` audit row.
 smoke_assert_contains "$(cat "$BRIDGE_AUDIT_LOG")" "profile_publish_failed" \
   "C6 profile_publish_failed audit row emitted"
@@ -247,9 +258,45 @@ smoke_log "C6 PASS — forced publish failure is non-fatal (create succeeds) + n
 
 # =====================================================================
 # C7 — watchdog publish-gap classification + cache-stale preservation
+#      (incl. C11 long-name dir-group-anchor regression guard).
 # =====================================================================
 "$PY_BIN" "$HELPER_DIR/assert-watchdog-publish-gap.py" "$REPO_ROOT" \
   || smoke_fail "C7 FAIL — watchdog publish-gap classification / cache-stale preservation"
 smoke_log "C7 PASS — watchdog classifies publish-gap; genuine cache-stale preserved"
+
+# =====================================================================
+# C8 — TOCTOU / no-follow PROPERTY tooth (BLOCKING #1 regression guard).
+#      The root mutation must be fd-based (open O_NOFOLLOW + fchown/fchmod
+#      on the OPEN FD), NEVER a path-based root chgrp/chmod that a rename
+#      could race after prepare's `chown -R` hands the workdir to the iso
+#      UID. Assert the helper opens with O_NOFOLLOW and mutates the fd, and
+#      that the lib publish path no longer re-resolves a profile pathname
+#      for a root chgrp/chmod.
+# =====================================================================
+PUB_HELPER="$REPO_ROOT/scripts/python-helpers/isolation-publish-profile-files.py"
+[[ -f "$PUB_HELPER" ]] || smoke_fail "C8 FAIL — publish helper missing: $PUB_HELPER"
+grep -q "O_NOFOLLOW" "$PUB_HELPER" \
+  || smoke_fail "C8 FAIL — helper does not open with O_NOFOLLOW (TOCTOU-unsafe)"
+grep -q "os.fchown" "$PUB_HELPER" \
+  || smoke_fail "C8 FAIL — helper does not fchown the open fd"
+grep -q "os.fchmod" "$PUB_HELPER" \
+  || smoke_fail "C8 FAIL — helper does not fchmod the open fd"
+# The publish FUNCTION body in the lib must delegate to the helper, not
+# re-introduce a path-based `bridge_linux_sudo_root chgrp/chmod <path>`.
+# Extract just that function's body via awk (no heredoc — footgun #11):
+# print from the function header to its first column-0 closing brace.
+PUBLISH_FN_BODY="$SMOKE_TMP_ROOT/publish-fn-body.txt"
+awk '
+  /^bridge_isolation_v2_publish_workdir_profile_files\(\)[[:space:]]*\{/ { f=1 }
+  f { print }
+  f && /^\}/ { exit }
+' "$REPO_ROOT/lib/bridge-isolation-v2.sh" >"$PUBLISH_FN_BODY"
+[[ -s "$PUBLISH_FN_BODY" ]] || smoke_fail "C8 FAIL — could not extract publish fn body"
+if grep -Eq 'bridge_linux_sudo_root[[:space:]]+(chgrp|chmod)[[:space:]]' "$PUBLISH_FN_BODY"; then
+  smoke_fail "C8 FAIL — publish fn re-introduced a path-based root chgrp/chmod (TOCTOU)"
+fi
+grep -q "isolation-publish-profile-files.py" "$PUBLISH_FN_BODY" \
+  || smoke_fail "C8 FAIL — publish fn does not delegate to the fd-based root helper"
+smoke_log "C8 PASS — root publish is fd-based O_NOFOLLOW (no path-based chgrp/chmod race)"
 
 smoke_log "ALL PASS"

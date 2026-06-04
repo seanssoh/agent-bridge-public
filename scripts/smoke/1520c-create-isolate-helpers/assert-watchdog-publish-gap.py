@@ -37,14 +37,24 @@ ISO_USER = "agent-bridge-foo"  # → expected group ab-agent-foo
 EXPECTED_GROUP = "ab-agent-foo"
 WRONG_GROUP = "controllergrp"
 
+# The expected group is now anchored to the workdir DIR's own group (the
+# setgid-inheritance contract), NOT a string-swap of the iso username. So
+# every seam must publish the workdir DIR's group:mode too — that is the
+# ground-truth `ab-agent-<a>:2770` anchor `_workdir_published_group` reads.
+DIR_META = {str(WD): f"{EXPECTED_GROUP}:2770"}
+
 # Create the on-disk fixtures the classifier will reference by path.
 for name in ("SOUL.md", "CLAUDE.md", "TOOLS.md", "HEARTBEAT.md"):
     (WD / name).write_text("x")
 
 
 def _seam(meta: dict, probe: dict) -> None:
+    # Merge the workdir-DIR anchor into every meta map (the dir-group
+    # lookup is what `_workdir_published_group` reads). A per-case `meta`
+    # entry for the same path wins over the default.
+    merged = {**DIR_META, **meta}
     mf = Path(TD) / "meta.json"
-    mf.write_text(json.dumps(meta))
+    mf.write_text(json.dumps(merged))
     os.environ["BRIDGE_WATCHDOG_TEST_PROFILE_META_JSON"] = str(mf)
     pf = Path(TD) / "probe.json"
     pf.write_text(json.dumps(probe))
@@ -123,6 +133,60 @@ check(
     "C10 nested SOUL.md not publish-gap",
     bw.classify_scan_error_category("permission_denied", nested, WD, ISO_USER),
     "controller-cache-stale",
+)
+
+# C11 — LONG agent name (BLOCKING #2 regression guard). The OS user name
+# is truncated to 32 chars (`agent-bridge-<31-char-slug>`) while the
+# per-agent GROUP follows `bridge_isolation_v2_agent_group_name`'s policy
+# (hash-truncated on Linux when >32) — so the two DIVERGE for a long name.
+# A naive prefix-swap of the iso username (the old derivation) would expect
+# `ab-agent-<31-char-slug>`, which does NOT equal the real per-agent group,
+# and would misfire `publish-gap` on a CORRECTLY-published long-name agent.
+# Anchoring the expected group to the workdir DIR's own group classifies it
+# correctly. Here the workdir dir AND the published file both carry the
+# hash-truncated group; the prefix-swap form is deliberately different.
+LONG_ISO_USER = "agent-bridge-thisisaverylongagentnam"  # 32-char truncated user
+LONG_DIR_GROUP = "ab-agent-thisisaver-1a2b3c4"           # hash-truncated group
+SWAP_FORM = "ab-agent-" + LONG_ISO_USER[len("agent-bridge-"):]  # != LONG_DIR_GROUP
+assert SWAP_FORM != LONG_DIR_GROUP, "tooth setup: swap form must differ from real group"
+LONG_WD = Path(TD) / "long-workdir"
+LONG_WD.mkdir()
+(LONG_WD / "SOUL.md").write_text("x")
+long_soul = str(LONG_WD / "SOUL.md")
+# Workdir dir = hash-truncated group @ 2770; published file = SAME group,
+# group-readable 0660 → correctly published → MUST be controller-cache-
+# stale, NOT publish-gap.
+mf = Path(TD) / "meta.json"
+mf.write_text(json.dumps({
+    str(LONG_WD): f"{LONG_DIR_GROUP}:2770",
+    long_soul: f"{LONG_DIR_GROUP}:660",
+}))
+os.environ["BRIDGE_WATCHDOG_TEST_PROFILE_META_JSON"] = str(mf)
+pf = Path(TD) / "probe.json"
+pf.write_text(json.dumps({long_soul: "readable"}))
+os.environ["BRIDGE_WATCHDOG_TEST_ISO_PROBE_JSON"] = str(pf)
+check(
+    "C11 long-name published (dir-group anchor, not prefix-swap)",
+    bw.classify_scan_error_category(
+        "permission_denied", long_soul, LONG_WD, LONG_ISO_USER
+    ),
+    "controller-cache-stale",
+)
+
+# C11b — same long-name agent, but the file is genuinely UNPUBLISHED
+# (controller group, owner-only): still correctly detected as publish-gap
+# because the file's group differs from the dir's hash-truncated group.
+mf.write_text(json.dumps({
+    str(LONG_WD): f"{LONG_DIR_GROUP}:2770",
+    long_soul: f"{WRONG_GROUP}:600",
+}))
+os.environ["BRIDGE_WATCHDOG_TEST_PROFILE_META_JSON"] = str(mf)
+check(
+    "C11b long-name unpublished still publish-gap",
+    bw.classify_scan_error_category(
+        "permission_denied", long_soul, LONG_WD, LONG_ISO_USER
+    ),
+    "publish-gap",
 )
 
 if failures:

@@ -1522,6 +1522,7 @@ bridge_isolation_v2_publish_workdir_profile_files() {
   local agent="$1"
   local workdir="$2"
   local group="${3:-}"
+  local os_user_in="${4:-}"
   [[ -n "$agent" && -n "$workdir" ]] || return 0
   bridge_isolation_v2_enforce || return 0
   if [[ -z "$group" ]]; then
@@ -1541,51 +1542,70 @@ bridge_isolation_v2_publish_workdir_profile_files() {
     "MEMORY-SCHEMA.md"
     "TOOLS.md"
   )
-  local name="" path="" cur="" cur_grp="" cur_mode_raw=""
-  local cur_mode_norm="" want_mode_norm=""
-  want_mode_norm="$(printf '%o' "$((8#660))" 2>/dev/null || printf '660')"
-  for name in "${_profile_basenames[@]}"; do
-    path="$workdir/$name"
-    # Existence + symlink checks are ROOT-side: the controller cannot stat
-    # a file behind the freshly-chowned 2770 workdir on the create pass
-    # (stale group cache), so a controller-side `[[ -f ]]` would false-skip
-    # the exact case this helper exists to fix. `test -e`/`test -h` via
-    # bridge_linux_sudo_root run as root and see the true tree.
-    bridge_linux_sudo_root test -e "$path" 2>/dev/null || continue
-    if bridge_linux_sudo_root test -h "$path" 2>/dev/null; then
-      # A symlinked profile file (e.g. CHANGE-POLICY-style sharing, or a
-      # planted redirect). Refuse — chgrp/chmod would follow to the target.
-      bridge_warn "publish_workdir_profile_files: refusing symlink at $path (agent=$agent); operator must repair the symlink before re-running isolate"
-      continue
-    fi
-    # Idempotent stat-skip (root-side stat: the controller may not be able
-    # to stat the file directly on the create pass).
-    cur="$(bridge_linux_sudo_root stat -c '%G:%a' "$path" 2>/dev/null || printf '')"
-    if [[ -n "$cur" ]]; then
-      cur_grp="${cur%%:*}"
-      cur_mode_raw="${cur##*:}"
-      cur_mode_norm="$(printf '%o' "$((8#${cur_mode_raw#0}))" 2>/dev/null || printf '%s' "$cur_mode_raw")"
-      if [[ "$cur_grp" == "$group" && "$cur_mode_norm" == "$want_mode_norm" ]]; then
-        continue
-      fi
-    fi
-    # Root-forced publish — independent of the controller's stale group
-    # cache and of workdir traversal. chgrp THEN chmod (group first so a
-    # transient observer never sees the new mode on the old group).
-    if ! bridge_linux_sudo_root chgrp "$group" "$path" 2>/dev/null; then
-      bridge_warn "publish_workdir_profile_files: chgrp $group failed for $path (agent=$agent; non-fatal) — re-run \`agent-bridge isolate $agent --reapply\`"
-      bridge_audit_log isolation profile_publish_failed "$agent" \
-        --detail file="$name" --detail op=chgrp --detail group="$group" \
-        >/dev/null 2>&1 || true
-      continue
-    fi
-    if ! bridge_linux_sudo_root chmod 0660 "$path" 2>/dev/null; then
-      bridge_warn "publish_workdir_profile_files: chmod 0660 failed for $path (agent=$agent; non-fatal) — re-run \`agent-bridge isolate $agent --reapply\`"
-      bridge_audit_log isolation profile_publish_failed "$agent" \
-        --detail file="$name" --detail op=chmod --detail mode=0660 \
-        >/dev/null 2>&1 || true
-      continue
-    fi
+  # The root-side mutation is delegated to a standalone python helper that
+  # opens each basename with O_NOFOLLOW relative to a workdir DIRECTORY fd
+  # and fchown/fchmod's the OPEN FD — never re-resolving a profile pathname
+  # after deciding to mutate it. This closes the TOCTOU window that a
+  # path-based `test -h` + `chgrp`/`chmod` left open: once prepare's
+  # `chown -R` hands the workdir to the iso UID, that UID owns every entry
+  # and can swap `SOUL.md` for `SOUL.md -> /etc/shadow` between a path
+  # check and a path mutation. An fd bound to the verified regular-file
+  # inode cannot be redirected by a later rename. See the helper header.
+  local _publish_helper="${BRIDGE_SCRIPT_DIR:-}/scripts/python-helpers/isolation-publish-profile-files.py"
+  if [[ ! -f "$_publish_helper" ]]; then
+    bridge_warn "publish_workdir_profile_files: helper missing ($_publish_helper) for agent=$agent (non-fatal) — re-run \`agent-bridge isolate $agent --reapply\`"
+    bridge_audit_log isolation profile_publish_failed "$agent" \
+      --detail op=publish-helper --detail reason=helper-missing \
+      >/dev/null 2>&1 || true
+    return 0
+  fi
+  # Owner of the freshly-chowned profile files; threaded so the helper can
+  # assert `st_uid == <iso-uid>` (defence in depth). Prefer the value the
+  # caller already resolved (the `chown -R` target); fall back to the
+  # roster value. Empty when neither is resolvable — the helper then skips
+  # the owner check rather than refusing everything.
+  local _os_user="$os_user_in"
+  [[ -n "$_os_user" ]] || _os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+  local _publish_out="" _publish_rc=0
+  _publish_out="$(bridge_linux_sudo_root python3 "$_publish_helper" \
+    "$workdir" "$group" 0660 "$_os_user" "${_profile_basenames[@]}" 2>/dev/null)"
+  _publish_rc=$?
+  if (( _publish_rc != 0 )); then
+    # Fatal setup error inside the helper (unknown group / workdir not
+    # openable) or the root invocation itself failed. Non-fatal: warn +
+    # audit, create still succeeds.
+    bridge_warn "publish_workdir_profile_files: root publish helper failed (rc=$_publish_rc) for agent=$agent (non-fatal) — re-run \`agent-bridge isolate $agent --reapply\`"
+    bridge_audit_log isolation profile_publish_failed "$agent" \
+      --detail op=publish-helper --detail rc="$_publish_rc" \
+      >/dev/null 2>&1 || true
+    return 0
+  fi
+  # Per-file results (TAB-separated: <status>\t<basename>\t<detail>).
+  # Piped into the loop (not a `<<<` here-string — lint-heredoc-ban bans
+  # here-strings to a non-interpreter consumer); the loop only warns/audits
+  # (side effects), keeping no state past the subshell, so the pipe is safe.
+  local _st="" _fname="" _detail=""
+  printf '%s\n' "$_publish_out" | while IFS=$'\t' read -r _st _fname _detail; do
+    [[ -n "$_st" ]] || continue
+    case "$_st" in
+      published|ok-nochange|absent)
+        : ;;  # success / nothing to do
+      refused-symlink)
+        # A symlinked profile basename (planted redirect or CHANGE-POLICY-
+        # style sharing). O_NOFOLLOW refused it before any chgrp/chmod.
+        bridge_warn "publish_workdir_profile_files: refusing symlink at $workdir/$_fname (agent=$agent); operator must repair the symlink before re-running isolate" ;;
+      refused-nonregular|refused-owner)
+        bridge_warn "publish_workdir_profile_files: refusing $_st at $workdir/$_fname (agent=$agent; $_detail; non-fatal)"
+        bridge_audit_log isolation profile_publish_failed "$agent" \
+          --detail file="$_fname" --detail op="$_st" --detail info="$_detail" \
+          >/dev/null 2>&1 || true ;;
+      mutate-failed|*)
+        # chgrp/chmod (fchown/fchmod) raised on the open fd. Non-fatal.
+        bridge_warn "publish_workdir_profile_files: chgrp/chmod failed for $workdir/$_fname (agent=$agent; $_detail; non-fatal) — re-run \`agent-bridge isolate $agent --reapply\`"
+        bridge_audit_log isolation profile_publish_failed "$agent" \
+          --detail file="$_fname" --detail op="${_detail%%:*}" --detail info="$_detail" \
+          >/dev/null 2>&1 || true ;;
+    esac
   done
   return 0
 }

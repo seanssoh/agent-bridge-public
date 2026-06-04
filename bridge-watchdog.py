@@ -405,21 +405,42 @@ def _sudo_test(os_user: str, flag: str, path: Path) -> int | None:
     return rc
 
 
-def _profile_group_for_iso_user(iso_user: str | None) -> str | None:
-    """Map the isolated OS account name to its per-agent group name.
+def _workdir_published_group(workdir: Path, iso_user: str | None) -> str | None:
+    """Expected group for a published profile file = the workdir DIR's own
+    group (the setgid-inheritance contract anchor).
 
-    The iso v2 contract pairs ``agent-bridge-<slug>`` (the OS user that
-    owns the workdir) with ``ab-agent-<slug>`` (the per-agent group the
-    profile files must carry). Derive the expected group from the iso
-    user by swapping the prefix — this threads the agent-context group
-    WITHOUT re-implementing the shell-side slug normalization (which
-    could drift from ``bridge_isolation_v2_agent_group_name``). Returns
-    ``None`` when ``iso_user`` is missing or does not carry the expected
-    ``agent-bridge-`` prefix.
+    The iso v2 publish contract is setgid inheritance: a profile file must
+    carry the SAME group as its ``2770`` parent workdir. On a first-time
+    create the workdir DIRECTORY is reliably normalized to ``ab-agent-<a>``
+    via a root step even when the profile FILES are missed (the exact
+    #1520c gap), so the workdir's own group IS the ground-truth contract
+    anchor for "what group should these files carry".
+
+    Deriving the expected group from the DIR — rather than string-swapping
+    the iso username's ``agent-bridge-`` prefix to ``ab-agent-`` — is
+    name-length-agnostic and never drifts from
+    ``bridge_isolation_v2_agent_group_name``. That shell policy keeps the
+    FULL agent segment on Darwin but HASH-TRUNCATES on Linux when the
+    composed ``ab-agent-<agent>`` name would exceed groupadd's 32-char
+    limit, while the OS user name (``agent-bridge-<agent>``) is
+    INDEPENDENTLY truncated to 32 chars by ``bridge_agent_default_os_user``.
+    For a long agent name those two truncations diverge, so a naive prefix
+    swap of the iso username yields a group that does NOT match the real
+    per-agent group — misclassifying a correctly-published long-name agent
+    as a publish gap. Reading the dir's actual group sidesteps the policy
+    entirely.
+
+    Resolved via the same iso-owner ``stat`` probe (and the same
+    ``BRIDGE_WATCHDOG_TEST_PROFILE_META_JSON`` test seam) as the file
+    metadata — the workdir path is just another path key. Returns ``None``
+    when the dir group cannot be resolved, in which case the caller does
+    NOT over-claim a publish gap.
     """
-    if not iso_user or not iso_user.startswith("agent-bridge-"):
+    dir_meta = _profile_path_group_mode(str(workdir), iso_user)
+    if dir_meta is None:
         return None
-    return "ab-agent-" + iso_user[len("agent-bridge-"):]
+    grp = (dir_meta[0] or "").strip()
+    return grp or None
 
 
 def _profile_path_group_mode(
@@ -1092,7 +1113,7 @@ def classify_scan_error_category(
         and err_p.name in PROFILE_PUBLISH_BASENAMES
         and err_p.parent == workdir
     ):
-        expected_group = _profile_group_for_iso_user(iso_owner)
+        expected_group = _workdir_published_group(workdir, iso_owner)
         meta = _profile_path_group_mode(error_path, iso_owner)
         if expected_group and meta is not None:
             on_disk_group, on_disk_mode = meta

@@ -4551,7 +4551,7 @@ bridge_linux_prepare_agent_isolation() {
   # for the legacy silent `|| true` publish.
   if command -v bridge_isolation_v2_publish_workdir_profile_files >/dev/null 2>&1; then
     bridge_isolation_v2_publish_workdir_profile_files \
-      "$agent" "$workdir" "$_v2_agent_group" \
+      "$agent" "$workdir" "$_v2_agent_group" "$os_user" \
       || bridge_warn "isolation v2 (#1520c): workdir profile-file publish returned non-zero for agent '$agent'; the six identity files may not be group-readable. Re-run \`agent-bridge isolate $agent --reapply\`."
   fi
 
