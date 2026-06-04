@@ -173,6 +173,34 @@ ln -s "$C1_EXT" "$C1_WD/CHANGE-POLICY.md"
 
 C1_LOG="$SMOKE_TMP_ROOT/c1.log"
 run_publish "$C1_WD" >"$C1_LOG" 2>&1
+if [[ "$(cat "$C1_LOG")" != *"rc=0"* ]]; then
+  {
+    echo "=== DIAG: C1_LOG empty/no-rc=0 ==="
+    echo "uname=$(uname -s) id=$(id) uid=$(id -u)"
+    echo "sudo path: $(command -v sudo || echo MISSING)"
+    echo "sudo -n true rc: "; sudo -n true 2>&1; echo "  -> rc=$?"
+    echo "python3 path: $(command -v python3)"
+    echo "OPERATOR_GROUP=$OPERATOR_GROUP gid=$(id -g)"
+    echo "=== C1_LOG raw (od) ==="
+    od -c "$C1_LOG" | head -20
+    echo "=== fixture listing ==="
+    ls -la "$C1_WD"
+    echo "=== direct helper as current user ==="
+    "$PY_BIN" "$REPO_ROOT/scripts/python-helpers/isolation-publish-profile-files.py" \
+      "$C1_WD" "$OPERATOR_GROUP" 0660 "" SOUL.md 2>&1; echo "  direct-rc=$?"
+    echo "=== run_publish re-run with xtrace ==="
+    (
+      set -x
+      source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1
+      echo "post-source-rc=$?"
+      bridge_isolation_v2_enforce() { return 0; }
+      bridge_isolation_v2_agent_group_name() { printf '%s' "$OPERATOR_GROUP"; }
+      bridge_isolation_v2_publish_workdir_profile_files "test_agent" "$C1_WD" "$OPERATOR_GROUP"
+      echo "fn-rc=$?"
+    ) 2>&1 | head -60
+    echo "=== END DIAG ==="
+  } >&2
+fi
 smoke_assert_contains "$(cat "$C1_LOG")" "rc=0" "C1 publish helper rc"
 
 "$PY_BIN" "$HELPER_DIR/assert-profile-publish-modes.py" "$C1_WD" "0660" \
