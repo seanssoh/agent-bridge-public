@@ -270,11 +270,12 @@ def cmd_create(args: argparse.Namespace) -> int:
     node = local_node()
     leader = caller_agent(args)
     token = rooms.mint_invite_token()
+    ttl = max(0, int(getattr(args, "ttl", 0) or 0))
     conn = rooms.open_rooms()
     try:
         room_id = rooms.create_room(
             conn, name=args.name or "", leader_agent=leader,
-            leader_node=node, token=token, once=False,
+            leader_node=node, token=token, once=False, ttl=ttl,
         )
     finally:
         conn.close()
@@ -380,11 +381,12 @@ def _require_leader_conn(conn: Any, room_id: str,
 
 def cmd_invite(args: argparse.Namespace) -> int:
     node = local_node()
+    ttl = max(0, int(getattr(args, "ttl", 0) or 0))
     conn = rooms.open_rooms()
     try:
         _require_leader_conn(conn, args.room_id, args)
         token = rooms.mint_invite_token()
-        rooms.set_invite_token(conn, args.room_id, token, once=args.once)
+        rooms.set_invite_token(conn, args.room_id, token, once=args.once, ttl=ttl)
     finally:
         conn.close()
     link = rooms.make_invite_link(args.room_id, node, token)
@@ -405,20 +407,182 @@ def cmd_rotate_invite(args: argparse.Namespace) -> int:
     return cmd_invite(args)
 
 
+def _post_room_join_request(*, leader_node: str, room_id: str, token: str,
+                            joiner_agent: str, timeout: float = 30.0,
+                            ) -> tuple[int, bytes]:
+    """POST a signed cross-node room-join-request to the leader's node (P4.1).
+
+    The leader's node id (`leader_node`) names the A2A peer to deliver to. We
+    resolve that peer from the local A2A config, sign the body with the node-link
+    HMAC secret, and POST to the leader's `room_join_path`. The wire carries
+    sha256(token) ONLY (hash_token) — the raw token never leaves this process.
+    `joiner_agent` is the OS-actor-anchored agent id (resolved by the CALLER via
+    caller_agent / resolve_os_actor) — NEVER a --from/env value. Returns
+    (http_status, response_body).
+
+    A test seam (BRIDGE_ROOMS_TEST_POST_HOOK, gated by the paired
+    BRIDGE_ROOMS_ALLOW_TEST_UID_MAP=1 + BRIDGE_A2A_ALLOW_TEST_BIND=1 flags) lets
+    the smoke capture the signed request + stub the transport so no real
+    Tailscale / live receiver is needed. It is NEVER honored in production (the
+    paired flags are unset there).
+    """
+    if a2a is None:  # pragma: no cover - a2a always ships beside this
+        raise rooms.RoomsError(
+            "cross-node join requires the A2A module + node-link config",
+            code="a2a_unavailable",
+        )
+    cfg = a2a.load_config()
+    local_bridge_id = str(cfg.get("bridge_id", "") or "").strip()
+    if not local_bridge_id:
+        raise rooms.RoomsError(
+            "config has no 'bridge_id' — cannot identify this node for a "
+            "cross-node join", code="no_bridge_id",
+        )
+    peer = a2a.find_peer(cfg, leader_node)
+    secret = a2a.peer_send_secret(peer)
+    token_hash = rooms.hash_token(token)
+    body = a2a.build_room_join_request(
+        room_id=room_id, join_token_sha256=token_hash, joiner_agent=joiner_agent,
+    )
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    message_id = a2a.new_message_id(local_bridge_id)
+    path = peer.get("room_join_path", a2a.ROOM_JOIN_PATH)
+    timestamp = str(a2a.now_ts())
+    body_hash = a2a.body_sha256(body_bytes)
+    canonical = a2a.canonical_string(
+        "POST", path, local_bridge_id, message_id, timestamp, body_hash)
+    signature = a2a.sign(secret, canonical)
+    headers = {
+        "Content-Type": "application/json",
+        "X-AGB-Protocol": a2a.ROOM_JOIN_PROTOCOL_VERSION,
+        "X-AGB-Peer": local_bridge_id,
+        "X-AGB-Message-Id": message_id,
+        "X-AGB-Timestamp": timestamp,
+        "X-AGB-Body-SHA256": body_hash,
+        "X-AGB-Signature": signature,
+    }
+
+    # Test seam: capture the fully-signed request + return a stubbed response,
+    # so the smoke exercises the real sender (signing, OS-actor joiner id, hash-
+    # only body) against the real receiver WITHOUT a live socket / Tailscale.
+    if _test_post_hook_allowed():
+        return _invoke_test_post_hook(path=path, headers=headers,
+                                      body_bytes=body_bytes)
+
+    address = a2a.resolve_peer_address(peer)
+    port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
+    if not address:
+        raise rooms.RoomsError(
+            f"leader node {leader_node!r} has no resolvable address",
+            code="no_leader_address",
+        )
+    import urllib.request
+
+    url = f"http://{address}:{port}{path}"
+    req = urllib.request.Request(url, data=body_bytes, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
+        return exc.code, (exc.read() or b"")
+
+
+def _test_post_hook_allowed() -> bool:
+    """Paired-flag gate for the cross-node POST test seam (prod-inert)."""
+    # noqa markers: these are plain env-VAR reads (test-seam gating), NOT
+    # isolated `.env` FILE access — the iso-helper-ratchet pattern matches the
+    # `.env` substring inside `os.environ`, a false positive here.
+    return (os.environ.get("BRIDGE_ROOMS_ALLOW_TEST_UID_MAP") == "1"  # noqa: iso-helper-boundary - env var, not a .env file
+            and os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") == "1"  # noqa: iso-helper-boundary - env var, not a .env file
+            and bool(os.environ.get("BRIDGE_ROOMS_TEST_POST_HOOK")))  # noqa: iso-helper-boundary - env var, not a .env file
+
+
+def _invoke_test_post_hook(*, path: str, headers: dict,
+                           body_bytes: bytes) -> tuple[int, bytes]:
+    """Write the signed request to the hook file + return a stubbed 200.
+
+    The hook value is a file path the smoke reads to assert on the signed
+    request (it can then replay it against the real receiver handler). Returns a
+    synthetic 200 so the CLI reports the pending post as sent.
+    """
+    import subprocess
+
+    hook = os.environ["BRIDGE_ROOMS_TEST_POST_HOOK"]  # noqa: iso-helper-boundary - env var, not a .env file
+    payload = {
+        "path": path, "headers": headers,
+        "body": body_bytes.decode("utf-8"),
+    }
+    # The hook is a script invoked with the JSON payload on argv (file-as-argv,
+    # never stdin — footgun #11 hygiene). Its stdout (if any) is the stubbed
+    # response body; a non-zero exit surfaces as a 503 to the caller.
+    try:
+        proc = subprocess.run(
+            [hook, json.dumps(payload)], capture_output=True, text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise rooms.RoomsError(f"test post hook failed: {exc}",
+                               code="test_hook_error")
+    if proc.returncode != 0:
+        return 503, (proc.stderr or "test hook non-zero").encode("utf-8")
+    return 200, (proc.stdout or "").encode("utf-8")
+
+
 def cmd_join(args: argparse.Namespace) -> int:
     parsed = rooms.parse_invite_link(args.link)
     room_id = parsed.get("room", "")
     token = parsed.get("t", "")
+    leader_node = parsed.get("leader", "")
+    # THE joiner identity (contract 2): the OS-actor-anchored trusted agent
+    # (resolve_os_actor / pwd.getpwuid), NEVER --from / BRIDGE_AGENT_ID / USER.
+    # The SAME anchor single-node uses — so a hostile --from/env cannot change
+    # the recorded joiner on either path.
     agent = caller_agent(args)
     node = local_node()
+    if not token:
+        return die("invite link carries no token (t=...) — a join needs "
+                   "the token-bearing link, not a bare room id", code=1)
+
+    # Cross-node (P4.1): the link names a leader node that is NOT this node.
+    # Post the join-request to the leader's node over the node-link; the leader
+    # verifies + persists the pending row (no local rooms.db write here — this
+    # node is not the leader's node and has no authority over the room).
+    if leader_node and leader_node != node:
+        try:
+            status, resp = _post_room_join_request(
+                leader_node=leader_node, room_id=room_id, token=token,
+                joiner_agent=agent,
+            )
+        except rooms.RoomsError as exc:
+            return die(str(exc), code=1)
+        except Exception as exc:  # noqa: BLE001 - transport/config failure
+            return die(f"cross-node join failed: {exc}", code=1)
+        if not (200 <= status < 300):
+            detail = ""
+            try:
+                detail = resp.decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001
+                detail = ""
+            return die(f"leader node rejected the join (HTTP {status}): {detail}",
+                       code=1)
+        if args.json:
+            out(json.dumps({"room_id": room_id,
+                            "agent": f"{agent}@{node}",
+                            "leader_node": leader_node,
+                            "status": rooms.JOIN_PENDING, "cross_node": True}))
+        else:
+            info(f"cross-node join request posted for {agent}@{node} on "
+                 f"{room_id} to leader node {leader_node} (pending approval)")
+        return 0
+
+    # Single-node (P1) path: joiner + leader share this node.
     conn = rooms.open_rooms()
     try:
         room = rooms.get_room(conn, room_id)
         if room is None:
             return die(f"room not found: {room_id}", code=1)
-        if not token:
-            return die("invite link carries no token (t=...) — a join needs "
-                       "the token-bearing link, not a bare room id", code=1)
         # Rate-limit per token + source BEFORE the hash compare so a brute
         # force on the token is bounded, then verify the token hash.
         try:
@@ -426,8 +590,8 @@ def cmd_join(args: argparse.Namespace) -> int:
         except rooms.RoomsError as exc:
             return die(str(exc), code=1)
         if not rooms.verify_invite_token(room, token):
-            return die("invalid invite token for this room (hash mismatch)",
-                       code=1)
+            return die("invalid invite token for this room (hash mismatch, "
+                       "expired, or revoked)", code=1)
         rooms.post_join_request(conn, room_id, agent, node)
     finally:
         conn.close()
@@ -707,6 +871,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_create = sub.add_parser("create", help="create a room (you are leader)")
     p_create.add_argument("--name", default="", help="human room name")
+    p_create.add_argument(
+        "--ttl", type=int, default=0,
+        help="invite-token lifetime in seconds (0 = no expiry, the default). "
+             "A cross-node join (P4.1) with an expired token is refused.")
     _add_common(p_create)
     p_create.set_defaults(func=cmd_create)
 
@@ -725,6 +893,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_invite.add_argument("room_id")
     p_invite.add_argument("--once", action="store_true",
                           help="single-use token (burned after one approval)")
+    p_invite.add_argument(
+        "--ttl", type=int, default=0,
+        help="invite-token lifetime in seconds (0 = no expiry, the default).")
     _add_common(p_invite)
     p_invite.set_defaults(func=cmd_invite)
 
