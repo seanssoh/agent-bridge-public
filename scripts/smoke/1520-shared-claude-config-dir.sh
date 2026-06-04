@@ -634,6 +634,85 @@ test_inherited_proven_spoof_export_attribute_scrubbed() {
   unset SEED_TARGET_CRED BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED
 }
 
+# T11 — TEETH for the r5 BASH_ENV + allexport BLOCKING (codex Phase-4). A
+# caller-controlled BASH_ENV sourced before line 1 can run `set -p -a` and define
+# a `set` function shadow. The KEY design decision (codex internal review): the
+# `bash -p` re-exec is DEFENSE-IN-DEPTH whose decision is intentionally NOT made
+# unspoofable (any caller-controlled signal — `$-` p flag, env marker, or an
+# fd-9 nonce the caller can pre-stage with a matching inherited fd 9 — is
+# forgeable on first entry). Instead the #1520 security invariant (no token /
+# proven-flag leak) is established UNCONDITIONALLY at true process entry, BEFORE
+# and independent of the re-exec, so a forged re-exec skip cannot reintroduce the
+# leak. This tooth pins that the UNCONDITIONAL entry hardening closes the leak
+# even with NO re-exec, even under a `set` function shadow:
+#   1. `builtin set +a` (the BUILTIN form) clears inherited allexport before the
+#      STEP A captures.
+#   2. `set` is in the `builtin unset -f` shadow-strip list, so even a bare
+#      `set` is unshadowed (belt for the builtin).
+# Boundary (deferred #1454): a caller that shadows the `builtin` KEYWORD itself
+# (`builtin(){ :; }`) defeats `builtin set +a` AND the whole STEP A `builtin`-
+# based credential scrub alike — that is the pre-existing same-UID-controls-
+# invocation-env boundary, out of scope here, NOT a new #1520 weakness. So this
+# tooth models the IN-SCOPE `set()` function shadow (not a `builtin()` shadow).
+test_bash_env_allexport_unconditional_entry_clear() {
+  # (a1) structural: `builtin set +a` precedes the STEP A token capture, and it
+  # is the BUILTIN form (not a bare `set +a` a `set` shadow could intercept).
+  local setapos cappos
+  setapos="$(grep -n '^builtin set +a$' "$RUN_SH" | head -1 | cut -d: -f1)"
+  cappos="$(grep -n '^_bridge_run_tok_oat="\${_bridge_run_tok_oat:-' "$RUN_SH" | head -1 | cut -d: -f1)"
+  [[ -n "$setapos" ]] \
+    || smoke_fail "T11 'builtin set +a' entry-clear of allexport missing from bridge-run.sh (a bare 'set +a' is shadowable)"
+  [[ -n "$cappos" ]] || smoke_fail "T11 could not locate the STEP A token capture line"
+  (( setapos < cappos )) \
+    || smoke_fail "T11 'builtin set +a' (line $setapos) must precede the STEP A token capture (line $cappos)"
+
+  # (a2) structural: `set` is in the function-shadow strip list, so a caller
+  # `set(){ :; }` cannot no-op the script's `set` builtins (belt for builtin set).
+  # The `builtin unset -f` statement spans line-continuations (`\`), so join the
+  # continued logical line first (captured to a var — avoids a `grep -q` early
+  # close SIGPIPE-ing awk under `set -o pipefail`).
+  local stripline
+  stripline="$(awk '/^builtin unset -f /{l=$0; while (l ~ /\\$/){getline n; sub(/\\$/,"",l); l=l n} print l; exit}' "$RUN_SH")"
+  printf '%s\n' "$stripline" | grep -qw 'set' \
+    || smoke_fail "T11 'set' must be in the 'builtin unset -f' shadow-strip list (a set() shadow could otherwise no-op a bare set)"
+
+  local envf
+  envf="$SMOKE_TMP_ROOT/bashenv-setpa.sh"
+
+  # (b1) behavioral: under BASH_ENV `set -p -a`, the production `builtin set +a`
+  # (extracted verbatim) keeps a representative `_bridge_run_tok_*` AND the proven
+  # flag process-local (ABSENT from a child) WITHOUT any re-exec — the leak is
+  # closed unconditionally at entry, so a forged re-exec skip is harmless.
+  local seta_line result
+  seta_line="$(grep -m1 '^builtin set +a$' "$RUN_SH")"
+  printf 'set -p -a\n' >"$envf"
+  result="$(BASH_ENV="$envf" "$BASH" -c '
+    '"$seta_line"'
+    _bridge_run_tok_oat="SECRET-OAT-FIXTURE"
+    BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1
+    ct="$('"$BASH"' -c "printf %s \"\${_bridge_run_tok_oat:-__ABSENT__}\"")"
+    cf="$('"$BASH"' -c "printf %s \"\${BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED:-__ABSENT__}\"")"
+    printf "%s|%s" "$ct" "$cf"
+  ')"
+  smoke_assert_eq "__ABSENT__|__ABSENT__" "$result" \
+    "T11 'builtin set +a' keeps the token capture AND proven flag process-local under BASH_ENV set -p -a (no re-exec needed)"
+
+  # (b2) behavioral: the `set` function shadow must NOT defeat the clear. A bare
+  # `set +a` would be a no-op under a `set(){ :; }` shadow (token leaks); the
+  # production `builtin set +a` (plus the shadow-strip) must still clear allexport
+  # (token ABSENT) — modeled here with the strip + the extracted builtin clear.
+  printf 'set(){ :; }\nbuiltin set -a\n' >"$envf"
+  local shadow_result
+  shadow_result="$(BASH_ENV="$envf" "$BASH" -c '
+    builtin unset -f set 2>/dev/null || true
+    '"$seta_line"'
+    _bridge_run_tok_oat="SECRET-OAT-FIXTURE"
+    printf %s "$('"$BASH"' -c "printf %s \"\${_bridge_run_tok_oat:-__ABSENT__}\"")"
+  ')"
+  smoke_assert_eq "__ABSENT__" "$shadow_result" \
+    "T11 'builtin set +a' clears allexport even under a BASH_ENV 'set(){ :; }' shadow (token stays local)"
+}
+
 smoke_run "T1 shared STATIC Claude launch exports per-agent CLAUDE_CONFIG_DIR" test_shared_claude_exports_config_dir
 smoke_run "T2 teeth: reverting the export empties CLAUDE_CONFIG_DIR"           test_teeth_revert_makes_config_dir_empty
 smoke_run "T3 codex shared launch sets no CLAUDE_CONFIG_DIR"                   test_codex_shared_no_config_dir
@@ -644,5 +723,6 @@ smoke_run "T7 proven keychain-free exports without a credential file"          t
 smoke_run "T8 teeth: unproven keychain-free does NOT export empty per-agent dir" test_unproven_keychain_free_does_not_export_empty_dir
 smoke_run "T9 degrade warning is one-time across N relaunches (sentinel)"      test_degrade_warning_is_one_time
 smoke_run "T10 teeth: inherited proven-spoof export attribute unset at entry"  test_inherited_proven_spoof_export_attribute_scrubbed
+smoke_run "T11 teeth: BASH_ENV set -p -a allexport leak closed UNCONDITIONALLY at entry (re-exec is defense-in-depth, not unspoofable by design)"  test_bash_env_allexport_unconditional_entry_clear
 
 smoke_log "all checks passed"

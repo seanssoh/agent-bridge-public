@@ -90,8 +90,8 @@ bridge-review.sh	137	H3	703b24afbe03d28c1a3c3c2072a949aac074c881f00496a189df9f83
 bridge-run.sh	1160	H3	284c4b8ea0187f630fe41146d5d4304b0da61a8bf2f6c5cc1cefe06befb2c4e5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-run.sh	1207	H3	284c4b8ea0187f630fe41146d5d4304b0da61a8bf2f6c5cc1cefe06befb2c4e5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-run.sh	1346	H3	fbe2e0c1fc0d55af86d8804be8589ce21a6b8977b22417398cdd4eb53fb20d4d	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-run.sh	1308	H3	3bcf9cf8bf2d74c066cde478b02a8a01baa4f46cce8c6c70fc79f523f5995683	here-string/procsub, non-interpreter consumer	patch	#1520 shared-launch CLAUDE_CONFIG_DIR (bridge_run_shared_launch)
-bridge-run.sh	1316	H3	11f888bc9c6abf6d821891c0d92e013a98ca8b08deb4257f893f4be3aff80516	here-string/procsub, non-interpreter consumer	patch	#1520 shared-launch CLAUDE_CONFIG_DIR (bridge_run_shared_launch)
+bridge-run.sh	1354	H3	3bcf9cf8bf2d74c066cde478b02a8a01baa4f46cce8c6c70fc79f523f5995683	here-string/procsub, non-interpreter consumer	patch	#1520 shared-launch CLAUDE_CONFIG_DIR (bridge_run_shared_launch)
+bridge-run.sh	1362	H3	11f888bc9c6abf6d821891c0d92e013a98ca8b08deb4257f893f4be3aff80516	here-string/procsub, non-interpreter consumer	patch	#1520 shared-launch CLAUDE_CONFIG_DIR (bridge_run_shared_launch)
 bridge-setup.sh	134	C3	dfa7cb8653e0fa5030cfb74dc10e3f9b1cea067a4a736f616072077c28737eda	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-setup.sh	158	C3	dfa7cb8653e0fa5030cfb74dc10e3f9b1cea067a4a736f616072077c28737eda	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-setup.sh	181	C3	25149f22b708794256a01db1a4cfb75cb8fc1b962478687d785a0ad389755c7a	interpreter heredoc, no capture	patch	Phase 3 PR C
