@@ -64,6 +64,26 @@ ROOM_JOIN_PROTOCOL_VERSION = "a2a-room-join-v1"
 ROOM_JOIN_ENVELOPE_PROTOCOL = "agent-bridge.a2a.room-join.v1"
 ROOM_JOIN_PATH = "/room-join-request"
 
+# A2A Rooms P4.2 (design §6 / §11 / §14 R2): the signed cross-node
+# `room-roster-broadcast` control message. After the leader (on node A) approves
+# a member it bumps the room epoch and broadcasts the canonical, leader-signed
+# roster to EACH member node over THAT node's existing node-link, MAC'd with the
+# leader-node↔member-node ordered-pair secret (one signed POST per member-link —
+# §14 R2 "Member X knows only the leader↔X secret, never leader↔Z, so X cannot
+# forge a roster node Z would accept"). Like the join-request it is a DISTINCT
+# protocol routed to a SEPARATE handler with the SAME fail-closed auth preamble
+# (remote_addr -> HMAC -> skew -> dedupe); its terminal action is a member-local
+# room_roster_cache write — it NEVER reaches the enqueue/allowlist/queue
+# boundary, carries no queue task, and admits nothing. The pairwise HMAC IS the
+# leader signature: the X-AGB-Signature header is computed over the canonical
+# request string (which binds method+path+peer+message_id+timestamp+body-hash)
+# with the leader↔member secret, so a member cannot forge a roster for a peer
+# whose secret it does not hold. The body carries ONLY the canonical roster
+# (room_id, room_epoch, sorted members, leader_node) — no token, no secret.
+ROOM_ROSTER_PROTOCOL_VERSION = "a2a-room-roster-v1"
+ROOM_ROSTER_ENVELOPE_PROTOCOL = "agent-bridge.a2a.room-roster.v1"
+ROOM_ROSTER_PATH = "/room-roster-broadcast"
+
 # Default per-peer caps. Receiver config may override per peer.
 DEFAULT_MAX_BODY_BYTES = 256 * 1024
 DEFAULT_MAX_TITLE_BYTES = 1024
@@ -975,6 +995,134 @@ def parse_room_join_request(raw: bytes) -> dict[str, Any]:
             "room-join-request join_token_sha256 must be a sha256 hex digest",
             code="bad_room_join",
         )
+    return body
+
+
+# --------------------------------------------------------------------------
+# Cross-node room-roster-broadcast control message (A2A Rooms P4.2, design §6/§14 R2)
+# --------------------------------------------------------------------------
+#
+# The body a leader's node A signs (over the per-member node-link HMAC) + each
+# member node re-validates. It carries the CANONICAL, leader-authoritative
+# roster for one room:
+#   - room_id:     the room.
+#   - room_epoch:  the monotonic epoch the broadcast carries (the freshness /
+#                  split-brain tiebreaker; a member ignores a lower-or-same epoch
+#                  unless it is a byte-identical idempotent duplicate).
+#   - members:     the roster, CANONICALLY sorted by (agent, node) — the exact
+#                  bytes the leader signed; any verifier recomputes the same MAC
+#                  string. Each entry is {agent, node, role}.
+#   - leader_node: the node that leads the room. CRITICAL (contract 3a): the
+#                  member accepts a roster ONLY when the authenticated X-AGB-Peer
+#                  (the node-link sender) EQUALS this leader_node — a roster from
+#                  any non-leader authenticated peer is rejected, persisting
+#                  nothing. There is deliberately NO leader_agent-on-the-wire
+#                  trust beyond what the roster members list itself carries.
+# The leader's signature is the node-link HMAC header (X-AGB-Signature) over the
+# canonical request string — the body carries no separate `sig` field because
+# the pairwise HMAC over the body hash IS the per-member signature (§14 R2: one
+# signature per member-link). No token, no secret ever crosses this wire.
+
+
+def build_room_roster_broadcast(
+    *,
+    room_id: str,
+    room_epoch: int,
+    members: list[dict[str, Any]],
+    leader_node: str,
+) -> dict[str, Any]:
+    """Build the cross-node room-roster-broadcast control body.
+
+    `members` MUST already be the CANONICAL sorted roster (sorted by (agent,
+    node) — `bridge_rooms_common._sorted_members` / `roster_for`). The caller
+    signs the resulting body bytes with the leader-node↔member-node pairwise
+    HMAC (the node-link secret) for EACH member node it broadcasts to, so a
+    member cannot forge a roster for a peer whose secret it does not hold. The
+    body carries NO `sig` field — the X-AGB-Signature header IS the per-link
+    signature (§14 R2).
+    """
+    return {
+        "protocol": ROOM_ROSTER_ENVELOPE_PROTOCOL,
+        "room_id": room_id,
+        "room_epoch": int(room_epoch),
+        "members": members,
+        "leader_node": leader_node,
+    }
+
+
+def parse_room_roster_broadcast(raw: bytes) -> dict[str, Any]:
+    """Parse + shape-validate a cross-node room-roster-broadcast control body.
+
+    Validates only the WIRE shape: a JSON object with the right protocol tag,
+    non-empty string `room_id` + `leader_node`, a non-negative int `room_epoch`,
+    and a `members` LIST whose every entry is an object with non-empty string
+    `agent` + string `node` (+ optional string `role`). A malformed/garbage
+    value is refused at the boundary, never half-trusted. It does NOT verify the
+    leader-authority binding (the receiver checks the authenticated peer ==
+    leader_node and the pairwise HMAC) and does NOT trust the roster beyond the
+    node-link auth the receiver already enforced.
+    """
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise A2AError(
+            f"room-roster-broadcast is not valid JSON: {exc}",
+            code="bad_room_roster",
+        ) from exc
+    if not isinstance(body, dict):
+        raise A2AError(
+            "room-roster-broadcast root must be a JSON object",
+            code="bad_room_roster",
+        )
+    if body.get("protocol") != ROOM_ROSTER_ENVELOPE_PROTOCOL:
+        raise A2AError(
+            f"unsupported room-roster-broadcast protocol: {body.get('protocol')!r}",
+            code="bad_room_roster_protocol",
+        )
+    for field in ("room_id", "leader_node"):
+        val = body.get(field)
+        if not isinstance(val, str) or not val:
+            raise A2AError(
+                f"room-roster-broadcast missing required string field: {field}",
+                code="bad_room_roster",
+            )
+    epoch = body.get("room_epoch")
+    # bool is an int subclass — reject it explicitly so `true`/`false` cannot
+    # masquerade as an epoch.
+    if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
+        raise A2AError(
+            "room-roster-broadcast room_epoch must be a non-negative integer",
+            code="bad_room_roster",
+        )
+    members = body.get("members")
+    if not isinstance(members, list):
+        raise A2AError(
+            "room-roster-broadcast members must be a list", code="bad_room_roster",
+        )
+    for entry in members:
+        if not isinstance(entry, dict):
+            raise A2AError(
+                "room-roster-broadcast member entries must be objects",
+                code="bad_room_roster",
+            )
+        agent = entry.get("agent")
+        node = entry.get("node", "")
+        role = entry.get("role", "")
+        if not isinstance(agent, str) or not agent:
+            raise A2AError(
+                "room-roster-broadcast member missing string 'agent'",
+                code="bad_room_roster",
+            )
+        if not isinstance(node, str):
+            raise A2AError(
+                "room-roster-broadcast member 'node' must be a string",
+                code="bad_room_roster",
+            )
+        if not isinstance(role, str):
+            raise A2AError(
+                "room-roster-broadcast member 'role' must be a string",
+                code="bad_room_roster",
+            )
     return body
 
 
