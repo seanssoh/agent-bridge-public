@@ -25,10 +25,12 @@ try:
     from bridge_iso_paths import (
         isolated_workdir_owner as _isolated_workdir_owner_canonical,
         sudo_run_as as _sudo_run_as_canonical,
+        sudo_run_as_capture as _sudo_run_as_capture_canonical,
     )
 except ImportError:
     _isolated_workdir_owner_canonical = None
     _sudo_run_as_canonical = None
+    _sudo_run_as_capture_canonical = None
 
 MANAGED_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
@@ -36,6 +38,24 @@ MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
 CLAUDE_REQUIRED_FILES = ("CLAUDE.md", "SOUL.md", "MEMORY-SCHEMA.md", "MEMORY.md", "SESSION-TYPE.md")
 # Backward-compat alias: legacy callers / tests reference REQUIRED_FILES.
 REQUIRED_FILES = CLAUDE_REQUIRED_FILES
+# #1520c: the six Claude identity profile basenames that
+# ``bridge_isolation_v2_publish_workdir_profile_files`` publishes to
+# ``ab-agent-<a>:0660`` at create+isolate time. A ``permission_denied`` on
+# one of these directly under the resolved workdir, whose on-disk group is
+# NOT ``ab-agent-<a>`` (or whose mode is owner-only / not group-readable),
+# is the create-time publish gap — operator action is ``isolate --reapply``,
+# NOT a controller supp-group refresh. Kept in lockstep with the shell
+# helper's basename list; HEARTBEAT.md / CHANGE-POLICY.md / AGENTS.md are
+# DELIBERATELY excluded (controller-owned 0600 / shared symlink / codex-only)
+# so they are never misclassified as a publish gap.
+PROFILE_PUBLISH_BASENAMES = (
+    "SOUL.md",
+    "CLAUDE.md",
+    "SESSION-TYPE.md",
+    "MEMORY.md",
+    "MEMORY-SCHEMA.md",
+    "TOOLS.md",
+)
 # #1237: Codex-runtime profile contract. Codex CLI reads ``AGENTS.md`` at
 # the agent home root; it has no SOUL.md / MEMORY*.md / SESSION-TYPE.md
 # equivalent (those are Claude-only conventions). ``.codex/hooks.json`` is
@@ -104,6 +124,17 @@ class AgentWatch:
     #   - "iso-uid-side": the iso UID itself cannot read its own workdir
     #     (mode/ownership corruption, broken ACL, missing setgid bit).
     #     Genuine drift; admin action required.
+    #   - "publish-gap" (#1520c): a Claude identity profile file
+    #     (SOUL/CLAUDE/SESSION-TYPE/MEMORY/MEMORY-SCHEMA/TOOLS.md) directly
+    #     under the resolved workdir is owner-only / wrong-group
+    #     (`iso-uid:<controller-group> 0600`) instead of the published
+    #     contract `iso-uid:ab-agent-<a> 0660`. This is the create-time
+    #     publish gap (the iso UID owns + can read the file, but the
+    #     controller cannot because the group was never flipped to
+    #     ab-agent-<a>). A supp-group refresh will NOT fix it — operator
+    #     action is `agent-bridge isolate <a> --reapply`. Distinct from
+    #     controller-cache-stale, where the metadata ALREADY matches the
+    #     published contract and only the controller's group cache is stale.
     error_category: str = ""
     # #1266 (v0.15.0-beta4 Lane G, r3 quiet-by-default): fresh-install
     # detection. True only when an explicit positive signal is present —
@@ -372,6 +403,136 @@ def _sudo_test(os_user: str, flag: str, path: Path) -> int | None:
     if rc == 127:
         return None
     return rc
+
+
+def _workdir_published_group(workdir: Path, iso_user: str | None) -> str | None:
+    """Expected group for a published profile file = the workdir DIR's own
+    group (the setgid-inheritance contract anchor).
+
+    The iso v2 publish contract is setgid inheritance: a profile file must
+    carry the SAME group as its ``2770`` parent workdir. On a first-time
+    create the workdir DIRECTORY is reliably normalized to ``ab-agent-<a>``
+    via a root step even when the profile FILES are missed (the exact
+    #1520c gap), so the workdir's own group IS the ground-truth contract
+    anchor for "what group should these files carry".
+
+    Deriving the expected group from the DIR — rather than string-swapping
+    the iso username's ``agent-bridge-`` prefix to ``ab-agent-`` — is
+    name-length-agnostic and never drifts from
+    ``bridge_isolation_v2_agent_group_name``. That shell policy keeps the
+    FULL agent segment on Darwin but HASH-TRUNCATES on Linux when the
+    composed ``ab-agent-<agent>`` name would exceed groupadd's 32-char
+    limit, while the OS user name (``agent-bridge-<agent>``) is
+    INDEPENDENTLY truncated to 32 chars by ``bridge_agent_default_os_user``.
+    For a long agent name those two truncations diverge, so a naive prefix
+    swap of the iso username yields a group that does NOT match the real
+    per-agent group — misclassifying a correctly-published long-name agent
+    as a publish gap. Reading the dir's actual group sidesteps the policy
+    entirely.
+
+    Resolved via the same iso-owner ``stat`` probe (and the same
+    ``BRIDGE_WATCHDOG_TEST_PROFILE_META_JSON`` test seam) as the file
+    metadata — the workdir path is just another path key. Returns ``None``
+    when the dir group cannot be resolved, in which case the caller does
+    NOT over-claim a publish gap.
+    """
+    dir_meta = _profile_path_group_mode(str(workdir), iso_user)
+    if dir_meta is None:
+        return None
+    grp = (dir_meta[0] or "").strip()
+    return grp or None
+
+
+def _profile_path_group_mode(
+    error_path: str, iso_user: str | None
+) -> tuple[str, str] | None:
+    """Return ``(group_name, octal_mode)`` for ``error_path``, or ``None``.
+
+    Read via the iso OWNER (``sudo -n -u <iso_user> stat -c '%G:%a'``):
+    the iso UID always owns + can stat its own profile file even when the
+    controller cannot (the exact create-time publish-gap condition). The
+    mode is the low three octal digits (``%a``) so a comparison against
+    the ``0660`` contract is straightforward.
+
+    Test seam: ``BRIDGE_WATCHDOG_TEST_PROFILE_META_JSON`` points to a JSON
+    file mapping ``{"<error-path>": "<group>:<octal-mode>", ...}`` so the
+    smoke can exercise the publish-gap branch on a non-Linux dev host
+    where the real ``sudo -n -u`` probe cannot run. The seam ONLY engages
+    when the env var is set; production paths use the live owner+sudo
+    probe.
+    """
+    seam = _profile_meta_test_override(error_path)
+    if seam is not None:
+        return seam
+    if not iso_user or not error_path or _sudo_run_as_capture_canonical is None:
+        return None
+    try:
+        proc = _sudo_run_as_capture_canonical(
+            iso_user, "stat", "-c", "%G:%a", error_path
+        )
+    except Exception:  # noqa: BLE001 — probe is best-effort; any failure → None
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or "").strip()
+    if ":" not in out:
+        return None
+    grp, _, mode = out.partition(":")
+    grp = grp.strip()
+    mode = mode.strip()
+    if not grp or not mode:
+        return None
+    return (grp, mode)
+
+
+def _profile_meta_test_override(error_path: str) -> tuple[str, str] | None:
+    """Read the ``BRIDGE_WATCHDOG_TEST_PROFILE_META_JSON`` test seam.
+
+    Returns ``(group, octal_mode)`` when the seam is active and the path
+    is mapped; ``None`` otherwise (the live probe path is then used).
+    """
+    seam_path = os.environ.get("BRIDGE_WATCHDOG_TEST_PROFILE_META_JSON", "").strip()
+    if not seam_path:
+        return None
+    try:
+        with open(seam_path, encoding="utf-8") as fh:  # noqa: raw-pathlib-controller-only — controller-side test seam only
+            mapping = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(mapping, dict):
+        return None
+    raw = mapping.get(error_path)
+    if not isinstance(raw, str) or ":" not in raw:
+        return None
+    grp, _, mode = raw.partition(":")
+    grp = grp.strip()
+    mode = mode.strip()
+    if not grp or not mode:
+        return None
+    return (grp, mode)
+
+
+def _profile_mode_is_owner_only(mode: str) -> bool:
+    """True when the octal ``mode`` grants the OWNER read but NOT the group.
+
+    The publish-gap contract requires the file be GROUP-readable (mode
+    ``0660`` → group digit ``6``). A mode whose group digit lacks the
+    read bit (e.g. ``0600`` → group digit ``0``) is owner-only and is a
+    publish gap regardless of the group name. Tolerant of 3- or 4-digit
+    octal strings; on a malformed mode returns ``False`` (do not
+    over-claim a publish gap on unparseable metadata).
+    """
+    digits = mode.lstrip("0") or "0"
+    if len(mode) >= 3:
+        group_digit = mode[-2]
+    else:
+        return False
+    try:
+        gd = int(group_digit, 8)
+    except ValueError:
+        return False
+    # Group read bit is 0o4. Missing → owner-only (publish gap).
+    return (gd & 0o4) == 0
 
 
 def resolve_scan_path(
@@ -852,7 +1013,7 @@ def classify_scan_error_category(
     iso_user: str | None = None,
 ) -> str:
     """Split the scan_error rows into operator-actionable buckets
-    (Lane G #1254 + r2).
+    (Lane G #1254 + r2; publish-gap #1520c).
 
     Rules:
       * Empty ``error_kind`` (= no error) → empty string.
@@ -865,11 +1026,26 @@ def classify_scan_error_category(
         denial is structural (e.g. parent mode 0000, missing ancestor)
         and not something a supp-group refresh will fix.
       * ``error_kind == "permission_denied"``, workdir IS statable, AND
+        the failing ``error_path`` is one of the six Claude identity
+        profile files (PROFILE_PUBLISH_BASENAMES) directly under the
+        workdir whose on-disk GROUP is NOT ``ab-agent-<a>`` (or whose
+        mode is owner-only / not group-readable) → "publish-gap"
+        (#1520c). This is the create-time gap: the iso UID owns + can
+        read the file (so the iso readability probe below would mislabel
+        it "controller-cache-stale"), but the controller can never read
+        it because the group was never flipped to ``ab-agent-<a>``. The
+        single-path metadata check runs BEFORE the iso readability probe
+        precisely so it is not shadowed. Operator action: re-run
+        ``agent-bridge isolate <a> --reapply``.
+      * ``error_kind == "permission_denied"``, workdir IS statable, AND
         the iso UID can read the failing ``error_path`` →
         "controller-cache-stale". This is the #1246 shape: the workdir
         + file are chmod'd ab-agent-<a> mode 0660 but the controller
         process's supplementary-group cache does not include that
-        group. A fresh shell would read it fine.
+        group. A fresh shell would read it fine. PRESERVED: when the
+        metadata already MATCHES the published contract (group =
+        ab-agent-<a>, group-readable mode) the publish-gap check above
+        does not fire and this genuine cache-stale verdict stands.
       * ``error_kind == "permission_denied"``, workdir IS statable, AND
         the iso UID ALSO cannot read the failing path → "iso-uid-side".
         Real file-permission corruption (mode 0000, broken ownership,
@@ -910,6 +1086,41 @@ def classify_scan_error_category(
             return "iso-uid-side"
     except (PermissionError, OSError):
         return "iso-uid-side"
+    # Resolve the iso owner up-front: both the publish-gap metadata check
+    # (#1520c) and the iso readability probe below need it.
+    iso_owner = iso_user
+    if iso_owner is None and _isolated_workdir_owner_canonical is not None:
+        try:
+            iso_owner = _isolated_workdir_owner(workdir)
+        except (PermissionError, OSError):
+            iso_owner = None
+    # #1520c publish-gap check — runs BEFORE the iso readability probe so a
+    # readable-by-iso-but-wrong-group profile file is not mislabeled
+    # "controller-cache-stale". Only fires for a permission_denied on one
+    # of the six Claude identity profile basenames sitting DIRECTLY under
+    # the resolved workdir (single-path, no recursive scan). When that
+    # file's on-disk group is NOT ``ab-agent-<a>`` OR its mode is owner-
+    # only / not group-readable, the publish never happened → "publish-gap"
+    # (operator action: re-run isolate). When the metadata MATCHES the
+    # published contract (group ab-agent-<a> + group-readable) the check
+    # does NOT fire and the genuine cache-stale verdict below is preserved.
+    try:
+        err_p = Path(error_path) if error_path else None
+    except (TypeError, ValueError):
+        err_p = None
+    if (
+        err_p is not None
+        and err_p.name in PROFILE_PUBLISH_BASENAMES
+        and err_p.parent == workdir
+    ):
+        expected_group = _workdir_published_group(workdir, iso_owner)
+        meta = _profile_path_group_mode(error_path, iso_owner)
+        if expected_group and meta is not None:
+            on_disk_group, on_disk_mode = meta
+            if on_disk_group != expected_group or _profile_mode_is_owner_only(
+                on_disk_mode
+            ):
+                return "publish-gap"
     # Workdir statable + permission_denied. Use the iso UID readability
     # probe to disambiguate "controller's supp-group cache is stale"
     # (iso readable, controller not) from "real iso-side file permission
@@ -927,12 +1138,6 @@ def classify_scan_error_category(
         return "controller-cache-stale"
     if probe == "denied":
         return "iso-uid-side"
-    iso_owner = iso_user
-    if iso_owner is None and _isolated_workdir_owner_canonical is not None:
-        try:
-            iso_owner = _isolated_workdir_owner(workdir)
-        except (PermissionError, OSError):
-            iso_owner = None
     if iso_owner and error_path and _sudo_run_as_canonical is not None:
         probe_rc = _sudo_test(iso_owner, "-r", Path(error_path))
         if probe_rc == 0:
@@ -1303,8 +1508,17 @@ def scan_agent(
             f"path={error_path}",
             file=sys.stderr,
         )
+        # #1520c: thread the agent's iso owner so the classifier can run
+        # the single-path publish-gap metadata check (and the existing iso
+        # readability probe) with explicit agent context rather than
+        # re-deriving it from the workdir owner alone.
+        scan_iso_user = None
+        try:
+            scan_iso_user = _isolated_workdir_owner(agent_dir)
+        except (PermissionError, OSError):
+            scan_iso_user = None
         error_category = classify_scan_error_category(
-            error_kind, str(error_path), agent_dir
+            error_kind, str(error_path), agent_dir, scan_iso_user
         )
         return AgentWatch(
             agent=resolved_name,
@@ -1628,8 +1842,19 @@ def main() -> int:
                 workdir_candidate = Path(workdir_str_for_check).expanduser()
             else:
                 workdir_candidate = path
+            # #1520c: thread the iso owner from the workdir candidate so the
+            # classifier's single-path publish-gap metadata check has
+            # explicit agent context. Exception-tolerant — an unreachable
+            # workdir simply yields None and the classifier falls back to
+            # its own workdir-owner resolution.
+            outer_iso_user = None
+            if workdir_candidate is not None:
+                try:
+                    outer_iso_user = _isolated_workdir_owner(workdir_candidate)
+                except (PermissionError, OSError):
+                    outer_iso_user = None
             error_category = classify_scan_error_category(
-                error_kind, error_path, workdir_candidate
+                error_kind, error_path, workdir_candidate, outer_iso_user
             )
             # Pass the registry's workdir candidate as an extra SESSION-
             # TYPE.md search dir so the auto-detect honors an iso-v2
