@@ -587,6 +587,24 @@ bridge_daemon_pid_file_cleanup_should_remove() {
   [[ -z "$recorded" || "$recorded" == "$exiting_pid" ]]
 }
 
+# Issue #1463 (codex #9603 B2) — active-agent guard predicate for cmd_restart.
+# The launchd restart fast-path returns BEFORE cmd_stop, so it must enforce
+# the SAME #314 Layer 3 active-agent guard cmd_stop applies, or a BARE
+# `restart` (no --force) would silently bypass it on a launchd install (a
+# subsequent restart picking up stale AGENT_SESSION_IDs is the #314 cascade).
+# Returns 0 ("REFUSE this restart") when NO --force was given AND active agent
+# sessions exist; returns 1 ("proceed") when --force is present OR no active
+# agents. Extracted as a standalone, sourceable predicate so the smoke tests
+# the SHIPPED decision (not an inline copy — codex r1 acceptance §5).
+bridge_daemon_restart_should_refuse_active_agents() {
+  local force_flag="$1"
+  # --force present → sanctioned recovery/automation path, never refuse.
+  [[ -z "$force_flag" ]] || return 1
+  local _active_count=0
+  _active_count="$(bridge_active_agent_ids 2>/dev/null | grep -c . || true)"
+  [[ "$_active_count" =~ ^[0-9]+$ ]] && (( _active_count > 0 ))
+}
+
 _bridge_daemon_on_exit() {
   local ec=$?
   local sig="${BRIDGE_LAST_SIGNAL:-none}"
@@ -11816,6 +11834,25 @@ cmd_restart() {
   # Skipped entirely when an internal group-refresh reason is set: that
   # path must run the in-process stop+start so PAM/initgroups rebuilds the
   # supplementary group set (a launchd kickstart would not re-resolve it).
+  # codex #9603 B2 — the launchd fast-path returns BEFORE cmd_stop, so it
+  # must enforce the SAME active-agent guard (#314 Layer 3) cmd_stop applies,
+  # or a BARE `restart` (no --force) would silently bypass it on a launchd
+  # install. Sanctioned automation (supervisors, upgrader) passes --force;
+  # a bare operator restart with active agents present is refused unless
+  # --force — identical contract to `cmd_stop`. (Internal group-refresh
+  # restarts never reach the fast-path; non-launchd installs fall through to
+  # cmd_stop, which applies the same guard.)
+  if [[ -z "$internal_reason" ]] \
+     && bridge_daemon_restart_should_refuse_active_agents "$force_flag"; then
+    local _restart_active_count=0
+    _restart_active_count="$(bridge_active_agent_ids 2>/dev/null | grep -c . || true)"
+    daemon_warn "Refusing daemon restart: $_restart_active_count active agent session(s) detected. Use 'agent-bridge upgrade --apply' (handles stop+start+relaunch), or re-run with --force for the recovery/wedged-host case."
+    bridge_audit_log daemon daemon_restart_refused daemon \
+      --detail reason=active_agents_present \
+      --detail active_count="$_restart_active_count" >/dev/null 2>&1 || true
+    return 1
+  fi
+
   if [[ -z "$internal_reason" ]] \
      && command -v bridge_daemon_launchd_restart >/dev/null 2>&1; then
     local launchd_rc=0

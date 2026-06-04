@@ -1521,18 +1521,24 @@ bridge_daemon_launchd_restart() {
   local job_pid=""
   job_pid="$(_bridge_daemon_launchd_job_pid "$label" 2>/dev/null || true)"
 
-  # Only enforce the split guard when we can read BOTH a live recorded pid
-  # AND launchd's job pid. If the recorded pid is alive but differs from
-  # the launchd job pid, that IS the out-of-band split → refuse.
+  # FAIL CLOSED on an out-of-band split (codex #9603 B1). A live recorded
+  # daemon pid is safe to kickstart over ONLY when launchd PROVES that same
+  # pid is its supervised job (job_pid non-empty AND == recorded_pid).
+  # Otherwise — launchd reports a DIFFERENT pid, OR launchd has NO current
+  # job pid (it is between KeepAlive attempts / lock-starved) — the live
+  # recorded holder is out-of-band: a kickstart would cycle the lock-starved
+  # supervised slot while the real holder survives, leaving the thrash armed
+  # and the supervisor falsely reporting success. Refuse. (A non-live /
+  # absent recorded pid means no holder to displace → kickstart is safe.)
   if [[ -n "$recorded_pid" ]] && kill -0 "$recorded_pid" 2>/dev/null \
-     && [[ -n "$job_pid" ]] && [[ "$recorded_pid" != "$job_pid" ]]; then
+     && { [[ -z "$job_pid" ]] || [[ "$recorded_pid" != "$job_pid" ]]; }; then
     command -v bridge_audit_log >/dev/null 2>&1 \
       && bridge_audit_log daemon daemon_launchd_restart_refused daemon \
            --detail reason="$reason" \
            --detail recorded_pid="$recorded_pid" \
-           --detail launchd_job_pid="$job_pid" \
+           --detail launchd_job_pid="${job_pid:-none}" \
            --detail label="$label" >/dev/null 2>&1 || true
-    bridge_warn "daemon-launchd: refusing kickstart — recorded daemon pid=$recorded_pid is not launchd's job pid=$job_pid (out-of-band split). Run 'bridge-daemon.sh stop --force' once to reconcile, then KeepAlive will respawn the supervised slot."
+    bridge_warn "daemon-launchd: refusing kickstart — live recorded daemon pid=$recorded_pid is not proven to be launchd's job pid=${job_pid:-<none>} (out-of-band split). Run 'bridge-daemon.sh stop --force' once to reconcile, then KeepAlive will respawn the supervised slot."
     return 2
   fi
 

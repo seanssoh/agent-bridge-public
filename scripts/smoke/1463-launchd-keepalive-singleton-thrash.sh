@@ -194,6 +194,25 @@ else
 fi
 
 # ===========================================================================
+# B2 — split guard, NO-CURRENT-LAUNCHD-JOB case (TEETH, codex #9603 B1):
+#      the recorded daemon pid is ALIVE but launchd reports NO current job
+#      pid (it is between KeepAlive attempts / lock-starved). The live holder
+#      is therefore UNPROVEN as launchd's job → must REFUSE (rc=2), NO
+#      kickstart. Before the fix the empty job pid skipped the guard and fell
+#      through to kickstart (rc=0), leaving the real holder + the thrash armed.
+# ===========================================================================
+reset_kickstart
+printf '%s\n' "$DAEMON_STUB_PID" >"$BRIDGE_DAEMON_PID_FILE"
+# LAUNCHD_JOB_PID deliberately UNSET → fake `launchctl print` emits no pid.
+FAKE_OS="Darwin" bridge_daemon_launchd_restart "smoke-B2" >/dev/null 2>&1
+rc=$?
+if (( rc == 2 )) && [[ "$(kickstart_count)" -eq 0 ]]; then
+  _pass "B2: live recorded pid + launchd reports NO job pid is REFUSED (rc=2), no kickstart"
+else
+  _fail "B2: no-job-pid split refusal" "rc=$rc kickstart_count=$(kickstart_count) (expected rc=2, 0 kickstarts — the fix must fail closed when launchd cannot prove the live pid is its job)"
+fi
+
+# ===========================================================================
 # C — non-launchd (Linux systemd/nohup shape): no marker + no plist → rc=1
 #     so the caller falls through to its existing stop+start. No kickstart.
 # ===========================================================================
@@ -350,6 +369,53 @@ PROBE
     _pass "E2: daemon_status resolves RUNNING via mkdir-lock owner.pid fallback ($e2_out)"
   else
     _fail "E2: status owner.pid fallback" "got '$e2_out' (expected 'RUNNING $DAEMON_STUB_PID')"
+  fi
+fi
+
+# ===========================================================================
+# F — bare-restart active-agent guard (TEETH, codex #9603 B2). The launchd
+#     restart fast-path returns BEFORE cmd_stop, so cmd_restart must enforce
+#     the same #314 Layer 3 active-agent guard or a bare `restart` (no --force)
+#     would bypass it on a launchd install. Source the SHIPPED predicate
+#     bridge_daemon_restart_should_refuse_active_agents (not a copy) and stub
+#     the agent enumerator — a revert dropping the guard fails F1.
+# ===========================================================================
+GUARD2_FN="$SMOKE_DIR/restart-active-guard.sh"
+awk '
+  /^bridge_daemon_restart_should_refuse_active_agents\(\)[[:space:]]*\{/ { capture=1 }
+  capture { print }
+  capture && /^\}[[:space:]]*$/ { exit }
+' "$DAEMON_SH" >"$GUARD2_FN" 2>/dev/null || true
+if [[ -s "$GUARD2_FN" ]]; then
+  # shellcheck source=/dev/null
+  source "$GUARD2_FN"
+fi
+if ! command -v bridge_daemon_restart_should_refuse_active_agents >/dev/null 2>&1; then
+  _fail "F: extract shipped restart guard" "bridge_daemon_restart_should_refuse_active_agents not found in $DAEMON_SH"
+else
+  # Stub the active-agent enumerator; ACTIVE_AGENTS controls the count.
+  # shellcheck disable=SC2329  # invoked indirectly by the sourced predicate
+  bridge_active_agent_ids() { local i; for ((i=0; i<${ACTIVE_AGENTS:-0}; i++)); do printf 'agent%s\n' "$i"; done; }
+
+  # F1 — bare restart (no --force) WITH active agents → REFUSE (returns 0).
+  if ACTIVE_AGENTS=2 bridge_daemon_restart_should_refuse_active_agents ""; then
+    _pass "F1: bare restart with active agents is refused (guard returns 0) — launchd fast-path can't bypass #314"
+  else
+    _fail "F1: bare-restart active-agent guard" "guard did not refuse with 2 active agents + no --force"
+  fi
+
+  # F2 — --force WITH active agents → PROCEED (returns 1).
+  if ACTIVE_AGENTS=2 bridge_daemon_restart_should_refuse_active_agents "--force"; then
+    _fail "F2: --force override" "guard refused even with --force (sanctioned recovery path must proceed)"
+  else
+    _pass "F2: --force proceeds past the active-agent guard"
+  fi
+
+  # F3 — bare restart with NO active agents → PROCEED (returns 1).
+  if ACTIVE_AGENTS=0 bridge_daemon_restart_should_refuse_active_agents ""; then
+    _fail "F3: no-active proceed" "guard refused with zero active agents (should proceed)"
+  else
+    _pass "F3: bare restart with no active agents proceeds"
   fi
 fi
 
