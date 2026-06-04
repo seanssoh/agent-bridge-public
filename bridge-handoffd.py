@@ -830,6 +830,17 @@ class HandoffHandler(BaseHTTPRequestHandler):
         if self.path == identity_update_path:
             self._handle_identity_update(cfg)
             return
+        # A2A Rooms P4.1 (design §11 / §14 R3): the signed cross-node
+        # room-join-request is ALSO routed to a SEPARATE handler with the same
+        # fail-closed auth preamble (remote_addr -> HMAC -> skew -> dedupe). Its
+        # terminal action is a token-verified PENDING join row — it NEVER reaches
+        # the enqueue/allowlist/queue boundary, creates no leader task, and
+        # admits nothing (approve is P4.2).
+        room_join_path = cfg.get("listen", {}).get(
+            "room_join_path", a2a.ROOM_JOIN_PATH)
+        if self.path == room_join_path:
+            self._handle_room_join_request(cfg)
+            return
         if self.path != enqueue_path:
             self._reply(404, {"ok": False, "error": "not found"})
             return
@@ -1494,6 +1505,423 @@ class HandoffHandler(BaseHTTPRequestHandler):
             return "new"
         finally:
             conn.close()
+
+    def _handle_room_join_request(self, cfg: dict[str, Any]) -> None:
+        """Receiver branch for the signed cross-node room-join-request
+        (A2A Rooms P4.1, design §11 / §14 R3).
+
+        HIGH-RISK: this is the only NEW remote-traffic surface in P4.1. It runs
+        the SAME fail-closed auth preamble as do_POST / _handle_identity_update
+        (NO step weakened), then performs the room-specific verification and
+        persists a PENDING join row. Validation ORDER (security=True audit on
+        every reject; NO persistence until ALL pass):
+          a. tailnet-only bind — guaranteed at startup (resolve_bind).
+          b. protocol tag == ROOM_JOIN_PROTOCOL_VERSION.
+          c. message_id REQUIRED (anchors dedupe + is in the signed canonical).
+          d. peer ALREADY PAIRED (find_peer; unknown -> 403). NOT discovery.
+          e. remote_addr == the peer's CURRENT resolved Tailscale IP (before
+             the body is read off the socket).
+          f. HMAC: secret present, body hash, signature (constant-time). The
+             request PATH is in the canonical string, so an enqueue/identity
+             signature cannot be replayed against this endpoint.
+          g. clock-skew window — transient drift 503, far-stale 401.
+          h. durable dedupe (replay-safe) on message_id.
+          i. parse the control body (shape only — never trusts the joiner id
+             beyond the node-link auth already enforced).
+          j. room is on THIS node (leader_node == this node) — else 404; a node
+             that does not lead the room has no authority to admit/queue it.
+          k. token verify: hash compare + TTL + revocation (verify_invite_token_
+             outcome). expired/revoked/mismatch -> 403, NO pending row.
+          l. rate-limit per (token-hash, SOURCE NODE) — a leaked reusable token
+             cannot mint unbounded pending rows from one node.
+          m. persist a VERIFIED pending row anchored to `joiner_agent` (the
+             OS-actor attestation made by node B) @ the HMAC-AUTHENTICATED
+             sender bridge as the node (NEVER a wire-asserted node). NO
+             membership add, NO leader task, NO token/hash in the row/audit.
+        """
+        client_ip = self._client_ip()
+        peer_id = self.headers.get("X-AGB-Peer", "")
+        message_id = self.headers.get("X-AGB-Message-Id", "")
+        timestamp = self.headers.get("X-AGB-Timestamp", "")
+        body_hash_hdr = self.headers.get("X-AGB-Body-SHA256", "")
+        signature = self.headers.get("X-AGB-Signature", "")
+        protocol = self.headers.get("X-AGB-Protocol", "")
+
+        # --- b. protocol tag ---
+        if protocol != a2a.ROOM_JOIN_PROTOCOL_VERSION:
+            audit("room_join_reject", reason="bad_protocol",
+                  peer=peer_id, client=client_ip, got=protocol)
+            self._reply(400, {"ok": False, "error": "unsupported protocol"})
+            return
+
+        # --- c. message_id REQUIRED (non-empty) ---
+        if not message_id:
+            audit("room_join_reject", reason="missing_message_id",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(400, {"ok": False, "error": "message id required"})
+            return
+
+        # --- d. peer must be ALREADY PAIRED (not a discovery channel) ---
+        try:
+            peer = a2a.find_peer(cfg, peer_id)
+        except a2a.A2AError:
+            audit("room_join_reject", reason="unknown_peer",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(403, {"ok": False, "error": "unknown peer"})
+            return
+
+        # --- e. remote_addr == authenticated peer's CURRENT address (before body) ---
+        try:
+            peer_addr = a2a.resolve_peer_address(peer)
+        except a2a.A2AError as exc:
+            audit("room_join_reject", reason=getattr(exc, "code",
+                  "resolve_error"), peer=peer_id, client=client_ip,
+                  security=True)
+            self._reply(403, {"ok": False, "error": "source address mismatch"})
+            return
+        if not peer_addr or client_ip != peer_addr:
+            audit("room_join_reject", reason="addr_mismatch",
+                  peer=peer_id, client=client_ip, expected=peer_addr,
+                  security=True)
+            self._reply(403, {"ok": False, "error": "source address mismatch"})
+            return
+
+        # --- size guard before reading the body (tiny control body) ---
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = -1
+        if content_length < 0:
+            self._reply(411, {"ok": False, "error": "length required"})
+            return
+        max_body = 8 * 1024
+        if content_length > max_body:
+            audit("room_join_reject", reason="oversize",
+                  peer=peer_id, client=client_ip, declared=content_length)
+            self._reply(413, {"ok": False, "error": "body too large"})
+            return
+        raw = self.rfile.read(content_length) if content_length else b""
+
+        # --- f. HMAC: secret present, body hash, signature (auth boundary) ---
+        secrets = a2a.peer_secrets(peer)
+        if not secrets:
+            audit("room_join_reject", reason="no_secret",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(403, {"ok": False, "error": "peer not provisioned"})
+            return
+        computed_hash = a2a.body_sha256(raw)
+        if body_hash_hdr != computed_hash:
+            audit("room_join_reject", reason="body_hash",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(401, {"ok": False, "error": "body hash mismatch"})
+            return
+        # HMAC FIRST (before timestamp-band classification) so an
+        # unauthenticated request never receives a transient/permanent split
+        # that leaks signature validity (same ordering as do_POST, #1346). The
+        # path is part of the canonical string, so an enqueue signature cannot
+        # be replayed against this control endpoint.
+        canonical = a2a.canonical_string(
+            "POST", self.path, peer_id, message_id, timestamp, computed_hash)
+        if not a2a.verify_signature(secrets, canonical, signature):
+            audit("room_join_reject", reason="bad_signature",
+                  peer=peer_id, client=client_ip, message_id=message_id,
+                  security=True)
+            self._reply(401, {"ok": False, "error": "signature verification failed"})
+            return
+
+        # --- g. clock-skew window (authenticated past this point) ---
+        skew = int(cfg.get("timestamp_skew_seconds",
+                           a2a.DEFAULT_TIMESTAMP_SKEW_SECONDS))
+        grace_skew = int(cfg.get("timestamp_skew_grace_seconds",
+                                 a2a.DEFAULT_TIMESTAMP_SKEW_GRACE_SECONDS))
+        if grace_skew < skew:
+            grace_skew = skew
+        receiver_now = a2a.now_ts()
+        try:
+            req_ts = int(timestamp)
+        except (TypeError, ValueError):
+            audit("room_join_reject", reason="bad_timestamp",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(401, {"ok": False, "error": "bad timestamp"})
+            return
+        ts_delta = abs(receiver_now - req_ts)
+        if ts_delta > grace_skew:
+            audit("room_join_reject", reason="clock_skew_permanent",
+                  peer=peer_id, client=client_ip, delta_seconds=ts_delta,
+                  security=True)
+            self._reply(401, {"ok": False,
+                              "error": "timestamp far outside skew window",
+                              "receiver_ts": receiver_now})
+            return
+        if ts_delta > skew:
+            audit("room_join_reject", reason="clock_skew_transient",
+                  peer=peer_id, client=client_ip, delta_seconds=ts_delta)
+            self._reply(503, {"ok": False,
+                              "error": "timestamp outside skew window — retry",
+                              "receiver_ts": receiver_now},
+                        extra_headers={"Retry-After": str(max(1, skew))})
+            return
+
+        # --- h. durable dedupe — READ-ONLY replay check (codex P4.1 r1/r2) ---
+        # CRITICAL: only a PREVIOUSLY-ACCEPTED request may replay as an
+        # idempotent 200. The dedupe ledger lives in rooms.db (NOT inbox.db) so
+        # the reservation commits ATOMICALLY with the pending row on the accept
+        # path (step m); a dedupe row therefore exists IFF a pending row exists.
+        # This read-only lookup gives the fast idempotent/conflict answer for an
+        # ALREADY-ACCEPTED id; a rejected request leaves NO dedupe row, so a
+        # replay re-runs verification and re-rejects (T3/T5 hold on replay). If
+        # rooms.db is absent (this is not the leader node), the lookup is "new"
+        # and the leader-node check (step j) will 404 anyway.
+        if rooms is None:
+            audit("room_join_error", reason="rooms_module_unavailable",
+                  peer=peer_id, client=client_ip, message_id=message_id)
+            self._reply(500, {"ok": False, "error": "rooms unavailable"})
+            return
+        try:
+            ro = rooms.open_rooms_readonly()
+            if ro is not None:
+                try:
+                    dup = rooms.room_join_dedupe_lookup(
+                        ro, message_id, computed_hash)
+                finally:
+                    ro.close()
+            else:
+                dup = "new"
+        except Exception as exc:  # noqa: BLE001 - last-resort guard
+            audit("room_join_error", reason="dedupe_error",
+                  peer=peer_id, client=client_ip, detail=str(exc)[:200])
+            self._reply(500, {"ok": False, "error": "internal error"})
+            return
+        if dup == rooms.JOIN_DEDUPE_DUPLICATE:
+            audit("room_join_accept", reason="duplicate",
+                  peer=peer_id, client=client_ip, message_id=message_id)
+            self._reply(200, {"ok": True, "duplicate": True})
+            return
+        if dup == rooms.JOIN_DEDUPE_CONFLICT:
+            audit("room_join_reject", reason="hash_conflict",
+                  peer=peer_id, client=client_ip, message_id=message_id,
+                  security=True)
+            self._reply(409, {"ok": False,
+                              "error": "message id reused with different body"})
+            return
+
+        # --- i. parse the control body (shape only) ---
+        try:
+            claim = a2a.parse_room_join_request(raw)
+        except a2a.A2AError as exc:
+            audit("room_join_reject", reason=getattr(exc, "code",
+                  "bad_room_join"), peer=peer_id, client=client_ip,
+                  message_id=message_id)
+            self._reply(422, {"ok": False, "error": str(exc)})
+            return
+
+        # (rooms-module availability was already asserted at step h.)
+        room_id = str(claim["room_id"])
+        token_hash = str(claim["join_token_sha256"])
+        joiner_agent = str(claim["joiner_agent"])
+        # The joiner's NODE is the HMAC-authenticated sender bridge — NEVER a
+        # wire-asserted field (contract 2). `peer_id` is the signed X-AGB-Peer
+        # the auth preamble already bound to this connection.
+        joiner_node = peer_id
+        this_node = str(cfg.get("bridge_id") or "")
+
+        # Open the rooms db to verify + persist. A leader-node receiver MUST have
+        # the controller-owned rooms.db; we open it read-write (the verified
+        # pending-row write needs it). open_rooms() creates it if absent, but a
+        # genuine leader node always has it — and a non-leader node fails the
+        # leader-node check below anyway, persisting nothing.
+        try:
+            conn = rooms.open_rooms()
+        except rooms.RoomsError as exc:
+            audit("room_join_error", reason=getattr(exc, "code", "rooms_db"),
+                  peer=peer_id, client=client_ip, message_id=message_id)
+            self._reply(500, {"ok": False, "error": "rooms db error"})
+            return
+        try:
+            room = rooms.get_room(conn, room_id)
+            if room is None:
+                audit("room_join_reject", reason="room_unknown",
+                      peer=peer_id, client=client_ip, room_id=room_id,
+                      message_id=message_id, security=True)
+                self._reply(404, {"ok": False, "error": "room not found"})
+                return
+
+            # --- j. room must be LED BY this node (else we have no authority) ---
+            leader_node = str(room["leader_node"] or "")
+            if leader_node != this_node:
+                audit("room_join_reject", reason="not_leader_node",
+                      peer=peer_id, client=client_ip, room_id=room_id,
+                      message_id=message_id, security=True)
+                self._reply(404, {"ok": False,
+                                  "error": "room not led by this node"})
+                return
+
+            # --- k. token verify: hash + TTL + revocation (NEVER log the hash) ---
+            # The wire carried sha256(token); compare it to the stored hash with
+            # the SAME TTL/revocation semantics verify_invite_token_outcome
+            # applies to a raw token, by hashing through a thin shim. We do NOT
+            # reconstruct the raw token (we never have it) — instead we compare
+            # the presented hash to the stored hash directly with TTL on top.
+            outcome = _room_join_verify_hash(room, token_hash)
+            if outcome != rooms.TOKEN_OK:
+                # outcome is one of mismatch/revoked/expired — a stable,
+                # token-free code, safe to audit.
+                audit("room_join_reject", reason=f"token_{outcome}",
+                      peer=peer_id, client=client_ip, room_id=room_id,
+                      message_id=message_id, security=True)
+                self._reply(403, {"ok": False,
+                                  "error": f"invite token {outcome}"})
+                return
+
+            # --- l. rate-limit per (token-hash, SOURCE NODE) ---
+            # Keyed on the source NODE (the authenticated peer), so a leaked
+            # reusable token cannot mint unbounded pending rows from one node.
+            # record_join_attempt keys its counter on the token HASH internally;
+            # we pass the already-hashed token via the hash-preserving shim so
+            # the raw token is never needed.
+            try:
+                _room_join_rate_check(conn, token_hash, source=joiner_node)
+            except rooms.RoomsError as exc:
+                audit("room_join_reject", reason="rate_limited",
+                      peer=peer_id, client=client_ip, room_id=room_id,
+                      message_id=message_id, security=True)
+                self._reply(429, {"ok": False, "error": str(exc)},
+                            extra_headers={"Retry-After": "120"})
+                return
+
+            # --- m. ACCEPT: reserve the dedupe row + persist the pending row
+            # ATOMICALLY in ONE rooms.db transaction (codex P4.1 r2). Because
+            # both writes commit together (or roll back together), "a dedupe row
+            # exists" is equivalent to "a pending row exists" — there is no window
+            # where a surviving reservation could let a replay return a bogus
+            # idempotent 200 with no pending row. The re-check inside the call
+            # closes the concurrent-replay-reserved-first race, resolving it to
+            # the same idempotent/conflict outcome the read-only lookup would have.
+            ttl_expiry = 0
+            try:
+                ttl = int(room["invite_token_ttl"])
+                if ttl > 0:
+                    ttl_expiry = int(room["invite_token_ts"]) + ttl
+            except (KeyError, IndexError, TypeError, ValueError):
+                ttl_expiry = 0
+            try:
+                outcome = rooms.record_verified_cross_node_join_request_atomic(
+                    conn, message_id=message_id, body_sha256=computed_hash,
+                    peer=peer_id, room_id=room_id, agent=joiner_agent,
+                    node=joiner_node, via_node=joiner_node,
+                    ttl_expiry=ttl_expiry,
+                )
+            except Exception as exc:  # noqa: BLE001 - last-resort guard
+                # The atomic helper rolled BOTH writes back on failure, so no
+                # orphan dedupe row survives → a replay re-runs verification.
+                audit("room_join_error", reason="persist_error",
+                      peer=peer_id, client=client_ip, message_id=message_id,
+                      detail=str(exc)[:200])
+                self._reply(500, {"ok": False, "error": "internal error"})
+                return
+        finally:
+            conn.close()
+
+        if outcome == rooms.JOIN_DEDUPE_DUPLICATE:
+            audit("room_join_accept", reason="duplicate",
+                  peer=peer_id, client=client_ip, message_id=message_id)
+            self._reply(200, {"ok": True, "duplicate": True})
+            return
+        if outcome == rooms.JOIN_DEDUPE_CONFLICT:
+            audit("room_join_reject", reason="hash_conflict",
+                  peer=peer_id, client=client_ip, message_id=message_id,
+                  security=True)
+            self._reply(409, {"ok": False,
+                              "error": "message id reused with different body"})
+            return
+
+        # Audit carries ONLY verified metadata — room id, joiner agent@node,
+        # message id — NEVER the token or its hash (contract 5).
+        audit("room_join_accept", reason="pending",
+              peer=peer_id, client=client_ip, room_id=room_id,
+              joiner=f"{joiner_agent}@{joiner_node}", message_id=message_id)
+        self._reply(200, {"ok": True, "status": rooms.JOIN_PENDING,
+                          "room_id": room_id,
+                          "joiner": f"{joiner_agent}@{joiner_node}"})
+
+
+# --------------------------------------------------------------------------
+# Room-join hash-only verification + rate-limit shims (P4.1)
+# --------------------------------------------------------------------------
+#
+# The wire carries sha256(token), NOT the raw token, so the leader-node receiver
+# never possesses the raw token. The rooms_common verify/rate helpers were
+# written for the single-node path that DOES hold the raw token (it hashes
+# internally). These shims let the receiver apply the SAME TTL/revocation +
+# rate-limit semantics to an already-hashed token without reconstructing the
+# raw value (which is impossible) and without duplicating the rooms_common
+# logic. They live here (the receiver), not in rooms_common, because they are a
+# cross-node-receiver-specific adaptation of the existing primitives.
+
+
+def _room_join_verify_hash(room: Any, token_hash: str) -> str:
+    """Verify a presented token HASH against the room (hash + TTL + revocation).
+
+    Mirrors rooms.verify_invite_token_outcome but takes the hash directly (the
+    receiver never has the raw token). Returns a rooms.TOKEN_* code. The order
+    matches the raw-token path: revocation -> constant-time hash compare ->
+    TTL — so the receiver path can never be MORE permissive than the local path.
+    """
+    import hmac as _hmac
+
+    stored = room["invite_token_sha256"]
+    if not stored:
+        return rooms.TOKEN_REVOKED
+    if not _hmac.compare_digest(str(stored), token_hash):
+        return rooms.TOKEN_MISMATCH
+    try:
+        ttl = int(room["invite_token_ttl"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        ttl = 0
+    if ttl > 0:
+        try:
+            issued = int(room["invite_token_ts"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            issued = 0
+        if issued + ttl < a2a.now_ts():
+            return rooms.TOKEN_EXPIRED
+    return rooms.TOKEN_OK
+
+
+def _room_join_rate_check(conn: Any, token_hash: str, *, source: str) -> None:
+    """Per-(token-hash, source-node) rate limit using the room_join_rate table.
+
+    Mirrors rooms.record_join_attempt's counter logic but keys directly on the
+    already-known token HASH (the receiver does not have the raw token to hash).
+    Raises rooms.RoomsError(code='rate_limited') past the ceiling. Kept in lock-
+    step with rooms.record_join_attempt's DEFAULT ceiling + schema.
+    """
+    limit = rooms.DEFAULT_JOIN_RATE_LIMIT_PER_TOKEN
+    ts = rooms.now_ts()
+    row = conn.execute(
+        "SELECT attempts FROM room_join_rate WHERE token_sha256=? AND source=?",
+        (token_hash, source),
+    ).fetchone()
+    attempts = (int(row["attempts"]) if row else 0) + 1
+    if row:
+        conn.execute(
+            "UPDATE room_join_rate SET attempts=?, last_ts=? "
+            "WHERE token_sha256=? AND source=?",
+            (attempts, ts, token_hash, source),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO room_join_rate (token_sha256, source, attempts, "
+            "first_ts, last_ts) VALUES (?, ?, ?, ?, ?)",
+            (token_hash, source, attempts, ts, ts),
+        )
+    conn.commit()
+    if attempts > limit:
+        raise rooms.RoomsError(
+            "join rate limit exceeded for this invite token "
+            f"(source node, {attempts} attempts > {limit})",
+            code="rate_limited",
+        )
 
 
 # --------------------------------------------------------------------------
