@@ -60,7 +60,33 @@ set -uo pipefail
 # common cases.
 builtin unset -f exec source command builtin unset printf read echo mktemp chmod \
          rm cat dirname cd pwd trap export local python3 python uname env \
-         claude codex head readlink bash sh true false 2>/dev/null || builtin true
+         claude codex head readlink bash sh set true false 2>/dev/null || builtin true
+
+# #1520 r5 (codex Phase-4 BLOCKING): clear inherited allexport at TRUE process
+# entry — BEFORE the STEP A `_bridge_run_tok_*` token captures (below) and any
+# proven-flag bare assignment. A caller-controlled BASH_ENV (sourced by bash
+# before line 1) can run `set -a` (allexport), under which every later BARE
+# assignment is EXPORTED to child processes instead of staying process-local —
+# leaking the captured credential values to the first `$()` command-sub fork
+# AND re-exporting the keychain-free proven flag to the launched Claude child.
+# `set +a` stops auto-exporting FUTURE assignments (it does not unset anything
+# the script legitimately exports later via an explicit `export`), so STEP A's
+# captures, the proven-flag lifecycle, and the loop counters all stay
+# process-local. Use `builtin set` (and `set` is in the `builtin unset -f`
+# shadow-strip above) so a caller `set(){ :; }` FUNCTION shadow cannot no-op it.
+#
+# Boundary (deferred #1454, the SAME boundary the credential STEP A capture
+# already lives under): this clear — like the entire STEP A scrub and the
+# `builtin unset -f` shadow-strip — is itself written with `builtin`. A caller
+# that shadows the `builtin` KEYWORD (`builtin(){ :; }` via BASH_ENV) defeats
+# `builtin set +a`, `builtin unset -f`, AND STEP A's `builtin printf`/scrub
+# alike — but such a caller "already controls our process environment entirely"
+# (same-UID-controls-invocation-env) and the operator token would leak through
+# STEP A regardless of #1520. So #1520's allexport clear inherits exactly the
+# pre-existing #1454 boundary; it introduces no NEW weakness. Closing the
+# `builtin`-keyword shadow is the #1454 work item, out of scope here. The
+# `bash -p` re-exec below is the belt for the lesser (non-`builtin`) shadows.
+builtin set +a
 
 # Caller startup-file + xtrace hooks (#1444 BLOCKING, codex round-3 / parallel
 # #1443): BASH_ENV / ENV name a file that EVERY non-interactive non-privileged
@@ -158,6 +184,21 @@ _bridge_run_tok_anthropic_key="${_bridge_run_tok_anthropic_key:-${ANTHROPIC_API_
 _bridge_run_tok_anthropic_auth="${_bridge_run_tok_anthropic_auth:-${ANTHROPIC_AUTH_TOKEN:-}}"
 unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 
+# #1520 r4 (codex Phase-4 BLOCKING): scrub the proven-keychain-free TRUST flag
+# at TRUE process entry — here, alongside the STEP A credential scrub, BEFORE
+# the `_bridge_run_pick` `$()` subshells below, the candidate-version probe
+# forks, and the privileged `bash -p` re-exec. `unset` removes BOTH the value
+# AND the export attribute, so an INHERITED exported
+# `BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1` from the parent env cannot
+# reach any early child / re-exec as a spoofed "proven" signal. A BARE `=0`
+# assignment would NOT suffice: assigning over an inherited exported var keeps
+# the export attribute (`env VAR=1 bash -c 'VAR=0; bash -c "echo \$VAR"'`
+# prints 0 — the child still SEES it). The flag is only ever a process-local
+# shell var afterward (the preflight sets/resets it with bare assignments,
+# which create a NON-exported var once the inherited export attribute is gone);
+# it must NEVER be exported, so the launched Claude child never inherits it.
+unset BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED
+
 # Bind the externals that run while the captured credential is reachable
 # (mktemp/chmod/rm during the optional self-re-exec transit) to HARDCODED ABSOLUTE
 # paths — a PATH-planted `mktemp`/`chmod`/`rm` must never run near the live token,
@@ -180,11 +221,29 @@ unset -f _bridge_run_pick
 # re-exec'd pass to match before it trusts fd 9.
 _BR_FD_MAGIC="agb-run-cred-fd-v2:${SRANDOM:-}:${RANDOM}${RANDOM}${RANDOM}:${BASHPID:-$$}:${EPOCHSECONDS:-0}"
 
-# UNIFIED re-exec to a PRIVILEGED Bash 4+ shell. We re-exec when EITHER we are not
-# privileged (`$-` lacks `p` — privileged Bash imports no env functions and ignores
-# BASH_ENV/ENV) OR we are not yet Bash 4+. A single `exec ... -p <bash4+>` satisfies
-# both, so bridge-lib.sh below never re-execs (we are already Bash 4+) and the
-# working shell + every child it forks is function-free + BASH_ENV-free.
+# UNIFIED re-exec to a PRIVILEGED Bash 4+ shell. We re-exec into `bash -p` so the
+# working shell + every child it forks is function-free + BASH_ENV-free + Bash 4+.
+#
+# #1520 r5 (codex Phase-4 BLOCKING): the re-exec into `bash -p` is DEFENSE IN
+# DEPTH for residual function-shadow / BASH_ENV cleanliness — it is NOT the
+# primary #1520 guarantee, and so its decision deliberately does NOT try to
+# detect "am I the re-exec'd pass" from any caller-influenced signal (the `$-`
+# `p` flag is set by a BASH_ENV `set -p`; a plain env marker or an fd-9 nonce
+# can be pre-staged by a same-UID caller who controls both the env var AND the
+# inherited fd). Those are all forgeable on first entry. Instead the SECURITY-
+# CRITICAL invariants are established UNCONDITIONALLY at true process entry,
+# BEFORE this decision and immune to it being skipped:
+#   - `builtin set +a` cleared inherited allexport, so the STEP A token captures
+#     and the keychain-free proven flag are process-local (never exported to a
+#     child) regardless of whether we re-exec;
+#   - STEP A captured + unset the credential env vars;
+#   - the `builtin unset -f` strip (now incl. `set`) removed function shadows
+#     and `builtin unset BASH_ENV ENV BASH_XTRACEFD` dropped the startup hooks.
+# So a caller `set -p` that skips this re-exec cannot reintroduce the #1520
+# token / proven-flag leak. We still re-exec for the clean `-p` shell on the
+# normal path (not privileged, or not yet Bash 4+); the `bash -p` target is
+# function-free + BASH_ENV-free + Bash 4+, and re-execs exactly once (after it,
+# `-p` is set and we are 4+, so the condition is false).
 #
 # CRITICAL (codex round-3 BLOCKING): this runs AFTER STEP A scrubbed the credential
 # from the ENV, so the candidate-version probe and the `exec` run in a TOKEN-FREE
@@ -212,9 +271,11 @@ if [[ "$-" != *p* ]] || (( ${BASH_VERSINFO[0]:-0} < 4 )); then
     done
     if [[ -n "$_bridge_run_chosen" ]]; then
       # 2. Now that a candidate is chosen and NO more probe children will fork,
-      #    stash the captured values on fd 9 (unlinked 0600 file, magic-prefixed;
-      #    `exec`/`-p` preserve fd inheritance). Only the `exec` target below
-      #    inherits fd 9.
+      #    stash the captured token values (if any) on fd 9 (unlinked 0600 file,
+      #    nonce-prefixed; `exec`/`-p` preserve fd inheritance). Only the `exec`
+      #    target below inherits fd 9. fd 9 is opened ONLY when a token exists —
+      #    it is purely the secure credential transit, NOT a re-exec signal (the
+      #    re-exec decision above is intentionally token/fd-independent).
       if [[ -n "$_bridge_run_tok_oat$_bridge_run_tok_anthropic_key$_bridge_run_tok_anthropic_auth" ]]; then
         if _bridge_run_fd_file="$("$_BR_MKTEMP" "${TMPDIR:-/tmp}/agb-run-cred.XXXXXX" 2>/dev/null)"; then
           "$_BR_CHMOD" 600 "$_bridge_run_fd_file" 2>/dev/null || true
@@ -236,16 +297,16 @@ if [[ "$-" != *p* ]] || (( ${BASH_VERSINFO[0]:-0} < 4 )); then
         # Drop the in-shell copies; the values ride fd 9 across the exec.
         unset _bridge_run_tok_oat _bridge_run_tok_anthropic_key _bridge_run_tok_anthropic_auth
         # Hand the nonce to the re-exec'd pass so it can prove fd 9 is OURS (it
-        # keeps fd 9 open + validates the first record == this nonce). Only set
-        # when we actually opened fd 9 with a token.
+        # validates the first record == this nonce). Only set when we actually
+        # opened fd 9 with a token.
         export _BRIDGE_RUN_FD9_NONCE="$_BR_FD_MAGIC"
       fi
       # 3. Re-exec into the chosen privileged Bash 4+ shell.
       exec "$_bridge_run_chosen" -p "$_bridge_run_self" "$@"
     fi
   fi
-  # Reached only if we are not privileged/Bash-4+ AND found no Bash-4+ candidate to
-  # re-exec into. The per-name `unset -f` strip above is the residual defense.
+  # Reached only if we found no Bash-4+ candidate to re-exec into. The per-name
+  # `unset -f` strip above is the residual defense.
   if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
     echo "[bridge-run] Agent Bridge requires Bash 4+ (current: ${BASH_VERSION:-unknown}). Put a Bash 4+ on PATH." >&2
     exit 1
@@ -1055,6 +1116,17 @@ bridge_run_claude_keychain_free_preflight() {
   local registry_path=""
   local ttl_ms=""
 
+  # #1520 r3 (codex Phase-4 BLOCKING): a "proven keychain-free" signal for the
+  # shared-launch credential guard. Reset every call so a non-Darwin /
+  # unvalidated path leaves it 0; it is set to 1 ONLY after the full Darwin
+  # settings/helper/registry validation below passes. The guard then treats
+  # keychain-free as export-safe-without-credential ONLY when this is 1 —
+  # never on the enable flag alone (which is platform-blind env/config), so a
+  # non-Darwin agent where this function early-returns without validating
+  # falls through to seed/recheck/skip-export instead of exporting an empty
+  # per-agent dir.
+  BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0
+
   [[ "$ENGINE" == "claude" ]] || return 0
   [[ $SAFE_MODE -eq 0 ]] || return 0
   bridge_claude_keychain_free_auth_enabled || return 0
@@ -1096,6 +1168,12 @@ bridge_run_claude_keychain_free_preflight() {
     bridge_die "Claude keychain-free auth is enabled but no active registry OAT is available"
   fi
 
+  # #1520 r3: every keychain-free precondition validated on this platform
+  # (Darwin + executable apiKeyHelper + settings.json pointing at it + an
+  # active registry OAT). The apiKeyHelper supplies the token at launch, so a
+  # missing per-agent `.credentials.json` is expected and the shared-launch
+  # guard may export the per-agent CLAUDE_CONFIG_DIR without seeding one.
+  BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1
 }
 
 bridge_run_ensure_claude_launch_channel_plugins() {
@@ -1106,9 +1184,188 @@ bridge_run_ensure_claude_launch_channel_plugins() {
   agent_home="${agent_claude_root%/.claude}"
   (
     export HOME="$agent_home"
+    # SC2030: subshell-local export is intentional — it scopes HOME /
+    # CLAUDE_CONFIG_DIR to the plugin-enable preflight only (see the
+    # matching #1520 export in bridge_run_shared_launch below).
+    # shellcheck disable=SC2030
     export CLAUDE_CONFIG_DIR="$agent_claude_root"
     bridge_ensure_claude_launch_channel_plugins "$AGENT"
   )
+}
+
+# Per-process sentinel for the #1520 r3 one-time degrade warning. bridge-run.sh
+# is one long-lived process per agent relaunch loop, so a process-scoped
+# associative array keyed by agent id de-duplicates the skip-export warning
+# across every loop iteration without a guard file. (Not exported — exporting
+# an associative array silently breaks; see the BRIDGE_AGENT_ISOLATION_MODE
+# collision footgun.)
+declare -A BRIDGE_RUN_DEGRADE_WARNED=()
+
+# bridge_run_warn_once <agent> <message>
+#
+# Emit <message> via log_line at most once per <agent> for the lifetime of
+# this process. Used by the shared-launch skip-export degrade path so a
+# persistently-unseedable agent does not spam the log on every relaunch
+# (bridge-run.sh's while-true loop re-enters bridge_run_shared_launch every
+# iteration).
+bridge_run_warn_once() {
+  local _agent="$1"
+  local _msg="$2"
+  [[ -n "${BRIDGE_RUN_DEGRADE_WARNED[$_agent]:-}" ]] && return 0
+  BRIDGE_RUN_DEGRADE_WARNED["$_agent"]=1
+  log_line "$_msg"
+}
+
+# bridge_run_ensure_shared_claude_credential <agent_claude_root>
+#
+# Issue #1520 r2 (codex Phase-4 BLOCKING) — guard the CLAUDE_CONFIG_DIR
+# export against stranding a shared agent authless.
+#
+# The export points the launched `claude` at its per-agent config dir. That
+# is only safe if the dir actually holds the credential `claude` needs.
+# Static shared Claude agents get their per-agent `.credentials.json`
+# populated by the daemon's periodic `claude-token sync` (default scope
+# `static`). Shared DYNAMIC Claude agents do NOT: dynamic create seeds only
+# `.claude.json` (first-run config), and the daemon sync's static-only
+# default skips BRIDGE_AGENT_SOURCE != static. So a previously
+# operator-global-authed dynamic agent would restart pointed at an empty
+# per-agent dir and lose auth.
+#
+# Fix: seed-at-launch-if-missing. Before exporting, if the per-agent
+# credential file is absent, run a single-agent `claude-token sync` for THIS
+# agent (the explicit-CSV `--agents <agent>` spec bypasses the static-only
+# selector — see bridge_auth_selected_agents) which reuses the production
+# credential resolver + controller-credentials fallback and writes the file
+# at 0600 via bridge-auth.py's atomic writer. Works for static AND dynamic;
+# no sync-default change, no hand-rolled secret copying.
+#
+# Returns 0 when the export is safe (credential present, OR a PROVEN
+# keychain-free launch where `.credentials.json` is intentionally absent and
+# the keychain-free preflight positively validated settings.json -> apiKeyHelper
+# -> registry OAT on this platform). Returns 1 when the per-agent dir has no
+# usable credential and could not be seeded (e.g. operator never authed) — the
+# caller then SKIPS the export so a previously-working operator-global launch
+# is not broken (graceful degrade).
+bridge_run_ensure_shared_claude_credential() {
+  local _claude_root="$1"
+  local _cred_file="$_claude_root/.credentials.json"
+
+  # Keychain-free auth: the per-agent dir authenticates via the apiKeyHelper
+  # wired into settings.json, not a credential file — so a missing credential
+  # file is expected and the export is safe WITHOUT seeding one.
+  #
+  # #1520 r3 (codex Phase-4 BLOCKING): gate this fast-path on the PROVEN
+  # keychain-free state, NOT on bridge_claude_keychain_free_auth_enabled. The
+  # enable flag is platform-blind env/config; bridge_run_claude_keychain_free_-
+  # preflight early-returns on non-Darwin WITHOUT validating settings/helper/
+  # registry, yet leaves the flag enabled. Trusting the flag alone would export
+  # an UNAUTHENTICATED empty per-agent dir on a non-Darwin host. The preflight
+  # sets BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1 only after it has
+  # positively validated keychain-free on this platform; anything else (non-
+  # Darwin, unvalidated, preflight not run) leaves it 0 and falls through to
+  # the seed -> recheck -> export-if-present -> else skip-export path below.
+  if [[ "${BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  # Already seeded (static agents, or a dynamic agent seeded on a prior pass).
+  [[ -f "$_cred_file" ]] && return 0
+
+  # Missing — seed THIS agent specifically (bypasses the static-only default).
+  # Best-effort + time-boxed: a sync failure must not wedge the launch loop.
+  bridge_with_timeout 20 shared_claude_credential_seed \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync \
+    --agents "$AGENT" --json >/dev/null 2>&1 || true
+
+  # Re-check: only report "safe to export" if the file now exists.
+  [[ -f "$_cred_file" ]] && return 0
+  return 1
+}
+
+# bridge_run_shared_launch <bash_bin> <launch_cmd> <errfile>
+#
+# Issue #1520 — final-launch site for the shared (non v2-secret-env) path.
+# Mirrors the v2 secret-env exec branch's job of getting the per-agent
+# CLAUDE_CONFIG_DIR onto the launched `claude` process, but for shared-mode
+# (isolation_mode: shared, non linux-user) Claude agents that never go
+# through bridge_isolation_v2_exec_with_secret_env.
+#
+# Without this, a shared Claude agent launched `"$bash_bin" -lc "$cmd"` with
+# CLAUDE_CONFIG_DIR unset, so Claude fell back to HOME-default config = the
+# operator's global ~/.claude.json. Per-agent user-scope MCP / settings /
+# credential isolation (which the bridge pre-seeds into
+# bridge_agent_claude_config_dir = <agent-home>/.claude) was silently
+# ignored. Exporting the resolved per-agent config dir here makes the fix
+# apply to BOTH newly-created AND existing shared agents on (re)start — it
+# rides the launch path, not a scaffold-time launch_cmd prefix that would
+# miss agents created before this change.
+#
+# Extracted as a function (matching the bridge_isolation_v2_exec_with_secret_env
+# rationale at lib/bridge-isolation-v2.sh) so the smoke test exercises the
+# EXACT production code path that constructs the child's launch env.
+#
+# Contract:
+#   - Claude only. Codex agents take the same shared else-branch but must
+#     NOT receive CLAUDE_CONFIG_DIR; gate on ENGINE == claude.
+#   - Export CLAUDE_CONFIG_DIR ONLY. HOME stays the operator/shared home in
+#     shared mode (unlike the plugin-preflight subshell above, which repoints
+#     HOME for its plugin-enable work). Repointing HOME for a shared agent
+#     would move every HOME-relative read off the operator's home and is
+#     explicitly out of scope for #1520.
+#   - The export runs in the same subshell that runs the launch, so it never
+#     pollutes the long-lived parent (the relaunch loop).
+#   - r2 (codex Phase-4): the export only fires when the per-agent dir holds a
+#     usable credential (bridge_run_ensure_shared_claude_credential seeds it
+#     on demand for static AND dynamic agents). If it cannot, the launch falls
+#     back to the pre-#1520 operator-global path so a previously-authed agent
+#     is never stranded.
+#   - Returns the child's exit code.
+bridge_run_shared_launch() {
+  local _bash_bin="$1"
+  local _launch_cmd="$2"
+  local _errfile="$3"
+  local _agent_claude_root=""
+
+  if [[ "$ENGINE" == "claude" ]]; then
+    _agent_claude_root="$(bridge_run_agent_claude_root)"
+    # r2: gate the export on the per-agent dir actually being authed. If the
+    # credential is missing AND cannot be seeded, clear the root so we skip
+    # the export and launch against the operator-global config as before.
+    if [[ -n "$_agent_claude_root" ]] \
+        && ! bridge_run_ensure_shared_claude_credential "$_agent_claude_root"; then
+      # r3: warn at most once per agent per process — the relaunch loop
+      # re-enters this skip-export path every iteration, so an unconditional
+      # log_line here spams the log. The functional fallback (skip export ->
+      # operator-global launch) is unchanged; only the warning is de-duped.
+      bridge_run_warn_once "$AGENT" \
+        "[warn] ${AGENT}: per-agent Claude credential missing and could not be seeded at $_agent_claude_root/.credentials.json — launching against the operator-global config (CLAUDE_CONFIG_DIR not set). Run 'agent-bridge auth claude-token sync --agents ${AGENT}' once the controller is authed to enable per-agent config isolation."
+      _agent_claude_root=""
+    fi
+  fi
+
+  local _rc=0
+  if [[ -n "$_agent_claude_root" ]]; then
+    if (
+      # SC2030/SC2031: the subshell-local export is the point — it scopes
+      # CLAUDE_CONFIG_DIR to the exec'd child only, never the relaunch loop.
+      # shellcheck disable=SC2030,SC2031
+      export CLAUDE_CONFIG_DIR="$_agent_claude_root"
+      exec "$_bash_bin" -lc "$_launch_cmd"
+    ) 2> >(tee -a "$_errfile" >&2); then
+      _rc=0
+    else
+      _rc=$?
+    fi
+  else
+    # Non-Claude (e.g. codex) shared launch — unchanged from pre-#1520:
+    # no CLAUDE_CONFIG_DIR export.
+    if "$_bash_bin" -lc "$_launch_cmd" 2> >(tee -a "$_errfile" >&2); then
+      _rc=0
+    else
+      _rc=$?
+    fi
+  fi
+  return "$_rc"
 }
 
 bridge_run_sync_dev_plugin_cache() {
@@ -1400,6 +1657,11 @@ RAPID_FAIL_COUNT=0
 RAPID_FAIL_WINDOW="${BRIDGE_RUN_RAPID_FAIL_WINDOW_SECONDS:-10}"
 MAX_RAPID_FAILS="${BRIDGE_RUN_MAX_RAPID_FAILS:-5}"
 HEALTHY_RUN_RESET_SECONDS="${BRIDGE_RUN_HEALTHY_RESET_SECONDS:-60}"
+# #1520 r4: the proven-keychain-free trust flag was already `unset` at true
+# process entry (top of this script, alongside the STEP A credential scrub) —
+# value AND export attribute removed BEFORE any fork/re-exec — so no separate
+# pre-loop scrub is needed here. The guard reads it with a `:-0` default, and
+# the preflight (re)sets it as a process-local var every iteration.
 while true; do
   local_launch_cmd_display=""
   local_err_size_before=0
@@ -1504,7 +1766,12 @@ while true; do
     EXIT_CODE="$BRIDGE_ISOLATION_V2_LAST_EXEC_RC"
     unset BRIDGE_ISOLATION_V2_LAST_EXEC_RC
   else
-    if "$BRIDGE_BASH_BIN" -lc "$LAUNCH_CMD" 2> >(tee -a "$ERRFILE" >&2); then
+    # Issue #1520: shared (non v2-secret-env) final launch. For Claude
+    # agents this exports the per-agent CLAUDE_CONFIG_DIR so the launched
+    # `claude` reads its own <agent-home>/.claude config instead of the
+    # operator's global ~/.claude.json. HOME stays the shared/operator home.
+    # Codex agents take the same path with no CLAUDE_CONFIG_DIR export.
+    if bridge_run_shared_launch "$BRIDGE_BASH_BIN" "$LAUNCH_CMD" "$ERRFILE"; then
       EXIT_CODE=0
     else
       EXIT_CODE=$?
