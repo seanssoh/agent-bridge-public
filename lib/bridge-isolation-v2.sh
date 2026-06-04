@@ -1449,6 +1449,147 @@ bridge_isolation_v2_normalize_workdir_profile_group() {
   return 0
 }
 
+# bridge_isolation_v2_publish_workdir_profile_files <agent> <workdir> [group]
+#
+# Issue #1520c (v0.16.0-beta3 residual). First-time `agent create
+# --isolate` for a linux-user iso Claude agent leaves the workdir profile
+# files at `iso-uid:<controller-primary-group> 0600` instead of the iso v2
+# contract `iso-uid:ab-agent-<a> 0660`, even though
+# `bridge_linux_prepare_agent_isolation` already runs the #1506 recursive
+# normalize (`bridge_isolation_v2_chgrp_setgid_recursive`) AFTER its
+# `chown -R "$os_user" "$workdir"`.
+#
+# PINNED MECHANISM (empirical trace on agb-node-a, v0.16.0-beta3): during
+# the SAME `agent create` process, `prepare` creates the `ab-agent-<a>`
+# group and chowns the workdir tree to the iso UID. The controller process
+# that invoked `agent create` carries a STALE supplementary-group cache
+# that does not yet include the just-created `ab-agent-<a>` group (live
+# processes never refresh group membership — KNOWN_ISSUES §28). The #1506
+# recursive normalize runs its per-FILE `find … -exec chgrp/chmod`
+# DIRECT-FIRST as the controller, which cannot traverse the now-
+# `2770 ab-agent-<a>` workdir directory — so `find` reaches zero of the
+# profile FILES (the workdir DIR itself was normalized via a root step,
+# which is why the dir is correctly 2770 but the files stay 0600/controller-
+# group). The `_bridge_isolation_v2_run_root_or_sudo` fallback does not
+# rescue the per-file passes because the un-enterable directory yields a
+# zero-file traversal rather than a hard non-zero the fallback re-runs
+# under sudo.
+#
+# This helper closes that gap with a NARROW, profile-file-only publish that
+# is ALWAYS root-forced (`bridge_linux_sudo_root`, i.e. `sudo -n` as root) —
+# root chgrp/chmod does not depend on the controller's group-cache or on
+# being able to traverse the 2770 workdir, so it succeeds on the very first
+# create. It is scoped to the six Claude identity profile basenames that
+# live directly under `$workdir`:
+#
+#   SOUL.md CLAUDE.md SESSION-TYPE.md MEMORY.md MEMORY-SCHEMA.md TOOLS.md
+#
+# DELIBERATELY EXCLUDED (NOT the broad
+# `bridge_isolation_v2_normalize_workdir_profile_group` set):
+#   * HEARTBEAT.md — controller-owned `0600` by design (daemon writes it as
+#     the controller; the iso UID never reads it). Publishing it would
+#     break the controller-owned contract and is a watchdog false-positive
+#     source in the other direction.
+#   * CHANGE-POLICY.md — a symlink to the shared `../../../shared/` copy;
+#     chgrp/chmod must never follow it (would mutate the shared target).
+#   * AGENTS.md — not part of the Claude identity profile that the iso UID
+#     must read at session boot; left to the broad normalizer's own contract.
+#   * The v3 channel-state dirs/files (`.teams/.ms365/.discord/.telegram/
+#     .mattermost`) — never matched (the six basenames are top-level files,
+#     not channel state) so the v3 `iso-uid:ab-agent-<a> 0600` contract is
+#     preserved untouched.
+#
+# Contract:
+#   * Linux v2 isolation only (gated via `bridge_isolation_v2_enforce`);
+#     a silent no-op success off Linux / when v2 primitives are not
+#     initialized, so the create path stays simple on every host.
+#   * Symlink-safe: a profile basename that is itself a symlink (root-side
+#     `test -h`) is REFUSED — never chgrp/chmod'd — so a planted
+#     `CLAUDE.md -> /tmp/evil` cannot redirect the publish onto an external
+#     target. (chgrp/chmod follow symlinks; the root-side `-h` check fences
+#     this before any mutation.)
+#   * Idempotent: a root-side `stat` short-circuits when the file already
+#     matches `ab-agent-<a>:0660`, so a re-run (reapply / prepare on an
+#     already-published tree) performs zero chgrp/chmod syscalls.
+#   * Exec-bit irrelevant: profile `.md` files carry no exec bit; the fixed
+#     `0660` is the canonical contract for these text identity files.
+#   * NON-SILENT but NON-FATAL (G3): a per-file failure emits a `bridge_warn`
+#     AND a `profile_publish_failed` audit row, and the loop CONTINUES — the
+#     function ALWAYS returns 0 so `agent create` SUCCEEDS even if the
+#     publish could not complete (operator then re-runs
+#     `agent-bridge isolate <a> --reapply`). It does NOT roll back create.
+bridge_isolation_v2_publish_workdir_profile_files() {
+  local agent="$1"
+  local workdir="$2"
+  local group="${3:-}"
+  [[ -n "$agent" && -n "$workdir" ]] || return 0
+  bridge_isolation_v2_enforce || return 0
+  if [[ -z "$group" ]]; then
+    group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+  fi
+  [[ -n "$group" ]] || return 0
+  # The six Claude identity profile basenames. Kept in lockstep with the
+  # scaffold/materialize fileset, but DELIBERATELY narrower than
+  # bridge_isolation_v2_normalize_workdir_profile_group's set: HEARTBEAT.md
+  # (controller-owned 0600), CHANGE-POLICY.md (shared symlink) and AGENTS.md
+  # are excluded on purpose — see the contract comment above.
+  local _profile_basenames=(
+    "SOUL.md"
+    "CLAUDE.md"
+    "SESSION-TYPE.md"
+    "MEMORY.md"
+    "MEMORY-SCHEMA.md"
+    "TOOLS.md"
+  )
+  local name="" path="" cur="" cur_grp="" cur_mode_raw=""
+  local cur_mode_norm="" want_mode_norm=""
+  want_mode_norm="$(printf '%o' "$((8#660))" 2>/dev/null || printf '660')"
+  for name in "${_profile_basenames[@]}"; do
+    path="$workdir/$name"
+    # Existence + symlink checks are ROOT-side: the controller cannot stat
+    # a file behind the freshly-chowned 2770 workdir on the create pass
+    # (stale group cache), so a controller-side `[[ -f ]]` would false-skip
+    # the exact case this helper exists to fix. `test -e`/`test -h` via
+    # bridge_linux_sudo_root run as root and see the true tree.
+    bridge_linux_sudo_root test -e "$path" 2>/dev/null || continue
+    if bridge_linux_sudo_root test -h "$path" 2>/dev/null; then
+      # A symlinked profile file (e.g. CHANGE-POLICY-style sharing, or a
+      # planted redirect). Refuse — chgrp/chmod would follow to the target.
+      bridge_warn "publish_workdir_profile_files: refusing symlink at $path (agent=$agent); operator must repair the symlink before re-running isolate"
+      continue
+    fi
+    # Idempotent stat-skip (root-side stat: the controller may not be able
+    # to stat the file directly on the create pass).
+    cur="$(bridge_linux_sudo_root stat -c '%G:%a' "$path" 2>/dev/null || printf '')"
+    if [[ -n "$cur" ]]; then
+      cur_grp="${cur%%:*}"
+      cur_mode_raw="${cur##*:}"
+      cur_mode_norm="$(printf '%o' "$((8#${cur_mode_raw#0}))" 2>/dev/null || printf '%s' "$cur_mode_raw")"
+      if [[ "$cur_grp" == "$group" && "$cur_mode_norm" == "$want_mode_norm" ]]; then
+        continue
+      fi
+    fi
+    # Root-forced publish — independent of the controller's stale group
+    # cache and of workdir traversal. chgrp THEN chmod (group first so a
+    # transient observer never sees the new mode on the old group).
+    if ! bridge_linux_sudo_root chgrp "$group" "$path" 2>/dev/null; then
+      bridge_warn "publish_workdir_profile_files: chgrp $group failed for $path (agent=$agent; non-fatal) — re-run \`agent-bridge isolate $agent --reapply\`"
+      bridge_audit_log isolation profile_publish_failed "$agent" \
+        --detail file="$name" --detail op=chgrp --detail group="$group" \
+        >/dev/null 2>&1 || true
+      continue
+    fi
+    if ! bridge_linux_sudo_root chmod 0660 "$path" 2>/dev/null; then
+      bridge_warn "publish_workdir_profile_files: chmod 0660 failed for $path (agent=$agent; non-fatal) — re-run \`agent-bridge isolate $agent --reapply\`"
+      bridge_audit_log isolation profile_publish_failed "$agent" \
+        --detail file="$name" --detail op=chmod --detail mode=0660 \
+        >/dev/null 2>&1 || true
+      continue
+    fi
+  done
+  return 0
+}
+
 bridge_isolation_v2_chgrp_setgid_recursive() {
   # Apply group + mode to a tree. Directories get the dir-mode (with
   # setgid bit), files get the file-mode (without setgid). The dir-mode

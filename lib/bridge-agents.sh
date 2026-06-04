@@ -4529,6 +4529,32 @@ bridge_linux_prepare_agent_isolation() {
     done
   fi
 
+  # Issue #1520c (v0.16.0-beta3 residual): the #1506 recursive normalize
+  # above runs its per-FILE chgrp/chmod DIRECT-FIRST as the controller. On
+  # a first-time `create --isolate` the controller process still carries a
+  # STALE supplementary-group cache that excludes the just-created
+  # `ab-agent-<a>` group (KNOWN_ISSUES §28), so its `find … -exec` cannot
+  # traverse the freshly-`chown -R`-ed `2770 ab-agent-<a>` workdir and never
+  # reaches the profile FILES — they stay `iso-uid:<controller-group> 0600`
+  # while the workdir DIR (normalized via a root step) is correctly 2770.
+  # Empirically pinned via a create-time stat trace on agb-node-a.
+  #
+  # Close the residual with a NARROW, ROOT-FORCED publish of ONLY the six
+  # Claude identity profile files (SOUL/CLAUDE/SESSION-TYPE/MEMORY/
+  # MEMORY-SCHEMA/TOOLS.md) directly under `$workdir`. Root chgrp/chmod is
+  # independent of the controller's group cache and of workdir traversal,
+  # so it succeeds on the first create. It deliberately does NOT touch
+  # HEARTBEAT.md (controller-owned 0600), CHANGE-POLICY.md (shared symlink),
+  # AGENTS.md, or the v3 channel-state files — see the helper's contract.
+  # Non-silent but non-fatal (warn + `profile_publish_failed` audit row on
+  # failure; create still succeeds), so this is the observable replacement
+  # for the legacy silent `|| true` publish.
+  if command -v bridge_isolation_v2_publish_workdir_profile_files >/dev/null 2>&1; then
+    bridge_isolation_v2_publish_workdir_profile_files \
+      "$agent" "$workdir" "$_v2_agent_group" \
+      || bridge_warn "isolation v2 (#1520c): workdir profile-file publish returned non-zero for agent '$agent'; the six identity files may not be group-readable. Re-run \`agent-bridge isolate $agent --reapply\`."
+  fi
+
   # Issue #1513 / #1518: the legacy per-agent tracked-profile mirror dir at
   # `$BRIDGE_AGENT_HOME_ROOT/<agent>/` must be group-traversable by the iso
   # UID (the Teams MCP prune runs against it). Its normalization is applied
