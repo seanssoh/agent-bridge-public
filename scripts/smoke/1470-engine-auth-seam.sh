@@ -133,50 +133,12 @@ smoke_run "A7b codex → empty (opaque copy, rc=0)" \
 
 # A8: Python-side mirror agrees with the bash descriptor for Claude and the
 # Claude credential payload key is byte-identical to the historical shape.
+# The Python body lives in 1470-engine-auth-seam-helper.py (file-as-argv,
+# NO heredoc) so the smoke does not introduce a `python3 - <<'PY'`-in-
+# command-substitution deadlock site (footgun #11 / KNOWN_ISSUES §26).
 assert_py_seam() {
   local out
-  out="$(python3 - "$AUTH_PY" <<'PY'
-import importlib.util
-import sys
-
-spec = importlib.util.spec_from_file_location("bauth", sys.argv[1])
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
-
-# Claude payload key byte-identical.
-payload = m.claude_oauth_credentials_payload("FAKE-TOKEN-FOR-SMOKE-0001")
-assert list(payload.keys()) == ["claudeAiOauth"], payload
-assert payload["claudeAiOauth"]["accessToken"] == "FAKE-TOKEN-FOR-SMOKE-0001"
-
-# Descriptor mirror agrees with bash for the key facts.
-claude = m.engine_auth_descriptor("claude")
-assert claude["auth_supported"] is True
-assert claude["auth_model"] == "rotating-pool"
-assert claude["cred_dest_tail"] == ".claude/.credentials.json"
-assert claude["cred_payload_key"] == "claudeAiOauth"
-assert claude["supports_rotation"] is True
-
-codex = m.engine_auth_descriptor("codex")
-assert codex["auth_supported"] is True
-assert codex["auth_model"] == "single-source-sync"
-assert codex["cred_dest_tail"] == ".codex/auth.json"
-assert codex["cred_payload_key"] is None
-assert codex["supports_rotation"] is False
-
-agy = m.engine_auth_descriptor("antigravity")
-assert agy["auth_supported"] is False
-
-# Unknown engine must raise, never silently fall through to Claude.
-try:
-    m.engine_auth_descriptor("bogus-engine")
-except ValueError:
-    pass
-else:
-    raise AssertionError("unknown engine did not raise")
-
-print("py-seam-ok")
-PY
-)"
+  out="$(python3 "$SCRIPT_DIR/1470-engine-auth-seam-helper.py" seam-mirror "$AUTH_PY")"
   smoke_assert_eq "py-seam-ok" "$out" "A8 python seam mirror"
 }
 smoke_run "A8 python descriptor mirror + claude payload byte-identical" \
@@ -190,63 +152,11 @@ smoke_run "A8 python descriptor mirror + claude payload byte-identical" \
 
 STATE_FILE="$SMOKE_TMP_ROOT/cred-state.json"
 
+# The cred-state Python body lives in 1470-engine-auth-seam-helper.py
+# (file-as-argv, NO heredoc) for the same footgun-#11 reason as A8 above.
 assert_cred_state() {
   local out
-  out="$(python3 - "$AUTH_PY" "$STATE_FILE" <<'PY'
-import importlib.util
-import os
-import stat
-import sys
-from pathlib import Path
-
-spec = importlib.util.spec_from_file_location("bauth", sys.argv[1])
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
-
-state_path = Path(sys.argv[2])
-
-# B1: first stamp → generation 1.
-r1 = m.stamp_cred_generation("agA", "claude", "material-v1", state_path=state_path)
-assert r1["cred_generation"] == 1, r1
-assert r1["engine"] == "claude"
-
-# B2: idempotent re-sync of the SAME material → no bump.
-r2 = m.stamp_cred_generation("agA", "claude", "material-v1", state_path=state_path)
-assert r2["cred_generation"] == 1, ("idempotent re-sync must not bump", r2)
-
-# B3: rotated material → generation 2.
-r3 = m.stamp_cred_generation("agA", "claude", "material-v2", state_path=state_path)
-assert r3["cred_generation"] == 2, r3
-
-# B4: a different agent has an independent counter starting at 1.
-r4 = m.stamp_cred_generation("agB", "claude", "material-x", state_path=state_path)
-assert r4["cred_generation"] == 1, r4
-
-# B5: state file is mode 0600.
-mode = stat.S_IMODE(os.stat(state_path).st_mode)
-assert mode == 0o600, oct(mode)
-
-# B6: the secret material is NEVER written to state — only its digest.
-body = state_path.read_text(encoding="utf-8")
-for secret in ("material-v1", "material-v2", "material-x"):
-    assert secret not in body, f"secret leaked into cred-state: {secret}"
-# the digest IS recorded.
-assert m.cred_source_digest("material-v2") in body
-
-# B7: fail-closed migration — a corrupt state file degrades to a fresh
-# default on read, it does not raise.
-state_path.write_text("{ not valid json at all", encoding="utf-8")
-migrated = m.load_cred_state(state_path)
-assert migrated == m.default_cred_state(), migrated
-
-# B8: a non-dict top-level also migrates cleanly.
-state_path.write_text("[1, 2, 3]", encoding="utf-8")
-migrated2 = m.load_cred_state(state_path)
-assert migrated2 == m.default_cred_state(), migrated2
-
-print("cred-state-ok")
-PY
-)"
+  out="$(python3 "$SCRIPT_DIR/1470-engine-auth-seam-helper.py" cred-state "$AUTH_PY" "$STATE_FILE")"
   smoke_assert_eq "cred-state-ok" "$out" "B cred-generation state"
 }
 smoke_run "B cred-generation idempotent + fail-closed + 0600 + no-secret" \
@@ -265,18 +175,20 @@ DEST_FILE="$DEST_DIR/.credentials.json"
 # A registry with one active token so the Claude path WOULD write if the
 # gate were absent. The token is a smoke-only fake.
 mkdir -p "$DEST_DIR"
-cat >"$REG_FILE" <<'JSON'
-{
-  "version": 1,
-  "active_token_id": "smoke",
-  "auto_rotate_enabled": false,
-  "rotation_threshold": 99.0,
-  "tokens": [
-    {"id": "smoke", "token": "FAKE-OAT-FOR-SMOKE-0001", "enabled": true}
-  ],
-  "last_rotation": {}
-}
-JSON
+# Fixture registry written with printf (not a heredoc) so no new
+# heredoc-stdin site remains anywhere in this smoke (footgun #11 hygiene).
+# The token is a smoke-only fake.
+printf '%s\n' \
+  '{' \
+  '  "version": 1,' \
+  '  "active_token_id": "smoke",' \
+  '  "auto_rotate_enabled": false,' \
+  '  "rotation_threshold": 99.0,' \
+  '  "tokens": [' \
+  '    {"id": "smoke", "token": "FAKE-OAT-FOR-SMOKE-0001", "enabled": true}' \
+  '  ],' \
+  '  "last_rotation": {}' \
+  '}' >"$REG_FILE"
 
 assert_engine_gate() {
   local engine="$1"
