@@ -5,7 +5,7 @@ Reads `.claude-plugin/plugin.json` at the path given as argv[1] and emits each
 element of the (optional) top-level `"requires"` array on its own line. This is
 the generic plugin-dependency hook consumed by `bridge_expand_channel_requires`
 in lib/bridge-agents.sh: a plugin may declare other channel specs it needs (e.g.
-`["plugin:ms365@agent-bridge"]`) and the agent-create path transitively pulls
+`["plugin:<dep>@<marketplace>"]`) and the agent-create path transitively pulls
 them into the resolved channel set.
 
 Invoked file-as-argv (NOT heredoc-stdin) to avoid the Bash 5.3.9

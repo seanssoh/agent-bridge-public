@@ -5995,7 +5995,7 @@ bridge_plugin_item_is_resolvable() {
 #
 # Generic plugin-dependency resolver for the agent-create path (issue: patch
 # cm-prod Part 1). A plugin manifest may declare a `"requires"` array of channel
-# specs it needs (e.g. a CRM plugin that requires `plugin:ms365@agent-bridge`);
+# specs it needs (e.g. a plugin that requires `plugin:<dep>@<marketplace>`);
 # this walks the requested channels, reads each plugin's requires, and pulls the
 # transitive closure into the resolved CSV. Zero domain hardcoding — core only
 # reads whatever specs the manifest declares.

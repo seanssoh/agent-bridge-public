@@ -91,8 +91,8 @@ export HOME="$FIXTURE_HOME"
 # Creates fixture-mkt/plugins/<name>/.claude-plugin/plugin.json and registers
 # it in installed_plugins.json. <requires-csv> is a comma-separated list of
 # channel specs (empty/omitted = no `requires` key).
-INSTALLED_JSON="$PLUGINS_ROOT/installed_plugins.json"
-KNOWN_MKT_JSON="$PLUGINS_ROOT/known_marketplaces.json"
+INSTALLED_JSON="$PLUGINS_ROOT/installed_plugins.json"  # noqa: iso-helper-boundary (test fixture builds a fake plugins-root, not a runtime iso-boundary path)
+KNOWN_MKT_JSON="$PLUGINS_ROOT/known_marketplaces.json"  # noqa: iso-helper-boundary (test fixture builds a fake plugins-root, not a runtime iso-boundary path)
 
 write_fixture_plugin() {
   local name="$1"
@@ -100,24 +100,19 @@ write_fixture_plugin() {
   local dir="$FIXTURE_MKT/plugins/$name"
   mkdir -p "$dir/.claude-plugin"
   if [[ -n "$requires_csv" ]]; then
-    python3 - "$dir/.claude-plugin/plugin.json" "$name" "$requires_csv" <<'PY'
-import json, sys
+    python3 -c 'import json, sys
 out_path, name, requires_csv = sys.argv[1], sys.argv[2], sys.argv[3]
 requires = [s.strip() for s in requires_csv.split(",") if s.strip()]
 with open(out_path, "w", encoding="utf-8") as f:
-    json.dump({"name": name, "version": "0.0.1", "requires": requires}, f, indent=2)
-PY
+    json.dump({"name": name, "version": "0.0.1", "requires": requires}, f, indent=2)' "$dir/.claude-plugin/plugin.json" "$name" "$requires_csv"
   else
-    python3 - "$dir/.claude-plugin/plugin.json" "$name" <<'PY'
-import json, sys
+    python3 -c 'import json, sys
 out_path, name = sys.argv[1], sys.argv[2]
 with open(out_path, "w", encoding="utf-8") as f:
-    json.dump({"name": name, "version": "0.0.1"}, f, indent=2)
-PY
+    json.dump({"name": name, "version": "0.0.1"}, f, indent=2)' "$dir/.claude-plugin/plugin.json" "$name"
   fi
   # Register install path.
-  python3 - "$INSTALLED_JSON" "$name@fixture-mkt" "$dir" <<'PY'
-import json, os, sys
+  python3 -c 'import json, os, sys
 path, key, install = sys.argv[1], sys.argv[2], sys.argv[3]
 data = {"plugins": {}}
 if os.path.isfile(path):
@@ -125,20 +120,17 @@ if os.path.isfile(path):
         data = json.load(f)
 data.setdefault("plugins", {})[key] = [{"installPath": install}]
 with open(path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2)
-PY
+    json.dump(data, f, indent=2)' "$INSTALLED_JSON" "$name@fixture-mkt" "$dir"
 }
 
 build_fixtures() {
   # Directory-source marketplace so bridge_resolve_plugin_install_path's
   # known_marketplaces fallback would also resolve (installed_plugins.json's
   # installPath is consulted first and suffices here).
-  python3 - "$KNOWN_MKT_JSON" "$FIXTURE_MKT" <<'PY'
-import json, sys
+  python3 -c 'import json, sys
 path, mkt_path = sys.argv[1], sys.argv[2]
 with open(path, "w", encoding="utf-8") as f:
-    json.dump({"fixture-mkt": {"source": {"source": "directory", "path": mkt_path}}}, f, indent=2)
-PY
+    json.dump({"fixture-mkt": {"source": {"source": "directory", "path": mkt_path}}}, f, indent=2)' "$KNOWN_MKT_JSON" "$FIXTURE_MKT"
 
   : >"$INSTALLED_JSON"  # truncate; write_fixture_plugin appends
   printf '{"plugins":{}}\n' >"$INSTALLED_JSON"
