@@ -199,9 +199,10 @@ spec.loader.exec_module(mod)
 assert str(mod.DAEMON_SCRIPT) == "$fake_daemon", \
     f"DAEMON_SCRIPT resolution drifted: got {mod.DAEMON_SCRIPT!r}"
 
-# Drive attempt_restart with a fixed reason payload. The fake stops with
-# rc=1 -> stop_failed branch -> writes silence-watchdog.json detail with
-# resolver_die populated.
+# Drive attempt_restart with a fixed reason payload. The fake "restart"
+# verb exits rc=1 -> restart_failed branch (#1463 routes through the single
+# "restart" verb) -> writes silence-watchdog.json detail with resolver_die
+# populated.
 mod.attempt_restart({"age_seconds": 9999, "threshold_seconds": 600,
                      "last_tick_ts": "2026-05-17T00:00:00+00:00",
                      "daemon_pid": 1})
@@ -221,10 +222,10 @@ payload = json.loads(state_path.read_text("utf-8"))
 detail = payload.get("detail") or {}
 
 errors = []
-if detail.get("outcome") != "stop_failed":
-    errors.append(f"  outcome: expected 'stop_failed', got {detail.get('outcome')!r}")
-if detail.get("stop_exit") != 1:
-    errors.append(f"  stop_exit: expected 1, got {detail.get('stop_exit')!r}")
+if detail.get("outcome") != "restart_failed":
+    errors.append(f"  outcome: expected 'restart_failed', got {detail.get('outcome')!r}")
+if detail.get("restart_exit") != 1:
+    errors.append(f"  restart_exit: expected 1, got {detail.get('restart_exit')!r}")
 resolver_die = detail.get("resolver_die", "")
 if "markerless-existing" not in resolver_die:
     errors.append(f"  resolver_die: expected 'markerless-existing' substring, got {resolver_die!r}")

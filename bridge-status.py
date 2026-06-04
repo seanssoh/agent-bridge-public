@@ -611,22 +611,134 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def daemon_status(pid_file: str) -> tuple[bool, str]:
+def _pid_alive(pid: int) -> bool:
     try:
-        pid = Path(pid_file).read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return (False, "-")
-    except Exception:
-        return (False, "?")
-
-    if not pid:
-        return (False, "-")
-
-    try:
-        os.kill(int(pid), 0)
+        os.kill(pid, 0)
     except OSError:
-        return (False, pid)
-    return (True, pid)
+        return False
+    return True
+
+
+def _proc_cmdline(pid: int) -> str:
+    """Best-effort process-args lookup. Linux: /proc/<pid>/cmdline. Any
+    platform: `ps -p <pid> -o args=`. Returns '' on failure."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if raw:
+            return raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        pass
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, timeout=5,
+        )
+        return (out.stdout or "").strip()
+    except (OSError, ValueError, Exception):
+        return ""
+
+
+def _daemon_pid_from_pgrep(bridge_home: str) -> str:
+    """Scoped pgrep fallback — mirror `bridge_daemon_pid` in
+    lib/bridge-state.sh. Match this user's `bridge-daemon.sh run` process so
+    a transiently-missing pid-file (the #1463 thrash deletes it) does not
+    read as 'stopped'. Returns the pid as a string, or '' when none found."""
+    if not bridge_home:
+        return ""
+    pattern = f"{bridge_home.rstrip('/')}/bridge-daemon.sh run"
+    try:
+        import subprocess
+
+        uid = os.getuid()
+        out = subprocess.run(
+            ["pgrep", "-U", str(uid), "-f", pattern],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, AttributeError, Exception):
+        return ""
+    for line in (out.stdout or "").splitlines():
+        cand = line.strip()
+        if cand.isdigit() and _pid_alive(int(cand)):
+            return cand
+    return ""
+
+
+def _daemon_pid_from_owner_pid(pid_file: str) -> str:
+    """mkdir-lock backend fallback (macOS hosts without flock(1)). The
+    singleton lock writes its holder pid to `<pid_file>.lock.d/owner.pid`.
+    On the #1463 thrash the launchd job loser deletes daemon.pid, but the
+    true holder still owns the mkdir lock — read its owner.pid so status
+    matches reality. Returns the pid string or '' when not live."""
+    owner = Path(f"{pid_file}.lock.d/owner.pid")
+    try:
+        raw = owner.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if digits and _pid_alive(int(digits)):
+        return digits
+    return ""
+
+
+def daemon_status(
+    pid_file: str,
+    state_dir: str = "",
+    bridge_home: str = "",
+) -> tuple[bool, str]:
+    """Resolve daemon running-state with the same fallback chain as the
+    shell resolver (`bridge_daemon_pid` in lib/bridge-state.sh). Issue
+    #1463: the Python dashboard previously read only `daemon.pid` +
+    `kill(pid, 0)` with NO fallback, so when a losing launchd KeepAlive job
+    instance deleted the true holder's pid-file the dashboard reported
+    `stopped pid=-` while the daemon was in fact running — disagreeing with
+    the shell resolver (which has the fallbacks). Port them here.
+
+    Resolution order:
+      1. Recorded pid (daemon.pid) — alive AND cmdline still looks like a
+         bridge-daemon (PID-recycling guard, mirrors #683).
+      2. Scoped pgrep for `<BRIDGE_HOME>/bridge-daemon.sh run`.
+      3. mkdir-lock `owner.pid` (macOS flock-less backend).
+    """
+    recorded = ""
+    try:
+        recorded = Path(pid_file).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        recorded = ""
+    except Exception:
+        # Unreadable pid-file (perm denied etc.) — fall through to the
+        # process-level fallbacks rather than reporting a hard error.
+        recorded = ""
+
+    # 1. Recorded pid with cmdline validation.
+    if recorded:
+        try:
+            rpid = int(recorded)
+        except ValueError:
+            rpid = 0
+        if rpid and _pid_alive(rpid):
+            cmdline = _proc_cmdline(rpid)
+            if not cmdline or "bridge-daemon.sh run" in cmdline:
+                return (True, recorded)
+            # Recorded pid is live but is a recycled/unrelated process —
+            # fall through to the pgrep/owner.pid fallbacks.
+
+    # 2. Scoped pgrep fallback.
+    pgrep_pid = _daemon_pid_from_pgrep(bridge_home)
+    if pgrep_pid:
+        return (True, pgrep_pid)
+
+    # 3. mkdir-lock owner.pid fallback (macOS flock-less backend).
+    owner_pid = _daemon_pid_from_owner_pid(pid_file)
+    if owner_pid:
+        return (True, owner_pid)
+
+    # Nothing resolved. Preserve the prior display convention: a recorded
+    # (but dead/unrelated) pid is echoed back; an absent pid-file shows '-'.
+    if recorded:
+        return (False, recorded)
+    return (False, "-")
 
 
 def read_dotenv(path: Path) -> dict[str, str]:
@@ -1243,7 +1355,11 @@ def render_bar(value: int, width: int = 10, char: str = "#") -> str:
 def render_dashboard(args: argparse.Namespace) -> str:
     roster = read_roster(args.roster_snapshot)
     queue_db = Path(args.db)
-    daemon_running, daemon_pid = daemon_status(args.daemon_pid_file)
+    daemon_running, daemon_pid = daemon_status(
+        args.daemon_pid_file,
+        state_dir=args.bridge_state_dir,
+        bridge_home=args.bridge_home or "",
+    )
 
     metrics: dict[str, dict[str, int | str | None]] = {}
     totals = {
@@ -1540,7 +1656,11 @@ def render_dashboard(args: argparse.Namespace) -> str:
 def render_dashboard_json(args: argparse.Namespace) -> str:
     roster = read_roster(args.roster_snapshot)
     queue_db = Path(args.db)
-    daemon_running, daemon_pid = daemon_status(args.daemon_pid_file)
+    daemon_running, daemon_pid = daemon_status(
+        args.daemon_pid_file,
+        state_dir=args.bridge_state_dir,
+        bridge_home=args.bridge_home or "",
+    )
     metrics: dict[str, dict[str, int | str | None]] = {}
     totals = {
         "queued_count": 0,

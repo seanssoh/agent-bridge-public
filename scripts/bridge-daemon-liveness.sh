@@ -127,8 +127,6 @@ record_cooldown() {
 restart_daemon() {
   local pid="$1"
   local age="$2"
-  local stop_rc=0
-  local start_rc=0
   emit_audit daemon_liveness_restart_attempt \
     --detail pid="$pid" \
     --detail heartbeat_age_seconds="$age" \
@@ -141,17 +139,34 @@ restart_daemon() {
   # Use BRIDGE_HOME's daemon script so the watcher targets the same install
   # root the heartbeat file was observed in. The launchd plist sets
   # BRIDGE_HOME explicitly; override via env if running by hand.
+  #
+  # Issue #1463: route through the single `restart` verb instead of a
+  # direct `stop --force` + `start`. On macOS launchd installs `restart`
+  # cycles launchd's OWN supervised job (`launchctl kickstart -k`) so the
+  # fresh daemon is launchd's instance and holds the singleton lock inside
+  # the supervised process tree — KeepAlive then has nothing to thrash
+  # against. A direct out-of-band stop+start (the old code) established a
+  # NON-launchd lock holder and re-armed the KeepAlive vs lock thrash on
+  # every ~600s liveness restart. On Linux (systemd/nohup) `restart` falls
+  # through to the same stop+start it always did, so this is a no-op there.
+  # rc=2 means restart REFUSED (out-of-band split needs a one-time operator
+  # reconcile) — surface it distinctly rather than masking it as success.
+  #
   # --force: the liveness watchdog only fires on a wedged daemon (heartbeat
   # past threshold). Bypass the #314/#315 active-agent guard so a stuck
   # daemon can still be restarted on a host with running agents.
-  if ! bash "$DAEMON_SH" stop --force >/dev/null 2>&1; then
-    stop_rc=$?
+  local restart_rc=0
+  bash "$DAEMON_SH" restart --force >/dev/null 2>&1 || restart_rc=$?
+  if (( restart_rc == 2 )); then
+    emit_audit daemon_liveness_restart_refused \
+      --detail reason="launchd_out_of_band_split" \
+      --detail heartbeat_age_seconds="$age"
+    printf '[liveness] restart REFUSED (out-of-band launchd split) — run "bridge-daemon.sh stop --force" once to reconcile\n'
+    return 1
   fi
-  if ! bash "$DAEMON_SH" start >/dev/null 2>&1; then
-    start_rc=$?
+  if (( restart_rc != 0 )); then
     emit_audit daemon_liveness_restart_failed \
-      --detail stop_rc="$stop_rc" \
-      --detail start_rc="$start_rc"
+      --detail restart_rc="$restart_rc"
     return 1
   fi
   printf '[liveness] restarted daemon pid=%s age=%ss\n' "$pid" "$age"
