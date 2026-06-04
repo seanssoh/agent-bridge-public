@@ -1,6 +1,9 @@
 # scripts/lint-heredoc-ban.sh --baseline-check ratchets against this file.
 # Schema: path<TAB>line<TAB>category<TAB>snippet_hash<TAB>reason<TAB>owner<TAB>expires_or_phase
 # Identity column is snippet_hash; line numbers are advisory.
+lib/bridge-agents.sh	5976	H3	f136d4b40ccf4727bc393e85710f85ab93fc0c3c2bb3f3587d6ed3855c2cee72	here-string/procsub, non-interpreter consumer	claude	plugin-requires-resolver (Part 1)
+lib/bridge-agents.sh	6062	H3	7b8781ef245b8be0b80600d8c42ce948340878670d7f2a260f3f922011c5c04e	here-string/procsub, non-interpreter consumer	claude	plugin-requires-resolver (Part 1)
+lib/bridge-agents.sh	6140	H3	58ffbcae1d04007f64f18668b42ef3ca6f964345b08046448376712ce8416487	here-string/procsub, non-interpreter consumer	claude	plugin-requires-resolver (Part 1)
 path	line	category	snippet_hash	reason	owner	expires_or_phase
 agent-bridge	744	C3	cc220a62dc7a5d056fd7e18ea17f2e1859ec43860341cb16e686acccdf4769c4	interpreter heredoc, no capture	patch	Phase 3 PR C
 agent-bridge	779	C3	99b39b0478da9a718dde0e83b21c7e3f236073606f3776baf08ed74fc6f9f741	interpreter heredoc, no capture	patch	Phase 3 PR C

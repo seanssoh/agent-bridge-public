@@ -5932,6 +5932,225 @@ bridge_plugin_source_dir_for_channel_item() {
   printf '%s' ""
 }
 
+# Read the optional `requires` channel specs declared by a plugin's manifest.
+#
+# Takes a (qualified) channel item `plugin:name@marketplace`, resolves its
+# on-disk install dir via bridge_plugin_source_dir_for_channel_item, reads
+# `.claude-plugin/plugin.json`, and prints each element of the manifest's
+# optional top-level `"requires"` array on its own line (qualified to canonical
+# `plugin:name@marketplace` form). Empty output means: no requires, OR the
+# plugin/manifest could not be resolved locally (the two cases are
+# indistinguishable here by design — the *caller* decides whether an
+# unresolvable plugin is a warn-and-continue, which it does via a separate
+# resolvability probe). The JSON read is delegated to a standalone python
+# helper invoked file-as-argv (NOT heredoc-stdin) per footgun #11.
+#
+# Generic: this function never inspects the plugin name or marketplace. It only
+# forwards whatever channel specs the manifest declares. Zero domain knowledge.
+bridge_plugin_requires_specs_for_item() {
+  local item="${1:-}"
+  local source_dir=""
+  local manifest=""
+  local raw_spec=""
+  local qualified=""
+
+  item="$(bridge_qualify_channel_item "$item")"
+  [[ "$item" == plugin:*@* ]] || return 0
+
+  source_dir="$(bridge_plugin_source_dir_for_channel_item "$item" 2>/dev/null || true)"
+  [[ -n "$source_dir" && -d "$source_dir" ]] || return 0
+  manifest="$source_dir/.claude-plugin/plugin.json"
+  [[ -f "$manifest" ]] || return 0
+
+  bridge_require_python
+  if ! bridge_resolve_script_dir_check; then
+    return 0
+  fi
+
+  while IFS= read -r raw_spec; do
+    raw_spec="$(bridge_trim_whitespace "$raw_spec")"
+    [[ -n "$raw_spec" ]] || continue
+    qualified="$(bridge_qualify_channel_item "$raw_spec")"
+    [[ -n "$qualified" ]] || continue
+    printf '%s\n' "$qualified"
+  done < <(python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/plugin-manifest-requires.py" "$manifest" 2>/dev/null || true)
+}
+
+# Probe whether a (qualified) channel item resolves to an installed plugin dir
+# with a readable manifest. Used by bridge_expand_channel_requires to tell an
+# *unresolvable* requires (warn-and-continue, e.g. a marketplace plugin not yet
+# installed locally) apart from a resolvable one with no requires.
+bridge_plugin_item_is_resolvable() {
+  local item="${1:-}"
+  local source_dir=""
+
+  item="$(bridge_qualify_channel_item "$item")"
+  [[ "$item" == plugin:*@* ]] || return 1
+
+  source_dir="$(bridge_plugin_source_dir_for_channel_item "$item" 2>/dev/null || true)"
+  [[ -n "$source_dir" && -d "$source_dir" && -f "$source_dir/.claude-plugin/plugin.json" ]]
+}
+
+# Transitively expand each plugin's declared `requires` into the channel set.
+#
+# Generic plugin-dependency resolver for the agent-create path (issue: patch
+# cm-prod Part 1). A plugin manifest may declare a `"requires"` array of channel
+# specs it needs (e.g. a plugin that requires `plugin:<dep>@<marketplace>`);
+# this walks the requested channels, reads each plugin's requires, and pulls the
+# transitive closure into the resolved CSV. Zero domain hardcoding — core only
+# reads whatever specs the manifest declares.
+#
+# Algorithm (BFS over plugin specs):
+#   * Seed the accumulator (ordered, deduped) + the work queue with the
+#     originally requested channels. Original channels come first; added
+#     requires append in discovery order.
+#   * For each plugin spec dequeued: if it is a plugin spec that resolves
+#     locally, read its `requires`. For each required spec not already in the
+#     accumulator, append it and enqueue it for further expansion. Emit one
+#     `[info] <plugin> requires <a>, <b> — adding` line per plugin that pulls
+#     something new.
+#   * dedupe: an explicitly-listed channel that is also a `requires` appears
+#     once (the accumulator membership check + bridge_append_csv_unique).
+#   * cycle detection: a `visited` set tracks plugin specs already expanded. A
+#     `requires` pointing back at an already-visited plugin emits a clear
+#     `[error] ... requires cycle detected ...` and terminates that branch
+#     (no infinite loop, create still proceeds with the deduped set).
+#   * depth cap: BFS rounds are capped (BRIDGE_REQUIRES_MAX_DEPTH, default 8).
+#     Exceeding the cap is a clear `[error]` (no hang) and stops further
+#     expansion.
+#   * robustness: an *unresolvable* requires (plugin not installed locally)
+#     is a bridge_warn + continue — create is NEVER blocked by a dependency
+#     that cannot be expanded; the un-expanded set is returned. (A cyclic /
+#     over-deep requires is a clear error; an unresolvable one is warn-only.)
+#
+# Prints the deduped, order-preserving expanded CSV on stdout. Backward
+# compatible: a set with no plugin `requires` returns byte-identical input.
+bridge_expand_channel_requires() {
+  local channels_csv="${1:-}"
+  local max_depth="${BRIDGE_REQUIRES_MAX_DEPTH:-8}"
+
+  [[ -n "$channels_csv" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  local result="$channels_csv"
+  local -a queue=()
+  local -a next_queue=()
+  local item="" spec="" qualified="" added_for_item=""
+  local depth=0
+  local item_added=0
+
+  # Membership sets. Markers are `\n<spec>\n` so a substring `case` match is
+  # exact (no prefix/substring false-hits across distinct specs).
+  #   * seed_specs    — the operator's originally requested channels. A
+  #                     requires that merely re-names a seed is normal dedupe,
+  #                     NOT a cycle.
+  #   * expanded_specs — plugins whose `requires` have already been read. Used
+  #                     both to avoid re-reading a plugin and, together with
+  #                     "added via requires", to flag a genuine back-edge.
+  #   * required_specs — specs pulled in transitively (via some plugin's
+  #                     requires). A requires pointing back at an
+  #                     already-expanded *required* spec is a dependency cycle
+  #                     (A->B->A); a requires pointing at a seed is just dedupe.
+  local seed_specs=$'\n'
+  local expanded_specs=$'\n'
+  local required_specs=$'\n'
+
+  # Seed the work queue + seed set with the requested channels (plugin specs
+  # only — non-plugin tokens stay in $result untouched).
+  IFS=',' read -r -a queue <<<"$channels_csv"
+  for item in "${queue[@]}"; do
+    item="$(bridge_trim_whitespace "$item")"
+    [[ -n "$item" ]] || continue
+    item="$(bridge_qualify_channel_item "$item")"
+    [[ "$item" == plugin:*@* ]] || continue
+    case "$seed_specs" in
+      *$'\n'"$item"$'\n'*) ;;
+      *) seed_specs+="$item"$'\n' ;;
+    esac
+  done
+
+  while (( ${#queue[@]} > 0 )); do
+    if (( depth >= max_depth )); then
+      bridge_warn "channel requires expansion exceeded max depth ($max_depth); stopping further expansion"
+      echo "[error] channel requires depth cap ($max_depth) exceeded — stopping expansion" >&2
+      break
+    fi
+    next_queue=()
+
+    for item in "${queue[@]}"; do
+      item="$(bridge_trim_whitespace "$item")"
+      [[ -n "$item" ]] || continue
+      item="$(bridge_qualify_channel_item "$item")"
+      [[ "$item" == plugin:*@* ]] || continue
+
+      # Skip a plugin whose requires we already read (re-processing guard; also
+      # bounds any cycle by construction — a re-encountered plugin is never
+      # expanded twice).
+      case "$expanded_specs" in
+        *$'\n'"$item"$'\n'*) continue ;;
+      esac
+      expanded_specs+="$item"$'\n'
+
+      # An unresolvable plugin (not installed locally) cannot have its requires
+      # read — warn and continue with the un-expanded set. Never block create.
+      if ! bridge_plugin_item_is_resolvable "$item"; then
+        bridge_warn "channel '$item' could not be resolved locally; its plugin 'requires' (if any) were not expanded"
+        continue
+      fi
+
+      added_for_item=""
+      item_added=0
+      while IFS= read -r spec; do
+        spec="$(bridge_trim_whitespace "$spec")"
+        [[ -n "$spec" ]] || continue
+        qualified="$(bridge_qualify_channel_item "$spec")"
+        [[ -n "$qualified" ]] || continue
+
+        # Cycle-as-error: a requires pointing back at a plugin that was itself
+        # pulled in via requires AND already expanded is a dependency back-edge
+        # (e.g. A->B->A). Report it clearly and skip; the BFS terminates either
+        # way (expanded_specs bounds it), but the explicit error makes a real
+        # cycle operator-visible. A requires that names an originally-listed
+        # seed is NOT a cycle — it is normal dedupe (handled silently below).
+        if [[ "$required_specs" == *$'\n'"$qualified"$'\n'* \
+              && "$expanded_specs" == *$'\n'"$qualified"$'\n'* \
+              && "$seed_specs" != *$'\n'"$qualified"$'\n'* ]]; then
+          echo "[error] $item requires $qualified — dependency cycle detected, skipping" >&2
+          continue
+        fi
+
+        # Dedupe against the accumulated set: an already-listed channel
+        # (explicit seed or previously-added requires) is not added twice and
+        # is not re-enqueued (so a requires on a seed terminates silently).
+        case ",$result," in
+          *",$qualified,"*) continue ;;
+        esac
+
+        result="$(bridge_append_csv_unique "$result" "$qualified")"
+        required_specs+="$qualified"$'\n'
+        next_queue+=("$qualified")
+        item_added=1
+        if [[ -n "$added_for_item" ]]; then
+          added_for_item="$added_for_item, $qualified"
+        else
+          added_for_item="$qualified"
+        fi
+      done < <(bridge_plugin_requires_specs_for_item "$item")
+
+      if (( item_added == 1 )); then
+        echo "[info] $item requires $added_for_item — adding" >&2
+      fi
+    done
+
+    queue=("${next_queue[@]}")
+    depth=$((depth + 1))
+  done
+
+  printf '%s' "$result"
+}
+
 bridge_plugin_mcp_server_selectors_csv_for_item() {
   local item="${1:-}"
   local source_dir=""
