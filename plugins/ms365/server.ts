@@ -150,6 +150,17 @@ const TENANT_ID = process.env.MS365_TENANT_ID ?? ''
 const CLIENT_ID = process.env.MS365_CLIENT_ID ?? ''
 const CLIENT_SECRET = process.env.MS365_CLIENT_SECRET ?? ''
 const DEFAULT_UPN = process.env.MS365_DEFAULT_UPN ?? ''
+// Multi-agent OAuth callback demux: when several isolated agents share one
+// public bot endpoint behind a router (one Azure app, N per-agent listeners),
+// the OAuth `/auth/callback` carries no agent identity — only ?code&state.
+// We embed the originating agent id as a `<agent>.<uuid>` prefix in the OAuth
+// `state` (Microsoft echoes `state` back verbatim) so the router can route the
+// callback to the agent that started the pairing. Sanitized to the callback
+// state charset so a malformed BRIDGE_AGENT_ID degrades to a plain-uuid state
+// (single-listener behavior, no demux). See teams plugin `/auth/callback`.
+const AGENT_TAG = /^[A-Za-z0-9_-]{1,64}$/.test((process.env.BRIDGE_AGENT_ID ?? '').trim())
+  ? (process.env.BRIDGE_AGENT_ID ?? '').trim()
+  : ''
 const DEFAULT_SCOPES =
   process.env.MS365_DEFAULT_SCOPES ??
   'openid profile offline_access User.Read Mail.Read Mail.Send Calendars.Read Calendars.ReadWrite People.Read User.Read.All Directory.Read.All Chat.ReadWrite'
@@ -376,7 +387,10 @@ function callbackPath(state: string): string {
 }
 
 function startAuthCode(upn: string, scopes: string, redirectUri: string): PendingFile {
-  const state = randomUUID()
+  // `<agent>.<uuid>` when running under the bridge multi-agent router, else a
+  // plain uuid. The `.` separator is absent from bridge agent ids and uuids, so
+  // the router can recover the agent with `state.split('.')[0]`.
+  const state = AGENT_TAG ? `${AGENT_TAG}.${randomUUID()}` : randomUUID()
   const now = Math.floor(Date.now() / 1000)
   const authorizeParams = new URLSearchParams({
     client_id: CLIENT_ID,
