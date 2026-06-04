@@ -632,6 +632,58 @@ acting-identity (`--as`) regimes, and the honest security model — is in
 [`docs/a2a-rooms.md`](./docs/a2a-rooms.md). Design rationale + schema:
 [`docs/design/a2a-rooms-design.md`](./docs/design/a2a-rooms-design.md).
 
+## Plugin channel `requires` (auto-provision dependency channels)
+
+(v0.16.0-beta3+, #1528) A plugin can declare the other channels it needs at
+runtime, so an operator no longer has to remember to hand-list every dependency
+when creating an agent (forgetting one used to yield a half-provisioned agent
+that looks created but can't authenticate or call its API).
+
+**Declare** — in the plugin's `.claude-plugin/plugin.json`, an optional
+top-level `"requires"` array:
+
+```json
+{
+  "name": "my-crm",
+  "version": "1.0.0",
+  "requires": ["plugin:ms365@agent-bridge", "plugin:my-approval@my-marketplace"]
+}
+```
+
+Each entry is a canonical channel spec `plugin:<name>@<marketplace>` (the same
+form `--channels` takes; the `@marketplace` suffix is required for non-built-in
+plugins).
+
+**Resolve** — on `agent create`, after the `--channels` list is parsed and
+before the dry-run gate, the create path transitively expands each plugin's
+`requires` into the resolved channel set:
+
+```bash
+agent-bridge agent create alice --channels plugin:my-crm@my-marketplace
+# [info] plugin:my-crm@my-marketplace requires plugin:ms365@agent-bridge, plugin:my-approval@my-marketplace — adding
+# → alice is provisioned with all three channels
+```
+
+- **Dedupe**: a channel listed explicitly *and* pulled in as a `requires`
+  appears once.
+- **Transitive**: a `requires` chain is followed (BFS), with a depth cap
+  (`BRIDGE_REQUIRES_MAX_DEPTH`, default 8) and cycle detection (`A→B→A` is a
+  clear error, never a hang).
+- **Never blocks create**: a `requires` pointing at a plugin not installed
+  locally (e.g. a marketplace plugin not yet seeded) emits a `bridge_warn` and
+  proceeds with the un-expanded set — the agent is still created.
+- **`--dry-run`** shows the expanded set without creating, so you can preview
+  what a channel pulls in.
+- **Backward compatible**: a plugin with no `requires` behaves exactly as
+  before (the resolved set is byte-identical). Core reads only what the manifest
+  declares — there is no domain-specific dependency knowledge in the bridge.
+
+The manifest `requires` lives with the plugin (in its marketplace/registry), so
+a fleet-wide capability is declared once and every install that pulls the
+marketplace gets the auto-provisioning. Caveat: a wholesale marketplace version
+sync that overwrites the plugin's `plugin.json` will drop a `requires` added
+out-of-band — declare it in the plugin's source so syncs preserve it.
+
 ## Status And Debugging
 
 Use these first:
