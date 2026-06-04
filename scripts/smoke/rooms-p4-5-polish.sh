@@ -176,17 +176,20 @@ base_url() { printf 'http://127.0.0.1:%s' "$A2A_PORT"; }
 write_a2a_roster() {
   local workdir="$BRIDGE_AGENT_HOME_ROOT/reviewer"
   mkdir -p "$workdir"
-  cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
-BRIDGE_ADMIN_AGENT_ID="reviewer"
-bridge_add_agent_id_if_missing "reviewer"
-BRIDGE_AGENT_DESC["reviewer"]="A2A P4.5 polish smoke reviewer"
-BRIDGE_AGENT_ENGINE["reviewer"]="shell"
-BRIDGE_AGENT_SESSION["reviewer"]="$REVIEWER_SESSION_NAME"
-BRIDGE_AGENT_WORKDIR["reviewer"]="$workdir"
-BRIDGE_AGENT_LAUNCH_CMD["reviewer"]="bash -lc 'echo reviewer'"
-BRIDGE_AGENT_LOOP["reviewer"]=0
-BRIDGE_AGENT_CONTINUE["reviewer"]=0
-EOF
+  # printf (not a heredoc) per the repo's heredoc-stdin ban (footgun #11 /
+  # KNOWN_ISSUES §26). Each roster line is a separate printf arg; the
+  # session/workdir values interpolate the same way an unquoted heredoc would.
+  printf '%s\n' \
+    'BRIDGE_ADMIN_AGENT_ID="reviewer"' \
+    'bridge_add_agent_id_if_missing "reviewer"' \
+    'BRIDGE_AGENT_DESC["reviewer"]="A2A P4.5 polish smoke reviewer"' \
+    'BRIDGE_AGENT_ENGINE["reviewer"]="shell"' \
+    "BRIDGE_AGENT_SESSION[\"reviewer\"]=\"$REVIEWER_SESSION_NAME\"" \
+    "BRIDGE_AGENT_WORKDIR[\"reviewer\"]=\"$workdir\"" \
+    "BRIDGE_AGENT_LAUNCH_CMD[\"reviewer\"]=\"bash -lc 'echo reviewer'\"" \
+    'BRIDGE_AGENT_LOOP["reviewer"]=0' \
+    'BRIDGE_AGENT_CONTINUE["reviewer"]=0' \
+    >"$BRIDGE_ROSTER_LOCAL_FILE"
 }
 
 # Both the unknown AND the valid target are in the inbound allowlist so the
@@ -194,23 +197,26 @@ EOF
 # (the roster gate), the valid one enqueues.
 write_a2a_config() {
   local port="$1"
-  cat >"$BRIDGE_HOME/handoff.local.json" <<EOF
-{
-  "bridge_id": "bridge-b",
-  "listen": { "address": "127.0.0.1", "port": ${port}, "enqueue_path": "/enqueue" },
-  "timestamp_skew_seconds": 300,
-  "peers": [
-    {
-      "id": "bridge-a",
-      "address": "127.0.0.1",
-      "port": ${port},
-      "secret": "${A2A_SECRET}",
-      "inbound_allowlist": ["${VALID_TARGET}", "${UNKNOWN_TARGET}"],
-      "caps": { "max_body_bytes": 262144, "max_title_bytes": 1024 }
-    }
-  ]
-}
-EOF
+  # printf (not a heredoc) per the repo's heredoc-stdin ban (footgun #11 /
+  # KNOWN_ISSUES §26). One printf arg per JSON line; the port/secret/allowlist
+  # values interpolate the same way an unquoted heredoc would.
+  printf '%s\n' \
+    '{' \
+    '  "bridge_id": "bridge-b",' \
+    "  \"listen\": { \"address\": \"127.0.0.1\", \"port\": ${port}, \"enqueue_path\": \"/enqueue\" }," \
+    '  "timestamp_skew_seconds": 300,' \
+    '  "peers": [' \
+    '    {' \
+    '      "id": "bridge-a",' \
+    '      "address": "127.0.0.1",' \
+    "      \"port\": ${port}," \
+    "      \"secret\": \"${A2A_SECRET}\"," \
+    "      \"inbound_allowlist\": [\"${VALID_TARGET}\", \"${UNKNOWN_TARGET}\"]," \
+    '      "caps": { "max_body_bytes": 262144, "max_title_bytes": 1024 }' \
+    '    }' \
+    '  ]' \
+    '}' \
+    >"$BRIDGE_HOME/handoff.local.json"
   chmod 0600 "$BRIDGE_HOME/handoff.local.json"
 }
 
