@@ -225,6 +225,21 @@ add_required rooms-p4-1-cross-node-join
 # mint prevented), epoch monotonicity, the cache update is atomic, and the
 # local-leader-add path stays distinct (no P4.1 regression).
 add_required rooms-p4-2-roster-broadcast
+# A2A rooms P4.3 (design §11): room-scoped TALK (cross-node member messaging).
+# Once a member node holds a leader-MAC'd roster in room_roster_cache (from P4.2),
+# members on DIFFERENT nodes exchange room-scoped messages WITHOUT the leader
+# online — each member validates membership against its OWN local cache + the
+# envelope's room_epoch, fail-closed. Lives in bridge-handoffd.py
+# (room_scoped_check — the P4.3 leader-MAC roster-cache gate on the enqueue path),
+# bridge_rooms_common.py (roster_cache_membership_check), and bridge-rooms.py
+# (`room talk` — OS-actor-anchored sender + cached-epoch stamp + room-scoped
+# enqueue over the node-link). Pins the 9 teeth: a member message is delivered, a
+# non-member sender is rejected, a mismatched epoch (stale AND ahead) is rejected
+# fail-closed, an unknown room (no cache) is rejected, a missing room_id/epoch is
+# 422, a plain non-room message is NOT room talk (delivered, no gate, no
+# membership), a hostile --from/env cannot impersonate, a replay is deduped /
+# same-id-diff-body is 409, and the auth preamble is unreachable pre-auth.
+add_required rooms-p4-3-room-talk
 
 
 }
@@ -890,7 +905,7 @@ select_for_path() {
       add_required queue a2a-rooms-p1b-acl
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/smoke/rooms-p4-2-roster-broadcast-helper.py|scripts/smoke/rooms-p4-2-post-hook.sh|scripts/install-handoffd-systemd.sh)
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/smoke/rooms-p4-2-roster-broadcast-helper.py|scripts/smoke/rooms-p4-2-post-hook.sh|scripts/smoke/rooms-p4-3-room-talk-helper.py|scripts/smoke/rooms-p4-3-post-hook.sh|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the
@@ -989,7 +1004,18 @@ select_for_path() {
       # teeth (cross-approve needs a verified row, non-leader roster rejected,
       # bad pairwise HMAC rejected, first-roster-without-binding refused, epoch
       # monotonicity, atomic cache, local-add path distinct). Pull on every move.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast
+      # A2A Rooms P4.3 (design §11): room-scoped TALK. The membership gate is the
+      # P4.3 activation of room_scoped_check in bridge-handoffd.py (it now reads
+      # the member-local leader-MAC room_roster_cache + the envelope room_epoch,
+      # fail-closed, instead of a live is_member read); the cache-membership
+      # decision is roster_cache_membership_check in bridge_rooms_common.py; the
+      # `room talk` sender (OS-actor-anchored + cached-epoch stamp + room-scoped
+      # enqueue) is in bridge-rooms.py. rooms-p4-3-room-talk pins the 9 teeth
+      # (member delivered, non-member rejected, epoch mismatch stale/ahead
+      # rejected, unknown room rejected, missing room_id/epoch 422, plain message
+      # not room talk, hostile --from cannot impersonate, replay dedupe /
+      # same-id-diff-body 409, auth preamble unreachable pre-auth). Pull on move.
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)

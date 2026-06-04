@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -610,16 +611,20 @@ def _identity_update_apply(
 #     HMAC / source-addr / allowlist / dedupe auth — it runs AFTER them and
 #     can only ADD a deny for a room-scoped message.
 #   - ROOM-scoped message -> the fail-closed membership decision against the
-#     local rooms.db: the enqueue is allowed ONLY if BOTH the sender
-#     (sender_agent@sender_node) AND the target (target_agent@<this_node>)
-#     are current members of the room. Any of {rooms module unavailable,
-#     rooms.db absent/unreadable, room unknown, either party not a member}
-#     -> FAIL CLOSED (deny). Because P1a is single-node and the receiver only
-#     ever handles cross-node traffic, no production message is room-scoped
-#     yet — so this branch is wired + unit-tested but off the hot path. P4
-#     replaces the raw membership read with a leader-MAC'd roster verify +
-#     freshness (roster_max_age / epoch refresh) WITHOUT touching this
-#     signature or the fail-closed default.
+#     member-local leader-MAC'd ROSTER CACHE (NOT a live rooms.db membership
+#     read, and NOT a live leader call): the enqueue is allowed ONLY if the
+#     local `room_roster_cache` for `room_id` exists, its cached epoch EQUALS
+#     the envelope's `room_epoch`, AND BOTH the sender (sender_agent@<the
+#     node-link-authenticated peer>) AND the target (target_agent@<this_node>)
+#     appear in that cached roster. Any of {rooms module unavailable,
+#     rooms.db absent/unreadable, no cache for the room, epoch mismatch, either
+#     party not a cached member} -> FAIL CLOSED (deny). This is the P4.3
+#     activation the P1a seam was frozen for: P4.3 replaces the raw `is_member`
+#     read with the leader-MAC'd roster-cache verify + epoch freshness WITHOUT
+#     touching this `(env, cfg) -> (ok, reason)` signature or the fail-closed
+#     default. The roster cache is written ONLY by P4.2's
+#     `accept_roster_broadcast` after a pairwise-HMAC verify FROM the leader, so
+#     the receiver never trusts a membership claim inside the inbound message.
 
 def room_scoped_check(env: dict[str, Any],
                       cfg: dict[str, Any]) -> tuple[bool, str]:
@@ -629,13 +634,31 @@ def room_scoped_check(env: dict[str, Any],
     config (carries this node's `bridge_id`); it is the authenticated peer
     config the caller already validated — the seam does NOT re-derive trust
     from it, it only reads the local node id.
+
+    A2A Rooms P4.3 (design §11): for a room-scoped envelope the decision is the
+    member-local leader-MAC'd ROSTER-CACHE membership gate
+    (`rooms.roster_cache_membership_check`), with `room_epoch` from the wire and
+    the un-spoofable authenticated peer as the sender node. A NON-room message
+    (no `room_id`) returns the unconditional `not_room_scoped` pass — the two
+    paths are fully separate: a plain send is NEVER gated by room membership and
+    NEVER grants/implies it (brief contract 5).
     """
     if not a2a.envelope_is_room_scoped(env):
         return True, "not_room_scoped"
 
     room_id = str(env.get("room_id") or "")
+    # `room_epoch` is validated as a non-negative int by parse_envelope before
+    # this seam runs; 0 is a legitimate epoch, so we read the actual value and
+    # let the gate's EXACT-match enforce freshness (contract 3, fail-closed both
+    # ways — a stale OR ahead epoch is rejected, never delivered).
+    room_epoch = int(env.get("room_epoch") or 0)
     sender = env.get("sender", {})
     sender_agent = str(sender.get("agent") or "") if isinstance(sender, dict) else ""
+    # The SENDER NODE is the node-link-AUTHENTICATED peer (the signed X-AGB-Peer
+    # the caller already verified), surfaced as `sender.bridge` in the envelope
+    # and pinned to == peer_id by the do_POST `reject_sender_mismatch` check that
+    # runs BEFORE this seam. We read it from the envelope (already proven to
+    # equal the authenticated peer) so the seam stays a pure (env, cfg) function.
     sender_node = str(sender.get("bridge") or "") if isinstance(sender, dict) else ""
     target_agent = str(env.get("target_agent") or "")
     this_node = str(cfg.get("bridge_id") or "")
@@ -653,16 +676,14 @@ def room_scoped_check(env: dict[str, Any],
         return False, "no_rooms_db"
 
     try:
-        room = rooms.get_room(conn, room_id)
-        if room is None:
-            return False, "room_unknown"
-        if not rooms.is_member(conn, room_id, sender_agent, sender_node):
-            return False, "sender_not_member"
-        if not rooms.is_member(conn, room_id, target_agent, this_node):
-            return False, "target_not_member"
+        reason = rooms.roster_cache_membership_check(
+            conn, room_id=room_id, room_epoch=room_epoch,
+            sender_agent=sender_agent, sender_node=sender_node,
+            target_agent=target_agent, target_node=this_node,
+        )
     finally:
         conn.close()
-    return True, "members_ok"
+    return (reason == rooms.ROOM_TALK_OK), reason
 
 
 # --------------------------------------------------------------------------
@@ -743,6 +764,73 @@ def staged_body_text(env: dict[str, Any]) -> str:
         "",
     ]
     return "\n".join(header) + env.get("body", "")
+
+
+def stage_inbound_body(peer_id: str, message_id: str, text: str) -> Path:
+    """Stage an inbound enqueue body to a PEER-SCOPED, COLLISION-PROOF file.
+
+    A2A Rooms P4.3 (codex r2 review BLOCKING): the staged artifact MUST NOT be
+    keyed on `message_id` alone. With the composite `(peer, message_id)` dedupe
+    ledger, the SAME sender-chosen `message_id` is legal for DIFFERENT
+    authenticated peers — and the receiver is threaded (one do_POST per request),
+    while `bridge-task.sh create --body-file <path>` reads the staged file LATER
+    (in a subprocess). A message_id-only path (`incoming/<id>.md`) let two
+    concurrent same-id peers race on ONE shared file: peer B could overwrite it
+    AFTER peer A verified its body hash but BEFORE peer A's bridge-task subprocess
+    read `--body-file`, so peer A's task would be created with peer B's body /
+    provenance while peer A's dedupe row recorded peer A's hash. That is a
+    cross-peer side effect outside the peer-scoped dedupe contract.
+
+    The defense: the filename is derived from sha256(peer_id || "\\0" ||
+    message_id) (so two peers reusing one id get DISTINCT base names — the NUL
+    separator makes the pair-encoding unambiguous), and the file is created with
+    O_EXCL (exclusive create) plus a per-attempt random suffix, so NO two
+    concurrent stages — even the SAME (peer, message_id) re-delivered twice —
+    can ever point at or overwrite the same path. The UNIQUE created path is
+    returned and is exactly what flows to `--body-file` (no re-derivation back to
+    a message_id-only path). Mode 0600; the later bridge-task subprocess (same
+    uid) reads it fine.
+    """
+    incoming = a2a.incoming_dir()
+    # Controller-side staging dir under the receiver's OWN handoff state — never
+    # an isolated-agent path (the receiver daemon owns it). Same controller-only
+    # context as the pre-existing log_dir / pid_path mkdirs in this file.
+    incoming.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only
+    digest = hashlib.sha256(
+        peer_id.encode("utf-8") + b"\x00" + message_id.encode("utf-8")
+    ).hexdigest()
+    data = text.encode("utf-8")
+    # O_EXCL exclusive create with a random suffix: the digest scopes the name to
+    # the (peer, message_id) pair; the random suffix + O_EXCL guarantees a fresh,
+    # never-shared inode even under concurrent same-pair re-delivery. Retry on the
+    # astronomically-unlikely suffix collision (O_EXCL raises FileExistsError).
+    for _ in range(8):
+        suffix = os.urandom(8).hex()
+        staged = incoming / f"{digest}-{suffix}.md"
+        try:
+            fd = os.open(
+                str(staged),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+        except OSError:
+            # Best-effort cleanup of a half-written exclusive file, then re-raise
+            # so the caller surfaces a 5xx rather than enqueuing a partial body.
+            # Controller-side staging path (receiver-owned), never an iso path.
+            try:
+                os.unlink(str(staged))  # noqa: raw-pathlib-controller-only
+            except OSError:
+                pass
+            raise
+        return staged
+    raise OSError(
+        "could not create a unique staged-body file after repeated O_EXCL "
+        "collisions")
 
 
 # --------------------------------------------------------------------------
@@ -1099,17 +1187,21 @@ class HandoffHandler(BaseHTTPRequestHandler):
         a2a.ensure_handoff_dirs()
         conn = a2a.open_inbox()
         try:
+            # Dedupe is scoped to the AUTHENTICATED peer (composite PK) so one
+            # peer cannot pre-seed/block another peer's sender-chosen message_id
+            # (A2A Rooms P4.3 codex review — same fix class as room_join_dedupe).
             existing = conn.execute(
                 "SELECT body_sha256, created_task_id FROM inbox_dedupe "
-                "WHERE message_id=?", (message_id,)
+                "WHERE peer=? AND message_id=?", (peer_id, message_id)
             ).fetchone()
             if existing is not None:
                 if existing["body_sha256"] == body_hash:
                     # Same id + same body → idempotent success.
                     conn.execute(
                         "UPDATE inbox_dedupe SET last_seen_ts=?, "
-                        "delivery_count=delivery_count+1 WHERE message_id=?",
-                        (a2a.now_ts(), message_id),
+                        "delivery_count=delivery_count+1 "
+                        "WHERE peer=? AND message_id=?",
+                        (a2a.now_ts(), peer_id, message_id),
                     )
                     conn.commit()
                     audit("accept_duplicate", peer=peer_id, client=client_ip,
@@ -1121,8 +1213,9 @@ class HandoffHandler(BaseHTTPRequestHandler):
                 # Same id + different body → security event, conflict.
                 conn.execute(
                     "UPDATE inbox_dedupe SET last_seen_ts=?, "
-                    "delivery_count=delivery_count+1 WHERE message_id=?",
-                    (a2a.now_ts(), message_id),
+                    "delivery_count=delivery_count+1 "
+                    "WHERE peer=? AND message_id=?",
+                    (a2a.now_ts(), peer_id, message_id),
                 )
                 conn.commit()
                 audit("reject_hash_conflict", peer=peer_id, client=client_ip,
@@ -1164,12 +1257,15 @@ class HandoffHandler(BaseHTTPRequestHandler):
                     return
 
             # --- stage body + enqueue via bridge-task.sh ---
-            staged = a2a.incoming_dir() / f"{message_id.replace(':', '_').replace('/', '_')}.md"
-            staged.write_text(staged_body_text(env), encoding="utf-8")
-            try:
-                os.chmod(staged, 0o600)
-            except OSError:
-                pass
+            # PEER-SCOPED + O_EXCL collision-proof staging (codex P4.3 r2): the
+            # composite-PK ledger legalizes the same message_id across peers, so
+            # the staged file MUST NOT be message_id-keyed (else two concurrent
+            # same-id peers race on one shared file between stage and the later
+            # bridge-task --body-file read). stage_inbound_body returns a UNIQUE
+            # path scoped to (peer_id, message_id) that flows straight to
+            # --body-file. peer_id is the authenticated X-AGB-Peer.
+            staged = stage_inbound_body(
+                peer_id, message_id, staged_body_text(env))
 
             sender = env.get("sender", {})
             ok, task_id, detail = enqueue_via_bridge_task(
@@ -1484,23 +1580,29 @@ class HandoffHandler(BaseHTTPRequestHandler):
         a2a.ensure_handoff_dirs()
         conn = a2a.open_inbox()
         try:
+            # Peer-scoped dedupe (composite PK) — same isolation as the enqueue
+            # path (A2A Rooms P4.3 codex review): one peer cannot pre-seed/block
+            # another peer's message_id in the shared inbox_dedupe ledger.
             existing = conn.execute(
-                "SELECT body_sha256 FROM inbox_dedupe WHERE message_id=?",
-                (message_id,),
+                "SELECT body_sha256 FROM inbox_dedupe "
+                "WHERE peer=? AND message_id=?",
+                (peer_id, message_id),
             ).fetchone()
             if existing is not None:
                 if existing["body_sha256"] == body_hash:
                     conn.execute(
                         "UPDATE inbox_dedupe SET last_seen_ts=?, "
-                        "delivery_count=delivery_count+1 WHERE message_id=?",
-                        (a2a.now_ts(), message_id),
+                        "delivery_count=delivery_count+1 "
+                        "WHERE peer=? AND message_id=?",
+                        (a2a.now_ts(), peer_id, message_id),
                     )
                     conn.commit()
                     return "duplicate"
                 conn.execute(
                     "UPDATE inbox_dedupe SET last_seen_ts=?, "
-                    "delivery_count=delivery_count+1 WHERE message_id=?",
-                    (a2a.now_ts(), message_id),
+                    "delivery_count=delivery_count+1 "
+                    "WHERE peer=? AND message_id=?",
+                    (a2a.now_ts(), peer_id, message_id),
                 )
                 conn.commit()
                 return "conflict"

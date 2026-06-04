@@ -1611,6 +1611,106 @@ def get_roster_cache(conn: sqlite3.Connection,
     ).fetchone()
 
 
+# --------------------------------------------------------------------------
+# Member-side room-scoped TALK gate (A2A Rooms P4.3, design §11)
+# --------------------------------------------------------------------------
+#
+# Once a member node holds a leader-MAC'd roster in `room_roster_cache` (written
+# by P4.2's `accept_roster_broadcast` after a pairwise-HMAC verify FROM the
+# leader), members on DIFFERENT nodes can exchange room-scoped messages WITHOUT
+# the leader being online — because each member validates membership against its
+# OWN local cache, never a live leader call. A room-scoped message carries
+# `room_id` + `room_epoch`; the receiver fail-closed-checks both the sender and
+# the local target against the locally-cached roster for that `room_id` at that
+# exact `room_epoch`. The receiver MUST NOT trust any membership claim inside the
+# inbound message — it consults ONLY this cache (the one P4.2 verified).
+
+# Stable, audit-safe room-talk membership outcome codes (contract 8: no
+# secret/token ever appears in them).
+ROOM_TALK_OK = "members_ok"
+ROOM_TALK_NO_CACHE = "no_roster_cache"        # no leader-MAC roster for this room
+ROOM_TALK_BAD_CACHE = "roster_cache_corrupt"  # cached members_json unparseable
+ROOM_TALK_EPOCH_MISMATCH = "epoch_mismatch"   # envelope epoch != cached epoch
+ROOM_TALK_SENDER_NOT_MEMBER = "sender_not_member"
+ROOM_TALK_TARGET_NOT_MEMBER = "target_not_member"
+
+
+def _cached_members(row: sqlite3.Row) -> Optional[list[dict[str, str]]]:
+    """Parse the cached `members_json` into a list of {agent,node} dicts.
+
+    Returns None if the stored JSON is not a list of objects (corrupt cache —
+    the caller fails closed). Each entry is normalized to plain strings so the
+    membership comparison never trips on a non-string node/agent.
+    """
+    try:
+        parsed = json.loads(str(row["members_json"] or "[]"))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    out: list[dict[str, str]] = []
+    for m in parsed:
+        if not isinstance(m, dict):
+            return None
+        out.append({
+            "agent": str(m.get("agent", "")),
+            "node": str(m.get("node", "")),
+        })
+    return out
+
+
+def roster_cache_membership_check(
+    conn: sqlite3.Connection, *, room_id: str, room_epoch: int,
+    sender_agent: str, sender_node: str, target_agent: str, target_node: str,
+) -> str:
+    """Fail-closed room-talk membership gate against the LOCAL roster cache (P4.3).
+
+    The member-side heart of P4.3 (brief contracts 2-4). The CALLER (the
+    receiver) has ALREADY run the full node-link auth preamble, so `sender_node`
+    is the node-link-AUTHENTICATED peer (un-spoofable) and `target_node` is THIS
+    receiver's own node id. This function applies the remaining room-scoped
+    delivery contracts and returns a ROOM_TALK_* code; the receiver delivers ONLY
+    on ROOM_TALK_OK.
+
+    Contracts enforced here (NEVER trusts any membership claim in the inbound
+    message — it reads ONLY the locally-cached leader-MAC roster):
+      - NO local roster cache for `room_id` → ROOM_TALK_NO_CACHE (contract 2: a
+        room with no leader-verified roster cannot validate membership → deny,
+        no delivery). A plain non-room send never reaches here, so it can NEITHER
+        be gated by this nor seed a cache.
+      - `room_epoch` must EQUAL the cached epoch (contract 3, fail-closed BOTH
+        ways): an envelope epoch lower OR higher than the cache → ROOM_TALK_
+        EPOCH_MISMATCH. We refuse to deliver against a roster we cannot confirm
+        the sender belongs to AT THAT EPOCH (roster refresh on mismatch is P4.x,
+        deliberately out of scope — just fail closed).
+      - The authenticated SENDER `(sender_agent, sender_node)` MUST appear in the
+        cached roster (contract 2/4). Identity is OS-actor + node anchored: the
+        node is the un-spoofable authenticated peer, and a hostile wire
+        `sender_agent` can at most name an agent the leader ACTUALLY admitted on
+        that node — it cannot conjure a NON-member into the cache → ROOM_TALK_
+        SENDER_NOT_MEMBER otherwise.
+      - The local TARGET `(target_agent, target_node)` MUST also be a cached
+        member (you only deliver a room message to a local agent who is itself in
+        the room) → ROOM_TALK_TARGET_NOT_MEMBER otherwise.
+    """
+    row = get_roster_cache(conn, room_id)
+    if row is None:
+        return ROOM_TALK_NO_CACHE
+    if int(room_epoch) != int(row["epoch"]):
+        return ROOM_TALK_EPOCH_MISMATCH
+    members = _cached_members(row)
+    if members is None:
+        return ROOM_TALK_BAD_CACHE
+    sender_pair = (str(sender_agent), str(sender_node))
+    target_pair = (str(target_agent), str(target_node))
+    member_pairs = {(m["agent"], m["node"]) for m in members}
+    if sender_pair not in member_pairs:
+        return ROOM_TALK_SENDER_NOT_MEMBER
+    if target_pair not in member_pairs:
+        return ROOM_TALK_TARGET_NOT_MEMBER
+    return ROOM_TALK_OK
+
+
 def accept_roster_broadcast(
     conn: sqlite3.Connection, *, room_id: str, room_epoch: int,
     members: list[dict[str, Any]], leader_node: str, peer_id: str,

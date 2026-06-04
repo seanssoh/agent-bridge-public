@@ -14,7 +14,8 @@
 #   - envelope contract: build/parse round-trip with room_id+room_epoch AND
 #     v1 (no room fields) back-compat
 #   - receiver seam: room_scoped_check fail-closed contract (non-room pass;
-#     room-scoped member ok; non-member / unknown-room / no-db deny)
+#     room-scoped member ok against the P4.3 leader-MAC roster cache + matching
+#     epoch; non-member / wrong-epoch / unknown-room / no-db deny)
 #   - rooms.db hygiene: mode 0600; absent-db reads degrade gracefully
 
 set -euo pipefail

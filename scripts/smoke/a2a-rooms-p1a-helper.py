@@ -169,6 +169,10 @@ def cmd_receiver_seam(repo_root: str) -> int:
     assert spec and spec.loader
     spec.loader.exec_module(hd)
 
+    # `bridge_id` is THIS receiver's node id — the membership gate pins the
+    # target to (target_agent, this_node). The cross-node sender (alice) is on
+    # nodeB so the room spans two nodes (the P4.3 cross-node case); bob is the
+    # local member on nodeA whom the message is delivered to.
     cfg = {"bridge_id": "nodeA"}
 
     # 1) non-room message -> pass (no-op).
@@ -183,7 +187,7 @@ def cmd_receiver_seam(repo_root: str) -> int:
 
     # 2) room-scoped but NO rooms.db -> fail closed.
     e2 = a2a.build_envelope(
-        message_id="m", sender_bridge="nodeA", sender_agent="alice",
+        message_id="m", sender_bridge="nodeB", sender_agent="alice",
         target_agent="bob", priority="normal", title="t", body="b",
         room_id="room-x", room_epoch=1,
     )
@@ -193,31 +197,68 @@ def cmd_receiver_seam(repo_root: str) -> int:
               file=sys.stderr)
         return 1
 
-    # Build a room with alice@nodeA (leader) + bob@nodeA member.
+    # A2A Rooms P4.3 (design §11): the seam now reads the member-local leader-MAC
+    # ROSTER CACHE + the envelope room_epoch (NOT a live is_member read). Seed a
+    # cache for `rid` at epoch 5 with the cross-node sender alice@nodeB (the
+    # leader's node) + the local member bob@nodeA — exactly what a P4.2 broadcast
+    # would have written on this member node.
     conn = rooms.open_rooms()
-    tok = rooms.mint_invite_token()
-    rid = rooms.create_room(
-        conn, name="t", leader_agent="alice", leader_node="nodeA", token=tok,
+    members = [
+        {"agent": "alice", "node": "nodeB", "role": "leader"},
+        {"agent": "bob", "node": "nodeA", "role": "member"},
+    ]
+    members_json = json.dumps(
+        sorted(members, key=lambda m: (m["agent"], m["node"])),
+        separators=(",", ":"))
+    rid = "room-p43-seam"
+    conn.execute(
+        "INSERT OR REPLACE INTO room_roster_cache (room_id, epoch, members_json, "
+        "from_node, mac, fetched_ts) VALUES (?, ?, ?, ?, ?, ?)",
+        (rid, 5, members_json, "nodeB", "leader-mac", rooms.now_ts()),
     )
-    rooms.add_member(conn, rid, "bob", "nodeA")
+    conn.commit()
     conn.close()
 
-    # 3) both members -> pass.
+    # 3) both members + matching epoch -> pass (cache-gated).
     e3 = a2a.build_envelope(
-        message_id="m", sender_bridge="nodeA", sender_agent="alice",
+        message_id="m", sender_bridge="nodeB", sender_agent="alice",
         target_agent="bob", priority="normal", title="t", body="b",
-        room_id=rid, room_epoch=1,
+        room_id=rid, room_epoch=5,
     )
     ok, reason = hd.room_scoped_check(e3, cfg)
     if not ok or reason != "members_ok":
         print(f"both-members must pass, got {(ok, reason)}", file=sys.stderr)
         return 1
 
+    # 3b) matching members but MISMATCHED epoch -> fail closed (P4.3 contract 3).
+    e3b = a2a.build_envelope(
+        message_id="m", sender_bridge="nodeB", sender_agent="alice",
+        target_agent="bob", priority="normal", title="t", body="b",
+        room_id=rid, room_epoch=4,
+    )
+    ok, reason = hd.room_scoped_check(e3b, cfg)
+    if ok or reason != "epoch_mismatch":
+        print(f"epoch-mismatch must fail closed, got {(ok, reason)}",
+              file=sys.stderr)
+        return 1
+
+    # 3c) a NON-member sender -> fail closed (P4.3 contract 2/4).
+    e3c = a2a.build_envelope(
+        message_id="m", sender_bridge="nodeB", sender_agent="mallory",
+        target_agent="bob", priority="normal", title="t", body="b",
+        room_id=rid, room_epoch=5,
+    )
+    ok, reason = hd.room_scoped_check(e3c, cfg)
+    if ok or reason != "sender_not_member":
+        print(f"non-member sender must fail closed, got {(ok, reason)}",
+              file=sys.stderr)
+        return 1
+
     # 4) target not a member -> fail closed.
     e4 = a2a.build_envelope(
-        message_id="m", sender_bridge="nodeA", sender_agent="alice",
+        message_id="m", sender_bridge="nodeB", sender_agent="alice",
         target_agent="carol", priority="normal", title="t", body="b",
-        room_id=rid, room_epoch=1,
+        room_id=rid, room_epoch=5,
     )
     ok, reason = hd.room_scoped_check(e4, cfg)
     if ok or reason != "target_not_member":
@@ -225,14 +266,14 @@ def cmd_receiver_seam(repo_root: str) -> int:
               file=sys.stderr)
         return 1
 
-    # 5) unknown room -> fail closed.
+    # 5) unknown room (no cache row) -> fail closed.
     e5 = a2a.build_envelope(
-        message_id="m", sender_bridge="nodeA", sender_agent="alice",
+        message_id="m", sender_bridge="nodeB", sender_agent="alice",
         target_agent="bob", priority="normal", title="t", body="b",
-        room_id="room-nope", room_epoch=1,
+        room_id="room-nope", room_epoch=5,
     )
     ok, reason = hd.room_scoped_check(e5, cfg)
-    if ok or reason != "room_unknown":
+    if ok or reason != "no_roster_cache":
         print(f"unknown-room must fail closed, got {(ok, reason)}",
               file=sys.stderr)
         return 1
