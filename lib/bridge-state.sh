@@ -2001,11 +2001,15 @@ _bridge_rewrite_session_id_in_file() {
 
   [[ -n "$file" && -f "$file" ]] || return 1
 
-  # `stat` flag differs between BSD (macOS) and GNU; fall back to a portable
-  # python probe so the helper works on both supported platforms.
-  if mode="$(stat -f '%Lp' "$file" 2>/dev/null)"; then
+  # `stat` flag differs between BSD (macOS) and GNU; try GNU first, then BSD,
+  # then fall back to a portable python probe so the helper works on both
+  # supported platforms. GNU-first is the canonical order across the repo: on
+  # GNU coreutils `stat -f` reads *filesystem* (statvfs) status, not file mode,
+  # so a BSD-first `stat -f '%Lp'` here would emit a statvfs blob (or a wrong
+  # value) on Linux and that polluted string would then be fed to `chmod`.
+  if mode="$(stat -c '%a' "$file" 2>/dev/null)"; then
     :
-  elif mode="$(stat -c '%a' "$file" 2>/dev/null)"; then
+  elif mode="$(stat -f '%Lp' "$file" 2>/dev/null)"; then
     :
   else
     mode="$(python3 - "$file" <<'PY' 2>/dev/null || true
