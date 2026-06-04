@@ -13,7 +13,7 @@
       "name": "teams",
       "source": "./plugins/teams",
       "description": "Microsoft Teams channel for Claude Code with Agent Bridge access control and setup integration.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "category": "messaging",
       "tags": ["teams", "messaging", "channel", "mcp"]
     },
@@ -21,7 +21,7 @@
       "name": "ms365",
       "source": "./plugins/ms365",
       "description": "Microsoft 365 / Graph API tools for Claude Code with Agent Bridge channel state and disclosure policy integration.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "category": "productivity",
       "tags": ["microsoft", "m365", "graph", "mail", "calendar", "teams", "mcp"]
     },

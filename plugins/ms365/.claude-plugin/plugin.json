@@ -1,7 +1,7 @@
 {
   "name": "ms365",
   "description": "Microsoft 365 / Graph API tools for Claude Code. Per-UPN delegated token management via OAuth authorization code flow (paired through the Teams plugin's /auth/callback handler). Tools for mail, calendar, people, directory, and Teams chat.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "Agent Bridge",
     "email": "maintainers@agent-bridge.local"
