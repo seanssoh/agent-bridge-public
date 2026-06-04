@@ -3605,6 +3605,104 @@ bridge_agent_clear_setup_pending() {
   return 1
 }
 
+# --- Credential-pending marker (PR-B / #1520b) --------------------------------
+#
+# Holds a freshly-created linux-user-isolated Claude agent from authless
+# daemon auto-start until its per-agent `.credentials.json` has been seeded.
+#
+# THE RACE: `agent create` makes a queued / always-on / cron static role
+# DAEMON-VISIBLE at the roster commit (bridge_write_role_block), which runs
+# BEFORE linux-user isolation-prep and BEFORE any credential seed. So the
+# daemon's next reconcile tick can warm-start the agent into its isolated
+# HOME *before* a credential exists there → the engine launches
+# unauthenticated and every channel reports "Channels not available".
+#
+# This marker is TRANSIENT RUNTIME STATE — NOT operator intent (start-policy
+# is the persistent-intent surface). It lives at the per-agent state leaf
+# `state/agents/<a>/credential-pending` alongside the idle / manual-stop /
+# setup-pending family. Unlike setup-pending it has NO grace window: it
+# stays put until the credential file actually lands, at which point the
+# daemon autostart gate self-clears it (lazy clear — see
+# bridge_daemon_autostart_allowed). Semantics are minimal — empty file,
+# presence IS the data (no body parse).
+#
+# Lifecycle:
+#   mark   — written by `agent create` BEFORE the roster commit, for every
+#            linux-user + claude agent regardless of always_on. Controller-
+#            owned direct write (the isolated `.claude` tree does not exist
+#            yet pre-prep, and the state-dir self-heal that runs after
+#            isolation-prep normalizes the leaf's group/mode later — we do
+#            NOT fight it). Returns non-zero on failure so the create flow
+#            can FAIL-CLOSED before the agent becomes roster-visible.
+#   active — pure existence test (consulted by the daemon autostart gate).
+#   clear  — best-effort removal on agent delete / retire / create-rollback,
+#            and lazily by the daemon autostart gate once the credential is
+#            present. iso-v2 sudo fallback mirrors clear_setup_pending.
+bridge_agent_credential_pending_file() {
+  local agent="$1"
+  printf '%s/credential-pending' "$(bridge_agent_idle_marker_dir "$agent")"
+}
+
+# Write the marker as a controller-owned empty file. Called pre-roster from
+# `agent create` (before isolation-prep), so the canonical matrix-aware
+# writer path is NOT used here — the isolated HOME / state group do not
+# exist yet. The state-dir self-heal that runs later in create normalizes
+# the leaf's mode (2770) + group (ab-agent-<a>) so the iso UID can later
+# read it; until then a controller-owned 0600 file is correct and the
+# daemon (controller-side) can both stat and rm it.
+#
+# Returns 1 if the directory or file cannot be created — the caller (C1)
+# MUST treat this as a hard create failure so the daemon race is never left
+# unguarded.
+bridge_agent_credential_pending_mark() {
+  local agent="$1"
+  local dir
+  local file
+
+  [[ -n "$agent" ]] || return 1
+  dir="$(bridge_agent_idle_marker_dir "$agent")"
+  file="$(bridge_agent_credential_pending_file "$agent")"
+
+  mkdir -p "$dir" >/dev/null 2>&1 || return 1
+  : >"$file" 2>/dev/null || return 1
+  return 0
+}
+
+# Returns 0 (true) iff the marker exists. No grace window — the hold
+# persists until the credential is seeded and the daemon gate clears it.
+bridge_agent_credential_pending_active() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  [[ -e "$(bridge_agent_credential_pending_file "$agent")" ]]
+}
+
+# Best-effort remove. Idempotent — no-op when the marker is already gone.
+# Called on agent delete / retire / create-rollback and lazily by the
+# daemon autostart gate. Mirrors bridge_agent_clear_setup_pending's iso-v2
+# sudo fallback: after the create-time state-dir self-heal the leaf is
+# mode 2770 group ab-agent-<a>, and a marker the daemon clear path created
+# may by then be owned by the iso UID — the controller's plain `rm -f` can
+# EACCES, so hand off to bridge_linux_sudo_root on linux-user hosts.
+bridge_agent_credential_pending_clear() {
+  local agent="$1"
+  local file
+
+  [[ -n "$agent" ]] || return 0
+  file="$(bridge_agent_credential_pending_file "$agent")"
+  [[ -e "$file" ]] || return 0
+
+  if rm -f "$file" 2>/dev/null; then
+    return 0
+  fi
+  if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    if bridge_linux_sudo_root rm -f "$file" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  bridge_warn "bridge_agent_credential_pending_clear: failed to remove $file (agent=$agent)"
+  return 1
+}
+
 bridge_reconcile_idle_markers() {
   local agent
   local file

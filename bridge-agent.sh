@@ -247,6 +247,15 @@ bridge_agent_create_rollback() {
     fi
   fi
 
+  # PR-B / #1520b (codex constraint C2) — clear the credential-pending hold
+  # marker on rollback. The marker is written pre-roster (BEFORE
+  # bridge_write_role_block), so a mid-flow abort can reach here with the
+  # marker on disk but the roster row already excised above. Leaving the
+  # marker would orphan a state leaf for a no-longer-registered agent.
+  if command -v bridge_agent_credential_pending_clear >/dev/null 2>&1; then
+    bridge_agent_credential_pending_clear "$agent" >/dev/null 2>&1 || true
+  fi
+
   # 2. Scaffold target — the per-agent identity source / home tree.
   if [[ "$scaffold_created" == "1" && -n "$scaffold_target" ]]; then
     bridge_agent_create_rollback_rmtree "$scaffold_target"
@@ -4049,6 +4058,37 @@ report and reap test-fixture agents per their pattern."
     local _create_audit_roster_path="$BRIDGE_ROSTER_LOCAL_FILE"
     local _create_audit_before_sha
     _create_audit_before_sha="$(bridge_agent_update_file_sha256 "$_create_audit_roster_path")"
+    # PR-B / #1520b (codex constraint C1) — credential-pending hold marker.
+    #
+    # A freshly-created linux-user-isolated Claude agent becomes DAEMON-
+    # VISIBLE at the bridge_write_role_block below — BEFORE isolation-prep
+    # and BEFORE any credential seed. The daemon's next reconcile tick can
+    # then warm-start the agent into its isolated HOME before a
+    # `.credentials.json` exists there → it launches unauthenticated and
+    # every channel reports "Channels not available" (the patch cm-prod
+    # PR-B incident). The credential-pending marker holds all three daemon
+    # start surfaces (warm always-on, on-demand queued, cron-dispatch wake)
+    # until the credential lands.
+    #
+    # The marker write is MANDATORY and PRE-ROSTER: if it cannot be created
+    # we FAIL create here, before the agent is ever roster-visible, so the
+    # race can never open. (The rollback trap armed above clears the marker
+    # on any later abort; the create-time SEED below is best-effort and does
+    # NOT roll back create, because by then the marker is already protecting
+    # daemon starts.) Gated on linux-user + claude regardless of always_on
+    # (C3): bridge_daemon_autostart_allowed is consulted by all three start
+    # paths, so one marker covers them all.
+    # Fail-CLOSED (codex C1): the marker is MANDATORY before the
+    # bridge_write_role_block roster commit below. NO `command -v` guard — if
+    # bridge_agent_credential_pending_mark is missing/unsourced the call returns
+    # 127 and the `if !` triggers bridge_die, so a linux-user Claude agent is
+    # NEVER roster-committed (daemon-visible) without the hold. A silent-skip
+    # here would reopen the authless-auto-start race.
+    if [[ "$isolation_mode" == "linux-user" ]] && [[ "$engine" == "claude" ]]; then
+      if ! bridge_agent_credential_pending_mark "$agent"; then
+        bridge_die "agent create: cannot write credential-pending hold marker for '$agent' (state/agents/$agent/credential-pending) — refusing to register a linux-user Claude agent the daemon could auto-start unauthenticated (#1520b). Inspect parent permissions on '$BRIDGE_ACTIVE_AGENT_DIR' and retry."
+      fi
+    fi
     # Issue #1093: pass positional 20 (loop_explicit_off) and positional
     # 21 (idle_timeout_value) so `agent add --loop no` persists the
     # explicit-off line and `--idle-timeout <seconds>` writes the
@@ -4231,6 +4271,66 @@ report and reap test-fixture agents per their pattern."
     if [[ -n "$channels" ]] && [[ $always_on -eq 1 ]] \
         && command -v bridge_agent_mark_setup_pending >/dev/null 2>&1; then
       bridge_agent_mark_setup_pending "$agent" >/dev/null 2>&1 || true
+    fi
+    # PR-B / #1520b (codex constraint C6) — create-time best-effort
+    # credential seed.
+    #
+    # The agent is now in the roster + its isolated `.claude/` tree exists
+    # (isolation-prep + first-run config ran above). Best-effort seed its
+    # `.credentials.json` NOW so the daemon's autostart gate self-clears the
+    # credential-pending marker on the very next tick instead of waiting up
+    # to a full periodic-sync interval. This reuses the EXISTING sync path
+    # verbatim — the same external `bridge-auth.sh claude-token sync` the
+    # daemon periodic-sync tick calls (bridge-daemon.sh) — so there is NO
+    # new credential-WRITING logic here: bridge-auth.sh loads the roster,
+    # resolves the iso owner/UID/path, runs the aliveness gate
+    # (expired→clean-fail, near-expiry→warn), and writes atomically across
+    # the UID boundary.
+    #
+    # bridge_with_timeout is external-command-only (it cannot bound a bash
+    # function), so it wraps the external bridge-auth.sh under a 15s box.
+    # Best-effort + held-on-failure: on success the cred file lands and the
+    # daemon gate (C4) self-clears the marker + allows; on failure/timeout
+    # the marker STAYS (agent held, never authless) and the daemon's
+    # periodic sync seeds it later — either way create NEVER rolls back on a
+    # seed failure (`|| true`). Only linux-user + claude agents carry the
+    # marker, so the seed is scoped to the same predicate.
+    if [[ "$isolation_mode" == "linux-user" ]] && [[ "$engine" == "claude" ]] \
+        && command -v bridge_with_timeout >/dev/null 2>&1; then
+      local _seed_json=""
+      _seed_json="$(bridge_with_timeout 15 create_credential_seed \
+        "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync \
+        --agents "$agent" --json 2>/dev/null || true)"
+      # Emit a controller_credentials_aliveness audit row (trigger=create)
+      # from the captured envelope BEFORE discarding it — same row shape as
+      # the daemon periodic-sync aliveness audit. Parse via the shared
+      # daemon-helpers parser under its own time-box; an empty / unparseable
+      # envelope (skipped sync, seed failure) yields no rows and we audit
+      # nothing. The capture above intentionally does NOT redirect to
+      # /dev/null so this audit can see the JSON.
+      if [[ -n "$_seed_json" ]] && command -v bridge_audit_log >/dev/null 2>&1; then
+        local _seed_rows=""
+        _seed_rows="$(bridge_with_timeout 5 create_credential_seed_parse python3 \
+          "$SCRIPT_DIR/bridge-daemon-helpers.py" sync-aliveness-parse "$_seed_json" \
+          2>/dev/null || printf '')"
+        if [[ -n "$_seed_rows" ]]; then
+          local _seed_tmp=""
+          _seed_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-create-seed-aliveness.XXXXXX" 2>/dev/null \
+            || printf '%s' "/tmp/agb-create-seed-aliveness.$$.$RANDOM")"
+          printf '%s\n' "$_seed_rows" > "$_seed_tmp"
+          local _seed_agent="" _seed_alive="" _seed_remaining=""
+          while IFS=$'\t' read -r _seed_agent _seed_alive _seed_remaining; do
+            [[ -n "$_seed_agent" ]] || continue
+            bridge_audit_log daemon controller_credentials_aliveness "$agent" \
+              --detail agent="$_seed_agent" \
+              --detail aliveness="${_seed_alive:-unknown}" \
+              --detail remaining_ms="${_seed_remaining:-0}" \
+              --detail trigger=create \
+              >/dev/null 2>&1 || true
+          done < "$_seed_tmp"
+          rm -f "$_seed_tmp" 2>/dev/null || true
+        fi
+      fi
     fi
     # Issue #680: bridge-start.sh --dry-run is purely informational here — its
     # output is reprinted to the user as `start_dry_run:` for diagnostic
@@ -5777,6 +5877,13 @@ PY
     rm -f "$BRIDGE_STATE_DIR/daemon-autostart/$agent.env" 2>/dev/null || true
   fi
 
+  # PR-B / #1520b (codex constraint C2) — clear the credential-pending hold
+  # marker on delete so a recreated agent of the same name starts from a
+  # clean hold state (and no orphan state leaf survives the roster excision).
+  if command -v bridge_agent_credential_pending_clear >/dev/null 2>&1; then
+    bridge_agent_credential_pending_clear "$agent" >/dev/null 2>&1 || true
+  fi
+
   # Issue #1010: reap the dedicated OS user + its named-user traversal
   # ACEs for an isolated (linux-user) agent. Unlike --purge-home (which
   # only removes home *files*), the orphan OS user and stale
@@ -6245,6 +6352,13 @@ PY
   # entry left a backoff state row behind.
   if [[ -n "${BRIDGE_STATE_DIR:-}" ]]; then
     rm -f "$BRIDGE_STATE_DIR/daemon-autostart/$agent.env" 2>/dev/null || true
+  fi
+
+  # PR-B / #1520b (codex constraint C2) — clear the credential-pending hold
+  # marker on retire too (the marker is per-agent transient runtime state;
+  # a retired agent should not leave a hold marker behind).
+  if command -v bridge_agent_credential_pending_clear >/dev/null 2>&1; then
+    bridge_agent_credential_pending_clear "$agent" >/dev/null 2>&1 || true
   fi
 
   # Step 8: quarantine OR purge the home dir.
