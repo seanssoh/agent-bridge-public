@@ -1115,6 +1115,62 @@ bridge_run_ensure_claude_launch_channel_plugins() {
   )
 }
 
+# bridge_run_ensure_shared_claude_credential <agent_claude_root>
+#
+# Issue #1520 r2 (codex Phase-4 BLOCKING) — guard the CLAUDE_CONFIG_DIR
+# export against stranding a shared agent authless.
+#
+# The export points the launched `claude` at its per-agent config dir. That
+# is only safe if the dir actually holds the credential `claude` needs.
+# Static shared Claude agents get their per-agent `.credentials.json`
+# populated by the daemon's periodic `claude-token sync` (default scope
+# `static`). Shared DYNAMIC Claude agents do NOT: dynamic create seeds only
+# `.claude.json` (first-run config), and the daemon sync's static-only
+# default skips BRIDGE_AGENT_SOURCE != static. So a previously
+# operator-global-authed dynamic agent would restart pointed at an empty
+# per-agent dir and lose auth.
+#
+# Fix: seed-at-launch-if-missing. Before exporting, if the per-agent
+# credential file is absent, run a single-agent `claude-token sync` for THIS
+# agent (the explicit-CSV `--agents <agent>` spec bypasses the static-only
+# selector — see bridge_auth_selected_agents) which reuses the production
+# credential resolver + controller-credentials fallback and writes the file
+# at 0600 via bridge-auth.py's atomic writer. Works for static AND dynamic;
+# no sync-default change, no hand-rolled secret copying.
+#
+# Returns 0 when the export is safe (credential present, OR keychain-free
+# auth where `.credentials.json` is intentionally absent and the keychain-
+# free preflight already validated settings.json -> apiKeyHelper). Returns
+# 1 when the per-agent dir has no usable credential and could not be seeded
+# (e.g. operator never authed) — the caller then SKIPS the export so a
+# previously-working operator-global launch is not broken (graceful degrade).
+bridge_run_ensure_shared_claude_credential() {
+  local _claude_root="$1"
+  local _cred_file="$_claude_root/.credentials.json"
+
+  # Keychain-free auth: the per-agent dir authenticates via the apiKeyHelper
+  # wired into settings.json, not a credential file. The keychain-free
+  # preflight (bridge_run_claude_keychain_free_preflight) has already run and
+  # would have bridge_die'd on a bad settings.json. The export is safe and a
+  # missing credential file is expected — do not try to seed one.
+  if bridge_claude_keychain_free_auth_enabled 2>/dev/null; then
+    return 0
+  fi
+
+  # Already seeded (static agents, or a dynamic agent seeded on a prior pass).
+  [[ -f "$_cred_file" ]] && return 0
+
+  # Missing — seed THIS agent specifically (bypasses the static-only default).
+  # Best-effort + time-boxed: a sync failure must not wedge the launch loop.
+  bridge_with_timeout 20 shared_claude_credential_seed \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync \
+    --agents "$AGENT" --json >/dev/null 2>&1 || true
+
+  # Re-check: only report "safe to export" if the file now exists.
+  [[ -f "$_cred_file" ]] && return 0
+  return 1
+}
+
 # bridge_run_shared_launch <bash_bin> <launch_cmd> <errfile>
 #
 # Issue #1520 — final-launch site for the shared (non v2-secret-env) path.
@@ -1147,6 +1203,11 @@ bridge_run_ensure_claude_launch_channel_plugins() {
 #     explicitly out of scope for #1520.
 #   - The export runs in the same subshell that runs the launch, so it never
 #     pollutes the long-lived parent (the relaunch loop).
+#   - r2 (codex Phase-4): the export only fires when the per-agent dir holds a
+#     usable credential (bridge_run_ensure_shared_claude_credential seeds it
+#     on demand for static AND dynamic agents). If it cannot, the launch falls
+#     back to the pre-#1520 operator-global path so a previously-authed agent
+#     is never stranded.
 #   - Returns the child's exit code.
 bridge_run_shared_launch() {
   local _bash_bin="$1"
@@ -1156,6 +1217,14 @@ bridge_run_shared_launch() {
 
   if [[ "$ENGINE" == "claude" ]]; then
     _agent_claude_root="$(bridge_run_agent_claude_root)"
+    # r2: gate the export on the per-agent dir actually being authed. If the
+    # credential is missing AND cannot be seeded, clear the root so we skip
+    # the export and launch against the operator-global config as before.
+    if [[ -n "$_agent_claude_root" ]] \
+        && ! bridge_run_ensure_shared_claude_credential "$_agent_claude_root"; then
+      log_line "[warn] ${AGENT}: per-agent Claude credential missing and could not be seeded at $_agent_claude_root/.credentials.json — launching against the operator-global config (CLAUDE_CONFIG_DIR not set). Run 'agent-bridge auth claude-token sync --agents ${AGENT}' once the controller is authed to enable per-agent config isolation."
+      _agent_claude_root=""
+    fi
   fi
 
   local _rc=0
