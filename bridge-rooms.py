@@ -303,14 +303,31 @@ def cmd_list(args: argparse.Namespace) -> int:
     try:
         owned = local_node() if args.owned else None
         rows = rooms.list_rooms(conn, owned_node=owned)
+        led_ids = {r["room_id"] for r in rows}
         items = [
             {
                 "room_id": r["room_id"], "name": r["name"],
                 "leader": f"{r['leader_agent']}@{r['leader_node']}",
                 "epoch": int(r["epoch"]), "status": r["status"],
+                "role": "leader", "source": "rooms",
             }
             for r in rows
         ]
+        # Member-side fallback (P4.5): include rooms this node JOINED but does
+        # not LEAD. They have a `room_roster_cache` row (the applied leader-MAC
+        # roster) but no `rooms` row, so `list_rooms` misses them. `--owned`
+        # asks specifically for led rooms, so the cache is excluded there.
+        if not args.owned:
+            for cr in rooms.list_roster_cache(conn):
+                rid = str(cr["room_id"])
+                if rid in led_ids:
+                    continue
+                items.append({
+                    "room_id": rid, "name": None,
+                    "leader": rooms.cached_leader(cr),
+                    "epoch": int(cr["epoch"]), "status": None,
+                    "role": "member", "source": "roster-cache",
+                })
     finally:
         conn.close()
     if args.json:
@@ -320,8 +337,12 @@ def cmd_list(args: argparse.Namespace) -> int:
         info("no rooms" + (" owned by this node" if args.owned else ""))
         return 0
     for it in items:
-        out(f"{it['room_id']}  epoch={it['epoch']}  leader={it['leader']}  "
-            f"name={it['name']!r}  status={it['status']}")
+        if it["source"] == "roster-cache":
+            out(f"{it['room_id']}  epoch={it['epoch']}  leader={it['leader']}  "
+                f"role=member (cached)")
+        else:
+            out(f"{it['room_id']}  epoch={it['epoch']}  leader={it['leader']}  "
+                f"name={it['name']!r}  status={it['status']}")
     return 0
 
 
@@ -333,7 +354,15 @@ def cmd_show(args: argparse.Namespace) -> int:
     try:
         room = rooms.get_room(conn, args.room_id)
         if room is None:
-            return die(f"room not found: {args.room_id}", code=1)
+            # Member-side fallback (P4.5): this node does not LEAD the room, but
+            # may have JOINED it — in which case `room_roster_cache` holds the
+            # applied leader-MAC roster (the same cache `room talk` reads). Show
+            # that cached view read-only, clearly marked role=member /
+            # source=roster-cache, rather than the misleading "not found".
+            cache_row = rooms.get_roster_cache(conn, args.room_id)
+            if cache_row is None:
+                return die(f"room not found: {args.room_id}", code=1)
+            return _show_cached_room(args, cache_row)
         roster = rooms.roster_for(conn, args.room_id)
         pending = [
             {"agent": r["agent"], "node": r["node"], "status": r["status"]}
@@ -350,6 +379,8 @@ def cmd_show(args: argparse.Namespace) -> int:
         "status": room["status"],
         "members": roster["members"],
         "pending_join_requests": pending,
+        "role": "leader",
+        "source": "rooms",
     }
     if args.json:
         out(json.dumps(payload))
@@ -363,6 +394,39 @@ def cmd_show(args: argparse.Namespace) -> int:
         out("pending join requests:")
         for p in pending:
             out(f"  - {p['agent']}@{p['node']}")
+    return 0
+
+
+def _show_cached_room(args: argparse.Namespace,
+                      cache_row: Any) -> int:
+    """Render a member-side cached room view (P4.5) read-only.
+
+    The cache holds what the leader broadcast and this node verified+applied:
+    members (with role), epoch, and the leader node. It does NOT hold leader-only
+    fields (room name, status, the live pending-join queue) — those live only in
+    the leader's `rooms`/`room_join_requests` tables — so we surface ONLY what
+    the cache actually contains and never fabricate the rest.
+    """
+    members = rooms.cached_roster_members(cache_row)
+    if members is None:
+        return die(f"local roster cache for room {args.room_id} is corrupt",
+                   code=1)
+    payload = {
+        "room_id": str(cache_row["room_id"]),
+        "leader": rooms.cached_leader(cache_row),
+        "epoch": int(cache_row["epoch"]),
+        "members": members,
+        "role": "member",
+        "source": "roster-cache",
+    }
+    if args.json:
+        out(json.dumps(payload))
+        return 0
+    info(f"room {payload['room_id']} (epoch {payload['epoch']}, "
+         f"leader {payload['leader']}) [member-side cached view]")
+    out("members:")
+    for m in payload["members"]:
+        out(f"  - {m['agent']}@{m['node']} ({m['role']})")
     return 0
 
 
