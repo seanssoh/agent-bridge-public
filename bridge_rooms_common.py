@@ -523,6 +523,11 @@ CREATE TABLE IF NOT EXISTS rooms (
   epoch              INTEGER NOT NULL DEFAULT 0,
   invite_token_sha256 TEXT,
   invite_token_ts    INTEGER NOT NULL DEFAULT 0,
+  -- P4.1 (§14 R3): TTL in seconds for the current invite token. 0 == no
+  -- expiry (the P1 default, back-compat: an existing room created before
+  -- this column simply gets 0 and never expires). verify_invite_token
+  -- enforces `invite_token_ts + invite_token_ttl >= now` when ttl > 0.
+  invite_token_ttl   INTEGER NOT NULL DEFAULT 0,
   invite_once        INTEGER NOT NULL DEFAULT 0,
   status             TEXT NOT NULL DEFAULT 'active',
   created_ts         INTEGER NOT NULL,
@@ -545,6 +550,25 @@ CREATE TABLE IF NOT EXISTS room_join_requests (
   node         TEXT NOT NULL DEFAULT '',
   requested_ts INTEGER NOT NULL,
   status       TEXT NOT NULL DEFAULT 'pending',
+  -- P4.1 (§11, §14 R3) cross-node forward-contract columns. They carry ONLY
+  -- verified METADATA, NEVER the reusable token hash (contract 5: the hash is
+  -- bearer-equivalent and is never persisted in any row):
+  --   verified  : 1 when this pending row was created by the receiver AFTER
+  --               the node-link HMAC + token-hash + TTL/revocation verification
+  --               passed. A future cross-node `approve` (P4.2) REQUIRES a row
+  --               with verified=1 (the local leader-initiated add path stays
+  --               separate and does NOT claim this gate — contract 6).
+  --   via_node  : the HMAC-authenticated node-link peer the request arrived
+  --               over (the joiner's node, bound to the authenticated sender
+  --               bridge — never a wire-asserted node).
+  --   ttl_expiry: absolute unix ts after which this pending request is stale.
+  --               0 == no expiry. Forward-contract for P4.2 cleanup.
+  -- Existing P1 rows get verified=0 / via_node='' / ttl_expiry=0 on migration,
+  -- which correctly reads as "a local single-node request, not a verified
+  -- cross-node one".
+  verified     INTEGER NOT NULL DEFAULT 0,
+  via_node     TEXT NOT NULL DEFAULT '',
+  ttl_expiry   INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (room_id, agent, node)
 );
 
@@ -572,11 +596,57 @@ CREATE TABLE IF NOT EXISTS room_join_rate (
   last_ts      INTEGER NOT NULL,
   PRIMARY KEY (token_sha256, source)
 );
+
+-- P4.1 (codex r2): cross-node room-join-request dedupe ledger. It lives in
+-- rooms.db (NOT the A2A inbox.db) so the dedupe reservation and the
+-- room_join_requests pending row commit in ONE transaction — "a dedupe row
+-- exists" is then ATOMIC with "a pending row exists", closing the window where
+-- a reservation could survive a failed pending write and let a replay return a
+-- bogus idempotent-200 with no pending row. message_id is the idempotency key;
+-- body_sha256 distinguishes an exact replay (duplicate) from id-reuse
+-- (conflict). It carries NO token / token-hash (contract 5).
+CREATE TABLE IF NOT EXISTS room_join_dedupe (
+  message_id   TEXT NOT NULL,
+  peer         TEXT NOT NULL DEFAULT '',
+  body_sha256  TEXT NOT NULL,
+  created_ts   INTEGER NOT NULL,
+  -- codex P4.1 Phase-4: dedupe is scoped to the AUTHENTICATED peer. A
+  -- composite (peer, message_id) PK means one authenticated peer cannot
+  -- consume/block another peer's join id by reusing a message_id (the
+  -- earlier message_id-only PK let nodeC pre-reserve nodeB's id).
+  PRIMARY KEY (peer, message_id)
+);
 """
 
 
 def now_ts() -> int:
     return int(time.time())
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Idempotently add columns introduced AFTER P1 to an existing rooms.db.
+
+    `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a rooms.db
+    created by P1 lacks the P4.1 columns (rooms.invite_token_ttl,
+    room_join_requests.{verified,via_node,ttl_expiry}). We add them with the
+    same defaults the schema declares, so a migrated P1 row reads identically to
+    a freshly-created one. ALTER TABLE ADD COLUMN is cheap + non-rewriting in
+    SQLite; the per-column try/except makes re-runs (column already present) a
+    no-op rather than an error. NEVER drops/rewrites data.
+    """
+    migrations = (
+        "ALTER TABLE rooms ADD COLUMN invite_token_ttl INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE room_join_requests ADD COLUMN verified INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE room_join_requests ADD COLUMN via_node TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE room_join_requests ADD COLUMN ttl_expiry INTEGER NOT NULL DEFAULT 0",
+    )
+    for stmt in migrations:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            # duplicate column name (already migrated) → idempotent no-op.
+            pass
+    conn.commit()
 
 
 def _connect(path: Path, schema: str) -> sqlite3.Connection:
@@ -587,6 +657,7 @@ def _connect(path: Path, schema: str) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(schema)
+    _migrate_schema(conn)
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -792,22 +863,23 @@ def list_rooms(conn: sqlite3.Connection,
 
 def create_room(conn: sqlite3.Connection, *, name: str, leader_agent: str,
                 leader_node: str, token: str,
-                once: bool = False) -> str:
+                once: bool = False, ttl: int = 0) -> str:
     """Create a room led by `leader_agent@leader_node`; seed leader member row.
 
     `epoch` starts at 0. The leader row is role='leader'. Only the token HASH
-    is stored. Returns the minted room_id. The caller is responsible for
-    printing the one-time invite link (it holds the raw token).
+    is stored. `ttl` (seconds, P4.1) is the invite-token lifetime; 0 == no
+    expiry (the P1 default). Returns the minted room_id. The caller is
+    responsible for printing the one-time invite link (it holds the raw token).
     """
     room_id = mint_room_id()
     ts = now_ts()
     conn.execute(
         "INSERT INTO rooms (room_id, name, leader_agent, leader_node, epoch, "
-        "invite_token_sha256, invite_token_ts, invite_once, status, "
-        "created_ts, updated_ts) "
-        "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+        "invite_token_sha256, invite_token_ts, invite_token_ttl, invite_once, "
+        "status, created_ts, updated_ts) "
+        "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
         (room_id, name, leader_agent, leader_node, hash_token(token), ts,
-         1 if once else 0, ROOM_ACTIVE, ts, ts),
+         max(0, int(ttl)), 1 if once else 0, ROOM_ACTIVE, ts, ts),
     )
     conn.execute(
         "INSERT INTO room_members (room_id, agent, node, role, joined_ts) "
@@ -852,13 +924,21 @@ def require_leader(room: sqlite3.Row, caller_agent: str,
 # --------------------------------------------------------------------------
 
 def set_invite_token(conn: sqlite3.Connection, room_id: str, token: str,
-                     once: bool = False) -> None:
-    """Store a fresh token hash, INVALIDATING any prior token for the room."""
+                     once: bool = False, ttl: int = 0) -> None:
+    """Store a fresh token hash, INVALIDATING any prior token for the room.
+
+    `ttl` (seconds, P4.1 §14 R3) is the lifetime of THIS token; 0 == no expiry
+    (the P1 default). Setting/rotating a token resets `invite_token_ts` to now,
+    so the TTL clock restarts on every rotate — and because the prior hash is
+    overwritten, a rotate also REVOKES the old token (verify hash-compares the
+    new one). `ttl` is stored alongside so verify_invite_token can enforce
+    `invite_token_ts + ttl >= now`.
+    """
     ts = now_ts()
     conn.execute(
         "UPDATE rooms SET invite_token_sha256=?, invite_token_ts=?, "
-        "invite_once=?, updated_ts=? WHERE room_id=?",
-        (hash_token(token), ts, 1 if once else 0, ts, room_id),
+        "invite_token_ttl=?, invite_once=?, updated_ts=? WHERE room_id=?",
+        (hash_token(token), ts, max(0, int(ttl)), 1 if once else 0, ts, room_id),
     )
     # A rotated token invalidates prior rate-counters too (fresh budget).
     conn.execute(
@@ -868,14 +948,64 @@ def set_invite_token(conn: sqlite3.Connection, room_id: str, token: str,
     conn.commit()
 
 
-def verify_invite_token(room: sqlite3.Row, token: str) -> bool:
-    """Constant-time compare of `sha256(token)` against the room's stored hash."""
-    stored = room["invite_token_sha256"]
-    if not stored:
-        return False
+# Stable outcome codes for the token check (audit-safe — never carry the token).
+TOKEN_OK = "ok"
+TOKEN_MISMATCH = "mismatch"       # hash does not match (wrong/forged token)
+TOKEN_REVOKED = "revoked"         # no token set (rotated/burned away)
+TOKEN_EXPIRED = "expired"         # hash matches but TTL elapsed
+
+
+def verify_invite_token_outcome(room: sqlite3.Row, token: str,
+                                now: Optional[int] = None) -> str:
+    """Verify the invite token against the room, enforcing TTL + revocation.
+
+    Returns one of the TOKEN_* codes (NEVER the token itself, so the caller can
+    audit the outcome safely — contract 5). The order is:
+      1. revocation — a NULL/empty stored hash means the token was rotated or
+         burned away → TOKEN_REVOKED (nothing to match).
+      2. hash compare — constant-time `sha256(token)` vs the stored hash. A
+         mismatch is TOKEN_MISMATCH (wrong/forged token). We compare BEFORE the
+         TTL check so an attacker presenting a garbage token cannot learn the
+         room's TTL state via a timing/branch difference.
+      3. TTL (§14 R3) — when `invite_token_ttl` > 0, the token is valid only
+         while `invite_token_ts + ttl >= now`; past that it is TOKEN_EXPIRED.
+         A ttl of 0 means no expiry (P1 back-compat).
+    """
     import hmac as _hmac
 
-    return _hmac.compare_digest(stored, hash_token(token))
+    stored = room["invite_token_sha256"]
+    if not stored:
+        return TOKEN_REVOKED
+    if not _hmac.compare_digest(str(stored), hash_token(token)):
+        return TOKEN_MISMATCH
+    # Hash matched — now enforce TTL. Use a defensive getattr-style read so a
+    # row from an unmigrated/partial source (no ttl column) is treated as "no
+    # expiry" rather than raising.
+    try:
+        ttl = int(room["invite_token_ttl"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        ttl = 0
+    if ttl > 0:
+        try:
+            issued = int(room["invite_token_ts"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            issued = 0
+        if now is None:
+            now = now_ts()
+        if issued + ttl < int(now):
+            return TOKEN_EXPIRED
+    return TOKEN_OK
+
+
+def verify_invite_token(room: sqlite3.Row, token: str,
+                        now: Optional[int] = None) -> bool:
+    """Boolean form of `verify_invite_token_outcome` (True iff TOKEN_OK).
+
+    Now enforces TTL + revocation in addition to the hash compare, so every
+    existing caller (single-node `cmd_join`, the smokes) transparently gains the
+    P4.1 expiry/revocation gate without a signature change.
+    """
+    return verify_invite_token_outcome(room, token, now=now) == TOKEN_OK
 
 
 def burn_invite_token(conn: sqlite3.Connection, room_id: str) -> None:
@@ -1035,12 +1165,168 @@ def shared_rooms(conn: sqlite3.Connection, agent1: str, node1: str,
 
 def post_join_request(conn: sqlite3.Connection, room_id: str, agent: str,
                       node: str = "") -> None:
+    """Persist a LOCAL (single-node P1) pending join request.
+
+    verified stays 0 / via_node='' (this is not a node-link-attested cross-node
+    request). INSERT OR REPLACE re-affirms a re-requested pending row.
+    """
     conn.execute(
         "INSERT OR REPLACE INTO room_join_requests (room_id, agent, node, "
-        "requested_ts, status) VALUES (?, ?, ?, ?, ?)",
+        "requested_ts, status, verified, via_node, ttl_expiry) "
+        "VALUES (?, ?, ?, ?, ?, 0, '', 0)",
         (room_id, agent, node, now_ts(), JOIN_PENDING),
     )
     conn.commit()
+
+
+def record_verified_cross_node_join_request(
+    conn: sqlite3.Connection, room_id: str, agent: str, node: str,
+    *, via_node: str, ttl_expiry: int = 0,
+) -> None:
+    """Persist a VERIFIED cross-node (P4.1) pending join request.
+
+    Called by the leader-node receiver ONLY after the node-link HMAC +
+    token-hash + TTL/revocation verification has passed (contract 4). The row
+    carries verified METADATA — the joiner `agent@node`, the verified flag, the
+    HMAC-authenticated node-link peer (`via_node`), and an optional `ttl_expiry`
+    — but NEVER the reusable token hash (contract 5: the hash is bearer-
+    equivalent and is never persisted in any row). NO membership is added and NO
+    leader task is created here: admission is a separate P4.2 `approve` that
+    REQUIRES a verified row (contract 6).
+
+    `node` is the joiner's node as bound by the receiver to the authenticated
+    sender bridge (NEVER a wire-asserted value). INSERT OR REPLACE keyed on
+    (room_id, agent, node) makes a duplicate request idempotent (refresh ts).
+
+    NOTE: prefer `record_verified_cross_node_join_request_atomic` on the receiver
+    path — it commits the dedupe reservation + this pending row in ONE
+    transaction. This bare helper is retained for the local/test path that does
+    not need the dedupe ledger.
+    """
+    conn.execute(
+        "INSERT OR REPLACE INTO room_join_requests (room_id, agent, node, "
+        "requested_ts, status, verified, via_node, ttl_expiry) "
+        "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+        (room_id, agent, node, now_ts(), JOIN_PENDING, via_node,
+         max(0, int(ttl_expiry))),
+    )
+    conn.commit()
+
+
+# Stable outcomes for the atomic cross-node dedupe+persist (audit-safe codes).
+JOIN_DEDUPE_RESERVED = "reserved"   # new id → dedupe row + pending row committed
+JOIN_DEDUPE_DUPLICATE = "duplicate"  # same id + same body → already-accepted
+JOIN_DEDUPE_CONFLICT = "conflict"    # same id + different body → id reuse
+
+
+def room_join_dedupe_lookup(conn: sqlite3.Connection, peer: str,
+                            message_id: str, body_sha256: str) -> str:
+    """READ-ONLY dedupe check against rooms.db. Returns one of:
+    'new' (no row), JOIN_DEDUPE_DUPLICATE (same id+body), JOIN_DEDUPE_CONFLICT
+    (same id, different body). A row exists ONLY for a PREVIOUSLY-ACCEPTED
+    cross-node join (the reservation is atomic with the pending row), so a hit
+    here means the request was already accepted. Never writes.
+
+    On an UPGRADED P1 rooms.db the `room_join_dedupe` table may not exist yet
+    when this read-only path runs (codex P4.1 r3 #2): `open_rooms_readonly`
+    deliberately does NOT run schema creation, and the migrating RW `open_rooms`
+    happens later on the accept path. A missing table therefore means "no
+    prior accepted request" → 'new'; the RW open on the accept path creates the
+    table before the reservation. Any OTHER operational error propagates.
+    """
+    try:
+        row = conn.execute(
+            "SELECT body_sha256 FROM room_join_dedupe "
+            "WHERE peer=? AND message_id=?",
+            (peer, message_id),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return "new"
+        raise
+    if row is None:
+        return "new"
+    return (JOIN_DEDUPE_DUPLICATE if row["body_sha256"] == body_sha256
+            else JOIN_DEDUPE_CONFLICT)
+
+
+def record_verified_cross_node_join_request_atomic(
+    conn: sqlite3.Connection, *, message_id: str, body_sha256: str, peer: str,
+    room_id: str, agent: str, node: str, via_node: str, ttl_expiry: int = 0,
+) -> str:
+    """ATOMICALLY reserve the dedupe row AND persist the verified pending row.
+
+    The whole operation commits in ONE transaction (codex P4.1 r2): "a dedupe row
+    exists" is therefore equivalent to "a pending row exists", closing the window
+    where a surviving reservation could let a replay return a bogus idempotent
+    200 with no pending row. Returns:
+      - JOIN_DEDUPE_DUPLICATE : the message_id was already accepted with the SAME
+        body → idempotent, NOTHING re-written.
+      - JOIN_DEDUPE_CONFLICT  : the message_id was already used with a DIFFERENT
+        body → id reuse, NOTHING written.
+      - JOIN_DEDUPE_RESERVED  : a NEW id → the dedupe row + the pending row are
+        BOTH committed together.
+
+    The dedupe + pending writes are issued WITHOUT an intermediate commit, then a
+    single `conn.commit()` makes them durable atomically; a failure before the
+    commit (e.g. the pending INSERT raises) rolls BOTH back, so no orphan dedupe
+    row survives. Carries NO token / token-hash (contract 5).
+    """
+    # Re-check inside this call (the caller's read-only lookup may have raced).
+    # Scoped to the authenticated peer (codex P4.1 Phase-4 — composite PK).
+    existing = conn.execute(
+        "SELECT body_sha256 FROM room_join_dedupe "
+        "WHERE peer=? AND message_id=?",
+        (peer, message_id),
+    ).fetchone()
+    if existing is not None:
+        # A concurrent accept reserved first → resolve to the same outcome the
+        # lookup would have produced. No write (the pending row is already there
+        # from the first accept).
+        return (JOIN_DEDUPE_DUPLICATE if existing["body_sha256"] == body_sha256
+                else JOIN_DEDUPE_CONFLICT)
+    ts = now_ts()
+    try:
+        conn.execute(
+            "INSERT INTO room_join_dedupe (message_id, peer, body_sha256, "
+            "created_ts) VALUES (?, ?, ?, ?)",
+            (message_id, peer, body_sha256, ts),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO room_join_requests (room_id, agent, node, "
+            "requested_ts, status, verified, via_node, ttl_expiry) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+            (room_id, agent, node, ts, JOIN_PENDING, via_node,
+             max(0, int(ttl_expiry))),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # CONCURRENCY (codex P4.1 r3 #1): two handlers both passed the pre-check
+        # SELECT before either committed; this one lost the message_id PK race.
+        # The dedupe row's PRIMARY KEY is the serialization point — roll back our
+        # partial write and re-query the winner's row, returning the SAME
+        # idempotent/conflict outcome the pre-check would have. The loser thus
+        # gets a clean duplicate/conflict, never a 500. (No orphan row: our
+        # INSERT was rolled back; the pending row, if any, belongs to the winner.)
+        conn.rollback()
+        winner = conn.execute(
+            "SELECT body_sha256 FROM room_join_dedupe "
+            "WHERE peer=? AND message_id=?",
+            (peer, message_id),
+        ).fetchone()
+        if winner is not None:
+            return (JOIN_DEDUPE_DUPLICATE
+                    if winner["body_sha256"] == body_sha256
+                    else JOIN_DEDUPE_CONFLICT)
+        # The PK violation came from somewhere other than a concurrent winner
+        # (should not happen) — surface it rather than silently swallow.
+        raise
+    except Exception:
+        # Roll BOTH writes back so a failed pending insert never leaves an
+        # orphan dedupe reservation (the r2 atomicity contract).
+        conn.rollback()
+        raise
+    return JOIN_DEDUPE_RESERVED
 
 
 def list_join_requests(conn: sqlite3.Connection, room_id: str,
@@ -1161,6 +1447,62 @@ def approve_join(conn: sqlite3.Connection, room_id: str, agent: str,
     return bump_epoch(conn, room_id)
 
 
+def has_verified_pending_request(conn: sqlite3.Connection, room_id: str,
+                                 agent: str, node: str) -> bool:
+    """True iff a VERIFIED, still-pending cross-node join row exists (P4.2).
+
+    The two-factor gate for a CROSS-NODE approve (contract 1): admitting a
+    REMOTE agent (one whose node != this leader node) REQUIRES a
+    `room_join_requests` row with `verified=1` AND `status='pending'` —
+    i.e. a row the receiver (P4.1) created only AFTER the node-link HMAC +
+    token-hash + TTL/revocation verification passed. A row that is denied/
+    approved/absent does NOT satisfy the gate. The LOCAL leader-initiated add
+    path (a leader admitting an agent on its OWN node) is a SEPARATE path that
+    does NOT consult this gate — see `approve_cross_node` vs `approve_join`.
+    """
+    row = conn.execute(
+        "SELECT verified, status FROM room_join_requests "
+        "WHERE room_id=? AND agent=? AND node=?",
+        (room_id, agent, node),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        verified = int(row["verified"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        verified = 0
+    return verified == 1 and str(row["status"]) == JOIN_PENDING
+
+
+def approve_cross_node(conn: sqlite3.Connection, room_id: str, agent: str,
+                       node: str) -> int:
+    """Admit a REMOTE (cross-node) member — REQUIRES a verified pending row.
+
+    The P4.2 cross-node admission path (contract 1). Unlike `approve_join` (the
+    P1 local path that admits a local agent with no pending-row requirement),
+    this REFUSES to add a remote member unless a P4.1 verified pending row
+    exists (`has_verified_pending_request`). This is the anti-forgery gate: a
+    leader cannot be tricked into broadcasting a roster that admits a remote
+    agent who never completed the node-link-authenticated, token-verified join.
+
+    Raises RoomsError(code='no_verified_request') when the gate is unmet (NO
+    membership add, NO epoch bump). On success: add member, mark the request
+    approved, bump the epoch (which re-persists the leader's authoritative
+    roster cache atomically). Returns the new epoch.
+    """
+    require_room(conn, room_id)
+    if not has_verified_pending_request(conn, room_id, agent, node):
+        raise RoomsError(
+            f"cross-node approve of {agent}@{node} on {room_id} requires a "
+            "verified pending join request (none found) — a remote agent must "
+            "complete the node-link-authenticated, token-verified join first",
+            code="no_verified_request",
+        )
+    add_member(conn, room_id, agent, node, role=ROLE_MEMBER)
+    set_join_request_status(conn, room_id, agent, node, JOIN_APPROVED)
+    return bump_epoch(conn, room_id)
+
+
 def remove_and_bump(conn: sqlite3.Connection, room_id: str, agent: str,
                     node: str = "") -> int:
     """Remove a member (leave/kick), bump epoch, recompute roster.
@@ -1177,6 +1519,519 @@ def remove_and_bump(conn: sqlite3.Connection, room_id: str, agent: str,
         )
     # bump_epoch re-persists room_roster_cache atomically (centralized in F2).
     return bump_epoch(conn, room_id)
+
+
+# --------------------------------------------------------------------------
+# Member-side roster broadcast acceptance (A2A Rooms P4.2, design §6/§14 R2)
+# --------------------------------------------------------------------------
+#
+# The leader (node A) signs the canonical roster with the leader↔member pairwise
+# HMAC and POSTs it to each member node. The member node verifies the node-link
+# HMAC (the receiver auth preamble does this) and then runs THIS acceptance
+# logic, which encodes the anti-spoof / anti-rogue-leader / monotonic-epoch
+# contracts. It writes the member-local `room_roster_cache` (the cache that lets
+# comms survive a leader outage — design §6 "Roster cache").
+#
+# Stable, audit-safe acceptance outcome codes (no secret/token ever in them).
+ROSTER_ACCEPTED = "accepted"            # cache written (first bind or higher epoch)
+ROSTER_DUPLICATE = "duplicate"          # byte-identical idempotent re-broadcast
+ROSTER_STALE_EPOCH = "stale_epoch"      # lower-or-same epoch (not a dup) → ignored
+ROSTER_NOT_LEADER = "not_leader"        # peer != body.leader_node → rejected
+ROSTER_NO_LOCAL_BINDING = "no_local_binding"  # first roster w/o local join state
+ROSTER_LEADER_MISMATCH = "leader_mismatch"  # peer != the ESTABLISHED cached leader
+ROSTER_DEDUPE_CONFLICT = "dedupe_conflict"  # same (peer,message_id), DIFFERENT body
+
+
+def _local_join_binding_for(conn: sqlite3.Connection, room_id: str,
+                            expected_leader_node: str) -> bool:
+    """True iff this node holds LOCAL outbound join state for `room_id` that
+    names `expected_leader_node` as the leader (the FIRST-ROSTER binding anchor).
+
+    The anti-rogue-leader contract (codex #9622 contract 2, brief contract 3c): a
+    member accepts its FIRST roster for a room ONLY if it already initiated a
+    join to THIS room naming THIS leader node. The member's own `room join`
+    (P4.2) records a LOCAL `room_join_requests` row (status pending/approved)
+    whose `via_node` is the leader node it posted to — that row is the proof the
+    member chose this room+leader, so an inbound roster claiming
+    `leader_node=<some configured peer>` cannot MINT a brand-new room cache out
+    of thin air (which would let any configured peer shape future room-scoped
+    allow decisions).
+
+    The binding requires:
+      - a `room_join_requests` row for `room_id`,
+      - status pending OR approved (a denied request is not a live intent),
+      - `via_node` == `expected_leader_node` (the member posted its join to THIS
+        leader node — an un-spoofable record of the member's own outbound choice,
+        NOT a wire-asserted value).
+    """
+    rows = conn.execute(
+        "SELECT status, via_node FROM room_join_requests WHERE room_id=?",
+        (room_id,),
+    ).fetchall()
+    for r in rows:
+        if str(r["status"]) not in (JOIN_PENDING, JOIN_APPROVED):
+            continue
+        if str(r["via_node"] or "") == expected_leader_node:
+            return True
+    return False
+
+
+def record_local_join_intent(conn: sqlite3.Connection, room_id: str, agent: str,
+                             node: str, *, leader_node: str) -> None:
+    """Record the member's OWN outbound cross-node join intent locally (P4.2).
+
+    Called on the MEMBER/sender node when it posts a cross-node `room join`, so
+    the member has a LOCAL record that it chose `room_id` with leader
+    `leader_node`. This row is the FIRST-ROSTER binding anchor
+    (`_local_join_binding_for`): it lets the member later accept the leader's
+    first roster broadcast for this room, while refusing a roster for a room it
+    never tried to join (the rogue-leader-minting defense).
+
+    `via_node` carries the leader node the member posted to (its own choice).
+    `verified` stays 0 — this is the member's local view, NOT the leader-side
+    receiver-verified row (that lives on the leader's node). INSERT OR REPLACE
+    keyed on (room_id, agent, node) re-affirms a re-issued join.
+    """
+    conn.execute(
+        "INSERT OR REPLACE INTO room_join_requests (room_id, agent, node, "
+        "requested_ts, status, verified, via_node, ttl_expiry) "
+        "VALUES (?, ?, ?, ?, ?, 0, ?, 0)",
+        (room_id, agent, node, now_ts(), JOIN_PENDING, leader_node),
+    )
+    conn.commit()
+
+
+def get_roster_cache(conn: sqlite3.Connection,
+                     room_id: str) -> Optional[sqlite3.Row]:
+    """The member-local cached roster row for a room (or None)."""
+    return conn.execute(
+        "SELECT room_id, epoch, members_json, from_node, mac, fetched_ts "
+        "FROM room_roster_cache WHERE room_id=?",
+        (room_id,),
+    ).fetchone()
+
+
+def list_roster_cache(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """All member-local cached roster rows (every room this node has joined).
+
+    The read-only counterpart to `get_roster_cache` for `agb room list` on a
+    NON-leader node: a member node holds a `room_roster_cache` row per room it
+    was admitted into (written by P4.2), but no `rooms` row (it does not LEAD
+    them). `list_rooms` only sees led rooms; this surfaces the joined-but-not-led
+    ones so they are visible alongside. Ordered by room_id for a stable view.
+    """
+    return conn.execute(
+        "SELECT room_id, epoch, members_json, from_node, mac, fetched_ts "
+        "FROM room_roster_cache ORDER BY room_id"
+    ).fetchall()
+
+
+def cached_roster_members(row: sqlite3.Row) -> Optional[list[dict[str, str]]]:
+    """Parse a roster-cache row's `members_json` for DISPLAY (keeps `role`).
+
+    Unlike `_cached_members` (the talk gate, which deliberately drops `role`
+    so the membership comparison only keys on agent+node), this preserves the
+    cached `role` so `room show`/`room list` can render a member-side view that
+    matches what a leader node shows. Returns None on a corrupt cache (caller
+    surfaces that read-only, never fabricates).
+    """
+    try:
+        parsed = json.loads(str(row["members_json"] or "[]"))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    out: list[dict[str, str]] = []
+    for m in parsed:
+        if not isinstance(m, dict):
+            return None
+        out.append({
+            "agent": str(m.get("agent", "")),
+            "node": str(m.get("node", "")),
+            "role": str(m.get("role", "member")) or "member",
+        })
+    return out
+
+
+def cached_leader(row: sqlite3.Row) -> str:
+    """Best-effort `leader_agent@leader_node` from a roster-cache row.
+
+    The cache stores the leader's NODE (`from_node`) but not the leader agent
+    name as a top-level field — so the leader agent is recovered from the cached
+    member whose `role == 'leader'` (the leader is always a roster member). If no
+    leader member is present (corrupt/partial cache), only the node is shown —
+    we never invent a leader agent the cache does not actually contain.
+    """
+    members = cached_roster_members(row)
+    leader_node = str(row["from_node"] or "")
+    if members:
+        for m in members:
+            if m["role"] == "leader":
+                node = m["node"] or leader_node
+                return f"{m['agent']}@{node}" if node else m["agent"]
+    return f"?@{leader_node}" if leader_node else "?"
+
+
+# --------------------------------------------------------------------------
+# Member-side room-scoped TALK gate (A2A Rooms P4.3, design §11)
+# --------------------------------------------------------------------------
+#
+# Once a member node holds a leader-MAC'd roster in `room_roster_cache` (written
+# by P4.2's `accept_roster_broadcast` after a pairwise-HMAC verify FROM the
+# leader), members on DIFFERENT nodes can exchange room-scoped messages WITHOUT
+# the leader being online — because each member validates membership against its
+# OWN local cache, never a live leader call. A room-scoped message carries
+# `room_id` + `room_epoch`; the receiver fail-closed-checks both the sender and
+# the local target against the locally-cached roster for that `room_id` at that
+# exact `room_epoch`. The receiver MUST NOT trust any membership claim inside the
+# inbound message — it consults ONLY this cache (the one P4.2 verified).
+
+# Stable, audit-safe room-talk membership outcome codes (contract 8: no
+# secret/token ever appears in them).
+ROOM_TALK_OK = "members_ok"
+ROOM_TALK_NO_CACHE = "no_roster_cache"        # no leader-MAC roster for this room
+ROOM_TALK_BAD_CACHE = "roster_cache_corrupt"  # cached members_json unparseable
+ROOM_TALK_EPOCH_MISMATCH = "epoch_mismatch"   # envelope epoch != cached epoch
+ROOM_TALK_SENDER_NOT_MEMBER = "sender_not_member"
+ROOM_TALK_TARGET_NOT_MEMBER = "target_not_member"
+
+
+def _cached_members(row: sqlite3.Row) -> Optional[list[dict[str, str]]]:
+    """Parse the cached `members_json` into a list of {agent,node} dicts.
+
+    Returns None if the stored JSON is not a list of objects (corrupt cache —
+    the caller fails closed). Each entry is normalized to plain strings so the
+    membership comparison never trips on a non-string node/agent.
+    """
+    try:
+        parsed = json.loads(str(row["members_json"] or "[]"))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    out: list[dict[str, str]] = []
+    for m in parsed:
+        if not isinstance(m, dict):
+            return None
+        out.append({
+            "agent": str(m.get("agent", "")),
+            "node": str(m.get("node", "")),
+        })
+    return out
+
+
+def roster_cache_membership_check(
+    conn: sqlite3.Connection, *, room_id: str, room_epoch: int,
+    sender_agent: str, sender_node: str, target_agent: str, target_node: str,
+) -> str:
+    """Fail-closed room-talk membership gate against the LOCAL roster cache (P4.3).
+
+    The member-side heart of P4.3 (brief contracts 2-4). The CALLER (the
+    receiver) has ALREADY run the full node-link auth preamble, so `sender_node`
+    is the node-link-AUTHENTICATED peer (un-spoofable) and `target_node` is THIS
+    receiver's own node id. This function applies the remaining room-scoped
+    delivery contracts and returns a ROOM_TALK_* code; the receiver delivers ONLY
+    on ROOM_TALK_OK.
+
+    Contracts enforced here (NEVER trusts any membership claim in the inbound
+    message — it reads ONLY the locally-cached leader-MAC roster):
+      - NO local roster cache for `room_id` → ROOM_TALK_NO_CACHE (contract 2: a
+        room with no leader-verified roster cannot validate membership → deny,
+        no delivery). A plain non-room send never reaches here, so it can NEITHER
+        be gated by this nor seed a cache.
+      - `room_epoch` must EQUAL the cached epoch (contract 3, fail-closed BOTH
+        ways): an envelope epoch lower OR higher than the cache → ROOM_TALK_
+        EPOCH_MISMATCH. We refuse to deliver against a roster we cannot confirm
+        the sender belongs to AT THAT EPOCH (roster refresh on mismatch is P4.x,
+        deliberately out of scope — just fail closed).
+      - The authenticated SENDER `(sender_agent, sender_node)` MUST appear in the
+        cached roster (contract 2/4). Identity is OS-actor + node anchored: the
+        node is the un-spoofable authenticated peer, and a hostile wire
+        `sender_agent` can at most name an agent the leader ACTUALLY admitted on
+        that node — it cannot conjure a NON-member into the cache → ROOM_TALK_
+        SENDER_NOT_MEMBER otherwise.
+      - The local TARGET `(target_agent, target_node)` MUST also be a cached
+        member (you only deliver a room message to a local agent who is itself in
+        the room) → ROOM_TALK_TARGET_NOT_MEMBER otherwise.
+    """
+    row = get_roster_cache(conn, room_id)
+    if row is None:
+        return ROOM_TALK_NO_CACHE
+    if int(room_epoch) != int(row["epoch"]):
+        return ROOM_TALK_EPOCH_MISMATCH
+    members = _cached_members(row)
+    if members is None:
+        return ROOM_TALK_BAD_CACHE
+    sender_pair = (str(sender_agent), str(sender_node))
+    target_pair = (str(target_agent), str(target_node))
+    member_pairs = {(m["agent"], m["node"]) for m in members}
+    if sender_pair not in member_pairs:
+        return ROOM_TALK_SENDER_NOT_MEMBER
+    if target_pair not in member_pairs:
+        return ROOM_TALK_TARGET_NOT_MEMBER
+    return ROOM_TALK_OK
+
+
+def accept_roster_broadcast(
+    conn: sqlite3.Connection, *, room_id: str, room_epoch: int,
+    members: list[dict[str, Any]], leader_node: str, peer_id: str,
+    message_id: str, body_sha256: str, mac: str = "",
+) -> str:
+    """Apply a verified leader roster broadcast to the member-local cache.
+
+    The member-side heart of P4.2. The CALLER (the receiver) has ALREADY verified
+    the node-link pairwise HMAC over the canonical request (so `peer_id` is the
+    authenticated sender node and the body is intact). This function encodes the
+    remaining security contracts and performs the ATOMIC dedupe-reserve + cache
+    write. Returns a ROSTER_* outcome code; raises RoomsError only on an
+    unexpected DB fault.
+
+    Contracts enforced here (brief §3):
+      a. LEADER-AUTHORITY (3a): accept ONLY when `peer_id == leader_node`. A
+         roster whose body `leader_node` != the authenticated sender →
+         ROSTER_NOT_LEADER, persists NOTHING. (The pairwise-HMAC verify in 3b is
+         the caller's job; a bad HMAC never reaches here.)
+      a'. LEADER PINNING (codex P4.2 r1 BLOCKING — close the rogue-leader
+         TAKEOVER of an EXISTING room): once a cache exists, the room's leader is
+         PINNED to the cached `from_node`. A DIFFERENT configured peer that
+         self-claims `leader_node=<itself>` + signs a higher epoch must NOT
+         overwrite the cache → ROSTER_LEADER_MISMATCH, persists NOTHING. Without
+         this, contract 3a alone (`peer_id == leader_node`) is trivially
+         satisfied by any peer naming itself leader, so the first-roster binding
+         would only protect the FIRST roster, not subsequent updates.
+      c. FIRST-ROSTER BINDING (3c): if NO cache row exists yet for this room, the
+         member accepts the first roster ONLY if it holds LOCAL outbound join
+         state for THIS room naming THIS leader_node
+         (`_local_join_binding_for`). Otherwise → ROSTER_NO_LOCAL_BINDING,
+         persists NOTHING. NEVER mint a room cache purely from an inbound roster.
+      d. MONOTONIC EPOCH (3d): with an existing cache (from the PINNED leader), a
+         STRICTLY-higher epoch updates; a lower-or-same epoch is IGNORED
+         (ROSTER_STALE_EPOCH) UNLESS the incoming roster is BYTE-IDENTICAL to the
+         cached one at the SAME epoch (ROSTER_DUPLICATE — idempotent, no write).
+      e. ATOMIC dedupe + update (3e + codex P4.2 r3 BLOCKING — close the TOCTOU
+         race): for any outcome that WRITES the cache (ACCEPTED), the peer-scoped
+         dedupe RESERVATION and the room_roster_cache WRITE commit in ONE
+         transaction (single serialization point). The dedupe reservation is the
+         `room_join_dedupe` PRIMARY KEY (peer, message_id), so:
+           - a fresh (peer, message_id) → reserve + write cache + commit together.
+           - a same (peer, message_id) with a DIFFERENT body_sha256 →
+             ROSTER_DEDUPE_CONFLICT, write NOTHING (rolled back). The receiver
+             answers 409. This holds EVEN under a check-then-write race: two
+             concurrent same-id deliveries cannot both pass + both write — the PK
+             serializes them and the loser is re-classified (IntegrityError →
+             re-query → conflict/duplicate), never a partial cache mutation.
+           - a same (peer, message_id) with the SAME body_sha256 →
+             ROSTER_DUPLICATE (idempotent — the cache already reflects it; no
+             double-apply).
+         A contract REJECT (not_leader / leader_mismatch / no_binding /
+         stale_epoch) reserves NO dedupe row, so a replay re-evaluates the
+         contracts (the stale/not-leader teeth hold on replay).
+
+    `members` MUST be the canonical sorted roster (the bytes the leader signed);
+    we re-canonicalize on store so the cached `members_json` is reproducible.
+    `mac` is the presented per-link signature (stored for audit/debug; the real
+    auth is the receiver's HMAC verify, already done). `message_id`/`body_sha256`
+    are the dedupe key (peer-scoped) the receiver carries from the wire headers.
+    """
+    # --- 3a: leader-authority binding — the authenticated sender must be the
+    # node the body names as leader. (peer_id is the un-spoofable HMAC-authed
+    # X-AGB-Peer; leader_node is the body's claim.) ---
+    if peer_id != leader_node:
+        return ROSTER_NOT_LEADER
+
+    incoming_members = _canonical_member_list(members)
+    incoming_json = json.dumps(incoming_members, separators=(",", ":"))
+    epoch = int(room_epoch)
+
+    existing = get_roster_cache(conn, room_id)
+    if existing is None:
+        # --- 3c: FIRST-ROSTER binding — never mint a cache from an inbound
+        # roster alone; the member must have chosen this room+leader locally. ---
+        if not _local_join_binding_for(conn, room_id, leader_node):
+            return ROSTER_NO_LOCAL_BINDING
+        # WRITE path → atomic dedupe-reserve + cache write (3e).
+        return _reserve_and_write_roster_cache(
+            conn, peer=peer_id, message_id=message_id, body_sha256=body_sha256,
+            room_id=room_id, epoch=epoch, members_json=incoming_json,
+            from_node=leader_node, mac=mac)
+
+    # --- 3a': LEADER PINNING — an existing cache fixes the room's leader to its
+    # established `from_node`. A roster signed by a DIFFERENT peer is a TAKEOVER
+    # attempt → reject, persist nothing (even at a higher epoch). The legitimate
+    # leader always signs with its own node id == the cached from_node, so this
+    # never blocks a genuine update from the real leader.
+    #
+    # The comparison is UNGUARDED by truthiness (codex P4.2 r2 BLOCKING): an
+    # existing cache whose `from_node` is "" is a SINGLE-NODE/local room (P1a
+    # seeds `from_node=leader_node`, which is "" when local_node() is empty). A
+    # remote peer arriving over a node-link ALWAYS has a non-empty authenticated
+    # `peer_id == leader_node`, so for any such inbound roster `leader_node !=
+    # "" == cached_from_node` → rejected. A remote node can therefore NEVER claim
+    # leadership of a local/single-node room via a roster broadcast. ---
+    cached_leader = str(existing["from_node"] or "")
+    if leader_node != cached_leader:
+        return ROSTER_LEADER_MISMATCH
+
+    # --- 3d: monotonic epoch (existing cache present, leader pinned) ---
+    cached_epoch = int(existing["epoch"])
+    if epoch > cached_epoch:
+        # WRITE path → atomic dedupe-reserve + cache write (3e).
+        return _reserve_and_write_roster_cache(
+            conn, peer=peer_id, message_id=message_id, body_sha256=body_sha256,
+            room_id=room_id, epoch=epoch, members_json=incoming_json,
+            from_node=leader_node, mac=mac)
+    # epoch <= cached_epoch: accept ONLY a byte-identical idempotent duplicate
+    # (same epoch AND same canonical members AND same leader node). Everything
+    # else (a lower epoch, or a same-epoch roster with DIFFERENT contents — a
+    # replay/forge attempt) is ignored without a write.
+    if (epoch == cached_epoch
+            and str(existing["members_json"]) == incoming_json
+            and str(existing["from_node"] or "") == leader_node):
+        # A byte-identical re-broadcast does NOT need a cache write (the cache
+        # already reflects it), but it MUST still BURN the (peer, message_id) in
+        # the dedupe ledger (codex P4.2 r3 BLOCKING): a terminal ROSTER_DUPLICATE
+        # that did not reserve the id would let a LATER (peer, SAME id, DIFFERENT
+        # body, higher epoch) reuse be treated as fresh and ACCEPTED. The
+        # reserve-only path records the id (or re-classifies a same-id/different-
+        # body reuse to ROSTER_DEDUPE_CONFLICT) WITHOUT touching the cache.
+        return _reserve_roster_dedupe_only(
+            conn, peer=peer_id, message_id=message_id, body_sha256=body_sha256)
+    return ROSTER_STALE_EPOCH
+
+
+def _reserve_and_write_roster_cache(
+    conn: sqlite3.Connection, *, peer: str, message_id: str, body_sha256: str,
+    room_id: str, epoch: int, members_json: str, from_node: str, mac: str,
+) -> str:
+    """ATOMICALLY reserve the peer-scoped dedupe row AND write the roster cache.
+
+    The single serialization point that closes the TOCTOU dedupe/cache race
+    (codex P4.2 r3 BLOCKING). Mirrors P4.1's
+    `record_verified_cross_node_join_request_atomic`: a pre-check + an
+    IntegrityError-on-PK fallback re-query, so two concurrent same-id deliveries
+    cannot both pass + both write. Both the `room_join_dedupe` reservation and
+    the `room_roster_cache` write are issued WITHOUT an intermediate commit, then
+    ONE commit makes them durable together; any failure before the commit rolls
+    BOTH back (no orphan dedupe row, no partial cache).
+
+    Returns:
+      - ROSTER_DEDUPE_CONFLICT : (peer, message_id) already used with a DIFFERENT
+        body → write NOTHING.
+      - ROSTER_DUPLICATE       : (peer, message_id) already reserved with the
+        SAME body → idempotent, write NOTHING (the cache already reflects it).
+      - ROSTER_ACCEPTED        : fresh id → dedupe row + cache row committed
+        together.
+    """
+    # Pre-check inside this call (the caller did no read-only dedupe check on the
+    # write path). Scoped to the authenticated peer (composite PK).
+    existing = conn.execute(
+        "SELECT body_sha256 FROM room_join_dedupe WHERE peer=? AND message_id=?",
+        (peer, message_id),
+    ).fetchone()
+    if existing is not None:
+        return (ROSTER_DUPLICATE if existing["body_sha256"] == body_sha256
+                else ROSTER_DEDUPE_CONFLICT)
+    try:
+        conn.execute(
+            "INSERT INTO room_join_dedupe (message_id, peer, body_sha256, "
+            "created_ts) VALUES (?, ?, ?, ?)",
+            (message_id, peer, body_sha256, now_ts()),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO room_roster_cache (room_id, epoch, "
+            "members_json, from_node, mac, fetched_ts) VALUES (?, ?, ?, ?, ?, ?)",
+            (room_id, epoch, members_json, from_node, mac, now_ts()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Lost a concurrent (peer, message_id) PK race — roll BOTH writes back and
+        # re-query the winner's row, returning the SAME idempotent/conflict
+        # outcome the pre-check would have. The loser thus gets a clean
+        # duplicate/conflict (never a partial cache mutation, never a 500).
+        conn.rollback()
+        winner = conn.execute(
+            "SELECT body_sha256 FROM room_join_dedupe "
+            "WHERE peer=? AND message_id=?",
+            (peer, message_id),
+        ).fetchone()
+        if winner is not None:
+            return (ROSTER_DUPLICATE if winner["body_sha256"] == body_sha256
+                    else ROSTER_DEDUPE_CONFLICT)
+        # PK violation from somewhere other than a concurrent winner (should not
+        # happen) — surface it rather than silently swallow.
+        raise
+    except Exception:
+        # Roll BOTH writes back so a failed cache insert never leaves an orphan
+        # dedupe reservation (the atomicity contract).
+        conn.rollback()
+        raise
+    return ROSTER_ACCEPTED
+
+
+def _reserve_roster_dedupe_only(
+    conn: sqlite3.Connection, *, peer: str, message_id: str, body_sha256: str,
+) -> str:
+    """BURN a (peer, message_id) in the dedupe ledger WITHOUT writing the cache.
+
+    The reserve-only sibling of `_reserve_and_write_roster_cache` (codex P4.2 r3
+    BLOCKING — close the duplicate-branch id-reuse hole). Used by the byte-
+    identical-existing-cache ROSTER_DUPLICATE branch: the cache already reflects
+    the roster (no write needed), but the id MUST still be recorded so a LATER
+    same-(peer, message_id)/DIFFERENT-body reuse is a CONFLICT rather than a
+    fresh accept. Returns:
+      - ROSTER_DEDUPE_CONFLICT : (peer, message_id) already used with a DIFFERENT
+        body → caller answers 409.
+      - ROSTER_DUPLICATE       : a fresh reservation OR a same-body re-reservation
+        (idempotent) → the id is now burned, no cache change.
+    Uses the same IntegrityError-rollback-and-requery guard as the write helper
+    so a concurrent same-id duplicate cannot double-insert (the PK serializes).
+    """
+    existing = conn.execute(
+        "SELECT body_sha256 FROM room_join_dedupe WHERE peer=? AND message_id=?",
+        (peer, message_id),
+    ).fetchone()
+    if existing is not None:
+        return (ROSTER_DUPLICATE if existing["body_sha256"] == body_sha256
+                else ROSTER_DEDUPE_CONFLICT)
+    try:
+        conn.execute(
+            "INSERT INTO room_join_dedupe (message_id, peer, body_sha256, "
+            "created_ts) VALUES (?, ?, ?, ?)",
+            (message_id, peer, body_sha256, now_ts()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Lost a concurrent (peer, message_id) PK race — roll back + re-query the
+        # winner, returning the SAME idempotent/conflict outcome the pre-check
+        # would have (never a raise, never a cache mutation — there is none here).
+        conn.rollback()
+        winner = conn.execute(
+            "SELECT body_sha256 FROM room_join_dedupe "
+            "WHERE peer=? AND message_id=?",
+            (peer, message_id),
+        ).fetchone()
+        if winner is not None:
+            return (ROSTER_DUPLICATE if winner["body_sha256"] == body_sha256
+                    else ROSTER_DEDUPE_CONFLICT)
+        raise
+    return ROSTER_DUPLICATE
+
+
+def _canonical_member_list(members: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Re-sort + normalize a roster member list to the canonical (agent,node)
+    ordering, so the stored cache bytes are reproducible regardless of the
+    wire order (defensive — the leader already sorts, but a verifier must not
+    depend on the sender's ordering for its stored canonical form)."""
+    norm = [
+        {
+            "agent": str(m.get("agent", "")),
+            "node": str(m.get("node", "")),
+            "role": str(m.get("role", "")),
+        }
+        for m in members
+    ]
+    norm.sort(key=lambda m: (m["agent"], m["node"]))
+    return norm
 
 
 # --------------------------------------------------------------------------

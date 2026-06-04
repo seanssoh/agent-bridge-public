@@ -198,6 +198,60 @@ add_required a2a-rooms-p1b-acl
 # controller), the env-redirect teeth (BRIDGE_A2A_ROOMS_DB does NOT relocate
 # the bootstrap), and idempotency (a 2nd create does not re-bootstrap/clobber).
 add_required a2a-rooms-1517-bootstrap
+# A2A rooms P4.1 (design §11 / §14 R3): the cross-node JOIN. Member on node B
+# posts a signed room-join-request to the leader's node A over the node-link;
+# node A re-runs the full fail-closed auth preamble (remote_addr -> HMAC -> skew
+# -> dedupe), verifies the invite token (HASH compare + TTL + revocation), and
+# persists a VERIFIED PENDING row (no auto-admit — approve is P4.2). In the full
+# static suite. Lives in bridge-handoffd.py (_handle_room_join_request),
+# bridge_a2a_common.py (build/parse_room_join_request), bridge_rooms_common.py
+# (verify_invite_token_outcome TTL/revocation + record_verified_cross_node_join_
+# request), and bridge-rooms.py (OS-actor-anchored joiner + cross-node send).
+# Pins the 5 teeth (hostile --from/env inert, no-cross-agent-impersonation,
+# expired/revoked refused, no token/hash persisted anywhere, malformed/dup
+# handled) + the unweakened auth preamble + the non-leader-node refusal.
+add_required rooms-p4-1-cross-node-join
+# A2A rooms P4.2 (design §6 / §11 / §14 R2): leader APPROVE + roster broadcast.
+# On a cross-node approve the leader admits the member (REQUIRING a P4.1 verified
+# pending row), bumps the epoch, and broadcasts the leader-signed canonical
+# roster to every member node over the node-link; each member persists it to
+# room_roster_cache. Lives in bridge-handoffd.py (_handle_room_roster_broadcast),
+# bridge_a2a_common.py (build/parse_room_roster_broadcast), bridge_rooms_common.py
+# (approve_cross_node gate + accept_roster_broadcast member-side contracts +
+# reserve_roster_dedupe), and bridge-rooms.py (cross-approve gate + broadcast
+# sender + local-join-intent binding). Pins the 7 teeth: cross-approve requires a
+# verified pending row, a non-leader peer roster is rejected, an invalid pairwise
+# HMAC is rejected, a first roster with no local binding is refused (rogue-leader
+# mint prevented), epoch monotonicity, the cache update is atomic, and the
+# local-leader-add path stays distinct (no P4.1 regression).
+add_required rooms-p4-2-roster-broadcast
+# A2A rooms P4.3 (design §11): room-scoped TALK (cross-node member messaging).
+# Once a member node holds a leader-MAC'd roster in room_roster_cache (from P4.2),
+# members on DIFFERENT nodes exchange room-scoped messages WITHOUT the leader
+# online — each member validates membership against its OWN local cache + the
+# envelope's room_epoch, fail-closed. Lives in bridge-handoffd.py
+# (room_scoped_check — the P4.3 leader-MAC roster-cache gate on the enqueue path),
+# bridge_rooms_common.py (roster_cache_membership_check), and bridge-rooms.py
+# (`room talk` — OS-actor-anchored sender + cached-epoch stamp + room-scoped
+# enqueue over the node-link). Pins the 9 teeth: a member message is delivered, a
+# non-member sender is rejected, a mismatched epoch (stale AND ahead) is rejected
+# fail-closed, an unknown room (no cache) is rejected, a missing room_id/epoch is
+# 422, a plain non-room message is NOT room talk (delivered, no gate, no
+# membership), a hostile --from/env cannot impersonate, a replay is deduped /
+# same-id-diff-body is 409, and the auth preamble is unreachable pre-auth.
+add_required rooms-p4-3-room-talk
+# A2A rooms P4.5 (design §11): two polish follow-ups from the P4.4 VM acceptance.
+# FIX 1 (UX completeness): a NON-leader node that joined a room now sees it via
+# `room show`/`room list` — cmd_show/cmd_list (bridge-rooms.py) fall back to the
+# member-side room_roster_cache (list_roster_cache / cached_roster_members /
+# cached_leader in bridge_rooms_common.py) instead of "not found". FIX 2 (info-
+# hygiene): enqueue_via_bridge_task (bridge-handoffd.py) returns a TERSE peer-
+# facing 422 detail ("unknown target '<agent>'") instead of echoing the
+# `bridge-task.sh` roster dump (agb-list engine/workdir/source columns) — the
+# full reason stays in the LOCAL audit only. Pins both teeth sets: member-side
+# show/list surfaces the cache, leader rooms unchanged, no-room/no-cache still
+# 404; unknown target -> 422 with no roster leak + full local audit recorded.
+add_required rooms-p4-5-polish
 
 
 }
@@ -863,7 +917,7 @@ select_for_path() {
       add_required queue a2a-rooms-p1b-acl
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/install-handoffd-systemd.sh)
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/smoke/rooms-p4-2-roster-broadcast-helper.py|scripts/smoke/rooms-p4-2-post-hook.sh|scripts/smoke/rooms-p4-3-room-talk-helper.py|scripts/smoke/rooms-p4-3-post-hook.sh|scripts/smoke/rooms-p4-5-polish.sh|scripts/smoke/rooms-p4-5-helper.py|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the
@@ -938,7 +992,52 @@ select_for_path() {
       # auth/dedupe gates upstream of the enqueue stay enforced. Pull on every
       # bridge-handoffd.py move so the force flag cannot regress to a 422 drop
       # or, worse, to a guard bypass that also weakens auth/dedupe.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force
+      # A2A Rooms P4.1 (design §11 / §14 R3): the cross-node JOIN. A member on
+      # node B posts a signed room-join-request to the leader's node A; node A
+      # verifies (node-link HMAC + token-HASH + TTL + revocation) and persists a
+      # PENDING row (no auto-admit). The NEW remote surface is
+      # _handle_room_join_request in bridge-handoffd.py; the wire builder/parser
+      # is in bridge_a2a_common.py; the TTL/revocation verify + verified-pending
+      # persistence is in bridge_rooms_common.py; the OS-actor-anchored joiner +
+      # cross-node send is in bridge-rooms.py. rooms-p4-1-cross-node-join pins the
+      # 5 teeth: hostile --from/env cannot change the joiner, a node-B process
+      # cannot join as another B agent, expired/revoked tokens are refused, the
+      # raw token AND its hash never persist in any queue/audit/staged file, and
+      # malformed/duplicate requests are handled — PLUS the auth preamble stays
+      # unweakened (HMAC 401 / remote_addr 403 / unknown-peer 403). Pull on every
+      # move to any of those files so the cross-node admission gate cannot regress.
+      # A2A Rooms P4.2 (design §6 / §14 R2): leader APPROVE + roster broadcast.
+      # The NEW remote surface is _handle_room_roster_broadcast in
+      # bridge-handoffd.py; the wire builder/parser is build/parse_room_roster_
+      # broadcast in bridge_a2a_common.py; the cross-approve gate + member-side
+      # acceptance (anti-rogue-leader binding + monotonic epoch + atomic cache) is
+      # in bridge_rooms_common.py; the broadcast sender + local-join-intent
+      # binding is in bridge-rooms.py. rooms-p4-2-roster-broadcast pins the 7
+      # teeth (cross-approve needs a verified row, non-leader roster rejected,
+      # bad pairwise HMAC rejected, first-roster-without-binding refused, epoch
+      # monotonicity, atomic cache, local-add path distinct). Pull on every move.
+      # A2A Rooms P4.3 (design §11): room-scoped TALK. The membership gate is the
+      # P4.3 activation of room_scoped_check in bridge-handoffd.py (it now reads
+      # the member-local leader-MAC room_roster_cache + the envelope room_epoch,
+      # fail-closed, instead of a live is_member read); the cache-membership
+      # decision is roster_cache_membership_check in bridge_rooms_common.py; the
+      # `room talk` sender (OS-actor-anchored + cached-epoch stamp + room-scoped
+      # enqueue) is in bridge-rooms.py. rooms-p4-3-room-talk pins the 9 teeth
+      # (member delivered, non-member rejected, epoch mismatch stale/ahead
+      # rejected, unknown room rejected, missing room_id/epoch 422, plain message
+      # not room talk, hostile --from cannot impersonate, replay dedupe /
+      # same-id-diff-body 409, auth preamble unreachable pre-auth). Pull on move.
+      # A2A Rooms P4.5 (design §11): two follow-ups from the P4.4 VM acceptance.
+      # FIX 1 (UX): `cmd_show`/`cmd_list` in bridge-rooms.py now fall back to the
+      # member-side room_roster_cache (via list_roster_cache / cached_roster_
+      # members / cached_leader in bridge_rooms_common.py) so a NON-leader node
+      # sees a room it joined instead of "not found". FIX 2 (info-hygiene):
+      # enqueue_via_bridge_task in bridge-handoffd.py returns a TERSE peer-facing
+      # detail (no `agb list` roster dump) while the full reason stays in the
+      # local audit only. rooms-p4-5-polish pins both: member show/list surfaces
+      # the cache, leader rooms unchanged, unknown-room still 404; an unknown
+      # target -> terse 422 with no engine/workdir/source leak + full local audit.
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk rooms-p4-5-polish
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)

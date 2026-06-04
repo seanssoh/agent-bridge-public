@@ -270,11 +270,12 @@ def cmd_create(args: argparse.Namespace) -> int:
     node = local_node()
     leader = caller_agent(args)
     token = rooms.mint_invite_token()
+    ttl = max(0, int(getattr(args, "ttl", 0) or 0))
     conn = rooms.open_rooms()
     try:
         room_id = rooms.create_room(
             conn, name=args.name or "", leader_agent=leader,
-            leader_node=node, token=token, once=False,
+            leader_node=node, token=token, once=False, ttl=ttl,
         )
     finally:
         conn.close()
@@ -302,14 +303,31 @@ def cmd_list(args: argparse.Namespace) -> int:
     try:
         owned = local_node() if args.owned else None
         rows = rooms.list_rooms(conn, owned_node=owned)
+        led_ids = {r["room_id"] for r in rows}
         items = [
             {
                 "room_id": r["room_id"], "name": r["name"],
                 "leader": f"{r['leader_agent']}@{r['leader_node']}",
                 "epoch": int(r["epoch"]), "status": r["status"],
+                "role": "leader", "source": "rooms",
             }
             for r in rows
         ]
+        # Member-side fallback (P4.5): include rooms this node JOINED but does
+        # not LEAD. They have a `room_roster_cache` row (the applied leader-MAC
+        # roster) but no `rooms` row, so `list_rooms` misses them. `--owned`
+        # asks specifically for led rooms, so the cache is excluded there.
+        if not args.owned:
+            for cr in rooms.list_roster_cache(conn):
+                rid = str(cr["room_id"])
+                if rid in led_ids:
+                    continue
+                items.append({
+                    "room_id": rid, "name": None,
+                    "leader": rooms.cached_leader(cr),
+                    "epoch": int(cr["epoch"]), "status": None,
+                    "role": "member", "source": "roster-cache",
+                })
     finally:
         conn.close()
     if args.json:
@@ -319,8 +337,12 @@ def cmd_list(args: argparse.Namespace) -> int:
         info("no rooms" + (" owned by this node" if args.owned else ""))
         return 0
     for it in items:
-        out(f"{it['room_id']}  epoch={it['epoch']}  leader={it['leader']}  "
-            f"name={it['name']!r}  status={it['status']}")
+        if it["source"] == "roster-cache":
+            out(f"{it['room_id']}  epoch={it['epoch']}  leader={it['leader']}  "
+                f"role=member (cached)")
+        else:
+            out(f"{it['room_id']}  epoch={it['epoch']}  leader={it['leader']}  "
+                f"name={it['name']!r}  status={it['status']}")
     return 0
 
 
@@ -332,7 +354,15 @@ def cmd_show(args: argparse.Namespace) -> int:
     try:
         room = rooms.get_room(conn, args.room_id)
         if room is None:
-            return die(f"room not found: {args.room_id}", code=1)
+            # Member-side fallback (P4.5): this node does not LEAD the room, but
+            # may have JOINED it — in which case `room_roster_cache` holds the
+            # applied leader-MAC roster (the same cache `room talk` reads). Show
+            # that cached view read-only, clearly marked role=member /
+            # source=roster-cache, rather than the misleading "not found".
+            cache_row = rooms.get_roster_cache(conn, args.room_id)
+            if cache_row is None:
+                return die(f"room not found: {args.room_id}", code=1)
+            return _show_cached_room(args, cache_row)
         roster = rooms.roster_for(conn, args.room_id)
         pending = [
             {"agent": r["agent"], "node": r["node"], "status": r["status"]}
@@ -349,6 +379,8 @@ def cmd_show(args: argparse.Namespace) -> int:
         "status": room["status"],
         "members": roster["members"],
         "pending_join_requests": pending,
+        "role": "leader",
+        "source": "rooms",
     }
     if args.json:
         out(json.dumps(payload))
@@ -362,6 +394,39 @@ def cmd_show(args: argparse.Namespace) -> int:
         out("pending join requests:")
         for p in pending:
             out(f"  - {p['agent']}@{p['node']}")
+    return 0
+
+
+def _show_cached_room(args: argparse.Namespace,
+                      cache_row: Any) -> int:
+    """Render a member-side cached room view (P4.5) read-only.
+
+    The cache holds what the leader broadcast and this node verified+applied:
+    members (with role), epoch, and the leader node. It does NOT hold leader-only
+    fields (room name, status, the live pending-join queue) — those live only in
+    the leader's `rooms`/`room_join_requests` tables — so we surface ONLY what
+    the cache actually contains and never fabricate the rest.
+    """
+    members = rooms.cached_roster_members(cache_row)
+    if members is None:
+        return die(f"local roster cache for room {args.room_id} is corrupt",
+                   code=1)
+    payload = {
+        "room_id": str(cache_row["room_id"]),
+        "leader": rooms.cached_leader(cache_row),
+        "epoch": int(cache_row["epoch"]),
+        "members": members,
+        "role": "member",
+        "source": "roster-cache",
+    }
+    if args.json:
+        out(json.dumps(payload))
+        return 0
+    info(f"room {payload['room_id']} (epoch {payload['epoch']}, "
+         f"leader {payload['leader']}) [member-side cached view]")
+    out("members:")
+    for m in payload["members"]:
+        out(f"  - {m['agent']}@{m['node']} ({m['role']})")
     return 0
 
 
@@ -380,11 +445,12 @@ def _require_leader_conn(conn: Any, room_id: str,
 
 def cmd_invite(args: argparse.Namespace) -> int:
     node = local_node()
+    ttl = max(0, int(getattr(args, "ttl", 0) or 0))
     conn = rooms.open_rooms()
     try:
         _require_leader_conn(conn, args.room_id, args)
         token = rooms.mint_invite_token()
-        rooms.set_invite_token(conn, args.room_id, token, once=args.once)
+        rooms.set_invite_token(conn, args.room_id, token, once=args.once, ttl=ttl)
     finally:
         conn.close()
     link = rooms.make_invite_link(args.room_id, node, token)
@@ -405,20 +471,595 @@ def cmd_rotate_invite(args: argparse.Namespace) -> int:
     return cmd_invite(args)
 
 
+def _post_room_join_request(*, leader_node: str, room_id: str, token: str,
+                            joiner_agent: str, timeout: float = 30.0,
+                            ) -> tuple[int, bytes]:
+    """POST a signed cross-node room-join-request to the leader's node (P4.1).
+
+    The leader's node id (`leader_node`) names the A2A peer to deliver to. We
+    resolve that peer from the local A2A config, sign the body with the node-link
+    HMAC secret, and POST to the leader's `room_join_path`. The wire carries
+    sha256(token) ONLY (hash_token) — the raw token never leaves this process.
+    `joiner_agent` is the OS-actor-anchored agent id (resolved by the CALLER via
+    caller_agent / resolve_os_actor) — NEVER a --from/env value. Returns
+    (http_status, response_body).
+
+    A test seam (BRIDGE_ROOMS_TEST_POST_HOOK, gated by the paired
+    BRIDGE_ROOMS_ALLOW_TEST_UID_MAP=1 + BRIDGE_A2A_ALLOW_TEST_BIND=1 flags) lets
+    the smoke capture the signed request + stub the transport so no real
+    Tailscale / live receiver is needed. It is NEVER honored in production (the
+    paired flags are unset there).
+    """
+    if a2a is None:  # pragma: no cover - a2a always ships beside this
+        raise rooms.RoomsError(
+            "cross-node join requires the A2A module + node-link config",
+            code="a2a_unavailable",
+        )
+    cfg = a2a.load_config()
+    local_bridge_id = str(cfg.get("bridge_id", "") or "").strip()
+    if not local_bridge_id:
+        raise rooms.RoomsError(
+            "config has no 'bridge_id' — cannot identify this node for a "
+            "cross-node join", code="no_bridge_id",
+        )
+    peer = a2a.find_peer(cfg, leader_node)
+    secret = a2a.peer_send_secret(peer)
+    token_hash = rooms.hash_token(token)
+    body = a2a.build_room_join_request(
+        room_id=room_id, join_token_sha256=token_hash, joiner_agent=joiner_agent,
+    )
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    message_id = a2a.new_message_id(local_bridge_id)
+    path = peer.get("room_join_path", a2a.ROOM_JOIN_PATH)
+    timestamp = str(a2a.now_ts())
+    body_hash = a2a.body_sha256(body_bytes)
+    canonical = a2a.canonical_string(
+        "POST", path, local_bridge_id, message_id, timestamp, body_hash)
+    signature = a2a.sign(secret, canonical)
+    headers = {
+        "Content-Type": "application/json",
+        "X-AGB-Protocol": a2a.ROOM_JOIN_PROTOCOL_VERSION,
+        "X-AGB-Peer": local_bridge_id,
+        "X-AGB-Message-Id": message_id,
+        "X-AGB-Timestamp": timestamp,
+        "X-AGB-Body-SHA256": body_hash,
+        "X-AGB-Signature": signature,
+    }
+
+    # Test seam: capture the fully-signed request + return a stubbed response,
+    # so the smoke exercises the real sender (signing, OS-actor joiner id, hash-
+    # only body) against the real receiver WITHOUT a live socket / Tailscale.
+    if _test_post_hook_allowed():
+        return _invoke_test_post_hook(path=path, headers=headers,
+                                      body_bytes=body_bytes)
+
+    address = a2a.resolve_peer_address(peer)
+    port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
+    if not address:
+        raise rooms.RoomsError(
+            f"leader node {leader_node!r} has no resolvable address",
+            code="no_leader_address",
+        )
+    import urllib.request
+
+    url = f"http://{address}:{port}{path}"
+    req = urllib.request.Request(url, data=body_bytes, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
+        return exc.code, (exc.read() or b"")
+
+
+def _test_post_hook_allowed() -> bool:
+    """Paired-flag gate for the cross-node POST test seam (prod-inert)."""
+    # noqa markers: these are plain env-VAR reads (test-seam gating), NOT
+    # isolated `.env` FILE access — the iso-helper-ratchet pattern matches the
+    # `.env` substring inside `os.environ`, a false positive here.
+    return (os.environ.get("BRIDGE_ROOMS_ALLOW_TEST_UID_MAP") == "1"  # noqa: iso-helper-boundary - env var, not a .env file
+            and os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") == "1"  # noqa: iso-helper-boundary - env var, not a .env file
+            and bool(os.environ.get("BRIDGE_ROOMS_TEST_POST_HOOK")))  # noqa: iso-helper-boundary - env var, not a .env file
+
+
+def _invoke_test_post_hook(*, path: str, headers: dict,
+                           body_bytes: bytes) -> tuple[int, bytes]:
+    """Write the signed request to the hook file + return a stubbed 200.
+
+    The hook value is a file path the smoke reads to assert on the signed
+    request (it can then replay it against the real receiver handler). Returns a
+    synthetic 200 so the CLI reports the pending post as sent.
+    """
+    import subprocess
+
+    hook = os.environ["BRIDGE_ROOMS_TEST_POST_HOOK"]  # noqa: iso-helper-boundary - env var, not a .env file
+    payload = {
+        "path": path, "headers": headers,
+        "body": body_bytes.decode("utf-8"),
+    }
+    # The hook is a script invoked with the JSON payload on argv (file-as-argv,
+    # never stdin — footgun #11 hygiene). Its stdout (if any) is the stubbed
+    # response body; a non-zero exit surfaces as a 503 to the caller.
+    try:
+        proc = subprocess.run(
+            [hook, json.dumps(payload)], capture_output=True, text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise rooms.RoomsError(f"test post hook failed: {exc}",
+                               code="test_hook_error")
+    if proc.returncode != 0:
+        return 503, (proc.stderr or "test hook non-zero").encode("utf-8")
+    return 200, (proc.stdout or "").encode("utf-8")
+
+
+def _post_room_roster_broadcast(*, member_node: str, room_id: str,
+                                room_epoch: int, members: list,
+                                leader_node: str, timeout: float = 30.0,
+                                ) -> tuple[int, bytes]:
+    """POST the leader-signed roster broadcast to ONE member node (P4.2).
+
+    `member_node` names the A2A peer to deliver to; the body is signed with the
+    leader-node↔member-node PAIRWISE node-link HMAC (the existing per-peer
+    secret), so the member can verify the roster came from the leader and a
+    member that lacks the leader↔Z secret cannot forge a roster node Z accepts
+    (§14 R2). `members` MUST be the canonical sorted roster. `leader_node` is the
+    local node (this leader's node id). Returns (http_status, response_body).
+
+    Reuses the SAME paired-flag test seam as the join sender
+    (BRIDGE_ROOMS_TEST_POST_HOOK) — the hook captures the signed request; the
+    smoke replays it through the real member-side receiver handler. NEVER honored
+    in production (the paired flags are unset there).
+    """
+    if a2a is None:  # pragma: no cover - a2a always ships beside this
+        raise rooms.RoomsError(
+            "roster broadcast requires the A2A module + node-link config",
+            code="a2a_unavailable",
+        )
+    cfg = a2a.load_config()
+    local_bridge_id = str(cfg.get("bridge_id", "") or "").strip()
+    if not local_bridge_id:
+        raise rooms.RoomsError(
+            "config has no 'bridge_id' — cannot identify this leader node for a "
+            "roster broadcast", code="no_bridge_id",
+        )
+    peer = a2a.find_peer(cfg, member_node)
+    secret = a2a.peer_send_secret(peer)
+    body = a2a.build_room_roster_broadcast(
+        room_id=room_id, room_epoch=room_epoch, members=members,
+        leader_node=leader_node,
+    )
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    message_id = a2a.new_message_id(local_bridge_id)
+    path = peer.get("room_roster_path", a2a.ROOM_ROSTER_PATH)
+    timestamp = str(a2a.now_ts())
+    body_hash = a2a.body_sha256(body_bytes)
+    canonical = a2a.canonical_string(
+        "POST", path, local_bridge_id, message_id, timestamp, body_hash)
+    signature = a2a.sign(secret, canonical)
+    headers = {
+        "Content-Type": "application/json",
+        "X-AGB-Protocol": a2a.ROOM_ROSTER_PROTOCOL_VERSION,
+        "X-AGB-Peer": local_bridge_id,
+        "X-AGB-Message-Id": message_id,
+        "X-AGB-Timestamp": timestamp,
+        "X-AGB-Body-SHA256": body_hash,
+        "X-AGB-Signature": signature,
+    }
+
+    if _test_post_hook_allowed():
+        return _invoke_test_post_hook(path=path, headers=headers,
+                                      body_bytes=body_bytes)
+
+    address = a2a.resolve_peer_address(peer)
+    port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
+    if not address:
+        raise rooms.RoomsError(
+            f"member node {member_node!r} has no resolvable address",
+            code="no_member_address",
+        )
+    import urllib.request
+
+    url = f"http://{address}:{port}{path}"
+    req = urllib.request.Request(url, data=body_bytes, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
+        return exc.code, (exc.read() or b"")
+
+
+def _member_nodes_for_broadcast(roster: dict, leader_node: str) -> list:
+    """The DISTINCT remote member nodes a roster broadcast targets.
+
+    Every member node that is NOT the leader's own node (the leader's local
+    members already see the authoritative rooms.db — no node-link hop). The
+    leader node is excluded so the leader never POSTs a roster to itself.
+    Deterministically ordered for reproducible broadcasts.
+    """
+    nodes: list = []
+    for m in roster.get("members", []):
+        mnode = str(m.get("node", "") or "")
+        if mnode and mnode != leader_node and mnode not in nodes:
+            nodes.append(mnode)
+    return sorted(nodes)
+
+
+def _broadcast_roster_to_members(room_id: str, roster: dict,
+                                 leader_node: str) -> dict:
+    """Broadcast the leader-signed canonical roster to every remote member node.
+
+    One signed POST per member node (§14 R2). Returns a summary
+    {delivered:[...], failed:[{node,status}...]} so the CLI can report partial
+    failures (a member-node outage does not unwind the already-committed local
+    approve — the leader's rooms.db is authoritative; the roster broadcast is
+    durable/retryable, design §14 R2). Broadcast failures are reported, never
+    fatal to the approve.
+    """
+    delivered: list = []
+    failed: list = []
+    member_nodes = _member_nodes_for_broadcast(roster, leader_node)
+    for mnode in member_nodes:
+        try:
+            status, _resp = _post_room_roster_broadcast(
+                member_node=mnode, room_id=room_id,
+                room_epoch=int(roster["epoch"]), members=roster["members"],
+                leader_node=leader_node,
+            )
+        except rooms.RoomsError as exc:
+            failed.append({"node": mnode, "error": str(exc)})
+            continue
+        except Exception as exc:  # noqa: BLE001 - transport/config failure
+            failed.append({"node": mnode, "error": f"broadcast failed: {exc}"})
+            continue
+        if 200 <= status < 300:
+            delivered.append(mnode)
+        else:
+            failed.append({"node": mnode, "status": status})
+    return {"delivered": delivered, "failed": failed}
+
+
+# --------------------------------------------------------------------------
+# room talk — room-scoped cross-node member messaging (A2A Rooms P4.3, §11)
+# --------------------------------------------------------------------------
+
+def _post_room_talk(*, member_node: str, room_id: str, room_epoch: int,
+                    sender_agent: str, target_agent: str, title: str,
+                    body: str, priority: str, timeout: float = 30.0,
+                    ) -> tuple[int, bytes]:
+    """POST a ROOM-SCOPED A2A enqueue message to ONE other member node (P4.3).
+
+    Routes over the EXISTING `/enqueue` A2A path (NOT a new endpoint) so the
+    receiver's full auth preamble + durable dedupe run unchanged; the room-scope
+    is carried in the envelope (`room_id` + `room_epoch`), and the receiver's
+    fail-closed `room_scoped_check` (the P4.3 leader-MAC roster-cache gate)
+    decides delivery. The body is signed with the SAME per-peer node-link HMAC
+    secret every other A2A send uses — membership is NOT asserted on the wire,
+    it is proven by the receiver against its OWN cached leader-MAC roster.
+
+    `sender_agent` is the OS-actor-anchored agent id (the CALLER resolved it via
+    `caller_agent`/`resolve_os_actor`) — NEVER a `--from`/env value. `room_epoch`
+    is the sender's LOCALLY-cached epoch for the room (the caller read it from
+    its own `room_roster_cache`); a hostile epoch cannot be conjured because the
+    receiver requires it to EQUAL its own cached epoch. Returns
+    (http_status, response_body).
+
+    Reuses the SAME paired-flag test seam (BRIDGE_ROOMS_TEST_POST_HOOK) the join
+    / roster-broadcast senders use — the hook captures the signed request; the
+    smoke replays it through the real receiver. NEVER honored in production.
+    """
+    if a2a is None:  # pragma: no cover - a2a always ships beside this
+        raise rooms.RoomsError(
+            "room talk requires the A2A module + node-link config",
+            code="a2a_unavailable",
+        )
+    cfg = a2a.load_config()
+    local_bridge_id = str(cfg.get("bridge_id", "") or "").strip()
+    if not local_bridge_id:
+        raise rooms.RoomsError(
+            "config has no 'bridge_id' — cannot identify this node for a "
+            "room-scoped send", code="no_bridge_id",
+        )
+    peer = a2a.find_peer(cfg, member_node)
+    secret = a2a.peer_send_secret(peer)
+    message_id = a2a.new_message_id(local_bridge_id)
+    envelope = a2a.build_envelope(
+        message_id=message_id,
+        sender_bridge=local_bridge_id,
+        sender_agent=sender_agent,
+        target_agent=target_agent,
+        priority=priority,
+        title=title,
+        body=body,
+        reply_peer=local_bridge_id,
+        reply_agent=sender_agent,
+        room_id=room_id,
+        room_epoch=int(room_epoch),
+    )
+    body_bytes = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+    path = peer.get("enqueue_path",
+                    cfg.get("listen", {}).get("enqueue_path", "/enqueue"))
+    timestamp = str(a2a.now_ts())
+    body_hash = a2a.body_sha256(body_bytes)
+    canonical = a2a.canonical_string(
+        "POST", path, local_bridge_id, message_id, timestamp, body_hash)
+    signature = a2a.sign(secret, canonical)
+    headers = {
+        "Content-Type": "application/json",
+        "X-AGB-Protocol": a2a.PROTOCOL_VERSION,
+        "X-AGB-Peer": local_bridge_id,
+        "X-AGB-Message-Id": message_id,
+        "X-AGB-Timestamp": timestamp,
+        "X-AGB-Body-SHA256": body_hash,
+        "X-AGB-Signature": signature,
+    }
+
+    if _test_post_hook_allowed():
+        return _invoke_test_post_hook(path=path, headers=headers,
+                                      body_bytes=body_bytes)
+
+    address = a2a.resolve_peer_address(peer)
+    port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
+    if not address:
+        raise rooms.RoomsError(
+            f"member node {member_node!r} has no resolvable address",
+            code="no_member_address",
+        )
+    import urllib.request
+
+    url = f"http://{address}:{port}{path}"
+    req = urllib.request.Request(url, data=body_bytes, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
+        return exc.code, (exc.read() or b"")
+
+
+def _talk_target_pairs(members: list, sender_agent: str,
+                       sender_node: str, local_node_id: str,
+                       only_to: str = "") -> list:
+    """The (agent, node) pairs a room-talk send targets, from the CACHED roster.
+
+    Every cached member EXCEPT the sender itself, on a node that is NOT this
+    sender's own node (a same-node member is reachable through the local queue,
+    not a node-link hop — P4.3 is cross-node messaging). `only_to`
+    (`agent` or `agent@node`) narrows to a single recipient. Deterministically
+    ordered for reproducible sends.
+    """
+    want_agent, _, want_node = (only_to or "").partition("@")
+    want_agent = want_agent.strip()
+    want_node = want_node.strip()
+    pairs: list = []
+    for m in members:
+        magent = str(m.get("agent", "") or "")
+        mnode = str(m.get("node", "") or "")
+        if magent == sender_agent and mnode == sender_node:
+            continue  # never send to self
+        if not mnode or mnode == local_node_id:
+            continue  # same node → local queue, not a cross-node room-talk hop
+        if only_to:
+            if magent != want_agent:
+                continue
+            if want_node and mnode != want_node:
+                continue
+        pair = (magent, mnode)
+        if pair not in pairs:
+            pairs.append(pair)
+    return sorted(pairs)
+
+
+def cmd_talk(args: argparse.Namespace) -> int:
+    """Send a ROOM-SCOPED message to the room's OTHER member nodes (P4.3).
+
+    The sender identity is the OS-actor-anchored trusted agent (NEVER
+    --from/env). The send stamps the room_id + the sender's LOCALLY-cached epoch
+    and routes a room-scoped A2A enqueue to each other member node over the
+    node-link. Membership is enforced by the RECEIVER against its own leader-MAC
+    roster cache — this command only sends to members the sender's OWN cache
+    already knows, and refuses to send at all if the sender is not itself a
+    cached member (fail-closed symmetry with the receiver gate).
+    """
+    room_id = args.room_id
+    agent = caller_agent(args)
+    node = local_node()
+
+    # Resolve body from --body / --body-file / stdin.
+    if args.body is not None and args.body_file is not None:
+        return die("pass only one of --body / --body-file", code=1)
+    if args.body_file is not None:
+        body_src = args.body_file
+        if not os.path.isfile(body_src):
+            return die(f"--body-file not found: {body_src}", code=1)
+        try:
+            with open(body_src, encoding="utf-8") as fh:
+                body_text = fh.read()
+        except OSError as exc:
+            return die(f"--body-file unreadable: {body_src}: {exc}", code=1)
+    elif args.body is not None:
+        body_text = args.body
+    else:
+        body_text = sys.stdin.read() if not sys.stdin.isatty() else ""
+
+    if not args.title:
+        return die("--title is required", code=1)
+    if not body_text and not args.allow_empty_body:
+        return die("body is empty; pass --body/--body-file or "
+                   "--allow-empty-body", code=1)
+    priority = args.priority
+    if a2a is not None and priority not in a2a.VALID_PRIORITIES:
+        return die(f"invalid --priority: {priority}", code=1)
+
+    # Read the sender's OWN locally-cached leader-MAC roster for this room. A
+    # room-talk send is only meaningful once this node holds a verified roster
+    # cache (from a P4.2 broadcast) — and the sender must itself be a cached
+    # member, else there is nothing it is authorized to address.
+    conn = rooms.open_rooms_readonly()
+    if conn is None:
+        return die(f"no local roster cache for room {room_id} — join the room "
+                   "and wait for the leader's roster broadcast first", code=1)
+    try:
+        row = rooms.get_roster_cache(conn, room_id)
+    finally:
+        conn.close()
+    if row is None:
+        return die(f"no local roster cache for room {room_id} — join the room "
+                   "and wait for the leader's roster broadcast first", code=1)
+    cached_epoch = int(row["epoch"])
+    members = rooms._cached_members(row)
+    if members is None:
+        return die(f"local roster cache for room {room_id} is corrupt", code=1)
+    member_pairs = {(m["agent"], m["node"]) for m in members}
+    if (agent, node) not in member_pairs:
+        return die(f"{agent}@{node} is not a member of room {room_id} per the "
+                   "local roster cache — refusing to send", code=1)
+
+    targets = _talk_target_pairs(members, agent, node, node,
+                                 only_to=getattr(args, "to", "") or "")
+    if not targets:
+        return die(f"no other-node members to send to in room {room_id} "
+                   "(roster has no cross-node recipients matching the filter)",
+                   code=1)
+
+    delivered: list = []
+    failed: list = []
+    for tagent, tnode in targets:
+        try:
+            status, resp = _post_room_talk(
+                member_node=tnode, room_id=room_id, room_epoch=cached_epoch,
+                sender_agent=agent, target_agent=tagent, title=args.title,
+                body=body_text, priority=priority,
+            )
+        except rooms.RoomsError as exc:
+            failed.append({"agent": tagent, "node": tnode, "error": str(exc)})
+            continue
+        except Exception as exc:  # noqa: BLE001 - transport/config failure
+            failed.append({"agent": tagent, "node": tnode,
+                           "error": f"room talk failed: {exc}"})
+            continue
+        if 200 <= status < 300:
+            delivered.append({"agent": tagent, "node": tnode})
+        else:
+            detail = ""
+            try:
+                detail = resp.decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001
+                detail = ""
+            failed.append({"agent": tagent, "node": tnode,
+                           "status": status, "detail": detail})
+
+    payload = {
+        "room_id": room_id, "epoch": cached_epoch,
+        "from": f"{agent}@{node}",
+        "delivered": delivered, "failed": failed,
+    }
+    if args.json:
+        out(json.dumps(payload))
+    else:
+        info(f"room talk on {room_id} (epoch {cached_epoch}) from {agent}@{node}: "
+             f"{len(delivered)} delivered, {len(failed)} failed")
+        for f in failed:
+            info(f"  FAILED {f['agent']}@{f['node']}: "
+                 f"{f.get('error') or f.get('status')}")
+    # A partial failure is a non-zero exit so callers/cron notice, but a fully
+    # delivered send (or an all-targets dry filter) returns 0.
+    return 0 if not failed else 2
+
+
 def cmd_join(args: argparse.Namespace) -> int:
     parsed = rooms.parse_invite_link(args.link)
     room_id = parsed.get("room", "")
     token = parsed.get("t", "")
+    leader_node = parsed.get("leader", "")
+    # THE joiner identity (contract 2): the OS-actor-anchored trusted agent
+    # (resolve_os_actor / pwd.getpwuid), NEVER --from / BRIDGE_AGENT_ID / USER.
+    # The SAME anchor single-node uses — so a hostile --from/env cannot change
+    # the recorded joiner on either path.
     agent = caller_agent(args)
     node = local_node()
+    if not token:
+        return die("invite link carries no token (t=...) — a join needs "
+                   "the token-bearing link, not a bare room id", code=1)
+
+    # Cross-node (P4.1): the link names a leader node that is NOT this node.
+    # Post the join-request to the leader's node over the node-link; the leader
+    # verifies + persists the pending row (no local rooms.db write here — this
+    # node is not the leader's node and has no authority over the room).
+    if leader_node and leader_node != node:
+        try:
+            status, resp = _post_room_join_request(
+                leader_node=leader_node, room_id=room_id, token=token,
+                joiner_agent=agent,
+            )
+        except rooms.RoomsError as exc:
+            return die(str(exc), code=1)
+        except Exception as exc:  # noqa: BLE001 - transport/config failure
+            return die(f"cross-node join failed: {exc}", code=1)
+        if not (200 <= status < 300):
+            detail = ""
+            try:
+                detail = resp.decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001
+                detail = ""
+            return die(f"leader node rejected the join (HTTP {status}): {detail}",
+                       code=1)
+        # P4.2 FIRST-ROSTER binding anchor: record the member's OWN outbound
+        # join intent locally (room_id + the leader_node it posted to). This is
+        # the un-spoofable proof that THIS node chose THIS room+leader, so the
+        # member can later accept the leader's FIRST roster broadcast for this
+        # room — and REFUSE a roster for a room it never tried to join (the
+        # anti-rogue-leader-minting defense, accept_roster_broadcast contract
+        # 3c). We record ONLY when the leader's 2xx response CONFIRMS it
+        # persisted a pending row (`status==pending`) or already had one
+        # (`duplicate==true`) — a bare 200 with no such confirmation does NOT
+        # mint a local binding (so a non-committal/stub response cannot seed a
+        # spurious intent).
+        leader_confirmed_pending = False
+        try:
+            ack = json.loads(resp.decode("utf-8", "replace") or "{}")
+            if isinstance(ack, dict):
+                leader_confirmed_pending = (
+                    ack.get("status") == rooms.JOIN_PENDING
+                    or ack.get("duplicate") is True)
+        except (ValueError, json.JSONDecodeError):
+            leader_confirmed_pending = False
+        if leader_confirmed_pending:
+            try:
+                mconn = rooms.open_rooms()
+                try:
+                    rooms.record_local_join_intent(
+                        mconn, room_id, agent, node, leader_node=leader_node)
+                finally:
+                    mconn.close()
+            except rooms.RoomsError as exc:
+                # The leader already accepted the join; failing to record the
+                # local binding is non-fatal but means the first roster will be
+                # refused until re-joined. Surface it without unwinding the
+                # accepted join.
+                info(f"WARNING: cross-node join accepted but local binding not "
+                     f"recorded ({exc}); the first roster broadcast may be "
+                     "refused until you re-run join")
+        if args.json:
+            out(json.dumps({"room_id": room_id,
+                            "agent": f"{agent}@{node}",
+                            "leader_node": leader_node,
+                            "status": rooms.JOIN_PENDING, "cross_node": True}))
+        else:
+            info(f"cross-node join request posted for {agent}@{node} on "
+                 f"{room_id} to leader node {leader_node} (pending approval)")
+        return 0
+
+    # Single-node (P1) path: joiner + leader share this node.
     conn = rooms.open_rooms()
     try:
         room = rooms.get_room(conn, room_id)
         if room is None:
             return die(f"room not found: {room_id}", code=1)
-        if not token:
-            return die("invite link carries no token (t=...) — a join needs "
-                       "the token-bearing link, not a bare room id", code=1)
         # Rate-limit per token + source BEFORE the hash compare so a brute
         # force on the token is bounded, then verify the token hash.
         try:
@@ -426,8 +1067,8 @@ def cmd_join(args: argparse.Namespace) -> int:
         except rooms.RoomsError as exc:
             return die(str(exc), code=1)
         if not rooms.verify_invite_token(room, token):
-            return die("invalid invite token for this room (hash mismatch)",
-                       code=1)
+            return die("invalid invite token for this room (hash mismatch, "
+                       "expired, or revoked)", code=1)
         rooms.post_join_request(conn, room_id, agent, node)
     finally:
         conn.close()
@@ -444,17 +1085,32 @@ def cmd_approve(args: argparse.Namespace) -> int:
     node = local_node()
     agent, anode = split_agent_node(args.target, node)
     conn = rooms.open_rooms()
+    roster_snapshot: Optional[dict] = None
     try:
         room = _require_leader_conn(conn, args.room_id, args)
-        # A join must have been requested (the two-factor gate: token =>
-        # request => leader approval). Approving an unrequested agent is a
-        # leader-initiated add, which we allow but note.
-        epoch = rooms.approve_join(conn, args.room_id, agent, anode)
+        leader_node = str(room["leader_node"] or "")
+        # P4.2 contract 1/6: a CROSS-NODE approve (admitting a REMOTE agent whose
+        # node != this leader node) REQUIRES a P4.1 verified pending row — the
+        # receiver only creates that AFTER the node-link HMAC + token + TTL/
+        # revocation verification passed. The LOCAL leader-add path (admitting an
+        # agent on this leader's OWN node) stays a SEPARATE path that does NOT
+        # claim that token/two-factor gate. The two paths are kept distinct here.
+        is_cross_node = bool(anode) and bool(leader_node) and anode != leader_node
+        if is_cross_node:
+            epoch = rooms.approve_cross_node(conn, args.room_id, agent, anode)
+        else:
+            # P1 local path: a leader-initiated add of a local agent (no verified-
+            # pending-row requirement — the leader is OS-authenticated and the
+            # agent shares this node).
+            epoch = rooms.approve_join(conn, args.room_id, agent, anode)
         if room["invite_once"]:
             rooms.burn_invite_token(conn, args.room_id)
             burned = True
         else:
             burned = False
+        # Snapshot the NEW canonical roster (post-approve, post-epoch-bump) while
+        # the connection is open, so we can broadcast it after closing the db.
+        roster_snapshot = rooms.roster_for(conn, args.room_id)
     except rooms.RoomsError as exc:
         conn.close()
         return die(str(exc), code=1)
@@ -463,12 +1119,32 @@ def cmd_approve(args: argparse.Namespace) -> int:
             conn.close()
         except Exception:  # noqa: BLE001
             pass
+
+    # Broadcast the leader-signed canonical roster to every REMOTE member node
+    # over the node-link (§14 R2). The local approve is already committed +
+    # authoritative; a member-node delivery failure is reported, never fatal
+    # (roster broadcasts are durable/retryable). No-op when there are no remote
+    # member nodes (a pure single-node room).
+    broadcast = {"delivered": [], "failed": []}
+    if roster_snapshot is not None and leader_node:
+        broadcast = _broadcast_roster_to_members(
+            args.room_id, roster_snapshot, leader_node)
+
     if args.json:
         out(json.dumps({"room_id": args.room_id, "approved": f"{agent}@{anode}",
-                        "epoch": epoch, "invite_burned": burned}))
+                        "epoch": epoch, "invite_burned": burned,
+                        "cross_node": is_cross_node,
+                        "roster_broadcast": broadcast}))
     else:
         info(f"approved {agent}@{anode} into {args.room_id} (epoch {epoch})"
              + (" — single-use invite burned" if burned else ""))
+        if broadcast["delivered"]:
+            info(f"roster broadcast delivered to: "
+                 f"{', '.join(broadcast['delivered'])}")
+        if broadcast["failed"]:
+            info(f"WARNING: roster broadcast failed for: "
+                 f"{broadcast['failed']} (durable/retryable — the local approve "
+                 "is committed)")
     return 0
 
 
@@ -707,6 +1383,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_create = sub.add_parser("create", help="create a room (you are leader)")
     p_create.add_argument("--name", default="", help="human room name")
+    p_create.add_argument(
+        "--ttl", type=int, default=0,
+        help="invite-token lifetime in seconds (0 = no expiry, the default). "
+             "A cross-node join (P4.1) with an expired token is refused.")
     _add_common(p_create)
     p_create.set_defaults(func=cmd_create)
 
@@ -725,6 +1405,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_invite.add_argument("room_id")
     p_invite.add_argument("--once", action="store_true",
                           help="single-use token (burned after one approval)")
+    p_invite.add_argument(
+        "--ttl", type=int, default=0,
+        help="invite-token lifetime in seconds (0 = no expiry, the default).")
     _add_common(p_invite)
     p_invite.set_defaults(func=cmd_invite)
 
@@ -761,6 +1444,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_leave.add_argument("room_id")
     _add_common(p_leave)
     p_leave.set_defaults(func=cmd_leave)
+
+    p_talk = sub.add_parser(
+        "talk",
+        help="send a room-scoped message to the room's other member nodes")
+    p_talk.add_argument("room_id")
+    p_talk.add_argument("--title", required=True)
+    p_talk.add_argument("--body", default=None)
+    p_talk.add_argument("--body-file", dest="body_file", default=None)
+    p_talk.add_argument("--to", default="",
+                        help="narrow to one recipient (agent or agent@node); "
+                             "default = every other-node member")
+    p_talk.add_argument("--priority", default="normal")
+    p_talk.add_argument("--allow-empty-body", action="store_true",
+                        dest="allow_empty_body")
+    _add_common(p_talk)
+    p_talk.set_defaults(func=cmd_talk)
 
     p_adopt = sub.add_parser(
         "adopt-all",

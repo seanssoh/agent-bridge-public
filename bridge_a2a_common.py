@@ -51,6 +51,39 @@ IDENTITY_UPDATE_ENVELOPE_PROTOCOL = "agent-bridge.a2a.identity-update.v1"
 # and vice versa.
 IDENTITY_UPDATE_PATH = "/peer-identity-update"
 
+# A2A Rooms P4.1 (design §11 / §14 R3): the signed cross-node `room-join-request`
+# control message. A member on node B posts this to the leader's node A over the
+# EXISTING node-link so node A can verify the invite token + persist a PENDING
+# join request. Like the identity-update message it is a DISTINCT protocol routed
+# to a SEPARATE handler with its own fail-closed stack — it NEVER reaches the
+# enqueue/allowlist/queue boundary, NEVER carries a queue task, and NEVER
+# auto-admits. The wire carries `sha256(join_token)` ONLY (never the raw token,
+# §14 R3) and the joiner *agent* claim; the joiner *node* is bound by the
+# receiver to the HMAC-authenticated sender bridge (never wire-asserted).
+ROOM_JOIN_PROTOCOL_VERSION = "a2a-room-join-v1"
+ROOM_JOIN_ENVELOPE_PROTOCOL = "agent-bridge.a2a.room-join.v1"
+ROOM_JOIN_PATH = "/room-join-request"
+
+# A2A Rooms P4.2 (design §6 / §11 / §14 R2): the signed cross-node
+# `room-roster-broadcast` control message. After the leader (on node A) approves
+# a member it bumps the room epoch and broadcasts the canonical, leader-signed
+# roster to EACH member node over THAT node's existing node-link, MAC'd with the
+# leader-node↔member-node ordered-pair secret (one signed POST per member-link —
+# §14 R2 "Member X knows only the leader↔X secret, never leader↔Z, so X cannot
+# forge a roster node Z would accept"). Like the join-request it is a DISTINCT
+# protocol routed to a SEPARATE handler with the SAME fail-closed auth preamble
+# (remote_addr -> HMAC -> skew -> dedupe); its terminal action is a member-local
+# room_roster_cache write — it NEVER reaches the enqueue/allowlist/queue
+# boundary, carries no queue task, and admits nothing. The pairwise HMAC IS the
+# leader signature: the X-AGB-Signature header is computed over the canonical
+# request string (which binds method+path+peer+message_id+timestamp+body-hash)
+# with the leader↔member secret, so a member cannot forge a roster for a peer
+# whose secret it does not hold. The body carries ONLY the canonical roster
+# (room_id, room_epoch, sorted members, leader_node) — no token, no secret.
+ROOM_ROSTER_PROTOCOL_VERSION = "a2a-room-roster-v1"
+ROOM_ROSTER_ENVELOPE_PROTOCOL = "agent-bridge.a2a.room-roster.v1"
+ROOM_ROSTER_PATH = "/room-roster-broadcast"
+
 # Default per-peer caps. Receiver config may override per peer.
 DEFAULT_MAX_BODY_BYTES = 256 * 1024
 DEFAULT_MAX_TITLE_BYTES = 1024
@@ -881,6 +914,219 @@ def parse_identity_update(raw: bytes) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Cross-node room-join-request control message (A2A Rooms P4.1, design §11)
+# --------------------------------------------------------------------------
+#
+# The body a node-B member signs (over the node-link HMAC) + the leader's node A
+# receiver re-validates. It carries:
+#   - room_id:          the room the joiner wants into.
+#   - join_token_sha256: sha256(raw_token) — the HASH ONLY. The raw token NEVER
+#                        crosses the wire (§14 R3); the leader hash-compares it
+#                        against the stored `invite_token_sha256`.
+#   - joiner_agent:      the joiner's agent id as attested by node B. CRITICAL
+#                        (contract 2): node B MUST derive this from its local
+#                        OS-actor / gateway-credential regime (resolve_os_actor),
+#                        NEVER from --from / BRIDGE_AGENT_ID / USER. The node-link
+#                        HMAC authenticates the NODE; the leader binds the joiner
+#                        *node* to the authenticated sender bridge (NOT to any
+#                        wire-asserted node field) and accepts `joiner_agent` only
+#                        as that authenticated node's OS-actor-anchored attestation.
+# There is deliberately NO `joiner_node` field: a wire-asserted node would be
+# spoofable, so the receiver uses the HMAC-authenticated `X-AGB-Peer` as the node.
+
+
+def build_room_join_request(
+    *,
+    room_id: str,
+    join_token_sha256: str,
+    joiner_agent: str,
+) -> dict[str, Any]:
+    """Build the cross-node room-join-request control body.
+
+    `join_token_sha256` MUST already be the hash (the caller hashes the raw
+    token with `bridge_rooms_common.hash_token` before this is built) — the raw
+    token must never reach this function or the wire. `joiner_agent` MUST be the
+    OS-actor-anchored agent id (see the section header), never a caller flag.
+    """
+    return {
+        "protocol": ROOM_JOIN_ENVELOPE_PROTOCOL,
+        "room_id": room_id,
+        "join_token_sha256": join_token_sha256,
+        "joiner_agent": joiner_agent,
+    }
+
+
+def parse_room_join_request(raw: bytes) -> dict[str, Any]:
+    """Parse + shape-validate a cross-node room-join-request control body.
+
+    Validates only the WIRE shape: a JSON object with the right protocol tag and
+    non-empty string `room_id`, `join_token_sha256`, `joiner_agent`. The token
+    hash must look like a sha256 hex digest (64 lowercase hex chars) so a
+    malformed/garbage value is refused at the boundary, never half-trusted. It
+    does NOT verify the token (the leader hash-compares + TTL/revocation-checks
+    against rooms.db) and does NOT trust the joiner identity beyond the
+    node-link auth the receiver already enforced.
+    """
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise A2AError(
+            f"room-join-request is not valid JSON: {exc}", code="bad_room_join",
+        ) from exc
+    if not isinstance(body, dict):
+        raise A2AError(
+            "room-join-request root must be a JSON object", code="bad_room_join",
+        )
+    if body.get("protocol") != ROOM_JOIN_ENVELOPE_PROTOCOL:
+        raise A2AError(
+            f"unsupported room-join-request protocol: {body.get('protocol')!r}",
+            code="bad_room_join_protocol",
+        )
+    for field in ("room_id", "join_token_sha256", "joiner_agent"):
+        val = body.get(field)
+        if not isinstance(val, str) or not val:
+            raise A2AError(
+                f"room-join-request missing required string field: {field}",
+                code="bad_room_join",
+            )
+    th = body["join_token_sha256"]
+    if len(th) != 64 or any(c not in "0123456789abcdef" for c in th):
+        raise A2AError(
+            "room-join-request join_token_sha256 must be a sha256 hex digest",
+            code="bad_room_join",
+        )
+    return body
+
+
+# --------------------------------------------------------------------------
+# Cross-node room-roster-broadcast control message (A2A Rooms P4.2, design §6/§14 R2)
+# --------------------------------------------------------------------------
+#
+# The body a leader's node A signs (over the per-member node-link HMAC) + each
+# member node re-validates. It carries the CANONICAL, leader-authoritative
+# roster for one room:
+#   - room_id:     the room.
+#   - room_epoch:  the monotonic epoch the broadcast carries (the freshness /
+#                  split-brain tiebreaker; a member ignores a lower-or-same epoch
+#                  unless it is a byte-identical idempotent duplicate).
+#   - members:     the roster, CANONICALLY sorted by (agent, node) — the exact
+#                  bytes the leader signed; any verifier recomputes the same MAC
+#                  string. Each entry is {agent, node, role}.
+#   - leader_node: the node that leads the room. CRITICAL (contract 3a): the
+#                  member accepts a roster ONLY when the authenticated X-AGB-Peer
+#                  (the node-link sender) EQUALS this leader_node — a roster from
+#                  any non-leader authenticated peer is rejected, persisting
+#                  nothing. There is deliberately NO leader_agent-on-the-wire
+#                  trust beyond what the roster members list itself carries.
+# The leader's signature is the node-link HMAC header (X-AGB-Signature) over the
+# canonical request string — the body carries no separate `sig` field because
+# the pairwise HMAC over the body hash IS the per-member signature (§14 R2: one
+# signature per member-link). No token, no secret ever crosses this wire.
+
+
+def build_room_roster_broadcast(
+    *,
+    room_id: str,
+    room_epoch: int,
+    members: list[dict[str, Any]],
+    leader_node: str,
+) -> dict[str, Any]:
+    """Build the cross-node room-roster-broadcast control body.
+
+    `members` MUST already be the CANONICAL sorted roster (sorted by (agent,
+    node) — `bridge_rooms_common._sorted_members` / `roster_for`). The caller
+    signs the resulting body bytes with the leader-node↔member-node pairwise
+    HMAC (the node-link secret) for EACH member node it broadcasts to, so a
+    member cannot forge a roster for a peer whose secret it does not hold. The
+    body carries NO `sig` field — the X-AGB-Signature header IS the per-link
+    signature (§14 R2).
+    """
+    return {
+        "protocol": ROOM_ROSTER_ENVELOPE_PROTOCOL,
+        "room_id": room_id,
+        "room_epoch": int(room_epoch),
+        "members": members,
+        "leader_node": leader_node,
+    }
+
+
+def parse_room_roster_broadcast(raw: bytes) -> dict[str, Any]:
+    """Parse + shape-validate a cross-node room-roster-broadcast control body.
+
+    Validates only the WIRE shape: a JSON object with the right protocol tag,
+    non-empty string `room_id` + `leader_node`, a non-negative int `room_epoch`,
+    and a `members` LIST whose every entry is an object with non-empty string
+    `agent` + string `node` (+ optional string `role`). A malformed/garbage
+    value is refused at the boundary, never half-trusted. It does NOT verify the
+    leader-authority binding (the receiver checks the authenticated peer ==
+    leader_node and the pairwise HMAC) and does NOT trust the roster beyond the
+    node-link auth the receiver already enforced.
+    """
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise A2AError(
+            f"room-roster-broadcast is not valid JSON: {exc}",
+            code="bad_room_roster",
+        ) from exc
+    if not isinstance(body, dict):
+        raise A2AError(
+            "room-roster-broadcast root must be a JSON object",
+            code="bad_room_roster",
+        )
+    if body.get("protocol") != ROOM_ROSTER_ENVELOPE_PROTOCOL:
+        raise A2AError(
+            f"unsupported room-roster-broadcast protocol: {body.get('protocol')!r}",
+            code="bad_room_roster_protocol",
+        )
+    for field in ("room_id", "leader_node"):
+        val = body.get(field)
+        if not isinstance(val, str) or not val:
+            raise A2AError(
+                f"room-roster-broadcast missing required string field: {field}",
+                code="bad_room_roster",
+            )
+    epoch = body.get("room_epoch")
+    # bool is an int subclass — reject it explicitly so `true`/`false` cannot
+    # masquerade as an epoch.
+    if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
+        raise A2AError(
+            "room-roster-broadcast room_epoch must be a non-negative integer",
+            code="bad_room_roster",
+        )
+    members = body.get("members")
+    if not isinstance(members, list):
+        raise A2AError(
+            "room-roster-broadcast members must be a list", code="bad_room_roster",
+        )
+    for entry in members:
+        if not isinstance(entry, dict):
+            raise A2AError(
+                "room-roster-broadcast member entries must be objects",
+                code="bad_room_roster",
+            )
+        agent = entry.get("agent")
+        node = entry.get("node", "")
+        role = entry.get("role", "")
+        if not isinstance(agent, str) or not agent:
+            raise A2AError(
+                "room-roster-broadcast member missing string 'agent'",
+                code="bad_room_roster",
+            )
+        if not isinstance(node, str):
+            raise A2AError(
+                "room-roster-broadcast member 'node' must be a string",
+                code="bad_room_roster",
+            )
+        if not isinstance(role, str):
+            raise A2AError(
+                "room-roster-broadcast member 'role' must be a string",
+                code="bad_room_roster",
+            )
+    return body
+
+
+# --------------------------------------------------------------------------
 # Outbox (sender side) — durable SQLite
 # --------------------------------------------------------------------------
 
@@ -908,18 +1154,118 @@ CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, next_attempt_ts);
 CREATE INDEX IF NOT EXISTS idx_outbox_peer ON outbox(peer, status);
 """
 
+# A2A Rooms P4.3 (codex review): the inbox dedupe ledger is scoped to the
+# AUTHENTICATED peer via a COMPOSITE (peer, message_id) PRIMARY KEY — mirrors
+# P4.1's room_join_dedupe fix. `message_id` is sender-chosen (the `<bridge>:uuid`
+# convention is NOT enforced on the wire), so a message_id-ONLY PK let one
+# authenticated peer pre-seed / block another peer's message_id (a fresh row
+# with that id, or a same-id/different-body row → the victim's later legitimate
+# message is mis-classified as a 409 conflict and suppressed). The composite PK
+# isolates each peer's dedupe namespace: a (peerB, "nodeA:uuid") row can never
+# collide with (peerA, "nodeA:uuid"). Room-talk rides this same /enqueue dedupe,
+# so contract 6 (peer-scoped dedupe + replay protection) is satisfied here for
+# room messages too — without a separate ledger.
 _INBOX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS inbox_dedupe (
-  message_id      TEXT PRIMARY KEY,
+  message_id      TEXT NOT NULL,
   peer            TEXT NOT NULL,
   body_sha256     TEXT NOT NULL,
   created_task_id TEXT,
   first_seen_ts   INTEGER NOT NULL,
   last_seen_ts    INTEGER NOT NULL,
-  delivery_count  INTEGER NOT NULL DEFAULT 1
+  delivery_count  INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (peer, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_peer ON inbox_dedupe(peer, first_seen_ts);
 """
+
+
+def _migrate_inbox_schema(conn: sqlite3.Connection) -> None:
+    """Idempotently rebuild a legacy single-column-PK inbox_dedupe to the
+    composite (peer, message_id) PK (A2A Rooms P4.3, codex review).
+
+    `CREATE TABLE IF NOT EXISTS` never alters an existing table, so an inbox.db
+    created before this change keeps `message_id TEXT PRIMARY KEY`. SQLite cannot
+    `ALTER TABLE ... ADD PRIMARY KEY`, so we detect the old shape (the
+    `message_id` column declared `pk=1` while `peer` is not part of the PK) and
+    rebuild: create the new table, copy rows (collapsing any pre-existing
+    cross-peer id collisions to the FIRST-seen row per (peer, message_id) — which
+    the old global PK could not even have stored, so there is nothing to lose in
+    practice), swap, reindex. The whole rebuild is one transaction; on any error
+    it rolls back and leaves the legacy table intact (fail-safe — dedupe still
+    works, just globally, until the next open retries the migration). NEVER drops
+    rows for a peer.
+    """
+    try:
+        cols = conn.execute("PRAGMA table_info(inbox_dedupe)").fetchall()
+    except sqlite3.Error:
+        return
+    if not cols:
+        return
+    # Map column name -> pk position (0 = not part of pk).
+    pk_of = {row[1]: int(row[5]) for row in cols}
+    # Legacy shape: message_id is the sole PK (pk==1) and peer is NOT in the PK.
+    legacy = pk_of.get("message_id", 0) == 1 and pk_of.get("peer", 0) == 0
+    if not legacy:
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            CREATE TABLE inbox_dedupe_p43 (
+              message_id      TEXT NOT NULL,
+              peer            TEXT NOT NULL,
+              body_sha256     TEXT NOT NULL,
+              created_task_id TEXT,
+              first_seen_ts   INTEGER NOT NULL,
+              last_seen_ts    INTEGER NOT NULL,
+              delivery_count  INTEGER NOT NULL DEFAULT 1,
+              PRIMARY KEY (peer, message_id)
+            )
+        """)
+        # INSERT OR IGNORE collapses to one row per (peer, message_id); with a
+        # global PK there can be at most one row per message_id anyway, so this
+        # is a faithful 1:1 copy. Order by first_seen_ts so the earliest wins.
+        conn.execute("""
+            INSERT OR IGNORE INTO inbox_dedupe_p43
+              (message_id, peer, body_sha256, created_task_id, first_seen_ts,
+               last_seen_ts, delivery_count)
+            SELECT message_id, peer, body_sha256, created_task_id, first_seen_ts,
+                   last_seen_ts, delivery_count
+            FROM inbox_dedupe ORDER BY first_seen_ts
+        """)
+        conn.execute("DROP TABLE inbox_dedupe")
+        conn.execute("ALTER TABLE inbox_dedupe_p43 RENAME TO inbox_dedupe")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_peer "
+            "ON inbox_dedupe(peer, first_seen_ts)")
+        conn.commit()
+    except sqlite3.Error:
+        # Leave the legacy table intact (no row loss) and roll back the partial
+        # rebuild. The CALLER (open_inbox) re-verifies the PK shape and FAILS
+        # CLOSED if the table is still legacy (codex P4.3 r2) — it must NOT hand
+        # back a connection on which a cross-peer same-id message could pass the
+        # peer-scoped lookup yet collide only at the post-enqueue INSERT (which
+        # would let a task be staged against a global-PK ledger).
+        conn.rollback()
+
+
+def _inbox_pk_is_composite(conn: sqlite3.Connection) -> bool:
+    """True iff inbox_dedupe carries the composite (peer, message_id) PK.
+
+    The post-migration verification gate (codex P4.3 r2). Reads PRAGMA
+    table_info: both `peer` and `message_id` must be part of the PRIMARY KEY (pk
+    position > 0). A legacy single-column-PK table (message_id pk=1, peer pk=0)
+    returns False so open_inbox can fail closed rather than serve cross-peer
+    dedupe on a global-PK ledger.
+    """
+    try:
+        cols = conn.execute("PRAGMA table_info(inbox_dedupe)").fetchall()
+    except sqlite3.Error:
+        return False
+    if not cols:
+        return False
+    pk_of = {row[1]: int(row[5]) for row in cols}
+    return pk_of.get("peer", 0) > 0 and pk_of.get("message_id", 0) > 0
 
 
 def _connect(path: Path, schema: str) -> sqlite3.Connection:
@@ -941,7 +1287,24 @@ def open_outbox() -> sqlite3.Connection:
 
 
 def open_inbox() -> sqlite3.Connection:
-    return _connect(inbox_db_path(), _INBOX_SCHEMA)
+    conn = _connect(inbox_db_path(), _INBOX_SCHEMA)
+    _migrate_inbox_schema(conn)
+    # FAIL CLOSED if the dedupe ledger is still the legacy global-PK shape
+    # (a fresh db is created composite; an upgraded db is migrated above; only a
+    # FAILED migration leaves it legacy). Returning a legacy-PK connection would
+    # let a cross-peer same-message_id request pass the peer-scoped lookup and
+    # reach enqueue, then collide only at the post-enqueue INSERT — so we refuse
+    # to serve dedupe on it. The caller's try/except turns this into a 500
+    # BEFORE any staging/enqueue (codex P4.3 r2).
+    if not _inbox_pk_is_composite(conn):
+        conn.close()
+        raise A2AError(
+            "inbox_dedupe is still the legacy global-PK shape after migration — "
+            "refusing to serve peer-scoped dedupe on it (retry after the rebuild "
+            "succeeds)",
+            code="inbox_dedupe_legacy_pk",
+        )
+    return conn
 
 
 def outbox_total_bytes(conn: sqlite3.Connection) -> int:
