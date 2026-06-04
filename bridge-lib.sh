@@ -458,9 +458,59 @@ BRIDGE_CRON_STAGING_STALE_SECONDS="${BRIDGE_CRON_STAGING_STALE_SECONDS:-300}"
 # slow disk) would otherwise stall the cron-sync tick. Default 25s
 # leaves headroom under the cron_sync_timeout (default 30s).
 BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS="${BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS:-25}"
-# Default 1 (issue #579): serial fan-out is the safe baseline on small-RAM
-# hosts. Operators with headroom can lift this by exporting an override.
-BRIDGE_CRON_DISPATCH_MAX_PARALLEL="${BRIDGE_CRON_DISPATCH_MAX_PARALLEL:-1}"
+# cron-dispatch worker-pool size resolution (issue #1461). Precedence, in
+# order, highest wins:
+#
+#   1. BRIDGE_CRON_DISPATCH_MAX_PARALLEL env (explicit operator override —
+#      e.g. the daemon LaunchAgent/systemd unit env, or an exported value).
+#   2. `cron_dispatch_max_parallel` in the runtime bridge-config.json — the
+#      sanctioned, audit-chained, upgrade-safe path. Set it with
+#      `agb config set --path runtime/bridge-config.json
+#        --change cron_dispatch_max_parallel=<N>`. `agb config set` refuses
+#      the `.sh` roster (it cannot shell-parse it safely), so this JSON key
+#      is the only tunable an operator can set through sanctioned tooling.
+#   3. Host-profile-scaled default: profile=server hosts (the cron-heavy
+#      case the issue reports) get 3; dev / small-RAM / unknown hosts keep
+#      the conservative serial 1 baseline from issue #579.
+#
+# The resolution must happen AFTER BRIDGE_RUNTIME_CONFIG_FILE is resolved
+# (below), so the actual assignment is deferred until then; only the helper
+# is defined here. Precedence 2 (JSON config) + 3 (host-profile default) live
+# in a standalone file-as-argv python helper rather than an inline heredoc —
+# heredoc-stdin to a subprocess is the Bash 5.3.9 footgun #11 deadlock class
+# this repo bans (see KNOWN_ISSUES.md §26 / lint-heredoc-ban). The helper is
+# callable at lib-load time (BRIDGE_SCRIPT_DIR / scripts/python-helpers are
+# validated earlier in this file).
+bridge_resolve_cron_dispatch_max_parallel() {
+  # 1. Explicit env override wins outright (when it is a positive integer).
+  local env_val="${BRIDGE_CRON_DISPATCH_MAX_PARALLEL:-}"
+  if [[ "$env_val" =~ ^[0-9]+$ ]] && (( 10#$env_val >= 1 )); then
+    printf '%s' "$env_val"
+    return 0
+  fi
+
+  command -v python3 >/dev/null 2>&1 || { printf '1'; return 0; }
+
+  local config_file="${BRIDGE_RUNTIME_CONFIG_FILE:-}"
+  local host_profile_file=""
+  if [[ -n "${BRIDGE_HOME:-}" && -f "$BRIDGE_HOME/state/install/host-profile.json" ]]; then
+    host_profile_file="$BRIDGE_HOME/state/install/host-profile.json"
+  elif [[ -n "${BRIDGE_STATE_DIR:-}" && -f "$BRIDGE_STATE_DIR/install/host-profile.json" ]]; then
+    host_profile_file="$BRIDGE_STATE_DIR/install/host-profile.json"
+  fi
+
+  # 2. runtime config key, then 3. host-profile-scaled default. The helper
+  # never raises — any read error / missing file falls through to the
+  # serial-1 floor — so a guard here keeps the resolver from emitting empty.
+  local resolved=""
+  resolved="$(python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-cron-max-parallel.py" \
+    "$config_file" "$host_profile_file" 2>/dev/null || true)"
+  if [[ "$resolved" =~ ^[0-9]+$ ]] && (( 10#$resolved >= 1 )); then
+    printf '%s' "$resolved"
+  else
+    printf '1'
+  fi
+}
 BRIDGE_CRON_DISPATCH_LEASE_SECONDS="${BRIDGE_CRON_DISPATCH_LEASE_SECONDS:-7200}"
 BRIDGE_WORKTREE_ROOT="${BRIDGE_WORKTREE_ROOT:-$HOME/.agent-bridge/worktrees}"
 BRIDGE_AGENT_HOME_ROOT="${BRIDGE_AGENT_HOME_ROOT:-$BRIDGE_HOME/agents}"
@@ -483,6 +533,11 @@ if [[ -z "${BRIDGE_RUNTIME_CONFIG_FILE:-}" ]]; then
     BRIDGE_RUNTIME_CONFIG_FILE="$BRIDGE_RUNTIME_ROOT/bridge-config.json"
   fi
 fi
+# Resolve cron-dispatch worker-pool size now that BRIDGE_RUNTIME_CONFIG_FILE
+# is known (issue #1461). See bridge_resolve_cron_dispatch_max_parallel above
+# for the env > JSON-config > host-profile precedence. The result is exported
+# below so the daemon's start_cron_dispatch_workers reads the resolved value.
+BRIDGE_CRON_DISPATCH_MAX_PARALLEL="$(bridge_resolve_cron_dispatch_max_parallel)"
 BRIDGE_GATEWAY_TRANSPORT="${BRIDGE_GATEWAY_TRANSPORT:-file}"
 BRIDGE_GATEWAY_LISTENER="${BRIDGE_GATEWAY_LISTENER:-auto}"
 BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT="${BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT:-/run/agent-bridge}"
