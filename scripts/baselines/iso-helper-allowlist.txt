@@ -18,3 +18,9 @@
 # Compatibility wrappers that already delegate to bridge_iso_run /
 # bridge_iso_paths.iso_run (callers are migrated, body remains for
 # back-compat with operator-installed shims).
+
+# PR-C (#1520c) test fixtures — reference iso-boundary filenames (.env, profile files,
+# HEARTBEAT.md) only to ASSERT publish/exclusion contracts; not runtime boundary RW.
+scripts/smoke/1520c-create-isolate-profile-publish.sh
+scripts/smoke/1520c-create-isolate-helpers/assert-profile-publish-modes.py
+scripts/smoke/1520c-create-isolate-helpers/assert-watchdog-publish-gap.py
