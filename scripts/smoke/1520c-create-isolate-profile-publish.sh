@@ -188,16 +188,14 @@ if [[ "$(cat "$C1_LOG")" != *"rc=0"* ]]; then
     echo "=== direct helper as current user ==="
     "$PY_BIN" "$REPO_ROOT/scripts/python-helpers/isolation-publish-profile-files.py" \
       "$C1_WD" "$OPERATOR_GROUP" 0660 "" SOUL.md 2>&1; echo "  direct-rc=$?"
-    echo "=== run_publish re-run with xtrace ==="
+    echo "=== source bridge-lib.sh WITHOUT suppression (capture exit) ==="
     (
-      set -x
-      source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1
-      echo "post-source-rc=$?"
-      bridge_isolation_v2_enforce() { return 0; }
-      bridge_isolation_v2_agent_group_name() { printf '%s' "$OPERATOR_GROUP"; }
-      bridge_isolation_v2_publish_workdir_profile_files "test_agent" "$C1_WD" "$OPERATOR_GROUP"
-      echo "fn-rc=$?"
-    ) 2>&1 | head -60
+      trap 'echo "TRAP-EXIT rc=$? line=$LINENO"' EXIT
+      source "$REPO_ROOT/bridge-lib.sh"
+      echo "post-source-rc=$? fn=$(type -t bridge_isolation_v2_publish_workdir_profile_files)"
+    ) 2>&1 | tail -40
+    echo "=== bash version on runner ==="
+    echo "BASH_VERSION=$BASH_VERSION BASH_VERSINFO=${BASH_VERSINFO[*]}"
     echo "=== END DIAG ==="
   } >&2
 fi
