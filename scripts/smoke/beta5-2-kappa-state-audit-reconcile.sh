@@ -53,19 +53,91 @@ trap cleanup EXIT
 smoke_setup_bridge_home "$SMOKE_NAME"
 
 REPO_ROOT="$SMOKE_REPO_ROOT"
-STATE_LIB="$REPO_ROOT/lib/bridge-state.sh"
-AGENT_LIB="$REPO_ROOT/bridge-agent.sh"
-DAEMON_LIB="$REPO_ROOT/bridge-daemon.sh"
-AUDIT_CLI="$REPO_ROOT/bridge-audit.sh"
-RECONCILE_LIB="$REPO_ROOT/lib/bridge-isolation-v2-reconcile.sh"
-STATUS_PY="$REPO_ROOT/bridge-status.py"
 
-[[ -f "$STATE_LIB" ]]      || smoke_fail "missing $STATE_LIB"
-[[ -f "$AGENT_LIB" ]]      || smoke_fail "missing $AGENT_LIB"
-[[ -f "$DAEMON_LIB" ]]     || smoke_fail "missing $DAEMON_LIB"
-[[ -f "$AUDIT_CLI" ]]      || smoke_fail "missing $AUDIT_CLI"
-[[ -f "$RECONCILE_LIB" ]]  || smoke_fail "missing $RECONCILE_LIB"
-[[ -f "$STATUS_PY" ]]      || smoke_fail "missing $STATUS_PY"
+# ---------------------------------------------------------------------
+# Hermetic source snapshot (#1509).
+#
+# Every static introspection below (T1.x / T3.x / T4.x / T8.a) greps or
+# awk-extracts a function body from a source file to assert "function X
+# wires call Y". Reading those files from the LIVE working tree makes the
+# assertions NON-HERMETIC: under the CI `unit/static smoke` job, many
+# smokes run sequentially against ONE checkout, and a neighbor smoke (or
+# a load-sensitive partial read while another step rewrites/copies the
+# same path) can transiently present a mutated/partial body — yielding a
+# FALSE-RED (e.g. T1.c "bridge_write_roster_status_snapshot does not call
+# bridge_agent_picker_blocked") even though `origin/main` is correct.
+#
+# Fix: snapshot each source file under test ONCE, here, into this smoke's
+# own private $SMOKE_TMP_ROOT (a per-process mktemp dir that NOTHING in
+# the job can mutate after capture). Re-point the *_LIB / *_CLI / *_PY
+# vars at the immutable copies. The static assertions are unchanged in
+# MEANING — they still verify the real source wires the call — they just
+# read a copy that is frozen at smoke start.
+#
+# Capture source: PREFER the committed blob via `git show HEAD:<path>`.
+# In CI the `unit/static smoke` job runs against a checked-out commit, so
+# HEAD is exactly the source under test, and the object store is IMMUNE to
+# any working-tree mutation — even a writer that truncates+rewrites the
+# live file cannot corrupt a `git show` read (a plain `cp` of the live
+# file CAN race such a writer and freeze a corrupt copy). When the smoke
+# runs outside a git work tree (e.g. a tarball install), fall back to a
+# `cp` of the live file. The teeth (T5/T6/T7/T9) derive their own temp
+# copies from these snapshots, so they stay fully isolated from the live
+# tree.
+# ---------------------------------------------------------------------
+SNAP_DIR="$SMOKE_TMP_ROOT/src-snapshot"
+mkdir -p "$SNAP_DIR"
+
+# Detect a usable git work tree rooted at the source checkout. If present,
+# capture from the committed blob; otherwise fall back to copying the live
+# file. Resolved once so every file uses the same capture strategy.
+SNAP_USE_GIT=0
+if command -v git >/dev/null 2>&1 \
+   && git -C "$REPO_ROOT" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+  SNAP_USE_GIT=1
+fi
+
+# Freeze an immutable copy of one source file.
+#   $1 = repo-relative path (e.g. lib/bridge-state.sh)
+#   $2 = snapshot destination path
+#
+# In git mode we read the committed blob via `git show HEAD:$rel` WITHOUT
+# touching the live working-tree path at all — no `[[ -f live ]]` guard,
+# because that guard would re-introduce a working-tree dependency: a
+# neighbor smoke transiently unlinking/replacing the live file could
+# false-red the existence check even though the object store (what git
+# mode actually reads) is fine. Only the non-git fallback needs the live
+# file to exist.
+_kappa_snapshot_source() {
+  local rel="$1" dest="$2"
+  if [[ "$SNAP_USE_GIT" == "1" ]]; then
+    if git -C "$REPO_ROOT" show "HEAD:$rel" >"$dest" 2>/dev/null \
+       && [[ -s "$dest" ]]; then
+      return 0
+    fi
+    # HEAD lacks the path (e.g. a brand-new untracked source file): fall
+    # through to the live-file copy below rather than failing outright.
+  fi
+  # Fallback: copy the live file (non-git context, or path not yet in HEAD).
+  [[ -f "$REPO_ROOT/$rel" ]] || smoke_fail "missing $REPO_ROOT/$rel"
+  cp "$REPO_ROOT/$rel" "$dest" || smoke_fail "could not snapshot $rel -> $dest"
+}
+
+STATE_LIB="$SNAP_DIR/bridge-state.sh"
+AGENT_LIB="$SNAP_DIR/bridge-agent.sh"
+DAEMON_LIB="$SNAP_DIR/bridge-daemon.sh"
+AUDIT_CLI="$SNAP_DIR/bridge-audit.sh"
+RECONCILE_LIB="$SNAP_DIR/bridge-isolation-v2-reconcile.sh"
+STATUS_PY="$SNAP_DIR/bridge-status.py"
+QUEUE_PY="$SNAP_DIR/bridge-queue.py"
+
+_kappa_snapshot_source "lib/bridge-state.sh"                   "$STATE_LIB"
+_kappa_snapshot_source "bridge-agent.sh"                       "$AGENT_LIB"
+_kappa_snapshot_source "bridge-daemon.sh"                      "$DAEMON_LIB"
+_kappa_snapshot_source "bridge-audit.sh"                       "$AUDIT_CLI"
+_kappa_snapshot_source "lib/bridge-isolation-v2-reconcile.sh" "$RECONCILE_LIB"
+_kappa_snapshot_source "bridge-status.py"                     "$STATUS_PY"
+_kappa_snapshot_source "bridge-queue.py"                      "$QUEUE_PY"
 
 # ---------------------------------------------------------------------
 # T1 (H1, #1319) — activity_state picker_blocked: predicate function
@@ -396,7 +468,7 @@ if ! awk '/^bridge_write_agent_snapshot\(\) \{/,/^\}/' "$STATE_LIB" \
       | grep -qF 'bridge_agent_picker_blocked'; then
   smoke_fail "T8.a: bridge_write_agent_snapshot does not call bridge_agent_picker_blocked (#1345 r2)"
 fi
-QUEUE_PY="$REPO_ROOT/bridge-queue.py"
+# $QUEUE_PY is the immutable snapshot frozen at smoke start (#1509).
 [[ -f "$QUEUE_PY" ]] || smoke_fail "T8.a: missing $QUEUE_PY"
 if ! grep -qF '_idle_excluded_states' "$QUEUE_PY"; then
   smoke_fail "T8.a: bridge-queue.py missing _idle_excluded_states (picker_blocked exclude — #1345 r2)"
