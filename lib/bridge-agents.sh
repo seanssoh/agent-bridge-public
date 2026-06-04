@@ -4529,38 +4529,11 @@ bridge_linux_prepare_agent_isolation() {
     done
   fi
 
-  # Issue #1513: the legacy per-agent tracked-profile mirror dir at
-  # `$BRIDGE_AGENT_HOME_ROOT/<agent>/` (e.g. `~/.agent-bridge/agents/<a>/`)
-  # must be traversable ("other" x-bit) by the isolated UID. On the
-  # create-shared-then-isolate path it was scaffolded by the plain
-  # controller `mkdir -p` under `umask 077` (mode 0700, group=<controller>),
-  # so the iso UID — not the owner, not in the owning group — cannot
-  # traverse it. `bridge-run.sh` runs scripts/python-helpers/prune-legacy-
-  # teams-mcp.py AS the iso UID against `--agent-root
-  # $BRIDGE_AGENT_HOME_ROOT/<a>`; `Path('.../<a>/.mcp.json').is_file()`
-  # then raises `PermissionError` (EACCES, which Python 3.10's is_file()
-  # does NOT swallow), the prune exits non-zero, and the launch aborts
-  # with `stale Teams MCP cleanup failed`. A healthy/older agent's legacy
-  # root is `0755`, so the same prune returns False cleanly.
-  #
-  # The scaffold-time fix (bridge-agent.sh #1165 Gap 4) only fires when
-  # isolation is active AT `agent create`; the create-shared-then-isolate
-  # path leaves this dir 0700. Normalize the dir NODE traverse bit here
-  # (in the shared prepare path used by both create-isolate and
-  # isolate/reapply) so it is `drwxr-xr-x` like a healthy agent's. This
-  # is a single-node `chmod 0755` (NOT recursive): the 0600 files inside
-  # — non-secret JSON mirrors; channel secrets live under
-  # `workdir/.<channel>/` with their own ACLs — are untouched, and
-  # owner/group are unchanged. Idempotent; Linux-gated via
-  # `bridge_host_platform` at the top of prepare. Mirrors the
-  # bridge-agent.sh:#1165 scaffold-path recipe (mkdir/chown/chmod 0755).
-  if [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" ]]; then
-    local _v2_legacy_mirror_dir="$BRIDGE_AGENT_HOME_ROOT/$agent"
-    if bridge_linux_sudo_root test -d "$_v2_legacy_mirror_dir"; then
-      bridge_linux_sudo_root chmod 0755 "$_v2_legacy_mirror_dir" \
-        || bridge_warn "isolation v2 (#1513): could not set traverse bit on legacy mirror dir '$_v2_legacy_mirror_dir' for agent '$agent'; the iso-UID Teams MCP prune may abort the launch with EACCES. Manual fix: \`sudo chmod 0755 $_v2_legacy_mirror_dir\`."
-    fi
-  fi
+  # Issue #1513 / #1518: the legacy per-agent tracked-profile mirror dir at
+  # `$BRIDGE_AGENT_HOME_ROOT/<agent>/` must be group-traversable by the iso
+  # UID (the Teams MCP prune runs against it). Its normalization is applied
+  # LAST in this function — AFTER the grant-matrix + install-tree reconciler
+  # — so it is not clobbered. See the `#1518` block near the end of prepare.
 
   # Isolated-home POSIX contract (HOME + .claude + .claude/plugins +
   # .claude/session-env). Phase 3 codex design: one shared helper at
@@ -4689,6 +4662,57 @@ bridge_linux_prepare_agent_isolation() {
           --mode apply --agent "$agent" --reason agent-create \
           >/dev/null 2>&1; then
       bridge_warn "bridge_linux_prepare_agent_isolation: install-tree reconciler reported drift for agent=$agent (non-fatal; run: agent-bridge isolation reconcile --apply --agent $agent)"
+    fi
+  fi
+
+  # Issue #1513 / #1518: normalize the legacy per-agent tracked-profile
+  # mirror dir `$BRIDGE_AGENT_HOME_ROOT/<agent>/` (= `$BRIDGE_HOME/agents/<a>`)
+  # to the iso v2 group-traversal contract. This runs LAST — after the
+  # grant-matrix + install-tree reconciler above — on purpose (#1518).
+  #
+  # Why here, not earlier: `bridge-run.sh` runs the Teams MCP prune
+  # (scripts/python-helpers/prune-legacy-teams-mcp.py) AS the iso UID
+  # against `--agent-root $BRIDGE_AGENT_HOME_ROOT/<a>` (the LEGACY path,
+  # bridge-run.sh:~1219), so this dir must be traversable by the iso UID
+  # or the prune raises EACCES on `is_file()` and the launch aborts with
+  # `stale Teams MCP cleanup failed` (#1513). On the create-shared-then-
+  # isolate path the controller's plain `mkdir -p` under `umask 077`
+  # leaves it `0700 group=<controller>` — non-traversable by the iso UID.
+  #
+  # On the DEFAULT v2 layout the live runtime root is
+  # `$BRIDGE_AGENT_ROOT_V2/<a>` (= `$BRIDGE_HOME/data/agents/<a>`), which is
+  # a DIFFERENT directory from this legacy `$BRIDGE_HOME/agents/<a>` mirror
+  # (BRIDGE_DATA_ROOT defaults to `$BRIDGE_HOME/data`). The per-agent
+  # grant-matrix and the install-tree reconciler both normalize the v2 path
+  # — NOT this legacy leaf (the reconciler's only `agents/` row is the
+  # `$BRIDGE_HOME/agents` PARENT at 0710, not the per-agent child). So on a
+  # split-root install nothing else gives this dir its traverse bit: #1513's
+  # original L2 `chmod 0755` earlier in prepare was both (a) clobbered to
+  # `2750 root:ab-agent-<a>` on a non-split install where legacy==v2 root,
+  # AND (b) the only thing covering the split-root case (#1518). We resolve
+  # both by setting the contract HERE, after every normalizer:
+  #
+  #   chgrp ab-agent-<a> + chmod 2750  → `drwxr-s--- 2750 root:ab-agent-<a>`
+  #
+  # group r-x + setgid (NO "other" access — narrower than the old `0755`);
+  # the iso UID `agent-bridge-<a>` is a member of `ab-agent-<a>` and
+  # traverses via the GROUP x-bit. This matches the contract the grant
+  # matrix lands on the v2 root, so both layouts converge to the same final
+  # state. `$_v2_agent_group` (= `ab-agent-<a>`) is the same per-agent group
+  # this function already `ensure_group`s and chgrps the v2 root/subtrees to
+  # above, so no new identity is introduced. Dir-NODE only (NOT recursive):
+  # the 0600 files inside — non-secret JSON mirrors; channel secrets live
+  # under `workdir/.<channel>/` with their own ACLs — and the chown owner
+  # are left untouched. Idempotent. The whole
+  # `bridge_linux_prepare_agent_isolation` body early-returns on non-Linux
+  # (a complete no-op on macOS/dev hosts), so this is Linux-only.
+  if [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" ]]; then
+    local _v2_legacy_mirror_dir="$BRIDGE_AGENT_HOME_ROOT/$agent"
+    if bridge_linux_sudo_root test -d "$_v2_legacy_mirror_dir"; then
+      bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_legacy_mirror_dir" \
+        || bridge_warn "isolation v2 (#1518): could not chgrp legacy mirror dir '$_v2_legacy_mirror_dir' to '$_v2_agent_group' for agent '$agent'; the iso-UID Teams MCP prune may abort the launch with EACCES."
+      bridge_linux_sudo_root chmod 2750 "$_v2_legacy_mirror_dir" \
+        || bridge_warn "isolation v2 (#1518): could not set the group-traverse bit (2750) on legacy mirror dir '$_v2_legacy_mirror_dir' for agent '$agent'; the iso-UID Teams MCP prune may abort the launch with EACCES. Manual fix: \`sudo chgrp $_v2_agent_group $_v2_legacy_mirror_dir && sudo chmod 2750 $_v2_legacy_mirror_dir\`."
     fi
   fi
 
