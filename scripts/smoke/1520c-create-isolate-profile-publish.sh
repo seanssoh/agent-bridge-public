@@ -64,6 +64,9 @@
 #              false-passed).
 #   C2-teeth.  Add HEARTBEAT.md to the helper's basename list and C2
 #              fails (HEARTBEAT.md becomes group-readable).
+#   C3-teeth.  Drop the `profile_publish_failed` audit row from the
+#              refused-symlink branch and C3's audit-parity assertion fails
+#              (a planted-redirect refusal must be audited, not just warned).
 #   C6-teeth.  Make the publish failure fatal (return 1 instead of warn)
 #              and C6's "returns 0" assertion fails.
 #   C7-teeth.  Move the publish-gap metadata check AFTER the iso-probe
@@ -199,9 +202,18 @@ rm -f "$C3_WD/CLAUDE.md"
 ln -s "$C3_EXT" "$C3_WD/CLAUDE.md"
 
 C3_LOG="$SMOKE_TMP_ROOT/c3.log"
+# Reset the audit log so the symlink-refusal row is unambiguously C3's.
+: >"$BRIDGE_AUDIT_LOG"
 run_publish "$C3_WD" >"$C3_LOG" 2>&1
 smoke_assert_contains "$(cat "$C3_LOG")" "rc=0" "C3 publish helper rc"
 smoke_assert_contains "$(cat "$C3_LOG")" "refusing symlink" "C3 symlink refusal warn"
+# Audit parity: a refused symlink (planted-redirect security path) MUST
+# emit a `profile_publish_failed` audit row with op=refused-symlink, the
+# same as the other per-file refusals — not just a transient warn.
+smoke_assert_contains "$(cat "$BRIDGE_AUDIT_LOG")" "profile_publish_failed" \
+  "C3 symlink-refusal emits profile_publish_failed audit row"
+smoke_assert_contains "$(cat "$BRIDGE_AUDIT_LOG")" "refused-symlink" \
+  "C3 audit row carries op=refused-symlink"
 # External CLAUDE.md target untouched (publish refused to follow the link).
 C3_EXT_MODE="$(stat -c '%a' "$C3_EXT" 2>/dev/null || stat -f '%Lp' "$C3_EXT" 2>/dev/null)"
 smoke_assert_eq "600" "$C3_EXT_MODE" "C3 symlink external target mode (must stay 0600)"

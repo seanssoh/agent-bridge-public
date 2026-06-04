@@ -1591,9 +1591,17 @@ bridge_isolation_v2_publish_workdir_profile_files() {
       published|ok-nochange|absent)
         : ;;  # success / nothing to do
       refused-symlink)
-        # A symlinked profile basename (planted redirect or CHANGE-POLICY-
-        # style sharing). O_NOFOLLOW refused it before any chgrp/chmod.
-        bridge_warn "publish_workdir_profile_files: refusing symlink at $workdir/$_fname (agent=$agent); operator must repair the symlink before re-running isolate" ;;
+        # A symlinked profile basename at one of the six identity files is
+        # anomalous — a planted redirect (the exact attack this fd-based
+        # publish hardens against) or a mis-shared CHANGE-POLICY-style link.
+        # O_NOFOLLOW refused it before any chgrp/chmod. Warn AND audit: a
+        # refused symlink is a security-relevant signal, not a transient
+        # condition, so it gets the same `profile_publish_failed` row as the
+        # other per-file refusals (audit parity, G3 contract).
+        bridge_warn "publish_workdir_profile_files: refusing symlink at $workdir/$_fname (agent=$agent); operator must repair the symlink before re-running isolate"
+        bridge_audit_log isolation profile_publish_failed "$agent" \
+          --detail file="$_fname" --detail op=refused-symlink \
+          >/dev/null 2>&1 || true ;;
       refused-nonregular|refused-owner)
         bridge_warn "publish_workdir_profile_files: refusing $_st at $workdir/$_fname (agent=$agent; $_detail; non-fatal)"
         bridge_audit_log isolation profile_publish_failed "$agent" \
