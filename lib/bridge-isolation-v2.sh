@@ -1618,6 +1618,167 @@ bridge_isolation_v2_publish_workdir_profile_files() {
   return 0
 }
 
+# Issue #1533 — root-forced, TOCTOU-safe normalize of an isolated agent's
+# WRITABLE CONTENT SUBTREES (`home/`, `workdir/`, `runtime/`, `logs/`) to
+# the iso v2 contract (`ab-agent-<a>:0660` files / `ab-agent-<a>:2770`
+# dirs) on a FIRST `agent create --isolate`.
+#
+# This is the recursive generalization of
+# `bridge_isolation_v2_publish_workdir_profile_files` (PR-C, #1520c). Same
+# root cause, broader surface: the create-path #1506 normalize
+# (`bridge_isolation_v2_chgrp_setgid_recursive`, below) runs its per-entry
+# chgrp/chmod DIRECT-FIRST as the controller. On a first create the
+# controller's supplementary-group cache is STALE for the just-created
+# `ab-agent-<a>` group (KNOWN_ISSUES §28), so its `find … -exec` cannot
+# ENTER the freshly-`chown -R`-ed `2770 ab-agent-<a>` subtree — it reaches
+# zero files, returns 0, and EVERY pre-scaffolded file under `home/`
+# (`.claude/**`, `memory/**`, `raw/**`, `skills/**`, `users/**`) stays
+# stranded at `iso-uid:<controller-group> 0600`. PR-C narrowly rescued
+# only the six profile basenames directly under `$workdir`; this closes
+# the residual for the whole content tree so no controller-written
+# first-isolate file needs a manual `sg`-wrapped `--reapply`.
+#
+# Always-root + fd-safe (the inner python walker
+# `scripts/python-helpers/isolation-normalize-content-tree.py`):
+#   * Runs via `bridge_linux_sudo_root`, so it is independent of the
+#     controller's group cache and of 2770 traversability — it succeeds on
+#     the first create. Off Linux / under `bridge_linux_sudo_root`'s direct
+#     fall-through it runs the SAME fd-based path (so the smoke exercises
+#     real behavior on macOS).
+#   * TOCTOU: after prepare's `chown -R <iso-uid>` the iso UID owns every
+#     entry and can swap any inode for a symlink mid-walk. The walker opens
+#     every directory descent and every file with `O_NOFOLLOW`/`O_DIRECTORY`
+#     and fchown/fchmod's the OPEN FD — never a path-based root chgrp/chmod
+#     that a rename could redirect (the CVE-class footgun a `find -exec` as
+#     root over an iso-owned tree would reopen). A symlinked / non-regular /
+#     wrong-owner entry is REFUSED, never mutated.
+#   * Exec bits preserved (a `+x` plugin script lands 0770, not stripped).
+#   * Excludes the v3 channel-state dirs' CONTENTS (`.teams`/`.ms365`/
+#     `.discord`/`.telegram`/`.mattermost` files stay `iso-uid 0600`); the
+#     dir nodes themselves are still normalized 2770 so they stay
+#     group-traversable — mirrors the `--exclude-subdir` contract of the
+#     recursive bash helper.
+#   * Excludes BY NAME (`--exclude-name`) the top-level files whose
+#     0600/owner contract must NOT be relaxed: HEARTBEAT.md
+#     (controller-owned 0600 by design — the daemon owns it; the iso UID
+#     never reads it) and CHANGE-POLICY.md (shared symlink — O_NOFOLLOW
+#     refuses it anyway, the name-exclude just avoids a per-run
+#     `refused-symlink` warn). These are skipped ENTIRELY (no chgrp/chmod),
+#     preserving the same exclusions the #1520c profile publish + watchdog
+#     classifier already hold.
+#   * Idempotent: an entry already at the contract is skipped (no syscall),
+#     so a re-run / the re-login case where the direct-first normalize
+#     already succeeded performs zero mutations.
+#   * NON-SILENT but NON-FATAL (G3): a per-entry refusal/failure emits a
+#     `bridge_warn` + a `content_publish_failed` audit row; the function
+#     ALWAYS returns 0 so `agent create` SUCCEEDS even if a node could not
+#     be normalized (operator can still `--reapply`). It does NOT roll back
+#     create.
+bridge_isolation_v2_publish_content_tree() {
+  local agent="$1"; shift
+  local group="$1"; shift
+  local os_user_in="$1"; shift
+  # Remaining args: one or more root dirs to normalize, optionally
+  # interleaved with `--exclude-subdir <name>` (applied to ALL roots'
+  # top-level entries). The caller passes the v3 channel-state names.
+  [[ -n "$agent" ]] || return 0
+  bridge_isolation_v2_enforce || return 0
+  if [[ -z "$group" ]]; then
+    group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+  fi
+  [[ -n "$group" ]] || return 0
+
+  local -a _roots=()
+  local -a _excludes=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --exclude-subdir)
+        [[ $# -ge 2 ]] || { shift; continue; }
+        _excludes+=(--exclude-subdir "$2"); shift 2 ;;
+      --exclude-name)
+        [[ $# -ge 2 ]] || { shift; continue; }
+        _excludes+=(--exclude-name "$2"); shift 2 ;;
+      *)
+        # Collect a non-empty root candidate. Deliberately NOT a
+        # controller-side `[[ -d "$1" ]]` precheck: on a FIRST
+        # `agent create --isolate` the controller's STALE supp-group cache
+        # (KNOWN_ISSUES §28) cannot group-traverse the per-agent root
+        # (`controller:ab-agent-<a> 2750`), so a `-d` test would FALSE-
+        # NEGATIVE every root and the publish would no-op — the exact bug
+        # this function fixes. The ROOT walker (`_open_root`) runs as root,
+        # CAN traverse, and treats a genuinely missing root as a benign
+        # skip (FileNotFoundError), so existence validation belongs there,
+        # not in this group-cache-dependent controller precheck.
+        [[ -n "$1" ]] && _roots+=("$1"); shift ;;
+    esac
+  done
+  # Nothing to normalize (no root args at all) → benign no-op success.
+  [[ ${#_roots[@]} -gt 0 ]] || return 0
+
+  local _helper="${BRIDGE_SCRIPT_DIR:-}/scripts/python-helpers/isolation-normalize-content-tree.py"
+  if [[ ! -f "$_helper" ]]; then
+    bridge_warn "publish_content_tree: helper missing ($_helper) for agent=$agent (non-fatal) — re-run \`agent-bridge isolate $agent --reapply\`"
+    bridge_audit_log isolation content_publish_failed "$agent" \
+      --detail op=publish-helper --detail reason=helper-missing \
+      >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  local _os_user="$os_user_in"
+  [[ -n "$_os_user" ]] || _os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+
+  # The controller owns the prepared container dirs (`home`/`workdir`/
+  # `runtime`/`logs` at `controller:2770`); pass it so the walker accepts
+  # those as valid DIRECTORY owners (in addition to the iso UID) and can
+  # descend through them to the iso-owned content beneath. Regular FILES
+  # stay gated strictly to the iso UID.
+  local _controller_user=""
+  _controller_user="$(bridge_current_user 2>/dev/null || id -un 2>/dev/null || printf '')"
+  local -a _controller_arg=()
+  [[ -n "$_controller_user" ]] && _controller_arg=(--controller-user "$_controller_user")
+
+  local _out="" _rc=0
+  _out="$(bridge_linux_sudo_root python3 "$_helper" \
+    "$group" 0660 2770 "$_os_user" "${_roots[@]}" "${_excludes[@]}" \
+    "${_controller_arg[@]}" 2>/dev/null)"
+  _rc=$?
+  if (( _rc != 0 )); then
+    bridge_warn "publish_content_tree: root normalize helper failed (rc=$_rc) for agent=$agent (non-fatal) — re-run \`agent-bridge isolate $agent --reapply\`"
+    bridge_audit_log isolation content_publish_failed "$agent" \
+      --detail op=publish-helper --detail rc="$_rc" \
+      >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # Per-entry results (TAB-separated: <status>\t<relpath>\t<detail>). The
+  # walker emits ONLY non-ok lines + a trailing `summary` line. Piped (not
+  # a here-string — lint-heredoc-ban) into a side-effect-only loop.
+  local _st="" _rel="" _detail=""
+  printf '%s\n' "$_out" | while IFS=$'\t' read -r _st _rel _detail; do
+    [[ -n "$_st" ]] || continue
+    case "$_st" in
+      summary)
+        : ;;  # counts line; nothing actionable per-entry
+      refused-symlink)
+        bridge_warn "publish_content_tree: refusing symlink at $_rel (agent=$agent); not normalized (planted-redirect guard)"
+        bridge_audit_log isolation content_publish_failed "$agent" \
+          --detail file="$_rel" --detail op=refused-symlink \
+          >/dev/null 2>&1 || true ;;
+      refused-nonregular|refused-owner)
+        bridge_warn "publish_content_tree: refusing $_st at $_rel (agent=$agent; $_detail; non-fatal)"
+        bridge_audit_log isolation content_publish_failed "$agent" \
+          --detail file="$_rel" --detail op="$_st" --detail info="$_detail" \
+          >/dev/null 2>&1 || true ;;
+      mutate-failed|*)
+        bridge_warn "publish_content_tree: chgrp/chmod failed for $_rel (agent=$agent; $_detail; non-fatal) — re-run \`agent-bridge isolate $agent --reapply\`"
+        bridge_audit_log isolation content_publish_failed "$agent" \
+          --detail file="$_rel" --detail op="${_detail%%:*}" --detail info="$_detail" \
+          >/dev/null 2>&1 || true ;;
+    esac
+  done
+  return 0
+}
+
 bridge_isolation_v2_chgrp_setgid_recursive() {
   # Apply group + mode to a tree. Directories get the dir-mode (with
   # setgid bit), files get the file-mode (without setgid). The dir-mode

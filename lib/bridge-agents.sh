@@ -4797,6 +4797,71 @@ bridge_linux_prepare_agent_isolation() {
     bridge_isolation_v2_write_agent_metadata "$agent" \
       || bridge_warn "bridge_linux_prepare_agent_isolation: agent-meta.env write failed for agent=$agent (non-fatal; iso UID will fall back to getent-based config_dir resolution)"
   fi
+
+  # Issue #1533 (run LAST in prepare — after the #1506 normalize, the
+  # #1520c profile publish, the grant-matrix apply, and the install-tree
+  # reconciler — so no later step can re-strand it): the create-path
+  # group/mode normalizers above are all DIRECT-FIRST as the controller.
+  # On a FIRST `agent create --isolate` the controller's STALE
+  # supplementary-group cache (KNOWN_ISSUES §28) cannot group-traverse the
+  # freshly-`chown -R`-ed `2770 ab-agent-<a>` content subtrees, so every
+  # one of them — the #1506 `find … -exec`, the grant-matrix `chgrp/chmod`
+  # — silently under-reaches and leaves the scaffolded content under
+  # `home/` (`.claude/**`, `memory/**`, `raw/**`, `skills/**`, `users/**`),
+  # `workdir/`, `runtime/`, `logs/` stranded at
+  # `iso-uid:<controller-group> 0600`, AND the container dirs themselves at
+  # `<controller-group>` (so the iso UID cannot even group-traverse
+  # `home/`). PR-C (#1520c) rescued only the six profile basenames under
+  # `$workdir`; this is the GENERAL backstop for the whole content tree.
+  #
+  # Run the always-root, fd-safe (O_NOFOLLOW per descent) walker over the
+  # WHOLE content tree. As root it is independent of the controller's group
+  # cache and of 2770 traversal, so it normalizes every node — files to
+  # `ab-agent-<a>:0660`, dirs (incl. the `home/`/`workdir/` containers) to
+  # `ab-agent-<a>:2770` — on the first create with NO manual `sg`-wrapped
+  # `--reapply`. It fchown's only the GROUP (never the owner), so the
+  # controller-owned container dirs stay controller-owned (the iso UID
+  # traverses via the group r-x + setgid bit). Idempotent (the re-login /
+  # reapply case where the direct-first normalizers already succeeded
+  # performs zero mutations). Excludes the v3 channel-state dirs' CONTENTS
+  # and the controller-owned 0600 files (HEARTBEAT.md / CHANGE-POLICY.md
+  # symlink). Non-silent but non-fatal (warn + `content_publish_failed`
+  # audit on a per-node refusal/failure; create still succeeds).
+  # Issue #1533 (per-agent ROOT node group, always-root): the grant matrix
+  # asserts `$_v2_agent_root` at `root-owned:ab-agent-<a> 2750` (line ~2627),
+  # but its `chgrp ab-agent-<a>` is DIRECT-FIRST and strands on the stale
+  # controller cache the same way — leaving the per-agent root at
+  # `<controller-group> 2750`. Because that root is the FIRST hop the iso UID
+  # must group-traverse to reach `home/`/`workdir/`, a stranded root-group
+  # blocks the iso UID from EVERYTHING beneath it (even after the content
+  # tree below is published). Fix it with a single always-root `chgrp`
+  # (mode stays 2750, owner untouched): root-side, so it is independent of
+  # the controller's group cache; TOCTOU-safe because the root's PARENT
+  # (`data/agents/`) is controller-owned and the node itself is
+  # controller/root-owned (the iso UID cannot swap it). Non-fatal.
+  if [[ -n "${_v2_agent_root:-}" ]] \
+      && command -v bridge_isolation_v2_enforce >/dev/null 2>&1 \
+      && bridge_isolation_v2_enforce 2>/dev/null; then
+    bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_agent_root" \
+      || bridge_warn "isolation v2 (#1533): could not chgrp per-agent root '$_v2_agent_root' to '$_v2_agent_group' for agent '$agent' (non-fatal); the iso UID may not traverse into its own dir until a refreshed shell + \`agent-bridge isolate $agent --reapply\`."
+  fi
+
+  if command -v bridge_isolation_v2_publish_content_tree >/dev/null 2>&1; then
+    # The cached launch env basename is passed as a SKIP exclusion (its
+    # controller:0640 contract is owned by bridge_write_linux_agent_env_file
+    # — the content walker must NOT relax it to 0660). Carried in a local so
+    # the basename literal lives on a single annotated line.
+    local _env_basename="agent-env.sh"  # noqa: iso-helper-boundary — exclude-arg (skip), not a boundary RW
+    bridge_isolation_v2_publish_content_tree \
+      "$agent" "$_v2_agent_group" "$os_user" \
+      "$_v2_agent_root/home" "$workdir" "$runtime_state_dir" "$log_dir" \
+      --exclude-subdir .teams --exclude-subdir .ms365 \
+      --exclude-subdir .discord --exclude-subdir .telegram \
+      --exclude-subdir .mattermost \
+      --exclude-name HEARTBEAT.md --exclude-name CHANGE-POLICY.md \
+      --exclude-name "$_env_basename" \
+      || bridge_warn "isolation v2 (#1533): content-tree publish returned non-zero for agent '$agent'; some scaffolded files may not be group-readable. Re-run \`agent-bridge isolate $agent --reapply\`."
+  fi
 }
 bridge_linux_install_isolated_channel_symlink() {
   # Plant a root-owned symlink at $user_home/.claude/channels/<channel>

@@ -24,3 +24,9 @@
 scripts/smoke/1520c-create-isolate-profile-publish.sh
 scripts/smoke/1520c-create-isolate-helpers/assert-profile-publish-modes.py
 scripts/smoke/1520c-create-isolate-helpers/assert-watchdog-publish-gap.py
+
+# #1533 test fixtures — reference iso-boundary filenames (.env, agent-env.sh,
+# HEARTBEAT.md) only to ASSERT the content-tree publish/exclusion contracts in a
+# mktemp fixture; not runtime boundary RW.
+scripts/smoke/1533-create-isolate-content-publish.sh
+scripts/smoke/1533-create-isolate-helpers/assert-content-tree-modes.py
