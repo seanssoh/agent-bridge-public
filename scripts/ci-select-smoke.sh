@@ -211,6 +211,20 @@ add_required a2a-rooms-1517-bootstrap
 # expired/revoked refused, no token/hash persisted anywhere, malformed/dup
 # handled) + the unweakened auth preamble + the non-leader-node refusal.
 add_required rooms-p4-1-cross-node-join
+# A2A rooms P4.2 (design §6 / §11 / §14 R2): leader APPROVE + roster broadcast.
+# On a cross-node approve the leader admits the member (REQUIRING a P4.1 verified
+# pending row), bumps the epoch, and broadcasts the leader-signed canonical
+# roster to every member node over the node-link; each member persists it to
+# room_roster_cache. Lives in bridge-handoffd.py (_handle_room_roster_broadcast),
+# bridge_a2a_common.py (build/parse_room_roster_broadcast), bridge_rooms_common.py
+# (approve_cross_node gate + accept_roster_broadcast member-side contracts +
+# reserve_roster_dedupe), and bridge-rooms.py (cross-approve gate + broadcast
+# sender + local-join-intent binding). Pins the 7 teeth: cross-approve requires a
+# verified pending row, a non-leader peer roster is rejected, an invalid pairwise
+# HMAC is rejected, a first roster with no local binding is refused (rogue-leader
+# mint prevented), epoch monotonicity, the cache update is atomic, and the
+# local-leader-add path stays distinct (no P4.1 regression).
+add_required rooms-p4-2-roster-broadcast
 
 
 }
@@ -876,7 +890,7 @@ select_for_path() {
       add_required queue a2a-rooms-p1b-acl
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/install-handoffd-systemd.sh)
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/smoke/rooms-p4-2-roster-broadcast-helper.py|scripts/smoke/rooms-p4-2-post-hook.sh|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the
@@ -965,7 +979,17 @@ select_for_path() {
       # malformed/duplicate requests are handled — PLUS the auth preamble stays
       # unweakened (HMAC 401 / remote_addr 403 / unknown-peer 403). Pull on every
       # move to any of those files so the cross-node admission gate cannot regress.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force rooms-p4-1-cross-node-join
+      # A2A Rooms P4.2 (design §6 / §14 R2): leader APPROVE + roster broadcast.
+      # The NEW remote surface is _handle_room_roster_broadcast in
+      # bridge-handoffd.py; the wire builder/parser is build/parse_room_roster_
+      # broadcast in bridge_a2a_common.py; the cross-approve gate + member-side
+      # acceptance (anti-rogue-leader binding + monotonic epoch + atomic cache) is
+      # in bridge_rooms_common.py; the broadcast sender + local-join-intent
+      # binding is in bridge-rooms.py. rooms-p4-2-roster-broadcast pins the 7
+      # teeth (cross-approve needs a verified row, non-leader roster rejected,
+      # bad pairwise HMAC rejected, first-roster-without-binding refused, epoch
+      # monotonicity, atomic cache, local-add path distinct). Pull on every move.
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)
