@@ -57,7 +57,15 @@ if [[ -z "${BRIDGE_ADMIN_AGENT:-}${BRIDGE_ADMIN_AGENT_ID:-}" ]]; then
   # Extract it without executing the rest of the file.
   for _roster in "$BRIDGE_HOME/agent-roster.local.sh" "$BRIDGE_HOME/agent-roster.sh"; do
     if [[ -r "$_roster" ]]; then
-      _admin_line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?BRIDGE_ADMIN_AGENT_ID=' "$_roster" | head -n 1 | sed -E 's/^[[:space:]]*(export[[:space:]]+)?BRIDGE_ADMIN_AGENT_ID=//; s/^"([^"]*)".*/\1/; s/^'"'"'([^'"'"']*)'"'"'.*/\1/; s/[[:space:]]*#.*$//')"
+      # Issue #1399: on an admin-less roster the `grep` finds no
+      # BRIDGE_ADMIN_AGENT_ID line and exits 1. Under `set -euo pipefail`
+      # that non-zero rc propagates as the pipeline's status and aborts
+      # the script — so "no admin" must be treated as an empty result, not
+      # a fatal error. Guard ONLY the legitimately-empty grep with a brace
+      # group + `|| true`; do NOT blanket the whole pipeline, so a real
+      # failure in `head`/`sed` (e.g. a broken sed expression) still
+      # surfaces under pipefail rather than being silently masked.
+      _admin_line="$({ grep -E '^[[:space:]]*(export[[:space:]]+)?BRIDGE_ADMIN_AGENT_ID=' "$_roster" || true; } | head -n 1 | sed -E 's/^[[:space:]]*(export[[:space:]]+)?BRIDGE_ADMIN_AGENT_ID=//; s/^"([^"]*)".*/\1/; s/^'"'"'([^'"'"']*)'"'"'.*/\1/; s/[[:space:]]*#.*$//')"
       if [[ -n "$_admin_line" ]]; then
         BRIDGE_ADMIN_AGENT_ID="$_admin_line"
         export BRIDGE_ADMIN_AGENT_ID
