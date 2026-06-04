@@ -158,6 +158,21 @@ _bridge_run_tok_anthropic_key="${_bridge_run_tok_anthropic_key:-${ANTHROPIC_API_
 _bridge_run_tok_anthropic_auth="${_bridge_run_tok_anthropic_auth:-${ANTHROPIC_AUTH_TOKEN:-}}"
 unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
 
+# #1520 r4 (codex Phase-4 BLOCKING): scrub the proven-keychain-free TRUST flag
+# at TRUE process entry — here, alongside the STEP A credential scrub, BEFORE
+# the `_bridge_run_pick` `$()` subshells below, the candidate-version probe
+# forks, and the privileged `bash -p` re-exec. `unset` removes BOTH the value
+# AND the export attribute, so an INHERITED exported
+# `BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1` from the parent env cannot
+# reach any early child / re-exec as a spoofed "proven" signal. A BARE `=0`
+# assignment would NOT suffice: assigning over an inherited exported var keeps
+# the export attribute (`env VAR=1 bash -c 'VAR=0; bash -c "echo \$VAR"'`
+# prints 0 — the child still SEES it). The flag is only ever a process-local
+# shell var afterward (the preflight sets/resets it with bare assignments,
+# which create a NON-exported var once the inherited export attribute is gone);
+# it must NEVER be exported, so the launched Claude child never inherits it.
+unset BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED
+
 # Bind the externals that run while the captured credential is reachable
 # (mktemp/chmod/rm during the optional self-re-exec transit) to HARDCODED ABSOLUTE
 # paths — a PATH-planted `mktemp`/`chmod`/`rm` must never run near the live token,
@@ -1596,16 +1611,11 @@ RAPID_FAIL_COUNT=0
 RAPID_FAIL_WINDOW="${BRIDGE_RUN_RAPID_FAIL_WINDOW_SECONDS:-10}"
 MAX_RAPID_FAILS="${BRIDGE_RUN_MAX_RAPID_FAILS:-5}"
 HEALTHY_RUN_RESET_SECONDS="${BRIDGE_RUN_HEALTHY_RESET_SECONDS:-60}"
-# #1520 r3 (codex r3 BLOCKING): scrub the proven-keychain-free signal at
-# process entry so an INHERITED `BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1`
-# from the parent environment can never be trusted as proof. The preflight
-# is the only writer that sets it to 1, and `--safe-mode` skips the preflight
-# (bridge-run.sh:"$ENGINE" == claude && $SAFE_MODE -eq 0) while still reaching
-# bridge_run_shared_launch — without this scrub a spoofed/inherited 1 would
-# make the credential guard take the export-without-credential fast-path and
-# export an unauthenticated empty per-agent dir. Reset once here (before the
-# loop); the preflight re-resets + re-validates every iteration.
-BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0
+# #1520 r4: the proven-keychain-free trust flag was already `unset` at true
+# process entry (top of this script, alongside the STEP A credential scrub) —
+# value AND export attribute removed BEFORE any fork/re-exec — so no separate
+# pre-loop scrub is needed here. The guard reads it with a `:-0` default, and
+# the preflight (re)sets it as a process-local var every iteration.
 while true; do
   local_launch_cmd_display=""
   local_err_size_before=0

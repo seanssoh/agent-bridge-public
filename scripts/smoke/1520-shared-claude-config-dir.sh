@@ -540,30 +540,71 @@ test_degrade_warning_is_one_time() {
   unset SEED_TARGET_CRED
 }
 
-# T10 — TEETH for the r3 inherited-spoof BLOCKING (codex r3): an INHERITED
-# BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1 must never be trusted as proof.
-# The preflight is the only legitimate writer, and --safe-mode skips the
-# preflight while still reaching bridge_run_shared_launch — so bridge-run.sh
-# scrubs the var to 0 at process entry (before the relaunch loop). This tooth
-# pins BOTH:
-#   (a) the structural scrub exists at process entry (before `while true`),
-#       so a refactor cannot silently drop it; and
-#   (b) the behavioral contract: after the process-entry scrub, an inherited
-#       spoof=1 is gone, the preflight did NOT run (safe-mode), there is no
-#       credential -> the guard does NOT fast-path and the empty per-agent dir
-#       is NOT exported.
-test_inherited_proven_spoof_is_scrubbed() {
-  # (a) structural: the scrub statement is present at process entry, ahead of
-  # the launch loop. Extract the pre-`while true` slice and grep it.
+# T10 — TEETH for the r4 inherited-EXPORT-ATTRIBUTE BLOCKING (codex Phase-4):
+# an INHERITED *exported* BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1 must be
+# fully removed (value AND export attribute) at true process entry, so the
+# trust primitive cannot cross child / re-exec boundaries. A bare `=0` is NOT
+# enough: assigning over an inherited exported var keeps the export attribute,
+# so the value (0) still leaks to children — and bridge-run.sh forks candidate
+# probes + execs a privileged bash BEFORE any pre-loop scrub, where an
+# inherited exported =1 would arrive as a spoofed "proven". bridge-run.sh
+# therefore `unset`s the flag at the very top (alongside the STEP A credential
+# scrub), before any fork/exec. This tooth pins:
+#   (a) structural — the entry `unset` exists in the pre-fork prologue (before
+#       the first `_bridge_run_pick` `$()` fork and the privileged re-exec),
+#       and there is NO bare `=0` pre-loop scrub masquerading as the fix; and
+#   (b) behavioral (the real Bash-semantics assertion) — with an inherited
+#       EXPORTED =1, after the production `unset`, a child subprocess (modeling
+#       BOTH the launched Claude child AND an early candidate-probe / re-exec)
+#       sees the flag ABSENT (unset), not `0`. Reverting `unset` to a bare `=0`
+#       makes the child SEE it (export attribute survives) -> this tooth bites.
+test_inherited_proven_spoof_export_attribute_scrubbed() {
+  # (a) structural: the entry `unset` is in the prologue, ahead of the first
+  # `_bridge_run_pick` `$()` fork (which is where early children begin), and no
+  # bare `=0` pre-loop scrub is relied upon. Slice the script up to that fork.
+  local prologue
+  prologue="$(awk '/_bridge_run_pick \//{exit} {print}' "$RUN_SH")"
+  printf '%s\n' "$prologue" | grep -q '^unset BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED$' \
+    || smoke_fail "T10 entry unset of BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED missing before the first fork/exec"
+  # No bare `=0` between the init block and the launch loop (the r3 redundant
+  # scrub must be gone — the entry unset is the single source of truth).
   local preloop
   preloop="$(awk '/^while true; do/{exit} {print}' "$RUN_SH")"
   printf '%s\n' "$preloop" | grep -q '^BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0$' \
-    || smoke_fail "T10 process-entry scrub BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0 missing before the launch loop"
+    && smoke_fail "T10 a bare =0 pre-loop scrub is back — it does NOT drop the export attribute; the entry unset is the fix"
 
-  # (b) behavioral: model the safe-mode path — inherit a spoofed proven=1,
-  # apply the production scrub, do NOT run the preflight (safe-mode skips it),
-  # then launch with no credential. The scrub must have neutralized the spoof
-  # so the guard sees 0 and skips the export instead of exporting empty.
+  # (b) behavioral: an inherited EXPORTED =1, then the production entry `unset`,
+  # then a child subprocess (models the launched child AND an early probe/
+  # re-exec) must see the flag ABSENT — not 0. This is the exact bug the bare
+  # =0 left open (`env VAR=1 bash -c 'VAR=0; bash -c "echo $VAR"'` prints 0).
+  local child_seen
+  child_seen="$(
+    # SC2030: the subshell-local export modeling an inherited exported flag is
+    # the whole point — the assertion is that the following unset removes it.
+    # shellcheck disable=SC2030
+    export BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1   # inherited, exported
+    unset BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED      # production entry scrub
+    "$BASH" -c 'printf %s "${BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED-__ABSENT__}"'
+  )"
+  smoke_assert_eq "__ABSENT__" "$child_seen" \
+    "T10 entry unset removes the export attribute — child/re-exec sees the flag ABSENT, not a leaked value"
+
+  # And even after the preflight's legitimate bare =1 (validated Darwin path),
+  # the flag stays a process-local var (the inherited export attribute is gone),
+  # so the launched child still never inherits it.
+  local child_after_set
+  child_after_set="$(
+    # shellcheck disable=SC2030,SC2031
+    export BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1
+    unset BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED
+    BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1            # preflight bare set
+    "$BASH" -c 'printf %s "${BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED-__ABSENT__}"'
+  )"
+  smoke_assert_eq "__ABSENT__" "$child_after_set" \
+    "T10 a bare set after the entry unset stays process-local — never re-exported to the launched child"
+
+  # (c) end-to-end: the safe-mode path (preflight skipped) with an inherited
+  # spoof + no credential still does NOT export the empty per-agent dir.
   : >"$MARKER"
   : >"$WARN_LOG"
   BRIDGE_RUN_DEGRADE_WARNED=()
@@ -576,24 +617,21 @@ test_inherited_proven_spoof_is_scrubbed() {
   SEED_SHOULD_SUCCEED=0
   SEED_CALLED=0
   SEED_TARGET_CRED="$expected_dir/.credentials.json"
-
-  # Inherited spoof.
+  # Model the production prologue: inherited exported spoof, then entry unset.
+  # shellcheck disable=SC2031
   export BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1
-  # Production process-entry scrub (verbatim — the exact line asserted above).
-  BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0
+  unset BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED
   unset CLAUDE_CONFIG_DIR
   bridge_run_shared_launch "$BASH" "$(probe_launch_cmd)" "$ERRFILE" \
-    || smoke_fail "T10 spoofed-then-scrubbed launch returned non-zero"
-
+    || smoke_fail "T10 spoofed-then-unset launch returned non-zero"
   smoke_assert_eq "1" "$SEED_CALLED" \
     "T10 scrubbed spoof does not take the keychain-free fast-path (seed attempted)"
   local launched_dir
   launched_dir="$(cat "$MARKER" 2>/dev/null || true)"
   [[ -z "$launched_dir" || "$launched_dir" == "__UNSET__" ]] \
-    || smoke_fail "T10 inherited proven-spoof must NOT export the empty per-agent dir after scrub (got '$launched_dir')"
+    || smoke_fail "T10 inherited proven-spoof must NOT export the empty per-agent dir after unset (got '$launched_dir')"
 
   unset SEED_TARGET_CRED BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED
-  BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0
 }
 
 smoke_run "T1 shared STATIC Claude launch exports per-agent CLAUDE_CONFIG_DIR" test_shared_claude_exports_config_dir
@@ -605,6 +643,6 @@ smoke_run "T6 degrade: unseedable agent skips the export (no auth break)"      t
 smoke_run "T7 proven keychain-free exports without a credential file"          test_proven_keychain_free_exports_without_credential_file
 smoke_run "T8 teeth: unproven keychain-free does NOT export empty per-agent dir" test_unproven_keychain_free_does_not_export_empty_dir
 smoke_run "T9 degrade warning is one-time across N relaunches (sentinel)"      test_degrade_warning_is_one_time
-smoke_run "T10 teeth: inherited proven-spoof is scrubbed at process entry"     test_inherited_proven_spoof_is_scrubbed
+smoke_run "T10 teeth: inherited proven-spoof export attribute unset at entry"  test_inherited_proven_spoof_export_attribute_scrubbed
 
 smoke_log "all checks passed"
