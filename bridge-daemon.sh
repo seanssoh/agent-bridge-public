@@ -561,6 +561,32 @@ _bridge_daemon_on_err() {
   _BRIDGE_DAEMON_IN_ERR_TRAP=0
 }
 
+# Issue #1463 (secondary bug): pure decision helper for the on-exit
+# pid-file cleanup. Given a pid-file path and the exiting process's pid,
+# return 0 ("safe to remove — the file is absent, empty, or still records
+# OUR pid") or 1 ("do NOT remove — the file records a DIFFERENT pid").
+# Extracted so the shipped guard is unit-testable (the smoke sources THIS
+# function rather than a copy). Pure: reads the file, mutates nothing.
+#
+# Why the guard exists: a losing competitor — the launchd KeepAlive job
+# instance that just failed `ensure_singleton` and is exiting 1 — must NOT
+# delete the pid-file belonging to the TRUE lock holder (a different,
+# healthy daemon). The old unconditional `rm -f` erased the live holder's
+# pid-file on every thrash cycle, which made `bridge-status.py` (no
+# fallback) report `stopped pid=-` while the daemon was in fact running.
+bridge_daemon_pid_file_cleanup_should_remove() {
+  local pid_file="$1"
+  local exiting_pid="$2"
+  local recorded=""
+  if [[ -f "$pid_file" ]]; then
+    recorded="$(cat "$pid_file" 2>/dev/null | tr -dc '0-9' | head -c 16)"
+  fi
+  # Absent/empty pid-file → nothing to protect, safe to remove (no-op).
+  # Recorded pid == our pid → our own teardown, remove.
+  # Recorded pid != our pid → a foreign holder's file, keep it.
+  [[ -z "$recorded" || "$recorded" == "$exiting_pid" ]]
+}
+
 _bridge_daemon_on_exit() {
   local ec=$?
   local sig="${BRIDGE_LAST_SIGNAL:-none}"
@@ -591,7 +617,23 @@ _bridge_daemon_on_exit() {
     --detail last_step="$step" \
     --detail err_location="${err_location:-none}" >/dev/null 2>&1 || true
 
-  rm -f "$BRIDGE_DAEMON_PID_FILE" 2>/dev/null || true
+  # Issue #1463 (secondary bug): remove the pid-file ONLY if it still
+  # records our own pid (see bridge_daemon_pid_file_cleanup_should_remove
+  # for the rationale). Otherwise leave the TRUE holder's file intact and
+  # audit a `daemon_pid_file_cleanup_skipped` row.
+  if bridge_daemon_pid_file_cleanup_should_remove "$BRIDGE_DAEMON_PID_FILE" "$$"; then
+    rm -f "$BRIDGE_DAEMON_PID_FILE" 2>/dev/null || true
+  else
+    local _recorded_exit_pid=""
+    if [[ -f "$BRIDGE_DAEMON_PID_FILE" ]]; then
+      _recorded_exit_pid="$(cat "$BRIDGE_DAEMON_PID_FILE" 2>/dev/null | tr -dc '0-9' | head -c 16)"
+    fi
+    bridge_audit_log daemon daemon_pid_file_cleanup_skipped daemon \
+      --detail exiting_pid="$$" \
+      --detail recorded_pid="$_recorded_exit_pid" \
+      --detail exit_code="$ec" \
+      --detail last_step="$step" >/dev/null 2>&1 || true
+  fi
   if (( ec != 0 )); then
     # PR #198 review: daemon_log_event internally does mkdir + append write,
     # either of which can fail (dir unwritable, disk full). Under set -e an
@@ -11757,6 +11799,31 @@ cmd_restart() {
     case " ${stop_args[*]} " in
       *' --force '*|*' -f '*) ;;
       *) stop_args+=("--force") ;;
+    esac
+  fi
+
+  # Issue #1463 — launchd-aware restart. On macOS launchd installs, cycle
+  # launchd's OWN supervised job via `launchctl kickstart -k` instead of an
+  # out-of-band stop+start. An out-of-band restart takes the singleton lock
+  # outside launchd's process tree, so launchd's KeepAlive job can never
+  # reacquire it and thrashes against the lock every ThrottleInterval (30s).
+  # Kickstart makes launchd's instance the sole lock holder, ending the
+  # thrash. Returns:
+  #   0 → kickstart issued; do NOT also stop+start.
+  #   2 → REFUSE (out-of-band split detected); surface to the operator.
+  #   1 → not a launchd install (Linux systemd / nohup) → fall through to
+  #       the existing stop+start primitive below (unchanged behavior).
+  # Skipped entirely when an internal group-refresh reason is set: that
+  # path must run the in-process stop+start so PAM/initgroups rebuilds the
+  # supplementary group set (a launchd kickstart would not re-resolve it).
+  if [[ -z "$internal_reason" ]] \
+     && command -v bridge_daemon_launchd_restart >/dev/null 2>&1; then
+    local launchd_rc=0
+    bridge_daemon_launchd_restart "operator-restart" || launchd_rc=$?
+    case "$launchd_rc" in
+      0) return 0 ;;
+      2) return 2 ;;  # refused — out-of-band split, operator must reconcile
+      *) : ;;          # 1 → not launchd-managed; fall through to stop+start
     esac
   fi
 

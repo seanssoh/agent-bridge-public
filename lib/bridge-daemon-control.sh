@@ -1406,6 +1406,158 @@ bridge_daemon_run_without_singleton_lock() {
   fi
 }
 
+# Issue #1463 — launchd KeepAlive vs out-of-band supervisor restart.
+#
+# On macOS launchd installs the daemon LaunchAgent runs with
+# `KeepAlive=true` + `ThrottleInterval=30`. When a supervisor (liveness
+# or silence watchdog) restarts the daemon out-of-band of launchd — via
+# a direct `bridge-daemon.sh stop --force` + `start` — the fresh daemon
+# takes the singleton lock OUTSIDE launchd's supervised process tree.
+# launchd's own KeepAlive job instance can then never acquire the lock:
+# it fails `ensure_singleton`, exits 1, and KeepAlive respawns it every
+# ThrottleInterval (30s) indefinitely (observed: 300+ runs / ~40h). The
+# real working daemon is the out-of-band lock holder and is healthy, but
+# the launchd slot thrashes against it forever.
+#
+# The canonical restart primitive below resolves this by cycling
+# launchd's OWN supervised job (`launchctl kickstart -k gui/$UID/<label>`)
+# instead of forking a non-launchd daemon. After a kickstart the lock
+# holder is always launchd's instance, so KeepAlive has nothing to fight.
+#
+# Returns:
+#   0  — kickstart issued (the supervisor must NOT also stop+start).
+#   1  — not a launchd install / launchctl unavailable / non-Darwin: the
+#        caller should fall back to its existing stop+start primitive
+#        (Linux systemd installs are unaffected and keep the old path).
+#   2  — REFUSE: this is a launchd install but the live lock holder is
+#        NOT launchd's job pid (an existing out-of-band split). Blindly
+#        kickstarting would TERM/KILL the supervised slot while the real
+#        holder survives, re-arming the thrash. Refuse and require an
+#        explicit one-time operator reconcile (`bridge-daemon.sh stop
+#        --force` once, then let launchd's KeepAlive bring the slot back
+#        as the sole holder). Audited as `daemon_launchd_restart_refused`.
+
+# Resolve the launchd label for this install. Prefers the installer-
+# written marker (`state/launchagent.config`, which is also the
+# "we are launchd-managed" signal), then the exported bridge-lib default.
+# Prints the label on stdout; empty string when not launchd-managed.
+_bridge_daemon_launchd_label() {
+  local config_path="${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}/launchagent.config"
+  if [[ -f "$config_path" ]]; then
+    local label
+    label="$(
+      # shellcheck disable=SC1090
+      source "$config_path" 2>/dev/null
+      printf '%s' "${BRIDGE_LAUNCHAGENT_LABEL:-}"
+    )"
+    if [[ -n "$label" ]]; then
+      printf '%s' "$label"
+      return 0
+    fi
+  fi
+  # No marker → not launchd-managed via our installer. Fall through to the
+  # bridge-lib default ONLY if the plist actually exists on disk, so a
+  # systemd/nohup Linux install (which has the env default but no plist)
+  # is correctly treated as not-launchd.
+  local label="${BRIDGE_DAEMON_LAUNCHAGENT_LABEL:-}"
+  local plist="${BRIDGE_DAEMON_LAUNCHAGENT_PLIST:-}"
+  if [[ -n "$label" && -n "$plist" && -f "$plist" ]]; then
+    printf '%s' "$label"
+    return 0
+  fi
+  printf ''
+  return 1
+}
+
+# Read the live pid of launchd's supervised job for $label. Parses
+# `launchctl print gui/$UID/<label>` for the `pid = NNN` line. Prints the
+# pid on stdout (empty when the job is not currently running / not loaded).
+_bridge_daemon_launchd_job_pid() {
+  local label="$1"
+  [[ -n "$label" ]] || return 1
+  command -v launchctl >/dev/null 2>&1 || return 1
+  local uid
+  uid="$(id -u 2>/dev/null || printf '%s' "${UID:-}")"
+  [[ -n "$uid" ]] || return 1
+  local pid
+  pid="$(
+    launchctl print "gui/${uid}/${label}" 2>/dev/null \
+      | awk -F'=' '/^[[:space:]]*pid[[:space:]]*=/ { gsub(/[^0-9]/, "", $2); print $2; exit }'
+  )"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$pid"
+}
+
+# bridge_daemon_launchd_restart — the canonical launchd-aware restart used
+# by the out-of-band supervisors (#1463). See header block above for the
+# rationale and return-code contract. `$1` is an optional forensic reason
+# string recorded in the audit trail.
+bridge_daemon_launchd_restart() {
+  local reason="${1:-supervisor}"
+
+  # Linux / non-launchd hosts: signal the caller to use its stop+start
+  # fallback. systemd installs are unaffected by the launchd KeepAlive
+  # thrash and keep their existing restart path.
+  [[ "$(uname 2>/dev/null)" == "Darwin" ]] || return 1
+  command -v launchctl >/dev/null 2>&1 || return 1
+
+  local label
+  label="$(_bridge_daemon_launchd_label 2>/dev/null || true)"
+  [[ -n "$label" ]] || return 1
+
+  local uid
+  uid="$(id -u 2>/dev/null || printf '%s' "${UID:-}")"
+  [[ -n "$uid" ]] || return 1
+
+  # Split detection: the recorded daemon pid must be launchd's job pid.
+  # If a prior out-of-band restart already established a non-launchd lock
+  # holder, kickstart would cycle the (lock-starved) supervised slot and
+  # leave the real holder running → the thrash re-arms. Refuse instead.
+  local pid_file="${BRIDGE_DAEMON_PID_FILE:-${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}/daemon.pid}"
+  local recorded_pid=""
+  if [[ -f "$pid_file" ]]; then
+    recorded_pid="$(cat "$pid_file" 2>/dev/null | tr -dc '0-9' | head -c 16)"
+  fi
+  local job_pid=""
+  job_pid="$(_bridge_daemon_launchd_job_pid "$label" 2>/dev/null || true)"
+
+  # Only enforce the split guard when we can read BOTH a live recorded pid
+  # AND launchd's job pid. If the recorded pid is alive but differs from
+  # the launchd job pid, that IS the out-of-band split → refuse.
+  if [[ -n "$recorded_pid" ]] && kill -0 "$recorded_pid" 2>/dev/null \
+     && [[ -n "$job_pid" ]] && [[ "$recorded_pid" != "$job_pid" ]]; then
+    command -v bridge_audit_log >/dev/null 2>&1 \
+      && bridge_audit_log daemon daemon_launchd_restart_refused daemon \
+           --detail reason="$reason" \
+           --detail recorded_pid="$recorded_pid" \
+           --detail launchd_job_pid="$job_pid" \
+           --detail label="$label" >/dev/null 2>&1 || true
+    bridge_warn "daemon-launchd: refusing kickstart — recorded daemon pid=$recorded_pid is not launchd's job pid=$job_pid (out-of-band split). Run 'bridge-daemon.sh stop --force' once to reconcile, then KeepAlive will respawn the supervised slot."
+    return 2
+  fi
+
+  command -v bridge_audit_log >/dev/null 2>&1 \
+    && bridge_audit_log daemon daemon_launchd_restart daemon \
+         --detail reason="$reason" \
+         --detail recorded_pid="${recorded_pid:-none}" \
+         --detail launchd_job_pid="${job_pid:-none}" \
+         --detail label="$label" >/dev/null 2>&1 || true
+
+  # Cycle launchd's own supervised job. -k sends SIGKILL to the current
+  # instance (if any) then relaunches it; the relaunched instance is the
+  # sole lock holder, ending the KeepAlive thrash.
+  if launchctl kickstart -k "gui/${uid}/${label}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  command -v bridge_audit_log >/dev/null 2>&1 \
+    && bridge_audit_log daemon daemon_launchd_restart_failed daemon \
+         --detail reason="$reason" \
+         --detail label="$label" >/dev/null 2>&1 || true
+  bridge_warn "daemon-launchd: launchctl kickstart gui/${uid}/${label} failed"
+  return 1
+}
+
 # bridge_daemon_self_check — periodic R3 visibility helper. Called
 # from cmd_run's main loop on a throttled schedule. Compares $$ to the
 # pid attribute of the most recent `daemon_started` audit row; mismatch

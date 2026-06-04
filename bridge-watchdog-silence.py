@@ -526,35 +526,76 @@ def run_daemon_command(*verb_args: str) -> tuple[int, str]:
 
 
 def attempt_restart(reason_detail: dict) -> None:
-    """Stop + start the daemon and emit the structured audit trail."""
+    """Restart the daemon via the single `restart` verb and emit the
+    structured audit trail.
+
+    Issue #1463: route through `bridge-daemon.sh restart --force` instead
+    of a direct `stop --force` + `start`. On macOS launchd installs the
+    `restart` verb cycles launchd's OWN supervised job
+    (`launchctl kickstart -k`) so the fresh daemon holds the singleton lock
+    inside launchd's process tree — KeepAlive then has nothing to thrash
+    against. A direct out-of-band stop+start (the old code) established a
+    NON-launchd lock holder and re-armed the KeepAlive vs lock thrash. On
+    Linux (systemd/nohup) `restart` falls through to the same internal
+    stop+start it always did, so the resolver_die classification surface
+    below is preserved on the host where it matters.
+    """
     emit_audit("daemon_silence_detected", reason_detail)
     log.warning("daemon silence detected — %s", reason_detail)
 
     # --force: the silence watchdog only fires on a wedged/silent daemon.
     # Bypass the issue #314/#315 active-agent guard so a stuck daemon can
     # still be restarted on a host with running agents.
-    stop_code, stop_output = run_daemon_command("stop", "--force")
-    if stop_code != 0:
+    restart_code, restart_output = run_daemon_command("restart", "--force")
+
+    # rc=2 from the restart verb means the launchd-aware primitive REFUSED
+    # to kickstart because the live lock holder is not launchd's job pid (an
+    # existing out-of-band split). Surface it distinctly — a one-time
+    # operator reconcile (`bridge-daemon.sh stop --force`) is required;
+    # auto-restarting here would not help and the cooldown prevents a loop.
+    if restart_code == 2:
+        emit_audit(
+            "daemon_silence_restart_attempted",
+            {
+                "outcome": "restart_refused",
+                "restart_exit": restart_code,
+                "reason": "launchd_out_of_band_split",
+                **reason_detail,
+            },
+        )
+        log.error(
+            "daemon restart REFUSED — out-of-band launchd split; run "
+            "'bridge-daemon.sh stop --force' once to reconcile:\n%s",
+            _indent_block(restart_output),
+        )
+        write_cooldown(time.time(), {
+            "outcome": "restart_refused",
+            "restart_exit": restart_code,
+            "reason": "launchd_out_of_band_split",
+        })
+        return
+
+    if restart_code != 0:
         # Issue #946 L3: classify which resolver die path fired (when the
         # failure was a v0.8.0 isolation hard-cut) and quote the full
         # stderr block in the watchdog log so post-mortem readers can
         # disambiguate `marker-legacy` / `markerless-existing` /
         # `markerless-fresh-candidate` without re-running the wedge.
-        stop_resolver_die = _classify_resolver_die(stop_output)
-        stop_preview = _stderr_preview(stop_output)
+        restart_resolver_die = _classify_resolver_die(restart_output)
+        restart_preview = _stderr_preview(restart_output)
         emit_audit(
             "daemon_silence_restart_attempted",
             {
-                "outcome": "stop_failed",
-                "stop_exit": stop_code,
-                "stop_resolver_die": stop_resolver_die,
-                "stop_msg": stop_preview,
+                "outcome": "restart_failed",
+                "restart_exit": restart_code,
+                "restart_resolver_die": restart_resolver_die,
+                "restart_msg": restart_preview,
                 **reason_detail,
             },
         )
         log.error(
-            "daemon stop failed (exit=%s, resolver_die=%s):\n%s",
-            stop_code, stop_resolver_die, _indent_block(stop_output),
+            "daemon restart failed (exit=%s, resolver_die=%s):\n%s",
+            restart_code, restart_resolver_die, _indent_block(restart_output),
         )
         # Cooldown is set even on failure so we don't loop on a permanently
         # broken daemon. Persist the resolver_die classification and the
@@ -562,36 +603,10 @@ def attempt_restart(reason_detail: dict) -> None:
         # diagnosis pass) can grep `silence-watchdog.json` and immediately
         # learn which die path fired without re-running anything.
         write_cooldown(time.time(), {
-            "outcome": "stop_failed",
-            "stop_exit": stop_code,
-            "resolver_die": stop_resolver_die,
-            "stderr_preview": stop_preview,
-        })
-        return
-
-    start_code, start_output = run_daemon_command("start")
-    if start_code != 0:
-        start_resolver_die = _classify_resolver_die(start_output)
-        start_preview = _stderr_preview(start_output)
-        emit_audit(
-            "daemon_silence_restart_attempted",
-            {
-                "outcome": "start_failed",
-                "start_exit": start_code,
-                "start_resolver_die": start_resolver_die,
-                "start_msg": start_preview,
-                **reason_detail,
-            },
-        )
-        log.error(
-            "daemon start failed (exit=%s, resolver_die=%s):\n%s",
-            start_code, start_resolver_die, _indent_block(start_output),
-        )
-        write_cooldown(time.time(), {
-            "outcome": "start_failed",
-            "start_exit": start_code,
-            "resolver_die": start_resolver_die,
-            "stderr_preview": start_preview,
+            "outcome": "restart_failed",
+            "restart_exit": restart_code,
+            "resolver_die": restart_resolver_die,
+            "stderr_preview": restart_preview,
         })
         return
 
