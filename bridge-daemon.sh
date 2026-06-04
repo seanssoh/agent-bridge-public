@@ -4534,6 +4534,56 @@ bridge_daemon_autostart_allowed() {
     return 1
   fi
 
+  # PR-B / #1520b (codex constraints C4 + C5) — credential-pending hold.
+  #
+  # A freshly-created linux-user-isolated Claude agent carries a
+  # `state/agents/<a>/credential-pending` marker (written pre-roster by
+  # `agent create`) until its per-agent `.credentials.json` is seeded. While
+  # the marker is present AND the credential is absent, hold every daemon
+  # auto-start surface (warm always-on, on-demand queued, cron-dispatch wake
+  # — all three consult this gate) so the agent never launches
+  # unauthenticated. This is a HOLD, not a failure: we return 1 WITHOUT
+  # touching the autostart backoff state (the callers `continue` / refuse
+  # without calling bridge_daemon_note_autostart_failure, so a plain early
+  # return 1 here writes no backoff — the marker is the only state).
+  #
+  # We do NOT source/import bridge-auth.sh here (C4): the credential path is
+  # resolved via the existing bridge_agent_claude_config_dir resolver and the
+  # presence check is a cheap file-exists + non-empty (size>0) stat (C5).
+  # bridge-auth.py writes the final credential via tempfile → fsync →
+  # chmod/chown → os.replace (atomic), so a torn / zero-byte file never
+  # appears at the canonical path — size>0 is a sufficient "seeded" signal
+  # with no JSON parse in this hot path.
+  #
+  # Lazy self-clear (REQUIRED): once the credential IS present (whether
+  # seeded by the create-time best-effort sync or, later, by the daemon's
+  # periodic token-sync tick) we clear the marker best-effort and allow.
+  # Scope (codex C4): only honor the credential-pending hold for a Claude
+  # linux-user-isolated agent. A STALE marker on a shared/codex agent must be
+  # ignored here — bridge_agent_claude_config_dir falls back to the controller
+  # .claude for non-iso agents, so without this scope gate a stray marker could
+  # deny or clear a non-target based on the CONTROLLER's credential. The scope
+  # predicate MUST precede the config-dir resolution + the marker honoring.
+  local _cp_engine=""
+  _cp_engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+  if [[ "$_cp_engine" == "claude" ]] \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && command -v bridge_agent_credential_pending_active >/dev/null 2>&1 \
+      && bridge_agent_credential_pending_active "$agent" 2>/dev/null; then
+    local _cred_config_dir=""
+    local _cred_file=""
+    _cred_config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+    [[ -n "$_cred_config_dir" ]] && _cred_file="$_cred_config_dir/.credentials.json"
+    if [[ -n "$_cred_file" && -s "$_cred_file" ]]; then
+      # Credential seeded → drop the hold and allow this tick (and every
+      # future tick) to proceed through the normal backoff/start path.
+      bridge_agent_credential_pending_clear "$agent" >/dev/null 2>&1 || true
+    else
+      # Credential not yet present → hold WITHOUT writing backoff state.
+      return 1
+    fi
+  fi
+
   file="$(bridge_daemon_autostart_state_file "$agent")"
   [[ -f "$file" ]] || return 0
   daemon_source_state_file "$file" "autostart/$agent" 1 "AUTO_START_NEXT_RETRY_TS" || return 0
