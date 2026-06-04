@@ -45,7 +45,11 @@ Subcommands (argv[1]):
                                    local agent with NO verified-row requirement).
   member-accept-unit <db>          unit-drive accept_roster_broadcast contracts
                                    (not-leader / no-binding / first-bind / higher
-                                   epoch / stale / duplicate / atomic).
+                                   epoch / stale / duplicate / leader-pin).
+  empty-leader-takeover-unit <db>  unit-drive the empty-from_node takeover refusal.
+  dedupe-race-unit <db>            unit-drive the atomic dedupe/cache TOCTOU
+                                   contract (same-id/diff-body → conflict, no
+                                   cache write; same-id/same-body → duplicate).
   db-contains <db> <needle>        exit 0 iff <needle> appears in the db dump.
 """
 
@@ -383,9 +387,28 @@ def cmd_local_add_no_gate(db: str) -> int:
 # ---------------------------------------------------------------------------
 # unit driver — member-side acceptance contracts
 # ---------------------------------------------------------------------------
+def _accept(conn, *, room_id, room_epoch, members, leader_node, peer_id, mid):
+    """accept_roster_broadcast wrapper that supplies a per-call dedupe key.
+
+    `mid` is a UNIQUE message id per logical delivery; the body_sha256 is derived
+    from the actual canonical body bytes so a same-id replay of identical content
+    is a real duplicate while different content under the same id is a conflict —
+    exactly what the receiver sees on the wire."""
+    body = a2a.build_room_roster_broadcast(
+        room_id=room_id, room_epoch=room_epoch, members=members,
+        leader_node=leader_node)
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    return rooms.accept_roster_broadcast(
+        conn, room_id=room_id, room_epoch=room_epoch, members=members,
+        leader_node=leader_node, peer_id=peer_id, message_id=mid,
+        body_sha256=a2a.body_sha256(body_bytes))
+
+
 def cmd_member_accept_unit(db: str) -> int:
     """Drive accept_roster_broadcast's full contract surface directly (a unit
-    test of the security-critical acceptance logic). One line per case."""
+    test of the security-critical acceptance logic). One line per case. Each
+    logical delivery uses a UNIQUE message id so dedupe does not collide across
+    cases (the dedupe-race case has its own dedicated driver)."""
     os.environ["BRIDGE_A2A_ROOMS_DB"] = db  # noqa: iso-helper-boundary - env var, not a .env file
     conn = rooms.open_rooms()
     try:
@@ -400,60 +423,55 @@ def cmd_member_accept_unit(db: str) -> int:
         # rejected, persists nothing — EVEN with a local binding present.
         rooms.record_local_join_intent(
             conn, room_id, "bob", "nodeB", leader_node=leader)
-        out = rooms.accept_roster_broadcast(
-            conn, room_id=room_id, room_epoch=2, members=members_v2,
-            leader_node=leader, peer_id="nodeZ")
+        out = _accept(conn, room_id=room_id, room_epoch=2, members=members_v2,
+                      leader_node=leader, peer_id="nodeZ", mid="nodeZ:u1")
         print(f"not_leader={out}")
         print(f"not_leader_no_cache={rooms.get_roster_cache(conn, room_id) is None}")
 
         # (3c) FIRST roster with NO local binding -> refused (rogue-leader mint
         # prevented). Use a DIFFERENT room with no local intent.
-        out = rooms.accept_roster_broadcast(
-            conn, room_id="room-rogue", room_epoch=5, members=members_v2,
-            leader_node=leader, peer_id=leader)
+        out = _accept(conn, room_id="room-rogue", room_epoch=5,
+                      members=members_v2, leader_node=leader, peer_id=leader,
+                      mid="nodeA:u2")
         print(f"no_binding={out}")
         print("no_binding_no_cache="
               f"{rooms.get_roster_cache(conn, 'room-rogue') is None}")
 
         # (3c) FIRST roster WITH a local binding (recorded above) -> accepted.
-        out = rooms.accept_roster_broadcast(
-            conn, room_id=room_id, room_epoch=2, members=members_v2,
-            leader_node=leader, peer_id=leader)
+        out = _accept(conn, room_id=room_id, room_epoch=2, members=members_v2,
+                      leader_node=leader, peer_id=leader, mid="nodeA:u3")
         cache = rooms.get_roster_cache(conn, room_id)
         print(f"first_bind={out}:epoch={cache['epoch']}")
 
         # (3d) a STRICTLY-higher epoch updates.
         members_v3 = members_v2 + [
             {"agent": "carol", "node": "nodeC", "role": "member"}]
-        out = rooms.accept_roster_broadcast(
-            conn, room_id=room_id, room_epoch=3, members=members_v3,
-            leader_node=leader, peer_id=leader)
+        out = _accept(conn, room_id=room_id, room_epoch=3, members=members_v3,
+                      leader_node=leader, peer_id=leader, mid="nodeA:u4")
         cache = rooms.get_roster_cache(conn, room_id)
         has_carol = "carol" in cache["members_json"]
         print(f"higher_epoch={out}:epoch={cache['epoch']}:has_carol={has_carol}")
 
         # (3d) a LOWER epoch is IGNORED (stale) — the cache keeps epoch 3.
-        out = rooms.accept_roster_broadcast(
-            conn, room_id=room_id, room_epoch=2, members=members_v2,
-            leader_node=leader, peer_id=leader)
+        out = _accept(conn, room_id=room_id, room_epoch=2, members=members_v2,
+                      leader_node=leader, peer_id=leader, mid="nodeA:u5")
         cache = rooms.get_roster_cache(conn, room_id)
         still_carol = "carol" in cache["members_json"]
         print(f"lower_epoch={out}:epoch={cache['epoch']}:still_carol={still_carol}")
 
         # (3d) the SAME epoch with DIFFERENT members is IGNORED (a forge/replay),
         # NOT accepted — the cache is unchanged.
-        out = rooms.accept_roster_broadcast(
-            conn, room_id=room_id, room_epoch=3, members=members_v2,
-            leader_node=leader, peer_id=leader)
+        out = _accept(conn, room_id=room_id, room_epoch=3, members=members_v2,
+                      leader_node=leader, peer_id=leader, mid="nodeA:u6")
         cache = rooms.get_roster_cache(conn, room_id)
         same_still_carol = "carol" in cache["members_json"]
         print(f"same_epoch_diff={out}:still_carol={same_still_carol}")
 
         # (3d) a BYTE-IDENTICAL re-broadcast at the SAME epoch is an idempotent
-        # duplicate (accepted-as-noop).
-        out = rooms.accept_roster_broadcast(
-            conn, room_id=room_id, room_epoch=3, members=members_v3,
-            leader_node=leader, peer_id=leader)
+        # duplicate (accepted-as-noop). Use the SAME message id + body as the
+        # higher_epoch write (u4) so the dedupe ledger recognizes it as a replay.
+        out = _accept(conn, room_id=room_id, room_epoch=3, members=members_v3,
+                      leader_node=leader, peer_id=leader, mid="nodeA:u4")
         print(f"idempotent_dup={out}")
 
         # (3a' codex P4.2 r1 BLOCKING) LEADER-TAKEOVER of an EXISTING cache: a
@@ -464,9 +482,9 @@ def cmd_member_accept_unit(db: str) -> int:
         # pinned to the original leader nodeA at the original epoch.
         rogue_members = [
             {"agent": "mallory", "node": "nodeC", "role": "leader"}]
-        out = rooms.accept_roster_broadcast(
-            conn, room_id=room_id, room_epoch=99, members=rogue_members,
-            leader_node="nodeC", peer_id="nodeC")
+        out = _accept(conn, room_id=room_id, room_epoch=99,
+                      members=rogue_members, leader_node="nodeC",
+                      peer_id="nodeC", mid="nodeC:u7")
         cache = rooms.get_roster_cache(conn, room_id)
         print(f"takeover={out}:from_node={cache['from_node']}:"
               f"epoch={cache['epoch']}:"
@@ -489,16 +507,64 @@ def cmd_empty_leader_takeover_unit(db: str) -> int:
         before = rooms.get_roster_cache(conn, room_id)
         # A remote peer nodeC (non-empty authenticated peer_id) self-claims
         # leadership at a higher epoch. Must be refused (leader_mismatch).
-        out = rooms.accept_roster_broadcast(
+        out = _accept(
             conn, room_id=room_id, room_epoch=99,
             members=[{"agent": "mallory", "node": "nodeC", "role": "leader"}],
-            leader_node="nodeC", peer_id="nodeC")
+            leader_node="nodeC", peer_id="nodeC", mid="nodeC:empty1")
         after = rooms.get_roster_cache(conn, room_id)
         unchanged = (str(before["from_node"]) == str(after["from_node"])
                      and int(before["epoch"]) == int(after["epoch"]))
         print(f"empty_takeover={out}:from_node='{after['from_node']}':"
               f"epoch={after['epoch']}:unchanged={unchanged}:"
               f"has_mallory={'mallory' in after['members_json']}")
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_dedupe_race_unit(db: str) -> int:
+    """Drive the atomic dedupe/cache TOCTOU contract directly (codex P4.2 r3
+    BLOCKING). Two deliveries reuse the SAME (peer, message_id) with DIFFERENT
+    bodies; the SECOND must be a CONFLICT with NO cache mutation (the cache still
+    holds the FIRST body). Then a byte-identical replay of the FIRST is a
+    DUPLICATE (no double-apply). One line per case.
+
+    The two bodies differ only in members (mallory vs trent), so a successful
+    takeover would be observable as the cache flipping to the second body. The
+    SAME message_id forces the second through the dedupe-conflict branch BEFORE
+    the cache write — proving the write does not precede the conflict detection.
+    """
+    os.environ["BRIDGE_A2A_ROOMS_DB"] = db  # noqa: iso-helper-boundary - env var, not a .env file
+    conn = rooms.open_rooms()
+    try:
+        room_id = "room-race"
+        leader = "nodeM"  # the (single) leader peer for this room
+        # The member chose this room+leader locally (first-roster binding).
+        rooms.record_local_join_intent(
+            conn, room_id, "self", "nodeSelf", leader_node=leader)
+        members_a = [{"agent": "mallory", "node": "nodeM", "role": "leader"}]
+        members_b = [{"agent": "trent", "node": "nodeM", "role": "leader"}]
+        mid = "nodeM:race-X"
+
+        # Delivery 1: (peer=nodeM, id=race-X, bodyA) → first-bind ACCEPTED.
+        out1 = _accept(conn, room_id=room_id, room_epoch=1, members=members_a,
+                       leader_node=leader, peer_id=leader, mid=mid)
+        print(f"first_accept={out1}")
+        # Delivery 2: SAME (peer, id) but DIFFERENT body (bodyB) at a HIGHER
+        # epoch — would otherwise pass leader-pin + monotonic-epoch and WRITE.
+        # The atomic dedupe reservation must catch it as a CONFLICT FIRST, with
+        # NO cache mutation.
+        out2 = _accept(conn, room_id=room_id, room_epoch=2, members=members_b,
+                       leader_node=leader, peer_id=leader, mid=mid)
+        cache = rooms.get_roster_cache(conn, room_id)
+        print(f"reuse_diff_body={out2}:epoch={cache['epoch']}:"
+              f"has_mallory={'mallory' in cache['members_json']}:"
+              f"has_trent={'trent' in cache['members_json']}")
+        # Delivery 3: a byte-identical replay of delivery 1 → idempotent DUPLICATE
+        # (no double-apply), cache unchanged.
+        out3 = _accept(conn, room_id=room_id, room_epoch=1, members=members_a,
+                       leader_node=leader, peer_id=leader, mid=mid)
+        print(f"replay_same_body={out3}")
     finally:
         conn.close()
     return 0
@@ -536,6 +602,8 @@ def main(argv: list[str]) -> int:
         return cmd_member_accept_unit(rest[0])
     if cmd == "empty-leader-takeover-unit":
         return cmd_empty_leader_takeover_unit(rest[0])
+    if cmd == "dedupe-race-unit":
+        return cmd_dedupe_race_unit(rest[0])
     if cmd == "db-contains":
         return cmd_db_contains(rest[0], rest[1])
     print(f"unknown subcommand: {cmd}", file=sys.stderr)

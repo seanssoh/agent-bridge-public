@@ -425,6 +425,55 @@ test_T7_local_add_no_token_gate() {
 }
 
 # ---------------------------------------------------------------------------
+# T8 (codex P4.2 r3 BLOCKING — TOCTOU dedupe/cache race): a same-(peer,
+# message_id) / DIFFERENT-body roster MUST be rejected (409 / conflict) with NO
+# cache mutation — the dedupe reservation + cache write are ONE atomic txn, so
+# the conflict is detected BEFORE any write. Driven two ways: a unit driver
+# (proves the atomic helper's conflict branch + no-write) and end-to-end through
+# the REAL receiver.
+# ---------------------------------------------------------------------------
+test_T8a_dedupe_race_unit() {
+  local rdb="$SMOKE_TMP_ROOT/dedupe-race.db"
+  local out
+  out="$(env "${TEST_FLAGS[@]}" python3 "$HELPER" dedupe-race-unit "$rdb" 2>&1)" \
+    || smoke_fail "dedupe-race-unit helper must not raise: $out"
+  smoke_assert_contains "$out" "first_accept=accepted" \
+    "T8a: the first delivery (peer,id,bodyA) is accepted"
+  smoke_assert_contains "$out" "reuse_diff_body=dedupe_conflict:epoch=1:has_mallory=True:has_trent=False" \
+    "T8a: a same-(peer,id)/DIFFERENT-body delivery is a CONFLICT with NO cache write (cache keeps bodyA)"
+  smoke_assert_contains "$out" "replay_same_body=duplicate" \
+    "T8a: a byte-identical replay of the first is an idempotent duplicate (no double-apply)"
+}
+
+test_T8b_dedupe_race_end_to_end() {
+  # Establish bodyA at the captured message_id through the REAL receiver, then
+  # re-deliver the SAME message_id with a DIFFERENT (validly-signed) body → the
+  # receiver MUST answer 409 and the cache MUST still hold bodyA (not bodyB).
+  local mdb="$SMOKE_TMP_ROOT/member-race-e2e.db"
+  python3 "$HELPER" make-member-db "$mdb" "$ROOM" "$NODE_A" bob "$NODE_B" >/dev/null
+  local first
+  first="$(deliver_roster_into "$mdb" "$CFG_B_JSON")"
+  smoke_assert_contains "$first" "status=200" "T8b setup: bodyA accepted at the captured message_id"
+  local before
+  before="$(python3 "$HELPER" cache-rows "$mdb" "$ROOM")"
+  # A DIFFERENT body (adds a rogue member) under the SAME captured message_id,
+  # re-signed by the legit leader nodeA so the HMAC gate passes and the dedupe
+  # conflict is what stops it (NOT the signature gate).
+  local rogue_body
+  rogue_body='{"protocol":"agent-bridge.a2a.room-roster.v1","room_id":"'"$ROOM"'","room_epoch":50,"members":[{"agent":"trent","node":"'"$NODE_A"'","role":"member"}],"leader_node":"'"$NODE_A"'"}'
+  local res
+  res="$(env "BRIDGE_A2A_ROOMS_DB=$mdb" \
+    python3 "$HELPER" deliver-roster-to-receiver "$SMOKE_REPO_ROOT" \
+      "$CFG_B_JSON" "$CAPTURE" \
+      '{"body":'"$(python3 -c "import json,sys;print(json.dumps(sys.argv[1]))" "$rogue_body")"',"resign":true}')"
+  smoke_assert_contains "$res" "status=409" "T8b: a same-id/different-body roster is a 409 conflict"
+  local after
+  after="$(python3 "$HELPER" cache-rows "$mdb" "$ROOM")"
+  smoke_assert_eq "$before" "$after" "T8b: the conflicting delivery left the cache byte-for-byte unchanged (bodyA)"
+  smoke_assert_not_contains "$after" "trent" "T8b: the rogue different-body did NOT enter the cache (no pre-write race)"
+}
+
+# ---------------------------------------------------------------------------
 # auth preamble teeth: unknown peer / wrong source addr are refused (unweakened)
 # ---------------------------------------------------------------------------
 test_auth_preamble_unweakened() {
@@ -483,6 +532,8 @@ smoke_run "T4: a first roster with NO local binding is refused (rogue-leader min
 smoke_run "T5: epoch monotonicity (lower/same ignored, higher updates, dup idempotent)" test_T5_epoch_monotonicity
 smoke_run "T6: the cache update is atomic (a rejected update leaves the prior roster)" test_T6_atomic_no_partial_roster
 smoke_run "T7: the local-leader-add path admits a local agent without the token gate" test_T7_local_add_no_token_gate
+smoke_run "T8a: dedupe/cache TOCTOU — same-id/diff-body is a conflict, no cache write (unit)" test_T8a_dedupe_race_unit
+smoke_run "T8b: dedupe/cache TOCTOU — same-id/diff-body is 409 + cache unchanged (end-to-end)" test_T8b_dedupe_race_end_to_end
 smoke_run "auth preamble unweakened (remote_addr 403 / unknown peer 403)" test_auth_preamble_unweakened
 smoke_run "idempotent re-delivery: a byte-identical broadcast is an idempotent 200" test_idempotent_redelivery
 

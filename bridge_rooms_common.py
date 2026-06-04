@@ -1250,51 +1250,6 @@ def room_join_dedupe_lookup(conn: sqlite3.Connection, peer: str,
             else JOIN_DEDUPE_CONFLICT)
 
 
-def reserve_roster_dedupe(conn: sqlite3.Connection, *, peer: str,
-                          message_id: str, body_sha256: str) -> str:
-    """Reserve a peer-scoped dedupe row for an APPLIED roster broadcast (P4.2).
-
-    Reuses the `room_join_dedupe` ledger (peer-scoped composite PK) so a
-    re-delivery of the SAME (peer, message_id, body) short-circuits to an
-    idempotent 200, while a (peer, message_id) reuse with a DIFFERENT body is a
-    409 conflict. Called by the roster receiver ONLY after the cache write
-    actually committed (or was an idempotent same-state accept), so a dedupe row
-    exists IFF the broadcast was applied — a rejected/ignored broadcast leaves no
-    row and a replay re-evaluates. Returns JOIN_DEDUPE_RESERVED on a fresh
-    reservation, JOIN_DEDUPE_DUPLICATE/JOIN_DEDUPE_CONFLICT if a row already
-    existed (idempotent re-reserve). Never raises on a benign PK race.
-    """
-    existing = conn.execute(
-        "SELECT body_sha256 FROM room_join_dedupe WHERE peer=? AND message_id=?",
-        (peer, message_id),
-    ).fetchone()
-    if existing is not None:
-        return (JOIN_DEDUPE_DUPLICATE if existing["body_sha256"] == body_sha256
-                else JOIN_DEDUPE_CONFLICT)
-    try:
-        conn.execute(
-            "INSERT INTO room_join_dedupe (message_id, peer, body_sha256, "
-            "created_ts) VALUES (?, ?, ?, ?)",
-            (message_id, peer, body_sha256, now_ts()),
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        # Lost a concurrent PK race — re-query the winner's row, return the same
-        # idempotent/conflict classification (never a raise).
-        conn.rollback()
-        winner = conn.execute(
-            "SELECT body_sha256 FROM room_join_dedupe "
-            "WHERE peer=? AND message_id=?",
-            (peer, message_id),
-        ).fetchone()
-        if winner is not None:
-            return (JOIN_DEDUPE_DUPLICATE
-                    if winner["body_sha256"] == body_sha256
-                    else JOIN_DEDUPE_CONFLICT)
-        raise
-    return JOIN_DEDUPE_RESERVED
-
-
 def record_verified_cross_node_join_request_atomic(
     conn: sqlite3.Connection, *, message_id: str, body_sha256: str, peer: str,
     room_id: str, agent: str, node: str, via_node: str, ttl_expiry: int = 0,
@@ -1584,6 +1539,7 @@ ROSTER_STALE_EPOCH = "stale_epoch"      # lower-or-same epoch (not a dup) → ig
 ROSTER_NOT_LEADER = "not_leader"        # peer != body.leader_node → rejected
 ROSTER_NO_LOCAL_BINDING = "no_local_binding"  # first roster w/o local join state
 ROSTER_LEADER_MISMATCH = "leader_mismatch"  # peer != the ESTABLISHED cached leader
+ROSTER_DEDUPE_CONFLICT = "dedupe_conflict"  # same (peer,message_id), DIFFERENT body
 
 
 def _local_join_binding_for(conn: sqlite3.Connection, room_id: str,
@@ -1658,15 +1614,16 @@ def get_roster_cache(conn: sqlite3.Connection,
 def accept_roster_broadcast(
     conn: sqlite3.Connection, *, room_id: str, room_epoch: int,
     members: list[dict[str, Any]], leader_node: str, peer_id: str,
-    mac: str = "",
+    message_id: str, body_sha256: str, mac: str = "",
 ) -> str:
     """Apply a verified leader roster broadcast to the member-local cache.
 
     The member-side heart of P4.2. The CALLER (the receiver) has ALREADY verified
     the node-link pairwise HMAC over the canonical request (so `peer_id` is the
     authenticated sender node and the body is intact). This function encodes the
-    remaining security contracts and performs the ATOMIC cache write. Returns a
-    ROSTER_* outcome code; raises RoomsError only on an unexpected DB fault.
+    remaining security contracts and performs the ATOMIC dedupe-reserve + cache
+    write. Returns a ROSTER_* outcome code; raises RoomsError only on an
+    unexpected DB fault.
 
     Contracts enforced here (brief §3):
       a. LEADER-AUTHORITY (3a): accept ONLY when `peer_id == leader_node`. A
@@ -1690,14 +1647,30 @@ def accept_roster_broadcast(
          STRICTLY-higher epoch updates; a lower-or-same epoch is IGNORED
          (ROSTER_STALE_EPOCH) UNLESS the incoming roster is BYTE-IDENTICAL to the
          cached one at the SAME epoch (ROSTER_DUPLICATE — idempotent, no write).
-      e. ATOMIC update (3e): the cache row is written in a SINGLE transaction
-         (INSERT OR REPLACE + one commit) — a reader/crash never observes a
-         partial roster.
+      e. ATOMIC dedupe + update (3e + codex P4.2 r3 BLOCKING — close the TOCTOU
+         race): for any outcome that WRITES the cache (ACCEPTED), the peer-scoped
+         dedupe RESERVATION and the room_roster_cache WRITE commit in ONE
+         transaction (single serialization point). The dedupe reservation is the
+         `room_join_dedupe` PRIMARY KEY (peer, message_id), so:
+           - a fresh (peer, message_id) → reserve + write cache + commit together.
+           - a same (peer, message_id) with a DIFFERENT body_sha256 →
+             ROSTER_DEDUPE_CONFLICT, write NOTHING (rolled back). The receiver
+             answers 409. This holds EVEN under a check-then-write race: two
+             concurrent same-id deliveries cannot both pass + both write — the PK
+             serializes them and the loser is re-classified (IntegrityError →
+             re-query → conflict/duplicate), never a partial cache mutation.
+           - a same (peer, message_id) with the SAME body_sha256 →
+             ROSTER_DUPLICATE (idempotent — the cache already reflects it; no
+             double-apply).
+         A contract REJECT (not_leader / leader_mismatch / no_binding /
+         stale_epoch) reserves NO dedupe row, so a replay re-evaluates the
+         contracts (the stale/not-leader teeth hold on replay).
 
     `members` MUST be the canonical sorted roster (the bytes the leader signed);
     we re-canonicalize on store so the cached `members_json` is reproducible.
     `mac` is the presented per-link signature (stored for audit/debug; the real
-    auth is the receiver's HMAC verify, already done).
+    auth is the receiver's HMAC verify, already done). `message_id`/`body_sha256`
+    are the dedupe key (peer-scoped) the receiver carries from the wire headers.
     """
     # --- 3a: leader-authority binding — the authenticated sender must be the
     # node the body names as leader. (peer_id is the un-spoofable HMAC-authed
@@ -1715,8 +1688,11 @@ def accept_roster_broadcast(
         # roster alone; the member must have chosen this room+leader locally. ---
         if not _local_join_binding_for(conn, room_id, leader_node):
             return ROSTER_NO_LOCAL_BINDING
-        _write_roster_cache(conn, room_id, epoch, incoming_json, leader_node, mac)
-        return ROSTER_ACCEPTED
+        # WRITE path → atomic dedupe-reserve + cache write (3e).
+        return _reserve_and_write_roster_cache(
+            conn, peer=peer_id, message_id=message_id, body_sha256=body_sha256,
+            room_id=room_id, epoch=epoch, members_json=incoming_json,
+            from_node=leader_node, mac=mac)
 
     # --- 3a': LEADER PINNING — an existing cache fixes the room's leader to its
     # established `from_node`. A roster signed by a DIFFERENT peer is a TAKEOVER
@@ -1738,17 +1714,91 @@ def accept_roster_broadcast(
     # --- 3d: monotonic epoch (existing cache present, leader pinned) ---
     cached_epoch = int(existing["epoch"])
     if epoch > cached_epoch:
-        _write_roster_cache(conn, room_id, epoch, incoming_json, leader_node, mac)
-        return ROSTER_ACCEPTED
+        # WRITE path → atomic dedupe-reserve + cache write (3e).
+        return _reserve_and_write_roster_cache(
+            conn, peer=peer_id, message_id=message_id, body_sha256=body_sha256,
+            room_id=room_id, epoch=epoch, members_json=incoming_json,
+            from_node=leader_node, mac=mac)
     # epoch <= cached_epoch: accept ONLY a byte-identical idempotent duplicate
     # (same epoch AND same canonical members AND same leader node). Everything
     # else (a lower epoch, or a same-epoch roster with DIFFERENT contents — a
-    # replay/forge attempt) is ignored without a write.
+    # replay/forge attempt) is ignored without a write. A byte-identical re-
+    # broadcast does NOT need a cache write (the cache already reflects it), so
+    # it does not reserve dedupe either — it is idempotent by construction.
     if (epoch == cached_epoch
             and str(existing["members_json"]) == incoming_json
             and str(existing["from_node"] or "") == leader_node):
         return ROSTER_DUPLICATE
     return ROSTER_STALE_EPOCH
+
+
+def _reserve_and_write_roster_cache(
+    conn: sqlite3.Connection, *, peer: str, message_id: str, body_sha256: str,
+    room_id: str, epoch: int, members_json: str, from_node: str, mac: str,
+) -> str:
+    """ATOMICALLY reserve the peer-scoped dedupe row AND write the roster cache.
+
+    The single serialization point that closes the TOCTOU dedupe/cache race
+    (codex P4.2 r3 BLOCKING). Mirrors P4.1's
+    `record_verified_cross_node_join_request_atomic`: a pre-check + an
+    IntegrityError-on-PK fallback re-query, so two concurrent same-id deliveries
+    cannot both pass + both write. Both the `room_join_dedupe` reservation and
+    the `room_roster_cache` write are issued WITHOUT an intermediate commit, then
+    ONE commit makes them durable together; any failure before the commit rolls
+    BOTH back (no orphan dedupe row, no partial cache).
+
+    Returns:
+      - ROSTER_DEDUPE_CONFLICT : (peer, message_id) already used with a DIFFERENT
+        body → write NOTHING.
+      - ROSTER_DUPLICATE       : (peer, message_id) already reserved with the
+        SAME body → idempotent, write NOTHING (the cache already reflects it).
+      - ROSTER_ACCEPTED        : fresh id → dedupe row + cache row committed
+        together.
+    """
+    # Pre-check inside this call (the caller did no read-only dedupe check on the
+    # write path). Scoped to the authenticated peer (composite PK).
+    existing = conn.execute(
+        "SELECT body_sha256 FROM room_join_dedupe WHERE peer=? AND message_id=?",
+        (peer, message_id),
+    ).fetchone()
+    if existing is not None:
+        return (ROSTER_DUPLICATE if existing["body_sha256"] == body_sha256
+                else ROSTER_DEDUPE_CONFLICT)
+    try:
+        conn.execute(
+            "INSERT INTO room_join_dedupe (message_id, peer, body_sha256, "
+            "created_ts) VALUES (?, ?, ?, ?)",
+            (message_id, peer, body_sha256, now_ts()),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO room_roster_cache (room_id, epoch, "
+            "members_json, from_node, mac, fetched_ts) VALUES (?, ?, ?, ?, ?, ?)",
+            (room_id, epoch, members_json, from_node, mac, now_ts()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Lost a concurrent (peer, message_id) PK race — roll BOTH writes back and
+        # re-query the winner's row, returning the SAME idempotent/conflict
+        # outcome the pre-check would have. The loser thus gets a clean
+        # duplicate/conflict (never a partial cache mutation, never a 500).
+        conn.rollback()
+        winner = conn.execute(
+            "SELECT body_sha256 FROM room_join_dedupe "
+            "WHERE peer=? AND message_id=?",
+            (peer, message_id),
+        ).fetchone()
+        if winner is not None:
+            return (ROSTER_DUPLICATE if winner["body_sha256"] == body_sha256
+                    else ROSTER_DEDUPE_CONFLICT)
+        # PK violation from somewhere other than a concurrent winner (should not
+        # happen) — surface it rather than silently swallow.
+        raise
+    except Exception:
+        # Roll BOTH writes back so a failed cache insert never leaves an orphan
+        # dedupe reservation (the atomicity contract).
+        conn.rollback()
+        raise
+    return ROSTER_ACCEPTED
 
 
 def _canonical_member_list(members: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -1766,22 +1816,6 @@ def _canonical_member_list(members: list[dict[str, Any]]) -> list[dict[str, str]
     ]
     norm.sort(key=lambda m: (m["agent"], m["node"]))
     return norm
-
-
-def _write_roster_cache(conn: sqlite3.Connection, room_id: str, epoch: int,
-                        members_json: str, from_node: str, mac: str) -> None:
-    """ATOMICALLY (single transaction) write the member-local roster cache row.
-
-    The whole row is replaced in one INSERT OR REPLACE + one commit (3e
-    atomicity): a concurrent reader or a crash mid-update sees either the PRIOR
-    complete roster or the NEW complete roster, never a partial one.
-    """
-    conn.execute(
-        "INSERT OR REPLACE INTO room_roster_cache (room_id, epoch, "
-        "members_json, from_node, mac, fetched_ts) VALUES (?, ?, ?, ?, ?, ?)",
-        (room_id, epoch, members_json, from_node, mac, now_ts()),
-    )
-    conn.commit()
 
 
 # --------------------------------------------------------------------------

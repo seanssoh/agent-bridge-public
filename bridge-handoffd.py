@@ -2062,13 +2062,17 @@ class HandoffHandler(BaseHTTPRequestHandler):
         room_epoch = int(roster["room_epoch"])
         members = list(roster["members"])
 
-        # --- j. ACCEPT per the member-side contracts + reserve dedupe atomically.
-        # accept_roster_broadcast enforces leader-authority (peer==leader_node),
-        # the first-roster binding, the monotonic epoch, and the atomic cache
-        # write. We reserve the dedupe row ONLY when the cache was actually
-        # written or it was an idempotent same-state accept — so a rejected
-        # (not-leader / no-binding / stale) broadcast leaves NO dedupe row and a
-        # replay re-evaluates (never a bogus idempotent 200).
+        # --- j. ACCEPT per the member-side contracts WITH atomic dedupe (codex
+        # P4.2 r3 BLOCKING — close the TOCTOU race). accept_roster_broadcast
+        # enforces leader-authority (peer==leader_node), the leader pin, the
+        # first-roster binding, the monotonic epoch, AND folds the peer-scoped
+        # dedupe RESERVATION into the SAME transaction as the cache write. So a
+        # same-(peer,message_id)/DIFFERENT-body roster is caught as a CONFLICT
+        # BEFORE any cache mutation (409, nothing written), and a contract REJECT
+        # (not_leader / leader_mismatch / no_binding / stale) reserves NO dedupe
+        # row so a replay re-evaluates. The earlier read-only dedupe pre-check
+        # (step h) is a fast-path early answer for an ALREADY-RESERVED id; the
+        # authoritative serialization is here.
         try:
             conn = rooms.open_rooms()
         except rooms.RoomsError as exc:
@@ -2081,6 +2085,7 @@ class HandoffHandler(BaseHTTPRequestHandler):
                 outcome = rooms.accept_roster_broadcast(
                     conn, room_id=room_id, room_epoch=room_epoch,
                     members=members, leader_node=leader_node, peer_id=peer_id,
+                    message_id=message_id, body_sha256=computed_hash,
                     mac=signature,
                 )
             except rooms.RoomsError as exc:
@@ -2089,63 +2094,57 @@ class HandoffHandler(BaseHTTPRequestHandler):
                       message_id=message_id, room_id=room_id)
                 self._reply(500, {"ok": False, "error": "internal error"})
                 return
-
-            if outcome == rooms.ROSTER_NOT_LEADER:
-                audit("room_roster_reject", reason="not_leader",
-                      peer=peer_id, client=client_ip, room_id=room_id,
-                      leader_node=leader_node, message_id=message_id,
-                      security=True)
-                self._reply(403, {"ok": False,
-                                  "error": "roster sender is not the room leader"})
-                return
-            if outcome == rooms.ROSTER_LEADER_MISMATCH:
-                # A configured peer self-claiming leadership of a room already
-                # led by a DIFFERENT node — a takeover attempt. Reject, persist
-                # nothing (codex P4.2 r1 BLOCKING).
-                audit("room_roster_reject", reason="leader_mismatch",
-                      peer=peer_id, client=client_ip, room_id=room_id,
-                      leader_node=leader_node, message_id=message_id,
-                      security=True)
-                self._reply(403, {"ok": False,
-                                  "error": "roster sender is not the established "
-                                  "room leader (takeover refused)"})
-                return
-            if outcome == rooms.ROSTER_NO_LOCAL_BINDING:
-                audit("room_roster_reject", reason="no_local_binding",
-                      peer=peer_id, client=client_ip, room_id=room_id,
-                      message_id=message_id, security=True)
-                self._reply(403, {"ok": False,
-                                  "error": "no local join state for this room — "
-                                  "refusing to mint a roster cache from an "
-                                  "inbound broadcast"})
-                return
-            if outcome == rooms.ROSTER_STALE_EPOCH:
-                # Not an error (a legitimate lower/same-epoch non-duplicate is
-                # simply ignored), but we still return 200 with applied=False so
-                # the leader does not retry forever. No dedupe row reserved.
-                audit("room_roster_ignore", reason="stale_epoch",
-                      peer=peer_id, client=client_ip, room_id=room_id,
-                      epoch=room_epoch, message_id=message_id)
-                self._reply(200, {"ok": True, "applied": False,
-                                  "reason": "stale_epoch"})
-                return
-
-            # ACCEPTED (cache written) or DUPLICATE (idempotent same-state). Both
-            # are legitimate terminal states for THIS message — reserve the
-            # peer-scoped dedupe row so an exact replay short-circuits to an
-            # idempotent 200 (and an id-reuse-with-different-body is a 409). The
-            # reservation is best-effort: a failure to reserve must NOT undo the
-            # already-committed cache write, so we log + still return 200.
-            try:
-                rooms.reserve_roster_dedupe(
-                    conn, peer=peer_id, message_id=message_id,
-                    body_sha256=computed_hash)
-            except Exception as exc:  # noqa: BLE001 - dedupe is best-effort
-                audit("room_roster_warn", reason="dedupe_reserve_failed",
-                      peer=peer_id, client=client_ip, message_id=message_id,
-                      detail=str(exc)[:200])
         finally:
             conn.close()
+
+        if outcome == rooms.ROSTER_NOT_LEADER:
+            audit("room_roster_reject", reason="not_leader",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  leader_node=leader_node, message_id=message_id,
+                  security=True)
+            self._reply(403, {"ok": False,
+                              "error": "roster sender is not the room leader"})
+            return
+        if outcome == rooms.ROSTER_LEADER_MISMATCH:
+            # A configured peer self-claiming leadership of a room already led by
+            # a DIFFERENT node — a takeover attempt. Reject, persist nothing
+            # (codex P4.2 r1 BLOCKING).
+            audit("room_roster_reject", reason="leader_mismatch",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  leader_node=leader_node, message_id=message_id,
+                  security=True)
+            self._reply(403, {"ok": False,
+                              "error": "roster sender is not the established "
+                              "room leader (takeover refused)"})
+            return
+        if outcome == rooms.ROSTER_NO_LOCAL_BINDING:
+            audit("room_roster_reject", reason="no_local_binding",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  message_id=message_id, security=True)
+            self._reply(403, {"ok": False,
+                              "error": "no local join state for this room — "
+                              "refusing to mint a roster cache from an "
+                              "inbound broadcast"})
+            return
+        if outcome == rooms.ROSTER_DEDUPE_CONFLICT:
+            # Same (peer, message_id) reused with a DIFFERENT body — caught at the
+            # atomic dedupe reservation BEFORE any cache write (codex P4.2 r3).
+            audit("room_roster_reject", reason="hash_conflict",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  message_id=message_id, security=True)
+            self._reply(409, {"ok": False,
+                              "error": "message id reused with different body"})
+            return
+        if outcome == rooms.ROSTER_STALE_EPOCH:
+            # Not an error (a legitimate lower/same-epoch non-duplicate is simply
+            # ignored), but we still return 200 with applied=False so the leader
+            # does not retry forever. No dedupe row reserved.
+            audit("room_roster_ignore", reason="stale_epoch",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  epoch=room_epoch, message_id=message_id)
+            self._reply(200, {"ok": True, "applied": False,
+                              "reason": "stale_epoch"})
+            return
 
         if outcome == rooms.ROSTER_DUPLICATE:
             audit("room_roster_accept", reason="duplicate",
