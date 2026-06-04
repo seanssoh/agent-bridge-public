@@ -165,6 +165,7 @@ bridge_link_claude_settings_to_shared() {
   local agent="${3-}"
   local effective_file
   local agent_class=""
+  local channels_csv=""
   local agent_claude_config_dir=""
   local agent_claude_home=""
   local agent_effective_file=""
@@ -180,6 +181,24 @@ bridge_link_claude_settings_to_shared() {
     if declare -p BRIDGE_AGENT_SOURCE >/dev/null 2>&1; then
       agent_class="$(bridge_agent_source "$agent" 2>/dev/null || true)"
     fi
+    # Issue #1453: resolve the agent's effective channels CSV
+    # (BRIDGE_AGENT_CHANNELS SSOT) and thread it to the renderer. The stored
+    # launch command does NOT carry the composed `--channels` flag for
+    # normally-created channel agents, so without this the renderer cannot
+    # tell which channel plugins the agent runs with → managed defaults
+    # never assert them enabled and a stale enabledPlugins=false silently
+    # drops inbound. Gate on BRIDGE_AGENT_CHANNELS actually being declared
+    # (same pattern as the BRIDGE_AGENT_SOURCE guard above): callers that
+    # haven't loaded the roster (smoke fixtures, back-compat callers) leave
+    # the assoc-array undeclared, and `bridge_agent_channels_csv` would then
+    # trip the `${BRIDGE_AGENT_CHANNELS[$agent]-}` undeclared-assoc-array
+    # arithmetic-subscript footgun under `set -u`. When undeclared, leave
+    # channels_csv empty → the renderer falls back to launch-cmd flag
+    # parsing (prior behavior).
+    if declare -p BRIDGE_AGENT_CHANNELS >/dev/null 2>&1 \
+        && command -v bridge_agent_channels_csv >/dev/null 2>&1; then
+      channels_csv="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
+    fi
   else
     effective_file="$(bridge_hook_shared_settings_effective_file)"
   fi
@@ -188,7 +207,8 @@ bridge_link_claude_settings_to_shared() {
     --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
     --effective-settings-file "$effective_file" \
     --launch-cmd "$launch_cmd" \
-    --agent-class "$agent_class" >/dev/null
+    --agent-class "$agent_class" \
+    --channels-csv "$channels_csv" >/dev/null
   # Issue #1145: defer `cmd_link_shared_settings` under v2 isolation when the
   # workdir hasn't been normalized yet by
   # `bridge_linux_prepare_agent_isolation` (Step A). Step B (this controller-
@@ -269,7 +289,8 @@ bridge_link_claude_settings_to_shared() {
           --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
           --effective-settings-file "$agent_effective_file" \
           --launch-cmd "$launch_cmd" \
-          --agent-class "$agent_class" >/dev/null
+          --agent-class "$agent_class" \
+          --channels-csv "$channels_csv" >/dev/null
         bridge_hooks_python link-shared-settings --workdir "$agent_claude_home" --shared-settings-file "$agent_effective_file" >/dev/null
       fi
     fi
@@ -479,6 +500,18 @@ bridge_install_isolated_home_settings() {
   if declare -p BRIDGE_AGENT_SOURCE >/dev/null 2>&1; then
     agent_class="$(bridge_agent_source "$agent" 2>/dev/null || true)"
   fi
+  # Issue #1453: resolve the agent's effective channels CSV
+  # (BRIDGE_AGENT_CHANNELS SSOT) and thread it to the isolated-home renderer
+  # — the stored launch command does not carry the composed `--channels`
+  # flag, so the CSV is the only signal for the launched channel plugin set
+  # (see bridge_link_claude_settings_to_shared for the full rationale). Gate
+  # on BRIDGE_AGENT_CHANNELS being declared so an unloaded roster does not
+  # trip the undeclared-assoc-array footgun under `set -u`.
+  local channels_csv=""
+  if declare -p BRIDGE_AGENT_CHANNELS >/dev/null 2>&1 \
+      && command -v bridge_agent_channels_csv >/dev/null 2>&1; then
+    channels_csv="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
+  fi
 
   [[ -n "$agent" ]] || return 0
 
@@ -606,7 +639,8 @@ bridge_install_isolated_home_settings() {
         --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
         --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
         --launch-cmd "$launch_cmd" \
-        --agent-class "$agent_class" >"$stage_root/render.out" 2>&1; then
+        --agent-class "$agent_class" \
+        --channels-csv "$channels_csv" >"$stage_root/render.out" 2>&1; then
     bridge_warn "isolated home settings install: render failed for $agent ($(head -n1 "$stage_root/render.out" 2>/dev/null || true))"
     rm -rf "$stage_root"
     return 1

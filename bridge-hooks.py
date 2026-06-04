@@ -81,7 +81,148 @@ def resolve_managed_autocompact_window(
     return BRIDGE_AUTOCOMPACT_WINDOW_DEFAULT
 
 
-def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str, Any]:
+# Issue #1453: the launch command may carry the channel plugin set under
+# either the internal `--dangerously-load-development-channels` flag or the
+# public `--channels` alias the bridge actually threads through to the
+# running process (lib/bridge-hooks.sh:156, #570). Both must be parsed
+# identically — see `launched_channel_plugin_specs`.
+_CHANNEL_PLUGIN_FLAGS = (
+    "--dangerously-load-development-channels",
+    "--channels",
+)
+
+
+def _channel_item_to_spec(item: str) -> str | None:
+    """Map a single channel item to its `<plugin>@<marketplace>` spec, or
+    None if the item is not a plugin channel.
+
+    A channel item is the `bridge_qualify_channel_item` form: either
+    `plugin:<name>@<marketplace>` (a Claude Code plugin channel, the only
+    kind that appears in `enabledPlugins`) or `server:<name>` (a transport,
+    NOT a plugin). Returns the spec with the leading `plugin:` stripped
+    (matching the `enabledPlugins` key form Claude Code records) for plugin
+    items; returns None for `server:` items and anything malformed (empty
+    plugin name or marketplace id).
+    """
+    item = item.strip()
+    if not item.startswith("plugin:") or "@" not in item:
+        return None
+    spec = item[len("plugin:") :]
+    plugin_name, _sep, marketplace_id = spec.rpartition("@")
+    if not plugin_name or not marketplace_id:
+        return None
+    return spec
+
+
+def channel_specs_from_csv(channels_csv: str | None) -> list[str]:
+    """Return the ordered, de-duped plugin specs from a normalized channels
+    CSV (`plugin:a@m,plugin:b@m,server:x`).
+
+    This is the form `bridge_agent_channels_csv` (lib/bridge-agents.sh:6259)
+    emits — the SSOT for an agent's effective channel set, sourced from
+    `BRIDGE_AGENT_CHANNELS` (the roster) and threaded into the renderers as
+    `--channels-csv` (#1453). The bridge composes the actual `--channels`
+    launch flag from this same set at launch time, so for normally-created
+    channel agents the stored `--launch-cmd` does NOT carry `--channels` —
+    the CSV is the only signal the renderer has.
+    """
+    if not channels_csv:
+        return []
+    specs: list[str] = []
+    seen: set[str] = set()
+    for item in channels_csv.split(","):
+        spec = _channel_item_to_spec(item)
+        if spec is None or spec in seen:
+            continue
+        seen.add(spec)
+        specs.append(spec)
+    return specs
+
+
+def launched_channel_plugin_specs(launch_cmd: str | None) -> list[str]:
+    """Return the ordered, de-duped `<plugin>@<marketplace>` specs carried in
+    the launch command's channel flags.
+
+    Parses both the internal `--dangerously-load-development-channels` flag
+    and the public `--channels` alias (#1453). A single flag value may itself
+    be a CSV of channel items (`plugin:a@m,plugin:b@m,server:x`) — the form
+    `bridge_extract_channels_from_command` (lib/bridge-agents.sh:5735)
+    parses. `server:` items are dropped. The leading `plugin:` prefix is
+    stripped from each returned spec.
+
+    NOTE: for a normally-created channel agent the bridge composes the
+    `--channels` flag from `BRIDGE_AGENT_CHANNELS` at launch time and the
+    *stored* launch command (what the renderer is fed) does NOT carry it; in
+    that case this returns []. The renderer must therefore ALSO consult the
+    `--channels-csv` it is given — see `effective_channel_plugin_specs`. This
+    function still matters for launch commands that DO carry the flag inline
+    (explicit `--channels`/dev-channels args, e.g. some dynamic agents).
+    """
+    if not launch_cmd:
+        return []
+    try:
+        tokens = shlex.split(launch_cmd)
+    except ValueError:
+        tokens = launch_cmd.split()
+
+    specs: list[str] = []
+    seen: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        value = ""
+        if token in _CHANNEL_PLUGIN_FLAGS and index + 1 < len(tokens):
+            value = tokens[index + 1]
+            index += 2
+        elif "=" in token and token.split("=", 1)[0] in _CHANNEL_PLUGIN_FLAGS:
+            value = token.split("=", 1)[1]
+            index += 1
+        else:
+            index += 1
+            continue
+        for item in value.split(","):
+            spec = _channel_item_to_spec(item)
+            if spec is None or spec in seen:
+                continue
+            seen.add(spec)
+            specs.append(spec)
+    return specs
+
+
+def effective_channel_plugin_specs(
+    launch_cmd: str | None,
+    channels_csv: str | None = None,
+) -> list[str]:
+    """Return the ordered, de-duped union of the agent's effective channel
+    plugin specs from BOTH signals the renderer has (#1453):
+
+      - the launch command's inline channel flags
+        (`launched_channel_plugin_specs`), and
+      - the agent's resolved channels CSV (`channel_specs_from_csv`), sourced
+        from `BRIDGE_AGENT_CHANNELS` (the SSOT) and passed as `--channels-csv`.
+
+    The CSV is required because the bridge composes the `--channels` launch
+    flag from `BRIDGE_AGENT_CHANNELS` at launch time — the *stored* launch
+    command the renderer is fed (`bridge_agent_launch_cmd_raw`) does NOT
+    carry it for normally-created channel agents. This union is the single
+    source of truth for "which channel plugins is this agent launched with"
+    consumed by `managed_claude_settings_defaults` (managed-default enables)
+    and the renderers' sticky-false repair.
+    """
+    specs: list[str] = []
+    seen: set[str] = set()
+    for spec in (*launched_channel_plugin_specs(launch_cmd), *channel_specs_from_csv(channels_csv)):
+        if spec in seen:
+            continue
+        seen.add(spec)
+        specs.append(spec)
+    return specs
+
+
+def agent_bridge_development_plugin_settings(
+    launch_cmd: str | None,
+    channels_csv: str | None = None,
+) -> dict[str, Any]:
     # Issue #1212: previously this filter required every plugin spec to
     # end with `@agent-bridge`, which silently dropped every third-party
     # marketplace plugin (e.g. `plugin:cosmax-crm@cosmax-crm-marketplace`)
@@ -112,51 +253,30 @@ def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str
     # plugin stays in `enabledPlugins` (Claude's dev-channels argv still
     # loads the plugin from disk; we just decline to materialize a
     # marketplace identity for it).
-    if not launch_cmd:
-        return {}
-    try:
-        tokens = shlex.split(launch_cmd)
-    except ValueError:
-        tokens = launch_cmd.split()
-
-    plugin_specs: list[str] = []
-    seen: set[str] = set()
-    marketplace_ids: list[str] = []
-    marketplace_seen: set[str] = set()
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        value = ""
-        if token == "--dangerously-load-development-channels" and index + 1 < len(tokens):
-            value = tokens[index + 1]
-            index += 2
-        elif token.startswith("--dangerously-load-development-channels="):
-            value = token.split("=", 1)[1]
-            index += 1
-        else:
-            index += 1
-            continue
-        # Accept only `plugin:<spec>` where spec contains `@` and both
-        # sides are non-empty. `rsplit("@", 1)` so the marketplace id is
-        # always the rightmost segment (defensive against a plugin name
-        # that itself contains `@`, even though current naming forbids
-        # it).
-        if not value.startswith("plugin:") or "@" not in value:
-            continue
-        spec = value[len("plugin:") :]
-        plugin_name, _sep, marketplace_id = spec.rpartition("@")
-        if not plugin_name or not marketplace_id:
-            continue
-        if spec in seen:
-            continue
-        seen.add(spec)
-        plugin_specs.append(spec)
-        if marketplace_id not in marketplace_seen:
-            marketplace_seen.add(marketplace_id)
-            marketplace_ids.append(marketplace_id)
-
+    # Issue #1453: resolve the agent's effective channel plugin set through
+    # the shared `effective_channel_plugin_specs` helper, which unions the
+    # launch command's inline channel flags (`--channels` alias + the
+    # internal dev-channels flag) with the agent's resolved channels CSV
+    # (`--channels-csv`, sourced from BRIDGE_AGENT_CHANNELS — the SSOT). The
+    # CSV is essential: the bridge composes the `--channels` launch flag from
+    # BRIDGE_AGENT_CHANNELS at launch time, so the stored launch command the
+    # renderer is fed (`bridge_agent_launch_cmd_raw`) does NOT carry it for
+    # normally-created channel agents. A single resolver keeps this managed-
+    # default path and the renderers' sticky-false repair from ever diverging
+    # on which channels count. `spec` here is the `<plugin>@<marketplace>`
+    # form (leading `plugin:` already stripped); the marketplace id is the
+    # rightmost `@` segment, defensive against a plugin name that itself
+    # contains `@`.
+    plugin_specs = effective_channel_plugin_specs(launch_cmd, channels_csv)
     if not plugin_specs:
         return {}
+    marketplace_ids: list[str] = []
+    marketplace_seen: set[str] = set()
+    for spec in plugin_specs:
+        _plugin_name, _sep, marketplace_id = spec.rpartition("@")
+        if marketplace_id and marketplace_id not in marketplace_seen:
+            marketplace_seen.add(marketplace_id)
+            marketplace_ids.append(marketplace_id)
 
     bridge_home = os.environ.get("BRIDGE_HOME", "").strip()
     if not bridge_home:
@@ -209,6 +329,7 @@ def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str
 def managed_claude_settings_defaults(
     launch_cmd: str | None,
     agent_class: str | None = None,
+    channels_csv: str | None = None,
 ) -> dict[str, Any]:
     # `promptSuggestionEnabled: False` disables Claude Code's inline
     # composer ghost text (the dimmed "Try asking …" suggestion that
@@ -246,7 +367,7 @@ def managed_claude_settings_defaults(
     # `managed < base < overlay < preserved` merge order.
     if launch_cmd and "--dangerously-skip-permissions" in launch_cmd:
         defaults["skipDangerousModePermissionPrompt"] = True
-    plugin_settings = agent_bridge_development_plugin_settings(launch_cmd)
+    plugin_settings = agent_bridge_development_plugin_settings(launch_cmd, channels_csv)
     if plugin_settings:
         defaults = merge_settings(defaults, plugin_settings)
     return defaults
@@ -1439,6 +1560,68 @@ def _load_preserved_user_keys(effective_path: Path) -> dict[str, Any]:
     return {k: existing[k] for k in PRESERVED_USER_KEYS if k in existing}
 
 
+def _repair_sticky_false_channel_enables(
+    merged: dict[str, Any],
+    launch_cmd: str | None,
+    context: str,
+    channels_csv: str | None = None,
+) -> list[str]:
+    """Force `enabledPlugins[<spec>] = True` for every launched channel plugin
+    whose preserved value left it disabled (#1453, fix B).
+
+    `enabledPlugins` is a preserved-user key merged *last*, so once Claude
+    Code's own plugin runtime records `<channel>: false` into the effective
+    file, every subsequent render re-preserves that `false` and the managed
+    `true` from `agent_bridge_development_plugin_settings` can never win.
+    A disabled channel plugin means Claude Code does not wire up its inbound
+    MCP notification handler, so inbound channel messages are silently
+    dropped (outbound, which goes through the `--channels` launch path,
+    keeps working — the asymmetric symptom).
+
+    The launched channel set is resolved via `effective_channel_plugin_specs`
+    — the union of the launch command's inline channel flags and the agent's
+    resolved channels CSV (`channels_csv`, from BRIDGE_AGENT_CHANNELS). The
+    CSV is essential: normally-created channel agents store a launch command
+    WITHOUT `--channels` (the bridge composes it at launch from the roster),
+    so the CSV is the only signal the renderer has for which channels the
+    agent actually runs.
+
+    The fix asserts the bridge's authority for plugins that are part of the
+    agent's launched channel set: for those specs the managed `true` is
+    authoritative and overrides a preserved/recorded `false` (or absence).
+    Operator enable/disable is still preserved for every plugin that is NOT
+    in the launched channel set, so the legitimate "disable a non-launched
+    plugin" case is untouched.
+
+    Mutates `merged` in place. Returns the sorted list of spec names whose
+    `false` was corrected so the caller can emit a loud `[warn]` (a stale
+    sticky-false is a real misconfiguration that previously failed silently).
+    """
+    specs = effective_channel_plugin_specs(launch_cmd, channels_csv)
+    if not specs:
+        return []
+    enabled = merged.get("enabledPlugins")
+    if not isinstance(enabled, dict):
+        enabled = {}
+        merged["enabledPlugins"] = enabled
+    corrected: list[str] = []
+    for spec in specs:
+        if enabled.get(spec) is not True:
+            if enabled.get(spec) is False:
+                corrected.append(spec)
+            enabled[spec] = True
+    if corrected:
+        sys.stderr.write(
+            "[warn] bridge-hooks: forced enabledPlugins["
+            f"{', '.join(sorted(corrected))}]=true in {context} — the "
+            "launched channel plugin(s) were recorded disabled, which "
+            "silently drops inbound channel delivery (#1453 sticky-false). "
+            "Managed channel enables are authoritative for launched "
+            "plugins.\n"
+        )
+    return sorted(corrected)
+
+
 def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     base_path = Path(args.base_settings_file).expanduser()
     overlay_path = Path(args.overlay_settings_file).expanduser()
@@ -1453,7 +1636,12 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
 
     launch_cmd = (getattr(args, "launch_cmd", "") or "") or None
     agent_class = (getattr(args, "agent_class", "") or "") or None
-    managed_defaults = managed_claude_settings_defaults(launch_cmd, agent_class)
+    # #1453: the agent's resolved channels CSV (from BRIDGE_AGENT_CHANNELS,
+    # the SSOT — bridge_agent_channels_csv). Required because the stored
+    # launch command does NOT carry the `--channels` flag for
+    # normally-created channel agents (the bridge composes it at launch).
+    channels_csv = (getattr(args, "channels_csv", "") or "") or None
+    managed_defaults = managed_claude_settings_defaults(launch_cmd, agent_class, channels_csv)
     # Compose: managed defaults < base < overlay < preserved user keys.
     # Preserved keys merge last so per-agent edits to the effective file
     # (e.g. operator-disabled plugins) survive every rerender. See
@@ -1469,6 +1657,13 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     # on this rerender — merge_settings preserves it otherwise — and a
     # fresh render never ships a key Claude Code would reject.
     _warn_dropped_hook_keys(_prune_invalid_hook_keys(merged), str(effective_path))
+    # #1453: the preserved-key merge above lets a stale
+    # `enabledPlugins[<channel>]=false` (recorded by Claude Code's plugin
+    # runtime) override the managed `true`, silently killing inbound channel
+    # delivery. Re-assert the bridge's authority over launched-channel
+    # plugins *after* the preserved merge so the sticky-false is repaired on
+    # this rerender instead of being carried forward forever.
+    _repair_sticky_false_channel_enables(merged, launch_cmd, str(effective_path), channels_csv)
     save_json(effective_path, merged)
 
     # #1175: report-only `overlay_present` probe routes through the
@@ -1518,6 +1713,10 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     overlay_path = Path(args.overlay_settings_file).expanduser()
     launch_cmd = (getattr(args, "launch_cmd", "") or "") or None
     agent_class = (getattr(args, "agent_class", "") or "") or None
+    # #1453: agent's resolved channels CSV (BRIDGE_AGENT_CHANNELS SSOT). See
+    # the shared renderer for why the stored launch command alone is
+    # insufficient.
+    channels_csv = (getattr(args, "channels_csv", "") or "") or None
 
     target_dir = isolated_home / ".claude"
     target_dir.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — render flow runs sudo-backed externally when the isolated home denies controller writes
@@ -1583,7 +1782,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     if not isinstance(overlay_payload, dict):
         raise SystemExit(f"isolated overlay must be a JSON object: {overlay_path}")
 
-    managed_defaults = managed_claude_settings_defaults(launch_cmd, agent_class)
+    managed_defaults = managed_claude_settings_defaults(launch_cmd, agent_class, channels_csv)
     merged = merge_settings(managed_defaults, base_payload)
     merged = merge_settings(merged, overlay_payload)
     if preserved:
@@ -1595,6 +1794,10 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # otherwise — and a fresh render never ships a key Claude Code would
     # reject (which would skip the WHOLE settings file → plugins/MCP off).
     _warn_dropped_hook_keys(_prune_invalid_hook_keys(merged), str(effective_path))
+    # #1453: re-assert managed channel-plugin enables over a preserved
+    # sticky-false (same trap as the shared renderer above) so an isolated
+    # channel agent's inbound delivery is not silently dropped.
+    _repair_sticky_false_channel_enables(merged, launch_cmd, str(effective_path), channels_csv)
 
     # 3. Atomic write of the effective file (mode 0644 so the isolated UID
     # can read it; ownership stays with whoever invoked us — controller
@@ -2474,12 +2677,17 @@ def build_parser() -> argparse.ArgumentParser:
     render_shared_parser.add_argument(
         "--launch-cmd",
         default="",
-        help="Accepted for backwards compatibility; no longer consulted (issue #570 — managed autoCompactWindow default keys off --agent-class instead).",
+        help="The agent launch command. No longer drives the autoCompactWindow default (issue #570 — that keys off --agent-class), but IS parsed for the launched channel plugin set (--channels / --dangerously-load-development-channels) so managed defaults assert those plugins as enabled and a stale enabledPlugins=false is repaired (#1212, #1453).",
     )
     render_shared_parser.add_argument(
         "--agent-class",
         default="",
         help="static|dynamic — drives the autoCompactWindow default (issue #593: static=400_000, dynamic=1_000_000, unknown=1_000_000).",
+    )
+    render_shared_parser.add_argument(
+        "--channels-csv",
+        default="",
+        help="The agent's resolved channels CSV (bridge_agent_channels_csv, from BRIDGE_AGENT_CHANNELS — the SSOT). Required so the renderer knows the launched channel plugin set for normally-created channel agents, whose stored launch command does NOT carry the --channels flag (the bridge composes it at launch). Managed defaults assert these plugins enabled and a stale enabledPlugins=false is repaired (#1453).",
     )
     render_shared_parser.add_argument("--format", choices=("text", "shell"), default="text")
     render_shared_parser.set_defaults(handler=cmd_render_shared_settings)
@@ -2496,12 +2704,17 @@ def build_parser() -> argparse.ArgumentParser:
     render_isolated_parser.add_argument(
         "--launch-cmd",
         default="",
-        help="Accepted for backwards compatibility; no longer consulted (issue #570 — managed autoCompactWindow default keys off --agent-class instead).",
+        help="The agent launch command. No longer drives the autoCompactWindow default (issue #570 — that keys off --agent-class), but IS parsed for the launched channel plugin set (--channels / --dangerously-load-development-channels) so managed defaults assert those plugins as enabled and a stale enabledPlugins=false is repaired (#1212, #1453).",
     )
     render_isolated_parser.add_argument(
         "--agent-class",
         default="",
         help="static|dynamic — drives the autoCompactWindow default (issue #593: static=400_000, dynamic=1_000_000, unknown=1_000_000).",
+    )
+    render_isolated_parser.add_argument(
+        "--channels-csv",
+        default="",
+        help="The agent's resolved channels CSV (bridge_agent_channels_csv, from BRIDGE_AGENT_CHANNELS — the SSOT). Required so the renderer knows the launched channel plugin set for normally-created channel agents, whose stored launch command does NOT carry the --channels flag (the bridge composes it at launch). Managed defaults assert these plugins enabled and a stale enabledPlugins=false is repaired (#1453).",
     )
     render_isolated_parser.add_argument("--format", choices=("text", "shell"), default="text")
     render_isolated_parser.set_defaults(handler=cmd_render_isolated_home_settings)
