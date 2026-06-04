@@ -1188,6 +1188,47 @@ bridge_linux_sudo_root() {
   sudo -n "$@"
 }
 
+# Non-fatal sibling of `bridge_linux_sudo_root` for best-effort /
+# controller-owned-tree / absent-file-probe sites. Identical escalation
+# logic — direct call off Linux, direct call as root, `sudo -n` as a
+# non-root Linux caller — EXCEPT that when `sudo` is absent it falls
+# through to a direct invocation as the controller user instead of
+# `bridge_die`ing. Issue #1400.
+#
+# Why a separate helper instead of softening `bridge_linux_sudo_root`:
+# the fatal variant guards genuinely-privileged operations (`useradd`,
+# `chown root:root`, the manifest writers) that MUST fail loud when
+# escalation is impossible — a silent direct fallback there would write
+# the wrong ownership. This degrade-to-direct path is for sites where
+# escalation is both impossible AND unnecessary: a shared-mode agent's
+# home is controller-owned, so a plain `rm` succeeds, and an absent-file
+# probe (`test -f`) needs no privilege. On a real isolated install with
+# sudoers provisioned, this helper still escalates via sudo exactly as
+# the fatal variant does — the direct fallback only engages on a
+# sudo-less host (e.g. a minimal container), where it would otherwise
+# `exit 1` mid-`|| bridge_warn` and abort the surrounding subcommand.
+bridge_linux_sudo_root_best_effort() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    "$@"
+    return $?
+  fi
+
+  if [[ "$(id -u)" == "0" ]]; then
+    "$@"
+    return $?
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    sudo -n "$@"
+    return $?
+  fi
+
+  # sudo absent: degrade to a direct invocation as the controller user.
+  # Callers route only sites here where the controller already owns the
+  # target (or is merely probing), so a non-escalated call is correct.
+  "$@"
+}
+
 bridge_linux_can_sudo_to() {
   local os_user="$1"
 
@@ -9135,9 +9176,18 @@ _bridge_claude_plugin_bridge_manifest_has_spec() {
     user_home="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || printf '')"
     if [[ -n "$user_home" ]]; then
       iso_manifest="$user_home/.claude/plugins/installed_plugins.json"  # noqa: iso-helper-boundary
-      if bridge_linux_sudo_root test -f "$iso_manifest" 2>/dev/null; then
+      # Issue #1400: probe + read via the non-fatal sibling. The fatal
+      # `bridge_linux_sudo_root` `bridge_die`s "requires sudo" on a
+      # sudo-less host, and because that `exit 1` fires inside this
+      # function's command substitution at the caller
+      # (`bridge_manifest_has_spec="$(_bridge_..._has_spec ...)"`), the
+      # subshell dies before printing — so the documented step-2
+      # ab-shared shared-cache fallback below is never reached and the
+      # check fails closed. Degrading to a direct probe/read lets a
+      # sudo-less controller fall through to that shared-cache fallback.
+      if bridge_linux_sudo_root_best_effort test -f "$iso_manifest" 2>/dev/null; then
         bridge_require_python
-        result="$(bridge_linux_sudo_root python3 \
+        result="$(bridge_linux_sudo_root_best_effort python3 \
           "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/claude-plugin-manifest-has-spec.py" \
           "$iso_manifest" "$plugin_spec" 2>/dev/null || printf 'absent')"
         if [[ "$result" == "present" ]]; then

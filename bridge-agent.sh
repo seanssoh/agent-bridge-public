@@ -5975,8 +5975,18 @@ PY
     case "$home_dir" in
       "$BRIDGE_AGENT_HOME_ROOT"/*|"${BRIDGE_AGENT_ROOT_V2:-/dev/null}"/*)
         if [[ -d "$home_dir" ]]; then
-          if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
-            bridge_linux_sudo_root rm -rf -- "$home_dir" || \
+          # Issue #1400: route through the non-fatal best-effort helper.
+          # The prior `command -v bridge_linux_sudo_root` guard was always
+          # true (the helper is sourced unconditionally), so the direct-rm
+          # `else` was dead and a shared-mode delete on a sudo-less Linux
+          # host hit the fatal `bridge_die "requires sudo"` before
+          # `|| bridge_warn` could catch it. A shared-mode home is
+          # controller-owned, so the degrade-to-direct rm succeeds; on a
+          # real isolated install the helper still escalates via sudo. The
+          # `command -v` guard keeps a plain-rm fallback for any context
+          # that runs this without lib/bridge-agents.sh sourced.
+          if command -v bridge_linux_sudo_root_best_effort >/dev/null 2>&1; then
+            bridge_linux_sudo_root_best_effort rm -rf -- "$home_dir" || \
               bridge_warn "agent delete: --purge-home best-effort rm failed: $home_dir"
           else
             rm -rf -- "$home_dir" || \
@@ -6004,8 +6014,10 @@ PY
         # Sibling workdir under the per-agent root.
         local v2_workdir="$v2_agent_root/workdir"
         if [[ -d "$v2_workdir" ]]; then
-          if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
-            bridge_linux_sudo_root rm -rf -- "$v2_workdir" || \
+          # Issue #1400: degrade-to-direct on a sudo-less host (see the
+          # home_dir site above for the full rationale).
+          if command -v bridge_linux_sudo_root_best_effort >/dev/null 2>&1; then
+            bridge_linux_sudo_root_best_effort rm -rf -- "$v2_workdir" || \
               bridge_warn "agent delete: --purge-home best-effort rm failed: $v2_workdir"
           else
             rm -rf -- "$v2_workdir" || \
@@ -6013,10 +6025,12 @@ PY
           fi
         fi
         # The per-agent root parent — root-owned 2750 on isolated installs.
-        # Rm it last so its children are gone first. Use sudo when the
-        # controller cannot rm directly (isolated parent ownership).
-        if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
-          bridge_linux_sudo_root rm -rf -- "$v2_agent_root" || \
+        # Rm it last so its children are gone first. Issue #1400: best-effort
+        # helper escalates via sudo on a provisioned isolated install and
+        # degrades to direct rm when sudo is absent (shared-mode roots are
+        # controller-owned, so the direct rm succeeds).
+        if command -v bridge_linux_sudo_root_best_effort >/dev/null 2>&1; then
+          bridge_linux_sudo_root_best_effort rm -rf -- "$v2_agent_root" || \
             bridge_warn "agent delete: --purge-home best-effort rm failed: $v2_agent_root"
         else
           rm -rf -- "$v2_agent_root" || \
@@ -6043,8 +6057,10 @@ PY
     if [[ -n "$profile_src" ]] && [[ -d "$profile_src" ]]; then
       case "$profile_src" in
         "${BRIDGE_AGENT_HOME_ROOT:-/dev/null}"/*)
-          if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
-            bridge_linux_sudo_root rm -rf -- "$profile_src" || \
+          # Issue #1400: degrade-to-direct on a sudo-less host (see the
+          # home_dir site above for the full rationale).
+          if command -v bridge_linux_sudo_root_best_effort >/dev/null 2>&1; then
+            bridge_linux_sudo_root_best_effort rm -rf -- "$profile_src" || \
               bridge_warn "agent delete: --purge-home best-effort rm failed: $profile_src"
           else
             rm -rf -- "$profile_src" || \
@@ -6073,9 +6089,11 @@ PY
     #  - Refuse anything that doesn't match `^/home/agent-bridge-<slug>$`.
     #    This blocks operator home, /, /root, /tmp, /var/lib/..., etc.,
     #    even if a misconfigured passwd entry pointed there.
-    #  - Use bridge_linux_sudo_root because the tree is owned by the
-    #    isolated UID (and dotfiles inside it are often root-owned via
-    #    upgrade-time fixups), so the controller alone cannot rm it.
+    #  - Use bridge_linux_sudo_root_best_effort because the tree is owned
+    #    by the isolated UID (and dotfiles inside it are often root-owned
+    #    via upgrade-time fixups), so the controller alone cannot rm it;
+    #    the best-effort variant degrades to a (failing, warn-only) direct
+    #    rm on a sudo-less host instead of fatally `die`ing (#1400).
     #  - Failures warn-only; the agent is already removed from the
     #    roster, so an unreachable home is operator-followup, not a
     #    fail-loud condition.
@@ -6092,7 +6110,15 @@ PY
         if [[ -n "$linux_home" && "$linux_home" =~ ^/home/agent-bridge-[a-zA-Z0-9_-]+$ ]]; then
           if [[ -d "$linux_home" ]]; then
             bridge_warn "agent delete: --purge-home also removing isolated Linux home: $linux_home"
-            bridge_linux_sudo_root rm -rf -- "$linux_home" || \
+            # Issue #1400: best-effort helper. This site only runs for a
+            # genuinely-isolated agent (gated on
+            # bridge_agent_linux_user_isolation_effective above), so on a
+            # provisioned host it still escalates via sudo. On a sudo-less
+            # host the iso-UID-owned home is not controller-removable, so
+            # the degraded direct rm fails and warns (operator follow-up) —
+            # which is the intended best-effort behavior, not a fatal abort
+            # that would also strand the rest of the cleanup.
+            bridge_linux_sudo_root_best_effort rm -rf -- "$linux_home" || \
               bridge_warn "agent delete: --purge-home best-effort Linux home rm failed: $linux_home (operator manual cleanup may be required)"
           fi
         elif [[ -n "$linux_home" ]]; then
