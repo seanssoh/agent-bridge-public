@@ -25,8 +25,40 @@ Usage:
 EOF
 }
 
+# Fleet-credential Phase 1 (#1470): the `claude-token` CLI verb operates
+# on the Claude engine's credential registry. The engine is named
+# explicitly (rather than as a bare `claude` string literal scattered
+# through the selector/sync paths) so a later wave can add a parallel
+# verb for another engine by flipping this binding + the descriptor —
+# the dispatch shape below stays the same. Phase 1 keeps Claude behavior
+# byte-identical: this is `claude`, exactly as before.
+BRIDGE_AUTH_CLAUDE_ENGINE="claude"
+
 bridge_auth_registry_path() {
   printf '%s' "${BRIDGE_CLAUDE_TOKEN_REGISTRY:-$BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json}"
+}
+
+# bridge_auth_engine_cred_file_tail <agent> <engine>
+#
+# Resolve the home-relative credential-file tail for an engine via the
+# descriptor seam, with a behavior-preserving Claude fallback so the
+# auth path keeps working even if the descriptor is not sourced (e.g. an
+# isolated unit test that sources bridge-auth.sh directly). Phase 1 only
+# the Claude tail is consumed; the helper exists so the dest path is no
+# longer a Claude-hardcoded string in the sync writer.
+bridge_auth_engine_cred_file_tail() {
+  local agent="$1"
+  local engine="${2:-$BRIDGE_AUTH_CLAUDE_ENGINE}"
+  local tail=""
+  if declare -F bridge_engine_cred_dest_path >/dev/null 2>&1; then
+    tail="$(bridge_engine_cred_dest_path "$agent" "$engine" 2>/dev/null || true)"
+  fi
+  if [[ -z "$tail" ]]; then
+    # Descriptor unavailable / unknown engine — preserve the historical
+    # Claude tail so the Claude path is never broken by a missing seam.
+    tail=".claude/.credentials.json"
+  fi
+  printf '%s' "$tail"
 }
 
 bridge_auth_run_privileged() {
@@ -123,13 +155,18 @@ bridge_auth_verify_safe_claude_dir() {
 bridge_auth_claude_credentials_file_for_agent() {
   local agent="$1"
   local user_home=""
+  local cred_tail=""
   user_home="$(bridge_auth_resolved_user_home_for_agent "$agent")" || return 1
   [[ -n "$user_home" ]] || {
     printf '[error] cannot resolve user home for agent: %s\n' "$agent" >&2
     return 1
   }
   bridge_auth_verify_safe_claude_dir "$agent" "$user_home" || return 1
-  printf '%s/.claude/.credentials.json' "$user_home"
+  # Fleet-credential Phase 1 (#1470): resolve the dest tail through the
+  # engine-auth descriptor instead of a hardcoded `.claude/.credentials.json`.
+  # For the Claude engine this is byte-identical to the old literal.
+  cred_tail="$(bridge_auth_engine_cred_file_tail "$agent" "$BRIDGE_AUTH_CLAUDE_ENGINE")"
+  printf '%s/%s' "$user_home" "$cred_tail"
 }
 
 bridge_auth_prepare_credential_file() {
@@ -373,18 +410,23 @@ bridge_auth_selected_agents() {
   local agent=""
   local item=""
   local -a explicit=()
+  # Fleet-credential Phase 1 (#1470): the engine this `claude-token`
+  # registry syncs is named via the explicit binding rather than a bare
+  # `claude` literal so the selector is an engine-parameterized filter,
+  # not a Claude-hardcoded one. Phase 1 value == `claude`, byte-identical.
+  local engine="$BRIDGE_AUTH_CLAUDE_ENGINE"
 
   case "$spec" in
     static|"")
       for agent in "${BRIDGE_AGENT_IDS[@]}"; do
-        [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || continue
+        [[ "$(bridge_agent_engine "$agent")" == "$engine" ]] || continue
         [[ "$(bridge_agent_source "$agent")" == "static" ]] || continue
         printf '%s\n' "$agent"
       done
       ;;
     all|claude)
       for agent in "${BRIDGE_AGENT_IDS[@]}"; do
-        [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || continue
+        [[ "$(bridge_agent_engine "$agent")" == "$engine" ]] || continue
         printf '%s\n' "$agent"
       done
       ;;
@@ -398,7 +440,7 @@ bridge_auth_selected_agents() {
           printf '[error] unknown agent: %s\n' "$item" >&2
           return 1
         }
-        [[ "$(bridge_agent_engine "$item")" == "claude" ]] || {
+        [[ "$(bridge_agent_engine "$item")" == "$engine" ]] || {
           printf '[error] agent is not a Claude agent: %s\n' "$item" >&2
           return 1
         }

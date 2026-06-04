@@ -166,3 +166,146 @@ bridge_engine_materialization_target() {
   fi
   return 1
 }
+
+# ─────────────────────────────────────────────────────────────────────
+# Fleet-credential auth seam (L0 → L1, #1470 Phase 1)
+#
+# These accessors are the engine-auth descriptor: the single source for
+# per-engine branching of credential operations so `bridge-auth.sh` /
+# `bridge-auth.py` dispatch BY ENGINE instead of hardcoding Claude.
+#
+# Phase 1 is a behavior-preserving refactor — every Claude value below
+# is exactly what the auth stack already hardcodes today (the
+# `claudeAiOauth` payload key, the `claude-oauth-tokens.json` registry,
+# the `.claude/.credentials.json` dest, the native-oauth usage probe,
+# rotation-supported). Codex/Gemini get descriptor slots only; the
+# adapters that fill them (`register`/`sync`/`verify` for Codex) are
+# Phase 2. Any engine that is not credential-managed answers
+# `auth_supported = no` so callers degrade cleanly rather than error.
+#
+# The accessors are pure case-tables (no external deps) so they can be
+# sourced and called from a bare subshell exactly like the layout/hook
+# accessors above. They never touch the network or the filesystem.
+
+# bridge_engine_auth_supported <engine>
+#
+# Whether the bridge centrally manages this engine's credential. claude
+# (rotating OAT pool + controller-fallback) and codex (single-source
+# auth.json fleet-sync, Phase 2) are managed; antigravity has no stable
+# auth contract yet (deferred). Returns 0 (supported) / 1 (unsupported
+# or unknown engine).
+bridge_engine_auth_supported() {
+  case "${1:-}" in
+    claude|codex) return 0 ;;
+    antigravity) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# bridge_engine_auth_model <engine>
+#
+# The credential-management model for the engine, on stdout:
+#   claude       → rotating-pool      (multi-token registry, one active)
+#   codex        → single-source-sync (one source auth.json fanned out)
+#   antigravity  → none
+# Returns 1 for unknown engines (prints nothing).
+bridge_engine_auth_model() {
+  case "${1:-}" in
+    claude) printf 'rotating-pool' ;;
+    codex) printf 'single-source-sync' ;;
+    antigravity) printf 'none' ;;
+    *) return 1 ;;
+  esac
+}
+
+# bridge_engine_cred_dest_path <agent> <engine>
+#
+# The per-agent path the engine runtime reads its credential from,
+# relative to the agent's home:
+#   claude → <agent_home>/.claude/.credentials.json
+#   codex  → <agent_home>/.codex/auth.json
+# antigravity has no managed dest (returns 1).
+#
+# This is the *home-relative tail*; the auth stack resolves the agent's
+# real (iso-aware) home separately via
+# `bridge_auth_resolved_user_home_for_agent`. Keeping the tail in the
+# descriptor means a future engine layout change lands here, not inline
+# in the sync writer.
+bridge_engine_cred_dest_path() {
+  local agent="$1"
+  local engine="$2"
+  [[ -n "$agent" && -n "$engine" ]] || return 1
+  case "$engine" in
+    claude) printf '.claude/.credentials.json' ;;
+    codex) printf '.codex/auth.json' ;;
+    *) return 1 ;;
+  esac
+}
+
+# bridge_engine_cred_source <engine>
+#
+# Where the credential to fan out comes from, on stdout:
+#   claude → registry            (the claude-oauth-tokens.json pool, with
+#                                 controller-credentials fallback)
+#   codex  → agent-source        (a designated source agent's auth.json;
+#                                 the concrete binding is Phase 2 config,
+#                                 NOT hardcoded here — Q1 resolution)
+#   antigravity → none
+# Returns 1 for unknown engines.
+bridge_engine_cred_source() {
+  case "${1:-}" in
+    claude) printf 'registry' ;;
+    codex) printf 'agent-source' ;;
+    antigravity) printf 'none' ;;
+    *) return 1 ;;
+  esac
+}
+
+# bridge_engine_supports_rotation <engine>
+#
+# Whether the engine supports multi-credential rotation/failover.
+# claude:yes (the OAT pool). codex:no (single subscription login the
+# binary self-refreshes — `rotate`/`recover`/`activate` are clean
+# no-ops on the Codex adapter). antigravity:no. Returns 0/1.
+bridge_engine_supports_rotation() {
+  case "${1:-}" in
+    claude) return 0 ;;
+    codex|antigravity) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# bridge_engine_usage_source <engine>
+#
+# The usage/quota signal source the rotation policy keys on, on stdout:
+#   claude → native-oauth-probe  (#1437/#1468 GET + 429 positive signal)
+#   codex  → codex-snapshots     (observe-only; not actionable — there
+#                                 is no rotation to drive)
+#   antigravity → none
+# Returns 1 for unknown engines.
+bridge_engine_usage_source() {
+  case "${1:-}" in
+    claude) printf 'native-oauth-probe' ;;
+    codex) printf 'codex-snapshots' ;;
+    antigravity) printf 'none' ;;
+    *) return 1 ;;
+  esac
+}
+
+# bridge_engine_cred_payload_key <engine>
+#
+# The JSON object key the engine's credential file is keyed under, on
+# stdout. For claude this is `claudeAiOauth` — the key that today lives
+# inline in `claude_oauth_credentials_payload` / the controller-fallback
+# read in bridge-auth.py. For codex the credential file is an
+# opaque-copy (whole-file write-through, no key extraction) so this
+# returns empty with rc=0 to signal "no payload key — copy verbatim".
+# antigravity returns 1 (no managed credential).
+bridge_engine_cred_payload_key() {
+  case "${1:-}" in
+    claude) printf 'claudeAiOauth' ;;
+    codex) printf '' ;;
+    antigravity) return 1 ;;
+    *) return 1 ;;
+  esac
+}

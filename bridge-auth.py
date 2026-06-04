@@ -26,6 +26,77 @@ from typing import Any, Iterator
 
 REGISTRY_VERSION = 1
 TOKEN_ENV_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
+# ─────────────────────────────────────────────────────────────────────
+# Fleet-credential engine-auth seam (L0 → L1, #1470 Phase 1).
+#
+# The Python side of the engine-auth descriptor. The bash descriptor
+# (lib/bridge-engine-descriptor.sh) owns the same table for shell
+# callers; this mirror lets bridge-auth.py dispatch credential
+# operations BY ENGINE instead of hardcoding Claude.
+#
+# Phase 1 is behavior-preserving: `claude` resolves to exactly what the
+# auth stack already hardcodes (the `claudeAiOauth` payload key, the
+# `.claude/.credentials.json` dest, rotating-pool model). Codex is a
+# descriptor slot only — the adapter that fills `register`/`sync`/
+# `verify` is Phase 2. Any engine that is not credential-managed answers
+# `auth_supported = False` so callers degrade cleanly.
+#
+# `ENGINE_AUTH_DESCRIPTOR` is the single table. Keeping it data (not
+# scattered conditionals) is the whole point of the seam — Phase 2 adds
+# one row, no new branches in the sync writer.
+DEFAULT_AUTH_ENGINE = "claude"
+CLAUDE_CRED_PAYLOAD_KEY = "claudeAiOauth"
+ENGINE_AUTH_DESCRIPTOR: dict[str, dict[str, Any]] = {
+    "claude": {
+        "auth_supported": True,
+        "auth_model": "rotating-pool",
+        "cred_dest_tail": ".claude/.credentials.json",
+        "cred_source": "registry",
+        "supports_rotation": True,
+        "usage_source": "native-oauth-probe",
+        # `None` payload key would mean opaque whole-file copy; Claude
+        # extracts/writes under this key.
+        "cred_payload_key": CLAUDE_CRED_PAYLOAD_KEY,
+    },
+    "codex": {
+        "auth_supported": True,
+        "auth_model": "single-source-sync",
+        "cred_dest_tail": ".codex/auth.json",
+        "cred_source": "agent-source",
+        "supports_rotation": False,
+        "usage_source": "codex-snapshots",
+        # Opaque copy — no key extraction. The adapter (Phase 2) writes
+        # the source auth.json verbatim through write_private_file_atomic.
+        "cred_payload_key": None,
+    },
+    "antigravity": {
+        "auth_supported": False,
+        "auth_model": "none",
+        "cred_dest_tail": None,
+        "cred_source": "none",
+        "supports_rotation": False,
+        "usage_source": "none",
+        "cred_payload_key": None,
+    },
+}
+
+
+def engine_auth_descriptor(engine: str) -> dict[str, Any]:
+    """Return the auth descriptor row for ``engine``.
+
+    Raises ``ValueError`` for an unknown engine so a caller can never
+    silently fall through to Claude behavior on a typo. The default
+    engine for the Claude-token path is resolved by the *caller*
+    (DEFAULT_AUTH_ENGINE), not by swallowing unknowns here.
+    """
+    row = ENGINE_AUTH_DESCRIPTOR.get(engine)
+    if row is None:
+        raise ValueError(f"unknown engine for auth descriptor: {engine!r}")
+    return row
+
+
+def engine_auth_supported(engine: str) -> bool:
+    return bool(engine_auth_descriptor(engine)["auth_supported"])
 TOKEN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # #1437 — single source of truth for the usage-limit/429 substrings. Used by
 # both ``classify_probe`` (the token-recovery probe) and the new
@@ -282,8 +353,13 @@ def validate_threshold(value: float) -> float:
 
 
 def claude_oauth_credentials_payload(token: str) -> dict[str, Any]:
+    # Fleet-credential Phase 1 (#1470): the payload key is sourced from
+    # the engine-auth descriptor instead of an inline literal. For Claude
+    # this resolves to `claudeAiOauth` — byte-identical to the prior
+    # hardcoded shape.
+    payload_key = engine_auth_descriptor(DEFAULT_AUTH_ENGINE)["cred_payload_key"]
     return {
-        "claudeAiOauth": {
+        payload_key: {
             "accessToken": token,
             "expiresAt": CLAUDE_OAUTH_EXPIRES_AT_MS,
             "scopes": CLAUDE_OAUTH_SCOPES,
@@ -1573,6 +1649,191 @@ def write_private_file_atomic(
                 pass
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Credential-generation state (Q4 groundwork, #1469 enabler, #1470 P1).
+#
+# A later #1469 set-scoped re-wake must answer "which agents were running
+# under the credential generation a rotation just vacated?" The queue /
+# daemon state record no such field today, so Phase 1 lays the schema +
+# a stamp-at-sync hook; it does NOT wire the full re-wake yet.
+#
+# The store is a single JSON document mapping agent → a small record:
+#   {
+#     "version": 1,
+#     "agents": {
+#       "<agent>": {
+#         "engine":        "claude",        # which engine descriptor row
+#         "source_digest": "<sha256-hex>",  # one-way digest of the synced
+#                                           #   credential material (NEVER
+#                                           #   the secret itself)
+#         "cred_generation": 7,             # monotone per-agent counter,
+#                                           #   bumps only when the digest
+#                                           #   changes (idempotent re-sync
+#                                           #   does NOT bump)
+#         "synced_at":      "<iso8601>"
+#       }
+#     }
+#   }
+#
+# Design constraints honored:
+#   * idempotent migration — load tolerates a missing / legacy / corrupt
+#     file by returning a fresh default; it never raises on read.
+#   * fail-closed write — the writer routes through
+#     ``write_private_file_atomic`` (0600, atomic replace, chown-before-
+#     replace) so a partial write can never leave a half-written or
+#     world-readable state file. A write failure propagates (caller
+#     decides), it is never silently swallowed.
+#   * one-way digest only — the recorded ``source_digest`` is a SHA-256
+#     of the credential material; the secret is never written to state.
+CRED_STATE_VERSION = 1
+
+
+def cred_state_path() -> Path:
+    """Resolve the per-agent credential-generation state file path.
+
+    Precedence mirrors the rest of the auth stack's state resolution:
+      1. ``$BRIDGE_AUTH_CRED_STATE_FILE`` (explicit override, tests).
+      2. ``$BRIDGE_STATE_DIR/auth/cred-state.json``.
+      3. ``$BRIDGE_HOME/state/auth/cred-state.json``.
+      4. ``./state/auth/cred-state.json`` (last-resort cwd-relative; only
+         reached when neither env var is set, e.g. a bare unit test).
+    """
+    explicit = os.environ.get("BRIDGE_AUTH_CRED_STATE_FILE", "").strip()  # noqa: iso-helper-boundary - controller cred-state override
+    if explicit:
+        return Path(explicit).expanduser()
+    state_dir = os.environ.get("BRIDGE_STATE_DIR", "").strip()  # noqa: iso-helper-boundary - controller state dir
+    if state_dir:
+        return Path(state_dir).expanduser() / "auth" / "cred-state.json"
+    bridge_home = os.environ.get("BRIDGE_HOME", "").strip()  # noqa: iso-helper-boundary - controller bridge home fallback
+    if bridge_home:
+        return Path(bridge_home).expanduser() / "state" / "auth" / "cred-state.json"
+    return Path("state") / "auth" / "cred-state.json"
+
+
+def default_cred_state() -> dict[str, Any]:
+    return {"version": CRED_STATE_VERSION, "agents": {}}
+
+
+def load_cred_state(path: Path) -> dict[str, Any]:
+    """Load the cred-state document, tolerating absence / corruption.
+
+    Idempotent migration: an unreadable, non-JSON, wrong-shape, or
+    legacy file degrades to a fresh default rather than raising. This is
+    the read side of the fail-closed contract — a corrupt state file must
+    never block a credential sync (the sync is the source of truth; the
+    state is a derived stamp).
+    """
+    if not path.exists():  # noqa: raw-pathlib-controller-only - controller cred-state probe
+        return default_cred_state()
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default_cred_state()
+    if not isinstance(parsed, dict):
+        return default_cred_state()
+    agents = parsed.get("agents")
+    if not isinstance(agents, dict):
+        agents = {}
+    # Normalize: drop any non-dict per-agent rows defensively so a later
+    # consumer can rely on the shape without re-validating each field.
+    normalized: dict[str, Any] = {}
+    for name, row in agents.items():
+        if isinstance(row, dict):
+            normalized[str(name)] = row
+    return {"version": CRED_STATE_VERSION, "agents": normalized}
+
+
+def save_cred_state(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+) -> None:
+    """Persist the cred-state document fail-closed (atomic, 0600).
+
+    Routes through ``write_private_file_atomic`` so the state file lands
+    at mode 0600 via an atomic ``os.replace`` (chown-before-replace when
+    an owner is supplied). A write error propagates — the stamp is
+    best-effort at the *call site* (see ``stamp_cred_generation``), but
+    the primitive itself never leaves a partial / world-readable file.
+    """
+    text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
+    write_private_file_atomic(
+        path,
+        text,
+        mode=0o600,
+        prefix=".cred-state.",
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
+
+
+def cred_source_digest(material: str) -> str:
+    """One-way digest of credential material for generation tracking.
+
+    SHA-256 hex — the same family as ``token_fingerprint`` but full-width
+    so two distinct credentials never collide on the truncated prefix.
+    The secret is NEVER recorded; only this digest is.
+    """
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def stamp_cred_generation(
+    agent: str,
+    engine: str,
+    source_material: str,
+    *,
+    state_path: Path | None = None,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Record the credential generation for ``agent`` at sync time.
+
+    Idempotent: the per-agent ``cred_generation`` counter bumps ONLY when
+    the ``source_digest`` changes. A re-sync of the same credential
+    leaves the generation untouched (so a no-op periodic sync does not
+    inflate the counter and spuriously look like a rotation to #1469).
+
+    Returns the per-agent record that was written (or the unchanged
+    existing one). Fail-closed at the boundary: a write failure raises so
+    the caller can decide — ``cmd_sync_agent`` treats the stamp as
+    best-effort and never lets a stamp failure abort an otherwise
+    successful credential sync.
+    """
+    path = state_path if state_path is not None else cred_state_path()
+    when = (now or now_utc()).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    digest = cred_source_digest(source_material)
+    state = load_cred_state(path)
+    agents = state["agents"]
+    existing = agents.get(agent)
+    prev_gen = 0
+    prev_digest = ""
+    if isinstance(existing, dict):
+        try:
+            prev_gen = int(existing.get("cred_generation", 0) or 0)
+        except (TypeError, ValueError):
+            prev_gen = 0
+        prev_digest = str(existing.get("source_digest", "") or "")
+    if prev_digest == digest and prev_gen > 0:
+        # Idempotent re-sync: digest unchanged → do not bump, do not
+        # rewrite. Refresh synced_at only would churn the file on every
+        # periodic tick; we keep the record stable so the digest is the
+        # sole rotation signal.
+        return existing if isinstance(existing, dict) else {}
+    generation = prev_gen + 1
+    record = {
+        "engine": engine,
+        "source_digest": digest,
+        "cred_generation": generation,
+        "synced_at": when,
+    }
+    agents[agent] = record
+    save_cred_state(path, state, owner_uid=owner_uid, owner_gid=owner_gid)
+    return record
+
+
 def ensure_claude_config_file(
     config_dir: Path,
     trusted_workdirs: list[str] | None = None,
@@ -1719,6 +1980,49 @@ def cmd_api_key_helper(args: argparse.Namespace) -> int:
 
 def cmd_sync_agent(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
+    # Fleet-credential Phase 1 (#1470): fail-closed engine gate. The body
+    # of cmd_sync_agent IS the Claude registry/controller-credentials
+    # write path. Phase 1 only supports `claude` through this command —
+    # Codex/Gemini are descriptor SLOTS, their `register`/`sync`/`verify`
+    # adapter is Phase 2. Reject any non-Claude `--engine` BEFORE touching
+    # the registry or writing a credential so a caller can never run the
+    # Claude write body for another engine (codex r1 BLOCKING). An unknown
+    # engine raises through engine_auth_descriptor; a known-but-non-Claude
+    # engine is refused here with an explicit "Phase 2" message.
+    #
+    # codex r2 BLOCKING: distinguish OMITTED from EXPLICITLY-EMPTY. The
+    # argparse default is None (NOT DEFAULT_AUTH_ENGINE), so:
+    #   --engine omitted entirely → args.engine is None → Claude (allowed).
+    #   --engine "" / "   "       → args.engine is a blank string → REJECT.
+    # Using `args.engine or DEFAULT_AUTH_ENGINE` would coerce the explicit
+    # empty string back to Claude (falsy `""` collapses to the default),
+    # which is exactly the cross-engine credential-misdelivery hole codex
+    # found: Phase 2 passing an empty engine var would write a Claude
+    # credential into the Codex dest. Treat None (omitted) as Claude;
+    # treat a provided-but-blank value as an explicit, refused engine.
+    raw_engine = getattr(args, "engine", None)
+    if raw_engine is None:
+        engine = DEFAULT_AUTH_ENGINE
+    else:
+        engine = raw_engine.strip()
+        if not engine:
+            return fail(
+                "sync-agent --engine was given an empty/whitespace value; "
+                "omit --engine for the default Claude credential sync or "
+                "pass an explicit engine name",
+                json_mode,
+            )
+    try:
+        engine_auth_descriptor(engine)  # raises ValueError on unknown engine
+    except ValueError as exc:
+        return fail(str(exc), json_mode)
+    if engine != DEFAULT_AUTH_ENGINE:
+        return fail(
+            f"sync-agent does not support engine {engine!r} in Phase 1 — "
+            f"only {DEFAULT_AUTH_ENGINE!r} credential sync is implemented "
+            "(the Codex adapter is Phase 2 of #1470)",
+            json_mode,
+        )
     # #1261 (v0.15.0-beta4): track the controller-credentials aliveness
     # so the JSON payload carries a structured signal. Daemon-side
     # callers (bridge-daemon.sh periodic sync tick) emit this into
@@ -1835,9 +2139,9 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
                 owner_gid=owner_gid,
                 allowed_root=allowed_root,
             )
-            fingerprint = token_fingerprint(
-                str(controller_payload["claudeAiOauth"]["accessToken"])
-            )
+            payload_key = engine_auth_descriptor(DEFAULT_AUTH_ENGINE)["cred_payload_key"]
+            synced_material = str(controller_payload[payload_key]["accessToken"])
+            fingerprint = token_fingerprint(synced_material)
         else:
             write_claude_credentials_file(
                 credential_file,
@@ -1846,6 +2150,7 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
                 owner_gid=owner_gid,
                 allowed_root=allowed_root,
             )
+            synced_material = token
             fingerprint = token_fingerprint(token)
         config_file = ensure_claude_config_file(
             credential_file.parent,
@@ -1862,6 +2167,33 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
         )
     except Exception as exc:
         return fail(str(exc), json_mode)
+    # Fleet-credential Phase 1 (#1470, Q4 groundwork): stamp the per-agent
+    # credential generation so a later #1469 set-scoped re-wake can target
+    # only agents running under a vacated generation. Best-effort — the
+    # credential sync above already succeeded and is the source of truth;
+    # a stamp failure (e.g. an unwritable state dir) must never turn a
+    # good sync into a reported failure. The bump is idempotent: a re-sync
+    # of the same credential leaves cred_generation unchanged. `engine` is
+    # the fail-closed-validated value resolved at the top of cmd_sync_agent
+    # (Phase 1: always `claude` here, since non-Claude engines were
+    # already refused before any write).
+    cred_generation = 0
+    cred_state_file = ""
+    try:
+        record = stamp_cred_generation(
+            args.agent,
+            engine,
+            synced_material,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+        cred_generation = int(record.get("cred_generation", 0) or 0)
+        cred_state_file = str(cred_state_path())
+    except Exception as exc:  # noqa: BLE001 - stamp is best-effort, never fatal
+        print(
+            f"warning: cred-generation stamp failed for {args.agent}: {exc}",
+            file=sys.stderr,
+        )
     payload = {
         "status": "synced",
         "agent": args.agent,
@@ -1879,6 +2211,14 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
         # populated for the controller_credentials fallback.
         "aliveness": aliveness,
         "remaining_ms": remaining_ms,
+        # Fleet-credential Phase 1 (#1470): the engine this sync ran for
+        # and the credential generation stamped at sync time. `engine` is
+        # `claude` on the existing path (byte-compatible additive field);
+        # `cred_generation` is 0 when the best-effort stamp could not be
+        # written.
+        "engine": engine,
+        "cred_generation": cred_generation,
+        "cred_state_file": cred_state_file,
     }
     if claude_keychain_free_auth_enabled():
         payload["api_key_helper"] = claude_api_key_helper_path()
@@ -1980,6 +2320,15 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser = sub.add_parser("sync-agent")
     sync_parser.add_argument("--agent", required=True)
     sync_parser.add_argument("--file", required=True)
+    # Fleet-credential Phase 1 (#1470): which engine descriptor row this
+    # sync runs for. The default is None (NOT DEFAULT_AUTH_ENGINE) so
+    # cmd_sync_agent's fail-closed gate can distinguish "--engine omitted"
+    # (→ Claude, every existing caller is byte-compatible) from "--engine
+    # given an empty string" (→ refused). codex r2 BLOCKING: a literal
+    # default of `claude` here combined with `args.engine or DEFAULT` in
+    # the gate let an explicit `--engine ""` collapse back to Claude.
+    # Phase 2's Codex adapter passes `--engine codex`.
+    sync_parser.add_argument("--engine", default=None)
     sync_parser.add_argument("--workdir", action="append", default=[])
     sync_parser.add_argument(
         "--owner-uid",
