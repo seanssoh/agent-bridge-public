@@ -93,6 +93,7 @@ RUN_SH="$REPO_ROOT/bridge-run.sh"
 EXTRACT="$SMOKE_TMP_ROOT/bridge-run-launch-fns.sh"
 awk '
   /^bridge_run_agent_claude_root\(\) \{/              { copy = 1 }
+  /^bridge_run_warn_once\(\) \{/                      { copy = 1 }
   /^bridge_run_ensure_shared_claude_credential\(\) \{/ { copy = 1 }
   /^bridge_run_shared_launch\(\) \{/                  { copy = 1 }
   copy { print }
@@ -103,6 +104,8 @@ grep -q '^bridge_run_shared_launch()' "$EXTRACT" \
   || smoke_fail "failed to extract bridge_run_shared_launch from bridge-run.sh"
 grep -q '^bridge_run_agent_claude_root()' "$EXTRACT" \
   || smoke_fail "failed to extract bridge_run_agent_claude_root from bridge-run.sh"
+grep -q '^bridge_run_warn_once()' "$EXTRACT" \
+  || smoke_fail "failed to extract bridge_run_warn_once from bridge-run.sh"
 grep -q '^bridge_run_ensure_shared_claude_credential()' "$EXTRACT" \
   || smoke_fail "failed to extract bridge_run_ensure_shared_claude_credential from bridge-run.sh"
 
@@ -121,12 +124,31 @@ declare -F bridge_run_shared_launch >/dev/null \
   || smoke_fail "bridge_run_shared_launch not defined after sourcing extract"
 declare -F bridge_run_agent_claude_root >/dev/null \
   || smoke_fail "bridge_run_agent_claude_root not defined after sourcing extract"
+declare -F bridge_run_warn_once >/dev/null \
+  || smoke_fail "bridge_run_warn_once not defined after sourcing extract"
 declare -F bridge_run_ensure_shared_claude_credential >/dev/null \
   || smoke_fail "bridge_run_ensure_shared_claude_credential not defined after sourcing extract"
 declare -F bridge_agent_claude_config_dir >/dev/null \
   || smoke_fail "bridge_agent_claude_config_dir not defined after sourcing bridge-lib.sh"
 declare -F bridge_reset_roster_maps >/dev/null \
   || smoke_fail "bridge_reset_roster_maps not defined"
+
+# The extracted bridge_run_warn_once uses a process-scoped associative array
+# (declared at bridge-run.sh script scope, not inside the extracted functions)
+# and log_line (a bridge-run.sh logger not present here). Provide both as the
+# test harness so the one-time-warning behavior is observable:
+#   - the sentinel array is what de-dupes the warn,
+#   - WARN_LOG captures every emitted warning so a tooth can count them.
+declare -A BRIDGE_RUN_DEGRADE_WARNED=()
+WARN_LOG="$SMOKE_TMP_ROOT/warn.log"
+: >"$WARN_LOG"
+log_line() { printf '%s\n' "$*" >>"$WARN_LOG"; }
+
+# Default the proven-keychain-free flag OFF — the preflight (not exercised
+# here) is the only thing that sets it to 1, and only after validating
+# settings/helper/registry on Darwin. Tests that need the proven state set it
+# explicitly via an env prefix (T7) so it never leaks across tests.
+BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0
 
 # Test seam for the credential seed (r2). bridge_run_ensure_shared_claude_-
 # credential seeds a missing per-agent credential by calling
@@ -373,6 +395,8 @@ test_shared_dynamic_seeds_then_exports() {
 # behavior the agent was previously relying on. Never strand it authless.
 test_degrade_when_seed_fails() {
   : >"$MARKER"
+  : >"$WARN_LOG"
+  BRIDGE_RUN_DEGRADE_WARNED=()
   register_agent "$DYN_AGENT" claude "$DYN_WORKDIR" dynamic
   AGENT="$DYN_AGENT"
   ENGINE="claude"
@@ -400,15 +424,20 @@ test_degrade_when_seed_fails() {
   launched_dir="$(cat "$MARKER" 2>/dev/null || true)"
   [[ -z "$launched_dir" || "$launched_dir" == "__UNSET__" ]] \
     || smoke_fail "T6 degrade: unseedable agent must NOT export CLAUDE_CONFIG_DIR (got '$launched_dir')"
+  # The degrade [warn] must have actually fired (with a working log_line) —
+  # the r2 smoke missed this (log_line was undefined so the warn was silent).
+  smoke_assert_eq "1" "$(grep -c '\[warn\]' "$WARN_LOG")" \
+    "T6 degrade emits the skip-export warning exactly once"
 
   unset SEED_TARGET_CRED
 }
 
-# T7 — keychain-free auth: the per-agent dir authenticates via the
-# apiKeyHelper wired into settings.json, so a missing `.credentials.json` is
-# expected and must NOT block the export (and must not attempt a token-sync
-# seed). The export is safe; the keychain-free preflight validated settings.
-test_keychain_free_exports_without_credential_file() {
+# T7 — PROVEN keychain-free auth (no regression): when the preflight has
+# positively validated keychain-free on this platform
+# (BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1), the per-agent dir
+# authenticates via the apiKeyHelper, so a missing `.credentials.json` is
+# expected and must NOT block the export OR trigger a token-sync seed.
+test_proven_keychain_free_exports_without_credential_file() {
   : >"$MARKER"
   register_agent "$CLAUDE_AGENT" claude "$CLAUDE_WORKDIR" static
   AGENT="$CLAUDE_AGENT"
@@ -418,16 +447,153 @@ test_keychain_free_exports_without_credential_file() {
   clear_agent_credential "$expected_dir"
 
   SEED_CALLED=0
-  BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
+  # The preflight sets this only after validating settings/helper/registry.
+  BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1 \
     bridge_run_shared_launch "$BASH" "$(probe_launch_cmd)" "$ERRFILE" \
-    || smoke_fail "T7 keychain-free launch returned non-zero"
+    || smoke_fail "T7 proven keychain-free launch returned non-zero"
 
   smoke_assert_eq "0" "$SEED_CALLED" \
-    "T7 keychain-free path does not attempt a credential seed"
+    "T7 proven keychain-free path does not attempt a credential seed"
   local launched_dir
   launched_dir="$(cat "$MARKER" 2>/dev/null || true)"
   smoke_assert_eq "$expected_dir" "$launched_dir" \
-    "T7 keychain-free exports CLAUDE_CONFIG_DIR despite no credential file"
+    "T7 proven keychain-free exports CLAUDE_CONFIG_DIR despite no credential file"
+}
+
+# T8 — TEETH for the r3 BLOCKING: keychain-free ENABLED but NOT proven
+# (non-Darwin / unvalidated — BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED unset
+# or 0) with no per-agent credential must NOT export the empty per-agent dir.
+# The guard must fall through to seed -> recheck -> skip-export, exactly the
+# auth-break the proof-gate closes. The enable flag is set (keychain-free is
+# "on") but the proof flag is NOT — the only thing standing between a correct
+# launch and an unauthenticated export is the proof-gate. Reverting the gate
+# (guard checking bridge_claude_keychain_free_auth_enabled again) makes this
+# bite: the empty dir would be exported.
+test_unproven_keychain_free_does_not_export_empty_dir() {
+  : >"$MARKER"
+  : >"$WARN_LOG"
+  BRIDGE_RUN_DEGRADE_WARNED=()
+  register_agent "$DYN_AGENT" claude "$DYN_WORKDIR" dynamic
+  AGENT="$DYN_AGENT"
+  ENGINE="claude"
+  local expected_dir
+  expected_dir="$(bridge_agent_claude_config_dir "$DYN_AGENT")"
+  clear_agent_credential "$expected_dir"
+
+  # keychain-free is ENABLED (env flag) but NOT proven, and the seed can't
+  # produce a credential — the proof-gate must force the skip-export degrade.
+  SEED_SHOULD_SUCCEED=0
+  SEED_CALLED=0
+  SEED_TARGET_CRED="$expected_dir/.credentials.json"
+  unset BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED
+  unset CLAUDE_CONFIG_DIR
+  BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
+    bridge_run_shared_launch "$BASH" "$(probe_launch_cmd)" "$ERRFILE" \
+    || smoke_fail "T8 unproven keychain-free launch returned non-zero"
+
+  smoke_assert_eq "1" "$SEED_CALLED" \
+    "T8 unproven keychain-free still attempts the seed (not the fast-path)"
+  local launched_dir
+  launched_dir="$(cat "$MARKER" 2>/dev/null || true)"
+  [[ -z "$launched_dir" || "$launched_dir" == "__UNSET__" ]] \
+    || smoke_fail "T8 unproven keychain-free must NOT export the empty per-agent dir (got '$launched_dir')"
+
+  unset SEED_TARGET_CRED BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH
+}
+
+# T9 — one-time degrade warning (r3 SHOULD-FIX): the relaunch loop re-enters
+# the skip-export path every iteration; the [warn] must fire exactly ONCE per
+# agent per process via the sentinel, while the export stays skipped EVERY
+# iteration. Simulate N relaunch iterations by calling the launch repeatedly
+# with the same persistently-unseedable agent. Reverting the sentinel (warn
+# unconditionally) makes this fail with N warnings.
+test_degrade_warning_is_one_time() {
+  : >"$WARN_LOG"
+  BRIDGE_RUN_DEGRADE_WARNED=()
+  register_agent "$DYN_AGENT" claude "$DYN_WORKDIR" dynamic
+  AGENT="$DYN_AGENT"
+  ENGINE="claude"
+  local expected_dir
+  expected_dir="$(bridge_agent_claude_config_dir "$DYN_AGENT")"
+
+  SEED_SHOULD_SUCCEED=0
+  SEED_TARGET_CRED="$expected_dir/.credentials.json"
+
+  local i skipped=0
+  for i in 1 2 3 4 5; do
+    : >"$MARKER"
+    clear_agent_credential "$expected_dir"
+    unset CLAUDE_CONFIG_DIR
+    bridge_run_shared_launch "$BASH" "$(probe_launch_cmd)" "$ERRFILE" \
+      || smoke_fail "T9 relaunch iteration $i returned non-zero"
+    local launched_dir
+    launched_dir="$(cat "$MARKER" 2>/dev/null || true)"
+    [[ -z "$launched_dir" || "$launched_dir" == "__UNSET__" ]] \
+      && skipped=$((skipped + 1))
+  done
+
+  smoke_assert_eq "5" "$skipped" \
+    "T9 export stays skipped on every one of the 5 relaunch iterations"
+  smoke_assert_eq "1" "$(grep -c '\[warn\]' "$WARN_LOG")" \
+    "T9 skip-export warning is emitted exactly once across 5 relaunches (sentinel)"
+
+  unset SEED_TARGET_CRED
+}
+
+# T10 — TEETH for the r3 inherited-spoof BLOCKING (codex r3): an INHERITED
+# BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1 must never be trusted as proof.
+# The preflight is the only legitimate writer, and --safe-mode skips the
+# preflight while still reaching bridge_run_shared_launch — so bridge-run.sh
+# scrubs the var to 0 at process entry (before the relaunch loop). This tooth
+# pins BOTH:
+#   (a) the structural scrub exists at process entry (before `while true`),
+#       so a refactor cannot silently drop it; and
+#   (b) the behavioral contract: after the process-entry scrub, an inherited
+#       spoof=1 is gone, the preflight did NOT run (safe-mode), there is no
+#       credential -> the guard does NOT fast-path and the empty per-agent dir
+#       is NOT exported.
+test_inherited_proven_spoof_is_scrubbed() {
+  # (a) structural: the scrub statement is present at process entry, ahead of
+  # the launch loop. Extract the pre-`while true` slice and grep it.
+  local preloop
+  preloop="$(awk '/^while true; do/{exit} {print}' "$RUN_SH")"
+  printf '%s\n' "$preloop" | grep -q '^BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0$' \
+    || smoke_fail "T10 process-entry scrub BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0 missing before the launch loop"
+
+  # (b) behavioral: model the safe-mode path — inherit a spoofed proven=1,
+  # apply the production scrub, do NOT run the preflight (safe-mode skips it),
+  # then launch with no credential. The scrub must have neutralized the spoof
+  # so the guard sees 0 and skips the export instead of exporting empty.
+  : >"$MARKER"
+  : >"$WARN_LOG"
+  BRIDGE_RUN_DEGRADE_WARNED=()
+  register_agent "$DYN_AGENT" claude "$DYN_WORKDIR" dynamic
+  AGENT="$DYN_AGENT"
+  ENGINE="claude"
+  local expected_dir
+  expected_dir="$(bridge_agent_claude_config_dir "$DYN_AGENT")"
+  clear_agent_credential "$expected_dir"
+  SEED_SHOULD_SUCCEED=0
+  SEED_CALLED=0
+  SEED_TARGET_CRED="$expected_dir/.credentials.json"
+
+  # Inherited spoof.
+  export BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1
+  # Production process-entry scrub (verbatim — the exact line asserted above).
+  BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0
+  unset CLAUDE_CONFIG_DIR
+  bridge_run_shared_launch "$BASH" "$(probe_launch_cmd)" "$ERRFILE" \
+    || smoke_fail "T10 spoofed-then-scrubbed launch returned non-zero"
+
+  smoke_assert_eq "1" "$SEED_CALLED" \
+    "T10 scrubbed spoof does not take the keychain-free fast-path (seed attempted)"
+  local launched_dir
+  launched_dir="$(cat "$MARKER" 2>/dev/null || true)"
+  [[ -z "$launched_dir" || "$launched_dir" == "__UNSET__" ]] \
+    || smoke_fail "T10 inherited proven-spoof must NOT export the empty per-agent dir after scrub (got '$launched_dir')"
+
+  unset SEED_TARGET_CRED BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED
+  BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0
 }
 
 smoke_run "T1 shared STATIC Claude launch exports per-agent CLAUDE_CONFIG_DIR" test_shared_claude_exports_config_dir
@@ -436,6 +602,9 @@ smoke_run "T3 codex shared launch sets no CLAUDE_CONFIG_DIR"                   t
 smoke_run "T4 launch resolver agrees with config-dir SSOT"                    test_resolver_agreement
 smoke_run "T5 shared DYNAMIC seeds credential then exports (auth not broken)"  test_shared_dynamic_seeds_then_exports
 smoke_run "T6 degrade: unseedable agent skips the export (no auth break)"      test_degrade_when_seed_fails
-smoke_run "T7 keychain-free exports without a credential file"                 test_keychain_free_exports_without_credential_file
+smoke_run "T7 proven keychain-free exports without a credential file"          test_proven_keychain_free_exports_without_credential_file
+smoke_run "T8 teeth: unproven keychain-free does NOT export empty per-agent dir" test_unproven_keychain_free_does_not_export_empty_dir
+smoke_run "T9 degrade warning is one-time across N relaunches (sentinel)"      test_degrade_warning_is_one_time
+smoke_run "T10 teeth: inherited proven-spoof is scrubbed at process entry"     test_inherited_proven_spoof_is_scrubbed
 
 smoke_log "all checks passed"

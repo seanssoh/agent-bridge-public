@@ -1055,6 +1055,17 @@ bridge_run_claude_keychain_free_preflight() {
   local registry_path=""
   local ttl_ms=""
 
+  # #1520 r3 (codex Phase-4 BLOCKING): a "proven keychain-free" signal for the
+  # shared-launch credential guard. Reset every call so a non-Darwin /
+  # unvalidated path leaves it 0; it is set to 1 ONLY after the full Darwin
+  # settings/helper/registry validation below passes. The guard then treats
+  # keychain-free as export-safe-without-credential ONLY when this is 1 —
+  # never on the enable flag alone (which is platform-blind env/config), so a
+  # non-Darwin agent where this function early-returns without validating
+  # falls through to seed/recheck/skip-export instead of exporting an empty
+  # per-agent dir.
+  BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0
+
   [[ "$ENGINE" == "claude" ]] || return 0
   [[ $SAFE_MODE -eq 0 ]] || return 0
   bridge_claude_keychain_free_auth_enabled || return 0
@@ -1096,6 +1107,12 @@ bridge_run_claude_keychain_free_preflight() {
     bridge_die "Claude keychain-free auth is enabled but no active registry OAT is available"
   fi
 
+  # #1520 r3: every keychain-free precondition validated on this platform
+  # (Darwin + executable apiKeyHelper + settings.json pointing at it + an
+  # active registry OAT). The apiKeyHelper supplies the token at launch, so a
+  # missing per-agent `.credentials.json` is expected and the shared-launch
+  # guard may export the per-agent CLAUDE_CONFIG_DIR without seeding one.
+  BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1
 }
 
 bridge_run_ensure_claude_launch_channel_plugins() {
@@ -1113,6 +1130,29 @@ bridge_run_ensure_claude_launch_channel_plugins() {
     export CLAUDE_CONFIG_DIR="$agent_claude_root"
     bridge_ensure_claude_launch_channel_plugins "$AGENT"
   )
+}
+
+# Per-process sentinel for the #1520 r3 one-time degrade warning. bridge-run.sh
+# is one long-lived process per agent relaunch loop, so a process-scoped
+# associative array keyed by agent id de-duplicates the skip-export warning
+# across every loop iteration without a guard file. (Not exported — exporting
+# an associative array silently breaks; see the BRIDGE_AGENT_ISOLATION_MODE
+# collision footgun.)
+declare -A BRIDGE_RUN_DEGRADE_WARNED=()
+
+# bridge_run_warn_once <agent> <message>
+#
+# Emit <message> via log_line at most once per <agent> for the lifetime of
+# this process. Used by the shared-launch skip-export degrade path so a
+# persistently-unseedable agent does not spam the log on every relaunch
+# (bridge-run.sh's while-true loop re-enters bridge_run_shared_launch every
+# iteration).
+bridge_run_warn_once() {
+  local _agent="$1"
+  local _msg="$2"
+  [[ -n "${BRIDGE_RUN_DEGRADE_WARNED[$_agent]:-}" ]] && return 0
+  BRIDGE_RUN_DEGRADE_WARNED["$_agent"]=1
+  log_line "$_msg"
 }
 
 # bridge_run_ensure_shared_claude_credential <agent_claude_root>
@@ -1138,22 +1178,32 @@ bridge_run_ensure_claude_launch_channel_plugins() {
 # at 0600 via bridge-auth.py's atomic writer. Works for static AND dynamic;
 # no sync-default change, no hand-rolled secret copying.
 #
-# Returns 0 when the export is safe (credential present, OR keychain-free
-# auth where `.credentials.json` is intentionally absent and the keychain-
-# free preflight already validated settings.json -> apiKeyHelper). Returns
-# 1 when the per-agent dir has no usable credential and could not be seeded
-# (e.g. operator never authed) — the caller then SKIPS the export so a
-# previously-working operator-global launch is not broken (graceful degrade).
+# Returns 0 when the export is safe (credential present, OR a PROVEN
+# keychain-free launch where `.credentials.json` is intentionally absent and
+# the keychain-free preflight positively validated settings.json -> apiKeyHelper
+# -> registry OAT on this platform). Returns 1 when the per-agent dir has no
+# usable credential and could not be seeded (e.g. operator never authed) — the
+# caller then SKIPS the export so a previously-working operator-global launch
+# is not broken (graceful degrade).
 bridge_run_ensure_shared_claude_credential() {
   local _claude_root="$1"
   local _cred_file="$_claude_root/.credentials.json"
 
   # Keychain-free auth: the per-agent dir authenticates via the apiKeyHelper
-  # wired into settings.json, not a credential file. The keychain-free
-  # preflight (bridge_run_claude_keychain_free_preflight) has already run and
-  # would have bridge_die'd on a bad settings.json. The export is safe and a
-  # missing credential file is expected — do not try to seed one.
-  if bridge_claude_keychain_free_auth_enabled 2>/dev/null; then
+  # wired into settings.json, not a credential file — so a missing credential
+  # file is expected and the export is safe WITHOUT seeding one.
+  #
+  # #1520 r3 (codex Phase-4 BLOCKING): gate this fast-path on the PROVEN
+  # keychain-free state, NOT on bridge_claude_keychain_free_auth_enabled. The
+  # enable flag is platform-blind env/config; bridge_run_claude_keychain_free_-
+  # preflight early-returns on non-Darwin WITHOUT validating settings/helper/
+  # registry, yet leaves the flag enabled. Trusting the flag alone would export
+  # an UNAUTHENTICATED empty per-agent dir on a non-Darwin host. The preflight
+  # sets BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1 only after it has
+  # positively validated keychain-free on this platform; anything else (non-
+  # Darwin, unvalidated, preflight not run) leaves it 0 and falls through to
+  # the seed -> recheck -> export-if-present -> else skip-export path below.
+  if [[ "${BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED:-0}" == "1" ]]; then
     return 0
   fi
 
@@ -1222,7 +1272,12 @@ bridge_run_shared_launch() {
     # the export and launch against the operator-global config as before.
     if [[ -n "$_agent_claude_root" ]] \
         && ! bridge_run_ensure_shared_claude_credential "$_agent_claude_root"; then
-      log_line "[warn] ${AGENT}: per-agent Claude credential missing and could not be seeded at $_agent_claude_root/.credentials.json — launching against the operator-global config (CLAUDE_CONFIG_DIR not set). Run 'agent-bridge auth claude-token sync --agents ${AGENT}' once the controller is authed to enable per-agent config isolation."
+      # r3: warn at most once per agent per process — the relaunch loop
+      # re-enters this skip-export path every iteration, so an unconditional
+      # log_line here spams the log. The functional fallback (skip export ->
+      # operator-global launch) is unchanged; only the warning is de-duped.
+      bridge_run_warn_once "$AGENT" \
+        "[warn] ${AGENT}: per-agent Claude credential missing and could not be seeded at $_agent_claude_root/.credentials.json — launching against the operator-global config (CLAUDE_CONFIG_DIR not set). Run 'agent-bridge auth claude-token sync --agents ${AGENT}' once the controller is authed to enable per-agent config isolation."
       _agent_claude_root=""
     fi
   fi
@@ -1541,6 +1596,16 @@ RAPID_FAIL_COUNT=0
 RAPID_FAIL_WINDOW="${BRIDGE_RUN_RAPID_FAIL_WINDOW_SECONDS:-10}"
 MAX_RAPID_FAILS="${BRIDGE_RUN_MAX_RAPID_FAILS:-5}"
 HEALTHY_RUN_RESET_SECONDS="${BRIDGE_RUN_HEALTHY_RESET_SECONDS:-60}"
+# #1520 r3 (codex r3 BLOCKING): scrub the proven-keychain-free signal at
+# process entry so an INHERITED `BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1`
+# from the parent environment can never be trusted as proof. The preflight
+# is the only writer that sets it to 1, and `--safe-mode` skips the preflight
+# (bridge-run.sh:"$ENGINE" == claude && $SAFE_MODE -eq 0) while still reaching
+# bridge_run_shared_launch — without this scrub a spoofed/inherited 1 would
+# make the credential guard take the export-without-credential fast-path and
+# export an unauthenticated empty per-agent dir. Reset once here (before the
+# loop); the preflight re-resets + re-validates every iteration.
+BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=0
 while true; do
   local_launch_cmd_display=""
   local_err_size_before=0
