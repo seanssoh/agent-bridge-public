@@ -2193,7 +2193,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # the admin exemption serves. Pull 1359-cron-create-iso-staging (it
       # now carries the #1474 admin-exemption + env-forgery-refused
       # security cases) so a future bootstrap change re-runs the gate.
-      add_required H-bootstrap-memory-iso-rebuild J-beta4-workflow-docs 1359-cron-create-iso-staging
+      #
+      # Issue #1399: the admin-extraction `grep|head|sed` pipeline near the
+      # top of the script must treat an admin-less roster as an EMPTY
+      # result, not a fatal error — under `set -euo pipefail` a no-match
+      # grep (rc=1) otherwise aborts the whole script before the `patch`
+      # default applies. 1399-bootstrap-memory-no-admin pins the brace-
+      # group `|| true` guard (scoped to the grep, not the whole pipeline)
+      # + the end-to-end no-abort behavior on a fresh admin-less install.
+      add_required H-bootstrap-memory-iso-rebuild J-beta4-workflow-docs 1359-cron-create-iso-staging 1399-bootstrap-memory-no-admin
       add_integration integration-minimal
       ;;
 
