@@ -1154,18 +1154,118 @@ CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, next_attempt_ts);
 CREATE INDEX IF NOT EXISTS idx_outbox_peer ON outbox(peer, status);
 """
 
+# A2A Rooms P4.3 (codex review): the inbox dedupe ledger is scoped to the
+# AUTHENTICATED peer via a COMPOSITE (peer, message_id) PRIMARY KEY — mirrors
+# P4.1's room_join_dedupe fix. `message_id` is sender-chosen (the `<bridge>:uuid`
+# convention is NOT enforced on the wire), so a message_id-ONLY PK let one
+# authenticated peer pre-seed / block another peer's message_id (a fresh row
+# with that id, or a same-id/different-body row → the victim's later legitimate
+# message is mis-classified as a 409 conflict and suppressed). The composite PK
+# isolates each peer's dedupe namespace: a (peerB, "nodeA:uuid") row can never
+# collide with (peerA, "nodeA:uuid"). Room-talk rides this same /enqueue dedupe,
+# so contract 6 (peer-scoped dedupe + replay protection) is satisfied here for
+# room messages too — without a separate ledger.
 _INBOX_SCHEMA = """
 CREATE TABLE IF NOT EXISTS inbox_dedupe (
-  message_id      TEXT PRIMARY KEY,
+  message_id      TEXT NOT NULL,
   peer            TEXT NOT NULL,
   body_sha256     TEXT NOT NULL,
   created_task_id TEXT,
   first_seen_ts   INTEGER NOT NULL,
   last_seen_ts    INTEGER NOT NULL,
-  delivery_count  INTEGER NOT NULL DEFAULT 1
+  delivery_count  INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (peer, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_peer ON inbox_dedupe(peer, first_seen_ts);
 """
+
+
+def _migrate_inbox_schema(conn: sqlite3.Connection) -> None:
+    """Idempotently rebuild a legacy single-column-PK inbox_dedupe to the
+    composite (peer, message_id) PK (A2A Rooms P4.3, codex review).
+
+    `CREATE TABLE IF NOT EXISTS` never alters an existing table, so an inbox.db
+    created before this change keeps `message_id TEXT PRIMARY KEY`. SQLite cannot
+    `ALTER TABLE ... ADD PRIMARY KEY`, so we detect the old shape (the
+    `message_id` column declared `pk=1` while `peer` is not part of the PK) and
+    rebuild: create the new table, copy rows (collapsing any pre-existing
+    cross-peer id collisions to the FIRST-seen row per (peer, message_id) — which
+    the old global PK could not even have stored, so there is nothing to lose in
+    practice), swap, reindex. The whole rebuild is one transaction; on any error
+    it rolls back and leaves the legacy table intact (fail-safe — dedupe still
+    works, just globally, until the next open retries the migration). NEVER drops
+    rows for a peer.
+    """
+    try:
+        cols = conn.execute("PRAGMA table_info(inbox_dedupe)").fetchall()
+    except sqlite3.Error:
+        return
+    if not cols:
+        return
+    # Map column name -> pk position (0 = not part of pk).
+    pk_of = {row[1]: int(row[5]) for row in cols}
+    # Legacy shape: message_id is the sole PK (pk==1) and peer is NOT in the PK.
+    legacy = pk_of.get("message_id", 0) == 1 and pk_of.get("peer", 0) == 0
+    if not legacy:
+        return
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            CREATE TABLE inbox_dedupe_p43 (
+              message_id      TEXT NOT NULL,
+              peer            TEXT NOT NULL,
+              body_sha256     TEXT NOT NULL,
+              created_task_id TEXT,
+              first_seen_ts   INTEGER NOT NULL,
+              last_seen_ts    INTEGER NOT NULL,
+              delivery_count  INTEGER NOT NULL DEFAULT 1,
+              PRIMARY KEY (peer, message_id)
+            )
+        """)
+        # INSERT OR IGNORE collapses to one row per (peer, message_id); with a
+        # global PK there can be at most one row per message_id anyway, so this
+        # is a faithful 1:1 copy. Order by first_seen_ts so the earliest wins.
+        conn.execute("""
+            INSERT OR IGNORE INTO inbox_dedupe_p43
+              (message_id, peer, body_sha256, created_task_id, first_seen_ts,
+               last_seen_ts, delivery_count)
+            SELECT message_id, peer, body_sha256, created_task_id, first_seen_ts,
+                   last_seen_ts, delivery_count
+            FROM inbox_dedupe ORDER BY first_seen_ts
+        """)
+        conn.execute("DROP TABLE inbox_dedupe")
+        conn.execute("ALTER TABLE inbox_dedupe_p43 RENAME TO inbox_dedupe")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inbox_peer "
+            "ON inbox_dedupe(peer, first_seen_ts)")
+        conn.commit()
+    except sqlite3.Error:
+        # Leave the legacy table intact (no row loss) and roll back the partial
+        # rebuild. The CALLER (open_inbox) re-verifies the PK shape and FAILS
+        # CLOSED if the table is still legacy (codex P4.3 r2) — it must NOT hand
+        # back a connection on which a cross-peer same-id message could pass the
+        # peer-scoped lookup yet collide only at the post-enqueue INSERT (which
+        # would let a task be staged against a global-PK ledger).
+        conn.rollback()
+
+
+def _inbox_pk_is_composite(conn: sqlite3.Connection) -> bool:
+    """True iff inbox_dedupe carries the composite (peer, message_id) PK.
+
+    The post-migration verification gate (codex P4.3 r2). Reads PRAGMA
+    table_info: both `peer` and `message_id` must be part of the PRIMARY KEY (pk
+    position > 0). A legacy single-column-PK table (message_id pk=1, peer pk=0)
+    returns False so open_inbox can fail closed rather than serve cross-peer
+    dedupe on a global-PK ledger.
+    """
+    try:
+        cols = conn.execute("PRAGMA table_info(inbox_dedupe)").fetchall()
+    except sqlite3.Error:
+        return False
+    if not cols:
+        return False
+    pk_of = {row[1]: int(row[5]) for row in cols}
+    return pk_of.get("peer", 0) > 0 and pk_of.get("message_id", 0) > 0
 
 
 def _connect(path: Path, schema: str) -> sqlite3.Connection:
@@ -1187,7 +1287,24 @@ def open_outbox() -> sqlite3.Connection:
 
 
 def open_inbox() -> sqlite3.Connection:
-    return _connect(inbox_db_path(), _INBOX_SCHEMA)
+    conn = _connect(inbox_db_path(), _INBOX_SCHEMA)
+    _migrate_inbox_schema(conn)
+    # FAIL CLOSED if the dedupe ledger is still the legacy global-PK shape
+    # (a fresh db is created composite; an upgraded db is migrated above; only a
+    # FAILED migration leaves it legacy). Returning a legacy-PK connection would
+    # let a cross-peer same-message_id request pass the peer-scoped lookup and
+    # reach enqueue, then collide only at the post-enqueue INSERT — so we refuse
+    # to serve dedupe on it. The caller's try/except turns this into a 500
+    # BEFORE any staging/enqueue (codex P4.3 r2).
+    if not _inbox_pk_is_composite(conn):
+        conn.close()
+        raise A2AError(
+            "inbox_dedupe is still the legacy global-PK shape after migration — "
+            "refusing to serve peer-scoped dedupe on it (retry after the rebuild "
+            "succeeds)",
+            code="inbox_dedupe_legacy_pk",
+        )
+    return conn
 
 
 def outbox_total_bytes(conn: sqlite3.Connection) -> int:

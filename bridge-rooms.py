@@ -658,6 +658,255 @@ def _broadcast_roster_to_members(room_id: str, roster: dict,
     return {"delivered": delivered, "failed": failed}
 
 
+# --------------------------------------------------------------------------
+# room talk — room-scoped cross-node member messaging (A2A Rooms P4.3, §11)
+# --------------------------------------------------------------------------
+
+def _post_room_talk(*, member_node: str, room_id: str, room_epoch: int,
+                    sender_agent: str, target_agent: str, title: str,
+                    body: str, priority: str, timeout: float = 30.0,
+                    ) -> tuple[int, bytes]:
+    """POST a ROOM-SCOPED A2A enqueue message to ONE other member node (P4.3).
+
+    Routes over the EXISTING `/enqueue` A2A path (NOT a new endpoint) so the
+    receiver's full auth preamble + durable dedupe run unchanged; the room-scope
+    is carried in the envelope (`room_id` + `room_epoch`), and the receiver's
+    fail-closed `room_scoped_check` (the P4.3 leader-MAC roster-cache gate)
+    decides delivery. The body is signed with the SAME per-peer node-link HMAC
+    secret every other A2A send uses — membership is NOT asserted on the wire,
+    it is proven by the receiver against its OWN cached leader-MAC roster.
+
+    `sender_agent` is the OS-actor-anchored agent id (the CALLER resolved it via
+    `caller_agent`/`resolve_os_actor`) — NEVER a `--from`/env value. `room_epoch`
+    is the sender's LOCALLY-cached epoch for the room (the caller read it from
+    its own `room_roster_cache`); a hostile epoch cannot be conjured because the
+    receiver requires it to EQUAL its own cached epoch. Returns
+    (http_status, response_body).
+
+    Reuses the SAME paired-flag test seam (BRIDGE_ROOMS_TEST_POST_HOOK) the join
+    / roster-broadcast senders use — the hook captures the signed request; the
+    smoke replays it through the real receiver. NEVER honored in production.
+    """
+    if a2a is None:  # pragma: no cover - a2a always ships beside this
+        raise rooms.RoomsError(
+            "room talk requires the A2A module + node-link config",
+            code="a2a_unavailable",
+        )
+    cfg = a2a.load_config()
+    local_bridge_id = str(cfg.get("bridge_id", "") or "").strip()
+    if not local_bridge_id:
+        raise rooms.RoomsError(
+            "config has no 'bridge_id' — cannot identify this node for a "
+            "room-scoped send", code="no_bridge_id",
+        )
+    peer = a2a.find_peer(cfg, member_node)
+    secret = a2a.peer_send_secret(peer)
+    message_id = a2a.new_message_id(local_bridge_id)
+    envelope = a2a.build_envelope(
+        message_id=message_id,
+        sender_bridge=local_bridge_id,
+        sender_agent=sender_agent,
+        target_agent=target_agent,
+        priority=priority,
+        title=title,
+        body=body,
+        reply_peer=local_bridge_id,
+        reply_agent=sender_agent,
+        room_id=room_id,
+        room_epoch=int(room_epoch),
+    )
+    body_bytes = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+    path = peer.get("enqueue_path",
+                    cfg.get("listen", {}).get("enqueue_path", "/enqueue"))
+    timestamp = str(a2a.now_ts())
+    body_hash = a2a.body_sha256(body_bytes)
+    canonical = a2a.canonical_string(
+        "POST", path, local_bridge_id, message_id, timestamp, body_hash)
+    signature = a2a.sign(secret, canonical)
+    headers = {
+        "Content-Type": "application/json",
+        "X-AGB-Protocol": a2a.PROTOCOL_VERSION,
+        "X-AGB-Peer": local_bridge_id,
+        "X-AGB-Message-Id": message_id,
+        "X-AGB-Timestamp": timestamp,
+        "X-AGB-Body-SHA256": body_hash,
+        "X-AGB-Signature": signature,
+    }
+
+    if _test_post_hook_allowed():
+        return _invoke_test_post_hook(path=path, headers=headers,
+                                      body_bytes=body_bytes)
+
+    address = a2a.resolve_peer_address(peer)
+    port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
+    if not address:
+        raise rooms.RoomsError(
+            f"member node {member_node!r} has no resolvable address",
+            code="no_member_address",
+        )
+    import urllib.request
+
+    url = f"http://{address}:{port}{path}"
+    req = urllib.request.Request(url, data=body_bytes, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
+        return exc.code, (exc.read() or b"")
+
+
+def _talk_target_pairs(members: list, sender_agent: str,
+                       sender_node: str, local_node_id: str,
+                       only_to: str = "") -> list:
+    """The (agent, node) pairs a room-talk send targets, from the CACHED roster.
+
+    Every cached member EXCEPT the sender itself, on a node that is NOT this
+    sender's own node (a same-node member is reachable through the local queue,
+    not a node-link hop — P4.3 is cross-node messaging). `only_to`
+    (`agent` or `agent@node`) narrows to a single recipient. Deterministically
+    ordered for reproducible sends.
+    """
+    want_agent, _, want_node = (only_to or "").partition("@")
+    want_agent = want_agent.strip()
+    want_node = want_node.strip()
+    pairs: list = []
+    for m in members:
+        magent = str(m.get("agent", "") or "")
+        mnode = str(m.get("node", "") or "")
+        if magent == sender_agent and mnode == sender_node:
+            continue  # never send to self
+        if not mnode or mnode == local_node_id:
+            continue  # same node → local queue, not a cross-node room-talk hop
+        if only_to:
+            if magent != want_agent:
+                continue
+            if want_node and mnode != want_node:
+                continue
+        pair = (magent, mnode)
+        if pair not in pairs:
+            pairs.append(pair)
+    return sorted(pairs)
+
+
+def cmd_talk(args: argparse.Namespace) -> int:
+    """Send a ROOM-SCOPED message to the room's OTHER member nodes (P4.3).
+
+    The sender identity is the OS-actor-anchored trusted agent (NEVER
+    --from/env). The send stamps the room_id + the sender's LOCALLY-cached epoch
+    and routes a room-scoped A2A enqueue to each other member node over the
+    node-link. Membership is enforced by the RECEIVER against its own leader-MAC
+    roster cache — this command only sends to members the sender's OWN cache
+    already knows, and refuses to send at all if the sender is not itself a
+    cached member (fail-closed symmetry with the receiver gate).
+    """
+    room_id = args.room_id
+    agent = caller_agent(args)
+    node = local_node()
+
+    # Resolve body from --body / --body-file / stdin.
+    if args.body is not None and args.body_file is not None:
+        return die("pass only one of --body / --body-file", code=1)
+    if args.body_file is not None:
+        body_src = args.body_file
+        if not os.path.isfile(body_src):
+            return die(f"--body-file not found: {body_src}", code=1)
+        try:
+            with open(body_src, encoding="utf-8") as fh:
+                body_text = fh.read()
+        except OSError as exc:
+            return die(f"--body-file unreadable: {body_src}: {exc}", code=1)
+    elif args.body is not None:
+        body_text = args.body
+    else:
+        body_text = sys.stdin.read() if not sys.stdin.isatty() else ""
+
+    if not args.title:
+        return die("--title is required", code=1)
+    if not body_text and not args.allow_empty_body:
+        return die("body is empty; pass --body/--body-file or "
+                   "--allow-empty-body", code=1)
+    priority = args.priority
+    if a2a is not None and priority not in a2a.VALID_PRIORITIES:
+        return die(f"invalid --priority: {priority}", code=1)
+
+    # Read the sender's OWN locally-cached leader-MAC roster for this room. A
+    # room-talk send is only meaningful once this node holds a verified roster
+    # cache (from a P4.2 broadcast) — and the sender must itself be a cached
+    # member, else there is nothing it is authorized to address.
+    conn = rooms.open_rooms_readonly()
+    if conn is None:
+        return die(f"no local roster cache for room {room_id} — join the room "
+                   "and wait for the leader's roster broadcast first", code=1)
+    try:
+        row = rooms.get_roster_cache(conn, room_id)
+    finally:
+        conn.close()
+    if row is None:
+        return die(f"no local roster cache for room {room_id} — join the room "
+                   "and wait for the leader's roster broadcast first", code=1)
+    cached_epoch = int(row["epoch"])
+    members = rooms._cached_members(row)
+    if members is None:
+        return die(f"local roster cache for room {room_id} is corrupt", code=1)
+    member_pairs = {(m["agent"], m["node"]) for m in members}
+    if (agent, node) not in member_pairs:
+        return die(f"{agent}@{node} is not a member of room {room_id} per the "
+                   "local roster cache — refusing to send", code=1)
+
+    targets = _talk_target_pairs(members, agent, node, node,
+                                 only_to=getattr(args, "to", "") or "")
+    if not targets:
+        return die(f"no other-node members to send to in room {room_id} "
+                   "(roster has no cross-node recipients matching the filter)",
+                   code=1)
+
+    delivered: list = []
+    failed: list = []
+    for tagent, tnode in targets:
+        try:
+            status, resp = _post_room_talk(
+                member_node=tnode, room_id=room_id, room_epoch=cached_epoch,
+                sender_agent=agent, target_agent=tagent, title=args.title,
+                body=body_text, priority=priority,
+            )
+        except rooms.RoomsError as exc:
+            failed.append({"agent": tagent, "node": tnode, "error": str(exc)})
+            continue
+        except Exception as exc:  # noqa: BLE001 - transport/config failure
+            failed.append({"agent": tagent, "node": tnode,
+                           "error": f"room talk failed: {exc}"})
+            continue
+        if 200 <= status < 300:
+            delivered.append({"agent": tagent, "node": tnode})
+        else:
+            detail = ""
+            try:
+                detail = resp.decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001
+                detail = ""
+            failed.append({"agent": tagent, "node": tnode,
+                           "status": status, "detail": detail})
+
+    payload = {
+        "room_id": room_id, "epoch": cached_epoch,
+        "from": f"{agent}@{node}",
+        "delivered": delivered, "failed": failed,
+    }
+    if args.json:
+        out(json.dumps(payload))
+    else:
+        info(f"room talk on {room_id} (epoch {cached_epoch}) from {agent}@{node}: "
+             f"{len(delivered)} delivered, {len(failed)} failed")
+        for f in failed:
+            info(f"  FAILED {f['agent']}@{f['node']}: "
+                 f"{f.get('error') or f.get('status')}")
+    # A partial failure is a non-zero exit so callers/cron notice, but a fully
+    # delivered send (or an all-targets dry filter) returns 0.
+    return 0 if not failed else 2
+
+
 def cmd_join(args: argparse.Namespace) -> int:
     parsed = rooms.parse_invite_link(args.link)
     room_id = parsed.get("room", "")
@@ -1131,6 +1380,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_leave.add_argument("room_id")
     _add_common(p_leave)
     p_leave.set_defaults(func=cmd_leave)
+
+    p_talk = sub.add_parser(
+        "talk",
+        help="send a room-scoped message to the room's other member nodes")
+    p_talk.add_argument("room_id")
+    p_talk.add_argument("--title", required=True)
+    p_talk.add_argument("--body", default=None)
+    p_talk.add_argument("--body-file", dest="body_file", default=None)
+    p_talk.add_argument("--to", default="",
+                        help="narrow to one recipient (agent or agent@node); "
+                             "default = every other-node member")
+    p_talk.add_argument("--priority", default="normal")
+    p_talk.add_argument("--allow-empty-body", action="store_true",
+                        dest="allow_empty_body")
+    _add_common(p_talk)
+    p_talk.set_defaults(func=cmd_talk)
 
     p_adopt = sub.add_parser(
         "adopt-all",

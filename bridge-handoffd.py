@@ -610,16 +610,20 @@ def _identity_update_apply(
 #     HMAC / source-addr / allowlist / dedupe auth — it runs AFTER them and
 #     can only ADD a deny for a room-scoped message.
 #   - ROOM-scoped message -> the fail-closed membership decision against the
-#     local rooms.db: the enqueue is allowed ONLY if BOTH the sender
-#     (sender_agent@sender_node) AND the target (target_agent@<this_node>)
-#     are current members of the room. Any of {rooms module unavailable,
-#     rooms.db absent/unreadable, room unknown, either party not a member}
-#     -> FAIL CLOSED (deny). Because P1a is single-node and the receiver only
-#     ever handles cross-node traffic, no production message is room-scoped
-#     yet — so this branch is wired + unit-tested but off the hot path. P4
-#     replaces the raw membership read with a leader-MAC'd roster verify +
-#     freshness (roster_max_age / epoch refresh) WITHOUT touching this
-#     signature or the fail-closed default.
+#     member-local leader-MAC'd ROSTER CACHE (NOT a live rooms.db membership
+#     read, and NOT a live leader call): the enqueue is allowed ONLY if the
+#     local `room_roster_cache` for `room_id` exists, its cached epoch EQUALS
+#     the envelope's `room_epoch`, AND BOTH the sender (sender_agent@<the
+#     node-link-authenticated peer>) AND the target (target_agent@<this_node>)
+#     appear in that cached roster. Any of {rooms module unavailable,
+#     rooms.db absent/unreadable, no cache for the room, epoch mismatch, either
+#     party not a cached member} -> FAIL CLOSED (deny). This is the P4.3
+#     activation the P1a seam was frozen for: P4.3 replaces the raw `is_member`
+#     read with the leader-MAC'd roster-cache verify + epoch freshness WITHOUT
+#     touching this `(env, cfg) -> (ok, reason)` signature or the fail-closed
+#     default. The roster cache is written ONLY by P4.2's
+#     `accept_roster_broadcast` after a pairwise-HMAC verify FROM the leader, so
+#     the receiver never trusts a membership claim inside the inbound message.
 
 def room_scoped_check(env: dict[str, Any],
                       cfg: dict[str, Any]) -> tuple[bool, str]:
@@ -629,13 +633,31 @@ def room_scoped_check(env: dict[str, Any],
     config (carries this node's `bridge_id`); it is the authenticated peer
     config the caller already validated — the seam does NOT re-derive trust
     from it, it only reads the local node id.
+
+    A2A Rooms P4.3 (design §11): for a room-scoped envelope the decision is the
+    member-local leader-MAC'd ROSTER-CACHE membership gate
+    (`rooms.roster_cache_membership_check`), with `room_epoch` from the wire and
+    the un-spoofable authenticated peer as the sender node. A NON-room message
+    (no `room_id`) returns the unconditional `not_room_scoped` pass — the two
+    paths are fully separate: a plain send is NEVER gated by room membership and
+    NEVER grants/implies it (brief contract 5).
     """
     if not a2a.envelope_is_room_scoped(env):
         return True, "not_room_scoped"
 
     room_id = str(env.get("room_id") or "")
+    # `room_epoch` is validated as a non-negative int by parse_envelope before
+    # this seam runs; 0 is a legitimate epoch, so we read the actual value and
+    # let the gate's EXACT-match enforce freshness (contract 3, fail-closed both
+    # ways — a stale OR ahead epoch is rejected, never delivered).
+    room_epoch = int(env.get("room_epoch") or 0)
     sender = env.get("sender", {})
     sender_agent = str(sender.get("agent") or "") if isinstance(sender, dict) else ""
+    # The SENDER NODE is the node-link-AUTHENTICATED peer (the signed X-AGB-Peer
+    # the caller already verified), surfaced as `sender.bridge` in the envelope
+    # and pinned to == peer_id by the do_POST `reject_sender_mismatch` check that
+    # runs BEFORE this seam. We read it from the envelope (already proven to
+    # equal the authenticated peer) so the seam stays a pure (env, cfg) function.
     sender_node = str(sender.get("bridge") or "") if isinstance(sender, dict) else ""
     target_agent = str(env.get("target_agent") or "")
     this_node = str(cfg.get("bridge_id") or "")
@@ -653,16 +675,14 @@ def room_scoped_check(env: dict[str, Any],
         return False, "no_rooms_db"
 
     try:
-        room = rooms.get_room(conn, room_id)
-        if room is None:
-            return False, "room_unknown"
-        if not rooms.is_member(conn, room_id, sender_agent, sender_node):
-            return False, "sender_not_member"
-        if not rooms.is_member(conn, room_id, target_agent, this_node):
-            return False, "target_not_member"
+        reason = rooms.roster_cache_membership_check(
+            conn, room_id=room_id, room_epoch=room_epoch,
+            sender_agent=sender_agent, sender_node=sender_node,
+            target_agent=target_agent, target_node=this_node,
+        )
     finally:
         conn.close()
-    return True, "members_ok"
+    return (reason == rooms.ROOM_TALK_OK), reason
 
 
 # --------------------------------------------------------------------------
@@ -1099,17 +1119,21 @@ class HandoffHandler(BaseHTTPRequestHandler):
         a2a.ensure_handoff_dirs()
         conn = a2a.open_inbox()
         try:
+            # Dedupe is scoped to the AUTHENTICATED peer (composite PK) so one
+            # peer cannot pre-seed/block another peer's sender-chosen message_id
+            # (A2A Rooms P4.3 codex review — same fix class as room_join_dedupe).
             existing = conn.execute(
                 "SELECT body_sha256, created_task_id FROM inbox_dedupe "
-                "WHERE message_id=?", (message_id,)
+                "WHERE peer=? AND message_id=?", (peer_id, message_id)
             ).fetchone()
             if existing is not None:
                 if existing["body_sha256"] == body_hash:
                     # Same id + same body → idempotent success.
                     conn.execute(
                         "UPDATE inbox_dedupe SET last_seen_ts=?, "
-                        "delivery_count=delivery_count+1 WHERE message_id=?",
-                        (a2a.now_ts(), message_id),
+                        "delivery_count=delivery_count+1 "
+                        "WHERE peer=? AND message_id=?",
+                        (a2a.now_ts(), peer_id, message_id),
                     )
                     conn.commit()
                     audit("accept_duplicate", peer=peer_id, client=client_ip,
@@ -1121,8 +1145,9 @@ class HandoffHandler(BaseHTTPRequestHandler):
                 # Same id + different body → security event, conflict.
                 conn.execute(
                     "UPDATE inbox_dedupe SET last_seen_ts=?, "
-                    "delivery_count=delivery_count+1 WHERE message_id=?",
-                    (a2a.now_ts(), message_id),
+                    "delivery_count=delivery_count+1 "
+                    "WHERE peer=? AND message_id=?",
+                    (a2a.now_ts(), peer_id, message_id),
                 )
                 conn.commit()
                 audit("reject_hash_conflict", peer=peer_id, client=client_ip,
@@ -1484,23 +1509,29 @@ class HandoffHandler(BaseHTTPRequestHandler):
         a2a.ensure_handoff_dirs()
         conn = a2a.open_inbox()
         try:
+            # Peer-scoped dedupe (composite PK) — same isolation as the enqueue
+            # path (A2A Rooms P4.3 codex review): one peer cannot pre-seed/block
+            # another peer's message_id in the shared inbox_dedupe ledger.
             existing = conn.execute(
-                "SELECT body_sha256 FROM inbox_dedupe WHERE message_id=?",
-                (message_id,),
+                "SELECT body_sha256 FROM inbox_dedupe "
+                "WHERE peer=? AND message_id=?",
+                (peer_id, message_id),
             ).fetchone()
             if existing is not None:
                 if existing["body_sha256"] == body_hash:
                     conn.execute(
                         "UPDATE inbox_dedupe SET last_seen_ts=?, "
-                        "delivery_count=delivery_count+1 WHERE message_id=?",
-                        (a2a.now_ts(), message_id),
+                        "delivery_count=delivery_count+1 "
+                        "WHERE peer=? AND message_id=?",
+                        (a2a.now_ts(), peer_id, message_id),
                     )
                     conn.commit()
                     return "duplicate"
                 conn.execute(
                     "UPDATE inbox_dedupe SET last_seen_ts=?, "
-                    "delivery_count=delivery_count+1 WHERE message_id=?",
-                    (a2a.now_ts(), message_id),
+                    "delivery_count=delivery_count+1 "
+                    "WHERE peer=? AND message_id=?",
+                    (a2a.now_ts(), peer_id, message_id),
                 )
                 conn.commit()
                 return "conflict"
