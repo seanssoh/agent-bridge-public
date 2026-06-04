@@ -692,9 +692,19 @@ def enqueue_via_bridge_task(
         "--priority", priority,
         "--title", title,
         "--body-file", str(body_file),
+        # Issue #1398: durably queue inbound cross-bridge mail even when the
+        # local target agent is momentarily stopped. An inbound A2A handoff is
+        # durable mail — a transiently-stopped local target is a NORMAL state,
+        # unlike an interactive operator send — so it must land in the queue
+        # for when the agent restarts, not 422 under the #1318 stopped-target
+        # reader guard. --force bypasses ONLY that liveness guard; it does NOT
+        # relax companion validation, the allowlist, dedupe, or any auth check.
+        "--force",
     ]
     # NOTE: --skip-companion-validate is deliberately NOT passed — remote
-    # peers must not bypass companion-review validation.
+    # peers must not bypass companion-review validation. --force (above)
+    # is the stopped-target liveness override ONLY; the auth/allowlist/dedupe
+    # gates upstream of this enqueue stay fully enforced.
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, timeout=120,
