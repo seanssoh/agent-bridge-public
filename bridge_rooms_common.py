@@ -1722,13 +1722,19 @@ def accept_roster_broadcast(
     # epoch <= cached_epoch: accept ONLY a byte-identical idempotent duplicate
     # (same epoch AND same canonical members AND same leader node). Everything
     # else (a lower epoch, or a same-epoch roster with DIFFERENT contents — a
-    # replay/forge attempt) is ignored without a write. A byte-identical re-
-    # broadcast does NOT need a cache write (the cache already reflects it), so
-    # it does not reserve dedupe either — it is idempotent by construction.
+    # replay/forge attempt) is ignored without a write.
     if (epoch == cached_epoch
             and str(existing["members_json"]) == incoming_json
             and str(existing["from_node"] or "") == leader_node):
-        return ROSTER_DUPLICATE
+        # A byte-identical re-broadcast does NOT need a cache write (the cache
+        # already reflects it), but it MUST still BURN the (peer, message_id) in
+        # the dedupe ledger (codex P4.2 r3 BLOCKING): a terminal ROSTER_DUPLICATE
+        # that did not reserve the id would let a LATER (peer, SAME id, DIFFERENT
+        # body, higher epoch) reuse be treated as fresh and ACCEPTED. The
+        # reserve-only path records the id (or re-classifies a same-id/different-
+        # body reuse to ROSTER_DEDUPE_CONFLICT) WITHOUT touching the cache.
+        return _reserve_roster_dedupe_only(
+            conn, peer=peer_id, message_id=message_id, body_sha256=body_sha256)
     return ROSTER_STALE_EPOCH
 
 
@@ -1799,6 +1805,55 @@ def _reserve_and_write_roster_cache(
         conn.rollback()
         raise
     return ROSTER_ACCEPTED
+
+
+def _reserve_roster_dedupe_only(
+    conn: sqlite3.Connection, *, peer: str, message_id: str, body_sha256: str,
+) -> str:
+    """BURN a (peer, message_id) in the dedupe ledger WITHOUT writing the cache.
+
+    The reserve-only sibling of `_reserve_and_write_roster_cache` (codex P4.2 r3
+    BLOCKING — close the duplicate-branch id-reuse hole). Used by the byte-
+    identical-existing-cache ROSTER_DUPLICATE branch: the cache already reflects
+    the roster (no write needed), but the id MUST still be recorded so a LATER
+    same-(peer, message_id)/DIFFERENT-body reuse is a CONFLICT rather than a
+    fresh accept. Returns:
+      - ROSTER_DEDUPE_CONFLICT : (peer, message_id) already used with a DIFFERENT
+        body → caller answers 409.
+      - ROSTER_DUPLICATE       : a fresh reservation OR a same-body re-reservation
+        (idempotent) → the id is now burned, no cache change.
+    Uses the same IntegrityError-rollback-and-requery guard as the write helper
+    so a concurrent same-id duplicate cannot double-insert (the PK serializes).
+    """
+    existing = conn.execute(
+        "SELECT body_sha256 FROM room_join_dedupe WHERE peer=? AND message_id=?",
+        (peer, message_id),
+    ).fetchone()
+    if existing is not None:
+        return (ROSTER_DUPLICATE if existing["body_sha256"] == body_sha256
+                else ROSTER_DEDUPE_CONFLICT)
+    try:
+        conn.execute(
+            "INSERT INTO room_join_dedupe (message_id, peer, body_sha256, "
+            "created_ts) VALUES (?, ?, ?, ?)",
+            (message_id, peer, body_sha256, now_ts()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Lost a concurrent (peer, message_id) PK race — roll back + re-query the
+        # winner, returning the SAME idempotent/conflict outcome the pre-check
+        # would have (never a raise, never a cache mutation — there is none here).
+        conn.rollback()
+        winner = conn.execute(
+            "SELECT body_sha256 FROM room_join_dedupe "
+            "WHERE peer=? AND message_id=?",
+            (peer, message_id),
+        ).fetchone()
+        if winner is not None:
+            return (ROSTER_DUPLICATE if winner["body_sha256"] == body_sha256
+                    else ROSTER_DEDUPE_CONFLICT)
+        raise
+    return ROSTER_DUPLICATE
 
 
 def _canonical_member_list(members: list[dict[str, Any]]) -> list[dict[str, str]]:

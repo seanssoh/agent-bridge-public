@@ -50,6 +50,9 @@ Subcommands (argv[1]):
   dedupe-race-unit <db>            unit-drive the atomic dedupe/cache TOCTOU
                                    contract (same-id/diff-body → conflict, no
                                    cache write; same-id/same-body → duplicate).
+  duplicate-burns-id-unit <db>     unit-drive the duplicate-branch id-burn (a
+                                   same-state DUPLICATE still reserves the id, so
+                                   a later same-id/diff-body reuse is a conflict).
   db-contains <db> <needle>        exit 0 iff <needle> appears in the db dump.
 """
 
@@ -570,6 +573,54 @@ def cmd_dedupe_race_unit(db: str) -> int:
     return 0
 
 
+def cmd_duplicate_burns_id_unit(db: str) -> int:
+    """Drive the DUPLICATE-branch id-burn contract (codex P4.2 r3 deeper edge).
+
+    The byte-identical-existing-cache ROSTER_DUPLICATE branch MUST still reserve
+    the (peer, message_id) in the dedupe ledger, so a LATER same-id/DIFFERENT-body
+    reuse is a CONFLICT (not a fresh accept). Sequence (one line per case):
+      1. accept (peer, idX, bodyA, epoch 1) → ACCEPTED (first-bind).
+      2. deliver a byte-identical roster under a NEW id idY (same bytes/epoch) →
+         the cache already matches → DUPLICATE branch → MUST burn idY.
+      3. assert a dedupe row for idY now EXISTS (the id was burned).
+      4. deliver (peer, SAME idY, DIFFERENT body bodyB naming rogue 'trent',
+         HIGHER epoch, would otherwise pass leader-pin + monotonic-epoch) →
+         MUST be ROSTER_DEDUPE_CONFLICT, cache epoch unchanged, no 'trent'.
+    """
+    os.environ["BRIDGE_A2A_ROOMS_DB"] = db  # noqa: iso-helper-boundary - env var, not a .env file
+    conn = rooms.open_rooms()
+    try:
+        room_id = "room-dupburn"
+        leader = "nodeM"
+        rooms.record_local_join_intent(
+            conn, room_id, "self", "nodeSelf", leader_node=leader)
+        members_a = [{"agent": "mallory", "node": "nodeM", "role": "leader"}]
+        members_b = [{"agent": "trent", "node": "nodeM", "role": "leader"}]
+        id_x = "nodeM:burn-X"
+        id_y = "nodeM:burn-Y"
+
+        out1 = _accept(conn, room_id=room_id, room_epoch=1, members=members_a,
+                       leader_node=leader, peer_id=leader, mid=id_x)
+        print(f"first_accept={out1}")
+        # Byte-identical roster under a DIFFERENT id → reaches the DUPLICATE
+        # branch (cache already matches) → must BURN id_y.
+        out2 = _accept(conn, room_id=room_id, room_epoch=1, members=members_a,
+                       leader_node=leader, peer_id=leader, mid=id_y)
+        burned = conn.execute(
+            "SELECT 1 FROM room_join_dedupe WHERE peer=? AND message_id=?",
+            (leader, id_y)).fetchone() is not None
+        print(f"same_state_reuse_id={out2}:dedupe_after_same_state={burned}")
+        # Later: SAME id_y, DIFFERENT body, HIGHER epoch → must be CONFLICT.
+        out3 = _accept(conn, room_id=room_id, room_epoch=2, members=members_b,
+                       leader_node=leader, peer_id=leader, mid=id_y)
+        cache = rooms.get_roster_cache(conn, room_id)
+        print(f"later_same_id_diff_body={out3}:cache_epoch={cache['epoch']}:"
+              f"has_trent={'trent' in cache['members_json']}")
+    finally:
+        conn.close()
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print("usage: rooms-p4-2-roster-broadcast-helper.py <subcommand> [args]",
@@ -604,6 +655,8 @@ def main(argv: list[str]) -> int:
         return cmd_empty_leader_takeover_unit(rest[0])
     if cmd == "dedupe-race-unit":
         return cmd_dedupe_race_unit(rest[0])
+    if cmd == "duplicate-burns-id-unit":
+        return cmd_duplicate_burns_id_unit(rest[0])
     if cmd == "db-contains":
         return cmd_db_contains(rest[0], rest[1])
     print(f"unknown subcommand: {cmd}", file=sys.stderr)

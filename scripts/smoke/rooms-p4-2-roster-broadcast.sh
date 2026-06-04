@@ -474,6 +474,65 @@ test_T8b_dedupe_race_end_to_end() {
 }
 
 # ---------------------------------------------------------------------------
+# T9 (codex P4.2 r3 deeper edge — the DUPLICATE branch must BURN the id): a
+# byte-identical same-state ROSTER_DUPLICATE that does NOT reserve the
+# (peer, message_id) would let a LATER same-id/DIFFERENT-body reuse be ACCEPTED.
+# Driven two ways: a unit driver (proves the reserve-only path + the later
+# conflict) and end-to-end through the REAL receiver.
+# ---------------------------------------------------------------------------
+test_T9a_duplicate_burns_id_unit() {
+  local ddb="$SMOKE_TMP_ROOT/dup-burn.db"
+  local out
+  out="$(env "${TEST_FLAGS[@]}" python3 "$HELPER" duplicate-burns-id-unit "$ddb" 2>&1)" \
+    || smoke_fail "duplicate-burns-id-unit helper must not raise: $out"
+  smoke_assert_contains "$out" "first_accept=accepted" \
+    "T9a: the first delivery is accepted"
+  smoke_assert_contains "$out" "same_state_reuse_id=duplicate:dedupe_after_same_state=True" \
+    "T9a: a same-state DUPLICATE under a new id STILL burns that id (dedupe row created)"
+  smoke_assert_contains "$out" "later_same_id_diff_body=dedupe_conflict:cache_epoch=1:has_trent=False" \
+    "T9a: a LATER same-id/diff-body reuse is a CONFLICT (not accepted); cache unchanged, no rogue member"
+}
+
+test_T9b_duplicate_burns_id_end_to_end() {
+  # Through the REAL receiver: establish bodyA at a DEDICATED new id (so the
+  # delivery reaches the DUPLICATE branch, not the captured-id path), confirm a
+  # same-state replay under that id is a duplicate, then a same-id/different-body
+  # reuse is a 409 with the cache untouched.
+  local mdb="$SMOKE_TMP_ROOT/member-dupburn-e2e.db"
+  python3 "$HELPER" make-member-db "$mdb" "$ROOM" "$NODE_A" bob "$NODE_B" >/dev/null
+  # 1) bodyA at the captured id → ACCEPTED (seeds the cache).
+  local d1
+  d1="$(deliver_roster_into "$mdb" "$CFG_B_JSON")"
+  smoke_assert_contains "$d1" "status=200" "T9b setup: bodyA accepted (cache seeded)"
+  # 2) the SAME bodyA bytes under a NEW message id idY → reaches the DUPLICATE
+  # branch (cache already matches) → 200 duplicate AND burns idY.
+  local idY="nodeA:dupburn-Y"
+  local d2
+  d2="$(env "BRIDGE_A2A_ROOMS_DB=$mdb" \
+    python3 "$HELPER" deliver-roster-to-receiver "$SMOKE_REPO_ROOT" \
+      "$CFG_B_JSON" "$CAPTURE" \
+      '{"headers":{"X-AGB-Message-Id":"'"$idY"'"},"resign":true}')"
+  smoke_assert_contains "$d2" "status=200" "T9b: a same-state roster under a new id is 200"
+  smoke_assert_contains "$d2" "\"duplicate\": true" "T9b: it is flagged a duplicate"
+  local before
+  before="$(python3 "$HELPER" cache-rows "$mdb" "$ROOM")"
+  # 3) the SAME idY but a DIFFERENT (validly-signed) body naming rogue 'trent',
+  # HIGHER epoch → MUST be 409 (the id was burned by step 2), cache untouched.
+  local rogue_body
+  rogue_body='{"protocol":"agent-bridge.a2a.room-roster.v1","room_id":"'"$ROOM"'","room_epoch":77,"members":[{"agent":"trent","node":"'"$NODE_A"'","role":"member"}],"leader_node":"'"$NODE_A"'"}'
+  local d3
+  d3="$(env "BRIDGE_A2A_ROOMS_DB=$mdb" \
+    python3 "$HELPER" deliver-roster-to-receiver "$SMOKE_REPO_ROOT" \
+      "$CFG_B_JSON" "$CAPTURE" \
+      '{"headers":{"X-AGB-Message-Id":"'"$idY"'"},"body":'"$(python3 -c "import json,sys;print(json.dumps(sys.argv[1]))" "$rogue_body")"',"resign":true}')"
+  smoke_assert_contains "$d3" "status=409" "T9b: a later same-id/diff-body reuse is a 409 (the duplicate burned the id)"
+  local after
+  after="$(python3 "$HELPER" cache-rows "$mdb" "$ROOM")"
+  smoke_assert_eq "$before" "$after" "T9b: the conflicting reuse left the cache byte-for-byte unchanged"
+  smoke_assert_not_contains "$after" "trent" "T9b: no rogue member entered the cache after the duplicate"
+}
+
+# ---------------------------------------------------------------------------
 # auth preamble teeth: unknown peer / wrong source addr are refused (unweakened)
 # ---------------------------------------------------------------------------
 test_auth_preamble_unweakened() {
@@ -534,6 +593,8 @@ smoke_run "T6: the cache update is atomic (a rejected update leaves the prior ro
 smoke_run "T7: the local-leader-add path admits a local agent without the token gate" test_T7_local_add_no_token_gate
 smoke_run "T8a: dedupe/cache TOCTOU — same-id/diff-body is a conflict, no cache write (unit)" test_T8a_dedupe_race_unit
 smoke_run "T8b: dedupe/cache TOCTOU — same-id/diff-body is 409 + cache unchanged (end-to-end)" test_T8b_dedupe_race_end_to_end
+smoke_run "T9a: a same-state DUPLICATE burns the id — later same-id/diff-body is a conflict (unit)" test_T9a_duplicate_burns_id_unit
+smoke_run "T9b: a same-state DUPLICATE burns the id — later same-id/diff-body is 409 (end-to-end)" test_T9b_duplicate_burns_id_end_to_end
 smoke_run "auth preamble unweakened (remote_addr 403 / unknown peer 403)" test_auth_preamble_unweakened
 smoke_run "idempotent re-delivery: a byte-identical broadcast is an idempotent 200" test_idempotent_redelivery
 
