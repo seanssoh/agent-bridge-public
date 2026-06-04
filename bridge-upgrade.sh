@@ -69,6 +69,7 @@ RESTART_AGENTS_EXPLICIT=0
 JSON=0
 ALLOW_DIRTY=0
 ALLOW_DIRTY_SOURCE=0
+ALLOW_DOWNGRADE=0
 STRICT_MERGE=0
 BACKUP=1
 MIGRATE_AGENTS=1
@@ -117,7 +118,7 @@ _BRIDGE_UPGRADE_DIE_REMEDIATION=""
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents]
+  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--allow-downgrade] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents]
   $(basename "$0") analyze [--source <repo-dir>] [--target <bridge-home>] [--json]
   $(basename "$0") rollback [--target <bridge-home>] [--backup-root <dir>] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json]
   $(basename "$0") conflicts list [--target <bridge-home>] [--json]
@@ -132,6 +133,11 @@ customizations such as:
 The repo checkout remains source of truth for core code. Live-only operator changes are preserved.
 When run from an installed live copy without --source, the last recorded source checkout is reused and pulled automatically.
 Default channel is stable: the latest vX.Y.Z tag is used when one exists. Use --channel dev to track main, or --channel current/--source to deploy the current checkout.
+
+The default stable channel skips pre-release (beta/rc) tags. On a pre-release install
+a bare \`upgrade --apply\` would otherwise resolve to a LOWER stable version and silently
+downgrade the install; the upgrader now refuses such a backward move. Pin the intended
+version with \`--ref <tag>\`, or pass \`--allow-downgrade\` to force the backward move.
 EOF
 }
 
@@ -252,6 +258,23 @@ bridge_upgrade_version_at_ref() {
   else
     bridge_upgrade_version_from_file "$root"
   fi
+}
+
+# Issue #1516: full semver 2.0.0 ordering of two version strings, so the
+# apply path can detect a backward (downgrade) target before mutating the
+# install. Echoes "-1"/"0"/"1" (installed <, ==, > target) on stdout, or
+# nothing when either side is unparseable. Delegates to
+# `bridge-release.py compare`, reusing the exact comparator the
+# release-notification path uses so the two never disagree (a beta of
+# 0.16.0 is NEWER than 0.15.4 but OLDER than 0.16.0 final). Uses
+# `python3 <script> compare a b` (file-as-argv) — never a heredoc on
+# stdin — to stay clear of the Bash 5.3.9 read_comsub deadlock (footgun
+# #11).
+bridge_upgrade_compare_versions() {
+  local source_root="$1"
+  local lhs="$2"
+  local rhs="$3"
+  python3 "$source_root/bridge-release.py" compare "$lhs" "$rhs" 2>/dev/null || true
 }
 
 bridge_upgrade_with_target_env() {
@@ -1224,6 +1247,10 @@ while [[ $# -gt 0 ]]; do
       ALLOW_DIRTY_SOURCE=1
       shift
       ;;
+    --allow-downgrade)
+      ALLOW_DOWNGRADE=1
+      shift
+      ;;
     --strict-merge)
       STRICT_MERGE=1
       shift
@@ -1485,6 +1512,59 @@ EOF
     fi
   fi
   # END: Issue #1144 INSTALLED_VERSION capture block
+
+  # Issue #1516: refuse a SILENT BACKWARD downgrade. The default `stable`
+  # channel resolves to the latest vX.Y.Z tag and SKIPS pre-release tags,
+  # so a bare `upgrade --apply` on a pre-release install (e.g.
+  # 0.16.0-beta2) would resolve TARGET_VERSION to a LOWER stable version
+  # (e.g. 0.15.4) and apply it with no warning — discarding the beta under
+  # test. Compare the resolved TARGET to the currently-INSTALLED version
+  # BEFORE any checkout/merge below mutates the tree; if the target is
+  # strictly LOWER (a backward move) abort unless the operator explicitly
+  # opts in with --allow-downgrade. Forward upgrades (-1) and the
+  # same-version no-op (0) are untouched, as is an unparseable comparison
+  # (empty result → proceed; a malformed VERSION file must not block a
+  # legitimate forward upgrade). Fires for both --apply and --dry-run (so
+  # the dry-run preview is honest) but never for --check, which has
+  # already exited above.
+  #
+  # SCOPE (codex r1): only the `stable` and `ref` channels resolve an
+  # AUTHORITATIVE TARGET_VERSION at this point — stable reads a fixed tag
+  # (latest stable or --version) via bridge_upgrade_version_at_ref, and ref
+  # reads the pinned --ref tag's VERSION directly; neither is touched by a
+  # later pull. The `dev` and `current` channels instead resolve
+  # TARGET_VERSION from the PRE-pull local main / working tree, and the
+  # actual `git pull --ff-only` that determines the applied version runs
+  # AFTER this guard (see below). Comparing the stale pre-pull value there
+  # would false-block a legitimate forward `dev`/`current --pull` upgrade
+  # (e.g. local main behind origin/main), so the guard skips those moving-
+  # line channels — they are "advance to the tracked line" by design and
+  # are not the silent stable-revert this issue reports.
+  if [[ $ALLOW_DOWNGRADE -eq 0 \
+        && ( "$CHANNEL" == "stable" || "$CHANNEL" == "ref" ) \
+        && -n "${INSTALLED_VERSION:-}" && -n "${TARGET_VERSION:-}" ]]; then
+    _downgrade_cmp="$(bridge_upgrade_compare_versions "$SOURCE_ROOT" "$INSTALLED_VERSION" "$TARGET_VERSION")"
+    if [[ "$_downgrade_cmp" == "1" ]]; then
+      cat >&2 <<EOF
+error: refusing to DOWNGRADE the install (installed $INSTALLED_VERSION → target $TARGET_VERSION).
+
+The default 'stable' channel skips pre-release (beta/rc) tags, so a bare
+\`upgrade --apply\` on a pre-release install resolves to a LOWER stable version
+and would silently move the install BACKWARD — discarding the version under test.
+
+Proceed intentionally with one of:
+  1. Pin the version you actually want:
+       agent-bridge upgrade --apply --ref v$INSTALLED_VERSION   # stay on the current line
+       agent-bridge upgrade --apply --ref <tag>                 # a specific release
+  2. Track main (the development line):
+       agent-bridge upgrade --apply --channel dev
+  3. If you genuinely want the backward move to $TARGET_VERSION, force it:
+       agent-bridge upgrade --apply --allow-downgrade
+EOF
+      exit 64
+    fi
+  fi
+  # END: Issue #1516 downgrade guard
 
   if [[ -n "$TARGET_REF" && $DRY_RUN -eq 0 ]]; then
     git -C "$SOURCE_ROOT" checkout -q "$TARGET_REF"
