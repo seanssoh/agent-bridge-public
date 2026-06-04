@@ -1106,9 +1106,81 @@ bridge_run_ensure_claude_launch_channel_plugins() {
   agent_home="${agent_claude_root%/.claude}"
   (
     export HOME="$agent_home"
+    # SC2030: subshell-local export is intentional — it scopes HOME /
+    # CLAUDE_CONFIG_DIR to the plugin-enable preflight only (see the
+    # matching #1520 export in bridge_run_shared_launch below).
+    # shellcheck disable=SC2030
     export CLAUDE_CONFIG_DIR="$agent_claude_root"
     bridge_ensure_claude_launch_channel_plugins "$AGENT"
   )
+}
+
+# bridge_run_shared_launch <bash_bin> <launch_cmd> <errfile>
+#
+# Issue #1520 — final-launch site for the shared (non v2-secret-env) path.
+# Mirrors the v2 secret-env exec branch's job of getting the per-agent
+# CLAUDE_CONFIG_DIR onto the launched `claude` process, but for shared-mode
+# (isolation_mode: shared, non linux-user) Claude agents that never go
+# through bridge_isolation_v2_exec_with_secret_env.
+#
+# Without this, a shared Claude agent launched `"$bash_bin" -lc "$cmd"` with
+# CLAUDE_CONFIG_DIR unset, so Claude fell back to HOME-default config = the
+# operator's global ~/.claude.json. Per-agent user-scope MCP / settings /
+# credential isolation (which the bridge pre-seeds into
+# bridge_agent_claude_config_dir = <agent-home>/.claude) was silently
+# ignored. Exporting the resolved per-agent config dir here makes the fix
+# apply to BOTH newly-created AND existing shared agents on (re)start — it
+# rides the launch path, not a scaffold-time launch_cmd prefix that would
+# miss agents created before this change.
+#
+# Extracted as a function (matching the bridge_isolation_v2_exec_with_secret_env
+# rationale at lib/bridge-isolation-v2.sh) so the smoke test exercises the
+# EXACT production code path that constructs the child's launch env.
+#
+# Contract:
+#   - Claude only. Codex agents take the same shared else-branch but must
+#     NOT receive CLAUDE_CONFIG_DIR; gate on ENGINE == claude.
+#   - Export CLAUDE_CONFIG_DIR ONLY. HOME stays the operator/shared home in
+#     shared mode (unlike the plugin-preflight subshell above, which repoints
+#     HOME for its plugin-enable work). Repointing HOME for a shared agent
+#     would move every HOME-relative read off the operator's home and is
+#     explicitly out of scope for #1520.
+#   - The export runs in the same subshell that runs the launch, so it never
+#     pollutes the long-lived parent (the relaunch loop).
+#   - Returns the child's exit code.
+bridge_run_shared_launch() {
+  local _bash_bin="$1"
+  local _launch_cmd="$2"
+  local _errfile="$3"
+  local _agent_claude_root=""
+
+  if [[ "$ENGINE" == "claude" ]]; then
+    _agent_claude_root="$(bridge_run_agent_claude_root)"
+  fi
+
+  local _rc=0
+  if [[ -n "$_agent_claude_root" ]]; then
+    if (
+      # SC2030/SC2031: the subshell-local export is the point — it scopes
+      # CLAUDE_CONFIG_DIR to the exec'd child only, never the relaunch loop.
+      # shellcheck disable=SC2030,SC2031
+      export CLAUDE_CONFIG_DIR="$_agent_claude_root"
+      exec "$_bash_bin" -lc "$_launch_cmd"
+    ) 2> >(tee -a "$_errfile" >&2); then
+      _rc=0
+    else
+      _rc=$?
+    fi
+  else
+    # Non-Claude (e.g. codex) shared launch — unchanged from pre-#1520:
+    # no CLAUDE_CONFIG_DIR export.
+    if "$_bash_bin" -lc "$_launch_cmd" 2> >(tee -a "$_errfile" >&2); then
+      _rc=0
+    else
+      _rc=$?
+    fi
+  fi
+  return "$_rc"
 }
 
 bridge_run_sync_dev_plugin_cache() {
@@ -1504,7 +1576,12 @@ while true; do
     EXIT_CODE="$BRIDGE_ISOLATION_V2_LAST_EXEC_RC"
     unset BRIDGE_ISOLATION_V2_LAST_EXEC_RC
   else
-    if "$BRIDGE_BASH_BIN" -lc "$LAUNCH_CMD" 2> >(tee -a "$ERRFILE" >&2); then
+    # Issue #1520: shared (non v2-secret-env) final launch. For Claude
+    # agents this exports the per-agent CLAUDE_CONFIG_DIR so the launched
+    # `claude` reads its own <agent-home>/.claude config instead of the
+    # operator's global ~/.claude.json. HOME stays the shared/operator home.
+    # Codex agents take the same path with no CLAUDE_CONFIG_DIR export.
+    if bridge_run_shared_launch "$BRIDGE_BASH_BIN" "$LAUNCH_CMD" "$ERRFILE"; then
       EXIT_CODE=0
     else
       EXIT_CODE=$?
