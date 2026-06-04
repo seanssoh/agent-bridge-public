@@ -198,6 +198,19 @@ add_required a2a-rooms-p1b-acl
 # controller), the env-redirect teeth (BRIDGE_A2A_ROOMS_DB does NOT relocate
 # the bootstrap), and idempotency (a 2nd create does not re-bootstrap/clobber).
 add_required a2a-rooms-1517-bootstrap
+# A2A rooms P4.1 (design §11 / §14 R3): the cross-node JOIN. Member on node B
+# posts a signed room-join-request to the leader's node A over the node-link;
+# node A re-runs the full fail-closed auth preamble (remote_addr -> HMAC -> skew
+# -> dedupe), verifies the invite token (HASH compare + TTL + revocation), and
+# persists a VERIFIED PENDING row (no auto-admit — approve is P4.2). In the full
+# static suite. Lives in bridge-handoffd.py (_handle_room_join_request),
+# bridge_a2a_common.py (build/parse_room_join_request), bridge_rooms_common.py
+# (verify_invite_token_outcome TTL/revocation + record_verified_cross_node_join_
+# request), and bridge-rooms.py (OS-actor-anchored joiner + cross-node send).
+# Pins the 5 teeth (hostile --from/env inert, no-cross-agent-impersonation,
+# expired/revoked refused, no token/hash persisted anywhere, malformed/dup
+# handled) + the unweakened auth preamble + the non-leader-node refusal.
+add_required rooms-p4-1-cross-node-join
 
 
 }
@@ -863,7 +876,7 @@ select_for_path() {
       add_required queue a2a-rooms-p1b-acl
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/install-handoffd-systemd.sh)
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the
@@ -938,7 +951,21 @@ select_for_path() {
       # auth/dedupe gates upstream of the enqueue stay enforced. Pull on every
       # bridge-handoffd.py move so the force flag cannot regress to a 422 drop
       # or, worse, to a guard bypass that also weakens auth/dedupe.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force
+      # A2A Rooms P4.1 (design §11 / §14 R3): the cross-node JOIN. A member on
+      # node B posts a signed room-join-request to the leader's node A; node A
+      # verifies (node-link HMAC + token-HASH + TTL + revocation) and persists a
+      # PENDING row (no auto-admit). The NEW remote surface is
+      # _handle_room_join_request in bridge-handoffd.py; the wire builder/parser
+      # is in bridge_a2a_common.py; the TTL/revocation verify + verified-pending
+      # persistence is in bridge_rooms_common.py; the OS-actor-anchored joiner +
+      # cross-node send is in bridge-rooms.py. rooms-p4-1-cross-node-join pins the
+      # 5 teeth: hostile --from/env cannot change the joiner, a node-B process
+      # cannot join as another B agent, expired/revoked tokens are refused, the
+      # raw token AND its hash never persist in any queue/audit/staged file, and
+      # malformed/duplicate requests are handled — PLUS the auth preamble stays
+      # unweakened (HMAC 401 / remote_addr 403 / unknown-peer 403). Pull on every
+      # move to any of those files so the cross-node admission gate cannot regress.
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force rooms-p4-1-cross-node-join
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)

@@ -523,6 +523,11 @@ CREATE TABLE IF NOT EXISTS rooms (
   epoch              INTEGER NOT NULL DEFAULT 0,
   invite_token_sha256 TEXT,
   invite_token_ts    INTEGER NOT NULL DEFAULT 0,
+  -- P4.1 (§14 R3): TTL in seconds for the current invite token. 0 == no
+  -- expiry (the P1 default, back-compat: an existing room created before
+  -- this column simply gets 0 and never expires). verify_invite_token
+  -- enforces `invite_token_ts + invite_token_ttl >= now` when ttl > 0.
+  invite_token_ttl   INTEGER NOT NULL DEFAULT 0,
   invite_once        INTEGER NOT NULL DEFAULT 0,
   status             TEXT NOT NULL DEFAULT 'active',
   created_ts         INTEGER NOT NULL,
@@ -545,6 +550,25 @@ CREATE TABLE IF NOT EXISTS room_join_requests (
   node         TEXT NOT NULL DEFAULT '',
   requested_ts INTEGER NOT NULL,
   status       TEXT NOT NULL DEFAULT 'pending',
+  -- P4.1 (§11, §14 R3) cross-node forward-contract columns. They carry ONLY
+  -- verified METADATA, NEVER the reusable token hash (contract 5: the hash is
+  -- bearer-equivalent and is never persisted in any row):
+  --   verified  : 1 when this pending row was created by the receiver AFTER
+  --               the node-link HMAC + token-hash + TTL/revocation verification
+  --               passed. A future cross-node `approve` (P4.2) REQUIRES a row
+  --               with verified=1 (the local leader-initiated add path stays
+  --               separate and does NOT claim this gate — contract 6).
+  --   via_node  : the HMAC-authenticated node-link peer the request arrived
+  --               over (the joiner's node, bound to the authenticated sender
+  --               bridge — never a wire-asserted node).
+  --   ttl_expiry: absolute unix ts after which this pending request is stale.
+  --               0 == no expiry. Forward-contract for P4.2 cleanup.
+  -- Existing P1 rows get verified=0 / via_node='' / ttl_expiry=0 on migration,
+  -- which correctly reads as "a local single-node request, not a verified
+  -- cross-node one".
+  verified     INTEGER NOT NULL DEFAULT 0,
+  via_node     TEXT NOT NULL DEFAULT '',
+  ttl_expiry   INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (room_id, agent, node)
 );
 
@@ -572,11 +596,57 @@ CREATE TABLE IF NOT EXISTS room_join_rate (
   last_ts      INTEGER NOT NULL,
   PRIMARY KEY (token_sha256, source)
 );
+
+-- P4.1 (codex r2): cross-node room-join-request dedupe ledger. It lives in
+-- rooms.db (NOT the A2A inbox.db) so the dedupe reservation and the
+-- room_join_requests pending row commit in ONE transaction — "a dedupe row
+-- exists" is then ATOMIC with "a pending row exists", closing the window where
+-- a reservation could survive a failed pending write and let a replay return a
+-- bogus idempotent-200 with no pending row. message_id is the idempotency key;
+-- body_sha256 distinguishes an exact replay (duplicate) from id-reuse
+-- (conflict). It carries NO token / token-hash (contract 5).
+CREATE TABLE IF NOT EXISTS room_join_dedupe (
+  message_id   TEXT NOT NULL,
+  peer         TEXT NOT NULL DEFAULT '',
+  body_sha256  TEXT NOT NULL,
+  created_ts   INTEGER NOT NULL,
+  -- codex P4.1 Phase-4: dedupe is scoped to the AUTHENTICATED peer. A
+  -- composite (peer, message_id) PK means one authenticated peer cannot
+  -- consume/block another peer's join id by reusing a message_id (the
+  -- earlier message_id-only PK let nodeC pre-reserve nodeB's id).
+  PRIMARY KEY (peer, message_id)
+);
 """
 
 
 def now_ts() -> int:
     return int(time.time())
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Idempotently add columns introduced AFTER P1 to an existing rooms.db.
+
+    `CREATE TABLE IF NOT EXISTS` never alters an existing table, so a rooms.db
+    created by P1 lacks the P4.1 columns (rooms.invite_token_ttl,
+    room_join_requests.{verified,via_node,ttl_expiry}). We add them with the
+    same defaults the schema declares, so a migrated P1 row reads identically to
+    a freshly-created one. ALTER TABLE ADD COLUMN is cheap + non-rewriting in
+    SQLite; the per-column try/except makes re-runs (column already present) a
+    no-op rather than an error. NEVER drops/rewrites data.
+    """
+    migrations = (
+        "ALTER TABLE rooms ADD COLUMN invite_token_ttl INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE room_join_requests ADD COLUMN verified INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE room_join_requests ADD COLUMN via_node TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE room_join_requests ADD COLUMN ttl_expiry INTEGER NOT NULL DEFAULT 0",
+    )
+    for stmt in migrations:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            # duplicate column name (already migrated) → idempotent no-op.
+            pass
+    conn.commit()
 
 
 def _connect(path: Path, schema: str) -> sqlite3.Connection:
@@ -587,6 +657,7 @@ def _connect(path: Path, schema: str) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(schema)
+    _migrate_schema(conn)
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -792,22 +863,23 @@ def list_rooms(conn: sqlite3.Connection,
 
 def create_room(conn: sqlite3.Connection, *, name: str, leader_agent: str,
                 leader_node: str, token: str,
-                once: bool = False) -> str:
+                once: bool = False, ttl: int = 0) -> str:
     """Create a room led by `leader_agent@leader_node`; seed leader member row.
 
     `epoch` starts at 0. The leader row is role='leader'. Only the token HASH
-    is stored. Returns the minted room_id. The caller is responsible for
-    printing the one-time invite link (it holds the raw token).
+    is stored. `ttl` (seconds, P4.1) is the invite-token lifetime; 0 == no
+    expiry (the P1 default). Returns the minted room_id. The caller is
+    responsible for printing the one-time invite link (it holds the raw token).
     """
     room_id = mint_room_id()
     ts = now_ts()
     conn.execute(
         "INSERT INTO rooms (room_id, name, leader_agent, leader_node, epoch, "
-        "invite_token_sha256, invite_token_ts, invite_once, status, "
-        "created_ts, updated_ts) "
-        "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+        "invite_token_sha256, invite_token_ts, invite_token_ttl, invite_once, "
+        "status, created_ts, updated_ts) "
+        "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
         (room_id, name, leader_agent, leader_node, hash_token(token), ts,
-         1 if once else 0, ROOM_ACTIVE, ts, ts),
+         max(0, int(ttl)), 1 if once else 0, ROOM_ACTIVE, ts, ts),
     )
     conn.execute(
         "INSERT INTO room_members (room_id, agent, node, role, joined_ts) "
@@ -852,13 +924,21 @@ def require_leader(room: sqlite3.Row, caller_agent: str,
 # --------------------------------------------------------------------------
 
 def set_invite_token(conn: sqlite3.Connection, room_id: str, token: str,
-                     once: bool = False) -> None:
-    """Store a fresh token hash, INVALIDATING any prior token for the room."""
+                     once: bool = False, ttl: int = 0) -> None:
+    """Store a fresh token hash, INVALIDATING any prior token for the room.
+
+    `ttl` (seconds, P4.1 §14 R3) is the lifetime of THIS token; 0 == no expiry
+    (the P1 default). Setting/rotating a token resets `invite_token_ts` to now,
+    so the TTL clock restarts on every rotate — and because the prior hash is
+    overwritten, a rotate also REVOKES the old token (verify hash-compares the
+    new one). `ttl` is stored alongside so verify_invite_token can enforce
+    `invite_token_ts + ttl >= now`.
+    """
     ts = now_ts()
     conn.execute(
         "UPDATE rooms SET invite_token_sha256=?, invite_token_ts=?, "
-        "invite_once=?, updated_ts=? WHERE room_id=?",
-        (hash_token(token), ts, 1 if once else 0, ts, room_id),
+        "invite_token_ttl=?, invite_once=?, updated_ts=? WHERE room_id=?",
+        (hash_token(token), ts, max(0, int(ttl)), 1 if once else 0, ts, room_id),
     )
     # A rotated token invalidates prior rate-counters too (fresh budget).
     conn.execute(
@@ -868,14 +948,64 @@ def set_invite_token(conn: sqlite3.Connection, room_id: str, token: str,
     conn.commit()
 
 
-def verify_invite_token(room: sqlite3.Row, token: str) -> bool:
-    """Constant-time compare of `sha256(token)` against the room's stored hash."""
-    stored = room["invite_token_sha256"]
-    if not stored:
-        return False
+# Stable outcome codes for the token check (audit-safe — never carry the token).
+TOKEN_OK = "ok"
+TOKEN_MISMATCH = "mismatch"       # hash does not match (wrong/forged token)
+TOKEN_REVOKED = "revoked"         # no token set (rotated/burned away)
+TOKEN_EXPIRED = "expired"         # hash matches but TTL elapsed
+
+
+def verify_invite_token_outcome(room: sqlite3.Row, token: str,
+                                now: Optional[int] = None) -> str:
+    """Verify the invite token against the room, enforcing TTL + revocation.
+
+    Returns one of the TOKEN_* codes (NEVER the token itself, so the caller can
+    audit the outcome safely — contract 5). The order is:
+      1. revocation — a NULL/empty stored hash means the token was rotated or
+         burned away → TOKEN_REVOKED (nothing to match).
+      2. hash compare — constant-time `sha256(token)` vs the stored hash. A
+         mismatch is TOKEN_MISMATCH (wrong/forged token). We compare BEFORE the
+         TTL check so an attacker presenting a garbage token cannot learn the
+         room's TTL state via a timing/branch difference.
+      3. TTL (§14 R3) — when `invite_token_ttl` > 0, the token is valid only
+         while `invite_token_ts + ttl >= now`; past that it is TOKEN_EXPIRED.
+         A ttl of 0 means no expiry (P1 back-compat).
+    """
     import hmac as _hmac
 
-    return _hmac.compare_digest(stored, hash_token(token))
+    stored = room["invite_token_sha256"]
+    if not stored:
+        return TOKEN_REVOKED
+    if not _hmac.compare_digest(str(stored), hash_token(token)):
+        return TOKEN_MISMATCH
+    # Hash matched — now enforce TTL. Use a defensive getattr-style read so a
+    # row from an unmigrated/partial source (no ttl column) is treated as "no
+    # expiry" rather than raising.
+    try:
+        ttl = int(room["invite_token_ttl"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        ttl = 0
+    if ttl > 0:
+        try:
+            issued = int(room["invite_token_ts"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            issued = 0
+        if now is None:
+            now = now_ts()
+        if issued + ttl < int(now):
+            return TOKEN_EXPIRED
+    return TOKEN_OK
+
+
+def verify_invite_token(room: sqlite3.Row, token: str,
+                        now: Optional[int] = None) -> bool:
+    """Boolean form of `verify_invite_token_outcome` (True iff TOKEN_OK).
+
+    Now enforces TTL + revocation in addition to the hash compare, so every
+    existing caller (single-node `cmd_join`, the smokes) transparently gains the
+    P4.1 expiry/revocation gate without a signature change.
+    """
+    return verify_invite_token_outcome(room, token, now=now) == TOKEN_OK
 
 
 def burn_invite_token(conn: sqlite3.Connection, room_id: str) -> None:
@@ -1035,12 +1165,168 @@ def shared_rooms(conn: sqlite3.Connection, agent1: str, node1: str,
 
 def post_join_request(conn: sqlite3.Connection, room_id: str, agent: str,
                       node: str = "") -> None:
+    """Persist a LOCAL (single-node P1) pending join request.
+
+    verified stays 0 / via_node='' (this is not a node-link-attested cross-node
+    request). INSERT OR REPLACE re-affirms a re-requested pending row.
+    """
     conn.execute(
         "INSERT OR REPLACE INTO room_join_requests (room_id, agent, node, "
-        "requested_ts, status) VALUES (?, ?, ?, ?, ?)",
+        "requested_ts, status, verified, via_node, ttl_expiry) "
+        "VALUES (?, ?, ?, ?, ?, 0, '', 0)",
         (room_id, agent, node, now_ts(), JOIN_PENDING),
     )
     conn.commit()
+
+
+def record_verified_cross_node_join_request(
+    conn: sqlite3.Connection, room_id: str, agent: str, node: str,
+    *, via_node: str, ttl_expiry: int = 0,
+) -> None:
+    """Persist a VERIFIED cross-node (P4.1) pending join request.
+
+    Called by the leader-node receiver ONLY after the node-link HMAC +
+    token-hash + TTL/revocation verification has passed (contract 4). The row
+    carries verified METADATA — the joiner `agent@node`, the verified flag, the
+    HMAC-authenticated node-link peer (`via_node`), and an optional `ttl_expiry`
+    — but NEVER the reusable token hash (contract 5: the hash is bearer-
+    equivalent and is never persisted in any row). NO membership is added and NO
+    leader task is created here: admission is a separate P4.2 `approve` that
+    REQUIRES a verified row (contract 6).
+
+    `node` is the joiner's node as bound by the receiver to the authenticated
+    sender bridge (NEVER a wire-asserted value). INSERT OR REPLACE keyed on
+    (room_id, agent, node) makes a duplicate request idempotent (refresh ts).
+
+    NOTE: prefer `record_verified_cross_node_join_request_atomic` on the receiver
+    path — it commits the dedupe reservation + this pending row in ONE
+    transaction. This bare helper is retained for the local/test path that does
+    not need the dedupe ledger.
+    """
+    conn.execute(
+        "INSERT OR REPLACE INTO room_join_requests (room_id, agent, node, "
+        "requested_ts, status, verified, via_node, ttl_expiry) "
+        "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+        (room_id, agent, node, now_ts(), JOIN_PENDING, via_node,
+         max(0, int(ttl_expiry))),
+    )
+    conn.commit()
+
+
+# Stable outcomes for the atomic cross-node dedupe+persist (audit-safe codes).
+JOIN_DEDUPE_RESERVED = "reserved"   # new id → dedupe row + pending row committed
+JOIN_DEDUPE_DUPLICATE = "duplicate"  # same id + same body → already-accepted
+JOIN_DEDUPE_CONFLICT = "conflict"    # same id + different body → id reuse
+
+
+def room_join_dedupe_lookup(conn: sqlite3.Connection, peer: str,
+                            message_id: str, body_sha256: str) -> str:
+    """READ-ONLY dedupe check against rooms.db. Returns one of:
+    'new' (no row), JOIN_DEDUPE_DUPLICATE (same id+body), JOIN_DEDUPE_CONFLICT
+    (same id, different body). A row exists ONLY for a PREVIOUSLY-ACCEPTED
+    cross-node join (the reservation is atomic with the pending row), so a hit
+    here means the request was already accepted. Never writes.
+
+    On an UPGRADED P1 rooms.db the `room_join_dedupe` table may not exist yet
+    when this read-only path runs (codex P4.1 r3 #2): `open_rooms_readonly`
+    deliberately does NOT run schema creation, and the migrating RW `open_rooms`
+    happens later on the accept path. A missing table therefore means "no
+    prior accepted request" → 'new'; the RW open on the accept path creates the
+    table before the reservation. Any OTHER operational error propagates.
+    """
+    try:
+        row = conn.execute(
+            "SELECT body_sha256 FROM room_join_dedupe "
+            "WHERE peer=? AND message_id=?",
+            (peer, message_id),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return "new"
+        raise
+    if row is None:
+        return "new"
+    return (JOIN_DEDUPE_DUPLICATE if row["body_sha256"] == body_sha256
+            else JOIN_DEDUPE_CONFLICT)
+
+
+def record_verified_cross_node_join_request_atomic(
+    conn: sqlite3.Connection, *, message_id: str, body_sha256: str, peer: str,
+    room_id: str, agent: str, node: str, via_node: str, ttl_expiry: int = 0,
+) -> str:
+    """ATOMICALLY reserve the dedupe row AND persist the verified pending row.
+
+    The whole operation commits in ONE transaction (codex P4.1 r2): "a dedupe row
+    exists" is therefore equivalent to "a pending row exists", closing the window
+    where a surviving reservation could let a replay return a bogus idempotent
+    200 with no pending row. Returns:
+      - JOIN_DEDUPE_DUPLICATE : the message_id was already accepted with the SAME
+        body → idempotent, NOTHING re-written.
+      - JOIN_DEDUPE_CONFLICT  : the message_id was already used with a DIFFERENT
+        body → id reuse, NOTHING written.
+      - JOIN_DEDUPE_RESERVED  : a NEW id → the dedupe row + the pending row are
+        BOTH committed together.
+
+    The dedupe + pending writes are issued WITHOUT an intermediate commit, then a
+    single `conn.commit()` makes them durable atomically; a failure before the
+    commit (e.g. the pending INSERT raises) rolls BOTH back, so no orphan dedupe
+    row survives. Carries NO token / token-hash (contract 5).
+    """
+    # Re-check inside this call (the caller's read-only lookup may have raced).
+    # Scoped to the authenticated peer (codex P4.1 Phase-4 — composite PK).
+    existing = conn.execute(
+        "SELECT body_sha256 FROM room_join_dedupe "
+        "WHERE peer=? AND message_id=?",
+        (peer, message_id),
+    ).fetchone()
+    if existing is not None:
+        # A concurrent accept reserved first → resolve to the same outcome the
+        # lookup would have produced. No write (the pending row is already there
+        # from the first accept).
+        return (JOIN_DEDUPE_DUPLICATE if existing["body_sha256"] == body_sha256
+                else JOIN_DEDUPE_CONFLICT)
+    ts = now_ts()
+    try:
+        conn.execute(
+            "INSERT INTO room_join_dedupe (message_id, peer, body_sha256, "
+            "created_ts) VALUES (?, ?, ?, ?)",
+            (message_id, peer, body_sha256, ts),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO room_join_requests (room_id, agent, node, "
+            "requested_ts, status, verified, via_node, ttl_expiry) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+            (room_id, agent, node, ts, JOIN_PENDING, via_node,
+             max(0, int(ttl_expiry))),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # CONCURRENCY (codex P4.1 r3 #1): two handlers both passed the pre-check
+        # SELECT before either committed; this one lost the message_id PK race.
+        # The dedupe row's PRIMARY KEY is the serialization point — roll back our
+        # partial write and re-query the winner's row, returning the SAME
+        # idempotent/conflict outcome the pre-check would have. The loser thus
+        # gets a clean duplicate/conflict, never a 500. (No orphan row: our
+        # INSERT was rolled back; the pending row, if any, belongs to the winner.)
+        conn.rollback()
+        winner = conn.execute(
+            "SELECT body_sha256 FROM room_join_dedupe "
+            "WHERE peer=? AND message_id=?",
+            (peer, message_id),
+        ).fetchone()
+        if winner is not None:
+            return (JOIN_DEDUPE_DUPLICATE
+                    if winner["body_sha256"] == body_sha256
+                    else JOIN_DEDUPE_CONFLICT)
+        # The PK violation came from somewhere other than a concurrent winner
+        # (should not happen) — surface it rather than silently swallow.
+        raise
+    except Exception:
+        # Roll BOTH writes back so a failed pending insert never leaves an
+        # orphan dedupe reservation (the r2 atomicity contract).
+        conn.rollback()
+        raise
+    return JOIN_DEDUPE_RESERVED
 
 
 def list_join_requests(conn: sqlite3.Connection, room_id: str,
