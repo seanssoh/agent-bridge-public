@@ -105,6 +105,24 @@ smoke_make_temp_root "$SMOKE_NAME"
 export BRIDGE_AUDIT_LOG="$SMOKE_TMP_ROOT/audit.jsonl"
 : >"$BRIDGE_AUDIT_LOG"
 
+# Pin the v2 layout via the env-override path BEFORE any `bridge-lib.sh`
+# source. `bridge_isolation_v2_resolve_layout` runs while bridge-lib.sh is
+# sourced; on a host with NO v2 marker and no env override it resolves the
+# layout as `markerless(fresh-install-candidate)` and `bridge_die`s ("v0.8.0
+# requires isolation-v2"). That die `exit 1`s the `run_publish` subshell
+# BEFORE its `printf 'rc=%s'` runs, so C1 reads an EMPTY log and fails with
+# "expected rc=0, got: ". The author's dev host (and most operator boxes)
+# carry a leftover `~/.agent-bridge/state/layout-marker.sh` pinning v2, which
+# masked this — but a clean Linux CI runner ($HOME with no ~/.agent-bridge,
+# BRIDGE_HOME unset) takes the fresh-install die and the smoke was red on
+# `main` since it landed. Exporting BRIDGE_LAYOUT=v2 + an ABSOLUTE
+# BRIDGE_DATA_ROOT makes the resolver take its env-override branch
+# (BRIDGE_LAYOUT_SOURCE="env", return 0) — the same v2 layout a real isolated
+# install always has — so the source completes and the publish fn runs.
+export BRIDGE_LAYOUT="v2"
+export BRIDGE_DATA_ROOT="$SMOKE_TMP_ROOT/data"
+mkdir -p "$BRIDGE_DATA_ROOT"
+
 HELPER_DIR="$REPO_ROOT/scripts/smoke/1520c-create-isolate-helpers"
 [[ -d "$HELPER_DIR" ]] || smoke_fail "missing $HELPER_DIR (PR-C helpers)"
 
