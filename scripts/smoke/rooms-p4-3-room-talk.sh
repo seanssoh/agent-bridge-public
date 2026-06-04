@@ -34,6 +34,11 @@
 #   T10 (codex review) inbox_dedupe is scoped to the authenticated peer (composite
 #       PK): a second peer reusing another peer's message_id does NOT collide, so
 #       room talk's replay protection (which rides this dedupe) is peer-isolated.
+#   T11 (codex r2) open_inbox FAILS CLOSED if the legacy->composite-PK migration
+#       did not take (no global-PK dedupe ever served).
+#   T12 (codex r2) the staged body file is PEER-SCOPED + O_EXCL collision-proof: a
+#       competing same-message_id peer cannot clobber the staged body the later
+#       bridge-task --body-file read returns.
 
 set -euo pipefail
 
@@ -388,6 +393,34 @@ test_T11_migration_fail_closed() {
 }
 
 # ---------------------------------------------------------------------------
+# T12 (codex r2 BLOCKER): the staged body file is PEER-SCOPED + collision-proof.
+# Drives peer A's REAL do_POST through to the enqueue --body-file READ, while a
+# competing peer B stages its body under the SAME message_id between stage and
+# read. With message_id-only staging peer A would read peer B's body; with the
+# peer-scoped O_EXCL fix peer A reads its OWN body + provenance.
+# ---------------------------------------------------------------------------
+test_T12_staged_body_peer_scoped() {
+  local idb="$SMOKE_TMP_ROOT/inbox-staged-race.db"
+  local out
+  # cfg_a = the receiver config that trusts nodeA as an inbound peer (CFG_B);
+  # cfg_b = a config carrying nodeB's secret (CFG_A). The inbox dedupe + incoming
+  # staging dir live under this isolated BRIDGE_STATE_DIR.
+  out="$(env "BRIDGE_A2A_INBOX_DB=$idb" \
+    python3 "$HELPER" staged-race-unit "$SMOKE_REPO_ROOT" \
+      "$CFG_B_JSON" "$(cat "$CFG_A")" 2>&1)" \
+    || smoke_fail "staged-race-unit helper must not raise: $out"
+  smoke_assert_contains "$out" "status=200" "T12: peer A's plain enqueue is accepted (200)"
+  smoke_assert_contains "$out" "peerA_read_own_body=True" \
+    "T12: peer A's bridge-task --body-file read returns peer A's OWN body (not peer B's)"
+  smoke_assert_contains "$out" "peerA_read_B_body=False" \
+    "T12: a competing same-message_id peer B did NOT clobber peer A's staged body"
+  smoke_assert_contains "$out" "peerA_read_own_provenance=True" \
+    "T12: peer A's staged provenance is peer A's (remote agent alice), not peer B's"
+  smoke_assert_contains "$out" "sender_bridge=nodeA" \
+    "T12: the enqueued task is attributed to peer A"
+}
+
+# ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
 smoke_run "T1: a member room message (matching epoch) IS delivered" test_T1_member_talk_delivered
@@ -401,6 +434,7 @@ smoke_run "T8: a replayed room message is deduped/idempotent; same-id/diff-body 
 smoke_run "T9: auth-preamble parity — room talk is unreachable pre-auth" test_T9_auth_preamble_unweakened
 smoke_run "T10: inbox dedupe is peer-scoped — cross-peer message_id reuse does not collide" test_T10_cross_peer_dedupe_isolation
 smoke_run "T11: open_inbox fails closed if the dedupe-PK migration did not take" test_T11_migration_fail_closed
+smoke_run "T12: the staged body file is peer-scoped — no cross-peer same-id clobber" test_T12_staged_body_peer_scoped
 smoke_run "unit: the roster-cache membership gate decision surface" test_membership_gate_unit
 
 smoke_log "passed"

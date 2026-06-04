@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -765,6 +766,73 @@ def staged_body_text(env: dict[str, Any]) -> str:
     return "\n".join(header) + env.get("body", "")
 
 
+def stage_inbound_body(peer_id: str, message_id: str, text: str) -> Path:
+    """Stage an inbound enqueue body to a PEER-SCOPED, COLLISION-PROOF file.
+
+    A2A Rooms P4.3 (codex r2 review BLOCKING): the staged artifact MUST NOT be
+    keyed on `message_id` alone. With the composite `(peer, message_id)` dedupe
+    ledger, the SAME sender-chosen `message_id` is legal for DIFFERENT
+    authenticated peers — and the receiver is threaded (one do_POST per request),
+    while `bridge-task.sh create --body-file <path>` reads the staged file LATER
+    (in a subprocess). A message_id-only path (`incoming/<id>.md`) let two
+    concurrent same-id peers race on ONE shared file: peer B could overwrite it
+    AFTER peer A verified its body hash but BEFORE peer A's bridge-task subprocess
+    read `--body-file`, so peer A's task would be created with peer B's body /
+    provenance while peer A's dedupe row recorded peer A's hash. That is a
+    cross-peer side effect outside the peer-scoped dedupe contract.
+
+    The defense: the filename is derived from sha256(peer_id || "\\0" ||
+    message_id) (so two peers reusing one id get DISTINCT base names — the NUL
+    separator makes the pair-encoding unambiguous), and the file is created with
+    O_EXCL (exclusive create) plus a per-attempt random suffix, so NO two
+    concurrent stages — even the SAME (peer, message_id) re-delivered twice —
+    can ever point at or overwrite the same path. The UNIQUE created path is
+    returned and is exactly what flows to `--body-file` (no re-derivation back to
+    a message_id-only path). Mode 0600; the later bridge-task subprocess (same
+    uid) reads it fine.
+    """
+    incoming = a2a.incoming_dir()
+    # Controller-side staging dir under the receiver's OWN handoff state — never
+    # an isolated-agent path (the receiver daemon owns it). Same controller-only
+    # context as the pre-existing log_dir / pid_path mkdirs in this file.
+    incoming.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only
+    digest = hashlib.sha256(
+        peer_id.encode("utf-8") + b"\x00" + message_id.encode("utf-8")
+    ).hexdigest()
+    data = text.encode("utf-8")
+    # O_EXCL exclusive create with a random suffix: the digest scopes the name to
+    # the (peer, message_id) pair; the random suffix + O_EXCL guarantees a fresh,
+    # never-shared inode even under concurrent same-pair re-delivery. Retry on the
+    # astronomically-unlikely suffix collision (O_EXCL raises FileExistsError).
+    for _ in range(8):
+        suffix = os.urandom(8).hex()
+        staged = incoming / f"{digest}-{suffix}.md"
+        try:
+            fd = os.open(
+                str(staged),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+        except OSError:
+            # Best-effort cleanup of a half-written exclusive file, then re-raise
+            # so the caller surfaces a 5xx rather than enqueuing a partial body.
+            # Controller-side staging path (receiver-owned), never an iso path.
+            try:
+                os.unlink(str(staged))  # noqa: raw-pathlib-controller-only
+            except OSError:
+                pass
+            raise
+        return staged
+    raise OSError(
+        "could not create a unique staged-body file after repeated O_EXCL "
+        "collisions")
+
+
 # --------------------------------------------------------------------------
 # Request handling
 # --------------------------------------------------------------------------
@@ -1189,12 +1257,15 @@ class HandoffHandler(BaseHTTPRequestHandler):
                     return
 
             # --- stage body + enqueue via bridge-task.sh ---
-            staged = a2a.incoming_dir() / f"{message_id.replace(':', '_').replace('/', '_')}.md"
-            staged.write_text(staged_body_text(env), encoding="utf-8")
-            try:
-                os.chmod(staged, 0o600)
-            except OSError:
-                pass
+            # PEER-SCOPED + O_EXCL collision-proof staging (codex P4.3 r2): the
+            # composite-PK ledger legalizes the same message_id across peers, so
+            # the staged file MUST NOT be message_id-keyed (else two concurrent
+            # same-id peers race on one shared file between stage and the later
+            # bridge-task --body-file read). stage_inbound_body returns a UNIQUE
+            # path scoped to (peer_id, message_id) that flows straight to
+            # --body-file. peer_id is the authenticated X-AGB-Peer.
+            staged = stage_inbound_body(
+                peer_id, message_id, staged_body_text(env))
 
             sender = env.get("sender", {})
             ok, task_id, detail = enqueue_via_bridge_task(

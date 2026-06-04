@@ -53,6 +53,10 @@ Subcommands (argv[1]):
                                    another peer's message_id does NOT collide).
   migration-failclosed-unit <db>   prove open_inbox FAILS CLOSED (raises) if the
                                    legacy->composite-PK migration did not take.
+  staged-race-unit <repo> <cfgA> <cfgB>  prove the staged body file is
+                                   peer-scoped: a competing same-message_id peer
+                                   cannot clobber the staged body the bridge-task
+                                   --body-file read returns.
 """
 
 from __future__ import annotations
@@ -432,6 +436,106 @@ def cmd_dedupe_isolation_unit(inbox_db: str) -> int:
     return 0
 
 
+def _build_signed_enqueue(cfg: dict, peer_id: str, secret: str, *,
+                          message_id: str, target: str, sender_agent: str,
+                          title: str, body: str) -> tuple:
+    """Build a fully-signed plain A2A enqueue request (headers + body bytes) for
+    `peer_id`. Returns (path, headers, body_bytes)."""
+    env = a2a.build_envelope(
+        message_id=message_id, sender_bridge=peer_id, sender_agent=sender_agent,
+        target_agent=target, priority="normal", title=title, body=body,
+    )
+    body_bytes = json.dumps(env, ensure_ascii=False).encode("utf-8")
+    path = cfg.get("listen", {}).get("enqueue_path", "/enqueue")
+    ts = str(a2a.now_ts())
+    bh = a2a.body_sha256(body_bytes)
+    canonical = a2a.canonical_string("POST", path, peer_id, message_id, ts, bh)
+    headers = {
+        "X-AGB-Protocol": a2a.PROTOCOL_VERSION,
+        "X-AGB-Peer": peer_id,
+        "X-AGB-Message-Id": message_id,
+        "X-AGB-Timestamp": ts,
+        "X-AGB-Body-SHA256": bh,
+        "X-AGB-Signature": a2a.sign(secret, canonical),
+        "Content-Length": str(len(body_bytes)),
+    }
+    return path, headers, body_bytes
+
+
+def cmd_staged_race_unit(repo_root: str, cfg_a_json: str, cfg_b_json: str) -> int:
+    """Prove the staged body file is PEER-SCOPED + collision-proof (codex P4.3
+    r2): two peers reusing ONE message_id must NOT share/overwrite the staged
+    file between stage-time and the bridge-task --body-file READ.
+
+    Drives peer A's REAL do_POST. The fake enqueue ACTUALLY READS `body_file`,
+    but FIRST — while peer A's body is staged and BEFORE peer A's read — it stages
+    peer B's body under the SAME message_id (the competing concurrent peer). If
+    the staged path were message_id-keyed, peer B's stage would overwrite peer
+    A's file and peer A's read would return peer B's bytes. With peer-scoped O_EXCL
+    staging the paths are distinct, so peer A reads its OWN body/provenance."""
+    hd = _load_handoffd(repo_root)
+    cfg_a = json.loads(cfg_a_json)
+    cfg_b = json.loads(cfg_b_json)
+    secret_a = next((p.get("secret", "") for p in cfg_a.get("peers", [])
+                     if p.get("id") == "nodeA"), "")
+    secret_b = next((p.get("secret", "") for p in cfg_b.get("peers", [])
+                     if p.get("id") == "nodeB"), "")
+    addr_a = next((p.get("address", "") for p in cfg_a.get("peers", [])
+                   if p.get("id") == "nodeA"), "127.0.0.1")
+    shared_id = "shared:race-id"
+
+    # Build BOTH peers' signed enqueue requests carrying the SAME message_id but
+    # DIFFERENT bodies/agents.
+    path_a, headers_a, body_a = _build_signed_enqueue(
+        cfg_a, "nodeA", secret_a, message_id=shared_id, target="bob",
+        sender_agent="alice", title="from-A", body="PEER-A-BODY")
+    path_b, headers_b, body_b = _build_signed_enqueue(
+        cfg_b, "nodeB", secret_b, message_id=shared_id, target="bob",
+        sender_agent="carol", title="from-B", body="PEER-B-BODY")
+
+    captured: dict = {}
+
+    def _racing_enqueue(*, target, sender_bridge, sender_agent, priority, title,
+                        body_file):
+        # The COMPETING peer B stages its body under the SAME message_id NOW —
+        # after peer A staged, before peer A's read. Peer-scoped staging means
+        # this writes a DIFFERENT file and cannot clobber peer A's.
+        hd.stage_inbound_body("nodeB", shared_id,
+                              hd.staged_body_text(json.loads(
+                                  body_b.decode("utf-8"))))
+        # NOW read what peer A's enqueue was handed.
+        with open(body_file, encoding="utf-8") as fh:
+            captured["read"] = fh.read()
+        captured["sender_bridge"] = sender_bridge
+        captured["sender_agent"] = sender_agent
+        captured["body_file"] = str(body_file)
+        return True, "9999", "created task #9999"
+
+    hd.enqueue_via_bridge_task = _racing_enqueue  # type: ignore[assignment]
+
+    handler = hd.HandoffHandler.__new__(hd.HandoffHandler)
+    handler.path = path_a
+    handler.headers = _FakeHeaders(headers_a)
+    handler.rfile = _FakeRFile(body_a)
+    handler.client_address = (addr_a, 0)
+    handler.server = _FakeServer(cfg_a)
+    reply: dict = {}
+    handler._reply = lambda s, p, extra_headers=None: reply.update(  # type: ignore[assignment]
+        {"status": s, "payload": p})
+    handler.do_POST()
+
+    read = captured.get("read", "")
+    saw_a_body = "PEER-A-BODY" in read
+    saw_b_body = "PEER-B-BODY" in read
+    saw_a_prov = "remote agent : alice" in read
+    print(f"status={reply.get('status')}")
+    print(f"peerA_read_own_body={saw_a_body}")
+    print(f"peerA_read_B_body={saw_b_body}")
+    print(f"peerA_read_own_provenance={saw_a_prov}")
+    print(f"sender_bridge={captured.get('sender_bridge')}")
+    return 0
+
+
 def cmd_migration_failclosed_unit(inbox_db: str) -> int:
     """Prove open_inbox FAILS CLOSED if the legacy->composite migration did not
     take (codex P4.3 r2). Seeds a legacy single-PK inbox.db, neutralizes the
@@ -484,6 +588,8 @@ def main(argv: list) -> int:
         return cmd_dedupe_isolation_unit(argv[2])
     if cmd == "migration-failclosed-unit":
         return cmd_migration_failclosed_unit(argv[2])
+    if cmd == "staged-race-unit":
+        return cmd_staged_race_unit(argv[2], argv[3], argv[4])
     print(f"unknown subcommand: {cmd}", file=sys.stderr)
     return 2
 
