@@ -1682,7 +1682,7 @@ class HandoffHandler(BaseHTTPRequestHandler):
             if ro is not None:
                 try:
                     dup = rooms.room_join_dedupe_lookup(
-                        ro, message_id, computed_hash)
+                        ro, peer_id, message_id, computed_hash)
                 finally:
                     ro.close()
             else:

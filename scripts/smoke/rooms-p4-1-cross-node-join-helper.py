@@ -374,6 +374,56 @@ def cmd_atomic_race_reclassify(db: str) -> int:
     return 0
 
 
+def cmd_cross_peer_dedupe(db: str) -> int:
+    """Prove the dedupe ledger is scoped to the AUTHENTICATED peer (codex P4.1
+    Phase-4 BLOCKING). The composite (peer, message_id) PK means one
+    authenticated peer cannot consume OR block another peer's join id by reusing
+    a message_id, while same-peer idempotency (same body -> duplicate) and
+    conflict (different body -> conflict) are preserved. One line per case.
+    """
+    import bridge_rooms_common as r
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(r._ROOMS_SCHEMA)
+    conn.commit()
+    mid = "nodeB:shared-id-1"
+    body1 = "a" * 64
+    body2 = "b" * 64
+    # nodeB reserves (its own dedupe + pending row, committed atomically).
+    out_b = r.record_verified_cross_node_join_request_atomic(
+        conn, message_id=mid, body_sha256=body1, peer="nodeB",
+        room_id="room-x", agent="bob", node="nodeB", via_node="nodeB")
+    print(f"nodeB_reserve={out_b}")
+    # nodeC, SAME message_id + SAME body -> NEW (NOT consumed by nodeB's row).
+    print("nodeC_same_body_lookup="
+          + r.room_join_dedupe_lookup(conn, "nodeC", mid, body1))
+    # nodeC, SAME message_id + DIFFERENT body -> NEW (no cross-peer conflict/409).
+    print("nodeC_diff_body_lookup="
+          + r.room_join_dedupe_lookup(conn, "nodeC", mid, body2))
+    # nodeB, SAME id + SAME body -> duplicate (same-peer idempotency preserved).
+    print("nodeB_same_body_lookup="
+          + r.room_join_dedupe_lookup(conn, "nodeB", mid, body1))
+    # nodeB, SAME id + DIFFERENT body -> conflict (same-peer conflict preserved).
+    print("nodeB_diff_body_lookup="
+          + r.room_join_dedupe_lookup(conn, "nodeB", mid, body2))
+    # nodeC can INDEPENDENTLY reserve the SAME message_id (its own row + pending).
+    out_c = r.record_verified_cross_node_join_request_atomic(
+        conn, message_id=mid, body_sha256=body2, peer="nodeC",
+        room_id="room-x", agent="carol", node="nodeC", via_node="nodeC")
+    print(f"nodeC_reserve={out_c}")
+    n_ded = conn.execute(
+        "SELECT COUNT(*) FROM room_join_dedupe WHERE message_id=?",
+        (mid,)).fetchone()[0]
+    print(f"dedupe_rows_for_shared_id={n_ded}")
+    n_pending = conn.execute(
+        "SELECT COUNT(*) FROM room_join_requests WHERE room_id=?",
+        ("room-x",)).fetchone()[0]
+    print(f"pending_rows_for_shared_id={n_pending}")
+    conn.close()
+    return 0
+
+
 def cmd_drop_dedupe_table(db: str) -> int:
     """DROP room_join_dedupe to simulate an UPGRADED P1 rooms.db whose RW-open
     migration has not yet recreated the table (codex P4.1 r3 #2 tooth)."""
@@ -424,6 +474,8 @@ def main(argv: list[str]) -> int:
         return cmd_drop_dedupe_table(rest[0])
     if cmd == "atomic-race-reclassify":
         return cmd_atomic_race_reclassify(rest[0])
+    if cmd == "cross-peer-dedupe":
+        return cmd_cross_peer_dedupe(rest[0])
     if cmd == "set-token-ts":
         return cmd_set_token_ts(rest[0], rest[1], rest[2])
     print(f"unknown subcommand: {cmd}", file=sys.stderr)

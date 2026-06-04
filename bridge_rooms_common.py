@@ -606,10 +606,15 @@ CREATE TABLE IF NOT EXISTS room_join_rate (
 -- body_sha256 distinguishes an exact replay (duplicate) from id-reuse
 -- (conflict). It carries NO token / token-hash (contract 5).
 CREATE TABLE IF NOT EXISTS room_join_dedupe (
-  message_id   TEXT PRIMARY KEY,
+  message_id   TEXT NOT NULL,
   peer         TEXT NOT NULL DEFAULT '',
   body_sha256  TEXT NOT NULL,
-  created_ts   INTEGER NOT NULL
+  created_ts   INTEGER NOT NULL,
+  -- codex P4.1 Phase-4: dedupe is scoped to the AUTHENTICATED peer. A
+  -- composite (peer, message_id) PK means one authenticated peer cannot
+  -- consume/block another peer's join id by reusing a message_id (the
+  -- earlier message_id-only PK let nodeC pre-reserve nodeB's id).
+  PRIMARY KEY (peer, message_id)
 );
 """
 
@@ -1214,8 +1219,8 @@ JOIN_DEDUPE_DUPLICATE = "duplicate"  # same id + same body → already-accepted
 JOIN_DEDUPE_CONFLICT = "conflict"    # same id + different body → id reuse
 
 
-def room_join_dedupe_lookup(conn: sqlite3.Connection, message_id: str,
-                            body_sha256: str) -> str:
+def room_join_dedupe_lookup(conn: sqlite3.Connection, peer: str,
+                            message_id: str, body_sha256: str) -> str:
     """READ-ONLY dedupe check against rooms.db. Returns one of:
     'new' (no row), JOIN_DEDUPE_DUPLICATE (same id+body), JOIN_DEDUPE_CONFLICT
     (same id, different body). A row exists ONLY for a PREVIOUSLY-ACCEPTED
@@ -1231,8 +1236,9 @@ def room_join_dedupe_lookup(conn: sqlite3.Connection, message_id: str,
     """
     try:
         row = conn.execute(
-            "SELECT body_sha256 FROM room_join_dedupe WHERE message_id=?",
-            (message_id,),
+            "SELECT body_sha256 FROM room_join_dedupe "
+            "WHERE peer=? AND message_id=?",
+            (peer, message_id),
         ).fetchone()
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower():
@@ -1267,9 +1273,11 @@ def record_verified_cross_node_join_request_atomic(
     row survives. Carries NO token / token-hash (contract 5).
     """
     # Re-check inside this call (the caller's read-only lookup may have raced).
+    # Scoped to the authenticated peer (codex P4.1 Phase-4 — composite PK).
     existing = conn.execute(
-        "SELECT body_sha256 FROM room_join_dedupe WHERE message_id=?",
-        (message_id,),
+        "SELECT body_sha256 FROM room_join_dedupe "
+        "WHERE peer=? AND message_id=?",
+        (peer, message_id),
     ).fetchone()
     if existing is not None:
         # A concurrent accept reserved first → resolve to the same outcome the
@@ -1302,8 +1310,9 @@ def record_verified_cross_node_join_request_atomic(
         # INSERT was rolled back; the pending row, if any, belongs to the winner.)
         conn.rollback()
         winner = conn.execute(
-            "SELECT body_sha256 FROM room_join_dedupe WHERE message_id=?",
-            (message_id,),
+            "SELECT body_sha256 FROM room_join_dedupe "
+            "WHERE peer=? AND message_id=?",
+            (peer, message_id),
         ).fetchone()
         if winner is not None:
             return (JOIN_DEDUPE_DUPLICATE

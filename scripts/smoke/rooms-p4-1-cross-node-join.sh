@@ -457,6 +457,35 @@ test_atomic_race_reclassified_not_500() {
 }
 
 # ---------------------------------------------------------------------------
+# T6 (codex P4.1 Phase-4 BLOCKING): dedupe is scoped to the AUTHENTICATED peer.
+#     A second authenticated peer (nodeC) reusing nodeB's message_id must NOT
+#     consume or block nodeB's join id — composite (peer, message_id) PK. Same-
+#     peer idempotency (same body) + conflict (different body) are preserved.
+# ---------------------------------------------------------------------------
+test_T6_cross_peer_dedupe_isolation() {
+  local xdb="$SMOKE_TMP_ROOT/cross-peer.db"
+  local out
+  out="$(python3 "$HELPER" cross-peer-dedupe "$xdb" 2>&1)" \
+    || smoke_fail "cross-peer-dedupe helper must not raise: $out"
+  smoke_assert_contains "$out" "nodeB_reserve=reserved" \
+    "nodeB reserves its own dedupe + pending row"
+  smoke_assert_contains "$out" "nodeC_same_body_lookup=new" \
+    "T6: nodeC reusing nodeB's message_id (SAME body) is NEW — not consumed (cross-peer isolation)"
+  smoke_assert_contains "$out" "nodeC_diff_body_lookup=new" \
+    "T6: nodeC reusing nodeB's message_id (DIFFERENT body) is NEW — no cross-peer 409"
+  smoke_assert_contains "$out" "nodeB_same_body_lookup=duplicate" \
+    "T6: nodeB same id+body stays idempotent (duplicate) — same-peer dedupe preserved"
+  smoke_assert_contains "$out" "nodeB_diff_body_lookup=conflict" \
+    "T6: nodeB same id+different body stays a conflict — same-peer dedupe preserved"
+  smoke_assert_contains "$out" "nodeC_reserve=reserved" \
+    "T6: nodeC independently reserves the SAME message_id (its own row)"
+  smoke_assert_contains "$out" "dedupe_rows_for_shared_id=2" \
+    "T6: two authenticated peers => two independent dedupe rows for one message_id"
+  smoke_assert_contains "$out" "pending_rows_for_shared_id=2" \
+    "T6: two authenticated peers => two independent pending rows"
+}
+
+# ---------------------------------------------------------------------------
 # run
 # ---------------------------------------------------------------------------
 smoke_run "setup: room on node A + baseline cross-node join captured" test_setup_room_and_capture
@@ -472,5 +501,6 @@ smoke_run "auth preamble unweakened (HMAC 401 / remote_addr 403 / unknown peer 4
 smoke_run "a non-leader node refuses + persists nothing" test_non_leader_node_refuses
 smoke_run "r3 #2: unmigrated P1 db (missing dedupe table) still joins (no 500)" test_upgraded_db_missing_dedupe_table
 smoke_run "r3 #1: a message_id PK race is reclassified (dup/conflict), not a 500" test_atomic_race_reclassified_not_500
+smoke_run "T6: dedupe scoped to authenticated peer — one peer can't consume/block another's join id" test_T6_cross_peer_dedupe_isolation
 
 smoke_log "passed"
