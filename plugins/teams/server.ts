@@ -265,7 +265,11 @@ function saveJson(path: string, payload: unknown): void {
 }
 
 function ms365CallbackStateValid(state: string): boolean {
-  return /^[A-Za-z0-9_-]{8,128}$/.test(state)
+  // Allow a `.` so the multi-agent router can carry a `<agent>.<uuid>` prefix
+  // (the ms365 plugin embeds BRIDGE_AGENT_ID to demux a shared /auth/callback).
+  // No `/` is permitted, so `ms365CallbackPath` can never escape the callback
+  // dir; min length 8 still rejects `..`. Max bumped to fit agent prefix+uuid.
+  return /^[A-Za-z0-9_.-]{8,160}$/.test(state)
 }
 
 function ms365CallbackPath(state: string): string {
