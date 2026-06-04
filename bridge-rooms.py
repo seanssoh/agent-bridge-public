@@ -530,6 +530,134 @@ def _invoke_test_post_hook(*, path: str, headers: dict,
     return 200, (proc.stdout or "").encode("utf-8")
 
 
+def _post_room_roster_broadcast(*, member_node: str, room_id: str,
+                                room_epoch: int, members: list,
+                                leader_node: str, timeout: float = 30.0,
+                                ) -> tuple[int, bytes]:
+    """POST the leader-signed roster broadcast to ONE member node (P4.2).
+
+    `member_node` names the A2A peer to deliver to; the body is signed with the
+    leader-node↔member-node PAIRWISE node-link HMAC (the existing per-peer
+    secret), so the member can verify the roster came from the leader and a
+    member that lacks the leader↔Z secret cannot forge a roster node Z accepts
+    (§14 R2). `members` MUST be the canonical sorted roster. `leader_node` is the
+    local node (this leader's node id). Returns (http_status, response_body).
+
+    Reuses the SAME paired-flag test seam as the join sender
+    (BRIDGE_ROOMS_TEST_POST_HOOK) — the hook captures the signed request; the
+    smoke replays it through the real member-side receiver handler. NEVER honored
+    in production (the paired flags are unset there).
+    """
+    if a2a is None:  # pragma: no cover - a2a always ships beside this
+        raise rooms.RoomsError(
+            "roster broadcast requires the A2A module + node-link config",
+            code="a2a_unavailable",
+        )
+    cfg = a2a.load_config()
+    local_bridge_id = str(cfg.get("bridge_id", "") or "").strip()
+    if not local_bridge_id:
+        raise rooms.RoomsError(
+            "config has no 'bridge_id' — cannot identify this leader node for a "
+            "roster broadcast", code="no_bridge_id",
+        )
+    peer = a2a.find_peer(cfg, member_node)
+    secret = a2a.peer_send_secret(peer)
+    body = a2a.build_room_roster_broadcast(
+        room_id=room_id, room_epoch=room_epoch, members=members,
+        leader_node=leader_node,
+    )
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    message_id = a2a.new_message_id(local_bridge_id)
+    path = peer.get("room_roster_path", a2a.ROOM_ROSTER_PATH)
+    timestamp = str(a2a.now_ts())
+    body_hash = a2a.body_sha256(body_bytes)
+    canonical = a2a.canonical_string(
+        "POST", path, local_bridge_id, message_id, timestamp, body_hash)
+    signature = a2a.sign(secret, canonical)
+    headers = {
+        "Content-Type": "application/json",
+        "X-AGB-Protocol": a2a.ROOM_ROSTER_PROTOCOL_VERSION,
+        "X-AGB-Peer": local_bridge_id,
+        "X-AGB-Message-Id": message_id,
+        "X-AGB-Timestamp": timestamp,
+        "X-AGB-Body-SHA256": body_hash,
+        "X-AGB-Signature": signature,
+    }
+
+    if _test_post_hook_allowed():
+        return _invoke_test_post_hook(path=path, headers=headers,
+                                      body_bytes=body_bytes)
+
+    address = a2a.resolve_peer_address(peer)
+    port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
+    if not address:
+        raise rooms.RoomsError(
+            f"member node {member_node!r} has no resolvable address",
+            code="no_member_address",
+        )
+    import urllib.request
+
+    url = f"http://{address}:{port}{path}"
+    req = urllib.request.Request(url, data=body_bytes, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
+        return exc.code, (exc.read() or b"")
+
+
+def _member_nodes_for_broadcast(roster: dict, leader_node: str) -> list:
+    """The DISTINCT remote member nodes a roster broadcast targets.
+
+    Every member node that is NOT the leader's own node (the leader's local
+    members already see the authoritative rooms.db — no node-link hop). The
+    leader node is excluded so the leader never POSTs a roster to itself.
+    Deterministically ordered for reproducible broadcasts.
+    """
+    nodes: list = []
+    for m in roster.get("members", []):
+        mnode = str(m.get("node", "") or "")
+        if mnode and mnode != leader_node and mnode not in nodes:
+            nodes.append(mnode)
+    return sorted(nodes)
+
+
+def _broadcast_roster_to_members(room_id: str, roster: dict,
+                                 leader_node: str) -> dict:
+    """Broadcast the leader-signed canonical roster to every remote member node.
+
+    One signed POST per member node (§14 R2). Returns a summary
+    {delivered:[...], failed:[{node,status}...]} so the CLI can report partial
+    failures (a member-node outage does not unwind the already-committed local
+    approve — the leader's rooms.db is authoritative; the roster broadcast is
+    durable/retryable, design §14 R2). Broadcast failures are reported, never
+    fatal to the approve.
+    """
+    delivered: list = []
+    failed: list = []
+    member_nodes = _member_nodes_for_broadcast(roster, leader_node)
+    for mnode in member_nodes:
+        try:
+            status, _resp = _post_room_roster_broadcast(
+                member_node=mnode, room_id=room_id,
+                room_epoch=int(roster["epoch"]), members=roster["members"],
+                leader_node=leader_node,
+            )
+        except rooms.RoomsError as exc:
+            failed.append({"node": mnode, "error": str(exc)})
+            continue
+        except Exception as exc:  # noqa: BLE001 - transport/config failure
+            failed.append({"node": mnode, "error": f"broadcast failed: {exc}"})
+            continue
+        if 200 <= status < 300:
+            delivered.append(mnode)
+        else:
+            failed.append({"node": mnode, "status": status})
+    return {"delivered": delivered, "failed": failed}
+
+
 def cmd_join(args: argparse.Namespace) -> int:
     parsed = rooms.parse_invite_link(args.link)
     room_id = parsed.get("room", "")
@@ -567,6 +695,42 @@ def cmd_join(args: argparse.Namespace) -> int:
                 detail = ""
             return die(f"leader node rejected the join (HTTP {status}): {detail}",
                        code=1)
+        # P4.2 FIRST-ROSTER binding anchor: record the member's OWN outbound
+        # join intent locally (room_id + the leader_node it posted to). This is
+        # the un-spoofable proof that THIS node chose THIS room+leader, so the
+        # member can later accept the leader's FIRST roster broadcast for this
+        # room — and REFUSE a roster for a room it never tried to join (the
+        # anti-rogue-leader-minting defense, accept_roster_broadcast contract
+        # 3c). We record ONLY when the leader's 2xx response CONFIRMS it
+        # persisted a pending row (`status==pending`) or already had one
+        # (`duplicate==true`) — a bare 200 with no such confirmation does NOT
+        # mint a local binding (so a non-committal/stub response cannot seed a
+        # spurious intent).
+        leader_confirmed_pending = False
+        try:
+            ack = json.loads(resp.decode("utf-8", "replace") or "{}")
+            if isinstance(ack, dict):
+                leader_confirmed_pending = (
+                    ack.get("status") == rooms.JOIN_PENDING
+                    or ack.get("duplicate") is True)
+        except (ValueError, json.JSONDecodeError):
+            leader_confirmed_pending = False
+        if leader_confirmed_pending:
+            try:
+                mconn = rooms.open_rooms()
+                try:
+                    rooms.record_local_join_intent(
+                        mconn, room_id, agent, node, leader_node=leader_node)
+                finally:
+                    mconn.close()
+            except rooms.RoomsError as exc:
+                # The leader already accepted the join; failing to record the
+                # local binding is non-fatal but means the first roster will be
+                # refused until re-joined. Surface it without unwinding the
+                # accepted join.
+                info(f"WARNING: cross-node join accepted but local binding not "
+                     f"recorded ({exc}); the first roster broadcast may be "
+                     "refused until you re-run join")
         if args.json:
             out(json.dumps({"room_id": room_id,
                             "agent": f"{agent}@{node}",
@@ -608,17 +772,32 @@ def cmd_approve(args: argparse.Namespace) -> int:
     node = local_node()
     agent, anode = split_agent_node(args.target, node)
     conn = rooms.open_rooms()
+    roster_snapshot: Optional[dict] = None
     try:
         room = _require_leader_conn(conn, args.room_id, args)
-        # A join must have been requested (the two-factor gate: token =>
-        # request => leader approval). Approving an unrequested agent is a
-        # leader-initiated add, which we allow but note.
-        epoch = rooms.approve_join(conn, args.room_id, agent, anode)
+        leader_node = str(room["leader_node"] or "")
+        # P4.2 contract 1/6: a CROSS-NODE approve (admitting a REMOTE agent whose
+        # node != this leader node) REQUIRES a P4.1 verified pending row — the
+        # receiver only creates that AFTER the node-link HMAC + token + TTL/
+        # revocation verification passed. The LOCAL leader-add path (admitting an
+        # agent on this leader's OWN node) stays a SEPARATE path that does NOT
+        # claim that token/two-factor gate. The two paths are kept distinct here.
+        is_cross_node = bool(anode) and bool(leader_node) and anode != leader_node
+        if is_cross_node:
+            epoch = rooms.approve_cross_node(conn, args.room_id, agent, anode)
+        else:
+            # P1 local path: a leader-initiated add of a local agent (no verified-
+            # pending-row requirement — the leader is OS-authenticated and the
+            # agent shares this node).
+            epoch = rooms.approve_join(conn, args.room_id, agent, anode)
         if room["invite_once"]:
             rooms.burn_invite_token(conn, args.room_id)
             burned = True
         else:
             burned = False
+        # Snapshot the NEW canonical roster (post-approve, post-epoch-bump) while
+        # the connection is open, so we can broadcast it after closing the db.
+        roster_snapshot = rooms.roster_for(conn, args.room_id)
     except rooms.RoomsError as exc:
         conn.close()
         return die(str(exc), code=1)
@@ -627,12 +806,32 @@ def cmd_approve(args: argparse.Namespace) -> int:
             conn.close()
         except Exception:  # noqa: BLE001
             pass
+
+    # Broadcast the leader-signed canonical roster to every REMOTE member node
+    # over the node-link (§14 R2). The local approve is already committed +
+    # authoritative; a member-node delivery failure is reported, never fatal
+    # (roster broadcasts are durable/retryable). No-op when there are no remote
+    # member nodes (a pure single-node room).
+    broadcast = {"delivered": [], "failed": []}
+    if roster_snapshot is not None and leader_node:
+        broadcast = _broadcast_roster_to_members(
+            args.room_id, roster_snapshot, leader_node)
+
     if args.json:
         out(json.dumps({"room_id": args.room_id, "approved": f"{agent}@{anode}",
-                        "epoch": epoch, "invite_burned": burned}))
+                        "epoch": epoch, "invite_burned": burned,
+                        "cross_node": is_cross_node,
+                        "roster_broadcast": broadcast}))
     else:
         info(f"approved {agent}@{anode} into {args.room_id} (epoch {epoch})"
              + (" — single-use invite burned" if burned else ""))
+        if broadcast["delivered"]:
+            info(f"roster broadcast delivered to: "
+                 f"{', '.join(broadcast['delivered'])}")
+        if broadcast["failed"]:
+            info(f"WARNING: roster broadcast failed for: "
+                 f"{broadcast['failed']} (durable/retryable — the local approve "
+                 "is committed)")
     return 0
 
 

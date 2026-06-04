@@ -841,6 +841,16 @@ class HandoffHandler(BaseHTTPRequestHandler):
         if self.path == room_join_path:
             self._handle_room_join_request(cfg)
             return
+        # A2A Rooms P4.2 (design §6 / §14 R2): the leader-signed roster broadcast
+        # is ALSO routed to a SEPARATE handler with the SAME fail-closed auth
+        # preamble (remote_addr -> HMAC -> skew -> dedupe). Its terminal action
+        # is a member-local room_roster_cache write — it NEVER reaches the
+        # enqueue/allowlist/queue boundary, creates no task, and admits nothing.
+        room_roster_path = cfg.get("listen", {}).get(
+            "room_roster_path", a2a.ROOM_ROSTER_PATH)
+        if self.path == room_roster_path:
+            self._handle_room_roster_broadcast(cfg)
+            return
         if self.path != enqueue_path:
             self._reply(404, {"ok": False, "error": "not found"})
             return
@@ -1843,6 +1853,314 @@ class HandoffHandler(BaseHTTPRequestHandler):
         self._reply(200, {"ok": True, "status": rooms.JOIN_PENDING,
                           "room_id": room_id,
                           "joiner": f"{joiner_agent}@{joiner_node}"})
+
+    def _handle_room_roster_broadcast(self, cfg: dict[str, Any]) -> None:
+        """Receiver branch for the leader-signed cross-node roster broadcast
+        (A2A Rooms P4.2, design §6 / §14 R2).
+
+        HIGH-RISK: a NEW remote-traffic surface. It runs the SAME fail-closed
+        auth preamble as do_POST / _handle_room_join_request (NO step weakened),
+        then applies the member-side roster-acceptance contracts and writes the
+        member-local room_roster_cache. Validation ORDER (security=True audit on
+        every reject; NO persistence until ALL pass):
+          a. tailnet-only bind — guaranteed at startup (resolve_bind).
+          b. protocol tag == ROOM_ROSTER_PROTOCOL_VERSION.
+          c. message_id REQUIRED (anchors dedupe).
+          d. peer ALREADY PAIRED (find_peer; unknown -> 403). NOT discovery.
+          e. remote_addr == the peer's CURRENT resolved Tailscale IP (before
+             the body is read off the socket).
+          f. HMAC: secret present, body hash, signature (constant-time). The
+             X-AGB-Signature IS the leader-node↔member-node PAIRWISE signature
+             (§14 R2) — a member that lacks the leader↔Z secret cannot forge a
+             roster node Z would accept. The PATH is in the canonical string, so
+             an enqueue/join/identity signature cannot be replayed here.
+          g. clock-skew window — transient drift 503, far-stale 401.
+          h. durable dedupe (replay-safe) on (peer, message_id). A byte-identical
+             re-broadcast is an idempotent 200; an id-reuse-with-different-body is
+             a 409. The dedupe ledger lives in rooms.db (the member's own db).
+          i. parse the control body (shape only).
+          j. ACCEPT per the member-side contracts (anti-rogue-leader binding +
+             monotonic epoch + atomic cache write) — see
+             rooms.accept_roster_broadcast. The authenticated `peer_id` is the
+             ONLY trusted leader identity (it MUST equal the body's leader_node);
+             a roster from a non-leader peer persists NOTHING.
+        """
+        client_ip = self._client_ip()
+        peer_id = self.headers.get("X-AGB-Peer", "")
+        message_id = self.headers.get("X-AGB-Message-Id", "")
+        timestamp = self.headers.get("X-AGB-Timestamp", "")
+        body_hash_hdr = self.headers.get("X-AGB-Body-SHA256", "")
+        signature = self.headers.get("X-AGB-Signature", "")
+        protocol = self.headers.get("X-AGB-Protocol", "")
+
+        # --- b. protocol tag ---
+        if protocol != a2a.ROOM_ROSTER_PROTOCOL_VERSION:
+            audit("room_roster_reject", reason="bad_protocol",
+                  peer=peer_id, client=client_ip, got=protocol)
+            self._reply(400, {"ok": False, "error": "unsupported protocol"})
+            return
+
+        # --- c. message_id REQUIRED (non-empty) ---
+        if not message_id:
+            audit("room_roster_reject", reason="missing_message_id",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(400, {"ok": False, "error": "message id required"})
+            return
+
+        # --- d. peer must be ALREADY PAIRED (not a discovery channel) ---
+        try:
+            peer = a2a.find_peer(cfg, peer_id)
+        except a2a.A2AError:
+            audit("room_roster_reject", reason="unknown_peer",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(403, {"ok": False, "error": "unknown peer"})
+            return
+
+        # --- e. remote_addr == authenticated peer's CURRENT address (before body) ---
+        try:
+            peer_addr = a2a.resolve_peer_address(peer)
+        except a2a.A2AError as exc:
+            audit("room_roster_reject", reason=getattr(exc, "code",
+                  "resolve_error"), peer=peer_id, client=client_ip,
+                  security=True)
+            self._reply(403, {"ok": False, "error": "source address mismatch"})
+            return
+        if not peer_addr or client_ip != peer_addr:
+            audit("room_roster_reject", reason="addr_mismatch",
+                  peer=peer_id, client=client_ip, expected=peer_addr,
+                  security=True)
+            self._reply(403, {"ok": False, "error": "source address mismatch"})
+            return
+
+        # --- size guard before reading the body (roster bodies are small) ---
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = -1
+        if content_length < 0:
+            self._reply(411, {"ok": False, "error": "length required"})
+            return
+        max_body = 256 * 1024  # a roster of many members, still bounded
+        if content_length > max_body:
+            audit("room_roster_reject", reason="oversize",
+                  peer=peer_id, client=client_ip, declared=content_length)
+            self._reply(413, {"ok": False, "error": "body too large"})
+            return
+        raw = self.rfile.read(content_length) if content_length else b""
+
+        # --- f. HMAC: secret present, body hash, signature (auth boundary) ---
+        secrets = a2a.peer_secrets(peer)
+        if not secrets:
+            audit("room_roster_reject", reason="no_secret",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(403, {"ok": False, "error": "peer not provisioned"})
+            return
+        computed_hash = a2a.body_sha256(raw)
+        if body_hash_hdr != computed_hash:
+            audit("room_roster_reject", reason="body_hash",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(401, {"ok": False, "error": "body hash mismatch"})
+            return
+        # HMAC FIRST (before timestamp-band classification) so an
+        # unauthenticated request never receives a transient/permanent split
+        # that leaks signature validity (same ordering as do_POST, #1346). The
+        # path is part of the canonical string, so a signature minted for the
+        # enqueue/join/identity endpoint cannot be replayed against this one.
+        canonical = a2a.canonical_string(
+            "POST", self.path, peer_id, message_id, timestamp, computed_hash)
+        if not a2a.verify_signature(secrets, canonical, signature):
+            audit("room_roster_reject", reason="bad_signature",
+                  peer=peer_id, client=client_ip, message_id=message_id,
+                  security=True)
+            self._reply(401, {"ok": False, "error": "signature verification failed"})
+            return
+
+        # --- g. clock-skew window (authenticated past this point) ---
+        skew = int(cfg.get("timestamp_skew_seconds",
+                           a2a.DEFAULT_TIMESTAMP_SKEW_SECONDS))
+        grace_skew = int(cfg.get("timestamp_skew_grace_seconds",
+                                 a2a.DEFAULT_TIMESTAMP_SKEW_GRACE_SECONDS))
+        if grace_skew < skew:
+            grace_skew = skew
+        receiver_now = a2a.now_ts()
+        try:
+            req_ts = int(timestamp)
+        except (TypeError, ValueError):
+            audit("room_roster_reject", reason="bad_timestamp",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(401, {"ok": False, "error": "bad timestamp"})
+            return
+        ts_delta = abs(receiver_now - req_ts)
+        if ts_delta > grace_skew:
+            audit("room_roster_reject", reason="clock_skew_permanent",
+                  peer=peer_id, client=client_ip, delta_seconds=ts_delta,
+                  security=True)
+            self._reply(401, {"ok": False,
+                              "error": "timestamp far outside skew window",
+                              "receiver_ts": receiver_now})
+            return
+        if ts_delta > skew:
+            audit("room_roster_reject", reason="clock_skew_transient",
+                  peer=peer_id, client=client_ip, delta_seconds=ts_delta)
+            self._reply(503, {"ok": False,
+                              "error": "timestamp outside skew window — retry",
+                              "receiver_ts": receiver_now},
+                        extra_headers={"Retry-After": str(max(1, skew))})
+            return
+
+        # --- h. durable dedupe — READ-ONLY replay check (peer-scoped) ---
+        # A byte-identical re-broadcast (same peer+id+body) is an idempotent 200;
+        # an id-reuse with a DIFFERENT body is a 409. The dedupe ledger reuses
+        # the room_join_dedupe table in the MEMBER's rooms.db (the member's own
+        # db). A rejected/no-op acceptance leaves NO dedupe row, so a replay
+        # re-runs acceptance (the stale-epoch / not-leader teeth hold on replay).
+        if rooms is None:
+            audit("room_roster_error", reason="rooms_module_unavailable",
+                  peer=peer_id, client=client_ip, message_id=message_id)
+            self._reply(500, {"ok": False, "error": "rooms unavailable"})
+            return
+        try:
+            ro = rooms.open_rooms_readonly()
+            if ro is not None:
+                try:
+                    dup = rooms.room_join_dedupe_lookup(
+                        ro, peer_id, message_id, computed_hash)
+                finally:
+                    ro.close()
+            else:
+                dup = "new"
+        except Exception as exc:  # noqa: BLE001 - last-resort guard
+            audit("room_roster_error", reason="dedupe_error",
+                  peer=peer_id, client=client_ip, detail=str(exc)[:200])
+            self._reply(500, {"ok": False, "error": "internal error"})
+            return
+        if dup == rooms.JOIN_DEDUPE_DUPLICATE:
+            audit("room_roster_accept", reason="duplicate",
+                  peer=peer_id, client=client_ip, message_id=message_id)
+            self._reply(200, {"ok": True, "duplicate": True})
+            return
+        if dup == rooms.JOIN_DEDUPE_CONFLICT:
+            audit("room_roster_reject", reason="hash_conflict",
+                  peer=peer_id, client=client_ip, message_id=message_id,
+                  security=True)
+            self._reply(409, {"ok": False,
+                              "error": "message id reused with different body"})
+            return
+
+        # --- i. parse the control body (shape only) ---
+        try:
+            roster = a2a.parse_room_roster_broadcast(raw)
+        except a2a.A2AError as exc:
+            audit("room_roster_reject", reason=getattr(exc, "code",
+                  "bad_room_roster"), peer=peer_id, client=client_ip,
+                  message_id=message_id)
+            self._reply(422, {"ok": False, "error": str(exc)})
+            return
+
+        room_id = str(roster["room_id"])
+        leader_node = str(roster["leader_node"])
+        room_epoch = int(roster["room_epoch"])
+        members = list(roster["members"])
+
+        # --- j. ACCEPT per the member-side contracts WITH atomic dedupe (codex
+        # P4.2 r3 BLOCKING — close the TOCTOU race). accept_roster_broadcast
+        # enforces leader-authority (peer==leader_node), the leader pin, the
+        # first-roster binding, the monotonic epoch, AND folds the peer-scoped
+        # dedupe RESERVATION into the SAME transaction as the cache write. So a
+        # same-(peer,message_id)/DIFFERENT-body roster is caught as a CONFLICT
+        # BEFORE any cache mutation (409, nothing written), and a contract REJECT
+        # (not_leader / leader_mismatch / no_binding / stale) reserves NO dedupe
+        # row so a replay re-evaluates. The earlier read-only dedupe pre-check
+        # (step h) is a fast-path early answer for an ALREADY-RESERVED id; the
+        # authoritative serialization is here.
+        try:
+            conn = rooms.open_rooms()
+        except rooms.RoomsError as exc:
+            audit("room_roster_error", reason=getattr(exc, "code", "rooms_db"),
+                  peer=peer_id, client=client_ip, message_id=message_id)
+            self._reply(500, {"ok": False, "error": "rooms db error"})
+            return
+        try:
+            try:
+                outcome = rooms.accept_roster_broadcast(
+                    conn, room_id=room_id, room_epoch=room_epoch,
+                    members=members, leader_node=leader_node, peer_id=peer_id,
+                    message_id=message_id, body_sha256=computed_hash,
+                    mac=signature,
+                )
+            except rooms.RoomsError as exc:
+                audit("room_roster_error", reason=getattr(exc, "code",
+                      "accept_error"), peer=peer_id, client=client_ip,
+                      message_id=message_id, room_id=room_id)
+                self._reply(500, {"ok": False, "error": "internal error"})
+                return
+        finally:
+            conn.close()
+
+        if outcome == rooms.ROSTER_NOT_LEADER:
+            audit("room_roster_reject", reason="not_leader",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  leader_node=leader_node, message_id=message_id,
+                  security=True)
+            self._reply(403, {"ok": False,
+                              "error": "roster sender is not the room leader"})
+            return
+        if outcome == rooms.ROSTER_LEADER_MISMATCH:
+            # A configured peer self-claiming leadership of a room already led by
+            # a DIFFERENT node — a takeover attempt. Reject, persist nothing
+            # (codex P4.2 r1 BLOCKING).
+            audit("room_roster_reject", reason="leader_mismatch",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  leader_node=leader_node, message_id=message_id,
+                  security=True)
+            self._reply(403, {"ok": False,
+                              "error": "roster sender is not the established "
+                              "room leader (takeover refused)"})
+            return
+        if outcome == rooms.ROSTER_NO_LOCAL_BINDING:
+            audit("room_roster_reject", reason="no_local_binding",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  message_id=message_id, security=True)
+            self._reply(403, {"ok": False,
+                              "error": "no local join state for this room — "
+                              "refusing to mint a roster cache from an "
+                              "inbound broadcast"})
+            return
+        if outcome == rooms.ROSTER_DEDUPE_CONFLICT:
+            # Same (peer, message_id) reused with a DIFFERENT body — caught at the
+            # atomic dedupe reservation BEFORE any cache write (codex P4.2 r3).
+            audit("room_roster_reject", reason="hash_conflict",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  message_id=message_id, security=True)
+            self._reply(409, {"ok": False,
+                              "error": "message id reused with different body"})
+            return
+        if outcome == rooms.ROSTER_STALE_EPOCH:
+            # Not an error (a legitimate lower/same-epoch non-duplicate is simply
+            # ignored), but we still return 200 with applied=False so the leader
+            # does not retry forever. No dedupe row reserved.
+            audit("room_roster_ignore", reason="stale_epoch",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  epoch=room_epoch, message_id=message_id)
+            self._reply(200, {"ok": True, "applied": False,
+                              "reason": "stale_epoch"})
+            return
+
+        if outcome == rooms.ROSTER_DUPLICATE:
+            audit("room_roster_accept", reason="duplicate",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  message_id=message_id)
+            self._reply(200, {"ok": True, "duplicate": True,
+                              "room_id": room_id, "epoch": room_epoch})
+            return
+
+        # ACCEPTED — the member-local roster cache now reflects this epoch.
+        audit("room_roster_accept", reason="applied",
+              peer=peer_id, client=client_ip, room_id=room_id,
+              epoch=room_epoch, members=len(members), message_id=message_id)
+        self._reply(200, {"ok": True, "applied": True,
+                          "room_id": room_id, "epoch": room_epoch,
+                          "members": len(members)})
 
 
 # --------------------------------------------------------------------------
