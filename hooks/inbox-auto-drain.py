@@ -44,7 +44,13 @@ def load_event() -> dict:
 
 def main() -> int:
     try:
-        agent = os.environ.get("BRIDGE_AGENT_ID", "").strip()
+        # Stop hook runs AS the agent; it reads its own BRIDGE_AGENT_ID to
+        # identify itself and writes its own per-agent marker under
+        # BRIDGE_ACTIVE_AGENT_DIR (same-UID, no controller→iso crossing). The
+        # `os.environ` token false-matches the ratchet's `.env` boundary
+        # pattern — the identical false-positive is already noqa'd in
+        # bridge_hook_common.py and baselined in check_inbox.py.
+        agent = os.environ.get("BRIDGE_AGENT_ID", "").strip()  # noqa: iso-helper-boundary — os.environ (.environ) false-matches the .env pattern; Stop hook self-identity read, not a controller→iso artifact
         if not agent:
             return 0  # TUI-only / admin session — not a bridge agent context.
 
