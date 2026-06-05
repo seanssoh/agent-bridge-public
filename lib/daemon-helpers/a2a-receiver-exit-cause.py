@@ -219,42 +219,51 @@ def _config_fingerprint(config_file):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
-def _config_unloadable(config_file):
-    """True when a config_file was provided that EXISTS but cannot be loaded.
+def _config_auth_error(config_file):
+    """True when a config_file EXISTS but is a CONFIG/AUTH error RIGHT NOW.
 
-    #1563 PR-4 (codex r2/r3): the supervisor decides backoff/breaker per tick
-    from the persisted error_class, but the failing receiver's OWN startup_fail
-    row for THIS tick's bad config is only emitted later in the restart path —
-    so a stale bind-phase (transient) jsonl row could let an already-open
-    transient breaker swallow a brand-new bad config and hold it (wrongly) as
-    circuit_open until a window reset.
+    #1563 PR-4 (codex r2/r3/r1-rc2): the supervisor decides backoff/breaker per
+    tick from the persisted error_class, but the failing receiver's OWN
+    startup_fail row for THIS tick's bad config is only emitted later in the
+    restart path — so a stale bind-phase (transient) jsonl row could let an
+    already-open transient breaker swallow a brand-new bad config and hold it
+    (wrongly) as circuit_open until a window reset.
 
-    A config file that is present but FAILS the receiver's own load_config()
-    contract (config_stat / config_perms / config_parse / config_shape;
-    config_missing is the absence case handled below) is, by definition, a
-    CONFIG-phase (auth_config) condition RIGHT NOW — it can never be a transient
-    bind-availability blip. Detecting it here is the authoritative current-state
-    signal that overrides any stale jsonl-derived class.
+    A config file that fails the receiver's REAL boot contract — either
+    load_config() (config_stat / config_perms / config_parse / config_shape;
+    config_missing is the absence case handled below) OR the receiver secret
+    gate validate_config_peer_secrets(side="receiver") (peer_no_secret: an empty
+    or missing peer secret) — is, by definition, a CONFIG/AUTH-phase
+    (auth_config) condition RIGHT NOW. It can never be a transient
+    bind-availability blip: a transient classification REQUIRES both load_config
+    AND the secret gate to PASS (the receiver reaches the bind phase only after
+    both). Detecting it here is the authoritative current-state signal that
+    overrides any stale jsonl-derived transient class — even with the breaker
+    already open.
 
-    We REUSE the receiver's real bridge_a2a_common.load_config() (rather than
-    re-implementing a subset) so this stays in lockstep with the loader — in
-    particular it inherits the 0600 mode gate (config_perms) the codex r3 review
-    flagged, plus any future config-phase check, with zero drift. load_config()
-    runs nothing on import and reads the config READ-ONLY; it never extracts or
-    logs a secret. If the module cannot be imported (unexpected), we fall back
-    to a lightweight json parse/shape probe so the exit-cause helper never
-    crashes — at worst the override is coarser, never a false positive on a
-    cleanly-loadable config.
+    We REUSE the receiver's real bridge_a2a_common.load_config() AND
+    validate_config_peer_secrets() (rather than re-implementing either) so this
+    stays in lockstep with the loader + the fail-closed secret contract — it
+    inherits the 0600 mode gate (config_perms) the codex r3 review flagged AND
+    the peer_no_secret gate the codex r1-rc2 review flagged, plus any future
+    config/secret check, with zero drift. Both run nothing on import and read
+    the config READ-ONLY; neither extracts or logs a secret (only that one
+    EXISTS). If the module cannot be imported (unexpected), we fall back to a
+    lightweight json parse/shape probe so the exit-cause helper never crashes —
+    at worst the override is coarser, never a false positive on a clean config.
 
     Returns False when no config_file was given or the file is ABSENT (absence
     is the supervisor's process-gone / jsonl path, not a bad-config scenario),
-    and False when it loads cleanly.
+    and False when it loads AND passes the secret gate cleanly.
     """
     if not config_file:
         return False
     if not os.path.exists(config_file):
         return False
-    # Preferred: the receiver's own loader (config_perms / parse / shape / stat).
+    # Preferred: the receiver's own loader (config_perms / parse / shape / stat)
+    # AND its fail-closed secret gate (peer_no_secret) — the SAME contract the
+    # receiver enforces at boot. Transient stays reserved for the case where
+    # BOTH pass (config+secret valid, only the network/bind is unavailable).
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))))
     if repo_root not in sys.path:
@@ -266,17 +275,23 @@ def _config_unloadable(config_file):
     if _a2a is not None:
         from pathlib import Path as _Path
         try:
-            _a2a.load_config(_Path(config_file))
+            cfg = _a2a.load_config(_Path(config_file))
+            # Reuse the receiver's secret contract — do NOT re-implement it. An
+            # empty/missing peer secret raises A2AError(code="peer_no_secret")
+            # here, exactly as the receiver's preflight refuses it, so a
+            # loadable-but-secret-less config is an auth_config error NOW (never
+            # a transient bind blip).
+            _a2a.validate_config_peer_secrets(cfg, side="receiver")
             return False
         except _a2a.A2AError:
             return True
         except Exception:  # pragma: no cover - never let the probe crash the tick
-            # An unexpected loader error is not a config-phase signal we can
-            # trust; fall through to the lightweight probe below.
+            # An unexpected loader/validator error is not a config-phase signal
+            # we can trust; fall through to the lightweight probe below.
             pass
-    # Fallback probe (import unavailable): json parse + root/peers shape only.
-    # NOTE: this degraded path does NOT replicate the 0600 mode gate; it is used
-    # only when bridge_a2a_common cannot be imported.
+    # Fallback probe (import unavailable): json parse + root/peers shape +
+    # empty-secret detection. NOTE: this degraded path does NOT replicate the
+    # 0600 mode gate; it is used only when bridge_a2a_common cannot be imported.
     try:
         with open(config_file, "r", encoding="utf-8") as fh:
             cfg = json.load(fh)
@@ -284,8 +299,40 @@ def _config_unloadable(config_file):
         return True
     if not isinstance(cfg, dict):
         return True
-    if "peers" in cfg and not isinstance(cfg.get("peers"), list):
+    peers = cfg.get("peers")
+    if "peers" in cfg and not isinstance(peers, list):
         return True
+    # Mirror validate_config_peer_secrets' contract conservatively: a peer entry
+    # with no usable secret (no non-empty `secret` / `secret_next` / `secrets[]`)
+    # is an auth_config error. Bridges with NO peers are allowed (early-install
+    # probe state) — same as the real validator.
+    if isinstance(peers, list):
+        for peer in peers:
+            if not isinstance(peer, dict):
+                continue
+            if not _peer_has_secret(peer):
+                return True
+    return False
+
+
+def _peer_has_secret(peer):
+    """Fallback-only mirror of bridge_a2a_common.peer_secrets() truthiness.
+
+    Used ONLY on the degraded path where bridge_a2a_common cannot be imported,
+    so the empty-secret auth_config signal is preserved even without the real
+    validator. Never reads the secret VALUE beyond an is-non-empty check.
+    """
+    primary = peer.get("secret")
+    if isinstance(primary, str) and primary:
+        return True
+    nxt = peer.get("secret_next")
+    if isinstance(nxt, str) and nxt:
+        return True
+    extra = peer.get("secrets")
+    if isinstance(extra, list):
+        for item in extra:
+            if isinstance(item, str) and item:
+                return True
     return False
 
 
@@ -365,13 +412,17 @@ def main(argv):
 
     last_audit_event = _last_terminal_audit(jsonl_file)
     error_class = _classify_error_class(reason, last_audit_event)
-    # #1563 PR-4 (codex r2): if the LIVE config is present-but-unloadable, that
-    # is a definitive current-state CONFIG-phase failure — override any stale
-    # jsonl-derived class so an already-open transient breaker cannot swallow a
-    # brand-new malformed/unreadable config and hold it as circuit_open. This is
-    # the authoritative now-signal the per-tick decision needs BEFORE the
-    # restart path emits its own phase=config row.
-    if _config_unloadable(config_file):
+    # #1563 PR-4 (codex r2/r1-rc2): if the LIVE config fails the receiver's REAL
+    # boot contract NOW — either load_config() (malformed/unreadable/too-open) OR
+    # the fail-closed secret gate validate_config_peer_secrets (empty/missing
+    # peer secret) — that is a definitive current-state CONFIG/AUTH-phase
+    # failure. Override any stale jsonl-derived TRANSIENT class so an already-open
+    # transient breaker cannot swallow a brand-new bad config and hold it as
+    # circuit_open until a window reset. Transient is reserved for the case where
+    # load_config AND the secret gate BOTH pass (only the network/bind is
+    # unavailable). This is the authoritative now-signal the per-tick decision
+    # needs BEFORE the restart path emits its own phase=config row.
+    if _config_auth_error(config_file):
         error_class = "auth_config"
     config_fingerprint = _config_fingerprint(config_file)
 

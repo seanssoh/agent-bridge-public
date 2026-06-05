@@ -676,6 +676,97 @@ check_malformed_config_overrides_open_transient_breaker() {
   export BRIDGE_A2A_RECEIVER_BACKOFF_OPEN_THRESHOLD=3
 }
 
+# --- Check (b4): an EMPTY-PEER-SECRET config is HELD as auth_config even when
+#                the breaker is ALREADY OPEN on transient (codex r1-rc2 finding)
+# This is the gap codex's rc2 r1 review flagged: the current-state override
+# reused only load_config(), NOT the receiver's SECRET gate. An empty-secret
+# config is mode 0600, valid JSON, valid shape — so load_config() SUCCEEDS and
+# the load_config-only override returns "config loads fine" -> NO override. With
+# a stale bind-phase (transient) jsonl row + an already-open transient breaker,
+# the per-tick decision would then return `open` (transient) and keep the
+# receiver backing off / circuit-open instead of HOLDING as auth_config and
+# surfacing the real misconfig (validate_config_peer_secrets => peer_no_secret).
+# The fix runs validate_config_peer_secrets(side="receiver") AFTER load_config()
+# in the override, so a loadable-but-secret-less config is reclassified
+# auth_config NOW (class transient->auth_config => consec_transient reset =>
+# decision `hold`). TEETH: reverting to the load_config-only override makes this
+# classify transient and the decision `open`, FAILING the asserts below.
+check_empty_secret_overrides_open_transient_breaker() {
+  reset_scenario_state
+  register_admin_agent
+  A2A_PORT="$(pick_free_port)"
+
+  # Stale transient bind-phase row, as if the prior episode was tailnet-down.
+  mkdir -p "$BRIDGE_LOG_DIR"
+  printf '%s\n' '{"event":"startup_fail","code":"tailscale_unavailable","phase":"bind","detail":"earlier tailnet blip"}' \
+    >"$BRIDGE_LOG_DIR/a2a-handoff.jsonl"
+
+  # Seed an ALREADY-OPEN transient breaker (consec >= threshold). LAST_RESTART_TS
+  # is NOW so the window reset does NOT pre-emptively clear it — the SECRET-gate
+  # reclassification, not the window reset, must be what holds the bad config.
+  local now_ts
+  now_ts="$(date +%s)"
+  {
+    printf 'A2A_RECEIVER_RESTART_COUNT=1\n'
+    printf 'A2A_RECEIVER_LAST_RESTART_TS=%s\n' "$now_ts"
+    printf 'A2A_RECEIVER_CONSEC_UNHEALTHY=0\n'
+    printf 'A2A_RECEIVER_ALARM=circuit_open\n'
+    printf 'A2A_RECEIVER_LAST_REASON=bind_proof_failed\n'
+    printf 'A2A_RECEIVER_LAST_EXIT_EVENT=startup_fail\n'
+    printf 'A2A_RECEIVER_LAST_EXIT_DETAIL=seeded\n'
+    printf 'A2A_RECEIVER_LAST_ADMIN_TASK_TS=0\n'
+    printf 'A2A_RECEIVER_ERROR_CLASS=transient\n'
+    printf 'A2A_RECEIVER_BREAKER_KEY=deadbeefdeadbeef\n'
+    printf 'A2A_RECEIVER_CONSEC_TRANSIENT=5\n'
+  } >"$(supervise_state)"
+  chmod 0600 "$(supervise_state)" 2>/dev/null || true
+
+  # A LOADABLE config (mode 0600, valid JSON + shape) whose only fault is an
+  # EMPTY peer secret. load_config() passes; only validate_config_peer_secrets
+  # (peer_no_secret) catches it. BRIDGE_A2A_ALLOW_TEST_BIND alone does NOT relax
+  # the secret gate (only the paired DEV_INSECURE_BIND does, never set here).
+  write_empty_secret_config "$A2A_PORT"
+  # Threshold 3 so the seeded consec=5 is OVER the open threshold (proves the
+  # decision WOULD say `open` for a transient class — the fix must override it).
+  export BRIDGE_A2A_RECEIVER_BACKOFF_OPEN_THRESHOLD=3
+
+  run_sync >/dev/null
+
+  smoke_assert_eq "auth_config" "$(supervise_field A2A_RECEIVER_ERROR_CLASS)" \
+    "(b4) loadable empty-secret config reclassified auth_config (peer_no_secret) over the open transient breaker"
+  smoke_assert_eq "auth_config" "$(supervise_field A2A_RECEIVER_ALARM)" \
+    "(b4) empty-secret config HELD as auth_config (NOT left as circuit_open / open / backoff)"
+  smoke_assert_eq "0" "$(supervise_field A2A_RECEIVER_CONSEC_TRANSIENT)" \
+    "(b4) class change transient->auth_config reset the stale transient counter"
+  local audit
+  audit="$(audit_log_text)"
+  smoke_assert_contains "$audit" "a2a_receiver_auth_config_hold" \
+    "(b4) a2a_receiver_auth_config_hold emitted (NOT a fresh circuit_open) for the empty-secret config"
+  smoke_assert_not_contains "$audit" "a2a_receiver_bind_backoff" \
+    "(b4) empty-secret config did NOT enter the transient backoff path"
+
+  # Direct teeth on the helper: the SAME stale-transient jsonl + the SAME
+  # loadable empty-secret config must classify auth_config (NOT transient). A
+  # load_config-only override leaves this `transient`; the secret-gate override
+  # flips it to auth_config. This pins the fix at the classifier boundary
+  # independent of the daemon decision wiring.
+  local classify_out
+  classify_out="$(python3 "$SCRIPT_DIR/../../lib/daemon-helpers/a2a-receiver-exit-cause.py" \
+    "$BRIDGE_STATE_DIR/handoff/b4-classify.json" \
+    "$BRIDGE_LOG_DIR/a2a-handoffd.log" \
+    "$BRIDGE_LOG_DIR/a2a-handoff.jsonl" \
+    bind_proof_failed 123 1000 20 "$(config_path)" 2>/dev/null || true)"
+  smoke_assert_match "$classify_out" 'auth_config' \
+    "(b4) exit-cause classifier: stale-transient row + loadable empty-secret config -> auth_config (secret-gate override, NOT load_config-only)"
+
+  # The receiver never came up (empty secret refused) — fail-closed held.
+  local rc=0
+  python3 "$SCRIPT_DIR/a2a-cross-bridge-helper.py" wait-port "$A2A_PORT" 2>/dev/null || rc=$?
+  smoke_assert_match "$rc" '^[1-9]' "(b4) receiver never bound under an empty-secret config (fail-closed held)"
+
+  export BRIDGE_A2A_RECEIVER_BACKOFF_OPEN_THRESHOLD=3
+}
+
 # --- Check (c): a successful bind RESETS the breaker -------------------------
 # The "successful bind resets the breaker" contract has two reachable proofs in
 # an isolated harness (a real loopback receiver is deliberately NOT seen as
@@ -851,6 +942,7 @@ main() {
   smoke_run "(b) auth/config error is HELD, not thrashed through the backoff path" check_auth_config_hold
   smoke_run "(b2) malformed config held as auth_config even after a stale transient row" check_malformed_config_held_after_stale_transient
   smoke_run "(b3) malformed config overrides an ALREADY-OPEN transient breaker" check_malformed_config_overrides_open_transient_breaker
+  smoke_run "(b4) loadable empty-secret config overrides an ALREADY-OPEN transient breaker (secret gate)" check_empty_secret_overrides_open_transient_breaker
   smoke_run "(c) a successful bind RESETS the circuit breaker" check_recovery_resets_breaker
   smoke_run "(d) fail-closed INTACT: bad HMAC -> 401, unknown peer -> 403" check_fail_closed_intact
   smoke_run "(e) escalation task-create failure is audited + retried (not swallowed)" check_escalation_task_create_failure_audited
