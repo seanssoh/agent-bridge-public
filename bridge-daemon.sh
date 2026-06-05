@@ -2847,7 +2847,20 @@ process_a2a_outbox_stuck_scan_tick() {
       python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" a2a-diag-lookup \
         "$peer" "$diag_tmp" 2>/dev/null || true)"
     if [[ -n "$diag_row" ]]; then
-      IFS=$'\t' read -r diag_class diag_tcp diag_healthz diag_next diag_reset diag_tcp_healthy <<<"$diag_row"
+      # Split the 6-field TSV row via pure parameter expansion over the tab
+      # delimiter — avoids the banned `<<<` here-string (footgun #11, Bash
+      # 5.3.9 read_comsub deadlock) while keeping the values in THIS shell
+      # (a `printf | read` pipe would lose them to a subshell). The last
+      # field takes the remainder. Field order matches the lookup helper:
+      #   classification \t tcp_probe \t local_healthz \t next_attempt_in_seconds
+      #   \t backoff_reset \t tcp_healthy_backoff_waiting
+      local _diag_rest="$diag_row"
+      diag_class="${_diag_rest%%$'\t'*}"; _diag_rest="${_diag_rest#*$'\t'}"
+      diag_tcp="${_diag_rest%%$'\t'*}"; _diag_rest="${_diag_rest#*$'\t'}"
+      diag_healthz="${_diag_rest%%$'\t'*}"; _diag_rest="${_diag_rest#*$'\t'}"
+      diag_next="${_diag_rest%%$'\t'*}"; _diag_rest="${_diag_rest#*$'\t'}"
+      diag_reset="${_diag_rest%%$'\t'*}"; _diag_rest="${_diag_rest#*$'\t'}"
+      diag_tcp_healthy="${_diag_rest}"
     fi
 
     local body_file

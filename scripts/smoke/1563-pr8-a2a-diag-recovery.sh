@@ -198,7 +198,15 @@ python3 "$HELPER" reset-scenario "$OUTBOX" "$CFG" "$LEDGER" >"$DIAG_JSON" \
 
 TSV="$(python3 "$SMOKE_REPO_ROOT/bridge-daemon-helpers.py" a2a-diag-lookup reachable "$DIAG_JSON")"
 [[ -n "$TSV" ]] || smoke_fail "#3 diag-lookup returned empty for a backoff-waiting peer"
-IFS=$'\t' read -r d_class d_tcp d_healthz d_next d_reset d_tcp_healthy <<<"$TSV"
+# Split the 6-field TSV via parameter expansion (no banned `<<<` here-string,
+# footgun #11) — keeps the vars in this shell, last field takes the remainder.
+_tsv_rest="$TSV"
+d_class="${_tsv_rest%%$'\t'*}"; _tsv_rest="${_tsv_rest#*$'\t'}"
+d_tcp="${_tsv_rest%%$'\t'*}"; _tsv_rest="${_tsv_rest#*$'\t'}"
+d_healthz="${_tsv_rest%%$'\t'*}"; _tsv_rest="${_tsv_rest#*$'\t'}"
+d_next="${_tsv_rest%%$'\t'*}"; _tsv_rest="${_tsv_rest#*$'\t'}"
+d_reset="${_tsv_rest%%$'\t'*}"; _tsv_rest="${_tsv_rest#*$'\t'}"
+d_tcp_healthy="${_tsv_rest}"
 smoke_assert_eq "$d_class" "tcp_healthy_backoff_waiting" "#3 alert classification field"
 smoke_assert_eq "$d_tcp" "ok" "#3 alert tcp_probe field"
 smoke_assert_match "$d_next" '^[0-9]+$' "#3 alert next_attempt_in_seconds is numeric"
