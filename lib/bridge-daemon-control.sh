@@ -1050,19 +1050,121 @@ _bridge_daemon_singleton_cmdline() {
   ps -p "$pid" -o args= 2>/dev/null | head -n1
 }
 
-# bridge_daemon_ensure_singleton — acquire the PID-file flock, evict
-# any stale-but-living bridge-daemon process, atomically claim the PID
-# file, and emit the `daemon_started` audit row.
+# Internal: portable process START-TIME proof (#1563). `ps -o lstart=`
+# prints the absolute wall-clock start time of a pid and is portable
+# across macOS (BSD ps) and Linux (procps ps) — unlike `/proc/<pid>/stat`
+# field 22 (Linux-only) or `etime` (elapsed, not absolute). Two processes
+# that reuse the same pid number across a recycle have DIFFERENT lstart
+# values, so a recorded (pid, start_time) pair uniquely identifies one
+# process GENERATION: a recycled pid with a non-matching lstart is NOT the
+# process we recorded. Whitespace is collapsed to single spaces so the
+# value is a stable single-line token safe to store in the owner record
+# and compare with `==`. Prints the normalized lstart on stdout; empty
+# (and returns 1) when the pid is gone or ps is unavailable.
+_bridge_daemon_proc_start_time() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  local raw
+  raw="$(ps -p "$pid" -o lstart= 2>/dev/null | head -n1)"
+  # Collapse runs of whitespace to a single space + trim ends so the same
+  # process always yields a byte-identical token regardless of ps padding.
+  raw="$(printf '%s' "$raw" | tr -s '[:space:]' ' ')"
+  raw="${raw# }"
+  raw="${raw% }"
+  [[ -n "$raw" ]] || return 1
+  printf '%s' "$raw"
+}
+
+# Internal: resolve the active-generation OWNER RECORD path (#1563). Lives
+# next to the pid-file; holds the current lock owner's
+# (pid, cmdline, start_time, generation) so a competitor can prove whether
+# a pid-file pid is the SAME live process that took the lock (vs a recycled
+# pid that merely reused the number).
+_bridge_daemon_singleton_owner_path() {
+  printf '%s.owner' "${BRIDGE_DAEMON_PID_FILE:-${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}/daemon.pid}"
+}
+
+# Internal: atomically publish the active-generation owner record under the
+# held lock (#1563 point 1). Called ONLY after the lock is won, so exactly
+# one writer reaches here per generation. tmp + rename so a competitor can
+# never read a half-written record. Fields are newline-delimited `k=v`:
+#   pid=<$$>  cmdline=<our args>  start_time=<lstart>  generation=<token>
+# generation is a monotonic-ish token (epoch ns when available, else
+# epoch-seconds.pid) that disambiguates two records that happen to share a
+# recycled pid + identical-second start time. Best-effort: a write failure
+# is non-fatal (the pid + start_time pair already observable via `ps` is the
+# primary proof; the record is a convenience cache, not the source of truth).
+_bridge_daemon_singleton_write_owner() {
+  local owner_path
+  owner_path="$(_bridge_daemon_singleton_owner_path)"
+  local self_cmdline self_start generation
+  self_cmdline="$(_bridge_daemon_singleton_cmdline "$$" 2>/dev/null || true)"
+  self_start="$(_bridge_daemon_proc_start_time "$$" 2>/dev/null || true)"
+  # generation token: prefer nanosecond resolution; fall back to
+  # seconds.pid on platforms whose `date` lacks %N (macOS /bin/date emits
+  # the literal string "N", which the case below rejects).
+  generation="$(date +%s%N 2>/dev/null || true)"
+  case "$generation" in
+    ''|*[!0-9]*) generation="$(date +%s 2>/dev/null || printf '0').$$" ;;
+  esac
+  local owner_tmp="${owner_path}.new.$$"
+  {
+    printf 'pid=%s\n' "$$"
+    printf 'cmdline=%s\n' "$self_cmdline"
+    printf 'start_time=%s\n' "$self_start"
+    printf 'generation=%s\n' "$generation"
+  } >"$owner_tmp" 2>/dev/null || { rm -f "$owner_tmp" 2>/dev/null || true; return 1; }
+  mv -f -- "$owner_tmp" "$owner_path" 2>/dev/null || { rm -f "$owner_tmp" 2>/dev/null || true; return 1; }
+  return 0
+}
+
+# Internal: read one field from the active-generation owner record. Prints
+# the field value on stdout (empty when the record or field is absent).
+# `$1` = field name (pid|cmdline|start_time|generation).
+_bridge_daemon_singleton_owner_field() {
+  local field="$1"
+  local owner_path
+  owner_path="$(_bridge_daemon_singleton_owner_path)"
+  [[ -r "$owner_path" ]] || return 1
+  local line val=""
+  while IFS= read -r line; do
+    case "$line" in
+      "${field}="*) val="${line#*=}" ;;
+    esac
+  done <"$owner_path"
+  printf '%s' "$val"
+}
+
+# bridge_daemon_ensure_singleton — acquire the PID-file flock, publish the
+# active-generation owner record, evict a PROVEN-stale bridge-daemon
+# predecessor, atomically claim the PID file, and emit the `daemon_started`
+# audit row.
 #
-# Returns 0 on success (PID file claimed, audit row written).
-# Returns 1 when the lock cannot be acquired within the timeout (means
-# a concurrent ensure_singleton is already in flight — this process
-# MUST NOT proceed; the canonical pattern is `bridge_die` at the
-# caller's site to abort the daemon's main loop before it starts
+# #1563 singleton invariant (the foundation this function enforces):
+#   1. Exactly ONE daemon owns the lock AND publishes the active-generation
+#      owner record — (pid, cmdline, start_time, generation) written under
+#      the held lock via `_bridge_daemon_singleton_write_owner`.
+#   2. A LOSER (a second `run` that cannot acquire the lock) exits cleanly
+#      via `daemon_singleton_loser_exit` + `return 1` and NEVER evicts the
+#      live holder.
+#   3. A pid-file predecessor is reclaimed/evicted ONLY after POSITIVE
+#      proof it is stale: PID-not-alive OR cmdline-mismatch OR
+#      start-time-mismatch (its live `ps -o lstart=` differs from the
+#      owner record). A recycled pid (same number, different start-time)
+#      is never signalled — the slot is reclaimed without a kill.
+#   4. The flock fd is held for the daemon's PROCESS LIFETIME (kernel
+#      auto-release on exit); the mkdir fallback covers flock-less hosts.
+#
+# Returns 0 on success (PID file claimed, owner record published, audit
+# row written).
+# Returns 1 when the lock cannot be acquired (a concurrent holder is live —
+# this process MUST NOT proceed; the canonical pattern is `bridge_die` at
+# the caller's site to abort the daemon's main loop before it starts
 # polling).
 #
 # Side effects on success:
 #   - $BRIDGE_DAEMON_PID_FILE contains $$ atomically (tmp + rename).
+#   - $BRIDGE_DAEMON_PID_FILE.owner holds the active-generation record.
 #   - audit log row `daemon daemon_started daemon pid=$$ parent_pid=$PPID
 #     wrapper=<value> sudo_self=<0|1>` is written.
 #   - If an existing bridge-daemon process was found alive, an
@@ -1201,6 +1303,21 @@ bridge_daemon_ensure_singleton() {
              --detail wrapper="$wrapper" \
              --detail sudo_self="$sudo_self" \
              --detail lock_mode="flock_n" >/dev/null 2>&1 || true
+      # #1563 point 2 — the named loser-exit contract row. A second `run`
+      # that cannot acquire the lock exits cleanly as a LOSER and NEVER
+      # evicts the live holder. This row carries the held-owner identity
+      # (from the owner record) so an operator can confirm exactly which
+      # process won, and proves (by its mere presence + absence of any
+      # `daemon_spawn_replacing*` kill row) that the loser killed nothing.
+      command -v bridge_audit_log >/dev/null 2>&1 \
+        && bridge_audit_log daemon daemon_singleton_loser_exit daemon \
+             --detail attempting_pid="$$" \
+             --detail parent_pid="$PPID" \
+             --detail wrapper="$wrapper" \
+             --detail sudo_self="$sudo_self" \
+             --detail lock_backend="flock" \
+             --detail held_by_pid="$(_bridge_daemon_singleton_owner_field pid 2>/dev/null || true)" \
+             --detail evicted_holder="no" >/dev/null 2>&1 || true
       bridge_warn "daemon-singleton: refused to spawn — another daemon holds $lock_path (non-blocking flock -n)"
       exec {lock_fd}>&- 2>/dev/null || true
       return 1
@@ -1261,6 +1378,19 @@ bridge_daemon_ensure_singleton() {
              --detail sudo_self="$sudo_self" \
              --detail lock_backend="mkdir" \
              --detail lock_mode="non_blocking" >/dev/null 2>&1 || true
+      # #1563 point 2 — named loser-exit contract row (mkdir backend).
+      # The competitor aborts WITHOUT touching the live owner's lock dir or
+      # process; the live owner.pid stays intact (we only reclaim a dir
+      # whose owner.pid is a DEAD pid, above).
+      command -v bridge_audit_log >/dev/null 2>&1 \
+        && bridge_audit_log daemon daemon_singleton_loser_exit daemon \
+             --detail attempting_pid="$$" \
+             --detail parent_pid="$PPID" \
+             --detail wrapper="$wrapper" \
+             --detail sudo_self="$sudo_self" \
+             --detail lock_backend="mkdir" \
+             --detail held_by_pid="$(_bridge_daemon_singleton_owner_field pid 2>/dev/null || true)" \
+             --detail evicted_holder="no" >/dev/null 2>&1 || true
       bridge_warn "daemon-singleton: refused to spawn — $lock_dir held (non-blocking)"
       return 1
     fi
@@ -1298,8 +1428,24 @@ bridge_daemon_ensure_singleton() {
     esac
   }
 
-  # Inspect the PID file. If a bridge-daemon process is still alive
-  # under the recorded PID, evict it with TERM + 10s grace + KILL.
+  # Inspect the PID file. We have already WON the lock above (flock -n /
+  # mkdir), so by the singleton invariant no OTHER live process is the
+  # lock holder right now — a pid recorded in the pid-file is either a
+  # crashed/exiting predecessor whose fd the kernel already released, a
+  # recycled pid the OS handed to an unrelated process, or (mkdir-fallback
+  # only) a genuinely-live predecessor whose dir we reclaimed because its
+  # owner.pid was dead. Reclaiming the pid-file SLOT is always safe once we
+  # hold the lock; the question this block answers is the narrower one of
+  # whether to also SEND SIGNALS to that recorded pid.
+  #
+  # #1563 point 3 — reclaim/evict ONLY after POSITIVE PROOF the recorded
+  # pid is a stale bridge-daemon predecessor: it must be alive AND its
+  # cmdline must look like `bridge-daemon.sh run` AND its start-time must
+  # MATCH the start-time we recorded for that pid in the prior owner record.
+  # A recycled pid (same number, DIFFERENT `ps -o lstart=`) is NOT the
+  # predecessor we recorded — signalling it would TERM/KILL an unrelated
+  # process — so we reclaim the slot WITHOUT signalling. Belt-and-braces:
+  # never signal our own pid.
   local existing_pid=""
   if [[ -f "$pid_file" ]]; then
     existing_pid="$(cat "$pid_file" 2>/dev/null | tr -dc '0-9' | head -c 16)"
@@ -1307,13 +1453,33 @@ bridge_daemon_ensure_singleton() {
   if [[ -n "$existing_pid" ]] && [[ "$existing_pid" != "$$" ]] && kill -0 "$existing_pid" 2>/dev/null; then
     local existing_cmdline=""
     existing_cmdline="$(_bridge_daemon_singleton_cmdline "$existing_pid" 2>/dev/null || true)"
-    if [[ "$existing_cmdline" == *"bridge-daemon.sh run"* ]]; then
+    # Start-time proof: compare the live pid's CURRENT lstart against the
+    # lstart recorded for that pid in the prior owner record. A match
+    # proves this is the SAME process generation we recorded as the owner
+    # (so it is a real stale predecessor, safe to evict). A mismatch — or
+    # an absent owner record / unreadable start-time — means we CANNOT
+    # prove identity, so we fail closed on the kill and only reclaim the
+    # slot (codex #1563: a recycled pid with a different start-time is NOT
+    # the holder).
+    local recorded_owner_pid="" recorded_owner_start="" live_start="" start_proven="no"
+    recorded_owner_pid="$(_bridge_daemon_singleton_owner_field pid 2>/dev/null || true)"
+    recorded_owner_start="$(_bridge_daemon_singleton_owner_field start_time 2>/dev/null || true)"
+    live_start="$(_bridge_daemon_proc_start_time "$existing_pid" 2>/dev/null || true)"
+    if [[ -n "$recorded_owner_pid" && "$recorded_owner_pid" == "$existing_pid" \
+          && -n "$recorded_owner_start" && -n "$live_start" \
+          && "$recorded_owner_start" == "$live_start" ]]; then
+      start_proven="yes"
+    fi
+    if [[ "$existing_cmdline" == *"bridge-daemon.sh run"* ]] && [[ "$start_proven" == "yes" ]]; then
+      # Proven stale predecessor (live, daemon cmdline, start-time matches
+      # the owner record). Safe to evict: TERM + 10s grace + KILL.
       command -v bridge_audit_log >/dev/null 2>&1 \
         && bridge_audit_log daemon daemon_spawn_replacing daemon \
              --detail existing_pid="$existing_pid" \
              --detail new_pid="$$" \
              --detail wrapper="$wrapper" \
-             --detail sudo_self="$sudo_self" >/dev/null 2>&1 || true
+             --detail sudo_self="$sudo_self" \
+             --detail start_time_proven="yes" >/dev/null 2>&1 || true
       kill -TERM "$existing_pid" 2>/dev/null || true
       local waited_evict=0
       while kill -0 "$existing_pid" 2>/dev/null && (( waited_evict < 10 )); do
@@ -1328,6 +1494,19 @@ bridge_daemon_ensure_singleton() {
                --detail existing_pid="$existing_pid" \
                --detail new_pid="$$" >/dev/null 2>&1 || true
       fi
+    elif [[ "$existing_cmdline" == *"bridge-daemon.sh run"* ]]; then
+      # Cmdline LOOKS like a daemon but the start-time does NOT match the
+      # owner record (recycled pid, or no owner record to prove identity
+      # against). Do NOT signal — reclaim the slot only. Killing here would
+      # be the exact recycled-pid eviction #1563 forbids.
+      command -v bridge_audit_log >/dev/null 2>&1 \
+        && bridge_audit_log daemon daemon_spawn_reclaim_unproven_pid daemon \
+             --detail recorded_pid="$existing_pid" \
+             --detail new_pid="$$" \
+             --detail owner_record_pid="${recorded_owner_pid:-none}" \
+             --detail owner_record_start="${recorded_owner_start:-none}" \
+             --detail live_start="${live_start:-none}" \
+             --detail recorded_cmdline_head="${existing_cmdline:0:120}" >/dev/null 2>&1 || true
     else
       # Recorded PID belongs to a non-bridge process (recycled PID).
       # Don't kill; just reclaim the pid-file slot.
@@ -1354,6 +1533,16 @@ bridge_daemon_ensure_singleton() {
     _bridge_daemon_singleton_release_lock
     return 1
   fi
+
+  # #1563 point 1 — publish the active-generation OWNER RECORD now that we
+  # hold the lock and own the pid-file. This (pid, cmdline, start_time,
+  # generation) record is what a future competitor reads to prove whether a
+  # pid-file pid is THIS live process or a recycled number, so the eviction
+  # path above can fail closed on the kill. Best-effort: a write failure is
+  # non-fatal — the live `ps -o lstart=` of our pid is still the primary
+  # proof; the record is a cache. We never abort the daemon over it.
+  _bridge_daemon_singleton_write_owner || \
+    bridge_warn "daemon-singleton: owner record write failed (non-fatal; start-time proof falls back to live ps)"
 
   # Emit the canonical `daemon_started` audit row. This is the row the
   # issue identified as missing on the sudo-wrapped spawn path; we now
@@ -1622,17 +1811,57 @@ sys.stdout.write(latest)
   fi
 
   # Mismatch: another daemon emitted `daemon_started` more recently.
-  # If that recent pid is still alive, we have a genuine duplicate.
+  # If that recent pid is still alive, we MIGHT have a genuine duplicate —
+  # but a bare `kill -0` also passes for a RECYCLED pid the OS handed to an
+  # unrelated process after the audited daemon exited. #1563: confirm the
+  # live pid is genuinely a current daemon GENERATION before alerting, so a
+  # recycled pid does not raise a false "duplicate daemon" task. The proof
+  # ladder (each step best-effort; we degrade to the prior, looser signal):
+  #   1. its cmdline must look like `bridge-daemon.sh run`; AND
+  #   2. when an owner record exists for that pid, its recorded start_time
+  #      must match the live `ps -o lstart=` (a recycled pid fails this).
+  # If the cmdline is non-daemon, it is provably a recycled pid → NOT a
+  # duplicate, no alert. If the cmdline matches but no owner record is
+  # available to cross-check, we keep the (looser) old "alive" signal so we
+  # never SUPPRESS a real duplicate just because the record is missing.
   local other_alive="false"
+  local recycled_pid="false"
   if kill -0 "$latest_pid" 2>/dev/null; then
-    other_alive="true"
+    local other_cmdline="" other_live_start="" owner_rec_pid="" owner_rec_start=""
+    other_cmdline="$(_bridge_daemon_singleton_cmdline "$latest_pid" 2>/dev/null || true)"
+    if [[ "$other_cmdline" == *"bridge-daemon.sh run"* ]]; then
+      owner_rec_pid="$(_bridge_daemon_singleton_owner_field pid 2>/dev/null || true)"
+      owner_rec_start="$(_bridge_daemon_singleton_owner_field start_time 2>/dev/null || true)"
+      other_live_start="$(_bridge_daemon_proc_start_time "$latest_pid" 2>/dev/null || true)"
+      if [[ -n "$owner_rec_pid" && "$owner_rec_pid" == "$latest_pid" \
+            && -n "$owner_rec_start" && -n "$other_live_start" \
+            && "$owner_rec_start" != "$other_live_start" ]]; then
+        # Owner record names this pid but with a DIFFERENT start-time →
+        # the audited daemon exited and its pid was recycled. Not a dup.
+        recycled_pid="true"
+      else
+        other_alive="true"
+      fi
+    else
+      # Live pid is NOT a bridge-daemon → recycled to an unrelated process.
+      recycled_pid="true"
+    fi
   fi
   command -v bridge_audit_log >/dev/null 2>&1 \
     && bridge_audit_log daemon daemon_pid_mismatch daemon \
          --detail self_pid="$$" \
          --detail recent_audit_pid="$latest_pid" \
-         --detail other_alive="$other_alive" >/dev/null 2>&1 || true
-  bridge_warn "daemon-self-check: pid mismatch — self=$$, latest audit daemon_started pid=$latest_pid, other_alive=$other_alive"
+         --detail other_alive="$other_alive" \
+         --detail recycled_pid="$recycled_pid" >/dev/null 2>&1 || true
+  bridge_warn "daemon-self-check: pid mismatch — self=$$, latest audit daemon_started pid=$latest_pid, other_alive=$other_alive, recycled_pid=$recycled_pid"
+
+  # A recycled pid is provably NOT a live duplicate — do not raise an admin
+  # task (that would be a false-positive duplicate-daemon alert). The audit
+  # row above already records the mismatch + recycled classification for
+  # forensics; return 1 (mismatch observed) without escalating.
+  if [[ "$recycled_pid" == "true" ]]; then
+    return 1
+  fi
 
   # r2 (codex BLOCKING #1): the audit row + bridge_warn is not enough —
   # without an operator-visible queue task, a surviving duplicate daemon

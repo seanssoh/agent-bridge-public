@@ -641,6 +641,24 @@ _bridge_daemon_on_exit() {
   # audit a `daemon_pid_file_cleanup_skipped` row.
   if bridge_daemon_pid_file_cleanup_should_remove "$BRIDGE_DAEMON_PID_FILE" "$$"; then
     rm -f "$BRIDGE_DAEMON_PID_FILE" 2>/dev/null || true
+    # #1563 — clear OUR active-generation owner record on a clean self
+    # teardown so the next start does not read a stale (pid, start_time)
+    # for a slot we no longer hold. Gated on the same ownership proof as
+    # the pid-file (only remove the record when its `pid` field is ours),
+    # so a losing competitor's exit never erases the TRUE holder's record.
+    # A leftover record is already harmless (the eviction path requires a
+    # LIVE matching `ps -o lstart=`, which a dead/recycled pid fails), but
+    # clearing it keeps the state legible. Best-effort.
+    if [[ -n "${BRIDGE_DAEMON_PID_FILE:-}" ]]; then
+      local _owner_record="${BRIDGE_DAEMON_PID_FILE}.owner"
+      if [[ -f "$_owner_record" ]]; then
+        local _owner_rec_pid=""
+        _owner_rec_pid="$(awk -F= '/^pid=/{print $2; exit}' "$_owner_record" 2>/dev/null | tr -dc '0-9')"
+        if [[ -z "$_owner_rec_pid" || "$_owner_rec_pid" == "$$" ]]; then
+          rm -f "$_owner_record" 2>/dev/null || true
+        fi
+      fi
+    fi
   else
     local _recorded_exit_pid=""
     if [[ -f "$BRIDGE_DAEMON_PID_FILE" ]]; then
