@@ -142,6 +142,14 @@ extract_singleton_lib() {
     printf '%s\n' '}'
     awk '/^_bridge_daemon_singleton_lock_path\(\) \{/,/^\}/' "$source"
     awk '/^_bridge_daemon_singleton_cmdline\(\) \{/,/^\}/' "$source"
+    # #1563 PR-1 owner-record helpers — ensure_singleton + self_check now
+    # depend on the active-generation owner record (pid+cmdline+start_time+
+    # generation) for stale-holder proof, so the extracted fixture MUST
+    # carry these or the driver dies with `command not found`.
+    awk '/^_bridge_daemon_proc_start_time\(\) \{/,/^\}/' "$source"
+    awk '/^_bridge_daemon_singleton_owner_path\(\) \{/,/^\}/' "$source"
+    awk '/^_bridge_daemon_singleton_write_owner\(\) \{/,/^\}/' "$source"
+    awk '/^_bridge_daemon_singleton_owner_field\(\) \{/,/^\}/' "$source"
     awk '/^bridge_daemon_ensure_singleton\(\) \{/,/^\}/' "$source"
     awk '/^bridge_daemon_self_check\(\) \{/,/^\}/' "$source"
   } >>"$out"
@@ -150,6 +158,64 @@ extract_singleton_lib() {
 }
 
 SINGLETON_LIB="$(extract_singleton_lib)"
+
+# ---------------------------------------------------------------------
+# #1563 eviction-proof helpers. The hardened ensure_singleton no longer
+# evicts a pid-file predecessor on a bare cmdline match — it now demands
+# POSITIVE start-time proof (the recorded owner record's pid+start_time
+# must match the predecessor's live `ps -o lstart=`) before it will
+# TERM/KILL. So the eviction-path tests (T2 contention-during-critical-
+# section, T4 evict-living-daemon) must pre-stage BOTH a matching owner
+# record AND a `ps` shim that returns a stable lstart token, or the holder
+# correctly refuses to signal and reclaims the slot without entering the
+# TERM-wait (the unproven-reclaim safety, exhaustively covered by
+# scripts/smoke/1563-daemon-singleton.sh C2). These helpers keep that
+# setup in one place.
+# ---------------------------------------------------------------------
+# A whitespace-free token so `_bridge_daemon_proc_start_time`'s
+# `tr -s '[:space:]' ' '` collapse is a no-op and the stored value
+# compares byte-identical with `==`.
+FAKE_LSTART_TOKEN="SmokeFixedLstart-D-beta4"
+
+# write_daemon_ps_shim <dir> — emit a `ps` shim into <dir> that reports
+# its target pid as a bridge-daemon: `-o lstart=` queries return the fixed
+# token (the start-time proof), every other query returns the
+# `bridge-daemon.sh run` cmdline (the eviction/self-check substring match).
+write_daemon_ps_shim() {
+  local shim_dir="$1"
+  mkdir -p "$shim_dir"
+  : >"$shim_dir/ps"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'fmt=""'
+    printf '%s\n' 'while (( $# > 0 )); do'
+    printf '%s\n' '  case "$1" in'
+    printf '%s\n' '    -o) shift; fmt="${1:-}"; shift || true ;;'
+    printf '%s\n' '    *) shift ;;'
+    printf '%s\n' '  esac'
+    printf '%s\n' 'done'
+    printf '%s\n' 'case "$fmt" in'
+    printf '%s\n' "  *lstart*) printf '%s\\n' '$FAKE_LSTART_TOKEN' ;;"
+    printf '%s\n' "  *) printf '%s\\n' 'bridge-daemon.sh run' ;;"
+    printf '%s\n' 'esac'
+  } >>"$shim_dir/ps"
+  chmod +x "$shim_dir/ps"
+}
+
+# write_owner_record <pid> — pre-stage the active-generation owner record
+# for a stale-but-live predecessor so ensure_singleton can PROVE staleness
+# (pid + start_time match the smart `ps` shim above) and take the eviction
+# path. Overwrites any prior record at the canonical owner path.
+write_owner_record() {
+  local pid="$1"
+  local owner_path="${BRIDGE_DAEMON_PID_FILE}.owner"
+  {
+    printf 'pid=%s\n' "$pid"
+    printf 'cmdline=%s\n' 'bridge-daemon.sh run'
+    printf 'start_time=%s\n' "$FAKE_LSTART_TOKEN"
+    printf 'generation=%s\n' 'smoke-fixed'
+  } >"$owner_path"
+}
 
 # ---------------------------------------------------------------------
 # T1: first spawn — ensure_singleton emits `daemon_started` with pid +
@@ -237,15 +303,16 @@ chmod +x "$T2_VICTIM_TRAP"
 /usr/bin/env bash "$T2_VICTIM_TRAP" &
 T2_VICTIM_PID=$!
 printf '%s\n' "$T2_VICTIM_PID" >"$BRIDGE_DAEMON_PID_FILE"
+# #1563: pre-stage the matching owner record so the holder can PROVE the
+# victim is a stale daemon predecessor (pid+start_time match the smart `ps`
+# shim's lstart token) and enter the TERM-wait — that 10s wait is what
+# holds the lock across the competitor's contended acquire below. Without
+# the record the holder would (correctly) refuse to signal an unproven pid,
+# reclaim the slot, and return immediately — no contention window.
+write_owner_record "$T2_VICTIM_PID"
 
 T2_SHIM="$SMOKE_TMP_ROOT/t2-shim"
-mkdir -p "$T2_SHIM"
-: >"$T2_SHIM/ps"
-{
-  printf '%s\n' '#!/usr/bin/env bash'
-  printf '%s\n' 'printf "%s\n" "bridge-daemon.sh run"'
-} >>"$T2_SHIM/ps"
-chmod +x "$T2_SHIM/ps"
+write_daemon_ps_shim "$T2_SHIM"
 
 T2_HOLDER="$SMOKE_TMP_ROOT/t2-holder.sh"
 : >"$T2_HOLDER"
@@ -585,23 +652,18 @@ mkfifo "$T4_SLEEPER_FIFO" 2>/dev/null || true
 sleep 60 &
 T4_EXISTING_PID=$!
 printf '%s\n' "$T4_EXISTING_PID" >"$BRIDGE_DAEMON_PID_FILE"
+# #1563: pre-stage the matching owner record so the evictor can PROVE the
+# sleeper is a stale daemon predecessor (pid+start_time match the smart
+# `ps` shim's lstart token). Without it ensure_singleton would reclaim the
+# slot WITHOUT signalling (the unproven-pid safety, covered by
+# 1563-daemon-singleton.sh C2), and this evict-the-living-daemon test
+# would have nothing to evict.
+write_owner_record "$T4_EXISTING_PID"
 
-# Build PS shim that reports the sleeper as `bridge-daemon.sh run`.
+# Build a PS shim that reports the sleeper as `bridge-daemon.sh run` with a
+# stable lstart token (so the #1563 start-time proof matches the record).
 T4_SHIM="$SMOKE_TMP_ROOT/t4-shim"
-mkdir -p "$T4_SHIM"
-: >"$T4_SHIM/ps"
-{
-  printf '%s\n' '#!/usr/bin/env bash'
-  printf '%s\n' 'while (( $# > 0 )); do'
-  printf '%s\n' '  case "$1" in'
-  printf '%s\n' '    -p) shift; QUERY_PID="$1"; shift ;;'
-  printf '%s\n' '    -o) shift; QUERY_FMT="$1"; shift ;;'
-  printf '%s\n' '    *) shift ;;'
-  printf '%s\n' '  esac'
-  printf '%s\n' 'done'
-  printf '%s\n' 'printf "%s\n" "bridge-daemon.sh run"'
-} >>"$T4_SHIM/ps"
-chmod +x "$T4_SHIM/ps"
+write_daemon_ps_shim "$T4_SHIM"
 
 T4_DRIVER="$SMOKE_TMP_ROOT/t4-driver.sh"
 : >"$T4_DRIVER"
