@@ -163,6 +163,20 @@ Fail-closed and conservative — it never guesses:
   / `port` / `bridge_id` — only the identity fields (and, with `--drop-address`,
   the migrated `address`) change.
 
+> **Recommended: key peers on `node_id` / `tailscale_name`, not a raw `address`.**
+> A raw-IP peer entry is vulnerable to peer-IP staleness — after the peer
+> re-logs-in to Tailscale and its IP drifts, a raw `address` keeps pointing at
+> the old IP until someone re-edits the config, whereas an identity-keyed peer
+> re-resolves to the current IP at use-time. (This was *not* the cause of the
+> 2026-06-06 outage — that was an environmental tailnet dead path, see
+> "Diagnosis + backoff recovery" above — but raw-IP staleness is a real,
+> separate failure mode worth pre-empting.) `agb a2a peers list` emits a
+> non-fatal WARN for any peer still configured with a raw `address` and no
+> identity, pointing here; running `agb a2a migrate-identity --apply` clears it.
+> `handoff.local.json` is machine-specific config (git-ignored) — these
+> recommendations live in docs + the runtime WARN, never baked into tracked
+> source.
+
 ## Signed `peer-identity-update` control message (`agb a2a announce-identity`)
 
 Even with identity-keyed configs + per-request resolution, the
@@ -358,6 +372,54 @@ runner loops from double-sending.
   per-peer pending count; over-cap, new sends fail locally with a clear
   remediation message (no silent unbounded disk growth).
 
+## Diagnosis + backoff recovery (`agb a2a diagnose-stuck`, #1563 PR-8)
+
+After a tailnet outage the bridge's *diagnosis* and *recovery* used to prolong
+the incident even though the death itself was environmental (a one-way tailnet
+dead path needing a re-handshake — not a receiver or protocol bug). Two
+defects were fixed:
+
+- **Directional diagnosis.** A bare `transport: timed out` last_error told
+  neither side which leg failed, so both peers blamed the other's receiver.
+  `agb a2a diagnose-stuck` now classifies the failing leg from three
+  **non-mutating** probes — the local receiver healthz (`GET /healthz`), a peer
+  TCP `address:port` connect (the same mechanic as `peers test`), and a
+  `tailscale status` node-online + tx/rx read — into one of:
+  `peer_receiver_unreachable` (our serve is healthy, the peer's port is closed),
+  `peer_tailnet_degraded` (the peer's node is offline at the tailnet layer),
+  `local_tailnet_degraded` (our own serve is unhealthy, or an outbound-dead
+  `tx 0 / rx > 0` asymmetry), or `transport_dead_path_unknown` (inconclusive).
+  The classification is surfaced in the daemon's stuck-alert body.
+
+- **Backoff recovery reset.** `backoff_seconds(base=15, ceiling=3600)` + jitter
+  means an attempt-8..10 retry row waits 16–60 min, and the `deliver` tick only
+  selects `next_attempt_ts <= now` rows — so after the peer *recovered*, the
+  high-attempt rows stayed dormant for tens of minutes (the incident needed a
+  manual `agb a2a outbox retry`). `diagnose-stuck` now, when a backoff-waiting
+  peer's **TCP probe succeeds**, resets that peer's `retry` rows to
+  `next_attempt_ts=0` so the next deliver tick sends immediately. The reset is
+  **probe-gated and transition-gated**: a peer whose probe still *fails* is left
+  on its backoff (its max-attempts / dead-letter behavior is untouched — an
+  unreachable peer is never thrashed), and a peer that stays reachable is reset
+  only once (on the fail→ok transition), not every tick. **Leased / `sending`
+  rows are never touched.**
+
+**TCP `peer:port` is the reachability ORACLE — never `tailscale ping`** (a
+disco-protocol artifact that can time out on a perfectly healthy A2A path).
+`diagnose-stuck` reads `tailscale status` (non-mutating) only as a side-channel
+for the directional classification; it **never** runs `tailscale up` / `down`
+or any other tailscale state mutation — the only self-recovery is the
+TCP-probe-gated backoff reset. This is **sender-side** diagnosis + outbox
+recovery only; the fail-closed receiver bind proof / HMAC / `remote_addr` /
+allowlist / dedupe are untouched.
+
+The daemon runs `diagnose-stuck` automatically inside the outbox stuck-scan
+tick; operators can also run it by hand (`--json` for the machine report,
+`--dry-run` to classify without resetting any backoff). When a delivery
+succeeds after a retry storm, the row's `last_error` is **preserved** (not
+NULL-wiped) on ack so a post-mortem keeps the attempt trail; `status='acked'`
+remains the authoritative success signal.
+
 ## Receiver dedupe / backpressure
 
 SQLite `$BRIDGE_STATE_DIR/handoff/inbox.db` tracks `message_id`, `peer`,
@@ -371,6 +433,8 @@ backpressure: over quota → `429` with `Retry-After`.
 | Situation | Mitigation |
 |-----------|-----------|
 | Receiver asleep / unreachable | sender outbox retry with backoff |
+| Peer recovered but rows stuck on long backoff | `diagnose-stuck` TCP-probes the peer and, on success, resets its `retry` rows to send-now (no manual `outbox retry`); unreachable peers stay on backoff (#1563 PR-8) |
+| Both sides blame each other's receiver | directional classification (`peer_receiver_unreachable` / `local_tailnet_degraded` / `peer_tailnet_degraded` / `transport_dead_path_unknown`) from local healthz + peer TCP + `tailscale status`, surfaced in the stuck-alert (#1563 PR-8) |
 | Receiver silently dead / serve wedged | daemon supervise tick auto-restarts via the fail-closed `start`; crash-loop → alarm-and-hold + admin task + `status` flag (#1405) |
 | Sender sleeps post-enqueue | resumes on the next `a2a deliver` tick |
 | Duplicate POST / lost ACK | `message_id` dedupe → idempotent `200` |
@@ -389,6 +453,7 @@ backpressure: over quota → `429` with `Retry-After`.
 - `agent-bridge a2a inbox-dedupe list|gc`
 - `agent-bridge a2a peers list|test <peer>`
 - `agent-bridge a2a deliver` — drain the outbox once
+- `agent-bridge a2a diagnose-stuck [--json] [--dry-run] [--probe-timeout <s>] [--ledger <path>]` — classify backoff-waiting `retry` rows by failing leg + reset backoff for peers whose TCP probe recovered (#1563 PR-8; also run automatically by the daemon stuck-scan)
 - `agent-bridge a2a announce-identity [--peer <id>] [--dry-run] [--timeout <s>]` — push a signed `peer-identity-update` to peers after an IP change
 - `agent-bridge a2a setup [--show-state [--json]] [--bridge-id <id>] [--peer <id>] [--peer-secret-env <ENVVAR>] [--listen-port <n>] [--inbound-allowlist a,b] [--yes] [--live-handshake]` — agent-driven setup wizard (see "Setup wizard" below)
 - `agent-bridge a2a daemon start|stop|restart|status|healthz|tick` — receiver lifecycle (`healthz` = read-only serve-liveness probe via `GET /healthz`)

@@ -1263,6 +1263,64 @@ def cmd_a2a_stuck_ack(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_a2a_diag_lookup(args: argparse.Namespace) -> int:
+    """Original site: bridge-daemon.sh process_a2a_outbox_stuck_scan_tick.
+
+    Issue #1563 PR-8 (A2A diagnostic + recovery hardening).
+
+    Extract the directional-diagnosis fields for a single peer from the
+    `bridge-a2a.py diagnose-stuck --json` report so the daemon shell can
+    enrich the stuck-alert body without an inline jq/python heredoc (footgun
+    #11). One peer's entry → one TSV row; no entry → no output (empty), which
+    the shell treats as "no diagnosis available for this peer".
+
+    Input (positional):
+      peer            — the destination peer id to look up.
+      diag_json_path  — JSON array file from `a2a diagnose-stuck --json`.
+
+    Output (stdout, single TSV row when the peer is present):
+      classification \\t tcp_probe \\t local_healthz \\t
+      next_attempt_in_seconds \\t backoff_reset(0|1) \\t
+      tcp_healthy_backoff_waiting(0|1)
+
+    Errors are swallowed (rc=0, no output) — a malformed/absent report must
+    never crash the daemon tick; the alert just falls back to the un-enriched
+    body.
+    """
+    peer = str(args.peer or "")
+    diag_path = args.diag_json_path
+    if not peer:
+        return 0
+    try:
+        with open(diag_path, "r", encoding="utf-8") as fh:
+            report = json.load(fh)
+        if not isinstance(report, list):
+            return 0
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return 0
+
+    for entry in report:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("peer") or "") != peer:
+            continue
+        classification = str(entry.get("classification") or "").replace("\t", " ")
+        tcp_probe = str(entry.get("tcp_probe") or "").replace("\t", " ")
+        local_healthz = str(entry.get("local_healthz") or "").replace("\t", " ")
+        try:
+            next_in = int(entry.get("next_attempt_in_seconds") or 0)
+        except (TypeError, ValueError):
+            next_in = 0
+        backoff_reset = "1" if entry.get("backoff_reset") else "0"
+        tcp_healthy = "1" if entry.get("tcp_healthy_backoff_waiting") else "0"
+        print(
+            f"{classification}\t{tcp_probe}\t{local_healthz}\t"
+            f"{next_in}\t{backoff_reset}\t{tcp_healthy}"
+        )
+        return 0
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI plumbing.
 # ---------------------------------------------------------------------------
@@ -1440,6 +1498,22 @@ SUBCOMMANDS = {
             ),
         ],
         "Stamp ledger for successful task-create rows + prune entries missing from outbox.",
+    ),
+    # Issue #1563 PR-8 (A2A diagnostic + recovery hardening): per-peer
+    # directional-diagnosis lookup for the stuck-alert body. See
+    # cmd_a2a_diag_lookup.
+    "a2a-diag-lookup": (
+        cmd_a2a_diag_lookup,
+        [
+            ("peer", "destination peer id to look up"),
+            (
+                "diag_json_path",
+                "JSON array file from `bridge-a2a.py diagnose-stuck --json`",
+            ),
+        ],
+        "Single TSV row (classification / tcp_probe / local_healthz / "
+        "next_attempt_in_seconds / backoff_reset / tcp_healthy_backoff_waiting) "
+        "for the peer, or empty when the peer is not backoff-waiting.",
     ),
 }
 

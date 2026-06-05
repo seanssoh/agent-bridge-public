@@ -2774,16 +2774,45 @@ process_a2a_outbox_stuck_scan_tick() {
     daemon_warn "[a2a_stuck_scan] mktemp failed; skipping"
     return 1
   }
+  # #1563 PR-8: per-peer directional-diagnosis + probe-gated backoff-reset
+  # report (one JSON entry per backoff-waiting peer). Used to enrich the
+  # stuck-alert body (classification / TCP-probe result / next_attempt_in_s).
+  local diag_tmp
+  diag_tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-stuck-diag.XXXXXX" 2>/dev/null)" || {
+    rm -f "$list_tmp" "$emit_tmp" "$ack_tmp"
+    daemon_warn "[a2a_stuck_scan] mktemp failed; skipping"
+    return 1
+  }
 
   local list_rc=0
   bridge_with_timeout 30 a2a_outbox_list \
     python3 "$SCRIPT_DIR/bridge-a2a.py" outbox list --json >"$list_tmp" 2>/dev/null || list_rc=$?
   if (( list_rc != 0 )); then
     daemon_warn "[a2a_stuck_scan] outbox list rc=$list_rc; skipping this tick"
-    rm -f "$list_tmp" "$emit_tmp" "$ack_tmp"
+    rm -f "$list_tmp" "$emit_tmp" "$ack_tmp" "$diag_tmp"
     printf 'A2A_STUCK_SCAN_LAST_TS=%s\nA2A_STUCK_SCAN_NEXT_TS=%s\nA2A_STUCK_SCAN_LAST_EMITTED=0\n' \
       "$now" "$((now + interval))" >"$tick_state" 2>/dev/null || true
     return 0
+  fi
+
+  # #1563 PR-8: directional diagnosis + probe-gated backoff recovery. This
+  # runs the NON-mutating probe set (local healthz, peer TCP connect — the
+  # health ORACLE, never `tailscale ping` — and a `tailscale status` tx/rx
+  # read) per backoff-waiting peer, classifies the failing leg, and — on a
+  # TCP-probe SUCCESS *transition* (gated by its own per-peer ledger so an
+  # unreachable peer is never thrashed) — resets that peer's retry rows to
+  # `next_attempt_ts=0` so the next deliver tick sends immediately instead of
+  # sitting dormant for the 16-60 min attempt-8..10 backoff. The JSON report
+  # (one entry per peer) is consumed below to enrich the alert body. Wrapped
+  # in bridge_with_timeout (the probes have their own short socket timeouts)
+  # so a hung tailscale/socket cannot wedge the daemon; failure is non-fatal
+  # (the alert still fires, just without the enriched diagnosis fields).
+  local diag_rc=0
+  bridge_with_timeout 30 a2a_diagnose_stuck \
+    python3 "$SCRIPT_DIR/bridge-a2a.py" diagnose-stuck --json >"$diag_tmp" 2>/dev/null || diag_rc=$?
+  if (( diag_rc != 0 )); then
+    daemon_warn "[a2a_stuck_scan] diagnose-stuck rc=$diag_rc; alerts will lack the directional diagnosis this tick"
+    printf '[]\n' >"$diag_tmp" 2>/dev/null || true
   fi
 
   # Parse + emit decisions in python3 — too much JSON+ledger logic to
@@ -2804,6 +2833,23 @@ process_a2a_outbox_stuck_scan_tick() {
   local emitted=0
   while IFS=$'\t' read -r message_id peer target_agent status attempts age_seconds last_error; do
     [[ -z "$message_id" ]] && continue
+
+    # #1563 PR-8: look up this peer's directional diagnosis from the
+    # diagnose-stuck report so the alert body tells the operator WHICH leg
+    # failed + whether the path has already recovered (TCP healthy but
+    # backoff-waiting). TSV row:
+    #   classification \t tcp_probe \t local_healthz \t next_attempt_in_seconds
+    #   \t backoff_reset \t tcp_healthy_backoff_waiting
+    # Empty (no row for this peer) when the peer is not backoff-waiting.
+    local diag_class="" diag_tcp="" diag_healthz="" diag_next="" diag_reset="" diag_tcp_healthy=""
+    local diag_row=""
+    diag_row="$(bridge_with_timeout 5 a2a_diag_lookup \
+      python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" a2a-diag-lookup \
+        "$peer" "$diag_tmp" 2>/dev/null || true)"
+    if [[ -n "$diag_row" ]]; then
+      IFS=$'\t' read -r diag_class diag_tcp diag_healthz diag_next diag_reset diag_tcp_healthy <<<"$diag_row"
+    fi
+
     local body_file
     body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-stuck.md.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-stuck.$$.$RANDOM")"
     {
@@ -2820,6 +2866,24 @@ process_a2a_outbox_stuck_scan_tick() {
       printf -- '- age: %ss\n' "$age_seconds"
       if [[ -n "$last_error" ]]; then
         printf -- '- last_error: `%s`\n' "$last_error"
+      fi
+      # #1563 PR-8 item #1 + #3: directional diagnosis + actionable fields.
+      if [[ -n "$diag_class" ]]; then
+        printf '\n## Diagnosis (#1563 PR-8)\n\n'
+        printf -- '- classification: `%s`\n' "$diag_class"
+        printf -- '- last TCP probe (peer:port, the reachability oracle): `%s`\n' "${diag_tcp:-unknown}"
+        printf -- '- local receiver healthz: `%s`\n' "${diag_healthz:-unknown}"
+        if [[ -n "$diag_next" ]]; then
+          printf -- '- next_attempt_in_seconds: %s\n' "$diag_next"
+        fi
+        if [[ "$diag_tcp_healthy" == "1" ]]; then
+          printf -- '- NOTE: TCP path is HEALTHY but this entry is waiting on exponential backoff.\n'
+          if [[ "$diag_reset" == "1" ]]; then
+            printf -- '  The daemon already reset this peer'\''s backoff to send-now; delivery should resume shortly.\n'
+          else
+            printf -- '  Run `agb a2a outbox retry %s` to send immediately if it does not.\n' "$message_id"
+          fi
+        fi
       fi
       printf '\n## Next steps\n\n'
       printf '1. Check `agb a2a outbox list` for context.\n'
@@ -2884,7 +2948,7 @@ process_a2a_outbox_stuck_scan_tick() {
       "$now" "$ledger_file" "$ack_tmp" "$list_tmp" \
       >/dev/null 2>&1 || true
 
-  rm -f "$list_tmp" "$emit_tmp" "$ack_tmp" 2>/dev/null || true
+  rm -f "$list_tmp" "$emit_tmp" "$ack_tmp" "$diag_tmp" 2>/dev/null || true
 
   if (( emitted > 0 )); then
     daemon_log_event "[a2a_stuck_scan] emitted $emitted stuck-outbox admin task(s)"
