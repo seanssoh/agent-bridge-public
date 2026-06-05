@@ -37,7 +37,10 @@
 #       pair present.
 #   P5  MCP-liveness giveup → admin task: bridge_daemon_mcp_giveup_escalate_admin
 #       files an admin task + emits plugin_mcp_liveness_giveup_escalated;
-#       task-create-fail retains retry; admin==affected agent is audit-only.
+#       task-create-fail retains retry. admin==affected agent: (a) routes the
+#       durable task to the codex pair (patch-dev) when one is provisioned
+#       (action=route_to_admin_dev), (b) audit-only (action=audit_only_no_admin_dev)
+#       only when no codex pair exists.
 #   P_teeth: structural reverts (claimed-work predicate; swallowed || true)
 #       are pinned to fail.
 #
@@ -436,13 +439,34 @@ step_p5_mcp_giveup_escalates() {
   bridge_daemon_mcp_giveup_escalate_admin "worker-b" "plugin:ms365@agent-bridge" "$now" || true
   [[ -f "$gmarker" ]] || smoke_fail "P5: giveup marker must be written after a successful escalation"
 
-  # admin==affected agent: feedback-loop guard → audit-only, no task.
+  # admin==affected agent, sub-case (a): a codex pair (patch-dev) IS in the
+  # roster → the admin can't action its own down inbox, so the durable task
+  # is routed to patch-dev (not audit-only). The self audit is emitted with
+  # action=route_to_admin_dev for visibility. Teeth: reverting item-1 to the
+  # old audit-only-always behavior FAILS this sub-case (no task / wrong action).
   reset_state
+  # patch-dev is present in the default roster (_SMOKE_AGENT_EXISTS).
   bridge_daemon_mcp_giveup_escalate_admin "$ADMIN" "plugin:teams@agent-bridge" "$now" || true
-  smoke_assert_eq "0" "$(task_create_count)" "P5: admin==affected agent → no self-task"
-  smoke_assert_eq "1" "$(audit_count plugin_mcp_liveness_giveup_admin_self)" "P5: admin-self giveup is audit-only"
+  smoke_assert_eq "1" "$(task_create_count)" "P5(a): admin-self with patch-dev → durable task routed (not audit-only)"
+  smoke_assert_contains "$(cat "$TASK_LOG")" "--to $ADMIN_DEV" "P5(a): admin-self task routed to patch-dev"
+  smoke_assert_contains "$(cat "$TASK_LOG")" "[mcp-giveup]" "P5(a): admin-self task titled [mcp-giveup]"
+  smoke_assert_eq "1" "$(audit_count plugin_mcp_liveness_giveup_admin_self)" "P5(a): admin-self audit row emitted"
+  smoke_assert_contains "$(cat "$AUDIT_LOG")" "action=route_to_admin_dev" "P5(a): admin-self audit action=route_to_admin_dev"
+  smoke_assert_eq "1" "$(audit_count plugin_mcp_liveness_giveup_escalated)" "P5(a): admin-self routes through the escalated path"
 
-  smoke_log "P5 PASS — MCP giveup escalates to admin, retains retry on failure, feedback-loop guarded"
+  # admin==affected agent, sub-case (b): NO codex pair in the roster → routing
+  # to the admin's own down inbox is useless, so keep audit-only (no task).
+  reset_state
+  unset '_SMOKE_AGENT_EXISTS[patch-dev]'
+  bridge_daemon_mcp_giveup_escalate_admin "$ADMIN" "plugin:teams@agent-bridge" "$now" || true
+  smoke_assert_eq "0" "$(task_create_count)" "P5(b): admin-self with NO patch-dev → no task"
+  smoke_assert_eq "1" "$(audit_count plugin_mcp_liveness_giveup_admin_self)" "P5(b): admin-self audit row emitted"
+  smoke_assert_contains "$(cat "$AUDIT_LOG")" "action=audit_only_no_admin_dev" "P5(b): admin-self audit action=audit_only_no_admin_dev"
+  smoke_assert_eq "0" "$(audit_count plugin_mcp_liveness_giveup_escalated)" "P5(b): no escalation task fired without a codex pair"
+  # Restore the dev pair for any subsequent tests.
+  _SMOKE_AGENT_EXISTS["$ADMIN_DEV"]=1
+
+  smoke_log "P5 PASS — MCP giveup escalates to admin/patch-dev, retains retry on failure, admin-self routes to codex pair (audit-only without one)"
 }
 
 # ===========================================================================

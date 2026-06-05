@@ -8450,8 +8450,12 @@ bridge_report_plugin_liveness_miss() {
 # quiet. Cooldown-gated per-agent via a marker file; on task-create FAILURE it
 # emits daemon_escalation_task_create_failed and RETAINS retry state (no
 # marker written) so the next giveup re-attempts. Routes to the admin (the
-# operator-facing owner of channel config); skips cleanly when admin is unset,
-# is the affected agent itself (feedback-loop guard), or no CLI is reachable.
+# operator-facing owner of channel config) for the normal affected-agent case;
+# when the affected agent IS the admin (admin-self), the admin cannot action
+# its own down inbox, so the durable task is routed to the admin's codex pair
+# (patch-dev) when one is provisioned — falling back to audit-only visibility
+# (action=audit_only_no_admin_dev) only when no codex pair exists. Skips
+# cleanly when admin is unset or no CLI is reachable.
 bridge_daemon_mcp_giveup_escalate_admin() {
   local agent="$1"
   local missing="$2"
@@ -8464,14 +8468,35 @@ bridge_daemon_mcp_giveup_escalate_admin() {
   [[ "$now_ts" =~ ^[0-9]+$ ]] || now_ts="$(date +%s)"
   [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=1800
 
-  # Feedback-loop guard: the admin can't action its own MCP-liveness inbox
-  # task if the admin IS the affected agent. Emit audit-only visibility.
+  # Routing target for the durable task. Defaults to the admin (the
+  # operator-facing owner of channel config) for the normal affected-agent
+  # case; the admin-self case below redirects it to the admin's codex pair.
+  local target="$admin"
+
+  # Admin-self case: the admin can't action its OWN MCP-liveness inbox task
+  # while its MCP channel is down, so routing the durable task to the admin
+  # is useless. Mirror process_daemon_admin_liveness_escalation and route to
+  # the admin's codex pair (patch-dev) instead — a recipient that can act.
   if [[ "$agent" == "$admin" ]]; then
+    local dev_target
+    dev_target="$(bridge_daemon_resolve_admin_dev_agent "$admin" 2>/dev/null || printf '')"
+    if [[ -z "$dev_target" ]]; then
+      # No codex pair provisioned — there is genuinely no better recipient
+      # (the admin's own down inbox is useless). Keep audit-only visibility.
+      bridge_audit_log daemon plugin_mcp_liveness_giveup_admin_self "$admin" \
+        --detail missing_channels="$missing" \
+        --detail action=audit_only_no_admin_dev \
+        2>/dev/null || true
+      return 0
+    fi
+    # Route the durable task to the codex pair + emit the self audit for
+    # visibility, then fall through to the normal cooldown + task-create path.
+    target="$dev_target"
     bridge_audit_log daemon plugin_mcp_liveness_giveup_admin_self "$admin" \
       --detail missing_channels="$missing" \
-      --detail action=audit_only_admin_target \
+      --detail action=route_to_admin_dev \
+      --detail target_agent="$dev_target" \
       2>/dev/null || true
-    return 0
   fi
 
   local state_dir marker
@@ -8496,7 +8521,7 @@ bridge_daemon_mcp_giveup_escalate_admin() {
   if [[ -z "$target_bridge" ]]; then
     bridge_audit_log daemon daemon_escalation_task_create_failed "$admin" \
       --detail reason=no_cli \
-      --detail target_agent="$admin" \
+      --detail target_agent="$target" \
       --detail kind=mcp_giveup \
       --detail affected_agent="$agent" \
       2>/dev/null || true
@@ -8525,11 +8550,12 @@ bridge_daemon_mcp_giveup_escalate_admin() {
   } >"$body_file"
 
   if "$target_bridge" task create \
-       --to "$admin" --priority high --from daemon \
+       --to "$target" --priority high --from daemon \
        --title "[mcp-giveup] ${agent} channel delivery stopped" \
        --body-file "$body_file" --force >/dev/null 2>&1; then
     bridge_audit_log daemon plugin_mcp_liveness_giveup_escalated "$admin" \
       --detail affected_agent="$agent" \
+      --detail target_agent="$target" \
       --detail missing_channels="$missing" \
       --detail cooldown_secs="$cooldown" \
       2>/dev/null || true
@@ -8537,11 +8563,11 @@ bridge_daemon_mcp_giveup_escalate_admin() {
   else
     bridge_audit_log daemon daemon_escalation_task_create_failed "$admin" \
       --detail reason=task_create_failed \
-      --detail target_agent="$admin" \
+      --detail target_agent="$target" \
       --detail kind=mcp_giveup \
       --detail affected_agent="$agent" \
       2>/dev/null || true
-    daemon_warn "[mcp_giveup] failed to file [mcp-giveup] escalation for ${agent} -> ${admin}; retaining retry state"
+    daemon_warn "[mcp_giveup] failed to file [mcp-giveup] escalation for ${agent} -> ${target}; retaining retry state"
   fi
   rm -f "$body_file" >/dev/null 2>&1 || true
   return 0

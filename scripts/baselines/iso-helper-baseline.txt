@@ -140,6 +140,7 @@ scripts/smoke/1455-settings-two-tree-doctor.sh=16
 scripts/smoke/1495-settings-invalid-hook-key.sh=6
 scripts/smoke/1497-p2-operator-home.sh=14
 scripts/smoke/1506-isolate-normalize.sh=5
+scripts/smoke/1563-pr3-daemon-escalation.sh=1
 scripts/smoke/1563-pr4-a2a-receiver-healthz.sh=5
 scripts/smoke/4494-integrated-dynamic-recovery.sh=4
 scripts/smoke/857-pr1-isolation-write-helper.sh=9
