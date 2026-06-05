@@ -6,6 +6,19 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.16.0-rc1] — 2026-06-05
+
+Release candidate for **0.16.0**, capping the `0.16.0-beta1..4` line with a 6-item stabilization wave (each codex pair-reviewed). Same `agb upgrade` path; no schema/contract change vs beta4.
+
+### Fixed / Added
+
+- **#1455 — settings single-tree drift doctor (#1556).** Read-only `agb doctor` detectors `settings-two-tree-drift` + `settings-multi-tree` (realpath-keyed dedup) flag a managed agent whose HOME vs workdir `.claude/settings.json` diverge; no writer/render change.
+- **#1459 — cron-dispatch backlog recovery + run/queue reconcile (#1557).** Daemon-wired backlog recovery with a separate `cron_dispatch_*` audit taxonomy (never the human-unclaimed/nudge path) + three run/queue reconcile cases guarded by worker-evidence so a live cron run is never false-positived.
+- **#1417 — lifecycle identity sync-on-start + `agb agent set-onboarding` (#1558).** Managed-project agents (workdir≠home) re-materialize the workdir identity copies FROM HOME on start — identity files only, strictly-newer-HOME mtime guard, fail-closed, iso v2 controller-published — so HOME edits / onboarding-state changes actually propagate to the copy the runtime reads.
+- **#9773 — surgical codex app-server subtree reap on teardown (#1560).** Reaps only the torn-down session's pane-subtree codex / Pencil-MCP children, verified by absolute start-time identity (`ps -o lstart=`), so a leaked codex app-server is cleaned without ever touching a live roster codex or in-progress review.
+- **#9780 — Stop/turn-end inbox auto-drain, claude + codex (#1562).** A turn-end hook drains a genuinely-claimable queued task instead of idling, behind a fail-open infinite-loop guard (id+status marker, atomic-persist-before-block) that preserves the #1199 queued-vs-claimed split.
+- **#1367 — auth sealed-paste: operator-terminal `agb auth claude-token receive` (#1559).** Echo-off `/dev/tty` read so the operator's Claude token is never read into an agent transcript / argv / env / queue / audit; fails closed with no controlling tty. The agent-context refusal + PreToolUse hook wrapper-detection are documented best-effort deterrents (the shared-UID residual — where an agent can only store its own token — is out of the threat model; on iso-v2 the registry's controller-UID ownership is the real FS boundary).
+
 ## [0.16.0-beta4] — 2026-06-04
 
 A **beta** on `0.16.0-beta3` landing the **create→isolate→onboard completeness** fixes for linux-user isolated agents — surfaced from a live multi-user onboarding. Two create-path fixes: first-create credential seeding so an isolated Claude agent does not auto-start authless, and a **TOCTOU-safe root publish** of the six identity profile files (plus a metadata-aware watchdog classifier). Both went through codex pair-review (the profile publish converged over three rounds down to symlink-race safety and audit parity); same `agb upgrade` path, no schema/contract change vs beta3.
