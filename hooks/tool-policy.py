@@ -2529,16 +2529,56 @@ def _is_bash_wrapper_receive(text: str) -> bool:
         # Unbalanced quotes etc. (a smuggling attempt) but the command
         # still names the wrapper receive — deny rather than fall through.
         return "receive" in stripped
-    # Skip leading `VAR=value` env-assignment tokens (`FOO=1 bash …`).
+    # See through leading `VAR=value` env-assignments AND `env`/`command`
+    # /`/usr/bin/env` command-prefix wrappers (with their own flags +
+    # `env`'s VAR=value / `-u NAME` args), then bash options — codex #1367
+    # r4 found `env FOO=1 bash …`, `/usr/bin/env bash …`, `command bash …`,
+    # `bash --noprofile …` all ran a working token-accepting receive. NOTE
+    # this hook detector is best-effort defense-in-depth ONLY: the real
+    # boundary is the runtime agent-context refusal in bridge-auth.py
+    # cmd_receive (an agent's BRIDGE_AGENT_ID is set), which catches the
+    # unbounded remaining spellings (`sh -c`, `eval`, symlinks, …) the hook
+    # cannot enumerate. We deny the common spellings here for a clean early
+    # signal + audit; we do NOT try to be exhaustive.
     idx = 0
-    while idx < len(tokens) and _ENV_ASSIGN_RE.match(tokens[idx]):
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if _ENV_ASSIGN_RE.match(tok):
+            idx += 1
+            continue
+        base = tok.rsplit("/", 1)[-1]
+        if base in ("env", "command", "nice", "nohup", "stdbuf"):
+            idx += 1
+            # Consume the wrapper's own flags + `env` VAR=value / `-u NAME`.
+            while idx < len(tokens):
+                a = tokens[idx]
+                if _ENV_ASSIGN_RE.match(a):
+                    idx += 1
+                    continue
+                if a.startswith("-"):
+                    consumes_arg = a == "-u"
+                    idx += 1
+                    if consumes_arg and idx < len(tokens):
+                        idx += 1
+                    continue
+                break
+            continue
+        break
+    # tokens[idx] must now be the bash interpreter.
+    if idx >= len(tokens) or tokens[idx].rsplit("/", 1)[-1] != "bash":
+        return False
+    idx += 1
+    # Skip bash options (`--noprofile`, `--norc`, `-x`, …) up to the script
+    # path. `-c` is intentionally NOT skipped: `bash -c '<string>'` runs a
+    # code string, not `bridge-auth.sh` as argv[1] — that form is left to
+    # the runtime agent-context refusal, not this detector.
+    while idx < len(tokens) and tokens[idx].startswith("-") and tokens[idx] != "-c":
         idx += 1
     return (
-        len(tokens) - idx >= 4
-        and tokens[idx] == "bash"
-        and tokens[idx + 1].rsplit("/", 1)[-1] == "bridge-auth.sh"
-        and tokens[idx + 2] == "claude-token"
-        and tokens[idx + 3] == "receive"
+        len(tokens) - idx >= 3
+        and tokens[idx].rsplit("/", 1)[-1] == "bridge-auth.sh"
+        and tokens[idx + 1] == "claude-token"
+        and tokens[idx + 2] == "receive"
     )
 
 

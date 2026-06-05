@@ -3126,6 +3126,35 @@ def cmd_receive(args: argparse.Namespace) -> int:
     if args.request:
         return _cmd_receive_request(args, registry_path, json_mode)
 
+    # ── agent-context refusal (the runtime boundary, #1367 r4) ───────
+    # The token-ACCEPTING receive must run ONLY in the OPERATOR's own
+    # terminal, never from inside an agent. An agent's process carries
+    # BRIDGE_AGENT_ID; the operator's own shell does not (a legit
+    # operator-run receive is audited under the "operator" label). Refuse
+    # affirmatively HERE so the guarantee does NOT depend on the PreToolUse
+    # hook enumerating every shell spelling — `env`/`command`/`/usr/bin/env`
+    # /`bash -opt`/`sh -c`/symlink/… are unbounded, so the hook is only
+    # best-effort defense-in-depth; this runtime gate is the real boundary.
+    # The token-free `--request` shape returned above is unaffected, so an
+    # admin agent can still INITIATE the flow without touching a token.
+    agent_ctx = os.environ.get("BRIDGE_AGENT_ID", "").strip()  # noqa: iso-helper-boundary - agent-context gate for the operator-only token-accepting receive
+    if agent_ctx:
+        _sealed_receive_audit(
+            "tool_policy_credential_sealed_receive_refused_agent_context",
+            {
+                "surface": "sealed_paste_receive",
+                "id": args.id or "",
+                "reason": "agent_context_token_accepting_receive",
+            },
+        )
+        return fail(
+            "token-accepting `receive` must be run by the OPERATOR from a "
+            "terminal, not from an agent (BRIDGE_AGENT_ID is set). Use "
+            "`receive --request ... --json` to initiate; the operator then "
+            "completes it from their own terminal.",
+            json_mode,
+        )
+
     # ── operator-terminal echo-off receive ──────────────────────────
     if not args.id:
         return fail("receive requires --id <id> (or --request)", json_mode)

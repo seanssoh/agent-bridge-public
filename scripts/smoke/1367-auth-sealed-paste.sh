@@ -174,6 +174,14 @@ main() {
   smoke_assert_file_exists "$PTY_HELPER" "pty harness helper present"
   build_reg_verify
 
+  # The operator-path tests (R1-R4) simulate the OPERATOR's own terminal,
+  # where BRIDGE_AGENT_ID is NOT set. Clear any inherited value (this smoke
+  # is itself run by an agent whose BRIDGE_AGENT_ID would otherwise trip the
+  # #1367 r4 agent-context refusal during R1-R4). The agent-context test
+  # (R1b) and the PreToolUse hook tests set BRIDGE_AGENT_ID explicitly,
+  # inline, so they are unaffected by this clear.
+  unset BRIDGE_AGENT_ID
+
   setup_agent_home admin-1367 admin
   setup_agent_home user-1367 user
 
@@ -204,6 +212,31 @@ main() {
     smoke_fail "R1 LEAK: registry was written despite no controlling tty"
   else
     smoke_log "ok: R1 NO registry written on fail-closed"
+  fi
+
+  # ── R1b — agent-context refusal (#1367 r4, the RUNTIME boundary) ────
+  # A token-accepting receive run with BRIDGE_AGENT_ID set (agent context)
+  # must REFUSE before any tty read — regardless of the shell spelling used
+  # to invoke it. This is the boundary the PreToolUse hook merely backstops;
+  # it closes the env/command/bash-option wrapper bypasses at the source.
+  smoke_log "R1b: agent-context refusal (BRIDGE_AGENT_ID set)"
+  local r1b_out r1b_rc=0
+  r1b_out="$(BRIDGE_AGENT_ID="agent-1367-probe" "$PYTHON_BIN" "$SMOKE_REPO_ROOT/bridge-auth.py" \
+    --registry "$registry" receive --id pool-r1b --json </dev/null 2>&1)" || r1b_rc=$?
+  if (( r1b_rc != 0 )); then
+    smoke_log "ok: R1b receive refuses in agent context (rc=$r1b_rc)"
+  else
+    smoke_fail "R1b: expected refusal with BRIDGE_AGENT_ID set, got rc=0: $r1b_out"
+  fi
+  if [[ "$r1b_out" == *"must be run by the OPERATOR"* ]]; then
+    smoke_log "ok: R1b refusal names the operator-terminal requirement"
+  else
+    smoke_fail "R1b: expected an operator-terminal refusal message, got: $r1b_out"
+  fi
+  if [[ -f "$registry" ]]; then
+    smoke_fail "R1b LEAK: registry written despite agent-context refusal"
+  else
+    smoke_log "ok: R1b NO registry written on agent-context refusal"
   fi
 
   # ── R2 — operator-terminal echo-off receive (pty harness) ──────────
@@ -494,6 +527,47 @@ main() {
     "N8-bash-envprefix token-accepting receive with env-assignment prefix" \
     admin-1367 \
     "FOO=1 bash bridge-auth.sh claude-token receive --id pool-a --activate --json" \
+    "DENY" \
+    "admin-1367"
+
+  # N8-bash-env / -command / -opt / -env-u — #1367 r4 (codex SECURITY):
+  # command-prefix wrappers (`env`, `/usr/bin/env`, `command`) and bash
+  # options (`--noprofile`) also run a working token-accepting receive and
+  # must DENY at the hook (best-effort defense-in-depth; the runtime
+  # agent-context refusal is the real boundary). `env -u BRIDGE_AGENT_ID`
+  # additionally tries to clear the runtime gate — the hook must still deny.
+  assert_hook_verdict \
+    "N8-bash-env token-accepting receive via env prefix" \
+    admin-1367 \
+    "env FOO=1 bash bridge-auth.sh claude-token receive --id pool-a --activate --json" \
+    "DENY" \
+    "admin-1367"
+
+  assert_hook_verdict \
+    "N8-bash-env-abs token-accepting receive via /usr/bin/env prefix" \
+    admin-1367 \
+    "/usr/bin/env bash bridge-auth.sh claude-token receive --id pool-a --activate --json" \
+    "DENY" \
+    "admin-1367"
+
+  assert_hook_verdict \
+    "N8-bash-command token-accepting receive via command prefix" \
+    admin-1367 \
+    "command bash bridge-auth.sh claude-token receive --id pool-a --activate --json" \
+    "DENY" \
+    "admin-1367"
+
+  assert_hook_verdict \
+    "N8-bash-opt token-accepting receive with bash option" \
+    admin-1367 \
+    "bash --noprofile bridge-auth.sh claude-token receive --id pool-a --activate --json" \
+    "DENY" \
+    "admin-1367"
+
+  assert_hook_verdict \
+    "N8-bash-env-u token-accepting receive clearing BRIDGE_AGENT_ID via env -u" \
+    admin-1367 \
+    "env -u BRIDGE_AGENT_ID bash bridge-auth.sh claude-token receive --id pool-a --activate --json" \
     "DENY" \
     "admin-1367"
 
