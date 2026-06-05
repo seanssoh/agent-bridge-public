@@ -10094,8 +10094,30 @@ reap_idle_orphan_sessions() {
     [[ "$idle" =~ ^[0-9]+$ ]] || idle=0
     (( idle >= threshold )) || continue
 
+    # Incident #9770 Track 2: capture the session's codex app-server + Pencil
+    # MCP subtree BEFORE the external kill, while the pane PID still resolves.
+    # The pane's own EXIT trap does not run under an external `tmux
+    # kill-session`, so this is the only path that catches the leak on idle
+    # reap. Scoped to the pane subtree — never a live roster codex elsewhere.
+    local codex_subtree_root_pid=""
+    local codex_subtree_capture=""
+    if command -v bridge_codex_subtree_capture >/dev/null 2>&1; then
+      codex_subtree_root_pid="$(bridge_codex_subtree_pane_pid "$session" 2>/dev/null || true)"
+      codex_subtree_capture="$(bridge_codex_subtree_capture "$session" 2>/dev/null || true)"
+    fi
+
     if bridge_tmux_kill_session "$session" >/dev/null 2>&1; then
       sleep 0.2
+      if command -v bridge_codex_subtree_reap_captured >/dev/null 2>&1; then
+        if [[ -n "$codex_subtree_root_pid" ]]; then
+          bridge_codex_subtree_reap_captured "$session" "$codex_subtree_root_pid" \
+            "$codex_subtree_capture" "orphan-session:${session}" >/dev/null 2>&1 || true
+        else
+          bridge_audit_log daemon codex_subtree_reap_skipped_no_pane codex \
+            --detail "session=${session}" --detail "reason=pane-pid-unresolvable" \
+            >/dev/null 2>&1 || true
+        fi
+      fi
       if [[ "${BRIDGE_MCP_ORPHAN_CLEANUP_ENABLED:-1}" == "1" ]]; then
         bridge_mcp_orphan_cleanup "orphan-session:${session}" "${BRIDGE_MCP_ORPHAN_SESSION_STOP_MIN_AGE_SECONDS:-0}" 1 >/dev/null 2>&1 || true
       fi

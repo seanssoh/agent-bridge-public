@@ -10424,6 +10424,8 @@ bridge_kill_agent_session() {
   local agent="$1"
   local session
   local attempt
+  local codex_subtree_capture=""
+  local codex_subtree_root_pid=""
 
   session="$(bridge_agent_session "$agent")"
   if [[ -z "$session" ]]; then
@@ -10434,6 +10436,17 @@ bridge_kill_agent_session() {
   if ! bridge_tmux_session_exists "$session"; then
     bridge_warn "이미 종료된 세션입니다: $agent/$session"
     return 1
+  fi
+
+  # Incident #9770 Track 2: capture this session's codex app-server + Pencil
+  # MCP subtree BEFORE the tmux kill, while the pane PID is still resolvable.
+  # `tmux kill-session` reparents the codex chain to a non-PPID-1 ancestor on
+  # macOS where the global orphan cleaner cannot reach it, so we resolve the
+  # set up front and reap it explicitly after the session is gone. Scoped to
+  # the pane subtree only — never a live roster codex in a different pane.
+  if command -v bridge_codex_subtree_capture >/dev/null 2>&1; then
+    codex_subtree_root_pid="$(bridge_codex_subtree_pane_pid "$session" 2>/dev/null || true)"
+    codex_subtree_capture="$(bridge_codex_subtree_capture "$session" 2>/dev/null || true)"
   fi
 
   bridge_tmux_kill_session "$session"
@@ -10448,6 +10461,20 @@ bridge_kill_agent_session() {
     return 1
   fi
   sleep 0.2
+  # Reap the captured codex subtree (fail-soft). When the pane PID was
+  # unresolvable, codex_subtree_root_pid is empty and the helper no-ops + the
+  # _for_session fallback below records the skip-audit instead of a global
+  # sweep.
+  if command -v bridge_codex_subtree_reap_captured >/dev/null 2>&1; then
+    if [[ -n "$codex_subtree_root_pid" ]]; then
+      bridge_codex_subtree_reap_captured "$agent" "$codex_subtree_root_pid" \
+        "$codex_subtree_capture" "session-kill:${agent}" >/dev/null 2>&1 || true
+    else
+      bridge_audit_log daemon codex_subtree_reap_skipped_no_pane codex \
+        --detail "label=${agent}" --detail "session=${session}" \
+        --detail "reason=pane-pid-unresolvable" >/dev/null 2>&1 || true
+    fi
+  fi
   bridge_mcp_orphan_cleanup_after_session_stop "$agent" >/dev/null 2>&1 || true
   bridge_agent_port_aware_orphan_cleanup_after_session_stop "$agent" \
     >/dev/null 2>&1 || true

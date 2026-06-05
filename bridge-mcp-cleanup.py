@@ -74,6 +74,33 @@ DEFAULT_PATTERNS = [
 ]
 
 
+# Incident #9770 Track 2 — codex app-server / Pencil MCP teardown leak.
+#
+# These patterns are used ONLY by the `subtree` subcommand (surgical
+# per-session reap rooted at a known tmux pane PID). They are deliberately
+# NOT part of DEFAULT_PATTERNS: the global orphan path (scan/cleanup) must
+# stay PPID-orphan + DEFAULT_PATTERNS only, so a live roster `codex resume`
+# (a descendant of its OWN live pane) is never a global-cleanup candidate.
+#
+# In `subtree` mode the allowlist is a WITHIN-SUBTREE filter, never a global
+# match: the candidate set is already constrained to descendants of the
+# torn-down session's pane PID, so matching `codex` here can only ever reach
+# the codex the torn-down session itself spawned. A second live roster codex,
+# the operator's interactive codex, and a non-codex child the user opened in
+# the same pane are all excluded by construction (different pane subtree) or
+# by name (the same-pane non-codex child).
+#
+# Provenance (live ps -axo command= on the Darwin leak host):
+#   - `codex` / `codex resume <hash>` / `codex exec ...`  (the CLI itself)
+#   - `codex app-server`                                  (the leaked child)
+#   - `.../Pencil.app/.../mcp-server-darwin-arm64 ...`    (Pencil MCP grandchild)
+SUBTREE_ALLOWLIST_PATTERNS = [
+    r"(?:^|/)codex(?:\s|$)",
+    r"(?:^|/)codex\s+app-server\b",
+    r"\bmcp-server-darwin-arm64\b",
+]
+
+
 @dataclass(frozen=True)
 class Proc:
     pid: int
@@ -310,6 +337,315 @@ def kill_pid(
     return True, "killed"
 
 
+def still_killable_subtree(
+    pid: int,
+    expected_command: str,
+    expected_pattern: re.Pattern[str],
+    min_observed_age: int,
+) -> bool:
+    """PID-reuse guard for the SUBTREE reap path (#9770 Track 2).
+
+    Identical to `still_killable` EXCEPT it deliberately drops the parent-PID
+    constraint. On the daemon idle-kill path we capture the codex/app-server/MCP
+    descendants of a pane PID and reap them AFTER `tmux kill-session` — which
+    tears the pane down, so the captured codex REPARENTS to init/launchd. That
+    reparent is the expected, benign signal of the teardown we initiated, not a
+    PID-reuse event, so a ppid check would wrongly refuse to reap the very leak
+    we are trying to close. PID reuse is still defended by the triple (a) the
+    pid still exists, (b) it still matches the within-subtree allowlist, (c) its
+    command string is byte-identical to the captured command, and (d) it is no
+    younger than when captured (a recycled pid is a fresh, younger process).
+    """
+    identity = read_proc_identity(pid)
+    if identity is None:
+        return False
+    command, _ppid, age = identity
+    if not expected_pattern.search(command):
+        return False
+    if command != expected_command:
+        return False
+    if age < min_observed_age:
+        return False
+    return True
+
+
+def kill_pid_subtree(
+    pid: int,
+    grace_seconds: float,
+    expected_command: str,
+    expected_pattern: re.Pattern[str],
+    min_observed_age: int,
+) -> tuple[bool, str]:
+    """SIGTERM→grace→SIGKILL with ppid-agnostic PID-reuse revalidation before
+    every signal. Fail-soft + idempotent: ESRCH is success/no-op; a vanished or
+    identity-changed pid is skipped rather than signalled."""
+    # PID-reuse revalidation IMMEDIATELY before SIGTERM.
+    if not still_killable_subtree(pid, expected_command, expected_pattern, min_observed_age):
+        return True, "skipped-pid-reuse"
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True, "already-gone"
+    except PermissionError as exc:
+        return False, str(exc)
+
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        if not alive(pid):
+            return True, "terminated"
+        time.sleep(0.05)
+
+    # Revalidate again before escalating to SIGKILL — the pid may have exited
+    # (and possibly been recycled) during the grace window. A process that has
+    # become a zombie (SIGTERM took effect, parent has not reaped it yet) no
+    # longer matches the captured command, so this correctly reports it as
+    # already-terminated rather than re-signalling a recycled pid.
+    if not still_killable_subtree(pid, expected_command, expected_pattern, min_observed_age):
+        return True, "terminated"
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True, "terminated"
+    except PermissionError as exc:
+        return False, str(exc)
+    return True, "killed"
+
+
+def descendants_of(root_pid: int, processes: dict[int, Proc], max_nodes: int = 4096) -> list[Proc]:
+    """BFS the live process map for every descendant of `root_pid`.
+
+    The root itself is NOT included — we only ever reap the codex/app-server/
+    MCP children the pane spawned, never the pane's shell/login process. Bounded
+    by `max_nodes` so a pathological cycle (which `seen` already prevents) or a
+    huge process table can never spin. Built from a single ps snapshot so the
+    parent→child edges are internally consistent.
+    """
+    children: dict[int, list[int]] = {}
+    for proc in processes.values():
+        children.setdefault(proc.ppid, []).append(proc.pid)
+
+    out: list[Proc] = []
+    seen: set[int] = {root_pid}
+    queue: list[int] = list(children.get(root_pid, []))
+    while queue and len(seen) < max_nodes:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        proc = processes.get(pid)
+        if proc is None:
+            continue
+        out.append(proc)
+        queue.extend(children.get(pid, []))
+    return out
+
+
+def _subtree_matched_pattern(proc: Proc, patterns: list[re.Pattern[str]]) -> str:
+    if proc.pid == os.getpid():
+        return ""
+    if "bridge-mcp-cleanup.py" in proc.command:
+        return ""
+    for pattern in patterns:
+        if pattern.search(proc.command):
+            return pattern.pattern
+    return ""
+
+
+def capture_subtree(root_pid: int, patterns: list[re.Pattern[str]]) -> list[dict[str, object]]:
+    """Resolve the codex/app-server/MCP descendants of `root_pid` (the torn-down
+    session's tmux pane PID), with per-PID metadata for later revalidation.
+
+    Returns a leaf-to-root–ordered list (highest pid first as a cheap proxy) of
+    {pid, ppid, age_seconds, rss_kb, pattern, command}. Only processes whose
+    command matches the within-subtree allowlist are captured — a non-codex
+    child the user opened in the same pane is intentionally left out.
+    """
+    processes = load_processes()
+    captured: list[dict[str, object]] = []
+    for proc in descendants_of(root_pid, processes):
+        pattern = _subtree_matched_pattern(proc, patterns)
+        if not pattern:
+            continue
+        captured.append(
+            {
+                "pid": proc.pid,
+                "ppid": proc.ppid,
+                "age_seconds": proc.age_seconds,
+                "rss_kb": proc.rss_kb,
+                "pattern": pattern,
+                "command": proc.command,
+            }
+        )
+    # Reap children before their parents: a parent that re-spawns a child
+    # mid-reap is defended by per-signal revalidation, but leaf-first keeps the
+    # common case clean. Highest pid first is a cheap, stable leaf-to-root proxy.
+    captured.sort(key=lambda item: int(item["pid"]), reverse=True)
+    return captured
+
+
+def reap_captured(
+    captured: list[dict[str, object]],
+    patterns: list[re.Pattern[str]],
+    grace_seconds: float,
+) -> dict[str, list[dict[str, object]]]:
+    """Reap a previously-captured subtree PID set, revalidating each PID against
+    its captured metadata immediately before EVERY signal (PID-reuse defense).
+
+    Fail-soft and idempotent: a vanished PID is success/no-op (ESRCH), a PID
+    whose identity changed since capture is skipped, and a permission failure is
+    recorded as an error without raising.
+    """
+    pattern_by_str = {pattern.pattern: pattern for pattern in patterns}
+    killed: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
+    errors: list[dict[str, object]] = []
+    self_pid = os.getpid()
+    parent_pid = os.getppid()
+    for item in captured:
+        try:
+            pid = int(item["pid"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        enriched = dict(item)
+        # Never signal self or our own parent — a captured set should never
+        # contain them, but this is the cheap structural guard the reviewer
+        # asked for ("PID is not self/parent").
+        if pid in (self_pid, parent_pid):
+            enriched["kill_status"] = "skipped-self-or-parent"
+            skipped.append(enriched)
+            continue
+        expected_pattern = pattern_by_str.get(str(item.get("pattern")))
+        if expected_pattern is None:
+            # Defensive: never signal a pid we cannot revalidate against a
+            # within-subtree allowlist pattern.
+            enriched["kill_status"] = "skipped-no-pattern"
+            skipped.append(enriched)
+            continue
+        # ppid-agnostic revalidation: the captured codex reparents to init when
+        # we tear its pane down on the daemon path, which is expected — see
+        # kill_pid_subtree / still_killable_subtree.
+        ok, status = kill_pid_subtree(
+            pid,
+            grace_seconds,
+            str(item.get("command", "")),
+            expected_pattern,
+            int(item.get("age_seconds", 0)),
+        )
+        enriched["kill_status"] = status
+        if status.startswith("skipped-"):
+            skipped.append(enriched)
+        elif ok:
+            killed.append(enriched)
+        else:
+            errors.append(enriched)
+    return {"killed": killed, "skipped": skipped, "errors": errors}
+
+
+def build_subtree_report(args: argparse.Namespace) -> dict[str, object]:
+    """`subtree` subcommand: surgical per-session reap of the codex/app-server/
+    MCP descendants of a known tmux pane PID.
+
+    Three shapes, all scoped to ONE torn-down session's pane subtree:
+      * --capture-only --root-pid N   → emit the captured PID+metadata set
+        (used on the daemon idle-kill path BEFORE `tmux kill-session`).
+      * --pids-json '[...]'           → reap a previously-captured set (used
+        AFTER the kill, so we never rediscover globally once the pane is gone).
+      * --root-pid N (no flags)       → capture-then-reap in one shot (the
+        clean-exit / kill-agent-session path, where the pane is still alive).
+    """
+    patterns = compile_patterns(args.pattern or SUBTREE_ALLOWLIST_PATTERNS)
+
+    if args.pids_json is not None:
+        try:
+            captured = json.loads(args.pids_json)
+        except (ValueError, TypeError):
+            captured = []
+        if not isinstance(captured, list):
+            captured = []
+        root_pid = int(args.root_pid) if args.root_pid is not None else -1
+    else:
+        if args.root_pid is None:
+            return {
+                "mode": "subtree",
+                "root_pid": None,
+                "captured_count": 0,
+                "captured": [],
+                "killed_count": 0,
+                "skipped_count": 0,
+                "killed": [],
+                "skipped": [],
+                "errors": [],
+                "error": "no-root-pid",
+            }
+        root_pid = int(args.root_pid)
+        captured = capture_subtree(root_pid, patterns)
+
+    if args.capture_only:
+        return {
+            "mode": "subtree-capture",
+            "root_pid": root_pid,
+            "captured_count": len(captured),
+            "captured": captured,
+        }
+
+    result = reap_captured(captured, patterns, args.grace_seconds)
+    killed_rss_kb = sum(int(item.get("rss_kb") or 0) for item in result["killed"])
+    return {
+        "mode": "subtree",
+        "trigger": args.trigger,
+        "root_pid": root_pid,
+        "captured_count": len(captured),
+        "killed_count": len(result["killed"]),
+        "skipped_count": len(result["skipped"]),
+        "error_count": len(result["errors"]),
+        "freed_mb_estimate": round(killed_rss_kb / 1024, 1),
+        "captured": captured,
+        "killed": result["killed"],
+        "skipped": result["skipped"],
+        "errors": result["errors"],
+    }
+
+
+def extract_captured_pids(report_text: str) -> str:
+    """Parse a `subtree --capture-only` JSON report and re-emit its `captured`
+    array as a compact JSON list (for `--pids-json`). Empty string on any
+    parse failure so the bash caller can no-op without hand-rolling JSON."""
+    try:
+        report = json.loads(report_text)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(report, dict):
+        return ""
+    captured = report.get("captured")
+    if not isinstance(captured, list):
+        return ""
+    return json.dumps(captured, ensure_ascii=False)
+
+
+def subtree_audit_summary(report_text: str) -> str:
+    """Render a redacted one-line `key=value` summary of a subtree reap report
+    for the audit log. ONLY counts + the freed-MB estimate leave the process —
+    never the captured command strings (which can carry cwd/paths). Returns ''
+    when there was nothing worth recording (no captures and no skips/errors)."""
+    try:
+        report = json.loads(report_text)
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(report, dict):
+        return ""
+    captured = int(report.get("captured_count") or 0)
+    killed = int(report.get("killed_count") or 0)
+    skipped = int(report.get("skipped_count") or 0)
+    errors = int(report.get("error_count") or 0)
+    if captured == 0 and killed == 0 and skipped == 0 and errors == 0:
+        return ""
+    freed = report.get("freed_mb_estimate") or 0
+    return (
+        f"captured={captured} killed={killed} "
+        f"skipped={skipped} errors={errors} freed_mb={freed}"
+    )
+
+
 def build_report(args: argparse.Namespace) -> dict[str, object]:
     patterns = compile_patterns(args.pattern or DEFAULT_PATTERNS)
     processes = load_processes()
@@ -401,7 +737,60 @@ def main() -> int:
         child.add_argument("--kill", action="store_true")
         child.add_argument("--dry-run", action="store_true")
 
+    # Incident #9770 Track 2 — surgical per-session subtree reap.
+    subtree = subparsers.add_parser("subtree")
+    subtree.add_argument("--json", action="store_true")
+    subtree.add_argument(
+        "--root-pid",
+        type=int,
+        default=None,
+        help="tmux pane PID of the torn-down session (subtree root)",
+    )
+    subtree.add_argument(
+        "--pids-json",
+        default=None,
+        help="reap a previously-captured PID+metadata set (JSON list)",
+    )
+    subtree.add_argument(
+        "--capture-only",
+        action="store_true",
+        help="emit the captured set without reaping (daemon pre-kill capture)",
+    )
+    subtree.add_argument("--pattern", action="append")
+    subtree.add_argument("--trigger", default="subtree")
+    subtree.add_argument("--grace-seconds", type=float, default=1.0)
+
+    # Shell-side glue for the subtree reap: parse the captured array out of a
+    # capture-only report (so bash never hand-rolls JSON), and render a redacted
+    # one-line audit summary. Kept here (not a separate helper) so the whole
+    # subtree contract lives in one file.
+    extract = subparsers.add_parser("subtree-extract-captured")
+    extract.add_argument("--report", required=True)
+    audit = subparsers.add_parser("subtree-audit-summary")
+    audit.add_argument("--report", required=True)
+
     args = parser.parse_args()
+
+    if args.command == "subtree":
+        report = build_subtree_report(args)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(f"mode: {report.get('mode')}")
+            print(f"root_pid: {report.get('root_pid')}")
+            print(f"captured: {report.get('captured_count', 0)}")
+            print(f"killed: {report.get('killed_count', 0)}")
+            print(f"skipped: {report.get('skipped_count', 0)}")
+        return 0
+
+    if args.command == "subtree-extract-captured":
+        print(extract_captured_pids(args.report))
+        return 0
+
+    if args.command == "subtree-audit-summary":
+        print(subtree_audit_summary(args.report))
+        return 0
+
     if args.command == "scan":
         args.kill = False
     elif args.dry_run:

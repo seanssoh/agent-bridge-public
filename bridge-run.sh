@@ -880,6 +880,17 @@ bridge_run_cleanup_mcp_orphans() {
   [[ "${BRIDGE_MCP_ORPHAN_CLEANUP_ENABLED:-1}" == "1" ]] || return 0
   [[ "$min_age" =~ ^[0-9]+$ ]] || min_age=0
 
+  # Incident #9770 Track 2: surgically reap THIS session's own codex
+  # app-server + Pencil MCP subtree on clean pane exit. The pane is still
+  # alive here (this runs in the exit handler before the tmux session is
+  # gone), so a single resolve of the pane PID is race-free. Scoped to the
+  # pane's descendants only — a live roster codex in a different pane is
+  # never reachable. Fail-soft; must not block exit.
+  if command -v bridge_codex_subtree_reap_for_session >/dev/null 2>&1; then
+    bridge_codex_subtree_reap_for_session "$SESSION" "$AGENT" "session-exit:${AGENT}" \
+      >/dev/null 2>&1 || true
+  fi
+
   # Give orphaned MCP grandchildren a brief chance to be reparented to init
   # before scanning, otherwise the conservative detector can miss them.
   sleep 0.2
