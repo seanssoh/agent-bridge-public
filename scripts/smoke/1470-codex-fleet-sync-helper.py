@@ -158,6 +158,68 @@ def _dirfd_writer(auth_py: str, work_dir: str) -> str:
     return "dirfd-writer-ok"
 
 
+def _live_swap(auth_py: str, work_dir: str) -> str:
+    """Live parent-swap negative control (codex Phase-4 BLOCKING repro).
+
+    Monkeypatch os.open so the FIRST O_DIRECTORY open of the dest parent
+    races the attacker swap: rename the OPENED `.codex` OUTSIDE allowed_root
+    and drop an in-root `.codex` decoy. The writer must REFUSE (the fd's own
+    identity, not a string re-resolution, is checked) and write NOTHING inside
+    OR outside. This is the exact proof codex ran on a non-procfs host where
+    the old string fallback let the write land outside; the fix uses
+    F_GETPATH (Darwin) / /proc/self/fd (Linux) on the OPEN fd, fail-closed
+    otherwise — so the tooth must REFUSE on BOTH platforms.
+    """
+    m = _load_bridge_auth(auth_py)
+    root = Path(work_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    home = root / "home"
+    outside = root / "outside"
+    home.mkdir(parents=True, exist_ok=True)
+    outside.mkdir(parents=True, exist_ok=True)
+    (home / ".codex").mkdir(parents=True, exist_ok=True)
+
+    codex_dir = str(home / ".codex")
+    real_os_open = os.open
+    state = {"done": False}
+
+    def patched_open(path, flags, *a, **k):
+        fd = real_os_open(path, flags, *a, **k)
+        if (
+            not state["done"]
+            and isinstance(path, str)
+            and os.path.abspath(path) == os.path.abspath(codex_dir)
+            and (flags & os.O_DIRECTORY)
+        ):
+            state["done"] = True
+            # The opened fd now points at this dir — move it OUT of root...
+            os.rename(codex_dir, str(outside / ".codex"))
+            # ...and drop an in-root decoy a STRING re-resolution would accept.
+            os.mkdir(codex_dir)
+        return fd
+
+    # Patch os.open in the loaded module's namespace (it calls os.open).
+    m.os.open = patched_open
+    accepted = False
+    try:
+        m.write_private_file_atomic_dirfd(
+            home / ".codex" / "auth.json",
+            "ATTACKER-WINS-IF-WRITTEN",
+            mode=0o600,
+            allowed_root=home,
+        )
+        accepted = True
+    except PermissionError:
+        pass
+    finally:
+        m.os.open = real_os_open
+
+    assert not accepted, "live parent-swap was ACCEPTED (TOCTOU still open)"
+    assert not (home / ".codex" / "auth.json").exists(), "credential written into the in-root decoy"
+    assert not (outside / ".codex" / "auth.json").exists(), "credential leaked OUTSIDE allowed_root"
+    return "live-swap-refused-ok"
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print("usage: 1470-codex-fleet-sync-helper.py <mode> ...", file=sys.stderr)
@@ -174,6 +236,9 @@ def main(argv: list[str]) -> int:
         return 0
     if mode == "dirfd-writer":
         print(_dirfd_writer(argv[2], argv[3]))
+        return 0
+    if mode == "live-swap":
+        print(_live_swap(argv[2], argv[3]))
         return 0
     print(f"unknown mode: {mode!r}", file=sys.stderr)
     return 2

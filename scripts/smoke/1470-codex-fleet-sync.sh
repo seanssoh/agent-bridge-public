@@ -336,4 +336,45 @@ assert_dirfd_writer_hardening() {
 smoke_run "L dir_fd writer: O_NOFOLLOW rejects symlinked parent; allowed_root enforced" \
   assert_dirfd_writer_hardening
 
+# ── M: LIVE parent-swap refused on every platform (codex Phase-4 BLOCKING) ──
+# The exact codex repro: monkeypatch os.open so the dest parent `.codex` is
+# RENAMED OUTSIDE allowed_root the instant the writer opens it, with an in-root
+# decoy dropped in its place. The fix checks the OPENED FD's identity (F_GETPATH
+# on Darwin, /proc/self/fd on Linux; fail-closed otherwise) — NOT a string
+# re-resolution that the decoy would defeat. The write MUST be REFUSED and land
+# NOTHING inside the decoy OR outside the root. This is the macOS-specific hole
+# the old `parent.resolve()` fallback left open; the tooth exercises the
+# F_GETPATH path on macOS and the procfs path on Linux.
+assert_live_swap_refused() {
+  local out
+  out="$(python3 "$HELPER" live-swap "$AUTH_PY" "$SMOKE_TMP_ROOT/liveswap")"
+  smoke_assert_eq "live-swap-refused-ok" "$out" "M live parent-swap refused (fd identity)"
+}
+smoke_run "M live parent-swap refused on this platform (fd identity, no string re-resolve)" \
+  assert_live_swap_refused
+
+# ── N: sync-level live-swap → error envelope + no write (audit-able) ────────
+# At the cmd_codex_sync orchestration layer a refused dir_fd write surfaces as
+# a structured `"status": "error"` envelope (the audit-able outcome) and writes
+# NO credential. We can't easily race os.open through the CLI, so we assert the
+# orchestration refusal shape for the symlinked-parent case (same refusal path
+# the live-swap takes): error envelope, non-zero rc, nothing written.
+assert_sync_refusal_is_auditable() {
+  local nhome="$SMOKE_TMP_ROOT/nhome"
+  local nevil="$SMOKE_TMP_ROOT/nevil"
+  mkdir -p "$nhome" "$nevil"
+  ln -sf "$nevil" "$nhome/.codex"
+  local out rc
+  set +e
+  out="$(codex_cli codex-sync --agent nagent --source-file "$SRC" \
+    --file "$nhome/.codex/auth.json" --allowed-root "$nhome" --json 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -ne 0 ]] || smoke_fail "N: expected refusal rc, got 0; out=$out"
+  smoke_assert_contains "$out" '"status": "error"' "N: error envelope (audit-able)"
+  [[ ! -e "$nevil/auth.json" ]] || smoke_fail "N: credential leaked outside via the parent symlink"
+}
+smoke_run "N sync-level refusal emits an error envelope + writes nothing (auditable)" \
+  assert_sync_refusal_is_auditable
+
 smoke_log "smoke test passed"

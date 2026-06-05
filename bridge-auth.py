@@ -1649,6 +1649,57 @@ def write_private_file_atomic(
                 pass
 
 
+# macOS F_GETPATH fcntl constant (defined in <sys/fcntl.h> as 50). The `fcntl`
+# module only exposes it as `fcntl.F_GETPATH` on Darwin builds; fall back to the
+# numeric constant so the lookup is robust across CPython builds.
+_DARWIN_F_GETPATH = getattr(fcntl, "F_GETPATH", 50)
+
+
+def _dir_fd_real_path(dir_fd: int) -> str:
+    """Resolve the real filesystem path of an OPEN directory fd — by IDENTITY.
+
+    codex Phase-4 BLOCKING: the allowed-root containment check MUST be made
+    against the identity of the fd that was actually opened (and that the
+    subsequent dir_fd-relative write USES), NOT a re-resolution of the string
+    path. A live parent-swap (rename the opened ``.codex`` outside the root,
+    drop an in-root decoy) defeats any string re-resolution but cannot fool the
+    fd's own identity.
+
+    Per platform:
+      * Linux  → ``os.readlink('/proc/self/fd/<n>')``.
+      * Darwin → ``fcntl.fcntl(dir_fd, F_GETPATH)`` (the kernel returns the
+                 fd's current real path into the buffer).
+    If NEITHER is available, raise ``PermissionError`` — FAIL CLOSED. We never
+    fall back to ``parent.resolve()`` / a string re-resolution, which is exactly
+    the hole codex found on non-procfs hosts.
+    """
+    # Linux procfs first (cheap, no buffer dance).
+    proc_link = f"/proc/self/fd/{dir_fd}"
+    if os.path.exists(proc_link):  # noqa: raw-pathlib-controller-only - controller-side procfs fd-identity probe
+        try:
+            return os.readlink(proc_link)  # noqa: raw-pathlib-controller-only - controller-side fd-identity realpath via procfs
+        except OSError:
+            pass
+    # Darwin / BSD F_GETPATH: the kernel writes the fd's real path into the
+    # buffer. fcntl.fcntl with an int arg returns the (possibly mutated) int on
+    # most platforms, so use a bytes buffer arg form which returns the buffer.
+    if platform.system() == "Darwin":
+        try:
+            buf = bytes(1024)  # PATH_MAX-ish; F_GETPATH writes a NUL-terminated path
+            ret = fcntl.fcntl(dir_fd, _DARWIN_F_GETPATH, buf)
+            # When passed a bytes buffer, fcntl returns the buffer's bytes.
+            if isinstance(ret, (bytes, bytearray)):
+                return ret.split(b"\x00", 1)[0].decode("utf-8", "surrogateescape")
+        except (OSError, ValueError):
+            pass
+    # Neither fd-identity API worked → fail closed (no string fallback).
+    raise PermissionError(
+        "cannot resolve the opened directory fd's real identity on this platform "
+        "(no /proc/self/fd and no F_GETPATH) — refusing the privileged write "
+        "rather than re-resolving a swappable string path"
+    )
+
+
 def write_private_file_atomic_dirfd(
     path: Path,
     text: str,
@@ -1673,10 +1724,12 @@ def write_private_file_atomic_dirfd(
 
     - ``O_NOFOLLOW`` makes the open FAIL if the final component (``.codex``)
       is a symlink — closing the symlinked-parent case at open time.
-    - When ``allowed_root`` is given, the opened fd's realpath
-      (``/proc/self/fd/<n>`` on Linux, ``os.fstat`` inode cross-check
-      elsewhere) is verified to stay inside ``allowed_root`` BEFORE any write,
-      so even a non-symlink swap to a sibling dir is rejected.
+    - When ``allowed_root`` is given, the OPENED FD's real IDENTITY
+      (``/proc/self/fd/<n>`` on Linux, ``F_GETPATH`` on Darwin) is verified to
+      stay inside ``allowed_root`` BEFORE any write — never a re-resolution of
+      the string path (codex Phase-4 BLOCKING: a live parent-swap defeats a
+      string re-resolution but not the fd's own identity). On a platform with
+      NEITHER fd-identity API, the write FAILS CLOSED.
     - The parent dir is NOT created here (the bash layer / iso prepare creates
       it owner-correct first); a missing parent fails loud rather than racing a
       mkdir through a swappable path.
@@ -1696,14 +1749,15 @@ def write_private_file_atomic_dirfd(
                 f"refusing to open Codex dest parent {parent} "
                 f"(O_DIRECTORY|O_NOFOLLOW failed — symlinked/missing parent?): {exc}"
             ) from exc
-        # Verify the OPENED directory (by its real identity) is inside the
-        # allowed root. We resolve the fd's real path; on a swap to a sibling
-        # this is the swapped dir's path, which the prefix check rejects.
+        # Verify the OPENED directory is inside the allowed root BY THE FD's OWN
+        # IDENTITY (not a string re-resolution). A live parent-swap — rename the
+        # opened `.codex` outside the root, drop an in-root decoy — would pass a
+        # string-path check but the fd still points at the moved-out directory,
+        # so `_dir_fd_real_path` returns the escaped path and the prefix check
+        # rejects it. On a non-procfs / non-Darwin host the resolver raises and
+        # we fail closed.
         if allowed_root is not None:
-            try:
-                real_parent = os.readlink(f"/proc/self/fd/{dir_fd}")  # noqa: raw-pathlib-controller-only - controller-side fd realpath via procfs
-            except OSError:
-                real_parent = str(parent.resolve())
+            real_parent = _dir_fd_real_path(dir_fd)
             try:
                 allowed = str(allowed_root.resolve(strict=True))
             except OSError as exc:
