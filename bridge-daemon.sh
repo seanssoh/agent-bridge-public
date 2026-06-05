@@ -540,7 +540,61 @@ _BRIDGE_DAEMON_IN_ERR_TRAP=0
 # (b) surface a `daemon_step_warning` audit row so an operator can spot a
 # wedged writer after N consecutive ticks instead of having to grep raw
 # logs.
+#
+# Issue #1563 PR-2 r3: this counter must ACCUMULATE across ticks, but since
+# PR-2's runner-process T1 runs each tick as a supervised CHILD subshell,
+# in-memory shell vars mutated inside the tick are lost on exit. The
+# authoritative value is therefore persisted in a daemon-state file. The
+# wrappers below (_bridge_daemon_consec_fail_*) prefer the control-lib
+# bridge_daemon_state_counter_* helpers and, if those are absent (a hand-mixed
+# install with a NEW bridge-daemon.sh over an OLD lib/bridge-daemon-control.sh
+# that has the supervisor but not the r3 counter helpers), fall back to an
+# INLINE file persist — so the counter is persisted whenever ticks are
+# supervised, never silently lost. This module-level var is the in-memory
+# mirror used for audit/log emission within the same tick.
 _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=0
+
+# Resolve the consec-fail counter file (mirrors bridge_daemon_state_counter_file
+# so the inline fallback writes the SAME path the lib helper would). Used only
+# when the control-lib counter helpers are not loaded.
+_bridge_daemon_consec_fail_file() {
+  local state_dir="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  printf '%s/daemon-state-counters/_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL' "$state_dir"
+}
+
+# Persist + print the incremented consec-fail counter. Prefers the control-lib
+# helper; otherwise persists inline (read-modify-write the same file).
+_bridge_daemon_consec_fail_incr() {
+  if command -v bridge_daemon_state_counter_incr >/dev/null 2>&1; then
+    bridge_daemon_state_counter_incr _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL
+    return 0
+  fi
+  local cf cur=0 next dir
+  cf="$(_bridge_daemon_consec_fail_file)"
+  if [[ -r "$cf" ]]; then
+    cur="$(tr -dc '0-9' <"$cf" 2>/dev/null | head -c 18)"
+  fi
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+  next=$(( cur + 1 ))
+  dir="$(dirname "$cf" 2>/dev/null || printf '.')"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s\n' "$next" 2>/dev/null >"$cf" || true
+  printf '%s' "$next"
+}
+
+# Persist + print the reset (0) consec-fail counter. Same prefer/fallback shape.
+_bridge_daemon_consec_fail_reset() {
+  if command -v bridge_daemon_state_counter_reset >/dev/null 2>&1; then
+    bridge_daemon_state_counter_reset _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL
+    return 0
+  fi
+  local cf dir
+  cf="$(_bridge_daemon_consec_fail_file)"
+  dir="$(dirname "$cf" 2>/dev/null || printf '.')"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s\n' 0 2>/dev/null >"$cf" || true
+  printf '%s' 0
+}
 
 _bridge_daemon_on_signal() {
   BRIDGE_LAST_SIGNAL="$1"
@@ -11087,11 +11141,20 @@ cmd_sync_cycle() {
   # consecutive-failure counter and audit row are preserved so an operator
   # still gets the writer-wedge signal.
   nudge_output=""
+  # Issue #1563 PR-2 r3: this counter must ACCUMULATE across ticks, but the
+  # tick now runs as a supervised CHILD subshell (runner-process T1) whose
+  # in-memory shell vars are lost on exit. The _bridge_daemon_consec_fail_*
+  # wrappers persist it in a small daemon-state file so a sustained
+  # idle-ready-writer failure climbs 1,2,3,… across ticks (child-local memory
+  # would pin it at 1 every tick) — and persist even when the control-lib
+  # counter helpers are absent (the hand-mixed-install gap), so the counter is
+  # never silently lost whenever ticks run supervised. The printed value is
+  # mirrored into the module-level var for this tick's audit/log emission.
   if bridge_write_idle_ready_agents "$ready_agents_file"; then
-    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=0
+    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL="$(_bridge_daemon_consec_fail_reset)"
     nudge_output="$(bridge_task_daemon_step "$snapshot_file" "$ready_agents_file" 2>/dev/null || true)"
   else
-    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=$(( _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL + 1 ))
+    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL="$(_bridge_daemon_consec_fail_incr)"
     bridge_audit_log daemon daemon_step_warning daemon \
       --detail step="nudge_scan_idle_ready" \
       --detail reason="bridge_write_idle_ready_agents non-zero (matrix not applied or writer error)" \
@@ -11921,6 +11984,14 @@ cmd_run() {
   if command -v bridge_daemon_run_tick_supervised >/dev/null 2>&1; then
     _tick_supervised=1
   fi
+
+  # Issue #1563 PR-2 r3: the idle-ready-writer consecutive-failure counter is
+  # persisted in a daemon-state file so it accumulates across supervised CHILD
+  # ticks (whose in-memory mutations are otherwise lost). Reset it once on each
+  # fresh daemon process so a new daemon does not inherit a stale escalation
+  # count from a crashed predecessor — this preserves the original
+  # module-load-time `=0` contract now that the source of truth is on disk.
+  _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL="$(_bridge_daemon_consec_fail_reset 2>/dev/null || printf '0')"
 
   # Issue #815 Wave C: emit one initial daemon_tick + heartbeat write BEFORE
   # the first sync cycle so the post-restart healthy state is observable

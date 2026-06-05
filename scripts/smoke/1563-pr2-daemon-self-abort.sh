@@ -139,7 +139,9 @@ source "$CONTROL_LIB"
 # Helper presence gate — a revert of the PR-2 hardening removes these.
 for fn in bridge_daemon_run_tick_supervised bridge_daemon_tick_deadline_seconds \
           bridge_daemon_tick_progress_touch bridge_daemon_tick_progress_file \
-          _bridge_daemon_tick_progress_age bridge_daemon_sd_notify; do
+          _bridge_daemon_tick_progress_age bridge_daemon_sd_notify \
+          bridge_daemon_state_counter_incr bridge_daemon_state_counter_get \
+          bridge_daemon_state_counter_reset bridge_daemon_state_counter_set; do
   if ! command -v "$fn" >/dev/null 2>&1; then
     printf '[FAIL] %s not defined after sourcing %s (PR-2 hardening missing?)\n' "$fn" "$CONTROL_LIB" >&2
     exit 1
@@ -537,6 +539,147 @@ if (( D5_FAIL == 0 )); then
   _pass "D5 every long bounded step (daily_backup/bridge_sync/watchdog/a2a_deliver_tick/precompact_events) is BRACKETED before+after — no before-only false-abort gap"
 else
   _fail "D5 progress-markers" "see missing/under-bracketed marker lines above"
+fi
+
+# ===========================================================================
+# F — CROSS-TICK daemon-state counter ACCUMULATES across supervised CHILD ticks
+#     (#1563 PR-2 r3, codex r2 BLOCKING regression).
+# ===========================================================================
+# THE REGRESSION codex r2 found: the runner-process T1 runs each tick as a
+# background CHILD subshell, so an in-memory shell var mutated inside the tick
+# is LOST when the child exits. The audited cross-tick accumulator is
+# _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL (issue #946 L4): under a sustained
+# idle-ready-writer failure it must climb 1,2,3,… across ticks. With a
+# child-local counter the parent re-enters every tick with the pre-fork value,
+# so it reports 1 EVERY tick (codex probe: counter==0 after a supervised run).
+#
+# The fix persists the counter in a daemon-state file
+# (bridge_daemon_state_counter_*), read-modify-written by the child, so it
+# survives the boundary. This section drives the EXACT production primitive
+# (the real shipped bridge_daemon_state_counter_incr) through the REAL
+# supervisor N times and asserts the persisted value == N. TEETH (F-teeth): a
+# child-local in-memory counter, run the same way, reports 1 — and FAILS.
+F_KEY="_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL"
+F_N=4
+# Start clean so a prior assertion can't seed the count.
+bridge_daemon_state_counter_reset "$F_KEY" >/dev/null 2>&1 || true
+
+# The production failure-path tick: persist-increment the counter exactly as the
+# cmd_sync_cycle `else` branch does on a writer failure. Healthy + quick so the
+# supervisor never wedges it — we are measuring ACCUMULATION, not the deadline.
+# shellcheck disable=SC2329  # invoked via the supervisor's `"$@"`
+persisted_fail_tick() {
+  bridge_daemon_tick_progress_touch "nudge_scan"
+  bridge_daemon_state_counter_incr "$F_KEY" >/dev/null 2>&1 || true
+  return 0
+}
+F_TICK=0
+while (( F_TICK < F_N )); do
+  F_TICK=$(( F_TICK + 1 ))
+  bridge_daemon_run_tick_supervised "$F_TICK" persisted_fail_tick >/dev/null 2>&1 || true
+done
+F_VAL="$(bridge_daemon_state_counter_get "$F_KEY")"
+if [[ "$F_VAL" == "$F_N" ]]; then
+  _pass "F persisted consec-fail counter ACCUMULATES across $F_N supervised CHILD ticks (counter=$F_VAL == $F_N) — survives the runner-process boundary"
+else
+  _fail "F cross-tick-accumulation" "counter=$F_VAL after $F_N supervised ticks, expected $F_N — child-local mutations are being LOST across the tick boundary (the codex r2 regression)"
+fi
+
+# A successful write must RESET the persisted counter (the production reset path
+# also crosses the child boundary). Run one reset tick, assert 0.
+# shellcheck disable=SC2329  # invoked via the supervisor's `"$@"`
+persisted_reset_tick() {
+  bridge_daemon_tick_progress_touch "nudge_scan"
+  bridge_daemon_state_counter_reset "$F_KEY" >/dev/null 2>&1 || true
+  return 0
+}
+bridge_daemon_run_tick_supervised 99 persisted_reset_tick >/dev/null 2>&1 || true
+F_RESET="$(bridge_daemon_state_counter_get "$F_KEY")"
+if [[ "$F_RESET" == "0" ]]; then
+  _pass "F-reset a successful-write reset crosses the child boundary too (counter=0 after a supervised reset tick)"
+else
+  _fail "F-reset cross-tick-reset" "counter=$F_RESET after a supervised reset tick, expected 0"
+fi
+
+# F-teeth: prove the assertion has BITE. A CHILD-LOCAL in-memory counter (the
+# pre-fix shape) run the SAME way must report < F_N — i.e. a revert to
+# child-local memory FAILS the accumulation check above. We run the in-memory
+# variant through the supervisor and confirm the parent never sees it climb to
+# F_N. Uses a plain literal global (no `declare -g` / no name-indirection) so it
+# stays portable to bash 3.2 under `set -u`.
+F_INMEM_VAL=0
+# shellcheck disable=SC2329  # invoked via the supervisor's `"$@"`
+inmem_fail_tick() {
+  bridge_daemon_tick_progress_touch "nudge_scan"
+  # The pre-fix bug: mutate a plain shell var inside the child. Lost on exit.
+  F_INMEM_VAL=$(( F_INMEM_VAL + 1 ))
+  return 0
+}
+F_INMEM_TICK=0
+while (( F_INMEM_TICK < F_N )); do
+  F_INMEM_TICK=$(( F_INMEM_TICK + 1 ))
+  bridge_daemon_run_tick_supervised "$F_INMEM_TICK" inmem_fail_tick >/dev/null 2>&1 || true
+done
+# The parent's copy never advances past its pre-fork 0 (the child's increment
+# died with the subshell). Assert it is < F_N (the regression signature: it does
+# NOT accumulate across the boundary).
+[[ "$F_INMEM_VAL" =~ ^[0-9]+$ ]] || F_INMEM_VAL=0
+if (( F_INMEM_VAL < F_N )); then
+  _pass "F-teeth child-local in-memory counter does NOT accumulate across the boundary (parent sees $F_INMEM_VAL < $F_N) — proves the persisted-file fix is load-bearing and a revert FAILS check F"
+else
+  _fail "F-teeth child-local-leak" "in-memory counter unexpectedly reached $F_INMEM_VAL (>= $F_N) — the supervisor is not actually running the tick in a child subshell, so check F would be vacuous"
+fi
+
+# F-mixed: HAND-MIXED INSTALL gap (#1572 r3 codex r3 BLOCKING). _tick_supervised
+# is gated on bridge_daemon_run_tick_supervised existing, INDEPENDENTLY of the
+# r3 counter helpers. A new bridge-daemon.sh over an OLD lib/bridge-daemon-
+# control.sh has the supervisor but NOT bridge_daemon_state_counter_* — ticks
+# still run as child subshells, so a counter gated on the lib helper would be
+# lost. The bridge-daemon.sh wrappers (_bridge_daemon_consec_fail_incr/_reset)
+# therefore fall back to an INLINE file persist. This check sources just those
+# wrappers from bridge-daemon.sh, UNSETs the lib counter helpers (simulating the
+# mixed shape), drives the wrapper through the REAL supervisor F_N times, and
+# asserts the inline fallback STILL accumulates to F_N.
+extract_fn() {  # extract a single top-level shell function body from a file
+  awk -v fn="$1" '$0 ~ "^"fn"\\(\\) \\{"{p=1} p{print} p&&/^\}/{exit}' "$2"
+}
+FMIX_OK=1
+for w in _bridge_daemon_consec_fail_file _bridge_daemon_consec_fail_incr _bridge_daemon_consec_fail_reset; do
+  body="$(extract_fn "$w" "$DAEMON_SH")"
+  if [[ -z "$body" ]]; then
+    FMIX_OK=0
+    printf '[FAIL] F-mixed: could not extract %s from %s\n' "$w" "$DAEMON_SH" >&2
+    continue
+  fi
+  eval "$body"
+done
+if (( FMIX_OK == 1 )) && command -v _bridge_daemon_consec_fail_incr >/dev/null 2>&1; then
+  # Simulate the mixed shape in a subshell (so the unset does not leak into
+  # later sections): supervisor stays, lib counter helpers go away. The subshell
+  # exits 0 iff the inline fallback accumulated to F_N.
+  if (
+        unset -f bridge_daemon_state_counter_incr bridge_daemon_state_counter_reset \
+                 bridge_daemon_state_counter_set bridge_daemon_state_counter_get \
+                 bridge_daemon_state_counter_file 2>/dev/null || true
+        _bridge_daemon_consec_fail_reset >/dev/null 2>&1 || true
+        fmix_tick=0
+        while (( fmix_tick < F_N )); do
+          fmix_tick=$(( fmix_tick + 1 ))
+          ( _bridge_daemon_consec_fail_incr >/dev/null 2>&1 ) &
+          bridge_daemon_run_tick_supervised "$fmix_tick" true >/dev/null 2>&1 || true
+          wait 2>/dev/null || true
+        done
+        f="$(_bridge_daemon_consec_fail_file)"
+        v="$(tr -dc '0-9' <"$f" 2>/dev/null | head -c 18)"
+        [[ "$v" =~ ^[0-9]+$ ]] || v=0
+        [[ "$v" == "$F_N" ]]
+     ); then
+    _pass "F-mixed inline fallback persists when the control-lib counter helpers are ABSENT but the supervisor is PRESENT (hand-mixed install) → still accumulates to $F_N"
+  else
+    _fail "F-mixed inline-fallback" "with the lib counter helpers unset, the supervised counter did NOT accumulate to $F_N — the mixed-install gap (new daemon over old control lib) reopens the codex r2 regression"
+  fi
+else
+  _fail "F-mixed extract" "could not load the bridge-daemon.sh consec-fail wrappers — the inline fallback for the mixed-install shape is missing"
 fi
 
 # ===========================================================================

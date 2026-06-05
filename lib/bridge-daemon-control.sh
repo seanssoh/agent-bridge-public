@@ -2240,6 +2240,80 @@ _bridge_daemon_tick_progress_age() {
   printf '%s' "$age"
 }
 
+# ---------------------------------------------------------------------------
+# Cross-tick daemon-state counter persistence (#1563 PR-2 r3)
+#
+# Why this exists: the runner-process T1 (bridge_daemon_run_tick_supervised)
+# runs each scheduler tick as a background CHILD subshell. Any in-memory shell
+# variable mutated inside the tick (cmd_sync_cycle and its callees) is LOST when
+# the child exits — the parent re-enters the NEXT tick with the variable's
+# pre-fork value. That silently breaks ANY daemon-process-state counter that is
+# supposed to ACCUMULATE across ticks. The audited instance is
+# _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL (issue #946 L4 / PR #952 r2): under a
+# persistent idle-ready-writer failure it must climb 1,2,3,… across ticks so an
+# operator sees the wedge escalate; child-local memory pins it at 1 every tick.
+#
+# Fix: persist such counters in a tiny per-key state file under $BRIDGE_STATE_DIR
+# (one integer, newline-terminated). The child reads-at-tick-start, increments
+# or resets, and writes — the file survives the child boundary cleanly, matching
+# the daemon's existing tick-progress / nudge-state file patterns. Best-effort:
+# a failed read returns 0, a failed write must never abort the tick.
+
+# bridge_daemon_state_counter_file <key> — path of the persisted counter file.
+# <key> is sanitized to [A-Za-z0-9_.-] so a caller key can never escape the dir.
+bridge_daemon_state_counter_file() {
+  local key="${1:-counter}"
+  key="$(printf '%s' "$key" | tr -dc 'A-Za-z0-9_.-' | head -c 96)"
+  [[ -n "$key" ]] || key="counter"
+  local state_dir="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  printf '%s/daemon-state-counters/%s' "$state_dir" "$key"
+}
+
+# bridge_daemon_state_counter_get <key> — print the persisted integer (0 if the
+# file is missing/unreadable/non-numeric). Never errors (set -u safe: a missing
+# <key> resolves to the default counter, a missing file reads as 0).
+bridge_daemon_state_counter_get() {
+  local cf v=0
+  cf="$(bridge_daemon_state_counter_file "${1:-}")"
+  if [[ -r "$cf" ]]; then
+    v="$(tr -dc '0-9' <"$cf" 2>/dev/null | head -c 18)"
+  fi
+  [[ "$v" =~ ^[0-9]+$ ]] || v=0
+  printf '%s' "$v"
+}
+
+# bridge_daemon_state_counter_set <key> <value> — persist <value> atomically and
+# print it. Non-numeric/missing <value> is coerced to 0. Best-effort write
+# (set -u safe: both positionals default).
+bridge_daemon_state_counter_set() {
+  local cf val dir
+  cf="$(bridge_daemon_state_counter_file "${1:-}")"
+  val="${2:-0}"
+  [[ "$val" =~ ^[0-9]+$ ]] || val=0
+  dir="$(dirname "$cf" 2>/dev/null || printf '.')"
+  mkdir -p "$dir" 2>/dev/null || true
+  if printf '%s\n' "$val" 2>/dev/null >"$cf.tmp.$$"; then
+    mv -f "$cf.tmp.$$" "$cf" 2>/dev/null || printf '%s\n' "$val" 2>/dev/null >"$cf" || true
+  else
+    printf '%s\n' "$val" 2>/dev/null >"$cf" || true
+  fi
+  printf '%s' "$val"
+}
+
+# bridge_daemon_state_counter_incr <key> — read, +1, persist, print the NEW
+# value. This is the accumulate-across-ticks primitive (set -u safe).
+bridge_daemon_state_counter_incr() {
+  local key="${1:-}" cur next
+  cur="$(bridge_daemon_state_counter_get "$key")"
+  next=$(( cur + 1 ))
+  bridge_daemon_state_counter_set "$key" "$next"
+}
+
+# bridge_daemon_state_counter_reset <key> — persist 0 (and print it; set -u safe).
+bridge_daemon_state_counter_reset() {
+  bridge_daemon_state_counter_set "${1:-}" 0
+}
+
 # bridge_daemon_run_tick_supervised — the runner-process T1.
 #
 # Runs the tick function ("$@", normally `cmd_sync_cycle`) as a CHILD in its
