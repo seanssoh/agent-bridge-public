@@ -2385,7 +2385,21 @@ def _room_join_rate_check(conn: Any, token_hash: str, *, source: str) -> None:
 
 def cmd_preflight(args: argparse.Namespace) -> int:
     try:
-        cfg = a2a.load_config(Path(args.config) if args.config else None)
+        # phase=config: load_config raises config_missing / config_perms /
+        # config_parse / config_shape — all NON-transient operator errors
+        # (#1563 PR-4). bridge_a2a_receiver_start drives the supervised restart
+        # through THIS preflight, so a malformed/unreadable config must emit a
+        # phase=config terminal audit row (just like cmd_serve) — otherwise the
+        # exit-cause classifier sees no row for this failure and falls back to
+        # `unknown`, or worse INHERITS a stale bind-phase row and mis-routes the
+        # config error into the transient backoff thrash. Auditing it here is
+        # the discriminating signal that holds it as auth_config.
+        try:
+            cfg = a2a.load_config(Path(args.config) if args.config else None)
+        except a2a.A2AError as exc:
+            audit("startup_fail", code=exc.code, detail=str(exc)[:300],
+                  phase="config")
+            raise
         # #1331: refuse to certify a config carrying an unprovisioned peer.
         # Audited so the operator sees the bypass when test-mode is on.
         try:

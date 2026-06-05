@@ -3122,9 +3122,16 @@ process_a2a_receiver_supervise_tick() {
   # counter (and any alarm) is stale — a fresh window starts clean. A healthy
   # probe below ALSO resets, but this covers a long-quiet host that crossed
   # the window with the alarm still set.
+  # #1563 PR-4: the same staleness applies to the circuit breaker — a host that
+  # crossed the window quiet should not inherit a near-open transient counter /
+  # stale error_class on its next failure (the same "fresh schedule" rationale
+  # the healthy-probe reset below documents). Reset the breaker state too so a
+  # post-window failure starts a clean backoff schedule.
   if (( restart_count > 0 )) && (( now - last_restart_ts >= restart_window )); then
     restart_count=0
     alarm=""
+    consec_transient=0
+    prev_error_class=""
   fi
 
   # --- stage 1: process gate (cheap; no new code, reuse the lib helper) ---
@@ -3171,6 +3178,10 @@ process_a2a_receiver_supervise_tick() {
       # the key (transient-failure counter -> 0, error_class cleared) so the
       # NEXT transient failure starts a fresh backoff schedule instead of
       # inheriting a near-open breaker.
+      # shellcheck disable=SC2031  # `alarm` is a function-local read here; the
+      # $(bridge_a2a_supervise_decision/_escalate ...) command-subs LATER in the
+      # tick run in subshells but never assign it — this is a false positive
+      # (the read precedes those subshells and reflects this tick's own state).
       if (( consec_unhealthy != 0 )) || (( restart_count != 0 )) || [[ -n "$alarm" ]] || (( consec_transient != 0 )); then
         daemon_log_event "[a2a_receiver_supervise] receiver healthy (pid ${last_pid:-?}); clearing counters + circuit breaker"
       fi
