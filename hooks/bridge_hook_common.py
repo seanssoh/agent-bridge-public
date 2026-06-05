@@ -1496,6 +1496,322 @@ def codex_stop_reason(agent: str, row: dict[str, Any]) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Stop/turn-end inbox auto-drain (#9780)
+# ---------------------------------------------------------------------------
+# A new Stop step that, when a turn ends with genuinely-actionable queue work,
+# emits {"decision":"block","reason":...} so the engine re-enters the turn and
+# drains its inbox instead of going idle until an external push or a human
+# wakes it. The whole point of failure here is to NEVER turn a marker I/O bug
+# into an infinite Stop->block->Stop loop, so every fragile step (queue read,
+# marker parse, marker write) FAILS OPEN — exit 0, no block.
+#
+# The guard (codex-agreed plan #9790):
+#   * honour stop_hook_active (a prior chain hook already blocked → never stack)
+#   * never block on an empty/actionless queue
+#   * a per-agent marker holds the last self-continue task key + a consecutive
+#     counter + the last block ts. The key is id+status (+updated_ts when the
+#     queue row carries it) so genuine progress RESETS the guard, while a stuck
+#     SAME-STATE task cannot loop: once the same key is seen within cooldown or
+#     the consecutive cap is reached, the hook idles instead of re-blocking.
+#   * read/init the marker AND atomically persist the updated marker FIRST; only
+#     emit decision:block AFTER the marker write succeeds. A marker write failure
+#     fails open.
+#   * keep queued auto-drain and already-claimed anti-abandonment DISTINCT so the
+#     #1199 "queued-only ACTION REQUIRED, claimed still blocks stop" contract is
+#     preserved (queued top wins; claimed is the anti-abandonment fallback).
+
+
+def _stop_drain_int_env(name: str, default: int, minimum: int = 0) -> int:
+    """Read a ``BRIDGE_STOP_DRAIN_*`` integer override, clamped to >= minimum."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else minimum
+
+
+def stop_drain_enabled() -> bool:
+    """Whether the Stop inbox-drain auto-continue is active. Default on.
+
+    ``BRIDGE_STOP_DRAIN_DISABLE`` (1/true/yes/on) is the operator kill-switch —
+    when set the drain hook degrades to a quiet no-op (exit 0, never blocks).
+    """
+    raw = os.environ.get("BRIDGE_STOP_DRAIN_DISABLE", "").strip().lower()
+    return raw not in {"1", "true", "yes", "on"}
+
+
+def stop_drain_cap() -> int:
+    """Max consecutive auto-continues on the SAME unchanged task key.
+
+    Once reached, the hook idles (lets a human/daemon intervene) instead of
+    re-blocking — the runaway backstop. ``BRIDGE_STOP_DRAIN_CAP`` override.
+    """
+    return _stop_drain_int_env("BRIDGE_STOP_DRAIN_CAP", 3, minimum=1)
+
+
+def stop_drain_cooldown() -> int:
+    """Seconds within which a re-block on the SAME unchanged key is suppressed.
+
+    ``BRIDGE_STOP_DRAIN_COOLDOWN`` override. 0 disables the time gate (the
+    consecutive cap still applies).
+    """
+    return _stop_drain_int_env("BRIDGE_STOP_DRAIN_COOLDOWN", 90, minimum=0)
+
+
+def inbox_drain_state_path(agent: str) -> Path:
+    """Per-agent marker for the Stop inbox-drain loop guard.
+
+    Resolved under the per-agent runtime state root helper
+    (``bridge_active_agent_dir()`` honours ``BRIDGE_ACTIVE_AGENT_DIR``) so an
+    isolated Stop hook writes the marker under the same contract as other hook
+    state (timestamp.json, next-session.sha, ...), NOT a hard-coded
+    ``state/agents/<agent>`` path.
+    """
+    return bridge_active_agent_dir() / agent / "inbox-drain-state.json"
+
+
+def load_drain_state(agent: str) -> dict[str, Any] | None:
+    """Return the persisted drain marker, ``{}`` when absent, or ``None`` on a
+    parse/read error.
+
+    ``None`` is the fail-open signal: a corrupt or unreadable marker must make
+    the hook idle (exit 0, no block) rather than re-derive guard state from a
+    bad file and risk an infinite loop. ``{}`` (file genuinely absent) is the
+    normal first-run path and is safe to initialise from.
+    """
+    path = inbox_drain_state_path(agent)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def save_drain_state(agent: str, payload: dict[str, Any]) -> bool:
+    """Atomically persist the drain marker. Returns True on success.
+
+    Any permission/OS error returns False so the caller fails open (does NOT
+    block). Mirrors save_timestamp_state's mkdir + temp-write + chmod + replace
+    sequence; the only behavioural difference is that a controller-side failure
+    is also non-fatal here — a Stop hook must never raise, and the marker write
+    failing is exactly the case the guard must fail-open on.
+    """
+    path = inbox_drain_state_path(agent)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+        os.chmod(path, 0o600)
+        return True
+    except (PermissionError, OSError):
+        return False
+
+
+def _drain_task_key(row: dict[str, Any]) -> str:
+    """Stable task key for the loop guard: ``id:status[:updated_ts]``.
+
+    ``updated_ts`` is included when the queue row carries it (find-open single
+    rows now emit it, #9780) so a status/timestamp change RESETS the guard while
+    a stuck same-state task keeps the same key and cannot loop forever.
+    """
+    task_id = int(row.get("id", 0) or 0)
+    status = str(row.get("status") or "")
+    updated = row.get("updated_ts")
+    if isinstance(updated, int) and updated > 0:
+        return f"{task_id}:{status}:{updated}"
+    return f"{task_id}:{status}"
+
+
+def drain_top_actionable(agent: str) -> dict[str, Any] | None:
+    """Return the top actionable queue row for the Stop drain, or None.
+
+    Two DISTINCT paths, queued first (preserves the #1199 contract):
+      1. genuinely-queued work → the queued head (ACTION REQUIRED drain).
+      2. else self-claimed-but-incomplete work → the top claimed row
+         (anti-abandonment; this is NOT an ACTION REQUIRED re-claim nudge).
+    A blocked-only queue is not actionable → None (idle quietly).
+    """
+    pending, row = queue_summary(agent)
+    if pending > 0:
+        # Queued work exists → queued-first wins. If the top-row read itself
+        # failed (pending>0 but row is None — a transient find-open hiccup), do
+        # NOT fall through to the claimed anti-abandonment path: that would
+        # silently switch a queued drain into a claimed block on a partial
+        # queue error. Return the queued row when we have it, else None (idle /
+        # fail open) so the queued-first contract holds.
+        return row
+    if open_claimed_count(agent) > 0:
+        return top_claimed_row(agent)
+    return None
+
+
+def queued_ids_for(agent: str) -> list[int]:
+    """Return the current queued (status=='queued') task ids for ``agent``.
+
+    Used to scope the daemon nudge-suppression stamp to exactly the queued set
+    the self-continue covered (same shape the daemon's ``last_nudge_key`` gate
+    keys on). Empty list on any error — the stamp is best-effort, so a queue
+    subprocess error here must never escape into the caller's block path.
+    """
+    try:
+        proc = queue_cli(
+            ["find-open", "--agent", agent, "--status-filter", "queued", "--all", "--format", "json"]
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never raise into the Stop path
+        return []
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    try:
+        rows = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(rows, list):
+        return []
+    ids: list[int] = []
+    for r in rows:
+        if isinstance(r, dict):
+            try:
+                ids.append(int(r.get("id", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+    return [i for i in ids if i]
+
+
+def note_self_continue(agent: str, queued_ids: Iterable[int]) -> None:
+    """Stamp a non-failure "attention delivered" marker for the daemon.
+
+    On a self-continue the daemon could fire a concurrent ACTION REQUIRED nudge
+    for the same queued set (double-submit). This updates ``agent_state``'s
+    ``last_nudge_ts`` + ``last_nudge_key`` for the CURRENT queued-id set via the
+    dedicated ``note-self-continue`` CLI verb, which (unlike ``note-nudge``)
+    does NOT increment ``nudge_fail_count`` or touch zombie state. Best-effort:
+    any failure is swallowed — the drain block still proceeds.
+    """
+    key = ",".join(str(i) for i in queued_ids if i)
+    args = ["note-self-continue", "--agent", agent]
+    if key:
+        args += ["--key", key]
+    try:
+        queue_cli(args)
+    except Exception:  # noqa: BLE001 — daemon coordination is best-effort
+        pass
+
+
+def compute_drain_decision(
+    agent: str,
+    event: dict[str, Any] | None,
+    *,
+    reason_builder,
+    now_epoch: int | None = None,
+) -> dict[str, str] | None:
+    """Core Stop inbox-drain guard. Returns the decision dict to emit, or None.
+
+    None means "do not block" (idle quietly / fail open). A non-None return is
+    ``{"decision": "block", "reason": <reason_builder(agent, row)>}`` and is
+    emitted ONLY after the guard marker has been read/initialised AND atomically
+    persisted. ``reason_builder`` lets each engine supply its own instruction
+    text (Claude vs codex) over the same shared guard.
+    """
+    if not agent or not stop_drain_enabled():
+        return None
+    # A prior chain hook already blocked this turn → never stack.
+    if event and bool(event.get("stop_hook_active")):
+        return None
+
+    # Queue read fails open: a timeout / parse error must not loop.
+    try:
+        row = drain_top_actionable(agent)
+    except Exception:  # noqa: BLE001 — queue subprocess error → fail open
+        return None
+    if not row:
+        return None
+
+    key = _drain_task_key(row)
+    now = now_epoch if now_epoch is not None else int(
+        datetime.now(timezone.utc).timestamp()
+    )
+
+    # Read/init the guard marker. A corrupt/unreadable marker fails open.
+    state = load_drain_state(agent)
+    if state is None:
+        return None
+
+    last_key = str(state.get("last_task_key") or "")
+    last_ts = int(state.get("last_ts") or 0) if isinstance(state.get("last_ts"), int) else 0
+    consecutive = int(state.get("consecutive") or 0) if isinstance(state.get("consecutive"), int) else 0
+
+    if key == last_key:
+        cooldown = stop_drain_cooldown()
+        within_cooldown = bool(last_ts) and cooldown > 0 and (now - last_ts) < cooldown
+        if within_cooldown or consecutive >= stop_drain_cap():
+            # Same unchanged task, still within cooldown or already capped →
+            # do NOT re-block. Let it idle for a human / the daemon.
+            return None
+        new_consecutive = consecutive + 1
+    else:
+        new_consecutive = 1
+
+    new_state = {
+        "last_task_key": key,
+        "last_ts": now,
+        "consecutive": new_consecutive,
+    }
+    # Atomically persist FIRST; only block if the marker write succeeded. A
+    # write failure fails open so a marker I/O bug can never become a loop.
+    if not save_drain_state(agent, new_state):
+        return None
+
+    # Non-failure daemon coordination: stamp last_nudge_ts/last_nudge_key for
+    # the current queued set so a concurrent daemon nudge is suppressed for this
+    # window WITHOUT incrementing nudge_fail_count. Strictly best-effort and
+    # AFTER the marker commit so it never gates the block — the WHOLE stamp
+    # (queued-id read + the note-self-continue call) is wrapped so a subprocess
+    # error in either step can never escape into the codex Stop path
+    # (check_inbox.py main has no outer try/except) and turn an attention stamp
+    # failure into a Stop-hook error banner.
+    try:
+        note_self_continue(agent, queued_ids_for(agent))
+    except Exception:  # noqa: BLE001 — daemon coordination is best-effort only
+        pass
+
+    reason = reason_builder(agent, row)
+    return {"decision": "block", "reason": reason}
+
+
+def claude_drain_reason(agent: str, row: dict[str, Any]) -> str:
+    """Claude Stop-hook auto-continue instruction for the drain block."""
+    task_id = int(row.get("id", 0) or 0)
+    title = str(row.get("title") or "")
+    priority = str(row.get("priority") or "normal")
+    status = str(row.get("status") or "")
+    if status == "claimed":
+        return (
+            f"Agent Bridge still has open claimed work: task #{task_id} "
+            f"[{priority}] {title}. "
+            f"Run ~/.agent-bridge/agb inbox {agent} now, then continue and "
+            f"finish the claimed task before ending the session."
+        )
+    return (
+        f"Agent Bridge queued work is waiting: task #{task_id} "
+        f"[{priority}] {title}. "
+        f"Run ~/.agent-bridge/agb inbox {agent} now, claim the highest-priority "
+        f"queued task, process it, then mark it done before ending the session."
+    )
+
+
 _GUARD_MODULE_NAME = "bridge_guard_common"
 
 

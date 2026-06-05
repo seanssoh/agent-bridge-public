@@ -149,12 +149,13 @@ assert_operator_overlay_wins() {
 }
 
 assert_stop_hook_suite_propagates() {
-  # Issue #541 PR-B: ensure-stop-hook on the shared base must register the
-  # full suite (mark-idle.sh + surface-reply-enforce.py + session-stop.py),
-  # and the rendered effective settings (consumed by every per-agent symlink
-  # via bridge_link_claude_settings_to_shared) must carry all three.
+  # Issue #541 PR-B (+ #9780): ensure-stop-hook on the shared base must
+  # register the full suite — mark-idle.sh + surface-reply-enforce.py +
+  # inbox-auto-drain.py (#9780) + session-stop.py — and the rendered effective
+  # settings (consumed by every per-agent symlink via
+  # bridge_link_claude_settings_to_shared) must carry all four.
   local base effective stop_count
-  local has_mark_idle has_surface has_session_stop
+  local has_mark_idle has_surface has_inbox_drain has_session_stop
 
   base="$BRIDGE_AGENT_HOME_ROOT/.claude/settings.json"
   effective="$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json"
@@ -179,7 +180,7 @@ flat = [h.get("command","") for grp in stop for h in grp.get("hooks", [])]
 print(len(flat))
 PY
 )"
-  smoke_assert_eq "3" "$stop_count" "shared base Stop array has 3 entries after ensure-stop-hook"
+  smoke_assert_eq "4" "$stop_count" "shared base Stop array has 4 entries after ensure-stop-hook"
 
   has_mark_idle="$(python3 - "$base" mark-idle.sh <<'PY'
 import json, sys
@@ -201,6 +202,9 @@ flat = [h.get("command","") for grp in stop for h in grp.get("hooks", [])]
 print("yes" if any(needle in c for c in flat) else "no")
 PY
 )"
+  # #9780: presence + ordering go through a file-as-argv helper (no
+  # python3 heredoc-stdin in a capture — footgun #11 / lint-heredoc-ban C1).
+  has_inbox_drain="$(python3 "$SCRIPT_DIR/upgrade-shared-settings-propagate-helpers/stop-chain-probe.py" has "$base" inbox-auto-drain.py)"
   has_session_stop="$(python3 - "$base" session-stop.py <<'PY'
 import json, sys
 from pathlib import Path
@@ -213,13 +217,21 @@ PY
 )"
   smoke_assert_eq "yes" "$has_mark_idle" "shared base Stop suite includes mark-idle.sh"
   smoke_assert_eq "yes" "$has_surface" "shared base Stop suite includes surface-reply-enforce.py"
+  smoke_assert_eq "yes" "$has_inbox_drain" "shared base Stop suite includes inbox-auto-drain.py (#9780)"
   smoke_assert_eq "yes" "$has_session_stop" "shared base Stop suite includes session-stop.py"
+
+  # #9780: ordering is load-bearing — inbox-auto-drain.py must sit AFTER
+  # surface-reply-enforce.py and BEFORE session-stop.py.
+  local order_ok
+  order_ok="$(python3 "$SCRIPT_DIR/upgrade-shared-settings-propagate-helpers/stop-chain-probe.py" order "$base")"
+  smoke_assert_eq "yes" "$order_ok" "Stop chain order: surface-reply-enforce → inbox-auto-drain → session-stop (#9780)"
 
   # status-stop-hook must agree (suite present, exit 0)
   local status_out
   status_out="$(python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" status-stop-hook --settings-file "$base" --bridge-home "$BRIDGE_HOME" --bash-bin bash --format shell)"
   smoke_assert_contains "$status_out" "HOOK_STOP_HOOK_SUITE=present" "status-stop-hook reports suite present"
   smoke_assert_contains "$status_out" "HOOK_STOP_HOOK_SURFACE_REPLY_ENFORCE=present" "status-stop-hook reports surface-reply-enforce.py present"
+  smoke_assert_contains "$status_out" "HOOK_STOP_HOOK_INBOX_DRAIN=present" "status-stop-hook reports inbox-auto-drain.py present"
   smoke_assert_contains "$status_out" "HOOK_STOP_HOOK_SESSION_STOP=present" "status-stop-hook reports session-stop.py present"
 
   # render-shared-settings must propagate the suite into the effective file
@@ -238,7 +250,7 @@ flat = [h.get("command","") for grp in stop for h in grp.get("hooks", [])]
 print(len(flat))
 PY
 )"
-  smoke_assert_eq "3" "$effective_count" "effective settings carries 3-entry Stop suite (rerender-consumed)"
+  smoke_assert_eq "4" "$effective_count" "effective settings carries 4-entry Stop suite (rerender-consumed)"
 }
 
 main() {

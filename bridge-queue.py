@@ -1562,6 +1562,10 @@ def cmd_find_open(args: argparse.Namespace) -> int:
                     "priority": str(row["priority"] or ""),
                     "claimed_by": str(row["claimed_by"] or ""),
                     "body_path": str(row["body_path"] or ""),
+                    # #9780: surface updated_ts on the single-row JSON so the
+                    # Stop inbox-drain loop guard can key on id+status+updated_ts
+                    # (a status/timestamp change resets the guard).
+                    "updated_ts": int(row["updated_ts"] or 0),
                 },
                 ensure_ascii=False,
             )
@@ -3023,6 +3027,31 @@ def cmd_note_nudge(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_note_self_continue(args: argparse.Namespace) -> int:
+    # #9780: a non-failure "attention delivered" stamp written when a Stop
+    # inbox-drain auto-continues the agent on its own queued work. It mirrors
+    # note-nudge's last_nudge_ts/last_nudge_key write so the daemon's nudge
+    # cooldown/freshness gate suppresses a concurrent ACTION REQUIRED nudge for
+    # the same queued set — but it MUST NOT increment nudge_fail_count or touch
+    # zombie state (the agent IS attending to the queue; this is the opposite of
+    # a failed/dropped nudge). Distinct verb so the failure-count semantics of
+    # note-nudge can never leak into the self-continue path.
+    current_ts = now_ts()
+    with closing(connect()) as conn, conn:
+        conn.execute(
+            """
+            INSERT INTO agent_state (agent, last_nudge_ts, last_nudge_key, nudge_fail_count, zombie)
+            VALUES (?, ?, ?, 0, 0)
+            ON CONFLICT(agent) DO UPDATE SET
+              last_nudge_ts = excluded.last_nudge_ts,
+              last_nudge_key = excluded.last_nudge_key
+            """,
+            (args.agent, current_ts, args.key or ""),
+        )
+    print(f"recorded self-continue for {args.agent}")
+    return 0
+
+
 def cmd_events(args: argparse.Namespace) -> int:
     import json as _json
 
@@ -3338,6 +3367,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=int(os.environ.get("BRIDGE_ZOMBIE_NUDGE_THRESHOLD", "10")),
     )
     nudge_parser.set_defaults(handler=cmd_note_nudge)
+
+    self_continue_parser = subparsers.add_parser("note-self-continue", allow_abbrev=False)
+    self_continue_parser.add_argument("--agent", required=True)
+    self_continue_parser.add_argument("--key")
+    self_continue_parser.set_defaults(handler=cmd_note_self_continue)
 
     events_parser = subparsers.add_parser("events", allow_abbrev=False)
     events_parser.add_argument("--type", dest="event_type")
