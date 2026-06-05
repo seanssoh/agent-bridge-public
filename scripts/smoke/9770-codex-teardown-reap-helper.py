@@ -29,6 +29,7 @@ import ast
 import importlib.util
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -391,6 +392,101 @@ def cmd_default_patterns_codex_free(reaper_path: str) -> int:
     return 0
 
 
+def cmd_start_time_identity(reaper_path: str) -> int:
+    """(h) PID-reuse identity guard — the regression guard for the codex
+    Phase-4 BLOCKING finding. A captured entry with the SAME pid + SAME command
+    + a relaxed/equal age (which would have passed the old `age >= captured_age`
+    check) but a DIFFERENT absolute start time (lstart) must NOT be killed: a
+    recycled pid is a different process with a different start time.
+
+    Driven against a real live codex-named process so read_proc_lstart returns a
+    genuine timestamp. We do not actually recycle the pid (impossible on demand);
+    instead we assert the predicate + reap path refuse the mismatched-lstart
+    identity while accepting the exact one.
+    """
+    mod = _load_module(reaper_path)
+    child = subprocess.Popen(
+        ["codex app-server", "120"],
+        executable="/bin/sleep",
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        pid = child.pid
+        true_lstart = ""
+        for _ in range(60):
+            true_lstart = mod.read_proc_lstart(pid)
+            if true_lstart:
+                break
+            time.sleep(0.05)
+        if not true_lstart:
+            print("could not read live child lstart", file=sys.stderr)
+            return 1
+        cmd = "codex app-server 120"
+        pat = re.compile(r"(?:^|/)codex\s+app-server\b")
+
+        # Exact identity (correct lstart) IS killable.
+        if not mod.still_killable_subtree(pid, cmd, pat, true_lstart, 0):
+            print("exact-identity (correct lstart) was wrongly refused", file=sys.stderr)
+            return 1
+        # THE BUG: same pid + same command + captured_age 0 (would pass old age
+        # check) but WRONG lstart → MUST refuse.
+        if mod.still_killable_subtree(pid, cmd, pat, "Mon Jan  1 00:00:00 2000", 0):
+            print("PID-REUSE REGRESSION: a wrong-lstart same-command pid was accepted (captured_age=0)", file=sys.stderr)
+            return 1
+        # Same, but with an age that aged PAST the captured value (old check:
+        # later_age >= captured_age=0 → accept). Wrong lstart must still refuse.
+        if mod.still_killable_subtree(pid, cmd, pat, "Mon Jan  1 00:00:00 2000", 99999):
+            print("PID-REUSE REGRESSION: wrong-lstart accepted under relaxed/older age", file=sys.stderr)
+            return 1
+        # Empty captured lstart → fail closed.
+        if mod.still_killable_subtree(pid, cmd, pat, "", 0):
+            print("empty captured lstart was not fail-closed", file=sys.stderr)
+            return 1
+
+        # End-to-end through reap_captured: a captured set whose lstart is wrong
+        # must SKIP (not kill) and the process must survive; the kill_status must
+        # be the pid-reuse skip, not a kill.
+        wrong = [{
+            "pid": pid, "ppid": 1, "age_seconds": 0, "rss_kb": 0,
+            "pattern": pat.pattern, "command": cmd,
+            "lstart": "Mon Jan  1 00:00:00 2000",
+        }]
+        res = mod.reap_captured(wrong, [pat], 0.2)
+        if res["killed"]:
+            print(f"reap_captured KILLED a wrong-lstart pid: {res['killed']}", file=sys.stderr)
+            return 1
+        statuses = {str(i.get("kill_status")) for i in res["skipped"]}
+        if "skipped-pid-reuse" not in statuses:
+            print(f"reap_captured did not skip-pid-reuse the wrong-lstart pid: {res}", file=sys.stderr)
+            return 1
+        time.sleep(0.3)
+        if not _alive_running(pid):
+            print("the wrong-lstart process was killed (must survive)", file=sys.stderr)
+            return 1
+
+        # A captured set with NO lstart must fail closed (skipped-no-lstart).
+        missing = [{
+            "pid": pid, "ppid": 1, "age_seconds": 0, "rss_kb": 0,
+            "pattern": pat.pattern, "command": cmd, "lstart": "",
+        }]
+        res2 = mod.reap_captured(missing, [pat], 0.2)
+        statuses2 = {str(i.get("kill_status")) for i in res2["skipped"]}
+        if "skipped-no-lstart" not in statuses2 or res2["killed"]:
+            print(f"reap_captured did not fail-closed on missing lstart: {res2}", file=sys.stderr)
+            return 1
+
+        print("[ok] (h) start-time identity — wrong-lstart same-command pid refused (incl relaxed age); missing lstart fails closed")
+        return 0
+    finally:
+        try:
+            child.kill()
+            child.wait(timeout=2)
+        except Exception:
+            pass
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 3:
         print("usage: 9770-codex-teardown-reap-helper.py <subcommand> <reaper.py>", file=sys.stderr)
@@ -402,6 +498,7 @@ def main(argv: list[str]) -> int:
         "no-pane-skip": cmd_no_pane_skip,
         "idempotent": cmd_idempotent,
         "default-patterns-codex-free": cmd_default_patterns_codex_free,
+        "start-time-identity": cmd_start_time_identity,
     }
     fn = table.get(command)
     if fn is None:

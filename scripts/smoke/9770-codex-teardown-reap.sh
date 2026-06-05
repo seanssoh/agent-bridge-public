@@ -83,6 +83,10 @@ smoke_log "E: (g) idempotent 2nd reap pass is ESRCH-clean"
 python3 "$HELPER_PY" idempotent "$REAPER_PY" || \
   smoke_fail "idempotent 2nd pass failed"
 
+smoke_log "E2: (h) PID-reuse identity — wrong start-time (same pid+command, relaxed age) is NOT killed"
+python3 "$HELPER_PY" start-time-identity "$REAPER_PY" || \
+  smoke_fail "start-time identity regression guard failed (PID-reuse defense)"
+
 # ---------------------------------------------------------------------------
 # DEFAULT_PATTERNS must stay codex-free: the global orphan path is untouched, so
 # a live roster `codex resume` can never become a global-cleanup candidate.

@@ -270,6 +270,35 @@ def read_proc_identity(pid: int) -> tuple[str, int, int] | None:
     return None
 
 
+def read_proc_lstart(pid: int) -> str:
+    """Read a pid's ABSOLUTE process start timestamp via `ps -o lstart=`.
+
+    `lstart` is the wall-clock instant the process started (e.g.
+    "Thu Jun  5 12:47:56 2026"). It is portable on both macOS and Linux, stable
+    for the entire life of that exact process, and — combined with the numeric
+    pid — a UNIQUE process identity: a recycled pid is a NEW process with a
+    DIFFERENT start time. We read it in a dedicated ps call (not folded into
+    read_proc_identity) because lstart carries internal spaces that would make a
+    single positional split against `command=` fragile.
+
+    Returns the whitespace-normalized timestamp, or "" if the pid is gone /
+    unreadable (callers treat "" as "cannot prove identity" → refuse to signal).
+    """
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError:
+        return ""
+    # Collapse internal runs of whitespace so the captured form and the
+    # re-read form compare byte-for-byte regardless of ps padding.
+    return " ".join(completed.stdout.split())
+
+
 def still_killable(
     pid: int,
     expected_command: str,
@@ -341,21 +370,30 @@ def still_killable_subtree(
     pid: int,
     expected_command: str,
     expected_pattern: re.Pattern[str],
+    expected_lstart: str,
     min_observed_age: int,
 ) -> bool:
     """PID-reuse guard for the SUBTREE reap path (#9770 Track 2).
 
-    Identical to `still_killable` EXCEPT it deliberately drops the parent-PID
-    constraint. On the daemon idle-kill path we capture the codex/app-server/MCP
-    descendants of a pane PID and reap them AFTER `tmux kill-session` — which
-    tears the pane down, so the captured codex REPARENTS to init/launchd. That
-    reparent is the expected, benign signal of the teardown we initiated, not a
-    PID-reuse event, so a ppid check would wrongly refuse to reap the very leak
-    we are trying to close. PID reuse is still defended by the triple (a) the
-    pid still exists, (b) it still matches the within-subtree allowlist, (c) its
-    command string is byte-identical to the captured command, and (d) it is no
-    younger than when captured (a recycled pid is a fresh, younger process).
+    This path deliberately drops the parent-PID constraint: on the daemon
+    idle-kill path we capture the codex/app-server/MCP descendants of a pane PID
+    and reap them AFTER `tmux kill-session`, which tears the pane down so the
+    captured codex REPARENTS to init/launchd. That reparent is the expected,
+    benign signal of the teardown we initiated, not a PID-reuse event, so a ppid
+    check would wrongly refuse to reap the very leak we are trying to close.
+
+    Because the ppid check is gone, the PID-reuse defense is anchored on the
+    process's ABSOLUTE start time (`lstart`): pid + start-time is a unique
+    process identity, so a numeric pid recycled between capture and reap — now an
+    unrelated process that merely happens to share the command string — has a
+    DIFFERENT start time and is REFUSED here. This exact-match is the identity
+    guarantee; the allowlist + byte-identical command + age-not-younger checks
+    are secondary coarse filters, NOT the identity check. An empty captured or
+    live `lstart` (unreadable) fails closed — we never signal a pid we cannot
+    prove the identity of.
     """
+    if not expected_lstart:
+        return False
     identity = read_proc_identity(pid)
     if identity is None:
         return False
@@ -364,6 +402,12 @@ def still_killable_subtree(
         return False
     if command != expected_command:
         return False
+    # Identity check: the live process must have the SAME absolute start time as
+    # the one we captured. A recycled pid is a fresh process with a later start.
+    live_lstart = read_proc_lstart(pid)
+    if not live_lstart or live_lstart != expected_lstart:
+        return False
+    # Secondary coarse filter only (start-time already proved identity).
     if age < min_observed_age:
         return False
     return True
@@ -374,13 +418,15 @@ def kill_pid_subtree(
     grace_seconds: float,
     expected_command: str,
     expected_pattern: re.Pattern[str],
+    expected_lstart: str,
     min_observed_age: int,
 ) -> tuple[bool, str]:
-    """SIGTERM→grace→SIGKILL with ppid-agnostic PID-reuse revalidation before
-    every signal. Fail-soft + idempotent: ESRCH is success/no-op; a vanished or
-    identity-changed pid is skipped rather than signalled."""
+    """SIGTERM→grace→SIGKILL with ppid-agnostic, start-time-anchored PID-reuse
+    revalidation before every signal. Fail-soft + idempotent: ESRCH is
+    success/no-op; a vanished or identity-changed pid is skipped rather than
+    signalled."""
     # PID-reuse revalidation IMMEDIATELY before SIGTERM.
-    if not still_killable_subtree(pid, expected_command, expected_pattern, min_observed_age):
+    if not still_killable_subtree(pid, expected_command, expected_pattern, expected_lstart, min_observed_age):
         return True, "skipped-pid-reuse"
     try:
         os.kill(pid, signal.SIGTERM)
@@ -398,9 +444,9 @@ def kill_pid_subtree(
     # Revalidate again before escalating to SIGKILL — the pid may have exited
     # (and possibly been recycled) during the grace window. A process that has
     # become a zombie (SIGTERM took effect, parent has not reaped it yet) no
-    # longer matches the captured command, so this correctly reports it as
-    # already-terminated rather than re-signalling a recycled pid.
-    if not still_killable_subtree(pid, expected_command, expected_pattern, min_observed_age):
+    # longer matches the captured command/start-time, so this correctly reports
+    # it as already-terminated rather than re-signalling a recycled pid.
+    if not still_killable_subtree(pid, expected_command, expected_pattern, expected_lstart, min_observed_age):
         return True, "terminated"
     try:
         os.kill(pid, signal.SIGKILL)
@@ -456,9 +502,11 @@ def capture_subtree(root_pid: int, patterns: list[re.Pattern[str]]) -> list[dict
     session's tmux pane PID), with per-PID metadata for later revalidation.
 
     Returns a leaf-to-root–ordered list (highest pid first as a cheap proxy) of
-    {pid, ppid, age_seconds, rss_kb, pattern, command}. Only processes whose
-    command matches the within-subtree allowlist are captured — a non-codex
-    child the user opened in the same pane is intentionally left out.
+    {pid, ppid, age_seconds, rss_kb, pattern, command, lstart}. `lstart` is the
+    absolute process start timestamp that anchors the PID-reuse identity check at
+    reap time. Only processes whose command matches the within-subtree allowlist
+    are captured — a non-codex child the user opened in the same pane is
+    intentionally left out.
     """
     processes = load_processes()
     captured: list[dict[str, object]] = []
@@ -474,6 +522,10 @@ def capture_subtree(root_pid: int, patterns: list[re.Pattern[str]]) -> list[dict
                 "rss_kb": proc.rss_kb,
                 "pattern": pattern,
                 "command": proc.command,
+                # Absolute start time = the PID-reuse identity anchor. Captured
+                # here (while the process is still the one we walked) so a later
+                # reap can prove the live pid is the SAME process.
+                "lstart": read_proc_lstart(proc.pid),
             }
         )
     # Reap children before their parents: a parent that re-spawns a child
@@ -521,14 +573,24 @@ def reap_captured(
             enriched["kill_status"] = "skipped-no-pattern"
             skipped.append(enriched)
             continue
-        # ppid-agnostic revalidation: the captured codex reparents to init when
-        # we tear its pane down on the daemon path, which is expected — see
-        # kill_pid_subtree / still_killable_subtree.
+        expected_lstart = str(item.get("lstart") or "")
+        if not expected_lstart:
+            # Fail closed: without a captured start time we cannot prove the
+            # live pid is the SAME process (PID-reuse defense), so refuse to
+            # signal it. This only happens if capture could not read lstart.
+            enriched["kill_status"] = "skipped-no-lstart"
+            skipped.append(enriched)
+            continue
+        # ppid-agnostic revalidation anchored on the absolute start time: the
+        # captured codex reparents to init when we tear its pane down on the
+        # daemon path (expected), but a recycled pid has a different lstart and
+        # is refused — see kill_pid_subtree / still_killable_subtree.
         ok, status = kill_pid_subtree(
             pid,
             grace_seconds,
             str(item.get("command", "")),
             expected_pattern,
+            expected_lstart,
             int(item.get("age_seconds", 0)),
         )
         enriched["kill_status"] = status
