@@ -262,6 +262,68 @@ else
 fi
 
 # ===========================================================================
+# A2 — PRODUCTION before+after BRACKETING teeth (#1563 PR-2 r2, codex BLOCKING).
+# ===========================================================================
+# Reproduces the codex healthy-daemon false-abort probe at the EXACT shape the
+# production wiring now defends against: a long bounded step that stamps
+# progress BEFORE it runs, consumes ~max_step, and is followed by healthy TAIL
+# work (release_monitor + the rest of the tick). The cmd_sync_cycle markers now
+# stamp progress BEFORE *and* AFTER each long step, so a healthy max-duration
+# step re-baselines the heartbeat and the tail inherits the FULL deadline. This
+# teeth proves BOTH directions:
+#   (1) a BEFORE-ONLY revert (no AFTER stamp) + ~max_step + healthy tail MUST be
+#       FALSE-ABORTED (rc=99) — i.e. the production bug codex reproduced; and
+#   (2) the BEFORE+AFTER production wiring with the SAME timings MUST NOT abort.
+# With the smoke's deadline=4 (max_step 3 + grace 1): step=3s (age reaches ~3,
+# under deadline — a healthy step) then tail=3s. Before-only: age climbs 3→6,
+# crosses 4 → ABORT. Before+after: the AFTER stamp resets age to 0, tail age
+# only reaches ~3 < 4 → NO abort. The mid-step pulse the A negative-control uses
+# did NOT catch this class (it pulsed every second); a real long step is opaque
+# between its before/after marks.
+
+# (1) BEFORE-ONLY: stamp before, run the step (~max_step), then healthy tail
+#     work with NO further stamp until the tick ends. This is the pre-fix
+#     production shape — it MUST false-abort.
+# shellcheck disable=SC2329  # invoked via the supervisor's `"$@"`
+before_only_then_tail_tick() {
+  bridge_daemon_tick_progress_touch "long_step"   # BEFORE the long step
+  sleep 3                                          # the long bounded step (~max_step)
+  # NO after-stamp here (the bug). Healthy tail work follows:
+  sleep 3                                          # tail (release_monitor + rest)
+  return 0
+}
+reset_audit
+BO_RC=0
+bridge_daemon_run_tick_supervised 21 before_only_then_tail_tick || BO_RC=$?
+BO_ABORTS="$(audit_count daemon_tick_deadline_exceeded)"
+if (( BO_RC == ${BRIDGE_DAEMON_TICK_WEDGE_RC:-99} )) && [[ "${BO_ABORTS:-0}" != "0" ]]; then
+  _pass "A2-teeth BEFORE-ONLY stamp + ~max_step + healthy tail → FALSE-ABORTED (rc=$BO_RC) — proves a before-only revert reintroduces the healthy-daemon false-abort codex reproduced"
+else
+  _fail "A2-teeth before-only" "before-only + max_step + tail was NOT aborted (rc=$BO_RC, rows=${BO_ABORTS:-?}) — the teeth is vacuous; the production false-abort class is not pinned"
+fi
+
+# (2) BEFORE+AFTER (production wiring): same timings, but re-baseline progress
+#     AFTER the long step. The tail inherits the FULL deadline → NO abort. This
+#     is what the cmd_sync_cycle before+after markers now do for every long step.
+# shellcheck disable=SC2329  # invoked via the supervisor's `"$@"`
+before_after_then_tail_tick() {
+  bridge_daemon_tick_progress_touch "long_step"   # BEFORE the long step
+  sleep 3                                          # the long bounded step (~max_step)
+  bridge_daemon_tick_progress_touch "long_step"   # AFTER — re-baseline (the fix)
+  sleep 3                                          # tail inherits the full deadline
+  return 0
+}
+reset_audit
+BA_RC=0
+bridge_daemon_run_tick_supervised 22 before_after_then_tail_tick || BA_RC=$?
+BA_ABORTS="$(audit_count daemon_tick_deadline_exceeded)"
+if (( BA_RC == 0 )) && [[ "${BA_ABORTS:-0}" == "0" ]]; then
+  _pass "A2 BEFORE+AFTER production wiring + ~max_step + healthy tail → NO false-abort (rc=0) — the AFTER stamp re-baselines and the tail gets the full deadline"
+else
+  _fail "A2 before+after" "before+after wiring was FALSE-ABORTED (rc=$BA_RC, rows=${BA_ABORTS:-?}) — the production bracketing does not prevent the healthy-daemon abort"
+fi
+
+# ===========================================================================
 # B — WEDGED unbounded step → self-abort within (max-step + grace) + audit.
 # ===========================================================================
 # shellcheck disable=SC2329  # invoked via the supervisor's `"$@"`
@@ -447,18 +509,34 @@ if grep -q 'bridge_daemon_run_tick_supervised' "$DAEMON_SH" \
 else
   _fail "D4 cmd_run-wiring" "cmd_run does not wire supervisor + wedge-rc exit in $DAEMON_SH"
 fi
-# D5 — the long bounded steps refresh progress (the markers are wired).
+# D5 — the long bounded steps refresh progress (the markers are wired) AND are
+# BRACKETED before+after (#1563 PR-2 r2, codex BLOCKING). A before-ONLY stamp
+# leaves a healthy max-duration step's tail with only the grace window → the
+# false-abort class. Assert (a) precompact_events is now wired (BLOCKING 2) and
+# (b) EVERY long bounded step's mark appears at least TWICE in cmd_sync_cycle
+# (the BEFORE + AFTER stamps) so a revert to before-only is caught.
 D5_FAIL=0
-for step in '_bridge_daemon_mark_progress "daily_backup"' '_bridge_daemon_mark_progress "bridge_sync"' '_bridge_daemon_mark_progress "watchdog"' '_bridge_daemon_mark_progress "a2a_deliver_tick"'; do
-  if ! grep -qF "$step" "$DAEMON_SH"; then
-    printf '[FAIL] D5: missing progress marker: %s\n' "$step" >&2
+# Restrict the count to the cmd_sync_cycle body so an unrelated occurrence
+# elsewhere in the file cannot mask a missing after-stamp.
+SYNC_BODY="$(awk '/^cmd_sync_cycle\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$DAEMON_SH")"
+for step in daily_backup bridge_sync watchdog a2a_deliver_tick precompact_events; do
+  marker="_bridge_daemon_mark_progress \"$step\""
+  if ! grep -qF "$marker" "$DAEMON_SH"; then
+    printf '[FAIL] D5: missing progress marker: %s\n' "$marker" >&2
+    D5_FAIL=1
+    continue
+  fi
+  cnt="$(printf '%s\n' "$SYNC_BODY" | grep -cF "$marker" | tr -dc '0-9' | head -c 4)"
+  [[ "$cnt" =~ ^[0-9]+$ ]] || cnt=0
+  if (( cnt < 2 )); then
+    printf '[FAIL] D5: long step %s is NOT bracketed before+after (mark count=%s in cmd_sync_cycle; expected >= 2)\n' "$step" "$cnt" >&2
     D5_FAIL=1
   fi
 done
 if (( D5_FAIL == 0 )); then
-  _pass "D5 long bounded steps (daily_backup/bridge_sync/watchdog/a2a) refresh the progress heartbeat (negative-control plumbing)"
+  _pass "D5 every long bounded step (daily_backup/bridge_sync/watchdog/a2a_deliver_tick/precompact_events) is BRACKETED before+after — no before-only false-abort gap"
 else
-  _fail "D5 progress-markers" "see missing-marker lines above"
+  _fail "D5 progress-markers" "see missing/under-bracketed marker lines above"
 fi
 
 # ===========================================================================

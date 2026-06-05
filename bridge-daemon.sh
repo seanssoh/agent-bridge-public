@@ -10972,8 +10972,14 @@ cmd_sync_cycle() {
   # the Discord relay (so any inbound user activity is already mirrored into
   # the activity index when the route lookup runs) and before bridge-sync,
   # which is the cheap "I/O is mostly done for this cycle" boundary.
-  BRIDGE_DAEMON_LAST_STEP="precompact_events"
+  # #1563 PR-2 (r2): process_precompact_events fans out bounded channel sends
+  # via bridge_with_timeout 30 (each PreCompact notify) — a long bounded step.
+  # Bracket it BEFORE and AFTER so a healthy fan-out re-baselines the progress
+  # heartbeat on completion and the tail work gets the FULL deadline, not just
+  # the residual grace window (the healthy-daemon false-abort class).
+  _bridge_daemon_mark_progress "precompact_events"
   ( process_precompact_events ) || true
+  _bridge_daemon_mark_progress "precompact_events"
 
   # #1563 PR-2: refresh the supervisor progress heartbeat right before this
   # long bounded step (30s ceiling) so a healthy bridge-sync keeps liveness
@@ -10983,6 +10989,9 @@ cmd_sync_cycle() {
   # wedge the daemon main loop. 30s ceiling — bridge-sync.sh reconciles roster
   # + state under normal conditions in <1s; timeouts here are pathological.
   bridge_with_timeout 30 bridge_sync "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true
+  # #1563 PR-2 (r2): re-baseline progress AFTER the long step so the tail work
+  # below inherits the full deadline, not just the residual grace window.
+  _bridge_daemon_mark_progress "bridge_sync"
   # Issue #848: bridge-sync.sh ran as a child process and may have
   # touched the roster files; invalidate so this in-loop reload picks
   # up any newly-registered dynamic agents.
@@ -11120,6 +11129,9 @@ cmd_sync_cycle() {
   # #1563 PR-2: refresh progress before the A2A deliver tick (60s ceiling).
   _bridge_daemon_mark_progress "a2a_deliver_tick"
   ( process_a2a_deliver_tick ) || true
+  # #1563 PR-2 (r2): re-baseline progress AFTER the 60s deliver tick so the
+  # subsequent tail steps inherit the full deadline, not just residual grace.
+  _bridge_daemon_mark_progress "a2a_deliver_tick"
 
   # Issue #1262 Gap 3 (v0.15.0-beta4 Lane I): A2A outbox stuck-alert
   # scan. Pairs with the deliver tick above — when a row stays in
@@ -11281,14 +11293,23 @@ cmd_sync_cycle() {
   if process_watchdog_report; then
     changed=0
   fi
+  # #1563 PR-2 (r2): re-baseline progress AFTER the 30s watchdog scan so the
+  # tail steps inherit the full deadline, not just the residual grace window.
+  _bridge_daemon_mark_progress "watchdog"
   BRIDGE_DAEMON_LAST_STEP="crash_reports"
   if process_crash_reports; then
     changed=0
   fi
-  BRIDGE_DAEMON_LAST_STEP="claude_token_recovery"
+  # #1563 PR-2 (r2): bracket claude_token_recovery — a bounded synchronous step
+  # whose ceiling (BRIDGE_CLAUDE_TOKEN_RECOVERY_TIMEOUT_SECONDS, default 60s) is
+  # a max-step knob the recovery runbook tells operators to RAISE. Without an
+  # AFTER mark a raised recovery timeout would collapse the periodic-sync /
+  # usage-monitor tail budget to the residual grace window (false-abort class).
+  _bridge_daemon_mark_progress "claude_token_recovery"
   if process_claude_token_recovery; then
     changed=0
   fi
+  _bridge_daemon_mark_progress "claude_token_recovery"
   # v0.13.6 hotfix — refs operator report 2026-05-15 patch host.
   # Cron-only static agents never trigger the rotation/recovery branch above
   # and so go stale (mgt_ahn hit 429 after 3 days on a 5/12 token). The
@@ -11317,6 +11338,11 @@ cmd_sync_cycle() {
   if process_daily_backup; then
     changed=0
   fi
+  # #1563 PR-2 (r2): re-baseline progress AFTER the LONGEST bounded step (600s
+  # ceiling) so a healthy max-duration backup leaves the FULL deadline for the
+  # tail (release_monitor + the rest of the tick) — not just the grace window.
+  # This closes the healthy-daemon false-abort class codex reproduced (rc=99).
+  _bridge_daemon_mark_progress "daily_backup"
   BRIDGE_DAEMON_LAST_STEP="release_monitor"
   if process_release_monitor; then
     changed=0
@@ -11365,8 +11391,12 @@ cmd_sync_cycle() {
   # Failures here MUST NOT abort the rest of the tick; the apply path
   # never aborts on a single file, so this wrapper just absorbs an
   # unexpected non-zero rc with a warn line.
-  BRIDGE_DAEMON_LAST_STEP="cron_staging_apply"
+  # #1563 PR-2 (r2): bracket cron_staging_apply — BRIDGE_CRON_STAGING_APPLY_
+  # TIMEOUT_SECONDS (default 25s) is a max-step knob; re-baseline progress
+  # before+after so a raised ceiling cannot collapse the tail-wrap budget.
+  _bridge_daemon_mark_progress "cron_staging_apply"
   process_cron_staging_apply || daemon_warn "cron-staging apply step failed"
+  _bridge_daemon_mark_progress "cron_staging_apply"
 
   # Cron sync runs LAST, in the background with a timeout, so it never blocks
   # relay/auto-start above.  Only one sync runs at a time (PID-file guard).
