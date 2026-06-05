@@ -15,12 +15,13 @@ heredoc-stdin — lint-heredoc-ban C3 ban; see KNOWN_ISSUES.md §26):
 Each subcommand exits non-zero (message on stderr) on failure so the calling
 smoke can `|| smoke_fail`.
 
-Stand-in shape: a `/bin/sh` "pane root" that exec-renames /bin/sleep children
-to the codex/app-server/MCP names (and one unrelated non-codex child), then
-blocks. We treat the `/bin/sh` PID as the tmux pane PID and pass it as
---root-pid. A SECOND such pane root models a live roster codex in a different
-pane; a detached `setsid` codex-named sleep models the operator's non-bridge
-codex outside any pane.
+Stand-in shape: a `bash` "pane root" that exec-renames /bin/sleep children to
+the codex/app-server/MCP names (and one unrelated non-codex child) via the bash
+`exec -a` builtin, then blocks. bash is resolved explicitly (NOT `/bin/sh`,
+which is dash on Ubuntu and has no `exec -a`). We treat the pane-root PID as the
+tmux pane PID and pass it as --root-pid. A SECOND such pane root models a live
+roster codex in a different pane; a detached `setsid` codex-named sleep models
+the operator's non-bridge codex outside any pane.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -47,8 +49,31 @@ def _load_module(reaper_path: str):
 
 # --- stand-in process-tree primitives ------------------------------------
 
-# Each pane is a /bin/sh that renames sleep children via `exec -a`. We capture
-# the child PIDs by having the shell print them, then read them back.
+
+def _resolve_bash() -> str:
+    """Resolve a bash interpreter for the pane stand-in.
+
+    The pane body uses `exec -a` to set argv[0] on the /bin/sleep children so
+    their `ps` command matches the codex/app-server/MCP allowlist. `exec -a` is
+    a BASH builtin — on Ubuntu `/bin/sh` is dash, which has no `exec -a`, so the
+    stand-ins would never start (the CI portability bug). Always run the pane
+    body under bash explicitly.
+    """
+    found = shutil.which("bash")
+    if found:
+        return found
+    for candidate in ("/bin/bash", "/usr/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"):
+        if os.path.exists(candidate):
+            return candidate
+    # Last resort: let the OS resolve `bash` from PATH at exec time.
+    return "bash"
+
+
+_BASH_BIN = _resolve_bash()
+
+# Each pane is a bash "pane root" that renames /bin/sleep children via the bash
+# `exec -a` builtin. We capture the child PIDs by having the shell print them,
+# then read them back.
 _PANE_SH = (
     'exec -a "codex app-server" /bin/sleep 600 & echo "codex=$!"; '
     'exec -a "mcp-server-darwin-arm64 --stdio" /bin/sleep 600 & echo "mcp=$!"; '
@@ -61,7 +86,7 @@ _PANE_SH = (
 class Pane:
     def __init__(self) -> None:
         self.proc = subprocess.Popen(
-            ["/bin/sh", "-c", _PANE_SH],
+            [_BASH_BIN, "-c", _PANE_SH],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -81,7 +106,7 @@ class Pane:
 
     @property
     def root(self) -> int:
-        # The /bin/sh root PID == the Popen child PID.
+        # The bash pane-root PID == the Popen child PID.
         return self.proc.pid
 
     def teardown(self) -> None:
@@ -250,7 +275,7 @@ def cmd_capture_then_reap(reaper_path: str) -> int:
             return 1
 
         # Kill the pane root (mimics `tmux kill-session`). The codex/mcp children
-        # reparent away from the now-dead /bin/sh.
+        # reparent away from the now-dead bash pane root.
         os.kill(pane.root, signal.SIGKILL)
         try:
             pane.proc.wait(timeout=2)
