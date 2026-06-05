@@ -545,32 +545,51 @@ _bridge_layout_sync_one_identity_file() {
   fi
 
   # --- write the workdir copy -------------------------------------------
-  mkdir -p "$(dirname "$dst")" 2>/dev/null || return 1
-  if (( iso_effective == 1 )) && (( can_iso_write == 1 )); then
+  #
+  # iso v2 (effective) and non-iso are split into two strictly-separate write
+  # paths — they must NEVER cross. (codex r2 BLOCKING 1+2.)
+  if (( iso_effective == 1 )); then
+    # ISO PATH — controller-published ONLY.
+    #
+    # BLOCKING 1: do NOT `mkdir -p "$(dirname "$dst")"` here. The controller
+    # is not in `ab-agent-<a>` and cannot traverse the 0750/2770 workdir
+    # parent, so a controller-side mkdir would fail with `Permission denied`
+    # and abort the propagation for exactly the iso agents #1417 targets.
+    # The workdir leaf always exists at start (bridge-start.sh guarantees
+    # WORK_DIR_PRESENT), and `bridge_isolation_write_file_as_agent_user_via_bash`
+    # itself validates the dest dir + writes atomically AS the iso UID.
+    #
+    # BLOCKING 2: once iso is effective the ONLY acceptable outcomes are
+    # "published via the helper" or "fail loud" — NEVER a controller `cp -f`
+    # into the iso workdir (that drops a controller-owned file across the
+    # boundary). A helper rc=1 ("predicate says not actually isolated") is
+    # NOT proof a controller write is safe, so we fail closed on it too
+    # (mirrors `agent set-onboarding`, which dies on an unexpected rc).
+    if (( can_iso_write == 0 )); then
+      # iso effective but the sudo-as-iso writer is unavailable → cannot
+      # publish, and a controller write is forbidden → fail closed.
+      return 1
+    fi
     local _wrc=0
     bridge_isolation_write_file_as_agent_user_via_bash \
       "$agent" "$dst" "0660" < "$src" >/dev/null 2>&1 || _wrc=$?
-    case "$_wrc" in
-      0)
-        if (( can_per_file_normalize == 1 )); then
-          bridge_isolation_v2_chgrp_file_iso_group \
-            "$agent" "$dst" 0660 "$target_dir" >/dev/null 2>&1 || true
-        fi
-        return 0
-        ;;
-      1) : ;; # helper says not actually isolated → fall through to cp
-      *) return 1 ;; # sudo unavailable / helper error → fail-closed
-    esac
+    if (( _wrc == 0 )); then
+      if (( can_per_file_normalize == 1 )); then
+        bridge_isolation_v2_chgrp_file_iso_group \
+          "$agent" "$dst" 0660 "$target_dir" >/dev/null 2>&1 || true
+      fi
+      return 0
+    fi
+    # Any nonzero helper rc (sudo unavailable, predicate disagreement, IO
+    # error) → fail closed. Never fall through to a controller write.
+    return 1
   fi
 
-  # Controller-side copy (shared mode / macOS / non-isolated). The differ
-  # guard above already ensured we only reach here when HOME is the
-  # authoritative newer copy.
+  # NON-ISO PATH — controller can write directly (shared mode / macOS /
+  # single-OS-user). The differ guard above already ensured we only reach
+  # here when HOME is the authoritative newer copy (or the dst is absent).
+  mkdir -p "$(dirname "$dst")" 2>/dev/null || return 1
   cp -f -- "$src" "$dst" 2>/dev/null || return 1
-  if (( iso_effective == 1 )) && (( can_per_file_normalize == 1 )); then
-    bridge_isolation_v2_chgrp_file_iso_group \
-      "$agent" "$dst" 0660 "$target_dir" >/dev/null 2>&1 || true
-  fi
   return 0
 }
 

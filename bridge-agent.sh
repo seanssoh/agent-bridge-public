@@ -7067,7 +7067,37 @@ except OSError:
 #     sudo-as-iso path + chgrp, never a controller direct-write into the iso
 #     tree (CLAUDE.md iso-v2 boundary). Shared mode (home == workdir) writes a
 #     single physical copy in the HOME step above.
+_set_onboarding_usage() {
+  # Printed to STDOUT (issue #1117 universal --help gate: rc=0 + non-empty
+  # stdout). bridge_die routes usage to STDERR + rc=1, which the gate fails,
+  # so the --help path must NOT go through it.
+  printf 'Usage: %s set-onboarding <agent> <state>\n' "$(basename "$0")"
+  printf '\n'
+  printf 'Set the agent onboarding state in BOTH the HOME and workdir\n'
+  printf 'SESSION-TYPE.md copies atomically (issue #1417). Use this instead of\n'
+  printf 'hand-editing SESSION-TYPE.md — a managed-project (workdir != home)\n'
+  printf 'agent reads workdir-first, so a HOME-only edit silently no-ops.\n'
+  printf '\n'
+  printf '  <state>   onboarding state to set (e.g. complete | pending | partial;\n'
+  printf '            any [A-Za-z0-9._-]+ token the runtime parser accepts)\n'
+  printf '\n'
+  printf 'Example: %s set-onboarding reviewer complete\n' "$(basename "$0")"
+}
+
 run_set_onboarding() {
+  # #1117 universal --help gate: support -h/--help anywhere in the args with
+  # rc=0 + usage on STDOUT, BEFORE positional consumption (so the verb does
+  # not treat `--help` as the <agent> positional — the #1114 bug class).
+  local _arg
+  for _arg in "$@"; do
+    case "$_arg" in
+      -h|--help|help)
+        _set_onboarding_usage
+        return 0
+        ;;
+    esac
+  done
+
   local agent="${1:-}"
   local new_state="${2:-}"
   shift 2 2>/dev/null || true
