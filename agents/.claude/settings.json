@@ -26,6 +26,15 @@
         "hooks": [
           {
             "type": "command",
+            "command": "/usr/bin/python3 ~/.agent-bridge/hooks/inbox-auto-drain.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "/usr/bin/python3 ~/.agent-bridge/hooks/session-stop.py",
             "timeout": 35
           }

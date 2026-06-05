@@ -444,6 +444,13 @@ def session_stop_hook_command(bridge_home: Path, python_bin: str) -> str:
     return shell_command(python_bin, shell_path(hook_path))
 
 
+def inbox_drain_hook_command(bridge_home: Path, python_bin: str) -> str:
+    # #9780: Stop inbox-drain auto-continue. Wired AFTER surface-reply-enforce
+    # (so it never shadows the channel-reply block) and BEFORE session-stop.
+    hook_path = bridge_home / "hooks" / "inbox-auto-drain.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
 def session_start_hook_command(bridge_home: Path, python_bin: str, fmt: str = "text") -> str:
     hook_path = bridge_home / "hooks" / "session-start.py"
     if fmt != "text":
@@ -562,6 +569,10 @@ def is_surface_reply_enforce_hook(command: str) -> bool:
 
 def is_session_stop_hook(command: str) -> bool:
     return "session-stop.py" in str(command)
+
+
+def is_inbox_drain_hook(command: str) -> bool:
+    return "inbox-auto-drain.py" in str(command)
 
 
 def is_session_start_hook(command: str) -> bool:
@@ -691,13 +702,15 @@ def cmd_status_stop_hook(args: argparse.Namespace) -> int:
     stop_hooks = hooks_list(settings, "Stop")
     _idle_group, idle_hook = find_command_hook(stop_hooks, is_mark_idle_hook)
     _surface_group, surface_hook = find_command_hook(stop_hooks, is_surface_reply_enforce_hook)
+    _inbox_drain_group, inbox_drain_hook = find_command_hook(stop_hooks, is_inbox_drain_hook)
     _session_stop_group, session_stop_hook = find_command_hook(stop_hooks, is_session_stop_hook)
     # mark-idle.sh keeps the legacy HOOK_STOP_HOOK / HOOK_COMMAND fields so
     # existing operators / scripts that grep for them stay green. The
     # HOOK_STOP_HOOK_SUITE field (#541 PR-B) reports the aggregate state so
-    # the upgrade and smoke paths can detect partial drops of the new pair.
+    # the upgrade and smoke paths can detect partial drops of the suite
+    # (now including the #9780 inbox-auto-drain step).
     command = str(idle_hook.get("command") or "") if idle_hook else ""
-    suite_present = bool(idle_hook and surface_hook and session_stop_hook)
+    suite_present = bool(idle_hook and surface_hook and inbox_drain_hook and session_stop_hook)
     payload = {
         "HOOK_SETTINGS_FILE": str(settings_path),
         "HOOK_STATUS": "present" if suite_present else "missing",
@@ -705,6 +718,7 @@ def cmd_status_stop_hook(args: argparse.Namespace) -> int:
         "HOOK_STOP_HOOK_SUITE": "present" if suite_present else "missing",
         "HOOK_STOP_HOOK_MARK_IDLE": "present" if idle_hook else "missing",
         "HOOK_STOP_HOOK_SURFACE_REPLY_ENFORCE": "present" if surface_hook else "missing",
+        "HOOK_STOP_HOOK_INBOX_DRAIN": "present" if inbox_drain_hook else "missing",
         "HOOK_STOP_HOOK_SESSION_STOP": "present" if session_stop_hook else "missing",
         "HOOK_PROMPT_HOOK": "",
         "HOOK_COMMAND": command,
@@ -715,6 +729,7 @@ def cmd_status_stop_hook(args: argparse.Namespace) -> int:
         print(f"stop_hook_suite: {'present' if suite_present else 'missing'}")
         print(f"stop_hook_mark_idle: {'present' if idle_hook else 'missing'}")
         print(f"stop_hook_surface_reply_enforce: {'present' if surface_hook else 'missing'}")
+        print(f"stop_hook_inbox_drain: {'present' if inbox_drain_hook else 'missing'}")
         print(f"stop_hook_session_stop: {'present' if session_stop_hook else 'missing'}")
     return 0 if suite_present else 1
 
@@ -799,6 +814,56 @@ def ensure_command_hook(
     return changed
 
 
+def reorder_event_hook_before(
+    settings_path: Path,
+    event_name: str,
+    move_matcher: Any,
+    before_matcher: Any,
+) -> bool:
+    """Move the hook group matching ``move_matcher`` to sit immediately before
+    the group matching ``before_matcher`` in ``event_name``.
+
+    #9780: ``ensure_command_hook`` appends a freshly-registered hook at the end
+    of the event list, which would land the inbox-drain hook AFTER session-stop.
+    The Stop chain ordering is load-bearing (inbox-drain must run after
+    surface-reply-enforce and before session-stop), so this normalises the
+    position on every ensure pass — idempotent when already in place. No-op when
+    either group is missing.
+    """
+    settings = ensure_settings_root(settings_path)
+    event_hooks = hooks_list(settings, event_name)
+
+    move_idx = before_idx = None
+    for idx, group in enumerate(event_hooks):
+        if not isinstance(group, dict):
+            continue
+        hooks = group.get("hooks")
+        if not isinstance(hooks, list):
+            continue
+        for hook in hooks:
+            if not isinstance(hook, dict) or hook.get("type") != "command":
+                continue
+            command = str(hook.get("command") or "")
+            if move_idx is None and move_matcher(command):
+                move_idx = idx
+            if before_idx is None and before_matcher(command):
+                before_idx = idx
+
+    if move_idx is None or before_idx is None:
+        return False
+    if move_idx + 1 == before_idx:
+        return False  # already immediately before — nothing to do.
+
+    group = event_hooks.pop(move_idx)
+    # Recompute the anchor index after the pop (it shifts left if it followed
+    # the moved group).
+    if move_idx < before_idx:
+        before_idx -= 1
+    event_hooks.insert(before_idx, group)
+    save_json(settings_path, settings)
+    return True
+
+
 def cmd_ensure_stop_hook(args: argparse.Namespace) -> int:
     bridge_home = Path(args.bridge_home).expanduser()
     settings_path = resolve_settings_path(args)
@@ -810,12 +875,15 @@ def cmd_ensure_stop_hook(args: argparse.Namespace) -> int:
     python_bin = getattr(args, "python_bin", None) or shutil.which("python3") or "/usr/bin/python3"
     mark_idle_command = stop_hook_command(bridge_home, args.bash_bin)
     surface_command = surface_reply_enforce_hook_command(bridge_home, python_bin)
+    inbox_drain_command = inbox_drain_hook_command(bridge_home, python_bin)
     session_stop_command = session_stop_hook_command(bridge_home, python_bin)
 
     # Issue #541 PR-B: ensure the full Stop hook suite. mark-idle.sh keeps
-    # additionalContext=true (idle-wake context); surface-reply-enforce.py
-    # and session-stop.py mirror agents/_template/.claude/settings.json
-    # (no additionalContext, timeout 5 / 35 respectively).
+    # additionalContext=true (idle-wake context); surface-reply-enforce.py,
+    # inbox-auto-drain.py (#9780) and session-stop.py mirror
+    # agents/_template/.claude/settings.json (no additionalContext, timeout
+    # 5 / 10 / 35 respectively). Chain order: mark-idle → surface-reply-enforce
+    # → inbox-auto-drain → session-stop.
     changed = ensure_command_hook(
         settings_path,
         "Stop",
@@ -834,9 +902,26 @@ def cmd_ensure_stop_hook(args: argparse.Namespace) -> int:
     changed = ensure_command_hook(
         settings_path,
         "Stop",
+        inbox_drain_command,
+        is_inbox_drain_hook,
+        timeout=10,
+    ) or changed
+    changed = ensure_command_hook(
+        settings_path,
+        "Stop",
         session_stop_command,
         is_session_stop_hook,
         timeout=35,
+    ) or changed
+    # #9780: ensure_command_hook appends a newly-registered hook at the end of
+    # the list. Re-seat inbox-auto-drain immediately before session-stop so the
+    # drain runs after surface-reply-enforce and before the reconcile/idle hook
+    # regardless of registration order on an existing install.
+    changed = reorder_event_hook_before(
+        settings_path,
+        "Stop",
+        is_inbox_drain_hook,
+        is_session_stop_hook,
     ) or changed
 
     payload = {
@@ -846,6 +931,7 @@ def cmd_ensure_stop_hook(args: argparse.Namespace) -> int:
         "HOOK_STOP_HOOK_SUITE": "present",
         "HOOK_STOP_HOOK_MARK_IDLE": "present",
         "HOOK_STOP_HOOK_SURFACE_REPLY_ENFORCE": "present",
+        "HOOK_STOP_HOOK_INBOX_DRAIN": "present",
         "HOOK_STOP_HOOK_SESSION_STOP": "present",
         "HOOK_PROMPT_HOOK": "",
         "HOOK_COMMAND": mark_idle_command,
@@ -855,6 +941,7 @@ def cmd_ensure_stop_hook(args: argparse.Namespace) -> int:
     if args.format != "shell":
         print("stop_hook_suite: present")
         print(f"surface_reply_enforce_command: {surface_command}")
+        print(f"inbox_drain_command: {inbox_drain_command}")
         print(f"session_stop_command: {session_stop_command}")
     return 0
 

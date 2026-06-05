@@ -10,10 +10,9 @@ import sys
 
 from bridge_hook_common import (
     codex_stop_reason,
-    open_claimed_count,
+    compute_drain_decision,
     queue_attention_message,
     queue_summary,
-    top_claimed_row,
 )
 
 
@@ -41,43 +40,43 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.format == "codex":
+        # The Codex managed Stop hook (`check-inbox.py --format codex` via
+        # bridge-hooks.py) is the Codex turn-end inbox-drain. It reuses the
+        # SHARED #9780 guard in compute_drain_decision so it gets the same
+        # infinite-Stop-loop protection (per-agent marker keyed on
+        # id+status+updated_ts, consecutive cap + cooldown), the
+        # stop_hook_active short-circuit, the never-block-when-empty invariant,
+        # the atomic-persist-before-block contract, the fail-open-on-error
+        # behaviour, and the daemon double-submit suppression stamp.
+        #
+        # drain_top_actionable() inside compute_drain_decision keeps the two
+        # distinct concerns intact (#1199): queued head first (claim it), else
+        # open claimed work (continue it) — never a re-claim nudge of a
+        # just-claimed task. codex_stop_reason supplies the engine-specific
+        # instruction text over that shared guard.
         event = load_event()
-        if bool(event.get("stop_hook_active")):
+        # compute_drain_decision already fails open (returns None) on its own
+        # error paths, but a Stop hook MUST exit 0 / emit the codex "no
+        # decision" {} on ANY unexpected error — check_inbox.py main has no
+        # outer try/except, so a raise here would surface a Stop-hook error
+        # banner. Wrap so any escape degrades to the safe no-block {}.
+        try:
+            decision = compute_drain_decision(
+                agent,
+                event,
+                reason_builder=codex_stop_reason,
+            )
+        except Exception:  # noqa: BLE001 — Stop hook must never raise / nonzero
+            decision = None
+        if decision is None:
             json.dump({}, sys.stdout, ensure_ascii=False)
             sys.stdout.write("\n")
             return 0
-
-    pending, row = queue_summary(agent)
-
-    if args.format == "codex":
-        # The codex Stop hook has two distinct concerns:
-        #   1. genuinely-queued work waiting → block + "claim it" (uses the
-        #      queued-only `pending`/`row` from queue_summary).
-        #   2. open claimed work the agent holds → block + "continue it"
-        #      (issue #1199: this is NOT an ACTION REQUIRED nudge and must
-        #      not survive in the queued `pending` count, or the agent gets
-        #      re-nudged to re-claim a task it just claimed). We keep the
-        #      anti-abandonment gate via the separate claimed lookups so a
-        #      session cannot quietly end on open claimed work.
-        if pending > 0 and row is not None:
-            stop_row = row
-        else:
-            claimed_row = top_claimed_row(agent) if open_claimed_count(agent) > 0 else None
-            stop_row = claimed_row
-        if stop_row is None:
-            json.dump({}, sys.stdout, ensure_ascii=False)
-            sys.stdout.write("\n")
-            return 0
-        json.dump(
-            {
-                "decision": "block",
-                "reason": codex_stop_reason(agent, stop_row),
-            },
-            sys.stdout,
-            ensure_ascii=False,
-        )
+        json.dump(decision, sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
         return 0
+
+    pending, row = queue_summary(agent)
 
     # Text path (Claude Stop hook via mark-idle.sh): ACTION REQUIRED nudge is
     # a queued-work call-to-action only. A claimed/blocked task never fires it

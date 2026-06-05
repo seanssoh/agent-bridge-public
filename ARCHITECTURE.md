@@ -282,6 +282,51 @@ sanitization. Together with `hooks/bridge_hook_common.py` it is the
 containment/audit layer (not a sandbox — see CLAUDE.md "High-Risk
 Areas" item 5).
 
+### Stop chain + inbox auto-drain (#9780)
+
+The Claude Stop event fires a four-hook chain, in order:
+
+1. `mark-idle.sh` — idle-wake marker; also surfaces `check-inbox.py
+   --format text` as `additionalContext` only (never blocks).
+2. `surface-reply-enforce.py` — blocks when a channel-sourced user turn
+   did not get a matching `*__reply` (issue #415).
+3. `inbox-auto-drain.py` — **the #9780 turn-end inbox drain.** Emits
+   `{"decision":"block","reason":...}` to re-enter the turn and drain the
+   queue (claim → process → done) when there is genuinely-actionable work,
+   instead of going idle until an external `[Agent Bridge]` push. Placed
+   AFTER `surface-reply-enforce.py` so it can never shadow the
+   channel-reply block, and BEFORE `session-stop.py`.
+4. `session-stop.py` — transcript→daily-note reconcile (PR #449), always
+   exit-0.
+
+The Codex managed Stop hook is `check-inbox.py --format codex` (via
+`bridge-hooks.py ensure-codex-hooks`); it routes through the SAME shared
+guard so both engines share one drain implementation.
+
+The infinite-Stop-loop guard lives in
+`bridge_hook_common.compute_drain_decision`. It honours `stop_hook_active`
+(never stacks on a prior chain block), never blocks on an empty/actionless
+queue, and keys a per-agent marker
+(`<runtime-state>/<agent>/inbox-drain-state.json`, under the
+`BRIDGE_ACTIVE_AGENT_DIR` runtime state root) on `id+status+updated_ts`
+plus a consecutive counter and cooldown — so genuine progress (a
+status/timestamp change) RESETS the guard while a stuck same-state task
+cannot loop. The marker is read/initialised and **atomically persisted
+BEFORE** any `decision:block` is emitted; a queue timeout, a marker parse
+error, or a marker write failure **FAILS OPEN** (exit 0, no block) so a
+marker I/O bug can never become an infinite Stop→block→Stop loop. The
+cap/cooldown are env-overridable (`BRIDGE_STOP_DRAIN_CAP`,
+`BRIDGE_STOP_DRAIN_COOLDOWN`); `BRIDGE_STOP_DRAIN_DISABLE` is the operator
+kill-switch. On a self-continue the hook also writes a non-failure
+"attention delivered" stamp (`bridge-queue.py note-self-continue` —
+updates `agent_state.last_nudge_ts`/`last_nudge_key` for the current
+queued set WITHOUT incrementing `nudge_fail_count`) so a concurrent daemon
+ACTION REQUIRED nudge for the same window is suppressed (no double-submit).
+The queued auto-drain and the already-claimed anti-abandonment block are
+kept DISTINCT so the #1199 "queued-only ACTION REQUIRED, claimed still
+blocks stop" contract is preserved. Smoke:
+`scripts/smoke/9780-stop-inbox-drain.sh`.
+
 ### Hook config SSOT (#1068)
 
 `bridge-hooks.py` is the single source of truth for the effective
