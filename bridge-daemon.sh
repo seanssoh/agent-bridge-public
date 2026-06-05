@@ -546,6 +546,22 @@ _bridge_daemon_on_signal() {
   BRIDGE_LAST_SIGNAL="$1"
 }
 
+# Issue #1563 PR-2 — in-tick progress marker. Records the named step into
+# BRIDGE_DAEMON_LAST_STEP (the existing exit-record + audit field) AND stamps
+# the parent-side progress heartbeat (bridge_daemon_tick_progress_touch in
+# lib/bridge-daemon-control.sh). Called by cmd_sync_cycle BEFORE each long
+# bounded step so legit long work (daily_backup 600s, a2a 60s, bridge-sync
+# 30s, watchdog 30s) keeps the supervisor's progress signal FRESH and never
+# trips the max-step-budget backstop deadline (the B1 negative control).
+# Best-effort: a missing helper (lib not loaded) degrades to the bare
+# LAST_STEP assignment so a partial install still ticks.
+_bridge_daemon_mark_progress() {
+  BRIDGE_DAEMON_LAST_STEP="$1"
+  if command -v bridge_daemon_tick_progress_touch >/dev/null 2>&1; then
+    bridge_daemon_tick_progress_touch "$1" || true
+  fi
+}
+
 _bridge_daemon_on_err() {
   # Recursion guard: trap handlers that themselves fail must not retrigger.
   if (( _BRIDGE_DAEMON_IN_ERR_TRAP != 0 )); then
@@ -10915,7 +10931,12 @@ cmd_sync_cycle() {
   # than wedging on per-call retries. The next launchd-restart of the
   # daemon (from inside the source dir at boot time, or via the silence
   # watchdog) re-arms BRIDGE_SCRIPT_DIR.
-  BRIDGE_DAEMON_LAST_STEP="l1_script_dir_health"
+  # #1563 PR-2: re-baseline the supervisor progress heartbeat at the TOP of
+  # the tick (the loop-top stamp) so the per-tick child establishes its own
+  # fresh progress anchor regardless of how long the prior tick's last step
+  # took. The supervisor also seeds a baseline before forking, so this is the
+  # in-child confirmation that the tick actually started executing.
+  _bridge_daemon_mark_progress "l1_script_dir_health"
   if ! bridge_resolve_script_dir_check; then
     daemon_info "[L1] BRIDGE_SCRIPT_DIR=${BRIDGE_SCRIPT_DIR:-<unset>} is missing or invalid; helper invocations will fail-empty this tick. Re-source from a valid checkout (or run \`agb upgrade --apply\`) and the daemon will recover."
   fi
@@ -10954,7 +10975,10 @@ cmd_sync_cycle() {
   BRIDGE_DAEMON_LAST_STEP="precompact_events"
   ( process_precompact_events ) || true
 
-  BRIDGE_DAEMON_LAST_STEP="bridge_sync"
+  # #1563 PR-2: refresh the supervisor progress heartbeat right before this
+  # long bounded step (30s ceiling) so a healthy bridge-sync keeps liveness
+  # FRESH and the supervisor's max-step-budget backstop never fires on it.
+  _bridge_daemon_mark_progress "bridge_sync"
   # Refs #815 Wave B: wrap with bridge_with_timeout so a stuck child cannot
   # wedge the daemon main loop. 30s ceiling — bridge-sync.sh reconciles roster
   # + state under normal conditions in <1s; timeouts here are pathological.
@@ -11093,7 +11117,8 @@ cmd_sync_cycle() {
   # Placement: after cron_dispatch_workers (where queue maintenance is
   # done) and before nudge_agents (the cycle's last big external fanout).
   # Issue #1338 defense-in-depth: subshell-isolate (rationale above).
-  BRIDGE_DAEMON_LAST_STEP="a2a_deliver_tick"
+  # #1563 PR-2: refresh progress before the A2A deliver tick (60s ceiling).
+  _bridge_daemon_mark_progress "a2a_deliver_tick"
   ( process_a2a_deliver_tick ) || true
 
   # Issue #1262 Gap 3 (v0.15.0-beta4 Lane I): A2A outbox stuck-alert
@@ -11251,7 +11276,8 @@ cmd_sync_cycle() {
   if refresh_agent_heartbeats; then
     changed=0
   fi
-  BRIDGE_DAEMON_LAST_STEP="watchdog"
+  # #1563 PR-2: refresh progress before the watchdog scan (30s ceiling).
+  _bridge_daemon_mark_progress "watchdog"
   if process_watchdog_report; then
     changed=0
   fi
@@ -11282,7 +11308,12 @@ cmd_sync_cycle() {
   if process_usage_monitor; then
     changed=0
   fi
-  BRIDGE_DAEMON_LAST_STEP="daily_backup"
+  # #1563 PR-2: refresh progress right before the LONGEST bounded step
+  # (process_daily_backup, 600s ceiling). This is the step that defines the
+  # max-step budget; a healthy backup stamps progress here, runs under its
+  # own bridge_with_timeout, and stays comfortably inside the (600+grace)
+  # backstop deadline — the B1 negative control.
+  _bridge_daemon_mark_progress "daily_backup"
   if process_daily_backup; then
     changed=0
   fi
@@ -11849,6 +11880,17 @@ cmd_run() {
   [[ "$heartbeat_interval" =~ ^[0-9]+$ ]] || heartbeat_interval=60
   local last_heartbeat_ts=0
   local now_ts
+  # #1563 PR-2: monotonically increasing tick id stamped into the
+  # daemon_tick_deadline_exceeded audit row so a wedge is attributable to a
+  # specific tick. Also flags whether the runner-process supervisor is
+  # available (it lives in lib/bridge-daemon-control.sh); on a partial install
+  # where the lib failed to load we fall back to the legacy in-line tick so
+  # the daemon still ticks (without the backstop) rather than refusing to run.
+  local tick_id=0
+  local _tick_supervised=0
+  if command -v bridge_daemon_run_tick_supervised >/dev/null 2>&1; then
+    _tick_supervised=1
+  fi
 
   # Issue #815 Wave C: emit one initial daemon_tick + heartbeat write BEFORE
   # the first sync cycle so the post-restart healthy state is observable
@@ -11864,6 +11906,15 @@ cmd_run() {
     2>/dev/null || true
   printf '%s\n' "$now_ts" 2>/dev/null >"$BRIDGE_STATE_DIR/daemon.heartbeat" || true
   last_heartbeat_ts="$now_ts"
+
+  # #1563 PR-2 (T0 Linux backstop): announce readiness to systemd. A
+  # `Type=notify` unit waits for READY=1 before considering the daemon up; on
+  # any other launcher (launchd, bare run, Type=simple) NOTIFY_SOCKET is unset
+  # so this is a no-op. Subsequent WATCHDOG=1 pings ride the per-progress pulse
+  # in bridge_daemon_tick_progress_touch.
+  if command -v bridge_daemon_sd_notify >/dev/null 2>&1; then
+    bridge_daemon_sd_notify READY=1
+  fi
 
   while true; do
     BRIDGE_DAEMON_LAST_STEP="queue_gateway_socket_listener"
@@ -11887,11 +11938,42 @@ cmd_run() {
     BRIDGE_DAEMON_LAST_STEP="supp_groups_refresh_poll"
     bridge_daemon_supp_groups_poll_and_dispatch || true
     BRIDGE_DAEMON_LAST_STEP="sync_cycle"
-    if cmd_sync_cycle; then
-      :
+    tick_id=$(( tick_id + 1 ))
+    # #1563 PR-2 — T1 self-abort BACKSTOP. Run ONE scheduler tick as a
+    # supervised CHILD (runner-process, the codex-Q2-agreed DEFAULT). The
+    # supervisor watches the child's in-tick progress heartbeat and, if no
+    # progress is made within the max-step-budget + grace deadline, KILLs the
+    # wedged child's process group, emits `daemon_tick_deadline_exceeded`,
+    # and returns BRIDGE_DAEMON_TICK_WEDGE_RC (99) so the daemon EXITS
+    # non-zero — T0 (launchd KeepAlive / systemd Restart=always) then restarts
+    # a FRESH daemon. This is the actual #1563 "alive-but-not-ticking" wedge
+    # fix. It is safe ONLY because PR-1 singleton hardening landed: a restart
+    # cannot amplify into duplicate-daemon contention.
+    #
+    # A healthy long step (daily_backup 600s) refreshes progress around the
+    # step and completes under its own bridge_with_timeout, so the backstop
+    # never fires on it (the B1 negative control). On a partial install where
+    # the supervisor lib is missing, fall back to the legacy in-line tick.
+    if (( _tick_supervised == 1 )); then
+      if bridge_daemon_run_tick_supervised "$tick_id" cmd_sync_cycle; then
+        :
+      else
+        cycle_status=$?
+        if (( cycle_status == ${BRIDGE_DAEMON_TICK_WEDGE_RC:-99} )); then
+          daemon_log_event "tick $tick_id WEDGED (last_step=$BRIDGE_DAEMON_LAST_STEP) — self-aborting for OS-init restart (#1563)"
+          # EXIT for OS-init restart. The EXIT trap records the structured
+          # exit row; T0's KeepAlive/Restart=always brings up a fresh daemon.
+          exit "$cycle_status"
+        fi
+        daemon_log_event "sync cycle failed with exit=$cycle_status"
+      fi
     else
-      cycle_status=$?
-      daemon_log_event "sync cycle failed with exit=$cycle_status"
+      if cmd_sync_cycle; then
+        :
+      else
+        cycle_status=$?
+        daemon_log_event "sync cycle failed with exit=$cycle_status"
+      fi
     fi
     now_ts="$(date +%s)"
     if (( heartbeat_interval > 0 )) && (( now_ts - last_heartbeat_ts >= heartbeat_interval )); then

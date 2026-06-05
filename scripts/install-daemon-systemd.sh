@@ -25,11 +25,23 @@ BASH_PATH=""
 SUDO_SELF_MODE=""      # "", "force", "force-off"
 CONTROLLER_USER=""     # explicit override
 SUDO_PATH=""
+# Issue #1563 PR-2 (T0 Linux backstop): when 1, render a `Type=notify` unit
+# with `WatchdogSec` so systemd is an INDEPENDENT outer-ring restart for a
+# wedged daemon (the daemon pings WATCHDOG=1 on every progress pulse). OFF by
+# default: `Restart=always` already restarts the daemon on the T1 self-abort
+# non-zero exit, and a `Type=notify` unit that fails to deliver READY=1 in
+# time across the sudo-wrapped ExecStart would itself flap a HEALTHY daemon —
+# the exact irony PR-2 must avoid. WATCHDOG_SEC is sized well ABOVE the T1
+# deadline (max-step 600 + grace 120 = 720) so the daemon's own backstop fires
+# first and systemd is strictly the slower ring.
+WATCHDOG=0
+WATCHDOG_SEC="${BRIDGE_DAEMON_SYSTEMD_WATCHDOG_SEC:-900}"
 
 usage() {
   cat <<EOF
 Usage: $0 [--bridge-home <dir>] [--unit <service-name>] [--service-path <path>] [--log-path <path>]
        [--apply] [--enable] [--sudo-self | --no-sudo-self] [--controller-user <user>]
+       [--watchdog] [--watchdog-sec <seconds>]
 
 Without --apply, prints the systemd user unit file.
 With --apply, writes the unit to ~/.config/systemd/user (or --service-path target).
@@ -51,6 +63,16 @@ Beta20 L2 Variant 3A r4 — sudo-wrapped ExecStart:
                        automatic supp-groups refresh.
   --controller-user U  Pin the named controller user used in the sudo
                        wrapper. Defaults to \$USER / id -un.
+
+  --watchdog           (Issue #1563 PR-2) Render a Type=notify unit with
+                       WatchdogSec so systemd is an INDEPENDENT outer-ring
+                       restart for a wedged daemon. OFF by default —
+                       Restart=always already restarts on the daemon's own
+                       T1 self-abort non-zero exit; the watchdog adds a
+                       second ring only when explicitly opted in.
+  --watchdog-sec N     WatchdogSec value (implies --watchdog). Default 900s;
+                       MUST stay above the T1 deadline (max-step + grace =
+                       720s) so the daemon's own backstop fires first.
 EOF
 }
 
@@ -96,6 +118,17 @@ while [[ $# -gt 0 ]]; do
     --controller-user)
       [[ $# -lt 2 ]] && { usage; exit 1; }
       CONTROLLER_USER="$2"
+      shift 2
+      ;;
+    --watchdog)
+      # Issue #1563 PR-2: opt-in systemd Type=notify + WatchdogSec outer ring.
+      WATCHDOG=1
+      shift
+      ;;
+    --watchdog-sec)
+      [[ $# -lt 2 ]] && { usage; exit 1; }
+      WATCHDOG=1
+      WATCHDOG_SEC="$2"
       shift 2
       ;;
     -h|--help)
@@ -336,11 +369,69 @@ if [[ $SUDO_SELF_ACTIVE -eq 1 ]]; then
   # + absolute bridge_home, exact daemon `run` invocation. The sudoers
   # drop-in installed by `agent-bridge init sudoers daemon-refresh
   # --apply` authorizes this exact command (no wildcards).
-  EXEC_START_LINE="ExecStart=${SUDO_PATH} -n -u ${CONTROLLER_USER} -H --preserve-env=BRIDGE_HOME,BRIDGE_STATE_DIR,BRIDGE_LAYOUT_MARKER_DIR,BRIDGE_ROSTER_FILE,BRIDGE_ROSTER_LOCAL_FILE,BRIDGE_TASK_DB,BRIDGE_BASH_BIN -- ${BASH_PATH} ${BRIDGE_HOME_TARGET}/bridge-daemon.sh run"
+  # Issue #1563 PR-2: when the systemd watchdog is enabled, NOTIFY_SOCKET must
+  # survive the sudo hop so the wrapped `bridge-daemon.sh run` can systemd-
+  # notify READY=1/WATCHDOG=1. Append it to --preserve-env ONLY then so the
+  # default (non-watchdog) sudo ExecStart stays byte-equal to the prior shape.
+  _PRESERVE_ENV="BRIDGE_HOME,BRIDGE_STATE_DIR,BRIDGE_LAYOUT_MARKER_DIR,BRIDGE_ROSTER_FILE,BRIDGE_ROSTER_LOCAL_FILE,BRIDGE_TASK_DB,BRIDGE_BASH_BIN"
+  if (( WATCHDOG == 1 )); then
+    _PRESERVE_ENV="${_PRESERVE_ENV},NOTIFY_SOCKET"
+  fi
+  EXEC_START_LINE="ExecStart=${SUDO_PATH} -n -u ${CONTROLLER_USER} -H --preserve-env=${_PRESERVE_ENV} -- ${BASH_PATH} ${BRIDGE_HOME_TARGET}/bridge-daemon.sh run"
   REFRESH_MODE_ENV="Environment=BRIDGE_DAEMON_SYSTEMD_REFRESH_MODE=sudo-self"
 else
   EXEC_START_LINE="ExecStart=${BASH_PATH} ${BRIDGE_HOME_TARGET}/bridge-daemon.sh run"
   REFRESH_MODE_ENV=""
+fi
+
+# Issue #1563 PR-2: when --watchdog is set, render a Type=notify unit with
+# WatchdogSec so systemd is an independent outer-ring restart for a wedged
+# daemon (the daemon pings WATCHDOG=1 on every progress pulse via
+# bridge_daemon_sd_notify). Default keeps Type=simple (byte-equal legacy
+# shape) — Restart=always already restarts on the T1 self-abort non-zero exit.
+TYPE_LINE='Type=simple'
+if (( WATCHDOG == 1 )); then
+  TYPE_LINE='Type=notify'
+  [[ "$WATCHDOG_SEC" =~ ^[0-9]+$ ]] || WATCHDOG_SEC=900
+  # COUPLE the systemd watchdog to the daemon's own T1 deadline so the outer
+  # ring can never fire BEFORE the daemon's self-abort (codex #1563-PR2
+  # review). The T1 deadline = effective-max-step + grace, where the effective
+  # max-step is the MAX of the floor and EVERY operator-tunable
+  # bridge_with_timeout step ceiling reachable from cmd_sync_cycle (the SAME
+  # set as bridge_daemon_tick_resolved_max_step_seconds in
+  # lib/bridge-daemon-control.sh — mirrored here so the systemd ring tracks the
+  # full set, not only daily-backup). We recompute a conservative floor and
+  # force WatchdogSec strictly above it so systemd is always the SLOWER ring.
+  # A too-small --watchdog-sec is raised + warned rather than rendered into a
+  # flapping unit. Format: "ENV:default".
+  _T1_MAX_STEP=600
+  if [[ "${BRIDGE_DAEMON_TICK_MAX_STEP_SECONDS:-}" =~ ^[0-9]+$ ]] && (( BRIDGE_DAEMON_TICK_MAX_STEP_SECONDS > _T1_MAX_STEP )); then
+    _T1_MAX_STEP="$BRIDGE_DAEMON_TICK_MAX_STEP_SECONDS"
+  fi
+  for _knob in \
+    "BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS:600" \
+    "BRIDGE_CLAUDE_TOKEN_RECOVERY_TIMEOUT_SECONDS:60" \
+    "BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS:45" \
+    "BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS:25" \
+    "BRIDGE_CRON_SYNC_TIMEOUT:30"; do
+    _kname="${_knob%%:*}"
+    _kval="$(printf '%s' "${!_kname:-}" | tr -dc '0-9')"
+    [[ -n "$_kval" ]] || continue
+    if (( _kval > _T1_MAX_STEP )); then
+      _T1_MAX_STEP="$_kval"
+    fi
+  done
+  _T1_GRACE=120
+  if [[ "${BRIDGE_DAEMON_TICK_GRACE_SECONDS:-}" =~ ^[0-9]+$ ]]; then
+    _T1_GRACE="$BRIDGE_DAEMON_TICK_GRACE_SECONDS"
+  fi
+  _T1_DEADLINE=$(( _T1_MAX_STEP + _T1_GRACE ))
+  # systemd must sit at least one full deadline-margin above T1.
+  _WATCHDOG_FLOOR=$(( _T1_DEADLINE + _T1_GRACE ))
+  if (( WATCHDOG_SEC <= _T1_DEADLINE )); then
+    echo "[warn] --watchdog-sec ${WATCHDOG_SEC}s is at/below the daemon T1 deadline ${_T1_DEADLINE}s; raising to ${_WATCHDOG_FLOOR}s so systemd never fires before the daemon's own self-abort (#1563)." >&2
+    WATCHDOG_SEC="$_WATCHDOG_FLOOR"
+  fi
 fi
 
 # Render the unit. The optional refresh-mode env is emitted as a
@@ -355,10 +446,19 @@ UNIT_CONTENT="$(
     'Wants=network-online.target' \
     '' \
     '[Service]' \
-    'Type=simple' \
+    "$TYPE_LINE" \
     "$EXEC_START_LINE" \
     "WorkingDirectory=${BRIDGE_HOME_TARGET}" \
     "Environment=BRIDGE_HOME=${BRIDGE_HOME_TARGET}"
+  if (( WATCHDOG == 1 )); then
+    # NotifyAccess=all because the notifying process (bash bridge-daemon.sh
+    # run, possibly under the sudo-wrapped ExecStart) is not necessarily the
+    # unit's main PID. WatchdogSec is the systemd-side deadline; the daemon's
+    # own T1 backstop (max-step + grace) fires first.
+    printf '%s\n' \
+      'NotifyAccess=all' \
+      "WatchdogSec=${WATCHDOG_SEC}"
+  fi
   if [[ -n "$REFRESH_MODE_ENV" ]]; then
     printf '%s\n' "$REFRESH_MODE_ENV"
   fi
