@@ -68,6 +68,8 @@ Subcommands:
   stop               Stop <agent>'s tmux session.
   restart            Restart <agent> with channel-banner verification.
   forget-session     Clear the persisted Claude/Codex resume id.
+  set-onboarding     Set onboarding state in BOTH the HOME + workdir
+                     SESSION-TYPE.md copies atomically (#1417).
   attach             Attach to <agent>'s tmux session.
   compact            Trigger an admin-driven /compact for <agent>.
   handoff            Capture a handoff note for <agent>.
@@ -85,6 +87,7 @@ Examples:
   $(basename "$0") reclassify --apply
   $(basename "$0") rerender-settings --apply
   $(basename "$0") start reviewer --dry-run
+  $(basename "$0") set-onboarding reviewer complete
   $(basename "$0") restart reviewer --attach
   $(basename "$0") safe-mode reviewer --attach
   $(basename "$0") stop reviewer
@@ -6962,6 +6965,245 @@ run_forget_session() {
   fi
 }
 
+# _set_onboarding_atomic_copy <src> <dst>
+#
+# Copy <src> to <dst> atomically: write to a tmp sibling of <dst> then
+# rename over it (rename is atomic on the same filesystem). Codex r2
+# BLOCKING: a plain `cp -f` of HOME→workdir during the re-materialize path
+# is NOT atomic — an interruption could leave a partial/stale workdir
+# SESSION-TYPE.md after HOME was already rewritten. Returns 0 on success,
+# 1 on any IO error. `python3 -c` one-liner (no heredoc — footgun #11).
+_set_onboarding_atomic_copy() {
+  local src="$1" dst="$2"
+  [[ -n "$src" && -n "$dst" ]] || return 1
+  python3 -c '
+import os, shutil, sys, tempfile
+src, dst = sys.argv[1], sys.argv[2]
+d = os.path.dirname(dst) or "."
+try:
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".onboarding-copy-")
+    os.close(fd)
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+except OSError:
+    try:
+        os.unlink(tmp)  # noqa: F821 — only bound after mkstemp succeeds
+    except (OSError, NameError):
+        pass
+    sys.exit(1)
+' "$src" "$dst"
+}
+
+# _set_onboarding_rewrite_line <file> <new_state>
+#
+# Rewrite the single `- Onboarding State: <x>` line in <file> to <new_state>,
+# in place + atomic (write tmp, then mv). Returns 0 on a successful rewrite,
+# 2 when <file> has no onboarding-state line to rewrite (caller fails loud —
+# we never append a line a template did not author, to avoid drift), 1 on any
+# IO error. Uses `python3 -c` (a one-liner, NOT a heredoc) so it adds nothing
+# to the bridge-agent.sh heredoc ceiling (footgun #11 lint).
+_set_onboarding_rewrite_line() {
+  local file="$1" new_state="$2"
+  [[ -n "$file" && -n "$new_state" ]] || return 1
+  python3 -c '
+import os, re, sys, tempfile
+path, new_state = sys.argv[1], sys.argv[2]
+try:
+    text = open(path, encoding="utf-8").read()
+except OSError:
+    sys.exit(1)
+new_text, n = re.subn(
+    r"(^- Onboarding State:[ \t]*)([A-Za-z0-9._-]+)",
+    r"\g<1>" + new_state,
+    text,
+    count=1,
+    flags=re.MULTILINE,
+)
+if n == 0:
+    sys.exit(2)
+d = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=d, prefix=".onboarding-write-")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(new_text)
+    os.replace(tmp, path)
+except OSError:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    sys.exit(1)
+' "$file" "$new_state"
+}
+
+# run_set_onboarding <agent> <state> — issue #1417.
+#
+# Atomically set the agent's onboarding state by writing the
+# `- Onboarding State:` line in BOTH the authored HOME SESSION-TYPE.md (the
+# SSOT) AND the runtime-canonical WORKDIR copy (which the runtime reads
+# workdir-first via bridge_agent_onboarding_state). Closes the "no CLI verb,
+# hand-editing two files is the only path" gap (#1417): before this verb an
+# operator who edited only the HOME copy saw it silently no-op because the
+# workdir copy never reconciled.
+#
+# Contract:
+#   * Touches SESSION-TYPE.md ONLY — never CLAUDE.md, memory, or any
+#     watchdog/runtime state.
+#   * HOME copy (the authored SSOT) is the source of truth and is rewritten
+#     in place, line-only: we fail LOUD if the HOME SESSION-TYPE.md or its
+#     `Onboarding State:` line is absent, rather than synthesizing a line a
+#     template did not author.
+#   * WORKDIR copy is then RECONCILED to match HOME so the runtime (which
+#     reads workdir-first) sees the new value with no second hand-edit:
+#       - if it already has an onboarding line, that line is rewritten in
+#         place (line-only, like HOME);
+#       - if the workdir file is missing OR lacks the line (a half-scaffolded
+#         drift), it is (re)materialized from the just-written HOME copy so
+#         the two trees end up byte-consistent. We deliberately do NOT fail
+#         here — leaving the workdir copy stale would re-open the exact #1417
+#         drift this verb exists to close.
+#   * iso v2: the workdir copy is written through the controller-published
+#     sudo-as-iso path + chgrp, never a controller direct-write into the iso
+#     tree (CLAUDE.md iso-v2 boundary). Shared mode (home == workdir) writes a
+#     single physical copy in the HOME step above.
+_set_onboarding_usage() {
+  # Printed to STDOUT (issue #1117 universal --help gate: rc=0 + non-empty
+  # stdout). bridge_die routes usage to STDERR + rc=1, which the gate fails,
+  # so the --help path must NOT go through it.
+  printf 'Usage: %s set-onboarding <agent> <state>\n' "$(basename "$0")"
+  printf '\n'
+  printf 'Set the agent onboarding state in BOTH the HOME and workdir\n'
+  printf 'SESSION-TYPE.md copies atomically (issue #1417). Use this instead of\n'
+  printf 'hand-editing SESSION-TYPE.md — a managed-project (workdir != home)\n'
+  printf 'agent reads workdir-first, so a HOME-only edit silently no-ops.\n'
+  printf '\n'
+  printf '  <state>   onboarding state to set (e.g. complete | pending | partial;\n'
+  printf '            any [A-Za-z0-9._-]+ token the runtime parser accepts)\n'
+  printf '\n'
+  printf 'Example: %s set-onboarding reviewer complete\n' "$(basename "$0")"
+}
+
+run_set_onboarding() {
+  # #1117 universal --help gate: support -h/--help anywhere in the args with
+  # rc=0 + usage on STDOUT, BEFORE positional consumption (so the verb does
+  # not treat `--help` as the <agent> positional — the #1114 bug class).
+  local _arg
+  for _arg in "$@"; do
+    case "$_arg" in
+      -h|--help|help)
+        _set_onboarding_usage
+        return 0
+        ;;
+    esac
+  done
+
+  local agent="${1:-}"
+  local new_state="${2:-}"
+  shift 2 2>/dev/null || true
+  [[ -n "$agent" && -n "$new_state" ]] \
+    || bridge_die "Usage: $(basename "$0") set-onboarding <agent> <state>  (state: complete|pending|partial|…)"
+  [[ $# -eq 0 ]] || bridge_die "지원하지 않는 agent set-onboarding 옵션입니다: $1"
+  # The parser (bridge_agent_onboarding_state) accepts [A-Za-z0-9._-]+ — keep
+  # the verb input in the same alphabet so a set value round-trips on read.
+  [[ "$new_state" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || bridge_die "유효하지 않은 onboarding state '$new_state' (allowed: [A-Za-z0-9._-]+)"
+  bridge_require_agent "$agent"
+
+  local engine home_dir work_dir
+  engine="$(bridge_agent_engine "$agent" 2>/dev/null || printf 'claude')"
+  home_dir="$(bridge_agent_default_home "$agent" 2>/dev/null || printf '')"
+  work_dir="$(bridge_agent_workdir "$agent" 2>/dev/null || printf '')"
+  [[ -n "$home_dir" ]] || bridge_die "set-onboarding: cannot resolve home dir for '$agent'"
+
+  local home_file="$home_dir/SESSION-TYPE.md"
+  [[ -f "$home_file" ]] \
+    || bridge_die "set-onboarding: HOME SESSION-TYPE.md 가 없습니다: $home_file"
+
+  # 1) Rewrite the HOME copy (the authored SSOT) atomically.
+  local _hrc=0
+  _set_onboarding_rewrite_line "$home_file" "$new_state" || _hrc=$?
+  case "$_hrc" in
+    0) ;;
+    2) bridge_die "set-onboarding: HOME SESSION-TYPE.md 에 'Onboarding State:' 줄이 없습니다 (template drift): $home_file" ;;
+    *) bridge_die "set-onboarding: HOME SESSION-TYPE.md 쓰기 실패: $home_file" ;;
+  esac
+
+  # 2) Reconcile the WORKDIR copy. Shared mode (home == workdir) already
+  # wrote the single physical copy in step 1.
+  local wrote_workdir="no"
+  local work_file=""
+  if [[ -n "$work_dir" && "$work_dir" != "$home_dir" ]]; then
+    work_file="$work_dir/SESSION-TYPE.md"
+    local _iso_effective=0
+    if declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then
+      bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+        && _iso_effective=1
+    fi
+    if (( _iso_effective == 1 )) \
+        && declare -F bridge_isolation_write_file_as_agent_user_via_bash >/dev/null 2>&1; then
+      # Controller-published write: stream the just-updated HOME copy into
+      # the iso-owned workdir, then chgrp+chmod to ab-agent-<a> 0660.
+      local _wrc=0
+      bridge_isolation_write_file_as_agent_user_via_bash \
+        "$agent" "$work_file" "0660" < "$home_file" >/dev/null 2>&1 || _wrc=$?
+      case "$_wrc" in
+        0)
+          wrote_workdir="yes"
+          if declare -F bridge_isolation_v2_chgrp_file_iso_group >/dev/null 2>&1; then
+            bridge_isolation_v2_chgrp_file_iso_group \
+              "$agent" "$work_file" 0660 "$work_dir" >/dev/null 2>&1 || true
+          fi
+          ;;
+        2) bridge_die "set-onboarding: passwordless sudo unavailable — wrote HOME copy but could not reconcile the iso workdir copy ($work_file); restart the agent or grant sudo and retry" ;;
+        *) bridge_die "set-onboarding: iso workdir write failed (rc=$_wrc): $work_file" ;;
+      esac
+    else
+      # Non-isolated (shared-OS-user / macOS): rewrite the workdir copy in
+      # place when it exists, else materialize it from HOME. Both paths land
+      # the identical onboarding line.
+      if [[ -f "$work_file" ]]; then
+        local _w2rc=0
+        _set_onboarding_rewrite_line "$work_file" "$new_state" || _w2rc=$?
+        case "$_w2rc" in
+          0) wrote_workdir="yes" ;;
+          2)
+            # workdir copy exists but lacks the line — overwrite from HOME so
+            # both trees match (closes a half-scaffolded drift). Atomic
+            # tmp+rename so an interrupted copy can't strand a partial file.
+            _set_onboarding_atomic_copy "$home_file" "$work_file" \
+              && wrote_workdir="yes" \
+              || bridge_die "set-onboarding: workdir SESSION-TYPE.md 쓰기 실패: $work_file"
+            ;;
+          *) bridge_die "set-onboarding: workdir SESSION-TYPE.md 쓰기 실패: $work_file" ;;
+        esac
+      else
+        mkdir -p "$work_dir" 2>/dev/null || true
+        _set_onboarding_atomic_copy "$home_file" "$work_file" \
+          && wrote_workdir="yes" \
+          || bridge_die "set-onboarding: workdir SESSION-TYPE.md 생성 실패: $work_file"
+      fi
+    fi
+  fi
+
+  bridge_audit_log daemon agent_onboarding_set "$agent" \
+    --detail state="$new_state" \
+    --detail engine="$engine" \
+    --detail wrote_workdir="$wrote_workdir" >/dev/null 2>&1 || true
+
+  printf 'agent: %s\n' "$agent"
+  printf 'onboarding_state: %s\n' "$new_state"
+  printf 'home_file: %s\n' "$home_file"
+  if [[ "$wrote_workdir" == "yes" ]]; then
+    printf 'workdir_file: %s\n' "$work_file"
+  else
+    printf 'workdir_file: (shared — single copy)\n'
+  fi
+  if bridge_agent_is_active "$agent" 2>/dev/null; then
+    bridge_warn "active=yes — the running session reads its identity at launch; restart to pick up the new state if it is mid-onboarding: bridge-agent.sh restart $agent"
+  fi
+}
+
 # bridge_admin_maintenance_dispatch — issue #304 Track B common path.
 #
 # Both `agent compact` and `agent handoff` are admin-driven autonomous
@@ -7567,6 +7809,9 @@ case "$subcommand" in
   forget-session)
     run_forget_session "$@"
     ;;
+  set-onboarding)
+    run_set_onboarding "$@"
+    ;;
   attach)
     run_attach "$@"
     ;;
@@ -7582,7 +7827,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create update delete retire list registry show describe reclassify roster doctor rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
+      "create update delete retire list registry show describe reclassify roster doctor rerender-settings start safe-mode stop restart ack-crash forget-session set-onboarding attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;

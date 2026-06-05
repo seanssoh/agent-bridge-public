@@ -493,6 +493,23 @@ if [[ $WORK_DIR_PRESENT -eq 0 ]]; then
   fi
 fi
 
+# Issue #1417 — sync-on-start identity reconciliation. For a managed-project
+# agent (workdir != home) `agent create` materializes the HOME identity files
+# into the workdir once; a later hand-edit of the HOME copy never propagates,
+# so the runtime (which reads workdir-first via bridge_agent_onboarding_state)
+# silently ignores the HOME edit and onboarding can stay stuck `pending`. This
+# call re-materializes the workdir identity copies FROM HOME at every start —
+# but ONLY identity files, ONLY when HOME differs AND is the newer copy, and
+# fail-closed (it never clobbers a deliberate workdir runtime value or any
+# workdir-anchored watchdog state #1108/#1109, and never aborts the launch).
+# No-op in shared mode (workdir == home, single physical copy) and on a
+# dry-run. $WORK_DIR is passed as the explicit target so the resolution
+# matches what this launch actually uses.
+if [[ $DRY_RUN -eq 0 ]] \
+    && declare -F bridge_layout_sync_identity_from_home >/dev/null 2>&1; then
+  bridge_layout_sync_identity_from_home "$AGENT" "$ENGINE" "$WORK_DIR" || true
+fi
+
 if bridge_tmux_session_exists "$SESSION"; then
   if [[ $REPLACE -eq 1 ]]; then
     if [[ $DRY_RUN -eq 1 ]]; then
