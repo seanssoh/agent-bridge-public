@@ -798,6 +798,73 @@ def quota_recheck_due(row: dict[str, Any], reference: datetime) -> bool:
     return not any(due_values)
 
 
+def _apply_token_to_registry(
+    registry_path: Path,
+    token_id: str,
+    token: str,
+    *,
+    note: str = "",
+    activate: bool = False,
+    replace: bool = False,
+    enable_auto_rotate: bool = False,
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    """Write *token* into the locked registry under *token_id*.
+
+    Shared core for ``cmd_add`` and ``cmd_receive`` (#1367). The token
+    is already in process memory (read from ``--stdin``/``--token-file``
+    for ``add``, or echo-off from ``/dev/tty`` for ``receive``); this
+    helper performs the locked read-modify-write only. Token validation
+    is the caller's responsibility (done OUTSIDE the lock so the
+    critical section stays narrow, per PR #799 r2 codex finding 3).
+
+    Returns the result payload (``status``/``id``/``active_token_id``/
+    ``fingerprint``/``registry``). Raises ``ValueError`` on a duplicate
+    id without ``replace``.
+    """
+    with registry_lock(registry_path):
+        registry = load_registry(registry_path)
+
+        rows = token_rows(registry)
+        existing = find_token(registry, token_id)
+        timestamp = now_iso()
+        row = {
+            "id": token_id,
+            "token": token,
+            "enabled": True,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "last_activated_at": "",
+            "note": note or "",
+        }
+        if existing is not None:
+            if not replace:
+                raise ValueError(f"token id already exists: {token_id}")
+            row["created_at"] = existing.get("created_at") or timestamp
+            row["last_activated_at"] = existing.get("last_activated_at") or ""
+            rows[rows.index(existing)] = row
+        else:
+            rows.append(row)
+
+        if activate or not registry.get("active_token_id"):
+            registry["active_token_id"] = token_id
+            row["last_activated_at"] = timestamp
+        if enable_auto_rotate:
+            registry["auto_rotate_enabled"] = True
+        if threshold is not None:
+            registry["rotation_threshold"] = validate_threshold(threshold)
+
+        save_registry(registry_path, registry)
+
+    return {
+        "status": "added" if existing is None else "replaced",
+        "id": token_id,
+        "active_token_id": registry.get("active_token_id") or "",
+        "fingerprint": token_fingerprint(token),
+        "registry": str(registry_path),
+    }
+
+
 def cmd_add(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
@@ -811,49 +878,19 @@ def cmd_add(args: argparse.Namespace) -> int:
         return fail(str(exc), json_mode)
 
     try:
-        with registry_lock(registry_path):
-            registry = load_registry(registry_path)
-
-            rows = token_rows(registry)
-            existing = find_token(registry, args.id)
-            timestamp = now_iso()
-            row = {
-                "id": args.id,
-                "token": token,
-                "enabled": True,
-                "created_at": timestamp,
-                "updated_at": timestamp,
-                "last_activated_at": "",
-                "note": args.note or "",
-            }
-            if existing is not None:
-                if not args.replace:
-                    return fail(f"token id already exists: {args.id}", json_mode)
-                row["created_at"] = existing.get("created_at") or timestamp
-                row["last_activated_at"] = existing.get("last_activated_at") or ""
-                rows[rows.index(existing)] = row
-            else:
-                rows.append(row)
-
-            if args.activate or not registry.get("active_token_id"):
-                registry["active_token_id"] = args.id
-                row["last_activated_at"] = timestamp
-            if args.enable_auto_rotate:
-                registry["auto_rotate_enabled"] = True
-            if args.threshold is not None:
-                registry["rotation_threshold"] = validate_threshold(args.threshold)
-
-            save_registry(registry_path, registry)
+        payload = _apply_token_to_registry(
+            registry_path,
+            args.id,
+            token,
+            note=args.note or "",
+            activate=bool(args.activate),
+            replace=bool(args.replace),
+            enable_auto_rotate=bool(args.enable_auto_rotate),
+            threshold=args.threshold,
+        )
     except Exception as exc:
         return fail(str(exc), json_mode)
 
-    payload = {
-        "status": "added" if existing is None else "replaced",
-        "id": args.id,
-        "active_token_id": registry.get("active_token_id") or "",
-        "fingerprint": token_fingerprint(token),
-        "registry": str(registry_path),
-    }
     if json_mode:
         json_dump(payload)
     else:
@@ -2949,6 +2986,379 @@ def _cleanup_codex_backup(backup_path: Path) -> None:
         pass
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Sealed-paste operator-terminal receive (#1367).
+#
+# #1358 closed the tactical scope: the admin agent runs `bash
+# bridge-auth.sh claude-token add --stdin …` and the operator pastes the
+# raw OAuth token into the agent's Bash tool. The audit row is redacted,
+# but the admin agent's TRANSCRIPT/tool-input is NOT — so the raw token
+# lands in the admin transcript.
+#
+# `receive` is the root path (codex-agreed Option B): the echo-off read
+# happens in the OPERATOR's terminal process via `/dev/tty`, NEVER inside
+# an agent process. The token exists only in this process's memory and
+# then in the intended 0600 registry output. It is never an argv, env
+# var, queue body, audit detail, note text, prompt text, or named
+# temp file. Fail CLOSED when there is no controlling TTY — never
+# downgrade to stdin/argv/env/file input.
+#
+# `receive --request` is the token-FREE admin-agent UX: an admin agent
+# can INITIATE the flow (emit a pending request id + nonce + requested
+# agents) without ever touching the token. The operator terminal later
+# fulfills that request id with the echo-off read.
+
+SEALED_RECEIVE_PROMPT = (
+    "paste your Claude OAuth token (input will NOT echo and will NOT be "
+    "logged), then press Enter: "
+)
+
+
+def _sealed_receive_audit(action: str, detail: dict[str, Any]) -> None:
+    """Best-effort redacted audit row for the sealed-paste path (#1367).
+
+    Routes through the hooks' ``write_audit`` choke-point (which runs the
+    SSOT credential redactor over the detail dict) so a sealed-receive
+    audit row inherits the same token-value scrub as every PreToolUse /
+    PostToolUse row. The detail must already be token-free by
+    construction here (id, safe flags, fingerprint tail, redacted
+    summary only); the choke-point is belt-and-suspenders.
+
+    Lazy import of the hooks module keeps the rest of bridge-auth.py
+    free of a hard dependency on the hooks dir, and a missing/unusable
+    audit sink NEVER blocks the registry write — the operator-side
+    receive must not fail because an audit append could not be made.
+    """
+    try:
+        hooks_dir = ROOT / "hooks"
+        if str(hooks_dir) not in sys.path:
+            sys.path.insert(0, str(hooks_dir))
+        from bridge_hook_common import write_audit as _write_audit  # type: ignore
+
+        target = (
+            os.environ.get("BRIDGE_AGENT_ID", "").strip()  # noqa: iso-helper-boundary - controller-side audit-target label for the operator-run receive
+            or os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()  # noqa: iso-helper-boundary - controller-side audit-target label fallback
+            or "operator"
+        )
+        _write_audit(action, target, detail)
+    except Exception:  # noqa: BLE001 - audit emit is best-effort, never fatal
+        pass
+
+
+def read_token_from_controlling_tty(prompt: str = SEALED_RECEIVE_PROMPT) -> str:
+    """Read a token echo-off from the controlling terminal (#1367).
+
+    Opens ``/dev/tty`` directly (NOT stdin) so the read provably happens
+    in the operator's terminal process. Echo is disabled via ``termios``
+    for the duration of the read; the prompt is written to the tty, not
+    to stdout (so a captured stdout never contains the prompt either).
+
+    Fails CLOSED — raises ``RuntimeError`` — when there is no controlling
+    terminal (``/dev/tty`` cannot be opened or is not a tty). The caller
+    MUST NOT downgrade to stdin/argv/env/file on this failure; that is the
+    whole point of the sealed path.
+    """
+    import termios
+
+    try:
+        tty_fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError as exc:
+        raise RuntimeError(
+            "no controlling terminal — run `receive` from an operator "
+            "terminal (the token read needs an interactive tty and will "
+            f"not fall back to stdin/argv/env/file): {exc}"
+        ) from exc
+
+    # Raw fd I/O only — a tty is not seekable, so `os.fdopen` with a
+    # buffered text wrapper fails. We prompt + read echo-off directly on
+    # the fd. The token bytes live only in this frame's local.
+    old_attrs = None
+    try:
+        if not os.isatty(tty_fd):
+            raise RuntimeError(
+                "/dev/tty is not a terminal — run `receive` from an "
+                "interactive operator terminal"
+            )
+        old_attrs = termios.tcgetattr(tty_fd)
+        new_attrs = list(old_attrs)
+        # lflags index 3: clear ECHO so the token is not displayed.
+        new_attrs[3] = new_attrs[3] & ~termios.ECHO
+        termios.tcsetattr(tty_fd, termios.TCSADRAIN, new_attrs)
+        os.write(tty_fd, prompt.encode("utf-8", errors="replace"))
+        # Read one line (up to a newline) byte-by-byte so we stop exactly
+        # at the operator's Enter without slurping anything beyond it.
+        chunks: list[bytes] = []
+        while True:
+            ch = os.read(tty_fd, 1)
+            if not ch or ch in (b"\n", b"\r"):
+                break
+            chunks.append(ch)
+        raw = b"".join(chunks)
+    finally:
+        if old_attrs is not None:
+            try:
+                termios.tcsetattr(tty_fd, termios.TCSADRAIN, old_attrs)
+                # Echo the newline the operator typed (it was suppressed).
+                os.write(tty_fd, b"\n")
+            except Exception:  # noqa: BLE001
+                pass
+        os.close(tty_fd)
+
+    token = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+    validate_token(token)
+    return token
+
+
+def cmd_receive(args: argparse.Namespace) -> int:
+    """Sealed-paste operator-terminal token receive (#1367).
+
+    Two shapes:
+      * ``receive --request`` — token-FREE: emit a pending request record
+        (id, safe flags, nonce, requested agents). No token is read or
+        touched. An admin agent may run this to initiate the flow.
+      * ``receive --id <id> [flags]`` — operator-terminal echo-off read
+        from ``/dev/tty``; writes through the existing locked-registry
+        add path. Fails closed with no controlling tty.
+    """
+    json_mode = bool(args.json)
+    registry_path = Path(args.registry).expanduser()
+
+    if args.request:
+        return _cmd_receive_request(args, registry_path, json_mode)
+
+    # ── operator-terminal echo-off receive ──────────────────────────
+    if not args.id:
+        return fail("receive requires --id <id> (or --request)", json_mode)
+    try:
+        validate_token_id(args.id)
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+
+    request_record: dict[str, Any] | None = None
+    if args.fulfill:
+        try:
+            request_record = _load_and_consume_request(registry_path, args.fulfill)
+        except Exception as exc:
+            return fail(str(exc), json_mode)
+
+    try:
+        token = read_token_from_controlling_tty()
+    except RuntimeError as exc:
+        # Fail closed — NO token read, nothing written anywhere.
+        _sealed_receive_audit(
+            "tool_policy_credential_sealed_receive_failed",
+            {
+                "surface": "sealed_paste_receive",
+                "id": args.id,
+                "reason": "no_controlling_tty",
+            },
+        )
+        return fail(str(exc), json_mode)
+    except Exception as exc:
+        # validate_token / termios error — the token never reached the
+        # registry. The message from validate_token is generic (e.g.
+        # "token is too short"); it never echoes the token value.
+        return fail(str(exc), json_mode)
+
+    try:
+        result = _apply_token_to_registry(
+            registry_path,
+            args.id,
+            token,
+            note=args.note or "",
+            activate=bool(args.activate),
+            replace=bool(args.replace),
+            enable_auto_rotate=bool(args.enable_auto_rotate),
+            threshold=args.threshold,
+        )
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+    finally:
+        # Drop the token reference promptly; Python cannot zero the bytes
+        # but we minimise the window it stays bound in this frame.
+        token = ""
+
+    # Audit: redacted-only. The fingerprint is the SAME forensic anchor
+    # the registry stores (sha256 prefix + 4-char tail), never the raw
+    # token. The summary is a fixed-shape redacted record.
+    _sealed_receive_audit(
+        "tool_policy_credential_sealed_receive",
+        {
+            "surface": "sealed_paste_receive",
+            "id": result["id"],
+            "status": result["status"],
+            "fingerprint": result["fingerprint"],
+            "activated": result["active_token_id"] == result["id"],
+            "fulfilled_request": (request_record or {}).get("request_id", ""),
+            "summary": (
+                f"sealed receive: id={result['id']} status={result['status']} "
+                f"fingerprint={result['fingerprint']}"
+            ),
+        },
+    )
+
+    payload = {
+        "status": result["status"],
+        "id": result["id"],
+        "active_token_id": result["active_token_id"],
+        "fingerprint": result["fingerprint"],
+        "registry": result["registry"],
+        "delivery": "sealed_paste_receive",
+    }
+    if request_record is not None:
+        payload["fulfilled_request"] = request_record.get("request_id", "")
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(
+            f"sealed receive: {result['status']} {result['id']} "
+            f"({result['fingerprint']})"
+        )
+    return 0
+
+
+def sealed_request_dir(registry_path: Path) -> Path:
+    """Directory holding token-FREE pending sealed-receive requests.
+
+    Sibling to the registry so it inherits the controller-owned, 0700
+    secrets-dir contract. The request records carry NO token, but they
+    are controller-owned/restricted regardless (they name agent ids and
+    a nonce).
+    """
+    return registry_path.expanduser().parent / "sealed-receive-requests"
+
+
+def _write_sealed_request_record(
+    registry_path: Path, record: dict[str, Any]
+) -> Path:
+    request_dir = sealed_request_dir(registry_path)
+    request_dir.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only - controller secrets-dir sibling of the registry
+    os.chmod(request_dir, 0o700)
+    path = request_dir / f"{record['request_id']}.json"
+    text = json.dumps(record, ensure_ascii=True, indent=2) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=".sealed-req.", suffix=".tmp", dir=str(request_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+        os.chmod(path, 0o600)
+        tmp_name = ""
+    finally:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)  # noqa: raw-pathlib-controller-only - controller-side tempfile cleanup in the secrets dir
+            except FileNotFoundError:
+                pass
+    return path
+
+
+def _cmd_receive_request(
+    args: argparse.Namespace, registry_path: Path, json_mode: bool
+) -> int:
+    """Emit a token-FREE pending sealed-receive request (#1367)."""
+    if not args.id:
+        return fail("receive --request requires --id <id>", json_mode)
+    try:
+        validate_token_id(args.id)
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+
+    agents = ""
+    if args.agents is not None:
+        agents = str(args.agents).strip()
+        # The request record only carries safe slug/csv values. Reject any
+        # shell-metachar so the record stays a clean data file.
+        if agents and not re.match(r"^[A-Za-z0-9_.,-]+$", agents):
+            return fail("--agents must be a safe slug/csv", json_mode)
+
+    request_id = uuid.uuid4().hex
+    nonce = uuid.uuid4().hex
+    record = {
+        "request_id": request_id,
+        "id": args.id,
+        "nonce": nonce,
+        "agents": agents,
+        "activate": bool(args.activate),
+        "enable_auto_rotate": bool(args.enable_auto_rotate),
+        "replace": bool(args.replace),
+        "created_at": now_iso(),
+        "status": "pending",
+    }
+    try:
+        path = _write_sealed_request_record(registry_path, record)
+    except Exception as exc:
+        return fail(f"cannot write sealed request record: {exc}", json_mode)
+
+    _sealed_receive_audit(
+        "tool_policy_credential_sealed_request",
+        {
+            "surface": "sealed_paste_request",
+            "id": args.id,
+            "request_id": request_id,
+            "agents": agents,
+            "summary": (
+                f"sealed request: id={args.id} request_id={request_id} "
+                f"agents={agents or '(default)'}"
+            ),
+        },
+    )
+
+    payload = {
+        "status": "pending",
+        "request_id": request_id,
+        "id": args.id,
+        "nonce": nonce,
+        "agents": agents,
+        "activate": bool(args.activate),
+        "enable_auto_rotate": bool(args.enable_auto_rotate),
+        "replace": bool(args.replace),
+        "record": str(path),
+        "delivery": "sealed_paste_request",
+        "next": (
+            "operator: run `bridge-auth.sh claude-token receive "
+            f"--id {args.id} --fulfill {request_id}` from an operator terminal"
+        ),
+    }
+    # The request is token-free, so JSON is always safe to emit even when
+    # the admin agent requested it (this is the whole point — the agent
+    # observes only the redacted request shape).
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(
+            f"sealed request pending: id={args.id} request_id={request_id}"
+        )
+    return 0
+
+
+def _load_and_consume_request(
+    registry_path: Path, request_id: str
+) -> dict[str, Any]:
+    """Load + remove a pending sealed-receive request by id (#1367).
+
+    The fulfill path is operator-driven; this only reconciles the
+    request id so the audit row can link request → receive. The token is
+    NEVER stored in the request record, so nothing secret is read here.
+    """
+    if not re.match(r"^[0-9a-f]{32}$", str(request_id or "")):
+        raise ValueError("invalid request id")
+    path = sealed_request_dir(registry_path) / f"{request_id}.json"
+    if not path.is_file():  # noqa: raw-pathlib-controller-only - controller secrets-dir request probe
+        raise ValueError(f"no pending sealed request: {request_id}")
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"cannot parse sealed request {request_id}: {exc}") from exc
+    try:
+        path.unlink()  # noqa: raw-pathlib-controller-only - controller-side consume of the token-free request record
+    except OSError:
+        pass
+    return record if isinstance(record, dict) else {}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--registry", required=True)
@@ -2967,6 +3377,31 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser.add_argument("--agents", help=argparse.SUPPRESS)
     add_parser.add_argument("--json", action="store_true")
     add_parser.set_defaults(handler=cmd_add)
+
+    # #1367 — sealed-paste operator-terminal receive. NOTE: there is NO
+    # --stdin / --token-file here by design — the ONLY token source is the
+    # echo-off read from the controlling tty. A token-FREE request shape
+    # (`receive --request`) lets an admin agent initiate the flow.
+    receive_parser = sub.add_parser("receive")
+    receive_parser.add_argument("--id")
+    receive_parser.add_argument(
+        "--request",
+        action="store_true",
+        help="emit a token-FREE pending request record (admin-agent UX) and exit",
+    )
+    receive_parser.add_argument(
+        "--fulfill",
+        default=None,
+        help="reconcile a pending request id created by --request",
+    )
+    receive_parser.add_argument("--activate", action="store_true")
+    receive_parser.add_argument("--replace", action="store_true")
+    receive_parser.add_argument("--note", default="")
+    receive_parser.add_argument("--enable-auto-rotate", action="store_true")
+    receive_parser.add_argument("--threshold", type=float)
+    receive_parser.add_argument("--agents", default=None)
+    receive_parser.add_argument("--json", action="store_true")
+    receive_parser.set_defaults(handler=cmd_receive)
 
     list_parser = sub.add_parser("list")
     list_parser.add_argument("--json", action="store_true")
