@@ -214,6 +214,38 @@ bridge_secret_scrub_capture() {
   return 0
 }
 
+# ── Codex ambient-key scrub (#1470 Phase 2, Q6) ──────────────────────
+# The Codex fleet-sync model delivers the subscription `auth.json` as a
+# FILE the `codex` binary reads from CODEX_HOME — NEVER as an ambient env
+# var. So for a MANAGED Codex agent the OpenAI-key env var and the Codex-
+# access-token env var must be actively REMOVED from the child env before
+# the agent process forks (defense against a stale/foreign ambient key
+# silently overriding the bridge-delivered file login). These two helpers
+# mirror the Claude capture/restore above but for the Codex var names; the
+# bridge-run.sh launch path scrubs unconditionally at process entry and
+# restores ONLY for an explicitly unmanaged/operator-owned Codex run.
+#
+# Var names (fleet-credential-design.md §6/Q6): OPENAI_API_KEY (the API-key
+# login env override) + CODEX_ACCESS_TOKEN (the subscription access-token
+# env override). NEVER logged.
+bridge_secret_scrub_capture_codex() {
+  local _openai_var="${1:-}" _codex_token_var="${2:-}"
+  [[ -n "$_openai_var" && -n "$_codex_token_var" ]] || return 2
+  printf -v "$_openai_var" '%s' "${OPENAI_API_KEY:-}"
+  printf -v "$_codex_token_var" '%s' "${CODEX_ACCESS_TOKEN:-}"
+  unset OPENAI_API_KEY CODEX_ACCESS_TOKEN 2>/dev/null || true
+  return 0
+}
+
+bridge_secret_scrub_restore_codex() {
+  local _openai_var="${1:-}" _codex_token_var="${2:-}"
+  [[ -n "$_openai_var" && -n "$_codex_token_var" ]] || return 2
+  local _openai="${!_openai_var:-}" _codex_token="${!_codex_token_var:-}"
+  [[ -n "$_openai" ]] && export OPENAI_API_KEY="$_openai"
+  [[ -n "$_codex_token" ]] && export CODEX_ACCESS_TOKEN="$_codex_token"
+  return 0
+}
+
 # Restore the three captured values back into the well-known env names (only
 # when non-empty). Builtin-only, no fork.
 bridge_secret_scrub_restore() {

@@ -22,6 +22,10 @@ Usage:
   bash $SCRIPT_DIR/bridge-auth.sh claude-token mark-quota <id> [--reset-at <iso>] [--retry-seconds <sec>] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token recover-due [--timeout <sec>] [--retry-seconds <sec>] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token auto-rotate <enable|disable|status> [--threshold 99] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh codex-cred register --source <agent> [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh codex-cred source [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh codex-cred sync [--agents static|all|csv] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh codex-cred verify --file <path> [--json]
 EOF
 }
 
@@ -678,6 +682,358 @@ PY
   return "$rc"
 }
 
+# ─────────────────────────────────────────────────────────────────────
+# Codex fleet-sync adapter (#1470 Phase 2, #1467).
+#
+# The operator manually `codex login`s on ONE designated source Codex
+# agent; the bridge propagates that source's `<home>/.codex/auth.json`
+# write-through to every managed Codex agent (INCLUDING Linux iso v2
+# homes) so a fleet of Codex agents shares the one subscription without
+# each logging in. There is no rotation/registry/failover — Codex auth is
+# a single subscription the `codex` binary self-refreshes in place.
+#
+# Security contracts (codex-agreed, fleet-credential-design.md §6/§7):
+#   Q1 source binding — configurable + admin/controller-owned, persisted
+#     in protected state (bridge-auth.py codex-register), validated here
+#     as an existing, non-stopped Codex agent. Default to `<admin>-dev`
+#     when it exists and is a Codex agent. NOT env-overridable.
+#   §6.6 delivery — write-through copy via write_private_file_atomic
+#     (0600, chown-before-replace), NEVER a symlink. iso dest owner
+#     agent-bridge-<a>:ab-agent-<a>; a failed iso write fails loud.
+#   §6.3 iso source read — a 0600 source auth.json owned by an iso UID is
+#     read via `sudo -n -u <owner> cat`; if that fails → FAIL LOUD, no
+#     world-readable fallback.
+
+BRIDGE_AUTH_CODEX_ENGINE="codex"
+
+# bridge_auth_codex_source_binding [--quiet]
+#
+# Resolve the configured Codex source agent. Precedence:
+#   1. The persisted binding (bridge-auth.py codex-source) — the operator-
+#      registered source (Q1: protected state, NOT env-overridable).
+#   2. The documented `<admin>-dev` co-located codex pair when it exists
+#      and is a Codex agent (a sensible default, still persisted on first
+#      register so it is auditable).
+# Prints the resolved source agent on stdout (empty if none). Never reads
+# an env override — the source is operator-owned, not caller-overridable.
+bridge_auth_codex_source_binding() {
+  local persisted=""
+  # `codex-source` (no --json) prints the bare source agent name, or the
+  # literal "(no codex source configured)" placeholder when unset.
+  persisted="$(python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$(bridge_auth_registry_path)" \
+    codex-source 2>/dev/null || true)"
+  case "$persisted" in
+    ""|"(no codex source configured)") persisted="" ;;
+  esac
+  if [[ -n "$persisted" ]]; then
+    printf '%s' "$persisted"
+    return 0
+  fi
+  # Default candidate: the admin's `<admin>-dev` codex pair, if present.
+  local admin=""
+  admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  if [[ -n "$admin" ]]; then
+    local candidate="${admin}-dev"
+    if bridge_agent_exists "$candidate" \
+        && [[ "$(bridge_agent_engine "$candidate")" == "$BRIDGE_AUTH_CODEX_ENGINE" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  fi
+  printf ''
+  return 0
+}
+
+# bridge_auth_codex_validate_source <agent>
+#
+# Validate a candidate Codex source agent (Q1): must exist, be a Codex
+# engine agent, and not be in a stopped/broken state. Returns 0 on
+# success, 1 with an [error] on stderr otherwise.
+bridge_auth_codex_validate_source() {
+  local agent="$1"
+  [[ -n "$agent" ]] || {
+    printf '[error] codex source: empty agent name\n' >&2
+    return 1
+  }
+  bridge_agent_exists "$agent" || {
+    printf '[error] codex source: unknown agent: %s\n' "$agent" >&2
+    return 1
+  }
+  [[ "$(bridge_agent_engine "$agent")" == "$BRIDGE_AUTH_CODEX_ENGINE" ]] || {
+    printf '[error] codex source: %s is not a Codex agent\n' "$agent" >&2
+    return 1
+  }
+  # Stopped/quarantined check: a broken-launch marker means the agent's
+  # last launches failed — refuse to bind a dead source so the fleet does
+  # not pin a credential from an agent that may never have logged in.
+  local broken=""
+  if declare -F bridge_agent_broken_launch_file >/dev/null 2>&1; then
+    broken="$(bridge_agent_broken_launch_file "$agent" 2>/dev/null || true)"
+    if [[ -n "$broken" && -f "$broken" ]]; then
+      printf '[error] codex source: %s is in a broken-launch (stopped) state — refusing to bind a stopped source\n' "$agent" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# bridge_auth_codex_read_source_auth <source_agent> <out_file>
+#
+# Read the source agent's `.codex/auth.json` into <out_file> (a controller-
+# owned 0600 tempfile). Honors the iso boundary (§6.3): an iso-owned 0600
+# source is read via `sudo -n -u <owner> cat`; if the direct read AND the
+# sudo fallback both fail → FAIL LOUD (return 1), never a world-readable
+# fallback. The caller then passes <out_file> as --source-file to Python.
+bridge_auth_codex_read_source_auth() {
+  local source_agent="$1"
+  local out_file="$2"
+  local user_home=""
+  local src_path=""
+  local os_user=""
+  user_home="$(bridge_auth_resolved_user_home_for_agent "$source_agent" 2>/dev/null || true)"
+  [[ -n "$user_home" ]] || {
+    printf '[error] codex source: cannot resolve home for %s\n' "$source_agent" >&2
+    return 1
+  }
+  src_path="$user_home/$(bridge_auth_engine_cred_file_tail "$source_agent" "$BRIDGE_AUTH_CODEX_ENGINE")"
+  # codex r1 BLOCKING: an ISO source must be read STRICTLY owner-mediated.
+  # The earlier draft did a controller direct `cat` FIRST, which would
+  # succeed on a world-readable / controller-readable iso source and thereby
+  # bypass the intended `sudo -n -u <owner> cat` boundary (and silently
+  # accept a wrongly-permissive source). Branch on isolation up front:
+  #   - ISO source  → ONLY `sudo -n -u <owner> cat`; if that fails, FAIL LOUD.
+  #   - shared mode → controller direct `cat` (same UID; no boundary to cross).
+  if bridge_agent_linux_user_isolation_effective "$source_agent" 2>/dev/null; then
+    os_user="$(bridge_agent_os_user "$source_agent" 2>/dev/null || true)"
+    [[ -n "$os_user" ]] || {
+      printf '[error] codex source: cannot resolve iso os_user for %s\n' "$source_agent" >&2
+      return 1
+    }
+    # SC2024 is INTENTIONAL: only the `cat` READ needs the iso UID's
+    # privilege; the `>"$out_file"` redirect stays as the CONTROLLER so the
+    # snapshot lands in the controller-owned 0600 tempfile (the documented
+    # body-file pattern). A `sudo … | tee` would run tee as the controller
+    # anyway, with no security gain.
+    # shellcheck disable=SC2024  # redirect-as-controller into the 0600 tempfile is the intended ownership
+    if sudo -n -u "$os_user" cat "$src_path" >"$out_file" 2>/dev/null && [[ -s "$out_file" ]]; then
+      chmod 0600 "$out_file" 2>/dev/null || true
+      return 0
+    fi
+    # FAIL LOUD — no insecure fallback (§6.3). Never a world-readable copy.
+    : >"$out_file" 2>/dev/null || true   # ensure no partial/secret bytes linger
+    printf '[error] codex source: iso source %s for %s unreadable via sudo -n -u %s cat — fail loud, no fallback\n' \
+      "$src_path" "$source_agent" "$os_user" >&2
+    return 1
+  fi
+  # Shared-mode source: controller and agent are the same UID — a direct
+  # read crosses no boundary. chmod 0600 on the controller-owned tempfile.
+  if cat "$src_path" >"$out_file" 2>/dev/null && [[ -s "$out_file" ]]; then
+    chmod 0600 "$out_file" 2>/dev/null || true
+    return 0
+  fi
+  : >"$out_file" 2>/dev/null || true
+  printf '[error] codex source: cannot read shared-mode source %s for %s\n' \
+    "$src_path" "$source_agent" >&2
+  return 1
+}
+
+# bridge_auth_codex_selected_agents <spec>
+#
+# Codex fleet selector (mirrors bridge_auth_selected_agents but filters to
+# the Codex engine). `static` → static Codex agents; `all`/`codex` → every
+# Codex agent; csv → explicit Codex agents. The configured source is
+# included only if explicitly named — by default the source is NOT a sync
+# DESTINATION (it is the source of truth; re-writing it would clobber the
+# operator's live login). The caller (sync driver) excludes the source.
+bridge_auth_codex_selected_agents() {
+  local spec="${1:-static}"
+  local agent=""
+  local item=""
+  local -a explicit=()
+  local engine="$BRIDGE_AUTH_CODEX_ENGINE"
+  case "$spec" in
+    static|"")
+      for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+        [[ "$(bridge_agent_engine "$agent")" == "$engine" ]] || continue
+        [[ "$(bridge_agent_source "$agent")" == "static" ]] || continue
+        printf '%s\n' "$agent"
+      done
+      ;;
+    all|codex)
+      for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+        [[ "$(bridge_agent_engine "$agent")" == "$engine" ]] || continue
+        printf '%s\n' "$agent"
+      done
+      ;;
+    *)
+      IFS=',' read -r -a explicit <<<"$spec"
+      for item in "${explicit[@]}"; do
+        item="${item#"${item%%[![:space:]]*}"}"
+        item="${item%"${item##*[![:space:]]}"}"
+        [[ -n "$item" ]] || continue
+        bridge_agent_exists "$item" || {
+          printf '[error] unknown agent: %s\n' "$item" >&2
+          return 1
+        }
+        [[ "$(bridge_agent_engine "$item")" == "$engine" ]] || {
+          printf '[error] agent is not a Codex agent: %s\n' "$item" >&2
+          return 1
+        }
+        printf '%s\n' "$item"
+      done
+      ;;
+  esac
+}
+
+# bridge_auth_codex_sync_one <source_file> <dest_agent>
+#
+# Write-through the already-read source auth bytes (<source_file>) into one
+# Codex dest agent's `.codex/auth.json`, resolving the dest's iso owner so
+# Python chowns-before-replace at 0600. Prints the inner JSON on stdout.
+bridge_auth_codex_sync_one() {
+  local source_file="$1"
+  local dest_agent="$2"
+  local dest_home=""
+  local dest_file=""
+  local os_user=""
+  local owner_uid=""
+  local owner_gid=""
+  local -a owner_args=()
+
+  dest_home="$(bridge_auth_resolved_user_home_for_agent "$dest_agent" 2>/dev/null || true)"
+  [[ -n "$dest_home" ]] || {
+    printf '[error] codex dest: cannot resolve home for %s\n' "$dest_agent" >&2
+    return 1
+  }
+  dest_file="$dest_home/$(bridge_auth_engine_cred_file_tail "$dest_agent" "$BRIDGE_AUTH_CODEX_ENGINE")"
+
+  if bridge_agent_linux_user_isolation_effective "$dest_agent" 2>/dev/null; then
+    os_user="$(bridge_agent_os_user "$dest_agent" 2>/dev/null || true)"
+    if [[ -n "$os_user" ]]; then
+      owner_uid="$(id -u "$os_user" 2>/dev/null || true)"
+      owner_gid="$(id -g "$os_user" 2>/dev/null || true)"
+      [[ -n "$owner_uid" ]] && owner_args+=(--owner-uid "$owner_uid")
+      [[ -n "$owner_gid" ]] && owner_args+=(--owner-gid "$owner_gid")
+    fi
+    # The iso dest's .codex dir must exist + be owned by the iso UID before
+    # the privileged write. Reuse the prepare-dir contract; Python's
+    # chown-before-replace lands the file owner-correct.
+    bridge_linux_sudo_root mkdir -p "$(dirname "$dest_file")" 2>/dev/null || true
+    # codex r1 BLOCKING: pass --allowed-root so Python's _ensure_claude_dir_safe
+    # rejects a symlinked PARENT (.codex) that would redirect the privileged
+    # write out of the agent home (the final-name symlink check alone is not
+    # enough — the atomic writer replaces THROUGH the parent dir).
+    bridge_linux_sudo_root python3 "$SCRIPT_DIR/bridge-auth.py" \
+      --registry "$(bridge_auth_registry_path)" codex-sync \
+      --agent "$dest_agent" --source-file "$source_file" --file "$dest_file" \
+      --engine "$BRIDGE_AUTH_CODEX_ENGINE" "${owner_args[@]}" \
+      --allowed-root "$dest_home" --json
+    return $?
+  fi
+  # Non-isolated: caller UID already owns the dest home. Still pass
+  # --allowed-root so the symlinked-parent reject applies on dev installs too.
+  mkdir -p "$(dirname "$dest_file")" 2>/dev/null || true
+  python3 "$SCRIPT_DIR/bridge-auth.py" \
+    --registry "$(bridge_auth_registry_path)" codex-sync \
+    --agent "$dest_agent" --source-file "$source_file" --file "$dest_file" \
+    --engine "$BRIDGE_AUTH_CODEX_ENGINE" --allowed-root "$dest_home" --json
+}
+
+# bridge_auth_codex_sync_agents <spec> <json_mode>
+#
+# Drive the full Codex fleet sync: resolve + validate the source, read its
+# auth.json (iso-aware), then write-through to every selected Codex agent
+# EXCEPT the source itself. The source bytes live ONLY in a controller-
+# owned 0600 tempfile, removed on exit.
+bridge_auth_codex_sync_agents() {
+  local spec="${1:-static}"
+  local json_mode="${2:-0}"
+  local source_agent=""
+  local source_file=""
+  local selection=""
+  local rc=0
+  local -a agents=()
+  local -a synced=()
+  local -a unchanged=()
+  local -a failed=()
+
+  source_agent="$(bridge_auth_codex_source_binding)"
+  if [[ -z "$source_agent" ]]; then
+    if [[ "$json_mode" == "1" ]]; then
+      printf '%s\n' '{"status":"skipped","reason":"no_codex_source_configured","synced":[],"failed":[]}'
+    else
+      printf 'skipped: no codex source configured (run: agent-bridge auth codex-cred register --source <agent>)\n' >&2
+    fi
+    return 0
+  fi
+  if ! bridge_auth_codex_validate_source "$source_agent"; then
+    if [[ "$json_mode" == "1" ]]; then
+      printf '{"status":"failed","reason":"source_invalid","source_agent":"%s","synced":[],"failed":[]}\n' "$source_agent"
+    fi
+    return 1
+  fi
+
+  # codex r1 BLOCKING: the source tempfile carries the live subscription
+  # secret. The earlier draft fell back to a PREDICTABLE
+  # `/tmp/agb-codex-src.$$.$RANDOM` path on mktemp failure and chmod'd
+  # AFTER (a window where another process could pre-create/symlink it). Now:
+  #   - mktemp is the ONLY creator (no predictable fallback); a mktemp
+  #     failure FAILS LOUD before any secret is read.
+  #   - the create happens under a 0600 umask so the file is never even
+  #     momentarily group/world-readable, and we re-chmod 0600 defensively.
+  local _prev_umask
+  _prev_umask="$(umask)"
+  umask 0077
+  source_file="$(mktemp "${TMPDIR:-/tmp}/agb-codex-src.XXXXXX" 2>/dev/null || true)"
+  umask "$_prev_umask"
+  if [[ -z "$source_file" || ! -f "$source_file" ]]; then
+    if [[ "$json_mode" == "1" ]]; then
+      printf '{"status":"failed","reason":"tempfile_failed","source_agent":"%s","synced":[],"failed":[]}\n' "$source_agent"
+    else
+      printf '[error] codex sync: cannot create a private source tempfile (mktemp failed)\n' >&2
+    fi
+    return 1
+  fi
+  chmod 0600 "$source_file" 2>/dev/null || true
+  # shellcheck disable=SC2064  # expand source_file now for the trap
+  trap "rm -f '$source_file' 2>/dev/null || true" RETURN
+  if ! bridge_auth_codex_read_source_auth "$source_agent" "$source_file"; then
+    if [[ "$json_mode" == "1" ]]; then
+      printf '{"status":"failed","reason":"source_unreadable","source_agent":"%s","synced":[],"failed":[]}\n' "$source_agent"
+    fi
+    return 1
+  fi
+
+  if ! selection="$(bridge_auth_codex_selected_agents "$spec" 2>/dev/null)"; then
+    return 1
+  fi
+  [[ -n "$selection" ]] && mapfile -t agents <<<"$selection"
+
+  local agent="" out=""
+  for agent in "${agents[@]}"; do
+    # Never re-write the source itself (it is the source of truth).
+    [[ "$agent" == "$source_agent" ]] && continue
+    if out="$(bridge_auth_codex_sync_one "$source_file" "$agent" 2>/dev/null)"; then
+      case "$out" in
+        *'"status": "unchanged"'*|*'"status":"unchanged"'*) unchanged+=("$agent") ;;
+        *) synced+=("$agent") ;;
+      esac
+      [[ "$json_mode" == "1" ]] || printf 'codex synced: %s\n' "$agent"
+    else
+      failed+=("$agent")
+      rc=1
+      [[ "$json_mode" == "1" ]] || printf 'codex FAILED: %s\n' "$agent" >&2
+    fi
+  done
+
+  if [[ "$json_mode" == "1" ]]; then
+    python3 "$SCRIPT_DIR/lib/upgrade-helpers/codex-sync-summary.py" \
+      "$source_agent" "$rc" \
+      "synced:${synced[*]:-}" "unchanged:${unchanged[*]:-}" "failed:${failed[*]:-}"
+  fi
+  return "$rc"
+}
+
 bridge_auth_json_requested() {
   local arg=""
   for arg in "$@"; do
@@ -806,6 +1162,62 @@ PY
             bridge_auth_sync_agents "$registry" "$agents_spec" 0
           fi
         fi
+        ;;
+      -h|--help|help)
+        usage
+        ;;
+      *)
+        usage >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  codex-cred)
+    # Fleet-credential Phase 2 (#1470): the Codex register-once → fleet-sync
+    # adapter. register/sync/verify/source only — Codex has no rotation.
+    subcommand="${1:-}"
+    [[ -n "$subcommand" ]] || {
+      usage
+      exit 1
+    }
+    shift || true
+    registry="$(bridge_auth_registry_path)"
+    case "$subcommand" in
+      register)
+        # Resolve + validate the requested source BEFORE persisting it (Q1).
+        source_arg=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --source)
+              [[ $# -ge 2 ]] || {
+                printf '[error] --source requires a value\n' >&2
+                exit 1
+              }
+              source_arg="$2"
+              shift 2
+              ;;
+            *) shift ;;
+          esac
+        done
+        [[ -n "$source_arg" ]] || {
+          printf '[error] codex-cred register requires --source <agent>\n' >&2
+          exit 1
+        }
+        bridge_auth_codex_validate_source "$source_arg" || exit 1
+        exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
+          codex-register --source "$source_arg" "$@"
+        ;;
+      source)
+        exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" codex-source "$@"
+        ;;
+      verify)
+        exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" codex-verify "$@"
+        ;;
+      sync)
+        json_mode=0
+        bridge_auth_json_requested "$@" && json_mode=1
+        agents_spec="$(bridge_auth_agents_arg "$@")"
+        bridge_auth_codex_sync_agents "$agents_spec" "$json_mode"
         ;;
       -h|--help|help)
         usage

@@ -2,7 +2,7 @@
 
 **Umbrella:** [#1470](https://github.com/seanssoh/agent-bridge-public/issues/1470) (tracking/design)
 **In focus:** [#1467](https://github.com/seanssoh/agent-bridge-public/issues/1467) (central registry + adapter + fleet sync for Codex/Gemini), [#1469](https://github.com/seanssoh/agent-bridge-public/issues/1469) (post-rotation set-scoped fleet re-wake)
-**Status:** Phase 1 landed (engine-auth descriptor seam + cred-generation groundwork). Phase 2 (Codex adapter) and the L5 re-wake wiring are NOT yet built.
+**Status:** Phase 1 landed (engine-auth descriptor seam + cred-generation groundwork). **Phase 2 landed** (Codex register-once → fleet-sync adapter: `codex-cred {register,sync,verify,source}`, iso-inclusive write-through, ambient-key active-scrub, daemon tick). The L5 re-wake wiring (#1469) is NOT yet built.
 **Security class:** HIGH-RISK — this is the most security-sensitive surface in the repo after the A2A receiver (see `CLAUDE.md` High-Risk #5/#6). The token store and the sync path must be locked down on every engine.
 
 This doc is the durable home for the agreed model. It supersedes the ephemeral `/tmp/fleet-credential-plan.md` and the codex plan-agreement note that resolved the six open questions.
@@ -57,6 +57,66 @@ Operator decision: **subscription login, not API key.** Operator manually runs `
 - **Sync = generalize the #1075 controller-fallback to a designated source agent**, through the same `write_private_file_atomic` + per-agent iso-aware machinery. Handles: (a) in-place refresh re-propagation, (b) the iso boundary (the fleet-sync **MUST include Linux iso v2 agents**), (c) operator re-login.
 - **No registry pool, no rotation, no failover.** The Codex adapter implements `register` (point at the source), `sync`, and `verify` only; `activate/rotate/recover` are **clean no-ops that return a "not-supported-for-this-engine" status**.
 - **CLEAN SLATE:** the bridge does NOT manage Codex auth today (no `auth.json` injection in tracked code). Phase 2 is a NEW capability, not an env-injection migration — but a legacy ambient-key precedence guard must still exist defensively (§6/Q6).
+
+#### 3.2.1 Phase 2 as built (landed) — operator usage + surface
+
+The Codex adapter is the `codex-cred` verb on `bridge-auth.sh` (CLI: `agent-bridge auth codex-cred …`):
+
+```bash
+# 1. The operator runs `codex login` ONCE on a designated source agent.
+# 2. Register that source (validated as an existing, non-stopped Codex agent;
+#    persisted to protected 0600 state — NOT env-overridable). Defaults to
+#    <admin>-dev when it exists and is a Codex agent.
+agent-bridge auth codex-cred register --source <codex-agent>
+agent-bridge auth codex-cred source                 # show the bound source
+# 3. Fan the source auth.json out to every managed Codex agent (write-through).
+agent-bridge auth codex-cred sync --agents static   # or all|<csv>
+# 4. Offline well-formedness check of any auth.json (no `codex` subprocess).
+agent-bridge auth codex-cred verify --file <path>
+```
+
+The daemon re-runs `codex-cred sync` on a wall-clock tick
+(`bridge_daemon_periodic_codex_cred_sync_tick`, default 3600s, tunable via
+`BRIDGE_CODEX_CRED_SYNC_INTERVAL_SECONDS` / `…_AGENTS` / `…_ENABLED`) so an
+in-place refresh the `codex` binary writes to the source, or a fresh operator
+re-login, re-propagates to the fleet with no human action. The tick is a clean
+no-op until a source is registered. Audit row: `codex_cred_periodic_sync`.
+
+**How the security contracts map to code:**
+
+- **Source binding (Q1)** — `cmd_codex_register` persists the validated source to
+  `state/auth/codex-source.json` (0600). The path derives ONLY from the runtime root
+  (`BRIDGE_STATE_DIR`/`BRIDGE_HOME`) — there is deliberately NO dedicated file-level
+  env override, so caller env cannot redirect the binding independently of the rest
+  of runtime state.
+  `bridge_auth_codex_validate_source` rejects an unknown / non-Codex / broken-launch
+  source. The default `<admin>-dev` is only auto-selected when it exists; the binding
+  is never read from an env override.
+- **Refresh detection (Q2)** — `read_codex_auth_snapshot` reads ONE atomic snapshot,
+  validates the JSON/shape, and digests the RAW bytes; `cmd_codex_sync` propagates
+  only when the digest differs from the dest's recorded `cred_generation`
+  (`status: unchanged` otherwise). No advisory lock against `codex`.
+- **Aliveness (Q3)** — `codex_auth_wellformed` is an OFFLINE shape check
+  (tokens-object OR `OPENAI_API_KEY`). **Codex L4 is documented weaker than Claude:**
+  there is no side-effect-free live Codex probe (`codex login status` mutates
+  CODEX_HOME on 0.135.0), so the adapter never shells out to `codex`.
+- **Delivery (§6.6)** — `cmd_codex_sync` writes the source bytes VERBATIM via
+  `write_private_file_atomic` (chown-before-replace, 0600) and REFUSES a pre-placed
+  symlink at the dest. The bash layer resolves the iso owner
+  (`agent-bridge-<a>:ab-agent-<a>`) so the iso dest lands 0600 owner-correct; a failed
+  iso write fails loud (no insecure fallback).
+- **Iso source read (§6.3)** — `bridge_auth_codex_read_source_auth` reads a 0600
+  iso-owned source via `sudo -n -u <owner> cat` into a controller-owned 0600 tempfile;
+  if both the direct read and the sudo fallback fail, it fails loud — never a
+  world-readable copy.
+- **Rollback (Q-extra)** — `cmd_codex_sync` captures a same-owner last-known-good
+  sidecar (`<dest>.agb-lkg`) before the write and restores it on a write failure, but
+  ONLY if that backup itself re-validates (never rolls back to a malformed/expired
+  file). The atomic writer's chown-before-replace means a chown failure leaves the
+  original dest untouched in the first place.
+- **No cross-engine misdelivery (§8)** — `cmd_codex_sync` fail-closed-gates the engine
+  to `codex` BEFORE any write; the Phase-1 `cmd_sync_agent` still refuses
+  `--engine codex`. Neither path can write the other engine's credential.
 
 ### 3.3 Gemini (Antigravity / `agy`) — deferred
 
@@ -132,7 +192,7 @@ The store and sync path must be locked down on every engine:
 3. **Q3 — Codex aliveness.** No proven side-effect-free live Codex aliveness probe exists (`codex login status` on 0.135.0 mutates `CODEX_HOME`). Use offline well-formedness/expiry/path checks; optionally run CLI status only against a scratch copy. **Codex L4 is documented as weaker than Claude** until a side-effect-free native probe exists.
 4. **Q4 — stranded-set precision.** Add **credential-generation stamping.** Do not accept "re-wake all agents with work" except as an explicitly temporary Phase-0 tactical fallback. Store per-agent `engine/source_digest/cred_generation/synced_at`; stamp at sync; the #1469 re-wake targets only work running under a vacated generation. *(Phase 1: landed — §5.)*
 5. **Q5 — rollout.** Ship **Phase 1 as a separate beta from Phase 2.** The auth descriptor/refactor is high-risk enough to prove Claude no-regression first; add the Codex adapter only after the seam is stable. *(This is why this PR is Phase 1 only.)*
-6. **Q6 — ambient env.** **Active-scrub for managed Codex.** `OPENAI_API_KEY` and `CODEX_ACCESS_TOKEN` must be removed at true `bridge-run.sh` process entry before any child fork, from the iso-v2 secret loader / final launch path, and from any managed Codex child environment. Warn-only is acceptable only for explicitly unmanaged/operator-owned Codex runs. Never log token values. *(Phase 2.)*
+6. **Q6 — ambient env.** **Active-scrub for managed Codex.** `OPENAI_API_KEY` and `CODEX_ACCESS_TOKEN` must be removed at true `bridge-run.sh` process entry before any child fork, from the iso-v2 secret loader / final launch path, and from any managed Codex child environment. Warn-only is acceptable only for explicitly unmanaged/operator-owned Codex runs. Never log token values. *(Phase 2 — LANDED.* `bridge-run.sh` captures + unsets both vars at true process entry alongside the Claude scrub; they ride the same fd-9 transit across the privileged re-exec; `bridge_run_apply_codex_ambient_env` at the launch site restores them ONLY for an explicit `BRIDGE_CODEX_UNMANAGED_AUTH=1` opt-out. The shared `lib/bridge-secret-scrub.sh` gained `bridge_secret_scrub_capture_codex` / `…_restore_codex` mirroring the Claude pair.*)*
 
 **Extra build constraints (Phase 2):**
 - Prove the real Codex auth path before copying credentials — a verifier showing the launched Codex process reads the intended `<home>/.codex/auth.json` in both shared and iso-v2 modes, or deliberately set that path before sync. The default Codex command has no `CODEX_HOME` pin and the non-Claude shared launch does not obviously export `HOME`/`CODEX_HOME`.
@@ -147,7 +207,7 @@ The store and sync path must be locked down on every engine:
 |---|---|---|
 | **Phase 0** | Claude lane + the #1454 security gate; #1468 429-signal; #1261 stale-guard; #1469 Claude-tactical re-wake | mostly DONE in v0.15.4 (re-wake pending) |
 | **Phase 1** | engine-auth descriptor + seam generalization (Claude behavior-preserving); cred-generation schema groundwork | **THIS WORK — landed** |
-| **Phase 2** | Codex adapter against the Phase-1 seam: `register`/`sync`/`verify`; iso-inclusive write-through; ambient-key scrub; daemon tick wiring; uniform sync audit row | NOT STARTED |
+| **Phase 2** | Codex adapter against the Phase-1 seam: `register`/`sync`/`verify`; iso-inclusive write-through; ambient-key scrub; daemon tick wiring; uniform sync audit row | **LANDED** |
 | **Phase 5 / Gemini** | re-wake generalization for non-Claude wake mechanisms; Gemini L1/L4 | deferred |
 
 ---
@@ -157,7 +217,8 @@ The store and sync path must be locked down on every engine:
 - **Static (required before any PR):** `bash -n` + `shellcheck` over touched `*.sh`/root scripts + `py_compile` + `./scripts/smoke-test.sh` (isolated) + `lint-heredoc-ban --baseline-check` + `lint-raw-pathlib-on-isolated` + `iso-helper-ratchet`.
 - **Phase-1 regression gate:** the existing Claude auth + usage + rotation smokes pass **byte-identically** — Phase 1 is behavior-preserving. Register each new smoke at the `bridge-auth.py|bridge-auth.sh` and `lib/bridge-engine-descriptor.sh` `ci-select-smoke.sh` sites + the master required list.
 - **Phase-1 new smoke:** `scripts/smoke/1470-engine-auth-seam.sh` — descriptor dispatches Claude through the seam byte-identically (Part A), and the cred-generation schema is idempotent + fail-closed + 0600 + never records the secret (Part B).
-- **Phase-2 smokes (future):** Codex write-through to shared + iso v2 (dest 0600 owner-correct, no symlink, run on Linux), in-place-refresh re-propagation, symlink-hazard guard, ambient-key precedence guard, no-token-in-child-env assertion, plus the #1469 L5 stranded-set/idle-not-woken/token-health-gate/`fleet_rewake`-audit smoke.
+- **Phase-2 smoke (landed):** `scripts/smoke/1470-codex-fleet-sync.sh` pins the eight teeth — write-through-not-symlink delivery (0600 byte-identical regular file), digest idempotency (unchanged=no-op / changed=re-sync+gen-bump), malformed/unreadable/unrecognized source fail-loud, symlink-dest refusal, no cross-engine misdelivery (both directions), no-secret-in-state, the Q6 active-scrub primitive, and the offline well-formedness / atomic-snapshot / source-binding round-trip. Heredoc bodies live in `1470-codex-fleet-sync-helper.py` (file-as-argv, footgun #11). Registered at the `bridge-auth.py|bridge-auth.sh`, `lib/bridge-secret-scrub.sh`, `bridge-run.sh`, `bridge-daemon.sh`, and master-required `ci-select-smoke.sh` sites. The iso-home 0600-owner-correct delivery is proven on a Linux VM (no Linux iso UID exists in the macOS smoke sandbox).
+- **Phase-5 smoke (future):** the #1469 L5 stranded-set / idle-not-woken / token-health-gate / `fleet_rewake`-audit smoke.
 - **codex pair-review at every gate** + a read-only adversarial-verify sweep on the security paths before pair-review (Phase 2 especially).
 
 ---
@@ -168,5 +229,12 @@ The store and sync path must be locked down on every engine:
 - `bridge-auth.py` — `ENGINE_AUTH_DESCRIPTOR` / `engine_auth_descriptor`, `claude_oauth_credentials_payload` (descriptor-keyed), `cred_state_path` / `load_cred_state` / `save_cred_state` / `stamp_cred_generation` (§5), `write_private_file_atomic` (the iso-safe write seam), `controller_credentials_aliveness` (#1261), `cmd_sync_agent` (the `--engine` dispatch + stamp call).
 - `bridge-auth.sh` — `BRIDGE_AUTH_CLAUDE_ENGINE`, `bridge_auth_engine_cred_file_tail`, `bridge_auth_claude_credentials_file_for_agent`, `bridge_auth_selected_agents`.
 - `bridge-daemon.sh` — `process_usage_monitor` → `claude-token rotate --if-auto-enabled --sync` → `claude_token_rotation` audit row (the L5 trigger).
-- `lib/bridge-secret-scrub.sh` — the #1454 shared scrub/transit primitive any new secret path must use.
-- `bridge-run.sh` — #1444 fd credential transit + child-env scrub (extend for Codex, don't weaken).
+- `lib/bridge-secret-scrub.sh` — the #1454 shared scrub/transit primitive any new secret path must use; Phase 2 added `bridge_secret_scrub_capture_codex` / `…_restore_codex` for the OpenAI-key / Codex-token ambient scrub.
+- `bridge-run.sh` — #1444 fd credential transit + child-env scrub; Phase 2 captures + unsets the Codex ambient keys at entry, rides them on fd 9, and `bridge_run_apply_codex_ambient_env` decides restore (managed=absent / `BRIDGE_CODEX_UNMANAGED_AUTH=1`=restore) at the launch site.
+
+**Phase 2 anchors (#1470):**
+- `bridge-auth.py` — `cmd_codex_register` / `cmd_codex_source` / `cmd_codex_verify` / `cmd_codex_sync`; `load/save_codex_source_binding`, `read_codex_auth_snapshot`, `codex_auth_wellformed`, `codex_dest_generation_digest`, `codex_rollback_backup_path` (the digest-gate + write-through + rollback engine).
+- `bridge-auth.sh` — the `codex-cred {register,sync,verify,source}` CLI; `bridge_auth_codex_source_binding` (Q1 resolution), `bridge_auth_codex_validate_source`, `bridge_auth_codex_read_source_auth` (§6.3 iso source read), `bridge_auth_codex_selected_agents`, `bridge_auth_codex_sync_one`, `bridge_auth_codex_sync_agents`.
+- `lib/upgrade-helpers/codex-sync-summary.py` — the heredoc-free fleet-sync JSON summary helper (footgun #11).
+- `bridge-daemon.sh` — `bridge_daemon_periodic_codex_cred_sync_tick` (the wall-clock re-propagation tick; `codex_cred_periodic_sync` audit row).
+- `lib/bridge-engine-descriptor.sh` — the Phase-1 `codex` descriptor slot Phase 2 fills (`.codex/auth.json` dest, `single-source-sync` model, opaque-copy payload key, no rotation).

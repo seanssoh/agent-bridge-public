@@ -36,6 +36,8 @@ bridge-agent.sh	6160	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f99
 bridge-agent.sh	6262	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-audit.sh	60	H3	967276bccff3eae7ab3fe0ebb717d60a4a3793d2edc085f88df3c7390b65841f	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 bridge-auth.sh	392	H3	25a1d9fe293aaa39b67439a679addbb8a932f1e79d870356616753d39d6e5a08	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-auth.sh	855	H3	25a1d9fe293aaa39b67439a679addbb8a932f1e79d870356616753d39d6e5a08	here-string/procsub, non-interpreter consumer	claude	#1470 P2 codex fleet selector csv split (bridge_auth_codex_selected_agents)
+bridge-auth.sh	970	H3	69ea35d8b4d2b7652321e46dd6fdb97ec04fe837e8db017b6e53ff7562066ee8	here-string/procsub, non-interpreter consumer	claude	#1470 P2 codex sync agents mapfile (bridge_auth_codex_sync_agents)
 bridge-auth.sh	444	C3	26443b7bc9716cdb116dce6dcd63dd687bd143618b70fe1ff1de15489812eb22	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-auth.sh	460	H3	a1c5db1d093ea6fe1580b441f1100a60d3519709bc349b16f9d611a6d957a72e	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-auth.sh	464	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
@@ -94,7 +96,7 @@ bridge-run.sh	1160	H3	284c4b8ea0187f630fe41146d5d4304b0da61a8bf2f6c5cc1cefe06bef
 bridge-run.sh	1207	H3	284c4b8ea0187f630fe41146d5d4304b0da61a8bf2f6c5cc1cefe06befb2c4e5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-run.sh	1346	H3	fbe2e0c1fc0d55af86d8804be8589ce21a6b8977b22417398cdd4eb53fb20d4d	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-run.sh	1354	H3	3bcf9cf8bf2d74c066cde478b02a8a01baa4f46cce8c6c70fc79f523f5995683	here-string/procsub, non-interpreter consumer	patch	#1520 shared-launch CLAUDE_CONFIG_DIR (bridge_run_shared_launch)
-bridge-run.sh	1362	H3	11f888bc9c6abf6d821891c0d92e013a98ca8b08deb4257f893f4be3aff80516	here-string/procsub, non-interpreter consumer	patch	#1520 shared-launch CLAUDE_CONFIG_DIR (bridge_run_shared_launch)
+bridge-run.sh	1451	H3	3bcf9cf8bf2d74c066cde478b02a8a01baa4f46cce8c6c70fc79f523f5995683	here-string/procsub, non-interpreter consumer	claude	#1470 P2 codex managed-ambient-env launch subshell (bridge_run_shared_launch codex branch)
 bridge-setup.sh	134	C3	dfa7cb8653e0fa5030cfb74dc10e3f9b1cea067a4a736f616072077c28737eda	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-setup.sh	158	C3	dfa7cb8653e0fa5030cfb74dc10e3f9b1cea067a4a736f616072077c28737eda	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-setup.sh	181	C3	25149f22b708794256a01db1a4cfb75cb8fc1b962478687d785a0ad389755c7a	interpreter heredoc, no capture	patch	Phase 3 PR C
