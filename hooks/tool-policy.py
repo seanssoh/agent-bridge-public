@@ -2324,6 +2324,301 @@ def _emit_credential_routine_admin_exempted_audit(
     )
 
 
+# Issue #1367 — sealed-paste token-FREE request shape.
+#
+# The sealed-paste root path (`bridge-auth.sh claude-token receive`)
+# reads the OAuth token echo-off from the OPERATOR's controlling tty, so
+# a token NEVER appears in the agent's Bash command at all. The ONLY
+# agent-initiated shape we exempt here is the token-FREE request/receipt
+# (`receive --request … --json`), so an admin agent can INITIATE the
+# flow without ever touching the token. The token-ACCEPTING `receive`
+# form is deliberately NOT exempted: it has no token-bearing argv (no
+# --stdin/--token-file/positional), and run from inside an agent it
+# fails closed at the tty open. Keeping it out of the exemption means an
+# agent Bash tool cannot drive a token-accepting receive past this gate.
+#
+# Both `bash bridge-auth.sh …` and `agb auth …` / `agent-bridge auth …`
+# spellings are accepted (the verb is the same surface through three
+# front-ends). The match is strict-prefix on the raw text (mirrors the
+# #1358 contract: a quote/spacing variant must fail) then shape-validates
+# the suffix flags against a tight token-free allowlist.
+_SEALED_RECEIVE_REQUEST_PREFIXES = (
+    "bash bridge-auth.sh claude-token receive --request",
+    "agb auth claude-token receive --request",
+    "agent-bridge auth claude-token receive --request",
+)
+
+# Token-free request shape flags. NOTE: NO --stdin, NO --token-file, NO
+# --note (free text), NO positional — anything outside this set denies.
+_SEALED_REQUEST_FLAGS_BOOL = frozenset(
+    {
+        "--request",
+        "--activate",
+        "--replace",
+        "--enable-auto-rotate",
+        "--json",
+    }
+)
+_SEALED_REQUEST_FLAGS_SLUG = frozenset({"--id", "--agents", "--threshold"})
+
+
+def _validate_sealed_request_args(tokens: list[str]) -> bool:
+    """Walk *tokens* accepting only the token-FREE sealed-request flags.
+
+    Rejects any positional argument, any unknown flag (so a future
+    token-bearing flag cannot be absorbed), any DUPLICATE flag (a
+    smuggling shape — `--id a --id b`), `--note`/`--token-file`/
+    `--stdin`/`--fulfill` (not part of the request shape), and validates
+    each value flag's argument as a safe slug. Fail-closed: any malformed
+    shape returns False.
+    """
+    idx = 0
+    n = len(tokens)
+    seen: set[str] = set()
+    while idx < n:
+        tok = tokens[idx]
+        if tok in _SEALED_REQUEST_FLAGS_BOOL:
+            if tok in seen:
+                return False
+            seen.add(tok)
+            idx += 1
+            continue
+        if tok in _SEALED_REQUEST_FLAGS_SLUG:
+            if tok in seen:
+                return False
+            seen.add(tok)
+            if idx + 1 >= n:
+                return False
+            if not _safe_slug_arg(tokens[idx + 1]):
+                return False
+            idx += 2
+            continue
+        if tok.startswith("--") and "=" in tok:
+            flag, value = tok.split("=", 1)
+            if flag in _SEALED_REQUEST_FLAGS_SLUG:
+                if flag in seen:
+                    return False
+                seen.add(flag)
+                if not _safe_slug_arg(value):
+                    return False
+                idx += 1
+                continue
+            return False
+        # Positional / unknown flag — reject.
+        return False
+    return True
+
+
+def _is_sealed_receive_request(text: str, agent: str) -> bool:
+    """True iff *text* is an admin's token-FREE sealed-receive REQUEST.
+
+    Tight exemption (#1367): admin role (strict env+roster agreement,
+    same gate as the #1358 carve-out) AND the token-free request shape.
+    The shape gate requires: a literal request prefix, `--json`, no
+    shell embedding / command separators / redirection / substitution,
+    and only the token-free flag allowlist. Returns False (NOT raising)
+    on any mismatch so the exemption fails closed.
+
+    Scoped to the ``bash bridge-auth.sh`` spelling: the ``agb`` /
+    ``agent-bridge auth …`` spellings route through
+    :func:`_admin_bridge_verb_check`, which emits its own sealed-paste
+    audit row — gating the main-flow emit to the bash spelling avoids a
+    double audit row for the same command.
+    """
+    if not _is_admin_credential_routine_strict_agreement(agent):
+        return False
+    if not text.lstrip().startswith("bash bridge-auth.sh claude-token receive --request"):
+        return False
+    return _sealed_receive_request_shape_matches(text)
+
+
+def _sealed_receive_request_shape_matches(text: str) -> bool:
+    """Shape-only gate for the token-free sealed-receive request (#1367).
+
+    No role check — factored out so a future caller can reuse it. The
+    shape is intentionally MUCH tighter than the #1358 add carve-out:
+    there is no heredoc/here-string body (the request carries no token),
+    so ANY `<`/`>`/`<<`/substitution/separator denies outright.
+    """
+    if not text:
+        return False
+    stripped = text.lstrip()
+    matched_prefix = ""
+    for prefix in _SEALED_RECEIVE_REQUEST_PREFIXES:
+        if stripped.startswith(prefix):
+            matched_prefix = prefix
+            break
+    if not matched_prefix:
+        return False
+    after_prefix = stripped[len(matched_prefix):]
+    # The char after `--request` must end the token or be whitespace.
+    if after_prefix and after_prefix[0] not in (" ", "\t"):
+        return False
+    # No shell embedding (heredoc/here-string/proc-sub) — the request
+    # shape never needs any of them.
+    if _command_has_shell_embedding(text):
+        return False
+    if re.search(r"\$\(", text) or "`" in text:
+        return False
+    # No command separators or redirection anywhere (after dropping the
+    # safe `2>/dev/null` forms). The request shape is a single command.
+    sanitized = _SAFE_REDIRECT_RE.sub(" ", text)
+    if _COMMAND_OPERATOR_RE.search(sanitized):
+        return False
+    if "<" in sanitized or ">" in sanitized:
+        return False
+    # Validate the suffix flags against the token-free allowlist.
+    try:
+        tokens = shlex.split(after_prefix, posix=True, comments=False)
+    except ValueError:
+        return False
+    if not _validate_sealed_request_args(tokens):
+        return False
+    # Must carry --json (the request/receipt is a structured emit) and
+    # must NOT carry the token-accepting flags.
+    if "--json" not in tokens:
+        return False
+    for forbidden in ("--stdin", "--token-file", "--note", "--fulfill"):
+        if forbidden in after_prefix:
+            return False
+    return True
+
+
+# Deny reason for a `bash bridge-auth.sh claude-token receive` invocation
+# that is NOT the token-free `--request … --json` request shape. The
+# token-ACCEPTING receive reads the OAuth token echo-off from the
+# operator's controlling tty; it must be run by the operator from a
+# terminal, never driven from an agent Bash tool. The `agb` /
+# `agent-bridge` spellings are already denied by
+# `_admin_bridge_verb_check`; this guards the `bash bridge-auth.sh`
+# wrapper spelling so it cannot fall through the bash-wrapper path.
+SEALED_RECEIVE_BASH_DENY_REASON = (
+    "bash bridge-auth.sh claude-token receive: only the token-free "
+    "`--request ... --json` shape is permitted from an agent; the "
+    "token-accepting receive reads the token echo-off from the operator's "
+    "terminal and must be run by the operator, not from an agent Bash tool"
+)
+
+
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _is_bash_wrapper_receive(text: str) -> bool:
+    """True iff *text* invokes `bash <…>/bridge-auth.sh claude-token receive …`.
+
+    Spelling-scoped detector for the bash wrapper (`agb` / `agent-bridge`
+    spellings route through `_admin_bridge_verb_check`). shlex-splits the
+    command and matches the `bash <path>bridge-auth.sh claude-token receive`
+    sub-verb robustly, so it is NOT fooled by the variants a prefix-only
+    `startswith` missed (codex #1367 r2): an absolute/relative path to
+    bridge-auth.sh (`bash /opt/x/bridge-auth.sh …`), collapsed/extra
+    whitespace (`bash  bridge-auth.sh …`), or a leading `VAR=value`
+    env-assignment prefix (`FOO=1 bash bridge-auth.sh …`). Returns False
+    (never raises) on any non-matching shape; on an unsplittable string
+    that still names the wrapper receive, denies (returns True) rather than
+    falling through.
+    """
+    stripped = text.lstrip() if text else ""
+    # Cheap pre-filter before the shlex cost; the tokenized sub-verb match
+    # below is the real (path/spacing/env-prefix robust) check.
+    if "bridge-auth.sh" not in stripped or "claude-token" not in stripped:
+        return False
+    try:
+        tokens = shlex.split(stripped, posix=True, comments=False)
+    except ValueError:
+        # Unbalanced quotes etc. (a smuggling attempt) but the command
+        # still names the wrapper receive — deny rather than fall through.
+        return "receive" in stripped
+    # See through leading `VAR=value` env-assignments AND `env`/`command`
+    # /`/usr/bin/env` command-prefix wrappers (with their own flags +
+    # `env`'s VAR=value / `-u NAME` args), then bash options — codex #1367
+    # r4 found `env FOO=1 bash …`, `/usr/bin/env bash …`, `command bash …`,
+    # `bash --noprofile …` all ran a working token-accepting receive. NOTE
+    # this hook detector is BEST-EFFORT defense-in-depth ONLY and NOT
+    # exhaustive: unbounded spellings (`sh -c "…"`, `eval`, a symlink, or
+    # invoking `python3 bridge-auth.py receive` directly) escape it, and the
+    # bridge-auth.py runtime agent-context refusal it pairs with is ALSO
+    # best-effort (an agent on a shared-UID host can clear BRIDGE_AGENT_ID +
+    # attach a pty — codex #1367 r4). Neither layer is a sandbox (CLAUDE.md).
+    # #1367's actual guarantee is that the OPERATOR's token, read echo-off in
+    # the operator's own terminal, never transits an agent transcript; an
+    # agent that bypasses both layers can only store ITS OWN token, outside
+    # that threat model. We deny the common spellings here for a clean early
+    # signal + audit.
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if _ENV_ASSIGN_RE.match(tok):
+            idx += 1
+            continue
+        base = tok.rsplit("/", 1)[-1]
+        if base in ("env", "command", "nice", "nohup", "stdbuf"):
+            idx += 1
+            # Consume the wrapper's own flags + `env` VAR=value / `-u NAME`.
+            while idx < len(tokens):
+                a = tokens[idx]
+                if _ENV_ASSIGN_RE.match(a):
+                    idx += 1
+                    continue
+                if a.startswith("-"):
+                    consumes_arg = a == "-u"
+                    idx += 1
+                    if consumes_arg and idx < len(tokens):
+                        idx += 1
+                    continue
+                break
+            continue
+        break
+    # tokens[idx] must now be the bash interpreter.
+    if idx >= len(tokens) or tokens[idx].rsplit("/", 1)[-1] != "bash":
+        return False
+    idx += 1
+    # Skip bash options (`--noprofile`, `--norc`, `-x`, …) up to the script
+    # path. `-c` is intentionally NOT skipped: `bash -c '<string>'` runs a
+    # code string, not `bridge-auth.sh` as argv[1] — that form is outside
+    # this detector, covered only by the documented best-effort runtime
+    # check + the residual-threat-model scoping (not an airtight boundary).
+    while idx < len(tokens) and tokens[idx].startswith("-") and tokens[idx] != "-c":
+        idx += 1
+    return (
+        len(tokens) - idx >= 3
+        and tokens[idx].rsplit("/", 1)[-1] == "bridge-auth.sh"
+        and tokens[idx + 1] == "claude-token"
+        and tokens[idx + 2] == "receive"
+    )
+
+
+def _emit_sealed_receive_request_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+) -> None:
+    """Audit row for the token-FREE sealed-receive request exemption (#1367).
+
+    Distinct action (`tool_policy_credential_routine_sealed_paste`) so
+    operators can grep the sealed-paste surface separately from the
+    #1358 add carve-out. The request is token-free by construction, but
+    the row is value-redacted defensively anyway and carries only the
+    verb skeleton + a `command_sha256` forensic anchor (no raw command,
+    consistent with the #1358 hash-only contract).
+    """
+    raw_command = text or ""
+    if tool_input is not None and not raw_command:
+        raw_command = str(tool_input.get("command") or "")
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "surface": "sealed_paste_request",
+        "exemption": "credential_routine_sealed_paste",
+        "command_sha256": _credential_routine_command_sha256(raw_command),
+    }
+    write_audit(
+        "tool_policy_credential_routine_sealed_paste",
+        agent or "unknown",
+        detail,
+    )
+
+
 # Issue #1358 — strict raw-text prefix for the admin credential rotation
 # routine. The carve-out matches by literal raw-text prefix (NOT shlex
 # tokenisation) because the brief's edge case 2 explicitly calls out that
@@ -2803,11 +3098,11 @@ def _admin_bridge_verb_check(
     verb = tokens[1]
 
     if verb == "auth":
-        # `auth claude-token (add|activate|sync|rotate) ...`
+        # `auth claude-token (add|activate|sync|rotate|receive) ...`
         if len(tokens) < 4 or tokens[2] != "claude-token":
             return False, None
         sub = tokens[3]
-        if sub not in {"add", "activate", "sync", "rotate"}:
+        if sub not in {"add", "activate", "sync", "rotate", "receive"}:
             return False, None
         if not admin:
             return False, (
@@ -2823,6 +3118,26 @@ def _admin_bridge_verb_check(
                 return False, "agent-bridge auth claude-token activate: unsafe id"
             if not _validate_auth_flags(rest[1:]):
                 return False, "agent-bridge auth claude-token activate: unsafe arguments"
+        elif sub == "receive":
+            # #1367 — sealed-paste. The ONLY agent-runnable shape is the
+            # token-FREE request/receipt (`receive --request … --json`).
+            # The token-accepting receive form reads echo-off from the
+            # operator's tty and must NOT be drivable from an agent Bash
+            # tool — so anything that is not the strict token-free request
+            # shape is denied here.
+            if not _sealed_receive_request_shape_matches(text):
+                return False, (
+                    "agent-bridge auth claude-token receive: only the "
+                    "token-free `--request ... --json` shape is permitted "
+                    "from an agent; the token-accepting receive must be run "
+                    "by the operator from a terminal"
+                )
+            _emit_sealed_receive_request_audit(
+                agent,
+                text=text,
+                tool_input=tool_input,
+            )
+            return True, None
         else:  # sync, rotate
             if not _validate_auth_flags(rest):
                 return False, f"agent-bridge auth claude-token {sub}: unsafe arguments"
@@ -3029,6 +3344,38 @@ def protected_alias_reason(
             text=text,
             tool_input=tool_input,
         )
+    # Issue #1367 — sealed-paste token-FREE request emit. The
+    # `bash bridge-auth.sh claude-token receive --request … --json` shape
+    # carries NO token (the token is read echo-off from the operator's
+    # tty by a SEPARATE operator-terminal receive), so it is not caught
+    # by the credential-substring deny below; we emit a distinct audit
+    # row here for the admin-initiated request so the sealed-paste
+    # surface is grep-able. The `agb`/`agent-bridge auth …` spellings are
+    # audited via `_admin_bridge_verb_check`. This only EMITS an audit
+    # row — it does not bypass any deny (the request is already
+    # token-free), so the credential-content deny ordering is unchanged.
+    if _is_sealed_receive_request(text, agent):
+        _emit_sealed_receive_request_audit(
+            agent,
+            text=text,
+            tool_input=tool_input,
+        )
+    # Issue #1367 r2 (codex SECURITY) — close the bash-wrapper bypass. A
+    # `bash bridge-auth.sh claude-token receive …` carries no token in its
+    # argv (the token is read echo-off from the operator's tty), so the
+    # credential-content denies below do NOT catch it, and because the
+    # `bash` wrapper leaf is not `agb`/`agent-bridge` it also is NOT routed
+    # through `_admin_bridge_verb_check` (which denies the token-accepting
+    # receive for those two spellings). Without this gate the token-
+    # accepting `bash bridge-auth.sh claude-token receive --id X --activate
+    # --json` would fall through to the peer/shared check and be ALLOWED,
+    # letting an agent Bash tool drive a token-accepting receive. Deny any
+    # bash-wrapper `receive` UNLESS it is the strict token-free
+    # `--request … --json` shape (the same tight allow-shape the `agb`
+    # spelling uses in `_admin_bridge_verb_check`). The token-free request
+    # stays allowed; everything else denies here, before the allowlist.
+    if _is_bash_wrapper_receive(text) and not _sealed_receive_request_shape_matches(text):
+        return SEALED_RECEIVE_BASH_DENY_REASON
     if _raw_mentions_claude_credentials(text):
         # Admin agents are the operator's deputy: their read-intent
         # diagnostic commands (e.g. `ls ~/.claude/.credentials.json`,

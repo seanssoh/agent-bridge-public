@@ -13,6 +13,8 @@ usage() {
   cat <<EOF
 Usage:
   bash $SCRIPT_DIR/bridge-auth.sh claude-token add --id <id> (--stdin|--token-file <path>) [--activate] [--replace] [--sync] [--agents static|all|csv] [--enable-auto-rotate] [--threshold 99] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token receive --id <id> [--fulfill <request-id>] [--activate] [--replace] [--enable-auto-rotate] [--threshold 99] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token receive --request --id <id> [--agents static|all|csv] [--activate] [--enable-auto-rotate] --json
   bash $SCRIPT_DIR/bridge-auth.sh claude-token list [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token activate <id> [--sync] [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token sync [--agents static|all|csv] [--json]
@@ -1122,6 +1124,23 @@ case "$command" in
             bridge_auth_sync_agents "$registry" "$agents_spec" 0
           fi
         fi
+        ;;
+      receive)
+        # #1367 sealed-paste. `--help`/`-h` must print usage with rc=0 so
+        # the universal CLI-help gate (#1117) passes. The token-accepting
+        # form reads echo-off from the controlling tty INSIDE the Python
+        # process, so we `exec` (inherit the terminal) — never capture its
+        # stdin/stdout. The token-free `--request` form is also exec'd; it
+        # reads no token.
+        for arg in "$@"; do
+          case "$arg" in
+            -h|--help|help)
+              usage
+              exit 0
+              ;;
+          esac
+        done
+        exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" receive "$@"
         ;;
       list|auto-rotate|check|recover-due|classify-output|mark-quota)
         exec python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" "$subcommand" "$@"
