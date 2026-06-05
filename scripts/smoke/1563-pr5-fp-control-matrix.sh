@@ -165,6 +165,9 @@ export BRIDGE_CLAUDE_TOKEN_RECOVERY_TIMEOUT_SECONDS=1
 export BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS=1
 export BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS=1
 export BRIDGE_CRON_SYNC_TIMEOUT=1
+# #1563 PR-6: the watchdog drift-scan ceiling is now a resolved-max-step knob
+# (default 30) — clamp it so the rows-1-3 fast deadline stays 4s.
+export BRIDGE_WATCHDOG_SCAN_TIMEOUT_SECONDS=1
 
 # shellcheck source=/dev/null
 source "$CONTROL_LIB"

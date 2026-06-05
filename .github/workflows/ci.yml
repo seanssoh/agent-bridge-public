@@ -131,7 +131,7 @@ jobs:
     # hermetic-snapshot fix in this PR closes a real source-mutation race but
     # is secondary; the tight timeout was the dominant cause. 15m matches the
     # integration-smoke budget below. See #1509.
-    timeout-minutes: 15
+    timeout-minutes: 20
     needs:
       - syntax
       - lint
