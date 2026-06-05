@@ -109,6 +109,9 @@ def cmd_build_outbox(argv):
     cfg_path = os.path.join(os.path.dirname(outbox_db) or ".", "handoff.local.json")
     with open(cfg_path, "w", encoding="utf-8") as fh:
         json.dump(_config(ok_port, closed_port), fh)
+    # The A2A config carries peer secrets; config-load refuses any mode != 0600.
+    # Force 0600 so the fixture works regardless of the CI umask (umask 022 -> 0644).
+    os.chmod(cfg_path, 0o600)
     os.environ["BRIDGE_A2A_OUTBOX_DB"] = outbox_db
     os.environ["BRIDGE_A2A_CONFIG"] = cfg_path
     conn = a2a.open_outbox()
