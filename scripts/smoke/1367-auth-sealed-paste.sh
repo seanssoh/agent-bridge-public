@@ -30,7 +30,21 @@
 #   N5  duplicate flags
 #   N6  raw token never lands in a deny/error audit row
 #   N7  admin token-free `receive --request … --json` -> ALLOW + audit
-#   N8  token-accepting `receive` from an agent shape -> DENIED
+#   N8  token-accepting `receive` from an agent shape -> DENIED (+ wrapper
+#       spellings: path / spacing / env-prefix / env / command / bash-opt /
+#       env -u) and R1b the bridge-auth.py runtime agent-context refusal.
+#
+# Boundary scope (#1367 r5, codex-agreed): the N8 hook denies + the R1b
+# runtime refusal are BEST-EFFORT deterrents, NOT an airtight sandbox. On a
+# shared-UID host an agent can clear BRIDGE_AGENT_ID (`env -u` / `unset`) and
+# invoke `python3 bridge-auth.py receive` directly with a pty it controls,
+# escaping both layers (codex #1367 r4). That residual is OUT of #1367's
+# threat model: such an agent can only store ITS OWN token, never the
+# operator's. #1367's actual guarantee is that the OPERATOR's token, read
+# echo-off in the operator's own terminal (R2), never transits an agent
+# transcript / argv / env / queue / audit (R2 asserts canary-absence). On
+# iso-v2 the locked registry's controller-UID ownership is the real FS
+# boundary an iso agent cannot cross.
 #
 # Footgun #11 discipline: the pty harness is a standalone file-as-argv
 # helper (1367-auth-sealed-paste-pty-helper.py), NEVER heredoc-stdin to a

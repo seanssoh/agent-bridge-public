@@ -2534,12 +2534,17 @@ def _is_bash_wrapper_receive(text: str) -> bool:
     # `env`'s VAR=value / `-u NAME` args), then bash options — codex #1367
     # r4 found `env FOO=1 bash …`, `/usr/bin/env bash …`, `command bash …`,
     # `bash --noprofile …` all ran a working token-accepting receive. NOTE
-    # this hook detector is best-effort defense-in-depth ONLY: the real
-    # boundary is the runtime agent-context refusal in bridge-auth.py
-    # cmd_receive (an agent's BRIDGE_AGENT_ID is set), which catches the
-    # unbounded remaining spellings (`sh -c`, `eval`, symlinks, …) the hook
-    # cannot enumerate. We deny the common spellings here for a clean early
-    # signal + audit; we do NOT try to be exhaustive.
+    # this hook detector is BEST-EFFORT defense-in-depth ONLY and NOT
+    # exhaustive: unbounded spellings (`sh -c "…"`, `eval`, a symlink, or
+    # invoking `python3 bridge-auth.py receive` directly) escape it, and the
+    # bridge-auth.py runtime agent-context refusal it pairs with is ALSO
+    # best-effort (an agent on a shared-UID host can clear BRIDGE_AGENT_ID +
+    # attach a pty — codex #1367 r4). Neither layer is a sandbox (CLAUDE.md).
+    # #1367's actual guarantee is that the OPERATOR's token, read echo-off in
+    # the operator's own terminal, never transits an agent transcript; an
+    # agent that bypasses both layers can only store ITS OWN token, outside
+    # that threat model. We deny the common spellings here for a clean early
+    # signal + audit.
     idx = 0
     while idx < len(tokens):
         tok = tokens[idx]

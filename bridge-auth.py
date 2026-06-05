@@ -3126,18 +3126,31 @@ def cmd_receive(args: argparse.Namespace) -> int:
     if args.request:
         return _cmd_receive_request(args, registry_path, json_mode)
 
-    # ── agent-context refusal (the runtime boundary, #1367 r4) ───────
-    # The token-ACCEPTING receive must run ONLY in the OPERATOR's own
-    # terminal, never from inside an agent. An agent's process carries
-    # BRIDGE_AGENT_ID; the operator's own shell does not (a legit
-    # operator-run receive is audited under the "operator" label). Refuse
-    # affirmatively HERE so the guarantee does NOT depend on the PreToolUse
-    # hook enumerating every shell spelling — `env`/`command`/`/usr/bin/env`
-    # /`bash -opt`/`sh -c`/symlink/… are unbounded, so the hook is only
-    # best-effort defense-in-depth; this runtime gate is the real boundary.
-    # The token-free `--request` shape returned above is unaffected, so an
-    # admin agent can still INITIATE the flow without touching a token.
-    agent_ctx = os.environ.get("BRIDGE_AGENT_ID", "").strip()  # noqa: iso-helper-boundary - agent-context gate for the operator-only token-accepting receive
+    # ── agent-context refusal (BEST-EFFORT deterrent, #1367 r4/r5) ───
+    # #1367's SECURITY GUARANTEE is narrow and holds BY CONSTRUCTION: when
+    # the OPERATOR runs `receive` from THEIR OWN terminal, the token is read
+    # echo-off from /dev/tty (below) and never transits an agent's
+    # transcript / argv / env / queue / audit. That guarantee does NOT
+    # depend on this check.
+    #
+    # This refusal is a BEST-EFFORT DETERRENT, NOT an airtight boundary. An
+    # agent process carries BRIDGE_AGENT_ID and the operator's own shell
+    # does not, so we refuse affirmatively when it is set. But
+    # BRIDGE_AGENT_ID is CALLER-CONTROLLED: on a SHARED-UID host (e.g.
+    # macOS) an agent has the same powers as the operator and can clear it
+    # (`env -u BRIDGE_AGENT_ID` / `unset` / invoke this entrypoint directly)
+    # and attach a pty to reach the token-accepting write (codex #1367 r4
+    # proof). That residual is acceptable because such an agent can only
+    # store ITS OWN token — it does not possess the operator's — so it is
+    # OUTSIDE #1367's threat model; and per CLAUDE.md the hook/runtime are a
+    # containment+audit layer, NOT a sandbox. On iso-v2 (UID-separated
+    # Linux) the locked registry's controller-UID ownership is the real FS
+    # boundary an iso agent cannot cross. The PreToolUse hook
+    # (_is_bash_wrapper_receive) is a parallel best-effort deterrent for the
+    # common bash-wrapper spellings. The token-free `--request` shape
+    # returned above is unaffected, so an admin agent can still INITIATE the
+    # flow without touching a token.
+    agent_ctx = os.environ.get("BRIDGE_AGENT_ID", "").strip()  # noqa: iso-helper-boundary - best-effort agent-context deterrent for the operator-only token-accepting receive
     if agent_ctx:
         _sealed_receive_audit(
             "tool_policy_credential_sealed_receive_refused_agent_context",
