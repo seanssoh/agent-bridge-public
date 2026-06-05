@@ -1672,6 +1672,154 @@ bridge_mcp_orphan_cleanup_after_session_stop() {
   bridge_mcp_orphan_cleanup "session-stop:${agent}" "$min_age" 1
 }
 
+# ---------------------------------------------------------------------------
+# Incident #9770 Track 2 — surgical per-session codex app-server subtree reap.
+#
+# Codex launches in a tmux pane (bridge-state.sh:111/113/161) and internally
+# spawns a `codex app-server` child + Pencil `mcp-server-darwin-arm64`
+# grandchildren whose PIDs are tracked nowhere. The global orphan cleaner
+# (bridge_mcp_orphan_cleanup) deliberately does NOT match codex (a live roster
+# `codex resume` must never be a global-kill candidate), so on teardown the
+# app-server reparents to a non-PPID-1 ancestor on macOS and survives → a
+# linear memory leak (incident #9770).
+#
+# These helpers reap ONLY the descendant subtree of the SPECIFIC torn-down
+# session's tmux pane PID, filtered to the codex/app-server/MCP allowlist that
+# lives in bridge-mcp-cleanup.py (`subtree` subcommand). The blast-radius
+# guarantee is by construction: a live roster codex / in-progress reviewer is a
+# descendant of ITS OWN live pane, never of a different torn-down session, and
+# the operator's interactive codex is not a bridge-pane descendant at all — so
+# neither can ever appear in the captured set. The Python is invoked
+# file-as-argv (no heredoc-stdin → footgun #11).
+bridge_codex_subtree_enabled() {
+  [[ "${BRIDGE_CODEX_SUBTREE_REAP_ENABLED:-1}" == "1" ]]
+}
+
+# Resolve the tmux pane PID for a session, validated numeric. Empty on failure.
+bridge_codex_subtree_pane_pid() {
+  local session="$1"
+  local pane_pid=""
+
+  [[ -n "$session" ]] || return 0
+  pane_pid="$(bridge_tmux_session_pane_pid "$session" 2>/dev/null || true)"
+  [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 0
+  printf '%s' "$pane_pid"
+}
+
+# Capture (without reaping) the codex/app-server/MCP descendants of the
+# session's pane. Used on the daemon idle/orphan-kill path BEFORE
+# `tmux kill-session`, so the set is resolved while the pane is still alive and
+# then reaped after the kill. Emits the captured-set JSON on stdout (the full
+# `subtree --capture-only` report). Emits nothing when the pane PID cannot be
+# resolved (caller treats that as skip+audit, never a global sweep).
+bridge_codex_subtree_capture() {
+  local session="$1"
+  local pane_pid=""
+
+  bridge_codex_subtree_enabled || return 0
+  pane_pid="$(bridge_codex_subtree_pane_pid "$session")"
+  [[ -n "$pane_pid" ]] || return 0
+
+  bridge_require_python
+  python3 "$BRIDGE_SCRIPT_DIR/bridge-mcp-cleanup.py" subtree \
+    --root-pid "$pane_pid" --capture-only --json 2>/dev/null || true
+}
+
+# Reap a previously-captured subtree set (the JSON emitted by
+# bridge_codex_subtree_capture). Revalidates each PID against its captured
+# metadata immediately before every signal (PID-reuse defense, in the Python).
+# Fail-soft + idempotent; never breaks the caller's teardown.
+bridge_codex_subtree_reap_captured() {
+  local label="$1"
+  local root_pid="$2"
+  local captured_json="$3"
+  local trigger="${4:-codex-subtree}"
+  local pids_json=""
+  local report=""
+
+  bridge_codex_subtree_enabled || return 0
+  [[ "$root_pid" =~ ^[0-9]+$ ]] || return 0
+
+  # Extract the captured array from the capture-only report; if absent or the
+  # report is empty, there is nothing to reap.
+  pids_json="$(bridge_codex_subtree_extract_captured "$captured_json")"
+  [[ -n "$pids_json" && "$pids_json" != "[]" ]] || return 0
+
+  bridge_require_python
+  report="$(python3 "$BRIDGE_SCRIPT_DIR/bridge-mcp-cleanup.py" subtree \
+    --root-pid "$root_pid" --pids-json "$pids_json" --trigger "$trigger" \
+    --json 2>/dev/null || true)"
+  bridge_codex_subtree_audit "$label" "$root_pid" "$report"
+}
+
+# One-shot capture+reap of the session's own pane subtree. Used on the clean
+# pane-exit path (bridge-run.sh) and bridge_kill_agent_session, where the pane
+# is still alive at reap time so a single resolve is race-free. Skips + audits
+# (never a global sweep) when the pane PID is unresolvable.
+bridge_codex_subtree_reap_for_session() {
+  local session="$1"
+  local label="${2:-$session}"
+  local trigger="${3:-codex-subtree}"
+  local pane_pid=""
+  local report=""
+
+  bridge_codex_subtree_enabled || return 0
+  [[ -n "$session" ]] || return 0
+
+  pane_pid="$(bridge_codex_subtree_pane_pid "$session")"
+  if [[ -z "$pane_pid" ]]; then
+    bridge_audit_log daemon codex_subtree_reap_skipped_no_pane codex \
+      --detail "label=${label}" --detail "session=${session}" \
+      --detail "reason=pane-pid-unresolvable" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  bridge_require_python
+  report="$(python3 "$BRIDGE_SCRIPT_DIR/bridge-mcp-cleanup.py" subtree \
+    --root-pid "$pane_pid" --trigger "$trigger" --json 2>/dev/null || true)"
+  bridge_codex_subtree_audit "$label" "$pane_pid" "$report"
+}
+
+# Parse the `captured` array out of a `subtree --capture-only` JSON report,
+# re-emitting it as a compact JSON list for `--pids-json`. Empty string when the
+# report is missing/unparseable (caller no-ops). Pure stdlib json; no secrets.
+bridge_codex_subtree_extract_captured() {
+  local report="$1"
+
+  [[ -n "$report" ]] || return 0
+  bridge_require_python
+  python3 "$BRIDGE_SCRIPT_DIR/bridge-mcp-cleanup.py" subtree-extract-captured \
+    --report "$report" 2>/dev/null || true
+}
+
+# Emit a redacted audit row for a subtree reap. Only safe metadata leaves the
+# process: pane_pid, captured/killed/skipped counts, freed-MB estimate — never
+# the command strings (which can carry cwd/paths). Best-effort.
+bridge_codex_subtree_audit() {
+  local label="$1"
+  local root_pid="$2"
+  local report="$3"
+  local summary=""
+
+  [[ -n "$report" ]] || return 0
+  bridge_require_python
+  # The helper prints space-separated `key=value` tokens (already redacted) or
+  # nothing when there was no reap activity worth recording.
+  summary="$(python3 "$BRIDGE_SCRIPT_DIR/bridge-mcp-cleanup.py" subtree-audit-summary \
+    --report "$report" 2>/dev/null || true)"
+  [[ -n "$summary" ]] || return 0
+
+  local -a detail_args=()
+  detail_args+=(--detail "label=${label}")
+  detail_args+=(--detail "pane_pid=${root_pid}")
+  local token=""
+  for token in $summary; do
+    detail_args+=(--detail "$token")
+  done
+  bridge_audit_log daemon codex_session_subtree_reaped codex \
+    "${detail_args[@]}" >/dev/null 2>&1 || true
+}
+
 bridge_dynamic_agent_ids() {
   local agent
 

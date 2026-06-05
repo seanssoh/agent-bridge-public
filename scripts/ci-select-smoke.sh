@@ -142,6 +142,11 @@ add_required 8807-cron-backfill-coalesce
 # scripts/smoke/* catch-all → add_all_required_static — still re-runs the
 # reaper-pattern smoke.
 add_required 8807-mcp-reaper-patterns
+# Incident #9770 Track 2: surgical per-session codex app-server / Pencil MCP
+# subtree reap. In the full static suite so a change to bridge-mcp-cleanup.py,
+# the helper, or any of the three teardown seams (bridge-run.sh /
+# bridge_kill_agent_session / daemon idle-kill) re-runs the #1-invariant proof.
+add_required 9770-codex-teardown-reap
 # #8945 Track A: the engine-aware urgent-nudge-body smoke. In the full static
 # suite so a scripts/smoke/* or lib/bridge-agents.sh change re-runs it via the
 # catch-all. (1067-codex-provisioning is already listed above.)
@@ -491,7 +496,23 @@ select_for_path() {
         # corrupts the preserved mode. Pull the smoke on every bridge-state.sh
         # move so a refactor cannot silently revert to the wrong-order class.
         add_required 1402-stat-platform-order
+        # Incident #9770 Track 2: lib/bridge-state.sh hosts the codex subtree
+        # reap helpers (bridge_codex_subtree_capture / _reap_captured /
+        # _reap_for_session / _audit) that all three teardown seams call, plus
+        # the redacted audit summary. Pull 9770-codex-teardown-reap on every
+        # bridge-state.sh move so a refactor cannot drop a helper, leak command
+        # strings into the audit, or weaken the within-subtree allowlist filter.
+        add_required 9770-codex-teardown-reap
       fi
+      ;;
+
+    bridge-run.sh)
+      # Incident #9770 Track 2: bridge-run.sh's bridge_run_cleanup_mcp_orphans
+      # is the clean-pane-exit teardown seam that one-shot captures+reaps the
+      # session's own codex pane subtree (while the pane is still alive). Pull
+      # 9770-codex-teardown-reap on every bridge-run.sh move so a refactor
+      # cannot drop the clean-exit subtree reap or its skip+audit fallback.
+      add_required 9770-codex-teardown-reap
       ;;
   esac
 
@@ -1444,6 +1465,13 @@ select_for_path() {
       # pressure-relief ordering and the single-invocation invariant cannot
       # silently regress.
       add_required 8807-mcp-reaper-patterns
+      # Incident #9770 Track 2: bridge-daemon.sh's reap_idle_orphan_sessions is
+      # one of the three central teardown seams that capture the codex pane
+      # subtree BEFORE `tmux kill-session` and reap it after. Pull
+      # 9770-codex-teardown-reap on every bridge-daemon.sh move so a refactor
+      # cannot drop the capture-before-kill ordering or the skip+audit (never a
+      # global sweep) when the pane PID is unresolvable.
+      add_required 9770-codex-teardown-reap
       # PR-B / #1520b: bridge-daemon.sh's bridge_daemon_autostart_allowed
       # gained the credential-pending hold predicate (return-hold-without-
       # backoff while the marker is present + the credential absent, lazy
@@ -1478,6 +1506,14 @@ select_for_path() {
       # the control matrix and the pre-TERM/pre-KILL revalidation cannot
       # regress.
       add_required 8807-mcp-reaper-patterns
+      # Incident #9770 Track 2: the reaper now hosts the surgical per-session
+      # subtree mode (capture_subtree / reap_captured / kill_pid_subtree +
+      # SUBTREE_ALLOWLIST_PATTERNS, kept OUT of DEFAULT_PATTERNS). Pull
+      # 9770-codex-teardown-reap on every reaper move so a refactor cannot
+      # weaken the #1 invariant (a live roster codex / in-progress review is
+      # never killed), leak codex names into the global DEFAULT_PATTERNS, or
+      # regress the per-signal PID-reuse revalidation.
+      add_required 9770-codex-teardown-reap
       ;;
 
     lib/bridge-daemon-control.sh|scripts/install-daemon-systemd.sh|scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template)
