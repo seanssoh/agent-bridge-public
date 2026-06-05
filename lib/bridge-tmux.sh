@@ -1506,8 +1506,32 @@ bridge_tmux_pending_attention_with_lock() {
 
   lock_dir="$(bridge_agent_pending_attention_lock_dir "$agent")"
   pid_file="$lock_dir/holder.pid"
-  mkdir -p "$(dirname "$lock_dir")"
+  # Issue #9981: distinguish a *permission* failure on the spool dir from
+  # genuine lock contention. The spool now anchors on the controller-owned
+  # state leaf (bridge_agent_pending_attention_state_dir → state/agents/<a>/),
+  # so a controller can normally always create it. But if the leaf is
+  # unwritable for any reason (rm'd + self-heal could not recover, an
+  # operator-misconfigured mode, a non-standard host), a `mkdir` EACCES used
+  # to masquerade as contention and burn all 200 retries with a misleading
+  # "lock contention" warning before giving up. Fast-fail instead: emit ONE
+  # clear warning and return so the caller keeps its durable-queue delivery
+  # without spamming the log — never block the urgent send on a spool that
+  # cannot be written.
+  if ! mkdir -p "$(dirname "$lock_dir")" 2>/dev/null; then
+    bridge_warn "pending-attention spool dir unwritable for '$agent' ($(dirname "$lock_dir")); skipping instant-wake spool — task remains queued for poll delivery"
+    return 75
+  fi
   while ! mkdir "$lock_dir" 2>/dev/null; do
+    # If the lock dir itself cannot be created because of a *permission*
+    # error (the parent exists and is traversable per the mkdir -p above,
+    # but the controller still cannot create a child — e.g. the leaf is
+    # owned by another UID with no group write), this is NOT contention and
+    # retrying 200× is pointless. Probe via a writability test on the parent
+    # and fast-fail with a single warning.
+    if [[ ! -d "$lock_dir" ]] && [[ ! -w "$(dirname "$lock_dir")" ]]; then
+      bridge_warn "pending-attention spool dir unwritable for '$agent' ($(dirname "$lock_dir")); skipping instant-wake spool — task remains queued for poll delivery"
+      return 75
+    fi
     # Stale-lock recovery: if the holder PID file exists and the holder
     # process is gone, reclaim the lock dir. This avoids the previous
     # implementation's force-rmdir-after-N-attempts which could yank the
@@ -1539,6 +1563,102 @@ bridge_tmux_pending_attention_with_lock() {
   return $rc
 }
 
+# bridge_tmux_pending_attention_publish_group_read — make the controller-owned
+# pending-attention spool file READABLE by the isolated agent that consumes it.
+#
+# Issue #9981 (read-side, the r1 follow-up gap): the spool now anchors on the
+# controller-owned state leaf (state/agents/<a>/, owner=controller, mode 2770
+# group=ab-agent-<a> when iso-v2 is effective — see
+# bridge_agent_state_dir_self_heal). The WRITE side is fixed: the controller
+# owns the leaf, so it can always create + append the spool. But the spool file
+# itself is written by `printf >>` under bridge-lib.sh's umask 077, so it lands
+# mode 0600 owner=controller. The CONSUMER of this spool is the ISO AGENT, not
+# the controller: hooks/bridge_hook_common.py runs inside the agent's session
+# (UID agent-bridge-<a>, member of ab-agent-<a>) and reads
+# state/agents/<a>/pending-attention.env to surface "N queued external
+# event(s)" at prompt time. With mode 0600 the agent UID — a group member but
+# not the owner — gets EACCES on the read; the hook silently treats the OSError
+# as zero pending events, so the instant-wake count never surfaces and the
+# urgent degrades to self-poll latency (the same user-visible failure as the
+# pre-r1 write EACCES, just moved to the read side).
+#
+# This is the iso cross-class CONTROLLER-PUBLISHED pattern (CLAUDE.md §"Working
+# with isolated agents"): the controller writes the file as owner, binds it to
+# the per-agent group ab-agent-<a>, and sets mode 0640 (owner rw, group r--) so
+# the agent can READ — and only read — the marker. The setgid parent (2770)
+# already lands new files in ab-agent-<a>, but we chgrp explicitly so the
+# publish is correct even if the parent's setgid bit was lost (operator rm +
+# umask-077 self-heal recreate). We publish ONLY this one marker file
+# group-readable; nothing else in the controller's state/ leaf is opened to the
+# agent group, and no group-WRITE is granted (the agent only consumes, never
+# writes, the spool).
+#
+# Gated on bridge_agent_linux_user_isolation_effective: for non-iso / shared /
+# non-Linux installs this is a no-op, so the spool file keeps its byte-identical
+# umask-077 0600 mode (the controller is both writer and reader there, and
+# ab-agent-<a> is not a real OS group).
+bridge_tmux_pending_attention_publish_group_read() {
+  local agent="$1"
+  local spool_file="$2"
+  [[ -n "$agent" && -n "$spool_file" && -f "$spool_file" ]] || return 0
+  # Non-iso / shared / non-Linux → no group-publish; leave umask-077 0600.
+  if ! declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    return 0
+  fi
+  # Bind the marker to the agent's per-agent group so the group read bit below
+  # confines visibility to controller + the agent's isolated UID (and only
+  # them). The setgid parent (state/agents/<a>/ at 2770 group=ab-agent-<a>)
+  # normally already lands new files in the right group; the explicit chgrp
+  # covers a parent that lost setgid.
+  #
+  # FAIL-CLOSED (codex r2): we must NOT open the group-read bit unless the file
+  # actually carries the agent's per-agent group. If the group resolver is
+  # absent, returns empty, or the chgrp fails, the file may still hold the
+  # controller's primary group (or a stale wrong group) — chmod 0640 there would
+  # expose the marker to the WRONG group while STILL leaving the iso agent
+  # unable to read it (it is not in that group). In every such case we leave the
+  # file owner-only (0600): the iso read stays blocked (the same degraded poll
+  # latency, surfaced via the existing self-heal warning path), but we never
+  # mis-publish to an unintended group.
+  local agent_grp=""
+  if declare -F bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+    agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null)" || agent_grp=""
+  fi
+  if [[ -z "$agent_grp" ]]; then
+    return 0
+  fi
+  # Stat the CURRENT group FIRST (codex r3 — the iso stale-supp-group case this
+  # track exists to fix). The setgid parent (state/agents/<a>/ at 2770
+  # group=ab-agent-<a>) normally already lands new files in the right group, so
+  # a long-running controller whose live supplementary-group set is STALE
+  # (#1025/#1207/#1378 class) can have the file ALREADY in ab-agent-<a> while
+  # being UNABLE to chgrp to that same group. Requiring chgrp-success here would
+  # leave such a marker at 0600 and the iso agent still unable to read it. So:
+  # accept current-group == target WITHOUT a chgrp; only attempt chgrp when the
+  # group DIFFERS, and keep the post-chgrp re-stat fail-closed gate.
+  local cur_grp=""
+  cur_grp="$(stat -c %G "$spool_file" 2>/dev/null || stat -f %Sg "$spool_file" 2>/dev/null)"
+  if [[ "$cur_grp" != "$agent_grp" ]]; then
+    # Group differs → try to bind it, then RE-STAT to confirm (fail-closed: a
+    # chgrp that fails / silently no-ops must NOT lead to a wrong-group 0640).
+    chgrp "$agent_grp" "$spool_file" 2>/dev/null || true
+    cur_grp="$(stat -c %G "$spool_file" 2>/dev/null || stat -f %Sg "$spool_file" 2>/dev/null)"
+    if [[ "$cur_grp" != "$agent_grp" ]]; then
+      # Still not the per-agent group → leave owner-only 0600 (iso read stays
+      # blocked, surfaced via the self-heal warning; never mis-published).
+      return 0
+    fi
+  fi
+  # 0640: controller (owner) read/write, agent (group) read-only. The agent is
+  # the wake CONSUMER — it must read this to surface the queued-event count, but
+  # it never writes the spool, so no group-write is granted.
+  chmod 0640 "$spool_file" 2>/dev/null || true
+  return 0
+}
+
 _bridge_tmux_pending_attention_append_locked() {
   local agent="$1"
   local text="$2"
@@ -1551,6 +1671,11 @@ _bridge_tmux_pending_attention_append_locked() {
   ts="$(date +%s)"
   escaped="$(bridge_tmux_pending_attention_escape "$text")"
   printf '%s\t%s\n' "$ts" "$escaped" >>"$spool_file"
+  # Issue #9981 (read-side): publish the marker group-readable so the iso AGENT
+  # (the wake consumer, member of ab-agent-<a>) can READ it via the prompt-
+  # context hook. No-op on non-iso installs (byte-identical 0600). See the
+  # publish helper's docstring for the controller-published-pattern rationale.
+  bridge_tmux_pending_attention_publish_group_read "$agent" "$spool_file"
 }
 
 bridge_tmux_pending_attention_append() {
@@ -1592,6 +1717,10 @@ _bridge_tmux_pending_attention_prepend_locked() {
     cat "$spool_file" >>"$tmp"
   fi
   mv "$tmp" "$spool_file"
+  # Issue #9981 (read-side): mktemp+mv lands a fresh 0600 file, dropping any
+  # prior group-read publish. Re-publish so the iso AGENT can still read the
+  # re-queued spool. No-op on non-iso installs (byte-identical 0600).
+  bridge_tmux_pending_attention_publish_group_read "$agent" "$spool_file"
 }
 
 bridge_tmux_pending_attention_prepend() {

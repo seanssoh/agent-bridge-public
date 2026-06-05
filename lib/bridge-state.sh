@@ -3153,14 +3153,59 @@ bridge_agent_maybe_expire_next_session() {
   printf '%s' "$age_seconds"
 }
 
+# bridge_agent_pending_attention_state_dir — resolve the directory that holds
+# the per-agent pending-attention spool (pending-attention.env) and its lock
+# (pending-attention.lock).
+#
+# Issue #9981: the pending-attention spool is the ONLY mechanism that keeps a
+# busy-gate / booting-gate inject (urgent send, daemon nudge) from being
+# dropped — and, for an always-on iso agent, it is also what carries the
+# *instant* wake when `urgent` runs while the bot is mid-turn. Every spool
+# reader/writer is CONTROLLER-side: the writer
+# (bridge_tmux_pending_attention_append, reached from bridge-send.sh's
+# controller `urgent` path and from bridge_dispatch_notification's booting
+# branch) and the daemon flush (bridge_tmux_pending_attention_flush) both run
+# as the controller; the isolated UID never reads or writes this spool (the
+# only consumers are bridge-daemon.sh, bridge-notify.sh, and bridge-send.sh).
+#
+# Previously this resolved through bridge_agent_runtime_state_dir, which for
+# iso-v2 agents returns `data/agents/<a>/runtime/` (owner=agent-bridge-<a>,
+# group=ab-agent-<a>, under the per-agent root `data/agents/<a>/` at 2750
+# root:ab-agent-<a>). The controller is NOT the owner of those leaves — it
+# holds only group bits — and its live supplementary-group set may not yet
+# include `ab-agent-<a>` (the #1025/#1207/#1378 stale-supp-group class: a
+# long-running controller/daemon process does not pick up a freshly-added
+# group until re-login). So the controller's `mkdir` of the lock dir fails
+# with `Permission denied`, the lock loop burns all 200 attempts, warns, and
+# gives up — the instant wake is silently lost and the urgent degrades to the
+# bot's self-poll latency (~1-2 min).
+#
+# This is the SAME class #1378 already fixed for the controller-only
+# `session.lock` by re-anchoring it on the controller-owned state leaf
+# (bridge_agent_idle_marker_dir → `state/agents/<a>/`, owner=controller mode
+# 2770). The controller is the OWNER of that leaf, so it can always create +
+# write the spool/lock regardless of its live group set, and the iso boundary
+# is untouched — the controller already owns `state/agents/<a>/`, nothing new
+# is granted into the iso home, and the iso UID loses nothing because it never
+# touched the spool. The pending-attention spool was simply left on the
+# iso-owned runtime dir when #1378 re-anchored its sibling.
+#
+# For non-iso / shared / non-Linux installs this is a no-op:
+# bridge_agent_runtime_state_dir already returns bridge_agent_idle_marker_dir
+# there, so the resolved path is byte-identical to the prior behaviour.
+bridge_agent_pending_attention_state_dir() {
+  local agent="$1"
+  bridge_agent_idle_marker_dir "$agent"
+}
+
 bridge_agent_pending_attention_file() {
   local agent="$1"
-  printf '%s/pending-attention.env' "$(bridge_agent_runtime_state_dir "$agent")"
+  printf '%s/pending-attention.env' "$(bridge_agent_pending_attention_state_dir "$agent")"
 }
 
 bridge_agent_pending_attention_lock_dir() {
   local agent="$1"
-  printf '%s/pending-attention.lock' "$(bridge_agent_runtime_state_dir "$agent")"
+  printf '%s/pending-attention.lock' "$(bridge_agent_pending_attention_state_dir "$agent")"
 }
 
 bridge_agent_initial_inbox_marker_file() {
