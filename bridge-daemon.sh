@@ -2897,6 +2897,12 @@ bridge_a2a_write_supervise_state() {
   local state_file="$1" restart_count="$2" last_restart_ts="$3" \
     consec_unhealthy="$4" alarm="$5" last_reason="$6" last_exit_event="$7" \
     last_exit_detail="$8" last_admin_task_ts="$9"
+  # #1563 PR-4: trailing-optional circuit-breaker state (existing 9-arg
+  # callers stay valid — they write empty new fields). error_class is the last
+  # classified supervision class; breaker_key is the config fingerprint that
+  # keys the breaker (a config edit changes it -> the breaker resets);
+  # consec_transient is the per-key consecutive transient-failure count.
+  local error_class="${10:-}" breaker_key="${11:-}" consec_transient="${12:-0}"
   {
     printf 'A2A_RECEIVER_RESTART_COUNT=%s\n' "$(printf '%q' "$restart_count")"
     printf 'A2A_RECEIVER_LAST_RESTART_TS=%s\n' "$(printf '%q' "$last_restart_ts")"
@@ -2906,8 +2912,128 @@ bridge_a2a_write_supervise_state() {
     printf 'A2A_RECEIVER_LAST_EXIT_EVENT=%s\n' "$(printf '%q' "$last_exit_event")"
     printf 'A2A_RECEIVER_LAST_EXIT_DETAIL=%s\n' "$(printf '%q' "$last_exit_detail")"
     printf 'A2A_RECEIVER_LAST_ADMIN_TASK_TS=%s\n' "$(printf '%q' "$last_admin_task_ts")"
+    printf 'A2A_RECEIVER_ERROR_CLASS=%s\n' "$(printf '%q' "$error_class")"
+    printf 'A2A_RECEIVER_BREAKER_KEY=%s\n' "$(printf '%q' "$breaker_key")"
+    printf 'A2A_RECEIVER_CONSEC_TRANSIENT=%s\n' "$(printf '%q' "$consec_transient")"
   } >"$state_file" 2>/dev/null || true
   chmod 0600 "$state_file" 2>/dev/null || true
+}
+
+# #1563 PR-4: file ONE cooldown-gated admin task for a held/open receiver and
+# echo the new last_admin_task_ts. Shared by the crash-loop cap, the
+# circuit-open (repeated transient bind failure), and the auth/config hold
+# branches so the escalate-once-per-cooldown + the task-create-failure
+# visibility are identical across all three. On a task-create FAILURE we emit a
+# structured `a2a_receiver_escalation_task_create_failed` audit (replacing the
+# previously-swallowed `|| true` / bare warn) and RETAIN the old
+# last_admin_task_ts so the next eligible tick retries — the failure is never
+# silently dropped.
+#
+# Echoes the (possibly-updated) last_admin_task_ts on stdout. Args:
+#   $1 alarm_kind     — crashloop | circuit_open | auth_config_hold
+#   $2 admin          — BRIDGE_ADMIN_AGENT_ID ("" => no-op, echo old ts)
+#   $3 now
+#   $4 last_admin_ts  — previous escalation ts (cooldown anchor)
+#   $5 admin_cooldown — seconds between escalations
+#   $6 reason / $7 exit_event / $8 exit_detail / $9 error_class
+#   ${10} restarts-or-failures count / ${11} max / ${12} window-seconds
+#   ${13} exit_json / ${14} log_file
+bridge_a2a_receiver_escalate() {
+  local alarm_kind="$1" admin="$2" now="$3" last_admin_ts="$4" \
+    admin_cooldown="$5" reason="$6" exit_event="$7" exit_detail="$8" \
+    error_class="$9" count="${10}" max="${11}" window="${12}" \
+    exit_json="${13}" log_file="${14}"
+  [[ "$now" =~ ^[0-9]+$ ]] || now=0
+  [[ "$last_admin_ts" =~ ^[0-9]+$ ]] || last_admin_ts=0
+  [[ "$admin_cooldown" =~ ^[0-9]+$ ]] || admin_cooldown=1800
+
+  # No admin configured, or still inside the cooldown — echo the old ts and
+  # return WITHOUT filing (escalate-once-per-cooldown).
+  if [[ -z "$admin" ]] || (( now - last_admin_ts < admin_cooldown )); then
+    printf '%s' "$last_admin_ts"
+    return 0
+  fi
+
+  local target_bridge=""
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  fi
+  if [[ -z "$target_bridge" ]]; then
+    # No CLI to file with — surface it as a structured failure (not silent) and
+    # retain the old ts so a later tick (once a CLI is present) retries.
+    bridge_audit_log daemon a2a_receiver_escalation_task_create_failed daemon \
+      --detail alarm_kind="$alarm_kind" \
+      --detail reason="no_agent_bridge_cli" >/dev/null 2>&1 || true
+    printf '%s' "$last_admin_ts"
+    return 0
+  fi
+
+  local title body_intro
+  case "$alarm_kind" in
+    circuit_open)
+      title="[A2A] receiver bind backoff — circuit OPEN, auto-restart paused"
+      body_intro="repeatedly failed its fail-closed tailnet bind ($count consecutive transient failures) and the supervisor has OPENED the circuit breaker — auto-restart is paused with exponential backoff to stop a hot bind crash-loop."
+      ;;
+    auth_config_hold)
+      title="[A2A] receiver auth/config error — auto-restart HELD"
+      body_intro="failed to start with a NON-transient auth/config error ($reason) — retrying cannot fix it, so the supervisor is HOLDING auto-restart until the operator corrects the configuration."
+      ;;
+    *)
+      title="[A2A] receiver crash-loop — auto-restart stopped"
+      body_intro="restarted $count time(s) within ${window}s and is now held — the daemon supervisor has STOPPED auto-restarting it to avoid a hot crash loop."
+      ;;
+  esac
+
+  local body_file
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-receiver-escalate.md.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-receiver-escalate.$$.$RANDOM")"
+  {
+    printf '# %s\n\n' "$title"
+    printf 'The A2A receiver daemon (bridge-handoffd.py) %s\n\n' "$body_intro"
+    printf '## State\n\n'
+    printf -- '- last_reason: `%s`\n' "$reason"
+    printf -- '- error_class: `%s`\n' "${error_class:-unknown}"
+    if [[ -n "$exit_event" ]]; then
+      printf -- '- last_exit_event: `%s`\n' "$exit_event"
+    fi
+    if [[ -n "$exit_detail" ]]; then
+      printf -- '- last_exit_detail: `%s`\n' "$exit_detail"
+    fi
+    printf -- '- count: %s%s\n' "$count" "$( [[ "$alarm_kind" == crashloop ]] && printf '/%s within %ss' "$max" "$window" || printf ' consecutive' )"
+    printf '\n## Next steps\n\n'
+    printf '1. Inspect the captured exit cause:\n'
+    printf '   `%s`\n' "$exit_json"
+    printf '2. Check the receiver log tail:\n'
+    printf '   `%s`\n' "$log_file"
+    if [[ "$alarm_kind" == auth_config_hold ]]; then
+      printf '3. Fix the receiver config/secret (handoff.local.json), then\n'
+      printf '   `agb a2a daemon restart`. The hold clears on a healthy bind.\n'
+    else
+      printf '3. If the bind is unprovable (tailnet down / IP drift),\n'
+      printf '   confirm `agb a2a daemon reconcile` resolves a valid bind,\n'
+      printf '   then `agb a2a daemon restart`.\n'
+      printf '4. The supervisor resumes auto-restart on a healthy probe.\n'
+    fi
+  } >"$body_file"
+
+  local new_ts="$last_admin_ts"
+  if "$target_bridge" task create \
+       --to "$admin" --priority high --from daemon \
+       --title "$title" \
+       --body-file "$body_file" --force >/dev/null 2>&1; then
+    new_ts="$now"
+  else
+    # NOT swallowed: emit a structured audit + retain the old ts so the next
+    # eligible tick retries the escalation.
+    bridge_audit_log daemon a2a_receiver_escalation_task_create_failed daemon \
+      --detail alarm_kind="$alarm_kind" \
+      --detail admin="$admin" \
+      --detail reason=task_create_nonzero >/dev/null 2>&1 || true
+    daemon_warn "[a2a_receiver_supervise] $alarm_kind admin task-create FAILED (audited a2a_receiver_escalation_task_create_failed); will retry after cooldown"
+  fi
+  rm -f "$body_file" 2>/dev/null || true
+  printf '%s' "$new_ts"
 }
 
 process_a2a_receiver_supervise_tick() {
@@ -2966,10 +3092,12 @@ process_a2a_receiver_supervise_tick() {
   local A2A_RECEIVER_RESTART_COUNT="" A2A_RECEIVER_LAST_RESTART_TS="" \
     A2A_RECEIVER_CONSEC_UNHEALTHY="" A2A_RECEIVER_ALARM="" \
     A2A_RECEIVER_LAST_REASON="" A2A_RECEIVER_LAST_EXIT_EVENT="" \
-    A2A_RECEIVER_LAST_EXIT_DETAIL="" A2A_RECEIVER_LAST_ADMIN_TASK_TS=""
+    A2A_RECEIVER_LAST_EXIT_DETAIL="" A2A_RECEIVER_LAST_ADMIN_TASK_TS="" \
+    A2A_RECEIVER_ERROR_CLASS="" A2A_RECEIVER_BREAKER_KEY="" \
+    A2A_RECEIVER_CONSEC_TRANSIENT=""
   if [[ -f "$state_file" ]]; then
     daemon_source_state_file "$state_file" "a2a-receiver-supervise" 0 "" \
-      "A2A_RECEIVER_RESTART_COUNT A2A_RECEIVER_LAST_RESTART_TS A2A_RECEIVER_CONSEC_UNHEALTHY A2A_RECEIVER_ALARM A2A_RECEIVER_LAST_REASON A2A_RECEIVER_LAST_EXIT_EVENT A2A_RECEIVER_LAST_EXIT_DETAIL A2A_RECEIVER_LAST_ADMIN_TASK_TS" \
+      "A2A_RECEIVER_RESTART_COUNT A2A_RECEIVER_LAST_RESTART_TS A2A_RECEIVER_CONSEC_UNHEALTHY A2A_RECEIVER_ALARM A2A_RECEIVER_LAST_REASON A2A_RECEIVER_LAST_EXIT_EVENT A2A_RECEIVER_LAST_EXIT_DETAIL A2A_RECEIVER_LAST_ADMIN_TASK_TS A2A_RECEIVER_ERROR_CLASS A2A_RECEIVER_BREAKER_KEY A2A_RECEIVER_CONSEC_TRANSIENT" \
       || true
   fi
   local restart_count="${A2A_RECEIVER_RESTART_COUNT:-0}"
@@ -2980,18 +3108,30 @@ process_a2a_receiver_supervise_tick() {
   local last_exit_event="${A2A_RECEIVER_LAST_EXIT_EVENT:-}"
   local last_exit_detail="${A2A_RECEIVER_LAST_EXIT_DETAIL:-}"
   local last_admin_task_ts="${A2A_RECEIVER_LAST_ADMIN_TASK_TS:-}"
+  # #1563 PR-4 circuit-breaker state.
+  local prev_error_class="${A2A_RECEIVER_ERROR_CLASS:-}"
+  local breaker_key="${A2A_RECEIVER_BREAKER_KEY:-}"
+  local consec_transient="${A2A_RECEIVER_CONSEC_TRANSIENT:-0}"
   [[ "$restart_count" =~ ^[0-9]+$ ]] || restart_count=0
   [[ "$last_restart_ts" =~ ^[0-9]+$ ]] || last_restart_ts=0
   [[ "$consec_unhealthy" =~ ^[0-9]+$ ]] || consec_unhealthy=0
   [[ "$last_admin_task_ts" =~ ^[0-9]+$ ]] || last_admin_task_ts=0
+  [[ "$consec_transient" =~ ^[0-9]+$ ]] || consec_transient=0
 
   # Restart-window reset: if the last restart is older than the window, the
   # counter (and any alarm) is stale — a fresh window starts clean. A healthy
   # probe below ALSO resets, but this covers a long-quiet host that crossed
   # the window with the alarm still set.
+  # #1563 PR-4: the same staleness applies to the circuit breaker — a host that
+  # crossed the window quiet should not inherit a near-open transient counter /
+  # stale error_class on its next failure (the same "fresh schedule" rationale
+  # the healthy-probe reset below documents). Reset the breaker state too so a
+  # post-window failure starts a clean backoff schedule.
   if (( restart_count > 0 )) && (( now - last_restart_ts >= restart_window )); then
     restart_count=0
     alarm=""
+    consec_transient=0
+    prev_error_class=""
   fi
 
   # --- stage 1: process gate (cheap; no new code, reuse the lib helper) ---
@@ -3034,16 +3174,27 @@ process_a2a_receiver_supervise_tick() {
     if (( probe_rc == 0 )) && [[ "$healthz_reason" == "healthy" ]]; then
       # Healthy — reset the consec-unhealthy counter, clear any alarm, and
       # reset the restart counter so a recovered receiver starts clean.
-      if (( consec_unhealthy != 0 )) || (( restart_count != 0 )) || [[ -n "$alarm" ]]; then
-        daemon_log_event "[a2a_receiver_supervise] receiver healthy (pid ${last_pid:-?}); clearing counters"
+      # #1563 PR-4: a successful bind RESETS the circuit breaker/backoff for
+      # the key (transient-failure counter -> 0, error_class cleared) so the
+      # NEXT transient failure starts a fresh backoff schedule instead of
+      # inheriting a near-open breaker.
+      # shellcheck disable=SC2031  # `alarm` is a function-local read here; the
+      # $(bridge_a2a_supervise_decision/_escalate ...) command-subs LATER in the
+      # tick run in subshells but never assign it — this is a false positive
+      # (the read precedes those subshells and reflects this tick's own state).
+      if (( consec_unhealthy != 0 )) || (( restart_count != 0 )) || [[ -n "$alarm" ]] || (( consec_transient != 0 )); then
+        daemon_log_event "[a2a_receiver_supervise] receiver healthy (pid ${last_pid:-?}); clearing counters + circuit breaker"
       fi
       consec_unhealthy=0
       restart_count=0
       alarm=""
       last_reason="healthy"
+      consec_transient=0
+      prev_error_class=""
       bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
         "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
-        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts"
+        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+        "$prev_error_class" "$breaker_key" "$consec_transient"
       return 0
     fi
     # Unhealthy probe: tolerate ONE transient (the #946 L4 idiom). Two
@@ -3053,7 +3204,8 @@ process_a2a_receiver_supervise_tick() {
       daemon_log_event "[a2a_receiver_supervise] transient unhealthy probe (${healthz_reason:-unknown}); tolerating one (consec=$consec_unhealthy)"
       bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
         "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
-        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts"
+        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+        "$prev_error_class" "$breaker_key" "$consec_transient"
       return 0
     fi
     dead=1
@@ -3068,28 +3220,53 @@ process_a2a_receiver_supervise_tick() {
   jsonl_file="${BRIDGE_LOG_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/logs}/a2a-handoff.jsonl"
   # Exit-cause record (file paths as argv — footgun #11: no heredoc-stdin /
   # here-string to a captured subprocess; the helper writes JSON to exit_json
-  # AND prints a one-line `event<TAB>detail` TSV summary on stdout, which we
-  # capture to a tmp file and read via `done < "$file"` — never `<<<`). This
-  # keeps ALL multi-line python (jsonl scan + log tail + summary) inside the
-  # standalone helper, so bridge-daemon.sh stays heredoc/here-string-free.
-  local exit_event="" exit_detail="" mine_tmp=""
+  # AND prints a one-line `event<TAB>detail<TAB>error_class<TAB>fingerprint`
+  # TSV summary on stdout, which we capture to a tmp file and read via
+  # `done < "$file"` — never `<<<`). This keeps ALL multi-line python (jsonl
+  # scan + log tail + #1563 classification + summary) inside the standalone
+  # helper, so bridge-daemon.sh stays heredoc/here-string-free. The config path
+  # is passed so the helper can compute the secret-free config_fingerprint that
+  # keys the circuit breaker.
+  local exit_event="" exit_detail="" error_class="" exit_fingerprint="" mine_tmp=""
   mine_tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-receiver-exit.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-receiver-exit.$$.$RANDOM")"
   bridge_with_timeout 10 a2a_receiver_exit_cause \
     python3 "$SCRIPT_DIR/lib/daemon-helpers/a2a-receiver-exit-cause.py" \
       "$exit_json" "$log_file" "$jsonl_file" "$reason" "${last_pid:-}" "$now" 20 \
+      "$config" \
       >"$mine_tmp" 2>/dev/null || true
-  while IFS=$'\t' read -r _ev _detail; do
+  while IFS=$'\t' read -r _ev _detail _eclass _fp; do
     exit_event="$_ev"
     exit_detail="$_detail"
+    error_class="$_eclass"
+    exit_fingerprint="$_fp"
   done <"$mine_tmp"
   rm -f "$mine_tmp" 2>/dev/null || true
   last_exit_event="$exit_event"
   last_exit_detail="$exit_detail"
+  # Default an empty/garbled class to "unknown" so the decision helper falls
+  # back to the bounded-restart cap rather than mis-routing.
+  case "$error_class" in
+    transient|auth_config|unknown) : ;;
+    *) error_class="unknown" ;;
+  esac
+
+  # #1563 PR-4: re-key the circuit breaker. If the config fingerprint changed
+  # (operator edited the config) OR the error_class changed, the previous
+  # transient-failure count is stale for this key — reset it so a config fix
+  # or a different failure mode starts a clean backoff schedule.
+  if [[ -n "$exit_fingerprint" && "$exit_fingerprint" != "$breaker_key" ]]; then
+    consec_transient=0
+    breaker_key="$exit_fingerprint"
+  elif [[ -n "$prev_error_class" && "$error_class" != "$prev_error_class" ]]; then
+    consec_transient=0
+  fi
+  prev_error_class="$error_class"
 
   bridge_audit_log daemon a2a_receiver_died daemon \
     --detail reason="$reason" \
     --detail last_pid="${last_pid:-}" \
     --detail last_exit_event="$exit_event" \
+    --detail error_class="$error_class" \
     --detail systemd_owner="$(bridge_a2a_receiver_systemd_active && printf 'yes' || printf 'no')" \
     >/dev/null 2>&1 || true
 
@@ -3099,11 +3276,93 @@ process_a2a_receiver_supervise_tick() {
     last_reason="$reason"
     bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
       "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
-      "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts"
+      "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+      "$prev_error_class" "$breaker_key" "$consec_transient"
     return 0
   fi
 
-  # --- crash-loop give-up cap ---
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+
+  # --- #1563 PR-4: bounded backoff + circuit breaker (transient/auth_config) ---
+  # Decide BEFORE the restart whether this (config-fingerprint, error_class)
+  # key may re-attempt now. The decision helper returns:
+  #   wait  — a transient failure still inside its exponential backoff window;
+  #           hold this tick WITHOUT a new restart attempt (this is the
+  #           anti-thrash: no immediate respawn).
+  #   open  — transient failures reached the open threshold; STOP respawning,
+  #           emit circuit-open + bind-backoff audits, escalate once/cooldown.
+  #   hold  — a NON-transient auth/config error; do NOT retry into a thrash,
+  #           surface the real error + escalate once/cooldown.
+  #   retry — fall through to the existing bounded-restart cap below (used for
+  #           error_class=unknown and for transient attempts whose backoff has
+  #           elapsed and the breaker is not yet open).
+  local decision
+  decision="$(bridge_a2a_supervise_decision "$error_class" "$consec_transient" "$last_restart_ts" "$now")"
+  case "$decision" in
+    wait)
+      local backoff_need
+      backoff_need="$(bridge_a2a_backoff_seconds "$((consec_transient + 1))")"
+      alarm="bind_backoff"
+      last_reason="$reason"
+      daemon_log_event "[a2a_receiver_supervise] transient bind failure (reason=$reason, class=$error_class); backing off (${consec_transient} consecutive, next attempt after ${backoff_need}s) — NO immediate respawn"
+      bridge_audit_log daemon a2a_receiver_bind_backoff daemon \
+        --detail reason="$reason" \
+        --detail error_class="$error_class" \
+        --detail consec_transient="$consec_transient" \
+        --detail backoff_seconds="$backoff_need" >/dev/null 2>&1 || true
+      bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+        "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+        "$prev_error_class" "$breaker_key" "$consec_transient"
+      return 0
+      ;;
+    open)
+      alarm="circuit_open"
+      last_reason="$reason"
+      daemon_warn "[a2a_receiver_supervise] circuit OPEN: ${consec_transient} consecutive transient bind failures for key=${breaker_key:-?} (class=$error_class) — auto-restart PAUSED; see $exit_json"
+      bridge_audit_log daemon a2a_receiver_circuit_open daemon \
+        --detail consec_transient="$consec_transient" \
+        --detail error_class="$error_class" \
+        --detail breaker_key="${breaker_key:-}" \
+        --detail last_reason="$reason" >/dev/null 2>&1 || true
+      last_admin_task_ts="$(bridge_a2a_receiver_escalate circuit_open \
+        "$admin" "$now" "$last_admin_task_ts" "$admin_cooldown" \
+        "$reason" "$exit_event" "$exit_detail" "$error_class" \
+        "$consec_transient" "$max_restarts" "$restart_window" \
+        "$exit_json" "$log_file")"
+      [[ "$last_admin_task_ts" =~ ^[0-9]+$ ]] || last_admin_task_ts=0
+      bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+        "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+        "$prev_error_class" "$breaker_key" "$consec_transient"
+      return 0
+      ;;
+    hold)
+      alarm="auth_config"
+      last_reason="$reason"
+      daemon_warn "[a2a_receiver_supervise] auth/config error (reason=$reason, class=$error_class) — auto-restart HELD (non-transient; retrying cannot fix it); see $exit_json"
+      bridge_audit_log daemon a2a_receiver_auth_config_hold daemon \
+        --detail reason="$reason" \
+        --detail error_class="$error_class" \
+        --detail last_exit_event="$exit_event" >/dev/null 2>&1 || true
+      last_admin_task_ts="$(bridge_a2a_receiver_escalate auth_config_hold \
+        "$admin" "$now" "$last_admin_task_ts" "$admin_cooldown" \
+        "$reason" "$exit_event" "$exit_detail" "$error_class" \
+        "$consec_transient" "$max_restarts" "$restart_window" \
+        "$exit_json" "$log_file")"
+      [[ "$last_admin_task_ts" =~ ^[0-9]+$ ]] || last_admin_task_ts=0
+      bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+        "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+        "$prev_error_class" "$breaker_key" "$consec_transient"
+      return 0
+      ;;
+    retry|*)
+      : # fall through to the bounded-restart cap below
+      ;;
+  esac
+
+  # --- crash-loop give-up cap (legacy bounded restart for class=unknown) ---
   if (( restart_count >= max_restarts )); then
     alarm="crashloop"
     last_reason="$reason"
@@ -3112,60 +3371,21 @@ process_a2a_receiver_supervise_tick() {
       --detail restart_count="$restart_count" \
       --detail max_restarts="$max_restarts" \
       --detail window_seconds="$restart_window" \
+      --detail error_class="$error_class" \
       --detail last_reason="$reason" >/dev/null 2>&1 || true
-    # File ONE cooldown-gated admin task (mirror the stuck-scan + daily-backup
-    # admin-task pattern: live CLI preferred, --force so a stopped admin still
-    # gets the wake trigger).
-    local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
-    if [[ -n "$admin" ]] && (( now - last_admin_task_ts >= admin_cooldown )); then
-      local target_bridge=""
-      if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
-        target_bridge="$BRIDGE_HOME/agent-bridge"
-      elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
-        target_bridge="$SCRIPT_DIR/agent-bridge"
-      fi
-      if [[ -n "$target_bridge" ]]; then
-        local body_file
-        body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-receiver-crashloop.md.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-receiver-crashloop.$$.$RANDOM")"
-        {
-          printf '# A2A receiver crash-loop — auto-restart STOPPED\n\n'
-          printf 'The A2A receiver daemon (bridge-handoffd.py) restarted\n'
-          printf '%s time(s) within %ss and is now held — the daemon supervisor\n' "$restart_count" "$restart_window"
-          printf 'has STOPPED auto-restarting it to avoid a hot crash loop.\n\n'
-          printf '## State\n\n'
-          printf -- '- last_reason: `%s`\n' "$reason"
-          if [[ -n "$exit_event" ]]; then
-            printf -- '- last_exit_event: `%s`\n' "$exit_event"
-          fi
-          if [[ -n "$exit_detail" ]]; then
-            printf -- '- last_exit_detail: `%s`\n' "$exit_detail"
-          fi
-          printf -- '- restarts: %s/%s within %ss\n' "$restart_count" "$max_restarts" "$restart_window"
-          printf '\n## Next steps\n\n'
-          printf '1. Inspect the captured exit cause:\n'
-          printf '   `%s`\n' "$exit_json"
-          printf '2. Check the receiver log tail:\n'
-          printf '   `%s`\n' "$log_file"
-          printf '3. If the bind is unprovable (tailnet down / IP drift),\n'
-          printf '   confirm `agb a2a daemon reconcile` resolves a valid bind,\n'
-          printf '   then `agb a2a daemon restart`.\n'
-          printf '4. The supervisor resumes auto-restart on a healthy probe\n'
-          printf '   or once the %ss restart window elapses.\n' "$restart_window"
-        } >"$body_file"
-        if "$target_bridge" task create \
-             --to "$admin" --priority high --from daemon \
-             --title "[A2A] receiver crash-loop — auto-restart stopped" \
-             --body-file "$body_file" --force >/dev/null 2>&1; then
-          last_admin_task_ts="$now"
-        else
-          daemon_warn "[a2a_receiver_supervise] crash-loop admin task-create failed; will retry after cooldown"
-        fi
-        rm -f "$body_file" 2>/dev/null || true
-      fi
-    fi
+    # File ONE cooldown-gated admin task via the shared escalate helper (the
+    # task-create failure now emits a2a_receiver_escalation_task_create_failed
+    # + retains the retry ts instead of swallowing the error).
+    last_admin_task_ts="$(bridge_a2a_receiver_escalate crashloop \
+      "$admin" "$now" "$last_admin_task_ts" "$admin_cooldown" \
+      "$reason" "$exit_event" "$exit_detail" "$error_class" \
+      "$restart_count" "$max_restarts" "$restart_window" \
+      "$exit_json" "$log_file")"
+    [[ "$last_admin_task_ts" =~ ^[0-9]+$ ]] || last_admin_task_ts=0
     bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
       "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
-      "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts"
+      "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+      "$prev_error_class" "$breaker_key" "$consec_transient"
     return 0
   fi
 
@@ -3191,33 +3411,35 @@ process_a2a_receiver_supervise_tick() {
   if (( start_rc != 0 )); then
     # Persistent BIND-PROOF failure: the fail-closed preflight refused to bring
     # the receiver up (tailnet down, bind unresolvable, peer secret missing).
-    # Tagged with the distinct bind_proof_failed reason+alarm and counted toward
-    # the crash-loop cap. Retry is BOUNDED, not unbounded re-probing: each tick
-    # re-runs the full proof, but once restart_count reaches max_restarts
-    # (default 5, ~2.5min at the 30s cadence) the crash-loop branch above latches
-    # the alarm and auto-restart STOPS. So a host that lost its tailnet IP
-    # re-probes at most max_restarts times and then holds — it does not hammer
-    # tailscale forever.
-    # NOTE (codex/operator judgment): whether bind_proof_failed should HOLD on
-    # the FIRST failure (zero retries) instead of the current bounded
-    # cap-then-hold is a deliberate behavior question, not a bug — see PR #1414
-    # review. Current semantics: bounded cap-then-hold.
+    # Tagged with the distinct bind_proof_failed reason+alarm. The restart
+    # itself re-ran the full proof and it failed, so this is ANOTHER transient
+    # bind failure for the key — #1563 PR-4: increment consec_transient so the
+    # NEXT tick's decision helper backs off (exponential) and, after the open
+    # threshold, OPENS the circuit instead of re-probing every 30s. (The legacy
+    # restart_count cap still latches as a backstop for class=unknown.)
     reason="bind_proof_failed"
     last_reason="$reason"
     alarm="bind_proof_failed"
-    daemon_warn "[a2a_receiver_supervise] restart FAILED bind proof (rc=$start_rc); bounded retry toward cap (restart_count=$restart_count/${max_restarts}), holds at cap"
+    consec_transient=$((consec_transient + 1))
+    daemon_warn "[a2a_receiver_supervise] restart FAILED bind proof (rc=$start_rc); transient backoff (consec_transient=$consec_transient, restart_count=$restart_count/${max_restarts})"
     bridge_audit_log daemon a2a_receiver_bind_proof_failed daemon \
       --detail rc="$start_rc" \
       --detail restart_count="$restart_count" \
+      --detail consec_transient="$consec_transient" \
       --detail max_restarts="$max_restarts" >/dev/null 2>&1 || true
   else
+    # A real receiver exit AFTER a previously-healthy bind that we successfully
+    # restarted: the bind proved, so RESET the transient-failure counter (this
+    # key is healthy again) — only REPEATED bind failures back off.
     last_reason="$reason"
-    daemon_log_event "[a2a_receiver_supervise] restart succeeded (restart_count=$restart_count/${max_restarts})"
+    consec_transient=0
+    daemon_log_event "[a2a_receiver_supervise] restart succeeded (restart_count=$restart_count/${max_restarts}); breaker reset"
   fi
 
   bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
     "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
-    "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts"
+    "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+    "$prev_error_class" "$breaker_key" "$consec_transient"
   return 0
 }
 

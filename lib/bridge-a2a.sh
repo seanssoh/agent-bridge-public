@@ -300,3 +300,117 @@ bridge_a2a_reconcile() {
   # the running daemon uses.
   python3 "$repo_root/bridge-handoffd.py" reconcile --config "$config"
 }
+
+# --------------------------------------------------------------------------
+# #1563 PR-4: A2A receiver supervision POLICY (bounded backoff + circuit
+# breaker). Pure decision helpers — no live-process I/O — so the daemon
+# supervise tick (process_a2a_receiver_supervise_tick in bridge-daemon.sh)
+# stays small and the policy is unit-testable in isolation. NONE of these
+# touch the fail-closed bind/HMAC boundary; they only decide WHEN the
+# supervisor may re-attempt a restart and WHEN to stop + escalate.
+#
+# The thrash these fix (#1563): when the tailnet bind is transiently
+# unavailable (tailnet not yet up / IP drift after a re-login), the receiver
+# fails the fail-closed preflight, exits, gets respawned immediately, fails
+# again — a ~9-minute crash-loop with no backoff. A transient bind failure
+# now backs off exponentially and, after N consecutive failures for the same
+# (config-fingerprint, error_class) key, OPENS the breaker (stop respawning +
+# escalate once per cooldown). A successful bind RESETS the key. A real
+# auth/config error is NEVER routed through the transient-retry path — it is
+# held immediately, surfacing the real error instead of thrashing.
+# --------------------------------------------------------------------------
+
+# Exponential backoff (seconds) for the Nth consecutive TRANSIENT failure of a
+# key: base * 2^(n-1), capped. n is 1-based (the 1st failure waits `base`).
+# Tunable via env so the smoke can compress the schedule. Always echoes a
+# non-negative integer; clamps a bad/zero input to the floor.
+bridge_a2a_backoff_seconds() {
+  local n="$1"
+  local base="${BRIDGE_A2A_RECEIVER_BACKOFF_BASE_SECONDS:-30}"
+  local cap="${BRIDGE_A2A_RECEIVER_BACKOFF_CAP_SECONDS:-900}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=1
+  [[ "$base" =~ ^[0-9]+$ ]] || base=30
+  [[ "$cap" =~ ^[0-9]+$ ]] || cap=900
+  (( n < 1 )) && n=1
+  (( base < 1 )) && base=1
+  # Compute base * 2^(n-1) with an early exit once we exceed the cap so a
+  # large n cannot overflow / spin.
+  local secs="$base" i=1
+  while (( i < n )); do
+    secs=$(( secs * 2 ))
+    if (( secs >= cap )); then
+      secs="$cap"
+      break
+    fi
+    i=$(( i + 1 ))
+  done
+  (( secs > cap )) && secs="$cap"
+  printf '%s' "$secs"
+}
+
+# True (return 0) when the circuit breaker should be OPEN for a key after
+# `consec_failures` consecutive TRANSIENT failures — i.e. stop respawning and
+# escalate. Threshold tunable via BRIDGE_A2A_RECEIVER_BACKOFF_OPEN_THRESHOLD
+# (default 5). Only meaningful for the transient class; the caller routes
+# auth_config to an immediate hold (never the backoff path) and unknown to the
+# legacy bounded-restart cap.
+bridge_a2a_breaker_should_open() {
+  local consec_failures="$1"
+  local threshold="${BRIDGE_A2A_RECEIVER_BACKOFF_OPEN_THRESHOLD:-5}"
+  [[ "$consec_failures" =~ ^[0-9]+$ ]] || consec_failures=0
+  [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=5
+  (( threshold < 1 )) && threshold=1
+  (( consec_failures >= threshold ))
+}
+
+# Decide what the supervisor should do for a confirmed-dead receiver, given the
+# classified error_class, the per-key consecutive-failure count, the last
+# attempt ts, and now. Echoes ONE decision word on stdout:
+#   retry   — enough backoff has elapsed (or first attempt); attempt a restart.
+#   wait    — a transient failure whose backoff window has NOT elapsed; hold
+#             this tick WITHOUT counting a new attempt (no thrash).
+#   open    — transient failures reached the open threshold; stop respawning,
+#             escalate once per cooldown.
+#   hold    — a non-transient auth/config error; do NOT retry into a thrash,
+#             surface the real error and escalate once per cooldown.
+#
+# `error_class` ∈ {transient, auth_config, unknown}. `unknown` returns "retry"
+# so the caller falls back to the pre-#1563 bounded-restart cap (a previously
+# healthy receiver that died/wedged may legitimately restart promptly).
+bridge_a2a_supervise_decision() {
+  local error_class="$1" consec_failures="$2" last_attempt_ts="$3" now="$4"
+  [[ "$consec_failures" =~ ^[0-9]+$ ]] || consec_failures=0
+  [[ "$last_attempt_ts" =~ ^[0-9]+$ ]] || last_attempt_ts=0
+  [[ "$now" =~ ^[0-9]+$ ]] || now=0
+
+  case "$error_class" in
+    auth_config)
+      # Never retry a config/auth error into a thrash — hold + escalate.
+      printf 'hold'
+      return 0
+      ;;
+    transient)
+      if bridge_a2a_breaker_should_open "$consec_failures"; then
+        printf 'open'
+        return 0
+      fi
+      # Honor exponential backoff between transient attempts. The Nth attempt
+      # waits backoff(N) since the LAST attempt; consec_failures is the count
+      # of failures ALREADY recorded, so the next backoff is backoff(consec+1).
+      local need elapsed
+      need="$(bridge_a2a_backoff_seconds "$((consec_failures + 1))")"
+      elapsed=$(( now - last_attempt_ts ))
+      if (( consec_failures > 0 )) && (( elapsed < need )); then
+        printf 'wait'
+      else
+        printf 'retry'
+      fi
+      return 0
+      ;;
+    *)
+      # unknown — defer to the caller's bounded-restart cap (legacy behavior).
+      printf 'retry'
+      return 0
+      ;;
+  esac
+}

@@ -302,23 +302,30 @@ check_systemd_defer() {
     "supervisor did NOT restart the receiver while deferring to systemd"
 }
 
-# --- Check 4: crash-loop cap + alarm + admin task + no launch past cap ---
+# --- Check 4: repeated transient bind failure -> auto-restart HELD + alarm ---
 # Point the config at an UNPROVABLE bind (tailnet-shaped, not a real local
 # interface) with the tailscale CLI absent so bridge_a2a_receiver_start fails
-# closed every time (bind_proof_failed). Run sync MAX+2 times. Assert the
-# restart counter caps at MAX, the alarm is set, an a2a_receiver_crashloop
-# audit row is present, an admin task was filed, and the receiver never came
-# up (no `listening` past the cap).
+# closed every time. #1563 PR-4 reclassified this as a TRANSIENT bind failure
+# (config+secret VALID, the bind is just unprovable), so instead of climbing the
+# legacy restart_count crash-loop cap it now BACKS OFF (exponential) and, after
+# the open threshold, OPENS the circuit breaker — auto-restart is PAUSED and ONE
+# admin task is filed. Either terminal state (legacy crashloop OR the new
+# circuit_open) satisfies the #1405 contract this check protects: the supervisor
+# STOPS auto-restarting a persistently-failing receiver, sets an alarm, notifies
+# the admin, and never lets the unprovable receiver bind. We compress the #1563
+# backoff schedule (tiny base, low open threshold) so the breaker opens within a
+# few fast test syncs.
 check_crashloop_cap_and_alarm() {
   # Ensure no live receiver / stale pid first.
   bash "$SMOKE_REPO_ROOT/bridge-handoff-daemon.sh" stop >/dev/null 2>&1 || true
-  rm -f "$(handoffd_pidfile)" "$(supervise_state)" 2>/dev/null || true
+  rm -f "$(handoffd_pidfile)" "$(supervise_state)" \
+    "$BRIDGE_LOG_DIR/a2a-handoff.jsonl" 2>/dev/null || true
 
   local crash_port
   crash_port="$(pick_free_port)"
   write_unprovable_config "$crash_port"
 
-  # Register a minimal admin agent so the crash-loop admin task can be filed.
+  # Register a minimal admin agent so the alarm admin task can be filed.
   # BRIDGE_AGENT_SESSION must be set for bridge_agent_exists() to recognize the
   # agent (it keys on BRIDGE_AGENT_SESSION[<agent>]); the task is filed with
   # --force so the stopped target (no live tmux) does not refuse the enqueue.
@@ -335,45 +342,52 @@ BRIDGE_AGENT_CONTINUE["reviewer"]=0
 EOF
   mkdir -p "$BRIDGE_AGENT_HOME_ROOT/reviewer"
 
+  # Compress the #1563 backoff/breaker so the circuit opens in a few syncs.
   local max="$BRIDGE_A2A_RECEIVER_MAX_RESTARTS"
-  local syncs=$((max + 2))
-  # tailscale CLI pointed at a nonexistent path => resolve_bind fails closed,
-  # so bridge_a2a_receiver_start returns non-zero (bind_proof_failed) each tick.
-  local i
+  local syncs=$((max + 6))
+  local i alarm
   for (( i = 0; i < syncs; i++ )); do
-    BRIDGE_A2A_TAILSCALE_CLI="$SMOKE_TMP_ROOT/no-such-tailscale" run_sync >/dev/null
+    BRIDGE_A2A_TAILSCALE_CLI="$SMOKE_TMP_ROOT/no-such-tailscale" \
+      BRIDGE_A2A_RECEIVER_BACKOFF_BASE_SECONDS=1 \
+      BRIDGE_A2A_RECEIVER_BACKOFF_CAP_SECONDS=4 \
+      BRIDGE_A2A_RECEIVER_BACKOFF_OPEN_THRESHOLD=3 \
+      run_sync >/dev/null
+    alarm="$(printf '%s\n' "$(cat "$(supervise_state)" 2>/dev/null)" | sed -n 's/^A2A_RECEIVER_ALARM=//p' | tr -d "'" | head -1)"
+    [[ "$alarm" == "circuit_open" || "$alarm" == "crashloop" ]] && break
   done
 
   local state
   state="$(cat "$(supervise_state)" 2>/dev/null || true)"
   smoke_assert_contains "$state" "A2A_RECEIVER_ALARM=" "supervise.env carries an alarm field"
-  # Alarm must be set (non-empty value). Pre-fix: no supervise.env at all.
-  smoke_assert_match "$state" "A2A_RECEIVER_ALARM=('?)(crashloop|bind_proof_failed)" \
-    "supervise.env alarm is set after the crash-loop cap"
+  # Alarm must be a terminal hold state: the legacy crashloop cap OR the #1563
+  # circuit breaker (transient bind failure) — both mean "auto-restart STOPPED".
+  smoke_assert_match "$state" "A2A_RECEIVER_ALARM=('?)(crashloop|circuit_open|bind_proof_failed|bind_backoff)" \
+    "supervise.env alarm is set after the supervisor held auto-restart"
 
-  # Restart counter must cap at MAX (never exceed it despite syncs > MAX).
+  # Restart counter must never exceed MAX (the bound still holds either way).
   local count
   count="$(printf '%s\n' "$state" | sed -n "s/^A2A_RECEIVER_RESTART_COUNT=//p" | tr -d "'" | head -1)"
   [[ "$count" =~ ^[0-9]+$ ]] || smoke_fail "could not parse restart count from supervise.env: $state"
   (( count <= max )) || smoke_fail "restart count ($count) exceeded the cap ($max)"
-  (( count >= max )) || smoke_fail "restart count ($count) did not reach the cap ($max)"
 
-  # The crash-loop audit row must be present.
+  # A terminal hold audit row must be present: legacy crashloop OR #1563
+  # circuit_open. Pre-fix: no supervise tick at all -> neither appears.
   local audit
   audit="$(cat "$BRIDGE_AUDIT_LOG" 2>/dev/null || true)"
-  smoke_assert_contains "$audit" "a2a_receiver_crashloop" \
-    "a2a_receiver_crashloop audit row emitted at the cap"
+  printf '%s' "$audit" | grep -qE 'a2a_receiver_crashloop|a2a_receiver_circuit_open' \
+    || smoke_fail "no terminal hold audit (a2a_receiver_crashloop / a2a_receiver_circuit_open) emitted"
 
-  # An admin task must have been filed for the crash-loop alarm.
+  # An admin task must have been filed for the alarm (crash-loop OR circuit-open
+  # — both notify the admin that auto-restart was stopped).
   local inbox
   inbox="$(bash "$SMOKE_REPO_ROOT/agent-bridge" inbox reviewer 2>/dev/null || true)"
-  smoke_assert_contains "$inbox" "crash-loop" \
-    "crash-loop admin task filed to the admin agent"
+  printf '%s' "$inbox" | grep -qiE 'crash-loop|circuit OPEN|auto-restart' \
+    || smoke_fail "no auto-restart-held admin task filed to the admin agent: $inbox"
 
   # The receiver must NEVER have come up (bind unprovable) — no live port.
   local rc=0
   python3 "$SCRIPT_DIR/a2a-cross-bridge-helper.py" wait-port "$crash_port" 2>/dev/null || rc=$?
-  smoke_assert_match "$rc" '^[1-9]' "receiver never bound (crash-loop config is unprovable)"
+  smoke_assert_match "$rc" '^[1-9]' "receiver never bound (unprovable config — fail-closed held)"
 }
 
 # --- Check 6: status alarm visible in agent-bridge status ---
