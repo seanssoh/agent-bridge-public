@@ -6263,6 +6263,279 @@ bridge_daemon_should_enqueue_mcp_miss() {
 # automatically benefit without a per-site rename. The wrapper is
 # intentionally removed; do NOT reintroduce it.
 
+# Issue #1459 — cron-dispatch backlog sweep + run/queue reconcile layer.
+#
+# Context: the 2026-06-01 syrs-warehouse incident showed a serial cron
+# worker backlog (BRIDGE_CRON_DISPATCH_MAX_PARALLEL=1) looking like a
+# 30m+ unclaimed HUMAN task, and a [cron-dispatch] row claimed/done
+# outside the cron worker leaving the run artifact stuck non-terminal.
+# PR #1458 closed the immediate misclassification bugs (the unclaimed
+# sweep excludes [cron-dispatch]; nudge detail uses the non-cron set).
+# This sweep is the cron-SPECIFIC recovery layer: it WRAPS the existing
+# bare `start_cron_dispatch_workers` daemon call so a recovery is at
+# most once per tick, and emits cron-only audit actions
+# (cron_dispatch_backlog / cron_dispatch_auto_recovered) that are
+# DISTINCT from the human task_unclaimed_escalated / session_nudge_*
+# taxonomy. It NEVER files an [unclaimed-task] for a [cron-dispatch] row.
+#
+# Cadence/idempotency: a marker dir keyed by (oldest_task_id, reason)
+# under state/cron-dispatch-backlog/ throttles repeated backlog audits
+# to BRIDGE_CRON_DISPATCH_BACKLOG_COOLDOWN_SECONDS. The recovery branch
+# (idle slot + queued dispatch) calls the real worker-start path and
+# audits on before/after snapshots. BRIDGE_CRON_DISPATCH_MAX_PARALLEL=0
+# stays a no-op (the starter returns early; this sweep also short-
+# circuits). The unclaimed sweep's `--exclude-title-prefix
+# '[cron-dispatch]'` human path is untouched.
+bridge_daemon_cron_dispatch_backlog_state_dir() {
+  printf '%s/cron-dispatch-backlog' "$BRIDGE_STATE_DIR"
+}
+
+bridge_daemon_cron_dispatch_backlog_marker_file() {
+  local oldest_task_id="$1"
+  local reason="$2"
+  printf '%s/%s.%s.ts' "$(bridge_daemon_cron_dispatch_backlog_state_dir)" "$oldest_task_id" "$reason"
+}
+
+# Collect live cron worker pids (space-separated) for the backlog audit's
+# worker_pids evidence field. Reuses the same pid-file dir + liveness
+# probe as cron_worker_running_count so the two never disagree.
+bridge_daemon_cron_worker_pids() {
+  local worker_dir pid_file pid pids=""
+  worker_dir="$(bridge_cron_worker_dir)"
+  [[ -d "$worker_dir" ]] || { printf ''; return 0; }
+  shopt -s nullglob
+  for pid_file in "$worker_dir"/*.pid; do
+    pid="$(<"$pid_file")"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      if [[ -n "$pids" ]]; then
+        pids="$pids,$pid"
+      else
+        pids="$pid"
+      fi
+    fi
+  done
+  shopt -u nullglob
+  printf '%s' "$pids"
+}
+
+# bridge_daemon_sweep_cron_dispatch_backlog
+#
+# Placed BEFORE the unclaimed sweep in cmd_sync_cycle and WRAPS the
+# previously-bare `start_cron_dispatch_workers` call. Returns 0 when it
+# changed state (started a worker), 1 otherwise (matches the daemon
+# "changed" convention used by the surrounding sweeps).
+bridge_daemon_sweep_cron_dispatch_backlog() {
+  local max_parallel="${BRIDGE_CRON_DISPATCH_MAX_PARALLEL:-0}"
+  local threshold="${BRIDGE_CRON_DISPATCH_BACKLOG_THRESHOLD_SECONDS:-300}"
+  local cooldown="${BRIDGE_CRON_DISPATCH_BACKLOG_COOLDOWN_SECONDS:-1800}"
+  local changed=1
+
+  [[ "$max_parallel" =~ ^[0-9]+$ ]] || max_parallel=0
+  [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=300
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=1800
+
+  # BRIDGE_CRON_DISPATCH_MAX_PARALLEL=0 is a no-op (cron dispatch off).
+  (( max_parallel > 0 )) || { ( start_cron_dispatch_workers ) || true; return 1; }
+
+  local now_ts running_before queued_before snapshot
+  now_ts="$(date +%s)"
+  running_before="$(cron_worker_running_count)"
+
+  # Snapshot the queued [cron-dispatch] backlog BEFORE the worker-start
+  # path runs so a recovery's before/after delta is meaningful. Scope is
+  # cron-only via the queue-GLOBAL `cron-backlog-snapshot` (cron rows can
+  # be assigned to ANY agent — find-open --agent cannot express that). This
+  # NEVER touches the human unclaimed path. TSV:
+  #   oldest_id<TAB>oldest_age<TAB>queued_count<TAB>title<TAB>family<TAB>agent.
+  snapshot="$(bridge_queue_cli cron-backlog-snapshot --format tsv 2>/dev/null || true)"
+
+  # Tab-split via `cut` — never a `read <<<` here-string (footgun #11 H3).
+  local oldest_task_id oldest_age queued_before_count oldest_title oldest_family oldest_agent
+  oldest_task_id="$(printf '%s' "$snapshot" | cut -f1)"
+  oldest_age="$(printf '%s' "$snapshot" | cut -f2)"
+  queued_before_count="$(printf '%s' "$snapshot" | cut -f3)"
+  oldest_title="$(printf '%s' "$snapshot" | cut -f4)"
+  oldest_family="$(printf '%s' "$snapshot" | cut -f5)"
+  oldest_agent="$(printf '%s' "$snapshot" | cut -f6)"
+  [[ "$oldest_task_id" =~ ^[0-9]+$ ]] || oldest_task_id=0
+  [[ "$oldest_age" =~ ^[0-9]+$ ]] || oldest_age=0
+  [[ "$queued_before_count" =~ ^[0-9]+$ ]] || queued_before_count=0
+  queued_before="$queued_before_count"
+
+  # WRAP (not duplicate) the existing bare starter. At most once per tick.
+  ( start_cron_dispatch_workers ) && changed=0 || true
+
+  local running_after queued_after snapshot_after
+  running_after="$(cron_worker_running_count)"
+  snapshot_after="$(bridge_queue_cli cron-backlog-snapshot --format tsv 2>/dev/null || true)"
+  local queued_after_count
+  queued_after_count="$(printf '%s' "$snapshot_after" | cut -f3)"
+  [[ "$queued_after_count" =~ ^[0-9]+$ ]] || queued_after_count=0
+  queued_after="$queued_after_count"
+
+  # No queued cron-dispatch backlog at all → nothing cron-specific to do.
+  (( queued_before > 0 )) || return "$changed"
+
+  # Recovery branch: an idle slot existed and the starter consumed queued
+  # work (a worker was started, so the queued backlog dropped OR running
+  # rose). Emit cron_dispatch_auto_recovered — NEVER the human nudge row.
+  if (( running_after > running_before )); then
+    bridge_audit_log daemon cron_dispatch_auto_recovered cron-dispatch \
+      --detail reason=idle_slot_with_queued_dispatch \
+      --detail started_count="$(( running_after - running_before ))" \
+      --detail queued_before="$queued_before" \
+      --detail queued_after="$queued_after" \
+      --detail running_before="$running_before" \
+      --detail running_after="$running_after" \
+      --detail max_parallel="$max_parallel" \
+      --detail oldest_task_id="$oldest_task_id" \
+      2>/dev/null || true
+    return 0
+  fi
+
+  # Saturation branch: workers are at/over capacity and the oldest queued
+  # cron-dispatch row is past the backlog threshold. Audit-only
+  # (cron_dispatch_backlog), throttled per (oldest_task_id, reason) so it
+  # does not spam every tick. NO admin [unclaimed-task] by default.
+  if (( running_after >= max_parallel )) && (( oldest_task_id > 0 )) && (( oldest_age >= threshold )); then
+    local reason="workers_saturated"
+    local marker
+    marker="$(bridge_daemon_cron_dispatch_backlog_marker_file "$oldest_task_id" "$reason")"
+    mkdir -p "$(bridge_daemon_cron_dispatch_backlog_state_dir)" 2>/dev/null || true
+    if [[ -f "$marker" ]]; then
+      local _marker_ts
+      _marker_ts="$(head -n1 "$marker" 2>/dev/null || printf '0')"
+      [[ "$_marker_ts" =~ ^[0-9]+$ ]] || _marker_ts=0
+      if (( _marker_ts > 0 )) && (( now_ts - _marker_ts < cooldown )); then
+        return "$changed"
+      fi
+    fi
+
+    local worker_pids ready_count
+    worker_pids="$(bridge_daemon_cron_worker_pids)"
+    # ready_count: rows the scheduler considers runnable right now. Use the
+    # queued backlog as the conservative upper bound (cron-ready overfetch
+    # already keeps deferred families out of the worker claim path).
+    ready_count="$queued_before"
+    bridge_audit_log daemon cron_dispatch_backlog cron-dispatch \
+      --detail reason="$reason" \
+      --detail oldest_task_id="$oldest_task_id" \
+      --detail oldest_age_seconds="$oldest_age" \
+      --detail queued_count="$queued_before" \
+      --detail ready_count="$ready_count" \
+      --detail running_count="$running_after" \
+      --detail max_parallel="$max_parallel" \
+      --detail oldest_agent="${oldest_agent:-}" \
+      --detail oldest_family="$oldest_family" \
+      --detail worker_pids="${worker_pids:-none}" \
+      2>/dev/null || true
+    printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+    changed=0
+  fi
+
+  return "$changed"
+}
+
+# Issue #1459 — late nudge-success sweep. SEPARATE from the cron
+# reconciler (run_reconcile_run_state): this reconciles HUMAN nudge drops,
+# not cron status-file state pairs. For each prior
+# `session_nudge_dropped reason=submit_lost_post_grace` audit row whose
+# task later reached claimed/done, emit `session_nudge_late_success` once
+# so status/reporting can count UNRESOLVED drops (not raw drop rows). The
+# resolved-drop marker dir prevents a re-emit every tick.
+bridge_daemon_nudge_late_success_state_dir() {
+  printf '%s/nudge-late-success' "$BRIDGE_STATE_DIR"
+}
+
+bridge_daemon_sweep_nudge_late_success() {
+  local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local window="${BRIDGE_NUDGE_LATE_SUCCESS_WINDOW_SECONDS:-1800}"
+  local changed=1
+
+  [[ "$window" =~ ^[0-9]+$ ]] || window=1800
+  [[ -n "${BRIDGE_AUDIT_LOG:-}" ]] || return 1
+  [[ -f "$BRIDGE_AUDIT_LOG" ]] || return 1
+  bridge_require_python 2>/dev/null || return 1
+  if ! bridge_resolve_script_dir_check 2>/dev/null; then
+    return 1
+  fi
+
+  local now_ts since_iso state_dir
+  now_ts="$(date +%s)"
+  since_iso="$(bridge_daemon_helper_python format-epoch-iso "$(( now_ts - window ))" 2>/dev/null || true)"
+  state_dir="$(bridge_daemon_nudge_late_success_state_dir)"
+  mkdir -p "$state_dir" 2>/dev/null || true
+
+  local list_args=(list --file "$BRIDGE_AUDIT_LOG" --action session_nudge_dropped --contains submit_lost_post_grace --limit 200)
+  if [[ -n "$since_iso" ]]; then
+    list_args+=(--since "$since_iso")
+  fi
+
+  # Footgun #11: capture the audit list to a tmpfile and read via
+  # `done < "$file"` — NEVER `done <<<"$var"` (here-string heredoc_write
+  # wedge class). Same precedent as process_unclaimed_queue_escalation.
+  local _rows_tmp
+  _rows_tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-nudge-late.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_rows_tmp'" RETURN
+  if ! python3 "$BRIDGE_SCRIPT_DIR/bridge-audit.py" "${list_args[@]}" >"$_rows_tmp" 2>/dev/null; then
+    rm -f -- "$_rows_tmp"
+    trap - RETURN
+    return 1
+  fi
+  if [[ ! -s "$_rows_tmp" ]]; then
+    rm -f -- "$_rows_tmp"
+    trap - RETURN
+    return 1
+  fi
+
+  local _ts _actor _action _target _detail_json
+  while IFS=$'\t' read -r _ts _actor _action _target _detail_json; do
+    [[ -n "$_detail_json" ]] || continue
+    # Single consolidated extract+elapsed pass (consistent UTC; avoids
+    # per-field bash JSON parsing and tz drift). Tab-split via `cut` so
+    # we never reach for a `read <<<` here-string (footgun #11 H3).
+    local extracted task_id title fingerprint elapsed_seconds resolved_ts
+    extracted="$(bridge_daemon_helper_python nudge-late-success "$_detail_json" "$_ts" "$now_ts" 2>/dev/null || true)"
+    [[ -n "$extracted" ]] || continue
+    task_id="$(printf '%s' "$extracted" | cut -f1)"
+    title="$(printf '%s' "$extracted" | cut -f2)"
+    fingerprint="$(printf '%s' "$extracted" | cut -f3)"
+    elapsed_seconds="$(printf '%s' "$extracted" | cut -f4)"
+    resolved_ts="$(printf '%s' "$extracted" | cut -f5)"
+    [[ "$task_id" =~ ^[0-9]+$ ]] || continue
+    [[ "$elapsed_seconds" =~ ^[0-9]+$ ]] || elapsed_seconds=0
+
+    # Resolved-drop dedupe: keyed by task id so a re-tick does not
+    # re-emit the same late-success row.
+    local marker="$state_dir/${task_id}.resolved"
+    [[ -f "$marker" ]] && continue
+
+    local post_status
+    post_status="$(bridge_queue_task_status "$task_id" 2>/dev/null || true)"
+    case "$post_status" in
+      claimed|done) ;;
+      *) continue ;;
+    esac
+
+    bridge_audit_log daemon session_nudge_late_success "${_target:-$admin_agent}" \
+      --detail task_id="$task_id" \
+      --detail post_status="$post_status" \
+      --detail drop_ts="$_ts" \
+      --detail resolved_ts="${resolved_ts:-}" \
+      --detail elapsed_seconds="$elapsed_seconds" \
+      --detail title="${title:-}" \
+      --detail fingerprint="${fingerprint:-}" \
+      2>/dev/null || true
+    printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+    changed=0
+  done < "$_rows_tmp"
+
+  rm -f -- "$_rows_tmp"
+  trap - RETURN
+  return "$changed"
+}
+
 # Issue #1318 (beta5-2 Lane ι) — 7051-B unclaimed-queue escalation.
 #
 # Pre-fix: tasks queued against a stopped / wedged agent stay queued
@@ -10764,8 +11037,14 @@ cmd_sync_cycle() {
   rm -f "$ready_agents_file"
 
   # Issue #1338 defense-in-depth: subshell-isolate (rationale above).
+  # Issue #1459: the bare start_cron_dispatch_workers call is now WRAPPED
+  # by bridge_daemon_sweep_cron_dispatch_backlog — it still drives the
+  # same worker-start path at most once per tick, but adds cron-specific
+  # backlog/auto-recovery audit on the before/after snapshots so a serial
+  # cron backlog is never mistaken for a human unclaimed task. The sweep
+  # short-circuits to the bare starter when BRIDGE_CRON_DISPATCH_MAX_PARALLEL=0.
   BRIDGE_DAEMON_LAST_STEP="cron_dispatch_workers"
-  ( start_cron_dispatch_workers ) || true
+  ( bridge_daemon_sweep_cron_dispatch_backlog ) || true
 
   # Issue #1197 (beta22): A2A cross-bridge delivery tick. No-op silently
   # when handoff.local.json is absent (most installs), throttled to
@@ -10918,6 +11197,12 @@ cmd_sync_cycle() {
   ( process_unclaimed_queue_escalation ) && changed=0 || true
   BRIDGE_DAEMON_LAST_STEP="unclaimed_marker_sweep"
   ( bridge_daemon_sweep_stale_unclaimed_markers ) && changed=0 || true
+  # Issue #1459: late nudge-success reconcile. Emits
+  # session_nudge_late_success for prior submit_lost_post_grace drops
+  # whose task later became claimed/done so status/reporting counts
+  # UNRESOLVED drops, not raw drop rows. Subshell-isolated (#1338).
+  BRIDGE_DAEMON_LAST_STEP="nudge_late_success_sweep"
+  ( bridge_daemon_sweep_nudge_late_success ) && changed=0 || true
   BRIDGE_DAEMON_LAST_STEP="context_pressure_scan"
   if [[ -n "$summary_output" ]] && process_context_pressure_reports "$summary_output"; then
     changed=0
