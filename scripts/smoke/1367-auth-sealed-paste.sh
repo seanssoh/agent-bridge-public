@@ -228,11 +228,14 @@ main() {
     smoke_log "ok: R1 NO registry written on fail-closed"
   fi
 
-  # ── R1b — agent-context refusal (#1367 r4, the RUNTIME boundary) ────
-  # A token-accepting receive run with BRIDGE_AGENT_ID set (agent context)
-  # must REFUSE before any tty read — regardless of the shell spelling used
-  # to invoke it. This is the boundary the PreToolUse hook merely backstops;
-  # it closes the env/command/bash-option wrapper bypasses at the source.
+  # ── R1b — agent-context refusal (#1367 r4/r5, BEST-EFFORT) ──────────
+  # A token-accepting receive run with BRIDGE_AGENT_ID PRESENT must REFUSE
+  # before any tty read. This proves only the best-effort env-PRESENT
+  # refusal — it is NOT "the boundary" and does NOT close `env -u
+  # BRIDGE_AGENT_ID` / direct `python3 bridge-auth.py receive` / agent-pty
+  # variants (codex #1367 r4). See the header "Boundary scope": #1367's real
+  # guarantee is the operator-terminal echo-off design (R2); this refusal +
+  # the N8 hook denies are documented best-effort deterrents only.
   smoke_log "R1b: agent-context refusal (BRIDGE_AGENT_ID set)"
   local r1b_out r1b_rc=0
   r1b_out="$(BRIDGE_AGENT_ID="agent-1367-probe" "$PYTHON_BIN" "$SMOKE_REPO_ROOT/bridge-auth.py" \
@@ -547,9 +550,12 @@ main() {
   # N8-bash-env / -command / -opt / -env-u — #1367 r4 (codex SECURITY):
   # command-prefix wrappers (`env`, `/usr/bin/env`, `command`) and bash
   # options (`--noprofile`) also run a working token-accepting receive and
-  # must DENY at the hook (best-effort defense-in-depth; the runtime
-  # agent-context refusal is the real boundary). `env -u BRIDGE_AGENT_ID`
-  # additionally tries to clear the runtime gate — the hook must still deny.
+  # must DENY at the hook (best-effort defense-in-depth — neither the hook
+  # nor the runtime env-present refusal is an airtight boundary; see the
+  # header "Boundary scope"). `env -u BRIDGE_AGENT_ID` additionally tries to
+  # clear the runtime gate — the hook must still deny this common spelling
+  # (though direct `python3 bridge-auth.py` + pty remains a documented
+  # best-effort residual, out of #1367's threat model).
   assert_hook_verdict \
     "N8-bash-env token-accepting receive via env prefix" \
     admin-1367 \

@@ -2575,8 +2575,9 @@ def _is_bash_wrapper_receive(text: str) -> bool:
     idx += 1
     # Skip bash options (`--noprofile`, `--norc`, `-x`, …) up to the script
     # path. `-c` is intentionally NOT skipped: `bash -c '<string>'` runs a
-    # code string, not `bridge-auth.sh` as argv[1] — that form is left to
-    # the runtime agent-context refusal, not this detector.
+    # code string, not `bridge-auth.sh` as argv[1] — that form is outside
+    # this detector, covered only by the documented best-effort runtime
+    # check + the residual-threat-model scoping (not an airtight boundary).
     while idx < len(tokens) and tokens[idx].startswith("-") and tokens[idx] != "-c":
         idx += 1
     return (
