@@ -18,9 +18,23 @@ Detectors:
 - orphan-agent-dir         : directories under $BRIDGE_AGENT_HOME_ROOT that are not in
                              `agent registry --json` (#598 Track 2). Report-only;
                              emits a manual quarantine recipe in suggested_action.
+- settings-two-tree-drift  : an agent whose home + workdir `settings.json` resolve to
+                             DIFFERENT real files — i.e. the workdir copy is a second
+                             real file instead of a relative symlink back to the home
+                             effective tree (#1455). This inode divergence lets the
+                             preserved-user `enabledPlugins` key drift and was the root
+                             cause of #1453.
+- settings-multi-tree      : an agent whose effective settings file exists as a real
+                             (non-symlink) file in MORE THAN ONE location — both
+                             `home/.claude/` and `workdir/.claude/` (#1455). The
+                             single-tree invariant requires exactly one physical
+                             effective file with every other location a symlink to it.
 
 Read-only contract: the CLI never mutates queue/state/tmux. `suggested_action`
-is a string the admin agent LLM parses and decides whether to execute.
+is a string the admin agent LLM parses and decides whether to execute. The two
+`settings-*` detectors are report-only by design — they NEVER re-point a symlink
+or author policy; the operator runs `link-shared-settings` (bridge-hooks.py) to
+remediate. See docs/settings-single-tree-invariant.md (#1455).
 """
 
 from __future__ import annotations
@@ -47,6 +61,26 @@ DETECTOR_KINDS = (
     "abnormal-session-pane",
     "daemon-log-split",
     "orphan-agent-dir",
+    "settings-two-tree-drift",
+    "settings-multi-tree",
+)
+
+# Issue #1455: the settings detectors share a registry-derived view of an
+# agent's two trees. These names are the canonical leaves the
+# single-tree invariant pins (see docs/settings-single-tree-invariant.md):
+#   <home>/.claude/settings.json            → settings.effective.json (real)
+#   <workdir>/.claude/settings.json         → relative symlink into home
+# Both detectors read these via `agent registry --json` (home + workdir
+# columns), never by re-deriving the layout — that keeps the doctor in
+# lockstep with the bridge's own resolved paths.
+SETTINGS_CLAUDE_DIR = ".claude"
+SETTINGS_LINK_NAME = "settings.json"
+SETTINGS_EFFECTIVE_NAME = "settings.effective.json"
+# The set of detector kinds that consume `agent registry --json`. The
+# registry is lazy-loaded in main() only when at least one of these (or
+# orphan-agent-dir) is enabled.
+SETTINGS_DETECTOR_KINDS = frozenset(
+    {"settings-two-tree-drift", "settings-multi-tree"}
 )
 
 
@@ -862,6 +896,220 @@ def detect_orphan_agent_dir(
     return findings
 
 
+# --- settings single-tree invariant (#1455) --------------------------------
+
+
+def _settings_tree_paths(base: str) -> tuple[Path, Path] | None:
+    """Resolve the (link, effective) settings paths under a tree root.
+
+    `base` is an agent's `home` or `workdir` (from `agent registry --json`).
+    Returns `(<base>/.claude/settings.json, <base>/.claude/settings.effective.json)`
+    or None when `base` is empty. Does NOT require either path to exist —
+    the callers handle the missing-file case so an agent that simply has
+    no rendered settings yet never trips a false positive.
+    """
+    base = (base or "").strip()
+    if not base:
+        return None
+    claude_dir = Path(base).expanduser() / SETTINGS_CLAUDE_DIR
+    return (claude_dir / SETTINGS_LINK_NAME, claude_dir / SETTINGS_EFFECTIVE_NAME)
+
+
+def _real_settings_target(link_path: Path) -> Path | None:
+    """Return the resolved real file `link_path` points at, or None.
+
+    `link_path` is `<tree>/.claude/settings.json`. When it is a symlink we
+    follow it (the invariant requires the workdir link to resolve into the
+    home effective tree); when it is a plain file we treat the file itself
+    as the real target. A broken symlink or a missing path returns None so
+    a not-yet-rendered tree never produces a finding.
+
+    Read-only: only `os.path.realpath` / stat — never a write.
+    """
+    try:
+        if not link_path.exists():  # noqa: raw-pathlib-controller-only — read-only diagnostic probe; the enclosing try/except OSError swallows a PermissionError on an iso tree (the doctor degrades to "skip this agent", never crashes), so the safe-wrapper sudo escalation the lint guards against is intentionally NOT wanted here.
+            # Broken symlink or absent file: no real target to compare.
+            return None
+        return Path(os.path.realpath(link_path))
+    except OSError:
+        return None
+
+
+def _iter_registry_agents(
+    registry: list[dict[str, Any]],
+) -> list[tuple[str, str, str]]:
+    """Yield (agent_id, home, workdir) triples from `agent registry --json`.
+
+    Skips rows missing an id or lacking BOTH a home and a workdir (nothing
+    to compare). Mirrors the orphan detector's tolerance for partial rows.
+    """
+    out: list[tuple[str, str, str]] = []
+    for row in registry:
+        if not isinstance(row, dict):
+            continue
+        agent_id = str(row.get("id") or "").strip()
+        if not agent_id:
+            continue
+        home = str(row.get("home") or "").strip()
+        workdir = str(row.get("workdir") or "").strip()
+        if not home and not workdir:
+            continue
+        out.append((agent_id, home, workdir))
+    return out
+
+
+def detect_settings_two_tree_drift(
+    registry: list[dict[str, Any]],
+    ts: str,
+) -> list[dict[str, Any]]:
+    """Issue #1455 detector (a): home + workdir `settings.json` diverge.
+
+    For every agent whose registry row carries BOTH a `home` and a
+    `workdir`, resolve `<home>/.claude/settings.json` and
+    `<workdir>/.claude/settings.json` to their real files and flag the
+    agent when they resolve to DIFFERENT inodes — i.e. the workdir copy is
+    a second real file instead of a relative symlink back at the home
+    effective tree. This is the silent drift that lets a stale
+    `enabledPlugins[X]=false` survive in the workdir copy (#1453 root
+    cause).
+
+    Cases that are NOT flagged (no false positive):
+      * either tree's `settings.json` missing / not-yet-rendered;
+      * both resolve to the same real file (the healthy symlinked layout);
+      * an agent with only one of {home, workdir} (no second tree to drift
+        against — covered by settings-multi-tree if it ever grows one).
+
+    Read-only. `suggested_action` points at `link-shared-settings`; the
+    detector never re-points the symlink itself.
+    """
+    findings: list[dict[str, Any]] = []
+    for agent_id, home, workdir in _iter_registry_agents(registry):
+        if not home or not workdir:
+            continue
+        home_paths = _settings_tree_paths(home)
+        work_paths = _settings_tree_paths(workdir)
+        if home_paths is None or work_paths is None:
+            continue
+        home_link, _home_eff = home_paths
+        work_link, _work_eff = work_paths
+        home_real = _real_settings_target(home_link)
+        work_real = _real_settings_target(work_link)
+        # Need BOTH sides resolvable to claim divergence. A missing/broken
+        # side is left to settings-multi-tree or simply skipped — never a
+        # two-tree finding (avoids flagging a half-rendered agent).
+        if home_real is None or work_real is None:
+            continue
+        if home_real == work_real:
+            continue
+        try:
+            work_is_symlink = work_link.is_symlink()  # noqa: raw-pathlib-controller-only — read-only evidence probe; OSError-guarded so an iso-tree PermissionError degrades to a null evidence field rather than crashing the diagnostic.
+        except OSError:
+            work_is_symlink = None
+        evidence = {
+            "home_settings": str(home_link),
+            "home_resolves_to": str(home_real),
+            "workdir_settings": str(work_link),
+            "workdir_resolves_to": str(work_real),
+            "workdir_is_symlink": work_is_symlink,
+        }
+        suggested = (
+            f"Two-tree settings drift for {agent_id}: "
+            f"{work_link} resolves to {work_real} but {home_link} resolves to "
+            f"{home_real} — the workdir settings is a SECOND real file instead "
+            "of a relative symlink to the home effective tree, so "
+            "enabledPlugins can drift (the #1453 signature). Re-point the "
+            "workdir at the home effective file with "
+            f"`bash bridge-hooks.sh link-shared-settings --agent {agent_id}` "
+            "(controller-owned render; never hand-copy). Verify with "
+            f"`realpath {work_link}` == `realpath {home_link}`."
+        )
+        findings.append(
+            {
+                "ts": ts,
+                "kind": "settings-two-tree-drift",
+                "agent": agent_id,
+                "evidence": evidence,
+                "suggested_action": suggested,
+            }
+        )
+    return findings
+
+
+def detect_settings_multi_tree(
+    registry: list[dict[str, Any]],
+    ts: str,
+) -> list[dict[str, Any]]:
+    """Issue #1455 detector (b): effective settings exist in >1 real tree.
+
+    The single-tree invariant says exactly one physical
+    `settings.effective.json` may exist for an agent (canonically under
+    `home/.claude/`); every other location is a symlink to it. This
+    detector flags an agent that has a REAL (non-symlink) effective file
+    under BOTH its `home/.claude/` and its `workdir/.claude/` — two
+    physical copies, guaranteed to drift.
+
+    Distinct from settings-two-tree-drift: that one compares the
+    `settings.json` link resolution; this one counts physical
+    `settings.effective.json` files. An agent can trip (b) even if its
+    `settings.json` links happen to agree, and the two together cover the
+    promotion-time hazard described in the issue.
+
+    Read-only.
+    """
+    findings: list[dict[str, Any]] = []
+    for agent_id, home, workdir in _iter_registry_agents(registry):
+        # Map distinct PHYSICAL file (realpath) -> a display path. Keying by
+        # realpath dedupes the case where `home` and `workdir` resolve to the
+        # SAME tree (identical paths, or the workdir's `.claude` parent is a
+        # symlink to home's) — there the same `settings.effective.json` would
+        # otherwise be counted twice and produce a false multi-tree finding.
+        # Only TWO OR MORE distinct physical files is a real violation.
+        physical: dict[str, str] = {}
+        for base in (home, workdir):
+            paths = _settings_tree_paths(base)
+            if paths is None:
+                continue
+            _link, eff = paths
+            try:
+                # A real, physical effective file = exists AND is not a
+                # symlink. A symlinked effective.json (workdir pointing at
+                # home) is the HEALTHY case and must not be counted.
+                if eff.is_file() and not eff.is_symlink():  # noqa: raw-pathlib-controller-only — read-only diagnostic probe; OSError-guarded (PermissionError on an iso tree falls through to `continue`, never crashing the doctor), so the sudo-escalating safe wrapper the lint guards against is intentionally not used.
+                    real = os.path.realpath(eff)
+                    physical.setdefault(real, str(eff))
+            except OSError:
+                continue
+        if len(physical) < 2:
+            continue
+        real_locations = sorted(physical.values())
+        evidence = {
+            "real_effective_files": real_locations,
+            "count": len(real_locations),
+        }
+        suggested = (
+            f"Multi-tree settings for {agent_id}: a real settings.effective.json "
+            f"exists in {len(real_locations)} trees "
+            f"({', '.join(sorted(real_locations))}). The single-tree invariant "
+            "allows exactly one physical effective file (canonically under "
+            "home/.claude/) with every other location a symlink to it. Two "
+            "physical copies drift silently. Re-render the single home tree and "
+            "re-point the workdir with "
+            f"`bash bridge-hooks.sh link-shared-settings --agent {agent_id}`; "
+            "after that there must be ZERO physical settings.effective.json "
+            "under workdir/.claude/."
+        )
+        findings.append(
+            {
+                "ts": ts,
+                "kind": "settings-multi-tree",
+                "agent": agent_id,
+                "evidence": evidence,
+                "suggested_action": suggested,
+            }
+        )
+    return findings
+
+
 # --- rendering -------------------------------------------------------------
 
 
@@ -1060,24 +1308,31 @@ def main() -> int:
     enabled_set_pre = set(enabled)
     home_root = resolve_agent_home_root(args.agent_home_root)
     registry_load_failed = False
-    if "orphan-agent-dir" in enabled_set_pre:
+    # Issue #598 Track 2 + #1455: `agent registry --json` backs the
+    # orphan-agent-dir detector AND the two settings single-tree detectors
+    # (they read the home + workdir columns). Lazy-load it once when ANY of
+    # those is enabled; a load failure surfaces as one detector-error per
+    # affected detector (emitted lazily below) rather than failing the run.
+    registry_consumers = {"orphan-agent-dir"} | set(SETTINGS_DETECTOR_KINDS)
+    if enabled_set_pre & registry_consumers:
         try:
             registry = load_agent_registry(args)
         except SystemExit as exc:
             registry = []
             registry_load_failed = True
-            findings.append(
-                {
-                    "ts": ts,
-                    "kind": "detector-error",
-                    "agent": "",
-                    "evidence": {
-                        "detector": "orphan-agent-dir",
-                        "error": str(exc),
-                    },
-                    "suggested_action": "",
-                }
-            )
+            for consumer in sorted(enabled_set_pre & registry_consumers):
+                findings.append(
+                    {
+                        "ts": ts,
+                        "kind": "detector-error",
+                        "agent": "",
+                        "evidence": {
+                            "detector": consumer,
+                            "error": str(exc),
+                        },
+                        "suggested_action": "",
+                    }
+                )
     else:
         registry = []
 
@@ -1111,6 +1366,16 @@ def main() -> int:
             # known-set otherwise treats every dir under BRIDGE_AGENT_HOME_ROOT
             # as orphan.
             lambda: [] if registry_load_failed else detect_orphan_agent_dir(registry, home_root, ts),
+        ),
+        (
+            # Issue #1455 (a): home + workdir settings.json diverge.
+            "settings-two-tree-drift",
+            lambda: [] if registry_load_failed else detect_settings_two_tree_drift(registry, ts),
+        ),
+        (
+            # Issue #1455 (b): effective settings physically present in >1 tree.
+            "settings-multi-tree",
+            lambda: [] if registry_load_failed else detect_settings_multi_tree(registry, ts),
         ),
     ]
 
