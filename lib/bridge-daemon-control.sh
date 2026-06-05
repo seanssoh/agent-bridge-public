@@ -2011,3 +2011,439 @@ sys.stdout.write(latest)
   fi
   return 1
 }
+
+# ===========================================================================
+# Issue #1563 PR-2 — T1 daemon self-abort BACKSTOP (runner-process default).
+#
+# THE WEDGE (the actual #1563 bug): the daemon can sit "alive-but-not-
+# ticking" — `cmd_run`'s pid stays alive while `cmd_sync_cycle` is blocked
+# on an unbounded child (the canonical stack: bash at __wait4 on a tmux
+# send-keys whose far end is a closed SSL pipe that escaped a
+# bridge_with_timeout wrapper). A naive `kill -0 $pid` health check passes
+# this wedge. PR-2 makes a wedged daemon SELF-ABORT (exit non-zero) so T0
+# (launchd KeepAlive / systemd Restart=always) restarts a FRESH daemon —
+# WITHOUT ever aborting a HEALTHY daemon mid-long-step.
+#
+# THE HARD CONSTRAINT (why a naive per-tick deadline is WRONG): the tick
+# legitimately does long BOUNDED work in-line — process_daily_backup (600s
+# ceiling), A2A deliver (60s), bridge-sync (30s), watchdog (30s). A deadline
+# tuned to desired nudge latency would KILL a healthy daemon mid-backup.
+# So the deadline is a WEDGE BACKSTOP derived from the MAX legitimate single
+# synchronous step budget + grace — NEVER from nudge latency.
+#
+# THE MECHANISM (runner-process, the codex-Q2-agreed DEFAULT — NOT bash
+# SIGALRM, which leaks trap/timer state across ticks): `cmd_run` runs ONE
+# scheduler tick (`cmd_sync_cycle`) as a CHILD in its own process group via
+# bridge_daemon_run_tick_supervised. The child writes a PROGRESS heartbeat
+# (epoch -> the progress file) around each long bounded step (the parent-
+# side progress signal); the supervisor parent waits on the child and
+# watches the FRESHNESS of that progress file. As long as the child makes
+# progress within (longest single step budget + grace) the supervisor never
+# fires — a healthy 600s backup refreshes progress right before the step and
+# completes under its own 600s bridge_with_timeout, comfortably inside the
+# (600 + grace) deadline. A genuine wedge = no progress update for longer
+# than the deadline -> kill the child's process group, emit
+# `daemon_tick_deadline_exceeded`, and signal the caller to exit non-zero.
+# The timer is the child itself (it dies with the kill); there is no bash
+# alarm/trap to leak into the NEXT tick (the supervisor re-forks a fresh
+# child + fresh progress baseline each tick — assertion (c)).
+# ===========================================================================
+
+# Default FLOOR per-step budget (seconds). process_daily_backup is the longest
+# legitimate synchronous step (600s default ceiling), so 600 is the floor. The
+# EFFECTIVE max-step is the MAX of this floor and the ACTUAL resolved bounded-
+# step budgets (see bridge_daemon_tick_resolved_max_step_seconds) — critically,
+# the operator-tunable BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS, which the recovery
+# runbook tells large-install operators to RAISE. Deriving from the resolved
+# budget (not a fixed 600) is what guarantees the deadline always sits ABOVE
+# the longest legitimately-configured step, so a healthy backup that runs under
+# its own (possibly raised) bridge_with_timeout can never trip the backstop
+# (codex #1563-PR2 review: a fixed 600 floor + a documented 900s backup timeout
+# would FALSE-ABORT a healthy daemon — the exact flapping irony).
+: "${BRIDGE_DAEMON_TICK_MAX_STEP_SECONDS:=600}"
+# Grace on top of the max step: covers progress-write latency, the
+# supervisor poll interval, and process teardown. NOT a nudge-latency knob.
+: "${BRIDGE_DAEMON_TICK_GRACE_SECONDS:=120}"
+# How often the supervisor parent polls the child + progress freshness.
+: "${BRIDGE_DAEMON_TICK_POLL_SECONDS:=2}"
+
+# The operator-tunable synchronous bridge_with_timeout step ceilings reachable
+# from cmd_sync_cycle, paired with their documented defaults. The effective
+# max-step is the MAX of the floor and EVERY one of these, so raising ANY of
+# them automatically widens the T1 deadline and a healthy step running under
+# its own (possibly raised) bridge_with_timeout can never trip the backstop
+# (codex #1563-PR2 review: daily-backup was not the only tunable step —
+# claude-token-recovery and cron-staging-apply are also operator-raisable).
+# Format: "ENV_VAR_NAME:default_seconds". Only SYNCHRONOUS step DURATIONS
+# belong here — data-age thresholds (e.g. BRIDGE_PERMISSION_ESCALATION_TIMEOUT_
+# SECONDS, a task-age comparison, NOT a step duration) and counts
+# (BRIDGE_NUDGE_RECHECK_TIMEOUT_ESCALATE_AFTER) are deliberately excluded. Keep
+# this list in sync when a new operator-tunable bridge_with_timeout ceiling is
+# added to cmd_sync_cycle (the 1563-pr2 smoke pins the coupling).
+_BRIDGE_DAEMON_TICK_STEP_TIMEOUT_KNOBS=(
+  "BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS:600"
+  "BRIDGE_CLAUDE_TOKEN_RECOVERY_TIMEOUT_SECONDS:60"
+  "BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS:45"
+  "BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS:25"
+  "BRIDGE_CRON_SYNC_TIMEOUT:30"
+)
+
+# bridge_daemon_tick_resolved_max_step_seconds — the EFFECTIVE longest
+# legitimate single synchronous step. Starts from the configured floor
+# (BRIDGE_DAEMON_TICK_MAX_STEP_SECONDS) and raises it to the LARGEST of every
+# operator-tunable bridge_with_timeout step ceiling reachable from
+# cmd_sync_cycle (see _BRIDGE_DAEMON_TICK_STEP_TIMEOUT_KNOBS), so the deadline
+# can never be SMALLER than a configured bounded step. The daily-backup ceiling
+# is resolved via bridge_daily_backup_resolve_timeout (in scope at runtime once
+# bridge-lib.sh sources this lib into the daemon) when available, else its env
+# var; every other knob is read from its env var with its documented default.
+bridge_daemon_tick_resolved_max_step_seconds() {
+  local max_step="${BRIDGE_DAEMON_TICK_MAX_STEP_SECONDS:-600}"
+  [[ "$max_step" =~ ^[0-9]+$ ]] || max_step=600
+
+  # Daily backup has a resolver helper (clamps/validates); prefer it.
+  local backup="$max_step"
+  if command -v bridge_daily_backup_resolve_timeout >/dev/null 2>&1; then
+    local resolved
+    resolved="$(bridge_daily_backup_resolve_timeout 2>/dev/null || printf '')"
+    [[ "$resolved" =~ ^[0-9]+$ ]] && backup="$resolved"
+  elif [[ "${BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS:-}" =~ ^[0-9]+$ ]]; then
+    backup="$BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS"
+  fi
+  (( backup > max_step )) && max_step="$backup"
+
+  # Every other operator-tunable step ceiling: env override or documented
+  # default, whichever applies; raise the running max.
+  local knob name default val
+  for knob in "${_BRIDGE_DAEMON_TICK_STEP_TIMEOUT_KNOBS[@]}"; do
+    name="${knob%%:*}"
+    default="${knob#*:}"
+    # daily-backup already handled via its resolver above.
+    [[ "$name" == "BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS" ]] && continue
+    val="${!name:-$default}"
+    [[ "$val" =~ ^[0-9]+$ ]] || val="$default"
+    (( val > max_step )) && max_step="$val"
+  done
+
+  printf '%s' "$max_step"
+}
+
+# bridge_daemon_tick_deadline_seconds — the wedge-backstop deadline =
+# (effective resolved max-step) + grace. Emitted into the audit row so the
+# value is operator-visible and the smoke can assert it is max-step-DERIVED
+# (always >= the longest configured bounded step), NOT a fixed/nudge-latency
+# number.
+bridge_daemon_tick_deadline_seconds() {
+  local max_step grace
+  max_step="$(bridge_daemon_tick_resolved_max_step_seconds)"
+  grace="${BRIDGE_DAEMON_TICK_GRACE_SECONDS:-120}"
+  [[ "$max_step" =~ ^[0-9]+$ ]] || max_step=600
+  [[ "$grace" =~ ^[0-9]+$ ]] || grace=120
+  printf '%s' "$(( max_step + grace ))"
+}
+
+# bridge_daemon_tick_progress_file — path of the per-tick progress heartbeat
+# the in-tick markers write and the supervisor watches. Distinct from
+# state/daemon.heartbeat (the cross-tick OS-watcher file) so the supervisor's
+# in-tick wedge detection is not masked by anything else touching the OS file.
+bridge_daemon_tick_progress_file() {
+  local state_dir="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  printf '%s/daemon.tick-progress' "$state_dir"
+}
+
+# bridge_daemon_sd_notify — best-effort systemd sd_notify (Linux T0 backstop).
+# Only fires when running under a systemd `Type=notify` unit (NOTIFY_SOCKET is
+# exported by systemd in that case) AND `systemd-notify` is on PATH. A no-op
+# everywhere else (macOS/launchd, non-notify units, bare runs). Used to send
+# READY=1 at daemon startup and WATCHDOG=1 on each progress pulse so systemd's
+# own WatchdogSec is an INDEPENDENT backstop to the T1 self-abort: if the
+# daemon wedges so hard it cannot even reach its own supervisor poll, the
+# missed WATCHDOG=1 makes systemd restart it. The WatchdogSec is sized ABOVE
+# the T1 deadline so a healthy long step never trips systemd before T1's own
+# (already-grace-padded) backstop — systemd is the slower outer ring.
+bridge_daemon_sd_notify() {
+  [[ -n "${NOTIFY_SOCKET:-}" ]] || return 0
+  command -v systemd-notify >/dev/null 2>&1 || return 0
+  systemd-notify "$@" >/dev/null 2>&1 || true
+  return 0
+}
+
+# bridge_daemon_tick_progress_touch — the PARENT-SIDE progress heartbeat
+# primitive: stamp the current epoch into the progress file (atomic via
+# mv) AND refresh state/daemon.heartbeat so the cross-tick OS watcher
+# (launchd liveness / systemd timer) also sees forward progress. Called by
+# the in-tick step markers (_bridge_daemon_mark_progress in bridge-daemon.sh)
+# around each long bounded step and at the top of each loop iteration.
+#
+# Optional arg $1 = the step label. The tick runs as a CHILD subshell, so its
+# BRIDGE_DAEMON_LAST_STEP mutations never reach the supervisor parent; the
+# child publishes the step label to a small sibling file so the supervisor's
+# wedge audit can name the ACTUAL hung step (not the stale parent value).
+# Best-effort: a failed stamp must never abort the tick.
+bridge_daemon_tick_progress_touch() {
+  local step="${1:-}"
+  local now_ts
+  now_ts="$(date +%s 2>/dev/null || printf '0')"
+  local pf hb sf
+  pf="$(bridge_daemon_tick_progress_file)"
+  sf="${pf}.step"
+  hb="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}/daemon.heartbeat"
+  local dir
+  dir="$(dirname "$pf" 2>/dev/null || printf '.')"
+  mkdir -p "$dir" 2>/dev/null || true
+  if printf '%s\n' "$now_ts" 2>/dev/null >"$pf.tmp.$$"; then
+    mv -f "$pf.tmp.$$" "$pf" 2>/dev/null || printf '%s\n' "$now_ts" 2>/dev/null >"$pf" || true
+  else
+    printf '%s\n' "$now_ts" 2>/dev/null >"$pf" || true
+  fi
+  if [[ -n "$step" ]]; then
+    printf '%s\n' "$step" 2>/dev/null >"$sf" || true
+  fi
+  printf '%s\n' "$now_ts" 2>/dev/null >"$hb" || true
+  # Linux T0 backstop: pet the systemd watchdog on every progress pulse so a
+  # healthy long step keeps systemd's WatchdogSec satisfied (no-op off systemd
+  # notify). A genuine wedge stops pulsing → systemd restarts as the outer ring.
+  bridge_daemon_sd_notify WATCHDOG=1
+  return 0
+}
+
+# _bridge_daemon_tick_last_step — read the step label the child last
+# published (see bridge_daemon_tick_progress_touch). Used by the supervisor
+# to attribute a wedge to the real hung step.
+_bridge_daemon_tick_last_step() {
+  local sf
+  sf="$(bridge_daemon_tick_progress_file).step"
+  if [[ -r "$sf" ]]; then
+    local v
+    v="$(head -n1 "$sf" 2>/dev/null | tr -dc 'A-Za-z0-9_.-' | head -c 64)"
+    [[ -n "$v" ]] && { printf '%s' "$v"; return 0; }
+  fi
+  printf '%s' "unknown"
+}
+
+# _bridge_daemon_tick_progress_age — seconds since the last progress stamp.
+# Prints a large sentinel when the file is missing/unreadable so the
+# supervisor treats "never wrote progress" as a wedge candidate only after
+# the deadline (the first stamp happens at tick start, so a healthy child
+# establishes the baseline immediately).
+_bridge_daemon_tick_progress_age() {
+  local pf now_ts last_ts
+  pf="$(bridge_daemon_tick_progress_file)"
+  now_ts="$(date +%s 2>/dev/null || printf '0')"
+  if [[ -r "$pf" ]]; then
+    last_ts="$(tr -dc '0-9' <"$pf" 2>/dev/null | head -c 18)"
+  fi
+  [[ "$last_ts" =~ ^[0-9]+$ ]] || { printf '%s' "999999"; return 0; }
+  [[ "$now_ts" =~ ^[0-9]+$ ]] || { printf '%s' "999999"; return 0; }
+  local age=$(( now_ts - last_ts ))
+  (( age < 0 )) && age=0
+  printf '%s' "$age"
+}
+
+# ---------------------------------------------------------------------------
+# Cross-tick daemon-state counter persistence (#1563 PR-2 r3)
+#
+# Why this exists: the runner-process T1 (bridge_daemon_run_tick_supervised)
+# runs each scheduler tick as a background CHILD subshell. Any in-memory shell
+# variable mutated inside the tick (cmd_sync_cycle and its callees) is LOST when
+# the child exits — the parent re-enters the NEXT tick with the variable's
+# pre-fork value. That silently breaks ANY daemon-process-state counter that is
+# supposed to ACCUMULATE across ticks. The audited instance is
+# _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL (issue #946 L4 / PR #952 r2): under a
+# persistent idle-ready-writer failure it must climb 1,2,3,… across ticks so an
+# operator sees the wedge escalate; child-local memory pins it at 1 every tick.
+#
+# Fix: persist such counters in a tiny per-key state file under $BRIDGE_STATE_DIR
+# (one integer, newline-terminated). The child reads-at-tick-start, increments
+# or resets, and writes — the file survives the child boundary cleanly, matching
+# the daemon's existing tick-progress / nudge-state file patterns. Best-effort:
+# a failed read returns 0, a failed write must never abort the tick.
+
+# bridge_daemon_state_counter_file <key> — path of the persisted counter file.
+# <key> is sanitized to [A-Za-z0-9_.-] so a caller key can never escape the dir.
+bridge_daemon_state_counter_file() {
+  local key="${1:-counter}"
+  key="$(printf '%s' "$key" | tr -dc 'A-Za-z0-9_.-' | head -c 96)"
+  [[ -n "$key" ]] || key="counter"
+  local state_dir="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  printf '%s/daemon-state-counters/%s' "$state_dir" "$key"
+}
+
+# bridge_daemon_state_counter_get <key> — print the persisted integer (0 if the
+# file is missing/unreadable/non-numeric). Never errors (set -u safe: a missing
+# <key> resolves to the default counter, a missing file reads as 0).
+bridge_daemon_state_counter_get() {
+  local cf v=0
+  cf="$(bridge_daemon_state_counter_file "${1:-}")"
+  if [[ -r "$cf" ]]; then
+    v="$(tr -dc '0-9' <"$cf" 2>/dev/null | head -c 18)"
+  fi
+  [[ "$v" =~ ^[0-9]+$ ]] || v=0
+  printf '%s' "$v"
+}
+
+# bridge_daemon_state_counter_set <key> <value> — persist <value> atomically and
+# print it. Non-numeric/missing <value> is coerced to 0. Best-effort write
+# (set -u safe: both positionals default).
+bridge_daemon_state_counter_set() {
+  local cf val dir
+  cf="$(bridge_daemon_state_counter_file "${1:-}")"
+  val="${2:-0}"
+  [[ "$val" =~ ^[0-9]+$ ]] || val=0
+  dir="$(dirname "$cf" 2>/dev/null || printf '.')"
+  mkdir -p "$dir" 2>/dev/null || true
+  if printf '%s\n' "$val" 2>/dev/null >"$cf.tmp.$$"; then
+    mv -f "$cf.tmp.$$" "$cf" 2>/dev/null || printf '%s\n' "$val" 2>/dev/null >"$cf" || true
+  else
+    printf '%s\n' "$val" 2>/dev/null >"$cf" || true
+  fi
+  printf '%s' "$val"
+}
+
+# bridge_daemon_state_counter_incr <key> — read, +1, persist, print the NEW
+# value. This is the accumulate-across-ticks primitive (set -u safe).
+bridge_daemon_state_counter_incr() {
+  local key="${1:-}" cur next
+  cur="$(bridge_daemon_state_counter_get "$key")"
+  next=$(( cur + 1 ))
+  bridge_daemon_state_counter_set "$key" "$next"
+}
+
+# bridge_daemon_state_counter_reset <key> — persist 0 (and print it; set -u safe).
+bridge_daemon_state_counter_reset() {
+  bridge_daemon_state_counter_set "${1:-}" 0
+}
+
+# bridge_daemon_run_tick_supervised — the runner-process T1.
+#
+# Runs the tick function ("$@", normally `cmd_sync_cycle`) as a CHILD in its
+# OWN process group, establishes a fresh progress baseline, then polls:
+#   - reaps the child the instant it finishes -> returns the child's status
+#     (0 = healthy tick, the daemon loop continues);
+#   - on each poll, recomputes progress age; if it exceeds the
+#     max-step-budget + grace deadline the child is WEDGED -> SIGTERM then
+#     SIGKILL the child's whole process group (so a hung grandchild cannot
+#     orphan), emit a structured `daemon_tick_deadline_exceeded` audit row
+#     (tick_id, last_step, duration_seconds, deadline_seconds), and return
+#     the reserved status BRIDGE_DAEMON_TICK_WEDGE_RC (99) so the caller
+#     exits non-zero for OS-init restart.
+#
+# A fresh child + fresh progress baseline per call means a stale timer/child
+# can never fire into the NEXT tick (assertion (c)): if this returns 0 the
+# child has already been reaped; the next call forks a brand-new pgid.
+BRIDGE_DAEMON_TICK_WEDGE_RC=99
+bridge_daemon_run_tick_supervised() {
+  local tick_id="${1:-0}"
+  shift || true
+  if (( $# == 0 )); then
+    set -- cmd_sync_cycle
+  fi
+
+  local deadline poll
+  deadline="$(bridge_daemon_tick_deadline_seconds)"
+  poll="${BRIDGE_DAEMON_TICK_POLL_SECONDS:-2}"
+  [[ "$poll" =~ ^[0-9]+$ ]] && (( poll > 0 )) || poll=2
+
+  # Establish the progress baseline BEFORE forking so a child that wedges
+  # before its first own stamp is still measured from tick start (not from
+  # a stale prior-tick value). Seed the step label as "tick_start" so a child
+  # that wedges before its own first marker is still attributed, not left
+  # showing the previous tick's step.
+  bridge_daemon_tick_progress_touch "tick_start"
+
+  local tick_started_ts
+  tick_started_ts="$(date +%s 2>/dev/null || printf '0')"
+
+  # Run the tick as a child in its OWN process group so a wedge can be killed
+  # as a group and a hung GRANDCHILD cannot orphan. The portable mechanism is
+  # job control: when `set -m` is active in the PARENT at the moment a `&` job
+  # is launched, bash places that job in a fresh process group whose pgid ==
+  # the job's pid ($!). We then `kill -TERM -$child_pid` to signal the whole
+  # group. `set -m` must be active in the parent (NOT inside the subshell —
+  # that only makes the grandchild its own leader and leaves the subshell in
+  # the daemon's group, so the group-kill misses the tree). We record the
+  # prior `-m` state and restore it immediately so the long-lived daemon shell
+  # is never left in job-control mode (which would emit spurious job
+  # notifications). All job-control chatter from the launch is stderr-scoped.
+  local _had_monitor=0
+  case "$-" in *m*) _had_monitor=1 ;; esac
+  local child_pid=""
+  {
+    set -m 2>/dev/null || true
+    ( "$@" ) &
+    child_pid=$!
+    if (( _had_monitor == 0 )); then
+      set +m 2>/dev/null || true
+    fi
+  } 2>/dev/null
+
+  local child_status=0
+  while true; do
+    # Has the child finished? `kill -0` is true while alive.
+    if ! kill -0 "$child_pid" 2>/dev/null; then
+      # Reap and capture the real exit status.
+      wait "$child_pid" 2>/dev/null
+      child_status=$?
+      return "$child_status"
+    fi
+
+    local age
+    age="$(_bridge_daemon_tick_progress_age)"
+    [[ "$age" =~ ^[0-9]+$ ]] || age=0
+    if (( age >= deadline )); then
+      # WEDGE. Kill the child's process group (TERM, grace, KILL) so a hung
+      # grandchild cannot orphan, then emit the structured audit + signal a
+      # non-zero exit. A negative pid targets the process group of the leader.
+      # The child publishes its step label to a sibling file (its subshell
+      # BRIDGE_DAEMON_LAST_STEP never reaches us); prefer that, then fall back
+      # to the parent's last-set step.
+      local last_step
+      last_step="$(_bridge_daemon_tick_last_step 2>/dev/null || printf 'unknown')"
+      if [[ -z "$last_step" || "$last_step" == "unknown" ]]; then
+        last_step="${BRIDGE_DAEMON_LAST_STEP:-unknown}"
+      fi
+      local now_ts duration
+      now_ts="$(date +%s 2>/dev/null || printf '0')"
+      if [[ "$now_ts" =~ ^[0-9]+$ && "$tick_started_ts" =~ ^[0-9]+$ ]]; then
+        duration=$(( now_ts - tick_started_ts ))
+        (( duration < 0 )) && duration=0
+      else
+        duration="$age"
+      fi
+
+      # Kill + grace + reap, confined to a stderr-redirected block so the
+      # parent shell's job-control "Terminated: 15" notification (emitted
+      # when it reaps a signal-killed background job) does not leak into the
+      # daemon/launchagent log. The structured audit + warn below carry the
+      # real, intentional operator signal.
+      {
+        kill -TERM "-$child_pid" || kill -TERM "$child_pid" || true
+        local waited=0
+        while kill -0 "$child_pid" 2>/dev/null && (( waited < 5 )); do
+          sleep 1
+          waited=$(( waited + 1 ))
+        done
+        if kill -0 "$child_pid" 2>/dev/null; then
+          kill -KILL "-$child_pid" || kill -KILL "$child_pid" || true
+        fi
+        wait "$child_pid" || true
+      } >/dev/null 2>&1
+
+      if command -v bridge_audit_log >/dev/null 2>&1; then
+        bridge_audit_log daemon daemon_tick_deadline_exceeded daemon \
+          --detail tick_id="$tick_id" \
+          --detail last_step="$last_step" \
+          --detail duration_seconds="$duration" \
+          --detail deadline_seconds="$deadline" \
+          --detail progress_age_seconds="$age" \
+          --detail pid="$$" >/dev/null 2>&1 || true
+      fi
+      if command -v bridge_warn >/dev/null 2>&1; then
+        bridge_warn "daemon-tick: WEDGE detected at step=$last_step (no progress for ${age}s >= deadline ${deadline}s) — self-aborting for OS-init restart (issue #1563)"
+      fi
+      return "$BRIDGE_DAEMON_TICK_WEDGE_RC"
+    fi
+
+    sleep "$poll"
+  done
+}

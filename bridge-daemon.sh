@@ -540,10 +540,80 @@ _BRIDGE_DAEMON_IN_ERR_TRAP=0
 # (b) surface a `daemon_step_warning` audit row so an operator can spot a
 # wedged writer after N consecutive ticks instead of having to grep raw
 # logs.
+#
+# Issue #1563 PR-2 r3: this counter must ACCUMULATE across ticks, but since
+# PR-2's runner-process T1 runs each tick as a supervised CHILD subshell,
+# in-memory shell vars mutated inside the tick are lost on exit. The
+# authoritative value is therefore persisted in a daemon-state file. The
+# wrappers below (_bridge_daemon_consec_fail_*) prefer the control-lib
+# bridge_daemon_state_counter_* helpers and, if those are absent (a hand-mixed
+# install with a NEW bridge-daemon.sh over an OLD lib/bridge-daemon-control.sh
+# that has the supervisor but not the r3 counter helpers), fall back to an
+# INLINE file persist — so the counter is persisted whenever ticks are
+# supervised, never silently lost. This module-level var is the in-memory
+# mirror used for audit/log emission within the same tick.
 _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=0
+
+# Resolve the consec-fail counter file (mirrors bridge_daemon_state_counter_file
+# so the inline fallback writes the SAME path the lib helper would). Used only
+# when the control-lib counter helpers are not loaded.
+_bridge_daemon_consec_fail_file() {
+  local state_dir="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  printf '%s/daemon-state-counters/_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL' "$state_dir"
+}
+
+# Persist + print the incremented consec-fail counter. Prefers the control-lib
+# helper; otherwise persists inline (read-modify-write the same file).
+_bridge_daemon_consec_fail_incr() {
+  if command -v bridge_daemon_state_counter_incr >/dev/null 2>&1; then
+    bridge_daemon_state_counter_incr _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL
+    return 0
+  fi
+  local cf cur=0 next dir
+  cf="$(_bridge_daemon_consec_fail_file)"
+  if [[ -r "$cf" ]]; then
+    cur="$(tr -dc '0-9' <"$cf" 2>/dev/null | head -c 18)"
+  fi
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+  next=$(( cur + 1 ))
+  dir="$(dirname "$cf" 2>/dev/null || printf '.')"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s\n' "$next" 2>/dev/null >"$cf" || true
+  printf '%s' "$next"
+}
+
+# Persist + print the reset (0) consec-fail counter. Same prefer/fallback shape.
+_bridge_daemon_consec_fail_reset() {
+  if command -v bridge_daemon_state_counter_reset >/dev/null 2>&1; then
+    bridge_daemon_state_counter_reset _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL
+    return 0
+  fi
+  local cf dir
+  cf="$(_bridge_daemon_consec_fail_file)"
+  dir="$(dirname "$cf" 2>/dev/null || printf '.')"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s\n' 0 2>/dev/null >"$cf" || true
+  printf '%s' 0
+}
 
 _bridge_daemon_on_signal() {
   BRIDGE_LAST_SIGNAL="$1"
+}
+
+# Issue #1563 PR-2 — in-tick progress marker. Records the named step into
+# BRIDGE_DAEMON_LAST_STEP (the existing exit-record + audit field) AND stamps
+# the parent-side progress heartbeat (bridge_daemon_tick_progress_touch in
+# lib/bridge-daemon-control.sh). Called by cmd_sync_cycle BEFORE each long
+# bounded step so legit long work (daily_backup 600s, a2a 60s, bridge-sync
+# 30s, watchdog 30s) keeps the supervisor's progress signal FRESH and never
+# trips the max-step-budget backstop deadline (the B1 negative control).
+# Best-effort: a missing helper (lib not loaded) degrades to the bare
+# LAST_STEP assignment so a partial install still ticks.
+_bridge_daemon_mark_progress() {
+  BRIDGE_DAEMON_LAST_STEP="$1"
+  if command -v bridge_daemon_tick_progress_touch >/dev/null 2>&1; then
+    bridge_daemon_tick_progress_touch "$1" || true
+  fi
 }
 
 _bridge_daemon_on_err() {
@@ -10915,7 +10985,12 @@ cmd_sync_cycle() {
   # than wedging on per-call retries. The next launchd-restart of the
   # daemon (from inside the source dir at boot time, or via the silence
   # watchdog) re-arms BRIDGE_SCRIPT_DIR.
-  BRIDGE_DAEMON_LAST_STEP="l1_script_dir_health"
+  # #1563 PR-2: re-baseline the supervisor progress heartbeat at the TOP of
+  # the tick (the loop-top stamp) so the per-tick child establishes its own
+  # fresh progress anchor regardless of how long the prior tick's last step
+  # took. The supervisor also seeds a baseline before forking, so this is the
+  # in-child confirmation that the tick actually started executing.
+  _bridge_daemon_mark_progress "l1_script_dir_health"
   if ! bridge_resolve_script_dir_check; then
     daemon_info "[L1] BRIDGE_SCRIPT_DIR=${BRIDGE_SCRIPT_DIR:-<unset>} is missing or invalid; helper invocations will fail-empty this tick. Re-source from a valid checkout (or run \`agb upgrade --apply\`) and the daemon will recover."
   fi
@@ -10951,14 +11026,26 @@ cmd_sync_cycle() {
   # the Discord relay (so any inbound user activity is already mirrored into
   # the activity index when the route lookup runs) and before bridge-sync,
   # which is the cheap "I/O is mostly done for this cycle" boundary.
-  BRIDGE_DAEMON_LAST_STEP="precompact_events"
+  # #1563 PR-2 (r2): process_precompact_events fans out bounded channel sends
+  # via bridge_with_timeout 30 (each PreCompact notify) — a long bounded step.
+  # Bracket it BEFORE and AFTER so a healthy fan-out re-baselines the progress
+  # heartbeat on completion and the tail work gets the FULL deadline, not just
+  # the residual grace window (the healthy-daemon false-abort class).
+  _bridge_daemon_mark_progress "precompact_events"
   ( process_precompact_events ) || true
+  _bridge_daemon_mark_progress "precompact_events"
 
-  BRIDGE_DAEMON_LAST_STEP="bridge_sync"
+  # #1563 PR-2: refresh the supervisor progress heartbeat right before this
+  # long bounded step (30s ceiling) so a healthy bridge-sync keeps liveness
+  # FRESH and the supervisor's max-step-budget backstop never fires on it.
+  _bridge_daemon_mark_progress "bridge_sync"
   # Refs #815 Wave B: wrap with bridge_with_timeout so a stuck child cannot
   # wedge the daemon main loop. 30s ceiling — bridge-sync.sh reconciles roster
   # + state under normal conditions in <1s; timeouts here are pathological.
   bridge_with_timeout 30 bridge_sync "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true
+  # #1563 PR-2 (r2): re-baseline progress AFTER the long step so the tail work
+  # below inherits the full deadline, not just the residual grace window.
+  _bridge_daemon_mark_progress "bridge_sync"
   # Issue #848: bridge-sync.sh ran as a child process and may have
   # touched the roster files; invalidate so this in-loop reload picks
   # up any newly-registered dynamic agents.
@@ -11054,11 +11141,20 @@ cmd_sync_cycle() {
   # consecutive-failure counter and audit row are preserved so an operator
   # still gets the writer-wedge signal.
   nudge_output=""
+  # Issue #1563 PR-2 r3: this counter must ACCUMULATE across ticks, but the
+  # tick now runs as a supervised CHILD subshell (runner-process T1) whose
+  # in-memory shell vars are lost on exit. The _bridge_daemon_consec_fail_*
+  # wrappers persist it in a small daemon-state file so a sustained
+  # idle-ready-writer failure climbs 1,2,3,… across ticks (child-local memory
+  # would pin it at 1 every tick) — and persist even when the control-lib
+  # counter helpers are absent (the hand-mixed-install gap), so the counter is
+  # never silently lost whenever ticks run supervised. The printed value is
+  # mirrored into the module-level var for this tick's audit/log emission.
   if bridge_write_idle_ready_agents "$ready_agents_file"; then
-    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=0
+    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL="$(_bridge_daemon_consec_fail_reset)"
     nudge_output="$(bridge_task_daemon_step "$snapshot_file" "$ready_agents_file" 2>/dev/null || true)"
   else
-    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=$(( _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL + 1 ))
+    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL="$(_bridge_daemon_consec_fail_incr)"
     bridge_audit_log daemon daemon_step_warning daemon \
       --detail step="nudge_scan_idle_ready" \
       --detail reason="bridge_write_idle_ready_agents non-zero (matrix not applied or writer error)" \
@@ -11093,8 +11189,12 @@ cmd_sync_cycle() {
   # Placement: after cron_dispatch_workers (where queue maintenance is
   # done) and before nudge_agents (the cycle's last big external fanout).
   # Issue #1338 defense-in-depth: subshell-isolate (rationale above).
-  BRIDGE_DAEMON_LAST_STEP="a2a_deliver_tick"
+  # #1563 PR-2: refresh progress before the A2A deliver tick (60s ceiling).
+  _bridge_daemon_mark_progress "a2a_deliver_tick"
   ( process_a2a_deliver_tick ) || true
+  # #1563 PR-2 (r2): re-baseline progress AFTER the 60s deliver tick so the
+  # subsequent tail steps inherit the full deadline, not just residual grace.
+  _bridge_daemon_mark_progress "a2a_deliver_tick"
 
   # Issue #1262 Gap 3 (v0.15.0-beta4 Lane I): A2A outbox stuck-alert
   # scan. Pairs with the deliver tick above — when a row stays in
@@ -11251,18 +11351,28 @@ cmd_sync_cycle() {
   if refresh_agent_heartbeats; then
     changed=0
   fi
-  BRIDGE_DAEMON_LAST_STEP="watchdog"
+  # #1563 PR-2: refresh progress before the watchdog scan (30s ceiling).
+  _bridge_daemon_mark_progress "watchdog"
   if process_watchdog_report; then
     changed=0
   fi
+  # #1563 PR-2 (r2): re-baseline progress AFTER the 30s watchdog scan so the
+  # tail steps inherit the full deadline, not just the residual grace window.
+  _bridge_daemon_mark_progress "watchdog"
   BRIDGE_DAEMON_LAST_STEP="crash_reports"
   if process_crash_reports; then
     changed=0
   fi
-  BRIDGE_DAEMON_LAST_STEP="claude_token_recovery"
+  # #1563 PR-2 (r2): bracket claude_token_recovery — a bounded synchronous step
+  # whose ceiling (BRIDGE_CLAUDE_TOKEN_RECOVERY_TIMEOUT_SECONDS, default 60s) is
+  # a max-step knob the recovery runbook tells operators to RAISE. Without an
+  # AFTER mark a raised recovery timeout would collapse the periodic-sync /
+  # usage-monitor tail budget to the residual grace window (false-abort class).
+  _bridge_daemon_mark_progress "claude_token_recovery"
   if process_claude_token_recovery; then
     changed=0
   fi
+  _bridge_daemon_mark_progress "claude_token_recovery"
   # v0.13.6 hotfix — refs operator report 2026-05-15 patch host.
   # Cron-only static agents never trigger the rotation/recovery branch above
   # and so go stale (mgt_ahn hit 429 after 3 days on a 5/12 token). The
@@ -11282,10 +11392,20 @@ cmd_sync_cycle() {
   if process_usage_monitor; then
     changed=0
   fi
-  BRIDGE_DAEMON_LAST_STEP="daily_backup"
+  # #1563 PR-2: refresh progress right before the LONGEST bounded step
+  # (process_daily_backup, 600s ceiling). This is the step that defines the
+  # max-step budget; a healthy backup stamps progress here, runs under its
+  # own bridge_with_timeout, and stays comfortably inside the (600+grace)
+  # backstop deadline — the B1 negative control.
+  _bridge_daemon_mark_progress "daily_backup"
   if process_daily_backup; then
     changed=0
   fi
+  # #1563 PR-2 (r2): re-baseline progress AFTER the LONGEST bounded step (600s
+  # ceiling) so a healthy max-duration backup leaves the FULL deadline for the
+  # tail (release_monitor + the rest of the tick) — not just the grace window.
+  # This closes the healthy-daemon false-abort class codex reproduced (rc=99).
+  _bridge_daemon_mark_progress "daily_backup"
   BRIDGE_DAEMON_LAST_STEP="release_monitor"
   if process_release_monitor; then
     changed=0
@@ -11334,8 +11454,12 @@ cmd_sync_cycle() {
   # Failures here MUST NOT abort the rest of the tick; the apply path
   # never aborts on a single file, so this wrapper just absorbs an
   # unexpected non-zero rc with a warn line.
-  BRIDGE_DAEMON_LAST_STEP="cron_staging_apply"
+  # #1563 PR-2 (r2): bracket cron_staging_apply — BRIDGE_CRON_STAGING_APPLY_
+  # TIMEOUT_SECONDS (default 25s) is a max-step knob; re-baseline progress
+  # before+after so a raised ceiling cannot collapse the tail-wrap budget.
+  _bridge_daemon_mark_progress "cron_staging_apply"
   process_cron_staging_apply || daemon_warn "cron-staging apply step failed"
+  _bridge_daemon_mark_progress "cron_staging_apply"
 
   # Cron sync runs LAST, in the background with a timeout, so it never blocks
   # relay/auto-start above.  Only one sync runs at a time (PID-file guard).
@@ -11849,6 +11973,25 @@ cmd_run() {
   [[ "$heartbeat_interval" =~ ^[0-9]+$ ]] || heartbeat_interval=60
   local last_heartbeat_ts=0
   local now_ts
+  # #1563 PR-2: monotonically increasing tick id stamped into the
+  # daemon_tick_deadline_exceeded audit row so a wedge is attributable to a
+  # specific tick. Also flags whether the runner-process supervisor is
+  # available (it lives in lib/bridge-daemon-control.sh); on a partial install
+  # where the lib failed to load we fall back to the legacy in-line tick so
+  # the daemon still ticks (without the backstop) rather than refusing to run.
+  local tick_id=0
+  local _tick_supervised=0
+  if command -v bridge_daemon_run_tick_supervised >/dev/null 2>&1; then
+    _tick_supervised=1
+  fi
+
+  # Issue #1563 PR-2 r3: the idle-ready-writer consecutive-failure counter is
+  # persisted in a daemon-state file so it accumulates across supervised CHILD
+  # ticks (whose in-memory mutations are otherwise lost). Reset it once on each
+  # fresh daemon process so a new daemon does not inherit a stale escalation
+  # count from a crashed predecessor — this preserves the original
+  # module-load-time `=0` contract now that the source of truth is on disk.
+  _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL="$(_bridge_daemon_consec_fail_reset 2>/dev/null || printf '0')"
 
   # Issue #815 Wave C: emit one initial daemon_tick + heartbeat write BEFORE
   # the first sync cycle so the post-restart healthy state is observable
@@ -11864,6 +12007,15 @@ cmd_run() {
     2>/dev/null || true
   printf '%s\n' "$now_ts" 2>/dev/null >"$BRIDGE_STATE_DIR/daemon.heartbeat" || true
   last_heartbeat_ts="$now_ts"
+
+  # #1563 PR-2 (T0 Linux backstop): announce readiness to systemd. A
+  # `Type=notify` unit waits for READY=1 before considering the daemon up; on
+  # any other launcher (launchd, bare run, Type=simple) NOTIFY_SOCKET is unset
+  # so this is a no-op. Subsequent WATCHDOG=1 pings ride the per-progress pulse
+  # in bridge_daemon_tick_progress_touch.
+  if command -v bridge_daemon_sd_notify >/dev/null 2>&1; then
+    bridge_daemon_sd_notify READY=1
+  fi
 
   while true; do
     BRIDGE_DAEMON_LAST_STEP="queue_gateway_socket_listener"
@@ -11887,11 +12039,42 @@ cmd_run() {
     BRIDGE_DAEMON_LAST_STEP="supp_groups_refresh_poll"
     bridge_daemon_supp_groups_poll_and_dispatch || true
     BRIDGE_DAEMON_LAST_STEP="sync_cycle"
-    if cmd_sync_cycle; then
-      :
+    tick_id=$(( tick_id + 1 ))
+    # #1563 PR-2 — T1 self-abort BACKSTOP. Run ONE scheduler tick as a
+    # supervised CHILD (runner-process, the codex-Q2-agreed DEFAULT). The
+    # supervisor watches the child's in-tick progress heartbeat and, if no
+    # progress is made within the max-step-budget + grace deadline, KILLs the
+    # wedged child's process group, emits `daemon_tick_deadline_exceeded`,
+    # and returns BRIDGE_DAEMON_TICK_WEDGE_RC (99) so the daemon EXITS
+    # non-zero — T0 (launchd KeepAlive / systemd Restart=always) then restarts
+    # a FRESH daemon. This is the actual #1563 "alive-but-not-ticking" wedge
+    # fix. It is safe ONLY because PR-1 singleton hardening landed: a restart
+    # cannot amplify into duplicate-daemon contention.
+    #
+    # A healthy long step (daily_backup 600s) refreshes progress around the
+    # step and completes under its own bridge_with_timeout, so the backstop
+    # never fires on it (the B1 negative control). On a partial install where
+    # the supervisor lib is missing, fall back to the legacy in-line tick.
+    if (( _tick_supervised == 1 )); then
+      if bridge_daemon_run_tick_supervised "$tick_id" cmd_sync_cycle; then
+        :
+      else
+        cycle_status=$?
+        if (( cycle_status == ${BRIDGE_DAEMON_TICK_WEDGE_RC:-99} )); then
+          daemon_log_event "tick $tick_id WEDGED (last_step=$BRIDGE_DAEMON_LAST_STEP) — self-aborting for OS-init restart (#1563)"
+          # EXIT for OS-init restart. The EXIT trap records the structured
+          # exit row; T0's KeepAlive/Restart=always brings up a fresh daemon.
+          exit "$cycle_status"
+        fi
+        daemon_log_event "sync cycle failed with exit=$cycle_status"
+      fi
     else
-      cycle_status=$?
-      daemon_log_event "sync cycle failed with exit=$cycle_status"
+      if cmd_sync_cycle; then
+        :
+      else
+        cycle_status=$?
+        daemon_log_event "sync cycle failed with exit=$cycle_status"
+      fi
     fi
     now_ts="$(date +%s)"
     if (( heartbeat_interval > 0 )) && (( now_ts - last_heartbeat_ts >= heartbeat_interval )); then
