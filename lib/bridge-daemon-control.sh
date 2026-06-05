@@ -2086,6 +2086,14 @@ _BRIDGE_DAEMON_TICK_STEP_TIMEOUT_KNOBS=(
   "BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS:45"
   "BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS:25"
   "BRIDGE_CRON_SYNC_TIMEOUT:30"
+  # Issue #1563 PR-6: the watchdog drift-scan ceiling (per scan). The
+  # watchdog phase runs two bounded scans (markdown + --json) with a
+  # progress pulse BETWEEN them (process_watchdog_report), so each scan is a
+  # single bounded step <= this ceiling — coupling the single-scan value here
+  # (not 2x) keeps the supervisor deadline above any operator-raised watchdog
+  # ceiling so a healthy raised scan can never be false-aborted by the PR-2
+  # backstop. Default mirrors BRIDGE_WATCHDOG_SCAN_TIMEOUT_SECONDS:-30.
+  "BRIDGE_WATCHDOG_SCAN_TIMEOUT_SECONDS:30"
 )
 
 # bridge_daemon_tick_resolved_max_step_seconds — the EFFECTIVE longest

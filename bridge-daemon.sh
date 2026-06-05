@@ -4647,6 +4647,89 @@ WATCHDOG_LAST_REPORT_TS=$(printf '%q' "$last_report_ts")
 EOF
 }
 
+# Issue #1563 PR-6: bound an *external* command with a deadline AND a
+# process-GROUP kill on expiry, capturing its stdout to a caller-supplied
+# file. This is the watchdog-scan-specific counterpart to
+# bridge_with_timeout (lib/bridge-state.sh): bridge_with_timeout's tier-1
+# GNU `timeout`/`gtimeout` and tier-2 `subprocess.run(timeout=…)` both kill
+# only the *immediate* child on expiry. The watchdog scan chain is
+#   <this fn> → "$BRIDGE_BASH_BIN" bridge-watchdog.sh (exec→ python3
+#   bridge-watchdog.py) → `agent-bridge agent registry --json` (grandchild)
+# so a hung scan leaves the python3 directory-walk AND/OR the agent-bridge
+# grandchild orphaned + spinning (patch's 2026-06-06 `sample`: the .sh
+# wrapper died but the .py child kept doing `__getdirentries64`). We reuse
+# the PR #952 monitor-mode + `_bridge_kill_proc_tree` negative-pid pgroup
+# kill already proven in _bridge_heartbeat_value_with_timeout so the whole
+# descendant tree dies — independent of pgrep/ps process-table visibility
+# (denied in the macOS sandbox + some Linux containers).
+#
+# Args: <timeout_seconds> <call_site_label> <stdout_file> <cmd> [args...]
+# Returns: the command's exit code on natural completion, or 124 on timeout
+# (matching GNU timeout(1) / bridge_with_timeout so the callers' existing
+# `if ! …; then return 1` failure branch fires identically). stderr of the
+# child is discarded (the markdown/json scan output is on stdout).
+bridge_run_command_with_pgroup_timeout() {
+  local secs="$1"
+  local label="$2"
+  local stdout_file="$3"
+  shift 3
+
+  if [[ ! "$secs" =~ ^[0-9]+$ ]] || (( secs == 0 )); then
+    secs=30
+  fi
+
+  local started_ts
+  started_ts="$(date +%s 2>/dev/null || echo 0)"
+
+  # Background the command under monitor mode so the wrapper subshell is
+  # its own process-group leader (pgid == pid). Disable monitor mode INSIDE
+  # the subshell so any grandchild forked by the command inherits the
+  # wrapper's pgid instead of getting its own — a single negative-pid kill
+  # then reaches the entire tree. The parent's monitor-mode state is
+  # restored immediately, so daemon-wide job control is unaffected.
+  set -m
+  ( set +m; exec "$@" >"$stdout_file" 2>/dev/null ) &
+  local pid=$!
+  set +m
+
+  # Poll at 100ms granularity so a fast scan returns near-instantly.
+  local i=0
+  local poll_max=$(( secs * 10 ))
+  while (( i < poll_max )); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    # Deadline hit. Group-kill TERM → grace → unconditional group-KILL so a
+    # SIGTERM-ignoring python3/agent-bridge grandchild in the same pgroup
+    # cannot survive (PR #952 r5 P2 #1 rationale).
+    _bridge_kill_proc_tree "$pid" "TERM"
+    sleep 0.5
+    _bridge_kill_proc_tree "$pid" "KILL"
+    wait "$pid" 2>/dev/null || true
+    local elapsed=0
+    elapsed=$(( $(date +%s 2>/dev/null || echo "$started_ts") - started_ts ))
+    bridge_audit_log daemon daemon_subprocess_timeout daemon \
+      --detail call_site="$label" \
+      --detail timeout_seconds="$secs" \
+      --detail elapsed_seconds="$elapsed" \
+      --detail exit_code="124" \
+      --detail tier="pgroup" \
+      2>/dev/null || true
+    return 124
+  fi
+
+  local rc=0
+  # Stderr redirect on `wait` suppresses bash monitor-mode's "[1]+ Done …"
+  # job-completion notice from leaking into the daemon stderr stream.
+  wait "$pid" 2>/dev/null && rc=0 || rc=$?
+  return "$rc"
+}
+
 process_watchdog_report() {
   local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
   local title_prefix="[watchdog] "
@@ -4671,12 +4754,51 @@ process_watchdog_report() {
 
   report_file="$(bridge_watchdog_report_file)"
   mkdir -p "$(dirname "$report_file")"
-  if ! "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-watchdog.sh" scan >"$report_file"; then
+  # Issue #1563 PR-6: the report-file (markdown) scan was previously a BARE,
+  # UN-bounded call — a hung `bridge-watchdog.py` directory-walk blocked the
+  # daemon main loop FOREVER here, never reaching the 30s-ceiling --json call
+  # below (patch diagnosed live with `sample` 2026-06-06: killing the hung
+  # child resumed the tick instantly → the daemon was synchronously wedged on
+  # this line). Both the markdown scan and the --json scan now run through
+  # bridge_run_command_with_pgroup_timeout, which enforces a 30s ceiling AND
+  # process-GROUP-kills the hung scan (python3 walk + agent-bridge grandchild)
+  # on expiry. On timeout the helper returns 124 → the existing failure branch
+  # fires (the cycle skips the scan; the daemon continues to the next tick).
+  # The two scans stay distinct because their output contracts differ: the
+  # markdown is consumed verbatim as the drift task `--body-file`, while the
+  # --json feeds the problem-count / fresh-install / problem-key helpers.
+  local watchdog_scan_ceiling="${BRIDGE_WATCHDOG_SCAN_TIMEOUT_SECONDS:-30}"
+  [[ "$watchdog_scan_ceiling" =~ ^[0-9]+$ ]] || watchdog_scan_ceiling=30
+  if ! bridge_run_command_with_pgroup_timeout "$watchdog_scan_ceiling" \
+    daemon_watchdog_scan_report "$report_file" \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-watchdog.sh" scan; then
     return 1
   fi
-  if ! report_json="$(bridge_with_timeout 30 daemon_watchdog_scan "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-watchdog.sh" scan --json 2>/dev/null)"; then
+  # Issue #1563 PR-6 (codex r1): pulse the daemon progress heartbeat BETWEEN
+  # the two bounded scans. The watchdog phase runs two scans back-to-back
+  # inside the single before/after `_bridge_daemon_mark_progress "watchdog"`
+  # bracket in cmd_sync_cycle, so without this mid-phase pulse the worst-case
+  # progress gap is 2× the per-scan ceiling — a healthy operator-RAISED
+  # BRIDGE_WATCHDOG_SCAN_TIMEOUT_SECONDS could blow the PR-2 self-abort
+  # freshness window even though each scan is individually within budget. With
+  # this pulse each scan is its own bounded step (<= the ceiling now coupled
+  # into _BRIDGE_DAEMON_TICK_STEP_TIMEOUT_KNOBS), so the supervisor deadline
+  # sits above any single raised scan. A no-op outside the supervised tick
+  # (the touch helper is guarded by command -v).
+  _bridge_daemon_mark_progress "watchdog_scan_json"
+  local watchdog_json_file=""
+  watchdog_json_file="$(mktemp 2>/dev/null)" || watchdog_json_file=""
+  if [[ -z "$watchdog_json_file" ]]; then
     return 1
   fi
+  if ! bridge_run_command_with_pgroup_timeout "$watchdog_scan_ceiling" \
+    daemon_watchdog_scan "$watchdog_json_file" \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-watchdog.sh" scan --json; then
+    rm -f -- "$watchdog_json_file"
+    return 1
+  fi
+  report_json="$(cat -- "$watchdog_json_file" 2>/dev/null)"
+  rm -f -- "$watchdog_json_file"
   # Issue #800 Track A: heredoc-stdin → helper subcommand wrapped by
   # bridge_with_timeout (5s — single int extraction, no IO).
   problem_count="$(bridge_with_timeout 5 watchdog_problem_count python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" watchdog-problem-count "$report_json")"

@@ -122,16 +122,20 @@ export BRIDGE_DAEMON_TICK_MAX_STEP_SECONDS=3
 export BRIDGE_DAEMON_TICK_GRACE_SECONDS=1
 export BRIDGE_DAEMON_TICK_POLL_SECONDS=1
 # The resolved-max-step now floors on EVERY operator-tunable step ceiling
-# (token-recovery 60 / token-check 45 / cron-staging 25 / cron-sync 30 by
-# default). For the FAST wedge tests below we clamp them all to 1s so the
-# effective deadline stays the tiny 4s above; the E5/E6 assertions explicitly
-# RAISE individual knobs to prove the coupling. Production keeps the real
-# defaults (all < the 600s floor, so they never change the deadline there).
+# (token-recovery 60 / token-check 45 / cron-staging 25 / cron-sync 30 /
+# watchdog-scan 30 by default). For the FAST wedge tests below we clamp them
+# all to 1s so the effective deadline stays the tiny 4s above; the E5/E6
+# assertions explicitly RAISE individual knobs to prove the coupling.
+# Production keeps the real defaults (all < the 600s floor, so they never
+# change the deadline there).
 export BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS=1
 export BRIDGE_CLAUDE_TOKEN_RECOVERY_TIMEOUT_SECONDS=1
 export BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS=1
 export BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS=1
 export BRIDGE_CRON_SYNC_TIMEOUT=1
+# #1563 PR-6: the watchdog drift-scan ceiling is now a resolved-max-step knob
+# (default 30) — clamp it too so the fast-wedge deadline stays 4s.
+export BRIDGE_WATCHDOG_SCAN_TIMEOUT_SECONDS=1
 
 # shellcheck source=/dev/null
 source "$CONTROL_LIB"
@@ -188,10 +192,13 @@ fi
 # E5 — codex #1563-PR2 round-2 BLOCKER coverage: daily-backup is NOT the only
 # operator-tunable bridge_with_timeout step. Raising any of the OTHER reachable
 # step ceilings (claude-token-recovery / claude-token-check / cron-staging-
-# apply / cron-sync) must ALSO widen the deadline so a healthy raised step is
-# never self-aborted. Check each one drives the resolved-max-step.
+# apply / cron-sync / watchdog-scan) must ALSO widen the deadline so a healthy
+# raised step is never self-aborted. Check each one drives the resolved-max-
+# step. (#1563 PR-6 codex r1 added BRIDGE_WATCHDOG_SCAN_TIMEOUT_SECONDS — the
+# watchdog drift-scan ceiling — to the knob list; pinned here so a future PR
+# cannot drop the coupling and re-introduce the watchdog false-abort class.)
 E5_FAIL=0
-for kv in BRIDGE_CLAUDE_TOKEN_RECOVERY_TIMEOUT_SECONDS:1500 BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS:1400 BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS:1300 BRIDGE_CRON_SYNC_TIMEOUT:1100; do
+for kv in BRIDGE_CLAUDE_TOKEN_RECOVERY_TIMEOUT_SECONDS:1500 BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS:1400 BRIDGE_CRON_STAGING_APPLY_TIMEOUT_SECONDS:1300 BRIDGE_CRON_SYNC_TIMEOUT:1100 BRIDGE_WATCHDOG_SCAN_TIMEOUT_SECONDS:1200; do
   k="${kv%%:*}"; v="${kv#*:}"
   got="$(env "$k=$v" BRIDGE_DAEMON_TICK_MAX_STEP_SECONDS=600 bash -c "source '$CONTROL_LIB'; bridge_daemon_tick_resolved_max_step_seconds")"
   if [[ "$got" != "$v" ]]; then
@@ -200,7 +207,7 @@ for kv in BRIDGE_CLAUDE_TOKEN_RECOVERY_TIMEOUT_SECONDS:1500 BRIDGE_CLAUDE_TOKEN_
   fi
 done
 if (( E5_FAIL == 0 )); then
-  _pass "E5 every operator-tunable step ceiling (token-recovery/token-check/cron-staging/cron-sync) widens the deadline — no false-abort of any raised bounded step"
+  _pass "E5 every operator-tunable step ceiling (token-recovery/token-check/cron-staging/cron-sync/watchdog-scan) widens the deadline — no false-abort of any raised bounded step"
 else
   _fail "E5 multi-knob-coupling" "see missing-knob lines above"
 fi
