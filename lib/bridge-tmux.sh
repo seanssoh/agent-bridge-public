@@ -1630,16 +1630,27 @@ bridge_tmux_pending_attention_publish_group_read() {
   if [[ -z "$agent_grp" ]]; then
     return 0
   fi
-  if ! chgrp "$agent_grp" "$spool_file" 2>/dev/null; then
-    return 0
-  fi
-  # Re-stat to confirm the file actually carries the per-agent group before we
-  # widen the group-read bit (a chgrp that silently no-ops on an exotic host
-  # must not lead to a wrong-group 0640).
+  # Stat the CURRENT group FIRST (codex r3 — the iso stale-supp-group case this
+  # track exists to fix). The setgid parent (state/agents/<a>/ at 2770
+  # group=ab-agent-<a>) normally already lands new files in the right group, so
+  # a long-running controller whose live supplementary-group set is STALE
+  # (#1025/#1207/#1378 class) can have the file ALREADY in ab-agent-<a> while
+  # being UNABLE to chgrp to that same group. Requiring chgrp-success here would
+  # leave such a marker at 0600 and the iso agent still unable to read it. So:
+  # accept current-group == target WITHOUT a chgrp; only attempt chgrp when the
+  # group DIFFERS, and keep the post-chgrp re-stat fail-closed gate.
   local cur_grp=""
   cur_grp="$(stat -c %G "$spool_file" 2>/dev/null || stat -f %Sg "$spool_file" 2>/dev/null)"
   if [[ "$cur_grp" != "$agent_grp" ]]; then
-    return 0
+    # Group differs → try to bind it, then RE-STAT to confirm (fail-closed: a
+    # chgrp that fails / silently no-ops must NOT lead to a wrong-group 0640).
+    chgrp "$agent_grp" "$spool_file" 2>/dev/null || true
+    cur_grp="$(stat -c %G "$spool_file" 2>/dev/null || stat -f %Sg "$spool_file" 2>/dev/null)"
+    if [[ "$cur_grp" != "$agent_grp" ]]; then
+      # Still not the per-agent group → leave owner-only 0600 (iso read stays
+      # blocked, surfaced via the self-heal warning; never mis-published).
+      return 0
+    fi
   fi
   # 0640: controller (owner) read/write, agent (group) read-only. The agent is
   # the wake CONSUMER — it must read this to surface the queued-event count, but

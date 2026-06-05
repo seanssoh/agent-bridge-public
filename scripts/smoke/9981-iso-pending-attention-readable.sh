@@ -328,10 +328,71 @@ test_publish_fail_closed_on_bad_group() {
   )
 }
 
+# ---------------------------------------------------------------------
+# T6 — stale-supp-group case (codex r3): the marker ALREADY carries the
+# per-agent group (inherited from the setgid 2770 parent), but the
+# long-running controller's stale supplementary-group set means `chgrp` to
+# that same group FAILS. The publish must STILL chmod 0640 (the file is
+# already in the right group) — it must NOT require chgrp-success. This is
+# the exact iso #1025/#1207/#1378 class this track fixes; the old
+# chgrp-first shape left such a marker at 0600 and the iso agent could not
+# read the wake count. Teeth: reverting to chgrp-first makes this FAIL.
+# ---------------------------------------------------------------------
+test_publish_chmods_when_group_already_correct_and_chgrp_fails() {
+  smoke_log "T6: marker already in the per-agent group + chgrp fails → still publishes group-readable (stale-supp-group)"
+
+  (
+    local own_grp
+    own_grp="$(id -gn 2>/dev/null)"
+    if [[ -z "$own_grp" ]]; then
+      smoke_skip "T6" "could not resolve own group name"
+      return 0
+    fi
+    # iso effective; the resolver returns a group we ARE in (so the setgid
+    # parent lands new files in it without a chgrp), and `chgrp` is FORCED to
+    # fail to simulate the controller's stale supplementary-group set.
+    # shellcheck disable=SC2329
+    bridge_agent_linux_user_isolation_effective() { return 0; }
+    # shellcheck disable=SC2329
+    bridge_isolation_v2_agent_group_name() { printf '%s' "$own_grp"; }
+    # shellcheck disable=SC2329
+    chgrp() { return 1; }  # controller cannot chgrp (stale supp-group)
+
+    local stale_agent="stalegrpbot"
+    local state_leaf spool_file
+    state_leaf="$(bridge_agent_idle_marker_dir "$stale_agent")"
+    spool_file="$(bridge_agent_pending_attention_file "$stale_agent")"
+    mkdir -p "$state_leaf"
+    # setgid + group=own_grp so the NEW spool file inherits own_grp with no
+    # chgrp. `command chgrp` bypasses the failing-chgrp override for setup only.
+    command chgrp "$own_grp" "$state_leaf" 2>/dev/null || true
+    chmod 2770 "$state_leaf" 2>/dev/null || true
+    rm -f "$spool_file"
+    umask 077
+    bridge_tmux_pending_attention_append "$stale_agent" "wake while controller supp-group is stale" \
+      || smoke_fail "T6: append failed"
+    smoke_assert_file_exists "$spool_file" "T6: spool file created"
+
+    local fgrp mode
+    fgrp="$(stat -c %G "$spool_file" 2>/dev/null || stat -f %Sg "$spool_file" 2>/dev/null)"
+    if [[ "$fgrp" != "$own_grp" ]]; then
+      smoke_skip "T6" "host did not inherit the parent group onto the new file (fgrp=$fgrp) — setgid inheritance unavailable; the stat-first logic is asserted by code on Linux fresh-install"
+      return 0
+    fi
+    mode="$(_read_mode "$spool_file")"
+    smoke_log "T6: spool group=$fgrp mode=$mode (already per-agent group; chgrp failed; expect group-readable 0640)"
+    if ! _mode_has_group_read "$mode"; then
+      smoke_fail "T6: spool mode=$mode has NO group-read bit despite already carrying the per-agent group — the publish wrongly required chgrp-success (stale-supp-group regression: the iso agent cannot read the marker)"
+    fi
+    smoke_log "T6: published group-readable without chgrp — the stale-supp-group case is handled"
+  )
+}
+
 smoke_run "T1 publish lands group-readable" test_publish_lands_group_readable
 smoke_run "T2 group member can read (Linux-faithful)" test_group_member_can_read
 smoke_run "T3 non-iso stays 0600 (parity + teeth)" test_non_iso_stays_0600_not_group_readable
 smoke_run "T4 hook reads published path" test_hook_reads_published_path
 smoke_run "T5 publish fails closed on unbindable group" test_publish_fail_closed_on_bad_group
+smoke_run "T6 chmods when group already correct + chgrp fails" test_publish_chmods_when_group_already_correct_and_chgrp_fails
 
 smoke_log "PASS — #9981 read-side: controller publishes the pending-attention marker group-readable so the iso AGENT can read its instant-wake count; non-iso parity (0600) preserved; wrong-group mis-publish fails closed"
