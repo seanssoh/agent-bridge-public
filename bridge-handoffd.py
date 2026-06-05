@@ -2391,12 +2391,26 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         try:
             a2a.validate_config_peer_secrets(cfg, side="receiver")
         except a2a.A2AError as exc:
-            audit("startup_fail", code=exc.code, detail=str(exc)[:300])
+            # phase=config: NON-transient operator error (#1563 PR-4). Mirrors
+            # cmd_serve so the supervisor classifies a preflight-detected
+            # config/secret failure (the path bridge_a2a_receiver_start drives)
+            # the same way as a serve-time one.
+            audit("startup_fail", code=exc.code, detail=str(exc)[:300],
+                  phase="config")
             raise
         if a2a._allow_insecure_no_secret():
             audit("insecure_secret_bypass", side="receiver", phase="preflight",
                   security=True)
-        bind, port = resolve_bind(cfg)
+        try:
+            bind, port = resolve_bind(cfg)
+        except a2a.A2AError as exc:
+            # phase=bind: resolve_bind failed AFTER validation passed — the
+            # classifier decides transient (tailnet down / IP drift) vs
+            # structural config (wildcard/loopback). Audited so the preflight
+            # restart path carries the same discriminating signal as serve.
+            audit("startup_fail", code=exc.code, detail=str(exc)[:300],
+                  phase="bind")
+            raise
     except a2a.A2AError as exc:
         print(f"[handoffd][preflight] FAIL: {exc} ({exc.code})", file=sys.stderr)
         return 1
@@ -2546,23 +2560,44 @@ def _detach_into_own_session() -> None:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
+    # #1331: refuse to start the daemon if any peer has no secret —
+    # the per-request `reject_no_secret` 403 path covers an empty
+    # secret slipping past load, but a startup gate makes the
+    # misconfiguration visible BEFORE the daemon starts accepting
+    # untrusted remote traffic. The paired BRIDGE_A2A_DEV_INSECURE_BIND
+    # + BRIDGE_A2A_ALLOW_TEST_BIND escape hatch is the only way to
+    # silence the gate; we audit that bypass so it cannot be quiet.
+    #
+    # #1563 PR-4: config-load + secret validation failures are tagged
+    # phase=config (NON-transient operator error) and the bind resolution
+    # failure is tagged phase=bind (potentially-transient availability error),
+    # so the supervisor's exit-cause classifier never retries a config/auth
+    # error into a crash-loop. This labels the failures for supervision
+    # policy ONLY — it does NOT change what the receiver accepts or binds.
     try:
         cfg = a2a.load_config(Path(args.config) if args.config else None)
-        # #1331: refuse to start the daemon if any peer has no secret —
-        # the per-request `reject_no_secret` 403 path covers an empty
-        # secret slipping past load, but a startup gate makes the
-        # misconfiguration visible BEFORE the daemon starts accepting
-        # untrusted remote traffic. The paired BRIDGE_A2A_DEV_INSECURE_BIND
-        # + BRIDGE_A2A_ALLOW_TEST_BIND escape hatch is the only way to
-        # silence the gate; we audit that bypass so it cannot be quiet.
         a2a.validate_config_peer_secrets(cfg, side="receiver")
-        if a2a._allow_insecure_no_secret():
-            audit("insecure_secret_bypass", side="receiver", phase="serve",
-                  security=True)
-        bind, port = resolve_bind(cfg)
     except a2a.A2AError as exc:
         log(f"FATAL: {exc} ({exc.code})")
-        audit("startup_fail", code=exc.code, detail=str(exc)[:300])
+        audit("startup_fail", code=exc.code, detail=str(exc)[:300],
+              phase="config")
+        return 1
+    if a2a._allow_insecure_no_secret():
+        audit("insecure_secret_bypass", side="receiver", phase="serve",
+              security=True)
+    try:
+        bind, port = resolve_bind(cfg)
+    except a2a.A2AError as exc:
+        # BIND phase: resolve_bind failed AFTER config+secret validation
+        # PASSED. The classifier decides whether the specific code is a
+        # transient availability error (tailnet not yet up / IP drift ->
+        # bind_unresolved / bind_not_tailnet / tailscale_unavailable /
+        # resolve_*) or a structural config error (bind_wildcard /
+        # bind_loopback / bind_not_ip). The fail-closed proof itself is
+        # UNCHANGED — the receiver still refuses to serve.
+        log(f"FATAL: {exc} ({exc.code})")
+        audit("startup_fail", code=exc.code, detail=str(exc)[:300],
+              phase="bind")
         return 1
 
     a2a.ensure_handoff_dirs()
@@ -2570,8 +2605,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         server = HandoffServer((bind, port), HandoffHandler, cfg)
     except OSError as exc:
+        # The socket bind itself failed (EADDRNOTAVAIL on IP drift,
+        # EADDRINUSE on a stale listener) AFTER both config validation and the
+        # fail-closed bind proof passed. phase=bind: a transient availability
+        # error the supervisor should back off, not thrash.
         log(f"FATAL: cannot bind {bind}:{port}: {exc}")
-        audit("bind_fail", address=bind, port=port, detail=str(exc))
+        audit("bind_fail", address=bind, port=port, detail=str(exc),
+              phase="bind")
         return 1
     # The peer-identity-update apply re-loads + rewrites this same file.
     server.config_path = config_path
