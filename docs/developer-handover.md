@@ -255,6 +255,19 @@ Python으로 빠지는 패턴이 많다.
 
 이 레이어는 "보안 제품"이 아니라 shared-user runtime의 containment/audit layer다.
 
+**Settings single-tree invariant (#1455).** effective settings 파일은 에이전트당
+**정확히 한 곳**(`home/.claude/settings.effective.json`)에만 실재해야 하고, 나머지
+(특히 `workdir/.claude/settings.json`)는 그 파일을 가리키는 **상대 symlink**여야 한다 —
+두 개의 real copy는 조용히 drift하고, `enabledPlugins`가 preserved-user key라 stale
+값이 재시작에도 살아남는다(이게 #1453의 root cause다). 새 settings tree를 만들 때는
+직접 copy하지 말고 `link-shared-settings`(`bridge-hooks.py`) +
+`bridge_ensure_claude_shared_settings_for_managed_workdir`(`lib/bridge-hooks.sh`)를
+재사용한다. `bridge-doctor.py`의 `settings-two-tree-drift` /
+`settings-multi-tree` detector가 위반을 read-only로 surface한다.
+앞으로 만들 **dynamic → static promotion**(home tree를 처음 materialize하는 시점,
+follow-up #1555)은 이 invariant를 day-one부터 지켜야 한다. 전체 계약은
+[`settings-single-tree-invariant.md`](./settings-single-tree-invariant.md) 참고.
+
 ### 6. cron with reporting
 
 cron은 disposable child가 부모 에이전트(target_agent)에게 inbox-only로 보고하는 contract다. PR1+PR2가 정의한 인터페이스의 핵심:
