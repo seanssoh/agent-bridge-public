@@ -141,6 +141,8 @@ if [[ -n "${_BRIDGE_RUN_FD9_NONCE:-}" ]] && [[ -r /dev/fd/9 ]]; then
       CLAUDE_CODE_OAUTH_TOKEN=*) _bridge_run_tok_oat="${_bridge_run_fd_payload#*=}" ;;
       ANTHROPIC_API_KEY=*) _bridge_run_tok_anthropic_key="${_bridge_run_fd_payload#*=}" ;;
       ANTHROPIC_AUTH_TOKEN=*) _bridge_run_tok_anthropic_auth="${_bridge_run_fd_payload#*=}" ;;
+      OPENAI_API_KEY=*) _bridge_run_tok_openai="${_bridge_run_fd_payload#*=}" ;;
+      CODEX_ACCESS_TOKEN=*) _bridge_run_tok_codex="${_bridge_run_fd_payload#*=}" ;;
     esac
   done
   unset _bridge_run_fd_payload _bridge_run_fd_magic_seen
@@ -183,6 +185,22 @@ _bridge_run_tok_oat="${_bridge_run_tok_oat:-${CLAUDE_CODE_OAUTH_TOKEN:-}}"
 _bridge_run_tok_anthropic_key="${_bridge_run_tok_anthropic_key:-${ANTHROPIC_API_KEY:-}}"
 _bridge_run_tok_anthropic_auth="${_bridge_run_tok_anthropic_auth:-${ANTHROPIC_AUTH_TOKEN:-}}"
 unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+
+# #1470 Phase 2 (Q6) — Codex ambient-key active-scrub. The Codex fleet-sync
+# model delivers the subscription auth.json as a FILE the `codex` binary
+# reads from CODEX_HOME, never an ambient env var. Capture the OpenAI-key /
+# Codex-access-token env values into NON-exported shell vars and UNSET them
+# from the env at TRUE process entry — alongside the STEP A Claude scrub,
+# BEFORE any `$(...)` subshell / probe child / re-exec — so no child of
+# bridge-run.sh ever inherits them. They are RESTORED later (below the
+# launch decision) ONLY for an explicitly unmanaged/operator-owned Codex
+# run; a MANAGED Codex agent launches with these absent so the bridge-
+# delivered auth.json is the sole credential. (Pure parameter-expansion +
+# unset — builtin-only, no fork, runs before the secret-scrub lib is
+# sourced, mirroring the Claude capture above.) Values are NEVER logged.
+_bridge_run_tok_openai="${_bridge_run_tok_openai:-${OPENAI_API_KEY:-}}"
+_bridge_run_tok_codex="${_bridge_run_tok_codex:-${CODEX_ACCESS_TOKEN:-}}"
+unset OPENAI_API_KEY CODEX_ACCESS_TOKEN
 
 # #1520 r4 (codex Phase-4 BLOCKING): scrub the proven-keychain-free TRUST flag
 # at TRUE process entry — here, alongside the STEP A credential scrub, BEFORE
@@ -276,16 +294,21 @@ if [[ "$-" != *p* ]] || (( ${BASH_VERSINFO[0]:-0} < 4 )); then
       #    target below inherits fd 9. fd 9 is opened ONLY when a token exists —
       #    it is purely the secure credential transit, NOT a re-exec signal (the
       #    re-exec decision above is intentionally token/fd-independent).
-      if [[ -n "$_bridge_run_tok_oat$_bridge_run_tok_anthropic_key$_bridge_run_tok_anthropic_auth" ]]; then
+      if [[ -n "$_bridge_run_tok_oat$_bridge_run_tok_anthropic_key$_bridge_run_tok_anthropic_auth$_bridge_run_tok_openai$_bridge_run_tok_codex" ]]; then
         if _bridge_run_fd_file="$("$_BR_MKTEMP" "${TMPDIR:-/tmp}/agb-run-cred.XXXXXX" 2>/dev/null)"; then
           "$_BR_CHMOD" 600 "$_bridge_run_fd_file" 2>/dev/null || true
           # builtin printf so an exported printf() function cannot intercept the
           # token write. NUL-delimited NAME=VALUE records (safe for newlines/`=`).
+          # #1470 P2: the captured Codex ambient-key values ride the SAME fd-9
+          # transit so they too are scrubbed from the env across the re-exec and
+          # restored ONLY for an explicitly unmanaged Codex run (decided below).
           {
             builtin printf '%s\0' "$_BR_FD_MAGIC"
             [[ -n "$_bridge_run_tok_oat" ]] && builtin printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\0' "$_bridge_run_tok_oat"
             [[ -n "$_bridge_run_tok_anthropic_key" ]] && builtin printf 'ANTHROPIC_API_KEY=%s\0' "$_bridge_run_tok_anthropic_key"
             [[ -n "$_bridge_run_tok_anthropic_auth" ]] && builtin printf 'ANTHROPIC_AUTH_TOKEN=%s\0' "$_bridge_run_tok_anthropic_auth"
+            [[ -n "$_bridge_run_tok_openai" ]] && builtin printf 'OPENAI_API_KEY=%s\0' "$_bridge_run_tok_openai"
+            [[ -n "$_bridge_run_tok_codex" ]] && builtin printf 'CODEX_ACCESS_TOKEN=%s\0' "$_bridge_run_tok_codex"
           } >"$_bridge_run_fd_file"
           # Brace-group the redirect: a bare `exec 9<file 2>/dev/null` (exec with
           # redirections but no command) would make `2>/dev/null` PERMANENT and
@@ -295,7 +318,8 @@ if [[ "$-" != *p* ]] || (( ${BASH_VERSINFO[0]:-0} < 4 )); then
           unset _bridge_run_fd_file
         fi
         # Drop the in-shell copies; the values ride fd 9 across the exec.
-        unset _bridge_run_tok_oat _bridge_run_tok_anthropic_key _bridge_run_tok_anthropic_auth
+        unset _bridge_run_tok_oat _bridge_run_tok_anthropic_key _bridge_run_tok_anthropic_auth \
+              _bridge_run_tok_openai _bridge_run_tok_codex
         # Hand the nonce to the re-exec'd pass so it can prove fd 9 is OURS (it
         # validates the first record == this nonce). Only set when we actually
         # opened fd 9 with a token.
@@ -395,6 +419,15 @@ if [[ -n "$_bridge_run_tok_oat$_bridge_run_tok_anthropic_key$_bridge_run_tok_ant
   unset _bridge_run_restore_creds
 fi
 unset _bridge_run_tok_oat _bridge_run_tok_anthropic_key _bridge_run_tok_anthropic_auth
+
+# #1470 Phase 2 (Q6): the captured Codex ambient-key values
+# (_bridge_run_tok_openai / _bridge_run_tok_codex) are deliberately NOT
+# unset here — unlike the Claude vars above, the Codex restore DECISION
+# needs the per-agent ENGINE + managed/unmanaged status, which is resolved
+# later in the relaunch loop. They stay live (NON-exported, already scrubbed
+# from the env) until bridge_run_apply_codex_ambient_env runs at the launch
+# site. For every non-Codex agent they simply remain absent from the env
+# (correct — the launched Claude/antigravity child never wants them).
 
 # PR-E (revised): linux-user isolation requires umask 0007 in both
 # legacy ACL-backed isolation and v2 group/setgid isolation. Without
@@ -1282,6 +1315,54 @@ bridge_run_ensure_shared_claude_credential() {
   return 1
 }
 
+# bridge_run_apply_codex_ambient_env
+#
+# #1470 Phase 2 (Q6) — the Codex ambient-key restore DECISION, run inside
+# the launch subshell right before the agent process forks (so the export
+# scopes to the launched child only, never the long-lived relaunch loop).
+#
+# At process entry bridge-run.sh ACTIVE-SCRUBBED the OpenAI-key + Codex-
+# access-token env vars into the NON-exported _bridge_run_tok_openai /
+# _bridge_run_tok_codex shell vars (they rode the fd-9 transit across the
+# privileged re-exec and were restored into those vars there). This helper
+# decides whether to put them BACK into the launched child's env:
+#
+#   - MANAGED Codex agent (the default for any roster Codex agent): the
+#     bridge delivers the subscription auth.json as a FILE the `codex`
+#     binary reads from CODEX_HOME (= <agent_home>/.codex, because the
+#     launch sets HOME to the agent home). The ambient key must NOT be
+#     restored — a stale/foreign OPENAI_API_KEY / CODEX_ACCESS_TOKEN in
+#     the env would silently override the file login. Keep them ABSENT.
+#   - EXPLICITLY UNMANAGED / operator-owned Codex run
+#     (BRIDGE_CODEX_UNMANAGED_AUTH=1, or a non-Codex agent that legitimately
+#     carried these vars): restore so the operator's own ambient auth still
+#     works. This is the warn-only escape hatch the design permits.
+#   - NON-Codex agent: no-op (the vars were never relevant; they stay
+#     absent, which is the correct token-free child env).
+#
+# Values are NEVER logged. Builtin-only branch + export; no fork.
+bridge_run_apply_codex_ambient_env() {
+  # Nothing captured → nothing to decide.
+  [[ -n "${_bridge_run_tok_openai:-}${_bridge_run_tok_codex:-}" ]] || return 0
+
+  if [[ "$ENGINE" == "codex" ]]; then
+    if [[ "${BRIDGE_CODEX_UNMANAGED_AUTH:-0}" == "1" ]]; then
+      # Explicit operator opt-out: this Codex run authenticates from the
+      # ambient env, not a bridge-delivered auth.json. Restore + warn once.
+      [[ -n "${_bridge_run_tok_openai:-}" ]] && export OPENAI_API_KEY="$_bridge_run_tok_openai"
+      [[ -n "${_bridge_run_tok_codex:-}" ]] && export CODEX_ACCESS_TOKEN="$_bridge_run_tok_codex"
+      bridge_run_warn_once "$AGENT" \
+        "[warn] ${AGENT}: BRIDGE_CODEX_UNMANAGED_AUTH=1 — launching Codex with the ambient OpenAI-key / Codex-token env vars RESTORED (operator-owned auth, NOT bridge-managed). Unset BRIDGE_CODEX_UNMANAGED_AUTH and run 'agent-bridge auth codex-cred sync' to switch this agent to the managed file-login fleet."
+    fi
+    # MANAGED (default): do nothing — the vars stay scrubbed so the
+    # bridge-delivered .codex/auth.json is the sole credential.
+    return 0
+  fi
+  # Non-Codex agent that happened to inherit these vars: a managed Claude/
+  # antigravity child has no use for them; leave them absent (token-free).
+  return 0
+}
+
 # bridge_run_shared_launch <bash_bin> <launch_cmd> <errfile>
 #
 # Issue #1520 — final-launch site for the shared (non v2-secret-env) path.
@@ -1357,9 +1438,17 @@ bridge_run_shared_launch() {
       _rc=$?
     fi
   else
-    # Non-Claude (e.g. codex) shared launch — unchanged from pre-#1520:
-    # no CLAUDE_CONFIG_DIR export.
-    if "$_bash_bin" -lc "$_launch_cmd" 2> >(tee -a "$_errfile" >&2); then
+    # Non-Claude (e.g. codex) shared launch — no CLAUDE_CONFIG_DIR export.
+    # #1470 Phase 2 (Q6): apply the Codex ambient-key restore DECISION inside
+    # the launch subshell so any export scopes to the exec'd child only. For a
+    # MANAGED Codex agent (default) this is a no-op — the OpenAI-key / Codex-
+    # token env vars stay scrubbed so the bridge-delivered .codex/auth.json is
+    # the sole credential; for the explicit unmanaged opt-out it restores them.
+    if (
+      # shellcheck disable=SC2030,SC2031  # subshell-local export scopes to the exec'd child
+      bridge_run_apply_codex_ambient_env
+      exec "$_bash_bin" -lc "$_launch_cmd"
+    ) 2> >(tee -a "$_errfile" >&2); then
       _rc=0
     else
       _rc=$?
@@ -1760,11 +1849,31 @@ while true; do
     # so the smoke test exercises the EXACT production code path. The
     # helper sets BRIDGE_ISOLATION_V2_LAST_EXEC_RC to the child's exit
     # code (or calls bridge_die on loader failure).
+    #
+    # #1470 Phase 2 (Q6): a MANAGED Codex iso agent must launch with the
+    # OpenAI-key / Codex-token env vars ABSENT — they were already scrubbed
+    # from this process's env at entry, so the iso loader subshell inherits a
+    # clean env (no code change needed; this is the default). For the explicit
+    # unmanaged opt-out, bridge_run_apply_codex_ambient_env restores them here
+    # so the iso loader subshell carries them through. For a managed agent it
+    # is a no-op (the vars stay absent).
+    bridge_run_apply_codex_ambient_env
+    # #1470 Q6 (codex r1 BLOCKING): the v2 secret loader exports arbitrary
+    # KEY=VALUE rows from launch-secrets.env immediately before exec, which
+    # could re-introduce OPENAI_API_KEY / CODEX_ACCESS_TOKEN into a MANAGED
+    # Codex child even after the process-entry scrub. Pass the scrub-key list
+    # so the exec helper unsets them INSIDE the loader+exec subshell, AFTER
+    # the loader runs. For an explicitly-unmanaged Codex run (or non-Codex),
+    # pass nothing so the loader/restore behavior is unchanged.
+    _v2_codex_scrub=""
+    if [[ "$ENGINE" == "codex" && "${BRIDGE_CODEX_UNMANAGED_AUTH:-0}" != "1" ]]; then
+      _v2_codex_scrub="OPENAI_API_KEY CODEX_ACCESS_TOKEN"
+    fi
     BRIDGE_ISOLATION_V2_LAST_EXEC_RC=0
     bridge_isolation_v2_exec_with_secret_env \
-      "$_v2_secret_file" "$BRIDGE_BASH_BIN" "$LAUNCH_CMD" "$ERRFILE" "$AGENT"
+      "$_v2_secret_file" "$BRIDGE_BASH_BIN" "$LAUNCH_CMD" "$ERRFILE" "$AGENT" "$_v2_codex_scrub"
     EXIT_CODE="$BRIDGE_ISOLATION_V2_LAST_EXEC_RC"
-    unset BRIDGE_ISOLATION_V2_LAST_EXEC_RC
+    unset BRIDGE_ISOLATION_V2_LAST_EXEC_RC _v2_codex_scrub
   else
     # Issue #1520: shared (non v2-secret-env) final launch. For Claude
     # agents this exports the per-agent CLAUDE_CONFIG_DIR so the launched

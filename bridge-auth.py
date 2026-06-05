@@ -1649,6 +1649,113 @@ def write_private_file_atomic(
                 pass
 
 
+def write_private_file_atomic_dirfd(
+    path: Path,
+    text: str,
+    *,
+    mode: int = 0o600,
+    prefix: str = ".tmp.",
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+    allowed_root: Path | None = None,
+) -> None:
+    """TOCTOU-hardened atomic private write (codex r2 BLOCKING).
+
+    ``write_private_file_atomic`` re-opens ``path.parent`` by STRING for
+    ``mkstemp`` / ``os.replace``. A live agent that swaps ``.codex`` AFTER a
+    pre-check but BEFORE that string re-open can still redirect the
+    privileged write out of the allowed root (a live parent-swap TOCTOU,
+    distinct from the pre-placed-symlink case). This variant pins the parent
+    by a single fd opened ``O_DIRECTORY|O_NOFOLLOW`` and does ALL filesystem
+    ops (create tempfile, fsync, chmod, chown, rename) relative to that fd via
+    ``dir_fd=`` — so the directory the writer USES is byte-for-byte the
+    directory it CHECKED, with no second path resolution in between.
+
+    - ``O_NOFOLLOW`` makes the open FAIL if the final component (``.codex``)
+      is a symlink — closing the symlinked-parent case at open time.
+    - When ``allowed_root`` is given, the opened fd's realpath
+      (``/proc/self/fd/<n>`` on Linux, ``os.fstat`` inode cross-check
+      elsewhere) is verified to stay inside ``allowed_root`` BEFORE any write,
+      so even a non-symlink swap to a sibling dir is rejected.
+    - The parent dir is NOT created here (the bash layer / iso prepare creates
+      it owner-correct first); a missing parent fails loud rather than racing a
+      mkdir through a swappable path.
+    """
+    parent = path.parent
+    name = path.name
+    dir_fd = -1
+    fd = -1
+    tmp_name = ""
+    try:
+        try:
+            dir_fd = os.open(
+                str(parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+        except OSError as exc:
+            raise PermissionError(
+                f"refusing to open Codex dest parent {parent} "
+                f"(O_DIRECTORY|O_NOFOLLOW failed — symlinked/missing parent?): {exc}"
+            ) from exc
+        # Verify the OPENED directory (by its real identity) is inside the
+        # allowed root. We resolve the fd's real path; on a swap to a sibling
+        # this is the swapped dir's path, which the prefix check rejects.
+        if allowed_root is not None:
+            try:
+                real_parent = os.readlink(f"/proc/self/fd/{dir_fd}")  # noqa: raw-pathlib-controller-only - controller-side fd realpath via procfs
+            except OSError:
+                real_parent = str(parent.resolve())
+            try:
+                allowed = str(allowed_root.resolve(strict=True))
+            except OSError as exc:
+                raise PermissionError(
+                    f"cannot resolve allowed root {allowed_root}: {exc}"
+                ) from exc
+            if real_parent != allowed and not real_parent.startswith(allowed + os.sep):
+                raise PermissionError(
+                    f"Codex dest parent resolves outside allowed root: "
+                    f"{real_parent} not under {allowed}"
+                )
+        # All ops below are relative to the pinned dir_fd — no second path
+        # resolution, so the checked dir IS the used dir. mkstemp does not
+        # accept dir_fd, so create the tempfile manually relative to dir_fd
+        # with O_CREAT|O_EXCL|O_NOFOLLOW (uuid name avoids a predictable path).
+        tmp_name = f"{prefix}{uuid.uuid4().hex}.tmp"
+        fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode,
+            dir_fd=dir_fd,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # chmod/chown the tempfile by name relative to dir_fd (BEFORE rename),
+        # so the credential is never world-readable or root-owned at its final
+        # path. follow_symlinks=False so a raced symlink at tmp_name is not
+        # followed.
+        os.chmod(tmp_name, mode, dir_fd=dir_fd, follow_symlinks=False)
+        if owner_uid is not None:
+            gid = owner_gid if owner_gid is not None else -1
+            os.chown(
+                tmp_name, owner_uid, gid, dir_fd=dir_fd, follow_symlinks=False
+            )
+        # Atomic rename within the pinned directory.
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        tmp_name = ""  # replaced; nothing to clean up
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp_name:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)  # noqa: raw-pathlib-controller-only - controller-side dir_fd-relative tempfile cleanup
+            except (FileNotFoundError, OSError):
+                pass
+        if dir_fd >= 0:
+            os.close(dir_fd)
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Credential-generation state (Q4 groundwork, #1469 enabler, #1470 P1).
 #
@@ -1832,6 +1939,205 @@ def stamp_cred_generation(
     agents[agent] = record
     save_cred_state(path, state, owner_uid=owner_uid, owner_gid=owner_gid)
     return record
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Codex fleet-sync adapter (#1470 Phase 2, #1467).
+#
+# Codex auth is a SINGLE subscription `auth.json` the `codex` binary
+# self-refreshes in place — there is nothing to rotate. The adapter is
+# therefore `register` (point at a source agent) / `sync` (write-through
+# the source auth.json to every managed Codex agent home) / `verify`
+# (offline well-formedness). `rotate`/`recover`/`activate` are clean
+# no-ops (the descriptor's supports_rotation=False).
+#
+# Security contracts (codex-agreed, fleet-credential-design.md §6/§7):
+#   * Source binding (Q1): the source agent is persisted here in a
+#     protected 0600 state file, NOT hardcoded and NOT env-overridable.
+#     The bash layer validates it is an existing, non-stopped Codex
+#     agent before calling register; this module stores the validated
+#     name.
+#   * Refresh detection (Q2): the source auth.json is read as an atomic
+#     snapshot, validated as well-formed JSON, and a content digest is
+#     computed. The sync propagates ONLY when the digest changes vs the
+#     dest's recorded generation (the Phase-1 cred-generation store).
+#   * Aliveness (Q3): OFFLINE well-formedness / expiry / path checks
+#     only. There is NO side-effect-free live Codex probe; this module
+#     never shells out to `codex`.
+#   * Delivery (§6.6): write-through copy via write_private_file_atomic
+#     (chown-before-replace, 0600), NEVER a symlink. The iso published
+#     write preserves owner agent-bridge-<a>:ab-agent-<a> mode 0600.
+#   * Rollback (Q-extra): a same-owner/same-mode last-known-good auth.json
+#     is kept keyed by source-digest; on a failed write the dest is
+#     restored from it — but only if that backup is itself well-formed
+#     and not from a different/expired source.
+#   * No cross-engine misdelivery (§8): the codex sync path NEVER writes
+#     a Claude credential; the engine is fail-closed-gated to `codex`.
+CODEX_SOURCE_BINDING_VERSION = 1
+# The opaque whole-file copy must still be RECOGNIZABLY a Codex auth.json
+# before we fan it out — a malformed / wrong-shape file fails loud and is
+# never propagated. Codex 0.135.0 writes a top-level JSON object whose
+# subscription material lives under `tokens` (access/refresh/id token) or,
+# for the API-key login, an `OPENAI_API_KEY` field. We accept either shape
+# but require a JSON object with at least one recognized credential key.
+CODEX_AUTH_TOKENS_KEY = "tokens"
+CODEX_AUTH_APIKEY_KEY = "OPENAI_API_KEY"
+
+
+def codex_source_binding_path() -> Path:
+    """Resolve the protected Codex source-binding state file path.
+
+    Q1 (codex r1 BLOCKING): the selected source Codex agent is persisted in
+    protected state (mode 0600) and the binding is **NOT env-overridable** —
+    there is deliberately NO dedicated `BRIDGE_AUTH_CODEX_SOURCE_FILE`
+    file-level override (an earlier draft had one; codex flagged it as a
+    way for caller env to select alternate protected state). The path is
+    derived ONLY from the runtime root the whole auth stack already trusts:
+      1. ``$BRIDGE_STATE_DIR/auth/codex-source.json``.
+      2. ``$BRIDGE_HOME/state/auth/codex-source.json``.
+      3. ``./state/auth/codex-source.json`` (last-resort, bare unit test).
+    A test points `BRIDGE_STATE_DIR`/`BRIDGE_HOME` at a temp root (the same
+    way every other state file is redirected); it cannot redirect the
+    binding file independently of the rest of the runtime state.
+    """
+    state_dir = os.environ.get("BRIDGE_STATE_DIR", "").strip()  # noqa: iso-helper-boundary - controller state dir
+    if state_dir:
+        return Path(state_dir).expanduser() / "auth" / "codex-source.json"
+    bridge_home = os.environ.get("BRIDGE_HOME", "").strip()  # noqa: iso-helper-boundary - controller bridge home fallback
+    if bridge_home:
+        return Path(bridge_home).expanduser() / "state" / "auth" / "codex-source.json"
+    return Path("state") / "auth" / "codex-source.json"
+
+
+def load_codex_source_binding(path: Path | None = None) -> dict[str, Any]:
+    """Load the persisted Codex source-agent binding, tolerating absence.
+
+    Returns ``{"version": 1, "source_agent": "<name>"|""}``. A missing /
+    corrupt / wrong-shape file degrades to an empty binding rather than
+    raising — the caller treats an empty source as "not configured" and
+    fails loud at sync time.
+    """
+    p = path if path is not None else codex_source_binding_path()
+    default = {"version": CODEX_SOURCE_BINDING_VERSION, "source_agent": ""}
+    if not p.exists():  # noqa: raw-pathlib-controller-only - controller codex source binding probe
+        return default
+    try:
+        parsed = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+    if not isinstance(parsed, dict):
+        return default
+    source = parsed.get("source_agent")
+    if not isinstance(source, str):
+        source = ""
+    return {"version": CODEX_SOURCE_BINDING_VERSION, "source_agent": source.strip()}
+
+
+def save_codex_source_binding(
+    source_agent: str,
+    *,
+    path: Path | None = None,
+) -> None:
+    """Persist the validated Codex source-agent binding fail-closed (0600).
+
+    The bash layer has already validated ``source_agent`` is an existing,
+    non-stopped Codex agent before calling here — this writer only stamps
+    the protected state. Routed through ``write_private_file_atomic`` so
+    the binding never lands world-readable or half-written.
+    """
+    p = path if path is not None else codex_source_binding_path()
+    payload = {
+        "version": CODEX_SOURCE_BINDING_VERSION,
+        "source_agent": source_agent.strip(),
+        "registered_at": now_iso(),
+    }
+    text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
+    write_private_file_atomic(p, text, mode=0o600, prefix=".codex-source.")
+
+
+def codex_auth_wellformed(payload: Any) -> tuple[bool, str]:
+    """Offline well-formedness gate for a Codex auth.json payload (Q3).
+
+    Returns ``(ok, reason)``. ``ok`` is True only when ``payload`` is a
+    JSON object carrying at least one recognized Codex credential key
+    (``tokens`` subscription object or an ``OPENAI_API_KEY`` string). No
+    network, no `codex` subprocess — Codex L4 is intentionally weaker
+    than Claude (there is no side-effect-free live probe).
+    """
+    if not isinstance(payload, dict):
+        return (False, "auth.json is not a JSON object")
+    tokens = payload.get(CODEX_AUTH_TOKENS_KEY)
+    apikey = payload.get(CODEX_AUTH_APIKEY_KEY)
+    has_tokens = isinstance(tokens, dict) and bool(tokens)
+    has_apikey = isinstance(apikey, str) and bool(apikey.strip())
+    if not (has_tokens or has_apikey):
+        return (
+            False,
+            "auth.json missing a recognized Codex credential "
+            f"({CODEX_AUTH_TOKENS_KEY!r} object or {CODEX_AUTH_APIKEY_KEY!r})",
+        )
+    return (True, "")
+
+
+def read_codex_auth_snapshot(path: Path) -> tuple[str, dict[str, Any], str]:
+    """Read + validate the source Codex auth.json as an atomic snapshot (Q2).
+
+    Returns ``(raw_text, parsed, digest)``. Raises ``ValueError`` on any
+    of: unreadable file, non-JSON, malformed/unrecognized shape. The
+    digest is a one-way SHA-256 over the RAW file bytes (so a refresh the
+    `codex` binary writes in place is detected the moment a single byte
+    changes). Invalid / unstable reads fail loud here — the caller never
+    propagates a credential it could not validate.
+
+    No advisory lock is taken against the `codex` binary (it will not
+    take one). A single ``read_text`` is the atomic snapshot; the digest
+    over the exact bytes read guards against a torn write being fanned
+    out (a torn write fails JSON parse → ValueError → no propagation).
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ValueError(f"source Codex auth.json not found: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"source Codex auth.json unreadable: {path}: {exc}") from exc
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        raise ValueError(
+            f"source Codex auth.json is not valid JSON ({path}): {exc}"
+        ) from exc
+    ok, reason = codex_auth_wellformed(parsed)
+    if not ok:
+        raise ValueError(f"source Codex auth.json rejected ({path}): {reason}")
+    digest = cred_source_digest(raw)
+    return (raw, parsed, digest)
+
+
+def codex_dest_generation_digest(agent: str, *, state_path: Path | None = None) -> str:
+    """Return the source_digest recorded for ``agent`` in the cred-state.
+
+    Empty string when the agent has no Codex record yet (first sync) or
+    the recorded engine is not codex. Used by the digest gate so an
+    idempotent re-sync of the same source auth.json is a NO-OP (the
+    generation is not bumped and the dest is not rewritten).
+    """
+    path = state_path if state_path is not None else cred_state_path()
+    state = load_cred_state(path)
+    row = state["agents"].get(agent)
+    if not isinstance(row, dict):
+        return ""
+    if str(row.get("engine", "")) != "codex":
+        return ""
+    return str(row.get("source_digest", "") or "")
+
+
+def codex_rollback_backup_path(dest_file: Path) -> Path:
+    """Sidecar last-known-good backup path for a Codex dest auth.json.
+
+    Same directory as the dest so it inherits the dest's iso ownership
+    contract and an atomic rename never crosses a filesystem boundary.
+    """
+    return dest_file.parent / (dest_file.name + ".agb-lkg")
 
 
 def ensure_claude_config_file(
@@ -2236,6 +2542,359 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
     return 0
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Codex fleet-sync CLI handlers (#1470 Phase 2). Invoked by bridge-auth.sh
+# `codex-cred {register,sync,verify,source}` after the bash layer has
+# resolved iso ownership / source-agent validation.
+CODEX_ENGINE = "codex"
+
+
+def cmd_codex_register(args: argparse.Namespace) -> int:
+    """Persist the validated Codex source-agent binding (Q1).
+
+    The bash layer (``bridge-auth.sh codex-cred register``) has already
+    validated ``--source`` is an existing, non-stopped Codex agent. This
+    handler only stamps the protected 0600 state file. Refuses an empty
+    source (the binding must name a concrete agent).
+    """
+    json_mode = bool(args.json)
+    source = (args.source or "").strip()
+    if not source:
+        return fail("codex-cred register requires a non-empty --source agent", json_mode)
+    try:
+        save_codex_source_binding(source)
+    except Exception as exc:  # noqa: BLE001 - surface as a clean CLI error
+        return fail(f"failed to persist Codex source binding: {exc}", json_mode)
+    payload = {
+        "status": "registered",
+        "engine": CODEX_ENGINE,
+        "source_agent": source,
+        "binding_file": str(codex_source_binding_path()),
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(f"codex source registered: {source} -> {payload['binding_file']}")
+    return 0
+
+
+def cmd_codex_source(args: argparse.Namespace) -> int:
+    """Print the persisted Codex source-agent binding (Q1 read side)."""
+    json_mode = bool(args.json)
+    binding = load_codex_source_binding()
+    source = binding.get("source_agent", "")
+    payload = {
+        "status": "ok" if source else "unconfigured",
+        "engine": CODEX_ENGINE,
+        "source_agent": source,
+        "binding_file": str(codex_source_binding_path()),
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(source if source else "(no codex source configured)")
+    return 0
+
+
+def cmd_codex_verify(args: argparse.Namespace) -> int:
+    """Offline well-formedness/expiry verify of a Codex auth.json (Q3).
+
+    NO network, NO `codex` subprocess. Reports ``ok``/``rejected`` plus
+    the content digest so a caller can compare generations. Codex L4 is
+    documented as weaker than Claude — this is a path/shape/parse check,
+    not proof the remote subscription is live.
+    """
+    json_mode = bool(args.json)
+    path = Path(args.file).expanduser()
+    try:
+        _raw, _parsed, digest = read_codex_auth_snapshot(path)
+    except ValueError as exc:
+        payload = {
+            "status": "rejected",
+            "engine": CODEX_ENGINE,
+            "file": str(path),
+            "reason": str(exc),
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(f"codex auth REJECTED ({path}): {exc}", file=sys.stderr)
+        return 1
+    payload = {
+        "status": "ok",
+        "engine": CODEX_ENGINE,
+        "file": str(path),
+        "source_digest": digest,
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(f"codex auth ok ({path}) digest={digest[:12]}…")
+    return 0
+
+
+def cmd_codex_sync(args: argparse.Namespace) -> int:
+    """Write-through the source Codex auth.json to a managed dest (L4).
+
+    The bash layer passes the resolved ``--source-file`` (read out of the
+    source agent home, via ``sudo -n -u <owner> cat`` when iso-owned),
+    the ``--file`` dest path, and the dest's iso ``--owner-uid``/
+    ``--owner-gid``. This handler:
+
+      1. Validates the source snapshot (fail loud on malformed — NEVER
+         propagate; §6.5 / Q2).
+      2. Cross-engine gate: refuses any engine != codex BEFORE any write
+         so a Codex sync can never write a Claude credential (§8).
+      3. Digest gate (Q2): if the dest already recorded this exact
+         source_digest, it is a NO-OP — no rewrite, no generation bump
+         (idempotent re-sync). Force with ``--force``.
+      4. Write-through (§6.6): delivers the source bytes VERBATIM via
+         ``write_private_file_atomic`` (chown-before-replace, 0600).
+         NEVER a symlink. Refuses to write through a pre-existing symlink
+         at the dest (the agent could pre-place one to redirect the
+         write out of its home).
+      5. Rollback (Q-extra): captures a same-owner last-known-good
+         backup BEFORE the write; on a write failure restores it, but
+         only if that backup is itself well-formed (never roll back to a
+         malformed/empty file).
+      6. Stamps the Phase-1 cred-generation under engine=codex.
+    """
+    json_mode = bool(args.json)
+    # Fail-closed engine gate (§8): this command body writes a Codex
+    # credential. Refuse any non-codex engine BEFORE touching the dest so
+    # the Codex write path can never be driven for another engine, and an
+    # unknown engine raises through the descriptor (never silent Claude).
+    #
+    # codex r1 BLOCKING: distinguish OMITTED (None → codex, byte-compatible)
+    # from EXPLICITLY-EMPTY (`--engine ""` / `"  "` → REFUSE). A naive
+    # `args.engine or CODEX_ENGINE` would coerce an explicit empty string
+    # back to codex — but worse, an empty string is an attacker-shaped value
+    # that must be rejected, not silently accepted as the default. Mirror the
+    # Phase-1 cmd_sync_agent gate exactly.
+    raw_engine_arg = getattr(args, "engine", None)
+    if raw_engine_arg is None:
+        raw_engine = CODEX_ENGINE
+    else:
+        raw_engine = raw_engine_arg.strip()
+        if not raw_engine:
+            return fail(
+                "codex-cred sync --engine was given an empty/whitespace value; "
+                "omit --engine for the default Codex sync or pass an explicit "
+                "engine name",
+                json_mode,
+            )
+    try:
+        engine_auth_descriptor(raw_engine)
+    except ValueError as exc:
+        return fail(str(exc), json_mode)
+    if raw_engine != CODEX_ENGINE:
+        return fail(
+            f"codex-cred sync only supports engine {CODEX_ENGINE!r}, got {raw_engine!r}",
+            json_mode,
+        )
+
+    source_path = Path(args.source_file).expanduser()
+    dest_path = Path(args.file).expanduser()
+    owner_uid = args.owner_uid if args.owner_uid is not None and args.owner_uid >= 0 else None
+    owner_gid = args.owner_gid if args.owner_gid is not None and args.owner_gid >= 0 else None
+    allowed_root = (
+        Path(args.allowed_root).expanduser() if args.allowed_root else None
+    )
+
+    # 1. Validate the source snapshot — fail loud, never propagate a bad cred.
+    try:
+        source_raw, _parsed, source_digest = read_codex_auth_snapshot(source_path)
+    except ValueError as exc:
+        return fail(str(exc), json_mode)
+
+    # 2. Refuse to write through a symlink at the dest OR a symlinked PARENT
+    #    (codex r1 BLOCKING: the agent owns its home and could pre-place
+    #    `.codex` itself — not just `.codex/auth.json` — as a symlink to
+    #    redirect a privileged write out of its home; write_private_file_atomic
+    #    creates its tempfile in `dest.parent` and replaces THROUGH that
+    #    parent, so a symlinked parent escapes the home even when the final
+    #    name is not yet a symlink). Reuse the Claude path's `_ensure_claude_dir_safe`
+    #    realpath-stays-inside guard for the PARENT, plus a final-name symlink
+    #    reject.
+    if dest_path.is_symlink():  # noqa: raw-pathlib-controller-only - controller-side final-name symlink reject on the bash-resolved dest
+        return fail(
+            f"refusing to write through a symlink at the Codex dest: {dest_path}",
+            json_mode,
+        )
+    try:
+        _ensure_claude_dir_safe(dest_path, allowed_root)
+    except PermissionError as exc:
+        return fail(str(exc), json_mode)
+
+    # 3. Digest gate (Q2): idempotent re-sync is a no-op unless --force.
+    prior_digest = codex_dest_generation_digest(args.agent)
+    if not args.force and prior_digest and prior_digest == source_digest:
+        cred_generation = 0
+        state = load_cred_state(cred_state_path())
+        row = state["agents"].get(args.agent)
+        if isinstance(row, dict):
+            try:
+                cred_generation = int(row.get("cred_generation", 0) or 0)
+            except (TypeError, ValueError):
+                cred_generation = 0
+        payload = {
+            "status": "unchanged",
+            "engine": CODEX_ENGINE,
+            "agent": args.agent,
+            "file": str(dest_path),
+            "source_digest": source_digest,
+            "cred_generation": cred_generation,
+            "cred_state_file": str(cred_state_path()),
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(f"codex unchanged: {args.agent} (digest stable)")
+        return 0
+
+    # 4. Capture a last-known-good backup of the CURRENT dest BEFORE the
+    #    write, so a failed write can roll back. codex r1 BLOCKING: roll back
+    #    ONLY to a credential the bridge KNOWS is good — i.e. one whose digest
+    #    matches the generation cred-state recorded for THIS agent (the last
+    #    one the bridge itself successfully synced). A current dest the agent
+    #    may have swapped in (wrong-source / expired / hand-placed) does NOT
+    #    match the recorded digest and is NEVER eligible as a rollback target.
+    #    The backup is therefore gated on `current_dest_digest == prior_digest`
+    #    where prior_digest is the recorded cred-generation digest. If the
+    #    recorded digest is absent (first sync) there is nothing trusted to
+    #    roll back to, and that is correct: a first-sync failure leaves no
+    #    dest, never an attacker-chosen one.
+    backup_path = codex_rollback_backup_path(dest_path)
+    have_backup = False
+    backup_digest = ""
+    if (
+        prior_digest
+        and dest_path.exists()  # noqa: raw-pathlib-controller-only - controller-side last-known-good probe on the bash-resolved dest
+        and not dest_path.is_symlink()  # noqa: raw-pathlib-controller-only - controller-side symlink reject before backing up the dest
+    ):
+        try:
+            prev_raw, _prev_parsed, prev_digest = read_codex_auth_snapshot(dest_path)
+        except ValueError:
+            prev_raw = None  # current dest is malformed — do NOT back it up.
+            prev_digest = ""
+        # Only trust the current dest as a rollback target when its digest
+        # equals the generation cred-state recorded (the bridge's own LKG).
+        if prev_raw is not None and prev_digest == prior_digest:
+            try:
+                # codex r2 BLOCKING: the parent-pinned (dir_fd) writer so a
+                # live `.codex` swap cannot redirect even the backup write.
+                write_private_file_atomic_dirfd(
+                    backup_path,
+                    prev_raw,
+                    mode=0o600,
+                    prefix=".codex-lkg.",
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                    allowed_root=allowed_root,
+                )
+                have_backup = True
+                backup_digest = prev_digest
+            except Exception:  # noqa: BLE001 - backup is best-effort; a failure
+                have_backup = False  # just means rollback is unavailable.
+
+    # 5. Write-through the source bytes VERBATIM (no key extraction, no
+    #    re-serialization) so a byte-for-byte copy lands at the dest.
+    #    codex r2 BLOCKING: use the parent-pinned (dir_fd) writer so a live
+    #    parent-swap TOCTOU between the _ensure_claude_dir_safe check and the
+    #    write cannot redirect the privileged write out of allowed_root — the
+    #    directory the writer USES is the fd it opened O_DIRECTORY|O_NOFOLLOW.
+    rolled_back = False
+    try:
+        write_private_file_atomic_dirfd(
+            dest_path,
+            source_raw,
+            mode=0o600,
+            prefix=".codex-auth.",
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            allowed_root=allowed_root,
+        )
+    except Exception as exc:  # noqa: BLE001 - attempt rollback then fail loud
+        if have_backup:
+            try:
+                # Restore only the backup we captured above, AND only if it
+                # STILL re-validates as well-formed AND its digest still
+                # equals the recorded last-known-good (never roll back to a
+                # malformed/expired/wrong-source file, and never to a backup
+                # tampered between capture and restore).
+                restore_raw, _rp, restore_digest = read_codex_auth_snapshot(backup_path)
+                if restore_digest != backup_digest:
+                    raise ValueError(
+                        "rollback backup digest changed since capture — refusing to restore"
+                    )
+                write_private_file_atomic_dirfd(
+                    dest_path,
+                    restore_raw,
+                    mode=0o600,
+                    prefix=".codex-auth.",
+                    owner_uid=owner_uid,
+                    owner_gid=owner_gid,
+                    allowed_root=allowed_root,
+                )
+                rolled_back = True
+            except Exception:  # noqa: BLE001 - rollback failed too; report both
+                rolled_back = False
+        _cleanup_codex_backup(backup_path)
+        return fail(
+            f"codex auth write failed for {args.agent} ({dest_path}): {exc}"
+            + ("; rolled back to last-known-good" if rolled_back else ""),
+            json_mode,
+        )
+
+    # Write succeeded — the backup is no longer needed.
+    _cleanup_codex_backup(backup_path)
+
+    # 6. Stamp the cred-generation under engine=codex (best-effort, never
+    #    turns a good write into a reported failure). The digest is over
+    #    the same source material so an idempotent re-sync of the same
+    #    auth.json does not bump the generation.
+    cred_generation = 0
+    try:
+        record = stamp_cred_generation(
+            args.agent,
+            CODEX_ENGINE,
+            source_raw,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+        cred_generation = int(record.get("cred_generation", 0) or 0)
+    except Exception as exc:  # noqa: BLE001 - stamp is best-effort
+        print(
+            f"warning: cred-generation stamp failed for {args.agent}: {exc}",
+            file=sys.stderr,
+        )
+
+    payload = {
+        "status": "synced",
+        "engine": CODEX_ENGINE,
+        "agent": args.agent,
+        "file": str(dest_path),
+        "delivery": "codex_auth_file",
+        "source_digest": source_digest,
+        "cred_generation": cred_generation,
+        "cred_state_file": str(cred_state_path()),
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        print(f"codex synced: {args.agent} <- source (digest={source_digest[:12]}…)")
+    return 0
+
+
+def _cleanup_codex_backup(backup_path: Path) -> None:
+    try:
+        backup_path.unlink()  # noqa: raw-pathlib-controller-only - controller-side cleanup of the same-dir last-known-good sidecar
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--registry", required=True)
@@ -2357,6 +3016,61 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_parser.add_argument("--json", action="store_true")
     sync_parser.set_defaults(handler=cmd_sync_agent)
+
+    # ── Codex fleet-sync adapter (#1470 Phase 2) ──────────────────────
+    # register/sync/verify/source only — Codex has no rotation/recover/
+    # activate (descriptor supports_rotation=False). bridge-auth.sh
+    # `codex-cred <sub>` resolves iso ownership + source validation, then
+    # calls these.
+    codex_reg = sub.add_parser("codex-register")
+    codex_reg.add_argument("--source", required=True)
+    codex_reg.add_argument("--json", action="store_true")
+    codex_reg.set_defaults(handler=cmd_codex_register)
+
+    codex_src = sub.add_parser("codex-source")
+    codex_src.add_argument("--json", action="store_true")
+    codex_src.set_defaults(handler=cmd_codex_source)
+
+    codex_ver = sub.add_parser("codex-verify")
+    codex_ver.add_argument("--file", required=True)
+    codex_ver.add_argument("--json", action="store_true")
+    codex_ver.set_defaults(handler=cmd_codex_verify)
+
+    codex_sync = sub.add_parser("codex-sync")
+    codex_sync.add_argument("--agent", required=True)
+    codex_sync.add_argument(
+        "--source-file",
+        required=True,
+        help="resolved path/bytes of the source agent's .codex/auth.json (read by the bash layer, via sudo -n -u <owner> cat for iso source)",
+    )
+    codex_sync.add_argument("--file", required=True, help="dest agent's .codex/auth.json")
+    # Engine is fail-closed to codex; default codex so an omitted arg is
+    # byte-compatible, but an explicit non-codex value is refused.
+    codex_sync.add_argument("--engine", default=None)
+    codex_sync.add_argument(
+        "--owner-uid",
+        type=int,
+        default=None,
+        help="chown the dest auth.json to this UID before os.replace (iso owner agent-bridge-<a>)",
+    )
+    codex_sync.add_argument(
+        "--owner-gid",
+        type=int,
+        default=None,
+        help="chown the dest auth.json to this GID before os.replace (iso group ab-agent-<a>)",
+    )
+    codex_sync.add_argument(
+        "--force",
+        action="store_true",
+        help="re-write the dest even when the source digest is unchanged (bypass the idempotent no-op gate)",
+    )
+    codex_sync.add_argument(
+        "--allowed-root",
+        default=None,
+        help="require the resolved dest .codex dir to stay under this real path (symlinked-parent hardening, mirrors the Claude sync-agent --allowed-root)",
+    )
+    codex_sync.add_argument("--json", action="store_true")
+    codex_sync.set_defaults(handler=cmd_codex_sync)
 
     return parser
 

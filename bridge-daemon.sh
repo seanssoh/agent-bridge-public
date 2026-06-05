@@ -2209,6 +2209,94 @@ bridge_daemon_periodic_token_sync_tick() {
   return 1
 }
 
+# ─────────────────────────────────────────────────────────────────────
+# Periodic Codex credential fleet-sync (#1470 Phase 2).
+#
+# Mirrors the Claude periodic token-sync tick but for the Codex single-
+# source → fleet-shared model: on each wall-clock interval, re-run
+# `bridge-auth.sh codex-cred sync`, which reads an atomic snapshot of the
+# source agent's auth.json, computes a digest, and propagates ONLY when
+# the digest changed (idempotent no-op otherwise). This re-propagates an
+# in-place refresh the `codex` binary writes to the source, and a fresh
+# operator re-login, without the operator touching every Codex agent.
+#
+# Disabled by default until a source is registered (the tick is a clean
+# no-op when no source is configured). Tunables:
+#   BRIDGE_CODEX_CRED_SYNC_ENABLED        (default 1)
+#   BRIDGE_CODEX_CRED_SYNC_INTERVAL_SECONDS (default 3600)
+#   BRIDGE_CODEX_CRED_SYNC_AGENTS         (default static)
+# Audit row: `codex_cred_periodic_sync` with status / source / agent_scope.
+bridge_daemon_periodic_codex_sync_state_file() {
+  printf '%s/daemon/last-codex-cred-sync' "$BRIDGE_STATE_DIR"
+}
+
+bridge_daemon_periodic_codex_sync_due() {
+  local interval="${BRIDGE_CODEX_CRED_SYNC_INTERVAL_SECONDS:-3600}"
+  local file=""
+  local last_ts=0
+  local now=0
+  local elapsed=0
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=3600
+  (( interval > 0 )) || return 1
+  file="$(bridge_daemon_periodic_codex_sync_state_file)"
+  [[ -f "$file" ]] || return 0
+  last_ts="$(tr -dc '0-9' < "$file" 2>/dev/null || printf '0')"
+  [[ -n "$last_ts" ]] || last_ts=0
+  now="$(date +%s)"
+  elapsed=$(( now - last_ts ))
+  (( elapsed >= interval ))
+}
+
+bridge_daemon_periodic_codex_cred_sync_tick() {
+  local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
+  local interval="${BRIDGE_CODEX_CRED_SYNC_INTERVAL_SECONDS:-3600}"
+  local agent_scope="${BRIDGE_CODEX_CRED_SYNC_AGENTS:-static}"
+  local file=""
+  local now=0
+  local sync_json=""
+  local sync_status=""
+
+  [[ "${BRIDGE_CODEX_CRED_SYNC_ENABLED:-1}" == "1" ]] || return 1
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=3600
+  (( interval > 0 )) || return 1
+  bridge_daemon_periodic_codex_sync_due || return 1
+
+  file="$(bridge_daemon_periodic_codex_sync_state_file)"
+  now="$(date +%s)"
+
+  if sync_json="$(bridge_with_timeout 20 daemon_codex_cred_sync "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" codex-cred sync \
+      --agents "$agent_scope" --json 2>/dev/null)"; then
+    # The envelope's top-level `status` (ok/partial/failed/skipped) is the
+    # audit signal. A `skipped` (no source configured) is a clean no-op.
+    # Reuse the shared sync-status-parse helper (same one the Claude tick
+    # uses) so the parse is a JSON load, not a brittle regex.
+    sync_status="$(bridge_with_timeout 5 codex_cred_sync_status_parse python3 \
+      "$SCRIPT_DIR/bridge-daemon-helpers.py" sync-status-parse "$sync_json" \
+      2>/dev/null || printf '')"
+    mkdir -p "$(dirname "$file")" 2>/dev/null || true
+    printf '%s\n' "$now" >"$file" 2>/dev/null || true
+    bridge_audit_log daemon codex_cred_periodic_sync "$target" \
+      --detail status="${sync_status:-unknown}" \
+      --detail trigger=periodic \
+      --detail agent_scope="$agent_scope" \
+      --detail interval_seconds="$interval" \
+      2>/dev/null || true
+    daemon_info "codex cred periodic sync: status=${sync_status:-unknown} agents=$agent_scope interval=${interval}s"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  printf '%s\n' "$now" >"$file" 2>/dev/null || true
+  bridge_audit_log daemon codex_cred_periodic_sync "$target" \
+    --detail status=failed \
+    --detail trigger=periodic \
+    --detail agent_scope="$agent_scope" \
+    --detail interval_seconds="$interval" \
+    2>/dev/null || true
+  daemon_warn "codex cred periodic sync failed (bridge-auth.sh exited non-zero; see audit log)"
+  return 1
+}
+
 process_claude_token_recovery() {
   local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
   local recovery_json=""
@@ -10856,6 +10944,13 @@ cmd_sync_cycle() {
   # periodic tick guarantees a wall-clock sync regardless of rotation events.
   BRIDGE_DAEMON_LAST_STEP="claude_token_periodic_sync"
   if bridge_daemon_periodic_token_sync_tick; then
+    changed=0
+  fi
+  # #1470 Phase 2: Codex single-source → fleet-shared auth.json sync. A
+  # clean no-op until a source is registered; re-propagates an in-place
+  # refresh / operator re-login on the wall-clock interval.
+  BRIDGE_DAEMON_LAST_STEP="codex_cred_periodic_sync"
+  if bridge_daemon_periodic_codex_cred_sync_tick; then
     changed=0
   fi
   BRIDGE_DAEMON_LAST_STEP="usage_monitor"

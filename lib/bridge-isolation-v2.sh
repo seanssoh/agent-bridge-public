@@ -361,6 +361,15 @@ bridge_isolation_v2_exec_with_secret_env() {
   #   $3 launch_cmd    the agent launch command line
   #   $4 errfile       path to append child stderr to (via tee)
   #   $5 agent_name    agent id, used in the loader-failure bridge_die message
+  #   $6 scrub_env_keys (optional) space-separated env var NAMES to `unset`
+  #      AFTER the secret loader runs and BEFORE the `exec` — the
+  #      managed-Codex ambient-key scrub (#1470 Q6 / codex r1 BLOCKING).
+  #      The loader exports arbitrary KEY=VALUE rows from launch-secrets.env;
+  #      without this a managed Codex agent could re-inherit OPENAI_API_KEY /
+  #      CODEX_ACCESS_TOKEN from that file even though bridge-run.sh scrubbed
+  #      the ambient env. Unsetting them HERE, inside the loader+exec
+  #      subshell, guarantees the launched child sees them absent regardless
+  #      of the launch-secrets.env content. Empty/unset → no scrub.
   #
   # Side effects:
   #   - Sets BRIDGE_ISOLATION_V2_LAST_EXEC_RC to the child's exit code.
@@ -370,6 +379,7 @@ bridge_isolation_v2_exec_with_secret_env() {
   local _launch_cmd="$3"
   local _errfile="$4"
   local _agent="$5"
+  local _scrub_keys="${6:-}"
   # PR-C r2 review P2 #1: cannot use the subshell exit code as the
   # loader-failure sentinel — the same subshell `exec`s the agent
   # command, so any legitimate child exit code (e.g. exit 75 from a
@@ -386,6 +396,14 @@ bridge_isolation_v2_exec_with_secret_env() {
       : 2>/dev/null > "$_fail_marker" || true
       exit 1
     }
+    # #1470 Q6 (codex r1 BLOCKING): scrub the managed-Codex ambient keys
+    # AFTER the loader (which may have re-exported them from
+    # launch-secrets.env) and BEFORE the exec, so the launched child never
+    # inherits them. `unset` removes both value and export attribute.
+    if [[ -n "$_scrub_keys" ]]; then
+      # shellcheck disable=SC2086  # intentional word-split of the name list
+      unset $_scrub_keys 2>/dev/null || true
+    fi
     exec "$_bash_bin" -lc "$_launch_cmd"
   ) 2> >(tee -a "$_errfile" >&2); then
     _rc=0
