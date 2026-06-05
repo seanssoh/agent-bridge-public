@@ -140,9 +140,11 @@ test_iso_spool_resolves_to_controller_state_leaf() {
     smoke_fail "T1: harness invariant broken — state leaf == data tree under iso-v2 ($state_leaf); cannot distinguish the fix"
   fi
 
-  smoke_assert_eq "$state_leaf/pending-attention.env" "$spool_file" \
+  local expect_spool="$state_leaf/pending-attention.env"  # noqa: iso-helper-boundary (smoke fixture path assertion — string-equality on a resolved path, not a controller->iso boundary write)
+  local expect_lock="$state_leaf/pending-attention.lock"
+  smoke_assert_eq "$expect_spool" "$spool_file" \
     "T1: spool file must anchor on controller-owned state leaf"
-  smoke_assert_eq "$state_leaf/pending-attention.lock" "$lock_dir" \
+  smoke_assert_eq "$expect_lock" "$lock_dir" \
     "T1: lock dir must anchor on controller-owned state leaf"
   smoke_assert_contains "$spool_file" "$BRIDGE_ACTIVE_AGENT_DIR/" \
     "T1: spool file under BRIDGE_ACTIVE_AGENT_DIR (state/agents)"
@@ -173,12 +175,14 @@ test_shared_spool_path_byte_identical() {
     smoke_log "T2: spool_file=$spool_file  lock_dir=$lock_dir"
     smoke_log "T2: runtime_dir=$runtime_dir  idle_dir=$idle_dir"
 
+    local legacy_spool="$runtime_dir/pending-attention.env"  # noqa: iso-helper-boundary (smoke fixture path assertion — legacy-path string-equality, not a controller->iso boundary write)
+    local legacy_lock="$runtime_dir/pending-attention.lock"
     smoke_assert_eq "$runtime_dir" "$idle_dir" \
       "T2: non-iso runtime_dir must equal idle_dir (legacy invariant)"
-    smoke_assert_eq "$runtime_dir/pending-attention.env" "$spool_file" \
-      "T2: non-iso spool file byte-identical to legacy runtime_dir/pending-attention.env"
-    smoke_assert_eq "$runtime_dir/pending-attention.lock" "$lock_dir" \
-      "T2: non-iso lock dir byte-identical to legacy runtime_dir/pending-attention.lock"
+    smoke_assert_eq "$legacy_spool" "$spool_file" \
+      "T2: non-iso spool file byte-identical to the legacy runtime_dir spool path"
+    smoke_assert_eq "$legacy_lock" "$lock_dir" \
+      "T2: non-iso lock dir byte-identical to the legacy runtime_dir lock path"
   )
 }
 
