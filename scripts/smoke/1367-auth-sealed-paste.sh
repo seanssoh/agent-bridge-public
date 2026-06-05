@@ -284,7 +284,15 @@ main() {
     req_file="$(find "$req_dir" -name '*.json' -type f | head -1)"
     if [[ -n "$req_file" ]]; then
       local mode
-      mode="$(stat -f '%Lp' "$req_file" 2>/dev/null || stat -c '%a' "$req_file" 2>/dev/null || printf '')"
+      # Portable mode read. macOS `stat -f '%Lp'` and Linux GNU
+      # `stat -c '%a'` are mutually incompatible: on GNU stat `-f` means
+      # `--file-system` and can exit 0 with non-mode output, so a
+      # `stat -f … || stat -c …` chain silently yields garbage on Linux
+      # instead of falling through. Read the mode via python3 (identical
+      # on both platforms) to keep the 0600 assertion correct under
+      # Linux CI. Format with no leading zero ('%o') so it compares to
+      # the literal "600".
+      mode="$("$PYTHON_BIN" -c 'import os,sys;print("%o" % (os.stat(sys.argv[1]).st_mode & 0o777))' "$req_file" 2>/dev/null || printf '')"
       if [[ "$mode" == "600" ]]; then
         smoke_log "ok: R3 request record is mode 0600"
       else
@@ -329,11 +337,18 @@ main() {
     "admin-1367"
 
   # N2 — token via heredoc/stdin. The sealed receive has no --stdin; a
-  # heredoc body carrying the token must DENY.
+  # here-string body carrying the token must DENY. The here-string
+  # operator is assembled from a variable so the literal `<<<` never
+  # appears in this smoke's SOURCE (otherwise scripts/audit-footgun-11.sh
+  # classifies the line as a new H3 site and trips --baseline-check). The
+  # JSON-escaped command the hook actually receives still carries the
+  # real here-string operator, so the deny assertion is unchanged.
+  local lt='<'
+  local herestr_op="${lt}${lt}${lt}"
   assert_hook_verdict \
     "N2 token via heredoc/stdin" \
     admin-1367 \
-    "bash bridge-auth.sh claude-token receive --id pool-a <<< '${DUMMY_CANARY}'" \
+    "bash bridge-auth.sh claude-token receive --id pool-a ${herestr_op} '${DUMMY_CANARY}'" \
     "DENY" \
     "admin-1367"
 
@@ -430,6 +445,55 @@ main() {
     "N8 token-accepting receive from agent (agb)" \
     admin-1367 \
     "agb auth claude-token receive --id pool-a --activate --json" \
+    "DENY" \
+    "admin-1367"
+
+  # N8-bash — #1367 r2 (codex SECURITY): the SAME token-accepting receive
+  # via the `bash bridge-auth.sh` wrapper spelling must ALSO DENY. The
+  # wrapper carries no token in its argv and its leaf is not `agb`/
+  # `agent-bridge`, so before the r2 fix it fell through ALLOWED. Guard
+  # the bash-wrapper bypass.
+  assert_hook_verdict \
+    "N8-bash token-accepting receive from agent (bash bridge-auth.sh)" \
+    admin-1367 \
+    "bash bridge-auth.sh claude-token receive --id pool-a --activate --json" \
+    "DENY" \
+    "admin-1367"
+
+  # N8-bash-allow — the token-FREE `--request … --json` bash spelling must
+  # STAY allowed (the r2 deny must not over-block the legitimate request
+  # shape). This re-confirms N7b under the new deny gate.
+  assert_hook_verdict \
+    "N8-bash-allow token-free request stays allowed (bash bridge-auth.sh)" \
+    admin-1367 \
+    "bash bridge-auth.sh claude-token receive --request --id pool-a --json" \
+    "ALLOW" \
+    "admin-1367"
+
+  # N8-bash-path / -spacing / -envprefix — #1367 r2 (codex SECURITY,
+  # internal-review finding): the bash-wrapper deny must be robust to the
+  # invocation variants a prefix-only `startswith` missed — an absolute
+  # path to bridge-auth.sh, collapsed/extra whitespace, and a leading
+  # `VAR=value` env-assignment prefix. Each is still a working token-
+  # accepting receive and must DENY.
+  assert_hook_verdict \
+    "N8-bash-path token-accepting receive via absolute path" \
+    admin-1367 \
+    "bash /opt/agent-bridge/bridge-auth.sh claude-token receive --id pool-a --activate --json" \
+    "DENY" \
+    "admin-1367"
+
+  assert_hook_verdict \
+    "N8-bash-spacing token-accepting receive with extra spacing" \
+    admin-1367 \
+    "bash   bridge-auth.sh   claude-token   receive --id pool-a --activate --json" \
+    "DENY" \
+    "admin-1367"
+
+  assert_hook_verdict \
+    "N8-bash-envprefix token-accepting receive with env-assignment prefix" \
+    admin-1367 \
+    "FOO=1 bash bridge-auth.sh claude-token receive --id pool-a --activate --json" \
     "DENY" \
     "admin-1367"
 

@@ -2484,6 +2484,64 @@ def _sealed_receive_request_shape_matches(text: str) -> bool:
     return True
 
 
+# Deny reason for a `bash bridge-auth.sh claude-token receive` invocation
+# that is NOT the token-free `--request … --json` request shape. The
+# token-ACCEPTING receive reads the OAuth token echo-off from the
+# operator's controlling tty; it must be run by the operator from a
+# terminal, never driven from an agent Bash tool. The `agb` /
+# `agent-bridge` spellings are already denied by
+# `_admin_bridge_verb_check`; this guards the `bash bridge-auth.sh`
+# wrapper spelling so it cannot fall through the bash-wrapper path.
+SEALED_RECEIVE_BASH_DENY_REASON = (
+    "bash bridge-auth.sh claude-token receive: only the token-free "
+    "`--request ... --json` shape is permitted from an agent; the "
+    "token-accepting receive reads the token echo-off from the operator's "
+    "terminal and must be run by the operator, not from an agent Bash tool"
+)
+
+
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _is_bash_wrapper_receive(text: str) -> bool:
+    """True iff *text* invokes `bash <…>/bridge-auth.sh claude-token receive …`.
+
+    Spelling-scoped detector for the bash wrapper (`agb` / `agent-bridge`
+    spellings route through `_admin_bridge_verb_check`). shlex-splits the
+    command and matches the `bash <path>bridge-auth.sh claude-token receive`
+    sub-verb robustly, so it is NOT fooled by the variants a prefix-only
+    `startswith` missed (codex #1367 r2): an absolute/relative path to
+    bridge-auth.sh (`bash /opt/x/bridge-auth.sh …`), collapsed/extra
+    whitespace (`bash  bridge-auth.sh …`), or a leading `VAR=value`
+    env-assignment prefix (`FOO=1 bash bridge-auth.sh …`). Returns False
+    (never raises) on any non-matching shape; on an unsplittable string
+    that still names the wrapper receive, denies (returns True) rather than
+    falling through.
+    """
+    stripped = text.lstrip() if text else ""
+    # Cheap pre-filter before the shlex cost; the tokenized sub-verb match
+    # below is the real (path/spacing/env-prefix robust) check.
+    if "bridge-auth.sh" not in stripped or "claude-token" not in stripped:
+        return False
+    try:
+        tokens = shlex.split(stripped, posix=True, comments=False)
+    except ValueError:
+        # Unbalanced quotes etc. (a smuggling attempt) but the command
+        # still names the wrapper receive — deny rather than fall through.
+        return "receive" in stripped
+    # Skip leading `VAR=value` env-assignment tokens (`FOO=1 bash …`).
+    idx = 0
+    while idx < len(tokens) and _ENV_ASSIGN_RE.match(tokens[idx]):
+        idx += 1
+    return (
+        len(tokens) - idx >= 4
+        and tokens[idx] == "bash"
+        and tokens[idx + 1].rsplit("/", 1)[-1] == "bridge-auth.sh"
+        and tokens[idx + 2] == "claude-token"
+        and tokens[idx + 3] == "receive"
+    )
+
+
 def _emit_sealed_receive_request_audit(
     agent: str,
     *,
@@ -3256,6 +3314,22 @@ def protected_alias_reason(
             text=text,
             tool_input=tool_input,
         )
+    # Issue #1367 r2 (codex SECURITY) — close the bash-wrapper bypass. A
+    # `bash bridge-auth.sh claude-token receive …` carries no token in its
+    # argv (the token is read echo-off from the operator's tty), so the
+    # credential-content denies below do NOT catch it, and because the
+    # `bash` wrapper leaf is not `agb`/`agent-bridge` it also is NOT routed
+    # through `_admin_bridge_verb_check` (which denies the token-accepting
+    # receive for those two spellings). Without this gate the token-
+    # accepting `bash bridge-auth.sh claude-token receive --id X --activate
+    # --json` would fall through to the peer/shared check and be ALLOWED,
+    # letting an agent Bash tool drive a token-accepting receive. Deny any
+    # bash-wrapper `receive` UNLESS it is the strict token-free
+    # `--request … --json` shape (the same tight allow-shape the `agb`
+    # spelling uses in `_admin_bridge_verb_check`). The token-free request
+    # stays allowed; everything else denies here, before the allowlist.
+    if _is_bash_wrapper_receive(text) and not _sealed_receive_request_shape_matches(text):
+        return SEALED_RECEIVE_BASH_DENY_REASON
     if _raw_mentions_claude_credentials(text):
         # Admin agents are the operator's deputy: their read-intent
         # diagnostic commands (e.g. `ls ~/.claude/.credentials.json`,
