@@ -1549,6 +1549,28 @@ bridge_daemon_ensure_singleton() {
   # emit it from cmd_run's entry, so every invocation path (cmd_start
   # fork, direct `bridge-daemon.sh run`, sudo-wrapped, systemd ExecStart)
   # produces exactly one row per live daemon process.
+  #
+  # #9882 / BUG B INVARIANT (emit at the FINAL daemon pid, never a wrapper):
+  # `daemon_started` MUST be emitted only by the surviving singleton holder
+  # AT the pid that becomes the long-lived daemon — because BUG A's proof
+  # gate compares this `pid` against the live process. The invariant holds
+  # because this is the SOLE `bridge_audit_log daemon daemon_started` emit
+  # in the tree (grep-asserted by scripts/smoke/9882-daemon-audit-fp.sh),
+  # it lives inside `ensure_singleton`, and `ensure_singleton` is called
+  # from EXACTLY ONE site — cmd_run (bridge-daemon.sh, the `run` verb). In
+  # every spawn path the process that runs `run` IS the long-lived daemon:
+  #   - cmd_start FORKS `bridge-daemon.sh run &`; the fork CHILD runs
+  #     cmd_run, so $$ here is the child = the daemon (cmd_start itself
+  #     emits `daemon_start_supervised`, NOT `daemon_started`).
+  #   - direct `bridge-daemon.sh run` dispatches cmd_run in-process.
+  #   - the sudo / systemd ExecStart wrappers EXEC the bash `run` child
+  #     (the wrapper is the parent, the bash child is the daemon and the
+  #     emitter).
+  # So no wrapper that forks-and-stays ever emits this row at its own pid.
+  # If you add a NEW spawn path, route it through `ensure_singleton` in the
+  # FINAL daemon process (exec-replace any wrapper) — do NOT emit
+  # `daemon_started` from a forking parent, or you reintroduce BUG B (a
+  # phantom wrapper pid that feeds BUG A's mismatch path).
   command -v bridge_audit_log >/dev/null 2>&1 \
     && bridge_audit_log daemon daemon_started daemon \
          --detail pid="$$" \
@@ -1756,9 +1778,20 @@ bridge_daemon_launchd_restart() {
 # bridge_daemon_self_check — periodic R3 visibility helper. Called
 # from cmd_run's main loop on a throttled schedule. Compares $$ to the
 # pid attribute of the most recent `daemon_started` audit row; mismatch
-# → audit `daemon_pid_mismatch` + best-effort alert task (admin nudge
-# is the canonical pathway; we use a structured audit row + warn so
-# operator-visible dashboards surface the divergence).
+# → audit `daemon_pid_mismatch` + (ONLY on positively-proven duplicate)
+# a best-effort admin alert task. The structured audit row + warn always
+# surface the divergence on operator dashboards.
+#
+# #9882 / BUG A: a mismatch is escalated to the operator ONLY when the
+# audited pid is positively proven to be a DISTINCT, LIVE daemon
+# generation (alive + daemon cmdline + owner record names this pid + the
+# owner-record start_time matches the live `ps -o lstart=` + it is not
+# $$). Every inconclusive mismatch is audit-only
+# (`escalation=suppressed_unproven`) — that gate is what stops the
+# false-positive "duplicate daemon" task on a healthy single-daemon host.
+# PR-1 (#1563) guarantees the surviving singleton always publishes the
+# owner record before emitting `daemon_started`, so a GENUINE duplicate is
+# still provable and still alerts.
 #
 # Returns 0 on match, 1 on mismatch (caller may decide whether to
 # escalate further). Never aborts the daemon.
@@ -1813,23 +1846,56 @@ sys.stdout.write(latest)
   # Mismatch: another daemon emitted `daemon_started` more recently.
   # If that recent pid is still alive, we MIGHT have a genuine duplicate —
   # but a bare `kill -0` also passes for a RECYCLED pid the OS handed to an
-  # unrelated process after the audited daemon exited. #1563: confirm the
-  # live pid is genuinely a current daemon GENERATION before alerting, so a
-  # recycled pid does not raise a false "duplicate daemon" task. The proof
-  # ladder (each step best-effort; we degrade to the prior, looser signal):
-  #   1. its cmdline must look like `bridge-daemon.sh run`; AND
-  #   2. when an owner record exists for that pid, its recorded start_time
-  #      must match the live `ps -o lstart=` (a recycled pid fails this).
-  # If the cmdline is non-daemon, it is provably a recycled pid → NOT a
-  # duplicate, no alert. If the cmdline matches but no owner record is
-  # available to cross-check, we keep the (looser) old "alive" signal so we
-  # never SUPPRESS a real duplicate just because the record is missing.
+  # unrelated process after the audited daemon exited.
+  #
+  # #9882 / BUG A (the false-positive this PR fixes): the prior shape
+  # DEFAULTED to escalation. It treated `cmdline matches bridge-daemon.sh
+  # run` + `alive` as a duplicate UNLESS the owner record positively
+  # disproved it (a start-time mismatch). That `else → other_alive=true`
+  # fallthrough fired the admin "duplicate daemon" task on every
+  # INCONCLUSIVE case — no owner record, `owner_rec_pid != latest_pid`, an
+  # unreadable live start-time, or (perversely) start-times that happen to
+  # MATCH. On a healthy single-daemon host the audited pid is most often
+  # the daemon's OWN prior generation (or a wrapper briefly daemon-shaped)
+  # with no usable cross-check, so the old code over-escalated. Measured:
+  # the live audit false-positived twice in 15 minutes (#9872/#9880).
+  #
+  # #9882 fix: ESCALATION REQUIRES POSITIVE PROOF of a distinct, live
+  # duplicate generation — symmetric with the #1563 fail-closed-on-kill
+  # eviction gate. We only alert when EVERY proof holds:
+  #   1. the audited pid is alive (kill -0); AND
+  #   2. its cmdline looks like `bridge-daemon.sh run`; AND
+  #   3. an owner record exists AND names exactly this pid
+  #      (`owner_rec_pid == latest_pid`); AND
+  #   4. the owner record's start_time and the live `ps -o lstart=` are
+  #      both readable AND MATCH — i.e. this pid is the recorded singleton
+  #      generation, not a recycled number; AND
+  #   5. it is not THIS process (`latest_pid != $$`).
+  # Only that combination proves a second live daemon generation. Anything
+  # short of it (no/partial owner record, pid mismatch, unreadable
+  # start-time) is INCONCLUSIVE → audit-only (`escalation=suppressed_unproven`),
+  # NO operator alert.
+  #
+  # Why fail-closed-on-alert is now SAFE (balancing the old comment's
+  # concern that we "never SUPPRESS a real duplicate just because the
+  # record is missing"): PR-1 (#1563 singleton hardening) now GUARANTEES
+  # the surviving singleton holder always publishes the owner record
+  # (tmp+rename under the held lock) before it emits `daemon_started`. So a
+  # GENUINE second live daemon DOES have a matching owner record and IS
+  # provable here — see the `real-dup still alerts` smoke assertion. The
+  # only cases that now lose the alert are exactly the unprovable ones that
+  # were producing the false positives.
+  #
+  # `recycled_pid` (cmdline non-daemon OR start-time PROVABLY mismatched)
+  # keeps its existing early-return as a no-alert classification.
   local other_alive="false"
   local recycled_pid="false"
+  local proven_duplicate="false"
   if kill -0 "$latest_pid" 2>/dev/null; then
     local other_cmdline="" other_live_start="" owner_rec_pid="" owner_rec_start=""
     other_cmdline="$(_bridge_daemon_singleton_cmdline "$latest_pid" 2>/dev/null || true)"
     if [[ "$other_cmdline" == *"bridge-daemon.sh run"* ]]; then
+      other_alive="true"
       owner_rec_pid="$(_bridge_daemon_singleton_owner_field pid 2>/dev/null || true)"
       owner_rec_start="$(_bridge_daemon_singleton_owner_field start_time 2>/dev/null || true)"
       other_live_start="$(_bridge_daemon_proc_start_time "$latest_pid" 2>/dev/null || true)"
@@ -1839,12 +1905,30 @@ sys.stdout.write(latest)
         # Owner record names this pid but with a DIFFERENT start-time →
         # the audited daemon exited and its pid was recycled. Not a dup.
         recycled_pid="true"
-      else
-        other_alive="true"
+        other_alive="false"
+      elif [[ -n "$owner_rec_pid" && "$owner_rec_pid" == "$latest_pid" \
+              && -n "$owner_rec_start" && -n "$other_live_start" \
+              && "$owner_rec_start" == "$other_live_start" \
+              && "$latest_pid" != "$$" ]]; then
+        # POSITIVE proof: a live, daemon-cmdline pid that is the recorded
+        # singleton generation (owner_rec_pid == latest_pid AND start-times
+        # match) and is not us → a genuine distinct live duplicate. Alert.
+        proven_duplicate="true"
       fi
+      # Else INCONCLUSIVE (no/partial owner record, pid mismatch, or
+      # unreadable start-time): other_alive stays "true" for forensics but
+      # proven_duplicate stays "false" → audit-only, no escalation below.
     else
       # Live pid is NOT a bridge-daemon → recycled to an unrelated process.
       recycled_pid="true"
+    fi
+  fi
+  local escalation_class="proven_duplicate"
+  if [[ "$proven_duplicate" != "true" ]]; then
+    if [[ "$recycled_pid" == "true" ]]; then
+      escalation_class="suppressed_recycled_pid"
+    else
+      escalation_class="suppressed_unproven"
     fi
   fi
   command -v bridge_audit_log >/dev/null 2>&1 \
@@ -1852,14 +1936,25 @@ sys.stdout.write(latest)
          --detail self_pid="$$" \
          --detail recent_audit_pid="$latest_pid" \
          --detail other_alive="$other_alive" \
-         --detail recycled_pid="$recycled_pid" >/dev/null 2>&1 || true
-  bridge_warn "daemon-self-check: pid mismatch — self=$$, latest audit daemon_started pid=$latest_pid, other_alive=$other_alive, recycled_pid=$recycled_pid"
+         --detail recycled_pid="$recycled_pid" \
+         --detail proven_duplicate="$proven_duplicate" \
+         --detail escalation="$escalation_class" >/dev/null 2>&1 || true
+  bridge_warn "daemon-self-check: pid mismatch — self=$$, latest audit daemon_started pid=$latest_pid, other_alive=$other_alive, recycled_pid=$recycled_pid, escalation=$escalation_class"
 
   # A recycled pid is provably NOT a live duplicate — do not raise an admin
   # task (that would be a false-positive duplicate-daemon alert). The audit
   # row above already records the mismatch + recycled classification for
   # forensics; return 1 (mismatch observed) without escalating.
   if [[ "$recycled_pid" == "true" ]]; then
+    return 1
+  fi
+
+  # #9882 / BUG A: only a POSITIVELY PROVEN distinct live daemon generation
+  # raises the operator alert. An inconclusive mismatch (no/partial owner
+  # record, pid mismatch, unreadable start-time) is recorded in the audit
+  # row above with `escalation=suppressed_unproven` and returns WITHOUT the
+  # admin task — that audit-only path is what stops the false positive.
+  if [[ "$proven_duplicate" != "true" ]]; then
     return 1
   fi
 
@@ -1893,15 +1988,17 @@ sys.stdout.write(latest)
     alert_body_file="$(mktemp -t bridge-daemon-pid-mismatch.XXXXXX 2>/dev/null || true)"
     if [[ -n "$alert_body_file" ]]; then
       {
-        printf 'Daemon self-check detected another `daemon_started` audit row with a different PID.\n\n'
+        printf 'Daemon self-check detected a PROVEN distinct live daemon generation.\n'
+        printf '(positive proof: alive + bridge-daemon.sh-run cmdline + owner record names this pid + owner-record start_time matches live ps lstart + pid != self)\n\n'
         printf 'self_pid: %s\n' "$$"
         printf 'recent_audit_pid: %s\n' "$latest_pid"
         printf 'other_alive: %s\n' "$other_alive"
+        printf 'escalation: %s\n' "$escalation_class"
         printf 'host: %s\n' "$(hostname 2>/dev/null || echo unknown)"
         printf 'ts: %s\n' "$(date -u +%FT%TZ 2>/dev/null || date)"
         printf '\n'
         printf 'Action: investigate via `ps -ef | grep bridge-daemon` and kill the orphan if necessary.\n'
-        printf 'Source: lib/bridge-daemon-control.sh bridge_daemon_self_check (issue #1276 Lane D R3).\n'
+        printf 'Source: lib/bridge-daemon-control.sh bridge_daemon_self_check (issue #1276 Lane D R3; #9882 BUG A positive-proof gate).\n'
       } >"$alert_body_file" 2>/dev/null || true
       bash "$task_script" create \
         --from daemon \
