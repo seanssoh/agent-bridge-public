@@ -1537,6 +1537,16 @@ select_for_path() {
       # every bridge-daemon.sh move so a refactor cannot drop the hold,
       # start writing backoff state on a hold, or remove the lazy self-clear.
       add_required 1520b-create-time-creds-sync
+      # #9819 A/B (rc2 #1563 PR-3): bridge-daemon.sh gained the admin-liveness
+      # escalation tick (process_daemon_admin_liveness_escalation) + the
+      # MCP-liveness-giveup admin escalation (bridge_daemon_mcp_giveup_escalate_admin).
+      # Pull 1563-pr3-daemon-escalation on every bridge-daemon.sh move so a
+      # refactor cannot (a) regress the conservative admin-down predicate into
+      # the flapping-monitor irony (escalating a busy/idle-but-alive admin),
+      # (b) re-swallow the escalation task-create failure (drop the
+      # daemon_escalation_task_create_failed audit + retry retention), or
+      # (c) drop the patch-dev fallback / giveup→admin-task routing.
+      add_required 1563-pr3-daemon-escalation
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;

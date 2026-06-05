@@ -7091,6 +7091,247 @@ bridge_daemon_sweep_stale_unclaimed_markers() {
   return "$changed"
 }
 
+# ---------------------------------------------------------------------------
+# T2 — admin-liveness escalation (#9819 A/B, rc2 #1563 PR-3).
+#
+# "Escalate, don't self-heal": when the daemon's mechanical liveness check
+# determines the ADMIN AGENT itself is down (not the daemon — the daemon is
+# alive, it is the one running this tick), it does NOT try to restart it.
+# It ESCALATES by enqueuing a durable admin task created_by=daemon, routed to
+# the admin's codex pair (patch-dev) since the admin can't action its own
+# inbox while down.
+#
+# THE CRUX — admin-liveness predicate (the flapping-monitor irony is the #1
+# risk). "admin is down" is DELIBERATELY conservative:
+#
+#   - A BUSY / long-turn admin (deep in a long tool call, activity_state
+#     `working` / `starting` / `picker_blocked`) is NOT down — it is making
+#     progress (or blocked on a picker the stall-report family already owns).
+#     The predicate returns `alive` for any active session regardless of
+#     activity_state. We NEVER classify a busy-but-alive admin down: that is
+#     a regression strictly worse than the bug.
+#   - An IDLE admin with a live tmux session is NOT down — idle is a normal
+#     resting state, not an outage.
+#   - "down" requires BOTH (a) the admin tmux session is genuinely absent
+#     (activity_state `stopped` / `unknown` — no live session at all) AND
+#     (b) the daemon's heartbeat for the admin has been stale past
+#     BRIDGE_DAEMON_ADMIN_DOWN_STALE_SECS (default 900s). The heartbeat
+#     staleness window is the grace period: a momentary stop (restart,
+#     brief crash the autostart loop will recover) does not escalate.
+#   - It is explicitly NOT "patch has claimed work" / "patch is not idle".
+#     Reverting the predicate to those signals fails the busy-admin negative
+#     control in scripts/smoke/1563-pr3-daemon-escalation.sh.
+#
+# Cooldown + retry-state retention mirror the unclaimed-escalation marker
+# pattern and the A2A receiver `last_admin_task_ts` round-trip: the marker
+# file is written ONLY after a successful task create, so a transient queue
+# failure retains retry state (next tick retries) instead of silently
+# dropping the escalation. The cooldown still applies (no hot-loop).
+# ---------------------------------------------------------------------------
+bridge_daemon_admin_liveness_escalation_state_dir() {
+  printf '%s/admin-liveness-escalations' "$BRIDGE_STATE_DIR"
+}
+
+bridge_daemon_admin_liveness_marker_file() {
+  local admin="$1"
+  printf '%s/%s.ts' "$(bridge_daemon_admin_liveness_escalation_state_dir)" "$admin"
+}
+
+# Resolve the admin's codex-pair (patch-dev) escalation target. Honors the
+# BRIDGE_ADMIN_DEV_AGENT_ID override; otherwise falls back to the install
+# convention `<admin>-dev` (e.g. patch -> patch-dev). Returns the resolved id
+# on stdout ONLY when it exists in the loaded roster; empty otherwise so the
+# caller can decide to fall back to the admin's own inbox.
+bridge_daemon_resolve_admin_dev_agent() {
+  local admin="$1"
+  local dev="${BRIDGE_ADMIN_DEV_AGENT_ID:-}"
+  if [[ -z "$dev" ]]; then
+    [[ -n "$admin" ]] && dev="${admin}-dev"
+  fi
+  [[ -n "$dev" ]] || return 1
+  bridge_agent_exists "$dev" || return 1
+  printf '%s' "$dev"
+}
+
+# admin-liveness predicate. Echoes one of: alive | down | unknown.
+#   alive   — the admin has a live tmux session (busy OR idle); NEVER escalate.
+#   down    — no live session AND heartbeat stale past the threshold.
+#   unknown — no live session but still within the staleness grace window, or
+#             no heartbeat state yet (fresh install). Treated as NOT-down.
+bridge_daemon_admin_liveness_class() {
+  local admin="$1"
+  local now_ts="$2"
+  local stale_secs="$3"
+  local state=""
+
+  state="$(bridge_agent_heartbeat_activity_state "$admin" 2>/dev/null || printf 'unknown')"
+  [[ -n "$state" ]] || state="unknown"
+
+  # ANY active session — working / starting / picker_blocked / idle — is
+  # ALIVE. This is the flapping-monitor guard: a long-turn admin keeps a
+  # live session and MUST NOT be classified down.
+  case "$state" in
+    stopped|unknown) ;;
+    *)
+      printf '%s' "alive"
+      return 0
+      ;;
+  esac
+
+  # No live session. Require the daemon heartbeat to be stale past the grace
+  # threshold before declaring down. HEARTBEAT_UPDATED_TS is refreshed by
+  # refresh_agent_heartbeats every heartbeat cycle while the admin is being
+  # processed; a long-stale value means the admin has been absent for a
+  # genuine outage window, not a momentary restart.
+  local hb_file updated_ts=0
+  hb_file="$(bridge_agent_heartbeat_state_file "$admin")"
+  if [[ -f "$hb_file" ]]; then
+    local HEARTBEAT_UPDATED_TS=""
+    daemon_source_state_file "$hb_file" "heartbeat/$admin" 0 "" \
+      "HEARTBEAT_UPDATED_TS HEARTBEAT_NEXT_TS" || true
+    updated_ts="${HEARTBEAT_UPDATED_TS:-0}"
+  fi
+  [[ "$updated_ts" =~ ^[0-9]+$ ]] || updated_ts=0
+
+  # No heartbeat state yet (fresh install, never processed) — not enough
+  # evidence to escalate. Stay in `unknown` (grace) rather than risk a
+  # false-positive on a host the daemon just started watching.
+  if (( updated_ts == 0 )); then
+    printf '%s' "unknown"
+    return 0
+  fi
+
+  if (( now_ts - updated_ts >= stale_secs )); then
+    printf '%s' "down"
+  else
+    printf '%s' "unknown"
+  fi
+}
+
+process_daemon_admin_liveness_escalation() {
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local stale_secs="${BRIDGE_DAEMON_ADMIN_DOWN_STALE_SECS:-900}"
+  local cooldown="${BRIDGE_DAEMON_ADMIN_DOWN_COOLDOWN_SECS:-1800}"
+
+  [[ -n "$admin" ]] || return 1
+  bridge_agent_exists "$admin" || return 1
+  [[ "$stale_secs" =~ ^[0-9]+$ ]] || stale_secs=900
+  (( stale_secs > 0 )) || return 1
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=1800
+
+  local now_ts class
+  now_ts="$(date +%s)"
+  class="$(bridge_daemon_admin_liveness_class "$admin" "$now_ts" "$stale_secs")"
+
+  # alive (busy or idle) or unknown (within grace) — nothing to escalate.
+  # This is the negative-control path: a busy/long-turn admin returns here.
+  [[ "$class" == "down" ]] || return 1
+
+  # Route to the admin's codex pair (patch-dev) — ONLY reached after the
+  # admin-down predicate is satisfied. The admin cannot consume its own inbox
+  # while down, so patch-dev is the recipient that can actually act.
+  local dev_target
+  dev_target="$(bridge_daemon_resolve_admin_dev_agent "$admin" 2>/dev/null || printf '')"
+  if [[ -z "$dev_target" ]]; then
+    # No codex pair provisioned. Emit a visible audit row so the operator
+    # still sees the admin-down signal, but there is nowhere to route the
+    # durable task. Do NOT write the cooldown marker — retain retry state so
+    # the next tick re-emits once a pair is provisioned.
+    bridge_audit_log daemon daemon_admin_down_no_dev_pair "$admin" \
+      --detail stale_secs="$stale_secs" \
+      --detail action=audit_only_no_dev_pair \
+      2>/dev/null || true
+    return 1
+  fi
+
+  local state_dir marker
+  state_dir="$(bridge_daemon_admin_liveness_escalation_state_dir)"
+  mkdir -p "$state_dir" 2>/dev/null || true
+  marker="$(bridge_daemon_admin_liveness_marker_file "$admin")"
+  if [[ -f "$marker" ]]; then
+    local _marker_ts
+    _marker_ts="$(head -n1 "$marker" 2>/dev/null || printf '0')"
+    [[ "$_marker_ts" =~ ^[0-9]+$ ]] || _marker_ts=0
+    if (( _marker_ts > 0 )) && (( now_ts - _marker_ts < cooldown )); then
+      return 1
+    fi
+  fi
+
+  # Resolve a live CLI for the durable task create (mirror the daily-backup /
+  # A2A crashloop pattern — operator-facing paths in the body should match
+  # what they will actually run). --force so a stopped recipient still gets
+  # the wake trigger.
+  local target_bridge=""
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  fi
+  if [[ -z "$target_bridge" ]]; then
+    # No CLI reachable — retain retry state (no marker) + audit visibility.
+    bridge_audit_log daemon daemon_escalation_task_create_failed "$admin" \
+      --detail reason=no_cli \
+      --detail target_agent="$dev_target" \
+      --detail kind=admin_down \
+      2>/dev/null || true
+    return 1
+  fi
+
+  local hostname_short
+  hostname_short="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+
+  local body_file
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-admin-down.md.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-admin-down.$$.$RANDOM")"
+  {
+    printf '# Admin agent down — daemon escalation (%s)\n\n' "$hostname_short"
+    printf 'The daemon liveness check determined the admin agent `%s` is\n' "$admin"
+    printf 'DOWN — no live tmux session and the daemon heartbeat has been\n'
+    printf 'stale for at least %ss. The daemon does NOT restart the admin\n' "$stale_secs"
+    printf 'itself; it escalates to you (`%s`, the admin codex pair) so a\n' "$dev_target"
+    printf 'human/operator-trusted actor can recover it.\n\n'
+    printf '## State\n\n'
+    printf -- '- admin agent: `%s`\n' "$admin"
+    printf -- '- classification: `down` (no live session + heartbeat stale)\n'
+    printf -- '- stale threshold: %ss (`BRIDGE_DAEMON_ADMIN_DOWN_STALE_SECS`)\n' "$stale_secs"
+    printf -- '- escalation cooldown: %ss (`BRIDGE_DAEMON_ADMIN_DOWN_COOLDOWN_SECS`)\n' "$cooldown"
+    printf '\n## Next steps\n\n'
+    printf '1. Confirm the admin is actually down:\n'
+    printf '   `agent-bridge agent show %s`\n' "$admin"
+    printf '2. If it should be running, start it:\n'
+    printf '   `agent-bridge agent start %s`\n' "$admin"
+    printf '3. Inspect the daemon log / audit trail for the outage cause:\n'
+    printf '   `agent-bridge audit follow --action daemon_admin_down_escalated`\n'
+    printf '4. The daemon re-escalates at most once per %ss cooldown window\n' "$cooldown"
+    printf '   until the admin is back (a live session clears the down class).\n'
+  } >"$body_file"
+
+  if "$target_bridge" task create \
+       --to "$dev_target" --priority high --from daemon \
+       --title "[admin-down] ${admin} unreachable on ${hostname_short}" \
+       --body-file "$body_file" --force >/dev/null 2>&1; then
+    # Success: emit the escalation audit + arm the cooldown marker.
+    bridge_audit_log daemon daemon_admin_down_escalated "$admin" \
+      --detail target_agent="$dev_target" \
+      --detail stale_secs="$stale_secs" \
+      --detail cooldown_secs="$cooldown" \
+      2>/dev/null || true
+    printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+  else
+    # FAILURE: replace the swallowed `|| true`. Emit a visible audit row AND
+    # retain retry state (do NOT write the marker) so the next tick retries.
+    # The cooldown still gates re-attempts via the absent marker + the
+    # caller's tick cadence — no hot-loop, no silently-dropped escalation.
+    bridge_audit_log daemon daemon_escalation_task_create_failed "$admin" \
+      --detail reason=task_create_failed \
+      --detail target_agent="$dev_target" \
+      --detail kind=admin_down \
+      2>/dev/null || true
+    daemon_warn "[admin_liveness] failed to file [admin-down] escalation for ${admin} -> ${dev_target}; retaining retry state"
+  fi
+  rm -f "$body_file" >/dev/null 2>&1 || true
+  return 0
+}
+
 nudge_agent_session() {
   local agent="$1"
   local session="$2"
@@ -8143,6 +8384,22 @@ bridge_report_plugin_liveness_miss() {
       # preserves giveup fields and the arm helper preserves the rest.
       bridge_agent_mcp_giveup_arm "$agent" "$now_ts"
     fi
+    # #9819 B (rc2 #1563 PR-3): MCP-liveness giveup → admin task. The daemon
+    # has exhausted its restart budget and STOPS re-checking until the channel
+    # CSV changes — that is the silent-message-drop class (Teams stops
+    # delivering). Enqueue a cooldown-gated, retry-retaining admin task so the
+    # operator gets an inbox signal instead of the condition going silent.
+    #
+    # This runs in the OUTER giveup branch (every latched-giveup tick), NOT
+    # only on the one-shot attempts==max entry: the helper is idempotent +
+    # cooldown-gated by its own marker, so a SUCCESS writes the marker and
+    # suppresses re-attempts for the cooldown window (no hot-loop), while a
+    # transient task-create FAILURE leaves the marker absent so the NEXT
+    # latched-giveup tick retries (codex r1: invoking it only on attempts==max
+    # made the retry-retention dead — the sentinel bump to max+1 meant the
+    # one-shot block never fired again). `|| true` so a non-zero from the
+    # helper cannot break this giveup branch.
+    bridge_daemon_mcp_giveup_escalate_admin "$agent" "$missing" "$now_ts" || true
     bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts" "$restart_attempts"
     return 0
   fi
@@ -8185,6 +8442,109 @@ bridge_report_plugin_liveness_miss() {
   fi
 
   bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts" "$restart_attempts"
+}
+
+# #9819 B (rc2 #1563 PR-3): MCP-liveness giveup → admin task. Called once from
+# the giveup arm (bridge_report_plugin_liveness_miss, attempts == max) so the
+# silent-message-drop class surfaces in the admin inbox instead of going
+# quiet. Cooldown-gated per-agent via a marker file; on task-create FAILURE it
+# emits daemon_escalation_task_create_failed and RETAINS retry state (no
+# marker written) so the next giveup re-attempts. Routes to the admin (the
+# operator-facing owner of channel config); skips cleanly when admin is unset,
+# is the affected agent itself (feedback-loop guard), or no CLI is reachable.
+bridge_daemon_mcp_giveup_escalate_admin() {
+  local agent="$1"
+  local missing="$2"
+  local now_ts="$3"
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local cooldown="${BRIDGE_DAEMON_MCP_GIVEUP_ADMIN_COOLDOWN_SECS:-1800}"
+
+  [[ -n "$agent" ]] || return 1
+  [[ -n "$admin" ]] || return 1
+  [[ "$now_ts" =~ ^[0-9]+$ ]] || now_ts="$(date +%s)"
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=1800
+
+  # Feedback-loop guard: the admin can't action its own MCP-liveness inbox
+  # task if the admin IS the affected agent. Emit audit-only visibility.
+  if [[ "$agent" == "$admin" ]]; then
+    bridge_audit_log daemon plugin_mcp_liveness_giveup_admin_self "$admin" \
+      --detail missing_channels="$missing" \
+      --detail action=audit_only_admin_target \
+      2>/dev/null || true
+    return 0
+  fi
+
+  local state_dir marker
+  state_dir="$(bridge_daemon_admin_liveness_escalation_state_dir)/mcp-giveup"
+  mkdir -p "$state_dir" 2>/dev/null || true
+  marker="$state_dir/${agent}.ts"
+  if [[ -f "$marker" ]]; then
+    local _marker_ts
+    _marker_ts="$(head -n1 "$marker" 2>/dev/null || printf '0')"
+    [[ "$_marker_ts" =~ ^[0-9]+$ ]] || _marker_ts=0
+    if (( _marker_ts > 0 )) && (( now_ts - _marker_ts < cooldown )); then
+      return 0
+    fi
+  fi
+
+  local target_bridge=""
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  fi
+  if [[ -z "$target_bridge" ]]; then
+    bridge_audit_log daemon daemon_escalation_task_create_failed "$admin" \
+      --detail reason=no_cli \
+      --detail target_agent="$admin" \
+      --detail kind=mcp_giveup \
+      --detail affected_agent="$agent" \
+      2>/dev/null || true
+    return 1
+  fi
+
+  local body_file
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-mcp-giveup.md.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-mcp-giveup.$$.$RANDOM")"
+  {
+    printf '# MCP liveness give-up on %s — auto-restart STOPPED\n\n' "$agent"
+    printf 'The daemon exhausted its MCP-liveness restart budget for agent\n'
+    printf '`%s` and has STOPPED re-checking until the missing-channel set\n' "$agent"
+    printf 'changes. While in this state the affected plugin channel(s) stop\n'
+    printf 'delivering messages silently — this task is the operator-visible\n'
+    printf 'signal so the drop does not go unnoticed.\n\n'
+    printf '## State\n\n'
+    printf -- '- affected agent: `%s`\n' "$agent"
+    printf -- '- missing channels: `%s`\n' "${missing:-(none reported)}"
+    printf '\n## Next steps\n\n'
+    printf '1. Inspect the give-up + recovery audit trail:\n'
+    printf '   `agent-bridge audit follow --action plugin_mcp_liveness_giveup`\n'
+    printf '2. Confirm the agent is alive and its plugin channel is provisioned:\n'
+    printf '   `agent-bridge agent show %s`\n' "$agent"
+    printf '3. Once the channel config is corrected, the daemon auto-clears the\n'
+    printf '   give-up on the next idle transition or fallback recheck.\n'
+  } >"$body_file"
+
+  if "$target_bridge" task create \
+       --to "$admin" --priority high --from daemon \
+       --title "[mcp-giveup] ${agent} channel delivery stopped" \
+       --body-file "$body_file" --force >/dev/null 2>&1; then
+    bridge_audit_log daemon plugin_mcp_liveness_giveup_escalated "$admin" \
+      --detail affected_agent="$agent" \
+      --detail missing_channels="$missing" \
+      --detail cooldown_secs="$cooldown" \
+      2>/dev/null || true
+    printf '%s\n' "$now_ts" >"$marker" 2>/dev/null || true
+  else
+    bridge_audit_log daemon daemon_escalation_task_create_failed "$admin" \
+      --detail reason=task_create_failed \
+      --detail target_agent="$admin" \
+      --detail kind=mcp_giveup \
+      --detail affected_agent="$agent" \
+      2>/dev/null || true
+    daemon_warn "[mcp_giveup] failed to file [mcp-giveup] escalation for ${agent} -> ${admin}; retaining retry state"
+  fi
+  rm -f "$body_file" >/dev/null 2>&1 || true
+  return 0
 }
 
 process_plugin_liveness() {
@@ -11438,6 +11798,18 @@ cmd_sync_cycle() {
   # Issue #1338 defense-in-depth: subshell-isolate (rationale above).
   BRIDGE_DAEMON_LAST_STEP="a2a_receiver_supervise_tick"
   ( process_a2a_receiver_supervise_tick ) || true
+
+  # #9819 A/B (rc2 #1563 PR-3): admin-liveness escalation. Mechanical check —
+  # when the ADMIN AGENT itself is down (no live session + heartbeat stale
+  # past the grace threshold), escalate to its codex pair (patch-dev) with a
+  # durable created_by=daemon task. NEVER restarts the admin (escalate, not
+  # self-heal) and NEVER classifies a busy/idle-but-alive admin down (the
+  # flapping-monitor guard lives in bridge_daemon_admin_liveness_class).
+  # Cooldown-gated; a transient task-create failure emits
+  # daemon_escalation_task_create_failed and retains retry state. Subshell-
+  # isolated (defense-in-depth, mirrors the sibling ticks).
+  BRIDGE_DAEMON_LAST_STEP="admin_liveness_escalation"
+  ( process_daemon_admin_liveness_escalation ) || true
 
   BRIDGE_DAEMON_LAST_STEP="nudge_agents"
   printf '%s\n' "$nudge_output" > "$_nudge_tmp"
