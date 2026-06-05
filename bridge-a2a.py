@@ -9,6 +9,9 @@ Subcommands (surfaced through `agent-bridge a2a ...`):
   peers         list | test <peer> — inspect configured peers.
   deliver       Drain the outbox: sign + POST each pending entry over the
                 tailnet, with retry/backoff/jitter and dead-lettering.
+  diagnose-stuck  Classify backoff-waiting retry rows by failing leg
+                (peer_receiver_unreachable / *_tailnet_degraded / unknown) and
+                reset backoff for peers whose TCP probe recovered (#1563 PR-8).
   reconcile     Trigger + preview one receiver self-heal reconcile.
   migrate-identity  Rewrite raw-IP peers/listen to Tailscale identity keying
                 so today's raw-`address` configs self-heal (dry-run default).
@@ -549,6 +552,27 @@ def cmd_peers(args: argparse.Namespace) -> int:
                 print(f"{p.get('id', '?'):20}  {p.get('address', '-'):20}  "
                       f"secret={'yes' if a2a.peer_secrets(p) else 'NO'}  "
                       f"inbound_allowlist={allow}")
+        # #1563 PR-8 item #5: a non-fatal WARN for any peer keyed on a raw
+        # `address` with no Tailscale identity. A raw IP is vulnerable to
+        # peer-IP staleness (the peer's IP drifts after a re-login); an
+        # identity-keyed peer (`node_id` / `tailscale_name`) re-resolves to the
+        # current IP at use-time. WARN-only — no behavior change for existing
+        # raw-IP peers — and on stderr so it never pollutes `--json` stdout.
+        for p in peers:
+            if not isinstance(p, dict):
+                continue
+            has_identity = bool(
+                (isinstance(p.get("node_id"), str) and p["node_id"].strip())
+                or (isinstance(p.get("tailscale_name"), str) and p["tailscale_name"].strip())
+            )
+            if not has_identity and str(p.get("address") or "").strip():
+                info(
+                    f"WARN peer {p.get('id', '?')!r} is keyed on a raw IP "
+                    f"({p.get('address')}) with no node_id/tailscale_name — "
+                    "vulnerable to peer-IP staleness. Run "
+                    "`agb a2a migrate-identity --apply` to identity-key it "
+                    "(see docs/a2a-cross-bridge.md)."
+                )
         return 0
 
     if args.action == "test":
@@ -703,9 +727,19 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
             remote_task = str(parsed.get("task_id", ""))
         except (UnicodeDecodeError, json.JSONDecodeError):
             pass
+        # #1563 PR-8 item #4 (history preservation): do NOT NULL `last_error`
+        # on ack. The prior code wiped it, so a row that succeeded only after
+        # a long retry storm landed in the outbox as `status='acked'` with no
+        # trace of the transient failures — post-mortems then had to rely on
+        # the (cooldown-throttled, eventually-pruned) stuck-alert bodies.
+        # Keeping the last transient error preserves the attempt trail
+        # (visible in `agb a2a outbox list`); `status='acked'` is the
+        # authoritative success signal, and the stuck-scan only ever inspects
+        # pending/retry rows, so a non-NULL last_error on an acked row never
+        # re-triggers an alert. Ack success semantics are unchanged.
         conn.execute(
             "UPDATE outbox SET status='acked', attempts=?, "
-            "acked_remote_task_id=?, last_error=NULL, updated_ts=? "
+            "acked_remote_task_id=?, updated_ts=? "
             "WHERE message_id=?",
             (attempts, remote_task, a2a.now_ts(), message_id),
         )
@@ -841,6 +875,392 @@ def cmd_deliver(args: argparse.Namespace) -> int:
         info("no due outbox entries")
     else:
         info(f"processed {delivered} outbox entr{'y' if delivered == 1 else 'ies'}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# a2a diagnose-stuck (#1563 PR-8): directional diagnosis + backoff recovery
+# --------------------------------------------------------------------------
+#
+# After the 2026-06-06 tailnet outage (#1563 A2A subtrack) two recovery
+# defects prolonged the incident, even though the death itself was
+# environmental (a one-way tailnet dead path needing a re-handshake — NOT a
+# bridge receiver/protocol bug):
+#
+#   1. DIAGNOSIS — a bare "transport: timed out" last_error told neither side
+#      which leg failed, so each agent blamed the OTHER's receiver. This
+#      classifies the failing leg from the three EXISTING non-mutating probes:
+#      local receiver healthz (TCP GET /healthz), peer TCP `address:port`
+#      connect (the `peers test` mechanic), and `tailscale status` node
+#      online + tx/rx asymmetry.
+#
+#   2. RECOVERY — `backoff_seconds(base=15, ceiling=3600)` + jitter means an
+#      attempt-8..10 retry row waits 16-60 min. The deliver tick only selects
+#      `next_attempt_ts <= now` rows, so after the peer RECOVERED the high-
+#      attempt rows stayed dormant for tens of minutes (the incident needed a
+#      manual `agb a2a outbox retry`). Here, when a retry row's peer TCP probe
+#      SUCCEEDS, we reset that peer's retry rows to `next_attempt_ts=0` so the
+#      next deliver tick sends immediately (bounded by `deliver --batch`).
+#
+# HEALTH ORACLE: TCP `peer:port` — never `tailscale ping` (a disco-protocol
+# artifact that times out on a healthy A2A path; see the #10114 root-cause
+# writeup). We do NOT mutate tailscale state (no `tailscale up/down`); the
+# only self-recovery is the backoff reset on a TCP-probe SUCCESS transition.
+# This is sender-side diagnosis + outbox recovery ONLY — the fail-closed
+# receiver bind proof / HMAC / remote_addr / allowlist / dedupe are untouched.
+
+# Directional classification codes (surfaced in the report + stuck-alert).
+A2A_DIAG_PEER_RECEIVER_UNREACHABLE = "peer_receiver_unreachable"
+A2A_DIAG_LOCAL_TAILNET_DEGRADED = "local_tailnet_degraded"
+A2A_DIAG_PEER_TAILNET_DEGRADED = "peer_tailnet_degraded"
+A2A_DIAG_TRANSPORT_DEAD_PATH_UNKNOWN = "transport_dead_path_unknown"
+# Probe SUCCEEDED — the path is healthy; the row is only backoff-waiting.
+A2A_DIAG_TCP_HEALTHY_BACKOFF_WAITING = "tcp_healthy_backoff_waiting"
+
+
+def _a2a_tcp_probe(address: str, port: int, timeout: float) -> tuple[bool, str]:
+    """TCP-connect probe to ``address:port`` — the A2A reachability ORACLE.
+
+    Mirrors the `peers test` / setup-S6 mechanic (socket.create_connection,
+    no enqueue, no auth). Returns (ok, detail). NEVER uses `tailscale ping`.
+    """
+    if not address:
+        return False, "no resolvable address"
+    try:
+        with socket.create_connection((address, port), timeout=timeout):
+            pass
+    except OSError as exc:
+        return False, str(exc)
+    return True, "ok"
+
+
+def _a2a_local_healthz(cfg: dict[str, Any], timeout: float) -> tuple[Optional[bool], str]:
+    """Best-effort probe of THIS node's receiver via `bridge-handoffd.py healthz`.
+
+    Returns (healthy, detail): healthy is True/False, or None when the probe
+    could not run conclusively (no receiver configured / helper missing /
+    tailscale unavailable). Non-fatal — a None here just means the local leg
+    is indeterminate, and the classifier degrades to *_unknown rather than
+    asserting a local fault.
+    """
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    handoffd = os.path.join(repo_root, "bridge-handoffd.py")
+    if not os.path.isfile(handoffd):
+        return None, "healthz helper missing"
+    config_override = os.environ.get("BRIDGE_A2A_CONFIG")
+    argv = [sys.executable, handoffd, "healthz", "--timeout", str(int(max(1, timeout)))]
+    if config_override:
+        argv += ["--config", config_override]
+    try:
+        out = _run_subprocess(argv, timeout=max(2.0, timeout + 2.0))
+    except (OSError, ValueError) as exc:
+        return None, f"healthz probe failed to run: {exc}"
+    text = (out.stdout or "").strip().splitlines()
+    last = text[-1].strip() if text else ""
+    if out.returncode == 0 and last == "healthy":
+        return True, "healthy"
+    # Non-zero rc OR a non-"healthy" terminal line → unhealthy/indeterminate.
+    # The healthz command prints a machine token (healthz_timeout /
+    # healthz_status:<code> / healthz_badbody / bind-unresolved) we relay.
+    if not last:
+        return None, "healthz indeterminate (no output)"
+    return False, last
+
+
+def _a2a_tailnet_asymmetry(address: str) -> dict[str, Any]:
+    """Non-mutating `tailscale status` read for the directional classifier.
+
+    Returns a dict with best-effort flags (all optional — the classifier
+    tolerates a fully-empty dict when tailscale is unavailable):
+      self_tx, self_rx        — Self node TxBytes/RxBytes (outbound/inbound)
+      peer_online             — True/False/None: does a node own `address`
+                                and is it Online?
+    Never raises — tailscale being unavailable is an expected, benign state
+    on hosts without a tailnet (the classifier falls back to *_unknown).
+    """
+    out: dict[str, Any] = {
+        "self_tx": None, "self_rx": None, "peer_online": None,
+    }
+    try:
+        status = a2a.tailscale_status_json()
+    except Exception:  # noqa: BLE001 - tailscale-unavailable is benign here
+        return out
+    self_node = status.get("Self")
+    if isinstance(self_node, dict):
+        try:
+            out["self_tx"] = int(self_node.get("TxBytes") or 0)
+            out["self_rx"] = int(self_node.get("RxBytes") or 0)
+        except (TypeError, ValueError):
+            pass
+    if address:
+        try:
+            owners = a2a.nodes_owning_ip(status, address)
+        except Exception:  # noqa: BLE001
+            owners = []
+        if owners:
+            node = owners[0]
+            out["peer_online"] = bool(node.get("Online"))
+    return out
+
+
+def _a2a_classify_leg(
+    *,
+    probe_ok: bool,
+    local_healthz: Optional[bool],
+    tailnet: dict[str, Any],
+) -> str:
+    """Classify the failing A2A leg from the three EXISTING probes (#1).
+
+    Priority of evidence:
+      - probe_ok           → path is healthy; the row is only backoff-waiting.
+      - peer TCP FAIL + local healthz OK + peer not tailnet-online
+                           → peer_tailnet_degraded (peer's tailnet/node down).
+      - peer TCP FAIL + local healthz OK + peer tailnet-online
+                           → peer_receiver_unreachable (node up, port closed).
+      - peer TCP FAIL + local healthz UNHEALTHY
+                           → local_tailnet_degraded (our own serve/path issue).
+      - local Self shows tx==0 while rx>0 (outbound dead path)
+                           → local_tailnet_degraded.
+      - otherwise          → transport_dead_path_unknown.
+    """
+    if probe_ok:
+        return A2A_DIAG_TCP_HEALTHY_BACKOFF_WAITING
+
+    self_tx = tailnet.get("self_tx")
+    self_rx = tailnet.get("self_rx")
+    # Outbound-dead asymmetry: we have received bytes but sent none — our own
+    # outbound tailnet path is the suspect leg.
+    if isinstance(self_tx, int) and isinstance(self_rx, int) and self_tx == 0 and self_rx > 0:
+        return A2A_DIAG_LOCAL_TAILNET_DEGRADED
+
+    if local_healthz is False:
+        # Our own receiver is unhealthy → most likely a local serve/tailnet
+        # problem, not the peer's. (We still couldn't reach the peer, but the
+        # local fault is the actionable one.)
+        return A2A_DIAG_LOCAL_TAILNET_DEGRADED
+
+    if local_healthz is True:
+        peer_online = tailnet.get("peer_online")
+        if peer_online is False:
+            return A2A_DIAG_PEER_TAILNET_DEGRADED
+        if peer_online is True:
+            return A2A_DIAG_PEER_RECEIVER_UNREACHABLE
+        # Peer online status indeterminate, but our local leg is healthy and
+        # the peer TCP port is closed → most likely the peer's receiver.
+        return A2A_DIAG_PEER_RECEIVER_UNREACHABLE
+
+    # local healthz indeterminate AND peer TCP fail → cannot attribute a leg.
+    return A2A_DIAG_TRANSPORT_DEAD_PATH_UNKNOWN
+
+
+def _run_subprocess(argv: list[str], *, timeout: float):
+    """Thin subprocess.run wrapper kept local so the import stays lazy."""
+    import subprocess
+    return subprocess.run(
+        argv, capture_output=True, text=True, timeout=timeout, check=False,
+    )
+
+
+def _a2a_load_diag_ledger(path: str) -> dict[str, str]:
+    """Per-peer last-probe-result ledger (peer -> 'ok' | 'fail').
+
+    Used to GATE the backoff reset on a fail→ok TRANSITION so we never reset
+    the same peer's rows every tick (which would thrash an unreachable peer if
+    the gate were ever weakened). Missing/corrupt ledger → empty (first scan).
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _a2a_save_diag_ledger(path: str, ledger: dict[str, str]) -> None:
+    """Atomic rewrite of the per-peer probe-result ledger (best-effort)."""
+    try:
+        import tempfile
+        ledger_dir = os.path.dirname(path) or "."
+        os.makedirs(ledger_dir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=ledger_dir,
+            prefix=".a2a-diag.", suffix=".tmp", delete=False,
+        ) as tmp:
+            json.dump(ledger, tmp, ensure_ascii=False)
+            tmp_path = tmp.name
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    except OSError:
+        pass
+
+
+def cmd_diagnose_stuck(args: argparse.Namespace) -> int:
+    """Directional A2A diagnosis + probe-gated backoff recovery (#1563 PR-8).
+
+    Scans the outbox for `status='retry'` rows whose `next_attempt_ts > now`
+    (backoff-waiting). For each such PEER it runs the non-mutating probe set,
+    classifies the failing leg, and — on a TCP-probe SUCCESS transition — resets
+    that peer's retry rows to `next_attempt_ts=0` so the next deliver tick sends
+    immediately. Emits a JSON report (one entry per affected peer) the daemon
+    stuck-scan enriches its alert body with.
+
+    Flags:
+      --json          emit the machine report to stdout (default human lines).
+      --dry-run       classify + report but do NOT reset any backoff (teeth
+                      harness uses this to observe the decision without the SQL
+                      side-effect).
+      --probe-timeout TCP-connect / healthz timeout seconds (default 5).
+      --ledger PATH   per-peer probe-result ledger for transition-gating
+                      (default under the outbox dir).
+
+    NEVER touches `sending`/leased rows. NEVER mutates tailscale state.
+    """
+    probe_timeout = float(args.probe_timeout or 5.0)
+    apply_reset = not bool(getattr(args, "dry_run", False))
+
+    try:
+        cfg = a2a.load_config()
+    except a2a.A2AError as exc:
+        return die(str(exc)) or 1
+
+    ledger_path = args.ledger or str(
+        a2a.outbox_db_path().parent / "a2a-diag-probe-ledger.json"
+    )
+    ledger = _a2a_load_diag_ledger(ledger_path)
+
+    conn = a2a.open_outbox()
+    report: list[dict[str, Any]] = []
+    try:
+        now = a2a.now_ts()
+        # Backoff-waiting retry rows ONLY: status='retry' AND a future
+        # next_attempt_ts. pending rows are already due; sending/leased rows
+        # are mid-attempt and must never be disturbed; dead/acked are terminal.
+        waiting = conn.execute(
+            "SELECT peer, COUNT(*) AS n, MIN(next_attempt_ts) AS soonest, "
+            "MAX(attempts) AS max_attempts "
+            "FROM outbox WHERE status='retry' AND next_attempt_ts > ? "
+            "GROUP BY peer ORDER BY peer ASC",
+            (now,),
+        ).fetchall()
+
+        for prow in waiting:
+            peer_id = prow["peer"]
+            waiting_rows = int(prow["n"] or 0)
+            soonest = int(prow["soonest"] or 0)
+            next_in = max(0, soonest - now)
+            # Resolve the peer to a current address (identity-keyed peers
+            # resolve live via tailscale; raw-IP peers return the literal).
+            address = ""
+            port = int(cfg.get("listen", {}).get("port", 8787))
+            resolve_err = ""
+            try:
+                peer = a2a.find_peer(cfg, peer_id)
+                port = int(peer.get("port", port))
+                address = a2a.resolve_peer_address(peer)
+            except a2a.A2AError as exc:
+                # TailscaleUnavailable is an A2AError subclass — both the
+                # peer-unknown and tailscale-down cases land here, carrying a
+                # machine-readable `.code` (tailscale_unavailable / resolve_*).
+                resolve_err = f"{exc} ({exc.code})"
+
+            if address:
+                probe_ok, probe_detail = _a2a_tcp_probe(address, port, probe_timeout)
+            else:
+                probe_ok, probe_detail = False, (resolve_err or "unresolvable peer")
+
+            local_healthz, healthz_detail = _a2a_local_healthz(cfg, probe_timeout)
+            tailnet = _a2a_tailnet_asymmetry(address)
+            classification = _a2a_classify_leg(
+                probe_ok=probe_ok,
+                local_healthz=local_healthz,
+                tailnet=tailnet,
+            )
+
+            prev = ledger.get(peer_id)
+            cur = "ok" if probe_ok else "fail"
+            # Transition gate: reset ONLY on a fail→ok (or first-seen→ok)
+            # transition, never on a sustained-ok every tick. A peer that
+            # stays unreachable (cur='fail') is never reset → no thrash; its
+            # backoff + max-attempts/dead-letter behavior is fully preserved.
+            is_recovery_transition = probe_ok and prev != "ok"
+
+            reset_rows = 0
+            if probe_ok and is_recovery_transition and apply_reset:
+                # Reuse the `outbox retry` SQL, peer-scoped: only status='retry'
+                # rows (never pending/sending/leased), clear the lease, send now.
+                cur_reset = conn.execute(
+                    "UPDATE outbox SET status='pending', next_attempt_ts=0, "
+                    "lease_owner=NULL, lease_expires_ts=0, updated_ts=? "
+                    "WHERE peer=? AND status='retry'",
+                    (now, peer_id),
+                )
+                conn.commit()
+                reset_rows = cur_reset.rowcount or 0
+
+            # Record the current probe result for the next-tick transition
+            # gate — but ONLY when we actually applied resets. `--dry-run` is
+            # strictly read-only: it must NOT consume the transition. Otherwise
+            # an operator's `diagnose-stuck --dry-run` on a just-recovered peer
+            # would stamp the ledger 'ok' without resetting any row, and the
+            # next REAL run would see prev=='ok', skip the reset, and leave the
+            # rows dormant until natural backoff / manual retry — re-opening the
+            # exact recovery defect this PR closes.
+            if apply_reset:
+                ledger[peer_id] = cur
+
+            report.append({
+                "peer": peer_id,
+                "address": address,
+                "port": port,
+                "waiting_rows": waiting_rows,
+                "max_attempts": int(prow["max_attempts"] or 0),
+                "next_attempt_in_seconds": next_in,
+                "tcp_probe": cur,
+                "tcp_probe_detail": probe_detail,
+                "local_healthz": (
+                    "healthy" if local_healthz is True
+                    else "unhealthy" if local_healthz is False
+                    else "indeterminate"
+                ),
+                "local_healthz_detail": healthz_detail,
+                "peer_tailnet_online": tailnet.get("peer_online"),
+                "classification": classification,
+                "tcp_healthy_backoff_waiting": probe_ok,
+                "backoff_reset": reset_rows > 0,
+                "backoff_reset_rows": reset_rows,
+                "recovery_transition": is_recovery_transition,
+            })
+
+        # Persist the transition ledger only on a real (non-dry-run) pass —
+        # dry-run is strictly read-only and must leave the gate state for the
+        # daemon untouched. Prune entries for peers no longer backoff-waiting
+        # so it does not grow unboundedly. (A peer that drains or dead-letters
+        # all its retry rows drops out of `waiting`; re-arming its transition
+        # gate on a future stuck event is correct.)
+        if apply_reset:
+            live_peers = {str(p["peer"]) for p in waiting}
+            ledger = {k: v for k, v in ledger.items() if k in live_peers}
+            _a2a_save_diag_ledger(ledger_path, ledger)
+    finally:
+        conn.close()
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        if not report:
+            info("no backoff-waiting retry rows")
+        for r in report:
+            line = (
+                f"{r['peer']}: {r['classification']} "
+                f"(tcp={r['tcp_probe']} healthz={r['local_healthz']} "
+                f"waiting={r['waiting_rows']} next={r['next_attempt_in_seconds']}s"
+            )
+            if r["backoff_reset"]:
+                line += f" -> RESET {r['backoff_reset_rows']} row(s) to send-now"
+            line += ")"
+            info(line)
     return 0
 
 
@@ -2194,6 +2614,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_deliver.add_argument("--lease", type=int, default=None)
     p_deliver.add_argument("--timeout", type=float, default=None)
     p_deliver.set_defaults(func=cmd_deliver)
+
+    # #1563 PR-8: directional diagnosis + probe-gated backoff recovery.
+    p_diag = sub.add_parser(
+        "diagnose-stuck",
+        help="classify backoff-waiting retry rows by failing leg + reset "
+             "backoff for peers whose TCP probe recovered (#1563 PR-8)")
+    p_diag.add_argument("--json", action="store_true",
+                        help="emit the machine report to stdout")
+    p_diag.add_argument("--dry-run", action="store_true",
+                        help="classify + report only, do NOT reset any backoff")
+    p_diag.add_argument("--probe-timeout", type=float, default=None,
+                        help="TCP-connect / healthz timeout seconds (default 5)")
+    p_diag.add_argument("--ledger", default=None,
+                        help="per-peer probe-result ledger path for "
+                             "transition-gating (default under the outbox dir)")
+    p_diag.set_defaults(func=cmd_diagnose_stuck)
 
     p_reconcile = sub.add_parser(
         "reconcile",

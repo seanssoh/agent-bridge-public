@@ -36,3 +36,10 @@ scripts/smoke/1533-create-isolate-helpers/assert-content-tree-modes.py
 # ASSERT the admin-liveness false-positive control; it never RWs a controller->iso
 # boundary path (same shape as the #1520c / #1533 test-fixture allowlist entries).
 scripts/smoke/1563-pr5-fp-control-matrix.sh
+
+# #1563 PR-8 diag/recovery fixture — the helper only sets process-local env vars
+# (`os.environ["BRIDGE_A2A_OUTBOX_DB"|"BRIDGE_A2A_CONFIG"]`, `dict(os.environ)`) to
+# drive `agb a2a` / daemon-helper subprocesses inside a mktemp WORK dir; the `.env`
+# matches are the `environ` substring, never a controller->iso boundary RW (same shape
+# as the #1520c / #1533 / PR-5 test-fixture allowlist entries).
+scripts/smoke/1563-pr8-a2a-diag-recovery-helper.py
