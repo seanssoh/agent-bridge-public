@@ -241,7 +241,15 @@ if ! grep -nE '^process_a2a_deliver_tick\(\)' "$DAEMON_SH" >/dev/null; then
 fi
 
 # T4b — called from cmd_sync_cycle (LAST_STEP=a2a_deliver_tick set before call).
-if ! grep -F 'BRIDGE_DAEMON_LAST_STEP="a2a_deliver_tick"' "$DAEMON_SH" >/dev/null; then
+# Issue #1563 (PR-2) made a2a_deliver_tick a "long bounded step" that needs a
+# before+after heartbeat pulse, so the raw `BRIDGE_DAEMON_LAST_STEP="..."`
+# assignment was replaced by `_bridge_daemon_mark_progress "a2a_deliver_tick"`
+# — a helper whose first line is `BRIDGE_DAEMON_LAST_STEP="$1"` (it sets the
+# same heartbeat var AND touches the tick-progress file). Accept either the
+# raw assignment (still used by sibling steps) or the helper form, since both
+# provably set LAST_STEP before the call. Anchor to the start of an executable
+# line so a commented-out mention does NOT satisfy it (matching T4c's teeth).
+if ! grep -Eq '^[[:space:]]*(BRIDGE_DAEMON_LAST_STEP="a2a_deliver_tick"|_bridge_daemon_mark_progress[[:space:]]+"a2a_deliver_tick")' "$DAEMON_SH"; then
   T4_FAILS+="cmd_sync_cycle does not set LAST_STEP=a2a_deliver_tick; "
 fi
 # Issue #1338 wrapped the deliver-tick call in a defense-in-depth subshell:
