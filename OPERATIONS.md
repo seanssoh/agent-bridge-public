@@ -613,19 +613,23 @@ overrides discovery for a non-standard install.
 bodies) are live-only operator-owned state — preserved across `agb upgrade`
 like `state/`, `logs/`, and the local roster.
 
-## A2A Rooms (beta, single-node)
+## A2A Rooms (beta)
 
 A2A **Rooms** (v0.16.0-beta1) is a room / leader(방장) / join-on-approval
-membership model that unifies internal-team and (in beta2) cross-bridge agent
-messaging, plus an opt-in internal-queue ACL (`rooms_acl`, default **off**) that
-restricts inter-agent queue creates to shared-room members — OS-enforced under
-linux-user isolation (iso v2). The control plane (`agb room create|join|approve|
-list|show|kick|leave|invite|rotate-invite|adopt-all|acl`) and its `rooms.db` live
-under `state/handoff/` (preserved across `agb upgrade`).
+membership model that unifies internal-team and cross-bridge agent messaging,
+plus an opt-in internal-queue ACL (`rooms_acl`, default **off**) that restricts
+inter-agent queue creates to shared-room members — OS-enforced under linux-user
+isolation (iso v2). The control plane (`agb room create|join|approve|list|show|
+kick|leave|invite|rotate-invite|adopt-all|acl`) and its `rooms.db` live under
+`state/handoff/` (preserved across `agb upgrade`).
 
-beta1 is **single-node**: rooms and the ACL operate on one install's roster.
-Multi-node transport (Tailscale / Cloudflare Zero Trust), node-link bootstrap,
-and cross-node roster relay are **beta2**.
+As of **v0.16.0-rc1**, cross-node rooms (P4) are **wired and multi-node-verified**
+on a live 2- and 3-node Tailscale mesh: a room spans nodes, the leader's roster
+is broadcast over the node-link, and join-on-approval works across nodes (`agb
+room create/join/approve/show`, the `agbroom://` invite, per-room epoch bumps,
+and the P4.2 roster-broadcast were all confirmed cross-node). The Cloudflare Zero
+Trust transport and whole-room `agb a2a send` fan-out remain the maturing edges
+(the Tailscale transport is the verified one).
 
 Full operator usage — lifecycle, the `adopt-all` → `enforce` migration, the
 acting-identity (`--as`) regimes, and the honest security model — is in
@@ -683,6 +687,72 @@ a fleet-wide capability is declared once and every install that pulls the
 marketplace gets the auto-provisioning. Caveat: a wholesale marketplace version
 sync that overwrites the plugin's `plugin.json` will drop a `requires` added
 out-of-band — declare it in the plugin's source so syncs preserve it.
+
+## Daemon supervision (#1563)
+
+(v0.16.0-rc1) The daemon is **crash-only and self-supervising**: when it detects
+that it cannot make progress it *aborts* and lets the OS init layer restart a
+fresh process, rather than trying to self-heal in place. There are two rings:
+
+- **T1 — runner-process self-abort (in the daemon).** Each scheduler tick runs
+  as a child in its own process group. The supervisor watches an in-tick
+  *progress heartbeat*; if no progress is stamped for `(max-step-budget + grace)`
+  the tick is **wedged** — the supervisor kills the child's process group (so a
+  hung grandchild can't orphan), emits a `daemon_tick_deadline_exceeded` audit
+  row, and exits non-zero. A **healthy long step that keeps stamping progress is
+  never aborted** — the deadline is derived from the *longest configured bounded
+  step* (so raising any `bridge_with_timeout` ceiling automatically widens it),
+  never a fixed/nudge-latency number. This is the flapping-monitor guard.
+- **T0 — OS init restart (outside the daemon).** launchd `KeepAlive` (macOS) /
+  systemd `Restart=always` (Linux) turn the T1 non-zero exit into a fresh
+  daemon. Install the systemd unit with `--watchdog` for an additional
+  `Type=notify` + `WatchdogSec` outer ring (sized **above** the T1 deadline so it
+  never fires before the daemon's own self-abort).
+
+A hardened **singleton** guarantees exactly one daemon owns the lock + the
+active-generation owner record; a loser exits cleanly and **never** evicts the
+live holder, and a stale predecessor is evicted only after a positive
+start-time proof (a *recycled* pid — same number, different `ps -o lstart=` — is
+reclaimed without ever being signalled).
+
+**Escalate, don't self-heal.** When the daemon's mechanical liveness check finds
+the **admin agent itself** down (no live tmux session AND the daemon heartbeat
+stale past the threshold), it does **not** restart the admin — it enqueues a
+durable `created_by=daemon` task to the admin's codex pair (e.g. `patch-dev`). A
+*busy* or long-turn admin (any live session) is **never** classified down. An
+MCP-liveness give-up for the admin's own channel routes to the codex pair too
+(audit-only when no pair is provisioned). A failed escalation task-create is
+audited (`daemon_escalation_task_create_failed`) and **retried** on the next tick
+— never silently swallowed.
+
+**A2A receiver supervision.** A transient tailnet/bind-availability failure
+(config + secret proven valid) **backs off** exponentially and, after enough
+consecutive failures for the same `(config-fingerprint, error_class)` key, **opens
+a circuit breaker** (stop respawning + escalate once per cooldown) instead of a
+~9-minute hot crash-loop. A real **auth/config** error (bad/missing secret,
+malformed config) is **held immediately** — retrying can't fix it. A successful
+bind resets the breaker. The fail-closed tailnet bind proof / HMAC / allowlist
+are **unchanged** — this is a supervision-policy layer only.
+
+Env knobs (all optional; defaults are sized for production):
+
+| Var | Default | Effect |
+|---|---|---|
+| `BRIDGE_DAEMON_TICK_MAX_STEP_SECONDS` | `600` | Floor for the T1 max-step budget (raised by any larger bounded step). |
+| `BRIDGE_DAEMON_TICK_GRACE_SECONDS` | `120` | Grace added on top of the max step before a tick is called wedged. |
+| `BRIDGE_DAEMON_ADMIN_DOWN_STALE_SECS` | `900` | Heartbeat staleness before the admin is classified `down`. |
+| `BRIDGE_DAEMON_ADMIN_DOWN_COOLDOWN_SECS` | `1800` | Re-escalation cooldown for the admin-down task. |
+| `BRIDGE_A2A_RECEIVER_BACKOFF_BASE_SECONDS` | `30` | First transient-failure backoff (doubles each consecutive failure). |
+| `BRIDGE_A2A_RECEIVER_BACKOFF_CAP_SECONDS` | `900` | Backoff ceiling. |
+| `BRIDGE_A2A_RECEIVER_BACKOFF_OPEN_THRESHOLD` | `5` | Consecutive transient failures before the circuit opens. |
+
+Observe it via the audit trail:
+
+```bash
+agb audit follow --action daemon_tick_deadline_exceeded   # T1 self-abort fired
+agb audit follow --action daemon_admin_down_escalated     # admin-down escalation
+agb audit follow --action a2a_receiver_circuit_open       # A2A breaker opened
+```
 
 ## Status And Debugging
 
@@ -1290,6 +1360,24 @@ agent-bridge auth claude-token add --id claude-a --stdin --activate --sync
 claude setup-token
 agent-bridge auth claude-token add --id claude-b --stdin --sync
 ```
+
+**Sealed-paste entry (#1367, v0.16.0-rc1).** When you want the operator — not an
+agent — to enter a token at a terminal, use the `receive` verb. It reads the
+token **echo-off directly from `/dev/tty`** (never argv / env / stdin / a queued
+body), so the secret is never captured into an agent transcript, the shell
+history, the queue, or the audit log. It **fails closed** when there is no
+controlling tty (e.g. inside a non-interactive agent session):
+
+```bash
+# Operator at a real terminal:
+agent-bridge auth claude-token receive --id claude-a --activate
+# Prompts on /dev/tty with echo OFF; paste the setup token, press Enter.
+```
+
+An admin agent can *request* a token without ever touching it: `receive
+--request --id <id>` queues a token-free request that the operator later fulfills
+with `receive --id <id> --fulfill <request-id>` (the echo-off read happens in the
+operator's terminal, never the agent's).
 
 The registry lives at
 `$BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json` (mode `0600`), and

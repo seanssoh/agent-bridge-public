@@ -202,6 +202,44 @@ Python으로 빠지는 패턴이 많다.
 이 셋은 서로 강하게 연결되어 있으므로, 하나를 바꾸면 나머지 관찰면도 같이
 확인해야 한다.
 
+**Daemon supervision contract (#1563, v0.16.0-rc1).** daemon은 이제 **crash-only /
+self-supervising**이다 — in-place self-heal 대신, 진행이 막히면 *abort*하고 OS init이
+fresh daemon을 띄운다. 코드 위치와 불변식:
+
+- **T1 (runner-process self-abort)** — `lib/bridge-daemon-control.sh`의
+  `bridge_daemon_run_tick_supervised`. 각 tick을 자기 process group의 child로 돌리고,
+  in-tick progress heartbeat(`bridge_daemon_tick_progress_touch`)가 `(max-step-budget
+  + grace)`(= `bridge_daemon_tick_deadline_seconds`) 동안 갱신되지 않으면 wedge로 보고
+  child의 process group을 kill → `daemon_tick_deadline_exceeded` audit + rc 99로 exit.
+  **healthy long step은 절대 abort되지 않는다** — deadline은 *가장 긴 bounded step*에서
+  파생되므로(`bridge_with_timeout` ceiling을 올리면 deadline도 자동으로 넓어진다) 고정값/
+  nudge-latency 숫자로 되돌리지 말 것. flapping-monitor irony가 이 설계의 #1 리스크다.
+- **T0 (OS init restart)** — launchd `KeepAlive` / systemd `Restart=always`
+  (`scripts/install-daemon-{launchagent,systemd}.sh`), `--watchdog`로 `Type=notify` +
+  `WatchdogSec` outer ring(T1 deadline보다 크게 sizing).
+- **singleton** — `bridge_daemon_ensure_singleton`. 정확히 하나의 holder + owner record;
+  loser는 clean exit하고 live holder를 **절대 evict하지 않는다**. recycled pid(같은 번호,
+  다른 `ps -o lstart=`)는 signal 없이 reclaim — start-time proof를 약화시키지 말 것.
+- **escalate, don't self-heal** — `bridge-daemon.sh`의
+  `bridge_daemon_admin_liveness_class` / `process_daemon_admin_liveness_escalation` /
+  `bridge_daemon_mcp_giveup_escalate_admin`. admin이 down이면 admin을 재시작하지 않고
+  codex pair로 durable task를 escalate. busy/long-turn admin은 절대 down으로 분류하지 말 것.
+- **A2A receiver supervision** — `process_a2a_receiver_supervise_tick` +
+  `lib/bridge-a2a.sh`(backoff/breaker decision) + `lib/daemon-helpers/a2a-receiver-exit-cause.py`
+  (transient vs auth_config 분류). transient bind blip은 exponential backoff + circuit
+  breaker, auth/config 에러는 즉시 hold. fail-closed bind/HMAC 경계는 **건드리지 말 것** —
+  이건 supervision-policy 레이어일 뿐이다.
+
+통합 false-positive 회귀는 `scripts/smoke/1563-pr5-fp-control-matrix.sh`(7-row 매트릭스 +
+teeth)가, 각 메커니즘은 `1563-daemon-singleton` / `1563-pr2`(T1) / `1563-pr3`(escalation) /
+`1563-pr4`(A2A) smoke가 핀으로 박는다. OPERATIONS.md §"Daemon supervision (#1563)"에 운영자용
+env 노브 표가 있다.
+
+**Stop/turn-end inbox auto-drain (#9780).** turn 종료 시 `hooks/inbox-auto-drain.py`
+(Stop hook)가 idle 대신 genuinely-claimable queued task를 하나 drain한다. id+status marker +
+atomic-persist-before-block의 fail-open 무한루프 가드가 있고, #1199 queued-vs-claimed 분리를
+보존한다 — 이 가드를 약화시키면 turn-end 루프가 생긴다.
+
 ### 2. tmux I/O
 
 `bridge-tmux.sh`는 deceptively simple해 보여도 실패 시 영향이 크다.

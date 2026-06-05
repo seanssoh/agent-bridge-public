@@ -30,3 +30,9 @@ scripts/smoke/1520c-create-isolate-helpers/assert-watchdog-publish-gap.py
 # mktemp fixture; not runtime boundary RW.
 scripts/smoke/1533-create-isolate-content-publish.sh
 scripts/smoke/1533-create-isolate-helpers/assert-content-tree-modes.py
+
+# #1563 PR-5 integration matrix — a heartbeat state-file STUB (`heartbeat/<a>.env`)
+# inside a mktemp BRIDGE_HOME only mirrors the PR-3 escalation predicate's input to
+# ASSERT the admin-liveness false-positive control; it never RWs a controller->iso
+# boundary path (same shape as the #1520c / #1533 test-fixture allowlist entries).
+scripts/smoke/1563-pr5-fp-control-matrix.sh
