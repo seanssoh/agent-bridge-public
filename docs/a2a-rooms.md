@@ -1,23 +1,28 @@
 # A2A Rooms (beta) — operator usage
 
 A2A **Rooms** is a room / leader(방장) / join-on-approval membership model that
-unifies internal-team and (in a later beta) cross-bridge agent messaging under
-one boundary. A *leader* creates a room and hands out a one-time invite link;
-each agent posts a join request with that link, and the leader approves or
-denies it. The same room membership can then back an **opt-in internal-queue
-ACL** so inter-agent queue creates are restricted to agents that share a room.
+unifies internal-team and cross-bridge agent messaging under one boundary. A
+*leader* creates a room and hands out a one-time invite link; each agent posts a
+join request with that link, and the leader approves or denies it. The same room
+membership can then back an **opt-in internal-queue ACL** so inter-agent queue
+creates are restricted to agents that share a room.
 
 This page is the **operator usage** reference. The full design rationale,
 schema, and security derivation live in
 [`docs/design/a2a-rooms-design.md`](./design/a2a-rooms-design.md) — this page
 does not duplicate it.
 
-> **Scope: beta1 is single-node.** Everything below operates on **one install's**
-> control plane (`rooms.db`) and **its own roster**. Multi-node transport
-> (Tailscale / Cloudflare Zero Trust), node-link bootstrap, and cross-node
-> roster broadcast + relay-through-leader are **beta2** — they are *not* wired in
-> beta1. A room created on node A does not yet reach an agent on node B. Until
-> beta2, treat rooms as an internal-team boundary on a single bridge.
+> **Scope (as of `v0.16.0-rc1`): cross-node rooms (P4) are wired and
+> multi-node-verified.** The single-node control plane (P1: `rooms.db`, the
+> `agb room` CLI, the OS-enforced leader ACL) and the **cross-node** layer (P4:
+> roster broadcast over the node-link, join-on-approval across nodes,
+> relay-through-leader) are both live. A room created on node A reaches an agent
+> on node B: `agb room create / join / approve / show`, the `agbroom://` invite,
+> the per-room epoch bumps, and the P4.2 leader roster-broadcast were all
+> confirmed cross-node on a live 2- and 3-node Tailscale mesh. What was verified:
+> single-leader rooms with invite/join/approve, leader roster-broadcast, and
+> multi-node delivery for both 1:1 and room-scoped messages. Treat rooms as an
+> internal-team OR cross-bridge boundary.
 
 The CLI is `agb room <verb>` (equivalently `agent-bridge room <verb>`). All
 verbs accept `--json` for machine-readable output; mutating verbs accept `--as`
@@ -64,8 +69,9 @@ agbroom://join?room=<room_id>&leader=<node>&t=<token>
 ```
 
 `--name` is optional (defaults to empty). On a single-node install `<node>` is
-the A2A config `bridge_id`, or empty if no A2A config is present — both are fine
-in beta1.
+the A2A config `bridge_id`, or empty if no A2A config is present — both are fine.
+Across nodes, `<node>` is the peer's `bridge_id` and the invite link carries it
+so a member on another node can route its join request back to the leader.
 
 ### 2. Share the link, then each agent joins
 
@@ -241,16 +247,24 @@ derivation, see
 
 ---
 
-## What is NOT in beta1 (deferred to beta2+)
+## Cross-node status (P4)
 
-- **Multi-node transport** — Tailscale and Cloudflare Zero Trust transport
-  backends, transport negotiation.
-- **Node-link bootstrap** — the `--init` / `--accept` bundle flow that links two
-  bridges.
-- **Cross-node rooms** — roster spanning multiple nodes, roster broadcast over
-  node-links, relay-through-leader and relay→direct auto-upgrade.
-- **`agb a2a send` room fan-out** — addressing a whole room as a send target.
+Cross-node rooms (P4) are **wired and multi-node-verified as of `v0.16.0-rc1`**.
+A room spans nodes, the leader's roster is broadcast over the node-link, and a
+join is approved across nodes. The following were confirmed on a live 2- and
+3-node Tailscale mesh:
 
-In beta1, a room and its ACL operate entirely within one install. Cross-node
-behavior is validated against real nodes in beta2 — do not expect a room to
-reach another bridge yet.
+- **Single-leader rooms** with `agb room create / join / approve / show`.
+- **`agbroom://` invite links** + per-room `epoch` bumps on membership change.
+- **P4.2 leader roster-broadcast** — the leader's canonical roster reaches member
+  nodes over the node-link.
+- **Multi-node delivery** for both 1:1 (`agb a2a send`) and room-scoped messages.
+
+Still maturing (covered by the `rooms-p4-*` smokes with a stubbed transport, not
+yet part of the live-mesh verification above):
+
+- **Cloudflare Zero Trust transport** — only the Tailscale transport is exercised
+  on the live mesh; the transport-negotiation seam exists but ZT is unverified.
+- **`agb a2a send` whole-room fan-out** — room-scoped *delivery* (P4.3 room-talk)
+  is wired; addressing a whole room as a single `agb a2a send` target is the next
+  ergonomic step.
