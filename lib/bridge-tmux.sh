@@ -1506,8 +1506,32 @@ bridge_tmux_pending_attention_with_lock() {
 
   lock_dir="$(bridge_agent_pending_attention_lock_dir "$agent")"
   pid_file="$lock_dir/holder.pid"
-  mkdir -p "$(dirname "$lock_dir")"
+  # Issue #9981: distinguish a *permission* failure on the spool dir from
+  # genuine lock contention. The spool now anchors on the controller-owned
+  # state leaf (bridge_agent_pending_attention_state_dir → state/agents/<a>/),
+  # so a controller can normally always create it. But if the leaf is
+  # unwritable for any reason (rm'd + self-heal could not recover, an
+  # operator-misconfigured mode, a non-standard host), a `mkdir` EACCES used
+  # to masquerade as contention and burn all 200 retries with a misleading
+  # "lock contention" warning before giving up. Fast-fail instead: emit ONE
+  # clear warning and return so the caller keeps its durable-queue delivery
+  # without spamming the log — never block the urgent send on a spool that
+  # cannot be written.
+  if ! mkdir -p "$(dirname "$lock_dir")" 2>/dev/null; then
+    bridge_warn "pending-attention spool dir unwritable for '$agent' ($(dirname "$lock_dir")); skipping instant-wake spool — task remains queued for poll delivery"
+    return 75
+  fi
   while ! mkdir "$lock_dir" 2>/dev/null; do
+    # If the lock dir itself cannot be created because of a *permission*
+    # error (the parent exists and is traversable per the mkdir -p above,
+    # but the controller still cannot create a child — e.g. the leaf is
+    # owned by another UID with no group write), this is NOT contention and
+    # retrying 200× is pointless. Probe via a writability test on the parent
+    # and fast-fail with a single warning.
+    if [[ ! -d "$lock_dir" ]] && [[ ! -w "$(dirname "$lock_dir")" ]]; then
+      bridge_warn "pending-attention spool dir unwritable for '$agent' ($(dirname "$lock_dir")); skipping instant-wake spool — task remains queued for poll delivery"
+      return 75
+    fi
     # Stale-lock recovery: if the holder PID file exists and the holder
     # process is gone, reclaim the lock dir. This avoids the previous
     # implementation's force-rmdir-after-N-attempts which could yank the
