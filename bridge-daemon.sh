@@ -616,6 +616,76 @@ _bridge_daemon_mark_progress() {
   fi
 }
 
+# Issue #1579 (#1563 follow-up, rc2 PR-7) — per-tick cadence gate for the
+# EXPENSIVE PERIODIC passes. Root cause 2 of the wedge/slow-tick finding:
+# cmd_sync_cycle runs ~33 passes SERIALLY and several iterate over every agent
+# every 5s tick (channel-health, plugin-liveness, the per-agent context-
+# pressure / stall scans, the unclaimed sweeps). On a real roster that blows
+# the 5s tick interval (tick_age oscillated to 30-45s on the operator's EC2
+# mac). These passes are health/housekeeping scans that do NOT need 5s
+# granularity, so we run them on a slower, env-overridable cadence (~30s)
+# while the TIME-CRITICAL delivery/escalation passes (queue_gateway,
+# attention_flush, cron_dispatch, a2a_*, nudge_*, admin_liveness, the
+# mcp-giveup recovery, prompt-ready, heartbeats, discord DM-wake) stay EVERY
+# tick — gating those would regress task-delivery / the #1563 escalation the
+# whole release is about.
+#
+# Mirrors the established bridge_watchdog_due cadence pattern, backed by a
+# per-pass last-run stamp under $BRIDGE_STATE_DIR/daemon-pass-cadence/<pass>.ts
+# (tmp+mv atomic, key-sanitized). Contract:
+#   bridge_daemon_pass_due "<pass>" "<interval_secs>"
+#     - returns 0 (run now) when now - last >= interval, and STAMPS the
+#       new run time, so the next call within the interval returns 1.
+#     - returns 0 (run now) on the FIRST tick of a fresh daemon (no state
+#       file yet) — never starve a freshly-restarted daemon.
+#     - interval <= 0 or non-numeric => always run (gate disabled).
+# The state file only advances on a RUN (a skipped/gated tick does NOT touch
+# it), so a pass fires exactly once per interval regardless of tick rate.
+#
+# IMPORTANT (PR-2 interaction): the cmd_sync_cycle callers stamp the progress
+# heartbeat (BRIDGE_DAEMON_LAST_STEP / _bridge_daemon_mark_progress) BEFORE
+# this due-check, so a tick that legitimately SKIPS a gated pass still refreshes
+# the PR-2 supervisor heartbeat and is never mistaken for a wedge.
+bridge_daemon_pass_due() {
+  local pass="$1"
+  local interval="${2:-30}"
+  local cadence_dir=""
+  local file=""
+  local key=""
+  local now=0
+  local last=0
+  local tmp=""
+
+  [[ -n "$pass" ]] || return 0
+  # Non-numeric / non-positive interval disables the gate (run every tick).
+  [[ "$interval" =~ ^[0-9]+$ ]] || return 0
+  (( interval > 0 )) || return 0
+
+  # Sanitize the key to a safe filename (defense-in-depth — pass names are
+  # internal literals, but never let one produce a path-traversal stamp).
+  key="$(printf '%s' "$pass" | tr -c 'A-Za-z0-9._-' '_')"
+  cadence_dir="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-/tmp}/state}/daemon-pass-cadence"
+  file="$cadence_dir/${key}.ts"
+  now="$(date +%s)"
+
+  if [[ -f "$file" ]]; then
+    last="$(tr -dc '0-9' <"$file" 2>/dev/null | head -c 18)"
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    # Not yet due — leave the stamp untouched (the pass does NOT run).
+    (( now - last < interval )) && return 1
+  fi
+
+  # Due (or fresh daemon with no stamp): record this run atomically, then run.
+  mkdir -p "$cadence_dir" 2>/dev/null || true
+  tmp="$(mktemp "${file}.XXXXXX" 2>/dev/null)" || { printf '%s\n' "$now" >"$file" 2>/dev/null || true; return 0; }
+  if printf '%s\n' "$now" >"$tmp" 2>/dev/null; then
+    mv -f -- "$tmp" "$file" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null || true; }
+  else
+    rm -f -- "$tmp" 2>/dev/null || true
+  fi
+  return 0
+}
+
 _bridge_daemon_on_err() {
   # Recursion guard: trap handlers that themselves fail must not retrigger.
   if (( _BRIDGE_DAEMON_IN_ERR_TRAP != 0 )); then
@@ -11695,6 +11765,12 @@ cmd_sync_cycle() {
   local changed=1
   local cron_sync_timeout="${BRIDGE_CRON_SYNC_TIMEOUT:-30}"
   local timeout_bin=""
+  # #1579 (PR-7) defense-in-depth: capture the tick wall-clock start so the end
+  # of this function can emit a daemon_tick_slow DIAGNOSTIC audit row when a
+  # single cmd_sync_cycle exceeds the budget (default 10s). Diagnostic ONLY —
+  # PR-2's runner-process supervisor owns the abort decision; this never aborts.
+  local _tick_start_ts=0
+  _tick_start_ts="$(date +%s)"
   # Footgun #11 (refs #815 Wave B): tempfile-route nudge_output loop.
   local _nudge_tmp=""
   _nudge_tmp="$(mktemp)"
@@ -11799,8 +11875,17 @@ cmd_sync_cycle() {
   ( reconcile_prompt_ready_latches ) || true
   BRIDGE_DAEMON_LAST_STEP="attention_flush"
   ( flush_pending_attention_spools ) || true
-  BRIDGE_DAEMON_LAST_STEP="channel_health"
-  ( process_channel_health ) || true
+  # #1579 (PR-7): cadence-gate the per-agent channel-health scan (~30s). It
+  # walks EVERY agent's channel-miss state every tick; on a real roster that is
+  # a hot per-tick cost with no delivery responsibility. Mark via
+  # _bridge_daemon_mark_progress (NOT a bare LAST_STEP=) so the PR-2 supervisor's
+  # parent-visible progress heartbeat (bridge_daemon_tick_progress_touch) is
+  # refreshed BEFORE the due-check — a fully-skipped gated tick still pulses
+  # progress and is never mistaken for a wedge.
+  _bridge_daemon_mark_progress "channel_health"
+  if bridge_daemon_pass_due channel_health "${BRIDGE_DAEMON_CHANNEL_HEALTH_INTERVAL_SECONDS:-30}"; then
+    ( process_channel_health ) || true
+  fi
   # Issue #1307 (v0.15.0-beta5-1 Lane 3) — auto-clear MCP-liveness giveup
   # on agent recovery. Runs BEFORE process_plugin_liveness because
   # process_plugin_liveness's silent-clear path
@@ -11838,8 +11923,16 @@ cmd_sync_cycle() {
   BRIDGE_DAEMON_LAST_STEP="mcp_liveness_giveup_recovery"
   ( process_mcp_liveness_giveup_recovery ) || true
 
-  BRIDGE_DAEMON_LAST_STEP="plugin_liveness"
-  ( process_plugin_liveness ) || true
+  # #1579 (PR-7): cadence-gate the per-agent plugin-liveness scan (~30s). Like
+  # channel_health it iterates EVERY agent every tick. The mcp-liveness GIVEUP
+  # RECOVERY tick above is NOT gated (it stays every-tick — Teams/MCP delivery
+  # recovery latency is the silent-message-drop class), and it deliberately runs
+  # BEFORE plugin_liveness so the ordering invariant (#1307) is preserved on the
+  # ticks where the gated plugin_liveness does run.
+  _bridge_daemon_mark_progress "plugin_liveness"
+  if bridge_daemon_pass_due plugin_liveness "${BRIDGE_DAEMON_PLUGIN_LIVENESS_INTERVAL_SECONDS:-30}"; then
+    ( process_plugin_liveness ) || true
+  fi
 
   BRIDGE_DAEMON_LAST_STEP="nudge_scan"
   snapshot_file="$(mktemp)"
@@ -12054,12 +12147,29 @@ cmd_sync_cycle() {
 
   BRIDGE_DAEMON_LAST_STEP="queue_summary"
   summary_output="$(bridge_queue_cli summary --format tsv 2>/dev/null || true)"
-  BRIDGE_DAEMON_LAST_STEP="memory_refresh"
-  if process_memory_daily_refresh_requests; then
+  # #1579 (PR-7): cadence-gate the housekeeping/health scans below (~30s). NONE
+  # of these drive task delivery or escalation latency — memory_refresh is a
+  # daily-refresh request sweep, stall_reports / context_pressure_scan are
+  # per-agent health scans, the unclaimed_* sweeps act on OLD tasks (>1800s, so
+  # 30s granularity is irrelevant), nudge_late_success_sweep is a reporting
+  # reconcile, and crash_reports is a crash-marker scan. The BRIDGE_DAEMON_LAST_
+  # STEP mark on each one refreshes the PR-2 heartbeat BEFORE its due-check, so a
+  # skipped tick still pulses progress and never looks wedged. queue_summary
+  # above stays EVERY tick because its $summary_output is consumed by the gated
+  # stall/context scans AND by the un-gated on_demand autostart path later.
+  # permission_timeout_fanout and heartbeats below stay every-tick (delivery /
+  # liveness latency). Each gated step marks via _bridge_daemon_mark_progress
+  # (NOT a bare LAST_STEP=) so the PR-2 parent-visible heartbeat is refreshed
+  # BEFORE the due-check — a fully-skipped gated tick still pulses progress.
+  _bridge_daemon_mark_progress "memory_refresh"
+  if bridge_daemon_pass_due memory_refresh "${BRIDGE_DAEMON_MEMORY_REFRESH_INTERVAL_SECONDS:-30}" \
+      && process_memory_daily_refresh_requests; then
     changed=0
   fi
-  BRIDGE_DAEMON_LAST_STEP="stall_reports"
-  if [[ -n "$summary_output" ]] && process_stall_reports "$summary_output"; then
+  _bridge_daemon_mark_progress "stall_reports"
+  if [[ -n "$summary_output" ]] \
+      && bridge_daemon_pass_due stall_reports "${BRIDGE_DAEMON_STALL_REPORTS_INTERVAL_SECONDS:-30}" \
+      && process_stall_reports "$summary_output"; then
     changed=0
   fi
   BRIDGE_DAEMON_LAST_STEP="permission_timeout_fanout"
@@ -12075,18 +12185,26 @@ cmd_sync_cycle() {
   # gate): structurally non-overlapping — that gate looks at NEW tasks
   # (<60s), we look at OLD tasks (>1800s). Subshell-isolated per the
   # Lane π defense-in-depth pattern (#1338).
-  BRIDGE_DAEMON_LAST_STEP="unclaimed_queue_escalation"
-  ( process_unclaimed_queue_escalation ) && changed=0 || true
-  BRIDGE_DAEMON_LAST_STEP="unclaimed_marker_sweep"
-  ( bridge_daemon_sweep_stale_unclaimed_markers ) && changed=0 || true
+  _bridge_daemon_mark_progress "unclaimed_queue_escalation"
+  if bridge_daemon_pass_due unclaimed_queue_escalation "${BRIDGE_DAEMON_UNCLAIMED_QUEUE_INTERVAL_SECONDS:-30}"; then
+    ( process_unclaimed_queue_escalation ) && changed=0 || true
+  fi
+  _bridge_daemon_mark_progress "unclaimed_marker_sweep"
+  if bridge_daemon_pass_due unclaimed_marker_sweep "${BRIDGE_DAEMON_UNCLAIMED_MARKER_INTERVAL_SECONDS:-30}"; then
+    ( bridge_daemon_sweep_stale_unclaimed_markers ) && changed=0 || true
+  fi
   # Issue #1459: late nudge-success reconcile. Emits
   # session_nudge_late_success for prior submit_lost_post_grace drops
   # whose task later became claimed/done so status/reporting counts
   # UNRESOLVED drops, not raw drop rows. Subshell-isolated (#1338).
-  BRIDGE_DAEMON_LAST_STEP="nudge_late_success_sweep"
-  ( bridge_daemon_sweep_nudge_late_success ) && changed=0 || true
-  BRIDGE_DAEMON_LAST_STEP="context_pressure_scan"
-  if [[ -n "$summary_output" ]] && process_context_pressure_reports "$summary_output"; then
+  _bridge_daemon_mark_progress "nudge_late_success_sweep"
+  if bridge_daemon_pass_due nudge_late_success_sweep "${BRIDGE_DAEMON_NUDGE_LATE_SUCCESS_INTERVAL_SECONDS:-30}"; then
+    ( bridge_daemon_sweep_nudge_late_success ) && changed=0 || true
+  fi
+  _bridge_daemon_mark_progress "context_pressure_scan"
+  if [[ -n "$summary_output" ]] \
+      && bridge_daemon_pass_due context_pressure_scan "${BRIDGE_DAEMON_CONTEXT_PRESSURE_INTERVAL_SECONDS:-30}" \
+      && process_context_pressure_reports "$summary_output"; then
     changed=0
   fi
   BRIDGE_DAEMON_LAST_STEP="heartbeats"
@@ -12101,8 +12219,13 @@ cmd_sync_cycle() {
   # #1563 PR-2 (r2): re-baseline progress AFTER the 30s watchdog scan so the
   # tail steps inherit the full deadline, not just the residual grace window.
   _bridge_daemon_mark_progress "watchdog"
-  BRIDGE_DAEMON_LAST_STEP="crash_reports"
-  if process_crash_reports; then
+  # #1579 (PR-7): cadence-gate the crash-marker scan (~30s) — a housekeeping
+  # report sweep, not a delivery path. (The watchdog scan above is already
+  # cadence-gated via bridge_watchdog_due, default 1800s.) _bridge_daemon_mark_
+  # progress (not bare LAST_STEP=) refreshes the PR-2 heartbeat before the gate.
+  _bridge_daemon_mark_progress "crash_reports"
+  if bridge_daemon_pass_due crash_reports "${BRIDGE_DAEMON_CRASH_REPORTS_INTERVAL_SECONDS:-30}" \
+      && process_crash_reports; then
     changed=0
   fi
   # #1563 PR-2 (r2): bracket claude_token_recovery — a bounded synchronous step
@@ -12261,6 +12384,24 @@ cmd_sync_cycle() {
 
   BRIDGE_DAEMON_LAST_STEP="dashboard_post"
   ( bridge_dashboard_post_if_changed "$summary_output" ) || true
+
+  # #1579 (PR-7) defense-in-depth: emit a DIAGNOSTIC daemon_tick_slow audit row
+  # when this whole tick exceeded the budget (BRIDGE_DAEMON_TICK_SLOW_LOG_SECONDS,
+  # default 10s). This is the slow-tick signal that made #1579 hard to diagnose —
+  # now `agb audit follow` surfaces the offending duration + the LAST_STEP. It
+  # does NOT abort the tick (PR-2's supervisor owns the wedge → self-abort).
+  local _tick_slow_budget="${BRIDGE_DAEMON_TICK_SLOW_LOG_SECONDS:-10}"
+  if [[ "$_tick_slow_budget" =~ ^[0-9]+$ ]] && (( _tick_slow_budget > 0 )) \
+      && [[ "$_tick_start_ts" =~ ^[0-9]+$ ]] && (( _tick_start_ts > 0 )); then
+    local _tick_elapsed=$(( $(date +%s) - _tick_start_ts ))
+    if (( _tick_elapsed >= _tick_slow_budget )); then
+      bridge_audit_log daemon daemon_tick_slow daemon \
+        --detail duration_seconds="$_tick_elapsed" \
+        --detail budget_seconds="$_tick_slow_budget" \
+        --detail last_step="${BRIDGE_DAEMON_LAST_STEP:-unknown}" \
+        2>/dev/null || true
+    fi
+  fi
 }
 
 # --- Silence-watchdog sibling (issue #265 proposal C) ----------------------
