@@ -2068,6 +2068,66 @@ def load_roster_status(path: str) -> dict[str, dict[str, str]]:
     return rows
 
 
+def cmd_cron_backlog_snapshot(args: argparse.Namespace) -> int:
+    # Issue #1459 — queue-GLOBAL oldest queued [cron-dispatch] row + count.
+    #
+    # The daemon's cron-dispatch backlog sweep needs the oldest queued cron
+    # row across ALL agents (cron rows can be assigned to any agent), which
+    # `find-open --agent <a>` cannot express. `cron-ready` is global but
+    # ranks/defers and drops created_ts. This single-purpose read returns
+    # exactly the backlog snapshot fields the sweep audits on, with no
+    # ranking/deferral (a backlog audit must see the true oldest row).
+    sql = """
+        SELECT id, assigned_to, priority, title, created_ts
+        FROM tasks
+        WHERE status = 'queued'
+          AND title LIKE '[cron-dispatch]%'
+        ORDER BY created_ts, id
+    """
+    with closing(connect()) as conn:
+        rows = conn.execute(sql).fetchall()
+
+    current_ts = now_ts()
+    queued_count = len(rows)
+    payload: dict[str, object] = {
+        "queued_count": queued_count,
+        "oldest_task_id": 0,
+        "oldest_age_seconds": 0,
+        "oldest_agent": "",
+        "oldest_title": "",
+        "oldest_family": "",
+    }
+    if rows:
+        oldest = rows[0]
+        created = int(oldest["created_ts"] or current_ts)
+        payload.update(
+            {
+                "oldest_task_id": int(oldest["id"]),
+                "oldest_age_seconds": max(0, current_ts - created),
+                "oldest_agent": str(oldest["assigned_to"] or ""),
+                "oldest_title": str(oldest["title"] or ""),
+                "oldest_family": classify_family(str(oldest["title"] or "")),
+            }
+        )
+
+    if getattr(args, "format", "json") == "tsv":
+        print(
+            "\t".join(
+                [
+                    str(payload["oldest_task_id"]),
+                    str(payload["oldest_age_seconds"]),
+                    str(payload["queued_count"]),
+                    str(payload["oldest_title"]),
+                    str(payload["oldest_family"]),
+                    str(payload["oldest_agent"]),
+                ]
+            )
+        )
+    else:
+        print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
 def dispatch_task_family(row: sqlite3.Row) -> str:
     body_path = str(row["body_path"] or "").strip()
     if body_path and os.path.isfile(body_path):
@@ -3215,6 +3275,11 @@ def build_parser() -> argparse.ArgumentParser:
     cron_ready_parser.add_argument("--status-snapshot")
     cron_ready_parser.add_argument("--memory-daily-defer-seconds", type=int, default=10800)
     cron_ready_parser.set_defaults(handler=cmd_cron_ready)
+
+    # Issue #1459 — queue-global cron-dispatch backlog snapshot.
+    cron_backlog_parser = subparsers.add_parser("cron-backlog-snapshot", allow_abbrev=False)
+    cron_backlog_parser.add_argument("--format", choices=("json", "tsv"), default="json")
+    cron_backlog_parser.set_defaults(handler=cmd_cron_backlog_snapshot)
 
     daemon_parser = subparsers.add_parser("daemon-step", allow_abbrev=False)
     daemon_parser.add_argument("--snapshot", required=True)

@@ -2658,9 +2658,102 @@ def run_native_import(args):
     return 0
 
 
+# Issue #1459 — terminal cron run states. A run in any of these is "done"
+# from the reconciler's point of view and is never re-touched.
+_CRON_RECONCILE_TERMINAL_STATES = {"cancelled", "success", "error", "timed_out"}
+
+
+def _cron_reconcile_path_present(path_str):
+    """Best-effort `exists()` for a reconcile worker-evidence path.
+
+    Controller-only helper (the reconciler runs as the controller, never
+    as an iso UID), so the raw `os.path.exists` call is whitelisted for
+    `lint-raw-pathlib-on-isolated`. Swallows any OSError so a permission
+    or race surface degrades to "no evidence" rather than aborting the
+    whole reconcile pass.
+    """
+    if not path_str:
+        return False
+    try:
+        return os.path.exists(path_str)  # noqa: raw-pathlib-controller-only
+    except OSError:
+        return False
+
+
+def _cron_reconcile_worker_evidence(request, runs_run_dir, worker_dir, dispatch_task_id):
+    """Return True when there is live/recent worker evidence for a run.
+
+    Evidence is any of: a worker pid/log file under `worker_dir`
+    (`task-<id>.pid` / `task-<id>.log`), a terminal `result.json` for the
+    run, or stdout/stderr logs the runner created. The reconciler uses
+    the ABSENCE of all of these (past the grace window) to classify a
+    queued/running run as lost rather than merely in-flight.
+    """
+    if worker_dir:
+        if _cron_reconcile_path_present(os.path.join(worker_dir, f"task-{dispatch_task_id}.pid")):
+            return True
+        if _cron_reconcile_path_present(os.path.join(worker_dir, f"task-{dispatch_task_id}.log")):
+            return True
+    result_file = str(request.get("result_file") or os.path.join(str(runs_run_dir), "result.json"))
+    if _cron_reconcile_path_present(result_file):
+        return True
+    for log_key, default_name in (("stdout_log", "stdout.log"), ("stderr_log", "stderr.log")):
+        candidate = str(request.get(log_key) or os.path.join(str(runs_run_dir), default_name))
+        if _cron_reconcile_path_present(candidate):
+            return True
+    return False
+
+
+def _cron_reconcile_age_seconds(status, request, now_dt):
+    """Best-effort age in seconds since the run's last known transition.
+
+    Prefers status.json `updated_at`, then `started_at`, then the
+    request's `created_at`. Returns None when no parseable timestamp is
+    available so the caller can fall back to "no grace evidence" handling.
+    """
+    for source in (status.get("updated_at"), status.get("started_at"), request.get("created_at")):
+        if not source:
+            continue
+        try:
+            ts_dt = datetime.fromisoformat(str(source))
+        except ValueError:
+            continue
+        if ts_dt.tzinfo is None:
+            ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (now_dt - ts_dt).total_seconds())
+    return None
+
+
+def _cron_reconcile_emit_audit(reason, run_id, task_id, queue_status, state_before, state_after, status_file, result_file):
+    """Emit a `cron_dispatch_reconcile` audit row (best-effort).
+
+    Distinct from the human-unclaimed/nudge taxonomy by design (#1459):
+    split-brain run/queue repairs are NEVER reported as
+    `task_unclaimed_escalated` or `session_nudge_*`.
+    """
+    emit_cron_mutation_audit(
+        "cron_dispatch_reconcile",
+        str(run_id),
+        {
+            "run_id": str(run_id),
+            "task_id": task_id,
+            "queue_status": queue_status,
+            "run_state_before": state_before,
+            "run_state_after": state_after,
+            "reason": reason,
+            "status_file": str(status_file),
+            "result_file": str(result_file),
+        },
+    )
+
+
 def run_reconcile_run_state(args):
     tasks_db = Path(args.tasks_db).expanduser().resolve()
     runs_dir = Path(args.runs_dir).expanduser().resolve()
+    worker_dir = ""
+    if getattr(args, "worker_dir", None):
+        worker_dir = str(Path(args.worker_dir).expanduser())
+    grace_seconds = float(getattr(args, "grace_seconds", 0) or 0)
     repaired = []
     scanned = 0
 
@@ -2678,6 +2771,8 @@ def run_reconcile_run_state(args):
             print("repaired_runs: 0")
         return 0
 
+    now_dt = datetime.now(timezone.utc)
+
     with sqlite3.connect(tasks_db) as conn:
         conn.row_factory = sqlite3.Row
         for request_path in sorted(runs_dir.glob("*/request.json")):
@@ -2694,8 +2789,9 @@ def run_reconcile_run_state(args):
                 continue
 
             row = conn.execute("SELECT status FROM tasks WHERE id = ?", (dispatch_task_id,)).fetchone()
-            if row is None or row["status"] != "cancelled":
+            if row is None:
                 continue
+            queue_status = str(row["status"] or "")
 
             status_path = Path(str(request.get("status_file") or request_path.parent / "status.json")).expanduser()
             status = {}
@@ -2705,27 +2801,167 @@ def run_reconcile_run_state(args):
                 except Exception:
                     status = {}
 
-            if str(status.get("state") or "") in {"cancelled", "success", "error"}:
+            run_state = str(status.get("state") or "")
+            run_id = str(request.get("run_id") or request_path.parent.name)
+            engine = str(status.get("engine") or request.get("target_engine") or "")
+            request_file = str(status.get("request_file") or request.get("request_file") or request_path)
+            result_file = str(status.get("result_file") or request.get("result_file") or request_path.parent / "result.json")
+
+            # ----- Existing case: queue cancelled, run non-terminal -----
+            if queue_status == "cancelled":
+                if run_state in _CRON_RECONCILE_TERMINAL_STATES:
+                    continue
+                payload = {
+                    "run_id": run_id,
+                    "state": "cancelled",
+                    "engine": engine,
+                    "updated_at": now_dt.astimezone().isoformat(timespec="seconds"),
+                    "request_file": request_file,
+                    "result_file": result_file,
+                    "error": "cancelled via queue reconciliation",
+                }
+                status_path.parent.mkdir(parents=True, exist_ok=True)
+                status_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+                repaired.append(
+                    {
+                        "run_id": run_id,
+                        "task_id": dispatch_task_id,
+                        "queue_status": queue_status,
+                        "run_state_before": run_state,
+                        "run_state_after": "cancelled",
+                        "reason": "queue_cancelled_run_nonterminal",
+                        "status_file": str(status_path),
+                    }
+                )
                 continue
 
-            payload = {
-                "run_id": str(request.get("run_id") or request_path.parent.name),
-                "state": "cancelled",
-                "engine": str(status.get("engine") or request.get("target_engine") or ""),
-                "updated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-                "request_file": str(status.get("request_file") or request.get("request_file") or request_path),
-                "result_file": str(status.get("result_file") or request.get("result_file") or request_path.parent / "result.json"),
-                "error": "cancelled via queue reconciliation",
-            }
-            status_path.parent.mkdir(parents=True, exist_ok=True)
-            status_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
-            repaired.append(
-                {
-                    "run_id": payload["run_id"],
-                    "task_id": dispatch_task_id,
-                    "status_file": str(status_path),
+            # The split-brain cases below only apply while the run status
+            # is still non-terminal — a finished run is authoritative.
+            if run_state in _CRON_RECONCILE_TERMINAL_STATES:
+                continue
+
+            # ----- Case (a): queue done, run queued/running -----
+            # #991-style interactive/foreign close. The inbox row was
+            # claimed/done OUTSIDE the cron worker, so the run artifact is
+            # stranded non-terminal. Mark it `orphaned_interactive_done`
+            # and DO NOT re-dispatch a terminal queue row.
+            if queue_status == "done" and run_state in {"queued", "running"}:
+                payload = {
+                    "run_id": run_id,
+                    "state": "orphaned_interactive_done",
+                    "engine": engine,
+                    "updated_at": now_dt.astimezone().isoformat(timespec="seconds"),
+                    "request_file": request_file,
+                    "result_file": result_file,
+                    "error": "queue task reached done outside the cron worker (run left non-terminal)",
                 }
+                status_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only
+                status_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+                _cron_reconcile_emit_audit(
+                    "queue_done_run_nonterminal",
+                    run_id,
+                    dispatch_task_id,
+                    queue_status,
+                    run_state,
+                    "orphaned_interactive_done",
+                    status_path,
+                    result_file,
+                )
+                repaired.append(
+                    {
+                        "run_id": run_id,
+                        "task_id": dispatch_task_id,
+                        "queue_status": queue_status,
+                        "run_state_before": run_state,
+                        "run_state_after": "orphaned_interactive_done",
+                        "reason": "queue_done_run_nonterminal",
+                        "status_file": str(status_path),
+                    }
+                )
+                continue
+
+            age_seconds = _cron_reconcile_age_seconds(status, request, now_dt)
+            past_grace = grace_seconds <= 0 or (age_seconds is not None and age_seconds >= grace_seconds)
+            has_worker_evidence = _cron_reconcile_worker_evidence(
+                request, request_path.parent, worker_dir, dispatch_task_id
             )
+
+            # ----- Case (b): queue queued, run queued, no worker, past grace -----
+            # Submitted-but-lost before any worker claimed it. The daemon
+            # backlog sweep owns the actual worker-start (bash side); the
+            # reconciler only REPORTS `queued_dispatch_lost` so the row is
+            # visible if recovery did not happen by the follow-up tick.
+            # The auto-recovery audit (`cron_dispatch_auto_recovered`) is
+            # emitted by the backlog sweep, NOT here.
+            if queue_status == "queued" and run_state == "queued":
+                if has_worker_evidence or not past_grace:
+                    continue
+                _cron_reconcile_emit_audit(
+                    "queued_dispatch_lost",
+                    run_id,
+                    dispatch_task_id,
+                    queue_status,
+                    run_state,
+                    "queued_dispatch_lost",
+                    status_path,
+                    result_file,
+                )
+                repaired.append(
+                    {
+                        "run_id": run_id,
+                        "task_id": dispatch_task_id,
+                        "queue_status": queue_status,
+                        "run_state_before": run_state,
+                        "run_state_after": "queued_dispatch_lost",
+                        "reason": "queued_dispatch_lost",
+                        "status_file": str(status_path),
+                        "age_seconds": age_seconds,
+                    }
+                )
+                continue
+
+            # ----- Case (c): queue claimed, run running, stale worker -----
+            # A lost running worker: the row is claimed and the run says
+            # `running`, but there is no live pid/log/result and the lease
+            # window elapsed. Mark `orphaned_worker_lost` so the operator
+            # surface shows it and the lease can be reclaimed.
+            if queue_status == "claimed" and run_state == "running":
+                if has_worker_evidence or not past_grace:
+                    continue
+                payload = {
+                    "run_id": run_id,
+                    "state": "orphaned_worker_lost",
+                    "engine": engine,
+                    "updated_at": now_dt.astimezone().isoformat(timespec="seconds"),
+                    "request_file": request_file,
+                    "result_file": result_file,
+                    "error": "running cron worker is lost (no live pid/log/result past grace)",
+                }
+                status_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only
+                status_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+                _cron_reconcile_emit_audit(
+                    "running_worker_stale",
+                    run_id,
+                    dispatch_task_id,
+                    queue_status,
+                    run_state,
+                    "orphaned_worker_lost",
+                    status_path,
+                    result_file,
+                )
+                repaired.append(
+                    {
+                        "run_id": run_id,
+                        "task_id": dispatch_task_id,
+                        "queue_status": queue_status,
+                        "run_state_before": run_state,
+                        "run_state_after": "orphaned_worker_lost",
+                        "reason": "running_worker_stale",
+                        "status_file": str(status_path),
+                        "age_seconds": age_seconds,
+                    }
+                )
+                continue
 
     payload = {
         "status": "ok",
@@ -3127,6 +3363,14 @@ def build_parser():
     reconcile_parser = subparsers.add_parser("reconcile-run-state", help="Repair cron run state from queue state.")
     reconcile_parser.add_argument("--tasks-db", required=True)
     reconcile_parser.add_argument("--runs-dir", required=True)
+    # Issue #1459 — optional worker-evidence + grace inputs for the
+    # split-brain cases (b/c). Omitting them keeps the legacy
+    # queue-cancelled-only behavior intact (no worker dir → no evidence
+    # lookup; grace 0 → past-grace always true, but those cases still
+    # gate on no-worker-evidence so a live in-flight run is never touched
+    # without --grace-seconds set).
+    reconcile_parser.add_argument("--worker-dir", default=None)
+    reconcile_parser.add_argument("--grace-seconds", type=float, default=0)
     reconcile_parser.add_argument("--json", action="store_true")
     return parser
 

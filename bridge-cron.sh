@@ -1537,9 +1537,17 @@ run_sync() {
   trap 'rm -rf "$tmp_dir"' RETURN
 
   if [[ $dry_run -eq 0 ]]; then
+    # Issue #1459 — thread worker-evidence dir + grace so the reconciler
+    # can classify the split-brain cases (queue-done/run-queued,
+    # queued-dispatch-lost, running-worker-stale) without false-positiving
+    # a live in-flight run. The grace defaults to the dispatch lease so a
+    # run is only declared lost well after a real worker would have
+    # produced a pid/log/result.
     if ! bridge_cron_python reconcile-run-state \
       --tasks-db "$BRIDGE_TASK_DB" \
       --runs-dir "$BRIDGE_CRON_STATE_DIR/runs" \
+      --worker-dir "${BRIDGE_CRON_DISPATCH_WORKER_DIR:-$BRIDGE_CRON_STATE_DIR/workers}" \
+      --grace-seconds "${BRIDGE_CRON_RECONCILE_GRACE_SECONDS:-${BRIDGE_CRON_DISPATCH_LEASE_SECONDS:-7200}}" \
       --json >"$tmp_dir/reconcile.json"; then
       status=1
     fi
