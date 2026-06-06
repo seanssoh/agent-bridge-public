@@ -100,6 +100,18 @@ DEFAULT_TIMESTAMP_SKEW_GRACE_SECONDS = 3600
 # Sender outbox caps — fail new sends locally instead of growing unbounded.
 DEFAULT_OUTBOX_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 DEFAULT_OUTBOX_MAX_PENDING_PER_PEER = 500
+DEFAULT_INBOX_DEDUPE_GC_MAX_AGE_SECONDS = 86400 * 60
+DEFAULT_INBOX_DEDUPE_MAX_ROWS_PER_PEER = 10000
+
+# Sender outbox retry timing caps. The exponential backoff ceiling bounds our
+# own recovery dormancy; Retry-After uses a separate cap so peer backpressure can
+# remain a hard floor without letting an untrusted HTTP response sleep us
+# indefinitely.
+DEFAULT_DELIVERY_BACKOFF_CEILING_SECONDS = 120
+MIN_DELIVERY_BACKOFF_CEILING_SECONDS = 15
+DEFAULT_DELIVERY_MAX_RETRY_AFTER_SECONDS = 600
+MIN_DELIVERY_MAX_RETRY_AFTER_SECONDS = 1
+DEFAULT_DELIVERY_TRUSTED_RETRY_AFTER_SANITY_CAP_SECONDS = 3600
 
 VALID_PRIORITIES = ("low", "normal", "high", "urgent")
 TERMINAL_OUTBOX_STATUSES = ("acked", "dead")
@@ -229,6 +241,8 @@ def load_config(path: Optional[Path] = None) -> dict[str, Any]:
     cfg.setdefault("bridge_id", "")
     cfg.setdefault("listen", {})
     cfg.setdefault("peers", [])
+    cfg.setdefault("delivery_max_retry_after_seconds",
+                   DEFAULT_DELIVERY_MAX_RETRY_AFTER_SECONDS)
     if not isinstance(cfg["peers"], list):
         raise A2AError("A2A config 'peers' must be a list", code="config_shape")
     return cfg
@@ -1307,6 +1321,61 @@ def open_inbox() -> sqlite3.Connection:
     return conn
 
 
+def prune_inbox_dedupe(
+    conn: sqlite3.Connection,
+    *,
+    max_age: int = DEFAULT_INBOX_DEDUPE_GC_MAX_AGE_SECONDS,
+    max_rows_per_peer: int = DEFAULT_INBOX_DEDUPE_MAX_ROWS_PER_PEER,
+) -> tuple[int, int]:
+    """Prune receiver dedupe rows by age and per-peer total-row ceiling.
+
+    Age-based pruning already existed as a manual CLI path. The per-peer cap is
+    deliberately independent of max_open_tasks so NULL control/pending rows and
+    hash-conflict delivery_count bumps cannot grow forever on an authenticated
+    peer that stays below the open-task quota.
+    """
+    now = now_ts()
+    age_removed = 0
+    cap_removed = 0
+    if max_age > 0:
+        cur = conn.execute(
+            "DELETE FROM inbox_dedupe WHERE last_seen_ts < ?",
+            (now - max_age,),
+        )
+        age_removed = int(cur.rowcount or 0)
+
+    if max_rows_per_peer > 0:
+        rows = conn.execute(
+            """
+            SELECT peer, COUNT(*) AS n
+              FROM inbox_dedupe
+             GROUP BY peer
+            HAVING n > ?
+            """,
+            (max_rows_per_peer,),
+        ).fetchall()
+        for row in rows:
+            excess = int(row["n"] or 0) - max_rows_per_peer
+            if excess <= 0:
+                continue
+            cur = conn.execute(
+                """
+                DELETE FROM inbox_dedupe
+                 WHERE rowid IN (
+                       SELECT rowid
+                         FROM inbox_dedupe
+                        WHERE peer = ?
+                        ORDER BY last_seen_ts ASC, first_seen_ts ASC, message_id ASC
+                        LIMIT ?
+                 )
+                """,
+                (row["peer"], excess),
+            )
+            cap_removed += int(cur.rowcount or 0)
+    conn.commit()
+    return age_removed, cap_removed
+
+
 def outbox_total_bytes(conn: sqlite3.Connection) -> int:
     row = conn.execute(
         "SELECT COALESCE(SUM(body_bytes), 0) AS total FROM outbox "
@@ -1358,7 +1427,39 @@ def outbox_insert(
     conn.commit()
 
 
-def backoff_seconds(attempts: int, base: int = 15, ceiling: int = 3600) -> int:
+def backoff_seconds(attempts: int, base: int = 15,
+                    ceiling: int = DEFAULT_DELIVERY_BACKOFF_CEILING_SECONDS) -> int:
     """Exponential backoff with a ceiling; jitter is added by the caller."""
     delay = base * (2 ** max(0, attempts - 1))
     return min(delay, ceiling)
+
+
+def _int_with_floor(raw: Any, default: int, floor: int) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(floor, value)
+
+
+def delivery_backoff_ceiling(cfg: dict[str, Any]) -> int:
+    """Resolve the exponential outbox retry backoff ceiling in seconds."""
+    raw: Any = os.environ.get("BRIDGE_A2A_BACKOFF_CEILING_SECONDS")
+    if raw is None or str(raw).strip() == "":
+        raw = cfg.get("delivery_backoff_ceiling_seconds",
+                      DEFAULT_DELIVERY_BACKOFF_CEILING_SECONDS)
+    return _int_with_floor(
+        raw,
+        DEFAULT_DELIVERY_BACKOFF_CEILING_SECONDS,
+        MIN_DELIVERY_BACKOFF_CEILING_SECONDS,
+    )
+
+
+def delivery_max_retry_after_seconds(cfg: dict[str, Any]) -> int:
+    """Resolve the untrusted peer Retry-After floor cap in seconds."""
+    return _int_with_floor(
+        cfg.get("delivery_max_retry_after_seconds",
+                DEFAULT_DELIVERY_MAX_RETRY_AFTER_SECONDS),
+        DEFAULT_DELIVERY_MAX_RETRY_AFTER_SECONDS,
+        MIN_DELIVERY_MAX_RETRY_AFTER_SECONDS,
+    )

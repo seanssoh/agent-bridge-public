@@ -362,7 +362,15 @@ SQLite `$BRIDGE_STATE_DIR/handoff/outbox.db`. The outbox entry is written
 runner loops from double-sending.
 
 - Retry only on timeout / connection-refused / `429` / `5xx`; honor
-  `Retry-After`; exponential backoff with jitter + ceiling.
+  `Retry-After`; exponential backoff (`base=15` + full jitter) with a
+  **configurable ceiling** — `delivery_backoff_ceiling_seconds` (default
+  **120s**, env override `BRIDGE_A2A_BACKOFF_CEILING_SECONDS`, floored at the
+  15s base step). The default was lowered from 3600s in #1575 Part B so a
+  recovered peer's high-attempt rows resume within ~1–2 min instead of idling
+  16–60 min. A peer's `Retry-After` is **clamped to the ceiling** (the header
+  is not part of the HMAC-authenticated envelope, so a transient/spoofed `503`
+  cannot re-impose a multi-minute backoff) unless
+  `delivery_trust_peer_retry_after` is set to `true`.
 - Permanent-fail on `400/401/403/404/409/413/422` → dead-letter.
 - **Crashed-runner reclaim**: a row left in `status='sending'` with an
   expired lease (the runner that claimed it died mid-attempt) is demoted
@@ -391,13 +399,12 @@ defects were fixed:
   `tx 0 / rx > 0` asymmetry), or `transport_dead_path_unknown` (inconclusive).
   The classification is surfaced in the daemon's stuck-alert body.
 
-- **Backoff recovery reset.** `backoff_seconds(base=15, ceiling=3600)` + jitter
-  means an attempt-8..10 retry row waits 16–60 min, and the `deliver` tick only
-  selects `next_attempt_ts <= now` rows — so after the peer *recovered*, the
-  high-attempt rows stayed dormant for tens of minutes (the incident needed a
-  manual `agb a2a outbox retry`). `diagnose-stuck` now, when a backoff-waiting
-  peer's **TCP probe succeeds**, resets that peer's `retry` rows to
-  `next_attempt_ts=0` so the next deliver tick sends immediately. The reset is
+- **Backoff recovery reset.** Sender retry backoff now defaults to
+  `backoff_seconds(base=15, ceiling=120)` + jitter, so high-attempt retry rows
+  no longer wait 16-60 min after the peer recovers. The `deliver` tick still
+  selects only `next_attempt_ts <= now` rows, so `diagnose-stuck`, when a
+  backoff-waiting peer's **TCP probe succeeds**, resets that peer's `retry` rows
+  to `next_attempt_ts=0` so the next deliver tick sends immediately. The reset is
   **probe-gated and transition-gated**: a peer whose probe still *fails* is left
   on its backoff (its max-attempts / dead-letter behavior is untouched — an
   unreachable peer is never thrashed), and a peer that stays reachable is reset

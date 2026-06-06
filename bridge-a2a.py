@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import signal
@@ -56,6 +57,31 @@ def info(msg: str) -> None:
 def die(msg: str, code: int = 1) -> "Optional[int]":
     err(msg)
     return code
+
+
+def _unlink_outbox_body_path(body_path: "str | Path | None") -> bool:
+    """Best-effort removal for sender-side outgoing envelope files.
+
+    The path comes from the durable outbox DB. Refuse to unlink anything outside
+    the managed outgoing/ staging directory so a corrupt row cannot become an
+    arbitrary-file delete primitive.
+    """
+    if not body_path:
+        return False
+    try:
+        path = Path(str(body_path)).expanduser()
+        outgoing_root = a2a.outgoing_dir().expanduser().resolve()
+        resolved = path.resolve(strict=False)
+        resolved.relative_to(outgoing_root)
+    except (OSError, ValueError):
+        return False
+    try:
+        if not path.is_file():
+            return False
+        path.unlink()  # noqa: raw-pathlib-controller-only
+        return True
+    except OSError:
+        return False
 
 
 def _audit_body_file_sudo_fallback(
@@ -464,22 +490,35 @@ def cmd_outbox(args: argparse.Namespace) -> int:
         if action == "drop":
             if not args.message_id:
                 return die("outbox drop needs <message_id>") or 1
+            row = conn.execute(
+                "SELECT body_path FROM outbox WHERE message_id=?",
+                (args.message_id,),
+            ).fetchone()
             cur = conn.execute("DELETE FROM outbox WHERE message_id=?", (args.message_id,))
             conn.commit()
             if cur.rowcount == 0:
                 return die(f"no outbox entry: {args.message_id}") or 1
+            if row is not None:
+                _unlink_outbox_body_path(row["body_path"])
             print(f"dropped {args.message_id}")
             return 0
 
         if action == "gc":
             max_age = int(args.max_age or 86400 * 14)
             cutoff = a2a.now_ts() - max_age
+            rows = conn.execute(
+                "SELECT body_path FROM outbox WHERE status IN ('acked', 'dead') "
+                "AND updated_ts < ?",
+                (cutoff,),
+            ).fetchall()
             cur = conn.execute(
                 "DELETE FROM outbox WHERE status IN ('acked', 'dead') "
                 "AND updated_ts < ?",
                 (cutoff,),
             )
             conn.commit()
+            for row in rows:
+                _unlink_outbox_body_path(row["body_path"])
             print(f"gc removed {cur.rowcount} terminal outbox rows older than {max_age}s")
             return 0
     finally:
@@ -512,13 +551,19 @@ def cmd_inbox_dedupe(args: argparse.Namespace) -> int:
             return 0
         if args.action == "gc":
             # Dedupe retention deliberately exceeds sender retry retention.
-            max_age = int(args.max_age or 86400 * 60)
-            cutoff = a2a.now_ts() - max_age
-            cur = conn.execute(
-                "DELETE FROM inbox_dedupe WHERE last_seen_ts < ?", (cutoff,)
+            max_age = int(args.max_age or a2a.DEFAULT_INBOX_DEDUPE_GC_MAX_AGE_SECONDS)
+            max_rows = int(
+                args.max_rows_per_peer
+                or a2a.DEFAULT_INBOX_DEDUPE_MAX_ROWS_PER_PEER
             )
-            conn.commit()
-            print(f"gc removed {cur.rowcount} dedupe rows older than {max_age}s")
+            age_removed, cap_removed = a2a.prune_inbox_dedupe(
+                conn, max_age=max_age, max_rows_per_peer=max_rows)
+            total = age_removed + cap_removed
+            print(
+                f"gc removed {total} dedupe rows "
+                f"(age={age_removed}, per_peer_cap={cap_removed}, "
+                f"max_age={max_age}s, max_rows_per_peer={max_rows})"
+            )
             return 0
     finally:
         conn.close()
@@ -622,7 +667,7 @@ def _post_envelope(
     secret: str,
     envelope_bytes: bytes,
     timeout: float,
-) -> tuple[int, dict[str, str], bytes]:
+) -> tuple[int, Any, bytes]:
     """Sign and POST a single attempt. Returns (status, headers, body).
 
     `X-AGB-Peer` (and the peer-id field of the canonical signing string)
@@ -648,9 +693,9 @@ def _post_envelope(
     req.add_header("X-AGB-Signature", signature)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, dict(resp.headers), resp.read()
+            return resp.status, resp.headers, resp.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers or {}), exc.read() or b""
+        return exc.code, exc.headers or {}, exc.read() or b""
 
 
 def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
@@ -744,6 +789,7 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
             (attempts, remote_task, a2a.now_ts(), message_id),
         )
         conn.commit()
+        _unlink_outbox_body_path(body_path)
         return f"acked(task={remote_task or '?'})"
 
     detail = ""
@@ -766,6 +812,10 @@ def _schedule_retry(conn, message_id: str, attempts: int, cfg: dict[str, Any],
                     last_error: str, retry_after: Optional[str] = None) -> str:
     max_attempts = int(cfg.get("delivery_max_attempts", 12))
     if attempts >= max_attempts:
+        row = conn.execute(
+            "SELECT body_path FROM outbox WHERE message_id=?",
+            (message_id,),
+        ).fetchone()
         conn.execute(
             "UPDATE outbox SET status='dead', attempts=?, last_error=?, updated_ts=? "
             "WHERE message_id=?",
@@ -773,16 +823,37 @@ def _schedule_retry(conn, message_id: str, attempts: int, cfg: dict[str, Any],
              a2a.now_ts(), message_id),
         )
         conn.commit()
+        if row is not None:
+            _unlink_outbox_body_path(row["body_path"])
         return "dead(maxattempts)"
 
-    delay = a2a.backoff_seconds(attempts)
+    ceiling = a2a.delivery_backoff_ceiling(cfg)
+    retry_after_floor = 0
     if retry_after:
         try:
-            delay = max(delay, int(float(retry_after)))
-        except (TypeError, ValueError):
-            pass
-    # Full jitter.
-    delay = int(delay * (0.5 + random.random() * 0.5))
+            retry_after_value = float(retry_after)
+            parsed_retry_after = (
+                max(0, math.ceil(retry_after_value))
+                if math.isfinite(retry_after_value) else 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            parsed_retry_after = 0
+        if parsed_retry_after > 0:
+            if cfg.get("delivery_trust_peer_retry_after", False) is True:
+                retry_after_floor = min(
+                    parsed_retry_after,
+                    a2a.DEFAULT_DELIVERY_TRUSTED_RETRY_AFTER_SANITY_CAP_SECONDS,
+                )
+            else:
+                retry_after_floor = min(
+                    parsed_retry_after,
+                    a2a.delivery_max_retry_after_seconds(cfg),
+                )
+    # Full jitter applies only to our exponential backoff component; an explicit
+    # receiver Retry-After remains a hard floor.
+    delay = int(a2a.backoff_seconds(attempts, ceiling=ceiling) *
+                (0.5 + random.random() * 0.5))
+    delay = max(delay, retry_after_floor)
     next_ts = a2a.now_ts() + max(1, delay)
     conn.execute(
         "UPDATE outbox SET status='retry', attempts=?, next_attempt_ts=?, "
@@ -795,12 +866,18 @@ def _schedule_retry(conn, message_id: str, attempts: int, cfg: dict[str, Any],
 
 
 def _mark_dead(conn, message_id: str, reason: str) -> None:
+    row = conn.execute(
+        "SELECT body_path FROM outbox WHERE message_id=?",
+        (message_id,),
+    ).fetchone()
     conn.execute(
         "UPDATE outbox SET status='dead', last_error=?, "
         "lease_owner=NULL, lease_expires_ts=0, updated_ts=? WHERE message_id=?",
         (reason[:500], a2a.now_ts(), message_id),
     )
     conn.commit()
+    if row is not None:
+        _unlink_outbox_body_path(row["body_path"])
 
 
 def cmd_deliver(args: argparse.Namespace) -> int:
@@ -894,13 +971,12 @@ def cmd_deliver(args: argparse.Namespace) -> int:
 #      connect (the `peers test` mechanic), and `tailscale status` node
 #      online + tx/rx asymmetry.
 #
-#   2. RECOVERY — `backoff_seconds(base=15, ceiling=3600)` + jitter means an
-#      attempt-8..10 retry row waits 16-60 min. The deliver tick only selects
-#      `next_attempt_ts <= now` rows, so after the peer RECOVERED the high-
-#      attempt rows stayed dormant for tens of minutes (the incident needed a
-#      manual `agb a2a outbox retry`). Here, when a retry row's peer TCP probe
-#      SUCCEEDS, we reset that peer's retry rows to `next_attempt_ts=0` so the
-#      next deliver tick sends immediately (bounded by `deliver --batch`).
+#   2. RECOVERY — the retry backoff ceiling is now 120s by default (was 3600)
+#      so high-attempt rows no longer idle for 16-60 min after a peer recovers.
+#      The deliver tick only selects `next_attempt_ts <= now` rows, so this
+#      still resets a peer's retry rows to `next_attempt_ts=0` when the peer TCP
+#      probe SUCCEEDS, letting the next deliver tick send immediately (bounded
+#      by `deliver --batch`).
 #
 # HEALTH ORACLE: TCP `peer:port` — never `tailscale ping` (a disco-protocol
 # artifact that times out on a healthy A2A path; see the #10114 root-cause
@@ -1438,7 +1514,7 @@ def _post_identity_update(
     secret: str,
     body_bytes: bytes,
     timeout: float,
-) -> "tuple[int, dict[str, str], bytes]":
+) -> tuple[int, Any, bytes]:
     """Sign + POST one peer-identity-update attempt. Mirrors `_post_envelope`:
     `X-AGB-Peer` + the canonical-string peer field carry the SENDER's own
     bridge_id (the authenticated identity the receiver looks up). The path is
@@ -1460,9 +1536,9 @@ def _post_identity_update(
     req.add_header("X-AGB-Signature", signature)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, dict(resp.headers), resp.read()
+            return resp.status, resp.headers, resp.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers or {}), exc.read() or b""
+        return exc.code, exc.headers or {}, exc.read() or b""
 
 
 def announce_identity(
@@ -2601,6 +2677,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_dedupe.add_argument("action", choices=["list", "gc"])
     p_dedupe.add_argument("--json", action="store_true")
     p_dedupe.add_argument("--max-age", type=int, default=None)
+    p_dedupe.add_argument("--max-rows-per-peer", type=int, default=None,
+                          help="gc: keep at most this many dedupe rows per peer")
     p_dedupe.set_defaults(func=cmd_inbox_dedupe)
 
     p_peers = sub.add_parser("peers", help="inspect configured peers")

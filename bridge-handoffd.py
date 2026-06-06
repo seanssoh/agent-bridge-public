@@ -28,10 +28,14 @@ import ipaddress
 import json
 import os
 import signal
+import socket
+import socketserver
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,6 +67,12 @@ ABSOLUTE_MAX_REQUEST_BYTES = 4 * 1024 * 1024
 # (a SIGHUP-triggered reconcile still works). Default 45s — the middle of
 # the 30-60s band.
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 45
+OPEN_REMOTE_TASK_STATUSES = ("queued", "claimed", "blocked")
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
+DEFAULT_MAX_CONCURRENT_REQUESTS = 64
+DEFAULT_PENDING_RETRY_SECONDS = 180
+DEFAULT_MAINTENANCE_INTERVAL_SECONDS = 3600
+DEFAULT_INCOMING_REAP_AGE_SECONDS = 86400
 
 
 def _reconcile_interval() -> int:
@@ -75,6 +85,33 @@ def _reconcile_interval() -> int:
     except (TypeError, ValueError):
         return DEFAULT_RECONCILE_INTERVAL_SECONDS
     return max(0, val)
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return default
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
+
+
+def pending_retry_seconds() -> int:
+    return _positive_int_env(
+        "BRIDGE_A2A_PENDING_RETRY_SECONDS", DEFAULT_PENDING_RETRY_SECONDS)
 
 
 def log(msg: str) -> None:
@@ -94,6 +131,325 @@ def audit(event: str, **fields: Any) -> None:
     except OSError:
         pass
     log(f"{event} " + " ".join(f"{k}={v}" for k, v in fields.items()))
+
+
+def task_db_path() -> Path:
+    override = os.environ.get("BRIDGE_TASK_DB")
+    if override:
+        return Path(override)
+    return a2a.state_dir() / "tasks.db"
+
+
+def queue_bodies_dir() -> Path:
+    return a2a.state_dir() / "queue" / "bodies"
+
+
+def canonical_path_text(path: Path | str) -> str:
+    return str(Path(path).expanduser().resolve(strict=False))
+
+
+def count_open_remote_tasks(inbox_conn: sqlite3.Connection, peer_id: str) -> int:
+    """Count open local queue tasks plus fresh A2A enqueue reservations.
+
+    `inbox_dedupe` is an append-style replay ledger in handoff/inbox.db; it is
+    not a live task table. Backpressure must count only dedupe rows whose
+    created task still exists in tasks.db and is open. Done/cancelled/deleted
+    tasks do not consume capacity. Fresh NULL `created_task_id` rows are counted
+    as reservations so concurrent requests cannot all observe the same headroom
+    while their bridge-task subprocesses are still creating queue rows.
+    """
+    pending_cutoff = a2a.now_ts() - pending_retry_seconds()
+    pending_row = inbox_conn.execute(
+        """
+        SELECT COUNT(*) AS n
+          FROM inbox_dedupe
+         WHERE peer = ?
+           AND created_task_id IS NULL
+           AND last_seen_ts >= ?
+        """,
+        (peer_id, pending_cutoff),
+    ).fetchone()
+    pending_count = int(pending_row["n"] if pending_row is not None else 0)
+
+    task_ids: set[int] = set()
+    for row in inbox_conn.execute(
+        """
+        SELECT DISTINCT created_task_id
+          FROM inbox_dedupe
+         WHERE peer = ?
+           AND created_task_id IS NOT NULL
+        """,
+        (peer_id,),
+    ):
+        raw_task_id = str(row["created_task_id"] or "")
+        try:
+            task_ids.add(int(raw_task_id))
+        except ValueError:
+            continue
+    if not task_ids:
+        return pending_count
+
+    queue_db = task_db_path()
+    if not queue_db.exists():
+        return pending_count
+
+    queue_uri = "file:" + urllib.parse.quote(
+        canonical_path_text(queue_db), safe="/:"
+    ) + "?mode=ro"
+    conn = sqlite3.connect(queue_uri, uri=True)
+    try:
+        open_count = 0
+        task_id_list = sorted(task_ids)
+        for start in range(0, len(task_id_list), 800):
+            chunk = task_id_list[start:start + 800]
+            id_placeholders = ",".join("?" for _ in chunk)
+            status_placeholders = ",".join(
+                "?" for _ in OPEN_REMOTE_TASK_STATUSES)
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS n
+                  FROM tasks
+                 WHERE id IN ({id_placeholders})
+                   AND status IN ({status_placeholders})
+                """,
+                (*chunk, *OPEN_REMOTE_TASK_STATUSES),
+            ).fetchone()
+            open_count += int(row[0] if row is not None else 0)
+        return open_count + pending_count
+    except sqlite3.OperationalError as exc:
+        if "no such table: tasks" in str(exc).lower():
+            return pending_count
+        raise
+    finally:
+        conn.close()
+
+
+def promote_inbound_body_to_queue(staged: Path) -> Path:
+    """Copy an incoming/ staged body into durable queue/bodies storage.
+
+    bridge-queue.py treats paths under the bridge state tree as durable and will
+    not copy them itself. Passing a queue/bodies copy lets the receiver unlink
+    the transient incoming/ file without breaking large tasks whose DB body_text
+    is intentionally not inlined.
+    """
+    bodies = queue_bodies_dir()
+    bodies.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only
+    prefix = f"{a2a.now_ts()}-{os.getpid()}-a2a-{staged.stem}"
+    suffix = staged.suffix or ".md"
+    raw = staged.read_bytes()
+    for counter in range(64):
+        extra = f"-{counter}" if counter else ""
+        target = bodies / f"{prefix}{extra}{suffix}"
+        try:
+            fd = os.open(
+                str(target),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+        return target
+    raise OSError("could not create unique queue body path for inbound A2A body")
+
+
+def cleanup_incoming_staged_body(path: Optional[Path]) -> None:
+    if path is None:
+        return
+    try:
+        incoming_root = a2a.incoming_dir().expanduser().resolve()
+        resolved = path.expanduser().resolve(strict=False)
+        resolved.relative_to(incoming_root)
+    except (OSError, ValueError):
+        return
+    try:
+        path.unlink()  # noqa: raw-pathlib-controller-only
+    except OSError:
+        pass
+
+
+def cleanup_queue_body_copy_if_unreferenced(path: Optional[Path]) -> None:
+    if path is None:
+        return
+    try:
+        bodies_root = queue_bodies_dir().expanduser().resolve()
+        resolved = path.expanduser().resolve(strict=False)
+        resolved.relative_to(bodies_root)
+    except (OSError, ValueError):
+        return
+    if task_body_path_is_referenced(path):
+        return
+    try:
+        path.unlink()  # noqa: raw-pathlib-controller-only
+    except OSError:
+        pass
+
+
+def task_body_path_is_referenced(path: Path) -> bool:
+    db = task_db_path()
+    if not db.exists():
+        return False
+    wanted = canonical_path_text(path)
+    db_uri = "file:" + urllib.parse.quote(canonical_path_text(db), safe="/:") + "?mode=ro"
+    try:
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM tasks WHERE body_path=? LIMIT 1",
+                (str(path),),
+            ).fetchone()
+            if row is not None:
+                return True
+            rows = conn.execute(
+                "SELECT body_path FROM tasks WHERE body_path IS NOT NULL"
+            ).fetchall()
+            for candidate_row in rows:
+                candidate = str(candidate_row[0] or "")
+                if candidate and canonical_path_text(candidate) == wanted:
+                    return True
+            return False
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # Fail safe: if we cannot prove no task references the file, keep it.
+        return True
+
+
+def reap_unreferenced_incoming_staged_bodies(max_age: int) -> int:
+    if max_age <= 0:
+        return 0
+    incoming = a2a.incoming_dir()
+    if not incoming.is_dir():
+        return 0
+    cutoff = a2a.now_ts() - max_age
+    removed = 0
+    try:
+        entries = list(incoming.iterdir())
+    except OSError:
+        return 0
+    for path in entries:
+        try:
+            if not path.is_file():
+                continue
+            if int(path.stat().st_mtime) >= cutoff:
+                continue
+            if task_body_path_is_referenced(path):
+                continue
+            path.unlink()  # noqa: raw-pathlib-controller-only
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def recover_task_id_for_message(
+    peer_id: str,
+    message_id: str,
+    *,
+    sender_bridge: str = "",
+    first_seen_ts: int = 0,
+) -> str:
+    """Find a task already created for a pending A2A dedupe row.
+
+    If the receiver dies after `bridge-task.sh create` commits but before the
+    dedupe UPDATE stores the task id, retries see a pending row. The local task
+    body carries a deterministic provenance line, so we can recover the task id
+    instead of creating a duplicate task.
+    """
+    db = task_db_path()
+    if not db.exists():
+        return ""
+    db_uri = "file:" + urllib.parse.quote(canonical_path_text(db), safe="/:") + "?mode=ro"
+    marker = f"message id   : {message_id}"
+    peer_marker = f"remote peer  : {peer_id}"
+    created_by_prefixes = {f"a2a:{peer_id}:"}
+    if sender_bridge:
+        created_by_prefixes.add(f"a2a:{sender_bridge}:")
+    lower_bound = max(0, int(first_seen_ts or 0) - 300)
+    try:
+        conn = sqlite3.connect(db_uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            prefix_terms = " OR ".join(
+                "substr(created_by, 1, ?) = ?"
+                for _ in created_by_prefixes
+            )
+            prefix_args: list[Any] = []
+            for prefix in sorted(created_by_prefixes):
+                prefix_args.extend([len(prefix), prefix])
+            rows = conn.execute(
+                f"""
+                SELECT id, body_text, body_path
+                  FROM tasks
+                 WHERE ({prefix_terms})
+                   AND created_ts >= ?
+                 ORDER BY id DESC
+                 LIMIT 200
+                """,
+                (*prefix_args, lower_bound),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return ""
+    for row in rows:
+        body_text = row["body_text"] or ""
+        if marker in body_text and (
+            peer_marker in body_text or not sender_bridge
+            or f"remote peer  : {sender_bridge}" in body_text
+        ):
+            return str(row["id"])
+        body_path = str(row["body_path"] or "")
+        if not body_path:
+            continue
+        try:
+            with Path(body_path).open("r", encoding="utf-8", errors="replace") as fh:
+                prefix = fh.read(8192)
+                if marker in prefix and (
+                    peer_marker in prefix or not sender_bridge
+                    or f"remote peer  : {sender_bridge}" in prefix
+                ):
+                    return str(row["id"])
+        except OSError:
+            continue
+    return ""
+
+
+def run_receiver_maintenance() -> None:
+    age_removed = 0
+    cap_removed = 0
+    incoming_removed = 0
+    try:
+        conn = a2a.open_inbox()
+        try:
+            age_removed, cap_removed = a2a.prune_inbox_dedupe(
+                conn,
+                max_age=_positive_int_env(
+                    "BRIDGE_A2A_INBOX_DEDUPE_GC_MAX_AGE_SECONDS",
+                    a2a.DEFAULT_INBOX_DEDUPE_GC_MAX_AGE_SECONDS,
+                ),
+                max_rows_per_peer=_positive_int_env(
+                    "BRIDGE_A2A_INBOX_DEDUPE_MAX_ROWS_PER_PEER",
+                    a2a.DEFAULT_INBOX_DEDUPE_MAX_ROWS_PER_PEER,
+                ),
+            )
+        finally:
+            conn.close()
+    except (sqlite3.Error, a2a.A2AError, OSError) as exc:
+        audit("maintenance_inbox_dedupe_gc_fail", detail=str(exc)[:200])
+    try:
+        incoming_removed = reap_unreferenced_incoming_staged_bodies(
+            _positive_int_env(
+                "BRIDGE_A2A_INCOMING_REAP_AGE_SECONDS",
+                DEFAULT_INCOMING_REAP_AGE_SECONDS,
+            )
+        )
+    except OSError as exc:
+        audit("maintenance_incoming_reap_fail", detail=str(exc)[:200])
+    if age_removed or cap_removed or incoming_removed:
+        audit("maintenance_pruned", inbox_age=age_removed,
+              inbox_cap=cap_removed, incoming=incoming_removed)
 
 
 # --------------------------------------------------------------------------
@@ -872,6 +1228,7 @@ def stage_inbound_body(peer_id: str, message_id: str, text: str) -> Path:
 class HandoffServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    timeout = DEFAULT_REQUEST_TIMEOUT_SECONDS
 
     def __init__(self, addr, handler, cfg: dict[str, Any]) -> None:
         super().__init__(addr, handler)
@@ -892,6 +1249,77 @@ class HandoffServer(ThreadingHTTPServer):
         # rewrites (None = the default resolution). Set by cmd_serve so the
         # control-message handler mutates the SAME file the daemon loaded.
         self.config_path: Optional[Path] = None
+        listen_obj = cfg.get("listen", {})
+        listen_cfg = listen_obj if isinstance(listen_obj, dict) else {}
+        try:
+            self.request_timeout_seconds = float(listen_cfg.get(
+                "request_timeout_seconds",
+                _positive_float_env(
+                    "BRIDGE_A2A_REQUEST_TIMEOUT_SECONDS",
+                    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+                ),
+            ))
+        except (TypeError, ValueError):
+            self.request_timeout_seconds = DEFAULT_REQUEST_TIMEOUT_SECONDS
+        try:
+            self.max_concurrent_requests = int(listen_cfg.get(
+                "max_concurrent_requests",
+                _positive_int_env(
+                    "BRIDGE_A2A_MAX_CONCURRENT_REQUESTS",
+                    DEFAULT_MAX_CONCURRENT_REQUESTS,
+                ),
+            ))
+        except (TypeError, ValueError):
+            self.max_concurrent_requests = DEFAULT_MAX_CONCURRENT_REQUESTS
+        if self.max_concurrent_requests <= 0:
+            self.max_concurrent_requests = DEFAULT_MAX_CONCURRENT_REQUESTS
+        self._request_semaphore = threading.BoundedSemaphore(
+            self.max_concurrent_requests)
+
+    def get_request(self):  # noqa: ANN201 - socketserver API
+        request, client_address = super().get_request()
+        try:
+            request.settimeout(self.request_timeout_seconds)
+        except OSError:
+            pass
+        return request, client_address
+
+    def process_request(self, request, client_address) -> None:  # noqa: ANN001
+        if not self._request_semaphore.acquire(blocking=False):
+            audit("reject_concurrency", client=client_address[0],
+                  limit=self.max_concurrent_requests, security=True)
+            try:
+                body = b'{"ok": false, "error": "receiver busy"}'
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Connection: close\r\n"
+                    b"Retry-After: 5\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                    + body
+                )
+            except OSError:
+                pass
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._request_semaphore.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:  # noqa: ANN001
+        try:
+            try:
+                request.settimeout(self.request_timeout_seconds)
+            except OSError:
+                pass
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_semaphore.release()
 
     def swap_cfg(self, new_cfg: dict[str, Any]) -> None:
         """Publish an ALREADY-VALIDATED config to the request handlers.
@@ -905,6 +1333,76 @@ class HandoffServer(ThreadingHTTPServer):
             self.cfg = new_cfg
 
 
+class RequestDeadlineReader:
+    """Socket reader that enforces one absolute request deadline.
+
+    socket.settimeout() alone is per recv, so a peer can trickle headers forever
+    by sending one byte before each timeout. BaseHTTPRequestHandler reads the
+    request line and headers from `self.rfile` before do_POST/auth runs; this
+    reader makes those pre-auth reads consume the same fixed deadline.
+    """
+
+    def __init__(self, sock: socket.socket, deadline: float) -> None:
+        self.sock = sock
+        self.deadline = deadline
+        self.buffer = bytearray()
+        self.closed = False
+
+    def _recv(self, max_bytes: int) -> bytes:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("A2A request deadline exceeded")
+        self.sock.settimeout(remaining)
+        return self.sock.recv(max(1, max_bytes))
+
+    def readline(self, limit: int = -1) -> bytes:
+        while True:
+            newline = self.buffer.find(b"\n")
+            if newline >= 0:
+                end = newline + 1
+                if limit >= 0:
+                    end = min(end, limit)
+                out = bytes(self.buffer[:end])
+                del self.buffer[:end]
+                return out
+            if limit >= 0 and len(self.buffer) >= limit:
+                out = bytes(self.buffer[:limit])
+                del self.buffer[:limit]
+                return out
+            read_budget = 4096
+            if limit >= 0:
+                read_budget = max(1, min(read_budget, limit - len(self.buffer)))
+            chunk = self._recv(read_budget)
+            if not chunk:
+                out = bytes(self.buffer)
+                self.buffer.clear()
+                return out
+            self.buffer.extend(chunk)
+
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+        if size < 0:
+            chunks = [bytes(self.buffer)]
+            self.buffer.clear()
+            while True:
+                chunk = self._recv(8192)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+        while len(self.buffer) < size:
+            chunk = self._recv(min(8192, size - len(self.buffer)))
+            if not chunk:
+                break
+            self.buffer.extend(chunk)
+        out = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return out
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class HandoffHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "AgentBridgeHandoffd/1"
@@ -913,12 +1411,52 @@ class HandoffHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         return
 
+    def setup(self) -> None:
+        self.connection = self.request
+        timeout = getattr(
+            self.server,  # type: ignore[attr-defined]
+            "request_timeout_seconds",
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        )
+        deadline = time.monotonic() + float(timeout)
+        try:
+            self.connection.settimeout(float(timeout))
+        except OSError:
+            pass
+        if self.disable_nagle_algorithm:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True)
+        self.rfile = RequestDeadlineReader(self.connection, deadline)
+        if self.wbufsize == 0:
+            self.wfile = socketserver._SocketWriter(self.connection)  # type: ignore[attr-defined]
+        else:
+            self.wfile = self.connection.makefile("wb", self.wbufsize)
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except (TimeoutError, socket.timeout) as exc:
+            audit("reject_header_timeout", client=self._client_ip(),
+                  detail=str(exc)[:160], security=True)
+            body = b'{"ok": false, "error": "request timeout"}'
+            try:
+                self.connection.sendall(
+                    b"HTTP/1.1 408 Request Timeout\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Connection: close\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                    + body
+                )
+            except OSError:
+                pass
+            self.close_connection = True
+
     def _reply(self, status: int, payload: dict[str, Any],
                extra_headers: Optional[dict[str, str]] = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         for key, val in (extra_headers or {}).items():
             self.send_header(key, val)
         self.end_headers()
@@ -926,9 +1464,39 @@ class HandoffHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except OSError:
             pass
+        self.close_connection = True
 
     def _client_ip(self) -> str:
         return self.client_address[0] if self.client_address else ""
+
+    def _read_exact_body(
+        self,
+        content_length: int,
+        *,
+        audit_event: str,
+        audit_fields: dict[str, Any],
+    ) -> Optional[bytes]:
+        if content_length == 0:
+            return b""
+        try:
+            raw = self.rfile.read(content_length)
+        except (OSError, TimeoutError, socket.timeout) as exc:
+            fields = dict(audit_fields)
+            fields.setdefault("reason", "read_timeout")
+            fields.update({"declared": content_length,
+                           "detail": str(exc)[:160], "security": True})
+            audit(audit_event, **fields)
+            self._reply(400, {"ok": False, "error": "incomplete request body"})
+            return None
+        if len(raw) != content_length:
+            fields = dict(audit_fields)
+            fields.setdefault("reason", "short_read")
+            fields.update({"declared": content_length,
+                           "actual": len(raw), "security": True})
+            audit(audit_event, **fields)
+            self._reply(400, {"ok": False, "error": "incomplete request body"})
+            return None
+        return raw
 
     def do_GET(self) -> None:  # noqa: N802 - http.server API
         if self.path == "/healthz":
@@ -1034,7 +1602,14 @@ class HandoffHandler(BaseHTTPRequestHandler):
             self._reply(413, {"ok": False, "error": "body too large"})
             return
 
-        raw = self.rfile.read(content_length) if content_length else b""
+        raw = self._read_exact_body(
+            content_length,
+            audit_event="reject_incomplete_body",
+            audit_fields={"peer": peer_id, "client": client_ip,
+                          "message_id": message_id},
+        )
+        if raw is None:
+            return
 
         # --- HMAC + timestamp before parsing ---
         secrets = a2a.peer_secrets(peer)
@@ -1216,19 +1791,149 @@ class HandoffHandler(BaseHTTPRequestHandler):
     ) -> None:
         message_id = env["message_id"]
         peer_id = peer.get("id", "")
+        sender_obj = env.get("sender", {})
+        sender = sender_obj if isinstance(sender_obj, dict) else {}
+        sender_bridge = str(sender.get("bridge", "unknown"))
+        sender_agent = str(sender.get("agent", "unknown"))
         a2a.ensure_handoff_dirs()
         conn = a2a.open_inbox()
+        staged: Optional[Path] = None
+        durable_body: Optional[Path] = None
+        durable_body_retained = False
         try:
+            def gate_new_enqueue() -> bool:
+                # --- room-scoped membership (A2A rooms, design §14 R2 — FAIL CLOSED) ---
+                # Runs AFTER the existing HMAC/source-addr/allowlist auth AND after
+                # the durable dedupe duplicate/hash-conflict handling above (so an
+                # idempotent room-scoped retry already returned its original task
+                # id, and a hash-conflict already 409'd) — it gates ONLY a NEW
+                # room-scoped enqueue, and can only ADD a denial, never relax a
+                # non-room message. P1a is single-node so production traffic is not
+                # room-scoped yet; this is the frozen seam P4 activates on the
+                # cross-node path with the leader-MAC'd roster verify.
+                room_ok, room_reason = room_scoped_check(env, cfg)
+                if not room_ok:
+                    conn.rollback()
+                    audit("reject_room_membership", peer=peer_id, client=client_ip,
+                          target=env.get("target_agent"), room_id=env.get("room_id"),
+                          reason=room_reason, message_id=message_id, security=True)
+                    self._reply(
+                        403,
+                        {"ok": False,
+                         "error": f"room-scoped enqueue denied: {room_reason}"},
+                    )
+                    return False
+
+                # --- backpressure: max open remote tasks per peer/target ---
+                max_open = a2a.peer_cap(peer, "max_open_tasks", None)
+                if max_open is not None:
+                    try:
+                        open_count = count_open_remote_tasks(conn, peer_id)
+                    except sqlite3.DatabaseError as exc:
+                        conn.rollback()
+                        audit("backpressure_count_fail", peer=peer_id,
+                              message_id=message_id, detail=str(exc)[:200])
+                        self._reply(503, {"ok": False, "error": "queue busy, retry"},
+                                    extra_headers={"Retry-After": "30"})
+                        return False
+                    if int(open_count) >= int(max_open):
+                        conn.rollback()
+                        audit("reject_backpressure", peer=peer_id, client=client_ip,
+                              message_id=message_id, open=open_count)
+                        self._reply(
+                            429,
+                            {"ok": False, "error": "peer task quota reached"},
+                            extra_headers={"Retry-After": "120"},
+                        )
+                        return False
+                return True
+
+            conn.execute("BEGIN IMMEDIATE")
             # Dedupe is scoped to the AUTHENTICATED peer (composite PK) so one
             # peer cannot pre-seed/block another peer's sender-chosen message_id
             # (A2A Rooms P4.3 codex review — same fix class as room_join_dedupe).
             existing = conn.execute(
-                "SELECT body_sha256, created_task_id FROM inbox_dedupe "
+                "SELECT body_sha256, created_task_id, first_seen_ts, last_seen_ts "
+                "FROM inbox_dedupe "
                 "WHERE peer=? AND message_id=?", (peer_id, message_id)
             ).fetchone()
             if existing is not None:
                 if existing["body_sha256"] == body_hash:
-                    # Same id + same body → idempotent success.
+                    task_id = str(existing["created_task_id"] or "")
+                    if task_id:
+                        # Same id + same body → idempotent success.
+                        conn.execute(
+                            "UPDATE inbox_dedupe SET last_seen_ts=?, "
+                            "delivery_count=delivery_count+1 "
+                            "WHERE peer=? AND message_id=?",
+                            (a2a.now_ts(), peer_id, message_id),
+                        )
+                        conn.commit()
+                        audit("accept_duplicate", peer=peer_id, client=client_ip,
+                              message_id=message_id, task_id=task_id)
+                        self._reply(200, {"ok": True, "duplicate": True,
+                                          "task_id": task_id})
+                        return
+
+                    recovered_task_id = recover_task_id_for_message(
+                        peer_id,
+                        message_id,
+                        sender_bridge=sender_bridge,
+                        first_seen_ts=int(existing["first_seen_ts"] or 0),
+                    )
+                    if recovered_task_id:
+                        conn.execute(
+                            "UPDATE inbox_dedupe SET created_task_id=?, "
+                            "last_seen_ts=?, delivery_count=delivery_count+1 "
+                            "WHERE peer=? AND message_id=?",
+                            (recovered_task_id, a2a.now_ts(), peer_id, message_id),
+                        )
+                        conn.commit()
+                        audit("accept_duplicate_recovered", peer=peer_id,
+                              client=client_ip, message_id=message_id,
+                              task_id=recovered_task_id)
+                        self._reply(200, {"ok": True, "duplicate": True,
+                                          "task_id": recovered_task_id})
+                        return
+
+                    pending_age = a2a.now_ts() - int(
+                        existing["first_seen_ts"] or a2a.now_ts())
+                    if pending_age < pending_retry_seconds():
+                        # Another thread/process has reserved this message_id and
+                        # is still within the bridge-task create budget. Return a
+                        # retryable response instead of enqueueing a duplicate.
+                        conn.execute(
+                            "UPDATE inbox_dedupe SET last_seen_ts=?, "
+                            "delivery_count=delivery_count+1 "
+                            "WHERE peer=? AND message_id=?",
+                            (a2a.now_ts(), peer_id, message_id),
+                        )
+                        conn.commit()
+                        audit("accept_pending_retry", peer=peer_id,
+                              client=client_ip, message_id=message_id,
+                              age=pending_age)
+                        self._reply(503, {"ok": False,
+                                          "error": "handoff pending, retry"},
+                                    extra_headers={"Retry-After": "30"})
+                        return
+
+                    # Stale pending row with no recoverable task: reuse the row as
+                    # this retry's reservation and attempt enqueue below.
+                    if not gate_new_enqueue():
+                        return
+                    retry_started = a2a.now_ts()
+                    conn.execute(
+                        "UPDATE inbox_dedupe SET first_seen_ts=?, last_seen_ts=?, "
+                        "delivery_count=delivery_count+1 "
+                        "WHERE peer=? AND message_id=?",
+                        (retry_started, retry_started, peer_id, message_id),
+                    )
+                    conn.commit()
+                    audit("pending_retry_reenqueue", peer=peer_id,
+                          client=client_ip, message_id=message_id,
+                          age=pending_age)
+                # Same id + different body → security event, conflict.
+                else:
                     conn.execute(
                         "UPDATE inbox_dedupe SET last_seen_ts=?, "
                         "delivery_count=delivery_count+1 "
@@ -1236,57 +1941,23 @@ class HandoffHandler(BaseHTTPRequestHandler):
                         (a2a.now_ts(), peer_id, message_id),
                     )
                     conn.commit()
-                    audit("accept_duplicate", peer=peer_id, client=client_ip,
-                          message_id=message_id,
-                          task_id=existing["created_task_id"])
-                    self._reply(200, {"ok": True, "duplicate": True,
-                                      "task_id": existing["created_task_id"]})
+                    audit("reject_hash_conflict", peer=peer_id, client=client_ip,
+                          message_id=message_id, security=True)
+                    self._reply(409, {"ok": False,
+                                      "error": "message id reused with different body"})
                     return
-                # Same id + different body → security event, conflict.
+            else:
+                if not gate_new_enqueue():
+                    return
+
+                now = a2a.now_ts()
                 conn.execute(
-                    "UPDATE inbox_dedupe SET last_seen_ts=?, "
-                    "delivery_count=delivery_count+1 "
-                    "WHERE peer=? AND message_id=?",
-                    (a2a.now_ts(), peer_id, message_id),
+                    "INSERT INTO inbox_dedupe (message_id, peer, body_sha256, "
+                    "created_task_id, first_seen_ts, last_seen_ts, delivery_count) "
+                    "VALUES (?, ?, ?, NULL, ?, ?, 1)",
+                    (message_id, peer_id, body_hash, now, now),
                 )
                 conn.commit()
-                audit("reject_hash_conflict", peer=peer_id, client=client_ip,
-                      message_id=message_id, security=True)
-                self._reply(409, {"ok": False,
-                                  "error": "message id reused with different body"})
-                return
-
-            # --- room-scoped membership (A2A rooms, design §14 R2 — FAIL CLOSED) ---
-            # Runs AFTER the existing HMAC/source-addr/allowlist auth AND after
-            # the durable dedupe duplicate/hash-conflict handling above (so an
-            # idempotent room-scoped retry already returned its original task
-            # id, and a hash-conflict already 409'd) — it gates ONLY a NEW
-            # room-scoped enqueue, and can only ADD a denial, never relax a
-            # non-room message. P1a is single-node so production traffic is not
-            # room-scoped yet; this is the frozen seam P4 activates on the
-            # cross-node path with the leader-MAC'd roster verify.
-            room_ok, room_reason = room_scoped_check(env, cfg)
-            if not room_ok:
-                audit("reject_room_membership", peer=peer_id, client=client_ip,
-                      target=env.get("target_agent"), room_id=env.get("room_id"),
-                      reason=room_reason, message_id=message_id, security=True)
-                self._reply(403, {"ok": False,
-                                  "error": f"room-scoped enqueue denied: {room_reason}"})
-                return
-
-            # --- backpressure: max open remote tasks per peer/target ---
-            max_open = a2a.peer_cap(peer, "max_open_tasks", None)
-            if max_open is not None:
-                open_count = conn.execute(
-                    "SELECT COUNT(*) AS n FROM inbox_dedupe WHERE peer=? "
-                    "AND created_task_id IS NOT NULL", (peer_id,)
-                ).fetchone()["n"]
-                if int(open_count) >= int(max_open):
-                    audit("reject_backpressure", peer=peer_id, client=client_ip,
-                          message_id=message_id, open=open_count)
-                    self._reply(429, {"ok": False, "error": "peer task quota reached"},
-                                extra_headers={"Retry-After": "120"})
-                    return
 
             # --- stage body + enqueue via bridge-task.sh ---
             # PEER-SCOPED + O_EXCL collision-proof staging (codex P4.3 r2): the
@@ -1298,17 +1969,51 @@ class HandoffHandler(BaseHTTPRequestHandler):
             # --body-file. peer_id is the authenticated X-AGB-Peer.
             staged = stage_inbound_body(
                 peer_id, message_id, staged_body_text(env))
+            durable_body = promote_inbound_body_to_queue(staged)
 
-            sender = env.get("sender", {})
             ok, task_id, audit_detail, peer_detail = enqueue_via_bridge_task(
                 target=env["target_agent"],
-                sender_bridge=sender.get("bridge", "unknown"),
-                sender_agent=sender.get("agent", "unknown"),
+                sender_bridge=sender_bridge,
+                sender_agent=sender_agent,
                 priority=env.get("priority", "normal"),
                 title=env["title"],
-                body_file=staged,
+                body_file=durable_body,
             )
             if not ok:
+                recovered_task_id = recover_task_id_for_message(
+                    peer_id, message_id, sender_bridge=sender_bridge)
+                conn.execute("BEGIN IMMEDIATE")
+                if recovered_task_id:
+                    cur = conn.execute(
+                        "UPDATE inbox_dedupe SET created_task_id=?, "
+                        "last_seen_ts=? WHERE peer=? AND message_id=? "
+                        "AND body_sha256=?",
+                        (recovered_task_id, a2a.now_ts(), peer_id, message_id,
+                         body_hash),
+                    )
+                    if cur.rowcount == 0:
+                        now = a2a.now_ts()
+                        conn.execute(
+                            "INSERT OR IGNORE INTO inbox_dedupe "
+                            "(message_id, peer, body_sha256, created_task_id, "
+                            "first_seen_ts, last_seen_ts, delivery_count) "
+                            "VALUES (?, ?, ?, ?, ?, ?, 1)",
+                            (message_id, peer_id, body_hash, recovered_task_id,
+                             now, now),
+                        )
+                    conn.commit()
+                    audit("accept_recovered_after_enqueue_fail", peer=peer_id,
+                          client=client_ip, message_id=message_id,
+                          task_id=recovered_task_id)
+                    self._reply(200, {"ok": True, "duplicate": False,
+                                      "task_id": recovered_task_id})
+                    return
+                conn.execute(
+                    "DELETE FROM inbox_dedupe WHERE peer=? AND message_id=? "
+                    "AND body_sha256=? AND created_task_id IS NULL",
+                    (peer_id, message_id, body_hash),
+                )
+                conn.commit()
                 # Distinguish a transient lock failure (retryable 503) from
                 # a permanent validation/guard/allowlist rejection (422). The
                 # rejection status + the LOCAL audit detail are unchanged; only
@@ -1329,20 +2034,43 @@ class HandoffHandler(BaseHTTPRequestHandler):
                           message_id=message_id, detail=audit_detail[:200])
                     self._reply(422, {"ok": False, "error": peer_detail})
                 return
+            durable_body_retained = True
 
             now = a2a.now_ts()
-            conn.execute(
-                "INSERT INTO inbox_dedupe (message_id, peer, body_sha256, "
-                "created_task_id, first_seen_ts, last_seen_ts, delivery_count) "
-                "VALUES (?, ?, ?, ?, ?, ?, 1)",
-                (message_id, peer_id, body_hash, task_id, now, now),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT body_sha256 FROM inbox_dedupe WHERE peer=? AND message_id=?",
+                (peer_id, message_id),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO inbox_dedupe (message_id, peer, body_sha256, "
+                    "created_task_id, first_seen_ts, last_seen_ts, delivery_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1)",
+                    (message_id, peer_id, body_hash, task_id, now, now),
+                )
+            elif row["body_sha256"] == body_hash:
+                conn.execute(
+                    "UPDATE inbox_dedupe SET created_task_id=?, last_seen_ts=? "
+                    "WHERE peer=? AND message_id=?",
+                    (task_id, now, peer_id, message_id),
+                )
+            else:
+                conn.rollback()
+                audit("dedupe_final_conflict", peer=peer_id, client=client_ip,
+                      message_id=message_id, task_id=task_id, security=True)
+                self._reply(409, {"ok": False,
+                                  "error": "message id reused with different body"})
+                return
             conn.commit()
             audit("accept", peer=peer_id, client=client_ip,
                   message_id=message_id, target=env["target_agent"],
                   task_id=task_id)
             self._reply(200, {"ok": True, "duplicate": False, "task_id": task_id})
         finally:
+            cleanup_incoming_staged_body(staged)
+            if not durable_body_retained:
+                cleanup_queue_body_copy_if_unreferenced(durable_body)
             conn.close()
 
     def _handle_identity_update(self, cfg: dict[str, Any]) -> None:
@@ -1441,7 +2169,14 @@ class HandoffHandler(BaseHTTPRequestHandler):
                   peer=peer_id, client=client_ip, declared=content_length)
             self._reply(413, {"ok": False, "error": "body too large"})
             return
-        raw = self.rfile.read(content_length) if content_length else b""
+        raw = self._read_exact_body(
+            content_length,
+            audit_event="identity_update_reject",
+            audit_fields={"reason": "incomplete_body", "peer": peer_id,
+                          "client": client_ip, "message_id": message_id},
+        )
+        if raw is None:
+            return
 
         # --- c. HMAC: secret present, body hash, signature (auth boundary) ---
         secrets = a2a.peer_secrets(peer)
@@ -1747,7 +2482,14 @@ class HandoffHandler(BaseHTTPRequestHandler):
                   peer=peer_id, client=client_ip, declared=content_length)
             self._reply(413, {"ok": False, "error": "body too large"})
             return
-        raw = self.rfile.read(content_length) if content_length else b""
+        raw = self._read_exact_body(
+            content_length,
+            audit_event="room_join_reject",
+            audit_fields={"reason": "incomplete_body", "peer": peer_id,
+                          "client": client_ip, "message_id": message_id},
+        )
+        if raw is None:
+            return
 
         # --- f. HMAC: secret present, body hash, signature (auth boundary) ---
         secrets = a2a.peer_secrets(peer)
@@ -2083,7 +2825,14 @@ class HandoffHandler(BaseHTTPRequestHandler):
                   peer=peer_id, client=client_ip, declared=content_length)
             self._reply(413, {"ok": False, "error": "body too large"})
             return
-        raw = self.rfile.read(content_length) if content_length else b""
+        raw = self._read_exact_body(
+            content_length,
+            audit_event="room_roster_reject",
+            audit_fields={"reason": "incomplete_body", "peer": peer_id,
+                          "client": client_ip, "message_id": message_id},
+        )
+        if raw is None:
+            return
 
         # --- f. HMAC: secret present, body hash, signature (auth boundary) ---
         secrets = a2a.peer_secrets(peer)
@@ -2684,6 +3433,11 @@ def serve_with_reconcile(server: "HandoffServer",
     socket keeps the old listener (fail-safe).
     """
     interval = _reconcile_interval()
+    maintenance_interval = _positive_int_env(
+        "BRIDGE_A2A_MAINTENANCE_INTERVAL_SECONDS",
+        DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
+    )
+    next_maintenance_ts = 0
     wake = threading.Event()
 
     # SIGHUP triggers an immediate reconcile (operator / wizard `kill -HUP`).
@@ -2737,6 +3491,11 @@ def serve_with_reconcile(server: "HandoffServer",
         if result.changed() or result.bind_error or result.config_error:
             audit("reconcile", summary=result.summary())
             log(f"reconcile: {result.summary()}")
+
+        now = a2a.now_ts()
+        if maintenance_interval > 0 and now >= next_maintenance_ts:
+            run_receiver_maintenance()
+            next_maintenance_ts = now + maintenance_interval
 
         if not result.want_rebind:
             continue
