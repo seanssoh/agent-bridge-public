@@ -265,6 +265,67 @@ yet part of the live-mesh verification above):
 
 - **Cloudflare Zero Trust transport** — only the Tailscale transport is exercised
   on the live mesh; the transport-negotiation seam exists but ZT is unverified.
-- **`agb a2a send` whole-room fan-out** — room-scoped *delivery* (P4.3 room-talk)
-  is wired; addressing a whole room as a single `agb a2a send` target is the next
-  ergonomic step.
+
+---
+
+## Whole-room fan-out (`a2a send --room`)
+
+Sending the same message to *every* member of a room — without naming each
+recipient — is a first-class verb:
+
+```bash
+# fan a message out to every OTHER member of the room (you are excluded):
+agb a2a send --room <room_id> --title "standup" --body "what's blocking you?"
+
+# equivalently:
+agb room send <room_id> --title "standup" --body "..."
+agb room talk <room_id> --fanout --title "standup" --body "..."
+```
+
+What it does:
+
+- **You must be a member of the room.** Membership is proven from *this node's
+  own* leader-MAC roster cache / authoritative `rooms.db` — never from the flags
+  you pass — so an agent that belongs to room A cannot address room B unless it
+  is also a member of B. A non-member send is refused before anything leaves.
+- **You are excluded** from the recipient set (no self-delivery).
+- **The room roster decides the recipients.** Members on **this same node** are
+  delivered through the **local internal queue** (`bridge-task.sh create`, the
+  same durable boundary every inter-agent task uses); members on **other nodes**
+  are delivered via the **cross-node room-scoped A2A** path (node-link + HMAC +
+  the room epoch — exactly what `room talk` uses). The receiver on each remote
+  node independently re-checks membership against its own cached roster (the
+  sender-side check is an *additive* gate, it does not replace the receiver's).
+- **Partial failures don't abort the rest.** Each recipient is attempted
+  independently; failures are collected and reported per recipient.
+
+`--to <agent[@node]>` narrows a fan-out to a single member; `--priority`,
+`--body-file`, and `--allow-empty-body` work as they do for a 1:1 send. `--peer`
+(1:1 cross-bridge) and `--room` (fan-out) are mutually exclusive.
+
+With `--json`, the result is machine-readable:
+
+```json
+{
+  "room_id": "<room_id>",
+  "epoch": 7,
+  "sender": "alice@nodeA",
+  "delivered": [
+    {"agent": "dave", "node": "nodeA", "leg": "local"},
+    {"agent": "bob",  "node": "nodeB", "leg": "remote"}
+  ],
+  "failed": [
+    {"agent": "carol", "node": "nodeC", "leg": "remote",
+     "status": 403, "detail": "..."}
+  ],
+  "legs": {"local": true, "remote": true}
+}
+```
+
+`delivered`/`failed` each tag the recipient with the **leg** used (`local` vs
+`remote`), and `legs` records which legs fired at all. A fully-delivered send
+exits `0`; any partial failure exits non-zero (`2`) so cron/callers notice.
+
+> `room talk` (without `--fanout`) is unchanged: it stays cross-node only (it
+> skips same-node members). The fan-out is the additive whole-room surface over
+> the same machinery.

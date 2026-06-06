@@ -594,6 +594,51 @@ def _invoke_test_post_hook(*, path: str, headers: dict,
     return 200, (proc.stdout or "").encode("utf-8")
 
 
+def _test_local_hook_allowed() -> bool:
+    """Paired-flag gate for the LOCAL-queue fan-out test seam (prod-inert).
+
+    Mirrors `_test_post_hook_allowed` for the same-node local leg (#1594): the
+    smoke captures the would-be `bridge-task.sh create` invocation instead of
+    shelling out to a live queue. Same paired insecure-test flags so it can
+    NEVER fire in production.
+    """
+    return (os.environ.get("BRIDGE_ROOMS_ALLOW_TEST_UID_MAP") == "1"  # noqa: iso-helper-boundary - env var, not a .env file
+            and os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") == "1"  # noqa: iso-helper-boundary - env var, not a .env file
+            and bool(os.environ.get("BRIDGE_ROOMS_TEST_LOCAL_HOOK")))  # noqa: iso-helper-boundary - env var, not a .env file
+
+
+def _invoke_test_local_hook(*, target_agent: str, sender_agent: str,
+                            sender_node: str, room_id: str, room_epoch: int,
+                            title: str, priority: str,
+                            body: str) -> tuple[bool, str]:
+    """Write the would-be local-queue create to the hook file; return ok.
+
+    The hook value is a script invoked with a JSON payload on argv (file-as-argv,
+    never stdin — footgun #11 hygiene). A non-zero exit is reported as a local
+    delivery failure so the smoke can exercise the partial-failure path.
+    """
+    import subprocess
+
+    hook = os.environ["BRIDGE_ROOMS_TEST_LOCAL_HOOK"]  # noqa: iso-helper-boundary - env var, not a .env file
+    payload = {
+        "target_agent": target_agent, "from": f"room:{room_id}:{sender_agent}",
+        "sender": f"{sender_agent}@{sender_node}", "room_id": room_id,
+        "room_epoch": int(room_epoch), "title": title, "priority": priority,
+        "body": body,
+    }
+    try:
+        proc = subprocess.run(
+            [hook, json.dumps(payload)], capture_output=True, text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"test local hook failed: {exc}"
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout or "test local hook "
+                       "non-zero").strip()[-300:]
+    return True, (proc.stdout or "").strip()
+
+
 def _post_room_roster_broadcast(*, member_node: str, room_id: str,
                                 room_epoch: int, members: list,
                                 leader_node: str, timeout: float = 30.0,
@@ -854,6 +899,119 @@ def _talk_target_pairs(members: list, sender_agent: str,
     return sorted(pairs)
 
 
+def _local_target_pairs(members: list, sender_agent: str,
+                        sender_node: str, local_node_id: str,
+                        only_to: str = "") -> list:
+    """The SAME-NODE (agent, node) pairs a whole-room fan-out targets locally.
+
+    The complement of `_talk_target_pairs`: every cached member on THIS sender's
+    own node (or, when the node ids are empty as in single-node P1a, a member
+    whose node matches the sender's empty node), EXCEPT the sender itself. These
+    recipients are reachable through the LOCAL queue (`bridge-task.sh create`),
+    not a cross-node node-link hop — so `a2a send --room` delivers to them via
+    the same durable internal-queue boundary every inter-agent task uses, while
+    `_talk_target_pairs` handles the remote leg. `only_to` (`agent`/`agent@node`)
+    narrows to a single recipient. Deterministically ordered.
+
+    The membership source is the SAME cached/authoritative roster the remote leg
+    reads — a recipient is only addressed because it is already a proven member
+    of this room, never because the caller named it.
+    """
+    want_agent, _, want_node = (only_to or "").partition("@")
+    want_agent = want_agent.strip()
+    want_node = want_node.strip()
+    pairs: list = []
+    for m in members:
+        magent = str(m.get("agent", "") or "")
+        mnode = str(m.get("node", "") or "")
+        if magent == sender_agent and mnode == sender_node:
+            continue  # never send to self
+        if mnode and mnode != local_node_id:
+            continue  # other node → remote room-talk hop, not the local queue
+        if only_to:
+            if magent != want_agent:
+                continue
+            if want_node and mnode != want_node and want_node != local_node_id:
+                continue
+        pair = (magent, mnode)
+        if pair not in pairs:
+            pairs.append(pair)
+    return sorted(pairs)
+
+
+def _post_room_local(*, target_agent: str, sender_agent: str, sender_node: str,
+                     room_id: str, room_epoch: int, title: str, body: str,
+                     priority: str, timeout: float = 120.0) -> tuple[bool, str]:
+    """Deliver a room fan-out message to a SAME-NODE member via the local queue.
+
+    Routes through the EXISTING `bridge-task.sh create` boundary (the same
+    durable internal-queue path the A2A receiver uses for inbound mail, and the
+    same one every inter-agent task takes) — NOT a new transport, and NOT a
+    direct queue-db write. The `--from` is stamped as `room:<room_id>:<sender>`
+    so the recipient (and the audit log) can see this arrived as a room fan-out,
+    parallel to the receiver's `a2a:<bridge>:<agent>` provenance for remote mail.
+
+    `sender_agent` is the OS-actor-anchored caller (the fan-out already proved it
+    is a member of `room_id` before calling here); the local target was selected
+    from the SAME proven roster. The room epoch is carried in the provenance
+    header for the recipient's context — local delivery does not need the wire
+    room-scoped gate because there is no untrusted network hop: the internal
+    queue is already the controller-owned, in-host boundary, and the membership
+    was proven locally. Returns (ok, detail).
+    """
+    if _test_local_hook_allowed():
+        return _invoke_test_local_hook(
+            target_agent=target_agent, sender_agent=sender_agent,
+            sender_node=sender_node, room_id=room_id, room_epoch=room_epoch,
+            title=title, priority=priority, body=body)
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "bridge-task.sh")
+    if not os.path.isfile(script):
+        return False, f"bridge-task.sh not found beside {here}"
+    bash = os.environ.get("BRIDGE_BASH_BIN", "bash")  # noqa: iso-helper-boundary - os.environ read, not a .env file
+    provenance = (
+        "<!-- A2A room fan-out — provenance -->\n"
+        f"room id   : {room_id}\n"
+        f"room epoch: {int(room_epoch)}\n"
+        f"from      : {sender_agent}@{sender_node}\n"
+        "\n---\n\n"
+    )
+    full_body = provenance + body
+    import subprocess
+    import tempfile
+
+    # Stage the body to a temp file so a multi-line / large body crosses the
+    # bridge-task.sh boundary intact (mirrors the receiver's --body-file path).
+    fd, body_path = tempfile.mkstemp(prefix="room-fanout-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(full_body)
+        argv = [
+            bash, script, "create",
+            "--to", target_agent,
+            "--from", f"room:{room_id}:{sender_agent}",
+            "--priority", priority,
+            "--title", title,
+            "--body-file", body_path,
+        ]
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f"bridge-task.sh invocation failed: {exc}"
+    finally:
+        try:
+            os.unlink(body_path)  # noqa: raw-pathlib-controller-only - our own mkstemp temp, not an iso-metadata path
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[-300:]
+        return False, detail or f"bridge-task.sh exited {proc.returncode}"
+    return True, (proc.stdout or "").strip()
+
+
 def cmd_talk(args: argparse.Namespace) -> int:
     """Send a ROOM-SCOPED message to the room's OTHER member nodes (P4.3).
 
@@ -919,16 +1077,31 @@ def cmd_talk(args: argparse.Namespace) -> int:
         return die(f"{agent}@{node} is not a member of room {room_id} per the "
                    "local roster cache — refusing to send", code=1)
 
-    targets = _talk_target_pairs(members, agent, node, node,
-                                 only_to=getattr(args, "to", "") or "")
-    if not targets:
-        return die(f"no other-node members to send to in room {room_id} "
-                   "(roster has no cross-node recipients matching the filter)",
-                   code=1)
+    only_to = getattr(args, "to", "") or ""
+    fanout = bool(getattr(args, "fanout", False))
+    remote_targets = _talk_target_pairs(members, agent, node, node,
+                                        only_to=only_to)
+    # The local (same-node) leg is the whole-room fan-out addition (#1594) and
+    # fires ONLY under fan-out (`a2a send --room` / `room send` /
+    # `room talk --fanout`). Bare `room talk` stays a strictly cross-node verb
+    # (back-compat): it never touches the local queue, even with `--to` naming a
+    # same-node member (that path keeps its prior "no cross-node recipients"
+    # behavior). `--to` still narrows the fan-out's local leg to one member.
+    local_targets = (
+        _local_target_pairs(members, agent, node, node, only_to=only_to)
+        if fanout else []
+    )
+    if not remote_targets and not local_targets:
+        return die(f"no other members to send to in room {room_id} "
+                   "(roster has no recipients matching the filter)", code=1)
 
     delivered: list = []
     failed: list = []
-    for tagent, tnode in targets:
+    used_remote = False
+    used_local = False
+
+    for tagent, tnode in remote_targets:
+        used_remote = True
         try:
             status, resp = _post_room_talk(
                 member_node=tnode, room_id=room_id, room_epoch=cached_epoch,
@@ -936,36 +1109,58 @@ def cmd_talk(args: argparse.Namespace) -> int:
                 body=body_text, priority=priority,
             )
         except rooms.RoomsError as exc:
-            failed.append({"agent": tagent, "node": tnode, "error": str(exc)})
+            failed.append({"agent": tagent, "node": tnode, "leg": "remote",
+                           "error": str(exc)})
             continue
         except Exception as exc:  # noqa: BLE001 - transport/config failure
-            failed.append({"agent": tagent, "node": tnode,
+            failed.append({"agent": tagent, "node": tnode, "leg": "remote",
                            "error": f"room talk failed: {exc}"})
             continue
         if 200 <= status < 300:
-            delivered.append({"agent": tagent, "node": tnode})
+            delivered.append({"agent": tagent, "node": tnode, "leg": "remote"})
         else:
             detail = ""
             try:
                 detail = resp.decode("utf-8", "replace")[:200]
             except Exception:  # noqa: BLE001
                 detail = ""
-            failed.append({"agent": tagent, "node": tnode,
+            failed.append({"agent": tagent, "node": tnode, "leg": "remote",
                            "status": status, "detail": detail})
+
+    for tagent, tnode in local_targets:
+        used_local = True
+        try:
+            ok, detail = _post_room_local(
+                target_agent=tagent, sender_agent=agent, sender_node=node,
+                room_id=room_id, room_epoch=cached_epoch, title=args.title,
+                body=body_text, priority=priority,
+            )
+        except Exception as exc:  # noqa: BLE001 - local enqueue failure
+            failed.append({"agent": tagent, "node": tnode, "leg": "local",
+                           "error": f"local enqueue failed: {exc}"})
+            continue
+        if ok:
+            delivered.append({"agent": tagent, "node": tnode, "leg": "local"})
+        else:
+            failed.append({"agent": tagent, "node": tnode, "leg": "local",
+                           "detail": detail})
 
     payload = {
         "room_id": room_id, "epoch": cached_epoch,
-        "from": f"{agent}@{node}",
+        "sender": f"{agent}@{node}",
+        "from": f"{agent}@{node}",  # back-compat alias for the prior field name
         "delivered": delivered, "failed": failed,
+        "legs": {"local": used_local, "remote": used_remote},
     }
     if args.json:
         out(json.dumps(payload))
     else:
-        info(f"room talk on {room_id} (epoch {cached_epoch}) from {agent}@{node}: "
-             f"{len(delivered)} delivered, {len(failed)} failed")
+        info(f"room send on {room_id} (epoch {cached_epoch}) from {agent}@{node}: "
+             f"{len(delivered)} delivered, {len(failed)} failed "
+             f"(local={used_local}, remote={used_remote})")
         for f in failed:
-            info(f"  FAILED {f['agent']}@{f['node']}: "
-                 f"{f.get('error') or f.get('status')}")
+            info(f"  FAILED {f['agent']}@{f['node']} [{f.get('leg', '?')}]: "
+                 f"{f.get('error') or f.get('detail') or f.get('status')}")
     # A partial failure is a non-zero exit so callers/cron notice, but a fully
     # delivered send (or an all-targets dry filter) returns 0.
     return 0 if not failed else 2
@@ -1458,8 +1653,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_talk.add_argument("--priority", default="normal")
     p_talk.add_argument("--allow-empty-body", action="store_true",
                         dest="allow_empty_body")
+    p_talk.add_argument("--fanout", action="store_true", dest="fanout",
+                        help="ALSO deliver to same-node members via the local "
+                             "queue (whole-room fan-out); default = cross-node "
+                             "members only")
     _add_common(p_talk)
     p_talk.set_defaults(func=cmd_talk)
+
+    # `send` is the canonical whole-room fan-out alias (#1594): same machinery as
+    # `talk` but fan-out ON by default (every OTHER member — local same-node via
+    # the queue + remote member-nodes via room-scoped A2A — self excluded). It is
+    # what `agent-bridge a2a send --room <room_id>` routes to. `talk` stays for
+    # back-compat (cross-node only unless --fanout). The receiver-side gate is
+    # unchanged and still independently enforces membership on every remote hop.
+    p_fan = sub.add_parser(
+        "send",
+        help="whole-room fan-out: deliver to EVERY other room member "
+             "(local via the queue + remote via room-scoped A2A)")
+    p_fan.add_argument("room_id")
+    p_fan.add_argument("--title", required=True)
+    p_fan.add_argument("--body", default=None)
+    p_fan.add_argument("--body-file", dest="body_file", default=None)
+    p_fan.add_argument("--to", default="",
+                       help="narrow to one recipient (agent or agent@node); "
+                            "default = every other member, local and remote")
+    p_fan.add_argument("--priority", default="normal")
+    p_fan.add_argument("--allow-empty-body", action="store_true",
+                       dest="allow_empty_body")
+    _add_common(p_fan)
+    p_fan.set_defaults(func=cmd_talk, fanout=True)
 
     p_adopt = sub.add_parser(
         "adopt-all",

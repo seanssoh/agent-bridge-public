@@ -232,7 +232,64 @@ def _sudo_read_text(path: Path) -> str | None:
 # a2a send — stage an outbound entry into the durable outbox
 # --------------------------------------------------------------------------
 
+def _delegate_room_fanout(args: argparse.Namespace) -> int:
+    """Route `a2a send --room <id> ...` into the rooms whole-room fan-out (#1594).
+
+    The fan-out machinery (membership proof from the local leader-MAC roster
+    cache / authoritative rooms.db, OS-actor-anchored sender identity, the
+    same-node local-queue leg + the cross-node room-scoped A2A leg, partial
+    failure collection) lives in `bridge-rooms.py send` — the canonical alias of
+    `room talk --fanout`. This is the SAME code path `agent-bridge room talk`
+    uses; `a2a send --room` is the ergonomic surface over it, NOT a second
+    implementation or a new wire path. We invoke it as a subprocess (argv array,
+    never a shell string) so the OS-actor identity resolution, the rooms.db open,
+    and the receiver-enforced room gate all run exactly as they do for the
+    `room` CLI. The sender's membership is NEVER asserted from these flags — the
+    delegated command proves it against this node's own roster before sending.
+    """
+    import subprocess
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    rooms_cli = os.path.join(here, "bridge-rooms.py")
+    if not os.path.isfile(rooms_cli):
+        return die(f"bridge-rooms.py not found beside {here}") or 1
+    argv = [sys.executable or "python3", rooms_cli, "send", args.room,
+            "--title", args.title, "--priority", args.priority]
+    if args.body is not None:
+        argv += ["--body", args.body]
+    if args.body_file is not None:
+        argv += ["--body-file", args.body_file]
+    if args.to:
+        argv += ["--to", args.to]
+    if args.allow_empty_body:
+        argv.append("--allow-empty-body")
+    if getattr(args, "as_agent", None):
+        argv += ["--as", args.as_agent]
+    if args.json:
+        argv.append("--json")
+    proc = subprocess.run(argv)  # stdout/stderr stream straight through
+    return proc.returncode
+
+
 def cmd_send(args: argparse.Namespace) -> int:
+    # #1594: `--room` is the whole-room fan-out mode; it is mutually exclusive
+    # with the 1:1 `--peer`/`--to` path. Validate the surface, then delegate to
+    # the rooms fan-out (which owns membership proof + the local/remote legs).
+    if getattr(args, "room", None):
+        if args.peer:
+            return die("pass only one of --peer (1:1 send) / --room "
+                       "(whole-room fan-out)") or 1
+        if args.dry_run:
+            return die("--dry-run is not supported for --room fan-out; "
+                       "use 'agent-bridge room show <room_id>' to preview the "
+                       "roster") or 1
+        return _delegate_room_fanout(args)
+    # Below here is the 1:1 cross-bridge send — --peer + --to are required.
+    if not args.peer:
+        return die("--peer is required for a 1:1 send (or pass --room for a "
+                   "whole-room fan-out)") or 1
+    if not args.to:
+        return die("--to is required for a 1:1 send") or 1
     try:
         cfg = a2a.load_config()
         # #1331: fail-closed at send time too — surface the empty-secret
@@ -2653,14 +2710,31 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_send = sub.add_parser("send", help="stage an outbound cross-bridge handoff")
-    p_send.add_argument("--peer", required=True, help="configured peer bridge id")
-    p_send.add_argument("--to", required=True, help="target agent on the peer bridge")
+    # `--peer --to` is the 1:1 cross-bridge send. `--room <id>` is the whole-room
+    # fan-out (#1594): one message to EVERY other member of a room (self
+    # excluded) — local same-node members via the internal queue, remote members
+    # via room-scoped A2A. The two modes are mutually exclusive; `--peer`/`--to`
+    # are therefore NOT argparse-required (validated in cmd_send so a `--room`
+    # send is not forced to supply a peer it does not have).
+    p_send.add_argument("--peer", default=None, help="configured peer bridge id "
+                        "(1:1 send; mutually exclusive with --room)")
+    p_send.add_argument("--to", default=None, help="target agent on the peer "
+                        "bridge (1:1 send) or a single room member to narrow a "
+                        "--room fan-out to (agent or agent@node)")
+    p_send.add_argument("--room", default=None, help="whole-room fan-out: send "
+                        "to every OTHER member of this room id (self excluded; "
+                        "mutually exclusive with --peer)")
     p_send.add_argument("--from", dest="from_agent", default=None, help="sending agent id")
+    p_send.add_argument("--as", dest="as_agent", default=None,
+                        help="(room fan-out) recorded acting identity for a "
+                             "proven operator shell; IGNORED under iso v2")
     p_send.add_argument("--title", required=True)
     p_send.add_argument("--body", default=None)
     p_send.add_argument("--body-file", default=None)
     p_send.add_argument("--priority", default="normal")
     p_send.add_argument("--allow-empty-body", action="store_true")
+    p_send.add_argument("--json", action="store_true",
+                        help="(room fan-out) machine-readable per-recipient result")
     p_send.add_argument("--dry-run", action="store_true",
                         help="resolve + validate but do not write the outbox")
     p_send.set_defaults(func=cmd_send)
