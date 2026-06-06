@@ -228,7 +228,7 @@ import askuserquestion_escalate as a
 from pathlib import Path
 import tempfile
 
-os.environ["BRIDGE_ASKUSERQUESTION_WAIT_SECONDS"] = "30"
+os.environ["BRIDGE_ASKUSERQUESTION_WAIT_SECONDS"] = "30"  # noqa: iso-helper-boundary — smoke fixture env (.environ false-matches .env); not an isolated runtime artifact
 state = Path(tempfile.mkdtemp()) / "state"
 
 class Clock:
@@ -269,47 +269,50 @@ smoke_log "ok: (e) escalate time shares the budget — total wall-clock hard-cap
 # handle_pretool/handle_askuserquestion entry points, with the module imported
 # (not run as __main__) so we can null out the helper handle.
 smoke_log "(f) missing helper -> still bounded (no fall-through to raw picker)"
-# Load tool-policy.py by path (hyphenated filename isn't a normal module name)
-# and exercise the None-helper branch directly.
-OUT_F="$(BRIDGE_AGENT_ID="$AGENT" "$PYTHON_BIN" - "$SMOKE_REPO_ROOT" <<'PY'
-import sys, os, json, importlib.util
-repo = sys.argv[1]
-sys.path.insert(0, os.path.join(repo, "hooks"))
-spec = importlib.util.spec_from_file_location(
-    "tool_policy_under_test", os.path.join(repo, "hooks", "tool-policy.py")
-)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-# Simulate the broken/partial install: helper unavailable.
-mod._auq_escalate = None
-payload = {
-    "hook_event_name": "PreToolUse",
-    "tool_name": "AskUserQuestion",
-    "tool_input": {"question": "Which color theme?", "options": ["dark", "light"]},
-    "tool_use_id": "smoke-1569-f",
-    "session_id": "smoke-session",
-}
-import io, contextlib
-buf = io.StringIO()
-with contextlib.redirect_stdout(buf):
-    mod.handle_pretool(payload, os.environ["BRIDGE_AGENT_ID"])
-sys.stdout.write(buf.getvalue())
-PY
-)"
+# Invoke the probe file-as-argv (NOT a heredoc-in-command-substitution, which is
+# the Bash 5.3.9 read_comsub deadlock class / lint-heredoc-ban C1). The probe
+# loads tool-policy.py by path, nulls out the escalation helper handle, and runs
+# handle_pretool against an AskUserQuestion payload.
+OUT_F="$(BRIDGE_AGENT_ID="$AGENT" "$PYTHON_BIN" "$SCRIPT_DIR/1569-missing-helper-probe.py" "$SMOKE_REPO_ROOT")"
 smoke_assert_contains "$OUT_F" '"permissionDecision": "deny"' "(f) missing helper still denies (bounded)"
 smoke_assert_contains "$OUT_F" 'proceed with your best-judgment default' "(f) missing helper -> proceed+note fallback"
 smoke_log "ok: (f) missing helper bounded via proceed-with-note (no raw fall-through)"
 
 # --- audit trail: each AskUserQuestion intercept wrote exactly one row ------
 
-# (a), (b), (c) each wrote one row through the real hook. (f) ran an imported
-# copy of tool-policy.py against the SAME isolated BRIDGE_HOME audit log, so it
-# adds a fourth proceed-with-note row. (e) is helper-level only (no hook → no
-# row).
-AUQ_ROWS="$(count_audit_rows askuserquestion_bounded)"
-if (( AUQ_ROWS != 4 )); then
-  smoke_fail "expected 4 askuserquestion_bounded audit rows (a,b,c,f), got ${AUQ_ROWS}"
+# --- (g) numeric reply resolves to the chosen option TEXT -------------------
+
+# render_channel_question tells the human "reply with the option number"; a
+# numeric reply "2" against options ["dark","light"] must reach the agent as the
+# option TEXT "light", NOT the bare digit (codex #1569 Phase-4 finding 3).
+smoke_log "(g) numeric reply '2' -> agent receives the option text 'light'"
+rm -f "$REPLY_FILE"
+PAYLOAD="$SMOKE_TMP_ROOT/auq-g.json"
+write_auq_payload "$PAYLOAD" "Which color theme should the dashboard use?" '["dark", "light"]'
+( sleep 1; printf '%s\n' '{"answer": "2"}' >"$REPLY_FILE" ) &
+REPLY_WRITER_PID=$!
+START="$(date +%s)"
+OUT_G="$(run_pretool_hook "$PAYLOAD")"
+END="$(date +%s)"
+wait "$REPLY_WRITER_PID" 2>/dev/null || true
+ELAPSED=$((END - START))
+if (( ELAPSED > BOUND_CEILING )); then
+  smoke_fail "(g) hook did not return within the bound: ${ELAPSED}s > ${BOUND_CEILING}s (HANG)"
 fi
-smoke_log "ok: 4 askuserquestion_bounded audit rows recorded"
+smoke_assert_contains "$OUT_G" '"permissionDecision": "deny"' "(g) AskUserQuestion short-circuited (deny)"
+smoke_assert_contains "$OUT_G" 'A human answered your question' "(g) human answer surfaced to the agent"
+smoke_assert_contains "$OUT_G" "'light'" "(g) numeric reply '2' resolved to option text 'light'"
+smoke_assert_not_contains "$OUT_G" "channel: '2'" "(g) the raw digit is NOT surfaced as the answer"
+smoke_log "ok: (g) numeric reply resolved to option text"
+
+# (a), (b), (c), (g) each wrote one row through the real hook. (f) ran an
+# imported copy of tool-policy.py against the SAME isolated BRIDGE_HOME audit
+# log, so it adds a fifth proceed-with-note row. (e) is helper-level only (no
+# hook → no row).
+AUQ_ROWS="$(count_audit_rows askuserquestion_bounded)"
+if (( AUQ_ROWS != 5 )); then
+  smoke_fail "expected 5 askuserquestion_bounded audit rows (a,b,c,g,f), got ${AUQ_ROWS}"
+fi
+smoke_log "ok: 5 askuserquestion_bounded audit rows recorded"
 
 smoke_log "PASS: $SMOKE_NAME"

@@ -260,6 +260,39 @@ def _read_reply(path: Path) -> str | None:
     return None
 
 
+def resolve_answer_to_option(answer: str, options: list[str]) -> str:
+    """Map a human reply to the chosen option TEXT.
+
+    ``render_channel_question`` tells the human "reply with the option number or
+    its exact text", so a reply of ``"2"`` against options ``["dark", "light"]``
+    must come back to the agent as ``"light"``, not the bare digit (codex #1569
+    Phase-4 finding 3). Resolution order:
+
+    1. A 1-indexed integer that is in range → that option's text.
+    2. An exact (case-insensitive, trimmed) match of an option's text → that
+       option's canonical text (normalizes casing/whitespace back to the label).
+    3. Otherwise → the reply verbatim (a free-text answer the human typed that
+       is not one of the offered options; the agent still gets their intent).
+
+    When there are no options (a bare prompt), the reply always passes through.
+    """
+    reply = answer.strip()
+    if not options or not reply:
+        return reply
+    # (1) 1-indexed numeric selection.
+    if reply.isdigit():
+        idx = int(reply)
+        if 1 <= idx <= len(options):
+            return options[idx - 1]
+    # (2) exact option-text match (case/space-insensitive), return canonical.
+    lowered = reply.lower()
+    for option in options:
+        if option.strip().lower() == lowered:
+            return option
+    # (3) free-text answer — pass through.
+    return reply
+
+
 def _clear_reply(path: Path) -> None:
     try:
         path.unlink()
@@ -396,11 +429,16 @@ def resolve_escalation(
 
     if answer is not None:
         _clear_reply(reply_path)
+        # A numeric reply ("2") or a case/space variant of an option's text is
+        # resolved to the chosen option's canonical TEXT before it reaches the
+        # agent (codex #1569 Phase-4 finding 3) — the human was told they may
+        # reply with the option number.
+        chosen = resolve_answer_to_option(answer, options)
         return {
             "decision": "answered",
-            "answer": answer,
+            "answer": chosen,
             "reason": (
-                f"A human answered your question via the channel: {answer!r}. "
+                f"A human answered your question via the channel: {chosen!r}. "
                 "Proceed with that choice."
             ),
             "waited_seconds": round(waited, 2),
