@@ -67,9 +67,11 @@ MARKER="$BRIDGE_ACTIVE_AGENT_DIR/$AGENT/inbox-drain-state.json"
 
 QUEUE() { python3 "$REPO_ROOT/bridge-queue.py" "$@"; }
 
+# shellcheck disable=SC2120  # optional event-JSON arg; every caller uses the default {}
 drain_claude() {
   printf '%s' "${1:-\{\}}" | python3 "$REPO_ROOT/hooks/inbox-auto-drain.py" 2>/dev/null
 }
+# shellcheck disable=SC2120  # optional event-JSON arg; every caller uses the default {}
 drain_codex() {
   printf '%s' "${1:-\{\}}" | python3 "$REPO_ROOT/hooks/check_inbox.py" --format codex 2>/dev/null
 }
