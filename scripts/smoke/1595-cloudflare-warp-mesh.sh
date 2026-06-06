@@ -104,7 +104,7 @@ print_enrolled_reg() {
 case "$sub" in
   status)
     case "$mode" in
-      connected|unregistered|missing-reg|reg-neg-value|reg-revoked|reg-contradict|reg-nonzero-neg|reg-label-neg) echo "Status update: Connected" ;;
+      connected|unregistered|missing-reg|reg-neg-value|reg-revoked|reg-contradict|reg-nonzero-neg|reg-label-neg|reg-nonzero-positive) echo "Status update: Connected" ;;
       disconnected)                        echo "Status update: Disconnected" ;;
       not-connected)                       echo "Status update: Not Connected" ;;
       connected-false)                     echo "Status update: Connected: false" ;;
@@ -151,6 +151,18 @@ case "$sub" in
         else
           print_enrolled_reg
         fi
+        ;;
+      reg-nonzero-positive)
+        # BOTH the modern `registration show` AND the legacy `account` verb EXIT
+        # NON-ZERO (the query failed) yet still print a positive-looking identity
+        # label on stdout, with the error on stderr (NOT a recognized negative
+        # token). A positive enrollment conclusion REQUIRES rc==0 — a FAILED
+        # query that happens to show "Organization: …" must NOT prove enrollment
+        # (#1595 patch-dev re-review). Both sites are rc-gated → downgraded to
+        # UNKNOWN → REFUSED.
+        echo "Organization: Cosmax"
+        echo "Error: registration service unavailable" >&2
+        exit 17
         ;;
       disconnected|not-connected|connected-false|connecting) print_enrolled_reg ;;
       *)                     echo "" ;;
@@ -443,6 +455,20 @@ cf_bind_refuse_reg_label_negative_value_fallback() {
     "'Account type: false' (terminal) not overridden by positive 'account' -> warp_unavailable"
 }
 
+cf_bind_refuse_reg_nonzero_positive() {
+  # patch-dev #1595 re-review: BOTH `registration show` AND the legacy `account`
+  # verb EXIT NON-ZERO (the query failed) yet print a positive-looking identity
+  # label ("Organization: Cosmax") on stdout with the error on stderr (NOT a
+  # recognized negative token). A positive enrollment conclusion REQUIRES rc==0
+  # — a FAILED query that merely shows a positive label must NOT prove
+  # enrollment. The rc gate downgrades both probe sites to UNKNOWN -> fail closed.
+  local mock; mock="$(write_mock_warp_cli)"
+  local res; res="$(cf_preflight "$MESH_IP" reg-nonzero-positive "$MESH_IP" "$mock")"
+  smoke_assert_contains "$res" "__RC__=1" "non-zero positive-label reg refused (rc=1)"
+  smoke_assert_contains "$res" "warp_unavailable" \
+    "non-zero 'registration show'/'account' positive label not trusted -> warp_unavailable"
+}
+
 cf_bind_refuse_listen_tailscale_identity() {
   cat >"$BRIDGE_HOME/handoff-cf-listenid.json" <<EOF
 {
@@ -617,6 +643,7 @@ main() {
   smoke_run "(d) CF bind refused: contradictory reg probes (codex r4 trap)" cf_bind_refuse_reg_contradictory_probe
   smoke_run "(d) CF bind refused: non-zero explicit-negative reg (codex r5 trap)" cf_bind_refuse_reg_nonzero_negative
   smoke_run "(d) CF bind refused: label-negative-value not overridden by fallback (codex r6 trap)" cf_bind_refuse_reg_label_negative_value_fallback
+  smoke_run "(d) CF bind refused: non-zero exit + positive label (patch-dev re-review: rc==0 required for enrolled)" cf_bind_refuse_reg_nonzero_positive
   smoke_run "(d) CF bind refused: WARP listen keyed on tailscale identity" cf_bind_refuse_listen_tailscale_identity
 
   # (a) e2e + (c) + (f) over a live loopback CF-transport receiver.

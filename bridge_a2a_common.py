@@ -772,8 +772,8 @@ def _run_warp_cli(cli: str, args: list[str]) -> str:
     return out.stdout or ""
 
 
-def _warp_cli_capture(cli: str, args: list[str]) -> tuple[bool, str]:
-    """Run `warp-cli <args>` and return (ran, raw_output).
+def _warp_cli_capture(cli: str, args: list[str]) -> tuple[bool, str, int]:
+    """Run `warp-cli <args>` and return (ran, raw_output, returncode).
 
     `ran` is False ONLY when the binary could not be executed at all (missing
     / not executable / OS error) — a truly unknowable state. Otherwise `ran`
@@ -785,6 +785,12 @@ def _warp_cli_capture(cli: str, args: list[str]) -> tuple[bool, str]:
     wrapper-prefixed line — codex r7). This is the runner the enrollment proof
     uses; the `status` query keeps `_run_warp_cli` (raise-on-nonzero) because
     an unreadable status is itself a fail-closed "not connected".
+
+    `returncode` is returned alongside so the enrollment proof can FAIL CLOSED
+    on a POSITIVE-looking label that actually came from a FAILED query: a
+    nonzero exit may only ever confirm an explicit NEGATIVE (parsed from the
+    verbatim output), never prove enrollment (#1595 patch-dev re-review). It is
+    -1 when the binary could not be executed (`ran` False).
     """
     try:
         out = subprocess.run(
@@ -792,11 +798,11 @@ def _warp_cli_capture(cli: str, args: list[str]) -> tuple[bool, str]:
             capture_output=True, text=True, timeout=10,
         )
     except (FileNotFoundError, subprocess.SubprocessError, OSError):
-        return False, ""
+        return False, "", -1
     combined = (out.stdout or "")
     if out.stderr:
         combined = (combined + "\n" + out.stderr) if combined else out.stderr
-    return True, combined
+    return True, combined, out.returncode
 
 
 # Negative status/enrollment tokens that must NEVER be misread as "up". These
@@ -1018,12 +1024,24 @@ def warp_connected_and_enrolled() -> None:
     # UNINFORMATIVE: the binary could not run (`ran` False), or it ran but
     # produced no concrete/negative enrollment signal (e.g. an old client's
     # "unrecognized subcommand").
-    ran, reg = _warp_cli_capture(cli, ["--accept-tos", "registration", "show"])
+    ran, reg, rc = _warp_cli_capture(cli, ["--accept-tos", "registration", "show"])
     state = _warp_registration_state(reg) if ran else _WARP_REG_UNKNOWN
+    # Fail-closed rc gate (#1595 patch-dev re-review): a POSITIVE enrollment
+    # conclusion REQUIRES the probe to have EXITED 0. A nonzero exit that still
+    # prints a positive-looking label (e.g. exit 17 + "Organization: …" while
+    # stderr reports the registration service is unavailable) must NOT prove
+    # enrollment — downgrade it to UNKNOWN so we fall back to the legacy verb
+    # and, failing a clean positive there, fail closed. An explicit NEGATIVE on
+    # a nonzero exit stays TERMINAL (handled in _warp_registration_state), and
+    # rc==0 positives are honored exactly as before.
+    if state == _WARP_REG_ENROLLED and rc != 0:
+        state = _WARP_REG_UNKNOWN
     if state == _WARP_REG_UNKNOWN:
         # Modern verb uninformative — try the legacy `account` verb.
-        ran, reg = _warp_cli_capture(cli, ["account"])
+        ran, reg, rc = _warp_cli_capture(cli, ["account"])
         state = _warp_registration_state(reg) if ran else _WARP_REG_UNKNOWN
+        if state == _WARP_REG_ENROLLED and rc != 0:
+            state = _WARP_REG_UNKNOWN
     if state != _WARP_REG_ENROLLED:
         raise CloudflareWarpUnavailable(
             "WARP device is not registered/enrolled (no positive enrollment "
