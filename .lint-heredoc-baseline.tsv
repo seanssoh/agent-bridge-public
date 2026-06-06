@@ -866,7 +866,6 @@ tests/system-config-gating/smoke.sh	459	C2	22768408ebe20f57367214dca8f83555238b8
 tests/system-config-gating/smoke.sh	481	C2	ad27080167f721bcb6b76c420ef476c33664a2e421415f0edc9a92780c6518dc	cat heredoc in capture	patch-dev	Phase 6 PR F
 tests/system-config-gating/smoke.sh	505	C2	c29510f32a074ff03db47b7689308249ac32ebe94198e3fb3d23572d565c236f	cat heredoc in capture	patch-dev	Phase 6 PR F
 tests/system-config-gating/smoke.sh	530	C2	67e26fe9bd787e0f30c8be0d694bea1e3ad2037303f0c75fb1dc8304a65beccc	cat heredoc in capture	patch-dev	Phase 6 PR F
-tests/system-config-gating/smoke.sh	657	C2	3c77d80841635c87aad3477829f804a36c3d77a344afd334af11b014edab9ad0	cat heredoc in capture	patch-dev	Phase 6 PR F
 tests/tool-policy-bash-system-class/smoke.sh	115	C1	8b40ac1ae47b8dc42bb883423f199a472e4eb3d6b3a9ba31fc107d6cd14f1de7	heredoc in capture	patch-dev	Phase 6 PR F
 tests/tool-policy-bash-system-class/smoke.sh	130	H3	8983fa977b37ee4a8f50f74ce401778bd9fc69d94937f3b220a18c888cba466d	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 tests/tool-policy-bash-system-class/smoke.sh	280	H3	8293e229c5c17adeb0cb6ff34680a60c285a87d8f52bd071892657bc4e582b59	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
