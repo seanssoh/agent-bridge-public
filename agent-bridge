@@ -893,10 +893,19 @@ PY
           cat <<'A2A_HELP'
 Usage: agent-bridge a2a <command> [args]
 
-  send          Stage an outbound cross-bridge handoff into the outbox.
+  send          Stage an outbound cross-bridge handoff into the outbox, OR
+                fan a message out to every member of a room (--room).
+                  # 1:1 cross-bridge send:
                   agent-bridge a2a send --peer <peer> --to <agent> \
                     --title <t> [--body <text>|--body-file <path>] \
                     [--priority low|normal|high|urgent] [--dry-run]
+                  # whole-room fan-out (every OTHER member, self excluded;
+                  # local members via the queue, remote via room-scoped A2A):
+                  agent-bridge a2a send --room <room_id> \
+                    --title <t> [--body <text>|--body-file <path>] \
+                    [--to <member>] [--priority ...] [--json]
+                (--peer/--to and --room are mutually exclusive. The same
+                fan-out is also `agent-bridge room talk <room_id> --fanout`.)
   outbox        list | retry <id> | drop <id> | gc — manage the outbox.
   inbox-dedupe  list | gc — inspect/prune the receiver dedupe ledger.
   peers         list | test <peer> — inspect configured peers.
@@ -941,6 +950,11 @@ Usage: agent-bridge room <command> [args]
                   agent-bridge room join <link> [--as <agent>]
   approve|deny  Leader-only: approve/deny a join request (agent or agent@node).
   kick|leave    Remove a member (leader kick / self leave) — bumps epoch.
+  talk          Room-scoped message to other-node members (add --fanout to ALSO
+                reach same-node members via the queue).
+  send          Whole-room fan-out to EVERY other member (self excluded; local
+                via the queue + remote via room-scoped A2A). Same as
+                `agent-bridge a2a send --room <room_id>`.
   adopt-all     Create a default room with every current roster agent.
   acl           Show/set rooms_acl mode (off|enforce). P1a does NOT enforce.
 
