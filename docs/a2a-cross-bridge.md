@@ -399,17 +399,12 @@ defects were fixed:
   `tx 0 / rx > 0` asymmetry), or `transport_dead_path_unknown` (inconclusive).
   The classification is surfaced in the daemon's stuck-alert body.
 
-- **Backoff recovery reset.** The historical `backoff_seconds(base=15,
-  ceiling=3600)` + jitter meant an attempt-8..10 retry row waited 16–60 min,
-  and the `deliver` tick only selects `next_attempt_ts <= now` rows — so after
-  the peer *recovered*, the high-attempt rows stayed dormant for tens of
-  minutes (the incident needed a manual `agb a2a outbox retry`).
-  `diagnose-stuck` now, when a backoff-waiting peer's **TCP probe succeeds**,
-  resets that peer's `retry` rows to `next_attempt_ts=0` so the next deliver
-  tick sends immediately. #1575 Part B complements this from the other side by
-  lowering the default backoff ceiling to **120s** (see *Sender outbox* above),
-  so even without a probe transition the worst-case dormancy is ~1–2 min. The
-  reset is
+- **Backoff recovery reset.** Sender retry backoff now defaults to
+  `backoff_seconds(base=15, ceiling=120)` + jitter, so high-attempt retry rows
+  no longer wait 16-60 min after the peer recovers. The `deliver` tick still
+  selects only `next_attempt_ts <= now` rows, so `diagnose-stuck`, when a
+  backoff-waiting peer's **TCP probe succeeds**, resets that peer's `retry` rows
+  to `next_attempt_ts=0` so the next deliver tick sends immediately. The reset is
   **probe-gated and transition-gated**: a peer whose probe still *fails* is left
   on its backoff (its max-attempts / dead-letter behavior is untouched — an
   unreachable peer is never thrashed), and a peer that stays reachable is reset
