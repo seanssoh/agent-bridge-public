@@ -11,6 +11,24 @@ bridge_hooks_python() {
   python3 "$BRIDGE_SCRIPT_DIR/bridge-hooks.py" "$@"
 }
 
+# Issue #1574: pin the interpreter baked into generated hook commands to the
+# platform's *system* python rather than a bare `python3`. On a Homebrew-python
+# macOS host, Claude Code's hook-execution PATH puts the Homebrew interpreter
+# first, so a bare `python3` resolves to e.g. Homebrew 3.14 — which surfaces
+# stricter SyntaxWarnings and a per-call "hook error … Traceback" wrapper even
+# though the command runs fine. `/usr/bin/python3` is the system interpreter on
+# both macOS and the supported Linux targets and matches the pin already used
+# by the tracked scaffold (agents/.claude/settings.json). Fall back to the
+# PATH-resolved python3 only when `/usr/bin/python3` is genuinely absent (e.g.
+# a minimal container) so the pin stays portable and never emits an empty bin.
+bridge_hook_pinned_python_bin() {
+  if [[ -x /usr/bin/python3 ]]; then
+    printf '/usr/bin/python3'
+    return 0
+  fi
+  command -v python3 || printf '/usr/bin/python3'
+}
+
 bridge_hook_mark_idle_path() {
   printf '%s/mark-idle.sh' "$BRIDGE_HOOKS_DIR"
 }
@@ -402,10 +420,10 @@ bridge_ensure_claude_tool_policy_hooks() {
   local launch_cmd="${2-}"
   local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
-    bridge_hooks_python ensure-tool-policy-hooks --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
+    bridge_hooks_python ensure-tool-policy-hooks --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
-    bridge_hooks_python ensure-tool-policy-hooks --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+    bridge_hooks_python ensure-tool-policy-hooks --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
