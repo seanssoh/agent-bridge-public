@@ -15,6 +15,10 @@
 
   "timestamp_skew_seconds": 300,
   "delivery_max_attempts": 12,
+  "_delivery_backoff_ceiling_comment": "OPTIONAL (#1575 Part B). Ceiling in seconds for the exponential outbox-retry backoff (base 15s + full jitter). Default 120. Caps how long a recovered peer's high-attempt retry rows idle before the next deliver tick re-sends them; the 2026-06-06 tailnet incident showed the old 3600s ceiling left messages dormant for 16-60 min after the path recovered. Floor is 15s. Env override: BRIDGE_A2A_BACKOFF_CEILING_SECONDS.",
+  "delivery_backoff_ceiling_seconds": 120,
+  "_delivery_trust_peer_retry_after_comment": "OPTIONAL (#1575 Part B). When false (default) a peer's Retry-After header is clamped to delivery_backoff_ceiling_seconds — the header is NOT HMAC-authenticated, so a transient/spoofed 503 cannot re-impose a multi-minute backoff. Set true ONLY if you intentionally trust a peer to dictate a longer backoff (e.g. a deliberately long maintenance window).",
+  "delivery_trust_peer_retry_after": false,
   "outbox_max_total_bytes": 67108864,
   "outbox_max_pending_per_peer": 500,
 

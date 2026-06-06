@@ -775,12 +775,31 @@ def _schedule_retry(conn, message_id: str, attempts: int, cfg: dict[str, Any],
         conn.commit()
         return "dead(maxattempts)"
 
-    delay = a2a.backoff_seconds(attempts)
+    # #1575 Part B: cap the exponential backoff at the configured ceiling
+    # (default 120s, was 3600s) so a recovered peer's retry rows do not idle
+    # out a 16-60 min backoff. base=15 + jitter (below) are unchanged.
+    ceiling = a2a.delivery_backoff_ceiling(cfg)
+    delay = a2a.backoff_seconds(attempts, ceiling=ceiling)
     if retry_after:
         try:
-            delay = max(delay, int(float(retry_after)))
+            ra = int(float(retry_after))
         except (TypeError, ValueError):
-            pass
+            ra = 0
+        if ra > 0:
+            # The Retry-After header is NOT part of the HMAC-authenticated
+            # envelope, so a large value from a transient/spoofed 503 must not
+            # be allowed to re-impose a multi-minute backoff that #1575 Part B
+            # is explicitly removing. Honor it, but clamp it to the ceiling
+            # unless the operator has opted this bridge into trusting peer
+            # Retry-After verbatim (`delivery_trust_peer_retry_after: true` —
+            # the existing config-key trust pattern, no new wire trust path).
+            # The gate requires an EXACT boolean True: any other value (the
+            # strings "false"/"true", 1, "yes", etc.) is NOT trusted, so a
+            # config typo cannot fail open into honoring an unauthenticated
+            # peer Retry-After beyond the ceiling.
+            if cfg.get("delivery_trust_peer_retry_after", False) is not True:
+                ra = min(ra, ceiling)
+            delay = max(delay, ra)
     # Full jitter.
     delay = int(delay * (0.5 + random.random() * 0.5))
     next_ts = a2a.now_ts() + max(1, delay)
@@ -894,13 +913,16 @@ def cmd_deliver(args: argparse.Namespace) -> int:
 #      connect (the `peers test` mechanic), and `tailscale status` node
 #      online + tx/rx asymmetry.
 #
-#   2. RECOVERY — `backoff_seconds(base=15, ceiling=3600)` + jitter means an
-#      attempt-8..10 retry row waits 16-60 min. The deliver tick only selects
-#      `next_attempt_ts <= now` rows, so after the peer RECOVERED the high-
-#      attempt rows stayed dormant for tens of minutes (the incident needed a
-#      manual `agb a2a outbox retry`). Here, when a retry row's peer TCP probe
-#      SUCCEEDS, we reset that peer's retry rows to `next_attempt_ts=0` so the
-#      next deliver tick sends immediately (bounded by `deliver --batch`).
+#   2. RECOVERY — the historical `backoff_seconds(base=15, ceiling=3600)` +
+#      jitter meant an attempt-8..10 retry row waited 16-60 min. The deliver
+#      tick only selects `next_attempt_ts <= now` rows, so after the peer
+#      RECOVERED the high-attempt rows stayed dormant for tens of minutes (the
+#      incident needed a manual `agb a2a outbox retry`). Here, when a retry
+#      row's peer TCP probe SUCCEEDS, we reset that peer's retry rows to
+#      `next_attempt_ts=0` so the next deliver tick sends immediately (bounded
+#      by `deliver --batch`). #1575 Part B complements this from the other
+#      side: the default backoff ceiling is now 120s (was 3600s), so even
+#      WITHOUT a probe transition the worst-case dormancy is ~1-2 min.
 #
 # HEALTH ORACLE: TCP `peer:port` — never `tailscale ping` (a disco-protocol
 # artifact that times out on a healthy A2A path; see the #10114 root-cause
