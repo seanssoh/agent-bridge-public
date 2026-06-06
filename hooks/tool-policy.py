@@ -75,6 +75,16 @@ from system_config_paths import (  # noqa: E402
     protected_literal_suffixes,
 )
 
+# Issue #1569: bounded AskUserQuestion escalation. The helper lives in this
+# hooks/ directory (already on sys.path via _HOOKS_DIR) and is imported
+# defensively — a missing/broken helper must NOT brick every Claude session,
+# it just means the AskUserQuestion intercept is inert (the tool falls through
+# to its normal, unbounded behavior, i.e. no regression for other tools).
+try:
+    import askuserquestion_escalate as _auq_escalate  # noqa: E402
+except Exception:  # noqa: BLE001 — see rationale above
+    _auq_escalate = None  # type: ignore[assignment]
+
 
 def roster_local_path() -> Path:
     return bridge_home_dir() / "agent-roster.local.sh"
@@ -3678,6 +3688,105 @@ def pretool_block_response(reason: str, detail: dict[str, Any]) -> None:
     sys.stdout.write("\n")
 
 
+def _askuserquestion_enabled() -> bool:
+    """Whether the bounded-AskUserQuestion intercept is active.
+
+    Default ON — an autonomous bridge agent that calls AskUserQuestion without
+    the bound is the foot-gun #1569 fixes. An operator can set
+    ``BRIDGE_ASKUSERQUESTION_BOUND=0`` to restore the raw (unbounded)
+    multiple-choice UI for a specific interactive session.
+    """
+    raw = os.environ.get("BRIDGE_ASKUSERQUESTION_BOUND", "").strip().lower()  # noqa: iso-helper-boundary — os.environ (.environ) false-matches the .env boundary pattern; this is a feature toggle, not an isolated runtime artifact
+    return raw not in {"0", "false", "no", "off"}
+
+
+def handle_askuserquestion(payload: dict[str, Any], agent: str, tool_input: dict[str, Any]) -> int:
+    """Bound an AskUserQuestion call to a channel escalation + fallback (#1569).
+
+    PreToolUse cannot inject a tool result, so the contract is: DENY the
+    AskUserQuestion call and carry the human's channel answer (or the
+    autonomous fallback instruction) back to the agent in
+    ``permissionDecisionReason`` / ``additionalContext``. The agent then acts
+    on that guidance instead of hanging on the interactive picker.
+
+    The bounded wait + escalation lives in ``askuserquestion_escalate`` so the
+    polling loop stays out of the per-tool dispatch path; this wrapper only
+    builds the audit row + the deny response. NEVER waits beyond
+    ``BRIDGE_ASKUSERQUESTION_WAIT_SECONDS`` (default 30s).
+    """
+    if _auq_escalate is None:
+        # The escalation helper is missing/unimportable. We must STILL bound the
+        # call rather than let the raw unbounded picker through (codex #1569 r1
+        # finding 1) — deny with the safe reversible fallback so the agent
+        # proceeds with a note instead of hanging.
+        result = {
+            "decision": "proceed_with_note",
+            "reason": (
+                "AskUserQuestion escalation is unavailable on this install "
+                "(helper module not loaded); proceed with your best-judgment "
+                "default and leave a durable note. Do NOT retry the question."
+            ),
+            "waited_seconds": 0,
+            "high_stakes": False,
+        }
+        reason = str(result["reason"])
+        write_audit(
+            "askuserquestion_bounded",
+            agent or "unknown",
+            {
+                "agent": agent,
+                "tool_use_id": str(payload.get("tool_use_id") or ""),
+                "session_id": str(payload.get("session_id") or ""),
+                "decision": result["decision"],
+                "waited_seconds": result["waited_seconds"],
+                "high_stakes": result["high_stakes"],
+                "escalated": False,
+            },
+        )
+        pretool_block_response(reason, {"agent": agent, "tool_name": "AskUserQuestion"})
+        return 0
+
+    try:
+        result = _auq_escalate.resolve_escalation(
+            tool_input,
+            agent=agent,
+            state_dir=bridge_home_dir() / "state",
+            script_dir=ROOT,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The escalation machinery failed (bad env, missing script, etc.). The
+        # ONE thing we must never do is hang or hard-error — fall back to the
+        # safe reversible branch so the agent proceeds with a note rather than
+        # stalling on the interactive picker.
+        result = {
+            "decision": "proceed_with_note",
+            "reason": (
+                "AskUserQuestion escalation could not run "
+                f"({type(exc).__name__}); proceed with your best-judgment "
+                "default and leave a durable note. Do NOT retry the question."
+            ),
+            "waited_seconds": 0,
+            "high_stakes": False,
+        }
+
+    reason = str(result.get("reason") or "")
+    write_audit(
+        "askuserquestion_bounded",
+        agent or "unknown",
+        {
+            "agent": agent,
+            "tool_use_id": str(payload.get("tool_use_id") or ""),
+            "session_id": str(payload.get("session_id") or ""),
+            "decision": result.get("decision"),
+            "waited_seconds": result.get("waited_seconds"),
+            "high_stakes": result.get("high_stakes"),
+            "escalated": result.get("escalated"),
+        },
+    )
+    pretool_block_response(reason, {"agent": agent, "tool_name": "AskUserQuestion"})
+    return 0
+
+
 def _system_config_path_from_input(tool_name: str, tool_input: dict[str, Any]) -> Path | None:
     """Return the protected-path argument that triggered the hook deny.
 
@@ -3824,6 +3933,18 @@ def handle_pretool(payload: dict[str, Any], agent: str) -> int:
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
         return 0
+
+    # Issue #1569: bound AskUserQuestion to a channel escalation + autonomous
+    # fallback so an autonomous agent never hangs on the interactive picker.
+    # This is a fully separate, short-circuiting branch — it returns before any
+    # other gate runs, so the credential / protected-path / cross-agent
+    # handling of EVERY OTHER tool stays byte-for-byte unchanged. The intercept
+    # fires whenever the bound is enabled (default on); a missing/broken helper
+    # does NOT fall through to the raw unbounded tool (codex #1569 r1 finding 1)
+    # — handle_askuserquestion takes the safe proceed-with-note fallback so the
+    # call is always bounded.
+    if tool_name == "AskUserQuestion" and _askuserquestion_enabled():
+        return handle_askuserquestion(payload, agent, tool_input)
 
     reason: str | None = None
     detail = {
