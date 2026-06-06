@@ -251,8 +251,20 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 # subcommand token is also kept so that an `agb help` style invocation
 # (if a future patch adds the subcommand handler) does not eat the
 # roster cost either.
+#
+# Issue #848 (lost-fix upstream): also skip the top-level load for the
+# pure queue verbs (`show`, `claim`, `done`, `cancel`, `update`,
+# `handoff`, `summary`, `create`). The dispatch table below `exec`s
+# `bridge-task.sh "$@"` for all of these (alongside the already-listed
+# `inbox`), and `bridge-task.sh` is a separate process that owns its
+# own lazy roster loading (`ensure_roster_loaded`). So the parent-level
+# load here is pure redundant cold-start cost — the child re-derives
+# whatever roster state it needs. `handoff` is the only one that
+# validates a target against the roster, and it does so via the child's
+# own `ensure_roster_loaded` immediately before `bridge_require_agent`,
+# so it is unaffected by skipping the parent load.
 case "${1:-}" in
-  version|status|daemon|agent|task|inbox|a2a|room|iso-run|help|--help|-h|--version|-V) ;;
+  version|status|daemon|agent|task|inbox|show|claim|done|cancel|update|handoff|summary|create|a2a|room|iso-run|help|--help|-h|--version|-V) ;;
   init)
     # bridge-isolation-v2.sh's `BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"`
     # default fires during our bridge-lib.sh source above and exports the
