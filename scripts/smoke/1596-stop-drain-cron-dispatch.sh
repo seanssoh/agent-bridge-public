@@ -317,6 +317,26 @@ else
 fi
 
 # ============================================================
+# (i2) nonzero-rc read failure WITH a parseable row → fail open (patch-dev re-review)
+# ============================================================
+# (i) covers a read failure with EMPTY stdout. A real failure can ALSO exit
+# nonzero while still emitting a parseable, valid-looking row on stdout (a
+# partial / SQLite-warning read). _open_rows_for must fail open (None) on ANY
+# nonzero rc except the documented rc==1 + literal `[]` empty sentinel — never
+# trust the row, or a failed read could emit a Stop block. The probe
+# monkeypatches queue_cli to return rc=2 + a valid queued row (must → None / no
+# block) AND rc==1 + `[]` (must stay [], the empty sentinel, so the queued path
+# still falls through). It prints NONE only when both hold; BLOCK or BADEMPTY
+# otherwise.
+reset_marker
+RCFAIL_OUT="$(python3 "$SCRIPT_DIR/1596-stop-drain-cron-dispatch-helpers/rc-failure-probe.py" "$AGENT" 2>"$TMP_DIR/rcfail.err" || true)"
+if [[ "$RCFAIL_OUT" == "NONE" ]] && [[ ! -s "$TMP_DIR/rcfail.err" ]]; then
+  pass "(i2) nonzero-rc read failure with a parseable row → fail open; rc==1 [] sentinel preserved"
+else
+  fail "(i2) nonzero-rc read with a row must fail open and keep the [] sentinel (out='${RCFAIL_OUT}', err='$(cat "$TMP_DIR/rcfail.err")')"
+fi
+
+# ============================================================
 # (h) both engines: identical actionable verdicts over the same states
 # ============================================================
 # Drive BOTH engines over each canonical state with a fresh marker and assert

@@ -1724,16 +1724,31 @@ def _open_rows_for(
         proc = queue_cli(cmd)
     except OSError:
         return None
-    # CRITICAL fail-open distinction: with --all, find-open prints the literal
-    # `[]` (and exits 1) for a genuinely EMPTY result, but a real read FAILURE
-    # (SQLite/open error) exits nonzero with a traceback on stderr and EMPTY
-    # stdout. So empty/whitespace stdout means the read FAILED → return None
-    # (fail open: do not block, do not fall through), NOT []. The genuine
-    # empty case arrives as the string "[]" and parses to [] below.
-    if not proc.stdout.strip():
+    # CRITICAL fail-open distinction. `find-open --all` uses exit code 1 ONLY as
+    # the "genuinely EMPTY" sentinel (it prints the literal `[]`); exit 0 is a
+    # normal populated read. ANY OTHER nonzero exit is a real read FAILURE
+    # (SQLite/open error) and MUST fail open — return None — EVEN WHEN stdout
+    # carries parseable JSON: a partial/garbled failed read can still emit a
+    # valid-looking row, and treating it as actionable would let a FAILED queue
+    # read emit a Stop block (#1596 patch-dev re-review — a nonzero rc with a
+    # parseable row in stdout was wrongly blocking; checking only empty-stdout
+    # missed it). Empty/whitespace stdout is likewise a failed read → None.
+    # None is the fail-open signal (do not block, do not fall through); `[]` is
+    # genuinely-empty (lets the queued path fall through to the claimed
+    # anti-abandonment path) and is produced ONLY by the rc==1 literal-`[]`
+    # sentinel (or an rc==0 empty list).
+    stdout = proc.stdout.strip()
+    if proc.returncode not in (0, 1):
+        return None
+    if not stdout:
+        return None
+    if proc.returncode == 1 and stdout != "[]":
+        # rc==1 is the empty-sentinel ONLY with the literal `[]`; rc==1 carrying
+        # any other body is anomalous (not the documented empty contract) → fail
+        # open rather than trust a partial/odd read.
         return None
     try:
-        rows = json.loads(proc.stdout)
+        rows = json.loads(stdout)
     except json.JSONDecodeError:
         return None
     if not isinstance(rows, list):
