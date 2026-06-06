@@ -3115,7 +3115,21 @@ def cmd_conflicts_adopt(args: argparse.Namespace) -> int:
         try:
             shutil.copyfile(live, backup)
         except OSError as exc:
-            print(f"warning: could not snapshot prior live file to {backup}: {exc}", file=sys.stderr)
+            # The backup-before-overwrite invariant is load-bearing: if the
+            # prior live bytes cannot be snapshotted, REFUSE before mutating
+            # live. A non-writable PARENT DIR with a still-writable live file
+            # would otherwise let the overwrite succeed WITHOUT a `.pre-adopt`
+            # recovery copy (and then crash on the sidecar unlink) — exactly the
+            # data-loss this guard exists to prevent (#1601 patch-dev re-review).
+            # Controlled nonzero, no traceback, sidecar left in place.
+            print(
+                f"refusing to adopt: could not snapshot the prior live file to "
+                f"{backup} ({exc}). The live file is UNCHANGED and the sidecar "
+                f"is left in place. Fix the destination (e.g. parent-directory "
+                f"permissions) and re-run adopt.",
+                file=sys.stderr,
+            )
+            return 1
 
     # Only after the guard has passed do we mutate the live file, and only
     # after a successful write do we unlink the sidecar (the recovery artifact).
@@ -3129,7 +3143,18 @@ def cmd_conflicts_adopt(args: argparse.Namespace) -> int:
     except OSError as exc:
         print(f"adopt failed writing {live}: {exc}", file=sys.stderr)
         return 1
-    conflict.unlink()
+    try:
+        conflict.unlink()
+    except OSError as exc:
+        # The live file was already written successfully; failing to remove the
+        # sidecar (e.g. a non-writable parent dir) is non-fatal — it is now a
+        # stale recovery artifact, not corruption. Surface a CONTROLLED warning
+        # rather than a traceback (#1601 patch-dev re-review).
+        print(
+            f"warning: adopted {live} but could not remove the sidecar "
+            f"{conflict}: {exc}. Remove it manually.",
+            file=sys.stderr,
+        )
     write_conflict_audit(
         target_root,
         "conflict_adopt",

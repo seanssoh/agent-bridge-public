@@ -184,6 +184,35 @@ assert_force_overrides_guard() {
   smoke_assert_file_exists "$live.pre-adopt" "(f) --force adopt still snapshots the prior live"
 }
 
+assert_backup_failure_refuses_before_write() {
+  # patch-dev #1601 re-review: a non-writable PARENT DIR with a still-writable
+  # live file makes the `.pre-adopt` snapshot fail while the live overwrite
+  # would otherwise succeed. Adopt MUST refuse BEFORE writing live — never
+  # overwrite without a recovery copy — with a controlled nonzero (no
+  # traceback) and the sidecar preserved.
+  local dir="$BRIDGE_HOME/ro-target"
+  mkdir -p "$dir"
+  local live="$dir/live.py"
+  local conflict="$live.upgrade-conflict"
+  printf 'old = 1\n' >"$live"
+  printf 'new = 2\n' >"$conflict"
+  chmod 600 "$live" "$conflict"
+  chmod 500 "$dir"   # parent non-writable: a new `.pre-adopt` cannot be created
+
+  local rc=0 err
+  err="$(python3 "$UPGRADE_PY" conflicts-adopt --target-root "$BRIDGE_HOME" --yes "$conflict" \
+    2>&1 1>/dev/null)" || rc=$?
+  chmod 700 "$dir"   # restore so we can inspect + cleanup can remove the dir
+
+  [[ "$rc" -ne 0 ]] || smoke_fail "(g) adopt must refuse when the .pre-adopt snapshot cannot be created"
+  smoke_assert_eq "old = 1" "$(cat "$live")" "(g) live UNCHANGED when the backup cannot be written"
+  [[ -f "$live.pre-adopt" ]] && smoke_fail "(g) no .pre-adopt must exist after a refused adopt"
+  smoke_assert_file_exists "$conflict" "(g) sidecar PRESERVED on backup-failure refusal"
+  if printf '%s' "$err" | grep -qiE 'Traceback'; then
+    smoke_fail "(g) backup-failure refusal must be a controlled error, not a traceback"
+  fi
+}
+
 main() {
   smoke_require_cmd python3
   smoke_require_cmd bash
@@ -196,6 +225,7 @@ main() {
   smoke_run "(d) self-brick: marker bridge-upgrade.py refused, tool stays runnable" assert_self_brick_refused
   smoke_run "(e) =-prefixed content line is not a marker, still adoptable" assert_marker_false_positive_adopts
   smoke_run "(f) --force escape hatch overrides the guard" assert_force_overrides_guard
+  smoke_run "(g) backup snapshot failure refuses before overwriting live" assert_backup_failure_refuses_before_write
   smoke_log "passed"
 }
 
