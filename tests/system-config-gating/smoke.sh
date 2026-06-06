@@ -557,7 +557,7 @@ fi
 # quoted-delimiter simple cat/tee shape is strippable (see
 # _command_is_simple_inert_quoted_heredoc_write) — anything that could execute
 # the body stays conservative (D2k/D2l/D2m).
-sce7i_payload=$(cat <<'JSON'
+IFS= read -r -d '' sce7i_payload <<'JSON' || true
 {
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
@@ -569,7 +569,6 @@ sce7i_payload=$(cat <<'JSON'
   }
 }
 JSON
-)
 sce7i_out="$(run_hook_pretool_payload "$sce7i_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
 if [[ "$sce7i_out" == *'"deny"'* ]]; then
   fail "scenario 7 (D2i #1574): shared/ report mentioning 'hooks/...' in body falsely denied — output: $sce7i_out"
@@ -582,7 +581,7 @@ fi
 # strippable simple quoted-heredoc shape. The body strip removes only the body,
 # never the target (it keeps the head up to `<<'EOF'`), so the `hooks/` needle
 # still fires at the redirect boundary in the retained head.
-sce7j_payload=$(cat <<'JSON'
+IFS= read -r -d '' sce7j_payload <<'JSON' || true
 {
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
@@ -594,7 +593,6 @@ sce7j_payload=$(cat <<'JSON'
   }
 }
 JSON
-)
 sce7j_out="$(run_hook_pretool_payload "$sce7j_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
 if [[ "$sce7j_out" == *'"deny"'* ]] && [[ "$sce7j_out" == *"system config path"* ]]; then
   pass "scenario 7 (D2j #1574): real write into hooks/ target still denied after body strip"
@@ -608,7 +606,7 @@ fi
 # protected write. The body-strip is gated on _heredoc_body_is_inert_data, which
 # fail-closes for interpreters, so the raw body stays on the scan surface and
 # the gate MUST deny. Without the gate this command bypassed the guard.
-sce7k_payload=$(cat <<'JSON'
+IFS= read -r -d '' sce7k_payload <<'JSON' || true
 {
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
@@ -620,17 +618,16 @@ sce7k_payload=$(cat <<'JSON'
   }
 }
 JSON
-)
 sce7k_out="$(run_hook_pretool_payload "$sce7k_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
 if [[ "$sce7k_out" == *'"deny"'* ]] && [[ "$sce7k_out" == *"system config path"* ]]; then
-  pass "scenario 7 (D2k #1574): bash <<EOF body writing hooks/ still denied (no interpreter bypass)"
+  pass "scenario 7 (D2k #1574): bash-interpreter heredoc body writing hooks/ still denied (no interpreter bypass)"
 else
   fail "scenario 7 (D2k #1574): interpreter heredoc-body write NOT denied — output: $sce7k_out"
 fi
 
 # D2l (Issue #1574) — pipe-to-interpreter teeth-preserve: `cat <<EOF | bash`
 # pipes the body to an interpreter, so the body executes. Must still deny.
-sce7l_payload=$(cat <<'JSON'
+IFS= read -r -d '' sce7l_payload <<'JSON' || true
 {
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
@@ -642,7 +639,6 @@ sce7l_payload=$(cat <<'JSON'
   }
 }
 JSON
-)
 sce7l_out="$(run_hook_pretool_payload "$sce7l_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
 if [[ "$sce7l_out" == *'"deny"'* ]] && [[ "$sce7l_out" == *"system config path"* ]]; then
   pass "scenario 7 (D2l #1574): cat <<EOF | bash body writing hooks/ still denied"
@@ -656,7 +652,7 @@ fi
 # shell-exec construct means the command is NOT the simple-quoted-heredoc shape
 # (_command_is_simple_inert_quoted_heredoc_write returns False), so the raw body
 # stays on the scan surface and the gate MUST deny.
-sce7m_payload=$(cat <<'JSON'
+IFS= read -r -d '' sce7m_payload <<'JSON' || true
 {
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
@@ -668,7 +664,6 @@ sce7m_payload=$(cat <<'JSON'
   }
 }
 JSON
-)
 sce7m_out="$(run_hook_pretool_payload "$sce7m_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
 if [[ "$sce7m_out" == *'"deny"'* ]] && [[ "$sce7m_out" == *"system config path"* ]]; then
   pass "scenario 7 (D2m #1574): cat > >(bash) procsub body writing hooks/ still denied"
@@ -682,7 +677,7 @@ fi
 # literal interpreter basename and the inert sink (cat) write `>p` looks benign,
 # but the body IS executed. The command has multiple stages / `&` / `$`, so it
 # is not the simple-quoted-heredoc shape → raw body scanned → MUST deny.
-sce7n_payload=$(cat <<'JSON'
+IFS= read -r -d '' sce7n_payload <<'JSON' || true
 {
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
@@ -694,7 +689,6 @@ sce7n_payload=$(cat <<'JSON'
   }
 }
 JSON
-)
 sce7n_out="$(run_hook_pretool_payload "$sce7n_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
 if [[ "$sce7n_out" == *'"deny"'* ]] && [[ "$sce7n_out" == *"system config path"* ]]; then
   pass "scenario 7 (D2n #1574): variable-backed FIFO interpreter body writing hooks/ still denied"
@@ -706,7 +700,7 @@ fi
 # is subject to shell expansion, so a `$(...)` inside it EXECUTES. The strip
 # only applies to QUOTED delimiters, so this unquoted body stays on the scan
 # surface and the embedded `>hooks/evil.py` write MUST deny.
-sce7o_payload=$(cat <<'JSON'
+IFS= read -r -d '' sce7o_payload <<'JSON' || true
 {
   "hook_event_name": "PreToolUse",
   "tool_name": "Bash",
@@ -718,7 +712,6 @@ sce7o_payload=$(cat <<'JSON'
   }
 }
 JSON
-)
 sce7o_out="$(run_hook_pretool_payload "$sce7o_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
 if [[ "$sce7o_out" == *'"deny"'* ]] && [[ "$sce7o_out" == *"system config path"* ]]; then
   pass "scenario 7 (D2o #1574): unquoted heredoc with \$(...) writing hooks/ still denied"
