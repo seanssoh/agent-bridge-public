@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import time
@@ -140,6 +142,22 @@ class TailscaleUnavailable(A2AError):
 
     def __init__(self, message: str) -> None:
         super().__init__(message, code="tailscale_unavailable")
+
+
+class CloudflareWarpUnavailable(A2AError):
+    """The local Cloudflare WARP CLI / status could not be queried.
+
+    The Cloudflare-One / WARP-Mesh transport analogue of
+    `TailscaleUnavailable`: when the WARP connection/enrollment state cannot
+    be determined (CLI missing, status query failed, not registered, not
+    connected) the receiver bind proof MUST fail closed — it never guesses
+    "connected" from a CIDR shape or a bare interface address. Distinct from
+    "WARP is up but the bind IP is not on a local interface", which is a
+    plain A2AError (`bind_not_warp_local`).
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="warp_unavailable")
 
 
 # --------------------------------------------------------------------------
@@ -606,6 +624,631 @@ def resolve_peer_address(entry: dict[str, Any]) -> str:
         "connectivity.",
         code="resolve_name_unknown",
     )
+
+
+# --------------------------------------------------------------------------
+# Transport selection (#1595 — Tailscale | cloudflare-warp-mesh)
+# --------------------------------------------------------------------------
+#
+# A2A is transport-pluggable. The transport decides ONE thing: how the
+# receiver PROVES that a candidate bind IP is a real, currently-up local
+# interface on the private network substrate (and, for the sender, how a
+# peer's target IP is resolved). Everything above the transport — the
+# HMAC-signed wire protocol, dedupe, allowlist/caps/backpressure,
+# room_scoped_check, room epoch, the `remote_addr == resolved-peer`
+# source check — is transport-AGNOSTIC and unchanged.
+#
+# Two kinds today:
+#   - "tailscale"            (default; legacy back-compat): proof is
+#                            membership in `tailscale ip`'s set. A config
+#                            with NO `transport` key behaves EXACTLY as
+#                            before — `transport_kind` returns "tailscale".
+#   - "cloudflare-warp-mesh" (#1595): proof is (a) the candidate IP is
+#                            assigned to a real local interface AND (b) WARP
+#                            is connected + registered/enrolled. CIDR shape
+#                            alone is NOT proof. Fail CLOSED on any
+#                            uncertainty (CLI missing, WARP disconnected,
+#                            IP not on a local interface).
+#
+# This is Mesh / WARP-to-WARP PRIVATE-IP connectivity (TCP/UDP by device
+# IP) — NOT the Cloudflare Tunnel + Access hostname model. The two are
+# distinct substrates; only the private-IP one is implemented here.
+
+TRANSPORT_TAILSCALE = "tailscale"
+TRANSPORT_CLOUDFLARE_WARP_MESH = "cloudflare-warp-mesh"
+SUPPORTED_TRANSPORTS = (TRANSPORT_TAILSCALE, TRANSPORT_CLOUDFLARE_WARP_MESH)
+
+
+def transport_kind(cfg: dict[str, Any]) -> str:
+    """Return the configured A2A transport kind, defaulting to "tailscale".
+
+    Back-compat: a config with no `transport` block (every config shipped
+    before #1595) resolves to "tailscale" and the legacy bind/source proof
+    runs unchanged. An explicit `transport.kind` must be one of
+    SUPPORTED_TRANSPORTS — an unknown kind is a HARD error (fail closed)
+    rather than a silent fallback to a weaker proof.
+    """
+    if not isinstance(cfg, dict):
+        raise A2AError("config must be an object", code="transport_config")
+    transport = cfg.get("transport")
+    if transport is None:
+        return TRANSPORT_TAILSCALE
+    if not isinstance(transport, dict):
+        raise A2AError(
+            "config 'transport' must be an object", code="transport_config")
+    kind = transport.get("kind", TRANSPORT_TAILSCALE)
+    if not isinstance(kind, str) or not kind.strip():
+        raise A2AError(
+            "config 'transport.kind' must be a non-empty string",
+            code="transport_config")
+    kind = kind.strip()
+    if kind not in SUPPORTED_TRANSPORTS:
+        raise A2AError(
+            f"unknown transport.kind {kind!r}; supported: "
+            f"{', '.join(SUPPORTED_TRANSPORTS)}",
+            code="transport_unknown")
+    return kind
+
+
+# --------------------------------------------------------------------------
+# Cloudflare One / WARP-Mesh local proof (#1595)
+# --------------------------------------------------------------------------
+#
+# The WARP analogue of `tailscale_addresses()` + `is_tailnet_address()`.
+# It proves TWO independent facts before the receiver will bind:
+#   1. WARP is connected AND registered/enrolled (queried from the WARP CLI
+#      — `warp-cli status` + `warp-cli --accept-tos registration show` /
+#      `account`), and
+#   2. the candidate bind IP is assigned to a REAL local interface right now
+#      (enumerated from the OS, not inferred from a CIDR).
+# Either fact unknowable -> CloudflareWarpUnavailable / A2AError -> the
+# caller fails closed. There is deliberately no CIDR-shape fallback, exactly
+# mirroring the Tailscale posture.
+
+# Well-known absolute locations for the WARP CLI, probed when it is not on
+# PATH. A receiver invoked from cron / launchd / systemd often has a minimal
+# PATH that omits the GUI app's bundled CLI dir. Probing these does not
+# weaken any proof — the resolved binary's output is still the only thing
+# trusted.
+_WARP_CLI_FALLBACK_PATHS = (
+    "/opt/homebrew/bin/warp-cli",                              # Homebrew (Apple Silicon)
+    "/usr/local/bin/warp-cli",                                 # Homebrew (Intel) / manual
+    "/Applications/Cloudflare WARP.app/Contents/Resources/warp-cli",  # macOS app bundle
+    "/usr/bin/warp-cli",                                       # Linux package
+    "/usr/sbin/warp-cli",
+)
+
+
+def resolve_warp_cli() -> Optional[str]:
+    """Locate the `warp-cli` binary: PATH first, then well-known locations.
+
+    `BRIDGE_A2A_WARP_CLI` overrides discovery entirely (an explicit path for
+    non-standard installs; it also lets the smoke point at a mock CLI that
+    simulates connected/disconnected WARP without a real WARP install).
+    Returns the resolved path, or None when no candidate exists — the caller
+    fails closed on None.
+
+    Single source of truth for the WARP CLI location so the sender +
+    receiver never diverge on where WARP is.
+    """
+    override = os.environ.get("BRIDGE_A2A_WARP_CLI")
+    if override:
+        return override
+    found = shutil.which("warp-cli")
+    if found:
+        return found
+    for cand in _WARP_CLI_FALLBACK_PATHS:
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _run_warp_cli(cli: str, args: list[str]) -> str:
+    """Run `warp-cli <args>` and return stdout; raise CloudflareWarpUnavailable.
+
+    A non-zero exit, a missing binary, or any OS error is "WARP state is
+    unknowable" -> fail closed. stdout is returned verbatim (callers parse
+    it case-insensitively).
+    """
+    try:
+        out = subprocess.run(
+            [cli, *args],
+            capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError as exc:
+        raise CloudflareWarpUnavailable(
+            f"the 'warp-cli' path {cli!r} does not exist or is not "
+            "executable — cannot prove WARP is connected/enrolled."
+        ) from exc
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise CloudflareWarpUnavailable(
+            f"'warp-cli {' '.join(args)}' failed to run: {exc}"
+        ) from exc
+    if out.returncode != 0:
+        raise CloudflareWarpUnavailable(
+            f"'warp-cli {' '.join(args)}' exited {out.returncode}: "
+            f"{(out.stderr or out.stdout or '').strip()[:200]}"
+        )
+    return out.stdout or ""
+
+
+def _warp_cli_capture(cli: str, args: list[str]) -> tuple[bool, str, int]:
+    """Run `warp-cli <args>` and return (ran, raw_output, returncode).
+
+    `ran` is False ONLY when the binary could not be executed at all (missing
+    / not executable / OS error) — a truly unknowable state. Otherwise `ran`
+    is True and `raw_output` is the COMBINED stdout+stderr verbatim
+    REGARDLESS of exit code — deliberately NOT wrapped in any
+    `'warp-cli ... exited N:'` framing, so the registration classifier always
+    parses CLEAN CLI output (a non-zero exit that prints `Account type: false`
+    on stderr must be classifiable as a negative, not hidden behind a
+    wrapper-prefixed line — codex r7). This is the runner the enrollment proof
+    uses; the `status` query keeps `_run_warp_cli` (raise-on-nonzero) because
+    an unreadable status is itself a fail-closed "not connected".
+
+    `returncode` is returned alongside so the enrollment proof can FAIL CLOSED
+    on a POSITIVE-looking label that actually came from a FAILED query: a
+    nonzero exit may only ever confirm an explicit NEGATIVE (parsed from the
+    verbatim output), never prove enrollment (#1595 patch-dev re-review). It is
+    -1 when the binary could not be executed (`ran` False).
+    """
+    try:
+        out = subprocess.run(
+            [cli, *args],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return False, "", -1
+    combined = (out.stdout or "")
+    if out.stderr:
+        combined = (combined + "\n" + out.stderr) if combined else out.stderr
+    return True, combined, out.returncode
+
+
+# Negative status/enrollment tokens that must NEVER be misread as "up". These
+# are substrings whose presence in a `Status update:` value or an enrollment
+# line forces a fail-closed refusal even if a positive word also appears
+# (e.g. "Not Connected", "Connected: false", "Device unregistered").
+_WARP_STATUS_NEGATIVE = (
+    "not connected", "disconnect", "connecting", "unable",
+    "no network", "false", "off", "error", "pause", "stopped", "down",
+)
+_WARP_REG_NEGATIVE = (
+    "unregister", "not registered", "missing registration",
+    "registration missing", "no registration", "none", "not enrolled",
+    # Non-active registration states: a revoked/inactive/etc registration is
+    # NOT enrollment even if a concrete identity field is also printed. These
+    # are scanned as substrings over the whole blob, so a `Status: Revoked`
+    # line forces a fail-closed refusal regardless of any Device ID line.
+    "revoked", "inactive", "deleted", "expired", "suspended", "disabled",
+)
+# Positive enrollment tokens: a real `warp-cli registration show` /
+# `warp-cli account` prints at least one of these CONCRETE identity field
+# labels with a non-empty value when the device is enrolled in an org. We
+# deliberately do NOT treat a generic `Registration:`/`Registered:` summary
+# label as positive — those carry free-form values (e.g. `Registration:
+# Missing`, `Registered: false`) that a label-only check would false-pass.
+_WARP_REG_POSITIVE_LABELS = (
+    "account type", "organization", "account id", "device id",
+)
+# A value under a positive label that is itself one of these is NOT
+# enrollment (e.g. `Account type: none`, `Organization: false`). Matched as
+# the WHOLE trimmed value (exact) so a real org name containing the word
+# "no" (e.g. "Nordic") is not rejected.
+_WARP_REG_NEGATIVE_VALUES = frozenset((
+    "none", "false", "no", "0", "off", "unknown", "missing",
+    "unregistered", "not registered", "n/a", "null", "-",
+))
+# Summary status labels whose VALUE can be a negative signal (e.g.
+# `Registration: false`, `Registered: no`, `Status: revoked`). These are read
+# ONLY as a negative signal (never positive enrollment proof) — a free-form
+# summary value is not a concrete enrolled identity.
+_WARP_REG_SUMMARY_LABELS = (
+    "registration", "registered", "status", "state", "enrolled",
+)
+
+
+def _warp_status_is_connected(raw: str) -> bool:
+    """Strict positive parse of `warp-cli status` -> True only if Connected.
+
+    Fail-closed: requires an EXACT `Connected` state. The real CLI prints
+    `Status update: <STATE>` (e.g. `Connected`, `Disconnected`, `Connecting`,
+    `Unable to connect`, `Not Connected`). We read the value after the last
+    `Status update:` (or, lacking that label, the whole text), refuse if it
+    carries ANY negative token, and then require the bare token `connected`.
+    Anything unrecognized is refused — an unknown status is NOT "up".
+    """
+    text = raw or ""
+    value = ""
+    for line in text.splitlines():
+        low_line = line.strip().lower()
+        if low_line.startswith("status update:"):
+            value = low_line.split(":", 1)[1].strip()
+        elif low_line.startswith("status:"):
+            value = low_line.split(":", 1)[1].strip()
+    if not value:
+        # No explicit status line: fall back to the whole blob, but still
+        # require the strict positive + no-negative rule below.
+        value = text.strip().lower()
+    if not value:
+        return False
+    for neg in _WARP_STATUS_NEGATIVE:
+        if neg in value:
+            return False
+    # Require the exact connected token. Accept `connected` possibly followed
+    # by punctuation/whitespace, but reject e.g. `connected: false` (already
+    # caught by the negative scan above).
+    tok = value.strip().strip(".").strip()
+    return tok == "connected" or tok.startswith("connected ") \
+        or tok.startswith("connected.")
+
+
+# Tri-state classification of a registration/account probe.
+_WARP_REG_ENROLLED = "enrolled"
+_WARP_REG_NOT_ENROLLED = "not_enrolled"   # EXPLICIT negative — terminal
+_WARP_REG_UNKNOWN = "unknown"             # uninformative — may try fallback
+
+
+def _warp_registration_state(raw: str) -> str:
+    """Tri-state parse of registration/account output (fail-closed).
+
+    Returns one of:
+      - `_WARP_REG_ENROLLED`     a concrete identity label carries a
+                                 non-empty, non-negative value AND no negative
+                                 token is present anywhere.
+      - `_WARP_REG_NOT_ENROLLED` an EXPLICIT negative token is present
+                                 (`Device unregistered`, `Status: Revoked`,
+                                 `Missing registration`, …). This is a
+                                 definitive "not enrolled" and is TERMINAL —
+                                 the caller must NOT let a later fallback probe
+                                 override it.
+      - `_WARP_REG_UNKNOWN`      empty / CLI-error / no recognizable token. The
+                                 modern verb may be unavailable on an old
+                                 client — the caller MAY try the legacy
+                                 `account` verb in this case only.
+
+    Non-empty output alone is never enrollment.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return _WARP_REG_UNKNOWN
+    low = text.lower()
+    # An explicit negative anywhere in the blob is definitive + terminal.
+    for neg in _WARP_REG_NEGATIVE:
+        if neg in low:
+            return _WARP_REG_NOT_ENROLLED
+    # A summary status/registration label carrying a negative value (e.g.
+    # `Registration: false`, `Registered: no`, `Status: <neg>`) is an EXPLICIT
+    # not-enrolled signal — terminal, so a later `account` fallback cannot
+    # override it. These summary labels are NOT in _WARP_REG_POSITIVE_LABELS
+    # (their values are free-form, not a concrete identity), so they are only
+    # ever read as a negative signal here, never as positive proof.
+    for line in low.splitlines():
+        line = line.strip()
+        for slabel in _WARP_REG_SUMMARY_LABELS:
+            if line.startswith(slabel) and ":" in line:
+                sval = line.split(":", 1)[1].strip()
+                snorm = sval.strip().strip(".,;:!?)(]['\" ").strip()
+                if (not snorm) or (snorm in _WARP_REG_NEGATIVE_VALUES):
+                    return _WARP_REG_NOT_ENROLLED
+    saw_concrete_label = False
+    for line in low.splitlines():
+        line = line.strip()
+        for label in _WARP_REG_POSITIVE_LABELS:
+            if line.startswith(label):
+                # A concrete identity label MUST carry a `label: <value>`
+                # where <value> is non-empty AND is not itself a negative
+                # token. `Account type:` (empty) / `Organization: none` /
+                # `Device id: false` are NOT enrollment.
+                if ":" not in line:
+                    continue
+                saw_concrete_label = True
+                val = line.split(":", 1)[1].strip()
+                # Normalize terminal punctuation before the negative-value
+                # match so `false.` / `n/a.` / `-.` cannot slip past the
+                # exact-token compare. Internal characters are preserved so a
+                # real value is not mangled.
+                norm = val.strip().strip(".,;:!?)(]['\" ").strip()
+                if norm and norm not in _WARP_REG_NEGATIVE_VALUES:
+                    return _WARP_REG_ENROLLED
+    # A CONCRETE identity label appeared but every occurrence carried an empty
+    # or negative value (e.g. `Account type: false`, `Device ID: -`). That is
+    # an EXPLICIT not-enrolled signal — terminal, never "uninformative" — so a
+    # later `account` fallback cannot override it (codex r6 fail-open).
+    if saw_concrete_label:
+        return _WARP_REG_NOT_ENROLLED
+    # No concrete enrollment field and no explicit negative → uninformative
+    # (e.g. an old client whose modern verb is unsupported).
+    return _WARP_REG_UNKNOWN
+
+
+def _warp_registration_is_enrolled(raw: str) -> bool:
+    """Convenience bool wrapper over `_warp_registration_state` — True only on
+    a definitive ENROLLED classification."""
+    return _warp_registration_state(raw) == _WARP_REG_ENROLLED
+
+
+def warp_connected_and_enrolled() -> None:
+    """Prove WARP is currently CONNECTED and REGISTERED/ENROLLED.
+
+    Returns None on proof; raises CloudflareWarpUnavailable otherwise. This
+    is the WARP analogue of "Tailscale is up and this node is in the
+    tailnet". It runs two independent WARP CLI queries:
+
+      1. `warp-cli status` must report a Connected status. A disconnected /
+         connecting / unable-to-connect status is a HARD refusal — we never
+         bind a Mesh IP while WARP is down (the IP would be stranded /
+         spoofable on the local segment).
+      2. `warp-cli --accept-tos registration show` (modern) or
+         `warp-cli account` (older) must show a registration/account, i.e.
+         the device is enrolled in the org. An unregistered device is
+         refused — an un-enrolled WARP install is not a trusted Mesh member.
+
+    `BRIDGE_A2A_WARP_CLI` (set by the smoke) points these at a mock CLI so
+    connected/disconnected can be simulated without a real WARP install. An
+    empirical probe blocked by "WARP not installed" (resolve_warp_cli()
+    returns None) fails closed here, it does NOT pass.
+    """
+    cli = resolve_warp_cli()
+    if cli is None:
+        raise CloudflareWarpUnavailable(
+            "the 'warp-cli' CLI was not found on PATH or in any standard "
+            "install location — cannot prove WARP is connected/enrolled. "
+            "Install the Cloudflare One client, set BRIDGE_A2A_WARP_CLI to "
+            "the warp-cli path, or use the Tailscale transport."
+        )
+
+    status = _run_warp_cli(cli, ["status"])
+    if not _warp_status_is_connected(status):
+        raise CloudflareWarpUnavailable(
+            "WARP is not connected ('warp-cli status' did not report an "
+            "exact Connected state) — refusing to bind a Mesh IP while the "
+            "WARP tunnel is down (fail-closed)."
+        )
+
+    # Registration/enrollment proof. Try the modern verb first; the legacy
+    # `account` verb is a fallback ONLY when the modern verb is UNINFORMATIVE
+    # (old client / CLI error / unrecognized output). An EXPLICIT negative
+    # from the modern verb ("Device unregistered", "Status: Revoked", …) is
+    # DEFINITIVE and TERMINAL — we must not let a contradictory `account`
+    # fallback override a proven-not-enrolled result (fail-closed on
+    # contradictory probes). Proof is a POSITIVE enrollment token, never
+    # merely "non-empty output".
+    # Classify the RAW CLI output (stdout+stderr) regardless of exit code via
+    # _warp_cli_capture — never a wrapper-prefixed exception string — so an
+    # explicit negative printed on a NON-ZERO exit (e.g. "Account type: false"
+    # / "Device unregistered" on stderr) is classified as a TERMINAL
+    # not-enrolled, not hidden behind a `'warp-cli ... exited N:' ` prefix that
+    # the line-anchored classifier would miss (codex r5/r7 fail-open). The
+    # legacy `account` fallback runs ONLY when the modern verb is genuinely
+    # UNINFORMATIVE: the binary could not run (`ran` False), or it ran but
+    # produced no concrete/negative enrollment signal (e.g. an old client's
+    # "unrecognized subcommand").
+    ran, reg, rc = _warp_cli_capture(cli, ["--accept-tos", "registration", "show"])
+    state = _warp_registration_state(reg) if ran else _WARP_REG_UNKNOWN
+    # Fail-closed rc gate (#1595 patch-dev re-review): a POSITIVE enrollment
+    # conclusion REQUIRES the probe to have EXITED 0. A nonzero exit that still
+    # prints a positive-looking label (e.g. exit 17 + "Organization: …" while
+    # stderr reports the registration service is unavailable) must NOT prove
+    # enrollment — downgrade it to UNKNOWN so we fall back to the legacy verb
+    # and, failing a clean positive there, fail closed. An explicit NEGATIVE on
+    # a nonzero exit stays TERMINAL (handled in _warp_registration_state), and
+    # rc==0 positives are honored exactly as before.
+    if state == _WARP_REG_ENROLLED and rc != 0:
+        state = _WARP_REG_UNKNOWN
+    if state == _WARP_REG_UNKNOWN:
+        # Modern verb uninformative — try the legacy `account` verb.
+        ran, reg, rc = _warp_cli_capture(cli, ["account"])
+        state = _warp_registration_state(reg) if ran else _WARP_REG_UNKNOWN
+        if state == _WARP_REG_ENROLLED and rc != 0:
+            state = _WARP_REG_UNKNOWN
+    if state != _WARP_REG_ENROLLED:
+        raise CloudflareWarpUnavailable(
+            "WARP device is not registered/enrolled (no positive enrollment "
+            "token shown by 'warp-cli registration show' / 'warp-cli "
+            "account') — an un-enrolled device is not a trusted Mesh member "
+            "(fail-closed)."
+        )
+
+
+def _parse_ifconfig_addresses(text: str) -> list[str]:
+    """Pull every `inet`/`inet6` address out of `ifconfig -a` output.
+
+    Cross-platform over the macOS and Linux ifconfig formats:
+      macOS: `\tinet 100.96.0.5 netmask 0xff000000 ...`
+      Linux: `        inet 100.96.0.5  netmask 255.0.0.0 ...`
+    IPv6 addresses may carry a `%scope` zone suffix which is stripped.
+    """
+    addrs: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not (line.startswith("inet ") or line.startswith("inet6 ")):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        cand = parts[1].split("%", 1)[0]
+        addrs.append(cand)
+    return addrs
+
+
+def _parse_ip_addr_addresses(text: str) -> list[str]:
+    """Pull addresses out of `ip -o addr show` output (Linux).
+
+    Each line looks like:
+      `3: warp0    inet 100.96.0.5/32 scope global warp0\\       ...`
+    We take the token after `inet`/`inet6` and strip the prefix length.
+    """
+    addrs: list[str] = []
+    for raw_line in text.splitlines():
+        toks = raw_line.split()
+        for i, tok in enumerate(toks):
+            if tok in ("inet", "inet6") and i + 1 < len(toks):
+                cand = toks[i + 1].split("/", 1)[0].split("%", 1)[0]
+                addrs.append(cand)
+    return addrs
+
+
+def local_interface_addresses() -> list[str]:
+    """Return every IP currently assigned to a local interface on THIS host.
+
+    Used by the Cloudflare/WARP bind proof to confirm a candidate bind IP is
+    actually present on a real local interface (not merely CIDR-shaped). The
+    enumeration shells out to the OS so it reflects live kernel state:
+      - `ip -o addr show` (Linux iproute2), else
+      - `ifconfig -a`     (macOS + BSD + older Linux).
+
+    `BRIDGE_A2A_IFACE_ADDRS` overrides enumeration entirely with a
+    comma/whitespace-separated list — this lets the smoke simulate "the Mesh
+    IP IS / IS NOT on a local interface" without touching real interfaces.
+    Raises A2AError (code `iface_enum_failed`) when the address set cannot be
+    determined at all — the caller fails closed rather than guessing.
+    """
+    override = os.environ.get("BRIDGE_A2A_IFACE_ADDRS")
+    if override is not None:
+        out: list[str] = []
+        for tok in override.replace(",", " ").split():
+            tok = tok.split("%", 1)[0].split("/", 1)[0].strip()
+            if tok:
+                out.append(tok)
+        return out
+
+    # Prefer iproute2 on Linux; fall back to ifconfig (macOS/BSD/old Linux).
+    ip_cli = shutil.which("ip")
+    if ip_cli:
+        try:
+            res = subprocess.run(
+                [ip_cli, "-o", "addr", "show"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                return _parse_ip_addr_addresses(res.stdout)
+        except (subprocess.SubprocessError, OSError):
+            pass
+    ifconfig_cli = shutil.which("ifconfig") or "/sbin/ifconfig"
+    try:
+        res = subprocess.run(
+            [ifconfig_cli, "-a"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise A2AError(
+            f"cannot enumerate local interface addresses (no usable 'ip' or "
+            f"'ifconfig'): {exc}",
+            code="iface_enum_failed",
+        ) from exc
+    if res.returncode != 0:
+        raise A2AError(
+            f"'ifconfig -a' exited {res.returncode}: "
+            f"{(res.stderr or '').strip()[:200]} — cannot enumerate local "
+            "interface addresses.",
+            code="iface_enum_failed",
+        )
+    return _parse_ifconfig_addresses(res.stdout)
+
+
+def is_local_interface_address(addr: str, local_addrs: list[str]) -> bool:
+    """True only if `addr` is assigned to one of this host's interfaces.
+
+    `local_addrs` is the exact output of `local_interface_addresses()`.
+    Comparison is by normalized `ipaddress` value (so `::1` == `0:0:0:0:0:0:0:1`
+    and a zero-padded IPv4 still matches). There is deliberately NO
+    CIDR-shape fallback: being inside a Mesh CIDR does not prove the IP is on
+    a local interface.
+    """
+    try:
+        want = ipaddress.ip_address(addr.strip())
+    except ValueError:
+        return False
+    for cand in local_addrs:
+        try:
+            if ipaddress.ip_address(cand.strip()) == want:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def prove_warp_mesh_local_bind(candidate: str) -> None:
+    """Fail-closed proof that `candidate` is a bindable WARP-Mesh local IP.
+
+    Raises A2AError / CloudflareWarpUnavailable on ANY uncertainty; returns
+    None only when BOTH:
+      1. the candidate is assigned to a real local interface right now, AND
+      2. WARP is connected + registered/enrolled.
+
+    Refuses (by virtue of the checks layered in `resolve_bind` plus this
+    function): wildcard, loopback, an IP not on any local interface, WARP
+    disconnected, WARP unregistered, or a CIDR-only guess. This is the WARP
+    counterpart to the Tailscale `is_tailnet_address(bind, tailscale ip)`
+    membership proof and must reach the REAL probe (interfaces + WARP CLI),
+    never a shape check.
+    """
+    # (1) interface assignment — proven from live OS state.
+    local_addrs = local_interface_addresses()
+    if not is_local_interface_address(candidate, local_addrs):
+        raise A2AError(
+            f"bind address {candidate!r} is not assigned to any local "
+            f"interface ({local_addrs or 'none'}). A WARP-Mesh bind must be "
+            "a real local Mesh/device IP, not a CIDR-shaped guess "
+            "(fail-closed).",
+            code="bind_not_warp_local",
+        )
+    # (2) WARP connected + enrolled — proven from the WARP CLI.
+    warp_connected_and_enrolled()
+
+
+def resolve_peer_address_for_transport(
+    kind: str, entry: dict[str, Any]) -> str:
+    """Transport-aware peer/`listen` address resolution.
+
+    The single seam the sender target resolution AND the receiver source
+    proof go through so they never diverge on how an address is produced
+    per transport:
+
+      - "tailscale" (default): delegates to `resolve_peer_address` UNCHANGED
+        (node_id / tailscale_name live-resolve, else literal `address`).
+      - "cloudflare-warp-mesh": the peer is keyed on its raw Mesh/device IP
+        in `address`. Tailscale identity keys (`node_id`/`tailscale_name`)
+        are a MISCONFIGURATION for this transport and are rejected (we never
+        silently run `tailscale status` for a WARP peer). The returned
+        address is validated as a real IP literal — that literal is then
+        compared against `remote_addr` by the receiver's existing
+        source-address check, exactly as for a legacy raw-IP Tailscale peer.
+
+    This does NOT replace any app-layer auth: HMAC, dedupe, allowlist, skew
+    and room_scoped_check remain layered on top of (never instead of) this
+    address check.
+    """
+    if not isinstance(entry, dict):
+        raise A2AError("address entry must be an object", code="resolve_shape")
+    if kind == TRANSPORT_CLOUDFLARE_WARP_MESH:
+        node_id = entry.get("node_id")
+        ts_name = entry.get("tailscale_name")
+        if (isinstance(node_id, str) and node_id.strip()) or (
+                isinstance(ts_name, str) and ts_name.strip()):
+            raise A2AError(
+                "a cloudflare-warp-mesh peer/listen entry must key on a raw "
+                "Mesh/device 'address', not a Tailscale node_id/"
+                "tailscale_name. Remove the Tailscale identity keys.",
+                code="warp_identity_misconfig",
+            )
+        address = entry.get("address", "")
+        if not isinstance(address, str):
+            raise A2AError("'address' must be a string", code="resolve_shape")
+        address = address.strip()
+        if address:
+            try:
+                ipaddress.ip_address(address)
+            except ValueError as exc:
+                raise A2AError(
+                    f"cloudflare-warp-mesh 'address' {address!r} is not an "
+                    f"IP literal: {exc}",
+                    code="resolve_not_ip",
+                ) from exc
+        return address
+    # Default: the unchanged Tailscale resolver (raw-IP back-compat included).
+    return resolve_peer_address(entry)
 
 
 # --------------------------------------------------------------------------

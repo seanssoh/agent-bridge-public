@@ -36,6 +36,119 @@ Three fixed decisions shape the design:
 3. **Protocol = symmetric fire-and-forget enqueue.** No correlation IDs,
    no result channel. A reply is just another A2A enqueue in reverse.
 
+> Decision 1 (the network substrate) is **pluggable** — see *Transports*
+> below. Tailscale is the default; Cloudflare One / WARP-Mesh is a second
+> first-class transport. Decisions 2 and 3 (HMAC auth + the enqueue protocol)
+> are transport-AGNOSTIC and identical on every transport.
+
+## Transports (#1595)
+
+A2A is **transport-pluggable**. A transport decides exactly one thing: how
+the receiver **proves** that a candidate bind IP is a real, currently-up
+local interface on the private network substrate (and, symmetrically, how a
+peer's target IP is resolved on the sender). Everything *above* the transport
+— the HMAC-signed wire protocol, `remote_addr == resolved-peer` source check,
+dedupe, allowlist/caps/backpressure, `room_scoped_check`, room epoch — is
+transport-agnostic and **unchanged** across transports.
+
+The transport is selected by an optional top-level `transport` block in
+`handoff.local.json`:
+
+```jsonc
+"transport": { "kind": "tailscale" }              // default (may be omitted)
+"transport": { "kind": "cloudflare-warp-mesh" }   // Cloudflare One / WARP Mesh
+```
+
+A config with **no `transport` block** resolves to `tailscale` and behaves
+**exactly** as before #1595 — full back-compat for every existing raw-IP /
+Tailscale config. An unknown `transport.kind` is a **hard error** (fail
+closed), never a silent fallback to a weaker proof.
+
+| Kind | Bind proof (fail-closed) | Peer/target resolution |
+|------|--------------------------|------------------------|
+| `tailscale` (default) | candidate ∈ this node's `tailscale ip` set | `node_id` / `tailscale_name` live-resolved via `tailscale status --json`, else literal `address` |
+| `cloudflare-warp-mesh` | candidate is assigned to a **real local interface** AND WARP is **connected + registered/enrolled** | literal Mesh/device `address` (Tailscale identity keys are rejected) |
+
+### Cloudflare One / WARP-Mesh (`cloudflare-warp-mesh`)
+
+This transport targets **Cloudflare One / WARP Mesh** — private
+**WARP-to-WARP device/server connectivity by Mesh/device IP** over
+TCP/UDP/ICMP. It is the WARP analogue of the Tailscale tailnet.
+
+**This is NOT the Cloudflare Tunnel + Access hostname model.** Tunnel/Access
+publishes a *hostname* fronted by Cloudflare's edge; Mesh/WARP-to-WARP is a
+*private device IP* on the enrolled WARP network. Only the private-IP Mesh
+model is implemented here. Do not configure a Tunnel/Access hostname as a
+WARP-Mesh `address`.
+
+**Bind proof — the security core (fail-closed).** For `cloudflare-warp-mesh`,
+the receiver binds to the configured device/Mesh IP **only after proving**,
+from live OS + WARP state:
+
+1. the bind IP is **assigned to a real local interface right now**
+   (enumerated from `ip -o addr` / `ifconfig -a`), AND
+2. WARP is **connected** (`warp-cli status` reports a Connected state) AND
+   **registered/enrolled** (`warp-cli registration show` / `warp-cli
+   account` shows a registration).
+
+**CIDR-shape alone is NOT proof** — being inside a Mesh CIDR does not prove
+the IP is a live local interface. The receiver **refuses** (fails closed) on
+any of: wildcard (`0.0.0.0` / `::`), loopback, an IP **not assigned to any
+local interface**, **WARP disconnected**, **WARP unregistered/unenrolled**,
+the **`warp-cli` CLI absent** (an empirical probe blocked by "WARP not
+installed" fails closed — it never passes), or a **CIDR-only guess**. This
+mirrors the Tailscale posture exactly (no CIDR-shape fallback; refuse to
+serve on any uncertainty).
+
+The `warp-cli` binary is located on `PATH` first, then in well-known install
+locations (`/opt/homebrew/bin`, `/usr/local/bin`, the macOS app bundle,
+`/usr/bin`). Set `BRIDGE_A2A_WARP_CLI` to an explicit path for a non-standard
+install (it is also the seam the smoke uses to mock connected/disconnected
+WARP without a real install).
+
+**Source proof.** A `cloudflare-warp-mesh` peer is keyed on its **raw
+Mesh/device `address`**. The receiver's existing
+`remote_addr == resolved-peer-address` check runs unchanged on top of HMAC +
+dedupe + allowlist — the network address check is **layered on**, never
+*instead of*, the app-layer HMAC. Tailscale identity keys
+(`node_id` / `tailscale_name`) on a WARP peer are a misconfiguration and are
+rejected (the receiver never runs `tailscale status` for a WARP peer).
+
+### Tailscale ↔ WARP routing conflict (one transport at a time)
+
+WARP and Tailscale generally **cannot run simultaneously** — both install
+default routes / DNS and a connected WARP tunnel typically forces Tailscale
+to disconnect (and vice-versa). A2A therefore runs **one transport at a
+time**: pick `tailscale` *or* `cloudflare-warp-mesh` per node, set it
+consistently across the mesh, and do not expect a node to be reachable on
+both substrates at once. Migrating a fleet from Tailscale to WARP is a
+coordinated cutover (enroll WARP on every node, flip `transport.kind`, update
+each peer's `address` to its Mesh IP), not a per-node toggle.
+
+### Operator setup path (Cloudflare One Client)
+
+1. Install the **Cloudflare One Client (WARP)** on every Mac and server that
+   participates in the mesh, and **enroll** each device into the corporate
+   Zero Trust org (so `warp-cli registration show` reports a registration).
+2. **Connect** WARP on each node (`warp-cli connect`); confirm
+   `warp-cli status` reports Connected. Because of the routing conflict
+   above, disconnect Tailscale on nodes you move to WARP.
+3. Note each node's **WARP Mesh/device IP** (the private IP other enrolled
+   devices reach it on).
+4. In each node's `handoff.local.json`: set
+   `"transport": { "kind": "cloudflare-warp-mesh" }`, set `listen.address`
+   to **this** node's Mesh IP, and set every peer's `address` to **that
+   peer's** Mesh IP. Keep secrets/route inventory **out** of tracked files
+   and logs (the config stays mode 0600, git-ignored).
+5. Start/restart the receiver (`bridge-handoff-daemon.sh start`). The bind
+   proof above runs at startup and on every reconcile.
+
+> **Live 2-node validation is gated on operator WARP infra.** A real ≥2-node
+> test with Tailscale OFF and WARP ON is deferred until WARP is enrolled on
+> 2+ nodes. The smoke (`scripts/smoke/1595-cloudflare-warp-mesh.sh`) mocks
+> the WARP/interface probes so the fail-closed proof + the end-to-end signed
+> handoff are covered with no real WARP install.
+
 ## Components
 
 | File | Role |
@@ -48,7 +161,12 @@ Three fixed decisions shape the design:
 
 ## Security model
 
-- **Bind**: the receiver binds ONLY to the configured tailnet IP. Startup
+- **Bind**: the receiver binds ONLY to a proven private-substrate IP. The
+  proof is **transport-specific** (see *Transports* above): for the default
+  `tailscale` transport it is membership in `tailscale ip`'s set; for
+  `cloudflare-warp-mesh` it is "the IP is on a real local interface AND WARP
+  is connected/enrolled". The rest of this bullet describes the default
+  Tailscale transport. Startup
   fails **closed** if the bind address is `0.0.0.0`, `::`, a loopback, or
   not proven to be in this node's actual local Tailscale address set
   (the exact output of `tailscale ip`). There is no CIDR-shape fallback:

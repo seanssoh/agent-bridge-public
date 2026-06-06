@@ -772,20 +772,21 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
         _mark_dead(conn, message_id, f"peer config missing: {exc}")
         return "dead(config)"
 
-    # P0: resolve the peer's CURRENT tailnet IP. A peer carrying a Tailscale
-    # identity (`node_id` / `tailscale_name`) is resolved live via
-    # `tailscale status --json`; otherwise the literal `address` is used
-    # (legacy back-compat). A resolve failure (Tailscale temporarily
-    # unavailable, or the peer/identity not yet visible in the tailnet) is
-    # treated as TRANSIENT and scheduled for retry — NOT dead-lettered —
-    # because nothing stores a resolved IP, so the next tick self-heals once
-    # Tailscale / the peer is reachable again. This is the inherent self-heal
-    # of identity-keyed config (today's stale-IP incident cannot recur). The
+    # P0: resolve the peer's CURRENT target IP (transport-aware, #1595). For
+    # Tailscale a peer carrying an identity (`node_id` / `tailscale_name`) is
+    # resolved live via `tailscale status --json`; for cloudflare-warp-mesh
+    # the peer is keyed on its raw Mesh device IP (`address`). Otherwise the
+    # literal `address` is used (legacy back-compat). A resolve failure
+    # (Tailscale temporarily unavailable, or the peer/identity not yet visible
+    # in the tailnet) is treated as TRANSIENT and scheduled for retry — NOT
+    # dead-lettered — because nothing stores a resolved IP, so the next tick
+    # self-heals once the substrate / the peer is reachable again. The
     # max-attempts ceiling still eventually dead-letters a permanently-bad
     # identity, so an unresolvable peer does not wedge the outbox forever.
     attempts = int(row["attempts"]) + 1
     try:
-        address = a2a.resolve_peer_address(peer)
+        address = a2a.resolve_peer_address_for_transport(
+            a2a.transport_kind(cfg), peer)
     except a2a.A2AError as exc:
         return _schedule_retry(
             conn, message_id, attempts, cfg,
