@@ -536,6 +536,37 @@ if [[ "$OUT18" == "ok" ]]; then
   pass 18
 fi
 
+# ---------- case 19: operating-manual pointer rendered into the PRODUCTION project CLAUDE.md managed-block ----------
+# Regression guard for the #1604 re-review: the pointer was added to a helper
+# the production renderers do not call, so the rendered project CLAUDE.md (the
+# Codex/static managed-block) omitted it. Assert the v2 renderer
+# (lib/skills-helpers/claude-md-render.py — the modern create/upgrade path)
+# actually emits the pointer, and that the legacy non-iso renderer block carries
+# it too (static drift guard, since that block is an in-function heredoc).
+banner 19 "operating-manual pointer rendered into the project CLAUDE.md managed-block"
+C19_DIR="$SMOKE_ROOT/c19"
+mkdir -p "$C19_DIR"
+C19_SRC="$C19_DIR/src.md"
+C19_DST="$C19_DIR/dst.md"
+printf '# My Project\n\nexisting content\n' >"$C19_SRC"
+ok19=true
+"$PYTHON" "$REPO_ROOT/lib/skills-helpers/claude-md-render.py" \
+  "$C19_SRC" "$C19_DST" "/tmp/fake-bridge-home" \
+  "<!-- BEGIN AGENT BRIDGE PROJECT GUIDANCE -->" \
+  "<!-- END AGENT BRIDGE PROJECT GUIDANCE -->" \
+  "managed: agent-bridge project" >/dev/null 2>&1 || { ok19=false; fail 19 "v2 renderer claude-md-render.py exited nonzero"; }
+if [[ "$ok19" == true ]] && ! grep -qF 'Operating manual index: `/tmp/fake-bridge-home/.claude/skills/agent-bridge-operating-manual/SKILL.md`' "$C19_DST" 2>/dev/null; then
+  ok19=false
+  fail 19 "v2 renderer (claude-md-render.py) omitted the operating-manual pointer:\n$(cat "$C19_DST" 2>/dev/null)"
+fi
+if [[ "$ok19" == true ]] && ! grep -qF 'Operating manual index: `{bridge_home}/.claude/skills/agent-bridge-operating-manual/SKILL.md`' "$REPO_ROOT/lib/bridge-skills.sh" 2>/dev/null; then
+  ok19=false
+  fail 19 "legacy non-iso renderer block in bridge-skills.sh omitted the operating-manual pointer"
+fi
+if [[ "$ok19" == true ]]; then
+  pass 19
+fi
+
 # ---------- summary ----------
 printf '\n=== summary: %d PASS, %d FAIL ===\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
