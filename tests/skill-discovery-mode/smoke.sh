@@ -21,6 +21,7 @@
 #   8  `agb skills list --agent <unknown>` exits non-zero with a clear
 #      error
 #   17 operating-manual shared skill appears in registry + legacy catalogs
+#   18 operating-manual SSOT pointers resolve from an agent workdir fixture
 #
 # Each case runs against a tmp BRIDGE_HOME / tmp installed_plugins.json
 # fixture; the operator's real install is never touched.
@@ -474,6 +475,65 @@ print("ok")
 }
 if [[ "$OUT17" == "ok" ]]; then
   pass 17
+fi
+
+# ---------- case 18: operating-manual SSOT pointers are workdir-resolvable ----------
+banner 18 "agent-bridge-operating-manual SSOT pointers resolve from workdir"
+C18_HOME="$SMOKE_ROOT/c18"
+C18_WORKDIR="$SMOKE_ROOT/c18-agent/workdir"
+mkdir -p \
+  "$C18_HOME/shared/wiki" \
+  "$C18_HOME/docs/agent-runtime" \
+  "$C18_WORKDIR"
+touch \
+  "$C18_HOME/shared/COMMON-INSTRUCTIONS.md" \
+  "$C18_HOME/shared/ADMIN-PROTOCOL.md" \
+  "$C18_HOME/shared/CHANGE-POLICY.md" \
+  "$C18_HOME/shared/TOOLS.md" \
+  "$C18_WORKDIR/MEMORY-SCHEMA.md" \
+  "$C18_HOME/docs/agent-runtime/handoff-protocol.md" \
+  "$C18_HOME/shared/wiki/index.md"
+
+OUT18=$("$PYTHON" -c $'
+import pathlib
+import re
+import sys
+
+skill = pathlib.Path(sys.argv[1])
+bridge_home = pathlib.Path(sys.argv[2])
+workdir = pathlib.Path(sys.argv[3])
+
+text = skill.read_text(encoding="utf-8")
+section = text.split("## 3. SSOT 문서 지도", 1)[1]
+section = section.split("\\n## ", 1)[0]
+pointers = re.findall(r"^- `([^`]+)`", section, flags=re.M)
+expected = [
+    "~/.agent-bridge/shared/COMMON-INSTRUCTIONS.md",
+    "~/.agent-bridge/shared/ADMIN-PROTOCOL.md",
+    "~/.agent-bridge/shared/CHANGE-POLICY.md",
+    "~/.agent-bridge/shared/TOOLS.md",
+    "MEMORY-SCHEMA.md",
+    "~/.agent-bridge/docs/agent-runtime/handoff-protocol.md",
+    "~/.agent-bridge/docs/agent-runtime/",
+    "~/.agent-bridge/shared/wiki/index.md",
+]
+assert pointers == expected, pointers
+
+for pointer in pointers:
+    if pointer.startswith("~/.agent-bridge/"):
+        candidate = bridge_home / pointer.removeprefix("~/.agent-bridge/")
+    else:
+        candidate = workdir / pointer
+    assert candidate.exists(), f"{pointer} -> {candidate} missing"
+
+bare_admin = re.search(r"^- `ADMIN-PROTOCOL\\.md`", section, flags=re.M)
+assert not bare_admin, section
+print("ok")
+' "$REPO_ROOT/.claude/skills/agent-bridge-operating-manual/SKILL.md" "$C18_HOME" "$C18_WORKDIR" 2>&1) || {
+  fail 18 "operating-manual pointer assertion failed:\n$OUT18"
+}
+if [[ "$OUT18" == "ok" ]]; then
+  pass 18
 fi
 
 # ---------- summary ----------

@@ -53,13 +53,14 @@ description: >-
 운영 본문은 전부 아래에 있고, 이 스킬은 그 사본이 아니다. 업그레이드 때 이 문서들이
 `shared/` 렌더 + 에이전트 심링크 + CLAUDE.md managed-block으로 전 에이전트에 동기화된다.
 
-루트-레벨 파일(`COMMON-INSTRUCTIONS.md` 등)은 에이전트 home/workdir에 심링크로 보장돼 있고,
-`docs/`·`shared/`는 `~/.agent-bridge/` 절대경로로 적는다(iso 홈 렌더러가 BRIDGE_HOME으로 재작성).
+공유 canon은 `~/.agent-bridge/shared/` 경로로 적는다(iso 홈 렌더러가 BRIDGE_HOME으로 재작성).
+일부 설치에서는 `ADMIN-PROTOCOL.md`가 workdir에 심링크되지 않으므로 bare 파일명으로 가리키지 않는다.
+에이전트별 `MEMORY-SCHEMA.md`는 home/workdir에 실파일로 보장되므로 bare 파일명을 유지한다.
 
-- `COMMON-INSTRUCTIONS.md` — 전 에이전트 공통 운영 SSOT (queue, task, autonomy, channel)
-- `ADMIN-PROTOCOL.md` — admin 전용 (first-run, upgrade, static/dynamic 경계, release)
-- `CHANGE-POLICY.md` — 변경 upstream/downstream 분류
-- `TOOLS.md` — bridge-native 런타임 레퍼런스
+- `~/.agent-bridge/shared/COMMON-INSTRUCTIONS.md` — 전 에이전트 공통 운영 SSOT (queue, task, autonomy, channel)
+- `~/.agent-bridge/shared/ADMIN-PROTOCOL.md` — admin 전용 (first-run, upgrade, static/dynamic 경계, release)
+- `~/.agent-bridge/shared/CHANGE-POLICY.md` — 변경 upstream/downstream 분류
+- `~/.agent-bridge/shared/TOOLS.md` — bridge-native 런타임 레퍼런스
 - `MEMORY-SCHEMA.md` — 메모리 위키 유지 규칙
 - `~/.agent-bridge/docs/agent-runtime/handoff-protocol.md` — handoff/NEXT-SESSION 계약
 - `~/.agent-bridge/docs/agent-runtime/` — 심화 문서 (role-architecture, wiki-*, user-preference-injection 등)
