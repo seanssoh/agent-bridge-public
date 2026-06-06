@@ -78,6 +78,7 @@ def main(argv: list[str]) -> int:
 ## Agent Bridge
 - When a task involves bridge coordination, use the `agent-bridge` skill before improvising commands.
 - Do not guess bridge commands. Use `{bridge_home}/agb --help`, `{bridge_home}/agent-bridge --help`, or the local bridge skill reference.
+- Operating manual index: `{bridge_home}/.claude/skills/agent-bridge-operating-manual/SKILL.md`.
 - Your sender id is your current bridge agent id. Prefer `$BRIDGE_AGENT_ID`; if it is missing, verify the agent from `{bridge_home}/state/active-roster.md`.
 - When you create or hand off work, set `--from "$BRIDGE_AGENT_ID"` when running outside a bridge-managed wrapper.
 - Queue state is source of truth. Use `{bridge_home}/agb inbox|show|claim|done` instead of direct sqlite access.

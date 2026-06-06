@@ -20,6 +20,8 @@
 #   7  `agb skills list --agent <name>` restricts to one agent
 #   8  `agb skills list --agent <unknown>` exits non-zero with a clear
 #      error
+#   17 operating-manual shared skill appears in registry + legacy catalogs
+#   18 operating-manual SSOT pointers resolve from an agent workdir fixture
 #
 # Each case runs against a tmp BRIDGE_HOME / tmp installed_plugins.json
 # fixture; the operator's real install is never touched.
@@ -443,6 +445,127 @@ if $ok16 && [[ ! -f "$BACKUP_DIR/SKILLS.md" ]]; then
   ok16=false; fail 16 "expected backup at $BACKUP_DIR/SKILLS.md (cleanup must be recoverable). state contents:\n$(find "$C16_HOME/state" -type f 2>/dev/null)"
 fi
 $ok16 && pass 16
+
+# ---------- case 17: operating-manual shared skill registry/catalog ----------
+banner 17 "agent-bridge-operating-manual appears in registry and legacy catalogs"
+C17_HOME="$SMOKE_ROOT/c17"
+C17_SOURCE_SHARED="$SMOKE_ROOT/c17-src-shared"
+mkdir -p "$C17_HOME/state" "$C17_SOURCE_SHARED"
+
+OUT17=$("$PYTHON" -c "$load_bd_preamble"$'
+import json
+import pathlib
+
+home = pathlib.Path("'"$C17_HOME"'")
+source_shared = pathlib.Path("'"$C17_SOURCE_SHARED"'")
+registry = mod.build_skill_registry(home)
+assert "agent-bridge-operating-manual" in registry, sorted(registry)
+mod.write_skill_registry(home, registry, dry_run=False)
+mod.sync_shared_docs(home, source_shared, dry_run=False, stamp="20260503T000001Z", registry=registry)
+
+payload = json.loads((home / "state" / "skill-registry.json").read_text(encoding="utf-8"))
+assert "agent-bridge-operating-manual" in payload["skills"], payload["skills"].keys()
+shared_catalog = (home / "shared" / "SKILLS.md").read_text(encoding="utf-8")
+assert "`agent-bridge-operating-manual`" in shared_catalog, shared_catalog
+agent_catalog = mod.render_agent_skills_md(home / "agents" / "agent-a", registry)
+assert "agent-bridge-operating-manual" in agent_catalog, agent_catalog
+print("ok")
+' 2>&1) || {
+  fail 17 "registry/catalog assertion failed:\n$OUT17"
+}
+if [[ "$OUT17" == "ok" ]]; then
+  pass 17
+fi
+
+# ---------- case 18: operating-manual SSOT pointers are workdir-resolvable ----------
+banner 18 "agent-bridge-operating-manual SSOT pointers resolve from workdir"
+C18_HOME="$SMOKE_ROOT/c18"
+C18_WORKDIR="$SMOKE_ROOT/c18-agent/workdir"
+mkdir -p \
+  "$C18_HOME/shared/wiki" \
+  "$C18_HOME/docs/agent-runtime" \
+  "$C18_WORKDIR"
+touch \
+  "$C18_HOME/shared/COMMON-INSTRUCTIONS.md" \
+  "$C18_HOME/shared/ADMIN-PROTOCOL.md" \
+  "$C18_HOME/shared/CHANGE-POLICY.md" \
+  "$C18_HOME/shared/TOOLS.md" \
+  "$C18_WORKDIR/MEMORY-SCHEMA.md" \
+  "$C18_HOME/docs/agent-runtime/handoff-protocol.md" \
+  "$C18_HOME/shared/wiki/index.md"
+
+OUT18=$("$PYTHON" -c $'
+import pathlib
+import re
+import sys
+
+skill = pathlib.Path(sys.argv[1])
+bridge_home = pathlib.Path(sys.argv[2])
+workdir = pathlib.Path(sys.argv[3])
+
+text = skill.read_text(encoding="utf-8")
+section = text.split("## 3. SSOT 문서 지도", 1)[1]
+section = section.split("\\n## ", 1)[0]
+pointers = re.findall(r"^- `([^`]+)`", section, flags=re.M)
+expected = [
+    "~/.agent-bridge/shared/COMMON-INSTRUCTIONS.md",
+    "~/.agent-bridge/shared/ADMIN-PROTOCOL.md",
+    "~/.agent-bridge/shared/CHANGE-POLICY.md",
+    "~/.agent-bridge/shared/TOOLS.md",
+    "MEMORY-SCHEMA.md",
+    "~/.agent-bridge/docs/agent-runtime/handoff-protocol.md",
+    "~/.agent-bridge/docs/agent-runtime/",
+    "~/.agent-bridge/shared/wiki/index.md",
+]
+assert pointers == expected, pointers
+
+for pointer in pointers:
+    if pointer.startswith("~/.agent-bridge/"):
+        candidate = bridge_home / pointer.removeprefix("~/.agent-bridge/")
+    else:
+        candidate = workdir / pointer
+    assert candidate.exists(), f"{pointer} -> {candidate} missing"
+
+bare_admin = re.search(r"^- `ADMIN-PROTOCOL\\.md`", section, flags=re.M)
+assert not bare_admin, section
+print("ok")
+' "$REPO_ROOT/.claude/skills/agent-bridge-operating-manual/SKILL.md" "$C18_HOME" "$C18_WORKDIR" 2>&1) || {
+  fail 18 "operating-manual pointer assertion failed:\n$OUT18"
+}
+if [[ "$OUT18" == "ok" ]]; then
+  pass 18
+fi
+
+# ---------- case 19: operating-manual pointer rendered into the PRODUCTION project CLAUDE.md managed-block ----------
+# Regression guard for the #1604 re-review: the pointer was added to a helper
+# the production renderers do not call, so the rendered project CLAUDE.md (the
+# Codex/static managed-block) omitted it. Assert the v2 renderer
+# (lib/skills-helpers/claude-md-render.py — the modern create/upgrade path)
+# actually emits the pointer, and that the legacy non-iso renderer block carries
+# it too (static drift guard, since that block is an in-function heredoc).
+banner 19 "operating-manual pointer rendered into the project CLAUDE.md managed-block"
+C19_DIR="$SMOKE_ROOT/c19"
+mkdir -p "$C19_DIR"
+C19_SRC="$C19_DIR/src.md"
+C19_DST="$C19_DIR/dst.md"
+printf '# My Project\n\nexisting content\n' >"$C19_SRC"
+ok19=true
+"$PYTHON" "$REPO_ROOT/lib/skills-helpers/claude-md-render.py" \
+  "$C19_SRC" "$C19_DST" "/tmp/fake-bridge-home" \
+  "<!-- BEGIN AGENT BRIDGE PROJECT GUIDANCE -->" \
+  "<!-- END AGENT BRIDGE PROJECT GUIDANCE -->" \
+  "managed: agent-bridge project" >/dev/null 2>&1 || { ok19=false; fail 19 "v2 renderer claude-md-render.py exited nonzero"; }
+if [[ "$ok19" == true ]] && ! grep -qF 'Operating manual index: `/tmp/fake-bridge-home/.claude/skills/agent-bridge-operating-manual/SKILL.md`' "$C19_DST" 2>/dev/null; then
+  ok19=false
+  fail 19 "v2 renderer (claude-md-render.py) omitted the operating-manual pointer:\n$(cat "$C19_DST" 2>/dev/null)"
+fi
+if [[ "$ok19" == true ]] && ! grep -qF 'Operating manual index: `{bridge_home}/.claude/skills/agent-bridge-operating-manual/SKILL.md`' "$REPO_ROOT/lib/bridge-skills.sh" 2>/dev/null; then
+  ok19=false
+  fail 19 "legacy non-iso renderer block in bridge-skills.sh omitted the operating-manual pointer"
+fi
+if [[ "$ok19" == true ]]; then
+  pass 19
+fi
 
 # ---------- summary ----------
 printf '\n=== summary: %d PASS, %d FAIL ===\n' "$PASS" "$FAIL"

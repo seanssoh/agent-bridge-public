@@ -1236,8 +1236,9 @@ PR1 section above.
 
 ### Bridge-native skills under the isolated HOME
 
-Bridge-native Claude skills (`agent-bridge-runtime`, `cron-manager`,
-`memory-wiki`, `patch-permission-approval`) are synced into
+Bridge-native Claude skills (`agent-bridge-runtime`,
+`agent-bridge-operating-manual`, `cron-manager`, `memory-wiki`,
+`patch-permission-approval`) are synced into
 `<isolated-home>/.claude/skills/<skill>/` on agent isolate, restart,
 `agent-bridge isolate <agent> --reapply`, and `agb upgrade`. Claude Code
 running under the isolated UID reads `~/.claude/skills/` from that home,

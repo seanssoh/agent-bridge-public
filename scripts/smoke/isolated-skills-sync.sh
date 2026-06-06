@@ -4,8 +4,9 @@
 # Validates `bridge_sync_isolated_home_claude_skills` against a fixture
 # bridge home and a stand-in isolated UID home. Three groups of assertions:
 #
-# 1. All four bridge-native skills (agent-bridge-runtime, cron-manager,
-#    memory-wiki, patch-permission-approval) land in the isolated home's
+# 1. All five bridge-native skills (agent-bridge-runtime,
+#    agent-bridge-operating-manual, cron-manager, memory-wiki,
+#    patch-permission-approval) land in the isolated home's
 #    .claude/skills/<skill>/SKILL.md.
 # 2. Path text in rendered SKILL.md is normalized: every occurrence of
 #    `~/.agent-bridge/` becomes the absolute BRIDGE_HOME path, so the
@@ -35,7 +36,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-SKILL_NAMES=(agent-bridge-runtime cron-manager memory-wiki patch-permission-approval)
+SKILL_NAMES=(agent-bridge-runtime agent-bridge-operating-manual cron-manager memory-wiki patch-permission-approval)
 
 build_fixture() {
   smoke_make_temp_root "$SMOKE_NAME"
@@ -61,8 +62,9 @@ EOF
   # Seed each shared skill with a minimal SKILL.md whose body contains
   # the `~/.agent-bridge/` literal that the renderer must rewrite. The
   # extra plain-text line ensures rewrite happens both inline and in
-  # fenced code blocks. patch-permission-approval also gets a
-  # references/ subdir so the smoke verifies subdir preservation.
+  # fenced code blocks. agent-bridge-operating-manual and
+  # patch-permission-approval also get references/ subdirs so the smoke
+  # verifies subtree preservation for the new bundled index skill.
   local skill
   for skill in "${SKILL_NAMES[@]}"; do
     mkdir -p "$FIXTURE_BRIDGE_HOME/.claude/skills/$skill"
@@ -82,8 +84,14 @@ Run \`~/.agent-bridge/agb inbox \$BRIDGE_AGENT_ID\` to drain the queue.
 EOF
   done
 
-  # Subdirectory in patch-permission-approval — verify the renderer
-  # walks the tree and preserves structure.
+  # Subdirectories in bridge-native skills — verify the renderer walks
+  # the tree and preserves structure.
+  mkdir -p "$FIXTURE_BRIDGE_HOME/.claude/skills/agent-bridge-operating-manual/references"
+  cat >"$FIXTURE_BRIDGE_HOME/.claude/skills/agent-bridge-operating-manual/references/index.md" <<'EOF'
+# Operating manual reference
+
+See `~/.agent-bridge/shared/COMMON-INSTRUCTIONS.md` for task processing.
+EOF
   mkdir -p "$FIXTURE_BRIDGE_HOME/.claude/skills/patch-permission-approval/references"
   cat >"$FIXTURE_BRIDGE_HOME/.claude/skills/patch-permission-approval/references/notes.md" <<'EOF'
 # Reference notes
@@ -170,14 +178,25 @@ assert_path_normalization() {
 }
 
 assert_subdir_preserved() {
+  local manual_target="$FIXTURE_ISOLATED_HOME/.claude/skills/agent-bridge-operating-manual/references/index.md"
   local subdir_target="$FIXTURE_ISOLATED_HOME/.claude/skills/patch-permission-approval/references/notes.md"
+  smoke_assert_file_exists "$manual_target" \
+    "operating manual references/ file preserved during sync"
   smoke_assert_file_exists "$subdir_target" \
     "subdirectory file under references/ preserved during sync"
   # Same intentional-tilde rationale as assert_path_normalization above.
   # shellcheck disable=SC2088
+  if grep -F '~/.agent-bridge/' "$manual_target" >/dev/null 2>&1; then
+    smoke_fail "operating manual reference still contains '~/.agent-bridge/' after rewrite (target=$manual_target)"
+  fi
+  # shellcheck disable=SC2088
   if grep -F '~/.agent-bridge/' "$subdir_target" >/dev/null 2>&1; then
     smoke_fail "subdir file still contains '~/.agent-bridge/' after rewrite (target=$subdir_target)"
   fi
+  smoke_assert_contains \
+    "$(cat "$manual_target")" \
+    "$FIXTURE_BRIDGE_HOME/shared/COMMON-INSTRUCTIONS.md" \
+    "operating manual reference rewrites bridge path to absolute BRIDGE_HOME"
   smoke_assert_contains \
     "$(cat "$subdir_target")" \
     "$FIXTURE_BRIDGE_HOME/agb show" \
