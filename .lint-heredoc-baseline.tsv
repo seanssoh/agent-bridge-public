@@ -206,10 +206,7 @@ lib/bridge-channels.sh	144	C3	28c211234a01352ec3a0c87c4ce9cab53ba60e168fa4663482
 lib/bridge-channels.sh	237	H3	8b19f0a7707fef140d1598934bd1208cb7fecaa437dc0e50d49609323eef73ac	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-channels.sh	371	C3	011f1d4418e8f0e4cd28ce77a92161e0945c93eb9c8684bd2add1a8ddbe741be	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-core.sh	514	C3	c5a19ca66d0088387de551f481ce08c0218765bdc1221891c961bb801d2ea2f7	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-core.sh	684	C3	aef38fbc7564d9de6b2815ae358b26d9825bfb3f22fc31a8dab46b9c8d49d9f0	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-core.sh	823	H3	7f7d4271f82d264c46d0c2422682d01605a432c0cb26abe55cab67d0259b5683	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-core.sh	1131	C1	70a49191ce1893945509406b7a5958498a35d5a13f7ea313cc6fcb8e22361100	interpreter heredoc (stripper false-positive: phantom capture from nested-quote bash-c-python at L714)	patch	process-boundary-safe
-lib/bridge-core.sh	1152	C1	70a49191ce1893945509406b7a5958498a35d5a13f7ea313cc6fcb8e22361100	interpreter heredoc (stripper false-positive: phantom capture from nested-quote bash-c-python at L714)	patch	process-boundary-safe
+lib/bridge-core.sh	818	H3	57c30e1fe048f6b4fab20ea8714175de73c6d88cd0e2b6b41b3dfc183ff9c509	here-string/procsub, non-interpreter consumer	claude	#1466 de-heredoc — process-boundary-safe procsub (was <<< here-string at L823)
 lib/bridge-cron.sh	1125	H3	35b27cdf94bea1e16d55b7480469958cce5ee843d0216db616ff389351e17801	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-cron.sh	1126	H3	5f60048d8c2bcee42ee39ed4d116dc02d56b1e0338b43fc3566ca862a142ff20	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-discord.sh	40	H3	b7fa996e0677d162d0061308f4f1561a488c85997ab55a095544e4d61e676bee	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)

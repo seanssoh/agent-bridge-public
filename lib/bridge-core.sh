@@ -681,12 +681,7 @@ bridge_sha1() {
   local text="$1"
 
   bridge_require_python
-  python3 - "$text" <<'PY'
-import hashlib
-import sys
-
-print(hashlib.sha1(sys.argv[1].encode("utf-8")).hexdigest())
-PY
+  python3 -c 'import hashlib, sys; print(hashlib.sha1(sys.argv[1].encode("utf-8")).hexdigest())' "$text"
 }
 
 # Batch variant of bridge_sha1 — one python3 spawn hashes N inputs. Reads
@@ -820,7 +815,7 @@ bridge_queue_source_shell() {
 
   queue_output="$(bridge_queue_cli "$@")" || return $?
   # shellcheck disable=SC1090
-  source /dev/stdin <<<"$queue_output"
+  source /dev/stdin < <(printf '%s\n' "$queue_output")
 }
 
 bridge_reset_roster_maps() {
@@ -1128,20 +1123,14 @@ bridge_path_relative_to_root() {
   local root="$2"
 
   bridge_require_python
-  python3 - "$path" "$root" <<'PY'
-import os
-import sys
-
-path = os.path.realpath(sys.argv[1])
-root = os.path.realpath(sys.argv[2])
-
-try:
-    rel = os.path.relpath(path, root)
-except Exception:
-    rel = "."
-
-print(rel)
-PY
+  # #946 L1: guard the `python3 "$BRIDGE_SCRIPT_DIR/..."` helper call so a
+  # stale/removed source checkout self-heals or fails auditably instead of
+  # raising `unbound variable` / `can't open file`. The `_check` form (not
+  # `_or_die`) is required because callers wrap this in `$( ... )`.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  python3 "$BRIDGE_SCRIPT_DIR/lib/bridge-path-utils.py" relative "$path" "$root"
 }
 
 bridge_path_is_within_root() {
@@ -1149,21 +1138,13 @@ bridge_path_is_within_root() {
   local root="$2"
 
   bridge_require_python
-  python3 - "$path" "$root" <<'PY'
-import os
-import sys
-
-path = os.path.realpath(sys.argv[1])
-root = os.path.realpath(sys.argv[2])
-
-try:
-    common = os.path.commonpath([path, root])
-except ValueError:
-    print("0")
-    raise SystemExit(0)
-
-print("1" if common == root else "0")
-PY
+  # #946 L1: see bridge_path_relative_to_root. `_check` form because callers
+  # wrap this in `$( ... )`; an unguarded `$BRIDGE_SCRIPT_DIR` would surface
+  # as an unbound-variable abort or a silent empty capture in daemon paths.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  python3 "$BRIDGE_SCRIPT_DIR/lib/bridge-path-utils.py" within "$path" "$root"
 }
 
 bridge_history_key_for() {
