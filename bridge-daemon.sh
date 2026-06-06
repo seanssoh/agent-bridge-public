@@ -7816,7 +7816,24 @@ nudge_agent_session() {
   local attached=0
   attached="$(bridge_tmux_session_attached_count "$session" 2>/dev/null || printf '0')"
   [[ "$attached" =~ ^[0-9]+$ ]] || attached=0
-  if (( attached > 0 )); then
+  # #1568: skip the routine idle-nudge only when the session is genuinely BUSY
+  # (composer pending input / mid-turn banner / recent keypress), not merely
+  # attached. The inject path below is already spool-safe (re-spools when busy
+  # instead of clobbering), so an attached-but-IDLE session must fall through and
+  # actually receive the nudge. Bare `attached>0` stranded queued tasks behind any
+  # persistent tmux client (e.g. cmux multitab keeps every session attached). This
+  # reuses the exact predicate the urgent/inject primitive uses.
+  local _nudge_engine=""
+  _nudge_engine="$(bridge_agent_engine "$agent" 2>/dev/null || printf 'claude')"
+  # bridge_agent_engine returns `unknown` (rc=0) for a missing/clobbered engine
+  # map, which would make inject_busy skip claude's midturn-banner detection and
+  # risk nudging over a mid-turn session. Normalize anything that is not a known
+  # engine to `claude` — the strictest busy predicate is the safe default here.
+  case "$_nudge_engine" in
+    claude|codex) ;;
+    *) _nudge_engine="claude" ;;
+  esac
+  if (( attached > 0 )) && bridge_tmux_session_inject_busy "$session" "$_nudge_engine"; then
     local _att_skip_task_id="${live_nudge_key%%,*}"
     [[ -n "$_att_skip_task_id" ]] || _att_skip_task_id="none"
     # Issue #1936 / gap #4: attached-session skip is correct for raw tmux
