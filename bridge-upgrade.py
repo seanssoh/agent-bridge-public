@@ -2075,6 +2075,13 @@ def file_sha256(path: Path) -> str:
         return ""
 
 
+def path_exists_noexcept(path: Path) -> bool:
+    try:
+        return os.path.exists(path)
+    except OSError:
+        return False
+
+
 def list_conflict_records(target_root: Path) -> list[Path]:
     record_dir = target_root / "state" / "upgrade-conflicts"
     if not record_dir.is_dir():
@@ -2801,7 +2808,8 @@ def cmd_conflicts_list(args: argparse.Namespace) -> int:
             live_target = str(record_entry.get("live_target") or "")
             at_write = str(record_entry.get("live_target_sha256_at_write") or "")
             if live_target:
-                current = file_sha256(Path(live_target)) if Path(live_target).exists() else ""
+                live_target_path = Path(live_target)
+                current = file_sha256(live_target_path) if path_exists_noexcept(live_target_path) else ""
                 if at_write:
                     hash_changed = current != at_write
         rows.append(
