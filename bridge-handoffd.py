@@ -528,9 +528,25 @@ def is_tailnet_address(addr: str, allowed: list[str]) -> bool:
 def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
     """Resolve + fail-closed-validate the receiver bind address.
 
-    Raises A2AError if the bind is missing, loopback, wildcard, or not a
-    tailnet address.
+    Transport-pluggable (#1595): the candidate resolution, wildcard/loopback
+    refusal and the test-bind escape hatch are transport-AGNOSTIC; only the
+    final membership proof differs by `transport.kind`:
+
+      - "tailscale" (default / legacy): candidate ∈ `tailscale ip` set.
+        UNCHANGED — a config with no `transport` block runs exactly as
+        before.
+      - "cloudflare-warp-mesh" (#1595): candidate is assigned to a real
+        local interface AND WARP is connected + registered/enrolled
+        (`a2a.prove_warp_mesh_local_bind`). CIDR shape alone is NOT proof.
+
+    Raises A2AError if the bind is missing, loopback, wildcard, or not
+    proven for the selected transport. Fail CLOSED on any uncertainty.
     """
+    # Transport selection. An unknown/malformed `transport.kind` is a hard
+    # error here (fail closed) rather than a silent fallback to a weaker
+    # proof. Legacy configs (no `transport` block) resolve to "tailscale".
+    kind = a2a.transport_kind(cfg)
+
     listen = cfg.get("listen", {})
     if not isinstance(listen, dict):
         raise a2a.A2AError("config 'listen' must be an object", code="bind_config")
@@ -541,15 +557,29 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
     # `tailscale status --json`. Resolution ONLY produces a candidate IP —
     # the fail-closed proof below (candidate ∈ `tailscale ip` set) is
     # unchanged and still independently proves the candidate is a real local
-    # Tailscale interface. When `listen` has only a raw `address` (legacy),
-    # resolve_peer_address returns it verbatim and behavior is exactly as
-    # before. A resolution failure (identity given but not resolvable, or
-    # Tailscale unavailable) propagates as an A2AError / TailscaleUnavailable
-    # and the daemon fails closed — it never silently binds a stale address.
-    bind = a2a.resolve_peer_address(listen).strip()
+    # Tailscale interface. When `listen` has only a raw `address` (legacy or
+    # a WARP-Mesh device IP), resolve_peer_address returns it verbatim and
+    # behavior is exactly as before. A resolution failure (identity given but
+    # not resolvable, or Tailscale unavailable) propagates as an A2AError /
+    # TailscaleUnavailable and the daemon fails closed — it never silently
+    # binds a stale address. Transport-aware (#1595): for tailscale this
+    # delegates to the unchanged resolver; for cloudflare-warp-mesh it
+    # REJECTS a `listen` keyed on a Tailscale identity (node_id /
+    # tailscale_name) — a WARP listen must carry a raw Mesh device IP, never
+    # a tailnet identity the WARP node could not resolve.
+    bind = a2a.resolve_peer_address_for_transport(kind, listen).strip()
 
     if not bind:
-        # Auto-select fails closed: tailscale_addresses() raises
+        if kind == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
+            # No tailnet-style auto-select for WARP — the operator must name
+            # the device/Mesh IP this node binds. Fail closed.
+            raise a2a.A2AError(
+                "no listen.address configured for the cloudflare-warp-mesh "
+                "transport. Set listen.address to this node's WARP Mesh "
+                "device IP in handoff.local.json.",
+                code="bind_unresolved",
+            )
+        # Tailscale auto-select fails closed: tailscale_addresses() raises
         # TailscaleUnavailable when the local address set is unknowable.
         tailnet = tailscale_addresses()
         if not tailnet:
@@ -566,7 +596,7 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
     if lowered in ("0.0.0.0", "::", "*"):
         raise a2a.A2AError(
             f"refusing to bind to wildcard address {bind!r} — the A2A "
-            "receiver MUST bind to a tailnet IP only.",
+            "receiver MUST bind to a proven private substrate IP only.",
             code="bind_wildcard",
         )
 
@@ -574,9 +604,10 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
     # address when BRIDGE_A2A_ALLOW_TEST_BIND=1. This is NEVER honored for
     # wildcard addresses (the check above already rejected those) and is
     # not surfaced anywhere in the operator-facing config or CLI. Smoke
-    # tests cannot exercise a real tailnet, so this lets the loopback
-    # end-to-end smoke run without weakening the production fail-closed
-    # contract for any unset/normal environment.
+    # tests cannot exercise a real tailnet/WARP mesh, so this lets the
+    # loopback end-to-end smoke run without weakening the production
+    # fail-closed contract for any unset/normal environment. Transport-
+    # agnostic: it short-circuits BEFORE either membership proof.
     if os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") == "1":
         try:
             test_ip = ipaddress.ip_address(bind)
@@ -594,15 +625,26 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
     if ip.is_loopback:
         raise a2a.A2AError(
             f"refusing to bind to loopback {bind!r} — A2A must be reachable "
-            "by tailnet peers.",
+            "by mesh peers.",
             code="bind_loopback",
         )
 
-    # Fail closed: the bind address MUST be proven to be in this node's
-    # actual local Tailscale address set. tailscale_addresses() raises
-    # TailscaleUnavailable (a subclass of A2AError) if the local set
-    # cannot be determined — that propagates and the daemon refuses to
-    # serve. There is no CIDR-shape fallback.
+    # --- transport-specific fail-closed membership proof ---
+    if kind == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
+        # Cloudflare One / WARP-Mesh: the bind IP MUST be assigned to a real
+        # local interface AND WARP must be connected + registered/enrolled.
+        # prove_warp_mesh_local_bind raises A2AError / CloudflareWarpUnavailable
+        # (both subclasses of A2AError) on ANY uncertainty — interface
+        # enumeration failure, IP not local, WARP down, WARP unenrolled — and
+        # the daemon refuses to serve. There is no CIDR-shape fallback.
+        a2a.prove_warp_mesh_local_bind(bind)
+        return bind, port
+
+    # Tailscale (default): the bind address MUST be proven to be in this
+    # node's actual local Tailscale address set. tailscale_addresses() raises
+    # TailscaleUnavailable (a subclass of A2AError) if the local set cannot be
+    # determined — that propagates and the daemon refuses to serve. There is
+    # no CIDR-shape fallback. UNCHANGED from the pre-#1595 behavior.
     allowed = tailscale_addresses()
     if not is_tailnet_address(bind, allowed):
         raise a2a.A2AError(
@@ -1566,16 +1608,19 @@ class HandoffHandler(BaseHTTPRequestHandler):
 
         # --- remote_addr == authenticated peer's CURRENT address (before body) ---
         # Resolve the configured SENDER peer (the authenticated X-AGB-Peer we
-        # just looked up) to its live Tailscale IP rather than trusting a
-        # literal/stale `address`. A peer keyed on `node_id`/`tailscale_name`
-        # would otherwise be rejected here as a source-address mismatch even
-        # though the sender delivered correctly — and, worse, a stale stored
-        # `address` would remain the inbound auth anchor (the very class P0
-        # exists to close). FAIL CLOSED: any resolver / TailscaleUnavailable
-        # error rejects the request (we never fall through to accept) and the
-        # check stays BEFORE the body is read off the socket.
+        # just looked up) to its CURRENT address rather than trusting a
+        # literal/stale stored value. Transport-aware (#1595): for Tailscale a
+        # peer keyed on `node_id`/`tailscale_name` live-resolves to its
+        # current TailscaleIP; for cloudflare-warp-mesh the peer is keyed on
+        # its raw Mesh device IP (Tailscale identity keys are rejected). A
+        # stale stored `address` would otherwise remain the inbound auth
+        # anchor (the very class P0 exists to close). FAIL CLOSED: any
+        # resolver / Tailscale/WARP error rejects the request (we never fall
+        # through to accept) and the check stays BEFORE the body is read off
+        # the socket.
         try:
-            peer_addr = a2a.resolve_peer_address(peer)
+            peer_addr = a2a.resolve_peer_address_for_transport(
+                a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("reject_addr_unresolved", peer=peer_id, client=client_ip,
                   reason=getattr(exc, "code", "resolve_error"), security=True)
@@ -2135,11 +2180,13 @@ class HandoffHandler(BaseHTTPRequestHandler):
             return
 
         # --- b. remote_addr == authenticated peer's CURRENT address (before body) ---
-        # Resolve the SENDER peer to its live Tailscale IP rather than trusting
-        # a stale stored `address`. FAIL CLOSED: any resolver / Tailscale error
-        # rejects BEFORE the body is read. (Identical anchor to do_POST.)
+        # Resolve the SENDER peer to its CURRENT address (transport-aware,
+        # #1595) rather than trusting a stale stored `address`. FAIL CLOSED:
+        # any resolver / Tailscale/WARP error rejects BEFORE the body is read.
+        # (Identical anchor to do_POST.)
         try:
-            peer_addr = a2a.resolve_peer_address(peer)
+            peer_addr = a2a.resolve_peer_address_for_transport(
+                a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("identity_update_reject", reason=getattr(exc, "code",
                   "resolve_error"), peer=peer_id, client=client_ip,
@@ -2453,8 +2500,11 @@ class HandoffHandler(BaseHTTPRequestHandler):
             return
 
         # --- e. remote_addr == authenticated peer's CURRENT address (before body) ---
+        # Transport-aware resolution (#1595): Tailscale identity live-resolve
+        # or WARP-Mesh raw device IP; fail closed on any resolver error.
         try:
-            peer_addr = a2a.resolve_peer_address(peer)
+            peer_addr = a2a.resolve_peer_address_for_transport(
+                a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("room_join_reject", reason=getattr(exc, "code",
                   "resolve_error"), peer=peer_id, client=client_ip,
@@ -2796,8 +2846,11 @@ class HandoffHandler(BaseHTTPRequestHandler):
             return
 
         # --- e. remote_addr == authenticated peer's CURRENT address (before body) ---
+        # Transport-aware resolution (#1595): Tailscale identity live-resolve
+        # or WARP-Mesh raw device IP; fail closed on any resolver error.
         try:
-            peer_addr = a2a.resolve_peer_address(peer)
+            peer_addr = a2a.resolve_peer_address_for_transport(
+                a2a.transport_kind(cfg), peer)
         except a2a.A2AError as exc:
             audit("room_roster_reject", reason=getattr(exc, "code",
                   "resolve_error"), peer=peer_id, client=client_ip,

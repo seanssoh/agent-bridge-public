@@ -533,7 +533,11 @@ def _post_room_join_request(*, leader_node: str, room_id: str, token: str,
         return _invoke_test_post_hook(path=path, headers=headers,
                                       body_bytes=body_bytes)
 
-    address = a2a.resolve_peer_address(peer)
+    # Transport-aware target resolution (#1595): Tailscale identity
+    # live-resolve or WARP-Mesh raw device IP. Back-compat for legacy
+    # raw-IP configs is preserved (literal `address` returned verbatim).
+    address = a2a.resolve_peer_address_for_transport(
+        a2a.transport_kind(cfg), peer)
     port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
     if not address:
         raise rooms.RoomsError(
@@ -697,7 +701,11 @@ def _post_room_roster_broadcast(*, member_node: str, room_id: str,
         return _invoke_test_post_hook(path=path, headers=headers,
                                       body_bytes=body_bytes)
 
-    address = a2a.resolve_peer_address(peer)
+    # Transport-aware target resolution (#1595): Tailscale identity
+    # live-resolve or WARP-Mesh raw device IP. Back-compat for legacy
+    # raw-IP configs is preserved (literal `address` returned verbatim).
+    address = a2a.resolve_peer_address_for_transport(
+        a2a.transport_kind(cfg), peer)
     port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
     if not address:
         raise rooms.RoomsError(
@@ -846,7 +854,11 @@ def _post_room_talk(*, member_node: str, room_id: str, room_epoch: int,
         return _invoke_test_post_hook(path=path, headers=headers,
                                       body_bytes=body_bytes)
 
-    address = a2a.resolve_peer_address(peer)
+    # Transport-aware target resolution (#1595): Tailscale identity
+    # live-resolve or WARP-Mesh raw device IP. Back-compat for legacy
+    # raw-IP configs is preserved (literal `address` returned verbatim).
+    address = a2a.resolve_peer_address_for_transport(
+        a2a.transport_kind(cfg), peer)
     port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
     if not address:
         raise rooms.RoomsError(

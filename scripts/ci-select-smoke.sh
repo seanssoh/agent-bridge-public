@@ -134,6 +134,12 @@ add_required a2a-backpressure-openonly
 # #1575-B + #1589/B8: A2A sender retry scheduling keeps our exponential backoff
 # ceiling separate from peer Retry-After floor caps.
 add_required 1575b-a2a-backoff-ceiling
+# #1595: A2A is transport-pluggable (Tailscale | cloudflare-warp-mesh). The
+# Cloudflare bind proof inspects REAL local interface state + WARP connected/
+# enrolled status (CIDR shape is NOT proof; fail-closed on uncertainty); the
+# Tailscale + raw-IP back-compat is preserved exactly. Keep in the static suite
+# and pull it per-file below on the receiver / shared-protocol / sender moves.
+add_required 1595-cloudflare-warp-mesh
 # Issue #1461: BRIDGE_CRON_DISPATCH_MAX_PARALLEL must resolve env > runtime
 # bridge-config.json key > host-profile-scaled default, and the resolved value
 # must reach start_cron_dispatch_workers' worker-slot gate. In the static suite
