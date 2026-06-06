@@ -219,6 +219,99 @@ def tracked_files(source_root: Path) -> list[str]:
     return [item for item in proc.stdout.decode("utf-8").split("\x00") if item]
 
 
+def tracked_files_at_ref(source_root: Path, ref: str) -> list[str]:
+    """File set tracked by `ref`, read WITHOUT mutating the working tree.
+
+    Issue #1602: the dry-run preview must reflect the requested `--ref`, not
+    whatever ref `SOURCE_ROOT`'s working tree currently sits on. The apply
+    path checks the ref out and walks the working tree via `tracked_files`;
+    dry-run cannot (it must not mutate the tree), so it enumerates the target
+    file set from the ref's git tree object instead. `-z` keeps parity with
+    `tracked_files` (NUL-delimited paths, robust to spaces/newlines).
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(source_root), "ls-tree", "-r", "-z", "--name-only", ref],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return [item for item in proc.stdout.decode("utf-8").split("\x00") if item]
+
+
+def upstream_tracked_files(source_root: Path, upstream_ref: str) -> list[str]:
+    """Upstream file set: from `upstream_ref` when set, else the working tree.
+
+    Issue #1602: `upstream_ref` is set ONLY on the dry-run `--ref` preview
+    path (threaded from `bridge-upgrade.sh` as `--upstream-ref`). The apply
+    path leaves it empty and keeps reading the working tree, which it has
+    already checked out to the ref.
+    """
+    if upstream_ref:
+        return tracked_files_at_ref(source_root, upstream_ref)
+    return tracked_files(source_root)
+
+
+def upstream_file_bytes(source_root: Path, upstream_ref: str, relpath: str) -> bytes | None:
+    """Upstream bytes for `relpath`: from `upstream_ref` when set, else WT.
+
+    Issue #1602: ref-side reads reuse `git_file_bytes` (`git show <ref>:path`)
+    so the dry-run preview's upstream bytes match the requested `--ref`
+    without a checkout. The working-tree read is a direct `read_bytes()` —
+    identical to the pre-#1602 inline read at the call sites (the file set
+    comes from `git ls-files`, so every path is tracked + present); a
+    missing path raises exactly as it did before.
+    """
+    if upstream_ref:
+        return git_file_bytes(source_root, upstream_ref, relpath)
+    return (source_root / relpath).read_bytes()
+
+
+def upstream_exec_bits(source_root: Path, upstream_ref: str, relpath: str) -> int:
+    """git-tracked exec bit for `relpath`: from `upstream_ref` when set, else WT.
+
+    Issue #1602: mirrors `git_tracked_exec_bits` but resolves the mode from
+    the ref's tree (`git ls-tree <ref> -- <path>`) so the dry-run mode-drift
+    classification reflects the requested `--ref`. Empty `upstream_ref` keeps
+    the existing working-tree-index lookup.
+    """
+    if not upstream_ref:
+        return git_tracked_exec_bits(source_root, relpath)
+    proc = subprocess.run(
+        ["git", "-C", str(source_root), "ls-tree", upstream_ref, "--", relpath],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return 0
+    # `100755 blob <sha>\t<path>` — first field is the mode.
+    mode_field = proc.stdout.decode("utf-8", errors="replace").split(maxsplit=1)[0]
+    try:
+        return int(mode_field, 8) & 0o111
+    except ValueError:
+        return 0
+
+
+def read_upstream_version(source_root: Path, upstream_ref: str) -> str:
+    """Source VERSION: from `upstream_ref` when set, else the working tree.
+
+    Issue #1602: `versions_differ` (Issue #666 path) must compare the live
+    install against the REQUESTED ref's VERSION on the dry-run preview, not
+    the checked-out tree's VERSION. Falls back to the dev sentinel exactly
+    like `read_source_version` when the ref has no readable VERSION.
+    """
+    if not upstream_ref:
+        return read_source_version(source_root)
+    data = git_file_bytes(source_root, upstream_ref, "VERSION")
+    if data is None:
+        return "0.0.0-dev"
+    try:
+        version = data.decode("utf-8").splitlines()[0].strip()
+    except (IndexError, UnicodeDecodeError):
+        return "0.0.0-dev"
+    return version or "0.0.0-dev"
+
+
 def should_skip_relpath(relpath: str) -> bool:
     if relpath in {"agent-roster.local.sh"}:
         return True
@@ -1684,7 +1777,20 @@ def resolve_base_ref(target_root: Path, explicit_ref: str) -> str:
     return str(manifest.get("source_head") or "").strip()
 
 
-def analyze_live(source_root: Path, target_root: Path, base_ref: str) -> dict[str, Any]:
+def analyze_live(
+    source_root: Path,
+    target_root: Path,
+    base_ref: str,
+    upstream_ref: str = "",
+) -> dict[str, Any]:
+    # Issue #1602: `upstream_ref` is set ONLY on the dry-run `--ref` preview
+    # path. When set, the upstream file SET and BYTES are read from the
+    # requested ref's git tree (`git ls-tree` / `git show <ref>:path`) with no
+    # working-tree mutation, so the preview reflects the requested ref instead
+    # of whatever ref `SOURCE_ROOT` currently sits on. The apply path leaves
+    # `upstream_ref` empty and keeps reading the working tree, which it has
+    # already checked out to the ref. The merge BASE (`base_ref`, the recorded
+    # `source_head`) is UNCHANGED — only the upstream side is ref-resolved.
     files: list[dict[str, Any]] = []
     counts = {
         "missing_live": 0,
@@ -1707,7 +1813,7 @@ def analyze_live(source_root: Path, target_root: Path, base_ref: str) -> dict[st
     # when there is no usable `base` *and* we know upstream is a different
     # release — preserving the "rerun same version → keep operator edits"
     # contract by gating on the version mismatch, not just on `base is None`.
-    source_version = read_source_version(source_root)
+    source_version = read_upstream_version(source_root, upstream_ref)
     target_version = read_target_version(target_root)
     # `read_source_version` falls back to the dev sentinel "0.0.0-dev" when
     # the source checkout has no `VERSION` file (a dev clone, not a real
@@ -1725,12 +1831,11 @@ def analyze_live(source_root: Path, target_root: Path, base_ref: str) -> dict[st
         and source_version != "0.0.0-dev"
     )
 
-    for relpath in tracked_files(source_root):
+    for relpath in upstream_tracked_files(source_root, upstream_ref):
         if should_skip_relpath(relpath):
             continue
-        source_path = source_root / relpath
         live_path = target_root / relpath
-        upstream = source_path.read_bytes()
+        upstream = upstream_file_bytes(source_root, upstream_ref, relpath)
         live = live_path.read_bytes() if live_path.exists() else None
         base = git_file_bytes(source_root, base_ref, relpath) if base_ref else None
 
@@ -1748,7 +1853,7 @@ def analyze_live(source_root: Path, target_root: Path, base_ref: str) -> dict[st
             # have drifted filesystem perms (0744 / 0700) while git
             # still tracks 100755, and using stat would propagate the
             # bad worktree mode to every downstream install.
-            source_exec = git_tracked_exec_bits(source_root, relpath)
+            source_exec = upstream_exec_bits(source_root, upstream_ref, relpath)
             live_exec = 0
             if not live_path.is_symlink():
                 try:
@@ -1845,8 +1950,15 @@ def apply_live(
     dry_run: bool,
     strict_merge: bool,
     run_id: str = "",
+    upstream_ref: str = "",
 ) -> dict[str, Any]:
-    analysis = analyze_live(source_root, target_root, base_ref)
+    # Issue #1602: `upstream_ref` is honored ONLY on the dry-run preview path
+    # (the caller never sets it when actually writing). It is asserted below so
+    # a ref-resolved upstream can never be paired with a real apply, which
+    # MUST read the checked-out working tree it is about to copy from.
+    if upstream_ref and not dry_run:
+        raise ValueError("upstream_ref is only valid with dry_run=True (apply reads the checked-out working tree)")
+    analysis = analyze_live(source_root, target_root, base_ref, upstream_ref)
     actions: list[dict[str, Any]] = []
     counts = {
         "files_copied": 0,
@@ -1870,7 +1982,12 @@ def apply_live(
         relpath = str(item["path"])
         classification = str(item["classification"])
         live_path = target_root / relpath
-        upstream = (source_root / relpath).read_bytes()
+        # Issue #1602: read upstream from the ref on the dry-run `--ref`
+        # preview so the previewed merge/conflict bytes match the requested
+        # ref. `upstream_ref` is empty on apply → working-tree read, unchanged.
+        upstream = upstream_file_bytes(source_root, upstream_ref, relpath)
+        if upstream is None:
+            upstream = b""
         live = live_path.read_bytes() if live_path.exists() else None
         base = git_file_bytes(source_root, base_ref, relpath) if base_ref else None
 
@@ -2171,7 +2288,12 @@ def write_conflict_audit(target_root: Path, action: str, detail: dict[str, Any])
 def cmd_analyze_live(args: argparse.Namespace) -> int:
     source_root = Path(args.source_root).expanduser()
     target_root = Path(args.target_root).expanduser()
-    payload = analyze_live(source_root, target_root, resolve_base_ref(target_root, args.base_ref or ""))
+    payload = analyze_live(
+        source_root,
+        target_root,
+        resolve_base_ref(target_root, args.base_ref or ""),
+        str(getattr(args, "upstream_ref", "") or ""),
+    )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
@@ -2719,6 +2841,7 @@ def cmd_apply_live(args: argparse.Namespace) -> int:
         bool(args.dry_run),
         bool(args.strict_merge),
         run_id=str(getattr(args, "run_id", "") or ""),
+        upstream_ref=str(getattr(args, "upstream_ref", "") or ""),
     )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 2 if payload.get("aborted") else 0
@@ -3148,12 +3271,22 @@ def build_parser() -> argparse.ArgumentParser:
     # Issue #394: caller-supplied run-id stamps the structured record
     # at state/upgrade-conflicts/<run-id>.json. Empty → auto-generated.
     apply_live_parser.add_argument("--run-id", default="")
+    # Issue #1602: dry-run-only ref for the upstream side of the preview. When
+    # set, the upstream file set + bytes come from this ref's git tree (no
+    # working-tree mutation) so `--ref <tag> --dry-run` previews the requested
+    # ref. Rejected with a non-empty value unless --dry-run (apply must read
+    # the checked-out tree). Empty → working tree, unchanged.
+    apply_live_parser.add_argument("--upstream-ref", default="")
     apply_live_parser.set_defaults(handler=cmd_apply_live)
 
     analyze = subparsers.add_parser("analyze-live")
     analyze.add_argument("--source-root", required=True)
     analyze.add_argument("--target-root", required=True)
     analyze.add_argument("--base-ref", default="")
+    # Issue #1602: see apply-live --upstream-ref. analyze-live has no apply
+    # side, so no dry-run guard is needed; a set value always reads from the
+    # ref's git tree.
+    analyze.add_argument("--upstream-ref", default="")
     analyze.set_defaults(handler=cmd_analyze_live)
 
     write_state = subparsers.add_parser("write-state")
