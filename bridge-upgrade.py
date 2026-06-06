@@ -3001,6 +3001,60 @@ def cmd_conflicts_diff(args: argparse.Namespace) -> int:
     return 0 if proc.returncode in {0, 1} else proc.returncode
 
 
+# Git merge-file --diff3 marker forms. A marker is a line that STARTS with
+# exactly seven identical marker chars, optionally followed by a space + a
+# label (`<<<<<<< live`, `||||||| base`, `>>>>>>> upstream`) or, for the
+# divider, the seven chars alone (`=======`). We anchor to start-of-line and
+# require the 8th char to be a space or end-of-line so a legitimate content
+# line that merely begins with `=======` followed by more `=` (e.g. a Markdown
+# `========` heading underline) or by non-space text is NOT a false positive.
+_CONFLICT_MARKER_RE = re.compile(
+    rb"^(?:<<<<<<<|\|\|\|\|\|\|\||>>>>>>>|=======)(?:[ \t].*)?$"
+)
+
+
+def _scan_conflict_markers(data: bytes) -> list[int]:
+    """Return 1-based line numbers of any unresolved diff3 conflict markers."""
+    hits: list[int] = []
+    for lineno, line in enumerate(data.split(b"\n"), start=1):
+        # Strip a trailing CR so CRLF sidecars are still matched.
+        if _CONFLICT_MARKER_RE.match(line.rstrip(b"\r")):
+            hits.append(lineno)
+    return hits
+
+
+def _syntax_check_for_target(live: Path, data: bytes) -> str | None:
+    """Best-effort syntax validation of the already-read sidecar bytes against
+    the live target's type. Returns an error string on failure, or None when
+    the file type is unchecked or the check passes. Validates the SAME bytes
+    that will be written (no re-read), and never imports/execs them — for `.py`
+    it parse-compiles the in-memory bytes (no `.pyc` cache, no module load), so
+    adopting a broken bridge-upgrade.py cannot re-enter the half-written
+    module."""
+    suffix = live.suffix.lower()
+    name = live.name
+    if suffix == ".py":
+        try:
+            # Parse + compile the bytes only; writes nothing to disk and does
+            # not import/exec. `dont_inherit` keeps the current process's
+            # __future__ flags out of the check.
+            compile(data, str(live), "exec", dont_inherit=True)
+        except (SyntaxError, ValueError) as exc:
+            return str(exc).strip()
+        return None
+    if suffix == ".sh" or name in {"agent-bridge", "agb"}:
+        proc = subprocess.run(
+            ["bash", "-n", "/dev/stdin"],
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return (proc.stderr or proc.stdout).decode("utf-8", errors="replace").strip() or "bash -n failed"
+    return None
+
+
 def cmd_conflicts_adopt(args: argparse.Namespace) -> int:
     target_root = Path(args.target_root).expanduser().resolve()
     conflict = _resolve_conflict_path(target_root, args.path)
@@ -3008,16 +3062,109 @@ def cmd_conflicts_adopt(args: argparse.Namespace) -> int:
         print(f"not a *.upgrade-conflict path: {conflict}", file=sys.stderr)
         return 1
     live = conflict.with_name(conflict.name[: -len(".upgrade-conflict")])
+
+    # Fail-closed content guard (#1601). The sidecar holds `git merge-file
+    # --diff3` output, i.e. it may still contain unresolved conflict markers.
+    # Adopting marker-laden / unparseable content over a working live file can
+    # brick the very tool used to recover (CLAUDE.md high-risk area #3), and
+    # the post-copy unlink would destroy the only obvious recovery artifact.
+    # So we validate BEFORE copying and NEVER unlink on failure. --force is the
+    # documented escape hatch for an operator who has knowingly hand-merged.
+    force = bool(getattr(args, "force", False))
+    try:
+        sidecar_bytes = conflict.read_bytes()
+    except OSError as exc:
+        print(f"cannot read conflict sidecar: {conflict}: {exc}", file=sys.stderr)
+        return 1
+
+    if not force:
+        marker_lines = _scan_conflict_markers(sidecar_bytes)
+        if marker_lines:
+            preview = ", ".join(str(n) for n in marker_lines[:10])
+            if len(marker_lines) > 10:
+                preview += ", …"
+            print(
+                f"refusing to adopt: {conflict} still contains unresolved conflict "
+                f"markers at line(s): {preview}.\n"
+                f"Resolve the markers in the sidecar first (see "
+                f"`agb upgrade conflicts diff {conflict}`), then re-run adopt. "
+                f"The sidecar has been left in place. Pass --force to override.",
+                file=sys.stderr,
+            )
+            return 1
+        syntax_err = _syntax_check_for_target(live, sidecar_bytes)
+        if syntax_err is not None:
+            print(
+                f"refusing to adopt: {conflict} fails a syntax check for the live "
+                f"target {live.name}:\n{syntax_err}\n"
+                f"Fix the sidecar first, then re-run adopt. The sidecar has been "
+                f"left in place. Pass --force to override.",
+                file=sys.stderr,
+            )
+            return 1
+
     if not _confirm_or_abort(f"adopt {conflict} → {live}?", bool(args.yes)):
         return 1
-    shutil.copyfile(conflict, live)
-    conflict.unlink()
+
+    # Keep a `.pre-adopt` snapshot of the prior live bytes so even a --force'd
+    # (or marker-free-but-still-wrong) adopt remains recoverable. Best-effort:
+    # a missing live target is fine (the conflict path can pre-date the live
+    # file in some scaffold cases).
+    if live.exists():
+        backup = live.with_name(f"{live.name}.pre-adopt")
+        try:
+            shutil.copyfile(live, backup)
+        except OSError as exc:
+            # The backup-before-overwrite invariant is load-bearing: if the
+            # prior live bytes cannot be snapshotted, REFUSE before mutating
+            # live. A non-writable PARENT DIR with a still-writable live file
+            # would otherwise let the overwrite succeed WITHOUT a `.pre-adopt`
+            # recovery copy (and then crash on the sidecar unlink) — exactly the
+            # data-loss this guard exists to prevent (#1601 patch-dev re-review).
+            # Controlled nonzero, no traceback, sidecar left in place.
+            print(
+                f"refusing to adopt: could not snapshot the prior live file to "
+                f"{backup} ({exc}). The live file is UNCHANGED and the sidecar "
+                f"is left in place. Fix the destination (e.g. parent-directory "
+                f"permissions) and re-run adopt.",
+                file=sys.stderr,
+            )
+            return 1
+
+    # Only after the guard has passed do we mutate the live file, and only
+    # after a successful write do we unlink the sidecar (the recovery artifact).
+    # Write the EXACT bytes we validated (no re-read of `conflict`) so a sidecar
+    # that changed during the prompt / between validate and copy cannot slip
+    # marker-laden content past the guard. `open(wb)` preserves the live file's
+    # existing mode (it overwrites contents, not the inode's permissions).
+    try:
+        with open(live, "wb") as handle:
+            handle.write(sidecar_bytes)
+    except OSError as exc:
+        print(f"adopt failed writing {live}: {exc}", file=sys.stderr)
+        return 1
+    try:
+        conflict.unlink()
+    except OSError as exc:
+        # The live file was already written successfully; failing to remove the
+        # sidecar (e.g. a non-writable parent dir) is non-fatal — it is now a
+        # stale recovery artifact, not corruption. Surface a CONTROLLED warning
+        # rather than a traceback (#1601 patch-dev re-review).
+        print(
+            f"warning: adopted {live} but could not remove the sidecar "
+            f"{conflict}: {exc}. Remove it manually.",
+            file=sys.stderr,
+        )
     write_conflict_audit(
         target_root,
         "conflict_adopt",
-        {"conflict": str(conflict), "live_target": str(live)},
+        {"conflict": str(conflict), "live_target": str(live), "forced": force},
     )
-    print(json.dumps({"action": "adopt", "conflict": str(conflict), "live_target": str(live)}))
+    print(
+        json.dumps(
+            {"action": "adopt", "conflict": str(conflict), "live_target": str(live), "forced": force}
+        )
+    )
     return 0
 
 
@@ -3323,6 +3470,11 @@ def build_parser() -> argparse.ArgumentParser:
     conflicts_adopt = subparsers.add_parser("conflicts-adopt")
     conflicts_adopt.add_argument("--target-root", required=True)
     conflicts_adopt.add_argument("--yes", action="store_true")
+    conflicts_adopt.add_argument(
+        "--force",
+        action="store_true",
+        help="skip the conflict-marker scan and syntax check (for a knowingly hand-merged sidecar)",
+    )
     conflicts_adopt.add_argument("path")
     conflicts_adopt.set_defaults(handler=cmd_conflicts_adopt)
 

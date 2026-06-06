@@ -1084,7 +1084,7 @@ bridge_upgrade_conflicts_dispatch() {
 Usage:
   agb upgrade conflicts list     [--target <bridge-home>] [--json]
   agb upgrade conflicts diff     [--target <bridge-home>] <conflict-path>
-  agb upgrade conflicts adopt    [--target <bridge-home>] [--yes] <conflict-path>
+  agb upgrade conflicts adopt    [--target <bridge-home>] [--yes] [--force] <conflict-path>
   agb upgrade conflicts discard  [--target <bridge-home>] [--yes] <conflict-path>
   agb upgrade conflicts archive  [--target <bridge-home>] [--yes] <conflict-path>
   agb upgrade conflicts reconcile [--target <bridge-home>] [--auto-archive]
@@ -1115,7 +1115,7 @@ USAGE
 Usage:
   agb upgrade conflicts list     [--target <bridge-home>] [--json]
   agb upgrade conflicts diff     [--target <bridge-home>] <conflict-path>
-  agb upgrade conflicts adopt    [--target <bridge-home>] [--yes] <conflict-path>
+  agb upgrade conflicts adopt    [--target <bridge-home>] [--yes] [--force] <conflict-path>
   agb upgrade conflicts discard  [--target <bridge-home>] [--yes] <conflict-path>
   agb upgrade conflicts archive  [--target <bridge-home>] [--yes] <conflict-path>
   agb upgrade conflicts reconcile [--target <bridge-home>] [--auto-archive]
