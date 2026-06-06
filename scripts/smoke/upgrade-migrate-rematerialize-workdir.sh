@@ -186,6 +186,42 @@ test_dry_run_no_write() {
     "dry-run: planned updated path missing"
 }
 
+test_dry_run_healthy_workdir_backup_preview() {
+  setup_bridge_fixture
+  write_roster healthy
+  seed_agent healthy source-old source-old
+  local before=""
+  before="$(cat "$BRIDGE_AGENT_ROOT_V2/healthy/workdir/CLAUDE.md")"
+
+  local preview="$SMOKE_TMP_ROOT/healthy-preview.out"
+  run_migrate --dry-run >"$preview"
+  smoke_assert_eq "$before" "$(cat "$BRIDGE_AGENT_ROOT_V2/healthy/workdir/CLAUDE.md")" \
+    "healthy dry-run: workdir CLAUDE.md changed"
+  smoke_assert_eq "planned" "$(json_agent_remat_field "$(cat "$preview")" healthy status)" \
+    "healthy dry-run: rematerialize status"
+  smoke_assert_contains "$(json_agent_remat_field "$(cat "$preview")" healthy updated_paths)" \
+    "agents/healthy/workdir/CLAUDE.md" \
+    "healthy dry-run: byte-identical workdir CLAUDE.md was not planned"
+
+  local backup_root="$SMOKE_TMP_ROOT/healthy-backup"
+  python3 "$REPO_ROOT/bridge-upgrade.py" backup-live \
+    --target-root "$BRIDGE_HOME" \
+    --backup-root "$backup_root" \
+    --source-root "$REPO_ROOT" \
+    --migration-json-file "$preview" >"$SMOKE_TMP_ROOT/healthy-backup.out"
+  smoke_assert_contains "$(json_manifest_entry_paths "$backup_root/manifest.json")" \
+    "agents/healthy/workdir/CLAUDE.md" \
+    "healthy dry-run: backup planner did not include byte-identical workdir path"
+
+  local applied="$SMOKE_TMP_ROOT/healthy-applied.out"
+  run_migrate >"$applied"
+  cmp -s "$BRIDGE_AGENT_HOME_ROOT/healthy/CLAUDE.md" "$BRIDGE_AGENT_ROOT_V2/healthy/workdir/CLAUDE.md" \
+    || smoke_fail "healthy apply: workdir CLAUDE.md is not byte-identical to migrated source"
+  if [[ "$(cat "$BRIDGE_AGENT_ROOT_V2/healthy/workdir/CLAUDE.md")" == "$before" ]]; then
+    smoke_fail "healthy apply: workdir CLAUDE.md did not receive migrated source content"
+  fi
+}
+
 test_shared_pair_guard() {
   setup_bridge_fixture
   write_roster owner guest
@@ -264,6 +300,7 @@ test_target_outside_root_skips() {
 
 smoke_run "split stale workdir rematerializes on apply" test_split_apply
 smoke_run "dry-run plans but writes nothing" test_dry_run_no_write
+smoke_run "dry-run backs up healthy byte-identical workdir" test_dry_run_healthy_workdir_backup_preview
 smoke_run "shared-cwd pair skips non-owner identity" test_shared_pair_guard
 smoke_run "source equals target is a no-op" test_source_equals_target
 smoke_run "iso path uses writer stub and lands 0660" test_iso_writer_stub

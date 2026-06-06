@@ -18,6 +18,7 @@ shift 5 || true
 
 declare -a REMAT_UPDATED_PATHS=()
 declare -a REMAT_ERRORS=()
+declare -a REMAT_CHANGED_FILES=()
 
 status="applied"
 skipped_reason=""
@@ -97,11 +98,44 @@ _remat_finish() {
   _remat_emit_json
 }
 
+_remat_normalize_changed_file() {
+  local rel="${1:-}"
+  while [[ "$rel" == ./* ]]; do
+    rel="${rel#./}"
+  done
+  rel="${rel%/}"
+  [[ -n "$rel" ]] || return 1
+  [[ "$rel" != /* ]] || return 1
+  [[ "$rel" != "." && "$rel" != ".." && "$rel" != ../* && "$rel" != */../* && "$rel" != */.. ]] || return 1
+  printf '%s' "$rel"
+}
+
+_remat_load_changed_files() {
+  local item="" rel=""
+  for item in "$@"; do
+    rel="$(_remat_normalize_changed_file "$item" 2>/dev/null || true)"
+    [[ -n "$rel" ]] || continue
+    REMAT_CHANGED_FILES+=("$rel")
+  done
+}
+
+_remat_changed_file_is_planned() {
+  local rel="$1"
+  local item=""
+  [[ "$dry_run" == "1" ]] || return 1
+  for item in "${REMAT_CHANGED_FILES[@]}"; do
+    [[ "$item" == "$rel" ]] || continue
+    return 0
+  done
+  return 1
+}
+
 if [[ -z "$source_root" || -z "$target_root" || -z "$agent" || -z "$engine" ]]; then
   _remat_add_error "usage: rematerialize-agent-identity.sh <source_root> <target_root> <agent> <engine> <dry_run> [changed-file...]"
   _remat_finish
   exit 0
 fi
+_remat_load_changed_files "$@"
 
 export HOME="${HOME:-}"
 export PATH="${PATH:-/usr/bin:/bin}"
@@ -346,10 +380,19 @@ _remat_copy_one_file() {
   local src="$source_dir/$rel"
   local dst="$target_dir/$rel"
   local target_rel=""
-  [[ -f "$src" ]] || return 0
+  local force_plan=0
   target_rel="$(_remat_rel_to_target_root "$dst")"
 
-  if ! _remat_target_differs_or_missing "$src" "$dst"; then
+  if _remat_changed_file_is_planned "$rel"; then
+    force_plan=1
+  fi
+  if [[ ! -f "$src" ]]; then
+    if (( force_plan == 1 )); then
+      REMAT_UPDATED_PATHS+=("$target_rel")
+    fi
+    return 0
+  fi
+  if (( force_plan == 0 )) && ! _remat_target_differs_or_missing "$src" "$dst"; then
     return 0
   fi
   REMAT_UPDATED_PATHS+=("$target_rel")
