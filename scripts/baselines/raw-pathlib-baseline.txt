@@ -1,4 +1,4 @@
-bridge-a2a.py:6
+bridge-a2a.py:7
 bridge-audit.py:5
 bridge-auth.py:17
 bridge-bundle.py:8
@@ -16,7 +16,7 @@ bridge-discord-relay.py:9
 bridge-docs.py:67
 bridge-doctor.py:19
 bridge-guard.py:0
-bridge-handoffd.py:3
+bridge-handoffd.py:9
 bridge-hooks.py:0
 bridge-intake.py:4
 bridge-knowledge.py:26

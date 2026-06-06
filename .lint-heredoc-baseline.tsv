@@ -889,3 +889,4 @@ tests/wave-cli/smoke.sh	377	C3	8844b9da8cd1d8b04193a884fb2863a01e880d592299e5fe7
 tests/wave-cli/smoke.sh	461	C3	ba1f530715a8b88b4ee0e9566f08a922e06d575484eebed19375cc9a57b98f1f	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 tests/wiki-daily-ingest/smoke.sh	685	H3	9a200a2ec60ca5c9c64ae5229db1c1d1b0e191ff9de817a530248bd2f03e2065	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 tests/wiki-daily-ingest/smoke.sh	687	H3	49dbf920eb16a37d5ec324e0d1f242e7a191cbd8b16229f2dabbe907aeec86bc	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
+scripts/smoke/a2a-backpressure-openonly.sh	22	C3	950fbaf95809c154f9727b56952475c098c1c0e4a841b7063704fcecf1c3e18e	interpreter heredoc, no capture	agb-dev	rc3 #1589 Track A B1-B8

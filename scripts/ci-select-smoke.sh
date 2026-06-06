@@ -122,6 +122,13 @@ add_required 1568-routine-nudge-inject-busy-gate
 # per-file selectors below (hooks/bridge_hook_common.py, hooks/check_inbox.py,
 # bridge-queue.py, bridge-hooks.py) also pull it directly.
 add_required 9780-stop-inbox-drain
+# #10222: A2A receiver backpressure must count currently OPEN tasks
+# (queued/claimed/blocked) by joining inbox_dedupe to tasks.db, not all-time
+# accepted rows. Keep this in the static suite and pull it on receiver changes.
+add_required a2a-backpressure-openonly
+# #1575-B + #1589/B8: A2A sender retry scheduling keeps our exponential backoff
+# ceiling separate from peer Retry-After floor caps.
+add_required 1575b-a2a-backoff-ceiling
 # Issue #1461: BRIDGE_CRON_DISPATCH_MAX_PARALLEL must resolve env > runtime
 # bridge-config.json key > host-profile-scaled default, and the resolved value
 # must reach start_cron_dispatch_workers' worker-slot gate. In the static suite
@@ -1141,14 +1148,16 @@ select_for_path() {
       # delivery_backoff_ceiling(cfg) (config key + BRIDGE_A2A_BACKOFF_CEILING_
       # SECONDS env override, floored at the base step); backoff_seconds()
       # defaults to it; bridge-a2a.py:_schedule_retry reads it, passes it as the
-      # ceiling, keeps base 15 + full jitter, and CLAMPS an untrusted Retry-After
-      # to the ceiling unless delivery_trust_peer_retry_after is set.
+      # ceiling, keeps base 15 + full jitter, and bounds an untrusted Retry-After
+      # by the two-cap model (delivery_max_retry_after_seconds, #1589 two-cap).
       # 1575b-a2a-backoff-ceiling pins: the curve clamp, the ceiling precedence
       # (default/config/env/floor + non-numeric fallback), the end-to-end
-      # _schedule_retry delay <= ceiling+jitter, and the Retry-After clamp vs
-      # opt-in trust. Pull on every move to either file so a recovered peer's
-      # retry rows cannot regress to a multi-minute dormant backoff.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk rooms-p4-5-polish 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr8-a2a-diag-recovery 1575b-a2a-backoff-ceiling
+      # _schedule_retry delay <= ceiling+jitter, the two-cap Retry-After floor,
+      # and the non-finite guard. Pull on every move to either file so a
+      # recovered peer's retry rows cannot regress to a multi-minute dormant backoff.
+      # #1589 (A2A audit B1-B8): a2a-backpressure-openonly pins the in-transaction
+      # OPEN-only backpressure count + the reaper / recover / deadline regressions.
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force a2a-backpressure-openonly rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk rooms-p4-5-polish 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr8-a2a-diag-recovery 1575b-a2a-backoff-ceiling
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)
