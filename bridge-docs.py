@@ -33,7 +33,12 @@ DEPRECATED_SHARED_FILES = (
     "SYRS-USER.md",
 )
 AGENT_RUNTIME_REWRITE_FILES = ("SOUL.md", "HEARTBEAT.md", "CHECKLIST.md", "MEMORY.md")
-SHARED_CLAUDE_SKILL_NAMES = ("agent-bridge-runtime", "cron-manager", "memory-wiki")
+SHARED_CLAUDE_SKILL_NAMES = (
+    "agent-bridge-runtime",
+    "agent-bridge-operating-manual",
+    "cron-manager",
+    "memory-wiki",
+)
 LEGACY_PATTERNS = (
     "openclaw message send",
     "sessions_send",
@@ -1248,6 +1253,7 @@ def render_agent_bridge_block(agent_dir: Path, session_type: str | None = None) 
         "## Runtime Protocol Pointers",
         "- 공통 운영 본문은 `COMMON-INSTRUCTIONS.md`에 있다. queue, task 처리, autonomy, upstream issue policy, channel setup의 source of truth다.",
         "- admin-only 운영 본문은 `ADMIN-PROTOCOL.md`에 있다. first-run onboarding, self-cleanup, static/dynamic boundary, upgrade protocol은 admin 세션에만 적용된다.",
+        "- 운영 매뉴얼 인덱스는 `~/.agent-bridge/.claude/skills/agent-bridge-operating-manual/SKILL.md`에서 찾는다.",
         "- `[Agent Bridge] event=...` 외부 push는 `external-push-handling` skill을 읽고 처리한다. 이 블록에는 7-step 루틴을 하드카피하지 않는다.",
         "- handoff, memory/wiki, user preference promotion은 `docs/agent-runtime/`의 각 canonical 문서를 따른다.",
         "",

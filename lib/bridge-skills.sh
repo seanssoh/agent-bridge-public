@@ -58,7 +58,7 @@ bridge_agent_claude_skill_link_dir() {
 bridge_is_shared_claude_skill_name() {
   local skill_name="$1"
   case "$skill_name" in
-    agent-bridge-runtime|cron-manager|memory-wiki)
+    agent-bridge-runtime|agent-bridge-operating-manual|cron-manager|memory-wiki)
       return 0
       ;;
   esac
@@ -239,6 +239,7 @@ bridge_bootstrap_claude_shared_skills() {
   # empty (legacy single-arg caller), the guard short-circuits and behavior
   # is unchanged.
   bridge_link_shared_claude_skill "$workdir" "agent-bridge-runtime" "$agent"
+  bridge_link_shared_claude_skill "$workdir" "agent-bridge-operating-manual" "$agent"
   bridge_link_shared_claude_skill "$workdir" "cron-manager" "$agent"
   bridge_link_shared_claude_skill "$workdir" "memory-wiki" "$agent"
   # v0.8.6: wave-orchestration is the shared parallel-PR-ship pattern
@@ -270,6 +271,7 @@ bridge_bootstrap_claude_shared_skills() {
 bridge_isolated_home_shared_skill_names() {
   printf '%s\n' \
     "agent-bridge-runtime" \
+    "agent-bridge-operating-manual" \
     "cron-manager" \
     "memory-wiki" \
     "patch-permission-approval" \
@@ -728,6 +730,7 @@ $(bridge_project_claude_marker_start)
 ## Agent Bridge
 - When a task involves bridge coordination, use the \`agent-bridge\` skill before improvising commands.
 - Do not guess bridge commands. Use \`${bridge_home}/agb --help\`, \`${bridge_home}/agent-bridge --help\`, or the local bridge skill reference.
+- Operating manual index: \`${bridge_home}/.claude/skills/agent-bridge-operating-manual/SKILL.md\`.
 - Your sender id is your current bridge agent id. Prefer \`\$BRIDGE_AGENT_ID\`; if it is missing, verify the agent from \`${bridge_home}/state/active-roster.md\`.
 - When you create or hand off work, set \`--from "\$BRIDGE_AGENT_ID"\` when running outside a bridge-managed wrapper.
 - Queue state is source of truth. Use \`${bridge_home}/agb inbox|show|claim|done\` instead of direct sqlite access.
@@ -1179,6 +1182,7 @@ Use this skill when the task depends on the shared agent bridge in \`${bridge_ho
 ## Reference
 
 - Load [references/bridge-commands.md](references/bridge-commands.md) for command patterns and examples.
+- Operating manual index: \`${bridge_home}/.claude/skills/agent-bridge-operating-manual/SKILL.md\`.
 
 ## Guardrails
 

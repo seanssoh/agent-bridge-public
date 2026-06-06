@@ -20,6 +20,7 @@
 #   7  `agb skills list --agent <name>` restricts to one agent
 #   8  `agb skills list --agent <unknown>` exits non-zero with a clear
 #      error
+#   17 operating-manual shared skill appears in registry + legacy catalogs
 #
 # Each case runs against a tmp BRIDGE_HOME / tmp installed_plugins.json
 # fixture; the operator's real install is never touched.
@@ -443,6 +444,37 @@ if $ok16 && [[ ! -f "$BACKUP_DIR/SKILLS.md" ]]; then
   ok16=false; fail 16 "expected backup at $BACKUP_DIR/SKILLS.md (cleanup must be recoverable). state contents:\n$(find "$C16_HOME/state" -type f 2>/dev/null)"
 fi
 $ok16 && pass 16
+
+# ---------- case 17: operating-manual shared skill registry/catalog ----------
+banner 17 "agent-bridge-operating-manual appears in registry and legacy catalogs"
+C17_HOME="$SMOKE_ROOT/c17"
+C17_SOURCE_SHARED="$SMOKE_ROOT/c17-src-shared"
+mkdir -p "$C17_HOME/state" "$C17_SOURCE_SHARED"
+
+OUT17=$("$PYTHON" -c "$load_bd_preamble"$'
+import json
+import pathlib
+
+home = pathlib.Path("'"$C17_HOME"'")
+source_shared = pathlib.Path("'"$C17_SOURCE_SHARED"'")
+registry = mod.build_skill_registry(home)
+assert "agent-bridge-operating-manual" in registry, sorted(registry)
+mod.write_skill_registry(home, registry, dry_run=False)
+mod.sync_shared_docs(home, source_shared, dry_run=False, stamp="20260503T000001Z", registry=registry)
+
+payload = json.loads((home / "state" / "skill-registry.json").read_text(encoding="utf-8"))
+assert "agent-bridge-operating-manual" in payload["skills"], payload["skills"].keys()
+shared_catalog = (home / "shared" / "SKILLS.md").read_text(encoding="utf-8")
+assert "`agent-bridge-operating-manual`" in shared_catalog, shared_catalog
+agent_catalog = mod.render_agent_skills_md(home / "agents" / "agent-a", registry)
+assert "agent-bridge-operating-manual" in agent_catalog, agent_catalog
+print("ok")
+' 2>&1) || {
+  fail 17 "registry/catalog assertion failed:\n$OUT17"
+}
+if [[ "$OUT17" == "ok" ]]; then
+  pass 17
+fi
 
 # ---------- summary ----------
 printf '\n=== summary: %d PASS, %d FAIL ===\n' "$PASS" "$FAIL"
