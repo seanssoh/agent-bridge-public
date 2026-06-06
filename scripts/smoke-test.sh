@@ -8,6 +8,175 @@ REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
 # shellcheck source=../lib/bridge-session-patterns.sh
 source "$REPO_ROOT/lib/bridge-session-patterns.sh"
 
+_SMOKE_CONTROLLER_PATH_VARS=(
+  BRIDGE_ROSTER_FILE
+  BRIDGE_ROSTER_LOCAL_FILE
+  BRIDGE_STATE_DIR
+  BRIDGE_LAYOUT_MARKER_DIR
+  BRIDGE_ACTIVE_AGENT_DIR
+  BRIDGE_HISTORY_DIR
+  BRIDGE_WORKTREE_META_DIR
+  BRIDGE_ACTIVE_ROSTER_TSV
+  BRIDGE_ACTIVE_ROSTER_MD
+  BRIDGE_AGENTS_AGGREGATE_TSV
+  BRIDGE_DAEMON_PID_FILE
+  BRIDGE_DAEMON_LOG
+  BRIDGE_DAEMON_CRASH_LOG
+  BRIDGE_TASK_DB
+  BRIDGE_PROFILE_STATE_DIR
+  BRIDGE_CRON_STATE_DIR
+  BRIDGE_CRON_HOME_DIR
+  BRIDGE_NATIVE_CRON_JOBS_FILE
+  BRIDGE_CRON_DISPATCH_WORKER_DIR
+  BRIDGE_CRON_STAGING_DIR
+  BRIDGE_WORKTREE_ROOT
+  BRIDGE_AGENT_HOME_ROOT
+  BRIDGE_RUNTIME_ROOT
+  BRIDGE_RUNTIME_SCRIPTS_DIR
+  BRIDGE_RUNTIME_SKILLS_DIR
+  BRIDGE_RUNTIME_SHARED_DIR
+  BRIDGE_RUNTIME_SHARED_TOOLS_DIR
+  BRIDGE_RUNTIME_SHARED_REFERENCES_DIR
+  BRIDGE_RUNTIME_MEMORY_DIR
+  BRIDGE_RUNTIME_CREDENTIALS_DIR
+  BRIDGE_RUNTIME_SECRETS_DIR
+  BRIDGE_RUNTIME_CONFIG_FILE
+  BRIDGE_HOOKS_DIR
+  BRIDGE_SHARED_DIR
+  BRIDGE_TASK_NOTE_DIR
+  BRIDGE_LOG_DIR
+  BRIDGE_DATA_ROOT
+  BRIDGE_SHARED_ROOT
+  BRIDGE_AGENT_ROOT_V2
+  BRIDGE_CONTROLLER_STATE_ROOT
+  BRIDGE_AUDIT_LOG
+  BRIDGE_DASHBOARD_STATE_FILE
+  BRIDGE_DISCORD_RELAY_STATE_FILE
+  BRIDGE_SOURCE_CRON_JOBS_FILE
+  BRIDGE_OPENCLAW_CRON_JOBS_FILE
+  BRIDGE_CLAUDE_CHANNELS_HOME
+  BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT
+  BRIDGE_CLAUDE_INSTALLED_PLUGINS_FILE
+)
+
+_smoke_path_under_allowed_tmp_prefix() {
+  local path="${1:-}" candidate=""
+  [[ -n "$path" ]] || return 1
+  for candidate in "${TMPDIR:-}" "/tmp" "/private/tmp" "/var/folders" "/private/var/folders"; do
+    candidate="${candidate%/}"
+    [[ -n "$candidate" ]] || continue
+    case "$path" in
+      "$candidate"|"$candidate"/*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+_smoke_unset_controller_path_vars() {
+  local var=""
+  for var in "${_SMOKE_CONTROLLER_PATH_VARS[@]}"; do
+    unset "$var"
+  done
+}
+
+_smoke_sanitize_controller_path_vars() {
+  local var="" value=""
+  for var in "${_SMOKE_CONTROLLER_PATH_VARS[@]}"; do
+    value="${!var:-}"
+    [[ -n "$value" ]] || continue
+    if ! _smoke_path_under_allowed_tmp_prefix "$value"; then
+      unset "$var"
+    fi
+  done
+}
+
+_smoke_export_default_controller_paths() {
+  export BRIDGE_LAYOUT="v2"
+
+  BRIDGE_DATA_ROOT="${BRIDGE_DATA_ROOT:-$BRIDGE_HOME/data}"
+  BRIDGE_STATE_DIR="${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}"
+  BRIDGE_LAYOUT_MARKER_DIR="${BRIDGE_LAYOUT_MARKER_DIR:-$BRIDGE_STATE_DIR}"
+  BRIDGE_LOG_DIR="${BRIDGE_LOG_DIR:-$BRIDGE_HOME/logs}"
+  BRIDGE_SHARED_DIR="${BRIDGE_SHARED_DIR:-$BRIDGE_HOME/shared}"
+  BRIDGE_ROSTER_FILE="${BRIDGE_ROSTER_FILE:-$BRIDGE_HOME/agent-roster.sh}"
+  BRIDGE_ROSTER_LOCAL_FILE="${BRIDGE_ROSTER_LOCAL_FILE:-$BRIDGE_HOME/agent-roster.local.sh}"
+  BRIDGE_ACTIVE_AGENT_DIR="${BRIDGE_ACTIVE_AGENT_DIR:-$BRIDGE_STATE_DIR/agents}"
+  BRIDGE_HISTORY_DIR="${BRIDGE_HISTORY_DIR:-$BRIDGE_STATE_DIR/history}"
+  BRIDGE_WORKTREE_META_DIR="${BRIDGE_WORKTREE_META_DIR:-$BRIDGE_STATE_DIR/worktrees}"
+  BRIDGE_ACTIVE_ROSTER_TSV="${BRIDGE_ACTIVE_ROSTER_TSV:-$BRIDGE_STATE_DIR/active-roster.tsv}"
+  BRIDGE_ACTIVE_ROSTER_MD="${BRIDGE_ACTIVE_ROSTER_MD:-$BRIDGE_STATE_DIR/active-roster.md}"
+  BRIDGE_AGENTS_AGGREGATE_TSV="${BRIDGE_AGENTS_AGGREGATE_TSV:-$BRIDGE_STATE_DIR/agents-aggregate.tsv}"
+  BRIDGE_DAEMON_PID_FILE="${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}"
+  BRIDGE_DAEMON_LOG="${BRIDGE_DAEMON_LOG:-$BRIDGE_STATE_DIR/daemon.log}"
+  BRIDGE_DAEMON_CRASH_LOG="${BRIDGE_DAEMON_CRASH_LOG:-$BRIDGE_STATE_DIR/daemon-crash.log}"
+  BRIDGE_TASK_DB="${BRIDGE_TASK_DB:-$BRIDGE_STATE_DIR/tasks.db}"
+  BRIDGE_PROFILE_STATE_DIR="${BRIDGE_PROFILE_STATE_DIR:-$BRIDGE_STATE_DIR/profiles}"
+  BRIDGE_CRON_STATE_DIR="${BRIDGE_CRON_STATE_DIR:-$BRIDGE_STATE_DIR/cron}"
+  BRIDGE_CRON_HOME_DIR="${BRIDGE_CRON_HOME_DIR:-$BRIDGE_HOME/cron}"
+  BRIDGE_NATIVE_CRON_JOBS_FILE="${BRIDGE_NATIVE_CRON_JOBS_FILE:-$BRIDGE_CRON_HOME_DIR/jobs.json}"
+  BRIDGE_CRON_DISPATCH_WORKER_DIR="${BRIDGE_CRON_DISPATCH_WORKER_DIR:-$BRIDGE_CRON_STATE_DIR/workers}"
+  BRIDGE_CRON_STAGING_DIR="${BRIDGE_CRON_STAGING_DIR:-$BRIDGE_STATE_DIR/cron-staging}"
+  BRIDGE_WORKTREE_ROOT="${BRIDGE_WORKTREE_ROOT:-$BRIDGE_HOME/worktrees}"
+  BRIDGE_AGENT_HOME_ROOT="${BRIDGE_AGENT_HOME_ROOT:-$BRIDGE_HOME/agents}"
+  BRIDGE_RUNTIME_ROOT="${BRIDGE_RUNTIME_ROOT:-$BRIDGE_HOME/runtime}"
+  BRIDGE_RUNTIME_SCRIPTS_DIR="${BRIDGE_RUNTIME_SCRIPTS_DIR:-$BRIDGE_RUNTIME_ROOT/scripts}"
+  BRIDGE_RUNTIME_SKILLS_DIR="${BRIDGE_RUNTIME_SKILLS_DIR:-$BRIDGE_RUNTIME_ROOT/skills}"
+  BRIDGE_RUNTIME_SHARED_DIR="${BRIDGE_RUNTIME_SHARED_DIR:-$BRIDGE_RUNTIME_ROOT/shared}"
+  BRIDGE_RUNTIME_SHARED_TOOLS_DIR="${BRIDGE_RUNTIME_SHARED_TOOLS_DIR:-$BRIDGE_RUNTIME_SHARED_DIR/tools}"
+  BRIDGE_RUNTIME_SHARED_REFERENCES_DIR="${BRIDGE_RUNTIME_SHARED_REFERENCES_DIR:-$BRIDGE_RUNTIME_SHARED_DIR/references}"
+  BRIDGE_RUNTIME_MEMORY_DIR="${BRIDGE_RUNTIME_MEMORY_DIR:-$BRIDGE_RUNTIME_ROOT/memory}"
+  BRIDGE_RUNTIME_CREDENTIALS_DIR="${BRIDGE_RUNTIME_CREDENTIALS_DIR:-$BRIDGE_RUNTIME_ROOT/credentials}"
+  BRIDGE_RUNTIME_SECRETS_DIR="${BRIDGE_RUNTIME_SECRETS_DIR:-$BRIDGE_RUNTIME_ROOT/secrets}"
+  BRIDGE_RUNTIME_CONFIG_FILE="${BRIDGE_RUNTIME_CONFIG_FILE:-$BRIDGE_RUNTIME_ROOT/bridge-config.json}"
+  BRIDGE_HOOKS_DIR="${BRIDGE_HOOKS_DIR:-$BRIDGE_HOME/hooks}"
+  BRIDGE_TASK_NOTE_DIR="${BRIDGE_TASK_NOTE_DIR:-$BRIDGE_STATE_DIR/queue/notes}"
+  # Leave BRIDGE_AGENT_ROOT_V2/BRIDGE_SHARED_ROOT/BRIDGE_CONTROLLER_STATE_ROOT
+  # unset after sanitization; bridge-lib.sh derives them from BRIDGE_DATA_ROOT,
+  # and exporting them here changes the smoke launch fixture contract.
+  BRIDGE_AUDIT_LOG="${BRIDGE_AUDIT_LOG:-$BRIDGE_LOG_DIR/audit.jsonl}"
+  BRIDGE_DASHBOARD_STATE_FILE="${BRIDGE_DASHBOARD_STATE_FILE:-$BRIDGE_STATE_DIR/dashboard.json}"
+  BRIDGE_DISCORD_RELAY_STATE_FILE="${BRIDGE_DISCORD_RELAY_STATE_FILE:-$BRIDGE_STATE_DIR/discord-relay.json}"
+  BRIDGE_SOURCE_CRON_JOBS_FILE="${BRIDGE_SOURCE_CRON_JOBS_FILE:-$BRIDGE_CRON_HOME_DIR/legacy-jobs.json}"
+  BRIDGE_OPENCLAW_CRON_JOBS_FILE="${BRIDGE_OPENCLAW_CRON_JOBS_FILE:-$BRIDGE_SOURCE_CRON_JOBS_FILE}"
+  BRIDGE_CLAUDE_CHANNELS_HOME="${BRIDGE_CLAUDE_CHANNELS_HOME:-$BRIDGE_HOME/.claude}"
+  BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT="${BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT:-$BRIDGE_HOME/plugins/cache}"
+  BRIDGE_CLAUDE_INSTALLED_PLUGINS_FILE="${BRIDGE_CLAUDE_INSTALLED_PLUGINS_FILE:-$BRIDGE_HOME/plugins/installed.json}"
+
+  export BRIDGE_DATA_ROOT BRIDGE_STATE_DIR BRIDGE_LAYOUT_MARKER_DIR
+  export BRIDGE_LOG_DIR BRIDGE_SHARED_DIR
+  export BRIDGE_ROSTER_FILE BRIDGE_ROSTER_LOCAL_FILE
+  export BRIDGE_ACTIVE_AGENT_DIR BRIDGE_HISTORY_DIR BRIDGE_WORKTREE_META_DIR
+  export BRIDGE_ACTIVE_ROSTER_TSV BRIDGE_ACTIVE_ROSTER_MD BRIDGE_AGENTS_AGGREGATE_TSV
+  export BRIDGE_DAEMON_PID_FILE BRIDGE_DAEMON_LOG BRIDGE_DAEMON_CRASH_LOG
+  export BRIDGE_TASK_DB BRIDGE_PROFILE_STATE_DIR
+  export BRIDGE_CRON_STATE_DIR BRIDGE_CRON_HOME_DIR BRIDGE_NATIVE_CRON_JOBS_FILE
+  export BRIDGE_CRON_DISPATCH_WORKER_DIR BRIDGE_CRON_STAGING_DIR
+  export BRIDGE_WORKTREE_ROOT BRIDGE_AGENT_HOME_ROOT
+  export BRIDGE_RUNTIME_ROOT BRIDGE_RUNTIME_SCRIPTS_DIR BRIDGE_RUNTIME_SKILLS_DIR
+  export BRIDGE_RUNTIME_SHARED_DIR BRIDGE_RUNTIME_SHARED_TOOLS_DIR BRIDGE_RUNTIME_SHARED_REFERENCES_DIR
+  export BRIDGE_RUNTIME_MEMORY_DIR BRIDGE_RUNTIME_CREDENTIALS_DIR BRIDGE_RUNTIME_SECRETS_DIR
+  export BRIDGE_RUNTIME_CONFIG_FILE BRIDGE_HOOKS_DIR BRIDGE_TASK_NOTE_DIR
+  export BRIDGE_AUDIT_LOG BRIDGE_DASHBOARD_STATE_FILE BRIDGE_DISCORD_RELAY_STATE_FILE
+  export BRIDGE_SOURCE_CRON_JOBS_FILE BRIDGE_OPENCLAW_CRON_JOBS_FILE
+  export BRIDGE_CLAUDE_CHANNELS_HOME BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT
+  export BRIDGE_CLAUDE_INSTALLED_PLUGINS_FILE
+}
+
+_smoke_assert_controller_paths_temp() {
+  local context="$1" var="" value=""
+  for var in "${_SMOKE_CONTROLLER_PATH_VARS[@]}"; do
+    value="${!var:-}"
+    [[ -n "$value" ]] || continue
+    if ! _smoke_path_under_allowed_tmp_prefix "$value"; then
+      printf '[smoke][error] %s: %s escaped temp isolation: %s\n' \
+        "$context" "$var" "$value" >&2
+      exit 1
+    fi
+  done
+}
+
 # Safety: refuse to run against a live BRIDGE_HOME. smoke deliberately stops
 # its own daemon on cleanup, adopts/kills tmux sessions, and wipes state under
 # $TMP_ROOT. If BRIDGE_HOME is inherited from the parent shell and points at a
@@ -46,20 +215,18 @@ if [[ -z "${BRIDGE_HOME:-}" ]]; then
   # behavior of v0.14.1 fresh installs. Only applied for the auto-
   # isolated path — when the caller exports BRIDGE_HOME (CI runner,
   # custom rig) they remain responsible for layout state.
-  # r4 (codex PR #947 r3) — unset derived v2 roots that bridge-isolation-v2.sh
-  # preserves via the ${VAR:-default} idiom. Without unsetting, an operator
-  # shell that already exported these (e.g. an Agent Bridge-managed admin
-  # session running smoke against this checkout) would let later helpers
-  # write runtime/shared/state under the LIVE install despite the auto-
-  # isolated BRIDGE_HOME. Unsetting forces bridge-isolation-v2.sh to
-  # recompute from the freshly set BRIDGE_DATA_ROOT.
-  unset BRIDGE_AGENT_ROOT_V2 BRIDGE_SHARED_ROOT BRIDGE_CONTROLLER_STATE_ROOT
-  export BRIDGE_LAYOUT="v2"
-  export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
+  # r6 (#10213) — auto-isolation must clear every smoke-owned controller
+  # path, not only the v2 roots. The early script-dir harness below sources a
+  # temp bridge-lib.sh before TMP_ROOT exists; inherited BRIDGE_STATE_DIR /
+  # BRIDGE_DAEMON_LOG would otherwise write [L1] audits into the live install.
+  _smoke_unset_controller_path_vars
+  _smoke_export_default_controller_paths
+  BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT="$BRIDGE_HOME/iso-users"
+  export BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT
 fi
 if [[ -n "${BRIDGE_HOME:-}" ]]; then
   _smoke_allowed_tmp_prefix=""
-  for _smoke_tmp_candidate in "${TMPDIR:-}" "/tmp" "/private/tmp" "/var/folders"; do
+  for _smoke_tmp_candidate in "${TMPDIR:-}" "/tmp" "/private/tmp" "/var/folders" "/private/var/folders"; do
     _smoke_tmp_candidate="${_smoke_tmp_candidate%/}"
     [[ -n "$_smoke_tmp_candidate" ]] || continue
     case "$BRIDGE_HOME" in
@@ -76,6 +243,9 @@ if [[ -n "${BRIDGE_HOME:-}" ]]; then
     exit 1
   fi
   unset _smoke_allowed_tmp_prefix _smoke_tmp_candidate
+  _smoke_sanitize_controller_path_vars
+  _smoke_export_default_controller_paths
+  _smoke_assert_controller_paths_temp "startup controller path guard"
 fi
 
 # Issue #403: the BRIDGE_HOME guard above isn't enough — isolation tests
@@ -1598,18 +1768,17 @@ SPOOL_UT
 
 TMP_ROOT="$(cd "$(mktemp -d)" && pwd -P)"
 export BRIDGE_HOME="$TMP_ROOT/bridge-home"
-# #946 r2 — refresh BRIDGE_DATA_ROOT when BRIDGE_HOME is reassigned mid-script.
-# Without this re-export, the auto-isolation block's BRIDGE_DATA_ROOT (line 44)
-# still pointed at the obsolete `agb-smoke-isolated.../data` tree, so v2 paths
-# such as BRIDGE_AGENT_ROOT_V2 derived under bridge-lib.sh would escape
-# $TMP_ROOT and cleanup would miss the state files. Only refresh when the
-# auto-isolation path armed v2 in the first place — preserves the contract
-# that operator-supplied BRIDGE_HOME (CI runner / custom rig) keeps full
-# control of layout state.
+# #946 r2 / #10213 — refresh derived controller paths when BRIDGE_HOME is
+# reassigned mid-script. Without this, the auto-isolation block's early temp
+# BRIDGE_DATA_ROOT/BRIDGE_DAEMON_LOG/BRIDGE_STATE_DIR would survive after
+# BRIDGE_HOME moves to TMP_ROOT, so later sourced helpers could write outside
+# the main smoke tree. Only refresh under the auto-isolation contract —
+# operator-supplied temp BRIDGE_HOME keeps control after the startup sanitizer
+# has rejected/sanitized any non-temp inherited path.
 if [[ "${_SMOKE_AUTO_ISOLATED:-0}" == "1" ]]; then
-  # r4 (PR #947 r3) — same derived-root reset as the auto-isolation block.
-  unset BRIDGE_AGENT_ROOT_V2 BRIDGE_SHARED_ROOT BRIDGE_CONTROLLER_STATE_ROOT
-  export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
+  _smoke_unset_controller_path_vars
+  _smoke_export_default_controller_paths
+  _smoke_assert_controller_paths_temp "TMP_ROOT controller path guard"
 fi
 export BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1
 # Issue #403 fix #4: pin the isolated-user home root under TMP_ROOT so any
