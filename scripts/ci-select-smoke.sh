@@ -122,6 +122,11 @@ add_required 1568-routine-nudge-inject-busy-gate
 # per-file selectors below (hooks/bridge_hook_common.py, hooks/check_inbox.py,
 # bridge-queue.py, bridge-hooks.py) also pull it directly.
 add_required 9780-stop-inbox-drain
+# Issue #1596: the Stop drain excludes daemon-owned `[cron-dispatch]` rows from
+# the actionable predicate (with the `[cron-followup]` carve-out) so the daemon
+# cron tasks it owns/closes no longer wake the model. In the static suite and
+# pulled per-file below on hooks/* / bridge-queue.py / bridge-hooks.py moves.
+add_required 1596-stop-drain-cron-dispatch
 # #10222: A2A receiver backpressure must count currently OPEN tasks
 # (queued/claimed/blocked) by joining inbox_dedupe to tasks.db, not all-time
 # accepted rows. Keep this in the static suite and pull it on receiver changes.
@@ -935,6 +940,13 @@ select_for_path() {
       # silently regress the fail-count-free stamp or drop updated_ts (which
       # would weaken the id+status+updated_ts guard key → re-loop risk).
       add_required 9780-stop-inbox-drain
+      # Issue #1596: the Stop drain filters daemon-owned `[cron-dispatch]` rows
+      # out of the actionable predicate via find-open --all (title + created_by
+      # columns) and re-confirms the chosen row open. Pull
+      # 1596-stop-drain-cron-dispatch on every bridge-queue.py move so a change
+      # to the find-open `--all` payload (title / created_by / status / id) or
+      # the cron-dispatch SQL exclusions cannot silently break the filter.
+      add_required 1596-stop-drain-cron-dispatch
       add_integration integration-minimal
       ;;
 
@@ -2781,6 +2793,18 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # block, never-block-when-empty), the #1199 queued-vs-claimed split, or the
       # Stop-chain ordering.
       add_required 9780-stop-inbox-drain
+      # Issue #1596: hooks/bridge_hook_common.py::drain_top_actionable now filters
+      # daemon-owned `[cron-dispatch]` / `created_by=cron:` rows (with the
+      # `[cron-followup]` carve-out) out of BOTH the queued and claimed paths via
+      # _is_daemon_owned_cron_dispatch + the find-open --all iterate/filter, and
+      # re-confirms the SELECTED row still open (_row_still_open) before the
+      # block — so a daemon cron-dispatch row no longer wakes the model
+      # (check-inbox.py codex + inbox-auto-drain.py claude inherit the one shared
+      # predicate). Pull 1596-stop-drain-cron-dispatch on every hooks/* /
+      # bridge-hooks.py move so a future patch cannot re-broaden the predicate to
+      # block on daemon-owned work, drop the followup carve-out, single-shot the
+      # head (a real task behind a cron row), or skip the late fail-open re-check.
+      add_required 1596-stop-drain-cron-dispatch
       add_required 1497-p1-home-resolver
       add_required 1497-v2-dynamic-handoff
       # Issue #9981 (read side): hooks/bridge_hook_common.py is the CONSUMER of

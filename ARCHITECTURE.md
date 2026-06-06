@@ -327,6 +327,30 @@ kept DISTINCT so the #1199 "queued-only ACTION REQUIRED, claimed still
 blocks stop" contract is preserved. Smoke:
 `scripts/smoke/9780-stop-inbox-drain.sh`.
 
+The drain predicate is **actionable agent work, not merely any open
+queued/claimed row** (#1596). `drain_top_actionable` excludes daemon-owned
+`[cron-dispatch]` rows — the bridge daemon owns and closes those itself
+(`bridge-cron.sh` enqueue: `title="[cron-dispatch] …"`, `created_by="cron:…"`),
+so re-entering the model only burns a turn confirming there is nothing to do.
+`_is_daemon_owned_cron_dispatch(row)` uses the **title as the SSOT**: a titled
+row is daemon-owned ONLY when its title starts with `[cron-dispatch]`. The
+`created_by` starting with `cron:` is **not** a reliable signal on its own — the
+daemon's own real `[cron-followup]` follow-ups AND real `[picker-sweep]`
+notification tasks (`scripts/picker-sweep.sh`, `--from "cron:picker-sweep"`) are
+both filed by a `cron:` actor yet must STILL block — so `created_by cron:` is a
+defensive fallback that fires only for an untitled/blank-title row (a shape no
+real cron-actor task ever takes). Both paths iterate the FULL queued/claimed
+list (`find-open --all`, which carries `title`+`created_by`) and pick the top
+REMAINING actionable row, so a real task sitting BEHIND a cron-dispatch row
+still wins (not a single-shot null of the head). The SELECTED row is
+re-confirmed open as late as practical (`_row_still_open`) right before the
+block and FAILS OPEN if it vanished/closed in the race window. All queue read
+failures fail open — a nonzero-rc/empty-stdout read error maps to None (no
+block, no fall-through), distinct from an empty result which prints `[]`. Both
+engines inherit this one shared predicate; they differ only in the no-block
+OUTPUT (Codex emits `{}`, Claude emits nothing). Smoke:
+`scripts/smoke/1596-stop-drain-cron-dispatch.sh`.
+
 ### Hook config SSOT (#1068)
 
 `bridge-hooks.py` is the single source of truth for the effective
