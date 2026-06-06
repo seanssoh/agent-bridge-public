@@ -101,6 +101,20 @@ DEFAULT_TIMESTAMP_SKEW_GRACE_SECONDS = 3600
 DEFAULT_OUTBOX_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 DEFAULT_OUTBOX_MAX_PENDING_PER_PEER = 500
 
+# #1575 Part B: the exponential-backoff ceiling for outbox retries. The
+# historical 3600s ceiling meant an attempt-8..10 retry row waited 16-60 min,
+# so after a transient tailnet break each message kept idling out its long
+# backoff even once the peer recovered (the 2026-06-06 incident needed a
+# manual `agb a2a outbox retry`). 120s bounds worst-case recovery to ~1-2 min
+# even before #1582's probe-gated reset fires. Configurable via the top-level
+# `delivery_backoff_ceiling_seconds` config key (env override
+# `BRIDGE_A2A_BACKOFF_CEILING_SECONDS`); base 15 + jitter are unchanged.
+DEFAULT_DELIVERY_BACKOFF_CEILING_SECONDS = 120
+# Floor for the configured ceiling: it must stay >= the base step so the
+# curve is monotonic and a fat-fingered 0/negative value cannot pin every
+# retry to ~1s and hammer a dead peer.
+MIN_DELIVERY_BACKOFF_CEILING_SECONDS = 15
+
 VALID_PRIORITIES = ("low", "normal", "high", "urgent")
 TERMINAL_OUTBOX_STATUSES = ("acked", "dead")
 PENDING_OUTBOX_STATUSES = ("pending", "sending", "retry")
@@ -1358,7 +1372,32 @@ def outbox_insert(
     conn.commit()
 
 
-def backoff_seconds(attempts: int, base: int = 15, ceiling: int = 3600) -> int:
+def backoff_seconds(attempts: int, base: int = 15,
+                    ceiling: int = DEFAULT_DELIVERY_BACKOFF_CEILING_SECONDS) -> int:
     """Exponential backoff with a ceiling; jitter is added by the caller."""
     delay = base * (2 ** max(0, attempts - 1))
     return min(delay, ceiling)
+
+
+def delivery_backoff_ceiling(cfg: dict[str, Any]) -> int:
+    """Resolve the outbox-retry backoff ceiling in seconds (#1575 Part B).
+
+    Precedence: `BRIDGE_A2A_BACKOFF_CEILING_SECONDS` env override >
+    top-level `delivery_backoff_ceiling_seconds` config key >
+    `DEFAULT_DELIVERY_BACKOFF_CEILING_SECONDS` (120). Mirrors the data-only
+    `cfg.get(...)` pattern used by the other delivery knobs
+    (`delivery_max_attempts`, `outbox_max_*`); the env override follows the
+    existing `BRIDGE_A2A_*` convention so an operator can shrink the ceiling
+    on a flaky link without editing the 0600 config. A non-numeric or
+    sub-floor value falls back to the floor rather than raising — this runs
+    inside the daemon deliver loop and must never wedge it.
+    """
+    raw: Any = os.environ.get("BRIDGE_A2A_BACKOFF_CEILING_SECONDS")
+    if raw is None or str(raw).strip() == "":
+        raw = cfg.get("delivery_backoff_ceiling_seconds",
+                      DEFAULT_DELIVERY_BACKOFF_CEILING_SECONDS)
+    try:
+        ceiling = int(raw)
+    except (TypeError, ValueError):
+        ceiling = DEFAULT_DELIVERY_BACKOFF_CEILING_SECONDS
+    return max(MIN_DELIVERY_BACKOFF_CEILING_SECONDS, ceiling)
