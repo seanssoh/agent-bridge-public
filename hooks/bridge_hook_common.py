@@ -1635,27 +1635,229 @@ def _drain_task_key(row: dict[str, Any]) -> str:
     return f"{task_id}:{status}"
 
 
-def drain_top_actionable(agent: str) -> dict[str, Any] | None:
-    """Return the top actionable queue row for the Stop drain, or None.
+# Issue #1596 — daemon-owned cron-dispatch literals. The AUTHORITATIVE signal is
+# the title: the bridge daemon writes EXACTLY `title="[cron-dispatch] <job> (<slot>)"`
+# at the only enqueue site (bridge-cron.sh:655), and it owns and closes those
+# rows itself. `created_by = "cron:<job>"` (bridge-cron.sh:654 + :837 `--from`)
+# is NOT a reliable daemon-owned signal on its own — multiple REAL, agent-actionable
+# tasks are also filed by a `cron:`-prefixed actor:
+#   * `[cron-followup]` — the daemon's own human-facing follow-up
+#     (bridge-cron-runner.py cron_followup_title, actor `cron:<source-agent>`).
+#   * `[picker-sweep]`  — a real "agents auto-unstuck" notification task
+#     (scripts/picker-sweep.sh: `--from "cron:picker-sweep"`, title
+#     `[picker-sweep] …`). NOT daemon-closed.
+# Both carry a NON-`[cron-dispatch]` title. So we judge a TITLED row purely by its
+# title (only `[cron-dispatch]` is daemon-owned); the `created_by cron:` rule is a
+# defensive FALLBACK that fires ONLY for an untitled/blank-title row — a shape no
+# real cron-actor task ever takes — so it can never swallow `[picker-sweep]`,
+# `[cron-followup]`, or any other titled cron-actor work.
+_CRON_DISPATCH_TITLE_PREFIX = "[cron-dispatch]"
+_CRON_CREATED_BY_PREFIX = "cron:"
 
-    Two DISTINCT paths, queued first (preserves the #1199 contract):
-      1. genuinely-queued work → the queued head (ACTION REQUIRED drain).
+
+def _is_daemon_owned_cron_dispatch(row: dict[str, Any]) -> bool:
+    """True when ``row`` is a daemon-owned cron-dispatch the daemon closes itself.
+
+    Issue #1596: the bridge daemon owns and closes `[cron-dispatch]` rows; when
+    human follow-up is needed it files a SEPARATE `[cron-followup]` task. So
+    re-entering the model for a `[cron-dispatch]` row only spends tokens
+    confirming the inbox is empty/done (observed: `#10352 [cron-dispatch]
+    picker-sweep`). The Stop-drain predicate therefore excludes them.
+
+    Daemon-owned when (case-sensitive, matching the canonical daemon-written
+    forms — verified against the cron-dispatch creation site, NOT guessed):
+      - ``title`` (stripped) starts with ``[cron-dispatch]``  (the authoritative
+        daemon-owned-and-self-closed marker), OR
+      - the row has NO title (missing/blank) AND ``created_by`` (stripped) starts
+        with ``cron:`` — a defensive fallback for an untitled cron row.
+
+    A TITLED row that is NOT `[cron-dispatch]` is ALWAYS actionable, even when its
+    ``created_by`` starts with `cron:` — that covers the daemon's own real
+    `[cron-followup]` follow-ups AND real `[picker-sweep]` notification tasks
+    (scripts/picker-sweep.sh), neither of which is daemon-closed. The title is the
+    SSOT; created_by alone over-reaches.
+
+    Defensive: a missing / None / non-str title or created_by is handled above;
+    we fail toward "real task" so a malformed row can never silently swallow
+    genuine queued/claimed work.
+    """
+    title = row.get("title")
+    title = title.strip() if isinstance(title, str) else ""
+    if title:
+        # Titled row → judged purely by the title. ONLY `[cron-dispatch]` is
+        # daemon-owned; every other title (incl. `[cron-followup]`,
+        # `[picker-sweep]`, real user/dev work) stays actionable.
+        return title.startswith(_CRON_DISPATCH_TITLE_PREFIX)
+    # Untitled row → defensive fallback on the actor only. No real cron-actor
+    # task is untitled, so this never swallows genuine work.
+    created_by = row.get("created_by")
+    created_by = created_by.strip() if isinstance(created_by, str) else ""
+    return created_by.startswith(_CRON_CREATED_BY_PREFIX)
+
+
+def _open_rows_for(
+    agent: str, statuses: list[str] | None = None
+) -> list[dict[str, Any]] | None:
+    """Return the open task list for ``agent`` as filterable rows.
+
+    Issue #1596: ``drain_top_actionable`` must filter the queued/claimed list
+    and pick the top REMAINING actionable row — not single-shot the head — so a
+    real task sitting BEHIND a daemon-owned cron-dispatch row still wins. We
+    fetch the full status set via ``find-open --all`` (which carries ``title``
+    + ``created_by`` + ``updated_ts`` on every row) instead of the LIMIT-1
+    single-row helpers.
+
+    ``statuses`` is a list of status names emitted as REPEATED ``--status-filter``
+    flags (the CLI uses ``action="append"`` — it does NOT accept a comma list).
+    ``None`` omits the filter entirely, which the CLI defaults to the legacy open
+    set (queued|claimed|blocked).
+
+    Returns the list of dict rows (possibly empty) on success, or ``None`` on
+    any read/parse error. ``None`` is the fail-open signal — the caller treats
+    it as "queue read failed, do not block" rather than "no work". This never
+    raises into the Stop path.
+    """
+    cmd = ["find-open", "--agent", agent, "--all", "--format", "json"]
+    for status in statuses or []:
+        cmd += ["--status-filter", status]
+    try:
+        proc = queue_cli(cmd)
+    except OSError:
+        return None
+    # CRITICAL fail-open distinction. `find-open --all` uses exit code 1 ONLY as
+    # the "genuinely EMPTY" sentinel (it prints the literal `[]`); exit 0 is a
+    # normal populated read. ANY OTHER nonzero exit is a real read FAILURE
+    # (SQLite/open error) and MUST fail open — return None — EVEN WHEN stdout
+    # carries parseable JSON: a partial/garbled failed read can still emit a
+    # valid-looking row, and treating it as actionable would let a FAILED queue
+    # read emit a Stop block (#1596 patch-dev re-review — a nonzero rc with a
+    # parseable row in stdout was wrongly blocking; checking only empty-stdout
+    # missed it). Empty/whitespace stdout is likewise a failed read → None.
+    # None is the fail-open signal (do not block, do not fall through); `[]` is
+    # genuinely-empty (lets the queued path fall through to the claimed
+    # anti-abandonment path) and is produced ONLY by the rc==1 literal-`[]`
+    # sentinel (or an rc==0 empty list).
+    stdout = proc.stdout.strip()
+    if proc.returncode not in (0, 1):
+        return None
+    if not stdout:
+        return None
+    if proc.returncode == 1 and stdout != "[]":
+        # rc==1 is the empty-sentinel ONLY with the literal `[]`; rc==1 carrying
+        # any other body is anomalous (not the documented empty contract) → fail
+        # open rather than trust a partial/odd read.
+        return None
+    try:
+        rows = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(rows, list):
+        return None
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _top_actionable_in_status(agent: str, status: str) -> dict[str, Any] | None:
+    """Top actionable (non-daemon-owned) row in the open ``status`` set, or None.
+
+    Issue #1596: iterate + filter. The ``find-open --all`` list is already
+    ordered by the queue's priority CASE then id (deterministic). We drop
+    daemon-owned cron-dispatch rows and return the first REMAINING row, keeping
+    the queue's existing order stable (no re-sort). Returns None when the status
+    set is empty, every row is daemon-owned, OR the read failed — all of which
+    are "no actionable ``status`` work here" for this path.
+    """
+    rows = _open_rows_for(agent, [status])
+    if not rows:
+        return None
+    for row in rows:
+        if not _is_daemon_owned_cron_dispatch(row):
+            return row
+    return None
+
+
+def _row_still_open(agent: str, task_id: int) -> bool:
+    """Late re-confirm the SELECTED row is still open right before the block.
+
+    Issue #1596 asks the Stop drain to re-check queue state as late as practical
+    and fail OPEN / silent if the chosen row vanished or became done in the race
+    window. This re-reads the open set by id and returns True only when the row
+    is still open (queued/claimed/blocked) and assigned to ``agent``.
+
+    Fail-OPEN contract: any error (subprocess failure, JSON parse error, missing
+    row, status flipped terminal) returns False so the caller emits NO block.
+    This MUST never raise — `check-inbox.py` main has no outer try/except, so a
+    raise here would surface a traceback in the Codex Stop path. Every failure
+    mode is swallowed to False; True only on a positive, fresh confirmation.
+    """
+    if task_id <= 0:
+        return False
+    # Omit --status-filter → the CLI's default open set (queued|claimed|blocked).
+    rows = _open_rows_for(agent, None)
+    if not rows:
+        # None (read error) or [] (row gone) → fail open: do not block.
+        return False
+    for row in rows:
+        try:
+            if int(row.get("id", 0) or 0) == task_id:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def drain_top_actionable(agent: str) -> dict[str, Any] | None:
+    """Return the top **actionable agent work** row for the Stop drain, or None.
+
+    "Actionable agent work" — NOT merely any open queued/claimed row. Two
+    DISTINCT paths, queued first (preserves the #1199 contract):
+      1. genuinely-queued work → the top queued row (ACTION REQUIRED drain).
       2. else self-claimed-but-incomplete work → the top claimed row
          (anti-abandonment; this is NOT an ACTION REQUIRED re-claim nudge).
     A blocked-only queue is not actionable → None (idle quietly).
+
+    Issue #1596 exclusion: daemon-owned `[cron-dispatch]` rows (and
+    `created_by = cron:…` rows) are filtered OUT of BOTH paths — the daemon owns
+    and closes them, so re-entering the model only wastes a turn. A
+    `[cron-followup]` task is REAL follow-up and STILL blocks (carve-out, see
+    ``_is_daemon_owned_cron_dispatch``). We iterate the full queued/claimed list
+    and pick the top REMAINING actionable row so a real task sitting BEHIND a
+    cron-dispatch row still wins — not a single-shot null of the head.
+
+    Finally the SELECTED row is re-confirmed open as late as practical
+    (``_row_still_open``); if it vanished/closed in the race window we fail
+    OPEN (None, no block). All queue read/write failures fail OPEN.
     """
-    pending, row = queue_summary(agent)
-    if pending > 0:
-        # Queued work exists → queued-first wins. If the top-row read itself
-        # failed (pending>0 but row is None — a transient find-open hiccup), do
-        # NOT fall through to the claimed anti-abandonment path: that would
-        # silently switch a queued drain into a claimed block on a partial
-        # queue error. Return the queued row when we have it, else None (idle /
-        # fail open) so the queued-first contract holds.
-        return row
-    if open_claimed_count(agent) > 0:
-        return top_claimed_row(agent)
-    return None
+    # Queued-first. Fetch the FULL queued list and pick the top remaining
+    # non-daemon row. ``_open_rows_for`` returns None on a read error and [] on
+    # an empty set — we distinguish them so a transient queued read error does
+    # NOT silently flip into a claimed block (preserves the existing
+    # "pending>0 but row None → None" fail-open spirit).
+    queued_rows = _open_rows_for(agent, ["queued"])
+    if queued_rows is None:
+        # Queued read errored → fail open, do NOT fall through to claimed.
+        return None
+    if queued_rows:
+        for row in queued_rows:
+            if not _is_daemon_owned_cron_dispatch(row):
+                selected = row
+                break
+        else:
+            # Queued rows existed but ALL were daemon-owned. There is genuinely
+            # no actionable queued work; fall through to the claimed path.
+            selected = None
+        if selected is not None:
+            if not _row_still_open(agent, int(selected.get("id", 0) or 0)):
+                return None
+            return selected
+
+    # No actionable queued work → claimed anti-abandonment path. Same iterate +
+    # filter; a claimed set that is entirely daemon-owned → None (idle quietly).
+    claimed_selected = _top_actionable_in_status(agent, "claimed")
+    if claimed_selected is None:
+        return None
+    if not _row_still_open(agent, int(claimed_selected.get("id", 0) or 0)):
+        return None
+    return claimed_selected
 
 
 def queued_ids_for(agent: str) -> list[int]:
@@ -1683,6 +1885,12 @@ def queued_ids_for(agent: str) -> list[int]:
     ids: list[int] = []
     for r in rows:
         if isinstance(r, dict):
+            # Issue #1596: scope the stamp to the ACTIONABLE queued set — exclude
+            # daemon-owned cron-dispatch rows so the daemon double-submit
+            # suppression key matches exactly the set the drain self-continued
+            # on (the drain never blocks on those rows).
+            if _is_daemon_owned_cron_dispatch(r):
+                continue
             try:
                 ids.append(int(r.get("id", 0) or 0))
             except (TypeError, ValueError):
@@ -1722,8 +1930,18 @@ def compute_drain_decision(
     None means "do not block" (idle quietly / fail open). A non-None return is
     ``{"decision": "block", "reason": <reason_builder(agent, row)>}`` and is
     emitted ONLY after the guard marker has been read/initialised AND atomically
-    persisted. ``reason_builder`` lets each engine supply its own instruction
-    text (Claude vs codex) over the same shared guard.
+    persisted.
+
+    The "actionable agent work" predicate is SINGLE and SHARED: both engines go
+    through ``drain_top_actionable`` here, which excludes daemon-owned
+    `[cron-dispatch]` work (issue #1596) and re-confirms the chosen row is still
+    open. Engines differ ONLY in OUTPUT, never in the predicate:
+      - Codex (`check-inbox.py --format codex`) emits ``{}`` for the no-block
+        case (Codex's managed Stop hook requires a JSON decision object).
+      - Claude (`inbox-auto-drain.py`) emits NOTHING (exit 0) for no-block — a
+        Claude Stop hook stays silent unless it returns a decision.
+    ``reason_builder`` supplies the engine-specific instruction text (Claude vs
+    Codex) over the same shared guard + same shared actionable predicate.
     """
     if not agent or not stop_drain_enabled():
         return None

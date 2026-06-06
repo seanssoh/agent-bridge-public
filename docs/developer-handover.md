@@ -238,7 +238,19 @@ env 노브 표가 있다.
 **Stop/turn-end inbox auto-drain (#9780).** turn 종료 시 `hooks/inbox-auto-drain.py`
 (Stop hook)가 idle 대신 genuinely-claimable queued task를 하나 drain한다. id+status marker +
 atomic-persist-before-block의 fail-open 무한루프 가드가 있고, #1199 queued-vs-claimed 분리를
-보존한다 — 이 가드를 약화시키면 turn-end 루프가 생긴다.
+보존한다 — 이 가드를 약화시키면 turn-end 루프가 생긴다. predicate은 "actionable agent work"
+이지 "아무 open row"가 아니다(#1596): daemon이 직접 소유·종료하는 `[cron-dispatch]` row는
+`_is_daemon_owned_cron_dispatch`로 제외한다. **title이 SSOT다** — titled row는 title이
+`[cron-dispatch]`로 시작할 때만 daemon-owned다. `created_by=cron:`만으로는 daemon-owned가
+아니다: daemon의 실제 `[cron-followup]` 후속 작업과 실제 `[picker-sweep]` 알림 task
+(`scripts/picker-sweep.sh`, `--from "cron:picker-sweep"`)도 `cron:` actor지만 여전히
+block해야 하므로, `created_by cron:`는 title이 빈/없는 row에만 적용되는 방어적 fallback이다
+(실제 cron-actor task는 항상 title이 있어 절대 묻히지 않는다). queued/claimed 리스트를
+`find-open --all`로 전부 받아 daemon-owned를 걸러낸 뒤 남은 top row를 고르므로 cron row 뒤의
+실제 task가 묻히지 않고, 선택된 row는 block 직전에 다시 open인지 확인해 사라졌으면 fail-open
+한다. queue read 실패(nonzero rc + 빈 stdout)는 empty 결과(`[]` 출력)와 구분해 None으로
+fail-open한다. 두 엔진은 이 하나의 shared predicate를 공유하고 no-block 출력만 다르다(Codex
+`{}`, Claude 무출력). Smoke: `scripts/smoke/1596-stop-drain-cron-dispatch.sh`.
 
 ### 2. tmux I/O
 
