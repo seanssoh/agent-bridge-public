@@ -1599,7 +1599,31 @@ if [[ $CHECK_ONLY -eq 1 ]]; then
   RESTART_AGENTS=0
 fi
 
-ANALYSIS_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" analyze-live --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT")"
+# Issue #1602: ref-accurate dry-run preview. On --apply the requested ref was
+# checked out above (line ~1570, gated on DRY_RUN -eq 0), so the working tree
+# the analysis walks already IS the ref. On --dry-run that checkout is skipped
+# (dry-run must not mutate the tree), so the analysis would otherwise be
+# computed against whatever ref SOURCE_ROOT currently sits on while the header
+# truthfully shows the requested --ref — a silent disagreement. When dry-run
+# is paired with a requested --ref, thread it to analyze-live/apply-live as
+# --upstream-ref so the preview's upstream file set + bytes are read from the
+# ref's git tree (`git ls-tree` / `git show <ref>:path`) with NO checkout. The
+# apply path leaves UPSTREAM_REF_ARGS empty and reads the working tree,
+# unchanged.
+UPSTREAM_REF_ARGS=()
+if [[ $DRY_RUN -eq 1 && -n "$TARGET_REF" ]]; then
+  UPSTREAM_REF_ARGS=(--upstream-ref "$TARGET_REF")
+  # Belt-and-suspenders honesty (issue #1602, option 2): if the checked-out
+  # tree differs from the requested ref, say so AND confirm the preview is now
+  # computed against the requested ref (not the stale tree). Harmless when they
+  # already match (the common case where a prior upgrade left the tree on the
+  # last-applied tag and the operator re-previews the same ref).
+  if [[ -n "$TARGET_HEAD" && -n "$SOURCE_HEAD" && "$TARGET_HEAD" != "$SOURCE_HEAD" ]]; then
+    echo "[bridge-upgrade] note: source checkout is on ${SOURCE_HEAD:0:12} but --ref ${TARGET_REF} resolves to ${TARGET_HEAD:0:12}; --dry-run previews against the requested ref (read from git, no checkout). --apply would checkout ${TARGET_REF} first." >&2
+  fi
+fi
+
+ANALYSIS_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" analyze-live --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT" ${UPSTREAM_REF_ARGS[@]+"${UPSTREAM_REF_ARGS[@]}"})"
 # Footgun #11 (refs #890 / task #4532): both helpers below feed their inner
 # command stdin from a heredoc (`bash -s … <<'EOF'`, `python3 - … <<'PY'`).
 # Capturing them with a bare `$()` wedges Bash 5.3.9 in `read_comsub` during
@@ -1934,6 +1958,13 @@ if [[ -n "$BASE_REF" ]]; then
 fi
 if [[ $DRY_RUN -eq 1 ]]; then
   apply_args+=(--dry-run)
+  # Issue #1602: the dry-run apply-live preview must reflect the requested
+  # --ref too (it feeds the previewed merge/conflict bytes). UPSTREAM_REF_ARGS
+  # is populated above only when DRY_RUN=1 && TARGET_REF set; the apply path
+  # (DRY_RUN=0) never reaches this branch and reads the checked-out tree.
+  if [[ ${#UPSTREAM_REF_ARGS[@]} -gt 0 ]]; then
+    apply_args+=("${UPSTREAM_REF_ARGS[@]}")
+  fi
 fi
 if [[ $STRICT_MERGE -eq 1 ]]; then
   apply_args+=(--strict-merge)
