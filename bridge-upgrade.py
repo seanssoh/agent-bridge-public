@@ -455,6 +455,7 @@ class AgentMigrationResult:
     updated_files: list[str]
     session_type: str
     engine: str
+    rematerialize: dict[str, Any] | None = None
 
 
 def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, dry_run: bool) -> AgentMigrationResult:
@@ -556,15 +557,141 @@ def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, d
     )
 
 
+def bridge_upgrade_target_env(target_root: Path) -> dict[str, str]:
+    """Mirror bridge-upgrade.sh::bridge_upgrade_with_target_env for helpers."""
+    target = str(target_root)
+    return {
+        "HOME": os.environ.get("HOME", ""),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+        "USER": os.environ.get("USER", ""),
+        "SHELL": os.environ.get("SHELL", ""),
+        "TERM": os.environ.get("TERM", "dumb"),
+        "BRIDGE_HOME": target,
+        "BRIDGE_ROSTER_FILE": f"{target}/agent-roster.sh",
+        "BRIDGE_ROSTER_LOCAL_FILE": f"{target}/agent-roster.local.sh",
+        "BRIDGE_STATE_DIR": f"{target}/state",
+        "BRIDGE_ACTIVE_AGENT_DIR": f"{target}/state/agents",
+        "BRIDGE_HISTORY_DIR": f"{target}/state/history",
+        "BRIDGE_WORKTREE_META_DIR": f"{target}/state/worktrees",
+        "BRIDGE_ACTIVE_ROSTER_TSV": f"{target}/state/active-roster.tsv",
+        "BRIDGE_ACTIVE_ROSTER_MD": f"{target}/state/active-roster.md",
+        "BRIDGE_DAEMON_PID_FILE": f"{target}/state/daemon.pid",
+        "BRIDGE_DAEMON_LOG": f"{target}/state/daemon.log",
+        "BRIDGE_DAEMON_CRASH_LOG": f"{target}/state/daemon-crash.log",
+        "BRIDGE_TASK_DB": f"{target}/state/tasks.db",
+        "BRIDGE_PROFILE_STATE_DIR": f"{target}/state/profiles",
+        "BRIDGE_CRON_STATE_DIR": f"{target}/state/cron",
+        "BRIDGE_CRON_HOME_DIR": f"{target}/cron",
+        "BRIDGE_NATIVE_CRON_JOBS_FILE": f"{target}/cron/jobs.json",
+        "BRIDGE_CRON_DISPATCH_WORKER_DIR": f"{target}/state/cron/workers",
+        "BRIDGE_WORKTREE_ROOT": f"{target}/worktrees",
+        "BRIDGE_AGENT_HOME_ROOT": f"{target}/agents",
+        "BRIDGE_RUNTIME_ROOT": f"{target}/runtime",
+        "BRIDGE_RUNTIME_SCRIPTS_DIR": f"{target}/runtime/scripts",
+        "BRIDGE_RUNTIME_SKILLS_DIR": f"{target}/runtime/skills",
+        "BRIDGE_RUNTIME_SHARED_DIR": f"{target}/runtime/shared",
+        "BRIDGE_RUNTIME_SHARED_TOOLS_DIR": f"{target}/runtime/shared/tools",
+        "BRIDGE_RUNTIME_SHARED_REFERENCES_DIR": f"{target}/runtime/shared/references",
+        "BRIDGE_RUNTIME_MEMORY_DIR": f"{target}/runtime/memory",
+        "BRIDGE_RUNTIME_CREDENTIALS_DIR": f"{target}/runtime/credentials",
+        "BRIDGE_RUNTIME_SECRETS_DIR": f"{target}/runtime/secrets",
+        "BRIDGE_RUNTIME_CONFIG_FILE": f"{target}/runtime/bridge-config.json",
+        "BRIDGE_HOOKS_DIR": f"{target}/hooks",
+        "BRIDGE_LOG_DIR": f"{target}/logs",
+        "BRIDGE_AUDIT_LOG": f"{target}/logs/audit.jsonl",
+        "BRIDGE_SHARED_DIR": f"{target}/shared",
+        "BRIDGE_TASK_NOTE_DIR": f"{target}/shared/tasks",
+        "BRIDGE_DASHBOARD_STATE_FILE": f"{target}/state/dashboard.json",
+        "BRIDGE_DISCORD_RELAY_STATE_FILE": f"{target}/state/discord-relay.json",
+        "BRIDGE_LAYOUT_RESOLVER_BYPASS": os.environ.get("BRIDGE_LAYOUT_RESOLVER_BYPASS", ""),
+        "BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID": os.environ.get("BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID", ""),
+        "BRIDGE_UPGRADE_CONTEXT": os.environ.get("BRIDGE_UPGRADE_CONTEXT", ""),
+    }
+
+
+def rematerialize_error_result(agent: str, source_dir: str, target_dir: str, detail: str) -> dict[str, Any]:
+    return {
+        "agent": agent,
+        "status": "error",
+        "source_dir": source_dir,
+        "target_dir": target_dir,
+        "updated_paths": [],
+        "errors": [detail],
+    }
+
+
+def rematerialize_agent_identity(
+    source_root: Path,
+    target_root: Path,
+    result: AgentMigrationResult,
+    dry_run: bool,
+) -> dict[str, Any]:
+    helper = source_root / "lib" / "upgrade-helpers" / "rematerialize-agent-identity.sh"
+    if not helper.exists():
+        return rematerialize_error_result(
+            result.agent,
+            "",
+            "",
+            f"helper missing: {helper}",
+        )
+    changed_files = sorted(set(result.added_files + result.updated_files))
+    cmd = [
+        str(helper),
+        str(source_root),
+        str(target_root),
+        result.agent,
+        result.engine,
+        "1" if dry_run else "0",
+        *changed_files,
+    ]
+    proc = subprocess.run(
+        cmd,
+        env=bridge_upgrade_target_env(target_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    stdout = proc.stdout.strip()
+    if proc.returncode != 0:
+        return rematerialize_error_result(
+            result.agent,
+            "",
+            "",
+            f"helper exited {proc.returncode}: {proc.stderr.strip() or '<no stderr>'}",
+        )
+    if not stdout:
+        return rematerialize_error_result(result.agent, "", "", "helper emitted no JSON")
+    try:
+        payload = json.loads(stdout.splitlines()[-1])
+    except json.JSONDecodeError as exc:
+        return rematerialize_error_result(
+            result.agent,
+            "",
+            "",
+            f"helper emitted invalid JSON: {exc}: {stdout[:500]}",
+        )
+    if not isinstance(payload, dict):
+        return rematerialize_error_result(result.agent, "", "", "helper JSON was not an object")
+    if proc.stderr.strip():
+        payload.setdefault("warnings", []).append(proc.stderr.strip())
+    return payload
+
+
 def cmd_migrate_agents(args: argparse.Namespace) -> int:
     template_root = Path(args.source_root).expanduser() / "agents" / "_template"
     agent_root = Path(args.target_root).expanduser() / "agents"
+    source_root = Path(args.source_root).expanduser().resolve()
+    target_root = Path(args.target_root).expanduser().resolve()
     admin_agent = (args.admin_agent or "").strip()
     results: list[AgentMigrationResult] = []
     skipped_isolated: list[dict[str, str]] = []
     for path in discover_agent_dirs(agent_root):
         try:
-            results.append(migrate_agent_home(path, template_root, admin_agent, args.dry_run))
+            result = migrate_agent_home(path, template_root, admin_agent, args.dry_run)
+            result.rematerialize = rematerialize_agent_identity(source_root, target_root, result, args.dry_run)
+            results.append(result)
         except PermissionError as exc:
             # v0.8.2 (#652): per-UID isolated agent home is not stat-able
             # by the controller. Skip with a structured result instead of
@@ -579,15 +706,20 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
                 "agent": path.name,
                 "reason": f"PermissionError: {exc.filename or '<unknown path>'} (per-UID isolated tree)",
             })
+    def result_has_changes(item: AgentMigrationResult) -> bool:
+        remat = item.rematerialize or {}
+        return bool(item.added_files or item.created_dirs or item.updated_files or remat.get("updated_paths"))
+
     payload = {
         "agent_count": len(results) + len(skipped_isolated),
         "migrated_count": len(results),
         "skipped_isolated_count": len(skipped_isolated),
         "skipped_isolated": skipped_isolated,
-        "agents_with_additions": sum(1 for item in results if item.added_files or item.created_dirs or item.updated_files),
+        "agents_with_additions": sum(1 for item in results if result_has_changes(item)),
         "added_files": sum(len(item.added_files) for item in results),
         "created_dirs": sum(len(item.created_dirs) for item in results),
         "updated_files": sum(len(item.updated_files) for item in results),
+        "rematerialized_files": sum(len((item.rematerialize or {}).get("updated_paths") or []) for item in results),
         "agents": [asdict(item) for item in results],
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -639,6 +771,10 @@ def build_backup_entries(
             remember(f"{prefix}/{relpath}", "file")
         for relpath in agent_payload.get("created_dirs", []):
             remember(f"{prefix}/{relpath}", "dir")
+        rematerialize_payload = agent_payload.get("rematerialize") or {}
+        if isinstance(rematerialize_payload, dict):
+            for relpath in rematerialize_payload.get("updated_paths") or []:
+                remember(str(relpath), "file")
 
     remember("state/upgrade/last-upgrade.json", "file")
     return [entries[key] for key in sorted(entries)]
@@ -1939,6 +2075,13 @@ def file_sha256(path: Path) -> str:
         return ""
 
 
+def path_exists_noexcept(path: Path) -> bool:
+    try:
+        return os.path.exists(path)
+    except OSError:
+        return False
+
+
 def list_conflict_records(target_root: Path) -> list[Path]:
     record_dir = target_root / "state" / "upgrade-conflicts"
     if not record_dir.is_dir():
@@ -2665,7 +2808,8 @@ def cmd_conflicts_list(args: argparse.Namespace) -> int:
             live_target = str(record_entry.get("live_target") or "")
             at_write = str(record_entry.get("live_target_sha256_at_write") or "")
             if live_target:
-                current = file_sha256(Path(live_target)) if Path(live_target).exists() else ""
+                live_target_path = Path(live_target)
+                current = file_sha256(live_target_path) if path_exists_noexcept(live_target_path) else ""
                 if at_write:
                     hash_changed = current != at_write
         rows.append(
