@@ -293,6 +293,18 @@ atomic-persist-before-block의 fail-open 무한루프 가드가 있고, #1199 qu
 
 이 레이어는 "보안 제품"이 아니라 shared-user runtime의 containment/audit layer다.
 
+**Identity materialization invariant (#10370).** v2 layout에서 authored identity와
+runtime workdir copy는 의도적으로 분리되어 있다. create/start 경로는 HOME/source의
+identity 파일을 workdir read-target으로 **copy-on-materialize** 하며, reader를 HOME으로
+뒤집지 않는다. `bridge-upgrade.py migrate-agents`가 CLAUDE/AGENTS managed block 같은
+canon을 갱신한 뒤에는 `lib/upgrade-helpers/rematerialize-agent-identity.sh`가 같은
+fileset을 workdir에 다시 materialize한다. 이 upgrade-time 경로는 maintenance event라
+sync-on-start의 mtime guard를 쓰지 않는다. 대신 dry-run JSON에 planned workdir paths를
+내보내 backup planner가 apply 전에 기존 workdir copy를 잡게 하고, shared-cwd pair에서는
+target identity가 다른 agent 소유이면 `shared_workspace`로 skip한다. iso v2 workdir write는
+항상 `bridge_isolation_write_file_as_agent_user_via_bash` + per-file `0660` normalize를
+통한다.
+
 **Settings single-tree invariant (#1455).** effective settings 파일은 에이전트당
 **정확히 한 곳**(`home/.claude/settings.effective.json`)에만 실재해야 하고, 나머지
 (특히 `workdir/.claude/settings.json`)는 그 파일을 가리키는 **상대 symlink**여야 한다 —

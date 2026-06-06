@@ -11682,6 +11682,12 @@ bash "$REPO_ROOT/scripts/smoke/dynamic-agent-shared-mode-workdir.sh"
 log "running v2-scaffold-home-and-workdir smoke (issue #686)"
 bash "$REPO_ROOT/scripts/smoke/v2-scaffold-home-and-workdir.sh"
 
+# Issue #10370 — `bridge-upgrade.py migrate-agents` refreshes the authored
+# identity canon and must re-materialize the workdir read-copy in the same
+# migration JSON/backup surface.
+log "running upgrade-migrate-rematerialize-workdir smoke (issue #10370)"
+bash "$REPO_ROOT/scripts/smoke/upgrade-migrate-rematerialize-workdir.sh"
+
 # Issue #1238 — v0.15.0-beta1 fresh `agent create --isolate` scaffolded
 # the per-agent home tree (`SOUL.md`, `CLAUDE.md`, `.claude/`, etc.)
 # under the controller's umask and `bridge_linux_prepare_agent_isolation`
