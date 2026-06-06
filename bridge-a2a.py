@@ -793,7 +793,11 @@ def _schedule_retry(conn, message_id: str, attempts: int, cfg: dict[str, Any],
             # unless the operator has opted this bridge into trusting peer
             # Retry-After verbatim (`delivery_trust_peer_retry_after: true` —
             # the existing config-key trust pattern, no new wire trust path).
-            if not bool(cfg.get("delivery_trust_peer_retry_after", False)):
+            # The gate requires an EXACT boolean True: any other value (the
+            # strings "false"/"true", 1, "yes", etc.) is NOT trusted, so a
+            # config typo cannot fail open into honoring an unauthenticated
+            # peer Retry-After beyond the ceiling.
+            if cfg.get("delivery_trust_peer_retry_after", False) is not True:
                 ra = min(ra, ceiling)
             delay = max(delay, ra)
     # Full jitter.

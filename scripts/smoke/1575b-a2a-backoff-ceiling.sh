@@ -27,6 +27,9 @@
 #      but honored verbatim when delivery_trust_peer_retry_after=true.
 #      TOOTH: pre-Part-B `max(delay, Retry-After)` honored any value -> a
 #      transient/spoofed 503 could re-impose a multi-minute backoff.
+#      SECURITY TOOTH: the trust gate requires an EXACT boolean true; a
+#      string config value ("false"/"true") is truthy in Python but must
+#      still be clamped (a `bool()`/truthiness gate would fail-open here).
 #
 # No tailnet / sockets needed — this is the sender-side scheduling math only.
 
@@ -111,5 +114,18 @@ out="$(python3 "$HELPER" schedule "$WORK/ra2.db" 10 3600 --config '{"delivery_tr
 trust_delay="$(printf '%s' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin)["delay"])')"
 [[ "$trust_delay" -gt 120 ]] \
   || smoke_fail "#4 trusted Retry-After not honored (delay $trust_delay <= 120)"
+
+# SECURITY TOOTH: the trust gate requires an EXACT boolean true. A config typo
+# that yields a STRING ("false" or even "true") is truthy in Python but must
+# NOT enable the trust path — otherwise an unauthenticated peer Retry-After
+# could fail-open past the ceiling. Both string values MUST be clamped.
+for str_cfg in '{"delivery_trust_peer_retry_after": "false"}' \
+               '{"delivery_trust_peer_retry_after": "true"}'; do
+  out="$(python3 "$HELPER" schedule "$WORK/ra-str.db" 10 3600 --config "$str_cfg")"
+  str_delay="$(printf '%s' "$out" | python3 -c 'import sys,json; print(json.load(sys.stdin)["delay"])')"
+  rm -f "$WORK/ra-str.db"
+  [[ "$str_delay" -ge 1 && "$str_delay" -le 120 ]] \
+    || smoke_fail "#4 SECURITY: string trust value '$str_cfg' fail-open (delay $str_delay > 120, Retry-After not clamped)"
+done
 
 smoke_log "all #1575 Part B teeth passed"
