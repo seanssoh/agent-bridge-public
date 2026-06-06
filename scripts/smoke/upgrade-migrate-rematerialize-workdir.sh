@@ -141,7 +141,7 @@ for item in payload.get("entries", []):
 
 portable_mode() {
   local path="$1"
-  stat -f '%Lp' "$path" 2>/dev/null || stat -c '%a' "$path"
+  stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path"
 }
 
 test_split_apply() {

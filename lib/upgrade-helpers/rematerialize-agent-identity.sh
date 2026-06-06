@@ -27,9 +27,12 @@ target_dir=""
 
 _remat_tmp_paths=""
 _remat_tmp_errors=""
+_remat_tmp_user_files=""
 cleanup() {
   [[ -n "$_remat_tmp_paths" ]] && rm -f -- "$_remat_tmp_paths"
   [[ -n "$_remat_tmp_errors" ]] && rm -f -- "$_remat_tmp_errors"
+  [[ -n "$_remat_tmp_user_files" ]] && rm -f -- "$_remat_tmp_user_files"
+  return 0
 }
 trap cleanup EXIT
 
@@ -451,11 +454,17 @@ for name in "${remat_names[@]}"; do
 done
 
 if [[ -d "$source_dir/users" ]]; then
+  _remat_tmp_user_files="$(mktemp "${TMPDIR:-/tmp}/agb-remat-users.XXXXXX")" || {
+    _remat_add_error "mktemp failed for users inventory"
+    _remat_finish
+    exit 0
+  }
+  find "$source_dir/users" -type f -print >"$_remat_tmp_user_files" 2>/dev/null || true
   while IFS= read -r user_file; do
     [[ -n "$user_file" ]] || continue
     rel="${user_file#"$source_dir/"}"
     _remat_copy_one_file "$rel" || true
-  done < <(find "$source_dir/users" -type f -print 2>/dev/null)
+  done <"$_remat_tmp_user_files"
 fi
 
 _remat_finish
