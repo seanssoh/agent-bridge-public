@@ -376,6 +376,40 @@ def cmd_watchdog_fresh_install_only(args: argparse.Namespace) -> int:
     return 0
 
 
+def _connect_queue_db_readonly(db_path: str) -> sqlite3.Connection:
+    """Open the central queue DB read-only without ever creating it.
+
+    Issue #1631 (A2A audit R4 — fail-OPEN read-path mirror of #1623).
+    The nudge-eligibility helpers below classify an agent's LIVE queued
+    set so the daemon can decide whether a pending nudge is still real.
+    A plain ``sqlite3.connect(db_path)`` CREATES an empty DB when the
+    path is missing/unresolved (a transient ``BRIDGE_TASK_DB`` glitch),
+    which then reports ``queued=0`` and the shell caller actively DROPS
+    a legitimately-queued task's nudge, mislabeling it "stale".
+
+    Mirror the sibling ``cmd_task_status`` guard so a missing/unreadable
+    DB raises (helpers exit non-zero) instead of silently fabricating an
+    empty queue: ``Path(db_path).is_file()`` first, then open via the
+    ``file:...?mode=ro`` URI so a bad path can never create a fresh DB.
+    The shell call sites treat the non-zero exit as "skip this tick"
+    (the next tick retries naturally), never as a stale-drop.
+    """
+    path = Path(db_path)
+    if not path.is_file():  # noqa: raw-pathlib-controller-only — db_path is always the controller's central queue DB ($BRIDGE_TASK_DB), passed only by the daemon-side nudge fanout (bridge-daemon.sh::nudge_agent_session); never an iso-agent path.
+        raise sqlite3.OperationalError(f"queue DB not found: {db_path}")
+    # Build the file: URI from the already-validated absolute path via
+    # ``Path.as_uri()`` so URI metacharacters in the path (e.g. ``?`` / ``#``,
+    # valid in filesystem names and reachable through a custom ``BRIDGE_HOME``)
+    # are percent-encoded. A naive ``f"file:{path}?mode=ro"`` lets the sqlite
+    # URI parser split the path at the first raw ``?``/``#`` and open/create a
+    # DIFFERENT prefix path than the one ``is_file()`` just checked — which would
+    # silently bypass this read-only/no-create guard. ``as_uri()`` requires an
+    # absolute path; the queue DB path is always absolute, but resolve defensively.
+    abs_path = path if path.is_absolute() else path.resolve()
+    uri = f"{abs_path.as_uri()}?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
 def cmd_nudge_live_state(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:2728 (nudge_agent_session).
 
@@ -401,7 +435,7 @@ def cmd_nudge_live_state(args: argparse.Namespace) -> int:
     db_path = args.db_path
     agent = args.agent
     with_top_task = str(getattr(args, "with_top_task", "0")) == "1"
-    with sqlite3.connect(db_path) as conn:
+    with _connect_queue_db_readonly(db_path) as conn:
         queued_ids = [
             str(row[0])
             for row in conn.execute(
@@ -546,7 +580,7 @@ def cmd_nudge_eligibility_recheck(args: argparse.Namespace) -> int:
         redelivery_seconds = 0
     now_ts = int(datetime.now(timezone.utc).timestamp())
     cutoff_ts = now_ts - max(0, redelivery_seconds)
-    with sqlite3.connect(db_path) as conn:
+    with _connect_queue_db_readonly(db_path) as conn:
         if redelivery_seconds > 0:
             rows = conn.execute(
                 """
@@ -676,7 +710,7 @@ def cmd_human_followup_queued_state(args: argparse.Namespace) -> int:
         where.append(f"id IN ({placeholders})")
         params.extend(queued_ids)
 
-    with sqlite3.connect(db_path) as conn:
+    with _connect_queue_db_readonly(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             f"""

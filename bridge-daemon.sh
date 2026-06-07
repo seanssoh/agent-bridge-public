@@ -7647,6 +7647,30 @@ nudge_agent_session() {
     daemon_warn "nudge live-state query for ${agent} timed out (rc=${live_state_rc}); skipping nudge this tick"
     return 0
   fi
+  # Issue #1631 (A2A audit R4): the helper now opens the queue DB
+  # read-only with an `is_file()` guard (bridge-daemon-helpers.py
+  # ::_connect_queue_db_readonly) and exits non-zero on a
+  # missing/unreadable `BRIDGE_TASK_DB` instead of CREATING an empty DB
+  # and reporting `live_queued=0`. A bare empty `$live_state` is now
+  # ambiguous — it can mean either "agent genuinely has nothing queued"
+  # (rc=0, empty TSV is not produced; the helper always prints a row on
+  # success) OR "the live-state read failed" (rc!=0, no stdout). On a
+  # non-timeout read failure we must SKIP this tick (the next tick
+  # retries naturally), NOT fall through to `live_queued=0` which the
+  # block below converts into a `session_nudge_dropped_stale` — that
+  # would silently suppress a legitimately-queued task's nudge on a
+  # transient IO/env glitch. Timeouts (124/137) are already handled
+  # above with their own audit row; this catches the DB-open / sqlite
+  # failure class the #1631 guard surfaces.
+  if (( live_state_rc != 0 )); then
+    bridge_audit_log daemon daemon_subprocess_error "$agent" \
+      --detail call_site=nudge_live_state \
+      --detail target_agent="$agent" \
+      --detail exit_code="$live_state_rc" \
+      --detail action=skip_this_tick
+    daemon_warn "nudge live-state query for ${agent} failed (rc=${live_state_rc}); skipping nudge this tick"
+    return 0
+  fi
   if [[ -n "$live_state" ]]; then
     IFS=$'\t' read -r live_queued live_claimed live_nudge_key <<<"$live_state"
   else
