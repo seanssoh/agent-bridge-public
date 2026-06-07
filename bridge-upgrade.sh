@@ -2727,10 +2727,15 @@ drift if the state is already converged.
 
 2. \`$TARGET_ROOT/scripts/wiki-mention-scan.py --full-rebuild\`
    Builds the initial L1 observation index
-   (\`$TARGET_ROOT/shared/wiki/_index/mentions.db\`) and generates
-   today's distribution report.
+   (\`$TARGET_ROOT/shared/wiki/_index/mentions.db\`). This rebuilds the
+   DB only and prints a JSON summary — it does not write a report file.
 
-3. Review the distribution report at
+3. Generate today's distribution report from the freshly built index:
+   \`\`\`
+   $TARGET_ROOT/scripts/wiki-mention-scan.py --report \\
+     --out "$TARGET_ROOT/shared/wiki/_index/distribution-report-\$(date +%Y-%m-%d).md"
+   \`\`\`
+   Then review the report at
    \`$TARGET_ROOT/shared/wiki/_index/distribution-report-<date>.md\`.
    - §1 cross-agent reach (how entities are connected).
    - §2 L2 hub candidates (the weekly cron resurfaces these as

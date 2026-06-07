@@ -59,6 +59,30 @@ _CODESPAN_RE = re.compile(r"(`+)(?!`)(.+?)\1(?!`)")
 # long as the opening fence (CommonMark). Bash `[[ ... ]]` tests and
 # `[:space:]` classes inside such blocks are code, not wikilinks.
 _FENCE_LINE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+# A blank (or whitespace-only) line. An indented code block can *start*
+# after a blank line (or after any non-paragraph block); it can NOT
+# interrupt a paragraph. Used by ``blank_indented_code``.
+_BLANK_LINE_RE = re.compile(r"^[ \t]*$")
+# A POSIX bracket-expression class such as ``[:space:]`` / ``[:alpha:]``.
+# When ``[[`` immediately wraps one (``[[:space:]]``) it is a shell/grep
+# character-class fragment, never a wikilink. Used as a defensive reject in
+# ``iter_wikilinks`` on top of code-region blanking.
+_POSIX_CLASS_RE = re.compile(r"^:[a-z]+:$")
+# A list-item marker line (bullet ``-``/``*``/``+`` or ordered ``1.``/``1)``),
+# optionally indented. Inside a list, a blank-line-separated indented line is a
+# list paragraph (where a real ``[[wikilink]]`` can live), NOT an indented code
+# block — so ``blank_indented_code`` must not open a block while in a list.
+_LIST_MARKER_RE = re.compile(r"^[ \t]*(?:[-*+]|[0-9]{1,9}[.)])[ \t]")
+# An ATX heading line (``# ``..``###### ``) — a non-paragraph leaf block.
+# Indented code MAY start immediately after one (CommonMark only forbids
+# indented code from interrupting a *paragraph*), so a heading must not be
+# treated as a "paragraph" line that swallows a following indented block.
+_ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]|$)")
+# A thematic break (``---`` / ``***`` / ``___``, >=3 of one char, spaces
+# allowed) — also a non-paragraph block.
+_THEMATIC_BREAK_RE = re.compile(r"^[ \t]{0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$")
+# A blockquote marker line — non-paragraph block opener for our purposes.
+_BLOCKQUOTE_RE = re.compile(r"^[ \t]{0,3}>")
 
 # Skip these top-level wiki subtrees during scans. They are not content.
 _SKIP_TOP_DIRS = {"_workspace", "_audit", "_index", ".obsidian"}
@@ -341,6 +365,116 @@ def blank_fenced_code(text: str) -> str:
     return "\n".join(out)
 
 
+def blank_indented_code(text: str) -> str:
+    """Return ``text`` with CommonMark indented code blocks blanked out.
+
+    An indented code block is a run of lines each indented by >=4 spaces
+    (a leading tab counts as >=4 columns) that is *introduced* by a blank
+    line — i.e. it cannot interrupt a paragraph (CommonMark §4.4). Blank
+    lines interior to the block are kept as part of it; the block ends at
+    the first non-blank line indented by fewer than 4 columns.
+
+    Like ``blank_fenced_code`` this is length-preserving: every blanked
+    character becomes a space and newlines are kept, so byte offsets stay
+    aligned. Bash ``[[ ... ]]`` tests and ``[:space:]`` POSIX classes that
+    live in such a block are code, not wikilinks, so blanking the region
+    keeps them from satisfying ``_WIKILINK_RE``.
+
+    CommonMark rule, faithfully: an indented code block can begin only when
+    the indented line is NOT a lazy continuation of a paragraph. It may
+    start after a blank line, after a heading, after a thematic break, or at
+    the very top of the document — but it may NOT interrupt a paragraph. So
+    the block opens at a >=4-column line whenever the *previous* original
+    line was not a paragraph line (a blank line and the non-paragraph leaf
+    blocks — ATX heading, thematic break, blockquote, fence — all clear the
+    paragraph state).
+
+    It also refuses to open a block while inside a list: a blank-separated
+    indented line under a list item is a list paragraph, where a genuine
+    ``[[wikilink]]`` can live — not code. The overall bias is toward
+    *keeping* real links: an occasional leaked fragment in an exotic layout
+    is still caught by the POSIX-class reject in ``iter_wikilinks``, but a
+    wrongly-blanked link is unrecoverable.
+
+    ``text`` is expected to have already had its fenced regions blanked, so
+    an indented line *inside* a fence (now all spaces) is treated as blank
+    here and never re-opens a block.
+    """
+
+    def indent_columns(line: str) -> int:
+        """Expanded leading-whitespace width, with tab = 4 columns."""
+        cols = 0
+        for ch in line:
+            if ch == " ":
+                cols += 1
+            elif ch == "\t":
+                cols += 4
+            else:
+                break
+        return cols
+
+    def is_paragraph_line(line: str, is_blank: bool, indented: bool) -> bool:
+        """True when ``line`` is ordinary paragraph prose — a non-blank,
+        non-indented line that is not itself a non-paragraph leaf block
+        (heading / thematic break / blockquote / list marker). Only a
+        paragraph line can lazily swallow a following indented line."""
+        if is_blank or indented:
+            return False
+        if _ATX_HEADING_RE.match(line):
+            return False
+        if _THEMATIC_BREAK_RE.match(line):
+            return False
+        if _BLOCKQUOTE_RE.match(line):
+            return False
+        if _LIST_MARKER_RE.match(line):
+            return False
+        return True
+
+    lines = text.split("\n")
+    out: list[str] = []
+    in_block = False
+    # start-of-document is not a paragraph context, so an indented first
+    # line opens a block.
+    prev_paragraph = False
+    in_list = False  # currently inside a (possibly multi-paragraph) list
+    for line in lines:
+        is_blank = _BLANK_LINE_RE.match(line) is not None
+        indented = (not is_blank) and indent_columns(line) >= 4
+        is_list_marker = (not is_blank) and _LIST_MARKER_RE.match(line) is not None
+        if in_block:
+            if is_blank:
+                # A blank line may be interior whitespace of the block;
+                # keep it blanked and stay in-block (the block only ends
+                # at a non-blank, under-indented line).
+                out.append(" " * len(line))
+            elif indented:
+                out.append(" " * len(line))
+            else:
+                in_block = False
+                out.append(line)
+        else:
+            if indented and not prev_paragraph and not in_list:
+                in_block = True
+                out.append(" " * len(line))
+            else:
+                out.append(line)
+        # Maintain list-region state on the ORIGINAL line. A list opens at
+        # a marker line and persists across blank lines and indented
+        # continuations (list paragraphs); it closes at a non-blank,
+        # non-indented, non-marker line (a return to flush-left prose).
+        if is_list_marker:
+            in_list = True
+        elif not is_blank and not indented:
+            in_list = False
+        # Track whether the ORIGINAL line was paragraph prose so the next
+        # indented line knows whether it would be a lazy continuation
+        # (CommonMark forbids an indented block from interrupting a
+        # paragraph, but it MAY start after a heading / thematic break /
+        # blank line).
+        prev_paragraph = is_paragraph_line(line, is_blank, indented)
+    return "\n".join(out)
+
+
 def codespan_ranges(text: str) -> list[tuple[int, int]]:
     return [(m.start(), m.end()) for m in _CODESPAN_RE.finditer(text)]
 
@@ -359,18 +493,23 @@ def iter_wikilinks(text: str):
 
     surface_form is the part BEFORE any ``|`` or ``#`` (i.e. the link target).
 
-    Code regions are excluded before matching: fenced code blocks are
-    blanked first (length-preserving so positions stay aligned), then
-    inline codespans are skipped via ``codespan_ranges``. A real markdown
-    wikilink never lives inside either.
+    Code regions are excluded before matching: fenced code blocks and
+    indented (4-space / tab) code blocks are blanked first (length-
+    preserving so positions stay aligned), then inline codespans are
+    skipped via ``codespan_ranges``. A real markdown wikilink never lives
+    inside any of those. As a final defensive guard, surfaces shaped like a
+    POSIX character class (``:space:`` from ``[[:space:]]``) are rejected —
+    those are shell/grep fragments, not links.
     """
-    scan_text = blank_fenced_code(text)
+    scan_text = blank_indented_code(blank_fenced_code(text))
     ranges = codespan_ranges(scan_text)
     for match in _WIKILINK_RE.finditer(scan_text):
         if inside_codespan(match.start(), ranges):
             continue
         surface = match.group(1).strip()
         if not surface:
+            continue
+        if _POSIX_CLASS_RE.match(surface):
             continue
         yield surface, match.start()
 
