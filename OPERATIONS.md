@@ -243,6 +243,29 @@ The upgrader preserves local runtime data by default:
 - `agents/*` runtime homes
 - local backups and generated files
 
+#### migrate-agents: default-on, roster-restricted, no-downtime (#1611)
+
+`upgrade --apply` 는 migrate-agents 를 **켠 채로** 두는 것이 권장 경로다.
+`--no-migrate-agents` 로 끌 필요가 없다. migrate-agents 는 active/roster agent 의 canon
+(CLAUDE/AGENTS managed block, skills, session-type template 등)을 최신으로 유지한다.
+
+- **Roster-restricted by default.** v0.16.1+ 부터 migrate-agents 는 `agents/` 아래 모든
+  디렉터리가 아니라 **roster 에 있는 agent 만** migrate 한다. roster set 은
+  `state/agents-aggregate.tsv`(active+stopped 전체) + `state/active-roster.tsv` +
+  `agent-roster.sh` / `agent-roster.local.sh` + admin agent 의 합집합이다. roster 에 없는
+  orphan/test-agent home 은 skip 되고, JSON 의 `skipped_orphans` / `skipped_orphans_count`
+  와 `[bridge-upgrade] migrate-agents: skipped N non-roster dir(s): …` stderr line 으로
+  보인다. (예전에는 orphan home 이 쌓인 host 에서 전부 migrate 돼서 노이즈가 컸고, 그게
+  운영자가 `--no-migrate-agents` 를 쓰던 이유였다 — 이제 그 이유가 없어진다.)
+- **Safe fallback.** roster source 를 하나도 못 읽으면(또는 set 이 비면)
+  `roster_filtering=unavailable` 로 떨어지며 **모든 dir 을 migrate** 한다. 진짜 agent 를
+  놓치는 것보다 orphan 하나 더 migrate 하는 게 안전하기 때문이다.
+- **Force-include orphans.** orphan 까지 포함해서 예전처럼 전부 migrate 하려면
+  `agb upgrade --apply --migrate-all-agents` 를 쓴다(`roster_filtering=disabled`).
+- **No-downtime for active sessions.** default-on 이 실행 중인 세션에 안전한 이유: #1598
+  re-materialize 가 migrate 직후 workdir identity copy 를 즉시 갱신하고, active 세션은 다음
+  auto-compact 에서 `CLAUDE.md` 를 다시 읽으며 self-heal 한다. 강제 재시작이 필요 없다.
+
 매 release 의 후속 행동 (operator action) 은 [`OPERATOR_ACTIONS_PENDING.md`](OPERATOR_ACTIONS_PENDING.md) 의 release section 으로 surface 된다. `upgrade --apply` 가 admin agent 한테 자동 등록한 `[upgrade-complete]` task 에서 reference 됨. troubleshooting + rollback + admin host source-checkout 변형은 `UPGRADING.md` 참조.
 
 ### Daily-backup tuning (v0.7.2+)
