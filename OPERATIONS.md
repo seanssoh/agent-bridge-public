@@ -116,9 +116,10 @@ without guessing.
 
 표준 upgrade 절차는 [`UPGRADING.md`](UPGRADING.md) 에 정리되어 있다. 모든 install 에서 동일한 명령으로 진행한다:
 
-**Current target**: upgrade to **`v0.15.2`** (stable). It supersedes the
-`v0.15.0-rc1` / `v0.15.0-betaN` / `v0.14.5-betaN` prereleases, so the latest
-stable tag is the current target. A single
+**Current target**: upgrade to **`v0.16.2`** (stable). It supersedes the
+`v0.16.1` / `v0.16.0` / `v0.15.x` stable line and all the
+`v0.16.0-rc1..rc3` / `v0.15.0-rc1` / `v0.15.0-betaN` / `v0.14.5-betaN`
+prereleases, so the latest stable tag is the current target. A single
 `agent-bridge upgrade --apply` lands there from any v0.7.x+ source; the
 v0.13.7-v0.13.9 heredoc-chain fixes (extracted to `lib/upgrade-helpers/`) keep
 the leap-path safe on Bash 5.3.9 hosts:
@@ -126,7 +127,7 @@ the leap-path safe on Bash 5.3.9 hosts:
 ```bash
 cd <source-checkout>
 git fetch origin --tags
-# Pin to the latest STABLE tag (vX.Y.Z, no -beta/-rc suffix) — currently v0.15.2.
+# Pin to the latest STABLE tag (vX.Y.Z, no -beta/-rc suffix) — currently v0.16.2.
 git checkout "$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
 ./agent-bridge upgrade --apply
 ```
@@ -198,7 +199,7 @@ For per-stage detail, see `CHANGELOG.md` `[0.14.0]`. For the stabilization roadm
 
 ### v0.13.x hotfix wave (2026-05-15) — historical context
 
-**Current recommendation**: upgrade to the current target (`v0.15.2` stable — see the top of the Upgrade section). This section is preserved as historical context for the leap-path blockers that v0.13.7-v0.13.10 resolved.
+**Current recommendation**: upgrade to the current target (`v0.16.2` stable — see the top of the Upgrade section). This section is preserved as historical context for the leap-path blockers that v0.13.7-v0.13.10 resolved.
 
 The v0.13.7-v0.13.10 cycle fixed a four-stage `agent-bridge upgrade --apply` blocker that affected the v0.7.x → v0.13.x leap on Bash 5.3.9 hosts (matched by recent Linux distros). Operators on macOS were similarly affected by a markerless-existing-install layout reject. The v0.14.x line carries those fixes forward — operators can leap directly from v0.7.x/v0.8.x/v0.9.x/v0.10.x/v0.11.x/v0.12.x to the current target in a single `agent-bridge upgrade --apply` step.
 
@@ -242,6 +243,35 @@ The upgrader preserves local runtime data by default:
 - `shared/`
 - `agents/*` runtime homes
 - local backups and generated files
+
+#### upgrade/rollback singleton lock — concurrent runs refuse fast (#1661)
+
+v0.16.2+ 부터 `agb upgrade --apply` 와 non-dry-run `agb rollback` 은 install 당 하나만
+돌도록 **singleton lock** 을 잡는다 (`state/locks/upgrade.lock`, `lib/bridge-lock.sh`
+shared helper — flock 우선, flock 없는 host 는 `mkdir` fallback). 같은 `BRIDGE_HOME`
+에 대해 두 번째 mutating 호출이 동시에 들어오면 **즉시 거부(refuse-fast)** 한다:
+
+```
+agb upgrade --apply
+# → upgrade/rollback already running (pid 12345, started 2026-06-08T...) — refusing
+#    (use --wait [secs] to block); non-zero exit
+```
+
+- **운영/자동화 기대값.** upgrade 는 한 세션에서만(single-session) 돌린다. cron / watchdog
+  / 동시 admin 세션이 같은 host 에 두 번째 `upgrade --apply` 를 쏘면 두 번째가 빠르게
+  non-zero rc 로 떨어진다 — daemon + agent restart 가 서로 레이스하던 예전의 multi-process
+  thrash (실제 host 에서 5-process thrash 관측) 를 막는다.
+- **`--wait [secs]`.** 거부 대신 기존 run 이 끝날 때까지 **bounded wait** 하고 싶으면
+  `agb upgrade --apply --wait 300` (초 단위) 으로 opt-in 한다. 기본값은 refuse-fast.
+- **dry-run 은 lock 을 잡지 않는다.** `agb upgrade --dry-run` 은 mutating 경로가 아니라
+  병렬 실행이 자유롭다. lock 은 `--apply` 와 non-dry-run `rollback` 에만 걸린다.
+- **lock 자동 해제.** lock release 는 upgrade exit-handler 에 통합되어 있고, daemon /
+  receiver / agent restart 같은 child spawn 은 상속받은 lock fd 를 떨어뜨린다 — upgrade 가
+  죽거나 끝나면 lock 은 풀린다.
+
+(Linux/flock host 노트: v0.16.2 는 이 lock 을 모든 flock host 에서 무력화하던 두 버그도
+같이 고쳤다 — `flock -w 0` 이 실제 `flock(1)` 에 거부되던 것을 `flock -n` 으로, 그리고
+`exec {fd}>>file 2>/dev/null` 가 shell stderr 를 영구히 묵음 처리하던 것을.)
 
 #### migrate-agents: default-on, roster-restricted, no-downtime (#1611)
 
@@ -1691,6 +1721,26 @@ escalating:
    ```
    ..."detail":{"call_site":"bridge-a2a.cmd_send","exception":"Command '[...]' timed out after 10 seconds","exception_type":"TimeoutExpired","fallback_method":"sudo-read","file_path":"/path/to/body.md","iso_uid":"agent-bridge-patch","rc":"","success":false}
    ```
+
+6. **dev-plugin-cache upgrade-conflict sidecar no longer cascade-fails
+   launches** (Issue #1663, v0.16.2+). If an upgrade left a
+   `*.upgrade-conflict` backup (mode 0600, owner-only) inside a
+   dev-plugin source directory, the iso plugin-cache build used to hit a
+   `PermissionError` reading it and abort the **entire** cache — taking
+   down every iso agent that depends on that plugin (a real cm-prod iso
+   v2 outage). The cache overlay now **pattern-skips** upgrade/VCS
+   sidecars (`*.upgrade-conflict`, `*.orig`, `*.rej`, merge-tool
+   sidecars, `.git`/`.hg`/`.svn`) and **per-entry guards** any other
+   unreadable/unknown file — it is skipped with a warning instead of
+   aborting the whole cache. The one exception is **required
+   plugin-contract material** (`plugin.json`, `server.ts`/`server.js`,
+   `package.json`, `mcp.json`): if one of those is unreadable the build
+   now **fails loud** (`install-failed`) rather than silently shipping a
+   broken plugin. Operator action: a leftover `*.upgrade-conflict` in a
+   plugin dir is no longer launch-blocking, but it is still a stale
+   backup — resolve it (`agb upgrade conflicts adopt`/manual) at leisure;
+   a hard `install-failed` on a required contract file means that file
+   really is unreadable and needs a permission/ownership fix.
 
 For the developer-side rationale, see [CLAUDE.md](./CLAUDE.md) §
 "Working with isolated agents (iso v2)" and
