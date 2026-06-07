@@ -80,6 +80,16 @@ Claude authors the change; Codex reviews; Claude merges only after Codex signs o
 
 A release PR updates only `VERSION` and `CHANGELOG.md`. Keep it in a branch named `release/vX.Y.Z`. Codex reviews the CHANGELOG entries and verifies the version-bump convention before `git tag -a vX.Y.Z <merge-sha>` and `git push origin vX.Y.Z`. Do not tag on a non-merge commit or on the feature branch.
 
+### 3a. Release lines & LTS policy
+
+Agent Bridge runs an **LTS line + mainline**, not a single moving tag. Full policy: [`docs/release-lines.md`](./docs/release-lines.md). What a Codex reviewer needs to hold (operator-decided 2026-06-08):
+
+- **Current LTS: v0.16.2.** An LTS is a blessed stable tag (release title `(LTS)` + README marker) for conservative/production installs.
+- **One line until features diverge** — the v0.16.x hardening sequence (v0.16.3, …) rides `main` and *is* the LTS line; do not fork a maintenance branch until the first new *feature* lands. Fork trigger: branch `release/0.16-lts` from the latest `v0.16.x` tag and bump `main` to `v0.17.0-beta`. New features → beta first, never onto the LTS line.
+- **Support window**: an LTS is supported until the next LTS is declared.
+- **Backport criteria** (LTS branch only): security · data loss · upgrade/rollback breakage · fleet-host-down regression. Not features/cosmetic/perf-only/refactors. Fix on `main` first, cherry-pick back only if it qualifies. When reviewing a backport PR, confirm it meets these criteria.
+- **Versioning**: LTS = patch bumps; mainline features = minor. **Channel enforcement**: `--channel stable` currently resolves to the highest global tag, so an `lts` version-line-pin channel (landing in v0.16.3, on the v0.16.x line) is what keeps LTS installs from auto-jumping when a higher minor ships. The upgrader is high-risk — review channel-resolver changes adversarially and confirm the default channel behavior is unchanged.
+
 ### 4. Forbidden operations under shared worktree
 
 Even when a Codex agent is attached to a shared worktree for legacy reasons, the following are forbidden on the operator's primary checkout:
