@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 bridge_load_roster
 
 usage() {
-  echo "Usage: bash $SCRIPT_DIR/bridge-send.sh --urgent <agent> \"<message>\" [--wait <seconds>]"
+  echo "Usage: bash $SCRIPT_DIR/bridge-send.sh --urgent <agent> \"<message>\" [--from <agent>] [--wait <seconds>]"
   echo "       bash $SCRIPT_DIR/bridge-send.sh --list"
   echo "활성 로스터: $BRIDGE_ACTIVE_ROSTER_MD"
   echo ""
@@ -102,6 +102,7 @@ URGENT_ONLY=0
 TARGET=""
 MESSAGE=""
 WAIT_SECONDS=0
+FROM_ACTOR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -112,6 +113,15 @@ while [[ $# -gt 0 ]]; do
     --urgent)
       URGENT_ONLY=1
       shift
+      ;;
+    --from)
+      # Issue #1640: mirror `bridge-task.sh create --from` so the urgent
+      # wrapper can override sender attribution. With no --from the actor is
+      # auto-inferred (behavior unchanged); with --from the explicit value
+      # wins via infer_actor_if_possible.
+      [[ $# -lt 2 ]] && bridge_die "--from 뒤에 에이전트 id를 지정하세요."
+      FROM_ACTOR="$2"
+      shift 2
       ;;
     --wait)
       if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
@@ -165,7 +175,7 @@ if [[ $MSG_LEN -gt $BRIDGE_MAX_MESSAGE_LEN ]]; then
   bridge_warn "메시지가 ${MSG_LEN}자입니다. 길면 $BRIDGE_SHARED_DIR 아래 파일에 저장하고 경로만 전달하세요."
 fi
 
-ACTOR="$(infer_actor_if_possible "")"
+ACTOR="$(infer_actor_if_possible "$FROM_ACTOR")"
 TASK_ID=""
 TASK_TITLE=""
 TITLE="$(urgent_task_title "$MESSAGE")"
