@@ -127,6 +127,119 @@ def conflict_backup_path(live_path: Path) -> Path:
     return live_path.with_name(f"{live_path.name}.upgrade-conflict")
 
 
+# Issue #1638: settings.json `merge_required` files routinely text-conflict on
+# two purely-cosmetic axes even when the rendered hook SET is identical:
+#   (1) hook-event group ORDER differs (e.g. live lists `inbox-auto-drain`
+#       before `session-stop`; upstream lists them the other way), and
+#   (2) the python interpreter token differs (`python3` vs `/usr/bin/python3`)
+#       inside a hook `command` string.
+# Neither changes behavior, but `git merge-file` is line-oriented and writes a
+# spurious `.upgrade-conflict` on every cm-prod iso v2 upgrade. The helpers
+# below canonicalize ONLY those two axes so `apply_live` can short-circuit a
+# cosmetic-only settings diff to `keep_live` (preserve the operator's file as
+# is) instead of forcing a manual conflict. The normalization is deliberately
+# surgical — a real hook add/remove/retiming still falls through to the
+# unchanged conflict path.
+_SETTINGS_CONFLICT_BASENAME = "settings.json"
+# Closed allowlist of interpreter tokens treated as cosmetically equivalent.
+# Issue #1638 names exactly ONE cosmetic axis: the bridge renders the same hook
+# with either bare `python3` or `/usr/bin/python3` depending on host, and the
+# two are equivalent on the target. We deliberately do NOT generalize beyond
+# these two literals (codex #1638 review, three rounds): a bare `python` /
+# `python2`, a different minor version (`python3.10` vs `python3.11`), a venv /
+# relative interpreter, or any other absolute path is a runtime-RELEVANT change
+# the operator should see, so it must NOT be collapsed to cosmetic. Anything
+# outside this set falls through to the real merge/conflict path unchanged.
+_COSMETIC_PYTHON_INTERPRETERS = frozenset({"python3", "/usr/bin/python3"})
+
+
+def _canonicalize_hook_command(command: str) -> str:
+    """Normalize the python interpreter prefix of a hook command string.
+
+    Splits off the first whitespace-delimited token; if it is one of the closed
+    allowlist of cosmetically-equivalent python3 interpreters (bare `python3` or
+    `/usr/bin/python3`), rewrite it to the canonical `python3` and rejoin the
+    remainder verbatim. Every other command — `bash …`, bare `python`/`python2`,
+    a minor-version-pinned `python3.11`, a venv/relative interpreter, any other
+    absolute path — is returned unchanged so a runtime-relevant interpreter
+    change still surfaces as a real conflict.
+    """
+    stripped = command.lstrip()
+    if not stripped:
+        return command
+    head, sep, tail = stripped.partition(" ")
+    if head in _COSMETIC_PYTHON_INTERPRETERS:
+        return "python3" + sep + tail
+    return stripped
+
+
+def _canonicalize_settings_hooks(parsed: Any) -> Any:
+    """Return a deep, order-insensitive canonical form of a settings doc.
+
+    Only the `hooks` mapping is touched: each event's group list is rendered
+    order-independent (sorted by canonical JSON) and every hook `command` has
+    its python interpreter prefix normalized. All other keys/values are copied
+    through unchanged, so a non-cosmetic difference anywhere still shows up in
+    the comparison.
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    canonical = dict(parsed)
+    hooks = parsed.get("hooks")
+    if not isinstance(hooks, dict):
+        return canonical
+    canonical_hooks: dict[str, Any] = {}
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            canonical_hooks[event] = groups
+            continue
+        canonical_groups = []
+        for group in groups:
+            if isinstance(group, dict) and isinstance(group.get("hooks"), list):
+                new_group = dict(group)
+                new_group["hooks"] = [
+                    {**hook, "command": _canonicalize_hook_command(hook["command"])}
+                    if isinstance(hook, dict) and isinstance(hook.get("command"), str)
+                    else hook
+                    for hook in group["hooks"]
+                ]
+                canonical_groups.append(new_group)
+            else:
+                canonical_groups.append(group)
+        # Order-independent: a different group ORDER with the same membership
+        # collapses to the same canonical list. `sort_keys` makes the per-group
+        # serialization stable regardless of key insertion order.
+        canonical_groups.sort(
+            key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False)
+        )
+        canonical_hooks[event] = canonical_groups
+    canonical["hooks"] = canonical_hooks
+    return canonical
+
+
+def settings_cosmetic_only_diff(live: bytes, upstream: bytes) -> bool:
+    """True when live vs upstream settings.json differ ONLY cosmetically.
+
+    Cosmetic == hook-event group ordering and/or python interpreter prefix.
+    Returns False (→ fall through to the real conflict path) when either side
+    is not parseable JSON, when the bytes are already identical (no decision to
+    make here), or when any non-cosmetic difference remains after canonical
+    normalization.
+    """
+    try:
+        live_parsed = json.loads(live.decode("utf-8"))
+        upstream_parsed = json.loads(upstream.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if live_parsed == upstream_parsed:
+        # Byte-level diff with structurally-equal JSON (whitespace/key order):
+        # still cosmetic, keep_live is the right call.
+        return True
+    return _canonicalize_settings_hooks(live_parsed) == _canonicalize_settings_hooks(
+        upstream_parsed
+    )
+
+
 def git_head(source_root: Path) -> str:
     return (
         subprocess.check_output(["git", "-C", str(source_root), "rev-parse", "HEAD"], text=True).strip()
@@ -2329,6 +2442,10 @@ def apply_live(
         "files_preserved_live": 0,
         "files_skipped_noop": analysis["counts"].get("unchanged", 0),
         "files_mode_synced": 0,
+        # Issue #1638: settings.json diffs that turned out to be cosmetic only
+        # (hook-event order / python-interpreter prefix) and were preserved as
+        # `keep_live` instead of conflicting.
+        "settings_cosmetic_noconflict": 0,
     }
     conflicts: list[str] = []
     conflict_backups: list[str] = []
@@ -2376,6 +2493,22 @@ def apply_live(
 
         if classification != "merge_required":
             actions.append({"path": relpath, "action": "noop"})
+            continue
+
+        # Issue #1638: before the generic text-merge conflict path, short-
+        # circuit a settings.json diff that is cosmetic only (hook-event group
+        # order and/or `python3` vs `/usr/bin/python3` interpreter prefix).
+        # Such a diff is semantically a no-op, so preserve the operator's live
+        # file (`keep_live`) and emit no `.upgrade-conflict`. A real hook
+        # add/remove/retime is NOT cosmetic and falls through unchanged.
+        if (
+            Path(relpath).name == _SETTINGS_CONFLICT_BASENAME
+            and live is not None
+            and settings_cosmetic_only_diff(live, upstream)
+        ):
+            counts["files_preserved_live"] += 1
+            counts["settings_cosmetic_noconflict"] += 1
+            actions.append({"path": relpath, "action": "keep_live"})
             continue
 
         if item.get("text") and base is not None and live is not None:
