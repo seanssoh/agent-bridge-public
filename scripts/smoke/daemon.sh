@@ -720,7 +720,15 @@ EOF
   bash "$SMOKE_REPO_ROOT/bridge-daemon.sh" run >"$daemon_log" 2>&1 &
   DAEMON_SOCKET_PID="$!"
 
-  for ((i = 0; i < 50; i++)); do
+  # Issue #1644 CI flake: first_pid is `local`-declared (above) but left UNSET, so if
+  # the initial listener does not bind within the wait budget the loop exits without
+  # ever assigning it and `set -u` aborts at the check below with a cryptic
+  # "first_pid: unbound variable" instead of the intended smoke_fail. Initialize it
+  # (mirroring second_pid="" below) AND give cold daemon boot more headroom on a loaded
+  # CI runner: 50*0.1=5s was too tight; 100*0.1=10s matches the restart loop's
+  # generosity. Common case is unaffected — the loop breaks as soon as the socket binds.
+  first_pid=""
+  for ((i = 0; i < 100; i++)); do
     if [[ -S "$socket_path" && -f "$pid_file" ]] && kill -0 "$DAEMON_SOCKET_PID" 2>/dev/null; then
       first_pid="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
       [[ "$first_pid" =~ ^[0-9]+$ ]] && break
