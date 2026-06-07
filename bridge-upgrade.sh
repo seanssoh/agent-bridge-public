@@ -73,6 +73,10 @@ ALLOW_DOWNGRADE=0
 STRICT_MERGE=0
 BACKUP=1
 MIGRATE_AGENTS=1
+# Issue #1611: migrate-agents is roster-restricted by default (orphan /
+# non-roster dirs are skipped). This opt-in restores the historical
+# migrate-every-dir behavior for operators who want it.
+MIGRATE_ALL_AGENTS=0
 BACKUP_ROOT=""
 ANALYSIS_JSON='{}'
 TARGET_REF=""
@@ -118,7 +122,7 @@ _BRIDGE_UPGRADE_DIE_REMEDIATION=""
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--allow-downgrade] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents]
+  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--allow-downgrade] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents] [--migrate-all-agents]
   $(basename "$0") analyze [--source <repo-dir>] [--target <bridge-home>] [--json]
   $(basename "$0") rollback [--target <bridge-home>] [--backup-root <dir>] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json]
   $(basename "$0") conflicts list [--target <bridge-home>] [--json]
@@ -1271,6 +1275,11 @@ while [[ $# -gt 0 ]]; do
       MIGRATE_AGENTS=1
       shift
       ;;
+    --migrate-all-agents)
+      MIGRATE_AGENTS=1
+      MIGRATE_ALL_AGENTS=1
+      shift
+      ;;
     -h|--help|help)
       usage
       exit 0
@@ -1750,7 +1759,11 @@ if [[ -f "$TARGET_ROOT/agent-roster.local.sh" ]]; then
 fi
 
 if [[ $MIGRATE_AGENTS -eq 1 ]]; then
-  MIGRATION_PREVIEW_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" migrate-agents --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT" --admin-agent "$ADMIN_AGENT_ID" --dry-run)"
+  migrate_preview_args=(migrate-agents --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT" --admin-agent "$ADMIN_AGENT_ID" --dry-run)
+  if [[ $MIGRATE_ALL_AGENTS -eq 1 ]]; then
+    migrate_preview_args+=(--migrate-all-agents)
+  fi
+  MIGRATION_PREVIEW_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${migrate_preview_args[@]}")"
 fi
 
 if [[ $BACKUP -eq 1 ]]; then
@@ -2275,7 +2288,11 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   if [[ $DRY_RUN -eq 1 ]]; then
     MIGRATION_JSON="$MIGRATION_PREVIEW_JSON"
   else
-    MIGRATION_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" migrate-agents --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT" --admin-agent "$ADMIN_AGENT_ID")"
+    migrate_apply_args=(migrate-agents --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT" --admin-agent "$ADMIN_AGENT_ID")
+    if [[ $MIGRATE_ALL_AGENTS -eq 1 ]]; then
+      migrate_apply_args+=(--migrate-all-agents)
+    fi
+    MIGRATION_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${migrate_apply_args[@]}")"
   fi
   bridge_upgrade_with_target_env "$TARGET_ROOT" "$BRIDGE_BASH_BIN" -lc '
     set -euo pipefail

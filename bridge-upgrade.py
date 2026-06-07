@@ -421,6 +421,121 @@ def discover_agent_dirs(agent_root: Path) -> list[Path]:
     return results
 
 
+# Issue #1611: roster-restrict the migrate-agents loop. Hosts accumulate
+# orphan / test-agent homes under `agents/` (one live host had ~97), and
+# the pre-#1611 loop migrated every one of them — the write-surface noise
+# that pushed operators to `--no-migrate-agents` and defeated the intent
+# that an upgrade keeps active agents' canon/skills current.
+#
+# `BRIDGE_AGENT_*[...]=` map-key assignment in the roster shell files —
+# the most robust roster-membership signal, since `agent create` writes a
+# full per-agent record block keyed by id.
+_ROSTER_MAP_KEY_RE = re.compile(
+    r"""^\s*BRIDGE_[A-Z0-9_]+\[\s*(['"]?)([^'"\]\s]+)\1\s*\]""",
+    re.M,
+)
+# `bridge_add_agent_id_if_missing <id>` (quoted or bare) — the helper the
+# scaffolder emits alongside each per-agent record block.
+_ROSTER_ADD_ID_RE = re.compile(
+    r"""^\s*bridge_add_agent_id_if_missing\s+(['"]?)([^'"\s)]+)\1""",
+    re.M,
+)
+# `BRIDGE_AGENT_IDS=( a b c )` / `BRIDGE_AGENT_IDS+=( ... )` literal arrays.
+_ROSTER_IDS_ARRAY_RE = re.compile(
+    r"""BRIDGE_AGENT_IDS\+?=\(([^)]*)\)""",
+    re.S,
+)
+_ROSTER_ARRAY_TOKEN_RE = re.compile(r"""(['"])(.*?)\1|([^\s'"]+)""")
+
+
+def _parse_roster_shell_ids(text: str) -> set[str]:
+    """Best-effort extraction of agent ids from a roster shell file.
+
+    Static parse only — never sources the file. Three independent patterns
+    are unioned so a malformed clause in one shape does not lose ids that
+    another shape captured.
+    """
+    ids: set[str] = set()
+    for match in _ROSTER_MAP_KEY_RE.finditer(text):
+        ids.add(match.group(2))
+    for match in _ROSTER_ADD_ID_RE.finditer(text):
+        ids.add(match.group(2))
+    for array_match in _ROSTER_IDS_ARRAY_RE.finditer(text):
+        for token in _ROSTER_ARRAY_TOKEN_RE.finditer(array_match.group(1)):
+            value = token.group(2) if token.group(2) is not None else token.group(3)
+            if value:
+                ids.add(value)
+    # Drop obvious non-ids: shell expansions and empty strings.
+    return {i for i in ids if i and "$" not in i and "{" not in i}
+
+
+def _parse_roster_tsv_ids(path: Path) -> set[str]:
+    """First column of a state roster TSV, header row skipped."""
+    ids: set[str] = set()
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ids
+    for idx, line in enumerate(text.splitlines()):
+        if idx == 0 and line.startswith("agent\t"):
+            continue
+        first = line.split("\t", 1)[0].strip()
+        if first:
+            ids.add(first)
+    return ids
+
+
+def collect_roster_ids(target_root: Path, admin_agent: str) -> tuple[set[str], list[str]]:
+    """Build the set of roster agent ids for the migrate-agents filter.
+
+    Returns (roster_ids, sources_found). `sources_found` lists the roster
+    artifacts that contributed at least one id; an empty list means the
+    caller must fall back to migrating ALL dirs (#1611 safe fallback —
+    missing a real agent is worse than migrating an orphan).
+
+    `admin_agent` is always folded in when non-empty even if no source
+    surfaced it, so the install's admin is never treated as an orphan.
+    """
+    roster_ids: set[str] = set()
+    sources_found: list[str] = []
+
+    # state/agents-aggregate.tsv lists ALL registered agents (active AND
+    # stopped) — the strongest single source, since active-roster.tsv only
+    # carries currently-running sessions and would skip a real-but-stopped
+    # roster agent.
+    aggregate_tsv = target_root / "state" / "agents-aggregate.tsv"
+    aggregate_ids = _parse_roster_tsv_ids(aggregate_tsv)
+    if aggregate_ids:
+        roster_ids |= aggregate_ids
+        sources_found.append("state/agents-aggregate.tsv")
+
+    active_tsv = target_root / "state" / "active-roster.tsv"
+    active_ids = _parse_roster_tsv_ids(active_tsv)
+    if active_ids:
+        roster_ids |= active_ids
+        sources_found.append("state/active-roster.tsv")
+
+    for rel in ("agent-roster.sh", "agent-roster.local.sh"):
+        roster_path = target_root / rel
+        try:
+            text = roster_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            # Missing or unreadable roster file → skip. The read's
+            # FileNotFoundError/OSError IS the existence check; no raw
+            # pathlib .exists() probe (keeps the #1175 audit ceiling).
+            continue
+        shell_ids = _parse_roster_shell_ids(text)
+        if shell_ids:
+            roster_ids |= shell_ids
+            sources_found.append(rel)
+
+    admin_agent = (admin_agent or "").strip()
+    if admin_agent:
+        roster_ids.add(admin_agent)
+
+    return roster_ids, sources_found
+
+
 def detect_display_name(agent_dir: Path) -> str:
     claude_path = agent_dir / "CLAUDE.md"
     if claude_path.exists():
@@ -780,7 +895,30 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
     admin_agent = (args.admin_agent or "").strip()
     results: list[AgentMigrationResult] = []
     skipped_isolated: list[dict[str, str]] = []
+
+    # Issue #1611: roster-restrict the loop unless the operator opts into
+    # migrate-all (`--migrate-all-agents`) or no roster source is parseable
+    # (the safe fallback — never skip when the roster is unknown).
+    migrate_all = bool(getattr(args, "migrate_all_agents", False))
+    roster_ids, roster_sources = collect_roster_ids(target_root, admin_agent)
+    if migrate_all:
+        roster_filtering = "disabled"
+    elif not roster_sources or not roster_ids:
+        roster_filtering = "unavailable"
+    else:
+        roster_filtering = "active"
+    if roster_filtering == "unavailable":
+        print(
+            "[bridge-upgrade] migrate-agents: roster filtering unavailable "
+            "(no parseable roster source) — migrating all agent dirs",
+            file=sys.stderr,
+        )
+
+    skipped_orphans: list[str] = []
     for path in discover_agent_dirs(agent_root):
+        if roster_filtering == "active" and path.name not in roster_ids:
+            skipped_orphans.append(path.name)
+            continue
         try:
             result = migrate_agent_home(path, template_root, admin_agent, args.dry_run)
             result.rematerialize = rematerialize_agent_identity(source_root, target_root, result, args.dry_run)
@@ -803,11 +941,23 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
         remat = item.rematerialize or {}
         return bool(item.added_files or item.created_dirs or item.updated_files or remat.get("updated_paths"))
 
+    if skipped_orphans:
+        print(
+            "[bridge-upgrade] migrate-agents: skipped "
+            f"{len(skipped_orphans)} non-roster dir(s): "
+            f"{', '.join(sorted(skipped_orphans))}",
+            file=sys.stderr,
+        )
+
     payload = {
         "agent_count": len(results) + len(skipped_isolated),
         "migrated_count": len(results),
         "skipped_isolated_count": len(skipped_isolated),
         "skipped_isolated": skipped_isolated,
+        "skipped_orphans_count": len(skipped_orphans),
+        "skipped_orphans": sorted(skipped_orphans),
+        "roster_filtering": roster_filtering,
+        "roster_sources": roster_sources,
         "agents_with_additions": sum(1 for item in results if result_has_changes(item)),
         "added_files": sum(len(item.added_files) for item in results),
         "created_dirs": sum(len(item.created_dirs) for item in results),
@@ -3308,6 +3458,10 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--target-root", required=True)
     migrate.add_argument("--admin-agent", default="")
     migrate.add_argument("--dry-run", action="store_true")
+    # Issue #1611: escape hatch to force-include orphan / non-roster dirs.
+    # Default is roster-restricted; this opt-in restores the pre-#1611
+    # "migrate every dir under agents/" behavior for operators who want it.
+    migrate.add_argument("--migrate-all-agents", action="store_true")
     migrate.set_defaults(handler=cmd_migrate_agents)
 
     # Issue #4769 (reverts #517): the inject subcommand for the admin

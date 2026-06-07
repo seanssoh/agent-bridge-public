@@ -317,6 +317,22 @@ target identity가 다른 agent 소유이면 `shared_workspace`로 skip한다. i
 항상 `bridge_isolation_write_file_as_agent_user_via_bash` + per-file `0660` normalize를
 통한다.
 
+**migrate-agents는 default-on이고 roster-restricted다 (#1611).** `agb upgrade`의 권장
+경로는 migrate-agents를 켜 두는 것이다(`--no-migrate-agents`가 아니다). 예전에는
+`cmd_migrate_agents`가 `agents/` 아래 **모든** 디렉터리를 roster 인식 없이 migrate해서,
+orphan/test-agent home이 쌓인 host(한 live host는 ~97개)에서 노이즈가 심했고 — 그게
+운영자가 `--no-migrate-agents`로 도망친 이유였다. 이제 `collect_roster_ids`가
+`state/agents-aggregate.tsv`(active+stopped 전체) → `state/active-roster.tsv` →
+`agent-roster.sh` / `agent-roster.local.sh`(static parse, source 안 함) → 항상 포함되는
+`--admin-agent`로 roster id set을 만들고, set에 없는 dir은 orphan으로 skip한다
+(`skipped_orphans` + `skipped_orphans_count` + `[bridge-upgrade] migrate-agents: skipped N …`
+stderr line). **Safe fallback이 핵심이다**: parseable한 roster source가 하나도 없거나
+계산된 set이 비면 `roster_filtering=unavailable`로 떨어지고 **모든 dir을 migrate**한다 —
+진짜 agent를 놓치는 게 orphan 하나 더 migrate하는 것보다 나쁘기 때문이다.
+`--migrate-all-agents`는 orphan까지 강제 포함하는 opt-in escape hatch다. default-on이 active
+세션에 안전한 이유: #1598 re-materialize가 workdir identity copy를 즉시 갱신하고, active
+세션은 다음 auto-compact에서 `CLAUDE.md`를 다시 읽으며 self-heal한다 — 강제 재시작 없음.
+
 **Settings single-tree invariant (#1455).** effective settings 파일은 에이전트당
 **정확히 한 곳**(`home/.claude/settings.effective.json`)에만 실재해야 하고, 나머지
 (특히 `workdir/.claude/settings.json`)는 그 파일을 가리키는 **상대 symlink**여야 한다 —

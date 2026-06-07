@@ -51,12 +51,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# migrate-agents emits the JSON payload on STDOUT and informational/diagnostic
+# lines (e.g. the #1611 `[bridge-upgrade] migrate-agents: skipped ...` /
+# roster-filtering-unavailable notices) on STDERR. The real upgrade flow
+# (bridge-upgrade.sh:1753 / :2278) captures stdout only, so this smoke must do
+# the same — folding stderr into the captured stream with `2>&1` would feed a
+# `[`-prefixed line into json.loads and break parsing (it would be read as a
+# JSON array). We route stderr to a temp file so the JSON capture stays clean
+# while the diagnostics are still surfaced in each failure branch.
+MIGRATE_STDERR="$TMPHOME/migrate-stderr.log"
+
 run_migrate() {
   local target_root="$1"
+  : >"$MIGRATE_STDERR"
   python3 "$REPO_ROOT/bridge-upgrade.py" migrate-agents \
     --source-root "$REPO_ROOT" \
     --target-root "$target_root" \
-    --dry-run
+    --dry-run 2>"$MIGRATE_STDERR"
 }
 
 json_field() {
@@ -78,9 +89,10 @@ mkdir -p "$T1_HOME/agents/normal-agent/.claude"
 echo "stub" > "$T1_HOME/agents/normal-agent/CLAUDE.md"
 echo "stub" > "$T1_HOME/agents/normal-agent/MEMORY.md"
 
-T1_OUT="$(run_migrate "$T1_HOME" 2>&1)" || {
+T1_OUT="$(run_migrate "$T1_HOME")" || {
   echo "[smoke:upgrade-isolated-agent-migrate] T1 FAIL: rc!=0"
   echo "$T1_OUT"
+  echo "--- stderr ---"; cat "$MIGRATE_STDERR"
   exit 1
 }
 
@@ -104,10 +116,11 @@ mkdir -p "$T2_HOME/agents/locked-agent/.claude"
 echo "stub" > "$T2_HOME/agents/locked-agent/CLAUDE.md"
 chmod 0000 "$T2_HOME/agents/locked-agent"
 
-T2_OUT="$(run_migrate "$T2_HOME" 2>&1)" || {
+T2_OUT="$(run_migrate "$T2_HOME")" || {
   chmod 0700 "$T2_HOME/agents/locked-agent"
   echo "[smoke:upgrade-isolated-agent-migrate] T2 FAIL: rc!=0 (PermissionError not caught)"
   echo "$T2_OUT"
+  echo "--- stderr ---"; cat "$MIGRATE_STDERR"
   exit 1
 }
 chmod 0700 "$T2_HOME/agents/locked-agent"
@@ -135,10 +148,11 @@ mkdir -p "$T3_HOME/agents/locked-agent/.claude"
 echo "stub" > "$T3_HOME/agents/locked-agent/CLAUDE.md"
 chmod 0000 "$T3_HOME/agents/locked-agent"
 
-T3_OUT="$(run_migrate "$T3_HOME" 2>&1)" || {
+T3_OUT="$(run_migrate "$T3_HOME")" || {
   chmod 0700 "$T3_HOME/agents/locked-agent"
   echo "[smoke:upgrade-isolated-agent-migrate] T3 FAIL: rc!=0"
   echo "$T3_OUT"
+  echo "--- stderr ---"; cat "$MIGRATE_STDERR"
   exit 1
 }
 chmod 0700 "$T3_HOME/agents/locked-agent"
