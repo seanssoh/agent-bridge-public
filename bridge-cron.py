@@ -1934,6 +1934,12 @@ def run_native_create(args):
     if payload_kind == "text":
         text_payload: dict = {"kind": "text", "text": payload_text}
         if args.timeout is not None:
+            # #1625 r2 (codex BLOCKING): the text path must reject non-positive
+            # timeouts too, mirroring the shell path's `--timeout must be a
+            # positive integer` guard — otherwise `native-create --timeout 0`
+            # persists timeoutSeconds=0 and the runner fails/behaves oddly.
+            if int(args.timeout) <= 0:
+                raise ValueError("--timeout must be a positive integer")
             text_payload["timeoutSeconds"] = int(args.timeout)
         payload = text_payload
     base_slug = slugify_title(title)
@@ -2043,6 +2049,12 @@ def run_native_update(args):
         if text_fields_present:
             payload_text = read_payload_argument(args.payload, args.payload_file)
         text_timeout = args.timeout if args.timeout is not None else existing_payload.get("timeoutSeconds")
+        # #1625 r2 (codex BLOCKING): validate the user-supplied --timeout on the
+        # text update path (a positive-integer guard mirroring the shell path);
+        # inherited existing values are left as-is so editing a legacy job that
+        # predates this guard is not blocked.
+        if args.timeout is not None and int(args.timeout) <= 0:
+            raise ValueError("--timeout must be a positive integer")
         text_payload_: dict = {"kind": "text", "text": payload_text}
         if text_timeout is not None:
             text_payload_["timeoutSeconds"] = int(text_timeout)
