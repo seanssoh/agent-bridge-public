@@ -930,6 +930,19 @@ if bridge_start_should_controller_accept_dev_channels "$AGENT" "$SUPPRESS_MISSIN
   CONTROLLER_DEV_CHANNELS_ACCEPT=1
   SESSION_CMD="BRIDGE_CONTROLLER_DEV_CHANNELS_ACCEPT=1 ${SESSION_CMD}"
 fi
+# Issue #1639: signal the launched bridge-run.sh loop whether this start is an
+# AUTO-restart (daemon / upgrade / watchdog / `bridge-agent.sh restart` without
+# --attach) versus an operator-driven interactive launch/attach. ATTACH defaults
+# to 0 and only flips to 1 when the operator passes --attach (interactive
+# `agent-bridge start`/`agent restart --attach`); every daemon/upgrade restart
+# path invokes bridge-start.sh without --attach, so ATTACH==0 is the clean
+# auto-restart discriminator. bridge-run.sh uses BRIDGE_AUTO_RESTART_WAKE to
+# inject a one-time first-turn wake into the new Claude session so queued/blocked
+# work does not stall on a session that opened idle. NOT set on an interactive
+# launch — the operator is already there to type the first message.
+if [[ $ATTACH -eq 0 ]]; then
+  SESSION_CMD="BRIDGE_AUTO_RESTART_WAKE=1 ${SESSION_CMD}"
+fi
 
 SUDO_WRAP_ACTIVE=0
 SUDO_WRAP_OS_USER=""
