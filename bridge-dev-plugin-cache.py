@@ -412,6 +412,88 @@ def remove_tree(path: Path) -> None:
 
 NODE_MODULES_NAME = "node_modules"
 MCP_CONFIG_NAME = ".mcp.json"
+
+# Issue #1663 — upgrade/VCS sidecars that must NEVER be copied into a
+# plugin cache. `bridge-upgrade.py`'s `conflict_backup_path` writes
+# `<file>.upgrade-conflict` preserving the original file's mode/owner; on
+# an iso-v2 host a 0600 owner-only `server.ts.upgrade-conflict` left
+# inside a plugin source dir is unreadable by the isolated UID. The old
+# overlay used an exact-name skip set only, so it tried to `copy2` the
+# sidecar → PermissionError → the entire plugin cache build aborted →
+# every iso agent on that plugin cascade-failed to launch. These are not
+# plugin content, so skipping them is correct and non-fatal (skip+WARN).
+#
+# Deliberately NARROW: we do NOT skip `*.bak`, `*.tmp`, or arbitrary
+# dotfiles — those can be legitimate plugin content. Only known
+# upgrade/merge/VCS sidecars are pattern-skipped.
+_SIDECAR_SKIP_SUFFIXES = (
+    ".upgrade-conflict",
+    ".orig",
+    ".rej",
+)
+# git/hg merge-tool sidecars carry the marker as an INFIX, e.g.
+# `server.ts.BACKUP.12345`, `config.json.LOCAL.678`.
+_SIDECAR_MERGE_INFIXES = (
+    ".BACKUP.",
+    ".BASE.",
+    ".LOCAL.",
+    ".REMOTE.",
+)
+# Exact VCS metadata names if they somehow appear under a plugin source.
+_VCS_METADATA_NAMES = frozenset({".git", ".hg", ".svn"})
+
+# Issue #1663 — required plugin contract material. Silently shipping a
+# plugin cache that is missing one of these is worse than failing: the
+# plugin would load broken. So if one of these is unreadable / fails to
+# copy, we must fail-loud (install-failed) instead of skip+WARN. Matched
+# by basename, so `.claude-plugin/plugin.json` is covered by `plugin.json`.
+_REQUIRED_CONTRACT_NAMES = frozenset(
+    {
+        "plugin.json",
+        "package.json",
+        "server.ts",
+        "server.js",
+        "mcp.json",
+        MCP_CONFIG_NAME,  # ".mcp.json"
+    }
+)
+
+
+class RequiredContractUnreadable(OSError):
+    """Raised when a REQUIRED plugin-contract entry cannot be copied.
+
+    Issue #1663 — the per-entry overlay guard skips+WARNs an *unknown*
+    unreadable entry so one bad sidecar can never cascade-fail the whole
+    cache build. But a required-contract file (plugin.json, package.json,
+    server.ts/js, mcp.json/.mcp.json) silently missing from the cache is
+    worse than failing. This subclasses OSError so it still flows into
+    `sync_plugin_cache`'s existing `except OSError` → `install-failed`
+    branch (fail-loud), while the per-entry guard re-raises it instead of
+    swallowing it.
+    """
+
+
+def _sidecar_skip_reason(name: str) -> str | None:
+    """Return a human reason if ``name`` is a known upgrade/VCS sidecar.
+
+    Returns None when the entry is legitimate plugin content. Issue #1663.
+    """
+    if name in _VCS_METADATA_NAMES:
+        return f"vcs-metadata:{name}"
+    for suffix in _SIDECAR_SKIP_SUFFIXES:
+        if name.endswith(suffix):
+            return f"upgrade-sidecar:{name}"
+    for infix in _SIDECAR_MERGE_INFIXES:
+        if infix in name:
+            return f"merge-sidecar:{name}"
+    return None
+
+
+def _is_required_contract_name(name: str) -> bool:
+    """True when ``name`` is required plugin-contract material. Issue #1663."""
+    return name in _REQUIRED_CONTRACT_NAMES
+
+
 SENSITIVE_KEY_PARTS = (
     "authorization",
     "api_key",
@@ -555,11 +637,96 @@ def _is_symlink_outside_source_root(entry: Path, source_root: Path) -> bool:
             return True
 
 
+def _overlay_entry(
+    entry: Path,
+    target: Path,
+    source_root: Path,
+    skip_names: set[str],
+    agent: str = "",
+) -> bool:
+    """Overlay a single source entry into the cache. Returns True if written.
+
+    Shared by both `_overlay_dir()` (recursive) and
+    `overlay_source_to_cache()` (top level) so the skip/guard policy is
+    applied uniformly at every depth (Issue #1663 — the bug was that
+    only the top level pattern-skipped, while the recursion did not, or
+    vice versa; centralizing removes that drift).
+
+    Policy, in order:
+      1. Exact-name `skip_names` (node_modules etc.) → silent skip.
+      2. Known upgrade/VCS/merge sidecar (`*.upgrade-conflict`, `*.orig`,
+         `*.rej`, `*.BACKUP.*`/`*.BASE.*`/`*.LOCAL.*`/`*.REMOTE.*`, `.git`/
+         `.hg`/`.svn`) → skip + WARN, NON-FATAL. These are explicitly not
+         plugin content, so they must not abort the build or mark the
+         cache incomplete.
+      3. Symlink resolving outside the marketplace source root → skip +
+         WARN (pre-existing v1-isolation-leftover guard).
+      4. Directory → recurse (is_dir() FIRST so symlinks-to-directory are
+         materialized as a real copy — r4 codex catch).
+      5. File / symlink → copy.
+
+    Defense-in-depth (Issue #1663): steps 3-5 run under a per-entry guard
+    so a single unreadable entry (e.g. a 0600 owner-only file an iso UID
+    cannot read) is skipped + WARN'd instead of aborting the WHOLE cache
+    build (which cascade-failed every iso agent on the plugin). EXCEPT: an
+    unreadable / failed REQUIRED-CONTRACT entry (plugin.json, package.json,
+    server.ts/js, mcp.json/.mcp.json) is promoted to a fail-loud
+    `RequiredContractUnreadable` (→ install-failed) — silently shipping a
+    cache missing its contract file is worse than failing.
+    """
+    name = entry.name
+    if name in skip_names:
+        return False
+
+    sidecar_reason = _sidecar_skip_reason(name)
+    if sidecar_reason is not None:
+        sys.stderr.write(
+            f"[bridge-dev-plugin-cache] WARNING: skipping non-plugin sidecar "
+            f"{entry} ({sidecar_reason}; not copied into cache) "
+            f"agent={agent or '-'}\n"
+        )
+        return False
+
+    try:
+        if _is_symlink_outside_source_root(entry, source_root):
+            sys.stderr.write(
+                f"[bridge-dev-plugin-cache] WARNING: skipping symlink {entry} -> "
+                f"{entry.resolve()} (outside source root {source_root}; "
+                f"likely v1-isolation leftover, run cleanup helper)\n"
+            )
+            return False
+        if entry.is_dir():  # includes symlinks-to-directory (resolved-stat)
+            return _overlay_dir(entry, target, source_root, skip_names=skip_names, agent=agent)
+        if entry.is_file() or entry.is_symlink():
+            return _copy_file_if_changed(entry, target)
+        return False
+    except RequiredContractUnreadable:
+        # Already classified as fail-loud deeper in the recursion — let it
+        # propagate up to sync_plugin_cache's `except OSError` (install-failed).
+        raise
+    except OSError as exc:
+        # A required-contract file we cannot read/copy is fail-loud:
+        # silently shipping a cache without it is worse than failing.
+        if _is_required_contract_name(name):
+            raise RequiredContractUnreadable(
+                f"required-contract-unreadable:{entry}:{exc}"
+            ) from exc
+        # Unknown unreadable entry — skip + WARN, never abort the build.
+        # This is what stops one 0600 sidecar (or any unreadable file)
+        # from cascade-failing every iso agent on the plugin (#1663).
+        sys.stderr.write(
+            f"[bridge-dev-plugin-cache] WARNING: skipping unreadable entry "
+            f"{entry} ({exc}; omitted from cache) agent={agent or '-'}\n"
+        )
+        return False
+
+
 def _overlay_dir(
     src: Path,
     dst: Path,
     source_root: Path,
     skip_names: set[str] | None = None,
+    agent: str = "",
 ) -> bool:
     """Recursively overlay src onto dst. Returns True if anything was written.
 
@@ -577,6 +744,11 @@ def _overlay_dir(
     symlinks-to-outside-source BEFORE the is_dir() recursion, otherwise
     iterdir() would walk into a controller path the isolated UID
     cannot read.
+
+    Issue #1663 — per-entry skip/guard policy (sidecar pattern-skip +
+    unreadable-entry tolerance + required-contract fail-loud) lives in
+    `_overlay_entry()` so it applies at EVERY recursion depth, not just
+    the top level.
     """
     changed = False
     if dst.exists() and not dst.is_dir():
@@ -584,22 +756,9 @@ def _overlay_dir(
     dst.mkdir(parents=True, exist_ok=True)
     skip_names = skip_names or set()
     for entry in src.iterdir():
-        if entry.name in skip_names:
-            continue
         target = dst / entry.name
-        if _is_symlink_outside_source_root(entry, source_root):
-            sys.stderr.write(
-                f"[bridge-dev-plugin-cache] WARNING: skipping symlink {entry} -> "
-                f"{entry.resolve()} (outside source root {source_root}; "
-                f"likely v1-isolation leftover, run cleanup helper)\n"
-            )
-            continue
-        if entry.is_dir():  # includes symlinks-to-directory (resolved-stat)
-            if _overlay_dir(entry, target, source_root, skip_names=skip_names):
-                changed = True
-        elif entry.is_file() or entry.is_symlink():
-            if _copy_file_if_changed(entry, target):
-                changed = True
+        if _overlay_entry(entry, target, source_root, skip_names, agent=agent):
+            changed = True
     return changed
 
 
@@ -608,6 +767,7 @@ def overlay_source_to_cache(
     cache_version_path: Path,
     source_root: Path | None = None,
     skip_names: set[str] | None = None,
+    agent: str = "",
 ) -> bool:
     """Mirror source into cache.
 
@@ -642,6 +802,11 @@ def overlay_source_to_cache(
 
     Back-compat: when ``source_root`` is omitted (legacy callers),
     fall back to ``source_path`` as before.
+
+    Issue #1663 — per-entry skip/guard policy (upgrade/VCS sidecar
+    pattern-skip + unreadable-entry tolerance + required-contract
+    fail-loud) is centralized in `_overlay_entry()`, applied identically
+    here and inside the recursive `_overlay_dir()`.
     """
     if source_root is None:
         source_root = source_path.resolve()
@@ -650,25 +815,9 @@ def overlay_source_to_cache(
     changed = False
     skip_names = skip_names or set()
     for entry in source_path.iterdir():
-        if entry.name in skip_names:
-            continue
         target = cache_version_path / entry.name
-        if _is_symlink_outside_source_root(entry, source_root):
-            sys.stderr.write(
-                f"[bridge-dev-plugin-cache] WARNING: skipping symlink {entry} -> "
-                f"{entry.resolve()} (outside source root {source_root}; "
-                f"likely v1-isolation leftover, run cleanup helper)\n"
-            )
-            continue
-        # r4 codex catch — is_dir() FIRST so symlinks-to-directory are
-        # materialized into the cache as a real directory copy. Old
-        # ordering matched is_symlink first → shutil.copy2 → corrupt cache.
-        if entry.is_dir():
-            if _overlay_dir(entry, target, source_root, skip_names=skip_names):
-                changed = True
-        elif entry.is_file() or entry.is_symlink():
-            if _copy_file_if_changed(entry, target):
-                changed = True
+        if _overlay_entry(entry, target, source_root, skip_names, agent=agent):
+            changed = True
     return changed
 
 
@@ -795,7 +944,7 @@ def _verify_cache_version_path(
     return True, ""
 
 
-def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
+def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, str]:
     marketplace_name, plugins = load_marketplace(root)
 
     if not channel.startswith("plugin:") or "@" not in channel:
@@ -894,7 +1043,9 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
                 plugin_cache_root.parent.chmod(0o700)
             cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
             cache_version_path.chmod(0o700)  # explicit, defensive against umask
-            overlay_source_to_cache(source_path, cache_version_path, source_root=root)
+            overlay_source_to_cache(
+                source_path, cache_version_path, source_root=root, agent=agent
+            )
             status = "updated"
             cache_type = "directory"
         elif cache_version_path.is_dir():
@@ -911,6 +1062,7 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
                 cache_version_path,
                 source_root=root,
                 skip_names=skip_names,
+                agent=agent,
             )
             status = "updated" if changed else "unchanged"
             cache_type = "directory"
@@ -927,7 +1079,9 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
                 plugin_cache_root.parent.chmod(0o700)
             cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
             cache_version_path.chmod(0o700)  # explicit, defensive against umask
-            overlay_source_to_cache(source_path, cache_version_path, source_root=root)
+            overlay_source_to_cache(
+                source_path, cache_version_path, source_root=root, agent=agent
+            )
             status = "updated"
             cache_type = "directory"
         else:
@@ -942,9 +1096,31 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
                 plugin_cache_root.parent.chmod(0o700)
             cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
             cache_version_path.chmod(0o700)  # explicit, defensive against umask
-            overlay_source_to_cache(source_path, cache_version_path, source_root=root)
+            overlay_source_to_cache(
+                source_path, cache_version_path, source_root=root, agent=agent
+            )
             status = "linked"
             cache_type = "directory"
+    except RequiredContractUnreadable as exc:
+        # Issue #1663 — a REQUIRED plugin-contract entry (plugin.json,
+        # package.json, server.ts/js, mcp.json/.mcp.json) could not be
+        # copied into the cache. Silently shipping a cache missing its
+        # contract file is worse than failing, so fail loud here. Unknown
+        # sidecars/unreadable entries do NOT reach this branch — they are
+        # skipped + WARN'd inside `_overlay_entry()`.
+        return {
+            "channel": channel,
+            "plugin": plugin_name,
+            "marketplace": marketplace_name,
+            "version": version,
+            "source": str(source_path),
+            "cache": str(cache_version_path),
+            "cache_type": cache_type,
+            "status": "install-failed",
+            # exc message already carries the `required-contract-unreadable:`
+            # tag (set at the raise site in `_overlay_entry`).
+            "reason": str(exc),
+        }
     except OSError as exc:
         # Filesystem refused the install action — fail loud, do not
         # fall through to a verified label. RC6 root cause was the
@@ -1332,7 +1508,7 @@ def main(argv: list[str] | None = None) -> int:
     agent_label = args.agent or "-"
 
     results = [
-        sync_plugin_cache(resolve_marketplace_root(root, item), item)
+        sync_plugin_cache(resolve_marketplace_root(root, item), item, agent=args.agent)
         for item in normalize_channels(args.channels)
     ]
 
