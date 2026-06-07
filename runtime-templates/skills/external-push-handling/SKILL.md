@@ -31,7 +31,12 @@ But **only `event` is guaranteed**. Every other field is optional and depends on
 - queue inbox wake (`bridge-notify.sh::bridge_queue_attention_message`):
   `event=inbox agent=<a> count=<n> top=<id> priority=<p> title='<t>'` — no `from`.
 - inbox bootstrap on agent restart (`bridge-run.sh::bridge_run_schedule_idle_marker_and_inbox_bootstrap`):
-  `event=inbox-bootstrap agent=<a> top=<id>` — no `count`/`priority`/`title`/`from`.
+  `event=inbox-bootstrap agent=<a> top=<id>` — no `count`/`priority`/`title`/`from`. Also emitted as the
+  first-turn wake after a daemon/upgrade auto-restart when queued/blocked work is waiting (#1639).
+- session resumed after an automatic restart (same emitter, #1639), only when the queue is empty on a
+  first-ever auto-restart launch: `event=session-resumed agent=<a> reason=auto-restart` — no task fields.
+  Treat as "re-read your session onboarding (SOUL.md / CLAUDE.md / NEXT-SESSION.md) and check your inbox",
+  not as a task to delegate.
 
 Match on the `[Agent Bridge] event=` prefix and treat absent fields as not-applicable, not as malformed. New fields and new event kinds may appear over time.
 
@@ -39,7 +44,7 @@ Value encoding: bare token for `^[A-Za-z0-9._/@:-]+$`, otherwise single-quoted w
 
 Fields you will see in practice:
 
-- `event` (always) — `inbox`, `inbox-bootstrap`, `pending-attention`, `watchdog`, `cron-followup`, `urgent`, etc. Do not hardcode; treat as opaque but route on it.
+- `event` (always) — `inbox`, `inbox-bootstrap`, `session-resumed`, `pending-attention`, `watchdog`, `cron-followup`, `urgent`, etc. Do not hardcode; treat as opaque but route on it.
 - `agent` — which agent the event targets. Usually you, but a router may forward.
 - `count` — how many items are waiting (>=1). Absent on bootstrap-style pushes.
 - `top` — the single task id the daemon is surfacing first. Process this one first, not an arbitrary item.
@@ -54,6 +59,14 @@ The injection is intentionally metadata-only: no execution verbs, no file paths,
 ### Step 1 — Parse metadata
 
 Read `event` (always present) and whichever of `agent`/`count`/`top`/`priority`/`title`/`from` are on the injected line. Absent fields just mean the emitter didn't have a value — they are not a parse failure. Extract them with simple string matching; do not infer from surrounding prose. If `event` itself is missing or the bracket header is malformed, stop and ask the operator — do not guess.
+
+### Step 1.5 — Branch on task-less events (do this before Step 2)
+
+Some events carry **no `top` task id** and must NOT enter the `agb show <top>` / delegate routine below — there is nothing to show or delegate. Handle them inline and stop:
+
+- `event=session-resumed` (the agent was just auto-restarted by the daemon/upgrade with an empty queue): re-read your session onboarding (`SOUL.md`, `CLAUDE.md`, and `NEXT-SESSION.md` if present), then check your inbox once (`~/.agent-bridge/agb inbox <agent>`). If the inbox is genuinely empty, you are done — do not run `agb show` on an empty id, and do not dispatch a subagent.
+
+Only proceed to Step 2 when the event actually names a task (`top=<id>`, e.g. `inbox`, `inbox-bootstrap`, `urgent`).
 
 ### Step 2 — Read the spec
 

@@ -1011,10 +1011,33 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
   local next_file="$WORK_DIR/NEXT-SESSION.md"
   local marker_file=""
   local previous_session_id="${1:-}"
+  local auto_restart_wake=0
 
   [[ "$ENGINE" == "claude" ]] || return 0
   [[ $SAFE_MODE -eq 0 ]] || return 0
   marker_file="$(bridge_agent_initial_inbox_marker_file "$AGENT")"
+
+  # Issue #1639: a daemon/upgrade/watchdog auto-restart spawns a fresh Claude
+  # session that opens FULLY IDLE — the SessionStart hook runs as a shell
+  # process but its result only surfaces as a system-reminder on the NEXT user
+  # message, so with no user turn the first turn never starts and queued/blocked
+  # work stalls until a human types. bridge-start.sh propagates
+  # BRIDGE_AUTO_RESTART_WAKE=1 ONLY on a non-interactive (auto-restart) launch
+  # (ATTACH=0 — daemon, upgrade, `bridge-agent.sh restart` without --attach); an
+  # operator-driven interactive `agent-bridge start`/attach (ATTACH=1) never sets
+  # it, so this wake never fires under the operator's own eyes. We gate on
+  # RESTART_COUNT==0 so it fires at most ONCE per launched loop (a crash-restart
+  # iteration of the SAME loop has RESTART_COUNT>0 and is skipped), and we reuse
+  # the existing inbox-bootstrap inject + #1199 nudge record below so the daemon
+  # nudge tick treats the queued set as delivered and does NOT double-fire. The
+  # firing branch is widened to fire even when the once-per-loop-lifetime
+  # initial-inbox marker already exists (it persists on disk across restarts) —
+  # that marker would otherwise suppress every post-first-launch auto-wake, which
+  # is exactly the idle-session bug.
+  if [[ "${BRIDGE_AUTO_RESTART_WAKE:-0}" == "1" \
+        && "${BRIDGE_AGENT_LOOP_RESTART_COUNT:-0}" == "0" ]]; then
+    auto_restart_wake=1
+  fi
 
   (
     "$BRIDGE_BASH_BIN" -lc '
@@ -1025,6 +1048,7 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
       marker_file="$4"
       next_file="$5"
       previous_session_id="$6"
+      auto_restart_wake="$7"
       source "$script_dir/bridge-lib.sh"
       if bridge_tmux_wait_for_prompt "$session" claude 30; then
         # Issue #1248 Lane A3: drop the `>/dev/null 2>&1 || true` swallow
@@ -1045,30 +1069,106 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
           bridge_refresh_agent_session_id "$agent" 24 0.5 >/dev/null || true
         fi
         bridge_agent_mark_idle_now "$agent"
-        if [[ ! -f "$next_file" && ! -f "$marker_file" ]]; then
-          task_id="$(bridge_queue_cli find-open --agent "$agent" 2>/dev/null | head -n 1 || true)"
+        # Fire the first-turn inbox-bootstrap inject when EITHER:
+        #   - this is the first-ever launch of this agent (marker absent), the
+        #     long-standing behavior; OR
+        #   - this is an auto-restart (BRIDGE_AUTO_RESTART_WAKE=1 → $7==1) and the
+        #     marker already exists (#1639) — the new session would otherwise sit
+        #     idle because the persistent marker suppresses the bootstrap.
+        # A pending NEXT-SESSION.md handoff suppresses the inject in BOTH cases:
+        # the SessionStart hook + handoff resume drive that turn instead.
+        if [[ ! -f "$next_file" ]] \
+            && { [[ ! -f "$marker_file" ]] || [[ "$auto_restart_wake" == "1" ]]; }; then
+          # When there IS a genuinely-queued task, the surfaced top task AND the
+          # #1199 dedup key MUST come from the SAME queued/non-cron set so the
+          # agent is woken for exactly the tasks the nudge record marks as
+          # delivered. Use the daemon canonical emitter (bridge-daemon-helpers.py
+          # nudge-live-state with_top_task=1) in ONE bounded read: 4th TSV column
+          # = queued_top (highest-priority QUEUED non-cron task), 3rd column = the
+          # comma-join queued id CSV byte-identical to the daemon nudge_key
+          # (status=queued, title NOT LIKE [cron-dispatch]%, ORDER BY id). Issue
+          # #1639 codex r2 [P2]: a prior find-open --agent probe surfaced the
+          # highest-PRIORITY task over queued|claimed|blocked, so it could name a
+          # claimed/blocked/cron row as top while the dedup key recorded the
+          # queued ids — the daemon then suppressed the genuinely-queued nudge the
+          # agent was never shown. Sourcing both from nudge-live-state keeps them
+          # consistent. Same 15s ceiling the daemon/flush paths use.
+          queued_top=""
+          queue_key=""
+          if command -v bridge_with_timeout >/dev/null 2>&1; then
+            nudge_state="$(bridge_with_timeout 15 inbox_bootstrap_nudge_key \
+              python3 "$script_dir/bridge-daemon-helpers.py" \
+              nudge-live-state "${BRIDGE_TASK_DB:-}" "$agent" 1 2>/dev/null)" || nudge_state=""
+            if [[ -n "$nudge_state" ]]; then
+              queue_key="$(printf "%s" "$nudge_state" | cut -f3)"
+              queued_top="$(printf "%s" "$nudge_state" | cut -f4)"
+            fi
+          fi
+          task_id=""
+          if [[ -n "$queued_top" ]]; then
+            # Genuinely-queued work: surface the queued top + record the queued
+            # dedup key so the daemon does not double-fire the same set.
+            task_id="$queued_top"
+          else
+            # No queued task, OR the bounded read was unavailable/failed. Issue
+            # #1639 codex r3 [P2]: an agent can still have claimed/blocked OPEN
+            # work (exactly the in-progress/blocked stall #1639 targets) — probe
+            # for it so the wake still fires, but record NO dedup key. The daemon
+            # only ever nudges QUEUED work, so an empty key here cannot double-
+            # fire; conversely recording the queued-only key for a claimed/blocked
+            # wake would (the r2 mismatch), so we leave queue_key empty here.
+            #
+            # #1639 Phase-4 codex r4 BLOCKING: scope this fallback to NON-CRON
+            # claimed|blocked ONLY. A bare find-open defaults to
+            # queued|claimed|blocked AND keeps cron-dispatch rows, so a
+            # cron-dispatch-only queue would fire a spurious post-restart wake
+            # even though the daemon canonical nudge-live-state excludes cron
+            # (and claimed) and reports 0 queued. Mirror that exclusion: only
+            # in-progress/blocked NON-cron work justifies the fallback wake. A
+            # genuine 0-queued (nudge_state present, empty queued_top) and a
+            # helper failure (nudge_state empty) both land here; either way the
+            # daemon still owns QUEUED nudging, so this is purely the claimed/
+            # blocked-stall backstop.
+            queue_key=""
+            task_id="$(bridge_queue_cli find-open --agent "$agent" --status-filter claimed --status-filter blocked --exclude-title-prefix '[cron-dispatch]' 2>/dev/null | head -n 1 || true)"
+          fi
           if [[ -n "$task_id" ]]; then
             if bridge_inject_metadata_only_enabled; then
               inject_text="$(bridge_format_injection_meta inbox-bootstrap agent="$agent" top="$task_id")"
             else
-              inject_text="[Agent Bridge] ACTION REQUIRED — queued tasks detected. Run exactly: ~/.agent-bridge/agb inbox $agent"
+              inject_text="[Agent Bridge] ACTION REQUIRED — open tasks detected. Run exactly: ~/.agent-bridge/agb inbox $agent"
             fi
             bridge_tmux_send_and_submit "$session" claude "$inject_text" "$agent"
-            # Issue #1199 — record this injection as a nudge so the daemon
-            # nudge tick treats it as delivered for the queued set. Key =
-            # comma-separated task ids matching daemon nudge_key format
-            # (bridge-queue.py:2177). Without this, daemon fires again
-            # immediately (has_new_queue_ids=True since last_nudge_key empty).
-            queue_key=$(bridge_queue_cli find-open --agent "$agent" 2>/dev/null | tr "\012" "," | sed -e "s/,$//")
+            # Record the queued set as nudged so the daemon nudge tick treats it
+            # as delivered (last_nudge_key byte-matches the daemon nudge_key).
+            # Only set when a genuinely-queued top was surfaced above.
             if [[ -n "$queue_key" ]]; then
               bridge_task_note_nudge "$agent" "$queue_key" >/dev/null 2>&1 || true
             fi
+          elif [[ "$auto_restart_wake" == "1" && ! -f "$marker_file" ]]; then
+            # #1639 invariant 4: auto-restart with an empty queue. Send ONE
+            # minimal "session resumed" first-turn kick so the agent reads its
+            # SOUL/CLAUDE/NEXT-SESSION onboarding instead of sitting idle, but
+            # only on the first-ever launch boundary (marker absent) so we never
+            # spam on every routine daemon/upgrade restart of a long-lived agent.
+            if bridge_inject_metadata_only_enabled; then
+              inject_text="$(bridge_format_injection_meta session-resumed agent="$agent" reason=auto-restart)"
+            else
+              inject_text="[Agent Bridge] session resumed after an automatic restart — re-read your session onboarding (SOUL.md / CLAUDE.md / NEXT-SESSION.md) and check your queue: ~/.agent-bridge/agb inbox $agent"
+            fi
+            bridge_tmux_send_and_submit "$session" claude "$inject_text" "$agent"
           fi
-          mkdir -p "$(dirname "$marker_file")"
-          printf "%s\n" "$(date +%s)" >"$marker_file"
+          # Preserve the once-per-loop-lifetime marker for the first-launch
+          # branch. The auto-restart wake reuses the same #1199 nudge dedup and
+          # is gated by RESTART_COUNT==0 in the parent, so it never needs (or
+          # writes) a second marker.
+          if [[ ! -f "$marker_file" ]]; then
+            mkdir -p "$(dirname "$marker_file")"
+            printf "%s\n" "$(date +%s)" >"$marker_file"
+          fi
         fi
       fi
-    ' -- "$SCRIPT_DIR" "$SESSION" "$AGENT" "$marker_file" "$next_file" "$previous_session_id"
+    ' -- "$SCRIPT_DIR" "$SESSION" "$AGENT" "$marker_file" "$next_file" "$previous_session_id" "$auto_restart_wake"
   ) </dev/null >/dev/null 2>>"$ERRFILE" &
 }
 
