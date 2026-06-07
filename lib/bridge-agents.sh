@@ -1164,6 +1164,131 @@ bridge_agent_workdir_step_a_complete() {
   [[ -n "$_expected_owner" && "$_wd_owner" == "$_expected_owner" ]]
 }
 
+# bridge_workdir_presence <workdir>
+#
+# Issue #1637: `agb list` rendered an iso (linux-user) agent's workdir as
+# `[missing]` whenever the controller `[[ -d "$workdir" ]]` probe failed —
+# but for an iso agent that probe fails on *permission-denied* (the
+# controller is intentionally NOT in the agent's iso group, so it cannot
+# traverse the iso UID's home to reach the workdir), not because the
+# directory is absent. `[[ -d ]]` / `[[ -e ]]` collapse EACCES and ENOENT
+# into the same false, so the column lost the distinction the operator
+# needs.
+#
+# This helper recovers it. It emits exactly one token on stdout:
+#   present — the controller can stat the directory and it IS a directory.
+#   denied  — the controller cannot stat the directory, but the path entry
+#             demonstrably exists behind a permission boundary (a parent in
+#             the chain is non-traversable for the controller, OR the
+#             deepest readable ancestor lists the next component yet cannot
+#             be entered). This is the iso-boundary case.
+#   absent  — the controller can traverse down to the parent and the entry
+#             genuinely is not there (ENOENT), OR the path is empty.
+#
+# Portability: pure shell + `ls`; no `stat` flavor branching, no sudo, no
+# root. It works the same on the real Linux iso boundary (a 0700 iso-UID
+# home blocks traversal) and in an isolated macOS smoke (a chmod-000
+# ancestor reproduces the same EACCES) — see
+# scripts/smoke/1637-agb-list-iso-marker.sh. Caller decides whether
+# `denied` should render `[iso]` (iso-mode agents) or `[missing]`
+# (everything else); this helper only reports the filesystem reality.
+bridge_workdir_presence() {
+  local workdir="$1"
+
+  [[ -n "$workdir" ]] || { printf 'absent'; return 0; }
+
+  if [[ -d "$workdir" ]]; then
+    printf 'present'
+    return 0
+  fi
+
+  # `[[ -d ]]` missed. Distinguish EACCES (exists-but-blocked) from ENOENT
+  # (genuinely absent) by descending the path from the filesystem root and
+  # finding the deepest ancestor the controller can stat as a directory.
+  local _deepest=""
+  local -a _parts=()
+  # A leading slash means the descent starts at the absolute root.
+  [[ "$workdir" == /* ]] && _deepest="/"
+  # Split on `/` into components (handles repeated/trailing slashes via the
+  # empty-component skip below). Pure parameter-expansion split — NOT a
+  # `read -a <<<"$workdir"` here-string, which lint-heredoc-ban flags as a
+  # new H3 site. Empty components from leading/repeated/trailing slashes are
+  # skipped by the `[[ -z "$_part" ]] && continue` in the loop below, so this
+  # is behavior-equivalent to the prior IFS=/ read.
+  local _rest="$workdir" _seg
+  while [[ "$_rest" == */* ]]; do
+    _seg="${_rest%%/*}"
+    _parts+=("$_seg")
+    _rest="${_rest#*/}"
+  done
+  _parts+=("$_rest")
+
+  local _part _next
+  for _part in "${_parts[@]}"; do
+    [[ -z "$_part" ]] && continue
+    if [[ -z "$_deepest" ]]; then
+      _next="$_part"
+    elif [[ "$_deepest" == "/" ]]; then
+      _next="/$_part"
+    else
+      _next="$_deepest/$_part"
+    fi
+
+    if [[ -d "$_next" ]]; then
+      _deepest="$_next"
+      continue
+    fi
+
+    # `_next` is the first component we cannot stat as a directory while
+    # `_deepest` IS a readable directory ancestor (or "" before the first
+    # component on a relative path).
+    #
+    # First disambiguate present-but-not-a-directory from cannot-stat. If the
+    # controller can resolve `_next` at the path — either it stats to a
+    # non-directory (`[[ -e ]]`: regular file, symlink-to-file, etc.) or it
+    # is a symlink whose entry we can lstat even if the target is gone
+    # (`[[ -L ]]`: a dangling/broken symlink, where `[[ -e ]]` is false) —
+    # then it is present to us, just not a usable workdir directory. That is
+    # NOT the iso permission boundary, so report `absent` (the renderer maps
+    # it to `[missing]`, never `[iso]`). Covers the final-component-is-a-file
+    # case (#1637 review r1) and the dangling-symlink case (review r2). A
+    # symlink TO a directory is already handled above by the `[[ -d ]]`
+    # branch (it follows the link to a real dir), so it never reaches here.
+    if [[ -e "$_next" || -L "$_next" ]]; then
+      printf 'absent'
+      return 0
+    fi
+
+    # `_next` cannot be resolved at the path at all → ENOENT or EACCES.
+    # Decide via the
+    # readable parent:
+    #   - If `_deepest` is not even listable for us, the boundary is above
+    #     `_next` → permission-denied.
+    #   - Else, if `_deepest` lists `_part`, the entry exists but we cannot
+    #     stat/enter it → permission-denied.
+    #   - Else `_part` is genuinely absent in a readable parent → ENOENT.
+    local _listdir="${_deepest:-.}"
+    local _listing=""
+    if _listing="$(ls -1a -- "$_listdir" 2>/dev/null)"; then
+      if printf '%s\n' "$_listing" | grep -qxF -- "$_part"; then
+        printf 'denied'
+      else
+        printf 'absent'
+      fi
+    else
+      # Cannot even list the deepest "readable" ancestor → blocked above.
+      printf 'denied'
+    fi
+    return 0
+  done
+
+  # Descended the whole path with every component stat-able as a directory
+  # yet `[[ -d ]]` failed on the full workdir at the top — should not happen
+  # (the final component would have been caught in-loop), but treat as absent
+  # defensively so a non-iso caller still flags an unusable workdir.
+  printf 'absent'
+}
+
 bridge_current_user() {
   id -un
 }
@@ -10273,10 +10398,32 @@ bridge_list_active_agents_numbered() {
     # Issue #305 Track C: flag stale registrations whose workdir no longer
     # exists on disk so a leaked smoke fixture or deleted-repo agent is
     # visible in `agent-bridge list` without inspecting the roster file.
+    #
+    # Issue #1637: the bare `[[ ! -d ]]` probe also fired for iso
+    # (linux-user) agents whose workdir is present but un-traversable by the
+    # controller (the controller is deliberately outside the agent's iso
+    # group), mis-labelling a live iso agent `[missing]`. Discriminate with
+    # bridge_workdir_presence: a permission-denied workdir on an iso-mode
+    # agent is `[iso]` (exists, just controller-blind), while a genuinely
+    # absent dir (ENOENT) — iso or not — stays `[missing]`. A non-iso agent
+    # that somehow reports `denied` still gets `[missing]`, preserving the
+    # #305 "something is wrong, surface it" intent.
     local _workdir
     _workdir="$(bridge_agent_workdir "$agent")"
-    if [[ -n "$_workdir" && ! -d "$_workdir" ]]; then
-      _workdir="$_workdir [missing]"
+    if [[ -n "$_workdir" ]]; then
+      local _wd_presence
+      _wd_presence="$(bridge_workdir_presence "$_workdir")"
+      case "$_wd_presence" in
+        present) : ;;
+        denied)
+          if bridge_agent_linux_user_isolation_requested "$agent" 2>/dev/null; then
+            _workdir="$_workdir [iso]"
+          else
+            _workdir="$_workdir [missing]"
+          fi
+          ;;
+        *) _workdir="$_workdir [missing]" ;;
+      esac
     fi
 
     printf '%d. %s | engine=%s | tmux=%s | cwd=%s | source=%s | loop=%s | inbox=%s | claimed=%s | session_id=%s\n' \
