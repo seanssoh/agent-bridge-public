@@ -70,6 +70,37 @@ DEFAULT_RECONCILE_INTERVAL_SECONDS = 45
 OPEN_REMOTE_TASK_STATUSES = ("queued", "claimed", "blocked")
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_CONCURRENT_REQUESTS = 64
+# The unauthenticated, read-only liveness path. The supervisor probe
+# (cmd_healthz) reads `listen.healthz_path` from config but defaults to this;
+# do_GET hardcodes the same default. #1629: GET on this path is answered WITHOUT
+# consuming a request-concurrency slot, so a saturated-but-healthy receiver is
+# never misclassified DOWN and restarted mid-handoff.
+DEFAULT_HEALTHZ_PATH = "/healthz"
+# Bytes peeked (MSG_PEEK, non-destructive) off a fresh connection to classify it
+# as the liveness probe before the semaphore gate. The HTTP request line we look
+# for ("GET <path> HTTP/1.x\r\n") is tiny; cap the peek so a slow/hostile peer
+# cannot stall the accept loop, and never CONSUME the bytes (the handler re-reads
+# the full request normally).
+HEALTHZ_PEEK_MAX_BYTES = 256
+# Short, bounded deadline for the classification peek. The peek runs on the
+# SINGLE-THREADED accept loop (ThreadingHTTPServer dispatches a worker AFTER
+# process_request returns), so it must NOT block on a slow/idle peer — otherwise
+# one connection that opens but withholds its request line would stall accepting
+# every other connection (including real healthz probes) for the full request
+# timeout. The peek uses this tiny deadline and FAILS CLOSED (treat as
+# not-healthz -> normal semaphore gate) the instant the request line is not
+# already buffered, so the accept loop is never held hostage.
+HEALTHZ_PEEK_TIMEOUT_SECONDS = 0.05
+# The exempt liveness probe must NOT consume a `_request_semaphore` slot (that is
+# the whole point of #1629), but it still runs a worker thread that parses
+# headers before do_GET — a healthz-SHAPED slow peer (sends `GET /healthz ...\r\n`
+# then stalls before the header terminator) would otherwise spawn an UNBOUNDED
+# number of those worker threads. So the probe gets its OWN small bounded
+# semaphore: it is independent of `max_concurrent_requests` (a saturated request
+# load never blocks the probe) yet still caps how many concurrent healthz worker
+# threads can exist. The real supervisor fires ONE probe at a time, so a small
+# bound is ample; a healthz-shaped flood beyond it is rejected fast (no thread).
+DEFAULT_MAX_CONCURRENT_HEALTHZ = 8
 DEFAULT_PENDING_RETRY_SECONDS = 180
 DEFAULT_MAINTENANCE_INTERVAL_SECONDS = 3600
 DEFAULT_INCOMING_REAP_AGE_SECONDS = 86400
@@ -1416,6 +1447,22 @@ class HandoffServer(ThreadingHTTPServer):
             self.max_concurrent_requests = DEFAULT_MAX_CONCURRENT_REQUESTS
         self._request_semaphore = threading.BoundedSemaphore(
             self.max_concurrent_requests)
+        # #1629: a small, INDEPENDENT bound on concurrent liveness-probe worker
+        # threads (see DEFAULT_MAX_CONCURRENT_HEALTHZ). The probe is exempt from
+        # `_request_semaphore` so a saturated request load can't 503 it, but it
+        # must still be bounded so a healthz-shaped slow flood can't spawn
+        # unbounded threads.
+        self._healthz_semaphore = threading.BoundedSemaphore(
+            DEFAULT_MAX_CONCURRENT_HEALTHZ)
+        # #1629: track, per dispatched connection, WHICH semaphore (if any) it
+        # acquired, so process_request_thread releases exactly the one slot it
+        # took — never over-releasing a BoundedSemaphore. Value is the semaphore
+        # object to release (the request semaphore for a normal request, the
+        # healthz semaphore for an exempt probe). Keyed by id(request); the
+        # registry also holds a reference to the live socket for the dispatch's
+        # duration, so the id cannot be recycled while the entry exists.
+        self._acquired_requests: dict[int, threading.BoundedSemaphore] = {}
+        self._acquired_lock = threading.Lock()
 
     def get_request(self):  # noqa: ANN201 - socketserver API
         request, client_address = super().get_request()
@@ -1425,34 +1472,153 @@ class HandoffServer(ThreadingHTTPServer):
             pass
         return request, client_address
 
-    def process_request(self, request, client_address) -> None:  # noqa: ANN001
-        if not self._request_semaphore.acquire(blocking=False):
-            audit("reject_concurrency", client=client_address[0],
-                  limit=self.max_concurrent_requests, security=True)
+    def _healthz_path(self) -> str:
+        """The configured liveness path (defaults to /healthz).
+
+        Mirrors what cmd_healthz actually probes (`listen.healthz_path`), so the
+        semaphore exemption matches the real probe even on a non-default path.
+        Read defensively: a malformed/missing config never raises here.
+        """
+        try:
+            listen = self.cfg.get("listen", {})
+            if isinstance(listen, dict):
+                path = listen.get("healthz_path", DEFAULT_HEALTHZ_PATH)
+                if isinstance(path, str) and path:
+                    return path
+        except Exception:
+            pass
+        return DEFAULT_HEALTHZ_PATH
+
+    def _peek_is_healthz_probe(self, request) -> bool:  # noqa: ANN001
+        """Non-destructively peek the request line: is this `GET <healthz>`?
+
+        Uses MSG_PEEK so the bytes stay in the socket buffer and the normal
+        handler re-reads the full request. ONLY a GET on the configured liveness
+        path qualifies — every other method/path (the entire enqueue/auth/HMAC
+        surface) falls through to the semaphore gate UNCHANGED. Any peek error
+        (timeout, partial line, non-socket) returns False -> normal gating, so
+        the exemption can never fail OPEN into skipping concurrency control for a
+        real request.
+
+        This runs on the single-threaded accept loop (before the worker thread is
+        dispatched), so the peek is bounded by a TINY deadline and the original
+        socket timeout is restored before returning: a peer that connects but
+        withholds its request line is treated as not-healthz almost immediately,
+        so it cannot stall the accept loop (or starve real healthz probes) for
+        the full request timeout. The withheld-request connection then proceeds
+        through the normal semaphore gate and is read with the full deadline in
+        its worker thread exactly as before.
+        """
+        try:
+            original_timeout = request.gettimeout()
+        except (OSError, AttributeError):
+            original_timeout = None
+        try:
+            request.settimeout(HEALTHZ_PEEK_TIMEOUT_SECONDS)
+        except (OSError, AttributeError, ValueError):
+            return False
+        try:
+            peeked = request.recv(HEALTHZ_PEEK_MAX_BYTES, socket.MSG_PEEK)
+        except (OSError, AttributeError, ValueError):
+            # Includes socket.timeout (a subclass of OSError): the request line
+            # is not yet buffered within the tiny deadline -> fail closed.
+            return False
+        finally:
+            # Restore the request timeout so the worker thread (or the exempt
+            # probe's own handler) reads with the full deadline as before.
             try:
-                body = b'{"ok": false, "error": "receiver busy"}'
-                request.sendall(
-                    b"HTTP/1.1 503 Service Unavailable\r\n"
-                    b"Content-Type: application/json\r\n"
-                    b"Connection: close\r\n"
-                    b"Retry-After: 5\r\n"
-                    + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-                    + body
-                )
-            except OSError:
+                request.settimeout(original_timeout)
+            except (OSError, AttributeError, ValueError):
                 pass
-            try:
-                request.close()
-            except OSError:
-                pass
-            return
+        newline = peeked.find(b"\n")
+        if newline < 0:
+            # Whole request line not yet available within the peek window — do
+            # NOT exempt (fall through to the normal semaphore gate).
+            return False
+        try:
+            request_line = peeked[:newline].decode("ascii").rstrip("\r")
+        except UnicodeDecodeError:
+            return False
+        parts = request_line.split(" ")
+        if len(parts) < 2 or parts[0] != "GET":
+            return False
+        # Compare only the path component (ignore any ?query) against the
+        # configured liveness path.
+        target = parts[1].split("?", 1)[0]
+        return target == self._healthz_path()
+
+    def _reject_busy(self, request, client_address, *,  # noqa: ANN001
+                     audit_event: str) -> None:
+        """503 a connection at accept time without spawning a worker thread."""
+        audit(audit_event, client=client_address[0],
+              limit=self.max_concurrent_requests, security=True)
+        try:
+            body = b'{"ok": false, "error": "receiver busy"}'
+            request.sendall(
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Connection: close\r\n"
+                b"Retry-After: 5\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                + body
+            )
+        except OSError:
+            pass
+        try:
+            request.close()
+        except OSError:
+            pass
+
+    def _dispatch_with_slot(self, request, client_address,  # noqa: ANN001
+                            semaphore: "threading.BoundedSemaphore") -> None:
+        """Record the acquired semaphore then dispatch; release on a dispatch
+        failure so a slot is never leaked before the worker thread runs."""
+        with self._acquired_lock:
+            self._acquired_requests[id(request)] = semaphore
         try:
             super().process_request(request, client_address)
         except Exception:
-            self._request_semaphore.release()
+            with self._acquired_lock:
+                self._acquired_requests.pop(id(request), None)
+            semaphore.release()
             raise
 
+    def process_request(self, request, client_address) -> None:  # noqa: ANN001
+        # #1629: answer the unauthenticated, read-only liveness probe WITHOUT
+        # consuming a request-concurrency slot. A saturated-but-healthy receiver
+        # must still report alive so the supervisor does not misclassify it DOWN
+        # and restart it mid-handoff. The probe still flows through the normal
+        # handler (do_GET) and returns exactly what it did before. Real requests
+        # (enqueue + every signed control path) are UNAFFECTED — they still
+        # acquire a `_request_semaphore` slot at accept time, and the
+        # HMAC/bind/remote_addr/allowlist/dedupe gates downstream are untouched.
+        if self._peek_is_healthz_probe(request):
+            # The probe is exempt from `_request_semaphore`, but it still runs a
+            # worker thread that parses headers before do_GET, so a healthz-shaped
+            # slow flood could otherwise spawn unbounded threads. Gate it on its
+            # OWN small bound instead; a flood beyond that is rejected fast (no
+            # thread spawned). The single real supervisor probe always fits.
+            if not self._healthz_semaphore.acquire(blocking=False):
+                self._reject_busy(request, client_address,
+                                  audit_event="reject_healthz_concurrency")
+                return
+            self._dispatch_with_slot(request, client_address,
+                                     self._healthz_semaphore)
+            return
+        if not self._request_semaphore.acquire(blocking=False):
+            self._reject_busy(request, client_address,
+                              audit_event="reject_concurrency")
+            return
+        self._dispatch_with_slot(request, client_address,
+                                 self._request_semaphore)
+
     def process_request_thread(self, request, client_address) -> None:  # noqa: ANN001
+        # Release the EXACT semaphore THIS connection acquired (request slot for a
+        # normal request, healthz slot for an exempt probe), or none if it took
+        # no slot. A blind release would corrupt a BoundedSemaphore count
+        # (ValueError) and silently inflate the effective concurrency limit.
+        with self._acquired_lock:
+            semaphore = self._acquired_requests.pop(id(request), None)
         try:
             try:
                 request.settimeout(self.request_timeout_seconds)
@@ -1460,7 +1626,8 @@ class HandoffServer(ThreadingHTTPServer):
                 pass
             super().process_request_thread(request, client_address)
         finally:
-            self._request_semaphore.release()
+            if semaphore is not None:
+                semaphore.release()
 
     def swap_cfg(self, new_cfg: dict[str, Any]) -> None:
         """Publish an ALREADY-VALIDATED config to the request handlers.
