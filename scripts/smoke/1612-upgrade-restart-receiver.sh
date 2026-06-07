@@ -104,7 +104,14 @@ STUB="$TARGET_ROOT/bridge-handoff-daemon.sh"
 chmod +x "$STUB"
 
 # Drive the extracted block in a subshell with the upgrade-block's required
-# scalars set. The block references RESTART_DAEMON, DRY_RUN, TARGET_ROOT only.
+# runtime context. The block references RESTART_DAEMON, DRY_RUN, TARGET_ROOT and
+# — since #1661 — the shared lock helper bridge_scoped_lock_run_without (which
+# closes the upgrade-lock fd for the daemonizing receiver child). The real
+# upgrade always has lib/bridge-lock.sh sourced before this block runs (see
+# bridge-upgrade.sh), so the harness sources it too — that also defines the
+# BRIDGE_SCOPED_LOCK_TOKEN global. _BRIDGE_UPGRADE_LOCK_TOKEN is intentionally
+# left UNSET here to assert the block is nounset-safe (deref'd as `${…:-}` →
+# empty token → run_without is a transparent pass-through == pre-#1661 behavior).
 run_block() {
   # $1=RESTART_DAEMON $2=DRY_RUN ; prints stderr to $TMP/block.err
   : >"$TMP/argv.log"
@@ -112,6 +119,8 @@ run_block() {
     RESTART_DAEMON="$1"
     DRY_RUN="$2"
     TARGET_ROOT="$TARGET_ROOT"
+    # shellcheck source=lib/bridge-lock.sh
+    source "$ROOT_DIR/lib/bridge-lock.sh"
     eval "$RECEIVER_BLOCK"
   ) >"$TMP/block.out" 2>"$TMP/block.err"
 }

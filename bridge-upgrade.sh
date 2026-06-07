@@ -40,7 +40,7 @@ _bridge_upgrade_exit_handler() {
   # below. No-op when no lock was acquired (dry-run / analyze / conflicts).
   if [[ -n "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" ]] \
       && declare -F bridge_scoped_lock_release >/dev/null 2>&1; then
-    bridge_scoped_lock_release "$_BRIDGE_UPGRADE_LOCK_TOKEN" || true
+    bridge_scoped_lock_release "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" || true
     _BRIDGE_UPGRADE_LOCK_TOKEN=""
   fi
   unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID
@@ -1393,7 +1393,7 @@ if [[ $_BRIDGE_UPGRADE_LOCK_IS_MUTATING -eq 1 ]]; then
   # BRIDGE_HOME is set inline ONLY for the helper's contention diagnostic — not
   # exported into the rest of the upgrade flow.
   if BRIDGE_HOME="$TARGET_ROOT" bridge_scoped_lock_acquire "${_bridge_upgrade_lock_acquire_args[@]}"; then
-    _BRIDGE_UPGRADE_LOCK_TOKEN="$BRIDGE_SCOPED_LOCK_TOKEN"
+    _BRIDGE_UPGRADE_LOCK_TOKEN="${BRIDGE_SCOPED_LOCK_TOKEN:-}"
   else
     _BRIDGE_UPGRADE_LOCK_TOKEN=""
     bridge_die "다른 upgrade/rollback가 이미 실행 중입니다 ($TARGET_ROOT). 끝날 때까지 기다리거나 '--wait'로 블록하세요."
@@ -1766,14 +1766,17 @@ if [[ "$SUBCOMMAND" == "rollback" ]]; then
     bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
     # Issue #1661: close the upgrade-lock flock fd for the (daemonizing,
     # tmux-spawning) child so it cannot inherit + pin the lock past our exit.
-    bridge_scoped_lock_run_without "$_BRIDGE_UPGRADE_LOCK_TOKEN" \
+    # `:-` keeps this nounset-safe when the receiver/restart path runs without a
+    # lock token (e.g. the 1612 smoke extracts this block in isolation); an
+    # empty token makes run_without a transparent pass-through (pre-#1661 behavior).
+    bridge_scoped_lock_run_without "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" \
       bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
   fi
   if [[ $RESTART_AGENTS -eq 1 ]]; then
     # Issue #1661: the per-agent restart spawns long-lived tmux sessions; close
     # the upgrade-lock flock fd for those children so an immortal tmux server
     # cannot inherit + pin the lock past our exit (no-op on the mkdir backend).
-    ROLLBACK_AGENT_RESTART_REPORT="$(bridge_scoped_lock_run_without "$_BRIDGE_UPGRADE_LOCK_TOKEN" bridge_upgrade_collect_agent_restart_report "$TARGET_ROOT" "$DRY_RUN")"
+    ROLLBACK_AGENT_RESTART_REPORT="$(bridge_scoped_lock_run_without "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" bridge_upgrade_collect_agent_restart_report "$TARGET_ROOT" "$DRY_RUN")"
     # Issue 4 (v0.11.0): reconcile failed rows against the daemon's
     # subsequent launch cycle so the rollback summary does not over-
     # report failures the daemon already absorbed. No-op when dry-run
@@ -2600,7 +2603,9 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
   # Issue #1661: close the upgrade-lock flock fd for the (daemonizing,
   # tmux-spawning) child so it cannot inherit + pin the lock past our exit.
-  bridge_scoped_lock_run_without "$_BRIDGE_UPGRADE_LOCK_TOKEN" \
+  # `:-` keeps this nounset-safe when reached without a lock token (empty token
+  # => run_without is a transparent pass-through, pre-#1661 behavior).
+  bridge_scoped_lock_run_without "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" \
     bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
 fi
 
@@ -2632,7 +2637,11 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
       # that child so the immortal receiver cannot inherit + pin
       # state/locks/upgrade.lock past our exit (would wedge future upgrades on
       # the flock backend). No-op on the mkdir backend.
-      if bridge_scoped_lock_run_without "$_BRIDGE_UPGRADE_LOCK_TOKEN" \
+      # `:-` keeps this nounset-safe — the 1612 smoke extracts this block in
+      # isolation under `set -u` with no lock token set, and any code path that
+      # reaches the restart without acquiring the lock must behave as pre-#1661
+      # (empty token => run_without is a transparent pass-through).
+      if bridge_scoped_lock_run_without "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" \
           bash "$_a2a_handoff_script" restart >/dev/null 2>&1; then
         echo "[bridge-upgrade] A2A receiver restarted to apply upgraded code" >&2
       else
@@ -3091,8 +3100,9 @@ fi
 if [[ $RESTART_AGENTS -eq 1 ]]; then
   # Issue #1661: per-agent restart spawns long-lived tmux sessions — close the
   # upgrade-lock flock fd for those children so an immortal tmux server cannot
-  # inherit + pin the lock past our exit (no-op on the mkdir backend).
-  AGENT_RESTART_REPORT="$(bridge_scoped_lock_run_without "$_BRIDGE_UPGRADE_LOCK_TOKEN" bridge_upgrade_collect_agent_restart_report "$TARGET_ROOT" "$DRY_RUN")"
+  # inherit + pin the lock past our exit (no-op on the mkdir backend). `:-`
+  # keeps this nounset-safe when reached without a lock token.
+  AGENT_RESTART_REPORT="$(bridge_scoped_lock_run_without "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" bridge_upgrade_collect_agent_restart_report "$TARGET_ROOT" "$DRY_RUN")"
   # Issue 4 (v0.11.0): reconcile failed rows against the daemon's
   # subsequent launch cycle so the upgrade summary does not over-report
   # failures the daemon already absorbed. No-op when dry-run or when no
