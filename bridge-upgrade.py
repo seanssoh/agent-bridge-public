@@ -21,7 +21,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from stat import S_ISFIFO, S_ISSOCK
+from stat import S_ISDIR, S_ISFIFO, S_ISLNK, S_ISSOCK
 import tempfile
 from typing import Any, Iterator
 
@@ -973,10 +973,72 @@ def conflict_backup_relpath(relpath: str) -> str:
     return (Path(relpath).parent / conflict_backup_path(Path(relpath)).name).as_posix()
 
 
+def _record_backup_skip(
+    skipped: list[dict[str, str]] | None,
+    relpath: str,
+    filename: str | None,
+) -> None:
+    """Record a backup entry the controller could not stat (iso boundary).
+
+    Issue #1635: warn on stderr and append a structured skip record so the
+    operator can see exactly which iso-owned path was skipped. The agent's own
+    runtime owns these files; the controller's backup contract for isolated
+    agents is that owner-only subtrees are not entered.
+    """
+    print(
+        "[bridge-upgrade] backup-live: skipping unreadable iso-owned entry "
+        f"{filename or relpath} (per-UID isolated tree; controller not in group)",
+        file=sys.stderr,
+    )
+    if skipped is not None:
+        skipped.append({
+            "path": relpath,
+            "reason": f"PermissionError: {filename or relpath} (per-UID isolated tree)",
+        })
+
+
+class _IsoPermissionSkip(Exception):
+    """Raised by _probe_live_path when a path is unreadable for iso reasons."""
+
+    def __init__(self, filename: str | None) -> None:
+        super().__init__(filename or "")
+        self.filename = filename
+
+
+def _probe_live_path(path: Path) -> tuple[bool, bool, bool]:
+    """Version-independent existence probe → (present, is_symlink, is_dir).
+
+    Issue #1635 r5: `Path.exists()` / `Path.is_symlink()` SWALLOW PermissionError
+    and return False on Python 3.14+ (they only re-raise on 3.13 and earlier).
+    Relying on those raising would, on 3.14, silently record an unreadable
+    iso-owned file as `state=absent` instead of skipping it — corrupting rollback
+    metadata. Use raw `os.lstat` so the EACCES boundary is observed identically
+    on every Python: FileNotFoundError → not present; PermissionError / EACCES →
+    raise `_IsoPermissionSkip` (the iso boundary); anything else bubbles.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return (False, False, False)
+    except NotADirectoryError:
+        # A component of the path is a file, so the target cannot exist.
+        return (False, False, False)
+    except PermissionError as exc:
+        raise _IsoPermissionSkip(exc.filename or str(path)) from exc
+    except OSError as exc:
+        if exc.errno == errno.EACCES:
+            raise _IsoPermissionSkip(exc.filename or str(path)) from exc
+        raise
+    is_symlink = S_ISLNK(st.st_mode)
+    is_dir = S_ISDIR(st.st_mode) and not is_symlink
+    return (True, is_symlink, is_dir)
+
+
 def build_backup_entries(
     target_root: Path,
     analysis_payload: dict[str, Any],
     migration_payload: dict[str, Any],
+    skipped_isolated: list[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
     entries: dict[str, dict[str, str]] = {}
 
@@ -985,8 +1047,23 @@ def build_backup_entries(
         if not relpath:
             return
         live_path = target_root / relpath
-        if live_path.exists() or live_path.is_symlink():
-            kind = "dir" if live_path.is_dir() and not live_path.is_symlink() else "file"
+        # Issue #1635: under v2 isolation the controller is intentionally not a
+        # member of the iso agent's group, so statting an iso-owned profile file
+        # (e.g. `agents/<a>/workdir/SOUL.md`, mode 0600) or traversing an
+        # owner-only `0700` subtree raises PermissionError. That is an EXPECTED
+        # boundary, not a fatal upgrade error — graceful-skip the entry (warn +
+        # record) instead of aborting the whole backup/upgrade. Mirrors the
+        # `cmd_migrate_agents` and daily-backup `skipped_isolated` patterns.
+        # Only genuine permission failures are demoted; a controller-readable
+        # file that errors for any other reason still bubbles up so we never
+        # silently drop a backup we COULD have taken.
+        try:
+            present, _is_symlink, is_dir = _probe_live_path(live_path)
+        except _IsoPermissionSkip as skip:
+            _record_backup_skip(skipped_isolated, relpath, skip.filename)
+            return
+        if present:
+            kind = "dir" if is_dir else "file"
             entries[relpath] = {"path": relpath, "state": "present", "kind": kind}
             return
         current = entries.get(relpath)
@@ -1023,23 +1100,158 @@ def build_backup_entries(
     return [entries[key] for key in sorted(entries)]
 
 
-def copy_live_backup(target_root: Path, backup_root: Path, entries: list[dict[str, str]] | None = None) -> None:
+def _is_permission_error(exc: BaseException) -> bool:
+    """True iff exc (or every shutil.Error member) is a genuine permission failure.
+
+    Issue #1635: `shutil.copytree` wraps per-member failures in a `shutil.Error`
+    whose args carry `(src, dst, why)` tuples; the underlying error is usually a
+    `PermissionError` but may surface as a raw `OSError(EACCES)`. Treat all of
+    those as the iso boundary; everything else must still abort.
+    """
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError) and exc.errno == errno.EACCES:
+        return True
+    if isinstance(exc, shutil.Error):
+        # copytree's Error.args[0] is a list of (src, dst, why) triples where
+        # `why` is the str() of the original exception. Be conservative: only
+        # treat it as a permission boundary when EVERY recorded failure looks
+        # like an EACCES/permission denial, so a mixed batch still aborts.
+        records = exc.args[0] if exc.args else []
+        if not isinstance(records, list) or not records:
+            return False
+        for rec in records:
+            why = str(rec[2]) if isinstance(rec, (list, tuple)) and len(rec) >= 3 else str(rec)
+            if "Permission denied" not in why and "[Errno 13]" not in why:
+                return False
+        return True
+    return False
+
+
+def _perm_error_blamed_paths(exc: BaseException) -> list[str]:
+    """Best-effort list of EVERY filesystem path a permission error touches.
+
+    For a plain OSError/PermissionError that is `exc.filename` (and `filename2`).
+    For a `shutil.Error` (copytree per-member batch) each recorded triple is
+    `(src, dst, why)` — we collect BOTH `src` AND `dst`, because a nested
+    DESTINATION EACCES inside `copytree` surfaces at index 1 (Issue #1635 r4).
+    Used to tell a SOURCE-side iso skip from a DESTINATION-side backup write
+    failure (Issue #1635 r3): only a failure entirely on the source side is the
+    iso boundary; any path under the backup dir must still abort.
+    """
+    paths: list[str] = []
+    if isinstance(exc, shutil.Error):
+        records = exc.args[0] if exc.args else []
+        if isinstance(records, list):
+            for rec in records:
+                if isinstance(rec, (list, tuple)):
+                    # rec == (src, dst, why); record src and dst so a dest-side
+                    # EACCES is visible to the discriminator.
+                    if len(rec) >= 1 and rec[0]:
+                        paths.append(str(rec[0]))
+                    if len(rec) >= 2 and rec[1]:
+                        paths.append(str(rec[1]))
+        return paths
+    if isinstance(exc, OSError):
+        if exc.filename:
+            paths.append(str(exc.filename))
+        # filename2 is the dest on dual-path ops (rename/link); include it so a
+        # dest-side EACCES is visible to the source/dest discriminator.
+        if getattr(exc, "filename2", None):
+            paths.append(str(exc.filename2))
+    return paths
+
+
+def _is_under(path_str: str, root: Path) -> bool:
+    try:
+        Path(path_str).resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _is_source_side_perm_skip(
+    exc: BaseException,
+    src: Path,
+    backup_root: Path,
+) -> bool:
+    """True iff exc is a genuine permission failure on the SOURCE (iso) tree.
+
+    Issue #1635 r3: `shutil.copytree`/`copy2` read the source AND write the
+    destination in one call, so a single try/except cannot syntactically split
+    them. Discriminate by the blamed path instead: an EACCES on a path under
+    `backup_root` is a destination write failure (operator's backup dir is not
+    writable) and MUST abort — we never silently drop a controller-readable
+    backup. An EACCES on the source path (or any path NOT under backup_root) is
+    the expected iso owner-only boundary and is graceful-skipped.
+    """
+    if not _is_permission_error(exc):
+        return False
+    blamed = _perm_error_blamed_paths(exc)
+    if not blamed:
+        # No path attribution: we cannot PROVE the failure was source-side, so
+        # abort rather than risk silently dropping a readable backup. (Every
+        # OSError our copy ops raise carries .filename, and shutil.Error always
+        # records member triples, so this branch is defensive only.)
+        return False
+    for path_str in blamed:
+        if _is_under(path_str, backup_root):
+            # A destination write failure is in the batch (src OR dst side) —
+            # abort, do not skip; never silently drop a readable backup.
+            return False
+    return True
+
+
+def copy_live_backup(
+    target_root: Path,
+    backup_root: Path,
+    entries: list[dict[str, str]] | None = None,
+    skipped_isolated: list[dict[str, str]] | None = None,
+) -> None:
     backup_live = backup_root / "live"
     backup_live.mkdir(parents=True, exist_ok=True)
-    if entries:
+    if entries is not None:
+        # Targeted snapshot: copy exactly the recorded present entries. Iso-owned
+        # entries the scan could not stat were already dropped + recorded by
+        # build_backup_entries, so they never reach here. But a directory entry
+        # can be stat-able (recorded present) yet not traversable for the copy —
+        # Issue #1635: graceful-skip the per-entry copy on a genuine permission
+        # failure (warn + record), re-raising anything else.
         for entry in entries:
             if entry.get("state") != "present":
                 continue
             relpath = str(entry["path"])
             src = target_root / relpath
             dst = backup_live / relpath
-            if not src.exists() and not src.is_symlink():
+            # Version-independent stat gate (Issue #1635 r5): probe the source
+            # before copying so an iso-unreadable path is skipped identically on
+            # every Python, not silently treated as absent on 3.14+.
+            try:
+                present, src_is_symlink, src_is_dir = _probe_live_path(src)
+            except _IsoPermissionSkip as skip:
+                # Issue #1635 r6: demote the manifest entry so it no longer claims
+                # a `present` backup that was never copied. rollback ignores the
+                # `skipped_isolated` state (it is neither restored nor deleted),
+                # so the live iso file is left untouched.
+                entry["state"] = "skipped_isolated"
+                _record_backup_skip(skipped_isolated, relpath, skip.filename)
                 continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if src.is_dir() and not src.is_symlink():
-                shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dst, follow_symlinks=False)
+            if not present:
+                continue
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if src_is_dir:
+                    shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(src, dst, follow_symlinks=False)
+            except (PermissionError, OSError, shutil.Error) as exc:
+                # Source-side iso EACCES → skip; destination (backup dir) write
+                # failure → re-raise (never silently drop a readable backup).
+                if _is_source_side_perm_skip(exc, src, backup_root):
+                    entry["state"] = "skipped_isolated"
+                    _record_backup_skip(skipped_isolated, relpath, getattr(exc, "filename", None))
+                    continue
+                raise
         return
     for child in sorted(target_root.iterdir()):
         if child.name == "backups":
@@ -2454,14 +2666,25 @@ def cmd_backup_live(args: argparse.Namespace) -> int:
     source_root = Path(args.source_root).expanduser() if args.source_root else None
     analysis_payload = load_json_arg(args.analysis_json, args.analysis_json_file)
     migration_payload = load_json_arg(args.migration_json, args.migration_json_file)
-    entries = build_backup_entries(target_root, analysis_payload, migration_payload) if (analysis_payload or migration_payload) else []
+    skipped_isolated: list[dict[str, str]] = []
+    # Issue #1635: distinguish "a targeted scan was requested" from "the targeted
+    # scan produced entries". When every probed entry is an unreadable iso path
+    # the entry list is empty, but we must NOT fall back to the full-tree copy —
+    # that branch walks the whole install (including the protected iso subtrees)
+    # and would re-trigger the very PermissionError abort this fix removes.
+    targeted_scan_requested = bool(analysis_payload or migration_payload)
+    entries = (
+        build_backup_entries(target_root, analysis_payload, migration_payload, skipped_isolated)
+        if targeted_scan_requested
+        else []
+    )
     payload = {
         "target_root": str(target_root),
         "backup_root": str(backup_root),
         "exists": target_root.exists(),
         "created": False,
         "manifest_path": str(backup_root / "manifest.json"),
-        "snapshot_mode": "targeted" if entries else "full",
+        "snapshot_mode": "targeted" if targeted_scan_requested else "full",
         "entry_count": len(entries),
     }
     if source_root is not None:
@@ -2469,7 +2692,12 @@ def cmd_backup_live(args: argparse.Namespace) -> int:
         payload["source_ref"] = git_ref(source_root)
         payload["version"] = read_source_version(source_root)
     if target_root.exists() and not args.dry_run:
-        copy_live_backup(target_root, backup_root, entries or None)
+        copy_live_backup(
+            target_root,
+            backup_root,
+            entries if targeted_scan_requested else None,
+            skipped_isolated,
+        )
         manifest = {
             "created_at": now_iso(),
             "target_root": str(target_root),
@@ -2482,6 +2710,28 @@ def cmd_backup_live(args: argparse.Namespace) -> int:
         }
         save_json(backup_root / "manifest.json", manifest)
         payload["created"] = True
+    # Issue #1635: surface iso-owned entries the controller could not stat OR
+    # copy so operators can confirm the upgrade continued by design (not
+    # silently). Computed AFTER copy_live_backup so copy-stage skips are
+    # included; dedupe by path since a single relpath is only skipped once.
+    if skipped_isolated:
+        deduped: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for rec in skipped_isolated:
+            key = rec.get("path", "")
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(rec)
+        payload["skipped_isolated_count"] = len(deduped)
+        if len(deduped) <= 60:
+            payload["skipped_isolated"] = deduped
+        else:
+            payload["skipped_isolated"] = (
+                deduped[:50]
+                + [{"path": "...", "reason": "truncated"}]
+                + deduped[-10:]
+            )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
@@ -2537,6 +2787,7 @@ def cmd_backup_extend_live(args: argparse.Namespace) -> int:
     existing_relpaths = {str(entry.get("path") or "") for entry in existing_entries}
 
     added_entries: list[dict[str, str]] = []
+    skipped_isolated: list[dict[str, str]] = []
     backup_live = backup_root / "live"
 
     for raw_path in changed_paths:
@@ -2587,30 +2838,63 @@ def cmd_backup_extend_live(args: argparse.Namespace) -> int:
             continue
         existing_relpaths.add(relpath)
         live_path = target_root / relpath
-        if live_path.exists() or live_path.is_symlink():
-            kind = "dir" if live_path.is_dir() and not live_path.is_symlink() else "file"
+        # Issue #1635: the same iso boundary that aborts the primary backup scan
+        # applies here. Graceful-skip a changed path the controller cannot stat
+        # OR copy (genuine permission failure only) instead of aborting the loop
+        # — which would also silently drop every LATER readable extension backup.
+        # Version-independent stat gate (r5): never let 3.14's exists()-swallows-
+        # EACCES record a real iso file as `absent`.
+        try:
+            present, is_symlink, is_dir = _probe_live_path(live_path)
+        except _IsoPermissionSkip as skip:
+            _record_backup_skip(skipped_isolated, relpath, skip.filename)
+            continue
+        if present:
+            kind = "dir" if is_dir else "file"
             entry = {"path": relpath, "state": "present", "kind": kind}
         else:
             entry = {"path": relpath, "state": "absent", "kind": "file"}
             payload["skipped_missing"] += 1
-        added_entries.append(entry)
         if args.dry_run:
+            added_entries.append(entry)
             continue
         if entry["state"] != "present":
+            added_entries.append(entry)
             continue
         dst = backup_live / relpath
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if live_path.is_symlink():
-            link_target = os.readlink(live_path)
-            if dst.exists() or dst.is_symlink():
-                dst.unlink()
-            os.symlink(link_target, dst)
-        elif live_path.is_dir():
-            shutil.copytree(live_path, dst, symlinks=True, dirs_exist_ok=True)
-        else:
-            shutil.copy2(live_path, dst, follow_symlinks=False)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if is_symlink:
+                link_target = os.readlink(live_path)
+                if dst.exists() or dst.is_symlink():
+                    dst.unlink()
+                os.symlink(link_target, dst)
+            elif is_dir:
+                shutil.copytree(live_path, dst, symlinks=True, dirs_exist_ok=True)
+            else:
+                shutil.copy2(live_path, dst, follow_symlinks=False)
+        except (PermissionError, OSError, shutil.Error) as exc:
+            # Source-side iso EACCES → skip; destination (backup dir) write
+            # failure → re-raise (never silently drop a readable backup).
+            if _is_source_side_perm_skip(exc, live_path, backup_root):
+                _record_backup_skip(skipped_isolated, relpath, getattr(exc, "filename", None))
+                continue
+            raise
+        # Only record the manifest entry once the copy actually succeeded, so a
+        # skipped (uncopied) path never claims a backup that rollback can't find.
+        added_entries.append(entry)
 
     payload["added_entries"] = len(added_entries)
+    if skipped_isolated:
+        payload["skipped_isolated_count"] = len(skipped_isolated)
+        if len(skipped_isolated) <= 60:
+            payload["skipped_isolated"] = skipped_isolated
+        else:
+            payload["skipped_isolated"] = (
+                skipped_isolated[:50]
+                + [{"path": "...", "reason": "truncated"}]
+                + skipped_isolated[-10:]
+            )
 
     if added_entries and not args.dry_run:
         merged = existing_entries + added_entries
