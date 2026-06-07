@@ -33,6 +33,45 @@ MANAGED_CLAUDE_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
 # rerenders both blocks idempotently.
 
 
+def emit_json(payload: Any, rc: int = 0, *, indent: int | None = 2) -> int:
+    """Emit a command's JSON payload to stdout, BrokenPipe-safe (Issue #1660).
+
+    Every cmd_* helper ends by serializing its result and returning a process
+    rc. When the caller captures via command substitution
+    (`MIGRATION_JSON="$(python3 ... migrate-agents ...)"`) and that consumer
+    vanishes mid-write — e.g. a concurrent upgrade thrash — an unguarded
+    `print(json.dumps(...))` raises BrokenPipeError, which (uncaught) makes a
+    *completed* migration exit non-zero (observed exit 144). That mislead any
+    automation gating on the exit code.
+
+    Contract:
+      * write + flush happen INSIDE the try. The flush is REQUIRED — without
+        it a BrokenPipeError can surface during interpreter shutdown and still
+        perturb the exit code even though the body "succeeded".
+      * on BrokenPipeError, redirect stdout to os.devnull (the standard CPython
+        recipe) so the interpreter's final flush at shutdown does not re-raise,
+        then return the caller's intended rc.
+      * the caller's intended rc is ALWAYS preserved. A broken stdout must not
+        turn a non-zero rc (cmd_verify_tasks_db, cmd_apply_live) into 0, nor a
+        zero rc into non-zero. We do NOT install signal.signal(SIGPIPE,
+        SIG_DFL) globally — that would convert this completed-work case into a
+        141/signal exit instead of preserving rc.
+    """
+    text = json.dumps(payload, ensure_ascii=False, indent=indent)
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Consumer went away. Point stdout at devnull so the interpreter's
+        # shutdown flush is a no-op and cannot re-raise BrokenPipeError.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+    return rc
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -1085,8 +1124,7 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
         "scaffold_files": sum(len((item.rematerialize or {}).get("scaffold_paths") or []) for item in results),
         "agents": [asdict(item) for item in results],
     }
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    return emit_json(payload, 0)
 
 
 def conflict_backup_relpath(relpath: str) -> str:
@@ -2173,16 +2211,60 @@ def prune_daily_backup_archives(backup_dir: Path, retain_days: int, today: date)
     return pruned
 
 
-def remove_existing_target_children(target_root: Path) -> int:
+def remove_existing_target_children(target_root: Path, preserve_relpaths: set[str] | None = None) -> int:
+    # `preserve_relpaths` (Issue #1661): relative paths under target_root that
+    # must survive the wipe. Used by rollback to keep `state/locks` — which
+    # holds the active upgrade.lock the rollback ITSELF is holding — so a
+    # full-snapshot restore cannot delete its own singleton lock mid-flight and
+    # reopen the concurrent-mutation race. A preserved leaf keeps its inode
+    # (flock identity) AND its mkdir lockdir intact.
+    preserve = preserve_relpaths or set()
+    # Top-level child names that contain a preserved subpath — never rmtree
+    # these wholesale; descend and prune around the preserved entry instead.
+    preserved_top = {rel.split("/", 1)[0] for rel in preserve if rel}
+    # #1661: the raw pathlib metadata ops here are controller-only — this runs
+    # during a controller-driven rollback restore over the controller-owned live
+    # target tree (same category as the pre-#1661 body of this function, which
+    # the raw-pathlib baseline already accepts). The preserve-recursion descends
+    # ONLY into the controller-owned `state/` subtree (preserved_top); iso-owned
+    # agent homes still take the wholesale `shutil.rmtree` branch unchanged.
     removed = 0
     for child in sorted(target_root.iterdir()):
         if child.name == "backups":
+            continue
+        if child.name in preserved_top and child.is_dir() and not child.is_symlink():  # noqa: raw-pathlib-controller-only
+            removed += _remove_tree_except(child, target_root, preserve)
             continue
         removed += 1
         if child.is_symlink() or child.is_file():
             child.unlink(missing_ok=True)
         else:
             shutil.rmtree(child)
+    return removed
+
+
+def _remove_tree_except(node: Path, target_root: Path, preserve: set[str]) -> int:
+    # Recursively remove everything under `node` except paths whose relpath
+    # (from target_root) is in `preserve` or is an ancestor of a preserved
+    # path. The preserved leaf and its parent chain stay intact. #1661:
+    # controller-only — invoked solely from rollback's full-snapshot restore and
+    # confined to the controller-owned `state/` subtree (the only preserved_top),
+    # so the raw pathlib probes/mutations here never cross an iso-agent boundary.
+    removed = 0
+    for child in sorted(node.iterdir()):
+        rel = child.relative_to(target_root).as_posix()
+        if rel in preserve:
+            continue  # exact preserved leaf — keep it (and its contents)
+        if any(p == rel or p.startswith(rel + "/") for p in preserve):
+            # Ancestor of a preserved path — descend, do not remove the dir.
+            if child.is_dir() and not child.is_symlink():  # noqa: raw-pathlib-controller-only
+                removed += _remove_tree_except(child, target_root, preserve)
+            continue
+        removed += 1
+        if child.is_symlink() or child.is_file():  # noqa: raw-pathlib-controller-only
+            child.unlink(missing_ok=True)  # noqa: raw-pathlib-controller-only
+        else:
+            shutil.rmtree(child)  # noqa: raw-pathlib-controller-only
     return removed
 
 
@@ -2218,14 +2300,54 @@ def restore_live_backup(target_root: Path, backup_root: Path) -> int:
                 remove_path(dst)
                 removed += 1
         return removed
-    removed = remove_existing_target_children(target_root)
+    # Issue #1661: preserve state/locks across the full-snapshot wipe so the
+    # active upgrade.lock this rollback is holding survives — deleting it
+    # mid-rollback would reopen the concurrent-mutation race (flock: a
+    # recreated path is a new inode; mkdir: the lockdir frees immediately).
+    lock_preserve = {"state/locks"}
+    removed = remove_existing_target_children(target_root, preserve_relpaths=lock_preserve)
     for child in sorted(backup_live.iterdir()):
         dst = target_root / child.name
         if child.is_dir():
-            shutil.copytree(child, dst, symlinks=True, dirs_exist_ok=True)
+            # The backup snapshot itself can contain a STALE state/locks (it was
+            # taken during a prior LOCKED upgrade), so a plain merge would copy
+            # the old lock owner back over the live one — a concurrent run would
+            # then read a dead pid and reclaim the lock mid-rollback (mkdir
+            # backend). Skip the preserved subpaths on copy-back so the live
+            # lock dir + owner are never overwritten by stale backup contents.
+            shutil.copytree(
+                child,
+                dst,
+                symlinks=True,
+                dirs_exist_ok=True,
+                ignore=_make_preserve_ignore(target_root, child, lock_preserve),
+            )
         else:
             shutil.copy2(child, dst, follow_symlinks=False)
     return removed
+
+
+def _make_preserve_ignore(target_root: Path, backup_child: Path, preserve: set[str]):
+    # Build a shutil.copytree `ignore` callable that drops any directory entry
+    # whose destination relpath (under target_root) is in `preserve`. The
+    # callback receives the SOURCE dir + its entry names; we translate the
+    # source dir back to its destination-relative path to compare. Returns the
+    # set of names to skip at that level.
+    backup_root_for_child = backup_child.parent  # == backup_live
+
+    def _ignore(src_dir: str, names: list[str]) -> set[str]:
+        try:
+            rel_dir = Path(src_dir).relative_to(backup_root_for_child).as_posix()
+        except ValueError:
+            return set()
+        skip = set()
+        for name in names:
+            rel = f"{rel_dir}/{name}" if rel_dir != "." else name
+            if rel in preserve:
+                skip.add(name)
+        return skip
+
+    return _ignore
 
 
 def upgrade_state_path(target_root: Path) -> Path:
@@ -2801,8 +2923,7 @@ def cmd_analyze_live(args: argparse.Namespace) -> int:
         resolve_base_ref(target_root, args.base_ref or ""),
         str(getattr(args, "upstream_ref", "") or ""),
     )
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    return emit_json(payload, 0)
 
 
 def cmd_backup_live(args: argparse.Namespace) -> int:
@@ -2877,8 +2998,7 @@ def cmd_backup_live(args: argparse.Namespace) -> int:
                 + [{"path": "...", "reason": "truncated"}]
                 + deduped[-10:]
             )
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    return emit_json(payload, 0)
 
 
 def cmd_backup_extend_live(args: argparse.Namespace) -> int:
@@ -2915,8 +3035,7 @@ def cmd_backup_extend_live(args: argparse.Namespace) -> int:
 
     raw = (args.paths_json or "").strip()
     if not raw:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0
+        return emit_json(payload, 0)
 
     try:
         doc_payload = json.loads(raw)
@@ -3049,8 +3168,7 @@ def cmd_backup_extend_live(args: argparse.Namespace) -> int:
         # still leaves the full tree intact; leave snapshot_mode alone.
         save_json(manifest_path, manifest)
 
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    return emit_json(payload, 0)
 
 
 def cmd_daily_backup_live(args: argparse.Namespace) -> int:
@@ -3071,12 +3189,10 @@ def cmd_daily_backup_live(args: argparse.Namespace) -> int:
         "outcome": "skipped_no_target_root",
     }
     if not target_root.exists():
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0
+        return emit_json(payload, 0)
     if args.dry_run:
         payload["outcome"] = "dry_run"
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0
+        return emit_json(payload, 0)
 
     result = create_daily_backup_archive(target_root, backup_dir, today)
     payload["outcome"] = result["outcome"]
@@ -3102,8 +3218,7 @@ def cmd_daily_backup_live(args: argparse.Namespace) -> int:
         payload["pruned"] = prune_daily_backup_archives(backup_dir, retain_days, today)
         payload["snapshots_pruned"] = prune_sqlite_snapshots(target_root, retain_days, today)
 
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    return emit_json(payload, 0)
 
 
 def cmd_verify_tasks_db(args: argparse.Namespace) -> int:
@@ -3117,11 +3232,10 @@ def cmd_verify_tasks_db(args: argparse.Namespace) -> int:
     }
     if not db_path.exists():
         payload["error"] = "missing"
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
         # Fresh installs don't have tasks.db until the first task is filed.
         # Treat missing as non-fatal (exit 0); operator/agent reads `ok=false`
         # + `error=missing` from the JSON and decides what to do.
-        return 0
+        return emit_json(payload, 0)
     try:
         # mode=ro avoids any journal-mode side-effects on the live DB; the
         # Bridge guard policy that flags raw `sqlite3 state/tasks.db` from
@@ -3138,8 +3252,7 @@ def cmd_verify_tasks_db(args: argparse.Namespace) -> int:
         payload["error"] = f"sqlite_error: {exc}"
     except Exception as exc:  # pragma: no cover
         payload["error"] = f"{type(exc).__name__}: {exc}"
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0 if payload["ok"] else 1
+    return emit_json(payload, 0 if payload["ok"] else 1)
 
 
 # --- backup residue cleanup -------------------------------------------------
@@ -3405,8 +3518,7 @@ def cmd_cleanup_residue(args: argparse.Namespace) -> int:
     )
     payload["bytes_freed_human"] = _format_bytes(payload["bytes_freed"])
 
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    return emit_json(payload, 0)
 
 
 def cmd_apply_live(args: argparse.Namespace) -> int:
@@ -3422,8 +3534,7 @@ def cmd_apply_live(args: argparse.Namespace) -> int:
         run_id=str(getattr(args, "run_id", "") or ""),
         upstream_ref=str(getattr(args, "upstream_ref", "") or ""),
     )
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 2 if payload.get("aborted") else 0
+    return emit_json(payload, 2 if payload.get("aborted") else 0)
 
 
 def cmd_write_state(args: argparse.Namespace) -> int:
@@ -3442,8 +3553,7 @@ def cmd_write_state(args: argparse.Namespace) -> int:
     if analysis_payload:
         payload["analysis"] = analysis_payload
     save_json(upgrade_state_path(target_root), payload)
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    return emit_json(payload, 0)
 
 
 def cmd_rollback_live(args: argparse.Namespace) -> int:
@@ -3462,8 +3572,7 @@ def cmd_rollback_live(args: argparse.Namespace) -> int:
     if not args.dry_run:
         payload["removed_entries"] = restore_live_backup(target_root, backup_root)
         payload["restored"] = True
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    return emit_json(payload, 0)
 
 
 def _resolve_conflict_path(target_root: Path, raw: str) -> Path:
@@ -3527,8 +3636,7 @@ def cmd_conflicts_list(args: argparse.Namespace) -> int:
         )
     rows.sort(key=lambda row: row["mtime"], reverse=True)
     if args.json:
-        print(json.dumps({"conflicts": rows, "count": len(rows)}, ensure_ascii=False, indent=2))
-        return 0
+        return emit_json({"conflicts": rows, "count": len(rows)}, 0)
     if not rows:
         print("(no pending .upgrade-conflict files)")
         return 0
@@ -3739,12 +3847,11 @@ def cmd_conflicts_adopt(args: argparse.Namespace) -> int:
         "conflict_adopt",
         {"conflict": str(conflict), "live_target": str(live), "forced": force},
     )
-    print(
-        json.dumps(
-            {"action": "adopt", "conflict": str(conflict), "live_target": str(live), "forced": force}
-        )
+    return emit_json(
+        {"action": "adopt", "conflict": str(conflict), "live_target": str(live), "forced": force},
+        0,
+        indent=None,
     )
-    return 0
 
 
 def cmd_conflicts_discard(args: argparse.Namespace) -> int:
@@ -3761,8 +3868,7 @@ def cmd_conflicts_discard(args: argparse.Namespace) -> int:
         "conflict_discard",
         {"conflict": str(conflict)},
     )
-    print(json.dumps({"action": "discard", "conflict": str(conflict)}))
-    return 0
+    return emit_json({"action": "discard", "conflict": str(conflict)}, 0, indent=None)
 
 
 def cmd_conflicts_archive(args: argparse.Namespace) -> int:
@@ -3779,8 +3885,11 @@ def cmd_conflicts_archive(args: argparse.Namespace) -> int:
         "conflict_archive",
         {"conflict": str(conflict), "archived_to": str(dest), "reason": "manual"},
     )
-    print(json.dumps({"action": "archive", "conflict": str(conflict), "archived_to": str(dest)}))
-    return 0
+    return emit_json(
+        {"action": "archive", "conflict": str(conflict), "archived_to": str(dest)},
+        0,
+        indent=None,
+    )
 
 
 def cmd_conflicts_reconcile(args: argparse.Namespace) -> int:
@@ -3874,8 +3983,7 @@ def cmd_conflicts_reconcile(args: argparse.Namespace) -> int:
             / f"auto-archive-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
         )
         save_json(receipt_path, payload)
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    return emit_json(payload, 0)
 
 
 def build_parser() -> argparse.ArgumentParser:
