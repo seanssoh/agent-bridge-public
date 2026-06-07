@@ -5053,6 +5053,37 @@ bridge_agent_default_home() {
   printf '%s/%s' "$BRIDGE_AGENT_HOME_ROOT" "$agent"
 }
 
+bridge_agent_operator_home_dir() {
+  if [[ -n "${BRIDGE_CONTROLLER_HOME:-}" ]]; then
+    printf '%s' "$BRIDGE_CONTROLLER_HOME"
+    return 0
+  fi
+
+  local controller_user=""
+  local controller_home=""
+  if declare -F bridge_isolation_v2_controller_user >/dev/null 2>&1; then
+    controller_user="$(bridge_isolation_v2_controller_user 2>/dev/null || true)"
+  fi
+  if [[ -z "$controller_user" ]]; then
+    controller_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+  fi
+  if [[ -n "$controller_user" ]]; then
+    if command -v getent >/dev/null 2>&1; then
+      controller_home="$(getent passwd "$controller_user" 2>/dev/null | cut -d: -f6 || true)"
+    fi
+    if [[ -z "$controller_home" && "$(uname -s 2>/dev/null || printf '')" == "Darwin" ]] \
+        && command -v dscl >/dev/null 2>&1; then
+      controller_home="$(dscl . -read "/Users/$controller_user" NFSHomeDirectory 2>/dev/null \
+        | awk '{print $2; exit}' || true)"
+    fi
+  fi
+  if [[ -z "$controller_home" ]]; then
+    controller_home="${HOME:-}"
+  fi
+  [[ -n "$controller_home" ]] || return 1
+  printf '%s' "$controller_home"
+}
+
 bridge_agent_claude_home_dir() {
   local agent="$1"
   local os_user=""
@@ -5065,7 +5096,7 @@ bridge_agent_claude_home_dir() {
     fi
   fi
 
-  bridge_agent_default_home "$agent"
+  bridge_agent_operator_home_dir
 }
 
 # Lane A (v0.15.0-beta4): iso-v2 agents' Claude config dir must
@@ -5091,7 +5122,11 @@ bridge_agent_claude_home_dir() {
 #      iso UID prefix is conventionally `agent-bridge-` and can be
 #      overridden by `BRIDGE_AGENT_OS_USER_PREFIX` (existing project
 #      convention; `BRIDGE_OS_USER_PREFIX` was a typo introduced at r2).
-#   3) Otherwise, non-iso path — daemon HOME (caller's view).
+#   3) Otherwise, shared/non-iso path — per-agent Claude config dir.
+#      Shared agents now inherit the operator HOME, but Claude state
+#      remains anchored at the per-agent config dir so transcripts,
+#      settings, and file credentials do not collapse into the
+#      operator's ~/.claude tree.
 bridge_agent_claude_config_dir() {
   local agent="$1"
   local home_dir=""
@@ -5125,10 +5160,10 @@ bridge_agent_claude_config_dir() {
     fi
   fi
 
-  # Non-iso path or all iso-resolution attempts failed: print the
-  # legacy controller-view path. Callers gate on `[[ -d ]]`, so a
-  # non-existent path falls through to the daemon-HOME default.
-  printf '%s/.claude' "$(bridge_agent_claude_home_dir "$agent")"
+  # Shared/non-iso path or all iso-resolution attempts failed: keep
+  # Claude's config/state under the per-agent home even though shared
+  # launches use the operator HOME for generic ~/.config tools.
+  printf '%s/.claude' "$(bridge_agent_default_home "$agent")"
 }
 
 # bridge_ensure_claude_first_run_config <agent>

@@ -220,20 +220,29 @@ assert_teams_delivery_mode_source_grep_gate() {
 }
 
 assert_stale_claude_home_prefix_is_rewritten() {
-  local launch_cmd home_count config_count
+  local launch_cmd home_count config_count operator_home
+  # #1621/#1622 shared-mode contract: a shared (non-iso) Claude agent now runs
+  # with HOME = the OPERATOR home (so generic ~/.config tools stay shared) and
+  # CLAUDE_CONFIG_DIR = the PER-AGENT config dir (so Claude identity/settings/
+  # transcripts/credentials stay isolated). Pin the operator home to a fixture
+  # via BRIDGE_CONTROLLER_HOME so the assertion is portable (otherwise it
+  # resolves to the real $HOME of whoever runs the smoke).
+  operator_home="$BRIDGE_AGENT_ROOT_V2/operator-home"
   BRIDGE_AGENT_CHANNELS["worker"]="server:teams"
   BRIDGE_AGENT_LAUNCH_CMD["worker"]="HOME=/home/ec2-user CLAUDE_CONFIG_DIR=/home/ec2-user/.claude claude --dangerously-skip-permissions"
 
-  launch_cmd="$(bridge_agent_launch_cmd worker)"
+  launch_cmd="$(BRIDGE_CONTROLLER_HOME="$operator_home" bridge_agent_launch_cmd worker)"
 
-  smoke_assert_contains "$launch_cmd" "HOME=$BRIDGE_AGENT_ROOT_V2/worker/home" \
-    "stale inherited HOME is rewritten to the agent-scoped home"
+  smoke_assert_contains "$launch_cmd" "HOME=$operator_home " \
+    "stale inherited HOME is rewritten to the operator home (shared-mode #1621)"
   smoke_assert_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=$BRIDGE_AGENT_ROOT_V2/worker/home/.claude" \
-    "stale inherited Claude config dir is rewritten to the agent-scoped config dir"
+    "Claude config dir stays the per-agent config dir (#1520/#1621 isolation)"
   smoke_assert_not_contains "$launch_cmd" "HOME=/home/ec2-user " \
     "stale controller HOME does not survive"
   smoke_assert_not_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=/home/ec2-user/.claude" \
     "stale controller Claude config dir does not survive"
+  smoke_assert_not_contains "$launch_cmd" "HOME=$BRIDGE_AGENT_ROOT_V2/worker/home " \
+    "shared-mode HOME is NOT the per-agent home (would fragment ~/.config; #1370)"
 
   home_count="$(count_substring "$launch_cmd" "HOME=")"
   config_count="$(count_substring "$launch_cmd" "CLAUDE_CONFIG_DIR=")"

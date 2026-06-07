@@ -74,8 +74,9 @@ fi
 #       `<pwent_home>/.claude` via getent fallback when the roster
 #       array is empty AND iso v2 is effective.
 #
-#   T4: `bridge_agent_claude_config_dir` returns the legacy / daemon
-#       HOME path for a non-iso agent (backward compatibility).
+#   T4: `bridge_agent_claude_config_dir` returns the per-agent Claude
+#       config path for shared/non-iso agents, while
+#       `bridge_agent_claude_home_dir` returns operator HOME.
 #
 #   T5: snippet absence — the reader silently no-ops (no error
 #       output, no array population) when `agent-meta.env` is missing
@@ -248,22 +249,26 @@ fi
 smoke_log "T3 PASS — getent-based iso v2 fallback wired into bridge_agent_claude_config_dir"
 
 # ---------------------------------------------------------------------
-# T4: non-iso path preserves legacy / daemon HOME resolution.
+# T4: shared/non-iso path splits HOME from Claude config resolution.
 # ---------------------------------------------------------------------
-smoke_log "T4: bridge_agent_claude_config_dir non-iso path returns legacy controller-view"
+smoke_log "T4: shared/non-iso Claude config stays per-agent while HOME is operator"
 
-# The function body must still call `bridge_agent_claude_home_dir`
-# (which contains the non-iso fallback to `bridge_agent_default_home`).
-if [[ "$T3_FN_BODY" != *"bridge_agent_claude_home_dir"* ]]; then
-  smoke_fail "T4: bridge_agent_claude_config_dir non-iso path dropped — non-iso agents will lose their config dir resolution"
+# The config-dir fallback must be anchored at the per-agent default home,
+# not at `bridge_agent_claude_home_dir` (which now resolves shared HOME to
+# the operator home).
+if [[ "$T3_FN_BODY" != *"bridge_agent_default_home"* ]]; then
+  smoke_fail "T4: bridge_agent_claude_config_dir shared fallback dropped bridge_agent_default_home — shared agents will lose per-agent Claude state"
 fi
-# And `bridge_agent_claude_home_dir` itself must keep the non-iso
-# branch returning `bridge_agent_default_home`.
+if [[ "$T3_FN_BODY" == *"bridge_agent_claude_home_dir"* ]]; then
+  smoke_fail "T4: bridge_agent_claude_config_dir still derives from HOME — shared agents would collapse into operator .claude"
+fi
+# And `bridge_agent_claude_home_dir` itself must return the operator home
+# for shared/non-iso agents.
 T4_HOME_FN_BODY="$(awk '/^bridge_agent_claude_home_dir\(\) \{/,/^\}/' "$AGENTS_LIB")"
-if [[ "$T4_HOME_FN_BODY" != *"bridge_agent_default_home"* ]]; then
-  smoke_fail "T4: bridge_agent_claude_home_dir non-iso branch removed — non-iso agents will lose their HOME default"
+if [[ "$T4_HOME_FN_BODY" != *"bridge_agent_operator_home_dir"* ]]; then
+  smoke_fail "T4: bridge_agent_claude_home_dir shared branch does not resolve operator HOME"
 fi
-smoke_log "T4 PASS — non-iso resolution preserved (backward compat)"
+smoke_log "T4 PASS — shared HOME/config split is wired"
 
 # ---------------------------------------------------------------------
 # T5: snippet absence → reader silently no-ops.
@@ -371,7 +376,7 @@ T7_TMP="$(mktemp "${SMOKE_TMP_ROOT:-/tmp}/A-beta4-T7-lines.XXXXXX")"
 printf '%s\n' "$T7_LINES" >"$T7_TMP"
 T7_ISO_BRANCH="$(awk '
   /bridge_agent_linux_user_isolation_effective/,0
-' <"$T7_TMP" | sed -n '1,/Non-iso path/p')"
+' <"$T7_TMP" | sed -n '1,/Shared\/non-iso path/p')"
 rm -f "$T7_TMP"
 
 if [[ "$T7_ISO_BRANCH" == *"bridge_agent_default_home"* ]]; then
