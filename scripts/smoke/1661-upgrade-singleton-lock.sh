@@ -223,7 +223,7 @@ test_upgrade_sh_locks_mutating_only() {
   mkdir -p "$home/state" "$src"
   # Minimal source checkout so the script can resolve SOURCE_ROOT.
   git -C "$src" init -q
-  git -C "$src" config user.email s@e.com
+  git -C "$src" config user.email smoke@example.com
   git -C "$src" config user.name s
   git -C "$src" config commit.gpgsign false
   printf '0.16.2\n' >"$src/VERSION"
