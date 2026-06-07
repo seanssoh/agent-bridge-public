@@ -4100,14 +4100,14 @@ bridge_persist_agent_state() {
 
 # Issue #1015: resolve the Claude config dir to hand the session-id
 # helpers — but ONLY when `agent` is a genuinely registered agent whose
-# linux-user isolation is *effective* AND whose computed config dir
-# actually exists on disk. For test / unregistered / non-isolated callers,
-# `bridge_agent_claude_config_dir` still returns a *derived* path (e.g.
-# `$BRIDGE_AGENT_HOME_ROOT/<name>/.claude`); passing that to the helper
-# would OVERRIDE the per-call `HOME` the caller relies on and search the
-# wrong tree. Returning empty in that case lets the helper fall back to
+# computed config dir actually exists on disk and is known to be live.
+# For test / unregistered callers, `bridge_agent_claude_config_dir` still
+# returns a derived path; passing that to the helper would OVERRIDE the
+# per-call `HOME` the caller relies on and search the wrong tree.
+# Returning empty in that case lets the helper fall back to
 # `CLAUDE_CONFIG_DIR` env / `HOME` / `~` exactly as on `main`. Echoes the
-# config dir on stdout, or nothing when no isolated config dir is in play.
+# config dir on stdout, or nothing when no agent-specific config dir is in
+# play.
 #
 # Issue #1370 (beta5-2 #1316 regression): the iso-effective gate below is
 # the real defense — beta5-2's Lane θ ".claude tree normalize" backfill
@@ -4134,21 +4134,17 @@ bridge_resolve_agent_claude_config_dir() {
 
   # Issue #1370 (beta5-2 #1316 regression) gated this purely on linux-user
   # isolation being *effective*: when it is NOT (every non-Linux host, and
-  # shared-mode Linux agents) the agent USUALLY shares the controller HOME
-  # ~/.claude, so a derived <agent-home>/.claude is an empty #1316 scaffold
-  # that must NOT shadow the controller HOME (it would block --continue
-  # resume).
+  # shared-mode Linux agents) the agent was assumed to share the controller
+  # HOME ~/.claude, so a derived <agent-home>/.claude looked like an empty
+  # #1316 scaffold that must NOT shadow the controller HOME.
   #
-  # But that assumption is false on installs where each agent is launched with
-  # its OWN HOME (<agent-home>) even in shared mode — e.g. per-agent-HOME
-  # layouts on macOS/non-Linux hosts. There Claude writes its session JSON
-  # under <agent-home>/.claude/projects, which IS the live session location.
-  # The old gate discarded it, so bridge_detect_claude_session_id was handed
-  # an empty config dir, scanned the stale controller HOME, found no fresh
-  # transcript, returned 1, and the restart helper rolled back every
-  # just-launched session — a whole-fleet crash-loop (surfaced when Claude CLI
-  # boot grew slower than the session-id detect window). Discriminate an empty
-  # #1316 scaffold from a live per-agent home by whether projects/ holds data.
+  # That assumption is false for shared agents that launch Claude with a
+  # per-agent CLAUDE_CONFIG_DIR. HOME may now be the operator HOME again,
+  # but Claude still writes session JSON under <agent-home>/.claude/projects,
+  # which is the live session location. Discriminate an empty #1316
+  # scaffold from a live per-agent config dir by whether projects/ holds
+  # data; this keeps stale scaffolds from shadowing the operator HOME while
+  # still allowing live shared-agent resumes.
   #
   # iso-effective Linux agents own a private config dir unconditionally and
   # skip the scaffold check (the controller cannot stat their iso-UID

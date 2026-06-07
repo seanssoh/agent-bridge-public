@@ -966,6 +966,211 @@ bridge_isolation_v2_migrate_shared_sentinel_write() {
   return 0
 }
 
+bridge_isolation_v2_migrate_path_abs() {
+  local path="$1"
+  local dir base
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
+  (cd "$dir" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$base") || printf '%s' "$path"
+}
+
+bridge_isolation_v2_migrate_symlink_target_abs() {
+  local link_path="$1"
+  local target=""
+  target="$(readlink "$link_path" 2>/dev/null || true)"
+  [[ -n "$target" ]] || return 1
+  case "$target" in
+    /*) printf '%s' "$target" ;;
+    *) bridge_isolation_v2_migrate_path_abs "$(dirname "$link_path")/$target" ;;
+  esac
+}
+
+bridge_isolation_v2_migrate_creds_sentinel_write() {
+  local sentinel="$1" agent="$2" operator_home="$3" status="$4" details="$5"
+  local tmp="${sentinel}.tmp.$$"
+  mkdir -p "$(dirname "$sentinel")" 2>/dev/null || {
+    bridge_warn "creds_consolidate: mkdir sentinel dir failed: $(dirname "$sentinel")"
+    return 1
+  }
+  {
+    printf '# shared-mode credential config consolidation sentinel\n'
+    printf 'agent=%s\n' "$agent"
+    printf 'operator_home=%s\n' "$operator_home"
+    printf 'status=%s\n' "$status"
+    printf 'details=%s\n' "$details"
+    printf 'written_at=%s\n' "$(date -Iseconds 2>/dev/null || date 2>/dev/null || printf 'unknown')"
+  } > "$tmp" 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null || true
+    bridge_warn "creds_consolidate: write sentinel failed: $tmp"
+    return 1
+  }
+  mv -f "$tmp" "$sentinel" 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null || true
+    bridge_warn "creds_consolidate: mv sentinel failed: $sentinel"
+    return 1
+  }
+  return 0
+}
+
+bridge_isolation_v2_migrate_consolidate_one_config_dir() {
+  local agent="$1" source_path="$2" target_path="$3" stamp="$4"
+  local source_abs=""
+  local target_abs=""
+  local link_abs=""
+  local backup_path=""
+  local -a rsync_flags
+
+  source_abs="$(bridge_isolation_v2_migrate_path_abs "$source_path")"
+  target_abs="$(bridge_isolation_v2_migrate_path_abs "$target_path")"
+
+  if [[ "$source_abs" == "$target_abs" ]]; then
+    return 0
+  fi
+
+  if [[ -L "$source_path" ]]; then
+    link_abs="$(bridge_isolation_v2_migrate_symlink_target_abs "$source_path" || true)"
+    if [[ "$link_abs" == "$target_abs" ]]; then
+      return 0
+    fi
+    bridge_warn "creds_consolidate: $agent has wrong symlink $source_path -> ${link_abs:-<unresolved>} (expected $target_abs); refusing to clobber"
+    return 1
+  fi
+
+  [[ -e "$source_path" ]] || return 0
+  if [[ ! -d "$source_path" ]]; then
+    bridge_warn "creds_consolidate: $agent source is not a directory: $source_path"
+    return 1
+  fi
+  if [[ -e "$target_path" && ! -d "$target_path" ]]; then
+    bridge_warn "creds_consolidate: target exists but is not a directory: $target_path"
+    return 1
+  fi
+
+  mkdir -p "$target_path" 2>/dev/null || {
+    bridge_warn "creds_consolidate: mkdir target failed: $target_path"
+    return 1
+  }
+
+  rsync_flags=(-a)
+  if ! rsync "${rsync_flags[@]}" "$source_path"/ "$target_path"/ 2>/dev/null; then
+    bridge_warn "creds_consolidate: rsync $source_path -> $target_path failed"
+    return 1
+  fi
+
+  backup_path="${source_path}.pre-home-revert.${stamp}"
+  if [[ -e "$backup_path" || -L "$backup_path" ]]; then
+    bridge_warn "creds_consolidate: backup path already exists, refusing to overwrite: $backup_path"
+    return 1
+  fi
+  if ! mv "$source_path" "$backup_path" 2>/dev/null; then
+    bridge_warn "creds_consolidate: move source aside failed: $source_path -> $backup_path"
+    return 1
+  fi
+  if ! ln -s "$target_path" "$source_path" 2>/dev/null; then
+    bridge_warn "creds_consolidate: symlink install failed: $source_path -> $target_path"
+    mv "$backup_path" "$source_path" 2>/dev/null || \
+      bridge_warn "creds_consolidate: rollback move failed: $backup_path -> $source_path"
+    return 1
+  fi
+  return 0
+}
+
+bridge_isolation_v2_migrate_consolidate_agent_creds() {
+  local agent="$1" agent_home="$2" operator_home="$3"
+  local sentinel="$agent_home/.creds-consolidated.sentinel"
+  local status="ok"
+  local details=""
+  local stamp=""
+  local cfg source_path target_path
+  local failed=0
+  local touched=0
+
+  [[ -f "$sentinel" ]] && return 0
+  [[ -d "$agent_home" ]] || return 0
+  [[ -n "$operator_home" ]] || {
+    bridge_warn "creds_consolidate: operator HOME is empty"
+    return 1
+  }
+
+  stamp="$(date '+%Y%m%d%H%M%S' 2>/dev/null || printf '%s' "$$")"
+  mkdir -p "$operator_home/.config" 2>/dev/null || {
+    bridge_warn "creds_consolidate: mkdir operator .config failed: $operator_home/.config"
+    return 1
+  }
+
+  for cfg in gh gws gcloud; do
+    source_path="$agent_home/.config/$cfg"
+    target_path="$operator_home/.config/$cfg"
+    if [[ -e "$source_path" || -L "$source_path" ]]; then
+      touched=1
+      if bridge_isolation_v2_migrate_consolidate_one_config_dir \
+          "$agent" "$source_path" "$target_path" "$stamp"; then
+        details="${details}${cfg}:ok;"
+      else
+        details="${details}${cfg}:failed;"
+        failed=1
+      fi
+    else
+      details="${details}${cfg}:absent;"
+    fi
+  done
+
+  if (( failed != 0 )); then
+    status="partial"
+  elif (( touched == 0 )); then
+    status="no-sources"
+  fi
+  bridge_isolation_v2_migrate_creds_sentinel_write \
+    "$sentinel" "$agent" "$operator_home" "$status" "$details" || return 1
+  (( failed == 0 ))
+}
+
+bridge_isolation_v2_migrate_shared_credential_configs() {
+  local data_root="$1" target_root="$2"
+  local operator_home=""
+  local snapshot=""
+  local agent=""
+  local agent_home=""
+  local failed=0
+
+  : "$data_root"
+
+  if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+    operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+  fi
+  if [[ -z "$operator_home" ]]; then
+    operator_home="${BRIDGE_CONTROLLER_HOME:-${HOME:-}}"
+  fi
+  [[ -n "$operator_home" ]] || {
+    bridge_warn "creds_consolidate: cannot resolve operator HOME"
+    return 1
+  }
+
+  bridge_isolation_v2_migrate_capture_all_agents_snapshot
+  snapshot="$(bridge_isolation_v2_migrate_all_agents_snapshot_path)"
+  [[ -f "$snapshot" ]] || return 0
+
+  while IFS= read -r agent; do
+    [[ -n "$agent" ]] || continue
+    if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+        && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      continue
+    fi
+    if command -v bridge_agent_default_home >/dev/null 2>&1; then
+      agent_home="$(bridge_agent_default_home "$agent" 2>/dev/null || true)"
+    else
+      agent_home="${BRIDGE_AGENT_HOME_ROOT:-$target_root/agents}/$agent"
+    fi
+    [[ -n "$agent_home" ]] || continue
+    if ! bridge_isolation_v2_migrate_consolidate_agent_creds \
+        "$agent" "$agent_home" "$operator_home"; then
+      failed=1
+    fi
+  done < "$snapshot"
+
+  (( failed == 0 ))
+}
+
 # ---------------------------------------------------------------------------
 # 6. group ensure + post-flight probe
 # ---------------------------------------------------------------------------
@@ -2048,6 +2253,17 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
   # install keeps working exactly as before this migrate ran.
   if ! bridge_isolation_v2_migrate_shared_backfill "$data_root" "$target_root"; then
     bridge_warn "apply_for_upgrade: shared-tree backfill did not complete; resolver will keep using the legacy shared path (no split-brain, but data/shared not yet canonical — rerun \`agent-bridge upgrade --apply\` after addressing the warned cause)"
+  fi
+
+  # Shared-mode HOME-revert credential consolidation — MUST run beside
+  # shared_backfill before any skip branch. The runtime is moving shared
+  # agents back to the operator HOME for generic ~/.config tools, while
+  # Claude keeps CLAUDE_CONFIG_DIR per-agent. Preserve existing per-agent
+  # gh/gws/gcloud state by mirroring it into operator ~/.config and then
+  # flipping the per-agent path to a symlink. Sentinel-gated and
+  # non-destructive: source dirs are moved aside as backups, never deleted.
+  if ! bridge_isolation_v2_migrate_shared_credential_configs "$data_root" "$target_root"; then
+    bridge_warn "apply_for_upgrade: shared credential config consolidation reported warnings; inspect .creds-consolidated.sentinel and rerun after addressing any non-mergeable paths"
   fi
 
   # v0.13.10: markerless-existing-install + no-isolated-roster fast-path.

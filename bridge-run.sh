@@ -1138,11 +1138,16 @@ bridge_run_schedule_dev_channels_accept() {
 bridge_run_agent_claude_root() {
   # Resolve the Claude config root the launched agent will actually use.
   # Keep this in one place so the dev-plugin cache sync and plugin enable
-  # preflight operate on the same per-agent HOME/CLAUDE_CONFIG_DIR as the
-  # final LAUNCH_CMD. Otherwise shared agents can sync into their agent
-  # home but run `claude plugin enable` against the controller's home,
-  # leaving the launched Claude process with the channel plugin disabled.
+  # preflight operate on the same CLAUDE_CONFIG_DIR as the final
+  # LAUNCH_CMD. Shared agents inherit the operator HOME for generic
+  # ~/.config tools, but Claude state remains per-agent via
+  # CLAUDE_CONFIG_DIR.
   local _agent_os_user_local=""
+
+  if command -v bridge_agent_claude_config_dir >/dev/null 2>&1; then
+    bridge_agent_claude_config_dir "$AGENT"
+    return 0
+  fi
 
   if ! bridge_isolation_disabled_by_env && bridge_agent_linux_user_isolation_effective "$AGENT"; then
     _agent_os_user_local="$(bridge_agent_os_user "$AGENT")"
@@ -1220,12 +1225,18 @@ bridge_run_claude_keychain_free_preflight() {
   BRIDGE_RUN_CLAUDE_KEYCHAIN_FREE_VALIDATED=1
 }
 
+# shellcheck disable=SC2030,SC2031 # plugin preflight intentionally scopes env to this subshell.
 bridge_run_ensure_claude_launch_channel_plugins() {
   local agent_claude_root=""
   local agent_home=""
 
   agent_claude_root="$(bridge_run_agent_claude_root)"
-  agent_home="${agent_claude_root%/.claude}"
+  if command -v bridge_agent_claude_home_dir >/dev/null 2>&1; then
+    agent_home="$(bridge_agent_claude_home_dir "$AGENT" 2>/dev/null || true)"
+  fi
+  if [[ -z "$agent_home" ]]; then
+    agent_home="${agent_claude_root%/.claude}"
+  fi
   (
     export HOME="$agent_home"
     # SC2030: subshell-local export is intentional — it scopes HOME /
@@ -1466,6 +1477,24 @@ bridge_run_shared_launch() {
     fi
   fi
   return "$_rc"
+}
+
+# shellcheck disable=SC2030,SC2031 # launch env export is intentional for the child command below.
+bridge_run_export_claude_launch_env() {
+  local agent_claude_root=""
+  local agent_home=""
+
+  [[ "$ENGINE" == "claude" ]] || return 0
+
+  agent_claude_root="$(bridge_run_agent_claude_root)"
+  if command -v bridge_agent_claude_home_dir >/dev/null 2>&1; then
+    agent_home="$(bridge_agent_claude_home_dir "$AGENT" 2>/dev/null || true)"
+  fi
+  if [[ -z "$agent_home" ]]; then
+    agent_home="${agent_claude_root%/.claude}"
+  fi
+  [[ -n "$agent_home" ]] && export HOME="$agent_home"
+  [[ -n "$agent_claude_root" ]] && export CLAUDE_CONFIG_DIR="$agent_claude_root"
 }
 
 bridge_run_sync_dev_plugin_cache() {
@@ -1793,6 +1822,10 @@ while true; do
     LAUNCH_CMD="$(bridge_rewrite_launch_cmd_engine_bin "$LAUNCH_CMD" "$BRIDGE_ENGINE_BIN")"
   fi
   local_launch_cmd_display="$(bridge_redact_inline_env_secrets "$LAUNCH_CMD")"
+
+  if [[ "$ENGINE" == "claude" ]]; then
+    bridge_run_export_claude_launch_env
+  fi
 
   if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
     bridge_run_claude_keychain_free_preflight
