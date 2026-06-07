@@ -134,6 +134,10 @@ add_required a2a-backpressure-openonly
 # #1575-B + #1589/B8: A2A sender retry scheduling keeps our exponential backoff
 # ceiling separate from peer Retry-After floor caps.
 add_required 1575b-a2a-backoff-ceiling
+# #1618: `agb a2a outbox retry` of a dead/retry row resets attempts=0 (alongside
+# next_attempt_ts=0) so a manual retry walks the backoff ladder from the base
+# interval instead of one-shot-then-ceiling / re-dead-letter.
+add_required 1618-outbox-retry-resets-attempts
 # #1595: A2A is transport-pluggable (Tailscale | cloudflare-warp-mesh). The
 # Cloudflare bind proof inspects REAL local interface state + WARP connected/
 # enrolled status (CIDR shape is NOT proof; fail-closed on uncertainty); the
@@ -1027,7 +1031,7 @@ select_for_path() {
       add_required queue a2a-rooms-p1b-acl
       ;;
 
-    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|lib/daemon-helpers/a2a-receiver-exit-cause.py|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/smoke/rooms-p4-2-roster-broadcast-helper.py|scripts/smoke/rooms-p4-2-post-hook.sh|scripts/smoke/rooms-p4-3-room-talk-helper.py|scripts/smoke/rooms-p4-3-post-hook.sh|scripts/smoke/1594-rooms-fanout-helper.py|scripts/smoke/1594-rooms-fanout-post-hook.sh|scripts/smoke/1594-rooms-fanout-local-hook.sh|scripts/smoke/rooms-p4-5-polish.sh|scripts/smoke/rooms-p4-5-helper.py|scripts/smoke/1563-pr8-a2a-diag-recovery-helper.py|scripts/smoke/1575b-a2a-backoff-ceiling-helper.py|scripts/smoke/1595-cloudflare-warp-mesh-helper.py|scripts/install-handoffd-systemd.sh)
+    bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|lib/daemon-helpers/a2a-receiver-exit-cause.py|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/smoke/rooms-p4-2-roster-broadcast-helper.py|scripts/smoke/rooms-p4-2-post-hook.sh|scripts/smoke/rooms-p4-3-room-talk-helper.py|scripts/smoke/rooms-p4-3-post-hook.sh|scripts/smoke/1594-rooms-fanout-helper.py|scripts/smoke/1594-rooms-fanout-post-hook.sh|scripts/smoke/1594-rooms-fanout-local-hook.sh|scripts/smoke/rooms-p4-5-polish.sh|scripts/smoke/rooms-p4-5-helper.py|scripts/smoke/1563-pr8-a2a-diag-recovery-helper.py|scripts/smoke/1575b-a2a-backoff-ceiling-helper.py|scripts/smoke/1618-outbox-retry-resets-attempts-helper.py|scripts/smoke/1595-cloudflare-warp-mesh-helper.py|scripts/install-handoffd-systemd.sh)
       # Issue #1032: A2A cross-bridge task handoff. Any move to the
       # receiver daemon, sender outbox/delivery-runner, shared protocol
       # module, lifecycle helper, or the smoke helper re-runs the
@@ -1196,7 +1200,13 @@ select_for_path() {
       # hot-reload). Pull 1612-upgrade-restart-receiver whenever the receiver
       # lifecycle script / lib-a2a moves so a change to the status output shape
       # or the restart subcommand cannot silently break the upgrade-time cycle.
-      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force a2a-backpressure-openonly rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk 1594-rooms-fanout rooms-p4-5-polish 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr8-a2a-diag-recovery 1575b-a2a-backoff-ceiling 1595-cloudflare-warp-mesh 1612-upgrade-restart-receiver
+      # Issue #1618: bridge-a2a.py's `outbox retry` resets attempts=0 (alongside
+      # next_attempt_ts=0) so a manual retry of a dead/retry row walks the backoff
+      # ladder from the base interval instead of one-shot-then-ceiling /
+      # re-dead-letter. 1618-outbox-retry-resets-attempts drives the REAL
+      # cmd_outbox retry path + _schedule_retry; pull it on every bridge-a2a.py
+      # move so the attempt-reset cannot regress to the preserve-attempts footgun.
+      add_required a2a-cross-bridge queue I-beta4-a2a-3-gaps J-beta4-workflow-docs beta5-2-lambda-a2a-robustness a2a-tailscale-identity-resolve a2a-daemon-selfheal-reconcile a2a-migrate-identity a2a-ip-change-announce 1405-handoffd-supervision a2a-setup-wizard a2a-rooms-p1a a2a-rooms-p1b-acl a2a-rooms-1517-bootstrap 1398-a2a-inbound-stopped-target-force a2a-backpressure-openonly rooms-p4-1-cross-node-join rooms-p4-2-roster-broadcast rooms-p4-3-room-talk 1594-rooms-fanout rooms-p4-5-polish 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr8-a2a-diag-recovery 1575b-a2a-backoff-ceiling 1618-outbox-retry-resets-attempts 1595-cloudflare-warp-mesh 1612-upgrade-restart-receiver
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)
@@ -3011,6 +3021,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # already pulls it via the full static suite; this arm keeps the
       # selection focused when only these two files change).
       add_required 1611-migrate-orphan-skip
+      ;;
+
+    scripts/smoke/1618-outbox-retry-resets-attempts.sh|scripts/smoke/1618-outbox-retry-resets-attempts-helper.py)
+      # Issue #1618: editing the outbox-retry-reset smoke or its helper re-runs
+      # the smoke directly (the scripts/smoke/* catch-all already pulls it via
+      # the full static suite; this arm keeps the selection focused when only
+      # these two files change). The helper is ALSO listed in the bridge-a2a.py
+      # arm above so a sender change selects this smoke.
+      add_required 1618-outbox-retry-resets-attempts
       ;;
 
     bridge-release.py)
