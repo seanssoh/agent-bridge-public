@@ -1493,8 +1493,16 @@ bridge_run_export_claude_launch_env() {
   if [[ -z "$agent_home" ]]; then
     agent_home="${agent_claude_root%/.claude}"
   fi
+  # #1621/#1622: export the operator HOME ONLY. CLAUDE_CONFIG_DIR is owned by
+  # bridge_run_shared_launch's exec subshell (#1520) — it exports the per-agent
+  # config dir ONLY when the credential gate passes, and intentionally leaves
+  # it UNSET on the failed-seed graceful-degrade path so the launch falls back
+  # to the operator-global config ($HOME/.claude). Exporting CLAUDE_CONFIG_DIR
+  # here in the long-lived parent loop would leak into that degrade subshell
+  # and defeat the #1520 fallback (codex Phase-4 BLOCKING). HOME-only keeps the
+  # two concerns cleanly split: this sets shared HOME=operator; shared_launch
+  # decides CLAUDE_CONFIG_DIR per-agent-vs-degrade.
   [[ -n "$agent_home" ]] && export HOME="$agent_home"
-  [[ -n "$agent_claude_root" ]] && export CLAUDE_CONFIG_DIR="$agent_claude_root"
 }
 
 bridge_run_sync_dev_plugin_cache() {
