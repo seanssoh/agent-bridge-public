@@ -144,6 +144,55 @@ def queue_bodies_dir() -> Path:
     return a2a.state_dir() / "queue" / "bodies"
 
 
+def fresh_arrival_dir() -> Path:
+    """`$BRIDGE_STATE_DIR/queue/fresh-arrival` — one-shot daemon scan-now markers.
+
+    Issue #1630 (audit R3, root cause of #10561): an inbound A2A handoff creates
+    a queue task whose only wake is a best-effort create-time push. If that push
+    does not land (target session alive but not at a clean prompt), the daemon's
+    periodic nudge emitter suppresses the task for ~60s under the redelivery-age
+    gate (`BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS`, bridge-queue.py). This marker
+    dir is the SSOT both the receiver (writer) and the daemon nudge_scan step
+    (reader) resolve identically from $BRIDGE_STATE_DIR, so the daemon can exempt
+    the specific created task id from ONLY that age gate on its next tick. It
+    does NOT touch any auth/dedupe/queue/eligibility check — see
+    post_fresh_arrival_marker.
+    """
+    return a2a.state_dir() / "queue" / "fresh-arrival"
+
+
+def post_fresh_arrival_marker(task_id: str) -> None:
+    """Best-effort one-shot fresh-arrival marker for a freshly enqueued A2A task.
+
+    Writes `$BRIDGE_STATE_DIR/queue/fresh-arrival/<task_id>` (content = create
+    ts, for the daemon's own staleness sweep). The daemon nudge_scan step reads
+    these markers and treats the named task ids as exempt from ONLY the
+    redelivery-AGE gate for that tick, then deletes the consumed marker
+    (one-shot). It bypasses nothing else — the daemon still enforces the normal
+    queued-status, idle, cooldown and activity checks, and a marker for a
+    non-queued/done/unknown task is simply ignored and swept.
+
+    Best-effort by contract (#1630): a marker failure (read-only fs, the daemon
+    not running, a race on the dir) MUST NEVER fail the enqueue. The task is
+    already durably queued; the worst case without the marker is the pre-fix
+    ~60s age-gate latency, never a lost task or a security relaxation.
+    """
+    if not task_id or not str(task_id).strip().isdigit():
+        return
+    try:
+        marker_dir = fresh_arrival_dir()
+        marker_dir.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — $BRIDGE_STATE_DIR/queue is controller-owned queue state, never an isolated-agent tree
+        marker_path = marker_dir / str(task_id).strip()
+        tmp_path = marker_path.with_name(marker_path.name + ".tmp")
+        tmp_path.write_text(f"{a2a.now_ts()}\n", encoding="utf-8")
+        os.replace(tmp_path, marker_path)
+        audit("fresh_arrival_marker", task_id=str(task_id).strip())
+    except OSError:
+        # Daemon not running, read-only fs, or a benign dir race — the task is
+        # already queued; never propagate to the enqueue result.
+        return
+
+
 def canonical_path_text(path: Path | str) -> str:
     return str(Path(path).expanduser().resolve(strict=False))
 
@@ -2105,6 +2154,9 @@ class HandoffHandler(BaseHTTPRequestHandler):
                              now, now),
                         )
                     conn.commit()
+                    # Issue #1630: recovered id is a real freshly-queued task —
+                    # wake the daemon's next-tick nudge for it too.
+                    post_fresh_arrival_marker(recovered_task_id)
                     audit("accept_recovered_after_enqueue_fail", peer=peer_id,
                           client=client_ip, message_id=message_id,
                           task_id=recovered_task_id)
@@ -2166,6 +2218,14 @@ class HandoffHandler(BaseHTTPRequestHandler):
                                   "error": "message id reused with different body"})
                 return
             conn.commit()
+            # Issue #1630 (audit R3, root cause of #10561): the task is now
+            # durably queued. Post a one-shot fresh-arrival marker so the
+            # controller daemon nudges THIS task id on its next tick instead of
+            # suppressing it for ~60s under the redelivery-age gate when the
+            # best-effort create-time push didn't land (target alive but not at
+            # a clean prompt). Bypasses ONLY the age gate — never auth/dedupe/
+            # queue checks — and is best-effort (never fails the enqueue).
+            post_fresh_arrival_marker(task_id)
             audit("accept", peer=peer_id, client=client_ip,
                   message_id=message_id, target=env["target_agent"],
                   task_id=task_id)

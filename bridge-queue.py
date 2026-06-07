@@ -86,6 +86,87 @@ def get_db_path() -> Path:
     return db_path
 
 
+def fresh_arrival_dir() -> Path:
+    """`$BRIDGE_STATE_DIR/queue/fresh-arrival` — one-shot daemon scan-now markers.
+
+    Issue #1630 (audit R3, root cause of #10561): the A2A receiver writes a
+    marker file named `<task_id>` here right after a successful enqueue (see
+    `post_fresh_arrival_marker` in bridge-handoffd.py). The daemon nudge_scan
+    step (`cmd_daemon_step`) reads these markers and exempts the named task ids
+    from ONLY the redelivery-AGE gate for that tick — never any auth/dedupe/
+    queue/idle/cooldown check — then deletes the consumed marker (one-shot).
+    Resolution mirrors `get_db_path` so the receiver (writer) and the daemon
+    (reader) agree on one path regardless of $BRIDGE_STATE_DIR override.
+    """
+    bridge_home = operator_home()
+    state_dir = Path(os.environ.get("BRIDGE_STATE_DIR", str(bridge_home / "state")))
+    return state_dir / "queue" / "fresh-arrival"
+
+
+# Fresh-arrival markers older than this are swept as stale even if their task is
+# still queued — a generous ceiling so a marker only ever shaves the age-gate
+# latency once and never accumulates. Far larger than both the ~60s redelivery
+# window and a single daemon tick, so a legitimately-fresh task is never swept
+# before the daemon has a chance to nudge it.
+FRESH_ARRIVAL_MARKER_MAX_AGE_SECONDS = 3600
+
+
+def consume_fresh_arrival_markers() -> set[int]:
+    """Claim-by-delete the one-shot fresh-arrival markers, return their task ids.
+
+    One-shot by contract (#1630): a task id is returned ONLY when this call
+    successfully unlinks its marker — claim-by-delete. The id is added AFTER the
+    unlink succeeds, not before (codex R1 [P1]): otherwise two overlapping
+    daemon-step consumers could both list and return the same id, and a
+    readable-but-not-deletable marker (e.g. a numeric *directory*, or a perms
+    glitch) would keep exempting its task across every tick — defeating the
+    one-shot guarantee and reopening a perpetual age-gate bypass. With
+    claim-by-delete, exactly one caller wins the unlink and exempts the task for
+    AT MOST one tick; a lost race or failed unlink simply leaves the task to
+    wait out the ~60s age gate as before.
+
+    Stray non-id files (e.g. an orphaned writer `<id>.tmp`) older than the
+    ceiling are swept here too so the dir never accumulates. Best-effort: any fs
+    error is swallowed — a marker that cannot be read/claimed simply leaves the
+    pre-fix ~60s latency in place, never a crash in the daemon loop and never a
+    security relaxation.
+    """
+    ids: set[int] = set()
+    marker_dir = fresh_arrival_dir()
+    try:
+        entries = list(marker_dir.iterdir())
+    except OSError:
+        return ids
+    now = now_ts()
+    for entry in entries:
+        name = entry.name
+        # Ignore (but eventually sweep) the writer's in-flight `<id>.tmp` files
+        # and any other stray non-id files.
+        if not name.isdigit():
+            try:
+                # noqa markers: $BRIDGE_STATE_DIR/queue/fresh-arrival is
+                # controller-owned queue state, never an isolated-agent tree.
+                if entry.is_file() and (now - int(entry.stat().st_mtime)) > FRESH_ARRIVAL_MARKER_MAX_AGE_SECONDS:  # noqa: raw-pathlib-controller-only
+                    entry.unlink()  # noqa: raw-pathlib-controller-only
+            except OSError:
+                pass
+            continue
+        try:
+            task_id = int(name)
+        except ValueError:
+            continue
+        # Claim-by-delete: only exempt the task if WE removed its marker. A
+        # failed unlink (lost race, perms, a numeric directory) does not claim
+        # the id, so the marker can never exempt the same task on more than one
+        # tick and a never-deletable marker can never perpetually bypass the gate.
+        try:
+            entry.unlink()  # noqa: raw-pathlib-controller-only — controller-owned fresh-arrival marker
+        except OSError:
+            continue
+        ids.add(task_id)
+    return ids
+
+
 def get_queue_gateway_root() -> Path:
     bridge_home = operator_home()
     state_dir = Path(os.environ.get("BRIDGE_STATE_DIR", str(bridge_home / "state")))
@@ -2863,6 +2944,16 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
             getattr(args, "ready_agents_file", None)
         )
 
+        # Issue #1630 (audit R3, root cause of #10561): consume the one-shot
+        # fresh-arrival markers ONLY on the nudge-dispatching path (after the
+        # --skip-nudges short-circuit above), so the markers are never burned on
+        # a maintenance-only tick that wouldn't dispatch the nudge anyway. These
+        # ids are exempted from ONLY the redelivery-AGE gate below — every other
+        # eligibility check (queued status, idle, cooldown, activity, last-nudge
+        # key) still applies unchanged. A marker for a task that is no longer
+        # queued is simply ignored (it won't appear in queued_ids_by_agent).
+        fresh_arrival_ids = consume_fresh_arrival_markers()
+
         rows = conn.execute(
             """
             SELECT assigned_to, id, created_ts
@@ -2954,11 +3045,22 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
         # last_nudge_key state — the task-arrival push already covered it.
         # nudge_redelivery_seconds <= 0 disables the gate entirely
         # (restores pre-#1019 behavior).
+        #
+        # Issue #1630 (audit R3, root cause of #10561): a task whose id carries a
+        # one-shot fresh-arrival marker (posted by the A2A receiver right after
+        # enqueue) is age-eligible THIS tick even when younger than the
+        # redelivery window. This bypasses ONLY the age gate — the task must
+        # still be queued (it is, or it wouldn't be in `queue_ids`), and every
+        # downstream check (idle, cooldown, activity, last-nudge key) below runs
+        # unchanged. Without the marker the task simply waits out the ~60s gate
+        # as before. `fresh_arrival_ids` was already consumed (one-shot), so the
+        # exemption applies for AT MOST this tick.
         if nudge_redelivery_seconds > 0:
             eligible_queue_ids = [
                 task_id
                 for task_id in queue_ids
-                if (current_ts - queued_created_by_id.get(task_id, 0))
+                if task_id in fresh_arrival_ids
+                or (current_ts - queued_created_by_id.get(task_id, 0))
                 >= nudge_redelivery_seconds
             ]
         else:
