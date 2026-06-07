@@ -2504,6 +2504,42 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
 fi
 
+# Issue #1612 — cycle the A2A handoff receiver when --restart-daemon was
+# requested. The receiver (bridge-handoffd.py, managed via
+# bridge-handoff-daemon.sh) runs on a SEPARATE lifecycle from the main
+# daemon and is a long-lived Python process with NO hot-reload, so an
+# upgrade that may have changed receiver-side code keeps running the old
+# in-memory code until a manual restart. `--restart-daemon` was explicitly
+# requested, so cycle it here.
+#
+# Restart-if-running only: a receiver that is NOT running stays down (we do
+# not start one as a side effect of an upgrade). A missing script or a
+# non-running status is a quiet no-op — this must NEVER fail the upgrade.
+#
+# Security: the restart goes through the standard `bridge-handoff-daemon.sh
+# restart` path so the fail-closed tailnet bind preflight, HMAC verification,
+# remote_addr/allowlist checks, and dedupe are all re-established on the new
+# process. No launch-flag changes; no bind-proof bypass.
+# BEGIN: Issue #1612 A2A receiver restart
+if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
+  _a2a_handoff_script="$TARGET_ROOT/bridge-handoff-daemon.sh"
+  if [[ -f "$_a2a_handoff_script" ]]; then
+    _a2a_status_out="$(bash "$_a2a_handoff_script" status 2>/dev/null || true)"
+    # bridge_a2a_status() prints `receiver      : running (pid N)` when up.
+    if printf '%s\n' "$_a2a_status_out" | grep -q 'receiver .*: running'; then
+      if bash "$_a2a_handoff_script" restart >/dev/null 2>&1; then
+        echo "[bridge-upgrade] A2A receiver restarted to apply upgraded code" >&2
+      else
+        echo "[bridge-upgrade] WARN: A2A receiver restart failed; run" \
+             "'bash $_a2a_handoff_script restart' to pick up upgraded code" >&2
+      fi
+    fi
+    unset _a2a_status_out
+  fi
+  unset _a2a_handoff_script
+fi
+# END: Issue #1612 A2A receiver restart
+
 # Patch #4798 — tmux server-env cleanup. Pre-PR-#926 installs leaked
 # BRIDGE_LAYOUT / BRIDGE_DATA_ROOT into the tmux server's global env
 # via inheritance from the original `agent-bridge` invocation that
