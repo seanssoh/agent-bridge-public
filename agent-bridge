@@ -1099,10 +1099,12 @@ ISO_RUN_HELP
       case "${1:-}" in
         -h|--help)
           cat <<URGENT_HELP
-Usage: $CLI_NAME urgent <agent> "<message>" [--wait <seconds>]
+Usage: $CLI_NAME urgent <agent> "<message>" [--from <agent>] [--wait <seconds>]
        $CLI_NAME urgent --list
 
 Enqueues an urgent task to <agent> and pokes the live tmux session.
+--from <agent> overrides the sender attribution (default: auto-inferred),
+matching '$CLI_NAME task create --from'.
 For ordinary task creation use: $CLI_NAME task create ...
 URGENT_HELP
           exit 0
