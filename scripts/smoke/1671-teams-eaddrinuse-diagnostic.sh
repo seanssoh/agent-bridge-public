@@ -256,7 +256,7 @@ test_t5_real_listener_decoy_survives() {
   local decoy_js="$SMOKE_TMP_ROOT/decoy-listener.mjs"
   cat >"$decoy_js" <<'DECOY_EOF'
 import { createServer } from 'http'
-const port = Number(process.env.DECOY_PORT)
+const port = Number(process.env.DECOY_PORT) // # noqa: iso-helper-boundary
 const s = createServer((_req, res) => { res.writeHead(200); res.end('decoy') })
 s.on('error', (e) => { process.stderr.write('decoy-error: ' + e + '\n'); process.exit(3) })
 s.listen(port, '127.0.0.1', () => { process.stderr.write('decoy: listening\n') })
