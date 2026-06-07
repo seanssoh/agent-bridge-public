@@ -28,8 +28,21 @@ export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
 # defined later (`bridge_upgrade_emit_failure_json`); the trap is
 # installed up here so very-early bridge_die calls (option parsing, dirty
 # source check) still produce a JSON envelope when --json was passed.
+# Issue #1661: holds the scoped upgrade-lock release token once acquired (empty
+# until then). Declared before the trap so the EXIT handler can always release.
+_BRIDGE_UPGRADE_LOCK_TOKEN=""
 _bridge_upgrade_exit_handler() {
   local rc=$?
+  # Issue #1661: release the upgrade singleton lock FIRST so a crashed /
+  # interrupted run can never wedge the next upgrade. Release preserves rc (it
+  # only closes an fd / removes the lockdir) and is integrated here rather than
+  # via a second EXIT trap, which would clobber the JSON-failure-envelope path
+  # below. No-op when no lock was acquired (dry-run / analyze / conflicts).
+  if [[ -n "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" ]] \
+      && declare -F bridge_scoped_lock_release >/dev/null 2>&1; then
+    bridge_scoped_lock_release "$_BRIDGE_UPGRADE_LOCK_TOKEN" || true
+    _BRIDGE_UPGRADE_LOCK_TOKEN=""
+  fi
   unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID
   if [[ $rc -ne 0 \
         && "${JSON:-0}" == "1" \
@@ -49,6 +62,12 @@ source "$SCRIPT_DIR/lib/bridge-cleanup.sh"
 # upgrade-time sudoers regeneration gate at line ~2243 depends on it.
 # shellcheck source=lib/bridge-host-profile.sh
 source "$SCRIPT_DIR/lib/bridge-host-profile.sh"
+# Issue #1661: scoped singleton-lock primitive (flock-first / mkdir-fallback)
+# used to serialize concurrent `upgrade --apply` / `rollback --apply` against
+# the same install. Acquired after TARGET_ROOT is canonicalized (below) for
+# mutating flows only; released by _bridge_upgrade_exit_handler.
+# shellcheck source=lib/bridge-lock.sh
+source "$SCRIPT_DIR/lib/bridge-lock.sh"
 ORIGINAL_ARGS=("$@")
 
 SOURCE_ROOT="$SCRIPT_DIR"
@@ -77,6 +96,10 @@ MIGRATE_AGENTS=1
 # non-roster dirs are skipped). This opt-in restores the historical
 # migrate-every-dir behavior for operators who want it.
 MIGRATE_ALL_AGENTS=0
+# Issue #1661: lock-contention behavior for the mutating flows. Default -1 ==
+# refuse-fast (a concurrent upgrade/rollback already holds the lock => exit
+# non-zero with a diagnostic). `--wait [<secs>]` opts into a bounded block.
+LOCK_WAIT=-1
 BACKUP_ROOT=""
 ANALYSIS_JSON='{}'
 TARGET_REF=""
@@ -122,9 +145,9 @@ _BRIDGE_UPGRADE_DIE_REMEDIATION=""
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--allow-downgrade] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents] [--migrate-all-agents]
+  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--allow-downgrade] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents] [--migrate-all-agents] [--wait [<secs>]]
   $(basename "$0") analyze [--source <repo-dir>] [--target <bridge-home>] [--json]
-  $(basename "$0") rollback [--target <bridge-home>] [--backup-root <dir>] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json]
+  $(basename "$0") rollback [--target <bridge-home>] [--backup-root <dir>] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--wait [<secs>]]
   $(basename "$0") conflicts list [--target <bridge-home>] [--json]
 
 Updates a live Agent Bridge install from a repo checkout while preserving user-owned
@@ -1280,6 +1303,17 @@ while [[ $# -gt 0 ]]; do
       MIGRATE_ALL_AGENTS=1
       shift
       ;;
+    --wait)
+      # Issue #1661: block on the singleton lock instead of refusing fast.
+      # Optional numeric seconds; bare `--wait` => bounded default ceiling.
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        LOCK_WAIT="$2"
+        shift 2
+      else
+        LOCK_WAIT=600
+        shift
+      fi
+      ;;
     -h|--help|help)
       usage
       exit 0
@@ -1331,6 +1365,39 @@ if [[ "${BRIDGE_UPGRADE_SOURCE_REEXEC:-0}" != "1" \
   && -f "$SOURCE_ROOT/bridge-upgrade.sh" ]]; then
   export BRIDGE_UPGRADE_SOURCE_REEXEC=1
   exec "$BRIDGE_BASH_BIN" "$SOURCE_ROOT/bridge-upgrade.sh" "${ORIGINAL_ARGS[@]}" --target "$TARGET_ROOT"
+fi
+
+# Issue #1661: acquire the BRIDGE_HOME-scoped singleton lock for MUTATING flows
+# only — `upgrade --apply` (not --check / --dry-run) and `rollback` (not
+# --dry-run). `analyze`, `--dry-run`, and read-only `conflicts` (already
+# dispatched + exited above) never lock. Acquired here: AFTER TARGET_ROOT is
+# canonicalized and the source re-exec has settled, BEFORE any mutating
+# backup/apply/migrate/restart/rollback step. upgrade and rollback share the
+# SAME lockfile so they are mutually exclusive. Default is refuse-fast; `--wait`
+# blocks with a bounded timeout. Released by _bridge_upgrade_exit_handler.
+_BRIDGE_UPGRADE_LOCK_IS_MUTATING=0
+if [[ "$SUBCOMMAND" == "apply" && $DRY_RUN -eq 0 && $CHECK_ONLY -eq 0 ]]; then
+  _BRIDGE_UPGRADE_LOCK_IS_MUTATING=1
+elif [[ "$SUBCOMMAND" == "rollback" && $DRY_RUN -eq 0 ]]; then
+  _BRIDGE_UPGRADE_LOCK_IS_MUTATING=1
+fi
+if [[ $_BRIDGE_UPGRADE_LOCK_IS_MUTATING -eq 1 ]]; then
+  _bridge_upgrade_lock_acquire_args=("$TARGET_ROOT/state/locks/upgrade.lock")
+  if [[ $LOCK_WAIT -ge 0 ]]; then
+    _bridge_upgrade_lock_acquire_args+=(--wait "$LOCK_WAIT")
+  fi
+  # MUST call directly (NOT under `$(...)`): the flock backend holds the lock
+  # via a long-lived fd that a command-substitution subshell would close,
+  # silently releasing the lock. The token is returned via the global
+  # BRIDGE_SCOPED_LOCK_TOKEN (see lib/bridge-lock.sh CALLING CONVENTION).
+  # BRIDGE_HOME is set inline ONLY for the helper's contention diagnostic — not
+  # exported into the rest of the upgrade flow.
+  if BRIDGE_HOME="$TARGET_ROOT" bridge_scoped_lock_acquire "${_bridge_upgrade_lock_acquire_args[@]}"; then
+    _BRIDGE_UPGRADE_LOCK_TOKEN="$BRIDGE_SCOPED_LOCK_TOKEN"
+  else
+    _BRIDGE_UPGRADE_LOCK_TOKEN=""
+    bridge_die "다른 upgrade/rollback가 이미 실행 중입니다 ($TARGET_ROOT). 끝날 때까지 기다리거나 '--wait'로 블록하세요."
+  fi
 fi
 
 TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
@@ -1697,10 +1764,16 @@ if [[ "$SUBCOMMAND" == "rollback" ]]; then
     # --force: the upgrader is the sanctioned daemon stop+restart path
     # (issue #314 Layer 3 / #315 Track 3). Bypass the active-agent guard.
     bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
-    bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
+    # Issue #1661: close the upgrade-lock flock fd for the (daemonizing,
+    # tmux-spawning) child so it cannot inherit + pin the lock past our exit.
+    bridge_scoped_lock_run_without "$_BRIDGE_UPGRADE_LOCK_TOKEN" \
+      bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
   fi
   if [[ $RESTART_AGENTS -eq 1 ]]; then
-    ROLLBACK_AGENT_RESTART_REPORT="$(bridge_upgrade_collect_agent_restart_report "$TARGET_ROOT" "$DRY_RUN")"
+    # Issue #1661: the per-agent restart spawns long-lived tmux sessions; close
+    # the upgrade-lock flock fd for those children so an immortal tmux server
+    # cannot inherit + pin the lock past our exit (no-op on the mkdir backend).
+    ROLLBACK_AGENT_RESTART_REPORT="$(bridge_scoped_lock_run_without "$_BRIDGE_UPGRADE_LOCK_TOKEN" bridge_upgrade_collect_agent_restart_report "$TARGET_ROOT" "$DRY_RUN")"
     # Issue 4 (v0.11.0): reconcile failed rows against the daemon's
     # subsequent launch cycle so the rollback summary does not over-
     # report failures the daemon already absorbed. No-op when dry-run
@@ -2525,7 +2598,10 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   # --force: the upgrader is the sanctioned daemon stop+restart path
   # (issue #314 Layer 3 / #315 Track 3). Bypass the active-agent guard.
   bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
-  bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
+  # Issue #1661: close the upgrade-lock flock fd for the (daemonizing,
+  # tmux-spawning) child so it cannot inherit + pin the lock past our exit.
+  bridge_scoped_lock_run_without "$_BRIDGE_UPGRADE_LOCK_TOKEN" \
+    bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
 fi
 
 # Issue #1612 — cycle the A2A handoff receiver when --restart-daemon was
@@ -2551,7 +2627,13 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
     _a2a_status_out="$(bash "$_a2a_handoff_script" status 2>/dev/null || true)"
     # bridge_a2a_status() prints `receiver      : running (pid N)` when up.
     if printf '%s\n' "$_a2a_status_out" | grep -q 'receiver .*: running'; then
-      if bash "$_a2a_handoff_script" restart >/dev/null 2>&1; then
+      # Issue #1661: the receiver restart double-forks a long-lived detached
+      # bridge-handoffd.py (no hot-reload). Close the upgrade-lock flock fd for
+      # that child so the immortal receiver cannot inherit + pin
+      # state/locks/upgrade.lock past our exit (would wedge future upgrades on
+      # the flock backend). No-op on the mkdir backend.
+      if bridge_scoped_lock_run_without "$_BRIDGE_UPGRADE_LOCK_TOKEN" \
+          bash "$_a2a_handoff_script" restart >/dev/null 2>&1; then
         echo "[bridge-upgrade] A2A receiver restarted to apply upgraded code" >&2
       else
         echo "[bridge-upgrade] WARN: A2A receiver restart failed; run" \
@@ -3007,7 +3089,10 @@ POST_EOF
 fi
 
 if [[ $RESTART_AGENTS -eq 1 ]]; then
-  AGENT_RESTART_REPORT="$(bridge_upgrade_collect_agent_restart_report "$TARGET_ROOT" "$DRY_RUN")"
+  # Issue #1661: per-agent restart spawns long-lived tmux sessions — close the
+  # upgrade-lock flock fd for those children so an immortal tmux server cannot
+  # inherit + pin the lock past our exit (no-op on the mkdir backend).
+  AGENT_RESTART_REPORT="$(bridge_scoped_lock_run_without "$_BRIDGE_UPGRADE_LOCK_TOKEN" bridge_upgrade_collect_agent_restart_report "$TARGET_ROOT" "$DRY_RUN")"
   # Issue 4 (v0.11.0): reconcile failed rows against the daemon's
   # subsequent launch cycle so the upgrade summary does not over-report
   # failures the daemon already absorbed. No-op when dry-run or when no
