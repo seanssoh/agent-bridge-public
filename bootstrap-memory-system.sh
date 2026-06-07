@@ -1679,11 +1679,17 @@ if [[ "$MODE" == "apply" && ! -f "$FIRST_RUN_MARKER" \
 
 ## Next steps (one-time)
 
-1. Full mention scan — builds shared/wiki/_index/mentions.db and
-   today's distribution report. Idempotent, safe to re-run.
+1. Full mention scan — builds shared/wiki/_index/mentions.db only and
+   prints a JSON summary (it does not write a report file). Idempotent,
+   safe to re-run.
    \`$BRIDGE_HOME/scripts/wiki-mention-scan.py --full-rebuild\`
 
-2. Review the distribution report. Use every section:
+2. Generate today's distribution report from the freshly built index,
+   then review it. Use every section:
+   \`\`\`
+   $BRIDGE_HOME/scripts/wiki-mention-scan.py --report \\
+     --out $BRIDGE_WIKI_ROOT/_index/distribution-report-\$(date +%Y-%m-%d).md
+   \`\`\`
    - §1 cross-agent reach — sanity check.
    - §2 L2 hub candidates — the weekly cron resurfaces these as
      \`[wiki-hub-candidates]\` tasks; trigger now in step 3.
