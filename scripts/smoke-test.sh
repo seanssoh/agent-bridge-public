@@ -426,6 +426,44 @@ else
   log "shellcheck not installed; skipping"
 fi
 
+log "guarding agent map accessors against unset/scalar maps under set -u (#4411)"
+"$BASH4_BIN" -s "$REPO_ROOT" <<'BASH_AGENT_MAP_GUARD'
+set -euo pipefail
+repo="$1"
+source "$repo/lib/bridge-core.sh"
+source "$repo/lib/bridge-agents.sh"
+
+agent="unbound-agent"
+BRIDGE_AGENT_HOME_ROOT="${TMPDIR:-/tmp}/agb-agent-map-guard-home"
+expected_workdir="$(bridge_agent_default_home "$agent")"
+unset -v BRIDGE_AGENT_ENGINE BRIDGE_AGENT_SOURCE BRIDGE_AGENT_PROVENANCE \
+  BRIDGE_AGENT_PRECOMPACT_NOTIFY BRIDGE_AGENT_WORKDIR
+
+[[ "$(bridge_agent_engine "$agent")" == "unknown" ]]
+[[ "$(bridge_agent_source "$agent")" == "static" ]]
+[[ "$(bridge_agent_provenance "$agent")" == "static-roster" ]]
+if bridge_agent_precompact_notify_enabled "$agent"; then
+  printf 'precompact notify unexpectedly enabled for unset map\n' >&2
+  exit 1
+fi
+[[ "$(bridge_agent_workdir "$agent")" == "$expected_workdir" ]]
+
+BRIDGE_AGENT_ENGINE="declare -A spoof"
+BRIDGE_AGENT_SOURCE="declare -A spoof"
+BRIDGE_AGENT_PROVENANCE="declare -A spoof"
+BRIDGE_AGENT_PRECOMPACT_NOTIFY="declare -A spoof"
+BRIDGE_AGENT_WORKDIR="declare -A spoof"
+
+[[ "$(bridge_agent_engine "$agent")" == "unknown" ]]
+[[ "$(bridge_agent_source "$agent")" == "static" ]]
+[[ "$(bridge_agent_provenance "$agent")" == "static-roster" ]]
+if bridge_agent_precompact_notify_enabled "$agent"; then
+  printf 'precompact notify unexpectedly enabled for scalar map\n' >&2
+  exit 1
+fi
+[[ "$(bridge_agent_workdir "$agent")" == "$expected_workdir" ]]
+BASH_AGENT_MAP_GUARD
+
 log "redacting sensitive inline env vars from launch display paths (#428)"
 LAUNCH_REDACTION_OUTPUT="$("$BASH4_BIN" -s "$REPO_ROOT" <<'BASH_REDACTION'
 set -euo pipefail

@@ -886,6 +886,14 @@ bridge_agent_engine() {
 
 bridge_agent_source() {
   local agent="$1"
+  # #1457 follow-up: guard the same scalar-clobbered / undeclared-map hazard
+  # that bridge_agent_engine handles. Without this, an undeclared
+  # BRIDGE_AGENT_SOURCE makes the [$agent] subscript an arithmetic eval that
+  # aborts under `set -u`. Fall back to the documented historical default.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_SOURCE; then
+    printf '%s' 'static'
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_SOURCE[$agent]-static}"
 }
 
@@ -897,6 +905,12 @@ bridge_agent_source() {
 # only has BRIDGE_AGENT_SOURCE=static.
 bridge_agent_provenance() {
   local agent="$1"
+  # #1457 follow-up: see bridge_agent_source — guard before the arithmetic-index
+  # read so an undeclared/scalar map yields the default instead of aborting.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_PROVENANCE; then
+    printf '%s' 'static-roster'
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_PROVENANCE[$agent]-static-roster}"
 }
 
@@ -908,6 +922,11 @@ bridge_agent_provenance() {
 # one place. Default is OFF — only the literal value "1" enables the notice.
 bridge_agent_precompact_notify_enabled() {
   local agent="$1"
+  # #1457 follow-up: see bridge_agent_source — an undeclared/scalar map must not
+  # abort under `set -u`; treat it as the default (opt-out) instead.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_PRECOMPACT_NOTIFY; then
+    return 1
+  fi
   local val="${BRIDGE_AGENT_PRECOMPACT_NOTIFY[$agent]-0}"
   [[ "$val" == "1" ]]
 }
