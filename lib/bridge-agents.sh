@@ -760,7 +760,11 @@ bridge_agent_is_admin() {
 
 bridge_agent_exists() {
   local agent="$1"
-  declare -p BRIDGE_AGENT_SESSION >/dev/null 2>&1 || return 1
+  # #1627 sweep: a bare `declare -p` succeeds for a SCALAR-clobbered map too, so the
+  # `[$agent]+x` existence test below would still arithmetic-index $agent and abort
+  # under `set -u`. Use the flag-field anchored assoc check so a scalar/undeclared
+  # map degrades to "does not exist" instead of aborting.
+  bridge_var_is_assoc BRIDGE_AGENT_SESSION || return 1
   [[ -n "${BRIDGE_AGENT_SESSION[$agent]+x}" ]]
 }
 
@@ -851,6 +855,12 @@ bridge_agent_id_for_session() {
 
 bridge_agent_desc() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_source — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the default instead of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_DESC; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_DESC[$agent]-}"
 }
 
@@ -938,7 +948,14 @@ bridge_agent_precompact_notify_enabled() {
 # normalizes anything outside {en, ko} back to "en".
 bridge_agent_precompact_notify_lang() {
   local agent="$1"
-  local lang="${BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG[$agent]-${BRIDGE_PRECOMPACT_NOTIFY_LANG:-en}}"
+  # #1627 sweep: see bridge_agent_source — an undeclared/scalar map must not abort
+  # under `set -u`. Fall through to the global-env default (then "en") instead.
+  local lang=""
+  if bridge_var_is_assoc BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG; then
+    lang="${BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG[$agent]-${BRIDGE_PRECOMPACT_NOTIFY_LANG:-en}}"
+  else
+    lang="${BRIDGE_PRECOMPACT_NOTIFY_LANG:-en}"
+  fi
   [[ -n "$lang" ]] || lang="en"
   printf '%s' "$lang"
 }
@@ -953,7 +970,12 @@ bridge_agent_precompact_notify_lang() {
 # fallback.
 bridge_agent_class() {
   local agent="$1"
-  local cls="${BRIDGE_AGENT_CLASS[$agent]-user}"
+  # #1627 sweep: see bridge_agent_source — an undeclared/scalar map must not abort
+  # under `set -u`. Treat it as the documented "user" default-deny fallback.
+  local cls="user"
+  if bridge_var_is_assoc BRIDGE_AGENT_CLASS; then
+    cls="${BRIDGE_AGENT_CLASS[$agent]-user}"
+  fi
   case "$cls" in
     user|system) ;;
     *) cls="user" ;;
@@ -968,7 +990,12 @@ bridge_agent_class() {
 # matches bridge_agent_class above; future classes must extend both the
 # value list AND the tool-policy gate.
 bridge_validate_agent_classes() {
-  declare -p BRIDGE_AGENT_CLASS >/dev/null 2>&1 || return 0
+  # #1627 sweep: a bare declare-print SUCCEEDS for a scalar-clobbered map, which
+  # would then be iterated as a fake-key map (`${!MAP[@]}` yields index 0) and
+  # mis-validated ("unknown agent class 'declare -A spoof' for agent '0'"). Use the
+  # flag-field anchored assoc check so a scalar/undeclared map skips validation
+  # entirely (matches the best-effort "no proper class map → nothing to validate").
+  bridge_var_is_assoc BRIDGE_AGENT_CLASS || return 0
   local agent cls
   for agent in "${!BRIDGE_AGENT_CLASS[@]}"; do
     cls="${BRIDGE_AGENT_CLASS[$agent]}"
@@ -982,6 +1009,12 @@ bridge_validate_agent_classes() {
 
 bridge_agent_session() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_source — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the default instead of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_SESSION; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_SESSION[$agent]-}"
 }
 
@@ -997,8 +1030,17 @@ bridge_agent_isolation_mode() {
   # anything else → unknown (was previously rendered as the raw value or
   # `-`, leading to `no` / `-` / `shared` drift across same-install agents).
   local agent="$1"
-  local roster_mode="${BRIDGE_AGENT_ISOLATION_MODE[$agent]-}"
-  local os_user="${BRIDGE_AGENT_OS_USER[$agent]-}"
+  # #1627 sweep: see bridge_agent_source — undeclared/scalar maps must not abort
+  # under `set -u`. Read each backing map only when it is a real assoc array;
+  # otherwise treat it as unset (empty), preserving the shared/normalize defaults.
+  local roster_mode=""
+  local os_user=""
+  if bridge_var_is_assoc BRIDGE_AGENT_ISOLATION_MODE; then
+    roster_mode="${BRIDGE_AGENT_ISOLATION_MODE[$agent]-}"
+  fi
+  if bridge_var_is_assoc BRIDGE_AGENT_OS_USER; then
+    os_user="${BRIDGE_AGENT_OS_USER[$agent]-}"
+  fi
   if [[ -n "$os_user" ]]; then
     printf 'linux-user'
     return 0
@@ -1012,6 +1054,12 @@ bridge_agent_isolation_mode() {
 
 bridge_agent_os_user() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_source — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the empty default instead of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_OS_USER; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_OS_USER[$agent]-}"
 }
 
@@ -1023,7 +1071,12 @@ bridge_agent_os_user_display() {
   # passed `no` through unchanged, producing the three-different-shapes
   # drift the issue documents.
   local agent="$1"
-  local v="${BRIDGE_AGENT_OS_USER[$agent]-}"
+  # #1627 sweep: see bridge_agent_source — an undeclared/scalar map must not abort
+  # under `set -u`; treat it as unset so the display falls back to "-".
+  local v=""
+  if bridge_var_is_assoc BRIDGE_AGENT_OS_USER; then
+    v="${BRIDGE_AGENT_OS_USER[$agent]-}"
+  fi
   if [[ -n "$v" ]]; then
     printf '%s' "$v"
   else
@@ -3599,6 +3652,7 @@ bridge_write_linux_agent_env_file() {
   local admin_agent=""
   local agent_log_dir=""
   local agent_audit_log=""
+  local prompt_guard=""
 
   description="$(bridge_agent_desc "$agent")"
   engine="$(bridge_agent_engine "$agent")"
@@ -3615,17 +3669,26 @@ bridge_write_linux_agent_env_file() {
   continue_mode="$(bridge_agent_continue "$agent")"
   idle_timeout="$(bridge_agent_idle_timeout "$agent")"
   session_id="$(bridge_agent_session_id "$agent")"
-  history_key="${BRIDGE_AGENT_HISTORY_KEY[$agent]-}"
-  # #1407 D2 (PR #1410): safe read via accessor — non-assoc map degrades
-  # to empty instead of aborting under `set -u` (same class as the persist
-  # path; this composer runs on the agent-start surface #1407 reproduces).
+  # #1627 sweep: route history_key through its guarded accessor (and guard the
+  # updated_at inline read) so a non-assoc map degrades to empty instead of
+  # aborting under `set -u` — same class as created_at below; this composer runs
+  # on the agent-start surface #1407 reproduces.
+  history_key="$(bridge_agent_history_key "$agent")"
   created_at="$(bridge_agent_created_at "$agent")"
-  updated_at="${BRIDGE_AGENT_UPDATED_AT[$agent]-}"
+  updated_at=""
+  if bridge_var_is_assoc BRIDGE_AGENT_UPDATED_AT; then
+    updated_at="${BRIDGE_AGENT_UPDATED_AT[$agent]-}"
+  fi
   isolation_mode="$(bridge_agent_isolation_mode "$agent")"
   os_user="$(bridge_agent_os_user "$agent")"
   admin_agent="$(bridge_admin_agent_id)"
   agent_log_dir="$(bridge_agent_log_dir "$agent")"
   agent_audit_log="$(bridge_agent_audit_log_file "$agent")"
+  # #1627 sweep: precompute the prompt-guard value with the same nounset guard so
+  # the heredoc below never raw-subscripts an undeclared/scalar map under `set -u`.
+  if bridge_var_is_assoc BRIDGE_AGENT_PROMPT_GUARD; then
+    prompt_guard="${BRIDGE_AGENT_PROMPT_GUARD[$agent]-}"
+  fi
 
   bridge_reject_ephemeral_controller_env_for_agent_env
 
@@ -3865,7 +3928,7 @@ BRIDGE_AGENT_DISCORD_CHANNEL_ID[$(printf '%q' "$agent")]=$(printf '%q' "$discord
 BRIDGE_AGENT_CHANNELS[$(printf '%q' "$agent")]=$(printf '%q' "$channels")
 BRIDGE_AGENT_ISOLATION_MODE[$(printf '%q' "$agent")]=$(printf '%q' "$isolation_mode")
 BRIDGE_AGENT_OS_USER[$(printf '%q' "$agent")]=$(printf '%q' "$os_user")
-BRIDGE_AGENT_PROMPT_GUARD[$(printf '%q' "$agent")]=$(printf '%q' "${BRIDGE_AGENT_PROMPT_GUARD[$agent]-}")
+BRIDGE_AGENT_PROMPT_GUARD[$(printf '%q' "$agent")]=$(printf '%q' "$prompt_guard")
 BRIDGE_AGENT_CLASS[$(printf '%q' "$agent")]=$(printf '%q' "$(bridge_agent_class "$agent")")
 EOF
   # Peer entries: id + non-secret metadata. NEVER emit a peer's LAUNCH_CMD
@@ -5845,11 +5908,23 @@ bridge_agent_workdir() {
 
 bridge_agent_profile_home() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_source — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the empty default instead of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_PROFILE_HOME; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_PROFILE_HOME[$agent]-}"
 }
 
 bridge_agent_launch_cmd_raw() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_source — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the empty default instead of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_LAUNCH_CMD; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_LAUNCH_CMD[$agent]-}"
 }
 
@@ -6547,7 +6622,12 @@ bridge_agent_channels_csv() {
   local inferred=""
   local inferred_dev=""
 
-  explicit="${BRIDGE_AGENT_CHANNELS[$agent]-}"
+  # #1627 sweep: see bridge_agent_source — read the explicit map only when it is a
+  # real assoc array so an undeclared/scalar map does not abort under `set -u`; the
+  # command-inference fallback below still runs for the empty case.
+  if bridge_var_is_assoc BRIDGE_AGENT_CHANNELS; then
+    explicit="${BRIDGE_AGENT_CHANNELS[$agent]-}"
+  fi
   if [[ -n "$explicit" ]]; then
     bridge_normalize_channels_csv "$explicit"
     return 0
@@ -6577,7 +6657,12 @@ bridge_agent_plugins_csv() {
   # output as a flat plugin-id list (`<plugin>` or `<plugin>@<marketplace>`).
   # Returns the empty string when the entry is unset or contains no tokens.
   local agent="$1"
-  local raw="${BRIDGE_AGENT_PLUGINS[$agent]-}"
+  # #1627 sweep: see bridge_agent_source — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the empty default instead of aborting under `set -u`.
+  local raw=""
+  if bridge_var_is_assoc BRIDGE_AGENT_PLUGINS; then
+    raw="${BRIDGE_AGENT_PLUGINS[$agent]-}"
+  fi
   [[ -n "$raw" ]] || { printf ''; return 0; }
 
   local -a tokens=()
@@ -6612,7 +6697,13 @@ bridge_agent_plugins_csv() {
 
 bridge_agent_auto_accept_dev_channels_csv() {
   local agent="$1"
-  local explicit="${BRIDGE_AGENT_AUTO_ACCEPT_DEV_CHANNELS[$agent]-}"
+  # #1627 sweep: see bridge_agent_source — read the explicit map only when it is a
+  # real assoc array so an undeclared/scalar map does not abort under `set -u`; the
+  # global-default fallback below still runs for the empty case.
+  local explicit=""
+  if bridge_var_is_assoc BRIDGE_AGENT_AUTO_ACCEPT_DEV_CHANNELS; then
+    explicit="${BRIDGE_AGENT_AUTO_ACCEPT_DEV_CHANNELS[$agent]-}"
+  fi
 
   if [[ -n "$explicit" ]]; then
     bridge_normalize_channels_csv "$explicit"
@@ -6671,7 +6762,12 @@ bridge_agent_discord_channel_id() {
   local explicit=""
   local inferred=""
 
-  explicit="${BRIDGE_AGENT_DISCORD_CHANNEL_ID[$agent]-}"
+  # #1627 sweep: see bridge_agent_source — read the explicit map only when it is a
+  # real assoc array so an undeclared/scalar map does not abort under `set -u`; the
+  # plugin-inference fallback below still runs for the empty case.
+  if bridge_var_is_assoc BRIDGE_AGENT_DISCORD_CHANNEL_ID; then
+    explicit="${BRIDGE_AGENT_DISCORD_CHANNEL_ID[$agent]-}"
+  fi
   if [[ -n "$explicit" ]]; then
     printf '%s' "$explicit"
     return 0
@@ -9948,7 +10044,13 @@ bridge_ensure_claude_launch_channel_plugins() {
 
 bridge_agent_notify_kind() {
   local agent="$1"
-  local explicit="${BRIDGE_AGENT_NOTIFY_KIND[$agent]-}"
+  # #1627 sweep: see bridge_agent_source — read the explicit map only when it is a
+  # real assoc array so an undeclared/scalar map does not abort under `set -u`; the
+  # discord-inference fallback below still runs for the empty case.
+  local explicit=""
+  if bridge_var_is_assoc BRIDGE_AGENT_NOTIFY_KIND; then
+    explicit="${BRIDGE_AGENT_NOTIFY_KIND[$agent]-}"
+  fi
 
   if [[ -n "$explicit" ]]; then
     printf '%s' "$explicit"
@@ -9965,7 +10067,13 @@ bridge_agent_notify_kind() {
 
 bridge_agent_notify_target() {
   local agent="$1"
-  local explicit="${BRIDGE_AGENT_NOTIFY_TARGET[$agent]-}"
+  # #1627 sweep: see bridge_agent_source — read the explicit map only when it is a
+  # real assoc array so an undeclared/scalar map does not abort under `set -u`; the
+  # discord-id fallback below still runs for the empty case.
+  local explicit=""
+  if bridge_var_is_assoc BRIDGE_AGENT_NOTIFY_TARGET; then
+    explicit="${BRIDGE_AGENT_NOTIFY_TARGET[$agent]-}"
+  fi
 
   if [[ -n "$explicit" ]]; then
     printf '%s' "$explicit"
@@ -9977,7 +10085,13 @@ bridge_agent_notify_target() {
 
 bridge_agent_notify_account() {
   local agent="$1"
-  local explicit="${BRIDGE_AGENT_NOTIFY_ACCOUNT[$agent]-}"
+  # #1627 sweep: see bridge_agent_source — read the explicit map only when it is a
+  # real assoc array so an undeclared/scalar map does not abort under `set -u`; the
+  # kind-derived fallback below still runs for the empty case.
+  local explicit=""
+  if bridge_var_is_assoc BRIDGE_AGENT_NOTIFY_ACCOUNT; then
+    explicit="${BRIDGE_AGENT_NOTIFY_ACCOUNT[$agent]-}"
+  fi
   local kind
 
   if [[ -n "$explicit" ]]; then
@@ -10074,26 +10188,62 @@ bridge_agent_wake_status() {
 
 bridge_agent_loop() {
   local agent="$1"
+  # #1627 follow-up: see bridge_agent_source — an undeclared/scalar-clobbered map
+  # makes the [$agent] subscript an arithmetic eval that aborts under `set -u`.
+  # Guard before the read so it falls back to the documented default instead.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_LOOP; then
+    printf '%s' '1'
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_LOOP[$agent]-1}"
 }
 
 bridge_agent_continue() {
   local agent="$1"
+  # #1627 follow-up: see bridge_agent_source — guard the arithmetic-index read so
+  # an undeclared/scalar map yields the default instead of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_CONTINUE; then
+    printf '%s' '1'
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_CONTINUE[$agent]-1}"
 }
 
 bridge_agent_model() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_source — an undeclared/scalar map makes the
+  # [$agent] subscript an arithmetic eval that aborts under `set -u`. This getter
+  # feeds bridge_agent_uses_legacy_launch_flags on the Claude launch hot path
+  # (bridge-state.sh bridge_claude_dynamic_launch_cmd), so guard it and return the
+  # empty default — empty preserves legacy-launch semantics exactly.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_MODEL; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_MODEL[$agent]-}"
 }
 
 bridge_agent_effort() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_model — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the empty default (legacy-launch shape) instead
+  # of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_EFFORT; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_EFFORT[$agent]-}"
 }
 
 bridge_agent_permission_mode() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_model — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the empty default (legacy-launch shape) instead
+  # of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_PERMISSION_MODE; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_PERMISSION_MODE[$agent]-}"
 }
 
@@ -10121,7 +10271,10 @@ bridge_agent_session_id() {
   # arithmetic-index the agent id and abort with `<agent>: unbound variable`.
   # Degrade to empty instead of aborting. Per-function declare-guard avoids
   # the #1213 scalar-vs-`declare -g -A` collision class — do NOT redeclare.
-  if ! declare -p BRIDGE_AGENT_SESSION_ID 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+  # #1627 sweep: use bridge_var_is_assoc (flag-field anchored) instead of the
+  # unanchored `grep 'declare -[A-Za-z]*A'`, which false-POSITIVES on a scalar
+  # whose VALUE contains the text "declare -A" and then aborts on the read (#1457).
+  if ! bridge_var_is_assoc BRIDGE_AGENT_SESSION_ID; then
     printf '%s' ''
     return 0
   fi
@@ -10130,11 +10283,23 @@ bridge_agent_session_id() {
 
 bridge_agent_meta_file() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_source — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the empty default instead of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_META_FILE; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_META_FILE[$agent]-}"
 }
 
 bridge_agent_history_key() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_source — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the empty default instead of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_HISTORY_KEY; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_HISTORY_KEY[$agent]-}"
 }
 
@@ -10150,7 +10315,10 @@ bridge_agent_history_key() {
 bridge_agent_created_at() {
   local agent="$1"
   local default_val="${2-}"
-  if declare -p BRIDGE_AGENT_CREATED_AT 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
+  # #1627 sweep: use bridge_var_is_assoc (flag-field anchored) instead of the
+  # unanchored `grep 'declare -[A-Za-z]*A'`, which false-POSITIVES on a scalar
+  # whose VALUE contains the text "declare -A" and then aborts on the read (#1457).
+  if bridge_var_is_assoc BRIDGE_AGENT_CREATED_AT; then
     printf '%s' "${BRIDGE_AGENT_CREATED_AT[$agent]-$default_val}"
   else
     printf '%s' "$default_val"
@@ -10160,16 +10328,33 @@ bridge_agent_created_at() {
 bridge_agent_action() {
   local agent="$1"
   local action="$2"
+  # #1627 sweep: see bridge_agent_source — the ["$agent:$action"] subscript is the
+  # same arithmetic-eval hazard. Guard so an undeclared/scalar map yields the empty
+  # default instead of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_ACTION; then
+    printf '%s' ''
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_ACTION["$agent:$action"]-}"
 }
 
 bridge_agent_idle_timeout() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_source — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the "0" default instead of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_IDLE_TIMEOUT; then
+    printf '%s' '0'
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_IDLE_TIMEOUT[$agent]-0}"
 }
 
 bridge_agent_idle_timeout_configured() {
   local agent="$1"
+  # #1627 sweep: `[[ -v arr[key] ]]` still arithmetic-indexes $agent and aborts
+  # under `set -u` when the map is undeclared/scalar. Guard first; a non-assoc map
+  # means "not configured".
+  bridge_var_is_assoc BRIDGE_AGENT_IDLE_TIMEOUT || return 1
   [[ -v "BRIDGE_AGENT_IDLE_TIMEOUT[$agent]" ]]
 }
 
@@ -10192,7 +10377,13 @@ bridge_agent_is_always_on() {
 # #1213 collision class.
 bridge_agent_start_policy() {
   local agent="$1"
-  local value="${BRIDGE_AGENT_START_POLICY[$agent]-}"
+  # #1627 follow-up: see bridge_agent_source — an undeclared/scalar map must not
+  # abort under `set -u`. Treat it as the empty `-` fallback (which the case below
+  # already maps to "auto"), keeping behavior identical to the unset-key path.
+  local value=""
+  if bridge_var_is_assoc BRIDGE_AGENT_START_POLICY; then
+    value="${BRIDGE_AGENT_START_POLICY[$agent]-}"
+  fi
   case "$value" in
     hold|auto) printf '%s' "$value" ;;
     *)         printf '%s' "auto" ;;
@@ -10201,6 +10392,10 @@ bridge_agent_start_policy() {
 
 bridge_agent_start_policy_configured() {
   local agent="$1"
+  # #1627 sweep: `[[ -v arr[key] ]]` still arithmetic-indexes $agent and aborts
+  # under `set -u` when the map is undeclared/scalar. Guard first; a non-assoc map
+  # means "not configured".
+  bridge_var_is_assoc BRIDGE_AGENT_START_POLICY || return 1
   [[ -v "BRIDGE_AGENT_START_POLICY[$agent]" ]]
 }
 
@@ -10211,7 +10406,11 @@ bridge_agent_memory_daily_refresh_enabled() {
   [[ "$(bridge_agent_source "$agent")" == "static" ]] || return 1
   [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 1
 
-  if [[ -v "BRIDGE_AGENT_MEMORY_DAILY_REFRESH[$agent]" ]]; then
+  # #1627 sweep: `[[ -v arr[key] ]]` still arithmetic-indexes $agent and aborts
+  # under `set -u` when the map is undeclared/scalar. Guard so a non-assoc map
+  # falls through to the default-on behavior instead of aborting.
+  if bridge_var_is_assoc BRIDGE_AGENT_MEMORY_DAILY_REFRESH \
+     && [[ -v "BRIDGE_AGENT_MEMORY_DAILY_REFRESH[$agent]" ]]; then
     configured="${BRIDGE_AGENT_MEMORY_DAILY_REFRESH[$agent]-}"
     case "$configured" in
       1|true|yes|on)
@@ -10228,12 +10427,23 @@ bridge_agent_memory_daily_refresh_enabled() {
 
 bridge_agent_inject_timestamp() {
   local agent="$1"
+  # #1627 sweep: see bridge_agent_source — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the "1" default instead of aborting under `set -u`.
+  if ! bridge_var_is_assoc BRIDGE_AGENT_INJECT_TIMESTAMP; then
+    printf '%s' '1'
+    return 0
+  fi
   printf '%s' "${BRIDGE_AGENT_INJECT_TIMESTAMP[$agent]-1}"
 }
 
 bridge_agent_skills_csv() {
   local agent="$1"
-  local configured="${BRIDGE_AGENT_SKILLS[$agent]-}"
+  # #1627 sweep: see bridge_agent_source — guard the arithmetic-index read so an
+  # undeclared/scalar map yields the empty default instead of aborting under `set -u`.
+  local configured=""
+  if bridge_var_is_assoc BRIDGE_AGENT_SKILLS; then
+    configured="${BRIDGE_AGENT_SKILLS[$agent]-}"
+  fi
   local normalized=""
   local skill=""
 
@@ -10251,6 +10461,10 @@ bridge_list_actions() {
   local agent="$1"
   local key
 
+  # #1627 sweep: guard the key-iteration so a scalar-clobbered map is not iterated
+  # as a fake-key ("0") map; an unguarded `${!MAP[@]}` over a scalar yields a bogus
+  # index that could mis-classify. A non-assoc map means "no actions".
+  bridge_var_is_assoc BRIDGE_AGENT_ACTION || return 0
   for key in "${!BRIDGE_AGENT_ACTION[@]}"; do
     if [[ "$key" == "$agent:"* ]]; then
       printf '%s\n' "${key#*:}"

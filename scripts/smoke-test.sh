@@ -432,36 +432,169 @@ set -euo pipefail
 repo="$1"
 source "$repo/lib/bridge-core.sh"
 source "$repo/lib/bridge-agents.sh"
+# #1627 sweep: bridge_agent_discord_channel_id's inference path reaches
+# bridge_with_timeout (defined in bridge-state.sh); source it so the channel/
+# discord accessors exercise their real dependency graph without noise.
+source "$repo/lib/bridge-state.sh"
 
 agent="unbound-agent"
 BRIDGE_AGENT_HOME_ROOT="${TMPDIR:-/tmp}/agb-agent-map-guard-home"
 expected_workdir="$(bridge_agent_default_home "$agent")"
+# #1627 sweep: ALL agent-map accessors that subscript a BRIDGE_AGENT_* assoc map by
+# [$agent] must guard with bridge_var_is_assoc and degrade to the documented default
+# under set -u instead of aborting. Cover the full set under unset + scalar-spoof.
 unset -v BRIDGE_AGENT_ENGINE BRIDGE_AGENT_SOURCE BRIDGE_AGENT_PROVENANCE \
-  BRIDGE_AGENT_PRECOMPACT_NOTIFY BRIDGE_AGENT_WORKDIR
+  BRIDGE_AGENT_PRECOMPACT_NOTIFY BRIDGE_AGENT_WORKDIR \
+  BRIDGE_AGENT_LOOP BRIDGE_AGENT_CONTINUE BRIDGE_AGENT_START_POLICY \
+  BRIDGE_AGENT_DESC BRIDGE_AGENT_CLASS BRIDGE_AGENT_SESSION \
+  BRIDGE_AGENT_ISOLATION_MODE BRIDGE_AGENT_OS_USER BRIDGE_AGENT_PROFILE_HOME \
+  BRIDGE_AGENT_LAUNCH_CMD BRIDGE_AGENT_CHANNELS BRIDGE_AGENT_PLUGINS \
+  BRIDGE_AGENT_MODEL BRIDGE_AGENT_EFFORT BRIDGE_AGENT_PERMISSION_MODE \
+  BRIDGE_AGENT_META_FILE BRIDGE_AGENT_HISTORY_KEY BRIDGE_AGENT_IDLE_TIMEOUT \
+  BRIDGE_AGENT_INJECT_TIMESTAMP BRIDGE_AGENT_SKILLS BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG \
+  BRIDGE_AGENT_NOTIFY_KIND BRIDGE_AGENT_NOTIFY_TARGET BRIDGE_AGENT_NOTIFY_ACCOUNT \
+  BRIDGE_AGENT_ACTION BRIDGE_AGENT_DISCORD_CHANNEL_ID \
+  BRIDGE_AGENT_AUTO_ACCEPT_DEV_CHANNELS BRIDGE_AGENT_MEMORY_DAILY_REFRESH \
+  BRIDGE_AGENT_SESSION_ID BRIDGE_AGENT_CREATED_AT
 
-[[ "$(bridge_agent_engine "$agent")" == "unknown" ]]
-[[ "$(bridge_agent_source "$agent")" == "static" ]]
-[[ "$(bridge_agent_provenance "$agent")" == "static-roster" ]]
-if bridge_agent_precompact_notify_enabled "$agent"; then
-  printf 'precompact notify unexpectedly enabled for unset map\n' >&2
-  exit 1
-fi
-[[ "$(bridge_agent_workdir "$agent")" == "$expected_workdir" ]]
+# Assert every guarded accessor returns its documented default and does not abort.
+# Reused for both the unset phase and the scalar-spoof phase.
+assert_agent_map_defaults() {
+  local phase="$1"
+  [[ "$(bridge_agent_engine "$agent")" == "unknown" ]]        || { printf '%s: engine\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_source "$agent")" == "static" ]]         || { printf '%s: source\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_provenance "$agent")" == "static-roster" ]] || { printf '%s: provenance\n' "$phase" >&2; exit 1; }
+  if bridge_agent_precompact_notify_enabled "$agent"; then printf '%s: precompact_notify\n' "$phase" >&2; exit 1; fi
+  [[ "$(bridge_agent_workdir "$agent")" == "$expected_workdir" ]] || { printf '%s: workdir\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_loop "$agent")" == "1" ]]                || { printf '%s: loop\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_continue "$agent")" == "1" ]]            || { printf '%s: continue\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_start_policy "$agent")" == "auto" ]]     || { printf '%s: start_policy\n' "$phase" >&2; exit 1; }
+  # #1627 sweep additions:
+  [[ "$(bridge_agent_desc "$agent")" == "" ]]                 || { printf '%s: desc\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_class "$agent")" == "user" ]]            || { printf '%s: class\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_session "$agent")" == "" ]]             || { printf '%s: session\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_isolation_mode "$agent")" == "shared" ]] || { printf '%s: isolation_mode\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_os_user "$agent")" == "" ]]             || { printf '%s: os_user\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_os_user_display "$agent")" == "-" ]]    || { printf '%s: os_user_display\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_profile_home "$agent")" == "" ]]        || { printf '%s: profile_home\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_launch_cmd_raw "$agent")" == "" ]]      || { printf '%s: launch_cmd_raw\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_channels_csv "$agent")" == "" ]]        || { printf '%s: channels_csv\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_plugins_csv "$agent")" == "" ]]         || { printf '%s: plugins_csv\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_model "$agent")" == "" ]]               || { printf '%s: model\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_effort "$agent")" == "" ]]              || { printf '%s: effort\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_permission_mode "$agent")" == "" ]]     || { printf '%s: permission_mode\n' "$phase" >&2; exit 1; }
+  bridge_agent_uses_legacy_launch_flags "$agent"             || { printf '%s: legacy_launch_flags\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_meta_file "$agent")" == "" ]]           || { printf '%s: meta_file\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_history_key "$agent")" == "" ]]         || { printf '%s: history_key\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_idle_timeout "$agent")" == "0" ]]       || { printf '%s: idle_timeout\n' "$phase" >&2; exit 1; }
+  if bridge_agent_idle_timeout_configured "$agent"; then printf '%s: idle_timeout_configured\n' "$phase" >&2; exit 1; fi
+  if bridge_agent_start_policy_configured "$agent"; then printf '%s: start_policy_configured\n' "$phase" >&2; exit 1; fi
+  [[ "$(bridge_agent_inject_timestamp "$agent")" == "1" ]]   || { printf '%s: inject_timestamp\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_skills_csv "$agent")" == "" ]]          || { printf '%s: skills_csv\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_precompact_notify_lang "$agent")" == "en" ]] || { printf '%s: precompact_lang\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_notify_kind "$agent")" == "" ]]         || { printf '%s: notify_kind\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_notify_target "$agent")" == "" ]]       || { printf '%s: notify_target\n' "$phase" >&2; exit 1; }
+  bridge_agent_notify_account "$agent" >/dev/null            || { printf '%s: notify_account\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_action "$agent" "wake")" == "" ]]       || { printf '%s: action\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_discord_channel_id "$agent")" == "" ]]  || { printf '%s: discord_channel_id\n' "$phase" >&2; exit 1; }
+  [[ -n "$(bridge_agent_auto_accept_dev_channels_csv "$agent")" ]] || { printf '%s: auto_accept\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_session_id "$agent")" == "" ]]         || { printf '%s: session_id\n' "$phase" >&2; exit 1; }
+  [[ "$(bridge_agent_created_at "$agent")" == "" ]]         || { printf '%s: created_at\n' "$phase" >&2; exit 1; }
+  # bridge_agent_exists uses a `+x` existence probe — a bare declare-p guard would
+  # still abort on a scalar-clobbered map; assert it reports "not exists" instead.
+  if bridge_agent_exists "$agent"; then printf '%s: exists\n' "$phase" >&2; exit 1; fi
+  # bridge_list_actions key-iterates BRIDGE_AGENT_ACTION; must not iterate a scalar
+  # (fake key "0") and must return empty.
+  [[ "$(bridge_list_actions "$agent")" == "" ]] || { printf '%s: list_actions\n' "$phase" >&2; exit 1; }
+  # bridge_validate_agent_classes: a bare declare-p guard SUCCEEDS for a scalar and
+  # would iterate the fake key "0" then bridge_die "unknown agent class ... for
+  # agent '0'". With bridge_var_is_assoc it must skip validation (rc 0) on a
+  # scalar/unset class map. Run in a subshell so a regression's `exit 1` is caught.
+  ( bridge_validate_agent_classes ) || { printf '%s: validate_agent_classes\n' "$phase" >&2; exit 1; }
+  # memory_daily_refresh: must not abort (source!=static under unset → returns 1).
+  bridge_agent_memory_daily_refresh_enabled "$agent" || true
+}
+
+assert_agent_map_defaults "unset-map"
 
 BRIDGE_AGENT_ENGINE="declare -A spoof"
 BRIDGE_AGENT_SOURCE="declare -A spoof"
 BRIDGE_AGENT_PROVENANCE="declare -A spoof"
 BRIDGE_AGENT_PRECOMPACT_NOTIFY="declare -A spoof"
 BRIDGE_AGENT_WORKDIR="declare -A spoof"
+BRIDGE_AGENT_LOOP="declare -A spoof"
+BRIDGE_AGENT_CONTINUE="declare -A spoof"
+BRIDGE_AGENT_START_POLICY="declare -A spoof"
+BRIDGE_AGENT_DESC="declare -A spoof"
+BRIDGE_AGENT_CLASS="declare -A spoof"
+BRIDGE_AGENT_SESSION="declare -A spoof"
+BRIDGE_AGENT_ISOLATION_MODE="declare -A spoof"
+BRIDGE_AGENT_OS_USER="declare -A spoof"
+BRIDGE_AGENT_PROFILE_HOME="declare -A spoof"
+BRIDGE_AGENT_LAUNCH_CMD="declare -A spoof"
+BRIDGE_AGENT_CHANNELS="declare -A spoof"
+BRIDGE_AGENT_PLUGINS="declare -A spoof"
+BRIDGE_AGENT_MODEL="declare -A spoof"
+BRIDGE_AGENT_EFFORT="declare -A spoof"
+BRIDGE_AGENT_PERMISSION_MODE="declare -A spoof"
+BRIDGE_AGENT_META_FILE="declare -A spoof"
+BRIDGE_AGENT_HISTORY_KEY="declare -A spoof"
+BRIDGE_AGENT_IDLE_TIMEOUT="declare -A spoof"
+BRIDGE_AGENT_INJECT_TIMESTAMP="declare -A spoof"
+BRIDGE_AGENT_SKILLS="declare -A spoof"
+BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG="declare -A spoof"
+BRIDGE_AGENT_NOTIFY_KIND="declare -A spoof"
+BRIDGE_AGENT_NOTIFY_TARGET="declare -A spoof"
+BRIDGE_AGENT_NOTIFY_ACCOUNT="declare -A spoof"
+BRIDGE_AGENT_ACTION="declare -A spoof"
+BRIDGE_AGENT_DISCORD_CHANNEL_ID="declare -A spoof"
+BRIDGE_AGENT_AUTO_ACCEPT_DEV_CHANNELS="declare -A spoof"
+BRIDGE_AGENT_MEMORY_DAILY_REFRESH="declare -A spoof"
+# #1627 sweep: the value literally contains "declare -A" — this is the #1457
+# false-positive that an unanchored `grep 'declare -[A-Za-z]*A'` guard would
+# misread as a real assoc array. bridge_var_is_assoc must reject it.
+BRIDGE_AGENT_SESSION_ID="declare -A spoof"
+BRIDGE_AGENT_CREATED_AT="declare -A spoof"
 
-[[ "$(bridge_agent_engine "$agent")" == "unknown" ]]
-[[ "$(bridge_agent_source "$agent")" == "static" ]]
-[[ "$(bridge_agent_provenance "$agent")" == "static-roster" ]]
-if bridge_agent_precompact_notify_enabled "$agent"; then
-  printf 'precompact notify unexpectedly enabled for scalar map\n' >&2
-  exit 1
+assert_agent_map_defaults "scalar-map"
+
+# #1627 sweep: behavior must be IDENTICAL when the maps ARE proper assoc arrays.
+unset -v BRIDGE_AGENT_MODEL BRIDGE_AGENT_EFFORT BRIDGE_AGENT_PERMISSION_MODE \
+  BRIDGE_AGENT_CLASS BRIDGE_AGENT_START_POLICY BRIDGE_AGENT_IDLE_TIMEOUT \
+  BRIDGE_AGENT_DESC BRIDGE_AGENT_INJECT_TIMESTAMP \
+  BRIDGE_AGENT_SESSION_ID BRIDGE_AGENT_CREATED_AT BRIDGE_AGENT_SESSION
+declare -gA BRIDGE_AGENT_MODEL=([${agent}]="opus")
+declare -gA BRIDGE_AGENT_EFFORT=([${agent}]="high")
+declare -gA BRIDGE_AGENT_PERMISSION_MODE=([${agent}]="acceptEdits")
+declare -gA BRIDGE_AGENT_CLASS=([${agent}]="system")
+declare -gA BRIDGE_AGENT_START_POLICY=([${agent}]="hold")
+declare -gA BRIDGE_AGENT_IDLE_TIMEOUT=([${agent}]="0")
+declare -gA BRIDGE_AGENT_DESC=([${agent}]="my desc")
+declare -gA BRIDGE_AGENT_INJECT_TIMESTAMP=([${agent}]="0")
+declare -gA BRIDGE_AGENT_SESSION_ID=([${agent}]="sess-123")
+declare -gA BRIDGE_AGENT_CREATED_AT=([${agent}]="2026-01-01")
+declare -gA BRIDGE_AGENT_SESSION=([${agent}]="tmux-sess")
+[[ "$(bridge_agent_session_id "$agent")" == "sess-123" ]]    || { printf 'proper-array: session_id\n' >&2; exit 1; }
+[[ "$(bridge_agent_created_at "$agent")" == "2026-01-01" ]]  || { printf 'proper-array: created_at\n' >&2; exit 1; }
+bridge_agent_exists "$agent"                                 || { printf 'proper-array: exists\n' >&2; exit 1; }
+[[ "$(bridge_agent_model "$agent")" == "opus" ]]              || { printf 'proper-array: model\n' >&2; exit 1; }
+[[ "$(bridge_agent_effort "$agent")" == "high" ]]            || { printf 'proper-array: effort\n' >&2; exit 1; }
+[[ "$(bridge_agent_permission_mode "$agent")" == "acceptEdits" ]] || { printf 'proper-array: permission_mode\n' >&2; exit 1; }
+[[ "$(bridge_agent_class "$agent")" == "system" ]]           || { printf 'proper-array: class\n' >&2; exit 1; }
+[[ "$(bridge_agent_start_policy "$agent")" == "hold" ]]      || { printf 'proper-array: start_policy\n' >&2; exit 1; }
+[[ "$(bridge_agent_desc "$agent")" == "my desc" ]]           || { printf 'proper-array: desc\n' >&2; exit 1; }
+[[ "$(bridge_agent_inject_timestamp "$agent")" == "0" ]]     || { printf 'proper-array: inject_timestamp\n' >&2; exit 1; }
+bridge_agent_idle_timeout_configured "$agent"                || { printf 'proper-array: idle_timeout_configured\n' >&2; exit 1; }
+bridge_agent_start_policy_configured "$agent"                || { printf 'proper-array: start_policy_configured\n' >&2; exit 1; }
+if bridge_agent_uses_legacy_launch_flags "$agent"; then printf 'proper-array: legacy_launch_flags should be false when model set\n' >&2; exit 1; fi
+# #1627 sweep: a PROPER class map with a valid value must still pass validation
+# (the guard skips ONLY scalar/unset maps; real validation is preserved).
+( bridge_validate_agent_classes ) || { printf 'proper-array: validate_agent_classes should accept valid class\n' >&2; exit 1; }
+# ...and an INVALID class value must STILL be caught (validation not disabled).
+declare -gA BRIDGE_AGENT_CLASS=([${agent}]="bogus-class")
+if ( bridge_validate_agent_classes ) 2>/dev/null; then
+  printf 'proper-array: validate_agent_classes failed to reject invalid class\n' >&2; exit 1
 fi
-[[ "$(bridge_agent_workdir "$agent")" == "$expected_workdir" ]]
 BASH_AGENT_MAP_GUARD
 
 log "redacting sensitive inline env vars from launch display paths (#428)"
