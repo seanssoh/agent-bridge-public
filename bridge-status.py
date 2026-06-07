@@ -396,7 +396,7 @@ def cron_job_agent_keys(
     The schedule travels with the key so the run-dir scan can compute the
     cadence of the specific job a run belongs to (issue #1464). Keys are
     sorted longest-first so the most specific prefix wins in
-    `agent_for_cron_run_prefix`.
+    `matched_cron_key_for_prefix`.
     """
     if not bridge_home:
         return []
@@ -429,13 +429,20 @@ def cron_job_agent_keys(
     return keys
 
 
-def agent_for_cron_run_prefix(
+def matched_cron_key_for_prefix(
     prefix: str,
     keys: list[tuple[str, str, dict[str, object] | None]],
-) -> tuple[str, dict[str, object] | None] | None:
+) -> tuple[str, str, dict[str, object] | None] | None:
+    """``(matched_key, agent, schedule)`` for the run-id prefix, or None.
+
+    Longest-first match (the `keys` list is sorted that way) so the most
+    specific prefix wins. Returns the matched key alongside the agent/schedule
+    so the run-dir scan can group runs by their distinct owning job/schedule
+    (issue #1659 — reduce the cadence check to one-per-schedule).
+    """
     for key, agent, schedule in keys:
         if prefix == key or prefix.startswith(f"{key}-"):
-            return agent, schedule
+            return key, agent, schedule
     return None
 
 
@@ -486,10 +493,21 @@ def last_cron_run_by_agent(
     hint_lookback = int(max_hint * CRON_CADENCE_GRACE_MULTIPLE) if max_hint else 0
     window_seconds = max(CRON_ACTIVITY_WINDOW_SECONDS, int(critical_seconds or 0), hint_lookback)
     cutoff = now_ts - window_seconds
-    # Aggregate per agent: latch in_cadence True if any owned job fired on
-    # schedule, keep the most recent run timestamp, and record an interval for
-    # the observability column (preferring an in-cadence run's interval).
-    best: dict[str, dict[str, int | bool | None]] = {}
+    # Pass 1 — reduce the run-dir to the LATEST run per distinct
+    # (agent, matched-job-key) BEFORE running any cadence check (issue #1659).
+    # The cadence check (`cron_run_in_cadence` -> `enumerate_cron_occurrences`)
+    # is the expensive part; running it once per historical run row made the
+    # dashboard O(run-records). It only ever needs the latest run of each
+    # distinct schedule: `cron_run_in_cadence(schedule, run_ts, now)` is
+    # monotone in run_ts for a fixed schedule (a later run yields a later
+    # next-due, so it is at least as in-cadence as any earlier run of the same
+    # schedule). Thus the latest-per-schedule run dominates the "ANY owned job
+    # in cadence" latch — keeping only it is bit-for-bit equivalent to the old
+    # per-record aggregation. Grouping by the matched KEY (not the agent) is
+    # what preserves multi-job correctness: a weekly healthy job and an hourly
+    # overdue job under one agent stay two candidates, so the healthy one can
+    # still latch in_cadence while the most-recent timestamp surfaces the newer.
+    latest_per_key: dict[tuple[str, str], tuple[int, dict[str, object] | None]] = {}
     try:
         entries = list(runs_dir.iterdir())
     except OSError:
@@ -501,18 +519,34 @@ def last_cron_run_by_agent(
         if not entry.is_dir():  # noqa: raw-pathlib-controller-only — controller-owned run dir; iso UIDs never reach the dashboard render
             continue
         prefix = entry.name.rsplit("--", 1)[0]
-        match = agent_for_cron_run_prefix(prefix, keys)
+        match = matched_cron_key_for_prefix(prefix, keys)
         if not match:
             continue
-        agent, schedule = match
+        key, agent, schedule = match
+        group = (agent, key)
+        existing = latest_per_key.get(group)
+        if existing is None or ts > existing[0]:
+            latest_per_key[group] = (ts, schedule)
+
+    # Pass 2 — run the cadence check only on the few candidate runs and
+    # aggregate per agent EXACTLY as the old per-record loop did for the two
+    # contract behaviors: latch in_cadence True if any owned job fired on
+    # schedule, and keep the most recent run timestamp. The observability-only
+    # `cron_cadence_seconds` interval column is also recorded (preferring an
+    # in-cadence run's interval). Note: for an IRREGULAR schedule with several
+    # in-cadence runs in the window (e.g. `0 9,17 * * *`, alternating 8h/16h
+    # gaps) the old loop's interval value was already non-deterministic — it
+    # latched whichever in-cadence run `runs_dir.iterdir()` happened to visit
+    # last. Reducing to the latest run per schedule makes this deterministically
+    # the latest in-cadence run's interval; the health latch + surfaced
+    # timestamp (the actual dashboard contract) are unaffected.
+    best: dict[str, dict[str, int | bool | None]] = {}
+    for (agent, _key), (ts, schedule) in latest_per_key.items():
         in_cadence, interval = cron_run_in_cadence(schedule, ts, now_ts)
         record = best.setdefault(
             agent,
             {"last_cron_run_ts": 0, "cron_cadence_seconds": None, "cron_in_cadence": False},
         )
-        # An agent is cron-healthy if ANY of its jobs fired on schedule. Latch
-        # in_cadence True across runs; surface the most recent run's timestamp;
-        # prefer the interval of an in-cadence run for the observability column.
         if ts > int(record["last_cron_run_ts"] or 0):
             record["last_cron_run_ts"] = ts
         if in_cadence:
