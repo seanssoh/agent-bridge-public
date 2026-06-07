@@ -517,11 +517,12 @@ def collect_roster_ids(target_root: Path, admin_agent: str) -> tuple[set[str], l
 
     for rel in ("agent-roster.sh", "agent-roster.local.sh"):
         roster_path = target_root / rel
-        if not roster_path.exists():
-            continue
         try:
             text = roster_path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
+            # Missing or unreadable roster file → skip. The read's
+            # FileNotFoundError/OSError IS the existence check; no raw
+            # pathlib .exists() probe (keeps the #1175 audit ceiling).
             continue
         shell_ids = _parse_roster_shell_ids(text)
         if shell_ids:
