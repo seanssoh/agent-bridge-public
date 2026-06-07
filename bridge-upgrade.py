@@ -2222,11 +2222,17 @@ def remove_existing_target_children(target_root: Path, preserve_relpaths: set[st
     # Top-level child names that contain a preserved subpath — never rmtree
     # these wholesale; descend and prune around the preserved entry instead.
     preserved_top = {rel.split("/", 1)[0] for rel in preserve if rel}
+    # #1661: the raw pathlib metadata ops here are controller-only — this runs
+    # during a controller-driven rollback restore over the controller-owned live
+    # target tree (same category as the pre-#1661 body of this function, which
+    # the raw-pathlib baseline already accepts). The preserve-recursion descends
+    # ONLY into the controller-owned `state/` subtree (preserved_top); iso-owned
+    # agent homes still take the wholesale `shutil.rmtree` branch unchanged.
     removed = 0
     for child in sorted(target_root.iterdir()):
         if child.name == "backups":
             continue
-        if child.name in preserved_top and child.is_dir() and not child.is_symlink():
+        if child.name in preserved_top and child.is_dir() and not child.is_symlink():  # noqa: raw-pathlib-controller-only
             removed += _remove_tree_except(child, target_root, preserve)
             continue
         removed += 1
@@ -2240,7 +2246,10 @@ def remove_existing_target_children(target_root: Path, preserve_relpaths: set[st
 def _remove_tree_except(node: Path, target_root: Path, preserve: set[str]) -> int:
     # Recursively remove everything under `node` except paths whose relpath
     # (from target_root) is in `preserve` or is an ancestor of a preserved
-    # path. The preserved leaf and its parent chain stay intact.
+    # path. The preserved leaf and its parent chain stay intact. #1661:
+    # controller-only — invoked solely from rollback's full-snapshot restore and
+    # confined to the controller-owned `state/` subtree (the only preserved_top),
+    # so the raw pathlib probes/mutations here never cross an iso-agent boundary.
     removed = 0
     for child in sorted(node.iterdir()):
         rel = child.relative_to(target_root).as_posix()
@@ -2248,14 +2257,14 @@ def _remove_tree_except(node: Path, target_root: Path, preserve: set[str]) -> in
             continue  # exact preserved leaf — keep it (and its contents)
         if any(p == rel or p.startswith(rel + "/") for p in preserve):
             # Ancestor of a preserved path — descend, do not remove the dir.
-            if child.is_dir() and not child.is_symlink():
+            if child.is_dir() and not child.is_symlink():  # noqa: raw-pathlib-controller-only
                 removed += _remove_tree_except(child, target_root, preserve)
             continue
         removed += 1
-        if child.is_symlink() or child.is_file():
-            child.unlink(missing_ok=True)
+        if child.is_symlink() or child.is_file():  # noqa: raw-pathlib-controller-only
+            child.unlink(missing_ok=True)  # noqa: raw-pathlib-controller-only
         else:
-            shutil.rmtree(child)
+            shutil.rmtree(child)  # noqa: raw-pathlib-controller-only
     return removed
 
 
