@@ -8693,6 +8693,11 @@ assert_contains "$CRON_FALLBACK_ROUTE_OUTPUT" "delivery_mode: fallback"
 log "parsing Claude plain-text cron results without structured_output"
 python3 - <<'PY'
 import importlib.util
+import json
+import os
+import subprocess
+import tempfile
+from argparse import Namespace
 from pathlib import Path
 
 path = Path("bridge-cron-runner.py").resolve()
@@ -8710,6 +8715,141 @@ assert result["status"] == "completed"
 assert result["summary"] == "The cron run finished successfully with no events to remind."
 assert result["needs_human_followup"] is False
 assert result["confidence"] == "low"
+assert result["delivery_intent"] == "silent"
+
+poisoned = {
+    "CLAUDE_CODE_SESSION_ID": "live-session-id",
+    "CLAUDECODE": "1",
+}
+saved_env = {key: os.environ.get(key) for key in poisoned}
+saved_run = module.subprocess.run
+saved_resolve_binary = module.resolve_binary
+saved_apply_claude_agent_env = module.apply_claude_agent_env
+captured_child_env = {}
+try:
+    os.environ.update(poisoned)
+    module.resolve_binary = lambda name, override_env: "/usr/bin/false"
+    module.apply_claude_agent_env = lambda env, request, request_file: None
+
+    def capture_run(command, cwd, env, capture_output, text, timeout, check):
+        captured_child_env.update(env)
+        return subprocess.CompletedProcess(command, 0, "{}", "")
+
+    module.subprocess.run = capture_run
+    module.run_claude(
+        {"target_workdir": str(Path(".").resolve())},
+        "prompt",
+        1,
+    )
+finally:
+    module.subprocess.run = saved_run
+    module.resolve_binary = saved_resolve_binary
+    module.apply_claude_agent_env = saved_apply_claude_agent_env
+    for key, value in saved_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+for key in poisoned:
+    assert key not in captured_child_env
+
+task_notification_payload = (
+    '{"type":"result","subtype":"success","is_error":false,'
+    '"num_turns":1,'
+    '"result":"Background task completed; no further action.",'
+    '"origin":{"kind":"task-notification"}}'
+)
+try:
+    module.parse_claude_output(task_notification_payload)
+except module.IncompleteCronCaptureError as exc:
+    assert "task-notification" in str(exc)
+else:
+    raise AssertionError("task-notification plain text must be classified as incomplete capture")
+
+try:
+    module.parse_claude_output(f"[{task_notification_payload}]")
+except module.IncompleteCronCaptureError as exc:
+    assert "task-notification" in str(exc)
+else:
+    raise AssertionError("task-notification array must be classified as incomplete capture")
+
+with tempfile.TemporaryDirectory(prefix="agb-cron-incomplete-capture.") as tmp:
+    root = Path(tmp)
+    workdir = root / "workdir"
+    workdir.mkdir()
+    payload_file = root / "payload.md"
+    request_file = root / "request.json"
+    result_file = root / "result.json"
+    status_file = root / "status.json"
+    stdout_log = root / "stdout.log"
+    stderr_log = root / "stderr.log"
+    payload_file.write_text("echo retry-test\n", encoding="utf-8")
+    request = {
+        "run_id": "incomplete-capture-test",
+        "job_id": "incomplete-capture-test",
+        "job_name": "incomplete-capture-test",
+        "family": "incomplete-capture-test",
+        "slot": "2099-01-01T00:00:00+09:00",
+        "target_agent": "smoke-agent",
+        "source_agent": "smoke-agent",
+        "target_engine": "claude",
+        "target_workdir": str(workdir),
+        "payload_file": str(payload_file),
+        "result_file": str(result_file),
+        "status_file": str(status_file),
+        "stdout_log": str(stdout_log),
+        "stderr_log": str(stderr_log),
+    }
+    request_file.write_text(json.dumps(request), encoding="utf-8")
+
+    good_result = {
+        "status": "completed",
+        "summary": "retry succeeded",
+        "findings": [],
+        "actions_taken": ["retried after incomplete capture"],
+        "needs_human_followup": False,
+        "recommended_next_steps": [],
+        "artifacts": [],
+        "confidence": "high",
+        "delivery_intent": "silent",
+        "forward_target": None,
+        "summary_short": None,
+        "channel_relay": None,
+    }
+    calls = []
+
+    def fake_run_claude(request, prompt, timeout, request_file=None):
+        calls.append(prompt)
+        if len(calls) == 1:
+            stdout = task_notification_payload
+        else:
+            stdout = json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "num_turns": 2,
+                    "structured_output": good_result,
+                }
+            )
+        return ["fake-claude"], subprocess.CompletedProcess(["fake-claude"], 0, stdout, "")
+
+    module.check_memory_pressure = lambda: None
+    module.emit_legacy_key_audit = lambda *args, **kwargs: None
+    module.emit_audit_row = lambda *args, **kwargs: None
+    module.run_claude = fake_run_claude
+
+    rc = module.cmd_run(Namespace(request_file=str(request_file), dry_run=False))
+    assert rc == 0
+    assert len(calls) == 2
+    result = json.loads(result_file.read_text(encoding="utf-8"))
+    status = json.loads(status_file.read_text(encoding="utf-8"))
+    assert status["state"] == "success"
+    assert result["child_result_source"] == "child-retry-after-incomplete-capture"
+    assert result["claude_incomplete_capture_retries"] == 1
+    assert "task-notification" in result["claude_incomplete_capture_note"]
+    assert (root / "stdout.incomplete-capture-1.log").is_file()
 PY
 
 log "preserving cron channel-delivery metadata and target channel runtime"
@@ -8785,6 +8925,9 @@ assert "Reporting policy" in prompt
 assert "delivery_intent" in prompt
 assert "main_session_only" in prompt
 assert "forward_to_user" in prompt
+assert "Run scripts and shell commands synchronously inside this turn" in prompt
+assert "Do NOT use run_in_background" in prompt
+assert "task-notification" in prompt
 # PR1.3 — the cron child has no path to external channels at all, so the
 # prompt does not negotiate about `--channels` or relay tools. The `tester`
 # parent identity must still be surfaced (`<{parent}>`).
