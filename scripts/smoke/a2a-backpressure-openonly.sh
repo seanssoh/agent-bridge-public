@@ -244,13 +244,24 @@ finally:
 expect("stale pending room gate response count", len(replies), 1)
 expect("stale pending room gate", replies[0][0], 403)
 
-# M1: corrupt tasks.db on a capped path is a retryable 503, not a generic 500.
+# M1 (#1623): an uncomputable open-task COUNT must FAIL OPEN, not 503-reject.
+# The per-peer cap is an optional throttle, not a security gate; a corrupt /
+# transiently-unopenable tasks.db raises sqlite3.DatabaseError from
+# count_open_remote_tasks, and the receiver must skip the cap + proceed to
+# enqueue an already-authenticated handoff (loud backpressure_count_skip audit),
+# NOT 503-bounce it. enqueue_via_bridge_task is stubbed so the accept path is
+# deterministic without a real bridge-task subprocess.
 corrupt_task_db = task_db.parent / "corrupt-tasks.db"
 corrupt_task_db.write_text("not sqlite", encoding="utf-8")
 corrupt_peer = "corrupt-peer"
 dedupe(corrupt_peer, "corrupt-open-row", 123)
 old_task_db_env = os.environ["BRIDGE_TASK_DB"]
 os.environ["BRIDGE_TASK_DB"] = str(corrupt_task_db)
+audit_events: list[tuple[str, dict[str, object]]] = []
+old_audit = handoffd.audit
+handoffd.audit = lambda event, **fields: audit_events.append((event, fields))  # type: ignore[assignment]
+old_enqueue = handoffd.enqueue_via_bridge_task
+handoffd.enqueue_via_bridge_task = lambda **_kwargs: (True, "8801", "", "")  # type: ignore[assignment]
 handler, replies = fake_handler()
 try:
     handler._handle_dedupe_and_enqueue(
@@ -269,9 +280,15 @@ try:
     )
 finally:
     os.environ["BRIDGE_TASK_DB"] = old_task_db_env
-expect("corrupt tasks db response count", len(replies), 1)
-expect("corrupt tasks db maps to retryable 503", replies[0][0], 503)
-expect("corrupt tasks db carries Retry-After", replies[0][2].get("Retry-After"), "30")
+    handoffd.enqueue_via_bridge_task = old_enqueue  # type: ignore[assignment]
+    handoffd.audit = old_audit  # type: ignore[assignment]
+expect("uncomputable count response count", len(replies), 1)
+expect("uncomputable count fails OPEN (accept, not 503)", replies[0][0], 200)
+expect("uncomputable count accepted task id", replies[0][1].get("task_id"), "8801")
+if not any(ev == "backpressure_count_skip" for ev, _ in audit_events):
+    raise AssertionError("fail-open count error did not emit backpressure_count_skip audit")
+if any(ev == "backpressure_count_fail" for ev, _ in audit_events):
+    raise AssertionError("fail-open count error still emitted the old fail-closed audit")
 
 # B3: pending dedupe rows recover an already-created task by the provenance
 # marker instead of enqueueing a duplicate after a crash before final UPDATE.
