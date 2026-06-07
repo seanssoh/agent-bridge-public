@@ -35,7 +35,7 @@ bridge-setup.py:0
 bridge-stall.py:0
 bridge-status.py:6
 bridge-supervisor.py:5
-bridge-upgrade.py:132
+bridge-upgrade.py:124
 bridge-usage-probe.py:3
 bridge-usage.py:8
 bridge-watchdog-silence.py:11
