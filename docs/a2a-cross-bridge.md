@@ -497,6 +497,15 @@ runner loops from double-sending.
 - GC: max attempts or max age → `dead`. Caps on total outbox bytes +
   per-peer pending count; over-cap, new sends fail locally with a clear
   remediation message (no silent unbounded disk growth).
+- **Manual retry restarts the ladder (#1618).** `agb a2a outbox retry <id>`
+  on a `dead`/`retry` row sets `next_attempt_ts=0` ("send now") **and resets
+  `attempts=0`**, so it walks the backoff ladder from the base interval again
+  instead of getting one shot before the ceiling / re-dead-letter. To make this
+  actually resend, dead-letter now **preserves** the staged outgoing envelope
+  (it used to unlink it, so a retried `dead` row re-dead-lettered as
+  `dead(nobody)`); the dead body is reclaimed by `outbox gc` (terminal rows past
+  max-age, default 14d) or `outbox drop` instead. Dead rows do not count toward
+  the total-byte / per-peer-pending caps.
 
 ## Diagnosis + backoff recovery (`agb a2a diagnose-stuck`, #1563 PR-8)
 

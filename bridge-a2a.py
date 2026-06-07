@@ -5,6 +5,8 @@ Subcommands (surfaced through `agent-bridge a2a ...`):
 
   send          Stage an outbound handoff into the durable outbox.
   outbox        list | retry | drop | gc — manage the sender outbox.
+                `retry` requeues a dead/retry row to send now and resets its
+                attempt counter so it walks the backoff ladder afresh (#1618).
   inbox-dedupe  list | gc — inspect/prune the receiver dedupe ledger.
   peers         list | test <peer> — inspect configured peers.
   deliver       Drain the outbox: sign + POST each pending entry over the
@@ -532,9 +534,17 @@ def cmd_outbox(args: argparse.Namespace) -> int:
         if action == "retry":
             if not args.message_id:
                 return die("outbox retry needs <message_id>") or 1
+            # #1618: a manual retry RESTARTS the delivery effort, so it resets
+            # `attempts=0` alongside `next_attempt_ts=0` ("send now"). A dead row
+            # sits at the delivery_max_attempts ceiling (default 12); preserving
+            # the count gave it exactly ONE serve tick (attempts -> 13 >= max ->
+            # re-dead) or a single re-schedule at the backoff ceiling (12h/1d).
+            # Zeroing attempts walks the backoff ladder again from the base
+            # interval, matching the verb's intent ("send it now, keep trying").
+            # The historical attempt count is intentionally cleared.
             cur = conn.execute(
                 "UPDATE outbox SET status='pending', next_attempt_ts=0, "
-                "lease_owner=NULL, lease_expires_ts=0, updated_ts=? "
+                "attempts=0, lease_owner=NULL, lease_expires_ts=0, updated_ts=? "
                 "WHERE message_id=? AND status IN ('dead', 'retry')",
                 (a2a.now_ts(), args.message_id),
             )
@@ -870,10 +880,12 @@ def _schedule_retry(conn, message_id: str, attempts: int, cfg: dict[str, Any],
                     last_error: str, retry_after: Optional[str] = None) -> str:
     max_attempts = int(cfg.get("delivery_max_attempts", 12))
     if attempts >= max_attempts:
-        row = conn.execute(
-            "SELECT body_path FROM outbox WHERE message_id=?",
-            (message_id,),
-        ).fetchone()
+        # #1618: do NOT unlink the staged body on dead-letter. A `dead` row is an
+        # operator-retryable state (`agb a2a outbox retry`), and the prior code
+        # deleted the managed envelope here, so a manual retry of a maxattempts
+        # row re-dead-lettered as `dead(nobody)` on the next tick (body gone) —
+        # i.e. retry could never actually resend it. The body is still reclaimed
+        # by `outbox gc` (terminal rows older than max-age) and `outbox drop`.
         conn.execute(
             "UPDATE outbox SET status='dead', attempts=?, last_error=?, updated_ts=? "
             "WHERE message_id=?",
@@ -881,8 +893,6 @@ def _schedule_retry(conn, message_id: str, attempts: int, cfg: dict[str, Any],
              a2a.now_ts(), message_id),
         )
         conn.commit()
-        if row is not None:
-            _unlink_outbox_body_path(row["body_path"])
         return "dead(maxattempts)"
 
     ceiling = a2a.delivery_backoff_ceiling(cfg)
@@ -924,18 +934,18 @@ def _schedule_retry(conn, message_id: str, attempts: int, cfg: dict[str, Any],
 
 
 def _mark_dead(conn, message_id: str, reason: str) -> None:
-    row = conn.execute(
-        "SELECT body_path FROM outbox WHERE message_id=?",
-        (message_id,),
-    ).fetchone()
+    # #1618: the staged body is preserved on dead-letter (it used to be unlinked
+    # here) so `agb a2a outbox retry` can actually resend a dead row once the
+    # operator fixes the underlying cause (e.g. a recovered peer / corrected
+    # config). The body is reclaimed by `outbox gc` / `outbox drop` instead.
+    # `dead(nobody)` rows whose body was already missing simply have nothing to
+    # retain — the reschedule on the next tick will re-dead them the same way.
     conn.execute(
         "UPDATE outbox SET status='dead', last_error=?, "
         "lease_owner=NULL, lease_expires_ts=0, updated_ts=? WHERE message_id=?",
         (reason[:500], a2a.now_ts(), message_id),
     )
     conn.commit()
-    if row is not None:
-        _unlink_outbox_body_path(row["body_path"])
 
 
 def cmd_deliver(args: argparse.Namespace) -> int:
@@ -2740,7 +2750,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="resolve + validate but do not write the outbox")
     p_send.set_defaults(func=cmd_send)
 
-    p_outbox = sub.add_parser("outbox", help="manage the sender outbox")
+    p_outbox = sub.add_parser(
+        "outbox",
+        help="manage the sender outbox (retry resets the attempt counter, #1618)")
     p_outbox.add_argument("action", choices=["list", "retry", "drop", "gc"])
     p_outbox.add_argument("message_id", nargs="?", default=None)
     p_outbox.add_argument("--json", action="store_true")

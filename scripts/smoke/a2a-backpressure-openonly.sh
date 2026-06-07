@@ -445,8 +445,10 @@ finally:
     left.close()
     right.close()
 
-# B5/B8: terminal outbox transitions unlink outgoing envelopes, gc unlinks
-# deleted terminal rows, and Retry-After remains a floor after jitter.
+# B5/B8: the acked transition unlinks the outgoing envelope; dead-letter now
+# PRESERVES it (#1618: a `dead` row is operator-retryable, so the body must
+# survive for `agb a2a outbox retry`); gc unlinks deleted terminal rows
+# (acked AND dead); and Retry-After remains a floor after jitter.
 outbox = a2a.open_outbox()
 cfg = {
     "bridge_id": "local",
@@ -494,8 +496,20 @@ a2a.outbox_insert(
     body_bytes=2,
 )
 bridge_a2a._mark_dead(outbox, "dead-msg", "unit dead")
+# #1618: dead-letter must PRESERVE the staged body so a manual `outbox retry`
+# can actually resend the row (the prior code unlinked it here, so retry
+# re-dead-lettered as dead(nobody)). gc/drop reclaim the dead body instead.
+if not dead_path.exists():
+    raise AssertionError("dead outbox body was unlinked (must be preserved for retry, #1618)")
+# And gc must still reclaim the dead row's body once it ages past the cutoff.
+outbox.execute(
+    "UPDATE outbox SET updated_ts=? WHERE message_id='dead-msg'",
+    (now - 100,),
+)
+outbox.commit()
+bridge_a2a.cmd_outbox(argparse.Namespace(action="gc", message_id=None, json=False, max_age=1))
 if dead_path.exists():
-    raise AssertionError("dead outbox body was not unlinked")
+    raise AssertionError("outbox gc did not reclaim the aged dead body")
 
 gc_path = a2a.outgoing_dir() / "gc.json"
 gc_path.write_text("{}", encoding="utf-8")
