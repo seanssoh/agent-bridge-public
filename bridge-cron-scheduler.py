@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import math
 import os
@@ -252,14 +253,29 @@ def expand_atom(atom: str, minimum: int, maximum: int) -> set[int]:
     return values
 
 
-def field_matches(expr: str, value: int, minimum: int, maximum: int) -> bool:
+# `allowed_values` is a PURE function of `(expr, minimum, maximum)` — the set of
+# integers a cron field expression matches never changes for a given range. The
+# cadence-health walk in bridge-status.py enumerates occurrences minute-by-minute
+# over wide windows, so without memoization `field_matches`/`expand_atom` rebuilt
+# this set tens of millions of times (issue #1659: 45.9M `expand_atom` calls,
+# 51.8s self-time on a host with 5,632 cron-run records). A bounded
+# module-lifetime LRU collapses that to the handful of unique
+# `(expr, min, max)` tuples a roster of schedules actually uses. The bound caps
+# pathological memory growth from adversarial/unique expressions; the result is
+# an immutable frozenset so a cached value can never be mutated by a caller.
+@functools.lru_cache(maxsize=4096)
+def allowed_values(expr: str, minimum: int, maximum: int) -> frozenset[int]:
     allowed: set[int] = set()
     for atom in expr.split(","):
         atom = atom.strip()
         if not atom:
             continue
         allowed |= expand_atom(atom, minimum, maximum)
-    return value in allowed
+    return frozenset(allowed)
+
+
+def field_matches(expr: str, value: int, minimum: int, maximum: int) -> bool:
+    return value in allowed_values(expr, minimum, maximum)
 
 
 def cron_matches(expr: str, dt_value: datetime) -> bool:
