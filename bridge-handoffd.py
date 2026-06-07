@@ -148,6 +148,59 @@ def canonical_path_text(path: Path | str) -> str:
     return str(Path(path).expanduser().resolve(strict=False))
 
 
+# Bounded retry for the transient WAL read-only open window. The main daemon
+# writes tasks.db every ~5s; when it is not concurrently holding the shared
+# `-shm`, a `mode=ro` open of a WAL DB can momentarily raise "unable to open
+# database file" (a DatabaseError). A couple of tiny-backoff retries usually
+# crosses the window; the `query_only` fallback covers the rest while keeping
+# the receiver strictly read-only in intent (it never writes tasks.db).
+_QUEUE_RO_OPEN_ATTEMPTS = 3
+_QUEUE_RO_OPEN_BACKOFF_SECONDS = 0.05
+
+
+def _open_queue_db_readonly(queue_db: Path) -> sqlite3.Connection:
+    """Open the queue tasks.db read-only, robust to the transient WAL window.
+
+    Tries `mode=ro` (true read-only, no chance of mutating tasks.db) with a
+    small bounded retry. If every `mode=ro` attempt still raises a
+    DatabaseError, falls back to `mode=rw` (NEVER `mode=rwc` / a bare `file:`
+    URI, both of which CREATE the DB if missing) immediately set to
+    `PRAGMA query_only=ON` so the receiver still cannot mutate tasks.db but no
+    longer needs the `-shm`/`-wal` sidecars to be openable as read-only. The
+    `mode=rw` open also fails — rather than silently creating an empty DB — if
+    the file vanished after the caller's existence check (TOCTOU). Any error
+    from the final fallback propagates to the caller (whose backpressure handler
+    now fails OPEN on a DatabaseError).
+    """
+    quoted = urllib.parse.quote(canonical_path_text(queue_db), safe="/:")
+    queue_uri = "file:" + quoted + "?mode=ro"
+    last_exc: Optional[sqlite3.DatabaseError] = None
+    for attempt in range(_QUEUE_RO_OPEN_ATTEMPTS):
+        try:
+            return sqlite3.connect(queue_uri, uri=True)
+        except sqlite3.DatabaseError as exc:
+            last_exc = exc
+            if attempt + 1 < _QUEUE_RO_OPEN_ATTEMPTS:
+                time.sleep(_QUEUE_RO_OPEN_BACKOFF_SECONDS)
+
+    # Fallback: `mode=rw` opens an EXISTING db read/write-capable but does NOT
+    # create it (unlike `mode=rwc` or a bare `file:` URI), then immediately
+    # enforce query_only so we keep read-only intent without requiring the
+    # `mode=ro` WAL sidecar window. This never mutates or creates tasks.db.
+    rw_uri = "file:" + quoted + "?mode=rw"
+    conn = sqlite3.connect(rw_uri, uri=True)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+    except sqlite3.DatabaseError:
+        conn.close()
+        # Re-raise the original mode=ro failure: it is the more representative
+        # signal and keeps the audit detail stable.
+        raise last_exc if last_exc is not None else sqlite3.DatabaseError(
+            "queue db read-only open failed"
+        )
+    return conn
+
+
 def count_open_remote_tasks(inbox_conn: sqlite3.Connection, peer_id: str) -> int:
     """Count open local queue tasks plus fresh A2A enqueue reservations.
 
@@ -193,10 +246,7 @@ def count_open_remote_tasks(inbox_conn: sqlite3.Connection, peer_id: str) -> int
     if not queue_db.exists():
         return pending_count
 
-    queue_uri = "file:" + urllib.parse.quote(
-        canonical_path_text(queue_db), safe="/:"
-    ) + "?mode=ro"
-    conn = sqlite3.connect(queue_uri, uri=True)
+    conn = _open_queue_db_readonly(queue_db)
     try:
         open_count = 0
         task_id_list = sorted(task_ids)
@@ -1875,12 +1925,20 @@ class HandoffHandler(BaseHTTPRequestHandler):
                     try:
                         open_count = count_open_remote_tasks(conn, peer_id)
                     except sqlite3.DatabaseError as exc:
-                        conn.rollback()
-                        audit("backpressure_count_fail", peer=peer_id,
+                        # FAIL OPEN: the per-peer cap is an optional throttle, not a
+                        # security gate. If the open-task COUNT can't be computed
+                        # (e.g. the read-only WAL open of tasks.db transiently
+                        # raises "unable to open database file"), reject is the wrong
+                        # failure mode — it 503-bounces valid, already-authenticated
+                        # (HMAC/bind/allowlist/dedupe/room-scope-passed) handoffs.
+                        # Skip the cap for this request and proceed to enqueue,
+                        # behaving as the success path does. Do NOT rollback: the
+                        # success path keeps the open BEGIN IMMEDIATE transaction for
+                        # the caller's UPDATE/INSERT + commit, and the count only ran
+                        # SELECTs on conn (it never mutated the inbox transaction).
+                        audit("backpressure_count_skip", peer=peer_id,
                               message_id=message_id, detail=str(exc)[:200])
-                        self._reply(503, {"ok": False, "error": "queue busy, retry"},
-                                    extra_headers={"Retry-After": "30"})
-                        return False
+                        return True
                     if int(open_count) >= int(max_open):
                         conn.rollback()
                         audit("reject_backpressure", peer=peer_id, client=client_ip,
