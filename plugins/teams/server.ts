@@ -2435,8 +2435,73 @@ const httpServer = createServer((req, res) => {
   res.end()
 })
 
+// Issue #1671-A (v0.16.3): the prior handler was a bare `exit(1)` with a
+// terse "http listen failed" line. On the cm-prod incident the listener hit
+// EADDRINUSE on its expected loopback port (TEAMS_WEBHOOK_PORT) because a
+// reparented (ppid=1) stale teams listener from a prior session still held
+// it — and the operator had no actionable signal in the swallowed log, so
+// the only recovery was waiting out the orphan's #69 parent-death watchdog
+// (a ~22-min gap during which the router-default triage agent dropped
+// unknown-Teams-sender traffic).
+//
+// The fix here is the LOW-RISK, ALWAYS-SHIPPED half of the codex-consensus
+// direction: emit a clear, actionable EADDRINUSE diagnostic that names the
+// exact HOST:PORT, the configured TEAMS_WEBHOOK_PORT env var, and states
+// plainly that another process holds the port. We deliberately do NOT
+// auto-reap the port holder (see the design note below) — a reap can only
+// be done safely under a strict provenance gate, and the actual cm-prod
+// holder was a *different-UID* standalone router whose argv/cwd/env this
+// process cannot even read to prove ownership. So we keep the exit(1) and
+// let the existing #69 parent-death watchdog self-heal the orphan, just
+// with a far better operator signal than before.
+//
+// Why reap is DEFERRED (not shipped) for #1671-A:
+//   - A provenance gate strong enough to be safe ("this is provably MY own
+//     stale teams listener for THIS agent") requires reading the holder's
+//     argv/cwd/env to match the plugin entrypoint + BRIDGE_AGENT_ID. On the
+//     incident host the holder ran under a different OS user, so those reads
+//     are impossible (cross-UID /proc/<pid>/{cmdline,cwd,environ} is denied)
+//     → ownership is UNPROVABLE → killing it would be killing an arbitrary
+//     port holder, which the scope fence forbids.
+//   - A reap whose positive path cannot be proven by a CI smoke is an
+//     un-provable reap; per the consensus direction we ship diagnostic-only.
+//
+// `buildListenErrorDiagnostic` is a pure function (no process side-effects)
+// so the #1671-A smoke can assert the exact diagnostic shape for the
+// EADDRINUSE branch and the generic-error branch without standing up a real
+// listener. The single bind-error handler below is the only call site at
+// runtime.
+export function buildListenErrorDiagnostic(
+  code: string | undefined,
+  host: string,
+  port: number,
+  err: unknown,
+): string {
+  if (code === 'EADDRINUSE') {
+    return (
+      `teams channel: cannot bind ${host}:${port} — EADDRINUSE: another process ` +
+      `already holds this port. ` +
+      `The port is set by TEAMS_WEBHOOK_PORT (currently ${port}; ` +
+      `host TEAMS_WEBHOOK_HOST=${host}). ` +
+      `This usually means a previous teams listener for this agent was reparented ` +
+      `to init (ppid=1) and has not released the port yet — its #69 parent-death ` +
+      `watchdog will free it within ~a few seconds to minutes, after which a ` +
+      `restart will succeed. To recover immediately, identify and stop the holder ` +
+      `(e.g. on Linux: \`ss -ltnp 'sport = :${port}'\` or ` +
+      `\`lsof -nP -iTCP:${port} -sTCP:LISTEN\`), then restart this agent. ` +
+      `If the holder is a *separate* standalone router process, give it the same ` +
+      `parent-death watchdog or consolidate onto one listener for this port.\n`
+    )
+  }
+  return `teams channel: http listen failed on ${host}:${port}: ${err}\n`
+}
+
 httpServer.on('error', err => {
-  process.stderr.write(`teams channel: http listen failed on ${HOST}:${PORT}: ${err}\n`)
+  const code = (err as NodeJS.ErrnoException | undefined)?.code
+  // Always-shipped clear EADDRINUSE diagnostic (issue #1671-A). No reap: the
+  // holder's provenance is unprovable across the UID boundary on the incident
+  // host, so we exit and let the #69 parent-death watchdog self-heal.
+  process.stderr.write(buildListenErrorDiagnostic(code, HOST, PORT, err))
   process.exit(1)
 })
 
@@ -2767,6 +2832,35 @@ if (
   }
   const isBotOrSelf = isInboundFromBotOrSelf(fakeActivity)
   process.stdout.write(JSON.stringify({ should_skip: isBotOrSelf }) + '\n')
+  process.exit(0)
+}
+
+if (CLI_SUBCOMMAND === '_smoke-listen-error-diagnostic') {
+  // Issue #1671-A (v0.16.3): exercise buildListenErrorDiagnostic directly so
+  // the smoke can assert the EADDRINUSE diagnostic shape (HOST:PORT,
+  // TEAMS_WEBHOOK_PORT, "another process ... holds this port") and the
+  // generic-error fallback shape without standing up a real listener.
+  // Variants:
+  //   eaddrinuse — code 'EADDRINUSE' → port-conflict diagnostic.
+  //   generic    — any other code → terse "http listen failed" line.
+  // The HOST/PORT are read from TEAMS_WEBHOOK_HOST/TEAMS_WEBHOOK_PORT exactly
+  // as the runtime listener path does, so the smoke can pin that the operator
+  // env var name surfaces in the message. Output: the raw diagnostic string
+  // on stdout (single record; the trailing newline is preserved).
+  const argv = process.argv.slice(3)
+  const flags: Record<string, string> = {}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (!arg.startsWith('--')) continue
+    const key = arg.slice(2)
+    const value = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : ''
+    if (value) i++
+    flags[key] = value
+  }
+  const variant = String(flags['variant'] ?? 'eaddrinuse').trim()
+  const code = variant === 'generic' ? 'ECONNREFUSED' : 'EADDRINUSE'
+  const fakeErr = Object.assign(new Error(`listen ${code} ${HOST}:${PORT}`), { code })
+  process.stdout.write(buildListenErrorDiagnostic(code, HOST, PORT, fakeErr))
   process.exit(0)
 }
 
