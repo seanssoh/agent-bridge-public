@@ -168,13 +168,20 @@ step_t2_start_policy_reader() {
 
   local reader_driver="$SMOKE_TMP_ROOT/t2-reader.sh"
   local reader_body
+  # #1627: bridge_agent_start_policy now calls bridge_var_is_assoc (the nounset
+  # guard mirrored from #1626). Extract that helper too so the standalone driver
+  # resolves it — otherwise the guard's `if` falls through and a proper-array
+  # `hold` would regress to `auto`.
   reader_body="$(awk '
+    /^bridge_var_is_assoc\(\) \{/             { capture=1 }
     /^bridge_agent_start_policy\(\) \{/        { capture=1 }
     /^bridge_agent_start_policy_configured\(\) \{/ { capture=1 }
     capture { print }
     capture && /^}[[:space:]]*$/ { capture=0; print "" }
   ' "$REPO_ROOT/lib/bridge-agents.sh")"
   [[ -n "$reader_body" ]] || smoke_fail "T2: could not extract bridge_agent_start_policy from lib/bridge-agents.sh"
+  grep -q '^bridge_var_is_assoc() {' <<<"$reader_body" \
+    || smoke_fail "T2: could not extract bridge_var_is_assoc — check lib/bridge-agents.sh for rename"
 
   {
     printf '#!/usr/bin/env bash\n'
@@ -245,6 +252,15 @@ step_t3_daemon_hold_gate() {
   # plumbing.
   local helper_funcs="$SMOKE_TMP_ROOT/t3-funcs.sh"
   {
+    # #1627: bridge_agent_start_policy now depends on bridge_var_is_assoc (the
+    # nounset guard mirrored from #1626). Extract that helper first so the
+    # standalone gate driver resolves it — otherwise a proper-array `hold`
+    # regresses to `auto`.
+    awk '
+      /^bridge_var_is_assoc\(\) \{/ { capture=1 }
+      capture { print }
+      capture && /^}[[:space:]]*$/ { capture=0; print "" }
+    ' "$REPO_ROOT/lib/bridge-agents.sh"
     awk '
       /^bridge_agent_start_policy\(\) \{/ { capture=1 }
       capture { print }
@@ -267,7 +283,7 @@ step_t3_daemon_hold_gate() {
     ' "$REPO_ROOT/bridge-daemon.sh"
   } >"$helper_funcs"
 
-  for fn in bridge_agent_start_policy bridge_daemon_autostart_state_file \
+  for fn in bridge_var_is_assoc bridge_agent_start_policy bridge_daemon_autostart_state_file \
             bridge_daemon_note_autostart_failure bridge_daemon_clear_autostart_failure; do
     if ! grep -q "^${fn}() {" "$helper_funcs"; then
       smoke_fail "T3: could not extract helper $fn — check bridge-daemon.sh / lib/bridge-agents.sh for rename"
