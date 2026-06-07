@@ -1879,33 +1879,42 @@ bridge_tmux_pending_attention_rederive_queue_nudge() {
   return 0
 }
 
-# Issue #1952: detect the task id for a spooled `[task-complete]`
-# notification. Producer shape comes from bridge-task.sh::notify_task_requester
-# via bridge_compose_notification_text (lib/bridge-notify.sh):
-#   [Agent Bridge] task #123: [task-complete] ...
-#   [Agent Bridge] high task #123: [task-complete] ...
+# Issue #1617 (generalizes #1952): detect the task id for ANY spooled
+# producer-shaped `task #N` notification — a new-task ARRIVAL or a
+# `[task-complete]` COMPLETION (and any future `task #N`-bearing shape).
+# Producer header comes from bridge-task.sh::notify_* via
+# bridge_notification_text (lib/bridge-notify.sh):
+#   [Agent Bridge] task #123: <title>                  (arrival)
+#   [Agent Bridge] high task #123: <title>             (arrival, priority)
+#   [Agent Bridge] task #123: [task-complete] ...      (completion)
+#   [Agent Bridge] high task #123: [task-complete] ... (completion, priority)
 #
-# Detection is anchored to the FIRST LINE header, not the body. Completion
-# titles and note text are user-controlled enough that a broad substring scan
-# would risk suppressing an unrelated send that merely quotes a completion
-# payload. Echoes the notification task id on stdout and returns 0 only for a
-# producer-shaped completion notification.
-bridge_tmux_pending_attention_task_complete_id() {
+# Detection is anchored to the FIRST LINE header, not the body — completion
+# titles, arrival titles, and note text are user-controlled enough that a
+# broad substring scan would risk suppressing an unrelated send that merely
+# quotes such a payload (the original #1952 safety rationale, preserved).
+# The optional `([[:space:]][^[:space:]]+)?` group absorbs the priority word.
+# Dropping the trailing `[task-complete]` requirement is what unifies arrival
+# and completion into ONE type-agnostic gate (operator directive 2026-06-07:
+# do NOT add a third per-type matcher). Echoes the notification task id on
+# stdout and returns 0 only for a producer-shaped `task #N` notification.
+bridge_tmux_pending_attention_task_ref_id() {
   local decoded="$1"
   local first_line="${decoded%%$'\n'*}"
-  if [[ "$first_line" =~ ^\[Agent\ Bridge\]([[:space:]][^[:space:]]+)?[[:space:]]task[[:space:]]#([0-9]+):[[:space:]]\[task-complete\] ]]; then
+  if [[ "$first_line" =~ ^\[Agent\ Bridge\]([[:space:]][^[:space:]]+)?[[:space:]]task[[:space:]]#([0-9]+): ]]; then
     printf '%s' "${BASH_REMATCH[2]}"
     return 0
   fi
   return 1
 }
 
-# Issue #1952: completion notifications spooled during a busy window can be
-# replayed long after the requester already opened and closed the
-# `[task-complete]` task. Drop ONLY when a bounded read confirms the
-# notification task status is exactly `done`. Any parse/read/timeout failure
-# returns non-zero so the caller preserves the original payload.
-bridge_tmux_pending_attention_task_complete_is_done() {
+# Issue #1617 (generalizes #1952): a `task #N` notification (arrival OR
+# completion) spooled during a busy window can be replayed long after the
+# requester already claimed+done the referenced task. Drop ONLY when a bounded
+# read confirms the notification task status is exactly `done`. Any
+# parse/read/timeout failure returns non-zero so the caller preserves the
+# original payload (fail-safe: uncertainty is KEEP, never silent-drop).
+bridge_tmux_pending_attention_task_ref_is_done() {
   local task_id="$1"
   local status=""
   local status_rc=0
@@ -1915,12 +1924,24 @@ bridge_tmux_pending_attention_task_complete_is_done() {
     return 1
   fi
 
-  status="$(bridge_with_timeout 15 spool_task_complete_status \
+  status="$(bridge_with_timeout 15 spool_task_ref_status \
     python3 "$BRIDGE_SCRIPT_DIR/bridge-daemon-helpers.py" \
     task-status "$BRIDGE_TASK_DB" "$task_id" 2>/dev/null)" || status_rc=$?
   (( status_rc == 0 )) || return 1
   [[ "$status" == "done" ]] || return 1
   return 0
+}
+
+# Issue #1617: thin back-compat aliases for the pre-generalization #1952 names.
+# The detector/predicate were renamed _task_complete_* -> _task_ref_* when the
+# `[task-complete]`-only matcher was generalized to cover arrival notifications
+# too. Keep the old names callable so external smokes / callers that still
+# reference them resolve to the unified implementation.
+bridge_tmux_pending_attention_task_complete_id() {
+  bridge_tmux_pending_attention_task_ref_id "$@"
+}
+bridge_tmux_pending_attention_task_complete_is_done() {
+  bridge_tmux_pending_attention_task_ref_is_done "$@"
 }
 
 bridge_tmux_pending_attention_flush() {
@@ -1958,7 +1979,7 @@ bridge_tmux_pending_attention_flush() {
   local deferred_marker=0
   local rederived=""
   local rederive_rc=0
-  local task_complete_id=""
+  local task_ref_id=""
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     ts="${line%%$'\t'*}"
@@ -1983,10 +2004,14 @@ bridge_tmux_pending_attention_flush() {
     # query error / unresolvable) replay the original frozen text — never
     # silently drop.
     #
-    # Issue #1952: a non-nudge `[task-complete]` notification can also go
-    # stale while spooled. Drop ONLY when a bounded DB read confirms the
-    # completion notification task is already done; otherwise preserve the
-    # original payload. Other non-nudge payloads still replay verbatim.
+    # Issue #1617 (generalizes #1952): a non-nudge `task #N` notification —
+    # a new-task ARRIVAL or a `[task-complete]` COMPLETION (and any future
+    # `task #N`-bearing shape) — can also go stale while spooled. ONE
+    # type-agnostic gate: drop ONLY when a bounded DB read confirms the
+    # referenced task is already `done`; otherwise preserve the original
+    # payload. Any read/parse/timeout failure preserves (KEEP). Non-`task #N`
+    # payloads still replay verbatim. (Operator directive 2026-06-07: do NOT
+    # add a third per-type matcher — generalize the existing task-ref check.)
     if bridge_tmux_pending_attention_is_queue_nudge "$decoded"; then
       set +e
       rederived="$(bridge_tmux_pending_attention_rederive_queue_nudge "$agent")"
@@ -2000,9 +2025,10 @@ bridge_tmux_pending_attention_flush() {
         decoded="$rederived"
       fi
       # rc=1 (or empty rc=0) → fall through with the original frozen text.
-    elif task_complete_id="$(bridge_tmux_pending_attention_task_complete_id "$decoded")"; then
-      if bridge_tmux_pending_attention_task_complete_is_done "$task_complete_id"; then
-        # Requester already handled the completion notification task.
+    elif task_ref_id="$(bridge_tmux_pending_attention_task_ref_id "$decoded")"; then
+      if bridge_tmux_pending_attention_task_ref_is_done "$task_ref_id"; then
+        # Requester already claimed+done the referenced task (arrival or
+        # completion) — the deferred replay would be a stale nudge. Drop it.
         continue
       fi
     fi
