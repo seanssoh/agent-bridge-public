@@ -653,6 +653,17 @@ def _overlay_entry(
     vice versa; centralizing removes that drift).
 
     Policy, in order:
+      0. REQUIRED-CONTRACT classification wins over EVERY skip path
+         (Issue #1663 P1 / r2 codex catch). A required-contract entry
+         (plugin.json, .claude-plugin/plugin.json, package.json,
+         server.ts/js, mcp.json/.mcp.json — basename match) that cannot be
+         materialized into the cache for ANY reason — symlink resolving
+         outside the marketplace root, PermissionError, generic OSError —
+         is promoted to a fail-loud `RequiredContractUnreadable`
+         (→ install-failed). It must NEVER be silently skipped: shipping a
+         "verified" cache that is missing its contract file is worse than
+         failing. (Required-contract basenames are never sidecar patterns,
+         so step 0 and the sidecar-skip never conflict.)
       1. Exact-name `skip_names` (node_modules etc.) → silent skip.
       2. Known upgrade/VCS/merge sidecar (`*.upgrade-conflict`, `*.orig`,
          `*.rej`, `*.BACKUP.*`/`*.BASE.*`/`*.LOCAL.*`/`*.REMOTE.*`, `.git`/
@@ -660,23 +671,30 @@ def _overlay_entry(
          plugin content, so they must not abort the build or mark the
          cache incomplete.
       3. Symlink resolving outside the marketplace source root → skip +
-         WARN (pre-existing v1-isolation-leftover guard).
+         WARN (pre-existing v1-isolation-leftover guard). NON-required
+         entries only — a required-contract symlink-outside is fail-loud
+         per step 0.
       4. Directory → recurse (is_dir() FIRST so symlinks-to-directory are
          materialized as a real copy — r4 codex catch).
       5. File / symlink → copy.
 
-    Defense-in-depth (Issue #1663): steps 3-5 run under a per-entry guard
-    so a single unreadable entry (e.g. a 0600 owner-only file an iso UID
-    cannot read) is skipped + WARN'd instead of aborting the WHOLE cache
-    build (which cascade-failed every iso agent on the plugin). EXCEPT: an
-    unreadable / failed REQUIRED-CONTRACT entry (plugin.json, package.json,
-    server.ts/js, mcp.json/.mcp.json) is promoted to a fail-loud
-    `RequiredContractUnreadable` (→ install-failed) — silently shipping a
-    cache missing its contract file is worse than failing.
+    Defense-in-depth (Issue #1663): steps 2-5 run under a per-entry guard
+    so a single unreadable NON-required entry (e.g. a 0600 owner-only file
+    an iso UID cannot read) is skipped + WARN'd instead of aborting the
+    WHOLE cache build (which cascade-failed every iso agent on the plugin).
     """
     name = entry.name
     if name in skip_names:
         return False
+
+    # Step 0 — required-contract classification takes precedence over all
+    # skip paths. `_overlay_required_contract_entry` raises
+    # RequiredContractUnreadable if a required-contract entry cannot be
+    # materialized (symlink-outside / unreadable / OSError); otherwise it
+    # copies it and returns the changed flag. Non-required entries skip
+    # this branch and fall through to the normal skip/copy policy below.
+    if _is_required_contract_name(name):
+        return _overlay_required_contract_entry(entry, target, source_root, agent=agent)
 
     sidecar_reason = _sidecar_skip_reason(name)
     if sidecar_reason is not None:
@@ -701,24 +719,64 @@ def _overlay_entry(
             return _copy_file_if_changed(entry, target)
         return False
     except RequiredContractUnreadable:
-        # Already classified as fail-loud deeper in the recursion — let it
+        # Already classified as fail-loud deeper in the recursion (a
+        # required-contract entry nested under this directory) — let it
         # propagate up to sync_plugin_cache's `except OSError` (install-failed).
         raise
     except OSError as exc:
-        # A required-contract file we cannot read/copy is fail-loud:
-        # silently shipping a cache without it is worse than failing.
-        if _is_required_contract_name(name):
-            raise RequiredContractUnreadable(
-                f"required-contract-unreadable:{entry}:{exc}"
-            ) from exc
-        # Unknown unreadable entry — skip + WARN, never abort the build.
-        # This is what stops one 0600 sidecar (or any unreadable file)
-        # from cascade-failing every iso agent on the plugin (#1663).
+        # Unknown unreadable NON-required entry — skip + WARN, never abort
+        # the build. This is what stops one 0600 sidecar (or any unreadable
+        # file) from cascade-failing every iso agent on the plugin (#1663).
         sys.stderr.write(
             f"[bridge-dev-plugin-cache] WARNING: skipping unreadable entry "
             f"{entry} ({exc}; omitted from cache) agent={agent or '-'}\n"
         )
         return False
+
+
+def _overlay_required_contract_entry(
+    entry: Path,
+    target: Path,
+    source_root: Path,
+    agent: str = "",
+) -> bool:
+    """Materialize a REQUIRED plugin-contract entry into the cache, fail-loud.
+
+    Issue #1663 (P1 / r2 codex catch) — a required-contract file
+    (plugin.json, .claude-plugin/plugin.json, package.json, server.ts/js,
+    mcp.json/.mcp.json) must end up in the cache or the whole install
+    fails. It is NEVER eligible for any skip path:
+
+      * symlink resolving outside the marketplace source root → fail-loud
+        (a v1-isolation-leftover symlink at a contract path would otherwise
+        be silently dropped and the cache reported `linked-verified` with
+        the contract missing — exactly the P1 bug).
+      * PermissionError / generic OSError on stat/copy → fail-loud.
+
+    Always raises `RequiredContractUnreadable` on any failure; otherwise
+    returns the `_copy_file_if_changed` changed flag. The caller has
+    already confirmed `_is_required_contract_name(entry.name)`.
+    """
+    try:
+        if _is_symlink_outside_source_root(entry, source_root):
+            raise RequiredContractUnreadable(
+                f"required-contract-symlink-outside-source:{entry}:"
+                f"resolves outside source root {source_root}"
+            )
+        # A required-contract name is expected to be a regular file (a dir
+        # at that path is malformed plugin material). Treat is_file /
+        # symlink-to-file as the copy case; anything else is fail-loud.
+        if entry.is_file() or entry.is_symlink():
+            return _copy_file_if_changed(entry, target)
+        raise RequiredContractUnreadable(
+            f"required-contract-unreadable:{entry}:not-a-regular-file"
+        )
+    except RequiredContractUnreadable:
+        raise
+    except OSError as exc:
+        raise RequiredContractUnreadable(
+            f"required-contract-unreadable:{entry}:{exc}"
+        ) from exc
 
 
 def _overlay_dir(
@@ -890,6 +948,49 @@ def link_source_node_modules(source_path: Path, cache_version_path: Path) -> tup
     return "linked", str(cache_node_modules)
 
 
+def _find_missing_required_contract(
+    cache_version_path: Path, source_path: Path
+) -> str | None:
+    """Return a reason if a required-contract file in source is absent in cache.
+
+    Issue #1663 (P1 defense-in-depth / r2 codex catch) — the fail-loud
+    path in `_overlay_required_contract_entry` already prevents a required
+    file from being silently skipped, but verify must independently assert
+    the invariant so NO future skip path can ship a `linked-verified`
+    cache that is missing its contract material.
+
+    Invariant: every required-contract file that EXISTS in the source tree
+    (matched by basename, at any depth) must be present at the same
+    relative path in the cache. We only require what the source has — a
+    `.mjs` proxy plugin that legitimately ships without `package.json` /
+    `server.ts` is not penalized (we never assert a file the source lacks).
+
+    Any I/O error walking the source is reported as a verify failure (a
+    source we cannot enumerate is not a cache we can certify).
+    """
+    try:
+        source_entries = list(os.walk(source_path, followlinks=False))
+    except OSError as exc:
+        return f"required-contract-source-walk-failed:{exc}"
+    for dirpath, _dirnames, filenames in source_entries:
+        for fname in filenames:
+            if not _is_required_contract_name(fname):
+                continue
+            src_file = Path(dirpath) / fname
+            try:
+                rel = src_file.relative_to(source_path)
+            except ValueError:
+                continue
+            cache_file = cache_version_path / rel
+            try:
+                present = cache_file.is_file()
+            except OSError as exc:
+                return f"required-contract-cache-stat-failed:{rel}:{exc}"
+            if not present:
+                return f"required-contract-missing-in-cache:{rel}"
+    return None
+
+
 def _verify_cache_version_path(
     cache_version_path: Path, source_path: Path
 ) -> tuple[bool, str]:
@@ -907,6 +1008,10 @@ def _verify_cache_version_path(
     The previous linker logged `linked-OK` based purely on the symlink
     existing, even when the dest dir was unreadable for the isolated UID
     or never created — that silent success is exactly the bug RC6 names.
+
+    Issue #1663 (P1 defense-in-depth): additionally assert that every
+    required-contract file present in source landed in the cache, so a
+    missing contract file can never be reported `*-verified`.
     """
     try:
         if not source_path.exists():
@@ -940,6 +1045,13 @@ def _verify_cache_version_path(
         if parent == parent.parent:
             break
         parent = parent.parent
+
+    # Issue #1663 (P1 defense-in-depth) — a usable cache dir is not enough;
+    # the required-contract material must actually be in it. Fail verify if
+    # any required-contract file present in source is missing from cache.
+    missing = _find_missing_required_contract(resolved, source_path)
+    if missing is not None:
+        return False, missing
 
     return True, ""
 

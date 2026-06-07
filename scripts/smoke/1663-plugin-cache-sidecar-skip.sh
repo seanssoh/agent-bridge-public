@@ -36,6 +36,12 @@
 #      verified status.
 # T3 — a nested required-contract file (`.claude-plugin/plugin.json`)
 #      unreadable → fail-loud too (recursion-depth required-contract guard).
+# T4 — a required-contract file (`.claude-plugin/plugin.json`) that is a
+#      SYMLINK resolving OUTSIDE the marketplace source root → fail-loud
+#      (install-failed, NOT linked-verified, contract file not silently
+#      omitted). r2 codex P1: required-contract classification must take
+#      precedence over the symlink-outside-source skip path. A NON-required
+#      symlink-outside still skips+WARN (asserted too — no regression).
 
 set -u
 
@@ -223,8 +229,89 @@ t3_nested_required_contract_fail_loud() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# T4 — required-contract file as a SYMLINK resolving OUTSIDE the source root
+#      → fail-loud (r2 codex P1). The required-contract classification must
+#      win over the symlink-outside-source skip path; otherwise the contract
+#      file is silently dropped and the cache is reported linked-verified
+#      with the contract MISSING. Unlike T2/T3 this is a path-resolution
+#      check (not a permission check), so it does not require a non-root UID.
+# ---------------------------------------------------------------------------
+t4_required_contract_symlink_outside_fail_loud() {
+  local case_id="t4"
+  local mktroot="$SMOKE_TMP_ROOT/$case_id/mkt"
+  local srcdir
+  srcdir="$(build_fixture "$mktroot")"
+
+  # Point the required-contract plugin.json at a file OUTSIDE the marketplace
+  # root via a symlink (a v1-isolation-leftover-shaped pointer).
+  local outside="$SMOKE_TMP_ROOT/$case_id/outside"
+  mkdir -p "$outside"
+  printf '{"name": "%s", "version": "%s"}\n' "$PLUGIN" "$VERSION" >"$outside/plugin.json"
+  rm -f "$srcdir/.claude-plugin/plugin.json"
+  ln -s "$outside/plugin.json" "$srcdir/.claude-plugin/plugin.json"
+
+  local out rc
+  out="$(run_sync "$mktroot" "$case_id" 2>/dev/null)"
+  rc=$?
+
+  smoke_assert_eq "1" "$rc" "T4 required-contract symlink-outside must exit 1 (fail-loud)"
+
+  local status reason
+  status="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["results"][0].get("status",""))')"
+  reason="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["results"][0].get("reason",""))')"
+  smoke_assert_eq "install-failed" "$status" "T4 status must be install-failed (not silently linked-verified)"
+  smoke_assert_contains "$reason" "required-contract" "T4 reason names required-contract"
+
+  # The contract file must NOT be silently present-as-missing: cache must not
+  # be certified with the contract absent.
+  local cvd
+  cvd="$(cache_version_dir "$case_id")"
+  if [[ -d "$cvd" ]]; then
+    [[ -e "$cvd/.claude-plugin/plugin.json" ]] && \
+      smoke_fail "T4 contract file must not be silently materialized from an outside symlink"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# T5 — a NON-required file as a symlink-outside-source still skips+WARN and
+#      the cache stays verified (no regression: only required-contract
+#      entries change to fail-loud).
+# ---------------------------------------------------------------------------
+t5_non_required_symlink_outside_skip() {
+  local case_id="t5"
+  local mktroot="$SMOKE_TMP_ROOT/$case_id/mkt"
+  local srcdir
+  srcdir="$(build_fixture "$mktroot")"
+
+  local outside="$SMOKE_TMP_ROOT/$case_id/outside"
+  mkdir -p "$outside"
+  printf 'opaque\n' >"$outside/extra.txt"
+  ln -s "$outside/extra.txt" "$srcdir/extra.txt"
+
+  local out rc
+  out="$(run_sync "$mktroot" "$case_id" 2>/dev/null)"
+  rc=$?
+
+  smoke_assert_eq "0" "$rc" "T5 non-required symlink-outside must exit 0 (skip, no cascade)"
+
+  local status
+  status="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["results"][0].get("status",""))')"
+  smoke_assert_eq "linked-verified" "$status" "T5 non-required symlink-outside → still linked-verified"
+
+  local cvd
+  cvd="$(cache_version_dir "$case_id")"
+  [[ -e "$cvd/extra.txt" ]] && \
+    smoke_fail "T5 non-required symlink-outside must be OMITTED from cache"
+  smoke_assert_file_exists "$cvd/server.ts" "T5 real content still copied"
+  return 0
+}
+
 smoke_run "T1 sidecar + unknown unreadable → verified, no cascade" t1_sidecar_non_fatal
 smoke_run "T2 required-contract unreadable → fail-loud" t2_required_contract_fail_loud
 smoke_run "T3 nested required-contract unreadable → fail-loud" t3_nested_required_contract_fail_loud
+smoke_run "T4 required-contract symlink-outside → fail-loud" t4_required_contract_symlink_outside_fail_loud
+smoke_run "T5 non-required symlink-outside → skip, still verified" t5_non_required_symlink_outside_skip
 
 smoke_log "passed"
