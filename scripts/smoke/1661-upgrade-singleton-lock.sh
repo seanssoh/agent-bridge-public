@@ -54,61 +54,99 @@ smoke_make_temp_root
 LOCKDIR="$SMOKE_TMP_ROOT/locks"
 mkdir -p "$LOCKDIR"
 
-BASH_BIN="${BRIDGE_BASH_BIN:-bash}"
+# bash 4+ is required to source lib/bridge-lock.sh (its flock branch uses the
+# `exec {fd}>>` dynamic-fd form, a bash-4 feature). On macOS the bare `bash` is
+# 3.2, so prefer an explicit BRIDGE_BASH_BIN, then a Homebrew bash, then PATH
+# bash — and verify the chosen binary is >= 4 (fail loud rather than silently
+# mis-test under 3.2).
+_pick_bash() {
+  local cand
+  for cand in "${BRIDGE_BASH_BIN:-}" /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null)"; do
+    [[ -n "$cand" && -x "$cand" ]] || continue
+    if [[ "$("$cand" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)" =~ ^[4-9]$|^[1-9][0-9]+$ ]]; then
+      printf '%s' "$cand"; return 0
+    fi
+  done
+  return 1
+}
+BASH_BIN="$(_pick_bash)" || smoke_fail "no bash >= 4 found (need it for the lock-lib dynamic-fd flock branch)"
 
-# --------------------------------------------------------------------------
-# T1: refuse-fast default + release + re-acquire.
-# A child holds the lock + sleeps; while it holds, a refuse-fast acquire from
-# THIS shell must be refused. The flock backend ties the lock to the holder's
-# fd lifetime, so the holder must stay alive across the contender attempt.
-# --------------------------------------------------------------------------
-test_refuse_fast_then_release() {
-  local lock="$LOCKDIR/t1.lock"
-  local ready="$SMOKE_TMP_ROOT/t1.ready"
-  local proceed="$SMOKE_TMP_ROOT/t1.proceed"
-  rm -f "$ready" "$proceed"
-
-  # Holder: acquire DIRECTLY (never under $(...) — that would close the flock
-  # fd), signal ready, wait for the contender, then release.
-  "$BASH_BIN" -c '
-    set -euo pipefail
-    source "$1"
-    bridge_scoped_lock_acquire "$2" || { echo "holder-acquire-failed" >&2; exit 9; }
-    : >"$3"                       # signal ready
-    for _ in $(seq 1 50); do [[ -f "$4" ]] && break; sleep 0.1; done
-    bridge_scoped_lock_release "$BRIDGE_SCOPED_LOCK_TOKEN"
-  ' _ "$LOCK_LIB" "$lock" "$ready" "$proceed" &
-  local holder_pid=$!
-
-  # Wait for the holder to hold.
+# Hold the production singleton lock with a LIVE process so refuse-fast
+# assertions genuinely contend on BOTH backends:
+#   * flock backend (default where flock(1) exists): a live `flock -x <file> -c
+#     sleep` process holds the KERNEL flock on the exact lockfile — the prod
+#     helper's `flock -n` contender then sees it busy. Version-independent.
+#   * mkdir backend (BRIDGE_SCOPED_LOCK_DISABLE_FLOCK=1, e.g. no flock): a live
+#     bash-4 process calls bridge_scoped_lock_acquire (creates <file>.d + a
+#     live-owner-pid) and sleeps; the lockdir persists with a live owner so the
+#     contender's stale-reclaim never fires.
+# Args: $1=lockfile $2=ready-file $3=proceed-file.
+# Sets _HELD_LOCK_PID to the holder PID (NOT via $() — a bg process started in
+# a command substitution dies when that subshell returns; we background it in
+# the caller's own shell and return the pid through a global).
+# Caller signals teardown by `: >"$3"` then `wait "$_HELD_LOCK_PID"`.
+_HELD_LOCK_PID=""
+_hold_lock_bg() {
+  local lock="$1" ready="$2" proceed="$3"
+  rm -f "$ready" "$proceed" "$lock"
+  if [[ "${BRIDGE_SCOPED_LOCK_DISABLE_FLOCK:-0}" != "1" ]] && command -v flock >/dev/null 2>&1; then
+    # Live kernel-flock holder (POSIX sh body — no bash version dependency).
+    flock -x "$lock" -c "touch \"$ready\"; while [ ! -f \"$proceed\" ]; do sleep 0.1; done" &
+  else
+    # mkdir-backend holder via the prod helper in a live bash-4 process.
+    BRIDGE_SCOPED_LOCK_DISABLE_FLOCK="${BRIDGE_SCOPED_LOCK_DISABLE_FLOCK:-1}" \
+    "$BASH_BIN" -c '
+      source "$1"
+      bridge_scoped_lock_acquire "$2" || exit 9
+      : >"$3"
+      while [[ ! -f "$4" ]]; do sleep 0.1; done
+      bridge_scoped_lock_release "$BRIDGE_SCOPED_LOCK_TOKEN"
+    ' _ "$LOCK_LIB" "$lock" "$ready" "$proceed" &
+  fi
+  _HELD_LOCK_PID=$!
   local i
-  for i in $(seq 1 50); do [[ -f "$ready" ]] && break; sleep 0.1; done
-  smoke_assert_file_exists "$ready" "T1 holder acquired the lock"
+  for i in $(seq 1 100); do [[ -f "$ready" ]] && break; sleep 0.1; done
+}
+
+# --------------------------------------------------------------------------
+# T1: refuse-fast default + release + re-acquire, proven on BOTH backends.
+# A LIVE process holds the lock (via _hold_lock_bg — kernel flock or mkdir
+# lockdir-with-live-owner) while a refuse-fast contender must be refused with a
+# clear diagnostic; after teardown a fresh acquire must succeed. Running both
+# `flock` and `BRIDGE_SCOPED_LOCK_DISABLE_FLOCK=1` (mkdir) keeps parity with
+# Linux CI (flock) and macOS dev (mkdir).
+# --------------------------------------------------------------------------
+_refuse_fast_assert_once() {
+  # $1=label-suffix (backend name) ; uses caller env BRIDGE_SCOPED_LOCK_DISABLE_FLOCK
+  local backend="$1"
+  local lock="$LOCKDIR/t1-$backend.lock"
+  local ready="$SMOKE_TMP_ROOT/t1-$backend.ready"
+  local proceed="$SMOKE_TMP_ROOT/t1-$backend.proceed"
+
+  _hold_lock_bg "$lock" "$ready" "$proceed"
+  local holder_pid="$_HELD_LOCK_PID"
+  smoke_assert_file_exists "$ready" "T1[$backend] live holder acquired the lock"
 
   # Contender (refuse-fast): must be refused while the holder holds.
   set +e
-  local out rc
+  local out
   out="$("$BASH_BIN" -c '
-    set -euo pipefail
     source "$1"
     if bridge_scoped_lock_acquire "$2"; then
       bridge_scoped_lock_release "$BRIDGE_SCOPED_LOCK_TOKEN"
       echo "ACQUIRED"
     fi
   ' _ "$LOCK_LIB" "$lock" 2>&1)"
-  rc=$?
   set -e
-  smoke_assert_not_contains "$out" "ACQUIRED" "T1 refuse-fast contender did NOT acquire a held lock"
-  smoke_assert_contains "$out" "already running" "T1 refuse-fast contender printed a clear diagnostic"
+  smoke_assert_not_contains "$out" "ACQUIRED" "T1[$backend] refuse-fast contender did NOT acquire a held lock"
+  smoke_assert_contains "$out" "already running" "T1[$backend] refuse-fast contender printed a clear diagnostic"
 
-  # Let the holder release + reap it.
+  # Tear down the holder, then a fresh acquire must succeed (lock free again).
   : >"$proceed"
   wait "$holder_pid" 2>/dev/null || true
-
-  # Now a fresh acquire must succeed (lock free again).
   set +e
+  local rc
   out="$("$BASH_BIN" -c '
-    set -euo pipefail
     source "$1"
     bridge_scoped_lock_acquire "$2" || exit 1
     echo "ACQUIRED"
@@ -116,8 +154,20 @@ test_refuse_fast_then_release() {
   ' _ "$LOCK_LIB" "$lock" 2>&1)"
   rc=$?
   set -e
-  smoke_assert_eq "0" "$rc" "T1 fresh acquire after release returns 0"
-  smoke_assert_contains "$out" "ACQUIRED" "T1 fresh acquire after release succeeds"
+  smoke_assert_eq "0" "$rc" "T1[$backend] fresh acquire after release returns 0"
+  smoke_assert_contains "$out" "ACQUIRED" "T1[$backend] fresh acquire after release succeeds"
+}
+
+test_refuse_fast_then_release() {
+  # mkdir backend (always available).
+  BRIDGE_SCOPED_LOCK_DISABLE_FLOCK=1 _refuse_fast_assert_once "mkdir"
+  # flock backend (where flock(1) exists — Linux CI always; macOS with `brew
+  # install flock`). Skipped only when flock is genuinely absent.
+  if command -v flock >/dev/null 2>&1; then
+    BRIDGE_SCOPED_LOCK_DISABLE_FLOCK=0 _refuse_fast_assert_once "flock"
+  else
+    smoke_skip "T1[flock] refuse-fast" "flock(1) not installed (mkdir backend covered above)"
+  fi
 }
 
 # --------------------------------------------------------------------------
@@ -127,34 +177,22 @@ test_wait_is_bounded() {
   local lock="$LOCKDIR/t2.lock"
   local ready="$SMOKE_TMP_ROOT/t2.ready"
   local proceed="$SMOKE_TMP_ROOT/t2.proceed"
-  rm -f "$ready" "$proceed"
 
-  "$BASH_BIN" -c '
-    set -euo pipefail
-    source "$1"
-    bridge_scoped_lock_acquire "$2" || exit 9
-    : >"$3"
-    for _ in $(seq 1 100); do [[ -f "$4" ]] && break; sleep 0.1; done
-    bridge_scoped_lock_release "$BRIDGE_SCOPED_LOCK_TOKEN"
-  ' _ "$LOCK_LIB" "$lock" "$ready" "$proceed" &
-  local holder_pid=$!
-
-  local i
-  for i in $(seq 1 50); do [[ -f "$ready" ]] && break; sleep 0.1; done
-  smoke_assert_file_exists "$ready" "T2 holder acquired the lock"
+  # Live holder (flock backend where available, else mkdir).
+  _hold_lock_bg "$lock" "$ready" "$proceed"
+  local holder_pid="$_HELD_LOCK_PID"
+  smoke_assert_file_exists "$ready" "T2 live holder acquired the lock"
 
   # Contender with --wait 1: must give up after ~1s (bounded), NOT hang.
   set +e
-  local out rc
+  local out
   out="$("$BASH_BIN" -c '
-    set -euo pipefail
     source "$1"
     if bridge_scoped_lock_acquire "$2" --wait 1; then
       bridge_scoped_lock_release "$BRIDGE_SCOPED_LOCK_TOKEN"
       echo "ACQUIRED"
     fi
   ' _ "$LOCK_LIB" "$lock" 2>&1)"
-  rc=$?
   set -e
   smoke_assert_not_contains "$out" "ACQUIRED" "T2 --wait 1 contender gave up (bounded) on a held lock"
 
@@ -303,12 +341,12 @@ test_single_exit_trap_with_release() {
 }
 
 # --------------------------------------------------------------------------
-# T7 (flock backend, only where real flock(1) exists — Linux CI): cross-process
-# mutual exclusion. Guards the critical regression class where the flock fd is
-# released early — e.g. capturing the token under `$(...)` (a subshell that
-# closes the flock fd) instead of the direct-call / global-token convention.
-# Skipped where flock is absent (macOS dev hosts run the mkdir backend covered
-# by T1); the integration VM-verify stage exercises this on Linux.
+# T7 (flock backend, only where real flock(1) exists — Linux CI): the prod
+# helper's flock-token contender (`bridge_scoped_lock_acquire`, which runs
+# `flock -n` on the shared lockfile) must be refused while a DIFFERENT live
+# process holds the kernel flock on that file. Guards both the early-fd-release
+# regression class AND the `flock -w 0`-vs-`-n` refuse-fast contract. Skipped
+# where flock is absent (mkdir backend covered by T1[mkdir]).
 # --------------------------------------------------------------------------
 test_flock_cross_process_mutex() {
   if ! command -v flock >/dev/null 2>&1; then
@@ -318,26 +356,19 @@ test_flock_cross_process_mutex() {
   local lock="$LOCKDIR/t7.lock"
   local ready="$SMOKE_TMP_ROOT/t7.ready"
   local proceed="$SMOKE_TMP_ROOT/t7.proceed"
-  rm -f "$ready" "$proceed" "$lock"
 
-  "$BASH_BIN" -c '
-    set -euo pipefail
-    source "$1"
-    bridge_scoped_lock_acquire "$2" || exit 9
-    [[ "$BRIDGE_SCOPED_LOCK_TOKEN" == flock:* ]] || { echo "not-flock-backend" >&2; exit 8; }
-    : >"$3"
-    for _ in $(seq 1 100); do [[ -f "$4" ]] && break; sleep 0.1; done
-    bridge_scoped_lock_release "$BRIDGE_SCOPED_LOCK_TOKEN"
-  ' _ "$LOCK_LIB" "$lock" "$ready" "$proceed" &
-  local holder_pid=$!
-  local i
-  for i in $(seq 1 50); do [[ -f "$ready" ]] && break; sleep 0.1; done
-  smoke_assert_file_exists "$ready" "T7 flock holder acquired the lock"
+  # T7 is THE flock-backend test: force the flock backend for BOTH the holder
+  # AND the contender, even when the whole smoke is invoked with an ambient
+  # BRIDGE_SCOPED_LOCK_DISABLE_FLOCK=1 (mkdir-forced). A flock holder + a mkdir
+  # contender would not contend on the same primitive (false ACQUIRED).
+  # Live kernel-flock holder (a different process) via the shared helper.
+  BRIDGE_SCOPED_LOCK_DISABLE_FLOCK=0 _hold_lock_bg "$lock" "$ready" "$proceed"
+  local holder_pid="$_HELD_LOCK_PID"
+  smoke_assert_file_exists "$ready" "T7 live flock holder acquired the lock"
 
   set +e
   local out
-  out="$("$BASH_BIN" -c '
-    set -euo pipefail
+  out="$(BRIDGE_SCOPED_LOCK_DISABLE_FLOCK=0 "$BASH_BIN" -c '
     source "$1"
     if bridge_scoped_lock_acquire "$2"; then
       bridge_scoped_lock_release "$BRIDGE_SCOPED_LOCK_TOKEN"
@@ -348,6 +379,7 @@ test_flock_cross_process_mutex() {
   : >"$proceed"
   wait "$holder_pid" 2>/dev/null || true
   smoke_assert_not_contains "$out" "ACQUIRED" "T7 flock contender refused while a DIFFERENT process holds the lock"
+  smoke_assert_contains "$out" "already running" "T7 flock contender printed the refuse diagnostic"
 }
 
 # --------------------------------------------------------------------------

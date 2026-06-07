@@ -135,13 +135,28 @@ bridge_scoped_lock_acquire() {
     # Open with `>>` (no truncate) so a CONTENDER's open does not wipe the
     # current holder's stamped pid/started before it reads them; the winner
     # truncates + restamps explicitly below.
+    # NOTE: do NOT append `2>/dev/null` to this `exec` — a redirection on a
+    # bare `exec` applies to the WHOLE shell PERMANENTLY, so `exec {fd}>>file
+    # 2>/dev/null` would silence stderr for the rest of the process (it
+    # swallowed the "already running" refuse diagnostic and would mute all
+    # later upgrade output). The `|| { … }` already handles an open failure.
     # shellcheck disable=SC2093  # we explicitly want the fd to outlive this fn
-    exec {lock_fd}>>"$lock_path" 2>/dev/null || {
+    exec {lock_fd}>>"$lock_path" || {
       printf '[bridge-lock] cannot open lockfile: %s\n' "$lock_path" >&2
       return 1
     }
-    # -w 0 == non-blocking refuse-fast; -w <secs> == bounded wait.
-    if flock -w "$wait_secs" "$lock_fd" 2>/dev/null; then
+    # Refuse-fast (wait_secs==0) MUST use `flock -n`, NOT `flock -w 0`:
+    # real flock(1) (util-linux / Homebrew flock 0.4.0) rejects a zero timeout
+    # with "timeout must be greater than 0" (rc 64), which would abort the
+    # acquire on every Linux/flock host. `-n` is the canonical non-blocking
+    # form. A positive wait uses the bounded `-w <secs>`.
+    local _flock_acquired=1
+    if (( wait_secs > 0 )); then
+      flock -w "$wait_secs" "$lock_fd" 2>/dev/null || _flock_acquired=0
+    else
+      flock -n "$lock_fd" 2>/dev/null || _flock_acquired=0
+    fi
+    if (( _flock_acquired == 1 )); then
       # Truncate-then-stamp so the diagnostic reflects THIS owner.
       : >"$lock_path" 2>/dev/null || true
       _bridge_lock_stamp "$lock_fd" fd
@@ -155,7 +170,9 @@ bridge_scoped_lock_acquire() {
     started="${owner#* }"
     printf '[bridge-lock] an upgrade/rollback is already running for %s (pid %s, started %s)\n' \
       "${BRIDGE_HOME:-$lock_parent}" "$pid" "$started" >&2
-    exec {lock_fd}>&- 2>/dev/null || true
+    # Close the fd we opened (no `2>/dev/null` — a redirection on a bare `exec`
+    # persists for the whole shell; closing a valid fd is silent anyway).
+    exec {lock_fd}>&- || true
     return 1
   fi
 
