@@ -142,7 +142,7 @@ build_fixture() {
   local fixture_root="$SMOKE_TMP_ROOT/$label"
   local workdir="$fixture_root/workdir"
   local claude_dir="$workdir/.claude"
-  local shared_file="$fixture_root/shared/settings.effective.json"
+  local shared_file="$fixture_root/shared/settings.effective.json"  # noqa: iso-helper-boundary — test scaffolding, not a controller→iso boundary callsite
   mkdir -p "$claude_dir" "$fixture_root/shared"
   printf '%s\n' '{"smoke": "shared"}' >"$shared_file"
   # Pre-create the existing symlink at the settings.json site.
@@ -157,7 +157,7 @@ build_fixture() {
 # symlink_to raised FileExistsError → outer except OSError logged the spurious
 # warning. Post-fix: the FileExistsError catch re-checks, sees the target
 # already matches, marks unchanged, and emits NO warning.
-T1_FIXTURE="$(build_fixture "t1" "../../shared/settings.effective.json")"
+T1_FIXTURE="$(build_fixture "t1" "../../shared/settings.effective.json")"  # noqa: iso-helper-boundary — test scaffolding, not a controller→iso boundary callsite
 T1_WORKDIR="$(printf '%s\n' "$T1_FIXTURE" | sed -n 1p)"
 T1_SHARED="$(printf '%s\n' "$T1_FIXTURE" | sed -n 2p)"
 
@@ -211,7 +211,7 @@ smoke_log "T2 PASS: wrong-target existing link preserves the FileExistsError war
 # path, would NOT equal the intended target, and the spurious warning would
 # STILL fire. The fix forces `sudo readlink -f` first (`_resolve_iso_link_
 # realpath`), so the correct-target link resolves correctly and is idempotent.
-T3_FIXTURE="$(build_fixture "t3" "../../shared/settings.effective.json")"
+T3_FIXTURE="$(build_fixture "t3" "../../shared/settings.effective.json")"  # noqa: iso-helper-boundary — test scaffolding, not a controller→iso boundary callsite
 T3_WORKDIR="$(printf '%s\n' "$T3_FIXTURE" | sed -n 1p)"
 T3_SHARED="$(printf '%s\n' "$T3_FIXTURE" | sed -n 2p)"
 
