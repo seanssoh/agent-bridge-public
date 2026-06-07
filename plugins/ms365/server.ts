@@ -1647,5 +1647,39 @@ process.on('uncaughtException', err => {
   process.stderr.write(`ms365 channel: uncaught exception: ${err}\n`)
 })
 
+// #1650 B1: one-shot CLI entrypoint for sibling stdio callers (the cosmax-crm
+// proxy crm-mcp-proxy.mjs) that are NOT MCP clients and so cannot invoke the
+// get_valid_token MCP tool. `bun server.ts get-valid-token [upn]` prints one
+// JSON line { upn, access_token, expires_at, expires_in_seconds } to stdout and
+// exits — same contract as the get_valid_token tool: refresh-on-expiry via
+// getAccessToken (refresh_token grant + SingleFlight), NEVER the refresh_token.
+// Handled before mcp.connect so it never starts the server.
+if (process.argv[2] === 'get-valid-token') {
+  // #1654 codex r1 BLOCKING: resolveUpn() throws when no upn arg AND no
+  // MS365_DEFAULT_UPN. Keep it INSIDE the try so that failure exits non-zero
+  // (the global uncaughtException handler only logs — it would exit 0). `upn`
+  // is declared outside so the catch can still name it in the audit.
+  let upn = ''
+  try {
+    upn = resolveUpn(process.argv[3])
+    const access_token = await getAccessToken(upn)
+    const cur = loadJson<TokenFile>(tokenPath(upn))
+    const now = Math.floor(Date.now() / 1000)
+    const expires_at = cur?.expires_at ?? null
+    const expires_in_seconds = expires_at != null ? expires_at - now : null
+    // Redacted audit (upn + expiry only, never the token body), like the tool.
+    process.stderr.write(
+      `ms365 channel: ms365_token_issued upn=${upn} expires_in_seconds=${expires_in_seconds ?? 'unknown'} (cli)\n`,
+    )
+    process.stdout.write(JSON.stringify({ upn, access_token, expires_at, expires_in_seconds }) + '\n')
+    process.exit(0)
+  } catch (e) {
+    process.stderr.write(
+      `ms365 channel: ms365_token_issue_failed upn=${upn || process.argv[3] || '<none>'} err=${e instanceof Error ? e.message : String(e)}\n`,
+    )
+    process.exit(1)
+  }
+}
+
 await mcp.connect(new StdioServerTransport())
 process.stderr.write(`ms365: MCP connected (tenant=${TENANT_ID.slice(0, 8)}..., client=${CLIENT_ID.slice(0, 8)}..., secret_len=${CLIENT_SECRET.length}, default_upn=${DEFAULT_UPN}, state_dir=${STATE_DIR})\n`)
