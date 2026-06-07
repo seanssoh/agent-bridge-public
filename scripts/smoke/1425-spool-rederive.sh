@@ -25,9 +25,10 @@
 #        (preserve), NOT rc=2. A transient failure must never look like
 #        count==0.
 #   R5 — non-nudge payload → is_queue_nudge returns false (verbatim replay).
-#   R6 — task-complete detection is anchored to the producer header and
-#        extracts only the notification task id.
-#   R7 — stale task-complete status check drops only confirmed done rows and
+#   R6 — unified task-ref detection (#1617) is anchored to the producer
+#        header and extracts the notification task id for COMPLETION and
+#        ARRIVAL headers alike, rejecting body-quoted false positives.
+#   R7 — stale task-ref status check drops only confirmed done rows and
 #        preserves on queued/missing/read-failure cases.
 #   R8 — REAL flush teeth: drive bridge_tmux_pending_attention_flush end-to-end
 #        with a recording send stub and assert a DONE [task-complete] entry is
@@ -266,10 +267,15 @@ parsed_normal_id="$(bridge_tmux_pending_attention_task_complete_id "$complete_no
 if bridge_tmux_pending_attention_task_complete_id $'[Agent Bridge]: heads up from ops\n[Agent Bridge] high task #777: [task-complete] quoted in the body' >/dev/null; then
   fail "R6: body-quoted task-complete payload was misclassified"
 fi
-if bridge_tmux_pending_attention_task_complete_id "[Agent Bridge] high task #${complete_id}: ordinary title" >/dev/null; then
-  fail "R6: non-completion task header was misclassified"
-fi
-printf '[smoke]   [ok] R6: task-complete detector extracts header task id and rejects body/title false positives\n'
+# Issue #1617: the matcher is now type-agnostic — an ARRIVAL header
+# (`[Agent Bridge] high task #N: <title>`, no `[task-complete]`) MUST also
+# match and yield the id (this is the gap #1617 closes; pre-#1617 the
+# `[task-complete]`-only matcher rejected it and the arrival replayed stale).
+parsed_arrival_id="$(bridge_tmux_pending_attention_task_complete_id "[Agent Bridge] high task #${complete_id}: ordinary title")" \
+  || fail "R6: arrival task header (no [task-complete]) was not recognized by the unified matcher"
+[[ "$parsed_arrival_id" == "$complete_id" ]] \
+  || fail "R6: parsed arrival id ${parsed_arrival_id}, expected ${complete_id}"
+printf '[smoke]   [ok] R6: unified task-ref matcher extracts header id for completion AND arrival headers, rejects body-quoted false positives\n'
 
 # ---- R7: stale task-complete status check is done-only and fail-safe -------
 if bridge_tmux_pending_attention_task_complete_is_done "$complete_id"; then
@@ -411,25 +417,27 @@ else
   echo "[smoke]   [ok] S1: flusher drops the entry on rc=2 (confirmed count==0)"
 fi
 
-if ! grep -q "bridge_tmux_pending_attention_task_complete_id" "$tmux_sh"; then
-  echo "[smoke][error] S1: lib/bridge-tmux.sh does not define the task-complete detector" >&2
+# Issue #1617: the matcher/predicate were generalized to _task_ref_* (covers
+# arrival AND completion). The flusher now gates on the unified names.
+if ! grep -q "bridge_tmux_pending_attention_task_ref_id" "$tmux_sh"; then
+  echo "[smoke][error] S1: lib/bridge-tmux.sh does not define the unified task-ref detector" >&2
   failed=1
 else
-  echo "[smoke]   [ok] S1: task-complete detector is defined in lib/bridge-tmux.sh"
+  echo "[smoke]   [ok] S1: unified task-ref detector is defined in lib/bridge-tmux.sh"
 fi
 
-if ! printf '%s' "$flush_body" | grep -q "bridge_tmux_pending_attention_task_complete_id"; then
-  echo "[smoke][error] S1: flusher does not gate on the task-complete detector" >&2
+if ! printf '%s' "$flush_body" | grep -q "bridge_tmux_pending_attention_task_ref_id"; then
+  echo "[smoke][error] S1: flusher does not gate on the unified task-ref detector" >&2
   failed=1
 else
-  echo "[smoke]   [ok] S1: flusher gates non-nudge completion payloads on task-complete detector"
+  echo "[smoke]   [ok] S1: flusher gates non-nudge task #N payloads on the unified task-ref detector"
 fi
 
-if ! printf '%s' "$flush_body" | grep -q "bridge_tmux_pending_attention_task_complete_is_done"; then
-  echo "[smoke][error] S1: flusher does not call the task-complete stale checker" >&2
+if ! printf '%s' "$flush_body" | grep -q "bridge_tmux_pending_attention_task_ref_is_done"; then
+  echo "[smoke][error] S1: flusher does not call the unified task-ref stale checker" >&2
   failed=1
 else
-  echo "[smoke]   [ok] S1: flusher gates task-complete drops on the stale checker"
+  echo "[smoke]   [ok] S1: flusher gates task-ref drops on the unified stale checker"
 fi
 
 if ! grep -q "task-status" "$REPO_ROOT/bridge-daemon-helpers.py"; then
