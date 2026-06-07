@@ -1010,7 +1010,43 @@ def cmd_deliver(args: argparse.Namespace) -> int:
             row = conn.execute("SELECT * FROM outbox WHERE message_id=?", (mid,)).fetchone()
             if row is None:
                 continue
-            result = _deliver_one(conn, cfg, row, timeout=timeout)
+            # #1628: per-row guard. _deliver_one's pre-POST staging read
+            # `body_path.read_bytes()` runs outside any local catch, so an
+            # unreadable body (an iso-owned 0660 envelope the runner cannot read
+            # -> PermissionError) or a transient read OSError used to unwind the
+            # WHOLE batch — the poisoned row stayed leased as 'sending' and every
+            # other healthy due row on the tick was skipped. Isolate that failure
+            # to the one row: demote it to the existing transient `retry` path
+            # (clears the lease, walks the backoff ladder, and the max-attempts
+            # ceiling still eventually dead-letters a permanently-bad row) and
+            # continue the batch.
+            #
+            # The catch is scoped to OSError on purpose. (a) It is exactly the
+            # staging-read failure surface the issue names (read_bytes raises
+            # PermissionError/IsADirectoryError/FileNotFoundError, all OSError);
+            # the transport leg already has its own (URLError, timeout, OSError)
+            # catch inside _deliver_one and the ack/dead/retry transitions each
+            # commit before returning. (b) It deliberately does NOT swallow a
+            # programming error (NameError/TypeError/KeyError) — those should
+            # still crash loudly rather than be silently retried. (c) The only
+            # statement that runs after the success commit (acked) is
+            # _unlink_outbox_body_path, which swallows OSError internally, so a
+            # post-ack OSError cannot reach here and flip a durably-acked row
+            # back to retry (which would re-send an already-delivered message).
+            try:
+                result = _deliver_one(conn, cfg, row, timeout=timeout)
+            except OSError as exc:
+                attempts = int(row["attempts"]) + 1
+                result = _schedule_retry(
+                    conn, mid, attempts, cfg,
+                    f"deliver error: {type(exc).__name__}: {exc}",
+                )
+                info(f"{mid} -> {result} (per-row guard: {type(exc).__name__})")
+                # The row WAS processed this tick (demoted, lease cleared), so it
+                # counts toward the processed total — otherwise an all-poisoned
+                # batch would misleadingly log "no due outbox entries".
+                delivered += 1
+                continue
             delivered += 1
             info(f"{mid} -> {result}")
     finally:

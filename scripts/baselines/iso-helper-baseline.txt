@@ -144,6 +144,7 @@ scripts/smoke/1563-pr3-daemon-escalation.sh=1
 scripts/smoke/1563-pr4-a2a-receiver-healthz.sh=5
 scripts/smoke/1618-outbox-retry-resets-attempts-helper.py=4
 scripts/smoke/1623-a2a-backpressure-failopen-helper.py=1
+scripts/smoke/1628-a2a-deliver-per-row-guard-helper.py=3
 scripts/smoke/4494-integrated-dynamic-recovery.sh=4
 scripts/smoke/857-pr1-isolation-write-helper.sh=9
 scripts/smoke/857-pr6-isolation-v3-channel-dotenv-migrate.sh=25
