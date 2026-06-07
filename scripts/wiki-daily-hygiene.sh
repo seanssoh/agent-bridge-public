@@ -72,7 +72,7 @@ if [ "$critical_count" -gt 0 ]; then
   ADMIN="${BRIDGE_ADMIN_AGENT:-${BRIDGE_ADMIN_AGENT_ID:-patch}}"
   "${BRIDGE_AGB:-$HOME/.agent-bridge/agent-bridge}" task create \
     --to "$ADMIN" --priority high --from "$ADMIN" \
-    --title "[wiki-daily-hygiene] CRITICAL $critical_count건 — $DATE" \
+    --title "[wiki-daily-hygiene] CRITICAL ${critical_count}건 — $DATE" \
     --body-file "$LOG" >/dev/null 2>&1 || true
 fi
 

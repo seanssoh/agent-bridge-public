@@ -40,6 +40,7 @@ DELIVERY_INTENT_VALUES = ("silent", "main_session_only", "forward_to_user")
 FORWARD_CHANNEL_VALUES = ("telegram", "discord", "mattermost")
 FORWARD_FORMAT_VALUES = ("markdown", "text")
 SUMMARY_SHORT_MAX = 200
+CLAUDE_INCOMPLETE_CAPTURE_MAX_RETRIES = 1
 
 # PR1.5 — direct-send marker substrings the LLM should never emit at action
 # position (forward_target / summary_short). v1 behaviour: emit a one-line
@@ -200,6 +201,20 @@ SHELL_RESULT_STATUS_VALUES = {"success", "error"}
 SHELL_PAYLOAD_ENV_PREFIXES = ("POLL_", "SCRIPT_")
 SHELL_PROTECTED_ENV_EXACT = {"HOME", "PATH"}
 SHELL_PROTECTED_ENV_PREFIXES = ("BRIDGE_", "CRON_")
+
+
+class IncompleteCronCaptureError(ValueError):
+    """Claude captured a background-completion re-entry, not the work turn."""
+
+
+CLAUDE_SESSION_ENV_EXACT = {
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "ANTHROPIC_SESSION_ID",
+}
 
 
 def now_iso() -> str:
@@ -2166,6 +2181,9 @@ def build_prompt(request: dict[str, Any], payload_text: str) -> str:
         "- This run has NO access to Discord, Telegram, Mattermost, email, or any human channel.",
         "- Do NOT call agb urgent / agb task create / agb task done / agb handoff for delivery.",
         "- Do NOT call message/reply/send tools or post to webhook URLs.",
+        "- Run scripts and shell commands synchronously inside this turn. Do NOT use run_in_background, background tasks, `&`, `nohup`, `disown`, or fire-and-forget subprocesses.",
+        "- Wait for every command/script to finish before returning, then return the schema JSON in this same turn.",
+        "- If this input appears to be a `task-notification` or background-completion re-entry, do not answer with a one-turn plain-text completion notice. Return the original job's structured JSON contract instead.",
         "- Decide a `delivery_intent` and return it in the JSON result. Allowed values:",
         "    - `silent` — default. The work was done; the parent does not need to be told. No inbox task is created.",
         "    - `main_session_only` — the parent agent must absorb this into context. No user-facing send. The parent updates its mental model and closes the inbox task.",
@@ -2265,6 +2283,12 @@ def runner_env() -> dict[str, str]:
     env = dict(os.environ)
     env["PATH"] = augmented_path()
     return env
+
+
+def scrub_claude_session_env(env: dict[str, str]) -> None:
+    """Drop inherited interactive-Claude context before spawning a cron child."""
+    for key in CLAUDE_SESSION_ENV_EXACT:
+        env.pop(key, None)
 
 
 def _safe_agent_id(value: str) -> bool:
@@ -2592,6 +2616,7 @@ def run_claude(request: dict[str, Any], prompt: str, timeout: int, request_file:
         prompt,
     ]
     env = runner_env()
+    scrub_claude_session_env(env)
     sudo_user = apply_claude_agent_env(env, request, request_file)
     command = command_for_run_as_user(command, sudo_user, env)
     completed = subprocess.run(
@@ -2626,6 +2651,28 @@ def parse_codex_output(stdout_text: str) -> dict[str, Any]:
     return validate_result(json.loads(agent_message))
 
 
+def _origin_kind(payload: dict[str, Any]) -> str:
+    origin = payload.get("origin")
+    if isinstance(origin, dict):
+        return str(origin.get("kind") or "").strip()
+    return ""
+
+
+def _num_turns(payload: dict[str, Any]) -> int | None:
+    raw = payload.get("num_turns")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_incomplete_task_notification_capture(payload: dict[str, Any]) -> bool:
+    if _origin_kind(payload) != "task-notification":
+        return False
+    turns = _num_turns(payload)
+    return turns is not None and turns <= 1
+
+
 def parse_claude_output(stdout_text: str) -> dict[str, Any]:
     text = stdout_text.strip()
     if not text:
@@ -2640,6 +2687,10 @@ def parse_claude_output(stdout_text: str) -> dict[str, Any]:
         for event in reversed(payload):
             if isinstance(event, dict) and isinstance(event.get("structured_output"), dict):
                 return validate_result(event["structured_output"])
+            if isinstance(event, dict) and is_incomplete_task_notification_capture(event):
+                raise IncompleteCronCaptureError(
+                    "incomplete task-notification capture: output array without structured_output"
+                )
         raise ValueError("claude output array did not contain structured_output")
 
     if not isinstance(payload, dict):
@@ -2658,7 +2709,19 @@ def parse_claude_output(stdout_text: str) -> dict[str, Any]:
             except json.JSONDecodeError:
                 parsed_result = None
             if isinstance(parsed_result, dict):
-                return validate_result(parsed_result)
+                try:
+                    return validate_result(parsed_result)
+                except ValueError as exc:
+                    if is_incomplete_task_notification_capture(payload):
+                        raise IncompleteCronCaptureError(
+                            f"incomplete task-notification capture: {exc}"
+                        ) from exc
+                    raise
+
+            if is_incomplete_task_notification_capture(payload):
+                raise IncompleteCronCaptureError(
+                    "incomplete task-notification capture: plain-text background completion"
+                )
 
             if payload.get("subtype") == "success" and not payload.get("is_error", False):
                 return validate_result(
@@ -2671,6 +2734,10 @@ def parse_claude_output(stdout_text: str) -> dict[str, Any]:
                         "recommended_next_steps": [],
                         "artifacts": [],
                         "confidence": "low",
+                        "delivery_intent": "silent",
+                        "forward_target": None,
+                        "summary_short": None,
+                        "channel_relay": None,
                     }
                 )
 
@@ -3381,7 +3448,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # production cron jobs.
     emit_legacy_key_audit(request, run_id, target_agent=str(request.get("target_agent") or ""))
 
-    timeout = int(os.environ.get("BRIDGE_CRON_SUBAGENT_TIMEOUT_SECONDS", "900"))
+    timeout = int(request.get("timeoutSeconds") or os.environ.get("BRIDGE_CRON_SUBAGENT_TIMEOUT_SECONDS", "900") or 900)
     started_at = now_iso()
     write_status(
         status_file,
@@ -3404,6 +3471,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     sidecar_error_note: str | None = None
     family = request.get("family", "")
     sidecar_path = run_dir / "authoritative-memory-daily.json"
+    claude_incomplete_capture_retries = 0
+    claude_incomplete_capture_note: str | None = None
 
     try:
         if engine == "codex":
@@ -3415,29 +3484,61 @@ def cmd_run(args: argparse.Namespace) -> int:
             child_result = parse_codex_output(completed.stdout)
             final_state = "success" if child_result.get("status") != "error" else "error"
         elif engine == "claude":
-            command, completed = run_claude(request, prompt, timeout, request_file=request_file)
-            write_text(stdout_log, completed.stdout)
-            write_text(stderr_log, completed.stderr)
-            if completed.returncode != 0:
-                raise RuntimeError(f"claude -p failed with exit code {completed.returncode}")
+            max_attempts = CLAUDE_INCOMPLETE_CAPTURE_MAX_RETRIES + 1
+            for attempt in range(max_attempts):
+                command, completed = run_claude(request, prompt, timeout, request_file=request_file)
+                if completed.returncode != 0:
+                    write_text(stdout_log, completed.stdout)
+                    write_text(stderr_log, completed.stderr)
+                    raise RuntimeError(f"claude -p failed with exit code {completed.returncode}")
 
-            # memory-daily: authoritative sidecar written by the harvester is
-            # preferred source. Attempt it BEFORE parse_claude_output so a child
-            # relay that drops/rewrites structured_output cannot override the
-            # harvester's authoritative actions_taken.
-            if family == "memory-daily" and sidecar_path.is_file():
-                try:
-                    authoritative = json.loads(sidecar_path.read_text(encoding="utf-8"))
-                    child_result = validate_result(authoritative)
-                    child_result_source = "authoritative-sidecar"
-                except (OSError, json.JSONDecodeError, ValueError) as exc:
-                    sidecar_error_note = f"sidecar invalid: {exc!r}"
-                    child_result = None
+                parsed_child_result: dict[str, Any] | None = None
+                parsed_source = "child"
 
-            if child_result is None:
-                child_result = parse_claude_output(completed.stdout)
-                if family == "memory-daily":
-                    child_result_source = "child-fallback"
+                # memory-daily: authoritative sidecar written by the harvester is
+                # preferred source. Attempt it BEFORE parse_claude_output so a child
+                # relay that drops/rewrites structured_output cannot override the
+                # harvester's authoritative actions_taken.
+                if family == "memory-daily" and sidecar_path.is_file():
+                    try:
+                        authoritative = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                        parsed_child_result = validate_result(authoritative)
+                        parsed_source = "authoritative-sidecar"
+                    except (OSError, json.JSONDecodeError, ValueError) as exc:
+                        sidecar_error_note = f"sidecar invalid: {exc!r}"
+                        parsed_child_result = None
+
+                if parsed_child_result is None:
+                    try:
+                        parsed_child_result = parse_claude_output(completed.stdout)
+                        if family == "memory-daily":
+                            parsed_source = "child-fallback"
+                    except IncompleteCronCaptureError as exc:
+                        if attempt < max_attempts - 1:
+                            claude_incomplete_capture_retries += 1
+                            claude_incomplete_capture_note = str(exc)
+                            write_text(
+                                run_dir / f"stdout.incomplete-capture-{attempt + 1}.log",
+                                completed.stdout,
+                            )
+                            write_text(
+                                run_dir / f"stderr.incomplete-capture-{attempt + 1}.log",
+                                completed.stderr,
+                            )
+                            continue
+                        write_text(stdout_log, completed.stdout)
+                        write_text(stderr_log, completed.stderr)
+                        raise
+
+                write_text(stdout_log, completed.stdout)
+                write_text(stderr_log, completed.stderr)
+                child_result = parsed_child_result
+                child_result_source = (
+                    "child-retry-after-incomplete-capture"
+                    if claude_incomplete_capture_retries and parsed_source == "child"
+                    else parsed_source
+                )
+                break
 
             final_state = "success" if child_result.get("status") != "error" else "error"
         else:
@@ -3486,6 +3587,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             # spam the parent's inbox with malformed alerts. The audit log
             # records the failure separately via reporting_decision=invalid.
             "delivery_intent": "silent",
+            "forward_target": None,
+            "summary_short": None,
+            "channel_relay": None,
         }
 
     # PR1.2 — apply per-job reporting_policy override (always_silent /
@@ -3670,6 +3774,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         result_payload["direct_send_markers_count"] = len(markers)
     if sidecar_error_note:
         result_payload["sidecar_error_note"] = sidecar_error_note
+    if claude_incomplete_capture_retries:
+        result_payload["claude_incomplete_capture_retries"] = claude_incomplete_capture_retries
+        result_payload["claude_incomplete_capture_note"] = claude_incomplete_capture_note or ""
     if error_message:
         result_payload["runner_error"] = error_message
     if reactive_summary is not None:

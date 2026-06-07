@@ -154,6 +154,8 @@ def main() -> int:
         "stderr_log": stderr_log,
         "source_file": source_file,
     }
+    if shell_timeout_seconds:
+        payload["timeoutSeconds"] = int(shell_timeout_seconds)
     if payload_kind == "shell":
         shell_payload = {
             "kind": "shell",
