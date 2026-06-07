@@ -21,6 +21,21 @@ declare -Ag BRIDGE_AGENT_DESC=()
 # shellcheck disable=SC2034
 declare -Ag BRIDGE_AGENT_ENGINE=()
 
+# #1407/#1213/#1457 follow-up: SOURCE / PROVENANCE / PRECOMPACT_NOTIFY share
+# ENGINE's associative-map contract but were added (accessors + populate code)
+# without a declaration here. An undeclared map makes ${MAP[$agent]} evaluate
+# the agent id as an arithmetic subscript and abort the launcher under `set -u`
+# ("<agent>: unbound variable"). Declare them empty up front, exactly like the
+# maps above, so element assignment and reads always hit a real assoc array.
+# shellcheck disable=SC2034
+declare -Ag BRIDGE_AGENT_SOURCE=()
+
+# shellcheck disable=SC2034
+declare -Ag BRIDGE_AGENT_PROVENANCE=()
+
+# shellcheck disable=SC2034
+declare -Ag BRIDGE_AGENT_PRECOMPACT_NOTIFY=()
+
 # shellcheck disable=SC2034
 declare -Ag BRIDGE_AGENT_SESSION=()
 
