@@ -1822,6 +1822,13 @@ fi
 # the v2 marker is already present + valid). Failure aborts the upgrade
 # before apply-live touches the install — the `no_v080_code_installed=yes`
 # remediation hint tells the operator they can safely retry.
+# HOME-revert follow-up (#4378): shared-mode credential config
+# consolidation is wired through this same helper. It sources
+# lib/bridge-isolation-v2-migrate.sh and calls
+# bridge_isolation_v2_migrate_apply_for_upgrade, which runs the
+# sentinel-gated .config/{gh,gws,gcloud} consolidation before any
+# marker-only, macOS/no-isolated, marker-present, or full-migrate branch
+# can return.
 ISOLATION_V2_MIGRATION_JSON='{"mode":"isolation-v2-migrate","skipped":true,"reason":"dry-run"}'
 if [[ $DRY_RUN -eq 0 ]]; then
   # Run the migration in a child shell whose env is scoped to TARGET_ROOT

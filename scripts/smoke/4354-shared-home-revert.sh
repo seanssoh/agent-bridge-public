@@ -117,22 +117,35 @@ test_auto_memory_leaf_remains_agent_scoped() {
 
 test_credential_consolidation_and_idempotency() {
   local source_gh target_gh sentinel backup_count backup_path
+  local operator_hosts_before operator_hosts_after consolidation_output
   source_gh="$AGENT_HOME/.config/gh"
   target_gh="$OPERATOR_HOME/.config/gh"
   mkdir -p "$source_gh" "$target_gh"
-  printf 'source: agent\n' >"$source_gh/hosts.yml"
+  printf 'source: agent-stub\n' >"$source_gh/hosts.yml"
+  printf 'source: agent-only\n' >"$source_gh/agent-only.yml"
+  printf 'source: operator-valid-token\n' >"$target_gh/hosts.yml"
   printf 'source: operator\n' >"$target_gh/operator.yml"
+  operator_hosts_before="$SMOKE_TMP_ROOT/operator-hosts-before.yml"
+  operator_hosts_after="$SMOKE_TMP_ROOT/operator-hosts-after.yml"
+  cp "$target_gh/hosts.yml" "$operator_hosts_before"
 
-  bridge_isolation_v2_migrate_shared_credential_configs \
-    "$BRIDGE_DATA_ROOT" "$BRIDGE_HOME"
+  consolidation_output="$(bridge_isolation_v2_migrate_shared_credential_configs \
+    "$BRIDGE_DATA_ROOT" "$BRIDGE_HOME" 2>&1)"
+  cp "$target_gh/hosts.yml" "$operator_hosts_after"
 
   [[ -L "$source_gh" ]] || smoke_fail "credential consolidation should replace source gh dir with a symlink"
   smoke_assert_eq "$target_gh" "$(readlink "$source_gh")" \
     "credential consolidation symlink points at operator gh config"
+  cmp -s "$operator_hosts_before" "$operator_hosts_after" \
+    || smoke_fail "credential consolidation must not overwrite operator hosts.yml with agent stub"
   smoke_assert_file_exists "$target_gh/hosts.yml" \
-    "credential consolidation mirrors agent gh hosts into operator config"
+    "credential consolidation preserves operator gh hosts"
+  smoke_assert_file_exists "$target_gh/agent-only.yml" \
+    "credential consolidation mirrors agent-only gh files into operator config"
   smoke_assert_file_exists "$target_gh/operator.yml" \
     "credential consolidation preserves existing operator gh files"
+  smoke_assert_contains "$consolidation_output" "kept operator $target_gh/hosts.yml" \
+    "credential consolidation warns on divergent operator/agent overlap"
   sentinel="$AGENT_HOME/.creds-consolidated.sentinel"
   smoke_assert_file_exists "$sentinel" \
     "credential consolidation writes per-agent sentinel"
@@ -144,6 +157,8 @@ test_credential_consolidation_and_idempotency() {
   backup_path="$(find "$AGENT_HOME/.config" -maxdepth 1 -type d -name 'gh.pre-home-revert.*' -print -quit)"
   smoke_assert_file_exists "$backup_path/hosts.yml" \
     "credential consolidation backup preserves source contents"
+  smoke_assert_contains "$(cat "$backup_path/hosts.yml")" "agent-stub" \
+    "credential consolidation backup preserves divergent agent stub"
 
   bridge_isolation_v2_migrate_shared_credential_configs \
     "$BRIDGE_DATA_ROOT" "$BRIDGE_HOME"

@@ -1019,6 +1019,9 @@ bridge_isolation_v2_migrate_consolidate_one_config_dir() {
   local link_abs=""
   local backup_path=""
   local -a rsync_flags
+  local source_file=""
+  local relative_path=""
+  local target_file=""
 
   source_abs="$(bridge_isolation_v2_migrate_path_abs "$source_path")"
   target_abs="$(bridge_isolation_v2_migrate_path_abs "$target_path")"
@@ -1051,17 +1054,26 @@ bridge_isolation_v2_migrate_consolidate_one_config_dir() {
     return 1
   }
 
-  rsync_flags=(-a)
-  if ! rsync "${rsync_flags[@]}" "$source_path"/ "$target_path"/ 2>/dev/null; then
-    bridge_warn "creds_consolidate: rsync $source_path -> $target_path failed"
-    return 1
-  fi
-
   backup_path="${source_path}.pre-home-revert.${stamp}"
   if [[ -e "$backup_path" || -L "$backup_path" ]]; then
     bridge_warn "creds_consolidate: backup path already exists, refusing to overwrite: $backup_path"
     return 1
   fi
+
+  while IFS= read -r -d '' source_file; do
+    relative_path="${source_file#"$source_path"/}"
+    target_file="$target_path/$relative_path"
+    if [[ -f "$target_file" ]] && ! cmp -s "$source_file" "$target_file"; then
+      bridge_warn "creds_consolidate: kept operator $target_file; agent copy preserved in $backup_path/$relative_path"
+    fi
+  done < <(find "$source_path" -type f -print0 2>/dev/null)
+
+  rsync_flags=(-a --ignore-existing)
+  if ! rsync "${rsync_flags[@]}" "$source_path"/ "$target_path"/ 2>/dev/null; then
+    bridge_warn "creds_consolidate: rsync $source_path -> $target_path failed"
+    return 1
+  fi
+
   if ! mv "$source_path" "$backup_path" 2>/dev/null; then
     bridge_warn "creds_consolidate: move source aside failed: $source_path -> $backup_path"
     return 1

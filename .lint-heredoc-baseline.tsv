@@ -224,6 +224,7 @@ lib/bridge-host-profile.sh	203	C3	71eccee67da1310243de68add85154e68165f16059df93
 lib/bridge-host-profile.sh	273	H3	24060087d519f37a2d9f47765c64adbda24ceb59fe155510b4e209c5fd95a8de	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-host-profile.sh	307	H3	24060087d519f37a2d9f47765c64adbda24ceb59fe155510b4e209c5fd95a8de	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v2-migrate.sh	838	H3	f76308bcc7f5051dda9a60057540bfd3985f9d8364f1b7cb8689ef7850e07185	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2-migrate.sh	1069	H3	88aa0b12fe0ee603c2282a65d0d2d3b257c564c69f06730364ae840d562323fb	here-string/procsub, non-interpreter consumer	claude	shared-mode-operator-home (#1622)
 lib/bridge-isolation-v2-migrate.sh	1108	H3	c2d06bebe53400eca7b3da976ac9c1986bb8e2ba030db1d3b44abe171861bbd4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v2-migrate.sh	1245	H3	8641a4b0bfee263cf01bfcfca9354cd3efa54a918663d364a06f1fe327290bfa	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v2-migrate.sh	1249	H3	2a266e0375ff91ddfa86dc69923e8bf8c488c762496b01998ebd2db061c509ab	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
