@@ -82,4 +82,47 @@ if grep -E "ms365_token_issued" "$WORK/block.txt" | grep -Eq '\$\{access_token\}
   fail "T5: ms365_token_issued audit appears to embed the access_token body (must be upn+expiry only)"
 fi
 
+# T6 — #1650 B1: the one-shot CLI entrypoint for sibling stdio callers (the
+# cosmax-crm proxy, which is not an MCP client). `get-valid-token` argv branch
+# handled before mcp.connect, prints JSON, reuses getAccessToken, no refresh_token.
+log "T6: get-valid-token CLI entrypoint"
+grep -Eq "process\.argv\[2\] === 'get-valid-token'" "$MS365_TS" \
+  || fail "T6: server.ts does not handle the get-valid-token CLI subcommand"
+# Must be handled BEFORE mcp.connect (one-shot, never starts the server).
+CLI_LINE="$(grep -nE "process\.argv\[2\] === 'get-valid-token'" "$MS365_TS" | head -n1 | cut -d: -f1)"
+CONNECT_LINE="$(grep -nE 'mcp\.connect\(new StdioServerTransport' "$MS365_TS" | head -n1 | cut -d: -f1)"
+[[ -n "$CLI_LINE" && -n "$CONNECT_LINE" ]] || fail "T6: cannot locate CLI branch ($CLI_LINE) or mcp.connect ($CONNECT_LINE)"
+(( CLI_LINE < CONNECT_LINE )) || fail "T6: get-valid-token CLI branch (line $CLI_LINE) must precede mcp.connect (line $CONNECT_LINE)"
+# Isolate the CLI branch body (from the argv test to its process.exit(0)).
+awk "
+  /process.argv\[2\] === 'get-valid-token'/ {cap=1}
+  cap {buf=buf\$0 ORS}
+  cap && /process.exit\(0\)/ {print buf; exit}
+" "$MS365_TS" >"$WORK/cli.txt"
+[[ -s "$WORK/cli.txt" ]] || fail "T6: could not isolate the get-valid-token CLI branch body"
+grep -Eq "getAccessToken\(upn\)" "$WORK/cli.txt" || fail "T6: CLI branch does not reuse getAccessToken(upn)"
+grep -Eq "access_token" "$WORK/cli.txt" || fail "T6: CLI branch does not emit access_token"
+grep -vE "^[[:space:]]*//|^[[:space:]]*\*" "$WORK/cli.txt" >"$WORK/clicode.txt" || true
+if grep -Eq "refresh_token" "$WORK/clicode.txt"; then
+  fail "T6: CLI branch references refresh_token — must never leave the ms365 plugin"
+fi
+
+# T7 — #1654 codex r1 BLOCKING regression guard: resolveUpn() MUST be inside the
+# CLI try/catch so a missing-upn/no-default failure exits non-zero. If it sits
+# before `try {`, resolveUpn throws to the global uncaughtException handler which
+# only logs and the process exits 0 (false success), breaking the proxy contract.
+# Capture the FULL branch (through the catch's exit 1) and assert ordering + exit.
+log "T7: resolveUpn inside try, failure exits non-zero (no-upn regression guard)"
+awk "
+  /process.argv\[2\] === 'get-valid-token'/ {cap=1}
+  cap {n++; if (\$0 ~ /try \{/ && !tryline) tryline=n; if (\$0 ~ /resolveUpn\(process.argv\[3\]\)/ && !upnline) upnline=n; print}
+  cap && /process.exit\(1\)/ {exit}
+" "$MS365_TS" >"$WORK/full.txt"
+[[ -s "$WORK/full.txt" ]] || fail "T7: could not isolate the full CLI branch (through the catch)"
+TRY_AT="$(grep -nE 'try \{' "$WORK/full.txt" | head -n1 | cut -d: -f1)"
+UPN_AT="$(grep -nE 'resolveUpn\(process.argv\[3\]\)' "$WORK/full.txt" | head -n1 | cut -d: -f1)"
+[[ -n "$TRY_AT" && -n "$UPN_AT" ]] || fail "T7: cannot locate try ($TRY_AT) or resolveUpn ($UPN_AT) in the CLI branch"
+(( TRY_AT < UPN_AT )) || fail "T7: resolveUpn(process.argv[3]) (line $UPN_AT) must be INSIDE the try (try at line $TRY_AT) so a no-upn failure exits non-zero"
+grep -Eq "process\.exit\(1\)" "$WORK/full.txt" || fail "T7: CLI branch has no process.exit(1) failure path"
+
 log "passed"
