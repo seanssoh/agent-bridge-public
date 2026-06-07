@@ -1052,7 +1052,13 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
             })
     def result_has_changes(item: AgentMigrationResult) -> bool:
         remat = item.rematerialize or {}
-        return bool(item.added_files or item.created_dirs or item.updated_files or remat.get("updated_paths"))
+        return bool(
+            item.added_files
+            or item.created_dirs
+            or item.updated_files
+            or remat.get("updated_paths")
+            or remat.get("scaffold_paths")
+        )
 
     if skipped_orphans:
         print(
@@ -1076,6 +1082,7 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
         "created_dirs": sum(len(item.created_dirs) for item in results),
         "updated_files": sum(len(item.updated_files) for item in results),
         "rematerialized_files": sum(len((item.rematerialize or {}).get("updated_paths") or []) for item in results),
+        "scaffold_files": sum(len((item.rematerialize or {}).get("scaffold_paths") or []) for item in results),
         "agents": [asdict(item) for item in results],
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -1207,6 +1214,11 @@ def build_backup_entries(
         rematerialize_payload = agent_payload.get("rematerialize") or {}
         if isinstance(rematerialize_payload, dict):
             for relpath in rematerialize_payload.get("updated_paths") or []:
+                remember(str(relpath), "file")
+            # Issue #1636: scaffolding files newly materialized in the workdir
+            # are add-missing-only (absent in live pre-apply); record them so a
+            # rollback removes them, mirroring the rematerialize updated_paths.
+            for relpath in rematerialize_payload.get("scaffold_paths") or []:
                 remember(str(relpath), "file")
 
     remember("state/upgrade/last-upgrade.json", "file")

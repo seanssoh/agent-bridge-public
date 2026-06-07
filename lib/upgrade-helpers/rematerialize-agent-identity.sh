@@ -17,6 +17,7 @@ dry_run="${5:-0}"
 shift 5 || true
 
 declare -a REMAT_UPDATED_PATHS=()
+declare -a REMAT_SCAFFOLD_PATHS=()
 declare -a REMAT_ERRORS=()
 declare -a REMAT_CHANGED_FILES=()
 
@@ -26,10 +27,12 @@ source_dir=""
 target_dir=""
 
 _remat_tmp_paths=""
+_remat_tmp_scaffold=""
 _remat_tmp_errors=""
 _remat_tmp_user_files=""
 cleanup() {
   [[ -n "$_remat_tmp_paths" ]] && rm -f -- "$_remat_tmp_paths"
+  [[ -n "$_remat_tmp_scaffold" ]] && rm -f -- "$_remat_tmp_scaffold"
   [[ -n "$_remat_tmp_errors" ]] && rm -f -- "$_remat_tmp_errors"
   [[ -n "$_remat_tmp_user_files" ]] && rm -f -- "$_remat_tmp_user_files"
   return 0
@@ -45,15 +48,23 @@ _remat_emit_json() {
     printf '{"agent":"%s","status":"error","source_dir":"","target_dir":"","updated_paths":[],"errors":["mktemp failed"]}\n' "$agent"
     return 0
   }
+  _remat_tmp_scaffold="$(mktemp "${TMPDIR:-/tmp}/agb-remat-scaffold.XXXXXX")" || {
+    printf '{"agent":"%s","status":"error","source_dir":"","target_dir":"","updated_paths":[],"errors":["mktemp failed"]}\n' "$agent"
+    return 0
+  }
   _remat_tmp_errors="$(mktemp "${TMPDIR:-/tmp}/agb-remat-errors.XXXXXX")" || {
     printf '{"agent":"%s","status":"error","source_dir":"","target_dir":"","updated_paths":[],"errors":["mktemp failed"]}\n' "$agent"
     return 0
   }
   : >"$_remat_tmp_paths"
+  : >"$_remat_tmp_scaffold"
   : >"$_remat_tmp_errors"
   local item=""
   for item in "${REMAT_UPDATED_PATHS[@]}"; do
     printf '%s\n' "$item" >>"$_remat_tmp_paths"
+  done
+  for item in "${REMAT_SCAFFOLD_PATHS[@]}"; do
+    printf '%s\n' "$item" >>"$_remat_tmp_scaffold"
   done
   for item in "${REMAT_ERRORS[@]}"; do
     printf '%s\n' "$item" >>"$_remat_tmp_errors"
@@ -63,7 +74,7 @@ import json
 import sys
 from pathlib import Path
 
-agent, status, source_dir, target_dir, skipped_reason, dry_run, paths_file, errors_file = sys.argv[1:]
+agent, status, source_dir, target_dir, skipped_reason, dry_run, paths_file, scaffold_file, errors_file = sys.argv[1:]
 
 def read_lines(path):
     try:
@@ -71,6 +82,7 @@ def read_lines(path):
     except OSError:
         return []
 
+scaffold_paths = read_lines(scaffold_file)
 payload = {
     "agent": agent,
     "status": status,
@@ -78,6 +90,8 @@ payload = {
     "target_dir": target_dir,
     "dry_run": dry_run == "1",
     "updated_paths": read_lines(paths_file),
+    "scaffold_paths": scaffold_paths,
+    "scaffold_added": len(scaffold_paths),
 }
 errors = read_lines(errors_file)
 if skipped_reason:
@@ -85,7 +99,7 @@ if skipped_reason:
 if errors:
     payload["errors"] = errors
 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-' "$agent" "$status" "$source_dir" "$target_dir" "$skipped_reason" "$dry_run" "$_remat_tmp_paths" "$_remat_tmp_errors"
+' "$agent" "$status" "$source_dir" "$target_dir" "$skipped_reason" "$dry_run" "$_remat_tmp_paths" "$_remat_tmp_scaffold" "$_remat_tmp_errors"
 }
 
 _remat_finish() {
@@ -207,6 +221,17 @@ if [[ "${BRIDGE_REMATERIALIZE_TEST_STUB_ISO:-0}" == "1" ]]; then
     local _agent="$1"
     local dest_path="$2"
     local mode="${3:-0600}"
+    # Test-only iso-boundary fault injection: simulate a PermissionError on the
+    # iso-UID write for any dest matching this substring, so the smoke can prove
+    # the helper graceful-skips (records an error, never aborts) instead of
+    # exiting non-zero. Mirrors the real-world iso EACCES the controller hits.
+    if [[ -n "${BRIDGE_REMATERIALIZE_TEST_STUB_WRITE_FAIL_GLOB:-}" \
+          && "$dest_path" == *"$BRIDGE_REMATERIALIZE_TEST_STUB_WRITE_FAIL_GLOB"* ]]; then
+      if [[ -n "${BRIDGE_REMATERIALIZE_TEST_STUB_LOG:-}" ]]; then
+        printf 'write-fail:%s\n' "$dest_path" >>"$BRIDGE_REMATERIALIZE_TEST_STUB_LOG"
+      fi
+      return 13
+    fi
     mkdir -p -- "$(dirname -- "$dest_path")" || return 5
     cat - >"$dest_path" || return 7
     chmod "$mode" "$dest_path" || return 8
@@ -262,6 +287,19 @@ if [[ "$source_dir" == "$target_dir" ]]; then
   _remat_finish
   exit 0
 fi
+
+# Issue #1636: the non-identity _template scaffolding is materialized by
+# migrate_agent_home into the controller-owned PROFILE SOURCE
+# ($BRIDGE_HOME/agents/<agent>), NOT the identity home that source_dir points at
+# (on a v2 install that is $BRIDGE_AGENT_ROOT_V2/<agent>/home). Read scaffolding
+# from the profile source so the freshly-migrated commands/captures/codex tree is
+# actually visible; fall back to source_dir only when the profile source is
+# absent on disk (legacy single-tree layouts where they coincide).
+scaffold_source_dir="$source_dir"
+if [[ -n "$profile_source_dir" && -d "$profile_source_dir" ]]; then
+  scaffold_source_dir="$profile_source_dir"
+fi
+
 _remat_realpath() {
   python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
 }
@@ -270,7 +308,12 @@ _remat_rel_to_target_root() {
   python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]).replace(os.sep, "/"))' "$1" "$target_root"
 }
 
-_remat_path_under_target_root() {
+# _remat_path_under <root> <path>
+# True iff the realpath of <path> is <root> itself or a descendant of it.
+# Resolves symlinks in both arguments (realpath of a not-yet-existing leaf
+# resolves through its existing prefix), so an ancestor symlink that escapes
+# <root> fails the check.
+_remat_path_under() {
   python3 -c '
 import os
 import sys
@@ -282,7 +325,21 @@ try:
 except ValueError:
     ok = False
 sys.exit(0 if ok else 1)
-' "$target_root" "$1"
+' "$1" "$2"
+}
+
+_remat_path_under_target_root() {
+  _remat_path_under "$target_root" "$1"
+}
+
+# Issue #1636 (codex pair-review r1 follow-up): per-agent containment. The
+# scaffold + identity writes must land inside THIS agent's own workdir
+# ($target_dir), not merely somewhere under the global BRIDGE_HOME. A symlink
+# from one agent's workdir into ANOTHER agent's workdir stays under target_root
+# yet escapes target_dir — that is a cross-agent write escape. Gate writes on
+# the tighter per-agent boundary.
+_remat_path_under_target_dir() {
+  _remat_path_under "$target_dir" "$1"
 }
 
 if ! _remat_path_under_target_root "$target_dir"; then
@@ -406,6 +463,14 @@ _remat_copy_one_file() {
     _remat_add_error "refusing to overwrite symlink: $target_rel"
     return 1
   fi
+  # Per-agent containment (Issue #1636 codex r1 follow-up): refuse a write whose
+  # parent realpath escapes THIS agent's own workdir via an ancestor symlink —
+  # an in-root symlink into another agent's workdir would otherwise let the
+  # identity write cross into a sibling's tree. Shares the scaffold-write guard.
+  if ! _remat_path_under_target_dir "$(dirname -- "$dst")"; then
+    _remat_add_error "refusing identity write outside agent workdir: $target_rel"
+    return 1
+  fi
   if ! _remat_ensure_parent "$dst"; then
     _remat_add_error "failed to create parent for $target_rel"
     return 1
@@ -426,6 +491,113 @@ _remat_copy_one_file() {
   }
   return 0
 }
+
+# Issue #1636: add-missing-only propagation of the non-identity _template
+# scaffolding (slash commands, capture/session scaffolds, codex extras) from
+# the controller-owned profile source to the agent workdir. Unlike the identity
+# files above, scaffolding is SKIP-EXISTING: a user may have customized a slash
+# command, so an existing workdir file is never overwritten (a changed-upstream
+# command will not refresh — the safe trade-off for user-editable scaffolding).
+# Reuses the SAME iso-UID write path as the identity files; an iso PermissionError
+# graceful-skips per file (records an error, never aborts the upgrade).
+_remat_copy_scaffold_file() {
+  local rel="$1"
+  local src="$scaffold_source_dir/$rel"
+  local dst="$target_dir/$rel"
+  local target_rel=""
+  target_rel="$(_remat_rel_to_target_root "$dst")"
+
+  [[ -f "$src" ]] || return 0
+  # Skip-existing: never clobber a (possibly user-customized) workdir file.
+  if [[ -e "$dst" || -L "$dst" ]]; then
+    return 0
+  fi
+  # Containment (checked BEFORE recording the path, so a refused write is never
+  # reported as applied/planned): scaffolding creates NEW deep directory trees
+  # (.claude/commands, raw/captures/..., codex/) under the workdir. If any
+  # EXISTING ancestor of the destination is (or resolves through) a symlink that
+  # escapes THIS agent's own workdir, creating dirs / writing the file would land
+  # in another agent's tree (a cross-agent write escape — the symlink target can
+  # still be under the global BRIDGE_HOME). Verify the realpath of the
+  # destination's parent stays under target_dir BEFORE creating any parent dir or
+  # recording the path; skip + record a structured error otherwise rather than
+  # follow the symlink out of the agent's workdir. realpath of a not-yet-existing
+  # path resolves through its existing prefix, so this catches an escaping
+  # ancestor even when the leaf dirs are still absent (apply AND dry-run).
+  if ! _remat_path_under_target_dir "$(dirname -- "$dst")"; then
+    _remat_add_error "refusing scaffold write outside agent workdir: $target_rel"
+    return 1
+  fi
+  REMAT_SCAFFOLD_PATHS+=("$target_rel")
+  if [[ "$dry_run" == "1" ]]; then
+    return 0
+  fi
+  if ! _remat_ensure_parent "$dst"; then
+    _remat_add_error "failed to create parent for $target_rel"
+    return 1
+  fi
+  if (( iso_effective == 1 )); then
+    local write_rc=0
+    bridge_isolation_write_file_as_agent_user_via_bash "$agent" "$dst" "0660" <"$src" >/dev/null 2>&1 || write_rc=$?
+    if (( write_rc != 0 )); then
+      _remat_add_error "iso scaffold write failed for $target_rel (rc=$write_rc)"
+      return 1
+    fi
+    bridge_isolation_v2_chgrp_file_iso_group "$agent" "$dst" 0660 "$target_dir" >/dev/null 2>&1 || true
+    return 0
+  fi
+  cp -f -- "$src" "$dst" 2>/dev/null || {
+    _remat_add_error "scaffold copy failed for $target_rel"
+    return 1
+  }
+  return 0
+}
+
+# Walk a scaffolding subtree under the profile source and add-missing-only copy
+# every regular file to the workdir, mirroring the tree structure. Files matching
+# any path in REMAT_SCAFFOLD_EXCLUDE (relative to scaffold_source_dir) are never
+# handled here (e.g. codex/AGENTS.md, already materialized as the engine entry).
+_remat_propagate_scaffold_tree() {
+  local root="$1"
+  local src_root="$scaffold_source_dir/$root"
+  [[ -d "$src_root" ]] || return 0
+  local files_tmp=""
+  files_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-remat-scaffold-walk.XXXXXX")" || {
+    _remat_add_error "mktemp failed for scaffold inventory ($root)"
+    return 0
+  }
+  find "$src_root" -type f -print >"$files_tmp" 2>/dev/null || true
+  local scaffold_file="" rel="" excluded="" excl=""
+  while IFS= read -r scaffold_file; do
+    [[ -n "$scaffold_file" ]] || continue
+    rel="${scaffold_file#"$scaffold_source_dir/"}"
+    excluded=0
+    for excl in "${REMAT_SCAFFOLD_EXCLUDE[@]}"; do
+      [[ "$rel" == "$excl" ]] || continue
+      excluded=1
+      break
+    done
+    (( excluded == 0 )) || continue
+    _remat_copy_scaffold_file "$rel" || true
+  done <"$files_tmp"
+  rm -f -- "$files_tmp"
+}
+
+# Scaffolding roots under the profile source to propagate (Issue #1636). These
+# mirror the non-identity _template tree; the identity files + engine entry +
+# CLAUDE.md + users/ are handled separately above and intentionally excluded.
+declare -a REMAT_SCAFFOLD_ROOTS=(
+  ".claude/commands"
+  "raw/captures/inbox"
+  "raw/captures/ingested"
+  "session-type-files"
+  "codex"
+)
+# codex/AGENTS.md is already materialized as the codex engine entry — never
+# double-handle it here.
+declare -a REMAT_SCAFFOLD_EXCLUDE=(
+  "codex/AGENTS.md"
+)
 
 declare -a remat_names=(
   "SOUL.md"
@@ -466,5 +638,10 @@ if [[ -d "$source_dir/users" ]]; then
     _remat_copy_one_file "$rel" || true
   done <"$_remat_tmp_user_files"
 fi
+
+# Issue #1636: propagate the non-identity _template scaffolding (add-missing-only).
+for scaffold_root in "${REMAT_SCAFFOLD_ROOTS[@]}"; do
+  _remat_propagate_scaffold_tree "$scaffold_root"
+done
 
 _remat_finish
