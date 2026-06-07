@@ -869,6 +869,40 @@ const tools: ToolDef[] = [
     },
   },
   {
+    name: 'get_valid_token',
+    description:
+      'Return a currently-valid Microsoft Graph access_token for the UPN, transparently refreshing via the stored refresh_token if it is expired or within the 5-minute near-expiry margin. For trusted in-fleet callers (e.g. the CRM proxy, issue #1650) that must hold a guaranteed-valid token without reading the token file directly. NEVER returns the refresh_token.',
+    schema: {
+      type: 'object',
+      properties: {
+        upn: { type: 'string', description: 'User principal name. Defaults to MS365_DEFAULT_UPN.' },
+      },
+    },
+    handler: async args => {
+      const upn = resolveUpn(args.upn)
+      // #1650: reuse getAccessToken — pre-call expiry check + refresh_token
+      // grant + SingleFlight coordination (no duplicate concurrent refresh) +
+      // the transient/permanent classification and actionable re-auth error.
+      // This is the safety net for callers (the CRM proxy) that previously read
+      // the token file directly and so used a stale access_token: they now get a
+      // guaranteed-valid token and the refresh happens here, in the ms365 plugin
+      // that owns the refresh_token.
+      const access_token = await getAccessToken(upn)
+      // getAccessToken returns only the token string; the file carries the
+      // authoritative post-refresh expiry.
+      const cur = loadJson<TokenFile>(tokenPath(upn))
+      const now = Math.floor(Date.now() / 1000)
+      const expires_at = cur?.expires_at ?? null
+      const expires_in_seconds = expires_at != null ? expires_at - now : null
+      // Redacted audit: record that a valid token was issued to a caller, with
+      // upn + expiry only — never the token body, never the refresh_token.
+      process.stderr.write(
+        `ms365 channel: ms365_token_issued upn=${upn} expires_in_seconds=${expires_in_seconds ?? 'unknown'}\n`,
+      )
+      return textResult({ upn, access_token, expires_at, expires_in_seconds })
+    },
+  },
+  {
     name: 'pair_status',
     description: 'Report whether a UPN currently has a stored token and when it expires.',
     schema: { type: 'object', properties: { upn: { type: 'string' } } },
