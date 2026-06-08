@@ -92,7 +92,7 @@ def _net_status_held(config: str, bind: str, port: int, timeout: str) -> int:
     srv = _hold_and_drop_server(bind, port, stop)
     time.sleep(0.1)  # let the accept thread be ready before the probe
     try:
-        env = dict(os.environ)
+        env = dict(os.environ)  # noqa: iso-helper-boundary  # smoke fixture: copies the test process env to pass BRIDGE_A2A_* to the subprocess; not a controller->iso boundary write
         env["BRIDGE_A2A_ALLOW_TEST_BIND"] = "1"
         env["BRIDGE_A2A_CONFIG"] = config
         proc = subprocess.run(
