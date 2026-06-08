@@ -2978,6 +2978,11 @@ class HandoffHandler(BaseHTTPRequestHandler):
         body_hash_hdr = self.headers.get("X-AGB-Body-SHA256", "")
         signature = self.headers.get("X-AGB-Signature", "")
         protocol = self.headers.get("X-AGB-Protocol", "")
+        # Token-bootstrap (Lane 4): set by _room_join_bootstrap_unknown_peer when
+        # an unknown peer is admitted to the candidate in-mem cfg; the durable
+        # 0600 disk write is DEFERRED to the fresh-accept path (post-HMAC) so a
+        # bad-signature request never persists a peer (codex P1).
+        self._pending_peer_register: Optional[dict[str, Any]] = None
 
         # --- b. protocol tag ---
         if protocol != a2a.ROOM_JOIN_PROTOCOL_VERSION:
@@ -2993,35 +2998,12 @@ class HandoffHandler(BaseHTTPRequestHandler):
             self._reply(400, {"ok": False, "error": "message id required"})
             return
 
-        # --- d. peer must be ALREADY PAIRED (not a discovery channel) ---
-        try:
-            peer = a2a.find_peer(cfg, peer_id)
-        except a2a.A2AError:
-            audit("room_join_reject", reason="unknown_peer",
-                  peer=peer_id, client=client_ip, security=True)
-            self._reply(403, {"ok": False, "error": "unknown peer"})
-            return
-
-        # --- e. remote_addr == authenticated peer's CURRENT address (before body) ---
-        # Transport-aware resolution (#1595): Tailscale identity live-resolve
-        # or WARP-Mesh raw device IP; fail closed on any resolver error.
-        try:
-            peer_addr = a2a.resolve_peer_address_for_transport(
-                a2a.transport_kind(cfg), peer)
-        except a2a.A2AError as exc:
-            audit("room_join_reject", reason=getattr(exc, "code",
-                  "resolve_error"), peer=peer_id, client=client_ip,
-                  security=True)
-            self._reply(403, {"ok": False, "error": "source address mismatch"})
-            return
-        if not peer_addr or client_ip != peer_addr:
-            audit("room_join_reject", reason="addr_mismatch",
-                  peer=peer_id, client=client_ip, expected=peer_addr,
-                  security=True)
-            self._reply(403, {"ok": False, "error": "source address mismatch"})
-            return
-
-        # --- size guard before reading the body (tiny control body) ---
+        # --- size guard + body read (tiny control body). Hoisted ABOVE the peer
+        # lookup so the token-bootstrap path (below) can inspect the room_id +
+        # token hash it needs to derive a candidate peer key BEFORE the HMAC
+        # check, WITHOUT a second read off the socket. The addr check does not
+        # depend on the body, so moving the read earlier changes nothing for the
+        # established-peer path. ---
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -3042,6 +3024,49 @@ class HandoffHandler(BaseHTTPRequestHandler):
                           "client": client_ip, "message_id": message_id},
         )
         if raw is None:
+            return
+
+        # --- d. peer must be ALREADY PAIRED — UNLESS a valid invite token
+        # bootstraps the reverse node-link (Lane 4, #1695). The token-bootstrap
+        # path is the NARROWEST relaxation: it does NOT admit on token alone — it
+        # only synthesizes a candidate per-pair peer key (token validity standing
+        # in for pre-established trust) so the UNCHANGED preamble below (addr ==
+        # socket-ip, HMAC, skew, durable dedupe, leader-node, token re-verify,
+        # rate-limit, leader-approval gate) still runs in full. ---
+        bootstrapped = False
+        try:
+            peer = a2a.find_peer(cfg, peer_id)
+        except a2a.A2AError:
+            peer = self._room_join_bootstrap_unknown_peer(
+                cfg, peer_id=peer_id, client_ip=client_ip, raw=raw,
+                message_id=message_id)
+            if peer is None:
+                # Either auto-join is disabled (default-unchanged hard 403) or
+                # the token did not validate / could not derive a key — the
+                # reject was already audited + replied by the helper.
+                return
+            bootstrapped = True
+
+        # --- e. remote_addr == authenticated peer's CURRENT address (before body) ---
+        # Transport-aware resolution (#1595): Tailscale identity live-resolve
+        # or WARP-Mesh raw device IP; fail closed on any resolver error. For a
+        # token-bootstrapped peer the registered `address` IS the socket
+        # client_ip (never a body-asserted address), so this check still
+        # enforces socket==registered-addr — it is the SAME gate, not a bypass.
+        try:
+            peer_addr = a2a.resolve_peer_address_for_transport(
+                a2a.transport_kind(cfg), peer)
+        except a2a.A2AError as exc:
+            audit("room_join_reject", reason=getattr(exc, "code",
+                  "resolve_error"), peer=peer_id, client=client_ip,
+                  security=True, bootstrapped=bootstrapped)
+            self._reply(403, {"ok": False, "error": "source address mismatch"})
+            return
+        if not peer_addr or client_ip != peer_addr:
+            audit("room_join_reject", reason="addr_mismatch",
+                  peer=peer_id, client=client_ip, expected=peer_addr,
+                  security=True, bootstrapped=bootstrapped)
+            self._reply(403, {"ok": False, "error": "source address mismatch"})
             return
 
         # --- f. HMAC: secret present, body hash, signature (auth boundary) ---
@@ -3277,6 +3302,50 @@ class HandoffHandler(BaseHTTPRequestHandler):
                               "error": "message id reused with different body"})
             return
 
+        # The only remaining outcome for a fresh accept is RESERVED (the atomic
+        # helper committed the dedupe + pending rows together). Guard it on the
+        # typed enum with an EXPLICIT check (NOT an `assert`, which `python -O`
+        # strips) so a future rename of JOIN_DEDUPE_RESERVED can NOT silently
+        # fall through to the pending-accept reply with a non-reserved outcome
+        # (Lane 4 / SSOT "JOIN_DEDUPE_RESERVED typed enum / assert"; codex P2).
+        if outcome != rooms.JOIN_DEDUPE_RESERVED:
+            audit("room_join_error", reason="unexpected_dedupe_outcome",
+                  peer=peer_id, client=client_ip, message_id=message_id,
+                  outcome=str(outcome), security=True)
+            self._reply(500, {"ok": False, "error": "internal error"})
+            return
+
+        # DEFERRED durable peer write (codex P1): for a token-bootstrapped join,
+        # persist the reverse peer to handoff.local.json ONLY NOW — after HMAC
+        # proved possession of the raw-token-derived key AND the dedupe reserved a
+        # fresh row. A bad-signature attacker who knows only the wire token hash
+        # was rejected at the HMAC gate and never reaches here, so it cannot
+        # poison the on-disk peer config. TOCTOU-locked atomic 0600 write; a
+        # write failure does NOT unwind the committed pending row (the in-mem peer
+        # already authenticated this request; reconcile/retry converges the disk).
+        if self._pending_peer_register is not None:
+            reg = self._pending_peer_register
+            config_path = getattr(self.server, "config_path", None)  # type: ignore[attr-defined]
+            transport = ""
+            try:
+                transport = a2a.transport_kind(cfg)
+            except a2a.A2AError:
+                transport = ""
+            changed, code = a2a.auto_register_room_peer_locked(
+                config_path, peer_id=reg["peer_id"], address=reg["address"],
+                port=reg["port"], secret=reg["secret"],
+                inbound_allowlist=reg["inbound_allowlist"], transport=transport)
+            if changed:
+                audit("room_join_bootstrap", reason="token_autoregister",
+                      peer=peer_id, client=client_ip, room_id=room_id)
+            elif code not in ("noop",):
+                # The pending row is already committed + the in-mem peer
+                # authenticated this request; a disk-write hiccup is logged but
+                # not fatal (reconcile re-derives / the joiner can retry).
+                audit("room_join_bootstrap_warn", reason=f"register_{code}",
+                      peer=peer_id, client=client_ip, room_id=room_id,
+                      security=True)
+
         # Audit carries ONLY verified metadata — room id, joiner agent@node,
         # message id — NEVER the token or its hash (contract 5).
         audit("room_join_accept", reason="pending",
@@ -3285,6 +3354,194 @@ class HandoffHandler(BaseHTTPRequestHandler):
         self._reply(200, {"ok": True, "status": rooms.JOIN_PENDING,
                           "room_id": room_id,
                           "joiner": f"{joiner_agent}@{joiner_node}"})
+
+    def _room_join_bootstrap_unknown_peer(
+        self, cfg: dict[str, Any], *, peer_id: str, client_ip: str,
+        raw: bytes, message_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """Token-gated auto-bootstrap of a reverse node-link for an UNKNOWN peer
+        presenting a valid room invite token (A2A Rooms Lane 4, #1695).
+
+        Returns a candidate IN-MEMORY peer dict on success (so the caller falls
+        through to the UNCHANGED preamble: addr == socket-ip, HMAC with the
+        derived per-pair key, skew, durable dedupe, leader-node, token re-verify,
+        rate-limit, leader-approval gate). Returns None — having already audited +
+        replied — when:
+          - auto-join is disabled (env gate unset → DEFAULT-UNCHANGED hard 403);
+          - the body / room / token does not validate;
+          - no key seed is available to derive a per-pair key.
+
+        CRITICAL (codex P1 + r2 fix): this helper mutates NOTHING that outlives
+        the request before the HMAC runs — it does NOT write to disk AND does NOT
+        mutate the long-lived shared `cfg` peers list. It derives the candidate
+        per-pair key, RETURNS a candidate peer dict (used ONLY as this request's
+        local `peer` var for the addr + HMAC checks), and stashes the register
+        params on `self._pending_peer_register`. The TOCTOU-locked 0600 disk write
+        happens ONLY after the FULL preamble passes (HMAC + skew + durable dedupe
+        → fresh-accept RESERVED). So a bad-signature attacker who knows only the
+        wire-visible token hash CANNOT poison the on-disk peer config NOR the
+        in-memory shared cfg (nothing mutable persists unless possession of the
+        raw-token-derived key is proven by the HMAC). reconcile hot-reloads the
+        persisted peer into `cfg` after a genuine accept.
+
+        The ONLY relaxation vs. the established-peer path is that token validity
+        stands in for a pre-existing node-link. EVERY other gate still runs:
+          * the derived peer `address` is the SOCKET client_ip — NEVER a
+            body-asserted address — so the addr check is a real socket==addr gate;
+          * the peer `secret` is a UNIQUE per-(room, leader, joiner) HKDF key, so
+            the HMAC check resolves a real per-peer key (token-hash-as-key is
+            rejected by domain separation);
+          * `inbound_allowlist` is the room's `leader_agent` (room-derived, NOT
+            bridge_id).
+        """
+        # --- env gate: feature-enable, DEFAULT-UNCHANGED. Unset/!=1 → the prior
+        # unknown-peer 403 (reply + audit preserved). NB (SK-2): the body is now
+        # read BEFORE this reject (hoisted above find_peer so the bootstrap path
+        # can inspect room_id/token), so it is not literally byte-for-byte at the
+        # I/O level — but the read is bounded by the 8KB Content-Length guard +
+        # the socket request timeout, so it adds no unbounded work, and the
+        # peer-facing reply + the audit row are identical to before. This is the
+        # feature flag, NOT a POC `=1` test toggle: when ON the production path is
+        # always-on, gated by TOKEN VALIDITY (never on the env alone). ---
+        if os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN") != "1":  # noqa: iso-helper-boundary - feature env gate, not a .env file
+            audit("room_join_reject", reason="unknown_peer",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(403, {"ok": False, "error": "unknown peer"})
+            return None
+
+        if rooms is None:
+            audit("room_join_reject", reason="unknown_peer_rooms_unavailable",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(403, {"ok": False, "error": "unknown peer"})
+            return None
+
+        # --- parse the control body (shape only) — same parser the established
+        # path uses; an unknown peer's malformed body is a 403 (we never half-
+        # trust it, and we do not leak a 422 that would confirm token shape). ---
+        try:
+            claim = a2a.parse_room_join_request(raw)
+        except a2a.A2AError:
+            audit("room_join_reject", reason="unknown_peer_bad_body",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(403, {"ok": False, "error": "unknown peer"})
+            return None
+
+        room_id = str(claim["room_id"])
+        token_hash = str(claim["join_token_sha256"])
+        this_node = str(cfg.get("bridge_id") or "")
+        # The joiner's NODE is the HMAC-authenticated sender bridge — bound here
+        # to the signed X-AGB-Peer (peer_id), NEVER a wire-asserted field. The
+        # HMAC check (run AFTER this, against the derived key) is what proves the
+        # sender actually holds the per-pair key for this node id.
+        joiner_node = peer_id
+
+        # --- look up the room + verify it is LED BY THIS node (no authority
+        # otherwise) + verify the token hash (TTL + revocation). All read-only;
+        # NOTHING is persisted on a token-invalid reject. ---
+        try:
+            ro = rooms.open_rooms_readonly()
+        except Exception:  # noqa: BLE001 - last-resort guard
+            ro = None
+        if ro is None:
+            audit("room_join_reject", reason="unknown_peer_no_rooms_db",
+                  peer=peer_id, client=client_ip, security=True)
+            self._reply(403, {"ok": False, "error": "unknown peer"})
+            return None
+        try:
+            room = rooms.get_room(ro, room_id)
+            if room is None:
+                audit("room_join_reject", reason="unknown_peer_room_unknown",
+                      peer=peer_id, client=client_ip, room_id=room_id,
+                      security=True)
+                self._reply(403, {"ok": False, "error": "unknown peer"})
+                return None
+            leader_node = str(room["leader_node"] or "")
+            if leader_node != this_node:
+                audit("room_join_reject", reason="unknown_peer_not_leader_node",
+                      peer=peer_id, client=client_ip, room_id=room_id,
+                      security=True)
+                self._reply(403, {"ok": False, "error": "unknown peer"})
+                return None
+            leader_agent = str(room["leader_agent"] or "")
+            outcome = _room_join_verify_hash(room, token_hash)
+            if outcome != rooms.TOKEN_OK:
+                audit("room_join_reject", reason=f"unknown_peer_token_{outcome}",
+                      peer=peer_id, client=client_ip, room_id=room_id,
+                      security=True)
+                self._reply(403, {"ok": False,
+                                  "error": f"invite token {outcome}"})
+                return None
+            try:
+                key_seed = room["invite_key_seed"]
+            except (KeyError, IndexError):
+                key_seed = None
+        finally:
+            ro.close()
+
+        if not key_seed:
+            # A valid token but NO stored seed → a P1/P4.1 room that predates
+            # token-bootstrap (or a partially-migrated db). We cannot derive a
+            # per-pair key, so we fail closed (no admit-on-token-alone).
+            audit("room_join_reject", reason="unknown_peer_no_key_seed",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  security=True)
+            self._reply(403, {"ok": False, "error": "unknown peer"})
+            return None
+
+        if not leader_agent:
+            audit("room_join_reject", reason="unknown_peer_no_leader_agent",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  security=True)
+            self._reply(403, {"ok": False, "error": "unknown peer"})
+            return None
+
+        # --- derive the UNIQUE per-pair key from the STORED seed (domain-
+        # separated from the wire-visible token hash) keyed on the ordered
+        # (room, leader_node, joiner_node) triple. The joiner derives the same
+        # key from the raw token. ---
+        try:
+            pair_key = a2a.room_pair_key_from_seed(
+                str(key_seed), room_id=room_id, leader_node=leader_node,
+                joiner_node=joiner_node)
+        except Exception as exc:  # noqa: BLE001 - last-resort guard
+            audit("room_join_reject", reason="unknown_peer_key_derive_failed",
+                  peer=peer_id, client=client_ip, room_id=room_id,
+                  detail=str(exc)[:120], security=True)
+            self._reply(403, {"ok": False, "error": "unknown peer"})
+            return None
+
+        # --- build the candidate reverse peer: keyed on peer_id + the SOCKET
+        # client_ip (never a body-asserted address), secret = the derived per-pair
+        # key, inbound_allowlist = the room's leader_agent (room-derived, NOT
+        # bridge_id).
+        #
+        # CRITICAL (codex r2 P1): we do NOT mutate the long-lived SHARED `cfg`
+        # peers list, and we do NOT write to disk here. The candidate peer dict is
+        # RETURNED and used ONLY as this request's local `peer` var for the addr +
+        # HMAC checks. A bad-signature request therefore poisons NOTHING — neither
+        # the in-memory shared cfg nor the disk — because nothing mutable outlives
+        # this request until the HMAC has proven possession of the derived key.
+        # The durable 0600 disk write is stashed + executed only on the fresh-
+        # accept path (post-HMAC); reconcile then hot-reloads it into `cfg`. ---
+        port = int(cfg.get("listen", {}).get("port", 8787) or 8787)
+        peer_entry: dict[str, Any] = {
+            "id": peer_id,
+            "address": client_ip,
+            "secret": pair_key,
+            "inbound_allowlist": [leader_agent],
+            "port": port,
+        }
+        # Stash the params for the DEFERRED TOCTOU-locked disk write, executed
+        # ONLY on the fresh-accept path (after HMAC proves key possession).
+        self._pending_peer_register = {  # type: ignore[attr-defined]
+            "peer_id": peer_id, "address": client_ip, "port": port,
+            "secret": pair_key, "inbound_allowlist": [leader_agent],
+            "room_id": room_id,
+        }
+        audit("room_join_bootstrap", reason="token_candidate",
+              peer=peer_id, client=client_ip, room_id=room_id,
+              leader_agent=leader_agent)
+        return peer_entry
 
     def _handle_room_roster_broadcast(self, cfg: dict[str, Any]) -> None:
         """Receiver branch for the leader-signed cross-node roster broadcast
