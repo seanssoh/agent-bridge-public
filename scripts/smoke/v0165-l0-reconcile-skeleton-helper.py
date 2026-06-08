@@ -227,7 +227,7 @@ def cmd_snapshot(repo_root: str) -> int:
                     return 1
     finally:
         if _saved is not None:
-            os.environ["BRIDGE_A2A_RECONCILE_DB"] = _saved
+            os.environ["BRIDGE_A2A_RECONCILE_DB"] = _saved  # noqa: iso-helper-boundary
 
     # Seed one step so the snapshot has a real updated_ts to surface.
     conn = reconcile.open_reconcile_db()
