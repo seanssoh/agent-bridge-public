@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import os
 import random
+import socket
 import sqlite3
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -689,22 +690,534 @@ def tunnel_health(transport: str, cfg: dict[str, Any]) -> ReconcileStepResult:
         fields={"transport": transport, "transport_degraded": False})
 
 
+# --------------------------------------------------------------------------
+# peer-reachability (#1707) — per-peer UP→SUSPECT→DOWN state machine + IP-drift
+# --------------------------------------------------------------------------
+#
+# The daemon drives each configured peer through a hysteretic state machine so
+# the mesh self-heals from a peer drop WITHOUT flapping on a single missed
+# probe and WITHOUT a reconnect storm when the whole mesh loses a substrate at
+# once (control-loop reframe / 5 self-healing invariants):
+#
+#   UP ──(miss)──▶ SUSPECT ──(N consecutive misses)──▶ DOWN ──(success)──▶ UP
+#    ▲                │                                   │
+#    └──── success ───┴──────────── success ─────────────┘
+#
+# Hysteresis: a SINGLE failed probe demotes UP→SUSPECT (not straight to DOWN);
+# it takes `PEER_SUSPECT_THRESHOLD` consecutive misses to reach DOWN. A single
+# success promotes any state back to UP (recovery is immediate once the path is
+# proven live again). Bounded: the per-peer reconnect cadence rides the SAME
+# reconcile.db backoff gate as every other step — each peer is namespaced as a
+# step id `"peer-reachability:<peer_id>"`, so `step_is_eligible` /
+# `record_attempt` apply the cap + exponential backoff + jitter per peer (a
+# flapping peer cannot probe on every tick; a DOWN peer paces its reconnects).
+#
+# IP-drift (the live-discovered #1707 failure): when a peer is unreachable AND
+# this node's own `listen.address` is no longer present on any local interface
+# (the LAN IP vanished after a network move), we RECORD the desired rebind by
+# delegating to `stable_local_addr()` (which proposes the corrected
+# `listen.address` and persists it atomically). The ACTUAL rebind still routes
+# through `resolve_bind()` in `reconcile_once` on a subsequent tick — this step
+# NEVER binds. Fail-closed: `stable_local_addr` only ever proposes an address
+# proven present on a live local interface; an unprovable address is never
+# synthesized.
+
+# Per-peer FSM states (persisted in reconcile.db `peer_reachability.state`).
+PEER_STATE_UP = "up"
+PEER_STATE_SUSPECT = "suspect"
+PEER_STATE_DOWN = "down"
+
+# How many CONSECUTIVE failed probes demote a peer all the way to DOWN. The
+# first miss moves UP→SUSPECT; the `PEER_SUSPECT_THRESHOLD`-th consecutive miss
+# moves SUSPECT→DOWN. >=2 guarantees a single dropped probe never flaps a
+# healthy peer to DOWN (the hysteresis invariant). Env-overridable; a
+# non-numeric / <2 override falls back to the default (a threshold of 1 would
+# defeat hysteresis — fail-safe).
+DEFAULT_PEER_SUSPECT_THRESHOLD = 3
+
+# Short outbound-probe connect timeout (seconds). Mirrors the `peers test` /
+# net-status `_a2a_tcp_probe` mechanic — a TCP connect only, no enqueue/auth.
+# Kept small so a single unreachable peer cannot stall the reconcile tick.
+DEFAULT_PEER_PROBE_TIMEOUT_SECONDS = 3.0
+
+
+def peer_suspect_threshold() -> int:
+    """Resolve the consecutive-miss threshold that demotes a peer to DOWN.
+
+    `BRIDGE_A2A_PEER_SUSPECT_THRESHOLD` overrides the default. A non-numeric or
+    <2 override falls back to the default (a threshold of 1 would defeat the
+    hysteresis invariant by flapping a healthy peer to DOWN on one miss —
+    fail-safe).
+    """
+    raw = os.environ.get("BRIDGE_A2A_PEER_SUSPECT_THRESHOLD")  # noqa: iso-helper-boundary
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_PEER_SUSPECT_THRESHOLD
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_PEER_SUSPECT_THRESHOLD
+    return val if val >= 2 else DEFAULT_PEER_SUSPECT_THRESHOLD
+
+
+def peer_probe_timeout() -> float:
+    """Resolve the per-peer TCP-connect probe timeout in seconds.
+
+    `BRIDGE_A2A_PEER_PROBE_TIMEOUT_SECONDS` overrides the default. A
+    non-numeric / non-positive override falls back to the default (a timeout of
+    0 would make every probe fail instantly and storm-demote the mesh —
+    fail-safe).
+    """
+    raw = os.environ.get("BRIDGE_A2A_PEER_PROBE_TIMEOUT_SECONDS")  # noqa: iso-helper-boundary
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_PEER_PROBE_TIMEOUT_SECONDS
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_PEER_PROBE_TIMEOUT_SECONDS
+    return val if val > 0.0 else DEFAULT_PEER_PROBE_TIMEOUT_SECONDS
+
+
+_PEER_REACHABILITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS peer_reachability (
+    peer_id           TEXT PRIMARY KEY,
+    state             TEXT NOT NULL,
+    consecutive_fail  INTEGER NOT NULL DEFAULT 0,
+    last_state_ts     REAL,
+    updated_ts        REAL
+);
+"""
+
+
+def _ensure_peer_reachability_schema(conn: sqlite3.Connection) -> None:
+    """Create the per-peer FSM table if absent (idempotent).
+
+    Lives in the SAME reconcile.db `conn` the backoff store uses — peer FSM
+    state is generic transport-recovery state, exactly what reconcile.db is
+    for (design SSOT agenda 1: NOT rooms.db, which is room membership only).
+    """
+    conn.executescript(_PEER_REACHABILITY_SCHEMA)
+
+
+def _peer_step_id(peer_id: str) -> str:
+    """The reconcile-step id a peer's bounded backoff gate is namespaced under.
+
+    Each peer inherits the cap + exp-backoff + jitter pacing of the shared
+    `reconcile_step` store via this id (e.g. `peer-reachability:node-2`), so a
+    DOWN peer's reconnect cadence is bounded exactly like every other step.
+    """
+    return f"{STEP_PEER_REACHABILITY}:{peer_id}"
+
+
+def _peer_state_row(conn: sqlite3.Connection, peer_id: str) -> tuple[str, int]:
+    """Return `(state, consecutive_fail)` for a peer (UP/0 when unseen).
+
+    A never-probed peer starts optimistically UP with 0 consecutive failures —
+    the first probe result is what drives it off UP, and a healthy peer that
+    has never failed is correctly reported UP (idempotent no-op).
+    """
+    row = conn.execute(
+        "SELECT state, consecutive_fail FROM peer_reachability WHERE peer_id = ?",
+        (peer_id,),
+    ).fetchone()
+    if row is None:
+        return PEER_STATE_UP, 0
+    return str(row["state"]), int(row["consecutive_fail"])
+
+
+def _write_peer_state(conn: sqlite3.Connection, peer_id: str, state: str,
+                      consecutive_fail: int, now: float,
+                      *, state_changed: bool) -> None:
+    """Persist a peer's FSM state (no secrets — peer id + state + counters only).
+
+    `last_state_ts` only advances when the STATE label actually changed, so the
+    observable surface can report "how long in this state". `updated_ts` always
+    advances (every probe touches the row).
+    """
+    if state_changed:
+        conn.execute(
+            """
+            INSERT INTO peer_reachability
+                (peer_id, state, consecutive_fail, last_state_ts, updated_ts)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(peer_id) DO UPDATE SET
+                state            = excluded.state,
+                consecutive_fail = excluded.consecutive_fail,
+                last_state_ts    = excluded.last_state_ts,
+                updated_ts       = excluded.updated_ts
+            """,
+            (peer_id, state, consecutive_fail, now, now),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO peer_reachability
+                (peer_id, state, consecutive_fail, last_state_ts, updated_ts)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(peer_id) DO UPDATE SET
+                state            = excluded.state,
+                consecutive_fail = excluded.consecutive_fail,
+                updated_ts       = excluded.updated_ts
+            """,
+            (peer_id, state, consecutive_fail, now, now),
+        )
+    conn.commit()
+
+
+def _default_peer_probe(address: str, port: int, timeout: float) -> bool:
+    """Lightweight outbound reachability probe: a TCP connect to address:port.
+
+    The A2A reachability ORACLE, identical to the `peers test` / net-status
+    `_a2a_tcp_probe` mechanic — `socket.create_connection`, NO enqueue, NO
+    auth, NO `tailscale ping` (a disco-protocol echo is not a receiver-up
+    signal). Returns True iff the TCP handshake completed; False on ANY OSError
+    (connection refused / timeout / host unreachable). Never raises — an
+    unreachable peer is a normal state-machine input, not an exception.
+
+    INJECTABLE via `_PEER_REACHABILITY_PROBE` so the smoke can drive the FSM
+    deterministically without touching a real network.
+    """
+    if not address:
+        return False
+    try:
+        with socket.create_connection((address, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+# Injectable probe hook (module-level function reference). The daemon calls
+# `_PEER_REACHABILITY_PROBE(address, port, timeout)` per peer. The smoke
+# rebinds this to a spy/scripted function so it can drive UP/SUSPECT/DOWN/
+# recovery transitions WITHOUT a real socket; production keeps the real TCP
+# probe. Mirrors the L2 `_WARP_TUNNEL_BOUNCE` injection convention.
+_PEER_REACHABILITY_PROBE: Callable[[str, int, float], bool] = _default_peer_probe
+
+
+def _local_listen_address_drifted(transport: str,
+                                  cfg: dict[str, Any]) -> Optional[bool]:
+    """Is this node's OWN `listen.address` no longer on any local interface?
+
+    The IP-drift signal: a `listen.address` that was a LAN IP can vanish from
+    every interface after a network move, so the receiver can no longer bind it
+    (`bind_not_warp_local`). Returns:
+      - True  — a non-empty `listen.address` is configured but absent from the
+                live interface set (drift → a rebind should be RECORDED),
+      - False — the address is present (no drift), or none is configured yet,
+      - None  — the interface set is UNKNOWABLE (enumeration failed). Fail
+                closed: an unknowable interface set is NOT treated as drift
+                (we never propose a rebind we cannot prove is needed; the
+                stable-addr step itself fails closed on the same uncertainty).
+
+    Active-transport-only: only the WARP raw-IP path actually drifts this way;
+    a Tailscale node is identity-keyed and its bind address does not vanish on a
+    move, so we skip the check entirely for non-WARP transports (returning False
+    = no drift) rather than enumerate interfaces for a transport that cannot
+    exhibit the failure.
+    """
+    if transport != a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
+        return False
+    listen = cfg.get("listen")
+    if not isinstance(listen, dict):
+        return False
+    addr = listen.get("address")
+    addr = addr.strip() if isinstance(addr, str) else ""
+    if not addr:
+        # No configured listen address to drift away from yet.
+        return False
+    try:
+        local_addrs = a2a.local_interface_addresses()
+    except a2a.A2AError:
+        # Interface enumeration failed — UNKNOWABLE. Fail closed: do not claim
+        # drift we cannot prove (and do not propose a rebind on a guess).
+        return None
+    return not a2a.is_local_interface_address(addr, local_addrs)
+
+
 def peer_reachability_step(cfg: dict[str, Any],
                            conn: sqlite3.Connection) -> ReconcileStepResult:
-    """STUB (#1707 fills) — advance the per-peer UP/SUSPECT/DOWN state machine.
+    """Advance the per-peer UP→SUSPECT→DOWN→(recovery)→UP state machine (#1707).
 
-    For each configured peer, compute observed reachability and advance its
-    UP→SUSPECT→DOWN (and recovery) state machine, persisting per-peer backoff
-    in `conn` (the same reconcile.db connection — peer rows are namespaced by
-    the implementer, e.g. step ids like "peer-reachability:<peer_id>", so they
-    inherit the bounded gate). An IP-drift that needs a rebind RECORDS the
-    desired change; the rebind itself still routes through resolve_bind().
-    Returns step_converged() when all peers are UP, step_changed() when a peer
-    state advanced, or step_error() on a probe failure.
+    For each configured peer this step probes reachability via a lightweight
+    INJECTABLE outbound TCP connect (`_PEER_REACHABILITY_PROBE`, default a real
+    `socket.create_connection` to the peer's transport-resolved `address:port`)
+    and advances a HYSTERETIC state machine persisted per-peer in `conn` (the
+    reconcile.db connection):
 
-    Lane 0 ships a no-op stub.
+      - a probe SUCCESS promotes any state straight back to `up` (recovery is
+        immediate once the path is proven live, resets the failure counter);
+      - a probe MISS demotes `up` → `suspect` on the FIRST miss and only reaches
+        `down` after `peer_suspect_threshold()` CONSECUTIVE misses (hysteresis —
+        one dropped probe never flaps a healthy peer to DOWN).
+
+    Bounded: each peer's probe/reconnect cadence rides the SAME reconcile.db
+    backoff gate as every step — namespaced as the step id
+    `peer-reachability:<peer_id>` — so a non-UP peer is SKIPPED (paced) until
+    its per-peer cooldown elapses (cap + exponential backoff + jitter). A peer
+    that is UP/converged resets its backoff and is immediately re-eligible.
+
+    IP-drift LAN→WARP rebind: when at least one peer is unreachable AND this
+    node's own `listen.address` is no longer present on any local interface
+    (the LAN IP vanished after a network move), the desired rebind is RECORDED
+    by delegating to `stable_local_addr(transport, cfg)` — which PROPOSES the
+    corrected stable `listen.address` (persisted atomically). The ACTUAL rebind
+    still routes through `resolve_bind()` in `reconcile_once`; this step never
+    binds a socket.
+
+    Returns (probe outcomes classified into reachable / cleanly-unreachable /
+    infra-error; infra-error takes precedence):
+      - step_error() when ANY probe this tick was an INFRASTRUCTURE failure
+        (resolver raised / address unresolvable / the probe hook itself raised)
+        — the reachability is UNKNOWABLE, so the tick is fail-closed to error
+        REGARDLESS of any FSM advance, and the bounded backoff paces re-probes.
+        A clean ConnectionRefused/timeout is NOT an infra-error (that is a
+        determined down). Also returned when the mesh is simply not fully
+        reachable with no progress this tick.
+      - step_changed() when a peer's STATE cleanly advanced this tick OR a
+        desired rebind was recorded (and no infra-error occurred);
+      - step_converged() when every peer is UP and there is no recorded drift
+        (idempotent no-op — repeated ticks on an all-UP mesh do nothing).
+
+    Invariants (design SSOT §7 / 5 self-healing invariants):
+    - NEVER binds a socket and NEVER touches the receiver admission path
+      (HMAC / allowlist / dedupe / remote_addr); `resolve_bind()` stays the
+      only bind oracle and IP-drift only RECORDS desired config.
+    - ACTIVE-TRANSPORT-ONLY: peer addresses resolve through the configured
+      transport's resolver; no cross-shelling.
+    - NO SECRETS: persisted rows and result `fields` carry peer ids + states +
+      counts + timestamps only — never a peer key / HMAC secret / token.
+    - FAIL-SAFE: an operational failure returns step_error() (the run_step
+      backstop also catches a stray raise); it never crashes the tick.
     """
-    return step_noop("peer_reachability_step adapter not yet implemented (#1707)")
+    # Derive the active transport from cfg itself (fail-closed on a malformed
+    # transport block — same defense as stable_local_addr). A bad config is an
+    # operational error → step_error (bounded), never a guessed probe.
+    try:
+        transport = a2a.transport_kind(cfg)
+    except a2a.A2AError as exc:
+        return step_error(
+            f"peer-reachability: malformed/unknown transport "
+            f"({exc.code}): {exc}"[:200])
+
+    peers = cfg.get("peers")
+    if not isinstance(peers, list):
+        return step_error("peer-reachability: config 'peers' is not a list")
+
+    # No peers configured (early-install / probe state) → converged no-op.
+    peer_ids = [str(p.get("id")) for p in peers
+                if isinstance(p, dict) and p.get("id")]
+    if not peer_ids:
+        return step_converged("peer-reachability: no peers configured",
+                              fields={"peers_total": 0, "peers_up": 0})
+
+    _ensure_peer_reachability_schema(conn)
+
+    threshold = peer_suspect_threshold()
+    timeout = peer_probe_timeout()
+    now = a2a.now_ts()
+    listen = cfg.get("listen") if isinstance(cfg.get("listen"), dict) else {}
+    default_port = int(listen.get("port", 8787) or 8787)
+
+    any_state_changed = False
+    any_unreachable = False
+    any_infra_error = False
+    peers_up = 0
+    peer_summaries: list[dict[str, Any]] = []
+
+    for peer in peers:
+        if not isinstance(peer, dict) or not peer.get("id"):
+            continue
+        peer_id = str(peer["id"])
+        step_id = _peer_step_id(peer_id)
+        prev_state, prev_fail = _peer_state_row(conn, peer_id)
+
+        # Bounded gate: a non-eligible (backed-off) peer is SKIPPED this tick —
+        # we do NOT probe it (paces reconnects; a DOWN peer cannot probe every
+        # tick). Its persisted state stands; report it as-is.
+        if not step_is_eligible(conn, step_id, now):
+            if prev_state == PEER_STATE_UP:
+                peers_up += 1
+            else:
+                any_unreachable = True
+            peer_summaries.append(
+                {"peer": peer_id, "state": prev_state, "probed": False,
+                 "consecutive_fail": prev_fail})
+            continue
+
+        # Classify this peer's probe outcome into exactly one of three kinds —
+        # the fail-closed distinction the aggregate result depends on:
+        #   reachable           : the probe PROVED the peer up.
+        #   cleanly-unreachable : the probe cleanly DETERMINED the peer is down
+        #                         (ConnectionRefused / timeout / EHOSTUNREACH —
+        #                         a real down signal). This is legit
+        #                         down-detection: the FSM advances and the
+        #                         aggregate may report `changed`.
+        #   infra-error         : the probe could NOT complete its determination
+        #                         (resolver raised / address unresolvable / the
+        #                         probe HOOK itself raised). The reachability is
+        #                         UNKNOWABLE — fail-closed, NOT a clean "down".
+        #                         Any infra-error in the tick forces the
+        #                         aggregate to `step_error` (below) so the
+        #                         bounded backoff paces re-probes and we never
+        #                         treat unknown as a determined down.
+        #
+        # `probe_err_code` is a CLOSED-SET classification token only (an
+        # A2AError `.code`, or a fixed `probe_exception`/`unresolved_addr`) —
+        # NEVER the free-text exception message, so no resolver/probe string can
+        # leak into the result `fields` (no-secret contract: codes/states/
+        # counts/timestamps only).
+        probe_err_code = ""
+        infra_error = False
+        try:
+            address = a2a.resolve_peer_address_for_transport(transport, peer)
+        except a2a.A2AError as exc:
+            # Resolver raised → the target address is UNKNOWABLE (infra-error,
+            # not a clean down).
+            address = ""
+            probe_err_code = str(exc.code or "resolve_error")
+            infra_error = True
+
+        port = default_port
+        try:
+            if peer.get("port") is not None:
+                port = int(peer["port"])
+        except (TypeError, ValueError):
+            port = default_port
+
+        if infra_error:
+            # Address unknowable → do not probe; reachability unknown (fail-closed).
+            reachable = False
+        elif address:
+            try:
+                reachable = bool(_PEER_REACHABILITY_PROBE(address, port, timeout))
+            except Exception:  # noqa: BLE001 - a probe never raises into the tick
+                # The probe HOOK itself raised → its determination did NOT
+                # complete → UNKNOWABLE (infra-error), distinct from a clean
+                # `False` (ConnectionRefused/timeout, handled inside the probe).
+                reachable = False
+                infra_error = True
+                # Fixed token only — never the exception's str()/repr().
+                probe_err_code = "probe_exception"
+        else:
+            # Resolver returned an EMPTY address with no exception — the address
+            # could not be determined (operational, not a proven-down peer) →
+            # UNKNOWABLE (infra-error), fail-closed.
+            reachable = False
+            infra_error = True
+            probe_err_code = "unresolved_addr"
+
+        # Drive the hysteretic FSM.
+        if reachable:
+            new_state = PEER_STATE_UP
+            new_fail = 0
+        else:
+            new_fail = prev_fail + 1
+            if new_fail >= threshold:
+                new_state = PEER_STATE_DOWN
+            else:
+                # First miss (and any miss below threshold) → SUSPECT, never
+                # straight to DOWN (hysteresis).
+                new_state = PEER_STATE_SUSPECT
+
+        state_changed = new_state != prev_state
+        _write_peer_state(conn, peer_id, new_state, new_fail, now,
+                          state_changed=state_changed)
+
+        # Record this probe against the peer's bounded backoff gate: a reachable
+        # peer is "converged" (resets backoff, immediately re-eligible); an
+        # unreachable peer is "error" (engages cap + exp backoff + jitter so its
+        # next probe/reconnect is paced).
+        record_attempt(conn, step_id,
+                       RESULT_CONVERGED if reachable else RESULT_ERROR, now)
+
+        if reachable:
+            peers_up += 1
+        else:
+            any_unreachable = True
+        if infra_error:
+            # An UNKNOWABLE probe this tick forces the aggregate to step_error
+            # below (fail-closed: never let a state advance off an unknowable
+            # probe report as progress).
+            any_infra_error = True
+        if state_changed:
+            any_state_changed = True
+
+        summary: dict[str, Any] = {
+            "peer": peer_id, "state": new_state, "probed": True,
+            "consecutive_fail": new_fail}
+        if infra_error:
+            # Observable, non-secret bool: distinguishes a clean down from an
+            # unknowable probe for net-status.
+            summary["infra_error"] = True
+        if probe_err_code:
+            # A CLOSED-SET classification code ONLY (resolver A2AError code /
+            # probe_exception / unresolved_addr) — never a free-text message,
+            # so no resolver/probe string can ride into net-status fields.
+            summary["probe_err_code"] = probe_err_code
+        peer_summaries.append(summary)
+
+    # IP-drift LAN→WARP rebind: only when at least one peer is unreachable AND
+    # this node's own listen.address has vanished from every local interface.
+    # We RECORD the desired rebind via stable_local_addr (which proposes +
+    # persists the corrected address atomically); the actual bind still happens
+    # through resolve_bind() in reconcile_once. We NEVER bind here.
+    rebind_recorded = False
+    if any_unreachable:
+        drifted = _local_listen_address_drifted(transport, cfg)
+        if drifted is True:
+            drift_res = stable_local_addr(transport, cfg)
+            # stable_local_addr returns step_changed when it actually updated
+            # the desired listen.address (the rebind we want recorded). A
+            # converged/error result means there was nothing to (or it could
+            # not) record — we do not force a change in that case.
+            if drift_res.status == RESULT_CHANGED:
+                rebind_recorded = True
+                any_state_changed = True
+
+    fields: dict[str, Any] = {
+        "transport": transport,
+        "peers_total": len(peer_ids),
+        "peers_up": peers_up,
+        "peers": peer_summaries,
+        "ip_drift_rebind_recorded": rebind_recorded,
+        "infra_error": any_infra_error,
+    }
+
+    # FAIL-CLOSED (highest precedence): if ANY probe this tick could not
+    # complete its reachability determination (resolver raised / address
+    # unresolvable / the probe hook raised), the tick is UNKNOWABLE. Return
+    # step_error REGARDLESS of any FSM advance or recorded rebind — an
+    # unknowable probe must never be reported as progress (it would otherwise
+    # mask an infrastructure failure as a clean down-detection and skip the
+    # bounded backoff that paces re-probes). Any FSM/config writes already
+    # persisted stand; only the returned status is forced to error.
+    if any_infra_error:
+        return step_error(
+            f"peer-reachability: probe infrastructure error this tick "
+            f"({peers_up}/{len(peer_ids)} peer(s) up; reachability unknowable)"
+            + (" + IP-drift rebind recorded" if rebind_recorded else ""),
+            fields=fields)
+    # A state advance (a peer transition or a recorded rebind) is PROGRESS this
+    # tick → report step_changed even if the mesh is now fully up (a down→up
+    # recovery must not be reported as a converged no-op — it advanced state).
+    # Reached only when every probe CLEANLY determined reachability (no
+    # infra-error), so a `changed` here is legit clean down/up-detection.
+    if any_state_changed:
+        return step_changed(
+            f"{peers_up}/{len(peer_ids)} peer(s) up"
+            + (" + IP-drift rebind recorded" if rebind_recorded else ""),
+            fields=fields)
+    # All peers UP, nothing advanced, no recorded drift → converged
+    # (idempotent no-op — repeated ticks on a steady all-up mesh do nothing).
+    if peers_up == len(peer_ids) and not rebind_recorded:
+        return step_converged(
+            f"all {peers_up} peer(s) up", fields=fields)
+    # Some peers are non-UP but no state advanced this tick (e.g. a DOWN peer
+    # still down, or paced-out peers) — not converged, but no progress. Report
+    # as error so the step's OWN backoff paces the aggregate re-evaluation
+    # (fail-closed: a not-all-up mesh is not "converged").
+    return step_error(
+        f"{peers_up}/{len(peer_ids)} peer(s) up (mesh not fully reachable)",
+        fields=fields)
 
 
 def roster_epoch_reconcile(cfg: dict[str, Any],
