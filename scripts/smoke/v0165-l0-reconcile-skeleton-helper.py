@@ -76,6 +76,32 @@ def cmd_idempotent(repo_root: str) -> int:
     cfg = _fixture_cfg()
     server = _FakeServer(cfg)
 
+    # The Lane-0 contract this test pins is the FRAMEWORK idempotence (the loop
+    # skeleton + durable store), NOT any staged lane's adapter. Once a lane
+    # fills an adapter SEAM (e.g. Lane 2's tunnel_health, #1706) the adapter
+    # probes the HOST substrate (real `tailscale status` / `warp-cli`), whose
+    # liveness varies by CI host and would make this framework test flaky and
+    # host-coupled. Neutralize every adapter SEAM back to a deterministic noop
+    # for this test so the skeleton's idempotence is asserted in isolation; the
+    # lane's OWN smoke covers the real adapter behavior.
+    _orig_adapters = {
+        "stable_local_addr": reconcile.stable_local_addr,
+        "tunnel_health": reconcile.tunnel_health,
+        "peer_reachability_step": reconcile.peer_reachability_step,
+        "roster_epoch_reconcile": reconcile.roster_epoch_reconcile,
+    }
+    reconcile.stable_local_addr = lambda *a, **k: reconcile.step_noop("neutralized for L0 idempotence test")
+    reconcile.tunnel_health = lambda *a, **k: reconcile.step_noop("neutralized for L0 idempotence test")
+    reconcile.peer_reachability_step = lambda *a, **k: reconcile.step_noop("neutralized for L0 idempotence test")
+    reconcile.roster_epoch_reconcile = lambda *a, **k: reconcile.step_noop("neutralized for L0 idempotence test")
+    try:
+        return _cmd_idempotent_body(reconcile, handoffd, cfg, server)
+    finally:
+        for name, fn in _orig_adapters.items():
+            setattr(reconcile, name, fn)
+
+
+def _cmd_idempotent_body(reconcile, handoffd, cfg, server) -> int:
     # First run.
     res1 = handoffd.ReconcileResult()
     handoffd._run_reconcile_steps(server, res1, cfg)

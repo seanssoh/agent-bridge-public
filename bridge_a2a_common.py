@@ -1051,6 +1051,90 @@ def warp_connected_and_enrolled() -> None:
         )
 
 
+# The WARP CLI subcommand whose output carries the live MASQUE handshake age.
+# On a real client the `Time since last handshake: <N>s` line is printed by
+# `warp-cli tunnel stats` (NOT `warp-cli status`, which only shows a coarse
+# Connected/Network line and can falsely report `Connected` while the tunnel is
+# silently stale — the #1706 failure mode). We probe `tunnel stats` for the age
+# and scan its WHOLE output so a client that prints the line under `status`
+# instead is still handled.
+_WARP_HANDSHAKE_LABEL = "time since last handshake"
+
+
+def _parse_warp_handshake_age(text: str) -> Optional[int]:
+    """Parse `Time since last handshake: <N>s` -> N (seconds), or None.
+
+    Scans every line for the handshake-age label (case-insensitive) and reads
+    the leading integer-seconds value after the colon (tolerating a trailing
+    `s` / `sec` / `seconds` unit and surrounding whitespace). Returns None when
+    no parseable age line is present (an UNKNOWABLE age — the caller fails
+    closed without bouncing). Never raises.
+    """
+    for line in (text or "").splitlines():
+        low = line.strip().lower()
+        if not low.startswith(_WARP_HANDSHAKE_LABEL):
+            continue
+        if ":" not in low:
+            continue
+        raw = low.split(":", 1)[1].strip()
+        # Keep the leading run of digits ("3153s" -> "3153"); a non-digit (the
+        # unit, a space, punctuation) terminates the value. A line with no
+        # leading digit (e.g. "Time since last handshake: never") yields None.
+        digits = ""
+        for ch in raw:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits:
+            try:
+                return int(digits)
+            except ValueError:
+                return None
+    return None
+
+
+def warp_tunnel_handshake_age() -> Optional[int]:
+    """Return the WARP MASQUE tunnel handshake age in seconds, or None.
+
+    Runs `warp-cli tunnel stats` (read-only) and parses the
+    `Time since last handshake: <N>s` line. This is the freshness signal that
+    distinguishes a genuinely-live tunnel from the #1706 silent-stale failure
+    mode where `warp-cli status` keeps reporting `Connected` while established
+    sessions RST (handshake age e.g. 3153s) after a network change.
+
+    Returns:
+      - the integer handshake age in seconds when the line is present,
+      - None when the age could not be determined (CLI missing/errored, or the
+        output carried no parseable handshake line) — an UNKNOWABLE age. The
+        caller treats None as NOT-fresh (fail-closed) but MUST NOT auto-bounce
+        on a None (a probe-parse failure is not a proven stale handshake).
+
+    Read-only: never mutates WARP state. `BRIDGE_A2A_WARP_CLI` (set by the
+    smoke) points this at a mock CLI so a fresh/stale tunnel can be simulated
+    without a real WARP install.
+    """
+    cli = resolve_warp_cli()
+    if cli is None:
+        return None
+    try:
+        ran, raw, rc = _warp_cli_capture(cli, ["tunnel", "stats"])
+    except Exception:  # noqa: BLE001 - a freshness probe never raises into the reconcile tick
+        return None
+    if not ran:
+        return None
+    # Fail-closed rc gate (mirrors the #1595 enrollment rc gate): a PROVEN
+    # handshake age REQUIRES the probe to have EXITED 0. A non-zero exit whose
+    # output still happens to carry a `Time since last handshake: <N>s` line
+    # (a failed/partial `tunnel stats` printing a stale leftover) must NOT be
+    # trusted as a proven age — it is UNKNOWABLE. Returning None here keeps the
+    # adapter fail-safe: an unknowable age re-probes WITHOUT auto-bouncing (only
+    # a proven stale handshake from a successful probe may bounce).
+    if rc != 0:
+        return None
+    return _parse_warp_handshake_age(raw)
+
+
 def _parse_ifconfig_addresses(text: str) -> list[str]:
     """Pull every `inet`/`inet6` address out of `ifconfig -a` output.
 
