@@ -527,32 +527,46 @@ def reconcile_status_snapshot(state_dir: Optional[Path] = None,
     On a missing/unopenable store the snapshot still returns the stable shape
     with every step "unknown" (degrade safe — never raise).
     """
-    steps: dict[str, dict[str, Any]] = {}
-    last_tick_ts: Optional[float] = None
-    conn: Optional[sqlite3.Connection] = None
-    try:
-        conn = open_reconcile_db(state_dir)
-        steps = all_step_status(conn)
-        for entry in steps.values():
-            ts = entry.get("updated_ts")
-            if ts is not None and (last_tick_ts is None or ts > last_tick_ts):
-                last_tick_ts = ts
-    except (sqlite3.Error, OSError):
-        # open_reconcile_db mkdir's the handoff dir, so an unopenable state dir
-        # raises OSError (NotADirectoryError, PermissionError, …) as well as a
-        # corrupt-store sqlite3.Error. This is the net-status read surface
-        # (#1708) — it MUST degrade safe and never raise, so catch both.
-        steps = {step: {
+    def _all_unknown() -> dict[str, dict[str, Any]]:
+        return {step: {
             "step": step, "status": "unknown", "last_result": None,
             "attempt_count": 0, "last_attempt_ts": None,
             "next_eligible_ts": None, "updated_ts": None,
         } for step in RECONCILE_STEPS}
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except sqlite3.Error:
-                pass
+
+    steps: dict[str, dict[str, Any]] = {}
+    last_tick_ts: Optional[float] = None
+
+    # ★ Pure read surface (#1708): this MUST NOT create the store. A status
+    # call before the daemon has ever reconciled returns the stable
+    # all-unknown shape WITHOUT materializing reconcile.db (open_reconcile_db
+    # would mkdir + WAL + schema, mutating state from a viewer/status path —
+    # violating the observable-not-operable invariant). reconcile_db_path() is
+    # pure (no I/O); only the daemon's attempt path creates the store.
+    path = reconcile_db_path(state_dir)
+    if not path.exists():
+        steps = _all_unknown()
+    else:
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            # Read-only URI open: no mkdir, no WAL/schema setup, no creation.
+            # Fails closed (OSError/sqlite3.Error) on a vanished/locked/corrupt
+            # store or a not-yet-schema'd db → degrade to the unknown shape.
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            steps = all_step_status(conn)
+            for entry in steps.values():
+                ts = entry.get("updated_ts")
+                if ts is not None and (last_tick_ts is None or ts > last_tick_ts):
+                    last_tick_ts = ts
+        except (sqlite3.Error, OSError):
+            steps = _all_unknown()
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
 
     return {
         "last_tick_ts": last_tick_ts,

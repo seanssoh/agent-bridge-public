@@ -195,6 +195,40 @@ def cmd_backoff(repo_root: str) -> int:
 
 def cmd_snapshot(repo_root: str) -> int:
     reconcile = _load_reconcile(repo_root)
+
+    # ★ NON-CREATING (#1708 read-only contract): a status call against a state
+    # dir where reconcile.db does NOT yet exist must return the stable
+    # all-unknown shape WITHOUT materializing the store or its WAL/SHM
+    # sidecars — a viewer/status path must never mutate state
+    # (observable-not-operable). Regression guard for the create-on-read the
+    # PR #1717 Phase-4 review caught. Clear any ambient env override so the
+    # fresh state_dir is authoritative.
+    import tempfile
+    from pathlib import Path as _P
+    _saved = os.environ.pop("BRIDGE_A2A_RECONCILE_DB", None)  # noqa: iso-helper-boundary
+    try:
+        with tempfile.TemporaryDirectory() as _empty:
+            fresh = _P(_empty) / "handoff"
+            before = reconcile.reconcile_status_snapshot(state_dir=fresh, interval=45)
+            db = reconcile.reconcile_db_path(fresh)
+            for created in (db, _P(str(db) + "-wal"), _P(str(db) + "-shm")):
+                if created.exists():
+                    sys.stderr.write(
+                        f"FAIL snapshot: read-only status created {created}\n")
+                    return 1
+            if set(before["steps"].keys()) != set(reconcile.RECONCILE_STEPS):
+                sys.stderr.write(
+                    f"FAIL snapshot: fresh-dir steps {sorted(before['steps'].keys())}\n")
+                return 1
+            for step, row in before["steps"].items():
+                if row["status"] != "unknown":
+                    sys.stderr.write(
+                        f"FAIL snapshot: fresh-dir {step} not unknown ({row['status']})\n")
+                    return 1
+    finally:
+        if _saved is not None:
+            os.environ["BRIDGE_A2A_RECONCILE_DB"] = _saved
+
     # Seed one step so the snapshot has a real updated_ts to surface.
     conn = reconcile.open_reconcile_db()
     reconcile.record_attempt(conn, reconcile.STEP_STABLE_ADDR,
