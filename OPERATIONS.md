@@ -116,21 +116,25 @@ without guessing.
 
 표준 upgrade 절차는 [`UPGRADING.md`](UPGRADING.md) 에 정리되어 있다. 모든 install 에서 동일한 명령으로 진행한다:
 
-**Current target**: upgrade to **`v0.16.2`** (stable). It supersedes the
-`v0.16.1` / `v0.16.0` / `v0.15.x` stable line and all the
-`v0.16.0-rc1..rc3` / `v0.15.0-rc1` / `v0.15.0-betaN` / `v0.14.5-betaN`
-prereleases, so the latest stable tag is the current target. A single
-`agent-bridge upgrade --apply` lands there from any v0.7.x+ source; the
+**Current target**: upgrade to **`v0.16.3`** (stable — current head of the v0.16
+LTS line). It supersedes the `v0.16.2` / `v0.16.1` / `v0.16.0` / `v0.15.x` stable
+line and all the `v0.16.0-rc1..rc3` / `v0.15.0-rc1` / `v0.15.0-betaN` /
+`v0.14.5-betaN` prereleases, so the latest stable tag is the current target. A
+single `agent-bridge upgrade --apply` lands there from any v0.7.x+ source; the
 v0.13.7-v0.13.9 heredoc-chain fixes (extracted to `lib/upgrade-helpers/`) keep
 the leap-path safe on Bash 5.3.9 hosts:
 
 ```bash
 cd <source-checkout>
 git fetch origin --tags
-# Pin to the latest STABLE tag (vX.Y.Z, no -beta/-rc suffix) — currently v0.16.2.
+# Pin to the latest STABLE tag (vX.Y.Z, no -beta/-rc suffix) — currently v0.16.3.
 git checkout "$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
 ./agent-bridge upgrade --apply
 ```
+
+To stay on the v0.16 LTS line across future minors instead of auto-following the
+global latest, pin the channel once with `agb upgrade --channel lts` (see
+*`lts` upgrade channel — pin an install to the LTS line* below).
 
 **A2A peers on a pre-v0.16.1 source (leap-path note, #1685):** if this host runs
 the A2A cross-bridge receiver and you are upgrading from a **pre-v0.16.1** source
@@ -216,7 +220,7 @@ For per-stage detail, see `CHANGELOG.md` `[0.14.0]`. For the stabilization roadm
 
 ### v0.13.x hotfix wave (2026-05-15) — historical context
 
-**Current recommendation**: upgrade to the current target (`v0.16.2` stable — see the top of the Upgrade section). This section is preserved as historical context for the leap-path blockers that v0.13.7-v0.13.10 resolved.
+**Current recommendation**: upgrade to the current target (`v0.16.3` stable — see the top of the Upgrade section). This section is preserved as historical context for the leap-path blockers that v0.13.7-v0.13.10 resolved.
 
 The v0.13.7-v0.13.10 cycle fixed a four-stage `agent-bridge upgrade --apply` blocker that affected the v0.7.x → v0.13.x leap on Bash 5.3.9 hosts (matched by recent Linux distros). Operators on macOS were similarly affected by a markerless-existing-install layout reject. The v0.14.x line carries those fixes forward — operators can leap directly from v0.7.x/v0.8.x/v0.9.x/v0.10.x/v0.11.x/v0.12.x to the current target in a single `agent-bridge upgrade --apply` step.
 
@@ -260,6 +264,38 @@ The upgrader preserves local runtime data by default:
 - `shared/`
 - `agents/*` runtime homes
 - local backups and generated files
+
+#### `lts` upgrade channel — pin an install to the LTS line (#1687)
+
+v0.16.3+ 부터 `agb upgrade --channel lts` 는 install 을 **LTS 라인에 고정**한다. 보통
+`upgrade --apply` 는 글로벌 최신 stable 태그를 따라가지만, `--channel lts` 를 한 번
+지정하면 그 install 은 **LTS 시리즈 안에서만** 최신 non-prerelease 태그로 올라간다 —
+즉 더 높은 minor 가 다른 곳에 떠도 LTS 라인을 벗어나 자동 점프하지 않는다. LTS 시리즈는
+source root 의 `LTS_SERIES` pointer 로 정의된다 (현재 `0.16`); resolver 는 full-match
+(prefix 아님) 이고 prerelease 는 건너뛴다.
+
+선택은 **sticky** 하다 — `state/upgrade/channel` 에 기록되므로, 이후 plain
+`agb upgrade --apply` 도 계속 LTS 라인에 머무른다:
+
+```bash
+agb upgrade --channel lts --apply   # LTS 라인에 고정 (sticky)
+agb upgrade --apply                 # 이후 bare upgrade 는 LTS 라인 유지
+agb upgrade --channel stable --apply # 글로벌 latest stable 로 복귀 (sticky 재기록)
+```
+
+채널 우선순위: 명시적 CLI `--channel`/`--version`/`--ref` > 내부 special-case >
+기록된 sticky > legacy `stable`. **one-shot vs transient vs sticky**:
+
+- `--version <tag>` / `--ref <ref>` 는 **one-shot** — 그 한 번만 해당 타깃으로 가고,
+  기록된 sticky 채널을 덮어쓰지 않는다.
+- `AGENT_BRIDGE_UPGRADE_CHANNEL` 환경변수는 **transient** — 그 호출에만 적용되고
+  sticky 에 기록되지 않는다.
+- `--channel <name>` 만 sticky 를 갱신한다.
+
+resolver 는 **fail-closed** 다: `LTS_SERIES` 가 없거나 malformed 이거나 sticky write 를
+검증할 수 없으면, 조용히 `stable` 로 떨어져 install 을 LTS 라인에서 미끄러뜨리는 대신
+**명확한 remediation 메시지와 non-zero rc 로 거부**한다. `lts` 가 아닌 install 의
+기본 동작은 그대로다.
 
 #### upgrade/rollback singleton lock — concurrent runs refuse fast (#1661)
 
