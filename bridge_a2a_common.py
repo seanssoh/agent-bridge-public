@@ -1708,13 +1708,24 @@ def room_pair_key_from_token(raw_token: str, *, room_id: str,
 #
 # The invite link embeds a `reach=` transport locator so a joiner with NO
 # pre-existing node-link can direct its first room-join request at the leader.
-# `reach=` carries NO secret — only {kind, address, port}. To stop a relayed /
-# tampered link from redirecting first contact to an attacker-controlled
-# address, `reach=` (and the leader/room/token identity) is bound into a SIGNED
-# CANONICAL whose MAC key is derived from the raw token (which only the leader
-# and a legitimate invite-holder possess). A relay attacker who lacks the raw
-# token cannot forge a canonical that verifies, so a `reach=` tamper fails the
-# invite-signature check on the joiner side.
+# `reach=` carries NO secret — only {kind, address, port}. The leader binds
+# `reach=` (and the leader/room/token identity + an `iat`/`ttl`/`nonce` freshness
+# tuple) into a SIGNED CANONICAL whose MAC key is derived from the RAW TOKEN.
+#
+# Integrity scope — be honest (SK-1): the signing key is derived from the raw
+# token, which is the `t=` bearer in the SAME link. So the signature proves
+# integrity ONLY against a BLIND on-path tamperer who does NOT hold the token.
+# It does NOT provide relay-resistance: any party that RELAYS or OBSERVES the
+# link already holds the token and could re-sign a tampered `reach=`. The
+# concrete, enforced guarantees a joiner gets are therefore the LINK TTL
+# (`iat + ttl < now → reject`) and the single-use `nonce` (recorded + replay-
+# rejected joiner-side) — NOT relay-resistance. Crucially, NONE of this is an
+# admission gate: the leader re-runs token TTL/revocation + `client_ip` ==
+# registered-addr + per-pair HMAC + leader-approval regardless of `reach=`, so a
+# `reach=` forgery is at worst a first-contact transport redirect (phishing/DoS),
+# never a room-admission bypass. (Future hardening for true relay-resistance:
+# sign the locator with the leader's node-link identity key, which a relayer
+# does not hold — tracked as a follow-up, not solved here.)
 
 def invite_canonical(*, version: str, room_id: str, leader_node: str,
                      leader_bridge: str, reach: dict[str, Any],
@@ -1724,7 +1735,9 @@ def invite_canonical(*, version: str, room_id: str, leader_node: str,
 
     NO secret rides here — `reach` is {kind, address, port}; the bearer token
     itself is represented only by its verifier hash (`token_sha256`). Keys are
-    sorted so the leader and every joiner recompute byte-identical bytes.
+    sorted so the leader and every joiner recompute byte-identical bytes. See
+    the section header for the (deliberately narrow) integrity scope: token-keyed
+    integrity vs a blind tamperer, NOT relay-resistance.
     """
     payload = {
         "v": version,
@@ -1809,6 +1822,13 @@ def auto_register_room_peer_locked(
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
             except OSError as exc:
                 return False, f"lock_acquire_failed:{exc}"[:64]
+        # SK-3: when `fcntl is None` (non-POSIX), the advisory flock degrades to
+        # a NO-OP — concurrent writers from the same node could then race the
+        # read-modify-write below. The atomic `os.replace` still leaves a VALID
+        # single-entry config (no corruption/partial write); the only loss is the
+        # cross-process serialization that prevents a last-writer-wins overwrite.
+        # A2A is POSIX-only in practice (Linux/macOS), so `fcntl` is always
+        # present on a real deployment and this branch is a defensive fallback.
         # 2. reload from disk under the lock.
         try:
             disk_cfg = load_config(target_path)

@@ -3395,9 +3395,14 @@ class HandoffHandler(BaseHTTPRequestHandler):
             bridge_id).
         """
         # --- env gate: feature-enable, DEFAULT-UNCHANGED. Unset/!=1 → the prior
-        # behavior (hard 403 unknown_peer) is preserved byte-for-byte. This is
-        # the feature flag, NOT a POC `=1` test toggle: when ON the production
-        # path is always-on, gated by TOKEN VALIDITY (never on the env alone). ---
+        # unknown-peer 403 (reply + audit preserved). NB (SK-2): the body is now
+        # read BEFORE this reject (hoisted above find_peer so the bootstrap path
+        # can inspect room_id/token), so it is not literally byte-for-byte at the
+        # I/O level — but the read is bounded by the 8KB Content-Length guard +
+        # the socket request timeout, so it adds no unbounded work, and the
+        # peer-facing reply + the audit row are identical to before. This is the
+        # feature flag, NOT a POC `=1` test toggle: when ON the production path is
+        # always-on, gated by TOKEN VALIDITY (never on the env alone). ---
         if os.environ.get("BRIDGE_A2A_ROOM_AUTOJOIN") != "1":  # noqa: iso-helper-boundary - feature env gate, not a .env file
             audit("room_join_reject", reason="unknown_peer",
                   peer=peer_id, client=client_ip, security=True)

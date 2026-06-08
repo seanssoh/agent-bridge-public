@@ -330,6 +330,45 @@ def cmd_clear_key_seed(db: str, room_id: str) -> int:
     return 0
 
 
+def cmd_clear_nonces(db: str) -> int:
+    """Clear the joiner-side invite_nonce_seen ledger (test-only reset, so a test
+    can re-capture the SAME signed link without tripping the real single-use
+    replay guard). No-op when the db / table does not exist yet."""
+    if not Path(db).exists():
+        return 0
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DELETE FROM invite_nonce_seen")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # table not created yet (no signed join captured)
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_mint_signed_link(room_id: str, leader_node: str, token: str,
+                         address: str, port: str, iat: str, ttl: str,
+                         nonce: str) -> int:
+    """Mint a v2 SIGNED invite link with caller-controlled iat/ttl/nonce, signed
+    correctly with the raw token (SK-1 test seam). Used to drive the joiner's
+    LINK-expiry + nonce-replay enforcement deterministically without waiting on a
+    real clock. Prints the link."""
+    reach = {"kind": "cloudflare-warp-mesh", "address": address,
+             "port": int(port)}
+    canonical = a2a.invite_canonical(
+        version="2", room_id=room_id, leader_node=leader_node,
+        leader_bridge=leader_node, reach=reach,
+        token_sha256=rooms.hash_token(token), issued_ts=int(iat),
+        ttl=int(ttl), nonce=nonce)
+    sig = a2a.sign_invite_canonical(token, canonical)
+    signed = {"v": "2", "lb": leader_node,
+              "reach": f"cloudflare-warp-mesh:{address}:{port}",
+              "iat": iat, "ttl": ttl, "nonce": nonce, "s": sig}
+    print(rooms.make_invite_link(room_id, leader_node, token, signed=signed))
+    return 0
+
+
 def cmd_derive_pair_key(token: str, room: str, leader_node: str,
                         joiner_node: str) -> int:
     print(a2a.room_pair_key_from_token(
@@ -413,6 +452,10 @@ def main(argv: list[str]) -> int:
         "file-tree-contains": lambda: cmd_file_tree_contains(rest[0], rest[1]),
         "set-token-ts": lambda: cmd_set_token_ts(rest[0], rest[1], rest[2]),
         "clear-key-seed": lambda: cmd_clear_key_seed(rest[0], rest[1]),
+        "clear-nonces": lambda: cmd_clear_nonces(rest[0]),
+        "mint-signed-link": lambda: cmd_mint_signed_link(
+            rest[0], rest[1], rest[2], rest[3], rest[4], rest[5], rest[6],
+            rest[7]),
         "derive-pair-key": lambda: cmd_derive_pair_key(
             rest[0], rest[1], rest[2], rest[3]),
         "token-hash-key": lambda: cmd_token_hash_key(

@@ -274,12 +274,22 @@ def _leader_reach_from_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
     return {"kind": kind, "address": address, "port": port}
 
 
-def _make_invite_link_for(node: str, token: str, room_id: str) -> str:
+def _make_invite_link_for(node: str, token: str, room_id: str,
+                          link_ttl: Optional[int] = None) -> str:
     """Build the invite link the leader hands out. When the local A2A config is
-    available, emit a v2 SIGNED invite whose `reach=` (the leader's transport
-    locator) is bound into a token-signed canonical so a relayed/tampered link
-    cannot redirect a joiner's first contact. Falls back to the legacy unsigned
-    link (single-node / no a2a / no reachable address)."""
+    available, emit a v2 SIGNED invite that carries the leader's `reach=`
+    transport locator plus a freshness tuple (`iat`/`ttl`/`nonce`) bound into a
+    token-signed canonical. Falls back to the legacy unsigned link (single-node /
+    no a2a / no reachable address).
+
+    Integrity scope (SK-1, honest): the canonical signature is keyed on a value
+    derived from the raw token (the `t=` bearer in the SAME link), so it proves
+    integrity against a BLIND on-path tamperer who does NOT hold the token — it
+    does NOT defend against a party that relays or observes the link (that party
+    holds the token and could re-sign). The `iat`/`ttl` LINK expiry + the
+    single-use `nonce` are the real, enforced freshness/replay guarantees the
+    joiner applies; true relay-resistance (signing with the leader's node-link
+    identity key) is a future hardening."""
     if a2a is None:
         return rooms.make_invite_link(room_id, node, token)
     try:
@@ -293,7 +303,10 @@ def _make_invite_link_for(node: str, token: str, room_id: str) -> str:
         return rooms.make_invite_link(room_id, node, token)
     leader_bridge = str(cfg.get("bridge_id", "") or "").strip() or node
     issued_ts = a2a.now_ts()
-    ttl = 0
+    # A real, enforced LINK TTL (SK-1): a stale/leaked signed link stops working
+    # after this window even while the underlying token is still server-valid.
+    ttl = (rooms.DEFAULT_SIGNED_INVITE_LINK_TTL_SECONDS
+           if link_ttl is None else max(0, int(link_ttl)))
     nonce = a2a.new_message_id(leader_bridge).split(":", 1)[-1]
     token_sha = rooms.hash_token(token)
     reach_param = f"{reach['kind']}:{reach['address']}:{reach['port']}"
@@ -317,10 +330,24 @@ def _make_invite_link_for(node: str, token: str, room_id: str) -> str:
 def _verify_and_extract_reach(parsed: dict[str, str], token: str
                               ) -> Optional[dict[str, Any]]:
     """Joiner-side: verify a v2 signed invite's token-bound canonical and return
-    the trusted reach {kind, address, port}. Returns None for a legacy/unsigned
-    link (no `s=`). RAISES rooms.RoomsError on a SIGNATURE MISMATCH (a tampered
-    reach= / forged link) so the joiner fails closed rather than trusting an
-    attacker-redirected first contact."""
+    {"reach": {kind,address,port}, "nonce": <str>} for the caller to act on (the
+    caller records the nonce for single-use replay rejection). Returns None for a
+    legacy/unsigned link (no `s=`).
+
+    RAISES rooms.RoomsError (fail closed) on:
+      - a malformed reach=/iat/ttl,
+      - a SIGNATURE MISMATCH (the canonical was tampered with by a party that
+        does NOT hold the token, or the link was forged),
+      - an EXPIRED link (`iat + ttl < now`) — a real, enforced freshness gate.
+
+    Integrity scope (SK-1, honest): the signature key is derived from the raw
+    token carried in the SAME link, so verification proves integrity ONLY
+    against a blind on-path tamperer who lacks the token. A relayer/observer who
+    holds the token could re-sign a tampered reach=, so this is NOT relay-
+    resistance. The enforced LINK TTL + single-use nonce (recorded by the caller)
+    are the concrete guarantees; admission is unaffected either way (the leader
+    re-runs token TTL/revocation + client_ip==registered-addr + per-pair HMAC +
+    leader approval regardless of reach=)."""
     if a2a is None or not parsed.get("s"):
         return None
     reach_param = parsed.get("reach", "")
@@ -336,6 +363,7 @@ def _verify_and_extract_reach(parsed: dict[str, str], token: str
             raise rooms.RoomsError(
                 "invite link reach= is malformed", code="bad_invite_reach")
     reach = {"kind": kind, "address": address, "port": port}
+    nonce = parsed.get("nonce", "")
     try:
         issued_ts = int(parsed.get("iat", "0") or "0")
         ttl = int(parsed.get("ttl", "0") or "0")
@@ -347,13 +375,18 @@ def _verify_and_extract_reach(parsed: dict[str, str], token: str
         room_id=parsed.get("room", ""), leader_node=parsed.get("leader", ""),
         leader_bridge=parsed.get("lb", ""), reach=reach,
         token_sha256=rooms.hash_token(token), issued_ts=issued_ts, ttl=ttl,
-        nonce=parsed.get("nonce", ""))
+        nonce=nonce)
     if not a2a.verify_invite_canonical(token, canonical, parsed.get("s", "")):
         raise rooms.RoomsError(
             "invite link signature verification failed — the reach=/identity "
             "locator was tampered with or the link was forged (refusing first "
             "contact)", code="invite_sig_mismatch")
-    return reach
+    # Enforce the signed LINK TTL (SK-1): a real expiry, not a decorative field.
+    if ttl > 0 and issued_ts + ttl < a2a.now_ts():
+        raise rooms.RoomsError(
+            "invite link has expired — ask the leader to re-issue it with "
+            "`agb room invite`", code="invite_expired")
+    return {"reach": reach, "nonce": nonce}
 
 
 # --------------------------------------------------------------------------
@@ -576,6 +609,20 @@ def cmd_rotate_invite(args: argparse.Namespace) -> int:
     return cmd_invite(args)
 
 
+def _have_leader_peer(leader_node: str) -> bool:
+    """True iff the local A2A config already has a node-link peer for the leader
+    (i.e. this is a re-join by an already-paired peer, NOT a first contact). Used
+    to gate the signed-invite reach=/freshness checks to the bootstrap path."""
+    if a2a is None or not leader_node:
+        return False
+    try:
+        cfg = a2a.load_config()
+        a2a.find_peer(cfg, leader_node)
+        return True
+    except Exception:  # noqa: BLE001 - missing config / unknown peer → not paired
+        return False
+
+
 def _joiner_bootstrap_leader_peer(
     cfg: dict[str, Any], *, leader_node: str, room_id: str, token: str,
     bootstrap_reach: Optional[dict[str, Any]], local_bridge_id: str,
@@ -585,10 +632,13 @@ def _joiner_bootstrap_leader_peer(
 
     The peer `secret` is `room_pair_key_from_token(raw_token, room, leader,
     joiner=local_bridge_id)` — the SAME key the leader derives from the stored
-    seed. The `address` is the VERIFIED reach= address (a relayed/tampered reach=
-    was already rejected upstream by the token-signed canonical check). Writes
-    atomically under the same TOCTOU lock the receiver uses, then updates the
-    live in-mem cfg so the immediate send resolves the peer. RAISES
+    seed. The `address` is the reach= address from the signed canonical (SK-1
+    honesty: that signature catches a BLIND tamperer + an EXPIRED/replayed link,
+    but is token-keyed so it is NOT relay-resistance; either way a forged reach=
+    only redirects first-contact TRANSPORT, never admission — the leader re-runs
+    token-TTL/revocation + client_ip==registered-addr + per-pair HMAC + approval).
+    Writes atomically under the same TOCTOU lock the receiver uses, then updates
+    the live in-mem cfg so the immediate send resolves the peer. RAISES
     rooms.RoomsError when there is no reach to bootstrap from.
     """
     if not bootstrap_reach or not bootstrap_reach.get("address"):
@@ -1384,15 +1434,43 @@ def cmd_join(args: argparse.Namespace) -> int:
     # verifies + persists the pending row (no local rooms.db write here — this
     # node is not the leader's node and has no authority over the room).
     if leader_node and leader_node != node:
-        # Lane 4 (#1695): if the link is a v2 SIGNED invite, verify the
-        # token-bound canonical FIRST and extract the trusted reach= locator. A
-        # tampered/forged reach= raises here (fail closed — never trust a relayed
-        # redirect). `bootstrap_reach` lets `_post_room_join_request`
-        # self-register a local node-link when none exists yet.
-        try:
-            bootstrap_reach = _verify_and_extract_reach(parsed, token)
-        except rooms.RoomsError as exc:
-            return die(str(exc), code=1)
+        # Lane 4 (#1695): the signed-invite reach=/freshness gates apply ONLY to
+        # a FIRST-CONTACT bootstrap (no local node-link to the leader yet). A
+        # re-join by an already-paired peer takes the ordinary node-link and
+        # neither needs the reach= nor is bound by the single-use nonce (it is not
+        # a fresh first contact). Decide bootstrap-vs-known here.
+        bootstrap_reach: Optional[dict[str, Any]] = None
+        if not _have_leader_peer(leader_node):
+            # Verify the v2 signed canonical FIRST and extract the reach= locator.
+            # A tampered-by-blind-tamperer / forged / EXPIRED link raises here
+            # (fail closed). `bootstrap_reach` lets `_post_room_join_request`
+            # self-register a local node-link.
+            try:
+                verified = _verify_and_extract_reach(parsed, token)
+            except rooms.RoomsError as exc:
+                return die(str(exc), code=1)
+            if verified is not None:
+                bootstrap_reach = verified.get("reach")
+                # SK-1 single-use guard: record the signed invite's per-issue
+                # nonce so a REPLAYED signed link (re-sent later to drive a fresh
+                # first-contact bootstrap) is rejected. Recorded in the joiner's
+                # own rooms.db; orthogonal to the leader's server-side token TTL.
+                nonce = str(verified.get("nonce") or "")
+                if nonce:
+                    try:
+                        nconn = rooms.open_rooms()
+                        try:
+                            fresh = rooms.record_invite_nonce(
+                                nconn, room_id, nonce)
+                        finally:
+                            nconn.close()
+                    except rooms.RoomsError as exc:
+                        return die(f"cannot record invite nonce: {exc}", code=1)
+                    if not fresh:
+                        return die(
+                            "this signed invite link was already used on this "
+                            "node (replay refused) — ask the leader to issue a "
+                            "fresh invite with `agb room invite`", code=1)
         try:
             status, resp = _post_room_join_request(
                 leader_node=leader_node, room_id=room_id, token=token,

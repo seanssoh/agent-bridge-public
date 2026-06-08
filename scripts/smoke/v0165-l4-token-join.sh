@@ -127,6 +127,10 @@ reset_leader_cfg() {
   # not reuse a stale per-(room) key it derived for a PRIOR test's room.
   python3 "$HELPER" make-leader-config "$CFG_A" "$NODE_A" "$ADDR_A" >/dev/null
   python3 "$HELPER" make-joiner-config "$CFG_B" "$NODE_B" "$ADDR_B" >/dev/null
+  # SK-1: clear the joiner-side invite_nonce_seen ledger so a test that re-uses
+  # the SAME captured signed link is not blocked by the real single-use replay
+  # guard (the guard itself is exercised explicitly in test_nonce_replay_reject).
+  python3 "$HELPER" clear-nonces "$BRIDGE_A2A_ROOMS_DB" >/dev/null 2>&1 || true
 }
 
 # ---------------------------------------------------------------------------
@@ -305,6 +309,8 @@ test_revoked_and_expired_still_403() {
 # case 5: WARP reach= tamper — a tampered reach= fails the invite canonical sig
 # ---------------------------------------------------------------------------
 test_reach_tamper_fails_signature() {
+  # A clean joiner (no local leader peer) so the FIRST-CONTACT verify path runs.
+  reset_leader_cfg
   # Tamper the reach= address in the link, then try to join: the joiner's
   # token-bound canonical verification must FAIL (refusing first contact) so the
   # CLI exits non-zero and NO request is captured.
@@ -329,6 +335,60 @@ print(u.urlunsplit((parts.scheme, parts.netloc, parts.path, newq, '')))
     smoke_fail "case 5: the joiner must NOT send after a reach= tamper"
   fi
   smoke_log "ok: case 5: tampered reach= rejected by the token-bound canonical signature"
+}
+
+# ---------------------------------------------------------------------------
+# SK-1: an EXPIRED signed invite LINK (iat + ttl < now) is refused by the joiner
+# BEFORE first contact — a real, enforced freshness gate (distinct from the
+# leader's server-side token TTL).
+# ---------------------------------------------------------------------------
+test_invite_link_expired_refused() {
+  reset_leader_cfg
+  local out room rawtok link
+  out="$(room_create_as lena 0)"
+  room="$(json_field room_id "$out")"
+  rawtok="$(python3 "$SCRIPT_DIR/a2a-rooms-p1a-helper.py" token-from-link "$(json_field invite_link "$out")")"
+  # Mint a correctly-signed link whose iat is 100000s ago with a 24h ttl → expired.
+  local past
+  past="$(python3 -c "import time;print(int(time.time())-100000)")"
+  link="$(python3 "$HELPER" mint-signed-link "$room" "$NODE_A" "$rawtok" "$ADDR_A" 8787 "$past" 86400 "n-expired")"
+  : >"$CAPTURE" || true
+  if join_as lena -- "$link" >/dev/null 2>&1; then
+    smoke_fail "SK-1: an EXPIRED signed invite link must be refused by the joiner"
+  fi
+  if [[ -s "$CAPTURE" ]]; then
+    smoke_fail "SK-1: the joiner must NOT send after an expired link"
+  fi
+  smoke_log "ok: SK-1: an expired signed invite link is refused before first contact"
+}
+
+# ---------------------------------------------------------------------------
+# SK-1: the per-issue NONCE makes a signed link SINGLE-USE for a first-contact
+# bootstrap — a REPLAYED signed link is refused on the second presentation.
+# ---------------------------------------------------------------------------
+test_nonce_replay_reject() {
+  reset_leader_cfg
+  local out room rawtok link
+  out="$(room_create_as mara 0)"
+  room="$(json_field room_id "$out")"
+  rawtok="$(python3 "$SCRIPT_DIR/a2a-rooms-p1a-helper.py" token-from-link "$(json_field invite_link "$out")")"
+  local now
+  now="$(python3 -c "import time;print(int(time.time()))")"
+  link="$(python3 "$HELPER" mint-signed-link "$room" "$NODE_A" "$rawtok" "$ADDR_A" 8787 "$now" 86400 "n-once")"
+  # First use: succeeds (captures + records the nonce). The joiner ALSO writes a
+  # local leader peer, so we clear it before the replay to FORCE the bootstrap
+  # path again (otherwise the second join is a known-peer re-join, not a replay).
+  join_as mara -- "$link" >/dev/null 2>&1 || smoke_fail "first signed-link use should succeed"
+  python3 "$HELPER" make-joiner-config "$CFG_B" "$NODE_B" "$ADDR_B" >/dev/null
+  : >"$CAPTURE" || true
+  # Second use of the SAME link → nonce replay refused (no capture, non-zero rc).
+  if join_as mara -- "$link" >/dev/null 2>&1; then
+    smoke_fail "SK-1: a REPLAYED signed link (same nonce) must be refused"
+  fi
+  if [[ -s "$CAPTURE" ]]; then
+    smoke_fail "SK-1: the joiner must NOT send on a nonce replay"
+  fi
+  smoke_log "ok: SK-1: a replayed signed link (same nonce) is refused (single-use)"
 }
 
 # ---------------------------------------------------------------------------
@@ -415,13 +475,17 @@ test_reattach_known_vs_new() {
   smoke_assert_contains "$res" "status=200" \
     "reattach: a KNOWN peer re-joins via the ordinary node-link (no token-bootstrap, gate off)"
   # A brand-new DIFFERENT peer with the gate off is still 403 (two-factor for new).
-  local cfg_c="$SMOKE_TMP_ROOT/handoff-C.json"
+  # nodeC uses its OWN fresh room/link (a distinct single-use nonce) so it is a
+  # genuine first contact, not a replay of ivy's link.
+  local outc linkc cfg_c="$SMOKE_TMP_ROOT/handoff-C.json"
+  outc="$(room_create_as jade 0)"
+  linkc="$(json_field invite_link "$outc")"
   python3 "$HELPER" make-joiner-config "$cfg_c" "nodeC" "$ADDR_B" >/dev/null
   : >"$CAPTURE" || true
   env "${TEST_FLAGS[@]}" "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-jade" \
       "BRIDGE_A2A_CONFIG=$cfg_c" "BRIDGE_ROOMS_TEST_POST_HOOK=$POST_HOOK" \
       "CAPTURE_FILE=$CAPTURE" "CLIENT_IP=$ADDR_B" \
-    python3 "$ROOMS_CLI" join "$link" >/dev/null 2>&1 || smoke_fail "capture nodeC request"
+    python3 "$ROOMS_CLI" join "$linkc" >/dev/null 2>&1 || smoke_fail "capture nodeC request"
   res="$(deliver_no_gate '{"headers":{"X-AGB-Peer":"nodeC"}}')"
   smoke_assert_contains "$res" "status=403" \
     "reattach: a brand-new peer is still 403 with the gate off (new ≠ known; two-factor)"
@@ -474,6 +538,8 @@ smoke_run "case 1: token-hash-as-key rejected (domain separation)" test_token_ha
 smoke_run "case 1b: bad-sig bootstrap does not poison the shared in-mem cfg (r2 P1)" test_shared_cfg_no_poison_across_requests
 smoke_run "case 4 (neg): revoked / expired token still 403, no peer" test_revoked_and_expired_still_403
 smoke_run "case 5: WARP reach= tamper fails the invite canonical signature" test_reach_tamper_fails_signature
+smoke_run "SK-1: an expired signed invite link is refused before first contact" test_invite_link_expired_refused
+smoke_run "SK-1: a replayed signed link (same nonce) is refused (single-use)" test_nonce_replay_reject
 smoke_run "case 6: no raw token / seed / derived key in audit or join row" test_no_secret_in_audit_or_row
 smoke_run "case 2: concurrent unknown-peer joins → one peer, no corruption (TOCTOU)" test_concurrent_register_toctou
 smoke_run "case 3: reattach known-vs-new split (known skips bootstrap; new needs token)" test_reattach_known_vs_new

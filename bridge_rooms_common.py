@@ -78,6 +78,14 @@ INVITE_LINK_SCHEME = "agbroom"
 # counter; the window is advisory (single-node, no clock-coupled reset).
 DEFAULT_JOIN_RATE_LIMIT_PER_TOKEN = 50
 
+# Lane 4 (#1695) SK-1: default lifetime (seconds) of a v2 SIGNED invite LINK —
+# distinct from the room invite TOKEN's own server-side TTL (rooms.invite_token_ttl,
+# 0 == none). The signed link carries `iat`/`ttl` in its token-signed canonical
+# and the joiner enforces `iat + ttl < now → invite_expired` BEFORE first contact,
+# so a stale/leaked link stops being usable even while the underlying token is
+# still server-valid. 24h is a sane default for a hand-distributed invite.
+DEFAULT_SIGNED_INVITE_LINK_TTL_SECONDS = 86400
+
 
 class RoomsError(Exception):
     """A rooms control-plane failure with a machine-readable code."""
@@ -623,6 +631,19 @@ CREATE TABLE IF NOT EXISTS room_join_dedupe (
   -- earlier message_id-only PK let nodeC pre-reserve nodeB's id).
   PRIMARY KEY (peer, message_id)
 );
+
+-- Lane 4 (#1695) SK-1: JOINER-side replay ledger for v2 signed invite links.
+-- Each signed invite carries a per-issue `nonce`; the joiner records (room_id,
+-- nonce) once and rejects a second presentation, so a replayed signed link
+-- (e.g. an attacker re-sending an old, since-superseded link) cannot drive a
+-- fresh first-contact bootstrap. Carries NO token / token-hash. Local to the
+-- joiner node; the leader's server-side TTL/revocation is the orthogonal gate.
+CREATE TABLE IF NOT EXISTS invite_nonce_seen (
+  room_id    TEXT NOT NULL,
+  nonce      TEXT NOT NULL,
+  seen_ts    INTEGER NOT NULL,
+  PRIMARY KEY (room_id, nonce)
+);
 """
 
 
@@ -808,11 +829,15 @@ def _invite_key_seed_for(token: str) -> str:
 
 
 # The signed-invite locator (`reach=`) parameters carried in a v2 link, Lane 4
-# (#1695). They are bound into a token-signed canonical (the `s=` param) so a
-# relayed/tampered `reach=` cannot redirect a joiner's first contact. The
-# signing/verification (which needs the raw token) lives in the CLI
-# (bridge-rooms.py) where `bridge_a2a_common` is imported; these helpers stay
-# pure URL builders/parsers so single-node-only surfaces keep no a2a dependency.
+# (#1695). They are bound into a token-signed canonical (the `s=` param). SK-1
+# honesty: the signing key is token-derived (the `t=` bearer in the SAME link),
+# so the signature proves integrity only vs a BLIND on-path tamperer — it is NOT
+# relay-resistance (a relayer holds the token). The real enforced freshness
+# guarantees are the LINK `iat`/`ttl` expiry + the single-use `nonce`, both
+# applied joiner-side (see bridge-rooms.py). The signing/verification (which
+# needs the raw token) lives in the CLI where `bridge_a2a_common` is imported;
+# these helpers stay pure URL builders/parsers so single-node-only surfaces keep
+# no a2a dependency.
 _SIGNED_INVITE_KEYS = ("v", "lb", "reach", "iat", "ttl", "nonce", "s")
 
 
@@ -1077,6 +1102,30 @@ def burn_invite_token(conn: sqlite3.Connection, room_id: str) -> None:
         (now_ts(), room_id),
     )
     conn.commit()
+
+
+def record_invite_nonce(conn: sqlite3.Connection, room_id: str,
+                        nonce: str) -> bool:
+    """JOINER-side single-use guard for a v2 signed invite link (Lane 4 SK-1).
+
+    Records `(room_id, nonce)` once. Returns True the FIRST time it is seen and
+    False on any replay (the row already exists). The caller rejects a False as
+    a replayed link. Empty `nonce` is treated as non-recordable → returns True
+    (a legacy/unsigned link carries no nonce and must not be blocked).
+
+    The store is local to the joiner node; it is orthogonal to (and does not
+    replace) the leader's server-side token TTL/revocation. Carries NO token.
+    """
+    if not nonce:
+        return True
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO invite_nonce_seen (room_id, nonce, seen_ts) "
+        "VALUES (?, ?, ?)",
+        (room_id, nonce, now_ts()),
+    )
+    conn.commit()
+    # rowcount == 1 → freshly inserted (first sight); 0 → PK collision (replay).
+    return cur.rowcount == 1
 
 
 def record_join_attempt(conn: sqlite3.Connection, token: str, source: str,
