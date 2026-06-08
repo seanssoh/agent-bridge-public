@@ -282,21 +282,39 @@ EOF
     || smoke_fail "(6) #1701 case substrate.checked != cloudflare-warp-mesh; got: $out"
 }
 
-# === (7) static teeth: registration + read-only probe primitives =============
+# === (7) fail-soft: a warp iface-enum failure records a NON-None error ========
+# BLOCKING-2 fix: `error` is pre-seeded to None, so the iface-enum except branch
+# must use `or`-assignment, not setdefault (a no-op on an existing key) — else a
+# real probe failure silently reports error=None, violating the contract that
+# every probe failure records an error string.
+check_warp_iface_fail_records_error() {
+  # (7a) No prior error: the iface-enum failure must POPULATE error (not None).
+  helper substrate-iface-fail none \
+    | helper substrate-error-nonnull "iface_enum_failed" >/dev/null \
+    && smoke_log "ok-iface-fail-records" \
+    || smoke_fail "(7a) warp iface-enum failure must record a NON-None error string (BLOCKING-2)"
+  # (7b) A pre-existing warp_cli error must be PRESERVED, not clobbered.
+  helper substrate-iface-fail warp \
+    | helper substrate-error-nonnull "warp-cli not found" >/dev/null \
+    && smoke_log "ok-iface-fail-preserves-warp" \
+    || smoke_fail "(7b) a prior warp_cli error must be preserved (the iface-enum branch must not clobber it)"
+}
+
+# === (8) static teeth: registration + read-only probe primitives =============
 check_static_read_only() {
   local src; src="$(cat "$A2A_CLI")"
   smoke_assert_contains "$src" "def cmd_net_status" \
-    "(7) cmd_net_status handler exists"
+    "(8) cmd_net_status handler exists"
   smoke_assert_contains "$src" '("net-status", "status")' \
-    "(7) net-status + status alias both registered to the same handler"
+    "(8) net-status + status alias both registered to the same handler"
   smoke_assert_contains "$src" "os.kill(pid, 0)" \
-    "(7) receiver liveness is a SIGNAL-0 existence check (no mutation)"
+    "(8) receiver liveness is a SIGNAL-0 existence check (no mutation)"
   smoke_assert_contains "$src" "_a2a_local_healthz(cfg, timeout)" \
-    "(7) healthz verdict delegates to the shared helper (inherits #1701 fallback)"
+    "(8) healthz verdict delegates to the shared helper (inherits #1701 fallback)"
   # No mutating primitives in the net-status code region: assert the handler
   # does not write the config / send a signal other than 0 / open a server.
   smoke_assert_not_contains "$src" "write_config_atomic(.*net" \
-    "(7) net-status never writes config"
+    "(8) net-status never writes config"
 }
 
 main() {
@@ -310,7 +328,8 @@ main() {
   smoke_run "(4) malformed/missing transport config degrades safely with NO state mutation" check_malformed_safe_no_mutation
   smoke_run "(5) NO SECRETS: listen/peer secrets never leak into plain or JSON output" check_no_secrets
   smoke_run "(6) #1701 consistency: warp held-socket receiver reported healthy (not healthz_timeout)" check_1701_warp_receiver_alive
-  smoke_run "(7) static: net-status registered + read-only probe primitives" check_static_read_only
+  smoke_run "(7) fail-soft: warp iface-enum failure records a NON-None error (BLOCKING-2)" check_warp_iface_fail_records_error
+  smoke_run "(8) static: net-status registered + read-only probe primitives" check_static_read_only
 
   smoke_log "passed"
 }

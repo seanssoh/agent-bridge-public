@@ -110,6 +110,65 @@ def _net_status_held(config: str, bind: str, port: int, timeout: str) -> int:
             pass
 
 
+def _load_a2a_module():
+    """Import bridge-a2a.py by file path (hyphenated name isn't import-able).
+
+    The repo root must be on sys.path so bridge-a2a.py's own
+    `import bridge_a2a_common` resolves regardless of the caller's cwd.
+    """
+    import importlib.util
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    spec = importlib.util.spec_from_file_location("bridge_a2a_under_test", str(A2A_CLI))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _substrate_iface_fail(preexisting_warp_error: str) -> int:
+    """Drive `_netstat_substrate` for a warp-mesh config whose interface
+    enumeration FAILS, and print the resulting substrate dict as JSON.
+
+    This unit-drives the exact #1697 BLOCKING-2 fix: `error` is pre-seeded to
+    None, so a `setdefault` on the iface-enum failure path would be a no-op and
+    silently report `error=None`. We monkeypatch `local_interface_addresses` to
+    raise an A2AError (code iface_enum_failed) and assert the substrate records a
+    NON-None error.
+
+    `preexisting_warp_error`:
+      - "none"  → warp_cli resolves + warp status is connected, so no prior
+                  error exists; the iface-enum failure MUST populate `error`.
+      - "warp"  → warp_cli is forced absent so a prior, more-specific warp_cli
+                  error is already set; the iface-enum failure must PRESERVE it
+                  (the `or` keeps the first error, never clobbers it with None or
+                  a less-specific message).
+    """
+    mod = _load_a2a_module()
+    a2a = mod.a2a
+
+    # Always make interface enumeration fail.
+    def _raise_iface(*_a, **_k):
+        raise a2a.A2AError("simulated iface enumeration failure",
+                           code="iface_enum_failed")
+    a2a.local_interface_addresses = _raise_iface  # type: ignore[assignment]
+
+    if preexisting_warp_error == "warp":
+        # Force a prior warp_cli error: resolve_warp_cli returns None so the
+        # substrate sets error="warp-cli not found ..." BEFORE the iface path.
+        a2a.resolve_warp_cli = lambda: None  # type: ignore[assignment]
+    else:
+        # No prior error: warp_cli resolves and status reports connected.
+        a2a.resolve_warp_cli = lambda: "/usr/bin/warp-cli"  # type: ignore[assignment]
+        a2a._run_warp_cli = lambda *_a, **_k: "Status update: Connected"  # type: ignore[assignment]
+        a2a._warp_status_is_connected = lambda *_a, **_k: True  # type: ignore[assignment]
+
+    cfg = {"transport": {"kind": "cloudflare-warp-mesh"},
+           "listen": {"address": "100.96.0.5", "port": 8787}}
+    sub = mod._netstat_substrate(cfg, "100.96.0.5", a2a.TRANSPORT_CLOUDFLARE_WARP_MESH)
+    print(json.dumps(sub, ensure_ascii=False))
+    return 0
+
+
 def _load() -> dict:
     raw = sys.stdin.read()
     try:
@@ -141,6 +200,24 @@ def main(argv: list[str]) -> int:
     if cmd == "net-status-held":
         config, bind, port_s, timeout = rest[0], rest[1], rest[2], rest[3]
         return _net_status_held(config, bind, int(port_s), timeout)
+
+    if cmd == "substrate-iface-fail":
+        # rest[0] = "none" | "warp" (whether a prior warp_cli error exists)
+        return _substrate_iface_fail(rest[0] if rest else "none")
+
+    if cmd == "substrate-error-nonnull":
+        # Assert the stdin substrate JSON has a NON-None, non-empty error string,
+        # and (when an expected substring is given) that it is preserved.
+        sub = _load()
+        err = sub.get("error")
+        if err is None or err == "":
+            print(f"substrate.error is None/empty (expected a probe-failure string): {sub}")
+            return 1
+        if len(rest) >= 1 and rest[0] and rest[0] not in str(err):
+            print(f"substrate.error={err!r} does not preserve expected {rest[0]!r}")
+            return 1
+        print("ok")
+        return 0
 
     if cmd == "has-keys":
         doc = _load()

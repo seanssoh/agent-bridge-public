@@ -2525,7 +2525,11 @@ def _netstat_substrate(cfg: dict[str, Any], listen_addr: "str | None",
                     listen_addr, local_addrs)
         except a2a.A2AError as exc:
             sub["local_iface_addrs"] = None
-            sub.setdefault("error", f"{exc} ({exc.code})")
+            # `error` is pre-seeded to None, so setdefault would be a no-op and a
+            # real interface-enum failure would silently report error=None. Use
+            # `or` so a prior, more-specific error (e.g. a warp-cli failure) is
+            # preserved while an otherwise-None error records THIS failure.
+            sub["error"] = sub["error"] or f"{exc} ({exc.code})"
         return sub
     # tailscale (default) and legacy-none both probe Tailscale.
     sub["tailscale_up"] = None
