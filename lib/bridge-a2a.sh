@@ -267,6 +267,41 @@ bridge_a2a_status() {
   local exit_json
   exit_json="$(bridge_a2a_handoff_dir)/receiver-exit.json"
   [[ -f "$exit_json" ]] && echo "exit_cause    : $exit_json"
+
+  # #1685: surface the destination-side staleness self-heal state — whether a
+  # one-shot stale-code restart was attempted for the current upgrade and how it
+  # resolved. Read-only; a malformed/absent file is a quiet skip. The JSON read
+  # goes through the file-as-argv staleness helper `status` subcommand (footgun
+  # #11: NO heredoc-stdin to a subprocess), which prints a TSV `result<TAB>detail`
+  # line or nothing.
+  local staleness_file repo_root
+  staleness_file="$(bridge_a2a_handoff_dir)/receiver-staleness.json"
+  repo_root="$(bridge_a2a_repo_root)"
+  if [[ -f "$staleness_file" ]]; then
+    local _stale_row
+    _stale_row="$(python3 "$repo_root/lib/daemon-helpers/a2a-receiver-staleness.py" status "$staleness_file" 2>/dev/null || true)"
+    if [[ -n "$_stale_row" ]]; then
+      # Split the tab-delimited `result<TAB>detail` row with pure parameter
+      # expansion — NO here-string (footgun #11 / H3 heredoc-ban gate). The
+      # helper always emits a tab; if one is somehow absent, `%%` leaves the
+      # whole row as the result and `#*\t` (no match) makes detail empty rather
+      # than duplicating the row.
+      local _stale_result _stale_detail
+      _stale_result="${_stale_row%%$'\t'*}"
+      if [[ "$_stale_row" == *$'\t'* ]]; then
+        _stale_detail="${_stale_row#*$'\t'}"
+      else
+        _stale_detail=""
+      fi
+      printf 'staleness     : last self-heal=%s%s\n' \
+        "${_stale_result:-?}" \
+        "$( [[ -n "$_stale_detail" ]] && printf ' (%s)' "$_stale_detail" )"
+    fi
+    echo "staleness_file: $staleness_file"
+  fi
+  local boot_marker
+  boot_marker="$(bridge_a2a_handoff_dir)/receiver-boot.json"
+  [[ -f "$boot_marker" ]] && echo "boot_marker   : $boot_marker"
 }
 
 # Trigger + preview one receiver self-heal reconcile (P-self-heal-1, #1403).
