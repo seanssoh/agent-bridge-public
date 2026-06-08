@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+# scripts/smoke/1690-tasksdb-read-carveout.py — KEEP-invariant unit
+# layer for issue #1690 (queue tasks.db direct-READ over-block carve-out).
+#
+# Before #1690 both protected-path gates for state/tasks.db returned an
+# UNCONDITIONAL deny — the only protected path that omitted the
+# read_intent carve-out every sibling gate (roster, system-config) has.
+# A read of the DB *file* does not mutate the queue, so the fix mirrors
+# the roster gate shape: `if read_intent: return None`, deny otherwise.
+#
+# The whole point of the relaxation is fail-closed: the carve-out keys on
+# `_is_read_intent_bash`, which already classifies any output
+# redirection / write tool / unparseable command / sqlite3-mutate as
+# write-intent (read_intent=False). `sqlite3` is deliberately NOT on
+# `_READ_INTENT_BASH_COMMANDS`, so EVERY `sqlite3 …` (even a `-readonly`
+# SELECT) classifies write-intent and stays denied — fail-closed.
+#
+# This unit layer pins the classifier-level invariants that underpin the
+# carve-out. The end-to-end allow/deny verdict through the real
+# PreToolUse hook is asserted in the sibling 1690-tasksdb-read-carveout.sh
+# (Layer 2). Two layers because a classifier-only test gave false
+# confidence on the roster carve-out (#1014 codex r1 catch).
+
+import importlib.util
+import pathlib
+import sys
+
+
+def main() -> int:
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    policy_path = repo_root / "hooks" / "tool-policy.py"
+    spec = importlib.util.spec_from_file_location(
+        "tool_policy_tasksdb_read", policy_path
+    )
+    if spec is None or spec.loader is None:
+        print(f"[smoke] cannot load {policy_path}", file=sys.stderr)
+        return 2
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    is_read = module._is_read_intent_bash
+
+    db = "state/tasks.db"
+
+    # (command, expected read_intent). True => the carve-out's
+    # `if read_intent: return None` fires and the read is ALLOWED.
+    # False => stays DENIED (KEEP-invariant teeth).
+    cases: list[tuple[str, bool]] = [
+        # ---- read-intent of the DB file => ALLOWED after #1690 ----
+        (f"cat {db}", True),
+        (f"ls -l {db}", True),
+        (f"stat {db}", True),
+        (f"file {db}", True),
+        (f"head -c 64 {db}", True),
+        (f"xxd {db} | head", True),
+        (f"sha256sum {db}", True),
+        # ---- KEEP teeth: output redirection INTO / FROM a sink ----
+        (f"cat foo > {db}", False),          # clobber the DB
+        (f"cat foo >> {db}", False),         # append to the DB
+        (f"cat {db} > /tmp/leak", False),    # read redirected to a file sink
+        (f"cat {db} 1>/tmp/leak", False),    # numeric-fd sink
+        (f"cat {db} | tee /tmp/leak", False),  # tee sink stage (unknown leader)
+        # ---- KEEP teeth: sqlite3 stays write-intent (NOT unblocked) ----
+        # sqlite3 is intentionally absent from _READ_INTENT_BASH_COMMANDS,
+        # so a mutate AND even a -readonly SELECT both classify write-intent
+        # and stay denied. Fail-closed: we never let `sqlite3 db 'UPDATE'`
+        # become read-intent.
+        (f"sqlite3 {db} 'UPDATE tasks SET status=1'", False),
+        (f"sqlite3 {db} 'DELETE FROM tasks'", False),
+        (f"sqlite3 {db} 'INSERT INTO tasks VALUES (1)'", False),
+        (f"sqlite3 {db} '.dump' > /tmp/dump.sql", False),
+        (f"sqlite3 {db} '.backup /tmp/bk.db'", False),
+        (f"sqlite3 -readonly {db} 'SELECT id,status FROM tasks'", False),
+        (f"sqlite3 {db} '.schema'", False),
+        # ---- KEEP teeth: write tools / mutators ----
+        (f"rm {db}", False),
+        (f"truncate -s 0 {db}", False),
+        (f"dd if=/dev/zero of={db}", False),
+        # ---- KEEP teeth: awk in-program write/exec/pipe (issue #1690 ----
+        # codex direction-review). awk is on _READ_INTENT_BASH_COMMANDS but
+        # its program body can write/exfil with NO shell `>` token. These
+        # MUST classify write-intent; a plain awk read (below) stays True.
+        (f'awk \'{{print>"/tmp/leak"}}\' {db}', False),    # in-program file write
+        (f'awk \'{{print >> "/tmp/leak"}}\' {db}', False),  # in-program append
+        (f'awk \'{{print | "cmd"}}\' {db}', False),        # pipe to a command
+        (f'awk \'BEGIN{{system("cp {db} /tmp/copy")}}\' {db}', False),  # system()
+        (f'awk \'{{getline x < "cmd"}}\' {db}', False),    # getline from a source
+        (f"awk -i inplace '{{print}}' {db}", False),       # -i inplace flag
+        # plain awk reads stay read-intent (regression guard)
+        (f"awk '{{print $2}}' {db}", True),
+        (f"awk -F: '{{print $1}}' {db}", True),
+        # ---- KEEP teeth: other read-intent leaders with their OWN named- ----
+        # file output / external-exec primitive (#1690 codex re-review).
+        # sort -o, less -o, view -c 'w!', rg --pre, xxd infile outfile,
+        # xxd -r, yq -i all write/exfil WITHOUT a shell `>` token.
+        (f"sort -o /tmp/leak {db}", False),         # sort -o output file
+        (f"sort --output=/tmp/leak {db}", False),   # sort --output=
+        (f"sort -o/tmp/leak {db}", False),          # glued short flag
+        (f"less -o /tmp/leak {db}", False),         # less -o log file
+        (f"less --log-file=/tmp/leak {db}", False),  # less --log-file=
+        (f"xxd {db} /tmp/leak", False),             # xxd 2nd positional = output
+        (f"xxd {db} leak", False),                  # bare-name output in CWD
+        (f"xxd -r {db}", False),                    # xxd reverse/patch
+        (f"view -c 'w! /tmp/leak' -c 'qa!' {db}", False),  # ex :w write
+        (f"view +w! {db}", False),                  # +cmd ex write
+        (f"rg --pre sh . {db}", False),             # rg preprocessor RCE
+        (f"rg --pre=sh . {db}", False),             # rg --pre= glued
+        (f"yq -i . {db}", False),                   # yq in-place write
+        (f"yq eval -i . {db}", False),              # yq eval in-place write
+        # round-3 residuals: pager +cmd startup (less/more/view) + sort
+        # --compress-program RCE + quoted-token forms that the raw split
+        # exposes (the token keeps its surrounding quote).
+        (f"view '+w! /tmp/leak' {db}", False),      # ex :w via +cmd (quoted)
+        (f"less '+!cp {db} /tmp/leak' {db}", False),  # less +!shell
+        (f"less '+s /tmp/leak' {db}", False),       # less +s save-to-file
+        (f"more '+!cp {db} /tmp/leak' {db}", False),  # more +!shell
+        (f"sort --compress-program=sh {db}", False),  # sort RCE flag (glued)
+        (f"sort --compress-program sh {db}", False),  # sort RCE flag (sep)
+        (f'rg "--pre" sh . {db}', False),           # quoted --pre token
+        # round-4 residuals: awk program-from-file (unverifiable), yq
+        # split-exp write, and command-execution env prefixes that the
+        # leader check strips (LESSOPEN/PAGER/LD_PRELOAD/BASH_ENV/…).
+        (f"awk -f /tmp/evil.awk {db}", False),      # awk program from a file
+        (f"awk --file=/tmp/evil.awk {db}", False),  # awk --file= glued
+        (f"yq -s /tmp/leak . {db}", False),         # yq split-exp short
+        (f"yq --split-exp /tmp/leak . {db}", False),  # yq split-exp long
+        (f"PAGER=sh less {db}", False),             # PAGER env exec prefix
+        (f"LESSOPEN=|cmd less {db}", False),        # LESSOPEN preprocessor
+        (f"LD_PRELOAD=/tmp/x.so cat {db}", False),  # LD_PRELOAD injection
+        (f"BASH_ENV=/tmp/x cat {db}", False),       # BASH_ENV injection
+        # VIMINIT/EXINIT carry vim/ex startup commands (:write!/:!cmd) for
+        # the read-intent `view` leader (#1690 codex re-review round 6).
+        (f"VIMINIT=x view {db}", False),
+        (f"EXINIT=x view {db}", False),
+        # option/config-injection env vars for read leaders (#1690 round 7):
+        # the same write/exec primitive injected via env not argv.
+        (f"LESS=-o/tmp/log less {db}", False),               # less -o via LESS
+        (f"RIPGREP_CONFIG_PATH=/tmp/rg.rc rg needle {db}", False),  # rg --pre via cfg
+        (f"GREP_OPTIONS=--foo grep x {db}", False),          # grep option inject
+        (f"AWKPATH=/tmp awk '{{print}}' {db}", False),       # awk include path
+        (f"MORE=-foo more {db}", False),                     # more option inject
+        # benign env prefixes stay read-intent (regression guard)
+        (f"LC_ALL=C grep x {db}", True),
+        (f"TZ=UTC stat {db}", True),
+        # round-5 residual: adjacent-quote concatenation hides an awk
+        # `system`/`getline`/`close` marker from the raw substring scan
+        # (`'syst''em(...)'` reaches awk as system(...)). The quote-strip
+        # in _awk_is_read_only collapses the fragments. These MUST deny.
+        ("awk 'BEGIN{syst''em(\"id\")}' " + db, False),
+        ("awk 'BEGIN{sy''st''em(\"id\")}' " + db, False),  # triple-split
+        ("awk '{getl''ine x}' " + db, False),
+        ("awk '{cl''ose(\"x\")}' " + db, False),
+        # round-6 residual: shell embedding ($()/backtick/procsub) runs an
+        # arbitrary command BEFORE the visible read leader, so the whole
+        # command is not read-intent. _command_has_shell_embedding catches
+        # it. These MUST deny.
+        (f"cat {db} $(cp {db} sink)", False),       # command substitution
+        (f"cat $(cp {db} sink) {db}", False),       # cmd-subst leading arg
+        (f"cat `cp {db} sink` {db}", False),        # backtick substitution
+        (f"grep x {db} $(rm {db})", False),         # cmd-subst destructive
+        (f"cat <(cp {db} sink)", False),            # process substitution
+        (f"cat {db} <<< $(id)", False),             # here-string + subst
+        # benign forms of the same leaders stay read-intent
+        (f"sort -n {db}", True),
+        (f"less {db}", True),
+        (f"xxd {db}", True),
+        (f"xxd -s 0 -l 64 {db}", True),             # numeric flag values, lone input
+        (f"rg pattern {db}", True),
+        (f"view {db}", True),
+        (f"yq . {db}", True),
+        # ---- KEEP teeth: fail-closed on unparseable command ----
+        (f"cat {db} ' | tee /tmp/leak", False),  # unbalanced quote
+    ]
+
+    failures: list[str] = []
+    for cmd, want in cases:
+        got = bool(is_read(cmd))
+        if got != want:
+            tag = "read-mis-as-write" if want else "write-mis-as-read"
+            failures.append(
+                f"  FAIL  [{tag}] _is_read_intent_bash({cmd!r}) = {got}, want {want}"
+            )
+        else:
+            print(f"  PASS  _is_read_intent_bash({cmd!r}) = {got}")
+
+    # Belt-and-suspenders: sqlite3 must NOT be on the read-intent allowlist.
+    if "sqlite3" in module._READ_INTENT_BASH_COMMANDS:
+        failures.append(
+            "  FAIL  sqlite3 must NOT be on _READ_INTENT_BASH_COMMANDS "
+            "(a 'sqlite3 db UPDATE …' would wrongly become read-intent)"
+        )
+    else:
+        print("  PASS  sqlite3 absent from _READ_INTENT_BASH_COMMANDS")
+
+    if failures:
+        print(f"\n{len(failures)} failure(s):", file=sys.stderr)
+        for f in failures:
+            print(f, file=sys.stderr)
+        return 1
+    print(
+        f"\n[smoke:1690-tasksdb-read-carveout] all {len(cases)} cases passed"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

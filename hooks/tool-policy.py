@@ -743,6 +743,314 @@ def _find_is_read_only(stage_tokens: list[str]) -> bool:
     return True
 
 
+# Issue #1690 — `awk` program write/exec/pipe primitive filter.
+#
+# `awk` is on `_READ_INTENT_BASH_COMMANDS` because the common operator
+# diagnostic (`awk '{print $2}' <file>`, `awk -F: '{print $1}' <file>`)
+# is a pure read. But unlike `cat`/`grep`, awk has IN-PROGRAM write,
+# exec and pipe primitives that need NO shell `>` redirection token, so
+# the per-token output-redirect check in `_is_read_intent_bash` never
+# sees them (the whole awk program is a single quoted argv token whose
+# leading char is `{`/`'`, not `>`):
+#   awk '{print > "/tmp/leak"}'  <db>          # in-program file write
+#   awk '{print >> "/tmp/leak"}' <db>          # in-program file append
+#   awk '{print | "cmd"}'        <db>          # pipe to a command
+#   awk 'BEGIN{system("cp <db> /tmp/copy")}'   # spawn a subprocess
+#   awk '{getline x < "cmd"}'    <db>          # read from a command/file
+# Codex direction-review of #1690 demonstrated the first two as a real
+# tasks.db exfil that rode the new read-intent carve-out. The pre-existing
+# `awk -i inplace` flag check (in `_is_read_intent_bash`) only covers the
+# in-place flag, not these program-body primitives.
+#
+# Conservative posture: scan the awk PROGRAM text (every argv token after
+# the leader, minus flags) for any of the write/exec/pipe primitives. A
+# plain `print` / `printf` to stdout (no `>`/`|`) stays read-intent; the
+# moment a `>` / `>>` / `|` / `system` / `getline` / `close` / `fflush`
+# appears in the program the whole stage drops to write-intent. We do NOT
+# attempt to parse awk semantics — fail-closed on any of these markers.
+_AWK_PROGRAM_WRITE_MARKERS = (
+    ">",       # print/printf to a file (also catches >>)
+    "|",       # pipe to a command (print | "cmd", "cmd" | getline)
+    "system",  # awk system() spawns a subprocess
+    "getline", # getline < file / cmd | getline reads an external source
+    "close",   # close() flushes a write/pipe target
+    "fflush",  # fflush() flushes a write/pipe target
+)
+
+
+def _awk_is_read_only(stage_tokens: list[str]) -> bool:
+    """Return True iff an `awk` invocation has no in-program write/exec/pipe.
+
+    *stage_tokens* is the whitespace-split argv of a single pipeline
+    stage whose leader is `awk` (or a pathy equivalent). The program text
+    (all tokens after the leader) is scanned for the markers in
+    :data:`_AWK_PROGRAM_WRITE_MARKERS`; any hit returns False so the
+    caller drops the read-intent classification. Fail-closed: we do not
+    parse awk grammar, so a `>` / `|` / `system` / `getline` anywhere in
+    the program — even inside a string the parser would treat as data —
+    conservatively flips the stage to write-intent. The benign diagnostic
+    shapes (`awk '{print $2}' <db>`, `awk -F: '{print $1}' <db>`) contain
+    none of these markers and stay read-intent.
+    """
+    args = stage_tokens[1:]
+    # `awk -f FILE` / `awk --file FILE` / `awk --source ...` load the awk
+    # PROGRAM from an external file (or a second --source) we cannot
+    # inspect for the write/exec primitives below — fail-closed: an awk
+    # whose program is not the inline argv is treated as write-intent
+    # (issue #1690 codex re-review round 4: `awk -f /tmp/evil.awk <db>`).
+    for tok in args:
+        if tok in ("-f", "--file", "--source", "-e"):
+            return False
+        if tok.startswith("--file=") or tok.startswith("--source="):
+            return False
+        # GNU awk glued short form `-f/path`.
+        if tok.startswith("-f") and len(tok) > 2:
+            return False
+    program = " ".join(args)  # inline program text only
+    # Strip quote characters before the marker scan: bash concatenates
+    # adjacent quoted fragments before awk sees the program, so a split
+    # like `'syst''em(...)'` reaches awk as `system(...)` but the raw
+    # token still carries the embedded quotes and would hide the `system`
+    # substring (issue #1690 codex re-review round 5). Removing `'` and `"`
+    # collapses the fragments so the marker scan sees the effective program.
+    program = program.replace("'", "").replace('"', "")
+    return not any(marker in program for marker in _AWK_PROGRAM_WRITE_MARKERS)
+
+
+# Issue #1690 (codex direction-review rounds 2-3) — per-command output/
+# exec flag filter. Several leaders on `_READ_INTENT_BASH_COMMANDS` look
+# like pure readers but ship their OWN named-file output, in-place edit,
+# external-command, or pager-startup-command primitive that needs no
+# shell `>` redirection token, so the leader-only check + the per-token
+# `>` check both miss them. Codex re-review found these riding the
+# tasks.db read-intent carve-out as exfil / RCE:
+#   sort -o /tmp/leak <db>                # -o / --output writes to a file
+#   sort --compress-program='sh -c …'     # runs an external program (RCE)
+#   xxd <db> /tmp/leak                     # 2nd positional = output; -r patches
+#   less -o /tmp/leak <db>                 # -o / --log-file logs to a file
+#   less '+!cp <db> sink' <db>             # +cmd pager startup runs a shell cmd
+#   more '+!cp <db> sink' <db>             # same +cmd pager-startup exec
+#   view -c 'w! /tmp/leak' <db>            # ex `:w` write via -c
+#   view '+w! /tmp/leak' <db>              # ex `:w` write via +cmd
+#   rg --pre 'sh -c "cp <db> sink"'        # --pre runs an arbitrary preproc
+#
+# Each is handled with the narrowest rule that still fails closed; benign
+# diagnostic reads (`sort <db>`, `xxd <db>`, `less <db>`, `rg pat <db>`,
+# `view <db>`) carry none of these and stay read-intent. The pagers
+# (`less`/`more`/`view`) reject ANY `+cmd` startup token, since `+cmd`
+# only exists to run a pager/ex command (search/save/shell), never a
+# benign file read.
+_SORT_OUTPUT_FLAGS = ("-o", "--output")
+# sort's external-program flag (RCE) — exact match or `--flag=value` glued.
+_SORT_EXEC_FLAGS = ("--compress-program",)
+_LESS_OUTPUT_FLAGS = ("-o", "-O", "--log-file", "--LOG-FILE")
+# vim/view command + write + script flags that can run an ex `:w`/`:!`.
+_VIEW_EXEC_FLAGS = ("-c", "--cmd", "-w", "-W", "-s", "-S")
+# Pager leaders whose `+cmd` startup argument runs a pager/ex command
+# (search / save-to-file / shell-out / pipe) — never a benign file read.
+_PAGER_PLUS_CMD_LEADERS = frozenset({"less", "more", "view"})
+
+
+def _strip_token_quotes(token: str) -> str:
+    """Strip a single layer of surrounding matched quotes from a raw argv
+    token. `_is_read_intent_bash` operates on whitespace-split tokens with
+    quotes NOT removed (no shlex), so `'+w!'` arrives as the literal
+    `'+w!'`; the leading quote would hide a `+cmd`/flag prefix check. Only
+    strips when both ends match (`'…'` or `"…"`); leaves unbalanced or
+    quote-free tokens unchanged."""
+    if len(token) >= 2 and token[0] in ("'", '"') and token[-1] == token[0]:
+        return token[1:-1]
+    # Leading-only quote (the arg's closing quote is a separate token after
+    # a space, e.g. `'+w!` + `/tmp/leak'`): strip just the leading quote so
+    # the `+`/flag prefix is still detected.
+    if token[:1] in ("'", '"'):
+        return token[1:]
+    return token
+
+
+def _flag_or_valued(token: str, flags: tuple[str, ...]) -> bool:
+    """True if *token* is one of *flags*, or a `--flag=value` / `-oVALUE`
+    glued form of one of them. Quote-stripped so `'-o'` / `"--output=x"`
+    are recognised."""
+    token = _strip_token_quotes(token)
+    for flag in flags:
+        if token == flag:
+            return True
+        if flag.startswith("--") and token.startswith(flag + "="):
+            return True
+        # short-flag glued value: `-o/tmp/leak` for `-o`.
+        if not flag.startswith("--") and len(flag) == 2 and token.startswith(flag) and len(token) > 2:
+            return True
+    return False
+
+
+def _named_read_leader_is_read_only(leaf: str, stage_tokens: list[str]) -> bool:
+    """Return False iff a read-intent leader carries its own named-file
+    output flag, in-place/external-exec flag, pager `+cmd` startup, or
+    output-file positional that would write/exfil/RCE without a shell `>`
+    token. Returns True (read-only) for leaders this filter does not
+    constrain or for benign invocations.
+    """
+    args = stage_tokens[1:]
+    # Pager `+cmd` startup (less/more/view) runs a pager/ex command —
+    # search, save-to-file (`+s file` / `+w! file`), shell-out (`+!cmd`),
+    # or pipe. Quote-stripped so `'+w! …'` is caught. Never a benign read.
+    if leaf in _PAGER_PLUS_CMD_LEADERS:
+        if any(_strip_token_quotes(t).startswith("+") for t in args):
+            return False
+    if leaf == "sort":
+        if any(_flag_or_valued(t, _SORT_OUTPUT_FLAGS) for t in args):
+            return False
+        # --compress-program / --compress-program=CMD runs an external
+        # program; treat the flag (and its glued/separate value) as exec.
+        return not any(_flag_or_valued(t, _SORT_EXEC_FLAGS) for t in args)
+    if leaf == "less":
+        return not any(_flag_or_valued(t, _LESS_OUTPUT_FLAGS) for t in args)
+    if leaf == "more":
+        # `more` has no named-output flag of its own beyond the +cmd
+        # startup handled above; nothing more to constrain.
+        return True
+    if leaf == "view":
+        # `view` is the read-only vi, but -c/--cmd/-w/-W/-s/-S (and the
+        # +cmd handled above) can run an ex `:w`/`:!`.
+        return not any(_flag_or_valued(t, _VIEW_EXEC_FLAGS) for t in args)
+    if leaf == "rg":
+        # `--pre` / `--pre=CMD` runs an arbitrary preprocessor (RCE/exfil).
+        return not any(
+            _strip_token_quotes(t) == "--pre"
+            or _strip_token_quotes(t).startswith("--pre=")
+            for t in args
+        )
+    if leaf == "xxd":
+        # xxd writes its dump to a SECOND positional file arg
+        # (`xxd infile outfile`) — even a bare relative name in CWD — and
+        # `-r`/`-revert` patches binary back. Fail-closed: reject `-r`, and
+        # reject 2+ positionals (input + output). We skip the VALUES of
+        # xxd's valued flags (`-s`/`-l`/`-c`/`-g`/`-o` and their `-R`
+        # when/never form) so a numeric flag value is not mistaken for the
+        # output positional; everything else after the flags is a file
+        # positional and a second one is the write target.
+        xxd_valued = {"-s", "-l", "-c", "-g", "-o", "-R"}
+        positionals = []
+        skip_next = False
+        for tok in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok in ("-r", "-revert"):
+                return False
+            if tok in xxd_valued:
+                skip_next = True  # the following token is this flag's value
+                continue
+            if tok.startswith("-"):
+                continue  # other (glued or no-value) flag
+            positionals.append(tok)
+        if len(positionals) >= 2:
+            return False
+        return True
+    return True
+
+
+# Issue #1690 round 4 — `yq` write-surface filter. yq is on the read-
+# intent set for `yq '.x' <file>` style queries, but it has write flags:
+#   -i / --inplace        edit the source file in place (mutation)
+#   -s / --split-exp EXPR  write output to one or more named files (exfil)
+# Reject any of those (and their glued forms) so a yq mutation/exfil
+# cannot ride the tasks.db read-intent carve-out. mikefarah-yq and
+# kislyuk-yq differ in spelling; we reject the union, fail-closed.
+_YQ_WRITE_FLAGS = ("-i", "--inplace", "-s", "--split-exp")
+
+
+def _yq_is_read_only(stage_tokens: list[str]) -> bool:
+    for tok in stage_tokens[1:]:
+        t = _strip_token_quotes(tok)
+        if t in _YQ_WRITE_FLAGS:
+            return False
+        # glued short `-i…` and `--split-exp=EXPR`.
+        if t.startswith("-i") and not t.startswith("--"):
+            return False
+        if t.startswith("--split-exp="):
+            return False
+    return True
+
+
+# Issue #1690 round 4 — environment-prefix command-execution guard.
+# `_stage_first_token` strips leading `VAR=value` assignments so e.g.
+# `LC_ALL=C grep …` classifies as `grep`. But some env vars are
+# COMMAND-EXECUTION / preprocessor hooks: setting them turns an otherwise
+# read-only leader into an exec surface with NO shell `>` token. Codex
+# re-review round 4 demonstrated `LESSOPEN='|cmd %s' less <db>` (and
+# `PAGER=cmd`) exfil via the env prefix. Any read-intent stage that
+# carries one of these assignments is treated as write-intent.
+_DANGEROUS_ENV_PREFIXES = frozenset(
+    {
+        "LESSOPEN",
+        "LESSCLOSE",
+        "LESSPIPE",
+        "PAGER",
+        "GIT_PAGER",
+        "MANPAGER",
+        "BASH_ENV",
+        "ENV",
+        "SHELL",
+        "IFS",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "PYTHONSTARTUP",
+        "PERL5OPT",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_SSH_COMMAND",
+        "PROMPT_COMMAND",
+        # vim/ex (`view` is on the read-intent set) read startup commands
+        # from these env vars; they can run `:write!`/`:!cmd` (issue #1690
+        # codex re-review round 6: `VIMINIT='…write! sink…' view <db>`).
+        "VIMINIT",
+        "EXINIT",
+        # Option / config-file injection env vars for read-intent leaders.
+        # These inject argv-equivalent options (or a config file that can
+        # set an exec/output option) WITHOUT appearing on argv, so the
+        # per-leader flag guards (`less -o`, `rg --pre`, …) never see them
+        # (issue #1690 codex re-review round 7):
+        #   LESS=-o/file              # inject less's -o log-file output
+        #   RIPGREP_CONFIG_PATH=cfg   # rg config file can set --pre (RCE)
+        #   GREP_OPTIONS=…            # inject grep options
+        #   AWKPATH=… / AWKLIBPATH    # awk include / shared-lib search path
+        #   MORE=…                    # inject more options
+        "LESS",
+        "MORE",
+        "RIPGREP_CONFIG_PATH",
+        "GREP_OPTIONS",
+        "GREP_COLORS",
+        "AWKPATH",
+        "AWKLIBPATH",
+    }
+)
+
+
+def _stage_has_dangerous_env_prefix(stage: str) -> bool:
+    """True if a pipeline stage's leading `VAR=value` assignments include a
+    command-execution / preprocessor env var (LESSOPEN, PAGER, LD_PRELOAD,
+    …). These are stripped by `_stage_first_token` so the leader still
+    looks read-only; setting them is an exec surface — fail-closed."""
+    for token in stage.strip().split():
+        if not token:
+            continue
+        if token == "env":
+            continue
+        # A `VAR=value` assignment prefix (same shape `_stage_first_token`
+        # skips). Stop at the first non-assignment token — that is the
+        # command leader and anything after it is argv, not an env prefix.
+        if "=" in token and not token.startswith("-") and "/" not in token.split("=", 1)[0]:
+            var = token.split("=", 1)[0]
+            if var in _DANGEROUS_ENV_PREFIXES:
+                return True
+            continue
+        break
+    return False
+
+
 def _is_read_intent_bash(command: str) -> bool:
     """Return True iff *command* is purely read-intent.
 
@@ -765,8 +1073,20 @@ def _is_read_intent_bash(command: str) -> bool:
     - A single write-intent or unknown leading command anywhere in the
       pipeline disqualifies the whole thing. The bar is "this command
       provably does not mutate state".
+    - Shell embeddings (``$(...)``, backticks, ``<(...)``, ``>(...)``,
+      heredoc/here-string) make the command not read-intent: an embedded
+      subshell runs an arbitrary command *before* the visible read tool,
+      so ``cat <db> $(cp <db> sink)`` exfils despite the read leader
+      (issue #1690 codex re-review round 6). Mirrors the peer-agent gate,
+      which already refuses its carve-out on the same embeddings.
     """
     if not command.strip():
+        return False
+    # Issue #1690 round 6: refuse read-intent on any shell embedding. A
+    # `$(...)` / backtick / process-substitution body runs an arbitrary
+    # command the per-stage leader check never sees, so a visible read
+    # leader cannot vouch for the whole command. Fail-closed.
+    if _command_has_shell_embedding(command):
         return False
     # Strip stderr-suppression / fd-dup tokens before splitting on shell
     # operators. `_COMMAND_OPERATOR_RE` would otherwise tear `2>&1` and
@@ -792,6 +1112,13 @@ def _is_read_intent_bash(command: str) -> bool:
         stage_stripped = stage.strip()
         if not stage_stripped:
             continue
+        # Issue #1690 round 4: a `VAR=value` prefix that sets a command-
+        # execution / preprocessor env var (LESSOPEN, PAGER, LD_PRELOAD, …)
+        # turns an otherwise read-only leader into an exec surface. The
+        # leader check below never sees it because `_stage_first_token`
+        # strips the assignment. Reject the whole pipeline (fail-closed).
+        if _stage_has_dangerous_env_prefix(stage_stripped):
+            return False
         # Reject output-redirection anywhere in the stage. Input redir
         # (`<file`) is fine; write redir (`>`, `>>`, `&>`, `2>`) is not.
         # Stderr-suppression forms (`2>/dev/null`, `2>&1`, `&>/dev/null`)
@@ -829,6 +1156,23 @@ def _is_read_intent_bash(command: str) -> bool:
                 return False
             if leaf == "awk" and "-i" in stage_tokens[1:]:
                 return False
+            # Issue #1690 rounds 2-4: `yq` has write surfaces beyond `-i`.
+            # `-i` / `--inplace` edits the file IN PLACE (like `sed -i`);
+            # `-s` / `--split-exp` writes output to one or more named files
+            # (codex re-review round 4). Reject all of them so a `yq -i …`
+            # mutation or `yq -s /tmp/leak …` exfil cannot ride the read-
+            # intent carve-out (fail-closed; union across yq variants).
+            if leaf == "yq" and not _yq_is_read_only(stage_tokens):
+                return False
+            # Issue #1690: awk has in-program write/exec/pipe primitives
+            # (`print > "f"`, `print | "cmd"`, `system()`, `getline < cmd`)
+            # that need no shell `>` token, so the per-token redirect check
+            # above never sees them. Codex direction-review demonstrated
+            # `awk '{print>"/tmp/leak"}' <db>` as a real tasks.db exfil that
+            # rode the read-intent carve-out. Drop read-intent on any of
+            # those program-body markers (fail-closed).
+            if leaf == "awk" and not _awk_is_read_only(stage_tokens):
+                return False
             # `find` is whitelisted for diagnostics (`find <roster>
             # -name "*.sh"`), but it has mutation/exec primitives
             # (`-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`,
@@ -838,6 +1182,14 @@ def _is_read_intent_bash(command: str) -> bool:
             # -delete` or `find <roster> -exec python3
             # /tmp/mutator.py {} \;` through the roster carve-out.
             if leaf == "find" and not _find_is_read_only(stage_tokens):
+                return False
+            # Issue #1690 round 2: other read-intent leaders (sort -o,
+            # less -o, view -c 'w!', rg --pre, xxd infile outfile, xxd -r)
+            # carry their own named-file output / external-exec primitive
+            # that needs no shell `>` token. Codex re-review found them
+            # riding the tasks.db carve-out as exfil/RCE. Drop read-intent
+            # on any such form (fail-closed); benign reads keep it.
+            if not _named_read_leader_is_read_only(leaf, stage_tokens):
                 return False
             continue
         # `agent-bridge config get …` / `agb config get …` are read-intent.
@@ -1037,18 +1389,27 @@ def protected_path_reason(
     # Issue #383: read-intent calls (Read tool, cat/grep/etc., `agent-
     # bridge config get`) bypass the protected-path block-all branch.
     # #341's audit chain is about WRITES; reads do not mutate state and
-    # should not be denied regardless of agent identity. The queue DB
-    # is the one exception — its block message points at `agb` queue
-    # commands (the structured-read surface) rather than raw sqlite, so
-    # we keep blocking direct reads of the DB to preserve the queue
-    # contract.
+    # should not be denied regardless of agent identity.
     if path == roster_local_path():
         if read_intent:
             return None
         if admin:
             return ROSTER_LOCAL_DENY_REASON
         return "shared roster secrets are not available inside Claude tool calls"
+    # Issue #1690: the queue DB block is a WRITE contract — a read of the
+    # DB file (Read tool / cat / ls / stat / file) does not mutate the
+    # queue, so it must honor read_intent exactly like the roster /
+    # system-config gates above and below. Writes (Edit / Write /
+    # NotebookEdit and every other non-read-intent tool) still hit the
+    # unconditional deny: the `agb` queue commands remain the only
+    # sanctioned mutation surface. No admin bypass here — the carve-out is
+    # read-intent for every agent, not an admin escalation (admin parity is
+    # tracked separately in #1692). sqlite3 stays denied because it is not
+    # on `_READ_INTENT_BASH_COMMANDS`, so a `sqlite3 db 'UPDATE …'` never
+    # classifies as read-intent and never reaches this `return None`.
     if path == task_db_path():
+        if read_intent:
+            return None
         return "direct queue DB access is blocked; use `agb` queue commands instead"
     # Issue #341: remaining system-config paths must flow through the
     # wrapper for writes. Read-intent is allowed for all agents — the
@@ -3421,10 +3782,12 @@ def protected_alias_reason(
     # Issue #383: classify the whole pipeline once. Read-intent (cat /
     # grep / head / tail / `agent-bridge config get` / etc.) bypasses
     # the roster + system-config gates; #341's audit chain only
-    # protects WRITES, so a read should never be denied. The queue DB
-    # gate stays unconditional — `agb` queue commands are the
-    # structured-read surface and direct sqlite reads still bypass that
-    # contract.
+    # protects WRITES, so a read should never be denied. Issue #1690:
+    # the queue DB argv gate also honors read_intent now — a read of the
+    # DB file does not mutate the queue. Any output redirection / write
+    # tool / `sqlite3 … 'UPDATE …'` flips read_intent off (sqlite3 is not
+    # on `_READ_INTENT_BASH_COMMANDS`) and stays denied; `agb` queue
+    # commands remain the only sanctioned mutation surface.
     # Classify read-intent once, up front: the admin-credential-read
     # carve-out below needs the same classification the protected-path
     # gate uses, and there's no benefit to recomputing it after each
@@ -3573,6 +3936,17 @@ def protected_alias_reason(
             return ROSTER_LOCAL_DENY_REASON
         return "shared roster secrets are not available inside Claude tool calls"
     if _bash_argv_references_path(text, task_db_path()):
+        # Issue #1690: mirror the roster gate above — a read-only argv
+        # reference to the DB file (`cat`/`ls -l`/`stat`/`file` $db) is a
+        # read, not a queue mutation, so honor the read_intent
+        # classification. `read_intent` is False for any write tool,
+        # output redirection into a file sink (`> $db`, `>> $db`, numeric
+        # fd, `cmd > sink`), an unbalanced/unparseable command, or a
+        # `sqlite3 … 'UPDATE …'` (sqlite3 is deliberately NOT on
+        # `_READ_INTENT_BASH_COMMANDS`), so all of those still hit the
+        # unconditional deny below. Fail-closed on uncertainty.
+        if read_intent:
+            return None
         return "direct queue DB access is blocked; use `agb` queue commands instead"
     # Issue #341: system-config paths get the same argv-based check; the
     # wrapper command is the only normal mutation surface for writes.
