@@ -90,7 +90,7 @@ def cmd_warp_changed(repo_root: str, cfg_path: str) -> int:
     reconcile = _load_reconcile(repo_root)
     a2a = _load_a2a(repo_root)
 
-    iface = os.environ.get("BRIDGE_A2A_IFACE_ADDRS", "")
+    iface = os.environ.get("BRIDGE_A2A_IFACE_ADDRS", "")  # noqa: iso-helper-boundary
     cfg = a2a.load_config()
     before = _read_listen_addr(cfg_path)
     res = reconcile.stable_local_addr("cloudflare-warp-mesh", cfg)
@@ -172,7 +172,7 @@ def cmd_ts_changed(repo_root: str, cfg_path: str) -> int:
     cfg = a2a.load_config()
     # The expected tailscale IP comes from the mock `tailscale ip` (first IPv4).
     expected = a2a.tailscale_stable_addr()
-    iface = os.environ.get("BRIDGE_A2A_IFACE_ADDRS", "")
+    iface = os.environ.get("BRIDGE_A2A_IFACE_ADDRS", "")  # noqa: iso-helper-boundary
     res = reconcile.stable_local_addr("tailscale", cfg)
     if res.status != reconcile.RESULT_CHANGED:
         sys.stderr.write(f"FAIL ts-changed: status {res.status} ({res.detail})\n")
@@ -223,7 +223,7 @@ def cmd_isolation(repo_root: str, cfg_path: str) -> int:
     """
     reconcile = _load_reconcile(repo_root)
     a2a = _load_a2a(repo_root)
-    sentinel = os.environ.get("L1_TS_SENTINEL", "")
+    sentinel = os.environ.get("L1_TS_SENTINEL", "")  # noqa: iso-helper-boundary
     cfg = a2a.load_config()
     res = reconcile.stable_local_addr("cloudflare-warp-mesh", cfg)
     if res.status not in (reconcile.RESULT_CONVERGED, reconcile.RESULT_CHANGED):
@@ -255,7 +255,7 @@ def cmd_malformed(repo_root: str, cfg_path: str) -> int:
     """
     reconcile = _load_reconcile(repo_root)
     a2a = _load_a2a(repo_root)
-    sentinel = os.environ.get("L1_TS_SENTINEL", "")
+    sentinel = os.environ.get("L1_TS_SENTINEL", "")  # noqa: iso-helper-boundary
     cfg = a2a.load_config()
     before = _read_listen_addr(cfg_path)
     # Mimic the orchestrator's guessed fallback arg after transport_kind raised.
