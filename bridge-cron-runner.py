@@ -1066,6 +1066,24 @@ def normalize_summary_short(
 
 def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
     result = normalize_result(payload)
+
+    # #1677 — an ABSENT `summary_short` key on a non-silent intent must take the
+    # same derive-from-summary path as a null/empty value, NOT fail the
+    # required-fields check below (which lists `summary_short`) and fall through
+    # to the whole-payload error envelope. The child (an LLM) omits the key with
+    # the same nondeterminism that produces null. We only seed it when `summary`
+    # is a non-empty string so this stays a no-op for a genuinely empty result —
+    # the empty-`summary` fatal and the missing-`summary` fatal both still fire
+    # below. We deliberately do NOT seed the other required-but-nullable keys
+    # (`forward_target`, `channel_relay`): their absence stays fatal (scope fence).
+    if (
+        "summary_short" not in result
+        and str(result.get("delivery_intent") or "").strip() != "silent"
+        and isinstance(result.get("summary"), str)
+        and result["summary"].strip()
+    ):
+        result["summary_short"] = None
+
     missing = [key for key in RESULT_SCHEMA["required"] if key not in result]
     if missing:
         raise ValueError(f"result missing required fields: {', '.join(missing)}")
