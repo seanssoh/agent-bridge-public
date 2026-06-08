@@ -117,7 +117,7 @@ Acceptable: prep VERSION + CHANGELOG drafts, run codex-rescue review on a releas
 
 Agent Bridge runs an **LTS line + mainline**, not a single moving tag. Full policy: [`docs/release-lines.md`](./docs/release-lines.md). Headlines (operator-decided 2026-06-08 with the v0.16.2 LTS cut):
 
-- **Current LTS: v0.16.2** (declared 2026-06-08). An LTS is a blessed stable tag (release title `(LTS)` + README marker) that conservative/production installs pin to.
+- **Every v0.16.x release is an LTS release.** The current LTS-line head is **v0.16.4** (2026-06-09); v0.16.2 was the first declared LTS (2026-06-08) — both designations stand; a new patch supersedes the prior as line head without revoking its LTS status. An LTS is a blessed stable tag (release title `(LTS)` + README marker) that conservative/production installs pin to.
 - **One line until features diverge.** Until the first new *feature* lands there is a single line (`main`); the v0.16.x **hardening** sequence (v0.16.3, …) rides `main` and *is* the LTS line. Do **not** fork a maintenance branch prematurely.
 - **Fork trigger** = the first real new feature: branch `release/0.16-lts` from the latest `v0.16.x` tag, bump `main` to `v0.17.0-beta`. New features → **beta first** (existing rule), never onto the LTS line.
 - **Support window**: an LTS gets fixes **until the next LTS is declared**.
