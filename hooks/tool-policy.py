@@ -775,30 +775,152 @@ def _find_is_read_only(stage_tokens: list[str]) -> bool:
 # appears in the program the whole stage drops to write-intent. We do NOT
 # attempt to parse awk semantics — fail-closed on any of these markers.
 _AWK_PROGRAM_WRITE_MARKERS = (
-    ">",       # print/printf to a file (also catches >>)
-    "|",       # pipe to a command (print | "cmd", "cmd" | getline)
-    "system",  # awk system() spawns a subprocess
-    "getline", # getline < file / cmd | getline reads an external source
-    "close",   # close() flushes a write/pipe target
-    "fflush",  # fflush() flushes a write/pipe target
+    ">",        # print/printf to a file (also catches >>)
+    "|",        # pipe to a command (print | "cmd", "cmd" | getline)
+    "system",   # awk system() spawns a subprocess
+    "getline",  # getline < file / cmd | getline reads an external source
+    "close",    # close() flushes a write/pipe target
+    "fflush",   # fflush() flushes a write/pipe target
+    # gawk `@include "file"` / `@load "ext"` directives load external
+    # program / shared-extension code that can carry a system()/print>file.
+    # The flag-position `@include`/`@load` is already fail-closed in the
+    # allowlist loop, but a leading space/comment/newline makes the
+    # directive part of the INLINE program word (`awk ' @include "evil"'
+    # <db>`), so it must also be a program marker (issue #1690 r3 codex).
+    "@include",
+    "@load",
 )
+
+
+def _shell_words_with_expansion(text: str) -> list[tuple[str, bool]]:
+    """Split *text* into shell words, returning ``(value, shell_expanded)``
+    per word.
+
+    *value* approximates the post-quote-removal word (like
+    :func:`shlex.split`). *shell_expanded* is True when the word contains a
+    ``$``-parameter/command expansion or a backtick OUTSIDE single quotes —
+    i.e. the shell would rewrite the word before the command sees it, so
+    its real content is unknown to us. Single-quoted ``$`` (an awk field
+    ref like ``$1``/``$NF`` in ``'{print $1}'``) is NOT flagged; a double-
+    quoted or unquoted ``$VAR`` / ``$(...)`` / `` `...` `` IS.
+
+    This lets a caller scope the "content is hidden by the shell" check to
+    a SPECIFIC word (e.g. the awk PROGRAM word) rather than the whole
+    command, so a benign expansion in a DATA-FILE path (`awk '{print $1}'
+    $HOME/data`) does not over-block the read (issue #1690 r3).
+
+    Raises ``ValueError`` on an unterminated quote (caller fails closed).
+    """
+    words: list[tuple[str, bool]] = []
+    cur: list[str] = []
+    cur_expanded = False
+    in_word = False
+    in_sq = False
+    in_dq = False
+    i = 0
+    n = len(text)
+
+    def flush() -> None:
+        nonlocal cur, cur_expanded, in_word
+        if in_word:
+            words.append(("".join(cur), cur_expanded))
+        cur = []
+        cur_expanded = False
+        in_word = False
+
+    while i < n:
+        c = text[i]
+        if in_sq:
+            in_word = True
+            if c == "'":
+                in_sq = False
+            else:
+                cur.append(c)
+        elif in_dq:
+            in_word = True
+            if c == "\\" and i + 1 < n:
+                cur.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_dq = False
+            elif c in ("$", "`"):
+                cur_expanded = True
+                cur.append(c)
+            else:
+                cur.append(c)
+        else:
+            if c == "'":
+                in_sq = True
+                in_word = True
+            elif c == '"':
+                in_dq = True
+                in_word = True
+            elif c == "\\" and i + 1 < n:
+                cur.append(text[i + 1])
+                in_word = True
+                i += 2
+                continue
+            elif c.isspace():
+                flush()
+            elif c in ("$", "`"):
+                cur_expanded = True
+                cur.append(c)
+                in_word = True
+            else:
+                cur.append(c)
+                in_word = True
+        i += 1
+    if in_sq or in_dq:
+        raise ValueError("unterminated quote")
+    flush()
+    return words
 
 
 def _awk_is_read_only(stage_tokens: list[str]) -> bool:
     """Return True iff an `awk` invocation has no in-program write/exec/pipe.
 
     *stage_tokens* is the whitespace-split argv of a single pipeline
-    stage whose leader is `awk` (or a pathy equivalent). The program text
-    (all tokens after the leader) is scanned for the markers in
-    :data:`_AWK_PROGRAM_WRITE_MARKERS`; any hit returns False so the
-    caller drops the read-intent classification. Fail-closed: we do not
-    parse awk grammar, so a `>` / `|` / `system` / `getline` anywhere in
-    the program — even inside a string the parser would treat as data —
-    conservatively flips the stage to write-intent. The benign diagnostic
-    shapes (`awk '{print $2}' <db>`, `awk -F: '{print $1}' <db>`) contain
-    none of these markers and stay read-intent.
+    stage whose leader is `awk` (or a pathy equivalent). Two stages:
+
+    1. Flag allowlist: every flag must be a known benign POSIX/gawk flag
+       that takes no file and carries no exec/write surface. Any
+       program/extension loader, file-write flag, `-W` meta-flag, or
+       unknown flag fails closed.
+    2. Program marker scan: ONLY the awk PROGRAM word (the first non-flag
+       positional) is scanned for the write/exec/pipe markers in
+       :data:`_AWK_PROGRAM_WRITE_MARKERS`. The real exfil primitives
+       (`print > "f"`, `print | "cmd"`, `system()`, `getline`, `close`,
+       `fflush`) all live INSIDE that one shell word, so scanning only it
+       preserves security while avoiding the false-positive that scanning
+       *all* args caused (issue #1690 r3): a marker in a `-F`/`-v` flag
+       VALUE (`awk -F '|' …`) or in an INPUT-FILE-PATH positional
+       (`awk '{print $1}' lib/system_config_paths.py` — "system") wrongly
+       denied legitimate reads #1690 was meant to unblock.
+
+    Tokenisation uses `shlex` so the awk PROGRAM is recovered as the single
+    shell word awk itself receives (`awk '{print | "cmd"}' <db>` → program
+    word `{print | "cmd"}`), even when it contains whitespace. Whitespace-
+    split tokens cannot do this — `'{print` / `|` / `"cmd"}'` would split
+    the `|` marker away from the program word and miss it. Fail-closed on a
+    shlex parse failure (unbalanced quotes) and within the program word: we
+    do not parse awk grammar, so a marker anywhere in the program — even
+    inside a string the parser would treat as data — flips to write-intent.
     """
-    args = stage_tokens[1:]
+    # Re-tokenise so the program is one shell word (awk's own argv shape),
+    # not whitespace fragments. `_shell_words_with_expansion` also reports,
+    # per word, whether the shell EXPANDED it (a `$VAR`/`$(…)`/backtick
+    # outside single quotes), so we can fail closed when the awk PROGRAM
+    # word's real content is hidden by an expansion — e.g.
+    # `p='BEGIN{system("id")}'; awk "$p" <db>` (issue #1690 r3). Rejoining
+    # the already-split tokens with single spaces is faithful: shell word
+    # boundaries are preserved by the quotes, and collapsing internal
+    # whitespace runs does not change the substring-marker result.
+    try:
+        words = _shell_words_with_expansion(" ".join(stage_tokens))
+    except ValueError:
+        return False  # unbalanced quote → un-parseable → fail-closed
+    args = words[1:]  # skip the leading 'awk' (value, expanded) pairs
     # Issue #1690 r2 — awk option handling is an ALLOWLIST, not a denylist.
     # gawk has a large, ever-growing set of flags that load an external
     # PROGRAM/EXTENSION (`-f`/`--file`/`--source`/`-e`/`-E`/`--exec`/
@@ -813,12 +935,13 @@ def _awk_is_read_only(stage_tokens: list[str]) -> bool:
     # the stage to write-intent (fail-closed). The operator's read need
     # (`awk '{print $N}' <f>`, `awk -F: …`, `awk -v x=1 …`) is fully
     # covered. `-F`/`--field-separator` and `-v`/`--assign` take a value
-    # (separate token or glued); everything after them is still scanned.
+    # (separate token or glued); the value is NOT scanned for markers.
     _AWK_BENIGN_NOVALUE = {
         "-b", "--characters-as-bytes",
         "-c", "--traditional", "--compat",
         "-C", "--copyright",
         "-g", "--gen-po",  # extracts strings to STDOUT (not the file-writing --gen-pot)
+        "-M", "--bignum",  # arbitrary-precision arithmetic — no file/exec surface
         "-n", "--non-decimal-data",
         "-O", "--optimize",
         "-P", "--posix",
@@ -828,27 +951,31 @@ def _awk_is_read_only(stage_tokens: list[str]) -> bool:
         "--help", "--usage",
     }
     _AWK_BENIGN_VALUED = {"-F", "--field-separator", "-v", "--assign"}
+    program: str | None = None  # the first non-flag positional = awk program
+    program_expanded = False  # was the program word shell-expanded?
     skip_next = False
-    for raw_tok in args:
+    for tok, expanded in args:
         if skip_next:
             skip_next = False
-            continue
-        # Quote-strip before flag classification: a shell-quoted flag like
-        # `"-f"` / `'-f'` arrives as a raw token with embedded quotes, so a
-        # naive `startswith("-")` misclassifies it as the program/path and
-        # lets `awk "-f" /tmp/evil.awk <db>` ride the read-intent carve-out
-        # (issue #1690 r2 codex sweep). The shell removes the quotes before
-        # awk sees the flag, so we must too.
-        tok = _strip_token_quotes(raw_tok)
+            continue  # this word is a benign flag's VALUE — not scanned
         if not tok.startswith(("-", "@")) or tok == "-":
-            continue  # the inline program text or the input file path
+            # A non-flag positional. The FIRST one is the awk program (only
+            # reached when no -f/-e/--source loaded it from a file — those
+            # return False above). Subsequent positionals are INPUT DATA
+            # FILES and must NOT be scanned for markers (issue #1690 r3:
+            # `awk '{print $1}' lib/system_config_paths.py` — the path
+            # contains "system" but is not the program).
+            if program is None:
+                program = tok
+                program_expanded = expanded
+            continue
         if tok == "--":
             continue  # end-of-options marker
         bare = tok.split("=", 1)[0]
         if tok in _AWK_BENIGN_NOVALUE or bare in _AWK_BENIGN_NOVALUE:
             continue
         if tok in _AWK_BENIGN_VALUED:
-            skip_next = True  # the following token is this flag's value
+            skip_next = True  # the following word is this flag's value
             continue
         if bare in _AWK_BENIGN_VALUED:
             continue  # glued `--field-separator=:` / `-F:` / `-vx=1`
@@ -859,14 +986,20 @@ def _awk_is_read_only(stage_tokens: list[str]) -> bool:
         # `-W` meta-flag, an unknown gawk option, or an `@`-directive — is
         # NOT a benign read flag. Fail-closed.
         return False
-    program = " ".join(args)  # inline program text only
-    # Strip quote characters before the marker scan: bash concatenates
-    # adjacent quoted fragments before awk sees the program, so a split
-    # like `'syst''em(...)'` reaches awk as `system(...)` but the raw
-    # token still carries the embedded quotes and would hide the `system`
-    # substring (issue #1690 codex re-review round 5). Removing `'` and `"`
-    # collapses the fragments so the marker scan sees the effective program.
-    program = program.replace("'", "").replace('"', "")
+    if program is None:
+        return True  # no inline program (e.g. only flags); nothing to scan
+    # Issue #1690 r3: if the PROGRAM word was shell-expanded (a double-
+    # quoted / unquoted `$VAR` / `$(…)` / backtick — NOT a single-quoted
+    # awk `$1` field ref), its real content was rewritten by the shell
+    # before awk saw it, so the marker scan would miss a hidden
+    # `system(...)`/`print > …`. `p='BEGIN{system("id")}'; awk "$p" <db>`
+    # is exactly this. Fail-closed: an awk program we cannot read is never
+    # a safe read.
+    if program_expanded:
+        return False
+    # The quotes have been removed, so the program word is the effective
+    # program awk runs (the round-5 adjacent-quote `'syst''em'` case
+    # collapses to `system` here automatically).
     return not any(marker in program for marker in _AWK_PROGRAM_WRITE_MARKERS)
 
 
@@ -1084,6 +1217,14 @@ def _named_read_leader_is_read_only(leaf: str, stage_tokens: list[str]) -> bool:
         if len(positionals) >= 2:
             return False
         return True
+    if leaf == "file":
+        # Issue #1690 r3 (patch): `file -C` / `--compile` compiles a magic
+        # database to `<magicfile>.mgc` — a FILE WRITE with no `>` token.
+        # `-m`/`--magic-file`/`-M` only READ a magic file (no write), so
+        # those stay allowed. Reject the compile flag (quote-stripped).
+        return not any(
+            _strip_token_quotes(t) in ("-C", "--compile") for t in args
+        )
     return True
 
 
@@ -1132,10 +1273,26 @@ _DANGEROUS_ENV_PREFIXES = frozenset(
         "ENV",
         "SHELL",
         "IFS",
+        # Dynamic-loader / preprocessor env vars are a CODE-EXEC surface:
+        # the ld.so / dyld runtime linker loads and runs library code (or a
+        # converter / profile / audit module) BEFORE main() on ANY dynamic
+        # binary, including a plain read leader like `cat`, with no shell
+        # `>` token and no setuid needed. `LD_AUDIT=/tmp/evil.so cat <db>`
+        # runs evil.so's constructor via glibc rtld-audit = RCE (issue #1690
+        # r3, patch). Treat the whole class as exec; add any future
+        # ld.so/dyld loader var here.
         "LD_PRELOAD",
         "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "LD_PROFILE",
+        "LD_DEBUG_OUTPUT",
+        "GCONV_PATH",
+        "NLSPATH",
         "DYLD_INSERT_LIBRARIES",
         "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+        "DYLD_FALLBACK_FRAMEWORK_PATH",
         "PYTHONSTARTUP",
         "PERL5OPT",
         "GIT_EXTERNAL_DIFF",
@@ -1220,11 +1377,15 @@ def _is_read_intent_bash(command: str) -> bool:
     """
     if not command.strip():
         return False
-    # Issue #1690 round 6: refuse read-intent on any shell embedding. A
-    # `$(...)` / backtick / process-substitution body runs an arbitrary
-    # command the per-stage leader check never sees, so a visible read
-    # leader cannot vouch for the whole command. Fail-closed.
-    if _command_has_shell_embedding(command):
+    # Issue #1690 round 6: refuse read-intent on a shell embedding the
+    # shell would EXECUTE. A `$(...)` / backtick / process-substitution /
+    # heredoc body runs an arbitrary command the per-stage leader check
+    # never sees, so a visible read leader cannot vouch for the whole
+    # command (`cat <db> $(cp <db> sink)`). Fail-closed. Use the QUOTE-
+    # AWARE variant (issue #1690 r3) so a SINGLE-QUOTED `$(…)` the shell
+    # passes literally — e.g. an awk computed field `awk '{print $(NF-1)}'`
+    # — is not mis-denied; only unquoted/double-quoted expansions count.
+    if _command_has_unquoted_shell_embedding(command):
         return False
     # Strip stderr-suppression / fd-dup tokens before splitting on shell
     # operators. `_COMMAND_OPERATOR_RE` would otherwise tear `2>&1` and
@@ -1992,8 +2153,65 @@ def _command_has_shell_embedding(text: str) -> bool:
     The check runs against the raw text — the embedding tokens (``<<``,
     ``<<<``, ``<(``, ``>(``) are themselves the signals we want to
     catch, so we deliberately do NOT pre-strip safe redirect noise.
+
+    Single-quoted occurrences ARE flagged here on purpose: this gate
+    backs the cross-agent peer/shared substring carve-out, where a
+    quoted blob can still smuggle a forbidden path the argv parser cannot
+    surface. The read-intent classifier uses the quote-aware
+    :func:`_command_has_unquoted_shell_embedding` instead (issue #1690 r3)
+    so a single-quoted awk computed field (`awk '{print $(NF-1)}'`) — the
+    shell does NOT expand it — is not mis-denied.
     """
     return any(pat.search(text) for pat in _SHELL_EMBEDDING_PATTERNS)
+
+
+def _command_has_unquoted_shell_embedding(text: str) -> bool:
+    """True iff *text* contains a shell expansion / embedding that the
+    shell would actually EXECUTE — i.e. `$(...)`, a backtick, process
+    substitution `<(`/`>(`, or a heredoc/here-string `<<` that is NOT
+    inside single quotes.
+
+    Single-quoted occurrences are ignored: the shell passes them
+    literally, so `awk '{print $(NF-1)}'` (an awk computed field, not a
+    command substitution) stays read-intent (issue #1690 r3). An unquoted
+    or double-quoted `$(...)` / backtick still runs a command and is
+    flagged. Fail-closed on an unterminated quote.
+    """
+    i = 0
+    n = len(text)
+    in_sq = False
+    in_dq = False
+    while i < n:
+        c = text[i]
+        if in_sq:
+            if c == "'":
+                in_sq = False
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            i += 2  # backslash escape (outside single quotes)
+            continue
+        if c == "'" and not in_dq:
+            in_sq = True
+            i += 1
+            continue
+        if c == '"':
+            in_dq = not in_dq
+            i += 1
+            continue
+        # Not inside single quotes here — the shell would expand/execute.
+        if c == "`":
+            return True
+        if c == "$" and i + 1 < n and text[i + 1] == "(":
+            return True
+        if c in ("<", ">") and i + 1 < n and text[i + 1] == "(":
+            return True
+        if c == "<" and i + 1 < n and text[i + 1] == "<":
+            return True
+        i += 1
+    if in_sq:
+        return True  # unterminated single quote → un-parseable → fail-closed
+    return False
 
 
 def _peer_alias_list(agent: str) -> list[str]:

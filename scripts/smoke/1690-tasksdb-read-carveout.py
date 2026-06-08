@@ -151,12 +151,60 @@ def main() -> int:
         (f"awk -b '{{print}}' {db}", True),
         (f"awk --posix '{{print}}' {db}", True),
         (f"awk --sandbox '{{print}}' {db}", True),
+        # r3 FIX 1: the write-marker scan must read ONLY the awk PROGRAM
+        # word, not a `-F`/`-v` flag VALUE or an INPUT-FILE-PATH positional.
+        # These were over-blocked (the exact reads #1690 must unblock).
+        (f"awk -F '|' '{{print $2}}' {db}", True),       # `|` is the -F value
+        (f"awk -F'|' '{{print $2}}' {db}", True),        # glued -F value
+        (f"awk -v FS='|' '{{print $2}}' {db}", True),    # `|` is the -v value
+        (f"awk --field-separator='|' '{{print $2}}' {db}", True),
+        (f"awk -F '[:,]' '{{print $1}}' {db}", True),
+        ("awk '{print $1}' lib/system_config_paths.py", True),  # path has "system"
+        ("awk '{print $2}' shared/2026-05-28-232-closed.md", True),  # path has "close"
+        # r3 FIX 1 security: markers INSIDE the program word still DENY,
+        # incl. programs whose body contains whitespace (shlex keeps the
+        # program as one word so the `|`/system after a space is still seen).
+        (f'awk \'{{print | "sh -c id"}}\' {db}', False),
+        (f'awk \'BEGIN{{system("cp x y")}}\' {db}', False),
+        # r3 FIX 4: -M/--bignum has no file/exec surface — must ALLOW.
+        (f"awk -M 1 {db}", True),
+        (f"awk --bignum '{{print $1}}' {db}", True),
+        # r3 codex final-sweep: a shell-expanded awk PROGRAM word hides its
+        # real content from the marker scan ('p=...; awk "$p"') — fail
+        # closed. A single-quoted awk computed field ($(NF-1)) is NOT a
+        # shell substitution and must stay ALLOWed.
+        ('p=\'BEGIN{system("id")}\'; awk "$p" ' + db, False),  # shell-var program
+        ('awk $p ' + db, False),                       # unquoted var program
+        (f"awk '{{print $(NF-1)}}' {db}", True),       # awk computed field (allow)
+        (f"awk '{{print $(NF)}}' {db}", True),
+        (f"awk '{{print $1}}' $HOME/data.txt", True),  # $HOME in datafile = benign
+        # r3 codex: gawk @include/@load inside the INLINE program (leading
+        # space/newline/comment makes it the program word, not the first
+        # token) loads external code — must DENY via program marker.
+        ('awk \' @include "/tmp/evil.awk"\' ' + db, False),
+        ('awk \'\n@include "/tmp/evil.awk"\' ' + db, False),
+        ('awk \' @load "evil"\' ' + db, False),
         (f"yq -s /tmp/leak . {db}", False),         # yq split-exp short
         (f"yq --split-exp /tmp/leak . {db}", False),  # yq split-exp long
         (f"PAGER=sh less {db}", False),             # PAGER env exec prefix
         (f"LESSOPEN=|cmd less {db}", False),        # LESSOPEN preprocessor
         (f"LD_PRELOAD=/tmp/x.so cat {db}", False),  # LD_PRELOAD injection
         (f"BASH_ENV=/tmp/x cat {db}", False),       # BASH_ENV injection
+        # r3 FIX 2: dynamic-loader / preprocessor env vars are a code-exec
+        # surface (rtld-audit / converter / profile run before main()).
+        (f"LD_AUDIT=/tmp/x.so cat {db}", False),    # glibc rtld-audit RCE
+        (f"LD_PROFILE=/tmp/x cat {db}", False),
+        (f"GCONV_PATH=/tmp/x cat {db}", False),
+        (f"NLSPATH=/tmp/x cat {db}", False),
+        (f"DYLD_FALLBACK_LIBRARY_PATH=/tmp cat {db}", False),
+        (f"DYLD_FRAMEWORK_PATH=/tmp cat {db}", False),
+        # r3 FIX 3: `file -C` compiles a `.mgc` magic DB (file write); the
+        # read-only -m/--magic-file/-M stay allowed.
+        (f"file -C -m /tmp/x {db}", False),
+        (f"file --compile -m /tmp/x {db}", False),
+        (f"file {db}", True),
+        (f"file -m /tmp/magic {db}", True),
+        (f"file --magic-file /tmp/magic {db}", True),
         # VIMINIT/EXINIT carry vim/ex startup commands (:write!/:!cmd) for
         # the read-intent `view` leader (#1690 codex re-review round 6).
         (f"VIMINIT=x view {db}", False),

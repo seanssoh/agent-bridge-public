@@ -246,6 +246,29 @@ assert_bash_verdict "bash awk --dump-variables write"   "awk --dump-variables=/t
 assert_bash_verdict "bash awk -W meta-flag"             "awk -W exec=/tmp/x $TASK_DB"        "DENY"
 assert_bash_verdict "bash awk unknown flag (fail-closed)" "awk --some-future-flag '{print}' $TASK_DB" "DENY"
 assert_bash_verdict "bash awk --sandbox read (allowed)" "awk --sandbox '{print \$1}' $TASK_DB" "ALLOW"
+# r3 FIX 1: scan ONLY the awk PROGRAM word, not -F/-v flag values or the
+# input-file path. These were over-blocked (exact reads #1690 unblocks).
+assert_bash_verdict "bash awk -F pipe value (allowed)"  "awk -F '|' '{print \$2}' $TASK_DB"  "ALLOW"
+assert_bash_verdict "bash awk -v FS pipe value (allowed)" "awk -v FS='|' '{print \$2}' $TASK_DB" "ALLOW"
+assert_bash_verdict "bash awk path contains system (allowed)" "awk '{print \$1}' lib/system_config_paths.py" "ALLOW"
+# r3 FIX 1 security: markers inside a whitespace-containing program DENY
+assert_bash_verdict "bash awk program-pipe w/space (deny)" "awk '{print | \"sh -c id\"}' $TASK_DB" "DENY"
+# r3 FIX 4: -M/--bignum has no file/exec surface (allowed)
+assert_bash_verdict "bash awk -M bignum (allowed)"      "awk -M 1 $TASK_DB"                  "ALLOW"
+# r3 codex final-sweep: shell-expanded awk program word hides content (deny);
+# single-quoted awk computed field $(NF-1) is not a shell sub (allow)
+assert_bash_verdict "bash awk shell-var program (deny)" "p='BEGIN{system(\"id\")}'; awk \"\$p\" $TASK_DB" "DENY"
+assert_bash_verdict "bash awk computed field (allowed)" "awk '{print \$(NF-1)}' $TASK_DB"    "ALLOW"
+# r3 codex: gawk @include inside the inline program (leading space) loads
+# external code — must DENY via the program marker.
+assert_bash_verdict "bash awk @include in-program (deny)" "awk ' @include \"/tmp/evil.awk\"' $TASK_DB" "DENY"
+# r3 FIX 2: dynamic-loader env vars are a code-exec surface (DENY)
+assert_bash_verdict "bash LD_AUDIT rtld-audit RCE"      "LD_AUDIT=/tmp/x.so cat $TASK_DB"    "DENY"
+assert_bash_verdict "bash GCONV_PATH converter exec"    "GCONV_PATH=/tmp/x cat $TASK_DB"     "DENY"
+# r3 FIX 3: file -C writes a .mgc magic DB (DENY); file / file -m allowed
+assert_bash_verdict "bash file -C compile write"        "file -C -m /tmp/x $TASK_DB"         "DENY"
+assert_bash_verdict "bash file lone read (allowed)"     "file $TASK_DB"                      "ALLOW"
+assert_bash_verdict "bash file -m magic read (allowed)" "file -m /tmp/magic $TASK_DB"        "ALLOW"
 assert_bash_verdict "bash yq --in-place write"          "yq --in-place . $TASK_DB"           "DENY"
 assert_bash_verdict "bash awk plain read (allowed)"     "awk '{print \$2}' $TASK_DB"         "ALLOW"
 assert_bash_verdict "bash awk -F: read (allowed)"       "awk -F: '{print \$1}' $TASK_DB"     "ALLOW"
