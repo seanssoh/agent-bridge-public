@@ -22,7 +22,9 @@ The **first real new feature** is the fork point. At that moment:
 
 ## Current LTS
 
-- **v0.16.2 — declared LTS 2026-06-08.** GitHub release titled `v0.16.2 (LTS)` (Latest); README current-stable line marked LTS. Converged across the fleet (macbook / SYRS mac-mini / cm-prod) + a 4th host (ip-10-242, AL2023) + orbstack Linux iso v2 VM-verify, zero new issues.
+- **Every v0.16.x release is an LTS release.** The whole v0.16 line is LTS; each patch is an LTS patch. When a new v0.16.x patch ships, it becomes the new line head but does NOT de-LTS the prior one — it supersedes it on the same line. GitHub release titles use `(LTS)` on every v0.16.x release. The LTS designation cannot be revoked retroactively for a prior v0.16.x patch.
+- **v0.16.4 — current LTS-line head (2026-06-09).** GitHub release `v0.16.4 (LTS)` (Latest); guard over-block hardening wave (#1690/#1692/#1693/#1701/#1697). Supersedes v0.16.3 as line head; v0.16.3's LTS designation remains valid.
+- **v0.16.2 — original LTS declaration (2026-06-08).** The first release on this line declared as LTS. Fleet convergence: macbook / SYRS mac-mini / cm-prod + ip-10-242 (AL2023) + orbstack Linux iso v2 VM-verify, zero new issues.
 - An LTS is declared only on **proven convergence**: shipped + tagged, VM-verified on Linux iso v2, and a full fleet re-rollout surfacing zero new issues. (LTS declaration is delegated to the dev orchestrator when results are good — report, don't ask.)
 
 ## Support window

@@ -852,3 +852,65 @@ is shared by the blocked-aging upserts, so widening it with a global
 alerts. A code-side churn suppressor (a daemon-alert-specific `upsert-open`
 mode that reuses recently-closed *alerts* without reopening them) would be a
 separate, narrowly-scoped follow-up.
+
+## 31. Guard intent-aware credential / shared-alias mention gate descoped from v0.16.4 (#1691)
+
+The planned v0.16.4 relaxation of the intent-aware credential-name and
+shared-alias *mention* gate (#1691) was **descoped** after a dual adversarial
+review found two distinct real bypasses in the substring-analysis layer. The
+gate remains in its current conservatively over-blocking state.
+
+Impact:
+
+- Commands that merely *mention* a protected credential name or shared alias
+  in a string argument — without actually reading or writing the protected
+  path — may be denied even though they pose no real risk.
+
+Operator guidance:
+
+- Rephrase the command to avoid embedding the protected name in the
+  argument string, or use a shell variable to hold the value instead of
+  the literal name.
+- Will be redone bundled with #1709.
+
+## 32. Protected-path guard misses brace / `$BRIDGE_HOME` spellings (#1709)
+
+The substring-based protected-path gates in `hooks/tool-policy.py` match
+against **literal path spellings only**. A command that references a protected
+path through a Bash brace expansion (e.g. `${BRIDGE_HOME}/state/...`) or an
+unresolved `$BRIDGE_HOME` variable reference is not matched and passes
+through unprotected.
+
+Impact:
+
+- Bash commands that use brace or variable spellings for a protected path
+  are not caught by the substring gate. This is a **pre-existing** gap; it
+  was not introduced by v0.16.4.
+
+Operator guidance:
+
+- The guard is an audit/containment layer, not a sandbox — treat this as
+  defense-in-depth rather than a complete enforcement guarantee.
+- Tracked upstream as #1709; to be addressed bundled with the #1691 redo.
+
+## 33. Non-Bash admin Read can reach shared secret / private subtrees (#1711)
+
+The v0.16.4 admin peer-home read carve-out (#1692) limits the relaxation to
+**Bash** reads only and preserves the deny on shared secret and private
+subtrees even for admin. However, the broader guard does not yet enforce the
+same least-privilege boundary for non-Bash admin reads (e.g. a direct Read
+tool call from an admin session targeting a peer's secret/private subtree).
+
+Impact:
+
+- An admin agent using the Read tool directly (rather than a Bash
+  `cat`/`head`/etc.) can still reach peer secret/private material that the
+  Bash path now denies. Over-permissive rather than data-loss.
+
+Operator guidance:
+
+- Treat admin sessions with the same operational discipline as before —
+  access only what is needed; prefer the queue and bridge CLI over direct
+  cross-agent reads.
+- Tracked as #1711; a follow-up will align the non-Bash path with the
+  #1692 Bash least-privilege model.
