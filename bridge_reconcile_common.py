@@ -394,19 +394,205 @@ def stable_local_addr(transport: str, cfg: dict[str, Any]) -> ReconcileStepResul
     return step_noop("stable_local_addr adapter not yet implemented (#1705)")
 
 
-def tunnel_health(transport: str, cfg: dict[str, Any]) -> ReconcileStepResult:
-    """STUB (#1706 fills) — per-transport tunnel/substrate liveness.
+# --------------------------------------------------------------------------
+# tunnel-health (#1706) — per-transport substrate freshness + WARP auto-bounce
+# --------------------------------------------------------------------------
+#
+# The WARP MASQUE tunnel can silently go stale after a network change: the CLI
+# keeps reporting `Connected` while the handshake ages out (live: 3153s) and
+# established sessions RST even though a fresh SYN still passes. The steady-state
+# recovery is the daemon's job (operator control-loop amendment / design SSOT 5.5
+# "observable-not-operable"): on a PROVEN stale handshake the daemon auto-bounces
+# the tunnel (`warp-cli disconnect` + `connect`), BOUNDED by the reconcile.db
+# backoff gate `run_step` already applies (cap + exp backoff + jitter — no bounce
+# storm). net-status only REPORTS freshness; it never bounces.
 
-    Probe ONLY the configured `transport`'s substrate (a WARP install must
-    never shell `tailscale`, and vice-versa) and report tunnel liveness.
-    Returns step_converged() when the tunnel is healthy, or a result whose
-    `fields` carries a `transport_degraded` boolean (True when the substrate is
-    down/degraded) plus any non-secret health detail. On a degraded substrate
-    the step returns step_error() so the bounded backoff paces re-probes.
+# How old (seconds) a WARP handshake may be before the tunnel is treated as
+# degraded. Env-overridable; the live failure showed a 3153s handshake while
+# `warp-cli status` still said `Connected`. 120s is comfortably above a healthy
+# WARP keepalive cadence and well below the multi-minute stale window.
+DEFAULT_WARP_HANDSHAKE_STALE_SECONDS = 120
 
-    Lane 0 ships a no-op stub.
+
+def warp_handshake_stale_threshold() -> int:
+    """Resolve the WARP handshake-age staleness threshold in seconds.
+
+    `BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS` overrides the default. A
+    non-numeric / non-positive override falls back to the default (a threshold
+    of 0 would mark a fresh tunnel stale and bounce-storm — fail-safe).
     """
-    return step_noop("tunnel_health adapter not yet implemented (#1706)")
+    raw = os.environ.get("BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS")  # noqa: iso-helper-boundary
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_WARP_HANDSHAKE_STALE_SECONDS
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_WARP_HANDSHAKE_STALE_SECONDS
+    return val if val > 0 else DEFAULT_WARP_HANDSHAKE_STALE_SECONDS
+
+
+def _default_warp_bounce() -> bool:
+    """Bounce the WARP tunnel: `warp-cli disconnect` then `warp-cli connect`.
+
+    The documented recovery for a stale MASQUE tunnel (forces a fresh
+    handshake in seconds). Returns True when both legs ran; False (never
+    raises) when `warp-cli` is unavailable or a leg failed — a failed bounce
+    is recorded by the caller and re-paced by the backoff gate, it never
+    crashes the tick. INJECTABLE via `_WARP_TUNNEL_BOUNCE` so the smoke can
+    assert the bounce WAS invoked without touching a real host's WARP.
+    """
+    cli = a2a.resolve_warp_cli()
+    if cli is None:
+        return False
+    try:
+        # `_warp_cli_capture` returns (ran, output, rc) and never raises — a
+        # disconnect/connect that fails is just a non-zero rc we treat as a
+        # failed bounce (the backoff gate paces the retry).
+        d_ran, _d_out, d_rc = a2a._warp_cli_capture(cli, ["disconnect"])
+        c_ran, _c_out, c_rc = a2a._warp_cli_capture(cli, ["connect"])
+    except Exception:  # noqa: BLE001 - a bounce never raises into the reconcile tick
+        return False
+    return bool(d_ran and c_ran and d_rc == 0 and c_rc == 0)
+
+
+# Injectable bounce hook (module-level function reference). The daemon calls
+# `_WARP_TUNNEL_BOUNCE()` on a proven-stale WARP tunnel. The smoke rebinds this
+# to a spy so it can assert the bounce was invoked WITHOUT bouncing a real
+# tunnel; production keeps `_default_warp_bounce`.
+_WARP_TUNNEL_BOUNCE: Callable[[], bool] = _default_warp_bounce
+
+
+def _tunnel_health_warp() -> ReconcileStepResult:
+    """WARP substrate freshness probe + bounded auto-bounce (#1706).
+
+    Reads the MASQUE handshake age (read-only `warp-cli tunnel stats`):
+      - age UNKNOWABLE (warp-cli absent / unparseable) -> step_error with
+        transport_degraded=True but NO bounce (fail-closed re-probe; a parse
+        failure is not a proven stale handshake — never bounce on it).
+      - age <= threshold -> step_converged (healthy, idempotent no-op; never
+        bounces a fresh tunnel).
+      - age  > threshold -> PROVEN stale: invoke the injectable bounce hook,
+        return step_error with transport_degraded=True (engages the backoff
+        gate so the NEXT bounce is paced — no storm). The bounce result is
+        reported in fields for net-status (`bounced` bool), never a secret.
+    """
+    age = a2a.warp_tunnel_handshake_age()
+    if age is None:
+        # Unknowable freshness — fail closed (re-probe), but do NOT bounce: a
+        # probe-parse failure is not a proven stale handshake.
+        return step_error(
+            "warp tunnel handshake age unknowable (warp-cli absent or no "
+            "handshake line) — fail-closed re-probe, no bounce",
+            fields={"transport": "cloudflare-warp-mesh",
+                    "transport_degraded": True,
+                    "handshake_age_known": False})
+
+    threshold = warp_handshake_stale_threshold()
+    if age <= threshold:
+        return step_converged(
+            f"warp tunnel fresh (handshake age {age}s <= {threshold}s)",
+            fields={"transport": "cloudflare-warp-mesh",
+                    "transport_degraded": False,
+                    "handshake_age_seconds": age,
+                    "stale_threshold_seconds": threshold})
+
+    # PROVEN stale handshake -> auto-bounce (bounded by the run_step backoff
+    # gate: this adapter only runs when the step is eligible, so a flapping
+    # tunnel cannot bounce on every tick). The bounce hook never raises.
+    try:
+        bounced = bool(_WARP_TUNNEL_BOUNCE())
+    except Exception as exc:  # noqa: BLE001 - the bounce is best-effort; a failure is paced, not fatal
+        return step_error(
+            f"warp tunnel stale (handshake age {age}s > {threshold}s); "
+            f"auto-bounce raised {type(exc).__name__}",
+            fields={"transport": "cloudflare-warp-mesh",
+                    "transport_degraded": True,
+                    "handshake_age_seconds": age,
+                    "stale_threshold_seconds": threshold,
+                    "bounced": False})
+    return step_error(
+        f"warp tunnel stale (handshake age {age}s > {threshold}s); "
+        f"auto-bounce {'invoked' if bounced else 'attempted'}",
+        fields={"transport": "cloudflare-warp-mesh",
+                "transport_degraded": True,
+                "handshake_age_seconds": age,
+                "stale_threshold_seconds": threshold,
+                "bounced": bounced})
+
+
+def _tunnel_health_tailscale() -> ReconcileStepResult:
+    """Tailscale substrate liveness probe (#1706).
+
+    Surfaces `tailscale status --json` and detects tailnet-down / node-offline.
+    Tailscale's own keepalive / DERP reconnect makes the WARP-style silent
+    stale rare, so there is NO auto-bounce here — a down tailnet is reported
+    (step_error, transport_degraded=True) and the bounded backoff paces the
+    re-probe; recovery is Tailscale's own job. An unreachable CLI is itself a
+    fail-closed degraded signal.
+    """
+    try:
+        status = a2a.tailscale_status_json()
+    except a2a.TailscaleUnavailable:
+        return step_error(
+            "tailscale status unavailable — fail-closed degraded",
+            fields={"transport": "tailscale", "transport_degraded": True,
+                    "backend_state": None, "self_online": None})
+    backend = status.get("BackendState")
+    self_node = status.get("Self")
+    self_online = None
+    if isinstance(self_node, dict):
+        self_online = self_node.get("Online")
+    # Healthy only when the backend is Running AND this node reports Online.
+    # Anything else (NeedsLogin / Stopped / NoState / offline self) is a
+    # degraded tailnet — report it, the backoff paces the re-check.
+    degraded = not (backend == "Running" and self_online is True)
+    if degraded:
+        return step_error(
+            f"tailscale degraded (BackendState={backend!r}, "
+            f"Self.Online={self_online!r})",
+            fields={"transport": "tailscale", "transport_degraded": True,
+                    "backend_state": backend, "self_online": self_online})
+    return step_converged(
+        "tailscale up (BackendState=Running, Self.Online=True)",
+        fields={"transport": "tailscale", "transport_degraded": False,
+                "backend_state": backend, "self_online": self_online})
+
+
+def tunnel_health(transport: str, cfg: dict[str, Any]) -> ReconcileStepResult:
+    """Per-transport tunnel/substrate liveness (#1706).
+
+    Probes ONLY the configured `transport`'s substrate — a WARP install never
+    shells `tailscale`, and a Tailscale install never shells `warp-cli`. The
+    common control loop branches here exactly once, on `transport`:
+
+      - "cloudflare-warp-mesh": probe the MASQUE handshake AGE; on a PROVEN
+        stale handshake (age > threshold, default 120s, env-overridable) the
+        daemon AUTO-bounces the tunnel via the injectable `_WARP_TUNNEL_BOUNCE`
+        hook (bounded by the run_step backoff gate so a flapping tunnel cannot
+        storm). A fresh tunnel is a converged no-op (idempotent).
+      - "tailscale": surface `tailscale status` and detect tailnet-down /
+        node-offline (no auto-bounce — Tailscale self-heals via keepalive/DERP).
+      - anything else: converged no-op (no substrate-specific probe defined;
+        never shell a foreign transport's CLI).
+
+    Returns step_converged() when the tunnel is healthy; on a degraded /
+    unknowable substrate returns step_error() with `transport_degraded: True`
+    plus non-secret health detail in `fields` (handshake age + status only —
+    never tokens/keys), so the bounded backoff paces re-probes. Fail-safe: a
+    probe error returns step_error() and NEVER raises into the tick; an
+    unknowable state fails closed (treated as NOT-converged) but never triggers
+    a bounce (only a proven stale handshake does).
+    """
+    if transport == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
+        return _tunnel_health_warp()
+    if transport == a2a.TRANSPORT_TAILSCALE:
+        return _tunnel_health_tailscale()
+    # Unknown/unsupported transport: no substrate-specific probe. NO-OP rather
+    # than error so an unrecognized kind does not engage the backoff gate or
+    # shell a foreign CLI (active-transport-only).
+    return step_noop(
+        f"tunnel_health: no substrate probe for transport {transport!r}",
+        fields={"transport": transport, "transport_degraded": False})
 
 
 def peer_reachability_step(cfg: dict[str, Any],
