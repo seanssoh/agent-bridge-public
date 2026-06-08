@@ -36,6 +36,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
+# Put the repo root on sys.path so a by-path load of bridge-handoffd.py can
+# resolve its sibling top-level imports (bridge_a2a_common, and as of v0.16.5
+# Lane 0, bridge_reconcile_common). Without this the importlib exec_module
+# below raises ModuleNotFoundError for any new sibling module bridge-handoffd
+# imports — matches the sys.path.insert pattern the other by-path smokes use.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 def _load(mod_name: str, filename: str):
     spec = importlib.util.spec_from_file_location(
