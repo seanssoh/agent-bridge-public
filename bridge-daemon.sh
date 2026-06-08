@@ -3590,6 +3590,327 @@ process_a2a_receiver_supervise_tick() {
   return 0
 }
 
+# --------------------------------------------------------------------------
+# #1685: destination-side A2A receiver STALENESS self-heal (bootstrap gap).
+#
+# #1612 made the upgrader restart the A2A receiver so receiver-side code is
+# reloaded on upgrade — but that restart block lives in the v0.16.1+
+# (DESTINATION) upgrader, while an upgrade is RUN BY the source (old-version)
+# upgrader. So the FIRST upgrade from a pre-v0.16.1 source runs an OLD
+# bridge-upgrade.sh with no receiver-restart block → the receiver keeps running
+# STALE code (pre-#1623 backpressure) → cross-bridge A2A silently 429s
+# (choi-mac repro). The ONLY source-version-independent place to catch this is
+# the DESTINATION daemon tick — the daemon runs the installed target code.
+#
+# This tick is a guarded ONE-SHOT self-heal:
+#   - PURE no-op unless: handoff.local.json present AND last-upgrade.json present
+#     AND the receiver is RUNNING AND a stale boot marker (or NO marker) is
+#     detected for the CURRENT upgrade identity that has NOT been attempted yet.
+#   - ★ Preflight BEFORE stop: a stale-but-WORKING receiver must NEVER become an
+#     outage. We re-prove config + secret + bind through `bridge-handoffd.py
+#     preflight` (smoke-only insecure-bind env scrubbed) BEFORE any stop. A
+#     preflight FAILURE → do NOT stop; warn/audit/admin-task; leave it running.
+#   - systemd-owner → `systemctl --user restart agb-handoffd.service` (do NOT
+#     shell stop/start — never fight the unit's lifecycle authority).
+#   - non-systemd → restart through the existing bridge-handoff-daemon.sh
+#     lifecycle (NEVER a raw `serve`); `start` re-runs the full fail-closed
+#     bind proof.
+#   - ONE-SHOT keyed by upgrade identity (source_head|updated_at|version),
+#     persisted in state/handoff/receiver-staleness.json; NEVER loops.
+#
+# FAIL-SAFE: the JSON/ISO parsing lives in a file-as-argv python helper
+# (lib/daemon-helpers/a2a-receiver-staleness.py — footgun #11: no heredoc-stdin)
+# whose decide path ALWAYS prints a clean `noop` line on any malformed/unreadable
+# input and exits 0, so a bad marker can never break this tick.
+process_a2a_receiver_staleness_tick() {
+  local interval_str="${BRIDGE_A2A_RECEIVER_STALENESS_INTERVAL_SECONDS:-60}"
+  local interval
+  if [[ "$interval_str" =~ ^[0-9]+$ ]]; then
+    interval="$interval_str"
+  else
+    interval=60
+  fi
+  # 0 disables the tick entirely (operator opt-out).
+  (( interval == 0 )) && return 1
+
+  # No-op silently without handoff.local.json — non-A2A installs.
+  local config="${BRIDGE_A2A_CONFIG:-${BRIDGE_HOME:-$HOME/.agent-bridge}/handoff.local.json}"
+  [[ -f "$config" ]] || return 1
+
+  local last_upgrade="$BRIDGE_STATE_DIR/upgrade/last-upgrade.json"
+  # No-op without a recorded upgrade — no cutoff boundary to compare against.
+  [[ -f "$last_upgrade" ]] || return 1
+
+  local handoff_dir="$BRIDGE_STATE_DIR/handoff"
+  mkdir -p "$handoff_dir" 2>/dev/null || true
+  local boot_marker="$handoff_dir/receiver-boot.json"
+  local attempt_state="$handoff_dir/receiver-staleness.json"
+  local tick_state="$handoff_dir/receiver-staleness-tick.env"  # noqa: iso-helper-boundary — daemon-owned cadence file under controller $BRIDGE_STATE_DIR/handoff (mirrors receiver-supervise-tick.env); not a channel dotenv / iso-boundary path
+
+  local now next=0
+  now="$(date +%s)"
+  if [[ -f "$tick_state" ]]; then
+    # shellcheck source=/dev/null
+    # shellcheck disable=SC1090
+    source "$tick_state" 2>/dev/null || true
+    next="${A2A_RECEIVER_STALENESS_NEXT_TS:-0}"
+  fi
+  if [[ "$next" =~ ^[0-9]+$ ]] && (( now < next )); then
+    return 1
+  fi
+  # Stamp cadence immediately so an error path below cannot busy-spin.
+  printf 'A2A_RECEIVER_STALENESS_LAST_TS=%s\nA2A_RECEIVER_STALENESS_NEXT_TS=%s\n' \
+    "$now" "$((now + interval))" >"$tick_state" 2>/dev/null || true
+
+  # Source the lifecycle lib in THIS subshell only (the tick already runs in a
+  # `( ... ) || true` subshell in cmd_sync_cycle).
+  # shellcheck source=lib/bridge-a2a.sh
+  source "$SCRIPT_DIR/lib/bridge-a2a.sh" 2>/dev/null || {
+    daemon_warn "[a2a_receiver_staleness] could not source lib/bridge-a2a.sh; skipping"
+    return 1
+  }
+
+  # No-op when the receiver is NOT running (normal supervision owns a down
+  # receiver — we ONLY catch a RUNNING-but-stale one). bridge_a2a_receiver_running
+  # binds the pid to THIS install's pidfile + cmdline (pid reuse safe).
+  local receiver_running=0 verified_pid=""
+  if bridge_a2a_receiver_running; then
+    receiver_running=1
+    verified_pid="$(bridge_a2a_receiver_pid)"
+  fi
+  if (( receiver_running == 0 )); then
+    return 1
+  fi
+
+  # --- decide (file-as-argv helper; ALWAYS prints one TSV line, exits 0) ---
+  local decide_tmp decision="" upgrade_key="" reason="" marker_head="" marker_ver=""
+  decide_tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-staleness.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-staleness.$$.$RANDOM")"
+  bridge_with_timeout 10 a2a_receiver_staleness_decide \
+    python3 "$SCRIPT_DIR/lib/daemon-helpers/a2a-receiver-staleness.py" decide \
+      "$last_upgrade" "$boot_marker" "$attempt_state" \
+      "$receiver_running" "${verified_pid:-}" \
+      >"$decide_tmp" 2>/dev/null || true
+  while IFS=$'\t' read -r decision upgrade_key reason marker_head marker_ver; do
+    break
+  done <"$decide_tmp"
+  rm -f "$decide_tmp" 2>/dev/null || true
+
+  # Anything other than an explicit `stale` decision (including an empty read /
+  # helper failure) is a no-op — FAIL SAFE.
+  if [[ "$decision" != "stale" ]]; then
+    return 1
+  fi
+
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+
+  # --- ★ ATOMIC one-shot claim BEFORE any action (race guard) ---
+  # `decide` is advisory only: a manual `bridge-daemon.sh sync` and the
+  # background daemon tick can both pass `decide` before either records an
+  # attempt, which would double-restart. The python `claim` does an
+  # O_CREAT|O_EXCL create of the attempt-state file keyed to this upgrade
+  # identity — EXACTLY ONE caller wins. The loser (and any re-tick) gets
+  # `not_claimed` and no-ops, so the recycle happens at most once per upgrade
+  # key even under concurrency. The claim is written BEFORE the restart, so a
+  # crash mid-restart still leaves the one-shot held (safe: no re-arm; normal
+  # supervision owns a down receiver).
+  local claim_tmp claim_out=""
+  claim_tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-staleness-claim.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-staleness-claim.$$.$RANDOM")"
+  bridge_with_timeout 10 a2a_receiver_staleness_claim \
+    python3 "$SCRIPT_DIR/lib/daemon-helpers/a2a-receiver-staleness.py" claim \
+      "$attempt_state" "${upgrade_key:-}" \
+    >"$claim_tmp" 2>/dev/null || true
+  IFS= read -r claim_out <"$claim_tmp" 2>/dev/null || true
+  rm -f "$claim_tmp" 2>/dev/null || true
+  if [[ "$claim_out" != "claimed" ]]; then
+    # Another tick/sync already owns the one-shot for this upgrade key (or the
+    # claim could not be written safely). Do NOT act — FAIL SAFE.
+    return 1
+  fi
+
+  bridge_audit_log daemon a2a_receiver_stale_code_detected daemon \
+    --detail reason="${reason:-unknown}" \
+    --detail verified_pid="${verified_pid:-}" \
+    --detail marker_source_head="${marker_head:-}" \
+    --detail marker_version="${marker_ver:-}" \
+    --detail systemd_owner="$(bridge_a2a_receiver_systemd_active && printf 'yes' || printf 'no')" \
+    >/dev/null 2>&1 || true
+  daemon_warn "[a2a_receiver_staleness] receiver (pid ${verified_pid:-?}) appears to be running PRE-UPGRADE code (reason=${reason:-unknown}); attempting ONE guarded self-heal restart"
+
+  # Finalize a TERMINAL outcome: write the durable one-shot result (so `decide`
+  # reads `already_attempted` for this key forever) AND release the short-lived
+  # per-key claim lock (codex r3: the lock is the in-flight serializer, the
+  # terminal record is the permanent guard — releasing it means a daemon that
+  # DIES mid-action leaves NO terminal record, so a later tick reclaims the
+  # stale lock and retries instead of permanently skipping the heal).
+  _a2a_staleness_finalize() {
+    local result="$1" detail="$2"
+    bridge_with_timeout 10 a2a_receiver_staleness_record \
+      python3 "$SCRIPT_DIR/lib/daemon-helpers/a2a-receiver-staleness.py" record \
+        "$attempt_state" "${upgrade_key:-}" "$result" "$detail" \
+        >/dev/null 2>&1 || true
+    bridge_with_timeout 10 a2a_receiver_staleness_release \
+      python3 "$SCRIPT_DIR/lib/daemon-helpers/a2a-receiver-staleness.py" release \
+        "$attempt_state" "${upgrade_key:-}" \
+        >/dev/null 2>&1 || true
+  }
+
+  # --- ★ Preflight BEFORE stop: a stale-but-working receiver must NOT become an
+  # outage. Re-prove config + secret + bind through the python preflight with
+  # the smoke-only insecure-bind escape hatches scrubbed. A FAILURE here means
+  # restarting would leave the receiver DOWN (tailnet down / bad config), so we
+  # do NOT stop it — warn/audit/admin-task and leave it running. ---
+  local preflight_rc=0
+  bridge_with_timeout 20 a2a_receiver_staleness_preflight \
+    env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
+    python3 "$SCRIPT_DIR/bridge-handoffd.py" preflight --config "$config" \
+    >/dev/null 2>&1 || preflight_rc=$?
+
+  if (( preflight_rc != 0 )); then
+    daemon_warn "[a2a_receiver_staleness] preflight FAILED (rc=$preflight_rc) — NOT stopping the stale-but-running receiver (a restart would leave it DOWN); leaving it up and escalating"
+    bridge_audit_log daemon a2a_receiver_stale_code_restart_failed daemon \
+      --detail reason=preflight_failed \
+      --detail preflight_rc="$preflight_rc" \
+      --detail verified_pid="${verified_pid:-}" >/dev/null 2>&1 || true
+    # Record the one-shot so we do not re-stop-attempt this upgrade key every
+    # tick. Normal supervision still owns the receiver; a later config/bind fix
+    # plus a manual restart writes a fresh marker and clears the staleness.
+    _a2a_staleness_finalize preflight_failed "rc=$preflight_rc"
+    if [[ -n "$admin" ]]; then
+      bridge_a2a_staleness_escalate "$admin" preflight_failed "${reason:-unknown}" \
+        "${verified_pid:-}" "$config" "$last_upgrade" >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+
+  # --- systemd-owner: the unit owns lifecycle. Restart via the unit, never a
+  # shell stop/start (do not fight systemd). ---
+  if bridge_a2a_receiver_systemd_active; then
+    if command -v systemctl >/dev/null 2>&1; then
+      local sd_rc=0
+      bridge_with_timeout 60 a2a_receiver_staleness_systemctl_restart \
+        systemctl --user restart agb-handoffd.service >/dev/null 2>&1 || sd_rc=$?
+      if (( sd_rc == 0 )); then
+        daemon_log_event "[a2a_receiver_staleness] systemd-owned receiver recycled via 'systemctl --user restart agb-handoffd.service' to apply upgraded code"
+        bridge_audit_log daemon a2a_receiver_stale_code_restarted daemon \
+          --detail method=systemctl \
+          --detail reason="${reason:-unknown}" >/dev/null 2>&1 || true
+        _a2a_staleness_finalize restarted "systemctl"
+        return 0
+      fi
+      daemon_warn "[a2a_receiver_staleness] 'systemctl --user restart agb-handoffd.service' FAILED (rc=$sd_rc) — leaving the unit to its own Restart policy; escalating"
+      bridge_audit_log daemon a2a_receiver_stale_code_restart_failed daemon \
+        --detail method=systemctl \
+        --detail rc="$sd_rc" >/dev/null 2>&1 || true
+    else
+      daemon_warn "[a2a_receiver_staleness] systemd-owner active but systemctl not found — warn-only; escalating"
+      bridge_audit_log daemon a2a_receiver_stale_code_restart_failed daemon \
+        --detail method=systemctl \
+        --detail reason=no_systemctl >/dev/null 2>&1 || true
+    fi
+    _a2a_staleness_finalize systemd_warn_only "systemctl_unavailable_or_failed"
+    if [[ -n "$admin" ]]; then
+      bridge_a2a_staleness_escalate "$admin" systemd_warn_only "${reason:-unknown}" \
+        "${verified_pid:-}" "$config" "$last_upgrade" >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+
+  # --- non-systemd: restart through the existing lifecycle (NEVER raw serve).
+  # `restart` stops then starts; `start` re-runs the FULL fail-closed bind proof.
+  # Scrub the smoke-only insecure-bind escape hatches so the recycle cannot
+  # inherit a degraded loopback/secret-bypass contract from the daemon env. The
+  # preflight above already proved the production bind/config is good. ---
+  local restart_rc=0
+  bridge_with_timeout 60 a2a_receiver_staleness_restart \
+    env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
+    bash "$SCRIPT_DIR/bridge-handoff-daemon.sh" restart >/dev/null 2>&1 || restart_rc=$?
+
+  if (( restart_rc == 0 )); then
+    daemon_log_event "[a2a_receiver_staleness] receiver recycled via bridge-handoff-daemon.sh restart to apply upgraded code"
+    bridge_audit_log daemon a2a_receiver_stale_code_restarted daemon \
+      --detail method=lifecycle \
+      --detail reason="${reason:-unknown}" >/dev/null 2>&1 || true
+    _a2a_staleness_finalize restarted "lifecycle"
+  else
+    # The restart went through `start`'s fail-closed proof and it did not come
+    # up cleanly. The one-shot is recorded so we do not loop; normal receiver
+    # supervision (the sibling tick) now owns the down/crash-loop case.
+    daemon_warn "[a2a_receiver_staleness] receiver recycle FAILED (rc=$restart_rc); normal supervision now owns it; escalating"
+    bridge_audit_log daemon a2a_receiver_stale_code_restart_failed daemon \
+      --detail method=lifecycle \
+      --detail rc="$restart_rc" >/dev/null 2>&1 || true
+    _a2a_staleness_finalize restart_failed "rc=$restart_rc"
+    if [[ -n "$admin" ]]; then
+      bridge_a2a_staleness_escalate "$admin" restart_failed "${reason:-unknown}" \
+        "${verified_pid:-}" "$config" "$last_upgrade" >/dev/null 2>&1 || true
+    fi
+  fi
+  return 0
+}
+
+# File ONE admin task for a stale-receiver self-heal that could not complete
+# (preflight failed, systemd warn-only, or restart failed). Best-effort; never
+# fails the tick. NOT cooldown-gated beyond the one-shot upgrade-key guard — the
+# detector only reaches here once per upgrade identity, so there is no flood.
+bridge_a2a_staleness_escalate() {
+  local admin="$1" kind="$2" reason="$3" verified_pid="$4" config="$5" last_upgrade="$6"
+  [[ -n "$admin" ]] || return 0
+  local target_bridge=""
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  fi
+  [[ -n "$target_bridge" ]] || return 0
+  local title body_file
+  case "$kind" in
+    preflight_failed)
+      title="[A2A] receiver stale code — self-heal HELD (preflight failed)" ;;
+    systemd_warn_only)
+      title="[A2A] receiver stale code — systemd restart could not be issued" ;;
+    *)
+      title="[A2A] receiver stale code — self-heal restart FAILED" ;;
+  esac
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-staleness-escalate.md.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-staleness-escalate.$$.$RANDOM")"
+  {
+    printf '# %s\n\n' "$title"
+    printf 'The A2A receiver daemon (bridge-handoffd.py) appears to be running\n'
+    printf 'PRE-UPGRADE code (#1685 bootstrap gap: a pre-v0.16.1 source upgrader\n'
+    printf 'did not restart the receiver, so receiver-side fixes such as #1623\n'
+    printf 'backpressure fail-open are not applied — cross-bridge A2A can be\n'
+    printf 'silently degraded). The daemon attempted ONE guarded self-heal and\n'
+    printf 'could not complete it safely (kind=%s, reason=%s).\n\n' "$kind" "$reason"
+    printf '## State\n\n'
+    printf -- '- receiver pid: `%s`\n' "${verified_pid:-unknown}"
+    printf -- '- config: `%s`\n' "$config"
+    printf -- '- last-upgrade: `%s`\n\n' "$last_upgrade"
+    printf '## Manual fix\n\n'
+    if [[ "$kind" == preflight_failed ]]; then
+      printf '1. The receiver is STILL RUNNING (the daemon did NOT stop it because\n'
+      printf '   the bind/config preflight failed — a restart would leave it down).\n'
+      printf '2. Confirm the bind: `agb a2a daemon reconcile` then\n'
+      printf '   `agb a2a daemon healthz`.\n'
+      printf '3. Once the bind/config is healthy, restart to apply the upgraded\n'
+      printf '   code: `bash %s/bridge-handoff-daemon.sh restart`.\n' "$BRIDGE_HOME"
+    elif [[ "$kind" == systemd_warn_only ]]; then
+      printf '1. The receiver is managed by systemd (agb-handoffd.service).\n'
+      printf '2. Restart it: `systemctl --user restart agb-handoffd.service`,\n'
+      printf '   then verify `agb a2a daemon healthz`.\n'
+    else
+      printf '1. Inspect the receiver log tail and restart manually:\n'
+      printf '   `bash %s/bridge-handoff-daemon.sh restart`,\n' "$BRIDGE_HOME"
+      printf '   then verify `agb a2a daemon healthz`.\n'
+    fi
+  } >"$body_file"
+  "$target_bridge" task create \
+    --to "$admin" --priority high --from daemon \
+    --title "$title" --body-file "$body_file" --force >/dev/null 2>&1 || \
+    bridge_audit_log daemon a2a_receiver_escalation_task_create_failed daemon \
+      --detail alarm_kind="stale_$kind" >/dev/null 2>&1 || true
+  rm -f "$body_file" 2>/dev/null || true
+  return 0
+}
+
 process_release_monitor() {
   local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
   local monitor_json=""
@@ -12157,6 +12478,19 @@ cmd_sync_cycle() {
   # Issue #1338 defense-in-depth: subshell-isolate (rationale above).
   BRIDGE_DAEMON_LAST_STEP="a2a_receiver_supervise_tick"
   ( process_a2a_receiver_supervise_tick ) || true
+
+  # #1685 (bootstrap gap, #1612 follow-up): destination-side A2A receiver
+  # STALENESS self-heal. A pre-v0.16.1 source upgrader did not restart the
+  # receiver, so the FIRST upgrade leaves it on STALE (pre-#1623) code →
+  # cross-bridge A2A silently 429s. This tick is source-version-independent (it
+  # runs the installed code) and performs at most ONE guarded, preflight-gated
+  # restart per upgrade identity — a stale-but-working receiver is NEVER stopped
+  # without a passing preflight. No-op without handoff.local.json /
+  # last-upgrade.json / a running receiver / a fresh boot marker. Throttled by
+  # BRIDGE_A2A_RECEIVER_STALENESS_INTERVAL_SECONDS (default 60s). Subshell-
+  # isolated (defense-in-depth, mirrors the sibling ticks).
+  BRIDGE_DAEMON_LAST_STEP="a2a_receiver_staleness_tick"
+  ( process_a2a_receiver_staleness_tick ) || true
 
   # #9819 A/B (rc2 #1563 PR-3): admin-liveness escalation. Mechanical check —
   # when the ADMIN AGENT itself is down (no live session + heartbeat stale

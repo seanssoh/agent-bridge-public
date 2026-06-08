@@ -132,6 +132,23 @@ git checkout "$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V 
 ./agent-bridge upgrade --apply
 ```
 
+**A2A peers on a pre-v0.16.1 source (leap-path note, #1685):** if this host runs
+the A2A cross-bridge receiver and you are upgrading from a **pre-v0.16.1** source
+(v0.15.x, v0.16.0/rc), the *first* upgrade is run by the old upgrader, which does
+not restart the receiver — it would otherwise keep running stale receiver code
+(e.g. the pre-#1623 backpressure that silently 429s inbound peers). The
+destination daemon now self-heals this on its next tick (one guarded,
+preflight-gated restart). On a host whose always-on daemon is **not** running,
+do it once by hand right after the upgrade:
+
+```bash
+bash <BRIDGE_HOME>/bridge-handoff-daemon.sh restart
+agb a2a daemon healthz       # expect: healthy
+```
+
+Automatic from **v0.16.1+ → v0.16.x** onward. See *A2A receiver staleness
+self-heal* under the daemon supervision section below for the full mechanism.
+
 The per-release subsections below are operator follow-up notes (newest first),
 kept as historical context — they are **not** separate upgrade hops.
 
@@ -799,13 +816,62 @@ Env knobs (all optional; defaults are sized for production):
 | `BRIDGE_A2A_RECEIVER_BACKOFF_CAP_SECONDS` | `900` | Backoff ceiling. |
 | `BRIDGE_A2A_RECEIVER_BACKOFF_OPEN_THRESHOLD` | `5` | Consecutive transient failures before the circuit opens. |
 
+**A2A receiver staleness self-heal (upgrade bootstrap gap, #1685).** The A2A
+receiver (`bridge-handoffd.py`) is a long-lived process with **no hot-reload**, so
+an upgrade that changes receiver-side code only takes effect after the receiver
+is restarted. From **v0.16.1+** the upgrader restarts it automatically — but the
+restart block lives in the *destination* upgrader, while an upgrade is *run by
+the source (old) upgrader*. So the **first** upgrade from a **pre-v0.16.1**
+source (v0.15.x, v0.16.0/rc) runs an old upgrader with no restart block and
+leaves the receiver on stale code (e.g. the pre-#1623 backpressure that silently
+returns HTTP 429 *peer task quota reached* to inbound peers). The destination
+daemon now closes this gap **source-version-independently**: on each tick it
+compares the running receiver's boot time (a receiver-owned boot marker,
+`state/handoff/receiver-boot.json`) against the "new code installed" cutoff
+(`state/upgrade/last-upgrade.json` `updated_at`). A receiver that booted **before**
+the cutoff (or carries **no** marker, i.e. it was started by a build that predates
+the marker) is recycled **exactly once** per upgrade identity. The recycle is
+**preflight-gated**: the config + secret + fail-closed bind proof are re-proven
+**before** any stop, so a stale-but-*working* receiver is never turned into an
+outage — a failing preflight leaves the receiver running and files an admin task
+instead. A **systemd**-managed receiver (`agb-handoffd.service`) is restarted via
+`systemctl --user restart`, never a shell stop/start. The one-shot is persisted
+in `state/handoff/receiver-staleness.json`, so it **never loops**; normal receiver
+supervision (above) owns any subsequent death/crash-loop.
+
+| Var | Default | Effect |
+|---|---|---|
+| `BRIDGE_A2A_RECEIVER_STALENESS_INTERVAL_SECONDS` | `60` | Staleness-detector tick cadence (`0` disables it; e.g. a host that prefers manual restart). |
+
+Surfaces:
+
+```bash
+agb a2a daemon status     # shows boot_marker / staleness (last self-heal result)
+```
+
 Observe it via the audit trail:
 
 ```bash
-agb audit follow --action daemon_tick_deadline_exceeded   # T1 self-abort fired
-agb audit follow --action daemon_admin_down_escalated     # admin-down escalation
-agb audit follow --action a2a_receiver_circuit_open       # A2A breaker opened
+agb audit follow --action daemon_tick_deadline_exceeded     # T1 self-abort fired
+agb audit follow --action daemon_admin_down_escalated       # admin-down escalation
+agb audit follow --action a2a_receiver_circuit_open         # A2A breaker opened
+agb audit follow --action a2a_receiver_stale_code_detected  # stale receiver caught (#1685)
+agb audit follow --action a2a_receiver_stale_code_restarted # one-shot recycle succeeded
+agb audit follow --action a2a_receiver_stale_code_restart_failed  # held (preflight/lifecycle)
 ```
+
+**One-time manual step for pre-v0.16.1 sources.** If you upgrade to v0.16.x from
+a **pre-v0.16.1** source and the always-on daemon is **not** running (so the
+detector never ticks), restart the receiver once by hand after the upgrade so it
+picks up the upgraded code:
+
+```bash
+bash <BRIDGE_HOME>/bridge-handoff-daemon.sh restart
+agb a2a daemon healthz       # expect: healthy
+```
+
+This is automatic from **v0.16.1+ → v0.16.x** onward (the #1612 upgrader block),
+and on any host whose daemon is running (the #1685 detector).
 
 ## Status And Debugging
 

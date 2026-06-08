@@ -3312,6 +3312,23 @@ this task only after each applicable section is either executed or noted as
 "not applicable here because <reason>" in the done note. Sections that ship
 with no operator action (most release bumps) need no follow-up.
 
+## A2A receiver (cross-bridge handoff hosts only) — #1685
+
+If this host runs the A2A receiver (\`handoff.local.json\` present) AND you
+upgraded from a **pre-v0.16.1** source, the *first* upgrade is run by the old
+upgrader, which does not restart \`bridge-handoffd.py\`. It would otherwise keep
+running stale receiver code (e.g. the pre-#1623 backpressure that silently
+returns HTTP 429 to inbound peers). The destination daemon now self-heals this
+on its next tick (one guarded, preflight-gated restart). If the always-on daemon
+is **not** running on this host, restart the receiver once by hand:
+
+\`\`\`
+bash $TARGET_ROOT/bridge-handoff-daemon.sh restart
+$TARGET_ROOT/agent-bridge a2a daemon healthz   # expect: healthy
+\`\`\`
+
+Automatic from **v0.16.1+ → v0.16.x** onward. Non-A2A hosts can ignore this.
+
 ## Done note format
 
 When you finish the three steps above and processed every applicable section
