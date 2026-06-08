@@ -40,6 +40,12 @@ DELIVERY_INTENT_VALUES = ("silent", "main_session_only", "forward_to_user")
 FORWARD_CHANNEL_VALUES = ("telegram", "discord", "mattermost")
 FORWARD_FORMAT_VALUES = ("markdown", "text")
 SUMMARY_SHORT_MAX = 200
+# #1677 — visible (not silent) truncation marker for `summary_short`. When the
+# derived-or-supplied digest exceeds SUMMARY_SHORT_MAX we keep
+# SUMMARY_SHORT_MAX - len(marker) chars of text and append the marker so the
+# total stays within the downstream ≤200 contract AND the operator can see the
+# value was cut. Example: text[:197] + "...".
+SUMMARY_SHORT_TRUNCATE_MARKER = "..."
 CLAUDE_INCOMPLETE_CAPTURE_MAX_RETRIES = 1
 
 # PR1.5 — direct-send marker substrings the LLM should never emit at action
@@ -995,8 +1001,89 @@ def detect_direct_send_markers(result: dict[str, Any]) -> list[dict[str, str]]:
     return detections
 
 
+def normalize_summary_short(
+    summary_short_raw: Any, summary: str
+) -> tuple[str, str | None]:
+    """Return (summary_short, normalization_note) for a non-silent intent.
+
+    #1677 — `summary_short` is schema-valid as null (the embedded result schema
+    declares it `anyOf:[{string,maxLength 200},{null}]`) and the child (an LLM)
+    legitimately emits null ~25% of the time on a non-silent intent. The old
+    behaviour raised `ValueError` in that case, which the caller treats as a
+    fatal result-validation failure and substitutes a generic error envelope —
+    discarding the child's ENTIRE valid signal (summary/findings/actions/etc.),
+    not just the one missing routing digest.
+
+    Instead, derive the missing digest from `summary` (which `validate_result`
+    already requires to be a non-empty string, so a source always exists) and
+    PRESERVE the rest of the payload:
+
+    - non-empty `summary_short` → use it as-is (after stripping);
+    - missing/empty → derive from the FIRST non-empty line of `summary`
+      (whitespace-normalized) before truncating;
+    - longer than SUMMARY_SHORT_MAX → VISIBLE truncation (keep room for a
+      `...` marker so the total stays ≤ SUMMARY_SHORT_MAX), NOT silent;
+    - an overlong CHILD-provided `summary_short` is truncated the same way
+      rather than raising (same data-loss class; preserves the ≤200 contract).
+
+    First-sentence parsing is deliberately NOT attempted (language edge cases,
+    not worth the complexity for v0.16.3) — first-non-empty-line + truncate is
+    enough. `normalization_note` is a short human-readable string when a derive
+    and/or truncate happened (so the runner can surface it on result.json and
+    in a stderr warning), else None.
+
+    SCOPE FENCE: this only normalizes the `summary_short` digest. It does NOT
+    generalize the error-envelope substitution path; an empty `summary` and any
+    other validation failure (e.g. bad forward_target) stay fatal exactly as
+    today — that boundary lives in `validate_result`, not here.
+    """
+    note_parts: list[str] = []
+
+    raw_text = "" if summary_short_raw is None else str(summary_short_raw).strip()
+    if raw_text:
+        text = raw_text
+    else:
+        # Derive from the first non-empty line of `summary` so a multi-line
+        # summary yields a tight routing digest rather than a wrapped blob.
+        derived = ""
+        for line in str(summary or "").splitlines():
+            stripped = line.strip()
+            if stripped:
+                derived = stripped
+                break
+        derived = " ".join(derived.split())
+        text = derived
+        note_parts.append("derived from summary (child emitted null/empty)")
+
+    if len(text) > SUMMARY_SHORT_MAX:
+        keep = SUMMARY_SHORT_MAX - len(SUMMARY_SHORT_TRUNCATE_MARKER)
+        text = text[:keep].rstrip() + SUMMARY_SHORT_TRUNCATE_MARKER
+        note_parts.append(f"truncated to {SUMMARY_SHORT_MAX} chars")
+
+    note = "; ".join(note_parts) if note_parts else None
+    return text, note
+
+
 def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
     result = normalize_result(payload)
+
+    # #1677 — an ABSENT `summary_short` key on a non-silent intent must take the
+    # same derive-from-summary path as a null/empty value, NOT fail the
+    # required-fields check below (which lists `summary_short`) and fall through
+    # to the whole-payload error envelope. The child (an LLM) omits the key with
+    # the same nondeterminism that produces null. We only seed it when `summary`
+    # is a non-empty string so this stays a no-op for a genuinely empty result —
+    # the empty-`summary` fatal and the missing-`summary` fatal both still fire
+    # below. We deliberately do NOT seed the other required-but-nullable keys
+    # (`forward_target`, `channel_relay`): their absence stays fatal (scope fence).
+    if (
+        "summary_short" not in result
+        and str(result.get("delivery_intent") or "").strip() != "silent"
+        and isinstance(result.get("summary"), str)
+        and result["summary"].strip()
+    ):
+        result["summary_short"] = None
+
     missing = [key for key in RESULT_SCHEMA["required"] if key not in result]
     if missing:
         raise ValueError(f"result missing required fields: {', '.join(missing)}")
@@ -1026,20 +1113,28 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
         # cron child can fill it without breaking the silent contract.
         result.pop("summary_short", None)
     else:
-        if summary_short_raw is None:
-            raise ValueError(
-                f"summary_short is required when delivery_intent={intent}"
-            )
-        text = str(summary_short_raw).strip()
-        if not text:
-            raise ValueError(
-                f"summary_short must be a non-empty string when delivery_intent={intent}"
-            )
-        if len(text) > SUMMARY_SHORT_MAX:
-            raise ValueError(
-                f"summary_short exceeds {SUMMARY_SHORT_MAX} chars (was {len(text)})"
-            )
+        # #1677 — a missing/empty/overlong `summary_short` on a non-silent
+        # intent is NO LONGER fatal: it is schema-valid (anyOf allows null) and
+        # the LLM child emits null ~25% of the time. Deriving the digest from
+        # the already-required non-empty `summary` PRESERVES the rest of the
+        # valid signal instead of letting the whole payload fall through to the
+        # generic runner-error envelope. The hard boundary stays at an empty
+        # `summary` (fatal above) — and every OTHER validation failure (e.g.
+        # bad forward_target) remains fatal exactly as today.
+        text, normalization_note = normalize_summary_short(
+            summary_short_raw, str(result.get("summary") or "")
+        )
         result["summary_short"] = text
+        if normalization_note:
+            # Runner-visible: surface on result.json (surgical, non-schema key)
+            # and as a clear stderr WARNING so the LLM nondeterminism is
+            # observable rather than silent.
+            result["summary_short_normalized"] = normalization_note
+            print(
+                f"[cron-runner][warn] summary_short normalized "
+                f"(delivery_intent={intent}): {normalization_note}",
+                file=sys.stderr,
+            )
 
     relay = normalize_channel_relay(result.get("channel_relay"))
     if relay is not None:
@@ -3768,6 +3863,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         result_payload["forward_target"] = forward_target
     if summary_short:
         result_payload["summary_short"] = summary_short
+    # #1677 — surface the summary_short derive/truncate note on result.json so
+    # the LLM-null-field nondeterminism is observable per-run (not stderr-only).
+    summary_short_note = str(child_result.get("summary_short_normalized") or "").strip()
+    if summary_short_note:
+        result_payload["summary_short_normalized"] = summary_short_note
     if structured_relay_legacy:
         result_payload["legacy_structured_relay_key_used"] = True
     if markers:
