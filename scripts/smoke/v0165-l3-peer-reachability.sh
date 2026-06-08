@@ -32,8 +32,11 @@
 #                       stable_local_addr) but NO bind.
 #   (f') no-drift     — peer unreachable but listen.address present → NO rebind
 #                       recorded (config unchanged; fail-closed).
-#   (g) probe-failure — the probe hook RAISES → step_error, fail-closed (the
-#                       peer is NOT up; unknowable ≠ UP).
+#   (g) probe-failure — the probe hook RAISES (infra error) → step_error (NOT
+#                       changed), fail-closed (UNKNOWABLE; peer NOT up).
+#   (g') clean-down    — a CLEAN determinable-down (probe returns False) →
+#                       step_changed (NOT error); infra-error vs clean-down
+#                       paths are distinguished.
 #   (h) no-secret     — no secret-shaped field in any state row or result.
 #
 # Run green on /opt/homebrew/bin/bash (macOS) and Linux CI bash.
@@ -104,7 +107,11 @@ smoke_assert_contains "$out_nodrift" "OK no-drift-rebind" \
 
 out_probefail="$(run_helper probe-failure)"
 smoke_assert_contains "$out_probefail" "OK probe-failure" \
-  "(g) raising probe -> step_error, fail-closed (peer NOT up; unknowable != UP)"
+  "(g) raising probe (infra error) -> step_error, fail-closed (NOT changed; peer NOT up)"
+
+out_cleandown="$(run_helper clean-down)"
+smoke_assert_contains "$out_cleandown" "OK clean-down" \
+  "(g') clean determinable-down (probe returns False) -> step_changed (NOT error); infra/clean paths distinguished"
 
 out_secret="$(run_helper no-secret)"
 smoke_assert_contains "$out_secret" "OK no-secret" \

@@ -35,8 +35,13 @@ Subcommands (each prints `OK <cmd> ...` + exits 0 on pass; `FAIL ...` to stderr
   no-drift-rebind <repo_root> <db> <cfg> — a peer unreachable but the local
                                          listen.address IS on an interface → NO
                                          rebind recorded (config unchanged).
-  probe-failure <repo_root> <db> <cfg> — the probe hook RAISES → step_error,
-                                         fail-closed (the peer is NOT `up`).
+  probe-failure <repo_root> <db> <cfg> — the probe hook RAISES (infra error) →
+                                         step_error (NOT changed), fail-closed
+                                         (UNKNOWABLE; the peer is NOT `up`).
+  clean-down    <repo_root> <db> <cfg> — a CLEAN determinable-down (probe returns
+                                         False, never raises) → step_changed (NOT
+                                         error); proves infra-error vs clean-down
+                                         are distinguished.
   no-secret     <repo_root> <db> <cfg> — no secret-shaped field in any state row
                                          or result.
 
@@ -413,7 +418,14 @@ def cmd_no_drift_rebind(repo_root: str, db_path: str, cfg_path: str) -> int:
 
 
 def cmd_probe_failure(repo_root: str, db_path: str, cfg_path: str) -> int:
-    """A probe hook that RAISES → step_error, fail-closed (peer is NOT up)."""
+    """A probe hook that RAISES (infrastructure error) → step_error, fail-closed.
+
+    A raising probe could NOT complete its reachability determination, so the
+    reachability is UNKNOWABLE. The aggregate MUST be step_error (NOT
+    step_changed) even though the FSM advances up→suspect — an unknowable probe
+    is never reported as progress (would mask infra failure as a clean down and
+    skip the bounded backoff that paces re-probes). The peer is NOT up.
+    """
     reconcile = _load_reconcile(repo_root)
     a2a = _load_a2a(repo_root)
     _write_cfg(cfg_path, transport="cloudflare-warp-mesh",
@@ -428,11 +440,25 @@ def cmd_probe_failure(repo_root: str, db_path: str, cfg_path: str) -> int:
     try:
         conn = reconcile.open_reconcile_db()
         res = reconcile.peer_reachability_step(cfg, conn)
-        # A raising probe is caught inside the adapter and treated as a MISS
-        # (unknowable ≠ up); the aggregate result is NOT converged.
-        if res.status == reconcile.RESULT_CONVERGED:
+        # THE fail-closed contract: an infra-error probe is step_error, NOT
+        # step_changed (and certainly not converged). This is the bug the
+        # Phase-4 review caught — a raising probe was masked as step_changed.
+        if res.status != reconcile.RESULT_ERROR:
             sys.stderr.write(
-                f"FAIL probe-failure: converged on a raising probe (unknowable treated as up)\n")
+                f"FAIL probe-failure: status {res.status} (want error); a raising "
+                "probe is UNKNOWABLE and must NOT report as progress/changed\n")
+            return 1
+        if res.fields.get("infra_error") is not True:
+            sys.stderr.write(
+                f"FAIL probe-failure: infra_error not surfaced in fields: {res.fields}\n")
+            return 1
+        # The peer's per-summary carries the closed-set code + the infra_error flag.
+        psum = next((p for p in res.fields.get("peers", []) if p.get("peer") == "node-2"), {})
+        if psum.get("probe_err_code") != "probe_exception":
+            sys.stderr.write(f"FAIL probe-failure: probe_err_code not probe_exception: {psum}\n")
+            return 1
+        if psum.get("infra_error") is not True:
+            sys.stderr.write(f"FAIL probe-failure: per-peer infra_error not set: {psum}\n")
             return 1
         states = _peer_states(conn)
         if states.get("node-2", (None, None))[0] == reconcile.PEER_STATE_UP:
@@ -441,7 +467,57 @@ def cmd_probe_failure(repo_root: str, db_path: str, cfg_path: str) -> int:
         conn.close()
     finally:
         reconcile._PEER_REACHABILITY_PROBE = original
-    print(f"OK probe-failure raising probe -> {res.status} fail-closed (peer not up)")
+    print(f"OK probe-failure raising probe -> {res.status} fail-closed (infra_error, peer not up)")
+    return 0
+
+
+def cmd_clean_down(repo_root: str, db_path: str, cfg_path: str) -> int:
+    """A CLEAN connection-refused (probe cleanly returns False) is a DETERMINED
+    down → the FSM advances and the aggregate is step_changed, NOT step_error.
+
+    This is the counterpart to probe-failure: it proves the two paths are
+    distinguished — a clean down is legit down-detection (changed), only an
+    infra-error (raising probe) fails closed to error. The probe RETURNS False
+    (the contract of _default_peer_probe on OSError), it does NOT raise.
+    """
+    reconcile = _load_reconcile(repo_root)
+    a2a = _load_a2a(repo_root)
+    _write_cfg(cfg_path, transport="cloudflare-warp-mesh",
+               listen_addr="10.128.0.5", peer_ids=["node-2"])
+    cfg = a2a.load_config()
+    peer_addr = "192.0.2.10"
+
+    # Clean determinable-down: returns False, never raises (mirrors
+    # _default_peer_probe catching OSError → False).
+    probe = _ScriptedProbe(reachable_by_addr={peer_addr: False}, default=False)
+    original = reconcile._PEER_REACHABILITY_PROBE
+    reconcile._PEER_REACHABILITY_PROBE = probe
+    try:
+        conn = reconcile.open_reconcile_db()
+        res = reconcile.peer_reachability_step(cfg, conn)
+        # First clean miss advances up->suspect: that's a real state change, so
+        # the aggregate is CHANGED (legit down-detection), NOT error.
+        if res.status != reconcile.RESULT_CHANGED:
+            sys.stderr.write(
+                f"FAIL clean-down: status {res.status} (want changed); a clean "
+                "determinable-down must report as legit down-detection\n")
+            return 1
+        if res.fields.get("infra_error") is not False:
+            sys.stderr.write(
+                f"FAIL clean-down: infra_error should be False on a clean down: {res.fields}\n")
+            return 1
+        psum = next((p for p in res.fields.get("peers", []) if p.get("peer") == "node-2"), {})
+        if "infra_error" in psum or "probe_err_code" in psum:
+            sys.stderr.write(
+                f"FAIL clean-down: clean down must carry no infra_error/probe_err_code: {psum}\n")
+            return 1
+        if psum.get("state") != reconcile.PEER_STATE_SUSPECT:
+            sys.stderr.write(f"FAIL clean-down: state {psum.get('state')} (want suspect)\n")
+            return 1
+        conn.close()
+    finally:
+        reconcile._PEER_REACHABILITY_PROBE = original
+    print("OK clean-down determinable-down -> step_changed (not error), no infra_error")
     return 0
 
 
@@ -469,7 +545,7 @@ def cmd_no_secret(repo_root: str, db_path: str, cfg_path: str) -> int:
         # free-text probe_error, no exception message). probe_err_code, if
         # present, must be a closed-set classification token.
         allowed_peer_keys = {"peer", "state", "probed", "consecutive_fail",
-                             "probe_err_code"}
+                             "probe_err_code", "infra_error"}
         allowed_codes = {"warp_identity_misconfig", "resolve_shape",
                          "resolve_not_ip", "resolve_error", "probe_exception",
                          "unresolved_addr"}
@@ -507,6 +583,7 @@ _COMMANDS = {
     "ip-drift": cmd_ip_drift,
     "no-drift-rebind": cmd_no_drift_rebind,
     "probe-failure": cmd_probe_failure,
+    "clean-down": cmd_clean_down,
     "no-secret": cmd_no_secret,
 }
 

@@ -963,14 +963,19 @@ def peer_reachability_step(cfg: dict[str, Any],
     still routes through `resolve_bind()` in `reconcile_once`; this step never
     binds a socket.
 
-    Returns:
+    Returns (probe outcomes classified into reachable / cleanly-unreachable /
+    infra-error; infra-error takes precedence):
+      - step_error() when ANY probe this tick was an INFRASTRUCTURE failure
+        (resolver raised / address unresolvable / the probe hook itself raised)
+        — the reachability is UNKNOWABLE, so the tick is fail-closed to error
+        REGARDLESS of any FSM advance, and the bounded backoff paces re-probes.
+        A clean ConnectionRefused/timeout is NOT an infra-error (that is a
+        determined down). Also returned when the mesh is simply not fully
+        reachable with no progress this tick.
+      - step_changed() when a peer's STATE cleanly advanced this tick OR a
+        desired rebind was recorded (and no infra-error occurred);
       - step_converged() when every peer is UP and there is no recorded drift
-        (idempotent no-op — repeated ticks on an all-UP mesh do nothing);
-      - step_changed() when a peer's STATE advanced this tick OR a desired
-        rebind was recorded;
-      - step_error() on a probe-infrastructure failure (config malformed,
-        address unresolvable) — fail-closed: an unknowable reachability is NOT
-        treated as UP.
+        (idempotent no-op — repeated ticks on an all-UP mesh do nothing).
 
     Invariants (design SSOT §7 / 5 self-healing invariants):
     - NEVER binds a socket and NEVER touches the receiver admission path
@@ -1014,6 +1019,7 @@ def peer_reachability_step(cfg: dict[str, Any],
 
     any_state_changed = False
     any_unreachable = False
+    any_infra_error = False
     peers_up = 0
     peer_summaries: list[dict[str, Any]] = []
 
@@ -1037,21 +1043,38 @@ def peer_reachability_step(cfg: dict[str, Any],
                  "consecutive_fail": prev_fail})
             continue
 
-        # Resolve the peer's CURRENT target address through the configured
-        # transport's resolver. A resolve failure is an operational error for
-        # THIS peer (record an attempt so the backoff paces it) but never an
-        # uncaught raise — we treat it as unreachable (fail-closed: unknowable
-        # ≠ UP). `probe_err_code` is a CLOSED-SET classification token only
-        # (an A2AError `.code`, or a fixed `probe_exception`/`unresolved_addr`)
-        # — NEVER the free-text exception message, so no resolver/probe string
-        # can leak into the result `fields` (no-secret contract: codes/states/
+        # Classify this peer's probe outcome into exactly one of three kinds —
+        # the fail-closed distinction the aggregate result depends on:
+        #   reachable           : the probe PROVED the peer up.
+        #   cleanly-unreachable : the probe cleanly DETERMINED the peer is down
+        #                         (ConnectionRefused / timeout / EHOSTUNREACH —
+        #                         a real down signal). This is legit
+        #                         down-detection: the FSM advances and the
+        #                         aggregate may report `changed`.
+        #   infra-error         : the probe could NOT complete its determination
+        #                         (resolver raised / address unresolvable / the
+        #                         probe HOOK itself raised). The reachability is
+        #                         UNKNOWABLE — fail-closed, NOT a clean "down".
+        #                         Any infra-error in the tick forces the
+        #                         aggregate to `step_error` (below) so the
+        #                         bounded backoff paces re-probes and we never
+        #                         treat unknown as a determined down.
+        #
+        # `probe_err_code` is a CLOSED-SET classification token only (an
+        # A2AError `.code`, or a fixed `probe_exception`/`unresolved_addr`) —
+        # NEVER the free-text exception message, so no resolver/probe string can
+        # leak into the result `fields` (no-secret contract: codes/states/
         # counts/timestamps only).
         probe_err_code = ""
+        infra_error = False
         try:
             address = a2a.resolve_peer_address_for_transport(transport, peer)
         except a2a.A2AError as exc:
+            # Resolver raised → the target address is UNKNOWABLE (infra-error,
+            # not a clean down).
             address = ""
             probe_err_code = str(exc.code or "resolve_error")
+            infra_error = True
 
         port = default_port
         try:
@@ -1060,18 +1083,27 @@ def peer_reachability_step(cfg: dict[str, Any],
         except (TypeError, ValueError):
             port = default_port
 
-        if address:
+        if infra_error:
+            # Address unknowable → do not probe; reachability unknown (fail-closed).
+            reachable = False
+        elif address:
             try:
                 reachable = bool(_PEER_REACHABILITY_PROBE(address, port, timeout))
             except Exception:  # noqa: BLE001 - a probe never raises into the tick
+                # The probe HOOK itself raised → its determination did NOT
+                # complete → UNKNOWABLE (infra-error), distinct from a clean
+                # `False` (ConnectionRefused/timeout, handled inside the probe).
                 reachable = False
+                infra_error = True
                 # Fixed token only — never the exception's str()/repr().
                 probe_err_code = "probe_exception"
         else:
-            # No resolvable address → unreachable (fail-closed, never UP).
+            # Resolver returned an EMPTY address with no exception — the address
+            # could not be determined (operational, not a proven-down peer) →
+            # UNKNOWABLE (infra-error), fail-closed.
             reachable = False
-            if not probe_err_code:
-                probe_err_code = "unresolved_addr"
+            infra_error = True
+            probe_err_code = "unresolved_addr"
 
         # Drive the hysteretic FSM.
         if reachable:
@@ -1101,12 +1133,21 @@ def peer_reachability_step(cfg: dict[str, Any],
             peers_up += 1
         else:
             any_unreachable = True
+        if infra_error:
+            # An UNKNOWABLE probe this tick forces the aggregate to step_error
+            # below (fail-closed: never let a state advance off an unknowable
+            # probe report as progress).
+            any_infra_error = True
         if state_changed:
             any_state_changed = True
 
         summary: dict[str, Any] = {
             "peer": peer_id, "state": new_state, "probed": True,
             "consecutive_fail": new_fail}
+        if infra_error:
+            # Observable, non-secret bool: distinguishes a clean down from an
+            # unknowable probe for net-status.
+            summary["infra_error"] = True
         if probe_err_code:
             # A CLOSED-SET classification code ONLY (resolver A2AError code /
             # probe_exception / unresolved_addr) — never a free-text message,
@@ -1138,11 +1179,28 @@ def peer_reachability_step(cfg: dict[str, Any],
         "peers_up": peers_up,
         "peers": peer_summaries,
         "ip_drift_rebind_recorded": rebind_recorded,
+        "infra_error": any_infra_error,
     }
 
+    # FAIL-CLOSED (highest precedence): if ANY probe this tick could not
+    # complete its reachability determination (resolver raised / address
+    # unresolvable / the probe hook raised), the tick is UNKNOWABLE. Return
+    # step_error REGARDLESS of any FSM advance or recorded rebind — an
+    # unknowable probe must never be reported as progress (it would otherwise
+    # mask an infrastructure failure as a clean down-detection and skip the
+    # bounded backoff that paces re-probes). Any FSM/config writes already
+    # persisted stand; only the returned status is forced to error.
+    if any_infra_error:
+        return step_error(
+            f"peer-reachability: probe infrastructure error this tick "
+            f"({peers_up}/{len(peer_ids)} peer(s) up; reachability unknowable)"
+            + (" + IP-drift rebind recorded" if rebind_recorded else ""),
+            fields=fields)
     # A state advance (a peer transition or a recorded rebind) is PROGRESS this
     # tick → report step_changed even if the mesh is now fully up (a down→up
     # recovery must not be reported as a converged no-op — it advanced state).
+    # Reached only when every probe CLEANLY determined reachability (no
+    # infra-error), so a `changed` here is legit clean down/up-detection.
     if any_state_changed:
         return step_changed(
             f"{peers_up}/{len(peer_ids)} peer(s) up"
