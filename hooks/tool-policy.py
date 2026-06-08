@@ -4501,12 +4501,87 @@ def protected_alias_reason(
     # are off-limits for every non-admin agent regardless of class.
     # Substring deny because the path can ride inside a heredoc body or
     # a quoted blob the argv parser cannot surface as a clean token.
+    #
+    # Issue #1692 deliberately does NOT add an admin carve-out here. The
+    # admin read-intent carve-out below covers PEER-HOME reads only; the
+    # `shared/private` + `shared/secrets` forbidden subtrees hold operator
+    # secrets and stay DENIED for every agent INCLUDING admin (codex
+    # direction-consult: least privilege — admin is the operator's deputy
+    # for sanctioned auditable workflows, not a blanket Bash reader of
+    # arbitrary secret blobs). This keeps #1690's admin Stage-A teeth
+    # (`cat <tasks.db> <shared/secrets/…>` stays DENY) intact. The non-
+    # Bash `protected_path_reason` currently lets admin Reads bypass this
+    # forbidden-subtree gate (its `if admin: return None` precedes the
+    # check) — that over-permission is a separate follow-up, NOT the
+    # parity target to copy into Bash.
     for forbidden_alias in _shared_forbidden_aliases():
         if forbidden_alias in text:
             return (
                 "cross-agent access is blocked: shared/private and "
                 "shared/secrets are off-limits"
             )
+
+    # Issue #1692 — admin read-intent carve-out for the Bash PEER-HOME
+    # gate (Stage B), mirroring the non-Bash `protected_path_reason` admin
+    # read exemption for peer agent homes. Without this an admin
+    # (`is_admin_agent`) could `Read file_path=<peer>/MEMORY.md` but the
+    # SAME read via Bash `cat`/`grep` was denied, blocking routine admin
+    # triage. Placed AFTER the Stage A shared-forbidden deny so admin
+    # reads of `shared/private|secrets` stay blocked (see above).
+    #
+    # Scope is deliberately NARROW and fail-closed. The carve-out fires
+    # ONLY when ALL of the following hold:
+    #   - `is_admin_agent(agent)` — keyed on admin, NOT
+    #     `current_agent_class()`. admin and system-class are separate
+    #     concepts (class is only user|system; admin is resolved via
+    #     session-type / admin id). The system-class read carve-out in
+    #     Stage B below stays reachable independently for a system-class
+    #     non-admin agent; non-admin agents never reach this branch.
+    #   - `read_intent` — `_is_read_intent_bash(text)`. This already
+    #     fails closed on output redirection, in-place / output-file /
+    #     external-exec reader forms (`sed -i`, `sort -o`, `uniq IN OUT`,
+    #     `xxd`, `yq -i`/`-s`, `awk` in-program redirect/pipe/system,
+    #     `find -delete/-exec`, pager `+cmd`, `rg --pre`, dangerous env
+    #     prefixes) and on unquoted shell embeddings (#1690). So an admin
+    #     WRITE-intent command to a peer home falls through to the Stage
+    #     B deny below and stays blocked — admin mutations to peer state
+    #     still route through the queue, never direct Bash. This is
+    #     intentionally tighter than the non-Bash `if admin: return None`.
+    #   - `not read_carveout_blocked_by_expansion` — a read whose path is
+    #     spelled via an unresolved `$VAR`/`~`/brace expansion loses the
+    #     carve-out (#1690 r4 FIX 2): the literal protected path never
+    #     appears for the substring gate, so a forbidden sibling could be
+    #     smuggled in. Fail closed.
+    #   - `not _command_has_shell_embedding(text)` — belt-and-suspenders
+    #     re-check (catches single-quoted embeddings the `read_intent`
+    #     unquoted-only check passes), mirroring the Stage B system-class
+    #     guard so an embedded mutation cannot ride a read leader.
+    #
+    # We emit a `system_cross_agent_read` audit row (one per matched peer
+    # alias) so the operator keeps a full ledger of admin cross-agent
+    # reads, matching the Stage B system-class discipline. We return None
+    # ONLY when a peer alias actually matched, so a non-matching admin
+    # command falls through unchanged. NOTE: the raw-substring alias
+    # matching has a separate, pre-existing brace/`$BRIDGE_HOME` spelling
+    # gap tracked in #1709 — NOT addressed here.
+    if (
+        admin
+        and read_intent
+        and not read_carveout_blocked_by_expansion
+        and not _command_has_shell_embedding(text)
+    ):
+        admin_peer_read_audited = False
+        for peer_alias in _peer_alias_list(agent):
+            if peer_alias in text:
+                emit_system_cross_agent_read(
+                    agent=agent,
+                    target_path=peer_alias,
+                    target_agent="",
+                    tool="Bash",
+                )
+                admin_peer_read_audited = True
+        if admin_peer_read_audited:
+            return None
 
     # Stage B: peer-agent-home substring deny with a system-class
     # read-intent exception path. The default stance is deny: a system-
