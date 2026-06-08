@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import bridge_a2a_common as a2a
+import bridge_reconcile_common as reconcile
 
 try:
     # A2A rooms (design §6, §14 R2/R6): the room-scoped receiver-check seam
@@ -910,6 +911,12 @@ class ReconcileResult:
         self.new_bind: str = ""
         self.new_port: int = 0
         self.bind_error: str = ""
+        # v0.16.5 Lane 0: per-step outcomes from the ordered reconcile
+        # sequence (stable-addr → tunnel-health → peer-reachability →
+        # roster-epoch). Keyed by step id; value is the recorded status string.
+        # bind-reprove is reflected via want_rebind/bind_error above AND
+        # mirrored into this map for observability.
+        self.steps: dict[str, str] = {}
 
     def summary(self) -> str:
         parts: list[str] = []
@@ -929,10 +936,21 @@ class ReconcileResult:
                 f"current={self.old_bind}:{self.old_port}")
         else:
             parts.append(f"bind=unchanged({self.old_bind}:{self.old_port})")
+        # Append the non-trivial Lane-0 step outcomes (skip pure converged/noop
+        # to keep the log line terse — those are the steady state).
+        notable = {
+            s: r for s, r in self.steps.items()
+            if r not in (reconcile.RESULT_CONVERGED, reconcile.RESULT_NOOP)
+        }
+        if notable:
+            parts.append("steps=" + ",".join(
+                f"{s}:{r}" for s, r in notable.items()))
         return " ".join(parts)
 
     def changed(self) -> bool:
-        return self.config_reloaded or self.want_rebind
+        if self.config_reloaded or self.want_rebind:
+            return True
+        return any(r == reconcile.RESULT_CHANGED for r in self.steps.values())
 
 
 def reconcile_once(server: "HandoffServer",
@@ -950,6 +968,16 @@ def reconcile_once(server: "HandoffServer",
          new_bind/new_port. On any proof failure (Tailscale unavailable,
          candidate not in the tailnet set, …) it keeps the current bind and
          records the error — NEVER an unproven address.
+      3. (v0.16.5 Lane 0) Runs the ORDERED idempotent reconcile step sequence
+         through the durable backoff store (state/handoff/reconcile.db):
+            stable-addr → bind-reprove → tunnel-health → peer-reachability
+            → roster-epoch
+         Each step is gated by step_is_eligible(...) (bounded backoff) and its
+         outcome recorded via record_attempt(...). A step that raises is caught
+         and recorded as `error` — it NEVER crashes the tick. `resolve_bind()`
+         stays the only bind oracle: the stable-addr step (a stub until #1705)
+         only PROPOSES desired config; the actual rebind decision remains the
+         resolve_bind() path above.
 
     Never raises for an operational failure; the daemon keeps serving.
     """
@@ -991,7 +1019,13 @@ def reconcile_once(server: "HandoffServer",
         audit("reconcile_bind_kept", code=exc.code, detail=str(exc)[:200],
               current_bind=server.bound_address, security=True)
 
-    # --- 3. publish the validated config LAST ---
+    # --- 3. ordered idempotent reconcile sequence (v0.16.5 Lane 0) ---
+    # Run the desired-vs-observed steps through the durable backoff store. The
+    # store open is best-effort: if it cannot be opened the reconcile DEGRADES
+    # to the existing config+bind behavior (it never blocks the bind self-heal).
+    _run_reconcile_steps(server, result, proof_cfg)
+
+    # --- 4. publish the validated config LAST ---
     # Done after the bind decision so both used a consistent snapshot. Only
     # swap when the reload succeeded; a malformed reload keeps last-good.
     if new_cfg is not None:
@@ -999,6 +1033,107 @@ def reconcile_once(server: "HandoffServer",
         result.config_reloaded = True
 
     return result
+
+
+def _run_reconcile_steps(server: "HandoffServer", result: "ReconcileResult",
+                         proof_cfg: dict[str, Any]) -> None:
+    """Run the ordered Lane-0 reconcile step sequence through the durable store.
+
+    The order matches the design SSOT:
+        stable-addr → bind-reprove → tunnel-health → peer-reachability
+        → roster-epoch
+    Each step is eligibility-gated (bounded backoff) and its recorded outcome
+    is mirrored into `result.steps` for the summary/audit. FAIL-SAFE is layered:
+    a raising adapter is caught inside reconcile.run_step, AND the whole step
+    body here is wrapped so ANY store/write failure (a corrupt reconcile.db, an
+    OSError mkdir, a write that raises mid-sequence) degrades to a no-op + audit
+    rather than crashing the daemon tick. The store open itself catches both
+    sqlite3.Error and OSError (mkdir). `bind-reprove` is NOT re-run here — its
+    existing decision (above) is just RECORDED into the store for observability
+    (converged when the bind was unchanged, changed when a rebind is wanted,
+    error when it could not prove).
+    """
+    try:
+        transport = a2a.transport_kind(proof_cfg)
+    except a2a.A2AError:
+        # A malformed transport config must not crash the tick; the per-step
+        # adapters fail-safe on their own, but we still want a sane kind for the
+        # stubs. Fall back to the default.
+        transport = a2a.TRANSPORT_TAILSCALE
+
+    try:
+        # open_reconcile_db mkdir's the handoff dir, so an OSError (read-only fs,
+        # perms) is as possible as a sqlite3.Error on a corrupt/locked store —
+        # either way the reconcile DEGRADES to the existing config+bind behavior
+        # (never blocks the bind self-heal).
+        conn = reconcile.open_reconcile_db()
+    except (sqlite3.Error, OSError) as exc:
+        audit("reconcile_store_unavailable", detail=str(exc)[:200])
+        return
+
+    def _emit(step: str, step_result: "reconcile.ReconcileStepResult") -> None:
+        # Structured per-step event. Steady-state converged/noop steps are not
+        # audited (they are the no-news baseline); only notable transitions and
+        # errors emit, keeping the audit log signal-rich.
+        if step_result.status in (reconcile.RESULT_CONVERGED, reconcile.RESULT_NOOP):
+            return
+        audit("reconcile_step", step=step, status=step_result.status,
+              detail=step_result.detail[:200])
+
+    try:
+        # 1. stable-addr — proposes desired listen address (stub #1705).
+        r = reconcile.run_step(
+            conn, reconcile.STEP_STABLE_ADDR,
+            lambda: reconcile.stable_local_addr(transport, proof_cfg),
+            on_event=_emit)
+        result.steps[reconcile.STEP_STABLE_ADDR] = r.status
+
+        # 2. bind-reprove — RECORD the existing resolve_bind() decision (the
+        #    actual reprove already ran above; we never re-run it). The store is
+        #    written UNGATED for this step (the bind self-heal must not be paced
+        #    by backoff — resolve_bind() is the security oracle and runs every
+        #    tick) — we record it purely for observability.
+        if result.bind_error:
+            bind_status = reconcile.RESULT_ERROR
+        elif result.want_rebind:
+            bind_status = reconcile.RESULT_CHANGED
+        else:
+            bind_status = reconcile.RESULT_CONVERGED
+        reconcile.record_attempt(conn, reconcile.STEP_BIND_REPROVE, bind_status)
+        result.steps[reconcile.STEP_BIND_REPROVE] = bind_status
+
+        # 3. tunnel-health (stub #1706).
+        r = reconcile.run_step(
+            conn, reconcile.STEP_TUNNEL_HEALTH,
+            lambda: reconcile.tunnel_health(transport, proof_cfg),
+            on_event=_emit)
+        result.steps[reconcile.STEP_TUNNEL_HEALTH] = r.status
+
+        # 4. peer-reachability (stub #1707).
+        r = reconcile.run_step(
+            conn, reconcile.STEP_PEER_REACHABILITY,
+            lambda: reconcile.peer_reachability_step(proof_cfg, conn),
+            on_event=_emit)
+        result.steps[reconcile.STEP_PEER_REACHABILITY] = r.status
+
+        # 5. roster-epoch (stub #1695-P2).
+        r = reconcile.run_step(
+            conn, reconcile.STEP_ROSTER_EPOCH,
+            lambda: reconcile.roster_epoch_reconcile(proof_cfg, conn),
+            on_event=_emit)
+        result.steps[reconcile.STEP_ROSTER_EPOCH] = r.status
+    except Exception as exc:  # noqa: BLE001 - fail-safe: a store/write failure mid-sequence never crashes the tick
+        # run_step already catches a raising ADAPTER; this backstop covers a
+        # store-write failure (record_attempt on a corrupt/locked db, etc.) so
+        # the reconcile tick (and the unguarded serve loop that drives it) can
+        # never die on durable-state I/O. The config+bind decision already
+        # happened before this function; it is preserved.
+        audit("reconcile_steps_aborted", detail=str(exc)[:200])
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
 
 
 # --------------------------------------------------------------------------
