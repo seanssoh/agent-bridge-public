@@ -52,7 +52,7 @@ HELPER="$SMOKE_TMP_ROOT/derive_check.py"
 {
   printf '%s\n' 'import importlib.util, os, sys'
   printf '%s\n' ''
-  printf '%s\n' 'repo_root = os.environ["REPO_ROOT"]'
+  printf '%s\n' 'repo_root = os.environ["REPO_ROOT"]'  # noqa: iso-helper-boundary — os.environ stdlib read, not a .env-file controller->iso callsite
   printf '%s\n' 'target = os.path.join(repo_root, "bridge-cron-runner.py")'
   printf '%s\n' 'spec = importlib.util.spec_from_file_location("bridge_cron_runner", target)'
   printf '%s\n' 'module = importlib.util.module_from_spec(spec)'
