@@ -252,6 +252,111 @@ def _roster_agents() -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Signed invite link (reach=) — A2A Rooms v0.16.5 Lane 4, #1695
+# --------------------------------------------------------------------------
+
+_INVITE_LINK_VERSION = "2"
+
+
+def _leader_reach_from_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Build the leader's transport reach locator {kind, address, port} from the
+    local A2A config's `listen` block. NO secret rides here."""
+    listen = cfg.get("listen", {}) if isinstance(cfg, dict) else {}
+    try:
+        kind = a2a.transport_kind(cfg)
+    except Exception:  # noqa: BLE001 - default tailscale on any shape error
+        kind = a2a.TRANSPORT_TAILSCALE if a2a is not None else "tailscale"
+    address = str(listen.get("address", "") or "").strip()
+    try:
+        port = int(listen.get("port", 8787) or 8787)
+    except (TypeError, ValueError):
+        port = 8787
+    return {"kind": kind, "address": address, "port": port}
+
+
+def _make_invite_link_for(node: str, token: str, room_id: str) -> str:
+    """Build the invite link the leader hands out. When the local A2A config is
+    available, emit a v2 SIGNED invite whose `reach=` (the leader's transport
+    locator) is bound into a token-signed canonical so a relayed/tampered link
+    cannot redirect a joiner's first contact. Falls back to the legacy unsigned
+    link (single-node / no a2a / no reachable address)."""
+    if a2a is None:
+        return rooms.make_invite_link(room_id, node, token)
+    try:
+        cfg = a2a.load_config()
+    except Exception:  # noqa: BLE001 - single-node has no config
+        return rooms.make_invite_link(room_id, node, token)
+    reach = _leader_reach_from_cfg(cfg)
+    if not reach["address"]:
+        # No reachable address to advertise → keep the legacy unsigned link
+        # (Tailscale node_id/MagicDNS resolvable peers do not need reach=).
+        return rooms.make_invite_link(room_id, node, token)
+    leader_bridge = str(cfg.get("bridge_id", "") or "").strip() or node
+    issued_ts = a2a.now_ts()
+    ttl = 0
+    nonce = a2a.new_message_id(leader_bridge).split(":", 1)[-1]
+    token_sha = rooms.hash_token(token)
+    reach_param = f"{reach['kind']}:{reach['address']}:{reach['port']}"
+    canonical = a2a.invite_canonical(
+        version=_INVITE_LINK_VERSION, room_id=room_id, leader_node=node,
+        leader_bridge=leader_bridge, reach=reach, token_sha256=token_sha,
+        issued_ts=issued_ts, ttl=ttl, nonce=nonce)
+    sig = a2a.sign_invite_canonical(token, canonical)
+    signed = {
+        "v": _INVITE_LINK_VERSION,
+        "lb": leader_bridge,
+        "reach": reach_param,
+        "iat": str(issued_ts),
+        "ttl": str(ttl),
+        "nonce": nonce,
+        "s": sig,
+    }
+    return rooms.make_invite_link(room_id, node, token, signed=signed)
+
+
+def _verify_and_extract_reach(parsed: dict[str, str], token: str
+                              ) -> Optional[dict[str, Any]]:
+    """Joiner-side: verify a v2 signed invite's token-bound canonical and return
+    the trusted reach {kind, address, port}. Returns None for a legacy/unsigned
+    link (no `s=`). RAISES rooms.RoomsError on a SIGNATURE MISMATCH (a tampered
+    reach= / forged link) so the joiner fails closed rather than trusting an
+    attacker-redirected first contact."""
+    if a2a is None or not parsed.get("s"):
+        return None
+    reach_param = parsed.get("reach", "")
+    # reach_param == "<kind>:<address>:<port>". Split from the RIGHT so an IPv6
+    # address (which contains ':') survives — split off port, then kind.
+    kind, address, port = "", "", 0
+    if reach_param:
+        try:
+            head, port_s = reach_param.rsplit(":", 1)
+            kind, address = head.split(":", 1)
+            port = int(port_s)
+        except (ValueError, IndexError):
+            raise rooms.RoomsError(
+                "invite link reach= is malformed", code="bad_invite_reach")
+    reach = {"kind": kind, "address": address, "port": port}
+    try:
+        issued_ts = int(parsed.get("iat", "0") or "0")
+        ttl = int(parsed.get("ttl", "0") or "0")
+    except ValueError:
+        raise rooms.RoomsError("invite link iat/ttl malformed",
+                               code="bad_invite_link")
+    canonical = a2a.invite_canonical(
+        version=parsed.get("v", _INVITE_LINK_VERSION),
+        room_id=parsed.get("room", ""), leader_node=parsed.get("leader", ""),
+        leader_bridge=parsed.get("lb", ""), reach=reach,
+        token_sha256=rooms.hash_token(token), issued_ts=issued_ts, ttl=ttl,
+        nonce=parsed.get("nonce", ""))
+    if not a2a.verify_invite_canonical(token, canonical, parsed.get("s", "")):
+        raise rooms.RoomsError(
+            "invite link signature verification failed — the reach=/identity "
+            "locator was tampered with or the link was forged (refusing first "
+            "contact)", code="invite_sig_mismatch")
+    return reach
+
+
+# --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
 
@@ -279,7 +384,7 @@ def cmd_create(args: argparse.Namespace) -> int:
         )
     finally:
         conn.close()
-    link = rooms.make_invite_link(room_id, node, token)
+    link = _make_invite_link_for(node, token, room_id)
     if args.json:
         out(json.dumps({
             "room_id": room_id, "name": args.name or "",
@@ -453,7 +558,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
         rooms.set_invite_token(conn, args.room_id, token, once=args.once, ttl=ttl)
     finally:
         conn.close()
-    link = rooms.make_invite_link(args.room_id, node, token)
+    link = _make_invite_link_for(node, token, args.room_id)
     if args.json:
         out(json.dumps({"room_id": args.room_id, "invite_link": link,
                         "once": bool(args.once)}))
@@ -471,8 +576,73 @@ def cmd_rotate_invite(args: argparse.Namespace) -> int:
     return cmd_invite(args)
 
 
+def _joiner_bootstrap_leader_peer(
+    cfg: dict[str, Any], *, leader_node: str, room_id: str, token: str,
+    bootstrap_reach: Optional[dict[str, Any]], local_bridge_id: str,
+) -> dict[str, Any]:
+    """Self-register a local node-link peer for the leader so a first-contact
+    join can sign with the DERIVED per-pair key (Lane 4 zero-touch join).
+
+    The peer `secret` is `room_pair_key_from_token(raw_token, room, leader,
+    joiner=local_bridge_id)` — the SAME key the leader derives from the stored
+    seed. The `address` is the VERIFIED reach= address (a relayed/tampered reach=
+    was already rejected upstream by the token-signed canonical check). Writes
+    atomically under the same TOCTOU lock the receiver uses, then updates the
+    live in-mem cfg so the immediate send resolves the peer. RAISES
+    rooms.RoomsError when there is no reach to bootstrap from.
+    """
+    if not bootstrap_reach or not bootstrap_reach.get("address"):
+        raise rooms.RoomsError(
+            f"no local node-link to leader {leader_node!r} and the invite link "
+            "carries no signed reach= locator to bootstrap one — re-issue the "
+            "invite with `agb room invite` from a node that has a reachable "
+            "listen address", code="no_leader_peer_no_reach")
+    pair_key = a2a.room_pair_key_from_token(
+        token, room_id=room_id, leader_node=leader_node,
+        joiner_node=local_bridge_id)
+    address = str(bootstrap_reach.get("address", "")).strip()
+    try:
+        port = int(bootstrap_reach.get("port", 0) or 0)
+    except (TypeError, ValueError):
+        port = 0
+    try:
+        transport = a2a.transport_kind(cfg)
+    except a2a.A2AError:
+        transport = ""
+    changed, code = a2a.auto_register_room_peer_locked(
+        None, peer_id=leader_node, address=address, port=port,
+        secret=pair_key, inbound_allowlist=[], transport=transport)
+    if code == "peer_conflict":
+        raise rooms.RoomsError(
+            f"a local peer {leader_node!r} already exists with a different "
+            "secret — refusing to overwrite it (rotate/clear it first)",
+            code="leader_peer_conflict")
+    if not changed and code not in ("noop",):
+        raise rooms.RoomsError(
+            f"could not bootstrap a local node-link to {leader_node!r}: {code}",
+            code="bootstrap_register_failed")
+    peer_entry: dict[str, Any] = {
+        "id": leader_node, "address": address, "secret": pair_key,
+        "inbound_allowlist": [],
+    }
+    if port:
+        peer_entry["port"] = port
+    peers = cfg.setdefault("peers", [])
+    if isinstance(peers, list):
+        replaced = False
+        for i, p in enumerate(peers):
+            if isinstance(p, dict) and p.get("id") == leader_node:
+                peers[i] = peer_entry
+                replaced = True
+                break
+        if not replaced:
+            peers.append(peer_entry)
+    return peer_entry
+
+
 def _post_room_join_request(*, leader_node: str, room_id: str, token: str,
                             joiner_agent: str, timeout: float = 30.0,
+                            bootstrap_reach: Optional[dict[str, Any]] = None,
                             ) -> tuple[int, bytes]:
     """POST a signed cross-node room-join-request to the leader's node (P4.1).
 
@@ -483,6 +653,15 @@ def _post_room_join_request(*, leader_node: str, room_id: str, token: str,
     `joiner_agent` is the OS-actor-anchored agent id (resolved by the CALLER via
     caller_agent / resolve_os_actor) — NEVER a --from/env value. Returns
     (http_status, response_body).
+
+    Lane 4 (#1695): when there is NO local node-link to the leader yet AND a
+    VERIFIED `bootstrap_reach` (the token-signed reach= locator) is supplied, the
+    joiner self-bootstraps a local leader peer entry under a TOCTOU lock — its
+    `secret` is the per-pair key DERIVED from the raw token (HKDF, the SAME key
+    the leader derives from the stored seed), its `address` is the verified
+    reach= address (never an out-of-band hand-carried IP). The join request then
+    signs with that derived key; the leader's receiver derives the matching key
+    and the HMAC check passes. This is the zero-touch first-contact path.
 
     A test seam (BRIDGE_ROOMS_TEST_POST_HOOK, gated by the paired
     BRIDGE_ROOMS_ALLOW_TEST_UID_MAP=1 + BRIDGE_A2A_ALLOW_TEST_BIND=1 flags) lets
@@ -502,7 +681,14 @@ def _post_room_join_request(*, leader_node: str, room_id: str, token: str,
             "config has no 'bridge_id' — cannot identify this node for a "
             "cross-node join", code="no_bridge_id",
         )
-    peer = a2a.find_peer(cfg, leader_node)
+    try:
+        peer = a2a.find_peer(cfg, leader_node)
+    except a2a.A2AError:
+        # No local node-link to the leader yet — self-bootstrap one from the
+        # token-signed reach= locator (Lane 4 zero-touch first contact).
+        peer = _joiner_bootstrap_leader_peer(
+            cfg, leader_node=leader_node, room_id=room_id, token=token,
+            bootstrap_reach=bootstrap_reach, local_bridge_id=local_bridge_id)
     secret = a2a.peer_send_secret(peer)
     token_hash = rooms.hash_token(token)
     body = a2a.build_room_join_request(
@@ -1198,10 +1384,19 @@ def cmd_join(args: argparse.Namespace) -> int:
     # verifies + persists the pending row (no local rooms.db write here — this
     # node is not the leader's node and has no authority over the room).
     if leader_node and leader_node != node:
+        # Lane 4 (#1695): if the link is a v2 SIGNED invite, verify the
+        # token-bound canonical FIRST and extract the trusted reach= locator. A
+        # tampered/forged reach= raises here (fail closed — never trust a relayed
+        # redirect). `bootstrap_reach` lets `_post_room_join_request`
+        # self-register a local node-link when none exists yet.
+        try:
+            bootstrap_reach = _verify_and_extract_reach(parsed, token)
+        except rooms.RoomsError as exc:
+            return die(str(exc), code=1)
         try:
             status, resp = _post_room_join_request(
                 leader_node=leader_node, room_id=room_id, token=token,
-                joiner_agent=agent,
+                joiner_agent=agent, bootstrap_reach=bootstrap_reach,
             )
         except rooms.RoomsError as exc:
             return die(str(exc), code=1)

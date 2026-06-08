@@ -30,6 +30,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    import fcntl  # POSIX advisory file lock (TOCTOU guard on peer auto-register)
+except ImportError:  # pragma: no cover - non-POSIX; A2A is POSIX-only in practice
+    fcntl = None  # type: ignore[assignment]
+
 PROTOCOL_VERSION = "a2a-enqueue-v1"
 ENVELOPE_PROTOCOL = "agent-bridge.a2a.enqueue.v1"
 SIGNATURE_PREFIX = "v1="
@@ -1612,6 +1617,248 @@ def new_message_id(sender_bridge: str) -> str:
 
 def now_ts() -> int:
     return int(time.time())
+
+
+# --------------------------------------------------------------------------
+# Room-join token-bootstrap key derivation (A2A Rooms v0.16.5 Lane 4, #1695)
+# --------------------------------------------------------------------------
+#
+# The zero-touch room-join path derives a UNIQUE per-pair node-link HMAC key
+# from the room invite token, with strict DOMAIN SEPARATION so the wire-visible
+# token verifier (`sha256(token)`, transmitted in the join body) can NEVER be
+# turned into the HMAC key:
+#
+#   key_seed = HKDF-Extract(salt="a2a-room-pair-seed-v1", ikm=raw_invite_token)
+#   pair_key = HKDF-Expand(key_seed, info="a2a-room-pair-key-v1\n<room>\n
+#                          <leader_node>\n<joiner_node>", L=32)
+#
+# The JOINER holds the raw invite token (it is in the invite link) → derives the
+# key_seed → derives the pair_key. The LEADER never holds the raw token (the
+# wire carries only sha256(token)); it persists the key_seed in controller-owned
+# rooms state at invite-creation time and derives the SAME pair_key from the
+# stored seed. Because Extract is one-way (HMAC), the wire-visible token HASH
+# (sha256) is NOT the seed and cannot reconstruct it — that is the domain
+# separation the adversarial test "token-hash-as-key rejected" proves.
+#
+# RFC 5869 (HKDF) instantiated with HMAC-SHA256: Extract puts the domain label
+# in the salt position; Expand binds the room/leader/joiner identity in `info`
+# so a pair key is unique per (room, leader, joiner) ordered triple and cannot
+# be replayed against a different room or peer.
+
+_ROOM_PAIR_SEED_SALT = b"a2a-room-pair-seed-v1"
+_ROOM_PAIR_KEY_INFO = b"a2a-room-pair-key-v1"
+_ROOM_INVITE_SIG_SALT = b"a2a-room-invite-sig-v1"
+
+
+def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
+    """RFC 5869 HKDF-Extract (HMAC-SHA256). Returns the 32-byte PRK."""
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def hkdf_expand(prk: bytes, info: bytes, length: int = 32) -> bytes:
+    """RFC 5869 HKDF-Expand (HMAC-SHA256). `length` <= 32 (one block)."""
+    if length > hashlib.sha256().digest_size:
+        raise A2AError("hkdf_expand length exceeds one HMAC-SHA256 block",
+                       code="hkdf_length")
+    t = hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+    return t[:length]
+
+
+def room_pair_key_seed(raw_token: str) -> str:
+    """Derive the secret-equivalent key SEED from the raw invite token.
+
+    This is the controller-owned, leader-stored material (NOT the wire-visible
+    `sha256(token)` verifier). Returned as a hex string for JSON-safe storage in
+    rooms.db invite state while the invite is valid.
+    """
+    seed = hkdf_extract(_ROOM_PAIR_SEED_SALT, raw_token.encode("utf-8"))
+    return seed.hex()
+
+
+def room_pair_key_from_seed(key_seed_hex: str, *, room_id: str,
+                            leader_node: str, joiner_node: str) -> str:
+    """Derive the per-pair node-link HMAC key from the stored key SEED.
+
+    Both sides call this with the SAME seed (the leader reads it from rooms
+    state; the joiner re-derives it from the raw token via `room_pair_key_seed`)
+    and the SAME (room, leader_node, joiner_node) triple, so they agree on the
+    key. The returned hex string is what gets persisted as the peer `secret`.
+    """
+    prk = bytes.fromhex(key_seed_hex)
+    info = b"\n".join([
+        _ROOM_PAIR_KEY_INFO,
+        room_id.encode("utf-8"),
+        leader_node.encode("utf-8"),
+        joiner_node.encode("utf-8"),
+    ])
+    return hkdf_expand(prk, info, 32).hex()
+
+
+def room_pair_key_from_token(raw_token: str, *, room_id: str,
+                             leader_node: str, joiner_node: str) -> str:
+    """Joiner-side convenience: raw token → seed → per-pair key (hex)."""
+    return room_pair_key_from_seed(
+        room_pair_key_seed(raw_token), room_id=room_id,
+        leader_node=leader_node, joiner_node=joiner_node)
+
+
+# --------------------------------------------------------------------------
+# Signed invite locator (reach=) — A2A Rooms v0.16.5 Lane 4, agenda 6
+# --------------------------------------------------------------------------
+#
+# The invite link embeds a `reach=` transport locator so a joiner with NO
+# pre-existing node-link can direct its first room-join request at the leader.
+# `reach=` carries NO secret — only {kind, address, port}. To stop a relayed /
+# tampered link from redirecting first contact to an attacker-controlled
+# address, `reach=` (and the leader/room/token identity) is bound into a SIGNED
+# CANONICAL whose MAC key is derived from the raw token (which only the leader
+# and a legitimate invite-holder possess). A relay attacker who lacks the raw
+# token cannot forge a canonical that verifies, so a `reach=` tamper fails the
+# invite-signature check on the joiner side.
+
+def invite_canonical(*, version: str, room_id: str, leader_node: str,
+                     leader_bridge: str, reach: dict[str, Any],
+                     token_sha256: str, issued_ts: int, ttl: int,
+                     nonce: str) -> str:
+    """Deterministic JSON canonical of the signed invite payload.
+
+    NO secret rides here — `reach` is {kind, address, port}; the bearer token
+    itself is represented only by its verifier hash (`token_sha256`). Keys are
+    sorted so the leader and every joiner recompute byte-identical bytes.
+    """
+    payload = {
+        "v": version,
+        "room_id": room_id,
+        "leader_node": leader_node,
+        "leader_bridge": leader_bridge,
+        "reach": {
+            "kind": str(reach.get("kind", "")),
+            "address": str(reach.get("address", "")),
+            "port": int(reach.get("port", 0) or 0),
+        },
+        "token_sha256": token_sha256,
+        "issued_ts": int(issued_ts),
+        "ttl": int(ttl),
+        "nonce": nonce,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def invite_sig_key(raw_token: str) -> bytes:
+    """Derive the invite-canonical MAC key from the raw token (domain-separated
+    from the pair key so the two derivations never collide)."""
+    return hkdf_extract(_ROOM_INVITE_SIG_SALT, raw_token.encode("utf-8"))
+
+
+def sign_invite_canonical(raw_token: str, canonical: str) -> str:
+    digest = hmac.new(invite_sig_key(raw_token), canonical.encode("utf-8"),
+                      hashlib.sha256)
+    return SIGNATURE_PREFIX + digest.hexdigest()
+
+
+def verify_invite_canonical(raw_token: str, canonical: str,
+                            presented: str) -> bool:
+    """Constant-time verify of a signed invite canonical against the raw token."""
+    if not presented.startswith(SIGNATURE_PREFIX):
+        return False
+    expected = sign_invite_canonical(raw_token, canonical)
+    return hmac.compare_digest(expected, presented)
+
+
+# --------------------------------------------------------------------------
+# TOCTOU-locked peer auto-register (A2A Rooms v0.16.5 Lane 4, #1695)
+# --------------------------------------------------------------------------
+
+def auto_register_room_peer_locked(
+    cfg_path: Optional[Path], *, peer_id: str, address: str, port: int,
+    secret: str, inbound_allowlist: list[str], transport: str,
+) -> tuple[bool, str]:
+    """Atomically add a reverse node-link peer for a token-bootstrapped room
+    join, under an exclusive advisory FILE LOCK (closes the concurrent-join
+    TOCTOU race a bare in-memory check + atomic rename would lose).
+
+    The flow inside the lock mirrors `_identity_update_apply`'s safe-write
+    contract but adds the lock:
+      1. acquire `<cfg>.lock` (flock LOCK_EX) so concurrent unknown-peer joins
+         from the same node serialize on the disk write.
+      2. RELOAD the on-disk config (never the live cached one).
+      3. re-check idempotence: if the peer already exists with the SAME secret,
+         it is a no-op success; if it exists with a DIFFERENT secret, refuse
+         (a re-derivation mismatch / conflict — never silently overwrite a key).
+      4. validate the about-to-be-written config's secret gate.
+      5. write atomic 0600.
+    Returns (changed, code). Fail-closed: any error returns (False, code) and
+    changes nothing. The daemon's reconcile/hot-reload then picks up the peer.
+
+    NEVER trusts a wire-asserted address: the caller passes the SOCKET
+    remote_addr (`client_ip`) as `address`, not a body field.
+    """
+    if not peer_id or not secret:
+        return False, "missing_peer_or_secret"
+    target_path = cfg_path or config_path()
+    lock_path = target_path.with_name(target_path.name + ".lock")  # noqa: raw-pathlib-controller-only
+    lock_fd = -1
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        return False, f"lock_open_failed:{exc}"[:64]
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                return False, f"lock_acquire_failed:{exc}"[:64]
+        # 2. reload from disk under the lock.
+        try:
+            disk_cfg = load_config(target_path)
+        except A2AError as exc:
+            return False, getattr(exc, "code", "config_load_failed")
+        peers = disk_cfg.get("peers")
+        if not isinstance(peers, list):
+            return False, "config_shape"
+        # 3. idempotence / conflict re-check.
+        for p in peers:
+            if isinstance(p, dict) and p.get("id") == peer_id:
+                existing = peer_secrets(p)
+                if secret in existing:
+                    return False, "noop"  # already provisioned (idempotent)
+                return False, "peer_conflict"  # different secret — never clobber
+        entry: dict[str, Any] = {
+            "id": peer_id,
+            "address": address,
+            "secret": secret,
+            "inbound_allowlist": list(inbound_allowlist),
+        }
+        if port:
+            entry["port"] = int(port)
+        peers.append(entry)
+        # 4. re-validate the secret gate before writing.
+        try:
+            validate_config_peer_secrets(disk_cfg, side="receiver")
+        except A2AError as exc:
+            return False, getattr(exc, "code", "secret_gate")
+        try:
+            orig_mode = target_path.stat().st_mode & 0o777  # noqa: raw-pathlib-controller-only
+        except OSError:
+            orig_mode = 0o600
+        # 5. atomic 0600 write.
+        try:
+            write_config_atomic(target_path, disk_cfg, orig_mode)
+        except OSError as exc:
+            return False, f"write_failed:{exc}"[:64]
+        return True, "registered"
+    finally:
+        if lock_fd >= 0:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------

@@ -528,6 +528,13 @@ CREATE TABLE IF NOT EXISTS rooms (
   -- this column simply gets 0 and never expires). verify_invite_token
   -- enforces `invite_token_ts + invite_token_ttl >= now` when ttl > 0.
   invite_token_ttl   INTEGER NOT NULL DEFAULT 0,
+  -- Lane 4 (#1695): secret-equivalent HKDF key SEED derived from the raw
+  -- invite token at create/rotate time (NOT the wire-visible sha256 verifier).
+  -- The leader derives the per-pair node-link key from this seed when a
+  -- token-bootstrapped join arrives. NULL/'' == no seed (a P1/P4.1 room that
+  -- predates token-bootstrap, or a burned/rotated-away invite). Domain-
+  -- separated from invite_token_sha256 so the wire hash can never become a key.
+  invite_key_seed    TEXT,
   invite_once        INTEGER NOT NULL DEFAULT 0,
   status             TEXT NOT NULL DEFAULT 'active',
   created_ts         INTEGER NOT NULL,
@@ -639,6 +646,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         "ALTER TABLE room_join_requests ADD COLUMN verified INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE room_join_requests ADD COLUMN via_node TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE room_join_requests ADD COLUMN ttl_expiry INTEGER NOT NULL DEFAULT 0",
+        # Lane 4 (#1695): token-bootstrap key seed. Nullable (no NOT NULL) so a
+        # migrated P1/P4.1 row reads NULL == "no seed" rather than a fake value.
+        "ALTER TABLE rooms ADD COLUMN invite_key_seed TEXT",
     )
     for stmt in migrations:
         try:
@@ -779,26 +789,63 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+# Lane 4 (#1695): the token-bootstrap key SEED. This MUST stay byte-identical to
+# `bridge_a2a_common.room_pair_key_seed` (RFC 5869 HKDF-Extract, HMAC-SHA256,
+# salt="a2a-room-pair-seed-v1") so the leader (which stores the seed) and the
+# joiner (which re-derives it from the raw token via a2a) agree on the per-pair
+# key. We compute it locally rather than import a2a so rooms_common keeps no hard
+# dependency on the A2A module (it is imported by single-node-only surfaces too).
+_INVITE_KEY_SEED_SALT = b"a2a-room-pair-seed-v1"
+
+
+def _invite_key_seed_for(token: str) -> str:
+    """HKDF-Extract(salt, raw_token) → hex. Secret-equivalent; stored only in
+    controller-owned rooms.db while the invite is valid."""
+    import hmac as _hmac
+
+    return _hmac.new(_INVITE_KEY_SEED_SALT, token.encode("utf-8"),
+                     hashlib.sha256).hexdigest()
+
+
+# The signed-invite locator (`reach=`) parameters carried in a v2 link, Lane 4
+# (#1695). They are bound into a token-signed canonical (the `s=` param) so a
+# relayed/tampered `reach=` cannot redirect a joiner's first contact. The
+# signing/verification (which needs the raw token) lives in the CLI
+# (bridge-rooms.py) where `bridge_a2a_common` is imported; these helpers stay
+# pure URL builders/parsers so single-node-only surfaces keep no a2a dependency.
+_SIGNED_INVITE_KEYS = ("v", "lb", "reach", "iat", "ttl", "nonce", "s")
+
+
 def make_invite_link(room_id: str, leader_node: str, token: str,
-                     reach: str = "") -> str:
+                     reach: str = "", *, signed: Optional[dict[str, str]] = None
+                     ) -> str:
     """Build the `agbroom://join?...` link the leader hands out ONCE.
 
     The raw token is in the link, never stored. `reach` is an optional
-    transport hint (P2+); empty in single-node P1a.
+    transport hint. `signed` (Lane 4) carries the v2 signed-invite params
+    (`v`, `lb`, `iat`, `ttl`, `nonce`, `s`); when present the link is a signed
+    v2 invite whose `reach`/identity locator a joiner verifies against the raw
+    token before trusting it.
     """
     from urllib.parse import urlencode
 
     params = {"room": room_id, "leader": leader_node, "t": token}
     if reach:
         params["reach"] = reach
+    if signed:
+        for k in _SIGNED_INVITE_KEYS:
+            if k in signed and signed[k] != "":
+                params[k] = signed[k]
     return f"{INVITE_LINK_SCHEME}://join?" + urlencode(params)
 
 
 def parse_invite_link(link: str) -> dict[str, str]:
-    """Parse an `agbroom://join?...` link into {room, leader, t, reach}.
+    """Parse an `agbroom://join?...` link into {room, leader, t, reach, ...}.
 
     Accepts either a full link or a bare room_id (the CLI lets `join` take
-    `<link|room_id>`). A bare room_id yields {"room": <id>} with no token.
+    `<link|room_id>`). A bare room_id yields {"room": <id>} with no token. A v2
+    signed invite additionally surfaces {v, lb, iat, ttl, nonce, s} for the
+    CLI's token-bound canonical verification.
     """
     from urllib.parse import parse_qs, urlsplit
 
@@ -816,7 +863,7 @@ def parse_invite_link(link: str) -> dict[str, str]:
         )
     q = parse_qs(parts.query)
     out: dict[str, str] = {}
-    for key in ("room", "leader", "t", "reach"):
+    for key in ("room", "leader", "t", "reach") + _SIGNED_INVITE_KEYS:
         vals = q.get(key)
         if vals:
             out[key] = vals[0]
@@ -873,13 +920,18 @@ def create_room(conn: sqlite3.Connection, *, name: str, leader_agent: str,
     """
     room_id = mint_room_id()
     ts = now_ts()
+    # Lane 4 (#1695): store the token-bootstrap key seed (HKDF-Extract of the raw
+    # token) alongside the verifier hash. The seed is secret-equivalent material
+    # the leader uses to derive a per-pair node-link key for a token-bootstrapped
+    # join; it is domain-separated from invite_token_sha256.
+    key_seed = _invite_key_seed_for(token)
     conn.execute(
         "INSERT INTO rooms (room_id, name, leader_agent, leader_node, epoch, "
-        "invite_token_sha256, invite_token_ts, invite_token_ttl, invite_once, "
-        "status, created_ts, updated_ts) "
-        "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
+        "invite_token_sha256, invite_token_ts, invite_token_ttl, "
+        "invite_key_seed, invite_once, status, created_ts, updated_ts) "
+        "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
         (room_id, name, leader_agent, leader_node, hash_token(token), ts,
-         max(0, int(ttl)), 1 if once else 0, ROOM_ACTIVE, ts, ts),
+         max(0, int(ttl)), key_seed, 1 if once else 0, ROOM_ACTIVE, ts, ts),
     )
     conn.execute(
         "INSERT INTO room_members (room_id, agent, node, role, joined_ts) "
@@ -935,10 +987,16 @@ def set_invite_token(conn: sqlite3.Connection, room_id: str, token: str,
     `invite_token_ts + ttl >= now`.
     """
     ts = now_ts()
+    # Lane 4 (#1695): rotate the key seed in lockstep with the verifier hash, so
+    # the OLD token's seed is overwritten (revoking its bootstrap derivation) and
+    # the new token's seed is what the leader derives pair keys from.
+    key_seed = _invite_key_seed_for(token)
     conn.execute(
         "UPDATE rooms SET invite_token_sha256=?, invite_token_ts=?, "
-        "invite_token_ttl=?, invite_once=?, updated_ts=? WHERE room_id=?",
-        (hash_token(token), ts, max(0, int(ttl)), 1 if once else 0, ts, room_id),
+        "invite_token_ttl=?, invite_key_seed=?, invite_once=?, updated_ts=? "
+        "WHERE room_id=?",
+        (hash_token(token), ts, max(0, int(ttl)), key_seed, 1 if once else 0,
+         ts, room_id),
     )
     # A rotated token invalidates prior rate-counters too (fresh budget).
     conn.execute(
@@ -1010,9 +1068,12 @@ def verify_invite_token(room: sqlite3.Row, token: str,
 
 def burn_invite_token(conn: sqlite3.Connection, room_id: str) -> None:
     """Clear the token after a `--once` single-use join is approved."""
+    # Lane 4 (#1695): drop the key seed in lockstep — a burned invite can no
+    # longer bootstrap a new pair key (the seed is secret-equivalent material we
+    # keep ONLY while the invite is valid).
     conn.execute(
-        "UPDATE rooms SET invite_token_sha256=NULL, invite_once=0, "
-        "updated_ts=? WHERE room_id=?",
+        "UPDATE rooms SET invite_token_sha256=NULL, invite_key_seed=NULL, "
+        "invite_once=0, updated_ts=? WHERE room_id=?",
         (now_ts(), room_id),
     )
     conn.commit()
