@@ -167,6 +167,502 @@ def _raw_mentions_claude_credentials(raw: str) -> bool:
     )
 
 
+# Issue #1691: the five credential markers in
+# `_raw_mentions_claude_credentials` are NOT all the same risk class, so the
+# deny gates need an intent-aware split rather than the blunt substring scan
+# that denied a benign `grep -l <credfile> .` / `find . -name <credfile>` /
+# message-body mention (a name used as a grep/find SEARCH term, not opened).
+# `_raw_mentions_claude_credentials` itself stays UNCHANGED — it backs the
+# audit-summary hashing choke-point (`_bash_audit_summary_needs_hashing`),
+# whose job is to scrub the log on ANY mention; relaxing it would let token
+# bytes survive into an audit row. Only the deny gates consult the helpers
+# below.
+#
+# Two marker classes:
+#   - VALUE / env-var markers (`sk-ant-o`, `CLAUDE_CODE_OAUTH_TOKEN`): naming
+#     these in a Bash command is itself the exfil signal — there is no legit
+#     list/search/prose Bash use (`echo $CLAUDE_CODE_OAUTH_TOKEN`,
+#     `printenv …`, a bare token run). They stay an UNCONDITIONAL Bash deny,
+#     fail-closed. (`sk-ant-o` is the literal token bytes; the env-var name
+#     is its only-named-to-read-it sibling.)
+#   - FILE-NAME markers (`.credentials.json` + `.claude`, `launch-secrets.env`,
+#     `claude-oauth-tokens.json`): these name a FILE. Naming it as a grep/find
+#     SEARCH term, a grep `pattern`, or a message body does not read the secret
+#     bytes; only an argv that OPENS the file does. These become intent-aware —
+#     denied only when a real argv opener (positional / file-valued flag /
+#     redirect target / non-Bash `file_path`/`path`) references the file. Any
+#     other bare positional of an arbitrary leader (incl. `ls <credfile>`) is
+#     treated as a potential opener and stays DENIED — fail-closed; the
+#     unblock is scoped to the grep/find search positions the issue lists.
+def _raw_mentions_credential_value(raw: str) -> bool:
+    """True iff *raw* names a credential VALUE or its read-only env-var name.
+
+    These two markers are an unconditional deny for Bash: there is no benign
+    list/search/prose Bash use of the literal token bytes or the env-var name
+    (naming the env var means reading its value). Fail-closed.
+    """
+    return "sk-ant-o" in raw or "CLAUDE_CODE_OAUTH_TOKEN" in raw
+
+
+def _fragment_opens_credential_filename(fragment: str) -> bool:
+    """True iff a single argv path *fragment* names a credential FILE.
+
+    The `.credentials.json` marker requires `.claude` in the same fragment so a
+    stray `foo.credentials.json` unrelated file does not over-match — same
+    pairing `_raw_mentions_claude_credentials` uses (it requires both in the
+    whole raw text; here we scope it to the path fragment for precision).
+    """
+    if ".credentials.json" in fragment and ".claude" in fragment:
+        return True
+    return (
+        "launch-secrets.env" in fragment or "claude-oauth-tokens.json" in fragment
+    )
+
+
+def _raw_text_has_credential_filename(raw: str) -> bool:
+    """True iff *raw* contains a credential FILE-name marker (substring).
+
+    The shlex-fail fallback for `_bash_argv_opens_credential_filename` and the
+    deny test for non-Bash `file_path`/`path` inputs. Keeps the `.credentials
+    .json` + `.claude` pairing.
+    """
+    if ".credentials.json" in raw and ".claude" in raw:
+        return True
+    return "launch-secrets.env" in raw or "claude-oauth-tokens.json" in raw
+
+
+# Search commands whose first positional (grep) or `-name`/`-path`/`-regex`
+# value (find) is a PATTERN / SEARCH STRING, NOT a file the command opens.
+# Issue #1691: `grep -l <credfile> .` and `find . -name <credfile>` NAME the
+# credential file as a search term — they do not read its bytes. Distinguishing
+# the search-PATTERN position from a FILE-OPEN position is what lets a benign
+# list/search through while keeping a real open (`cat <credfile>`) denied.
+_GREP_FAMILY_LEADERS = frozenset(
+    {"grep", "egrep", "fgrep", "rg", "zgrep", "zegrep", "zfgrep"}
+)
+# grep flags whose VALUE is a regex pattern (a benign SEARCH term, never a
+# file open). `-e`/`--regexp` (POSIX + rg), `-m`/`--max-count`, `-A`/`-B`/`-C`
+# context counts, `--color` etc. Only the pattern-VALUE flags are listed here;
+# the boolean-flag allowlist below covers value-less flags.
+_GREP_PATTERN_VALUE_FLAGS = frozenset({"-e", "--regexp"})
+# grep flags whose VALUE is a FILE grep OPENS / EXECUTES (an exfil surface, NOT
+# a benign pattern). `-f`/`--file` reads a pattern file; rg `--pre` executes a
+# preprocessor command; rg `--ignore-file`/`--pre-glob` reads a path. These
+# disqualify the benign-mention shape entirely (#1691 r4/r5 P1): if present,
+# the stage is treated as an OPEN and the substring floor applies.
+_GREP_FILE_VALUE_FLAGS = frozenset(
+    {"-f", "--file", "--pre", "--ignore-file", "--pre-glob"}
+)
+# grep long options whose VALUE is a benign NON-file scalar (a count, a color
+# mode, a label, a context size, etc.). Their value is consumed and ignored —
+# it is neither a pattern nor a file, so it does not disqualify the benign
+# mention shape (#1691 r8 P2: `grep --max-count=1 <pattern> .` was over-blocked
+# because the known option looked "unknown"). Conservative allowlist; anything
+# not here stays fail-closed.
+_GREP_SCALAR_VALUE_FLAGS = frozenset(
+    {
+        "--max-count",
+        "--color",
+        "--colour",
+        "--context",
+        "--after-context",
+        "--before-context",
+        "--label",
+        "--binary-files",
+        "--devices",
+        "--directories",
+        "--group-separator",
+        "--max-columns",
+        "--threads",
+        "--sort",
+        "--sortr",
+        "--engine",
+        "--encoding",
+        "--m",
+    }
+)
+# grep/rg value-LESS long flags (booleans) we recognize as safe. Any OTHER long
+# flag stays fail-closed (it might consume a value we cannot account for).
+_GREP_LONG_BOOL_FLAGS = frozenset(
+    {
+        "--ignore-case",
+        "--no-ignore-case",
+        "--invert-match",
+        "--word-regexp",
+        "--line-regexp",
+        "--count",
+        "--files-with-matches",
+        "--files-without-match",
+        "--only-matching",
+        "--line-number",
+        "--no-line-number",
+        "--with-filename",
+        "--no-filename",
+        "--recursive",
+        "--dereference-recursive",
+        "--fixed-strings",
+        "--basic-regexp",
+        "--extended-regexp",
+        "--perl-regexp",
+        "--null",
+        "--null-data",
+        "--text",
+        "--binary",
+        "--quiet",
+        "--silent",
+        "--no-messages",
+        "--byte-offset",
+        "--hidden",
+        "--smart-case",
+        "--ignore-case-rg",
+        "--no-heading",
+        "--heading",
+        "--vimgrep",
+        "--column",
+        "--no-column",
+        "--multiline",
+        "--fixed-strings-rg",
+        "--pcre2",
+        "--no-ignore",
+        "--follow",
+        "--json",
+    }
+)
+# The ONLY grep flags whose value is a benign regex pattern in the separated
+# form (the value-less boolean flags are recognized structurally below). Any
+# OTHER grep flag (unknown, or a known file/exec flag) makes the stage NOT a
+# provable benign mention → fail-closed substring deny.
+# find predicate flags whose VALUE is a BASENAME glob — a benign search term
+# that does NOT, by itself, enumerate a subtree by full path. `-path`/`-regex`/
+# `-wholename` match the WHOLE path and a `find <allowed-root> -path
+# <secret>/*` STILL enumerates the secret subtree, so they are deliberately
+# EXCLUDED (#1691 r5 P1): a forbidden alias in those predicates denies.
+_FIND_NAME_VALUE_FLAGS = frozenset({"-name", "-iname", "-lname", "-ilname"})
+# Leaders that genuinely take a message-body string flag (`--body`/`-m`/
+# `--title`/…). `-t`/`-m` are NOT message flags for arbitrary commands
+# (`cat -t`, `ls -t`), so the string-payload skip is scoped to these leaders
+# (#1691 r5 P1). Bare names + common path spellings of the bridge CLIs.
+_MESSAGE_BODY_LEADERS = frozenset(
+    {"agb", "agent-bridge", "bridge-task.sh", "bridge-send.sh", "bridge-a2a.py"}
+)
+# Shell interpreters that run a SCRIPT given as their first non-flag argument
+# (`bash bridge-task.sh …`, `sh bridge-send.sh …`). The script basename is the
+# effective leader for message-body recognition (#1691 r8 P2).
+_SCRIPT_RUNNER_LEADERS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
+
+
+def _normalized_stage_leader(stage: str) -> tuple[str, str]:
+    """Return ``(effective_leader, message_leader)`` for *stage*.
+
+    ``effective_leader`` is the basename of the command word (so `./agent-
+    bridge`, `/usr/local/bin/agb`, and `agb` all resolve to `agb`). When the
+    leader is a shell interpreter (`bash <script>`), the SCRIPT basename is
+    used as the message-leader so `bash bridge-task.sh … --body …` is
+    recognized (#1691 r8 P2). Grep/find classification uses ``effective_
+    leader`` (the interpreter case is not grep/find anyway).
+    """
+    raw = _stage_first_token(stage)
+    effective = os.path.basename(raw) if raw else raw
+    message_leader = effective
+    if effective in _SCRIPT_RUNNER_LEADERS:
+        # Find the first non-flag token after the interpreter — the script.
+        try:
+            toks = shlex.split(stage, posix=True, comments=False)
+        except ValueError:
+            toks = []
+        seen_runner = False
+        for tok in toks:
+            if not seen_runner:
+                if os.path.basename(tok) == effective:
+                    seen_runner = True
+                continue
+            if tok.startswith("-"):
+                continue
+            message_leader = os.path.basename(tok)
+            break
+    return effective, message_leader
+
+
+# A bash brace expansion that multiplies one word into several argv words: a
+# `{...}` group containing a top-level comma (`{a,b}`) or a sequence range
+# (`{1..9}` / `{a..z}`). shlex does NOT expand braces, so such a token would be
+# mis-classified as a single mention while bash later splits it into multiple
+# words (one of which can be a real protected-file argument). #1691 r7.
+_BRACE_EXPANSION_RE = re.compile(r"\{[^{}]*(?:,|\.\.)[^{}]*\}")
+
+
+def _stage_mention_only_values(stage: str):
+    """Return the list of token values of a single shell *stage* that sit in a
+    PROVABLY-BENIGN MENTION position — a grep/find SEARCH pattern or a
+    message-body flag value — for the issue #1691 intent-aware gates.
+
+    The model is INVERTED from "yield openers, skip the rest" (which fails
+    OPEN on any mis-classified flag, codex #1691 r5) to "a marker is allowed
+    ONLY when EVERY occurrence is inside a value this returns; ANY other
+    occurrence DENIES." So the caller denies a marker unless it is fully
+    explained by a mention value here. Returns ``None`` when the stage is NOT a
+    provable benign-mention shape (shlex-fail, an unknown/file/exec flag, a
+    non-search/non-message leader, a redirect, or any token we cannot prove is
+    a benign mention) — the caller then applies the raw substring deny floor.
+
+    Recognized benign shapes (all fail-closed; anything off the path → None):
+      * grep family: leader is grep/rg/…; flags limited to the boolean
+        allowlist + `-e`/`--regexp` (pattern) [+ attached `-ePAT`]; NO
+        file/exec flag (`-f`/`--file`/`--pre`/`--ignore-file`/`--pre-glob`),
+        NO redirect, NO unknown flag. Mention values = every `-e` value, every
+        attached `-ePAT`, and the FIRST bare positional (the pattern). Search
+        PATHs (later positionals) are NOT mention values — a marker there is an
+        OPEN and denies.
+      * find: leader is find; mention values = `-name`/`-iname`/`-lname`
+        basename-glob values ONLY. The search ROOT positionals and `-path`/
+        `-regex`/`-wholename` predicate values are NOT mentions (they can
+        enumerate a subtree by full path), and `-exec`/unknown predicates →
+        None (fail-closed).
+      * message-body leader (`agb`/`agent-bridge`/`bridge-task.sh`/…): mention
+        values = every `_STRING_PAYLOAD_FLAGS` value. (`-t`/`-m` are message
+        flags ONLY for these leaders — `cat -t`/`ls -t` are not.)
+    """
+    try:
+        tokens = shlex.split(stage, posix=True, comments=False)
+    except ValueError:
+        return None
+    if not tokens:
+        return []
+
+    # A redirect operator anywhere disqualifies the benign-mention shape: a
+    # redirect target is an open/write, not a mention. Fail closed to the
+    # substring floor (the caller checks the redirect target itself).
+    for tok in tokens:
+        for _ in _redirect_target_fragments(tok):
+            return None
+
+    # codex #1691 r7 P1: a BRACE expansion (`{.,~/…/.credentials.json}`) is ONE
+    # shlex token here but bash later expands it into MULTIPLE argv words, so a
+    # protected path masked as a "pattern" mention becomes a REAL file argument
+    # at run time. shlex does not expand braces, so we cannot prove the mention
+    # is benign. Fail closed: any unresolved brace expansion in the stage drops
+    # to the raw substring deny floor. (`$VAR`/`~` expand IN PLACE — one token
+    # stays one word — so they do NOT reclassify a mention into an opener and
+    # are not failed here; the issue's `~/.claude/…` repro stays allowed.)
+    if _BRACE_EXPANSION_RE.search(stage):
+        return None
+
+    # Normalize the leader basename (`./agent-bridge` / `/usr/bin/agb` → `agb`)
+    # and unwrap a `bash <script>` runner to the script basename for message-
+    # body recognition (#1691 r8 P2).
+    effective_leader, message_leader = _normalized_stage_leader(stage)
+    is_grep = effective_leader in _GREP_FAMILY_LEADERS
+    is_find = effective_leader == "find"
+    is_message = message_leader in _MESSAGE_BODY_LEADERS
+
+    if not (is_grep or is_find or is_message):
+        # Any other leader (`cat`, `ls`, `python3`, an interpreter, an unknown
+        # command) — a marker in its argv is an open/exec, never a benign
+        # mention. Fail closed.
+        return None
+
+    # For grep/find the command word is the leader; for a `bash <script>`
+    # message wrapper, BOTH the runner and the script word precede the flags.
+    leader_words_to_skip = 1
+    if is_message and effective_leader in _SCRIPT_RUNNER_LEADERS:
+        leader_words_to_skip = 2
+
+    mentions: list[str] = []
+    skip_next = False
+    take_next_mention = False
+    leader_words_seen = 0
+    seen_leader = False
+    grep_pattern_supplied = False
+
+    # Grep boolean (value-less) flags we recognize as safe. Anything else
+    # (unknown, or a known file/exec flag) → None (fail-closed). The cluster
+    # form (`-rl`, `-rln`) is decomposed letter-by-letter; a trailing `e`/`f`
+    # consumes a value.
+    _GREP_BOOL_SHORT = set("rlRLinvwxocHhsaEFGPzUbpqV")
+
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if take_next_mention:
+            take_next_mention = False
+            mentions.append(tok)
+            continue
+        if not seen_leader:
+            # Skip the leader word(s): the command word, plus the script word
+            # for a `bash <script>` message wrapper. We count non-flag words so
+            # an interpreter flag (`bash -x script`) does not miscount.
+            if not tok.startswith("-"):
+                leader_words_seen += 1
+                if leader_words_seen >= leader_words_to_skip:
+                    seen_leader = True
+            continue
+
+        if is_message:
+            if tok in _STRING_PAYLOAD_FLAGS:
+                take_next_mention = True
+                continue
+            if tok.startswith("--") and "=" in tok:
+                flag, _, value = tok.partition("=")
+                if flag in _STRING_PAYLOAD_FLAGS:
+                    mentions.append(value)
+                continue
+            # Any other token of a message-body leader is a normal positional /
+            # flag. A marker there (e.g. a real path arg) is NOT a mention.
+            continue
+
+        if is_grep:
+            if tok in _GREP_PATTERN_VALUE_FLAGS:
+                grep_pattern_supplied = True
+                take_next_mention = True   # `-e PATTERN`
+                continue
+            if tok in _GREP_FILE_VALUE_FLAGS:
+                return None                # `-f`/`--pre`/`--ignore-file`: open/exec
+            if tok in _GREP_SCALAR_VALUE_FLAGS:
+                skip_next = True           # `--max-count 1`: scalar, ignore value
+                continue
+            if tok.startswith("--"):
+                if "=" in tok:
+                    flag, _, value = tok.partition("=")
+                    if flag in _GREP_PATTERN_VALUE_FLAGS:
+                        grep_pattern_supplied = True
+                        mentions.append(value)
+                        continue
+                    if flag in _GREP_FILE_VALUE_FLAGS:
+                        return None
+                    if flag in _GREP_SCALAR_VALUE_FLAGS:
+                        # `--max-count=1`: a benign scalar, value ignored.
+                        continue
+                    # An unknown `--flag=value`: cannot prove benign.
+                    return None
+                if tok in _GREP_LONG_BOOL_FLAGS:
+                    continue               # known value-less long flag, safe
+                # An unknown long boolean flag — cannot prove it is value-less
+                # and benign. Fail closed.
+                return None
+            if tok.startswith("-") and len(tok) > 1:
+                body = tok[1:]
+                ok = True
+                consumes = None  # 'e' (pattern) or 'f' (file) at the tail
+                for i, ch in enumerate(body):
+                    if ch in ("e", "f"):
+                        consumes = ch
+                        attached = body[i + 1:]
+                        break
+                    if ch not in _GREP_BOOL_SHORT:
+                        ok = False
+                        break
+                if not ok:
+                    return None            # unknown short flag → fail-closed
+                if consumes == "f":
+                    return None            # `-fFILE` / `-f FILE` opens a file
+                if consumes == "e":
+                    grep_pattern_supplied = True
+                    if attached:
+                        mentions.append(attached)   # `-ePAT`
+                    else:
+                        take_next_mention = True     # `-e PAT`
+                    continue
+                # pure boolean cluster (`-rl`) — value-less, safe.
+                continue
+            # A bare positional.
+            if not grep_pattern_supplied:
+                grep_pattern_supplied = True
+                mentions.append(tok)       # first bare positional = the pattern
+                continue
+            # A later positional is a SEARCH PATH — NOT a mention.
+            continue
+
+        if is_find:
+            if tok in _FIND_NAME_VALUE_FLAGS:
+                take_next_mention = True    # `-name GLOB` basename glob
+                continue
+            if tok.startswith("--") and "=" in tok:
+                flag, _, value = tok.partition("=")
+                if flag in _FIND_NAME_VALUE_FLAGS:
+                    mentions.append(value)
+                    continue
+                # other `-flag=value` predicate — not a mention.
+                continue
+            # `-path`/`-regex`/`-exec`/search-root positionals/unknown
+            # predicates: NOT mention values. A marker there denies. (We do not
+            # fail the whole stage to None here — the caller's substring check
+            # over the non-mention text catches a marker in these positions; a
+            # benign `find <root> -name <marker>` keeps <marker> as a mention.)
+            continue
+
+    return mentions
+
+
+def _stage_marker_in_open_position(stage: str, marker_substrings) -> bool:
+    """True iff any *marker_substrings* member appears in *stage* OUTSIDE a
+    provable benign-mention value (issue #1691, fail-closed).
+
+    The deny floor: blank the benign-mention values
+    (:func:`_stage_mention_only_values`) out of the stage text, then substring-
+    scan the remainder for a marker. A marker that survives sits in an open /
+    exec / inventory position and denies. If the stage is not a provable
+    benign-mention shape (helper returns ``None``), scan the WHOLE stage.
+
+    codex #1691 r6 P1: mask each mention value ONE occurrence at a time (NOT a
+    global replace). When the SAME alias is both the grep pattern AND a real
+    file argument (`grep <secret> <secret>/key.md`), the mentions list holds
+    one entry (the pattern); masking a single occurrence leaves the opener
+    occurrence in `scan_text`, so the open still denies.
+    """
+    mentions = _stage_mention_only_values(stage)
+    scan_text = stage
+    if mentions is not None:
+        for value in mentions:
+            if value:
+                scan_text = scan_text.replace(value, " ", 1)
+    return any(marker in scan_text for marker in marker_substrings)
+
+
+def _stage_argv_opens_credential_filename(stage: str) -> bool:
+    """True iff a single shell *stage* OPENS a credential file by name.
+
+    Fail-closed (#1691 r5): a credential FILE-name marker that appears in any
+    position OTHER than a grep/find search pattern or a message body is treated
+    as an open. The `.credentials.json` marker requires `.claude` in the same
+    stage (mirrors `_raw_text_has_credential_filename`); the other two markers
+    stand alone.
+    """
+    markers = ["launch-secrets.env", "claude-oauth-tokens.json"]
+    if ".claude" in stage:
+        markers = markers + [".credentials.json"]
+    return _stage_marker_in_open_position(stage, markers)
+
+
+def _bash_argv_opens_credential_filename(text: str) -> bool:
+    """True iff *text*, read as shell argv, OPENS a credential file by name.
+
+    Issue #1691: the credential-FILE-name deny must target an actual file
+    open, not a mere textual mention. Each shell stage is classified
+    independently (so `grep -l <credfile> . | cat` checks each leg with its
+    own leader) by :func:`_stage_argv_opens_credential_filename`.
+
+    Fail-closed (codex #1691 r4 P1): a command with a shell embedding /
+    HEREDOC / here-string (`$()`, backtick, process-sub, `<<EOF`/`<<<`, bash5.3
+    funsub) can feed a credential path into an interpreter body or a captured
+    command that the structural stage walk cannot surface (the heredoc body
+    line is split off as its own stage whose first word is treated as a
+    leader). For ANY such command the raw filename-marker scan applies — the
+    same substring floor the pre-#1691 deny had and the shared-forbidden gate
+    keeps. Likewise on an unbalanced command (a stage-split that ends inside a
+    quote).
+    """
+    stages, balanced = _split_command_stages(text)
+    if not balanced:
+        return _raw_text_has_credential_filename(text)
+    if _command_has_shell_embedding(text):
+        return _raw_text_has_credential_filename(text)
+    for stage in stages:
+        if _stage_argv_opens_credential_filename(stage):
+            return True
+    return False
+
+
 # PR #799 r3 codex finding 1 — match process-environment dump verbs
 # that revealed the exported CLAUDE_CODE_OAUTH_TOKEN under the abandoned
 # env-token delivery path. Path A now syncs Claude OAuth through
@@ -1896,6 +2392,42 @@ def _alias_path_fragments(token: str):
             yield fragment
 
 
+# Embedded-redirect splitter. Bash allows a redirection operator GLUED to the
+# command word with NO space: `cat</secret`, `cat<<<x`, `grep x>secret`. `shlex
+# .split` keeps the whole `cat</secret` as ONE token, and `_alias_path_
+# fragments` only peels a redirect prefix when the fragment STARTS with the
+# operator — so the path after a glued mid-token redirect is invisible to a
+# plain fragment scan (codex #1691 review P1: `cat</…/.credentials.json` and
+# `cat</…/shared/secrets/key.md` slipped the structural gates the old raw
+# substring deny caught). This yields the path portion that follows ANY
+# redirect operator embedded in *token*, so the credential-filename and
+# shared-forbidden checks can test it. The leading digit run handles numeric
+# fd redirects (`1>`, `3>>`). Quotes are not modelled here — a quoted redirect
+# target is a different shape the embedding gate / shlex handle.
+_EMBEDDED_REDIRECT_RE = re.compile(r"[0-9]*(?:&>|>>|<<<|<<|2>|>|<)")
+
+
+def _redirect_target_fragments(token: str):
+    """Yield path fragments that follow a redirect operator embedded anywhere
+    in *token* (not just at the start).
+
+    Complements :func:`_alias_path_fragments`: that peels a LEADING redirect
+    prefix, this surfaces a path after a redirect GLUED mid-token to a command
+    word (`cat</secret`). Each match's tail is itself run through
+    :func:`_alias_path_fragments` so a trailing operator on the redirect target
+    is still stripped.
+    """
+    for piece in _COMMAND_OPERATOR_RE.split(token):
+        piece = piece.strip()
+        if not piece:
+            continue
+        for match in _EMBEDDED_REDIRECT_RE.finditer(piece):
+            tail = piece[match.end():].strip()
+            if not tail:
+                continue
+            yield from _alias_path_fragments(tail)
+
+
 # Length below which a substring-fallback needle is considered too generic
 # to fire on its own — e.g. `hooks/` and `state/cron/` are short enough
 # that any heredoc body documenting the hook chain or cron layout will
@@ -2400,6 +2932,86 @@ def _bash_token_resolved_paths(token: str) -> list[Path]:
     return out
 
 
+def _fragment_targets_shared_forbidden(fragment: str) -> bool:
+    """True iff a single argv path *fragment* IS or is UNDER the
+    ``shared/private`` / ``shared/secrets`` forbidden tree.
+
+    Issue #1691 material decision: a NON-admin may MENTION / grep-pattern /
+    prose the shared private/secret name, but must NOT list its inventory
+    (`ls`/`find` the dir) and must NOT open/read a file under it. This helper
+    is the opener-position teeth: it fires when a real argv path token names
+    the forbidden directory (a listing) OR a path inside it (an open). It does
+    NOT fire on a name that only appears in a `--body`/`-m`/prose flag value —
+    the caller skips those tokens before consulting this helper.
+
+    Two checks, fail-closed:
+      1. Resolve the fragment (expandvars + expanduser) and test whether it is
+         the forbidden dir or sits under it via :func:`_resolve_under`. Catches
+         absolute and `~` spellings, plus any file under the tree.
+      2. A prefix-string check against :func:`_shared_forbidden_aliases` so an
+         UNEXPANDED `$BRIDGE_HOME` / `$HOME` spelling (the var is not in the
+         policy-eval env) still denies. The no-slash and trailing-slash
+         variants are both covered by the alias list.
+    """
+    bridge_home = bridge_home_dir()
+    shared_root = bridge_home / "shared"
+    expanded = os.path.expandvars(os.path.expanduser(fragment))
+    if expanded:
+        try:
+            candidate = Path(expanded)
+        except Exception:
+            candidate = None
+        if candidate is not None:
+            rel = _resolve_under(candidate, shared_root)
+            if rel is not None:
+                rel_str = rel.as_posix()
+                for forbidden in _SHARED_FORBIDDEN_PREFIXES:
+                    base = forbidden.rstrip("/")
+                    if rel_str == base or rel_str.startswith(base + "/"):
+                        return True
+    # Unexpanded-var / literal-alias prefix fallback. Compare the RAW fragment
+    # (not the expanded form) so a `$BRIDGE_HOME/shared/secrets/x` opener whose
+    # var did not expand still denies.
+    for alias in _shared_forbidden_aliases():
+        base = alias.rstrip("/")
+        if fragment == base or fragment.startswith(base + "/"):
+            return True
+    return False
+
+
+def _bash_argv_targets_shared_forbidden(text: str) -> bool:
+    """True iff *text*, read as shell argv, LISTS or OPENS the
+    ``shared/private`` / ``shared/secrets`` forbidden tree.
+
+    Issue #1691 (fail-closed, #1691 r5): replaces the blunt
+    ``forbidden_alias in text`` Stage-A substring scan with an
+    intent-aware-but-DENY-by-default check. A forbidden alias is allowed ONLY
+    when EVERY occurrence sits in a provable benign-MENTION value (a grep/find
+    SEARCH pattern or a `--body`/`-m` message body, per
+    :func:`_stage_mention_only_values`). Any other occurrence — a search ROOT
+    or path positional (`ls`/`find` inventory), a file open, an interpreter
+    payload, a `--pre`/file-flag value, an unknown-flag value, a redirect
+    target, or a shell-embedding / heredoc body — DENIES. This honors the
+    material decision: a non-admin may mention / grep-pattern / prose the name,
+    but inventory or any open under the tree stays DENIED.
+
+    Each stage is split independently. A shell embedding / heredoc / shlex-fail
+    falls back to the raw substring scan against :func:`_shared_forbidden_
+    aliases` so a malformed-shell evasion is never weaker than the pre-#1691
+    deny.
+    """
+    forbidden_aliases = _shared_forbidden_aliases()
+    stages, balanced = _split_command_stages(text)
+    if not balanced:
+        return any(alias in text for alias in forbidden_aliases)
+    if _command_has_shell_embedding(text):
+        return any(alias in text for alias in forbidden_aliases)
+    for stage in stages:
+        if _stage_marker_in_open_position(stage, forbidden_aliases):
+            return True
+    return False
+
+
 def _bash_argv_protected_decisions(
     text: str,
     agent: str,
@@ -2495,6 +3107,86 @@ def _bash_argv_protected_decisions(
     return decisions, all_allowed
 
 
+def _string_payload_flag_values(text: str) -> list[str] | None:
+    """Return the shlex-unquoted values of every `_STRING_PAYLOAD_FLAGS`
+    flag in *text* (`-m VALUE`, `--body VALUE`, `--title=VALUE`, …) that
+    belongs to a MESSAGE-BODY command leader.
+
+    Issue #1691: these values are MESSAGE BODIES the command sends
+    elsewhere, not paths it opens — a peer-home / shared alias inside one is
+    a benign mention. The caller subtracts alias occurrences found here from
+    the occurrence-proof so a `agb task create --body '… agents/peer/…'`
+    message body no longer trips the smuggle guard.
+
+    codex #1691 r6 P1: scope the extraction to the bridge CLI leaders that
+    actually take a message-body flag (`_MESSAGE_BODY_LEADERS`). `-t`/`-m` are
+    NOT message flags for arbitrary commands — `cat -t <peer>/MEMORY.md` must
+    NOT have its `<peer>/MEMORY.md` argument mistaken for a `-t` (title) body,
+    or a real peer-file read would be admitted by the message-body shortcut.
+    Each shell stage is classified by its own leader.
+
+    Returns ``None`` on a `shlex.split` ValueError so the caller fails closed
+    (no subtraction → the alias stays counted → deny, the pre-#1691 stance).
+    """
+    stages, balanced = _split_command_stages(text)
+    if not balanced:
+        return None
+    values: list[str] = []
+    for stage in stages:
+        try:
+            tokens = shlex.split(stage, posix=True, comments=False)
+        except ValueError:
+            return None
+        if _stage_first_token(stage) not in _MESSAGE_BODY_LEADERS:
+            continue
+        take_next = False
+        for tok in tokens:
+            if take_next:
+                take_next = False
+                values.append(tok)
+                continue
+            if tok in _STRING_PAYLOAD_FLAGS:
+                take_next = True
+                continue
+            if tok.startswith("--") and "=" in tok:
+                flag, _, value = tok.partition("=")
+                if flag in _STRING_PAYLOAD_FLAGS:
+                    values.append(value)
+    return values
+
+
+def _count_alias_occurrences(haystack: str, peer_aliases: list[str]) -> dict[str, int]:
+    """Count peer-alias occurrences in *haystack*, keyed by peer name.
+
+    Variants overlap (the no-trailing-slash form is a prefix of the
+    trailing-slash form). Sort by length descending and "consume" matched
+    ranges with NUL so the shorter form doesn't double-count.
+    """
+    sorted_aliases = sorted(peer_aliases, key=len, reverse=True)
+
+    def _peer_for_alias(alias: str) -> str:
+        return alias.rstrip("/").rsplit("/", 1)[-1]
+
+    consumed = list(haystack)
+    counts: dict[str, int] = {}
+    for alias in sorted_aliases:
+        peer = _peer_for_alias(alias)
+        if not peer:
+            continue
+        n = len(alias)
+        i = 0
+        while True:
+            joined = "".join(consumed)
+            idx = joined.find(alias, i)
+            if idx < 0:
+                break
+            for k in range(idx, idx + n):
+                consumed[k] = "\0"
+            counts[peer] = counts.get(peer, 0) + 1
+            i = idx + n
+    return counts
+
+
 def _argv_occurrences_explain_text(
     text: str,
     peer_aliases: list[str],
@@ -2510,32 +3202,26 @@ def _argv_occurrences_explain_text(
     peer X, a smuggle (e.g. second occurrence inside a quoted blob the
     argv parser cannot surface) is suspected.
 
-    Variants overlap (the no-trailing-slash form is a prefix of the
-    trailing-slash form). We sort by length descending and "consume"
-    matched ranges with NUL so the shorter form doesn't double-count.
+    Issue #1691: an alias occurrence INSIDE a `_STRING_PAYLOAD_FLAGS` value
+    (`-m`/`--body`/`--title`/…) is a benign message-body mention, NOT an
+    opener (`_bash_argv_protected_decisions` already skips those values, so
+    they never enter `decisions`). Subtract those occurrences from the text
+    count so a `agb task create --body '… agents/peer/…'` no longer fails the
+    proof. Fail-closed: a `shlex.split` ValueError (payload extraction
+    returns ``None``) means we do NOT subtract — the alias stays counted and
+    the proof denies, exactly as before #1691.
     """
-    sorted_aliases = sorted(peer_aliases, key=len, reverse=True)
+    text_count = _count_alias_occurrences(text, peer_aliases)
 
-    def _peer_for_alias(alias: str) -> str:
-        return alias.rstrip("/").rsplit("/", 1)[-1]
-
-    consumed = list(text)
-    text_count: dict[str, int] = {}
-    for alias in sorted_aliases:
-        peer = _peer_for_alias(alias)
-        if not peer:
-            continue
-        n = len(alias)
-        i = 0
-        while True:
-            joined = "".join(consumed)
-            idx = joined.find(alias, i)
-            if idx < 0:
-                break
-            for k in range(idx, idx + n):
-                consumed[k] = "\0"
-            text_count[peer] = text_count.get(peer, 0) + 1
-            i = idx + n
+    payload_values = _string_payload_flag_values(text)
+    if payload_values:
+        payload_blob = "\n".join(payload_values)
+        payload_count = _count_alias_occurrences(payload_blob, peer_aliases)
+        for peer, n in payload_count.items():
+            if peer in text_count:
+                text_count[peer] = max(0, text_count[peer] - n)
+                if text_count[peer] == 0:
+                    del text_count[peer]
 
     decision_count: dict[str, int] = {}
     for _path, _audit, peer_key in decisions:
@@ -4335,13 +5021,31 @@ def protected_alias_reason(
     # stays allowed; everything else denies here, before the allowlist.
     if _is_bash_wrapper_receive(text) and not _sealed_receive_request_shape_matches(text):
         return SEALED_RECEIVE_BASH_DENY_REASON
-    if _raw_mentions_claude_credentials(text):
-        # Admin agents are the operator's deputy: their read-intent
-        # diagnostic commands (e.g. `ls ~/.claude/.credentials.json`,
-        # `stat $BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json`)
-        # need to succeed for credential-state triage. The deny stays
-        # in force for write-intent commands and for non-admin agents.
-        # Every bypass writes an audit row.
+    # Issue #1691 — intent-aware credential-marker deny. The five markers
+    # split into two risk classes (see `_raw_mentions_credential_value` /
+    # `_bash_argv_opens_credential_filename`):
+    #
+    #   1. VALUE / env-var markers (`sk-ant-o`, `CLAUDE_CODE_OAUTH_TOKEN`):
+    #      naming either in a Bash command is itself the exfil signal (`echo
+    #      sk-ant-o…`, `echo $CLAUDE_CODE_OAUTH_TOKEN`, `printenv …`). Stay an
+    #      UNCONDITIONAL deny — there is no benign list/search/prose Bash use.
+    #
+    #   2. FILE-NAME markers (`.credentials.json`+`.claude`, `launch-secrets
+    #      .env`, `claude-oauth-tokens.json`): only deny when an argv OPENER
+    #      position actually opens the file. A `grep -l <credfile> .` /
+    #      `find . -name <credfile>` / message-body mention names the file as a
+    #      SEARCH term without reading its secret bytes, so the pre-#1691 blunt
+    #      substring scan (`_raw_mentions_claude_credentials`) over-blocked
+    #      them. A bare positional of an arbitrary leader (incl. `ls
+    #      <credfile>`) is treated as a potential opener and stays DENIED —
+    #      fail-closed; only the grep/find search positions are unblocked.
+    #
+    # The canonical-resolved-path argv gate (`claude_credential_paths()` loop
+    # below) and the token-VALUE redaction / audit hashing are unchanged.
+    # Both gates keep the existing admin read-intent carve-out (#1692) and the
+    # sanctioned rotation-routine exemption; non-admin / write-intent stay
+    # denied. Every bypass writes an audit row.
+    if _raw_mentions_credential_value(text):
         if admin and read_intent:
             _emit_admin_credential_read_allowed(
                 agent,
@@ -4353,6 +5057,25 @@ def protected_alias_reason(
         elif credential_routine_exempted:
             # Sanctioned rotation routine shape — the audit row was
             # already emitted above. Skip the substring deny.
+            pass
+        else:
+            return CLAUDE_CREDENTIAL_DENY_REASON
+    elif _bash_argv_opens_credential_filename(text):
+        # A credential FILE is opened by an argv path-opener position
+        # (positional token, `--body-file`/`-F`/`--file`/`--input` value,
+        # `--flag=path`, redirect target). Admin read-intent is allowed and
+        # audited; the sanctioned routine is exempt; everyone else denies.
+        # A mere mention / list / grep-pattern never reaches here because it
+        # does not put the credential filename in an opener position.
+        if admin and read_intent:
+            _emit_admin_credential_read_allowed(
+                agent,
+                tool="Bash",
+                surface="credential_filename_open",
+                sample=text,
+                tool_input=tool_input,
+            )
+        elif credential_routine_exempted:
             pass
         else:
             return CLAUDE_CREDENTIAL_DENY_REASON
@@ -4499,8 +5222,20 @@ def protected_alias_reason(
 
     # Issue #539 follow-up — Stage A: shared/private/ and shared/secrets/
     # are off-limits for every non-admin agent regardless of class.
-    # Substring deny because the path can ride inside a heredoc body or
-    # a quoted blob the argv parser cannot surface as a clean token.
+    #
+    # Issue #1691 material decision (operator/standing call): a non-admin may
+    # MENTION / grep-pattern / prose the shared private/secret NAME, but must
+    # NOT get directory INVENTORY (no `ls`/`find` listing) and must NOT
+    # OPEN/read a file under the tree. Fail-closed: mention-only.
+    #
+    # So the deny is now argv-position-aware (`_bash_argv_targets_shared_
+    # forbidden`): it fires when a real opener token LISTS the forbidden dir
+    # or OPENS a path under it, and stays quiet when the alias only appears in
+    # a `--body`/`-m`/prose value. To keep the pre-#1691 teeth against a path
+    # smuggled inside a `$(…)` / backtick / heredoc that the argv parser
+    # cannot surface as a clean token, a command WITH a shell embedding that
+    # also textually mentions a forbidden alias still denies (the conservative
+    # fallback — we cannot prove that mention is benign).
     #
     # Issue #1692 deliberately does NOT add an admin carve-out here. The
     # admin read-intent carve-out below covers PEER-HOME reads only; the
@@ -4514,12 +5249,15 @@ def protected_alias_reason(
     # forbidden-subtree gate (its `if admin: return None` precedes the
     # check) — that over-permission is a separate follow-up, NOT the
     # parity target to copy into Bash.
-    for forbidden_alias in _shared_forbidden_aliases():
-        if forbidden_alias in text:
-            return (
-                "cross-agent access is blocked: shared/private and "
-                "shared/secrets are off-limits"
-            )
+    # `_bash_argv_targets_shared_forbidden` is the SSOT: it is argv-position
+    # aware (allows grep-pattern / message-body mentions) AND keeps the raw
+    # substring floor for shell-embedding / heredoc / shlex-fail commands
+    # (#1691 r4). No separate embedding re-check is needed here.
+    if _bash_argv_targets_shared_forbidden(text):
+        return (
+            "cross-agent access is blocked: shared/private and "
+            "shared/secrets are off-limits"
+        )
 
     # Issue #1692 — admin read-intent carve-out for the Bash PEER-HOME
     # gate (Stage B), mirroring the non-Bash `protected_path_reason` admin
@@ -4583,18 +5321,53 @@ def protected_alias_reason(
         if admin_peer_read_audited:
             return None
 
-    # Stage B: peer-agent-home substring deny with a system-class
-    # read-intent exception path. The default stance is deny: a system-
-    # class agent earns the carve-out only when (1) the command is
-    # smuggle-free and (2) every alias substring in raw text is
-    # explained by a clean argv token whose resolved Path satisfies
-    # `_system_class_cross_agent_read_allowed`.
+    # Stage B: peer-agent-home substring deny with a read-intent exception
+    # path. The default stance is deny: a read-intent agent earns the carve-
+    # out only when (1) the command is smuggle-free and (2) every alias
+    # substring in raw text is explained by a clean argv token whose resolved
+    # Path satisfies `_system_class_cross_agent_read_allowed`.
+    #
+    # Issue #1691: the carve-out is no longer gated on `current_agent_class()
+    # == "system"`. A benign cross-agent LISTING / SEARCH that opens no peer-
+    # private file (`ls`/`grep`/`find` under `agents/<other>/memory/{projects,
+    # decisions,shared}/`) is read, not exfil, so it is allowed for ALL agents
+    # — the path allowlist in `_system_class_cross_agent_read_allowed` (NOT a
+    # class check) is what bounds WHAT can be read, and `all_allowed` flips
+    # False the instant an argv token resolves outside that allowlist. The
+    # message-body case (`agb task create --body '… agents/other/MEMORY.md'`)
+    # is admitted because `_bash_argv_protected_decisions` skips `_STRING_
+    # PAYLOAD_FLAGS` values. Write-intent, shell embeddings, shlex-fail, and
+    # any unexplained alias occurrence all still DENY below. Fail-closed.
     peer_aliases = _peer_alias_list(agent)
     matched_alias = next((a for a in peer_aliases if a in text), None)
     if matched_alias is None:
         return None
 
-    if not (read_intent and current_agent_class() == "system"):
+    # Issue #1691: a peer alias that appears ONLY inside a `_STRING_PAYLOAD_
+    # FLAGS` value (`agb task create --to peer --body '… agents/other/MEMORY
+    # .md'`, `-m '… agents/other/…'`) is a benign MESSAGE-BODY mention — the
+    # command sends that text elsewhere, it does not open a peer file. Allow
+    # it regardless of read_intent (a write-intent `agb task create` whose
+    # only peer reference is its message body opens no peer path). Fail-closed:
+    # only when (a) there is NO shell embedding that could execute a smuggle,
+    # and (b) every peer-alias occurrence in the raw text is accounted for by
+    # the extracted string-payload values (extraction returned a list, not
+    # None). Any peer alias OUTSIDE a payload value (a real argv token) skips
+    # this shortcut and flows to the read-intent / argv-proof gates below.
+    if not _command_has_shell_embedding(text):
+        payload_values = _string_payload_flag_values(text)
+        if payload_values is not None:
+            text_alias_count = _count_alias_occurrences(text, peer_aliases)
+            payload_alias_count = _count_alias_occurrences(
+                "\n".join(payload_values), peer_aliases
+            )
+            if text_alias_count and all(
+                payload_alias_count.get(peer, 0) >= count
+                for peer, count in text_alias_count.items()
+            ):
+                return None
+
+    if not read_intent:
         return f"cross-agent access is blocked: {matched_alias}"
 
     if _command_has_shell_embedding(text):
@@ -4938,7 +5711,36 @@ def handle_pretool(payload: dict[str, Any], agent: str) -> int:
             raw = str(tool_input.get(key) or "").strip()
             if not raw:
                 continue
-            if _raw_mentions_claude_credentials(raw):
+            # Issue #1691 — a Grep `pattern` is a SEARCH string, not a file
+            # open. Conflating "grep FOR this string" with "read the secret
+            # file" denied a benign `Grep pattern='<credfile>'` /
+            # `pattern='<oauth-token-env-var>'` that searches UNRELATED files.
+            # For the `pattern` key, deny ONLY the token-VALUE bytes
+            # (`sk-ant-o`) — grepping FOR the literal token IS the exfil
+            # signal and stays denied via the value marker — while a
+            # filename / env-var-NAME pattern is allowed (the
+            # `_redact_credential_token_values` audit scrub still strips any
+            # token bytes from the summary). The `file_path` / `path` keys
+            # keep the FULL credential deny (value + env-var + filename + the
+            # resolved-path check below): those open a file.
+            if key == "pattern":
+                if "sk-ant-o" in raw:
+                    if admin and read_intent:
+                        _emit_admin_credential_read_allowed(
+                            agent,
+                            tool=tool_name,
+                            surface="input_pattern",
+                            sample=raw,
+                            tool_input=tool_input,
+                        )
+                        continue
+                    reason = CLAUDE_CREDENTIAL_DENY_REASON
+                    break
+                continue
+            credential_marker = _raw_mentions_credential_value(
+                raw
+            ) or _raw_text_has_credential_filename(raw)
+            if credential_marker:
                 # Admin + read-intent (Read / Glob / Grep /
                 # NotebookRead) diagnostic on a credential surface —
                 # allow with an audit row. Mutating tools (Edit / Write

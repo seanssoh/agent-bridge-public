@@ -96,7 +96,11 @@ ADMIN_HOME="$BRIDGE_AGENT_HOME_ROOT/$ADMIN_AGENT"
 mkdir -p "$ADMIN_HOME"
 printf -- '- session type: admin\n' >"$ADMIN_HOME/SESSION-TYPE.md"
 
-# A plain (non-admin) user agent — its reads of peer/shared must STAY denied.
+# A plain (non-admin) user agent. Its reads of a TOP-LEVEL peer file and of
+# shared/private must STAY denied (asserted below). (After issue #1691 a
+# non-admin read of an ALLOWLISTED peer memory/{projects,decisions,shared}
+# path is allowed via the relaxed Stage B carve-out — that is covered by the
+# dedicated #1691 smoke, not asserted here.)
 USER_AGENT="worker-1692"
 USER_HOME="$BRIDGE_AGENT_HOME_ROOT/$USER_AGENT"
 mkdir -p "$USER_HOME"
@@ -115,6 +119,13 @@ PEER_HOME="$BRIDGE_AGENT_HOME_ROOT/$PEER_AGENT"
 mkdir -p "$PEER_HOME/memory/shared"
 printf -- '# peer memory fixture\n' >"$PEER_HOME/MEMORY.md"
 printf -- '# peer shared note\n' >"$PEER_HOME/memory/shared/note.md"
+# A second TOP-LEVEL peer file (outside the memory/{projects,decisions,shared}
+# system-class allowlist). Issue #1691 relaxed the Stage B read carve-out to
+# all read-intent agents for ALLOWLISTED peer subpaths, so a memory/shared
+# read is now allowed even without the #1692 admin carve-out — it is no
+# longer a valid revert-teeth flip for THIS smoke. A top-level peer file is
+# only readable via the #1692 admin carve-out, so it isolates this fix.
+printf -- '# peer top-level notes\n' >"$PEER_HOME/NOTES.md"
 
 # Shared off-limits subtrees (private/ + secrets/) under $BRIDGE_HOME/shared.
 SHARED_PRIV_DIR="$BRIDGE_SHARED_DIR/private"
@@ -259,8 +270,8 @@ assert_admin_read_allow_audited \
   "cat $PEER_HOME/MEMORY.md"
 
 assert_admin_read_allow_audited \
-  "admin read (grep) of peer shared note" \
-  "grep note $PEER_HOME/memory/shared/note.md"
+  "admin read (grep) of peer top-level NOTES.md" \
+  "grep notes $PEER_HOME/NOTES.md"
 
 # ---------------------------------------------------------------------------
 # Group 2 — DENY teeth (must STAY blocked).
@@ -440,17 +451,21 @@ revert_assert_deny() {
   fi
 }
 
-# Both cases are PEER-HOME reads that the real hook now ALLOWs for admin
-# (Group 1); against the stripped hook they must flip to DENY. (A shared/
-# private read would be DENY in both real and stripped — denied by Stage A
-# regardless — so it is NOT a valid revert-teeth flip and is not used here.)
+# Both cases are TOP-LEVEL PEER reads (outside the memory/{projects,decisions,
+# shared} system-class allowlist) that the real hook now ALLOWs for admin
+# (Group 1) ONLY via the admin carve-out; against the stripped hook they must
+# flip to DENY. (A shared/private read would be DENY in both real and stripped
+# — denied by Stage A regardless — so it is NOT a valid revert-teeth flip; and
+# after issue #1691 a memory/shared read is allowed for ALL read-intent agents
+# via the relaxed Stage B carve-out, so it no longer isolates the admin
+# carve-out either. Top-level peer files isolate this fix.)
 revert_assert_deny \
   "admin read of peer MEMORY.md" \
   "cat $PEER_HOME/MEMORY.md"
 
 revert_assert_deny \
-  "admin read of peer memory/shared note" \
-  "grep note $PEER_HOME/memory/shared/note.md"
+  "admin read of peer top-level NOTES.md" \
+  "grep notes $PEER_HOME/NOTES.md"
 
 # Sanity: the stripped hook must still ALLOW the system-class read (its own
 # branch is untouched by stripping the admin carve-out) — confirms the
