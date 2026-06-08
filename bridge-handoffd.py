@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import ipaddress
 import json
@@ -3634,6 +3635,48 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warp_self_probe_socket_held(bind: str, port: int) -> bool:
+    """cloudflare-warp-mesh liveness fallback (self-hairpin false-negative guard).
+
+    A cloudflare-warp-mesh receiver binds to a point-to-point /32 WARP tunnel IP
+    that cannot hairpin a TCP connection to ITSELF (#1701), so the GET /healthz
+    self-probe in `cmd_healthz` ALWAYS fails even when the receiver is healthy and
+    serving real peers. As a dependency-free liveness signal — no network
+    round-trip, no auth surface, no serve-path change — try to bind the same
+    `(address, port)`: an `EADDRINUSE` means the listen socket is still held by
+    the running receiver -> alive; a clean bind means nothing is listening there
+    -> not alive.
+
+    TRADEOFF (documented for #1701): this socket-held check cannot distinguish a
+    healthy serve loop from a WEDGED-but-bound one (the process holds the listen
+    socket either way), so on WARP this WEAKENS wedge-detection relative to the
+    HTTP self-probe. That is an accepted v0.16.4 tradeoff vs crash-looping a
+    healthy WARP receiver. It is scoped to the warp-mesh transport only; the HTTP
+    self-probe is unchanged and keeps full wedge-detection on Tailscale/LAN, whose
+    binds hairpin to themselves normally. The proper hardening (a loopback
+    127.0.0.1:<port> healthz-only listener so the probe can hit 127.0.0.1 even on
+    WARP) is tracked as a #1701 follow-up; it must expose ONLY /healthz on
+    loopback, never the auth/enqueue surface.
+
+    NOTE: a plain bind() is used deliberately — SO_REUSEADDR / SO_REUSEPORT must
+    NOT be set, or the bind could succeed alongside the live listener and mask the
+    EADDRINUSE this check relies on. The probe socket is a transient throwaway,
+    closed in `finally`, so it never lingers or races the real listener.
+    """
+    fam = socket.AF_INET6 if ":" in bind else socket.AF_INET
+    probe = socket.socket(fam, socket.SOCK_STREAM)
+    try:
+        probe.bind((bind, port))
+    except OSError as exc:
+        return exc.errno == errno.EADDRINUSE
+    finally:
+        try:
+            probe.close()
+        except OSError:
+            pass
+    return False
+
+
 def cmd_healthz(args: argparse.Namespace) -> int:
     """Probe a RUNNING receiver's serve liveness via GET /healthz.
 
@@ -3688,8 +3731,27 @@ def cmd_healthz(args: argparse.Namespace) -> int:
         print(f"healthz_status:{exc.code}")
         return 4
     except (urllib.error.URLError, OSError, ValueError):
-        # Connection refused / timed out / reset: pid alive but socket not
-        # accepting (the wedged-serve case). Bucketed as a timeout reason.
+        # Connection refused / timed out / reset: normally the pid is alive but
+        # the serve loop is not accepting (the wedged-serve case this probe
+        # exists to catch). EXCEPTION (#1701): a cloudflare-warp-mesh receiver
+        # binds to a point-to-point /32 WARP tunnel IP that cannot hairpin a TCP
+        # connection to itself, so this HTTP self-probe ALWAYS fails even when
+        # the receiver is healthy and serving real peers. For THAT transport
+        # only, fall back to a dependency-free socket-held liveness check so a
+        # healthy WARP receiver is not crash-looped by a false healthz_timeout.
+        # Tailscale/LAN keep full wedge-detection (their self-probe hairpins
+        # normally, so they never reach this fallback). See
+        # _warp_self_probe_socket_held for the wedged-but-bound tradeoff.
+        try:
+            kind = a2a.transport_kind(cfg)
+        except a2a.A2AError:
+            # A malformed transport block must not turn a clean timeout into a
+            # traceback — fall through to the original healthz_timeout reason.
+            kind = None
+        if kind == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH \
+                and _warp_self_probe_socket_held(bind, port):
+            print("healthy")
+            return 0
         print("healthz_timeout")
         return 3
 
