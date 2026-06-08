@@ -169,7 +169,7 @@ def reconcile_db_path(state_dir: Optional[Path] = None) -> Path:
     Honors `BRIDGE_A2A_RECONCILE_DB` (test override) first, then sits beside
     the other durable A2A state in `<state_dir>/handoff/reconcile.db`.
     """
-    override = os.environ.get("BRIDGE_A2A_RECONCILE_DB")
+    override = os.environ.get("BRIDGE_A2A_RECONCILE_DB")  # noqa: iso-helper-boundary
     if override:
         return Path(override)
     base = Path(state_dir) if state_dir is not None else a2a.handoff_dir()
