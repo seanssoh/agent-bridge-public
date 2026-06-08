@@ -2383,6 +2383,304 @@ def _setup_show_state(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# a2a net-status / status (READ-ONLY observability — #1697)
+# --------------------------------------------------------------------------
+#
+# A single non-mutating snapshot of THIS node's A2A network/transport state so
+# an agent stops acting on stale substrate assumptions (e.g. "restart
+# Tailscale" on a host that is actually configured for cloudflare-warp-mesh).
+#
+# Hard contract:
+#   * READ ONLY. No outbox/inbox/config write, no SIGHUP, no bind/serve, no
+#     `tailscale up`/`warp-cli connect`. Every probe is a status read
+#     (os.kill(pid, 0) existence check, os.environ.get, argv-list subprocess
+#     reads — never a shell string, never a mutation/signal).
+#   * It reports the substrate that is ACTUALLY configured (`transport.kind`),
+#     and probes ONLY that substrate. It never checks Tailscale for a WARP-mesh
+#     config or vice versa — that is the whole point of the command.
+#   * Each probe FAILS SOFT: a substrate/daemon probe that cannot complete
+#     records an error string in its field instead of raising, so the snapshot
+#     is always complete (an agent needs the WHOLE picture precisely when one
+#     leg is degraded). The only hard error is an unreadable/invalid config.
+#   * It reuses the EXISTING common helpers (transport_kind,
+#     tailscale_status_json, resolve_warp_cli/_warp_status_is_connected,
+#     local_interface_addresses/is_local_interface_address,
+#     resolve_peer_address_for_transport) so it can never drift from the real
+#     bind/resolve proofs the receiver + sender use.
+
+def _netstat_listen_addr(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the configured listen address:port WITHOUT proving the bind.
+
+    Read-only: it resolves the `listen` entry to a candidate address (per the
+    configured transport) and reports the port. It deliberately does NOT run
+    the receiver's fail-closed bind proof (that is `agb a2a reconcile`'s job and
+    would couple this read-only snapshot to the daemon's bind path). A resolve
+    failure is recorded as an error string, never raised.
+    """
+    listen = cfg.get("listen") if isinstance(cfg.get("listen"), dict) else {}
+    try:
+        port = int(listen.get("port", 8787))
+    except (TypeError, ValueError):
+        port = 8787
+    out: dict[str, Any] = {"port": port, "address": None, "resolve_error": None}
+    try:
+        kind = a2a.transport_kind(cfg)
+        addr = a2a.resolve_peer_address_for_transport(kind, listen)
+        out["address"] = addr or None
+        if not addr:
+            out["resolve_error"] = "no listen.address configured"
+    except a2a.A2AError as exc:
+        out["resolve_error"] = f"{exc} ({exc.code})"
+    return out
+
+
+def _netstat_receiver(cfg: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+    """Best-effort receiver-daemon liveness: pidfile + os.kill(0) + healthz.
+
+    Read-only. Reads `handoffd.pid`, checks the pid is alive with a 0-signal
+    (never SIGHUP/SIGTERM — `os.kill(pid, 0)` is a pure existence test, no
+    mutation), then delegates the serve-loop verdict to the EXISTING
+    `_a2a_local_healthz` helper, which runs `bridge-handoffd.py healthz` (the
+    SAME read-only GET /healthz probe the daemon supervisor uses).
+
+    #1701 consistency: the healthz verdict is owned by `bridge-handoffd.py
+    cmd_healthz`, which ALREADY carries the warp-mesh self-hairpin guard
+    (`_warp_self_probe_socket_held`) — on a `cloudflare-warp-mesh` install a
+    healthy receiver whose GET /healthz self-probe times out on the /32 WARP
+    bind falls back to the socket-held liveness check and reports `healthy`,
+    not `healthz_timeout`. Delegating through that helper (rather than
+    re-rolling the probe here) is the DRYest reuse of #1701: net-status can
+    never disagree with the supervisor's warp-aware verdict. Every failure mode
+    degrades to a field value, never an exception.
+    """
+    res: dict[str, Any] = {
+        "pid": None, "pid_alive": None, "healthz": None, "healthz_detail": None,
+    }
+    pid_file = a2a.handoff_dir() / "handoffd.pid"
+    pid: Optional[int] = None
+    try:
+        if pid_file.exists():  # noqa: raw-pathlib-controller-only
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pid = None
+    res["pid"] = pid
+    if pid is not None:
+        try:
+            os.kill(pid, 0)
+            res["pid_alive"] = True
+        except ProcessLookupError:
+            res["pid_alive"] = False
+        except OSError:
+            # EPERM => the process exists but is owned by another uid (still
+            # "alive" for our purposes); anything else is indeterminate.
+            res["pid_alive"] = True
+    # healthz probe (read-only GET) — delegate to the shared `_a2a_local_healthz`
+    # helper so the verdict matches the supervisor exactly AND inherits the
+    # #1701 warp-mesh socket-held fallback baked into `cmd_healthz`. healthy is
+    # True/False, or None when the probe could not run conclusively (helper
+    # missing / indeterminate); `detail` is the raw machine token.
+    healthy, detail = _a2a_local_healthz(cfg, timeout)
+    if healthy is True:
+        res["healthz"] = "healthy"
+    elif healthy is False:
+        res["healthz"] = detail or "unhealthy"
+    else:
+        # None => indeterminate (helper missing or no output). Surface the
+        # detail so an agent can tell "no receiver / helper" from "unhealthy".
+        res["healthz"] = None
+        res["healthz_detail"] = detail or None
+    return res
+
+
+def _netstat_substrate(cfg: dict[str, Any], listen_addr: "str | None",
+                       kind: str) -> dict[str, Any]:
+    """Probe ONLY the configured transport's substrate (read-only, fail-soft).
+
+    The dispatch is keyed on `kind` so an agent never checks/restarts the wrong
+    substrate: a tailscale config never runs warp-cli, a warp-mesh config never
+    runs `tailscale status`. legacy-none reports `transport=legacy-none`
+    (treated as Tailscale by the rest of the stack) and probes Tailscale.
+    """
+    sub: dict[str, Any] = {"checked": kind, "error": None}
+    if kind == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
+        # WARP-mesh: (a) warp-cli connected? (b) bind IP on a local iface?
+        sub["warp_cli"] = a2a.resolve_warp_cli()
+        sub["warp_connected"] = None
+        sub["bind_on_local_iface"] = None
+        if sub["warp_cli"] is None:
+            sub["error"] = "warp-cli not found (PATH or standard locations)"
+        else:
+            try:
+                raw = a2a._run_warp_cli(sub["warp_cli"], ["status"])
+                sub["warp_connected"] = a2a._warp_status_is_connected(raw)
+            except a2a.CloudflareWarpUnavailable as exc:
+                sub["warp_connected"] = False
+                sub["error"] = f"{exc} ({exc.code})"
+        try:
+            local_addrs = a2a.local_interface_addresses()
+            sub["local_iface_addrs"] = local_addrs
+            if listen_addr:
+                sub["bind_on_local_iface"] = a2a.is_local_interface_address(
+                    listen_addr, local_addrs)
+        except a2a.A2AError as exc:
+            sub["local_iface_addrs"] = None
+            sub.setdefault("error", f"{exc} ({exc.code})")
+        return sub
+    # tailscale (default) and legacy-none both probe Tailscale.
+    sub["tailscale_up"] = None
+    sub["self_tailscale_ips"] = None
+    sub["bind_in_tailscale_ips"] = None
+    try:
+        status = a2a.tailscale_status_json()
+    except a2a.TailscaleUnavailable as exc:
+        sub["tailscale_up"] = False
+        sub["error"] = f"{exc} ({exc.code})"
+        return sub
+    self_node = status.get("Self")
+    if isinstance(self_node, dict):
+        sub["tailscale_up"] = bool(self_node.get("Online", False))
+        ips = self_node.get("TailscaleIPs")
+        self_ips = [ip.strip() for ip in ips
+                    if isinstance(ip, str) and ip.strip()] if isinstance(ips, list) else []
+        sub["self_tailscale_ips"] = self_ips
+        if listen_addr:
+            sub["bind_in_tailscale_ips"] = listen_addr.strip() in self_ips
+    else:
+        sub["error"] = "'tailscale status --json' had no Self node"
+    return sub
+
+
+def _netstat_rooms_count() -> dict[str, Any]:
+    """Rooms membership count via the read-only `bridge-rooms.py list --json`.
+
+    Delegated as a subprocess (argv array, never a shell string) so the rooms.db
+    read goes through the canonical rooms CLI — this command never opens rooms.db
+    itself, which keeps it iso-boundary-safe (the rooms CLI owns the read-perm
+    + readonly-open semantics). Fail-soft: a missing helper / parse failure
+    records an error.
+    """
+    out: dict[str, Any] = {"count": None, "error": None}
+    rooms_cli = Path(__file__).resolve().parent / "bridge-rooms.py"
+    if not rooms_cli.is_file():  # noqa: raw-pathlib-controller-only
+        out["error"] = "bridge-rooms.py not found"
+        return out
+    try:
+        proc = _run_subprocess(
+            [sys.executable, str(rooms_cli), "list", "--json"], timeout=10,
+        )
+    except (OSError, ValueError) as exc:
+        out["error"] = str(exc)
+        return out
+    if proc.returncode != 0:
+        out["error"] = (proc.stderr or proc.stdout or "").strip()[:200] or \
+            f"bridge-rooms.py list exited {proc.returncode}"
+        return out
+    try:
+        items = json.loads(proc.stdout or "[]")
+        out["count"] = len(items) if isinstance(items, list) else None
+    except (ValueError, TypeError) as exc:
+        out["error"] = f"unparseable rooms list: {exc}"
+    return out
+
+
+def cmd_net_status(args: argparse.Namespace) -> int:
+    """Read-only snapshot of this node's A2A network/transport state (#1697).
+
+    Prints (and with --json emits) the ACTUALLY-configured transport, this
+    node's bridge_id + listen address:port, receiver daemon liveness, the
+    ACTIVE substrate state for the configured transport ONLY, configured peers,
+    and rooms membership count. Never mutates anything.
+    """
+    try:
+        cfg = a2a.load_config()
+    except a2a.A2AError as exc:
+        return die(str(exc)) or 1
+
+    timeout = float(getattr(args, "probe_timeout", None) or 3.0)
+
+    # Transport kind is the linchpin — resolve it first (fail-soft to a label).
+    try:
+        kind = a2a.transport_kind(cfg)
+    except a2a.A2AError as exc:
+        kind = f"invalid:{exc.code}"
+    transport_label = kind
+    if cfg.get("transport") is None and kind == a2a.TRANSPORT_TAILSCALE:
+        # No `transport` block at all — report the legacy-none sentinel the
+        # issue asks for, while still probing Tailscale (its effective kind).
+        transport_label = "legacy-none"
+        probe_kind = a2a.TRANSPORT_TAILSCALE
+    elif kind.startswith("invalid:"):
+        probe_kind = a2a.TRANSPORT_TAILSCALE
+    else:
+        probe_kind = kind
+
+    listen = _netstat_listen_addr(cfg)
+    receiver = _netstat_receiver(cfg, timeout=timeout)
+    substrate = _netstat_substrate(cfg, listen.get("address"), probe_kind)
+    rooms_info = _netstat_rooms_count()
+
+    peers_raw = cfg.get("peers", []) if isinstance(cfg.get("peers"), list) else []
+    peers = []
+    for p in peers_raw:
+        if not isinstance(p, dict):
+            continue
+        has_identity = bool(
+            (isinstance(p.get("node_id"), str) and p["node_id"].strip())
+            or (isinstance(p.get("tailscale_name"), str) and p["tailscale_name"].strip())
+        )
+        peers.append({
+            "id": p.get("id", "?"),
+            "address": p.get("address") or None,
+            "transport": probe_kind,
+            "identity_keyed": has_identity,
+        })
+
+    snapshot = {
+        "bridge_id": cfg.get("bridge_id", "") or None,
+        "transport": transport_label,
+        "listen": listen,
+        "receiver": receiver,
+        "substrate": substrate,
+        "peers": peers,
+        "rooms": rooms_info,
+    }
+
+    if args.json:
+        print(json.dumps(snapshot, ensure_ascii=False, indent=2))
+        return 0
+
+    addr = listen.get("address") or "(unresolved)"
+    print(f"bridge_id:   {snapshot['bridge_id'] or '(unset)'}")
+    print(f"transport:   {transport_label}")
+    print(f"listen:      {addr}:{listen['port']}"
+          + (f"  (resolve: {listen['resolve_error']})" if listen.get("resolve_error") else ""))
+    pid = receiver.get("pid")
+    alive = receiver.get("pid_alive")
+    alive_s = "alive" if alive is True else ("dead" if alive is False else "unknown")
+    print(f"receiver:    pid={pid if pid is not None else '-'} ({alive_s})  "
+          f"healthz={receiver.get('healthz') or '-'}"
+          + (f"  {receiver['healthz_detail']}" if receiver.get("healthz_detail") else ""))
+    print(f"substrate:   checked={substrate.get('checked')}")
+    if probe_kind == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
+        print(f"  warp_connected={substrate.get('warp_connected')}  "
+              f"bind_on_local_iface={substrate.get('bind_on_local_iface')}")
+    else:
+        print(f"  tailscale_up={substrate.get('tailscale_up')}  "
+              f"bind_in_tailscale_ips={substrate.get('bind_in_tailscale_ips')}")
+    if substrate.get("error"):
+        print(f"  substrate_error: {substrate['error']}")
+    print(f"peers:       {len(peers)} configured")
+    for p in peers:
+        print(f"  {p['id']:20}  {p['address'] or '-':22}  transport={p['transport']}"
+              + ("  identity-keyed" if p['identity_keyed'] else ""))
+    rc_count = rooms_info.get("count")
+    print(f"rooms:       {rc_count if rc_count is not None else '?'} member"
+          + ("" if rc_count == 1 else "s")
+          + (f"  ({rooms_info['error']})" if rooms_info.get("error") else ""))
+    return 0
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """`agb a2a setup` — the P1 wizard (S0/S1/S2/S5/S6, manual secret).
 
@@ -2884,6 +3182,35 @@ def build_parser() -> argparse.ArgumentParser:
              "(default: keep it as a fallback)",
     )
     p_migrate.set_defaults(func=cmd_migrate_identity)
+
+    # #1697: read-only A2A network/transport snapshot. Two names for the same
+    # handler — `net-status` (explicit) and `status` (ergonomic alias) — so an
+    # agent finds it under either guess. Pure read: no mutation.
+    for _ns_name in ("net-status", "status"):
+        p_netstat = sub.add_parser(
+            _ns_name,
+            help="read-only snapshot of this node's A2A transport/network state "
+                 "(configured transport, listen addr, receiver liveness, the "
+                 "ACTIVE substrate for the CONFIGURED transport only, peers, "
+                 "rooms count)",
+            description=(
+                "Print a non-mutating snapshot of THIS node's A2A state so an "
+                "agent does not act on stale substrate assumptions. Reports the "
+                "transport that is ACTUALLY configured (transport.kind) and "
+                "probes ONLY that substrate — a tailscale config never runs "
+                "warp-cli and a warp-mesh config never runs `tailscale status`, "
+                "so you never check/restart the wrong substrate. READ ONLY: no "
+                "config/outbox/inbox write, no SIGHUP, no bind/serve. Each probe "
+                "fails soft (an error string in its field) so the snapshot is "
+                "always complete. --json for the machine-readable document."
+            ),
+        )
+        p_netstat.add_argument("--json", action="store_true",
+                               help="emit the machine-readable snapshot")
+        p_netstat.add_argument("--probe-timeout", type=float, default=None,
+                               help="healthz / substrate probe timeout seconds "
+                                    "(default 3)")
+        p_netstat.set_defaults(func=cmd_net_status)
 
     p_setup = sub.add_parser(
         "setup",
