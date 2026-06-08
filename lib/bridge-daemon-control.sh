@@ -69,6 +69,18 @@ _BRIDGE_DAEMON_CONTROL_SOURCED=1
 # until acquired, and on the mkdir-fallback backend (no fd to leak).
 BRIDGE_DAEMON_SINGLETON_LOCK_FD="${BRIDGE_DAEMON_SINGLETON_LOCK_FD:-}"
 
+# Issue #1667: out-parameter for _bridge_daemon_control_lock_acquire (see the
+# CALLING CONVENTION on that function). The flock backend holds the daemon-
+# refresh lock through a long-lived fd opened with `exec {fd}>"$lock"`; that fd
+# survives only in the process that runs the acquire helper. Capturing the
+# token via command substitution — `tok="$(_bridge_daemon_control_lock_acquire
+# ...)"` — runs the acquire in a `$(...)` subshell whose open-file-description
+# closes on exit, RELEASING the flock immediately even though the parent saw a
+# token string. The token is therefore returned via this global, NOT stdout,
+# and the helper MUST be called directly. Mirrors lib/bridge-lock.sh's
+# BRIDGE_SCOPED_LOCK_TOKEN (#1661).
+BRIDGE_DAEMON_CONTROL_LOCK_TOKEN="${BRIDGE_DAEMON_CONTROL_LOCK_TOKEN:-}"
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -238,14 +250,26 @@ _bridge_daemon_control_sanitize_reason() {
 
 # Lock acquisition. Tries flock(1) first (preferred — atomic kernel-level
 # advisory lock with timeout); falls back to mkdir-with-PID-staleness
-# guard when flock is missing. Emits the lock token on stdout that the
-# caller passes back to _bridge_daemon_control_lock_release. Returns
-# rc=1 on contention or unrecoverable error.
+# guard when flock is missing. Returns rc=0 on success and rc=1 on
+# contention or unrecoverable error.
+#
+# CALLING CONVENTION (#1667 — flock correctness): on success the release
+# token is returned via the global BRIDGE_DAEMON_CONTROL_LOCK_TOKEN, NEVER
+# stdout. The flock backend holds the lock through a long-lived fd opened
+# with `exec {fd}>"$lock"`; that fd survives ONLY in the process that runs
+# this function. Capturing the token under command substitution
+# (`tok="$(_bridge_daemon_control_lock_acquire ...)"`) runs the body in a
+# `$(...)` subshell whose open-file-description closes on exit, releasing
+# the flock immediately — the caller would hold a token string for a lock
+# that is already free, defeating the mutual exclusion the daemon-refresh
+# critical section depends on. Call this helper DIRECTLY and read the token
+# from the global; pass that token to _bridge_daemon_control_lock_release.
 #
 # Token format:
 #   flock:<fd>:<lockfile>
 #   mkdir:<lockdir>
 _bridge_daemon_control_lock_acquire() {
+  BRIDGE_DAEMON_CONTROL_LOCK_TOKEN=""
   local lock_path="$1"
   local timeout_secs="${2:-30}"
   [[ -n "$lock_path" ]] || return 1
@@ -254,8 +278,9 @@ _bridge_daemon_control_lock_acquire() {
   mkdir -p -- "$lock_parent" 2>/dev/null || return 1
 
   if command -v flock >/dev/null 2>&1; then
-    # flock with a non-stdio fd. exec assigns the fd so the lock
-    # persists past the function return; caller closes it via the
+    # flock with a non-stdio fd. exec assigns the fd in THE CALLER'S
+    # process so the lock persists past the function return (see CALLING
+    # CONVENTION — never call under `$(...)`); caller closes it via the
     # release helper. The lockfile is created if missing.
     local lock_fd
     # shellcheck disable=SC2093  # we explicitly want the fd to outlive this fn
@@ -266,7 +291,7 @@ _bridge_daemon_control_lock_acquire() {
       # through the held fd via a subshell so multiple redirections
       # don't compete for stderr (shellcheck SC2261).
       ( printf '%s\n' "$$" >&"$lock_fd" ) 2>/dev/null || true
-      printf 'flock:%s:%s' "$lock_fd" "$lock_path"
+      BRIDGE_DAEMON_CONTROL_LOCK_TOKEN="flock:${lock_fd}:${lock_path}"
       return 0
     fi
     # Contention: close the fd we opened.
@@ -282,7 +307,7 @@ _bridge_daemon_control_lock_acquire() {
   while (( waited < timeout_secs )); do
     if mkdir -- "$lock_dir" 2>/dev/null; then
       printf '%s\n' "$$" >"$lock_dir/owner.pid" 2>/dev/null || true
-      printf 'mkdir:%s' "$lock_dir"
+      BRIDGE_DAEMON_CONTROL_LOCK_TOKEN="mkdir:${lock_dir}"
       return 0
     fi
     # Lock taken — check liveness of recorded owner PID.
@@ -469,8 +494,17 @@ bridge_daemon_refresh_after_group_membership_change() {
   # the new-PID poll.
   local lock_path
   lock_path="${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}/daemon.refresh.lock"
+  # Issue #1667: call the acquire helper DIRECTLY (NOT under `$(...)`) so the
+  # flock fd lives in THIS shell for the lock's full intended lifetime — the
+  # re-check + restart critical section below. The token is returned via the
+  # BRIDGE_DAEMON_CONTROL_LOCK_TOKEN global, not stdout. `2>/dev/null` here
+  # would muffle nothing useful (the helper is silent on contention; the
+  # caller emits the diagnostic), but a redirection on the bare call is safe
+  # since this is a function call, not a `exec`-style whole-shell redirect.
   local lock_token=""
-  lock_token="$(_bridge_daemon_control_lock_acquire "$lock_path" 30 2>/dev/null || true)"
+  if _bridge_daemon_control_lock_acquire "$lock_path" 30; then
+    lock_token="${BRIDGE_DAEMON_CONTROL_LOCK_TOKEN:-}"
+  fi
   if [[ -z "$lock_token" ]]; then
     bridge_warn "daemon-refresh: could not acquire $lock_path within 30s (another refresh in progress?)"
     printf 'failed-restart'

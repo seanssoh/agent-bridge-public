@@ -133,10 +133,14 @@ test_sanitizer() {
 test_lock_primitives() {
   local lock_path="$TMP_ROOT/lock-test"
 
-  # Acquire.
+  # Issue #1667: the acquire helper returns its token via the
+  # BRIDGE_DAEMON_CONTROL_LOCK_TOKEN global and MUST be called directly
+  # (NEVER under `$(...)`, which would close the flock fd in the subshell
+  # and release the lock immediately). Read the token from the global.
   local token=""
-  token="$(_bridge_daemon_control_lock_acquire "$lock_path" 5)" \
+  _bridge_daemon_control_lock_acquire "$lock_path" 5 \
     || fail "lock acquire failed"
+  token="${BRIDGE_DAEMON_CONTROL_LOCK_TOKEN:-}"
   [[ -n "$token" ]] || fail "lock token is empty"
   case "$token" in
     flock:*|mkdir:*) ;;
@@ -150,8 +154,9 @@ test_lock_primitives() {
 
   # Re-acquire after release.
   token=""
-  token="$(_bridge_daemon_control_lock_acquire "$lock_path" 5)" \
+  _bridge_daemon_control_lock_acquire "$lock_path" 5 \
     || fail "lock re-acquire after release failed"
+  token="${BRIDGE_DAEMON_CONTROL_LOCK_TOKEN:-}"
   _bridge_daemon_control_lock_release "$token"
   pass "lock re-acquired after release"
 }

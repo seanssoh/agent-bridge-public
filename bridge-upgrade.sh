@@ -112,6 +112,17 @@ SOURCE_RECLASSIFY_JSON='{}'
 SHARED_SETTINGS_RERENDER_JSON='{"mode":"skipped","count":0,"failed_count":0,"candidates":[]}'
 ISOLATION_V2_MIGRATION_JSON=""
 
+# Issue #1662: durable success marker for the self-restart exit-137 contract.
+# On sudo-self systemd installs, `upgrade --apply` (default --restart-daemon)
+# regenerates+restarts the systemd-user unit; the INVOKING tmux session lives
+# under that unit, so it gets cycled → SIGKILL → exit 137 even though the
+# upgrade SUCCEEDED. The marker is written under target state/ AFTER all
+# apply/migrate/reclassify work completes and BEFORE the restart phase begins,
+# so success is observable independent of the session SIGKILL. The variable
+# holds the resolved marker path once written (empty until then) so the post-
+# restart phase can promote it from phase=work-complete to phase=restart-complete.
+_BRIDGE_UPGRADE_COMPLETE_MARKER_PATH=""
+
 # Issue #752 W3d (M10/M11/M12): partial-failure surfacing for late
 # upgrade subsystems (shared rerender / channel-policy refresh / profile
 # relink). Each site appends a stable name when its post-step probe
@@ -921,6 +932,108 @@ value = payload.get(field, "")
 print("" if value is None else str(value))
 PY
 }
+
+# BEGIN: Issue #1662 upgrade-complete marker helpers
+# Issue #1662: minimal JSON-string escaper (pure shell — NO subprocess
+# interpreter, footgun #11 / lint-heredoc ceiling). Escapes backslash, double-
+# quote, and the control chars that would break a one-line JSON value. The
+# marker only carries known-safe fields (a phase keyword, an ISO timestamp, a
+# semver, and absolute paths), so this small escaper is sufficient and avoids
+# spinning up python on the success path right before the restart SIGKILL.
+_bridge_upgrade_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"   # backslash first
+  s="${s//\"/\\\"}"   # double-quote
+  s="${s//$'\t'/\\t}" # tab
+  s="${s//$'\n'/\\n}" # newline (paths shouldn't contain these, defensive)
+  s="${s//$'\r'/\\r}" # carriage return
+  printf '%s' "$s"
+}
+
+# Issue #1662: write/promote the durable upgrade-complete success marker.
+#
+# Usage:
+#   _bridge_upgrade_write_complete_marker <target_root> <phase> <version> [restart_daemon] [restart_agents]
+#
+# <phase> is one of:
+#   work-complete    — apply/migrate/reclassify all finished; the restart phase
+#                      is ABOUT TO begin and MAY SIGKILL the invoking session
+#                      (exit 137). Success is already true at this point.
+#   restart-complete — every restart step finished without the invoking session
+#                      being cycled (e.g. --no-restart-agents, or a non-self
+#                      install). The fuller, happiest state.
+#
+# The marker lives at <target_root>/state/upgrade/upgrade-complete.json. It is
+# the SOURCE OF TRUTH for upgrade success when the exit code is unreliable
+# (137 from a self-restart SIGKILL, 144 from a BrokenPipe per #1660). Written
+# with an atomic tmp+rename so a partial write is never observed; best-effort —
+# a marker-write failure is logged but NEVER aborts the upgrade.
+#
+# Sets _BRIDGE_UPGRADE_COMPLETE_MARKER_PATH to the marker path on success.
+_bridge_upgrade_write_complete_marker() {
+  local target_root="$1"
+  local phase="$2"
+  local version="${3:-}"
+  local restart_daemon="${4:-}"
+  local restart_agents="${5:-}"
+
+  local marker_dir="$target_root/state/upgrade"
+  local marker_path="$marker_dir/upgrade-complete.json"
+  mkdir -p "$marker_dir" 2>/dev/null || {
+    echo "[bridge-upgrade] WARN: could not create $marker_dir for the upgrade-complete marker (success still real; exit code is unreliable on self-restart)" >&2
+    return 0
+  }
+
+  local ts
+  ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+
+  local esc_phase esc_ts esc_version esc_target esc_run
+  esc_phase="$(_bridge_upgrade_json_escape "$phase")"
+  esc_ts="$(_bridge_upgrade_json_escape "$ts")"
+  esc_version="$(_bridge_upgrade_json_escape "$version")"
+  esc_target="$(_bridge_upgrade_json_escape "$target_root")"
+  esc_run="$(_bridge_upgrade_json_escape "${UPGRADE_RUN_ID:-}")"
+
+  # Booleans default to null-ish empty when not passed (work-complete records
+  # the intent so a downstream reader knows a restart phase was due to run).
+  local rd_json="null" ra_json="null"
+  [[ "$restart_daemon" == "1" ]] && rd_json="true"
+  [[ "$restart_daemon" == "0" ]] && rd_json="false"
+  [[ "$restart_agents" == "1" ]] && ra_json="true"
+  [[ "$restart_agents" == "0" ]] && ra_json="false"
+
+  local tmp
+  tmp="$(mktemp "${marker_dir}/.upgrade-complete.XXXXXX" 2>/dev/null)" || {
+    echo "[bridge-upgrade] WARN: mktemp failed for the upgrade-complete marker under $marker_dir (success still real)" >&2
+    return 0
+  }
+  # Pure-printf JSON — no subprocess interpreter. One object, stable key order.
+  {
+    printf '{\n'
+    printf '  "phase": "%s",\n' "$esc_phase"
+    printf '  "status": "ok",\n'
+    printf '  "version": "%s",\n' "$esc_version"
+    printf '  "target_root": "%s",\n' "$esc_target"
+    printf '  "run_id": "%s",\n' "$esc_run"
+    printf '  "restart_daemon": %s,\n' "$rd_json"
+    printf '  "restart_agents": %s,\n' "$ra_json"
+    printf '  "completed_at": "%s",\n' "$esc_ts"
+    printf '  "note": "Upgrade work completed. On a sudo-self systemd install the invoking session may be SIGKILLed by the daemon restart (exit 137) — that is EXPECTED, not a failure. This marker is the source of truth for success."\n'
+    printf '}\n'
+  } >"$tmp" 2>/dev/null || {
+    echo "[bridge-upgrade] WARN: could not write the upgrade-complete marker body (success still real)" >&2
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  }
+  if mv -f "$tmp" "$marker_path" 2>/dev/null; then
+    _BRIDGE_UPGRADE_COMPLETE_MARKER_PATH="$marker_path"
+  else
+    echo "[bridge-upgrade] WARN: could not finalize the upgrade-complete marker at $marker_path (success still real)" >&2
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+  return 0
+}
+# END: Issue #1662 upgrade-complete marker helpers
 
 # #8945 Track D: record the Codex CLI version across upgrades and surface a
 # NON-FATAL operator advisory when the MAJOR or MINOR component changes.
@@ -2597,6 +2710,36 @@ PY
   rm -rf "$_relink_profile_dir"
 fi
 
+# Issue #1662 — DURABLE SUCCESS MARKER + NOTICE, written BEFORE the restart
+# phase begins. On a sudo-self systemd install the upcoming daemon/systemd-unit
+# restart can cycle the INVOKING tmux session (it lives under the unit being
+# restarted) → SIGKILL → exit 137, even though every apply/migrate/reclassify
+# step already SUCCEEDED. So at THIS point — all mutating work done, restart not
+# yet started — we flush a durable marker (state/upgrade/upgrade-complete.json,
+# phase=work-complete) and emit a clear operator/automation notice. The marker
+# is the source of truth for success when the exit code is unreliable; flushing
+# it here makes success observable INDEPENDENT of the session SIGKILL.
+#
+# Skip on dry-run (no work was actually applied) and on analyze/check paths
+# (they exit earlier and never reach here).
+# BEGIN: Issue #1662 upgrade-complete marker + restart notice
+if [[ $DRY_RUN -eq 0 ]]; then
+  _bridge_upgrade_write_complete_marker \
+    "$TARGET_ROOT" "work-complete" "$SOURCE_VERSION" "$RESTART_DAEMON" "$RESTART_AGENTS"
+  # Notice only when a restart that COULD cycle the invoking session is about to
+  # run. With --no-restart-daemon AND --no-restart-agents nothing cycles the
+  # session, so the exit-137 caveat does not apply and we stay quiet (the
+  # restart-complete marker below still records the happy path).
+  if [[ $RESTART_DAEMON -eq 1 || $RESTART_AGENTS -eq 1 ]]; then
+    {
+      echo "[bridge-upgrade] upgrade COMPLETE (version ${SOURCE_VERSION:-unknown}) — entering the daemon/agent restart phase now."
+      echo "[bridge-upgrade] On a sudo-self systemd install this restart may TERMINATE the invoking session (exit 137 / SIGKILL). That is EXPECTED, not a failure."
+      echo "[bridge-upgrade] Success is recorded at ${_BRIDGE_UPGRADE_COMPLETE_MARKER_PATH:-$TARGET_ROOT/state/upgrade/upgrade-complete.json} — read it (phase + status) instead of gating on the exit code."
+    } >&2
+  fi
+fi
+# END: Issue #1662 upgrade-complete marker + restart notice
+
 if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   # --force: the upgrader is the sanctioned daemon stop+restart path
   # (issue #314 Layer 3 / #315 Track 3). Bypass the active-agent guard.
@@ -3179,6 +3322,19 @@ if [[ $RESTART_AGENTS -eq 1 ]]; then
   fi
 fi
 
+# Issue #1662 — promote the success marker to phase=restart-complete. Reaching
+# this line means every restart step ran to completion WITHOUT the invoking
+# session being SIGKILLed (e.g. --no-restart-agents, a non-self install, or a
+# self-restart that did not cycle this process). On a sudo-self systemd install
+# that DID cycle the invoking session, execution was already terminated during
+# the systemctl restart above and never reached here — in that case the durable
+# phase=work-complete marker written before the restart phase is the source of
+# truth. Skip on dry-run (no marker was written; nothing to promote).
+if [[ $DRY_RUN -eq 0 ]]; then
+  _bridge_upgrade_write_complete_marker \
+    "$TARGET_ROOT" "restart-complete" "$SOURCE_VERSION" "$RESTART_DAEMON" "$RESTART_AGENTS"
+fi
+
 if [[ $JSON -eq 1 ]]; then
   _json_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-json.XXXXXX")"
   printf '%s' "$BACKUP_JSON" >"$_json_payload_dir/backup.json"
@@ -3208,6 +3364,17 @@ if [[ $JSON -eq 1 ]]; then
   # never ran (dry-run paths) — load_optional_json then yields null and
   # the consumer branches accordingly.
   printf '%s' "${WORKDIR_BACKFILL_JSON:-}" >"$_json_payload_dir/workdir-backfill.json"
+  # Issue #1662: surface the durable upgrade-complete marker in --json output so
+  # callers/monitoring can read `phase` (work-complete / restart-complete) +
+  # `status` independent of the process exit code (137 on a self-restart
+  # SIGKILL is EXPECTED success, not failure). Copy the on-disk marker into the
+  # payload dir when present (it was written before the restart phase); empty
+  # file → load_optional_json yields null on dry-run / pre-marker paths.
+  if [[ -f "$TARGET_ROOT/state/upgrade/upgrade-complete.json" ]]; then
+    cat "$TARGET_ROOT/state/upgrade/upgrade-complete.json" >"$_json_payload_dir/upgrade-complete.json" 2>/dev/null || true
+  else
+    : >"$_json_payload_dir/upgrade-complete.json"
+  fi
   # Issue #752 W3d: emit dedup'd partial-failure subsystem names as a
   # JSON array file so the python envelope below can branch
   # `status:"partial"` + `partial_failures:[...]`. Empty array on the
@@ -3220,9 +3387,9 @@ if [[ $JSON -eq 1 ]]; then
     printf '[]' >"$_json_payload_dir/partial-failures.json"
   fi
   set +e
-  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" "$_json_payload_dir/isolation-v2-migration.json" "$_json_payload_dir/workdir-backfill.json" "$_json_payload_dir/partial-failures.json" <<'PY'
+  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" "$_json_payload_dir/isolation-v2-migration.json" "$_json_payload_dir/workdir-backfill.json" "$_json_payload_dir/upgrade-complete.json" "$_json_payload_dir/partial-failures.json" <<'PY'
 import json, sys
-source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file, isolation_v2_migration_json_file, workdir_backfill_json_file, partial_failures_json_file = sys.argv[1:]
+source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file, isolation_v2_migration_json_file, workdir_backfill_json_file, upgrade_complete_json_file, partial_failures_json_file = sys.argv[1:]
 
 def load_json(path):
     with open(path, encoding="utf-8") as fh:
@@ -3262,6 +3429,13 @@ isolation_v2_migration_payload = load_optional_json(isolation_v2_migration_json_
 # (dry-run, helper not invoked). Populated as `agents_with_writes`,
 # `markers_copied` so JSON consumers can audit the post-upgrade state.
 workdir_backfill_payload = load_optional_json(workdir_backfill_json_file)
+# Issue #1662: durable upgrade-complete marker (phase=work-complete written
+# before the restart phase, promoted to restart-complete after every restart
+# step survived). Null on dry-run / pre-marker paths. Lets a caller confirm
+# success independent of the process exit code — 137 (self-restart SIGKILL) and
+# 144 (#1660 BrokenPipe) are both EXPECTED-success exit codes, so gating on the
+# marker's `phase`/`status` is the reliable contract.
+upgrade_complete_payload = load_optional_json(upgrade_complete_json_file)
 # Issue #752 W3d: late-stage subsystems (shared rerender / channel-policy
 # refresh / profile relink) append their stable name to this list when
 # their post-step probe reports failures. `status:"partial"` surfaces the
@@ -3311,6 +3485,7 @@ payload = {
     "agent_migration": migration_payload,
     "isolation_v2_migration": isolation_v2_migration_payload,
     "workdir_backfill": workdir_backfill_payload,
+    "upgrade_complete_marker": upgrade_complete_payload,
     "source_reclassify": source_reclassify_payload,
     "shared_settings_rerender": shared_settings_rerender_payload,
     "cleanup": cleanup_payload,
