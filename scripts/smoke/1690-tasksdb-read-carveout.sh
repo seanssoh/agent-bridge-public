@@ -103,6 +103,18 @@ PEER_HOME="$BRIDGE_AGENT_HOME_ROOT/$PEER_AGENT"
 mkdir -p "$PEER_HOME"
 printf -- '- session type: static\n' >"$PEER_HOME/SESSION-TYPE.md"
 
+# A NON-admin (user-class) acting agent. Issue #1692 adds an admin read-
+# intent carve-out for peer-home reads, so the Stage-B peer-home sibling-
+# ordering teeth below (which assert the tasks.db carve-out does NOT short-
+# circuit the peer-home deny) must run as a non-admin agent — for admin the
+# peer-home read is now legitimately ALLOWED. The shared/secrets|private
+# Stage-A teeth stay on the admin $AGENT: those forbidden subtrees are
+# off-limits for admin too, so they remain DENY there.
+NONADMIN_AGENT="worker-1690"
+NONADMIN_HOME="$BRIDGE_AGENT_HOME_ROOT/$NONADMIN_AGENT"
+mkdir -p "$NONADMIN_HOME"
+printf -- '- session type: static\n' >"$NONADMIN_HOME/SESSION-TYPE.md"
+
 # JSON-escape a string for embedding in the payload.
 json_escape() {
   local s="$1"
@@ -143,11 +155,16 @@ write_path_payload() {
     >"$target"
 }
 
-# $1 payload file, $2 optional policy path override.
+# $1 payload file, $2 optional policy path override, $3 optional agent
+# override (defaults to the admin $AGENT). The agent override lets a
+# role-sensitive assertion (e.g. the Stage-B peer-home sibling-ordering
+# teeth, which #1692 now ALLOWs for admin) run as a non-admin agent so the
+# ordering invariant is proven without depending on admin behavior.
 run_pretool_hook() {
   local payload_file="$1"
   local policy="${2:-$SMOKE_REPO_ROOT/hooks/tool-policy.py}"
-  BRIDGE_AGENT_ID="$AGENT" \
+  local agent="${3:-$AGENT}"
+  BRIDGE_AGENT_ID="$agent" \
     "$PYTHON_BIN" "$policy" <"$payload_file"
 }
 
@@ -160,12 +177,13 @@ verdict_of() {
   fi
 }
 
-# Assert a Bash command's verdict. $1 label, $2 command, $3 ALLOW|DENY.
+# Assert a Bash command's verdict. $1 label, $2 command, $3 ALLOW|DENY,
+# $4 optional agent override (defaults to the admin $AGENT).
 assert_bash_verdict() {
-  local label="$1" command="$2" want="$3" payload out got
+  local label="$1" command="$2" want="$3" agent="${4:-$AGENT}" payload out got
   payload="$SMOKE_TMP_ROOT/payload-$RANDOM.json"
   write_bash_payload "$payload" "$command"
-  out="$(run_pretool_hook "$payload")"
+  out="$(run_pretool_hook "$payload" "" "$agent")"
   got="$(verdict_of "$out")"
   if [[ "$got" == "$want" ]]; then
     smoke_log "ok: ${label} -> ${got}"
@@ -336,8 +354,12 @@ assert_bash_verdict "bash shared/secrets + tasks.db (order swapped)" \
   "cat $SECRETS_FILE $TASK_DB" "DENY"
 assert_bash_verdict "bash tasks.db + shared/private (read-intent)" \
   "cat $TASK_DB $PRIVATE_FILE" "DENY"
-assert_bash_verdict "bash tasks.db + peer-home (read-intent)" \
-  "cat $TASK_DB $PEER_HOME/MEMORY.md" "DENY"
+# Run the peer-home sibling-ordering case as a NON-admin agent: issue #1692
+# gives admin a peer-home read carve-out (ALLOW), so the ordering invariant
+# (tasks.db carve-out must not short-circuit the Stage-B peer-home deny) is
+# proven with a user-class agent where the peer-home read stays denied.
+assert_bash_verdict "bash tasks.db + peer-home (read-intent, non-admin)" \
+  "cat $TASK_DB $PEER_HOME/MEMORY.md" "DENY" "$NONADMIN_AGENT"
 # Controls: the carve-out still works for tasks.db ALONE, and the forbidden
 # path alone is still denied (proving the deny is not a tasks.db artifact).
 assert_bash_verdict "bash tasks.db alone still ALLOWED" "cat $TASK_DB" "ALLOW"
