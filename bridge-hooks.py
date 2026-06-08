@@ -1490,11 +1490,21 @@ def next_backup_path(path: Path, os_user: str | None = None) -> Path:
 # survive the `settings.json` → `settings.effective.json` symlink
 # transition. Issue #613 generalized it to the shared renderer after
 # operators hit the same silent-clobber on every `--apply`.)
+#
+# (Issue #1689 added "statusLine": an operator-configured status line —
+# e.g. the claude-hud HUD set up via `/claude-hud:setup` — lives as a
+# top-level `statusLine` object in settings.json. Without preservation it
+# was dropped on every rerender, so the HUD silently vanished on the next
+# `agb upgrade` / restart. The bridge's own `hud_usage_tap` reads and
+# patches `settings["statusLine"]["command"]`, so preserving the key also
+# keeps that tap's patch alive across rerenders rather than having the next
+# render delete what the tap just wrote.)
 PRESERVED_USER_KEYS = (
     "enabledPlugins",
     "extraKnownMarketplaces",
     "apiKeyHelper",
     "skipDangerousModePermissionPrompt",
+    "statusLine",
 )
 
 # Issue #1495: Claude Code skips the ENTIRE settings.json (every key —
