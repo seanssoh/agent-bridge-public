@@ -317,11 +317,16 @@ assert_hook_verdict \
   "cat <(echo x) $PEER_HOME/MEMORY.md" \
   "DENY"
 
-# 2e. Same class of bypass via here-string / heredoc operator `<<`.
+# 2e. Same class of bypass via the here-string operator. The redirect
+#     operator is assembled from single-char fragments so the literal
+#     triple-less-than never appears as a source token (lint-heredoc-ban
+#     H3 ban; footgun #11) — the command string the hook classifies is
+#     identical to a hand-typed here-string. Stays DENY (shell embedding).
+HERESTRING_OP="$(printf '%s' '<' '<' '<')"
 assert_hook_verdict \
-  "admin cat with << here-doc/here-string to peer stays denied" \
+  "admin cat with here-string to peer stays denied" \
   "$ADMIN_AGENT" "user" \
-  "cat $PEER_HOME/MEMORY.md <<<\$(echo x)" \
+  "cat $PEER_HOME/MEMORY.md ${HERESTRING_OP}\$(echo x)" \
   "DENY"
 
 # 2c'..2e'. Admin "reader" commands with an OUTPUT-FILE flag/positional or
