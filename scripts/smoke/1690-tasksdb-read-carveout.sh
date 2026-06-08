@@ -343,6 +343,48 @@ assert_bash_verdict "bash tasks.db + peer-home (read-intent)" \
 assert_bash_verdict "bash tasks.db alone still ALLOWED" "cat $TASK_DB" "ALLOW"
 assert_bash_verdict "bash shared/secrets alone still DENIED" "cat $SECRETS_FILE" "DENY"
 
+# ===== DENY (teeth): FIX 2 — var/tilde/brace-spelled forbidden sibling (#1690 r4) =====
+# A var/${VAR}/~/brace-spelled forbidden sibling path hides from the literal
+# substring sibling gate, so when the tasks.db read carve-out is in play the
+# command must fail closed on any unresolved path-spelling expansion. The
+# var spellings are passed LITERALLY to the hook (single-quoted in the smoke
+# so the smoke's own shell does not expand them) — the hook classifies the
+# raw command text. ${BRIDGE_HOME} resolves to $BRIDGE_HOME at runtime.
+assert_bash_verdict "bash tasks.db + \${BRIDGE_HOME} sibling" \
+  "cat $TASK_DB \${BRIDGE_HOME}/shared/secrets/token.txt" "DENY"
+assert_bash_verdict "bash tasks.db + \$BRIDGE_HOME sibling" \
+  "cat $TASK_DB \$BRIDGE_HOME/shared/secrets/token.txt" "DENY"
+assert_bash_verdict "bash tasks.db + \${HOME} sibling" \
+  "cat $TASK_DB \${HOME}/.agent-bridge/shared/secrets/x" "DENY"
+assert_bash_verdict "bash tasks.db + ~ sibling" \
+  "cat $TASK_DB ~/.agent-bridge/shared/secrets/x" "DENY"
+assert_bash_verdict "bash tasks.db + brace sibling" \
+  "cat $BRIDGE_HOME/{state,shared/secrets}/x $TASK_DB" "DENY"
+# Controls: a literal-only read of tasks.db ALONE still ALLOWs (no expansion);
+# a NON-protected var/tilde read is unaffected (no carve-out in play).
+assert_bash_verdict "bash literal-absolute tasks.db (allowed)" \
+  "cat $BRIDGE_HOME/state/tasks.db" "ALLOW"
+assert_bash_verdict "bash non-protected \${HOME} read (allowed)" \
+  "cat \${HOME}/notes.txt" "ALLOW"
+assert_bash_verdict "bash non-protected ~ read (allowed)" \
+  "cat ~/notes.txt" "ALLOW"
+
+# ===== DENY (teeth): FIX 1 — bash 5.3 funsub RCE (#1690 r4) =====
+# `${ cmd; }` / `${| cmd; }` is a command-substitution the analyzer can't
+# split; a subshell body `${ (cmd) }` self-terminates so the stage leader
+# stays a benign read. Both embedding gates now flag `${`+whitespace/`|`.
+# `${VAR}` parameter expansion (no space) must NOT be flagged.
+assert_bash_verdict "bash funsub subshell exfil" \
+  "cat $TASK_DB \${ (cp $TASK_DB /tmp/sink) }" "DENY"
+assert_bash_verdict "bash funsub pipe form" \
+  "cat $TASK_DB \${| cp $TASK_DB /tmp/sink; }" "DENY"
+assert_bash_verdict "bash funsub brace-cmd form" \
+  "cat $TASK_DB \${ cp x y; }" "DENY"
+assert_bash_verdict "bash \${VAR} param-expansion read (allowed)" \
+  "cat \${SOMEVAR}" "ALLOW"
+assert_bash_verdict "bash \${arr[@]} param-expansion (allowed)" \
+  "echo \${arr[@]}" "ALLOW"
+
 # ===== DENY (teeth): mutators / fail-closed on unparseable =====
 assert_bash_verdict "bash rm tasks.db"             "rm $TASK_DB"              "DENY"
 assert_bash_verdict "bash unbalanced-quote command" "cat $TASK_DB ' | tee /tmp/leak" "DENY"

@@ -285,6 +285,19 @@ def main() -> int:
         # quoted flag-with-value must NOT over-block a lone-input read
         (f'xxd "-s" 0 {db}', True),
         (f'uniq "-f" 2 {db}', True),
+        # r4 FIX 1: bash 5.3 funsub `${ cmd; }` is a command substitution
+        # the stage-splitter can't see (a subshell body `${ (cmd) }` self-
+        # terminates), so the embedding gate must flag `${`+whitespace/`|`.
+        # These classify NOT read-intent (deny). `${VAR}` param-expansion
+        # (no space after `{`) must stay read-intent.
+        (f"cat {db} ${{ (cp {db} /tmp/sink) }}", False),  # funsub subshell
+        (f"cat {db} ${{| cp {db} /tmp/sink; }}", False),  # funsub pipe form
+        (f"cat {db} ${{ cp x y; }}", False),              # funsub brace-cmd
+        (f"cat ${{SOMEVAR}}", True),                       # param expansion
+        (f"cat ${{#x}}", True),
+        (f"echo ${{arr[@]}}", True),
+        (f"cat ${{x:-d}}", True),
+        (f"cat ${{BRIDGE_HOME}}/path", True),             # param expansion path
         # ---- KEEP teeth: fail-closed on unparseable command ----
         (f"cat {db} ' | tee /tmp/leak", False),  # unbalanced quote
     ]
@@ -308,6 +321,44 @@ def main() -> int:
         )
     else:
         print("  PASS  sqlite3 absent from _READ_INTENT_BASH_COMMANDS")
+
+    # r4 FIX 1: the funsub `${ space`-vs-`${VAR}` discriminator at the
+    # helper level, for BOTH embedding gates (strict + quote-aware).
+    strict = module._command_has_shell_embedding
+    unq = module._command_has_unquoted_shell_embedding
+    funsub_deny = ["cat ${ cmd; }", "cat ${| cmd; }", "cat ${\t(x) }", "cat ${\nx; }"]
+    param_allow = ["cat ${VAR}", "cat ${#x}", "echo ${arr[@]}", "cat ${x:-d}",
+                   "cat ${BRIDGE_HOME}/p"]
+    for c in funsub_deny:
+        if not strict(c):
+            failures.append(f"  FAIL  strict embedding MISSED funsub: {c!r}")
+        elif not unq(c):
+            failures.append(f"  FAIL  unquoted embedding MISSED funsub: {c!r}")
+        else:
+            print(f"  PASS  both gates flag funsub {c!r}")
+    for c in param_allow:
+        if strict(c) or unq(c):
+            failures.append(f"  FAIL  embedding over-flagged ${{VAR}} param: {c!r}")
+        else:
+            print(f"  PASS  ${{VAR}} param not flagged {c!r}")
+
+    # r4 FIX 2: the unresolved-path-expansion detector — $VAR/${VAR}/~/brace
+    # outside single quotes flagged; funsub/single-quoted/literal not.
+    pe = module._has_unresolved_path_expansion
+    pe_yes = ["cat ${BRIDGE_HOME}/x", "cat $BRIDGE_HOME/x", "cat ${HOME}/x",
+              "cat ~/x", "cat a {b,c}/x"]
+    pe_no = ["cat /abs/literal", "cat ${ cmd; }", "cat '${VAR}'/x",
+             "grep x file", "cat foo~bar"]
+    for c in pe_yes:
+        if not pe(c):
+            failures.append(f"  FAIL  path-expansion detector MISSED: {c!r}")
+        else:
+            print(f"  PASS  path-expansion detected {c!r}")
+    for c in pe_no:
+        if pe(c):
+            failures.append(f"  FAIL  path-expansion detector over-flagged: {c!r}")
+        else:
+            print(f"  PASS  path-expansion not flagged {c!r}")
 
     if failures:
         print(f"\n{len(failures)} failure(s):", file=sys.stderr)

@@ -2143,6 +2143,16 @@ _SHELL_EMBEDDING_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"<\("),        # process substitution (read)
     re.compile(r">\("),        # process substitution (write)
     re.compile(r"<<"),         # heredoc / here-string (covers <<-, <<<)
+    # bash 5.3 funsub (command substitution that captures output without a
+    # subshell): `${ cmd; }` and `${| cmd; }`. The `{` is followed by
+    # REQUIRED whitespace (space/tab/newline) or `|` — that is exactly what
+    # distinguishes it from `${VAR}` / `${#x}` / `${arr[@]}` parameter
+    # expansion (no space). A subshell body `${ (cmd) }` self-terminates
+    # with `)`, so `_split_command_stages` does NOT split it and the stage
+    # leader stays a benign read command — this gate is the only thing that
+    # catches it (issue #1690 r4, proven RCE on bash 5.3.9). NEVER match
+    # `${` immediately followed by a non-space char.
+    re.compile(r"\$\{[ \t\n|]"),
 )
 
 
@@ -2204,6 +2214,19 @@ def _command_has_unquoted_shell_embedding(text: str) -> bool:
             return True
         if c == "$" and i + 1 < n and text[i + 1] == "(":
             return True
+        # bash 5.3 funsub `${ cmd; }` / `${| cmd; }` — `${` followed by
+        # whitespace/`|` runs a command (issue #1690 r4). The required
+        # space is the discriminator from `${VAR}` parameter expansion;
+        # `${` followed by any non-space char is param expansion and is NOT
+        # flagged. (Inside double quotes `${ … }` still executes, so we
+        # check it here in the not-single-quoted branch.)
+        if (
+            c == "$"
+            and i + 2 < n
+            and text[i + 1] == "{"
+            and text[i + 2] in (" ", "\t", "\n", "|")
+        ):
+            return True
         if c in ("<", ">") and i + 1 < n and text[i + 1] == "(":
             return True
         if c == "<" and i + 1 < n and text[i + 1] == "<":
@@ -2211,6 +2234,103 @@ def _command_has_unquoted_shell_embedding(text: str) -> bool:
         i += 1
     if in_sq:
         return True  # unterminated single quote → un-parseable → fail-closed
+    return False
+
+
+# Protected-path carve-out deny reason for a command whose paths cannot be
+# statically resolved (issue #1690 r4 FIX 2).
+PATH_EXPANSION_CARVEOUT_DENY_REASON = (
+    "protected-path read blocked: the command spells a path via a shell "
+    "expansion ($VAR / ${VAR} / ~ / brace) that cannot be resolved "
+    "statically, so a forbidden sibling path could be hidden. Use a "
+    "literal absolute path or the `agb` queue commands."
+)
+
+
+def _has_unresolved_path_expansion(text: str) -> bool:
+    """True iff *text* contains a path-spelling shell expansion the
+    analyzer cannot reduce to a literal — parameter expansion (`$VAR` /
+    `${VAR}`), tilde (`~`, `~user`), or brace expansion (`{a,b}`) —
+    OUTSIDE single quotes (the shell expands these before the command
+    runs).
+
+    Issue #1690 r4 FIX 2: the protected-path carve-outs only grant a read
+    when they can statically SEE every literal path the command touches.
+    A var/tilde/brace path spelling hides a path from that analysis (e.g.
+    `cat <tasks.db> ${BRIDGE_HOME}/shared/secrets/x` — the literal
+    secrets path never appears, so the substring sibling gate misses it).
+    When this returns True AND a protected-path carve-out is about to be
+    granted, the caller fails closed.
+
+    Deliberately does NOT flag:
+      - `$(` command substitution / `${ ` funsub — already caught by the
+        shell-embedding gate.
+      - single-quoted occurrences — the shell passes them literally.
+      - a `~` that is not at a word start (`foo~bar` is a literal).
+    """
+    i = 0
+    n = len(text)
+    in_sq = False
+    in_dq = False
+    word_start = True
+    while i < n:
+        c = text[i]
+        if in_sq:
+            if c == "'":
+                in_sq = False
+            word_start = False
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            word_start = False
+            i += 2  # backslash escape outside single quotes
+            continue
+        if c == "'" and not in_dq:
+            in_sq = True
+            word_start = False
+            i += 1
+            continue
+        if c == '"':
+            in_dq = not in_dq
+            word_start = False
+            i += 1
+            continue
+        if c == "$" and i + 1 < n:
+            nx = text[i + 1]
+            # `${VAR}` parameter expansion — but NOT the funsub `${ ` form
+            # (a non-space after `{`); `$(` is command-sub (embedding gate).
+            if nx == "{" and i + 2 < n and text[i + 2] not in (" ", "\t", "\n", "|"):
+                return True
+            if nx != "(" and (nx.isalpha() or nx == "_"):
+                return True  # `$VAR`
+        # Tilde home expansion only at a word start (`~`, `~user`); a `~`
+        # mid-word (`foo~bar`) is a literal.
+        if c == "~" and word_start and not in_dq:
+            return True
+        # Brace expansion `{a,b}` (a brace group containing a comma) — a
+        # path multiplier the analyzer cannot enumerate. Outside quotes
+        # only; `${ … }` was already handled above (the `$` precedes it).
+        if c == "{" and not in_dq:
+            depth = 0
+            j = i
+            saw_comma = False
+            while j < n:
+                cj = text[j]
+                if cj == "'" or cj == '"':
+                    break  # quote inside the group — give up, not a clean brace
+                if cj == "{":
+                    depth += 1
+                elif cj == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif cj == "," and depth == 1:
+                    saw_comma = True
+                j += 1
+            if saw_comma:
+                return True
+        word_start = c in (" ", "\t", "\n")
+        i += 1
     return False
 
 
@@ -4153,6 +4273,20 @@ def protected_alias_reason(
     # redirection disqualifies the whole invocation. See
     # `_is_read_intent_bash` for the full contract.
     read_intent = _is_read_intent_bash(text)
+    # Issue #1690 r4 FIX 2: a read-intent command that spells a path via an
+    # unresolved shell expansion ($VAR / ${VAR} / ~ / brace) hides a path
+    # from the static analysis the protected-path carve-outs rely on, so a
+    # forbidden sibling could be smuggled in (e.g. `cat <tasks.db>
+    # ${BRIDGE_HOME}/shared/secrets/x` — the literal secrets path never
+    # appears for the substring sibling gate to catch). When a protected-
+    # path read carve-out is about to be GRANTED below, fail closed if this
+    # is set: an unresolvable path spelling is never a safe carve-out read.
+    # Scoped to the carve-out grants only, so a normal read of a NON-
+    # protected path via $VAR/~ is unaffected (no carve-out → no check).
+    # Accepted, documented over-block: a var/tilde-spelled read of a
+    # protected path itself loses the carve-out — use a literal absolute
+    # path or `agb`.
+    read_carveout_blocked_by_expansion = read_intent and _has_unresolved_path_expansion(text)
     # Issue #1358 tactical carve-out — admin rotation-pool token
     # registration via the sanctioned `bash bridge-auth.sh claude-token
     # add --stdin …` shape. Evaluated BEFORE the substring-deny block
@@ -4269,6 +4403,10 @@ def protected_alias_reason(
         return None
     if _bash_argv_references_path(text, roster_local_path()):
         if read_intent:
+            # Issue #1690 r4 FIX 2: an unresolved path-spelling expansion
+            # hides a sibling path from the analysis — deny the carve-out.
+            if read_carveout_blocked_by_expansion:
+                return PATH_EXPANSION_CARVEOUT_DENY_REASON
             return None
         # Issue #1255 r2 — admin roster read carve-out is a strict
         # read-intent whitelist (cat / grep / head / `agent-bridge
@@ -4312,11 +4450,22 @@ def protected_alias_reason(
         # forbidden path in the same command is still denied downstream.
         if not read_intent:
             return "direct queue DB access is blocked; use `agb` queue commands instead"
+        # Issue #1690 r4 FIX 2: the read carve-out falls through to the
+        # later sibling gates, but a var/tilde/brace-spelled sibling would
+        # be invisible to them. Deny the carve-out when the command spells
+        # a path via an unresolved expansion (`cat <tasks.db>
+        # ${BRIDGE_HOME}/shared/secrets/x`).
+        if read_carveout_blocked_by_expansion:
+            return PATH_EXPANSION_CARVEOUT_DENY_REASON
     # Issue #341: system-config paths get the same argv-based check; the
     # wrapper command is the only normal mutation surface for writes.
     # Read-intent is allowed for all agents — see #383.
     if _bash_argv_references_system_config(text):
         if read_intent:
+            # Issue #1690 r4 FIX 2: deny the carve-out on an unresolved
+            # path-spelling expansion (a sibling could be hidden).
+            if read_carveout_blocked_by_expansion:
+                return PATH_EXPANSION_CARVEOUT_DENY_REASON
             return None
         return SYSTEM_CONFIG_DENY_REASON
     # Issue #6607 — anchored admin bridge-verb allowlist (replaces the
