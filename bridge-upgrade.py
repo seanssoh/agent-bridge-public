@@ -1034,6 +1034,23 @@ def rematerialize_agent_identity(
         )
     if not isinstance(payload, dict):
         return rematerialize_error_result(result.agent, "", "", "helper JSON was not an object")
+    # Issue #1670: pin the identity boundary. The helper is always invoked with
+    # `result.agent` in the third positional slot, so the payload's "agent" must
+    # come back nonempty AND equal to it. If it does not (e.g. the helper's
+    # Bash 3.2 -> 4+ re-exec dropped the mandatory args and re-ran with a blank
+    # agent, the historical #1670 symptom), do NOT propagate a payload that
+    # blames the wrong / empty agent — convert it to a structured rematerialize
+    # error keyed on the agent we actually asked for, so the upgrade JSON, the
+    # backup planner, and rollback all see a coherent agent identity.
+    payload_agent = payload.get("agent")
+    if not isinstance(payload_agent, str) or not payload_agent or payload_agent != result.agent:
+        return rematerialize_error_result(
+            result.agent,
+            payload.get("source_dir", "") if isinstance(payload.get("source_dir"), str) else "",
+            payload.get("target_dir", "") if isinstance(payload.get("target_dir"), str) else "",
+            f"helper returned mismatched agent identity (expected '{result.agent}', "
+            f"got {payload_agent!r}); refusing to attribute rematerialize result to the wrong agent",
+        )
     if proc.stderr.strip():
         payload.setdefault("warnings", []).append(proc.stderr.strip())
     return payload

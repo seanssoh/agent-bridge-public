@@ -78,6 +78,12 @@ PULL_EXPLICIT=0
 SOURCE_EXPLICIT=0
 CHANNEL="${AGENT_BRIDGE_UPGRADE_CHANNEL:-stable}"
 CHANNEL_EXPLICIT=0
+# v0.16.3 Lane F: CHANNEL_FLAG_EXPLICIT is set ONLY by a literal `--channel`
+# flag (not --version / --ref, which also flip CHANNEL_EXPLICIT). The sticky
+# channel file is only rewritten on an explicit `--channel`, so --version /
+# --ref / a bare run / env-only AGENT_BRIDGE_UPGRADE_CHANNEL stay transient
+# and never overwrite the recorded per-install pin.
+CHANNEL_FLAG_EXPLICIT=0
 REQUESTED_VERSION=""
 REQUESTED_REF=""
 CHECK_ONLY=0
@@ -112,6 +118,17 @@ SOURCE_RECLASSIFY_JSON='{}'
 SHARED_SETTINGS_RERENDER_JSON='{"mode":"skipped","count":0,"failed_count":0,"candidates":[]}'
 ISOLATION_V2_MIGRATION_JSON=""
 
+# Issue #1662: durable success marker for the self-restart exit-137 contract.
+# On sudo-self systemd installs, `upgrade --apply` (default --restart-daemon)
+# regenerates+restarts the systemd-user unit; the INVOKING tmux session lives
+# under that unit, so it gets cycled → SIGKILL → exit 137 even though the
+# upgrade SUCCEEDED. The marker is written under target state/ AFTER all
+# apply/migrate/reclassify work completes and BEFORE the restart phase begins,
+# so success is observable independent of the session SIGKILL. The variable
+# holds the resolved marker path once written (empty until then) so the post-
+# restart phase can promote it from phase=work-complete to phase=restart-complete.
+_BRIDGE_UPGRADE_COMPLETE_MARKER_PATH=""
+
 # Issue #752 W3d (M10/M11/M12): partial-failure surfacing for late
 # upgrade subsystems (shared rerender / channel-policy refresh / profile
 # relink). Each site appends a stable name when its post-step probe
@@ -145,7 +162,7 @@ _BRIDGE_UPGRADE_DIE_REMEDIATION=""
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--allow-downgrade] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents] [--migrate-all-agents] [--wait [<secs>]]
+  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--apply] [--check] [--channel stable|dev|current|lts] [--version <semver>] [--ref <git-ref>] [--allow-downgrade] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents] [--migrate-all-agents] [--wait [<secs>]]
   $(basename "$0") analyze [--source <repo-dir>] [--target <bridge-home>] [--json]
   $(basename "$0") rollback [--target <bridge-home>] [--backup-root <dir>] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--wait [<secs>]]
   $(basename "$0") conflicts list [--target <bridge-home>] [--json]
@@ -160,6 +177,13 @@ customizations such as:
 The repo checkout remains source of truth for core code. Live-only operator changes are preserved.
 When run from an installed live copy without --source, the last recorded source checkout is reused and pulled automatically.
 Default channel is stable: the latest vX.Y.Z tag is used when one exists. Use --channel dev to track main, or --channel current/--source to deploy the current checkout.
+
+Use --channel lts to pin the install to the highest stable tag within the LTS series
+(read from the root LTS_SERIES file, e.g. 0.16 → highest v0.16.x). The lts channel is
+STICKY: once set with --channel lts, later bare \`upgrade --apply\`/\`--check\`/\`--dry-run\`
+stay on the LTS line (recorded in state/upgrade/channel) instead of jumping to a newer
+stable major/minor. Switch back with --channel stable. --version/--ref are one-shot and
+do NOT change the recorded channel.
 
 The default stable channel skips pre-release (beta/rc) tags. On a pre-release install
 a bare \`upgrade --apply\` would otherwise resolve to a LOWER stable version and silently
@@ -258,6 +282,148 @@ tags = [line.strip() for line in sys.stdin if re.fullmatch(r"v\d+\.\d+\.\d+", li
 tags.sort(key=lambda tag: tuple(int(part) for part in tag[1:].split(".")))
 print(tags[-1] if tags else "")
 '
+}
+
+# v0.16.3 Lane F: the `lts` channel pins to the highest stable tag WITHIN a
+# fixed major.minor series instead of the highest GLOBAL stable tag. The
+# series is read from the root tracked file `LTS_SERIES` (a single
+# `major.minor` line, e.g. "0.16"). It is deliberately NOT derived from
+# VERSION — every minor bump would otherwise self-nominate as the LTS, and
+# main / a future v0.17 line needs a stable way to keep `lts` pointing at
+# v0.16. The resolver FAILS CLOSED (bridge_die) when LTS_SERIES is
+# missing/empty/malformed, or when no stable tag exists in the series:
+# silently falling back to the global stable line would jump an LTS-pinned
+# install off the held series, which is exactly the regression this channel
+# prevents. Pre-release tags are skipped by construction (the fullmatch
+# regex only admits `v<series>.<patch>`). Uses the same `git tag | python3
+# -c '...'` shape as bridge_upgrade_latest_stable_tag (NO heredoc/here-string
+# subprocess — footgun #11).
+bridge_upgrade_latest_lts_tag() {
+  local root="$1"
+  local series_file="$root/LTS_SERIES"
+  if [[ ! -f "$series_file" ]]; then
+    bridge_die "lts 채널을 해석할 수 없습니다: $series_file 가 없습니다.
+이 source checkout은 lts 채널을 지원하지 않습니다 (LTS_SERIES 파일 누락).
+복구: lts 채널을 지원하는 릴리즈로 source를 업데이트하거나, --channel stable 을 사용하세요."
+  fi
+  local series=""
+  series="$(head -n 1 "$series_file" 2>/dev/null | tr -d '[:space:]')" || series=""
+  if [[ ! "$series" =~ ^[0-9]+[.][0-9]+$ ]]; then
+    bridge_die "lts 채널을 해석할 수 없습니다: $series_file 의 내용이 major.minor 형식이 아닙니다 (읽은 값: '${series}').
+예: 0.16
+복구: $series_file 를 올바른 major.minor 한 줄로 고치거나, --channel stable 을 사용하세요."
+  fi
+  # Fullmatch v<series>.<patch> — anchors the series so v0.16.x is admitted
+  # but v0.160.x / v1.16.x / pre-release tags (v0.16.3-beta1) are not. The
+  # series arrives via argv (`python3 -c '...' "$series"` → sys.argv[1]), the
+  # candidate tags via stdin — same dual-input shape works fine and keeps the
+  # footgun-#11 `git tag | python3 -c` pipe (no heredoc/here-string).
+  local tag=""
+  tag="$(git -C "$root" tag --list "v${series}.[0-9]*" | python3 -c '
+import re
+import sys
+
+series = sys.argv[1]
+pattern = re.compile(r"v" + re.escape(series) + r"\.\d+$")
+tags = [line.strip() for line in sys.stdin if pattern.fullmatch(line.strip())]
+tags.sort(key=lambda tag: tuple(int(part) for part in tag[1:].split(".")))
+print(tags[-1] if tags else "")
+' "$series")"
+  if [[ -z "$tag" ]]; then
+    bridge_die "lts 채널을 해석할 수 없습니다: v${series}.x 시리즈에 stable 릴리즈 태그가 없습니다.
+복구: 해당 시리즈의 태그를 fetch 했는지 확인하거나 (git fetch --tags), --channel stable 을 사용하세요."
+  fi
+  printf '%s' "$tag"
+}
+
+# v0.16.3 Lane F: sticky per-install channel persistence. The recorded
+# channel lives in `state/upgrade/channel` (a single line, one of
+# stable|dev|current|lts). This is a DEDICATED file, NOT the historical
+# `last-upgrade.json.channel` field — old installs may carry stray
+# channel:"dev"/"current"/"ref" values in that JSON from one-off --ref /
+# env-only / --source invocations that were never a persistent contract, so
+# the JSON field stays observability-only and this file is the policy source.
+#
+# Read: echoes the recorded channel on stdout when the file exists and is
+# valid; echoes nothing (rc 0) when the file is absent (no sticky pin →
+# caller applies the legacy `stable` default). FAILS CLOSED (bridge_die) when
+# the file exists but holds an unrecognized value — silently falling back to
+# stable would jump an LTS-pinned install to the global stable line.
+bridge_upgrade_read_sticky_channel() {
+  local target_root="$1"
+  local sticky_file="$target_root/state/upgrade/channel"
+  [[ -f "$sticky_file" ]] || return 0
+  local recorded=""
+  recorded="$(head -n 1 "$sticky_file" 2>/dev/null | tr -d '[:space:]')" || recorded=""
+  case "$recorded" in
+    stable|dev|current|lts)
+      printf '%s' "$recorded"
+      ;;
+    *)
+      bridge_die "기록된 upgrade 채널 파일이 유효하지 않습니다: $sticky_file (읽은 값: '${recorded}').
+유효한 값은 stable|dev|current|lts 입니다.
+복구: 의도한 채널로 명시적으로 다시 고정하세요. 예:
+  agent-bridge upgrade --apply --channel lts
+또는 파일을 직접 올바른 한 줄로 고치세요. 자동 stable 폴백은 LTS 고정을 깨뜨릴 수 있어 거부합니다."
+      ;;
+  esac
+}
+
+# v0.16.3 Lane F: write the sticky channel file. Only the apply path calls
+# this, and only when the operator passed an explicit `--channel` (NOT
+# --version / --ref / a bare run / env-only AGENT_BRIDGE_UPGRADE_CHANNEL).
+#
+# Defense-in-depth (codex r1 catch): refuse to persist a value the READER
+# would reject. The sticky vocabulary is stable|dev|current|lts; `ref` is a
+# transient per-invocation channel, never a persistent pin, and writing it
+# would later trip the reader's fail-closed and brick bare upgrades. The
+# caller already gates on CHANNEL_FLAG_EXPLICIT (cleared by --ref/--version),
+# so this guard for the NON-persistent case is belt-and-suspenders and stays a
+# silent skip (the apply already succeeded; not writing preserves the prior pin
+# or the legacy default — the safe outcome).
+#
+# Phase-4 (codex catch): for a PERSISTENT channel value the write MUST FAIL
+# CLOSED. A best-effort `mkdir … || true` + `printf … || true` could return
+# rc=0 while leaving state/upgrade/channel STALE (existing file at mode 0400)
+# or MISSING (non-creatable state/upgrade dir). The operator would then believe
+# `--channel lts --apply` pinned the install, but the next bare/automation/env
+# upgrade sees no `lts` sticky and resolves the global stable line — the exact
+# silent escape off the LTS line this feature exists to prevent. So mkdir and
+# the write are checked, and the value is re-read to confirm it actually landed;
+# any failure bridge_dies with a clear remediation.
+bridge_upgrade_write_sticky_channel() {
+  local target_root="$1"
+  local channel="$2"
+  case "$channel" in
+    stable|dev|current|lts) ;;
+    *)
+      # Never poison the sticky file with a non-persistent value (e.g. `ref`).
+      # Silent skip — see header.
+      return 0
+      ;;
+  esac
+  local state_dir="$target_root/state/upgrade"
+  local sticky_file="$state_dir/channel"
+  if ! mkdir -p "$state_dir" 2>/dev/null; then
+    bridge_die "채널 고정(pin)을 저장할 수 없습니다: $state_dir 디렉터리를 만들 수 없습니다.
+요청한 채널 '$channel'이 기록되지 않아, 다음 bare upgrade가 이 고정을 무시하고 stable 라인으로 이동할 수 있습니다.
+복구: $state_dir 의 상위 디렉터리 권한을 확인한 뒤 'agent-bridge upgrade --apply --channel $channel'을 다시 실행하세요."
+  fi
+  if ! printf '%s\n' "$channel" >"$sticky_file" 2>/dev/null; then
+    bridge_die "채널 고정(pin)을 저장할 수 없습니다: $sticky_file 에 쓸 수 없습니다.
+요청한 채널 '$channel'이 기록되지 않아, 다음 bare upgrade가 이 고정을 무시하고 stable 라인으로 이동할 수 있습니다.
+복구: $sticky_file 의 권한을 확인하거나(예: chmod u+w) 파일을 제거한 뒤 'agent-bridge upgrade --apply --channel $channel'을 다시 실행하세요."
+  fi
+  # Confirm the value actually landed — a write can report success yet leave a
+  # stale value on some filesystems / under odd permission states. Read it back
+  # and verify it matches before declaring the pin persisted.
+  local _written=""
+  _written="$(head -n 1 "$sticky_file" 2>/dev/null | tr -d '[:space:]')" || _written=""
+  if [[ "$_written" != "$channel" ]]; then
+    bridge_die "채널 고정(pin) 저장을 검증하지 못했습니다: $sticky_file 에 기록한 값이 '$channel'이 아니라 '${_written}'입니다.
+다음 bare upgrade가 이 고정을 무시할 수 있습니다.
+복구: $sticky_file 의 권한을 확인한 뒤 'agent-bridge upgrade --apply --channel $channel'을 다시 실행하세요."
+  fi
 }
 
 bridge_upgrade_normalize_version_tag() {
@@ -922,6 +1088,108 @@ print("" if value is None else str(value))
 PY
 }
 
+# BEGIN: Issue #1662 upgrade-complete marker helpers
+# Issue #1662: minimal JSON-string escaper (pure shell — NO subprocess
+# interpreter, footgun #11 / lint-heredoc ceiling). Escapes backslash, double-
+# quote, and the control chars that would break a one-line JSON value. The
+# marker only carries known-safe fields (a phase keyword, an ISO timestamp, a
+# semver, and absolute paths), so this small escaper is sufficient and avoids
+# spinning up python on the success path right before the restart SIGKILL.
+_bridge_upgrade_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"   # backslash first
+  s="${s//\"/\\\"}"   # double-quote
+  s="${s//$'\t'/\\t}" # tab
+  s="${s//$'\n'/\\n}" # newline (paths shouldn't contain these, defensive)
+  s="${s//$'\r'/\\r}" # carriage return
+  printf '%s' "$s"
+}
+
+# Issue #1662: write/promote the durable upgrade-complete success marker.
+#
+# Usage:
+#   _bridge_upgrade_write_complete_marker <target_root> <phase> <version> [restart_daemon] [restart_agents]
+#
+# <phase> is one of:
+#   work-complete    — apply/migrate/reclassify all finished; the restart phase
+#                      is ABOUT TO begin and MAY SIGKILL the invoking session
+#                      (exit 137). Success is already true at this point.
+#   restart-complete — every restart step finished without the invoking session
+#                      being cycled (e.g. --no-restart-agents, or a non-self
+#                      install). The fuller, happiest state.
+#
+# The marker lives at <target_root>/state/upgrade/upgrade-complete.json. It is
+# the SOURCE OF TRUTH for upgrade success when the exit code is unreliable
+# (137 from a self-restart SIGKILL, 144 from a BrokenPipe per #1660). Written
+# with an atomic tmp+rename so a partial write is never observed; best-effort —
+# a marker-write failure is logged but NEVER aborts the upgrade.
+#
+# Sets _BRIDGE_UPGRADE_COMPLETE_MARKER_PATH to the marker path on success.
+_bridge_upgrade_write_complete_marker() {
+  local target_root="$1"
+  local phase="$2"
+  local version="${3:-}"
+  local restart_daemon="${4:-}"
+  local restart_agents="${5:-}"
+
+  local marker_dir="$target_root/state/upgrade"
+  local marker_path="$marker_dir/upgrade-complete.json"
+  mkdir -p "$marker_dir" 2>/dev/null || {
+    echo "[bridge-upgrade] WARN: could not create $marker_dir for the upgrade-complete marker (success still real; exit code is unreliable on self-restart)" >&2
+    return 0
+  }
+
+  local ts
+  ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+
+  local esc_phase esc_ts esc_version esc_target esc_run
+  esc_phase="$(_bridge_upgrade_json_escape "$phase")"
+  esc_ts="$(_bridge_upgrade_json_escape "$ts")"
+  esc_version="$(_bridge_upgrade_json_escape "$version")"
+  esc_target="$(_bridge_upgrade_json_escape "$target_root")"
+  esc_run="$(_bridge_upgrade_json_escape "${UPGRADE_RUN_ID:-}")"
+
+  # Booleans default to null-ish empty when not passed (work-complete records
+  # the intent so a downstream reader knows a restart phase was due to run).
+  local rd_json="null" ra_json="null"
+  [[ "$restart_daemon" == "1" ]] && rd_json="true"
+  [[ "$restart_daemon" == "0" ]] && rd_json="false"
+  [[ "$restart_agents" == "1" ]] && ra_json="true"
+  [[ "$restart_agents" == "0" ]] && ra_json="false"
+
+  local tmp
+  tmp="$(mktemp "${marker_dir}/.upgrade-complete.XXXXXX" 2>/dev/null)" || {
+    echo "[bridge-upgrade] WARN: mktemp failed for the upgrade-complete marker under $marker_dir (success still real)" >&2
+    return 0
+  }
+  # Pure-printf JSON — no subprocess interpreter. One object, stable key order.
+  {
+    printf '{\n'
+    printf '  "phase": "%s",\n' "$esc_phase"
+    printf '  "status": "ok",\n'
+    printf '  "version": "%s",\n' "$esc_version"
+    printf '  "target_root": "%s",\n' "$esc_target"
+    printf '  "run_id": "%s",\n' "$esc_run"
+    printf '  "restart_daemon": %s,\n' "$rd_json"
+    printf '  "restart_agents": %s,\n' "$ra_json"
+    printf '  "completed_at": "%s",\n' "$esc_ts"
+    printf '  "note": "Upgrade work completed. On a sudo-self systemd install the invoking session may be SIGKILLed by the daemon restart (exit 137) — that is EXPECTED, not a failure. This marker is the source of truth for success."\n'
+    printf '}\n'
+  } >"$tmp" 2>/dev/null || {
+    echo "[bridge-upgrade] WARN: could not write the upgrade-complete marker body (success still real)" >&2
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  }
+  if mv -f "$tmp" "$marker_path" 2>/dev/null; then
+    _BRIDGE_UPGRADE_COMPLETE_MARKER_PATH="$marker_path"
+  else
+    echo "[bridge-upgrade] WARN: could not finalize the upgrade-complete marker at $marker_path (success still real)" >&2
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+  return 0
+}
+# END: Issue #1662 upgrade-complete marker helpers
+
 # #8945 Track D: record the Codex CLI version across upgrades and surface a
 # NON-FATAL operator advisory when the MAJOR or MINOR component changes.
 # Codex CLI capability (hooks, AGENTS.md, slash commands, permission
@@ -1217,9 +1485,10 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --channel)
-      [[ $# -lt 2 ]] && bridge_die "--channel 뒤에 stable|dev|current 중 하나를 지정하세요."
+      [[ $# -lt 2 ]] && bridge_die "--channel 뒤에 stable|dev|current|lts 중 하나를 지정하세요."
       CHANNEL="$2"
       CHANNEL_EXPLICIT=1
+      CHANNEL_FLAG_EXPLICIT=1
       shift 2
       ;;
     --version)
@@ -1227,6 +1496,12 @@ while [[ $# -gt 0 ]]; do
       REQUESTED_VERSION="$2"
       CHANNEL="stable"
       CHANNEL_EXPLICIT=1
+      # --version is a ONE-SHOT target selector: it must never rewrite the
+      # sticky pin, even when a prior --channel on the same command line
+      # latched CHANNEL_FLAG_EXPLICIT. Clearing it here keeps the write gate
+      # honest regardless of flag order (e.g. `--channel lts --version X` must
+      # NOT clobber an lts pin to stable). v0.16.3 Lane F (codex r1 catch).
+      CHANNEL_FLAG_EXPLICIT=0
       shift 2
       ;;
     --ref)
@@ -1234,6 +1509,10 @@ while [[ $# -gt 0 ]]; do
       REQUESTED_REF="$2"
       CHANNEL="ref"
       CHANNEL_EXPLICIT=1
+      # --ref is a ONE-SHOT target selector (same rationale as --version). Also
+      # prevents a `--channel ... --ref <tag>` form from persisting the invalid
+      # sticky value "ref". v0.16.3 Lane F (codex r1 catch).
+      CHANNEL_FLAG_EXPLICIT=0
       shift 2
       ;;
     --restart-daemon)
@@ -1427,11 +1706,47 @@ if [[ "$SUBCOMMAND" != "apply" && $CHANNEL_EXPLICIT -eq 0 ]]; then
   CHANNEL="current"
 fi
 
+# v0.16.3 Lane F: sticky-channel precedence. Resolution order (highest first):
+#   1. Explicit CLI target/channel (--channel / --version / --ref → CHANNEL_EXPLICIT=1).
+#   2. Special cases above (explicit --source → current; non-apply subcommand → current).
+#   3. Recorded sticky channel from state/upgrade/channel — applies ONLY to the
+#      apply path (apply / --check / --dry-run all keep SUBCOMMAND=="apply")
+#      with no explicit source/channel/version/ref.
+#   4. Legacy fallback `stable` (the value already in CHANNEL when no sticky exists).
+#
+# AGENT_BRIDGE_UPGRADE_CHANNEL (env, already folded into CHANNEL at the top of
+# the file) is TRANSIENT and does NOT set CHANNEL_EXPLICIT, so it never
+# rewrites the sticky file. By design a recorded sticky pin OVERRIDES an
+# env-only channel for this invocation too: an automation/cron path that
+# exports AGENT_BRIDGE_UPGRADE_CHANNEL=stable must NOT silently jump an
+# lts-pinned install to the global stable line — only a literal --channel
+# (which sets CHANNEL_EXPLICIT and short-circuits this block) can change the
+# resolved channel of an lts-pinned install. Reaching here with
+# CHANNEL_EXPLICIT=0 and SOURCE_EXPLICIT=0 means no persistent selector was
+# given, so the recorded per-install pin (if any) wins over both the env value
+# and the legacy stable default. This MUST run after TARGET_ROOT is
+# canonicalized and after the source re-exec (both above) so the live install
+# and the re-exec'd source checkout resolve the same target state file (the
+# re-exec preserves ORIGINAL_ARGS, so --channel survives into the child and the
+# sticky read/write both run against the canonical TARGET_ROOT). An invalid
+# sticky file FAILS CLOSED inside bridge_upgrade_read_sticky_channel — the
+# command substitution exits non-zero and `set -euo pipefail` aborts here,
+# never a silent stable fallback (which would jump an LTS-pinned install to the
+# global stable line).
+if [[ "$SUBCOMMAND" == "apply" && $CHANNEL_EXPLICIT -eq 0 && $SOURCE_EXPLICIT -eq 0 ]]; then
+  _sticky_channel="$(bridge_upgrade_read_sticky_channel "$TARGET_ROOT")"
+  if [[ -n "$_sticky_channel" ]]; then
+    CHANNEL="$_sticky_channel"
+  fi
+  unset _sticky_channel
+fi
+# END: v0.16.3 Lane F sticky-channel precedence
+
 case "$CHANNEL" in
-  stable|dev|current|ref)
+  stable|dev|current|ref|lts)
     ;;
   *)
-    bridge_die "--channel 값은 stable|dev|current 중 하나여야 합니다: $CHANNEL"
+    bridge_die "--channel 값은 stable|dev|current|lts 중 하나여야 합니다: $CHANNEL"
     ;;
 esac
 
@@ -1457,6 +1772,17 @@ if [[ "$SUBCOMMAND" == "apply" ]]; then
       fi
       if [[ -n "$TARGET_REF" ]] && ! git -C "$SOURCE_ROOT" rev-parse --verify "${TARGET_REF}^{commit}" >/dev/null 2>&1; then
         bridge_die "요청한 stable 릴리즈 태그를 찾을 수 없습니다: $TARGET_REF"
+      fi
+      ;;
+    lts)
+      # v0.16.3 Lane F: resolve the highest stable tag within the LTS_SERIES
+      # major.minor (e.g. v0.16.x). The resolver FAILS CLOSED (bridge_die) on
+      # a missing/malformed LTS_SERIES or an empty series — never a global
+      # stable fallback. --version is ignored for lts (it would override the
+      # series pin); operators wanting a specific tag use --ref.
+      TARGET_REF="$(bridge_upgrade_latest_lts_tag "$SOURCE_ROOT")"
+      if [[ -n "$TARGET_REF" ]] && ! git -C "$SOURCE_ROOT" rev-parse --verify "${TARGET_REF}^{commit}" >/dev/null 2>&1; then
+        bridge_die "lts 릴리즈 태그를 찾을 수 없습니다: $TARGET_REF"
       fi
       ;;
     dev)
@@ -1604,20 +1930,24 @@ EOF
   # the dry-run preview is honest) but never for --check, which has
   # already exited above.
   #
-  # SCOPE (codex r1): only the `stable` and `ref` channels resolve an
+  # SCOPE (codex r1): only the `stable`, `ref`, and `lts` channels resolve an
   # AUTHORITATIVE TARGET_VERSION at this point — stable reads a fixed tag
-  # (latest stable or --version) via bridge_upgrade_version_at_ref, and ref
-  # reads the pinned --ref tag's VERSION directly; neither is touched by a
-  # later pull. The `dev` and `current` channels instead resolve
-  # TARGET_VERSION from the PRE-pull local main / working tree, and the
-  # actual `git pull --ff-only` that determines the applied version runs
-  # AFTER this guard (see below). Comparing the stale pre-pull value there
-  # would false-block a legitimate forward `dev`/`current --pull` upgrade
-  # (e.g. local main behind origin/main), so the guard skips those moving-
-  # line channels — they are "advance to the tracked line" by design and
-  # are not the silent stable-revert this issue reports.
+  # (latest stable or --version) via bridge_upgrade_version_at_ref, ref reads
+  # the pinned --ref tag's VERSION directly, and lts (v0.16.3 Lane F) reads the
+  # highest stable tag within LTS_SERIES — all three are fixed release tags not
+  # touched by a later pull, so the pre-mutation semver compare is valid. The
+  # `dev` and `current` channels instead resolve TARGET_VERSION from the
+  # PRE-pull local main / working tree, and the actual `git pull --ff-only`
+  # that determines the applied version runs AFTER this guard (see below).
+  # Comparing the stale pre-pull value there would false-block a legitimate
+  # forward `dev`/`current --pull` upgrade (e.g. local main behind
+  # origin/main), so the guard skips those moving-line channels — they are
+  # "advance to the tracked line" by design and are not the silent
+  # stable-revert this issue reports. Including `lts` here means a backward
+  # move to the held LTS tag from a newer line is correctly blocked unless the
+  # operator passes --allow-downgrade.
   if [[ $ALLOW_DOWNGRADE -eq 0 \
-        && ( "$CHANNEL" == "stable" || "$CHANNEL" == "ref" ) \
+        && ( "$CHANNEL" == "stable" || "$CHANNEL" == "ref" || "$CHANNEL" == "lts" ) \
         && -n "${INSTALLED_VERSION:-}" && -n "${TARGET_VERSION:-}" ]]; then
     _downgrade_cmp="$(bridge_upgrade_compare_versions "$SOURCE_ROOT" "$INSTALLED_VERSION" "$TARGET_VERSION")"
     if [[ "$_downgrade_cmp" == "1" ]]; then
@@ -2115,6 +2445,10 @@ unset _helper_dir
 if [[ $DRY_RUN -eq 0 ]]; then
   _write_state_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-state-json.XXXXXX")"
   printf '%s' "$ANALYSIS_JSON" >"$_write_state_payload_dir/analysis.json"
+  # NOTE: `--channel "$CHANNEL"` here records the channel into
+  # last-upgrade.json for OBSERVABILITY only (v0.16.3 Lane F). It is NOT the
+  # sticky-policy source — that is state/upgrade/channel, written separately
+  # below and only on an explicit `--channel` flag.
   python3 "$SOURCE_ROOT/bridge-upgrade.py" write-state \
     --source-root "$SOURCE_ROOT" \
     --target-root "$TARGET_ROOT" \
@@ -2124,6 +2458,17 @@ if [[ $DRY_RUN -eq 0 ]]; then
     --source-ref "$SOURCE_REF" \
     --channel "$CHANNEL" >/dev/null
   rm -rf "$_write_state_payload_dir"
+
+  # v0.16.3 Lane F: persist the sticky per-install channel ONLY when the
+  # operator passed a literal `--channel` (CHANNEL_FLAG_EXPLICIT). --version /
+  # --ref are one-shot target selectors and must NOT rewrite the sticky pin;
+  # a bare run and env-only AGENT_BRIDGE_UPGRADE_CHANNEL are likewise
+  # transient. This makes `--channel lts --apply` pin the install and a later
+  # bare `--apply`/`--check`/`--dry-run` stay on lts, while `--ref <tag>` on an
+  # lts-pinned install applies that tag once and leaves the pin intact.
+  if [[ $CHANNEL_FLAG_EXPLICIT -eq 1 ]]; then
+    bridge_upgrade_write_sticky_channel "$TARGET_ROOT" "$CHANNEL"
+  fi
 fi
 
 # Phase 2 (post-v0.14.5-beta16): re-apply the declarative install-tree
@@ -2597,6 +2942,36 @@ PY
   rm -rf "$_relink_profile_dir"
 fi
 
+# Issue #1662 — DURABLE SUCCESS MARKER + NOTICE, written BEFORE the restart
+# phase begins. On a sudo-self systemd install the upcoming daemon/systemd-unit
+# restart can cycle the INVOKING tmux session (it lives under the unit being
+# restarted) → SIGKILL → exit 137, even though every apply/migrate/reclassify
+# step already SUCCEEDED. So at THIS point — all mutating work done, restart not
+# yet started — we flush a durable marker (state/upgrade/upgrade-complete.json,
+# phase=work-complete) and emit a clear operator/automation notice. The marker
+# is the source of truth for success when the exit code is unreliable; flushing
+# it here makes success observable INDEPENDENT of the session SIGKILL.
+#
+# Skip on dry-run (no work was actually applied) and on analyze/check paths
+# (they exit earlier and never reach here).
+# BEGIN: Issue #1662 upgrade-complete marker + restart notice
+if [[ $DRY_RUN -eq 0 ]]; then
+  _bridge_upgrade_write_complete_marker \
+    "$TARGET_ROOT" "work-complete" "$SOURCE_VERSION" "$RESTART_DAEMON" "$RESTART_AGENTS"
+  # Notice only when a restart that COULD cycle the invoking session is about to
+  # run. With --no-restart-daemon AND --no-restart-agents nothing cycles the
+  # session, so the exit-137 caveat does not apply and we stay quiet (the
+  # restart-complete marker below still records the happy path).
+  if [[ $RESTART_DAEMON -eq 1 || $RESTART_AGENTS -eq 1 ]]; then
+    {
+      echo "[bridge-upgrade] upgrade COMPLETE (version ${SOURCE_VERSION:-unknown}) — entering the daemon/agent restart phase now."
+      echo "[bridge-upgrade] On a sudo-self systemd install this restart may TERMINATE the invoking session (exit 137 / SIGKILL). That is EXPECTED, not a failure."
+      echo "[bridge-upgrade] Success is recorded at ${_BRIDGE_UPGRADE_COMPLETE_MARKER_PATH:-$TARGET_ROOT/state/upgrade/upgrade-complete.json} — read it (phase + status) instead of gating on the exit code."
+    } >&2
+  fi
+fi
+# END: Issue #1662 upgrade-complete marker + restart notice
+
 if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   # --force: the upgrader is the sanctioned daemon stop+restart path
   # (issue #314 Layer 3 / #315 Track 3). Bypass the active-agent guard.
@@ -2937,6 +3312,23 @@ this task only after each applicable section is either executed or noted as
 "not applicable here because <reason>" in the done note. Sections that ship
 with no operator action (most release bumps) need no follow-up.
 
+## A2A receiver (cross-bridge handoff hosts only) — #1685
+
+If this host runs the A2A receiver (\`handoff.local.json\` present) AND you
+upgraded from a **pre-v0.16.1** source, the *first* upgrade is run by the old
+upgrader, which does not restart \`bridge-handoffd.py\`. It would otherwise keep
+running stale receiver code (e.g. the pre-#1623 backpressure that silently
+returns HTTP 429 to inbound peers). The destination daemon now self-heals this
+on its next tick (one guarded, preflight-gated restart). If the always-on daemon
+is **not** running on this host, restart the receiver once by hand:
+
+\`\`\`
+bash $TARGET_ROOT/bridge-handoff-daemon.sh restart
+$TARGET_ROOT/agent-bridge a2a daemon healthz   # expect: healthy
+\`\`\`
+
+Automatic from **v0.16.1+ → v0.16.x** onward. Non-A2A hosts can ignore this.
+
 ## Done note format
 
 When you finish the three steps above and processed every applicable section
@@ -3179,6 +3571,19 @@ if [[ $RESTART_AGENTS -eq 1 ]]; then
   fi
 fi
 
+# Issue #1662 — promote the success marker to phase=restart-complete. Reaching
+# this line means every restart step ran to completion WITHOUT the invoking
+# session being SIGKILLed (e.g. --no-restart-agents, a non-self install, or a
+# self-restart that did not cycle this process). On a sudo-self systemd install
+# that DID cycle the invoking session, execution was already terminated during
+# the systemctl restart above and never reached here — in that case the durable
+# phase=work-complete marker written before the restart phase is the source of
+# truth. Skip on dry-run (no marker was written; nothing to promote).
+if [[ $DRY_RUN -eq 0 ]]; then
+  _bridge_upgrade_write_complete_marker \
+    "$TARGET_ROOT" "restart-complete" "$SOURCE_VERSION" "$RESTART_DAEMON" "$RESTART_AGENTS"
+fi
+
 if [[ $JSON -eq 1 ]]; then
   _json_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-json.XXXXXX")"
   printf '%s' "$BACKUP_JSON" >"$_json_payload_dir/backup.json"
@@ -3208,6 +3613,17 @@ if [[ $JSON -eq 1 ]]; then
   # never ran (dry-run paths) — load_optional_json then yields null and
   # the consumer branches accordingly.
   printf '%s' "${WORKDIR_BACKFILL_JSON:-}" >"$_json_payload_dir/workdir-backfill.json"
+  # Issue #1662: surface the durable upgrade-complete marker in --json output so
+  # callers/monitoring can read `phase` (work-complete / restart-complete) +
+  # `status` independent of the process exit code (137 on a self-restart
+  # SIGKILL is EXPECTED success, not failure). Copy the on-disk marker into the
+  # payload dir when present (it was written before the restart phase); empty
+  # file → load_optional_json yields null on dry-run / pre-marker paths.
+  if [[ -f "$TARGET_ROOT/state/upgrade/upgrade-complete.json" ]]; then
+    cat "$TARGET_ROOT/state/upgrade/upgrade-complete.json" >"$_json_payload_dir/upgrade-complete.json" 2>/dev/null || true
+  else
+    : >"$_json_payload_dir/upgrade-complete.json"
+  fi
   # Issue #752 W3d: emit dedup'd partial-failure subsystem names as a
   # JSON array file so the python envelope below can branch
   # `status:"partial"` + `partial_failures:[...]`. Empty array on the
@@ -3220,9 +3636,9 @@ if [[ $JSON -eq 1 ]]; then
     printf '[]' >"$_json_payload_dir/partial-failures.json"
   fi
   set +e
-  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" "$_json_payload_dir/isolation-v2-migration.json" "$_json_payload_dir/workdir-backfill.json" "$_json_payload_dir/partial-failures.json" <<'PY'
+  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" "$_json_payload_dir/isolation-v2-migration.json" "$_json_payload_dir/workdir-backfill.json" "$_json_payload_dir/upgrade-complete.json" "$_json_payload_dir/partial-failures.json" <<'PY'
 import json, sys
-source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file, isolation_v2_migration_json_file, workdir_backfill_json_file, partial_failures_json_file = sys.argv[1:]
+source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file, isolation_v2_migration_json_file, workdir_backfill_json_file, upgrade_complete_json_file, partial_failures_json_file = sys.argv[1:]
 
 def load_json(path):
     with open(path, encoding="utf-8") as fh:
@@ -3262,6 +3678,13 @@ isolation_v2_migration_payload = load_optional_json(isolation_v2_migration_json_
 # (dry-run, helper not invoked). Populated as `agents_with_writes`,
 # `markers_copied` so JSON consumers can audit the post-upgrade state.
 workdir_backfill_payload = load_optional_json(workdir_backfill_json_file)
+# Issue #1662: durable upgrade-complete marker (phase=work-complete written
+# before the restart phase, promoted to restart-complete after every restart
+# step survived). Null on dry-run / pre-marker paths. Lets a caller confirm
+# success independent of the process exit code — 137 (self-restart SIGKILL) and
+# 144 (#1660 BrokenPipe) are both EXPECTED-success exit codes, so gating on the
+# marker's `phase`/`status` is the reliable contract.
+upgrade_complete_payload = load_optional_json(upgrade_complete_json_file)
 # Issue #752 W3d: late-stage subsystems (shared rerender / channel-policy
 # refresh / profile relink) append their stable name to this list when
 # their post-step probe reports failures. `status:"partial"` surfaces the
@@ -3311,6 +3734,7 @@ payload = {
     "agent_migration": migration_payload,
     "isolation_v2_migration": isolation_v2_migration_payload,
     "workdir_backfill": workdir_backfill_payload,
+    "upgrade_complete_marker": upgrade_complete_payload,
     "source_reclassify": source_reclassify_payload,
     "shared_settings_rerender": shared_settings_rerender_payload,
     "cleanup": cleanup_payload,

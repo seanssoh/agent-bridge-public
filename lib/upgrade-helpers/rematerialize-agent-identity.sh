@@ -14,7 +14,19 @@ target_root="${2:-}"
 agent="${3:-}"
 engine="${4:-}"
 dry_run="${5:-0}"
-shift 5 || true
+# Issue #1670: capture the changed-file argv as a 6+ POSITIONAL SLICE rather
+# than `shift 5`. bridge-lib.sh (sourced below) performs a Bash 3.2 -> 4+
+# re-exec via `exec "$cand" -p "$target_script" "$@"` (#1454). The macOS stock
+# shebang `#!/usr/bin/env bash` resolves to /bin/bash 3.2 when Homebrew bash is
+# not first on PATH, so when bridge-upgrade.py invokes this helper by argv that
+# re-exec fires. A `shift 5` BEFORE the source would leave `$@` holding only the
+# changed-file tail at re-exec time, so the re-run would land the changed files
+# in the <source_root>/<target_root>/<agent>/<engine> slots and blank the
+# mandatory args -> `agent=""` + the usage error for every agent in the dry-run
+# preview. Slicing leaves `$@` fully intact, so the re-exec carries the original
+# argv and the re-run parses identically. `"${@:6}"` is empty-safe under
+# `set -u` in both Bash 3.2 and 5.x (verified) when there are zero changed files.
+declare -a REMAT_CHANGED_FILE_ARGS=("${@:6}")
 
 declare -a REMAT_UPDATED_PATHS=()
 declare -a REMAT_SCAFFOLD_PATHS=()
@@ -152,7 +164,7 @@ if [[ -z "$source_root" || -z "$target_root" || -z "$agent" || -z "$engine" ]]; 
   _remat_finish
   exit 0
 fi
-_remat_load_changed_files "$@"
+_remat_load_changed_files ${REMAT_CHANGED_FILE_ARGS[@]+"${REMAT_CHANGED_FILE_ARGS[@]}"}
 
 export HOME="${HOME:-}"
 export PATH="${PATH:-/usr/bin:/bin}"

@@ -199,24 +199,30 @@ def mode_scale(bs) -> None:
 
 
 def mode_multijob(bs) -> None:
-    """One agent, two jobs: healthy weekly + overdue hourly. Aggregation intact."""
+    """One agent, two jobs: healthy weekly + overdue hourly. Aggregation intact.
+
+    DETERMINISTIC + WEEKDAY-INDEPENDENT (issue #1683). The fixture run
+    timestamps are derived at FIXED offsets from ``now`` — NOT anchored to the
+    real most-recent Sunday-22:00 occurrence — so the ``hourly_run > weekly_run``
+    relationship holds no matter what weekday ``now`` falls on. The earlier
+    version anchored ``weekly_run`` to the actual last Sunday 22:00, which drifts
+    0-7 days with the weekday of ``now``; in the ~35h after every Sunday 22:00
+    UTC that real occurrence was NEWER than the fixed-offset 35h-old hourly run,
+    inverting the precondition and red-failing the required-static smoke job ~35h
+    every week. Note ``cron_run_in_cadence`` derives the next-due from the cron
+    EXPR (not from the stored run row), so a run timestamp need not land exactly
+    on a schedule occurrence for the cadence verdict to be correct — only the
+    intended healthy/overdue verdict matters, which the offsets below guarantee.
+    """
     now_ts = int(datetime.now(timezone.utc).timestamp())
     agent = "multimon"
 
-    # Healthy low-frequency job: weekly, last run on its most recent Sunday 22:00
-    # (in cadence). OLDER timestamp than the overdue hourly run below.
-    weekly = {
-        "id": "weekly-summary",
-        "name": "weekly-summary",
-        "agent": agent,
-        "enabled": True,
-        "schedule": {"kind": "cron", "expr": "0 22 * * 0", "tz": "UTC"},
-    }
-    weekly_run = _recent_occurrence_at_or_before(bs, "0 22 * * 0", now_ts)
-
-    # Overdue high-frequency job: hourly, last run 35h ago (badly overdue). This
-    # run is NEWER than the weekly run, so it must surface as last_cron_run_ts
-    # while the weekly job keeps the agent cron_in_cadence=True.
+    # Overdue high-frequency job: hourly, last run ~35h ago (badly overdue).
+    # Anchored on a real top-of-hour occurrence (a fixed offset from now, so
+    # weekday-independent). 35h > the hourly cadence's grace window (interval 1h,
+    # slack max(1h, CRON_CADENCE_MIN_WINDOW_SECONDS=2h) -> overdue past run+3h),
+    # so this job is always overdue. It is the NEWEST run, so it must surface as
+    # last_cron_run_ts while the weekly job keeps the agent cron_in_cadence=True.
     hourly = {
         "id": "hourly-monitor",
         "name": "hourly-monitor",
@@ -225,9 +231,26 @@ def mode_multijob(bs) -> None:
         "schedule": {"kind": "cron", "expr": "0 * * * *", "tz": "UTC"},
     }
     hourly_run = _recent_occurrence_at_or_before(bs, "0 * * * *", now_ts - 35 * 3600)
-
-    if weekly_run is None or hourly_run is None:
+    if hourly_run is None:
         _fail("could not derive fixture occurrence timestamps")
+
+    # Healthy low-frequency job: weekly. Its last run is pinned a FIXED 4 days
+    # BEFORE the hourly run (so OLDER than it by construction, regardless of the
+    # weekday of now). At ~5-6 days old it is well inside the weekly cadence's
+    # grace (interval 7d, slack 7d -> healthy until run+14d), so it always stays
+    # cron_in_cadence=True. The 4-day gap (>> the 35h hourly offset) guarantees
+    # hourly_run > weekly_run on every weekday, killing the Sunday-night flake.
+    weekly = {
+        "id": "weekly-summary",
+        "name": "weekly-summary",
+        "agent": agent,
+        "enabled": True,
+        "schedule": {"kind": "cron", "expr": "0 22 * * 0", "tz": "UTC"},
+    }
+    weekly_run = hourly_run - 4 * 86400
+
+    # Precondition is now structural (4-day fixed gap) — assert it anyway so any
+    # future offset edit that breaks the ordering fails loudly here.
     if not hourly_run > weekly_run:
         _fail(
             "fixture precondition: the overdue hourly run must be NEWER than the "
@@ -244,11 +267,20 @@ def mode_multijob(bs) -> None:
         state = home / "state"
         runs = state / "cron" / "runs"
         runs.mkdir(parents=True, exist_ok=True)
-        # Several historical rows for EACH job so the reduction has to collapse
-        # them to one candidate per schedule (not per agent).
-        for _ in range(5):
-            (runs / _run_id(weekly["id"], weekly_run)).mkdir(parents=True, exist_ok=True)
-        # Distinct older hourly rows + the latest overdue one.
+        # Several DISTINCT historical rows for EACH job so the per-schedule
+        # reduction has to collapse them to one candidate per schedule (not per
+        # agent). Both rows of each job stay inside the run-dir scan window: the
+        # multijob call's 86400 arg is dominated by the weekly job's field-based
+        # lookback hint (7d * CRON_CADENCE_GRACE_MULTIPLE=2 -> a 14-day window),
+        # so a ~5.6-day-old latest weekly + a 7-day-older second weekly (~12.6d,
+        # < 14d) are both counted; the reduction must keep only the newest
+        # (weekly_run) as the weekly job's candidate.
+        for back_weeks in range(2):
+            (runs / _run_id(weekly["id"], weekly_run - back_weeks * 7 * 86400)).mkdir(
+                parents=True, exist_ok=True
+            )
+        # Distinct older hourly rows + the latest overdue one; the reduction must
+        # keep only the newest (hourly_run) as the hourly job's candidate.
         for back in range(5):
             older = _recent_occurrence_at_or_before(
                 bs, "0 * * * *", hourly_run - back * 3600

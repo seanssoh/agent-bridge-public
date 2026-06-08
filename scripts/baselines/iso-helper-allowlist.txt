@@ -43,3 +43,10 @@ scripts/smoke/1563-pr5-fp-control-matrix.sh
 # matches are the `environ` substring, never a controller->iso boundary RW (same shape
 # as the #1520c / #1533 / PR-5 test-fixture allowlist entries).
 scripts/smoke/1563-pr8-a2a-diag-recovery-helper.py
+
+# #1685 receiver-staleness fixture — the only `.env` match is the daemon-owned
+# cadence file `state/handoff/receiver-staleness-tick.env` (mirrors
+# receiver-supervise-tick.env), cleared inside a literal-heredoc runner under a
+# mktemp WORK dir; it is controller-side daemon state, never a controller->iso
+# boundary RW (same shape as the #1520c / #1533 / PR-5 / PR-8 fixture entries).
+scripts/smoke/1685-receiver-staleness-selfheal.sh

@@ -133,7 +133,7 @@ bridge-upgrade.sh	1513	C3	674269ba5d1496f502b9f41abdf80da2864580442023f5b7c44d69
 bridge-upgrade.sh	1933	C3	ee2531cb84d04ac3f1033740f7befe85df1e4dd0efe556e0062c98c267ca6c5c	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upgrade.sh	1994	C3	fc4776a956841e63c8d8f102d10565d33762638341c9940f87a2585e8b3e41da	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upgrade.sh	2246	C3	8dd953f98d8205a0a40ad0a0d211508193419f78dc107f0d83d48aedfe711b8e	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2842	C3	7a105d5644aa6d7aac4c5fb50edbc9cce1d8b012e4bfcd24a61cfda00da86fa1	interpreter heredoc, no capture (issue #1113: argv list extended by workdir-backfill.json)	patch	Phase 3 PR C
+bridge-upgrade.sh	3390	C3	27a8de8db5c7678208c8e5a1720a1c24c663a787fd35d4e21b4fc4a0f9f96966	interpreter heredoc, no capture (issue #1662: argv list extended by upgrade-complete.json)	patch	Phase 3 PR C
 bridge-upgrade.sh	2981	C3	3b7b007634879006d9b95ee9e8f13693d64b0fe8244029b5690b38c4cf246344	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upgrade.sh	2988	C3	b919ffe917ff2abbde55677ee2b8c9fa5c91292bc8b9770d8e1a355f2fbc7023	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upgrade.sh	3001	C3	3479551ea337120bba6074762c98d92546f9f020aa56f21a9969bd0e11d93079	interpreter heredoc, no capture	patch	Phase 3 PR C

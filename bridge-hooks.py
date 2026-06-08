@@ -26,6 +26,7 @@ from bridge_iso_paths import (  # noqa: E402
     isolated_workdir_owner as _isolated_workdir_owner,
     resolve_isolated_owner_for_path as _resolve_isolated_owner_for_path,
     sudo_run_as as _sudo_run_as,
+    sudo_run_as_capture as _sudo_run_as_capture,
     safe_path_check as _safe_path_check,
     safe_read_env as _safe_read_env,
     safe_load_json as _safe_load_json,
@@ -1489,11 +1490,21 @@ def next_backup_path(path: Path, os_user: str | None = None) -> Path:
 # survive the `settings.json` → `settings.effective.json` symlink
 # transition. Issue #613 generalized it to the shared renderer after
 # operators hit the same silent-clobber on every `--apply`.)
+#
+# (Issue #1689 added "statusLine": an operator-configured status line —
+# e.g. the claude-hud HUD set up via `/claude-hud:setup` — lives as a
+# top-level `statusLine` object in settings.json. Without preservation it
+# was dropped on every rerender, so the HUD silently vanished on the next
+# `agb upgrade` / restart. The bridge's own `hud_usage_tap` reads and
+# patches `settings["statusLine"]["command"]`, so preserving the key also
+# keeps that tap's patch alive across rerenders rather than having the next
+# render delete what the tap just wrote.)
 PRESERVED_USER_KEYS = (
     "enabledPlugins",
     "extraKnownMarketplaces",
     "apiKeyHelper",
     "skipDangerousModePermissionPrompt",
+    "statusLine",
 )
 
 # Issue #1495: Claude Code skips the ENTIRE settings.json (every key —
@@ -2008,6 +2019,63 @@ def _safe_realpath(path: Path, os_user: str | None) -> str:
     return _safe_realpath_canonical(path, os_user)
 
 
+def _safe_readlink(path: Path, os_user: str | None, fallback: str) -> str:
+    """PermissionError-safe `os.readlink` for the diagnostic symlink_target line.
+
+    #1672: the final payload prints the raw symlink value for diagnostics.
+    On an iso-owned link the controller may lack `+x` on the parent dir and
+    `os.readlink` raises PermissionError — which would trade the (now-fixed)
+    FileExistsError warning for an UNcaught traceback after the try/except
+    OSError block. Mirror the `_safe_realpath` sudo-fallback shape: read the
+    raw link value via `sudo -n -u <owner> readlink` (no `-f`, so the printed
+    value stays the relative target), and fall back to the caller-supplied
+    string (the rel_target we just wrote) when sudo is unavailable. Purely
+    diagnostic — no caller parses this value.
+    """
+    try:
+        return os.readlink(path)  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo readlink fallback below (diagnostic-only, #1672)
+    except PermissionError:
+        if os_user is None:
+            return fallback
+        result = _sudo_run_as_capture(os_user, "readlink", str(path))
+        if result.returncode == 0:
+            return (result.stdout or "").strip() or fallback
+        return fallback
+
+
+def _resolve_iso_link_realpath(path: Path, os_user: str | None) -> str:
+    """Resolve a possibly-iso-owned link's fully-resolved target, iso-FIRST.
+
+    #1672: `_safe_realpath` resolves via `os.path.realpath` and only sudo-
+    falls back when that raises PermissionError. But `os.path.realpath`
+    NEVER raises on a blocked `lstat` — `os.path.islink` internally swallows
+    the OSError and returns False, so `realpath` treats the iso-owned link as
+    a plain non-link and returns the UNresolved input path. On the real iso
+    boundary the controller cannot `lstat` the link, so `_safe_realpath`
+    silently returns the unresolved settings.json path — which never equals
+    the intended target, defeating the idempotency check (codex review of
+    #1672, blocking finding 1).
+
+    So when `os_user` is known (the link is iso-owned and the controller is
+    known to be blind to it), force the `sudo -n -u <owner> readlink -f`
+    resolution FIRST — the same escalation pattern as #1170/#1280 iso-owned
+    reads — and only fall back to `os.path.realpath` when sudo is unavailable
+    (rc 127) or fails, or when there is no iso owner (`os_user is None`, the
+    non-isolated / dev-host path where the controller CAN resolve directly).
+    """
+    if os_user is not None:
+        result = _sudo_run_as_capture(os_user, "readlink", "-f", str(path))
+        if result.returncode == 0:
+            resolved = (result.stdout or "").strip()
+            if resolved:
+                return resolved
+        # sudo unavailable (rc 127) / failed — fall through to the controller-
+        # direct resolve. On a true iso boundary this returns the unresolved
+        # path (forcing the "not equal" → re-raise branch), which is the
+        # fail-closed choice: we never silently swallow a possible conflict.
+    return _safe_realpath(path, os_user)
+
+
 def cmd_link_shared_settings(args: argparse.Namespace) -> int:
     settings_path = Path(args.workdir).expanduser() / ".claude" / "settings.json"
     shared_path = Path(args.shared_settings_file).expanduser()
@@ -2096,6 +2164,29 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
             rel_target = os.path.relpath(shared_path, start=settings_path.parent)
             try:
                 settings_path.symlink_to(rel_target)  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo ln fallback below (mirrors the .unlink() pattern at line 1504, see #1178 r2)
+            except FileExistsError:
+                # #1672: `_safe_path_check("is_symlink", ...)` false-negatives on
+                # an iso-owned existing symlink (the controller's sudo probe
+                # can't stat it across the boundary), so we conclude "no link"
+                # and re-create — but the link is already there, so `symlink_to`
+                # raises FileExistsError on every iso-agent restart. Re-check
+                # idempotently: resolve the EXISTING path's target across the
+                # iso boundary: `_resolve_iso_link_realpath` forces the
+                # `sudo -n -u <owner> readlink -f` resolution when the link is
+                # iso-owned (the controller can't `lstat` it, and bare
+                # `os.path.realpath` would silently return the unresolved path
+                # — see that helper's docstring + codex #1672 finding 1). If it
+                # already points at the intended shared-settings target, this is
+                # a no-op — mark unchanged and suppress the spurious warning. A
+                # wrong-target symlink or a non-symlink collision is a REAL
+                # conflict; re-raise so the structured warning below still fires.
+                current_target = _resolve_iso_link_realpath(settings_path, os_user)
+                # `shared_path` is controller-owned (lives under shared/), so a
+                # straight controller-side realpath is correct — no escalation.
+                desired_target = _safe_realpath(shared_path, None)
+                if current_target != desired_target:
+                    raise
+                status = "unchanged"
             except PermissionError:
                 if os_user is None:
                     raise
@@ -2149,12 +2240,17 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
         "HOOK_ADDITIONAL_CONTEXT": "",
     }
     print_payload(payload, args.format)
+    # #1672: read the diagnostic symlink_target iso-safely — on an iso-owned
+    # link a bare `os.readlink` can raise PermissionError here (after the
+    # try/except OSError above), turning the idempotent-restart path into an
+    # uncaught traceback. Fall back to the canonical relative target string.
+    _symlink_target_fallback = os.path.relpath(shared_path, start=settings_path.parent)
     if backup_path and args.format != "shell":
         print(f"backup_file: {backup_path}")
-        print(f"symlink_target: {os.readlink(settings_path)}")
+        print(f"symlink_target: {_safe_readlink(settings_path, os_user, _symlink_target_fallback)}")
     elif args.format == "shell":
         print(shell_line("HOOK_BACKUP_FILE", backup_path))
-        print(shell_line("HOOK_SYMLINK_TARGET", os.readlink(settings_path)))
+        print(shell_line("HOOK_SYMLINK_TARGET", _safe_readlink(settings_path, os_user, _symlink_target_fallback)))
     return 0
 
 

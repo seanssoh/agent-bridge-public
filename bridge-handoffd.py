@@ -224,6 +224,88 @@ def post_fresh_arrival_marker(task_id: str) -> None:
         return
 
 
+def receiver_boot_marker_path() -> Path:
+    """`$BRIDGE_STATE_DIR/handoff/receiver-boot.json` — the receiver's own boot
+    identity stamp.
+
+    Issue #1685 (bootstrap gap): the destination daemon supervise tick needs a
+    source-version-independent way to tell whether a RUNNING receiver is on
+    pre-upgrade code. The receiver writes this marker AFTER a successful bind +
+    pidfile so the tick can compare the receiver's boot time against the
+    "new code installed" cutoff (state/upgrade/last-upgrade.json `updated_at`).
+    A receiver started by an OLD (pre-v0.16.1) build that predates this marker
+    will NOT have it — that absence is itself the staleness signal the tick
+    keys on.
+    """
+    return a2a.handoff_dir() / "receiver-boot.json"
+
+
+def _installed_identity() -> dict[str, str]:
+    """Best-effort installed (source_head, version) for the boot marker.
+
+    Read from this install's own state/upgrade/last-upgrade.json — the identity
+    of the CODE this receiver is running. Diagnostics ONLY (the tick decides
+    staleness on boot TIME vs the upgrade cutoff, not on these strings), so any
+    failure degrades to empty strings rather than blocking serve.
+    """
+    out = {"source_head": "", "version": ""}
+    try:
+        path = a2a.state_dir() / "upgrade" / "last-upgrade.json"
+        text = path.read_text(encoding="utf-8")  # noqa: raw-pathlib-controller-only — controller-owned $BRIDGE_STATE_DIR upgrade state, never an isolated-agent tree
+        data = json.loads(text)
+        if isinstance(data, dict):
+            out["source_head"] = str(data.get("source_head") or "")
+            out["version"] = str(data.get("version") or "")
+    except (OSError, ValueError, TypeError):
+        pass
+    return out
+
+
+def write_receiver_boot_marker(pidfile: Optional[str]) -> None:
+    """Stamp the receiver-owned boot marker atomically at mode 0600.
+
+    Called from cmd_serve AFTER a successful bind + pidfile ownership, with/
+    before the `listening` audit. Fields:
+      pid, started_at_epoch, started_at_iso, bridge_home, pidfile,
+      source_head, version (the last two diagnostics-only).
+
+    Best-effort by contract (#1685): a marker-write failure MUST NOT prevent
+    serving — we audit/log and continue. The worst case of a missing marker is
+    that the supervise tick classifies the receiver as `stale_unknown_boot_
+    marker` and performs ONE guarded (preflight-gated) restart; never an
+    outage, never a lost handoff.
+    """
+    now = int(time.time())
+    identity = _installed_identity()
+    record = {
+        "pid": os.getpid(),
+        "started_at_epoch": now,
+        "started_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "bridge_home": str(a2a.bridge_home()),
+        "pidfile": str(pidfile) if pidfile else "",
+        "source_head": identity["source_head"],
+        "version": identity["version"],
+    }
+    try:
+        marker_path = receiver_boot_marker_path()
+        marker_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-owned $BRIDGE_STATE_DIR/handoff, never an isolated-agent tree
+        tmp_path = marker_path.with_name(marker_path.name + f".{os.getpid()}.tmp")
+        tmp_path.write_text(json.dumps(record, ensure_ascii=False) + "\n",
+                            encoding="utf-8")
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, marker_path)
+        audit("receiver_boot_marker", pid=record["pid"],
+              started_at_epoch=now)
+    except OSError as exc:
+        # NON-fatal: the receiver must keep serving even if the marker write
+        # fails (read-only fs, perms). The tick falls back to the unknown-marker
+        # path, which is preflight-gated, so this can never cause an outage.
+        audit("receiver_boot_marker_fail", detail=str(exc)[:200])
+
+
 def canonical_path_text(path: Path | str) -> str:
     return str(Path(path).expanduser().resolve(strict=False))
 
@@ -3733,6 +3815,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
             log(f"FATAL: cannot write pidfile {args.pidfile}: {exc}")
             server.server_close()
             return 1
+
+    # #1685: stamp the receiver-owned boot marker AFTER the bind + pidfile so
+    # the destination daemon supervise tick can tell a fresh post-upgrade
+    # receiver from one running stale (pre-upgrade) code. Best-effort: a write
+    # failure is audited and serving continues (the tick degrades to the
+    # preflight-gated unknown-marker path, never an outage).
+    write_receiver_boot_marker(getattr(args, "pidfile", None))
 
     audit("listening", address=bind, port=port,
           peers=len(cfg.get("peers", [])), pid=os.getpid())
