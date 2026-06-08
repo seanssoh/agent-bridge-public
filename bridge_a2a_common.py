@@ -1282,6 +1282,166 @@ def prove_warp_mesh_local_bind(candidate: str) -> None:
     warp_connected_and_enrolled()
 
 
+# --------------------------------------------------------------------------
+# Stable substrate-address detection (#1705 — the reconcile stable-addr seam)
+# --------------------------------------------------------------------------
+#
+# The reconcile control-loop's `stable-addr` step (bridge_reconcile_common.py:
+# stable_local_addr) calls one of these per-transport detectors to discover the
+# node's STABLE listen address — the address that does NOT drift as the host
+# moves networks (the live drift `en0 10.11.10.211 → 172.20.10.3` that #1705
+# automates away). These are DETECTORS only: they NEVER bind. `resolve_bind()`
+# in bridge-handoffd.py stays the single bind oracle; the reconcile step uses
+# the detected address purely to PROPOSE a desired `listen.address`.
+#
+# Both detectors are FAIL-CLOSED and mirror the receiver bind-proof posture:
+# they return ONLY an address that is real for the substrate right now (a
+# Tailscale IP from `tailscale ip`, or a WARP Mesh IP that is BOTH in the
+# Cloudflare CGNAT block AND assigned to a live local interface). There is no
+# CIDR-shape / bare-text guess: the WARP path reuses `local_interface_addresses`
+# (hardened OS inspection) exactly as the bind proof does. On ANY uncertainty
+# they raise (TailscaleUnavailable / A2AError) so the caller fails closed.
+
+# Cloudflare WARP-Mesh assigns each enrolled device a stable IPv4 in the
+# Cloudflare CGNAT block 10.128.0.0/16 (the utun/Mesh address), plus a
+# point-to-point IPv6 in 2606:4700::/32. The IPv4 utun address is the PRIMARY
+# stable locator (it hit all 5 live CRM_DEV nodes); the IPv6 is accepted as a
+# documented secondary. These ranges are used ONLY to FILTER the live
+# interface-address set — membership in the range is necessary but NOT
+# sufficient (the address must also be on a real local interface), exactly
+# mirroring `prove_warp_mesh_local_bind`'s "CIDR shape is not proof" rule.
+WARP_MESH_CGNAT_CIDR_V4 = "10.128.0.0/16"
+WARP_MESH_CLOUDFLARE_CIDR_V6 = "2606:4700::/32"
+
+
+def tailscale_local_addresses() -> list[str]:
+    """Return THIS node's own Tailscale IPs (the stable, identity-keyed set).
+
+    Runs `tailscale ip` via the shared `resolve_tailscale_cli()` discovery so
+    the reconcile stable-addr detector reads the SAME address set the receiver
+    bind proof binds against (bridge-handoffd.py:tailscale_addresses /
+    is_tailnet_address). A Tailscale node is identity-keyed, so this set is
+    stable by construction — the detector just SURFACES it.
+
+    Raises TailscaleUnavailable when the CLI cannot be located or the query
+    fails (the caller fails closed rather than guessing from a CIDR shape). An
+    empty list (CLI ran fine but the node has no Tailscale address yet) is
+    returned as `[]`.
+    """
+    cli = resolve_tailscale_cli()
+    if cli is None:
+        raise TailscaleUnavailable(
+            "the 'tailscale' CLI was not found on PATH or in any standard "
+            "install location — cannot surface the node's stable Tailscale "
+            "address. Install Tailscale or set BRIDGE_A2A_TAILSCALE_CLI."
+        )
+    try:
+        out = subprocess.run(
+            [cli, "ip"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except FileNotFoundError as exc:
+        raise TailscaleUnavailable(
+            f"the 'tailscale' CLI path {cli!r} does not exist or is not "
+            "executable — cannot surface the node's stable Tailscale address."
+        ) from exc
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise TailscaleUnavailable(
+            f"'tailscale ip' failed to run: {exc}"
+        ) from exc
+    if out.returncode != 0:
+        raise TailscaleUnavailable(
+            f"'tailscale ip' exited {out.returncode}: "
+            f"{(out.stderr or '').strip()[:200]}"
+        )
+    addrs: list[str] = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line:
+            addrs.append(line)
+    return addrs
+
+
+def tailscale_stable_addr() -> str:
+    """Surface the node's stable Tailscale IPv4 (fail-closed).
+
+    Returns the first IPv4 in `tailscale_local_addresses()` — the legacy/raw
+    `listen.address` form the receiver binds against. Falls back to the first
+    address of any family only if no IPv4 is present (an IPv6-only tailnet).
+    Raises TailscaleUnavailable when the CLI is unavailable; raises A2AError
+    (`stable_addr_none`) when the CLI ran fine but the node has NO Tailscale
+    address yet (fail-closed — never invent one).
+    """
+    addrs = tailscale_local_addresses()
+    for addr in addrs:
+        try:
+            if isinstance(ipaddress.ip_address(addr), ipaddress.IPv4Address):
+                return addr
+        except ValueError:
+            continue
+    # No IPv4 — accept the first valid address of any family (IPv6-only node).
+    for addr in addrs:
+        try:
+            ipaddress.ip_address(addr)
+            return addr
+        except ValueError:
+            continue
+    raise A2AError(
+        "'tailscale ip' returned no usable address — the node has no stable "
+        "Tailscale address yet (fail-closed; never invent one).",
+        code="stable_addr_none",
+    )
+
+
+def warp_mesh_stable_addr() -> str:
+    """Detect the node's stable WARP-Mesh local address (fail-closed).
+
+    Enumerates the LIVE local interface set via `local_interface_addresses()`
+    (hardened OS inspection — `ip`/`ifconfig`, never a bare awk/text guess) and
+    returns the first address that is BOTH (a) inside the Cloudflare CGNAT
+    block 10.128.0.0/16 (the utun/Mesh IPv4) AND (b) assigned to a real local
+    interface right now. The Cloudflare point-to-point IPv6 (2606:4700::/32) is
+    accepted as a documented secondary only when no IPv4 utun address exists.
+
+    Membership in the CIDR is NECESSARY but NOT SUFFICIENT — the address is
+    only returned because it appears in the live interface set, exactly
+    mirroring `prove_warp_mesh_local_bind`'s "CIDR shape is not proof" rule. So
+    the returned address is ALWAYS one actually present on a local interface.
+
+    Raises A2AError (`iface_enum_failed`) when the interface set cannot be
+    determined at all, or (`stable_addr_none`) when no WARP-Mesh address is
+    present on any local interface (fail-closed — never synthesize one).
+    """
+    local_addrs = local_interface_addresses()
+    v4_net = ipaddress.ip_network(WARP_MESH_CGNAT_CIDR_V4)
+    v6_net = ipaddress.ip_network(WARP_MESH_CLOUDFLARE_CIDR_V6)
+
+    # Primary: a utun/Mesh IPv4 in the Cloudflare CGNAT block that is on a real
+    # local interface. Preserve interface-enumeration order for determinism.
+    for cand in local_addrs:
+        try:
+            ip = ipaddress.ip_address(cand.strip())
+        except ValueError:
+            continue
+        if isinstance(ip, ipaddress.IPv4Address) and ip in v4_net:
+            return str(ip)
+    # Secondary: the Cloudflare point-to-point IPv6, only if no IPv4 utun exists.
+    for cand in local_addrs:
+        try:
+            ip = ipaddress.ip_address(cand.strip())
+        except ValueError:
+            continue
+        if isinstance(ip, ipaddress.IPv6Address) and ip in v6_net:
+            return str(ip)
+    raise A2AError(
+        "no WARP-Mesh stable address is present on any local interface "
+        f"(local set: {local_addrs or 'none'}). A WARP node's stable address "
+        "is its utun/Mesh IP in 10.128.0.0/16 (or the Cloudflare 2606:4700::/32 "
+        "IPv6); refusing to synthesize one from a CIDR shape (fail-closed).",
+        code="stable_addr_none",
+    )
+
+
 def resolve_peer_address_for_transport(
     kind: str, entry: dict[str, Any]) -> str:
     """Transport-aware peer/`listen` address resolution.

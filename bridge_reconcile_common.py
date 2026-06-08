@@ -374,24 +374,118 @@ def all_step_status(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
 
 
 def stable_local_addr(transport: str, cfg: dict[str, Any]) -> ReconcileStepResult:
-    """STUB (#1705 fills) — detect the stable substrate listen address.
+    """Detect the stable substrate listen address and converge desired config (#1705).
 
     Detect the stable address the receiver SHOULD listen on for `transport`
-    (Tailscale: `tailscale ip -4` / existing proof; WARP: a real utun/Mesh
-    address in 10.128.0.0/16 via hardened OS/interface inspection — NEVER a
-    bare text/awk CIDR guess). Compares the OBSERVED stable address against the
-    DESIRED listen address in `cfg`; returns:
-      - step_converged() when they already agree,
-      - step_changed(fields={"observed": <addr>, "desired": <addr>}) when the
-        adapter UPDATED desired config (the actual rebind still goes through
-        resolve_bind() in reconcile_once — this step only proposes config),
-      - step_error() when the stable address could not be proven.
+    (Tailscale: the node's identity-keyed `tailscale ip` address — stable by
+    construction; cloudflare-warp-mesh: a real utun/Mesh address in
+    10.128.0.0/16 via hardened OS/interface inspection — NEVER a bare text/awk
+    CIDR guess). Compares the OBSERVED stable address against the DESIRED
+    `listen.address` in `cfg`, and returns:
+      - step_converged() when they already agree (idempotent no-op),
+      - step_changed(fields={"observed": <addr>, "desired": <addr>}) when this
+        step UPDATED the desired config (the new `listen.address` is written via
+        the atomic config writer; the ACTUAL rebind still goes through
+        resolve_bind() in reconcile_once on the next tick — this step only
+        proposes config),
+      - step_error() when the stable address could not be PROVEN.
 
-    Lane 0 ships a no-op stub: the address detection is not implemented yet, so
-    the bind self-heal continues to run exclusively through the existing
-    resolve_bind() path. `resolve_bind()` stays the only bind oracle.
+    Invariants (design SSOT agenda 5 / §7.1 / 5 self-healing invariants):
+    - `resolve_bind()` stays the ONLY bind oracle. This step NEVER binds a
+      socket; it only detects + writes desired config.
+    - FAIL-CLOSED: the detectors return ONLY an address actually present on a
+      live local interface / in the live `tailscale ip` set. On any uncertainty
+      (CLI unavailable, no stable address yet, enumeration failure) we return
+      step_error() — never a guessed/synthesized/configured-but-absent address.
+    - ACTIVE-TRANSPORT-ONLY: a warp-mesh node never shells `tailscale` and a
+      tailscale node never inspects WARP utun — the branch is on `transport`.
+    - IDEMPOTENT: a no-op (step_converged) when desired already == observed.
     """
-    return step_noop("stable_local_addr adapter not yet implemented (#1705)")
+    # 0. RE-DERIVE + validate the transport from `cfg` itself (defense in depth,
+    #    fail-closed). The orchestrator passes a `transport` arg, but on a
+    #    MALFORMED/unknown `transport.kind` reconcile_once falls back to a GUESSED
+    #    "tailscale" before calling this adapter. Detecting + persisting a stable
+    #    address under a guessed transport would violate fail-closed AND
+    #    active-transport-only, so we never trust the passed arg blindly: we
+    #    re-derive the kind from `cfg` (which HARD-errors on a malformed/unknown
+    #    transport block) and refuse if it raises or disagrees with `transport`.
+    try:
+        cfg_transport = a2a.transport_kind(cfg)
+    except a2a.A2AError as exc:
+        # Malformed/unknown transport.kind → do NOT guess, do NOT detect, do NOT
+        # persist. Fail closed (the bind oracle surfaces the same config error).
+        return step_error(
+            f"stable-addr: refusing to detect under a malformed/unknown "
+            f"transport config ({exc.code}): {exc}"[:200])
+    if cfg_transport != transport:
+        # The caller's arg disagrees with the config (e.g. a guessed fallback).
+        # Trust the config-derived kind is the only safe move — but a mismatch
+        # means the caller computed the wrong transport, so fail closed rather
+        # than detect under either.
+        return step_error(
+            f"stable-addr: transport arg {transport!r} disagrees with config "
+            f"transport {cfg_transport!r}; refusing to guess")
+
+    # 1. Detect the proven stable address for the ACTIVE transport only. Any
+    #    detector failure is an operational failure → step_error (bounded
+    #    backoff), never a raise out of the adapter and never a bad address.
+    try:
+        if transport == a2a.TRANSPORT_TAILSCALE:
+            observed = a2a.tailscale_stable_addr()
+        elif transport == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
+            observed = a2a.warp_mesh_stable_addr()
+        else:
+            # Unknown/unsupported transport: do NOT guess. Fail closed. (Unreachable
+            # after the transport_kind() validation above, which only returns a
+            # SUPPORTED_TRANSPORTS member — kept as a belt-and-suspenders guard.)
+            return step_error(
+                f"stable-addr: unsupported transport {transport!r}")
+    except a2a.A2AError as exc:
+        # TailscaleUnavailable / CloudflareWarpUnavailable / stable_addr_none /
+        # iface_enum_failed all land here — fail closed, pace via backoff.
+        return step_error(f"stable-addr unprovable ({exc.code}): {exc}"[:200])
+
+    observed = (observed or "").strip()
+    if not observed:
+        return step_error("stable-addr: detector returned an empty address")
+
+    # 2. Compare against the DESIRED listen.address. A malformed `listen` block
+    #    is a config error, not an address-drift — fail closed (the bind oracle
+    #    will surface it too).
+    listen = cfg.get("listen")
+    if not isinstance(listen, dict):
+        return step_error("stable-addr: config 'listen' is not an object")
+    desired = listen.get("address")
+    desired = desired.strip() if isinstance(desired, str) else ""
+
+    # 3. Idempotent: already converged → no-op.
+    if desired == observed:
+        return step_converged(
+            f"listen.address already at stable {transport} address",
+            fields={"observed": observed, "desired": desired})
+
+    # 4. Drift: PROPOSE the stable address as the new desired config, persisted
+    #    atomically. The actual rebind still happens through resolve_bind() in
+    #    reconcile_once on a subsequent tick — this step only proposes config.
+    #    A persist failure is an operational failure → step_error (re-attempted
+    #    under the bounded backoff), never a partial/torn write (the writer is
+    #    atomic via os.replace).
+    try:
+        listen["address"] = observed
+        cfg["listen"] = listen
+        a2a.write_config_atomic(a2a.config_path(), cfg)
+    except (OSError, a2a.A2AError) as exc:
+        # Roll the in-memory desired back so a failed persist does not leave the
+        # live cfg dict claiming a converged state it never wrote to disk.
+        listen["address"] = desired
+        cfg["listen"] = listen
+        return step_error(
+            f"stable-addr: failed to persist desired listen.address: {exc}"[:200])
+
+    return step_changed(
+        f"updated desired listen.address {desired or '(unset)'} -> {observed} "
+        f"(stable {transport} address); rebind via resolve_bind() next tick",
+        fields={"observed": observed, "desired": observed})
 
 
 # --------------------------------------------------------------------------
