@@ -113,6 +113,19 @@ Acceptable: prep VERSION + CHANGELOG drafts, run codex-rescue review on a releas
 
 **A release is not done at the tag — sync the docs index in the same session** (operator directive 2026-05-31). After the `vX.Y.Z` tag lands, update `README.md`'s top block to the new version: the `**Current version**` line, the one-line **Headline** (name the release's marquee feature + notable fixes), and the `Recommended upgrade target` + leap-path. Then confirm any new feature's usage docs are current (`OPERATIONS.md`, `docs/developer-handover.md`, `docs/<feature>-design.md`). This is a **separate `docs/vX.Y.Z-...` PR** — the release PR itself stays VERSION + CHANGELOG only (see "Working With Codex Reviewers" point 3). Why it matters: installing agents and patch read the README headline + feature docs — *not* the CHANGELOG — to discover and correctly use new capabilities, so a stale README ships new features invisible (v0.15.1's `agb setup template-sync` had 0 README refs right after the cut until PR #1435).
 
+## Release Lines & LTS Policy
+
+Agent Bridge runs an **LTS line + mainline**, not a single moving tag. Full policy: [`docs/release-lines.md`](./docs/release-lines.md). Headlines (operator-decided 2026-06-08 with the v0.16.2 LTS cut):
+
+- **Current LTS: v0.16.2** (declared 2026-06-08). An LTS is a blessed stable tag (release title `(LTS)` + README marker) that conservative/production installs pin to.
+- **One line until features diverge.** Until the first new *feature* lands there is a single line (`main`); the v0.16.x **hardening** sequence (v0.16.3, …) rides `main` and *is* the LTS line. Do **not** fork a maintenance branch prematurely.
+- **Fork trigger** = the first real new feature: branch `release/0.16-lts` from the latest `v0.16.x` tag, bump `main` to `v0.17.0-beta`. New features → **beta first** (existing rule), never onto the LTS line.
+- **Support window**: an LTS gets fixes **until the next LTS is declared**.
+- **Backport criteria** (LTS branch only): security · data loss · upgrade/rollback breakage · fleet-host-down regression. **Not** features/cosmetic/perf-only/refactors. Fix on `main` first, cherry-pick back only if it qualifies.
+- **Versioning**: LTS = patch bumps (v0.16.3 …); mainline features = minor (v0.17.0 …). Bump size is the operator's call (small-bumps preference); a capability-add in a patch is allowed when operator-directed.
+- **Channel enforcement (gap being closed in v0.16.3)**: `--channel stable` (default) resolves to the *highest global* tag today, so shipping v0.17.0 would auto-pull every default install off the LTS. v0.16.3 adds an **`lts` channel** (version-line pin → latest `v0.16.x`); it must ship on the v0.16.x line so LTS installs can pin. Prod installs track `lts`.
+- **Ownership**: one dev orchestrator + the codex pair own *both* lines; the fleet are consumers. A dedicated LTS agent is only warranted post-fork when feature + backport work compete — and then via a **worktree**, not a separate clone/folder.
+
 ## Environment Variables Worth Knowing
 
 - `BRIDGE_HOME` — override live runtime root; essential for isolated tests.
