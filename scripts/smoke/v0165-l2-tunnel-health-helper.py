@@ -78,11 +78,11 @@ def cmd_healthy(repo_root: str) -> int:
     reconcile._WARP_TUNNEL_BOUNCE = spy
     try:
         # Mock warp-cli reports a FRESH handshake (well under the 120s default).
-        os.environ["WARP_HANDSHAKE_AGE"] = "12"
+        os.environ["WARP_HANDSHAKE_AGE"] = "12"  # noqa: iso-helper-boundary
         res = reconcile.tunnel_health(transport, _warp_cfg())
     finally:
         reconcile._WARP_TUNNEL_BOUNCE = original
-        os.environ.pop("WARP_HANDSHAKE_AGE", None)
+        os.environ.pop("WARP_HANDSHAKE_AGE", None)  # noqa: iso-helper-boundary
 
     if res.status != reconcile.RESULT_CONVERGED:
         sys.stderr.write(f"FAIL healthy: status {res.status} (want converged)\n")
@@ -107,11 +107,11 @@ def cmd_stale(repo_root: str) -> int:
     reconcile._WARP_TUNNEL_BOUNCE = spy
     try:
         # Mock warp-cli reports a STALE handshake (the live 3153s failure mode).
-        os.environ["WARP_HANDSHAKE_AGE"] = "3153"
+        os.environ["WARP_HANDSHAKE_AGE"] = "3153"  # noqa: iso-helper-boundary
         res = reconcile.tunnel_health(transport, _warp_cfg())
     finally:
         reconcile._WARP_TUNNEL_BOUNCE = original
-        os.environ.pop("WARP_HANDSHAKE_AGE", None)
+        os.environ.pop("WARP_HANDSHAKE_AGE", None)  # noqa: iso-helper-boundary
 
     if res.status != reconcile.RESULT_ERROR:
         sys.stderr.write(f"FAIL stale: status {res.status} (want error)\n")
@@ -142,7 +142,7 @@ def cmd_bounded(repo_root: str) -> int:
     conn = reconcile.open_reconcile_db()
     step = reconcile.STEP_TUNNEL_HEALTH
     try:
-        os.environ["WARP_HANDSHAKE_AGE"] = "3153"
+        os.environ["WARP_HANDSHAKE_AGE"] = "3153"  # noqa: iso-helper-boundary
         adapter = lambda: reconcile.tunnel_health(transport, _warp_cfg())
 
         # Tick 1 at t=1000: eligible (never attempted) -> adapter runs -> stale
@@ -183,7 +183,7 @@ def cmd_bounded(repo_root: str) -> int:
     finally:
         reconcile._WARP_TUNNEL_BOUNCE = original
         conn.close()
-        os.environ.pop("WARP_HANDSHAKE_AGE", None)
+        os.environ.pop("WARP_HANDSHAKE_AGE", None)  # noqa: iso-helper-boundary
 
     print(f"OK bounded bounces={spy.calls} (paced by backoff: tick1+tick3, tick2 skipped)")
     return 0
@@ -203,13 +203,13 @@ def cmd_active_only(repo_root: str) -> int:
     try:
         # Tailscale mock reports a healthy tailnet; warp-cli mock is set to a
         # mode that would FAIL the warp probe if (wrongly) invoked.
-        os.environ["TS_MOCK_MODE"] = "up"
-        os.environ["WARP_HANDSHAKE_AGE"] = "3153"  # would bounce IF warp probed
+        os.environ["TS_MOCK_MODE"] = "up"  # noqa: iso-helper-boundary
+        os.environ["WARP_HANDSHAKE_AGE"] = "3153"  # would bounce IF warp probed  # noqa: iso-helper-boundary
         res_ts = reconcile.tunnel_health(a2a.TRANSPORT_TAILSCALE, _tailscale_cfg())
     finally:
         reconcile._WARP_TUNNEL_BOUNCE = original
-        os.environ.pop("TS_MOCK_MODE", None)
-        os.environ.pop("WARP_HANDSHAKE_AGE", None)
+        os.environ.pop("TS_MOCK_MODE", None)  # noqa: iso-helper-boundary
+        os.environ.pop("WARP_HANDSHAKE_AGE", None)  # noqa: iso-helper-boundary
 
     if res_ts.status != reconcile.RESULT_CONVERGED:
         sys.stderr.write(f"FAIL active-only: tailscale status {res_ts.status}\n")
@@ -230,14 +230,14 @@ def cmd_active_only(repo_root: str) -> int:
     spy2 = _BounceSpy()
     reconcile._WARP_TUNNEL_BOUNCE = spy2
     try:
-        os.environ["WARP_HANDSHAKE_AGE"] = "10"   # fresh
-        os.environ["TS_MOCK_MODE"] = "boom"        # tailscale mock would fail
+        os.environ["WARP_HANDSHAKE_AGE"] = "10"   # fresh  # noqa: iso-helper-boundary
+        os.environ["TS_MOCK_MODE"] = "boom"        # tailscale mock would fail  # noqa: iso-helper-boundary
         res_warp = reconcile.tunnel_health(
             a2a.TRANSPORT_CLOUDFLARE_WARP_MESH, _warp_cfg())
     finally:
         reconcile._WARP_TUNNEL_BOUNCE = original
-        os.environ.pop("WARP_HANDSHAKE_AGE", None)
-        os.environ.pop("TS_MOCK_MODE", None)
+        os.environ.pop("WARP_HANDSHAKE_AGE", None)  # noqa: iso-helper-boundary
+        os.environ.pop("TS_MOCK_MODE", None)  # noqa: iso-helper-boundary
 
     if res_warp.status != reconcile.RESULT_CONVERGED:
         sys.stderr.write(f"FAIL active-only: warp status {res_warp.status}\n")
@@ -263,11 +263,11 @@ def cmd_parse_fail(repo_root: str) -> int:
     original = reconcile._WARP_TUNNEL_BOUNCE
     reconcile._WARP_TUNNEL_BOUNCE = spy
     try:
-        os.environ["WARP_HANDSHAKE_AGE"] = "garbage"  # mock prints no age line
+        os.environ["WARP_HANDSHAKE_AGE"] = "garbage"  # mock prints no age line  # noqa: iso-helper-boundary
         res = reconcile.tunnel_health(transport, _warp_cfg())
     finally:
         reconcile._WARP_TUNNEL_BOUNCE = original
-        os.environ.pop("WARP_HANDSHAKE_AGE", None)
+        os.environ.pop("WARP_HANDSHAKE_AGE", None)  # noqa: iso-helper-boundary
 
     if res.status != reconcile.RESULT_ERROR:
         sys.stderr.write(f"FAIL parse-fail: status {res.status} (want error)\n")
@@ -302,13 +302,13 @@ def cmd_nonzero_stale(repo_root: str) -> int:
     reconcile._WARP_TUNNEL_BOUNCE = spy
     try:
         # Stale-looking line but the mock exits NON-ZERO (failed query).
-        os.environ["WARP_HANDSHAKE_AGE"] = "3153"
-        os.environ["WARP_TUNNEL_RC"] = "7"
+        os.environ["WARP_HANDSHAKE_AGE"] = "3153"  # noqa: iso-helper-boundary
+        os.environ["WARP_TUNNEL_RC"] = "7"  # noqa: iso-helper-boundary
         res = reconcile.tunnel_health(transport, _warp_cfg())
     finally:
         reconcile._WARP_TUNNEL_BOUNCE = original
-        os.environ.pop("WARP_HANDSHAKE_AGE", None)
-        os.environ.pop("WARP_TUNNEL_RC", None)
+        os.environ.pop("WARP_HANDSHAKE_AGE", None)  # noqa: iso-helper-boundary
+        os.environ.pop("WARP_TUNNEL_RC", None)  # noqa: iso-helper-boundary
 
     if res.status != reconcile.RESULT_ERROR:
         sys.stderr.write(f"FAIL nonzero-stale: status {res.status} (want error)\n")
@@ -340,11 +340,11 @@ def cmd_no_secret(repo_root: str) -> int:
     original = reconcile._WARP_TUNNEL_BOUNCE
     reconcile._WARP_TUNNEL_BOUNCE = spy
     try:
-        os.environ["WARP_HANDSHAKE_AGE"] = "3153"
+        os.environ["WARP_HANDSHAKE_AGE"] = "3153"  # noqa: iso-helper-boundary
         res = reconcile.tunnel_health(transport, _warp_cfg())
     finally:
         reconcile._WARP_TUNNEL_BOUNCE = original
-        os.environ.pop("WARP_HANDSHAKE_AGE", None)
+        os.environ.pop("WARP_HANDSHAKE_AGE", None)  # noqa: iso-helper-boundary
 
     blob = json.dumps({"detail": res.detail, "fields": res.fields}, default=str).lower()
     for bad in ("secret", "hmac", "token", "passwd", "password", "private_key",
