@@ -736,9 +736,15 @@ def _find_is_read_only(stage_tokens: list[str]) -> bool:
     take an inline value glued to the flag (find takes them as separate
     argv elements). See codex PR #1294 r2 for the BLOCKING-class repro
     that motivated the filter.
+
+    Issue #1690 r2 (codex sweep): quote-strip each token before the
+    match — a shell-quoted `"-exec"` / `'-delete'` arrives as a raw token
+    with embedded quotes, so a bare equality test would miss it and let
+    `find <db> "-exec" cp <db> sink {} \\;` ride the read carve-out. The
+    shell removes the quotes before `find` sees the flag, so we must too.
     """
-    for token in stage_tokens[1:]:  # skip the leading 'find'
-        if token in _FIND_MUTATION_FLAGS:
+    for raw_token in stage_tokens[1:]:  # skip the leading 'find'
+        if _strip_token_quotes(raw_token) in _FIND_MUTATION_FLAGS:
             return False
     return True
 
@@ -793,19 +799,66 @@ def _awk_is_read_only(stage_tokens: list[str]) -> bool:
     none of these markers and stay read-intent.
     """
     args = stage_tokens[1:]
-    # `awk -f FILE` / `awk --file FILE` / `awk --source ...` load the awk
-    # PROGRAM from an external file (or a second --source) we cannot
-    # inspect for the write/exec primitives below — fail-closed: an awk
-    # whose program is not the inline argv is treated as write-intent
-    # (issue #1690 codex re-review round 4: `awk -f /tmp/evil.awk <db>`).
-    for tok in args:
-        if tok in ("-f", "--file", "--source", "-e"):
-            return False
-        if tok.startswith("--file=") or tok.startswith("--source="):
-            return False
-        # GNU awk glued short form `-f/path`.
-        if tok.startswith("-f") and len(tok) > 2:
-            return False
+    # Issue #1690 r2 — awk option handling is an ALLOWLIST, not a denylist.
+    # gawk has a large, ever-growing set of flags that load an external
+    # PROGRAM/EXTENSION (`-f`/`--file`/`--source`/`-e`/`-E`/`--exec`/
+    # `-i`/`--include`/`@include`/`-l`/`--load`/`@load`), WRITE a named file
+    # (`-o`/`--pretty-print`, `-p`/`--profile`, `-d`/`--dump-variables`,
+    # `--gen-pot`), or expose an exec surface (`-D`/`--debug`, and the
+    # `-W <gawk-option>` meta-flag that aliases all of the above). Codex
+    # re-review found these one-at-a-time across several rounds; a denylist
+    # cannot keep up. Flip to a tiny benign-flag allowlist: only the POSIX/
+    # common awk flags that take NO file and carry NO exec/write surface are
+    # accepted; ANY other flag (or `@`-directive, or `-W` meta-flag) flips
+    # the stage to write-intent (fail-closed). The operator's read need
+    # (`awk '{print $N}' <f>`, `awk -F: …`, `awk -v x=1 …`) is fully
+    # covered. `-F`/`--field-separator` and `-v`/`--assign` take a value
+    # (separate token or glued); everything after them is still scanned.
+    _AWK_BENIGN_NOVALUE = {
+        "-b", "--characters-as-bytes",
+        "-c", "--traditional", "--compat",
+        "-C", "--copyright",
+        "-g", "--gen-po",  # extracts strings to STDOUT (not the file-writing --gen-pot)
+        "-n", "--non-decimal-data",
+        "-O", "--optimize",
+        "-P", "--posix",
+        "-r", "--re-interval",
+        "-S", "--sandbox",  # gawk: disables system()/getline-pipe/file-output
+        "-V", "--version",
+        "--help", "--usage",
+    }
+    _AWK_BENIGN_VALUED = {"-F", "--field-separator", "-v", "--assign"}
+    skip_next = False
+    for raw_tok in args:
+        if skip_next:
+            skip_next = False
+            continue
+        # Quote-strip before flag classification: a shell-quoted flag like
+        # `"-f"` / `'-f'` arrives as a raw token with embedded quotes, so a
+        # naive `startswith("-")` misclassifies it as the program/path and
+        # lets `awk "-f" /tmp/evil.awk <db>` ride the read-intent carve-out
+        # (issue #1690 r2 codex sweep). The shell removes the quotes before
+        # awk sees the flag, so we must too.
+        tok = _strip_token_quotes(raw_tok)
+        if not tok.startswith(("-", "@")) or tok == "-":
+            continue  # the inline program text or the input file path
+        if tok == "--":
+            continue  # end-of-options marker
+        bare = tok.split("=", 1)[0]
+        if tok in _AWK_BENIGN_NOVALUE or bare in _AWK_BENIGN_NOVALUE:
+            continue
+        if tok in _AWK_BENIGN_VALUED:
+            skip_next = True  # the following token is this flag's value
+            continue
+        if bare in _AWK_BENIGN_VALUED:
+            continue  # glued `--field-separator=:` / `-F:` / `-vx=1`
+        # short glued benign-valued: `-F:` / `-vFS=,`.
+        if tok[:2] in ("-F", "-v") and len(tok) > 2:
+            continue
+        # Anything else — program/extension loader, file-write flag, the
+        # `-W` meta-flag, an unknown gawk option, or an `@`-directive — is
+        # NOT a benign read flag. Fail-closed.
+        return False
     program = " ".join(args)  # inline program text only
     # Strip quote characters before the marker scan: bash concatenates
     # adjacent quoted fragments before awk sees the program, so a split
@@ -843,9 +896,33 @@ def _awk_is_read_only(stage_tokens: list[str]) -> bool:
 _SORT_OUTPUT_FLAGS = ("-o", "--output")
 # sort's external-program flag (RCE) — exact match or `--flag=value` glued.
 _SORT_EXEC_FLAGS = ("--compress-program",)
-_LESS_OUTPUT_FLAGS = ("-o", "-O", "--log-file", "--LOG-FILE")
-# vim/view command + write + script flags that can run an ex `:w`/`:!`.
-_VIEW_EXEC_FLAGS = ("-c", "--cmd", "-w", "-W", "-s", "-S")
+# less write/exec flags: `-o`/`-O`/`--log-file` write the session to a
+# named file; `-k`/`--lesskey-file`/`--lesskey-src`/`--lesskey-context`
+# load a lesskey source that can set `#env` directives (e.g. LESSOPEN=|cmd
+# input preprocessor → RCE/exfil), the same exec surface the LESSOPEN env
+# prefix already blocks (issue #1690 r2 codex consolidated sweep).
+_LESS_OUTPUT_FLAGS = (
+    "-o", "-O", "--log-file", "--LOG-FILE",
+    "-k", "--lesskey-file", "--lesskey-src", "--lesskey-context",
+)
+# `view` (read-only vi) benign-flag ALLOWLIST (issue #1690 r2). vim has a
+# huge flag surface — ex-command / script / startup-config / write-file /
+# verbose-to-file flags all turn `view` into an exec/write surface, and a
+# denylist could not keep up (codex sweep found -u, then --startuptime /
+# --log / -V one-at-a-time). Only these no-file, no-exec mode toggles are
+# accepted; every other flag is fail-closed. The operator's read need is
+# just `view <file>`. Bare-letter mode toggles (case-sensitive):
+#   -R readonly · -M/-m modifiability off · -n no-swap · -b binary ·
+#   -l lisp · -C/-N compatible · -Z restricted · -x no-crypt-prompt ·
+#   -A/-H/-F language modes. Ex/silent mode (`-e`/`-es`/…) is deliberately
+#   NOT benign — it reads ex commands from stdin (a write/exec surface).
+_VIEW_BENIGN_FLAGS = frozenset(
+    {
+        "-R", "-M", "-m", "-n", "-b", "-l", "-C", "-N", "-Z", "-x",
+        "-A", "-H", "-F",
+        "--noplugin", "--not-a-term", "--clean",
+    }
+)
 # Pager leaders whose `+cmd` startup argument runs a pager/ex command
 # (search / save-to-file / shell-out / pipe) — never a benign file read.
 _PAGER_PLUS_CMD_LEADERS = frozenset({"less", "more", "view"})
@@ -911,9 +988,34 @@ def _named_read_leader_is_read_only(leaf: str, stage_tokens: list[str]) -> bool:
         # startup handled above; nothing more to constrain.
         return True
     if leaf == "view":
-        # `view` is the read-only vi, but -c/--cmd/-w/-W/-s/-S (and the
-        # +cmd handled above) can run an ex `:w`/`:!`.
-        return not any(_flag_or_valued(t, _VIEW_EXEC_FLAGS) for t in args)
+        # `view` is read-only vi, but vim has a huge flag surface that can
+        # run an ex `:w`/`:!` or WRITE a named file: -c/--cmd/+cmd (ex cmd),
+        # -s/-S (sourced script), -u/-U (arbitrary startup config), -i
+        # (viminfo/shada write), -w/-W (script-out write), --startuptime
+        # FILE / --log FILE / -V[N]FILE (verbose-to-file write), -r FILE
+        # (recovery). A denylist cannot keep up with the vim option set
+        # (issue #1690 r2 codex sweep found -u, then --startuptime/--log/-V
+        # one-at-a-time), so — like awk — use a tiny benign-flag ALLOWLIST:
+        # only the no-file, no-exec mode toggles are accepted; ANY other
+        # flag flips to write-intent (fail-closed). The operator's read need
+        # is just `view <file>`. (+cmd is already rejected above.)
+        # Quote-strip before classification: a shell-quoted flag like
+        # `"-c"` / `'-c'` arrives with embedded quotes, so a naive
+        # `startswith("-")` would misclassify it as the file path and let
+        # `view "-c" "w! sink" <db>` ride the carve-out (issue #1690 r2
+        # codex sweep). The shell removes the quotes before vim sees the
+        # flag, so we must too.
+        for raw_tok in args:
+            tok = _strip_token_quotes(raw_tok)
+            if not tok.startswith("-") or tok == "-":
+                continue  # the file path (or `-` stdin)
+            if tok == "--":
+                continue
+            bare = tok.split("=", 1)[0]
+            if bare in _VIEW_BENIGN_FLAGS:
+                continue
+            return False
+        return True
     if leaf == "rg":
         # `--pre` / `--pre=CMD` runs an arbitrary preprocessor (RCE/exfil).
         return not any(
@@ -933,10 +1035,14 @@ def _named_read_leader_is_read_only(leaf: str, stage_tokens: list[str]) -> bool:
         xxd_valued = {"-s", "-l", "-c", "-g", "-o", "-R"}
         positionals = []
         skip_next = False
-        for tok in args:
+        for raw_tok in args:
             if skip_next:
                 skip_next = False
                 continue
+            # Quote-strip before flag classification so a quoted flag like
+            # `"-s"` is recognised (issue #1690 r2): otherwise its value
+            # would be miscounted as the output positional (an over-block).
+            tok = _strip_token_quotes(raw_tok)
             if tok in ("-r", "-revert"):
                 return False
             if tok in xxd_valued:
@@ -944,6 +1050,36 @@ def _named_read_leader_is_read_only(leaf: str, stage_tokens: list[str]) -> bool:
                 continue
             if tok.startswith("-"):
                 continue  # other (glued or no-value) flag
+            positionals.append(tok)
+        if len(positionals) >= 2:
+            return False
+        return True
+    if leaf == "uniq":
+        # Issue #1690 r2 (patch adversarial review): `uniq [opts] [INPUT
+        # [OUTPUT]]` — the SECOND positional is an OUTPUT file (write/
+        # exfil), e.g. `uniq <db> /tmp/leak` or `uniq -c <db> /tmp/leak`.
+        # Same shape as xxd. Reject 2+ positionals (input + output). Skip
+        # the VALUES of uniq's argument-taking flags (`-f`/--skip-fields,
+        # `-s`/--skip-chars, `-w`/--check-chars; GNU `--all-repeated` /
+        # `--group` take their arg glued via `=`) so a numeric flag value
+        # is not miscounted as the output positional. `-D`/`-d`/`-u`/`-c`/
+        # `-i`/`-z` take no separate value.
+        uniq_valued = {"-f", "-s", "-w"}
+        positionals = []
+        skip_next = False
+        for raw_tok in args:
+            if skip_next:
+                skip_next = False
+                continue
+            # Quote-strip before flag classification (issue #1690 r2) so a
+            # quoted `"-f"` is recognised and its value not miscounted as
+            # the output positional (an over-block).
+            tok = _strip_token_quotes(raw_tok)
+            if tok in uniq_valued:
+                skip_next = True  # the following token is this flag's value
+                continue
+            if tok.startswith("-"):
+                continue  # glued / no-value / long flag (e.g. -f2, --count)
             positionals.append(tok)
         if len(positionals) >= 2:
             return False
@@ -958,7 +1094,9 @@ def _named_read_leader_is_read_only(leaf: str, stage_tokens: list[str]) -> bool:
 # Reject any of those (and their glued forms) so a yq mutation/exfil
 # cannot ride the tasks.db read-intent carve-out. mikefarah-yq and
 # kislyuk-yq differ in spelling; we reject the union, fail-closed.
-_YQ_WRITE_FLAGS = ("-i", "--inplace", "-s", "--split-exp")
+# `--in-place` is the hyphenated spelling some yq builds accept alongside
+# `--inplace` (issue #1690 r2 codex sweep); reject both.
+_YQ_WRITE_FLAGS = ("-i", "--inplace", "--in-place", "-s", "--split-exp")
 
 
 def _yq_is_read_only(stage_tokens: list[str]) -> bool:
@@ -966,10 +1104,10 @@ def _yq_is_read_only(stage_tokens: list[str]) -> bool:
         t = _strip_token_quotes(tok)
         if t in _YQ_WRITE_FLAGS:
             return False
-        # glued short `-i…` and `--split-exp=EXPR`.
+        # glued short `-i…` and `--split-exp=EXPR` / `--in-place=EXPR`.
         if t.startswith("-i") and not t.startswith("--"):
             return False
-        if t.startswith("--split-exp="):
+        if t.startswith("--split-exp=") or t.startswith("--in-place="):
             return False
     return True
 
@@ -3936,18 +4074,26 @@ def protected_alias_reason(
             return ROSTER_LOCAL_DENY_REASON
         return "shared roster secrets are not available inside Claude tool calls"
     if _bash_argv_references_path(text, task_db_path()):
-        # Issue #1690: mirror the roster gate above — a read-only argv
-        # reference to the DB file (`cat`/`ls -l`/`stat`/`file` $db) is a
-        # read, not a queue mutation, so honor the read_intent
-        # classification. `read_intent` is False for any write tool,
-        # output redirection into a file sink (`> $db`, `>> $db`, numeric
-        # fd, `cmd > sink`), an unbalanced/unparseable command, or a
-        # `sqlite3 … 'UPDATE …'` (sqlite3 is deliberately NOT on
-        # `_READ_INTENT_BASH_COMMANDS`), so all of those still hit the
-        # unconditional deny below. Fail-closed on uncertainty.
-        if read_intent:
-            return None
-        return "direct queue DB access is blocked; use `agb` queue commands instead"
+        # Issue #1690: a read-only argv reference to the DB file
+        # (`cat`/`ls -l`/`stat`/`file` $db) is a read, not a queue
+        # mutation, so honor the read_intent classification. `read_intent`
+        # is False for any write tool, output redirection into a file sink
+        # (`> $db`, `>> $db`, numeric fd, `cmd > sink`), an unbalanced/
+        # unparseable command, or a `sqlite3 … 'UPDATE …'` (sqlite3 is
+        # deliberately NOT on `_READ_INTENT_BASH_COMMANDS`), so all of
+        # those still hit the unconditional deny here. Fail-closed.
+        #
+        # Issue #1690 r2 (codex Phase-4): the read-intent case must NOT
+        # `return None` here. Doing so short-circuited the LATER sibling
+        # deny gates (Stage A shared/private+shared/secrets, Stage B peer-
+        # home) for a command that names BOTH tasks.db and a forbidden
+        # path — e.g. `cat $db $BRIDGE_HOME/shared/secrets/token.txt`
+        # would be allowed because the tasks.db allow exited before the
+        # shared/secrets deny could fire. Instead, only the tasks.db-
+        # SPECIFIC deny is lifted: fall through and keep evaluating, so a
+        # forbidden path in the same command is still denied downstream.
+        if not read_intent:
+            return "direct queue DB access is blocked; use `agb` queue commands instead"
     # Issue #341: system-config paths get the same argv-based check; the
     # wrapper command is the only normal mutation surface for writes.
     # Read-intent is allowed for all agents — see #383.

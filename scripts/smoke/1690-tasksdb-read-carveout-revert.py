@@ -9,17 +9,33 @@
 # green). Standalone script (file-as-argv) so no interpreter heredoc-stdin
 # is needed (footgun #11).
 #
-# Surgical revert: for every line that contains the tasks.db deny string,
-# walk back over the two carve-out lines that immediately precede it —
-#   if read_intent:
-#       return None
-# — and drop them. Nothing else in the file is touched. If the expected
-# pair is not found above a deny, the helper exits non-zero so the smoke
-# fails loudly rather than silently producing a no-op revert.
+# The two tasks.db branches have DIFFERENT carve-out shapes:
+#
+#   Non-Bash (protected_path_reason):
+#       if read_intent:
+#           return None
+#       return "direct queue DB access is blocked; …"
+#     Revert = drop the `if read_intent:` + `return None` pair, leaving the
+#     unconditional deny.
+#
+#   Bash (protected_alias_reason) — issue #1690 r2 changed this so the
+#   read-intent case falls through to the later sibling gates instead of
+#   short-circuiting to allow:
+#       if not read_intent:
+#           return "direct queue DB access is blocked; …"
+#     Revert = make the deny UNCONDITIONAL: drop the `if not read_intent:`
+#     guard line and de-indent its `return` body by one level. Under the
+#     reverted policy a read of tasks.db is denied, so the smoke's revert
+#     teeth see DENY (proving the carve-out is load-bearing).
+#
+# Both reverted shapes deny a tasks.db read. If neither expected shape is
+# found above a deny line, the helper exits non-zero so the smoke fails
+# loudly rather than silently producing a no-op revert.
 
 import sys
 
 DENY_MARKER = "direct queue DB access is blocked"
+_INDENT = "    "
 
 
 def main() -> int:
@@ -34,29 +50,39 @@ def main() -> int:
         lines = fh.readlines()
 
     drop: set[int] = set()
+    dedent: dict[int, str] = {}
     reverted = 0
     for idx, line in enumerate(lines):
-        if DENY_MARKER not in line:
+        if DENY_MARKER not in line or "return" not in line:
             continue
-        # The deny line is `return "direct queue DB access is blocked…"`.
-        # Walk back skipping the deny's own `return` line: the two lines
-        # immediately above it (skipping the `return` that holds the
-        # marker) must be the carve-out pair.
-        ret_none = idx - 1
         if_read = idx - 2
+        ret_none = idx - 1
+        guard = idx - 1
         if (
             ret_none >= 0
             and if_read >= 0
             and lines[ret_none].strip() == "return None"
             and lines[if_read].strip() == "if read_intent:"
         ):
+            # Non-Bash shape: drop the read-intent allow pair.
             drop.add(ret_none)
             drop.add(if_read)
             reverted += 1
+        elif guard >= 0 and lines[guard].strip() == "if not read_intent:":
+            # Bash shape: drop the `if not read_intent:` guard and de-indent
+            # the deny `return` one level so the deny is unconditional.
+            drop.add(guard)
+            stripped = lines[idx]
+            if stripped.startswith(_INDENT):
+                dedent[idx] = stripped[len(_INDENT):]
+            else:
+                dedent[idx] = stripped
+            reverted += 1
         else:
             print(
-                f"[revert] expected `if read_intent:` / `return None` carve-out "
-                f"above the tasks.db deny at line {idx + 1}, not found",
+                f"[revert] tasks.db deny at line {idx + 1} does not match "
+                f"either expected carve-out shape (non-Bash `if read_intent:"
+                f"`/`return None` or Bash `if not read_intent:`)",
                 file=sys.stderr,
             )
             return 3
@@ -69,7 +95,11 @@ def main() -> int:
         )
         return 4
 
-    out = [ln for i, ln in enumerate(lines) if i not in drop]
+    out = []
+    for i, ln in enumerate(lines):
+        if i in drop:
+            continue
+        out.append(dedent.get(i, ln))
     with open(dest, "w", encoding="utf-8") as fh:
         fh.writelines(out)
     print(f"[revert] stripped {reverted} tasks.db read-intent carve-out(s)")

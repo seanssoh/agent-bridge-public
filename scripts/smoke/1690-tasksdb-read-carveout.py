@@ -97,6 +97,12 @@ def main() -> int:
         (f"sort -o/tmp/leak {db}", False),          # glued short flag
         (f"less -o /tmp/leak {db}", False),         # less -o log file
         (f"less --log-file=/tmp/leak {db}", False),  # less --log-file=
+        # less lesskey loader can set `#env LESSOPEN=|cmd` preprocessor
+        # (RCE), same surface the LESSOPEN env prefix blocks (#1690 r2).
+        (f"less -k /tmp/evil.lesskey {db}", False),
+        (f"less --lesskey-file=/tmp/x {db}", False),
+        (f"less --lesskey-src=/tmp/x {db}", False),
+        (f"less --lesskey-context=stuff {db}", False),
         (f"xxd {db} /tmp/leak", False),             # xxd 2nd positional = output
         (f"xxd {db} leak", False),                  # bare-name output in CWD
         (f"xxd -r {db}", False),                    # xxd reverse/patch
@@ -121,6 +127,30 @@ def main() -> int:
         # leader check strips (LESSOPEN/PAGER/LD_PRELOAD/BASH_ENV/…).
         (f"awk -f /tmp/evil.awk {db}", False),      # awk program from a file
         (f"awk --file=/tmp/evil.awk {db}", False),  # awk --file= glued
+        # r2 patch/codex sweep: gawk loads EXTERNAL program/extension code
+        # via --include/-i/@include and --load/-l/@load (each can carry a
+        # system()/print>file the inline scan never sees); glued -iinplace
+        # slips the caller's bare `-i` check. All MUST deny.
+        (f"awk --include=/tmp/evil.awk '{{print}}' {db}", False),
+        (f"awk -l /tmp/evil_ext '{{print}}' {db}", False),
+        (f"awk --load=/tmp/evil_ext '{{print}}' {db}", False),
+        (f"awk @include /tmp/evil.awk {db}", False),
+        (f"awk -iinplace '{{print}}' {db}", False),
+        (f"awk -E /tmp/evil.awk {db}", False),       # gawk --exec program file
+        (f"awk --exec=/tmp/evil.awk {db}", False),
+        (f"awk -o /tmp/o.awk '{{print}}' {db}", False),  # --pretty-print write
+        (f"awk -p /tmp/prof '{{print}}' {db}", False),   # --profile write
+        (f"awk -D '{{print}}' {db}", False),         # --debug interactive exec
+        (f"awk --dump-variables=/tmp/o '{{print}}' {db}", False),  # var-dump write
+        (f"awk -W exec=/tmp/x {db}", False),         # -W meta-flag (exec alias)
+        (f"awk --some-future-flag '{{print}}' {db}", False),  # allowlist fail-closed
+        (f"yq --in-place . {db}", False),            # hyphenated in-place write
+        # awk benign read flags stay read-intent (allowlist regression guard)
+        (f"awk --field-separator=: '{{print $1}}' {db}", True),
+        (f"awk --assign x=1 '{{print x}}' {db}", True),
+        (f"awk -b '{{print}}' {db}", True),
+        (f"awk --posix '{{print}}' {db}", True),
+        (f"awk --sandbox '{{print}}' {db}", True),
         (f"yq -s /tmp/leak . {db}", False),         # yq split-exp short
         (f"yq --split-exp /tmp/leak . {db}", False),  # yq split-exp long
         (f"PAGER=sh less {db}", False),             # PAGER env exec prefix
@@ -167,6 +197,46 @@ def main() -> int:
         (f"rg pattern {db}", True),
         (f"view {db}", True),
         (f"yq . {db}", True),
+        # ---- KEEP teeth: r2 patch adversarial review ----
+        # uniq [opts] [INPUT [OUTPUT]] — 2nd positional is an OUTPUT file
+        # (write/exfil), same shape as xxd. MUST deny; 1-positional read OK.
+        (f"uniq {db} /tmp/leak", False),
+        (f"uniq -c {db} /tmp/leak", False),
+        (f"uniq -f 2 {db} /tmp/leak", False),   # skip the -f value, still 2 pos
+        (f"uniq {db}", True),                   # lone input = read
+        (f"uniq -c {db}", True),
+        (f"uniq -f 2 {db}", True),              # flag-value not counted as output
+        # view is a benign-flag ALLOWLIST: vim's exec/write/startup/verbose
+        # flags all deny; only no-file mode toggles + plain `view <f>` read.
+        (f"view -u /tmp/evil.vim {db}", False),       # -u arbitrary vimrc
+        (f"view -U /tmp/g.vim {db}", False),          # -U gvimrc
+        (f"view -i /tmp/x.shada {db}", False),        # -i viminfo/shada write
+        (f"view --startuptime /tmp/out {db}", False),  # verbose-to-file write
+        (f"view --log /tmp/out {db}", False),         # --log file write
+        (f"view -V1/tmp/out {db}", False),            # -V[N]file verbose write
+        (f"view -es {db}", False),                    # ex/silent mode (exec)
+        (f"view -r /tmp/recover {db}", False),        # recovery (write)
+        (f"view --some-future-flag {db}", False),     # allowlist fail-closed
+        (f"view -R {db}", True),                      # readonly toggle (read)
+        (f"view -M {db}", True),                      # modifiability off (read)
+        (f"view -R -n {db}", True),                   # combined mode toggles
+        # quoted-flag bypass: a shell-quoted flag (`"-c"` / `'-f'`) arrives
+        # with embedded quotes; the allowlist loops quote-strip before
+        # classification so they still DENY (#1690 r2 codex sweep).
+        (f'view "-c" "w!/tmp/leak" {db}', False),
+        (f"view '-c' 'w!/tmp/leak' {db}", False),
+        (f'view "--startuptime" /tmp/out {db}', False),
+        (f'awk "-f" /tmp/x.awk {db}', False),
+        (f"awk '-f' /tmp/x.awk {db}", False),
+        (f'sort "-o" /tmp/leak {db}', False),
+        (f'less "-k" /tmp/lesskey {db}', False),
+        (f'rg "--pre" sh . {db}', False),
+        (f'find {db} "-exec" cp x {{}} ;', False),  # find quoted -exec
+        (f"find {db} '-delete'", False),            # find quoted -delete
+        (f"find {db} -type f -name x", True),       # benign find still read
+        # quoted flag-with-value must NOT over-block a lone-input read
+        (f'xxd "-s" 0 {db}', True),
+        (f'uniq "-f" 2 {db}', True),
         # ---- KEEP teeth: fail-closed on unparseable command ----
         (f"cat {db} ' | tee /tmp/leak", False),  # unbalanced quote
     ]

@@ -86,6 +86,23 @@ AGENT_HOME="$BRIDGE_AGENT_HOME_ROOT/$AGENT"
 mkdir -p "$AGENT_HOME"
 printf -- '- session type: admin\n' >"$AGENT_HOME/SESSION-TYPE.md"
 
+# Issue #1690 r2 (codex Phase-4): sibling-gate ordering fixtures. A
+# forbidden shared/secrets path and a peer-agent home, so a read-intent
+# command that names BOTH tasks.db AND a forbidden path can be exercised
+# end-to-end. The tasks.db read-intent carve-out must NOT short-circuit
+# the later Stage A (shared/secrets) / Stage B (peer-home) deny gates.
+SECRETS_FILE="$BRIDGE_SHARED_DIR/secrets/token.txt"
+mkdir -p "$BRIDGE_SHARED_DIR/secrets" "$BRIDGE_SHARED_DIR/private"
+printf '%s' 'secret-token' >"$SECRETS_FILE"
+PRIVATE_FILE="$BRIDGE_SHARED_DIR/private/notes.md"
+printf '%s' 'private' >"$PRIVATE_FILE"
+# A peer agent home so _peer_alias_list("$AGENT") includes it; a read-
+# intent command naming tasks.db + this peer home must stay denied.
+PEER_AGENT="peer-1690"
+PEER_HOME="$BRIDGE_AGENT_HOME_ROOT/$PEER_AGENT"
+mkdir -p "$PEER_HOME"
+printf -- '- session type: static\n' >"$PEER_HOME/SESSION-TYPE.md"
+
 # JSON-escape a string for embedding in the payload.
 json_escape() {
   local s="$1"
@@ -217,13 +234,29 @@ assert_bash_verdict "bash awk in-program append to sink" "awk '{print >> \"/tmp/
 assert_bash_verdict "bash awk pipe to command"          "awk '{print | \"cmd\"}' $TASK_DB"   "DENY"
 assert_bash_verdict "bash awk system() exec"            "awk 'BEGIN{system(\"cp $TASK_DB /tmp/copy\")}' $TASK_DB" "DENY"
 assert_bash_verdict "bash awk -i inplace"               "awk -i inplace '{print}' $TASK_DB"  "DENY"
+# r2 patch/codex sweep: gawk external program/extension loaders + glued -i
+assert_bash_verdict "bash awk --include load"           "awk --include=/tmp/evil.awk '{print}' $TASK_DB" "DENY"
+assert_bash_verdict "bash awk -l extension load"        "awk -l /tmp/evil_ext '{print}' $TASK_DB" "DENY"
+assert_bash_verdict "bash awk @include"                 "awk @include /tmp/evil.awk $TASK_DB" "DENY"
+assert_bash_verdict "bash awk -iinplace glued"          "awk -iinplace '{print}' $TASK_DB"   "DENY"
+assert_bash_verdict "bash awk -E exec program"          "awk -E /tmp/evil.awk $TASK_DB"      "DENY"
+assert_bash_verdict "bash awk -o pretty-print write"    "awk -o /tmp/o.awk '{print}' $TASK_DB" "DENY"
+assert_bash_verdict "bash awk -p profile write"         "awk -p /tmp/prof '{print}' $TASK_DB" "DENY"
+assert_bash_verdict "bash awk --dump-variables write"   "awk --dump-variables=/tmp/o '{print}' $TASK_DB" "DENY"
+assert_bash_verdict "bash awk -W meta-flag"             "awk -W exec=/tmp/x $TASK_DB"        "DENY"
+assert_bash_verdict "bash awk unknown flag (fail-closed)" "awk --some-future-flag '{print}' $TASK_DB" "DENY"
+assert_bash_verdict "bash awk --sandbox read (allowed)" "awk --sandbox '{print \$1}' $TASK_DB" "ALLOW"
+assert_bash_verdict "bash yq --in-place write"          "yq --in-place . $TASK_DB"           "DENY"
 assert_bash_verdict "bash awk plain read (allowed)"     "awk '{print \$2}' $TASK_DB"         "ALLOW"
+assert_bash_verdict "bash awk -F: read (allowed)"       "awk -F: '{print \$1}' $TASK_DB"     "ALLOW"
 
 # ===== DENY (teeth): other read leaders with named-output/exec (issue #1690) =====
 # sort -o / less -o / xxd outfile / view -c 'w!' / rg --pre / yq -i all
 # write/exfil/RCE with NO shell `>` token. Codex re-review found these.
 assert_bash_verdict "bash sort -o output file"   "sort -o /tmp/leak $TASK_DB"           "DENY"
 assert_bash_verdict "bash less -o log file"      "less -o /tmp/leak $TASK_DB"           "DENY"
+assert_bash_verdict "bash less -k lesskey loader" "less -k /tmp/evil.lesskey $TASK_DB"   "DENY"
+assert_bash_verdict "bash less --lesskey-context" "less --lesskey-context=stuff $TASK_DB" "DENY"
 assert_bash_verdict "bash xxd output positional" "xxd $TASK_DB /tmp/leak"               "DENY"
 assert_bash_verdict "bash xxd bare-name output"  "xxd $TASK_DB leak"                    "DENY"
 assert_bash_verdict "bash view ex :w write"      "view -c 'w! /tmp/leak' -c 'qa!' $TASK_DB" "DENY"
@@ -237,6 +270,24 @@ assert_bash_verdict "bash sort --compress-program RCE" "sort --compress-program=
 assert_bash_verdict "bash sort -n read (allowed)" "sort -n $TASK_DB"                    "ALLOW"
 assert_bash_verdict "bash xxd lone read (allowed)" "xxd -s 0 -l 64 $TASK_DB"            "ALLOW"
 assert_bash_verdict "bash more lone read (allowed)" "more $TASK_DB"                     "ALLOW"
+# r2 patch adversarial review: uniq 2nd-positional output, view startup-file
+assert_bash_verdict "bash uniq output positional" "uniq $TASK_DB /tmp/leak"             "DENY"
+assert_bash_verdict "bash uniq -c output positional" "uniq -c $TASK_DB /tmp/leak"       "DENY"
+assert_bash_verdict "bash uniq lone read (allowed)" "uniq $TASK_DB"                     "ALLOW"
+assert_bash_verdict "bash uniq -f flag-value read (allowed)" "uniq -f 2 $TASK_DB"       "ALLOW"
+assert_bash_verdict "bash view -u vimrc startup"  "view -u /tmp/evil.vim $TASK_DB"      "DENY"
+assert_bash_verdict "bash view -i shada startup"  "view -i /tmp/x.shada $TASK_DB"       "DENY"
+assert_bash_verdict "bash view -U gvimrc startup" "view -U /tmp/g.vim $TASK_DB"         "DENY"
+assert_bash_verdict "bash view --startuptime write" "view --startuptime /tmp/out $TASK_DB" "DENY"
+assert_bash_verdict "bash view -V verbose-to-file" "view -V1/tmp/out $TASK_DB"          "DENY"
+assert_bash_verdict "bash view unknown flag (fail-closed)" "view --some-future-flag $TASK_DB" "DENY"
+assert_bash_verdict "bash view -R readonly (allowed)" "view -R $TASK_DB"                "ALLOW"
+assert_bash_verdict "bash view lone read (allowed)" "view $TASK_DB"                     "ALLOW"
+# quoted-flag bypass: shell-quoted flags must still DENY (quote-strip)
+assert_bash_verdict "bash view quoted -c flag"    "view \"-c\" \"w!/tmp/leak\" $TASK_DB" "DENY"
+assert_bash_verdict "bash awk quoted -f flag"     "awk \"-f\" /tmp/x.awk $TASK_DB"      "DENY"
+assert_bash_verdict "bash find quoted -exec flag" "find $TASK_DB \"-exec\" cp x {} ;"   "DENY"
+assert_bash_verdict "bash xxd quoted flag-value (allowed)" "xxd \"-s\" 0 $TASK_DB"      "ALLOW"
 # round-4 residuals: awk -f program-file, yq -s split-exp, env-exec prefix
 assert_bash_verdict "bash awk -f program file"   "awk -f /tmp/evil.awk $TASK_DB"        "DENY"
 assert_bash_verdict "bash yq -s split-exp write" "yq -s /tmp/leak . $TASK_DB"           "DENY"
@@ -250,6 +301,24 @@ assert_bash_verdict "bash awk quote-split system()" "awk 'BEGIN{syst''em(\"id\")
 assert_bash_verdict "bash cmd-subst exfil"       "cat $TASK_DB \$(cp $TASK_DB sink)"    "DENY"
 assert_bash_verdict "bash backtick exfil"        "cat \`cp $TASK_DB sink\` $TASK_DB"    "DENY"
 assert_bash_verdict "bash process-subst exfil"   "cat <(cp $TASK_DB sink)"             "DENY"
+
+# ===== DENY (teeth): sibling-gate ordering (issue #1690 r2 — codex Phase-4) =====
+# The tasks.db read-intent carve-out lifts ONLY the tasks.db-specific deny;
+# it must NOT short-circuit the later Stage A (shared/secrets, shared/
+# private) and Stage B (peer-home) deny gates. A read-intent command that
+# names BOTH tasks.db AND a forbidden path must still be DENIED.
+assert_bash_verdict "bash tasks.db + shared/secrets (read-intent)" \
+  "cat $TASK_DB $SECRETS_FILE" "DENY"
+assert_bash_verdict "bash shared/secrets + tasks.db (order swapped)" \
+  "cat $SECRETS_FILE $TASK_DB" "DENY"
+assert_bash_verdict "bash tasks.db + shared/private (read-intent)" \
+  "cat $TASK_DB $PRIVATE_FILE" "DENY"
+assert_bash_verdict "bash tasks.db + peer-home (read-intent)" \
+  "cat $TASK_DB $PEER_HOME/MEMORY.md" "DENY"
+# Controls: the carve-out still works for tasks.db ALONE, and the forbidden
+# path alone is still denied (proving the deny is not a tasks.db artifact).
+assert_bash_verdict "bash tasks.db alone still ALLOWED" "cat $TASK_DB" "ALLOW"
+assert_bash_verdict "bash shared/secrets alone still DENIED" "cat $SECRETS_FILE" "DENY"
 
 # ===== DENY (teeth): mutators / fail-closed on unparseable =====
 assert_bash_verdict "bash rm tasks.db"             "rm $TASK_DB"              "DENY"
