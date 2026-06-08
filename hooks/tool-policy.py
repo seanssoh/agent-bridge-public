@@ -581,6 +581,31 @@ _READ_INTENT_BASH_COMMANDS = frozenset(
         "realpath",
         "basename",
         "dirname",
+        # Issue #1693 — additional unambiguously stdout-only viewers. Each
+        # is a pure read filter with NO named-file output, in-place edit,
+        # external-exec, or program-file flag surface, so a diagnostic read
+        # (`strings <db>`, `hexdump -C <file>`, `comm a b`) is no longer
+        # mis-classified write-intent and false-denied by the roster /
+        # system-config / queue gates. Confirmed against their man pages:
+        #   strings  — dumps printable strings to stdout; no output flag.
+        #   hexdump  — hex/ASCII dump to stdout; no output flag.
+        #   comm     — line-compares two sorted inputs to stdout; no output.
+        #   fold     — wraps lines to stdout; no output flag.
+        #   expand   — tabs→spaces to stdout; no output flag.
+        #   paste    — merges lines to stdout; no output flag.
+        #   csvlook  — csvkit pretty-printer to stdout; no output flag.
+        # A shell `>`/`>>` redirect to a protected path is still caught by
+        # the per-token write-redirect check, so a viewer cannot become a
+        # write bypass. `bat`/`batcat` are deliberately NOT added: they
+        # carry a pager-exec surface (`--pager`, `PAGER`/`BAT_PAGER`) that
+        # would need its own guard (issue #1693 keeps scope minimal).
+        "strings",
+        "hexdump",
+        "comm",
+        "fold",
+        "expand",
+        "paste",
+        "csvlook",
     }
 )
 
@@ -1931,6 +1956,105 @@ _PATH_PREFIX_CHARS = frozenset({
     ";",        # statement separator
     ",",        # comma separator in some shell idioms
 })
+# Issue #1693 — write/reference-position prefix chars for the SHORT-needle
+# (`hooks/`, `state/cron/`) deny in the shlex-failure substring fallback.
+# The full :data:`_PATH_PREFIX_CHARS` set above includes prose-punctuation
+# characters (quote, paren, comma, pipe, semicolon) that routinely sit
+# adjacent to a benign prose mention of a short suffix inside an
+# unbalanced-quote command body — `echo it's 'hooks/x and don't`,
+# `(hooks/post.sh)`, `a,hooks/z`. Those over-fired the system-config deny
+# even though no write to the path is present (issue #1693; the broader
+# class beyond the now-fixed verbatim repro). A REAL argv reference to a
+# short suffix sits in a write/redirect/assignment/path-construction
+# position — NOT after prose punctuation. The position test is done by
+# :func:`_short_needle_at_write_position`, which scans backward over any
+# opening quotes to the effective boundary char; these are the chars that
+# mark such a position:
+#   path construction — the needle is glued onto a path (`/etc/hooks/x`,
+#     `~/hooks/x`, `$DIR/hooks/x`), an assignment value (`FOO=hooks/x`).
+#   redirect operator  — `>` / `<` / `&` end an output / input / fd
+#     redirect right before the target (`>hooks/x`, `>>hooks/x`,
+#     `&>hooks/x`, `2>hooks/x`).
+_SHORT_NEEDLE_BOUNDARY_CHARS = frozenset({"/", "~", "$", "=", ">", "<", "&"})
+# Quote chars that may glue onto the FRONT of a redirect/assignment/path
+# target (`>'hooks/x`, `="hooks/x`). Skipped during the backward scan so
+# the effective boundary char behind them is what decides.
+_SHORT_NEEDLE_QUOTE_CHARS = frozenset({"'", '"'})
+
+
+def _short_needle_after_redirect_op(command: str, j: int) -> bool:
+    """Return True iff *command[j]* is the LAST char of a Bash output/input/
+    fd redirect operator that takes a file/word target:
+      `>` `>>` `2>` `1>` `N>` `<` `<>` `&>` `&>>`  — end in `>`/`<`
+      `>|`                                          — ends in `|` after `>`
+      `>&` `<&`                                     — end in `&` after `>`/`<`
+    Used to recognise a redirect TARGET separated from its operator by
+    whitespace (issue #1693 codex r3 `cat > 'hooks/x'`; r4 `echo x >& y`)."""
+    if j < 0:
+        return False
+    c = command[j]
+    if c in (">", "<"):
+        return True
+    # noclobber override `>|` ends in `|`, which must be preceded by `>`.
+    if c == "|" and j >= 1 and command[j - 1] == ">":
+        return True
+    # `>&word` / `<&word` redirect-to-target end in `&`, preceded by `>`/`<`
+    # (the glued `>&hooks/x` form is already caught by the boundary set; this
+    # covers the space-separated `>& hooks/x` form — issue #1693 codex r4).
+    if c == "&" and j >= 1 and command[j - 1] in (">", "<"):
+        return True
+    return False
+
+
+def _short_needle_at_write_position(command: str, idx: int) -> bool:
+    """Return True iff the short needle at *command[idx:]* sits in a genuine
+    write / redirect / assignment / path-construction position rather than
+    after prose punctuation (issue #1693).
+
+    Scans backward from the char before the needle, skipping any opening
+    quote chars (so `>'hooks/x` and `="hooks/x` reduce to their effective
+    boundary `>` / `=`). The needle is a real reference when:
+
+      * start-of-string after skipping quotes (`'hooks/x` opening the
+        command), or
+      * the boundary char is in :data:`_SHORT_NEEDLE_BOUNDARY_CHARS`
+        (path / assignment / redirect), or
+      * the boundary char is `|` AND it is itself preceded by `>` — the
+        Bash noclobber-override write `>|hooks/x` (codex #1693 r2). A bare
+        pipe (`a|hooks/x`) is a stage boundary running a command, not a
+        write to the path, and stays benign, or
+      * the boundary is whitespace whose run is preceded by a redirect
+        operator (`>`/`>>`/`>|`/`2>`/`<`/…) — a redirect target separated
+        from its operator by a space (codex #1693 r3: `cat > 'hooks/x'`,
+        `cat 2> hooks/x`).
+
+    Everything else (prose whitespace, `(`, `,`, `;`, a bare `|`, an alnum
+    word char) is a benign mention and returns False.
+    """
+    j = idx - 1
+    # Skip a single layer of opening quote(s) glued to the target front.
+    while j >= 0 and command[j] in _SHORT_NEEDLE_QUOTE_CHARS:
+        j -= 1
+    if j < 0:
+        # Needle (after optional opening quote) is at start-of-string.
+        return True
+    boundary = command[j]
+    if boundary in _SHORT_NEEDLE_BOUNDARY_CHARS:
+        return True
+    # Bash noclobber-override `>|target` — the `|` is a write redirect only
+    # when preceded by `>`; a bare pipe is a command stage, not a write.
+    if boundary == "|" and j >= 1 and command[j - 1] == ">":
+        return True
+    # A space-separated redirect target: `>` / `2>` / `<` … then whitespace
+    # then the (optionally quoted) target. Skip the whitespace run and check
+    # whether a redirect operator immediately precedes it (codex #1693 r3).
+    if boundary in (" ", "\t"):
+        k = j
+        while k >= 0 and command[k] in (" ", "\t"):
+            k -= 1
+        if _short_needle_after_redirect_op(command, k):
+            return True
+    return False
 
 
 def _command_substring_hits_protected_needle(command: str) -> bool:
@@ -1939,13 +2063,20 @@ def _command_substring_hits_protected_needle(command: str) -> bool:
 
     Long needles (>= :data:`_SHORT_NEEDLE_THRESHOLD` chars) match on a
     plain substring scan. Short needles fire when the needle sits at
-    start-of-string OR is preceded by a token/path-boundary character
-    (see :data:`_PATH_PREFIX_CHARS`). Whitespace is intentionally NOT a
-    boundary character so heredoc prose like ``It's hooks/post.sh``
-    pass — that prose is what triggered the regression operator-side on
-    2026-05-03 (issue #509 D2). Real argv writes such as
-    ``cat >hooks/foo 'unterminated`` still deny because ``>`` is in the
-    prefix set (#509 D2 r2 codex follow-up).
+    start-of-string OR in a write / redirect / assignment / path-
+    construction position (see :func:`_short_needle_at_write_position`).
+    Whitespace is intentionally NOT a boundary so heredoc prose like
+    ``It's hooks/post.sh`` passes — that prose is what triggered the
+    regression operator-side on 2026-05-03 (issue #509 D2). Issue #1693
+    additionally drops prose-punctuation characters (quote, paren, comma,
+    pipe, semicolon) from the short-needle position test: they routinely
+    sit adjacent to a benign prose mention inside an unbalanced-quote body
+    (``it's 'hooks/x``, ``(hooks/post.sh)``, ``a,hooks/z``) with no write
+    to the path. Real argv writes — bare or quoted, including the Bash
+    noclobber-override `>|target` — still deny because the position test
+    looks through opening quotes to the redirect / assignment / path
+    boundary (``cat >hooks/x``, ``cat >'hooks/x'``, ``cat >|hooks/x``,
+    ``FOO="hooks/x"``).
     """
     for needle in protected_literal_suffixes():
         if not needle:
@@ -1962,7 +2093,7 @@ def _command_substring_hits_protected_needle(command: str) -> bool:
             if idx == 0:
                 # Needle at start-of-string is path-shaped by construction.
                 return True
-            if command[idx - 1] in _PATH_PREFIX_CHARS:
+            if _short_needle_at_write_position(command, idx):
                 return True
             start = idx + 1
     return False
