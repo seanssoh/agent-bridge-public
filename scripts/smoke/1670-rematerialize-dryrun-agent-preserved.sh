@@ -184,97 +184,16 @@ test_bash4_preserves_agent() {
 }
 
 # --- Test 4: Python-side guard rejects a mismatched/blank-agent payload ------
+# The probe body lives in a file-as-argv helper (footgun #11 / lint-heredoc-ban):
+# invoke it as `python3 <helper> <repo_root>`, never a heredoc-stdin subprocess.
 test_python_guard_structures_mismatched_agent() {
-  python3 - "$REPO_ROOT" <<'PY'
-import importlib.util
-import sys
-from pathlib import Path
-
-repo_root = Path(sys.argv[1])
-spec = importlib.util.spec_from_file_location("bridge_upgrade", repo_root / "bridge-upgrade.py")
-mod = importlib.util.module_from_spec(spec)
-# Register before exec so the @dataclass field-type resolution (the module uses
-# `from __future__ import annotations`) can find the module in sys.modules.
-sys.modules["bridge_upgrade"] = mod
-spec.loader.exec_module(mod)
-
-# Build the smallest AgentMigrationResult the guard touches (agent + engine).
-result = mod.AgentMigrationResult(
-    agent="boundary",
-    added_files=[],
-    created_dirs=[],
-    updated_files=[],
-    session_type="static-claude",
-    engine="claude",
-)
-
-# Stand in for the helper subprocess: emit a payload with a BLANK agent + usage
-# error (the historical #1670 shape) and a separate MISMATCHED-agent payload.
-class _Proc:
-    def __init__(self, stdout):
-        self.stdout = stdout
-        self.stderr = ""
-        self.returncode = 0
-
-import json as _json
-
-cases = {
-    "blank-agent": _json.dumps({
-        "agent": "",
-        "status": "error",
-        "source_dir": "",
-        "target_dir": "",
-        "errors": ["usage: rematerialize-agent-identity.sh ..."],
-    }),
-    "mismatched-agent": _json.dumps({
-        "agent": "CLAUDE.md",
-        "status": "applied",
-        "source_dir": ".claude/commands/wrap-up.md",
-        "target_dir": "",
-    }),
-    "correct-agent": _json.dumps({
-        "agent": "boundary",
-        "status": "planned",
-        "source_dir": "/x/agents/boundary",
-        "target_dir": "/x/agents/boundary/workdir",
-        "updated_paths": [],
-    }),
-}
-
-orig_run = mod.subprocess.run
-helper_path = repo_root / "lib" / "upgrade-helpers" / "rematerialize-agent-identity.sh"
-if not helper_path.exists():
-    print("FAIL: helper path missing for guard test")
-    sys.exit(1)
-
-failures = []
-for label, stdout in cases.items():
-    def _fake_run(*_a, _stdout=stdout, **_kw):
-        return _Proc(_stdout)
-    mod.subprocess.run = _fake_run
-    try:
-        payload = mod.rematerialize_agent_identity(repo_root, Path("/x"), result, True)
-    finally:
-        mod.subprocess.run = orig_run
-
-    if label == "correct-agent":
-        if payload.get("agent") != "boundary" or payload.get("status") != "planned":
-            failures.append(f"{label}: correct payload was not passed through ({payload!r})")
-    else:
-        if payload.get("agent") != "boundary":
-            failures.append(f"{label}: guard did not re-key the error to the asked-for agent ({payload!r})")
-        if payload.get("status") != "error":
-            failures.append(f"{label}: guard did not produce a structured error ({payload!r})")
-        errs = payload.get("errors") or []
-        if not any("mismatched agent identity" in str(e) for e in errs):
-            failures.append(f"{label}: guard error message missing the mismatch detail ({errs!r})")
-
-if failures:
-    for f in failures:
-        print("FAIL: " + f)
-    sys.exit(1)
-print("OK: python-side guard re-keys blank/mismatched agent payloads and passes correct ones through")
-PY
+  local helper_py="$SCRIPT_DIR/1670-rematerialize-dryrun-agent-preserved-helper.py"
+  local out=""
+  if ! out="$(python3 "$helper_py" "$REPO_ROOT" 2>&1)"; then
+    smoke_fail "python guard probe failed: $out"
+  fi
+  smoke_assert_contains "$out" "OK: python-side guard re-keys" \
+    "python guard probe did not report OK ($out)"
 }
 
 smoke_run "bash3.2 re-exec boundary: zero changed files preserves agent" test_bash32_zero_changed_files_preserves_agent
