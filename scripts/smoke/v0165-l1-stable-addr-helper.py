@@ -281,6 +281,51 @@ def cmd_malformed(repo_root: str, cfg_path: str) -> int:
     return 0
 
 
+def cmd_custom_config_path(repo_root: str, cfg_path: str) -> int:
+    """A `serve --config <custom>` daemon must drift the CUSTOM file, not default.
+
+    Integration review #11573 (cross-lane L0×L1×L3 config_path seam): the
+    reconcile writer used to persist desired drift to `a2a.config_path()`
+    (BRIDGE_A2A_CONFIG / bridge-home default) regardless of the active config
+    the receiver loaded. A daemon started on a custom `--config` path then
+    drifted the DEFAULT file forever and never converged its own. This asserts
+    the threaded `config_path` makes the writer update the SAME file and leave
+    the default untouched. The custom path is passed via L1_CUSTOM_CFG to keep
+    the 3-arg helper argv contract.
+    """
+    from pathlib import Path
+    reconcile = _load_reconcile(repo_root)
+    a2a = _load_a2a(repo_root)
+    custom_path = os.environ.get("L1_CUSTOM_CFG", "")  # noqa: iso-helper-boundary
+    if not custom_path or not os.path.exists(custom_path):
+        sys.stderr.write("FAIL custom-config: L1_CUSTOM_CFG not set/missing\n")
+        return 1
+    # cfg_path is the DEFAULT (BRIDGE_A2A_CONFIG) — must stay byte-identical.
+    default_before = _read_listen_addr(cfg_path)
+    with open(custom_path, encoding="utf-8") as fh:
+        custom_cfg = json.load(fh)
+    expected = a2a.tailscale_stable_addr()
+    res = reconcile.stable_local_addr("tailscale", custom_cfg, Path(custom_path))
+    if res.status != reconcile.RESULT_CHANGED:
+        sys.stderr.write(
+            f"FAIL custom-config: status {res.status} ({res.detail})\n")
+        return 1
+    # The CUSTOM file got the stable addr...
+    if _read_listen_addr(custom_path) != expected:
+        sys.stderr.write(
+            f"FAIL custom-config: custom file not updated to {expected}\n")
+        return 1
+    # ...and the DEFAULT (BRIDGE_A2A_CONFIG) file was NOT drifted (the bug).
+    if _read_listen_addr(cfg_path) != default_before:
+        sys.stderr.write(
+            f"FAIL custom-config: DEFAULT config drifted ({default_before} -> "
+            f"{_read_listen_addr(cfg_path)}); writer ignored the active "
+            f"--config path (the #11573 regression)\n")
+        return 1
+    print(f"OK custom-config -> custom file updated to {expected}, default untouched")
+    return 0
+
+
 _COMMANDS = {
     "warp-converged": cmd_warp_converged,
     "warp-changed": cmd_warp_changed,
@@ -290,6 +335,7 @@ _COMMANDS = {
     "ts-error": cmd_ts_error,
     "isolation": cmd_isolation,
     "malformed": cmd_malformed,
+    "custom-config-path": cmd_custom_config_path,
 }
 
 

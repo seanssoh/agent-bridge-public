@@ -239,6 +239,24 @@ malformed_transport_no_guess() {
     "(d) tailscale CLI never shelled under a guessed transport (config-derived kind validated)"
 }
 
+# === (f) active --config seam: a custom-config daemon drifts its OWN file, not
+# the default (integration review #11573, cross-lane L0×L1×L3 config_path) ===
+custom_config_path_drifts_active_file() {
+  # The DEFAULT (BRIDGE_A2A_CONFIG) carries a baseline addr that must stay put.
+  local default_cfg="$CFG_DIR/seam-default.json"
+  write_cfg "$default_cfg" '' "9.9.9.9"
+  # The custom `serve --config` file carries the drift to be corrected.
+  local custom_cfg="$CFG_DIR/seam-custom.json"
+  write_cfg "$custom_cfg" '' "1.2.3.4"
+  local out
+  out="$(BRIDGE_A2A_CONFIG="$default_cfg" \
+        BRIDGE_A2A_TAILSCALE_CLI="$TS_MOCK" \
+        L1_CUSTOM_CFG="$custom_cfg" \
+        run_helper custom-config-path "$default_cfg")"
+  smoke_assert_contains "$out" "OK custom-config" \
+    "(f) custom --config daemon drifts ITS OWN file; the default (BRIDGE_A2A_CONFIG) is left untouched (#11573)"
+}
+
 warp_changed
 warp_converged
 warp_error
@@ -247,5 +265,6 @@ ts_converged
 ts_error
 isolation_warp_never_shells_ts
 malformed_transport_no_guess
+custom_config_path_drifts_active_file
 
 smoke_log "ALL CHECKS PASSED ($SMOKE_NAME)"
