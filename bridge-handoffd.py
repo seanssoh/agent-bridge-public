@@ -1909,19 +1909,54 @@ def enqueue_via_bridge_task(
     return True, task_id, stdout_detail, stdout_detail
 
 
-def staged_body_text(env: dict[str, Any]) -> str:
-    """Build the local task body with a provenance block prepended."""
+def staged_body_text(env: dict[str, Any], *,
+                     author_bridge: str = "", author_agent: str = "") -> str:
+    """Build the local task body with a provenance block prepended.
+
+    `author_bridge`/`author_agent` are the RESOLVED origin identity the caller
+    also hands to bridge-task for the queue attribution. On a leader-RELAYED leg
+    (Lane 5, #1695-P2 gotcha E) the wire `env.sender` is the LEADER (it re-signed
+    the leg) while the true author is the original member in `relayed_from`; the
+    caller resolves those into `author_*`. Rendering the body provenance from the
+    RAW `env.sender` would pair the original AGENT with the LEADER NODE
+    (`alice@<leader>`) — the exact leader-identity ambiguity Lane 5 closes — and
+    would disagree with the (correct) queue attribution. So the body provenance is
+    rendered from `author_*` (falling back to `env.sender` for a normal,
+    non-relayed send where they coincide), and a relayed leg ALSO renders an
+    explicit `relayed via : <leader> (room leader)` line so a human sees the true
+    origin PLUS the relay hop. The Reply-with hint targets the ORIGINAL author's
+    node so a reply routes to who actually wrote it, not the relay.
+    """
     sender = env.get("sender", {})
     reply = env.get("reply_to", {})
+    relayed = a2a.envelope_is_relayed(env)  # noqa: iso-helper-boundary - a2a.envelope_* call, not a .env file
+    # The displayed origin: the resolved author when present, else the wire sender.
+    peer = author_bridge or str(sender.get("bridge", "?") or "?")
+    agent = author_agent or str(sender.get("agent", "?") or "?")
     header = [
         "<!-- A2A cross-bridge handoff — provenance -->",
-        f"remote peer  : {sender.get('bridge', '?')}",
-        f"remote agent : {sender.get('agent', '?')}",
+        f"remote peer  : {peer}",
+        f"remote agent : {agent}",
+    ]
+    # On a relayed leg, name the relay hop explicitly (the leader is the X-AGB-Peer
+    # that signed the leg, surfaced as env.sender.bridge / relayed_via).
+    if relayed:
+        relay_via = str(env.get("relayed_via", "") or sender.get("bridge", "") or "?")
+        header.append(f"relayed via  : {relay_via} (room leader)")
+    # Reply-with hint. A NON-relayed send keeps the sender's declared `reply_to`
+    # (documented behavior). A RELAYED leg overrides it to the RESOLVED original
+    # author (`peer`/`agent`) so a reply routes to who actually wrote the message,
+    # NOT the relay leader (a relayed env.reply_to was rebuilt by the leader to the
+    # original author already, but we render from the resolved values so the body
+    # can never present the original agent paired with the leader node).
+    reply_peer = peer if relayed else str(reply.get("peer", "?") or "?")
+    reply_agent = agent if relayed else str(reply.get("agent", "?") or "?")
+    header += [
         f"message id   : {env.get('message_id', '?')}",
         "",
         "Reply with:",
-        f"  agent-bridge a2a send --peer {reply.get('peer', '?')} "
-        f"--to {reply.get('agent', '?')} --title \"<re: ...>\" --body \"...\"",
+        f"  agent-bridge a2a send --peer {reply_peer} "
+        f"--to {reply_agent} --title \"<re: ...>\" --body \"...\"",
         "",
         "---",
         "",
@@ -3100,8 +3135,15 @@ class HandoffHandler(BaseHTTPRequestHandler):
             # bridge-task --body-file read). stage_inbound_body returns a UNIQUE
             # path scoped to (peer_id, message_id) that flows straight to
             # --body-file. peer_id is the authenticated X-AGB-Peer.
+            # Render the body provenance from the SAME resolved author identity the
+            # queue attribution uses (sender_bridge/sender_agent) — on a relayed leg
+            # those are the rewritten `relayed_from` values, so the body and the
+            # queue agree and never present the original agent paired with the
+            # leader node (codex Phase-4 #1695-P2 body-provenance fix).
             staged = stage_inbound_body(
-                peer_id, message_id, staged_body_text(env))
+                peer_id, message_id,
+                staged_body_text(env, author_bridge=sender_bridge,
+                                 author_agent=sender_agent))
             durable_body = promote_inbound_body_to_queue(staged)
 
             ok, task_id, audit_detail, peer_detail = enqueue_via_bridge_task(

@@ -131,6 +131,45 @@ test_relay_leg_delivers_at_target() {
 }
 
 # ---------------------------------------------------------------------------
+# positive-body (codex Phase-4): the delivered task BODY provenance block must
+# AGREE with the queue attribution — it must show the ORIGINAL author's REAL node
+# (alice@nodeB), name the relay leader on a SEPARATE `relayed via` line, and the
+# Reply-with hint must target the original author's node. It must NEVER present
+# the original agent paired with the LEADER node (alice@nodeA).
+# ---------------------------------------------------------------------------
+test_relay_body_provenance_agrees() {
+  # Build a FRESH relay end-to-end (a new inbound -> a new relay leg) so the
+  # target delivery is a genuine first delivery (not a dedupe duplicate of the
+  # positive test's leg, which would short-circuit before the body is staged).
+  local inb="$SMOKE_TMP_ROOT/inbound-body.json"
+  local leg="$SMOKE_TMP_ROOT/relay-body.json"
+  python3 "$HELPER" build-member-enqueue "$inb" nodeB alice carol "$ROOM" 1 >/dev/null
+  env "${TEST_FLAGS[@]}" "BRIDGE_A2A_ROOMS_DB=$LEADER_DB" \
+      "BRIDGE_ROOMS_TEST_RELAY_HOOK=$RELAY_HOOK" "CAPTURE_FILE=$leg" \
+    python3 "$HELPER" deliver-to-receiver "$SMOKE_REPO_ROOT" \
+      "$(cat "$CFG_LEADER")" "$inb" '{"resign":true}' >/dev/null
+  local body="$SMOKE_TMP_ROOT/delivered-body.txt"
+  env "BRIDGE_A2A_ROOMS_DB=$TARGET_DB" "DELIVERED_BODY_FILE=$body" \
+    python3 "$HELPER" deliver-to-receiver "$SMOKE_REPO_ROOT" \
+      "$(cat "$CFG_TARGET")" "$leg" >/dev/null
+  smoke_assert_file_exists "$body" "the delivered task body was captured"
+  local body_text
+  body_text="$(cat "$body")"
+  # The TRUE origin: alice on nodeB, rendered together.
+  smoke_assert_contains "$body_text" "remote peer  : nodeB" "body provenance names the ORIGINAL author node (nodeB)"
+  smoke_assert_contains "$body_text" "remote agent : alice" "body provenance names the ORIGINAL author agent (alice)"
+  # The relay hop is named SEPARATELY (not conflated with the origin).
+  smoke_assert_contains "$body_text" "relayed via  : nodeA (room leader)" "body provenance names the relay leader on its OWN line"
+  # The Reply-with hint targets the ORIGINAL author's node, not the leader.
+  smoke_assert_contains "$body_text" "--peer nodeB --to alice" "the Reply-with hint targets the ORIGINAL author (nodeB), not the leader"
+  # THE decisive negatives (the leader-identity ambiguity Lane 5 closes): the body
+  # must NEVER pair the original agent with the leader node — not as the `remote
+  # peer` origin line, and not in the Reply-with hint.
+  smoke_assert_not_contains "$body_text" "remote peer  : nodeA" "the body's ORIGIN peer is never the leader node (nodeA)"
+  smoke_assert_not_contains "$body_text" "--peer nodeA --to alice" "the body NEVER pairs the original agent with the leader node in the reply hint"
+}
+
+# ---------------------------------------------------------------------------
 # A5b: the leader refuses to relay a STALE-epoch message (codex P2). The inbound
 # room_epoch must equal the leader's AUTHORITATIVE epoch (rooms.db) — a stale
 # (lower) epoch is a 409 and NOT forwarded (never relay against a superseded
@@ -367,6 +406,7 @@ test_A7_no_secret_leak() {
 # ---------------------------------------------------------------------------
 smoke_run "setup: a member->member room message is RELAYED by the leader" test_setup_member_to_leader_relay
 smoke_run "positive: the relay leg delivers at the target (original author validated)" test_relay_leg_delivers_at_target
+smoke_run "positive-body: the delivered body provenance agrees (alice@nodeB + relayed via nodeA)" test_relay_body_provenance_agrees
 smoke_run "A1: relay sig-replacement is rejected (target verifies the LEADER)" test_A1_relay_sig_replacement_rejected
 smoke_run "A1b: a non-room forged-relay message keeps its real provenance" test_A1b_nonroom_forged_relay_provenance
 smoke_run "A2: the leader refuses to relay to a non-member target (fail closed)" test_A2_relay_to_non_member_refused

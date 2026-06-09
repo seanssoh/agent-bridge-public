@@ -342,9 +342,17 @@ def cmd_deliver_to_receiver(repo_root: str, cfg_json: str, captured: str,
 
     def _fake_enqueue(*, target, sender_bridge, sender_agent, priority, title,
                       body_file):
+        # ALSO capture the rendered body file (the staged provenance block) so a
+        # tooth can assert the body provenance agrees with the queue attribution
+        # (codex Phase-4 #1695-P2 body-provenance fix).
+        body_text = ""
+        try:
+            body_text = Path(str(body_file)).read_text(encoding="utf-8")
+        except (OSError, TypeError, ValueError):
+            body_text = ""
         delivery.update({"target": target, "sender_bridge": sender_bridge,
                          "sender_agent": sender_agent, "priority": priority,
-                         "title": title})
+                         "title": title, "body_text": body_text})
         return True, "9999", "created task #9999", "created task #9999"
 
     hd.enqueue_via_bridge_task = _fake_enqueue  # type: ignore[assignment]
@@ -369,6 +377,11 @@ def cmd_deliver_to_receiver(repo_root: str, cfg_json: str, captured: str,
     payload = reply.get("payload", {})
     relayed = bool(isinstance(payload, dict) and payload.get("relayed"))
     delivered = bool(delivery)
+    # If DELIVERED_BODY_FILE is set, dump the rendered task body there so a tooth
+    # can grep the multi-line provenance block cleanly.
+    dump = os.environ.get("DELIVERED_BODY_FILE")  # noqa: iso-helper-boundary - env var, not a .env file
+    if dump:
+        Path(dump).write_text(delivery.get("body_text", ""), encoding="utf-8")
     print(f"status={status} delivered={delivered} relayed={relayed} "
           f"body={json.dumps(payload)} delivery={json.dumps(delivery)}")
     return 0
