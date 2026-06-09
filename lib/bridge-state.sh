@@ -1216,6 +1216,25 @@ bridge_load_roster() {
     fi
   fi
 
+  # Issue #1734: source the dedicated install env-override file LAST, after
+  # both the scoped agent env (iso path) and agent-roster.local.sh (standard
+  # path) above, so an `agb config set-env KEY=VALUE` override is a true
+  # install-wide override the daemon/receiver inherit. The file is written
+  # only by the audited `config set-env` wrapper (admin/operator-source
+  # gated, before/after-hash audited) and is protected from direct Edit/Write
+  # by PROTECTED_GLOBS (#341). `BRIDGE_AGENT_ENV_LOCAL_FILE` defaults to
+  # $BRIDGE_HOME/agent-env.local.sh (see bridge-lib.sh). Sourced only when
+  # present and readable; an unreadable file is skipped silently (the iso
+  # roster fail-closed above already covers the protected-roster case, and
+  # this override file is non-essential — a missing/unreadable override must
+  # not break a queue-safe iso invocation).
+  if [[ -n "${BRIDGE_AGENT_ENV_LOCAL_FILE:-}" ]] \
+      && [[ -f "$BRIDGE_AGENT_ENV_LOCAL_FILE" ]] \
+      && [[ -r "$BRIDGE_AGENT_ENV_LOCAL_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$BRIDGE_AGENT_ENV_LOCAL_FILE"
+  fi
+
   # Issue #539: validate BRIDGE_AGENT_CLASS values once the roster files
   # have been sourced. The closed value space is {user, system}; a typo
   # like `class=admin` must surface as a hard load error rather than

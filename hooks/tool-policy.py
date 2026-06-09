@@ -529,8 +529,10 @@ SYSTEM_CONFIG_DENY_REASON = (
 
 ROSTER_LOCAL_DENY_REASON = (
     "agent-roster.local.sh is a protected system config path. "
-    "Use `agent-bridge config set` instead. Admin role does not exempt "
-    "this path — the wrapper preserves the audit chain."
+    "For a durable env override use `agent-bridge config set-env "
+    "KEY=VALUE` (issue #1734); for a JSON config field use `agent-bridge "
+    "config set`. Admin role does not exempt this path — the wrapper "
+    "preserves the audit chain."
 )
 
 
@@ -2973,6 +2975,245 @@ def _is_config_set_wrapper(text: str) -> bool:
     return tokens[1] == "config" and tokens[2] == "set"
 
 
+# Issue #1734 — `config set-env` exact-shape, admin-only, anti-spoof gate.
+#
+# `set-env` writes a durable install env override through the audited
+# bridge-config.py wrapper (admin identity + operator caller-source). The
+# hook must let the SANCTIONED shape through (so an admin agent can call it)
+# while denying every smuggling shape. Unlike `config set`, `set-env` names
+# NO protected path in argv (the managed file is implicit), so the path-argv
+# gate would NOT catch a malformed call — `_admin_bridge_verb_check` would
+# fall through to the peer/shared gate, which ALLOWS a command that does not
+# name a peer home. That is the hole this dedicated gate closes.
+#
+# The critical extra teeth over `_is_config_set_wrapper` is the
+# ENV-ASSIGNMENT-PREFIX anti-spoof: a normal agent shell must not be able to
+# run `BRIDGE_CALLER_SOURCE=operator-tui agb config set-env ...` to forge the
+# very caller-source / agent-id the wrapper's trust gate reads. shlex.split
+# would put the `VAR=value` token at tokens[0], so the leaf check alone would
+# (correctly) NOT match `agb` — but it would then fall through to a silent
+# allow. We detect the leading assignment explicitly and DENY.
+_LEADING_ENV_ASSIGN_RE = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _has_leading_env_assignment(text: str) -> bool:
+    """True iff *text* begins with a `VAR=value` env-assignment prefix.
+
+    A leading `NAME=...` token (before the command word) is the shell's
+    per-command environment override. We refuse it on a `config set-env`
+    invocation so an agent cannot pre-seed `BRIDGE_CALLER_SOURCE` /
+    `BRIDGE_AGENT_ID` into the wrapper's process env and spoof the trust
+    gate. Matched on the RAW leading text (before shlex) because shlex
+    happily tokenizes `VAR=value cmd` and the assignment would otherwise
+    pass unnoticed.
+    """
+    return bool(_LEADING_ENV_ASSIGN_RE.match(text))
+
+
+def _first_stage_is_config_set_env(text: str) -> bool:
+    """True iff the FIRST command stage of *text* is `… config set-env …`.
+
+    "First stage" = the text up to the first shell separator
+    (`_COMMAND_OPERATOR_RE`). We strip a leading `VAR=value` env-assignment
+    prefix (which the shell would treat as a per-command env override) before
+    inspecting the command word, so a `BRIDGE_X=y agb config set-env …` spoof
+    is still RECOGNIZED as a set-env attempt (and therefore denied below
+    rather than falling through). Fail-closed on unparseable input: if shlex
+    rejects the stage, we return False (the unparseable command is handled by
+    the generic gates, not silently allowed by this carve-out).
+
+    This is the RECOGNITION predicate — it intentionally accepts the
+    spoof/smuggle shapes so the caller can DENY them. The narrower SANCTIONED
+    shape (no separators / embeddings / redirects / leading assignment, admin
+    caller) is checked separately by the caller.
+    """
+    if "set-env" not in text:
+        return False
+    first_stage = _COMMAND_OPERATOR_RE.split(text, maxsplit=1)[0]
+    scan = _SAFE_REDIRECT_RE.sub(" ", first_stage)
+    try:
+        toks = shlex.split(scan, posix=True, comments=False)
+    except ValueError:
+        return False
+    # Drop leading `VAR=value` env-assignment tokens.
+    while toks and "=" in toks[0] and _LEADING_ENV_ASSIGN_RE.match(toks[0] + " "):
+        toks.pop(0)
+    if len(toks) < 3:
+        return False
+    leaf = toks[0].rsplit("/", 1)[-1]
+    return (
+        leaf in {"agent-bridge", "agb"}
+        and toks[1] == "config"
+        and toks[2] == "set-env"
+    )
+
+
+def _config_set_env_check(
+    text: str,
+    agent: str,
+    tool_input: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """Exact-shape, admin-only gate for `(agent-bridge|agb) config set-env`.
+
+    Returns ``(allowed, deny_reason)`` like ``_admin_bridge_verb_check``:
+    - ``(True, None)``  — sanctioned admin invocation; audit row emitted.
+    - ``(False, str)``  — recognized as a `config set-env` attempt but
+      rejected (env-assignment spoof, shell embedding/redirect/separator,
+      non-admin caller). The caller returns the deny reason so a spoof /
+      smuggle cannot fall through to a silent allow at the peer/shared gate.
+    - ``(False, None)`` — not a `config set-env` invocation at all; the
+      caller falls through to the normal gates.
+
+    NOTE: the path-argv detection used elsewhere is deliberately NOT relied
+    on here — `set-env` names no protected path. The wrapper layers its own
+    admin/source gate + before/after-hash audit; the hook's job is the
+    exact-shape + anti-spoof envelope so a malformed/spoofed/smuggling call is
+    denied at the hook and never even reaches the wrapper.
+    """
+    # RECOGNITION: is the first command stage a `config set-env` invocation?
+    # If not, this is not our verb — fall through unchanged. From here on,
+    # EVERY exit is an explicit allow/deny (never a silent fall-through), so a
+    # recognized attempt cannot leak to the peer/shared gate.
+    if not _first_stage_is_config_set_env(text):
+        return False, None
+
+    # TEETH 1 — leading `VAR=value` env-assignment prefix is a spoof of the
+    # wrapper's trust env (`BRIDGE_CALLER_SOURCE` / `BRIDGE_AGENT_ID`). Deny.
+    if _has_leading_env_assignment(text):
+        _emit_config_set_env_denied_audit(
+            agent,
+            text=text,
+            tool_input=tool_input,
+            reason="env_assignment_prefix_spoof",
+        )
+        return False, (
+            "agent-bridge config set-env: a leading VAR=value env-assignment "
+            "prefix is not allowed (anti-spoof of BRIDGE_CALLER_SOURCE / "
+            "BRIDGE_AGENT_ID)"
+        )
+
+    # TEETH 2 — shell embeddings / redirections / separators. The wrapper
+    # cannot guard a file the shell opens or a second piped command that runs
+    # before it. A recognized set-env attempt carrying any of these is DENIED
+    # (not allowed, and not fallen-through).
+    if _command_has_shell_embedding(text):
+        _emit_config_set_env_denied_audit(
+            agent, text=text, tool_input=tool_input, reason="shell_embedding"
+        )
+        return False, (
+            "agent-bridge config set-env: shell embeddings "
+            "($(...), backticks, <(...), heredoc) are not allowed"
+        )
+    sanitized = _SAFE_REDIRECT_RE.sub(" ", text)
+    if "<" in sanitized or ">" in sanitized:
+        _emit_config_set_env_denied_audit(
+            agent, text=text, tool_input=tool_input, reason="io_redirection"
+        )
+        return False, (
+            "agent-bridge config set-env: I/O redirection is not allowed"
+        )
+    if _COMMAND_OPERATOR_RE.search(sanitized):
+        _emit_config_set_env_denied_audit(
+            agent, text=text, tool_input=tool_input, reason="command_separator"
+        )
+        return False, (
+            "agent-bridge config set-env: command separators "
+            "(;, |, &, &&, ||) are not allowed"
+        )
+
+    # SHAPE — strict positional `(agb|agent-bridge) config set-env <KEY=VALUE>`.
+    try:
+        tokens = shlex.split(sanitized, posix=True, comments=False)
+    except ValueError:
+        _emit_config_set_env_denied_audit(
+            agent, text=text, tool_input=tool_input, reason="unparseable"
+        )
+        return False, "agent-bridge config set-env: unparseable command"
+    if len(tokens) < 3:
+        return False, None
+    leaf = tokens[0].rsplit("/", 1)[-1]
+    if leaf not in {"agent-bridge", "agb"}:
+        return False, None
+    if not (tokens[1] == "config" and tokens[2] == "set-env"):
+        return False, None
+
+    # Recognized as a `config set-env` invocation. Admin-only at the hook
+    # layer (the wrapper re-checks; defense-in-depth). A non-admin attempt is
+    # denied explicitly + audited.
+    if not is_admin_agent(agent):
+        _emit_config_set_env_denied_audit(
+            agent,
+            text=text,
+            tool_input=tool_input,
+            reason="non_admin_caller",
+        )
+        return False, (
+            "agent-bridge config set-env is admin-only; non-admin agents "
+            "must request env overrides through admin"
+        )
+    _emit_config_set_env_allowed_audit(agent, text=text, tool_input=tool_input)
+    return True, None
+
+
+def _emit_config_set_env_allowed_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+) -> None:
+    """Audit row for a sanctioned admin `config set-env` invocation.
+
+    Mirrors `_emit_admin_bridge_verb_audit`. The wrapper emits its own
+    before/after-hash `system_config_mutation` row on apply; this row records
+    the HOOK's allow decision so the operator can see the gate let the
+    command through (and correlate with the wrapper row by timestamp).
+    """
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "verb": "config set-env",
+        "sample": _redact_credential_token_values(truncate_text(text, 240)),
+    }
+    if tool_input is not None:
+        detail["summary"] = _redact_credential_summary(
+            tool_input_summary("Bash", tool_input)
+        )
+    write_audit(
+        "tool_policy_config_set_env_allowed",
+        agent or "unknown",
+        detail,
+    )
+
+
+def _emit_config_set_env_denied_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+    reason: str,
+) -> None:
+    """Audit row for a denied `config set-env` attempt (spoof / non-admin).
+
+    Mirrors `_emit_admin_bridge_verb_denied_shape_audit`. `reason` records
+    the specific deny (`env_assignment_prefix_spoof` / `non_admin_caller`) so
+    operators can grep smuggling attempts and the smoke can pin the shape.
+    """
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "verb": "config set-env",
+        "reason": reason,
+        "sample": _redact_credential_token_values(truncate_text(text, 240)),
+    }
+    if tool_input is not None:
+        detail["summary"] = _redact_credential_summary(
+            tool_input_summary("Bash", tool_input)
+        )
+    write_audit(
+        "tool_policy_config_set_env_denied",
+        agent or "unknown",
+        detail,
+    )
+
+
 # Issue #6607 — anchored admin bridge-verb allowlist.
 #
 # Codex r1 rejected the original "full admin bypass" / "per-agent
@@ -4532,6 +4773,18 @@ def protected_alias_reason(
     # callers still get rejected at bridge-config.py.
     if _is_config_set_wrapper(text):
         return None
+    # Issue #1734: the `config set-env` exact-shape, admin-only, anti-spoof
+    # gate. Runs BEFORE the roster / system-config / peer-shared gates because
+    # `set-env` names NO protected path in argv (the managed file is
+    # implicit), so a malformed/spoofed call would otherwise fall through to a
+    # silent allow at the peer/shared check. A sanctioned admin call is
+    # allowed (the wrapper layers its own audit); a leading VAR=value spoof or
+    # a non-admin caller is denied explicitly.
+    set_env_allowed, set_env_deny = _config_set_env_check(text, agent, tool_input)
+    if set_env_allowed:
+        return None
+    if set_env_deny is not None:
+        return set_env_deny
     if _bash_argv_references_path(text, roster_local_path()):
         if read_intent:
             # Issue #1690 r4 FIX 2: an unresolved path-spelling expansion
