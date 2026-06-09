@@ -1589,6 +1589,30 @@ def peer_reachability_step(cfg: dict[str, Any],
         _write_peer_state(conn, peer_id, new_state, new_fail, now,
                           state_changed=state_changed)
 
+        # #1732 reconnect flush (seamless resume). On a TRANSITION to `up` for a
+        # TRANSIENT peer, wake that peer's parked/backoff-waiting outbox rows so
+        # the daemon's normal deliver loop resumes them on the next tick instead
+        # of waiting on the slower (~5 min) diagnose-stuck path. This is a pure
+        # row re-arm (status retry→pending, next_attempt_ts=0, leases cleared);
+        # it NEVER delivers inline and NEVER binds — the reconcile no-bind /
+        # no-receiver-admission invariant holds. Scoped to transient peers so a
+        # persistent peer's recovery stays on its existing diagnose-stuck path
+        # (byte-identical behavior for existing installs). Best-effort + fully
+        # fail-safe: any error here is swallowed so a flush hiccup can never crash
+        # the reconcile tick or mask the FSM advance (the deliver loop and
+        # diagnose-stuck remain the durable fallback). Rooms ride the SAME
+        # classic per-peer outbox, so this covers room messages too.
+        if reachable and state_changed and new_state == PEER_STATE_UP \
+                and a2a.peer_is_transient(peer):
+            try:
+                _ob = a2a.open_outbox()
+                try:
+                    a2a.wake_peer_outbox_for_resume(_ob, peer_id, now)
+                finally:
+                    _ob.close()
+            except Exception:  # noqa: BLE001 - a flush failure never crashes the tick
+                pass
+
         # Record this probe against the peer's bounded backoff gate: a reachable
         # peer is "converged" (resets backoff, immediately re-eligible); an
         # unreachable peer is "error" (engages cap + exp backoff + jitter so its

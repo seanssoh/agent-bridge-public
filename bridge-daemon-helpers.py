@@ -1142,6 +1142,26 @@ def cmd_a2a_stuck_decide(args: argparse.Namespace) -> int:
         # already gave up — separate signal not to confuse with stuck.
         if status not in ("pending", "retry"):
             continue
+        # #1732 class-aware noise policy. The `outbox list --json` rows carry the
+        # peer's class-keyed policy (enriched in bridge-a2a.py cmd_outbox). For a
+        # transient peer (alarm_on_unreachable=False) an expected disconnect is
+        # NOT an incident — suppress the `[A2A] outbox stuck` admin task entirely.
+        # The field defaults to True (alarm on) for any persistent / unknown peer,
+        # so existing installs are byte-identical. `alarm_on_unreachable` is read
+        # explicitly as a bool: only the literal `False` suppresses (a missing /
+        # non-bool field falls through to alarming — fail-safe, never silently
+        # quiet a server-class peer).
+        if row.get("alarm_on_unreachable") is False:
+            continue
+        # Per-peer grace-window override (#1732): a peer may set a LONGER
+        # `stuck_alert_secs` (e.g. a flaky-but-still-alarmed laptop) so the alarm
+        # only fires after a generous grace window. Only a positive int override
+        # is honored; otherwise the daemon's global `stuck_secs` default applies.
+        row_stuck_secs = stuck_secs
+        raw_override = row.get("stuck_alert_secs")
+        if isinstance(raw_override, int) and not isinstance(raw_override, bool) \
+                and raw_override > 0:
+            row_stuck_secs = raw_override
         try:
             age = int(row.get("age_seconds") or 0)
         except Exception:
@@ -1153,7 +1173,7 @@ def cmd_a2a_stuck_decide(args: argparse.Namespace) -> int:
                 created_ts = 0
             if created_ts > 0:
                 age = max(0, now - created_ts)
-        if age < stuck_secs:
+        if age < row_stuck_secs:
             continue
         last_emit = ledger.get(message_id, 0)
         if last_emit and (now - last_emit) < reemit_secs:
