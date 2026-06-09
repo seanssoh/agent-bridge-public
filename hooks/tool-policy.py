@@ -2765,41 +2765,99 @@ def _expand_bridge_prefixes(word: str) -> str:
     return out
 
 
-_CWD_VERB_RE = re.compile(r"^\\?(?:builtin\s+|command\s+)?(cd|pushd|popd)\b(.*)$")
+# Non-forking cd wrappers: `command`/`builtin` (each with its own option
+# grammar) and the `time` reserved word all leave the `cd` running in THIS
+# shell, so they change the cwd. `nice`/`nohup`/`env`/subshell fork, so they do
+# NOT change the parent cwd and are intentionally absent.
+_CWD_WRAPPER_WORDS = frozenset({"command", "builtin", "time"})
 
 
 def _segment_cwd_change(stripped: str) -> tuple[str, str | None] | None:
-    """Classify a command segment's effect on the working directory — bash
-    option/prefix aware (codex r3 #11779). Returns:
-      ``("target", <dir>)`` — `cd`/`pushd <dir>` (first NON-option arg, after
-        skipping `-P`/`-L`/`-e`/`-@` options and the `--` end-of-options marker,
-        and the `builtin cd` / `command cd` prefixes).
+    """Classify a command segment's effect on the working directory by walking
+    its shlex argv — bash wrapper/option/quote aware (codex r3 #11779, r4 #11787;
+    patch #11780). Returns:
+      ``("target", <dir>)`` — `cd`/`pushd <dir>` (first NON-option arg).
       ``("home", None)``   — a bare `cd` (no arg) → `$HOME`.
       ``("reset", None)``  — `popd` (pops the dir stack to a prior, unmodelable
         cwd → reset to UNKNOWN).
       ``None``             — not a cwd-changing command.
-    """
-    match = _CWD_VERB_RE.match(stripped)
-    if not match:
+
+    Tokenizing via :func:`shlex.split` (posix) handles quote removal AND the
+    ``\\cd`` / quoted-verb spellings for free, and lets us strip the non-forking
+    wrappers (``command``/``builtin``/``time``) together with THEIR option
+    grammar (``command -p cd``, ``command -- cd``, ``builtin -- cd``, ``time -p
+    cd``) before locating the verb — so the whole static cd-grammar class is
+    closed structurally rather than form by form."""
+    try:
+        toks = shlex.split(stripped, posix=True, comments=False)
+    except ValueError:
+        toks = stripped.split()
+    i = 0
+    # Strip leading non-forking cd wrappers AND each wrapper's own options.
+    while i < len(toks) and toks[i] in _CWD_WRAPPER_WORDS:
+        i += 1
+        while i < len(toks) and toks[i].startswith("-") and toks[i] != "-":
+            end_of_opts = toks[i] == "--"
+            i += 1
+            if end_of_opts:
+                break
+    if i >= len(toks) or toks[i] not in ("cd", "pushd", "popd"):
         return None
-    verb, rest = match.group(1), match.group(2)
+    verb = toks[i]
+    i += 1
     if verb == "popd":
         return ("reset", None)
-    try:
-        toks = shlex.split(rest, posix=True, comments=False)
-    except ValueError:
-        toks = rest.split()
+    # First NON-option token after the verb is the directory.
     seen_ddash = False
-    for tok in toks:
+    while i < len(toks):
+        tok = toks[i]
+        i += 1
         if not seen_ddash and tok == "--":
             seen_ddash = True
             continue
         if not seen_ddash and tok.startswith("-") and tok != "-":
             continue  # a `cd`/`pushd` option (-P / -L / -e / -@)
-        return ("target", tok)  # first non-option token = the directory
+        return ("target", tok)
     if verb == "cd":
         return ("home", None)  # bare `cd` → $HOME
     return None  # bare `pushd` (swaps the stack top — unmodelable, ignore)
+
+
+def _apply_cwd_change(cwd: object, change: tuple[str, str | None]) -> object:
+    """Apply one :func:`_segment_cwd_change` result to the running *cwd*,
+    returning the new cwd (absolute normalized path / ``_CWD_UNKNOWN`` /
+    ``_CWD_POISONED``)."""
+    kind, target = change
+    if kind == "reset":  # popd → previous (unmodelable) cwd
+        return _CWD_UNKNOWN
+    if kind == "home":  # bare `cd` → $HOME
+        home = os.path.expanduser("~")
+        return os.path.normpath(home) if os.path.isabs(home) else _CWD_UNKNOWN
+    # kind == "target"
+    expanded = _expand_bridge_prefixes(target or "")
+    if "$" in expanded:
+        return _CWD_POISONED  # unresolved $var cd-target → bridge-suspect
+    if os.path.isabs(expanded):
+        return os.path.normpath(expanded)
+    if cwd is _CWD_POISONED:
+        return _CWD_POISONED  # relative move under a poisoned cwd stays poisoned
+    if isinstance(cwd, str):
+        return os.path.normpath(os.path.join(cwd, expanded))
+    return _CWD_UNKNOWN  # relative cd with no known base
+
+
+def _segment_candidate_words(seg: str):
+    """Yield path-candidate words from a SINGLE shell *seg*, tokenized with
+    bash quote-removal via ``shlex.split(posix=True)`` (a malformed segment
+    falls back to a raw split; the caller fail-closes a bridge-anchored
+    unparseable command separately). Reuses :func:`_alias_path_fragments`."""
+    try:
+        tokens = shlex.split(seg, posix=True, comments=False)
+    except ValueError:
+        tokens = seg.split()
+    for token in tokens:
+        for fragment in _alias_path_fragments(token):
+            yield fragment
 
 
 def _command_effective_cwd(segments: list[str]) -> object:
@@ -2825,32 +2883,8 @@ def _command_effective_cwd(segments: list[str]) -> object:
     eff: object = _CWD_UNKNOWN
     for seg in segments:
         change = _segment_cwd_change(seg.strip())
-        if change is None:
-            continue
-        kind, target = change
-        if kind == "reset":  # popd → previous (unmodelable) cwd
-            eff = _CWD_UNKNOWN
-            continue
-        if kind == "home":  # bare `cd` → $HOME
-            home = os.path.expanduser("~")
-            eff = os.path.normpath(home) if os.path.isabs(home) else _CWD_UNKNOWN
-            continue
-        # kind == "target"
-        expanded = _expand_bridge_prefixes(target or "")
-        if "$" in expanded:
-            # Unresolved $var cd-target → bridge-suspect, poison the cwd.
-            eff = _CWD_POISONED
-            continue
-        if os.path.isabs(expanded):
-            eff = os.path.normpath(expanded)
-        elif eff is _CWD_POISONED:
-            # Relative move under an already-poisoned cwd stays poisoned.
-            continue
-        elif isinstance(eff, str):
-            eff = os.path.normpath(os.path.join(eff, expanded))
-        else:
-            # Relative cd with no known base — stays UNKNOWN.
-            eff = _CWD_UNKNOWN
+        if change is not None:
+            eff = _apply_cwd_change(eff, change)
     return eff
 
 
@@ -2979,7 +3013,6 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     for piece in _COMMAND_OPERATOR_RE.split(text):
         segments.extend(_PAREN_SPLIT_RE.split(piece))
 
-    eff_cwd = _command_effective_cwd(segments)
     forbidden_dirs = _forbidden_dirs_for_suffixes(suffixes)
 
     # Fail-close a genuinely unbalanced-quote (unparseable) COMMAND that is
@@ -2996,41 +3029,47 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
         except ValueError:
             return _OBFUSCATED_SUFFIX_SENTINEL
 
-    # Pass 1 — resolve every read-candidate word against the effective cwd.
-    for raw_word in _command_path_candidate_words(segments):
-        hit = _resolved_forbidden_hit(raw_word, eff_cwd, forbidden_dirs)
-        if hit is not None:
-            return hit
-        # Relative read under a POISONED (bridge-suspect `$var`) cwd whose tail
-        # names a forbidden suffix → fail closed.
-        if eff_cwd is _CWD_POISONED:
-            poison_hit = _relative_word_under_poison(raw_word, forbidden_dirs)
-            if poison_hit is not None:
-                return poison_hit
+    # POSITIONAL cwd walk (patch r4 #11788): resolve THIS segment's read words
+    # against the CURRENT cwd, THEN apply this segment's cd change. A read sees
+    # only the `cd`s that PRECEDE it, so a trailing `cd`/`popd` back out of the
+    # forbidden tree can no longer un-anchor an earlier forbidden read
+    # (`cd $BH/shared && cat secrets/token && cd /tmp`).
+    cwd: object = _CWD_UNKNOWN
+    for seg in segments:
+        words = list(_segment_candidate_words(seg))
 
-    # Pass 2 — obfuscation fail-close, per path-candidate word (r2 model).
-    for raw_word in _command_path_candidate_words(segments):
-        if not _word_carries_obfuscation(raw_word):
-            continue
-        # 2a. Decode ANSI-C `$'…'` / backslash escapes and re-resolve: a hidden
-        # separator/segment (`$'\x2fshared\x2fsecrets'`, `secre\x74s`) surfaces
-        # via the same resolved-path check as Pass 1.
-        if _decode_obfuscated_word(raw_word) != raw_word:
-            decoded_hit = _resolved_forbidden_hit(raw_word, eff_cwd, forbidden_dirs)
-            if decoded_hit is not None:
+        # Pass 1 — resolved-path containment against the CURRENT cwd.
+        for raw_word in words:
+            hit = _resolved_forbidden_hit(raw_word, cwd, forbidden_dirs)
+            if hit is not None:
+                return hit
+            # Relative read under a POISONED (bridge-suspect `$var`) cwd whose
+            # tail names a forbidden suffix → fail closed.
+            if cwd is _CWD_POISONED:
+                poison_hit = _relative_word_under_poison(raw_word, forbidden_dirs)
+                if poison_hit is not None:
+                    return poison_hit
+
+        # Pass 2 — obfuscation fail-close, per word, against the CURRENT cwd.
+        for raw_word in words:
+            if not _word_carries_obfuscation(raw_word):
+                continue
+            # 2a. Decode ANSI-C `$'…'` / backslash escapes and re-resolve.
+            if _decode_obfuscated_word(raw_word) != raw_word:
+                decoded_hit = _resolved_forbidden_hit(raw_word, cwd, forbidden_dirs)
+                if decoded_hit is not None:
+                    return _OBFUSCATED_SUFFIX_SENTINEL
+            # 2b. Glob / command-sub fail-close iff bridge-anchored and the
+            # literal prefix-before-the-glob could select a forbidden dir.
+            if not any(anchor in raw_word for anchor in _bridge_anchor_tokens()):
+                continue
+            if _glob_prefix_reaches_forbidden_dir(raw_word, suffixes):
                 return _OBFUSCATED_SUFFIX_SENTINEL
-        # 2b. Glob / command-sub fail-close. These cannot be resolved
-        # statically, so we deny iff the word is rooted under the operator
-        # bridge home AND its literal prefix-before-the-glob could select a
-        # forbidden directory (so a benign repo `./agents/*.md` — no bridge
-        # anchor — and a read strictly inside the agent's OWN home are NOT
-        # collateral). Backtick / `$(…)` words are also caught by the existing
-        # read-intent + shell-embedding gates upstream; we fail-close here too
-        # for defense-in-depth when bridge-anchored.
-        if not any(anchor in raw_word for anchor in _bridge_anchor_tokens()):
-            continue
-        if _glob_prefix_reaches_forbidden_dir(raw_word, suffixes):
-            return _OBFUSCATED_SUFFIX_SENTINEL
+
+        # THEN apply this segment's cd change so the NEXT segment's reads see it.
+        change = _segment_cwd_change(seg.strip())
+        if change is not None:
+            cwd = _apply_cwd_change(cwd, change)
     return None
 
 

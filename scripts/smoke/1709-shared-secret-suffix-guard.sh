@@ -268,6 +268,20 @@ assert_verdict "command cd subdir"        "command cd \$BRIDGE_HOME/shared && ca
 assert_verdict "backslash cd subdir"      "\\cd \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
 assert_verdict "B peer cd -- subdir"      "cd -- \$BRIDGE_HOME/agents && cat $PEER_AGENT/MEMORY.md" "DENY"
 
+# r5 (codex #11787 + patch #11788) — the last two structural axes: wrapper
+# builtins with their own option grammar (command -p/-- cd, builtin -- cd, time
+# cd) and POSITIONAL cwd (a read while cwd is inside the tree, then a trailing
+# `cd`/`popd` back OUT, must still DENY — the read is judged at its position).
+assert_verdict "command -p cd"            "command -p cd \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
+assert_verdict "command -- cd"            "command -- cd \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
+assert_verdict "builtin -- cd"            "builtin -- cd \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
+assert_verdict "time cd"                  "time cd \$BRIDGE_HOME/shared && cat secrets/token"       "DENY"
+assert_verdict "positional cd-out &&"     "cd \$BRIDGE_HOME/shared && cat secrets/token && cd /tmp" "DENY"
+assert_verdict "positional cd-out ;"      "cd \$BRIDGE_HOME/shared; cat secrets/token; cd /tmp"     "DENY"
+assert_verdict "positional pushd-popd"    "pushd \$BRIDGE_HOME/shared >/dev/null; cat secrets/token; popd" "DENY"
+assert_verdict "positional cd .."         "cd \$BRIDGE_HOME/shared; cat secrets/token; cd .."       "DENY"
+assert_verdict "B peer positional cd-out" "cd \$BRIDGE_HOME/agents; cat $PEER_AGENT/MEMORY.md; cd /tmp" "DENY"
+
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
 # ---------------------------------------------------------------------------
@@ -277,6 +291,9 @@ assert_verdict "public wiki \${HOME}"   "cat \${HOME}/.agent-bridge/shared/wiki/
 assert_verdict "repo-style glob"        "cat ./agents/*.md"                              "ALLOW"
 assert_verdict "non-forbidden bridge read" "cat \${HOME}/.agent-bridge/state/x.md"       "ALLOW"
 assert_verdict "cd-relative public wiki" "cd \$BRIDGE_HOME && cat shared/wiki/index.md"   "ALLOW"
+# positional: a relative read AFTER a cd OUT of the bridge is not anchored -> ALLOW.
+assert_verdict "read after cd-out"       "cd /tmp && cat secrets/token"                   "ALLOW"
+assert_verdict "cd-in then wiki then out" "cd \$BRIDGE_HOME/shared && cat wiki/index.md && cd /tmp" "ALLOW"
 # r3 no-over-block — the resolution model must NOT collateral-block these:
 #   a RELATIVE forbidden-tail read with NO `cd` (relative to the agent's own
 #   cwd, which the hook can't see → unanchorable, not bridge), and a `..` that
