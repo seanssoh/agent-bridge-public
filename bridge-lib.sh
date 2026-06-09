@@ -373,6 +373,11 @@ if [[ -z "${BRIDGE_ROSTER_FILE:-}" ]]; then
   fi
 fi
 BRIDGE_ROSTER_LOCAL_FILE="${BRIDGE_ROSTER_LOCAL_FILE:-$BRIDGE_HOME/agent-roster.local.sh}"
+# Issue #1734: dedicated install env-override file written by `agb config
+# set-env`. Sourced by bridge_load_roster AFTER the roster so it is a true
+# install override, and protected by PROTECTED_GLOBS (lib/system_config_paths.py)
+# so it is not a new unprotected sourced shell file.
+BRIDGE_AGENT_ENV_LOCAL_FILE="${BRIDGE_AGENT_ENV_LOCAL_FILE:-$BRIDGE_HOME/agent-env.local.sh}"
 BRIDGE_STATE_DIR="${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}"
 # Layout marker is anchored separately from BRIDGE_STATE_DIR so v2 activation
 # never moves marker discovery. Defaults to $BRIDGE_HOME/state and is never
