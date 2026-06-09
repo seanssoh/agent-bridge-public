@@ -282,6 +282,17 @@ assert_verdict "positional pushd-popd"    "pushd \$BRIDGE_HOME/shared >/dev/null
 assert_verdict "positional cd .."         "cd \$BRIDGE_HOME/shared; cat secrets/token; cd .."       "DENY"
 assert_verdict "B peer positional cd-out" "cd \$BRIDGE_HOME/agents; cat $PEER_AGENT/MEMORY.md; cd /tmp" "DENY"
 
+# r6 (codex #11794 + patch #11795) — control-flow SCOPE: a subshell whose cd
+# bash discards at \`)\`, a pushd/popd dirstack, or \`cd -\` can restore a cwd a
+# prior cd put inside the tree; the read at that position must still DENY. The
+# scope-ambiguous fail-close re-checks each relative read against every prior cwd.
+assert_verdict "subshell discards cd"     "cd \$BRIDGE_HOME/shared; (cd /tmp); cat secrets/token"   "DENY"
+assert_verdict "subshell discards cd &&"  "cd \$BRIDGE_HOME/shared && (cd /tmp) && cat secrets/token" "DENY"
+assert_verdict "pushd-pushd-popd restore" "pushd \$BRIDGE_HOME/shared; pushd /tmp; popd; cat secrets/token" "DENY"
+assert_verdict "empty-stack popd no-op"   "cd \$BRIDGE_HOME/shared; popd; cat secrets/token"        "DENY"
+assert_verdict "cd - restores prev"       "cd \$BRIDGE_HOME; cd shared; cd - >/dev/null; cat shared/secrets/token" "DENY"
+assert_verdict "B peer subshell discard"  "cd \$BRIDGE_HOME/agents; (cd /tmp); cat $PEER_AGENT/MEMORY.md" "DENY"
+
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
 # ---------------------------------------------------------------------------
@@ -293,6 +304,12 @@ assert_verdict "non-forbidden bridge read" "cat \${HOME}/.agent-bridge/state/x.m
 assert_verdict "cd-relative public wiki" "cd \$BRIDGE_HOME && cat shared/wiki/index.md"   "ALLOW"
 # positional: a relative read AFTER a cd OUT of the bridge is not anchored -> ALLOW.
 assert_verdict "read after cd-out"       "cd /tmp && cat secrets/token"                   "ALLOW"
+# r6 no-over-block: `command -v/-V cd` is DESCRIBE/query (no cwd change); a
+# subshell read of a PUBLIC tail stays ALLOW.
+assert_verdict "command -v query"        "command -v cd \$BRIDGE_HOME/shared && cat secrets/token" "ALLOW"
+assert_verdict "command -V query"        "command -V cd \$BRIDGE_HOME/shared && cat secrets/token" "ALLOW"
+assert_verdict "subshell read wiki"      "(cd \$BRIDGE_HOME && cat shared/wiki/page.md)"  "ALLOW"
+assert_verdict "subshell-then-rel wiki"  "cd \$BRIDGE_HOME/shared; (cd /tmp); cat wiki/index.md" "ALLOW"
 assert_verdict "cd-in then wiki then out" "cd \$BRIDGE_HOME/shared && cat wiki/index.md && cd /tmp" "ALLOW"
 # r3 no-over-block — the resolution model must NOT collateral-block these:
 #   a RELATIVE forbidden-tail read with NO `cd` (relative to the agent's own

@@ -2794,10 +2794,16 @@ def _segment_cwd_change(stripped: str) -> tuple[str, str | None] | None:
         toks = stripped.split()
     i = 0
     # Strip leading non-forking cd wrappers AND each wrapper's own options.
+    # `command -v`/`-V` (codex r5 #11794) are DESCRIBE/query modes — they do NOT
+    # execute the following `cd`, so the cwd does not change.
     while i < len(toks) and toks[i] in _CWD_WRAPPER_WORDS:
+        wrapper = toks[i]
         i += 1
         while i < len(toks) and toks[i].startswith("-") and toks[i] != "-":
-            end_of_opts = toks[i] == "--"
+            opt = toks[i]
+            end_of_opts = opt == "--"
+            if wrapper == "command" and not end_of_opts and ("v" in opt or "V" in opt):
+                return None  # `command -v/-V cd …` = describe, not execute → no cwd change
             i += 1
             if end_of_opts:
                 break
@@ -2817,6 +2823,12 @@ def _segment_cwd_change(stripped: str) -> tuple[str, str | None] | None:
             continue
         if not seen_ddash and tok.startswith("-") and tok != "-":
             continue  # a `cd`/`pushd` option (-P / -L / -e / -@)
+        if tok == "-":
+            # `cd -` restores the PREVIOUS cwd (codex r5 #11794) — unmodelable in
+            # a flat walk; reset to UNKNOWN. The scope-ambiguous fail-close in
+            # `_forbidden_suffix_in_command` (it flags `cd -`) re-checks reads
+            # against every prior cwd, so a restored bridge cwd is still caught.
+            return ("reset", None)
         return ("target", tok)
     if verb == "cd":
         return ("home", None)  # bare `cd` → $HOME
@@ -3029,12 +3041,39 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
         except ValueError:
             return _OBFUSCATED_SUFFIX_SENTINEL
 
+    # Control-flow SCOPE the flat positional walk cannot model precisely: a
+    # subshell `( … )` whose cwd change bash discards at `)`, a `pushd`/`popd`
+    # dirstack, and `cd -` (restore previous cwd). When such a construct appears
+    # in a bridge-anchored command, a relative read can resolve into a forbidden
+    # tree under a cwd a PRIOR `cd` established but control-flow restored. We
+    # fail-close (patch r5 #11795 / codex r5 #11794): resolve each relative read
+    # against EVERY cwd entered earlier in the walk, not just the linear current
+    # one. (Gated on the scope-ambiguous construct so a plain `cd in; cd out;
+    # read` is NOT over-blocked — that read is genuinely in the out cwd.)
+    # Loose bridge-presence (NOT the trailing-slash `_bridge_anchor_tokens` — a
+    # `cd $BRIDGE_HOME;` target has no trailing slash): the scope fail-close only
+    # ever DENIES a read that resolves into a forbidden dir, so a broad trigger
+    # cannot over-block.
+    bridge_mentioned = (
+        "$BRIDGE_HOME" in text
+        or "${BRIDGE_HOME}" in text
+        or "/.agent-bridge" in text
+        or str(bridge_home_dir()) in text
+    )
+    scope_ambiguous = bridge_mentioned and (
+        "(" in text
+        or ")" in text
+        or re.search(r"(?:^|[;&|()\s])(?:pushd|popd)\b", text) is not None
+        or re.search(r"(?:^|[;&|()\s])\\?cd\s+-(?:[\s;&|)]|$)", text) is not None
+    )
+
     # POSITIONAL cwd walk (patch r4 #11788): resolve THIS segment's read words
     # against the CURRENT cwd, THEN apply this segment's cd change. A read sees
     # only the `cd`s that PRECEDE it, so a trailing `cd`/`popd` back out of the
     # forbidden tree can no longer un-anchor an earlier forbidden read
     # (`cd $BH/shared && cat secrets/token && cd /tmp`).
     cwd: object = _CWD_UNKNOWN
+    cwds_seen: list[str] = []
     for seg in segments:
         words = list(_segment_candidate_words(seg))
 
@@ -3049,6 +3088,12 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
                 poison_hit = _relative_word_under_poison(raw_word, forbidden_dirs)
                 if poison_hit is not None:
                     return poison_hit
+            # Scope-ambiguous fail-close: also resolve against every prior cwd.
+            if scope_ambiguous:
+                for prior in cwds_seen:
+                    prior_hit = _resolved_forbidden_hit(raw_word, prior, forbidden_dirs)
+                    if prior_hit is not None:
+                        return prior_hit
 
         # Pass 2 — obfuscation fail-close, per word, against the CURRENT cwd.
         for raw_word in words:
@@ -3070,6 +3115,10 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
         change = _segment_cwd_change(seg.strip())
         if change is not None:
             cwd = _apply_cwd_change(cwd, change)
+            # Remember every concrete cwd entered (for the scope-ambiguous
+            # fail-close — a later control-flow construct can restore any of them).
+            if isinstance(cwd, str):
+                cwds_seen.append(cwd)
     return None
 
 
