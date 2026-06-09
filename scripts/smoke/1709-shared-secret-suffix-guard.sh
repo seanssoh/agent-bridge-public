@@ -402,6 +402,13 @@ assert_verdict "brace abs ls enum"         "ls \$BRIDGE_HOME/shared/{secrets,wik
 assert_verdict "brace rel cat"             "cd \$BRIDGE_HOME/shared && cat {secrets,wiki}/token" "DENY"
 assert_verdict "brace partial member"      "cd \$BRIDGE_HOME/shared && cat sec{r,}ets/token"     "DENY"
 assert_verdict "B peer brace enum"         "cd \$BRIDGE_HOME/agents && ls {$PEER_AGENT,worker-1709}" "DENY"
+# r15 Part 1 (codex #11845 + patch #11846) — a brace whose expansion overflows the
+# cap cannot be fully inspected, so a forbidden member could lie past it. A
+# bridge-RELEVANT truncation (segment bridge-anchored, or cwd inside the bridge
+# home) fails closed; a forbidden member after a literal benign run is denied.
+assert_verdict "brace trunc bridge-cwd"    "cd \$BRIDGE_HOME/shared && cat {0..2000}/token"      "DENY"
+assert_verdict "brace trunc secret-past-cap" "cd \$BRIDGE_HOME/shared && cat {$(seq -s, 0 1099),secrets}/token" "DENY"
+assert_verdict "brace trunc abs anchored"  "cat \$BRIDGE_HOME/shared/{0..2000}/token"            "DENY"
 
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
@@ -450,6 +457,15 @@ assert_verdict "brace public members"      "cd \$BRIDGE_HOME/shared && cat {wiki
 assert_verdict "brace comma-less literal"  "cd \$BRIDGE_HOME/shared && cat {wiki}/index.md"      "ALLOW"
 assert_verdict "brace off bridge cwd"      "cd /tmp && cat {secrets,wiki}/token"                 "ALLOW"
 assert_verdict "brace gated cd-out"        "cd \$BRIDGE_HOME/shared && cd /tmp && cat {secrets,wiki}/token" "ALLOW"
+# r15 Part 2 (codex #11845) — bash does NOT brace-expand QUOTED/ESCAPED braces, so
+# they are literal paths (nonexistent) → ALLOW; and an off-bridge / no-cd brace
+# truncation is not bridge-relevant → ALLOW.
+assert_verdict "squote brace literal"      "cd \$BRIDGE_HOME/shared && cat 'sec{r,}ets/token'"   "ALLOW"
+assert_verdict "dquote brace literal"      "cd \$BRIDGE_HOME/shared && cat \"sec{r,}ets/token\"" "ALLOW"
+assert_verdict "escaped brace literal"     "cd \$BRIDGE_HOME/shared && cat sec\\{r,\\}ets/token" "ALLOW"
+assert_verdict "squote whole bridge path"  "cat '\$BRIDGE_HOME/shared/{secrets,wiki}/token'"     "ALLOW"
+assert_verdict "brace trunc off-bridge"    "cd /tmp && cat {0..2000}/token"                      "ALLOW"
+assert_verdict "brace trunc no-cd echo"    "echo {0..2000}"                                      "ALLOW"
 # r3 no-over-block — the resolution model must NOT collateral-block these:
 #   a RELATIVE forbidden-tail read with NO `cd` (relative to the agent's own
 #   cwd, which the hook can't see → unanchorable, not bridge), and a `..` that

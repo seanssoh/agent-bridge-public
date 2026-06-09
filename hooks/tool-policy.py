@@ -2908,14 +2908,52 @@ def _ansic_decoded_segment(seg: str) -> str | None:
     return _ANSIC_RE.sub(_lit, seg)
 
 
+def _unquoted_comma_split(body: str) -> list[str] | None:
+    """Split a brace *body* on its top-level UNQUOTED commas (respecting ``'``,
+    ``"``, and ``\\`` — bash does not treat a quoted/escaped comma as an
+    alternative separator). Returns the parts iff at least one unquoted comma was
+    seen (empty members allowed: ``r,`` → ``['r', '']``), else ``None``."""
+    parts: list[str] = []
+    cur: list[str] = []
+    quote: str | None = None
+    esc = False
+    saw = False
+    for ch in body:
+        if esc:
+            cur.append(ch)
+            esc = False
+            continue
+        if ch == "\\" and quote != "'":
+            cur.append(ch)
+            esc = True
+            continue
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            cur.append(ch)
+            quote = ch
+            continue
+        if ch == ",":
+            saw = True
+            parts.append("".join(cur))
+            cur = []
+            continue
+        cur.append(ch)
+    parts.append("".join(cur))
+    return parts if saw else None
+
+
 def _brace_alternatives(body: str) -> list[str] | None:
     """The bash brace-expansion alternatives of an INNERMOST ``{body}`` (no
-    nested ``{``): a top-level comma list (``a,b,c`` — empty members allowed, so
-    ``r,`` → ``['r', '']``), an integer range ``m..n[..step]``, or a single-char
-    range ``a..z``. Returns ``None`` when *body* is not an expandable brace (a
-    plain ``{foo}`` bash leaves literal)."""
-    if "," in body:
-        return body.split(",")
+    nested unquoted ``{``): a top-level unquoted comma list, an integer range
+    ``m..n[..step]``, or a single-char range ``a..z``. Returns ``None`` when
+    *body* is not an expandable brace (a plain ``{foo}`` bash leaves literal)."""
+    parts = _unquoted_comma_split(body)
+    if parts is not None:
+        return parts
     m = re.fullmatch(r"(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?", body)
     if m:
         lo, hi = int(m.group(1)), int(m.group(2))
@@ -2923,98 +2961,151 @@ def _brace_alternatives(body: str) -> list[str] | None:
         if step == 0:
             step = 1
         rng = range(lo, hi + 1, step) if lo <= hi else range(lo, hi - 1, -step)
-        return [str(x) for x in rng][:256]
+        # Bound generation ABOVE the segment-expansion cap (1024) — slicing a
+        # range is O(1) so `{0..10000000}` never builds millions — so an
+        # over-cap range still overflows `_brace_expand_segment` and is signalled
+        # as truncated there (codex #11845 r15) rather than silently shortened.
+        return [str(x) for x in rng[:2048]]
     m = re.fullmatch(r"([A-Za-z])\.\.([A-Za-z])", body)
     if m:
         lo, hi = ord(m.group(1)), ord(m.group(2))
         seq = range(lo, hi + 1) if lo <= hi else range(lo, hi - 1, -1)
-        return [chr(x) for x in seq][:256]
+        return [chr(x) for x in seq[:2048]]
     return None
 
 
-def _brace_expand(word: str, cap: int = 1024) -> list[str]:
-    """Statically expand bash brace alternation/ranges in *word* to the finite
-    set of literal strings bash would produce (codex #11837 r13), bounded to
-    *cap* results. ``cat {secrets,wiki}/token`` → ``['secrets/token',
-    'wiki/token']`` so the forbidden member flows through the normal resolution.
-    ``${var}`` parameter expansion and comma-less single braces are left intact.
-    Expands innermost-first, iterated, so nested/multiple braces resolve
-    (cartesian). On hitting *cap* it returns what it has — the obfuscation
-    fail-close still covers a pathological brace."""
-    if "{" not in word:
-        return [word]
-    out = [word]
-    for _ in range(24):  # depth bound (nested/sequential braces)
+def _find_unquoted_innermost_brace(s: str):
+    """Return ``(start, close, alternatives)`` for the leftmost INNERMOST
+    expandable ``{…}`` in *s*, or ``None``. QUOTE-AWARE (codex #11845 r14): a
+    ``{``/``,``/``}`` inside ``'…'`` / ``"…"`` or after a ``\\`` is literal — bash
+    does not brace-expand quoted/escaped braces — and a ``${…}`` parameter
+    expansion is skipped. *start*..*close* index the ``{``..``}``."""
+    quote: str | None = None
+    esc = False
+    last_open: int | None = None
+    for idx, ch in enumerate(s):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and quote != "'":
+            esc = True
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch == "{" and not (idx > 0 and s[idx - 1] == "$"):
+            last_open = idx
+        elif ch == "}" and last_open is not None:
+            alts = _brace_alternatives(s[last_open + 1:idx])
+            if alts is not None:
+                return (last_open, idx, alts)
+            last_open = None
+    return None
+
+
+def _brace_expand_segment(s: str, cap: int = 1024) -> tuple[list[str], bool]:
+    """Statically expand bash brace alternation/ranges in the raw segment *s*
+    (BEFORE quote removal, so quoted/escaped braces are NOT expanded — codex
+    #11845 r14 Finding 2), returning ``(expansions, truncated)``. ``truncated``
+    is ``True`` when the cap or the depth bound is hit so a forbidden member
+    could lie past the inspected set — the caller fail-closes a bridge-relevant
+    truncation (codex #11845 / patch #11846 r14 Finding 1) rather than silently
+    dropping it."""
+    if "{" not in s:
+        return [s], False
+    out = [s]
+    truncated = False
+    for _ in range(24):  # depth bound (nested / sequential braces)
         nxt: list[str] = []
         expanded = False
         for w in out:
-            seg = _leftmost_innermost_brace(w)
-            if seg is None:
+            found = _find_unquoted_innermost_brace(w)
+            if found is None:
                 nxt.append(w)
                 continue
             expanded = True
-            pre, alts, post = seg
+            start, close, alts = found
+            pre, post = w[:start], w[close + 1:]
             for alt in alts:
                 nxt.append(pre + alt + post)
                 if len(nxt) >= cap:
+                    truncated = True
                     break
-            if len(nxt) >= cap:
+            if truncated:
                 break
         out = nxt
-        if not expanded or len(out) >= cap:
+        if not expanded:
             break
-    return out
+        if truncated:
+            break
+    else:
+        # Loop ran the full depth bound with braces possibly remaining.
+        if any(_find_unquoted_innermost_brace(w) is not None for w in out):
+            truncated = True
+    return out, truncated
 
 
-def _leftmost_innermost_brace(w: str):
-    """Return ``(prefix, alternatives, suffix)`` for the leftmost INNERMOST
-    expandable ``{…}`` in *w* (a brace whose body has no nested ``{`` and is a
-    comma-list or range), preferring a ``$``-immediately-before brace to be
-    SKIPPED (``${var}`` is parameter expansion, not brace expansion). ``None``
-    when no expandable brace remains."""
-    n = len(w)
-    i = 0
-    while i < n:
-        if w[i] == "{" and not (i > 0 and w[i - 1] == "$"):
-            j = i + 1
-            inner = False
-            while j < n and w[j] != "}":
-                if w[j] == "{":
-                    inner = True
-                    break
-                j += 1
-            if j < n and w[j] == "}" and not inner:
-                alts = _brace_alternatives(w[i + 1:j])
-                if alts is not None:
-                    return (w[:i], alts, w[j + 1:])
-        i += 1
-    return None
+def _brace_truncation_bridge_relevant(
+    seg: str,
+    read_cwds: list[object],
+    forbidden_dirs: list[tuple[str, str]],
+) -> bool:
+    """True iff a brace-expansion truncation in *seg* is BRIDGE-RELEVANT and must
+    fail closed (codex #11845 / patch #11846 r14): the segment is bridge-anchored,
+    OR the read runs under a cwd that is INSIDE the bridge home (a hidden post-cap
+    member — a short relative tail or a ``..`` climb — could resolve into a
+    forbidden subtree there). A truncation off the bridge (``echo {1..100000}``,
+    or under ``/tmp``) is NOT relevant → not over-blocked. *forbidden_dirs* is
+    unused but kept for call-site symmetry."""
+    del forbidden_dirs  # relevance is bridge-home containment, not a specific dir
+    if any(anchor in seg for anchor in _bridge_anchor_tokens()):
+        return True
+    try:
+        home = str(bridge_home_dir())
+    except Exception:  # noqa: BLE001
+        return False
+    for c in read_cwds:
+        if not isinstance(c, str) or c is _CWD_POISONED:
+            continue
+        if c == home or c.startswith(home + os.sep):
+            return True
+    return False
 
 
-def _segment_candidate_words(seg: str):
-    """Yield path-candidate words from a SINGLE shell *seg*, tokenized with
-    bash quote-removal via ``shlex.split(posix=True)`` (a malformed segment
-    falls back to a raw split; the caller fail-closes a bridge-anchored
-    unparseable command separately). Reuses :func:`_alias_path_fragments`.
+def _segment_candidate_words(seg: str) -> tuple[list[str], bool]:
+    """Return ``(fragments, brace_truncated)`` — the path-candidate words of a
+    SINGLE shell *seg*, plus whether a brace expansion overflowed the cap.
 
-    When the segment carries ANSI-C ``$'…'`` quoting, ALSO yield the candidates
-    from the ANSI-C-decoded segment — ``shlex`` mangles ``$'secrets'`` into
-    ``$secrets`` and would hide the decoded path (codex #11827 r11). Each token
-    is brace-expanded (``{secrets,wiki}/token`` → both members) so a finite brace
-    alternation cannot hide a forbidden member (codex #11837 r13)."""
+    Each variant (the raw segment, and — when it carries ANSI-C ``$'…'`` quoting
+    — the ANSI-C-decoded segment, codex #11827 r11) is brace-expanded QUOTE-AWARE
+    at the segment level (codex #11837 r13 / #11845 r14), THEN ``shlex``-tokenized
+    with bash quote-removal (a malformed segment falls back to a raw split; the
+    caller fail-closes a bridge-anchored unparseable command separately).
+    ``shlex`` mangles ``$'secrets'`` → ``$secrets`` and removes quotes, so brace
+    expansion MUST precede it to avoid both hiding a decoded path and expanding a
+    quoted brace bash would leave literal."""
     variants = [seg]
     decoded_seg = _ansic_decoded_segment(seg)
     if decoded_seg is not None:
         variants.append(decoded_seg)
+    fragments: list[str] = []
+    truncated = False
     for variant in variants:
-        try:
-            tokens = shlex.split(variant, posix=True, comments=False)
-        except ValueError:
-            tokens = variant.split()
-        for token in tokens:
-            for braced in _brace_expand(token):
-                for fragment in _alias_path_fragments(braced):
-                    yield fragment
+        expansions, trunc = _brace_expand_segment(variant)
+        truncated = truncated or trunc
+        for expansion in expansions:
+            try:
+                tokens = shlex.split(expansion, posix=True, comments=False)
+            except ValueError:
+                tokens = expansion.split()
+            for token in tokens:
+                for fragment in _alias_path_fragments(token):
+                    fragments.append(fragment)
+    return fragments, truncated
 
 
 def _command_effective_cwd(segments: list[str]) -> object:
@@ -3388,7 +3479,7 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
             sticky_cwds.extend(chain_cwds)
             chain_cwds = []
 
-        words = list(_segment_candidate_words(seg))
+        words, brace_truncated = _segment_candidate_words(seg)
         # The cwds this read may actually run in: the linear (all-success) cwd,
         # every sticky fail-branch (always), and the current chain's fail-branches
         # unless this read is `&&`-gated. `scope_ambiguous` (subshell/pushd/cd-)
@@ -3398,6 +3489,16 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
         read_cwds.extend(sticky_cwds)
         if (not gated) or scope_ambiguous:
             read_cwds.extend(chain_cwds)
+
+        # A brace expansion that overflowed the cap cannot be fully inspected, so
+        # a forbidden member could lie past the truncation (codex #11845 / patch
+        # #11846 r14). Fail closed when bridge-RELEVANT — the segment is
+        # bridge-anchored, or the read runs under a cwd that CONTAINS a forbidden
+        # subtree — so `echo {1..100000}` off the bridge stays ALLOW.
+        if brace_truncated and _brace_truncation_bridge_relevant(
+            seg, read_cwds, forbidden_dirs
+        ):
+            return _OBFUSCATED_SUFFIX_SENTINEL
 
         for raw_word in words:
             # Pass 1 — resolved-path containment against every cwd this read may
