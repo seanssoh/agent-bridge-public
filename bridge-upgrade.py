@@ -166,50 +166,113 @@ def conflict_backup_path(live_path: Path) -> Path:
     return live_path.with_name(f"{live_path.name}.upgrade-conflict")
 
 
-# Issue #1638: settings.json `merge_required` files routinely text-conflict on
-# two purely-cosmetic axes even when the rendered hook SET is identical:
+# Issue #1638 / #1675 / #1694: settings.json `merge_required` files routinely
+# text-conflict on purely-cosmetic axes even when the rendered hook SET is
+# identical:
 #   (1) hook-event group ORDER differs (e.g. live lists `inbox-auto-drain`
-#       before `session-stop`; upstream lists them the other way), and
-#   (2) the python interpreter token differs (`python3` vs `/usr/bin/python3`)
-#       inside a hook `command` string.
-# Neither changes behavior, but `git merge-file` is line-oriented and writes a
-# spurious `.upgrade-conflict` on every cm-prod iso v2 upgrade. The helpers
-# below canonicalize ONLY those two axes so `apply_live` can short-circuit a
-# cosmetic-only settings diff to `keep_live` (preserve the operator's file as
-# is) instead of forcing a manual conflict. The normalization is deliberately
-# surgical — a real hook add/remove/retiming still falls through to the
-# unchanged conflict path.
+#       before `session-stop`; upstream lists them the other way),
+#   (2) the python interpreter token differs (`python3` vs `/usr/bin/python3`
+#       vs Homebrew's `/opt/homebrew/bin/python3`) inside a hook `command`, and
+#   (3) the hook-script path ARGUMENT is `~/.agent-bridge/hooks/<x>` in the
+#       tracked template but the rendered live file carries the `~`-expanded
+#       absolute form (`<BRIDGE_HOME>/hooks/<x>`).
+# Axes (2)+(3) are exactly the two reconciliations `shared_settings_rerender`
+# performs after the merge — the render is authoritative for settings.json and
+# always produces the correct file — so a diff that consists ONLY of these is a
+# render-owned no-op. But `git merge-file` is line-oriented and writes a
+# spurious `.upgrade-conflict` on every macOS/Homebrew (and iso v2) hook-region
+# upgrade. The helpers below canonicalize ONLY those axes so `apply_live` can
+# short-circuit such a cosmetic-only settings diff to `keep_live` (the render
+# fixes up the live file right after) instead of forcing a manual conflict. The
+# normalization is deliberately surgical — a real hook add/remove/retiming, or a
+# genuinely operator-modified hook command, still falls through to the unchanged
+# conflict path.
 _SETTINGS_CONFLICT_BASENAME = "settings.json"
 # Closed allowlist of interpreter tokens treated as cosmetically equivalent.
-# Issue #1638 names exactly ONE cosmetic axis: the bridge renders the same hook
-# with either bare `python3` or `/usr/bin/python3` depending on host, and the
-# two are equivalent on the target. We deliberately do NOT generalize beyond
-# these two literals (codex #1638 review, three rounds): a bare `python` /
-# `python2`, a different minor version (`python3.10` vs `python3.11`), a venv /
-# relative interpreter, or any other absolute path is a runtime-RELEVANT change
-# the operator should see, so it must NOT be collapsed to cosmetic. Anything
-# outside this set falls through to the real merge/conflict path unchanged.
-_COSMETIC_PYTHON_INTERPRETERS = frozenset({"python3", "/usr/bin/python3"})
+# Issue #1638 named two literals (`python3`, `/usr/bin/python3`); Issue #1675
+# adds Homebrew's `/opt/homebrew/bin/python3`, which the render emits on
+# Homebrew-python macOS hosts and which is equivalent to the system interpreter
+# on the target. We deliberately do NOT generalize beyond these literals (codex
+# #1638 review, three rounds): a bare `python` / `python2`, a different minor
+# version (`python3.10` vs `python3.11`), a venv / relative interpreter, or any
+# other absolute path is a runtime-RELEVANT change the operator should see, so
+# it must NOT be collapsed to cosmetic. Anything outside this set falls through
+# to the real merge/conflict path unchanged.
+_COSMETIC_PYTHON_INTERPRETERS = frozenset(
+    {"python3", "/usr/bin/python3", "/opt/homebrew/bin/python3"}
+)
+# The bridge-hooks directory segment the render rewrites. The tracked template
+# stores `~/.agent-bridge/hooks/<script>`; `_normalize_bridge_hook_paths`
+# (bridge-hooks.py) expands `~/.agent-bridge/hooks/` → `<BRIDGE_HOME>/hooks/` at
+# render time, so the live command carries an absolute prefix the template never
+# had. Issue #1694: canonicalize BOTH prefixes to a single placeholder, keeping
+# the script BASENAME intact — so `~/.agent-bridge/hooks/session-stop.py` and
+# `/Users/x/.agent-bridge/hooks/session-stop.py` collapse to the same token,
+# while two genuinely-different hook scripts (different basename) still differ.
+_COSMETIC_HOOKS_DIR_SEGMENT = "/hooks/"
+_COSMETIC_HOOKS_DIR_PLACEHOLDER = "\x00hooks\x00/"
+
+
+def _canonicalize_hook_path_arg(tail: str) -> str:
+    """Collapse the render-owned bridge-hooks directory prefix in a path arg.
+
+    Issue #1694: the tracked template stores a hook script as
+    `~/.agent-bridge/hooks/<script>`, but the render expands `~` → the absolute
+    `<BRIDGE_HOME>/hooks/<script>` (`_normalize_bridge_hook_paths`,
+    bridge-hooks.py). That `~`-vs-absolute difference is a render-owned no-op,
+    yet it makes `live != base` on the command line and forces a spurious
+    text-merge conflict. Here we rewrite BOTH the template prefix
+    (`~/.agent-bridge/hooks/`) and the render-expanded absolute form
+    (`<abs>/.agent-bridge/hooks/`) to a single placeholder, preserving the
+    script BASENAME so two genuinely-different hook scripts still differ.
+
+    The match is deliberately anchored on the managed `.agent-bridge/hooks/`
+    segment (default `BRIDGE_HOME`): a hook pointed at some unrelated `/hooks/`
+    directory, or a non-default `BRIDGE_HOME` whose render prefix does not carry
+    `.agent-bridge`, is left untouched and still surfaces as a real diff.
+    """
+    # The render replaces the WHOLE `~/.agent-bridge/hooks/` prefix with
+    # `<BRIDGE_HOME>/hooks/`, so for both the template and rendered forms the
+    # only invariant tail is the script basename. Collapse to a single
+    # placeholder + the remainder after the `.agent-bridge/hooks/` segment in
+    # BOTH cases (symmetric) so a template arg and its rendered absolute twin
+    # canonicalize identically. The `~`-rooted template is just the absolute
+    # form with a `~` home, so the same segment search handles both.
+    for marker in (
+        "~/.agent-bridge" + _COSMETIC_HOOKS_DIR_SEGMENT,
+        "/.agent-bridge" + _COSMETIC_HOOKS_DIR_SEGMENT,
+    ):
+        idx = tail.find(marker)
+        if idx != -1:
+            rest = tail[idx + len(marker):]
+            return _COSMETIC_HOOKS_DIR_PLACEHOLDER + rest
+    return tail
 
 
 def _canonicalize_hook_command(command: str) -> str:
-    """Normalize the python interpreter prefix of a hook command string.
+    """Normalize the cosmetic axes of a hook command string.
 
-    Splits off the first whitespace-delimited token; if it is one of the closed
-    allowlist of cosmetically-equivalent python3 interpreters (bare `python3` or
-    `/usr/bin/python3`), rewrite it to the canonical `python3` and rejoin the
-    remainder verbatim. Every other command — `bash …`, bare `python`/`python2`,
-    a minor-version-pinned `python3.11`, a venv/relative interpreter, any other
-    absolute path — is returned unchanged so a runtime-relevant interpreter
-    change still surfaces as a real conflict.
+    Splits off the first whitespace-delimited token (the interpreter); if it is
+    one of the closed allowlist of cosmetically-equivalent python3 interpreters
+    (bare `python3`, `/usr/bin/python3`, or Homebrew's
+    `/opt/homebrew/bin/python3` — Issue #1675), rewrite it to the canonical
+    `python3`. The remainder (the script path argument) is then run through
+    `_canonicalize_hook_path_arg`, which collapses the render-owned
+    `~`-vs-absolute bridge-hooks prefix (Issue #1694).
+
+    Every other interpreter — `bash …`, bare `python`/`python2`, a
+    minor-version-pinned `python3.11`, a venv/relative interpreter, any other
+    absolute path — leaves the interpreter token unchanged so a runtime-relevant
+    interpreter change still surfaces as a real conflict; the path-arg
+    normalization still applies so a `bash ~/.agent-bridge/hooks/…` vs
+    `bash <abs>/…` difference is also collapsed.
     """
     stripped = command.lstrip()
     if not stripped:
         return command
     head, sep, tail = stripped.partition(" ")
-    if head in _COSMETIC_PYTHON_INTERPRETERS:
-        return "python3" + sep + tail
-    return stripped
+    interpreter = "python3" if head in _COSMETIC_PYTHON_INTERPRETERS else head
+    return interpreter + sep + _canonicalize_hook_path_arg(tail)
 
 
 def _canonicalize_settings_hooks(parsed: Any) -> Any:
