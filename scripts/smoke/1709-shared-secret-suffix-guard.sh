@@ -322,6 +322,18 @@ assert_verdict "cmd && cd-in union"       "grep x f && cd \$BRIDGE_HOME/shared; 
 assert_verdict "cd/tmp && cd-in chain"    "cd /tmp && cd \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
 assert_verdict "B peer true && cd-in"     "true && cd \$BRIDGE_HOME/agents; cat $PEER_AGENT/MEMORY.md" "DENY"
 
+# r9 (patch #11806) — `&&`/`||` CHAIN short-circuit precedence: a cd's execution
+# depends on the running boolean of the WHOLE chain, not the immediate
+# predecessor. `false && true || cd …` runs the cd (false&&true short-circuits
+# to false → || runs). A chain that genuinely skips the cd stays ALLOW.
+assert_verdict "false&&true||cd-in"       "false && true || cd \$BRIDGE_HOME/shared; cat secrets/token" "DENY"
+assert_verdict "true||false&&cd-in"       "true || false && cd \$BRIDGE_HOME/shared; cat secrets/token" "DENY"
+assert_verdict ":||false&&cd-in"          ": || false && cd \$BRIDGE_HOME/shared; cat secrets/token"    "DENY"
+assert_verdict "chain && read"            "false && true || cd \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
+assert_verdict "B peer chain cd-in"       "true || false && cd \$BRIDGE_HOME/agents; cat $PEER_AGENT/MEMORY.md" "DENY"
+assert_verdict "chain skips cd (&&-false)" "true && false && cd \$BRIDGE_HOME/shared; cat secrets/token" "ALLOW"
+assert_verdict "chain skips cd (||-true)"  "false || true || cd \$BRIDGE_HOME/shared; cat secrets/token" "ALLOW"
+
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
 # ---------------------------------------------------------------------------

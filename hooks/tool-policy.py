@@ -3082,24 +3082,42 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     #             MAY run, so model BOTH branches: record its target in
     #             `cwds_seen` + force the scope-ambiguous read check, but do NOT
     #             commit the linear cwd (the skip branch keeps the prior cwd).
+    # Evaluate the `&&`/`||` chain left-to-right with SHORT-CIRCUIT semantics
+    # (patch r8 #11806): a segment's `cd` execution depends on the running exit
+    # status of the WHOLE chain, not just the immediate predecessor. `false &&
+    # true || cd …` runs the cd (false&&true short-circuits to false → ||cd
+    # runs). `running` is the chain's exit so far (True/False/None=unknown),
+    # reset at `;`/`&`/`|`/newline. The bounded boolean grammar (true/false/:/!
+    # + &&/||) converges, unlike the open cwd grammar.
     seg_specs: list[tuple[str, str]] = []
     prev_op: str | None = None
-    prev_seg = ""
+    running: bool | None = None
+    chain_start = True
     for part in re.split(r"(&&|\|\||\||;|&|\n)", text):
         if part in ("&&", "||", "|", ";", "&", "\n"):
             prev_op = part
+            if part not in ("&&", "||"):
+                chain_start = True  # `;`/`&`/`|`/newline end the conditional chain
+                running = None
             continue
-        if prev_op in ("&&", "||"):
-            truth = _literal_truth(prev_seg)
-            if prev_op == "&&":
-                disp = "skip" if truth is False else ("exec" if truth is True else "union")
-            else:  # "||"
-                disp = "skip" if truth is True else ("exec" if truth is False else "union")
+        if chain_start:
+            runs: bool | None = True
+        elif prev_op == "&&":
+            runs = True if running is True else (False if running is False else None)
+        elif prev_op == "||":
+            runs = True if running is False else (False if running is True else None)
         else:
-            disp = "exec"
+            runs = True
+        disp = "exec" if runs is True else ("skip" if runs is False else "union")
         for sub in _PAREN_SPLIT_RE.split(part):
             seg_specs.append((disp, sub))
-        prev_seg = part
+        # Advance the running exit status for the next chained segment.
+        if runs is True:
+            running = _literal_truth(part)  # this segment's statically-known exit
+        elif runs is None:
+            running = None  # maybe-ran / unknown exit
+        # runs is False → short-circuited, running unchanged.
+        chain_start = False
 
     forbidden_dirs = _forbidden_dirs_for_suffixes(suffixes)
 
