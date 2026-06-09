@@ -3010,42 +3010,88 @@ def _has_leading_env_assignment(text: str) -> bool:
     return bool(_LEADING_ENV_ASSIGN_RE.match(text))
 
 
-def _first_stage_is_config_set_env(text: str) -> bool:
-    """True iff the FIRST command stage of *text* is `… config set-env …`.
+def _has_prefix_command_wrapper(text: str) -> bool:
+    """True iff the first command stage is wrapped by a prefix command.
 
-    "First stage" = the text up to the first shell separator
-    (`_COMMAND_OPERATOR_RE`). We strip a leading `VAR=value` env-assignment
-    prefix (which the shell would treat as a per-command env override) before
-    inspecting the command word, so a `BRIDGE_X=y agb config set-env …` spoof
-    is still RECOGNIZED as a set-env attempt (and therefore denied below
-    rather than falling through). Fail-closed on unparseable input: if shlex
-    rejects the stage, we return False (the unparseable command is handled by
-    the generic gates, not silently allowed by this carve-out).
-
-    This is the RECOGNITION predicate — it intentionally accepts the
-    spoof/smuggle shapes so the caller can DENY them. The narrower SANCTIONED
-    shape (no separators / embeddings / redirects / leading assignment, admin
-    caller) is checked separately by the caller.
+    `env [-i|-u VAR|--] [VAR=value ...] agb config set-env`, or the same via
+    `command`/`exec`/`nice`/`stdbuf`/… — a per-command env-override (or
+    leaf-hiding) vector that seeds `BRIDGE_CALLER_SOURCE` / `BRIDGE_AGENT_ID`
+    into the wrapper's process env to spoof the trust gate. No sanctioned
+    set-env runs through a prefix command, so any prefix-wrapped set-env is a
+    spoof. Detected on the first stage, after stripping leading bare `VAR=value`
+    tokens (the prefix command may itself be preceded by them). Fail-closed:
+    unparseable input returns False (handled by the generic gates).
     """
-    if "set-env" not in text:
-        return False
     first_stage = _COMMAND_OPERATOR_RE.split(text, maxsplit=1)[0]
     scan = _SAFE_REDIRECT_RE.sub(" ", first_stage)
     try:
         toks = shlex.split(scan, posix=True, comments=False)
     except ValueError:
         return False
-    # Drop leading `VAR=value` env-assignment tokens.
     while toks and "=" in toks[0] and _LEADING_ENV_ASSIGN_RE.match(toks[0] + " "):
         toks.pop(0)
-    if len(toks) < 3:
+    if not toks:
         return False
-    leaf = toks[0].rsplit("/", 1)[-1]
-    return (
-        leaf in {"agent-bridge", "agb"}
-        and toks[1] == "config"
-        and toks[2] == "set-env"
-    )
+    return toks[0].rsplit("/", 1)[-1] in _ENV_PREFIX_COMMANDS
+
+
+# Prefix-command wrappers that can carry / pass through a per-command env (or
+# simply hide the real command leaf from first-token inspection): the `env`
+# utility plus exec/command/nice/stdbuf/nohup/… A `config set-env` invocation
+# reached through ANY of these must be RECOGNIZED so the caller can DENY it —
+# `set-env` has no protected-path argv backstop (unlike `config set`), so the
+# set-env gate is the only boundary (#11710 + patch write-gate #11711).
+_ENV_PREFIX_COMMANDS = frozenset({
+    "env", "command", "exec", "nice", "stdbuf", "nohup", "setsid",
+    "timeout", "ionice", "chrt", "taskset",
+})
+
+
+def _strip_leading_env_and_prefix(toks: list[str]) -> list[str]:
+    """Drop leading `VAR=value` env-assignments and prefix-command wrappers."""
+    toks = list(toks)
+    progress = True
+    while progress and toks:
+        progress = False
+        while toks and "=" in toks[0] and _LEADING_ENV_ASSIGN_RE.match(toks[0] + " "):
+            toks.pop(0)
+            progress = True
+        if toks and toks[0].rsplit("/", 1)[-1] in _ENV_PREFIX_COMMANDS:
+            toks.pop(0)
+            progress = True
+    return toks
+
+
+def _config_set_env_attempt_present(text: str) -> bool:
+    """True iff ANY command stage of *text* invokes `… config set-env …`.
+
+    Recognition is deliberately BROAD and fail-closed: it scans every
+    separator-split stage (`;`, `&&`, `||`, `|`, `&`) and, within each stage,
+    strips leading `VAR=value` env-assignments AND a leading prefix-command
+    (`env`, `command`, `exec`, `nice`, `stdbuf`, …) before inspecting the
+    command leaf. If ANY stage is a `config set-env`, the whole command is
+    RECOGNIZED so the caller's teeth DENY every prefixed / multi-stage /
+    env-wrapped form. First-stage-only recognition missed `env VAR=v agb …`,
+    `export VAR=v; agb …`, and `… && agb …` shapes that all seed the wrapper's
+    trust env — privilege-escalating set-env from admin-only to any Bash agent
+    (#11710 P1 + patch write-gate #11711). Unparseable stages are skipped
+    (handled by the generic gates), never silently allowed.
+    """
+    if "set-env" not in text:
+        return False
+    for stage in _COMMAND_OPERATOR_RE.split(text):
+        scan = _SAFE_REDIRECT_RE.sub(" ", stage)
+        try:
+            toks = shlex.split(scan, posix=True, comments=False)
+        except ValueError:
+            continue
+        toks = _strip_leading_env_and_prefix(toks)
+        if (len(toks) >= 3
+                and toks[0].rsplit("/", 1)[-1] in {"agent-bridge", "agb"}
+                and toks[1] == "config"
+                and toks[2] == "set-env"):
+            return True
+    return False
 
 
 def _config_set_env_check(
@@ -3074,7 +3120,7 @@ def _config_set_env_check(
     # If not, this is not our verb — fall through unchanged. From here on,
     # EVERY exit is an explicit allow/deny (never a silent fall-through), so a
     # recognized attempt cannot leak to the peer/shared gate.
-    if not _first_stage_is_config_set_env(text):
+    if not _config_set_env_attempt_present(text):
         return False, None
 
     # TEETH 1 — leading `VAR=value` env-assignment prefix is a spoof of the
@@ -3090,6 +3136,24 @@ def _config_set_env_check(
             "agent-bridge config set-env: a leading VAR=value env-assignment "
             "prefix is not allowed (anti-spoof of BRIDGE_CALLER_SOURCE / "
             "BRIDGE_AGENT_ID)"
+        )
+
+    # TEETH 1b — a prefix-command wrapper (`env`/`command`/`exec`/`nice`/… agb
+    # config set-env) is the same trust-env spoof as a bare VAR=value prefix,
+    # via the env(1) binary (or simply hides the real leaf). The bare-assignment
+    # tooth above misses it (the leading token is `env`, not `VAR=`), so deny it
+    # explicitly (#11710 P1 + patch write-gate #11711).
+    if _has_prefix_command_wrapper(text):
+        _emit_config_set_env_denied_audit(
+            agent,
+            text=text,
+            tool_input=tool_input,
+            reason="prefix_command_wrapper_spoof",
+        )
+        return False, (
+            "agent-bridge config set-env: invoking via a prefix command "
+            "(env, command, exec, nice, …) is not allowed (anti-spoof of "
+            "BRIDGE_CALLER_SOURCE / BRIDGE_AGENT_ID)"
         )
 
     # TEETH 2 — shell embeddings / redirections / separators. The wrapper

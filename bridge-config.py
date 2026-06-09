@@ -541,7 +541,7 @@ def read_managed_env(path: Path) -> dict[str, str]:
     list is dropped defensively.
     """
     result: dict[str, str] = {}
-    if not path.exists():
+    if not path.exists():  # noqa: raw-pathlib-controller-only
         return result
     try:
         text = path.read_text(encoding="utf-8")
@@ -571,7 +571,7 @@ def write_managed_env(path: Path, entries: dict[str, str]) -> None:
     `os.replace`. Mode is 0600 on create (it can carry operator-tuned
     operational values; keep it owner-only like the roster).
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only
     body = _AGENT_ENV_HEADER
     for key in sorted(entries):
         body += render_env_export_line(key, entries[key]) + "\n"
@@ -579,14 +579,14 @@ def write_managed_env(path: Path, entries: dict[str, str]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(body)
-        if path.exists():
+        if path.exists():  # noqa: raw-pathlib-controller-only
             shutil.copymode(path, tmp_name)
         else:
             os.chmod(tmp_name, 0o600)
         os.replace(tmp_name, path)
     except Exception:
         try:
-            os.unlink(tmp_name)
+            os.unlink(tmp_name)  # noqa: raw-pathlib-controller-only
         except OSError:
             pass
         raise

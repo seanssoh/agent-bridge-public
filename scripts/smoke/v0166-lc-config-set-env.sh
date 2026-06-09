@@ -327,6 +327,35 @@ assert_bash_verdict \
   "BRIDGE_AGENT_ID=patch agb config set-env BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS=86400" \
   "DENY"
 
+# 3e. env(1)-utility prefix spoof — `env VAR=v agb config set-env` seeds the
+#     wrapper's trust env exactly like a bare VAR= prefix. Pre-fix this bypassed
+#     first-stage-only recognition (#11710 P1 / patch write-gate #11711). DENY.
+assert_bash_verdict \
+  "hook: env(1) prefix spoof denied" \
+  "$USER_AGENT" \
+  "env BRIDGE_AGENT_ID=patch BRIDGE_CALLER_SOURCE=operator-tui agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
+  "DENY"
+assert_bash_verdict \
+  "hook: /usr/bin/env prefix spoof denied" \
+  "$USER_AGENT" \
+  "/usr/bin/env BRIDGE_AGENT_ID=patch agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
+  "DENY"
+
+# 3f. preceding-stage `export VAR=v;` then set-env — a separate stage seeds the
+#     trust env; recognition must catch set-env in a LATER stage (#11710/#11711).
+assert_bash_verdict \
+  "hook: preceding export; stage spoof denied" \
+  "$USER_AGENT" \
+  "export BRIDGE_AGENT_ID=patch; agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
+  "DENY"
+
+# 3g. `export VAR=v &&` then set-env — same multi-stage spoof via &&. DENY.
+assert_bash_verdict \
+  "hook: preceding export && stage spoof denied" \
+  "$USER_AGENT" \
+  "export BRIDGE_CALLER_SOURCE=operator-tui && agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
+  "DENY"
+
 # 3d. shell-embedding / separator smuggles on a recognized set-env attempt.
 assert_bash_verdict \
   "hook: separator smuggle denied" \
