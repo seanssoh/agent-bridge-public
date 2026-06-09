@@ -476,6 +476,25 @@ assert_bash_verdict \
   'BRIDGE_AGENT_ID=patch agb config set\-env BRIDGE_A2A_RECONCILE_INTERVAL=60' \
   "DENY"
 
+# 3n. bash line-continuation of the `set-env` token (codex r6 #11742). bash
+#     removes `\<newline>` (and `\<CR><newline>`) before tokenizing, so
+#     `set-\<NL>env` runs as the `set-env` token, yet shlex does NOT collapse
+#     it. Built with $'…' ANSI-C quoting so the literal backslash-newline
+#     survives THIS script's own parsing. The recognizer joins line
+#     continuations at entry; the canonical-shape gate denies.
+LC_WRAP=$'BRIDGE_AGENT_ID=patch BRIDGE_CALLER_SOURCE=operator-tui agb config set-\\\nenv BRIDGE_A2A_RECONCILE_INTERVAL=60'
+assert_bash_verdict \
+  "hook: line-continuation wrapper spoof denied" \
+  "$USER_AGENT" "$LC_WRAP" "DENY"
+LC_DIRECT=$'BRIDGE_ADMIN_AGENT_ID=patch BRIDGE_AGENT_ID=patch python3 bridge-config.py set-\\\nenv BRIDGE_A2A_RECONCILE_INTERVAL=60'
+assert_bash_verdict \
+  "hook: line-continuation direct-script spoof denied" \
+  "$USER_AGENT" "$LC_DIRECT" "DENY"
+LC_ENVS=$'env -S \'BRIDGE_AGENT_ID=patch agb config set-\\\nenv BRIDGE_A2A_RECONCILE_INTERVAL=60\''
+assert_bash_verdict \
+  "hook: line-continuation inside env -S denied" \
+  "$USER_AGENT" "$LC_ENVS" "DENY"
+
 # 3d. shell-embedding / separator smuggles on a recognized set-env attempt.
 assert_bash_verdict \
   "hook: separator smuggle denied" \

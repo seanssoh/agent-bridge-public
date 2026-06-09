@@ -3100,10 +3100,17 @@ def _config_set_env_attempt_present(text: str) -> bool:
 
     Residual (out of a static hook's reach, tracked as the #341 env-trust root):
     indirection that hides the literal spelling — `eval '…'`, `bash -c '…'`,
-    `V=set-env; agb config $V …` — cannot be resolved from the command string.
-    The durable fix is wrapper-side identity (bridge-config.py must not trust
-    env-declared admin/source); the hook is defense-in-depth, not the boundary.
+    `V=set-env; agb config $V …`, or ANSI-C `$'\x73et-env'` — cannot be resolved
+    from the command string (shlex does not expand them either). The durable fix
+    is wrapper-side identity (bridge-config.py must not trust env-declared
+    admin/source); the hook is defense-in-depth, not the boundary.
     """
+    # Bash removes line continuations (`\<newline>`, `\<CR><newline>`) BEFORE
+    # tokenizing, so `set-\<NL>env` runs as the argv token `set-env` — but
+    # neither the substring prefilter nor shlex collapse them (codex r6 #11742).
+    # Join them first (same lexical-normalization family as the r5 quote/escape
+    # strip) so the spelling is normalized for both the prefilter and the scan.
+    text = text.replace("\\\r\n", "").replace("\\\n", "")
     if "set-env" not in _SHELL_QUOTE_ESCAPE_RE.sub("", text):
         return False
     for stage in _COMMAND_OPERATOR_RE.split(text):
