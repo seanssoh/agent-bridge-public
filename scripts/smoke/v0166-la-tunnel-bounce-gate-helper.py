@@ -498,6 +498,157 @@ def cmd_mixed_loss_stale(repo_root: str) -> int:
     return 0
 
 
+def cmd_transient_only(repo_root: str) -> int:
+    """#1732 × #1733 cross-lane: a TRANSIENT-only mesh whose sole peer is fresh-
+    DOWN must NEVER bounce — a transient (expected-disconnect) peer is not
+    bounce-relevant, so there is no proof of substrate loss (codex integration
+    review)."""
+    reconcile = _load_reconcile(repo_root)
+    a2a = _load_a2a(repo_root)
+    transport = a2a.TRANSPORT_CLOUDFLARE_WARP_MESH
+    cfg = {"transport": {"kind": "cloudflare-warp-mesh"},
+           "listen": {"address": "10.128.0.25", "port": 8787},
+           "peers": [{"id": "laptop", "class": "transient"}]}
+
+    bounce = _Spy()
+    soft = _Spy()
+    orig_b = reconcile._WARP_TUNNEL_BOUNCE
+    orig_s = reconcile._WARP_TUNNEL_SOFT_REFRESH
+    orig_age = a2a.warp_tunnel_handshake_age
+    reconcile._WARP_TUNNEL_BOUNCE = bounce
+    reconcile._WARP_TUNNEL_SOFT_REFRESH = soft
+    a2a.warp_tunnel_handshake_age = lambda: 5106
+    conn = reconcile.open_reconcile_db()
+    n = reconcile.warp_stale_streak_threshold()
+    try:
+        last = None
+        for _ in range(n + 1):
+            _seed_peers(reconcile, conn,
+                        {"laptop": reconcile.PEER_STATE_DOWN}, time.time())
+            last = reconcile.tunnel_health(transport, cfg, conn)
+    finally:
+        reconcile._WARP_TUNNEL_BOUNCE = orig_b
+        reconcile._WARP_TUNNEL_SOFT_REFRESH = orig_s
+        a2a.warp_tunnel_handshake_age = orig_age
+        conn.close()
+
+    if bounce.calls != 0 or soft.calls != 0:
+        sys.stderr.write(
+            f"FAIL transient-only: bounce={bounce.calls} soft={soft.calls} on a "
+            "transient-only DOWN mesh (a transient peer is not bounce-relevant)\n")
+        return 1
+    if last.fields.get("bounce_suppressed_reason") != \
+            reconcile.BOUNCE_SUPPRESSED_PEER_STATE_UNKNOWN:
+        sys.stderr.write(
+            f"FAIL transient-only: wrong suppressed reason {last.fields}\n")
+        return 1
+    print(f"OK transient-only bounces={bounce.calls} "
+          f"peer_counts={last.fields.get('peer_counts')} "
+          f"reason={last.fields.get('bounce_suppressed_reason')}")
+    return 0
+
+
+def cmd_persistent_up_transient_down(repo_root: str) -> int:
+    """#1732 × #1733: persistent peer fresh-UP + transient peer fresh-DOWN must
+    NOT bounce — the only bounce-relevant peer is up (codex integration review)."""
+    reconcile = _load_reconcile(repo_root)
+    a2a = _load_a2a(repo_root)
+    transport = a2a.TRANSPORT_CLOUDFLARE_WARP_MESH
+    cfg = {"transport": {"kind": "cloudflare-warp-mesh"},
+           "listen": {"address": "10.128.0.25", "port": 8787},
+           "peers": [{"id": "server"}, {"id": "laptop", "class": "transient"}]}
+
+    bounce = _Spy()
+    soft = _Spy()
+    orig_b = reconcile._WARP_TUNNEL_BOUNCE
+    orig_s = reconcile._WARP_TUNNEL_SOFT_REFRESH
+    orig_age = a2a.warp_tunnel_handshake_age
+    reconcile._WARP_TUNNEL_BOUNCE = bounce
+    reconcile._WARP_TUNNEL_SOFT_REFRESH = soft
+    a2a.warp_tunnel_handshake_age = lambda: 5106
+    conn = reconcile.open_reconcile_db()
+    n = reconcile.warp_stale_streak_threshold()
+    try:
+        last = None
+        for _ in range(n + 1):
+            _seed_peers(reconcile, conn, {
+                "server": reconcile.PEER_STATE_UP,
+                "laptop": reconcile.PEER_STATE_DOWN}, time.time())
+            last = reconcile.tunnel_health(transport, cfg, conn)
+    finally:
+        reconcile._WARP_TUNNEL_BOUNCE = orig_b
+        reconcile._WARP_TUNNEL_SOFT_REFRESH = orig_s
+        a2a.warp_tunnel_handshake_age = orig_age
+        conn.close()
+
+    if bounce.calls != 0 or soft.calls != 0:
+        sys.stderr.write(
+            f"FAIL persistent-up-transient-down: bounce={bounce.calls} "
+            f"soft={soft.calls} (the bounce-relevant peer is UP — no bounce)\n")
+        return 1
+    if last.fields.get("bounce_suppressed_reason") != \
+            reconcile.BOUNCE_SUPPRESSED_ALL_PEERS_FRESH_UP:
+        sys.stderr.write(
+            f"FAIL persistent-up-transient-down: wrong reason {last.fields}\n")
+        return 1
+    print(f"OK persistent-up-transient-down bounces={bounce.calls} "
+          f"peer_counts={last.fields.get('peer_counts')} "
+          f"reason={last.fields.get('bounce_suppressed_reason')}")
+    return 0
+
+
+def cmd_persistent_down_transient_up(repo_root: str) -> int:
+    """#1732 × #1733: persistent peer fresh-DOWN + transient peer fresh-UP DOES
+    bounce after the N-streak — a transient peer must not DILUTE a real
+    persistent loss (codex integration review)."""
+    reconcile = _load_reconcile(repo_root)
+    a2a = _load_a2a(repo_root)
+    transport = a2a.TRANSPORT_CLOUDFLARE_WARP_MESH
+    cfg = {"transport": {"kind": "cloudflare-warp-mesh"},
+           "listen": {"address": "10.128.0.25", "port": 8787},
+           "peers": [{"id": "server"}, {"id": "laptop", "class": "transient"}]}
+
+    order: list = []
+    bounce = _OrderSpy("bounce", order)
+    soft = _OrderSpy("soft", order)
+    orig_b = reconcile._WARP_TUNNEL_BOUNCE
+    orig_s = reconcile._WARP_TUNNEL_SOFT_REFRESH
+    orig_age = a2a.warp_tunnel_handshake_age
+    reconcile._WARP_TUNNEL_BOUNCE = bounce
+    reconcile._WARP_TUNNEL_SOFT_REFRESH = soft
+    a2a.warp_tunnel_handshake_age = lambda: 5106
+    conn = reconcile.open_reconcile_db()
+    n = reconcile.warp_stale_streak_threshold()
+    try:
+        results = []
+        for _ in range(n):
+            _seed_peers(reconcile, conn, {
+                "server": reconcile.PEER_STATE_DOWN,
+                "laptop": reconcile.PEER_STATE_UP}, time.time())
+            results.append(reconcile.tunnel_health(transport, cfg, conn))
+    finally:
+        reconcile._WARP_TUNNEL_BOUNCE = orig_b
+        reconcile._WARP_TUNNEL_SOFT_REFRESH = orig_s
+        a2a.warp_tunnel_handshake_age = orig_age
+        conn.close()
+
+    if bounce.calls != 1:
+        sys.stderr.write(
+            f"FAIL persistent-down-transient-up: bounce fired {bounce.calls}x "
+            f"over {n} ticks (want exactly 1 — a real persistent loss bounces "
+            "despite the transient peer being up)\n")
+        return 1
+    if order != ["soft", "bounce"]:
+        sys.stderr.write(
+            f"FAIL persistent-down-transient-up: order {order} "
+            "(soft must precede bounce)\n")
+        return 1
+    print(f"OK persistent-down-transient-up N={n} bounces={bounce.calls} "
+          f"order={order} "
+          f"peer_counts={results[-1].fields.get('peer_counts')}")
+    return 0
+
+
 _COMMANDS = {
     "all-up": cmd_all_up,
     "loss-bounces": cmd_loss_bounces,
@@ -506,6 +657,9 @@ _COMMANDS = {
     "mixed-loss-stale": cmd_mixed_loss_stale,
     "soft-first": cmd_soft_first,
     "soft-no-disc": cmd_soft_no_disc,
+    "transient-only": cmd_transient_only,
+    "persistent-up-transient-down": cmd_persistent_up_transient_down,
+    "persistent-down-transient-up": cmd_persistent_down_transient_up,
 }
 
 
@@ -514,7 +668,8 @@ def main() -> int:
         sys.stderr.write(
             "usage: v0166-la-tunnel-bounce-gate-helper.py "
             "<all-up|loss-bounces|single-stale|unknown-stale|mixed-loss-stale|"
-            "soft-first|soft-no-disc> <repo_root>\n")
+            "soft-first|soft-no-disc|transient-only|persistent-up-transient-down|"
+            "persistent-down-transient-up> <repo_root>\n")
         return 2
     cmd, repo_root = sys.argv[1], sys.argv[2]
     _isolate_reconcile_db(cmd)

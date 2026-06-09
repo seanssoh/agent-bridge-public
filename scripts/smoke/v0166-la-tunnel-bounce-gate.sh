@@ -147,4 +147,16 @@ smoke_assert_contains "$out_soft_first" "OK soft-first" "(e) soft-refresh is att
 out_soft_nd="$(run_helper soft-no-disc)"
 smoke_assert_contains "$out_soft_nd" "OK soft-no-disc" "(f) default soft-refresh nudges via connect, never disconnect"
 
+# --- (g) #1732 x #1733 cross-lane: a TRANSIENT peer's loss is NOT bounce-relevant ---
+out_tr_only="$(run_helper transient-only)"
+smoke_assert_contains "$out_tr_only" "OK transient-only" "(g) transient-only DOWN mesh -> NO bounce (transient peer not bounce-relevant)"
+smoke_assert_contains "$out_tr_only" "bounces=0" "(g) a transient peer going down never bounces the WARP tunnel"
+
+out_pu_td="$(run_helper persistent-up-transient-down)"
+smoke_assert_contains "$out_pu_td" "OK persistent-up-transient-down" "(h) persistent-UP + transient-DOWN -> NO bounce (the bounce-relevant peer is up)"
+smoke_assert_contains "$out_pu_td" "bounces=0" "(h) a transient-down peer alongside a healthy persistent peer never bounces"
+
+out_pd_tu="$(run_helper persistent-down-transient-up)"
+smoke_assert_contains "$out_pd_tu" "OK persistent-down-transient-up" "(i) persistent-DOWN + transient-UP -> bounce STILL fires after N-streak (transient must not dilute a real loss)"
+
 smoke_log "ALL CHECKS PASSED ($SMOKE_NAME)"

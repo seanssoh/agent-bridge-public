@@ -802,9 +802,24 @@ def _fresh_peer_reachability_loss(conn: sqlite3.Connection, cfg: dict[str, Any],
     peers = cfg.get("peers")
     if not isinstance(peers, list):
         return None, counts
-    peer_ids = [str(p.get("id")) for p in peers
-                if isinstance(p, dict) and p.get("id")]
+    # #1732 × #1733 cross-lane (codex integration review): the WARP bounce gate
+    # acts ONLY on BOUNCE-RELEVANT (persistent / alarm-on) peers. A transient
+    # (expected-disconnect, #1732) peer going suspect/down is NOT proof of
+    # substrate loss — counting it would bounce the tunnel on an expected blip,
+    # and a transient peer's stale state would even suppress a real persistent-
+    # loss bounce. `peer_alarm_on_unreachable` is the SAME policy the stuck-outbox
+    # admin alarm consumes (persistent default + explicit per-peer override).
+    bounce_relevant = [p for p in peers
+                       if isinstance(p, dict) and p.get("id")
+                       and a2a.peer_alarm_on_unreachable(p)]
+    counts["transient_excluded"] = sum(
+        1 for p in peers
+        if isinstance(p, dict) and p.get("id")
+        and not a2a.peer_alarm_on_unreachable(p))
+    peer_ids = [str(p.get("id")) for p in bounce_relevant]
     if not peer_ids:
+        # No bounce-relevant peers configured (all transient / alarm-off) — we
+        # can prove neither all-up nor a real loss; never bounce.
         return None, counts
 
     window = warp_peer_freshness_window()
