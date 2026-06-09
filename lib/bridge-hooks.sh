@@ -58,6 +58,28 @@ bridge_hook_shared_settings_overlay_file() {
   printf '%s/.claude/settings.local.json' "$BRIDGE_AGENT_HOME_ROOT"
 }
 
+# Queue request #11901 (operator-approved Option 1, 2026-06-10): resolve the
+# operator's REAL system-global Claude settings file. SHARED (non-isolated)
+# static agents inherit its safety-filtered contents as the bottom-most
+# render layer so operator changes to `~/.claude/settings.json` propagate.
+#
+# Resolution MUST use the operator/controller HOME — NOT $CLAUDE_CONFIG_DIR
+# (per-agent-contaminated: `…/agents/<name>/home/.claude`) and NOT
+# $BRIDGE_AGENT_HOME_ROOT (the bridge base). `bridge_agent_operator_home_dir`
+# is the canonical resolver (BRIDGE_CONTROLLER_HOME test seam ->
+# isolation-v2 controller user -> SUDO_USER/USER passwd home -> $HOME). When
+# it cannot resolve (no controller home, empty $HOME) we print nothing so
+# the Python renderer's `--operator-global-settings-file ""` triggers the
+# fail-safe degrade to the bridge base.
+bridge_hook_operator_global_settings_file() {
+  local operator_home=""
+  if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+    operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+  fi
+  [[ -n "$operator_home" ]] || return 0
+  printf '%s/.claude/settings.json' "$operator_home"
+}
+
 bridge_hook_shared_settings_effective_file() {
   printf '%s/.claude/settings.effective.json' "$BRIDGE_AGENT_HOME_ROOT"
 }
@@ -220,10 +242,26 @@ bridge_link_claude_settings_to_shared() {
   else
     effective_file="$(bridge_hook_shared_settings_effective_file)"
   fi
+  # #11901: thread the operator's system-global settings file so the SHARED
+  # renderer inherits its safety-filtered contents as the bottom-most layer.
+  # Scope: SHARED (non-isolated) agents only. A v2 linux-user-isolated agent
+  # also reaches this helper (its workdir is under $BRIDGE_AGENT_HOME_ROOT, so
+  # bridge_claude_settings_mode == "shared"), but its CANONICAL settings are
+  # rendered separately by cmd_render_isolated_home_settings into the isolated
+  # home — global inheritance is NOT the iso contract (AC5). So we leave the
+  # operator-global EMPTY for isolated agents (defense in depth: the shared
+  # effective file an iso agent never reads also stays free of global keys).
+  local operator_global_file=""
+  if [[ -z "$agent" ]] \
+      || ! command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      || ! bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    operator_global_file="$(bridge_hook_operator_global_settings_file 2>/dev/null || true)"
+  fi
   bridge_hooks_python render-shared-settings \
     --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
     --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
     --effective-settings-file "$effective_file" \
+    --operator-global-settings-file "$operator_global_file" \
     --launch-cmd "$launch_cmd" \
     --agent-class "$agent_class" \
     --channels-csv "$channels_csv" >/dev/null
@@ -306,6 +344,7 @@ bridge_link_claude_settings_to_shared() {
           --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
           --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
           --effective-settings-file "$agent_effective_file" \
+          --operator-global-settings-file "$operator_global_file" \
           --launch-cmd "$launch_cmd" \
           --agent-class "$agent_class" \
           --channels-csv "$channels_csv" >/dev/null
