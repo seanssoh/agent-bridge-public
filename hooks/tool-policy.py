@@ -2621,12 +2621,17 @@ def _decode_obfuscated_word(word: str) -> str:
             return match.group(0)
 
     decoded = _ANSIC_RE.sub(_ansic, word)
-    # Bare backslash escapes outside ANSI-C (`secre\x74s`, `priv\141te`).
+    # Outside ANSI-C `$'…'`, bash treats an unquoted backslash as "preserve the
+    # literal value of the next character": `\X` → `X` for ANY X. bash does NOT
+    # hex/octal/escape-decode outside `$'…'`, so `secre\ts` runs as `secrets`
+    # (NOT `secre<TAB>s`), `priv\ate` as `private`, `peer\-1709` as `peer-1709`
+    # (codex r2 #11763). Model that with a literal backslash strip — NOT
+    # unicode_escape, which wrongly turns `\t`→TAB (MISSING the bypass) and
+    # `\x74`→`t` (over-blocking a path bash would read as the harmless
+    # `secrex74s`). `\<newline>` is a line continuation (both chars removed).
     if "\\" in decoded:
-        try:
-            decoded = decoded.encode("latin-1", "backslashreplace").decode("unicode_escape")
-        except Exception:  # noqa: BLE001
-            pass
+        decoded = decoded.replace("\\\r\n", "").replace("\\\n", "")
+        decoded = re.sub(r"\\(.)", r"\1", decoded, flags=re.DOTALL)
     return decoded
 
 
@@ -2665,6 +2670,75 @@ def _word_carries_obfuscation(word: str) -> bool:
     return False
 
 
+def _collapse_path_separators(text: str) -> str:
+    """Collapse the redundant separators the shell resolver ignores — runs of
+    ``/`` → ``/`` and ``/./`` → ``/`` — so the literal forbidden-suffix scan
+    cannot be evaded by ``shared//secrets`` / ``shared///secrets`` /
+    ``shared/./secrets`` (patch r2 #1709; mirrors the set-env line-continuation
+    normalization). Applied ONLY to the text handed to the suffix scan — the
+    executed command is never mutated. Loops to a fixed point so interleaved
+    forms (``//./``) fully reduce.
+    """
+    prev = None
+    out = text
+    while prev != out:
+        prev = out
+        out = re.sub(r"/{2,}", "/", out)
+        out = out.replace("/./", "/")
+    return out
+
+
+_CD_RE = re.compile(r"(?:^|[;&|()]|\s)(?:cd|pushd)\s+([^\s;&|()<>]+)")
+
+
+def _command_cd_targets_bridge_anchor(text: str) -> bool:
+    """True iff the command ``cd``/``pushd``-es into a bridge-anchored directory,
+    after which a RELATIVE read (no leading ``/``) reaches the forbidden tree
+    (patch r2 #1709 cwd-relative vector). Detects ``cd $BRIDGE_HOME`` /
+    ``${BRIDGE_HOME}`` / ``~/.agent-bridge`` / the absolute home and any dir
+    under them. Conservative: a target we cannot resolve to a non-bridge path
+    is not treated as an anchor (the relative scan it gates is itself bounded).
+    """
+    try:
+        home = str(bridge_home_dir())
+    except Exception:  # noqa: BLE001
+        home = ""
+    for match in _CD_RE.finditer(text):
+        target = match.group(1).strip("'\"")
+        if "$BRIDGE_HOME" in target or "${BRIDGE_HOME}" in target or "/.agent-bridge" in target:
+            return True
+        expanded = os.path.expandvars(os.path.expanduser(target))
+        if home and (expanded == home or expanded.startswith(home + "/")):
+            return True
+    return False
+
+
+def _scan_relative_suffixes(text: str, suffixes: list[str]) -> str | None:
+    """Like :func:`_scan_suffixes` but for a RELATIVE forbidden tail (the suffix
+    with its leading ``/`` stripped), requiring a LEFT path-word boundary
+    (start, whitespace, quote, or a shell operator) since there is no leading
+    ``/`` to pin it. ONLY called once the command has cd'd into a bridge-anchored
+    dir, so a relative read in the agent's OWN workdir is not collateral-blocked.
+    A ``/``-preceded occurrence is excluded (that is an absolute path already
+    caught by the leading-``/`` scan)."""
+    for suffix in suffixes:
+        rel = suffix.lstrip("/")
+        if not rel:
+            continue
+        start = 0
+        while True:
+            idx = text.find(rel, start)
+            if idx == -1:
+                break
+            left_ok = idx == 0 or text[idx - 1] in (" ", "\t", "'", '"', ";", "&", "|", "(")
+            end = idx + len(rel)
+            right_ok = end >= len(text) or text[end] in ("/", "'", '"', " ", "\t")
+            if left_ok and right_ok:
+                return suffix
+            start = idx + 1
+    return None
+
+
 def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     """Scan the shell command *text* for a read of any forbidden *suffix*,
     independent of how the path prefix is spelled.
@@ -2697,10 +2771,24 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
        deny; a bare ``$(`)`` command-sub NOT under a forbidden parent is
        left to the existing read-intent / shell-embedding gates.
     """
+    # Normalize the separators bash collapses (`//`, `///`, `/./`) before the
+    # literal scan so a redundant-separator / dot-segment spelling can't evade
+    # it (patch r2 #1709). Only the scanned copy is normalized.
+    norm = _collapse_path_separators(text)
+
     # Pass 1 — literal suffix scan with a RIGHT path-boundary check.
-    hit = _scan_suffixes(text, suffixes)
+    hit = _scan_suffixes(norm, suffixes)
     if hit is not None:
         return hit
+
+    # Pass 1b — cwd-relative-after-cd. A read of a RELATIVE forbidden tail (no
+    # leading `/`) reaches the secret tree once the command has cd'd into a
+    # bridge-anchored dir (patch r2 #1709). Gate the relative scan on that cd so
+    # a relative read in the agent's own workdir is not collateral-blocked.
+    if _command_cd_targets_bridge_anchor(norm):
+        rel_hit = _scan_relative_suffixes(norm, suffixes)
+        if rel_hit is not None:
+            return rel_hit
 
     # Pass 2 — obfuscation fail-close, per path-candidate word.
     for raw_word in _command_path_candidate_words(text):
@@ -2709,7 +2797,7 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
         # 2a. Decode ANSI-C `$'…'` / backslash hex-octal escapes and re-run
         # the literal suffix scan: `$'\x2fshared\x2fsecrets'`, `secre\x74s`
         # surface their real bytes here (the runtime path bash would build).
-        decoded = _decode_obfuscated_word(raw_word)
+        decoded = _collapse_path_separators(_decode_obfuscated_word(raw_word))
         if decoded != raw_word and _scan_suffixes(decoded, suffixes) is not None:
             return _OBFUSCATED_SUFFIX_SENTINEL
         # 2b. Glob / command-sub fail-close. These cannot be decoded

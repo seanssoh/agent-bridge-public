@@ -246,6 +246,24 @@ assert_verdict "B peer \$BRIDGE_HOME"   "cat \$BRIDGE_HOME/agents/$PEER_AGENT/ME
 assert_verdict "B peer \${BRIDGE_HOME}" "cat \${BRIDGE_HOME}/agents/$PEER_AGENT/MEMORY.md"           "DENY"
 
 # ---------------------------------------------------------------------------
+# r2 (codex #11763 + patch #11764) — statically-resolvable spellings the
+# literal substring scan missed: ordinary unquoted backslash (`\X`->`X`, NOT
+# hex), redundant separators (`//`,`///`), dot segments (`/./`), and a
+# cwd-relative read after a bridge-anchored `cd` (no leading `/`). Both stages.
+# ---------------------------------------------------------------------------
+assert_verdict "A secrets backslash"     "cat \${HOME}/.agent-bridge/shared/secre\\ts/token"   "DENY"
+assert_verdict "A private backslash"     "grep x \${HOME}/.agent-bridge/shared/priv\\ate/ops.md" "DENY"
+assert_verdict "A secrets double-slash"  "cat \$BRIDGE_HOME/shared//secrets/token"             "DENY"
+assert_verdict "A secrets triple-slash"  "cat \$BRIDGE_HOME/shared///secrets/token"            "DENY"
+assert_verdict "A secrets dot-component" "cat \$BRIDGE_HOME/shared/./secrets/token"            "DENY"
+assert_verdict "A secrets cd-relative"   "cd \$BRIDGE_HOME && cat shared/secrets/token"        "DENY"
+assert_verdict "A secrets subshell-cd"   "(cd \$BRIDGE_HOME; cat shared/secrets/token)"        "DENY"
+assert_verdict "A private cd-relative"   "cd \$BRIDGE_HOME && grep x shared/private/ops.md"    "DENY"
+assert_verdict "B peer double-slash"     "cat \$BRIDGE_HOME/agents//$PEER_AGENT/MEMORY.md"     "DENY"
+assert_verdict "B peer dot-component"    "cat \$BRIDGE_HOME/agents/./$PEER_AGENT/MEMORY.md"    "DENY"
+assert_verdict "B peer cd-relative"      "cd \$BRIDGE_HOME && cat agents/$PEER_AGENT/MEMORY.md" "DENY"
+
+# ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
 # ---------------------------------------------------------------------------
 assert_verdict "own home read"          "cat $ABS/agents/$USER_AGENT/MEMORY.md"          "ALLOW"
@@ -253,6 +271,7 @@ assert_verdict "own home \${HOME}"      "cat \${HOME}/.agent-bridge/agents/$USER
 assert_verdict "public wiki \${HOME}"   "cat \${HOME}/.agent-bridge/shared/wiki/index.md" "ALLOW"
 assert_verdict "repo-style glob"        "cat ./agents/*.md"                              "ALLOW"
 assert_verdict "non-forbidden bridge read" "cat \${HOME}/.agent-bridge/state/x.md"       "ALLOW"
+assert_verdict "cd-relative public wiki" "cd \$BRIDGE_HOME && cat shared/wiki/index.md"   "ALLOW"
 
 # ---------------------------------------------------------------------------
 # Revert-teeth — the brace / $BRIDGE_HOME / ANSI-C cases FLIP TO ALLOW when
