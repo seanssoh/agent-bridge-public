@@ -450,6 +450,32 @@ assert_bash_verdict \
   "(BRIDGE_AGENT_ID=patch agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60)" \
   "DENY"
 
+# 3m. bash quote-concatenation / backslash-escape of the `set-env` token
+#     (codex r5 #11733). `set"-"env`, `set-en''v`, `set\-env` all shlex-resolve
+#     to the exact `set-env` token, but evade a raw-substring prefilter. The
+#     prefilter now strips shell quote/escape chars before the substring check;
+#     the verb still surfaces in the shlex scan -> canonical-shape gate denies.
+assert_bash_verdict \
+  "hook: set quote-concat wrapper spoof denied" \
+  "$USER_AGENT" \
+  'BRIDGE_AGENT_ID=patch BRIDGE_CALLER_SOURCE=operator-tui agb config set"-"env BRIDGE_A2A_RECONCILE_INTERVAL=60' \
+  "DENY"
+assert_bash_verdict \
+  "hook: set quote-concat direct-script spoof denied" \
+  "$USER_AGENT" \
+  'BRIDGE_ADMIN_AGENT_ID=patch BRIDGE_AGENT_ID=patch python3 bridge-config.py set"-"env BRIDGE_A2A_RECONCILE_INTERVAL=60' \
+  "DENY"
+assert_bash_verdict \
+  "hook: set quote-concat inside env -S payload denied" \
+  "$USER_AGENT" \
+  "env -S 'BRIDGE_AGENT_ID=patch agb config set\"-\"env BRIDGE_A2A_RECONCILE_INTERVAL=60'" \
+  "DENY"
+assert_bash_verdict \
+  "hook: set backslash-escape spoof denied" \
+  "$USER_AGENT" \
+  'BRIDGE_AGENT_ID=patch agb config set\-env BRIDGE_A2A_RECONCILE_INTERVAL=60' \
+  "DENY"
+
 # 3d. shell-embedding / separator smuggles on a recognized set-env attempt.
 assert_bash_verdict \
   "hook: separator smuggle denied" \

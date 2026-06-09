@@ -3018,6 +3018,16 @@ def _has_leading_env_assignment(text: str) -> bool:
 # canonical-shape gate then denies it (token[0] is `env`, not the bare verb).
 _ENV_SPLIT_SHORT_RE = re.compile(r"^-[A-Za-z]*S")
 
+# Shell quote/escape characters. A raw-substring prefilter on the command text
+# is unsound: bash quote-concatenation (`set"-"env`, `set-en''v`) or backslash
+# escaping (`set\-env`) spells the same `set-env` token while breaking the
+# literal substring, yet shlex still resolves the real token (codex r5 #11733).
+# We strip these for the substring PREFILTER only — the token scan itself uses
+# real shlex — so the concatenated spelling still trips the prefilter. Stripping
+# only makes the prefilter MORE permissive (more commands reach the sound shlex
+# scan below), never less, so it cannot introduce a false-negative.
+_SHELL_QUOTE_ESCAPE_RE = re.compile(r"""['"\\]""")
+
 
 def _expand_env_split_string(toks: list[str]) -> list[str]:
     """Inline any `env -S <STRING>` payload as freshly-parsed tokens.
@@ -3094,7 +3104,7 @@ def _config_set_env_attempt_present(text: str) -> bool:
     The durable fix is wrapper-side identity (bridge-config.py must not trust
     env-declared admin/source); the hook is defense-in-depth, not the boundary.
     """
-    if "set-env" not in text:
+    if "set-env" not in _SHELL_QUOTE_ESCAPE_RE.sub("", text):
         return False
     for stage in _COMMAND_OPERATOR_RE.split(text):
         scan = _SAFE_REDIRECT_RE.sub(" ", stage)
