@@ -1412,6 +1412,22 @@ def room_scoped_check(env: dict[str, Any],
     if rooms is None:
         return False, "rooms_module_unavailable"
 
+    # Lane 5 (#1695-P2 gotcha E) RELAYED-LEG acceptance: a relay leg is signed by
+    # the LEADER (sender_node == the authenticated leader peer), but the message
+    # AUTHOR is the original member the leader vouched for (`relayed_from`). The
+    # membership gate must validate the ORIGINAL author against the cached roster,
+    # NOT the relaying leader — AND must confirm the authenticated relayer IS this
+    # room's leader (the relayer node == the cached roster's `from_node`, the only
+    # node allowed to relay). A relay leg whose authenticated peer is NOT the
+    # cached leader, or that carries no original author, is fail-closed denied.
+    relayed = a2a.envelope_is_relayed(env)  # noqa: iso-helper-boundary - a2a.envelope_* call, not a .env file
+    relayed_author_agent = ""
+    relayed_author_node = ""
+    if relayed:
+        relayed_author_agent, relayed_author_node = a2a.relayed_from(env)
+        if not relayed_author_agent or not relayed_author_node:
+            return False, "relay_missing_author"
+
     try:
         conn = rooms.open_rooms_readonly()
     except rooms.RoomsError:
@@ -1422,14 +1438,383 @@ def room_scoped_check(env: dict[str, Any],
         return False, "no_rooms_db"
 
     try:
-        reason = rooms.roster_cache_membership_check(
-            conn, room_id=room_id, room_epoch=room_epoch,
-            sender_agent=sender_agent, sender_node=sender_node,
-            target_agent=target_agent, target_node=this_node,
-        )
+        if relayed:
+            # The authenticated relayer MUST be this room's leader. The cached
+            # roster's `from_node` is the leader (P4.2 binding); a relay leg whose
+            # authenticated peer != that leader is a non-leader pretending to relay
+            # -> fail closed (never accept a relayed message from a non-leader).
+            cache = rooms.get_roster_cache(conn, room_id)
+            if cache is None:
+                return False, "no_roster_cache"
+            leader_node = str(cache["from_node"] or "")
+            if not leader_node or sender_node != leader_node:
+                return False, "relay_not_from_leader"
+            # Validate the ORIGINAL AUTHOR (leader-vouched) against the roster, and
+            # the local target as usual. The author's node is the body-carried
+            # relayed_from.node — but it is only TRUSTED because the LEADER (the
+            # authenticated peer, pinned to the cached leader) signed this leg; the
+            # roster membership check still fails closed if that author is not a
+            # cached member at this epoch.
+            reason = rooms.roster_cache_membership_check(
+                conn, room_id=room_id, room_epoch=room_epoch,
+                sender_agent=relayed_author_agent,
+                sender_node=relayed_author_node,
+                target_agent=target_agent, target_node=this_node,
+            )
+        else:
+            reason = rooms.roster_cache_membership_check(
+                conn, room_id=room_id, room_epoch=room_epoch,
+                sender_agent=sender_agent, sender_node=sender_node,
+                target_agent=target_agent, target_node=this_node,
+            )
     finally:
         conn.close()
     return (reason == rooms.ROOM_TALK_OK), reason
+
+
+# --------------------------------------------------------------------------
+# Lane 5 (#1695-P2 gotcha E): leader-relay (member -> leader -> member)
+# --------------------------------------------------------------------------
+#
+# Members only peer with the LEADER (M node-links, not M²). A member->member
+# room message therefore CANNOT be sent directly (the sender has no peer link to
+# the target member). Instead the member sends the room-scoped message to the
+# LEADER (which it does peer with); the leader's receiver, on a room-scoped
+# message whose TARGET is a member on a DIFFERENT node, FORWARDS it as a FRESH
+# outbound /enqueue to that target member, RE-SIGNED with the leader<->target
+# pair key (NEVER the original sender's signature — which the target could not
+# verify anyway, lacking the sender<->target secret).
+#
+# SECURITY (design SSOT agenda 4 / §7 — every gate re-applied on the new leg):
+#   - The leader MUST have ALREADY verified the inbound member->leader message:
+#     do_POST ran the full preamble (remote_addr, HMAC, skew, dedupe) BEFORE this
+#     runs, so the sender peer is node-link-authenticated and the body intact.
+#   - The leader verifies, from its AUTHORITATIVE rooms.db (NEVER a body claim),
+#     that (a) it IS the room's leader, (b) the authenticated SENDER is a room
+#     member, (c) the TARGET agent is a member on exactly one OTHER node. Any
+#     miss -> no relay (fail closed).
+#   - The forward re-signs with the leader<->target node-link HMAC (the leader's
+#     own per-peer send secret), so the target verifies the LEADER (allowlist:
+#     the target has the leader in its inbound allowlist, true for any member);
+#     the original sender's signature is DISCARDED.
+#   - A FRESH message_id + the normal canonical string => fresh per-(peer,id)
+#     dedupe on the leader->target leg (no replay), and the PATH-in-canonical
+#     stops cross-endpoint replay.
+#   - Loop guard: the leader stamps `relayed_via=<leader_node>` and REFUSES to
+#     relay any inbound message already carrying that marker (a relayed message
+#     is never re-relayed; a member that pre-stamps it just gets denied, never
+#     amplified).
+
+
+class RelayOutcome:
+    """The leader-relay decision + result for one room-scoped enqueue.
+
+    `action` is one of:
+      - "not_applicable": this was not a relay case (the caller continues its
+        normal gate — e.g. a genuine local-target room message, or a non-room
+        message). NO forward attempted.
+      - "relayed": the leader forwarded the message to the target member node
+        (the caller replies 202 and does NOT enqueue locally).
+      - "refused": a relay was indicated but FAILED a security/authority check
+        or the forward send failed (the caller replies the carried status with
+        the reason; nothing is enqueued locally).
+    `status` is the HTTP status the caller should reply with for relayed/refused.
+    """
+
+    __slots__ = ("action", "status", "reason")
+
+    def __init__(self, action: str, status: int = 0, reason: str = "") -> None:
+        self.action = action
+        self.status = status
+        self.reason = reason
+
+
+def _relay_resolve(env: dict[str, Any], cfg: dict[str, Any],
+                   peer_id: str) -> tuple[str, str]:
+    """Read-only leader-relay AUTHORIZATION resolve (rooms.db, no body claim).
+
+    Returns (target_node, reason):
+      - (target_node, "ok"): this IS a leader-relay case — this node leads the
+        room, the authenticated sender is a member, and the target is a member on
+        exactly ONE other node (target_node).
+      - ("", "not_applicable"): NOT a relay case (not room-scoped, no rooms.db,
+        room absent, or this node is not the room's leader) — the caller falls
+        back to its normal static-allowlist / fail-closed deny.
+      - ("", "<refusal>"): a relay was indicated but FAILED a fail-closed check
+        (relay_loop_blocked / relay_sender_not_member / relay_target_not_member /
+        relay_target_ambiguous / rooms_db_unreadable). The caller denies.
+
+    Pure authorization (no network, no mutation). Used by BOTH the cheap
+    pre-dedupe allowlist gate and the post-dedupe relay so the decision is
+    computed identically and the forward only runs once, after dedupe.
+    """
+    if rooms is None or a2a is None:
+        return "", "not_applicable"
+    if not a2a.envelope_is_room_scoped(env):  # noqa: iso-helper-boundary - a2a.envelope_* call, not a .env file
+        return "", "not_applicable"
+    # LOOP GUARD: a message already stamped relayed is NEVER re-relayed. A
+    # non-leader peer that pre-stamps it to trigger a bounce is REFUSED (deny).
+    if a2a.envelope_is_relayed(env):  # noqa: iso-helper-boundary - a2a.envelope_* call, not a .env file
+        return "", "relay_loop_blocked"
+
+    room_id = str(env.get("room_id") or "")
+    room_epoch = int(env.get("room_epoch") or 0)
+    sender = env.get("sender", {})
+    sender_agent = str(sender.get("agent") or "") if isinstance(sender, dict) else ""
+    target_agent = str(env.get("target_agent") or "")
+    this_node = str(cfg.get("bridge_id") or "")
+    # The authenticated sender NODE is the verified X-AGB-Peer (un-spoofable);
+    # do_POST already pinned env.sender.bridge == peer_id before this runs.
+    sender_node = peer_id
+    if not room_id or not target_agent or not this_node:
+        return "", "not_applicable"
+
+    try:
+        conn = rooms.open_rooms_readonly()
+    except rooms.RoomsError:
+        return "", "rooms_db_unreadable"
+    if conn is None:
+        return "", "not_applicable"
+    try:
+        room = rooms.get_room(conn, room_id)
+        if room is None:
+            return "", "not_applicable"
+        leader_node = str(room["leader_node"] or "")
+        # Only the AUTHORITATIVE leader relays.
+        if not leader_node or leader_node != this_node:
+            return "", "not_applicable"
+        # EPOCH GATE (codex P2): the leader refuses to relay a STALE-epoch message.
+        # The inbound `room_epoch` MUST equal the leader's AUTHORITATIVE room epoch
+        # (rooms.db, never a body claim). Without this, a sender + target both
+        # holding an old cache could relay/deliver against a superseded roster (the
+        # target only checks envelope-epoch == its OWN cached epoch). Fail closed on
+        # any mismatch so a relayed message is always at the current epoch.
+        if room_epoch != int(room["epoch"]):
+            return "", "relay_stale_epoch"
+        # The authenticated SENDER must be a room member (fail closed).
+        if not rooms.is_member(conn, room_id, sender_agent, sender_node):
+            return "", "relay_sender_not_member"
+        # Resolve the TARGET member's node — must be a member on exactly one
+        # OTHER node (not local, not absent, not ambiguous).
+        target_nodes = rooms.member_nodes_for_agent(conn, room_id, target_agent)
+        remote_targets = [n for n in target_nodes if n and n != this_node]
+        if not remote_targets:
+            return "", "relay_target_not_member"
+        if len(remote_targets) > 1:
+            return "", "relay_target_ambiguous"
+        return remote_targets[0], "ok"
+    finally:
+        conn.close()
+
+
+def _relay_precheck(env: dict[str, Any], cfg: dict[str, Any],
+                    peer_id: str) -> bool:
+    """Cheap pre-dedupe test: would this message be a leader-relay candidate?
+
+    True when `_relay_resolve` says this is a valid relay case ("ok") OR a
+    refreshable mismatch ("relay_stale_epoch") — both reach the dedupe+relay gate
+    so the latter returns an informative 409 (refresh-and-retry) rather than a
+    bare allowlist 403. A HARD refusal (relay_loop_blocked / sender_not_member /
+    target_not_member / target_ambiguous / db) returns False so the static-
+    allowlist 403 stands — a refused relay must NOT be let through to leak a
+    distinct error / room structure. The authoritative relay re-runs
+    `_relay_resolve` AFTER dedupe.
+    """
+    _target_node, reason = _relay_resolve(env, cfg, peer_id)
+    return reason in ("ok", "relay_stale_epoch")
+
+
+def maybe_relay_room_message(env: dict[str, Any], cfg: dict[str, Any],
+                             peer_id: str) -> RelayOutcome:
+    """Decide + PERFORM the leader-relay forward (runs AFTER the durable dedupe).
+
+    Re-resolves the relay authorization (`_relay_resolve`) and, on a valid case,
+    forwards a FRESH outbound /enqueue to the target member node re-signed with
+    the leader<->target pair key (stamped relayed_via — loop guard). Returns:
+      - RelayOutcome("not_applicable"): NOT a relay case (the caller continues
+        its normal room-membership gate / fail-closed deny).
+      - RelayOutcome("relayed", 202): the forward succeeded.
+      - RelayOutcome("refused", <status>, <reason>): a relay was indicated but a
+        fail-closed check or the send failed.
+    """
+    target_node, reason = _relay_resolve(env, cfg, peer_id)
+    if reason == "not_applicable":
+        return RelayOutcome("not_applicable")
+    if reason != "ok":
+        # A fail-closed refusal (loop / non-member sender / bad target / stale
+        # epoch / db). A stale epoch or an ambiguous target is a 409 (the joiner
+        # can refresh its roster and retry at the current epoch); everything else
+        # is a 403 deny.
+        status = 409 if reason in ("relay_target_ambiguous",
+                                   "relay_stale_epoch") else 403
+        return RelayOutcome("refused", status, reason)
+
+    room_id = str(env.get("room_id") or "")
+    room_epoch = int(env.get("room_epoch") or 0)
+    sender = env.get("sender", {})
+    sender_agent = str(sender.get("agent") or "") if isinstance(sender, dict) else ""
+    target_agent = str(env.get("target_agent") or "")
+    this_node = str(cfg.get("bridge_id") or "")
+
+    # Forward as a FRESH outbound /enqueue, re-signed with the leader<->target
+    # pair key, stamped relayed_via (loop guard). A send failure is reported.
+    ok, status, detail = _relay_forward_send(
+        cfg, env=env, room_id=room_id, room_epoch=room_epoch,
+        sender_agent=sender_agent, target_agent=target_agent,
+        target_node=target_node, leader_node=this_node)
+    if ok:
+        audit("room_relay_forward", peer=peer_id, room_id=room_id,
+              target=target_agent, target_node=target_node, status=status)
+        return RelayOutcome("relayed", 202, "relayed")
+    audit("room_relay_failed", peer=peer_id, room_id=room_id,
+          target=target_agent, target_node=target_node, detail=detail[:200],
+          security=True)
+    return RelayOutcome("refused", 502, f"relay_forward_failed: {detail}"[:200])
+
+
+def _relay_forward_send(cfg: dict[str, Any], *, env: dict[str, Any],
+                        room_id: str, room_epoch: int, sender_agent: str,
+                        target_agent: str, target_node: str,
+                        leader_node: str, timeout: float = 30.0,
+                        ) -> tuple[bool, int, str]:
+    """Sign + POST the leader-relayed leg to the target member node.
+
+    Re-signs with the leader<->target pair key (NEVER the original sender's
+    signature). The forwarded envelope preserves the room scope (`room_id` +
+    `room_epoch` so the target's OWN roster-cache gate validates membership), the
+    title/body/priority, and the ORIGINAL sender identity in `sender` so the
+    target sees who actually wrote it — but the wire-authenticated peer is now the
+    LEADER (the X-AGB-Peer + signature are the leader's). The `relayed_via`
+    marker is stamped so the target's receiver never re-relays it. Returns
+    (ok, http_status, detail). NEVER raises.
+    """
+    try:
+        peer = a2a.find_peer(cfg, target_node)
+        secret = a2a.peer_send_secret(peer)
+    except a2a.A2AError as exc:
+        return False, 0, f"no leader->target pair key ({getattr(exc, 'code', 'peer')}): {exc}"
+
+    # DETERMINISTIC forward message_id (codex P1 r2): derive it from the ORIGINAL
+    # (sender-peer, message_id) so a RE-FORWARD of the SAME inbound member->leader
+    # message (e.g. after a leader crash between target-receipt and the local
+    # dedupe promote) reuses the SAME forward id — the TARGET's own per-(peer,
+    # message_id) dedupe then collapses the re-forward into an idempotent
+    # duplicate instead of delivering the message twice. A fresh random id would
+    # make every re-forward a distinct leg → double delivery. The id is namespaced
+    # `<leader>:relay:<hex>` (hex = sha256 of the original sender peer + original
+    # message_id, truncated) so it cannot collide with a normal `<leader>:uuid`.
+    sender = env.get("sender", {})
+    orig_peer = str(sender.get("bridge") or "") if isinstance(sender, dict) else ""
+    orig_message_id = str(env.get("message_id") or "")
+    relay_seed = f"{orig_peer}\x00{orig_message_id}".encode("utf-8")
+    message_id = (f"{leader_node}:relay:"
+                  f"{hashlib.sha256(relay_seed).hexdigest()[:32]}")
+    # Rebuild a FRESH envelope. The AUTHENTICATED sender (sender.bridge) is the
+    # LEADER node — the leg is re-signed with the leader->target pair key, so the
+    # target's reject_sender_mismatch passes (peer == sender.bridge == leader) and
+    # the target verifies the LEADER, NEVER the original member. The ORIGINAL
+    # author (the member the leader VOUCHED for after verifying its member->leader
+    # HMAC + membership) is carried as relayed_from {agent, node}; the target's
+    # room-membership gate validates THAT identity against its cached roster. The
+    # reply_to also points back at the original author so a reply routes correctly.
+    orig_sender_node = orig_peer
+    forward_env = a2a.build_envelope(
+        message_id=message_id,
+        sender_bridge=leader_node,
+        sender_agent=sender_agent,
+        target_agent=target_agent,
+        priority=str(env.get("priority", "normal")),
+        title=str(env.get("title", "")),
+        body=str(env.get("body", "")),
+        reply_peer=orig_sender_node or leader_node,
+        reply_agent=sender_agent,
+        room_id=room_id,
+        room_epoch=int(room_epoch),
+        relayed_via=leader_node,
+        relayed_from_agent=sender_agent,
+        relayed_from_node=orig_sender_node,
+    )
+    body_bytes = json.dumps(forward_env, ensure_ascii=False).encode("utf-8")
+    path = peer.get("enqueue_path",
+                    cfg.get("listen", {}).get("enqueue_path", "/enqueue"))
+    timestamp = str(a2a.now_ts())
+    body_hash = a2a.body_sha256(body_bytes)
+    # The X-AGB-Peer is the LEADER (the leader is the authenticated sender on this
+    # leg); the canonical is signed with the leader<->target secret.
+    canonical = a2a.canonical_string(
+        "POST", path, leader_node, message_id, timestamp, body_hash)
+    signature = a2a.sign(secret, canonical)
+    headers = {
+        "Content-Type": "application/json",
+        "X-AGB-Protocol": a2a.PROTOCOL_VERSION,
+        "X-AGB-Peer": leader_node,
+        "X-AGB-Message-Id": message_id,
+        "X-AGB-Timestamp": timestamp,
+        "X-AGB-Body-SHA256": body_hash,
+        "X-AGB-Signature": signature,
+    }
+
+    # Test seam (paired-flag, prod-inert): mirror the rooms sender so the smoke
+    # can CAPTURE the re-signed relay leg and replay it through the real target
+    # receiver. NEVER honored in production (the paired flags are unset there).
+    if _relay_test_post_hook_allowed():
+        return _relay_invoke_test_post_hook(
+            path=path, headers=headers, body_bytes=body_bytes)
+
+    try:
+        address = a2a.resolve_peer_address_for_transport(
+            a2a.transport_kind(cfg), peer)
+    except a2a.A2AError as exc:
+        return False, 0, f"target addr unresolved: {exc}"
+    port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
+    if not address:
+        return False, 0, "target node has no resolvable address"
+    url = f"http://{address}:{port}{path}"
+    req = urllib.request.Request(url, data=body_bytes, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = int(resp.status)
+            return (200 <= status < 300), status, f"status={status}"
+    except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
+        return False, int(exc.code), f"status={exc.code}"
+    except Exception as exc:  # noqa: BLE001 - transport failure
+        return False, 0, f"send failed: {exc}"
+
+
+def _relay_test_post_hook_allowed() -> bool:
+    """Paired-flag gate for the relay POST test seam (prod-inert).
+
+    Mirrors the rooms sender's seam: BOTH insecure-test flags AND a hook path
+    must be set, so a single stale env var can NEVER fire it in production.
+    """
+    return (os.environ.get("BRIDGE_ROOMS_ALLOW_TEST_UID_MAP") == "1"  # noqa: iso-helper-boundary - env var, not a .env file
+            and os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") == "1"  # noqa: iso-helper-boundary - env var, not a .env file
+            and bool(os.environ.get("BRIDGE_ROOMS_TEST_RELAY_HOOK")))  # noqa: iso-helper-boundary - env var, not a .env file
+
+
+def _relay_invoke_test_post_hook(*, path: str, headers: dict,
+                                 body_bytes: bytes) -> tuple[bool, int, str]:
+    """Write the re-signed relay leg to the hook file; return a stubbed success.
+
+    The hook value is a file path the smoke reads to assert on the re-signed
+    relay request (then replays it against the real target receiver). Returns
+    (ok, 202, detail).
+    """
+    import subprocess
+
+    hook = os.environ["BRIDGE_ROOMS_TEST_RELAY_HOOK"]  # noqa: iso-helper-boundary - env var, not a .env file
+    payload = {"path": path, "headers": headers,
+               "body": body_bytes.decode("utf-8")}
+    try:
+        proc = subprocess.run([hook, json.dumps(payload)],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, 0, f"relay test hook failed: {exc}"
+    if proc.returncode != 0:
+        return False, 503, (proc.stderr or "relay hook non-zero")[:200]
+    return True, 202, "relayed (test hook)"
 
 
 # --------------------------------------------------------------------------
@@ -2283,12 +2668,33 @@ class HandoffHandler(BaseHTTPRequestHandler):
 
         # --- allowlist: exact (peer, target) match, no wildcard default ---
         allowlist = peer.get("inbound_allowlist", [])
+        # `relay_candidate` is set ONLY when the target is NOT in the static
+        # allowlist AND this is a valid leader-relay case — so the dedupe+relay
+        # gate runs the forward ONLY for a deferred-allowlist message, never for a
+        # normal local-delivery message whose target IS allowlisted (that path
+        # must not be diverted into the relay branch — e.g. a relay LEG arriving
+        # at the target, whose `carol` IS allowlisted, must deliver locally).
+        relay_candidate = False
         if not isinstance(allowlist, list) or target not in allowlist:
-            audit("reject_allowlist", peer=peer_id, client=client_ip,
-                  target=target, message_id=message_id, security=True)
-            self._reply(403, {"ok": False,
-                              "error": f"target '{target}' not in allowlist for peer"})
-            return
+            # Lane 5 (#1695-P2 gotcha E): a room-scoped message whose target is a
+            # REMOTE room member is NOT in the leader's static inbound_allowlist
+            # (the leader never delivers to it locally — it RELAYS). Such a
+            # message is NOT rejected by the static allowlist; it DEFERS to the
+            # relay path, whose authorization is ROOM-MEMBERSHIP-derived
+            # (fail-closed, no wildcard) and which runs AFTER the durable dedupe
+            # (so a replayed member->leader message is deduped at the leader and
+            # never re-forwarded). `_relay_precheck` is a CHEAP read-only test
+            # (room-scoped + this node leads the room + authenticated sender is a
+            # member); only then do we let it through to the dedupe+relay gate. A
+            # non-room message, or a message this node does not lead, or a
+            # non-member sender STILL hits the static-allowlist 403 here.
+            if not _relay_precheck(env, cfg, peer_id):
+                audit("reject_allowlist", peer=peer_id, client=client_ip,
+                      target=target, message_id=message_id, security=True)
+                self._reply(403, {"ok": False,
+                                  "error": f"target '{target}' not in allowlist for peer"})
+                return
+            relay_candidate = True
 
         # NOTE: the room-scoped membership check (A2A rooms, design §14 R2)
         # runs INSIDE _handle_dedupe_and_enqueue, AFTER the durable dedupe
@@ -2308,7 +2714,9 @@ class HandoffHandler(BaseHTTPRequestHandler):
 
         # --- durable dedupe ---
         try:
-            self._handle_dedupe_and_enqueue(cfg, peer, env, computed_hash, client_ip)
+            self._handle_dedupe_and_enqueue(
+                cfg, peer, env, computed_hash, client_ip,
+                relay_candidate=relay_candidate)
         except Exception as exc:  # noqa: BLE001 - last-resort guard
             audit("error_internal", peer=peer_id, client=client_ip,
                   message_id=message_id, detail=str(exc)[:300])
@@ -2317,6 +2725,7 @@ class HandoffHandler(BaseHTTPRequestHandler):
     def _handle_dedupe_and_enqueue(
         self, cfg: dict[str, Any], peer: dict[str, Any],
         env: dict[str, Any], body_hash: str, client_ip: str,
+        relay_candidate: bool = False,
     ) -> None:
         message_id = env["message_id"]
         peer_id = peer.get("id", "")
@@ -2324,6 +2733,26 @@ class HandoffHandler(BaseHTTPRequestHandler):
         sender = sender_obj if isinstance(sender_obj, dict) else {}
         sender_bridge = str(sender.get("bridge", "unknown"))
         sender_agent = str(sender.get("agent", "unknown"))
+        # Lane 5 (#1695-P2 gotcha E) provenance: on a leader-RELAYED leg the
+        # authenticated/`sender.bridge` is the LEADER (it re-signed the leg), but
+        # the actual AUTHOR is the leader-vouched original member in `relayed_from`.
+        # The DELIVERED task must be attributed to the ORIGINAL AUTHOR, not the
+        # relaying leader — otherwise a relayed task appears as `a2a:<leader>:
+        # <author>`, a leader-identity spoof. The rewrite is gated on BOTH
+        # `relayed_via` AND `room_scoped`: a non-room envelope can NEVER be a
+        # legitimate relay leg (relay only forwards room-scoped messages), so a
+        # NON-room message carrying a forged `relayed_via`+`relayed_from` keeps its
+        # REAL authenticated-peer provenance and is never rewritten (closes the
+        # provenance-spoof codex P1 r2 raised). A room-scoped relayed leg, in turn,
+        # only reaches the DELIVERY (enqueue) path after room_scoped_check has
+        # validated peer==cached-leader + the original author's membership+epoch —
+        # so by the time we rewrite, the relayed_from is leader-vouched + validated.
+        if (a2a.envelope_is_relayed(env)  # noqa: iso-helper-boundary - a2a.envelope_* call, not a .env file
+                and a2a.envelope_is_room_scoped(env)):  # noqa: iso-helper-boundary - a2a.envelope_* call, not a .env file
+            rf_agent, rf_node = a2a.relayed_from(env)
+            if rf_agent and rf_node:
+                sender_bridge = rf_node
+                sender_agent = rf_agent
         a2a.ensure_handoff_dirs()
         conn = a2a.open_inbox()
         staged: Optional[Path] = None
@@ -2397,6 +2826,94 @@ class HandoffHandler(BaseHTTPRequestHandler):
             if existing is not None:
                 if existing["body_sha256"] == body_hash:
                     task_id = str(existing["created_task_id"] or "")
+                    # Lane 5 (#1695-P2 gotcha E) relay sentinels. A 'relayed' row
+                    # is TERMINAL — the leader->target forward already succeeded;
+                    # a replay is an idempotent duplicate (NEVER re-forwarded). A
+                    # 'relaying' row is a forward IN FLIGHT (reserved before the
+                    # network leg, not yet promoted/cleared): a concurrent replay
+                    # must NOT be reported as a completed task (it is not one) — it
+                    # is retryable. A 'relaying' row OLDER than the pending-retry
+                    # budget is treated as ABANDONED (the forwarding process died
+                    # before promote/delete): we re-arm it as this delivery's
+                    # reservation and re-attempt the relay below, so a crash can
+                    # never permanently wedge a (peer, message_id) behind a false
+                    # 200/503.
+                    if task_id == "relayed":
+                        conn.execute(
+                            "UPDATE inbox_dedupe SET last_seen_ts=?, "
+                            "delivery_count=delivery_count+1 "
+                            "WHERE peer=? AND message_id=?",
+                            (a2a.now_ts(), peer_id, message_id))
+                        conn.commit()
+                        audit("room_relay_duplicate", peer=peer_id,
+                              client=client_ip, message_id=message_id)
+                        self._reply(200, {"ok": True, "duplicate": True,
+                                          "relayed": True})
+                        return
+                    if task_id == "relaying":
+                        relaying_age = a2a.now_ts() - int(
+                            existing["first_seen_ts"] or a2a.now_ts())
+                        if relaying_age < pending_retry_seconds():
+                            # Forward in flight elsewhere — retryable, NOT a
+                            # completed task.
+                            conn.execute(
+                                "UPDATE inbox_dedupe SET last_seen_ts=?, "
+                                "delivery_count=delivery_count+1 "
+                                "WHERE peer=? AND message_id=?",
+                                (a2a.now_ts(), peer_id, message_id))
+                            conn.commit()
+                            audit("room_relay_inflight", peer=peer_id,
+                                  client=client_ip, message_id=message_id,
+                                  age=relaying_age)
+                            self._reply(503, {"ok": False,
+                                              "error": "relay in flight, retry"},
+                                        extra_headers={"Retry-After": "5"})
+                            return
+                        # Abandoned 'relaying' row (the prior forwarder died before
+                        # promote/delete) → RE-ARM the reservation timestamp and
+                        # COMMIT FIRST so the inbox write lock is RELEASED before we
+                        # touch the network (codex P1 r2: never hold the lock across
+                        # the forward; never re-attempt on a stale timestamp). The
+                        # re-arm bumps first_seen_ts to NOW so a CONCURRENT delivery
+                        # racing this same abandoned row sees it as freshly in-flight
+                        # (503) instead of also re-forwarding. The forward id is
+                        # DETERMINISTIC (derived from the original sender+id), so even
+                        # if the prior forward DID reach the target before the crash,
+                        # this re-forward collapses into the target's own idempotent
+                        # duplicate — no double delivery.
+                        now = a2a.now_ts()
+                        conn.execute(
+                            "UPDATE inbox_dedupe SET first_seen_ts=?, "
+                            "last_seen_ts=?, delivery_count=delivery_count+1 "
+                            "WHERE peer=? AND message_id=?",
+                            (now, now, peer_id, message_id))
+                        conn.commit()  # release the lock BEFORE the network forward
+                        relay = maybe_relay_room_message(env, cfg, peer_id)
+                        if relay.action == "relayed":
+                            conn.execute("BEGIN IMMEDIATE")
+                            conn.execute(
+                                "UPDATE inbox_dedupe SET created_task_id='relayed', "
+                                "last_seen_ts=? WHERE peer=? AND message_id=?",
+                                (a2a.now_ts(), peer_id, message_id))
+                            conn.commit()
+                            self._reply(relay.status,
+                                        {"ok": True, "relayed": True,
+                                         "room_id": env.get("room_id")})
+                            return
+                        # Re-attempt no longer relays (refused / membership changed)
+                        # → drop the stale reservation so the message is cleanly
+                        # denied (and a future legitimate re-send can re-reserve).
+                        conn.execute("BEGIN IMMEDIATE")
+                        conn.execute(
+                            "DELETE FROM inbox_dedupe WHERE peer=? AND "
+                            "message_id=? AND created_task_id='relaying'",
+                            (peer_id, message_id))
+                        conn.commit()
+                        status = relay.status if relay.action == "refused" else 403
+                        reason = (relay.reason if relay.action == "refused"
+                                  else "relay no longer applicable")
+                        self._reply(status, {"ok": False, "error": reason})
+                        return
                     if task_id:
                         # Same id + same body → idempotent success.
                         conn.execute(
@@ -2484,6 +3001,85 @@ class HandoffHandler(BaseHTTPRequestHandler):
                                       "error": "message id reused with different body"})
                     return
             else:
+                # Lane 5 (#1695-P2 gotcha E): leader-relay short-circuit. A NEW
+                # room-scoped message whose target is a REMOTE room member is
+                # FORWARDED by the leader (not enqueued locally). It runs HERE —
+                # AFTER the durable dedupe lookup (a replay of the same
+                # member->leader message was already caught above as a duplicate
+                # and returned WITHOUT re-relaying) and BEFORE the local
+                # room-membership gate (which would otherwise deny a remote target
+                # as not-a-local-member). It is gated on `relay_candidate` (the
+                # target was NOT in the static allowlist, only reachable via relay)
+                # so a normal local-delivery message is never diverted here.
+                #
+                # CONCURRENCY: we RESERVE the (peer, message_id) dedupe row FIRST
+                # (sentinel 'relaying') inside the held BEGIN IMMEDIATE + COMMIT —
+                # the composite PK SERIALIZES concurrent same-id deliveries, so at
+                # most ONE wins the reservation and forwards (no double-relay /
+                # amplification). We then RELEASE the lock and do the network
+                # forward OUTSIDE it. On a SUCCESS the sentinel is promoted to
+                # 'relayed' (a later replay is an idempotent duplicate, never
+                # re-forwarded). On a transient FAILURE the reservation is DELETED
+                # so a retry re-attempts the relay (no lost message); a fail-closed
+                # REFUSAL (loop / non-member / bad target) also deletes it (the
+                # message is denied, not retried as a relay).
+                _rtgt, _rreason = (("", "not_applicable") if not relay_candidate
+                                   else _relay_resolve(env, cfg, peer_id))
+                if _rreason != "not_applicable":
+                    now = a2a.now_ts()
+                    # The lock is still held (BEGIN IMMEDIATE above). Reserve the
+                    # row; a concurrent same-id delivery that already reserved it
+                    # loses here and we treat it as an in-flight duplicate (503
+                    # retry) rather than double-forwarding.
+                    try:
+                        conn.execute(
+                            "INSERT INTO inbox_dedupe (message_id, peer, "
+                            "body_sha256, created_task_id, first_seen_ts, "
+                            "last_seen_ts, delivery_count) "
+                            "VALUES (?, ?, ?, 'relaying', ?, ?, 1)",
+                            (message_id, peer_id, body_hash, now, now),
+                        )
+                        conn.commit()
+                    except sqlite3.IntegrityError:
+                        # A racing delivery reserved it first — do not double-relay.
+                        conn.rollback()
+                        audit("room_relay_inflight", peer=peer_id,
+                              client=client_ip, message_id=message_id)
+                        self._reply(503, {"ok": False,
+                                          "error": "relay in flight, retry"},
+                                    extra_headers={"Retry-After": "5"})
+                        return
+                    # Forward OUTSIDE the lock (the reservation is committed).
+                    relay = maybe_relay_room_message(env, cfg, peer_id)
+                    if relay.action == "relayed":
+                        conn.execute("BEGIN IMMEDIATE")
+                        conn.execute(
+                            "UPDATE inbox_dedupe SET created_task_id='relayed', "
+                            "last_seen_ts=? WHERE peer=? AND message_id=?",
+                            (a2a.now_ts(), peer_id, message_id))
+                        conn.commit()
+                        self._reply(relay.status, {"ok": True, "relayed": True,
+                                                   "room_id": env.get("room_id")})
+                        return
+                    # Not relayed → release the reservation so a retry can re-try
+                    # (transient send failure) or so the message is cleanly denied
+                    # (a fail-closed refusal). A relayed message is never lost; a
+                    # refused one is never silently dropped behind a stale dedupe.
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        "DELETE FROM inbox_dedupe WHERE peer=? AND message_id=? "
+                        "AND created_task_id='relaying'",
+                        (peer_id, message_id))
+                    conn.commit()
+                    if relay.action == "refused":
+                        self._reply(relay.status,
+                                    {"ok": False, "error": relay.reason})
+                        return
+                    # relay turned not_applicable on the authoritative resolve (a
+                    # racing membership change) — fall through to the normal gate
+                    # with a fresh transaction the gate + insert expect.
+                    conn.execute("BEGIN IMMEDIATE")
+
                 if not gate_new_enqueue():
                     return
 

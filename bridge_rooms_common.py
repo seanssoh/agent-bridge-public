@@ -644,6 +644,35 @@ CREATE TABLE IF NOT EXISTS invite_nonce_seen (
   seen_ts    INTEGER NOT NULL,
   PRIMARY KEY (room_id, nonce)
 );
+
+-- Lane 5 (#1695-P2 gotcha F): LEADER-side DURABLE roster-broadcast outbox. Every
+-- membership change (approve / kick / leave / deny) enqueues ONE pending row per
+-- remote member node naming the room + the epoch to converge it to. The CLI
+-- attempts an immediate best-effort delivery; a row that is NOT acked (member
+-- node offline) survives so the periodic `roster_epoch_reconcile` heartbeat
+-- re-broadcasts it until the member converges (anti-entropy — design §6/§14 R2).
+-- This carries ONLY room control-plane targeting (room_id, member_node, epoch) —
+-- NEVER a token / secret / roster body (the body is rebuilt from the leader's
+-- authoritative rooms.db at send time, so the outbox can never go stale on a
+-- later epoch bump and never persists secret material). It is keyed by
+-- (room_id, member_node): one outstanding convergence target per member node,
+-- the `epoch` column carrying the HIGHEST epoch that node still needs — a newer
+-- membership change simply RAISES the target epoch on the existing row
+-- (idempotent; epoch monotonic, never lowered). `status` is 'pending' until the
+-- member acks at >= this epoch, then 'done'.
+CREATE TABLE IF NOT EXISTS room_roster_outbox (
+  room_id       TEXT NOT NULL,
+  member_node   TEXT NOT NULL,
+  epoch         INTEGER NOT NULL DEFAULT 0,
+  status        TEXT NOT NULL DEFAULT 'pending',
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  last_error    TEXT NOT NULL DEFAULT '',
+  created_ts    INTEGER NOT NULL,
+  updated_ts    INTEGER NOT NULL,
+  PRIMARY KEY (room_id, member_node)
+);
+CREATE INDEX IF NOT EXISTS idx_roster_outbox_status
+  ON room_roster_outbox(status, updated_ts);
 """
 
 
@@ -1212,6 +1241,25 @@ def is_member(conn: sqlite3.Connection, room_id: str, agent: str,
     return row is not None
 
 
+def member_nodes_for_agent(conn: sqlite3.Connection, room_id: str,
+                           agent: str) -> list[str]:
+    """The node(s) on which `agent` is an AUTHORITATIVE member of `room_id`.
+
+    Lane 5 (#1695-P2 gotcha E) leader-relay support: read from the leader's
+    authoritative `room_members` (NEVER a body claim) so the relay can resolve a
+    target member agent to its node. Deterministically sorted. An agent absent
+    from the room returns []. Normally one node per (room, agent), but the schema
+    permits an agent name on multiple nodes — all are returned so the caller can
+    fail closed on ambiguity.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT node FROM room_members WHERE room_id=? AND agent=? "
+        "ORDER BY node",
+        (room_id, agent),
+    ).fetchall()
+    return [str(r["node"] or "") for r in rows]
+
+
 def add_member(conn: sqlite3.Connection, room_id: str, agent: str,
                node: str = "", role: str = ROLE_MEMBER) -> None:
     conn.execute(
@@ -1629,6 +1677,340 @@ def remove_and_bump(conn: sqlite3.Connection, room_id: str, agent: str,
         )
     # bump_epoch re-persists room_roster_cache atomically (centralized in F2).
     return bump_epoch(conn, room_id)
+
+
+# --------------------------------------------------------------------------
+# Lane 5 (#1695-P2 gotcha F): DURABLE roster-broadcast outbox (leader-side)
+# --------------------------------------------------------------------------
+#
+# A membership change on the leader (approve / kick / leave / deny) must reach
+# every REMOTE member node so its leader-MAC'd roster cache converges. The prior
+# approve path did a best-effort synchronous broadcast only — a member node that
+# was momentarily offline simply missed the update (the kick/leave/deny paths did
+# not broadcast at all). This durable outbox closes both gaps: the membership
+# change records a pending convergence target per remote member node, the CLI
+# tries an immediate delivery, and the periodic `roster_epoch_reconcile`
+# heartbeat re-broadcasts any row a member has not yet acked.
+#
+# SECURITY: the outbox stores ONLY (room_id, member_node, epoch) — never a token,
+# secret, or roster body. The actual broadcast body is rebuilt from the leader's
+# AUTHORITATIVE rooms.db at send time (`roster_for`), so a queued row can never
+# carry a stale roster and never persists secret material. Membership/target are
+# always read from rooms.db, never a body claim.
+
+# Bounded retry budget (codex P2 r2): a pending outbox row that fails this many
+# delivery attempts WITHOUT an ack is RETIRED so a permanently-gone member (e.g. a
+# kicked node that never returns) cannot leave a zombie row the heartbeat retries
+# forever. A later membership change re-arms the node (UPSERT resets status +
+# attempts), so a node that comes back still converges on the next real change.
+ROSTER_OUTBOX_MAX_ATTEMPTS = 12
+
+
+def _target_member_nodes(conn: sqlite3.Connection, room_id: str,
+                         leader_node: str) -> list[str]:
+    """The DISTINCT remote member nodes that should receive a roster broadcast.
+
+    Read from the authoritative rooms.db `room_members` (NEVER a body claim).
+    Excludes the leader's own node (the leader already holds the authoritative
+    rooms.db — no node-link hop) and the empty node (a local single-node member).
+    Deterministically sorted for reproducible enqueue/broadcast order.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT node FROM room_members WHERE room_id=?",
+        (room_id,),
+    ).fetchall()
+    nodes: set[str] = set()
+    for r in rows:
+        n = str(r["node"] or "")
+        if n and n != leader_node:
+            nodes.add(n)
+    return sorted(nodes)
+
+
+def enqueue_roster_broadcast(conn: sqlite3.Connection, room_id: str,
+                             epoch: int, leader_node: str,
+                             extra_nodes: Optional[list[str]] = None
+                             ) -> list[str]:
+    """Record a durable convergence target for every remote member node (F).
+
+    Called by the leader-side membership-change broadcast after the epoch bump.
+    For each remote member node, UPSERTs a `room_roster_outbox` row at the new
+    epoch (raising the target epoch monotonically on any existing row — a queued
+    row is never lowered, and a re-pending RESETS attempts so an already-given-up
+    row re-converges on the next change). Returns the list of member nodes that
+    now have a pending convergence target. Membership is read from rooms.db.
+
+    `extra_nodes` (codex P2 — kick/leave convergence): a just-REMOVED node is no
+    longer in room_members, so the new roster (in which it is absent) would never
+    be delivered to it and its local cache would stay stale indefinitely. A
+    kick/leave caller passes the removed node here so it ALSO gets a one-shot
+    convergence target — it receives the higher-epoch roster that drops it and
+    locally converges (drops the room). The removed node is enqueued only if it is
+    a distinct REMOTE node (not the leader's own node). A subsequent successful
+    ack clears the row; if it never acks it ages out under the heartbeat's bounded
+    retries (no permanent zombie — it is not re-enqueued on later changes since it
+    is no longer a member).
+    """
+    targets = _target_member_nodes(conn, room_id, leader_node)
+    seen = set(targets)
+    for node in (extra_nodes or []):
+        node = str(node or "")
+        if node and node != leader_node and node not in seen:
+            targets.append(node)
+            seen.add(node)
+    ts = now_ts()
+    for node in targets:
+        # UPSERT: raise the epoch monotonically (MAX of existing/new), reset the
+        # row to pending + attempts=0 so a change re-arms a previously-done or
+        # backed-off target. epoch is clamped to never go below the existing.
+        conn.execute(
+            "INSERT INTO room_roster_outbox "
+            "(room_id, member_node, epoch, status, attempts, last_error, "
+            " created_ts, updated_ts) "
+            "VALUES (?, ?, ?, 'pending', 0, '', ?, ?) "
+            "ON CONFLICT(room_id, member_node) DO UPDATE SET "
+            "  epoch=MAX(room_roster_outbox.epoch, excluded.epoch), "
+            "  status='pending', attempts=0, last_error='', updated_ts=excluded.updated_ts",
+            (room_id, node, int(epoch), ts, ts),
+        )
+    conn.commit()
+    return targets
+
+
+def pending_roster_outbox(conn: sqlite3.Connection,
+                          room_id: str = "") -> list[sqlite3.Row]:
+    """The pending durable roster-broadcast targets (optionally one room).
+
+    Read by the reconcile heartbeat + the CLI immediate-send. Ordered by
+    updated_ts so the oldest unconverged target is retried first.
+    """
+    if room_id:
+        return conn.execute(
+            "SELECT room_id, member_node, epoch, attempts FROM room_roster_outbox "
+            "WHERE status='pending' AND room_id=? ORDER BY updated_ts",
+            (room_id,),
+        ).fetchall()
+    return conn.execute(
+        "SELECT room_id, member_node, epoch, attempts FROM room_roster_outbox "
+        "WHERE status='pending' ORDER BY updated_ts",
+    ).fetchall()
+
+
+def mark_roster_outbox_done(conn: sqlite3.Connection, room_id: str,
+                            member_node: str, epoch: int) -> None:
+    """Mark a member node converged at >= `epoch` (delivery acked).
+
+    Only clears the row if the queued target epoch is NOT newer than the acked
+    epoch — a row whose target was raised by a concurrent membership change after
+    this send began stays pending (it must re-broadcast the newer roster). This
+    keeps the outbox monotonic: an ack never masks a still-needed higher epoch.
+    """
+    conn.execute(
+        "UPDATE room_roster_outbox SET status='done', last_error='', "
+        "updated_ts=? WHERE room_id=? AND member_node=? AND epoch<=?",
+        (now_ts(), room_id, member_node, int(epoch)),
+    )
+    conn.commit()
+
+
+def record_roster_outbox_failure(conn: sqlite3.Connection, room_id: str,
+                                 member_node: str, error: str) -> None:
+    """Record a delivery failure on a pending row (stays pending for retry).
+
+    Bumps the attempt counter + stores a SHORT non-secret error string. The row
+    remains pending so the reconcile heartbeat re-attempts it (bounded by the
+    reconcile.db backoff gate, not a per-row sleep). NEVER stores a secret.
+
+    RETIREMENT (codex P2 r2): once a row has failed `ROSTER_OUTBOX_MAX_ATTEMPTS`
+    times WITHOUT being acked, it is RETIRED (status='retired') so a member that
+    is permanently gone (e.g. a kicked node that never comes back) cannot leave a
+    zombie pending row that the heartbeat re-attempts forever. A retirement is
+    NOT a delivery — a LATER membership change re-arms the node via
+    `enqueue_roster_broadcast` (which resets status='pending' + attempts=0 on the
+    UPSERT), so a node that returns still converges on the next real change. A
+    retired row is also re-armed if the SAME node is re-added later.
+    """
+    conn.execute(
+        "UPDATE room_roster_outbox SET attempts=attempts+1, last_error=?, "
+        "updated_ts=? WHERE room_id=? AND member_node=? AND status='pending'",
+        (str(error)[:200], now_ts(), room_id, member_node),
+    )
+    # Retire a row that has exhausted its bounded retry budget (no zombie).
+    conn.execute(
+        "UPDATE room_roster_outbox SET status='retired', updated_ts=? "
+        "WHERE room_id=? AND member_node=? AND status='pending' AND attempts>=?",
+        (now_ts(), room_id, member_node, ROSTER_OUTBOX_MAX_ATTEMPTS),
+    )
+    conn.commit()
+
+
+# --------------------------------------------------------------------------
+# Lane 5 (#1695-P2 gotcha F): shared roster-broadcast SENDER + reconcile heartbeat
+# --------------------------------------------------------------------------
+#
+# The SINGLE signed-broadcast send path, importable by both the CLI (immediate
+# best-effort delivery on a membership change) and the reconcile daemon heartbeat
+# (anti-entropy re-broadcast of any un-acked durable outbox row). Keeping ONE
+# sender means the canonical string / signature / protocol tag never diverge
+# between the two callers. The pairwise leader↔member node-link HMAC is the auth;
+# membership is rebuilt from the leader's authoritative rooms.db, never the body.
+
+
+def _roster_test_post_hook_allowed() -> bool:
+    """Paired-flag gate for the cross-node POST test seam (prod-inert).
+
+    Mirrors bridge-rooms.py `_test_post_hook_allowed` so the reconcile heartbeat
+    SENDER replays through the same smoke capture hook. BOTH insecure-test flags
+    AND the hook path must be set — a single stale env var cannot fire it in
+    production.
+    """
+    return (os.environ.get("BRIDGE_ROOMS_ALLOW_TEST_UID_MAP") == "1"  # noqa: iso-helper-boundary - env var, not a .env file
+            and os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") == "1"  # noqa: iso-helper-boundary - env var, not a .env file
+            and bool(os.environ.get("BRIDGE_ROOMS_TEST_POST_HOOK")))  # noqa: iso-helper-boundary - env var, not a .env file
+
+
+def send_roster_broadcast(cfg: dict, *, member_node: str, room_id: str,
+                          room_epoch: int, members: list,
+                          leader_node: str, timeout: float = 30.0,
+                          ) -> tuple[int, bytes]:
+    """Sign + POST ONE leader-signed roster broadcast to one member node.
+
+    The shared SENDER (CLI immediate + reconcile heartbeat). Signs the canonical
+    roster with the leader-node↔member-node PAIRWISE node-link HMAC (the existing
+    per-peer secret — NEVER a token, never the original sender's signature). The
+    PATH is in the canonical string so a roster signature cannot be replayed
+    against the enqueue/join endpoints. Returns (http_status, response_body).
+    Honors the BRIDGE_ROOMS_TEST_POST_HOOK paired test seam (prod-inert) so the
+    smoke can capture + replay the signed request through the real receiver.
+
+    `members` is the canonical sorted roster (rebuilt from rooms.db by the
+    caller); `leader_node` is THIS leader's node id. Raises RoomsError on a
+    config / peer / secret fault (the caller records it as a delivery failure).
+    """
+    import bridge_a2a_common as a2a  # local import: a2a is the lower layer
+
+    local_bridge_id = str(cfg.get("bridge_id", "") or "").strip()
+    if not local_bridge_id:
+        raise RoomsError(
+            "config has no 'bridge_id' — cannot identify this leader node for a "
+            "roster broadcast", code="no_bridge_id")
+    peer = a2a.find_peer(cfg, member_node)
+    secret = a2a.peer_send_secret(peer)
+    body = a2a.build_room_roster_broadcast(
+        room_id=room_id, room_epoch=int(room_epoch), members=members,
+        leader_node=leader_node)
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    message_id = a2a.new_message_id(local_bridge_id)
+    path = peer.get("room_roster_path", a2a.ROOM_ROSTER_PATH)
+    timestamp = str(a2a.now_ts())
+    body_hash = a2a.body_sha256(body_bytes)
+    canonical = a2a.canonical_string(
+        "POST", path, local_bridge_id, message_id, timestamp, body_hash)
+    signature = a2a.sign(secret, canonical)
+    headers = {
+        "Content-Type": "application/json",
+        "X-AGB-Protocol": a2a.ROOM_ROSTER_PROTOCOL_VERSION,
+        "X-AGB-Peer": local_bridge_id,
+        "X-AGB-Message-Id": message_id,
+        "X-AGB-Timestamp": timestamp,
+        "X-AGB-Body-SHA256": body_hash,
+        "X-AGB-Signature": signature,
+    }
+
+    if _roster_test_post_hook_allowed():
+        import subprocess
+        hook = os.environ["BRIDGE_ROOMS_TEST_POST_HOOK"]  # noqa: iso-helper-boundary - env var, not a .env file
+        payload = {"path": path, "headers": headers,
+                   "body": body_bytes.decode("utf-8")}
+        try:
+            proc = subprocess.run([hook, json.dumps(payload)],
+                                  capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RoomsError(f"test post hook failed: {exc}",
+                             code="test_hook_error")
+        if proc.returncode != 0:
+            return 503, (proc.stderr or "test hook non-zero").encode("utf-8")
+        return 200, (proc.stdout or "").encode("utf-8")
+
+    address = a2a.resolve_peer_address_for_transport(
+        a2a.transport_kind(cfg), peer)
+    port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
+    if not address:
+        raise RoomsError(
+            f"member node {member_node!r} has no resolvable address",
+            code="no_member_address")
+    import urllib.error
+    import urllib.request
+    url = f"http://{address}:{port}{path}"
+    req = urllib.request.Request(url, data=body_bytes, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
+        return exc.code, (exc.read() or b"")
+
+
+def heartbeat_rebroadcast_rosters(cfg: dict, conn: sqlite3.Connection,
+                                  *, max_sends: int = 64) -> dict[str, int]:
+    """Re-broadcast every un-acked durable roster outbox row for THIS leader.
+
+    The reconcile heartbeat side of gotcha F (anti-entropy). For each pending
+    `room_roster_outbox` row whose room is led by THIS node (leader_node ==
+    cfg.bridge_id — read from rooms.db, NEVER a body claim), rebuild the
+    authoritative roster, send it, and clear/keep the durable row on ack/failure.
+    Bounded by `max_sends` per tick (the reconcile.db backoff gate paces the
+    whole step; this cap just bounds one tick's fan-out). Returns
+    {"sent": n_delivered, "failed": n_failed, "pending": n_remaining} so the
+    adapter can map it to step_converged / step_changed / step_error.
+
+    A row whose room this node does NOT lead is a stale artifact (e.g. leadership
+    moved) — it is marked done WITHOUT a send (never broadcast a roster we are not
+    the authoritative leader of). Membership/epoch always from rooms.db.
+    """
+    local_node = str(cfg.get("bridge_id", "") or "").strip()
+    sent = 0
+    failed = 0
+    rows = pending_roster_outbox(conn)
+    for row in rows[:max_sends]:
+        room_id = str(row["room_id"])
+        member_node = str(row["member_node"])
+        room = get_room(conn, room_id)
+        # Only the AUTHORITATIVE leader re-broadcasts. A row for a room we do not
+        # lead (or that no longer exists) is retired without a send (fail-closed:
+        # never sign a roster for a room we are not the leader of).
+        if room is None or str(room["leader_node"] or "") != local_node or not local_node:
+            mark_roster_outbox_done(conn, room_id, member_node,
+                                    int(row["epoch"]))
+            continue
+        # Rebuild the CURRENT authoritative roster (never the queued snapshot —
+        # the outbox carries only the target epoch, not a body).
+        roster = roster_for(conn, room_id)
+        try:
+            status, _resp = send_roster_broadcast(
+                cfg, member_node=member_node, room_id=room_id,
+                room_epoch=int(roster["epoch"]), members=roster["members"],
+                leader_node=local_node)
+        except RoomsError as exc:
+            record_roster_outbox_failure(conn, room_id, member_node, str(exc))
+            failed += 1
+            continue
+        except Exception as exc:  # noqa: BLE001 - transport/config failure
+            record_roster_outbox_failure(conn, room_id, member_node,
+                                         f"rebroadcast failed: {exc}")
+            failed += 1
+            continue
+        if 200 <= status < 300:
+            mark_roster_outbox_done(conn, room_id, member_node,
+                                    int(roster["epoch"]))
+            sent += 1
+        else:
+            record_roster_outbox_failure(conn, room_id, member_node,
+                                         f"status={status}")
+            failed += 1
+    remaining = len(pending_roster_outbox(conn))
+    return {"sent": sent, "failed": failed, "pending": remaining}
 
 
 # --------------------------------------------------------------------------
