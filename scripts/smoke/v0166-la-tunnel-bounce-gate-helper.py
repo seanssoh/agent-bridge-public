@@ -434,11 +434,76 @@ def cmd_soft_no_disc(repo_root: str) -> int:
     return 0
 
 
+def cmd_mixed_loss_stale(repo_root: str) -> int:
+    """Mixed peer state: a FRESH suspect/down peer AND a STALE/unknown peer ->
+    NO bounce, even once the N-streak is satisfied. A WARP bounce severs the
+    mesh's own substrate, so a single fresh loss is NOT proof of a real outage
+    while another configured peer's reachability is unknown (it might be up).
+    Pre-fix, fresh-loss short-circuited to loss=True and ignored stale peers, so
+    the gate bounced; this pins the codex P1 #11705 bypass closed."""
+    reconcile = _load_reconcile(repo_root)
+    a2a = _load_a2a(repo_root)
+    transport = a2a.TRANSPORT_CLOUDFLARE_WARP_MESH
+
+    bounce = _Spy()
+    soft = _Spy()
+    orig_b = reconcile._WARP_TUNNEL_BOUNCE
+    orig_s = reconcile._WARP_TUNNEL_SOFT_REFRESH
+    orig_age = a2a.warp_tunnel_handshake_age
+    reconcile._WARP_TUNNEL_BOUNCE = bounce
+    reconcile._WARP_TUNNEL_SOFT_REFRESH = soft
+    a2a.warp_tunnel_handshake_age = lambda: 5106
+    conn = reconcile.open_reconcile_db()
+    n = reconcile.warp_stale_streak_threshold()
+    res = None
+    try:
+        reconcile._ensure_peer_reachability_schema(conn)
+        # seunghyun is permanently STALE-down (updated_ts far in the past, beyond
+        # the freshness window) — its reachability is UNKNOWN, not a proven loss.
+        old = time.time() - 100000.0
+        reconcile._write_peer_state(conn, "seunghyun",
+                                    reconcile.PEER_STATE_DOWN, 3, old,
+                                    state_changed=True)
+        # Run past the N-streak; re-seed the FRESH peers each tick so the stale
+        # streak grows and choi is a genuine FRESH-down loss every tick.
+        for _ in range(n + 1):
+            now = time.time()
+            reconcile._write_peer_state(conn, "choi",
+                                        reconcile.PEER_STATE_DOWN, 3, now,
+                                        state_changed=True)
+            reconcile._write_peer_state(conn, "hyerin",
+                                        reconcile.PEER_STATE_UP, 0, now,
+                                        state_changed=True)
+            res = reconcile.tunnel_health(transport, _warp_cfg(), conn)
+    finally:
+        reconcile._WARP_TUNNEL_BOUNCE = orig_b
+        reconcile._WARP_TUNNEL_SOFT_REFRESH = orig_s
+        a2a.warp_tunnel_handshake_age = orig_age
+        conn.close()
+
+    if bounce.calls != 0:
+        sys.stderr.write(
+            f"FAIL mixed-loss-stale: BOUNCED {bounce.calls}x with a FRESH-down "
+            f"peer while another peer is STALE/unknown — an incomplete picture "
+            f"must suppress the disruptive bounce (the #11705 P1 bypass)\n")
+        return 1
+    if res.fields.get("bounce_suppressed_reason") != \
+            reconcile.BOUNCE_SUPPRESSED_PEER_STATE_UNKNOWN:
+        sys.stderr.write(
+            f"FAIL mixed-loss-stale: wrong suppressed reason {res.fields}\n")
+        return 1
+    print(f"OK mixed-loss-stale bounces={bounce.calls} "
+          f"peer_counts={res.fields.get('peer_counts')} "
+          f"reason={res.fields.get('bounce_suppressed_reason')}")
+    return 0
+
+
 _COMMANDS = {
     "all-up": cmd_all_up,
     "loss-bounces": cmd_loss_bounces,
     "single-stale": cmd_single_stale,
     "unknown-stale": cmd_unknown_stale,
+    "mixed-loss-stale": cmd_mixed_loss_stale,
     "soft-first": cmd_soft_first,
     "soft-no-disc": cmd_soft_no_disc,
 }
@@ -448,8 +513,8 @@ def main() -> int:
     if len(sys.argv) < 3 or sys.argv[1] not in _COMMANDS:
         sys.stderr.write(
             "usage: v0166-la-tunnel-bounce-gate-helper.py "
-            "<all-up|loss-bounces|single-stale|unknown-stale|soft-first|"
-            "soft-no-disc> <repo_root>\n")
+            "<all-up|loss-bounces|single-stale|unknown-stale|mixed-loss-stale|"
+            "soft-first|soft-no-disc> <repo_root>\n")
         return 2
     cmd, repo_root = sys.argv[1], sys.argv[2]
     _isolate_reconcile_db(cmd)

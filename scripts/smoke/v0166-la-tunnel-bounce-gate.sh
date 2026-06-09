@@ -132,6 +132,13 @@ smoke_assert_contains "$out_unknown" "OK unknown-stale" "(d) unknown/stale peer 
 smoke_assert_contains "$out_unknown" "bounces=0" "(d) unknown is neither all-up nor loss — never a bounce"
 smoke_assert_contains "$out_unknown" "peer_state_unknown_or_stale" "(d) suppression carries the unknown reason"
 
+# --- (d2) mixed-loss-stale: a fresh-down peer + a stale/unknown peer -> NO
+#     bounce even with the N-streak satisfied (codex P1 #11705 bypass guard) ---
+out_mixed="$(run_helper mixed-loss-stale)"
+smoke_assert_contains "$out_mixed" "OK mixed-loss-stale" "(d2) fresh-loss + a stale/unknown peer -> NO bounce (incomplete picture suppresses)"
+smoke_assert_contains "$out_mixed" "bounces=0" "(d2) a single fresh loss is not proof while another peer's state is unknown"
+smoke_assert_contains "$out_mixed" "peer_state_unknown_or_stale" "(d2) suppression carries the unknown reason, not a loss bounce"
+
 # --- (e) soft-first: soft-refresh precedes any full bounce ---
 out_soft_first="$(run_helper soft-first)"
 smoke_assert_contains "$out_soft_first" "OK soft-first" "(e) soft-refresh is attempted before any full bounce"

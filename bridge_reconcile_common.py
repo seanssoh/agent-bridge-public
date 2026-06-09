@@ -828,11 +828,17 @@ def _fresh_peer_reachability_loss(conn: sqlite3.Connection, cfg: dict[str, Any],
             # Unrecognized label — treat as unknown, never as a loss.
             counts["stale_or_missing"] += 1
 
-    if fresh_loss:
-        return True, counts
     if counts["stale_or_missing"] > 0:
-        # Some peer is stale/missing → NEITHER all-up NOR loss → unknown.
+        # ANY peer stale/missing/unknown → we can prove NEITHER all-up NOR a
+        # real reachability loss (the stale peer might be up). A WARP bounce
+        # severs the mesh's own substrate, so it must NOT fire on an incomplete
+        # picture — even when another peer is freshly suspect/down. (codex P1
+        # #11705: a mixed fresh-loss + stale set must suppress, not bounce.)
         return None, counts
+    if fresh_loss:
+        # Every configured peer has FRESH state and at least one is
+        # suspect/down → a proven reachability loss → eligible to bounce.
+        return True, counts
     if counts["fresh_up"] == counts["total"] and counts["total"] > 0:
         return False, counts
     # No fresh signal at all (shouldn't happen given the branches above, but
