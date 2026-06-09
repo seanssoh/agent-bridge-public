@@ -116,8 +116,8 @@ without guessing.
 
 표준 upgrade 절차는 [`UPGRADING.md`](UPGRADING.md) 에 정리되어 있다. 모든 install 에서 동일한 명령으로 진행한다:
 
-**Current target**: upgrade to **`v0.16.4`** (stable — current head of the v0.16
-LTS line). It supersedes the `v0.16.3` / `v0.16.2` / `v0.16.1` / `v0.16.0` / `v0.15.x` stable
+**Current target**: upgrade to **`v0.16.5`** (stable — current head of the v0.16
+LTS line). It supersedes the `v0.16.4` / `v0.16.3` / `v0.16.2` / `v0.16.1` / `v0.16.0` / `v0.15.x` stable
 line and all the `v0.16.0-rc1..rc3` / `v0.15.0-rc1` / `v0.15.0-betaN` /
 `v0.14.5-betaN` prereleases, so the latest stable tag is the current target. A
 single `agent-bridge upgrade --apply` lands there from any v0.7.x+ source; the
@@ -127,7 +127,7 @@ the leap-path safe on Bash 5.3.9 hosts:
 ```bash
 cd <source-checkout>
 git fetch origin --tags
-# Pin to the latest STABLE tag (vX.Y.Z, no -beta/-rc suffix) — currently v0.16.4.
+# Pin to the latest STABLE tag (vX.Y.Z, no -beta/-rc suffix) — currently v0.16.5.
 git checkout "$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
 ./agent-bridge upgrade --apply
 ```
@@ -220,7 +220,7 @@ For per-stage detail, see `CHANGELOG.md` `[0.14.0]`. For the stabilization roadm
 
 ### v0.13.x hotfix wave (2026-05-15) — historical context
 
-**Current recommendation**: upgrade to the current target (`v0.16.4` stable — see the top of the Upgrade section). This section is preserved as historical context for the leap-path blockers that v0.13.7-v0.13.10 resolved.
+**Current recommendation**: upgrade to the current target (`v0.16.5` stable — see the top of the Upgrade section). This section is preserved as historical context for the leap-path blockers that v0.13.7-v0.13.10 resolved.
 
 The v0.13.7-v0.13.10 cycle fixed a four-stage `agent-bridge upgrade --apply` blocker that affected the v0.7.x → v0.13.x leap on Bash 5.3.9 hosts (matched by recent Linux distros). Operators on macOS were similarly affected by a markerless-existing-install layout reject. The v0.14.x line carries those fixes forward — operators can leap directly from v0.7.x/v0.8.x/v0.9.x/v0.10.x/v0.11.x/v0.12.x to the current target in a single `agent-bridge upgrade --apply` step.
 
@@ -733,14 +733,32 @@ As of **v0.16.0-rc1**, cross-node rooms (P4) are **wired and multi-node-verified
 on a live 2- and 3-node Tailscale mesh: a room spans nodes, the leader's roster
 is broadcast over the node-link, and join-on-approval works across nodes (`agb
 room create/join/approve/show`, the `agbroom://` invite, per-room epoch bumps,
-and the P4.2 roster-broadcast were all confirmed cross-node). The Cloudflare Zero
-Trust transport and whole-room `agb a2a send` fan-out remain the maturing edges
-(the Tailscale transport is the verified one).
+and the P4.2 roster-broadcast were all confirmed cross-node).
+
+As of **v0.16.5**, the multi-node mesh is **zero-touch / self-healing**: a
+k8s-controller-style **reconcile control-loop** on the handoff-daemon tick
+converges each node's actual network state (stable address, tunnel health, peer
+reachability, applied roster epoch) toward the only human input — desired room
+membership + transport config. Three per-transport self-heal adapters
+(stable-address #1705, tunnel-health #1706, peer-reachability #1707) keep the
+mesh live without operator intervention; new nodes join from a room token,
+the leader relays member↔member traffic, and the roster anti-entropies itself
+(#1695). `agb a2a net-status` (alias `agb a2a status`, #1708) is the read-only
+**control-loop status window** — run it first when a peer looks unreachable to
+see whether the loop has already detected and is retrying. The mesh is
+**transport-agnostic** (identical on `cloudflare-warp-mesh` and `tailscale`).
+
+> **Testing the mesh locally:** override `BRIDGE_STATE_DIR` (not just
+> `BRIDGE_HOME`) plus the `BRIDGE_A2A_ROOMS_DB` / `_RECONCILE_DB` / `_INBOX_DB` /
+> `_OUTBOX_DB` paths under your test home — `handoff_dir()` honors
+> `BRIDGE_STATE_DIR` over `BRIDGE_HOME`, so a `BRIDGE_HOME`-only test mesh can
+> clobber the live `rooms.db` (#1728, guard planned for v0.16.6). See
+> [`docs/a2a-rooms.md`](./docs/a2a-rooms.md) §"Local test mesh isolation".
 
 Full operator usage — lifecycle, the `adopt-all` → `enforce` migration, the
-acting-identity (`--as`) regimes, and the honest security model — is in
-[`docs/a2a-rooms.md`](./docs/a2a-rooms.md). Design rationale + schema:
-[`docs/design/a2a-rooms-design.md`](./docs/design/a2a-rooms-design.md).
+acting-identity (`--as`) regimes, the zero-touch mesh, and the honest security
+model — is in [`docs/a2a-rooms.md`](./docs/a2a-rooms.md). Design rationale +
+schema: [`docs/design/a2a-rooms-design.md`](./docs/design/a2a-rooms-design.md).
 
 ## Plugin channel `requires` (auto-provision dependency channels)
 
