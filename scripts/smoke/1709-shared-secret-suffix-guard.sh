@@ -357,6 +357,28 @@ assert_verdict "B peer cd-in && cd-nx"     "cd \$BRIDGE_HOME/agents && cd /nonex
 assert_verdict "cd-in && cd-nx || true"    "cd \$BRIDGE_HOME/shared && cd /nonexistent || true; cat secrets/token" "DENY"
 assert_verdict "cd-in && cd-nx || read"    "cd \$BRIDGE_HOME/shared && cd /nonexistent || cat secrets/token" "DENY"
 assert_verdict "cd-in; true && cd-out; rd" "cd \$BRIDGE_HOME/shared; true && cd /tmp; cat secrets/data.txt" "DENY"
+# r12 Part A (patch #11823) — a fail-branch cwd is STICKY across a hard break: a
+# read gated only on a literal-true in a NEW chain after the failed cd still runs
+# in the bridge fail-branch → DENY (the r11 `gated` skip was chain-local only).
+assert_verdict "cd-fail; true && cat"      "cd \$BRIDGE_HOME/shared && cd /nx; true && cat secrets/token" "DENY"
+assert_verdict "cd-fail; : && cat"         "cd \$BRIDGE_HOME/shared && cd /nx; : && cat secrets/token"    "DENY"
+assert_verdict "cd-fail; true&&true&&cat"  "cd \$BRIDGE_HOME/shared && cd /nx; true && true && cat secrets/token" "DENY"
+assert_verdict "B peer cd-fail; true&&cat" "cd \$BRIDGE_HOME/agents && cd /nx; true && cat $PEER_AGENT/MEMORY.md" "DENY"
+# r12 Part B (codex #11827) — obfuscated RELATIVE read under a bridge cwd: ANSI-C
+# $'…' (shlex would mangle to \$secrets and hide it), hex/octal/unicode escapes,
+# globs (cwd-relative, no raw bridge anchor), backslash re-spell, quote-split —
+# all resolve into the protected tree at runtime → fail closed.
+assert_verdict "ansic relative read"       "cd \$BRIDGE_HOME/shared && cat \$'secrets'/token"   "DENY"
+assert_verdict "ansic hex relative"        "cd \$BRIDGE_HOME/shared && cat \$'\\x73ecrets'/token" "DENY"
+assert_verdict "ansic octal relative"      "cd \$BRIDGE_HOME/shared && cat \$'\\163ecrets'/token" "DENY"
+assert_verdict "glob mid relative"         "cd \$BRIDGE_HOME/shared && cat sec*ets/token"        "DENY"
+assert_verdict "glob descend relative"     "cd \$BRIDGE_HOME/shared && cat */token"              "DENY"
+assert_verdict "glob bracket relative"     "cd \$BRIDGE_HOME/shared && cat sec[r]ets/token"      "DENY"
+assert_verdict "backslash respell rel"     "cd \$BRIDGE_HOME/shared && cat sec\\rets/token"      "DENY"
+assert_verdict "quote-split relative"      "cd \$BRIDGE_HOME/shared && cat sec''rets/token"      "DENY"
+assert_verdict "B peer ansic relative"     "cd \$BRIDGE_HOME/agents && cat \$'$PEER_AGENT'/MEMORY.md" "DENY"
+assert_verdict "obf under cd-fail sticky"  "cd \$BRIDGE_HOME/shared && cd /nx; cat sec*ets/token" "DENY"
+assert_verdict "ansic in abs bridge path"  "cat \$BRIDGE_HOME/shared/\$'secrets'/token"          "DENY"
 
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
@@ -387,6 +409,17 @@ assert_verdict "cd-in && cd-out && read"   "cd \$BRIDGE_HOME/shared && cd /tmp &
 assert_verdict "cd-in && true && cd-out"   "cd \$BRIDGE_HOME/shared && true && cd /tmp && cat secrets/token"      "ALLOW"
 assert_verdict "cd-in && cd-out2 && read"  "cd \$BRIDGE_HOME/shared && cd /tmp && cd /var && cat secrets/token"   "ALLOW"
 assert_verdict "B peer cd-in && cd-out"    "cd \$BRIDGE_HOME/agents && cd /tmp && cat $PEER_AGENT/MEMORY.md"      "ALLOW"
+# r12 no-over-block (codex #11827 / patch #11823) — obfuscation is collateral-safe
+# OFF a bridge cwd, `cat *` only lists the parent (not the secret leaf), a public
+# tail glob is fine, and a gated cd-OUT obf read runs in the out-of-bridge cwd.
+assert_verdict "ansic read no cd"          "cat \$'secrets'/token"                              "ALLOW"
+assert_verdict "glob read no cd"           "cat sec*ets/token"                                  "ALLOW"
+assert_verdict "ansic read cd /tmp"        "cd /tmp && cat \$'secrets'/token"                   "ALLOW"
+assert_verdict "glob read cd /tmp"         "cd /tmp && cat sec*ets/token"                       "ALLOW"
+assert_verdict "cat star lists dir"        "cd \$BRIDGE_HOME/shared && cat *"                    "ALLOW"
+assert_verdict "public wiki glob"          "cd \$BRIDGE_HOME/shared && cat wiki/*.md"           "ALLOW"
+assert_verdict "gated cd-out glob read"    "cd \$BRIDGE_HOME/shared && cd /tmp && cat sec*ets/token" "ALLOW"
+assert_verdict "gated cd-out ansic read"   "cd \$BRIDGE_HOME/shared && cd /tmp && cat \$'secrets'/token" "ALLOW"
 # r3 no-over-block — the resolution model must NOT collateral-block these:
 #   a RELATIVE forbidden-tail read with NO `cd` (relative to the agent's own
 #   cwd, which the hook can't see → unanchorable, not bridge), and a `..` that

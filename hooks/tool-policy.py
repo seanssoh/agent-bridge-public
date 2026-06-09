@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -2885,18 +2886,49 @@ def _apply_cwd_change(cwd: object, change: tuple[str, str | None]) -> object:
     return _CWD_UNKNOWN  # relative cd with no known base
 
 
+def _ansic_decoded_segment(seg: str) -> str | None:
+    """Return *seg* with each ANSI-C ``$'…'`` span replaced by the literal bytes
+    bash produces, or ``None`` when the segment has no ``$'``. ``shlex.split``
+    treats ``$'secrets'`` as ``$`` + a single-quoted ``secrets`` and yields the
+    word ``$secrets`` — losing the decoded literal that bash actually reads
+    (codex #11827 r11). Decoding the ``$'…'`` span at the SEGMENT level first,
+    then re-tokenizing, surfaces the real path word (``secrets``) for the
+    resolution scan. Decode failure leaves the span literal (still fail-closed by
+    the obfuscation pass)."""
+    if "$'" not in seg:
+        return None
+
+    def _lit(match: re.Match) -> str:
+        body = match.group(1)
+        try:
+            return body.encode("latin-1", "backslashreplace").decode("unicode_escape")
+        except Exception:  # noqa: BLE001 — decode failure → leave the span literal
+            return match.group(0)
+
+    return _ANSIC_RE.sub(_lit, seg)
+
+
 def _segment_candidate_words(seg: str):
     """Yield path-candidate words from a SINGLE shell *seg*, tokenized with
     bash quote-removal via ``shlex.split(posix=True)`` (a malformed segment
     falls back to a raw split; the caller fail-closes a bridge-anchored
-    unparseable command separately). Reuses :func:`_alias_path_fragments`."""
-    try:
-        tokens = shlex.split(seg, posix=True, comments=False)
-    except ValueError:
-        tokens = seg.split()
-    for token in tokens:
-        for fragment in _alias_path_fragments(token):
-            yield fragment
+    unparseable command separately). Reuses :func:`_alias_path_fragments`.
+
+    When the segment carries ANSI-C ``$'…'`` quoting, ALSO yield the candidates
+    from the ANSI-C-decoded segment — ``shlex`` mangles ``$'secrets'`` into
+    ``$secrets`` and would hide the decoded path (codex #11827 r11)."""
+    variants = [seg]
+    decoded_seg = _ansic_decoded_segment(seg)
+    if decoded_seg is not None:
+        variants.append(decoded_seg)
+    for variant in variants:
+        try:
+            tokens = shlex.split(variant, posix=True, comments=False)
+        except ValueError:
+            tokens = variant.split()
+        for token in tokens:
+            for fragment in _alias_path_fragments(token):
+                yield fragment
 
 
 def _command_effective_cwd(segments: list[str]) -> object:
@@ -3124,7 +3156,7 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     # cd succeeded → cwd is the last cd target), but it CAN fail so `||` after it
     # is genuinely ambiguous (union → keeps `cd <missing> || cd <bridge>` sound).
     # The bounded grammar (true/false/:/! + cd-success + &&/||) converges.
-    seg_specs: list[tuple[str, bool, str]] = []
+    seg_specs: list[tuple[str, bool, bool, str]] = []
     prev_op: str | None = None
     running: object = None
     chain_start = True
@@ -3171,8 +3203,10 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
             and prev_op == "&&"
             and (running is True or running is _CD_LIKELY_SUCCESS)
         )
-        for sub in _PAREN_SPLIT_RE.split(part):
-            seg_specs.append((disp, gated, sub))
+        # Mark the FIRST sub of a hard-break-started chain so the walk can promote
+        # the prior chain's fail-branch cwds to sticky (patch #11823 r11).
+        for idx, sub in enumerate(_PAREN_SPLIT_RE.split(part)):
+            seg_specs.append((disp, gated, chain_start and idx == 0, sub))
         # Advance the running exit status for the next chained segment.
         if runs is True:
             running = _segment_exit(part)  # cd→likely-success, true/false→bool, …
@@ -3229,47 +3263,73 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     # forbidden tree can no longer un-anchor an earlier forbidden read
     # (`cd $BH/shared && cat secrets/token && cd /tmp`).
     cwd: object = _CWD_UNKNOWN
-    cwds_seen: list[str] = []
-    for disp, gated, seg in seg_specs:
-        words = list(_segment_candidate_words(seg))
+    # A cd-out can FAIL, leaving bash in the PRIOR cwd. Track those fail-branch
+    # cwds in two tiers (codex #11822 / patch #11823 r11):
+    #   sticky_cwds — the read may run there regardless of its local `&&` gate
+    #     (a fail-branch from a PRIOR chain, reached unconditionally after a
+    #     `;`/`&`/`|`/newline) → re-checked for EVERY read.
+    #   chain_cwds  — a fail-branch from the CURRENT chain → re-checked only for
+    #     a NON-`&&`-gated read, because a gated read short-circuits on the very
+    #     cd that created it (keeps codex r9's `cd $BH/shared && cd /tmp && read`
+    #     ALLOW). Promoted to sticky at the next hard-break boundary.
+    sticky_cwds: list[str] = []
+    chain_cwds: list[str] = []
+    for disp, gated, seg_chain_start, seg in seg_specs:
+        # Hard break before this segment → the prior chain's cd-failure branches
+        # are now reachable by the (unconditionally-run) read, even if it is
+        # `&&`-gated on a fresh literal-true. Promote them (patch #11823 r11):
+        # `cd $BH/shared && cd /nx; true && cat secrets` must DENY.
+        if seg_chain_start and chain_cwds:
+            sticky_cwds.extend(chain_cwds)
+            chain_cwds = []
 
-        # Pass 1 — resolved-path containment against the CURRENT cwd.
+        words = list(_segment_candidate_words(seg))
+        # The cwds this read may actually run in: the linear (all-success) cwd,
+        # every sticky fail-branch (always), and the current chain's fail-branches
+        # unless this read is `&&`-gated. `scope_ambiguous` (subshell/pushd/cd-)
+        # forces the chain set on too (those constructs restore a prior cwd the
+        # linear walk cannot model).
+        read_cwds: list[object] = [cwd]
+        read_cwds.extend(sticky_cwds)
+        if (not gated) or scope_ambiguous:
+            read_cwds.extend(chain_cwds)
+
         for raw_word in words:
-            hit = _resolved_forbidden_hit(raw_word, cwd, forbidden_dirs)
-            if hit is not None:
-                return hit
+            # Pass 1 — resolved-path containment against every cwd this read may
+            # run in.
+            for c in read_cwds:
+                hit = _resolved_forbidden_hit(raw_word, c, forbidden_dirs)
+                if hit is not None:
+                    return hit
             # Relative read under a POISONED (bridge-suspect `$var`) cwd whose
             # tail names a forbidden suffix → fail closed.
             if cwd is _CWD_POISONED:
                 poison_hit = _relative_word_under_poison(raw_word, forbidden_dirs)
                 if poison_hit is not None:
                     return poison_hit
-            # Scope-ambiguous fail-close: also resolve against every prior cwd —
-            # but ONLY for a non-`&&`-gated read. A gated read cannot run in a
-            # cd-failure branch (the failing cd short-circuits its `&&` chain),
-            # so re-checking it against the prior bridge cwd would be the r9
-            # over-block; a non-gated read genuinely may run there (codex #11822
-            # / patch #11823 r10).
-            if scope_ambiguous and not gated:
-                for prior in cwds_seen:
-                    prior_hit = _resolved_forbidden_hit(raw_word, prior, forbidden_dirs)
-                    if prior_hit is not None:
-                        return prior_hit
 
-        # Pass 2 — obfuscation fail-close, per word, against the CURRENT cwd.
-        for raw_word in words:
+            # Pass 2 — obfuscation fail-close (ANSI-C / glob / cmd-sub / backslash)
+            # against the SAME cwd set, not only the current linear cwd (codex
+            # #11827 r11: `cd $BH/shared && cat $'secrets'/token` and `… sec*ets/
+            # token` resolve under the bridge cwd but the raw word has no bridge
+            # anchor). ANSI-C `$'…'` reaching here as a candidate is already
+            # segment-decoded by `_segment_candidate_words`; this is the residual
+            # backslash/glob/cmd-sub fail-close.
             if not _word_carries_obfuscation(raw_word):
                 continue
-            # 2a. Decode ANSI-C `$'…'` / backslash escapes and re-resolve.
+            # 2a. Decode ANSI-C `$'…'` / backslash and re-resolve against each cwd.
             if _decode_obfuscated_word(raw_word) != raw_word:
-                decoded_hit = _resolved_forbidden_hit(raw_word, cwd, forbidden_dirs)
-                if decoded_hit is not None:
+                for c in read_cwds:
+                    if _resolved_forbidden_hit(raw_word, c, forbidden_dirs) is not None:
+                        return _OBFUSCATED_SUFFIX_SENTINEL
+            # 2b. Glob / command-sub fail-close: the literal prefix-before-the-glob
+            # can select a forbidden dir under the read's effective cwd (or a
+            # fail-branch prior), OR the raw word is itself bridge-anchored.
+            for c in read_cwds:
+                if _glob_word_hits_forbidden(raw_word, c, forbidden_dirs) is not None:
                     return _OBFUSCATED_SUFFIX_SENTINEL
-            # 2b. Glob / command-sub fail-close iff bridge-anchored and the
-            # literal prefix-before-the-glob could select a forbidden dir.
-            if not any(anchor in raw_word for anchor in _bridge_anchor_tokens()):
-                continue
-            if _glob_prefix_reaches_forbidden_dir(raw_word, suffixes):
+            if any(anchor in raw_word for anchor in _bridge_anchor_tokens()) and \
+                    _glob_prefix_reaches_forbidden_dir(raw_word, suffixes):
                 return _OBFUSCATED_SUFFIX_SENTINEL
 
         # THEN apply this segment's cd change so the NEXT segment's reads see it.
@@ -3280,29 +3340,18 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
             continue
         new_cwd = _apply_cwd_change(cwd, change)
         if disp == "exec":
-            # The cd advances the linear (all-success) cwd, but it CAN fail —
-            # leaving bash in the PRIOR cwd, which a later NON-`&&`-gated read
-            # would run in. Keep that prior cwd live for the fail-branch re-check
-            # so `cd $BH/shared && cd /nonexistent; cat secrets/token` stays DENY
-            # (codex #11822 / patch #11823 r10 — the un-handled sibling of the
-            # `||`-after-cd union). A gated read short-circuits on the cd-failure,
-            # so the `not gated` guard above keeps it ALLOW. Same treatment
-            # `pushd`/`popd`/`cd -` already get via the top-level trigger.
+            # The cd advances the linear cwd, but it CAN fail → bash stays in the
+            # PRIOR cwd. Record that prior as a current-chain fail-branch so a
+            # later non-gated read (or any read after the next hard break, once
+            # promoted sticky) re-checks it (codex #11822 / patch #11823 r10/r11).
             if isinstance(cwd, str):
-                cwds_seen.append(cwd)
-                scope_ambiguous = True
+                chain_cwds.append(cwd)
             cwd = new_cwd
-            if isinstance(cwd, str):
-                cwds_seen.append(cwd)
-        else:  # "union" — ambiguous conditional: model BOTH branches.
-            # Record the may-execute target for the scope-ambiguous read check
-            # and mark it, but DON'T commit the linear cwd (skip branch keeps the
-            # prior cwd). So `cmd && cd <bridge>; read` DENIES (executed branch),
-            # while `cmd && cd /tmp; read` over `secrets` is the safe-direction
-            # price for an unknowable condition.
+        else:  # "union" — ambiguous conditional: the cd MAY run; model its target
+            # as a current-chain fail-branch, but DON'T commit the linear cwd (the
+            # skip branch keeps the prior cwd). `cmd && cd <bridge>; read` DENIES.
             if isinstance(new_cwd, str):
-                cwds_seen.append(new_cwd)
-            scope_ambiguous = True
+                chain_cwds.append(new_cwd)
     return None
 
 
@@ -3343,6 +3392,58 @@ def _glob_prefix_reaches_forbidden_dir(word: str, suffixes: list[str]) -> bool:
         if expanded.startswith(forbidden_dir) or forbidden_dir.startswith(expanded):
             return True
     return False
+
+
+def _glob_word_hits_forbidden(
+    word: str,
+    cwd: object,
+    forbidden_dirs: list[tuple[str, str]],
+) -> str | None:
+    """For a glob / command-sub *word*, decide whether — resolved against the
+    effective *cwd* — it could select a path inside a forbidden directory
+    (codex #11827 r11: ``cd $BH/shared && cat sec*ets/token`` resolves the
+    relative wildcard under the bridge cwd). Returns the matched forbidden suffix
+    or ``None``.
+
+    Unlike :func:`_glob_prefix_reaches_forbidden_dir` (bridge-ANCHORED absolute
+    word only), this resolves a RELATIVE glob against the cwd the read runs in,
+    then component-wise ``fnmatch``-checks whether the pattern's leading
+    components can match the forbidden dir AND the pattern descends deeper (reads
+    a file strictly inside it). That deeper-than requirement keeps ``cat *`` (which
+    only lists the parent, not the secret leaf) ALLOW while ``cat */token`` /
+    ``cat sec*ets/token`` fail closed."""
+    if not any(ch in _OBFUSCATION_GLOB_CHARS for ch in word) \
+            and "`" not in word and "$(" not in word:
+        return None  # not a glob / command-sub word
+    decoded = _decode_obfuscated_word(word)  # fold ANSI-C / backslash, keep globs
+    expanded = _expand_bridge_prefixes(decoded)
+    if "$" in expanded or "`" in expanded or "$(" in expanded:
+        # Command-sub / unresolved $var inside the word: the literal prefix may
+        # still anchor it. Fall back to the prefix-before-first-special check.
+        cut = len(expanded)
+        for i, ch in enumerate(expanded):
+            if ch in _OBFUSCATION_GLOB_CHARS or ch == "`" or expanded[i:i + 2] == "$(" or ch == "$":
+                cut = i
+                break
+        expanded = expanded[:cut]
+        if not expanded:
+            return None  # nothing literal to anchor on → leave to other passes
+    if os.path.isabs(expanded):
+        pattern = os.path.normpath(expanded)
+    elif isinstance(cwd, str) and cwd is not _CWD_POISONED:
+        pattern = os.path.normpath(os.path.join(cwd, expanded))
+    else:
+        return None  # relative + unknown/poisoned base → not resolvable here
+    pat_parts = pattern.split(os.sep)
+    for abs_dir, suffix in forbidden_dirs:
+        dir_parts = abs_dir.split(os.sep)
+        if len(pat_parts) <= len(dir_parts):
+            # The pattern is not deep enough to read a file strictly INSIDE the
+            # forbidden dir (it could at most name the dir itself, e.g. `cat *`).
+            continue
+        if all(fnmatch.fnmatch(dp, pp) for pp, dp in zip(pat_parts, dir_parts)):
+            return suffix
+    return None
 
 
 # Sentinel deny-reason fragment for an obfuscated (un-analyzable) word that
