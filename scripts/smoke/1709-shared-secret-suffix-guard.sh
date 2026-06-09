@@ -343,6 +343,20 @@ assert_verdict "cd-in && read (no out)"    "cd \$BRIDGE_HOME/shared && cat secre
 assert_verdict "cd-in && skipped cd-out"   "cd \$BRIDGE_HOME/shared && false && cd /tmp; cat secrets/token" "DENY"
 assert_verdict "cd-miss || cd-bridge"      "cd /nonexistent || cd \$BRIDGE_HOME/shared; cat secrets/token" "DENY"
 assert_verdict "B peer cd-in && read"      "cd \$BRIDGE_HOME/agents && cat $PEER_AGENT/MEMORY.md"       "DENY"
+# r11 (codex #11822 + patch #11823) — an executed cd-OUT can FAIL, leaving bash
+# in the prior (bridge) cwd; a subsequent NON-`&&`-gated read (after `;`/`&`/
+# newline, or a `||` failure side) runs there → LEAK. The fix keeps the prior
+# bridge cwd live (fail-branch re-check, gated off for `&&`-gated reads). The
+# unavoidable, sound-direction price: `cd-into-bridge; …; cd-OUT; <forbidden
+# relative tail>` is DENY even though the cd-out usually succeeds — a static
+# model can't know the cd outcome, and a containment gate must not under-block.
+assert_verdict "cd-in && cd-nx; read"      "cd \$BRIDGE_HOME/shared && cd /nonexistent; cat secrets/token" "DENY"
+assert_verdict "cd-in; cd-nx; read"        "cd \$BRIDGE_HOME/shared; cd /nonexistent; cat secrets/token"   "DENY"
+assert_verdict "cd-in && cd-nx && cd-nx2"  "cd \$BRIDGE_HOME/shared && cd /nonexistent && cd /nx2; cat secrets/token" "DENY"
+assert_verdict "B peer cd-in && cd-nx"     "cd \$BRIDGE_HOME/agents && cd /nonexistent; cat $PEER_AGENT/MEMORY.md" "DENY"
+assert_verdict "cd-in && cd-nx || true"    "cd \$BRIDGE_HOME/shared && cd /nonexistent || true; cat secrets/token" "DENY"
+assert_verdict "cd-in && cd-nx || read"    "cd \$BRIDGE_HOME/shared && cd /nonexistent || cat secrets/token" "DENY"
+assert_verdict "cd-in; true && cd-out; rd" "cd \$BRIDGE_HOME/shared; true && cd /tmp; cat secrets/data.txt" "DENY"
 
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.

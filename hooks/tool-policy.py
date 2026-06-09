@@ -3124,7 +3124,7 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     # cd succeeded → cwd is the last cd target), but it CAN fail so `||` after it
     # is genuinely ambiguous (union → keeps `cd <missing> || cd <bridge>` sound).
     # The bounded grammar (true/false/:/! + cd-success + &&/||) converges.
-    seg_specs: list[tuple[str, str]] = []
+    seg_specs: list[tuple[str, bool, str]] = []
     prev_op: str | None = None
     running: object = None
     chain_start = True
@@ -3158,8 +3158,21 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
         else:
             runs = True
         disp = "exec" if runs is True else ("skip" if runs is False else "union")
+        # `&&`-GATED reachability (codex #11822 / patch #11823 r10): a segment
+        # reached via `&&` from a truthy/cd-success exit runs ONLY if every
+        # preceding cd succeeded, so the cd-FAILURE branch cannot reach it — its
+        # cwd is exactly the committed linear cwd, and it must NOT be re-checked
+        # against the prior (fail-branch) cwds. A non-gated read (chain start
+        # after `;`/`&`/`|`/newline, or a `||` failure side) CAN run after a cd
+        # failed, so it is re-checked against the prior cwd. `running` here is
+        # still the predecessor's exit (advanced below).
+        gated = (
+            not chain_start
+            and prev_op == "&&"
+            and (running is True or running is _CD_LIKELY_SUCCESS)
+        )
         for sub in _PAREN_SPLIT_RE.split(part):
-            seg_specs.append((disp, sub))
+            seg_specs.append((disp, gated, sub))
         # Advance the running exit status for the next chained segment.
         if runs is True:
             running = _segment_exit(part)  # cd→likely-success, true/false→bool, …
@@ -3217,7 +3230,7 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     # (`cd $BH/shared && cat secrets/token && cd /tmp`).
     cwd: object = _CWD_UNKNOWN
     cwds_seen: list[str] = []
-    for disp, seg in seg_specs:
+    for disp, gated, seg in seg_specs:
         words = list(_segment_candidate_words(seg))
 
         # Pass 1 — resolved-path containment against the CURRENT cwd.
@@ -3231,8 +3244,13 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
                 poison_hit = _relative_word_under_poison(raw_word, forbidden_dirs)
                 if poison_hit is not None:
                     return poison_hit
-            # Scope-ambiguous fail-close: also resolve against every prior cwd.
-            if scope_ambiguous:
+            # Scope-ambiguous fail-close: also resolve against every prior cwd —
+            # but ONLY for a non-`&&`-gated read. A gated read cannot run in a
+            # cd-failure branch (the failing cd short-circuits its `&&` chain),
+            # so re-checking it against the prior bridge cwd would be the r9
+            # over-block; a non-gated read genuinely may run there (codex #11822
+            # / patch #11823 r10).
+            if scope_ambiguous and not gated:
                 for prior in cwds_seen:
                     prior_hit = _resolved_forbidden_hit(raw_word, prior, forbidden_dirs)
                     if prior_hit is not None:
@@ -3262,7 +3280,17 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
             continue
         new_cwd = _apply_cwd_change(cwd, change)
         if disp == "exec":
-            # Unconditional or provably-executed → advance the linear cwd.
+            # The cd advances the linear (all-success) cwd, but it CAN fail —
+            # leaving bash in the PRIOR cwd, which a later NON-`&&`-gated read
+            # would run in. Keep that prior cwd live for the fail-branch re-check
+            # so `cd $BH/shared && cd /nonexistent; cat secrets/token` stays DENY
+            # (codex #11822 / patch #11823 r10 — the un-handled sibling of the
+            # `||`-after-cd union). A gated read short-circuits on the cd-failure,
+            # so the `not gated` guard above keeps it ALLOW. Same treatment
+            # `pushd`/`popd`/`cd -` already get via the top-level trigger.
+            if isinstance(cwd, str):
+                cwds_seen.append(cwd)
+                scope_ambiguous = True
             cwd = new_cwd
             if isinstance(cwd, str):
                 cwds_seen.append(cwd)
