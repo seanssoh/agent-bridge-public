@@ -30,6 +30,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    import fcntl  # POSIX advisory file lock (TOCTOU guard on peer auto-register)
+except ImportError:  # pragma: no cover - non-POSIX; A2A is POSIX-only in practice
+    fcntl = None  # type: ignore[assignment]
+
 PROTOCOL_VERSION = "a2a-enqueue-v1"
 ENVELOPE_PROTOCOL = "agent-bridge.a2a.enqueue.v1"
 SIGNATURE_PREFIX = "v1="
@@ -1051,6 +1056,90 @@ def warp_connected_and_enrolled() -> None:
         )
 
 
+# The WARP CLI subcommand whose output carries the live MASQUE handshake age.
+# On a real client the `Time since last handshake: <N>s` line is printed by
+# `warp-cli tunnel stats` (NOT `warp-cli status`, which only shows a coarse
+# Connected/Network line and can falsely report `Connected` while the tunnel is
+# silently stale — the #1706 failure mode). We probe `tunnel stats` for the age
+# and scan its WHOLE output so a client that prints the line under `status`
+# instead is still handled.
+_WARP_HANDSHAKE_LABEL = "time since last handshake"
+
+
+def _parse_warp_handshake_age(text: str) -> Optional[int]:
+    """Parse `Time since last handshake: <N>s` -> N (seconds), or None.
+
+    Scans every line for the handshake-age label (case-insensitive) and reads
+    the leading integer-seconds value after the colon (tolerating a trailing
+    `s` / `sec` / `seconds` unit and surrounding whitespace). Returns None when
+    no parseable age line is present (an UNKNOWABLE age — the caller fails
+    closed without bouncing). Never raises.
+    """
+    for line in (text or "").splitlines():
+        low = line.strip().lower()
+        if not low.startswith(_WARP_HANDSHAKE_LABEL):
+            continue
+        if ":" not in low:
+            continue
+        raw = low.split(":", 1)[1].strip()
+        # Keep the leading run of digits ("3153s" -> "3153"); a non-digit (the
+        # unit, a space, punctuation) terminates the value. A line with no
+        # leading digit (e.g. "Time since last handshake: never") yields None.
+        digits = ""
+        for ch in raw:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits:
+            try:
+                return int(digits)
+            except ValueError:
+                return None
+    return None
+
+
+def warp_tunnel_handshake_age() -> Optional[int]:
+    """Return the WARP MASQUE tunnel handshake age in seconds, or None.
+
+    Runs `warp-cli tunnel stats` (read-only) and parses the
+    `Time since last handshake: <N>s` line. This is the freshness signal that
+    distinguishes a genuinely-live tunnel from the #1706 silent-stale failure
+    mode where `warp-cli status` keeps reporting `Connected` while established
+    sessions RST (handshake age e.g. 3153s) after a network change.
+
+    Returns:
+      - the integer handshake age in seconds when the line is present,
+      - None when the age could not be determined (CLI missing/errored, or the
+        output carried no parseable handshake line) — an UNKNOWABLE age. The
+        caller treats None as NOT-fresh (fail-closed) but MUST NOT auto-bounce
+        on a None (a probe-parse failure is not a proven stale handshake).
+
+    Read-only: never mutates WARP state. `BRIDGE_A2A_WARP_CLI` (set by the
+    smoke) points this at a mock CLI so a fresh/stale tunnel can be simulated
+    without a real WARP install.
+    """
+    cli = resolve_warp_cli()
+    if cli is None:
+        return None
+    try:
+        ran, raw, rc = _warp_cli_capture(cli, ["tunnel", "stats"])
+    except Exception:  # noqa: BLE001 - a freshness probe never raises into the reconcile tick
+        return None
+    if not ran:
+        return None
+    # Fail-closed rc gate (mirrors the #1595 enrollment rc gate): a PROVEN
+    # handshake age REQUIRES the probe to have EXITED 0. A non-zero exit whose
+    # output still happens to carry a `Time since last handshake: <N>s` line
+    # (a failed/partial `tunnel stats` printing a stale leftover) must NOT be
+    # trusted as a proven age — it is UNKNOWABLE. Returning None here keeps the
+    # adapter fail-safe: an unknowable age re-probes WITHOUT auto-bouncing (only
+    # a proven stale handshake from a successful probe may bounce).
+    if rc != 0:
+        return None
+    return _parse_warp_handshake_age(raw)
+
+
 def _parse_ifconfig_addresses(text: str) -> list[str]:
     """Pull every `inet`/`inet6` address out of `ifconfig -a` output.
 
@@ -1196,6 +1285,166 @@ def prove_warp_mesh_local_bind(candidate: str) -> None:
         )
     # (2) WARP connected + enrolled — proven from the WARP CLI.
     warp_connected_and_enrolled()
+
+
+# --------------------------------------------------------------------------
+# Stable substrate-address detection (#1705 — the reconcile stable-addr seam)
+# --------------------------------------------------------------------------
+#
+# The reconcile control-loop's `stable-addr` step (bridge_reconcile_common.py:
+# stable_local_addr) calls one of these per-transport detectors to discover the
+# node's STABLE listen address — the address that does NOT drift as the host
+# moves networks (the live drift `en0 10.11.10.211 → 172.20.10.3` that #1705
+# automates away). These are DETECTORS only: they NEVER bind. `resolve_bind()`
+# in bridge-handoffd.py stays the single bind oracle; the reconcile step uses
+# the detected address purely to PROPOSE a desired `listen.address`.
+#
+# Both detectors are FAIL-CLOSED and mirror the receiver bind-proof posture:
+# they return ONLY an address that is real for the substrate right now (a
+# Tailscale IP from `tailscale ip`, or a WARP Mesh IP that is BOTH in the
+# Cloudflare CGNAT block AND assigned to a live local interface). There is no
+# CIDR-shape / bare-text guess: the WARP path reuses `local_interface_addresses`
+# (hardened OS inspection) exactly as the bind proof does. On ANY uncertainty
+# they raise (TailscaleUnavailable / A2AError) so the caller fails closed.
+
+# Cloudflare WARP-Mesh assigns each enrolled device a stable IPv4 in the
+# Cloudflare CGNAT block 10.128.0.0/16 (the utun/Mesh address), plus a
+# point-to-point IPv6 in 2606:4700::/32. The IPv4 utun address is the PRIMARY
+# stable locator (it hit all 5 live CRM_DEV nodes); the IPv6 is accepted as a
+# documented secondary. These ranges are used ONLY to FILTER the live
+# interface-address set — membership in the range is necessary but NOT
+# sufficient (the address must also be on a real local interface), exactly
+# mirroring `prove_warp_mesh_local_bind`'s "CIDR shape is not proof" rule.
+WARP_MESH_CGNAT_CIDR_V4 = "10.128.0.0/16"
+WARP_MESH_CLOUDFLARE_CIDR_V6 = "2606:4700::/32"
+
+
+def tailscale_local_addresses() -> list[str]:
+    """Return THIS node's own Tailscale IPs (the stable, identity-keyed set).
+
+    Runs `tailscale ip` via the shared `resolve_tailscale_cli()` discovery so
+    the reconcile stable-addr detector reads the SAME address set the receiver
+    bind proof binds against (bridge-handoffd.py:tailscale_addresses /
+    is_tailnet_address). A Tailscale node is identity-keyed, so this set is
+    stable by construction — the detector just SURFACES it.
+
+    Raises TailscaleUnavailable when the CLI cannot be located or the query
+    fails (the caller fails closed rather than guessing from a CIDR shape). An
+    empty list (CLI ran fine but the node has no Tailscale address yet) is
+    returned as `[]`.
+    """
+    cli = resolve_tailscale_cli()
+    if cli is None:
+        raise TailscaleUnavailable(
+            "the 'tailscale' CLI was not found on PATH or in any standard "
+            "install location — cannot surface the node's stable Tailscale "
+            "address. Install Tailscale or set BRIDGE_A2A_TAILSCALE_CLI."
+        )
+    try:
+        out = subprocess.run(
+            [cli, "ip"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except FileNotFoundError as exc:
+        raise TailscaleUnavailable(
+            f"the 'tailscale' CLI path {cli!r} does not exist or is not "
+            "executable — cannot surface the node's stable Tailscale address."
+        ) from exc
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise TailscaleUnavailable(
+            f"'tailscale ip' failed to run: {exc}"
+        ) from exc
+    if out.returncode != 0:
+        raise TailscaleUnavailable(
+            f"'tailscale ip' exited {out.returncode}: "
+            f"{(out.stderr or '').strip()[:200]}"
+        )
+    addrs: list[str] = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line:
+            addrs.append(line)
+    return addrs
+
+
+def tailscale_stable_addr() -> str:
+    """Surface the node's stable Tailscale IPv4 (fail-closed).
+
+    Returns the first IPv4 in `tailscale_local_addresses()` — the legacy/raw
+    `listen.address` form the receiver binds against. Falls back to the first
+    address of any family only if no IPv4 is present (an IPv6-only tailnet).
+    Raises TailscaleUnavailable when the CLI is unavailable; raises A2AError
+    (`stable_addr_none`) when the CLI ran fine but the node has NO Tailscale
+    address yet (fail-closed — never invent one).
+    """
+    addrs = tailscale_local_addresses()
+    for addr in addrs:
+        try:
+            if isinstance(ipaddress.ip_address(addr), ipaddress.IPv4Address):
+                return addr
+        except ValueError:
+            continue
+    # No IPv4 — accept the first valid address of any family (IPv6-only node).
+    for addr in addrs:
+        try:
+            ipaddress.ip_address(addr)
+            return addr
+        except ValueError:
+            continue
+    raise A2AError(
+        "'tailscale ip' returned no usable address — the node has no stable "
+        "Tailscale address yet (fail-closed; never invent one).",
+        code="stable_addr_none",
+    )
+
+
+def warp_mesh_stable_addr() -> str:
+    """Detect the node's stable WARP-Mesh local address (fail-closed).
+
+    Enumerates the LIVE local interface set via `local_interface_addresses()`
+    (hardened OS inspection — `ip`/`ifconfig`, never a bare awk/text guess) and
+    returns the first address that is BOTH (a) inside the Cloudflare CGNAT
+    block 10.128.0.0/16 (the utun/Mesh IPv4) AND (b) assigned to a real local
+    interface right now. The Cloudflare point-to-point IPv6 (2606:4700::/32) is
+    accepted as a documented secondary only when no IPv4 utun address exists.
+
+    Membership in the CIDR is NECESSARY but NOT SUFFICIENT — the address is
+    only returned because it appears in the live interface set, exactly
+    mirroring `prove_warp_mesh_local_bind`'s "CIDR shape is not proof" rule. So
+    the returned address is ALWAYS one actually present on a local interface.
+
+    Raises A2AError (`iface_enum_failed`) when the interface set cannot be
+    determined at all, or (`stable_addr_none`) when no WARP-Mesh address is
+    present on any local interface (fail-closed — never synthesize one).
+    """
+    local_addrs = local_interface_addresses()
+    v4_net = ipaddress.ip_network(WARP_MESH_CGNAT_CIDR_V4)
+    v6_net = ipaddress.ip_network(WARP_MESH_CLOUDFLARE_CIDR_V6)
+
+    # Primary: a utun/Mesh IPv4 in the Cloudflare CGNAT block that is on a real
+    # local interface. Preserve interface-enumeration order for determinism.
+    for cand in local_addrs:
+        try:
+            ip = ipaddress.ip_address(cand.strip())
+        except ValueError:
+            continue
+        if isinstance(ip, ipaddress.IPv4Address) and ip in v4_net:
+            return str(ip)
+    # Secondary: the Cloudflare point-to-point IPv6, only if no IPv4 utun exists.
+    for cand in local_addrs:
+        try:
+            ip = ipaddress.ip_address(cand.strip())
+        except ValueError:
+            continue
+        if isinstance(ip, ipaddress.IPv6Address) and ip in v6_net:
+            return str(ip)
+    raise A2AError(
+        "no WARP-Mesh stable address is present on any local interface "
+        f"(local set: {local_addrs or 'none'}). A WARP node's stable address "
+        "is its utun/Mesh IP in 10.128.0.0/16 (or the Cloudflare 2606:4700::/32 "
+        "IPv6); refusing to synthesize one from a CIDR shape (fail-closed).",
+        code="stable_addr_none",
+    )
 
 
 def resolve_peer_address_for_transport(
@@ -1371,6 +1620,268 @@ def now_ts() -> int:
 
 
 # --------------------------------------------------------------------------
+# Room-join token-bootstrap key derivation (A2A Rooms v0.16.5 Lane 4, #1695)
+# --------------------------------------------------------------------------
+#
+# The zero-touch room-join path derives a UNIQUE per-pair node-link HMAC key
+# from the room invite token, with strict DOMAIN SEPARATION so the wire-visible
+# token verifier (`sha256(token)`, transmitted in the join body) can NEVER be
+# turned into the HMAC key:
+#
+#   key_seed = HKDF-Extract(salt="a2a-room-pair-seed-v1", ikm=raw_invite_token)
+#   pair_key = HKDF-Expand(key_seed, info="a2a-room-pair-key-v1\n<room>\n
+#                          <leader_node>\n<joiner_node>", L=32)
+#
+# The JOINER holds the raw invite token (it is in the invite link) → derives the
+# key_seed → derives the pair_key. The LEADER never holds the raw token (the
+# wire carries only sha256(token)); it persists the key_seed in controller-owned
+# rooms state at invite-creation time and derives the SAME pair_key from the
+# stored seed. Because Extract is one-way (HMAC), the wire-visible token HASH
+# (sha256) is NOT the seed and cannot reconstruct it — that is the domain
+# separation the adversarial test "token-hash-as-key rejected" proves.
+#
+# RFC 5869 (HKDF) instantiated with HMAC-SHA256: Extract puts the domain label
+# in the salt position; Expand binds the room/leader/joiner identity in `info`
+# so a pair key is unique per (room, leader, joiner) ordered triple and cannot
+# be replayed against a different room or peer.
+
+_ROOM_PAIR_SEED_SALT = b"a2a-room-pair-seed-v1"
+_ROOM_PAIR_KEY_INFO = b"a2a-room-pair-key-v1"
+_ROOM_INVITE_SIG_SALT = b"a2a-room-invite-sig-v1"
+
+
+def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
+    """RFC 5869 HKDF-Extract (HMAC-SHA256). Returns the 32-byte PRK."""
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def hkdf_expand(prk: bytes, info: bytes, length: int = 32) -> bytes:
+    """RFC 5869 HKDF-Expand (HMAC-SHA256). `length` <= 32 (one block)."""
+    if length > hashlib.sha256().digest_size:
+        raise A2AError("hkdf_expand length exceeds one HMAC-SHA256 block",
+                       code="hkdf_length")
+    t = hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+    return t[:length]
+
+
+def room_pair_key_seed(raw_token: str) -> str:
+    """Derive the secret-equivalent key SEED from the raw invite token.
+
+    This is the controller-owned, leader-stored material (NOT the wire-visible
+    `sha256(token)` verifier). Returned as a hex string for JSON-safe storage in
+    rooms.db invite state while the invite is valid.
+    """
+    seed = hkdf_extract(_ROOM_PAIR_SEED_SALT, raw_token.encode("utf-8"))
+    return seed.hex()
+
+
+def room_pair_key_from_seed(key_seed_hex: str, *, room_id: str,
+                            leader_node: str, joiner_node: str) -> str:
+    """Derive the per-pair node-link HMAC key from the stored key SEED.
+
+    Both sides call this with the SAME seed (the leader reads it from rooms
+    state; the joiner re-derives it from the raw token via `room_pair_key_seed`)
+    and the SAME (room, leader_node, joiner_node) triple, so they agree on the
+    key. The returned hex string is what gets persisted as the peer `secret`.
+    """
+    prk = bytes.fromhex(key_seed_hex)
+    info = b"\n".join([
+        _ROOM_PAIR_KEY_INFO,
+        room_id.encode("utf-8"),
+        leader_node.encode("utf-8"),
+        joiner_node.encode("utf-8"),
+    ])
+    return hkdf_expand(prk, info, 32).hex()
+
+
+def room_pair_key_from_token(raw_token: str, *, room_id: str,
+                             leader_node: str, joiner_node: str) -> str:
+    """Joiner-side convenience: raw token → seed → per-pair key (hex)."""
+    return room_pair_key_from_seed(
+        room_pair_key_seed(raw_token), room_id=room_id,
+        leader_node=leader_node, joiner_node=joiner_node)
+
+
+# --------------------------------------------------------------------------
+# Signed invite locator (reach=) — A2A Rooms v0.16.5 Lane 4, agenda 6
+# --------------------------------------------------------------------------
+#
+# The invite link embeds a `reach=` transport locator so a joiner with NO
+# pre-existing node-link can direct its first room-join request at the leader.
+# `reach=` carries NO secret — only {kind, address, port}. The leader binds
+# `reach=` (and the leader/room/token identity + an `iat`/`ttl`/`nonce` freshness
+# tuple) into a SIGNED CANONICAL whose MAC key is derived from the RAW TOKEN.
+#
+# Integrity scope — be honest (SK-1): the signing key is derived from the raw
+# token, which is the `t=` bearer in the SAME link. So the signature proves
+# integrity ONLY against a BLIND on-path tamperer who does NOT hold the token.
+# It does NOT provide relay-resistance: any party that RELAYS or OBSERVES the
+# link already holds the token and could re-sign a tampered `reach=`. The
+# concrete, enforced guarantees a joiner gets are therefore the LINK TTL
+# (`iat + ttl < now → reject`) and the single-use `nonce` (recorded + replay-
+# rejected joiner-side) — NOT relay-resistance. Crucially, NONE of this is an
+# admission gate: the leader re-runs token TTL/revocation + `client_ip` ==
+# registered-addr + per-pair HMAC + leader-approval regardless of `reach=`, so a
+# `reach=` forgery is at worst a first-contact transport redirect (phishing/DoS),
+# never a room-admission bypass. (Future hardening for true relay-resistance:
+# sign the locator with the leader's node-link identity key, which a relayer
+# does not hold — tracked as a follow-up, not solved here.)
+
+def invite_canonical(*, version: str, room_id: str, leader_node: str,
+                     leader_bridge: str, reach: dict[str, Any],
+                     token_sha256: str, issued_ts: int, ttl: int,
+                     nonce: str) -> str:
+    """Deterministic JSON canonical of the signed invite payload.
+
+    NO secret rides here — `reach` is {kind, address, port}; the bearer token
+    itself is represented only by its verifier hash (`token_sha256`). Keys are
+    sorted so the leader and every joiner recompute byte-identical bytes. See
+    the section header for the (deliberately narrow) integrity scope: token-keyed
+    integrity vs a blind tamperer, NOT relay-resistance.
+    """
+    payload = {
+        "v": version,
+        "room_id": room_id,
+        "leader_node": leader_node,
+        "leader_bridge": leader_bridge,
+        "reach": {
+            "kind": str(reach.get("kind", "")),
+            "address": str(reach.get("address", "")),
+            "port": int(reach.get("port", 0) or 0),
+        },
+        "token_sha256": token_sha256,
+        "issued_ts": int(issued_ts),
+        "ttl": int(ttl),
+        "nonce": nonce,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def invite_sig_key(raw_token: str) -> bytes:
+    """Derive the invite-canonical MAC key from the raw token (domain-separated
+    from the pair key so the two derivations never collide)."""
+    return hkdf_extract(_ROOM_INVITE_SIG_SALT, raw_token.encode("utf-8"))
+
+
+def sign_invite_canonical(raw_token: str, canonical: str) -> str:
+    digest = hmac.new(invite_sig_key(raw_token), canonical.encode("utf-8"),
+                      hashlib.sha256)
+    return SIGNATURE_PREFIX + digest.hexdigest()
+
+
+def verify_invite_canonical(raw_token: str, canonical: str,
+                            presented: str) -> bool:
+    """Constant-time verify of a signed invite canonical against the raw token."""
+    if not presented.startswith(SIGNATURE_PREFIX):
+        return False
+    expected = sign_invite_canonical(raw_token, canonical)
+    return hmac.compare_digest(expected, presented)
+
+
+# --------------------------------------------------------------------------
+# TOCTOU-locked peer auto-register (A2A Rooms v0.16.5 Lane 4, #1695)
+# --------------------------------------------------------------------------
+
+def auto_register_room_peer_locked(
+    cfg_path: Optional[Path], *, peer_id: str, address: str, port: int,
+    secret: str, inbound_allowlist: list[str], transport: str,
+) -> tuple[bool, str]:
+    """Atomically add a reverse node-link peer for a token-bootstrapped room
+    join, under an exclusive advisory FILE LOCK (closes the concurrent-join
+    TOCTOU race a bare in-memory check + atomic rename would lose).
+
+    The flow inside the lock mirrors `_identity_update_apply`'s safe-write
+    contract but adds the lock:
+      1. acquire `<cfg>.lock` (flock LOCK_EX) so concurrent unknown-peer joins
+         from the same node serialize on the disk write.
+      2. RELOAD the on-disk config (never the live cached one).
+      3. re-check idempotence: if the peer already exists with the SAME secret,
+         it is a no-op success; if it exists with a DIFFERENT secret, refuse
+         (a re-derivation mismatch / conflict — never silently overwrite a key).
+      4. validate the about-to-be-written config's secret gate.
+      5. write atomic 0600.
+    Returns (changed, code). Fail-closed: any error returns (False, code) and
+    changes nothing. The daemon's reconcile/hot-reload then picks up the peer.
+
+    NEVER trusts a wire-asserted address: the caller passes the SOCKET
+    remote_addr (`client_ip`) as `address`, not a body field.
+    """
+    if not peer_id or not secret:
+        return False, "missing_peer_or_secret"
+    target_path = cfg_path or config_path()
+    lock_path = target_path.with_name(target_path.name + ".lock")  # noqa: raw-pathlib-controller-only
+    lock_fd = -1
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        return False, f"lock_open_failed:{exc}"[:64]
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                return False, f"lock_acquire_failed:{exc}"[:64]
+        # SK-3: when `fcntl is None` (non-POSIX), the advisory flock degrades to
+        # a NO-OP — concurrent writers from the same node could then race the
+        # read-modify-write below. The atomic `os.replace` still leaves a VALID
+        # single-entry config (no corruption/partial write); the only loss is the
+        # cross-process serialization that prevents a last-writer-wins overwrite.
+        # A2A is POSIX-only in practice (Linux/macOS), so `fcntl` is always
+        # present on a real deployment and this branch is a defensive fallback.
+        # 2. reload from disk under the lock.
+        try:
+            disk_cfg = load_config(target_path)
+        except A2AError as exc:
+            return False, getattr(exc, "code", "config_load_failed")
+        peers = disk_cfg.get("peers")
+        if not isinstance(peers, list):
+            return False, "config_shape"
+        # 3. idempotence / conflict re-check.
+        for p in peers:
+            if isinstance(p, dict) and p.get("id") == peer_id:
+                existing = peer_secrets(p)
+                if secret in existing:
+                    return False, "noop"  # already provisioned (idempotent)
+                return False, "peer_conflict"  # different secret — never clobber
+        entry: dict[str, Any] = {
+            "id": peer_id,
+            "address": address,
+            "secret": secret,
+            "inbound_allowlist": list(inbound_allowlist),
+        }
+        if port:
+            entry["port"] = int(port)
+        peers.append(entry)
+        # 4. re-validate the secret gate before writing.
+        try:
+            validate_config_peer_secrets(disk_cfg, side="receiver")
+        except A2AError as exc:
+            return False, getattr(exc, "code", "secret_gate")
+        try:
+            orig_mode = target_path.stat().st_mode & 0o777  # noqa: raw-pathlib-controller-only
+        except OSError:
+            orig_mode = 0o600
+        # 5. atomic 0600 write.
+        try:
+            write_config_atomic(target_path, disk_cfg, orig_mode)
+        except OSError as exc:
+            return False, f"write_failed:{exc}"[:64]
+        return True, "registered"
+    finally:
+        if lock_fd >= 0:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------
 # Envelope
 # --------------------------------------------------------------------------
 
@@ -1387,6 +1898,9 @@ def build_envelope(
     reply_agent: str = "",
     room_id: str = "",
     room_epoch: Optional[int] = None,
+    relayed_via: str = "",
+    relayed_from_agent: str = "",
+    relayed_from_node: str = "",
 ) -> dict[str, Any]:
     """Build the A2A enqueue envelope.
 
@@ -1397,6 +1911,20 @@ def build_envelope(
     present, `room_epoch` is the sender's view of the room epoch the receiver
     seam (P4) validates against the leader-MAC'd roster. P1a builds + parses
     them but does not yet enforce on the cross-node path.
+
+    A2A rooms Lane 5 (#1695-P2 gotcha E): the leader-relay leg markers. When the
+    LEADER forwards a member→member room message it builds a FRESH envelope whose
+    AUTHENTICATED sender (`sender.bridge`) is the LEADER node (re-signed with the
+    leader↔target pair key — so the target's `reject_sender_mismatch` passes and
+    the target verifies the LEADER, never the original member). The ORIGINAL
+    sender — the member the leader VOUCHES for after verifying its member→leader
+    HMAC + membership — is carried as `relayed_from` {agent, node}; the target's
+    room-membership gate validates THAT original sender against its cached roster
+    (not the leader, who is also a member but is not the message author).
+    `relayed_via=<leader_node>` is the loop-guard marker: the receiver REFUSES to
+    re-relay any message already carrying it (M links, not M²). All three are
+    emitted ONLY on a room-scoped relayed leg; a normal send omits them
+    (byte-for-byte v1 unchanged).
     """
     env: dict[str, Any] = {
         "protocol": ENVELOPE_PROTOCOL,
@@ -1416,7 +1944,39 @@ def build_envelope(
         # room_epoch defaults to 0 when room-scoped but unspecified — the
         # receiver treats epoch 0 as "stale, refresh before deciding" (P4).
         env["room_epoch"] = int(room_epoch) if room_epoch is not None else 0
+        if relayed_via:
+            env["relayed_via"] = str(relayed_via)
+            # The leader-vouched original author (a leg without an author is not a
+            # valid relay; the receiver fail-closes on a missing relayed_from).
+            env["relayed_from"] = {
+                "agent": str(relayed_from_agent),
+                "node": str(relayed_from_node),
+            }
     return env
+
+
+def envelope_is_relayed(env: dict[str, Any]) -> bool:
+    """True iff the envelope carries the leader-relay loop-guard marker (Lane 5).
+
+    The single predicate the relay decision keys its no-re-relay contract on, so
+    the leader (which stamps it) and the relay gate (which refuses to re-relay a
+    stamped message) never diverge. A non-relayed message omits the field.
+    """
+    rv = env.get("relayed_via")
+    return isinstance(rv, str) and bool(rv)
+
+
+def relayed_from(env: dict[str, Any]) -> tuple[str, str]:
+    """The leader-vouched ORIGINAL (agent, node) of a relayed message (Lane 5).
+
+    Returns ("", "") when the envelope is not a relay leg or carries a malformed
+    `relayed_from`. The receiver validates THIS identity (the original author the
+    leader vouched for) against its cached roster — never the relaying leader's.
+    """
+    rf = env.get("relayed_from")
+    if not isinstance(rf, dict):
+        return "", ""
+    return str(rf.get("agent") or ""), str(rf.get("node") or "")
 
 
 def envelope_is_room_scoped(env: dict[str, Any]) -> bool:
