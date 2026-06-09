@@ -9,14 +9,21 @@ and points BRIDGE_A2A_WARP_CLI / BRIDGE_A2A_TAILSCALE_CLI at MOCK CLIs so a
 fresh/stale tunnel can be simulated with no real WARP/Tailscale install and the
 bounce is asserted WITHOUT bouncing a real host).
 
+NOTE (#1733): the bounce is now GATED — a stale handshake only bounces when a
+FRESH peer reachability loss is also present (and a soft-refresh ran first). The
+bounce-expecting cases below seed that gate (fresh peer-down + pre-loaded
+streak) via `_seed_gate_loss` and pass `conn`; the dedicated all-up / unknown /
+soft-refresh suppression cases live in `v0166-la-tunnel-bounce-gate`.
+
 Subcommands (each takes <repo_root>):
   healthy     — WARP handshake age < threshold -> converged, NO bounce.
-  stale       — WARP handshake age > threshold -> transport_degraded + error +
-                the injected bounce hook WAS invoked.
+  stale       — WARP handshake age > threshold + a FRESH peer loss + N-streak ->
+                transport_degraded + error + the injected bounce hook WAS invoked.
   bounded     — repeated stale ticks DRIVEN THROUGH run_step do NOT bounce on
                 every call: the reconcile.db backoff gate paces the bounce
                 (first tick bounces, the backed-off tick skips the adapter
-                entirely -> no second bounce).
+                entirely -> no second bounce). The gate is re-seeded before each
+                eligible tick so the test stays focused on the BACKOFF pacing.
   active-only — the tailscale path never shells warp-cli and vice-versa (the
                 other transport's mock CLI is rigged to FAIL if invoked).
   parse-fail  — a warp-cli that returns no parseable handshake line -> error
@@ -50,6 +57,37 @@ def _load_a2a(repo_root: str):
 def _warp_cfg():
     return {"transport": {"kind": "cloudflare-warp-mesh"},
             "listen": {"address": "100.96.0.5", "port": 8787}, "peers": []}
+
+
+def _warp_cfg_loss():
+    """WARP cfg WITH a peer roster so the #1733 bounce gate can find a fresh
+    reachability loss. The gate (#1733) only bounces a stale tunnel when >=1
+    FRESH peer is suspect/down; this cfg + `_seed_gate_loss` below set that up so
+    the #1706 bounce-path cases still exercise a real bounce under the new
+    gated contract."""
+    return {"transport": {"kind": "cloudflare-warp-mesh"},
+            "listen": {"address": "100.96.0.5", "port": 8787},
+            "peers": [{"id": "peer-a"}, {"id": "peer-b"}]}
+
+
+def _seed_gate_loss(reconcile, conn):
+    """Seed the reconcile.db so the #1733 bounce gate is satisfied on the NEXT
+    stale tick: one peer FRESH-down (a proven reachability loss) and the stale
+    streak pre-loaded to threshold-1 (so a single stale tick reaches N)."""
+    import time as _time
+    now = _time.time()
+    reconcile._ensure_peer_reachability_schema(conn)
+    reconcile._write_peer_state(conn, "peer-a", reconcile.PEER_STATE_UP, 0, now,
+                                state_changed=True)
+    reconcile._write_peer_state(conn, "peer-b", reconcile.PEER_STATE_DOWN, 3,
+                                now, state_changed=True)
+    reconcile._ensure_tunnel_health_state_schema(conn)
+    n = reconcile.warp_stale_streak_threshold()
+    # The gate state is keyed by the transport string (a2a.TRANSPORT_CLOUDFLARE_
+    # WARP_MESH == "cloudflare-warp-mesh"). Pre-load the streak to N-1 so a single
+    # subsequent stale tick reaches the threshold.
+    reconcile._write_tunnel_health_state(
+        conn, "cloudflare-warp-mesh", n - 1, None, False, now)
 
 
 def _tailscale_cfg():
@@ -105,12 +143,18 @@ def cmd_stale(repo_root: str) -> int:
     spy = _BounceSpy()
     original = reconcile._WARP_TUNNEL_BOUNCE
     reconcile._WARP_TUNNEL_BOUNCE = spy
+    # #1733: a stale tunnel only bounces when the gate (conn + fresh peer loss +
+    # N-streak) is satisfied. Open reconcile.db, seed a fresh peer-down + a
+    # pre-loaded streak, and pass `conn` so this still exercises a real bounce.
+    conn = reconcile.open_reconcile_db()
     try:
+        _seed_gate_loss(reconcile, conn)
         # Mock warp-cli reports a STALE handshake (the live 3153s failure mode).
         os.environ["WARP_HANDSHAKE_AGE"] = "3153"  # noqa: iso-helper-boundary
-        res = reconcile.tunnel_health(transport, _warp_cfg())
+        res = reconcile.tunnel_health(transport, _warp_cfg_loss(), conn)
     finally:
         reconcile._WARP_TUNNEL_BOUNCE = original
+        conn.close()
         os.environ.pop("WARP_HANDSHAKE_AGE", None)  # noqa: iso-helper-boundary
 
     if res.status != reconcile.RESULT_ERROR:
@@ -143,7 +187,16 @@ def cmd_bounded(repo_root: str) -> int:
     step = reconcile.STEP_TUNNEL_HEALTH
     try:
         os.environ["WARP_HANDSHAKE_AGE"] = "3153"  # noqa: iso-helper-boundary
-        adapter = lambda: reconcile.tunnel_health(transport, _warp_cfg())
+
+        # #1733: each ELIGIBLE stale tick must find the bounce gate satisfied
+        # (fresh peer loss + N-streak). The peer-reachability step would keep the
+        # peer DOWN and re-establish the streak between bounces in production; we
+        # simulate that by re-seeding the gate immediately before each adapter
+        # run, so this test stays focused on the RUN_STEP BACKOFF pacing (a
+        # backed-off tick is SKIPPED so the adapter — and the gate — never runs).
+        def adapter():
+            _seed_gate_loss(reconcile, conn)
+            return reconcile.tunnel_health(transport, _warp_cfg_loss(), conn)
 
         # Tick 1 at t=1000: eligible (never attempted) -> adapter runs -> stale
         # -> bounce #1 -> error result engages backoff (next_eligible in future).
@@ -339,11 +392,16 @@ def cmd_no_secret(repo_root: str) -> int:
     spy = _BounceSpy()
     original = reconcile._WARP_TUNNEL_BOUNCE
     reconcile._WARP_TUNNEL_BOUNCE = spy
+    # Exercise the GATED bounce path (#1733) so the degraded result carries the
+    # full new observable field set — and assert NONE of it is secret-shaped.
+    conn = reconcile.open_reconcile_db()
     try:
+        _seed_gate_loss(reconcile, conn)
         os.environ["WARP_HANDSHAKE_AGE"] = "3153"  # noqa: iso-helper-boundary
-        res = reconcile.tunnel_health(transport, _warp_cfg())
+        res = reconcile.tunnel_health(transport, _warp_cfg_loss(), conn)
     finally:
         reconcile._WARP_TUNNEL_BOUNCE = original
+        conn.close()
         os.environ.pop("WARP_HANDSHAKE_AGE", None)  # noqa: iso-helper-boundary
 
     blob = json.dumps({"detail": res.detail, "fields": res.fields}, default=str).lower()
@@ -352,10 +410,15 @@ def cmd_no_secret(repo_root: str) -> int:
         if bad in blob:
             sys.stderr.write(f"FAIL no-secret: secret-shaped field '{bad}' in {blob}\n")
             return 1
-    # Only observable, non-secret keys may appear.
+    # Only observable, non-secret keys may appear (incl. the #1733 gate fields).
     allowed = {"transport", "transport_degraded", "handshake_age_seconds",
                "stale_threshold_seconds", "handshake_age_known", "bounced",
-               "backend_state", "self_online"}
+               "backend_state", "self_online",
+               # #1733 observable bounce-gate fields (no secrets — counters /
+               # enum reason / FSM counts only).
+               "stale_streak", "stale_streak_threshold",
+               "bounce_suppressed_reason", "soft_refresh_attempted",
+               "soft_refreshed", "peer_counts"}
     extra = set(res.fields.keys()) - allowed
     if extra:
         sys.stderr.write(f"FAIL no-secret: unexpected field keys {extra}\n")

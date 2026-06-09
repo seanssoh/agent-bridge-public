@@ -591,24 +591,311 @@ def _default_warp_bounce() -> bool:
 _WARP_TUNNEL_BOUNCE: Callable[[], bool] = _default_warp_bounce
 
 
-def _tunnel_health_warp() -> ReconcileStepResult:
-    """WARP substrate freshness probe + bounded auto-bounce (#1706).
+def _default_warp_soft_refresh() -> bool:
+    """Soft-refresh the WARP tunnel: a NON-disruptive `warp-cli connect` nudge.
 
-    Reads the MASQUE handshake age (read-only `warp-cli tunnel stats`):
+    The gentle FIRST step before a full disconnect/connect bounce (#1733): an
+    idempotent `warp-cli connect` forces a fresh MASQUE handshake on an
+    idle-but-live tunnel WITHOUT a `warp-cli disconnect` — so the `10.128.x`
+    A2A mesh that RIDES this same tunnel is never torn down. A handshake that
+    is merely idle (not broken) refreshes here, and the next tick sees a fresh
+    age, so the full bounce is never reached.
+
+    INVARIANT: this MUST NOT call `warp-cli disconnect` (that is the very
+    self-severance #1733 is fixing). It only `connect`s. Returns True when the
+    connect leg ran rc=0; False (never raises) when `warp-cli` is unavailable or
+    the connect failed — a failed soft-refresh is recorded by the caller and the
+    gate falls through to the (still gated) full bounce, it never crashes the
+    tick. INJECTABLE via `_WARP_TUNNEL_SOFT_REFRESH` so the smoke can assert the
+    soft-refresh ran (and that it never disconnects) without touching real WARP.
+    """
+    cli = a2a.resolve_warp_cli()
+    if cli is None:
+        return False
+    try:
+        # `connect` ONLY — never `disconnect`. `_warp_cli_capture` never raises;
+        # a non-zero rc is just a failed nudge the caller records.
+        c_ran, _c_out, c_rc = a2a._warp_cli_capture(cli, ["connect"])
+    except Exception:  # noqa: BLE001 - a soft-refresh never raises into the reconcile tick
+        return False
+    return bool(c_ran and c_rc == 0)
+
+
+# Injectable soft-refresh hook (module-level function reference). The daemon
+# calls `_WARP_TUNNEL_SOFT_REFRESH()` BEFORE a full bounce once the stale +
+# fresh-peer-loss + N-streak gate is satisfied. The smoke rebinds this to a spy
+# so it can assert the soft-refresh ran first WITHOUT touching a real tunnel;
+# production keeps `_default_warp_soft_refresh`. Mirrors the `_WARP_TUNNEL_BOUNCE`
+# injection convention.
+_WARP_TUNNEL_SOFT_REFRESH: Callable[[], bool] = _default_warp_soft_refresh
+
+
+# --- #1733 bounce-gating tunables -----------------------------------------
+#
+# The #1706 adapter bounced the WHOLE WARP tunnel on handshake-idle ALONE (age
+# > threshold), even when every peer was demonstrably UP — severing the very
+# mesh that rides the tunnel. The fix (codex design-consensus #11698) gates the
+# full disconnect/connect bounce on a CORRELATION of signals, never idle alone:
+#   stale handshake AND >=N consecutive stale ticks AND >=1 FRESH peer down/
+#   suspect AND a soft-refresh was tried first.
+#
+# Consecutive-stale streak required before the gate even considers a bounce.
+# >=2 guarantees a single idle tick (the normal MASQUE-idle case) NEVER bounces.
+# Env-overridable; a non-numeric / <2 override falls back to the default (a
+# streak of 1 would defeat the "idle != broken" hysteresis — fail-safe).
+DEFAULT_WARP_STALE_STREAK_THRESHOLD = 2
+
+# Peer-FSM freshness window: a peer's persisted state only COUNTS toward the
+# bounce decision when its `updated_ts` is within this many seconds of now. The
+# peer-reachability step runs AFTER tunnel-health, so the state tunnel-health
+# reads is one tick old — fine for a 120s+ decision, but a state STALER than a
+# small multiple of the reconcile interval is treated as UNKNOWN (neither "all
+# up" proof nor "loss" proof), so a never-probed / long-idle peer table can
+# never be read as a reachability loss. Resolved as a multiple of the reconcile
+# interval (default 45s * 4 = 180s) so it tracks the configured cadence.
+DEFAULT_WARP_PEER_FRESHNESS_INTERVAL_MULTIPLE = 4
+
+
+def warp_stale_streak_threshold() -> int:
+    """Resolve the consecutive-stale streak required before a bounce (#1733).
+
+    `BRIDGE_A2A_WARP_STALE_STREAK_THRESHOLD` overrides the default. A
+    non-numeric / <2 override falls back to the default (a streak of 1 would
+    bounce on a single idle tick — the exact #1733 over-aggression — fail-safe).
+    """
+    raw = os.environ.get("BRIDGE_A2A_WARP_STALE_STREAK_THRESHOLD")  # noqa: iso-helper-boundary
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_WARP_STALE_STREAK_THRESHOLD
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_WARP_STALE_STREAK_THRESHOLD
+    return val if val >= 2 else DEFAULT_WARP_STALE_STREAK_THRESHOLD
+
+
+def warp_peer_freshness_window() -> float:
+    """Resolve the peer-FSM freshness window in seconds (#1733).
+
+    A peer's persisted reachability state only counts toward the bounce decision
+    when probed within this window. Derived from the reconcile cadence so it
+    tracks the configured tick rate. `BRIDGE_A2A_WARP_PEER_FRESHNESS_SECONDS`
+    overrides the derived value directly; a non-numeric / non-positive override
+    falls back to the derived window (never 0 — a 0 window would make every
+    state UNKNOWN and suppress every bounce — fail-safe toward not-bouncing,
+    which is the safer direction for #1733).
+    """
+    raw = os.environ.get("BRIDGE_A2A_WARP_PEER_FRESHNESS_SECONDS")  # noqa: iso-helper-boundary
+    if raw is not None and str(raw).strip() != "":
+        try:
+            val = float(str(raw).strip())
+            if val > 0.0:
+                return val
+        except (TypeError, ValueError):
+            pass
+    interval = reconcile_interval()
+    if interval <= 0:
+        # Periodic timer disabled — fall back to the default cadence so the
+        # window is still a sane, non-zero multiple rather than collapsing to 0.
+        interval = DEFAULT_RECONCILE_INTERVAL_SECONDS
+    return float(interval * DEFAULT_WARP_PEER_FRESHNESS_INTERVAL_MULTIPLE)
+
+
+# Durable tunnel-health gate state (#1733): the consecutive-stale STREAK and the
+# last observable bounce-suppressed reason, persisted in reconcile.db so the
+# N-consecutive gate survives across ticks (and a daemon restart) and net-status
+# v2 can surface WHY a stale tunnel was NOT bounced. Single row keyed by
+# transport. Lives in the SAME reconcile.db as the backoff + peer FSM state.
+_TUNNEL_HEALTH_STATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tunnel_health_state (
+    transport               TEXT PRIMARY KEY,
+    stale_streak            INTEGER NOT NULL DEFAULT 0,
+    last_bounce_suppressed_reason TEXT,
+    soft_refresh_attempted  INTEGER NOT NULL DEFAULT 0,
+    updated_ts              REAL
+);
+"""
+
+# Observable bounce-suppressed reasons (no secrets — fixed enum strings only).
+BOUNCE_SUPPRESSED_ALL_PEERS_FRESH_UP = "all_peers_fresh_up"
+BOUNCE_SUPPRESSED_PEER_STATE_UNKNOWN = "peer_state_unknown_or_stale"
+BOUNCE_SUPPRESSED_STALE_STREAK_BELOW_N = "stale_streak_below_threshold"
+
+
+def _ensure_tunnel_health_state_schema(conn: sqlite3.Connection) -> None:
+    """Create the tunnel-health gate-state table if absent (idempotent)."""
+    conn.executescript(_TUNNEL_HEALTH_STATE_SCHEMA)
+
+
+def _tunnel_health_state_row(conn: sqlite3.Connection,
+                             transport: str) -> tuple[int, Optional[str]]:
+    """Return `(stale_streak, last_bounce_suppressed_reason)` for a transport.
+
+    A never-seen transport starts at streak 0 / reason None (a fresh tunnel has
+    no stale history). Read-only — never creates the row.
+    """
+    row = conn.execute(
+        "SELECT stale_streak, last_bounce_suppressed_reason "
+        "FROM tunnel_health_state WHERE transport = ?",
+        (transport,),
+    ).fetchone()
+    if row is None:
+        return 0, None
+    return int(row["stale_streak"] or 0), row["last_bounce_suppressed_reason"]
+
+
+def _write_tunnel_health_state(conn: sqlite3.Connection, transport: str,
+                               stale_streak: int,
+                               suppressed_reason: Optional[str],
+                               soft_refresh_attempted: bool,
+                               now: float) -> None:
+    """Persist the tunnel-health gate state (no secrets — counters + enum only)."""
+    conn.execute(
+        """
+        INSERT INTO tunnel_health_state
+            (transport, stale_streak, last_bounce_suppressed_reason,
+             soft_refresh_attempted, updated_ts)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(transport) DO UPDATE SET
+            stale_streak                  = excluded.stale_streak,
+            last_bounce_suppressed_reason = excluded.last_bounce_suppressed_reason,
+            soft_refresh_attempted        = excluded.soft_refresh_attempted,
+            updated_ts                    = excluded.updated_ts
+        """,
+        (transport, int(stale_streak), suppressed_reason,
+         1 if soft_refresh_attempted else 0, now),
+    )
+    conn.commit()
+
+
+def _fresh_peer_reachability_loss(conn: sqlite3.Connection, cfg: dict[str, Any],
+                                  now: float) -> tuple[Optional[bool], dict[str, int]]:
+    """Read the PRIOR-tick peer FSM and classify the mesh for the bounce gate.
+
+    Returns `(loss, counts)`:
+      - `loss is True`  → at least one FRESH peer FSM state is suspect/down AND
+        every other fresh peer is accounted for — a PROVEN reachability loss the
+        bounce gate may act on.
+      - `loss is False` → every configured peer has a FRESH `up` state — the
+        tunnel is demonstrably carrying traffic; NEVER bounce (the #1733 core).
+      - `loss is None`  → the peer state is UNKNOWN/STALE (no peers configured,
+        a peer never freshly probed, or every fresh state is up but some peers
+        are stale) — NEITHER proof-of-up NOR proof-of-loss; do not bounce and
+        let the later peer-reachability step refresh the state.
+
+    A peer's state only COUNTS when its `updated_ts` is within
+    `warp_peer_freshness_window()` of `now` (the peer-reachability step runs
+    AFTER this one, so a one-tick-old state is expected and fine; a state staler
+    than the window is treated as unknown). Pure read — never writes, never
+    probes a socket (that is the peer-reachability step's job).
+    """
+    counts = {"total": 0, "fresh_up": 0, "fresh_down_suspect": 0,
+              "stale_or_missing": 0}
+    peers = cfg.get("peers")
+    if not isinstance(peers, list):
+        return None, counts
+    peer_ids = [str(p.get("id")) for p in peers
+                if isinstance(p, dict) and p.get("id")]
+    if not peer_ids:
+        return None, counts
+
+    window = warp_peer_freshness_window()
+    counts["total"] = len(peer_ids)
+    fresh_loss = False
+    for pid in peer_ids:
+        row = conn.execute(
+            "SELECT state, updated_ts FROM peer_reachability WHERE peer_id = ?",
+            (pid,),
+        ).fetchone()
+        if row is None or row["updated_ts"] is None:
+            counts["stale_or_missing"] += 1
+            continue
+        try:
+            updated = float(row["updated_ts"])
+        except (TypeError, ValueError):
+            counts["stale_or_missing"] += 1
+            continue
+        if (now - updated) > window:
+            # State is older than the freshness window — UNKNOWN, not a signal.
+            counts["stale_or_missing"] += 1
+            continue
+        state = str(row["state"])
+        if state == PEER_STATE_UP:
+            counts["fresh_up"] += 1
+        elif state in (PEER_STATE_SUSPECT, PEER_STATE_DOWN):
+            counts["fresh_down_suspect"] += 1
+            fresh_loss = True
+        else:
+            # Unrecognized label — treat as unknown, never as a loss.
+            counts["stale_or_missing"] += 1
+
+    if counts["stale_or_missing"] > 0:
+        # ANY peer stale/missing/unknown → we can prove NEITHER all-up NOR a
+        # real reachability loss (the stale peer might be up). A WARP bounce
+        # severs the mesh's own substrate, so it must NOT fire on an incomplete
+        # picture — even when another peer is freshly suspect/down. (codex P1
+        # #11705: a mixed fresh-loss + stale set must suppress, not bounce.)
+        return None, counts
+    if fresh_loss:
+        # Every configured peer has FRESH state and at least one is
+        # suspect/down → a proven reachability loss → eligible to bounce.
+        return True, counts
+    if counts["fresh_up"] == counts["total"] and counts["total"] > 0:
+        return False, counts
+    # No fresh signal at all (shouldn't happen given the branches above, but
+    # fail safe toward unknown rather than inventing a loss).
+    return None, counts
+
+
+def _tunnel_health_warp(conn: Optional[sqlite3.Connection] = None,
+                        cfg: Optional[dict[str, Any]] = None) -> ReconcileStepResult:
+    """WARP substrate freshness probe + GATED auto-bounce (#1706 / #1733).
+
+    Reads the MASQUE handshake age (read-only `warp-cli tunnel stats`) and only
+    ever bounces the WHOLE tunnel on a CORRELATION of failure signals, never on
+    handshake-idle alone (the #1733 self-severance: the A2A mesh rides this same
+    tunnel, so an idle-bounce flaps the mesh it is protecting):
+
       - age UNKNOWABLE (warp-cli absent / unparseable) -> step_error with
         transport_degraded=True but NO bounce (fail-closed re-probe; a parse
-        failure is not a proven stale handshake — never bounce on it).
+        failure is not a proven stale handshake). Resets the stale streak.
       - age <= threshold -> step_converged (healthy, idempotent no-op; never
-        bounces a fresh tunnel).
-      - age  > threshold -> PROVEN stale: invoke the injectable bounce hook,
-        return step_error with transport_degraded=True (engages the backoff
-        gate so the NEXT bounce is paced — no storm). The bounce result is
-        reported in fields for net-status (`bounced` bool), never a secret.
+        bounces a fresh tunnel). Resets the stale streak.
+      - age  > threshold -> stale handshake. The FULL disconnect/connect bounce
+        is gated on ALL of:
+          (1) >= warp_stale_streak_threshold() CONSECUTIVE stale ticks
+              (persisted streak — a single idle tick never bounces), AND
+          (2) >= 1 FRESH peer FSM state suspect/down (prior-tick reachability,
+              read from `conn`; a peer only counts when freshly probed), AND
+          (3) a soft-refresh (`warp-cli connect`, NO disconnect) was tried first.
+        HARD no-bounce overrides (regardless of age):
+          - ALL peers FRESH-up -> the tunnel is demonstrably carrying traffic;
+            `bounce_suppressed_reason=all_peers_fresh_up`.
+          - peer state STALE/UNKNOWN -> neither all-up nor loss;
+            `bounce_suppressed_reason=peer_state_unknown_or_stale` and let the
+            later peer-reachability step refresh the state.
+          - stale streak below N -> wait for confirmation;
+            `bounce_suppressed_reason=stale_streak_below_threshold`.
+        On a gated bounce, returns step_error (engages the backoff gate so the
+        NEXT bounce is paced — no storm). All result fields are observable, no
+        secrets. `conn` is optional so a pre-gate caller (or the legacy stub
+        seam) still degrades to a no-bounce report on a stale tunnel — fail-safe
+        toward NOT severing the mesh.
     """
     age = a2a.warp_tunnel_handshake_age()
+    threshold = warp_handshake_stale_threshold()
+    transport = a2a.TRANSPORT_CLOUDFLARE_WARP_MESH
+
     if age is None:
         # Unknowable freshness — fail closed (re-probe), but do NOT bounce: a
-        # probe-parse failure is not a proven stale handshake.
+        # probe-parse failure is not a proven stale handshake. A non-proven tick
+        # also breaks the stale streak (we only count PROVEN stale ticks).
+        if conn is not None:
+            try:
+                _ensure_tunnel_health_state_schema(conn)
+                _write_tunnel_health_state(conn, transport, 0, None, False,
+                                           a2a.now_ts())
+            except sqlite3.Error:
+                pass
         return step_error(
             "warp tunnel handshake age unknowable (warp-cli absent or no "
             "handshake line) — fail-closed re-probe, no bounce",
@@ -616,8 +903,15 @@ def _tunnel_health_warp() -> ReconcileStepResult:
                     "transport_degraded": True,
                     "handshake_age_known": False})
 
-    threshold = warp_handshake_stale_threshold()
     if age <= threshold:
+        # Fresh tunnel — reset the stale streak (idle recovered or never stale).
+        if conn is not None:
+            try:
+                _ensure_tunnel_health_state_schema(conn)
+                _write_tunnel_health_state(conn, transport, 0, None, False,
+                                           a2a.now_ts())
+            except sqlite3.Error:
+                pass
         return step_converged(
             f"warp tunnel fresh (handshake age {age}s <= {threshold}s)",
             fields={"transport": "cloudflare-warp-mesh",
@@ -625,27 +919,155 @@ def _tunnel_health_warp() -> ReconcileStepResult:
                     "handshake_age_seconds": age,
                     "stale_threshold_seconds": threshold})
 
-    # PROVEN stale handshake -> auto-bounce (bounded by the run_step backoff
-    # gate: this adapter only runs when the step is eligible, so a flapping
-    # tunnel cannot bounce on every tick). The bounce hook never raises.
+    # ---- PROVEN stale handshake: gate the bounce (#1733) -----------------
+    now = a2a.now_ts()
+    streak = 1
+    streak_threshold = warp_stale_streak_threshold()
+
+    def _degraded_no_bounce(reason: str, detail: str,
+                            extra: Optional[dict[str, Any]] = None,
+                            *, soft_refresh_attempted: bool = False
+                            ) -> ReconcileStepResult:
+        if conn is not None:
+            try:
+                _write_tunnel_health_state(conn, transport, streak, reason,
+                                           soft_refresh_attempted, now)
+            except sqlite3.Error:
+                pass
+        fields = {"transport": "cloudflare-warp-mesh",
+                  "transport_degraded": True,
+                  "handshake_age_seconds": age,
+                  "stale_threshold_seconds": threshold,
+                  "stale_streak": streak,
+                  "stale_streak_threshold": streak_threshold,
+                  "bounced": False,
+                  "bounce_suppressed_reason": reason,
+                  "soft_refresh_attempted": soft_refresh_attempted}
+        if extra:
+            fields.update(extra)
+        return step_error(detail, fields=fields)
+
+    # No reconcile.db handle (pre-gate caller / legacy seam) — we CANNOT read the
+    # peer FSM, so we MUST NOT bounce (fail-safe toward not severing the mesh).
+    if conn is None:
+        return step_error(
+            f"warp tunnel stale (handshake age {age}s > {threshold}s); "
+            "no reconcile.db handle — peer state unreadable, bounce suppressed",
+            fields={"transport": "cloudflare-warp-mesh",
+                    "transport_degraded": True,
+                    "handshake_age_seconds": age,
+                    "stale_threshold_seconds": threshold,
+                    "bounced": False,
+                    "bounce_suppressed_reason":
+                        BOUNCE_SUPPRESSED_PEER_STATE_UNKNOWN})
+
+    try:
+        _ensure_tunnel_health_state_schema(conn)
+        _ensure_peer_reachability_schema(conn)
+        prev_streak, _prev_reason = _tunnel_health_state_row(conn, transport)
+        streak = int(prev_streak) + 1
+    except sqlite3.Error:
+        # State store unreadable — degrade to a single-tick view, no bounce.
+        streak = 1
+        return step_error(
+            f"warp tunnel stale (handshake age {age}s > {threshold}s); "
+            "gate-state store unreadable, bounce suppressed",
+            fields={"transport": "cloudflare-warp-mesh",
+                    "transport_degraded": True,
+                    "handshake_age_seconds": age,
+                    "stale_threshold_seconds": threshold,
+                    "bounced": False,
+                    "bounce_suppressed_reason":
+                        BOUNCE_SUPPRESSED_PEER_STATE_UNKNOWN})
+
+    # Read the prior-tick peer reachability classification.
+    peer_cfg = cfg if isinstance(cfg, dict) else {}
+    try:
+        loss, counts = _fresh_peer_reachability_loss(conn, peer_cfg, now)
+    except sqlite3.Error:
+        loss, counts = None, {"total": 0, "fresh_up": 0,
+                              "fresh_down_suspect": 0, "stale_or_missing": 0}
+
+    # HARD no-bounce: all peers FRESH-up -> tunnel demonstrably carrying traffic.
+    if loss is False:
+        return _degraded_no_bounce(
+            BOUNCE_SUPPRESSED_ALL_PEERS_FRESH_UP,
+            f"warp tunnel stale (handshake age {age}s > {threshold}s) but all "
+            f"{counts['total']} peers FRESH-up — idle, not broken; no bounce",
+            extra={"peer_counts": counts})
+
+    # HARD no-bounce: peer state unknown/stale -> neither all-up nor loss.
+    if loss is None:
+        return _degraded_no_bounce(
+            BOUNCE_SUPPRESSED_PEER_STATE_UNKNOWN,
+            f"warp tunnel stale (handshake age {age}s > {threshold}s) but peer "
+            "reachability state is unknown/stale — deferring to peer-"
+            "reachability refresh; no bounce",
+            extra={"peer_counts": counts})
+
+    # loss is True here: >=1 FRESH peer suspect/down. Require the N-streak too.
+    if streak < streak_threshold:
+        return _degraded_no_bounce(
+            BOUNCE_SUPPRESSED_STALE_STREAK_BELOW_N,
+            f"warp tunnel stale (handshake age {age}s > {threshold}s) with "
+            f"fresh peer loss, but stale streak {streak} < {streak_threshold} — "
+            "awaiting confirmation; no bounce",
+            extra={"peer_counts": counts})
+
+    # Gate satisfied: stale + N-streak + fresh peer loss. SOFT-REFRESH FIRST —
+    # a non-disruptive `warp-cli connect` nudge (NEVER disconnect) before any
+    # full bounce, so an idle-but-live tunnel refreshes without tearing the mesh.
+    try:
+        soft_refreshed = bool(_WARP_TUNNEL_SOFT_REFRESH())
+    except Exception:  # noqa: BLE001 - soft-refresh is best-effort; failure falls through to the bounce
+        soft_refreshed = False
+
+    # Full disconnect/connect bounce (the gate is satisfied AND soft-refresh was
+    # attempted first). Bounded by the run_step backoff gate around this adapter.
     try:
         bounced = bool(_WARP_TUNNEL_BOUNCE())
     except Exception as exc:  # noqa: BLE001 - the bounce is best-effort; a failure is paced, not fatal
+        try:
+            _write_tunnel_health_state(conn, transport, streak, None, True, now)
+        except sqlite3.Error:
+            pass
         return step_error(
-            f"warp tunnel stale (handshake age {age}s > {threshold}s); "
+            f"warp tunnel stale (handshake age {age}s > {threshold}s); fresh "
+            f"peer loss + streak {streak}; soft-refresh "
+            f"{'ran' if soft_refreshed else 'unavailable'}; "
             f"auto-bounce raised {type(exc).__name__}",
             fields={"transport": "cloudflare-warp-mesh",
                     "transport_degraded": True,
                     "handshake_age_seconds": age,
                     "stale_threshold_seconds": threshold,
+                    "stale_streak": streak,
+                    "stale_streak_threshold": streak_threshold,
+                    "soft_refresh_attempted": True,
+                    "soft_refreshed": soft_refreshed,
+                    "peer_counts": counts,
                     "bounced": False})
+
+    # A successful bounce refreshes the tunnel — reset the stale streak so the
+    # next stale episode starts its streak from scratch.
+    try:
+        _write_tunnel_health_state(conn, transport, 0 if bounced else streak,
+                                   None, True, now)
+    except sqlite3.Error:
+        pass
     return step_error(
-        f"warp tunnel stale (handshake age {age}s > {threshold}s); "
+        f"warp tunnel stale (handshake age {age}s > {threshold}s); fresh peer "
+        f"loss + streak {streak}/{streak_threshold}; soft-refresh "
+        f"{'ran' if soft_refreshed else 'unavailable'}; "
         f"auto-bounce {'invoked' if bounced else 'attempted'}",
         fields={"transport": "cloudflare-warp-mesh",
                 "transport_degraded": True,
                 "handshake_age_seconds": age,
                 "stale_threshold_seconds": threshold,
+                "stale_streak": streak,
+                "stale_streak_threshold": streak_threshold,
+                "soft_refresh_attempted": True,
+                "soft_refreshed": soft_refreshed,
+                "peer_counts": counts,
                 "bounced": bounced})
 
 
@@ -687,33 +1109,43 @@ def _tunnel_health_tailscale() -> ReconcileStepResult:
                 "backend_state": backend, "self_online": self_online})
 
 
-def tunnel_health(transport: str, cfg: dict[str, Any]) -> ReconcileStepResult:
-    """Per-transport tunnel/substrate liveness (#1706).
+def tunnel_health(transport: str, cfg: dict[str, Any],
+                  conn: Optional[sqlite3.Connection] = None
+                  ) -> ReconcileStepResult:
+    """Per-transport tunnel/substrate liveness (#1706 / #1733).
 
     Probes ONLY the configured `transport`'s substrate — a WARP install never
     shells `tailscale`, and a Tailscale install never shells `warp-cli`. The
     common control loop branches here exactly once, on `transport`:
 
       - "cloudflare-warp-mesh": probe the MASQUE handshake AGE; on a PROVEN
-        stale handshake (age > threshold, default 120s, env-overridable) the
-        daemon AUTO-bounces the tunnel via the injectable `_WARP_TUNNEL_BOUNCE`
-        hook (bounded by the run_step backoff gate so a flapping tunnel cannot
-        storm). A fresh tunnel is a converged no-op (idempotent).
+        stale handshake the daemon may AUTO-bounce the tunnel via the injectable
+        `_WARP_TUNNEL_BOUNCE` hook — but ONLY when the #1733 gate is satisfied
+        (>=N consecutive stale ticks AND >=1 FRESH peer suspect/down read from
+        the prior-tick FSM in `conn` AND a soft-refresh was tried first). A
+        fresh tunnel — or a stale tunnel whose peers are all FRESH-up / whose
+        peer state is unknown — is a no-bounce report (idempotent / suppressed).
       - "tailscale": surface `tailscale status` and detect tailnet-down /
         node-offline (no auto-bounce — Tailscale self-heals via keepalive/DERP).
       - anything else: converged no-op (no substrate-specific probe defined;
         never shell a foreign transport's CLI).
 
+    `conn` is the reconcile.db handle (the SAME one the backoff store uses). It
+    is threaded so the WARP path can read the prior-tick peer reachability FSM
+    and persist the consecutive-stale streak. It is OPTIONAL: when absent (a
+    pre-gate caller / a non-WARP transport), the WARP path degrades to a
+    no-bounce report on a stale tunnel — fail-safe toward NOT severing the mesh.
+    This step NEVER reorders the reconcile sequence and NEVER runs a second live
+    reachability probe (it only READS the FSM the peer-reachability step writes).
+
     Returns step_converged() when the tunnel is healthy; on a degraded /
     unknowable substrate returns step_error() with `transport_degraded: True`
-    plus non-secret health detail in `fields` (handshake age + status only —
-    never tokens/keys), so the bounded backoff paces re-probes. Fail-safe: a
-    probe error returns step_error() and NEVER raises into the tick; an
-    unknowable state fails closed (treated as NOT-converged) but never triggers
-    a bounce (only a proven stale handshake does).
+    plus non-secret health detail in `fields` (handshake age + status + FSM
+    counts only — never tokens/keys), so the bounded backoff paces re-probes.
+    Fail-safe: a probe error returns step_error() and NEVER raises into the tick.
     """
     if transport == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
-        return _tunnel_health_warp()
+        return _tunnel_health_warp(conn, cfg)
     if transport == a2a.TRANSPORT_TAILSCALE:
         return _tunnel_health_tailscale()
     # Unknown/unsupported transport: no substrate-specific probe. NO-OP rather
@@ -1578,3 +2010,63 @@ def peer_reachability_snapshot(peer_ids: list[str],
             except sqlite3.Error:
                 pass
     return out
+
+
+def tunnel_health_gate_snapshot(transport: str,
+                                state_dir: Optional[Path] = None,
+                                ) -> dict[str, Any]:
+    """Read-only #1733 bounce-gate state for net-status v2 (additive).
+
+    Surfaces the consecutive-stale streak + the last observable bounce-
+    suppressed reason for `transport` so an operator can see WHY a stale tunnel
+    was (not) bounced — no secrets, just the streak counter, the enum reason,
+    and whether a soft-refresh was attempted. Stable shape on a missing/
+    not-yet-reconciled store:
+
+        {
+          "stale_streak": <int>,
+          "last_bounce_suppressed_reason": <str|None>,
+          "soft_refresh_attempted": <bool>,
+          "updated_ts": <float|None>,
+        }
+
+    ★ Pure read (mirrors peer_reachability_snapshot): MUST NOT create the store.
+    Opens reconcile.db with a `?mode=ro` URI behind a `path.exists()` guard, so
+    a status call before the daemon has ever reconciled returns the stable
+    zero-shape WITHOUT materializing reconcile.db. Degrade-safe: any sqlite/OS
+    error degrades to the zero shape, never raises.
+    """
+    zero = {"stale_streak": 0, "last_bounce_suppressed_reason": None,
+            "soft_refresh_attempted": False, "updated_ts": None}
+    path = reconcile_db_path(state_dir)
+    if not path.exists():
+        return dict(zero)
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT stale_streak, last_bounce_suppressed_reason, "
+            "soft_refresh_attempted, updated_ts "
+            "FROM tunnel_health_state WHERE transport = ?",
+            (transport,),
+        ).fetchone()
+        if row is None:
+            return dict(zero)
+        return {
+            "stale_streak": int(row["stale_streak"] or 0),
+            "last_bounce_suppressed_reason":
+                row["last_bounce_suppressed_reason"],
+            "soft_refresh_attempted": bool(row["soft_refresh_attempted"]),
+            "updated_ts": row["updated_ts"],
+        }
+    except (sqlite3.Error, OSError):
+        # Missing table (not-yet-schema'd) / locked / corrupt → zero shape.
+        return dict(zero)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass

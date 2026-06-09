@@ -2920,6 +2920,28 @@ def _netstat_reconcile() -> dict[str, Any]:
         "tunnel_bounce_pending_retries": _attempts(reconcile.STEP_TUNNEL_HEALTH),
         "tunnel_bounce_last_result": _result(reconcile.STEP_TUNNEL_HEALTH),
     }
+
+    # #1733 additive observability: the WARP bounce-gate state (consecutive-
+    # stale streak + last bounce-suppressed reason + soft-refresh attempted).
+    # READ-ONLY, additive only — the existing schema/keys above are unchanged.
+    # Degrade-safe: any failure (no config, no store, non-WARP transport) just
+    # omits the optional block rather than raising into net-status.
+    try:
+        cfg = a2a.load_config()
+        transport = a2a.transport_kind(cfg)
+        if transport == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
+            gate = reconcile.tunnel_health_gate_snapshot(transport)
+            snap["auto_recovery"]["tunnel_bounce_gate"] = {
+                "stale_streak": gate.get("stale_streak", 0),
+                "bounce_suppressed_reason":
+                    gate.get("last_bounce_suppressed_reason"),
+                "soft_refresh_attempted":
+                    gate.get("soft_refresh_attempted", False),
+                "updated_ts": gate.get("updated_ts"),
+            }
+    except Exception:  # noqa: BLE001 - optional additive block; never raise into net-status
+        pass
+
     snap["error"] = None
     return snap
 
