@@ -250,16 +250,42 @@ def guard_test_bind_state_path() -> None:
     live / out-of-home location), refuse the operation with a clear message
     pointing at the override knobs. Production (flag unset) and a correctly
     isolated test mesh (state dir under the test home) are unaffected.
+
+    NOTE (#1728 r2): this state-dir check is necessary but NOT sufficient. The
+    explicit per-store DB overrides (`BRIDGE_A2A_OUTBOX_DB` / `_INBOX_DB` /
+    `BRIDGE_A2A_ROOMS_DB` / `_RECONCILE_DB`) bypass `state_dir()` entirely, so a
+    mesh can keep `BRIDGE_STATE_DIR` under home (passing here) yet still point a
+    db at a live tree. The db-path containment is enforced at each `_connect()`
+    choke point via `guard_test_bind_db_path()` — this entry stays for the early
+    `ensure_handoff_dirs()` / `cmd_serve` phase=config refuse-to-serve.
+    """
+    guard_test_bind_db_path(state_dir(), what="A2A state dir")
+
+
+def guard_test_bind_db_path(path: Path, *, what: str = "A2A db path") -> None:
+    """Fail closed when a test-bind mesh would write `path` into a live tree.
+
+    The db-path-aware core of the #1728 guard. `guard_test_bind_state_path()`
+    delegates here for the resolved state dir; each `_connect()` choke point
+    calls it with the FINAL resolved db path — which includes any explicit
+    `BRIDGE_A2A_OUTBOX_DB` / `_INBOX_DB` / `BRIDGE_A2A_ROOMS_DB` /
+    `_RECONCILE_DB` override that bypasses `state_dir()`. Under the test-bind
+    flag, ANY resolved write path outside the active `BRIDGE_HOME` fails closed,
+    so a throwaway test mesh can never clobber the live state tree no matter
+    which knob redirected it.
+
+    No-op when `BRIDGE_A2A_ALLOW_TEST_BIND` is unset (production) and when the
+    resolved path is under the active `BRIDGE_HOME` (a correctly isolated mesh,
+    including an override pointed UNDER the test home).
     """
     if os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") != "1":  # noqa: iso-helper-boundary - env var, not a .env file
         return
     home = bridge_home()
-    resolved_state = state_dir()
-    if _path_is_within(resolved_state, home):
+    if _path_is_within(path, home):
         return
     raise A2AError(
-        f"BRIDGE_A2A_ALLOW_TEST_BIND=1 (test mode) but the A2A state dir "
-        f"{str(resolved_state)!r} is outside BRIDGE_HOME {str(home)!r} — a "
+        f"BRIDGE_A2A_ALLOW_TEST_BIND=1 (test mode) but the {what} "
+        f"{str(path)!r} is outside BRIDGE_HOME {str(home)!r} — a "
         "test mesh would clobber the live rooms.db / reconcile.db / "
         "outbox / inbox. Set BRIDGE_STATE_DIR (and, if overridden, "
         "BRIDGE_A2A_ROOMS_DB / BRIDGE_A2A_RECONCILE_DB / "
@@ -2650,6 +2676,12 @@ def _inbox_pk_is_composite(conn: sqlite3.Connection) -> bool:
 
 
 def _connect(path: Path, schema: str) -> sqlite3.Connection:
+    # #1728 r2: guard the ACTUAL resolved db path (which may be a
+    # BRIDGE_A2A_OUTBOX_DB / _INBOX_DB override that bypasses state_dir()) —
+    # fail closed before creating/opening it if a test-bind mesh would land it
+    # outside its BRIDGE_HOME. No-op when the flag is unset (prod) or the path
+    # is under home (correctly isolated mesh).
+    guard_test_bind_db_path(path, what="A2A db path")
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30.0)
     conn.row_factory = sqlite3.Row

@@ -212,15 +212,16 @@ def open_reconcile_db(state_dir: Optional[Path] = None) -> sqlite3.Connection:
     WAL journal, 0600 perms — mirrors the outbox/inbox `_connect` convention in
     bridge_a2a_common.py so the file ownership/journaling story is identical.
     """
-    # #1728: fail closed before creating/opening reconcile.db if a test-bind
-    # mesh (BRIDGE_A2A_ALLOW_TEST_BIND=1) would land it on a live state dir
-    # outside its BRIDGE_HOME. Reuses the a2a-common guard (this module already
-    # imports `a2a`); no-op when the flag is unset (prod). Skipped only when the
-    # caller passes an EXPLICIT state_dir (smokes drive an isolated path directly
-    # — the guard keys on the env-resolved handoff_dir, not the override arg).
-    if state_dir is None and not os.environ.get("BRIDGE_A2A_RECONCILE_DB"):  # noqa: iso-helper-boundary
-        a2a.guard_test_bind_state_path()
+    # #1728 r2: guard the ACTUAL resolved reconcile.db path. The r1 guard keyed
+    # on the env-resolved state dir and SKIPPED entirely when BRIDGE_A2A_RECONCILE_DB
+    # was set — so the override could still land reconcile.db on a live tree under
+    # the test-bind flag (codex HIGH data-loss). Now resolve the final path first
+    # (state_dir arg OR BRIDGE_A2A_RECONCILE_DB override OR default) and guard THAT
+    # path. Reuses the a2a-common db-path guard (this module already imports `a2a`):
+    # no-op when the flag is unset (prod) or the resolved path is under BRIDGE_HOME
+    # (correctly isolated mesh, including an override / state_dir arg under home).
     path = reconcile_db_path(state_dir)
+    a2a.guard_test_bind_db_path(path, what="reconcile db path")
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30.0)
     conn.row_factory = sqlite3.Row

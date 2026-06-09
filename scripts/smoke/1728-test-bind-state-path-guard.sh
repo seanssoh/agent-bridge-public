@@ -37,6 +37,20 @@
 #                                   PRE-fix code WOULD write rooms.db into the
 #                                   live tree (the guard is what prevents it).
 #
+# r2 (#1728 codex needs-more, HIGH data-loss): the r1 guard checked only the
+# resolved STATE DIR, but the explicit per-store DB overrides bypass state_dir().
+# These cases keep BRIDGE_STATE_DIR safely UNDER home (so the state-dir guard
+# passes) and point a *_DB knob at the live tree — the real open choke point
+# must STILL fail closed:
+#   (f) db-override-outbox-deny     — BRIDGE_A2A_OUTBOX_DB outside home + opt-in
+#   (g) db-override-inbox-deny      — BRIDGE_A2A_INBOX_DB outside home + opt-in
+#   (h) db-override-rooms-deny      — BRIDGE_A2A_ROOMS_DB outside home + opt-in
+#   (i) db-override-reconcile-deny  — BRIDGE_A2A_RECONCILE_DB outside home + opt-in
+#                                     (the r1 code SKIPPED the guard entirely on
+#                                      this override → the data-loss path)
+#   (j) db-override-under-home-allow— all four *_DB knobs UNDER the test home +
+#                                     opt-in → allowed, nothing leaks live.
+#
 # Run green on /opt/homebrew/bin/bash (macOS) and Linux CI bash.
 
 set -euo pipefail
@@ -90,5 +104,27 @@ smoke_assert_contains "$out_d" "OK no-override-default-allow" \
 out_e="$(run_helper pre-fix-would-clobber)"
 smoke_assert_contains "$out_e" "OK pre-fix-would-clobber" \
   "(e) control: guard stubbed -> PRE-fix WOULD clobber the live rooms.db"
+
+# r2: explicit per-store DB overrides outside home must fail closed even when
+# BRIDGE_STATE_DIR (state-dir guard) is satisfied.
+out_f="$(run_helper db-override-outbox-deny)"
+smoke_assert_contains "$out_f" "OK db-override-outbox-deny" \
+  "(f) BRIDGE_A2A_OUTBOX_DB outside home + opt-in -> fail closed, no leak"
+
+out_g="$(run_helper db-override-inbox-deny)"
+smoke_assert_contains "$out_g" "OK db-override-inbox-deny" \
+  "(g) BRIDGE_A2A_INBOX_DB outside home + opt-in -> fail closed, no leak"
+
+out_h="$(run_helper db-override-rooms-deny)"
+smoke_assert_contains "$out_h" "OK db-override-rooms-deny" \
+  "(h) BRIDGE_A2A_ROOMS_DB outside home + opt-in -> fail closed, no leak"
+
+out_i="$(run_helper db-override-reconcile-deny)"
+smoke_assert_contains "$out_i" "OK db-override-reconcile-deny" \
+  "(i) BRIDGE_A2A_RECONCILE_DB outside home + opt-in -> fail closed (r1 skipped this), no leak"
+
+out_j="$(run_helper db-override-under-home-allow)"
+smoke_assert_contains "$out_j" "OK db-override-under-home-allow" \
+  "(j) all 4 *_DB overrides UNDER test home + opt-in -> allowed, no leak"
 
 smoke_log "ALL CHECKS PASSED ($SMOKE_NAME)"
