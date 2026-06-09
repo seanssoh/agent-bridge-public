@@ -24,6 +24,11 @@
 # This smoke proves all three. Parts A/B are Python-level and run on every
 # platform; Part C needs a real bound SEQPACKET socket and is Linux-only
 # (the same fail-closed gate as the other queue-gateway socket smokes).
+#
+# Every Python snippet is driven through the file-as-argv sidecar
+# scripts/smoke/1652-queue-gateway-crashloop-helper.py (footgun #11 / C1:
+# NO `python3 - <<'PY'` heredoc-stdin to a subprocess anywhere in this smoke;
+# heredoc-stdin in capture is a deadlock class banned by lint-heredoc-ban).
 
 set -euo pipefail
 
@@ -32,51 +37,15 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/smoke/lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
+HELPER="$SCRIPT_DIR/${SMOKE_NAME}-helper.py"
+
 trap smoke_cleanup_temp_root EXIT
 
 # Bug 2: a missing socket path must NOT crash the perms refresh. The
 # helpers must return False (degrade) instead of raising FileNotFoundError.
 gateway_missing_socket_perms_no_crash() {
   local out
-  out="$(
-    python3 - "$SMOKE_REPO_ROOT" <<'PY' 2>&1 || true
-import importlib.util
-import sys
-from pathlib import Path
-
-repo = Path(sys.argv[1])
-spec = importlib.util.spec_from_file_location("bqg", repo / "bridge-queue-gateway.py")
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-
-missing = repo / "does-not-exist" / "queue-gateway.sock"
-
-# _set_socket_group_mode on a missing path must return False, not raise.
-# live=False so a missing ab-shared group degrades to the 0600 branch
-# rather than SystemExit; either branch must still not raise on a missing
-# path.
-try:
-    rv = mod._set_socket_group_mode(missing, live=False)
-except FileNotFoundError:
-    print("FAIL: _set_socket_group_mode raised FileNotFoundError")
-    raise SystemExit(0)
-if rv is not False:
-    print(f"FAIL: _set_socket_group_mode returned {rv!r}, expected False")
-    raise SystemExit(0)
-
-# _refresh_socket_perms must propagate the False (degrade) without raising.
-try:
-    rv2 = mod._refresh_socket_perms(missing, {}, repo, live=False)
-except FileNotFoundError:
-    print("FAIL: _refresh_socket_perms raised FileNotFoundError")
-    raise SystemExit(0)
-if rv2 is not False:
-    print(f"FAIL: _refresh_socket_perms returned {rv2!r}, expected False")
-    raise SystemExit(0)
-
-print("ok-missing-socket-degrades")
-PY
-  )"
+  out="$(python3 "$HELPER" bug2-missing-socket-degrades "$SMOKE_REPO_ROOT" 2>&1 || true)"
   smoke_assert_contains "$out" "ok-missing-socket-degrades" \
     "bug2: missing-socket perms refresh degrades instead of crashing the listener"
 }
@@ -86,36 +55,7 @@ PY
 # not be a ValueError subclass (so the deny/invalid_payload path is skipped).
 gateway_probe_close_is_quiet() {
   local out
-  out="$(
-    python3 - "$SMOKE_REPO_ROOT" <<'PY' 2>&1 || true
-import importlib.util
-import socket
-import sys
-from pathlib import Path
-
-repo = Path(sys.argv[1])
-spec = importlib.util.spec_from_file_location("bqg", repo / "bridge-queue-gateway.py")
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-
-if issubclass(mod._ProbeClose, ValueError):
-    print("FAIL: _ProbeClose must not subclass ValueError (would re-enter invalid_payload)")
-    raise SystemExit(0)
-
-# Drive _recv_json with a socketpair where the writer closes without
-# sending anything — the reader's recv() returns b'' -> _ProbeClose.
-a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-b.close()
-try:
-    mod._recv_json(a)
-except mod._ProbeClose:
-    print("ok-empty-recv-is-probeclose")
-except ValueError as exc:
-    print(f"FAIL: empty recv raised ValueError {exc!r}, expected _ProbeClose")
-finally:
-    a.close()
-PY
-  )"
+  out="$(python3 "$HELPER" bug3-probe-close-quiet "$SMOKE_REPO_ROOT" 2>&1 || true)"
   smoke_assert_contains "$out" "ok-empty-recv-is-probeclose" \
     "bug3: empty connect-probe recv is a quiet _ProbeClose, not invalid_payload"
 }
@@ -135,41 +75,10 @@ gateway_clean_stale_keeps_live_socket() {
   socket_path="$sock_dir/gw.sock"
   mkdir -p "$BRIDGE_STATE_DIR"
 
-  # A real listener: bind + listen + accept loop in a background process,
-  # written to a file so its body is unambiguous under `set -e`. The accept()
-  # flaps on a 1.0s timeout — exactly the window that produced the
-  # transient-probe miss in the bug.
-  cat >"$SMOKE_TMP_ROOT/live-listener.py" <<'PY'
-import os
-import socket
-import sys
-import time
-
-path = sys.argv[1]
-try:
-    os.unlink(path)
-except FileNotFoundError:
-    pass
-s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-s.bind(path)
-s.listen(64)
-s.settimeout(1.0)
-# Serve until the parent kills us. accept() flaps on the 1.0s timeout, which
-# is exactly the window that produced the transient-probe miss in the bug.
-deadline = time.monotonic() + 30
-while time.monotonic() < deadline:
-    try:
-        conn, _ = s.accept()
-    except (TimeoutError, socket.timeout):
-        continue
-    except OSError:
-        break
-    try:
-        conn.close()
-    except OSError:
-        pass
-PY
-  python3 "$SMOKE_TMP_ROOT/live-listener.py" "$socket_path" >/dev/null 2>&1 &
+  # A real listener: bind + listen + accept loop in a background process via
+  # the file-as-argv helper (NO heredoc-stdin). accept() flaps on a 1.0s
+  # timeout — exactly the window that produced the transient-probe miss.
+  python3 "$HELPER" live-listener "$socket_path" 30 >/dev/null 2>&1 &
   listener_pid="$!"
   printf '%s\n' "$listener_pid" >"$pid_file"
 
@@ -246,20 +155,11 @@ gateway_clean_stale_still_removes_dead_socket() {
   socket_path="$sock_dir/gw.sock"
   mkdir -p "$BRIDGE_STATE_DIR"
 
-  # Alive but unrelated pid (the smoke runner), plus an unbound socket file.
+  # Alive but unrelated pid (the smoke runner), plus an unbound socket file
+  # (bind+close leaves the file on disk with no listener) via the helper.
   alive_pid="$$"
   printf '%s\n' "$alive_pid" >"$pid_file"
-  python3 - "$socket_path" >/dev/null <<'PY'
-import os, socket, sys
-p = sys.argv[1]
-try:
-    os.unlink(p)
-except FileNotFoundError:
-    pass
-s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-s.bind(p)
-s.close()
-PY
+  python3 "$HELPER" bind-and-close "$socket_path" >/dev/null
   [[ -S "$socket_path" ]] || smoke_fail "bug1-inverse: pre-condition — unbound socket file should exist"
 
   helper="$SMOKE_TMP_ROOT/clean-stale-dead-driver.sh"
@@ -305,6 +205,7 @@ BASH
 main() {
   smoke_require_cmd python3
   smoke_require_cmd awk
+  smoke_assert_file_exists "$HELPER" "1652 helper sidecar present"
   smoke_setup_bridge_home "1652-queue-gateway-crashloop"
   python3 "$SMOKE_REPO_ROOT/bridge-queue.py" init >/dev/null
 
