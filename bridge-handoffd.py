@@ -1061,6 +1061,12 @@ def _run_reconcile_steps(server: "HandoffServer", result: "ReconcileResult",
         # stubs. Fall back to the default.
         transport = a2a.TRANSPORT_TAILSCALE
 
+    # The active config the receiver loaded (set on `serve --config <path>`,
+    # else None → adapters resolve the default). Threaded into the steps that
+    # PERSIST desired config so a custom-config daemon converges its OWN file
+    # instead of drifting the default one forever (integration review #11573).
+    config_path = getattr(server, "config_path", None)
+
     try:
         # open_reconcile_db mkdir's the handoff dir, so an OSError (read-only fs,
         # perms) is as possible as a sqlite3.Error on a corrupt/locked store —
@@ -1084,7 +1090,7 @@ def _run_reconcile_steps(server: "HandoffServer", result: "ReconcileResult",
         # 1. stable-addr — proposes desired listen address (stub #1705).
         r = reconcile.run_step(
             conn, reconcile.STEP_STABLE_ADDR,
-            lambda: reconcile.stable_local_addr(transport, proof_cfg),
+            lambda: reconcile.stable_local_addr(transport, proof_cfg, config_path),
             on_event=_emit)
         result.steps[reconcile.STEP_STABLE_ADDR] = r.status
 
@@ -1112,7 +1118,7 @@ def _run_reconcile_steps(server: "HandoffServer", result: "ReconcileResult",
         # 4. peer-reachability (stub #1707).
         r = reconcile.run_step(
             conn, reconcile.STEP_PEER_REACHABILITY,
-            lambda: reconcile.peer_reachability_step(proof_cfg, conn),
+            lambda: reconcile.peer_reachability_step(proof_cfg, conn, config_path),
             on_event=_emit)
         result.steps[reconcile.STEP_PEER_REACHABILITY] = r.status
 

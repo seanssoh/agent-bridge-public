@@ -400,7 +400,8 @@ def all_step_status(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
 # config; the actual bind stays behind resolve_bind() in bridge-handoffd.py.
 
 
-def stable_local_addr(transport: str, cfg: dict[str, Any]) -> ReconcileStepResult:
+def stable_local_addr(transport: str, cfg: dict[str, Any],
+                      config_path: Optional[Path] = None) -> ReconcileStepResult:
     """Detect the stable substrate listen address and converge desired config (#1705).
 
     Detect the stable address the receiver SHOULD listen on for `transport`
@@ -500,7 +501,14 @@ def stable_local_addr(transport: str, cfg: dict[str, Any]) -> ReconcileStepResul
     try:
         listen["address"] = observed
         cfg["listen"] = listen
-        a2a.write_config_atomic(a2a.config_path(), cfg)
+        # Persist to the ACTIVE config the receiver loaded — `config_path` when
+        # the daemon was started with `serve --config <path>`, else the default
+        # (BRIDGE_A2A_CONFIG / bridge-home) resolved by a2a.config_path(). Without
+        # this the writer would drift the DEFAULT file while the receiver keeps
+        # reloading the unchanged custom file, re-proposing the same drift every
+        # tick and never converging (integration review #11573, the cross-lane
+        # L0×L1×L3 config_path seam).
+        a2a.write_config_atomic(config_path or a2a.config_path(), cfg)
     except (OSError, a2a.A2AError) as exc:
         # Roll the in-memory desired back so a failed persist does not leave the
         # live cfg dict claiming a converged state it never wrote to disk.
@@ -960,7 +968,8 @@ def _local_listen_address_drifted(transport: str,
 
 
 def peer_reachability_step(cfg: dict[str, Any],
-                           conn: sqlite3.Connection) -> ReconcileStepResult:
+                           conn: sqlite3.Connection,
+                           config_path: Optional[Path] = None) -> ReconcileStepResult:
     """Advance the per-peer UP→SUSPECT→DOWN→(recovery)→UP state machine (#1707).
 
     For each configured peer this step probes reachability via a lightweight
@@ -1190,7 +1199,9 @@ def peer_reachability_step(cfg: dict[str, Any],
     if any_unreachable:
         drifted = _local_listen_address_drifted(transport, cfg)
         if drifted is True:
-            drift_res = stable_local_addr(transport, cfg)
+            # Thread the active config_path so the IP-drift rebind persists to the
+            # SAME file the receiver loaded (not the default) — #11573 seam.
+            drift_res = stable_local_addr(transport, cfg, config_path)
             # stable_local_addr returns step_changed when it actually updated
             # the desired listen.address (the rebind we want recorded). A
             # converged/error result means there was nothing to (or it could
