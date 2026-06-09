@@ -9,9 +9,13 @@ processes that NOTHING reaps on subsequent upgrades:
      `app-server-broker.mjs` (parent node) + a child `node` app-server per
      disposable-agent / worktree session. On agent teardown the broker is
      not reaped on older versions and re-parents to init (`ppid==1`),
-     holding ~100-160MB each. Signature: `app-server-broker.mjs` with
-     `ppid==1`, `--cwd` pointing at a finished `.claude/worktrees/agent-*`
-     dir. The prevention fix (#1560 per-teardown reap) stops NEW leaks but
+     holding ~100-160MB each. Reapable signature (ALL required):
+     `app-server-broker.mjs` with `ppid==1` AND a `--cwd` that matches
+     `.claude/worktrees/agent-*` AND no longer exists on disk (the
+     disposable-worktree provenance proving the spawning session is gone).
+     ppid==1 alone is intentionally NOT sufficient to kill — a broker with no
+     `--cwd`, a non-worktree `--cwd`, or a still-present worktree is left
+     alone. The prevention fix (#1560 per-teardown reap) stops NEW leaks but
      does nothing for the backlog already accumulated on a long-running
      server. Reaping the parent broker alone orphans the child node, so we
      reap the `ppid==1` broker AND its child `node` app-server together.
@@ -280,11 +284,15 @@ def classify_orphans(
     self_pid = os.getpid()
 
     # --- codex broker orphans -------------------------------------------
-    # A broker is reapable only when it is orphaned (ppid==1) AND was
-    # launched against a finished disposable worktree (--cwd no longer
-    # exists, or no --cwd at all but ppid==1). We additionally require the
-    # --cwd path to be a `.claude/worktrees/agent-*` dir that is GONE — a
-    # broker whose worktree still exists may belong to a live session.
+    # A broker is reapable ONLY when ALL hold: it is orphaned (ppid==1), it is
+    # past the idle floor, AND it carries POSITIVE disposable-worktree
+    # provenance — a `--cwd` that matches `.claude/worktrees/agent-*` AND no
+    # longer exists on disk. ppid==1 alone is NOT enough evidence to KILL: a
+    # legit broker can reparent to init for benign reasons, and a broker with
+    # no `--cwd` (or a `--cwd` that is not a disposable worktree, or one whose
+    # worktree still exists) might belong to a live/owned session. Requiring the
+    # gone-worktree `--cwd` is the provenance that proves the session that
+    # spawned this broker has already torn down.
     orphan_broker_pids: set[int] = set()
     for proc in processes.values():
         if proc.pid == self_pid:
@@ -299,16 +307,18 @@ def classify_orphans(
         if proc.age_seconds < min_age:
             continue
         cwd = _first_group(CWD_RE, proc.command)
-        reason = "broker ppid==1"
-        if cwd:
-            if not WORKTREE_RE.search(cwd):
-                # --cwd points somewhere that is NOT a disposable worktree;
-                # be conservative and skip (could be an operator codex).
-                continue
-            if os.path.isdir(cwd):
-                # Worktree still on disk -> may belong to a live session.
-                continue
-            reason = "broker ppid==1, finished worktree --cwd gone"
+        if not cwd:
+            # No --cwd to prove disposable-worktree provenance -> NOT enough
+            # evidence to kill (could be a live/owned broker). Skip.
+            continue
+        if not WORKTREE_RE.search(cwd):
+            # --cwd points somewhere that is NOT a disposable worktree;
+            # could be an operator/live codex. Skip.
+            continue
+        if os.path.isdir(cwd):
+            # Worktree still on disk -> may belong to a live session. Skip.
+            continue
+        reason = "broker ppid==1, finished worktree --cwd gone"
         candidates.append(
             Candidate(
                 pid=proc.pid,

@@ -39,14 +39,28 @@ target_root="$2"
 admin_id="${3:-}"
 reap_optin="${4:-0}"
 
-# shellcheck source=/dev/null
-source "$source_root/bridge-lib.sh"
-
 helper_py="$source_root/lib/upgrade-helpers/codex-orphan-cleanup.py"
 marker="$target_root/state/upgrade/codex-orphan-cleanup.ts"
 
+# Self-contained logging — deliberately does NOT source bridge-lib.sh.
+#
+# BLOCKER 1 (CI-reproduced): bridge-lib.sh runs the isolation-v2 layout resolver
+# at source time, which `bridge_die`s / `exit`s on a `missing-marker(existing)`
+# target layout (`Agent Bridge v0.8.0 requires isolation-v2 ... markerless`).
+# That is a hard shell exit a `|| fallback` cannot catch, and sourcing it at all
+# makes the one-shot short-circuit layout-DEPENDENT. This helper is a pure
+# process-reaper: it only needs to log + shell out to python3 and the target's
+# own `agent-bridge` CLI (which loads bridge-lib in its OWN process). So we log
+# to stderr directly — exactly where bridge-upgrade.sh tails our output — and
+# never depend on the target's runtime layout being loadable. The full report
+# is also persisted to a state file, so nothing is lost vs. audit-log routing.
+bridge_info() { printf '%s\n' "$*" >&2; }
+bridge_warn() { printf '%s\n' "$*" >&2; }
+
 # Idempotency: one-shot. After a successful run we drop the marker; a present
-# marker short-circuits every later upgrade. Operators who want to re-run can
+# marker short-circuits every later upgrade — with NO dependency on the target
+# layout (the check is a plain file test, before any bridge-lib source).
+# Operators who want to re-run can
 # `rm "$BRIDGE_HOME/state/upgrade/codex-orphan-cleanup.ts"`.
 if [[ -f "$marker" ]]; then
   bridge_info "codex-orphan-cleanup: marker present — already ran, skipping (#1567)"

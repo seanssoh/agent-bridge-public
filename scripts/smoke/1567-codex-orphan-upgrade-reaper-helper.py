@@ -32,6 +32,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -267,6 +268,57 @@ def cmd_queue_gateway_staleness(cleanup_path: str) -> int:
             pass
 
 
+def cmd_broker_provenance_required(cleanup_path: str) -> int:
+    """Negative controls for BLOCKER 2: a ppid==1 broker is NEVER matched unless
+    it carries gone-disposable-worktree provenance. Proves three exclusions:
+      (a) ppid==1 broker with NO --cwd                       -> NOT matched
+      (b) ppid==1 broker with a non-worktree --cwd           -> NOT matched
+      (c) ppid==1 broker whose --cwd worktree STILL EXISTS   -> NOT matched
+    And one positive control:
+      (d) ppid==1 broker with a gone .claude/worktrees/agent-* --cwd -> matched
+    so the test fails loudly if the classifier ever stops matching legit orphans.
+    """
+    mod = _load_module(cleanup_path)
+    # (c) needs a worktree dir that actually exists on disk.
+    existing_wt = tempfile.mkdtemp(prefix="agb-1567-wt-")
+    existing_cwd = os.path.join(existing_wt, ".claude", "worktrees", "agent-live")
+    os.makedirs(existing_cwd, exist_ok=True)
+
+    no_cwd = _spawn_reparented("node /x/openai-codex/app-server-broker.mjs")
+    non_wt = _spawn_reparented(
+        "node /x/openai-codex/app-server-broker.mjs --cwd /tmp/agb-1567-not-a-worktree"
+    )
+    still_wt = _spawn_reparented(
+        f"node /x/openai-codex/app-server-broker.mjs --cwd {existing_cwd}"
+    )
+    gone_wt = _spawn_reparented(
+        f"node /x/openai-codex/app-server-broker.mjs --cwd {_gone_worktree()}"
+    )
+    spawned = [no_cwd, non_wt, still_wt, gone_wt]
+    try:
+        for pid in spawned:
+            if not _wait_reparented(pid):
+                raise RuntimeError(f"broker stand-in {pid} did not reparent to init")
+        procs = mod.load_processes()
+        cands = mod.classify_orphans(procs, 0)
+        broker_pids = {c.pid for c in cands if c.klass == "codex-broker"}
+        # Exclusions:
+        if no_cwd in broker_pids:
+            raise RuntimeError("(a) ppid==1 broker with NO --cwd was WRONGLY matched")
+        if non_wt in broker_pids:
+            raise RuntimeError("(b) ppid==1 broker with non-worktree --cwd was WRONGLY matched")
+        if still_wt in broker_pids:
+            raise RuntimeError("(c) ppid==1 broker whose worktree STILL EXISTS was WRONGLY matched")
+        # Positive control:
+        if gone_wt not in broker_pids:
+            raise RuntimeError("(d) ppid==1 broker with gone worktree --cwd was NOT matched (regression)")
+        return 0
+    finally:
+        for pid in spawned:
+            _kill(pid)
+        shutil.rmtree(existing_wt, ignore_errors=True)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print("usage: 1567-...-helper.py <subcommand> <cleanup.py>", file=sys.stderr)
@@ -279,6 +331,7 @@ def main(argv: list[str]) -> int:
         "dry-run-kills-nothing": cmd_dry_run_kills_nothing,
         "reap-orphans-only": cmd_reap_orphans_only,
         "queue-gateway-staleness": cmd_queue_gateway_staleness,
+        "broker-provenance-required": cmd_broker_provenance_required,
     }
     fn = table.get(sub)
     if fn is None:

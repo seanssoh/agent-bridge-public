@@ -73,6 +73,10 @@ smoke_log "B3: queue-gateway staleness — gone /tmp-smoke matched, live --bridg
 python3 "$HELPER_PY" queue-gateway-staleness "$CLEANUP_PY" || \
   smoke_fail "queue-gateway staleness matrix failed"
 
+smoke_log "B4: broker provenance required — ppid==1 alone never matches; only gone-worktree --cwd does"
+python3 "$HELPER_PY" broker-provenance-required "$CLEANUP_PY" || \
+  smoke_fail "broker provenance matrix failed (no-cwd / non-worktree / live-worktree must NOT match; gone-worktree must)"
+
 # ---------------------------------------------------------------------------
 smoke_log "C: marker idempotence — present marker short-circuits, absent marker is written"
 smoke_make_temp_root "$SMOKE_NAME"
@@ -80,14 +84,31 @@ fake_target="$SMOKE_TMP_ROOT/target"
 mkdir -p "$fake_target/state/upgrade"
 marker="$fake_target/state/upgrade/codex-orphan-cleanup.ts"
 
-# C1: present marker -> shim no-ops without invoking the detector. We assert the
-# stdout/stderr carries the "marker present" skip and never the scan summary.
+# C1: present marker -> shim short-circuits BEFORE sourcing bridge-lib.sh.
+# Reproduce the CI-failing layout: an EXISTING-install target (state/tasks.db
+# present) with NO v2 layout marker. Sourcing bridge-lib.sh against that env
+# `bridge_die`s with "requires isolation-v2 ... markerless(existing-install)"
+# (the original BLOCKER 1 failure). With our one-shot marker present, the shim
+# must read it and exit 0 BEFORE the source ever runs — regardless of layout.
+# We point BRIDGE_HOME/STATE at the target so the resolver sees the evidence,
+# exactly as bridge_upgrade_with_target_env would on a live upgrade.
+# existing-install evidence (state/tasks.db), NO v2 layout marker, and the
+# layout env explicitly UNSET so the resolver cannot take the env-override
+# escape and is forced down the markerless(existing-install) branch — the exact
+# bridge_die path the original blocker hit. The shim must short-circuit on our
+# marker BEFORE any bridge-lib source, so this layout never even reaches the die.
+: >"$fake_target/state/tasks.db"
 printf 'pre-existing\n' >"$marker"
-out_present="$(bash "$CLEANUP_SH" "$SMOKE_REPO_ROOT" "$fake_target" "" 0 2>&1 || true)"
+out_present="$(env -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT \
+  BRIDGE_HOME="$fake_target" BRIDGE_STATE_DIR="$fake_target/state" BRIDGE_LAYOUT_MARKER_DIR="$fake_target/state" \
+  bash "$CLEANUP_SH" "$SMOKE_REPO_ROOT" "$fake_target" "" 0 2>&1 || true)"
 smoke_assert_contains "$out_present" "marker present" \
   "present-marker run should short-circuit with a 'marker present' notice"
+smoke_assert_not_contains "$out_present" "requires isolation-v2" \
+  "present-marker run must NOT hit the bridge-lib isolation-v2 bridge_die (layout-independent short-circuit)"
 # The marker must be untouched (still our sentinel).
 grep -q '^pre-existing$' "$marker" || smoke_fail "present-marker run rewrote the marker"
+rm -f "$fake_target/state/tasks.db"
 
 # C2: absent marker, empty admin id (so no enqueue) -> shim runs the detector,
 # emits a DRY-RUN audit line, and WRITES the marker afterward. (On this host the
