@@ -240,6 +240,23 @@ rotation_threshold="${BRIDGE_CLAUDE_TOKEN_ROTATION_PERCENT:-99}"
 weekly_warn_threshold="${BRIDGE_CLAUDE_WEEKLY_WARN_PERCENT:-95}"
 claude_token_registry="${BRIDGE_CLAUDE_TOKEN_REGISTRY:-$BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json}"
 
+# Fail-safe a percent threshold (env- or registry-derived) before it reaches
+# the Python monitor's argparse float. A non-numeric or out-of-(0,100] value
+# (e.g. BRIDGE_CLAUDE_WEEKLY_WARN_PERCENT=foo) would make `usage monitor` exit
+# rc!=0 before collecting any snapshot, which suppresses the 5h hard-threshold
+# rotation candidate too — so an invalid value falls back to the safe default
+# instead of disabling rotation entirely (#1725 review). Mirrors the registry
+# 0<value<=100 validation below so env and registry inputs are equally guarded.
+_bridge_usage_sanitize_percent() {
+  local value="$1" fallback="$2"
+  if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    && awk -v v="$value" 'BEGIN { exit !(v > 0 && v <= 100) }'; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
 if [[ -f "$claude_token_registry" ]]; then
   registry_rotation_threshold="$(python3 - "$claude_token_registry" <<'PY' 2>/dev/null || true
 import json
@@ -274,6 +291,12 @@ PY
     weekly_warn_threshold="$registry_weekly_warn_threshold"
   fi
 fi
+
+# Final fail-safe at the single chokepoint before these reach the Python
+# monitor: a malformed env value (the registry path is already validated above)
+# must never reach argparse and take the whole `usage monitor` run down with it.
+rotation_threshold="$(_bridge_usage_sanitize_percent "$rotation_threshold" 99)"
+weekly_warn_threshold="$(_bridge_usage_sanitize_percent "$weekly_warn_threshold" 95)"
 
 # bridge_usage_select_claude_agents <spec>
 #   spec ∈ {static, all, claude, <csv>}; default `static`. Prints one Claude
