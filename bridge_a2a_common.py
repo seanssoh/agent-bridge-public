@@ -1898,6 +1898,9 @@ def build_envelope(
     reply_agent: str = "",
     room_id: str = "",
     room_epoch: Optional[int] = None,
+    relayed_via: str = "",
+    relayed_from_agent: str = "",
+    relayed_from_node: str = "",
 ) -> dict[str, Any]:
     """Build the A2A enqueue envelope.
 
@@ -1908,6 +1911,20 @@ def build_envelope(
     present, `room_epoch` is the sender's view of the room epoch the receiver
     seam (P4) validates against the leader-MAC'd roster. P1a builds + parses
     them but does not yet enforce on the cross-node path.
+
+    A2A rooms Lane 5 (#1695-P2 gotcha E): the leader-relay leg markers. When the
+    LEADER forwards a member→member room message it builds a FRESH envelope whose
+    AUTHENTICATED sender (`sender.bridge`) is the LEADER node (re-signed with the
+    leader↔target pair key — so the target's `reject_sender_mismatch` passes and
+    the target verifies the LEADER, never the original member). The ORIGINAL
+    sender — the member the leader VOUCHES for after verifying its member→leader
+    HMAC + membership — is carried as `relayed_from` {agent, node}; the target's
+    room-membership gate validates THAT original sender against its cached roster
+    (not the leader, who is also a member but is not the message author).
+    `relayed_via=<leader_node>` is the loop-guard marker: the receiver REFUSES to
+    re-relay any message already carrying it (M links, not M²). All three are
+    emitted ONLY on a room-scoped relayed leg; a normal send omits them
+    (byte-for-byte v1 unchanged).
     """
     env: dict[str, Any] = {
         "protocol": ENVELOPE_PROTOCOL,
@@ -1927,7 +1944,39 @@ def build_envelope(
         # room_epoch defaults to 0 when room-scoped but unspecified — the
         # receiver treats epoch 0 as "stale, refresh before deciding" (P4).
         env["room_epoch"] = int(room_epoch) if room_epoch is not None else 0
+        if relayed_via:
+            env["relayed_via"] = str(relayed_via)
+            # The leader-vouched original author (a leg without an author is not a
+            # valid relay; the receiver fail-closes on a missing relayed_from).
+            env["relayed_from"] = {
+                "agent": str(relayed_from_agent),
+                "node": str(relayed_from_node),
+            }
     return env
+
+
+def envelope_is_relayed(env: dict[str, Any]) -> bool:
+    """True iff the envelope carries the leader-relay loop-guard marker (Lane 5).
+
+    The single predicate the relay decision keys its no-re-relay contract on, so
+    the leader (which stamps it) and the relay gate (which refuses to re-relay a
+    stamped message) never diverge. A non-relayed message omits the field.
+    """
+    rv = env.get("relayed_via")
+    return isinstance(rv, str) and bool(rv)
+
+
+def relayed_from(env: dict[str, Any]) -> tuple[str, str]:
+    """The leader-vouched ORIGINAL (agent, node) of a relayed message (Lane 5).
+
+    Returns ("", "") when the envelope is not a relay leg or carries a malformed
+    `relayed_from`. The receiver validates THIS identity (the original author the
+    leader vouched for) against its cached roster — never the relaying leader's.
+    """
+    rf = env.get("relayed_from")
+    if not isinstance(rf, dict):
+        return "", ""
+    return str(rf.get("agent") or ""), str(rf.get("node") or "")
 
 
 def envelope_is_room_scoped(env: dict[str, Any]) -> bool:

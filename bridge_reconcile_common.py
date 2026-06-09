@@ -1222,18 +1222,92 @@ def peer_reachability_step(cfg: dict[str, Any],
 
 def roster_epoch_reconcile(cfg: dict[str, Any],
                            conn: sqlite3.Connection) -> ReconcileStepResult:
-    """STUB (#1695-P2 fills) — roster epoch anti-entropy.
+    """Roster epoch anti-entropy — re-broadcast un-acked leader rosters (#1695-P2 F).
 
-    Compare this node's observed roster/membership epoch against the desired
-    (leader-authored) epoch derived from rooms.db, and converge: pull a newer
-    roster, or re-broadcast continuity, bounded by the backoff gate in `conn`.
-    Membership is read from rooms.db / the roster cache — NEVER from a body-
-    asserted claim. Returns step_converged() at the matching epoch,
-    step_changed() when the roster advanced, or step_error() on a sync failure.
+    The heartbeat side of gotcha F: a membership change (approve/kick/leave/deny)
+    durably queues a per-member-node convergence target (`room_roster_outbox`) and
+    tries an immediate send; this periodic step re-broadcasts any row a member has
+    not yet acked, so a member that was offline at the change eventually converges
+    even across a transient outage. Membership/epoch ALWAYS read from the leader's
+    authoritative `rooms.db` (`roster_for`), NEVER a body-asserted claim; the
+    roster is signed with the per-pair leader↔member node-link HMAC. Bounded: this
+    runs inside `run_step`'s backoff gate (a tick that fails is paced out), and the
+    fan-out per tick is internally capped.
 
-    Lane 0 ships a no-op stub.
+    Result mapping:
+      - rooms module / rooms.db absent, or NO pending durable broadcast for any
+        room this node leads → step_noop (nothing to anti-entropy; idempotent,
+        resets backoff). This is also the deterministic outcome on the Lane-0
+        fixture (no rooms.db), keeping the framework smoke green.
+      - every pending row re-delivered (or retired) and none left → step_converged.
+      - at least one row delivered this tick (progress) → step_changed.
+      - rows remain pending and NONE delivered (all failed) → step_error (engages
+        the bounded backoff so the re-broadcast is paced, not stormed).
+    The `conn` arg is the reconcile.db backoff store (managed by run_step); the
+    rooms.db is opened separately here and only when there is actual work.
     """
-    return step_noop("roster_epoch_reconcile adapter not yet implemented (#1695-P2)")
+    # rooms module is optional in some minimal installs; fail-safe to noop.
+    try:
+        import bridge_rooms_common as rooms
+    except Exception:  # noqa: BLE001 - a missing rooms module is "nothing to do"
+        return step_noop("roster-epoch: rooms module unavailable")
+
+    # Cheap existence + pending probe on a READ-ONLY handle first (never CREATE
+    # rooms.db from the daemon tick — a fresh node with no rooms must no-op).
+    try:
+        ro = rooms.open_rooms_readonly()
+    except Exception as exc:  # noqa: BLE001 - present-but-unreadable is an op error
+        return step_error(f"roster-epoch: rooms.db unreadable ({exc})"[:200])
+    if ro is None:
+        return step_noop("roster-epoch: no rooms.db (nothing to anti-entropy)")
+    try:
+        try:
+            pending = rooms.pending_roster_outbox(ro)
+        except sqlite3.OperationalError:
+            # A rooms.db created BEFORE this table existed has no
+            # room_roster_outbox yet (open_rooms_readonly does not migrate). That
+            # simply means "no pending broadcasts" — the table is created lazily
+            # the next time the leader opens rooms.db writably (a membership
+            # change). Treat as a clean no-op, not an error.
+            return step_noop("roster-epoch: outbox table absent (no pending)")
+        except Exception as exc:  # noqa: BLE001 - other schema/db read error
+            return step_error(f"roster-epoch: outbox read failed ({exc})"[:200])
+    finally:
+        ro.close()
+    if not pending:
+        return step_noop("roster-epoch: no pending roster broadcasts")
+
+    # There is real work → open a WRITABLE handle and drain it through the shared
+    # sender (one signing path with the CLI). Any raise is contained (fail-safe).
+    try:
+        wconn = rooms.open_rooms()
+    except Exception as exc:  # noqa: BLE001 - rooms.db open failure is an op error
+        return step_error(f"roster-epoch: rooms.db open failed ({exc})"[:200])
+    try:
+        summary = rooms.heartbeat_rebroadcast_rosters(cfg, wconn)
+    except Exception as exc:  # noqa: BLE001 - last-resort guard (never crash tick)
+        return step_error(f"roster-epoch: rebroadcast raised ({exc})"[:200])
+    finally:
+        try:
+            wconn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    sent = int(summary.get("sent", 0))
+    failed = int(summary.get("failed", 0))
+    remaining = int(summary.get("pending", 0))
+    detail = (f"roster-epoch: re-broadcast sent={sent} failed={failed} "
+              f"pending={remaining}")
+    fields = {"sent": sent, "failed": failed, "pending": remaining}
+    if sent > 0:
+        # Progress this tick (a member converged) — reset backoff.
+        return step_changed(detail, fields=fields)
+    if remaining == 0:
+        # Nothing left pending and nothing sent (all rows retired as stale) —
+        # converged no-op.
+        return step_converged(detail, fields=fields)
+    # Rows remain and none were delivered → pace via the bounded backoff.
+    return step_error(detail, fields=fields)
 
 
 # --------------------------------------------------------------------------
