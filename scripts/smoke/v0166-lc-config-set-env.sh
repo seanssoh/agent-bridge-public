@@ -356,6 +356,50 @@ assert_bash_verdict \
   "export BRIDGE_CALLER_SOURCE=operator-tui && agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
   "DENY"
 
+# 3h. option-bearing env wrappers (`env -i` / `env --` / `/usr/bin/env -i`) —
+#     the env-options weren't consumed by the r2 enumerator (codex r2 #11717).
+#     The canonical-shape gate denies them uniformly (token[0] != agb verb).
+assert_bash_verdict \
+  "hook: env -i prefix spoof denied" \
+  "$USER_AGENT" \
+  "env -i BRIDGE_ADMIN_AGENT_ID=patch BRIDGE_AGENT_ID=patch BRIDGE_CALLER_SOURCE=operator-tui agb config set-env BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS=86400" \
+  "DENY"
+assert_bash_verdict \
+  "hook: env -- prefix spoof denied" \
+  "$USER_AGENT" \
+  "env -- BRIDGE_AGENT_ID=patch agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
+  "DENY"
+
+# 3i. shell reserved words / grouping metacharacters (`time`, `!`, subshell
+#     `(…)`, group `{…}`) also apply a leading env-assignment but are not PATH
+#     binaries (patch write-gate r2 #11718). The canonical-shape gate denies
+#     them without enumerating each one.
+assert_bash_verdict \
+  "hook: time keyword prefix spoof denied" \
+  "$USER_AGENT" \
+  "time BRIDGE_AGENT_ID=patch agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
+  "DENY"
+assert_bash_verdict \
+  "hook: ! keyword prefix spoof denied" \
+  "$USER_AGENT" \
+  "! BRIDGE_AGENT_ID=patch agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
+  "DENY"
+assert_bash_verdict \
+  "hook: subshell ( ) prefix spoof denied" \
+  "$USER_AGENT" \
+  "(BRIDGE_AGENT_ID=patch agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60)" \
+  "DENY"
+assert_bash_verdict \
+  "hook: group { } prefix spoof denied" \
+  "$USER_AGENT" \
+  "{ BRIDGE_AGENT_ID=patch agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60; }" \
+  "DENY"
+assert_bash_verdict \
+  "hook: time env -i combo spoof denied" \
+  "$USER_AGENT" \
+  "time env -i BRIDGE_AGENT_ID=patch agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
+  "DENY"
+
 # 3d. shell-embedding / separator smuggles on a recognized set-env attempt.
 assert_bash_verdict \
   "hook: separator smuggle denied" \
