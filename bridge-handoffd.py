@@ -1108,10 +1108,15 @@ def _run_reconcile_steps(server: "HandoffServer", result: "ReconcileResult",
         reconcile.record_attempt(conn, reconcile.STEP_BIND_REPROVE, bind_status)
         result.steps[reconcile.STEP_BIND_REPROVE] = bind_status
 
-        # 3. tunnel-health (stub #1706).
+        # 3. tunnel-health (#1706 + #1733 bounce-gating). `conn` is threaded so
+        #    the WARP path can read the PRIOR-tick peer reachability FSM (the
+        #    peer-reachability step below runs AFTER, so its state is one tick
+        #    old — fine for a 120s+ decision) and persist the consecutive-stale
+        #    streak. The step ORDER is unchanged; tunnel-health never runs a
+        #    second live reachability probe, it only READS the FSM rows.
         r = reconcile.run_step(
             conn, reconcile.STEP_TUNNEL_HEALTH,
-            lambda: reconcile.tunnel_health(transport, proof_cfg),
+            lambda: reconcile.tunnel_health(transport, proof_cfg, conn),
             on_event=_emit)
         result.steps[reconcile.STEP_TUNNEL_HEALTH] = r.status
 

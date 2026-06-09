@@ -318,7 +318,10 @@ def cmd_raises(repo_root: str) -> int:
     # Inject a RAISING adapter for the tunnel-health stub. The daemon step
     # sequence must catch it, record `error`, and STILL complete every later
     # step (fail-safe — a raising step never crashes the tick).
-    def _boom(transport, cfg_):
+    def _boom(transport, cfg_, conn=None):
+        # Signature matches tunnel_health(transport, cfg, conn) — #1733 threaded
+        # `conn` through the call site; accept it so the RAISE under test is the
+        # injected RuntimeError, not an accidental arity TypeError.
         raise RuntimeError("injected adapter failure")
 
     original = reconcile.tunnel_health
