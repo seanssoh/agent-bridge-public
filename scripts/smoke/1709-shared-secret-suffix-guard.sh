@@ -333,6 +333,16 @@ assert_verdict "chain && read"            "false && true || cd \$BRIDGE_HOME/sha
 assert_verdict "B peer chain cd-in"       "true || false && cd \$BRIDGE_HOME/agents; cat $PEER_AGENT/MEMORY.md" "DENY"
 assert_verdict "chain skips cd (&&-false)" "true && false && cd \$BRIDGE_HOME/shared; cat secrets/token" "ALLOW"
 assert_verdict "chain skips cd (||-true)"  "false || true || cd \$BRIDGE_HOME/shared; cat secrets/token" "ALLOW"
+# r10 (codex #11815) — an EXECUTED `cd` is likely-success: in an all-`&&` chain a
+# read only runs if every preceding cd succeeded, so its cwd is the LAST cd
+# target. `cd-in && cd-out && read` ends in the cd-OUT cwd → ALLOW (teeth below
+# in the no-over-block block). But a cd-IN with NO cd-out, or a cd-out that is
+# itself skipped, stays in the bridge → DENY. And a cd may FAIL, so
+# `cd <missing> || cd <bridge>` keeps the bridge branch live → DENY.
+assert_verdict "cd-in && read (no out)"    "cd \$BRIDGE_HOME/shared && cat secrets/token"               "DENY"
+assert_verdict "cd-in && skipped cd-out"   "cd \$BRIDGE_HOME/shared && false && cd /tmp; cat secrets/token" "DENY"
+assert_verdict "cd-miss || cd-bridge"      "cd /nonexistent || cd \$BRIDGE_HOME/shared; cat secrets/token" "DENY"
+assert_verdict "B peer cd-in && read"      "cd \$BRIDGE_HOME/agents && cat $PEER_AGENT/MEMORY.md"       "DENY"
 
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
@@ -357,6 +367,12 @@ assert_verdict "command -V query"        "command -V cd \$BRIDGE_HOME/shared && 
 assert_verdict "subshell read wiki"      "(cd \$BRIDGE_HOME && cat shared/wiki/page.md)"  "ALLOW"
 assert_verdict "subshell-then-rel wiki"  "cd \$BRIDGE_HOME/shared; (cd /tmp); cat wiki/index.md" "ALLOW"
 assert_verdict "cd-in then wiki then out" "cd \$BRIDGE_HOME/shared && cat wiki/index.md && cd /tmp" "ALLOW"
+# r10 (codex #11815) — EXECUTED cd-OUT chain: the read runs only if every
+# preceding `&&` cd succeeded, so the cwd is the last (out-of-bridge) cd target.
+assert_verdict "cd-in && cd-out && read"   "cd \$BRIDGE_HOME/shared && cd /tmp && cat secrets/token"              "ALLOW"
+assert_verdict "cd-in && true && cd-out"   "cd \$BRIDGE_HOME/shared && true && cd /tmp && cat secrets/token"      "ALLOW"
+assert_verdict "cd-in && cd-out2 && read"  "cd \$BRIDGE_HOME/shared && cd /tmp && cd /var && cat secrets/token"   "ALLOW"
+assert_verdict "B peer cd-in && cd-out"    "cd \$BRIDGE_HOME/agents && cd /tmp && cat $PEER_AGENT/MEMORY.md"      "ALLOW"
 # r3 no-over-block — the resolution model must NOT collateral-block these:
 #   a RELATIVE forbidden-tail read with NO `cd` (relative to the agent's own
 #   cwd, which the hook can't see → unanchorable, not bridge), and a `..` that

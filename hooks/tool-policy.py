@@ -2731,6 +2731,14 @@ def _word_carries_obfuscation(word: str) -> bool:
 _CWD_UNKNOWN = None
 _CWD_POISONED = "\x00POISONED\x00"
 
+# Bounded-chain exit sentinel for the &&/|| evaluator (codex r9 #11815): a
+# `cd`/`pushd`/`popd` command almost always SUCCEEDS — so `&&` after it
+# continues the chain — but it CAN fail (a missing dir), so a following `||`
+# branch MAY still run. Distinct from the literal True/False/None exits so the
+# evaluator can commit a cd-OUT cwd on the `&&` continuation while keeping a
+# `cd <missing> || cd <bridge>` chain sound on the `||` side.
+_CD_LIKELY_SUCCESS = "\x00CD_OK\x00"
+
 
 def _expand_bridge_prefixes(word: str) -> str:
     """Expand ONLY the bridge-known location prefixes in *word* — ``~`` /
@@ -3034,6 +3042,28 @@ def _literal_truth(seg: str) -> bool | None:
     return (not base) if neg else base
 
 
+def _segment_exit(seg: str) -> object:
+    """The bounded-chain exit model of command *seg* for the ``&&``/``||``
+    evaluator (codex r9 #11815). Returns:
+
+    - ``_CD_LIKELY_SUCCESS`` for a ``cd``/``pushd``/``popd`` command — it almost
+      always succeeds (so an ``&&`` continuation runs), but CAN fail (so a
+      following ``||`` MAY run);
+    - ``True`` / ``False`` for the literal ``true``/``:`` / ``false`` builtins
+      (with leading ``!`` negation), per :func:`_literal_truth`;
+    - ``None`` otherwise (unknown exit).
+
+    Modeling a successful ``cd`` is what lets ``cd $BH/shared && cd /tmp &&
+    read`` commit the cd-OUT cwd: in an all-``&&`` chain the read only runs if
+    EVERY preceding ``cd`` succeeded, so the read's cwd is precisely the last
+    ``cd`` target — not the prior bridge cwd. A ``cd`` whose own execution is
+    uncertain (a ``union`` disposition) never reaches here, so the sentinel is
+    only ever produced for a ``cd`` that definitely ran."""
+    if _segment_cwd_change(seg.strip()) is not None:
+        return _CD_LIKELY_SUCCESS
+    return _literal_truth(seg)
+
+
 def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     """Scan the shell command *text* for a read that RESOLVES into any
     forbidden tree, independent of how the path is spelled or traversed.
@@ -3086,12 +3116,17 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     # (patch r8 #11806): a segment's `cd` execution depends on the running exit
     # status of the WHOLE chain, not just the immediate predecessor. `false &&
     # true || cd …` runs the cd (false&&true short-circuits to false → ||cd
-    # runs). `running` is the chain's exit so far (True/False/None=unknown),
-    # reset at `;`/`&`/`|`/newline. The bounded boolean grammar (true/false/:/!
-    # + &&/||) converges, unlike the open cwd grammar.
+    # runs). `running` is the chain's exit so far, reset at `;`/`&`/`|`/newline.
+    # Exit states: True / False (literal builtins), None (unknown), and
+    # `_CD_LIKELY_SUCCESS` for an executed `cd`/`pushd`/`popd` (codex r9 #11815)
+    # — a cd almost always succeeds so `&&` after it CONTINUES the chain (commit
+    # the cd-OUT cwd: in an all-`&&` chain the read only runs if every preceding
+    # cd succeeded → cwd is the last cd target), but it CAN fail so `||` after it
+    # is genuinely ambiguous (union → keeps `cd <missing> || cd <bridge>` sound).
+    # The bounded grammar (true/false/:/! + cd-success + &&/||) converges.
     seg_specs: list[tuple[str, str]] = []
     prev_op: str | None = None
-    running: bool | None = None
+    running: object = None
     chain_start = True
     for part in re.split(r"(&&|\|\||\||;|&|\n)", text):
         if part in ("&&", "||", "|", ";", "&", "\n"):
@@ -3100,12 +3135,26 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
                 chain_start = True  # `;`/`&`/`|`/newline end the conditional chain
                 running = None
             continue
+        runs: bool | None
         if chain_start:
-            runs: bool | None = True
+            runs = True
         elif prev_op == "&&":
-            runs = True if running is True else (False if running is False else None)
+            # Continues iff the chain so far succeeded. A cd is likely-success.
+            if running is False:
+                runs = False
+            elif running is None:
+                runs = None
+            else:  # True or _CD_LIKELY_SUCCESS
+                runs = True
         elif prev_op == "||":
-            runs = True if running is False else (False if running is True else None)
+            # Runs iff the chain so far FAILED. A cd usually succeeds (|| skips)
+            # but MAY fail (|| runs) → genuinely ambiguous → union.
+            if running is True:
+                runs = False
+            elif running is False:
+                runs = True
+            else:  # None or _CD_LIKELY_SUCCESS
+                runs = None
         else:
             runs = True
         disp = "exec" if runs is True else ("skip" if runs is False else "union")
@@ -3113,7 +3162,7 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
             seg_specs.append((disp, sub))
         # Advance the running exit status for the next chained segment.
         if runs is True:
-            running = _literal_truth(part)  # this segment's statically-known exit
+            running = _segment_exit(part)  # cd→likely-success, true/false→bool, …
         elif runs is None:
             running = None  # maybe-ran / unknown exit
         # runs is False → short-circuited, running unchanged.
