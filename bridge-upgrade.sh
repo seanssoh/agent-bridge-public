@@ -2567,6 +2567,44 @@ if [[ $DRY_RUN -eq 0 ]]; then
     _upgrade_partial_failures+=("bundled_plugins_bun_install")
   fi
   rm -f -- "$_bundled_plugins_tmp"
+
+  # Issue #1567: one-shot upgrade-time reaper for the codex broker +
+  # queue-gateway socket-server orphan BACKLOG. Pre-0.16.0 installs leak
+  # `app-server-broker.mjs` (+ child node) reparented to init and stale
+  # `bridge-queue-gateway.py socket-server` procs whose --bridge-home is a
+  # long-gone /tmp smoke dir; the prevention fix (#1560 per-teardown reap)
+  # stops NEW leaks but never clears the backlog a long-running server already
+  # accumulated. The helper is gated by its own migration marker
+  # (state/upgrade/codex-orphan-cleanup.ts) so it runs EXACTLY ONCE; new
+  # installs have no backlog and the marker keeps it from re-running. Default
+  # posture is conservative: DRY-RUN report + a high-priority admin cleanup
+  # task carrying the safe-kill recipe — nothing is killed inside the upgrade
+  # unless the operator opts in via AGENT_BRIDGE_REAP_CODEX_ORPHANS=1 (an
+  # active session could match). Best-effort, non-fatal: a non-zero rc surfaces
+  # as a partial-failure warning, never a fatal abort.
+  #
+  # Footgun #11: file-as-argv via the standalone helper (no heredoc-stdin) —
+  # the helper delegates ps/kill detection to its Python sibling.
+  set +e
+  _codex_orphan_reap_optin=0
+  if [[ "${AGENT_BRIDGE_REAP_CODEX_ORPHANS:-0}" == "1" ]]; then
+    _codex_orphan_reap_optin=1
+  fi
+  _codex_orphan_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-codex-orphan.XXXXXX")"
+  bridge_upgrade_with_target_env "$TARGET_ROOT" \
+    "$BRIDGE_BASH_BIN" \
+    "$SOURCE_ROOT/lib/upgrade-helpers/codex-orphan-cleanup.sh" \
+    "$SOURCE_ROOT" "$TARGET_ROOT" "$ADMIN_AGENT_ID" "$_codex_orphan_reap_optin" >"$_codex_orphan_tmp" 2>&1
+  _codex_orphan_rc=$?
+  set -e
+  if [[ -s "$_codex_orphan_tmp" ]]; then
+    tail -n 30 "$_codex_orphan_tmp" >&2 || true
+  fi
+  if [[ $_codex_orphan_rc -ne 0 ]]; then
+    echo "[bridge-upgrade] WARN: codex orphan cleanup reported a failure (rc=$_codex_orphan_rc) — one or more orphans could not be signalled. Run 'python3 $TARGET_ROOT/lib/upgrade-helpers/codex-orphan-cleanup.py reap' manually." >&2
+    _upgrade_partial_failures+=("codex_orphan_cleanup")
+  fi
+  rm -f -- "$_codex_orphan_tmp"
 fi
 
 # Footgun #11: `bridge_upgrade_agent_restart_json` feeds python via heredoc;
