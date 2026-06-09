@@ -235,6 +235,9 @@ claude_usage_cache="${BRIDGE_CLAUDE_USAGE_CACHE:-$HOME/.claude/plugins/claude-hu
 codex_sessions_dir="${BRIDGE_CODEX_SESSIONS_DIR:-$HOME/.codex/sessions}"
 usage_state_file="${BRIDGE_USAGE_MONITOR_STATE_FILE:-$BRIDGE_STATE_DIR/usage/monitor-state.json}"
 rotation_threshold="${BRIDGE_CLAUDE_TOKEN_ROTATION_PERCENT:-99}"
+# Separate weekly preemptive warn threshold. Fires for the 7-day window before
+# rotation_threshold to allow proactive rotation/escalation.
+weekly_warn_threshold="${BRIDGE_CLAUDE_WEEKLY_WARN_PERCENT:-95}"
 claude_token_registry="${BRIDGE_CLAUDE_TOKEN_REGISTRY:-$BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json}"
 
 if [[ -f "$claude_token_registry" ]]; then
@@ -243,17 +246,32 @@ import json
 import sys
 from pathlib import Path
 
+def threshold(payload, key):
+    try:
+        value = float(payload.get(key) or 0)
+    except Exception:
+        return ""
+    if 0 < value <= 100:
+        return str(value)
+    return ""
+
 try:
     payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-    value = float(payload.get("rotation_threshold") or 0)
 except Exception:
-    value = 0
-if 0 < value <= 100:
-    print(value)
+    payload = {}
+print(f"{threshold(payload, 'rotation_threshold')}|{threshold(payload, 'weekly_warn_threshold')}")
 PY
 )"
+  registry_weekly_warn_threshold=""
+  if [[ "$registry_rotation_threshold" == *"|"* ]]; then
+    registry_weekly_warn_threshold="${registry_rotation_threshold#*|}"
+    registry_rotation_threshold="${registry_rotation_threshold%%|*}"
+  fi
   if [[ "$registry_rotation_threshold" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     rotation_threshold="$registry_rotation_threshold"
+  fi
+  if [[ "$registry_weekly_warn_threshold" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    weekly_warn_threshold="$registry_weekly_warn_threshold"
   fi
 fi
 
@@ -513,7 +531,7 @@ run_python() {
     --codex-sessions-dir "$codex_sessions_dir"
   )
   if [[ "$subcmd" == "monitor" ]]; then
-    base_args+=(--state-file "$usage_state_file" --rotation-threshold "$rotation_threshold")
+    base_args+=(--state-file "$usage_state_file" --rotation-threshold "$rotation_threshold" --weekly-warn-threshold "$weekly_warn_threshold")
   fi
   if [[ -n "$per_agent_cache_json" ]]; then
     base_args+=(--per-agent-cache-json "$per_agent_cache_json")

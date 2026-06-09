@@ -152,7 +152,7 @@ Examples:
   __CLI_NAME__ upgrade conflicts reconcile --auto-archive
   __CLI_NAME__ upgrade conflicts adopt --yes <conflict-path>
   __CLI_NAME__ auth claude-token add --id claude-a --stdin --activate --sync
-  __CLI_NAME__ auth claude-token auto-rotate enable --threshold 99
+  __CLI_NAME__ auth claude-token auto-rotate enable --threshold 99 --weekly-warn-threshold 95
   __CLI_NAME__ escalate question --agent reviewer --question "Should I ship this now?" --context "Second ask without a user reply."
   __CLI_NAME__ upstream draft --title "setup fails" --symptom "..." --why "..." --output /tmp/issue.md
   __CLI_NAME__ upstream propose --title "setup fails" --body-file /tmp/issue.md

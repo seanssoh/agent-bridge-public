@@ -2412,7 +2412,7 @@ bridge_daemon_run_tick_supervised() {
   local child_pid=""
   {
     set -m 2>/dev/null || true
-    ( "$@" ) &
+    ( bridge_daemon_run_without_singleton_lock "$@" ) &
     child_pid=$!
     if (( _had_monitor == 0 )); then
       set +m 2>/dev/null || true
