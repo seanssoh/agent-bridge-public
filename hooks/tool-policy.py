@@ -2472,6 +2472,16 @@ def _peer_alias_list(agent: str) -> list[str]:
     references. Each peer agent contributes six variants (with/without
     trailing slash, expanded vs ``~`` vs ``$HOME``). Stable order so
     deny messages are deterministic.
+
+    NOTE — same prefix-spelling incompleteness as
+    :func:`_shared_forbidden_aliases` (issue #1709): the brace ``${HOME}``,
+    ``$BRIDGE_HOME``, ``${BRIDGE_HOME}`` peer-home spellings are NOT in this
+    list, so a raw ``alias in text`` check alone lets a non-admin read a
+    peer home spelled ``${HOME}/.agent-bridge/agents/<other>/MEMORY.md``.
+    The authoritative non-admin Stage-B deny is the suffix matcher
+    :func:`_forbidden_suffix_in_command`, keyed off the same peer-name SSOT
+    (``other_agent_homes``). This list is retained for the deterministic
+    deny-reason text and the admin-carve-out audit ledger.
     """
     home_root = agent_home_root()
     aliases: list[str] = []
@@ -2493,9 +2503,22 @@ def _shared_forbidden_aliases() -> list[str]:
     """Return the substring-deny list for ``shared/private/`` and
     ``shared/secrets/``. Includes absolute, ``~``, and ``$HOME``
     variants — both with and without a trailing slash — so a bare
-    directory reference (``ls $BRIDGE_HOME/shared/private``) cannot
-    bypass the gate. patch-dev review of 94711d3 caught the
-    no-slash variant gap.
+    directory reference (``ls ~/.agent-bridge/shared/private``) is
+    caught. patch-dev review of 94711d3 caught the no-slash variant gap.
+
+    NOTE — this enumerated alias list is NOT prefix-spelling-complete and
+    must NOT be relied on alone for the non-admin Stage-A deny. It omits
+    the brace form ``${HOME}``, ``$BRIDGE_HOME``, ``${BRIDGE_HOME}``, and
+    any future env-var prefix; ``${HOME}/…`` is not a substring of
+    ``$HOME/…`` so a brace/``$BRIDGE_HOME``-spelled secret path slips past
+    a raw ``alias in text`` check (issue #1709, a HIGH confidentiality
+    bypass). These aliases are kept only as a deterministic, human-readable
+    deny-reason source and as defense-in-depth for the admin-carve-out
+    audit path. The authoritative non-admin Stage-A deny is the
+    prefix-spelling-agnostic suffix matcher
+    :func:`_forbidden_suffix_in_command` (see ``protected_alias_reason``),
+    which keys off ``_SHARED_FORBIDDEN_PREFIXES`` (the same SSOT) and so
+    cannot drift from this list.
     """
     bridge_home = bridge_home_dir()
     aliases: list[str] = []
@@ -2512,6 +2535,269 @@ def _shared_forbidden_aliases() -> list[str]:
             )
         )
     return aliases
+
+
+# Issue #1709 — prefix-spelling-agnostic forbidden-suffix matcher.
+#
+# The enumerated alias lists above are a substring blacklist over a FIXED
+# set of prefix spellings (absolute / `~` / `$HOME`). They miss the brace
+# form `${HOME}`, `$BRIDGE_HOME`, `${BRIDGE_HOME}`, and any future env-var
+# prefix — a HIGH confidentiality bypass for a non-admin secret/private
+# read. Statically deciding "does this shell word resolve to a forbidden
+# path?" is undecidable in general (the prefix can be any expansion), but
+# the *suffix* is invariant: every spelling of the team-shared secret tree
+# ends in `/shared/secrets`, every peer home ends in `/agents/<name>`. So
+# we match on the forbidden SUFFIX regardless of how the prefix is spelled,
+# and we fail CLOSED when a path-candidate word carries shell
+# expansion/encoding that could hide such a suffix at runtime (ANSI-C
+# `$'…'`, glob, backslash escape, command substitution). This is the
+# whitelist + suffix-match + fail-close stance the issue mandates over yet
+# another blacklist spelling.
+
+# Glob / wildcard chars that let a word expand to a forbidden path at
+# runtime without the literal suffix ever appearing in the command text.
+_OBFUSCATION_GLOB_CHARS = frozenset({"*", "?", "[", "]"})
+
+
+def _shared_forbidden_suffixes() -> list[str]:
+    """Forbidden path SUFFIXES for the team-shared secret/private trees,
+    derived from the same ``_SHARED_FORBIDDEN_PREFIXES`` SSOT the alias
+    list uses (so the two can never drift). Returned without a trailing
+    slash; the matcher treats end-of-word and a following ``/`` alike.
+
+    e.g. ``["/shared/private", "/shared/secrets"]``.
+    """
+    return [f"/shared/{forbidden.rstrip('/')}" for forbidden in _SHARED_FORBIDDEN_PREFIXES]
+
+
+def _peer_forbidden_suffixes(agent: str) -> list[str]:
+    """Forbidden path SUFFIXES for cross-agent peer homes, derived from the
+    same ``other_agent_homes`` SSOT ``_peer_alias_list`` uses.
+
+    e.g. ``["/agents/other-a", "/agents/other-b"]``. The ``/agents/<name>``
+    suffix is prefix-spelling-agnostic: it matches the absolute home-root
+    spelling (``…/.agent-bridge/agents/<name>``), the ``~`` / ``$HOME`` /
+    ``${HOME}`` / ``$BRIDGE_HOME`` / ``${BRIDGE_HOME}`` spellings, and any
+    future env-var prefix, all of which end in ``/agents/<name>``.
+    """
+    return [f"/agents/{other.name}" for other in other_agent_homes(agent)]
+
+
+# Bridge-home anchor tokens. A path word containing one of these is rooted
+# under the operator bridge home, so a `/agents/` parent marker in it refers
+# to the runtime PEER tree — not a same-named `agents/` directory in a source
+# repo or elsewhere. Used to scope the Stage-B glob fail-close so a benign
+# repo read (`cat ./agents/*.md`) is not collateral-damaged (issue #1709).
+def _bridge_anchor_tokens() -> list[str]:
+    """Raw-text tokens that prove a path word is rooted under the operator
+    bridge home: the absolute home, the canonical ``/.agent-bridge/`` install
+    dir name, and the ``$BRIDGE_HOME`` / ``${BRIDGE_HOME}`` env spellings.
+    """
+    return [
+        f"{bridge_home_dir()}/",
+        "/.agent-bridge/",
+        "$BRIDGE_HOME/",
+        "${BRIDGE_HOME}/",
+    ]
+
+
+_ANSIC_RE = re.compile(r"\$'((?:\\.|[^'\\])*)'")
+
+
+def _decode_obfuscated_word(word: str) -> str:
+    """Return *word* with ANSI-C ``$'…'`` segments and bare backslash
+    hex/octal/escape sequences decoded to the literal bytes bash would
+    produce at runtime, so a hidden separator / dir name (``$'\\x2fsecrets'``,
+    ``secre\\x74s``) is surfaced for the literal suffix scan. Var / glob /
+    command-sub expansion is NOT performed (those are handled separately).
+    A decode failure returns the word unchanged (the obfuscation flag still
+    forces the fail-close path, so this never opens a hole)."""
+
+    def _ansic(match: re.Match) -> str:
+        body = match.group(1)
+        try:
+            return body.encode("latin-1", "backslashreplace").decode("unicode_escape")
+        except Exception:  # noqa: BLE001 — decode failure → leave literal
+            return match.group(0)
+
+    decoded = _ANSIC_RE.sub(_ansic, word)
+    # Bare backslash escapes outside ANSI-C (`secre\x74s`, `priv\141te`).
+    if "\\" in decoded:
+        try:
+            decoded = decoded.encode("latin-1", "backslashreplace").decode("unicode_escape")
+        except Exception:  # noqa: BLE001
+            pass
+    return decoded
+
+
+def _word_carries_obfuscation(word: str) -> bool:
+    """True iff *word* contains shell expansion / encoding that can hide a
+    forbidden suffix from the literal-suffix scan at runtime.
+
+    Catches (issue #1709 fail-close):
+      - ANSI-C quoting ``$'…'`` — bash decodes ``$'\\x2f'`` → ``/`` at run
+        time, so the literal forbidden suffix never appears in raw text.
+      - command substitution ``$(…)`` / backticks — the path comes from a
+        subshell.
+      - glob / wildcard chars (``* ? [ ]``) — the word expands to a path
+        the static scan cannot see.
+      - backslash escapes — ``\\x``/``\\057`` style or any ``\\`` that can
+        re-spell a separator.
+
+    A plain literal path word (``/abs/path``, ``~/p``, ``$HOME/p``,
+    ``${HOME}/p``, ``$BRIDGE_HOME/p``, ``${BRIDGE_HOME}/p``) carries NONE
+    of these and is left to the suffix scan. ``$VAR`` / ``${VAR}`` plain
+    parameter expansion is deliberately NOT treated as obfuscation here —
+    it cannot re-spell the forbidden suffix INSIDE the word (only prefix
+    it), and the suffix scan already sees the literal ``/shared/secrets``
+    tail; flagging it would over-block legitimate ``$HOME``-relative reads.
+    """
+    if "$'" in word:
+        return True  # ANSI-C quoting
+    if "`" in word:
+        return True  # backtick command substitution
+    if "$(" in word:
+        return True  # command substitution
+    if "\\" in word:
+        return True  # backslash escape (hex/octal or separator re-spell)
+    if any(ch in _OBFUSCATION_GLOB_CHARS for ch in word):
+        return True  # glob expansion
+    return False
+
+
+def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
+    """Scan the shell command *text* for a read of any forbidden *suffix*,
+    independent of how the path prefix is spelled.
+
+    Returns the matched suffix (for the deny reason) or ``None``.
+
+    Two-pass, fail-closed:
+
+    1. Literal suffix scan over the raw text. ``${HOME}/.agent-bridge/
+       shared/secrets/token``, ``$BRIDGE_HOME/shared/secrets/token``, and
+       the absolute spelling all contain the literal ``/shared/secrets``
+       substring, so one check catches every prefix spelling. Each suffix
+       begins with a leading ``/`` (``/shared/secrets``,
+       ``/agents/<name>``) which already pins the LEFT path-component
+       boundary (``…-shared/secrets`` does NOT contain ``/shared/secrets``),
+       so only a RIGHT path-boundary check is needed (end-of-string, ``/``,
+       quote, or whitespace) to keep ``/shared/secretstuff`` from
+       false-hitting ``/shared/secrets``.
+
+    2. Obfuscation fail-close. A literal scan cannot see a suffix hidden by
+       ANSI-C ``$'…'`` hex, a glob, a backslash escape, or a command
+       substitution. For each whitespace/operator-split path-candidate word
+       that carries such obfuscation we deny IF the word also sits under a
+       forbidden PARENT marker (``/shared/`` for Stage-A, ``/agents/`` for
+       Stage-B) — so ``cat ${HOME}/.agent-bridge/shared/sec*ets/token`` and
+       ``…/shared/secre\\x74s/token`` fail closed (the glob / hex could
+       resolve to the secret dir at runtime) while an unrelated globby read
+       (``cat ./logs/*.txt``) is not collateral-damaged. ANSI-C ``$'…'`` /
+       ``$(`` / backtick words that sit under a forbidden parent likewise
+       deny; a bare ``$(`)`` command-sub NOT under a forbidden parent is
+       left to the existing read-intent / shell-embedding gates.
+    """
+    # Pass 1 — literal suffix scan with a RIGHT path-boundary check.
+    hit = _scan_suffixes(text, suffixes)
+    if hit is not None:
+        return hit
+
+    # Pass 2 — obfuscation fail-close, per path-candidate word.
+    for raw_word in _command_path_candidate_words(text):
+        if not _word_carries_obfuscation(raw_word):
+            continue
+        # 2a. Decode ANSI-C `$'…'` / backslash hex-octal escapes and re-run
+        # the literal suffix scan: `$'\x2fshared\x2fsecrets'`, `secre\x74s`
+        # surface their real bytes here (the runtime path bash would build).
+        decoded = _decode_obfuscated_word(raw_word)
+        if decoded != raw_word and _scan_suffixes(decoded, suffixes) is not None:
+            return _OBFUSCATED_SUFFIX_SENTINEL
+        # 2b. Glob / command-sub fail-close. These cannot be decoded
+        # statically, so we deny iff the word is rooted under the operator
+        # bridge home AND its literal prefix-before-the-glob could select a
+        # forbidden directory (so a benign repo `./agents/*.md` — no bridge
+        # anchor — and a read strictly inside the agent's OWN home are NOT
+        # collateral). Backtick / `$(…)` words are caught by the existing
+        # read-intent + shell-embedding gates upstream, but we fail-close
+        # here too for defense-in-depth when bridge-anchored.
+        if not any(anchor in raw_word for anchor in _bridge_anchor_tokens()):
+            continue
+        if _glob_prefix_reaches_forbidden_dir(raw_word, suffixes):
+            return _OBFUSCATED_SUFFIX_SENTINEL
+    return None
+
+
+def _scan_suffixes(text: str, suffixes: list[str]) -> str | None:
+    """Literal forbidden-suffix scan with a RIGHT path-boundary check (the
+    leading ``/`` in each suffix pins the LEFT boundary). Returns the matched
+    suffix or ``None``."""
+    for suffix in suffixes:
+        start = 0
+        while True:
+            idx = text.find(suffix, start)
+            if idx == -1:
+                break
+            end = idx + len(suffix)
+            right_ok = end >= len(text) or text[end] in ("/", "'", '"', " ", "\t")
+            if right_ok:
+                return suffix
+            start = idx + 1
+    return None
+
+
+def _glob_prefix_reaches_forbidden_dir(word: str, suffixes: list[str]) -> bool:
+    """For a glob / command-sub *word*, expand ``$VAR`` / ``~`` in the
+    literal prefix BEFORE the first wildcard / command-sub char and decide
+    whether that prefix could select a forbidden directory.
+
+    A forbidden directory is the absolute resolution of a forbidden suffix
+    under the bridge home (``<home>/shared/secrets``, ``<home>/agents/
+    other-a``). The glob can reach it when the resolved prefix is a string
+    prefix of the forbidden dir (the wildcard sits at/above the protected
+    leaf, e.g. ``…/agents/oth*r-a``) OR the forbidden dir is a prefix of the
+    resolved prefix (the wildcard sits strictly INSIDE the forbidden tree).
+    A read strictly inside the agent's OWN home (``…/agents/<self>/memory/
+    *.md``) resolves to a prefix that is neither, so it is NOT denied.
+    """
+    # First wildcard / command-sub position.
+    cut = len(word)
+    for i, ch in enumerate(word):
+        if ch in _OBFUSCATION_GLOB_CHARS or ch == "`" or word[i:i + 2] == "$(":
+            cut = i
+            break
+    prefix = word[:cut]
+    expanded = os.path.expandvars(os.path.expanduser(prefix))
+    if not expanded:
+        return True  # un-resolvable prefix → fail closed
+    # The caller only reaches here for a BRIDGE-ANCHORED word. If a `$VAR`
+    # survived expansion (a shell var Python's environ cannot see), the
+    # static prefix is inconclusive — fail closed rather than risk a
+    # var-spelled glob into the secret tree (the broader carve-out gates use
+    # the same "unresolved expansion → fail closed" stance, #1690 r4 FIX 2).
+    if "$" in expanded:
+        return True
+    bridge_home = str(bridge_home_dir())
+    for suffix in suffixes:
+        forbidden_dir = f"{bridge_home}{suffix}"
+        if expanded.startswith(forbidden_dir) or forbidden_dir.startswith(expanded):
+            return True
+    return False
+
+
+# Sentinel deny-reason fragment for an obfuscated (un-analyzable) word that
+# the fail-close path rejects. Surfaced in the deny message so the operator
+# can tell a suffix hit from an obfuscation fail-close.
+_OBFUSCATED_SUFFIX_SENTINEL = "(obfuscated path expansion)"
+
+
+def _command_path_candidate_words(text: str):
+    """Yield whitespace/operator-split words from *text* that look like a
+    path argument (skipping the obvious flag words). Reuses
+    :func:`_alias_path_fragments` per whitespace token so a redirect prefix
+    is peeled and shell operators do not hide a glued word."""
+    for token in text.split():
+        for fragment in _alias_path_fragments(token):
+            yield fragment
 
 
 def _bash_token_resolved_paths(token: str) -> list[Path]:
@@ -5024,6 +5310,26 @@ def protected_alias_reason(
                 "shared/secrets are off-limits"
             )
 
+    # Issue #1709 — prefix-spelling-agnostic Stage-A suffix deny. The
+    # enumerated alias loop above only covers absolute / `~` / `$HOME`
+    # spellings; it MISSES the brace `${HOME}`, `$BRIDGE_HOME`,
+    # `${BRIDGE_HOME}` (and any future env-var) spellings, a HIGH
+    # confidentiality bypass (`cat ${HOME}/.agent-bridge/shared/secrets/x`
+    # was ALLOWED). The suffix matcher catches every prefix spelling at
+    # once (every spelling ends in `/shared/secrets` or `/shared/private`)
+    # and fail-closes on ANSI-C `$'…'` / glob / backslash / command-sub
+    # obfuscation of the suffix. This deny is unconditional, matching the
+    # alias loop's existing all-agents-including-admin scope (the forbidden
+    # secret/private subtrees stay off-limits for every Bash reader; the
+    # admin asymmetry between Bash and the non-Bash `protected_path_reason`
+    # Read path is tracked separately in #1711 and is NOT changed here).
+    shared_suffix_hit = _forbidden_suffix_in_command(text, _shared_forbidden_suffixes())
+    if shared_suffix_hit is not None:
+        return (
+            "cross-agent access is blocked: shared/private and "
+            "shared/secrets are off-limits"
+        )
+
     # Issue #1692 — admin read-intent carve-out for the Bash PEER-HOME
     # gate (Stage B), mirroring the non-Bash `protected_path_reason` admin
     # read exemption for peer agent homes. Without this an admin
@@ -5094,6 +5400,27 @@ def protected_alias_reason(
     # `_system_class_cross_agent_read_allowed`.
     peer_aliases = _peer_alias_list(agent)
     matched_alias = next((a for a in peer_aliases if a in text), None)
+
+    # Issue #1709 — prefix-spelling-agnostic Stage-B peer-home matcher. The
+    # `_peer_alias_list` substring needles share the same brace/`$BRIDGE_HOME`
+    # gap as Stage-A: a non-admin (class=user) `cat
+    # ${HOME}/.agent-bridge/agents/<other>/MEMORY.md` matched NO alias and
+    # fell through to the `return None` ALLOW below. The suffix matcher
+    # (`/agents/<name>`) catches every prefix spelling and fail-closes on
+    # obfuscation. Scoped to NON-ADMIN only so admin Bash behavior is
+    # unchanged (the admin peer-read asymmetry between Bash and the non-Bash
+    # `protected_path_reason` Read path is #1711, out of scope here). A
+    # system-class agent that trips the suffix match still routes through
+    # the legitimate argv carve-out below (its brace-spelled path will fail
+    # the `_argv_occurrences_explain_text` proof and fail closed, which is
+    # the correct stance for an un-analyzable spelling).
+    if matched_alias is None and not admin:
+        peer_suffix_hit = _forbidden_suffix_in_command(
+            text, _peer_forbidden_suffixes(agent)
+        )
+        if peer_suffix_hit is not None:
+            matched_alias = f"cross-agent home ({peer_suffix_hit})"
+
     if matched_alias is None:
         return None
 
