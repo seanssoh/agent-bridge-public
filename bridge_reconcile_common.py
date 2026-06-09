@@ -59,6 +59,32 @@ DEFAULT_BACKOFF_BASE_SECONDS = 2.0
 DEFAULT_BACKOFF_CAP_SECONDS = 300.0
 DEFAULT_BACKOFF_JITTER_FRAC = 0.20
 
+# The reconcile timer cadence (seconds). The daemon (bridge-handoffd.py) owns
+# the live timer and carries its OWN copy of this default + resolver for the
+# loop; this parallel read-only resolver lets the net-status v2 snapshot (#1708)
+# surface the SAME configured cadence WITHOUT importing the heavyweight daemon
+# module. Both read `BRIDGE_A2A_RECONCILE_INTERVAL`; keep the default in sync.
+DEFAULT_RECONCILE_INTERVAL_SECONDS = 45
+
+
+def reconcile_interval() -> int:
+    """Resolve the configured reconcile cadence in seconds (read-only).
+
+    Honors `BRIDGE_A2A_RECONCILE_INTERVAL` (the same knob the daemon timer
+    reads); 0 means the periodic timer is disabled. A non-numeric override
+    falls back to the default. This is a PURE env read with no I/O — the
+    net-status snapshot calls it to report the cadence the daemon WOULD tick at,
+    never to drive a timer.
+    """
+    raw = os.environ.get("BRIDGE_A2A_RECONCILE_INTERVAL", "")  # noqa: iso-helper-boundary
+    if raw == "":
+        return DEFAULT_RECONCILE_INTERVAL_SECONDS
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_RECONCILE_INTERVAL_SECONDS
+    return max(0, val)
+
 # The ordered reconcile step identifiers. The sequence ORDER is defined by the
 # orchestrator in `bridge-handoffd.py:reconcile_once`; this tuple is the
 # canonical id set so the status snapshot and the smoke can enumerate every
@@ -1440,3 +1466,104 @@ def reconcile_status_snapshot(state_dir: Optional[Path] = None,
         "interval": interval,
         "steps": steps,
     }
+
+
+def peer_reachability_snapshot(peer_ids: list[str],
+                               state_dir: Optional[Path] = None,
+                               ) -> dict[str, dict[str, Any]]:
+    """Read-only per-peer FSM snapshot for net-status v2 (#1708 / #1707).
+
+    For each configured peer id, returns the persisted UP/SUSPECT/DOWN state
+    plus the no-secret observability the reviewer needs to confirm the mesh is
+    converging:
+
+        {
+          "<peer_id>": {
+            "state": "up"|"suspect"|"down"|"unknown",
+            "consecutive_fail": <int>,
+            "last_state_ts": <float|None>,   # when the state label last changed
+            "updated_ts": <float|None>,      # last probe of this peer
+            "last_attempt_ts": <float|None>, # from the per-peer backoff step row
+            "next_eligible_ts": <float|None>,
+            "attempt_count": <int>,
+          }, ...
+        }
+
+    NO SECRETS: peer ids, FSM labels, counters and timestamps only — never a
+    peer key, address, or remote-asserted material. A never-probed peer reports
+    the optimistic-UP zero-state the live FSM uses (`_peer_state_row` returns
+    UP/0 for an unseen peer), so the surface is stable-shaped before the first
+    tick. A peer not present in `peer_ids` is never invented.
+
+    ★ Pure read (mirrors reconcile_status_snapshot): this MUST NOT create the
+    store. It `path.exists()`-guards and opens reconcile.db with a `?mode=ro`
+    URI, so a status call before the daemon has ever reconciled returns the
+    stable all-`unknown`/optimistic shape WITHOUT materializing reconcile.db.
+    Degrade-safe: any sqlite/OS error degrades to the unknown shape, never
+    raises.
+    """
+    def _unknown(peer_id: str) -> dict[str, Any]:
+        # Before the store exists the live FSM treats an unseen peer as
+        # optimistically UP/0 (see _peer_state_row). We report state="unknown"
+        # here to distinguish "no reconcile.db / never probed" from a proven UP
+        # written by a successful probe — the snapshot is observability, and an
+        # un-probed peer is genuinely UNKNOWN, not asserted reachable.
+        return {
+            "state": "unknown", "consecutive_fail": 0,
+            "last_state_ts": None, "updated_ts": None,
+            "last_attempt_ts": None, "next_eligible_ts": None,
+            "attempt_count": 0,
+        }
+
+    ids = [p for p in peer_ids if isinstance(p, str) and p.strip()]
+    out: dict[str, dict[str, Any]] = {pid: _unknown(pid) for pid in ids}
+    if not ids:
+        return out
+
+    path = reconcile_db_path(state_dir)
+    if not path.exists():
+        return out
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        for pid in ids:
+            entry = out[pid]
+            # FSM state row (peer_reachability table). A missing row keeps the
+            # optimistic/unknown default — never invent a DOWN.
+            try:
+                frow = conn.execute(
+                    "SELECT state, consecutive_fail, last_state_ts, updated_ts "
+                    "FROM peer_reachability WHERE peer_id = ?", (pid,),
+                ).fetchone()
+            except sqlite3.Error:
+                frow = None
+            if frow is not None:
+                entry["state"] = str(frow["state"])
+                entry["consecutive_fail"] = int(frow["consecutive_fail"] or 0)
+                entry["last_state_ts"] = frow["last_state_ts"]
+                entry["updated_ts"] = frow["updated_ts"]
+            # Per-peer backoff/attempt row (reconcile_step, namespaced id).
+            try:
+                srow = conn.execute(
+                    "SELECT last_attempt_ts, attempt_count, next_eligible_ts "
+                    "FROM reconcile_step WHERE step = ?", (_peer_step_id(pid),),
+                ).fetchone()
+            except sqlite3.Error:
+                srow = None
+            if srow is not None:
+                entry["last_attempt_ts"] = srow["last_attempt_ts"]
+                entry["next_eligible_ts"] = srow["next_eligible_ts"]
+                entry["attempt_count"] = int(srow["attempt_count"] or 0)
+    except (sqlite3.Error, OSError):
+        # Whole-store failure (vanished/locked/corrupt/not-yet-schema'd) →
+        # degrade every peer to the unknown shape (already pre-seeded).
+        return {pid: _unknown(pid) for pid in ids}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+    return out
