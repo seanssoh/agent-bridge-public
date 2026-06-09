@@ -388,6 +388,20 @@ assert_verdict "ls star enum dirs"         "cd \$BRIDGE_HOME/shared && ls *"    
 assert_verdict "find glob enum dir"        "cd \$BRIDGE_HOME/shared && find sec*ets -maxdepth 1 -type f -print" "DENY"
 assert_verdict "cat star selects secret"   "cd \$BRIDGE_HOME/shared && cat *"                    "DENY"
 assert_verdict "B peer ls glob enum"       "cd \$BRIDGE_HOME/agents && ls $PEER_AGENT*"          "DENY"
+# r14 Part A (patch #11838) — a `!`-negated cd-OUT continues the `&&` chain EXACTLY
+# when the cd FAILS (bash stays in the bridge), so the `&&`-gated read runs in the
+# fail-branch. Odd `!` de-gates → prior cwd re-checked → DENY; even `!` is sound.
+assert_verdict "!-neg cd-out && read"      "cd \$BRIDGE_HOME/shared && ! cd /nx && cat secrets/token" "DENY"
+assert_verdict "!-neg builtin cd"          "cd \$BRIDGE_HOME/shared && ! builtin cd /nx && cat secrets/token" "DENY"
+assert_verdict "!-neg cd && true && read"  "cd \$BRIDGE_HOME/shared && ! cd /nx && true && cat secrets/token" "DENY"
+# r14 Part B (codex #11840) — bash BRACE expansion `{a,b}` is statically finite,
+# so a forbidden member is enumerated before argv. Each member is expanded and
+# resolved; a `${var}` parameter expansion and a comma-less `{foo}` are NOT braces.
+assert_verdict "brace abs both members"    "cat \$BRIDGE_HOME/shared/{secrets,wiki}/token"       "DENY"
+assert_verdict "brace abs ls enum"         "ls \$BRIDGE_HOME/shared/{secrets,wiki}"              "DENY"
+assert_verdict "brace rel cat"             "cd \$BRIDGE_HOME/shared && cat {secrets,wiki}/token" "DENY"
+assert_verdict "brace partial member"      "cd \$BRIDGE_HOME/shared && cat sec{r,}ets/token"     "DENY"
+assert_verdict "B peer brace enum"         "cd \$BRIDGE_HOME/agents && ls {$PEER_AGENT,worker-1709}" "DENY"
 
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
@@ -429,6 +443,13 @@ assert_verdict "public wiki glob"          "cd \$BRIDGE_HOME/shared && cat wiki/
 assert_verdict "ext-only glob no match"    "cd \$BRIDGE_HOME/shared && cat *.md"                "ALLOW"
 assert_verdict "gated cd-out glob read"    "cd \$BRIDGE_HOME/shared && cd /tmp && cat sec*ets/token" "ALLOW"
 assert_verdict "gated cd-out ansic read"   "cd \$BRIDGE_HOME/shared && cd /tmp && cat \$'secrets'/token" "ALLOW"
+# r14 no-over-block: even `!!` cd-out (cd-success semantics) ALLOW; brace with only
+# public members / off a bridge cwd / comma-less / `${var}` ALLOW.
+assert_verdict "double-neg cd-out read"    "cd \$BRIDGE_HOME/shared && ! ! cd /tmp && cat secrets/token" "ALLOW"
+assert_verdict "brace public members"      "cd \$BRIDGE_HOME/shared && cat {wiki,docs}/index.md" "ALLOW"
+assert_verdict "brace comma-less literal"  "cd \$BRIDGE_HOME/shared && cat {wiki}/index.md"      "ALLOW"
+assert_verdict "brace off bridge cwd"      "cd /tmp && cat {secrets,wiki}/token"                 "ALLOW"
+assert_verdict "brace gated cd-out"        "cd \$BRIDGE_HOME/shared && cd /tmp && cat {secrets,wiki}/token" "ALLOW"
 # r3 no-over-block — the resolution model must NOT collateral-block these:
 #   a RELATIVE forbidden-tail read with NO `cd` (relative to the agent's own
 #   cwd, which the hook can't see → unanchorable, not bridge), and a `..` that

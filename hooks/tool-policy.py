@@ -2908,6 +2908,89 @@ def _ansic_decoded_segment(seg: str) -> str | None:
     return _ANSIC_RE.sub(_lit, seg)
 
 
+def _brace_alternatives(body: str) -> list[str] | None:
+    """The bash brace-expansion alternatives of an INNERMOST ``{body}`` (no
+    nested ``{``): a top-level comma list (``a,b,c`` — empty members allowed, so
+    ``r,`` → ``['r', '']``), an integer range ``m..n[..step]``, or a single-char
+    range ``a..z``. Returns ``None`` when *body* is not an expandable brace (a
+    plain ``{foo}`` bash leaves literal)."""
+    if "," in body:
+        return body.split(",")
+    m = re.fullmatch(r"(-?\d+)\.\.(-?\d+)(?:\.\.(-?\d+))?", body)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        step = abs(int(m.group(3))) if m.group(3) else 1
+        if step == 0:
+            step = 1
+        rng = range(lo, hi + 1, step) if lo <= hi else range(lo, hi - 1, -step)
+        return [str(x) for x in rng][:256]
+    m = re.fullmatch(r"([A-Za-z])\.\.([A-Za-z])", body)
+    if m:
+        lo, hi = ord(m.group(1)), ord(m.group(2))
+        seq = range(lo, hi + 1) if lo <= hi else range(lo, hi - 1, -1)
+        return [chr(x) for x in seq][:256]
+    return None
+
+
+def _brace_expand(word: str, cap: int = 1024) -> list[str]:
+    """Statically expand bash brace alternation/ranges in *word* to the finite
+    set of literal strings bash would produce (codex #11837 r13), bounded to
+    *cap* results. ``cat {secrets,wiki}/token`` → ``['secrets/token',
+    'wiki/token']`` so the forbidden member flows through the normal resolution.
+    ``${var}`` parameter expansion and comma-less single braces are left intact.
+    Expands innermost-first, iterated, so nested/multiple braces resolve
+    (cartesian). On hitting *cap* it returns what it has — the obfuscation
+    fail-close still covers a pathological brace."""
+    if "{" not in word:
+        return [word]
+    out = [word]
+    for _ in range(24):  # depth bound (nested/sequential braces)
+        nxt: list[str] = []
+        expanded = False
+        for w in out:
+            seg = _leftmost_innermost_brace(w)
+            if seg is None:
+                nxt.append(w)
+                continue
+            expanded = True
+            pre, alts, post = seg
+            for alt in alts:
+                nxt.append(pre + alt + post)
+                if len(nxt) >= cap:
+                    break
+            if len(nxt) >= cap:
+                break
+        out = nxt
+        if not expanded or len(out) >= cap:
+            break
+    return out
+
+
+def _leftmost_innermost_brace(w: str):
+    """Return ``(prefix, alternatives, suffix)`` for the leftmost INNERMOST
+    expandable ``{…}`` in *w* (a brace whose body has no nested ``{`` and is a
+    comma-list or range), preferring a ``$``-immediately-before brace to be
+    SKIPPED (``${var}`` is parameter expansion, not brace expansion). ``None``
+    when no expandable brace remains."""
+    n = len(w)
+    i = 0
+    while i < n:
+        if w[i] == "{" and not (i > 0 and w[i - 1] == "$"):
+            j = i + 1
+            inner = False
+            while j < n and w[j] != "}":
+                if w[j] == "{":
+                    inner = True
+                    break
+                j += 1
+            if j < n and w[j] == "}" and not inner:
+                alts = _brace_alternatives(w[i + 1:j])
+                if alts is not None:
+                    return (w[:i], alts, w[j + 1:])
+        i += 1
+    return None
+
+
 def _segment_candidate_words(seg: str):
     """Yield path-candidate words from a SINGLE shell *seg*, tokenized with
     bash quote-removal via ``shlex.split(posix=True)`` (a malformed segment
@@ -2916,7 +2999,9 @@ def _segment_candidate_words(seg: str):
 
     When the segment carries ANSI-C ``$'…'`` quoting, ALSO yield the candidates
     from the ANSI-C-decoded segment — ``shlex`` mangles ``$'secrets'`` into
-    ``$secrets`` and would hide the decoded path (codex #11827 r11)."""
+    ``$secrets`` and would hide the decoded path (codex #11827 r11). Each token
+    is brace-expanded (``{secrets,wiki}/token`` → both members) so a finite brace
+    alternation cannot hide a forbidden member (codex #11837 r13)."""
     variants = [seg]
     decoded_seg = _ansic_decoded_segment(seg)
     if decoded_seg is not None:
@@ -2927,8 +3012,9 @@ def _segment_candidate_words(seg: str):
         except ValueError:
             tokens = variant.split()
         for token in tokens:
-            for fragment in _alias_path_fragments(token):
-                yield fragment
+            for braced in _brace_expand(token):
+                for fragment in _alias_path_fragments(braced):
+                    yield fragment
 
 
 def _command_effective_cwd(segments: list[str]) -> object:
@@ -3090,9 +3176,28 @@ def _segment_exit(seg: str) -> object:
     EVERY preceding ``cd`` succeeded, so the read's cwd is precisely the last
     ``cd`` target — not the prior bridge cwd. A ``cd`` whose own execution is
     uncertain (a ``union`` disposition) never reaches here, so the sentinel is
-    only ever produced for a ``cd`` that definitely ran."""
-    if _segment_cwd_change(seg.strip()) is not None:
-        return _CD_LIKELY_SUCCESS
+    only ever produced for a ``cd`` that definitely ran.
+
+    A leading ``!`` INVERTS the cd's exit (patch #11838 r12): ``! cd <out>``
+    exits 0 — continuing an ``&&`` chain — EXACTLY when the cd FAILS, i.e. when
+    bash stays in the prior (forbidden) cwd. So an ODD ``!`` count must NOT model
+    likely-success: return ``None`` (unknown), which de-gates the downstream read
+    (``gated=False``) so the prior cwd in ``chain_cwds`` is re-checked → DENY.
+    Even count keeps likely-success (``! ! cd`` = cd-success semantics). Mirrors
+    the ``!``-parity :func:`_literal_truth` already applies to ``true``/``:``."""
+    stripped = seg.strip()
+    if _segment_cwd_change(stripped) is not None:
+        try:
+            toks = shlex.split(stripped, posix=True, comments=False)
+        except ValueError:
+            toks = stripped.split()
+        neg = False
+        for tok in toks:
+            if tok == "!":
+                neg = not neg
+            else:
+                break
+        return None if neg else _CD_LIKELY_SUCCESS
     return _literal_truth(seg)
 
 
