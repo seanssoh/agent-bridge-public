@@ -98,7 +98,11 @@ jobs:
     # See docs/developer-handover.md §5.7 and
     # scripts/lint-heredoc-ban.sh --baseline-check for the policy.
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 10m (not 5m): the scan itself is seconds, but a 5m wall was being hit
+    # (job killed at exactly 5m04s = `cancelled`) on congested ubuntu-latest
+    # runners during release waves, eating reruns on PRs whose diff has zero
+    # heredoc regression. 10m gives headroom without masking a real hang.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
