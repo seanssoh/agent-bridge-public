@@ -3010,41 +3010,121 @@ def _has_leading_env_assignment(text: str) -> bool:
     return bool(_LEADING_ENV_ASSIGN_RE.match(text))
 
 
+# GNU coreutils `env -S` / `--split-string` re-parses its single STRING argument
+# into env-assignments + a command word at runtime. That packs the whole
+# `A=b /path/agent-bridge` (or even the full verb triple) inside ONE shell token,
+# hiding it from a naive shlex scan (codex r3 #11726). `_expand_env_split_string`
+# re-parses any such payload so the verb triple becomes visible again; the
+# canonical-shape gate then denies it (token[0] is `env`, not the bare verb).
+_ENV_SPLIT_SHORT_RE = re.compile(r"^-[A-Za-z]*S")
+
+
+def _expand_env_split_string(toks: list[str]) -> list[str]:
+    """Inline any `env -S <STRING>` payload as freshly-parsed tokens.
+
+    Handles `--split-string=STRING`, `--split-string STRING`, the short `-S`
+    standalone (payload is the next token), the short `-S<inline>` form, and
+    bundled short flags ending in S (`-iS`, `-vS`). Unknown/other tokens pass
+    through untouched. A payload that will not shlex-parse is kept verbatim
+    (fail-closed: still surfaces its literal text to the scan).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(toks)
+    while i < n:
+        t = toks[i]
+        payload: str | None = None
+        if t == "--split-string" and i + 1 < n:
+            payload = toks[i + 1]
+            i += 2
+        elif t.startswith("--split-string="):
+            payload = t[len("--split-string="):]
+            i += 1
+        elif _ENV_SPLIT_SHORT_RE.match(t):
+            rest = t[t.index("S") + 1:]
+            if rest:
+                payload = rest
+                i += 1
+            elif i + 1 < n:
+                payload = toks[i + 1]
+                i += 2
+            else:
+                i += 1
+        else:
+            out.append(t)
+            i += 1
+            continue
+        if payload is not None:
+            try:
+                out.extend(shlex.split(payload, posix=True, comments=False))
+            except ValueError:
+                out.append(payload)
+    return out
+
+
 def _config_set_env_attempt_present(text: str) -> bool:
-    """True iff ANY command stage of *text* contains the consecutive token
-    triple ``(agb|agent-bridge) config set-env`` — recognition by ALLOWLIST
-    INVERSION (patch write-gate r3 #11718, codex r2 #11717).
+    """True iff ANY command stage of *text* is a `config set-env` attempt —
+    recognition by ALLOWLIST INVERSION (patch r3 #11718, codex r2 #11717 / r3
+    #11726).
 
     Enumerating the bad prefixes (`env`/`exec`/`nice`/… plus `env -i`/`env --`
     options, plus the shell reserved words `time`/`!` and the `(`/`{` grouping
     metacharacters) is whack-a-mole against shell grammar. Instead we RECOGNIZE
-    broadly: in every separator-split stage, after stripping ONLY leading bare
-    `VAR=value` env-assignments (NOT prefix commands), we look for the verb
-    triple at ANY position in the shlex token list. So `time A=b agb config
-    set-env`, `env -i A=b agb config set-env`, `(A=b agb config set-env)`, etc.
-    are all recognized (the triple appears after the keyword / option / paren).
-    The caller then ALLOWS only the exact canonical stand-alone shape and DENIES
-    every other recognized form — closing the whole prefix/keyword class without
-    enumerating it. Quoted/body mentions (`echo 'agb config set-env'`,
-    `--body "…"`) collapse to a single shlex token, so the triple does not
-    appear → NOT recognized → unaffected. Unparseable stages are skipped.
+    broadly: in every separator-split stage, after expanding any `env -S` payload
+    and stripping ONLY leading bare `VAR=value` env-assignments (NOT prefix
+    commands), we look at ANY position in the shlex token list for either spelling
+    that reaches the wrapper:
+      • the canonical-wrapper triple ``(agb|agent-bridge) config set-env``, or
+      • the direct-script spelling ``bridge-config.py set-env`` (codex r3 #11726
+        — `set-env` has no protected-path argv backstop, so a direct
+        `python3 bridge-config.py set-env …` invocation would otherwise bypass
+        the hook entirely).
+    So `time A=b agb config set-env`, `env -i A=b agb config set-env`,
+    `env -S 'A=b agent-bridge' config set-env`, `(A=b agb config set-env)`, and
+    `python3 bridge-config.py set-env` are all recognized. The caller then ALLOWS
+    only the exact canonical stand-alone wrapper shape and DENIES every other
+    recognized form — closing the whole prefix/keyword/option/direct-script class
+    without enumerating it. Quoted/body mentions (`echo 'agb config set-env'`,
+    `--body "…"`) collapse to a single shlex token, so no spelling appears → NOT
+    recognized → unaffected. Unparseable stages are skipped.
+
+    Residual (out of a static hook's reach, tracked as the #341 env-trust root):
+    indirection that hides the literal spelling — `eval '…'`, `bash -c '…'`,
+    `V=set-env; agb config $V …` — cannot be resolved from the command string.
+    The durable fix is wrapper-side identity (bridge-config.py must not trust
+    env-declared admin/source); the hook is defense-in-depth, not the boundary.
     """
     if "set-env" not in text:
         return False
     for stage in _COMMAND_OPERATOR_RE.split(text):
         scan = _SAFE_REDIRECT_RE.sub(" ", stage)
+        # Neutralize subshell grouping parens. bash needs NO space after `(`
+        # (`(agb config set-env)` is a valid subshell), but shlex glues `(agb`
+        # into one token and the verb triple would hide. Replacing `(`/`)` with
+        # spaces exposes the inner command for the scan; the canonical-shape gate
+        # still sees the original parens in `sanitized` and denies it.
+        scan = scan.replace("(", " ").replace(")", " ")
         try:
             toks = shlex.split(scan, posix=True, comments=False)
         except ValueError:
             continue
+        # `env -S '<packed>'` re-parses its payload into tokens at runtime —
+        # expand it so a hidden verb triple/spelling becomes visible.
+        toks = _expand_env_split_string(toks)
         # Strip ONLY leading bare `VAR=value` env-assignments (a per-command env
         # override the shell applies before the verb). Do NOT strip prefix
         # commands here — the canonical-shape gate below rejects them instead.
         while toks and "=" in toks[0] and _LEADING_ENV_ASSIGN_RE.match(toks[0] + " "):
             toks.pop(0)
-        # The consecutive verb triple at ANY index → recognized.
-        for i in range(len(toks) - 2):
-            if (toks[i].rsplit("/", 1)[-1] in {"agent-bridge", "agb"}
+        # Either recognized spelling at ANY index → recognized attempt.
+        for i in range(len(toks) - 1):
+            leaf = toks[i].rsplit("/", 1)[-1]
+            # direct-script spelling: `[python3] bridge-config.py set-env`
+            if leaf == "bridge-config.py" and toks[i + 1] == "set-env":
+                return True
+            # canonical-wrapper triple: `(agb|agent-bridge) config set-env`
+            if (i + 2 < len(toks)
+                    and leaf in {"agent-bridge", "agb"}
                     and toks[i + 1] == "config"
                     and toks[i + 2] == "set-env"):
                 return True

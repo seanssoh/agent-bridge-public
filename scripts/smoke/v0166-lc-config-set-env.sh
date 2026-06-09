@@ -400,6 +400,56 @@ assert_bash_verdict \
   "time env -i BRIDGE_AGENT_ID=patch agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
   "DENY"
 
+# 3j. `env -S` / `--split-string` payload packing (codex r3 #11726). GNU env -S
+#     re-parses its single STRING arg into assignments + the command word at
+#     runtime, hiding the verb triple inside one shell token. The recognizer
+#     expands the payload so the triple resurfaces; canonical-shape gate denies.
+assert_bash_verdict \
+  "hook: env -S packed payload spoof denied" \
+  "$USER_AGENT" \
+  "env -S 'BRIDGE_AGENT_ID=patch BRIDGE_CALLER_SOURCE=operator-tui agent-bridge' config set-env BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS=86400" \
+  "DENY"
+assert_bash_verdict \
+  "hook: env -S whole-command payload denied" \
+  "$USER_AGENT" \
+  "env -S 'agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60'" \
+  "DENY"
+assert_bash_verdict \
+  "hook: env --split-string= payload spoof denied" \
+  "$USER_AGENT" \
+  "env --split-string='BRIDGE_AGENT_ID=patch agent-bridge' config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
+  "DENY"
+assert_bash_verdict \
+  "hook: env -iS bundled-flag payload denied" \
+  "$USER_AGENT" \
+  "env -iS 'BRIDGE_AGENT_ID=patch agb' config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
+  "DENY"
+
+# 3k. direct-script wrapper spelling (codex r3 #11726). `set-env` has NO
+#     protected-path argv backstop, so `python3 bridge-config.py set-env …`
+#     (with spoofed trust env) would bypass the hook entirely if only the
+#     `agb config set-env` spelling were recognized. Recognize the direct
+#     `bridge-config.py set-env` spelling too; canonical-shape gate denies it.
+assert_bash_verdict \
+  "hook: direct python3 bridge-config.py set-env (spoof env) denied" \
+  "$USER_AGENT" \
+  "BRIDGE_ADMIN_AGENT_ID=patch BRIDGE_AGENT_ID=patch BRIDGE_CALLER_SOURCE=operator-tui python3 bridge-config.py set-env BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS=86400" \
+  "DENY"
+assert_bash_verdict \
+  "hook: direct bridge-config.py set-env (bare) denied" \
+  "$USER_AGENT" \
+  "python3 bridge-config.py set-env BRIDGE_A2A_RECONCILE_INTERVAL=60" \
+  "DENY"
+
+# 3l. subshell with NO space after `(` (bash needs none: `(agb …)` is a valid
+#     subshell). shlex glues `(agb` into one token; the recognizer neutralizes
+#     grouping parens so the inner verb surfaces. Canonical-shape gate denies.
+assert_bash_verdict \
+  "hook: no-space subshell (agb spoof denied" \
+  "$USER_AGENT" \
+  "(BRIDGE_AGENT_ID=patch agb config set-env BRIDGE_A2A_RECONCILE_INTERVAL=60)" \
+  "DENY"
+
 # 3d. shell-embedding / separator smuggles on a recognized set-env attempt.
 assert_bash_verdict \
   "hook: separator smuggle denied" \
