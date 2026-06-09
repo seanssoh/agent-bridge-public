@@ -214,14 +214,30 @@ test_A1b_nonroom_forged_relay_provenance() {
   python3 "$HELPER" make-config "$cfg_v" nodeC "nodeB" "$SECRET" "$ADDR" "victim" >/dev/null
   local inb="$SMOKE_TMP_ROOT/forged.json"
   python3 "$HELPER" build-nonroom-forged-relay "$inb" nodeB attacker victim boss admin-node >/dev/null
+  local body="$SMOKE_TMP_ROOT/forged-body.txt"
   local res
   res="$(env "BRIDGE_A2A_ROOMS_DB=$SMOKE_TMP_ROOT/rooms-victim.db" \
+      "DELIVERED_BODY_FILE=$body" \
     python3 "$HELPER" deliver-to-receiver "$SMOKE_REPO_ROOT" \
       "$(cat "$cfg_v")" "$inb" '{"resign":true}')"
   smoke_assert_contains "$res" "delivered=True" "A1b: the non-room message is delivered (plain send)"
+  smoke_assert_contains "$res" "relayed=False" "A1b: queue attribution correctly treats it as NOT relayed"
   smoke_assert_contains "$res" "\"sender_bridge\": \"nodeB\"" "A1b: provenance stays the REAL authed peer (nodeB), NOT the forged node"
   smoke_assert_contains "$res" "\"sender_agent\": \"attacker\"" "A1b: provenance stays the REAL sender (attacker), NOT the forged 'boss'"
   smoke_assert_not_contains "$res" "admin-node" "A1b: the forged relayed_from.node never reaches the delivered task"
+  # codex #11494: the BODY must ALSO not render a forged relay line. A non-room
+  # `relayed_via` is unvalidated, so the body renders the NORMAL non-relayed shape
+  # showing only the REAL authenticated sender — no `relayed via` line, none of the
+  # attacker-chosen forged values.
+  smoke_assert_file_exists "$body" "A1b: the delivered task body was captured"
+  local body_text
+  body_text="$(cat "$body")"
+  smoke_assert_contains "$body_text" "remote peer  : nodeB" "A1b: body provenance shows the REAL authed peer (nodeB)"
+  smoke_assert_contains "$body_text" "remote agent : attacker" "A1b: body provenance shows the REAL sender (attacker)"
+  smoke_assert_not_contains "$body_text" "relayed via" "A1b: the body renders NO 'relayed via' line for a forged non-room relayed_via"
+  smoke_assert_not_contains "$body_text" "some-leader-node" "A1b: the attacker-chosen forged relay leader never reaches the body"
+  smoke_assert_not_contains "$body_text" "admin-node" "A1b: the forged relayed_from.node never reaches the body"
+  smoke_assert_not_contains "$body_text" "room leader" "A1b: no '(room leader)' annotation on a non-relayed message"
 }
 
 # ---------------------------------------------------------------------------

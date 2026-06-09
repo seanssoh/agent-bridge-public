@@ -1910,7 +1910,8 @@ def enqueue_via_bridge_task(
 
 
 def staged_body_text(env: dict[str, Any], *,
-                     author_bridge: str = "", author_agent: str = "") -> str:
+                     author_bridge: str = "", author_agent: str = "",
+                     is_relayed: bool = False) -> str:
     """Build the local task body with a provenance block prepended.
 
     `author_bridge`/`author_agent` are the RESOLVED origin identity the caller
@@ -1922,14 +1923,23 @@ def staged_body_text(env: dict[str, Any], *,
     (`alice@<leader>`) — the exact leader-identity ambiguity Lane 5 closes — and
     would disagree with the (correct) queue attribution. So the body provenance is
     rendered from `author_*` (falling back to `env.sender` for a normal,
-    non-relayed send where they coincide), and a relayed leg ALSO renders an
-    explicit `relayed via : <leader> (room leader)` line so a human sees the true
-    origin PLUS the relay hop. The Reply-with hint targets the ORIGINAL author's
-    node so a reply routes to who actually wrote it, not the relay.
+    non-relayed send where they coincide).
+
+    `is_relayed` is the caller's ALREADY-VALIDATED, leader-vouched relay decision
+    (the SAME `envelope_is_relayed AND envelope_is_room_scoped` gate the queue-
+    attribution rewrite uses) — NOT a re-derivation from the raw `relayed_via`
+    field. This is the codex #11494 fix: a NON-room sender can hand-craft a
+    `relayed_via` value, which queue attribution correctly ignores; if the body
+    renderer re-derived "relayed" from that raw field it would print an attacker-
+    chosen `relayed via : <fake> (room leader)` line on a message that was never a
+    room relay — re-introducing the provenance spoof on the body surface. By
+    threading the validated boolean, the `relayed via` line renders ONLY when the
+    receiver has actually validated this as a leader-vouched room relay; an
+    unvalidated `relayed_via` produces the normal non-relayed body, byte-for-byte.
     """
     sender = env.get("sender", {})
     reply = env.get("reply_to", {})
-    relayed = a2a.envelope_is_relayed(env)  # noqa: iso-helper-boundary - a2a.envelope_* call, not a .env file
+    relayed = bool(is_relayed)
     # The displayed origin: the resolved author when present, else the wire sender.
     peer = author_bridge or str(sender.get("bridge", "?") or "?")
     agent = author_agent or str(sender.get("agent", "?") or "?")
@@ -1938,17 +1948,19 @@ def staged_body_text(env: dict[str, Any], *,
         f"remote peer  : {peer}",
         f"remote agent : {agent}",
     ]
-    # On a relayed leg, name the relay hop explicitly (the leader is the X-AGB-Peer
-    # that signed the leg, surfaced as env.sender.bridge / relayed_via).
+    # On a VALIDATED relayed leg, name the relay hop explicitly. The leader is the
+    # X-AGB-Peer that signed the leg (env.sender.bridge); we prefer that over the
+    # body-carried relayed_via so the displayed relay node is the AUTHENTICATED
+    # leader, not a body-asserted value (defense in depth even though `relayed` is
+    # already the validated decision).
     if relayed:
-        relay_via = str(env.get("relayed_via", "") or sender.get("bridge", "") or "?")
+        relay_via = str(sender.get("bridge", "") or env.get("relayed_via", "") or "?")
         header.append(f"relayed via  : {relay_via} (room leader)")
     # Reply-with hint. A NON-relayed send keeps the sender's declared `reply_to`
-    # (documented behavior). A RELAYED leg overrides it to the RESOLVED original
-    # author (`peer`/`agent`) so a reply routes to who actually wrote the message,
-    # NOT the relay leader (a relayed env.reply_to was rebuilt by the leader to the
-    # original author already, but we render from the resolved values so the body
-    # can never present the original agent paired with the leader node).
+    # (documented behavior). A VALIDATED RELAYED leg overrides it to the RESOLVED
+    # original author (`peer`/`agent`) so a reply routes to who actually wrote the
+    # message, NOT the relay leader, and the body can never present the original
+    # agent paired with the leader node.
     reply_peer = peer if relayed else str(reply.get("peer", "?") or "?")
     reply_agent = agent if relayed else str(reply.get("agent", "?") or "?")
     header += [
@@ -2782,8 +2794,16 @@ class HandoffHandler(BaseHTTPRequestHandler):
         # only reaches the DELIVERY (enqueue) path after room_scoped_check has
         # validated peer==cached-leader + the original author's membership+epoch —
         # so by the time we rewrite, the relayed_from is leader-vouched + validated.
-        if (a2a.envelope_is_relayed(env)  # noqa: iso-helper-boundary - a2a.envelope_* call, not a .env file
-                and a2a.envelope_is_room_scoped(env)):  # noqa: iso-helper-boundary - a2a.envelope_* call, not a .env file
+        # THE TRUSTED relay decision (codex #11494): a relay leg is leader-vouched
+        # ONLY when it is both relay-marked AND room-scoped (a non-room sender can
+        # forge `relayed_via`, but never a room-scoped relay the leader validated).
+        # This SAME boolean gates the queue-attribution rewrite AND the body
+        # `relayed via` line — so the human-facing body can never disagree with the
+        # queue, and a forged non-room `relayed_via` produces neither a rewrite nor
+        # a relay line.
+        is_relayed_leg = (a2a.envelope_is_relayed(env)  # noqa: iso-helper-boundary - a2a.envelope_* call, not a .env file
+                          and a2a.envelope_is_room_scoped(env))  # noqa: iso-helper-boundary - a2a.envelope_* call, not a .env file
+        if is_relayed_leg:
             rf_agent, rf_node = a2a.relayed_from(env)
             if rf_agent and rf_node:
                 sender_bridge = rf_node
@@ -3136,14 +3156,17 @@ class HandoffHandler(BaseHTTPRequestHandler):
             # path scoped to (peer_id, message_id) that flows straight to
             # --body-file. peer_id is the authenticated X-AGB-Peer.
             # Render the body provenance from the SAME resolved author identity the
-            # queue attribution uses (sender_bridge/sender_agent) — on a relayed leg
-            # those are the rewritten `relayed_from` values, so the body and the
-            # queue agree and never present the original agent paired with the
-            # leader node (codex Phase-4 #1695-P2 body-provenance fix).
+            # queue attribution uses (sender_bridge/sender_agent) AND the SAME
+            # validated `is_relayed_leg` decision — on a relayed leg those are the
+            # rewritten `relayed_from` values + a true relay line, so the body and
+            # the queue agree and never present the original agent paired with the
+            # leader node; a forged non-room `relayed_via` renders NO relay line
+            # (codex Phase-4 #1695-P2 + #11494 body-provenance fix).
             staged = stage_inbound_body(
                 peer_id, message_id,
                 staged_body_text(env, author_bridge=sender_bridge,
-                                 author_agent=sender_agent))
+                                 author_agent=sender_agent,
+                                 is_relayed=is_relayed_leg))
             durable_body = promote_inbound_body_to_queue(staged)
 
             ok, task_id, audit_detail, peer_detail = enqueue_via_bridge_task(
