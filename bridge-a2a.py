@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import bridge_a2a_common as a2a
+import bridge_reconcile_common as reconcile
 
 
 # --------------------------------------------------------------------------
@@ -2569,11 +2570,17 @@ def _netstat_rooms_count() -> dict[str, Any]:
     if not rooms_cli.is_file():  # noqa: raw-pathlib-controller-only
         out["error"] = "bridge-rooms.py not found"
         return out
+    import subprocess
     try:
         proc = _run_subprocess(
             [sys.executable, str(rooms_cli), "list", "--json"], timeout=10,
         )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        # subprocess.SubprocessError covers TimeoutExpired (a wedged rooms CLI),
+        # which is NOT an OSError subclass. Without it a stalled `bridge-rooms.py
+        # list` would unwind the read-only snapshot from this (the FIRST) rooms
+        # read — the v2 readers harden the same seam; v1 must too. Shape-stable:
+        # this only widens the caught set, never the returned {count,error} dict.
         out["error"] = str(exc)
         return out
     if proc.returncode != 0:
@@ -2588,13 +2595,378 @@ def _netstat_rooms_count() -> dict[str, Any]:
     return out
 
 
+# --------------------------------------------------------------------------
+# net-status v2 enrichment (ADDITIVE, READ-ONLY — #1708)
+# --------------------------------------------------------------------------
+#
+# The v2 control-loop status window: enrich the #1697 snapshot so a human can
+# confirm at a glance that the daemon's reconcile loop is converging WITHOUT
+# reading config across nodes. STRICTLY additive — every v1 field name/shape
+# stays byte-identical; v2 fields are added alongside. Same hard contract as v1:
+#   * READ ONLY. Zero state mutation — no mkdir/WAL/schema/roster write. The
+#     reconcile + peer-FSM reads go through the NON-CREATING `?mode=ro`
+#     snapshots (reconcile_status_snapshot / peer_reachability_snapshot); the
+#     rooms reads go through the read-only `bridge-rooms.py` CLI (which uses
+#     open_rooms_readonly — returns None on an absent db, never creates it).
+#   * ACTIVE-TRANSPORT-ONLY. own_stable_address + tunnel_freshness probe ONLY
+#     the configured transport's adapter; an inactive transport is never probed.
+#   * NO SECRETS. addresses / ports / agent NAMES / epochs / ages / counts only.
+#     Never a peer key, listen secret, HMAC seed, room token, or raw provenance.
+#   * DEGRADE-SAFE. any missing source returns a null/empty field, NEVER raises.
+
+def _netstat_own_stable_address(probe_kind: str) -> dict[str, Any]:
+    """This node's detected stable address via the active transport adapter.
+
+    Dispatches to the #1705 stable-addr adapter for the CONFIGURED transport
+    only (no new per-transport branch is invented here — it calls the common
+    adapter and renders whatever it returns). Fail-soft: a node with no stable
+    address yet, or an unavailable CLI, records an error string and a null
+    address (never raises, never synthesizes one).
+    """
+    out: dict[str, Any] = {"transport": probe_kind, "address": None, "error": None}
+    try:
+        if probe_kind == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
+            out["address"] = a2a.warp_mesh_stable_addr()
+        else:
+            out["address"] = a2a.tailscale_stable_addr()
+    except a2a.A2AError as exc:
+        out["error"] = f"{exc} ({exc.code})"
+    return out
+
+
+def _netstat_rooms_cli(verb: str, *extra: str) -> "tuple[Any, str | None]":
+    """Run the read-only `bridge-rooms.py <verb> [extra...] --json` and parse.
+
+    The SAME iso-boundary-safe delegation v1's `_netstat_rooms_count` uses: the
+    rooms CLI owns the read-perm + readonly-open (`open_rooms_readonly`, which
+    NEVER creates rooms.db). net-status never opens rooms.db itself. Returns
+    `(parsed_json, error)` — parsed is None on any failure with `error` set.
+    """
+    rooms_cli = Path(__file__).resolve().parent / "bridge-rooms.py"
+    if not rooms_cli.is_file():  # noqa: raw-pathlib-controller-only
+        return None, "bridge-rooms.py not found"
+    argv = [sys.executable, str(rooms_cli), verb, *extra, "--json"]
+    import subprocess
+    try:
+        proc = _run_subprocess(argv, timeout=10)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        # subprocess.SubprocessError covers TimeoutExpired (a wedged rooms CLI)
+        # and CalledProcessError — neither is an OSError subclass, so without
+        # this a stalled `bridge-rooms.py` would unwind the read-only snapshot.
+        # Degrade-safe: a probe failure is a null/error field, never a raise.
+        return None, str(exc)
+    if proc.returncode != 0:
+        return None, (proc.stderr or proc.stdout or "").strip()[:200] or \
+            f"bridge-rooms.py {verb} exited {proc.returncode}"
+    try:
+        return json.loads(proc.stdout or "null"), None
+    except (ValueError, TypeError) as exc:
+        return None, f"unparseable bridge-rooms.py {verb}: {exc}"
+
+
+def _netstat_rooms_v2(applied_epochs: "dict[str, int]") -> dict[str, Any]:
+    """Per-room leader + roster + epoch convergence (read-only, #1708).
+
+    Builds, per room this node leads or has joined:
+      - room_leader: {room_id, leader_agent, leader_node, reachable_address}
+      - room_roster: {room_id, epoch, last_sync_ts, members:[{agent,node,role}]}
+      - roster_epoch_converged: this node's APPLIED roster epoch == the room's
+        epoch (per room).
+
+    All sourced from the read-only `bridge-rooms.py list/show --json` — agent
+    NAMES, node names, epochs, addresses only (no token/secret). `applied_epochs`
+    is the locally-applied per-room epoch (from the roster-cache view) used to
+    derive convergence without a second store open. Fail-soft: a missing rooms
+    db yields empty lists, never raises.
+    """
+    out: dict[str, Any] = {
+        "room_leader": [], "room_roster": [],
+        "roster_epoch_converged": [], "error": None,
+    }
+    listing, err = _netstat_rooms_cli("list")
+    if err is not None:
+        out["error"] = err
+        return out
+    if not isinstance(listing, list):
+        return out
+    for item in listing:
+        if not isinstance(item, dict):
+            continue
+        rid = item.get("room_id")
+        if not isinstance(rid, str) or not rid:
+            continue
+        leader = item.get("leader") or ""  # "agent@node"
+        leader_agent, _, leader_node = str(leader).partition("@")
+        room_epoch = item.get("epoch")
+        # `show --json` carries the canonical roster (members + epoch). A member-
+        # cached room returns the cached view (role=member); a led room returns
+        # the leader view — fail-soft to the list item either way.
+        #
+        # `reachable_address` + `last_sync_ts`: the read-only `bridge-rooms.py
+        # show --json` does NOT currently emit a per-leader reachable address or
+        # a roster-cache sync timestamp (it surfaces room/member/epoch/role
+        # only). We read them DEFENSIVELY (forward-compatible: if a later rooms-
+        # CLI lane adds these read-only fields they auto-populate) but they are
+        # NULL today — the field is reserved, not fabricated. `leader_node` is
+        # the addressing handle the mesh already exposes; a richer reachable
+        # address would require reading peer config we deliberately do NOT touch
+        # (net-status must not read config across nodes).
+        detail, derr = _netstat_rooms_cli("show", rid)
+        members: list[Any] = []
+        reach_addr = None
+        last_sync_ts = None
+        if isinstance(detail, dict) and derr is None:
+            raw_members = detail.get("members")
+            if isinstance(raw_members, list):
+                members = [
+                    {"agent": m.get("agent"), "node": m.get("node"),
+                     "role": m.get("role")}
+                    for m in raw_members if isinstance(m, dict)
+                ]
+            # Reserved/forward-compatible reads (null until the rooms CLI grows
+            # these read-only fields). Never a secret — these are addr/ts only.
+            reach_addr = detail.get("leader_reachable_address") or \
+                detail.get("reachable_address")
+            last_sync_ts = detail.get("last_sync_ts") or detail.get("fetched_ts")
+            if detail.get("epoch") is not None:
+                room_epoch = detail.get("epoch")
+        out["room_leader"].append({
+            "room_id": rid,
+            "leader_agent": leader_agent or None,
+            "leader_node": leader_node or None,
+            "reachable_address": reach_addr,
+        })
+        out["room_roster"].append({
+            "room_id": rid,
+            "epoch": room_epoch,
+            "last_sync_ts": last_sync_ts,
+            "members": members,
+        })
+        applied = applied_epochs.get(rid)
+        converged = None
+        if applied is not None and room_epoch is not None:
+            try:
+                converged = int(applied) == int(room_epoch)
+            except (TypeError, ValueError):
+                converged = None
+        out["roster_epoch_converged"].append({
+            "room_id": rid,
+            "applied_epoch": applied,
+            "room_epoch": room_epoch,
+            "converged": converged,
+            "last_sync_ts": last_sync_ts,
+        })
+    return out
+
+
+def _netstat_allowed_agents(cfg: dict[str, Any],
+                            rooms_v2: dict[str, Any]) -> dict[str, Any]:
+    """This node's allowed agents: per-peer inbound_allowlist + room members.
+
+    Read-only union of (a) each configured peer's `inbound_allowlist` (the
+    agent names the receiver admits from that peer) and (b) every room's member
+    agent list. Agent NAMES only — no secret. Degrade-safe: a peer with no
+    allowlist contributes an empty list.
+    """
+    peers_raw = cfg.get("peers", []) if isinstance(cfg.get("peers"), list) else []
+    per_peer: list[dict[str, Any]] = []
+    for p in peers_raw:
+        if not isinstance(p, dict):
+            continue
+        allow = p.get("inbound_allowlist")
+        allow = [str(a) for a in allow] if isinstance(allow, list) else []
+        per_peer.append({"peer": p.get("id", "?"), "inbound_allowlist": allow})
+    room_members: list[dict[str, Any]] = []
+    for r in rooms_v2.get("room_roster", []):
+        if not isinstance(r, dict):
+            continue
+        agents = [m.get("agent") for m in r.get("members", [])
+                  if isinstance(m, dict) and m.get("agent")]
+        room_members.append({"room_id": r.get("room_id"), "agents": agents})
+    return {"inbound_allowlist_per_peer": per_peer, "room_members": room_members}
+
+
+def _netstat_tunnel_freshness(probe_kind: str,
+                              substrate: dict[str, Any]) -> dict[str, Any]:
+    """Active-transport handshake freshness + degraded bool (read-only, #1706).
+
+    WARP-mesh: the #1706 tunnel-health adapter (`warp_tunnel_handshake_age`,
+    rc-gated) gives the handshake age; degraded = age is unknown (None) OR age
+    exceeds the staleness threshold (mirrors the tunnel-health step's
+    fail-closed rule — an unknowable age is NOT-fresh). Tailscale has no
+    warp-style handshake-age line, so age is null and degraded is derived from
+    the substrate's `tailscale_up` already probed by v1. NEVER probes an
+    inactive transport. Fail-soft throughout.
+    """
+    out: dict[str, Any] = {
+        "transport": probe_kind, "handshake_age_s": None,
+        "degraded": None, "error": None,
+    }
+    if probe_kind == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
+        try:
+            age = a2a.warp_tunnel_handshake_age()
+        except Exception as exc:  # noqa: BLE001 - a freshness probe never raises
+            out["error"] = str(exc)
+            out["degraded"] = True  # unknowable age is fail-closed NOT-fresh
+            return out
+        out["handshake_age_s"] = age
+        if age is None:
+            # Unknowable age — fail-closed NOT-fresh (mirrors the step's rule;
+            # the step re-probes WITHOUT bouncing, but freshness reports degraded).
+            out["degraded"] = True
+        else:
+            try:
+                threshold = reconcile.warp_handshake_stale_threshold()
+            except Exception:  # noqa: BLE001 - fall back to a safe default
+                threshold = reconcile.DEFAULT_WARP_HANDSHAKE_STALE_SECONDS
+            out["degraded"] = age > threshold
+        return out
+    # Tailscale (and legacy-none): no handshake-age line exists. Derive degraded
+    # from the substrate liveness v1 already probed (Online=False/None => not
+    # fresh). age stays null (honestly UNKNOWN, never synthesized).
+    up = substrate.get("tailscale_up")
+    out["degraded"] = (up is not True)
+    return out
+
+
+def _netstat_per_peer(peers: list[dict[str, Any]],
+                      substrate: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-peer reachability state-machine value + observability (read-only).
+
+    Surfaces the #1707 UP/SUSPECT/DOWN FSM value for each configured peer from
+    the NON-CREATING `peer_reachability_snapshot` (reconcile.db `?mode=ro`),
+    plus last-attempt/next-eligible ts and attempt-count. NO SECRETS — peer ids,
+    FSM labels, counters and timestamps only. A peer never probed (or before the
+    daemon has reconciled) reports state="unknown" (the snapshot's stable shape),
+    never an invented DOWN.
+    """
+    peer_ids = [str(p.get("id")) for p in peers
+                if isinstance(p, dict) and p.get("id") not in (None, "")]
+    try:
+        fsm = reconcile.peer_reachability_snapshot(peer_ids)
+    except Exception:  # noqa: BLE001 - degrade-safe, never raise into the snapshot
+        fsm = {}
+    out: list[dict[str, Any]] = []
+    for p in peers:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("id", "?"))
+        st = fsm.get(pid, {}) if isinstance(fsm, dict) else {}
+        out.append({
+            "id": pid,
+            "state": st.get("state", "unknown"),
+            "consecutive_fail": st.get("consecutive_fail", 0),
+            "last_state_ts": st.get("last_state_ts"),
+            "last_attempt_ts": st.get("last_attempt_ts"),
+            "next_eligible_ts": st.get("next_eligible_ts"),
+            "attempt_count": st.get("attempt_count", 0),
+        })
+    return out
+
+
+def _netstat_reconcile() -> dict[str, Any]:
+    """The control-loop's own observability via reconcile_status_snapshot (#1708).
+
+    Imports + calls the ALREADY-BUILT (Lane 0) `reconcile_status_snapshot()` —
+    a PURE read that NEVER creates reconcile.db (it `path.exists()`-guards and
+    opens `?mode=ro`). Surfaces last_tick_ts, interval, the per-step status, and
+    derives auto-recovery counts from the step attempt history (drift-rebind
+    #1705/#1707 = stable-addr + peer-reachability attempts; tunnel-bounce #1706 =
+    tunnel-health attempts) WITHOUT adding a new counter table. Degrade-safe: a
+    missing store yields the stable all-unknown shape.
+    """
+    try:
+        interval = reconcile.reconcile_interval()
+    except Exception:  # noqa: BLE001 - degrade-safe interval read
+        interval = None
+    try:
+        snap = reconcile.reconcile_status_snapshot(interval=interval)
+    except Exception as exc:  # noqa: BLE001 - never raise into the snapshot
+        return {"last_tick_ts": None, "interval": interval, "steps": {},
+                "auto_recovery": {}, "error": str(exc)}
+    steps = snap.get("steps", {}) if isinstance(snap.get("steps"), dict) else {}
+
+    def _attempts(step_id: str) -> int:
+        entry = steps.get(step_id, {})
+        try:
+            return int(entry.get("attempt_count", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _result(step_id: str):
+        entry = steps.get(step_id, {})
+        return entry.get("last_result")
+
+    # IMPORTANT semantics: `attempt_count` in reconcile.db is the bounded-backoff
+    # PENDING-RETRY counter (record_attempt resets it to 0 on a converged/changed
+    # result), NOT a cumulative lifetime recovery tally. So we surface the
+    # CURRENT auto-recovery PRESSURE per recovery path (how many failed retries
+    # are currently pending before the next eligible attempt) + the last result,
+    # NOT a "how many recoveries ever happened" count (which would require a new
+    # counter table the brief forbids). A non-zero pending count + an error
+    # last_result is the "this recovery path is actively struggling" signal;
+    # zero + a converged/changed result is "settled / recovered".
+    snap["auto_recovery"] = {
+        # Drift-rebind path: stable-addr (#1705) + peer-reachability (#1707)
+        # IP-drift rebind. Pending-retry pressure across both recovery steps.
+        "drift_rebind_pending_retries": _attempts(reconcile.STEP_STABLE_ADDR)
+        + _attempts(reconcile.STEP_PEER_REACHABILITY),
+        "drift_rebind_last_result": {
+            reconcile.STEP_STABLE_ADDR: _result(reconcile.STEP_STABLE_ADDR),
+            reconcile.STEP_PEER_REACHABILITY: _result(reconcile.STEP_PEER_REACHABILITY),
+        },
+        # Tunnel-bounce path: tunnel-health (#1706) WARP auto-bounce. Pending-
+        # retry pressure + last result.
+        "tunnel_bounce_pending_retries": _attempts(reconcile.STEP_TUNNEL_HEALTH),
+        "tunnel_bounce_last_result": _result(reconcile.STEP_TUNNEL_HEALTH),
+    }
+    snap["error"] = None
+    return snap
+
+
+def _netstat_applied_epochs() -> "tuple[dict[str, int], str | None]":
+    """Per-room locally-APPLIED roster epoch, read-only via bridge-rooms.py list.
+
+    The `list --json` view carries each room's epoch as THIS node currently sees
+    it (the leader's own epoch for led rooms; the applied roster-cache epoch for
+    member rooms). That is exactly the "applied" epoch the convergence check
+    compares against the room epoch — but for member rooms `list` and `show`
+    both read the same cache row, so a divergence only appears once a fresher
+    leader roster has been received but not yet cached. Fail-soft to empty.
+    """
+    listing, err = _netstat_rooms_cli("list")
+    if err is not None or not isinstance(listing, list):
+        return {}, err
+    applied: dict[str, int] = {}
+    for item in listing:
+        if not isinstance(item, dict):
+            continue
+        rid = item.get("room_id")
+        ep = item.get("epoch")
+        if isinstance(rid, str) and rid and ep is not None:
+            try:
+                applied[rid] = int(ep)
+            except (TypeError, ValueError):
+                continue
+    return applied, None
+
+
 def cmd_net_status(args: argparse.Namespace) -> int:
-    """Read-only snapshot of this node's A2A network/transport state (#1697).
+    """Read-only snapshot of this node's A2A network/transport state (#1697 v1
+    + #1708 v2 control-loop status window).
 
     Prints (and with --json emits) the ACTUALLY-configured transport, this
     node's bridge_id + listen address:port, receiver daemon liveness, the
     ACTIVE substrate state for the configured transport ONLY, configured peers,
-    and rooms membership count. Never mutates anything.
+    and rooms membership count (the v1 #1697 fields, byte-identical).
+
+    v2 (#1708) ADDITIVELY layers a control-loop status window on top: this
+    node's own_stable_address, per-room room_leader / room_roster (+ epoch +
+    last_sync_ts), allowed_agents, tunnel_freshness, per_peer UP/SUSPECT/DOWN
+    state, the reconcile loop's own observability (last_tick / interval /
+    per-step status + derived auto-recovery counts), and roster_epoch_converged.
+    Every v2 source is read-only and non-creating; never mutates anything (no
+    reconcile.db / rooms.db creation, no roster write).
     """
     try:
         cfg = a2a.load_config()
@@ -2640,7 +3012,20 @@ def cmd_net_status(args: argparse.Namespace) -> int:
             "identity_keyed": has_identity,
         })
 
+    # --- v2 enrichment (#1708): ADDITIVE control-loop status window ----------
+    # Each block is independently fail-soft (a missing source yields a
+    # null/empty field, never raises), so v1 consumers are untouched and v2
+    # readers always get the stable shape. All read-only.
+    own_stable_address = _netstat_own_stable_address(probe_kind)
+    tunnel_freshness = _netstat_tunnel_freshness(probe_kind, substrate)
+    per_peer = _netstat_per_peer(peers, substrate)
+    reconcile_status = _netstat_reconcile()
+    applied_epochs, _applied_err = _netstat_applied_epochs()
+    rooms_v2 = _netstat_rooms_v2(applied_epochs)
+    allowed_agents = _netstat_allowed_agents(cfg, rooms_v2)
+
     snapshot = {
+        # --- v1 (#1697) — byte-identical, order + shape preserved ------------
         "bridge_id": cfg.get("bridge_id", "") or None,
         "transport": transport_label,
         "listen": listen,
@@ -2648,7 +3033,18 @@ def cmd_net_status(args: argparse.Namespace) -> int:
         "substrate": substrate,
         "peers": peers,
         "rooms": rooms_info,
+        # --- v2 (#1708) — additive control-loop status window ----------------
+        "own_stable_address": own_stable_address,
+        "room_leader": rooms_v2.get("room_leader", []),
+        "allowed_agents": allowed_agents,
+        "room_roster": rooms_v2.get("room_roster", []),
+        "tunnel_freshness": tunnel_freshness,
+        "per_peer": per_peer,
+        "reconcile": reconcile_status,
+        "roster_epoch_converged": rooms_v2.get("roster_epoch_converged", []),
     }
+    if rooms_v2.get("error"):
+        snapshot["rooms_v2_error"] = rooms_v2["error"]
 
     if args.json:
         print(json.dumps(snapshot, ensure_ascii=False, indent=2))
@@ -2682,6 +3078,41 @@ def cmd_net_status(args: argparse.Namespace) -> int:
     print(f"rooms:       {rc_count if rc_count is not None else '?'} member"
           + ("" if rc_count == 1 else "s")
           + (f"  ({rooms_info['error']})" if rooms_info.get("error") else ""))
+
+    # --- v2 (#1708) plain rendering — control-loop status window ------------
+    osa = own_stable_address
+    print(f"stable_addr: {osa.get('address') or '-'}  (transport={osa.get('transport')})"
+          + (f"  ({osa['error']})" if osa.get("error") else ""))
+    tf = tunnel_freshness
+    age = tf.get("handshake_age_s")
+    print(f"tunnel:      handshake_age={age if age is not None else '-'}s  "
+          f"degraded={tf.get('degraded')}"
+          + (f"  ({tf['error']})" if tf.get("error") else ""))
+    print(f"per_peer:    {len(per_peer)} peer state(s)")
+    for pp in per_peer:
+        print(f"  {pp['id']:20}  state={pp['state']:8}  "
+              f"fail={pp['consecutive_fail']}  attempts={pp['attempt_count']}")
+    rec = reconcile_status
+    rec_ar = rec.get("auto_recovery", {}) if isinstance(rec.get("auto_recovery"), dict) else {}
+    print(f"reconcile:   last_tick={rec.get('last_tick_ts') or '-'}  "
+          f"interval={rec.get('interval')}s  "
+          f"drift_rebind_pending={rec_ar.get('drift_rebind_pending_retries', 0)}  "
+          f"tunnel_bounce_pending={rec_ar.get('tunnel_bounce_pending_retries', 0)}")
+    for step_id, st in (rec.get("steps", {}) or {}).items():
+        if not isinstance(st, dict):
+            continue
+        print(f"  {step_id:18}  status={st.get('status', 'unknown'):10}  "
+              f"attempts={st.get('attempt_count', 0)}")
+    rl = rooms_v2.get("room_leader", [])
+    print(f"rooms_v2:    {len(rl)} room(s)"
+          + (f"  ({rooms_v2['error']})" if rooms_v2.get("error") else ""))
+    epoch_by_room = {r.get("room_id"): r for r in rooms_v2.get("roster_epoch_converged", [])}
+    for lead in rl:
+        rid = lead.get("room_id")
+        conv = epoch_by_room.get(rid, {})
+        print(f"  {str(rid):20}  leader={lead.get('leader_agent') or '-'}@"
+              f"{lead.get('leader_node') or '-'}  epoch={conv.get('room_epoch')}  "
+              f"converged={conv.get('converged')}")
     return 0
 
 
