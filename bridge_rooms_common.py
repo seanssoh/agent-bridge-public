@@ -445,6 +445,55 @@ def handoff_dir() -> Path:
     return state_dir() / "handoff"
 
 
+def _path_is_within(child: Path, parent: Path) -> bool:
+    """True iff `child` resolves to `parent` or a descendant of it.
+
+    Pure lexical containment on the *resolved* (symlink-collapsed, absolute)
+    forms — no filesystem write, safe to call before any dir exists. Parallels
+    the A2A-common helper of the same name (this module duplicates
+    `bridge_home`/`state_dir`/`handoff_dir` rather than import-coupling to the
+    lower layer at module load).
+    """
+    try:
+        child_r = child.resolve()
+        parent_r = parent.resolve()
+    except (OSError, RuntimeError):
+        # resolve() can raise on a symlink loop; treat "cannot prove within" as
+        # NOT within so the guard fails closed rather than silently allowing.
+        return False
+    if child_r == parent_r:
+        return True
+    return parent_r in child_r.parents
+
+
+def guard_test_bind_state_path() -> None:
+    """Fail closed when a test-bind mesh would write into a live state tree.
+
+    The rooms-side mirror of `bridge_a2a_common.guard_test_bind_state_path`
+    (issue #1728). `BRIDGE_A2A_ALLOW_TEST_BIND=1` is TEST-ONLY — production
+    never sets it — so this guard cannot affect a production install. When the
+    flag is set AND the resolved rooms/handoff state dir is NOT under the
+    active `BRIDGE_HOME` (a `BRIDGE_STATE_DIR` override pointing at the live
+    state tree), refuse with a clear message so a throwaway test mesh cannot
+    silently clobber the live rooms.db / reconcile.db.
+    """
+    if os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") != "1":  # noqa: iso-helper-boundary - env var, not a .env file
+        return
+    home = bridge_home()
+    resolved_state = state_dir()
+    if _path_is_within(resolved_state, home):
+        return
+    raise RoomsError(
+        f"BRIDGE_A2A_ALLOW_TEST_BIND=1 (test mode) but the rooms state dir "
+        f"{str(resolved_state)!r} is outside BRIDGE_HOME {str(home)!r} — a "
+        "test mesh would clobber the live rooms.db / reconcile.db. Set "
+        "BRIDGE_STATE_DIR (and, if overridden, BRIDGE_A2A_ROOMS_DB / "
+        "BRIDGE_A2A_RECONCILE_DB) under your test BRIDGE_HOME so test state "
+        "cannot reach the live state tree.",
+        code="test_bind_state_outside_home",
+    )
+
+
 def rooms_db_path() -> Path:
     override = os.environ.get("BRIDGE_A2A_ROOMS_DB")
     if override:
@@ -710,6 +759,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
 
 
 def _connect(path: Path, schema: str) -> sqlite3.Connection:
+    # #1728: fail closed before creating/opening any rooms-tier DB if a
+    # test-bind mesh (BRIDGE_A2A_ALLOW_TEST_BIND=1) would land it on a live
+    # state dir outside its BRIDGE_HOME. No-op when the flag is unset (prod).
+    guard_test_bind_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30.0)
     conn.row_factory = sqlite3.Row

@@ -212,6 +212,14 @@ def open_reconcile_db(state_dir: Optional[Path] = None) -> sqlite3.Connection:
     WAL journal, 0600 perms — mirrors the outbox/inbox `_connect` convention in
     bridge_a2a_common.py so the file ownership/journaling story is identical.
     """
+    # #1728: fail closed before creating/opening reconcile.db if a test-bind
+    # mesh (BRIDGE_A2A_ALLOW_TEST_BIND=1) would land it on a live state dir
+    # outside its BRIDGE_HOME. Reuses the a2a-common guard (this module already
+    # imports `a2a`); no-op when the flag is unset (prod). Skipped only when the
+    # caller passes an EXPLICIT state_dir (smokes drive an isolated path directly
+    # — the guard keys on the env-resolved handoff_dir, not the override arg).
+    if state_dir is None and not os.environ.get("BRIDGE_A2A_RECONCILE_DB"):  # noqa: iso-helper-boundary
+        a2a.guard_test_bind_state_path()
     path = reconcile_db_path(state_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30.0)

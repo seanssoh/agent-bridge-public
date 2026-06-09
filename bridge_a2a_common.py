@@ -211,6 +211,64 @@ def handoff_dir() -> Path:
     return state_dir() / "handoff"
 
 
+def _path_is_within(child: Path, parent: Path) -> bool:
+    """True iff `child` resolves to `parent` or a descendant of it.
+
+    Pure lexical containment on the *resolved* (symlink-collapsed, absolute)
+    forms — no filesystem write, safe to call before any dir exists. Used by
+    the test-bind state-path guard to decide whether a `BRIDGE_STATE_DIR`
+    override still lands the A2A state tree under the active `BRIDGE_HOME`.
+    """
+    try:
+        child_r = child.resolve()
+        parent_r = parent.resolve()
+    except (OSError, RuntimeError):
+        # resolve() can raise on a symlink loop; treat "cannot prove within" as
+        # NOT within so the guard fails closed rather than silently allowing.
+        return False
+    if child_r == parent_r:
+        return True
+    return parent_r in child_r.parents
+
+
+def guard_test_bind_state_path() -> None:
+    """Fail closed when a test-bind mesh would write into a live state tree.
+
+    Symmetric to the `BRIDGE_A2A_ALLOW_TEST_BIND=1` loopback bind escape hatch
+    (`resolve_bind` in `bridge-handoffd.py`): that flag is TEST-ONLY — production
+    never sets it — so a guard keyed on it can never affect a production install.
+
+    The footgun (issue #1728): a throwaway test mesh that overrides only
+    per-node `BRIDGE_HOME` but inherits a live `BRIDGE_STATE_DIR` (normal on a
+    configured host) resolves `handoff_dir()` — and therefore rooms.db /
+    reconcile.db / outbox / inbox — to the LIVE state dir, silently clobbering
+    real room membership. The socket bind is gated by the test flag; the
+    state-path was not.
+
+    When `BRIDGE_A2A_ALLOW_TEST_BIND=1` AND the resolved handoff state dir is
+    NOT under the active `BRIDGE_HOME` (i.e. an override points it at a
+    live / out-of-home location), refuse the operation with a clear message
+    pointing at the override knobs. Production (flag unset) and a correctly
+    isolated test mesh (state dir under the test home) are unaffected.
+    """
+    if os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") != "1":  # noqa: iso-helper-boundary - env var, not a .env file
+        return
+    home = bridge_home()
+    resolved_state = state_dir()
+    if _path_is_within(resolved_state, home):
+        return
+    raise A2AError(
+        f"BRIDGE_A2A_ALLOW_TEST_BIND=1 (test mode) but the A2A state dir "
+        f"{str(resolved_state)!r} is outside BRIDGE_HOME {str(home)!r} — a "
+        "test mesh would clobber the live rooms.db / reconcile.db / "
+        "outbox / inbox. Set BRIDGE_STATE_DIR (and, if overridden, "
+        "BRIDGE_A2A_ROOMS_DB / BRIDGE_A2A_RECONCILE_DB / "
+        "BRIDGE_A2A_OUTBOX_DB / BRIDGE_A2A_INBOX_DB) under your test "
+        "BRIDGE_HOME so test state cannot reach the live state tree.",
+        code="test_bind_state_outside_home",
+    )
+
+
 def outbox_db_path() -> Path:
     override = os.environ.get("BRIDGE_A2A_OUTBOX_DB")
     if override:
@@ -241,6 +299,10 @@ def config_path() -> Path:
 
 
 def ensure_handoff_dirs() -> None:
+    # #1728: before creating/writing the handoff tree, fail closed if a
+    # test-bind mesh (BRIDGE_A2A_ALLOW_TEST_BIND=1) would land it on a live
+    # state dir outside its BRIDGE_HOME. No-op when the flag is unset (prod).
+    guard_test_bind_state_path()
     for path in (handoff_dir(), incoming_dir(), outgoing_dir()):
         path.mkdir(parents=True, exist_ok=True)
         try:
