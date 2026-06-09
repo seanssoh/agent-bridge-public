@@ -293,6 +293,23 @@ assert_verdict "empty-stack popd no-op"   "cd \$BRIDGE_HOME/shared; popd; cat se
 assert_verdict "cd - restores prev"       "cd \$BRIDGE_HOME; cd shared; cd - >/dev/null; cat shared/secrets/token" "DENY"
 assert_verdict "B peer subshell discard"  "cd \$BRIDGE_HOME/agents; (cd /tmp); cat $PEER_AGENT/MEMORY.md" "DENY"
 
+# r7 (codex #11799) — `&&`/`||` CONDITIONAL execution: bash skips a `cd` gated on
+# a prior command's exit, so a conditional `cd out` does NOT un-anchor a prior
+# bridge cwd (a conditional `cd` no longer advances the modeled cwd).
+assert_verdict "|| skipped cd-out"        "cd \$BRIDGE_HOME/shared; true || cd /tmp; cat secrets/token" "DENY"
+assert_verdict "&& skipped cd-out"        "cd \$BRIDGE_HOME/shared; false && cd /tmp; cat secrets/token" "DENY"
+assert_verdict "&&-chain skipped cd-out"  "cd \$BRIDGE_HOME/shared && true || cd /tmp; cat secrets/token" "DENY"
+assert_verdict "B peer || skipped cd-out" "cd \$BRIDGE_HOME/agents; true || cd /tmp; cat $PEER_AGENT/MEMORY.md" "DENY"
+
+# r7 (patch #11800) — `cd` hidden behind a brace-group / compound-keyword whose
+# body runs in the CURRENT shell (so the cd persists); the reserved-word strip
+# locates it. \`echo cd …\` (a regular command arg) is NOT stripped.
+assert_verdict "brace group cd"           "{ cd \$BRIDGE_HOME/shared; }; cat secrets/token"        "DENY"
+assert_verdict "brace whole-body"         "{ cd \$BRIDGE_HOME/shared; cat secrets/token; }"        "DENY"
+assert_verdict "if-then cd"               "if cd \$BRIDGE_HOME/shared; then cat secrets/token; fi" "DENY"
+assert_verdict "for-do cd"                "for i in 1; do cd \$BRIDGE_HOME/shared; cat secrets/token; done" "DENY"
+assert_verdict "fn-body cd"               "f(){ cd \$BRIDGE_HOME/agents; }; f; cat $PEER_AGENT/MEMORY.md" "DENY"
+
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
 # ---------------------------------------------------------------------------
@@ -307,6 +324,11 @@ assert_verdict "read after cd-out"       "cd /tmp && cat secrets/token"         
 # r6 no-over-block: `command -v/-V cd` is DESCRIBE/query (no cwd change); a
 # subshell read of a PUBLIC tail stays ALLOW.
 assert_verdict "command -v query"        "command -v cd \$BRIDGE_HOME/shared && cat secrets/token" "ALLOW"
+# r7 no-over-block: a CONDITIONAL `cd in` bash skips never enters the bridge; a
+# conditional `cd out` that executes genuinely leaves it — neither is anchored.
+assert_verdict "&& skipped cd-in"        "false && cd \$BRIDGE_HOME/shared; cat secrets/token" "ALLOW"
+assert_verdict "|| skipped cd-in"        "true || cd \$BRIDGE_HOME/shared; cat secrets/token"  "ALLOW"
+assert_verdict "&& cd-out executes"      "true && cd /tmp; cat secrets/token"                  "ALLOW"
 assert_verdict "command -V query"        "command -V cd \$BRIDGE_HOME/shared && cat secrets/token" "ALLOW"
 assert_verdict "subshell read wiki"      "(cd \$BRIDGE_HOME && cat shared/wiki/page.md)"  "ALLOW"
 assert_verdict "subshell-then-rel wiki"  "cd \$BRIDGE_HOME/shared; (cd /tmp); cat wiki/index.md" "ALLOW"

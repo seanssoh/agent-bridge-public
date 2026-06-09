@@ -2771,6 +2771,16 @@ def _expand_bridge_prefixes(word: str) -> str:
 # NOT change the parent cwd and are intentionally absent.
 _CWD_WRAPPER_WORDS = frozenset({"command", "builtin", "time"})
 
+# Bash reserved words / group-openers that can PRECEDE a cwd-changing command in
+# a compound command whose body runs in the CURRENT shell (so the `cd` persists,
+# unlike a subshell) — `{ cd …; }`, `if cd …`, `for …; do cd …` (patch r6
+# #11800). Stripped before locating the verb. A leading REGULAR command word
+# (`echo cd /tmp`) is NOT in this set, so it is correctly left as a non-cd line.
+_CWD_GROUP_OPENERS = frozenset({
+    "{", "}", "if", "then", "else", "elif", "fi", "do", "done",
+    "while", "until", "for", "case", "esac", "in", "!", "function", "(", ")",
+})
+
 
 def _segment_cwd_change(stripped: str) -> tuple[str, str | None] | None:
     """Classify a command segment's effect on the working directory by walking
@@ -2793,20 +2803,29 @@ def _segment_cwd_change(stripped: str) -> tuple[str, str | None] | None:
     except ValueError:
         toks = stripped.split()
     i = 0
-    # Strip leading non-forking cd wrappers AND each wrapper's own options.
-    # `command -v`/`-V` (codex r5 #11794) are DESCRIBE/query modes — they do NOT
-    # execute the following `cd`, so the cwd does not change.
-    while i < len(toks) and toks[i] in _CWD_WRAPPER_WORDS:
-        wrapper = toks[i]
-        i += 1
-        while i < len(toks) and toks[i].startswith("-") and toks[i] != "-":
-            opt = toks[i]
-            end_of_opts = opt == "--"
-            if wrapper == "command" and not end_of_opts and ("v" in opt or "V" in opt):
-                return None  # `command -v/-V cd …` = describe, not execute → no cwd change
+    # Strip, in any order, leading bash reserved words / group-openers (so a `cd`
+    # hidden behind `{`/`if`/`for`/… is still located — its body runs in the
+    # current shell, patch r6 #11800) AND the non-forking cd wrappers
+    # (`command`/`builtin`/`time`) together with THEIR option grammar. NOTE:
+    # `command -v`/`-V` (codex r5 #11794) are DESCRIBE/query modes that do NOT
+    # execute the cd → no cwd change.
+    while i < len(toks):
+        if toks[i] in _CWD_GROUP_OPENERS:
             i += 1
-            if end_of_opts:
-                break
+            continue
+        if toks[i] in _CWD_WRAPPER_WORDS:
+            wrapper = toks[i]
+            i += 1
+            while i < len(toks) and toks[i].startswith("-") and toks[i] != "-":
+                opt = toks[i]
+                end_of_opts = opt == "--"
+                if wrapper == "command" and not end_of_opts and ("v" in opt or "V" in opt):
+                    return None  # `command -v/-V cd …` = describe, not execute
+                i += 1
+                if end_of_opts:
+                    break
+            continue
+        break
     if i >= len(toks) or toks[i] not in ("cd", "pushd", "popd"):
         return None
     verb = toks[i]
@@ -3020,10 +3039,22 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
        bridge anchor) is not collateral-damaged.
     """
     # Split into shell segments on `;`, `&&`, `||`, `|`, `&`, newline, and the
-    # subshell parens `(` `)` so `(cd $BH; cat secrets/token)` is folded too.
-    segments: list[str] = []
-    for piece in _COMMAND_OPERATOR_RE.split(text):
-        segments.extend(_PAREN_SPLIT_RE.split(piece))
+    # subshell parens `(` `)`. Track whether each segment is CONDITIONAL — gated
+    # by a preceding `&&`/`||` on a prior command's exit (codex r6 #11799): bash
+    # may SKIP such a `cd`, so a conditional `cd` must NOT advance the modeled
+    # cwd (a skipped `cd out` leaves bash inside the tree; a skipped `cd in`
+    # never enters it). Reads in a conditional segment are still scanned (they
+    # may execute and leak). Split with the operators captured so the preceding
+    # operator of each segment is known.
+    seg_specs: list[tuple[bool, str]] = []
+    prev_op: str | None = None
+    for part in re.split(r"(&&|\|\||\||;|&|\n)", text):
+        if part in ("&&", "||", "|", ";", "&", "\n"):
+            prev_op = part
+            continue
+        conditional = prev_op in ("&&", "||")
+        for sub in _PAREN_SPLIT_RE.split(part):
+            seg_specs.append((conditional, sub))
 
     forbidden_dirs = _forbidden_dirs_for_suffixes(suffixes)
 
@@ -3074,7 +3105,7 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     # (`cd $BH/shared && cat secrets/token && cd /tmp`).
     cwd: object = _CWD_UNKNOWN
     cwds_seen: list[str] = []
-    for seg in segments:
+    for conditional, seg in seg_specs:
         words = list(_segment_candidate_words(seg))
 
         # Pass 1 — resolved-path containment against the CURRENT cwd.
@@ -3111,14 +3142,19 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
             if _glob_prefix_reaches_forbidden_dir(raw_word, suffixes):
                 return _OBFUSCATED_SUFFIX_SENTINEL
 
-        # THEN apply this segment's cd change so the NEXT segment's reads see it.
-        change = _segment_cwd_change(seg.strip())
-        if change is not None:
-            cwd = _apply_cwd_change(cwd, change)
-            # Remember every concrete cwd entered (for the scope-ambiguous
-            # fail-close — a later control-flow construct can restore any of them).
-            if isinstance(cwd, str):
-                cwds_seen.append(cwd)
+        # THEN apply this segment's cd change so the NEXT segment's reads see it
+        # — UNLESS the segment is conditional (`&&`/`||`-gated): bash may skip it,
+        # so a conditional `cd` must not advance/record the modeled cwd (codex r6
+        # #11799). The reads above were scanned against the cwd that the
+        # UNCONDITIONAL cd's establish, which is what bash is guaranteed to be in.
+        if not conditional:
+            change = _segment_cwd_change(seg.strip())
+            if change is not None:
+                cwd = _apply_cwd_change(cwd, change)
+                # Remember every concrete cwd entered (for the scope-ambiguous
+                # fail-close — a later construct can restore any of them).
+                if isinstance(cwd, str):
+                    cwds_seen.append(cwd)
     return None
 
 
