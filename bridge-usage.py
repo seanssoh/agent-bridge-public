@@ -595,6 +595,10 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     critical = float(args.critical_threshold)
     elevated = _parse_elevated(args, warn, critical)
     rotation_threshold = float(args.rotation_threshold)
+    # 5h stays on the hard rotation threshold; the 7d window gets a lower
+    # proactive threshold so the daemon can rotate or escalate before the
+    # account hard-limits.
+    weekly_warn_threshold = float(getattr(args, "weekly_warn_threshold", 95.0))
     # Track the worst-case agent so the aggregate rotation row tells the
     # operator which agent triggered. Per #831 patch-dev r2 §4: a 99% on
     # agent-A must NOT be masked by a 60% on agent-B sharing the same plan.
@@ -659,6 +663,12 @@ def cmd_monitor(args: argparse.Namespace) -> int:
 
         next_latch = previous_latch
         alerted_at = previous.get("alerted_at")
+        candidate_threshold = (
+            weekly_warn_threshold if snapshot.get("window") == "weekly" else rotation_threshold
+        )
+        candidate_threshold_name = (
+            "weekly_warn_threshold" if snapshot.get("window") == "weekly" else "rotation_threshold"
+        )
 
         if bucket == "ok":
             # Operator has room again; clear the latch so a future climb to warn
@@ -683,7 +693,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         if (
             snapshot.get("provider") == "claude"
             and isinstance(used_percent, (int, float))
-            and used_percent >= rotation_threshold
+            and used_percent >= candidate_threshold
         ):
             # Track worst-case across this monitor pass — used for aggregate
             # attribution in the output envelope.
@@ -693,11 +703,13 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             if not rotation_triggered_at:
                 candidate = {
                     **snapshot,
-                    "rotation_threshold": rotation_threshold,
+                    "rotation_threshold": candidate_threshold,
+                    "rotation_threshold_name": candidate_threshold_name,
                     "worst_case_agent": snapshot_agent or None,
                     "message": (
                         f"Claude usage rotation candidate: {snapshot.get('window') or 'unknown'} "
-                        f"window at {used_percent:.0f}% (threshold {rotation_threshold:.0f}%)"
+                        f"window at {used_percent:.0f}% "
+                        f"({candidate_threshold_name} {candidate_threshold:.0f}%)"
                         + (f" on agent {snapshot_agent}" if snapshot_agent else "")
                         + "."
                     ),
@@ -823,6 +835,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_source_args(monitor_parser)
     monitor_parser.add_argument("--state-file", required=True)
     monitor_parser.add_argument("--rotation-threshold", type=float, default=99.0)
+    # 7d proactive threshold. Separate from rotation_threshold so the 5h
+    # window keeps its 99% behavior while weekly usage can trigger earlier.
+    monitor_parser.add_argument("--weekly-warn-threshold", type=float, default=95.0)
     monitor_parser.add_argument("--json", action="store_true")
     monitor_parser.set_defaults(handler=cmd_monitor)
 

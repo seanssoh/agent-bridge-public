@@ -950,11 +950,12 @@ mkdir -p "$USAGE_CODEX"
 write_usage() {
   local weekly="$1"
   local reset="$2"
+  local five_hour="${3:-10}"
   cat >"$USAGE_CACHE" <<USAGE
 {
   "data": {
     "planName": "Max",
-    "fiveHour": 10,
+    "fiveHour": $five_hour,
     "sevenDay": $weekly,
     "fiveHourResetAt": "2026-05-11T12:00:00+00:00",
     "sevenDayResetAt": "$reset"
@@ -972,9 +973,9 @@ run_monitor() {
     --json
 }
 
-write_usage 98 "2026-05-18T12:00:00+00:00"
-MONITOR_98="$(run_monitor)"
-json_assert "usage 98" "$MONITOR_98" "payload['rotation_candidates'] == []"
+write_usage 94 "2026-05-18T12:00:00+00:00"
+MONITOR_94="$(run_monitor)"
+json_assert "usage 94" "$MONITOR_94" "payload['rotation_candidates'] == []"
 
 write_usage 99 "2026-05-18T12:00:00+00:00"
 MONITOR_99="$(run_monitor)"
@@ -985,18 +986,112 @@ json_assert "usage 99 dedupe" "$MONITOR_99_AGAIN" "payload['rotation_candidates'
 write_usage 99 "2026-05-25T12:00:00+00:00"
 MONITOR_99_RESET="$(run_monitor)"
 json_assert "usage 99 reset" "$MONITOR_99_RESET" "len(payload['rotation_candidates']) == 1"
-pass "usage monitor emits one 99% rotation candidate per reset cycle"
+pass "usage monitor emits one weekly rotation candidate per reset cycle"
 
-"$REPO_ROOT/agent-bridge" auth claude-token auto-rotate enable --threshold 98 --json >/dev/null
+# Weekly usage uses its own proactive threshold while 5h keeps the hard
+# rotation threshold.
+
+WEEKLY_ROTATION_STATE="$USAGE_ROOT/weekly-rotation-state.json"
+
+run_monitor_proactive() {
+  "$PYTHON" "$REPO_ROOT/bridge-usage.py" monitor \
+    --claude-usage-cache "$USAGE_CACHE" \
+    --codex-sessions-dir "$USAGE_CODEX" \
+    --state-file "$WEEKLY_ROTATION_STATE" \
+    --rotation-threshold 99 \
+    --weekly-warn-threshold 95 \
+    --json
+}
+
+# 94% - below weekly_warn_threshold; no rotation candidate.
+write_usage 94 "2026-06-10T12:00:00+00:00"
+MONITOR_WP_94="$(run_monitor_proactive)"
+json_assert "weekly proactive 94" "$MONITOR_WP_94" "payload['rotation_candidates'] == []"
+
+# 95% - at weekly threshold; normal rotation candidate fires.
+write_usage 95 "2026-06-10T12:00:00+00:00"
+MONITOR_WP_95="$(run_monitor_proactive)"
+json_assert "weekly proactive 95 fires" "$MONITOR_WP_95" "len(payload['rotation_candidates']) == 1 and payload['rotation_candidates'][0]['window'] == 'weekly' and payload['rotation_candidates'][0]['rotation_threshold'] == 95.0 and payload['rotation_candidates'][0]['rotation_threshold_name'] == 'weekly_warn_threshold'"
+
+# 95% again - latch dedupe; candidate should NOT re-fire.
+MONITOR_WP_95_AGAIN="$(run_monitor_proactive)"
+json_assert "weekly proactive 95 dedupe" "$MONITOR_WP_95_AGAIN" "payload['rotation_candidates'] == []"
+
+# 99% in same reset cycle stays deduped because the 95% weekly candidate
+# already fired for this reset.
+write_usage 99 "2026-06-10T12:00:00+00:00"
+MONITOR_WP_99="$(run_monitor_proactive)"
+json_assert "weekly proactive 99 deduped after 95" "$MONITOR_WP_99" "payload['rotation_candidates'] == []"
+
+# Reset cycle rollover - rotation latch clears and fires again.
+write_usage 96 "2026-06-17T12:00:00+00:00"
+MONITOR_WP_96_RESET="$(run_monitor_proactive)"
+json_assert "weekly proactive rollover re-fires" "$MONITOR_WP_96_RESET" "len(payload['rotation_candidates']) == 1 and payload['rotation_candidates'][0]['window'] == 'weekly'"
+
+# 5h remains tied to rotation_threshold; weekly threshold does not lower it.
+FIVE_H_STATE="$USAGE_ROOT/five-hour-threshold-state.json"
+write_usage 10 "2026-06-17T12:00:00+00:00" 98
+MONITOR_5H_98="$(
+  "$PYTHON" "$REPO_ROOT/bridge-usage.py" monitor \
+    --claude-usage-cache "$USAGE_CACHE" \
+    --codex-sessions-dir "$USAGE_CODEX" \
+    --state-file "$FIVE_H_STATE" \
+    --rotation-threshold 99 \
+    --weekly-warn-threshold 95 \
+    --json
+)"
+json_assert "5h still below 99" "$MONITOR_5H_98" "payload['rotation_candidates'] == []"
+write_usage 10 "2026-06-17T12:00:00+00:00" 99
+MONITOR_5H_99="$(
+  "$PYTHON" "$REPO_ROOT/bridge-usage.py" monitor \
+    --claude-usage-cache "$USAGE_CACHE" \
+    --codex-sessions-dir "$USAGE_CODEX" \
+    --state-file "$FIVE_H_STATE" \
+    --rotation-threshold 99 \
+    --weekly-warn-threshold 95 \
+    --json
+)"
+json_assert "5h still triggers at 99" "$MONITOR_5H_99" "len(payload['rotation_candidates']) == 1 and payload['rotation_candidates'][0]['window'] == '5h' and payload['rotation_candidates'][0]['rotation_threshold_name'] == 'rotation_threshold'"
+pass "weekly preemptive monitor: weekly fires at 95%, latches per cycle, and 5h still waits for 99%"
+
+# bridge-usage.sh passes --weekly-warn-threshold from env var when no registry
+# value is present.
 SHELL_USAGE_STATE="$USAGE_ROOT/shell-state.json"
-write_usage 98 "2026-06-01T12:00:00+00:00"
+write_usage 96 "2026-06-01T12:00:00+00:00"
+SHELL_MONITOR_WP="$(
+  BRIDGE_CLAUDE_USAGE_CACHE="$USAGE_CACHE" \
+  BRIDGE_CODEX_SESSIONS_DIR="$USAGE_CODEX" \
+  BRIDGE_USAGE_MONITOR_STATE_FILE="$SHELL_USAGE_STATE" \
+  BRIDGE_CLAUDE_TOKEN_REGISTRY="$USAGE_ROOT/no-registry.json" \
+  BRIDGE_CLAUDE_WEEKLY_WARN_PERCENT=90 \
+  "$REPO_ROOT/agent-bridge" usage monitor --json
+)"
+json_assert "usage shell weekly warn threshold env" "$SHELL_MONITOR_WP" "len(payload['rotation_candidates']) == 1 and payload['rotation_candidates'][0]['window'] == 'weekly' and payload['rotation_candidates'][0]['rotation_threshold'] == 90.0"
+pass "bridge-usage.sh passes BRIDGE_CLAUDE_WEEKLY_WARN_PERCENT as --weekly-warn-threshold"
+
+"$REPO_ROOT/agent-bridge" auth claude-token auto-rotate enable --threshold 98 --weekly-warn-threshold 93 --json >/dev/null
+AUTO_ROTATE_STATUS="$("$REPO_ROOT/agent-bridge" auth claude-token auto-rotate status --json)"
+json_assert "auto rotate status carries weekly threshold" "$AUTO_ROTATE_STATUS" "payload['rotation_threshold'] == 98.0 and payload['weekly_warn_threshold'] == 93.0"
+
+REGISTRY_WEEKLY_STATE="$USAGE_ROOT/registry-weekly-state.json"
+write_usage 94 "2026-06-08T12:00:00+00:00"
+SHELL_MONITOR_REGISTRY_WEEKLY="$(
+  BRIDGE_CLAUDE_USAGE_CACHE="$USAGE_CACHE" \
+  BRIDGE_CODEX_SESSIONS_DIR="$USAGE_CODEX" \
+  BRIDGE_USAGE_MONITOR_STATE_FILE="$REGISTRY_WEEKLY_STATE" \
+  "$REPO_ROOT/agent-bridge" usage monitor --json
+)"
+json_assert "usage shell registry weekly warn threshold" "$SHELL_MONITOR_REGISTRY_WEEKLY" "len(payload['rotation_candidates']) == 1 and payload['rotation_candidates'][0]['window'] == 'weekly' and payload['rotation_candidates'][0]['rotation_threshold'] == 93.0"
+pass "bridge-usage.sh reads registry weekly_warn_threshold"
+
+write_usage 10 "2026-06-01T12:00:00+00:00" 98
 SHELL_MONITOR="$(
   BRIDGE_CLAUDE_USAGE_CACHE="$USAGE_CACHE" \
   BRIDGE_CODEX_SESSIONS_DIR="$USAGE_CODEX" \
   BRIDGE_USAGE_MONITOR_STATE_FILE="$SHELL_USAGE_STATE" \
   "$REPO_ROOT/agent-bridge" usage monitor --json
 )"
-json_assert "usage shell registry threshold" "$SHELL_MONITOR" "len(payload['rotation_candidates']) == 1 and payload['rotation_candidates'][0]['rotation_threshold'] == 98.0"
+json_assert "usage shell registry threshold" "$SHELL_MONITOR" "len(payload['rotation_candidates']) == 1 and payload['rotation_candidates'][0]['window'] == '5h' and payload['rotation_candidates'][0]['rotation_threshold'] == 98.0"
 pass "bridge-usage.sh reads registry rotation threshold"
 
 # PR #799 r2/r3 defense-in-depth — the Path A sync path no longer puts

@@ -1987,6 +1987,82 @@ bridge_release_alert_body_file() {
   printf '%s/releases/%s.md' "$BRIDGE_SHARED_DIR" "$safe_tag"
 }
 
+bridge_claude_weekly_quota_task_body() {
+  local provider="${1:-claude}"
+  local account="${2:-unknown}"
+  local used_percent="${3:-unknown}"
+  local reset_at="${4:-unknown}"
+  local source="${5:-unknown}"
+  local worst_case_agent="${6:-unknown}"
+  local rotation_reason="${7:-no_alternate_token}"
+
+  printf 'Claude weekly usage needs a fresh token.\n\n'
+  printf -- '- provider: %s\n' "$provider"
+  printf -- '- account: %s\n' "${account:-unknown}"
+  printf -- '- window: weekly\n'
+  printf -- '- used_percent: %s\n' "${used_percent:-unknown}"
+  printf -- '- reset_at: %s\n' "${reset_at:-unknown}"
+  printf -- '- source: %s\n' "${source:-unknown}"
+  printf -- '- triggering_agent: %s\n' "${worst_case_agent:-unknown}"
+  printf -- '- rotation_result: skipped:%s\n\n' "${rotation_reason:-no_alternate_token}"
+  printf 'Why this matters:\n'
+  printf 'The 7-day Claude usage window crossed the proactive threshold, but automatic rotation could not continue because the enabled token pool has no alternate token. If this is not fixed before the reset, Claude cron workers and interactive sessions can start failing with quota errors.\n\n'
+  printf 'Operator action:\n'
+  printf '1. Create or obtain a fresh Claude OAuth setup token outside Agent Bridge.\n'
+  printf '2. Register and activate it on the controller:\n'
+  printf '   `agb auth claude-token add --id <new-token-id> --stdin --activate --sync`\n'
+  printf '3. Confirm the pool has an active alternate:\n'
+  printf '   `agb auth claude-token list`\n\n'
+  printf 'This task is upserted by title prefix and the usage monitor also latches per reset cycle, so it should not repeat every daemon tick.\n'
+}
+
+bridge_file_claude_weekly_quota_task() {
+  local admin_agent="${1:-}"
+  local provider="${2:-claude}"
+  local account="${3:-}"
+  local window="${4:-}"
+  local used_percent="${5:-}"
+  local reset_at="${6:-}"
+  local source="${7:-}"
+  local worst_case_agent="${8:-}"
+  local rotation_reason="${9:-}"
+  local body_file="" title="" title_prefix="" output="" task_dir=""
+
+  [[ -n "$admin_agent" ]] || return 1
+  [[ "$window" == "weekly" ]] || return 1
+  [[ "$rotation_reason" == "no_alternate_token" ]] || return 1
+
+  task_dir="${BRIDGE_SHARED_DIR:-${TMPDIR:-/tmp}}"
+  mkdir -p "$task_dir" >/dev/null 2>&1 || true
+  body_file="$(mktemp "${task_dir%/}/claude-quota-weekly.XXXXXX")" || return 1
+  bridge_claude_weekly_quota_task_body \
+    "$provider" "$account" "$used_percent" "$reset_at" "$source" "$worst_case_agent" "$rotation_reason" \
+    >"$body_file"
+
+  title_prefix="[claude-quota] weekly usage"
+  title="[claude-quota] weekly usage ${used_percent:-unknown}% - new Claude token needed"
+  output="$(bridge_queue_cli upsert-open \
+    --to "$admin_agent" \
+    --from daemon \
+    --priority high \
+    --title-prefix "$title_prefix" \
+    --title "$title" \
+    --body-file "$body_file" \
+    --format shell 2>/dev/null || true)"
+  rm -f "$body_file"
+  if [[ -n "$output" ]]; then
+    bridge_audit_log daemon claude_weekly_quota_no_alternate "$admin_agent" \
+      --detail provider="$provider" \
+      --detail account="$account" \
+      --detail used_percent="$used_percent" \
+      --detail reset_at="$reset_at" \
+      --detail source="$source" \
+      --detail worst_case_agent="$worst_case_agent"
+    return 0
+  fi
+  return 1
+}
+
 bridge_write_release_alert_body() {
   local body_file="$1"
   local monitor_json="$2"
@@ -2162,6 +2238,11 @@ process_usage_monitor() {
         title="claude token rotation needs attention"
         body="Claude usage reached ${used_percent}% for ${window}, but token rotation did not complete (${rotation_status:-unknown}${rotation_reason:+: $rotation_reason})."
         priority="high"
+        if [[ "$window" == "weekly" && "$rotation_status" == "skipped" && "$rotation_reason" == "no_alternate_token" ]]; then
+          bridge_file_claude_weekly_quota_task \
+            "$admin_agent" "$provider" "$account" "$window" "$used_percent" "$reset_at" "$source" "$worst_case_agent" "$rotation_reason" \
+            >/dev/null 2>&1 || true
+        fi
         ;;
       *)
         title=""
@@ -12105,9 +12186,16 @@ bridge_start_queue_gateway_socket_listener() {
   log_file="$(bridge_queue_gateway_socket_log_file)"
   socket_path="$(bridge_queue_gateway_socket_path)"
 
-  BRIDGE_QUEUE_GATEWAY_SERVER=1 python3 "$SCRIPT_DIR/bridge-queue-gateway.py" socket-server \
-    --bridge-home "$BRIDGE_HOME" \
-    --queue-script "$SCRIPT_DIR/bridge-queue.py" >>"$log_file" 2>&1 &
+  if [[ "${BRIDGE_DAEMON_SINGLETON_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
+    BRIDGE_QUEUE_GATEWAY_SERVER=1 python3 "$SCRIPT_DIR/bridge-queue-gateway.py" socket-server \
+      --bridge-home "$BRIDGE_HOME" \
+      --queue-script "$SCRIPT_DIR/bridge-queue.py" \
+      {BRIDGE_DAEMON_SINGLETON_LOCK_FD}>&- >>"$log_file" 2>&1 &
+  else
+    BRIDGE_QUEUE_GATEWAY_SERVER=1 python3 "$SCRIPT_DIR/bridge-queue-gateway.py" socket-server \
+      --bridge-home "$BRIDGE_HOME" \
+      --queue-script "$SCRIPT_DIR/bridge-queue.py" >>"$log_file" 2>&1 &
+  fi
   pid="$!"
   printf '%s\n' "$pid" >"$pid_file"
 

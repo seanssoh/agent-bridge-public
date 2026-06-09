@@ -420,6 +420,7 @@ def default_registry() -> dict[str, Any]:
         "active_token_id": "",
         "auto_rotate_enabled": False,
         "rotation_threshold": 99.0,
+        "weekly_warn_threshold": 95.0,
         "tokens": [],
         "last_rotation": {},
     }
@@ -600,6 +601,7 @@ def public_registry(registry: dict[str, Any]) -> dict[str, Any]:
         "active_token_id": active_id,
         "auto_rotate_enabled": bool(registry.get("auto_rotate_enabled", False)),
         "rotation_threshold": float(registry.get("rotation_threshold") or 99.0),
+        "weekly_warn_threshold": float(registry.get("weekly_warn_threshold") or 95.0),
         "tokens": [public_token_row(row, active_id) for row in token_rows(registry)],
         "last_rotation": registry.get("last_rotation") or {},
     }
@@ -808,6 +810,7 @@ def _apply_token_to_registry(
     replace: bool = False,
     enable_auto_rotate: bool = False,
     threshold: float | None = None,
+    weekly_warn_threshold: float | None = None,
 ) -> dict[str, Any]:
     """Write *token* into the locked registry under *token_id*.
 
@@ -853,6 +856,8 @@ def _apply_token_to_registry(
             registry["auto_rotate_enabled"] = True
         if threshold is not None:
             registry["rotation_threshold"] = validate_threshold(threshold)
+        if weekly_warn_threshold is not None:
+            registry["weekly_warn_threshold"] = validate_threshold(weekly_warn_threshold)
 
         save_registry(registry_path, registry)
 
@@ -887,6 +892,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             replace=bool(args.replace),
             enable_auto_rotate=bool(args.enable_auto_rotate),
             threshold=args.threshold,
+            weekly_warn_threshold=args.weekly_warn_threshold,
         )
     except Exception as exc:
         return fail(str(exc), json_mode)
@@ -911,6 +917,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     print(f"active_token_id: {payload['active_token_id'] or '-'}")
     print(f"auto_rotate_enabled: {'yes' if payload['auto_rotate_enabled'] else 'no'}")
     print(f"rotation_threshold: {payload['rotation_threshold']:.0f}%")
+    print(f"weekly_warn_threshold: {payload['weekly_warn_threshold']:.0f}%")
     for row in payload["tokens"]:
         active = "*" if row["active"] else " "
         enabled = "enabled" if row["enabled"] else "disabled"
@@ -1343,6 +1350,10 @@ def cmd_auto_rotate(args: argparse.Namespace) -> int:
                     registry["auto_rotate_enabled"] = True
                     if args.threshold is not None:
                         registry["rotation_threshold"] = validate_threshold(args.threshold)
+                    if getattr(args, "weekly_warn_threshold", None) is not None:
+                        registry["weekly_warn_threshold"] = validate_threshold(
+                            args.weekly_warn_threshold
+                        )
                 else:
                     registry["auto_rotate_enabled"] = False
                 save_registry(registry_path, registry)
@@ -1356,6 +1367,7 @@ def cmd_auto_rotate(args: argparse.Namespace) -> int:
         "status": "ok",
         "auto_rotate_enabled": bool(registry.get("auto_rotate_enabled", False)),
         "rotation_threshold": float(registry.get("rotation_threshold") or 99.0),
+        "weekly_warn_threshold": float(registry.get("weekly_warn_threshold") or 95.0),
         "active_token_id": registry.get("active_token_id") or "",
         "enabled_token_count": len(enabled_token_ids(registry)),
     }
@@ -1364,6 +1376,7 @@ def cmd_auto_rotate(args: argparse.Namespace) -> int:
     else:
         print(f"auto_rotate_enabled: {'yes' if payload['auto_rotate_enabled'] else 'no'}")
         print(f"rotation_threshold: {payload['rotation_threshold']:.0f}%")
+        print(f"weekly_warn_threshold: {payload['weekly_warn_threshold']:.0f}%")
         print(f"enabled_token_count: {payload['enabled_token_count']}")
     return 0
 
@@ -3274,26 +3287,10 @@ def _write_sealed_request_record(
     registry_path: Path, record: dict[str, Any]
 ) -> Path:
     request_dir = sealed_request_dir(registry_path)
-    request_dir.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only - controller secrets-dir sibling of the registry
-    os.chmod(request_dir, 0o700)
+    request_dir.mkdir(mode=0o700, parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only - controller secrets-dir sibling of the registry
     path = request_dir / f"{record['request_id']}.json"
     text = json.dumps(record, ensure_ascii=True, indent=2) + "\n"
-    fd, tmp_name = tempfile.mkstemp(prefix=".sealed-req.", suffix=".tmp", dir=str(request_dir))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, path)
-        os.chmod(path, 0o600)
-        tmp_name = ""
-    finally:
-        if tmp_name:
-            try:
-                os.unlink(tmp_name)  # noqa: raw-pathlib-controller-only - controller-side tempfile cleanup in the secrets dir
-            except FileNotFoundError:
-                pass
+    write_private_file_atomic(path, text, mode=0o600, prefix=".sealed-req.")
     return path
 
 
@@ -3415,6 +3412,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser.add_argument("--note", default="")
     add_parser.add_argument("--enable-auto-rotate", action="store_true")
     add_parser.add_argument("--threshold", type=float)
+    add_parser.add_argument("--weekly-warn-threshold", type=float, dest="weekly_warn_threshold")
     add_parser.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)
     add_parser.add_argument("--agents", help=argparse.SUPPRESS)
     add_parser.add_argument("--json", action="store_true")
@@ -3499,6 +3497,8 @@ def build_parser() -> argparse.ArgumentParser:
     auto_parser = sub.add_parser("auto-rotate")
     auto_parser.add_argument("action", choices=("enable", "disable", "status"))
     auto_parser.add_argument("--threshold", type=float)
+    # Set the weekly preemptive warn threshold alongside rotation_threshold.
+    auto_parser.add_argument("--weekly-warn-threshold", type=float, dest="weekly_warn_threshold")
     auto_parser.add_argument("--json", action="store_true")
     auto_parser.set_defaults(handler=cmd_auto_rotate)
 
