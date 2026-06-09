@@ -23,6 +23,11 @@ does not duplicate it.
 > single-leader rooms with invite/join/approve, leader roster-broadcast, and
 > multi-node delivery for both 1:1 and room-scoped messages. Treat rooms as an
 > internal-team OR cross-bridge boundary.
+>
+> **As of `v0.16.5` the multi-node mesh is self-healing** — a reconcile
+> control-loop on the daemon tick converges actual network state toward desired
+> membership without operator intervention. See
+> [Zero-touch mesh](#zero-touch-mesh--the-reconcile-control-loop-v0165) below.
 
 The CLI is `agb room <verb>` (equivalently `agent-bridge room <verb>`). All
 verbs accept `--json` for machine-readable output; mutating verbs accept `--as`
@@ -265,6 +270,117 @@ yet part of the live-mesh verification above):
 
 - **Cloudflare Zero Trust transport** — only the Tailscale transport is exercised
   on the live mesh; the transport-negotiation seam exists but ZT is unverified.
+
+---
+
+## Zero-touch mesh — the reconcile control-loop (`v0.16.5`)
+
+As of `v0.16.5` the multi-node mesh is **self-healing**. The single human input
+is the **desired state** — room membership (set with the `agb room` verbs above)
+plus the per-node transport config. Everything else — each node's reachable
+address, tunnel health, peer reachability, and the applied roster epoch — is the
+*actual state* the system continuously drives back toward desired, the way a
+Kubernetes controller reconciles a deployment.
+
+### How it works
+
+A **reconcile control-loop** runs on the handoff daemon's tick. On each pass it
+compares the desired state (membership + transport config) against the observed
+actual state and, where they diverge, runs a small finite-state-machine step to
+converge them. Steps are **idempotent** and use **durable backoff** — a step that
+can't complete (peer down, tunnel flapping) is retried with growing delay,
+persisted in `reconcile.db`, so a transient fault doesn't wedge the loop and a
+recovered peer rejoins without operator action. The loop never *creates*
+membership; it only enacts the membership you set with `agb room`.
+
+### The three self-heal adapters
+
+Convergence work that is transport-specific lives behind three per-transport
+adapters, so the control-loop logic itself stays transport-agnostic:
+
+- **Stable-address adapter (#1705)** — acquires/re-acquires this node's stable
+  reachable address via the active transport, so peers can always find it after a
+  re-tunnel or address change.
+- **Tunnel-health adapter (#1706)** — probes the transport tunnel and bounces it
+  when the handshake goes stale, restoring connectivity without a manual restart.
+- **Peer-reachability adapter (#1707)** — tracks which peers are actually
+  reachable and feeds that FSM state back into the loop (and into `net-status`),
+  driving retries for peers that have gone dark.
+
+### Token-bootstrap room join, leader-relay, roster anti-entropy (#1695)
+
+- **Token-bootstrap join (P1)** — a new node joins a room straight from a room
+  token: only `sha256(token)` crosses the wire, an HKDF-derived per-pair key
+  secures the pair channel, and the existing **two-factor admission** still
+  applies (the token gets you *to* the leader; the leader's approval *admits*).
+  A leaked token alone still does not grant membership.
+- **Leader-relay (P2)** — the leader relays member↔member traffic, so members
+  that can each reach the leader can exchange messages without a direct
+  member-to-member tunnel.
+- **Roster anti-entropy (P2)** — member nodes converge on the leader's canonical
+  roster epoch automatically; a node that missed a membership change catches up
+  on the next reconcile pass instead of drifting.
+
+### `agb a2a net-status` — the control-loop status window (v2, #1708)
+
+`agb a2a net-status` (alias `agb a2a status`) is the **read-only** window into
+the mesh control-loop. It is **active-transport-only**, performs **zero state
+mutation** (it never creates or writes `rooms.db` / `reconcile.db`; it opens
+reconcile state read-only), prints **no secrets**, and emits **stable JSON** with
+`--json`. v2 surfaces, on top of the v1 fields:
+
+- **bridge_id / transport / listen addr** — this node's identity and active
+  transport.
+- **receiver healthz** — reuses the #1701-hardened liveness path (a socket-held
+  WARP-mesh receiver reads healthy).
+- **substrate health** — the transport tunnel's own health.
+- **reconcile FSM step state** — per-step last result + pending-retry counts for
+  the stable-address, tunnel-health, and peer-reachability steps, so you can see
+  what the loop is currently working on.
+- **peers + room membership** — the reachable peer set and this node's room
+  roster view.
+
+```bash
+agb a2a net-status            # human-readable mesh status
+agb a2a net-status --json     # stable JSON for scripting / cron
+agb a2a status                # ergonomic alias
+```
+
+Use it as the first stop when a peer looks unreachable: the reconcile step state
+tells you whether the loop has already detected the problem and is retrying
+(usually it has — zero-touch), or whether the desired membership/transport config
+itself is wrong (operator input).
+
+### ★ Local test mesh isolation — override `BRIDGE_STATE_DIR`, not just `BRIDGE_HOME`
+
+> **Stand up a local multi-node test mesh and you can clobber the LIVE
+> `state/handoff/rooms.db` if you only override `BRIDGE_HOME`.** This is the
+> single most important gotcha when testing the mesh locally (finding #1728).
+
+The A2A handoff working directory is resolved as
+`$BRIDGE_STATE_DIR/handoff` — `handoff_dir()` consults **`BRIDGE_STATE_DIR`
+first** and only falls back to `BRIDGE_HOME/state` when `BRIDGE_STATE_DIR` is
+**unset**. So if your live environment exports `BRIDGE_STATE_DIR` (most do), a
+test node that overrides only `BRIDGE_HOME` will still write its rooms /
+reconcile / inbox / outbox state into the **live** `state/handoff/`, corrupting
+or churning the real `rooms.db`.
+
+To isolate a local test mesh, point **all** of these at your test home — not just
+`BRIDGE_HOME`:
+
+```bash
+export BRIDGE_HOME="$TEST_HOME"
+export BRIDGE_STATE_DIR="$TEST_HOME/state"          # the one that actually wins
+export BRIDGE_A2A_ROOMS_DB="$TEST_HOME/state/handoff/rooms.db"
+export BRIDGE_A2A_RECONCILE_DB="$TEST_HOME/state/handoff/reconcile.db"
+export BRIDGE_A2A_INBOX_DB="$TEST_HOME/state/handoff/inbox.db"
+export BRIDGE_A2A_OUTBOX_DB="$TEST_HOME/state/handoff/outbox.db"
+```
+
+(Each `BRIDGE_A2A_*_DB` also has an individual override that wins over the
+derived path, so setting them explicitly is belt-and-suspenders against any one
+of them leaking back to the live tree.) Reference issue **#1728**; a guard that
+refuses to run a test mesh against the live state dir is planned for `v0.16.6`.
 
 ---
 
