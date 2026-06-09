@@ -379,6 +379,15 @@ assert_verdict "quote-split relative"      "cd \$BRIDGE_HOME/shared && cat sec''
 assert_verdict "B peer ansic relative"     "cd \$BRIDGE_HOME/agents && cat \$'$PEER_AGENT'/MEMORY.md" "DENY"
 assert_verdict "obf under cd-fail sticky"  "cd \$BRIDGE_HOME/shared && cd /nx; cat sec*ets/token" "DENY"
 assert_verdict "ansic in abs bridge path"  "cat \$BRIDGE_HOME/shared/\$'secrets'/token"          "DENY"
+# r13 (codex #11837) — an EQUAL-depth glob that selects the protected dir ITSELF
+# enumerates it via ls/find/grep -r (the guard is command-agnostic, so `cat *`
+# denies too). The fnmatch is precise: a glob that does NOT match the forbidden
+# dir name (e.g. `*.md`) stays ALLOW.
+assert_verdict "ls glob enum dir"          "cd \$BRIDGE_HOME/shared && ls sec*ets"               "DENY"
+assert_verdict "ls star enum dirs"         "cd \$BRIDGE_HOME/shared && ls *"                     "DENY"
+assert_verdict "find glob enum dir"        "cd \$BRIDGE_HOME/shared && find sec*ets -maxdepth 1 -type f -print" "DENY"
+assert_verdict "cat star selects secret"   "cd \$BRIDGE_HOME/shared && cat *"                    "DENY"
+assert_verdict "B peer ls glob enum"       "cd \$BRIDGE_HOME/agents && ls $PEER_AGENT*"          "DENY"
 
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
@@ -416,8 +425,8 @@ assert_verdict "ansic read no cd"          "cat \$'secrets'/token"              
 assert_verdict "glob read no cd"           "cat sec*ets/token"                                  "ALLOW"
 assert_verdict "ansic read cd /tmp"        "cd /tmp && cat \$'secrets'/token"                   "ALLOW"
 assert_verdict "glob read cd /tmp"         "cd /tmp && cat sec*ets/token"                       "ALLOW"
-assert_verdict "cat star lists dir"        "cd \$BRIDGE_HOME/shared && cat *"                    "ALLOW"
 assert_verdict "public wiki glob"          "cd \$BRIDGE_HOME/shared && cat wiki/*.md"           "ALLOW"
+assert_verdict "ext-only glob no match"    "cd \$BRIDGE_HOME/shared && cat *.md"                "ALLOW"
 assert_verdict "gated cd-out glob read"    "cd \$BRIDGE_HOME/shared && cd /tmp && cat sec*ets/token" "ALLOW"
 assert_verdict "gated cd-out ansic read"   "cd \$BRIDGE_HOME/shared && cd /tmp && cat \$'secrets'/token" "ALLOW"
 # r3 no-over-block — the resolution model must NOT collateral-block these:

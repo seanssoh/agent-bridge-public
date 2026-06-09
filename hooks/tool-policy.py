@@ -3408,10 +3408,14 @@ def _glob_word_hits_forbidden(
     Unlike :func:`_glob_prefix_reaches_forbidden_dir` (bridge-ANCHORED absolute
     word only), this resolves a RELATIVE glob against the cwd the read runs in,
     then component-wise ``fnmatch``-checks whether the pattern's leading
-    components can match the forbidden dir AND the pattern descends deeper (reads
-    a file strictly inside it). That deeper-than requirement keeps ``cat *`` (which
-    only lists the parent, not the secret leaf) ALLOW while ``cat */token`` /
-    ``cat sec*ets/token`` fail closed."""
+    components can match the forbidden dir. A glob that selects the protected
+    directory ITSELF (equal depth) fails closed too — the guard is
+    command-AGNOSTIC, and while ``cat sec*ets`` only errors on a directory, an
+    ``ls``/``find``/``grep -r`` of the same glob ENUMERATES the protected tree
+    (codex #11837 r12; consistent with the Stage-A ``ls …/private`` directory
+    -reference contract). A shorter pattern that cannot even reach the forbidden
+    dir's depth, or a component that does not ``fnmatch`` the forbidden name
+    (``cat *.md`` under ``shared`` → no match on ``secrets``), is NOT denied."""
     if not any(ch in _OBFUSCATION_GLOB_CHARS for ch in word) \
             and "`" not in word and "$(" not in word:
         return None  # not a glob / command-sub word
@@ -3437,10 +3441,11 @@ def _glob_word_hits_forbidden(
     pat_parts = pattern.split(os.sep)
     for abs_dir, suffix in forbidden_dirs:
         dir_parts = abs_dir.split(os.sep)
-        if len(pat_parts) <= len(dir_parts):
-            # The pattern is not deep enough to read a file strictly INSIDE the
-            # forbidden dir (it could at most name the dir itself, e.g. `cat *`).
+        if len(pat_parts) < len(dir_parts):
+            # The pattern is too shallow to even name the forbidden dir.
             continue
+        # Equal depth → the glob selects the protected dir itself (ls/find
+        # enumerate it); deeper → it reads a file strictly inside. Both leak.
         if all(fnmatch.fnmatch(dp, pp) for pp, dp in zip(pat_parts, dir_parts)):
             return suffix
     return None
