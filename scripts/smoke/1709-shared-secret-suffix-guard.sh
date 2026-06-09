@@ -264,6 +264,24 @@ assert_verdict "B peer dot-component"    "cat \$BRIDGE_HOME/agents/./$PEER_AGENT
 assert_verdict "B peer cd-relative"      "cd \$BRIDGE_HOME && cat agents/$PEER_AGENT/MEMORY.md" "DENY"
 
 # ---------------------------------------------------------------------------
+# r3 (codex #11772 + patch #11773) — PATH-RESOLUTION vectors a literal-suffix
+# text scan structurally cannot model: `..` parent-traversal past an existing
+# public sibling, accumulated cwd depth from `cd` into a SUBDIR, multi-step
+# `cd`, and `cd`-subdir + `..`. These all RESOLVE into the forbidden tree and
+# must DENY (both stages). Modeled by folding `cd` targets into an effective
+# cwd + `os.path.normpath`-resolving each read word, not by spelling-matching.
+# ---------------------------------------------------------------------------
+assert_verdict "A secrets .. via sibling" "cat \$BRIDGE_HOME/shared/wiki/../secrets/token"     "DENY"
+assert_verdict "A secrets cd-subdir"      "cd \$BRIDGE_HOME/shared && cat secrets/token"       "DENY"
+assert_verdict "A secrets cd-subdir + .." "cd \$BRIDGE_HOME/shared/wiki && cat ../secrets/token" "DENY"
+assert_verdict "A secrets cd-rel + .."    "cd \$BRIDGE_HOME && cat shared/wiki/../secrets/token" "DENY"
+assert_verdict "A secrets multi-cd"       "cd \$BRIDGE_HOME; cd shared; cat secrets/token"     "DENY"
+assert_verdict "A private cd-subdir"      "cd \$BRIDGE_HOME/shared && grep x private/ops.md"   "DENY"
+assert_verdict "B peer .. via peer"       "cat \$BRIDGE_HOME/agents/$PEER_AGENT/../$PEER_AGENT/MEMORY.md" "DENY"
+assert_verdict "B peer cd-subdir"         "cd \$BRIDGE_HOME/agents && cat $PEER_AGENT/MEMORY.md" "DENY"
+assert_verdict "B peer multi-cd"          "cd \$BRIDGE_HOME; cd agents; cat $PEER_AGENT/MEMORY.md" "DENY"
+
+# ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
 # ---------------------------------------------------------------------------
 assert_verdict "own home read"          "cat $ABS/agents/$USER_AGENT/MEMORY.md"          "ALLOW"
@@ -272,6 +290,14 @@ assert_verdict "public wiki \${HOME}"   "cat \${HOME}/.agent-bridge/shared/wiki/
 assert_verdict "repo-style glob"        "cat ./agents/*.md"                              "ALLOW"
 assert_verdict "non-forbidden bridge read" "cat \${HOME}/.agent-bridge/state/x.md"       "ALLOW"
 assert_verdict "cd-relative public wiki" "cd \$BRIDGE_HOME && cat shared/wiki/index.md"   "ALLOW"
+# r3 no-over-block — the resolution model must NOT collateral-block these:
+#   a RELATIVE forbidden-tail read with NO `cd` (relative to the agent's own
+#   cwd, which the hook can't see → unanchorable, not bridge), and a `..` that
+#   escapes back OUT of the forbidden tree (resolves to a public sibling).
+assert_verdict "rel forbidden-tail no cd" "cat shared/secrets/token"                      "ALLOW"
+assert_verdict "rel peer-tail no cd"      "cat agents/$PEER_AGENT/MEMORY.md"              "ALLOW"
+assert_verdict "escape out via .."        "cat \$BRIDGE_HOME/shared/secrets/../wiki/index.md" "ALLOW"
+assert_verdict "own-workdir relative"     "cat notes/todo.md"                             "ALLOW"
 
 # ---------------------------------------------------------------------------
 # Revert-teeth — the brace / $BRIDGE_HOME / ANSI-C cases FLIP TO ALLOW when
@@ -282,5 +308,8 @@ assert_revert_allow "A secrets \$BRIDGE_HOME"  "cat \$BRIDGE_HOME/shared/secrets
 assert_revert_allow "A secrets ANSI-C hex"     "cat \$HOME/.agent-bridge/shared/\$'\\x73ecrets'/token"
 assert_revert_allow "B peer \${HOME}"          "cat \${HOME}/.agent-bridge/agents/$PEER_AGENT/MEMORY.md"
 assert_revert_allow "B peer \$BRIDGE_HOME"     "cat \$BRIDGE_HOME/agents/$PEER_AGENT/MEMORY.md"
+# r3 path-resolution vectors flip to ALLOW without the suffix-deny blocks too.
+assert_revert_allow "A secrets .. via sibling" "cat \$BRIDGE_HOME/shared/wiki/../secrets/token"
+assert_revert_allow "A secrets cd-subdir"      "cd \$BRIDGE_HOME/shared && cat secrets/token"
 
 smoke_log "passed"

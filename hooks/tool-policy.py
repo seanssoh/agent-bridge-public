@@ -2537,22 +2537,27 @@ def _shared_forbidden_aliases() -> list[str]:
     return aliases
 
 
-# Issue #1709 — prefix-spelling-agnostic forbidden-suffix matcher.
+# Issue #1709 — resolved-PATH forbidden-tree matcher (r3 path-modeling).
 #
 # The enumerated alias lists above are a substring blacklist over a FIXED
 # set of prefix spellings (absolute / `~` / `$HOME`). They miss the brace
 # form `${HOME}`, `$BRIDGE_HOME`, `${BRIDGE_HOME}`, and any future env-var
 # prefix — a HIGH confidentiality bypass for a non-admin secret/private
-# read. Statically deciding "does this shell word resolve to a forbidden
-# path?" is undecidable in general (the prefix can be any expansion), but
-# the *suffix* is invariant: every spelling of the team-shared secret tree
-# ends in `/shared/secrets`, every peer home ends in `/agents/<name>`. So
-# we match on the forbidden SUFFIX regardless of how the prefix is spelled,
-# and we fail CLOSED when a path-candidate word carries shell
-# expansion/encoding that could hide such a suffix at runtime (ANSI-C
-# `$'…'`, glob, backslash escape, command substitution). This is the
-# whitelist + suffix-match + fail-close stance the issue mandates over yet
-# another blacklist spelling.
+# read. r1/r2 closed prefix spellings + `//`/`/./`/backslash/cd-relative by
+# normalizing the TEXT and re-scanning for the forbidden SUFFIX, but a text
+# scan structurally cannot model the path RESOLUTION bash performs: `..`
+# parent-traversal and cwd depth accumulated across `cd`s kept leaking
+# (`shared/wiki/../secrets`, `cd shared && cat secrets/token`). r3 pivots to
+# MODELING the path — fold literal `cd`/`pushd` targets into an effective
+# cwd, resolve each read-candidate word (expand the bridge-known prefixes,
+# decode the bash literals, `os.path.normpath` to fold `..`/`//`/`/./`), and
+# DENY when the RESOLVED absolute path is — or sits under — a forbidden tree
+# derived from the SAME SSOTs (`_SHARED_FORBIDDEN_PREFIXES` / per-peer
+# `/agents/<name>`). One sound check closes every spelling AND every
+# traversal form. Obfuscation / unresolvable words still fail CLOSED.
+# Symlink-through + `$var` indirection are out of static scope (class-(b));
+# the TRUE read boundary is FS perms (iso-v2 group ownership) — this hook is
+# defense-in-depth. See `_forbidden_suffix_in_command` for the full model.
 
 # Glob / wildcard chars that let a word expand to a forbidden path at
 # runtime without the literal suffix ever appearing in the command text.
@@ -2670,166 +2675,306 @@ def _word_carries_obfuscation(word: str) -> bool:
     return False
 
 
-def _collapse_path_separators(text: str) -> str:
-    """Collapse the redundant separators the shell resolver ignores — runs of
-    ``/`` → ``/`` and ``/./`` → ``/`` — so the literal forbidden-suffix scan
-    cannot be evaded by ``shared//secrets`` / ``shared///secrets`` /
-    ``shared/./secrets`` (patch r2 #1709; mirrors the set-env line-continuation
-    normalization). Applied ONLY to the text handed to the suffix scan — the
-    executed command is never mutated. Loops to a fixed point so interleaved
-    forms (``//./``) fully reduce.
+# ---------------------------------------------------------------------------
+# Issue #1709 r3 — PATH-MODELING core (replaces the r1/r2 spelling-match).
+#
+# r1/r2 normalized ever-more bash path SPELLINGS (brace/`$BRIDGE_HOME`,
+# `//`/`/./`, backslash `\X`→`X`, cd-relative) and re-ran a literal forbidden-
+# SUFFIX text scan. Both reviewers (codex #11772, patch #11773) proved each
+# round still leaked via the NEXT resolution form bash performs but a text
+# scan cannot model — `..` parent-traversal and cwd depth accumulated across
+# `cd`s:
+#     cat $BRIDGE_HOME/shared/wiki/../secrets/token     # `..` past a sibling
+#     cd $BRIDGE_HOME/shared && cat secrets/token        # cd into a SUBDIR
+#     cd $BRIDGE_HOME; cd shared; cat secrets/token       # multi-step cd depth
+# A literal-suffix scan structurally cannot fold `..` or track accumulated cwd.
+#
+# The pivot: MODEL the path the way the kernel resolves it, then test the
+# RESOLVED absolute path for containment in a forbidden tree — one sound check
+# that closes `..`, cwd-depth, multi-`cd`, and every separator/`.`-segment
+# form at once. We:
+#   1. fold the command's literal `cd`/`pushd` targets left-to-right into an
+#      effective cwd (absolute, or UNKNOWN when it can't be anchored);
+#   2. for each read-candidate word, expand the bridge-known prefixes
+#      (`~`/`$HOME`/`${HOME}`/`$BRIDGE_HOME`/`${BRIDGE_HOME}`) and decode the
+#      already-handled bash literals (ANSI-C `$'…'`, ordinary backslash
+#      `\X`→`X`), join under the effective cwd if relative, and
+#      `os.path.normpath` — which folds `..`, `//`, `/./`;
+#   3. DENY when the resolved absolute path is the forbidden dir or sits
+#      under it (`== d or startswith(d + os.sep)`).
+# Obfuscation/unresolvable words still fail closed (Pass 2, unchanged model).
+#
+# Soundness boundary (class-(b), NOT claimed closed by this text analysis):
+#   - SYMLINK-through: lexical `os.path.normpath` folds `..` purely on the
+#     string; through a SYMLINKED component the kernel resolves differently,
+#     so a `..` that crosses a symlink is unsound here. This is runtime FS
+#     state a static hook cannot see.
+#   - `$var` cd-target / read-prefix the hook cannot resolve (only HOME +
+#     BRIDGE_HOME are known): fail closed when bridge-anchored-suspect (a `cd`
+#     into an unresolved `$var` POISONS the cwd so a later relative read of a
+#     forbidden tail denies), otherwise left to the agent's own cwd — we do
+#     NOT over-block a `$var` relative to the agent's real workdir.
+#   - eval / `bash -c` / `$()` command-sub indirection: #341 / #1738.
+# The TRUE confidentiality boundary for a read is FILESYSTEM PERMISSIONS — on
+# an iso-v2 install `shared/secrets` is group-owned and unreadable by a
+# non-admin UID regardless of how the path is spelled. This hook is
+# DEFENSE-IN-DEPTH over the static-path class; symlink-through and
+# var-indirection are covered by FS perms, not by this text analysis.
+# ---------------------------------------------------------------------------
+
+# Effective-cwd sentinels. `_CWD_UNKNOWN` = the agent's real cwd, which the
+# hook cannot see (a relative read here is relative to the agent's own
+# workdir → not anchorable under the bridge → not over-blocked).
+# `_CWD_POISONED` = a `cd` into an expression that COULD resolve to the bridge
+# home but the hook can't prove it (an unresolved `$var`) — a later relative
+# read of a forbidden tail under it fails closed.
+_CWD_UNKNOWN = None
+_CWD_POISONED = "\x00POISONED\x00"
+
+
+def _expand_bridge_prefixes(word: str) -> str:
+    """Expand ONLY the bridge-known location prefixes in *word* — ``~`` /
+    ``$HOME`` / ``${HOME}`` → the home dir, ``$BRIDGE_HOME`` / ``${BRIDGE_HOME}``
+    → the operator bridge home — and leave every OTHER ``$var`` literal.
+
+    Deliberately does NOT call :func:`os.path.expandvars`, which would leak
+    arbitrary ``os.environ`` into the resolved path (a security-sensitive
+    over-reach: an attacker-influenced env var could re-spell a benign word
+    into the secret tree, or mask a real one). Only ``HOME`` and ``BRIDGE_HOME``
+    are trusted location anchors. A surviving ``$`` in the result signals an
+    unresolved expansion the caller must treat as fail-closed-where-suspect.
     """
-    prev = None
-    out = text
-    while prev != out:
-        prev = out
-        out = re.sub(r"/{2,}", "/", out)
-        out = out.replace("/./", "/")
+    try:
+        home = str(bridge_home_dir())
+    except Exception:  # noqa: BLE001 — bridge home unresolved → expand only ~
+        home = ""
+    out = word
+    if out.startswith("~"):
+        out = os.path.expanduser(out)
+    # Brace forms are unambiguous; the bare `$NAME` forms must NOT swallow a
+    # longer var name (`$HOMEDIR` is not `$HOME`), so the bare form is only
+    # replaced when followed by a non-identifier char (`/`, end, etc.).
+    if home:
+        out = out.replace("${BRIDGE_HOME}", home)
+        out = re.sub(r"\$BRIDGE_HOME(?![A-Za-z0-9_])", lambda _m: home, out)
+    home_dir = os.path.expanduser("~")
+    if home_dir and home_dir != "~":
+        out = out.replace("${HOME}", home_dir)
+        out = re.sub(r"\$HOME(?![A-Za-z0-9_])", lambda _m: home_dir, out)
     return out
 
 
-_CD_RE = re.compile(r"(?:^|[;&|()]|\s)(?:cd|pushd)\s+([^\s;&|()<>]+)")
+_CD_RE = re.compile(r"(?:cd|pushd)\s+([^\s;&|()<>]+)")
 
 
-def _command_cd_targets_bridge_anchor(text: str) -> bool:
-    """True iff the command ``cd``/``pushd``-es into a bridge-anchored directory,
-    after which a RELATIVE read (no leading ``/``) reaches the forbidden tree
-    (patch r2 #1709 cwd-relative vector). Detects ``cd $BRIDGE_HOME`` /
-    ``${BRIDGE_HOME}`` / ``~/.agent-bridge`` / the absolute home and any dir
-    under them. Conservative: a target we cannot resolve to a non-bridge path
-    is not treated as an anchor (the relative scan it gates is itself bounded).
+def _command_effective_cwd(segments: list[str]) -> object:
+    """Fold the literal ``cd``/``pushd`` targets across the command *segments*
+    (already split on ``;`` / ``&&`` / ``||`` / ``|`` / ``(`` / ``)``) into an
+    effective cwd, returning an ABSOLUTE normalized path, ``_CWD_UNKNOWN`` (the
+    agent's real cwd — unanchorable), or ``_CWD_POISONED`` (a bridge-suspect
+    ``cd`` into an unresolved expression).
+
+    Rules (issue #1709 r3):
+      - ``cd <abs>`` where the target expands to a concrete absolute path
+        (``$HOME``/``${HOME}``/``~``/``$BRIDGE_HOME``/``${BRIDGE_HOME}``/literal
+        abs) → eff_cwd = ``normpath(<abs>)``.
+      - ``cd <rel>`` when eff_cwd is a known absolute path →
+        eff_cwd = ``normpath(join(eff_cwd, <rel>))`` (folds ``..`` / ``.``).
+      - ``cd <rel>`` when eff_cwd is UNKNOWN → stays UNKNOWN (can't anchor a
+        relative move with no base — it is relative to the agent's own cwd).
+      - ``cd <expr>`` that still carries an unresolved ``$var`` after
+        bridge-prefix expansion → POISONED (could be the bridge home; a later
+        relative forbidden read under it fails closed).
+    The cwd does NOT change for segments without a leading ``cd``/``pushd``.
+    """
+    eff: object = _CWD_UNKNOWN
+    for seg in segments:
+        stripped = seg.strip()
+        match = _CD_RE.match(stripped)
+        if not match:
+            continue
+        target = match.group(1).strip("'\"")
+        expanded = _expand_bridge_prefixes(target)
+        if "$" in expanded:
+            # Unresolved $var cd-target → bridge-suspect, poison the cwd.
+            eff = _CWD_POISONED
+            continue
+        if os.path.isabs(expanded):
+            eff = os.path.normpath(expanded)
+        elif eff is _CWD_POISONED:
+            # Relative move under an already-poisoned cwd stays poisoned.
+            continue
+        elif isinstance(eff, str):
+            eff = os.path.normpath(os.path.join(eff, expanded))
+        else:
+            # Relative cd with no known base — stays UNKNOWN.
+            eff = _CWD_UNKNOWN
+    return eff
+
+
+def _resolved_forbidden_hit(
+    word: str,
+    eff_cwd: object,
+    forbidden_dirs: list[tuple[str, str]],
+) -> str | None:
+    """Resolve a single read-candidate *word* against the effective cwd and
+    return the matched forbidden SUFFIX (for the deny reason) iff the resolved
+    absolute path lands inside a forbidden tree, else ``None``.
+
+    *forbidden_dirs* is a list of ``(abs_dir, suffix)`` — the absolute
+    forbidden directory under the bridge home and its display suffix.
+
+    Resolution mirrors the kernel for the static-path class:
+      - decode the bash literals already handled (ANSI-C ``$'…'``, ordinary
+        backslash ``\\X``→``X``) so an encoded separator/segment surfaces;
+      - expand the bridge-known prefixes (``~``/``$HOME``/``$BRIDGE_HOME`` …);
+      - ABSOLUTE after expansion → ``normpath(word)`` (folds ``..``/``//``/``.``);
+      - RELATIVE + known eff_cwd → ``normpath(join(eff_cwd, word))``;
+      - RELATIVE + UNKNOWN eff_cwd → unanchorable (relative to the agent's own
+        cwd) → ``None`` (do NOT over-block);
+      - RELATIVE + POISONED eff_cwd → see :func:`_forbidden_suffix_in_command`
+        fail-close (handled by the caller, not here).
+    A surviving ``$var`` after expansion is unresolved → ``None`` here; the
+    caller's Pass-2 obfuscation fail-close decides it.
+    """
+    decoded = _decode_obfuscated_word(word)
+    expanded = _expand_bridge_prefixes(decoded)
+    if "$" in expanded:
+        return None  # unresolved $var → caller's fail-close path decides
+    if os.path.isabs(expanded):
+        resolved = os.path.normpath(expanded)
+    elif isinstance(eff_cwd, str) and eff_cwd is not _CWD_POISONED:
+        resolved = os.path.normpath(os.path.join(eff_cwd, expanded))
+    else:
+        return None  # relative + unknown/poisoned base → not resolvable here
+    for abs_dir, suffix in forbidden_dirs:
+        if resolved == abs_dir or resolved.startswith(abs_dir + os.sep):
+            return suffix
+    return None
+
+
+def _forbidden_dirs_for_suffixes(suffixes: list[str]) -> list[tuple[str, str]]:
+    """Map each forbidden *suffix* (``/shared/secrets``, ``/agents/<name>``) to
+    its absolute directory under the bridge home, returning
+    ``(abs_dir, suffix)`` pairs. Derived from the SAME SSOTs as the suffix
+    lists, so the resolved containment check can never drift from the spelling
+    scan it replaces.
     """
     try:
         home = str(bridge_home_dir())
     except Exception:  # noqa: BLE001
-        home = ""
-    for match in _CD_RE.finditer(text):
-        target = match.group(1).strip("'\"")
-        if "$BRIDGE_HOME" in target or "${BRIDGE_HOME}" in target or "/.agent-bridge" in target:
-            return True
-        expanded = os.path.expandvars(os.path.expanduser(target))
-        if home and (expanded == home or expanded.startswith(home + "/")):
-            return True
-    return False
-
-
-def _scan_relative_suffixes(text: str, suffixes: list[str]) -> str | None:
-    """Like :func:`_scan_suffixes` but for a RELATIVE forbidden tail (the suffix
-    with its leading ``/`` stripped), requiring a LEFT path-word boundary
-    (start, whitespace, quote, or a shell operator) since there is no leading
-    ``/`` to pin it. ONLY called once the command has cd'd into a bridge-anchored
-    dir, so a relative read in the agent's OWN workdir is not collateral-blocked.
-    A ``/``-preceded occurrence is excluded (that is an absolute path already
-    caught by the leading-``/`` scan)."""
+        return []
+    out: list[tuple[str, str]] = []
     for suffix in suffixes:
+        out.append((os.path.normpath(home + suffix), suffix))
+    return out
+
+
+def _relative_word_under_poison(
+    word: str,
+    forbidden_dirs: list[tuple[str, str]],
+) -> str | None:
+    """For a POISONED eff_cwd (a ``cd`` into an unresolved bridge-suspect
+    ``$var``), a RELATIVE read whose folded path STARTS WITH a forbidden tail
+    could resolve into the secret tree at runtime → fail closed. Returns the
+    matched suffix iff *word* is relative and ``normpath(word)`` is — or sits
+    under — a forbidden tail (``shared/secrets/…``, ``agents/<name>/…``), else
+    ``None`` (an absolute word is judged by :func:`_resolved_forbidden_hit`; a
+    relative word that does not name a forbidden tail is the agent's own cwd
+    business). The match is anchored at the START of the folded relative path —
+    a ``cd $UNKNOWN`` could place the cwd at the bridge home, so
+    ``shared/secrets/token`` read from there reaches the secret tree, but a
+    ``logs/shared/secrets``-shaped tail elsewhere does not.
+    """
+    decoded = _decode_obfuscated_word(word)
+    expanded = _expand_bridge_prefixes(decoded)
+    if "$" in expanded or os.path.isabs(expanded):
+        return None
+    folded = os.path.normpath(expanded)
+    for _abs_dir, suffix in forbidden_dirs:
         rel = suffix.lstrip("/")
-        if not rel:
-            continue
-        start = 0
-        while True:
-            idx = text.find(rel, start)
-            if idx == -1:
-                break
-            left_ok = idx == 0 or text[idx - 1] in (" ", "\t", "'", '"', ";", "&", "|", "(")
-            end = idx + len(rel)
-            right_ok = end >= len(text) or text[end] in ("/", "'", '"', " ", "\t")
-            if left_ok and right_ok:
-                return suffix
-            start = idx + 1
+        if folded == rel or folded.startswith(rel + "/"):
+            return suffix
     return None
 
 
+_PAREN_SPLIT_RE = re.compile(r"[()]")
+
+
 def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
-    """Scan the shell command *text* for a read of any forbidden *suffix*,
-    independent of how the path prefix is spelled.
+    """Scan the shell command *text* for a read that RESOLVES into any
+    forbidden tree, independent of how the path is spelled or traversed.
 
-    Returns the matched suffix (for the deny reason) or ``None``.
+    Returns the matched forbidden suffix (for the deny reason) or ``None``.
 
-    Two-pass, fail-closed:
+    Path-MODELING (issue #1709 r3), two passes, fail-closed:
 
-    1. Literal suffix scan over the raw text. ``${HOME}/.agent-bridge/
-       shared/secrets/token``, ``$BRIDGE_HOME/shared/secrets/token``, and
-       the absolute spelling all contain the literal ``/shared/secrets``
-       substring, so one check catches every prefix spelling. Each suffix
-       begins with a leading ``/`` (``/shared/secrets``,
-       ``/agents/<name>``) which already pins the LEFT path-component
-       boundary (``…-shared/secrets`` does NOT contain ``/shared/secrets``),
-       so only a RIGHT path-boundary check is needed (end-of-string, ``/``,
-       quote, or whitespace) to keep ``/shared/secretstuff`` from
-       false-hitting ``/shared/secrets``.
+    1. Resolved-path containment. Fold the literal ``cd``/``pushd`` targets
+       into an effective cwd, then for each read-candidate word expand the
+       bridge-known prefixes (``~``/``$HOME``/``$BRIDGE_HOME`` …), decode the
+       bash literals (ANSI-C ``$'…'``, backslash ``\\X``→``X``), join under
+       the eff_cwd if relative, ``os.path.normpath`` (folding ``..``/``//``/
+       ``/./``), and DENY when the resolved absolute path is — or sits under —
+       a forbidden directory. This closes ``..`` parent-traversal, accumulated
+       ``cd`` depth, multi-``cd``, and every separator/dot-segment spelling in
+       one sound check (replacing the r1/r2 literal-suffix text scan that
+       could not model resolution). A relative word with an UNKNOWN eff_cwd is
+       NOT over-blocked (it is relative to the agent's own cwd). A relative
+       word under a POISONED eff_cwd (a ``cd`` into an unresolved bridge-suspect
+       ``$var``) whose tail names a forbidden suffix fails closed.
 
-    2. Obfuscation fail-close. A literal scan cannot see a suffix hidden by
-       ANSI-C ``$'…'`` hex, a glob, a backslash escape, or a command
-       substitution. For each whitespace/operator-split path-candidate word
-       that carries such obfuscation we deny IF the word also sits under a
-       forbidden PARENT marker (``/shared/`` for Stage-A, ``/agents/`` for
-       Stage-B) — so ``cat ${HOME}/.agent-bridge/shared/sec*ets/token`` and
-       ``…/shared/secre\\x74s/token`` fail closed (the glob / hex could
-       resolve to the secret dir at runtime) while an unrelated globby read
-       (``cat ./logs/*.txt``) is not collateral-damaged. ANSI-C ``$'…'`` /
-       ``$(`` / backtick words that sit under a forbidden parent likewise
-       deny; a bare ``$(`)`` command-sub NOT under a forbidden parent is
-       left to the existing read-intent / shell-embedding gates.
+    2. Obfuscation fail-close (unchanged r2 model). A word carrying a glob
+       (``* ? [ ]``), command-sub (``$(…)``/backtick), or a surviving ``$var``
+       the decode could not resolve cannot be statically modeled. We deny it
+       iff it is bridge-anchored AND its literal prefix-before-the-glob could
+       select a forbidden directory, so ``cat ${HOME}/.agent-bridge/shared/
+       sec*ets/token`` fails closed while a benign repo ``./agents/*.md`` (no
+       bridge anchor) is not collateral-damaged.
     """
-    # Normalize the separators bash collapses (`//`, `///`, `/./`) before the
-    # literal scan so a redundant-separator / dot-segment spelling can't evade
-    # it (patch r2 #1709). Only the scanned copy is normalized.
-    norm = _collapse_path_separators(text)
+    # Split into shell segments on `;`, `&&`, `||`, `|`, `&`, newline, and the
+    # subshell parens `(` `)` so `(cd $BH; cat secrets/token)` is folded too.
+    segments: list[str] = []
+    for piece in _COMMAND_OPERATOR_RE.split(text):
+        segments.extend(_PAREN_SPLIT_RE.split(piece))
 
-    # Pass 1 — literal suffix scan with a RIGHT path-boundary check.
-    hit = _scan_suffixes(norm, suffixes)
-    if hit is not None:
-        return hit
+    eff_cwd = _command_effective_cwd(segments)
+    forbidden_dirs = _forbidden_dirs_for_suffixes(suffixes)
 
-    # Pass 1b — cwd-relative-after-cd. A read of a RELATIVE forbidden tail (no
-    # leading `/`) reaches the secret tree once the command has cd'd into a
-    # bridge-anchored dir (patch r2 #1709). Gate the relative scan on that cd so
-    # a relative read in the agent's own workdir is not collateral-blocked.
-    if _command_cd_targets_bridge_anchor(norm):
-        rel_hit = _scan_relative_suffixes(norm, suffixes)
-        if rel_hit is not None:
-            return rel_hit
+    # Pass 1 — resolve every read-candidate word against the effective cwd.
+    for raw_word in _command_path_candidate_words(text):
+        hit = _resolved_forbidden_hit(raw_word, eff_cwd, forbidden_dirs)
+        if hit is not None:
+            return hit
+        # Relative read under a POISONED (bridge-suspect `$var`) cwd whose tail
+        # names a forbidden suffix → fail closed.
+        if eff_cwd is _CWD_POISONED:
+            poison_hit = _relative_word_under_poison(raw_word, forbidden_dirs)
+            if poison_hit is not None:
+                return poison_hit
 
-    # Pass 2 — obfuscation fail-close, per path-candidate word.
+    # Pass 2 — obfuscation fail-close, per path-candidate word (r2 model).
     for raw_word in _command_path_candidate_words(text):
         if not _word_carries_obfuscation(raw_word):
             continue
-        # 2a. Decode ANSI-C `$'…'` / backslash hex-octal escapes and re-run
-        # the literal suffix scan: `$'\x2fshared\x2fsecrets'`, `secre\x74s`
-        # surface their real bytes here (the runtime path bash would build).
-        decoded = _collapse_path_separators(_decode_obfuscated_word(raw_word))
-        if decoded != raw_word and _scan_suffixes(decoded, suffixes) is not None:
-            return _OBFUSCATED_SUFFIX_SENTINEL
-        # 2b. Glob / command-sub fail-close. These cannot be decoded
+        # 2a. Decode ANSI-C `$'…'` / backslash escapes and re-resolve: a hidden
+        # separator/segment (`$'\x2fshared\x2fsecrets'`, `secre\x74s`) surfaces
+        # via the same resolved-path check as Pass 1.
+        if _decode_obfuscated_word(raw_word) != raw_word:
+            decoded_hit = _resolved_forbidden_hit(raw_word, eff_cwd, forbidden_dirs)
+            if decoded_hit is not None:
+                return _OBFUSCATED_SUFFIX_SENTINEL
+        # 2b. Glob / command-sub fail-close. These cannot be resolved
         # statically, so we deny iff the word is rooted under the operator
         # bridge home AND its literal prefix-before-the-glob could select a
         # forbidden directory (so a benign repo `./agents/*.md` — no bridge
         # anchor — and a read strictly inside the agent's OWN home are NOT
-        # collateral). Backtick / `$(…)` words are caught by the existing
-        # read-intent + shell-embedding gates upstream, but we fail-close
-        # here too for defense-in-depth when bridge-anchored.
+        # collateral). Backtick / `$(…)` words are also caught by the existing
+        # read-intent + shell-embedding gates upstream; we fail-close here too
+        # for defense-in-depth when bridge-anchored.
         if not any(anchor in raw_word for anchor in _bridge_anchor_tokens()):
             continue
         if _glob_prefix_reaches_forbidden_dir(raw_word, suffixes):
             return _OBFUSCATED_SUFFIX_SENTINEL
-    return None
-
-
-def _scan_suffixes(text: str, suffixes: list[str]) -> str | None:
-    """Literal forbidden-suffix scan with a RIGHT path-boundary check (the
-    leading ``/`` in each suffix pins the LEFT boundary). Returns the matched
-    suffix or ``None``."""
-    for suffix in suffixes:
-        start = 0
-        while True:
-            idx = text.find(suffix, start)
-            if idx == -1:
-                break
-            end = idx + len(suffix)
-            right_ok = end >= len(text) or text[end] in ("/", "'", '"', " ", "\t")
-            if right_ok:
-                return suffix
-            start = idx + 1
     return None
 
 
