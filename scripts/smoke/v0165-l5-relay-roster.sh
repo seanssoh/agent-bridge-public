@@ -40,6 +40,15 @@ trap cleanup EXIT
 smoke_require_cmd python3
 smoke_setup_bridge_home "$SMOKE_NAME"
 
+# #1728: throwaway per-node / per-case rooms+outbox+reconcile DBs that are opened
+# with the test-bind flag (TEST_FLAGS) must live UNDER the active BRIDGE_HOME —
+# the state-path guard fails closed on ANY db path resolved outside BRIDGE_HOME
+# while BRIDGE_A2A_ALLOW_TEST_BIND=1. These simulate distinct nodes but share
+# this isolated test process, so a dir under BRIDGE_HOME keeps the guard a no-op
+# (and is correct: a test mesh's state never reaches a live tree).
+TEST_DB_DIR="$BRIDGE_HOME/test-dbs"
+mkdir -p "$TEST_DB_DIR"
+
 SECRET="test-pair-secret-aaaaaaaaaaaaaaaaaaaa"
 ADDR="127.0.0.1"
 ROOM="room-l5"
@@ -58,7 +67,7 @@ python3 "$HELPER" make-config "$CFG_LEADER" nodeA "nodeB,nodeC" "$SECRET" "$ADDR
 # Leader rooms.db: room led by lead@nodeA; members alice@nodeB (a remote member
 # that sends) + carol@nodeC (a remote member that receives). Membership is the
 # authoritative rooms.db the relay reads (NEVER a body claim).
-LEADER_DB="$SMOKE_TMP_ROOT/rooms-leader.db"
+LEADER_DB="$TEST_DB_DIR/rooms-leader.db"
 python3 "$HELPER" make-leader-db "$LEADER_DB" "$ROOM" lead nodeA \
   "lead@nodeA:leader,alice@nodeB,carol@nodeC" >/dev/null
 
@@ -66,7 +75,7 @@ python3 "$HELPER" make-leader-db "$LEADER_DB" "$ROOM" lead nodeA \
 # member). The relay leg authenticates as the leader, so this is what it needs.
 CFG_TARGET="$SMOKE_TMP_ROOT/cfg-target.json"
 python3 "$HELPER" make-config "$CFG_TARGET" nodeC "nodeA" "$SECRET" "$ADDR" "carol" >/dev/null
-TARGET_DB="$SMOKE_TMP_ROOT/rooms-target.db"
+TARGET_DB="$TEST_DB_DIR/rooms-target.db"
 python3 "$HELPER" make-leader-db "$TARGET_DB" "$ROOM" lead nodeA \
   "lead@nodeA:leader,alice@nodeB,carol@nodeC" >/dev/null
 
@@ -216,7 +225,7 @@ test_A1b_nonroom_forged_relay_provenance() {
   python3 "$HELPER" build-nonroom-forged-relay "$inb" nodeB attacker victim boss admin-node >/dev/null
   local body="$SMOKE_TMP_ROOT/forged-body.txt"
   local res
-  res="$(env "BRIDGE_A2A_ROOMS_DB=$SMOKE_TMP_ROOT/rooms-victim.db" \
+  res="$(env "BRIDGE_A2A_ROOMS_DB=$TEST_DB_DIR/rooms-victim.db" \
       "DELIVERED_BODY_FILE=$body" \
     python3 "$HELPER" deliver-to-receiver "$SMOKE_REPO_ROOT" \
       "$(cat "$cfg_v")" "$inb" '{"resign":true}')"
@@ -332,7 +341,7 @@ test_A4c_relay_replay_not_reforwarded() {
 # not-room-scoped).
 # ---------------------------------------------------------------------------
 test_A4b_relay_resolve_unit() {
-  local udb="$SMOKE_TMP_ROOT/relay-resolve.db"
+  local udb="$TEST_DB_DIR/relay-resolve.db"
   python3 "$HELPER" make-leader-db "$udb" room-x lead nodeM \
     "lead@nodeM:leader,alice@nodeM,carol@nodeC,bob@nodeB" >/dev/null
   local cfg="$SMOKE_TMP_ROOT/cfg-resolve.json"
@@ -350,7 +359,7 @@ test_A4b_relay_resolve_unit() {
 # A5: roster epoch monotonic + membership-from-rooms.db (durable outbox unit).
 # ---------------------------------------------------------------------------
 test_A5_roster_epoch_monotonic() {
-  local odb="$SMOKE_TMP_ROOT/outbox.db"
+  local odb="$TEST_DB_DIR/outbox.db"
   local out
   out="$(env "${TEST_FLAGS[@]}" python3 "$HELPER" outbox-unit "$odb")"
   smoke_assert_contains "$out" "targets=nodeB,nodeC" "A5: the outbox targets the REMOTE member nodes (leader's own node excluded; from rooms.db)"
@@ -369,7 +378,7 @@ test_A5_roster_epoch_monotonic() {
 # row clears -> the removed/changed member converges).
 # ---------------------------------------------------------------------------
 test_A6_membership_change_broadcast_heartbeat() {
-  local rdb="$SMOKE_TMP_ROOT/recon.db"
+  local rdb="$TEST_DB_DIR/recon.db"
   local cfg="$SMOKE_TMP_ROOT/cfg-recon.json"
   python3 "$HELPER" make-config "$cfg" nodeA "nodeB" "$SECRET" "$ADDR" "lead,bob" >/dev/null
   local out
@@ -389,7 +398,7 @@ test_A6_membership_change_broadcast_heartbeat() {
 # membership change RE-ARMS it (so a node that returns still converges).
 # ---------------------------------------------------------------------------
 test_A6b_outbox_retirement() {
-  local rdb="$SMOKE_TMP_ROOT/retire.db"
+  local rdb="$TEST_DB_DIR/retire.db"
   local out
   out="$(env "${TEST_FLAGS[@]}" python3 "$HELPER" outbox-retire-unit "$rdb")"
   smoke_assert_contains "$out" "after_cap_status=retired" "A6b: a node that exhausts the retry budget is RETIRED (not retried forever)"

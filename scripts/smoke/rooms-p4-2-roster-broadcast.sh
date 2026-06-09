@@ -52,6 +52,15 @@ smoke_setup_bridge_home "$SMOKE_NAME"
 export BRIDGE_A2A_ROOMS_DB="$BRIDGE_STATE_DIR/handoff/rooms.db"
 mkdir -p "$BRIDGE_STATE_DIR/handoff"
 
+# #1728: throwaway per-node / per-case rooms DBs that are opened with the
+# test-bind flag (TEST_FLAGS) must live UNDER the active BRIDGE_HOME — the
+# state-path guard fails closed on ANY rooms-DB resolved outside BRIDGE_HOME
+# while BRIDGE_A2A_ALLOW_TEST_BIND=1. These simulate distinct nodes but share
+# this isolated test process, so a dir under BRIDGE_HOME keeps the guard a
+# no-op (and is correct: a test mesh's state never reaches a live tree).
+TEST_DB_DIR="$BRIDGE_HOME/test-dbs"
+mkdir -p "$TEST_DB_DIR"
+
 NODE_A="nodeA"   # leader node
 NODE_B="nodeB"   # member node (the joiner)
 SECRET="test-pair-secret-aaaaaaaaaaaaaaaaaaaa"
@@ -71,7 +80,7 @@ CFG_B_JSON="$(cat "$CFG_B")"
 
 # The member-local rooms.db (node B's own db) — the receiver writes its cache
 # here. Distinct from the leader's db.
-MEMBER_DB="$SMOKE_TMP_ROOT/member-rooms.db"
+MEMBER_DB="$TEST_DB_DIR/member-rooms.db"
 
 CAPTURE="$SMOKE_TMP_ROOT/captured-roster.json"
 JOIN_CAPTURE="$SMOKE_TMP_ROOT/captured-join.json"
@@ -189,7 +198,7 @@ test_member_accepts_first_roster_with_binding() {
 # first roster — proving the binding is not a test-only seed.
 # ---------------------------------------------------------------------------
 test_cli_join_records_binding_then_accepts() {
-  local mdb="$SMOKE_TMP_ROOT/member-cli.db"
+  local mdb="$TEST_DB_DIR/member-cli.db"
   # Run the REAL member-side cross-node `room join` (post stubbed). The stub
   # returns a pending ack for a room-join post, so cmd_join records the local
   # binding into the member's OWN rooms.db ($mdb).
@@ -219,7 +228,7 @@ test_cli_join_records_binding_then_accepts() {
 # local-add path admits a local agent with no such requirement (distinct paths).
 # ---------------------------------------------------------------------------
 test_T1_cross_approve_requires_verified_pending() {
-  local gdb="$SMOKE_TMP_ROOT/gate.db"
+  local gdb="$TEST_DB_DIR/gate.db"
   local out
   out="$(env "${TEST_FLAGS[@]}" python3 "$HELPER" cross-approve-gate "$gdb" 2>&1)" \
     || smoke_fail "cross-approve-gate helper must not raise: $out"
@@ -241,7 +250,7 @@ test_T2_non_leader_peer_rejected() {
   # A fresh member db with a binding to the leader nodeA, but deliver the
   # broadcast over a config where the authenticated peer is nodeC (NOT the
   # room's leader_node nodeA). The receiver must reject + persist nothing.
-  local mdb="$SMOKE_TMP_ROOT/member-t2.db"
+  local mdb="$TEST_DB_DIR/member-t2.db"
   python3 "$HELPER" make-member-db "$mdb" "$ROOM" "$NODE_A" bob "$NODE_B" >/dev/null
   # nodeC config: the member trusts nodeC as a peer (so HMAC/addr pass), but the
   # captured broadcast was signed by nodeA. We re-sign as nodeC so the HMAC gate
@@ -264,7 +273,7 @@ test_T2_non_leader_peer_rejected() {
 # T3: a roster with an INVALID pairwise HMAC is rejected (401, no persist).
 # ---------------------------------------------------------------------------
 test_T3_invalid_hmac_rejected() {
-  local mdb="$SMOKE_TMP_ROOT/member-t3.db"
+  local mdb="$TEST_DB_DIR/member-t3.db"
   python3 "$HELPER" make-member-db "$mdb" "$ROOM" "$NODE_A" bob "$NODE_B" >/dev/null
   local res
   res="$(env "BRIDGE_A2A_ROOMS_DB=$mdb" \
@@ -285,7 +294,7 @@ test_T4_first_roster_without_binding_refused() {
   # perfectly-signed roster from the real leader nodeA must be refused — the
   # member never chose this room, so accepting would let a configured peer mint
   # a rogue-leader room cache.
-  local mdb="$SMOKE_TMP_ROOT/member-nobind.db"
+  local mdb="$TEST_DB_DIR/member-nobind.db"
   # Create the db but with a binding for a DIFFERENT room only, to prove the
   # binding is room-specific (not a blanket "any local row").
   python3 "$HELPER" make-member-db "$mdb" "room-other" "$NODE_A" bob "$NODE_B" >/dev/null
@@ -305,7 +314,7 @@ test_T4_first_roster_without_binding_refused() {
 # Unit-driven across the full contract surface for determinism.
 # ---------------------------------------------------------------------------
 test_T5_epoch_monotonicity() {
-  local udb="$SMOKE_TMP_ROOT/accept-unit.db"
+  local udb="$TEST_DB_DIR/accept-unit.db"
   local out
   out="$(env "${TEST_FLAGS[@]}" python3 "$HELPER" member-accept-unit "$udb" 2>&1)" \
     || smoke_fail "member-accept-unit helper must not raise: $out"
@@ -331,7 +340,7 @@ test_T5_epoch_monotonicity() {
 # whose cache for $ROOM is already pinned to nodeA → 403, no cache mutation.
 # ---------------------------------------------------------------------------
 test_T2b_existing_cache_leader_takeover_refused() {
-  local mdb="$SMOKE_TMP_ROOT/member-takeover.db"
+  local mdb="$TEST_DB_DIR/member-takeover.db"
   python3 "$HELPER" make-member-db "$mdb" "$ROOM" "$NODE_A" bob "$NODE_B" >/dev/null
   # Establish the legitimate nodeA cache first (the captured leader broadcast).
   local first
@@ -366,7 +375,7 @@ test_T2b_existing_cache_leader_takeover_refused() {
 # leader (no truthiness guard).
 # ---------------------------------------------------------------------------
 test_T2c_empty_leader_takeover_refused() {
-  local edb="$SMOKE_TMP_ROOT/empty-leader.db"
+  local edb="$TEST_DB_DIR/empty-leader.db"
   local out
   out="$(env "${TEST_FLAGS[@]}" python3 "$HELPER" empty-leader-takeover-unit "$edb" 2>&1)" \
     || smoke_fail "empty-leader-takeover-unit helper must not raise: $out"
@@ -413,7 +422,7 @@ test_T6_atomic_no_partial_roster() {
 # (no P4.1 regression — the two approve paths stay distinct).
 # ---------------------------------------------------------------------------
 test_T7_local_add_no_token_gate() {
-  local ldb="$SMOKE_TMP_ROOT/local-add.db"
+  local ldb="$TEST_DB_DIR/local-add.db"
   local out
   out="$(env "${TEST_FLAGS[@]}" python3 "$HELPER" local-add-no-gate "$ldb" 2>&1)" \
     || smoke_fail "local-add-no-gate helper must not raise: $out"
@@ -433,7 +442,7 @@ test_T7_local_add_no_token_gate() {
 # the REAL receiver.
 # ---------------------------------------------------------------------------
 test_T8a_dedupe_race_unit() {
-  local rdb="$SMOKE_TMP_ROOT/dedupe-race.db"
+  local rdb="$TEST_DB_DIR/dedupe-race.db"
   local out
   out="$(env "${TEST_FLAGS[@]}" python3 "$HELPER" dedupe-race-unit "$rdb" 2>&1)" \
     || smoke_fail "dedupe-race-unit helper must not raise: $out"
@@ -449,7 +458,7 @@ test_T8b_dedupe_race_end_to_end() {
   # Establish bodyA at the captured message_id through the REAL receiver, then
   # re-deliver the SAME message_id with a DIFFERENT (validly-signed) body → the
   # receiver MUST answer 409 and the cache MUST still hold bodyA (not bodyB).
-  local mdb="$SMOKE_TMP_ROOT/member-race-e2e.db"
+  local mdb="$TEST_DB_DIR/member-race-e2e.db"
   python3 "$HELPER" make-member-db "$mdb" "$ROOM" "$NODE_A" bob "$NODE_B" >/dev/null
   local first
   first="$(deliver_roster_into "$mdb" "$CFG_B_JSON")"
@@ -481,7 +490,7 @@ test_T8b_dedupe_race_end_to_end() {
 # conflict) and end-to-end through the REAL receiver.
 # ---------------------------------------------------------------------------
 test_T9a_duplicate_burns_id_unit() {
-  local ddb="$SMOKE_TMP_ROOT/dup-burn.db"
+  local ddb="$TEST_DB_DIR/dup-burn.db"
   local out
   out="$(env "${TEST_FLAGS[@]}" python3 "$HELPER" duplicate-burns-id-unit "$ddb" 2>&1)" \
     || smoke_fail "duplicate-burns-id-unit helper must not raise: $out"
@@ -498,7 +507,7 @@ test_T9b_duplicate_burns_id_end_to_end() {
   # delivery reaches the DUPLICATE branch, not the captured-id path), confirm a
   # same-state replay under that id is a duplicate, then a same-id/different-body
   # reuse is a 409 with the cache untouched.
-  local mdb="$SMOKE_TMP_ROOT/member-dupburn-e2e.db"
+  local mdb="$TEST_DB_DIR/member-dupburn-e2e.db"
   python3 "$HELPER" make-member-db "$mdb" "$ROOM" "$NODE_A" bob "$NODE_B" >/dev/null
   # 1) bodyA at the captured id → ACCEPTED (seeds the cache).
   local d1
@@ -536,7 +545,7 @@ test_T9b_duplicate_burns_id_end_to_end() {
 # auth preamble teeth: unknown peer / wrong source addr are refused (unweakened)
 # ---------------------------------------------------------------------------
 test_auth_preamble_unweakened() {
-  local mdb="$SMOKE_TMP_ROOT/member-auth.db"
+  local mdb="$TEST_DB_DIR/member-auth.db"
   python3 "$HELPER" make-member-db "$mdb" "$ROOM" "$NODE_A" bob "$NODE_B" >/dev/null
   # Wrong source address → 403 (remote_addr gate intact).
   local res
@@ -556,7 +565,7 @@ test_auth_preamble_unweakened() {
 # 200 duplicate (peer-scoped dedupe), the cache unchanged.
 # ---------------------------------------------------------------------------
 test_idempotent_redelivery() {
-  local mdb="$SMOKE_TMP_ROOT/member-idem.db"
+  local mdb="$TEST_DB_DIR/member-idem.db"
   python3 "$HELPER" make-member-db "$mdb" "$ROOM" "$NODE_A" bob "$NODE_B" >/dev/null
   local first second
   first="$(deliver_roster_into "$mdb" "$CFG_B_JSON")"

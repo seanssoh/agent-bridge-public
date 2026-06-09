@@ -60,7 +60,13 @@ smoke_assert_file_exists "$HELPER" "lane-B helper present"
 # root, never the operator's live runtime.
 smoke_setup_bridge_home "$SMOKE_NAME"
 
-CFG_DIR="$SMOKE_TMP_ROOT/lbcfg"
+# #1728: the permanent-still-dead / alarm cases open the per-peer outbox.db with
+# BRIDGE_A2A_ALLOW_TEST_BIND=1 + a BRIDGE_A2A_OUTBOX_DB override, so the db MUST
+# live UNDER the active BRIDGE_HOME — the state-path guard fails closed on ANY
+# resolved db path outside BRIDGE_HOME while the test-bind flag is set. Under
+# home keeps the guard a no-op (and is correct: a test mesh's state never reaches
+# a live tree).
+CFG_DIR="$BRIDGE_HOME/lbcfg"
 mkdir -p "$CFG_DIR"
 
 # Run one helper subcommand against a FRESH outbox.db + config so each assertion

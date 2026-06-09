@@ -4886,6 +4886,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         cfg = a2a.load_config(Path(args.config) if args.config else None)
         a2a.validate_config_peer_secrets(cfg, side="receiver")
+        # #1728: refuse to serve if a test-bind mesh would land the A2A state
+        # tree (rooms.db / reconcile.db / outbox / inbox) on a live state dir
+        # outside this node's BRIDGE_HOME. No-op unless BRIDGE_A2A_ALLOW_TEST_BIND=1
+        # (test-only flag → never fires in production). phase=config: a
+        # NON-transient operator misconfiguration, never retried by the supervisor.
+        a2a.guard_test_bind_state_path()
     except a2a.A2AError as exc:
         log(f"FATAL: {exc} ({exc.code})")
         audit("startup_fail", code=exc.code, detail=str(exc)[:300],

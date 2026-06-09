@@ -238,8 +238,15 @@ test_r3_fake_rooms_db_ignored() {
   # FAKE rooms-DB env: the gate must read the CANONICAL rooms.db (co-located with
   # the real task DB, where carol does NOT share alice) -> DENIED. If the fake
   # were honored this would be ALLOWED (the codex r3 bypass).
-  local fake_db="$SMOKE_TMP_ROOT/fake-rooms.db"
-  rm -f "$fake_db"
+  # NOTE (#1728): the fake db lives UNDER BRIDGE_HOME but at a NON-canonical
+  # path (canonical is $BRIDGE_STATE_DIR/handoff/rooms.db). Under-home keeps the
+  # #1728 test-bind state-path guard a no-op (the test-bind flag is set via
+  # ROOMS_TEST_FLAGS); the exploit-bait semantics (a redirected, non-canonical
+  # rooms-DB the gate must IGNORE) are unchanged — they never relied on the fake
+  # being outside home.
+  local fake_db="$BRIDGE_HOME/r3-fake/fake-rooms.db"
+  rm -rf "$BRIDGE_HOME/r3-fake"
+  mkdir -p "$BRIDGE_HOME/r3-fake"
   local fk fl
   fk="$(env "${ROOMS_TEST_FLAGS[@]}" "BRIDGE_A2A_ROOMS_DB=$fake_db" \
          "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-carol" \
@@ -287,9 +294,13 @@ test_r4_direct_fallback_fake_controller_rejected() {
   # re-resolved as the REAL OS actor (carol) → canonical: carol not in alice's
   # room → DENIED. The forged --from bob is NOT honored.
   local err
+  # NOTE (#1728): the fake rooms-DB paths sit UNDER BRIDGE_HOME (non-canonical,
+  # absent-by-design) so the test-bind state-path guard stays a no-op; the r4
+  # teeth (forged-CONTROLLER discard) never depended on the fake being outside
+  # home.
   if err="$(env "${ROOMS_TEST_FLAGS[@]}" \
                "BRIDGE_QUEUE_TEST_NOT_CONTROLLER=1" \
-               "BRIDGE_A2A_ROOMS_DB=$SMOKE_TMP_ROOT/r4-absent/fake.db" \
+               "BRIDGE_A2A_ROOMS_DB=$BRIDGE_HOME/r4-absent/fake.db" \
                "BRIDGE_ROOMS_TEST_ISO_USER=agent-bridge-carol" \
                "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
              python3 "$QUEUE_CLI" create --to alice --from bob --title t --body b 2>&1)"; then
@@ -303,7 +314,7 @@ test_r4_direct_fallback_fake_controller_rejected() {
   # forged controller is discarded -> UNRESOLVED -> fail closed (DENY).
   if err="$(env "${ROOMS_TEST_FLAGS[@]}" \
                "BRIDGE_QUEUE_TEST_NOT_CONTROLLER=1" \
-               "BRIDGE_A2A_ROOMS_DB=$SMOKE_TMP_ROOT/r4-self/fake.db" \
+               "BRIDGE_A2A_ROOMS_DB=$BRIDGE_HOME/r4-self/fake.db" \
                "BRIDGE_ROOMS_TEST_ISO_USER=" \
                "BRIDGE_ROOMS_TEST_HOST_HAS_ISO=1" \
                "BRIDGE_ROOMS_TEST_CONTROLLER_UID=${MY_UID}" \

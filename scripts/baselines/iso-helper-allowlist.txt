@@ -50,3 +50,11 @@ scripts/smoke/1563-pr8-a2a-diag-recovery-helper.py
 # mktemp WORK dir; it is controller-side daemon state, never a controller->iso
 # boundary RW (same shape as the #1520c / #1533 / PR-5 / PR-8 fixture entries).
 scripts/smoke/1685-receiver-staleness-selfheal.sh
+
+# #1728 test-bind state-path guard fixture — the helper ONLY sets process-local
+# env vars (`os.environ["BRIDGE_A2A_ALLOW_TEST_BIND"|"BRIDGE_STATE_DIR"|
+# "BRIDGE_A2A_{OUTBOX,INBOX,ROOMS,RECONCILE}_DB"]`, `os.environ.pop(...)`) to
+# drive the real A2A/rooms/reconcile open choke points against ISOLATED mktemp
+# dirs; every `.env` match is the `os.environ` substring, never a controller->iso
+# boundary RW (same shape as the #1520c / #1533 / PR-5 / PR-8 fixture entries).
+scripts/smoke/1728-test-bind-state-path-guard-helper.py
