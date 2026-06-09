@@ -310,6 +310,18 @@ assert_verdict "if-then cd"               "if cd \$BRIDGE_HOME/shared; then cat 
 assert_verdict "for-do cd"                "for i in 1; do cd \$BRIDGE_HOME/shared; cat secrets/token; done" "DENY"
 assert_verdict "fn-body cd"               "f(){ cd \$BRIDGE_HOME/agents; }; f; cat $PEER_AGENT/MEMORY.md" "DENY"
 
+# r8 (codex #11805 + patch #11806) — `&&`/`||` conditional cd that EXECUTES: the
+# guard (true/:/false) deterministically runs the cd into the bridge, so the
+# read IS anchored. Modeled by literal-truth (provably-executed → advance) +
+# union (ambiguous condition → record target + scope-ambiguous check).
+assert_verdict "true && cd-in"            "true && cd \$BRIDGE_HOME/shared; cat secrets/token"     "DENY"
+assert_verdict ": && cd-in"               ": && cd \$BRIDGE_HOME/shared; cat secrets/token"        "DENY"
+assert_verdict "false || cd-in"           "false || cd \$BRIDGE_HOME/shared; cat secrets/token"    "DENY"
+assert_verdict "true && cd && read"       "true && cd \$BRIDGE_HOME/shared && cat secrets/token"   "DENY"
+assert_verdict "cmd && cd-in union"       "grep x f && cd \$BRIDGE_HOME/shared; cat secrets/token" "DENY"
+assert_verdict "cd/tmp && cd-in chain"    "cd /tmp && cd \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
+assert_verdict "B peer true && cd-in"     "true && cd \$BRIDGE_HOME/agents; cat $PEER_AGENT/MEMORY.md" "DENY"
+
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.
 # ---------------------------------------------------------------------------

@@ -3008,6 +3008,32 @@ def _relative_word_under_poison(
 _PAREN_SPLIT_RE = re.compile(r"[()]")
 
 
+def _literal_truth(seg: str) -> bool | None:
+    """The statically-known exit truth of command *seg* iff it is the literal
+    ``true``/``:`` (→ True) or ``false`` (→ False) builtin (with optional leading
+    ``!`` negations), else ``None`` (unknown exit). Used to decide whether a
+    following ``&&``/``||``-conditional ``cd`` is PROVABLY skipped (codex r7
+    #11805): only ``&&`` after a literal-false, or ``||`` after a literal-true,
+    guarantees the skip; any other conditional ``cd`` MAY execute."""
+    try:
+        toks = shlex.split(seg.strip(), posix=True, comments=False)
+    except ValueError:
+        return None
+    neg = False
+    while toks and toks[0] == "!":
+        neg = not neg
+        toks.pop(0)
+    if not toks:
+        return None
+    if toks[0] in ("true", ":"):
+        base = True
+    elif toks[0] == "false":
+        base = False
+    else:
+        return None
+    return (not base) if neg else base
+
+
 def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     """Scan the shell command *text* for a read that RESOLVES into any
     forbidden tree, independent of how the path is spelled or traversed.
@@ -3046,15 +3072,34 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     # never enters it). Reads in a conditional segment are still scanned (they
     # may execute and leak). Split with the operators captured so the preceding
     # operator of each segment is known.
-    seg_specs: list[tuple[bool, str]] = []
+    # Disposition of each segment's `cd` under `&&`/`||` conditional execution
+    # (codex r6 #11799 / r7 #11805, patch r7 #11806):
+    #   "skip"  — provably NOT executed (`&&` after literal-false, `||` after
+    #             literal-true) → no cwd effect.
+    #   "exec"  — unconditional, or provably executed (`&&` after literal-true,
+    #             `||` after literal-false) → advance the linear cwd precisely.
+    #   "union" — genuinely ambiguous conditional (non-literal prior) → the cd
+    #             MAY run, so model BOTH branches: record its target in
+    #             `cwds_seen` + force the scope-ambiguous read check, but do NOT
+    #             commit the linear cwd (the skip branch keeps the prior cwd).
+    seg_specs: list[tuple[str, str]] = []
     prev_op: str | None = None
+    prev_seg = ""
     for part in re.split(r"(&&|\|\||\||;|&|\n)", text):
         if part in ("&&", "||", "|", ";", "&", "\n"):
             prev_op = part
             continue
-        conditional = prev_op in ("&&", "||")
+        if prev_op in ("&&", "||"):
+            truth = _literal_truth(prev_seg)
+            if prev_op == "&&":
+                disp = "skip" if truth is False else ("exec" if truth is True else "union")
+            else:  # "||"
+                disp = "skip" if truth is True else ("exec" if truth is False else "union")
+        else:
+            disp = "exec"
         for sub in _PAREN_SPLIT_RE.split(part):
-            seg_specs.append((conditional, sub))
+            seg_specs.append((disp, sub))
+        prev_seg = part
 
     forbidden_dirs = _forbidden_dirs_for_suffixes(suffixes)
 
@@ -3105,7 +3150,7 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     # (`cd $BH/shared && cat secrets/token && cd /tmp`).
     cwd: object = _CWD_UNKNOWN
     cwds_seen: list[str] = []
-    for conditional, seg in seg_specs:
+    for disp, seg in seg_specs:
         words = list(_segment_candidate_words(seg))
 
         # Pass 1 — resolved-path containment against the CURRENT cwd.
@@ -3142,19 +3187,27 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
             if _glob_prefix_reaches_forbidden_dir(raw_word, suffixes):
                 return _OBFUSCATED_SUFFIX_SENTINEL
 
-        # THEN apply this segment's cd change so the NEXT segment's reads see it
-        # — UNLESS the segment is conditional (`&&`/`||`-gated): bash may skip it,
-        # so a conditional `cd` must not advance/record the modeled cwd (codex r6
-        # #11799). The reads above were scanned against the cwd that the
-        # UNCONDITIONAL cd's establish, which is what bash is guaranteed to be in.
-        if not conditional:
-            change = _segment_cwd_change(seg.strip())
-            if change is not None:
-                cwd = _apply_cwd_change(cwd, change)
-                # Remember every concrete cwd entered (for the scope-ambiguous
-                # fail-close — a later construct can restore any of them).
-                if isinstance(cwd, str):
-                    cwds_seen.append(cwd)
+        # THEN apply this segment's cd change so the NEXT segment's reads see it.
+        if disp == "skip":
+            continue  # provably-skipped conditional cd — no cwd effect
+        change = _segment_cwd_change(seg.strip())
+        if change is None:
+            continue
+        new_cwd = _apply_cwd_change(cwd, change)
+        if disp == "exec":
+            # Unconditional or provably-executed → advance the linear cwd.
+            cwd = new_cwd
+            if isinstance(cwd, str):
+                cwds_seen.append(cwd)
+        else:  # "union" — ambiguous conditional: model BOTH branches.
+            # Record the may-execute target for the scope-ambiguous read check
+            # and mark it, but DON'T commit the linear cwd (skip branch keeps the
+            # prior cwd). So `cmd && cd <bridge>; read` DENIES (executed branch),
+            # while `cmd && cd /tmp; read` over `secrets` is the safe-direction
+            # price for an unknowable condition.
+            if isinstance(new_cwd, str):
+                cwds_seen.append(new_cwd)
+            scope_ambiguous = True
     return None
 
 
