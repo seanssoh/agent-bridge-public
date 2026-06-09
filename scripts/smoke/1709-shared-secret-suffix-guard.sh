@@ -112,43 +112,10 @@ printf -- '# public wiki\n' >"$BRIDGE_SHARED_DIR/wiki/index.md"
 # Remove the two #1709 suffix-deny call-site blocks (Stage-A + Stage-B) so the
 # brace / $BRIDGE_HOME / ANSI-C cases revert to the pre-fix ALLOW.
 STRIPPED_HOOK="$SMOKE_REPO_ROOT/hooks/.tool-policy-1709-stripped-$$.py"
-"$PYTHON_BIN" - "$REAL_HOOK" "$STRIPPED_HOOK" <<'PY'
-import re
-import sys
-
-real, out = sys.argv[1], sys.argv[2]
-src = open(real, encoding="utf-8").read()
-
-# Stage-A: drop the `shared_suffix_hit` deny block.
-a_start = src.find(
-    "    # Issue #1709 — prefix-spelling-agnostic Stage-A suffix deny."
-)
-a_end = src.find(
-    "    # Issue #1692 — admin read-intent carve-out for the Bash PEER-HOME",
-    a_start if a_start != -1 else 0,
-)
-if a_start == -1 or a_end == -1 or a_end < a_start:
-    sys.stderr.write("could not locate #1709 Stage-A suffix-deny block\n")
-    sys.exit(3)
-src = src[:a_start] + src[a_end:]
-
-# Stage-B: drop the `peer_suffix_hit` block (between matched_alias assignment
-# and the `if matched_alias is None: return None`).
-b_start = src.find(
-    "    # Issue #1709 — prefix-spelling-agnostic Stage-B peer-home matcher."
-)
-b_end = src.find("    if matched_alias is None:\n        return None", b_start if b_start != -1 else 0)
-if b_start == -1 or b_end == -1 or b_end < b_start:
-    sys.stderr.write("could not locate #1709 Stage-B peer-home block\n")
-    sys.exit(4)
-src = src[:b_start] + src[b_end:]
-
-if "_forbidden_suffix_in_command(\n            text, _peer_forbidden_suffixes" in src \
-        or "shared_suffix_hit = _forbidden_suffix_in_command" in src:
-    sys.stderr.write("a #1709 suffix-deny call site survived the strip\n")
-    sys.exit(5)
-open(out, "w", encoding="utf-8").write(src)
-PY
+# file-as-argv (NOT heredoc-stdin) — footgun #11 / lint-heredoc-ban.
+"$PYTHON_BIN" "$SCRIPT_DIR/1709-shared-secret-suffix-guard-strip.py" \
+  "$REAL_HOOK" "$STRIPPED_HOOK" \
+  || smoke_fail "could not build the #1709 suffix-deny-stripped hook copy"
 "$PYTHON_BIN" -m py_compile "$STRIPPED_HOOK" \
   || smoke_fail "stripped hook copy did not compile"
 
@@ -280,6 +247,26 @@ assert_verdict "A private cd-subdir"      "cd \$BRIDGE_HOME/shared && grep x pri
 assert_verdict "B peer .. via peer"       "cat \$BRIDGE_HOME/agents/$PEER_AGENT/../$PEER_AGENT/MEMORY.md" "DENY"
 assert_verdict "B peer cd-subdir"         "cd \$BRIDGE_HOME/agents && cat $PEER_AGENT/MEMORY.md" "DENY"
 assert_verdict "B peer multi-cd"          "cd \$BRIDGE_HOME; cd agents; cat $PEER_AGENT/MEMORY.md" "DENY"
+
+# r4 (codex #11779 + patch #11780) — two bounded word-expansion steps bash
+# applies BEFORE the path exists, which the resolver must source from bash's
+# real splitting: (Q) quote removal (`sec'rets'`, `"$BH/..."`, `shared'/'secrets`)
+# and (cd-form) the wider `cd` invocations (`cd --`/`-P`/`-L`, `builtin cd`,
+# `command cd`, `\cd`). The read words + cd targets are now tokenized via
+# shlex.split(posix), so all of these RESOLVE into the forbidden tree -> DENY.
+assert_verdict "Q secrets quote-concat"   "cat \$BRIDGE_HOME/shared/sec'rets'/token"       "DENY"
+assert_verdict "Q secrets empty-concat"   "cat \$BRIDGE_HOME/shared/secrets''/token"       "DENY"
+assert_verdict "Q secrets quoted-slash"   "cat \$BRIDGE_HOME/shared'/'secrets/token"       "DENY"
+assert_verdict "Q secrets whole-dquote"   "cat \"\$BRIDGE_HOME/shared/secrets/token\""     "DENY"
+assert_verdict "Q secrets quoted-prefix"  "cat \"\$BRIDGE_HOME\"/shared/secrets/token"     "DENY"
+assert_verdict "Q peer quote-concat"      "cat \$BRIDGE_HOME/agents/$PEER_AGENT''/MEMORY.md" "DENY"
+assert_verdict "cd -- subdir"             "cd -- \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
+assert_verdict "cd -P subdir"             "cd -P \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
+assert_verdict "cd -L subdir"             "cd -L \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
+assert_verdict "builtin cd subdir"        "builtin cd \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
+assert_verdict "command cd subdir"        "command cd \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
+assert_verdict "backslash cd subdir"      "\\cd \$BRIDGE_HOME/shared && cat secrets/token" "DENY"
+assert_verdict "B peer cd -- subdir"      "cd -- \$BRIDGE_HOME/agents && cat $PEER_AGENT/MEMORY.md" "DENY"
 
 # ---------------------------------------------------------------------------
 # No over-block — legit class=user reads stay ALLOW.

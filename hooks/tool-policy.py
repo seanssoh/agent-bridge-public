@@ -2738,11 +2738,12 @@ def _expand_bridge_prefixes(word: str) -> str:
     → the operator bridge home — and leave every OTHER ``$var`` literal.
 
     Deliberately does NOT call :func:`os.path.expandvars`, which would leak
-    arbitrary ``os.environ`` into the resolved path (a security-sensitive
-    over-reach: an attacker-influenced env var could re-spell a benign word
-    into the secret tree, or mask a real one). Only ``HOME`` and ``BRIDGE_HOME``
-    are trusted location anchors. A surviving ``$`` in the result signals an
-    unresolved expansion the caller must treat as fail-closed-where-suspect.
+    the arbitrary process environment into the resolved path (a
+    security-sensitive over-reach: an attacker-influenced variable could
+    re-spell a benign word into the secret tree, or mask a real one). Only
+    ``HOME`` and ``BRIDGE_HOME`` are trusted location anchors. A surviving
+    ``$`` in the result signals an unresolved expansion the caller must treat
+    as fail-closed-where-suspect.
     """
     try:
         home = str(bridge_home_dir())
@@ -2764,7 +2765,41 @@ def _expand_bridge_prefixes(word: str) -> str:
     return out
 
 
-_CD_RE = re.compile(r"(?:cd|pushd)\s+([^\s;&|()<>]+)")
+_CWD_VERB_RE = re.compile(r"^\\?(?:builtin\s+|command\s+)?(cd|pushd|popd)\b(.*)$")
+
+
+def _segment_cwd_change(stripped: str) -> tuple[str, str | None] | None:
+    """Classify a command segment's effect on the working directory — bash
+    option/prefix aware (codex r3 #11779). Returns:
+      ``("target", <dir>)`` — `cd`/`pushd <dir>` (first NON-option arg, after
+        skipping `-P`/`-L`/`-e`/`-@` options and the `--` end-of-options marker,
+        and the `builtin cd` / `command cd` prefixes).
+      ``("home", None)``   — a bare `cd` (no arg) → `$HOME`.
+      ``("reset", None)``  — `popd` (pops the dir stack to a prior, unmodelable
+        cwd → reset to UNKNOWN).
+      ``None``             — not a cwd-changing command.
+    """
+    match = _CWD_VERB_RE.match(stripped)
+    if not match:
+        return None
+    verb, rest = match.group(1), match.group(2)
+    if verb == "popd":
+        return ("reset", None)
+    try:
+        toks = shlex.split(rest, posix=True, comments=False)
+    except ValueError:
+        toks = rest.split()
+    seen_ddash = False
+    for tok in toks:
+        if not seen_ddash and tok == "--":
+            seen_ddash = True
+            continue
+        if not seen_ddash and tok.startswith("-") and tok != "-":
+            continue  # a `cd`/`pushd` option (-P / -L / -e / -@)
+        return ("target", tok)  # first non-option token = the directory
+    if verb == "cd":
+        return ("home", None)  # bare `cd` → $HOME
+    return None  # bare `pushd` (swaps the stack top — unmodelable, ignore)
 
 
 def _command_effective_cwd(segments: list[str]) -> object:
@@ -2789,12 +2824,19 @@ def _command_effective_cwd(segments: list[str]) -> object:
     """
     eff: object = _CWD_UNKNOWN
     for seg in segments:
-        stripped = seg.strip()
-        match = _CD_RE.match(stripped)
-        if not match:
+        change = _segment_cwd_change(seg.strip())
+        if change is None:
             continue
-        target = match.group(1).strip("'\"")
-        expanded = _expand_bridge_prefixes(target)
+        kind, target = change
+        if kind == "reset":  # popd → previous (unmodelable) cwd
+            eff = _CWD_UNKNOWN
+            continue
+        if kind == "home":  # bare `cd` → $HOME
+            home = os.path.expanduser("~")
+            eff = os.path.normpath(home) if os.path.isabs(home) else _CWD_UNKNOWN
+            continue
+        # kind == "target"
+        expanded = _expand_bridge_prefixes(target or "")
         if "$" in expanded:
             # Unresolved $var cd-target → bridge-suspect, poison the cwd.
             eff = _CWD_POISONED
@@ -2940,8 +2982,22 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     eff_cwd = _command_effective_cwd(segments)
     forbidden_dirs = _forbidden_dirs_for_suffixes(suffixes)
 
+    # Fail-close a genuinely unbalanced-quote (unparseable) COMMAND that is
+    # bridge-anchored: shlex cannot recover its real argv, so a forbidden read
+    # could hide behind the malformed quoting (patch r3 #11780, consistent with
+    # the bash-argv ValueError→deny stance). Checked on the WHOLE text — a legit
+    # `awk -F'|' … <bridge-path>` has balanced quotes overall but the operator
+    # split tears `-F'|'` at the `|` into spurious unbalanced pieces, so a
+    # per-segment check would over-block it. A non-bridge-anchored unparseable
+    # command is not our concern.
+    if any(anchor in text for anchor in _bridge_anchor_tokens()):
+        try:
+            shlex.split(text, posix=True, comments=False)
+        except ValueError:
+            return _OBFUSCATED_SUFFIX_SENTINEL
+
     # Pass 1 — resolve every read-candidate word against the effective cwd.
-    for raw_word in _command_path_candidate_words(text):
+    for raw_word in _command_path_candidate_words(segments):
         hit = _resolved_forbidden_hit(raw_word, eff_cwd, forbidden_dirs)
         if hit is not None:
             return hit
@@ -2953,7 +3009,7 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
                 return poison_hit
 
     # Pass 2 — obfuscation fail-close, per path-candidate word (r2 model).
-    for raw_word in _command_path_candidate_words(text):
+    for raw_word in _command_path_candidate_words(segments):
         if not _word_carries_obfuscation(raw_word):
             continue
         # 2a. Decode ANSI-C `$'…'` / backslash escapes and re-resolve: a hidden
@@ -3023,14 +3079,26 @@ def _glob_prefix_reaches_forbidden_dir(word: str, suffixes: list[str]) -> bool:
 _OBFUSCATED_SUFFIX_SENTINEL = "(obfuscated path expansion)"
 
 
-def _command_path_candidate_words(text: str):
-    """Yield whitespace/operator-split words from *text* that look like a
-    path argument (skipping the obvious flag words). Reuses
-    :func:`_alias_path_fragments` per whitespace token so a redirect prefix
-    is peeled and shell operators do not hide a glued word."""
-    for token in text.split():
-        for fragment in _alias_path_fragments(token):
-            yield fragment
+def _command_path_candidate_words(segments: list[str]):
+    """Yield path-candidate words from the shell *segments*, tokenized with
+    bash's real word-splitting + QUOTE REMOVAL via ``shlex.split(..., posix=True)``
+    so ``sec'rets'`` / ``sec"rets"`` / ``secrets''`` / ``shared'/'secrets`` /
+    ``"$BH/shared/secrets/token"`` collapse to their canonical word BEFORE
+    resolution (patch r3 #11780 Family Q — bash removes quotes before the path
+    exists, so a literal-text tokenizer left the quote chars in the path and the
+    resolved string never equaled the forbidden dir). A ``$var`` is left intact
+    for ``_expand_bridge_prefixes``. A segment with unbalanced quotes (shlex
+    ``ValueError``) falls back to a raw split here; the caller separately
+    fail-closes such a segment when it is bridge-anchored. Reuses
+    :func:`_alias_path_fragments` per token to peel redirect prefixes."""
+    for seg in segments:
+        try:
+            tokens = shlex.split(seg, posix=True, comments=False)
+        except ValueError:
+            tokens = seg.split()
+        for token in tokens:
+            for fragment in _alias_path_fragments(token):
+                yield fragment
 
 
 def _bash_token_resolved_paths(token: str) -> list[Path]:
