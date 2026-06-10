@@ -276,9 +276,14 @@ def _save_throttle(agent: str, state: dict[str, Any]) -> bool:
         return False
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Issue #1755: unique per-instance tmp + benign last-writer-wins on
-        # the final rename, so concurrent PermissionRequest instances never
-        # collide on a shared tmp name.
+        # Issue #1755: unique per-instance tmp so concurrent PermissionRequest
+        # instances never collide on a shared tmp name. Each renames its own
+        # tmp (atomic, last-writer-wins, no exception in the dup-hook race).
+        # With unique tmp names there is no benign FileNotFoundError to
+        # swallow on the final replace() — a FileNotFoundError there now means
+        # a real write failure, so let it fall through to this function's own
+        # outer fail-open handler (iso telemetry / return False) rather than
+        # masking it as success.
         fd, tmp_name = tempfile.mkstemp(
             dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp"
         )
@@ -287,10 +292,7 @@ def _save_throttle(agent: str, state: dict[str, Any]) -> bool:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(json.dumps(state, ensure_ascii=True) + "\n")
             os.chmod(tmp, 0o600)
-            try:
-                tmp.replace(path)
-            except FileNotFoundError:
-                return True
+            tmp.replace(path)
             os.chmod(path, 0o600)
         except BaseException:
             try:

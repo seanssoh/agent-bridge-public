@@ -1009,20 +1009,22 @@ def _atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
     instances on the same prompt (the same hook script registered in both
     the global and the per-workdir settings scope with divergent interpreter
     spellings — see lib/bridge-hooks.sh / bridge-hooks.py P2). A shared fixed
-    tmp name (``<path>.tmp``) makes the second instance's ``replace()`` fail
-    with FileNotFoundError after the first instance already renamed the tmp
-    onto ``path``. Two fixes here:
+    tmp name (``<path>.tmp``) made the second instance's ``replace()`` fail
+    with FileNotFoundError after the first instance had already renamed the
+    tmp onto ``path``. The fix is a per-instance unique tmp name (``mkstemp``)
+    so the two writers never contend for the same tmp file: each instance
+    renames *its own* tmp, the rename is atomic, and the dup-hook scenario
+    resolves as last-writer-wins with no exception on either side.
 
-      * Per-instance unique tmp name (pid + random suffix) so the two writers
-        never contend for the same tmp file.
-      * Treat FileNotFoundError on the final ``replace()`` as benign
-        last-writer-wins: another instance already produced a complete
-        ``path`` with equivalent content, so there is nothing to surface.
-
-    Genuine permission / OS errors (e.g. the iso v2 controller-owned tree,
-    #1205 Family B) still propagate to the caller so its fail-open policy
-    decides. The tmp is best-effort unlinked on any failure so we never leak
-    sidecar ``.tmp.<pid>...`` droppings into the state tree.
+    With unique tmp names there is no benign FileNotFoundError left to swallow
+    on the final ``replace()``. No other instance can rename *this* process's
+    unique source tmp away, so the only way ``replace()`` can now raise is a
+    genuine failure — the unique source tmp vanished, or the parent/target
+    path disappeared mid-write. All ``replace()`` errors therefore propagate
+    to the caller so its existing policy decides (e.g. save_timestamp_state's
+    #1205 Family B fail-open for non-controller iso UIDs / re-raise for the
+    controller). The tmp is best-effort unlinked on any failure so we never
+    leak sidecar ``.tmp`` droppings into the state tree.
     """
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp"
@@ -1032,13 +1034,7 @@ def _atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
         os.chmod(tmp, mode)
-        try:
-            tmp.replace(path)
-        except FileNotFoundError:
-            # Another concurrent instance already renamed its own tmp onto
-            # ``path`` between our write and replace. Last-writer-wins: the
-            # destination is complete, so this is a no-op, not an error.
-            return
+        tmp.replace(path)
         os.chmod(path, mode)
     except BaseException:
         try:
@@ -1266,11 +1262,14 @@ def save_timestamp_state(agent: str, payload: dict[str, int]) -> None:
     path = timestamp_state_path(agent)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Issue #1755: unique-tmp + benign last-writer-wins on the final
-        # replace. Two concurrent prompt_timestamp instances (dup hook
-        # registration) no longer collide on a shared tmp name, and the
-        # loser's FileNotFoundError is swallowed inside _atomic_write_text
-        # rather than re-raised here as a per-prompt "hook error" banner.
+        # Issue #1755: unique-tmp last-writer-wins. Two concurrent
+        # prompt_timestamp instances (dup hook registration) no longer
+        # collide on a shared tmp name — each renames its own unique tmp, so
+        # the loser's replace() no longer raises the per-prompt
+        # FileNotFoundError "hook error" banner. A FileNotFoundError that
+        # *does* reach here is now a genuine write failure and falls into the
+        # except below (iso fail-open / controller re-raise), not a silent
+        # success.
         _atomic_write_text(
             path,
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",

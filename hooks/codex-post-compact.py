@@ -87,9 +87,14 @@ def _refresh_heartbeat(agent: str) -> bool:
     }
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
-        # Issue #1755: unique per-instance tmp + benign last-writer-wins on
-        # the final rename, so two concurrent post-compact instances never
-        # collide on a shared tmp name and surface a Codex hook error.
+        # Issue #1755: unique per-instance tmp so two concurrent post-compact
+        # instances never collide on a shared tmp name. Each renames its own
+        # tmp (atomic, last-writer-wins, no exception in the dup-hook race).
+        # With unique tmp names there is no benign FileNotFoundError to
+        # swallow on the final replace() — a FileNotFoundError there now means
+        # a real write failure, so let it fall through to this function's own
+        # outer fail-open handler (iso telemetry / return False) rather than
+        # masking it as success.
         fd, tmp_name = tempfile.mkstemp(
             dir=str(marker.parent), prefix=f"{marker.name}.", suffix=".tmp"
         )
@@ -98,10 +103,7 @@ def _refresh_heartbeat(agent: str) -> bool:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
             os.chmod(tmp, 0o600)
-            try:
-                tmp.replace(marker)
-            except FileNotFoundError:
-                return True
+            tmp.replace(marker)
             os.chmod(marker, 0o600)
         except BaseException:
             try:
