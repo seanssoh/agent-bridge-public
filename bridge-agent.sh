@@ -190,7 +190,8 @@ Policy: admin operates exclusively through these typed verbs. Direct edits
 to protected-roster files (\$BRIDGE_ROSTER_LOCAL_FILE) are intentionally
 blocked because the audit chain depends on the typed-write path. Any
 out-of-band edits will be reverted by the daemon's reconciliation pass on
-next sync — bring changes through 'agent update' / 'config set' instead.
+next sync — bring role changes through 'agent update'; use 'config set'
+only for JSON global settings.
 EOF
 }
 
@@ -2709,11 +2710,21 @@ bridge_agent_shared_settings_plan_json() {
   local agent="$1"
   local workdir="$2"
   local launch_cmd
+  local channels_csv=""
   local agent_class=""
   local effective_file
   local settings_path_override=""
   local _isolated_active=0
   launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+  # #1453/#1756: mirror the renderer's launched-channel context in the
+  # plan helper. The stored launch command for normal channel agents often
+  # omits --channels because bridge-run composes it from the roster at
+  # launch time; channels_csv is therefore required for managed defaults and
+  # sticky-false repair symmetry.
+  if declare -p BRIDGE_AGENT_CHANNELS >/dev/null 2>&1 \
+      && command -v bridge_agent_channels_csv >/dev/null 2>&1; then
+    channels_csv="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
+  fi
   # Issue #593: pass the agent's source class through to the resolver so
   # the plan/diff helper computes the same managed default the renderer
   # will (static→400_000, dynamic→1_000_000). Without this the doctor
@@ -2799,6 +2810,7 @@ settings_path_override = argv[8] if len(argv) > 8 else ""
 # post-apply `effective == expected` check perpetually reports
 # `needs-rerender`.
 operator_global_file = argv[9] if len(argv) > 9 else ""
+channels_csv = argv[10] if len(argv) > 10 else ""
 spec = importlib.util.spec_from_file_location("bridge_hooks", hooks_py)
 if spec is None or spec.loader is None:
     raise SystemExit(f"could not load {hooks_py}")
@@ -2832,7 +2844,7 @@ def load_object(path: Path, label: str, *, absent_ok: bool = True) -> dict:
 
 base_payload = load_object(base_path, "base")
 overlay_payload = load_object(overlay_path, "overlay")
-managed_defaults = hooks.managed_claude_settings_defaults(launch_cmd or None, agent_class or None)
+managed_defaults = hooks.managed_claude_settings_defaults(launch_cmd or None, agent_class or None, channels_csv or None)
 # Queue #11901: mirror cmd_render_shared_settings' bottom-most operator-global
 # layer (safety-filtered) so the plan's `expected` matches what the renderer
 # actually wrote. Fail-safe: missing / unreadable / non-object / filtered-empty
@@ -2853,17 +2865,6 @@ else:
     expected = dict(managed_defaults)
 expected = hooks.merge_settings(expected, base_payload)
 expected = hooks.merge_settings(expected, overlay_payload)
-# PR #970: `cmd_render_shared_settings` rewrites `~/.agent-bridge/hooks/`
-# prefixes in the merged settings to absolute `<BRIDGE_HOME>/hooks/` paths
-# before writing the effective file. The plan must apply the same rewrite
-# to `expected` so the post-apply `effective_payload == expected` check
-# (driving `effective.matches_expected` and ultimately the apply-row
-# `rerendered` vs `needs-rerender` status) stays symmetric. Without this,
-# every install whose base `agents/.claude/settings.json` ships the legacy
-# `~/.agent-bridge/hooks/...` literals (the tracked source default) would
-# report `needs-rerender` after a successful apply on every run.
-if hasattr(hooks, "_normalize_bridge_hook_paths") and hasattr(hooks, "_bridge_home_from_base_settings"):
-    hooks._normalize_bridge_hook_paths(expected, hooks._bridge_home_from_base_settings(base_path))
 
 current_error = ""
 try:
@@ -2874,6 +2875,25 @@ except OSError as exc:
 
 effective_payload = load_object(effective_path, "effective")
 effective_exists = effective_path.exists()
+preserved_keys = getattr(hooks, "PRESERVED_USER_KEYS", ())
+preserved_payload = {
+    key: effective_payload[key]
+    for key in preserved_keys
+    if isinstance(effective_payload, dict) and key in effective_payload
+}
+if preserved_payload:
+    expected = hooks.merge_settings(expected, preserved_payload)
+# PR #970 / #1495 / #1453: mirror cmd_render_shared_settings after the
+# preserved-key fold. The renderer normalizes bridge hook paths, prunes
+# invalid hook events, and repairs sticky-false launched channel plugins
+# only after preserved user keys have been merged, so the plan must apply
+# those same transforms to keep `effective.matches_expected` symmetric.
+if hasattr(hooks, "_normalize_bridge_hook_paths") and hasattr(hooks, "_bridge_home_from_base_settings"):
+    hooks._normalize_bridge_hook_paths(expected, hooks._bridge_home_from_base_settings(base_path))
+if hasattr(hooks, "_prune_invalid_hook_keys"):
+    hooks._prune_invalid_hook_keys(expected)
+if hasattr(hooks, "_repair_sticky_false_channel_enables"):
+    hooks._repair_sticky_false_channel_enables(expected, launch_cmd or None, str(effective_path), channels_csv or None)
 effective_matches = effective_exists and effective_payload == expected
 
 changes = []
@@ -2943,7 +2963,8 @@ PY
       "$launch_cmd" \
       "$agent_class" \
       "$settings_path_override" \
-      ""
+      "" \
+      "$channels_csv"
     _plan_rc=$?
   else
     bridge_require_python
@@ -2957,7 +2978,8 @@ PY
       "$launch_cmd" \
       "$agent_class" \
       "$settings_path_override" \
-      "$_operator_global_file"
+      "$_operator_global_file" \
+      "$channels_csv"
     _plan_rc=$?
   fi
   rm -f "$_plan_py"
@@ -6586,11 +6608,11 @@ run_restart() {
   # healthy host is ~14s, 12s lost the race deterministically (issue #69
   # Defect B). Operators can still override via the env var.
   local verify_timeout="${BRIDGE_AGENT_RESTART_CHANNEL_VERIFY_SECONDS:-30}"
-  # Kill-on-repeated-fail threshold: how many consecutive banner-verify
-  # timeouts before we stop the session and let the daemon's cooldown retry
-  # later. Previously hardcoded at 2, which combined with a too-short
-  # timeout created a death loop (issue #69 Defect C). Default 5.
-  local verify_max_attempts="${BRIDGE_AGENT_RESTART_CHANNEL_VERIFY_MAX_ATTEMPTS:-5}"
+  # Restart-internal verifier threshold: how many consecutive probe misses
+  # we tolerate before returning non-zero while leaving the new session alive.
+  # Previously hardcoded at 5 with destructive retry relaunches, which turned
+  # one false-negative into a kill-loop. Default 2.
+  local verify_max_attempts="${BRIDGE_AGENT_RESTART_CHANNEL_VERIFY_MAX_ATTEMPTS:-2}"
   local verify_attempts=0
   local os_user=""
   local current_user=""
@@ -6729,6 +6751,12 @@ run_restart() {
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --replace "${start_args[@]}"
   }
 
+  refresh_restart_verify_state() {
+    bridge_refresh_runtime_state >/dev/null 2>&1 || true
+    bridge_roster_cache_invalidate 2>/dev/null || true
+    bridge_load_roster >/dev/null 2>&1 || true
+  }
+
   # Issue #1251 Phase 2 rollback helper. Invoked when a post-kill launch
   # step fails. Restores the managed block from snapshot, attempts a
   # second `restart_once` against the (now-restored) prior config, and
@@ -6796,7 +6824,7 @@ run_restart() {
 
   launch_channels="$(bridge_agent_effective_launch_plugin_channels_csv "$agent")"
 
-  [[ "$verify_max_attempts" =~ ^[0-9]+$ ]] || verify_max_attempts=5
+  [[ "$verify_max_attempts" =~ ^[0-9]+$ ]] || verify_max_attempts=2
   (( verify_max_attempts >= 1 )) || verify_max_attempts=1
 
   # Emergency operator kill-switch for the restart-internal verifier.
@@ -6813,6 +6841,7 @@ run_restart() {
   fi
 
   verify_attempts=1
+  refresh_restart_verify_state
   # Verify via descendant process probe (issue #143). The banner-based
   # verifier read only the last 80 tmux lines, so busy sessions (`--resume`
   # + `/compact` + first task dispatch) scrolled the startup banner off
@@ -6825,36 +6854,15 @@ run_restart() {
     return 0
   fi
 
-  # Retry with fresh sessions up to verify_max_attempts total. Keep going
-  # only while the session restarts cleanly. If we exhaust attempts without
-  # the plugin MCP coming alive, leave the session running and return
-  # non-zero so the daemon's next cooldown cycle can take another look.
-  # Previously we killed the session after 2 attempts, which — combined
-  # with the too-short 12s default timeout and reparented bun holding the
-  # port — produced the observed permanent death loop (issue #69 Defect C).
+  # Retry only the probe, not the session. The verifier is advisory: if
+  # it false-negatives, killing and relaunching the newly started session
+  # turns one bad signal into a restart kill-loop. Leave the session
+  # running and let the daemon's later steady-state liveness cycle recheck
+  # the same shared signal.
   while (( verify_attempts < verify_max_attempts )); do
     verify_attempts=$(( verify_attempts + 1 ))
-    bridge_warn "Claude plugin MCP liveness missing after restart for '$agent' (attempt ${verify_attempts}/${verify_max_attempts}). Retrying with a fresh session."
-    if bridge_tmux_session_exists "$session"; then
-      # #981: re-snapshot before each kill — the prior restart_once may have
-      # advanced the session_id to a fresh transcript that we still want to
-      # resume on the next attempt. See the comment above the first kill
-      # block for the full rationale.
-      bridge_load_roster >/dev/null 2>&1 || true
-      resume_session_snapshot="$(bridge_agent_session_id "$agent" 2>/dev/null || true)"
-      bridge_kill_agent_session "$agent" >/dev/null 2>&1 || true
-      bridge_refresh_runtime_state
-      if [[ -n "$resume_session_snapshot" ]]; then
-        bridge_set_agent_session_id "$agent" "$resume_session_snapshot" 2>/dev/null || true
-      fi
-    fi
-    if ! restart_once; then
-      # Issue #1251: launch failed during the verify-retry loop, AFTER the
-      # in-loop kill above. Attempt rollback to the snapshot so the agent
-      # is not left stopped on a transient verify-then-launch failure.
-      restart_rollback "verify-retry-launch-failed" "restart_once exited non-zero during verify retry attempt $verify_attempts/$verify_max_attempts" || true
-      return 1
-    fi
+    bridge_warn "Claude plugin MCP liveness missing after restart for '$agent' (attempt ${verify_attempts}/${verify_max_attempts}). Re-probing without relaunch."
+    refresh_restart_verify_state
     if bridge_tmux_wait_for_claude_plugin_mcp_alive "$agent" "$verify_timeout"; then
       # Issue #1251: success path on a verify-retry — clear the marker.
       bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true

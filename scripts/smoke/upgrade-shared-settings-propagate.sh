@@ -103,6 +103,32 @@ PY
   smoke_assert_contains "$audit" "shared_settings_rerendered" "rerender apply emits audit row"
 }
 
+assert_dry_run_ignores_preserved_user_key_drift() {
+  local output status effective_ok effective_file
+
+  effective_file="$BRIDGE_AGENT_HOME_ROOT/patch/.claude/settings.effective.json"
+  python3 - "$effective_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+enabled_plugins = payload.get("enabledPlugins")
+if not isinstance(enabled_plugins, dict):
+    enabled_plugins = {}
+payload["enabledPlugins"] = dict(enabled_plugins)
+payload["enabledPlugins"]["discord@claude-plugins-official"] = True
+path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+PY
+
+  output="$(BRIDGE_HOME="$BRIDGE_HOME" "$SMOKE_REPO_ROOT/agent-bridge" agent rerender-settings --json)"
+  status="$(json_field "$output" 'payload["candidates"][0]["status"]')"
+  effective_ok="$(json_field "$output" 'payload["candidates"][0]["effective"]["matches_expected"]')"
+  smoke_assert_eq "unchanged" "$status" "rerender dry-run should not flag preserved user keys as drift"
+  smoke_assert_eq "True" "$effective_ok" "effective comparison is preserved-key aware"
+}
+
 assert_upgrade_runs_rerender() {
   local agent_home upgrade_json has_patch
 
@@ -260,6 +286,7 @@ main() {
   write_fixture
   smoke_run "rerender dry-run reports missing managed default" assert_dry_run_reports_missing_default
   smoke_run "rerender apply links shared settings and audits" assert_apply_rerenders_and_preserves_overlay
+  smoke_run "rerender dry-run ignores preserved user keys" assert_dry_run_ignores_preserved_user_key_drift
   smoke_run "upgrade apply rerenders shared Claude settings" assert_upgrade_runs_rerender
   smoke_run "operator overlay wins over managed default" assert_operator_overlay_wins
   smoke_run "Stop hook suite propagates from shared base (#541 PR-B)" assert_stop_hook_suite_propagates

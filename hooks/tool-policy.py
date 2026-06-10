@@ -530,10 +530,11 @@ SYSTEM_CONFIG_DENY_REASON = (
 
 ROSTER_LOCAL_DENY_REASON = (
     "agent-roster.local.sh is a protected system config path. "
-    "For a durable env override use `agent-bridge config set-env "
-    "KEY=VALUE` (issue #1734); for a JSON config field use `agent-bridge "
-    "config set`. Admin role does not exempt this path — the wrapper "
-    "preserves the audit chain."
+    "Use typed agent/setup commands such as `agent-bridge agent update` "
+    "for roster changes. For a durable env override use `agent-bridge "
+    "config set-env KEY=VALUE` (issue #1734); for a JSON config field use "
+    "`agent-bridge config set`. Admin role does not exempt this path — "
+    "typed commands preserve the audit chain."
 )
 
 
@@ -1542,9 +1543,9 @@ def _is_read_intent_bash(command: str) -> bool:
 # (`_bash_command_has_no_write_intent`) that tolerated unknown stage
 # leaders. Codex r1 review showed that posture lets an admin agent run
 # `python3 /tmp/mutator.py <roster>`, `my-mutator <roster>`, or
-# `git commit -F <roster>` — paths that bypass the
-# `agent-bridge config set` wrapper's audit chain and can leak or
-# rewrite roster secrets outside the sanctioned mutation surface.
+# `git commit -F <roster>` — paths that bypass the typed mutation
+# audit chain and can leak or rewrite roster secrets outside the
+# sanctioned mutation surface.
 #
 # r2 flips the classifier to a whitelist: only the canonical read-only
 # shapes already enumerated in :data:`_READ_INTENT_BASH_COMMANDS` are
@@ -6089,17 +6090,18 @@ def protected_alias_reason(
         # let `python3 /tmp/mutator.py <roster>`, `my-mutator
         # <roster>`, and `git commit -F <roster>` slip past as
         # "non-write" while in fact mutating or leaking the roster
-        # outside the `agent-bridge config set` audit chain. The
+        # outside the typed mutation audit chain. The
         # whitelist captures every shape #1255 was meant to unblock
         # (operator diagnostics: `cat $roster`, `grep BRIDGE $roster`,
         # `head -10 $roster`) without exposing arbitrary admin
         # binaries that happen to take the roster as an argv element.
-        # Write paths still flow through the `agent-bridge config
-        # set` wrapper carve-out above.
+        # Write paths still flow through typed agent/setup commands; the
+        # config-set wrapper carve-out above is for JSON system config,
+        # not the shell roster file.
         if admin and _bash_command_has_read_intent(text):
             return None
         # Admin no longer bypasses the roster path (codex r1 #341 CP2);
-        # mutations route through `agent-bridge config set`.
+        # mutations route through typed agent/setup commands.
         if admin:
             return ROSTER_LOCAL_DENY_REASON
         return "shared roster secrets are not available inside Claude tool calls"

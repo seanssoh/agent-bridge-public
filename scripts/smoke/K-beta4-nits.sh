@@ -40,8 +40,8 @@
 #         stage leaders, which codex r1 review showed lets the admin
 #         shell run `python3 /tmp/mutator.py <roster>`, `my-mutator
 #         <roster>`, or `git commit -F <roster>` — paths that mutate
-#         or exfiltrate roster secrets outside the
-#         `agent-bridge config set` audit chain. r2 flips the
+#         or exfiltrate roster secrets outside the typed mutation
+#         audit chain. r2 flips the
 #         classifier so unknown leaders default-deny. Operator
 #         diagnostics (`cat $roster`, `grep BRIDGE $roster`,
 #         `head -10 $roster`) are still allowed because they're on
@@ -434,7 +434,7 @@ smoke_assert_contains "$T5T_EVENTS" "claimed|None" \
 # codex r1 review demonstrated that posture admitted
 # `python3 /tmp/mutator.py <roster>`, `my-mutator <roster>`, and
 # `git commit -F <roster>` — admin paths that mutate or exfiltrate the
-# roster outside the `agent-bridge config set` audit chain. r2 flips
+# roster outside the typed mutation audit chain. r2 flips
 # the classifier to a strict whitelist (`_bash_command_has_read_intent`
 # delegating to `_is_read_intent_bash`). Unknown leaders default-deny.
 #

@@ -629,9 +629,9 @@ Admin operates exclusively through typed `agent <verb>` subcommands. Direct
 edits to protected-roster files (`$BRIDGE_ROSTER_LOCAL_FILE`, by default
 `~/.agent-bridge/agent-roster.local.sh`) are intentionally blocked because
 the audit chain depends on the typed-write path. Any out-of-band edits will
-be reverted by the daemon's reconciliation pass on next sync — bring
-changes through `agent update` (or `agent-bridge config set` for global
-settings) instead.
+be reverted by the daemon's reconciliation pass on next sync — bring role
+changes through `agent update`; use `agent-bridge config set` only for JSON
+global settings.
 
 Typed verbs available today (run `agent-bridge agent --help` for the full
 listing):
@@ -1903,8 +1903,12 @@ otherwise):
 
    Apply refuses if any agent's roster has an explicit
    `BRIDGE_AGENT_PROFILE_HOME` that is not `<data_root>/agents/<agent>/workdir`.
-   Edit `agent-roster.local.sh` (via `agent-bridge config set`) to align
-   the override and re-run, or unset it and re-run.
+   There is no typed `agent update` verb for changing or unsetting
+   `BRIDGE_AGENT_PROFILE_HOME` after creation. Either recreate the agent with
+   the intended profile target (`agent-bridge agent delete <agent>` followed
+   by `agent-bridge agent create ... --profile-home <expected>`), or follow
+   the migration warning's admin-only roster edit exception to unset/align the
+   explicit `BRIDGE_AGENT_PROFILE_HOME["<agent>"]` entry, then re-run apply.
 
    **Shared-tree relocation + `.v2-shared-mirror.sentinel`.** Before any
    skip branch returns, apply real-copy mirrors the *active* shared tree

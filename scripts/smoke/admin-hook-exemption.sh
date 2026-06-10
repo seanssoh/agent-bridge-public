@@ -213,8 +213,8 @@ case_edit_credentials_admin_denied() {
 
 case_admin_roster_mutation_still_denied() {
   # Roster mutation deny contract from codex r1 #341 CP2 must remain.
-  # Admin cannot bypass agent-roster.local.sh writes; the wrapper
-  # (`agent-bridge config set`) is the only sound mutation surface.
+  # Admin cannot bypass agent-roster.local.sh writes; typed agent/setup
+  # commands are the only sound mutation surface.
   local payload="$SMOKE_TMP_ROOT/edit-roster-admin.json"
   local roster_path="$BRIDGE_HOME/agent-roster.local.sh"
   write_payload "$payload" "Write" \

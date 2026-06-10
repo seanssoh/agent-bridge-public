@@ -1348,6 +1348,51 @@ bridge_run_ensure_claude_launch_channel_plugins() {
   )
 }
 
+bridge_run_preflight_plugin_mcp_bun() {
+  local channels=""
+  local item=""
+  local needs_bun=0
+  local bun_bin=""
+  local IFS_orig="$IFS"
+  local -a items=()
+
+  [[ "$ENGINE" == "claude" ]] || return 0
+  [[ $SAFE_MODE -eq 0 ]] || return 0
+  channels="$(bridge_agent_effective_launch_plugin_channels_csv "$AGENT" 2>/dev/null || true)"
+  [[ -n "$channels" ]] || return 0
+
+  IFS=','
+  # shellcheck disable=SC2206 # intentional split on comma-separated channel CSV.
+  items=( $channels )
+  IFS="$IFS_orig"
+  for item in "${items[@]}"; do
+    item="$(bridge_trim_whitespace "$item")"
+    [[ -n "$item" ]] || continue
+    if bridge_plugin_mcp_is_probeable_item "$item"; then
+      needs_bun=1
+      break
+    fi
+  done
+  (( needs_bun == 1 )) || return 0
+
+  if declare -F bridge_resolve_bun_executable >/dev/null 2>&1; then
+    bun_bin="$(bridge_resolve_bun_executable 2>/dev/null || true)"
+  else
+    bun_bin="$(command -v bun 2>/dev/null || true)"
+  fi
+  if [[ -n "$bun_bin" && -x "$bun_bin" ]]; then
+    return 0
+  fi
+
+  bridge_audit_log state plugin_mcp_runtime_missing_bun "$AGENT" \
+    --field channels="$channels" \
+    --field path="$PATH" >/dev/null 2>&1 || true
+  log_line "[error] aborting launch: Claude plugin MCP channel(s) require bun but command -v bun failed for ${AGENT}"
+  log_line "[error] PATH=${PATH}"
+  log_line "[error] install or relink bun, then verify with: command -v bun && bun --version"
+  return 67
+}
+
 # Per-process sentinel for the #1520 r3 one-time degrade warning. bridge-run.sh
 # is one long-lived process per agent relaunch loop, so a process-scoped
 # associative array keyed by agent id de-duplicates the skip-export warning
@@ -1937,6 +1982,9 @@ while true; do
 
   if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
     bridge_run_claude_keychain_free_preflight
+    if ! bridge_run_preflight_plugin_mcp_bun; then
+      exit 67
+    fi
     # v0.9.7 RC6 (refs #781): channel-required plugin sync failure must
     # block the launch — the agent is being started for that channel
     # and an isolated-UID-unreadable cache directory means MCP servers

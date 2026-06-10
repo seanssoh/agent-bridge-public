@@ -11,8 +11,8 @@
 #   test -f agent-roster.local.sh && grep BRIDGE agent-roster.local.sh
 #   echo "checking"; grep BRIDGE agent-roster.local.sh
 # was mis-classified as a WRITE because `cd` / `test` / `echo` are not in
-# `_READ_INTENT_BASH_COMMANDS`. The grep read of the roster then drew the
-# write-oriented `Use \`agent-bridge config set\`` deny.
+# `_READ_INTENT_BASH_COMMANDS`. The grep read of the roster then drew a
+# write-oriented protected-roster mutation deny.
 #
 # Fix: a small set of provably non-mutating prelude builtins (cd / pwd /
 # test / [ / echo / printf / true / false / :) no longer disqualify a

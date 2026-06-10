@@ -84,11 +84,248 @@ launch_umask_probe_contract() {
   smoke_assert_eq "0007" "$isolated_recorded" "v2 linux-user bridge-run umask remains 0007"
 }
 
+bun_preflight_harness() {
+  local harness="$SMOKE_TMP_ROOT/bun-preflight-harness.sh"
+
+  cat >"$harness" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+AGENT="${BRIDGE_TEST_AGENT:-bun-preflight-agent}"
+ENGINE="${BRIDGE_TEST_ENGINE:-claude}"
+SAFE_MODE="${BRIDGE_TEST_SAFE_MODE:-0}"
+
+bridge_agent_effective_launch_plugin_channels_csv() {
+  printf '%s' "${BRIDGE_TEST_CHANNELS:-}"
+}
+
+bridge_trim_whitespace() {
+  local value="${1:-}"
+  value="${value#"${value%%[!$' \t\r\n']*}"}"
+  value="${value%"${value##*[!$' \t\r\n']}"}"
+  printf '%s' "$value"
+}
+
+bridge_plugin_mcp_is_probeable_item() {
+  case "${1:-}" in
+    plugin:discord|plugin:discord@claude-plugins-official|plugin:teams|plugin:teams@*|plugin:mattermost|plugin:mattermost@*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+bridge_resolve_bun_executable() {
+  [[ -n "${BRIDGE_TEST_BUN_BIN:-}" ]] || return 1
+  printf '%s' "$BRIDGE_TEST_BUN_BIN"
+}
+
+bridge_audit_log() {
+  printf '%s\n' "$*" >>"${BRIDGE_TEST_AUDIT:?}"
+}
+
+log_line() {
+  printf '%s\n' "$*" >>"${BRIDGE_TEST_LOG:?}"
+}
+
+EOF
+  awk '
+    /^bridge_run_preflight_plugin_mcp_bun\(\) \{/ { in_fn=1 }
+    in_fn { print }
+    in_fn && /^\}/ { exit }
+  ' "$SMOKE_REPO_ROOT/bridge-run.sh" >>"$harness"
+  cat >>"$harness" <<'EOF'
+bridge_run_preflight_plugin_mcp_bun
+EOF
+  chmod 0755 "$harness"
+  printf '%s' "$harness"
+}
+
+bun_preflight_contract() {
+  local harness no_bun_path fake_bun log_file audit_file rc out
+
+  harness="$(bun_preflight_harness)"
+  no_bun_path="$SMOKE_TMP_ROOT/no-bun-path"
+  mkdir -p "$no_bun_path"
+  log_file="$SMOKE_TMP_ROOT/bun-preflight.log"
+  audit_file="$SMOKE_TMP_ROOT/bun-preflight.audit"
+
+  rc=0
+  : >"$log_file"
+  : >"$audit_file"
+  out="$(BRIDGE_TEST_CHANNELS="plugin:discord@claude-plugins-official" \
+    BRIDGE_TEST_LOG="$log_file" \
+    BRIDGE_TEST_AUDIT="$audit_file" \
+    PATH="$no_bun_path" \
+    "$BASH" "$harness" 2>&1)" || rc=$?
+  smoke_assert_eq "67" "$rc" "probeable Claude plugin channel fails fast when bun is missing"
+  smoke_assert_contains "$(cat "$log_file")" "require bun" "missing-bun preflight logs actionable error"
+  smoke_assert_contains "$(cat "$audit_file")" "plugin_mcp_runtime_missing_bun" "missing-bun preflight audits runtime miss"
+  smoke_assert_eq "" "$out" "missing-bun harness emits through log_line only"
+
+  rc=0
+  : >"$log_file"
+  : >"$audit_file"
+  BRIDGE_TEST_CHANNELS="plugin:cosmax@marketplace" \
+    BRIDGE_TEST_LOG="$log_file" \
+    BRIDGE_TEST_AUDIT="$audit_file" \
+    PATH="$no_bun_path" \
+    "$BASH" "$harness" >/dev/null 2>&1 || rc=$?
+  smoke_assert_eq "0" "$rc" "non-probeable plugin channel does not require bun"
+  smoke_assert_eq "" "$(cat "$log_file")" "non-probeable plugin preflight stays quiet"
+
+  rc=0
+  : >"$log_file"
+  : >"$audit_file"
+  BRIDGE_TEST_CHANNELS="plugin:discord@claude-plugins-official" \
+    BRIDGE_TEST_SAFE_MODE=1 \
+    BRIDGE_TEST_LOG="$log_file" \
+    BRIDGE_TEST_AUDIT="$audit_file" \
+    PATH="$no_bun_path" \
+    "$BASH" "$harness" >/dev/null 2>&1 || rc=$?
+  smoke_assert_eq "0" "$rc" "safe mode bypasses bun preflight"
+
+  fake_bun="$SMOKE_TMP_ROOT/bin/bun"
+  mkdir -p "$(dirname "$fake_bun")"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_bun"
+  chmod 0755 "$fake_bun"
+  rc=0
+  : >"$log_file"
+  : >"$audit_file"
+  BRIDGE_TEST_CHANNELS="plugin:discord@claude-plugins-official" \
+    BRIDGE_TEST_BUN_BIN="$fake_bun" \
+    BRIDGE_TEST_LOG="$log_file" \
+    BRIDGE_TEST_AUDIT="$audit_file" \
+    PATH="$no_bun_path" \
+    "$BASH" "$harness" >/dev/null 2>&1 || rc=$?
+  smoke_assert_eq "0" "$rc" "probeable plugin channel passes when bun is resolvable"
+}
+
+bun_preflight_call_order_contract() {
+  python3 - "$SMOKE_REPO_ROOT/bridge-run.sh" <<'PY'
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+loop = text.index("while true; do")
+block_start = text.index('if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then', loop)
+block_end = text.index("bridge_run_ensure_claude_launch_channel_plugins", block_start)
+block = text[block_start:block_end]
+preflight = block.index("bridge_run_preflight_plugin_mcp_bun")
+sync = block.index("bridge_run_sync_dev_plugin_cache")
+if preflight > sync:
+    raise SystemExit("bun preflight must run before plugin cache sync")
+PY
+}
+
+restart_full_preflight_harness() {
+  local harness="$SMOKE_TMP_ROOT/restart-full-preflight-harness.sh"
+
+  cat >"$harness" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+bridge_agent_engine() {
+  printf '%s' "${BRIDGE_TEST_ENGINE:-claude}"
+}
+
+bridge_agent_channels_csv() {
+  printf '%s' "${BRIDGE_TEST_CHANNELS:-}"
+}
+
+bridge_agent_effective_launch_plugin_channels_csv() {
+  printf '%s' "${BRIDGE_TEST_LAUNCH_CHANNELS:-${BRIDGE_TEST_CHANNELS:-}}"
+}
+
+bridge_trim_whitespace() {
+  local value="${1:-}"
+  value="${value#"${value%%[!$' \t\r\n']*}"}"
+  value="${value%"${value##*[!$' \t\r\n']}"}"
+  printf '%s' "$value"
+}
+
+bridge_qualify_channel_item() {
+  case "${1:-}" in
+    plugin:discord) printf '%s' "plugin:discord@claude-plugins-official" ;;
+    *) printf '%s' "${1:-}" ;;
+  esac
+}
+
+bridge_plugin_mcp_is_probeable_item() {
+  case "${1:-}" in
+    plugin:discord|plugin:discord@claude-plugins-official|plugin:teams|plugin:teams@*|plugin:mattermost|plugin:mattermost@*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+bridge_resolve_bun_executable() {
+  [[ -n "${BRIDGE_TEST_BUN_BIN:-}" ]] || return 1
+  printf '%s' "$BRIDGE_TEST_BUN_BIN"
+}
+
+bridge_resolve_engine_binary() {
+  printf '%s' "${BRIDGE_TEST_ENGINE_BIN:-/bin/sh}"
+}
+
+bridge_isolation_disabled_by_env() {
+  return 0
+}
+
+bridge_agent_linux_user_isolation_effective() {
+  return 1
+}
+
+EOF
+  awk '
+    /^bridge_agent_restart_preflight_full_reason\(\) \{/ { in_fn=1 }
+    in_fn { print }
+    in_fn && /^\}/ { exit }
+  ' "$SMOKE_REPO_ROOT/lib/bridge-agents.sh" >>"$harness"
+  cat >>"$harness" <<'EOF'
+bridge_agent_restart_preflight_full_reason "${BRIDGE_TEST_AGENT:-restart-bun-agent}"
+EOF
+  chmod 0755 "$harness"
+  printf '%s' "$harness"
+}
+
+restart_bun_preflight_contract() {
+  local harness fake_bun reason
+
+  harness="$(restart_full_preflight_harness)"
+
+  reason="$(BRIDGE_TEST_CHANNELS="plugin:discord@claude-plugins-official" \
+    "$BASH" "$harness")"
+  smoke_assert_contains "$reason" "plugin-mcp-runtime-missing: bun not resolvable" "restart full preflight blocks missing bun before kill"
+  smoke_assert_contains "$reason" "plugin:discord@claude-plugins-official" "restart full preflight names affected channel"
+
+  reason="$(BRIDGE_TEST_CHANNELS="plugin:cosmax@marketplace" \
+    "$BASH" "$harness")"
+  smoke_assert_eq "" "$reason" "restart full preflight ignores non-probeable plugin channels"
+
+  fake_bun="$SMOKE_TMP_ROOT/bin/bun"
+  mkdir -p "$(dirname "$fake_bun")"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_bun"
+  chmod 0755 "$fake_bun"
+  reason="$(BRIDGE_TEST_CHANNELS="plugin:discord@claude-plugins-official" \
+    BRIDGE_TEST_BUN_BIN="$fake_bun" \
+    "$BASH" "$harness")"
+  smoke_assert_eq "" "$reason" "restart full preflight passes when bun is resolvable"
+}
+
 main() {
   smoke_setup_bridge_home "launch"
   write_launch_roster
   smoke_run "bridge-start/bridge-run dry-run launch contract" launch_dry_run_contract
   smoke_run "bridge-run linux-user umask probe contract" launch_umask_probe_contract
+  smoke_run "bridge-run Claude plugin bun preflight" bun_preflight_contract
+  smoke_run "bridge-run bun preflight precedes plugin sync" bun_preflight_call_order_contract
+  smoke_run "restart full preflight blocks missing bun before kill" restart_bun_preflight_contract
   smoke_log "passed"
 }
 

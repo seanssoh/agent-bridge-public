@@ -8343,6 +8343,160 @@ raise SystemExit(1)
 PY
 }
 
+bridge_plugin_mcp_engine_log_ready_for_item() {
+  local agent="$1"
+  local item="$2"
+  local root_pid="$3"
+  local identity=""
+  local workdir=""
+  local cache_roots=""
+  local xdg_cache=""
+  local session_id=""
+
+  [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 1
+  [[ "$root_pid" =~ ^[0-9]+$ ]] || return 1
+  identity="$(bridge_plugin_mcp_identity_for_item "$item")"
+  [[ -n "$identity" ]] || return 1
+  workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  [[ -n "$workdir" ]] || return 1
+  session_id="$(bridge_agent_session_id "$agent" 2>/dev/null || true)"
+  # Engine-log evidence is only trustworthy when bound to the current
+  # Claude session. Without a session id, same-cwd child/cron/subagent logs
+  # can satisfy the connected+registered pair and mask a dead channel.
+  [[ -n "$session_id" ]] || return 1
+
+  if [[ -n "${BRIDGE_CLAUDE_NODEJS_CACHE_DIR:-}" ]]; then
+    cache_roots="$BRIDGE_CLAUDE_NODEJS_CACHE_DIR"
+  else
+    xdg_cache="${XDG_CACHE_HOME:-${HOME:-}/.cache}"
+    cache_roots="${HOME:-}/Library/Caches/claude-cli-nodejs:${xdg_cache}/claude-cli-nodejs"
+  fi
+
+  bridge_require_python
+  BRIDGE_CLAUDE_NODEJS_CACHE_DIRS="$cache_roots" \
+  BRIDGE_PLUGIN_MCP_ENGINE_LOG_SESSION_ID="$session_id" \
+    python3 - "$identity" "$workdir" "$root_pid" <<'PY'
+import datetime as dt
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+identity = sys.argv[1].strip().lower()
+workdir = os.path.realpath(sys.argv[2])
+root_pid = sys.argv[3]
+expected_session_id = os.environ.get("BRIDGE_PLUGIN_MCP_ENGINE_LOG_SESSION_ID", "").strip()
+cache_roots = [
+    root
+    for root in os.environ.get("BRIDGE_CLAUDE_NODEJS_CACHE_DIRS", "").split(":")
+    if root
+]
+slack_seconds = int(os.environ.get("BRIDGE_PLUGIN_MCP_ENGINE_LOG_START_SLACK_SECONDS", "5"))
+max_files = int(os.environ.get("BRIDGE_PLUGIN_MCP_ENGINE_LOG_MAX_FILES", "80"))
+
+
+def process_start_epoch(pid):
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", pid],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    except Exception:
+        return None
+    raw = completed.stdout.strip()
+    if not raw:
+        return None
+    try:
+        parsed = dt.datetime.strptime(raw, "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return None
+    return parsed.timestamp()
+
+
+def parse_timestamp(raw):
+    if not isinstance(raw, str) or not raw:
+        return None
+    value = raw
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.datetime.now().astimezone().tzinfo)
+    return parsed.timestamp()
+
+
+start_epoch = process_start_epoch(root_pid)
+if start_epoch is None:
+    # If ps cannot report the pane start time, fall back to a recent-only
+    # window instead of accepting arbitrarily stale cache evidence.
+    recent_seconds = int(os.environ.get("BRIDGE_PLUGIN_MCP_ENGINE_LOG_RECENT_SECONDS", "300"))
+    start_epoch = time.time() - recent_seconds
+min_epoch = start_epoch - slack_seconds
+
+candidates = []
+for root in cache_roots:
+    if not os.path.isdir(root):
+        continue
+    pattern = os.path.join(root, "*", f"mcp-logs-plugin-{identity}-*", "*.jsonl")
+    candidates.extend(Path(p) for p in glob.glob(pattern))
+
+def safe_mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+candidates.sort(key=safe_mtime, reverse=True)
+states = {}
+
+for path in candidates[:max_files]:
+    try:
+        if path.stat().st_mtime < min_epoch:
+            continue
+    except OSError:
+        continue
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        continue
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        cwd = payload.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            continue
+        if os.path.realpath(cwd) != workdir:
+            continue
+        ts = parse_timestamp(payload.get("timestamp"))
+        if ts is None or ts < min_epoch:
+            continue
+        message = str(payload.get("debug") or payload.get("info") or payload.get("error") or "")
+        session_id = str(payload.get("sessionId") or f"file:{path}")
+        if expected_session_id and session_id != expected_session_id:
+            continue
+        state = states.setdefault(session_id, {"connected": False, "registered": False})
+        if "Successfully connected" in message:
+            state["connected"] = True
+        if "Channel notifications registered" in message:
+            state["registered"] = True
+        if state["connected"] and state["registered"]:
+            raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
 bridge_agent_plugin_mcp_alive_for_item() {
   local agent="$1"
   local item="$2"
@@ -8355,7 +8509,10 @@ bridge_agent_plugin_mcp_alive_for_item() {
   bridge_tmux_session_exists "$session" || return 1
   pane_pid="$(bridge_tmux_session_pane_pid "$session")"
   [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 1
-  bridge_plugin_mcp_descendant_ready_for_item "$pane_pid" "$item"
+  if bridge_plugin_mcp_descendant_ready_for_item "$pane_pid" "$item"; then
+    return 0
+  fi
+  bridge_plugin_mcp_engine_log_ready_for_item "$agent" "$item" "$pane_pid"
 }
 
 bridge_agent_missing_plugin_mcp_channels_csv() {
@@ -9306,10 +9463,13 @@ bridge_agent_restart_restore_managed_block() {
 bridge_agent_restart_preflight_full_reason() {
   local agent="$1"
   local channels_csv=""
+  local launch_plugin_channels_csv=""
   local item=""
   local plugin_status=""
   local engine=""
   local engine_bin=""
+  local bun_bin=""
+  local needs_bun=0
   local fragment=""
   local -a items=()
 
@@ -9381,6 +9541,38 @@ bridge_agent_restart_preflight_full_reason() {
         fi
       fi
     done
+  fi
+
+  # Check 2b: probeable Claude plugin MCP channels require bun at launch
+  # time. bridge-run.sh has the pane-side guard, but restart full preflight
+  # must catch the same hard failure BEFORE the old session is killed. This
+  # covers the issue #69 incident shape where a package manager removed bun:
+  # without this controller-side check, restart would kill a working session
+  # and then fail to relaunch the plugin MCP runtime.
+  if [[ "$engine" == "claude" ]]; then
+    launch_plugin_channels_csv="$(bridge_agent_effective_launch_plugin_channels_csv "$agent" 2>/dev/null || true)"
+    if [[ -n "$launch_plugin_channels_csv" ]]; then
+      IFS=',' read -r -a items <<<"$launch_plugin_channels_csv"
+      for item in "${items[@]}"; do
+        item="$(bridge_trim_whitespace "$item" 2>/dev/null || printf '%s' "$item")"
+        [[ -n "$item" ]] || continue
+        if bridge_plugin_mcp_is_probeable_item "$item"; then
+          needs_bun=1
+          break
+        fi
+      done
+    fi
+    if (( needs_bun == 1 )); then
+      if declare -F bridge_resolve_bun_executable >/dev/null 2>&1; then
+        bun_bin="$(bridge_resolve_bun_executable 2>/dev/null || true)"
+      else
+        bun_bin="$(command -v bun 2>/dev/null || true)"
+      fi
+      if [[ -z "$bun_bin" || ! -x "$bun_bin" ]]; then
+        printf 'plugin-mcp-runtime-missing: bun not resolvable on controller PATH for Claude plugin MCP channel(s): %s; PATH=%s (install or relink bun, then verify with: command -v bun && bun --version)' "$launch_plugin_channels_csv" "${PATH:-}"
+        return 0
+      fi
+    fi
   fi
 
   # Check 3: engine binary resolves. We do not require it for non-claude/

@@ -914,3 +914,51 @@ Operator guidance:
   cross-agent reads.
 - Tracked as #1711; a follow-up will align the non-Bash path with the
   #1692 Bash least-privilege model.
+
+## 34. Reparented Claude plugin MCP processes can fool process-tree liveness (#69)
+
+Some Claude plugin MCP servers briefly appear under the Claude/tmux pane
+process and then exit or reparent after the MCP handshake. In that shape,
+Claude can have already connected the plugin and registered channel
+notifications while a descendant-only `ps` probe reports the plugin as
+missing forever.
+
+Observed symptoms:
+
+- Claude MCP cache logs under
+  `~/Library/Caches/claude-cli-nodejs/<workdir-slug>/mcp-logs-plugin-<name>-*/`
+  on macOS or
+  `~/.cache/claude-cli-nodejs/<workdir-slug>/mcp-logs-plugin-<name>-*/`
+  on Linux contain both `Successfully connected` and
+  `Channel notifications registered`.
+- `agent show` or daemon liveness still reports the plugin MCP channel as
+  missing because no long-lived `bun` descendant remains under the tmux pane.
+- Restart-based remediation can become destructive if each verify miss kills
+  and relaunches the agent.
+
+Current mitigation:
+
+- The liveness probe accepts current-session engine-side MCP log evidence
+  as a valid readiness signal and keeps the descendant process check as an
+  auxiliary fast path. The log fallback is bound to the persisted current
+  Claude `sessionId`; if no current session id is known, it fails closed
+  rather than accepting same-workdir evidence from another Claude process.
+  This has the same same-UID trust boundary as the existing `ps` descendant
+  probe.
+- Restart verification re-probes the existing session instead of killing it
+  between attempts. The default verify attempt count is 2 and can be
+  overridden with `BRIDGE_AGENT_RESTART_CHANNEL_VERIFY_MAX_ATTEMPTS`.
+- Claude plugin-channel launches fail early when `bun` is not available in
+  the launch environment, so a missing runtime is surfaced before the agent
+  enters a restart loop. The pane-side launch guard exits 67; restart
+  preflight checks the same runtime before killing the old session.
+- Set `BRIDGE_CLAUDE_NODEJS_CACHE_DIR` to override the Claude NodeJS cache
+  root when the probing process `HOME` does not match the Claude runtime
+  home (for example, unusual isolation or per-agent-home layouts).
+
+Residual caveat:
+
+- A plugin may still connect successfully but fail its downstream provider
+  authentication or permission checks. For example, Discord inbound delivery
+  can still fail with `Used disallowed intents` until the bot's Message
+  Content privileged intent is enabled in the Discord Developer Portal.
