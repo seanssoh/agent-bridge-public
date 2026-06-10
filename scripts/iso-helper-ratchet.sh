@@ -79,8 +79,29 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 2
 fi
 
-# Pattern set — verbatim from codex r1 spec.
-PATTERN='\.env|\.access\.json|installed_plugins\.json|known_marketplaces\.json|webhook-port|settings\.effective\.json|agent-env\.sh'
+# Pattern set — boundary-anchored isolated-artifact filename families.
+#
+# Originally the codex r1 spec shipped the bare alternation
+#   \.env|\.access\.json|...|agent-env\.sh
+# but that substring-matches: `\.env` fires inside `os.environ` /
+# `environ[` / `environment`, and `settings\.effective\.json` fires on
+# fixture paths that merely mention the filename. Both are false
+# positives (no controller->isolated boundary RW), and each cost a
+# diagnose+noqa+push round (#1749/#1757/#1761, 2026-06-10).
+#
+# Fix: require a trailing word-boundary — each filename token must be
+# followed by a NON-word character or end-of-line. `os.environ` no longer
+# matches because the `.env` substring is followed by `i` (a word char);
+# a real `/.env`, `".env"`, `.env.bak`, or `agent-env.sh "` reference
+# still matches because it is followed by `/`, quote, `.`, space, etc.
+#
+# Portability: ripgrep's default (Rust) regex engine runs identically on
+# Linux CI and macOS dev hosts, so no BSD-vs-GNU grep skew applies here.
+# The trailing guard uses a POSIX-safe negated character class
+# `[^A-Za-z0-9_]` (no GNU-only `\b`) and `$`; rg lacks look-around so the
+# negated-class form is the portable equivalent of a `(?![A-Za-z0-9_])`
+# negative lookahead.
+PATTERN='(\.env|\.access\.json|installed_plugins\.json|known_marketplaces\.json|webhook-port|settings\.effective\.json|agent-env\.sh)([^A-Za-z0-9_]|$)'
 
 # Noqa marker callers can use to explicitly mark a controller-only site.
 NOQA_MARKER='# noqa: iso-helper-boundary'
