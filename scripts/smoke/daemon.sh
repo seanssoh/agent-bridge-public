@@ -817,6 +817,7 @@ PY
     awk '/^bridge_queue_gateway_socket_pid_file\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     awk '/^bridge_queue_gateway_socket_pid\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     awk '/^bridge_queue_gateway_socket_connect_probe\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    awk '/^bridge_queue_gateway_socket_probe_persistently_dead\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     awk '/^bridge_queue_gateway_socket_is_running\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     awk '/^bridge_queue_gateway_socket_clean_stale\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     cat <<'BASH'
@@ -891,6 +892,7 @@ PY
     awk '/^bridge_queue_gateway_socket_pid_file\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     awk '/^bridge_queue_gateway_socket_pid\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     awk '/^bridge_queue_gateway_socket_connect_probe\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    awk '/^bridge_queue_gateway_socket_probe_persistently_dead\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     awk '/^bridge_queue_gateway_socket_is_running\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     awk '/^bridge_queue_gateway_socket_clean_stale\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     cat <<'BASH'

@@ -12065,6 +12065,41 @@ bridge_queue_gateway_socket_connect_probe() {
     "$socket_path" >/dev/null 2>&1
 }
 
+bridge_queue_gateway_socket_probe_persistently_dead() {
+  # Issue #1652 (Bug 1): require N *consecutive* connect-probe failures
+  # before treating an alive-pid's bound socket as dead. The listener's
+  # accept() runs on a 1.0s timeout (cmd_socket_server), and the probe's
+  # own connect() has a 1.0s timeout, so a single probe landing in the
+  # wrong window can transiently refuse/timeout even though the listener
+  # is healthy and still bound. The previous clean_stale rm'd the LIVE
+  # socket on that single transient miss, which crash-looped the listener.
+  #
+  # A genuinely-dead socket (recycled pid + leftover file, or an unbound
+  # socket file) refuses every probe, so it still fails all N attempts and
+  # gets cleaned. A healthy-but-flapping listener answers at least one of
+  # the N probes, so we return 1 (not dead) and keep its socket.
+  #
+  # Returns 0 only when ALL attempts failed (persistently dead); 1 if any
+  # attempt succeeded (a live listener answered).
+  local socket_path="$1"
+  local attempts="${BRIDGE_QUEUE_GATEWAY_SOCKET_PROBE_ATTEMPTS:-3}"
+  local gap="${BRIDGE_QUEUE_GATEWAY_SOCKET_PROBE_GAP_SECONDS:-0.2}"
+  local i
+  [[ -n "$socket_path" ]] || return 0
+  [[ "$attempts" =~ ^[0-9]+$ ]] && (( attempts > 0 )) || attempts=3
+  for ((i = 0; i < attempts; i++)); do
+    if bridge_queue_gateway_socket_connect_probe "$socket_path"; then
+      # A live listener answered — not dead. Stop probing.
+      return 1
+    fi
+    # Don't sleep after the final attempt.
+    if (( i < attempts - 1 )); then
+      sleep "$gap" 2>/dev/null || true
+    fi
+  done
+  return 0
+}
+
 bridge_queue_gateway_socket_is_running() {
   # PR #571 r3 finding 4: defense-in-depth liveness check.
   #   1. pid file present and parseable.
@@ -12118,12 +12153,19 @@ bridge_queue_gateway_socket_clean_stale() {
         rm -f "$socket_path"
       fi
     elif [[ -n "$socket_path" && -S "$socket_path" ]] \
-        && ! bridge_queue_gateway_socket_connect_probe "$socket_path"; then
-      # pid is alive but connect refuses → recorded pid is not the
-      # process actually bound to this socket (recycled pid, or a
-      # listener that exited without unlinking). Drop both artifacts so
-      # the next start spawns fresh and the next stop does not signal
-      # an unrelated process.
+        && bridge_queue_gateway_socket_probe_persistently_dead "$socket_path"; then
+      # pid is alive but the connect probe refuses on EVERY one of N
+      # consecutive attempts → recorded pid is not the process actually
+      # bound to this socket (recycled pid, or a listener that exited
+      # without unlinking). Drop both artifacts so the next start spawns
+      # fresh and the next stop does not signal an unrelated process.
+      #
+      # Issue #1652 (Bug 1): the consecutive-failure gate is required.
+      # A single transient probe miss against a HEALTHY listener (its
+      # accept() flaps on a 1.0s timeout) must NOT delete the live
+      # socket — doing so crash-looped the listener (~every 50-90s) on
+      # iso/socket installs. A genuinely-dead socket still fails all N
+      # probes and is cleaned; a live listener answers at least one.
       rm -f "$pid_file"
       rm -f "$socket_path"
     fi

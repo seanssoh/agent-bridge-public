@@ -807,10 +807,28 @@ def _safe_send_json(conn: socket.socket, payload: dict[str, Any]) -> None:
             pass
 
 
+class _ProbeClose(Exception):
+    """Peer connected and closed without sending any bytes.
+
+    Issue #1652: the daemon's liveness connect-probe
+    (gateway-socket-connect-probe.py) connects then closes with no payload
+    on every tick. Treating that empty-recv as a malformed JSON payload made
+    the listener log `decision=deny reason_code=invalid_payload` plus a
+    `send_failed peer_gone=BrokenPipeError` for each probe — a large share of
+    the ~9.6 MB log churn in the crash-loop. The accept loop maps this to an
+    expected, no-op close: no deny log, no response attempt.
+    """
+
+
 def _recv_json(conn: socket.socket) -> dict[str, Any]:
     data = conn.recv(MAX_SOCKET_BYTES + 1)
     if len(data) > MAX_SOCKET_BYTES:
         raise ValueError("oversize")
+    if not data:
+        # Connect-probe / peer-closed-before-send: an empty datagram is not
+        # a malformed payload, it's "nothing was sent". Signal it distinctly
+        # so the handler can treat it as expected and stay quiet.
+        raise _ProbeClose()
     payload = json.loads(data.decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("payload_not_object")
@@ -1033,12 +1051,23 @@ def _shared_group() -> grp.struct_group | None:
         return None
 
 
-def _set_socket_group_mode(path: Path, live: bool = False) -> None:
+def _set_socket_group_mode(path: Path, live: bool = False) -> bool:
     """Set socket to group=ab-shared mode 0660 — no named-user ACEs needed.
 
     All isolated agent OS users are ab-shared members, so they get access
     automatically without per-agent setfacl. In live mode, a missing group
     is a hard failure. In smoke/dev mode, fall back to 0600 (owner-only).
+
+    Returns True when the mode/group was (re)asserted, False when the socket
+    path no longer exists on disk. Issue #1652: the daemon's clean_stale can
+    rm the live listener's socket out from under us on a transient probe
+    flap; the chown/chmod must NOT raise FileNotFoundError into the accept
+    loop (which previously crashed the listener -> daemon respawn ->
+    crash-loop). A missing socket path is a recoverable degrade, not a crash:
+    the listener fd is still bound in the kernel and keeps serving, and the
+    next refresh tick (or a daemon restart) reasserts perms once the path is
+    back. The permissions contract (mode 0660 + ab-shared group, or 0600
+    owner-only in dev) is unchanged when the path IS present.
     """
     g = _shared_group()
     if g is None:
@@ -1048,22 +1077,34 @@ def _set_socket_group_mode(path: Path, live: bool = False) -> None:
                 f"queue gateway socket requires group '{name}' (BRIDGE_SHARED_GROUP). "
                 f"Create the group and add all isolated agent users to it, then restart the daemon."
             )
-        os.chmod(path, 0o600)
-        return
-    os.chown(path, -1, g.gr_gid)
-    os.chmod(path, 0o660)
+        try:
+            os.chmod(path, 0o600)
+        except FileNotFoundError:
+            return False
+        return True
+    try:
+        os.chown(path, -1, g.gr_gid)
+        os.chmod(path, 0o660)
+    except FileNotFoundError:
+        return False
+    return True
 
 
-def _refresh_socket_perms(path: Path, peer_map: dict[int, str], script_dir: Path, live: bool = False) -> None:
+def _refresh_socket_perms(path: Path, peer_map: dict[int, str], script_dir: Path, live: bool = False) -> bool:
     """Refresh peer_map from roster and reassert group/mode on the socket.
 
     peer_map is kept current for SO_PEERCRED authorization in _handle_socket_request.
     The filesystem permission change (group mode) makes it self-healing on each tick.
+
+    Returns the result of the group/mode reassert (see _set_socket_group_mode):
+    True when reasserted, False when the socket path was transiently absent.
+    The peer_map refresh always runs first so authorization stays current
+    even when the fs perm reassert has to be skipped this tick.
     """
     latest = _peer_map_from_roster(script_dir)
     peer_map.clear()
     peer_map.update(latest)
-    _set_socket_group_mode(path, live=live)
+    return _set_socket_group_mode(path, live=live)
 
 
 def _task_row(home: str, task_id: int) -> sqlite3.Row | None:
@@ -1363,6 +1404,12 @@ def _handle_socket_request(
         # this is harmless (cmd_create is the only consumer).
         response.update(run_queue(queue_script, rewritten, cwd, trusted_actor=peer_agent))
         _safe_send_json(conn, response)
+    except _ProbeClose:
+        # Issue #1652: liveness connect-probe (or any peer that connected and
+        # closed without sending) — expected, not a protocol violation. Do
+        # NOT log a deny and do NOT attempt a response (the peer is already
+        # gone, which is what produced the per-probe BrokenPipeError spam).
+        return
     except ValueError as exc:
         reason = "oversize_payload" if str(exc) == "oversize" else "invalid_payload"
         gateway_log(subcmd, peer_uid, peer_agent, "deny", reason, request_id)
@@ -1419,7 +1466,11 @@ def cmd_socket_client(args: argparse.Namespace) -> int:
     except OSError as exc:
         print(f"queue gateway socket unavailable: {exc.strerror or type(exc).__name__}", file=sys.stderr)
         return 1
-    except ValueError:
+    except (ValueError, _ProbeClose):
+        # _ProbeClose: the server closed without sending any bytes — from the
+        # client's POV that is just an empty/invalid response (issue #1652
+        # split the empty-recv case out of ValueError on the server side; the
+        # client must keep treating it as a failed call, not crash uncaught).
         print("queue gateway socket returned an invalid response", file=sys.stderr)
         return 1
 
@@ -1517,7 +1568,18 @@ def cmd_socket_server(args: argparse.Namespace) -> int:
                 conn, _addr = server.accept()
             except (TimeoutError, socket.timeout):
                 if time.monotonic() >= next_acl_refresh:
-                    _refresh_socket_perms(path, peer_map, script_dir, live=is_live)
+                    # Issue #1652: a missing socket path here (daemon rm'd it
+                    # on a transient probe flap) must degrade, not crash —
+                    # _refresh_socket_perms returns False instead of raising
+                    # FileNotFoundError. Log the skip once per tick for
+                    # operator triage; the bound fd keeps serving and the
+                    # next tick reasserts perms once the path is back.
+                    if not _refresh_socket_perms(path, peer_map, script_dir, live=is_live):
+                        print(
+                            f"queue_gateway socket_perms_skip reason=socket_path_missing path={path}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     next_acl_refresh = time.monotonic() + acl_refresh_seconds
                 continue
             except OSError:

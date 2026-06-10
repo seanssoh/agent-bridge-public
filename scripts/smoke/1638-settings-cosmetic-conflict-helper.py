@@ -12,6 +12,13 @@ a heredoc/here-string into a subprocess. Two subcommands:
         upstream-pypath       upstream: bare `python3` interpreter (T2 base side)
         live-abs-pypath       live: `/usr/bin/python3` interpreter (T2)
         live-hook-added       live: an EXTRA hook group (T3, genuine conflict)
+        live-homebrew-abspath live: Homebrew python + ~-expanded abs hook paths
+                              (#1675 + #1694 — render output, cosmetic only)
+        live-abspath-usrbin   live: /usr/bin/python3 + ~-expanded abs hook paths
+                              (#1694-only — path-arg axis, cosmetic only)
+        live-genuine-edit-abspath
+                              live: a REPLACED hook basename + Homebrew/abs
+                              cosmetic axes (#1675/#1694 SAFETY — still conflict)
         plain-base/-upstream/-live
                               non-settings text file fixtures (T4)
 
@@ -123,6 +130,76 @@ def emit_settings(variant: str, out_path: str) -> None:
         doc["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] = (
             ".venv/bin/python3 ~/.agent-bridge/hooks/prompt_timestamp.py"
         )
+        doc["autoDreamEnabled"] = True
+    elif variant == "live-homebrew-abspath":
+        # Live side for #1675 + #1694 (the macOS/Homebrew render output): EVERY
+        # python hook is rewritten to Homebrew's interpreter
+        # (`/opt/homebrew/bin/python3`, #1675) AND the `~/.agent-bridge/hooks/`
+        # prefix is `~`-expanded to an absolute home path (#1694). `bash` hooks
+        # keep their interpreter but also get the absolute path arg. This is
+        # exactly what `shared_settings_rerender` produces on a Homebrew macOS
+        # host — a render-owned no-op — so the cosmetic pre-check must fire and
+        # keep_live with NO conflict. Pair with upstream `base`.
+        home = "/Users/example/.agent-bridge/hooks/"
+        for event in ("Stop", "UserPromptSubmit"):
+            for group in doc["hooks"][event]:
+                for hook in group["hooks"]:
+                    cmd = hook["command"]
+                    interp, _, arg = cmd.partition(" ")
+                    arg = arg.replace("~/.agent-bridge/hooks/", home)
+                    if interp in ("/usr/bin/python3", "python3"):
+                        interp = "/opt/homebrew/bin/python3"
+                    hook["command"] = interp + " " + arg
+        doc["autoDreamEnabled"] = True
+    elif variant == "live-abspath-usrbin":
+        # Live side for #1694-only: `/usr/bin/python3` is ALREADY allowlisted by
+        # #1638, so the interpreter token matches upstream — the ONLY difference
+        # is the `~`-expanded absolute hook path argument. Proves the path-arg
+        # canonicalization closes the conflict independently of the interpreter
+        # axis. Pair with upstream `base`.
+        home = "/Users/example/.agent-bridge/hooks/"
+        for event in ("Stop", "UserPromptSubmit"):
+            for group in doc["hooks"][event]:
+                for hook in group["hooks"]:
+                    hook["command"] = hook["command"].replace(
+                        "~/.agent-bridge/hooks/", home
+                    )
+        doc["autoDreamEnabled"] = True
+    elif variant == "live-genuine-edit-abspath":
+        # Live side for the #1675/#1694 SAFETY case: the operator genuinely
+        # REPLACED a hook script (session-stop.py -> operator-custom.py) AND the
+        # render expanded `~` to absolute + Homebrew python. The path-style /
+        # interpreter axes are cosmetic, but the changed BASENAME is a real edit
+        # the operator must still see. The pre-check must DECLINE (different hook
+        # SET after canonicalization) so a real conflict still surfaces. Pair
+        # with upstream `upstream-session-stop-edited`, which edits the SAME
+        # session-stop line so the two edits overlap into a genuine conflict.
+        home = "/Users/example/.agent-bridge/hooks/"
+        for group in doc["hooks"]["Stop"]:
+            for hook in group["hooks"]:
+                cmd = hook["command"].replace(
+                    "session-stop.py", "operator-custom.py"
+                )
+                interp, _, arg = cmd.partition(" ")
+                arg = arg.replace("~/.agent-bridge/hooks/", home)
+                if interp == "/usr/bin/python3":
+                    interp = "/opt/homebrew/bin/python3"
+                hook["command"] = interp + " " + arg
+        doc["autoDreamEnabled"] = True
+    elif variant == "upstream-session-stop-edited":
+        # Upstream side for the #1675/#1694 SAFETY case (H3): upstream edits the
+        # SAME session-stop hook COMMAND line that live replaces the basename of,
+        # so the two edits overlap and `git merge-file` reports a real conflict.
+        # Pairs with `live-genuine-edit-abspath` to prove the cosmetic pre-check
+        # declining lets a genuine operator edit surface as a true conflict (not
+        # just a coincidental clean merge). Stays on the template `~` form so the
+        # ONLY non-cosmetic axis vs live is the replaced basename.
+        for group in doc["hooks"]["Stop"]:
+            for hook in group["hooks"]:
+                if "session-stop.py" in hook["command"]:
+                    hook["command"] = (
+                        "/usr/bin/python3 ~/.agent-bridge/hooks/session-stop.py --upstream-flag"
+                    )
         doc["autoDreamEnabled"] = True
     elif variant == "upstream-hook-different":
         # Upstream side for T3: appends ITS OWN new hook at the same trailing
