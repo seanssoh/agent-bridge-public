@@ -324,7 +324,13 @@ bridge_link_claude_settings_to_shared() {
       && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
     return 0
   fi
-  bridge_hooks_python link-shared-settings --workdir "$workdir" --shared-settings-file "$effective_file"
+  # #1756 r2: thread the launched channel context so the adoption fold repairs
+  # a sticky-false launched-channel enabledPlugins entry (#1453) instead of
+  # re-disabling inbound delivery at symlink takeover. Same vars the
+  # render-shared-settings call above passes.
+  bridge_hooks_python link-shared-settings --workdir "$workdir" --shared-settings-file "$effective_file" \
+    --launch-cmd "$launch_cmd" \
+    --channels-csv "$channels_csv"
 
   # v2 non-isolated agents launch Claude with CLAUDE_CONFIG_DIR under
   # bridge_agent_default_home (<agent>/home/.claude), while the legacy shared
@@ -348,7 +354,9 @@ bridge_link_claude_settings_to_shared() {
           --launch-cmd "$launch_cmd" \
           --agent-class "$agent_class" \
           --channels-csv "$channels_csv" >/dev/null
-        bridge_hooks_python link-shared-settings --workdir "$agent_claude_home" --shared-settings-file "$agent_effective_file" >/dev/null
+        bridge_hooks_python link-shared-settings --workdir "$agent_claude_home" --shared-settings-file "$agent_effective_file" \
+          --launch-cmd "$launch_cmd" \
+          --channels-csv "$channels_csv" >/dev/null
       fi
     fi
   fi

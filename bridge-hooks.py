@@ -1499,12 +1499,35 @@ def next_backup_path(path: Path, os_user: str | None = None) -> Path:
 # patches `settings["statusLine"]["command"]`, so preserving the key also
 # keeps that tap's patch alive across rerenders rather than having the next
 # render delete what the tap just wrote.)
+#
+# (Issue #1756 added "model" + the benign session-preference toggles below.
+# Selection criterion: a user-set top-level key that is a Claude Code
+# session preference with NO bridge-managed default — the bridge renders no
+# value for it, so dropping the operator's value on every rerender is pure
+# data loss. `model` is the live-confirmed case: an operator who pinned
+# `"model"` saw it revert to the CLI default after the next upgrade/restart
+# re-render, because the render kept only this allowlist and silently
+# dropped everything else. DELIBERATELY EXCLUDED:
+#   - promptSuggestionEnabled / autoCompactWindow: the bridge SETS these as
+#     managed defaults (composer-nudge fix #630 / per-class window #593), so
+#     preserving them would let a stale effective value shadow the managed
+#     default. They are managed keys, not free user keys.
+#   - autoMemoryEnabled / autoDreamEnabled: shipped with a value in the
+#     tracked base (agents/.claude/settings.json), so they already carry a
+#     bridge-rendered value — not orphan user keys.
+#   - arbitrary/unknown keys (the smokes' `unrelatedSetting` control): NOT
+#     preserved. This stays a CURATED ALLOWLIST, not a preserve-everything
+#     denylist, so the #1495 invalid-hook-key sanitize contract and the
+#     existing "allowlist stays tight" regression teeth both still hold.)
 PRESERVED_USER_KEYS = (
     "enabledPlugins",
     "extraKnownMarketplaces",
     "apiKeyHelper",
     "skipDangerousModePermissionPrompt",
     "statusLine",
+    "model",
+    "alwaysThinkingEnabled",
+    "agentPushNotifEnabled",
 )
 
 # Queue request #11901 (operator-approved Option 1, 2026-06-10): a SHARED
@@ -1767,6 +1790,72 @@ def _load_preserved_user_keys(effective_path: Path) -> dict[str, Any]:
     if not isinstance(existing, dict):
         return {}
     return {k: existing[k] for k in PRESERVED_USER_KEYS if k in existing}
+
+
+def _fold_adopted_user_keys_into_shared(
+    regular_file: Path,
+    shared_effective: Path,
+    launch_cmd: str | None = None,
+    channels_csv: str | None = None,
+) -> list[str]:
+    """Fold a regular per-agent `settings.json`'s preserved user keys into the
+    shared effective file before `link-shared-settings` replaces it (#1756 (3)).
+
+    When `cmd_link_shared_settings` converts an operator's regular
+    `<workdir>/.claude/settings.json` to a symlink at the shared effective
+    file, the regular file's content is otherwise lost from the live surface:
+    the shared render reads its preserved keys from the *shared* effective
+    file, never from the per-agent regular file it is about to adopt. So an
+    operator who pinned e.g. `model` in the per-agent file (the file Claude
+    itself wrote into) loses it at adoption time. This folds the regular
+    file's `PRESERVED_USER_KEYS` into the shared effective target so the
+    adoption is lossless. The fold merges user keys *last* (they win), then
+    re-sanitizes invalid hook keys (#1495) so adoption can never reintroduce
+    a key Claude Code would reject.
+
+    `enabledPlugins` is one of the preserved keys this fold merges last, so an
+    adopted regular file recording `enabledPlugins[<launched-channel>]=false`
+    would otherwise re-disable a launched channel plugin in the shared
+    effective target — re-opening the exact #1453 sticky-false inbound-drop
+    the normal render paths repair AFTER the preserved merge. The fold runs
+    OUTSIDE the render path (`cmd_link_shared_settings`), so it must apply the
+    same `_repair_sticky_false_channel_enables` pass — with the agent's
+    launched channel context (`launch_cmd` + `channels_csv`) — after the merge
+    and prune, before save, mirroring the render paths' ordering. A false on a
+    NON-launched plugin still survives (operator intent preserved where safe).
+
+    Returns the sorted list of folded key names (empty when there is nothing
+    to carry forward). Best-effort: a missing/unreadable shared effective
+    file is a no-op (the link still forms; the next render re-preserves from
+    the effective file once Claude writes the keys back through the symlink).
+    """
+    adopted = _load_preserved_user_keys(regular_file)
+    if not adopted:
+        return []
+    shared_owner = _resolve_isolated_owner_for_path(shared_effective)
+    if not _safe_path_check("exists", shared_effective, shared_owner):
+        return []
+    try:
+        current = load_json(shared_effective)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(current, dict):
+        return []
+    folded = [k for k in adopted if current.get(k) != adopted[k]]
+    if not folded:
+        return []
+    merged = merge_settings(current, adopted)
+    _prune_invalid_hook_keys(merged)
+    # #1756 r2 (codex BLOCKING): the adopted file's preserved `enabledPlugins`
+    # can carry a launched-channel `false`; without this repair the fold would
+    # re-disable inbound channel delivery and bypass the #1453 sticky-false fix
+    # until some later render. Apply the same repair the render paths run after
+    # the preserved merge, with the launched channel context threaded in.
+    _repair_sticky_false_channel_enables(
+        merged, launch_cmd, str(shared_effective), channels_csv
+    )
+    save_json(shared_effective, merged)
+    return sorted(folded)
 
 
 def _repair_sticky_false_channel_enables(
@@ -2242,6 +2331,14 @@ def _resolve_iso_link_realpath(path: Path, os_user: str | None) -> str:
 def cmd_link_shared_settings(args: argparse.Namespace) -> int:
     settings_path = Path(args.workdir).expanduser() / ".claude" / "settings.json"
     shared_path = Path(args.shared_settings_file).expanduser()
+    # #1756 r2: the agent's launched channel context, threaded the same way the
+    # render paths receive it (BRIDGE_AGENT_CHANNELS CSV + stored launch
+    # command), so the adoption fold can repair a sticky-false launched-channel
+    # `enabledPlugins` entry (#1453) instead of re-disabling inbound delivery.
+    # Optional/empty for legacy and non-channel callers — then the repair
+    # resolves an empty launched set and is a no-op.
+    link_launch_cmd = (getattr(args, "launch_cmd", "") or "") or None
+    link_channels_csv = (getattr(args, "channels_csv", "") or "") or None
     # v0.8.8 #714 item 3 / #694: when the agent workdir is owned by a
     # linux-user-isolated account, controller-side `mkdir` / `unlink` /
     # `symlink_to` / `shutil.copy2` raise PermissionError because the
@@ -2310,6 +2407,25 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
                 rc = _sudo_run_as(os_user, "cp", "-p", str(settings_path), str(backup))
                 if rc != 0:
                     raise
+            # #1756 (3): fold the regular file's preserved user keys into the
+            # shared effective target BEFORE we unlink it, so an operator key
+            # (e.g. `model`) written into the per-agent settings.json is not
+            # lost the moment we adopt the file into the managed symlink. Done
+            # while the regular file still exists; best-effort (no-op when the
+            # shared target is missing/unreadable — the link still forms).
+            # #1756 r2: thread the agent's launched channel context so the fold
+            # repairs a sticky-false launched-channel `enabledPlugins` entry
+            # (#1453) instead of re-disabling inbound delivery at adoption time.
+            folded = _fold_adopted_user_keys_into_shared(
+                settings_path, shared_path, link_launch_cmd, link_channels_csv
+            )
+            if folded:
+                sys.stderr.write(
+                    "[info] bridge-hooks: link-shared-settings folded operator "
+                    f"key(s) {', '.join(folded)} from {settings_path} into "
+                    f"{shared_path} before adoption (#1756 — no loss at "
+                    "symlink takeover)\n"
+                )
             try:
                 settings_path.unlink()  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo rm fallback below
             except PermissionError:
@@ -3013,6 +3129,16 @@ def build_parser() -> argparse.ArgumentParser:
     link_shared_parser = subparsers.add_parser("link-shared-settings")
     link_shared_parser.add_argument("--workdir", required=True)
     link_shared_parser.add_argument("--shared-settings-file", required=True)
+    link_shared_parser.add_argument(
+        "--launch-cmd",
+        default="",
+        help="The agent launch command. #1756 r2: parsed for the launched channel plugin set (--channels / --dangerously-load-development-channels) so the adoption fold repairs a sticky-false launched-channel enabledPlugins entry (#1453) instead of re-disabling inbound delivery at symlink takeover. Empty for non-channel/legacy callers => no launched set => repair is a no-op.",
+    )
+    link_shared_parser.add_argument(
+        "--channels-csv",
+        default="",
+        help="The agent's resolved channels CSV (bridge_agent_channels_csv, from BRIDGE_AGENT_CHANNELS — the SSOT). #1756 r2: needed so the adoption fold knows the launched channel plugin set for normally-created channel agents, whose stored launch command does NOT carry the --channels flag, and repairs a stale enabledPlugins=false for those plugins (#1453).",
+    )
     link_shared_parser.add_argument("--format", choices=("text", "shell"), default="text")
     link_shared_parser.set_defaults(handler=cmd_link_shared_settings)
 
