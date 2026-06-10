@@ -20,11 +20,35 @@ Args (positional, order-sensitive):
                   `--continue` when continue_mode=1 and no session_id
                   but the workdir has a resumable transcript)
     sys.argv[5] — original (the roster-provided LAUNCH_CMD fallback)
+    sys.argv[6] — model (BRIDGE_AGENT_MODEL[<a>]; may be empty). When
+                  non-empty, the roster-materialized value WINS: any
+                  `--model <x>` already baked into the LAUNCH_CMD extras
+                  is stripped and `--model <model>` re-emitted. When
+                  empty, a baked `--model` is preserved byte-for-byte.
+                  Optional for back-compat — defaults to empty.
+    sys.argv[7] — effort (BRIDGE_AGENT_EFFORT[<a>]; may be empty). Same
+                  roster-wins / preserve-when-empty contract as model.
+                  Optional for back-compat — defaults to empty.
+
+Baked `--model`/`--effort` strip contract (when the roster overrides):
+    - Joined form `--model=x`: the value rides the same token; drop 1.
+    - Space form `--model x`: consume the following token as the value
+      slot ONLY when it is a plain value (does not start with `-`).
+    - Malformed/valueless space form — the follower is option-shaped
+      (`--model --settings ...`) or there is no follower (`--model` last):
+      treat the baked flag as valueless, drop only the flag, and PRESERVE
+      the following token. This guarantees an unrelated flag is never
+      eaten as the model value and no stray positional is stranded.
 
 Stdout: rewritten launch_cmd with `--dangerously-skip-permissions`,
-`--name <agent>`, and the appropriate resume mode pinned. Existing
-`-c`, `--continue`, `--dangerously-skip-permissions`, `--resume`,
-and `--name` tokens are stripped to avoid double-emit. Always exits 0.
+`--name <agent>`, the appropriate resume mode pinned, and (when the
+roster provides them) `--model` / `--effort`. Existing `-c`,
+`--continue`, `--dangerously-skip-permissions`, `--resume`, and
+`--name` tokens are stripped to avoid double-emit; `--model` /
+`--effort` are stripped only when the roster overrides them (issue
+#1763 — `agent update --model/--effort` was a silent no-op for static
+Claude agents because this builder never read those roster vars).
+Always exits 0.
 
 Behavior (preserved byte-for-byte from the pre-extraction body):
     Includes the `false` → `claude` repair (handles a stale-roster
@@ -60,6 +84,11 @@ def repair_false_command(value: str) -> str:
 
 def main() -> int:
     agent, continue_mode, session_id, continue_fallback, original = sys.argv[1:6]
+    # #1763: model/effort are optional positional tails for back-compat with
+    # any caller still passing the pre-#1763 5-arg shape (defaults to empty,
+    # which preserves the historical "do not touch model/effort" behavior).
+    model = sys.argv[6] if len(sys.argv) > 6 else ""
+    effort = sys.argv[7] if len(sys.argv) > 7 else ""
 
     original = repair_false_command(original)
     match = re.match(r"^(?P<prefix>.*?)(?P<command>claude(?:\s|$).*)$", original)
@@ -73,6 +102,24 @@ def main() -> int:
         print(original)
         return 0
 
+    # #1763: when the roster supplies a value, the materialized value WINS over
+    # a stale baked flag — strip the baked `--model`/`--effort` from the extras
+    # so the roster value is the single emission. Both the space-separated
+    # (`--model x`) and joined (`--model=x`) baked forms are stripped, so a
+    # re-render stays single-emission regardless of how the workaround flag was
+    # authored. When the roster var is empty, the baked flag is left untouched
+    # in extras (preserves the documented `--set-launch-cmd` workaround
+    # byte-for-byte).
+    override_flags = set()
+    if model:
+        override_flags.add("--model")
+    if effort:
+        override_flags.add("--effort")
+
+    def _is_override_token(tok: str) -> bool:
+        # Match `--model` / `--effort` exactly or their `--model=<x>` joined form.
+        return tok in override_flags or tok.split("=", 1)[0] in override_flags
+
     rest = args[1:]
     extras: list[str] = []
     j = 0
@@ -83,6 +130,23 @@ def main() -> int:
             continue
         if token in {"--resume", "--name"}:
             j += 2 if j + 1 < len(rest) else 1
+            continue
+        if _is_override_token(token):
+            # Drop the baked flag. The joined `--model=x` form carries its value
+            # in the same token (drop 1). For the space-separated `--model x`
+            # form, consume the FOLLOWING token as the value slot ONLY when it is
+            # a plain value (does not itself start with `-`). When the follower
+            # is option-shaped (e.g. a baked `--model --settings /tmp/x.json`) or
+            # absent, the baked flag is treated as malformed/valueless: drop only
+            # the flag and preserve the following token, so an unrelated flag is
+            # never eaten and no stray positional is stranded. The roster value
+            # is re-emitted below either way.
+            if "=" in token:
+                j += 1
+            elif j + 1 < len(rest) and not rest[j + 1].startswith("-"):
+                j += 2
+            else:
+                j += 1
             continue
         extras.append(token)
         if token.startswith("--") and j + 1 < len(rest) and not rest[j + 1].startswith("-"):
@@ -97,6 +161,13 @@ def main() -> int:
     elif continue_mode == "1" and continue_fallback == "1":
         base.append("--continue")
     base.extend(["--dangerously-skip-permissions", "--name", agent])
+    # #1763: mirror the dynamic builder's `--model`/`--effort` emission so a
+    # static agent's roster-materialized model/effort actually reach the
+    # launched `claude` process. Only emit when the roster supplies a value.
+    if model:
+        base.extend(["--model", model])
+    if effort:
+        base.extend(["--effort", effort])
     base.extend(extras)
 
     quoted = " ".join(shlex.quote(token) for token in base)
