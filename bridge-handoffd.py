@@ -854,6 +854,19 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
         a2a.prove_warp_mesh_local_bind(bind)
         return bind, port
 
+    if kind == a2a.TRANSPORT_TRUSTED_ROUTED:
+        # Trusted-routed (#1758): the bind IP MUST be assigned to a real local
+        # interface — the interface-assignment HALF of the WARP proof, with the
+        # WARP/Tailscale enrollment half DROPPED. The wildcard + loopback
+        # refusals above STILL apply (this branch is reached only after them);
+        # prove_trusted_routed_local_bind raises A2AError on interface-enum
+        # failure or an IP not on any local interface, so a CIDR-only guess is
+        # still refused. The trust boundary is the routed private network
+        # itself — an explicit operator decision; everything ELSE (HMAC,
+        # allowlist, source-addr check, dedupe) stays fail-closed + unchanged.
+        a2a.prove_trusted_routed_local_bind(bind)
+        return bind, port
+
     # Tailscale (default): the bind address MUST be proven to be in this
     # node's actual local Tailscale address set. tailscale_addresses() raises
     # TailscaleUnavailable (a subclass of A2AError) if the local set cannot be
@@ -1773,8 +1786,8 @@ def _relay_forward_send(cfg: dict[str, Any], *, env: dict[str, Any],
             path=path, headers=headers, body_bytes=body_bytes)
 
     try:
-        address = a2a.resolve_peer_address_for_transport(
-            a2a.transport_kind(cfg), peer)
+        kind = a2a.transport_kind(cfg)
+        address = a2a.resolve_peer_address_for_transport(kind, peer)
     except a2a.A2AError as exc:
         return False, 0, f"target addr unresolved: {exc}"
     port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
@@ -1784,8 +1797,13 @@ def _relay_forward_send(cfg: dict[str, Any], *, env: dict[str, Any],
     req = urllib.request.Request(url, data=body_bytes, method="POST")
     for k, v in headers.items():
         req.add_header(k, v)
+    # #1758: per-destination egress source — same symmetry as the outbox
+    # sender. A warp-mesh target leaves on this node's own Mesh listen.address;
+    # a trusted-routed/tailscale target gets None (OS routing picks the source).
+    opener = a2a.source_bound_opener(
+        a2a.select_source_address_for_transport(kind, cfg, peer))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             status = int(resp.status)
             return (200 <= status < 300), status, f"status={status}"
     except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]
