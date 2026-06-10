@@ -2,7 +2,7 @@
 """Helper for scripts/smoke/1759-selfref-global-loop-guard.sh.
 
 Issue #1759: on shared-admin layouts the operator's `~/.claude/settings.json`
-is a bridge-managed SYMLINK to an agent's own `settings.effective.json`
+is a bridge-managed SYMLINK to an agent's own `settings.effective.json` # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
 (created by `link-shared-settings`). The #11901 operator-global base-read then
 becomes SELF-REFERENTIAL for that one agent — its render reads its own
 previous output as the bottom layer, a self-sustaining loop (benign-key
@@ -126,7 +126,7 @@ def main(argv: list[str]) -> int:
     # ---- (a) SELF-REF: operator-global symlink -> agent A's own effective ----
     # The effective file at the per-agent render target shape so the detection
     # pattern (leaf settings.effective.json under .claude) matches.
-    effA = scratch / "agents" / "A" / ".claude" / "settings.effective.json"
+    effA = scratch / "agents" / "A" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
     effA.parent.mkdir(parents=True, exist_ok=True)
     # Seed the EXISTING effective file with (1) a benign key that ONLY ever
     # entered via the loop and (2) a PRESERVED_USER_KEY (`model`) that the
@@ -177,7 +177,7 @@ def main(argv: list[str]) -> int:
         ),
         encoding="utf-8",
     )
-    effB = scratch / "agents" / "B" / ".claude" / "settings.effective.json"
+    effB = scratch / "agents" / "B" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
     effB.parent.mkdir(parents=True, exist_ok=True)
     procB, effBr = _render(hooks_py, base, overlay, effB, op_global)
     _check(
@@ -192,7 +192,7 @@ def main(argv: list[str]) -> int:
     )
 
     # ---- (c) NESTED symlink chain -> still detected as self-ref for owner ----
-    effC = scratch / "agents" / "C" / ".claude" / "settings.effective.json"
+    effC = scratch / "agents" / "C" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
     effC.parent.mkdir(parents=True, exist_ok=True)
     effC.write_text(json.dumps({"model": "claude-opus-4-8[1m]"}), encoding="utf-8")
     inter = scratch / "intermediate.json"
@@ -214,7 +214,7 @@ def main(argv: list[str]) -> int:
     )
 
     # ---- (e) MISSING-GLOBAL degrade unchanged ----
-    effD = scratch / "agents" / "D" / ".claude" / "settings.effective.json"
+    effD = scratch / "agents" / "D" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
     procD, effDr = _render(
         hooks_py,
         base,

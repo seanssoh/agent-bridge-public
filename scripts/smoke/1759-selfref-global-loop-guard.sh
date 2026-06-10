@@ -55,10 +55,10 @@ assert_detection_helper() {
   smoke_make_temp_root "$SMOKE_NAME-detect"
   local d="$SMOKE_TMP_ROOT"
   mkdir -p "$d/agents/A/.claude" "$d/agents/B/.claude" "$d/ophome/.claude" "$d/realhome/.claude"
-  : >"$d/agents/A/.claude/settings.effective.json"
-  : >"$d/agents/B/.claude/settings.effective.json"
-  ln -s "$d/agents/A/.claude/settings.effective.json" "$d/ophome/.claude/settings.json"
-  ln -s "$d/agents/A/.claude/settings.effective.json" "$d/inter.json"
+  : >"$d/agents/A/.claude/settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+  : >"$d/agents/B/.claude/settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+  ln -s "$d/agents/A/.claude/settings.effective.json" "$d/ophome/.claude/settings.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+  ln -s "$d/agents/A/.claude/settings.effective.json" "$d/inter.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
   ln -s "$d/inter.json" "$d/ophome/.claude/settings-nested.json"
   printf '{"agentPushNotifEnabled": true}' >"$d/realhome/.claude/settings.json"
 
@@ -67,13 +67,13 @@ assert_detection_helper() {
     BRIDGE_SELFREF_DIR="$d" python3 -c '
 import importlib.util, os, sys
 from pathlib import Path
-d = Path(os.environ["BRIDGE_SELFREF_DIR"])
+d = Path(os.environ["BRIDGE_SELFREF_DIR"]) # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
 spec = importlib.util.spec_from_file_location("bridge_hooks", "'"$SMOKE_REPO_ROOT"'/bridge-hooks.py")
 hooks = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hooks)
 fn = hooks._operator_global_is_self_reference
-effA = d / "agents/A/.claude/settings.effective.json"
-effB = d / "agents/B/.claude/settings.effective.json"
+effA = d / "agents/A/.claude/settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+effB = d / "agents/B/.claude/settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
 direct = d / "ophome/.claude/settings.json"
 nested = d / "ophome/.claude/settings-nested.json"
 realg = d / "realhome/.claude/settings.json"
@@ -106,24 +106,24 @@ assert_drift_apply_guard() {
   smoke_make_temp_root "$SMOKE_NAME-guard"
   local d="$SMOKE_TMP_ROOT"
   mkdir -p "$d/home-root/sysmon/.claude" "$d/op-home/.claude" "$d/home-root/other/.claude"
-  : >"$d/home-root/sysmon/.claude/settings.effective.json"
-  : >"$d/home-root/other/.claude/settings.effective.json"
+  : >"$d/home-root/sysmon/.claude/settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+  : >"$d/home-root/other/.claude/settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
   # Operator global = symlink -> sysmon's own effective file (self-ref).
-  ln -s "$d/home-root/sysmon/.claude/settings.effective.json" "$d/op-home/.claude/settings.json"
+  ln -s "$d/home-root/sysmon/.claude/settings.effective.json" "$d/op-home/.claude/settings.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
 
   local out rc=0
   out="$(
     BRIDGE_GUARD_DIR="$d" python3 -c '
 import importlib.util, os, sys
 from pathlib import Path
-d = Path(os.environ["BRIDGE_GUARD_DIR"])
+d = Path(os.environ["BRIDGE_GUARD_DIR"]) # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
 spec = importlib.util.spec_from_file_location("bridge_hooks", "'"$SMOKE_REPO_ROOT"'/bridge-hooks.py")
 hooks = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hooks)
 fn = hooks._operator_global_is_self_reference
 op_global = d / "op-home/.claude/settings.json"
-eff_self = d / "home-root/sysmon/.claude/settings.effective.json"
-eff_other = d / "home-root/other/.claude/settings.effective.json"
+eff_self = d / "home-root/sysmon/.claude/settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+eff_other = d / "home-root/other/.claude/settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
 # Owning agent (sysmon): applying writes through the symlink to the operator
 # global -> guard fires and names the file.
 if fn(op_global, eff_self):
@@ -142,12 +142,12 @@ sys.exit(1)
   BRIDGE_GUARD_DIR="$d" python3 -c '
 import importlib.util, os, sys
 from pathlib import Path
-d = Path(os.environ["BRIDGE_GUARD_DIR"])
+d = Path(os.environ["BRIDGE_GUARD_DIR"]) # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
 spec = importlib.util.spec_from_file_location("bridge_hooks", "'"$SMOKE_REPO_ROOT"'/bridge-hooks.py")
 hooks = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hooks)
 op_global = d / "op-home/.claude/settings.json"
-eff_other = d / "home-root/other/.claude/settings.effective.json"
+eff_other = d / "home-root/other/.claude/settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
 sys.exit(0 if hooks._operator_global_is_self_reference(op_global, eff_other) else 1)
 ' || rc_other=$?
   smoke_assert_eq "$rc_other" "1" "drift-apply guard does NOT fire for a different agent's effective file"
