@@ -218,6 +218,12 @@ def main(argv: list[str]) -> int:
         scratch / "op_sens" / ".claude" / "settings.json",
         {
             "agentPushNotifEnabled": True,
+            # #1756 (2): a benign operator-global `model` pin must survive the
+            # safety filter and inherit into the shared agent — `model` is a
+            # plain session preference, not in the denylist or credential-name
+            # guard. Pinned in the same fixture so the FILTER block proves the
+            # benign-inherit and sensitive-drop sides together.
+            "model": "claude-opus-4-8[1m]",
             "apiKeyHelper": "/usr/local/bin/get-key.sh",
             "statusLine": {"type": "command", "command": "/Users/op/hud.sh"},
             "hooks": {
@@ -236,6 +242,11 @@ def main(argv: list[str]) -> int:
     _check(
         "FILTER benign agentPushNotifEnabled still inherited",
         eff.get("agentPushNotifEnabled") is True,
+    )
+    _check(
+        "FILTER benign operator-global model pin inherited (#1756)",
+        eff.get("model") == "claude-opus-4-8[1m]",
+        detail=json.dumps(eff.get("model")),
     )
     _check("FILTER apiKeyHelper dropped from global", "apiKeyHelper" not in eff)
     _check(
