@@ -37,6 +37,18 @@
 #   T2 — Admin's OWN start still reconciles its workdir from HOME (#1417 intact):
 #        a HOME edit on the admin propagates to the shared workdir (the owner is
 #        allowed to refresh its own identity copy).
+#   T3 — Owner refresh when the admin edits ALL identity anchors in HOME (SOUL.md
+#        PLUS CLAUDE.md/entrypoint PLUS SESSION-TYPE.md), not just one. The r1
+#        ownership test proved ownership by byte-equality between the workdir and
+#        the *current* home, so once the owner rewrote every anchor NO workdir
+#        copy matched the new home → the guard misclassified the admin's own
+#        workdir as foreign and BLOCKED the legitimate #1417 refresh (codex
+#        probe: PROBE_RESULT=blocked_owner_refresh). The r2 fix decides ownership
+#        by AGENT IDENTITY (the stale workdir copy still NAMES `patch`), so the
+#        admin's own start still refreshes its shared workdir from HOME.
+#   T3-TEETH — After that all-anchors owner refresh, the PAIR's start must STILL
+#        decline (the workdir names `patch`, the pair is `patch-dev` → foreign).
+#        Pins that ownership-by-identity kept the #1750 teeth.
 #   TEETH — With the guard disabled (BRIDGE_LAYOUT_DISABLE_FOREIGN_GUARD_1750=1,
 #        i.e. the pre-fix behavior), the pair's start DOES overwrite the admin's
 #        workdir with the codex-pair template — reproducing the #1750 divergence.
@@ -250,6 +262,91 @@ smoke_assert_contains "$(grep 'Onboarding State' "$SHARED_WORKDIR/SESSION-TYPE.m
 smoke_log "T2 PASS — admin self-sync still propagates HOME edits to its own workdir (#1417 intact)"
 
 # ===========================================================================
+# T3 — owner refresh when the admin edits ALL identity anchors in HOME
+#      (SOUL.md + CLAUDE.md/entrypoint + SESSION-TYPE.md), not just one.
+#      This is the case the r1 byte-equality ownership test MISCLASSIFIED as
+#      foreign and BLOCKED — codex's direct probe: PROBE_RESULT=blocked_owner_
+#      refresh. The r2 fix decides ownership by AGENT IDENTITY (the workdir still
+#      NAMES `patch`, stale or not), so the admin's own start must still refresh
+#      its shared workdir from HOME even though no workdir copy is byte-identical
+#      to the NEW home anchors.
+# ===========================================================================
+# Reset the shared workdir to a known-good admin identity @T0.
+write_admin_identity "$SHARED_WORKDIR"
+
+# Rewrite EVERY identity anchor in the admin HOME (the #1417 author edit). The
+# canonical headers still name `patch` (a refresh changes role/body text, not the
+# agent's own name) but every byte downstream differs from the workdir @T0 copy —
+# so the old `cmp -s home workdir` ownership probe finds NO matching anchor.
+{
+  printf '%s\n' '# patch Soul'
+  printf '%s\n' '너는 patch다. 역할은 Manager/admin role (REFRESHED v2)이다.'
+  printf '%s\n' '## 새 기준'
+  printf '%s\n' '- v2 refresh: 모든 anchor를 갱신했다.'
+} >"$ADMIN_HOME/SOUL.md"
+{
+  printf '%s\n' '# patch — Manager/admin role  (런타임: Claude Code CLI)'
+  printf '%s\n' ''
+  printf '%s\n' '## v2 운영 계약 (REFRESHED)'
+  printf '%s\n' '- 갱신된 운영 규칙 본문.'
+} >"$ADMIN_HOME/CLAUDE.md"
+{
+  printf '%s\n' '# Session Type'
+  printf '%s\n' ''
+  printf '%s\n' '- Session Type: admin'
+  printf '%s\n' '- Onboarding State: complete'
+  printf '%s\n' '- Engine: claude'
+  printf '%s\n' '- Refresh: v2'
+} >"$ADMIN_HOME/SESSION-TYPE.md"
+# HOME strictly newer than the workdir @T0 copies (so only the #1750 ownership
+# guard — not the #1417 mtime guard — could block the refresh).
+touch -t 200001010000 "$SHARED_WORKDIR/SOUL.md" "$SHARED_WORKDIR/SESSION-TYPE.md" "$SHARED_WORKDIR/CLAUDE.md"
+
+run_sync "$ADMIN" claude "$SHARED_WORKDIR" >/dev/null \
+  || smoke_fail "T3: admin all-anchors sync driver exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/sync.stderr"))"
+
+# The NEW identity must now be present in the shared workdir (refresh proceeded).
+if ! cmp -s -- "$ADMIN_HOME/SOUL.md" "$SHARED_WORKDIR/SOUL.md"; then
+  smoke_fail "T3: admin's all-anchors HOME refresh did NOT reach the workdir SOUL.md — the r1 byte-equality guard blocked the owner's own #1417 refresh (PROBE_RESULT=blocked_owner_refresh)"
+fi
+if ! cmp -s -- "$ADMIN_HOME/CLAUDE.md" "$SHARED_WORKDIR/CLAUDE.md"; then
+  smoke_fail "T3: admin's all-anchors HOME refresh did NOT reach the workdir CLAUDE.md — owner refresh blocked (PROBE_RESULT=blocked_owner_refresh)"
+fi
+smoke_assert_contains "$(grep -E 'Refresh:' "$SHARED_WORKDIR/SESSION-TYPE.md" 2>/dev/null)" "v2" \
+  "T3: admin's all-anchors HOME refresh did NOT reach the workdir SESSION-TYPE.md (#1417 owner refresh blocked)"
+# Still the ADMIN's identity — the refresh must not have leaked the pair template.
+smoke_assert_eq "# patch Soul" "$(workdir_soul_head)" \
+  "T3: workdir SOUL.md no longer names the admin after the all-anchors refresh"
+if grep -q "patch-dev" "$SHARED_WORKDIR/SOUL.md" "$SHARED_WORKDIR/SESSION-TYPE.md" "$SHARED_WORKDIR/CLAUDE.md" 2>/dev/null; then
+  smoke_fail "T3: the codex-pair (patch-dev) identity leaked into the admin workdir during the owner refresh"
+fi
+
+smoke_log "T3 PASS — admin all-anchors HOME refresh reaches its shared workdir (owner-refresh not blocked; codex blocked_owner_refresh probe fixed)"
+
+# ===========================================================================
+# T3-TEETH — prove T3 is load-bearing on the ownership predicate. With the same
+# all-anchors-changed admin HOME, the PAIR's start must STILL decline (the
+# workdir names `patch`, the pair is `patch-dev` → foreign → no clobber). This
+# pins that the r2 ownership-by-identity fix kept the #1750 teeth even after the
+# owner rewrote every anchor: owner refresh works, foreign pair still declines.
+# ===========================================================================
+# Workdir currently holds the admin's refreshed v2 identity (from T3). Make the
+# pair's HOME copies strictly newer so, absent the #1750 guard, the #1417 mtime
+# rule would propagate the pair template.
+touch -t 200001010000 "$SHARED_WORKDIR/SOUL.md" "$SHARED_WORKDIR/SESSION-TYPE.md" "$SHARED_WORKDIR/CLAUDE.md"
+
+run_sync "$PAIR" codex "$SHARED_WORKDIR" >/dev/null \
+  || smoke_fail "T3-TEETH: pair sync driver exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/sync.stderr"))"
+
+smoke_assert_eq "# patch Soul" "$(workdir_soul_head)" \
+  "T3-TEETH: pair start clobbered the admin's REFRESHED workdir SOUL.md (#1750 regressed for the all-anchors-changed owner)"
+if grep -q "patch-dev" "$SHARED_WORKDIR/SOUL.md" "$SHARED_WORKDIR/SESSION-TYPE.md" "$SHARED_WORKDIR/CLAUDE.md" 2>/dev/null; then
+  smoke_fail "T3-TEETH: the pair's codex template leaked into the admin's refreshed workdir (#1750 regressed)"
+fi
+
+smoke_log "T3-TEETH PASS — pair start still declines after the owner rewrote every anchor (#1750 intact)"
+
+# ===========================================================================
 # TEETH — disable the #1750 guard and confirm the pre-fix divergence returns.
 # ===========================================================================
 # Reset the workdir to the admin's correct identity, then run the pair start
@@ -269,4 +366,4 @@ fi
 
 smoke_log "TEETH PASS — disabling the #1750 guard reproduces the codex-pair divergence (the guard is load-bearing)"
 
-smoke_log "PASS: $SMOKE_NAME (T1, T2, TEETH)"
+smoke_log "PASS: $SMOKE_NAME (T1, T2, T3, T3-TEETH, TEETH)"
