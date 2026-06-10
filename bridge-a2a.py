@@ -863,10 +863,12 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
         _mark_dead(conn, message_id, str(exc))
         return "dead(nosecret)"
 
-    # #1758: per-destination egress source. A warp-mesh peer is reachable only
-    # over the Mesh utun, so we pin this node's own Mesh listen.address as the
-    # source; a trusted-routed (or tailscale) peer gets None so the OS routing
-    # table picks the reachable egress interface for the destination.
+    # #1758: per-destination egress source, keyed on the peer's EFFECTIVE
+    # transport (its own transport.kind override, else this node's `kind`). A
+    # warp-mesh destination is reachable only over the Mesh utun, so we pin this
+    # node's own Mesh listen.address; a trusted-routed/tailscale destination
+    # (incl. a routed-marked peer on a warp-mesh node) gets None so the OS
+    # routing table picks the reachable egress interface.
     source_address = a2a.select_source_address_for_transport(kind, cfg, peer)
     try:
         status, headers, resp_body = _post_envelope(

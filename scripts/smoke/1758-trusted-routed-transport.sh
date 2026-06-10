@@ -157,6 +157,29 @@ EOF
   chmod 0600 "$BRIDGE_HOME/handoff-tr-bind.json"
 }
 
+# A mock `tailscale` CLI that reports a tailnet IP on `ip` AND records that it
+# was invoked (touches a sentinel). Used by the empty-bind F1 case to PROVE the
+# trusted-routed empty-listen.address path FAILS CLOSED with bind_unresolved
+# and NEVER falls through to the Tailscale auto-select (which would otherwise
+# bind tailnet[0]=100.64.0.99 under the weaker interface-only proof).
+write_mock_tailscale_available() {
+  local cli="$SMOKE_TMP_ROOT/tailscale-mock-available"
+  local sentinel="$SMOKE_TMP_ROOT/tailscale-was-invoked"
+  rm -f "$sentinel"
+  cat >"$cli" <<EOF
+#!/usr/bin/env bash
+: >"$sentinel"
+case "\${1:-}" in
+  ip)            echo "100.64.0.99" ;;
+  status)        echo '{"Self":{"TailscaleIPs":["100.64.0.99"]}}' ;;
+  *)             echo "mock tailscale: \${1:-<none>}" >&2; exit 0 ;;
+esac
+exit 0
+EOF
+  chmod 0755 "$cli"
+  printf '%s' "$cli"
+}
+
 base_url() {
   printf 'http://127.0.0.1:%s' "$A2A_PORT"
 }
@@ -333,6 +356,57 @@ tr_sender_source_bound_egress() {
     "None-source (OS-routed) opener delivers the POST (trusted-routed case)"
 }
 
+# === (e/F2) CALL-SITE-SHAPED source selection — the real laptop rollout shape ===
+tr_sender_source_callsite() {
+  # Fixed warp-mesh node + two heterogeneous peers (one mesh, one routed-marked)
+  # resolved through the EXACT sender sequence. Proves the per-DESTINATION fix:
+  # the bug Mesh-pinned EVERY peer on a warp-mesh node, stranding the routed
+  # cm-prod peer ("Network is unreachable").
+  local out; out="$(helper source-select-callsite)"
+  smoke_assert_contains "$out" "NODE_KIND=cloudflare-warp-mesh" \
+    "node kind derived once = cloudflare-warp-mesh (the laptop)"
+  smoke_assert_contains "$out" "MESH_PEER_SOURCE=10.128.0.25" \
+    "unmarked Mesh peer keeps the pinned Mesh source (byte-unaffected)"
+  smoke_assert_contains "$out" "ROUTED_PEER_SOURCE=None" \
+    "routed-marked cm-prod peer gets None -> OS-routed (was wrongly Mesh-pinned)"
+}
+
+# === (e/F2) an unknown PEER transport.kind hard-fails (fail-closed) ===
+tr_peer_transport_unknown() {
+  local out; out="$(helper peer-transport-unknown)"
+  smoke_assert_contains "$out" "PEER_UNKNOWN_CODE=transport_unknown" \
+    "typo PEER transport.kind -> transport_unknown (no silent fallback)"
+}
+
+# === (F1) empty listen.address under trusted-routed -> bind_unresolved ===
+tr_empty_bind_no_autoselect() {
+  # The trusted-routed bind proof is interface-assignment ONLY (weaker). An
+  # empty listen.address MUST fail closed with bind_unresolved and MUST NOT
+  # fall through to the Tailscale auto-select (which would bind tailnet[0]
+  # under that weaker proof). A tailscale CLI that WOULD return 100.64.0.99 is
+  # provided; we assert it was NEVER consulted.
+  local ts_cli sentinel
+  ts_cli="$(write_mock_tailscale_available)"
+  sentinel="$SMOKE_TMP_ROOT/tailscale-was-invoked"
+  write_tr_bind_config ""
+  local out rc=0
+  out="$(BRIDGE_A2A_WARP_CLI="$SMOKE_TMP_ROOT/no-such-warp-cli" \
+        BRIDGE_A2A_TAILSCALE_CLI="$ts_cli" \
+        BRIDGE_A2A_IFACE_ADDRS="100.64.0.99" \
+        python3 "$SMOKE_REPO_ROOT/bridge-handoffd.py" preflight \
+          --config "$BRIDGE_HOME/handoff-tr-bind.json" 2>&1)" || rc=$?
+  smoke_assert_eq "1" "$rc" "trusted-routed empty listen.address refused (rc=1)"
+  smoke_assert_contains "$out" "bind_unresolved" \
+    "empty listen.address under trusted-routed -> bind_unresolved (no auto-select)"
+  smoke_assert_not_contains "$out" "auto-selected tailnet IP" \
+    "trusted-routed empty bind does NOT auto-select a tailnet IP"
+  smoke_assert_not_contains "$out" "100.64.0.99" \
+    "the auto-select tailnet IP never leaks into a trusted-routed bind"
+  [[ -f "$sentinel" ]] && smoke_fail \
+    "trusted-routed empty bind consulted tailscale (auto-select path reached)"
+  smoke_log "F1: trusted-routed empty bind failed closed, tailscale never consulted"
+}
+
 # === (f) NO weakening: WARP-mesh WITHOUT WARP still fails closed ===
 tr_warp_mesh_still_requires_warp() {
   stop_tr_receiver
@@ -382,7 +456,12 @@ main() {
 
   # (e) sender source symmetry.
   smoke_run "(e) sender source selection per transport (mesh vs routed)" tr_sender_source_select
+  smoke_run "(e/F2) call-site-shaped: warp-mesh node + mesh & routed-marked peers" tr_sender_source_callsite
+  smoke_run "(e/F2) unknown PEER transport.kind hard-fails" tr_peer_transport_unknown
   smoke_run "(e) source-bound opener egress (bound source vs OS-routed)" tr_sender_source_bound_egress
+
+  # (F1) empty listen.address under trusted-routed -> bind_unresolved (no auto-select).
+  smoke_run "(F1) trusted-routed empty listen.address -> bind_unresolved (no auto-select)" tr_empty_bind_no_autoselect
 
   # (f) no-weakening: WARP-mesh enrollment proof intact.
   smoke_run "(f) cloudflare-warp-mesh WITHOUT WARP still fails closed" tr_warp_mesh_still_requires_warp

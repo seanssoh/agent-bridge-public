@@ -170,10 +170,33 @@ source **per destination**:
   Mesh source cannot route off the overlay); letting routing pick the source
   selects the LAN interface that can actually reach it.
 
-This per-destination source selection (`select_source_address_for_transport`
-+ `source_bound_opener` in `bridge_a2a_common.py`) is **sender-side only** —
-it changes nothing about the receiver bind proof, HMAC, allowlist, or the
+**How the sender knows which substrate a peer is on — the per-peer
+`transport.kind` override.** The node-level `transport.kind` is the *default*
+substrate for every peer. A peer that is reachable over a **different**
+substrate carries its own `transport` block to say so — mirroring the
+node-level key exactly. On the warp-mesh laptop above, the routed corporate
+server peer is marked:
+
+```jsonc
+"peers": [
+  { "id": "cm-prod", "address": "10.21.2.4", "port": 8787,
+    "transport": { "kind": "trusted-routed" },   // reach THIS peer over the routed LAN, not the Mesh
+    "secret": "<per-pair-hmac>", "inbound_allowlist": ["..."] }
+]
+```
+
+An **unmarked** peer inherits the node kind, so an existing same-substrate mesh
+(every peer on one transport, no override) is **byte-unaffected** — only an
+explicitly routed-marked peer egresses OS-routed instead of Mesh-pinned. An
+explicit-but-unknown peer `transport.kind` **hard-fails** (fail-closed), same
+as the node-level key. The override is **sender-side egress selection only**:
+it changes the source-address choice for that destination and nothing else —
+not the peer's `address`, the bind proof, HMAC, allowlist, or the
 source-address check.
+
+This per-destination source selection
+(`peer_transport_kind` → `select_source_address_for_transport` +
+`source_bound_opener` in `bridge_a2a_common.py`) is **sender-side only**.
 
 ### Tailscale ↔ WARP routing conflict (one overlay transport at a time)
 

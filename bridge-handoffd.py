@@ -793,6 +793,20 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
                 "device IP in handoff.local.json.",
                 code="bind_unresolved",
             )
+        if kind == a2a.TRANSPORT_TRUSTED_ROUTED:
+            # No tailnet-style auto-select for trusted-routed either. An
+            # explicit listen.address is part of the trusted-routed contract:
+            # the bind proof is interface-assignment ONLY (the weaker,
+            # enrollment-dropped proof), so falling through to the Tailscale
+            # auto-select below would let a trusted-routed node silently bind
+            # an auto-selected tailnet IP under that weaker proof. The operator
+            # MUST name this node's routed-private IP. Fail closed.
+            raise a2a.A2AError(
+                "no listen.address configured for the trusted-routed "
+                "transport. Set listen.address to this node's routed-private "
+                "IP in handoff.local.json.",
+                code="bind_unresolved",
+            )
         # Tailscale auto-select fails closed: tailscale_addresses() raises
         # TailscaleUnavailable when the local address set is unknowable.
         tailnet = tailscale_addresses()
@@ -1798,8 +1812,11 @@ def _relay_forward_send(cfg: dict[str, Any], *, env: dict[str, Any],
     for k, v in headers.items():
         req.add_header(k, v)
     # #1758: per-destination egress source — same symmetry as the outbox
-    # sender. A warp-mesh target leaves on this node's own Mesh listen.address;
-    # a trusted-routed/tailscale target gets None (OS routing picks the source).
+    # sender, keyed on the target peer's EFFECTIVE transport (its own
+    # transport.kind override, else this node's `kind`). A warp-mesh target
+    # leaves on this node's own Mesh listen.address; a trusted-routed/tailscale
+    # target (incl. a routed-marked peer on a warp-mesh node) gets None (OS
+    # routing picks the source).
     opener = a2a.source_bound_opener(
         a2a.select_source_address_for_transport(kind, cfg, peer))
     try:

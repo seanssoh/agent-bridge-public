@@ -19,6 +19,18 @@ Scenarios
                                   returns the mesh listen.address for a
                                   warp-mesh peer and None (OS-routed) for a
                                   trusted-routed peer (#1758 sender symmetry).
+  source-select-callsite          CALL-SITE-SHAPED: a FIXED warp-mesh node cfg
+                                  + two heterogeneous peers (one mesh, one
+                                  trusted-routed-MARKED) resolved through the
+                                  EXACT sender sequence (transport_kind(cfg)
+                                  -> select_source_address_for_transport per
+                                  peer). Asserts the mesh peer gets the pinned
+                                  Mesh source AND the routed-marked peer gets
+                                  None — the real laptop->cm-prod rollout shape
+                                  (PR raison d'etre / patch gate-2 repro).
+  peer-transport-unknown          assert an unknown/typo PEER transport.kind
+                                  hard-fails (transport_unknown), same posture
+                                  as the node-level key (no silent fallback).
   source-bound-egress <port>      drive a real POST through source_bound_opener
                                   to a loopback HTTP echo server: the
                                   mesh-source case binds 127.0.0.1 (the chosen
@@ -142,6 +154,66 @@ def _source_select() -> int:
     return 0
 
 
+def _source_select_callsite() -> int:
+    """CALL-SITE-SHAPED #1758 source selection — the real laptop rollout shape.
+
+    The bug this PR exists to fix: the egress source must be decided
+    PER-DESTINATION, but the original code branched on the NODE's own
+    transport kind alone. On the warp-mesh laptop (FIXED node kind), every
+    peer — including the routed cm-prod server — got the Mesh source pinned,
+    yielding `nc -s 10.128.0.25 10.21.2.4` "Network is unreachable".
+
+    This drives the EXACT sequence both senders (`bridge-a2a._deliver_one`
+    and `bridge-handoffd._relay_forward_send`) run: derive the node kind ONCE
+    via `transport_kind(cfg)`, then call
+    `select_source_address_for_transport(kind, cfg, peer)` per peer. The node
+    is a warp-mesh node with a Mesh `listen.address`; one peer is an unmarked
+    Mesh peer, the other carries a per-peer `transport.kind: trusted-routed`
+    override (the rollout marking). The Mesh peer MUST get the pinned Mesh
+    source; the routed-marked peer MUST get None (OS-routed).
+    """
+    # Fixed node: warp-mesh, mesh listen.address (the laptop's WARP Mesh IP).
+    cfg = {
+        "transport": {"kind": "cloudflare-warp-mesh"},
+        "listen": {"address": "10.128.0.25", "port": 8787},
+        "peers": [
+            # Unmarked Mesh peer (inherits the node kind -> Mesh-pinned source).
+            {"id": "mac-peer", "address": "10.128.0.42"},
+            # Routed-marked peer (the cm-prod server reachable over the LAN).
+            {"id": "cm-prod", "address": "10.21.2.4",
+             "transport": {"kind": "trusted-routed"}},
+        ],
+    }
+    # EXACT sender sequence: node kind derived ONCE, then per-peer selection.
+    kind = a2a.transport_kind(cfg)
+    by_id = {}
+    for peer in cfg["peers"]:
+        by_id[peer["id"]] = a2a.select_source_address_for_transport(
+            kind, cfg, peer)
+    print(f"NODE_KIND={kind}")
+    print(f"MESH_PEER_SOURCE={by_id['mac-peer']}")
+    print(f"ROUTED_PEER_SOURCE={by_id['cm-prod']}")
+    return 0
+
+
+def _peer_transport_unknown() -> int:
+    """An unknown/typo PEER transport.kind must hard-fail (fail-closed)."""
+    cfg = {
+        "transport": {"kind": "cloudflare-warp-mesh"},
+        "listen": {"address": "10.128.0.25", "port": 8787},
+    }
+    peer = {"id": "cm-prod", "address": "10.21.2.4",
+            "transport": {"kind": "trusted-rooted"}}  # typo
+    try:
+        a2a.select_source_address_for_transport(
+            a2a.TRANSPORT_CLOUDFLARE_WARP_MESH, cfg, peer)
+    except a2a.A2AError as exc:
+        print(f"PEER_UNKNOWN_CODE={getattr(exc, 'code', '')}")
+        return 0
+    print("PEER_UNKNOWN_CODE=<none-raised>")
+    return 0
+
+
 def _source_bound_egress(port: int) -> int:
     """Drive a real POST through source_bound_opener to a loopback echo server.
 
@@ -201,6 +273,10 @@ def main(argv: list[str]) -> int:
         return 0 if _port_open(int(argv[1])) else 1
     if scenario == "source-select":
         return _source_select()
+    if scenario == "source-select-callsite":
+        return _source_select_callsite()
+    if scenario == "peer-transport-unknown":
+        return _peer_transport_unknown()
     if scenario == "source-bound-egress":
         return _source_bound_egress(int(argv[1]))
 

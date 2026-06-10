@@ -1771,17 +1771,73 @@ def resolve_peer_address_for_transport(
 #     pin a source and let routing select the egress interface per
 #     destination.
 #
-# `select_source_address_for_transport` returns the per-destination egress
-# source: the local Mesh `listen.address` for a same-transport warp-mesh peer,
-# and None (OS-routed, no pin) for trusted-routed and tailscale peers. The
-# sender feeds it to `source_bound_opener` so each POST binds the right source
-# (or none). This is purely a sender-side egress choice — it changes nothing
-# about the receiver bind proof, HMAC, allowlist, or the source-addr check.
+# The egress decision is PER-DESTINATION, not per-node: a single warp-mesh
+# node serves a Mesh peer (which needs the Mesh source pin) AND a routed peer
+# (which must NOT be Mesh-pinned) at the same time. The node-level
+# `transport.kind` is the DEFAULT substrate for a peer, but a peer that is
+# reachable over a DIFFERENT substrate is marked with its own
+# `transport.kind` (e.g. `"transport": {"kind": "trusted-routed"}`) — mirroring
+# the node-level key. `peer_transport_kind` resolves that per-peer override
+# (falling back to the node kind), and `select_source_address_for_transport`
+# branches on the EFFECTIVE per-destination kind: the local Mesh
+# `listen.address` is pinned ONLY for a warp-mesh destination, and None
+# (OS-routed, no pin) is returned for a trusted-routed/tailscale destination.
+# The sender feeds it to `source_bound_opener` so each POST binds the right
+# source (or none). This is purely a sender-side egress choice — it changes
+# nothing about the receiver bind proof, HMAC, allowlist, or the source-addr
+# check. An UNMARKED peer keeps the node-kind default, so existing meshes
+# (every peer same substrate, no override) are byte-unaffected.
+
+
+def peer_transport_kind(node_kind: str, peer: dict[str, Any]) -> str:
+    """Resolve the EFFECTIVE transport kind for reaching `peer`.
+
+    A peer MAY carry its own `transport.kind` to declare it is reachable over a
+    different substrate than the node's default — e.g. a warp-mesh node that
+    also talks to a corporate server marks that one peer
+    `"transport": {"kind": "trusted-routed"}`. When the peer carries no
+    override it inherits `node_kind`, so an unmarked peer behaves EXACTLY as
+    before (existing same-substrate meshes are unaffected).
+
+    An explicit but unknown/typo peer `transport.kind` is a HARD error
+    (fail-closed), identical to the node-level `transport_kind` posture — never
+    a silent fallback to a weaker/wrong substrate.
+    """
+    if not isinstance(peer, dict):
+        return node_kind
+    transport = peer.get("transport")
+    if transport is None:
+        return node_kind
+    if not isinstance(transport, dict):
+        raise A2AError(
+            "peer 'transport' must be an object", code="transport_config")
+    kind = transport.get("kind")
+    if kind is None:
+        return node_kind
+    if not isinstance(kind, str) or not kind.strip():
+        raise A2AError(
+            "peer 'transport.kind' must be a non-empty string",
+            code="transport_config")
+    kind = kind.strip()
+    if kind not in SUPPORTED_TRANSPORTS:
+        raise A2AError(
+            f"unknown peer transport.kind {kind!r}; supported: "
+            f"{', '.join(SUPPORTED_TRANSPORTS)}",
+            code="transport_unknown")
+    return kind
 
 
 def select_source_address_for_transport(
-    kind: str, cfg: dict[str, Any], peer: dict[str, Any]) -> Optional[str]:
+    node_kind: str, cfg: dict[str, Any], peer: dict[str, Any]) -> Optional[str]:
     """Return the egress source IP to bind for a POST to `peer`, or None.
+
+    The decision is PER-DESTINATION: it branches on the EFFECTIVE transport
+    kind for this peer (`peer_transport_kind`), which is the peer's own
+    `transport.kind` override when set, else the node's `node_kind`. This is
+    what lets one warp-mesh node correctly source a Mesh peer (pin) AND a
+    routed peer (no pin) at once — the bug this fixes was branching on
+    `node_kind` alone, which Mesh-pinned EVERY peer on a warp-mesh node and
+    stranded a routed peer ("Network is unreachable").
 
     None means "do not pin a source — let the OS routing table choose the
     egress interface for this destination" (the correct behavior for a routed
@@ -1793,11 +1849,12 @@ def select_source_address_for_transport(
     rather than guessing — the delivery either still routes or fails loudly at
     the socket, never silently mis-sourced.
 
-    Tailscale peers keep the legacy behavior (no source pin) — Tailscale
-    installs a single utun the OS already routes through, so the pre-#1758
+    Trusted-routed + Tailscale destinations get no source pin — the OS routing
+    table already selects the reachable egress interface, so the pre-#1758
     OS-routed behavior is preserved byte-for-byte.
     """
-    if kind != TRANSPORT_CLOUDFLARE_WARP_MESH:
+    effective_kind = peer_transport_kind(node_kind, peer)
+    if effective_kind != TRANSPORT_CLOUDFLARE_WARP_MESH:
         # trusted-routed + tailscale (+ any future routed kind): OS routing
         # selects the reachable egress source per destination. No pin.
         return None
