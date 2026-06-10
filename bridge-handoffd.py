@@ -4830,29 +4830,38 @@ def cmd_self_reach(args: argparse.Namespace) -> int:
                                       (FAIL-SAFE: supervisor keeps current
                                       behavior, does NOT hold).
     """
-    # Smoke-only forced-verdict hook (mirrors BRIDGE_A2A_IFACE_ADDRS, an
-    # unconditional test override for the interface enumeration). The macOS
-    # self-route flap and a SYN-blackhole are not portably reproducible in a
-    # hermetic smoke, so this lets the smoke drive the supervisor's HOLD/restart
-    # branches deterministically. SAFETY: this var ONLY forces the read-only
-    # self-reachability DISCRIMINATOR WORD — it has ZERO effect on the bind,
-    # serve, HMAC, allowlist, or any auth path (this subcommand never binds or
-    # serves). So even if it leaked into a production env it could at worst make
-    # the supervisor restart-or-hold a receiver it would otherwise hold-or-
-    # restart; it can NEVER weaken the fail-closed bind/auth contract. It is NOT
-    # surfaced in any operator-facing config/CLI. The supervisor passes it
-    # through to this subprocess deliberately (it scrubs only the bind-weakening
-    # ALLOW_TEST_BIND / DEV_INSECURE_BIND vars, never this discriminator hook).
-    forced = os.environ.get("BRIDGE_A2A_SELF_REACH_TEST_VERDICT", "").strip()  # noqa: iso-helper-boundary — env-var read (os.environ), not an iso-boundary .env file path
-    if forced in (_SELF_REACH_REACHABLE, _SELF_REACH_UNREACHABLE,
-                  _SELF_REACH_PROBE_ERROR):
-        print(forced)
-        log(f"self-reach: TEST verdict forced ({forced})")
-        if forced == _SELF_REACH_UNREACHABLE:
-            return 3
-        if forced == _SELF_REACH_PROBE_ERROR:
-            return 2
-        return 0
+    # Smoke-only forced-verdict hook — an EXPLICIT CLI ARGUMENT (`--test-verdict`),
+    # NEVER an environment variable. The macOS self-route flap and a SYN-blackhole
+    # are not portably reproducible in a hermetic smoke, so this lets the smoke
+    # drive the supervisor's HOLD/restart branches deterministically.
+    #
+    # SECURITY (#1679 r2): the previous design honored a
+    # `BRIDGE_A2A_SELF_REACH_TEST_VERDICT` ENV var here. A real daemon launched
+    # with that var in its environment would have it INHERITED by this supervisor
+    # subprocess (the supervisor scrubbed only the bind-weakening
+    # ALLOW_TEST_BIND / DEV_INSECURE_BIND vars), letting a forced verdict
+    # silently override PRODUCTION supervisor liveness CLASSIFICATION
+    # (restart-vs-hold-vs-healthy) — a daemon-critical false negative. A CLI arg
+    # CANNOT be accidentally inherited by a daemon's environment, and the
+    # production supervisor NEVER constructs this arg (only the hermetic smoke's
+    # explicit forward hook does), so the bypass is now STRUCTURALLY impossible,
+    # not merely scrubbed. This subcommand honors NO env-var verdict. SAFETY of
+    # the arg itself: it ONLY forces the read-only self-reachability DISCRIMINATOR
+    # WORD — ZERO effect on bind/serve/HMAC/allowlist (this subcommand never binds
+    # or serves). Hidden from --help (argparse.SUPPRESS); not an operator surface.
+    forced = (getattr(args, "test_verdict", None) or "").strip()
+    if forced:
+        if forced not in (_SELF_REACH_REACHABLE, _SELF_REACH_UNREACHABLE,
+                          _SELF_REACH_PROBE_ERROR):
+            log(f"self-reach: ignoring unknown --test-verdict ({forced!r})")
+        else:
+            print(forced)
+            log(f"self-reach: TEST verdict forced via --test-verdict ({forced})")
+            if forced == _SELF_REACH_UNREACHABLE:
+                return 3
+            if forced == _SELF_REACH_PROBE_ERROR:
+                return 2
+            return 0
 
     try:
         cfg = a2a.load_config(Path(args.config) if args.config else None)
@@ -5011,30 +5020,44 @@ def cmd_healthz(args: argparse.Namespace) -> int:
       - `healthz_badbody` : 200 but the body was not the a2a-handoffd health
                             envelope (something else is on the port).
     """
-    # Smoke-only forced-verdict hook (mirrors BRIDGE_A2A_SELF_REACH_TEST_VERDICT
-    # / BRIDGE_A2A_IFACE_ADDRS). The loopback test-bind harness can't be
-    # healthz-probed through the supervisor (the supervisor scrubs
-    # ALLOW_TEST_BIND from this subprocess so resolve_bind refuses the loopback),
-    # so this lets the smoke drive the supervisor's healthz reason word
-    # deterministically. SAFETY: it ONLY forces the read-only liveness reason
-    # word — zero effect on the bind/serve/HMAC/allowlist path (healthz never
-    # binds/serves). NOT surfaced in any operator-facing config/CLI. The
-    # exit-code mirrors the real reason classes.
-    _healthz_forced = os.environ.get("BRIDGE_A2A_HEALTHZ_TEST_VERDICT", "").strip()  # noqa: iso-helper-boundary — env-var read (os.environ), not an iso-boundary .env file path
+    # Smoke-only forced-verdict hook — an EXPLICIT CLI ARGUMENT (`--test-verdict`),
+    # NEVER an environment variable. The loopback test-bind harness can't be
+    # healthz-probed through the supervisor (the supervisor scrubs ALLOW_TEST_BIND
+    # from this subprocess so resolve_bind refuses the loopback), so this lets the
+    # smoke drive the supervisor's healthz reason word deterministically.
+    #
+    # SECURITY (#1405/#1679 r2): the previous design honored a
+    # `BRIDGE_A2A_HEALTHZ_TEST_VERDICT` ENV var here, which a real daemon could
+    # inherit — letting a forced `healthy` clear the supervisor's counters and
+    # skip the #1405 genuine-wedge path even while the receiver was NOT accepting,
+    # or a forced `healthz_timeout` drive the HOLD path. That was a daemon-critical
+    # false negative on supervision via inherited env. A CLI arg CANNOT be
+    # accidentally inherited by a daemon's environment, and the production
+    # supervisor NEVER constructs this arg, so the bypass is now STRUCTURALLY
+    # impossible. This subcommand honors NO env-var verdict. SAFETY of the arg
+    # itself: it ONLY forces the read-only liveness reason word — zero effect on
+    # the bind/serve/HMAC/allowlist path (healthz never binds/serves). Hidden from
+    # --help (argparse.SUPPRESS); not an operator surface.
+    _healthz_forced = (getattr(args, "test_verdict", None) or "").strip()
     if _healthz_forced:
-        print(_healthz_forced)
-        log(f"healthz: TEST verdict forced ({_healthz_forced})")
-        if _healthz_forced == "healthy":
-            return 0
-        if _healthz_forced == "bind_unresolved":
-            return 2
-        if _healthz_forced == "healthz_timeout":
+        _healthz_known = (
+            "healthy", "bind_unresolved", "healthz_timeout", "healthz_badbody")
+        if _healthz_forced in _healthz_known \
+                or _healthz_forced.startswith("healthz_status:"):
+            print(_healthz_forced)
+            log(f"healthz: TEST verdict forced via --test-verdict ({_healthz_forced})")
+            if _healthz_forced == "healthy":
+                return 0
+            if _healthz_forced == "bind_unresolved":
+                return 2
+            if _healthz_forced == "healthz_timeout":
+                return 3
+            if _healthz_forced.startswith("healthz_status:"):
+                return 4
+            if _healthz_forced == "healthz_badbody":
+                return 5
             return 3
-        if _healthz_forced.startswith("healthz_status:"):
-            return 4
-        if _healthz_forced == "healthz_badbody":
-            return 5
-        return 3
+        log(f"healthz: ignoring unknown --test-verdict ({_healthz_forced!r})")
 
     try:
         cfg = a2a.load_config(Path(args.config) if args.config else None)
@@ -5440,6 +5463,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_health.add_argument("--config", default=None)
     p_health.add_argument("--timeout", type=float, default=3.0,
                           help="connect/read timeout in seconds (default 3)")
+    # Hermetic-smoke ONLY: force the liveness reason word without a real probe.
+    # NOT an env var (a real daemon could inherit that) and NOT an operator
+    # surface (suppressed from --help). The production supervisor never passes
+    # this; only the smoke's explicit forward hook does. See cmd_healthz (#1679 r2).
+    p_health.add_argument("--test-verdict", default=None, dest="test_verdict",
+                          help=argparse.SUPPRESS)
     p_health.set_defaults(func=cmd_healthz)
 
     # #1679: read-only self-reachability discriminator for the supervisor. Does
@@ -5455,6 +5484,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_self.add_argument("--config", default=None)
     p_self.add_argument("--timeout", type=float, default=3.0,
                         help="connect timeout in seconds (default 3)")
+    # Hermetic-smoke ONLY: force the self-reachability discriminator word without
+    # a real probe. NOT an env var (a real daemon could inherit that) and NOT an
+    # operator surface (suppressed from --help). The production supervisor never
+    # passes this; only the smoke's explicit forward hook does. See cmd_self_reach
+    # (#1679 r2).
+    p_self.add_argument("--test-verdict", default=None, dest="test_verdict",
+                        help=argparse.SUPPRESS)
     p_self.set_defaults(func=cmd_self_reach)
 
     # #1680: read-only environmental discriminator — is the configured bind IP

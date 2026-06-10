@@ -23,13 +23,21 @@
 #
 # Loopback harness (BRIDGE_A2A_ALLOW_TEST_BIND=1, free port) reused from
 # 1405-handoffd-supervision.sh / a2a-cross-bridge.sh. The macOS self-route flap
-# and a SYN-blackhole are not portably reproducible, so the self-reachability
-# verdict is driven deterministically via BRIDGE_A2A_SELF_REACH_TEST_VERDICT
-# (a read-only discriminator override that NEVER touches the bind/auth path),
-# and the bind-IP presence via BRIDGE_A2A_IFACE_ADDRS (the existing interface-
-# enumeration test override). EVERY assertion has teeth: pre-fix (no self-reach
-# / bind-ip-present discriminator, no environmental hold) the relevant checks
-# FAIL.
+# and a SYN-blackhole are not portably reproducible, so the supervisor's
+# self-reachability / healthz verdicts are driven deterministically through the
+# CLEARLY-NAMED hermetic-smoke FORWARD HOOKS
+# BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_HEALTHZ_VERDICT /
+# BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_SELF_REACH_VERDICT. The supervisor forwards
+# those to the read-only discriminator subcommands as the explicit
+# `--test-verdict` CLI argument; the subcommands honor NO env-var verdict (#1679
+# r2 — a real daemon can no longer inherit a forced verdict, the production
+# supervisor never constructs the arg). Bind-IP presence is driven via
+# BRIDGE_A2A_IFACE_ADDRS (the pre-existing interface-enumeration test override).
+# EVERY assertion has teeth: pre-fix (no self-reach / bind-ip-present
+# discriminator, no environmental hold) the relevant checks FAIL. Case (f) is the
+# #1679 r2 regression guard: the LEGACY verdict env vars exported into the
+# PRODUCTION supervisor path must NOT change classification (inherited-env bypass
+# is closed).
 
 set -euo pipefail
 
@@ -203,8 +211,8 @@ check_self_unreachable_holds() {
   local i
   for (( i = 0; i < 4; i++ )); do
     run_sync_env \
-      BRIDGE_A2A_HEALTHZ_TEST_VERDICT=healthz_timeout \
-      BRIDGE_A2A_SELF_REACH_TEST_VERDICT=self_unreachable >/dev/null
+      BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_HEALTHZ_VERDICT=healthz_timeout \
+      BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_SELF_REACH_VERDICT=self_unreachable >/dev/null
   done
 
   local reason restart_count
@@ -257,8 +265,8 @@ check_self_reachable_restarts() {
   local i
   for (( i = 0; i < 4; i++ )); do
     run_sync_env \
-      BRIDGE_A2A_HEALTHZ_TEST_VERDICT=healthz_timeout \
-      BRIDGE_A2A_SELF_REACH_TEST_VERDICT=self_reachable >/dev/null
+      BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_HEALTHZ_VERDICT=healthz_timeout \
+      BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_SELF_REACH_VERDICT=self_reachable >/dev/null
   done
 
   local reason
@@ -332,13 +340,17 @@ check_bind_ip_absent_environmental() {
   # to the restart path). We assert the auto-rebind log + incident clear; the
   # bind itself still cannot succeed in the hermetic harness (no real tailnet),
   # so we only assert the supervisor LEFT the environmental hold.
+  # ENV_REPROBE_SECONDS=0 here forces the re-probe THIS tick (interval elapsed):
+  # the #1680 r2 cadence gate would otherwise hold-without-probing while still
+  # inside the re-probe window, and we need the interface re-check to observe the
+  # returned IP. (0 = "always re-probe" — the gate never short-circuits.)
   seed_bind_fail_exit "100.64.0.10" "$crash_port"
   local rebind_out
   rebind_out="$(run_sync_env \
     BRIDGE_A2A_IFACE_ADDRS="10.9.9.9 100.64.0.10" \
     BRIDGE_A2A_TAILSCALE_CLI="$SMOKE_TMP_ROOT/no-such-tailscale" \
     BRIDGE_A2A_RECEIVER_BACKOFF_BASE_SECONDS=1 \
-    BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS=1)"
+    BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS=0)"
   smoke_assert_contains "$rebind_out" "auto-rebind" \
     "supervisor logged auto-rebind when the bind IP returned (#1680)"
   local alarm_after
@@ -464,6 +476,135 @@ check_genuine_death_still_handled() {
   bash "$SMOKE_REPO_ROOT/bridge-handoff-daemon.sh" stop >/dev/null 2>&1 || true
 }
 
+# -------------------------------------------------------------------------
+# Case (f) — #1679 r2 TEETH-CHECK: the LEGACY forced-verdict ENV VARS exported
+# into the PRODUCTION supervisor path must NOT change classification. The
+# inherited-env bypass is closed: a real daemon launched with
+# BRIDGE_A2A_HEALTHZ_TEST_VERDICT=healthy +
+# BRIDGE_A2A_SELF_REACH_TEST_VERDICT=self_unreachable in its env can no longer
+# force the supervisor's restart-vs-hold-vs-healthy decision, because the
+# discriminator subcommands honor NO env-var verdict (only the explicit
+# `--test-verdict` CLI arg, which the production supervisor never passes). This
+# is the regression guard for the daemon-critical inherited-env false negative.
+# -------------------------------------------------------------------------
+check_legacy_verdict_env_ignored() {
+  bash "$SMOKE_REPO_ROOT/bridge-handoff-daemon.sh" stop >/dev/null 2>&1 || true
+  rm -f "$(supervise_state)" "$(env_incident_state)" 2>/dev/null || true
+
+  # ---- Layer 1: the SUBCOMMANDS ignore the legacy verdict env vars entirely.
+  # Invoke the discriminators directly with the legacy env exported; the printed
+  # discriminator word must be the REAL probe outcome, never the forced verdict.
+  A2A_PORT="$(pick_free_port)"
+  write_loopback_config "$A2A_PORT"
+  local hz_raw hz_word sr_raw sr_word
+  # Note: ALLOW_TEST_BIND is NOT exported here (mirroring the supervisor's scrub),
+  # so resolve_bind refuses the loopback and the real healthz word is
+  # `bind_unresolved` — categorically NOT the forced `healthy`. The probe exits
+  # non-zero on an unhealthy reason (rc 2), so we capture with `|| true` first to
+  # keep `set -e`/`pipefail` from aborting on the EXPECTED non-zero, then grep.
+  hz_raw="$(env -u BRIDGE_A2A_ALLOW_TEST_BIND \
+    BRIDGE_A2A_HEALTHZ_TEST_VERDICT=healthy \
+    python3 "$SMOKE_REPO_ROOT/bridge-handoffd.py" healthz \
+      --config "$BRIDGE_HOME/handoff.local.json" --timeout 1 2>/dev/null || true)"
+  hz_word="$(printf '%s\n' "$hz_raw" | grep -E '^(healthy|healthz_timeout|healthz_status:|healthz_badbody|bind_unresolved)' | tail -1 || true)"
+  [[ "$hz_word" != "healthy" ]] \
+    || smoke_fail "healthz subcommand HONORED legacy BRIDGE_A2A_HEALTHZ_TEST_VERDICT env (got forced 'healthy'); inherited-env bypass NOT closed"
+  sr_raw="$(env -u BRIDGE_A2A_ALLOW_TEST_BIND \
+    BRIDGE_A2A_SELF_REACH_TEST_VERDICT=self_unreachable \
+    python3 "$SMOKE_REPO_ROOT/bridge-handoffd.py" self-reach \
+      --config "$BRIDGE_HOME/handoff.local.json" --timeout 1 2>/dev/null || true)"
+  sr_word="$(printf '%s\n' "$sr_raw" | grep -E '^(self_reachable|self_unreachable|self_probe_error)' | tail -1 || true)"
+  [[ "$sr_word" != "self_unreachable" ]] \
+    || smoke_fail "self-reach subcommand HONORED legacy BRIDGE_A2A_SELF_REACH_TEST_VERDICT env (got forced 'self_unreachable'); inherited-env bypass NOT closed"
+
+  # ---- Layer 2: the SUPERVISOR PRODUCTION PATH, run with the legacy verdict env
+  # vars exported, must NOT reproduce case (a)'s forced HOLD. With the bypass
+  # closed, the legacy env is ignored: the real healthz probe (loopback refused by
+  # the scrubbed resolve_bind) yields `bind_unresolved`, the self-reach
+  # discriminator only runs on a `healthz_timeout`, so the supervisor never enters
+  # the self-unreachable HOLD -> LAST_REASON is NEVER `healthz_unreachable_self`
+  # and NEVER `healthy`. Pre-fix (env honored) the forced verdicts WOULD have
+  # produced exactly that HOLD (case a) -> this check has teeth.
+  bash "$SMOKE_REPO_ROOT/bridge-handoff-daemon.sh" stop >/dev/null 2>&1 || true
+  rm -f "$(supervise_state)" "$(env_incident_state)" 2>/dev/null || true
+  start_receiver_via_lifecycle
+  local i
+  for (( i = 0; i < 4; i++ )); do
+    run_sync_env \
+      BRIDGE_A2A_HEALTHZ_TEST_VERDICT=healthy \
+      BRIDGE_A2A_SELF_REACH_TEST_VERDICT=self_unreachable >/dev/null
+  done
+  local reason
+  reason="$(state_field LAST_REASON)"
+  [[ "$reason" != "healthz_unreachable_self" ]] \
+    || smoke_fail "PRODUCTION supervisor HONORED legacy verdict env (forced self-unreachable HOLD via inherited env); bypass NOT closed"
+  [[ "$reason" != "healthy" ]] \
+    || smoke_fail "PRODUCTION supervisor HONORED legacy healthz=healthy verdict env (inherited-env bypass); receiver was forced 'healthy' without a real probe"
+
+  # No env-incident should have been filed off a forced self_unreachable verdict.
+  [[ ! -f "$(env_incident_state)" ]] \
+    || smoke_fail "legacy verdict env produced an env-incident on the production path (bypass NOT closed)"
+
+  bash "$SMOKE_REPO_ROOT/bridge-handoff-daemon.sh" stop >/dev/null 2>&1 || true
+}
+
+# -------------------------------------------------------------------------
+# Case (g) — #1680 r2: BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS genuinely gates
+# the bind-IP re-probe cadence. With a LARGE interval, after the first
+# absent-IP hold the supervisor must HOLD WITHOUT re-running the interface probe
+# on subsequent ticks (the bind_ip_absent audit count must NOT grow per tick).
+# Pre-r2 the knob was logged/audited only and the probe ran every tick.
+# -------------------------------------------------------------------------
+check_env_reprobe_cadence_gates() {
+  bash "$SMOKE_REPO_ROOT/bridge-handoff-daemon.sh" stop >/dev/null 2>&1 || true
+  rm -f "$(handoffd_pidfile)" "$(supervise_state)" "$(env_incident_state)" \
+    "$BRIDGE_LOG_DIR/a2a-handoff.jsonl" 2>/dev/null || true
+
+  local crash_port
+  crash_port="$(pick_free_port)"
+  write_unprovable_config "$crash_port"
+
+  # First tick: confirm absent IP -> environmental hold + ONE bind_ip_absent
+  # audit, and the re-probe clock is stamped. Large interval so the gate holds.
+  seed_bind_fail_exit "100.64.0.10" "$crash_port"
+  run_sync_env \
+    BRIDGE_A2A_IFACE_ADDRS="10.9.9.9 192.168.50.50" \
+    BRIDGE_A2A_TAILSCALE_CLI="$SMOKE_TMP_ROOT/no-such-tailscale" \
+    BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS=3600 \
+    >/dev/null
+  smoke_assert_eq "env_bind_ip_absent" "$(state_field ALARM)" \
+    "first absent-IP tick enters the environmental hold"
+  local audits_after_first
+  audits_after_first="$(grep -c 'a2a_receiver_bind_ip_absent' "$BRIDGE_AUDIT_LOG" 2>/dev/null || printf '0')"
+  # The re-probe clock must be persisted (non-empty, numeric).
+  local reprobe_ts
+  reprobe_ts="$(state_field LAST_ENV_REPROBE_TS)"
+  [[ "$reprobe_ts" =~ ^[0-9]+$ ]] && (( reprobe_ts > 0 )) \
+    || smoke_fail "LAST_ENV_REPROBE_TS not stamped on the first absent-IP hold (got '$reprobe_ts')"
+
+  # Subsequent ticks WITHIN the large interval: the supervisor must HOLD WITHOUT
+  # re-probing. Each tick re-seeds the bind_fail artifact; if the gate did not
+  # work the probe would re-run and emit another bind_ip_absent audit per tick.
+  local j
+  for (( j = 0; j < 5; j++ )); do
+    seed_bind_fail_exit "100.64.0.10" "$crash_port"
+    run_sync_env \
+      BRIDGE_A2A_IFACE_ADDRS="10.9.9.9 192.168.50.50" \
+      BRIDGE_A2A_TAILSCALE_CLI="$SMOKE_TMP_ROOT/no-such-tailscale" \
+      BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS=3600 \
+      >/dev/null
+  done
+  local audits_after_hold
+  audits_after_hold="$(grep -c 'a2a_receiver_bind_ip_absent' "$BRIDGE_AUDIT_LOG" 2>/dev/null || printf '0')"
+  smoke_assert_eq "$audits_after_first" "$audits_after_hold" \
+    "re-probe cadence gate held: NO extra bind_ip_absent probe/audit within the interval (knob genuinely throttles)"
+  # The alarm is still the environmental hold (we never left it).
+  smoke_assert_eq "env_bind_ip_absent" "$(state_field ALARM)" \
+    "supervisor stayed in the environmental hold across the throttled ticks"
+
+  bash "$SMOKE_REPO_ROOT/bridge-handoff-daemon.sh" stop >/dev/null 2>&1 || true
+}
+
 main() {
   smoke_require_cmd python3
   smoke_setup_bridge_home "1679-1680-a2a-receiver-supervisor-robustness"
@@ -475,6 +616,8 @@ main() {
   smoke_run "(c) #1680 bind_fail + absent tailnet IP -> environmental, budget preserved, auto-rebind" check_bind_ip_absent_environmental
   smoke_run "(d) alert flood collapse -> ONE stateful env-incident over a sustained outage" check_alert_flood_collapse
   smoke_run "(e) regression: genuine process death still detected + restarted" check_genuine_death_still_handled
+  smoke_run "(f) #1679 r2 TEETH: legacy verdict ENV vars ignored on the production path (inherited-env bypass closed)" check_legacy_verdict_env_ignored
+  smoke_run "(g) #1680 r2: ENV_REPROBE_SECONDS genuinely gates the bind-IP re-probe cadence" check_env_reprobe_cadence_gates
 
   smoke_log "passed"
 }

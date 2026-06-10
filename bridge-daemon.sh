@@ -3131,6 +3131,13 @@ bridge_a2a_write_supervise_state() {
   # keys the breaker (a config edit changes it -> the breaker resets);
   # consec_transient is the per-key consecutive transient-failure count.
   local error_class="${10:-}" breaker_key="${11:-}" consec_transient="${12:-0}"
+  # #1680 r2: trailing-optional last_env_reprobe_ts — the epoch of the most
+  # recent bind-IP re-probe during an absent-tailnet-IP environmental hold. It
+  # gates the re-probe cadence (BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS): while
+  # the IP stays absent we re-run the (cheap) interface check at most once per
+  # that interval instead of every supervise tick. Callers that are NOT in the
+  # env hold pass 0 / omit it (the gate restamps when the hold is (re)entered).
+  local last_env_reprobe_ts="${13:-0}"
   {
     printf 'A2A_RECEIVER_RESTART_COUNT=%s\n' "$(printf '%q' "$restart_count")"
     printf 'A2A_RECEIVER_LAST_RESTART_TS=%s\n' "$(printf '%q' "$last_restart_ts")"
@@ -3143,6 +3150,7 @@ bridge_a2a_write_supervise_state() {
     printf 'A2A_RECEIVER_ERROR_CLASS=%s\n' "$(printf '%q' "$error_class")"
     printf 'A2A_RECEIVER_BREAKER_KEY=%s\n' "$(printf '%q' "$breaker_key")"
     printf 'A2A_RECEIVER_CONSEC_TRANSIENT=%s\n' "$(printf '%q' "$consec_transient")"
+    printf 'A2A_RECEIVER_LAST_ENV_REPROBE_TS=%s\n' "$(printf '%q' "$last_env_reprobe_ts")"
   } >"$state_file" 2>/dev/null || true
   chmod 0600 "$state_file" 2>/dev/null || true
 }
@@ -3468,6 +3476,38 @@ process_a2a_receiver_supervise_tick() {
   [[ "$admin_cooldown" =~ ^[0-9]+$ ]] || admin_cooldown=1800
   [[ "$healthz_timeout" =~ ^[0-9.]+$ ]] || healthz_timeout=3
 
+  # --- HERMETIC-SMOKE forced-verdict forward hook (#1679 r2) ---------------
+  # SECURITY: the discriminator subcommands (`healthz` / `self-reach`) honor a
+  # forced verdict ONLY via an explicit `--test-verdict` CLI ARGUMENT — they read
+  # NO env var. The macOS self-route flap / SYN-blackhole are not portably
+  # reproducible in a hermetic smoke, so the smoke drives the supervisor's
+  # HOLD/restart classification by setting these CLEARLY-NAMED forward-hook vars,
+  # which the supervisor forwards to the probe subprocess as `--test-verdict`.
+  # The PRODUCTION path sets NEITHER var, so it forwards NO arg and the
+  # subcommand always does a real probe — the inherited-env bypass (a real daemon
+  # inheriting a forced verdict) is STRUCTURALLY impossible because the verdict
+  # rides a CLI arg the production supervisor never constructs, not an env var the
+  # subcommand reads. Verdict values are validated against the known discriminator
+  # words; an unknown value is dropped (no arg forwarded). These hooks affect ONLY
+  # the read-only liveness/self-reach DISCRIMINATOR WORD — never bind/serve/auth.
+  local healthz_verdict_arg=() self_reach_verdict_arg=()
+  local _smoke_healthz_v="${BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_HEALTHZ_VERDICT:-}"
+  local _smoke_self_v="${BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_SELF_REACH_VERDICT:-}"
+  if [[ -n "$_smoke_healthz_v" ]]; then
+    case "$_smoke_healthz_v" in
+      healthy|bind_unresolved|healthz_timeout|healthz_badbody|healthz_status:*)
+        healthz_verdict_arg=(--test-verdict "$_smoke_healthz_v") ;;
+      *) daemon_warn "[a2a_receiver_supervise] ignoring unknown TEST healthz verdict ($_smoke_healthz_v)" ;;
+    esac
+  fi
+  if [[ -n "$_smoke_self_v" ]]; then
+    case "$_smoke_self_v" in
+      self_reachable|self_unreachable|self_probe_error)
+        self_reach_verdict_arg=(--test-verdict "$_smoke_self_v") ;;
+      *) daemon_warn "[a2a_receiver_supervise] ignoring unknown TEST self-reach verdict ($_smoke_self_v)" ;;
+    esac
+  fi
+
   local handoff_dir="$BRIDGE_STATE_DIR/handoff"
   mkdir -p "$handoff_dir" 2>/dev/null || true
   local tick_state="$handoff_dir/receiver-supervise-tick.env"
@@ -3498,10 +3538,10 @@ process_a2a_receiver_supervise_tick() {
     A2A_RECEIVER_LAST_REASON="" A2A_RECEIVER_LAST_EXIT_EVENT="" \
     A2A_RECEIVER_LAST_EXIT_DETAIL="" A2A_RECEIVER_LAST_ADMIN_TASK_TS="" \
     A2A_RECEIVER_ERROR_CLASS="" A2A_RECEIVER_BREAKER_KEY="" \
-    A2A_RECEIVER_CONSEC_TRANSIENT=""
+    A2A_RECEIVER_CONSEC_TRANSIENT="" A2A_RECEIVER_LAST_ENV_REPROBE_TS=""
   if [[ -f "$state_file" ]]; then
     daemon_source_state_file "$state_file" "a2a-receiver-supervise" 0 "" \
-      "A2A_RECEIVER_RESTART_COUNT A2A_RECEIVER_LAST_RESTART_TS A2A_RECEIVER_CONSEC_UNHEALTHY A2A_RECEIVER_ALARM A2A_RECEIVER_LAST_REASON A2A_RECEIVER_LAST_EXIT_EVENT A2A_RECEIVER_LAST_EXIT_DETAIL A2A_RECEIVER_LAST_ADMIN_TASK_TS A2A_RECEIVER_ERROR_CLASS A2A_RECEIVER_BREAKER_KEY A2A_RECEIVER_CONSEC_TRANSIENT" \
+      "A2A_RECEIVER_RESTART_COUNT A2A_RECEIVER_LAST_RESTART_TS A2A_RECEIVER_CONSEC_UNHEALTHY A2A_RECEIVER_ALARM A2A_RECEIVER_LAST_REASON A2A_RECEIVER_LAST_EXIT_EVENT A2A_RECEIVER_LAST_EXIT_DETAIL A2A_RECEIVER_LAST_ADMIN_TASK_TS A2A_RECEIVER_ERROR_CLASS A2A_RECEIVER_BREAKER_KEY A2A_RECEIVER_CONSEC_TRANSIENT A2A_RECEIVER_LAST_ENV_REPROBE_TS" \
       || true
   fi
   local restart_count="${A2A_RECEIVER_RESTART_COUNT:-0}"
@@ -3516,11 +3556,14 @@ process_a2a_receiver_supervise_tick() {
   local prev_error_class="${A2A_RECEIVER_ERROR_CLASS:-}"
   local breaker_key="${A2A_RECEIVER_BREAKER_KEY:-}"
   local consec_transient="${A2A_RECEIVER_CONSEC_TRANSIENT:-0}"
+  # #1680 r2: epoch of the last bind-IP re-probe during an absent-IP env hold.
+  local last_env_reprobe_ts="${A2A_RECEIVER_LAST_ENV_REPROBE_TS:-0}"
   [[ "$restart_count" =~ ^[0-9]+$ ]] || restart_count=0
   [[ "$last_restart_ts" =~ ^[0-9]+$ ]] || last_restart_ts=0
   [[ "$consec_unhealthy" =~ ^[0-9]+$ ]] || consec_unhealthy=0
   [[ "$last_admin_task_ts" =~ ^[0-9]+$ ]] || last_admin_task_ts=0
   [[ "$consec_transient" =~ ^[0-9]+$ ]] || consec_transient=0
+  [[ "$last_env_reprobe_ts" =~ ^[0-9]+$ ]] || last_env_reprobe_ts=0
 
   # Restart-window reset: if the last restart is older than the window, the
   # counter (and any alarm) is stale — a fresh window starts clean. A healthy
@@ -3560,18 +3603,26 @@ process_a2a_receiver_supervise_tick() {
     reason="process_gone"
   else
     # --- stage 2: serve probe (only when the process gate passed) ---
-    # SECURITY (#1414 codex r1): scrub the smoke-only insecure-bind escape
-    # hatches from EVERY supervisor-owned subprocess. If the daemon itself was
-    # launched with BRIDGE_A2A_ALLOW_TEST_BIND / BRIDGE_A2A_DEV_INSECURE_BIND in
-    # its env (e.g. a test harness), a plain child would inherit them — letting
-    # an auto-restart bring the receiver up on a loopback bind or with the
-    # peer-secret gate bypassed. The supervisor must never propagate them; the
-    # production bind/auth contract is non-negotiable for a daemon-driven action.
+    # SECURITY (#1414 codex r1 / #1679 r2): scrub the smoke-only insecure-bind
+    # escape hatches AND any legacy forced-verdict env vars from EVERY
+    # supervisor-owned subprocess. If the daemon itself was launched with
+    # BRIDGE_A2A_ALLOW_TEST_BIND / BRIDGE_A2A_DEV_INSECURE_BIND in its env (e.g. a
+    # test harness), a plain child would inherit them — letting an auto-restart
+    # bring the receiver up on a loopback bind or with the peer-secret gate
+    # bypassed. The supervisor must never propagate them; the production bind/auth
+    # contract is non-negotiable for a daemon-driven action. The
+    # BRIDGE_A2A_HEALTHZ_TEST_VERDICT / BRIDGE_A2A_SELF_REACH_TEST_VERDICT scrubs
+    # are belt-and-suspenders: the subcommands no longer READ those vars at all
+    # (#1679 r2 moved the verdict to an explicit `--test-verdict` CLI arg the
+    # production supervisor never passes), so unsetting them here is pure
+    # defense-in-depth so a stale legacy env can never influence a probe.
     local probe_out probe_rc=0
     probe_out="$(bridge_with_timeout 10 a2a_receiver_healthz \
       env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
+        -u BRIDGE_A2A_HEALTHZ_TEST_VERDICT -u BRIDGE_A2A_SELF_REACH_TEST_VERDICT \
       python3 "$SCRIPT_DIR/bridge-handoffd.py" healthz \
-        --config "$config" --timeout "$healthz_timeout" 2>/dev/null)" || probe_rc=$?
+        --config "$config" --timeout "$healthz_timeout" \
+        "${healthz_verdict_arg[@]+"${healthz_verdict_arg[@]}"}" 2>/dev/null)" || probe_rc=$?
     # The reason word is the LAST stdout line (healthy / healthz_timeout /
     # healthz_status:<code> / bind_unresolved / healthz_badbody).
     healthz_reason="$(printf '%s\n' "$probe_out" | grep -E '^(healthy|healthz_timeout|healthz_status:|healthz_badbody|bind_unresolved)' | tail -1)"
@@ -3645,10 +3696,16 @@ process_a2a_receiver_supervise_tick() {
     # adds NO listen socket and does NOT touch the fail-closed bind contract.
     if [[ "$reason" == "healthz_timeout" ]]; then
       local self_out self_rc=0 self_word=""
+      # SECURITY (#1679 r2): same env scrub as the healthz probe — strip the
+      # insecure-bind hatches AND the legacy forced-verdict env vars. The
+      # `--test-verdict` arg (production-empty; smoke-only via the forward hook)
+      # is the ONLY verdict injection path.
       self_out="$(bridge_with_timeout 10 a2a_receiver_self_reach \
         env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
+          -u BRIDGE_A2A_HEALTHZ_TEST_VERDICT -u BRIDGE_A2A_SELF_REACH_TEST_VERDICT \
         python3 "$SCRIPT_DIR/bridge-handoffd.py" self-reach \
-          --config "$config" --timeout "$healthz_timeout" 2>/dev/null)" || self_rc=$?
+          --config "$config" --timeout "$healthz_timeout" \
+          "${self_reach_verdict_arg[@]+"${self_reach_verdict_arg[@]}"}" 2>/dev/null)" || self_rc=$?
       self_word="$(printf '%s\n' "$self_out" | grep -E '^(self_reachable|self_unreachable|self_probe_error)' | tail -1)"
       if [[ "$self_word" == "self_unreachable" ]]; then
         # Environmental host self-route flap — HOLD the healthy receiver.
@@ -3798,18 +3855,48 @@ process_a2a_receiver_supervise_tick() {
     is_bind_avail_failure=1
   fi
   if (( is_bind_avail_failure == 1 )); then
+    # Re-probe cadence gate (#1680 r2): BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS
+    # genuinely throttles how often we re-run the (cheap) bind-IP interface check
+    # during a SUSTAINED absent-tailnet-IP outage. Once we are already in the
+    # environmental hold (alarm=env_bind_ip_absent), we do NOT re-probe on EVERY
+    # supervise tick — we re-check at most once per env-reprobe interval, holding
+    # in between without spending the subprocess. This is the actual wiring of the
+    # knob the comment promised: prior to this it was logged/audited only and the
+    # probe ran every tick regardless of the interval.
+    local env_reprobe="${BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS:-45}"
+    [[ "$env_reprobe" =~ ^[0-9]+$ ]] || env_reprobe=45
+    if [[ "$alarm" == "env_bind_ip_absent" ]] \
+        && (( now - last_env_reprobe_ts < env_reprobe )); then
+      # Still inside the interval AND already holding an absent IP — keep the hold
+      # WITHOUT re-running the probe. Counters stay reset (the env hold owns them);
+      # persist unchanged state (including last_env_reprobe_ts) and return.
+      reason="bind_ip_absent"
+      last_reason="$reason"
+      daemon_log_event "[a2a_receiver_supervise] absent tailnet IP — within re-probe interval (${env_reprobe}s); holding without re-probing this tick"
+      bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+        "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+        "$prev_error_class" "$breaker_key" "$consec_transient" \
+        "$last_env_reprobe_ts"
+      return 0
+    fi
     local bip_out bip_rc=0 bip_word=""
+    # SECURITY (#1414 / #1679 r2): scrub the insecure-bind hatches AND the legacy
+    # forced-verdict env vars from this discriminator subprocess too (uniform with
+    # the healthz / self-reach probes). bind-ip-present never read a verdict var;
+    # the scrub is defense-in-depth so the supervisor's discriminator subprocess
+    # env is uniformly clean.
     bip_out="$(bridge_with_timeout 10 a2a_receiver_bind_ip_present \
       env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
+        -u BRIDGE_A2A_HEALTHZ_TEST_VERDICT -u BRIDGE_A2A_SELF_REACH_TEST_VERDICT \
       python3 "$SCRIPT_DIR/bridge-handoffd.py" bind-ip-present \
         --config "$config" 2>/dev/null)" || bip_rc=$?
     bip_word="$(printf '%s\n' "$bip_out" | grep -E '^(bind_ip_present|bind_ip_absent|bind_ip_unknown)' | tail -1)"
     if [[ "$bip_word" == "bind_ip_absent" ]]; then
-      # Environmental: the tailnet IP is gone. Re-probe cadence gate so we do
-      # not re-evaluate the (cheap) interface check every supervise tick during
-      # a multi-hour outage — re-check at most once per env-reprobe interval.
-      local env_reprobe="${BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS:-45}"
-      [[ "$env_reprobe" =~ ^[0-9]+$ ]] || env_reprobe=45
+      # Environmental: the tailnet IP is gone. Stamp the re-probe clock so the
+      # cadence gate above holds (without re-probing) for the next env_reprobe
+      # seconds before the next interface re-check.
+      last_env_reprobe_ts="$now"
       alarm="env_bind_ip_absent"
       reason="bind_ip_absent"
       last_reason="$reason"
@@ -3836,7 +3923,8 @@ process_a2a_receiver_supervise_tick() {
       bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
         "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
         "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
-        "$prev_error_class" "$breaker_key" "$consec_transient"
+        "$prev_error_class" "$breaker_key" "$consec_transient" \
+        "$last_env_reprobe_ts"
       return 0
     fi
     if [[ "$bip_word" == "bind_ip_present" ]]; then
