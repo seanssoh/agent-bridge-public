@@ -32,9 +32,24 @@ antiloop  --session <s> --picker-id <p> [--window-seconds W] [--max-resolves M]
     W seconds. Emits {"tripped": bool, "count": N}. When tripped the caller
     must ESCALATE instead of re-keying.
 
+unknown-tick  --session <s> --pane-hash <h> [--stuck-minutes M] [--min-ticks N]
+              [--state-dir <d>]
+    Advance the per-session UNKNOWN-pane state machine (the novel-screen path).
+    A pane that matched no catalog entry but looks prompt-like is "unknown-stuck"
+    only when the SAME pane hash persists across >= N consecutive unknown ticks
+    AND for at least M minutes of wall-clock time since first_seen. Emits
+    {"stuck": bool, "ticks": N, "first_seen": epoch, "elapsed": secs}. A changing
+    pane hash resets the counter. Layer-3 escalation (picker_id=unknown) fires
+    only when this reports stuck=true.
+
 clear-state  --session <s> [--state-dir <d>]
     Drop the stuck-confirmation state for a session (called after a successful
     resolution or when the session clears) so the next encounter starts fresh.
+
+clear-unknown  --session <s> [--state-dir <d>]
+    Drop the UNKNOWN-pane state for a session (called when the pane changes, a
+    catalog entry matches, or after an unknown escalation fires) so the next
+    novel screen starts fresh.
 
 audit-line  --kw key=value [--kw key=value ...]
     Emit a single canonical JSON object (one line) for the audit log. Values
@@ -269,6 +284,64 @@ def cmd_tick(args: argparse.Namespace) -> dict[str, Any]:
     return {"stuck": ticks >= need, "ticks": ticks, "first_seen": first_seen}
 
 
+def cmd_unknown_tick(args: argparse.Namespace) -> dict[str, Any]:
+    """Track an UNKNOWN (no catalog match) prompt-like pane across ticks.
+
+    Mirrors cmd_tick but for the novel-screen path: a pane that matched no
+    catalog entry but looks prompt-like. A pane is "unknown-stuck" only when the
+    SAME pane hash has persisted across >= `min_ticks` consecutive unknown ticks
+    AND for at least `stuck_minutes` of wall-clock time since first_seen. Any
+    change of pane hash resets the counter (the agent is making progress); a tick
+    that does not pass the prompt-like gate is handled by the caller clearing the
+    state. This is what makes Layer-3 escalation real for genuinely novel screens
+    instead of dead code.
+
+    Emits {"stuck": bool, "ticks": N, "first_seen": epoch, "elapsed": secs}.
+    """
+    state_dir = _state_dir(args.state_dir)
+    path = state_dir / f"{_safe_name(args.session)}.unknown.json"
+    now = int(time.time())
+    cur = _read_json(path)
+
+    same = cur.get("pane_hash") == args.pane_hash
+    if same:
+        ticks = int(cur.get("ticks", 0)) + 1
+        first_seen = int(cur.get("first_seen", now))
+    else:
+        ticks = 1
+        first_seen = now
+
+    _write_json(
+        path,
+        {
+            "pane_hash": args.pane_hash,
+            "ticks": ticks,
+            "first_seen": first_seen,
+            "updated": now,
+        },
+    )
+    elapsed = now - first_seen
+    stuck_minutes = max(0, int(args.stuck_minutes))
+    min_ticks = max(1, int(args.min_ticks))
+    stuck = ticks >= min_ticks and elapsed >= stuck_minutes * 60
+    return {
+        "stuck": stuck,
+        "ticks": ticks,
+        "first_seen": first_seen,
+        "elapsed": elapsed,
+    }
+
+
+def cmd_clear_unknown(args: argparse.Namespace) -> dict[str, Any]:
+    state_dir = _state_dir(args.state_dir)
+    path = state_dir / f"{_safe_name(args.session)}.unknown.json"
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return {"cleared": True}
+
+
 def cmd_antiloop(args: argparse.Namespace) -> dict[str, Any]:
     state_dir = _state_dir(args.state_dir)
     key = f"{_safe_name(args.session)}__{_safe_name(args.picker_id)}"
@@ -313,6 +386,9 @@ def cmd_classify(args: argparse.Namespace) -> dict[str, Any]:
     decision["antiloop_max_resolves"] = int(
         catalog["defaults"].get("antiloop_max_resolves", 3)
     )
+    decision["unknown_stuck_minutes"] = int(
+        catalog["defaults"].get("unknown_stuck_minutes", 5)
+    )
     return decision
 
 
@@ -346,6 +422,19 @@ def main(argv: list[str] | None = None) -> int:
     p_tick.add_argument("--stuck-confirm-ticks", type=int, default=2)
     p_tick.add_argument("--state-dir")
     p_tick.set_defaults(func=cmd_tick)
+
+    p_uticks = sub.add_parser("unknown-tick")
+    p_uticks.add_argument("--session", required=True)
+    p_uticks.add_argument("--pane-hash", required=True)
+    p_uticks.add_argument("--stuck-minutes", type=int, default=5)
+    p_uticks.add_argument("--min-ticks", type=int, default=2)
+    p_uticks.add_argument("--state-dir")
+    p_uticks.set_defaults(func=cmd_unknown_tick)
+
+    p_uclear = sub.add_parser("clear-unknown")
+    p_uclear.add_argument("--session", required=True)
+    p_uclear.add_argument("--state-dir")
+    p_uclear.set_defaults(func=cmd_clear_unknown)
 
     p_anti = sub.add_parser("antiloop")
     p_anti.add_argument("--session", required=True)

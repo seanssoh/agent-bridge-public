@@ -64,7 +64,7 @@ Do **not** fire for `[PERMISSION]` tasks that route to `patch-permission-approva
 
 ## Policy rails the daemon already enforces (don't fight them)
 
-- **Post-resolve verification:** after keying, the daemon re-captures and refuses to re-key if the pane still matches any picker — it escalates to you instead. If you keep getting escalations for one picker, the fingerprint is wrong; fix the regex.
+- **Post-resolve verification:** after keying, the daemon re-captures and refuses to re-key if the pane still matches any picker — it escalates to you instead (`reason=post_resolve_verify_failed`). If the re-capture itself fails (empty/garbled — e.g. the session vanished mid-resolve), the daemon fails **open**: it treats the verification as indeterminate, audits it as such, and escalates (`reason=post_resolve_verify_indeterminate`) rather than claiming success. If you keep getting escalations for one picker, the fingerprint is wrong; fix the regex.
 - **Anti-loop:** same `(session, picker)` resolved too many times in a short window → the daemon stops and escalates. If you see this, the keystrokes are not actually clearing the picker.
 - **Destructive-guard:** the daemon refuses to advance when the selected option matches `destructive_match`. Encode the destructive option for every list picker.
 

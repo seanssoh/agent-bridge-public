@@ -22,9 +22,19 @@
 #         (select_first + confirm) through the tmux primitive layer
 #   T6  — post-resolve verification rail: if the pane STILL matches a picker
 #         after keying, do NOT re-key — escalate
+#   T6b — post-resolve recapture FAILS after keys sent (empty after-capture):
+#         no unbound-variable crash, verify resolves to INDETERMINATE, escalate,
+#         and later sessions in the same scan are still processed
 #   T7  — anti-loop: same picker resolved M times in the window escalates
 #   T8  — destructive-guard: destructive option selected → escalate, no keys
-#   T9  — unknown-but-stuck (escalate policy) files the admin escalation task
+#   T8b — destructive-guard recognizes a line-leading ASCII '>' selection glyph
+#         (not only the unicode ❯/› glyphs) → refuse + escalate, zero keys
+#   T9  — policy=escalate catalog picker (auth surface) files the admin task,
+#         zero keys
+#   T9b — TRUE novel-pane path: a prompt-like pane that matches NO catalog entry
+#         and stays unchanged past the unknown-stuck budget escalates EXACTLY
+#         once with picker_id=unknown and zero keys; a matched non_picker banner
+#         and ordinary non-prompt output never count as unknown-stuck
 #   T10 — defer policy routes to the existing trust/summary machinery, no keys
 #
 # Footgun #11 (heredoc-stdin deadlock class): the python helper is invoked
@@ -327,6 +337,43 @@ test_t6_post_resolve_verify() {
 }
 
 # ---------------------------------------------------------------------
+# T6b — post-resolve recapture FAILS after keys sent (Blocker 2): an empty
+# after-capture must NOT trip `set -u` on an unbound verify variable, must
+# resolve to an INDETERMINATE outcome (fail-open: escalate, never verify-ok,
+# never re-key), and must NOT abort the scan for later sessions.
+# ---------------------------------------------------------------------
+# shellcheck disable=SC2329
+test_t6b_recapture_failure_indeterminate() {
+  smoke_log "T6b: empty after-capture → indeterminate verify, escalate, no crash, scan continues"
+  python3 "$PICKER_PY" clear-state --session sT6b --state-dir "$BRIDGE_PICKER_STATE_DIR" >/dev/null 2>&1 || true
+  SMOKE_KEYS=""
+  printf '0' >"$SMOKE_CAPTURE_COUNTER"
+  SMOKE_PANE=$'codex:\nUpdate now? [Y/n]\n'
+  # The after-capture comes back EMPTY (capture-pane failed / session vanished).
+  SMOKE_PANE_AFTER=""
+  local before_esc; before_esc="$(count_escalations)"
+  # Must run under the smoke's own `set -e` without aborting (the resolver is
+  # `|| true`-guarded by callers; here we assert it returns cleanly).
+  bridge_picker_resolve_session "agentT6b" "sT6b" "codex" || true
+  local after_esc; after_esc="$(count_escalations)"
+  (( after_esc > before_esc )) \
+    || smoke_fail "T6b: indeterminate post-resolve verify must escalate (before=$before_esc after=$after_esc)"
+  # The audit log must record an indeterminate verify (not 'ok', not 'verify_failed').
+  local audit_log="${BRIDGE_PICKER_AUDIT_LOG:-${BRIDGE_LOG_DIR:-$BRIDGE_HOME/logs}/picker-resolve.jsonl}"
+  if [[ -f "$audit_log" ]]; then
+    grep -q "verify_indeterminate" "$audit_log" \
+      || smoke_fail "T6b: audit log must record outcome=verify_indeterminate"
+  fi
+  # A LATER session in the same scan must still be processed (no masked abort).
+  printf '0' >"$SMOKE_CAPTURE_COUNTER"
+  SMOKE_KEYS=""
+  SMOKE_PANE=$'codex:\nUpdate now? [Y/n]\n'
+  SMOKE_PANE_AFTER=$'╭───╮\n│ > │\n╰───╯\n'
+  bridge_picker_resolve_session "agentT6b2" "sT6b2" "codex" || true
+  smoke_assert_contains "$SMOKE_KEYS" "confirm" "T6b: a later session is still processed after an indeterminate one"
+}
+
+# ---------------------------------------------------------------------
 # T7 — anti-loop: after max resolves in the window, escalate not re-key.
 # ---------------------------------------------------------------------
 # shellcheck disable=SC2329
@@ -366,11 +413,32 @@ test_t8_destructive_guard() {
 }
 
 # ---------------------------------------------------------------------
-# T9 — unknown-but-stuck / escalate policy files the admin task.
+# T8b — destructive-guard recognizes a line-leading ASCII '>' selection glyph
+# (Blocker 3): the docs/fixtures claim '>' support but only the unicode glyphs
+# were detected. A destructive option marked with '>' must refuse + escalate
+# with zero keys, exactly like the unicode-glyph case in T8.
+# ---------------------------------------------------------------------
+# shellcheck disable=SC2329
+test_t8b_destructive_ascii_gt() {
+  smoke_log "T8b: ASCII '>' destructive selection → escalate, no keys"
+  python3 "$PICKER_PY" clear-state --session sT8b --state-dir "$BRIDGE_PICKER_STATE_DIR" >/dev/null 2>&1 || true
+  SMOKE_KEYS=""
+  printf '0' >"$SMOKE_CAPTURE_COUNTER"
+  # DESTRUCTIVE option carries a line-leading ASCII '>' marker (no unicode glyph).
+  SMOKE_PANE=$'pick one:\n  Continue where you left off\n> Start a new conversation\n'
+  SMOKE_PANE_AFTER=$'╭───╮\n│ > │\n╰───╯\n'
+  local before_esc; before_esc="$(count_escalations)"
+  bridge_picker_resolve_session "agentT8b" "sT8b" "claude" || true
+  (( $(count_escalations) > before_esc )) || smoke_fail "T8b: ASCII '>' destructive selection must escalate"
+  smoke_assert_not_contains "$SMOKE_KEYS" "confirm" "T8b: ASCII '>' destructive guard → NO keystrokes sent"
+}
+
+# ---------------------------------------------------------------------
+# T9 — policy=escalate catalog picker (auth surface) files the admin task.
 # ---------------------------------------------------------------------
 # shellcheck disable=SC2329
 test_t9_escalate_policy() {
-  smoke_log "T9: escalate-policy picker (auth surface) files admin task, no keys"
+  smoke_log "T9: policy=escalate catalog picker (auth surface) files admin task, no keys"
   python3 "$PICKER_PY" clear-state --session sT9 --state-dir "$BRIDGE_PICKER_STATE_DIR" >/dev/null 2>&1 || true
   SMOKE_KEYS=""
   printf '0' >"$SMOKE_CAPTURE_COUNTER"
@@ -380,6 +448,78 @@ test_t9_escalate_policy() {
   bridge_picker_resolve_session "agentT9" "sT9" "codex" || true
   (( $(count_escalations) > before_esc )) || smoke_fail "T9: escalate policy must file an admin task"
   smoke_assert_eq "" "$SMOKE_KEYS" "T9: escalate policy sends ZERO keystrokes"
+}
+
+# ---------------------------------------------------------------------
+# T9b — TRUE novel-pane path (Blocker 1): a prompt-like pane that matches NO
+# catalog entry, held UNCHANGED past the unknown-stuck budget, escalates EXACTLY
+# once with picker_id=unknown and ZERO keys. A matched non_picker banner and
+# ordinary non-prompt output must NEVER count as unknown-stuck.
+# ---------------------------------------------------------------------
+# shellcheck disable=SC2329
+test_t9b_unknown_pane_escalates() {
+  smoke_log "T9b: novel unknown prompt-like pane stuck → one escalation, zero keys"
+  # Use a catalog whose ONLY entry is a non_picker banner (so the novel pane
+  # below matches nothing) and unknown_stuck_minutes=0 (so the 2-tick budget is
+  # the only gate). Override the shipped-catalog resolver for the duration.
+  local ucat="$SMOKE_TMP_ROOT/unknown-catalog.json"
+  printf '%s' '{
+    "version": 1,
+    "defaults": {"stuck_confirm_ticks": 1, "unknown_stuck_minutes": 0},
+    "entries": [
+      {"picker_id":"t-banner","engine":"claude","enabled":true,"match":["Auto-update failed"],"policy":"non_picker"}
+    ]
+  }' >"$ucat"
+  local _saved_catfn; _saved_catfn="$(declare -f bridge_picker_shipped_catalogs)"
+  # shellcheck disable=SC2329
+  bridge_picker_shipped_catalogs() { printf '%s\n' "$ucat"; }
+
+  python3 "$PICKER_PY" clear-unknown --session sT9b --state-dir "$BRIDGE_PICKER_STATE_DIR" >/dev/null 2>&1 || true
+  SMOKE_KEYS=""
+  # A novel prompt-like screen (box glyphs + selection arrow) that matches no
+  # catalog entry. Same pane on both captures so the hash is unchanged.
+  local novel=$'╭──────────────╮\n│ ❯ Option A   │\n│   Option B   │\n╰──────────────╯\n'
+  local b1; b1="$(count_escalations)"
+  # Tick 1: needs 2 unknown ticks → must NOT escalate yet.
+  printf '0' >"$SMOKE_CAPTURE_COUNTER"; SMOKE_PANE="$novel"; SMOKE_PANE_AFTER="$novel"
+  bridge_picker_resolve_session "agentT9b" "sT9b" "claude" || true
+  local a1; a1="$(count_escalations)"
+  smoke_assert_eq "$b1" "$a1" "T9b: first unknown tick does not escalate (needs the tick budget)"
+  # Tick 2: same unchanged pane → unknown-stuck → exactly one escalation, no keys.
+  printf '0' >"$SMOKE_CAPTURE_COUNTER"; SMOKE_PANE="$novel"; SMOKE_PANE_AFTER="$novel"
+  bridge_picker_resolve_session "agentT9b" "sT9b" "claude" || true
+  local a2; a2="$(count_escalations)"
+  (( a2 == b1 + 1 )) || smoke_fail "T9b: unknown-stuck must escalate EXACTLY once (before=$b1 after=$a2)"
+  smoke_assert_eq "" "$SMOKE_KEYS" "T9b: unknown escalation sends ZERO keystrokes"
+  # Tick 3 immediately after: the timer was cleared on escalation → debounced,
+  # so the very next tick must NOT re-file.
+  printf '0' >"$SMOKE_CAPTURE_COUNTER"; SMOKE_PANE="$novel"; SMOKE_PANE_AFTER="$novel"
+  bridge_picker_resolve_session "agentT9b" "sT9b" "claude" || true
+  smoke_assert_eq "$a2" "$(count_escalations)" "T9b: escalation is debounced (timer cleared) — no immediate re-file"
+
+  # Negative 1: a matched non_picker banner is a HARD EXCLUSION — never stuck.
+  python3 "$PICKER_PY" clear-unknown --session sT9bN1 --state-dir "$BRIDGE_PICKER_STATE_DIR" >/dev/null 2>&1 || true
+  local banner=$'working...\n  Auto-update failed - Run /doctor\n> \n'
+  local bn; bn="$(count_escalations)"
+  local i
+  for i in 1 2 3; do
+    printf '0' >"$SMOKE_CAPTURE_COUNTER"; SMOKE_PANE="$banner"; SMOKE_PANE_AFTER="$banner"
+    bridge_picker_resolve_session "agentT9bN1" "sT9bN1" "claude" || true
+  done
+  smoke_assert_eq "$bn" "$(count_escalations)" "T9b: non_picker banner NEVER counts as unknown-stuck"
+
+  # Negative 2: ordinary non-prompt output must never escalate.
+  python3 "$PICKER_PY" clear-unknown --session sT9bN2 --state-dir "$BRIDGE_PICKER_STATE_DIR" >/dev/null 2>&1 || true
+  local plain=$'Running tests...\nAll 42 passed.\nDone.\n'
+  local bp; bp="$(count_escalations)"
+  for i in 1 2 3; do
+    printf '0' >"$SMOKE_CAPTURE_COUNTER"; SMOKE_PANE="$plain"; SMOKE_PANE_AFTER="$plain"
+    bridge_picker_resolve_session "agentT9bN2" "sT9bN2" "codex" || true
+  done
+  smoke_assert_eq "$bp" "$(count_escalations)" "T9b: ordinary non-prompt output NEVER counts as unknown-stuck"
+
+  # Restore the smoke-wide shipped-catalog override.
+  eval "$_saved_catfn"
 }
 
 # ---------------------------------------------------------------------
@@ -431,11 +571,14 @@ setup_shell_stage
 
 smoke_run "T5: auto_resolve key dispatch" test_t5_policy_dispatch_keys
 smoke_run "T6: post-resolve verification rail" test_t6_post_resolve_verify
+smoke_run "T6b: recapture-failure → indeterminate verify" test_t6b_recapture_failure_indeterminate
 smoke_run "T7: anti-loop escalation" test_t7_antiloop_escalates
 smoke_run "T8: destructive-guard" test_t8_destructive_guard
+smoke_run "T8b: destructive-guard ASCII '>'" test_t8b_destructive_ascii_gt
 smoke_run "T9: escalate policy files admin task" test_t9_escalate_policy
+smoke_run "T9b: novel unknown-pane escalation" test_t9b_unknown_pane_escalates
 smoke_run "T10: defer policy → existing machinery" test_t10_defer_policy
 smoke_run "T11: tmux primitive + daemon wiring teeth" test_t11_teeth
 
-smoke_log "all T1-T11 pass"
+smoke_log "all T1-T11 (+T6b/T8b/T9b) pass"
 exit 0

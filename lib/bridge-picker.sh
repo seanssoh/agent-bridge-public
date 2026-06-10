@@ -179,11 +179,19 @@ bridge_picker_resolve_session() {
   local matched picker_id policy pane_hash stuck_ticks
   matched="$(bridge_picker_json_field "$decision" matched)"
   if [[ "$matched" != "true" ]]; then
-    # No actionable picker (or a non_picker context signal) — clear any stale
-    # stuck-state so the next genuine encounter starts fresh, then bail.
+    # No catalog picker matched. Clear any stale KNOWN-picker stuck-state so a
+    # later genuine known encounter starts fresh, then hand off to the unknown
+    # path. A non_picker context signal (matched=false + non_picker=true) is a
+    # HARD EXCLUSION — it must never count as unknown-stuck — and is filtered
+    # inside bridge_picker_handle_unknown.
     bridge_picker_py clear-state --session "$session" --state-dir "$(bridge_picker_state_dir)" >/dev/null 2>&1 || true
-    return 1
+    bridge_picker_handle_unknown "$agent" "$session" "$engine" "$pane" "$decision"
+    return $?
   fi
+
+  # A known picker matched → this is not a novel screen; drop any unknown-pane
+  # tracking so a later genuine unknown starts fresh.
+  bridge_picker_py clear-unknown --session "$session" --state-dir "$(bridge_picker_state_dir)" >/dev/null 2>&1 || true
 
   picker_id="$(bridge_picker_json_field "$decision" picker_id)"
   policy="$(bridge_picker_json_field "$decision" policy)"
@@ -220,6 +228,84 @@ bridge_picker_resolve_session() {
       bridge_picker_escalate "$agent" "$session" "$engine" "$picker_id" "$pane" "$decision" "unknown_policy"
       ;;
   esac
+}
+
+# --------------------------------------------------------------------------
+# Layer 3 — unknown (novel) screen path
+# --------------------------------------------------------------------------
+# Heuristic: does the captured tail look like an interactive prompt waiting on
+# the agent (as opposed to ordinary scrolling output)? Conservative — a single
+# positive signal is enough, but a pane with NO signal is treated as "not a
+# prompt" so we never escalate plain working output. This only gates whether we
+# track the pane as a candidate novel screen; the unknown-tick budget + the
+# unchanged-hash requirement are what actually decide stuck.
+bridge_picker_pane_looks_prompt_like() {
+  local pane="$1"
+  [[ -n "$pane" ]] || return 1
+  # Selection/menu glyphs, a TUI box edge, a y/n style prompt, an arrow-key
+  # hint, or an explicit "Enter to" affordance all indicate an interactive
+  # surface. These are intentionally broad: a false positive only means we
+  # START the unknown-tick timer; escalation still needs the pane UNCHANGED for
+  # the full minute/tick budget, which ordinary live output never satisfies.
+  case "$pane" in
+    *❯*|*›*|*"╭"*|*"╰"*|*"│"*) return 0 ;;
+    *"[y/n]"*|*"[Y/n]"*|*"[y/N]"*|*"(y/n)"*|*"(Y/n)"*) return 0 ;;
+    *"↑/↓"*|*"↑↓"*|*"press enter"*|*"Press Enter"*|*"to continue"*) return 0 ;;
+    *"Press "*"to "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# No catalog entry matched. If the pane is a genuine novel prompt-like screen
+# that has stayed UNCHANGED past the unknown-stuck budget, escalate it to the
+# admin with picker_id=unknown so the picker-resolve skill can classify it and
+# extend the catalog. A non_picker context signal is a HARD EXCLUSION (it can
+# never be unknown-stuck). Returns 0 if it escalated, 1 otherwise.
+bridge_picker_handle_unknown() {
+  local agent="$1" session="$2" engine="$3" pane="$4" decision="$5"
+
+  # Hard exclusion: a matched non_picker banner is a known, non-blocking status
+  # signal — never a novel stuck screen. Drop any unknown tracking and bail.
+  local non_picker
+  non_picker="$(bridge_picker_json_field "$decision" non_picker)"
+  if [[ "$non_picker" == "true" ]]; then
+    bridge_picker_py clear-unknown --session "$session" --state-dir "$(bridge_picker_state_dir)" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # Not prompt-like → ordinary output; reset the timer so a real prompt later
+  # starts its budget fresh.
+  if ! bridge_picker_pane_looks_prompt_like "$pane"; then
+    bridge_picker_py clear-unknown --session "$session" --state-dir "$(bridge_picker_state_dir)" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  local pane_hash unknown_minutes
+  pane_hash="$(bridge_picker_json_field "$decision" pane_hash)"
+  unknown_minutes="$(bridge_picker_json_field "$decision" unknown_stuck_minutes)"
+  [[ "$unknown_minutes" =~ ^[0-9]+$ ]] || unknown_minutes=5
+
+  # Track the unknown pane across ticks: escalate only when the SAME hash has
+  # persisted across >= min-ticks consecutive ticks AND for the full minute
+  # budget. A changing pane (agent making progress) resets the counter.
+  local utick stuck
+  utick="$(bridge_picker_py unknown-tick --session "$session" --pane-hash "$pane_hash" \
+    --stuck-minutes "$unknown_minutes" --min-ticks 2 \
+    --state-dir "$(bridge_picker_state_dir)" 2>/dev/null || true)"
+  stuck="$(bridge_picker_json_field "$utick" stuck)"
+  if [[ "$stuck" != "true" ]]; then
+    return 1
+  fi
+
+  bridge_picker_log "picker detector: UNKNOWN screen stuck on session=${session} (agent=${agent}) past ${unknown_minutes}m — escalating for classification"
+  # Escalate with an empty picker_id; bridge_picker_escalate renders it as
+  # 'unknown' and the body carries the captured pane for the admin to classify.
+  bridge_picker_escalate "$agent" "$session" "$engine" "" "$pane" "$decision" "unknown_stuck"
+  # Clear the unknown timer so we do not re-file every tick; the anti-loop
+  # window inside the escalate path is not used here, so the timer reset is the
+  # debounce — a fresh budget must elapse before the next escalation.
+  bridge_picker_py clear-unknown --session "$session" --state-dir "$(bridge_picker_state_dir)" >/dev/null 2>&1 || true
+  return 0
 }
 
 # policy=defer → route to the EXISTING blocker machinery; do NOT key it here.
@@ -297,6 +383,15 @@ bridge_picker_handle_auto_resolve() {
   # wrong control.
   # Small settle so the TUI can redraw before we re-read.
   bridge_picker_settle
+  # FAIL-OPEN default: the keys are ALREADY sent, so the verify outcome must be
+  # initialized to a non-confirmed value. If the re-capture, mktemp, or classify
+  # below cannot run (empty after-capture, mktemp failure, helper error), the
+  # outcome stays `indeterminate` and we ESCALATE rather than reporting
+  # verify-ok, re-keying, or crashing under `set -u` on an unbound variable.
+  # Outcomes: confirmed_clear (pane verified no longer a picker — resolution ok)
+  #           still_picker     (pane still matches a fingerprint — escalate)
+  #           indeterminate    (verification could not be confirmed — escalate)
+  local verify_state="indeterminate"
   local pane_after verify_decision still_matched
   pane_after="$(bridge_capture_recent "$session" 40 2>/dev/null || true)"
   local snap_after
@@ -317,14 +412,34 @@ bridge_picker_handle_auto_resolve() {
       [[ -f "$local_catalog" ]] && catalog_args+=(--local-catalog "$local_catalog")
       verify_decision="$(bridge_picker_py classify --engine "$engine" --pane-file "$pane_after_file" "${catalog_args[@]}" 2>/dev/null || true)"
       rm -f "$pane_after_file" 2>/dev/null || true
-      still_matched="$(bridge_picker_json_field "$verify_decision" matched)"
+      if [[ -n "$verify_decision" ]]; then
+        still_matched="$(bridge_picker_json_field "$verify_decision" matched)"
+        # A definitive classify result resolves the outcome: a fingerprint
+        # match → still_picker; a clean classify → confirmed_clear. Anything
+        # else (empty/garbled helper output) leaves verify_state=indeterminate.
+        if [[ "$still_matched" == "true" ]]; then
+          verify_state="still_picker"
+        else
+          verify_state="confirmed_clear"
+        fi
+      fi
     fi
   fi
 
-  if [[ "$still_matched" == "true" ]]; then
+  if [[ "$verify_state" == "still_picker" ]]; then
     bridge_warn "picker resolver: post-resolve verification FAILED for '${picker_id}' on session=${session} (pane still matches a picker) — not re-keying, escalating"
     bridge_picker_audit_resolution "$agent" "$session" "$engine" "$picker_id" "auto_resolve" "" "$sent_keys" "$snap_before" "$snap_after" "verify_failed"
     bridge_picker_escalate "$agent" "$session" "$engine" "$picker_id" "$pane_after" "$decision" "post_resolve_verify_failed"
+    return 0
+  fi
+
+  if [[ "$verify_state" != "confirmed_clear" ]]; then
+    # Fail-open: re-capture/mktemp/classify did not confirm a clean pane. The
+    # keys are already sent, so we MUST NOT re-key and MUST NOT claim success —
+    # audit the indeterminate verify and escalate for a human/admin to confirm.
+    bridge_warn "picker resolver: post-resolve verification INDETERMINATE for '${picker_id}' on session=${session} (could not re-capture/classify after keying) — escalating"
+    bridge_picker_audit_resolution "$agent" "$session" "$engine" "$picker_id" "auto_resolve" "" "$sent_keys" "$snap_before" "$snap_after" "verify_indeterminate"
+    bridge_picker_escalate "$agent" "$session" "$engine" "$picker_id" "$pane_after" "$decision" "post_resolve_verify_indeterminate"
     return 0
   fi
 
@@ -348,7 +463,21 @@ bridge_picker_selected_is_destructive() {
   local line
   while IFS= read -r line; do
     case "$line" in
+      # Unicode selection glyphs (anywhere on the line) OR a line-leading ASCII
+      # '>' marker (optionally indented) — Claude/Codex TUIs render the
+      # highlighted option either way. The ASCII form is anchored to the line
+      # start (after optional whitespace) so a mid-line '>' (e.g. a quoted '>'
+      # or a redirection-looking glyph in body text) does NOT count as a
+      # selection marker.
       *❯*|*›*) ;;
+      [[:space:]]*">"*|">"*)
+        # Re-confirm the '>' is line-leading: strip leading whitespace and
+        # require the first remaining char to be '>'. (The case globs above are
+        # broad; this guards against a '>' that merely follows other text after
+        # the leading whitespace.)
+        local trimmed="${line#"${line%%[![:space:]]*}"}"
+        [[ "$trimmed" == ">"* ]] || continue
+        ;;
       *) continue ;;
     esac
     if [[ "$line" == *"$phrase"* ]]; then
