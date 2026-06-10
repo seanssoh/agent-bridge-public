@@ -30,6 +30,16 @@ Args (positional, order-sensitive):
         falls back to the `CLAUDE_CONFIG_DIR` env var, then `<HOME>/.claude`,
         then `os.path.expanduser("~/.claude")` — keeping the non-isolated
         path and existing call sites byte-for-byte unchanged.
+    sys.argv[7] — trusted_id (optional, issue #1769): a session id the bash
+        wrapper has vouched for via the short-TTL trusted-resume marker that
+        `run_restart` writes after validating the live session it killed.
+        When this equals the candidate, the live-session shortcut accepts the
+        candidate even though its pid is now dead — repairing the #981
+        re-inject for a freshly-started / idle session that had no eligible
+        transcript yet. The marker is TTL-bounded and consumed bash-side, so
+        this is additive (one id, one restart cycle) and never relaxes the
+        freshness/quarantine gate for any other id. Empty = no trusted id,
+        i.e. every pre-#1769 call site behaves byte-for-byte as before.
 
 Stdout: accepted session id, or empty when there is nothing to resume.
 Exit code:
@@ -46,7 +56,10 @@ Issue #827 live-session shortcut (preserved here):
     and exit 0 immediately — fresh Claude sessions create the session
     JSON before the transcript jsonl exists; rejecting that id would
     strand `AGENT_SESSION_ID` until the first transcript write. Dead-pid
-    records fall through to the transcript freshness path below.
+    records fall through to the transcript freshness path below — EXCEPT
+    when the candidate equals the issue #1769 trusted_id (argv[7]), in
+    which case the dead-pid record is accepted once (run_restart vouched
+    for it pre-kill via the short-TTL trusted-resume marker).
 """
 
 import glob
@@ -131,8 +144,39 @@ def main() -> int:
     config_root = claude_config_root(
         sys.argv[6] if len(sys.argv) > 6 else ""
     )
+    # Issue #1769: a session id the bash wrapper vouched for via the
+    # short-TTL trusted-resume marker run_restart writes pre-kill. Only
+    # honored when it equals the candidate (see live-session shortcut).
+    trusted_id = (sys.argv[7] if len(sys.argv) > 7 else "") or ""
 
     cutoff = time.time() - max_age_hours * 3600
+
+    # Issue #1769: when the candidate equals the trusted id the bash
+    # wrapper supplied, accept it once even though its pid is now dead.
+    # run_restart validated this exact id while the session was still
+    # live and re-injected it across the kill; without this the post-kill
+    # re-validation rejects a freshly-started / idle session (live-session
+    # JSON only, no eligible transcript yet) and the agent launches fresh,
+    # silently defeating #981. The marker is TTL-bounded and consumed
+    # bash-side after the wrapper observes this rc=0, so the bypass is
+    # one id / one restart cycle, not a standing relaxation of the gate.
+    #
+    # The trusted path relaxes ONLY the dead-pid / freshness rejection — it
+    # never bypasses the #820 resume-quarantine set. A candidate the runner
+    # quarantined (because `claude --resume` rejected it as "No conversation
+    # found") must stay rejected even with a marker, so it falls through to
+    # the normal logic below (rc=2 swap to a fresher non-quarantined id, or
+    # rc=1). This is the accept-site half of the #1769 codex-r1 defense in
+    # depth; the write-site (run_restart) independently refuses to vouch for
+    # an id that is not the validated live session.
+    if (
+        candidate
+        and trusted_id
+        and candidate == trusted_id
+        and candidate not in exclude
+    ):
+        print(candidate, end="")
+        return 0
 
     # Issue #827: when the candidate id matches a live same-cwd
     # `~/.claude/sessions/<pid>.json` with an alive pid, accept it
@@ -141,7 +185,17 @@ def main() -> int:
     # strands AGENT_SESSION_ID until the first transcript write. Dead-pid
     # records remain ineligible and fall through to the transcript-based
     # path below.
-    if candidate:
+    #
+    # Issue #1769 (codex-r2): the shortcut is quarantine-aware. A
+    # quarantined candidate must never resolve — live or not — because the
+    # quarantine set exists precisely to stop resuming that id (the runner
+    # added it after `claude --resume <id>` reported "No conversation
+    # found"). Without this guard a quarantined-but-still-live session would
+    # be accepted here (and, via the pre-kill `_write_if_live` validation,
+    # would get a trusted-resume marker). Skipping the shortcut lets the
+    # candidate fall through to the #820 quarantine branch below, which
+    # resolves to the freshest non-quarantined transcript (rc=2) or rc=1.
+    if candidate and candidate not in exclude:
         for session_path in glob.glob(
             os.path.join(config_root, "sessions", "*.json")
         ):

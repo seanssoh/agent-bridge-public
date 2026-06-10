@@ -282,8 +282,14 @@ bridge_normalize_agent_session_id() {
       # rc=2 swaps in a fresher in-window transcript for the same workdir;
       # we persist that replacement here, since hydration sites intentionally
       # do not write state.
+      # Issue #1769: this is the decision/persist site, so it is the one
+      # call that consumes the trusted-resume marker on a rc=0 trusted
+      # accept (read-only hydration probes leave the flag unset). The
+      # accepted id is the live id run_restart re-injected; emitting it
+      # here is what restores `--resume <id>` on the relaunch.
       local _accepted="" _rc=0
-      _accepted="$(bridge_resolve_resume_session_id claude "$agent" "$workdir" "$session_id")" || _rc=$?
+      _accepted="$(BRIDGE_RESUME_TRUSTED_CONSUME=1 \
+        bridge_resolve_resume_session_id claude "$agent" "$workdir" "$session_id")" || _rc=$?
       case "$_rc" in
         0)
           ;;
@@ -4325,23 +4331,56 @@ bridge_resolve_resume_session_id() {
   # calls execute as the iso UID. Empty user → legacy direct-as-controller
   # invocation (back-compat for non-iso and dev hosts).
   local _resolve_py="$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-claude-resume-session-id.py"
+
+  # Issue #1769: trusted-resume marker. run_restart writes a short-TTL
+  # marker after validating the live session it kills; honor it here so
+  # the post-kill resolver accepts that exact id once even though the pid
+  # is now dead — repairing the #981 re-inject for a freshly-started /
+  # idle session that has no eligible transcript yet. We only pass a
+  # trusted id when it MATCHES the candidate (the resolver applies the
+  # same guard), so this can never force-resume an id other than the one
+  # the caller already holds. The marker is consumed below on the
+  # decision-site call so the bypass is genuinely one-shot.
+  local _trusted_id=""
+  if [[ -n "$agent" && -n "$candidate" ]] \
+      && command -v bridge_agent_resume_trusted_marker_id >/dev/null 2>&1; then
+    _trusted_id="$(bridge_agent_resume_trusted_marker_id "$agent" 2>/dev/null || true)"
+    [[ "$_trusted_id" == "$candidate" ]] || _trusted_id=""
+  fi
+
   local _iso_sudo_user=""
   if command -v bridge_resolve_agent_iso_sudo_user >/dev/null 2>&1; then
     _iso_sudo_user="$(bridge_resolve_agent_iso_sudo_user "$agent" 2>/dev/null || true)"
   fi
+  local _rc=0
   if [[ -n "$_iso_sudo_user" ]] \
       && command -v bridge_linux_sudo_as_user >/dev/null 2>&1; then
     local _bash_bin="${BRIDGE_BASH_BIN:-$(command -v bash 2>/dev/null || printf '/bin/bash')}"
     bridge_linux_sudo_as_user "$_iso_sudo_user" \
       "$_bash_bin" -c 'exec python3 "$@"' bash \
       "$_resolve_py" "$workdir" "$candidate" "$max_age_hours" "$agent" \
-      "$exclude_csv" "$claude_config_dir"
-    return $?
+      "$exclude_csv" "$claude_config_dir" "$_trusted_id"
+    _rc=$?
+  else
+    python3 "$_resolve_py" \
+      "$workdir" "$candidate" "$max_age_hours" "$agent" "$exclude_csv" \
+      "$claude_config_dir" "$_trusted_id"
+    _rc=$?
   fi
 
-  python3 "$_resolve_py" \
-    "$workdir" "$candidate" "$max_age_hours" "$agent" "$exclude_csv" \
-    "$claude_config_dir"
+  # Consume the trusted-resume marker on a decision-site accept so the
+  # bypass is one id / one restart cycle. Only the decision/persist site
+  # (bridge_normalize_agent_session_id) sets BRIDGE_RESUME_TRUSTED_CONSUME=1;
+  # read-only hydration probes leave it unset so they may observe the same
+  # trusted id without burning it before the launch builder runs. rc=0 with
+  # a non-empty trusted id is the only outcome that reflects the bypass
+  # firing (rc=1/2 mean the marker did not decide the result).
+  if [[ -n "$_trusted_id" && "$_rc" == 0 \
+        && "${BRIDGE_RESUME_TRUSTED_CONSUME:-0}" == 1 ]] \
+      && command -v bridge_agent_resume_trusted_marker_clear >/dev/null 2>&1; then
+    bridge_agent_resume_trusted_marker_clear "$agent" 2>/dev/null || true
+  fi
+  return $_rc
 }
 
 # Returns 0 (true) if the given workdir has any in-window

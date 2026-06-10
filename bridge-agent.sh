@@ -6784,6 +6784,23 @@ run_restart() {
   local resume_session_snapshot=""
   resume_session_snapshot="$(bridge_agent_session_id "$agent" 2>/dev/null || true)"
 
+  # #1769: vouch for the snapshot id with a short-TTL trusted-resume marker so
+  # the relaunch's post-kill re-validation accepts that exact id once even
+  # though its pid is now dead — without this a freshly-started / idle session
+  # (live-session JSON only, no eligible transcript yet) is rejected and the
+  # agent launches fresh, silently defeating the #981 re-inject. Consumed by
+  # the resolver on the relaunch's decision-site accept; the short TTL is the
+  # crash backstop; cleared at every restart terminal point below.
+  #
+  # codex-r1 write-site defense: we do NOT trust the persisted id blindly.
+  # `_write_if_live` runs the resolver BEFORE the kill (pid still alive) and
+  # writes the marker ONLY when the #827 live-session shortcut accepts the id
+  # (sessions/<pid>.json carries it, pid alive, cwd matches, not quarantined).
+  # A stale or quarantined persisted id is therefore never vouched for. The
+  # helper is a no-op for non-claude engines / empty id.
+  bridge_agent_resume_trusted_marker_write_if_live "$agent" "$resume_session_snapshot" \
+    >/dev/null 2>&1 || true
+
   # Issue #1251 Phase 2 entry: pick the rollback snapshot + write the
   # in-progress marker BEFORE the kill. The marker is the Lane C2
   # (#1254) contract for watchdog drift suppression; the snapshot is the
@@ -6843,6 +6860,13 @@ run_restart() {
   restart_rollback() {
     local rb_kind="${1:-launch-failed}"
     local rb_detail="${2:-restart failed mid-flight}"
+
+    # #1769: drop the trusted-resume marker before rolling back — the
+    # rollback restores a PRIOR config and re-launches, so a vouch for the
+    # pre-rollback live id must not survive into the restored-config relaunch.
+    # The TTL would expire it anyway; clearing here makes the one-restart-
+    # cycle guarantee explicit instead of TTL-approximate.
+    bridge_agent_resume_trusted_marker_clear "$agent" 2>/dev/null || true
 
     # Mark the marker with rolled_back state up-front so a watchdog tick
     # that races the rollback's restart_once sees the terminal state
@@ -6909,6 +6933,9 @@ run_restart() {
     # operator's perspective" — clear the marker so a watchdog tick does
     # not enqueue drift on a no-verify happy path.
     bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
+    # #1769: restart cycle is done — drop any trusted-resume marker the
+    # relaunch did not already consume (idempotent; TTL is the backstop).
+    bridge_agent_resume_trusted_marker_clear "$agent" 2>/dev/null || true
     return 0
   fi
 
@@ -6922,6 +6949,9 @@ run_restart() {
   if bridge_tmux_wait_for_claude_plugin_mcp_alive "$agent" "$verify_timeout"; then
     # Issue #1251: success path — clear the marker + snapshot.
     bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
+    # #1769: restart cycle is done — drop any trusted-resume marker the
+    # relaunch did not already consume (idempotent; TTL is the backstop).
+    bridge_agent_resume_trusted_marker_clear "$agent" 2>/dev/null || true
     return 0
   fi
 
@@ -6942,6 +6972,13 @@ run_restart() {
       # block for the full rationale.
       bridge_load_roster >/dev/null 2>&1 || true
       resume_session_snapshot="$(bridge_agent_session_id "$agent" 2>/dev/null || true)"
+      # #1769: re-vouch for the (possibly advanced) live id before this
+      # kill too — the same dead-pid rejection applies on each verify-retry
+      # relaunch. `_write_if_live` re-validates against the CURRENT live
+      # session (and clears any prior marker first) so a retry never carries
+      # a stale vouch forward; a fresh write refreshes the TTL window.
+      bridge_agent_resume_trusted_marker_write_if_live "$agent" "$resume_session_snapshot" \
+        >/dev/null 2>&1 || true
       bridge_kill_agent_session "$agent" >/dev/null 2>&1 || true
       bridge_refresh_runtime_state
       if [[ -n "$resume_session_snapshot" ]]; then
@@ -6958,6 +6995,9 @@ run_restart() {
     if bridge_tmux_wait_for_claude_plugin_mcp_alive "$agent" "$verify_timeout"; then
       # Issue #1251: success path on a verify-retry — clear the marker.
       bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
+      # #1769: restart cycle is done — drop any trusted-resume marker the
+      # relaunch did not already consume (idempotent; TTL is the backstop).
+      bridge_agent_resume_trusted_marker_clear "$agent" 2>/dev/null || true
       return 0
     fi
   done
@@ -6973,6 +7013,10 @@ run_restart() {
     "${BRIDGE_AGENT_RESTART_MARKER_TTL:-60}" "rolled_back" \
     "verify-failed: plugin MCP liveness missing after $verify_max_attempts attempts (session left alive — see issue #69)" \
     >/dev/null 2>&1 || true
+  # #1769: terminal failure — the relaunch already consumed the marker on
+  # the last successful restart_once, but clear explicitly so no trusted
+  # vouch outlives this restart cycle (idempotent; TTL is the backstop).
+  bridge_agent_resume_trusted_marker_clear "$agent" 2>/dev/null || true
   return 1
 }
 

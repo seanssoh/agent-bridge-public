@@ -9081,6 +9081,194 @@ bridge_agent_restart_marker_clear() {
   return 0
 }
 
+# --------------------------------------------------------------------------
+# Issue #1769 — trusted-resume marker (one restart cycle, short TTL).
+#
+# `run_restart` snapshots and re-injects the live session id around its
+# SIGKILL (#981) so the relaunch emits `--resume <id>`. But the relaunch
+# re-validates that id post-kill through `bridge_resolve_resume_session_id`
+# → `resolve-claude-resume-session-id.py`, whose #827 live-session shortcut
+# requires an ALIVE pid. A freshly-started / idle session that has not yet
+# flushed a `>0`-byte in-window transcript has only its `sessions/<pid>.json`
+# record; after the kill that pid is dead, the transcript scan finds nothing
+# eligible (rc=1), `bridge_normalize_agent_session_id` clears the re-injected
+# id, and the agent launches fresh — silently defeating #981 for exactly the
+# case it was meant to protect.
+#
+# The id `run_restart` snapshots was, by construction, LIVE AND ACCEPTED
+# immediately before the kill. The trusted-resume marker honors that: after
+# validating the live session it is killing, `run_restart` writes this marker
+# and the resolver accepts that EXACT id once even though the pid is now
+# dead. It is additive — the marker only ever forces acceptance of the single
+# id `run_restart` just confirmed live, is bounded to one restart cycle (short
+# TTL + cleared at every restart terminal point), and never relaxes the
+# freshness/quarantine gate for any other id or any later resolve.
+#
+# Marker schema (key=value lines, mirrors restart.in-progress conventions):
+#   id=<session-id>     # the snapshotted, pre-kill-validated session id.
+#   started=<unix-ts>   # marker write time; the TTL window is measured from
+#                       # here so a stale/abandoned marker self-expires.
+#   ttl=<seconds>       # short window (minutes), default 300. Resolver
+#                       # acceptance is gated on `now < started + ttl`.
+# Lives under `state/agents/<a>/resume.trusted`, mode 0600 (controller-only;
+# unlike the watchdog marker the iso UID never needs to read this one — the
+# resolver consults it controller-side, or as the iso UID via the same
+# sudo-as-user path the resolver already takes for the jsonl scan).
+# --------------------------------------------------------------------------
+
+# Default trusted-resume marker TTL in seconds (issue #1769). Short by design
+# — it only needs to survive a single relaunch's resolver passes. Operators
+# can widen it for cold-cache hosts where `claude` first-launch is slow.
+: "${BRIDGE_RESUME_TRUSTED_MARKER_TTL:=300}"
+
+bridge_agent_resume_trusted_marker_path() {
+  local agent="$1"
+  printf '%s/resume.trusted' "$(bridge_agent_restart_state_dir "$agent")"
+}
+
+# Write the trusted-resume marker (low-level). The caller MUST have proven
+# the id is the live session — production callers go through
+# bridge_agent_resume_trusted_marker_write_if_live, which performs that
+# validation. Atomic write + mode 0600. A write failure is non-fatal to the
+# caller (best-effort: the worst case is the resolver falls back to the
+# normal freshness gate, i.e. today's behavior).
+#
+# Args:
+#   $1 — agent id
+#   $2 — session id (required; empty is a no-op success so callers can pass
+#        an unconditional snapshot without guarding)
+#   $3 — ttl seconds (defaults to BRIDGE_RESUME_TRUSTED_MARKER_TTL)
+bridge_agent_resume_trusted_marker_write() {
+  local agent="$1"
+  local session_id="${2:-}"
+  local ttl="${3:-$BRIDGE_RESUME_TRUSTED_MARKER_TTL}"
+  local state_dir=""
+  local marker=""
+  local started=""
+
+  [[ -n "$agent" ]] || return 1
+  # Empty id → nothing to trust. Not an error: run_restart passes the
+  # snapshot unconditionally and a session with no id simply has nothing
+  # to protect.
+  [[ -n "$session_id" ]] || return 0
+
+  state_dir="$(bridge_agent_restart_state_dir "$agent")"
+  marker="$(bridge_agent_resume_trusted_marker_path "$agent")"
+  started="$(date +%s)"
+
+  mkdir -p "$state_dir" 2>/dev/null || return 1
+
+  local tmp="${marker}.tmp.$$"
+  {
+    printf 'id=%s\n' "$session_id"
+    printf 'started=%s\n' "$started"
+    printf 'ttl=%s\n' "$ttl"
+  } >"$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$marker" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  chmod 0600 "$marker" 2>/dev/null || true
+  return 0
+}
+
+# Read the trusted-resume id IF the marker is present, well-formed, and
+# still inside its TTL window. Prints the id on stdout (rc=0) only when the
+# marker vouches for an in-window id; prints nothing + rc=1 otherwise
+# (absent, malformed, or expired). Expiry is the resolver's single-restart-
+# cycle backstop independent of run_restart's terminal cleanup.
+bridge_agent_resume_trusted_marker_id() {
+  local agent="$1"
+  local marker=""
+  local id="" started="" ttl="" now=""
+  marker="$(bridge_agent_resume_trusted_marker_path "$agent")"
+  [[ -f "$marker" ]] || return 1
+  id="$(awk -F'=' '$1=="id"{sub(/^[^=]*=/,""); print; exit}' "$marker" 2>/dev/null || true)"
+  started="$(awk -F'=' '$1=="started"{sub(/^[^=]*=/,""); print; exit}' "$marker" 2>/dev/null || true)"
+  ttl="$(awk -F'=' '$1=="ttl"{sub(/^[^=]*=/,""); print; exit}' "$marker" 2>/dev/null || true)"
+  [[ -n "$id" ]] || return 1
+  [[ "$started" =~ ^[0-9]+$ && "$ttl" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  (( now < started + ttl )) || return 1
+  printf '%s' "$id"
+  return 0
+}
+
+# Remove the trusted-resume marker. Idempotent. Called by the resolver on
+# consume (one-shot acceptance) AND by run_restart at every restart terminal
+# point (success, kill-switch, rollback) so a successful or rolled-back
+# restart never strands a trusted id past its cycle. The short TTL is the
+# crash backstop for a restart that dies before reaching a terminal point.
+bridge_agent_resume_trusted_marker_clear() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 0
+  rm -f "$(bridge_agent_resume_trusted_marker_path "$agent")" 2>/dev/null || true
+  return 0
+}
+
+# Validate-then-write the trusted-resume marker (issue #1769 codex-r1 write-
+# site defense). run_restart MUST NOT vouch for an id merely because it sits
+# in BRIDGE_AGENT_SESSION_ID — a stale or quarantined persisted id would then
+# be force-accepted on relaunch. This helper proves the candidate is the
+# CURRENT live session being killed before writing the marker:
+#
+#   - run it BEFORE the SIGKILL, while the pid is still alive, so the resolver's
+#     #827 live-session shortcut can fire;
+#   - it calls bridge_resolve_resume_session_id (the SSOT freshness/live/
+#     quarantine gate) with the candidate. rc=0 AND stdout == candidate means
+#     the #827 shortcut accepted it: `sessions/<pid>.json` carries this id,
+#     the pid is alive, the cwd matches the agent workdir, and the id is NOT
+#     in the resume-quarantine set (the #827 shortcut is quarantine-aware as
+#     of #1769 codex-r2). Any other outcome (rc=1 reject, rc=2 swap, or a
+#     different stdout) means the id is NOT the validated live session, so NO
+#     marker is written and the relaunch falls back to today's behavior.
+#
+# codex-r2 defense in depth: we ALSO reject up-front when the id is in the
+# agent's resume-quarantine set, before the resolver call, so the write-site
+# refusal does not depend solely on the resolver's quarantine-awareness.
+#
+# Returns 0 when a marker was written, 1 when validation failed / no marker.
+# Non-claude engines and an empty id are a no-op success (nothing to protect).
+bridge_agent_resume_trusted_marker_write_if_live() {
+  local agent="$1"
+  local session_id="${2:-}"
+  local ttl="${3:-$BRIDGE_RESUME_TRUSTED_MARKER_TTL}"
+  local workdir="" accepted="" rc=0 quarantine_csv=""
+
+  [[ -n "$agent" && -n "$session_id" ]] || return 1
+  [[ "$(bridge_agent_engine "$agent" 2>/dev/null)" == "claude" ]] || return 1
+
+  workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  [[ -n "$workdir" ]] || return 1
+
+  # codex-r2 belt-and-braces: refuse to vouch for a quarantined id directly,
+  # independent of the resolver. The quarantine CSV is comma-delimited; match
+  # the whole id between delimiters so a substring cannot false-positive.
+  if command -v bridge_agent_resume_quarantine_ids >/dev/null 2>&1; then
+    quarantine_csv="$(bridge_agent_resume_quarantine_ids "$agent" 2>/dev/null || true)"
+    if [[ ",${quarantine_csv}," == *",${session_id},"* ]]; then
+      bridge_agent_resume_trusted_marker_clear "$agent"
+      return 1
+    fi
+  fi
+
+  # Clear any marker left from a prior kill in this same restart (the
+  # verify-retry path re-validates before each kill). Otherwise the
+  # validation resolve below would observe that stale marker and short-
+  # circuit accept, defeating the live re-check. We are about to either
+  # re-write it (validation passes) or intentionally leave it absent
+  # (validation fails), so dropping it first is correct either way.
+  bridge_agent_resume_trusted_marker_clear "$agent"
+
+  # Prove the id is the live session: the #827 shortcut accepts only a
+  # live-pid, same-cwd, non-quarantined candidate. We require the resolver
+  # to return rc=0 with the SAME id (rc=2 would mean it swapped to a
+  # fresher transcript — i.e. the candidate itself was not the live one).
+  accepted="$(bridge_resolve_resume_session_id claude "$agent" "$workdir" "$session_id" 2>/dev/null)" || rc=$?
+  if [[ "$rc" != 0 || "$accepted" != "$session_id" ]]; then
+    return 1
+  fi
+
+  bridge_agent_resume_trusted_marker_write "$agent" "$session_id" "$ttl"
+}
+
 # Snapshot the agent's managed block from the local roster file so the
 # rollback path can restore the pre-restart configuration if launch
 # fails after the kill. The snapshot captures the whole `# BEGIN AGENT
