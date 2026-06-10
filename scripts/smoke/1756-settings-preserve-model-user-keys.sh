@@ -72,19 +72,7 @@ assert_model_and_toggles_preserved() {
   # plus an arbitrary unknown key. The render must keep the allowlisted ones
   # and drop the arbitrary one.
   invoke_shared_renderer >/dev/null
-  python3 - "$EFFECTIVE" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-payload = json.loads(path.read_text(encoding="utf-8"))
-payload["model"] = "claude-opus-4-8[1m]"
-payload["alwaysThinkingEnabled"] = True
-payload["agentPushNotifEnabled"] = False
-payload["unrelatedSetting"] = "should-not-leak-into-effective"
-path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-PY
+  python3 "$SCRIPT_DIR/1756-settings-preserve-model-user-keys-helper.py" seed-user-keys "$EFFECTIVE"
 
   invoke_shared_renderer >/dev/null
 
@@ -105,19 +93,7 @@ assert_managed_keys_still_rerender() {
   # in the effective file is corrected to the bridge base command on rerender
   # even though user keys are preserved. Seed a bogus Stop hook command and
   # confirm the render restores the real one.
-  python3 - "$EFFECTIVE" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-payload = json.loads(path.read_text(encoding="utf-8"))
-payload["model"] = "claude-opus-4-8[1m]"
-payload.setdefault("hooks", {})["Stop"] = [
-    {"hooks": [{"type": "command", "command": "bash /tmp/STALE-OPERATOR-HOOK.sh"}]}
-]
-path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-PY
+  python3 "$SCRIPT_DIR/1756-settings-preserve-model-user-keys-helper.py" seed-stale-hook "$EFFECTIVE"
 
   invoke_shared_renderer >/dev/null
 
@@ -135,19 +111,7 @@ assert_poison_hook_key_sanitized_with_model_preserved() {
   # (c) the #1495 invalid-hook-key sanitize and the new model preserve coexist:
   # a poison hook event (PermissionDenied — rejected by CC v2.1.87) is dropped
   # on the SAME render that preserves model.
-  python3 - "$EFFECTIVE" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-payload = json.loads(path.read_text(encoding="utf-8"))
-payload["model"] = "claude-opus-4-8[1m]"
-payload.setdefault("hooks", {})["PermissionDenied"] = [
-    {"hooks": [{"type": "command", "command": "bash /tmp/poison.sh"}]}
-]
-path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-PY
+  python3 "$SCRIPT_DIR/1756-settings-preserve-model-user-keys-helper.py" seed-poison-hook "$EFFECTIVE"
 
   invoke_shared_renderer 2>/dev/null >/dev/null
 
