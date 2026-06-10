@@ -70,11 +70,11 @@ export BRIDGE_A2A_RECEIVER_HEALTHZ_TIMEOUT_SECONDS=2
 pick_free_port() { python3 "$SCRIPT_DIR/a2a-cross-bridge-helper.py" free-port; }
 handoffd_pidfile() { printf '%s/handoff/handoffd.pid' "$BRIDGE_STATE_DIR"; }
 handoffd_log() { printf '%s/a2a-handoffd.log' "$BRIDGE_LOG_DIR"; }
-supervise_state() { printf '%s/handoff/receiver-supervise.env' "$BRIDGE_STATE_DIR"; }
-env_incident_state() { printf '%s/handoff/receiver-env-incident.env' "$BRIDGE_STATE_DIR"; }
+supervise_state() { printf '%s/handoff/receiver-supervise.env' "$BRIDGE_STATE_DIR"; } # noqa: iso-helper-boundary — daemon-owned supervisor state file in test BRIDGE_STATE_DIR (*.env state, not a controller->iso credential dotenv)
+env_incident_state() { printf '%s/handoff/receiver-env-incident.env' "$BRIDGE_STATE_DIR"; } # noqa: iso-helper-boundary — daemon-owned supervisor state file in test BRIDGE_STATE_DIR (*.env state, not a controller->iso credential dotenv)
 
 clear_supervise_throttle() {
-  rm -f "$BRIDGE_STATE_DIR/handoff/receiver-supervise-tick.env" 2>/dev/null || true
+  rm -f "$BRIDGE_STATE_DIR/handoff/receiver-supervise-tick.env" 2>/dev/null || true # noqa: iso-helper-boundary — daemon-owned supervisor tick state in test BRIDGE_STATE_DIR (*.env state, not a controller->iso credential dotenv)
 }
 
 write_loopback_config() {
