@@ -4363,6 +4363,9 @@ report and reap test-fixture agents per their pattern."
     # when isolated, preserving the read path under the isolated user.
     if [[ "$engine" == "claude" ]]; then
       bridge_ensure_claude_first_run_config "$agent" "$workdir" >/dev/null 2>&1 || true
+      # #1753: seed-if-absent the operator's allowlisted plugin display config
+      # (default claude-hud) so a fresh agent inherits the operator's HUD intent.
+      bridge_seed_operator_plugin_config "$agent" "$workdir" >/dev/null 2>&1 || true
     fi
     # #1252: state/agents/<a>/ MUST exist before this agent appears to
     # operators as `create:ok`. The v2 matrix apply above is the
