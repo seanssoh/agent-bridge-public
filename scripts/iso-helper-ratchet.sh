@@ -110,12 +110,14 @@ NOQA_MARKER='# noqa: iso-helper-boundary'
 # scripts/baselines/iso-helper-allowlist.txt are skipped entirely
 # (whole-file allowlist). Always-allowlisted files:
 #   - This ratchet script
-#   - The helper unit smoke
+#   - The helper unit smoke + the anchoring self-test smoke (both
+#     deliberately contain boundary-shaped fixture strings)
 #   - The baseline + allowlist files themselves
 #   - bridge_iso_run helper internals
 declare -A ALLOWED_FILES=(
   ["scripts/iso-helper-ratchet.sh"]=1
   ["scripts/iso-helper-smoke.sh"]=1
+  ["scripts/smoke/1764-ratchet-anchoring.sh"]=1
   ["lib/bridge-isolation-helpers.sh"]=1
   ["lib/bridge_iso_paths.py"]=1
 )
