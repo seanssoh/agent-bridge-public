@@ -1719,11 +1719,19 @@ def _operator_global_is_self_reference(
             if os.path.samefile(global_real, effective_real):
                 return True
         except OSError:
-            # Could not stat one side (e.g. the symlink resolves to a MISSING
-            # output-shaped path) -> same-file equivalence is UNPROVEN. Record
-            # it so an output-shaped target below fails safe instead of being
-            # treated as "fully resolved and different" (codex r2 blocker).
-            samefile_indeterminate = True
+            # samefile raises when EITHER side cannot be statted. The
+            # EFFECTIVE side commonly does not exist yet — an agent's FIRST
+            # render writes it — and that is the normal one-directional
+            # inherit (#11901 AC1), not a suspect global. Equivalence is only
+            # truly UNPROVEN when the GLOBAL side itself cannot be statted
+            # (e.g. the symlink resolves to a MISSING output-shaped path —
+            # the codex r2 repro). Record only that case so the output-shaped
+            # classification below fails safe instead of being treated as
+            # "fully resolved and different" (codex r2 blocker).
+            try:
+                os.stat(global_real)
+            except OSError:
+                samefile_indeterminate = True
 
     # The operator-global is not (or not provably) this agent's effective
     # file. Decide whether it is another agent's render output (legit inherit)
@@ -1736,10 +1744,13 @@ def _operator_global_is_self_reference(
             # and degrade to the bridge base.
             return True
         if global_real and effective_real:
-            # Both fully resolved, statted, and they differ -> it is ANOTHER
-            # agent's effective file reached one-directionally through the
-            # symlink. That is the live-verified correct inherit (#11901
-            # AC1-AC6): keep it, do not break the loop.
+            # Both paths fully resolved, they differ, and the global target
+            # is statable (the indeterminate flag above did not fire) -> it
+            # is ANOTHER agent's effective file reached one-directionally
+            # through the symlink. That is the live-verified correct inherit
+            # (#11901 AC1-AC6) — including the first-render case where OUR
+            # effective file does not exist yet. Keep it, do not break the
+            # loop.
             return False
         # Output-shaped but resolution was indeterminate (a realpath came back
         # empty) -> we cannot prove it is NOT this agent's own output. Fail

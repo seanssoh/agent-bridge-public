@@ -248,8 +248,12 @@ def main(argv: list[str]) -> int:
     # (FileNotFoundError is an OSError) while both realpaths are non-empty —
     # the guard must FAIL SAFE (break the loop), not treat it as "fully
     # resolved and different" (inherit).
+    # Axis pinned here: effective EXISTS + global target MISSING -> fail-safe
+    # break. (The inverse axis — effective missing on FIRST render + global
+    # statable -> inherit — is case (b) above: effB is never pre-written.)
     effF = scratch / "agents" / "F" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
     effF.parent.mkdir(parents=True, exist_ok=True)
+    effF.write_text(json.dumps({"model": "claude-opus-4-8[1m]"}), encoding="utf-8")
     missing_output = scratch / "missing" / "F" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
     missing_output.parent.mkdir(parents=True, exist_ok=True)
     op_home_f = scratch / "op-home-f" / ".claude"
@@ -265,6 +269,11 @@ def main(argv: list[str]) -> int:
     _check(
         "BROKEN output-shaped target: bridge base intact (Stop hook present)",
         "mark-idle.sh" in _stop_hook_cmd(effFr),
+    )
+    _check(
+        "BROKEN output-shaped target: preserved `model` still survives (#1756)",
+        effFr.get("model") == "claude-opus-4-8[1m]",
+        detail=json.dumps(effFr.get("model")),
     )
 
     # ---- (e) MISSING-GLOBAL degrade unchanged ----
