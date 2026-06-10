@@ -94,9 +94,23 @@ def _compact_note_should_emit(agent: str, now_epoch: int | None = None) -> bool:
         return False
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
-        tmp = marker.with_suffix(".tmp")
-        tmp.write_text(f"{now_epoch}\n", encoding="utf-8")
-        tmp.replace(marker)
+        # Issue #1755: unique per-instance tmp so two concurrent SessionStart
+        # instances never contend on a shared tmp name; a benign rename race
+        # (FileNotFoundError) is already swallowed by the OSError handler below.
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(marker.parent), prefix=f"{marker.name}.", suffix=".tmp"
+        )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(f"{now_epoch}\n")
+            tmp.replace(marker)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
     except OSError:
         # Failing to write the marker must not block the hook from
         # serving the session; worst case the dedup is a no-op.

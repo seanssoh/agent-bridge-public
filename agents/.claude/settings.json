@@ -55,7 +55,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.agent-bridge/hooks/prompt_timestamp.py",
+            "command": "/usr/bin/python3 ~/.agent-bridge/hooks/prompt_timestamp.py",
             "timeout": 3,
             "additionalContext": true
           }
@@ -67,7 +67,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.agent-bridge/hooks/session-start.py",
+            "command": "/usr/bin/python3 ~/.agent-bridge/hooks/session-start.py",
             "timeout": 3,
             "additionalContext": true
           }

@@ -13,6 +13,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -1001,6 +1002,52 @@ def gather_canonical_files(agent: str) -> dict[str, str]:
     return out
 
 
+def _atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
+    """Write ``text`` to ``path`` atomically, tolerating a concurrent writer.
+
+    Issue #1755: the prompt_timestamp hook can run as two concurrent
+    instances on the same prompt (the same hook script registered in both
+    the global and the per-workdir settings scope with divergent interpreter
+    spellings — see lib/bridge-hooks.sh / bridge-hooks.py P2). A shared fixed
+    tmp name (``<path>.tmp``) makes the second instance's ``replace()`` fail
+    with FileNotFoundError after the first instance already renamed the tmp
+    onto ``path``. Two fixes here:
+
+      * Per-instance unique tmp name (pid + random suffix) so the two writers
+        never contend for the same tmp file.
+      * Treat FileNotFoundError on the final ``replace()`` as benign
+        last-writer-wins: another instance already produced a complete
+        ``path`` with equivalent content, so there is nothing to surface.
+
+    Genuine permission / OS errors (e.g. the iso v2 controller-owned tree,
+    #1205 Family B) still propagate to the caller so its fail-open policy
+    decides. The tmp is best-effort unlinked on any failure so we never leak
+    sidecar ``.tmp.<pid>...`` droppings into the state tree.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.chmod(tmp, mode)
+        try:
+            tmp.replace(path)
+        except FileNotFoundError:
+            # Another concurrent instance already renamed its own tmp onto
+            # ``path`` between our write and replace. Last-writer-wins: the
+            # destination is complete, so this is a no-op, not an error.
+            return
+        os.chmod(path, mode)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def write_compact_snapshot(agent: str, payload: dict[str, str]) -> Path | None:
     """Atomically persist canonical-file contents next to the agent state.
 
@@ -1017,14 +1064,10 @@ def write_compact_snapshot(agent: str, payload: dict[str, str]) -> Path | None:
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(
+        _atomic_write_text(
+            path,
             json.dumps(envelope, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
         )
-        os.chmod(tmp, 0o600)
-        tmp.replace(path)
-        os.chmod(path, 0o600)
         return path
     except OSError:
         return None
@@ -1223,11 +1266,15 @@ def save_timestamp_state(agent: str, payload: dict[str, int]) -> None:
     path = timestamp_state_path(agent)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        tmp.replace(path)
-        os.chmod(path, 0o600)
+        # Issue #1755: unique-tmp + benign last-writer-wins on the final
+        # replace. Two concurrent prompt_timestamp instances (dup hook
+        # registration) no longer collide on a shared tmp name, and the
+        # loser's FileNotFoundError is swallowed inside _atomic_write_text
+        # rather than re-raised here as a per-prompt "hook error" banner.
+        _atomic_write_text(
+            path,
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
     except (PermissionError, OSError):
         if _under_isolated_uid():
             # Opportunistic audit attempt — best-effort, no stderr noise.
@@ -1607,14 +1654,10 @@ def save_drain_state(agent: str, payload: dict[str, Any]) -> bool:
     path = inbox_drain_state_path(agent)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(
+        _atomic_write_text(
+            path,
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
         )
-        os.chmod(tmp, 0o600)
-        tmp.replace(path)
-        os.chmod(path, 0o600)
         return True
     except (PermissionError, OSError):
         return False

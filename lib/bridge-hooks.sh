@@ -423,10 +423,10 @@ bridge_ensure_claude_session_start_hook() {
   local launch_cmd="${2-}"
   local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
-    bridge_hooks_python ensure-session-start-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
+    bridge_hooks_python ensure-session-start-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
-    bridge_hooks_python ensure-session-start-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+    bridge_hooks_python ensure-session-start-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
@@ -435,10 +435,10 @@ bridge_ensure_claude_prompt_hook() {
   local launch_cmd="${2-}"
   local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
-    bridge_hooks_python ensure-prompt-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --bash-bin bash --python-bin python3 >/dev/null
+    bridge_hooks_python ensure-prompt-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --bash-bin bash --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
-    bridge_hooks_python ensure-prompt-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN" --python-bin "$(command -v python3)"
+    bridge_hooks_python ensure-prompt-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
@@ -447,10 +447,10 @@ bridge_ensure_claude_prompt_guard_hook() {
   local launch_cmd="${2-}"
   local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
-    bridge_hooks_python ensure-prompt-guard-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
+    bridge_hooks_python ensure-prompt-guard-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
-    bridge_hooks_python ensure-prompt-guard-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+    bridge_hooks_python ensure-prompt-guard-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
@@ -479,10 +479,10 @@ bridge_ensure_claude_pre_compact_hook() {
   local launch_cmd="${2-}"
   local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
-    bridge_hooks_python ensure-pre-compact-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
+    bridge_hooks_python ensure-pre-compact-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
-    bridge_hooks_python ensure-pre-compact-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+    bridge_hooks_python ensure-pre-compact-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
@@ -496,7 +496,7 @@ bridge_ensure_hud_usage_tap() {
   local launch_cmd="${2-}"
   local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
-    bridge_hooks_python ensure-hud-usage-tap --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
+    bridge_hooks_python ensure-hud-usage-tap --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
     # bridge_link_claude_settings_to_shared skips linux-user isolated agents
     # (the mirror is under a foreign UID). Re-render the isolated home so the
@@ -505,7 +505,7 @@ bridge_ensure_hud_usage_tap() {
       bridge_install_isolated_home_settings "$agent" "$launch_cmd" >/dev/null 2>&1 || true
     fi
   else
-    bridge_hooks_python ensure-hud-usage-tap --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+    bridge_hooks_python ensure-hud-usage-tap --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
