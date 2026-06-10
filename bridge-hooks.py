@@ -1707,6 +1707,19 @@ def _operator_global_is_self_reference(
     if global_real and effective_real and global_real == effective_real:
         return True
 
+    # Case-insensitive filesystems (macOS APFS default): realpath PRESERVES
+    # the requested spelling, so a symlink target that differs from the
+    # effective path only by casing compares unequal above while naming the
+    # SAME file. Use inode-aware equivalence when both sides can be statted;
+    # any stat failure falls through to the output-shaped fail-safe below
+    # (never weaker than the string compare).
+    if global_real and effective_real:
+        try:
+            if os.path.samefile(global_real, effective_real):
+                return True
+        except OSError:
+            pass
+
     # The operator-global is not (or not provably) this agent's effective
     # file. Decide whether it is another agent's render output (legit inherit)
     # or an indeterminate output-shaped target (fail safe).

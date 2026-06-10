@@ -213,6 +213,35 @@ def main(argv: list[str]) -> int:
         detail=json.dumps(effCr.get("model")),
     )
 
+    # ---- (d2) CASE-VARIANT self-ref on case-insensitive filesystems ----
+    # macOS APFS default is case-insensitive: a symlink target spelled with
+    # different casing names the SAME file, but realpath PRESERVES the
+    # spelling so the string compare misses it (codex r1 blocker). The fix
+    # uses inode-aware os.path.samefile. Skip when the scratch fs is
+    # case-sensitive (the spelling variant would be a different file).
+    effE = scratch / "agents" / "CaseAgent" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+    effE.parent.mkdir(parents=True, exist_ok=True)
+    effE.write_text(json.dumps({"model": "claude-opus-4-8[1m]"}), encoding="utf-8")
+    case_variant = Path(str(effE).replace("CaseAgent", "caseagent"))
+    if case_variant.exists():  # case-insensitive fs: same file via other spelling
+        op_home_e = scratch / "op-home-e" / ".claude"
+        op_home_e.mkdir(parents=True, exist_ok=True)
+        op_global_case = op_home_e / "settings.json"
+        os.symlink(case_variant, op_global_case)
+        procE, effEr = _render(hooks_py, base, overlay, effE, op_global_case)
+        _check(
+            "CASE-VARIANT self-ref (APFS case-insensitive) -> loop broken via samefile",
+            "#1759" in procE.stderr,
+            detail=procE.stderr,
+        )
+        _check(
+            "CASE-VARIANT self-ref preserved `model` still survives",
+            effEr.get("model") == "claude-opus-4-8[1m]",
+            detail=json.dumps(effEr.get("model")),
+        )
+    else:
+        print("skip: case-sensitive filesystem — case-variant self-ref not reproducible here")
+
     # ---- (e) MISSING-GLOBAL degrade unchanged ----
     effD = scratch / "agents" / "D" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
     procD, effDr = _render(
