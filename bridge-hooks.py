@@ -1713,23 +1713,33 @@ def _operator_global_is_self_reference(
     # SAME file. Use inode-aware equivalence when both sides can be statted;
     # any stat failure falls through to the output-shaped fail-safe below
     # (never weaker than the string compare).
+    samefile_indeterminate = False
     if global_real and effective_real:
         try:
             if os.path.samefile(global_real, effective_real):
                 return True
         except OSError:
-            pass
+            # Could not stat one side (e.g. the symlink resolves to a MISSING
+            # output-shaped path) -> same-file equivalence is UNPROVEN. Record
+            # it so an output-shaped target below fails safe instead of being
+            # treated as "fully resolved and different" (codex r2 blocker).
+            samefile_indeterminate = True
 
     # The operator-global is not (or not provably) this agent's effective
     # file. Decide whether it is another agent's render output (legit inherit)
     # or an indeterminate output-shaped target (fail safe).
     global_shape_path = Path(global_real) if global_real else operator_global_path
     if _is_render_output_path(global_shape_path):
+        if samefile_indeterminate:
+            # Output-shaped AND same-file equivalence unproven -> we cannot
+            # rule out that this is our own output. Fail safe: break the loop
+            # and degrade to the bridge base.
+            return True
         if global_real and effective_real:
-            # Both fully resolved and they differ -> it is ANOTHER agent's
-            # effective file reached one-directionally through the symlink.
-            # That is the live-verified correct inherit (#11901 AC1-AC6): keep
-            # it, do not break the loop.
+            # Both fully resolved, statted, and they differ -> it is ANOTHER
+            # agent's effective file reached one-directionally through the
+            # symlink. That is the live-verified correct inherit (#11901
+            # AC1-AC6): keep it, do not break the loop.
             return False
         # Output-shaped but resolution was indeterminate (a realpath came back
         # empty) -> we cannot prove it is NOT this agent's own output. Fail

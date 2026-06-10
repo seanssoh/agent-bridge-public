@@ -242,6 +242,31 @@ def main(argv: list[str]) -> int:
     else:
         print("skip: case-sensitive filesystem — case-variant self-ref not reproducible here")
 
+    # ---- (d3) BROKEN output-shaped target: samefile-indeterminate fail-safe ----
+    # codex r2 blocker repro: the operator-global symlink resolves to a
+    # MISSING output-shaped settings.effective.json. samefile() raises
+    # (FileNotFoundError is an OSError) while both realpaths are non-empty —
+    # the guard must FAIL SAFE (break the loop), not treat it as "fully
+    # resolved and different" (inherit).
+    effF = scratch / "agents" / "F" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+    effF.parent.mkdir(parents=True, exist_ok=True)
+    missing_output = scratch / "missing" / "F" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+    missing_output.parent.mkdir(parents=True, exist_ok=True)
+    op_home_f = scratch / "op-home-f" / ".claude"
+    op_home_f.mkdir(parents=True, exist_ok=True)
+    op_global_broken = op_home_f / "settings.json"
+    os.symlink(missing_output, op_global_broken)
+    procF, effFr = _render(hooks_py, base, overlay, effF, op_global_broken)
+    _check(
+        "BROKEN output-shaped target (samefile OSError) -> fail-safe loop break",
+        "#1759" in procF.stderr,
+        detail=procF.stderr,
+    )
+    _check(
+        "BROKEN output-shaped target: bridge base intact (Stop hook present)",
+        "mark-idle.sh" in _stop_hook_cmd(effFr),
+    )
+
     # ---- (e) MISSING-GLOBAL degrade unchanged ----
     effD = scratch / "agents" / "D" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
     procD, effDr = _render(
