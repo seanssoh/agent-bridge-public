@@ -265,6 +265,37 @@ bridge_link_claude_settings_to_shared() {
     --launch-cmd "$launch_cmd" \
     --agent-class "$agent_class" \
     --channels-csv "$channels_csv" >/dev/null
+  # Issue #1766: the per-agent effective file just rendered (the link target
+  # the workdir `.claude/settings.json` symlink points at) is controller-owned
+  # mode 0600 — `bridge-hooks.py:save_json` writes it `os.chmod(... 0o600)`. On
+  # a v2 linux-user-isolated agent the iso UID `agent-bridge-<a>` is NOT the
+  # controller, so it cannot read its own `workdir/.claude/settings.json` target
+  # and Claude renders a blocking "Settings Error" picker on every (re)start.
+  # Publish the effective file group-readable to the agent's OWN group only:
+  # `chgrp ab-agent-<a>` + mode 0640 (group READ, no group write — the file
+  # stays controller-owned so the iso UID can never rewrite the hook contract,
+  # the same integrity boundary cmd_render_isolated_home_settings keeps), and
+  # the parent `.claude/` dir group-traversable at 0750. Never `ab-shared`,
+  # never world. Gated on v2 isolation being effective for this agent; on
+  # shared/macOS installs the enforce gate inside each helper makes this a
+  # no-op (byte-for-byte unchanged). The chgrp helpers are defined in
+  # lib/bridge-isolation-v2.sh (sourced after this module but available at
+  # runtime); command -v guards keep legacy/partial source-orders safe.
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && command -v bridge_isolation_v2_chgrp_file_iso_group >/dev/null 2>&1; then
+    local _eff_dir="${effective_file%/*}"
+    if [[ -d "$_eff_dir" ]] \
+        && command -v bridge_isolation_v2_chgrp_dir_iso_group >/dev/null 2>&1; then
+      bridge_isolation_v2_chgrp_dir_iso_group "$agent" "$_eff_dir" 0750 \
+        || bridge_warn "isolation v2 (#1766): could not publish settings dir '$_eff_dir' to the agent group for '$agent' (non-fatal); the iso UID may EACCES on its own settings.json until \`agent-bridge isolate $agent --reapply\`."
+    fi
+    if [[ -f "$effective_file" ]]; then
+      bridge_isolation_v2_chgrp_file_iso_group "$agent" "$effective_file" 0640 \
+        || bridge_warn "isolation v2 (#1766): could not group-publish the effective settings file '$effective_file' for '$agent' (non-fatal); the iso UID may EACCES on its own project settings until \`agent-bridge isolate $agent --reapply\`."
+    fi
+  fi
   # Issue #1145: defer `cmd_link_shared_settings` under v2 isolation when the
   # workdir hasn't been normalized yet by
   # `bridge_linux_prepare_agent_isolation` (Step A). Step B (this controller-

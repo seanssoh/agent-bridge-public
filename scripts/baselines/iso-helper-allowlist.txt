@@ -31,6 +31,15 @@ scripts/smoke/1520c-create-isolate-helpers/assert-watchdog-publish-gap.py
 scripts/smoke/1533-create-isolate-content-publish.sh
 scripts/smoke/1533-create-isolate-helpers/assert-content-tree-modes.py
 
+# #1766 test fixture — references `settings.effective.json` / `settings.json`
+# only to ASSERT the iso-settings group-publish (0640/0750) + the content-tree
+# walker's target-validated symlink accept/refuse contract + the picker-catalog
+# Settings-Error fingerprint, all in mktemp fixtures; not runtime boundary RW
+# (same shape as the #1520c / #1533 test-fixture allowlist entries). The two
+# 1766-iso-settings-helpers/*.py assertion helpers carry NO bare boundary
+# filenames under the anchored #1764 pattern, so they need no allowlist entry.
+scripts/smoke/1766-iso-settings-readable.sh
+
 # #1563 PR-5 integration matrix — a heartbeat state-file STUB (`heartbeat/<a>.env`)
 # inside a mktemp BRIDGE_HOME only mirrors the PR-3 escalation predicate's input to
 # ASSERT the admin-liveness false-positive control; it never RWs a controller->iso

@@ -1708,6 +1708,9 @@ bridge_isolation_v2_publish_content_tree() {
 
   local -a _roots=()
   local -a _excludes=()
+  # #1766: optional target-validated symlink acceptance passed straight
+  # through to the walker (only the canonical settings.json self-target link).
+  local -a _accept_args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --exclude-subdir)
@@ -1716,6 +1719,12 @@ bridge_isolation_v2_publish_content_tree() {
       --exclude-name)
         [[ $# -ge 2 ]] || { shift; continue; }
         _excludes+=(--exclude-name "$2"); shift 2 ;;
+      --accept-settings-link-rel)
+        [[ $# -ge 2 ]] || { shift; continue; }
+        _accept_args+=(--accept-settings-link-rel "$2"); shift 2 ;;
+      --accept-settings-link-target)
+        [[ $# -ge 2 ]] || { shift; continue; }
+        _accept_args+=(--accept-settings-link-target "$2"); shift 2 ;;
       *)
         # Collect a non-empty root candidate. Deliberately NOT a
         # controller-side `[[ -d "$1" ]]` precheck: on a FIRST
@@ -1758,7 +1767,7 @@ bridge_isolation_v2_publish_content_tree() {
   local _out="" _rc=0
   _out="$(bridge_linux_sudo_root python3 "$_helper" \
     "$group" 0660 2770 "$_os_user" "${_roots[@]}" "${_excludes[@]}" \
-    "${_controller_arg[@]}" 2>/dev/null)"
+    "${_controller_arg[@]}" "${_accept_args[@]}" 2>/dev/null)"
   _rc=$?
   if (( _rc != 0 )); then
     bridge_warn "publish_content_tree: root normalize helper failed (rc=$_rc) for agent=$agent (non-fatal) — re-run \`agent-bridge isolate $agent --reapply\`"
@@ -1777,6 +1786,12 @@ bridge_isolation_v2_publish_content_tree() {
     case "$_st" in
       summary)
         : ;;  # counts line; nothing actionable per-entry
+      accepted-settings-symlink)
+        # #1766: the canonical settings.json self-target link was accepted
+        # and its group normalized — a success outcome, audited for trace.
+        bridge_audit_log isolation content_settings_symlink_accepted "$agent" \
+          --detail file="$_rel" --detail target="$_detail" \
+          >/dev/null 2>&1 || true ;;
       refused-symlink)
         bridge_warn "publish_content_tree: refusing symlink at $_rel (agent=$agent); not normalized (planted-redirect guard)"
         bridge_audit_log isolation content_publish_failed "$agent" \

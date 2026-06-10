@@ -55,7 +55,9 @@
 #     runtime,logs,requests,
 #     responses}/                      agent:ab-agent-<agent>     2770
 #   agents/<agent>/credentials/        controller:ab-agent-<agent> 2750
-#   agents/<agent>/.claude/            controller:controller       0700
+#   agents/<agent>/.claude/            controller:ab-agent-<agent> 0750  (#1766)
+#   agents/<agent>/.claude/settings.effective.json
+#                                      controller:ab-agent-<agent> 0640  (#1766)
 #   agents/<agent>/agent-env.sh        controller:ab-agent-<agent> 0640
 #   agents/<agent>/workdir/.<provider>/ agent:ab-agent-<agent>     2770  (dir node only)
 #     .env, access.json, state.json,   agent:ab-agent-<agent>     0600  (v3 contract,
@@ -380,12 +382,32 @@ bridge_isolation_v2_reapply_one_agent() {
     "file" "$agent_root/credentials/launch-secrets.env" \
     "$controller_user:$agent_grp" "0640"
 
-  # `.claude/` is the surface that triggered the #737 cascade. If
-  # missing on apply, create it controller-owned 0700 so subsequent
-  # `bridge-hooks.py:cmd_link_shared_settings` can install settings.
+  # `.claude/` is the surface that triggered the #737 cascade. If missing
+  # on apply, create it controller-owned so `bridge-hooks.py:
+  # cmd_link_shared_settings` can install settings. #1766: the canonical
+  # mode is `controller:ab-agent-<a> 0750`, NOT `controller:controller
+  # 0700` — the iso UID must be able to group-traverse this dir to read its
+  # own `workdir/.claude/settings.json` (a symlink into here). 0750 grants
+  # the agent's OWN group r-x and traverse; controller keeps full rwx; the
+  # iso UID still cannot create/replace entries (no group write, no setgid).
   bridge_isolation_v2_reapply_assert \
     "$mode" "$apply" "$actions_file" "$errors_file" \
-    "dir_install" "$agent_root/.claude" "$controller_user:$controller_user" "0700"
+    "dir_install" "$agent_root/.claude" "$controller_user:$agent_grp" "0750"
+
+  # #1766: the per-agent-root `settings.effective.json` is the TARGET of the
+  # workdir `.claude/settings.json` symlink. `bridge-hooks.py:save_json`
+  # renders it controller-owned 0600 → the iso UID EACCESes on its own
+  # settings on every (re)start, surfacing a blocking "Settings Error"
+  # picker. Canonical contract: `controller:ab-agent-<a> 0640` — group READ
+  # only (the file stays controller-owned so the iso UID can never rewrite
+  # the hook contract). A freshly-isolated agent may not have rendered
+  # settings yet; the `file` kind records `skipped:no-such-file` (not drift)
+  # when the target is absent, so this row is safe pre-first-render.
+  local _eff_settings_path="$agent_root/.claude/settings.effective.json"  # noqa: iso-helper-boundary — controller-side reapply grant-matrix path (chgrp/chmod via reapply_assert), not an iso boundary RW; sibling of the agent-env.sh / launch-secrets.env rows above
+  bridge_isolation_v2_reapply_assert \
+    "$mode" "$apply" "$actions_file" "$errors_file" \
+    "file" "$_eff_settings_path" \
+    "$controller_user:$agent_grp" "0640"
 
   bridge_isolation_v2_reapply_assert \
     "$mode" "$apply" "$actions_file" "$errors_file" \
@@ -730,7 +752,7 @@ bridge_isolation_v2_reapply_assert() {
       fi
       # Already present — fall through to ownership/mode normalization
       # so a `.claude/` that was created in some other shape gets fixed
-      # to the canonical (controller:controller 0700) layout.
+      # to the canonical (controller:ab-agent-<a> 0750) layout (#1766).
       ;;
     dir|dir_root)
       if [[ "$before" == "absent" ]]; then
@@ -1234,7 +1256,10 @@ v0.7 → v0.8 upgrade drift. Covers:
   - agents/<agent>/credentials/
                             controller:ab-agent-<agent> 2750
   - agents/<agent>/.claude/
-                            controller:controller       0700  (created if absent)
+                            controller:ab-agent-<agent> 0750  (created if absent;
+                            #1766: group-traversable so the iso UID can read its
+                            own project settings; the rendered effective file
+                            inside is group-published controller:ab-agent 0640)
   - agents/<agent>/agent-env.sh
                             controller:ab-agent-<agent> 0640
   - agents/<agent>/workdir/.<provider>/

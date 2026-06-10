@@ -177,6 +177,8 @@ class Walker:
         dir_mode,
         excl_names,
         excl_basenames,
+        accept_link_rel=None,
+        accept_link_target=None,
     ):
         self.gid = gid
         # Strict owner gate for REGULAR FILES: after prepare's `chown -R`
@@ -200,6 +202,21 @@ class Walker:
         self.dir_mode = dir_mode
         self.excl_names = set(excl_names or ())
         self.excl_basenames = set(excl_basenames or ())
+        # #1766: a single TARGET-VALIDATED symlink whitelist. `accept_link_rel`
+        # is the EXACT relpath within a walked root that may be a symlink
+        # (e.g. `.claude/settings.json`); `accept_link_target` is the canonical
+        # absolute path that link MUST realpath-resolve to (the agent's OWN
+        # per-agent-root `settings.effective.json`). Only that one shape is
+        # accepted; every OTHER symlink stays refused (the planted-redirect
+        # guard for the rest of the tree is unchanged). The acceptance is
+        # target-validated, NOT name-validated: a `.claude/settings.json` that
+        # resolves anywhere else is still refused.
+        self.accept_link_rel = accept_link_rel or None
+        self.accept_link_target = (
+            os.path.realpath(accept_link_target)
+            if accept_link_target
+            else None
+        )
         self.published = 0
         self.ok = 0
         self.refused = 0
@@ -277,13 +294,63 @@ class Walker:
         finally:
             os.close(fd)
 
-    def walk(self, root_fd, root_label):
-        # Iterative DFS over an explicit (dir_fd, relpath, depth) stack so we
-        # never re-resolve a path and never hand os.walk an fd it would
-        # follow. The caller owns root_fd; we close every fd WE open.
-        stack = [(root_fd, root_label, 0, False)]
+    def _maybe_accept_settings_link(self, dir_fd, name, child_rel):
+        """#1766: accept the ONE canonical `settings.json` symlink whose
+        target realpath-resolves to the agent's own per-agent-root effective
+        render (the `accept_link_target`), and chgrp the LINK itself to the
+        agent group via lchown (relative to the verified dir_fd — no path
+        re-resolution race). Returns True if accepted (caller skips the
+        refusal), False otherwise (caller refuses as before).
+
+        Target-validated, not name-validated: the link's realpath MUST equal
+        the pre-resolved `accept_link_target`; a `.claude/settings.json` that
+        points anywhere else stays refused. lchown only ever touches the link
+        inode (never follows), and only the GROUP is changed (never owner,
+        never mode), so even if the iso UID swaps the link between the
+        realpath check and the lchown the blast radius is at most grouping an
+        attacker-owned link to the agent's OWN group — harmless."""
+        if not self.accept_link_rel or not self.accept_link_target:
+            return False
+        if child_rel != self.accept_link_rel:
+            return False
+        try:
+            target = os.readlink(name, dir_fd=dir_fd)
+        except OSError:
+            return False
+        # Resolve the link target relative to the directory that CONTAINS the
+        # link (dir_fd), using that directory's controller-resolved absolute
+        # path threaded down the walk. A relative target (the canonical
+        # `../../.claude/settings.effective.json`) and an absolute target are
+        # both handled by os.path.join + realpath.
+        link_dir_abs = self._current_dir_abs
+        if not link_dir_abs:
+            return False
+        resolved = os.path.realpath(os.path.join(link_dir_abs, target))
+        if resolved != self.accept_link_target:
+            return False
+        try:
+            os.chown(name, -1, self.gid, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError as exc:
+            self.failed += 1
+            _emit("mutate-failed", child_rel, f"lchown:{exc.errno}")
+            return True  # handled (do not also emit refused-symlink)
+        self.published += 1
+        _emit("accepted-settings-symlink", child_rel, resolved)
+        return True
+
+    def walk(self, root_fd, root_label, root_abspath=""):
+        # Iterative DFS over an explicit
+        # (dir_fd, relpath, depth, owns_fd, dir_abspath) stack so we never
+        # re-resolve a path and never hand os.walk an fd it would follow. The
+        # caller owns root_fd; we close every fd WE open. `dir_abspath` is the
+        # controller-resolved absolute path of the directory `dir_fd` points
+        # at — threaded ONLY so the #1766 settings-symlink acceptance can
+        # realpath-validate the link target; it is never re-opened or mutated.
+        self._current_dir_abs = ""
+        stack = [(root_fd, root_label, 0, False, root_abspath)]
         while stack:
-            dir_fd, relpath, depth, owns_fd = stack.pop()
+            dir_fd, relpath, depth, owns_fd, dir_abspath = stack.pop()
+            self._current_dir_abs = dir_abspath
             try:
                 if self.entries >= MAX_ENTRIES:
                     _emit("mutate-failed", relpath, "max-entries-exceeded")
@@ -353,6 +420,13 @@ class Walker:
                             )
                         continue
                     if stat.S_ISLNK(cst.st_mode):
+                        # #1766: accept the ONE canonical self-target
+                        # `settings.json -> settings.effective.json` link;
+                        # every other symlink stays refused.
+                        if self._maybe_accept_settings_link(
+                            dir_fd, name, child_rel
+                        ):
+                            continue
                         self.refused += 1
                         _emit("refused-symlink", child_rel, "")
                         continue
@@ -397,7 +471,14 @@ class Walker:
                             finally:
                                 os.close(cfd)
                             continue
-                        stack.append((cfd, child_rel, depth + 1, True))
+                        child_abspath = (
+                            os.path.join(dir_abspath, name)
+                            if dir_abspath
+                            else ""
+                        )
+                        stack.append(
+                            (cfd, child_rel, depth + 1, True, child_abspath)
+                        )
                     elif stat.S_ISREG(cst.st_mode):
                         self._normalize_file(dir_fd, name, child_rel)
                     else:
@@ -435,6 +516,15 @@ def main(argv):
     # iso-owned content beneath. Regular FILES are still gated strictly to
     # the iso UID. Empty / unresolvable → dir-owner gate is skipped.
     ap.add_argument("--controller-user", default="")
+    # #1766: target-validated symlink acceptance for the canonical
+    # `settings.json -> settings.effective.json` link. `--accept-settings-link-rel`
+    # is the EXACT relpath (within a walked root) that may be a symlink (the
+    # workdir-relative `.claude/settings.json`); `--accept-settings-link-target`
+    # is the canonical absolute path it MUST realpath-resolve to (the agent's
+    # own per-agent-root settings.effective.json). Both must be supplied to
+    # enable the acceptance; otherwise EVERY symlink stays refused (unchanged).
+    ap.add_argument("--accept-settings-link-rel", default="")
+    ap.add_argument("--accept-settings-link-target", default="")
     args = ap.parse_args(argv[1:])
 
     try:
@@ -484,6 +574,8 @@ def main(argv):
         dir_mode,
         args.exclude_subdir,
         args.exclude_name,
+        accept_link_rel=(args.accept_settings_link_rel or None),
+        accept_link_target=(args.accept_settings_link_target or None),
     )
 
     opened_any = False
@@ -501,7 +593,11 @@ def main(argv):
             return 2
         opened_any = True
         try:
-            walker.walk(root_fd, "")
+            # Pass the root's controller-resolved absolute path so the #1766
+            # settings-symlink acceptance can realpath-validate the link
+            # target. realpath of the root only (a controller-owned container
+            # whose parent is controller-owned) — never re-resolves content.
+            walker.walk(root_fd, "", os.path.realpath(root))
         finally:
             os.close(root_fd)
 
