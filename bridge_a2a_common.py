@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client as http_client
 import ipaddress
 import json
 import os
@@ -26,6 +27,7 @@ import socket
 import sqlite3
 import subprocess
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -833,7 +835,7 @@ def resolve_peer_address(entry: dict[str, Any]) -> str:
 # room_scoped_check, room epoch, the `remote_addr == resolved-peer`
 # source check — is transport-AGNOSTIC and unchanged.
 #
-# Two kinds today:
+# Three kinds today:
 #   - "tailscale"            (default; legacy back-compat): proof is
 #                            membership in `tailscale ip`'s set. A config
 #                            with NO `transport` key behaves EXACTLY as
@@ -844,14 +846,34 @@ def resolve_peer_address(entry: dict[str, Any]) -> str:
 #                            alone is NOT proof. Fail CLOSED on any
 #                            uncertainty (CLI missing, WARP disconnected,
 #                            IP not on a local interface).
+#   - "trusted-routed"       (#1758): proof is ONLY (a) the candidate IP is
+#                            assigned to a real local interface — the
+#                            interface-assignment HALF of the WARP proof, with
+#                            the WARP/Tailscale enrollment half DROPPED. For a
+#                            private IP on a TRUSTED, router-protected corporate
+#                            network with no overlay client present (WARP
+#                            purged, Tailscale down), the routing fabric — not
+#                            an overlay enrollment — is the trust boundary. The
+#                            security tradeoff (interface-assignment proof
+#                            REPLACES enrollment proof) is explicitly the
+#                            operator's call. Loopback + wildcard binds are
+#                            STILL refused; HMAC + inbound_allowlist + the
+#                            `remote_addr == resolved-peer` source check are all
+#                            unchanged; an unknown/typo kind STILL hard-fails.
+#                            This is NOT a default-allow path.
 #
-# This is Mesh / WARP-to-WARP PRIVATE-IP connectivity (TCP/UDP by device
-# IP) — NOT the Cloudflare Tunnel + Access hostname model. The two are
+# The WARP-Mesh kind is Mesh / WARP-to-WARP PRIVATE-IP connectivity (TCP/UDP by
+# device IP) — NOT the Cloudflare Tunnel + Access hostname model. The two are
 # distinct substrates; only the private-IP one is implemented here.
 
 TRANSPORT_TAILSCALE = "tailscale"
 TRANSPORT_CLOUDFLARE_WARP_MESH = "cloudflare-warp-mesh"
-SUPPORTED_TRANSPORTS = (TRANSPORT_TAILSCALE, TRANSPORT_CLOUDFLARE_WARP_MESH)
+TRANSPORT_TRUSTED_ROUTED = "trusted-routed"
+SUPPORTED_TRANSPORTS = (
+    TRANSPORT_TAILSCALE,
+    TRANSPORT_CLOUDFLARE_WARP_MESH,
+    TRANSPORT_TRUSTED_ROUTED,
+)
 
 
 def transport_kind(cfg: dict[str, Any]) -> str:
@@ -1477,6 +1499,40 @@ def prove_warp_mesh_local_bind(candidate: str) -> None:
     warp_connected_and_enrolled()
 
 
+def prove_trusted_routed_local_bind(candidate: str) -> None:
+    """Fail-closed proof that `candidate` is a bindable trusted-routed IP (#1758).
+
+    This is the WARP-Mesh proof with the enrollment half REMOVED: the ONLY
+    proof is that the candidate is assigned to a real local interface right
+    now (enumerated from live OS state — `ip`/`ifconfig`, never a CIDR-shape
+    guess). There is deliberately NO WARP/Tailscale enrollment requirement —
+    the trust boundary for this transport is the routed, router-protected
+    private network itself, not an overlay client. That tradeoff is the
+    operator's explicit decision (see the transport-selection comment above).
+
+    Everything else stays fail-closed and is UNCHANGED from the other
+    transports — loopback and wildcard are already refused by `resolve_bind`
+    BEFORE this proof runs, and the per-pair HMAC, `inbound_allowlist`, the
+    `remote_addr == resolved-peer` source check, and dedupe all remain layered
+    on top of (never instead of) this bind proof.
+
+    Raises A2AError on ANY uncertainty: interface enumeration failure
+    (`iface_enum_failed`, propagated from `local_interface_addresses`) or a
+    candidate that is not on any local interface (`bind_not_local`). A
+    CIDR-shaped-but-not-assigned address is REFUSED exactly as for WARP-Mesh —
+    being inside a private range does not prove the IP is a live interface.
+    """
+    local_addrs = local_interface_addresses()
+    if not is_local_interface_address(candidate, local_addrs):
+        raise A2AError(
+            f"bind address {candidate!r} is not assigned to any local "
+            f"interface ({local_addrs or 'none'}). A trusted-routed bind must "
+            "be a real local private IP, not a CIDR-shaped guess "
+            "(fail-closed).",
+            code="bind_not_local",
+        )
+
+
 # --------------------------------------------------------------------------
 # Stable substrate-address detection (#1705 — the reconcile stable-addr seam)
 # --------------------------------------------------------------------------
@@ -1654,6 +1710,12 @@ def resolve_peer_address_for_transport(
         address is validated as a real IP literal — that literal is then
         compared against `remote_addr` by the receiver's existing
         source-address check, exactly as for a legacy raw-IP Tailscale peer.
+      - "trusted-routed" (#1758): identical raw-IP-literal resolution to
+        cloudflare-warp-mesh — the peer is keyed on its raw routed private IP
+        in `address`, Tailscale identity keys are rejected, and the literal is
+        compared against `remote_addr` by the unchanged source-address check.
+        Only the bind PROOF differs by transport (enrollment dropped); address
+        resolution + the source check are byte-identical to WARP-Mesh.
 
     This does NOT replace any app-layer auth: HMAC, dedupe, allowlist, skew
     and room_scoped_check remain layered on top of (never instead of) this
@@ -1661,15 +1723,15 @@ def resolve_peer_address_for_transport(
     """
     if not isinstance(entry, dict):
         raise A2AError("address entry must be an object", code="resolve_shape")
-    if kind == TRANSPORT_CLOUDFLARE_WARP_MESH:
+    if kind in (TRANSPORT_CLOUDFLARE_WARP_MESH, TRANSPORT_TRUSTED_ROUTED):
         node_id = entry.get("node_id")
         ts_name = entry.get("tailscale_name")
         if (isinstance(node_id, str) and node_id.strip()) or (
                 isinstance(ts_name, str) and ts_name.strip()):
             raise A2AError(
-                "a cloudflare-warp-mesh peer/listen entry must key on a raw "
-                "Mesh/device 'address', not a Tailscale node_id/"
-                "tailscale_name. Remove the Tailscale identity keys.",
+                f"a {kind} peer/listen entry must key on a raw private "
+                "'address', not a Tailscale node_id/tailscale_name. Remove "
+                "the Tailscale identity keys.",
                 code="warp_identity_misconfig",
             )
         address = entry.get("address", "")
@@ -1681,13 +1743,192 @@ def resolve_peer_address_for_transport(
                 ipaddress.ip_address(address)
             except ValueError as exc:
                 raise A2AError(
-                    f"cloudflare-warp-mesh 'address' {address!r} is not an "
-                    f"IP literal: {exc}",
+                    f"{kind} 'address' {address!r} is not an IP literal: {exc}",
                     code="resolve_not_ip",
                 ) from exc
         return address
     # Default: the unchanged Tailscale resolver (raw-IP back-compat included).
     return resolve_peer_address(entry)
+
+
+# --------------------------------------------------------------------------
+# Sender source-address symmetry (#1758)
+# --------------------------------------------------------------------------
+#
+# A node can simultaneously serve warp-mesh peers AND trusted-routed peers
+# (cross-transport interop). The substrates have INCOMPATIBLE source-address
+# requirements:
+#
+#   - A warp-mesh destination is reachable ONLY over the WARP utun interface.
+#     The egress source must therefore be THIS node's own Mesh IP (its
+#     `listen.address`) — letting the OS pick a non-Mesh source (e.g. a LAN
+#     address) for a Mesh destination would leave the reply path stranded.
+#   - A trusted-routed destination (a routed private IP, NOT on the Mesh) is
+#     reachable over the ROUTED interface (e.g. the LAN). Pinning the Mesh
+#     source to it yields the measured `nc -s <mesh-addr> <routed>` "Network
+#     is unreachable" — the Mesh source cannot route there. The OS routing
+#     table already picks the correct reachable source for it, so we must NOT
+#     pin a source and let routing select the egress interface per
+#     destination.
+#
+# The egress decision is PER-DESTINATION, not per-node: a single warp-mesh
+# node serves a Mesh peer (which needs the Mesh source pin) AND a routed peer
+# (which must NOT be Mesh-pinned) at the same time. The node-level
+# `transport.kind` is the DEFAULT substrate for a peer, but a peer that is
+# reachable over a DIFFERENT substrate is marked with its own
+# `transport.kind` (e.g. `"transport": {"kind": "trusted-routed"}`) — mirroring
+# the node-level key. `peer_transport_kind` resolves that per-peer override
+# (falling back to the node kind), and `select_source_address_for_transport`
+# branches on the EFFECTIVE per-destination kind: the local Mesh
+# `listen.address` is pinned ONLY for a warp-mesh destination, and None
+# (OS-routed, no pin) is returned for a trusted-routed/tailscale destination.
+# The sender feeds it to `source_bound_opener` so each POST binds the right
+# source (or none). This is purely a sender-side egress choice — it changes
+# nothing about the receiver bind proof, HMAC, allowlist, or the source-addr
+# check. An UNMARKED peer keeps the node-kind default, so existing meshes
+# (every peer same substrate, no override) are byte-unaffected.
+
+
+def peer_transport_kind(node_kind: str, peer: dict[str, Any]) -> str:
+    """Resolve the EFFECTIVE transport kind for reaching `peer`.
+
+    A peer MAY carry its own `transport.kind` to declare it is reachable over a
+    different substrate than the node's default — e.g. a warp-mesh node that
+    also talks to a corporate server marks that one peer
+    `"transport": {"kind": "trusted-routed"}`. When the peer carries no
+    override it inherits `node_kind`, so an unmarked peer behaves EXACTLY as
+    before (existing same-substrate meshes are unaffected).
+
+    An explicit but unknown/typo peer `transport.kind` is a HARD error
+    (fail-closed), identical to the node-level `transport_kind` posture — never
+    a silent fallback to a weaker/wrong substrate.
+    """
+    if not isinstance(peer, dict):
+        return node_kind
+    transport = peer.get("transport")
+    if transport is None:
+        return node_kind
+    if not isinstance(transport, dict):
+        raise A2AError(
+            "peer 'transport' must be an object", code="transport_config")
+    kind = transport.get("kind")
+    if kind is None:
+        return node_kind
+    if not isinstance(kind, str) or not kind.strip():
+        raise A2AError(
+            "peer 'transport.kind' must be a non-empty string",
+            code="transport_config")
+    kind = kind.strip()
+    if kind not in SUPPORTED_TRANSPORTS:
+        raise A2AError(
+            f"unknown peer transport.kind {kind!r}; supported: "
+            f"{', '.join(SUPPORTED_TRANSPORTS)}",
+            code="transport_unknown")
+    return kind
+
+
+def select_source_address_for_transport(
+    node_kind: str, cfg: dict[str, Any], peer: dict[str, Any]) -> Optional[str]:
+    """Return the egress source IP to bind for a POST to `peer`, or None.
+
+    The decision is PER-DESTINATION: it branches on the EFFECTIVE transport
+    kind for this peer (`peer_transport_kind`), which is the peer's own
+    `transport.kind` override when set, else the node's `node_kind`. This is
+    what lets one warp-mesh node correctly source a Mesh peer (pin) AND a
+    routed peer (no pin) at once — the bug this fixes was branching on
+    `node_kind` alone, which Mesh-pinned EVERY peer on a warp-mesh node and
+    stranded a routed peer ("Network is unreachable").
+
+    None means "do not pin a source — let the OS routing table choose the
+    egress interface for this destination" (the correct behavior for a routed
+    private IP, which the Mesh source cannot reach).
+
+    A cloudflare-warp-mesh destination MUST egress from this node's own Mesh
+    IP, so we pin `listen.address` when it is a usable literal. If the local
+    Mesh listen address is missing/non-literal we fall back to None (OS-routed)
+    rather than guessing — the delivery either still routes or fails loudly at
+    the socket, never silently mis-sourced.
+
+    Trusted-routed + Tailscale destinations get no source pin — the OS routing
+    table already selects the reachable egress interface, so the pre-#1758
+    OS-routed behavior is preserved byte-for-byte.
+    """
+    effective_kind = peer_transport_kind(node_kind, peer)
+    if effective_kind != TRANSPORT_CLOUDFLARE_WARP_MESH:
+        # trusted-routed + tailscale (+ any future routed kind): OS routing
+        # selects the reachable egress source per destination. No pin.
+        return None
+    listen = cfg.get("listen", {})
+    if not isinstance(listen, dict):
+        return None
+    address = listen.get("address", "")
+    if not isinstance(address, str):
+        return None
+    address = address.strip()
+    if not address:
+        return None
+    try:
+        ipaddress.ip_address(address)
+    except ValueError:
+        return None
+    return address
+
+
+class _SourceBoundHTTPConnection(http_client.HTTPConnection):
+    """An HTTPConnection that binds its outbound socket to a fixed source IP.
+
+    Used by `source_bound_opener` to egress a single POST from a chosen local
+    interface (the Mesh `listen.address` for a warp-mesh destination). The
+    source PORT is left 0 so the OS still picks an ephemeral port; only the
+    source ADDRESS is pinned. The `_source_ip` class attribute is set on a
+    per-opener subclass.
+    """
+
+    _source_ip = ""
+
+    def connect(self) -> None:  # noqa: D401 - stdlib override
+        self.sock = socket.create_connection(
+            (self.host, self.port),
+            timeout=self.timeout,
+            source_address=(self._source_ip, 0),
+        )
+        if getattr(self, "_tunnel_host", None):
+            self._tunnel()
+
+
+class _SourceBoundHTTPHandler(urllib.request.HTTPHandler):
+    """A urllib HTTPHandler that opens connections via a source-bound class."""
+
+    _conn_class: type = _SourceBoundHTTPConnection
+
+    def http_open(self, req):  # noqa: ANN001, D102 - urllib override
+        return self.do_open(self._conn_class, req)
+
+
+def source_bound_opener(
+    source_address: Optional[str]) -> "urllib.request.OpenerDirector":
+    """Build a urllib opener that egresses HTTP from `source_address`.
+
+    When `source_address` is None/empty the DEFAULT opener is returned —
+    identical to plain `urllib.request.urlopen` (OS-routed source). This keeps
+    the trusted-routed + tailscale paths byte-for-byte unchanged from the
+    pre-#1758 sender (no source pin).
+
+    When a source IP is given (a warp-mesh destination), the returned opener
+    binds every outbound connection to that local source so the POST egresses
+    on the correct interface. HTTP-only by design — the A2A receiver speaks
+    plaintext HTTP over the private substrate; there is no HTTPS leg to bind.
+    """
+    if not source_address:
+        return urllib.request.build_opener()
+    bound_conn = type(
+        "_BoundHTTPConnection",
+        (_SourceBoundHTTPConnection,),
+        {"_source_ip": source_address},
+    )
+    handler = _SourceBoundHTTPHandler()
+    handler._conn_class = bound_conn  # type: ignore[attr-defined]
+    return urllib.request.build_opener(handler)
 
 
 # --------------------------------------------------------------------------

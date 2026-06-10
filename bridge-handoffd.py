@@ -793,6 +793,20 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
                 "device IP in handoff.local.json.",
                 code="bind_unresolved",
             )
+        if kind == a2a.TRANSPORT_TRUSTED_ROUTED:
+            # No tailnet-style auto-select for trusted-routed either. An
+            # explicit listen.address is part of the trusted-routed contract:
+            # the bind proof is interface-assignment ONLY (the weaker,
+            # enrollment-dropped proof), so falling through to the Tailscale
+            # auto-select below would let a trusted-routed node silently bind
+            # an auto-selected tailnet IP under that weaker proof. The operator
+            # MUST name this node's routed-private IP. Fail closed.
+            raise a2a.A2AError(
+                "no listen.address configured for the trusted-routed "
+                "transport. Set listen.address to this node's routed-private "
+                "IP in handoff.local.json.",
+                code="bind_unresolved",
+            )
         # Tailscale auto-select fails closed: tailscale_addresses() raises
         # TailscaleUnavailable when the local address set is unknowable.
         tailnet = tailscale_addresses()
@@ -852,6 +866,19 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
         # enumeration failure, IP not local, WARP down, WARP unenrolled — and
         # the daemon refuses to serve. There is no CIDR-shape fallback.
         a2a.prove_warp_mesh_local_bind(bind)
+        return bind, port
+
+    if kind == a2a.TRANSPORT_TRUSTED_ROUTED:
+        # Trusted-routed (#1758): the bind IP MUST be assigned to a real local
+        # interface — the interface-assignment HALF of the WARP proof, with the
+        # WARP/Tailscale enrollment half DROPPED. The wildcard + loopback
+        # refusals above STILL apply (this branch is reached only after them);
+        # prove_trusted_routed_local_bind raises A2AError on interface-enum
+        # failure or an IP not on any local interface, so a CIDR-only guess is
+        # still refused. The trust boundary is the routed private network
+        # itself — an explicit operator decision; everything ELSE (HMAC,
+        # allowlist, source-addr check, dedupe) stays fail-closed + unchanged.
+        a2a.prove_trusted_routed_local_bind(bind)
         return bind, port
 
     # Tailscale (default): the bind address MUST be proven to be in this
@@ -1773,8 +1800,17 @@ def _relay_forward_send(cfg: dict[str, Any], *, env: dict[str, Any],
             path=path, headers=headers, body_bytes=body_bytes)
 
     try:
-        address = a2a.resolve_peer_address_for_transport(
-            a2a.transport_kind(cfg), peer)
+        kind = a2a.transport_kind(cfg)
+        address = a2a.resolve_peer_address_for_transport(kind, peer)
+        # #1758 (F3): resolve the per-destination egress source INSIDE this
+        # A2AError guard — `select_source_address_for_transport` ->
+        # `peer_transport_kind` hard-fails on a typo'd per-peer
+        # `transport.kind` (the trusted-routed rollout hand-edits exactly this
+        # field). Resolving it here degrades the one poisoned target to the same
+        # graceful per-relay failure as an address resolve error, so one bad
+        # peer can no longer raise out of the relay sender and halt the leader's
+        # whole relay fan-out.
+        source_address = a2a.select_source_address_for_transport(kind, cfg, peer)
     except a2a.A2AError as exc:
         return False, 0, f"target addr unresolved: {exc}"
     port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
@@ -1784,8 +1820,16 @@ def _relay_forward_send(cfg: dict[str, Any], *, env: dict[str, Any],
     req = urllib.request.Request(url, data=body_bytes, method="POST")
     for k, v in headers.items():
         req.add_header(k, v)
+    # #1758: per-destination egress source — same symmetry as the outbox
+    # sender, keyed on the target peer's EFFECTIVE transport (its own
+    # transport.kind override, else this node's `kind`). A warp-mesh target
+    # leaves on this node's own Mesh listen.address; a trusted-routed/tailscale
+    # target (incl. a routed-marked peer on a warp-mesh node) gets None (OS
+    # routing picks the source). `source_address` is resolved above, inside the
+    # A2AError guard.
+    opener = a2a.source_bound_opener(source_address)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             status = int(resp.status)
             return (200 <= status < 300), status, f"status={status}"
     except urllib.error.HTTPError as exc:  # type: ignore[attr-defined]

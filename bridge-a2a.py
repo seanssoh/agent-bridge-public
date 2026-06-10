@@ -767,6 +767,7 @@ def _post_envelope(
     secret: str,
     envelope_bytes: bytes,
     timeout: float,
+    source_address: "str | None" = None,
 ) -> tuple[int, Any, bytes]:
     """Sign and POST a single attempt. Returns (status, headers, body).
 
@@ -776,6 +777,11 @@ def _post_envelope(
     destination peer only determines routing (address/port) and which
     HMAC secret to sign with; it is NOT what goes on the wire as the peer
     identity.
+
+    `source_address` (#1758): when set, the POST egresses from that local
+    source IP (a warp-mesh destination must leave on this node's own Mesh IP);
+    when None the OS routing table picks the egress source (the correct,
+    unchanged behavior for trusted-routed + tailscale destinations).
     """
     timestamp = str(a2a.now_ts())
     body_hash = a2a.body_sha256(envelope_bytes)
@@ -791,8 +797,9 @@ def _post_envelope(
     req.add_header("X-AGB-Timestamp", timestamp)
     req.add_header("X-AGB-Body-SHA256", body_hash)
     req.add_header("X-AGB-Signature", signature)
+    opener = a2a.source_bound_opener(source_address)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             return resp.status, resp.headers, resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.headers or {}, exc.read() or b""
@@ -828,8 +835,17 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
     # identity, so an unresolvable peer does not wedge the outbox forever.
     attempts = int(row["attempts"]) + 1
     try:
-        address = a2a.resolve_peer_address_for_transport(
-            a2a.transport_kind(cfg), peer)
+        kind = a2a.transport_kind(cfg)
+        address = a2a.resolve_peer_address_for_transport(kind, peer)
+        # #1758 (F3): resolve the per-destination egress source INSIDE this
+        # A2AError guard. `select_source_address_for_transport` calls
+        # `peer_transport_kind`, which hard-fails on a typo'd per-peer
+        # `transport.kind` — exactly the surface the trusted-routed rollout
+        # hand-edits. Resolving it here degrades that one poisoned row to the
+        # same per-row retry/dead-letter path as a node-kind resolve failure,
+        # so one bad peer no longer escapes the row loop and halts the whole
+        # runner (the caller's per-row guard is OSError-only).
+        source_address = a2a.select_source_address_for_transport(kind, cfg, peer)
     except a2a.A2AError as exc:
         return _schedule_retry(
             conn, message_id, attempts, cfg,
@@ -856,12 +872,17 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
         _mark_dead(conn, message_id, str(exc))
         return "dead(nosecret)"
 
+    # #1758: per-destination egress `source_address` is resolved above, inside
+    # the A2AError guard (a warp-mesh destination pins this node's own Mesh
+    # listen.address; a trusted-routed/tailscale destination gets None so the OS
+    # routing table picks the reachable egress interface).
     try:
         status, headers, resp_body = _post_envelope(
             address=address, port=port, path=path,
             local_bridge_id=local_bridge_id,
             message_id=message_id, secret=secret,
             envelope_bytes=envelope_bytes, timeout=timeout,
+            source_address=source_address,
         )
     except (urllib.error.URLError, socket.timeout, OSError) as exc:
         # Connection-level failure → retryable.

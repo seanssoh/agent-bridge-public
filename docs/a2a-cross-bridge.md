@@ -57,6 +57,7 @@ The transport is selected by an optional top-level `transport` block in
 ```jsonc
 "transport": { "kind": "tailscale" }              // default (may be omitted)
 "transport": { "kind": "cloudflare-warp-mesh" }   // Cloudflare One / WARP Mesh
+"transport": { "kind": "trusted-routed" }         // trusted routed private net
 ```
 
 A config with **no `transport` block** resolves to `tailscale` and behaves
@@ -68,6 +69,7 @@ closed), never a silent fallback to a weaker proof.
 |------|--------------------------|------------------------|
 | `tailscale` (default) | candidate ∈ this node's `tailscale ip` set | `node_id` / `tailscale_name` live-resolved via `tailscale status --json`, else literal `address` |
 | `cloudflare-warp-mesh` | candidate is assigned to a **real local interface** AND WARP is **connected + registered/enrolled** | literal Mesh/device `address` (Tailscale identity keys are rejected) |
+| `trusted-routed` (#1758) | candidate is assigned to a **real local interface** — interface-assignment proof **only** (no overlay enrollment) | literal routed-private `address` (Tailscale identity keys are rejected) |
 
 ### Cloudflare One / WARP-Mesh (`cloudflare-warp-mesh`)
 
@@ -114,16 +116,101 @@ dedupe + allowlist — the network address check is **layered on**, never
 (`node_id` / `tailscale_name`) on a WARP peer are a misconfiguration and are
 rejected (the receiver never runs `tailscale status` for a WARP peer).
 
-### Tailscale ↔ WARP routing conflict (one transport at a time)
+### Trusted routed (`trusted-routed`, #1758)
+
+This transport targets a **private IP on a trusted, router-protected
+corporate network** where **no overlay client is present** — e.g. a server
+on a directly-routed IT subnet (WARP purged per policy, Tailscale down). The
+private IPs are reachable host-to-host (routed, not NAT'd), so the receiver
+must bind its own private IP and the sender must reach the peer's — but with
+no WARP/Tailscale enrollment to prove against.
+
+**Trust model — the operator's explicit call.** For `cloudflare-warp-mesh`
+and `tailscale` the trust boundary is the *overlay enrollment* (a connected,
+registered WARP device / a tailnet member). `trusted-routed` **replaces that
+enrollment proof with interface-assignment proof**: the operator asserts that
+the routed private network itself — the corporate router/firewall fabric — is
+the trust boundary, so a node assigned the private IP is trusted to bind it.
+This is a deliberate security tradeoff and is **only** appropriate on a
+genuinely trusted private network. It is **not** a default-allow path:
+selecting it is explicit, an unknown/typo kind still hard-fails, and the
+loopback/wildcard refusals are unchanged.
+
+**Bind proof — the security core (fail-closed).** For `trusted-routed` the
+receiver binds to the configured private IP **only after proving**, from live
+OS state, that the bind IP is **assigned to a real local interface right now**
+(enumerated from `ip -o addr` / `ifconfig -a`). This is the
+interface-assignment **half** of the WARP-Mesh proof; the WARP/Tailscale
+enrollment half is **dropped**. Everything else is unchanged: **CIDR-shape
+alone is NOT proof**, and the receiver **refuses** (fails closed) on a wildcard
+(`0.0.0.0` / `::`), a loopback, an IP **not assigned to any local interface**,
+or a **CIDR-only guess**.
+
+**Message + source auth — byte-identical to the other transports.** The
+per-pair **HMAC secret**, the **`inbound_allowlist`**, the
+`remote_addr == resolved-peer-address` **source-address check**, and **dedupe**
+are all enforced exactly as on Tailscale / WARP-Mesh. A `trusted-routed` peer
+is keyed on its **raw routed-private `address`** (Tailscale identity keys are
+rejected, same as WARP). The network address check is **layered on**, never
+*instead of*, the app-layer HMAC.
+
+### Cross-transport interop + sender source symmetry (#1758)
+
+A single node can simultaneously serve **warp-mesh peers AND trusted-routed
+peers** — e.g. an operator laptop that talks to other Macs over WARP Mesh
+*and* to a corporate server over its routed LAN IP. This works because the
+substrates have **incompatible egress sources** and the sender resolves the
+source **per destination**:
+
+- A **warp-mesh** destination is reachable only over the WARP utun, so the
+  POST egresses from **this node's own Mesh `listen.address`** (pinned source).
+- A **trusted-routed** (or **tailscale**) destination gets **no source pin** —
+  the OS routing table selects the reachable egress interface. Pinning the
+  Mesh source to a routed private IP yields a "Network is unreachable" (the
+  Mesh source cannot route off the overlay); letting routing pick the source
+  selects the LAN interface that can actually reach it.
+
+**How the sender knows which substrate a peer is on — the per-peer
+`transport.kind` override.** The node-level `transport.kind` is the *default*
+substrate for every peer. A peer that is reachable over a **different**
+substrate carries its own `transport` block to say so — mirroring the
+node-level key exactly. On the warp-mesh laptop above, the routed corporate
+server peer is marked:
+
+```jsonc
+"peers": [
+  { "id": "cm-prod", "address": "10.21.2.4", "port": 8787,
+    "transport": { "kind": "trusted-routed" },   // reach THIS peer over the routed LAN, not the Mesh
+    "secret": "<per-pair-hmac>", "inbound_allowlist": ["..."] }
+]
+```
+
+An **unmarked** peer inherits the node kind, so an existing same-substrate mesh
+(every peer on one transport, no override) is **byte-unaffected** — only an
+explicitly routed-marked peer egresses OS-routed instead of Mesh-pinned. An
+explicit-but-unknown peer `transport.kind` **hard-fails** (fail-closed), same
+as the node-level key. The override is **sender-side egress selection only**:
+it changes the source-address choice for that destination and nothing else —
+not the peer's `address`, the bind proof, HMAC, allowlist, or the
+source-address check.
+
+This per-destination source selection
+(`peer_transport_kind` → `select_source_address_for_transport` +
+`source_bound_opener` in `bridge_a2a_common.py`) is **sender-side only**.
+
+### Tailscale ↔ WARP routing conflict (one overlay transport at a time)
 
 WARP and Tailscale generally **cannot run simultaneously** — both install
 default routes / DNS and a connected WARP tunnel typically forces Tailscale
-to disconnect (and vice-versa). A2A therefore runs **one transport at a
-time**: pick `tailscale` *or* `cloudflare-warp-mesh` per node, set it
+to disconnect (and vice-versa). A2A therefore runs **one overlay transport at
+a time**: pick `tailscale` *or* `cloudflare-warp-mesh` per node, set it
 consistently across the mesh, and do not expect a node to be reachable on
-both substrates at once. Migrating a fleet from Tailscale to WARP is a
-coordinated cutover (enroll WARP on every node, flip `transport.kind`, update
-each peer's `address` to its Mesh IP), not a per-node toggle.
+both *overlay* substrates at once. Migrating a fleet from Tailscale to WARP is
+a coordinated cutover (enroll WARP on every node, flip `transport.kind`, update
+each peer's `address` to its Mesh IP), not a per-node toggle. (`trusted-routed`
+is the exception that makes cross-substrate interop possible without an overlay
+— see *Cross-transport interop* above: a warp-mesh node can reach a
+trusted-routed peer over routed IPs while keeping WARP up for its mesh peers.)
 
 ### Operator setup path (Cloudflare One Client)
 
