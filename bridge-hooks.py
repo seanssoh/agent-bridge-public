@@ -1507,6 +1507,117 @@ PRESERVED_USER_KEYS = (
     "statusLine",
 )
 
+# Queue request #11901 (operator-approved Option 1, 2026-06-10): a SHARED
+# (non-isolated) static Claude agent inherits the operator's system-global
+# `~/.claude/settings.json` as the bottom-most render layer, so operator
+# changes to global settings (e.g. `agentPushNotifEnabled`) propagate to
+# shared agents on the next render. iso-v2 agents are UNAFFECTED (separate
+# OS user/home — global inheritance is not their contract), and dynamic
+# agents already read the real `~/.claude`.
+#
+# SAFETY FILTER (operator caveat): the operator global is a human's
+# machine-local file and may carry sensitive or machine-specific items that
+# must NOT flow into a managed agent's effective settings. We DENYLIST the
+# known-dangerous keys below, plus any top-level key whose name *looks*
+# credential-shaped (substring match — defense in depth against future
+# Claude Code keys we have not catalogued). Everything else inherits.
+#
+# Why a denylist (not an allowlist): the whole point of Option 1 is that a
+# *future* benign operator-global key (like `agentPushNotifEnabled`, which
+# is not in any bridge default) propagates without a code change. An
+# allowlist would silently swallow every new key until someone updates this
+# file — exactly the gap we are closing. The denylist names the categories
+# that are genuinely unsafe to inherit and lets the long tail through.
+#
+# Rationale per key:
+#   - hooks: machine-absolute hook commands; the bridge OWNS the hook suite
+#     (Stop/UserPromptSubmit/PreToolUse/... are ensured into the bridge base
+#     and must win). Inheriting the operator's hooks would either be
+#     redundant (same paths) or wire commands that do not exist on the
+#     agent's box.
+#   - statusLine: an absolute-path command (operator's HUD) that would break
+#     on the agent; it is also a PRESERVED_USER_KEY (#1689) so a per-agent
+#     statusLine still wins. We drop the global one rather than risk an
+#     unrunnable command in the effective file.
+#   - apiKeyHelper / awsAuthRefresh / awsCredentialExport / otelHeadersHelper:
+#     credential-emitting commands (machine/account specific).
+#   - forceLoginMethod / forceLoginOrgUUID: account binding.
+#   - permissions: the bridge governs tool access via the tool-policy hook +
+#     `--dangerously-skip-permissions`; inheriting the operator's machine-wide
+#     allow/deny rules could silently broaden or break a managed agent.
+#   - env: arbitrary environment injection, frequently machine/credential
+#     specific.
+OPERATOR_GLOBAL_INHERIT_DENYLIST = frozenset(
+    {
+        "hooks",
+        "statusLine",
+        "apiKeyHelper",
+        "awsAuthRefresh",
+        "awsCredentialExport",
+        "otelHeadersHelper",
+        "forceLoginMethod",
+        "forceLoginOrgUUID",
+        "permissions",
+        "env",
+    }
+)
+
+# Substring guard: drop any top-level operator-global key whose name looks
+# credential-shaped even if it is not in the explicit denylist above. Match
+# is case-insensitive and substring-based so e.g. `myApiKey`, `authToken`,
+# `clientSecret`, `oauthRefresh` are all caught.
+_OPERATOR_GLOBAL_SENSITIVE_NAME_TOKENS = (
+    "apikey",
+    "token",
+    "secret",
+    "credential",
+    "password",
+    "oauth",
+    "auth_refresh",
+    "authrefresh",
+)
+
+
+def _filter_operator_global_base(payload: Any) -> tuple[dict[str, Any], list[str]]:
+    """Return the inheritable subset of an operator-global settings payload.
+
+    Applies `OPERATOR_GLOBAL_INHERIT_DENYLIST` plus the credential-shaped
+    name guard. Returns `(filtered_dict, dropped_key_names)`. A non-dict
+    payload yields `({}, [])` so a malformed global degrades cleanly to the
+    bridge base via the fail-safe in `cmd_render_shared_settings`.
+    """
+    if not isinstance(payload, dict):
+        return {}, []
+    filtered: dict[str, Any] = {}
+    dropped: list[str] = []
+    for key, value in payload.items():
+        lowered = str(key).lower()
+        if key in OPERATOR_GLOBAL_INHERIT_DENYLIST or any(
+            token in lowered for token in _OPERATOR_GLOBAL_SENSITIVE_NAME_TOKENS
+        ):
+            dropped.append(str(key))
+            continue
+        filtered[key] = value
+    return filtered, sorted(dropped)
+
+
+def _warn_filtered_operator_global_keys(dropped: list[str], context: str) -> None:
+    """Emit a single stderr `[info]` line for sensitive operator-global keys
+    that the safety filter dropped before inheritance (#11901).
+
+    Kept off stdout so the `--json`/`--format shell` render paths stay
+    machine-parseable.
+    """
+    if not dropped:
+        return
+    sys.stderr.write(
+        "[info] bridge-hooks: operator-global settings inherited for this "
+        f"shared agent with {len(dropped)} sensitive/machine-specific key(s) "
+        f"filtered out ({', '.join(dropped)}) before merge into "
+        f"{context} (#11901 safety filter)\n"
+    )
+
+
 # Issue #1495: Claude Code skips the ENTIRE settings.json (every key —
 # enabledPlugins, skipDangerousModePermissionPrompt, the lot) when the
 # `hooks` record carries an event name the CLI does not recognize
@@ -1740,12 +1851,64 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     # normally-created channel agents (the bridge composes it at launch).
     channels_csv = (getattr(args, "channels_csv", "") or "") or None
     managed_defaults = managed_claude_settings_defaults(launch_cmd, agent_class, channels_csv)
-    # Compose: managed defaults < base < overlay < preserved user keys.
-    # Preserved keys merge last so per-agent edits to the effective file
-    # (e.g. operator-disabled plugins) survive every rerender. See
-    # `PRESERVED_USER_KEYS` rationale above.
+
+    # Queue request #11901 (operator-approved Option 1): for a SHARED static
+    # agent, the operator's system-global `~/.claude/settings.json` (resolved
+    # in the shell via `bridge_agent_operator_home_dir` and passed here as
+    # `--operator-global-settings-file`) is inherited as the BOTTOM-MOST
+    # layer, filtered through the safety denylist.
+    #
+    # Why bottom-most (below managed defaults), not the literal "base"
+    # position the design note sketched: the bridge's own hook suite (Stop /
+    # tool-policy / SessionStart / ...) and the per-class managed defaults
+    # (static `autoCompactWindow=400_000`) MUST win over whatever the
+    # operator happens to have globally. Placing the filtered global at the
+    # bottom means:
+    #   * a global key the bridge does NOT set (e.g. `agentPushNotifEnabled`)
+    #     propagates up untouched — the gap #11901 closes, and
+    #   * a global key the bridge DOES set (e.g. a global
+    #     `autoCompactWindow=1_000_000`) is overridden by the managed/base/
+    #     overlay layers above it — so per-class and per-agent intentional
+    #     differences are preserved.
+    #
+    # Fail-safe: if the global is missing, unreadable, or not a JSON object,
+    # `operator_global_layer` stays empty and the render degrades to the
+    # pre-#11901 `managed < base < overlay < preserved` stack — never an
+    # empty or broken effective file.
+    operator_global_path_arg = (
+        getattr(args, "operator_global_settings_file", "") or ""
+    ) or None
+    operator_global_layer: dict[str, Any] = {}
+    if operator_global_path_arg is not None:
+        operator_global_path = Path(operator_global_path_arg).expanduser()
+        try:
+            operator_global_payload = load_json(operator_global_path)
+        except (OSError, json.JSONDecodeError):
+            operator_global_payload = None
+        operator_global_layer, _global_dropped = _filter_operator_global_base(
+            operator_global_payload
+        )
+        # Warn whenever the safety filter dropped a sensitive key, regardless
+        # of whether any benign key survived (#11901 r2): an all-denied global
+        # (e.g. only `apiKeyHelper`/`env`) drops every key, leaving
+        # `operator_global_layer` empty — but the keys WERE dropped, so the
+        # helper contract (one `[info]` stderr line naming them) must still
+        # fire. Gating on `_global_dropped` instead of `operator_global_layer`
+        # closes the silent-drop gap; the helper itself early-returns on an
+        # empty `dropped`, so this stays a single, non-double `[info]` line.
+        if _global_dropped:
+            _warn_filtered_operator_global_keys(_global_dropped, str(effective_path))
+
+    # Compose: operator-global(filtered) < managed defaults < base < overlay
+    # < preserved user keys. Preserved keys merge last so per-agent edits to
+    # the effective file (e.g. operator-disabled plugins) survive every
+    # rerender. See `PRESERVED_USER_KEYS` rationale above.
     preserved = _load_preserved_user_keys(effective_path)
-    merged = merge_settings(managed_defaults, base_payload)
+    if operator_global_layer:
+        merged = merge_settings(operator_global_layer, managed_defaults)
+    else:
+        merged = dict(managed_defaults)
+    merged = merge_settings(merged, base_payload)
     merged = merge_settings(merged, overlay_payload)
     if preserved:
         merged = merge_settings(merged, preserved)
@@ -2857,6 +3020,11 @@ def build_parser() -> argparse.ArgumentParser:
     render_shared_parser.add_argument("--base-settings-file", required=True)
     render_shared_parser.add_argument("--overlay-settings-file", required=True)
     render_shared_parser.add_argument("--effective-settings-file", required=True)
+    render_shared_parser.add_argument(
+        "--operator-global-settings-file",
+        default="",
+        help="Operator's system-global ~/.claude/settings.json (resolved in the shell via bridge_agent_operator_home_dir). For SHARED static agents only, its safety-filtered contents are inherited as the bottom-most render layer so operator-global keys (e.g. agentPushNotifEnabled) propagate while per-class/per-agent managed differences still win (queue #11901). Empty / missing / unreadable / non-object => fail-safe degrade to the bridge base (pre-#11901 behavior).",
+    )
     render_shared_parser.add_argument(
         "--launch-cmd",
         default="",
