@@ -127,6 +127,235 @@ bridge_layout_memory_dir() {
   printf '%s/memory' "$(bridge_layout_agent_home "$agent")"
 }
 
+# _bridge_layout_canon_dir <path>
+#
+# Print a best-effort canonical form of <path> for comparison. Falls back to
+# the literal value when the directory cannot be canonicalized (e.g. an iso
+# workdir the controller cannot traverse) so the caller compares like-for-like
+# without a hard dependency on the path existing.
+_bridge_layout_canon_dir() {
+  local path="$1"
+  [[ -n "$path" ]] || return 1
+  local canon=""
+  canon="$(cd -P -- "$path" 2>/dev/null && pwd -P)" || canon=""
+  if [[ -n "$canon" ]]; then
+    printf '%s' "$canon"
+  else
+    printf '%s' "$path"
+  fi
+}
+
+# _bridge_layout_identity_names_agent <agent> <file>
+#
+# Issue #1750 r2 — ownership-by-identity (NOT byte-equality with the current
+# home). Return 0 (TRUE) when the authored identity in <file> names <agent> as
+# a WHOLE identity token in a canonical header / declaration position; 1 (FALSE)
+# otherwise. This is the primitive the foreign-owned guard uses to answer
+# "whose identity does the workdir currently carry?" — a question that must stay
+# answerable even after the OWNER edits every anchor in its home (so the workdir
+# copy is now stale and byte-differs from the current home). The old
+# `cmp -s … home … workdir` test misclassified exactly that case as foreign and
+# blocked the legitimate #1417 owner-refresh (codex probe: blocked_owner_refresh).
+#
+# Canonical positions probed (each authored by the create-time scaffold via the
+# `<Agent Name>` / `<agent-id>` placeholder substitution — see
+# `bridge_render_template_string` and the codex-pair fallback render in
+# bridge-agents.sh; `<Agent Name>` defaults to the agent id):
+#   * SOUL.md / first heading line:      `# <name> Soul`
+#   * entrypoint (CLAUDE.md / AGENTS.md): `# <name> — <Role>`
+#   * SOUL.md Korean self-declaration:    `너는 <name>다` / `너는 **<name>**다`
+#
+# Whole-token match only — `<name>` must be bounded by the surrounding literal
+# template syntax (`# ` … ` Soul`, `# ` … ` — `, `너는 ` … `다`, with optional
+# `**` bold markers). A loose substring would let `patch` match
+# `# patch-dev Soul` (the substring trap the brief calls out); the anchored
+# forms below cannot, because the character after `patch` in `# patch-dev Soul`
+# is `-`, not the required ` Soul` / ` — ` / `다` boundary.
+_bridge_layout_identity_names_agent() {
+  local name="$1" file="$2"
+  [[ -n "$name" && -n "$file" && -f "$file" ]] || return 1
+
+  # Identity headers live at the very top of SOUL.md / CLAUDE.md / AGENTS.md;
+  # read only the head so an incidental later mention of the name can never be
+  # mistaken for the authored identity declaration.
+  local head_block
+  head_block="$(head -n 8 -- "$file" 2>/dev/null)" || return 1
+  [[ -n "$head_block" ]] || return 1
+
+  # Escape BRE metacharacters in the agent id so the anchors below match it
+  # literally (agent ids are normally `[A-Za-z0-9_-]+`, but stay defensive).
+  local name_q
+  name_q="$(printf '%s' "$name" | sed -e 's/[.[\*^$/]/\\&/g')"
+
+  # SOUL.md heading: `# <name> Soul`. The ` Soul` suffix is the right boundary —
+  # `# patch-dev Soul` cannot match name=patch (the char after `patch` is `-`).
+  # NOTE: feed grep via `printf | grep` rather than a here-string redirect —
+  # here-strings are H3 footgun-#11 sites (lint-heredoc-ban). `printf '%s\n'`
+  # preserves the multi-line block + trailing newline so `^`/`$` behave identically.
+  printf '%s\n' "$head_block" | grep -qE "^#[[:space:]]+${name_q}[[:space:]]+Soul([[:space:]]|\$)" && return 0
+  # Entrypoint heading: `# <name> — <Role>`. The ` — ` separator is the boundary;
+  # accept the ASCII `-`/`--` fallback some renders emit too.
+  printf '%s\n' "$head_block" | grep -qE "^#[[:space:]]+${name_q}[[:space:]]+(—|--|-)[[:space:]]" && return 0
+  # SOUL.md Korean self-declaration: `너는 <name>다` / `너는 **<name>**다`. The
+  # trailing `다` plus the optional `**` bold markers bound the token.
+  printf '%s\n' "$head_block" | grep -qE "너는[[:space:]]+[*]*${name_q}[*]*다" && return 0
+
+  return 1
+}
+
+# bridge_layout_workspace_foreign_owned <agent> <target_dir>
+#
+# Issue #1750 — fail-safe shared-workspace guard for the WORKDIR identity
+# delivery paths (materialize + sync-on-start). Returns 0 (TRUE — foreign /
+# do-not-stamp) when <target_dir> is a workspace that is SHARED with at least
+# one OTHER roster agent AND the identity already present there does NOT belong
+# to <agent>. Returns 1 (FALSE — this agent may deliver its identity) otherwise.
+#
+# Why this exists, beyond the marker-text + BRIDGE_LAYOUT_WORKSPACE_SHARED env
+# guards already in materialize/sync:
+#
+#   On a managed-project install the admin (e.g. `patch`, claude) is created
+#   FIRST into its workdir, then its codex pair (`patch-dev`) is auto-provisioned
+#   with `--workdir <admin-workdir> --allow-shared-workdir` (bridge-init-codex-
+#   pair.sh). The create-time materialize is correctly suppressed for the pair
+#   via BRIDGE_LAYOUT_WORKSPACE_SHARED=1, so home stays correct. But the
+#   START-time sync (`bridge_layout_sync_identity_from_home`, bridge-start.sh)
+#   carries NEITHER guard: the env flag is create-time-only, and the admin's
+#   correct workdir CLAUDE.md (`# patch — …`) holds no "shared workdir" marker
+#   text. So when the pair starts, the unguarded sync copies the PAIR's home
+#   identity (SOUL/SESSION-TYPE/CLAUDE.md — codex / `Session Type: static-codex`)
+#   over the ADMIN's workdir copies, and the runtime (which reads identity from
+#   the workdir cwd) boots the admin as the codex pair. That is the #1750 drift
+#   (home @10:45 correct, workdir @10:47 overwritten with the pair template).
+#
+# The reliable signal at start time — with no persisted shared-workdir flag —
+# is the roster itself: another agent shares this workdir, AND the identity
+# physically present in the workdir names a DIFFERENT roster-sharer (the pair),
+# not this agent. In that case this agent is a non-owning sharer (the pair) and
+# MUST NOT stamp its identity over the owner's copy. Fail-safe: when ownership
+# is genuinely indeterminate (identity present but no sharer's marker matches)
+# we DECLINE to write rather than fall back to the sibling/pair template —
+# exactly the #1750 fail-safe contract.
+#
+# Ownership decided by AGENT IDENTITY, not byte-equality with the current home
+# (issue #1750 r2 — the codex BLOCKING). The workdir's authored identity files
+# NAME their owning agent in a canonical header position (`# patch Soul`,
+# `# patch — …`, `너는 patch다`) — the pair's name the pair (`# patch-dev Soul`,
+# `너는 patch-dev다`). Deciding ownership by *whose name the workdir carries*
+# (matched as a WHOLE identity token via `_bridge_layout_identity_names_agent`,
+# so `patch` never matches `patch-dev`) survives the owner editing every anchor
+# in its home: the stale workdir copy still NAMES the owner, so it is still
+# correctly classified as MINE → the #1417 refresh proceeds. The previous
+# byte-equality test broke here — once the owner changed SOUL+CLAUDE/entrypoint
+# in home, no workdir copy matched the NEW home and the guard wrongly declined
+# the owner's own refresh.
+#
+# Ownership test (when the workdir IS shared with another agent):
+#   * No identity present in the workdir yet  → not foreign (return 1): the
+#     first writer legitimately materializes (the empty-workspace create case).
+#   * Workdir identity NAMES this agent (even if stale vs the current home) →
+#     this agent owns it (return 1): the legitimate #1417 HOME→WORKDIR refresh
+#     of the owner's own copy proceeds.
+#   * Workdir identity NAMES another roster-sharer (the pair) → foreign owner
+#     (return 0): decline. The pair hits this branch because the workdir holds
+#     the admin's SOUL/CLAUDE.md, which name `patch`, not `patch-dev`. Name-match
+#     picks the LONGEST matching sharer id so `# patch-dev Soul` resolves to the
+#     pair, never the admin (substring-trap safe).
+#   * Identity present but no sharer's marker matches → indeterminate → foreign
+#     (return 0, fail-safe): never render a sibling/pair template.
+#
+# Roster-free / single-agent installs (no other agent shares the workdir) always
+# return 1 — this guard changes nothing for the common case, only for the
+# admin+pair shared-workdir topology that produced #1750.
+bridge_layout_workspace_foreign_owned() {
+  local agent="$1" target_dir="$2"
+  [[ -n "$agent" && -n "$target_dir" ]] || return 1
+
+  # Test-only teeth hatch (#1750 smoke): when set, the guard short-circuits to
+  # "not foreign" so the smoke can reproduce the pre-fix divergence WITHOUT
+  # editing source. Never set in production; the var is undocumented operator
+  # surface and defaults off.
+  [[ -n "${BRIDGE_LAYOUT_DISABLE_FOREIGN_GUARD_1750:-}" ]] && return 1
+
+  # Cannot enumerate the roster → cannot prove a shared workspace; do not block.
+  declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 || return 1
+  declare -F bridge_agent_workdir >/dev/null 2>&1 || return 1
+
+  local target_canon
+  target_canon="$(_bridge_layout_canon_dir "$target_dir")"
+
+  # Collect every OTHER roster agent whose resolved workdir is this same
+  # workspace — the set of potential foreign owners (the pair). Keep them all
+  # (not just the first) so the ownership probe can identify exactly which
+  # sharer's identity the workdir currently carries.
+  local other other_wd other_canon
+  local -a sharers=()
+  for other in "${BRIDGE_AGENT_IDS[@]}"; do
+    [[ -n "$other" ]] || continue
+    [[ "$other" == "$agent" ]] && continue
+    other_wd="$(bridge_agent_workdir "$other" 2>/dev/null || true)"
+    [[ -n "$other_wd" ]] || continue
+    other_canon="$(_bridge_layout_canon_dir "$other_wd")"
+    if [[ "$other_canon" == "$target_canon" ]]; then
+      sharers+=("$other")
+    fi
+  done
+  # Not shared with anyone else → ordinary managed-project workdir; allow.
+  (( ${#sharers[@]} > 0 )) || return 1
+
+  # Shared workspace. Decide ownership by AGENT IDENTITY — whose name the
+  # workdir's authored identity files currently carry — NOT byte-equality with
+  # this agent's *current* home (issue #1750 r2). An owner that has just edited
+  # every anchor in its home leaves the workdir copy stale, but the stale copy
+  # still NAMES the owner, so it is still correctly classified as MINE and the
+  # #1417 refresh proceeds.
+  local engine_entry=""
+  if declare -F bridge_engine_entrypoint_filename >/dev/null 2>&1; then
+    # The sync/materialize callers know the engine; resolve a best-effort
+    # entrypoint for the ownership probe. CLAUDE.md is the universal fallback.
+    engine_entry="$(bridge_engine_entrypoint_filename "${BRIDGE_LAYOUT_FOREIGN_PROBE_ENGINE:-claude}" 2>/dev/null || printf '')"
+  fi
+  [[ -n "$engine_entry" ]] || engine_entry="CLAUDE.md"
+
+  # Which roster-sharer (this agent OR a foreign sharer) does the workdir name?
+  # Probe SOUL.md, the engine entrypoint, and CLAUDE.md in canonical-header
+  # position. To defeat the substring trap (`patch` is a prefix of `patch-dev`),
+  # prefer the LONGEST candidate id that matches: a workdir SOUL.md reading
+  # `# patch-dev Soul` matches `patch-dev`, never `patch`. Candidate set = this
+  # agent + every foreign sharer.
+  local -a candidates=("$agent" "${sharers[@]}")
+  local probe present_any=0 fname cand
+  local owner_match="" owner_len=0
+  for fname in SOUL.md "$engine_entry" CLAUDE.md; do
+    [[ -n "$fname" ]] || continue
+    probe="$target_dir/$fname"
+    [[ -f "$probe" ]] || continue
+    present_any=1
+    for cand in "${candidates[@]}"; do
+      [[ -n "$cand" ]] || continue
+      if _bridge_layout_identity_names_agent "$cand" "$probe"; then
+        if (( ${#cand} > owner_len )); then
+          owner_match="$cand"
+          owner_len=${#cand}
+        fi
+      fi
+    done
+  done
+
+  # Shared workspace with NO identity present yet → first writer (owner) may
+  # materialize; not foreign.
+  (( present_any == 1 )) || return 1
+
+  # The workdir names THIS agent (even if its copy is stale vs the current home)
+  # → owned. Allow the #1417 owner-refresh from home to proceed.
+  [[ "$owner_match" == "$agent" ]] && return 1
+
+  # The workdir names a foreign sharer (the pair), OR no candidate's marker
+  # matched at all (indeterminate). Either way → decline (fail-safe): never
+  # stamp this agent's identity over the owner's copy or render a pair template.
+  return 0
+}
+
 # bridge_layout_materialize_identity <agent> <engine> [target_dir]
 #
 # The D1 materialization step. Copies/syncs the authored identity
@@ -200,6 +429,18 @@ bridge_layout_materialize_identity() {
   if [[ -n "${BRIDGE_LAYOUT_WORKSPACE_SHARED:-}" ]]; then
     bridge_layout_log_note "materialize: $agent — workspace flagged shared; per-agent identity kept in agent_home"
     return 0
+  fi
+  # Issue #1750 — defense in depth: even when the caller forgets to set
+  # BRIDGE_LAYOUT_WORKSPACE_SHARED (the env flag is create-path-only), decline
+  # to stamp this agent's identity over a workdir that is shared with another
+  # roster agent and already holds that agent's identity. Keeps the pair's
+  # codex template out of the admin's workdir regardless of the call site.
+  if declare -F bridge_layout_workspace_foreign_owned >/dev/null 2>&1; then
+    if BRIDGE_LAYOUT_FOREIGN_PROBE_ENGINE="$engine" \
+        bridge_layout_workspace_foreign_owned "$agent" "$target_dir"; then
+      bridge_layout_log_note "materialize: $agent — shared workspace owned by another agent ($target_dir); per-agent identity kept in agent_home (#1750)"
+      return 0
+    fi
   fi
 
   mkdir -p "$target_dir" 2>/dev/null || return 0
@@ -416,6 +657,26 @@ bridge_layout_sync_identity_from_home() {
     fi
   done
   [[ -n "${BRIDGE_LAYOUT_WORKSPACE_SHARED:-}" ]] && return 0
+
+  # Issue #1750 — fail-safe roster-aware shared-workspace guard. The two guards
+  # above are create-time signals: the marker text appears only in a project
+  # tree that explicitly declares itself shared, and BRIDGE_LAYOUT_WORKSPACE_
+  # SHARED is set only by the `agent create --allow-shared-workdir` path. The
+  # START path (this function) carries neither. On a managed-project admin+pair
+  # install the admin's correct workdir CLAUDE.md (`# patch — …`) holds no
+  # marker text and the env flag is unset, so without this guard the pair's
+  # start-time sync stamps the PAIR (codex / `Session Type: static-codex`)
+  # identity over the ADMIN's workdir copies — the exact #1750 drift. Decline
+  # when the workdir is shared with another roster agent and the identity there
+  # is not this agent's (fail-safe: never stamp a sibling/pair template over the
+  # owner's copy).
+  if declare -F bridge_layout_workspace_foreign_owned >/dev/null 2>&1; then
+    if BRIDGE_LAYOUT_FOREIGN_PROBE_ENGINE="$engine" \
+        bridge_layout_workspace_foreign_owned "$agent" "$target_dir"; then
+      bridge_layout_log_note "sync-identity: $agent — shared workspace owned by another agent ($target_dir); per-agent identity kept in agent_home (#1750)"
+      return 0
+    fi
+  fi
 
   # Resolve the engine entrypoint + claude-compat copy the same way
   # materialize does, so the synced fileset matches the create-time set.
