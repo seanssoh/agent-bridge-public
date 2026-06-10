@@ -114,6 +114,30 @@ bridge_start_should_controller_accept_dev_channels() {
   [[ -n "$effective" ]]
 }
 
+# Issue #1769 mechanism 2: a setup-freshness check tripped the fresh gate.
+# Record its name (for one diagnostic log line per failed check) and whether
+# the check is genuinely fresh-requiring — i.e. whether the relaunched Claude
+# would NOT pick the corrected artifact up via the re-ensure pass that runs
+# later in this same bridge-start process before the engine exec.
+#
+# All of stop/session-start/prompt/prompt-guard/tool-policy hook status read
+# settings.json, which Claude reloads at launch on resume just as on a fresh
+# start; their ensure helpers run unconditionally below (not gated on
+# INSTALL_PROJECT_SKILL), so a tripped hook check is always re-ensured this
+# run → re-ensurable. The CLAUDE.md-guidance and skill-bootstrap checks are
+# re-rendered only when INSTALL_PROJECT_SKILL=1 (the normal start/restart
+# default); under --skip-project-skill that render is skipped, so the
+# corrected artifact would not be in place for the relaunch → fresh-required.
+bridge_start_note_fresh_trip() {
+  local check_name="$1"
+  local fresh_required="${2:-0}"
+  FORCE_FRESH_SESSION=1
+  FRESH_TRIPPED_CHECKS+=("$check_name")
+  if [[ "$fresh_required" == "1" ]]; then
+    FRESH_TRIPPED_FRESH_REQUIRED+=("$check_name")
+  fi
+}
+
 bridge_start_post_launch_verify() {
   # Issue #715-C / #714-5: tmux new-session reports success even if the
   # session dies a few hundred ms later (plugin MCP liveness restart loop,
@@ -425,6 +449,12 @@ RUNNER="$SCRIPT_DIR/bridge-run.sh"
 ENV_PREFIX="$(bridge_export_env_prefix)"
 EFFECTIVE_CONTINUE_MODE="$(bridge_agent_continue "$AGENT")"
 FORCE_FRESH_SESSION=0
+# Issue #1769 mechanism 2: record WHICH setup-freshness check tripped the
+# fresh gate so the discard is diagnosable, and classify whether that check
+# is re-ensured later in THIS same bridge-start run (so a resumable session
+# need not be thrown away — see the gate-downgrade block below).
+FRESH_TRIPPED_CHECKS=()
+FRESH_TRIPPED_FRESH_REQUIRED=()
 SUPPRESS_MISSING_CHANNELS=0
 CHANNEL_REASON=""
 AGENT_ENV_FILE=""
@@ -528,8 +558,14 @@ if bridge_tmux_session_exists "$SESSION"; then
 fi
 
 if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
+  # Issue #1769 mechanism 2: each tripped check is recorded by name. The
+  # CLAUDE.md-guidance and skill-bootstrap artifacts are only re-rendered
+  # when INSTALL_PROJECT_SKILL=1, so they are fresh-required (no re-ensure
+  # this run) under --skip-project-skill; the hook-status checks are always
+  # re-ensured below regardless of INSTALL_PROJECT_SKILL.
+  _fresh_required_setup=$(( INSTALL_PROJECT_SKILL == 1 ? 0 : 1 ))
   if bridge_project_claude_guidance_needed "$WORK_DIR"; then
-    FORCE_FRESH_SESSION=1
+    bridge_start_note_fresh_trip claude_guidance_needed "$_fresh_required_setup"
   fi
   if [[ $INSTALL_PROJECT_SKILL -eq 1 ]]; then
     # Issue #1151: thread $AGENT so v2-isolation guard polarity fix can
@@ -537,23 +573,24 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
     bridge_ensure_project_claude_guidance "$WORK_DIR" "$AGENT" >/dev/null 2>&1 || true
   fi
   if ! bridge_project_skill_bootstrap_needed "$ENGINE" "$WORK_DIR"; then
-    FORCE_FRESH_SESSION=1
+    bridge_start_note_fresh_trip skill_bootstrap_needed "$_fresh_required_setup"
   fi
   if ! bridge_claude_stop_hook_status "$WORK_DIR" >/dev/null 2>&1; then
-    FORCE_FRESH_SESSION=1
+    bridge_start_note_fresh_trip stop_hook_status 0
   fi
   if ! bridge_claude_session_start_hook_status "$WORK_DIR" >/dev/null 2>&1; then
-    FORCE_FRESH_SESSION=1
+    bridge_start_note_fresh_trip session_start_hook_status 0
   fi
   if ! bridge_claude_prompt_hook_status "$WORK_DIR" >/dev/null 2>&1; then
-    FORCE_FRESH_SESSION=1
+    bridge_start_note_fresh_trip prompt_hook_status 0
   fi
   if ! bridge_claude_prompt_guard_hook_status "$WORK_DIR" >/dev/null 2>&1; then
-    FORCE_FRESH_SESSION=1
+    bridge_start_note_fresh_trip prompt_guard_hook_status 0
   fi
   if ! bridge_claude_tool_policy_hooks_status "$WORK_DIR" >/dev/null 2>&1; then
-    FORCE_FRESH_SESSION=1
+    bridge_start_note_fresh_trip tool_policy_hooks_status 0
   fi
+  unset _fresh_required_setup
   if [[ $INSTALL_PROJECT_SKILL -eq 1 ]]; then
     # Issue #1155: thread $AGENT (3rd arg) so the v2-isolation guard in
     # bridge_bootstrap_project_skill can resolve roster os_user. Without
@@ -608,7 +645,10 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   fi
 elif [[ "$ENGINE" == "codex" && $SAFE_MODE -eq 0 ]]; then
   if ! bridge_project_skill_bootstrap_needed "$ENGINE" "$WORK_DIR"; then
-    FORCE_FRESH_SESSION=1
+    # Codex resume semantics are unchanged by #1769 mechanism 2 (the
+    # resume-downgrade below is Claude-only); record the trip name purely
+    # for the diagnostic log line.
+    bridge_start_note_fresh_trip skill_bootstrap_needed 1
   fi
   if [[ $INSTALL_PROJECT_SKILL -eq 1 ]]; then
     # Issue #1155: thread $AGENT (3rd arg) for the v2-isolation guard.
@@ -624,10 +664,57 @@ elif [[ "$ENGINE" == "codex" && $SAFE_MODE -eq 0 ]]; then
 fi
 
 if [[ $FORCE_FRESH_SESSION -eq 1 ]]; then
-  if [[ $CONTINUE_EXPLICIT -eq 1 && "$CONTINUE_MODE" == "1" ]]; then
-    bridge_warn "Bridge project setup changed or was missing. Forcing a fresh session so CLAUDE.md, skills, and hooks are loaded."
+  # Issue #1769 mechanism 2: the setup-freshness gate used to silently drop a
+  # perfectly resumable session whenever ANY check tripped — the discard was
+  # invisible on normal restart flows (the visible warning below only fires
+  # when the operator explicitly passed --continue) and it defeated the #981
+  # restart re-inject fleet-wide after every controller-side settings
+  # re-render. Two changes here, both additive:
+  #
+  #   1. Diagnosability: log one line per tripped check, naming the check —
+  #      no longer silent, even on normal restarts.
+  #   2. Downgrade on resumable restart: for Claude, when a resume id is
+  #      resolvable AND every tripped check is re-ensured later in THIS run
+  #      (i.e. none is fresh-required), keep the resume. The ensure pass that
+  #      already ran above (and runs again for the engine) re-renders the
+  #      stale CLAUDE.md / skills / hooks before the engine exec, and a
+  #      resumed Claude reloads settings.json at launch exactly like a fresh
+  #      one — so the fresh launch bought nothing the re-ensure didn't.
+  #
+  # Force-fresh is preserved (unchanged behavior) when there is no resumable
+  # id, when a genuinely fresh-required check tripped (e.g. CLAUDE.md guidance
+  # / skill bootstrap under --skip-project-skill, where the re-render is
+  # skipped this run), or for Codex.
+  _fresh_resumable_id=""
+  if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 && "${CONTINUE_MODE}" == "1" ]]; then
+    _fresh_resumable_id="$(bridge_claude_resume_session_id_for_agent "$AGENT" 2>/dev/null || true)"
   fi
-  EFFECTIVE_CONTINUE_MODE=0
+  _fresh_required_count=${#FRESH_TRIPPED_FRESH_REQUIRED[@]}
+  if [[ -n "$_fresh_resumable_id" && $_fresh_required_count -eq 0 ]]; then
+    # Downgrade: keep the resumable session; the re-ensure pass fixed setup.
+    for _check in "${FRESH_TRIPPED_CHECKS[@]}"; do
+      bridge_warn "setup-freshness check '$_check' tripped on restart but is re-ensured this run; resuming session_id=${_fresh_resumable_id} (was: silent fresh discard, #1769)."
+    done
+    FORCE_FRESH_SESSION=0
+    if [[ $CONTINUE_EXPLICIT -eq 1 ]]; then
+      EFFECTIVE_CONTINUE_MODE="$CONTINUE_MODE"
+    fi
+  else
+    # Fresh launch (preserved behavior) — but now logged, naming each check.
+    for _check in "${FRESH_TRIPPED_CHECKS[@]}"; do
+      _fresh_req_note="re-ensurable"
+      for _fr in "${FRESH_TRIPPED_FRESH_REQUIRED[@]+"${FRESH_TRIPPED_FRESH_REQUIRED[@]}"}"; do
+        [[ "$_fr" == "$_check" ]] && _fresh_req_note="fresh-required"
+      done
+      bridge_warn "setup-freshness check '$_check' ($_fresh_req_note) forced a fresh session (#1769 diagnostic)."
+    done
+    unset _fresh_req_note _fr
+    if [[ $CONTINUE_EXPLICIT -eq 1 && "$CONTINUE_MODE" == "1" ]]; then
+      bridge_warn "Bridge project setup changed or was missing. Forcing a fresh session so CLAUDE.md, skills, and hooks are loaded."
+    fi
+    EFFECTIVE_CONTINUE_MODE=0
+  fi
+  unset _fresh_resumable_id _fresh_required_count _check
 elif [[ $CONTINUE_EXPLICIT -eq 1 ]]; then
   EFFECTIVE_CONTINUE_MODE="$CONTINUE_MODE"
 fi
