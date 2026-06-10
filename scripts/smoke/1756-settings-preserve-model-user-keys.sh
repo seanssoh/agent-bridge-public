@@ -24,8 +24,16 @@
 #   (d) Adoption fold (`link-shared-settings`): converting a regular per-agent
 #       settings.json carrying `model` to the managed symlink folds `model`
 #       into the shared effective target — nothing lost at symlink takeover.
+#   (e) Adoption fold + launched-channel repair (#1756 r2 / #1453): a regular
+#       file being adopted carries an `enabledPlugins` with BOTH a false
+#       LAUNCHED-channel plugin AND a false non-launched plugin. After adoption
+#       the launched one is repaired to `true` in the shared target (inbound
+#       delivery not silently disabled) while the non-launched disabled plugin
+#       stays `false` (operator intent preserved where safe). Without threading
+#       launch/channel context into the fold, the adopted false would re-disable
+#       the launched channel and bypass the #1453 sticky-false fix.
 #
-# (Criterion (e) — global `model` inherits through the #11901 safety filter —
+# (Criterion (f) — global `model` inherits through the #11901 safety filter —
 # is pinned in 11901-shared-global-settings-inherit-helper.py, which renders
 # the shared path with an operator-global; this smoke covers the per-agent
 # preserve + adoption surface.)
@@ -166,6 +174,70 @@ EOF
     "operator enabledPlugins also folded at adoption (existing preserved key)"
 }
 
+assert_adoption_fold_repairs_launched_channel_only() {
+  # (e) #1756 r2 / #1453: the adoption fold must NOT re-disable a launched
+  # channel plugin. A regular per-agent settings.json being adopted carries an
+  # enabledPlugins with BOTH a false LAUNCHED channel (threaded via
+  # --channels-csv, the SSOT path normally-created channel agents use) AND a
+  # false NON-launched plugin. After adoption: the launched plugin is repaired
+  # to true in the shared target (inbound delivery stays wired), the
+  # non-launched disabled plugin stays false (operator intent preserved where
+  # safe). The launched-channel context is threaded into link-shared-settings
+  # exactly as the render paths thread it.
+  local wd="$SMOKE_TMP_ROOT/adopt-channel-workdir"
+  mkdir -p "$wd/.claude"
+  local shared_effective="$SMOKE_TMP_ROOT/shared-channel/settings.effective.json" # noqa: iso-helper-boundary — test-fixture settings.effective.json path inside an isolated smoke tmp root, not a controller->iso boundary site
+  mkdir -p "$(dirname "$shared_effective")"
+
+  # The launched channel set (BRIDGE_AGENT_CHANNELS CSV form). teams is the
+  # launched channel; context7 is NOT launched (a plugin the operator disabled).
+  local channels_csv="plugin:teams@agent-bridge"
+
+  # Render the shared effective target fresh WITH the launched channel so the
+  # managed default already enables teams (true) before adoption — the realistic
+  # pre-state the operator's adopted false would clobber.
+  python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" render-shared-settings \
+    --base-settings-file "$BASE" \
+    --overlay-settings-file "$OVERLAY" \
+    --effective-settings-file "$shared_effective" \
+    --agent-class static \
+    --channels-csv "$channels_csv" \
+    --launch-cmd "" >/dev/null
+
+  # The operator's regular per-agent settings.json: BOTH the launched channel
+  # AND a non-launched plugin recorded disabled (Claude Code's runtime writes
+  # enabledPlugins=false; the launched-channel false is the #1453 sticky-false).
+  cat >"$wd/.claude/settings.json" <<'EOF'
+{
+  "enabledPlugins": {
+    "teams@agent-bridge": false,
+    "context7@official": false
+  }
+}
+EOF
+
+  python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" link-shared-settings \
+    --workdir "$wd" \
+    --shared-settings-file "$shared_effective" \
+    --channels-csv "$channels_csv" \
+    --launch-cmd "" 2>/dev/null >/dev/null
+
+  [[ -L "$wd/.claude/settings.json" ]] \
+    || smoke_fail "channel adopt workdir settings.json should be a symlink after adoption"
+
+  # Assert the launched channel was repaired to true while the non-launched
+  # plugin stayed false — exact JSON value checks (not substring), via the
+  # sidecar's assert-plugin-state subcommand (file-as-argv; no heredoc-stdin
+  # to python — footgun #11 / lint-heredoc-ban).
+  python3 "$SCRIPT_DIR/1756-settings-preserve-model-user-keys-helper.py" \
+    assert-plugin-state "$shared_effective" "teams@agent-bridge" true \
+    || smoke_fail "launched channel teams@agent-bridge must be repaired to true after adoption (#1756 r2 / #1453)"
+  python3 "$SCRIPT_DIR/1756-settings-preserve-model-user-keys-helper.py" \
+    assert-plugin-state "$shared_effective" "context7@official" false \
+    || smoke_fail "non-launched context7@official must stay false after adoption (operator intent preserved)"
+  smoke_log "  ok: launched channel repaired to true, non-launched disabled stays false (#1756 r2 / #1453)"
+}
+
 main() {
   build_fixture
 
@@ -177,6 +249,8 @@ main() {
     assert_poison_hook_key_sanitized_with_model_preserved
   smoke_run "adoption fold carries model into shared effective (#1756 (d))" \
     assert_adoption_fold_preserves_model
+  smoke_run "adoption fold repairs launched channel, keeps non-launched false (#1756 (e) / #1453)" \
+    assert_adoption_fold_repairs_launched_channel_only
 
   smoke_log "PASS"
 }
