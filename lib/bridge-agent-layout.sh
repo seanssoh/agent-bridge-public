@@ -189,13 +189,16 @@ _bridge_layout_identity_names_agent() {
 
   # SOUL.md heading: `# <name> Soul`. The ` Soul` suffix is the right boundary —
   # `# patch-dev Soul` cannot match name=patch (the char after `patch` is `-`).
-  grep -qE "^#[[:space:]]+${name_q}[[:space:]]+Soul([[:space:]]|\$)" <<<"$head_block" && return 0
+  # NOTE: feed grep via `printf | grep` rather than a here-string redirect —
+  # here-strings are H3 footgun-#11 sites (lint-heredoc-ban). `printf '%s\n'`
+  # preserves the multi-line block + trailing newline so `^`/`$` behave identically.
+  printf '%s\n' "$head_block" | grep -qE "^#[[:space:]]+${name_q}[[:space:]]+Soul([[:space:]]|\$)" && return 0
   # Entrypoint heading: `# <name> — <Role>`. The ` — ` separator is the boundary;
   # accept the ASCII `-`/`--` fallback some renders emit too.
-  grep -qE "^#[[:space:]]+${name_q}[[:space:]]+(—|--|-)[[:space:]]" <<<"$head_block" && return 0
+  printf '%s\n' "$head_block" | grep -qE "^#[[:space:]]+${name_q}[[:space:]]+(—|--|-)[[:space:]]" && return 0
   # SOUL.md Korean self-declaration: `너는 <name>다` / `너는 **<name>**다`. The
   # trailing `다` plus the optional `**` bold markers bound the token.
-  grep -qE "너는[[:space:]]+[*]*${name_q}[*]*다" <<<"$head_block" && return 0
+  printf '%s\n' "$head_block" | grep -qE "너는[[:space:]]+[*]*${name_q}[*]*다" && return 0
 
   return 1
 }
