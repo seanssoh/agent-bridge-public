@@ -611,6 +611,11 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   # still hit the theme-picker / trust-dialog restart loop on its next
   # start until the operator manually ran `auth claude-token sync`.
   bridge_ensure_claude_first_run_config "$AGENT" "$WORK_DIR" >/dev/null 2>&1 || true
+  # #1753: defensive seed-if-absent of the operator's allowlisted plugin
+  # display config (default claude-hud) on the start path, so agents created
+  # before this fix backfill their HUD config on their next start. No-op when
+  # the agent already has its own config (never overwrites).
+  bridge_seed_operator_plugin_config "$AGENT" "$WORK_DIR" >/dev/null 2>&1 || true
   if ! bridge_ensure_claude_project_trust "$WORK_DIR" >/dev/null 2>&1; then
     bridge_warn "Claude project trust seed failed: $WORK_DIR"
   fi

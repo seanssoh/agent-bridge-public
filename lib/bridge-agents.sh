@@ -5453,6 +5453,201 @@ bridge_ensure_claude_first_run_config() {
   return 0
 }
 
+# bridge_seed_operator_plugin_config <agent> [workdir]
+#
+# Issue #1753 — seed-if-absent the operator's per-plugin display config into a
+# Claude agent's per-agent `.claude/plugins/<plugin>/config.json`. `claude-hud`
+# (and similar display-only plugins) ship HUD rows OFF by default; a freshly
+# scaffolded agent runs in its own config dir with no plugin config and renders
+# the abbreviated HUD even when the operator enabled the full view in their own
+# `~/.claude/plugins/<plugin>/config.json`. This copies the operator config in
+# at scaffold/rerender time so new agents inherit the operator's HUD intent.
+#
+#   src = <operator_home>/.claude/plugins/<plugin>/config.json
+#   dst = <config_dir>/plugins/<plugin>/config.json
+#   copy only when src exists AND dst is absent (never overwrite — design note
+#   2: agents may legitimately diverge to a minimal HUD).
+#
+# Allowlist (design note 1): only plugins in an explicit allowlist are seeded —
+# a generic copy of arbitrary plugin config risks carrying secret-bearing
+# config across agent boundaries. Default is exactly `claude-hud`; operators
+# extend it via the roster knob `BRIDGE_SEED_PLUGIN_CONFIG_ALLOWLIST`
+# (space/comma-separated plugin ids). Setting it to an empty value disables
+# seeding entirely.
+#
+# Engine gate (design note 4): Claude agents only — `claude-hud` is a Claude
+# Code plugin; Codex/Gemini agents are skipped.
+#
+# Operator-home resolution (design note 5): reuses
+# `bridge_agent_operator_home_dir` (the #11901 operator-global resolver) — no
+# second resolver, nothing hardcoded.
+#
+# iso v2 boundary (design note 3): on linux-user-isolated hosts the copy
+# crosses controller->iso. The operator config lives in the CONTROLLER's home
+# (which an iso UID cannot read), so the controller — not the iso UID — reads
+# the source, and publishes it into the iso agent home through the canonical
+# `bridge_iso_run --op publish-root-file` path (root-owned, `chgrp
+# ab-agent-<a>`, mode 0660). That is the same controller-publish contract the
+# plugin-manifest writers use; the iso UID gets group-read but cannot rewrite
+# its own seeded config. Shared-mode agents get a plain controller python3 copy
+# via the helper.
+#
+# Idempotent and best-effort: a no-op when the agent is not Claude, when the
+# operator config is absent, or when the agent already has its own config. Any
+# failure is swallowed (`|| return 0`) so it never aborts create/start.
+bridge_seed_operator_plugin_config() {
+  local agent="$1"
+  local engine=""
+  local config_dir=""
+  local operator_home=""
+  local allowlist=""
+  local helper=""
+
+  [[ -n "$agent" ]] || return 0
+
+  engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+  [[ "$engine" == "claude" ]] || return 0
+
+  # Default allowlist is exactly `claude-hud`; the roster knob (when set, even
+  # to empty) overrides it. Empty -> seeding disabled.
+  allowlist="${BRIDGE_SEED_PLUGIN_CONFIG_ALLOWLIST-claude-hud}"
+  [[ -n "${allowlist//[[:space:]]/}" ]] || return 0
+
+  config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+  [[ -n "$config_dir" ]] || return 0
+
+  operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+  [[ -n "$operator_home" ]] || return 0
+
+  # iso v2 path: the controller reads its own operator home and publishes each
+  # allowlisted plugin config into the iso agent home root-owned + group-read.
+  local _iso_user=""
+  if ! bridge_isolation_disabled_by_env 2>/dev/null \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    _iso_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    if [[ -n "$_iso_user" ]] && declare -F bridge_iso_run >/dev/null 2>&1; then
+      bridge_seed_operator_plugin_config_iso \
+        "$agent" "$operator_home" "$config_dir" "$allowlist"
+      return 0
+    fi
+  fi
+
+  # Shared/non-iso path: plain controller python3 copy through the helper, which
+  # owns the allowlist parse + seed-if-absent + never-overwrite contract.
+  helper="${BRIDGE_SCRIPT_DIR:-}/scripts/python-helpers/seed-operator-plugin-config.py"
+  [[ -f "$helper" ]] || return 0
+  python3 "$helper" "$operator_home" "$config_dir" "$allowlist" \
+    >/dev/null 2>&1 || return 0
+  return 0
+}
+
+# bridge_seed_operator_plugin_config_iso <agent> <operator_home> <config_dir> <allowlist>
+#
+# iso v2 publish path for #1753. The controller reads each allowlisted plugin's
+# config from its OWN operator home (the iso UID cannot read controller HOME)
+# and publishes it into the iso agent home via `bridge_iso_run --op
+# publish-root-file` (root:ab-agent-<a>, mode 0660 — group-readable by the iso
+# UID). Seed-if-absent: skips a plugin when the iso-side dst already exists
+# (probed via `--op stat`), so a diverged agent-local config is never
+# clobbered. Best-effort per plugin — one plugin's failure does not block the
+# rest, and the function never returns non-zero into create/start.
+#
+# Plugin ids are validated as a single safe path segment
+# (`^[A-Za-z0-9._-]+$`, `.`/`..` rejected) before being used as a path
+# component, mirroring the python helper's gate so iso and shared agree and an
+# allowlist token like `../../secret-root` cannot escape the plugin root.
+#
+# Race note (design note 2): the stat-then-publish below is re-checked
+# immediately before the publish to shrink the check-then-write window, but
+# `publish-root-file` does an `mv -f` (no exclusive-create primitive exists in
+# the iso facade). A residual window remains between the second stat and the
+# mv: if the iso agent writes its own config in that sub-millisecond gap, the
+# publish could still overwrite it. In practice the seed only runs at
+# create/start time when the agent process is not yet writing its own plugin
+# config, so the window is not reachable on the supported paths; a fully
+# atomic iso publish-if-absent op would be the belt-and-braces follow-up.
+bridge_seed_operator_plugin_config_iso() {
+  local agent="$1"
+  local operator_home="$2"
+  local config_dir="$3"
+  local allowlist="$4"
+  local plugin="" src="" dst="" dst_dir=""
+
+  # Split the allowlist (space/comma separated, optional `plugin:` prefix)
+  # WITHOUT a process-substitution / here-string input form (footgun #11 H3,
+  # which the lint-heredoc-ban CI gate rejects). Use the positional-param
+  # word-split idiom with IFS set locally and globbing disabled so a token
+  # containing a glob char cannot expand against the cwd. The function already
+  # captured $1..$4 into named locals, so reusing the positional params for the
+  # token list is safe.
+  local IFS_orig="$IFS"
+  local _noglob_was_set=0
+  [[ "$-" == *f* ]] && _noglob_was_set=1
+  set -f
+  IFS=$' \t\n,'
+  # shellcheck disable=SC2086  # intentional word-splitting on the allowlist
+  set -- $allowlist
+  IFS="$IFS_orig"
+  (( _noglob_was_set == 1 )) || set +f
+
+  for plugin in "$@"; do
+    plugin="${plugin#plugin:}"
+    [[ -n "$plugin" ]] || continue
+
+    # Path-segment safety (defense layer 1): reject anything that is not a safe
+    # single segment, and reject `.`/`..` exactly. Mirrors the python helper.
+    case "$plugin" in
+      .|..) continue ;;
+      *[!A-Za-z0-9._-]*) continue ;;
+    esac
+
+    src="$operator_home/.claude/plugins/$plugin/config.json"
+    dst="$config_dir/plugins/$plugin/config.json"
+    dst_dir="$config_dir/plugins/$plugin"
+
+    # Containment (defense layer 2): the dst must stay under <config_dir>/
+    # plugins/. With the segment pattern above this is already guaranteed, but
+    # assert it lexically so a future loosening of the pattern cannot silently
+    # reintroduce an escape.
+    case "$dst" in
+      "$config_dir/plugins/"*) : ;;
+      *) continue ;;
+    esac
+
+    # Controller reads its own operator home; skip when the operator has no
+    # config for this plugin.
+    [[ -f "$src" ]] || continue
+
+    # Seed-if-absent: only publish when the iso-side dst is definitively
+    # ABSENT. The stat op returns 0 when the file is present and 30 when it is
+    # absent; any other rc (e.g. 32 present-but-unreadable, or a probe error)
+    # is treated as "do not overwrite" so a diverged agent-local config is
+    # never clobbered.
+    local _stat_rc=0
+    bridge_iso_run --agent "$agent" --op stat --path "$dst" --test file \
+      >/dev/null 2>&1 || _stat_rc=$?
+    [[ "$_stat_rc" == "30" ]] || continue
+
+    # Ensure the per-plugin dir exists in the iso home.
+    bridge_iso_run --agent "$agent" --op mkdir-p --path "$dst_dir" \
+      >/dev/null 2>&1 || continue
+
+    # Re-stat immediately before the publish to shrink the check-then-write
+    # window (see the race note in the function header). Skip if the dst
+    # appeared since the first stat.
+    _stat_rc=0
+    bridge_iso_run --agent "$agent" --op stat --path "$dst" --test file \
+      >/dev/null 2>&1 || _stat_rc=$?
+    [[ "$_stat_rc" == "30" ]] || continue
+
+    # Publish the controller-read content root-owned + group-read for the iso
+    # UID.
+    bridge_iso_run --agent "$agent" --op publish-root-file --path "$dst" \
+      --mode 0660 --group-agent "$agent" <"$src" >/dev/null 2>&1 || continue
+  done
+  return 0
+}
+
 # bridge_agent_onboarding_markers_complete <agent> <dir>
 #
 # #1139 sub-B helper. Checks whether the canonical onboarding markers

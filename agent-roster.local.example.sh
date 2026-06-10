@@ -263,3 +263,19 @@ BRIDGE_AGENT_ACTION["developer:clear"]="/clear"
 #
 # export BRIDGE_CODEX_TASK_MODE_POLICY=block
 # export BRIDGE_CODEX_OUTPUT_SHAPE_ENFORCE=block
+
+# --- Operator plugin display-config seeding (#1753) ---------------------------
+# At Claude-agent scaffold / start time, the bridge seeds-if-absent the
+# operator's per-plugin display config into each fresh agent home:
+#   <operator-home>/.claude/plugins/<plugin>/config.json
+#     -> <agent-home>/.claude/plugins/<plugin>/config.json
+# so a new agent inherits the operator's HUD intent (e.g. claude-hud rows that
+# ship OFF by default) instead of rendering the abbreviated view. The copy is
+# seed-if-absent — it NEVER overwrites an agent that has its own config.
+#
+# Only plugins in this allowlist are seeded (a generic copy would risk carrying
+# secret-bearing plugin config across agent boundaries). Default is exactly
+# `claude-hud`. Extend with a space- or comma-separated plugin-id list, or set
+# it to empty to disable seeding entirely. Claude agents only (Codex skipped).
+#
+# export BRIDGE_SEED_PLUGIN_CONFIG_ALLOWLIST="claude-hud"
