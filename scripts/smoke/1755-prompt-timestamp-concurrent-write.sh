@@ -79,13 +79,13 @@ T1_DRIVER="$SMOKE_TMP_ROOT/t1_concurrent.py"
   printf '%s\n' 'import threading'
   printf '%s\n' 'from pathlib import Path'
   printf '%s\n' ''
-  printf '%s\n' 'hooks_dir = Path(os.environ["DRIVER_HOOKS_DIR"]).resolve()'
-  printf '%s\n' 'repo_root = Path(os.environ["DRIVER_REPO_ROOT"]).resolve()'
+  printf '%s\n' 'hooks_dir = Path(os.environ["DRIVER_HOOKS_DIR"]).resolve()' # noqa: iso-helper-boundary — os.environ in an emitted test driver substring-matches the ratchet \.env pattern; not a boundary site
+  printf '%s\n' 'repo_root = Path(os.environ["DRIVER_REPO_ROOT"]).resolve()' # noqa: iso-helper-boundary — os.environ in an emitted test driver substring-matches the ratchet \.env pattern; not a boundary site
   printf '%s\n' 'sys.path.insert(0, str(repo_root / "lib"))'
   printf '%s\n' 'sys.path.insert(0, str(hooks_dir))'
   printf '%s\n' 'import bridge_hook_common as bhc'
   printf '%s\n' ''
-  printf '%s\n' 'agent = os.environ["DRIVER_AGENT"]'
+  printf '%s\n' 'agent = os.environ["DRIVER_AGENT"]' # noqa: iso-helper-boundary — os.environ in an emitted test driver substring-matches the ratchet \.env pattern; not a boundary site
   printf '%s\n' 'nthreads = 8'
   printf '%s\n' 'iters = 50'
   printf '%s\n' 'errors = []'
@@ -151,13 +151,13 @@ T2_DRIVER="$SMOKE_TMP_ROOT/t2_controller_raise.py"
   printf '%s\n' 'import sys'
   printf '%s\n' 'from pathlib import Path'
   printf '%s\n' ''
-  printf '%s\n' 'hooks_dir = Path(os.environ["DRIVER_HOOKS_DIR"]).resolve()'
-  printf '%s\n' 'repo_root = Path(os.environ["DRIVER_REPO_ROOT"]).resolve()'
+  printf '%s\n' 'hooks_dir = Path(os.environ["DRIVER_HOOKS_DIR"]).resolve()' # noqa: iso-helper-boundary — os.environ in an emitted test driver substring-matches the ratchet \.env pattern; not a boundary site
+  printf '%s\n' 'repo_root = Path(os.environ["DRIVER_REPO_ROOT"]).resolve()' # noqa: iso-helper-boundary — os.environ in an emitted test driver substring-matches the ratchet \.env pattern; not a boundary site
   printf '%s\n' 'sys.path.insert(0, str(repo_root / "lib"))'
   printf '%s\n' 'sys.path.insert(0, str(hooks_dir))'
   printf '%s\n' 'import bridge_hook_common as bhc'
   printf '%s\n' ''
-  printf '%s\n' 'agent = os.environ["DRIVER_AGENT"]'
+  printf '%s\n' 'agent = os.environ["DRIVER_AGENT"]' # noqa: iso-helper-boundary — os.environ in an emitted test driver substring-matches the ratchet \.env pattern; not a boundary site
   printf '%s\n' 'state_path = bhc.timestamp_state_path(agent)'
   printf '%s\n' 'parent = state_path.parent'
   printf '%s\n' 'parent.mkdir(parents=True, exist_ok=True)'
