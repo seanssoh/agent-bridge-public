@@ -3131,6 +3131,13 @@ bridge_a2a_write_supervise_state() {
   # keys the breaker (a config edit changes it -> the breaker resets);
   # consec_transient is the per-key consecutive transient-failure count.
   local error_class="${10:-}" breaker_key="${11:-}" consec_transient="${12:-0}"
+  # #1680 r2: trailing-optional last_env_reprobe_ts — the epoch of the most
+  # recent bind-IP re-probe during an absent-tailnet-IP environmental hold. It
+  # gates the re-probe cadence (BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS): while
+  # the IP stays absent we re-run the (cheap) interface check at most once per
+  # that interval instead of every supervise tick. Callers that are NOT in the
+  # env hold pass 0 / omit it (the gate restamps when the hold is (re)entered).
+  local last_env_reprobe_ts="${13:-0}"
   {
     printf 'A2A_RECEIVER_RESTART_COUNT=%s\n' "$(printf '%q' "$restart_count")"
     printf 'A2A_RECEIVER_LAST_RESTART_TS=%s\n' "$(printf '%q' "$last_restart_ts")"
@@ -3143,6 +3150,7 @@ bridge_a2a_write_supervise_state() {
     printf 'A2A_RECEIVER_ERROR_CLASS=%s\n' "$(printf '%q' "$error_class")"
     printf 'A2A_RECEIVER_BREAKER_KEY=%s\n' "$(printf '%q' "$breaker_key")"
     printf 'A2A_RECEIVER_CONSEC_TRANSIENT=%s\n' "$(printf '%q' "$consec_transient")"
+    printf 'A2A_RECEIVER_LAST_ENV_REPROBE_TS=%s\n' "$(printf '%q' "$last_env_reprobe_ts")"
   } >"$state_file" 2>/dev/null || true
   chmod 0600 "$state_file" 2>/dev/null || true
 }
@@ -3264,6 +3272,228 @@ bridge_a2a_receiver_escalate() {
   printf '%s' "$new_ts"
 }
 
+# #1679/#1680 Part 3: STATEFUL environmental-incident note (NOT a crashloop
+# task). An environmental condition — the host cannot self-route to its own
+# tailnet IP (self_unreachable, #1679) or the configured bind IP has left the
+# interface (bind_ip_absent, #1680) — is a TAILNET/HOST condition, never a
+# receiver fault. The receiver is healthy (self_unreachable) or down only
+# because Tailscale is down (bind_ip_absent), and it will self-recover when the
+# environment does. So instead of the per-cycle crashloop flood (#1679: 51
+# tasks/2d; #1680: ~100 tasks/53h) we file AT MOST ONE low-noise admin note for
+# a SUSTAINED incident, clearly labeled as a host/tailnet condition, gated by
+# the SAME cooldown anchor as the crashloop escalation so a single multi-hour
+# outage is ONE tracked item that escalates after the cooldown, not N near-
+# identical tasks. The state file `receiver-env-incident.env` tracks the open
+# incident (kind + first-seen ts) so Part-3's auto-clear on recovery can close
+# it (bridge_a2a_receiver_env_incident_clear).
+#
+# Args:
+#   $1 kind          — self_unreachable | bind_ip_absent
+#   $2 admin         — BRIDGE_ADMIN_AGENT_ID ("" => no-op, echo old ts)
+#   $3 now
+#   $4 last_admin_ts — previous note ts (cooldown anchor; shared w/ escalate)
+#   $5 admin_cooldown
+#   $6 reason        — the supervisor reason word for the note body
+# Echoes the (possibly-updated) last_admin_task_ts on stdout.
+bridge_a2a_receiver_env_incident_note() {
+  local kind="$1" admin="$2" now="$3" last_admin_ts="$4" \
+    admin_cooldown="$5" reason="$6"
+  [[ "$now" =~ ^[0-9]+$ ]] || now=0
+  [[ "$last_admin_ts" =~ ^[0-9]+$ ]] || last_admin_ts=0
+  [[ "$admin_cooldown" =~ ^[0-9]+$ ]] || admin_cooldown=1800
+
+  # Record / refresh the OPEN incident marker (first-seen ts is preserved so a
+  # recovery can report the outage duration; the kind is the latest cause).
+  local incident_file="$BRIDGE_STATE_DIR/handoff/receiver-env-incident.env"  # noqa: iso-helper-boundary — daemon-owned supervisor incident state under controller $BRIDGE_STATE_DIR/handoff (mirrors receiver-supervise.env); not a channel dotenv / iso-boundary path
+  local first_seen="$now"
+  if [[ -f "$incident_file" ]]; then
+    local A2A_RECEIVER_ENV_INCIDENT_FIRST_TS=""
+    # shellcheck source=/dev/null
+    # shellcheck disable=SC1090
+    source "$incident_file" 2>/dev/null || true
+    if [[ "${A2A_RECEIVER_ENV_INCIDENT_FIRST_TS:-}" =~ ^[0-9]+$ ]]; then
+      first_seen="$A2A_RECEIVER_ENV_INCIDENT_FIRST_TS"
+    fi
+  fi
+  {
+    printf 'A2A_RECEIVER_ENV_INCIDENT_KIND=%s\n' "$(printf '%q' "$kind")"
+    printf 'A2A_RECEIVER_ENV_INCIDENT_FIRST_TS=%s\n' "$(printf '%q' "$first_seen")"
+    printf 'A2A_RECEIVER_ENV_INCIDENT_LAST_TS=%s\n' "$(printf '%q' "$now")"
+  } >"$incident_file" 2>/dev/null || true
+  chmod 0600 "$incident_file" 2>/dev/null || true
+
+  # No admin configured, or still inside the cooldown — echo the old ts and do
+  # NOT file (one note per cooldown for the WHOLE incident, not per tick).
+  if [[ -z "$admin" ]] || (( now - last_admin_ts < admin_cooldown )); then
+    printf '%s' "$last_admin_ts"
+    return 0
+  fi
+
+  local target_bridge=""
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  fi
+  if [[ -z "$target_bridge" ]]; then
+    printf '%s' "$last_admin_ts"
+    return 0
+  fi
+
+  local title body_intro
+  case "$kind" in
+    self_unreachable)
+      title="[A2A] receiver self-unreachable — host/tailnet condition (receiver healthy)"
+      body_intro="is RUNNING and HEALTHY, but THIS host intermittently cannot route to its OWN tailnet IP (a macOS Tailscale self-connect flap). The self-probe \`GET /healthz\` times out even though remote peers can reach the receiver. This is a HOST/TAILNET condition, NOT a receiver fault — the supervisor is HOLDING the healthy process (no restart, no crash-loop) and will clear this automatically when the host's self-route recovers."
+      ;;
+    bind_ip_absent)
+      title="[A2A] receiver down — tailnet IP absent (environmental, auto-recovers)"
+      body_intro="cannot bind because its configured tailnet IP has LEFT the interface (Tailscale down or its data plane wedged). This is an ENVIRONMENTAL condition, NOT a receiver fault — the supervisor is re-probing for the IP and will AUTO-REBIND the receiver when the tailnet returns. No manual restart is required."
+      ;;
+    *)
+      title="[A2A] receiver environmental condition"
+      body_intro="hit an environmental host/tailnet condition ($reason). The supervisor is holding/re-probing and will self-recover."
+      ;;
+  esac
+
+  local body_file
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-receiver-env.md.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-receiver-env.$$.$RANDOM")"
+  {
+    printf '# %s\n\n' "$title"
+    printf 'The A2A receiver daemon (bridge-handoffd.py) %s\n\n' "$body_intro"
+    printf '## State\n\n'
+    printf -- '- condition: `%s`\n' "$kind"
+    printf -- '- reason: `%s`\n' "$reason"
+    printf -- '- first observed: `%s` (epoch)\n' "$first_seen"
+    printf -- '- still open as of: `%s` (epoch)\n' "$now"
+    printf '\n## This is NOT a receiver crash-loop\n\n'
+    printf 'No restart budget was burned and no auto-restart was stopped. This is a\n'
+    printf 'single tracked incident (deduped for the whole outage), not one task per\n'
+    printf 'supervise cycle. It clears automatically when the host/tailnet recovers.\n\n'
+    printf '## If it persists\n\n'
+    printf '1. Check the tailnet: `tailscale status` (first line) — is CurAddr empty?\n'
+    printf '2. Confirm the bind IP is on an interface: `ifconfig | grep <tailnet-ip>`.\n'
+    printf '   (`tailscale ip -4` prints a CACHED IP even when stopped — do not trust it.)\n'
+    printf '3. Bring Tailscale back up; the supervisor auto-recovers — no manual\n'
+    printf '   `agb a2a daemon restart` needed.\n'
+  } >"$body_file"
+
+  local new_ts="$last_admin_ts"
+  if "$target_bridge" task create \
+       --to "$admin" --priority normal --from daemon \
+       --title "$title" \
+       --body-file "$body_file" --force >/dev/null 2>&1; then
+    new_ts="$now"
+  else
+    bridge_audit_log daemon a2a_receiver_env_incident_note_failed daemon \
+      --detail kind="$kind" \
+      --detail admin="$admin" >/dev/null 2>&1 || true
+    daemon_warn "[a2a_receiver_supervise] env-incident note create FAILED (kind=$kind); will retry after cooldown"
+  fi
+  rm -f "$body_file" 2>/dev/null || true
+  printf '%s' "$new_ts"
+}
+
+# #1679/#1680 Part 3: clear the OPEN environmental incident on recovery. When a
+# healthy probe (or a successful rebind) ends the environmental condition, close
+# the tracked incident: remove the marker, emit a recovery audit, and (if an
+# admin is configured + a note was filed) file ONE terse "receiver recovered"
+# note so the operator sees the incident close, not just silence. Idempotent: a
+# no-op when there is no open incident.
+bridge_a2a_receiver_env_incident_clear() {
+  local admin="$1" now="$2"
+  local incident_file="$BRIDGE_STATE_DIR/handoff/receiver-env-incident.env"  # noqa: iso-helper-boundary — daemon-owned supervisor incident state under controller $BRIDGE_STATE_DIR/handoff (mirrors receiver-supervise.env); not a channel dotenv / iso-boundary path
+  [[ -f "$incident_file" ]] || return 0
+
+  local A2A_RECEIVER_ENV_INCIDENT_KIND="" A2A_RECEIVER_ENV_INCIDENT_FIRST_TS=""
+  # shellcheck source=/dev/null
+  # shellcheck disable=SC1090
+  source "$incident_file" 2>/dev/null || true
+  local kind="${A2A_RECEIVER_ENV_INCIDENT_KIND:-environmental}"
+  local first_ts="${A2A_RECEIVER_ENV_INCIDENT_FIRST_TS:-0}"
+  [[ "$first_ts" =~ ^[0-9]+$ ]] || first_ts=0
+  [[ "$now" =~ ^[0-9]+$ ]] || now=0
+  rm -f "$incident_file" 2>/dev/null || true
+
+  bridge_audit_log daemon a2a_receiver_env_incident_cleared daemon \
+    --detail kind="$kind" \
+    --detail first_ts="$first_ts" \
+    --detail recovered_ts="$now" >/dev/null 2>&1 || true
+  daemon_log_event "[a2a_receiver_supervise] environmental incident cleared (kind=$kind); receiver recovered"
+
+  [[ -n "$admin" ]] || return 0
+  local target_bridge=""
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  fi
+  [[ -n "$target_bridge" ]] || return 0
+  local body_file
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-receiver-env-clear.md.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-receiver-env-clear.$$.$RANDOM")"
+  {
+    printf '# [A2A] receiver recovered — environmental condition cleared\n\n'
+    printf 'The A2A receiver daemon (bridge-handoffd.py) has RECOVERED from an\n'
+    printf 'environmental condition (`%s`). The host/tailnet is reachable again and\n' "$kind"
+    printf 'the receiver is healthy. No action needed.\n\n'
+    printf -- '- condition: `%s`\n' "$kind"
+    printf -- '- first observed: `%s` (epoch)\n' "$first_ts"
+    printf -- '- recovered: `%s` (epoch)\n' "$now"
+  } >"$body_file"
+  "$target_bridge" task create \
+    --to "$admin" --priority normal --from daemon \
+    --title "[A2A] receiver recovered — environmental condition cleared" \
+    --body-file "$body_file" --force >/dev/null 2>&1 || true
+  rm -f "$body_file" 2>/dev/null || true
+  return 0
+}
+
+# --- A2A supervisor discriminator wrappers (#1679 r3) ----------------------
+# The supervisor tick invokes the three read-only liveness/self-route/bind-IP
+# discriminators ONLY through these single-purpose wrappers. Each wrapper runs
+# the REAL `bridge-handoffd.py` subcommand against the production bind/auth
+# contract: it scrubs the smoke-only insecure-bind escape hatches
+# (BRIDGE_A2A_ALLOW_TEST_BIND / BRIDGE_A2A_DEV_INSECURE_BIND — #1414) from the
+# child env so an auto-restart can never inherit a loopback/insecure bind, and
+# passes NO forced-verdict arg and reads NO forced-verdict env var of any name
+# (the inherited-env bypass closed in #1679 r3).
+#
+# These wrappers are the smoke's NON-INHERITABLE test seam: the hermetic smoke
+# sources bridge-daemon.sh and REDEFINES the relevant wrapper in its own shell
+# to echo a deterministic discriminator word, then calls
+# process_a2a_receiver_supervise_tick in-process. A function redefinition lives
+# only in the process that defined it — it cannot ride an env var or a CLI arg
+# across the fork+exec a real daemon performs, so production can never reach it.
+# stdout is the discriminator word(s); the caller greps for the reason token.
+# Args: $1 = config path, $2 = healthz/self-reach timeout (ignored by bind-ip).
+# The subprocess timeout is wrapped INSIDE each function (not by the caller) so
+# the wrapper is a single overridable unit: redefining it in the smoke replaces
+# the entire timeout+probe, and `timeout(1)` is never asked to exec a shell
+# function (which it cannot).
+_a2a_supervise_run_healthz() {
+  local _config="$1" _timeout="$2"
+  bridge_with_timeout 10 a2a_receiver_healthz \
+    env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
+      python3 "$SCRIPT_DIR/bridge-handoffd.py" healthz \
+        --config "$_config" --timeout "$_timeout" 2>/dev/null
+}
+
+_a2a_supervise_run_self_reach() {
+  local _config="$1" _timeout="$2"
+  bridge_with_timeout 10 a2a_receiver_self_reach \
+    env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
+      python3 "$SCRIPT_DIR/bridge-handoffd.py" self-reach \
+        --config "$_config" --timeout "$_timeout" 2>/dev/null
+}
+
+_a2a_supervise_run_bind_ip_present() {
+  local _config="$1"
+  bridge_with_timeout 10 a2a_receiver_bind_ip_present \
+    env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
+      python3 "$SCRIPT_DIR/bridge-handoffd.py" bind-ip-present \
+        --config "$_config" 2>/dev/null
+}
+
 process_a2a_receiver_supervise_tick() {
   local interval_str="${BRIDGE_A2A_RECEIVER_SUPERVISE_INTERVAL_SECONDS:-30}"
   local interval
@@ -3291,6 +3521,34 @@ process_a2a_receiver_supervise_tick() {
   [[ "$restart_window" =~ ^[0-9]+$ ]] || restart_window=600
   [[ "$admin_cooldown" =~ ^[0-9]+$ ]] || admin_cooldown=1800
   [[ "$healthz_timeout" =~ ^[0-9.]+$ ]] || healthz_timeout=3
+
+  # --- discriminator seam (#1679 r3) ---------------------------------------
+  # SECURITY: the production supervisor reads NO forced-verdict env var of ANY
+  # name and passes NO forced-verdict CLI arg, EVER. The earlier forward-hook
+  # design (r2) read CLEARLY-NAMED env vars and forwarded them to the probe
+  # subcommand as a forced-verdict arg — but an env-driven forward hook has the
+  # SAME inheritance semantics as the original bug: a real daemon launched with
+  # those vars in its environment would still force the supervisor's
+  # liveness/self-reach classification without a real probe (the daemon-critical
+  # inherited-env bypass). Renaming the env var did not close it.
+  #
+  # The discriminator subprocess invocations now live in three single-purpose
+  # wrapper functions — `_a2a_supervise_run_healthz`,
+  # `_a2a_supervise_run_self_reach`, `_a2a_supervise_run_bind_ip_present`
+  # (defined below this function). The supervisor tick calls ONLY those
+  # wrappers, which always run the REAL read-only discriminator subcommand
+  # against the production bind/auth contract. There is NO env or arg path to
+  # force a verdict in production.
+  #
+  # The hermetic smoke (which CANNOT portably reproduce the macOS self-route
+  # flap / SYN-blackhole) drives a deterministic verdict by SOURCING
+  # bridge-daemon.sh into its own shell and REDEFINING the relevant wrapper
+  # function to echo the desired discriminator word, then calling
+  # process_a2a_receiver_supervise_tick IN-PROCESS. A real daemon never sources
+  # the smoke, so this seam is STRUCTURALLY non-inheritable: a function
+  # redefinition exists only in the process that defined it and cannot ride an
+  # environment variable or a CLI argument across a fork+exec. See
+  # scripts/smoke/1679-1680-a2a-receiver-supervisor-robustness.sh.
 
   local handoff_dir="$BRIDGE_STATE_DIR/handoff"
   mkdir -p "$handoff_dir" 2>/dev/null || true
@@ -3322,10 +3580,10 @@ process_a2a_receiver_supervise_tick() {
     A2A_RECEIVER_LAST_REASON="" A2A_RECEIVER_LAST_EXIT_EVENT="" \
     A2A_RECEIVER_LAST_EXIT_DETAIL="" A2A_RECEIVER_LAST_ADMIN_TASK_TS="" \
     A2A_RECEIVER_ERROR_CLASS="" A2A_RECEIVER_BREAKER_KEY="" \
-    A2A_RECEIVER_CONSEC_TRANSIENT=""
+    A2A_RECEIVER_CONSEC_TRANSIENT="" A2A_RECEIVER_LAST_ENV_REPROBE_TS=""
   if [[ -f "$state_file" ]]; then
     daemon_source_state_file "$state_file" "a2a-receiver-supervise" 0 "" \
-      "A2A_RECEIVER_RESTART_COUNT A2A_RECEIVER_LAST_RESTART_TS A2A_RECEIVER_CONSEC_UNHEALTHY A2A_RECEIVER_ALARM A2A_RECEIVER_LAST_REASON A2A_RECEIVER_LAST_EXIT_EVENT A2A_RECEIVER_LAST_EXIT_DETAIL A2A_RECEIVER_LAST_ADMIN_TASK_TS A2A_RECEIVER_ERROR_CLASS A2A_RECEIVER_BREAKER_KEY A2A_RECEIVER_CONSEC_TRANSIENT" \
+      "A2A_RECEIVER_RESTART_COUNT A2A_RECEIVER_LAST_RESTART_TS A2A_RECEIVER_CONSEC_UNHEALTHY A2A_RECEIVER_ALARM A2A_RECEIVER_LAST_REASON A2A_RECEIVER_LAST_EXIT_EVENT A2A_RECEIVER_LAST_EXIT_DETAIL A2A_RECEIVER_LAST_ADMIN_TASK_TS A2A_RECEIVER_ERROR_CLASS A2A_RECEIVER_BREAKER_KEY A2A_RECEIVER_CONSEC_TRANSIENT A2A_RECEIVER_LAST_ENV_REPROBE_TS" \
       || true
   fi
   local restart_count="${A2A_RECEIVER_RESTART_COUNT:-0}"
@@ -3340,11 +3598,14 @@ process_a2a_receiver_supervise_tick() {
   local prev_error_class="${A2A_RECEIVER_ERROR_CLASS:-}"
   local breaker_key="${A2A_RECEIVER_BREAKER_KEY:-}"
   local consec_transient="${A2A_RECEIVER_CONSEC_TRANSIENT:-0}"
+  # #1680 r2: epoch of the last bind-IP re-probe during an absent-IP env hold.
+  local last_env_reprobe_ts="${A2A_RECEIVER_LAST_ENV_REPROBE_TS:-0}"
   [[ "$restart_count" =~ ^[0-9]+$ ]] || restart_count=0
   [[ "$last_restart_ts" =~ ^[0-9]+$ ]] || last_restart_ts=0
   [[ "$consec_unhealthy" =~ ^[0-9]+$ ]] || consec_unhealthy=0
   [[ "$last_admin_task_ts" =~ ^[0-9]+$ ]] || last_admin_task_ts=0
   [[ "$consec_transient" =~ ^[0-9]+$ ]] || consec_transient=0
+  [[ "$last_env_reprobe_ts" =~ ^[0-9]+$ ]] || last_env_reprobe_ts=0
 
   # Restart-window reset: if the last restart is older than the window, the
   # counter (and any alarm) is stale — a fresh window starts clean. A healthy
@@ -3384,18 +3645,20 @@ process_a2a_receiver_supervise_tick() {
     reason="process_gone"
   else
     # --- stage 2: serve probe (only when the process gate passed) ---
-    # SECURITY (#1414 codex r1): scrub the smoke-only insecure-bind escape
-    # hatches from EVERY supervisor-owned subprocess. If the daemon itself was
-    # launched with BRIDGE_A2A_ALLOW_TEST_BIND / BRIDGE_A2A_DEV_INSECURE_BIND in
-    # its env (e.g. a test harness), a plain child would inherit them — letting
-    # an auto-restart bring the receiver up on a loopback bind or with the
-    # peer-secret gate bypassed. The supervisor must never propagate them; the
+    # SECURITY (#1414 codex r1 / #1679 r3): the `_a2a_supervise_run_healthz`
+    # wrapper scrubs the smoke-only insecure-bind escape hatches
+    # (BRIDGE_A2A_ALLOW_TEST_BIND / BRIDGE_A2A_DEV_INSECURE_BIND) from the probe
+    # subprocess. If the daemon itself was launched with those vars in its env
+    # (e.g. a test harness), a plain child would inherit them — letting an
+    # auto-restart bring the receiver up on a loopback bind or with the
+    # peer-secret gate bypassed. The wrapper must never propagate them; the
     # production bind/auth contract is non-negotiable for a daemon-driven action.
+    # The wrapper passes NO forced-verdict arg and reads NO forced-verdict env
+    # var of any name — the inherited-env bypass is closed (#1679 r3). The smoke
+    # forces a deterministic verdict ONLY by redefining this wrapper in-process
+    # (a non-inheritable seam), never via the daemon's environment.
     local probe_out probe_rc=0
-    probe_out="$(bridge_with_timeout 10 a2a_receiver_healthz \
-      env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
-      python3 "$SCRIPT_DIR/bridge-handoffd.py" healthz \
-        --config "$config" --timeout "$healthz_timeout" 2>/dev/null)" || probe_rc=$?
+    probe_out="$(_a2a_supervise_run_healthz "$config" "$healthz_timeout")" || probe_rc=$?
     # The reason word is the LAST stdout line (healthy / healthz_timeout /
     # healthz_status:<code> / bind_unresolved / healthz_badbody).
     healthz_reason="$(printf '%s\n' "$probe_out" | grep -E '^(healthy|healthz_timeout|healthz_status:|healthz_badbody|bind_unresolved)' | tail -1)"
@@ -3419,6 +3682,10 @@ process_a2a_receiver_supervise_tick() {
       last_reason="healthy"
       consec_transient=0
       prev_error_class=""
+      # #1679/#1680 Part 3: a healthy probe ENDS any open environmental
+      # incident (self-route flap / tailnet-IP absence) — close + auto-clear it
+      # so the operator sees the incident resolve, not lingering state.
+      bridge_a2a_receiver_env_incident_clear "${BRIDGE_ADMIN_AGENT_ID:-}" "$now"
       bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
         "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
         "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
@@ -3438,6 +3705,71 @@ process_a2a_receiver_supervise_tick() {
     fi
     dead=1
     reason="${healthz_reason:-healthz_timeout}"
+
+    # --- #1679: self-reachability discriminator (BEFORE declaring death) ---
+    # A `healthz_timeout` is ambiguous on macOS: the receiver's listen socket
+    # can be perfectly healthy and reachable by REMOTE peers, while THIS host's
+    # route to its OWN tailnet IP intermittently drops (the macOS Tailscale
+    # self-connect flap). In that flap the self-probe `GET /healthz` times out
+    # even though nothing is wrong with the receiver. Restarting is futile (the
+    # replacement cannot be self-probed either) and the no-op "restart" just
+    # increments restart_count -> false crash-loop -> admin-task flood (#1679).
+    #
+    # So before we treat a healthz_timeout as a death, ask whether THIS host can
+    # even route a raw TCP SYN to the receiver's own (bind, port):
+    #   self_reachable   -> the host reaches its IP (handshake / RST). A
+    #                       healthz_timeout then IS a genuinely wedged serve
+    #                       loop -> fall through to death (#1405 restart path).
+    #   self_unreachable -> the host CANNOT self-route. HOLD the running
+    #                       process (the stage-1 process gate already proved it
+    #                       is alive), do NOT count a death, do NOT restart, do
+    #                       NOT burn the restart budget, do NOT file a crashloop
+    #                       task. Record the environmental incident only.
+    #   self_probe_error -> FAIL-SAFE: inconclusive probe -> keep the current
+    #                       behavior (fall through to death detection); we never
+    #                       suppress a genuine death on an ambiguous probe.
+    # The probe is an OUTBOUND connect to the already-bind-proven address — it
+    # adds NO listen socket and does NOT touch the fail-closed bind contract.
+    if [[ "$reason" == "healthz_timeout" ]]; then
+      local self_out self_rc=0 self_word=""
+      # SECURITY (#1679 r3): the `_a2a_supervise_run_self_reach` wrapper applies
+      # the same insecure-bind env scrub as the healthz probe and passes NO
+      # forced-verdict arg / reads NO forced-verdict env var (inherited-env
+      # bypass closed). The smoke forces a verdict ONLY by redefining the wrapper
+      # in-process — a non-inheritable seam.
+      self_out="$(_a2a_supervise_run_self_reach "$config" "$healthz_timeout")" || self_rc=$?
+      self_word="$(printf '%s\n' "$self_out" | grep -E '^(self_reachable|self_unreachable|self_probe_error)' | tail -1)"
+      if [[ "$self_word" == "self_unreachable" ]]; then
+        # Environmental host self-route flap — HOLD the healthy receiver.
+        # #1679: reason `healthz_unreachable_self` is NOT a death; we keep the
+        # running pid, reset the consec-unhealthy tolerance (so a recovered
+        # self-route does not instantly re-trip), and DO NOT touch
+        # restart_count / the circuit breaker. Part 3 files at most ONE
+        # stateful low-noise incident note (env-condition labeled), never a
+        # crashloop task, and auto-clears it on recovery.
+        # shellcheck disable=SC2031  # function-local reads (see the healthy
+        # branch's note); the escalate command-sub runs in a subshell.
+        consec_unhealthy=0
+        reason="healthz_unreachable_self"
+        last_reason="$reason"
+        daemon_warn "[a2a_receiver_supervise] healthz timed out but THIS host cannot self-route to its own bind (pid ${last_pid:-?}); HOLDING — environmental self-route flap (#1679), NOT a receiver fault. No restart, no crashloop task."
+        bridge_audit_log daemon a2a_receiver_self_unreachable daemon \
+          --detail last_pid="${last_pid:-}" \
+          --detail reason="$reason" >/dev/null 2>&1 || true
+        last_admin_task_ts="$(bridge_a2a_receiver_env_incident_note \
+          self_unreachable "${BRIDGE_ADMIN_AGENT_ID:-}" "$now" \
+          "$last_admin_task_ts" "$admin_cooldown" "$reason")"
+        [[ "$last_admin_task_ts" =~ ^[0-9]+$ ]] || last_admin_task_ts=0
+        bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+          "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+          "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+          "$prev_error_class" "$breaker_key" "$consec_transient"
+        return 0
+      fi
+      # self_reachable OR self_probe_error (fail-safe) -> fall through: the
+      # healthz_timeout is treated as a genuine wedge (the #1405 case).
+      daemon_log_event "[a2a_receiver_supervise] healthz timeout + self-reach=${self_word:-unknown} (rc=$self_rc) -> genuine wedge path (restart)"
+    fi
   fi
 
   # --- confirmed dead: capture exit-cause, then decide restart vs hold ---
@@ -3510,6 +3842,131 @@ process_a2a_receiver_supervise_tick() {
   fi
 
   local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+
+  # --- #1680: environmental tailnet-IP-absent gate (BEFORE the breaker) ---
+  # A `bind_fail` (Errno 49 / EADDRNOTAVAIL on the configured bind IP) caused by
+  # the tailnet IP LEAVING the interface (Tailscale down / data plane wedged) is
+  # an ENVIRONMENTAL state, not a receiver fault: the IP WILL return when
+  # Tailscale does, and the receiver should rebind THEN. The pre-#1680 path
+  # routed this through the #1563 transient circuit breaker, which after 5
+  # consecutive transient failures OPENS the breaker and PERMANENTLY stops
+  # auto-restart (no re-probe for the IP to reappear) — so a long tailnet outage
+  # left the receiver dark until a manual `agb a2a daemon reconcile && restart`,
+  # and each crash cycle filed an admin task (~100 over a 53h outage).
+  #
+  # The fix: when the death is a bind-availability failure AND the configured
+  # bind IP is confirmed ABSENT from every local interface, treat it as a
+  # retryable ENVIRONMENTAL state:
+  #   - do NOT burn the hard restart budget / circuit-breaker counter (no
+  #     consec_transient++ toward `open`, no restart_count++),
+  #   - enter a SLOW re-probe loop (the supervise tick re-runs on its cadence;
+  #     a configurable env-reprobe interval gates how often we re-check so we
+  #     never spin tight),
+  #   - file at most ONE stateful env-incident note (Part 3), auto-cleared on
+  #     recovery,
+  #   - AUTO-REBIND (a normal restart attempt) as soon as the IP returns.
+  # FAIL-SAFE: the bind-IP presence probe is bounded + best-effort; on
+  # `bind_ip_unknown` (cannot resolve/enumerate) we DO NOT enter the
+  # environmental hold — we fall through to the existing #1563 breaker so a real
+  # structural failure is never masked.
+  # The #1680 signal is specifically a `bind_fail` EXIT EVENT — the receiver got
+  # PAST resolve_bind (the fail-closed proof PASSED, e.g. `tailscale ip` still
+  # reports the cached IP even after Tailscale stopped, per the issue) and then
+  # the OS SOCKET bind raised EADDRNOTAVAIL because the IP had LEFT the
+  # interface. That is the precise tailnet-IP-loss signature.
+  #
+  # We deliberately do NOT gate on the broad `transient` error_class here: a
+  # tailnet-shaped address that was NEVER a real local interface fails at
+  # resolve_bind (phase=bind `startup_fail` — a persistently-unprovable bind /
+  # misconfiguration), which is ALSO classed `transient` but is NOT the #1680
+  # IP-left-the-interface case and must keep flowing through the #1563
+  # backoff/circuit breaker. The `bind_fail` exit event is what distinguishes
+  # "the IP was here and vanished" from "the IP was never bindable".
+  local is_bind_avail_failure=0
+  if [[ "$exit_event" == "bind_fail" ]]; then
+    is_bind_avail_failure=1
+  fi
+  if (( is_bind_avail_failure == 1 )); then
+    # Re-probe cadence gate (#1680 r2): BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS
+    # genuinely throttles how often we re-run the (cheap) bind-IP interface check
+    # during a SUSTAINED absent-tailnet-IP outage. Once we are already in the
+    # environmental hold (alarm=env_bind_ip_absent), we do NOT re-probe on EVERY
+    # supervise tick — we re-check at most once per env-reprobe interval, holding
+    # in between without spending the subprocess. This is the actual wiring of the
+    # knob the comment promised: prior to this it was logged/audited only and the
+    # probe ran every tick regardless of the interval.
+    local env_reprobe="${BRIDGE_A2A_RECEIVER_ENV_REPROBE_SECONDS:-45}"
+    [[ "$env_reprobe" =~ ^[0-9]+$ ]] || env_reprobe=45
+    if [[ "$alarm" == "env_bind_ip_absent" ]] \
+        && (( now - last_env_reprobe_ts < env_reprobe )); then
+      # Still inside the interval AND already holding an absent IP — keep the hold
+      # WITHOUT re-running the probe. Counters stay reset (the env hold owns them);
+      # persist unchanged state (including last_env_reprobe_ts) and return.
+      reason="bind_ip_absent"
+      last_reason="$reason"
+      daemon_log_event "[a2a_receiver_supervise] absent tailnet IP — within re-probe interval (${env_reprobe}s); holding without re-probing this tick"
+      bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+        "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+        "$prev_error_class" "$breaker_key" "$consec_transient" \
+        "$last_env_reprobe_ts"
+      return 0
+    fi
+    local bip_out bip_rc=0 bip_word=""
+    # SECURITY (#1414 / #1679 r3): the `_a2a_supervise_run_bind_ip_present`
+    # wrapper scrubs the insecure-bind hatches from this discriminator subprocess
+    # too (uniform with the healthz / self-reach probes) and passes no
+    # forced-verdict arg / reads no verdict env var. bind-ip presence is driven
+    # in the smoke via BRIDGE_A2A_IFACE_ADDRS (the interface-enumeration override
+    # honored by the real subcommand), not by overriding this wrapper.
+    bip_out="$(_a2a_supervise_run_bind_ip_present "$config")" || bip_rc=$?
+    bip_word="$(printf '%s\n' "$bip_out" | grep -E '^(bind_ip_present|bind_ip_absent|bind_ip_unknown)' | tail -1)"
+    if [[ "$bip_word" == "bind_ip_absent" ]]; then
+      # Environmental: the tailnet IP is gone. Stamp the re-probe clock so the
+      # cadence gate above holds (without re-probing) for the next env_reprobe
+      # seconds before the next interface re-check.
+      last_env_reprobe_ts="$now"
+      alarm="env_bind_ip_absent"
+      reason="bind_ip_absent"
+      last_reason="$reason"
+      # NOTE: we deliberately do NOT increment consec_transient or restart_count
+      # here — an absent tailnet IP must never burn the budget that permanently
+      # stops supervision. We also RESET both counters: once we positively
+      # confirm the IP is environmentally absent, any restart attempts already
+      # made this outage were misattributed (the receiver could never have
+      # bound), so the budget/breaker must start clean — otherwise a stale count
+      # accrued before the discriminator engaged could later trip the crashloop
+      # cap when the condition flaps. The reset is safe: a genuine process death
+      # is independently caught by the stage-1 process gate every tick.
+      restart_count=0
+      consec_transient=0
+      daemon_warn "[a2a_receiver_supervise] bind failure with tailnet IP ABSENT from all interfaces — ENVIRONMENTAL (#1680); re-probing (every ${env_reprobe}s), NOT counting against the restart budget. Will auto-rebind when the IP returns."
+      bridge_audit_log daemon a2a_receiver_bind_ip_absent daemon \
+        --detail reason="$reason" \
+        --detail exit_event="$exit_event" \
+        --detail env_reprobe_seconds="$env_reprobe" >/dev/null 2>&1 || true
+      last_admin_task_ts="$(bridge_a2a_receiver_env_incident_note \
+        bind_ip_absent "$admin" "$now" "$last_admin_task_ts" \
+        "$admin_cooldown" "$reason")"
+      [[ "$last_admin_task_ts" =~ ^[0-9]+$ ]] || last_admin_task_ts=0
+      bridge_a2a_write_supervise_state "$state_file" "$restart_count" \
+        "$last_restart_ts" "$consec_unhealthy" "$alarm" "$last_reason" \
+        "$last_exit_event" "$last_exit_detail" "$last_admin_task_ts" \
+        "$prev_error_class" "$breaker_key" "$consec_transient" \
+        "$last_env_reprobe_ts"
+      return 0
+    fi
+    if [[ "$bip_word" == "bind_ip_present" ]]; then
+      # The IP is back on the interface — this is the AUTO-REBIND moment. Close
+      # any open environmental incident and let the normal restart path below
+      # bring the receiver up against the now-present IP. (We do NOT short
+      # circuit the #1563 breaker decision; a present IP that still fails to
+      # bind is a genuine transient/structural problem the breaker should see.)
+      bridge_a2a_receiver_env_incident_clear "$admin" "$now"
+      daemon_warn "[a2a_receiver_supervise] bind IP returned to an interface — auto-rebind (#1680): proceeding to restart the receiver"
+    fi
+    # bind_ip_unknown -> fall through (FAIL-SAFE: existing breaker handles it).
+  fi
 
   # --- #1563 PR-4: bounded backoff + circuit breaker (transient/auth_config) ---
   # Decide BEFORE the restart whether this (config-fingerprint, error_class)
@@ -12065,6 +12522,41 @@ bridge_queue_gateway_socket_connect_probe() {
     "$socket_path" >/dev/null 2>&1
 }
 
+bridge_queue_gateway_socket_probe_persistently_dead() {
+  # Issue #1652 (Bug 1): require N *consecutive* connect-probe failures
+  # before treating an alive-pid's bound socket as dead. The listener's
+  # accept() runs on a 1.0s timeout (cmd_socket_server), and the probe's
+  # own connect() has a 1.0s timeout, so a single probe landing in the
+  # wrong window can transiently refuse/timeout even though the listener
+  # is healthy and still bound. The previous clean_stale rm'd the LIVE
+  # socket on that single transient miss, which crash-looped the listener.
+  #
+  # A genuinely-dead socket (recycled pid + leftover file, or an unbound
+  # socket file) refuses every probe, so it still fails all N attempts and
+  # gets cleaned. A healthy-but-flapping listener answers at least one of
+  # the N probes, so we return 1 (not dead) and keep its socket.
+  #
+  # Returns 0 only when ALL attempts failed (persistently dead); 1 if any
+  # attempt succeeded (a live listener answered).
+  local socket_path="$1"
+  local attempts="${BRIDGE_QUEUE_GATEWAY_SOCKET_PROBE_ATTEMPTS:-3}"
+  local gap="${BRIDGE_QUEUE_GATEWAY_SOCKET_PROBE_GAP_SECONDS:-0.2}"
+  local i
+  [[ -n "$socket_path" ]] || return 0
+  [[ "$attempts" =~ ^[0-9]+$ ]] && (( attempts > 0 )) || attempts=3
+  for ((i = 0; i < attempts; i++)); do
+    if bridge_queue_gateway_socket_connect_probe "$socket_path"; then
+      # A live listener answered — not dead. Stop probing.
+      return 1
+    fi
+    # Don't sleep after the final attempt.
+    if (( i < attempts - 1 )); then
+      sleep "$gap" 2>/dev/null || true
+    fi
+  done
+  return 0
+}
+
 bridge_queue_gateway_socket_is_running() {
   # PR #571 r3 finding 4: defense-in-depth liveness check.
   #   1. pid file present and parseable.
@@ -12118,12 +12610,19 @@ bridge_queue_gateway_socket_clean_stale() {
         rm -f "$socket_path"
       fi
     elif [[ -n "$socket_path" && -S "$socket_path" ]] \
-        && ! bridge_queue_gateway_socket_connect_probe "$socket_path"; then
-      # pid is alive but connect refuses → recorded pid is not the
-      # process actually bound to this socket (recycled pid, or a
-      # listener that exited without unlinking). Drop both artifacts so
-      # the next start spawns fresh and the next stop does not signal
-      # an unrelated process.
+        && bridge_queue_gateway_socket_probe_persistently_dead "$socket_path"; then
+      # pid is alive but the connect probe refuses on EVERY one of N
+      # consecutive attempts → recorded pid is not the process actually
+      # bound to this socket (recycled pid, or a listener that exited
+      # without unlinking). Drop both artifacts so the next start spawns
+      # fresh and the next stop does not signal an unrelated process.
+      #
+      # Issue #1652 (Bug 1): the consecutive-failure gate is required.
+      # A single transient probe miss against a HEALTHY listener (its
+      # accept() flaps on a 1.0s timeout) must NOT delete the live
+      # socket — doing so crash-looped the listener (~every 50-90s) on
+      # iso/socket installs. A genuinely-dead socket still fails all N
+      # probes and is cleaned; a live listener answers at least one.
       rm -f "$pid_file"
       rm -f "$socket_path"
     fi
@@ -13977,6 +14476,16 @@ daemon_args_have_help() {
   return 1
 }
 
+# Run the top-level verb dispatch ONLY when this file is executed directly.
+# When SOURCED (the #1679 r3 non-inheritable test seam — see
+# scripts/smoke/1679-1680-a2a-receiver-supervisor-robustness.sh), the smoke
+# loads the daemon's functions into its OWN shell, redefines a discriminator
+# wrapper to force a deterministic verdict, and calls
+# process_a2a_receiver_supervise_tick in-process — without driving the full
+# verb dispatch (which would `exit` on the empty/sourced CMD and abort the
+# smoke). A real daemon never sources this file, so the override seam is
+# structurally out of reach in production.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 case "$CMD" in
   -h|--help|help)
     usage
@@ -14055,3 +14564,4 @@ case "$CMD" in
     exit 1
     ;;
 esac
+fi

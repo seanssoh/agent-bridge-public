@@ -445,6 +445,75 @@ def handoff_dir() -> Path:
     return state_dir() / "handoff"
 
 
+def _path_is_within(child: Path, parent: Path) -> bool:
+    """True iff `child` resolves to `parent` or a descendant of it.
+
+    Pure lexical containment on the *resolved* (symlink-collapsed, absolute)
+    forms — no filesystem write, safe to call before any dir exists. Parallels
+    the A2A-common helper of the same name (this module duplicates
+    `bridge_home`/`state_dir`/`handoff_dir` rather than import-coupling to the
+    lower layer at module load).
+    """
+    try:
+        child_r = child.resolve()
+        parent_r = parent.resolve()
+    except (OSError, RuntimeError):
+        # resolve() can raise on a symlink loop; treat "cannot prove within" as
+        # NOT within so the guard fails closed rather than silently allowing.
+        return False
+    if child_r == parent_r:
+        return True
+    return parent_r in child_r.parents
+
+
+def guard_test_bind_state_path() -> None:
+    """Fail closed when a test-bind mesh would write into a live state tree.
+
+    The rooms-side mirror of `bridge_a2a_common.guard_test_bind_state_path`
+    (issue #1728). `BRIDGE_A2A_ALLOW_TEST_BIND=1` is TEST-ONLY — production
+    never sets it — so this guard cannot affect a production install. When the
+    flag is set AND the resolved rooms/handoff state dir is NOT under the
+    active `BRIDGE_HOME` (a `BRIDGE_STATE_DIR` override pointing at the live
+    state tree), refuse with a clear message so a throwaway test mesh cannot
+    silently clobber the live rooms.db / reconcile.db.
+
+    NOTE (#1728 r2): the state-dir check alone misses the explicit
+    `BRIDGE_A2A_ROOMS_DB` override, which bypasses `state_dir()` entirely. The
+    db-path containment is enforced at the `_connect()` choke point via
+    `guard_test_bind_db_path()` — this entry stays for callers that guard on the
+    state dir directly.
+    """
+    guard_test_bind_db_path(state_dir(), what="rooms state dir")
+
+
+def guard_test_bind_db_path(path: Path, *, what: str = "rooms db path") -> None:
+    """Fail closed when a test-bind mesh would write `path` into a live tree.
+
+    The db-path-aware core of the #1728 rooms guard, mirroring
+    `bridge_a2a_common.guard_test_bind_db_path`. `_connect()` calls it with the
+    FINAL resolved rooms.db path — which includes any explicit
+    `BRIDGE_A2A_ROOMS_DB` override that bypasses `state_dir()`. Under the
+    test-bind flag, ANY resolved write path outside the active `BRIDGE_HOME`
+    fails closed. No-op when the flag is unset (prod) or the path is under home
+    (a correctly isolated mesh, including an override pointed UNDER the test
+    home).
+    """
+    if os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") != "1":  # noqa: iso-helper-boundary - env var, not a .env file
+        return
+    home = bridge_home()
+    if _path_is_within(path, home):
+        return
+    raise RoomsError(
+        f"BRIDGE_A2A_ALLOW_TEST_BIND=1 (test mode) but the {what} "
+        f"{str(path)!r} is outside BRIDGE_HOME {str(home)!r} — a "
+        "test mesh would clobber the live rooms.db / reconcile.db. Set "
+        "BRIDGE_STATE_DIR (and, if overridden, BRIDGE_A2A_ROOMS_DB / "
+        "BRIDGE_A2A_RECONCILE_DB) under your test BRIDGE_HOME so test state "
+        "cannot reach the live state tree.",
+        code="test_bind_state_outside_home",
+    )
+
+
 def rooms_db_path() -> Path:
     override = os.environ.get("BRIDGE_A2A_ROOMS_DB")
     if override:
@@ -710,6 +779,12 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
 
 
 def _connect(path: Path, schema: str) -> sqlite3.Connection:
+    # #1728 r2: guard the ACTUAL resolved db path (which may be a
+    # BRIDGE_A2A_ROOMS_DB override that bypasses state_dir()) — fail closed
+    # before creating/opening it if a test-bind mesh would land it on a live
+    # tree outside its BRIDGE_HOME. No-op when the flag is unset (prod) or the
+    # path is under home (correctly isolated mesh).
+    guard_test_bind_db_path(path, what="rooms db path")
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30.0)
     conn.row_factory = sqlite3.Row

@@ -1108,10 +1108,15 @@ def _run_reconcile_steps(server: "HandoffServer", result: "ReconcileResult",
         reconcile.record_attempt(conn, reconcile.STEP_BIND_REPROVE, bind_status)
         result.steps[reconcile.STEP_BIND_REPROVE] = bind_status
 
-        # 3. tunnel-health (stub #1706).
+        # 3. tunnel-health (#1706 + #1733 bounce-gating). `conn` is threaded so
+        #    the WARP path can read the PRIOR-tick peer reachability FSM (the
+        #    peer-reachability step below runs AFTER, so its state is one tick
+        #    old — fine for a 120s+ decision) and persist the consecutive-stale
+        #    streak. The step ORDER is unchanged; tunnel-health never runs a
+        #    second live reachability probe, it only READS the FSM rows.
         r = reconcile.run_step(
             conn, reconcile.STEP_TUNNEL_HEALTH,
-            lambda: reconcile.tunnel_health(transport, proof_cfg),
+            lambda: reconcile.tunnel_health(transport, proof_cfg, conn),
             on_event=_emit)
         result.steps[reconcile.STEP_TUNNEL_HEALTH] = r.status
 
@@ -4736,6 +4741,255 @@ def _warp_self_probe_socket_held(bind: str, port: int) -> bool:
     return False
 
 
+# #1679: self-reachability discriminator for the supervisor.
+#
+# Discriminator words (printed on stdout by `cmd_self_reach`):
+#   self_reachable    — the raw TCP connect to the receiver's OWN (bind, port)
+#                       completed the handshake OR was actively refused
+#                       (ECONNREFUSED). Either way the host CAN route to its own
+#                       tailnet IP, so a /healthz timeout means a genuinely
+#                       wedged serve loop -> the supervisor should restart
+#                       (the #1405 case).
+#   self_unreachable  — the connect timed out (SYN lost, no RST). The host
+#                       cannot route to its OWN tailnet IP (the macOS
+#                       Tailscale self-connect flap, #1679). A /healthz timeout
+#                       here is an environmental host-self-route condition, NOT
+#                       a receiver fault -> the supervisor should HOLD the
+#                       running process (the process gate already proved it is
+#                       alive), never count a death, never restart.
+#   self_probe_error  — the probe itself could not run (resolve failed,
+#                       unexpected OSError). FAIL-SAFE: the supervisor treats
+#                       this exactly like the pre-#1679 behavior (does NOT hold
+#                       on an inconclusive probe), so genuine death detection is
+#                       never silently suppressed.
+_SELF_REACH_REACHABLE = "self_reachable"
+_SELF_REACH_UNREACHABLE = "self_unreachable"
+_SELF_REACH_PROBE_ERROR = "self_probe_error"
+
+
+def _self_tcp_reachable(bind: str, port: int, timeout: float) -> str:
+    """Raw outbound TCP connect to the receiver's OWN (bind, port).
+
+    SECURITY (#1679): this is an OUTBOUND connect to the already-configured,
+    already-bind-proven tailnet address — it NEVER opens a new listen socket
+    and NEVER adds a loopback bind. The fail-closed tailnet-only bind contract
+    is therefore completely untouched: we only ask "can THIS host complete a
+    SYN handshake to the IP the receiver is already serving on?". The answer
+    distinguishes a wedged serve loop (host reaches the IP, gets SYN-ACK or
+    RST) from a host self-route flap (SYN silently dropped -> connect timeout).
+
+    Returns one of the _SELF_REACH_* words. A connection refused (ECONNREFUSED)
+    is REACHABLE — the host's packets reached the IP and got an active reset,
+    which only happens when the route works (a self-route flap loses the SYN
+    entirely and yields a timeout, never an RST).
+    """
+    fam = socket.AF_INET6 if ":" in bind else socket.AF_INET
+    sock = socket.socket(fam, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect((bind, port))
+        # Handshake completed -> the host can route to its own tailnet IP.
+        return _SELF_REACH_REACHABLE
+    except socket.timeout:
+        # SYN lost, no RST within the timeout -> host cannot self-route.
+        return _SELF_REACH_UNREACHABLE
+    except OSError as exc:
+        if exc.errno == errno.ECONNREFUSED:
+            # Active refusal proves the route works (the packet reached the IP
+            # and a RST came back) — the receiver just is not accepting there.
+            return _SELF_REACH_REACHABLE
+        if exc.errno in (errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH):
+            # Kernel-level timeout / no route to the host's own address: the
+            # same self-route-flap class as a socket.timeout.
+            return _SELF_REACH_UNREACHABLE
+        # Any other error (EADDRNOTAVAIL on the source side, EACCES, etc.) is
+        # inconclusive — fail SAFE so the supervisor keeps its current behavior
+        # rather than holding on an ambiguous probe.
+        return _SELF_REACH_PROBE_ERROR
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def cmd_self_reach(args: argparse.Namespace) -> int:
+    """Probe whether THIS host can route a raw TCP SYN to its OWN bind address.
+
+    Read-only discriminator for the daemon supervisor (#1679). It resolves the
+    configured bind via the SAME fail-closed `resolve_bind` proof the receiver
+    uses, then does a single outbound TCP connect to that (bind, port). It
+    NEVER binds or serves and adds NO new listen surface — the only network
+    action is one outbound SYN to an address the receiver already serves on.
+
+    Prints ONE discriminator word on stdout and uses the exit code as a coarse
+    machine signal (the WORD is authoritative; the supervisor reads the word):
+      - exit 0 + `self_reachable`   : host reaches its own IP (handshake/RST).
+      - exit 3 + `self_unreachable` : connect timed out (self-route flap).
+      - exit 2 + `self_probe_error` : resolve failed / probe could not run
+                                      (FAIL-SAFE: supervisor keeps current
+                                      behavior, does NOT hold).
+    """
+    # Smoke-only forced-verdict hook — an EXPLICIT CLI ARGUMENT (`--test-verdict`),
+    # NEVER an environment variable. The macOS self-route flap and a SYN-blackhole
+    # are not portably reproducible in a hermetic smoke, so this lets the smoke
+    # drive the supervisor's HOLD/restart branches deterministically.
+    #
+    # SECURITY (#1679 r2): the previous design honored a
+    # `BRIDGE_A2A_SELF_REACH_TEST_VERDICT` ENV var here. A real daemon launched
+    # with that var in its environment would have it INHERITED by this supervisor
+    # subprocess (the supervisor scrubbed only the bind-weakening
+    # ALLOW_TEST_BIND / DEV_INSECURE_BIND vars), letting a forced verdict
+    # silently override PRODUCTION supervisor liveness CLASSIFICATION
+    # (restart-vs-hold-vs-healthy) — a daemon-critical false negative. A CLI arg
+    # CANNOT be accidentally inherited by a daemon's environment, and the
+    # production supervisor NEVER constructs this arg (only the hermetic smoke's
+    # explicit forward hook does), so the bypass is now STRUCTURALLY impossible,
+    # not merely scrubbed. This subcommand honors NO env-var verdict. SAFETY of
+    # the arg itself: it ONLY forces the read-only self-reachability DISCRIMINATOR
+    # WORD — ZERO effect on bind/serve/HMAC/allowlist (this subcommand never binds
+    # or serves). Hidden from --help (argparse.SUPPRESS); not an operator surface.
+    forced = (getattr(args, "test_verdict", None) or "").strip()
+    if forced:
+        if forced not in (_SELF_REACH_REACHABLE, _SELF_REACH_UNREACHABLE,
+                          _SELF_REACH_PROBE_ERROR):
+            log(f"self-reach: ignoring unknown --test-verdict ({forced!r})")
+        else:
+            print(forced)
+            log(f"self-reach: TEST verdict forced via --test-verdict ({forced})")
+            if forced == _SELF_REACH_UNREACHABLE:
+                return 3
+            if forced == _SELF_REACH_PROBE_ERROR:
+                return 2
+            return 0
+
+    try:
+        cfg = a2a.load_config(Path(args.config) if args.config else None)
+        bind, port = resolve_bind(cfg)
+    except a2a.A2AError as exc:
+        # A bind we cannot resolve is NOT a self-reachability question — surface
+        # it as a probe error so the supervisor falls back to its existing
+        # (bind-unresolved/exit-cause) handling rather than holding.
+        print(_SELF_REACH_PROBE_ERROR)
+        log(f"self-reach: bind unresolved ({exc.code})")
+        return 2
+
+    timeout = float(getattr(args, "timeout", 3) or 3)
+    try:
+        verdict = _self_tcp_reachable(bind, port, timeout)
+    except Exception as exc:  # noqa: BLE001 — fail SAFE, never raise to caller
+        print(_SELF_REACH_PROBE_ERROR)
+        log(f"self-reach: probe error ({exc!r})")
+        return 2
+
+    print(verdict)
+    if verdict == _SELF_REACH_UNREACHABLE:
+        return 3
+    if verdict == _SELF_REACH_PROBE_ERROR:
+        return 2
+    return 0
+
+
+# #1680: environmental bind-IP presence discriminator for the supervisor.
+#
+# Words (printed on stdout by `cmd_bind_ip_present`):
+#   bind_ip_present  — the receiver's CONFIGURED bind IP is currently assigned
+#                      to a real local interface. After a tailnet-IP-loss
+#                      crash (bind_fail / EADDRNOTAVAIL) this means the IP has
+#                      RETURNED -> the supervisor may auto-rebind (restart).
+#   bind_ip_absent   — the bind IP is NOT on any local interface (Tailscale
+#                      down / data plane wedged / IP drift). This is an
+#                      ENVIRONMENTAL condition, not a receiver fault -> the
+#                      supervisor must NOT burn the hard restart budget; it
+#                      enters a slow re-probe loop until the IP returns.
+#   bind_ip_unknown  — the configured address could not be resolved or the
+#                      interface set could not be enumerated. FAIL-SAFE: the
+#                      supervisor falls back to its existing classification
+#                      (does NOT treat an unknown as a license to hold forever).
+_BIND_IP_PRESENT = "bind_ip_present"
+_BIND_IP_ABSENT = "bind_ip_absent"
+_BIND_IP_UNKNOWN = "bind_ip_unknown"
+
+
+def cmd_bind_ip_present(args: argparse.Namespace) -> int:
+    """Report whether the CONFIGURED receiver bind IP is on a local interface.
+
+    Read-only environmental discriminator for the daemon supervisor (#1680).
+    It does NOT run the fail-closed `resolve_bind` proof (which REQUIRES the IP
+    to already be a proven local interface and would itself fail during the
+    very tailnet-down condition we are trying to detect). Instead it resolves
+    the configured target address best-effort (a raw `listen.address` literally;
+    an identity-keyed listen via the live resolver) and asks the OS interface
+    table — through the existing `local_interface_addresses()` helper, which
+    honors the `BRIDGE_A2A_IFACE_ADDRS` test override — whether that address is
+    currently assigned to a real interface. NEVER binds, serves, or connects.
+
+    This carries NO auth/bind surface: it is a pure local-interface lookup.
+
+    Prints ONE word on stdout; the exit code is a coarse machine echo (the WORD
+    is authoritative):
+      - exit 0 + `bind_ip_present` : the IP is back on an interface.
+      - exit 3 + `bind_ip_absent`  : the IP is gone (environmental).
+      - exit 2 + `bind_ip_unknown` : could not resolve/enumerate (FAIL-SAFE).
+    """
+    try:
+        cfg = a2a.load_config(Path(args.config) if args.config else None)
+    except a2a.A2AError as exc:
+        print(_BIND_IP_UNKNOWN)
+        log(f"bind-ip-present: config load failed ({exc.code})")
+        return 2
+
+    listen = cfg.get("listen", {})
+    if not isinstance(listen, dict):
+        print(_BIND_IP_UNKNOWN)
+        log("bind-ip-present: 'listen' is not an object")
+        return 2
+
+    # Resolve the configured target address best-effort. For an identity-keyed
+    # listen the live resolver needs Tailscale up; when Tailscale is DOWN the
+    # resolution fails — which is itself the bind_ip_absent condition (the IP
+    # cannot be present if its identity cannot resolve).
+    try:
+        kind = a2a.transport_kind(cfg)
+        bind = a2a.resolve_peer_address_for_transport(kind, listen)
+        bind = (bind or "").strip()
+    except a2a.TailscaleUnavailable:
+        # Identity present but Tailscale cannot be queried -> the tailnet is
+        # down, so the bind IP is environmentally ABSENT (the #1680 condition).
+        # NOTE: TailscaleUnavailable subclasses A2AError, so this MUST precede
+        # the A2AError handler below.
+        print(_BIND_IP_ABSENT)
+        log("bind-ip-present: tailscale unavailable -> bind IP absent")
+        return 3
+    except a2a.A2AError as exc:
+        # A structurally-bad transport/listen is unknown (operator config
+        # error), not an environmental absence.
+        print(_BIND_IP_UNKNOWN)
+        log(f"bind-ip-present: resolve failed ({getattr(exc, 'code', '?')})")
+        return 2
+
+    if not bind:
+        # No literal address and no resolvable identity -> cannot say it is
+        # present. Treat as absent (auto-select would need the tailnet up).
+        print(_BIND_IP_ABSENT)
+        log("bind-ip-present: no resolvable bind address -> absent")
+        return 3
+
+    try:
+        local_addrs = a2a.local_interface_addresses()
+    except a2a.A2AError as exc:
+        # Cannot enumerate interfaces at all -> unknown (FAIL-SAFE).
+        print(_BIND_IP_UNKNOWN)
+        log(f"bind-ip-present: interface enumeration failed ({exc.code})")
+        return 2
+
+    if a2a.is_local_interface_address(bind, local_addrs):
+        print(_BIND_IP_PRESENT)
+        return 0
+    print(_BIND_IP_ABSENT)
+    return 3
+
+
 def cmd_healthz(args: argparse.Namespace) -> int:
     """Probe a RUNNING receiver's serve liveness via GET /healthz.
 
@@ -4766,6 +5020,45 @@ def cmd_healthz(args: argparse.Namespace) -> int:
       - `healthz_badbody` : 200 but the body was not the a2a-handoffd health
                             envelope (something else is on the port).
     """
+    # Smoke-only forced-verdict hook — an EXPLICIT CLI ARGUMENT (`--test-verdict`),
+    # NEVER an environment variable. The loopback test-bind harness can't be
+    # healthz-probed through the supervisor (the supervisor scrubs ALLOW_TEST_BIND
+    # from this subprocess so resolve_bind refuses the loopback), so this lets the
+    # smoke drive the supervisor's healthz reason word deterministically.
+    #
+    # SECURITY (#1405/#1679 r2): the previous design honored a
+    # `BRIDGE_A2A_HEALTHZ_TEST_VERDICT` ENV var here, which a real daemon could
+    # inherit — letting a forced `healthy` clear the supervisor's counters and
+    # skip the #1405 genuine-wedge path even while the receiver was NOT accepting,
+    # or a forced `healthz_timeout` drive the HOLD path. That was a daemon-critical
+    # false negative on supervision via inherited env. A CLI arg CANNOT be
+    # accidentally inherited by a daemon's environment, and the production
+    # supervisor NEVER constructs this arg, so the bypass is now STRUCTURALLY
+    # impossible. This subcommand honors NO env-var verdict. SAFETY of the arg
+    # itself: it ONLY forces the read-only liveness reason word — zero effect on
+    # the bind/serve/HMAC/allowlist path (healthz never binds/serves). Hidden from
+    # --help (argparse.SUPPRESS); not an operator surface.
+    _healthz_forced = (getattr(args, "test_verdict", None) or "").strip()
+    if _healthz_forced:
+        _healthz_known = (
+            "healthy", "bind_unresolved", "healthz_timeout", "healthz_badbody")
+        if _healthz_forced in _healthz_known \
+                or _healthz_forced.startswith("healthz_status:"):
+            print(_healthz_forced)
+            log(f"healthz: TEST verdict forced via --test-verdict ({_healthz_forced})")
+            if _healthz_forced == "healthy":
+                return 0
+            if _healthz_forced == "bind_unresolved":
+                return 2
+            if _healthz_forced == "healthz_timeout":
+                return 3
+            if _healthz_forced.startswith("healthz_status:"):
+                return 4
+            if _healthz_forced == "healthz_badbody":
+                return 5
+            return 3
+        log(f"healthz: ignoring unknown --test-verdict ({_healthz_forced!r})")
+
     try:
         cfg = a2a.load_config(Path(args.config) if args.config else None)
         bind, port = resolve_bind(cfg)
@@ -4881,6 +5174,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         cfg = a2a.load_config(Path(args.config) if args.config else None)
         a2a.validate_config_peer_secrets(cfg, side="receiver")
+        # #1728: refuse to serve if a test-bind mesh would land the A2A state
+        # tree (rooms.db / reconcile.db / outbox / inbox) on a live state dir
+        # outside this node's BRIDGE_HOME. No-op unless BRIDGE_A2A_ALLOW_TEST_BIND=1
+        # (test-only flag → never fires in production). phase=config: a
+        # NON-transient operator misconfiguration, never retried by the supervisor.
+        a2a.guard_test_bind_state_path()
     except a2a.A2AError as exc:
         log(f"FATAL: {exc} ({exc.code})")
         audit("startup_fail", code=exc.code, detail=str(exc)[:300],
@@ -5164,7 +5463,48 @@ def build_parser() -> argparse.ArgumentParser:
     p_health.add_argument("--config", default=None)
     p_health.add_argument("--timeout", type=float, default=3.0,
                           help="connect/read timeout in seconds (default 3)")
+    # Hermetic-smoke ONLY: force the liveness reason word without a real probe.
+    # NOT an env var (a real daemon could inherit that) and NOT an operator
+    # surface (suppressed from --help). The production supervisor never passes
+    # this; only the smoke's explicit forward hook does. See cmd_healthz (#1679 r2).
+    p_health.add_argument("--test-verdict", default=None, dest="test_verdict",
+                          help=argparse.SUPPRESS)
     p_health.set_defaults(func=cmd_healthz)
+
+    # #1679: read-only self-reachability discriminator for the supervisor. Does
+    # ONE outbound TCP connect to the receiver's own (resolve_bind-proven)
+    # address — never binds/serves, never adds a loopback listen. Exit 0
+    # self_reachable / 3 self_unreachable / 2 self_probe_error + the word on
+    # stdout. The supervisor uses it to tell a wedged serve loop (restart) from
+    # a macOS Tailscale self-route flap (HOLD — environmental, not a fault).
+    p_self = sub.add_parser(
+        "self-reach",
+        help="probe whether THIS host can route a raw TCP SYN to its own bind "
+             "address (read-only; exit 0 reachable / 3 unreachable / 2 error)")
+    p_self.add_argument("--config", default=None)
+    p_self.add_argument("--timeout", type=float, default=3.0,
+                        help="connect timeout in seconds (default 3)")
+    # Hermetic-smoke ONLY: force the self-reachability discriminator word without
+    # a real probe. NOT an env var (a real daemon could inherit that) and NOT an
+    # operator surface (suppressed from --help). The production supervisor never
+    # passes this; only the smoke's explicit forward hook does. See cmd_self_reach
+    # (#1679 r2).
+    p_self.add_argument("--test-verdict", default=None, dest="test_verdict",
+                        help=argparse.SUPPRESS)
+    p_self.set_defaults(func=cmd_self_reach)
+
+    # #1680: read-only environmental discriminator — is the configured bind IP
+    # currently on a local interface? Does NOT run the fail-closed resolve_bind
+    # proof (which would itself fail during the tailnet-down condition this
+    # detects). Exit 0 present / 3 absent / 2 unknown + the word on stdout. The
+    # supervisor uses it to treat a bind_fail on an absent tailnet IP as a
+    # retryable environmental state (re-probe + auto-rebind), not a fault.
+    p_bip = sub.add_parser(
+        "bind-ip-present",
+        help="report whether the configured bind IP is on a local interface "
+             "(read-only; exit 0 present / 3 absent / 2 unknown)")
+    p_bip.add_argument("--config", default=None)
+    p_bip.set_defaults(func=cmd_bind_ip_present)
 
     return parser
 

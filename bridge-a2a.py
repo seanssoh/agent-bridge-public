@@ -481,10 +481,42 @@ def cmd_outbox(args: argparse.Namespace) -> int:
                 "FROM outbox ORDER BY created_ts DESC"
             ).fetchall()
             now = a2a.now_ts()
+            # #1732: best-effort load of the peer config so each row can carry
+            # its class-aware noise policy (peer_class / alarm_on_unreachable /
+            # stuck_alert_secs). The daemon's stuck-alert decider reads these
+            # fields straight off the `outbox list --json` rows, so the
+            # transient-peer suppression/grace lives entirely in data — no extra
+            # config plumbing in the daemon shell. A missing/unreadable config
+            # (early install, perms) degrades cleanly to the persistent default
+            # (alarm on, no per-peer grace) — fail-safe: never silently suppress.
+            _cfg_for_class: dict[str, Any] = {}
+            try:
+                _cfg_for_class = a2a.load_config()
+            except a2a.A2AError:
+                _cfg_for_class = {}
             enriched = []
             for r in rows:
                 d = dict(r)
                 status = d.get("status") or ""
+                # Class-aware noise-policy fields (#1732). Default persistent +
+                # alarm-on when the peer is unknown to the config.
+                _peer_id = d.get("peer") or ""
+                _peer_entry: Optional[dict[str, Any]] = None
+                if _cfg_for_class:
+                    try:
+                        _peer_entry = a2a.find_peer(_cfg_for_class, _peer_id)
+                    except a2a.A2AError:
+                        _peer_entry = None
+                if _peer_entry is not None:
+                    d["peer_class"] = a2a.peer_class(_peer_entry)
+                    d["alarm_on_unreachable"] = a2a.peer_alarm_on_unreachable(
+                        _peer_entry)
+                    d["stuck_alert_secs"] = a2a.peer_stuck_alert_secs(
+                        _cfg_for_class, _peer_entry)
+                else:
+                    d["peer_class"] = a2a.DEFAULT_PEER_CLASS
+                    d["alarm_on_unreachable"] = True
+                    d["stuck_alert_secs"] = None
                 created_ts = int(d.get("created_ts") or 0)
                 next_attempt_ts = int(d.get("next_attempt_ts") or 0)
                 lease_expires_ts = int(d.get("lease_expires_ts") or 0)
@@ -802,6 +834,7 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
         return _schedule_retry(
             conn, message_id, attempts, cfg,
             f"address resolve failed: {exc} ({exc.code})",
+            peer=peer,
         )
     port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
     path = peer.get("enqueue_path", "/enqueue")
@@ -832,7 +865,8 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
         )
     except (urllib.error.URLError, socket.timeout, OSError) as exc:
         # Connection-level failure → retryable.
-        return _schedule_retry(conn, message_id, attempts, cfg, f"transport: {exc}")
+        return _schedule_retry(conn, message_id, attempts, cfg,
+                               f"transport: {exc}", peer=peer)
 
     if 200 <= status < 300:
         remote_task = ""
@@ -874,13 +908,96 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
     # 429 / 5xx / anything else → retry, honoring Retry-After.
     retry_after = headers.get("Retry-After")
     return _schedule_retry(conn, message_id, attempts, cfg,
-                           f"HTTP {status}: {detail}", retry_after=retry_after)
+                           f"HTTP {status}: {detail}", retry_after=retry_after,
+                           peer=peer)
+
+
+def _peer_for_row(conn, cfg: dict[str, Any], message_id: str
+                  ) -> Optional[dict[str, Any]]:
+    """Best-effort resolve the destination peer config for an outbox row (#1732).
+
+    `_schedule_retry` needs the peer entry to apply the class-aware (transient vs
+    persistent) max-attempts policy, but the per-row-guard callsite does not have
+    `peer` in scope. We look it up from the row's `peer` column. Returns None when
+    the row or the peer config is gone — the caller then falls back to the
+    classic persistent behavior (fail-safe: an unknown peer is NOT treated as the
+    no-drop transient class).
+    """
+    try:
+        row = conn.execute(
+            "SELECT peer FROM outbox WHERE message_id=?", (message_id,)
+        ).fetchone()
+    except Exception:  # noqa: BLE001 - a read failure must not crash the tick
+        return None
+    if row is None:
+        return None
+    peer_id = row["peer"]
+    try:
+        return a2a.find_peer(cfg, peer_id)
+    except a2a.A2AError:
+        return None
 
 
 def _schedule_retry(conn, message_id: str, attempts: int, cfg: dict[str, Any],
-                    last_error: str, retry_after: Optional[str] = None) -> str:
+                    last_error: str, retry_after: Optional[str] = None,
+                    peer: Optional[dict[str, Any]] = None) -> str:
     max_attempts = int(cfg.get("delivery_max_attempts", 12))
+    if peer is None:
+        peer = _peer_for_row(conn, cfg, message_id)
+    transient = bool(peer is not None and a2a.peer_is_transient(peer))
+    ceiling = a2a.delivery_backoff_ceiling(cfg)
+
     if attempts >= max_attempts:
+        # #1732: for a TRANSIENT peer, reaching `delivery_max_attempts` is a
+        # DIAGNOSTIC/escalation threshold, NOT the terminal retry cutoff. A
+        # retryable transport-absence (an asleep laptop) must NOT terminally drop
+        # the message — it PARKS (stays `status='retry'`, backoff CAPPED at the
+        # ceiling so an offline peer cannot hot-loop) and is woken on the #1707
+        # peer-reachability UP transition. PERMANENT failures still dead-letter
+        # immediately via `_mark_dead` (they never reach this max-attempts gate).
+        # Bounded: once the parked row has lived past the per-peer transient
+        # retention TTL, it is expired to `dead(expired-transient-retention)` so
+        # GC reclaims it (no unbounded growth).
+        if transient:
+            created_ts = 0
+            try:
+                crow = conn.execute(
+                    "SELECT created_ts FROM outbox WHERE message_id=?",
+                    (message_id,),
+                ).fetchone()
+                if crow is not None:
+                    created_ts = int(crow["created_ts"] or 0)
+            except Exception:  # noqa: BLE001 - read failure → treat as not-expired
+                created_ts = 0
+            retention = a2a.peer_transient_retention_seconds(cfg, peer)
+            now = a2a.now_ts()
+            if created_ts and (now - created_ts) >= retention:
+                conn.execute(
+                    "UPDATE outbox SET status='dead', attempts=?, last_error=?, "
+                    "lease_owner=NULL, lease_expires_ts=0, updated_ts=? "
+                    "WHERE message_id=?",
+                    (attempts,
+                     f"expired-transient-retention ({retention}s): {last_error}",
+                     now, message_id),
+                )
+                conn.commit()
+                return "dead(expired-transient-retention)"
+            # Park at the backoff cap (capped delay + jitter), lease cleared, so
+            # the deliver tick keeps probing at the ceiling cadence and the
+            # reconnect-flush can re-arm it the instant the peer returns.
+            delay = int(ceiling * (0.5 + random.random() * 0.5))
+            next_ts = now + max(1, delay)
+            conn.execute(
+                "UPDATE outbox SET status='retry', attempts=?, next_attempt_ts=?, "
+                "last_error=?, lease_owner=NULL, lease_expires_ts=0, updated_ts=? "
+                "WHERE message_id=?",
+                (attempts, next_ts,
+                 (f"parked (transient peer, attempts>={max_attempts}): "
+                  f"{last_error}")[:500],
+                 now, message_id),
+            )
+            conn.commit()
+            return f"parked(transient,next_in={next_ts - now}s)"
         # #1618: do NOT unlink the staged body on dead-letter. A `dead` row is an
         # operator-retryable state (`agb a2a outbox retry`), and the prior code
         # deleted the managed envelope here, so a manual retry of a maxattempts
@@ -896,7 +1013,6 @@ def _schedule_retry(conn, message_id: str, attempts: int, cfg: dict[str, Any],
         conn.commit()
         return "dead(maxattempts)"
 
-    ceiling = a2a.delivery_backoff_ceiling(cfg)
     retry_after_floor = 0
     if retry_after:
         try:
@@ -2920,6 +3036,28 @@ def _netstat_reconcile() -> dict[str, Any]:
         "tunnel_bounce_pending_retries": _attempts(reconcile.STEP_TUNNEL_HEALTH),
         "tunnel_bounce_last_result": _result(reconcile.STEP_TUNNEL_HEALTH),
     }
+
+    # #1733 additive observability: the WARP bounce-gate state (consecutive-
+    # stale streak + last bounce-suppressed reason + soft-refresh attempted).
+    # READ-ONLY, additive only — the existing schema/keys above are unchanged.
+    # Degrade-safe: any failure (no config, no store, non-WARP transport) just
+    # omits the optional block rather than raising into net-status.
+    try:
+        cfg = a2a.load_config()
+        transport = a2a.transport_kind(cfg)
+        if transport == a2a.TRANSPORT_CLOUDFLARE_WARP_MESH:
+            gate = reconcile.tunnel_health_gate_snapshot(transport)
+            snap["auto_recovery"]["tunnel_bounce_gate"] = {
+                "stale_streak": gate.get("stale_streak", 0),
+                "bounce_suppressed_reason":
+                    gate.get("last_bounce_suppressed_reason"),
+                "soft_refresh_attempted":
+                    gate.get("soft_refresh_attempted", False),
+                "updated_ts": gate.get("updated_ts"),
+            }
+    except Exception:  # noqa: BLE001 - optional additive block; never raise into net-status
+        pass
+
     snap["error"] = None
     return snap
 

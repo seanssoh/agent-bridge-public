@@ -127,6 +127,32 @@ PENDING_OUTBOX_STATUSES = ("pending", "sending", "retry")
 # HTTP statuses that are permanent failures (no retry → dead-letter).
 PERMANENT_FAIL_STATUSES = (400, 401, 403, 404, 409, 413, 422)
 
+# #1732 transient-peer resilience (codex design-consensus #11698). A2A peers
+# are frequently personal laptops — connect/disconnect is NORMAL, not a fault.
+# A peer's `class` controls how the outbox treats a RETRYABLE (transport /
+# resolve / timeout / 5xx / 429) failure once `delivery_max_attempts` is hit
+# and whether the daemon raises the `[A2A] outbox stuck` admin alarm:
+#   - "persistent" (DEFAULT — no behavior change for existing installs): the
+#     classic server-class behavior. Max-attempts → terminal `dead`; the
+#     outbox-stuck alarm fires at `high` priority.
+#   - "transient" (explicit per-peer opt-in): a retryable failure NEVER
+#     terminally dead-letters just because max-attempts was reached — the row
+#     PARKS (stays `retry`, backoff capped so an offline laptop cannot hot-loop)
+#     and is woken on the #1707 peer-reachability UP transition. PERMANENT
+#     failures (missing config/secret/address/body, auth/HMAC, the
+#     PERMANENT_FAIL_STATUSES set) STILL go `dead` immediately for ANY class.
+#     Bounded: a parked row that has lived past the transient-retention TTL is
+#     expired to `dead(expired-transient-retention)` so GC reclaims it.
+DEFAULT_PEER_CLASS = "persistent"
+VALID_PEER_CLASSES = ("persistent", "transient")
+# Generous default retention for a transient peer's parked rows (7 days) — an
+# overnight/weekend-asleep laptop still receives its messages when it wakes,
+# without unbounded growth. Per-peer (`caps.transient_retention_seconds`) or
+# top-level (`transient_retention_seconds`) override; floored so a misconfig
+# cannot make retention effectively zero (which would re-introduce the drop).
+DEFAULT_TRANSIENT_RETENTION_SECONDS = 7 * 86400
+MIN_TRANSIENT_RETENTION_SECONDS = 3600
+
 
 class A2AError(Exception):
     """Generic A2A failure with an optional machine-readable code."""
@@ -185,6 +211,90 @@ def handoff_dir() -> Path:
     return state_dir() / "handoff"
 
 
+def _path_is_within(child: Path, parent: Path) -> bool:
+    """True iff `child` resolves to `parent` or a descendant of it.
+
+    Pure lexical containment on the *resolved* (symlink-collapsed, absolute)
+    forms — no filesystem write, safe to call before any dir exists. Used by
+    the test-bind state-path guard to decide whether a `BRIDGE_STATE_DIR`
+    override still lands the A2A state tree under the active `BRIDGE_HOME`.
+    """
+    try:
+        child_r = child.resolve()
+        parent_r = parent.resolve()
+    except (OSError, RuntimeError):
+        # resolve() can raise on a symlink loop; treat "cannot prove within" as
+        # NOT within so the guard fails closed rather than silently allowing.
+        return False
+    if child_r == parent_r:
+        return True
+    return parent_r in child_r.parents
+
+
+def guard_test_bind_state_path() -> None:
+    """Fail closed when a test-bind mesh would write into a live state tree.
+
+    Symmetric to the `BRIDGE_A2A_ALLOW_TEST_BIND=1` loopback bind escape hatch
+    (`resolve_bind` in `bridge-handoffd.py`): that flag is TEST-ONLY — production
+    never sets it — so a guard keyed on it can never affect a production install.
+
+    The footgun (issue #1728): a throwaway test mesh that overrides only
+    per-node `BRIDGE_HOME` but inherits a live `BRIDGE_STATE_DIR` (normal on a
+    configured host) resolves `handoff_dir()` — and therefore rooms.db /
+    reconcile.db / outbox / inbox — to the LIVE state dir, silently clobbering
+    real room membership. The socket bind is gated by the test flag; the
+    state-path was not.
+
+    When `BRIDGE_A2A_ALLOW_TEST_BIND=1` AND the resolved handoff state dir is
+    NOT under the active `BRIDGE_HOME` (i.e. an override points it at a
+    live / out-of-home location), refuse the operation with a clear message
+    pointing at the override knobs. Production (flag unset) and a correctly
+    isolated test mesh (state dir under the test home) are unaffected.
+
+    NOTE (#1728 r2): this state-dir check is necessary but NOT sufficient. The
+    explicit per-store DB overrides (`BRIDGE_A2A_OUTBOX_DB` / `_INBOX_DB` /
+    `BRIDGE_A2A_ROOMS_DB` / `_RECONCILE_DB`) bypass `state_dir()` entirely, so a
+    mesh can keep `BRIDGE_STATE_DIR` under home (passing here) yet still point a
+    db at a live tree. The db-path containment is enforced at each `_connect()`
+    choke point via `guard_test_bind_db_path()` — this entry stays for the early
+    `ensure_handoff_dirs()` / `cmd_serve` phase=config refuse-to-serve.
+    """
+    guard_test_bind_db_path(state_dir(), what="A2A state dir")
+
+
+def guard_test_bind_db_path(path: Path, *, what: str = "A2A db path") -> None:
+    """Fail closed when a test-bind mesh would write `path` into a live tree.
+
+    The db-path-aware core of the #1728 guard. `guard_test_bind_state_path()`
+    delegates here for the resolved state dir; each `_connect()` choke point
+    calls it with the FINAL resolved db path — which includes any explicit
+    `BRIDGE_A2A_OUTBOX_DB` / `_INBOX_DB` / `BRIDGE_A2A_ROOMS_DB` /
+    `_RECONCILE_DB` override that bypasses `state_dir()`. Under the test-bind
+    flag, ANY resolved write path outside the active `BRIDGE_HOME` fails closed,
+    so a throwaway test mesh can never clobber the live state tree no matter
+    which knob redirected it.
+
+    No-op when `BRIDGE_A2A_ALLOW_TEST_BIND` is unset (production) and when the
+    resolved path is under the active `BRIDGE_HOME` (a correctly isolated mesh,
+    including an override pointed UNDER the test home).
+    """
+    if os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") != "1":  # noqa: iso-helper-boundary - env var, not a .env file
+        return
+    home = bridge_home()
+    if _path_is_within(path, home):
+        return
+    raise A2AError(
+        f"BRIDGE_A2A_ALLOW_TEST_BIND=1 (test mode) but the {what} "
+        f"{str(path)!r} is outside BRIDGE_HOME {str(home)!r} — a "
+        "test mesh would clobber the live rooms.db / reconcile.db / "
+        "outbox / inbox. Set BRIDGE_STATE_DIR (and, if overridden, "
+        "BRIDGE_A2A_ROOMS_DB / BRIDGE_A2A_RECONCILE_DB / "
+        "BRIDGE_A2A_OUTBOX_DB / BRIDGE_A2A_INBOX_DB) under your test "
+        "BRIDGE_HOME so test state cannot reach the live state tree.",
+        code="test_bind_state_outside_home",
+    )
+
+
 def outbox_db_path() -> Path:
     override = os.environ.get("BRIDGE_A2A_OUTBOX_DB")
     if override:
@@ -215,6 +325,10 @@ def config_path() -> Path:
 
 
 def ensure_handoff_dirs() -> None:
+    # #1728: before creating/writing the handoff tree, fail closed if a
+    # test-bind mesh (BRIDGE_A2A_ALLOW_TEST_BIND=1) would land it on a live
+    # state dir outside its BRIDGE_HOME. No-op when the flag is unset (prod).
+    guard_test_bind_state_path()
     for path in (handoff_dir(), incoming_dir(), outgoing_dir()):
         path.mkdir(parents=True, exist_ok=True)
         try:
@@ -362,6 +476,82 @@ def peer_cap(peer: dict[str, Any], key: str, default: Any) -> Any:
     if isinstance(caps, dict) and key in caps:
         return caps[key]
     return default
+
+
+def peer_class(peer: dict[str, Any]) -> str:
+    """Resolve a peer's transience class — `persistent` (default) | `transient`.
+
+    #1732. The class is read from the top-level `class` key on the peer entry.
+    DEFAULT is `persistent` (existing installs and any peer that does not opt in
+    behave EXACTLY as before — the server-class drop-after-max-attempts + high
+    alarm). An unrecognized/non-string value FAILS SAFE to `persistent` (we never
+    silently treat an unknown class as the no-drop/quiet transient policy).
+    """
+    raw = peer.get("class")
+    if isinstance(raw, str) and raw.strip().lower() in VALID_PEER_CLASSES:
+        return raw.strip().lower()
+    return DEFAULT_PEER_CLASS
+
+
+def peer_is_transient(peer: dict[str, Any]) -> bool:
+    """True iff the operator marked this peer expected-transient (#1732)."""
+    return peer_class(peer) == "transient"
+
+
+def peer_alarm_on_unreachable(peer: dict[str, Any]) -> bool:
+    """Should the daemon raise the `[A2A] outbox stuck` admin alarm for this peer?
+
+    #1732. Class-keyed default: `persistent` → True (today's behavior unchanged),
+    `transient` → False (expected disconnects are not incidents — stay quiet). An
+    explicit per-peer `alarm_on_unreachable` boolean overrides the class default
+    either way (e.g. a transient laptop the operator still wants alarmed, or a
+    persistent peer deliberately silenced).
+    """
+    explicit = peer.get("alarm_on_unreachable")
+    if isinstance(explicit, bool):
+        return explicit
+    return not peer_is_transient(peer)
+
+
+def peer_transient_retention_seconds(cfg: dict[str, Any],
+                                     peer: dict[str, Any]) -> int:
+    """Resolve a transient peer's parked-row retention TTL in seconds (#1732).
+
+    Precedence: per-peer `caps.transient_retention_seconds` → top-level
+    `transient_retention_seconds` → DEFAULT_TRANSIENT_RETENTION_SECONDS. Floored
+    at MIN_TRANSIENT_RETENTION_SECONDS so a misconfigured tiny/zero value cannot
+    silently re-introduce the drop the no-drop guarantee is meant to remove.
+    """
+    raw = peer_cap(peer, "transient_retention_seconds", None)
+    if raw is None:
+        raw = cfg.get("transient_retention_seconds",
+                      DEFAULT_TRANSIENT_RETENTION_SECONDS)
+    return _int_with_floor(
+        raw,
+        DEFAULT_TRANSIENT_RETENTION_SECONDS,
+        MIN_TRANSIENT_RETENTION_SECONDS,
+    )
+
+
+def peer_stuck_alert_secs(cfg: dict[str, Any],
+                          peer: dict[str, Any]) -> Optional[int]:
+    """Resolve a per-peer override for the outbox-stuck alarm grace window (#1732).
+
+    Returns the per-peer `caps.stuck_alert_secs` (a longer grace window an
+    operator may set for a flaky-but-alarmed peer), or None to mean "use the
+    daemon's global `BRIDGE_A2A_STUCK_ALERT_SECS` default". A non-positive /
+    unparseable override is ignored (None). This is independent of
+    `alarm_on_unreachable`: a transient peer with the alarm suppressed never
+    reaches the grace-window check at all.
+    """
+    raw = peer_cap(peer, "stuck_alert_secs", None)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def write_config_atomic(path: Path, cfg: dict[str, Any], mode: int = 0o600) -> None:
@@ -2486,6 +2676,12 @@ def _inbox_pk_is_composite(conn: sqlite3.Connection) -> bool:
 
 
 def _connect(path: Path, schema: str) -> sqlite3.Connection:
+    # #1728 r2: guard the ACTUAL resolved db path (which may be a
+    # BRIDGE_A2A_OUTBOX_DB / _INBOX_DB override that bypasses state_dir()) —
+    # fail closed before creating/opening it if a test-bind mesh would land it
+    # outside its BRIDGE_HOME. No-op when the flag is unset (prod) or the path
+    # is under home (correctly isolated mesh).
+    guard_test_bind_db_path(path, what="A2A db path")
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30.0)
     conn.row_factory = sqlite3.Row
@@ -2577,6 +2773,39 @@ def prune_inbox_dedupe(
             cap_removed += int(cur.rowcount or 0)
     conn.commit()
     return age_removed, cap_removed
+
+
+def wake_peer_outbox_for_resume(conn: sqlite3.Connection, peer_id: str,
+                                now: Optional[int] = None) -> int:
+    """Re-arm a peer's backoff-waiting / parked outbox rows for immediate send.
+
+    #1732 reconnect flush (seamless resume). On a peer's #1707 peer-reachability
+    UP transition the daemon wakes ONLY that peer's eligible `status='retry'`
+    rows — including the parked transient rows that sit at the backoff cap —
+    back to `status='pending'`, `next_attempt_ts=0`, leases cleared, so the
+    daemon's NORMAL deliver loop picks them up on the very next tick. This covers
+    room messages too: rooms ride the SAME classic per-peer outbox.
+
+    Scope is deliberately narrow and side-effect-free beyond the row re-arm:
+      - `status='retry'` ONLY — never disturbs `pending` (already due),
+        `sending`/leased (mid-attempt), or `acked`/`dead` (terminal) rows.
+      - This function NEVER delivers inline; it only flips the rows to due. The
+        reconcile step that calls it must NOT POST anything — keeping the bind /
+        receiver-admission boundary untouched (the reconcile no-bind invariant).
+
+    Returns the number of rows re-armed (0 when the peer has none waiting).
+    `conn` is the OUTBOX connection (open_outbox), NOT the reconcile.db handle.
+    """
+    if now is None:
+        now = now_ts()
+    cur = conn.execute(
+        "UPDATE outbox SET status='pending', next_attempt_ts=0, "
+        "lease_owner=NULL, lease_expires_ts=0, updated_ts=? "
+        "WHERE peer=? AND status='retry'",
+        (now, peer_id),
+    )
+    conn.commit()
+    return int(cur.rowcount or 0)
 
 
 def outbox_total_bytes(conn: sqlite3.Connection) -> int:

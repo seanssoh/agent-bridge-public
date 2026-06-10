@@ -96,6 +96,15 @@ PROTECTED_GLOBS: tuple[str, ...] = (
     "data/agents/*/workdir/.discord/access.json",
     "data/agents/*/workdir/.telegram/access.json",
     "agent-roster.local.sh",
+    # Issue #1734: the dedicated install-env-override file `agb config
+    # set-env` writes. It is sourced by `bridge_load_roster` AFTER the
+    # roster (a true install override), so it MUST be protected exactly
+    # like the roster — otherwise it becomes a new unprotected sourced
+    # shell file (a write hole bypassing the #341 audit chain). Direct
+    # Edit/Write to it is blocked here; the only sanctioned writer is
+    # the `set-env` wrapper, which layers its own admin/operator-source
+    # gate + before/after-hash audit row.
+    "agent-env.local.sh",
     "cron/jobs.json",
     "runtime/openclaw.json",
     "runtime/bridge-config.json",
