@@ -337,6 +337,10 @@ def _mixed_batch_deliver(port: int) -> int:
     }
     cfg_path = tmp / "handoff.json"
     cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    # The config carries peer secrets — the loader fail-closes on mode != 0600.
+    # CI's umask yields 0644, cmd_deliver never runs, and rows stay 'pending'
+    # (exactly the Linux-CI failure shape); local macOS runs masked this.
+    cfg_path.chmod(0o600)
 
     outbox_db = tmp / "outbox.db"
     os.environ["BRIDGE_A2A_CONFIG"] = str(cfg_path)  # noqa: iso-helper-boundary - test env var, not a .env file
