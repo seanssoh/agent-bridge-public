@@ -1802,6 +1802,15 @@ def _relay_forward_send(cfg: dict[str, Any], *, env: dict[str, Any],
     try:
         kind = a2a.transport_kind(cfg)
         address = a2a.resolve_peer_address_for_transport(kind, peer)
+        # #1758 (F3): resolve the per-destination egress source INSIDE this
+        # A2AError guard — `select_source_address_for_transport` ->
+        # `peer_transport_kind` hard-fails on a typo'd per-peer
+        # `transport.kind` (the trusted-routed rollout hand-edits exactly this
+        # field). Resolving it here degrades the one poisoned target to the same
+        # graceful per-relay failure as an address resolve error, so one bad
+        # peer can no longer raise out of the relay sender and halt the leader's
+        # whole relay fan-out.
+        source_address = a2a.select_source_address_for_transport(kind, cfg, peer)
     except a2a.A2AError as exc:
         return False, 0, f"target addr unresolved: {exc}"
     port = int(peer.get("port", cfg.get("listen", {}).get("port", 8787)))
@@ -1816,9 +1825,9 @@ def _relay_forward_send(cfg: dict[str, Any], *, env: dict[str, Any],
     # transport.kind override, else this node's `kind`). A warp-mesh target
     # leaves on this node's own Mesh listen.address; a trusted-routed/tailscale
     # target (incl. a routed-marked peer on a warp-mesh node) gets None (OS
-    # routing picks the source).
-    opener = a2a.source_bound_opener(
-        a2a.select_source_address_for_transport(kind, cfg, peer))
+    # routing picks the source). `source_address` is resolved above, inside the
+    # A2AError guard.
+    opener = a2a.source_bound_opener(source_address)
     try:
         with opener.open(req, timeout=timeout) as resp:
             status = int(resp.status)

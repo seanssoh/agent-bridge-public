@@ -837,6 +837,15 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
     try:
         kind = a2a.transport_kind(cfg)
         address = a2a.resolve_peer_address_for_transport(kind, peer)
+        # #1758 (F3): resolve the per-destination egress source INSIDE this
+        # A2AError guard. `select_source_address_for_transport` calls
+        # `peer_transport_kind`, which hard-fails on a typo'd per-peer
+        # `transport.kind` — exactly the surface the trusted-routed rollout
+        # hand-edits. Resolving it here degrades that one poisoned row to the
+        # same per-row retry/dead-letter path as a node-kind resolve failure,
+        # so one bad peer no longer escapes the row loop and halts the whole
+        # runner (the caller's per-row guard is OSError-only).
+        source_address = a2a.select_source_address_for_transport(kind, cfg, peer)
     except a2a.A2AError as exc:
         return _schedule_retry(
             conn, message_id, attempts, cfg,
@@ -863,13 +872,10 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
         _mark_dead(conn, message_id, str(exc))
         return "dead(nosecret)"
 
-    # #1758: per-destination egress source, keyed on the peer's EFFECTIVE
-    # transport (its own transport.kind override, else this node's `kind`). A
-    # warp-mesh destination is reachable only over the Mesh utun, so we pin this
-    # node's own Mesh listen.address; a trusted-routed/tailscale destination
-    # (incl. a routed-marked peer on a warp-mesh node) gets None so the OS
-    # routing table picks the reachable egress interface.
-    source_address = a2a.select_source_address_for_transport(kind, cfg, peer)
+    # #1758: per-destination egress `source_address` is resolved above, inside
+    # the A2AError guard (a warp-mesh destination pins this node's own Mesh
+    # listen.address; a trusted-routed/tailscale destination gets None so the OS
+    # routing table picks the reachable egress interface).
     try:
         status, headers, resp_body = _post_envelope(
             address=address, port=port, path=path,

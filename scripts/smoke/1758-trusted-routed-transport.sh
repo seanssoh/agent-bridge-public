@@ -378,6 +378,24 @@ tr_peer_transport_unknown() {
     "typo PEER transport.kind -> transport_unknown (no silent fallback)"
 }
 
+# === (F3) one typo'd peer must NOT halt the whole outbox runner ===
+tr_mixed_batch_one_bad_peer() {
+  # Drive the REAL runner (bridge-a2a.cmd_deliver) over a mixed batch: a VALID
+  # trusted-routed peer A (live loopback 202 receiver) + a peer B with a typo'd
+  # per-peer transport.kind. The per-peer source resolution hard-fails for B;
+  # the F3 fix moves that resolution inside the per-row A2AError guard so B's
+  # row degrades to `retry` while A still ACKs and the runner exits 0. Before
+  # the fix the A2AError escaped the row loop and crashed the runner, halting A.
+  local port; port="$(pick_free_port)"
+  local out; out="$(helper mixed-batch-deliver "$port")"
+  smoke_assert_contains "$out" "PEER_A_STATUS=acked" \
+    "valid peer A still delivers (acked) despite a poisoned sibling row"
+  smoke_assert_contains "$out" "PEER_B_STATUS=retry" \
+    "typo'd peer B is isolated to the per-row retry path (not a runner crash)"
+  smoke_assert_contains "$out" "RUNNER_RC=0" \
+    "the outbox runner exits 0 — one bad peer no longer halts the node"
+}
+
 # === (F1) empty listen.address under trusted-routed -> bind_unresolved ===
 tr_empty_bind_no_autoselect() {
   # The trusted-routed bind proof is interface-assignment ONLY (weaker). An
@@ -459,6 +477,7 @@ main() {
   smoke_run "(e/F2) call-site-shaped: warp-mesh node + mesh & routed-marked peers" tr_sender_source_callsite
   smoke_run "(e/F2) unknown PEER transport.kind hard-fails" tr_peer_transport_unknown
   smoke_run "(e) source-bound opener egress (bound source vs OS-routed)" tr_sender_source_bound_egress
+  smoke_run "(F3) mixed batch: one typo'd peer does NOT halt the runner" tr_mixed_batch_one_bad_peer
 
   # (F1) empty listen.address under trusted-routed -> bind_unresolved (no auto-select).
   smoke_run "(F1) trusted-routed empty listen.address -> bind_unresolved (no auto-select)" tr_empty_bind_no_autoselect

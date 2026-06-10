@@ -35,6 +35,13 @@ Scenarios
                                   to a loopback HTTP echo server: the
                                   mesh-source case binds 127.0.0.1 (the chosen
                                   source); the routed (None) case is OS-routed.
+  mixed-batch-deliver <port>      F3 row-isolation: drive the REAL outbox runner
+                                  (bridge-a2a.cmd_deliver) over a config with a
+                                  VALID peer A (live loopback receiver) + a peer
+                                  B carrying a typo'd per-peer transport.kind.
+                                  Assert peer A still ACKs and peer B's row is
+                                  isolated to the per-row retry path — the runner
+                                  exits 0 (one bad peer no longer halts the node).
 """
 
 from __future__ import annotations
@@ -264,6 +271,119 @@ def _source_bound_egress(port: int) -> int:
     return 0
 
 
+def _mixed_batch_deliver(port: int) -> int:
+    """F3: one typo'd peer must NOT halt the whole outbox runner.
+
+    Drives the REAL runner (`bridge-a2a.cmd_deliver`) over a node config with
+    TWO peers: peer A is valid trusted-routed (points at a live loopback 202
+    receiver); peer B carries a typo'd per-peer `transport.kind` so the
+    per-peer source resolution (`select_source_address_for_transport` ->
+    `peer_transport_kind`) hard-fails. Before the F3 fix that A2AError escaped
+    the row loop and crashed the runner, halting peer A too. With the fix the
+    error is caught by the same per-row A2AError guard as an address resolve
+    failure: peer B's row degrades to `retry`, peer A still ACKs, and the
+    runner exits 0.
+
+    Asserts (one bad peer is isolated to its own row):
+      PEER_A_STATUS=acked   PEER_B_STATUS=retry   RUNNER_RC=0
+    """
+    import argparse
+    import importlib.util
+    import os
+    import tempfile
+
+    # Load the hyphenated CLI module (`bridge-a2a.py`) by path so we can call
+    # the REAL runner entrypoint exactly as `agb a2a outbox run` would.
+    spec = importlib.util.spec_from_file_location(
+        "bridge_a2a_cli", str(REPO_ROOT / "bridge-a2a.py"))
+    assert spec and spec.loader
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    tmp = Path(tempfile.mkdtemp(prefix="agb-1758-f3-"))
+    secret = "f3-smoke-shared-secret-do-not-use-in-prod-0123456789abc"
+
+    # Live loopback receiver for peer A: returns 202 + a task id so the row ACKs.
+    class _Recv(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            payload = json.dumps({"task_id": "t-peer-a"}).encode("utf-8")
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):  # noqa: ANN002 - silence
+            return
+
+    srv = HTTPServer(("127.0.0.1", port), _Recv)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+
+    # Node is trusted-routed; peer A inherits it (valid), peer B carries a
+    # typo'd per-peer override (the trusted-routed rollout hand-edit surface).
+    cfg = {
+        "bridge_id": "bridge-a",
+        "transport": {"kind": "trusted-routed"},
+        "listen": {"address": "127.0.0.1", "port": port},
+        "peers": [
+            {"id": "peer-a", "address": "127.0.0.1", "port": port,
+             "secret": secret},
+            {"id": "peer-b", "address": "127.0.0.1", "port": port,
+             "secret": secret, "transport": {"kind": "trusted-rooted"}},
+        ],
+    }
+    cfg_path = tmp / "handoff.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    outbox_db = tmp / "outbox.db"
+    os.environ["BRIDGE_A2A_CONFIG"] = str(cfg_path)  # noqa: iso-helper-boundary - test env var, not a .env file
+    os.environ["BRIDGE_A2A_OUTBOX_DB"] = str(outbox_db)  # noqa: iso-helper-boundary - test env var, not a .env file
+
+    # Stage one pending row per peer with a real staged body file.
+    conn = a2a.open_outbox()
+    mids = {}
+    try:
+        for peer_id, mid in (("peer-a", "bridge-a:f3-a"),
+                             ("peer-b", "bridge-a:f3-b")):
+            mids[peer_id] = mid
+            env = envelope(mid, "reviewer", f"f3 {peer_id}", "the body")
+            body = json.dumps(env, ensure_ascii=False).encode("utf-8")
+            body_path = tmp / f"{peer_id}.json"
+            body_path.write_bytes(body)
+            a2a.outbox_insert(
+                conn, message_id=mid, peer=peer_id, target_agent="reviewer",
+                priority="normal", title=f"f3 {peer_id}",
+                body_path=str(body_path), body_sha256_hex=a2a.body_sha256(body),
+                body_bytes=len(body))
+    finally:
+        conn.close()
+
+    args = argparse.Namespace(lease=120, timeout=10.0, batch=25)
+    rc = cli.cmd_deliver(args)
+
+    srv.shutdown()
+    srv.server_close()
+
+    conn = a2a.open_outbox()
+    try:
+        status = {}
+        for peer_id, mid in mids.items():
+            row = conn.execute(
+                "SELECT status FROM outbox WHERE message_id=?", (mid,)
+            ).fetchone()
+            status[peer_id] = row["status"] if row else "<missing>"
+    finally:
+        conn.close()
+
+    print(f"PEER_A_STATUS={status['peer-a']}")
+    print(f"PEER_B_STATUS={status['peer-b']}")
+    print(f"RUNNER_RC={rc}")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     scenario = argv[0]
     if scenario == "free-port":
@@ -279,6 +399,8 @@ def main(argv: list[str]) -> int:
         return _peer_transport_unknown()
     if scenario == "source-bound-egress":
         return _source_bound_egress(int(argv[1]))
+    if scenario == "mixed-batch-deliver":
+        return _mixed_batch_deliver(int(argv[1]))
 
     base_url = argv[1]
     peer_id = argv[2]
