@@ -128,14 +128,15 @@ jobs:
   unit-static-smoke:
     name: unit/static smoke
     runs-on: ubuntu-latest
-    # 15m (not 10m): the required-smoke suite legitimately runs ~9m30s-10m on
-    # ubuntu-latest, so a 10m cap intermittently CANCELLED the job on normal
-    # runner variance (+20s tips it over) — surfacing as the recurring
-    # "unit/static smoke" false-red mislabeled as the #1509 kappa flake. The
-    # hermetic-snapshot fix in this PR closes a real source-mutation race but
-    # is secondary; the tight timeout was the dominant cause. 15m matches the
-    # integration-smoke budget below. See #1509.
-    timeout-minutes: 20
+    # 25m (was 20m; before that 15m/10m): the required-smoke battery grows with
+    # every release wave — by v0.16.6 it legitimately runs ~17-18m on a healthy
+    # ubuntu-latest runner, so the 20m cap was CANCELLED twice in one day on
+    # normal congestion variance (20m14s/20m16s, all smokes passing at the
+    # kill point). Same failure mode as the original #1509 10m-cap false-red.
+    # 25m gives ~40% headroom over the healthy-runner baseline without masking
+    # a genuine hang. If the battery crosses ~20m on healthy runners, split the
+    # suite instead of bumping again. See #1509.
+    timeout-minutes: 25
     needs:
       - syntax
       - lint
