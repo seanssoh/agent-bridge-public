@@ -55,7 +55,7 @@ build_fixture() {
 
   BASE="$FIXTURE_BRIDGE_HOME/agents/.claude/settings.json"
   OVERLAY="$FIXTURE_BRIDGE_HOME/agents/.claude/settings.local.json"
-  EFFECTIVE="$FIXTURE_BRIDGE_HOME/agents/.claude/settings.effective.json"
+  EFFECTIVE="$FIXTURE_BRIDGE_HOME/agents/.claude/settings.effective.json" # noqa: iso-helper-boundary — test-fixture settings.effective.json path inside an isolated smoke BRIDGE_HOME, not a controller->iso boundary site
 }
 
 invoke_shared_renderer() {
@@ -132,7 +132,7 @@ assert_adoption_fold_preserves_model() {
   # The shared effective target the symlink will point at — render it fresh
   # WITHOUT model (simulating the pre-#1756 render output the operator never
   # had model folded into).
-  local shared_effective="$SMOKE_TMP_ROOT/shared/settings.effective.json"
+  local shared_effective="$SMOKE_TMP_ROOT/shared/settings.effective.json" # noqa: iso-helper-boundary — test-fixture settings.effective.json path inside an isolated smoke tmp root, not a controller->iso boundary site
   mkdir -p "$(dirname "$shared_effective")"
   python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" render-shared-settings \
     --base-settings-file "$BASE" \
