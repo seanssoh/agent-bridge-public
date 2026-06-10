@@ -12894,6 +12894,17 @@ cmd_sync_cycle() {
   ( bridge_reconcile_idle_markers ) || true
   BRIDGE_DAEMON_LAST_STEP="bootstrap_recovery"
   ( recover_claude_bootstrap_blockers ) || true
+  # Issue #1762: no-LLM picker auto-resolve scan. Runs AFTER bootstrap_recovery
+  # so the existing Claude trust/summary advancer owns those states first (the
+  # catalog's defer entries route back to it, never compete). Cadence-gated
+  # (default 30s) — one cheap `tmux capture-pane` per managed session per due
+  # tick, busy sessions skipped before the capture. The whole stage is opt-in
+  # (bridge_picker_enabled, default off) so a fresh install never auto-keys
+  # without operator intent. Subshell-wrapped per the #1338 set -e discipline.
+  _bridge_daemon_mark_progress "picker_autoresolve"
+  if bridge_daemon_pass_due picker_autoresolve "${BRIDGE_DAEMON_PICKER_AUTORESOLVE_INTERVAL_SECONDS:-30}"; then
+    ( bridge_picker_scan_all_sessions ) || true
+  fi
   # Issue #589: prompt-ready latch reconciliation runs BEFORE the
   # attention-spool flush so an agent whose prompt just became visible
   # gets latched and its spooled wakes drain in the same sync tick.

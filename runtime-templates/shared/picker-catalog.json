@@ -1,0 +1,121 @@
+{
+  "_comment": "Picker auto-resolve fingerprint catalog (#1762). Data-only — edited as data, never code. Each entry pairs a regex fingerprint with a resolution policy. The daemon's no-LLM detector (lib/bridge-picker.sh + lib/bridge-picker.py) matches the last ~40 captured pane lines against `match` (ALL regexes must be present), confirms `stuck_confirm_ticks` consecutive ticks with an unchanged pane hash, then dispatches `policy`. Install-local additions/overrides live in $BRIDGE_SHARED_DIR/picker-catalog.local.json (git-ignored, machine-specific OK there). Confidence: [approx] entries ship DISABLED until a verbatim pane capture replaces the regex (see the picker-resolve escalation skill); [exact] entries are grounded in a real observed string and may ship enabled. Catalog ground truth seeded by patch 2026-06-10 at the install's shared/picker-captures/INVENTORY.md.",
+  "version": 1,
+  "defaults": {
+    "stuck_confirm_ticks": 2,
+    "antiloop_window_seconds": 120,
+    "antiloop_max_resolves": 3,
+    "unknown_stuck_minutes": 5
+  },
+  "entries": [
+    {
+      "picker_id": "claude-trust-folder",
+      "engine": "claude",
+      "enabled": true,
+      "confidence": "exact",
+      "comment": "Trust prompt. Strings verbatim from lib/bridge-tmux.sh bridge_tmux_claude_blocker_state_from_text ('Quick safety check:' + 'Yes, I trust this folder') — already grounded in-repo. policy=defer routes to the EXISTING trust machinery (recover_claude_bootstrap_blockers / bridge_tmux_prepare_claude_session); the picker stage does NOT key it directly. INVENTORY slug: claude-trust-folder.",
+      "match": [
+        "Quick safety check:",
+        "Yes, I trust this folder"
+      ],
+      "policy": "defer",
+      "defer_to": "trust_machinery"
+    },
+    {
+      "picker_id": "claude-resume-summary",
+      "engine": "claude",
+      "enabled": true,
+      "confidence": "exact",
+      "comment": "Claude resume-from-summary blocker. Strings verbatim from lib/bridge-tmux.sh ('Resume from summary (recommended)' + 'Resume full session as-is') — grounded in-repo. policy=defer routes to the EXISTING summary-blocker machinery (recover_claude_bootstrap_blockers state=summary). NOTE: this is the resume-from-summary blocker, distinct from the resume/compact LIST picker (claude-resume-compact below).",
+      "match": [
+        "Resume from summary \\(recommended\\)",
+        "Resume full session as-is"
+      ],
+      "policy": "defer",
+      "defer_to": "summary_machinery"
+    },
+    {
+      "picker_id": "codex-update",
+      "engine": "codex",
+      "enabled": false,
+      "confidence": "approx",
+      "comment": "TODO[verbatim-capture]: codex update prompt. Strings APPROX from INVENTORY.md #1 ('A new version of Codex is available' / 'Update now? [Y/n]'); the codex TUI may render a selectable list instead. Operator policy: Update + restart, then resume the SAME session (success = session_id preserved post-restart). DISABLED until shared/picker-captures/codex-update-<date>.txt lands and replaces these regexes. When enabling: keep expect_restart=true and post_resolve_verify=true so the restart-resume is confirmed, not assumed.",
+      "match": [
+        "[Nn]ew version of [Cc]odex is available",
+        "[Uu]pdate now"
+      ],
+      "policy": "auto_resolve",
+      "keys": ["confirm"],
+      "expect_restart": true,
+      "post_resolve_verify": true
+    },
+    {
+      "picker_id": "claude-resume-compact",
+      "engine": "claude",
+      "enabled": false,
+      "confidence": "approx",
+      "comment": "TODO[verbatim-capture]: claude resume / post-compact LIST picker. Strings APPROX from INVENTORY.md #2 ('Continue where you left off' / 'Start a new conversation'). Operator policy: pick CONTINUE-CURRENT ('그냥 시작' — continue the existing session). 'Start a new conversation' is the DESTRUCTIVE wrong answer (loses the thread) — encoded in destructive_match so the resolver refuses to advance if the highlighted/selected option matches it. DISABLED until shared/picker-captures/claude-resume-compact-<date>.txt lands. post_resolve_verify=true.",
+      "match": [
+        "Continue where you left off",
+        "Start a new conversation"
+      ],
+      "destructive_match": [
+        "Start a new conversation"
+      ],
+      "policy": "auto_resolve",
+      "keys": ["select_first", "confirm"],
+      "post_resolve_verify": true
+    },
+    {
+      "picker_id": "codex-login-expired",
+      "engine": "codex",
+      "enabled": false,
+      "confidence": "approx",
+      "comment": "TODO[verbatim-capture]: codex login / session-expired auth surface. Strings APPROX from INVENTORY.md #4 ('Your session has expired' / 'Sign in again'). Operator policy: NEVER auto-key an auth flow — escalate only. policy=escalate means the detector files a queue task to the admin and sends ZERO keystrokes. Stays escalate-only forever (no keys field); enabling it only turns on detection->escalation, never auto-keying.",
+      "match": [
+        "[Ss]ession has expired",
+        "[Ss]ign in again"
+      ],
+      "policy": "escalate"
+    },
+    {
+      "picker_id": "claude-permission",
+      "engine": "claude",
+      "enabled": false,
+      "confidence": "approx",
+      "comment": "TODO[verbatim-capture]: claude tool-permission prompt (rare — fleet runs --dangerously-skip-permissions). Strings APPROX from INVENTORY.md #5 ('wants to run' / select Yes/No). Operator policy: NO blanket auto-yes — route to the install's permission-approval flow (patch-permission-approval skill / [PERMISSION] queue). policy=escalate sends ZERO keystrokes; escalation_route=permission_approval tags the task so the admin routes it correctly. Never gains a keys field.",
+      "match": [
+        "Claude wants to run",
+        "Yes, and don't ask again"
+      ],
+      "policy": "escalate",
+      "escalation_route": "permission_approval"
+    },
+    {
+      "picker_id": "claude-autoupdate-failed",
+      "engine": "claude",
+      "enabled": true,
+      "confidence": "exact",
+      "comment": "NON-PICKER context signal — NOT a stuck state. Verbatim Claude CLI status string observed live 2026-06-10 ('Auto-update failed' + 'Run /doctor'). This is a non-blocking STATUS-LINE banner; agents keep taking prompts. policy=non_picker means the detector explicitly EXCLUDES it from stuck-state matching so it can never register as stuck or trigger a resolution. Kept in the catalog so the exclusion is data-driven and the precursor relationship to claude-update-manual (below) is documented.",
+      "match": [
+        "Auto-update failed",
+        "Run /doctor"
+      ],
+      "policy": "non_picker"
+    },
+    {
+      "picker_id": "claude-update-manual",
+      "engine": "claude",
+      "enabled": false,
+      "confidence": "placeholder",
+      "comment": "PLACEHOLDER[verbatim-capture]: manual claude-update picker. As of 2026-06-10 claude auto-update is failing fleet-wide (see claude-autoupdate-failed), so a MANUAL update picker may soon appear. No real string observed yet — match is an obviously-unreachable sentinel so this entry can NEVER fire until a real capture replaces it. Documented disabled placeholder per the operator/patch heads-up. When the picker is seen: capture it to shared/picker-captures/claude-update-manual-<date>.txt, replace match with the verbatim regex, set the resume-preserving policy, and enable.",
+      "match": [
+        "__picker_placeholder_never_matches_a8f3c1__"
+      ],
+      "policy": "auto_resolve",
+      "keys": ["confirm"],
+      "expect_restart": true,
+      "post_resolve_verify": true
+    }
+  ]
+}
