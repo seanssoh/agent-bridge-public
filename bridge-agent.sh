@@ -2841,7 +2841,17 @@ managed_defaults = hooks.managed_claude_settings_defaults(launch_cmd or None, ag
 operator_global_layer = {}
 if operator_global_file and hasattr(hooks, "_filter_operator_global_base"):
     _global_path = Path(operator_global_file).expanduser()
-    if _global_path.exists():
+    # #1759: mirror the renderer's self-reference loop guard so the plan's
+    # `expected` matches what the renderer actually wrote on a shared-admin
+    # layout where the operator-global is a symlink to THIS agent's own
+    # effective file. Without this the plan would keep the (now-skipped)
+    # global layer in `expected` and report `needs-rerender` forever even
+    # though the renderer correctly degraded to the bridge base. Reuse the
+    # renderer's helper so the two stay symmetric.
+    _self_ref = hasattr(hooks, "_operator_global_is_self_reference") and (
+        hooks._operator_global_is_self_reference(_global_path, effective_path)
+    )
+    if not _self_ref and _global_path.exists():
         try:
             _global_payload = json.loads(_global_path.read_text(encoding="utf-8"))
         except Exception:
@@ -3060,9 +3070,74 @@ if int(failed_count):
 PY
 }
 
+# #1759 blast-radius guard: detect whether applying a rerender for `$agent`
+# would WRITE THROUGH a symlink whose fully-resolved target IS the operator's
+# hand-edited global `~/.claude/settings.json`. On a shared-admin layout the
+# operator's global is a bridge-managed symlink to the agent's own
+# settings.effective.json, so a render-apply rewrites the operator's global
+# wholesale. Prints the resolved operator-global file path (the file the apply
+# would clobber) and returns 0 when the apply is a self-reference; returns 1
+# otherwise. iso-v2 agents are exempt — they render through the isolated-home
+# path and never inherit the operator-global (so `operator_global_file` is
+# empty and the guard returns 1).
+bridge_agent_rerender_writes_operator_global() {
+  local agent="$1"
+  local operator_global_file=""
+  local effective_file=""
+  # Mirror the renderer's scope: skip the resolution for iso-v2 agents.
+  if [[ -z "$agent" ]] \
+      || ! command -v bridge_hook_operator_global_settings_file >/dev/null 2>&1; then
+    return 1
+  fi
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    return 1
+  fi
+  operator_global_file="$(bridge_hook_operator_global_settings_file 2>/dev/null || true)"
+  [[ -n "$operator_global_file" ]] || return 1
+  effective_file="$(bridge_hook_per_agent_settings_effective_file "$agent")"
+  [[ -n "$effective_file" ]] || return 1
+  # Reuse the renderer's Python self-reference helper so the shell guard and
+  # the render loop-break share one detection. Print the operator-global file
+  # on a match so the caller can name it in the refusal message.
+  bridge_require_python
+  BRIDGE_SELFREF_HOOKS="$SCRIPT_DIR/bridge-hooks.py" \
+  BRIDGE_SELFREF_GLOBAL="$operator_global_file" \
+  BRIDGE_SELFREF_EFFECTIVE="$effective_file" \
+    python3 -c '
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+hooks_py = os.environ["BRIDGE_SELFREF_HOOKS"]  # noqa: iso-helper-boundary — os.environ (.environ) false-matches the .env boundary pattern; this is an env-var read of a controller-resolved path, not an isolated .env artifact
+global_file = os.environ["BRIDGE_SELFREF_GLOBAL"]  # noqa: iso-helper-boundary — os.environ (.environ) false-matches the .env boundary pattern; this is an env-var read of a controller-resolved path, not an isolated .env artifact
+effective_file = os.environ["BRIDGE_SELFREF_EFFECTIVE"]  # noqa: iso-helper-boundary — os.environ (.environ) false-matches the .env boundary pattern; this is an env-var read of a controller-resolved path, not an isolated .env artifact
+spec = importlib.util.spec_from_file_location("bridge_hooks", hooks_py)
+if spec is None or spec.loader is None:
+    sys.exit(1)
+hooks = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hooks)
+fn = getattr(hooks, "_operator_global_is_self_reference", None)
+if fn is None:
+    sys.exit(1)
+if fn(Path(global_file).expanduser(), Path(effective_file).expanduser()):
+    print(global_file)
+    sys.exit(0)
+sys.exit(1)
+'
+}
+
 run_rerender_settings() {
   local apply=0
   local json_mode=0
+  # #1759: explicit opt-in to apply a rerender that would WRITE THROUGH a
+  # symlink whose target doubles as the operator's hand-edited global
+  # `~/.claude/settings.json`. Without it, such a target is refused (the
+  # apply would rewrite the operator's global wholesale — the live install's
+  # deliberately-held effective_ok=false drift). With it, the operator has
+  # acknowledged the blast radius.
+  local force_operator_global=0
   local agent=""
   local workdir=""
   local canonical=""
@@ -3092,8 +3167,12 @@ run_rerender_settings() {
         json_mode=1
         shift
         ;;
+      --force-operator-global)
+        force_operator_global=1
+        shift
+        ;;
       -h|--help)
-        printf 'Usage: %s rerender-settings [<agent>...] [--apply|--dry-run] [--json]\n' "$(basename "$0")"
+        printf 'Usage: %s rerender-settings [<agent>...] [--apply|--dry-run] [--json] [--force-operator-global]\n' "$(basename "$0")"
         return 0
         ;;
       --*)
@@ -3185,6 +3264,27 @@ run_rerender_settings() {
     rm -f "$_probe_stderr"
     error=""
     if [[ $apply -eq 1 ]]; then
+      # #1759 blast-radius guard: if applying would write through a symlink
+      # whose resolved target IS the operator's hand-edited global
+      # `~/.claude/settings.json`, refuse unless --force-operator-global was
+      # given. The render itself already breaks the inheritance loop (#1759
+      # in cmd_render_shared_settings), but the WRITE still lands on the file
+      # the operator treats as their global. Naming the file in the refusal
+      # lets the operator decide. The live install holds exactly this drift
+      # (effective_ok=false) deliberately un-applied; the flag is what makes
+      # the apply safe to ever run.
+      local _selfref_global=""
+      if [[ $force_operator_global -ne 1 ]] \
+          && _selfref_global="$(bridge_agent_rerender_writes_operator_global "$agent" 2>/dev/null)" \
+          && [[ -n "$_selfref_global" ]]; then
+        error="refused: applying would write through a symlink to the operator's global settings file ($_selfref_global), rewriting it wholesale. Re-run with --force-operator-global to acknowledge and apply (#1759)."
+        bridge_warn "rerender-settings: target='$agent' $error"
+        after_json="$before_json"
+        row_json="$(bridge_agent_rerender_row_json apply "$before_json" "$after_json" "$error")"
+        printf '%s\n' "$row_json" >>"$rows_file"
+        failed_count=$((failed_count + 1))
+        continue
+      fi
       # Issue #570: managed autoCompactWindow default is unconditionally
       # 1_000_000; launch_cmd is forwarded only for caller-signature parity
       # with helpers that still accept it (no longer consulted by the renderer).

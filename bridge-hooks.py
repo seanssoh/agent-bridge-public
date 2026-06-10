@@ -1641,6 +1641,127 @@ def _warn_filtered_operator_global_keys(dropped: list[str], context: str) -> Non
     )
 
 
+def _is_render_output_path(path: Path) -> bool:
+    """True when `path` matches a bridge-managed render OUTPUT location.
+
+    A bridge render writes the effective settings file (the `effective` leaf
+    under a `.claude` directory) at three target shapes — the shared per-agent
+    target, the isolated-home target, and the mirrored launched-config target
+    — all of which share that leaf-under-`.claude` shape. #1759: the operator-
+    global inherit (#11901) becomes self-referential when the operator's
+    `~/.claude` settings link is a bridge-managed symlink to one of these
+    outputs. Pattern match (leaf name + parent `.claude`) is the cheap pre-
+    filter; the authoritative self-ref test in
+    `_operator_global_is_self_reference` is the realpath equality against THE
+    effective file being rendered.
+    """
+    try:
+        return path.name == "settings.effective.json" and path.parent.name == ".claude"  # noqa: iso-helper-boundary — pure in-memory PurePath name/parent inspection of a controller-resolved render target; no filesystem read of an isolated artifact
+    except (IndexError, ValueError):
+        return False
+
+
+def _operator_global_is_self_reference(
+    operator_global_path: Path, effective_path: Path
+) -> bool:
+    """#1759 loop guard: is the operator-global base THIS agent's own output?
+
+    On a shared-admin layout the operator's `~/.claude/settings.json` can be a
+    bridge-managed symlink whose target IS this agent's `settings.effective.
+    json` (created by `link-shared-settings`). Inheriting it as the #11901
+    bottom-most base then reads the agent's own previous render output as its
+    base layer — a self-sustaining loop (benign-key resurrection / decay
+    inversion / accidental operator-edit survival; see the issue). The fix is
+    to break the loop ONLY for the agent that owns the effective file: every
+    OTHER agent reading through the same symlink resolves to a DIFFERENT
+    `effective_path`, so this returns False for them and their one-directional
+    inherit (live-verified AC1-AC6) is untouched.
+
+    Detection is realpath-based, not a string compare, so both the direct
+    symlink (settings link -> effective file) and the nested case (settings
+    link -> intermediate -> effective file) collapse to the same fully-
+    resolved target before comparison.
+
+    Fail SAFE: when the operator-global path *looks* like a render output (the
+    `effective` leaf under a `.claude` directory, per `_is_render_output_path`)
+    but its realpath cannot be conclusively resolved and matched — broken link,
+    permission boundary, indeterminate ownership — we treat it as a self-
+    reference and break the loop. Degrading to the bridge base is always safe
+    (it is the pre-#11901 behavior); risking the loop is not.
+    """
+    def _resolve(path: Path) -> str:
+        owner = _resolve_isolated_owner_for_path(path)
+        try:
+            return _safe_realpath(path, owner)
+        except OSError:
+            # Mid-path stat blocked with no iso owner to escalate through.
+            # Return empty so the caller treats resolution as indeterminate
+            # and fails safe (rather than crashing the render).
+            return ""
+
+    global_real = _resolve(operator_global_path)
+    effective_real = _resolve(effective_path)
+
+    # Authoritative self-reference: the resolved operator-global IS the exact
+    # effective file we are about to write.
+    if global_real and effective_real and global_real == effective_real:
+        return True
+
+    # Case-insensitive filesystems (macOS APFS default): realpath PRESERVES
+    # the requested spelling, so a symlink target that differs from the
+    # effective path only by casing compares unequal above while naming the
+    # SAME file. Use inode-aware equivalence when both sides can be statted;
+    # any stat failure falls through to the output-shaped fail-safe below
+    # (never weaker than the string compare).
+    samefile_indeterminate = False
+    if global_real and effective_real:
+        try:
+            if os.path.samefile(global_real, effective_real):
+                return True
+        except OSError:
+            # samefile raises when EITHER side cannot be statted. The
+            # EFFECTIVE side commonly does not exist yet — an agent's FIRST
+            # render writes it — and that is the normal one-directional
+            # inherit (#11901 AC1), not a suspect global. Equivalence is only
+            # truly UNPROVEN when the GLOBAL side itself cannot be statted
+            # (e.g. the symlink resolves to a MISSING output-shaped path —
+            # the codex r2 repro). Record only that case so the output-shaped
+            # classification below fails safe instead of being treated as
+            # "fully resolved and different" (codex r2 blocker).
+            try:
+                os.stat(global_real)
+            except OSError:
+                samefile_indeterminate = True
+
+    # The operator-global is not (or not provably) this agent's effective
+    # file. Decide whether it is another agent's render output (legit inherit)
+    # or an indeterminate output-shaped target (fail safe).
+    global_shape_path = Path(global_real) if global_real else operator_global_path
+    if _is_render_output_path(global_shape_path):
+        if samefile_indeterminate:
+            # Output-shaped AND same-file equivalence unproven -> we cannot
+            # rule out that this is our own output. Fail safe: break the loop
+            # and degrade to the bridge base.
+            return True
+        if global_real and effective_real:
+            # Both paths fully resolved, they differ, and the global target
+            # is statable (the indeterminate flag above did not fire) -> it
+            # is ANOTHER agent's effective file reached one-directionally
+            # through the symlink. That is the live-verified correct inherit
+            # (#11901 AC1-AC6) — including the first-render case where OUR
+            # effective file does not exist yet. Keep it, do not break the
+            # loop.
+            return False
+        # Output-shaped but resolution was indeterminate (a realpath came back
+        # empty) -> we cannot prove it is NOT this agent's own output. Fail
+        # safe: break the loop and degrade to the bridge base.
+        return True
+
+    # Not output-shaped: a genuine operator-authored `~/.claude/settings.json`.
+    # Inherit normally.
+    return False
+
+
 # Issue #1495: Claude Code skips the ENTIRE settings.json (every key —
 # enabledPlugins, skipDangerousModePermissionPrompt, the lot) when the
 # `hooks` record carries an event name the CLI does not recognize
@@ -1970,10 +2091,33 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     operator_global_layer: dict[str, Any] = {}
     if operator_global_path_arg is not None:
         operator_global_path = Path(operator_global_path_arg).expanduser()
-        try:
-            operator_global_payload = load_json(operator_global_path)
-        except (OSError, json.JSONDecodeError):
+        # #1759 loop guard: on a shared-admin layout the operator's
+        # `~/.claude/settings.json` can be a bridge-managed symlink to THIS
+        # agent's own `settings.effective.json` (created by
+        # `link-shared-settings`). Inheriting it as the #11901 base would make
+        # the render read its own previous output as the bottom layer — a
+        # self-sustaining loop (benign-key resurrection, decay inversion, and
+        # operator hand-edits surviving only by accident of the loop rather
+        # than via #1756's preserve contract). Break the loop ONLY for the
+        # owning agent by degrading to the bridge base exactly like the
+        # missing-global path; every OTHER agent's one-directional read
+        # through the same symlink resolves to a different effective file and
+        # keeps inheriting (#11901 AC1-AC6 intact).
+        if _operator_global_is_self_reference(operator_global_path, effective_path):
+            sys.stderr.write(
+                "[info] bridge-hooks: operator-global settings file resolves "
+                f"to this agent's own render output ({effective_path}); "
+                "skipping #11901 inheritance and degrading to the bridge base "
+                "to break the self-referential loop (#1759). Operator "
+                "hand-edits survive via the preserved-key pass (#1756).\n"
+            )
+            operator_global_path_arg = None
             operator_global_payload = None
+        else:
+            try:
+                operator_global_payload = load_json(operator_global_path)
+            except (OSError, json.JSONDecodeError):
+                operator_global_payload = None
         operator_global_layer, _global_dropped = _filter_operator_global_base(
             operator_global_payload
         )

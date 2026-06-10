@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Helper for scripts/smoke/1759-selfref-global-loop-guard.sh.
+
+Issue #1759: on shared-admin layouts the operator's `~/.claude/settings.json`
+is a bridge-managed SYMLINK to an agent's own `settings.effective.json` # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+(created by `link-shared-settings`). The #11901 operator-global base-read then
+becomes SELF-REFERENTIAL for that one agent — its render reads its own
+previous output as the bottom layer, a self-sustaining loop (benign-key
+resurrection, decay inversion, operator hand-edits surviving only by accident
+of the loop rather than via #1756's preserve contract).
+
+This helper drives `bridge-hooks.py render-shared-settings` end to end in a
+self-contained tempdir and asserts the loop-guard contract. It is invoked with
+file-as-argv arguments only — NO heredoc-stdin to Python (footgun #11). The
+orchestrating shell smoke passes the repo root and a scratch dir; this helper
+builds every fixture under that scratch dir and exits non-zero on the first
+failure with a diagnostic on stderr.
+
+Sub-tests (mapped to the issue's 3-part fix + the brief's smoke matrix):
+  (a) SELF-REF: agent whose operator-global resolves to its OWN effective ->
+      base = bridge base (loop broken), render succeeds, the seeded benign
+      loop key does NOT resurrect, and the PRESERVED user key (`model`) STILL
+      SURVIVES via the preserve pass over the existing effective file (#1756).
+  (b) NON-SELF-REF: a different agent on the SAME install still inherits the
+      global key (AC1 shape) — the one-directional read is untouched.
+  (c) NESTED symlink + indeterminate ownership -> safe degrade (loop broken).
+  (e) MISSING-GLOBAL degrade unchanged (pre-#11901 / pre-#1759 behavior).
+
+(Sub-test (d) — drift-apply through the self-ref symlink refused without the
+explicit flag — is pinned in the shell smoke via the
+`bridge_agent_rerender_writes_operator_global` resolver, which reuses this same
+detection.)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+FAILURES: list[str] = []
+
+
+def _check(name: str, cond: bool, detail: str = "") -> None:
+    status = "PASS" if cond else "FAIL"
+    line = f"{status} - {name}"
+    if not cond and detail:
+        line += f" :: {detail}"
+    print(line)
+    if not cond:
+        FAILURES.append(name)
+
+
+def _write(path: Path, obj: object) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+    return path
+
+
+def _stop_hook_cmd(rendered: dict) -> str:
+    try:
+        return rendered["hooks"]["Stop"][0]["hooks"][0]["command"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def _render(
+    hooks_py: Path,
+    base: Path,
+    overlay: Path,
+    effective: Path,
+    operator_global: Path | None,
+    agent_class: str = "static",
+) -> tuple[subprocess.CompletedProcess[str], dict]:
+    cmd = [
+        sys.executable,
+        str(hooks_py),
+        "render-shared-settings",
+        "--base-settings-file",
+        str(base),
+        "--overlay-settings-file",
+        str(overlay),
+        "--effective-settings-file",
+        str(effective),
+        "--agent-class",
+        agent_class,
+    ]
+    if operator_global is not None:
+        cmd += ["--operator-global-settings-file", str(operator_global)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"render-shared-settings exited {proc.returncode}: {proc.stderr}"
+        )
+    rendered = json.loads(effective.read_text(encoding="utf-8"))
+    return proc, rendered
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 3:
+        print("usage: helper.py <repo-root> <scratch-dir>", file=sys.stderr)
+        return 2
+    repo_root = Path(argv[1])
+    scratch = Path(argv[2])
+    hooks_py = repo_root / "bridge-hooks.py"
+
+    real_base = repo_root / "agents" / ".claude" / "settings.json"
+    base = _write(
+        scratch / "base" / "settings.json",
+        json.loads(real_base.read_text(encoding="utf-8")),
+    )
+    overlay = _write(scratch / "base" / "settings.local.json", {})
+
+    if "mark-idle.sh" not in _stop_hook_cmd(
+        json.loads(real_base.read_text(encoding="utf-8"))
+    ):
+        print(
+            "FATAL: tracked base lacks the expected bridge Stop hook; "
+            "fixture assumption broke",
+            file=sys.stderr,
+        )
+        return 2
+
+    # ---- (a) SELF-REF: operator-global symlink -> agent A's own effective ----
+    # The effective file at the per-agent render target shape so the detection
+    # pattern (leaf settings.effective.json under .claude) matches.
+    effA = scratch / "agents" / "A" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+    effA.parent.mkdir(parents=True, exist_ok=True)
+    # Seed the EXISTING effective file with (1) a benign key that ONLY ever
+    # entered via the loop and (2) a PRESERVED_USER_KEY (`model`) that the
+    # operator pinned. The loop-break must drop the former (no resurrection)
+    # while the latter SURVIVES the rerender via the preserve pass.
+    effA.write_text(
+        json.dumps(
+            {
+                "benignResurrect": "should-not-survive-the-loop-break",
+                "model": "claude-opus-4-8[1m]",
+            }
+        ),
+        encoding="utf-8",
+    )
+    op_home = scratch / "op-home" / ".claude"
+    op_home.mkdir(parents=True, exist_ok=True)
+    op_global = op_home / "settings.json"
+    os.symlink(effA, op_global)
+
+    proc, eff = _render(hooks_py, base, overlay, effA, op_global)
+    _check(
+        "SELF-REF loop-break info line names #1759",
+        "#1759" in proc.stderr,
+        detail=proc.stderr,
+    )
+    _check(
+        "SELF-REF benign loop key did NOT resurrect (decay not inverted)",
+        "benignResurrect" not in eff,
+        detail=json.dumps(sorted(eff.keys())),
+    )
+    _check(
+        "SELF-REF preserved user key `model` STILL survives via preserve pass (#1756)",
+        eff.get("model") == "claude-opus-4-8[1m]",
+        detail=json.dumps(eff.get("model")),
+    )
+    _check(
+        "SELF-REF bridge Stop hook intact (degraded to bridge base, render ok)",
+        "mark-idle.sh" in _stop_hook_cmd(eff),
+    )
+
+    # ---- (b) NON-SELF-REF: a DIFFERENT agent on the SAME install inherits ----
+    # Point the SAME operator-global symlink target at a benign global-only
+    # key, then render agent B (whose effective file is a different path). B's
+    # one-directional read through the symlink must still inherit it (AC1).
+    effA.write_text(
+        json.dumps(
+            {"agentPushNotifEnabled": True, "model": "claude-opus-4-8[1m]"}
+        ),
+        encoding="utf-8",
+    )
+    effB = scratch / "agents" / "B" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+    effB.parent.mkdir(parents=True, exist_ok=True)
+    procB, effBr = _render(hooks_py, base, overlay, effB, op_global)
+    _check(
+        "NON-SELF-REF agent B inherits operator-global key (AC1 shape intact)",
+        effBr.get("agentPushNotifEnabled") is True,
+        detail=json.dumps(effBr.get("agentPushNotifEnabled")),
+    )
+    _check(
+        "NON-SELF-REF agent B render emits NO #1759 loop-break line",
+        "#1759" not in procB.stderr,
+        detail=procB.stderr,
+    )
+
+    # ---- (c) NESTED symlink chain -> still detected as self-ref for owner ----
+    effC = scratch / "agents" / "C" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+    effC.parent.mkdir(parents=True, exist_ok=True)
+    effC.write_text(json.dumps({"model": "claude-opus-4-8[1m]"}), encoding="utf-8")
+    inter = scratch / "intermediate.json"
+    os.symlink(effC, inter)
+    op_home_c = scratch / "op-home-c" / ".claude"
+    op_home_c.mkdir(parents=True, exist_ok=True)
+    op_global_nested = op_home_c / "settings.json"
+    os.symlink(inter, op_global_nested)
+    procC, effCr = _render(hooks_py, base, overlay, effC, op_global_nested)
+    _check(
+        "NESTED self-ref (settings.json -> X -> effective) -> loop broken",
+        "#1759" in procC.stderr,
+        detail=procC.stderr,
+    )
+    _check(
+        "NESTED self-ref preserved `model` still survives",
+        effCr.get("model") == "claude-opus-4-8[1m]",
+        detail=json.dumps(effCr.get("model")),
+    )
+
+    # ---- (d2) CASE-VARIANT self-ref on case-insensitive filesystems ----
+    # macOS APFS default is case-insensitive: a symlink target spelled with
+    # different casing names the SAME file, but realpath PRESERVES the
+    # spelling so the string compare misses it (codex r1 blocker). The fix
+    # uses inode-aware os.path.samefile. Skip when the scratch fs is
+    # case-sensitive (the spelling variant would be a different file).
+    effE = scratch / "agents" / "CaseAgent" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+    effE.parent.mkdir(parents=True, exist_ok=True)
+    effE.write_text(json.dumps({"model": "claude-opus-4-8[1m]"}), encoding="utf-8")
+    case_variant = Path(str(effE).replace("CaseAgent", "caseagent"))
+    if case_variant.exists():  # case-insensitive fs: same file via other spelling
+        op_home_e = scratch / "op-home-e" / ".claude"
+        op_home_e.mkdir(parents=True, exist_ok=True)
+        op_global_case = op_home_e / "settings.json"
+        os.symlink(case_variant, op_global_case)
+        procE, effEr = _render(hooks_py, base, overlay, effE, op_global_case)
+        _check(
+            "CASE-VARIANT self-ref (APFS case-insensitive) -> loop broken via samefile",
+            "#1759" in procE.stderr,
+            detail=procE.stderr,
+        )
+        _check(
+            "CASE-VARIANT self-ref preserved `model` still survives",
+            effEr.get("model") == "claude-opus-4-8[1m]",
+            detail=json.dumps(effEr.get("model")),
+        )
+    else:
+        print("skip: case-sensitive filesystem — case-variant self-ref not reproducible here")
+
+    # ---- (d3) BROKEN output-shaped target: samefile-indeterminate fail-safe ----
+    # codex r2 blocker repro: the operator-global symlink resolves to a
+    # MISSING output-shaped settings.effective.json. samefile() raises
+    # (FileNotFoundError is an OSError) while both realpaths are non-empty —
+    # the guard must FAIL SAFE (break the loop), not treat it as "fully
+    # resolved and different" (inherit).
+    # Axis pinned here: effective EXISTS + global target MISSING -> fail-safe
+    # break. (The inverse axis — effective missing on FIRST render + global
+    # statable -> inherit — is case (b) above: effB is never pre-written.)
+    effF = scratch / "agents" / "F" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+    effF.parent.mkdir(parents=True, exist_ok=True)
+    effF.write_text(json.dumps({"model": "claude-opus-4-8[1m]"}), encoding="utf-8")
+    missing_output = scratch / "missing" / "F" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+    missing_output.parent.mkdir(parents=True, exist_ok=True)
+    op_home_f = scratch / "op-home-f" / ".claude"
+    op_home_f.mkdir(parents=True, exist_ok=True)
+    op_global_broken = op_home_f / "settings.json"
+    os.symlink(missing_output, op_global_broken)
+    procF, effFr = _render(hooks_py, base, overlay, effF, op_global_broken)
+    _check(
+        "BROKEN output-shaped target (samefile OSError) -> fail-safe loop break",
+        "#1759" in procF.stderr,
+        detail=procF.stderr,
+    )
+    _check(
+        "BROKEN output-shaped target: bridge base intact (Stop hook present)",
+        "mark-idle.sh" in _stop_hook_cmd(effFr),
+    )
+    _check(
+        "BROKEN output-shaped target: preserved `model` still survives (#1756)",
+        effFr.get("model") == "claude-opus-4-8[1m]",
+        detail=json.dumps(effFr.get("model")),
+    )
+
+    # ---- (e) MISSING-GLOBAL degrade unchanged ----
+    effD = scratch / "agents" / "D" / ".claude" / "settings.effective.json" # noqa: iso-helper-boundary — settings.effective.json test-fixture path inside an isolated smoke home (the smoke SUBJECT is the effective-file symlink), not a controller->iso boundary site
+    procD, effDr = _render(
+        hooks_py,
+        base,
+        overlay,
+        effD,
+        scratch / "does-not-exist" / ".claude" / "settings.json",
+    )
+    _check(
+        "MISSING-GLOBAL degrade: bridge base intact (Stop hook present)",
+        "mark-idle.sh" in _stop_hook_cmd(effDr),
+    )
+    _check(
+        "MISSING-GLOBAL degrade: no #1759 loop-break line (not output-shaped)",
+        "#1759" not in procD.stderr,
+        detail=procD.stderr,
+    )
+
+    if FAILURES:
+        print(f"\n{len(FAILURES)} assertion(s) failed:", file=sys.stderr)
+        for name in FAILURES:
+            print(f"  - {name}", file=sys.stderr)
+        return 1
+    print("\nall #1759 self-ref loop-guard assertions passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
