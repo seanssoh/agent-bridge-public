@@ -3448,6 +3448,52 @@ bridge_a2a_receiver_env_incident_clear() {
   return 0
 }
 
+# --- A2A supervisor discriminator wrappers (#1679 r3) ----------------------
+# The supervisor tick invokes the three read-only liveness/self-route/bind-IP
+# discriminators ONLY through these single-purpose wrappers. Each wrapper runs
+# the REAL `bridge-handoffd.py` subcommand against the production bind/auth
+# contract: it scrubs the smoke-only insecure-bind escape hatches
+# (BRIDGE_A2A_ALLOW_TEST_BIND / BRIDGE_A2A_DEV_INSECURE_BIND — #1414) from the
+# child env so an auto-restart can never inherit a loopback/insecure bind, and
+# passes NO forced-verdict arg and reads NO forced-verdict env var of any name
+# (the inherited-env bypass closed in #1679 r3).
+#
+# These wrappers are the smoke's NON-INHERITABLE test seam: the hermetic smoke
+# sources bridge-daemon.sh and REDEFINES the relevant wrapper in its own shell
+# to echo a deterministic discriminator word, then calls
+# process_a2a_receiver_supervise_tick in-process. A function redefinition lives
+# only in the process that defined it — it cannot ride an env var or a CLI arg
+# across the fork+exec a real daemon performs, so production can never reach it.
+# stdout is the discriminator word(s); the caller greps for the reason token.
+# Args: $1 = config path, $2 = healthz/self-reach timeout (ignored by bind-ip).
+# The subprocess timeout is wrapped INSIDE each function (not by the caller) so
+# the wrapper is a single overridable unit: redefining it in the smoke replaces
+# the entire timeout+probe, and `timeout(1)` is never asked to exec a shell
+# function (which it cannot).
+_a2a_supervise_run_healthz() {
+  local _config="$1" _timeout="$2"
+  bridge_with_timeout 10 a2a_receiver_healthz \
+    env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
+      python3 "$SCRIPT_DIR/bridge-handoffd.py" healthz \
+        --config "$_config" --timeout "$_timeout" 2>/dev/null
+}
+
+_a2a_supervise_run_self_reach() {
+  local _config="$1" _timeout="$2"
+  bridge_with_timeout 10 a2a_receiver_self_reach \
+    env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
+      python3 "$SCRIPT_DIR/bridge-handoffd.py" self-reach \
+        --config "$_config" --timeout "$_timeout" 2>/dev/null
+}
+
+_a2a_supervise_run_bind_ip_present() {
+  local _config="$1"
+  bridge_with_timeout 10 a2a_receiver_bind_ip_present \
+    env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
+      python3 "$SCRIPT_DIR/bridge-handoffd.py" bind-ip-present \
+        --config "$_config" 2>/dev/null
+}
+
 process_a2a_receiver_supervise_tick() {
   local interval_str="${BRIDGE_A2A_RECEIVER_SUPERVISE_INTERVAL_SECONDS:-30}"
   local interval
@@ -3476,37 +3522,33 @@ process_a2a_receiver_supervise_tick() {
   [[ "$admin_cooldown" =~ ^[0-9]+$ ]] || admin_cooldown=1800
   [[ "$healthz_timeout" =~ ^[0-9.]+$ ]] || healthz_timeout=3
 
-  # --- HERMETIC-SMOKE forced-verdict forward hook (#1679 r2) ---------------
-  # SECURITY: the discriminator subcommands (`healthz` / `self-reach`) honor a
-  # forced verdict ONLY via an explicit `--test-verdict` CLI ARGUMENT — they read
-  # NO env var. The macOS self-route flap / SYN-blackhole are not portably
-  # reproducible in a hermetic smoke, so the smoke drives the supervisor's
-  # HOLD/restart classification by setting these CLEARLY-NAMED forward-hook vars,
-  # which the supervisor forwards to the probe subprocess as `--test-verdict`.
-  # The PRODUCTION path sets NEITHER var, so it forwards NO arg and the
-  # subcommand always does a real probe — the inherited-env bypass (a real daemon
-  # inheriting a forced verdict) is STRUCTURALLY impossible because the verdict
-  # rides a CLI arg the production supervisor never constructs, not an env var the
-  # subcommand reads. Verdict values are validated against the known discriminator
-  # words; an unknown value is dropped (no arg forwarded). These hooks affect ONLY
-  # the read-only liveness/self-reach DISCRIMINATOR WORD — never bind/serve/auth.
-  local healthz_verdict_arg=() self_reach_verdict_arg=()
-  local _smoke_healthz_v="${BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_HEALTHZ_VERDICT:-}"
-  local _smoke_self_v="${BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_SELF_REACH_VERDICT:-}"
-  if [[ -n "$_smoke_healthz_v" ]]; then
-    case "$_smoke_healthz_v" in
-      healthy|bind_unresolved|healthz_timeout|healthz_badbody|healthz_status:*)
-        healthz_verdict_arg=(--test-verdict "$_smoke_healthz_v") ;;
-      *) daemon_warn "[a2a_receiver_supervise] ignoring unknown TEST healthz verdict ($_smoke_healthz_v)" ;;
-    esac
-  fi
-  if [[ -n "$_smoke_self_v" ]]; then
-    case "$_smoke_self_v" in
-      self_reachable|self_unreachable|self_probe_error)
-        self_reach_verdict_arg=(--test-verdict "$_smoke_self_v") ;;
-      *) daemon_warn "[a2a_receiver_supervise] ignoring unknown TEST self-reach verdict ($_smoke_self_v)" ;;
-    esac
-  fi
+  # --- discriminator seam (#1679 r3) ---------------------------------------
+  # SECURITY: the production supervisor reads NO forced-verdict env var of ANY
+  # name and passes NO forced-verdict CLI arg, EVER. The earlier forward-hook
+  # design (r2) read CLEARLY-NAMED env vars and forwarded them to the probe
+  # subcommand as a forced-verdict arg — but an env-driven forward hook has the
+  # SAME inheritance semantics as the original bug: a real daemon launched with
+  # those vars in its environment would still force the supervisor's
+  # liveness/self-reach classification without a real probe (the daemon-critical
+  # inherited-env bypass). Renaming the env var did not close it.
+  #
+  # The discriminator subprocess invocations now live in three single-purpose
+  # wrapper functions — `_a2a_supervise_run_healthz`,
+  # `_a2a_supervise_run_self_reach`, `_a2a_supervise_run_bind_ip_present`
+  # (defined below this function). The supervisor tick calls ONLY those
+  # wrappers, which always run the REAL read-only discriminator subcommand
+  # against the production bind/auth contract. There is NO env or arg path to
+  # force a verdict in production.
+  #
+  # The hermetic smoke (which CANNOT portably reproduce the macOS self-route
+  # flap / SYN-blackhole) drives a deterministic verdict by SOURCING
+  # bridge-daemon.sh into its own shell and REDEFINING the relevant wrapper
+  # function to echo the desired discriminator word, then calling
+  # process_a2a_receiver_supervise_tick IN-PROCESS. A real daemon never sources
+  # the smoke, so this seam is STRUCTURALLY non-inheritable: a function
+  # redefinition exists only in the process that defined it and cannot ride an
+  # environment variable or a CLI argument across a fork+exec. See
+  # scripts/smoke/1679-1680-a2a-receiver-supervisor-robustness.sh.
 
   local handoff_dir="$BRIDGE_STATE_DIR/handoff"
   mkdir -p "$handoff_dir" 2>/dev/null || true
@@ -3603,26 +3645,20 @@ process_a2a_receiver_supervise_tick() {
     reason="process_gone"
   else
     # --- stage 2: serve probe (only when the process gate passed) ---
-    # SECURITY (#1414 codex r1 / #1679 r2): scrub the smoke-only insecure-bind
-    # escape hatches AND any legacy forced-verdict env vars from EVERY
-    # supervisor-owned subprocess. If the daemon itself was launched with
-    # BRIDGE_A2A_ALLOW_TEST_BIND / BRIDGE_A2A_DEV_INSECURE_BIND in its env (e.g. a
-    # test harness), a plain child would inherit them — letting an auto-restart
-    # bring the receiver up on a loopback bind or with the peer-secret gate
-    # bypassed. The supervisor must never propagate them; the production bind/auth
-    # contract is non-negotiable for a daemon-driven action. The
-    # BRIDGE_A2A_HEALTHZ_TEST_VERDICT / BRIDGE_A2A_SELF_REACH_TEST_VERDICT scrubs
-    # are belt-and-suspenders: the subcommands no longer READ those vars at all
-    # (#1679 r2 moved the verdict to an explicit `--test-verdict` CLI arg the
-    # production supervisor never passes), so unsetting them here is pure
-    # defense-in-depth so a stale legacy env can never influence a probe.
+    # SECURITY (#1414 codex r1 / #1679 r3): the `_a2a_supervise_run_healthz`
+    # wrapper scrubs the smoke-only insecure-bind escape hatches
+    # (BRIDGE_A2A_ALLOW_TEST_BIND / BRIDGE_A2A_DEV_INSECURE_BIND) from the probe
+    # subprocess. If the daemon itself was launched with those vars in its env
+    # (e.g. a test harness), a plain child would inherit them — letting an
+    # auto-restart bring the receiver up on a loopback bind or with the
+    # peer-secret gate bypassed. The wrapper must never propagate them; the
+    # production bind/auth contract is non-negotiable for a daemon-driven action.
+    # The wrapper passes NO forced-verdict arg and reads NO forced-verdict env
+    # var of any name — the inherited-env bypass is closed (#1679 r3). The smoke
+    # forces a deterministic verdict ONLY by redefining this wrapper in-process
+    # (a non-inheritable seam), never via the daemon's environment.
     local probe_out probe_rc=0
-    probe_out="$(bridge_with_timeout 10 a2a_receiver_healthz \
-      env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
-        -u BRIDGE_A2A_HEALTHZ_TEST_VERDICT -u BRIDGE_A2A_SELF_REACH_TEST_VERDICT \
-      python3 "$SCRIPT_DIR/bridge-handoffd.py" healthz \
-        --config "$config" --timeout "$healthz_timeout" \
-        "${healthz_verdict_arg[@]+"${healthz_verdict_arg[@]}"}" 2>/dev/null)" || probe_rc=$?
+    probe_out="$(_a2a_supervise_run_healthz "$config" "$healthz_timeout")" || probe_rc=$?
     # The reason word is the LAST stdout line (healthy / healthz_timeout /
     # healthz_status:<code> / bind_unresolved / healthz_badbody).
     healthz_reason="$(printf '%s\n' "$probe_out" | grep -E '^(healthy|healthz_timeout|healthz_status:|healthz_badbody|bind_unresolved)' | tail -1)"
@@ -3696,16 +3732,12 @@ process_a2a_receiver_supervise_tick() {
     # adds NO listen socket and does NOT touch the fail-closed bind contract.
     if [[ "$reason" == "healthz_timeout" ]]; then
       local self_out self_rc=0 self_word=""
-      # SECURITY (#1679 r2): same env scrub as the healthz probe — strip the
-      # insecure-bind hatches AND the legacy forced-verdict env vars. The
-      # `--test-verdict` arg (production-empty; smoke-only via the forward hook)
-      # is the ONLY verdict injection path.
-      self_out="$(bridge_with_timeout 10 a2a_receiver_self_reach \
-        env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
-          -u BRIDGE_A2A_HEALTHZ_TEST_VERDICT -u BRIDGE_A2A_SELF_REACH_TEST_VERDICT \
-        python3 "$SCRIPT_DIR/bridge-handoffd.py" self-reach \
-          --config "$config" --timeout "$healthz_timeout" \
-          "${self_reach_verdict_arg[@]+"${self_reach_verdict_arg[@]}"}" 2>/dev/null)" || self_rc=$?
+      # SECURITY (#1679 r3): the `_a2a_supervise_run_self_reach` wrapper applies
+      # the same insecure-bind env scrub as the healthz probe and passes NO
+      # forced-verdict arg / reads NO forced-verdict env var (inherited-env
+      # bypass closed). The smoke forces a verdict ONLY by redefining the wrapper
+      # in-process — a non-inheritable seam.
+      self_out="$(_a2a_supervise_run_self_reach "$config" "$healthz_timeout")" || self_rc=$?
       self_word="$(printf '%s\n' "$self_out" | grep -E '^(self_reachable|self_unreachable|self_probe_error)' | tail -1)"
       if [[ "$self_word" == "self_unreachable" ]]; then
         # Environmental host self-route flap — HOLD the healthy receiver.
@@ -3881,16 +3913,13 @@ process_a2a_receiver_supervise_tick() {
       return 0
     fi
     local bip_out bip_rc=0 bip_word=""
-    # SECURITY (#1414 / #1679 r2): scrub the insecure-bind hatches AND the legacy
-    # forced-verdict env vars from this discriminator subprocess too (uniform with
-    # the healthz / self-reach probes). bind-ip-present never read a verdict var;
-    # the scrub is defense-in-depth so the supervisor's discriminator subprocess
-    # env is uniformly clean.
-    bip_out="$(bridge_with_timeout 10 a2a_receiver_bind_ip_present \
-      env -u BRIDGE_A2A_ALLOW_TEST_BIND -u BRIDGE_A2A_DEV_INSECURE_BIND \
-        -u BRIDGE_A2A_HEALTHZ_TEST_VERDICT -u BRIDGE_A2A_SELF_REACH_TEST_VERDICT \
-      python3 "$SCRIPT_DIR/bridge-handoffd.py" bind-ip-present \
-        --config "$config" 2>/dev/null)" || bip_rc=$?
+    # SECURITY (#1414 / #1679 r3): the `_a2a_supervise_run_bind_ip_present`
+    # wrapper scrubs the insecure-bind hatches from this discriminator subprocess
+    # too (uniform with the healthz / self-reach probes) and passes no
+    # forced-verdict arg / reads no verdict env var. bind-ip presence is driven
+    # in the smoke via BRIDGE_A2A_IFACE_ADDRS (the interface-enumeration override
+    # honored by the real subcommand), not by overriding this wrapper.
+    bip_out="$(_a2a_supervise_run_bind_ip_present "$config")" || bip_rc=$?
     bip_word="$(printf '%s\n' "$bip_out" | grep -E '^(bind_ip_present|bind_ip_absent|bind_ip_unknown)' | tail -1)"
     if [[ "$bip_word" == "bind_ip_absent" ]]; then
       # Environmental: the tailnet IP is gone. Stamp the re-probe clock so the
@@ -14447,6 +14476,16 @@ daemon_args_have_help() {
   return 1
 }
 
+# Run the top-level verb dispatch ONLY when this file is executed directly.
+# When SOURCED (the #1679 r3 non-inheritable test seam — see
+# scripts/smoke/1679-1680-a2a-receiver-supervisor-robustness.sh), the smoke
+# loads the daemon's functions into its OWN shell, redefines a discriminator
+# wrapper to force a deterministic verdict, and calls
+# process_a2a_receiver_supervise_tick in-process — without driving the full
+# verb dispatch (which would `exit` on the empty/sourced CMD and abort the
+# smoke). A real daemon never sources this file, so the override seam is
+# structurally out of reach in production.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
 case "$CMD" in
   -h|--help|help)
     usage
@@ -14525,3 +14564,4 @@ case "$CMD" in
     exit 1
     ;;
 esac
+fi

@@ -24,20 +24,24 @@
 # Loopback harness (BRIDGE_A2A_ALLOW_TEST_BIND=1, free port) reused from
 # 1405-handoffd-supervision.sh / a2a-cross-bridge.sh. The macOS self-route flap
 # and a SYN-blackhole are not portably reproducible, so the supervisor's
-# self-reachability / healthz verdicts are driven deterministically through the
-# CLEARLY-NAMED hermetic-smoke FORWARD HOOKS
-# BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_HEALTHZ_VERDICT /
-# BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_SELF_REACH_VERDICT. The supervisor forwards
-# those to the read-only discriminator subcommands as the explicit
-# `--test-verdict` CLI argument; the subcommands honor NO env-var verdict (#1679
-# r2 — a real daemon can no longer inherit a forced verdict, the production
-# supervisor never constructs the arg). Bind-IP presence is driven via
-# BRIDGE_A2A_IFACE_ADDRS (the pre-existing interface-enumeration test override).
-# EVERY assertion has teeth: pre-fix (no self-reach / bind-ip-present
-# discriminator, no environmental hold) the relevant checks FAIL. Case (f) is the
-# #1679 r2 regression guard: the LEGACY verdict env vars exported into the
-# PRODUCTION supervisor path must NOT change classification (inherited-env bypass
-# is closed).
+# self-reachability / healthz verdicts are driven deterministically through a
+# NON-INHERITABLE IN-PROCESS SEAM (#1679 r3): this smoke SOURCES bridge-daemon.sh
+# into its own shell and REDEFINES the small discriminator wrapper functions
+# (`_a2a_supervise_run_healthz` / `_a2a_supervise_run_self_reach`) to echo the
+# desired discriminator word, then calls process_a2a_receiver_supervise_tick
+# IN-PROCESS. A function redefinition exists only in the process that defined it;
+# it cannot ride an environment variable or a CLI argument across a fork+exec, so
+# a REAL daemon (which never sources the smoke) can never reach this seam. The
+# PRODUCTION supervisor reads NO forced-verdict env var of any name and passes NO
+# forced-verdict CLI arg — the daemon-critical inherited-env bypass is closed.
+# Bind-IP presence is driven via BRIDGE_A2A_IFACE_ADDRS (the pre-existing
+# interface-enumeration test override honored by the real subcommand, not a
+# forced verdict). EVERY assertion has teeth: pre-fix (no self-reach /
+# bind-ip-present discriminator, no environmental hold) the relevant checks FAIL.
+# Case (f) is the inherited-env teeth-check: BOTH the OLD
+# (BRIDGE_A2A_HEALTHZ_TEST_VERDICT / BRIDGE_A2A_SELF_REACH_TEST_VERDICT) AND the
+# r2-era new (BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_*_VERDICT) verdict env vars,
+# exported into the PRODUCTION supervisor path, must NOT change classification.
 
 set -euo pipefail
 
@@ -54,6 +58,7 @@ trap cleanup EXIT
 
 A2A_PORT=""
 A2A_SECRET="smoke-shared-secret-do-not-use-in-prod-0123456789"
+SUPERVISE_INPROC_RUNNER=""
 
 export BRIDGE_A2A_ALLOW_TEST_BIND=1
 export BRIDGE_A2A_RECEIVER_SUPERVISE_INTERVAL_SECONDS=1
@@ -150,10 +155,84 @@ start_receiver_via_lifecycle() {
 receiver_pid_now() { cat "$(handoffd_pidfile)" 2>/dev/null || true; }
 
 # run a single supervise sync with optional inline env (KEY=VAL ... ); the
-# throttle is cleared first so the tick always runs.
+# throttle is cleared first so the tick always runs. This drives the PRODUCTION
+# verb dispatch in a fresh subprocess — used for the cases whose verdict is
+# driven by a REAL env override the subcommand honors (BRIDGE_A2A_IFACE_ADDRS),
+# for the genuine-death regression, and for case (f) (which must observe the
+# untouched production path with forced-verdict env vars exported but INERT).
 run_sync_env() {
   clear_supervise_throttle
   env "$@" bash "$SMOKE_REPO_ROOT/bridge-daemon.sh" sync 2>&1 || true
+}
+
+# --- #1679 r3 NON-INHERITABLE in-process seam ------------------------------
+# The runner script is generated once (in main) at $SUPERVISE_INPROC_RUNNER. It
+# SOURCES bridge-daemon.sh into its own shell — which (with the r3 source-guard)
+# defines every daemon function WITHOUT running the verb dispatch — then, IF the
+# smoke-only env vars SMOKE_FORCE_HEALTHZ_VERDICT / SMOKE_FORCE_SELF_REACH_VERDICT
+# are set, REDEFINES the corresponding discriminator wrapper function to echo the
+# forced word, and finally calls process_a2a_receiver_supervise_tick in-process.
+#
+# Why this is non-inheritable: the SMOKE_FORCE_* vars are read ONLY by this smoke
+# runner (production bridge-daemon.sh code reads NO verdict env var of any name),
+# and the actual verdict injection is a SHELL FUNCTION REDEFINITION that exists
+# only inside this runner process. A real daemon never runs this runner and never
+# sources the smoke, so neither the env var nor the override can reach it.
+write_supervise_inproc_runner() {
+  cat >"$SUPERVISE_INPROC_RUNNER" <<'RUNNER_EOF'
+#!/usr/bin/env bash
+# Smoke-only in-process supervise-tick runner (#1679 r3). NOT a production path.
+set -uo pipefail
+_DAEMON="$1"
+# The seam REQUIRES a Bash 4+ interpreter. If this runner is reached under Bash
+# 3.2, `source "$_DAEMON"` -> bridge-lib.sh would `exec` a re-exec into a Bash 4+
+# shell against the daemon as an EXECUTED (not sourced) script — which destroys
+# this process and the function overrides with it, silently degrading the seam.
+# run_supervise_inproc invokes us with the smoke's own Bash 4+ ("$BASH"); assert
+# it here so a regression fails loudly instead of vacuously.
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+  printf 'inproc-runner: requires Bash 4+ (got %s)\n' "${BASH_VERSION:-?}" >&2
+  exit 97
+fi
+# Source the daemon: with the r3 executed-vs-sourced guard the verb dispatch is
+# skipped, so this only loads functions into THIS shell (no re-exec, no dispatch).
+# shellcheck source=/dev/null
+source "$_DAEMON"
+
+# Redefine the discriminator wrappers ONLY when the smoke asked for a forced
+# verdict. These overrides live in THIS process alone — they cannot be inherited
+# by any forked daemon. The production wrappers (the ones a real daemon uses)
+# read no verdict env var and pass no verdict arg.
+if [[ -n "${SMOKE_FORCE_HEALTHZ_VERDICT:-}" ]]; then
+  _a2a_supervise_run_healthz() { printf '%s\n' "$SMOKE_FORCE_HEALTHZ_VERDICT"; }
+fi
+if [[ -n "${SMOKE_FORCE_SELF_REACH_VERDICT:-}" ]]; then
+  _a2a_supervise_run_self_reach() { printf '%s\n' "$SMOKE_FORCE_SELF_REACH_VERDICT"; }
+fi
+
+# Mirror cmd_sync_cycle's subshell isolation around the tick.
+( process_a2a_receiver_supervise_tick ) || true
+RUNNER_EOF
+  chmod 0700 "$SUPERVISE_INPROC_RUNNER"
+}
+
+# Run one supervise tick IN-PROCESS via the sourced seam. Optional inline env
+# (KEY=VAL ...) — pass SMOKE_FORCE_HEALTHZ_VERDICT / SMOKE_FORCE_SELF_REACH_VERDICT
+# to force the discriminator words. The throttle is cleared first so the tick
+# always runs. BRIDGE_* are already exported by smoke_setup_bridge_home, so the
+# sourced daemon writes to the same state files the subprocess path uses.
+#
+# CRITICAL: invoke the runner with the smoke's OWN Bash 4+ interpreter ("$BASH",
+# the shell running this smoke), NOT a bare `bash` (which resolves to macOS's
+# Bash 3.2). Under Bash 3.2 the daemon's bridge-lib bootstrap `exec`s a re-exec
+# into a Bash 4+ shell against the daemon as an EXECUTED script — replacing the
+# runner process, running the verb dispatch, and discarding the in-process
+# function overrides (the seam would silently no-op). "$BASH" avoids the re-exec
+# entirely so the source stays in-process.
+run_supervise_inproc() {
+  clear_supervise_throttle
+  env "$@" "${BASH:-/opt/homebrew/bin/bash}" "$SUPERVISE_INPROC_RUNNER" \
+    "$SMOKE_REPO_ROOT/bridge-daemon.sh" 2>&1 || true
 }
 
 state_field() {
@@ -205,14 +284,16 @@ check_self_unreachable_holds() {
   # The receiver stays RUNNING (process gate passes). We force the healthz
   # reason to healthz_timeout AND the self-reach discriminator to
   # self_unreachable — exactly the #1679 self-route flap (healthy receiver, host
-  # can't reach its own IP). The supervisor must HOLD (not restart, not count a
-  # death). Two consecutive unhealthy probes confirm before the discriminator
-  # runs, so several syncs are needed (1st tolerates, 2nd confirms+discriminates).
+  # can't reach its own IP) — via the NON-INHERITABLE in-process seam (#1679 r3):
+  # the runner sources the daemon and redefines the wrapper functions in its own
+  # shell. The supervisor must HOLD (not restart, not count a death). Two
+  # consecutive unhealthy probes confirm before the discriminator runs, so
+  # several ticks are needed (1st tolerates, 2nd confirms+discriminates).
   local i
   for (( i = 0; i < 4; i++ )); do
-    run_sync_env \
-      BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_HEALTHZ_VERDICT=healthz_timeout \
-      BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_SELF_REACH_VERDICT=self_unreachable >/dev/null
+    run_supervise_inproc \
+      SMOKE_FORCE_HEALTHZ_VERDICT=healthz_timeout \
+      SMOKE_FORCE_SELF_REACH_VERDICT=self_unreachable >/dev/null
   done
 
   local reason restart_count
@@ -258,15 +339,15 @@ check_self_reachable_restarts() {
   pid="$(receiver_pid_now)"
   [[ -n "$pid" ]] || smoke_fail "no receiver pid for self-reachable test"
 
-  # Receiver stays running; force healthz_timeout + self_reachable so the
-  # supervisor classifies a GENUINE wedge (host CAN reach its own IP) and goes
-  # down the restart path (does NOT hold). The #1405 wedge-detection is
-  # preserved.
+  # Receiver stays running; force healthz_timeout + self_reachable (via the
+  # in-process seam) so the supervisor classifies a GENUINE wedge (host CAN reach
+  # its own IP) and goes down the restart path (does NOT hold). The #1405
+  # wedge-detection is preserved.
   local i
   for (( i = 0; i < 4; i++ )); do
-    run_sync_env \
-      BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_HEALTHZ_VERDICT=healthz_timeout \
-      BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_SELF_REACH_VERDICT=self_reachable >/dev/null
+    run_supervise_inproc \
+      SMOKE_FORCE_HEALTHZ_VERDICT=healthz_timeout \
+      SMOKE_FORCE_SELF_REACH_VERDICT=self_reachable >/dev/null
   done
 
   local reason
@@ -477,15 +558,21 @@ check_genuine_death_still_handled() {
 }
 
 # -------------------------------------------------------------------------
-# Case (f) — #1679 r2 TEETH-CHECK: the LEGACY forced-verdict ENV VARS exported
-# into the PRODUCTION supervisor path must NOT change classification. The
-# inherited-env bypass is closed: a real daemon launched with
-# BRIDGE_A2A_HEALTHZ_TEST_VERDICT=healthy +
-# BRIDGE_A2A_SELF_REACH_TEST_VERDICT=self_unreachable in its env can no longer
-# force the supervisor's restart-vs-hold-vs-healthy decision, because the
-# discriminator subcommands honor NO env-var verdict (only the explicit
-# `--test-verdict` CLI arg, which the production supervisor never passes). This
-# is the regression guard for the daemon-critical inherited-env false negative.
+# Case (f) — #1679 r3 TEETH-CHECK (inherited-env bypass closed for ANY name):
+# BOTH the OLD forced-verdict env vars (BRIDGE_A2A_HEALTHZ_TEST_VERDICT /
+# BRIDGE_A2A_SELF_REACH_TEST_VERDICT) AND the r2-era new ones
+# (BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_HEALTHZ_VERDICT /
+# BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_SELF_REACH_VERDICT), exported into the
+# PRODUCTION supervisor path, must NOT change classification. A real daemon
+# launched with ANY of these in its environment can no longer force the
+# supervisor's restart-vs-hold-vs-healthy decision:
+#   * the discriminator SUBCOMMANDS honor NO env-var verdict of any name; and
+#   * the production supervisor (bridge-daemon.sh) reads NO verdict env var of
+#     any name and passes NO forced-verdict CLI arg.
+# The ONLY thing that can force a verdict is the smoke's IN-PROCESS function
+# override (case a/b) — which a real daemon can never reach. This is the
+# regression guard for the daemon-critical inherited-env false negative that r2
+# only renamed instead of closing.
 # -------------------------------------------------------------------------
 check_legacy_verdict_env_ignored() {
   bash "$SMOKE_REPO_ROOT/bridge-handoff-daemon.sh" stop >/dev/null 2>&1 || true
@@ -494,6 +581,9 @@ check_legacy_verdict_env_ignored() {
   # ---- Layer 1: the SUBCOMMANDS ignore the legacy verdict env vars entirely.
   # Invoke the discriminators directly with the legacy env exported; the printed
   # discriminator word must be the REAL probe outcome, never the forced verdict.
+  # (The r2-era BRIDGE_A2A_RECEIVER_SUPERVISE_* vars were read by the bash
+  # supervisor, never the subcommand, so Layer 1 exercises the legacy names that
+  # the subcommands actually could have read — and must NOT.)
   A2A_PORT="$(pick_free_port)"
   write_loopback_config "$A2A_PORT"
   local hz_raw hz_word sr_raw sr_word
@@ -517,14 +607,18 @@ check_legacy_verdict_env_ignored() {
   [[ "$sr_word" != "self_unreachable" ]] \
     || smoke_fail "self-reach subcommand HONORED legacy BRIDGE_A2A_SELF_REACH_TEST_VERDICT env (got forced 'self_unreachable'); inherited-env bypass NOT closed"
 
-  # ---- Layer 2: the SUPERVISOR PRODUCTION PATH, run with the legacy verdict env
-  # vars exported, must NOT reproduce case (a)'s forced HOLD. With the bypass
-  # closed, the legacy env is ignored: the real healthz probe (loopback refused by
-  # the scrubbed resolve_bind) yields `bind_unresolved`, the self-reach
-  # discriminator only runs on a `healthz_timeout`, so the supervisor never enters
-  # the self-unreachable HOLD -> LAST_REASON is NEVER `healthz_unreachable_self`
-  # and NEVER `healthy`. Pre-fix (env honored) the forced verdicts WOULD have
-  # produced exactly that HOLD (case a) -> this check has teeth.
+  # ---- Layer 2: the SUPERVISOR PRODUCTION PATH (`bridge-daemon.sh sync`, a
+  # fresh subprocess), run with BOTH the OLD and the r2-era NEW forced-verdict
+  # env vars exported, must NOT reproduce case (a)'s forced HOLD. With the bypass
+  # closed, the production supervisor reads NONE of them: the real healthz probe
+  # (loopback refused by the scrubbed resolve_bind) yields `bind_unresolved`, the
+  # self-reach discriminator only runs on a `healthz_timeout`, so the supervisor
+  # never enters the self-unreachable HOLD -> LAST_REASON is NEVER
+  # `healthz_unreachable_self` and NEVER `healthy`. The r2-only rename WOULD have
+  # honored the BRIDGE_A2A_RECEIVER_SUPERVISE_* vars here (the inherited-env
+  # bypass r3 closes) -> exporting them proves they are now inert. This check has
+  # teeth: case (a) forces exactly this HOLD via the in-process seam, so an env
+  # path that produced it would mean the daemon honors inherited verdicts.
   bash "$SMOKE_REPO_ROOT/bridge-handoff-daemon.sh" stop >/dev/null 2>&1 || true
   rm -f "$(supervise_state)" "$(env_incident_state)" 2>/dev/null || true
   start_receiver_via_lifecycle
@@ -532,18 +626,20 @@ check_legacy_verdict_env_ignored() {
   for (( i = 0; i < 4; i++ )); do
     run_sync_env \
       BRIDGE_A2A_HEALTHZ_TEST_VERDICT=healthy \
-      BRIDGE_A2A_SELF_REACH_TEST_VERDICT=self_unreachable >/dev/null
+      BRIDGE_A2A_SELF_REACH_TEST_VERDICT=self_unreachable \
+      BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_HEALTHZ_VERDICT=healthz_timeout \
+      BRIDGE_A2A_RECEIVER_SUPERVISE_TEST_SELF_REACH_VERDICT=self_unreachable >/dev/null
   done
   local reason
   reason="$(state_field LAST_REASON)"
   [[ "$reason" != "healthz_unreachable_self" ]] \
-    || smoke_fail "PRODUCTION supervisor HONORED legacy verdict env (forced self-unreachable HOLD via inherited env); bypass NOT closed"
+    || smoke_fail "PRODUCTION supervisor HONORED a forced-verdict env (forced self-unreachable HOLD via inherited env, old OR new name); bypass NOT closed"
   [[ "$reason" != "healthy" ]] \
-    || smoke_fail "PRODUCTION supervisor HONORED legacy healthz=healthy verdict env (inherited-env bypass); receiver was forced 'healthy' without a real probe"
+    || smoke_fail "PRODUCTION supervisor HONORED a healthz=healthy verdict env (inherited-env bypass); receiver was forced 'healthy' without a real probe"
 
   # No env-incident should have been filed off a forced self_unreachable verdict.
   [[ ! -f "$(env_incident_state)" ]] \
-    || smoke_fail "legacy verdict env produced an env-incident on the production path (bypass NOT closed)"
+    || smoke_fail "forced-verdict env produced an env-incident on the production path (bypass NOT closed)"
 
   bash "$SMOKE_REPO_ROOT/bridge-handoff-daemon.sh" stop >/dev/null 2>&1 || true
 }
@@ -611,12 +707,16 @@ main() {
   : >"$BRIDGE_ROSTER_LOCAL_FILE"
   register_admin_reviewer
 
+  # Generate the #1679 r3 in-process supervise-tick runner (non-inheritable seam).
+  SUPERVISE_INPROC_RUNNER="$SMOKE_TMP_ROOT/supervise-inproc-runner.sh"
+  write_supervise_inproc_runner
+
   smoke_run "(a) #1679 self-unreachable healthz timeout -> HOLD, no restart, no crashloop task" check_self_unreachable_holds
   smoke_run "(b) #1405 self-reachable healthz timeout -> genuine wedge restart preserved" check_self_reachable_restarts
   smoke_run "(c) #1680 bind_fail + absent tailnet IP -> environmental, budget preserved, auto-rebind" check_bind_ip_absent_environmental
   smoke_run "(d) alert flood collapse -> ONE stateful env-incident over a sustained outage" check_alert_flood_collapse
   smoke_run "(e) regression: genuine process death still detected + restarted" check_genuine_death_still_handled
-  smoke_run "(f) #1679 r2 TEETH: legacy verdict ENV vars ignored on the production path (inherited-env bypass closed)" check_legacy_verdict_env_ignored
+  smoke_run "(f) #1679 r3 TEETH: OLD+NEW verdict ENV vars inert on the production supervisor path (inherited-env bypass closed)" check_legacy_verdict_env_ignored
   smoke_run "(g) #1680 r2: ENV_REPROBE_SECONDS genuinely gates the bind-IP re-probe cadence" check_env_reprobe_cadence_gates
 
   smoke_log "passed"
