@@ -62,6 +62,57 @@ bridge_tmux_send_submit_key() {
   bridge_tmux_send_keys_with_timeout "$label" -t "$pane_target" C-m
 }
 
+# Issue #1762: semantic key primitive for the picker auto-resolve stage. The
+# daemon's picker resolver (lib/bridge-picker.sh) MUST route every keystroke
+# through this layer — high-risk #2 forbids raw `tmux send-keys` from the
+# daemon. Maps a small, fixed vocabulary of catalog key tokens to tmux key
+# names, each wrapped in the existing per-call send-keys watchdog so a hung
+# tmux child cannot freeze the daemon main loop:
+#   confirm      → engine-aware submit (Enter / CSI-u) via bridge_tmux_send_submit_key
+#   down|up      → arrow keys (TUI list navigation)
+#   select_first → Home + Down*0 (move selection to the top of a list); the
+#                  catalog uses this to pick the first / continue-current option
+#   y|n          → literal 'y' / 'n' characters (Y/n style prompts), no submit
+# Unknown tokens are a no-op (returns 1) — a typo in a data file must never
+# send an unintended keystroke. This is intentionally NOT a general send-keys
+# passthrough: the vocabulary is closed so the catalog cannot smuggle
+# arbitrary input through a data edit.
+bridge_tmux_send_picker_key() {
+  local label="$1"
+  local session="$2"
+  local engine="${3:-}"
+  local token="${4:-}"
+  local pane_target
+  pane_target="$(bridge_tmux_pane_target "$session")"
+
+  case "$token" in
+    confirm)
+      bridge_tmux_send_submit_key "$label" "$session" "$engine"
+      ;;
+    down)
+      bridge_tmux_send_keys_with_timeout "$label" -t "$pane_target" Down
+      ;;
+    up)
+      bridge_tmux_send_keys_with_timeout "$label" -t "$pane_target" Up
+      ;;
+    select_first)
+      # Move the highlight to the first list item. Home is honored by the
+      # Claude/Codex select widgets; harmless on a non-list prompt.
+      bridge_tmux_send_keys_with_timeout "$label" -t "$pane_target" Home
+      ;;
+    y|Y)
+      bridge_tmux_send_keys_with_timeout "$label" -t "$pane_target" y
+      ;;
+    n|N)
+      bridge_tmux_send_keys_with_timeout "$label" -t "$pane_target" n
+      ;;
+    *)
+      bridge_warn "bridge_tmux_send_picker_key: unknown key token '${token}' on session=${session} — no keystroke sent"
+      return 1
+      ;;
+  esac
+}
+
 bridge_tmux_session_exists() {
   local session="$1"
   tmux has-session -t "$(bridge_tmux_session_target "$session")" 2>/dev/null

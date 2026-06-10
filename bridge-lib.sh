@@ -922,6 +922,11 @@ bridge_source_module "bridge-skills.sh"
 bridge_source_module "bridge-hooks.sh"
 bridge_source_module "bridge-channels.sh"
 bridge_source_module "bridge-state.sh"
+# Issue #1762: no-LLM picker auto-resolve stage. Sourced after bridge-tmux.sh
+# (it drives every keystroke through that layer's primitives) and
+# bridge-state.sh (bridge_with_timeout). Function-name resolution is at call
+# time, so this placement only needs to land before the daemon tick runs.
+bridge_source_module "bridge-picker.sh"
 # S3 (v0.14.x stabilization): platform discriminator. Sourced BEFORE
 # bridge-isolation-v2.sh so the v2 module's Bucket 2 enforcement
 # gates can call `bridge_isolation_v2_enforce`. Depends on

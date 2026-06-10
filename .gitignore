@@ -1,6 +1,11 @@
 logs/
 state/
 shared/
+# But the tracked runtime-template `shared/` overlay is source, not live runtime
+# state (it ships the wiki seeds + the #1762 picker catalog). The broad `shared/`
+# ignore above is for the LIVE runtime ~/.agent-bridge/shared.
+!runtime-templates/shared/
+!runtime-templates/shared/**
 migration/
 __pycache__/
 *.pyc

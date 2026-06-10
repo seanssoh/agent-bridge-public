@@ -891,3 +891,6 @@ tests/wave-cli/smoke.sh	461	C3	ba1f530715a8b88b4ee0e9566f08a922e06d575484eebed19
 tests/wiki-daily-ingest/smoke.sh	685	H3	9a200a2ec60ca5c9c64ae5229db1c1d1b0e191ff9de817a530248bd2f03e2065	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 tests/wiki-daily-ingest/smoke.sh	687	H3	49dbf920eb16a37d5ec324e0d1f242e7a191cbd8b16229f2dabbe907aeec86bc	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 scripts/smoke/a2a-backpressure-openonly.sh	22	C3	950fbaf95809c154f9727b56952475c098c1c0e4a841b7063704fcecf1c3e18e	interpreter heredoc, no capture	agb-dev	rc3 #1589 Track A B1-B8
+lib/bridge-picker.sh	167	H3	928cbf09926bbf863b3f93b86405da798b3398d1b5f3c21d5855e0383aba0b2e	here-string/procsub, non-interpreter consumer	claude	1762-picker-autoresolve (catalog-path while-read, bash loop consumer)
+lib/bridge-picker.sh	409	H3	928cbf09926bbf863b3f93b86405da798b3398d1b5f3c21d5855e0383aba0b2e	here-string/procsub, non-interpreter consumer	claude	1762-picker-autoresolve (catalog-path while-read, bash loop consumer)
+lib/bridge-picker.sh	486	H3	b664f747198f529a3d97ee169ce359b803a8239d687c6d9ef45ff7eb00cc249b	here-string/procsub, non-interpreter consumer	claude	1762-picker-autoresolve (destructive-guard pane line-split, bash loop consumer)

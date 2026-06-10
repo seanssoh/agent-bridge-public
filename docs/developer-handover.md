@@ -268,6 +268,18 @@ fail-open한다. 두 엔진은 이 하나의 shared predicate를 공유하고 no
   제거됐다 — 재도입하지 말 것
 - daemon이 tmux로 밀어넣는 외부 푸시는 **metadata-only**다 (`[Agent Bridge] event=... count=... top=... title=... from=...`). 실행 동사를 인젝션에 포함시키는 옛 포맷을 되살리지 말 것. 수신 에이전트가 해석·디스패치·검증하는 계약은 `docs/agent-runtime/common-instructions.md`의 "External Push Handling" 섹션과 `runtime-templates/skills/external-push-handling/SKILL.md`에 있다.
 
+#### Picker auto-resolve — no-LLM 피커 디텍터 (#1762)
+
+상시 LLM 스위퍼 대신, 데몬 틱에 fingerprint 카탈로그 기반 무토큰 디텍터를 둔다. 구조:
+
+- **데이터(카탈로그)**: `runtime-templates/shared/picker-catalog.json` (tracked, machine-agnostic). install-local 추가/오버라이드는 `$BRIDGE_SHARED_DIR/picker-catalog.local.json` (git-ignored). 항목은 `{picker_id, engine, enabled, confidence, match:[regex...], policy, keys, destructive_match, post_resolve_verify, expect_restart}`. 잘못된 추측은 코드 변경 없이 데이터 수정으로 고친다. `[approx]` 항목은 실제 pane 캡처가 verbatim regex로 대체할 때까지 **disabled**로 출하한다.
+- **구조(코드)**: `lib/bridge-picker.py`가 카탈로그 매칭·stuck-confirmation(N틱 + pane 해시 불변)·anti-loop·audit shaping을 담당(file-as-argv, heredoc-stdin 금지). `lib/bridge-picker.sh`가 데몬측 오케스트레이션 — **모든 tmux 상호작용은 `lib/bridge-tmux.sh` primitive로만** (읽기 `bridge_capture_recent`, 쓰기 `bridge_tmux_send_picker_key`/`bridge_tmux_send_submit_key`). raw `tmux send-keys` 금지(high-risk #2).
+- **데몬 wiring**: `bridge-daemon.sh`의 `cmd_sync_cycle`에서 `bootstrap_recovery` 직후 cadence-gated phase `picker_autoresolve`(기본 30s)로 `bridge_picker_scan_all_sessions` 호출. busy 세션은 캡처 전에 #1409 predicate로 건너뛴다(틱당 세션당 캡처 1회 예산).
+- **3개의 safety rail (모두 필수)**: (a) post-resolve 검증 — 키 입력 후 재캡처해서 pane이 여전히 피커면 재입력하지 않고 escalate(approx-regex 오매칭에 대한 1차 방어), (b) anti-loop — 같은 (session, picker)가 K초 내 M회면 중단+escalate, (c) destructive-guard — 선택된 옵션이 destructive 패턴(예: "Start a new conversation")이면 advance 거부+escalate.
+- **policy 종류**: `defer`(기존 trust/summary 머신 `recover_claude_bootstrap_blockers`로 라우팅, 중복 키 입력 안 함) / `auto_resolve`(키 입력 + 3 rail) / `escalate`(auth/permission 표면 — 키 입력 0, admin 큐 task만) / `non_picker`(상태줄 배너 같은 컨텍스트 신호 — 절대 stuck으로 매칭 안 함).
+- **Layer 3 — escalation**: unknown/escalate/verify-failed 상태는 admin(`BRIDGE_ADMIN_AGENT_ID`)에게 pane 캡처를 첨부한 `[picker]`(permission은 `[PERMISSION]`) 큐 task를 남긴다. admin은 `runtime-templates/skills/picker-resolve/SKILL.md`의 classify→resolve→카탈로그-확장 루프로 다음 발생을 스크립트-리졸브 가능하게 만든다. LLM 비용은 0으로 수렴한다.
+- **enable/config**: 전체 stage는 opt-in (`picker_autoresolve_enabled` runtime config 키 또는 `BRIDGE_PICKER_AUTORESOLVE=1`); 기본 OFF라 fresh install이 operator 의도 없이 auto-key하지 않는다. per-picker 동작은 각 카탈로그 항목의 `enabled`로 제어한다. audit는 `logs/picker-resolve.jsonl`, before/after pane 스냅샷은 `state/picker/snapshots/`.
+
 ### 3. upgrade / deploy
 
 업그레이드는 단순 덮어쓰기가 아니다.
