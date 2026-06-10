@@ -127,6 +127,141 @@ bridge_layout_memory_dir() {
   printf '%s/memory' "$(bridge_layout_agent_home "$agent")"
 }
 
+# _bridge_layout_canon_dir <path>
+#
+# Print a best-effort canonical form of <path> for comparison. Falls back to
+# the literal value when the directory cannot be canonicalized (e.g. an iso
+# workdir the controller cannot traverse) so the caller compares like-for-like
+# without a hard dependency on the path existing.
+_bridge_layout_canon_dir() {
+  local path="$1"
+  [[ -n "$path" ]] || return 1
+  local canon=""
+  canon="$(cd -P -- "$path" 2>/dev/null && pwd -P)" || canon=""
+  if [[ -n "$canon" ]]; then
+    printf '%s' "$canon"
+  else
+    printf '%s' "$path"
+  fi
+}
+
+# bridge_layout_workspace_foreign_owned <agent> <target_dir>
+#
+# Issue #1750 — fail-safe shared-workspace guard for the WORKDIR identity
+# delivery paths (materialize + sync-on-start). Returns 0 (TRUE — foreign /
+# do-not-stamp) when <target_dir> is a workspace that is SHARED with at least
+# one OTHER roster agent AND the identity already present there does NOT belong
+# to <agent>. Returns 1 (FALSE — this agent may deliver its identity) otherwise.
+#
+# Why this exists, beyond the marker-text + BRIDGE_LAYOUT_WORKSPACE_SHARED env
+# guards already in materialize/sync:
+#
+#   On a managed-project install the admin (e.g. `patch`, claude) is created
+#   FIRST into its workdir, then its codex pair (`patch-dev`) is auto-provisioned
+#   with `--workdir <admin-workdir> --allow-shared-workdir` (bridge-init-codex-
+#   pair.sh). The create-time materialize is correctly suppressed for the pair
+#   via BRIDGE_LAYOUT_WORKSPACE_SHARED=1, so home stays correct. But the
+#   START-time sync (`bridge_layout_sync_identity_from_home`, bridge-start.sh)
+#   carries NEITHER guard: the env flag is create-time-only, and the admin's
+#   correct workdir CLAUDE.md (`# patch — …`) holds no "shared workdir" marker
+#   text. So when the pair starts, the unguarded sync copies the PAIR's home
+#   identity (SOUL/SESSION-TYPE/CLAUDE.md — codex / `Session Type: static-codex`)
+#   over the ADMIN's workdir copies, and the runtime (which reads identity from
+#   the workdir cwd) boots the admin as the codex pair. That is the #1750 drift
+#   (home @10:45 correct, workdir @10:47 overwritten with the pair template).
+#
+# The reliable signal at start time — with no persisted shared-workdir flag —
+# is the roster itself: another agent shares this workdir, AND the identity
+# physically present in the workdir is NOT this agent's (it matches the other
+# sharer, or simply differs from this agent's authored home copy). In that case
+# this agent is a non-owning sharer (the pair) and MUST NOT stamp its identity
+# over the owner's copy. Fail-safe: when in doubt (shared + foreign identity
+# present) we DECLINE to write rather than fall back to the sibling/pair
+# template — exactly the #1750 fail-safe contract.
+#
+# Ownership test (when the workdir IS shared with another agent):
+#   * No identity present in the workdir yet  → not foreign (return 1): the
+#     first writer legitimately materializes (the empty-workspace create case).
+#   * Workdir identity is byte-identical to THIS agent's authored home copy
+#     (SOUL.md or the engine entrypoint) → this agent owns it (return 1):
+#     a legitimate #1417 HOME→WORKDIR refresh of the owner's own copy.
+#   * Workdir identity differs from this agent's home copy → foreign owner
+#     (return 0): decline. The pair hits this branch because the workdir holds
+#     the admin's SOUL/CLAUDE.md, which differ from the pair's home copies.
+#
+# Roster-free / single-agent installs (no other agent shares the workdir) always
+# return 1 — this guard changes nothing for the common case, only for the
+# admin+pair shared-workdir topology that produced #1750.
+bridge_layout_workspace_foreign_owned() {
+  local agent="$1" target_dir="$2"
+  [[ -n "$agent" && -n "$target_dir" ]] || return 1
+
+  # Test-only teeth hatch (#1750 smoke): when set, the guard short-circuits to
+  # "not foreign" so the smoke can reproduce the pre-fix divergence WITHOUT
+  # editing source. Never set in production; the var is undocumented operator
+  # surface and defaults off.
+  [[ -n "${BRIDGE_LAYOUT_DISABLE_FOREIGN_GUARD_1750:-}" ]] && return 1
+
+  # Cannot enumerate the roster → cannot prove a shared workspace; do not block.
+  declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 || return 1
+  declare -F bridge_agent_workdir >/dev/null 2>&1 || return 1
+
+  local target_canon
+  target_canon="$(_bridge_layout_canon_dir "$target_dir")"
+
+  # Is this workdir shared with at least one OTHER roster agent?
+  local other shared=0 other_wd other_canon
+  for other in "${BRIDGE_AGENT_IDS[@]}"; do
+    [[ -n "$other" ]] || continue
+    [[ "$other" == "$agent" ]] && continue
+    other_wd="$(bridge_agent_workdir "$other" 2>/dev/null || true)"
+    [[ -n "$other_wd" ]] || continue
+    other_canon="$(_bridge_layout_canon_dir "$other_wd")"
+    if [[ "$other_canon" == "$target_canon" ]]; then
+      shared=1
+      break
+    fi
+  done
+  # Not shared with anyone else → ordinary managed-project workdir; allow.
+  (( shared == 1 )) || return 1
+
+  # Shared workspace. Decide ownership by comparing the identity physically
+  # present in the workdir against THIS agent's authored home copy. The engine
+  # entrypoint and SOUL.md both embed the agent identity; either match proves
+  # ownership.
+  local source_dir
+  source_dir="$(bridge_layout_agent_home "$agent" 2>/dev/null || true)"
+
+  local engine_entry=""
+  if declare -F bridge_engine_entrypoint_filename >/dev/null 2>&1; then
+    # The sync/materialize callers know the engine; resolve a best-effort
+    # entrypoint for the ownership probe. CLAUDE.md is the universal fallback.
+    engine_entry="$(bridge_engine_entrypoint_filename "${BRIDGE_LAYOUT_FOREIGN_PROBE_ENGINE:-claude}" 2>/dev/null || printf '')"
+  fi
+  [[ -n "$engine_entry" ]] || engine_entry="CLAUDE.md"
+
+  local probe present_any=0 name
+  for name in SOUL.md "$engine_entry" CLAUDE.md; do
+    [[ -n "$name" ]] || continue
+    probe="$target_dir/$name"
+    [[ -f "$probe" ]] || continue
+    present_any=1
+    # Workdir copy matches THIS agent's authored home copy → this agent owns it.
+    if [[ -n "$source_dir" && -f "$source_dir/$name" ]] \
+        && cmp -s -- "$source_dir/$name" "$probe" 2>/dev/null; then
+      return 1
+    fi
+  done
+
+  # Shared workspace with NO identity present yet → first writer (owner) may
+  # materialize; not foreign.
+  (( present_any == 1 )) || return 1
+
+  # Shared workspace, identity present, and it does NOT match this agent's
+  # authored home copy → foreign-owned. Decline (fail-safe).
+  return 0
+}
+
 # bridge_layout_materialize_identity <agent> <engine> [target_dir]
 #
 # The D1 materialization step. Copies/syncs the authored identity
@@ -200,6 +335,18 @@ bridge_layout_materialize_identity() {
   if [[ -n "${BRIDGE_LAYOUT_WORKSPACE_SHARED:-}" ]]; then
     bridge_layout_log_note "materialize: $agent — workspace flagged shared; per-agent identity kept in agent_home"
     return 0
+  fi
+  # Issue #1750 — defense in depth: even when the caller forgets to set
+  # BRIDGE_LAYOUT_WORKSPACE_SHARED (the env flag is create-path-only), decline
+  # to stamp this agent's identity over a workdir that is shared with another
+  # roster agent and already holds that agent's identity. Keeps the pair's
+  # codex template out of the admin's workdir regardless of the call site.
+  if declare -F bridge_layout_workspace_foreign_owned >/dev/null 2>&1; then
+    if BRIDGE_LAYOUT_FOREIGN_PROBE_ENGINE="$engine" \
+        bridge_layout_workspace_foreign_owned "$agent" "$target_dir"; then
+      bridge_layout_log_note "materialize: $agent — shared workspace owned by another agent ($target_dir); per-agent identity kept in agent_home (#1750)"
+      return 0
+    fi
   fi
 
   mkdir -p "$target_dir" 2>/dev/null || return 0
@@ -416,6 +563,26 @@ bridge_layout_sync_identity_from_home() {
     fi
   done
   [[ -n "${BRIDGE_LAYOUT_WORKSPACE_SHARED:-}" ]] && return 0
+
+  # Issue #1750 — fail-safe roster-aware shared-workspace guard. The two guards
+  # above are create-time signals: the marker text appears only in a project
+  # tree that explicitly declares itself shared, and BRIDGE_LAYOUT_WORKSPACE_
+  # SHARED is set only by the `agent create --allow-shared-workdir` path. The
+  # START path (this function) carries neither. On a managed-project admin+pair
+  # install the admin's correct workdir CLAUDE.md (`# patch — …`) holds no
+  # marker text and the env flag is unset, so without this guard the pair's
+  # start-time sync stamps the PAIR (codex / `Session Type: static-codex`)
+  # identity over the ADMIN's workdir copies — the exact #1750 drift. Decline
+  # when the workdir is shared with another roster agent and the identity there
+  # is not this agent's (fail-safe: never stamp a sibling/pair template over the
+  # owner's copy).
+  if declare -F bridge_layout_workspace_foreign_owned >/dev/null 2>&1; then
+    if BRIDGE_LAYOUT_FOREIGN_PROBE_ENGINE="$engine" \
+        bridge_layout_workspace_foreign_owned "$agent" "$target_dir"; then
+      bridge_layout_log_note "sync-identity: $agent — shared workspace owned by another agent ($target_dir); per-agent identity kept in agent_home (#1750)"
+      return 0
+    fi
+  fi
 
   # Resolve the engine entrypoint + claude-compat copy the same way
   # materialize does, so the synced fileset matches the create-time set.
