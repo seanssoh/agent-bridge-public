@@ -5059,6 +5059,16 @@ bridge_linux_prepare_agent_isolation() {
     # — the content walker must NOT relax it to 0660). Carried in a local so
     # the basename literal lives on a single annotated line.
     local _env_basename="agent-env.sh"  # noqa: iso-helper-boundary — exclude-arg (skip), not a boundary RW
+    # #1766: the workdir's `.claude/settings.json` is the canonical symlink
+    # to the per-agent-root effective render. The walker refuses ALL symlinks
+    # by default (planted-redirect guard); accept EXACTLY this one shape, and
+    # only when it realpath-resolves to THIS agent's own effective file —
+    # every other symlink target stays refused. The link's own group is
+    # normalized by the walker; the TARGET's readability is published just
+    # below so `agent-bridge isolate <a> --reapply` (which routes through
+    # this prepare path, NOT the settings renderer) restores read access too.
+    local _settings_link_rel=".claude/settings.json"  # noqa: iso-helper-boundary — walker accept-arg (relpath literal), not a boundary RW
+    local _settings_link_target="$_v2_agent_root/.claude/settings.effective.json"  # noqa: iso-helper-boundary — walker accept-arg (target path), not a boundary RW
     bridge_isolation_v2_publish_content_tree \
       "$agent" "$_v2_agent_group" "$os_user" \
       "$_v2_agent_root/home" "$workdir" "$runtime_state_dir" "$log_dir" \
@@ -5067,7 +5077,32 @@ bridge_linux_prepare_agent_isolation() {
       --exclude-subdir .mattermost \
       --exclude-name HEARTBEAT.md --exclude-name CHANGE-POLICY.md \
       --exclude-name "$_env_basename" \
+      --accept-settings-link-rel "$_settings_link_rel" \
+      --accept-settings-link-target "$_settings_link_target" \
       || bridge_warn "isolation v2 (#1533): content-tree publish returned non-zero for agent '$agent'; some scaffolded files may not be group-readable. Re-run \`agent-bridge isolate $agent --reapply\`."
+
+    # #1766: publish the per-agent-root `.claude/` dir + the
+    # `settings.effective.json` link TARGET group-readable to the agent's OWN
+    # group (`ab-agent-<a>`), so the iso UID can read its own
+    # `workdir/.claude/settings.json` and Claude never renders the blocking
+    # "Settings Error" picker. The file is rendered controller-owned 0600 by
+    # `bridge-hooks.py:save_json`; keep it controller-owned (no chown) but set
+    # group + 0640 (group READ, no group write — the iso UID must not be able
+    # to rewrite the hook contract) and the parent dir group-traversable at
+    # 0750. Never `ab-shared`, never world. The `.claude/` dir lives at the
+    # per-agent ROOT (sibling of home/workdir), OUTSIDE the content-tree roots
+    # walked above, so it needs this explicit pass. Both helpers are
+    # idempotent + non-fatal + gated to Linux v2 (no-op on shared/macOS).
+    if command -v bridge_isolation_v2_chgrp_dir_iso_group >/dev/null 2>&1 \
+        && [[ -d "$_v2_agent_root/.claude" ]]; then
+      bridge_isolation_v2_chgrp_dir_iso_group "$agent" "$_v2_agent_root/.claude" 0750 \
+        || bridge_warn "isolation v2 (#1766): could not publish per-agent .claude dir for '$agent' (non-fatal); the iso UID may EACCES on its own settings.json."
+    fi
+    if command -v bridge_isolation_v2_chgrp_file_iso_group >/dev/null 2>&1 \
+        && [[ -f "$_settings_link_target" ]]; then
+      bridge_isolation_v2_chgrp_file_iso_group "$agent" "$_settings_link_target" 0640 \
+        || bridge_warn "isolation v2 (#1766): could not group-publish the per-agent effective settings file for '$agent' (non-fatal); the iso UID may EACCES on its own project settings."
+    fi
   fi
 }
 bridge_linux_install_isolated_channel_symlink() {

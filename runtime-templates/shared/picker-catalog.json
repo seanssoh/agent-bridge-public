@@ -116,6 +116,21 @@
       "keys": ["confirm"],
       "expect_restart": true,
       "post_resolve_verify": true
+    },
+    {
+      "picker_id": "claude-settings-error",
+      "engine": "claude",
+      "enabled": true,
+      "confidence": "exact",
+      "comment": "#1766 mitigation. Claude renders this blocking picker when a settings file cannot be read (e.g. an iso v2 agent EACCESing on its own controller-owned 0600 workdir/.claude/settings.json — the root cause #1766 fixes at the permission layer). Strings verbatim from the live cm-prod capture 2026-06-10: 'Settings Error' + 'Settings file could not be read' + the option 'Continue without these settings'. Operator policy: option '3. Continue without these settings' — the non-destructive, non-blocking choice (Claude proceeds without that one settings file; bridge-managed effective settings are reasserted on the next rerender). keys = select_first (Home -> option 1) then two 'down's (-> option 3) then confirm, so the highlight lands on option 3 deterministically regardless of where it starts. post_resolve_verify=true so a mismatched render does not blindly re-key. This is a SAFETY NET only — the real fix is the #1766 permission publish; the catalog keeps startup unblocked even if perms regress.",
+      "match": [
+        "Settings Error",
+        "Settings file could not be read",
+        "Continue without these settings"
+      ],
+      "policy": "auto_resolve",
+      "keys": ["select_first", "down", "down", "confirm"],
+      "post_resolve_verify": true
     }
   ]
 }
