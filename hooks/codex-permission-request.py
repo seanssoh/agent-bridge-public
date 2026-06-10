@@ -54,6 +54,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -275,11 +276,30 @@ def _save_throttle(agent: str, state: dict[str, Any]) -> bool:
         return False
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=True) + "\n", encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        tmp.replace(path)
-        os.chmod(path, 0o600)
+        # Issue #1755: unique per-instance tmp so concurrent PermissionRequest
+        # instances never collide on a shared tmp name. Each renames its own
+        # tmp (atomic, last-writer-wins, no exception in the dup-hook race).
+        # With unique tmp names there is no benign FileNotFoundError to
+        # swallow on the final replace() — a FileNotFoundError there now means
+        # a real write failure, so let it fall through to this function's own
+        # outer fail-open handler (iso telemetry / return False) rather than
+        # masking it as success.
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp"
+        )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(state, ensure_ascii=True) + "\n")
+            os.chmod(tmp, 0o600)
+            tmp.replace(path)
+            os.chmod(path, 0o600)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
         return True
     except (PermissionError, OSError):
         # codex review gap 1: keep ALL PermissionRequest audit rows free of
