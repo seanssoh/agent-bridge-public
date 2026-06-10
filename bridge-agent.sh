@@ -2793,6 +2793,12 @@ from pathlib import Path
 argv = sys.argv[1:]
 hooks_py, agent, workdir, base_file, overlay_file, effective_file, launch_cmd, agent_class = argv[:8]
 settings_path_override = argv[8] if len(argv) > 8 else ""
+# Queue #11901: operator-global settings file (10th arg). The renderer
+# inherits its safety-filtered contents as the bottom-most layer for SHARED
+# agents, so the plan's `expected` MUST apply the identical layer or the
+# post-apply `effective == expected` check perpetually reports
+# `needs-rerender`.
+operator_global_file = argv[9] if len(argv) > 9 else ""
 spec = importlib.util.spec_from_file_location("bridge_hooks", hooks_py)
 if spec is None or spec.loader is None:
     raise SystemExit(f"could not load {hooks_py}")
@@ -2827,7 +2833,25 @@ def load_object(path: Path, label: str, *, absent_ok: bool = True) -> dict:
 base_payload = load_object(base_path, "base")
 overlay_payload = load_object(overlay_path, "overlay")
 managed_defaults = hooks.managed_claude_settings_defaults(launch_cmd or None, agent_class or None)
-expected = hooks.merge_settings(managed_defaults, base_payload)
+# Queue #11901: mirror cmd_render_shared_settings' bottom-most operator-global
+# layer (safety-filtered) so the plan's `expected` matches what the renderer
+# actually wrote. Fail-safe: missing / unreadable / non-object / filtered-empty
+# global => no layer, identical to the renderer's degrade path. Reuse the
+# renderer's own filter so the two stay symmetric across future changes.
+operator_global_layer = {}
+if operator_global_file and hasattr(hooks, "_filter_operator_global_base"):
+    _global_path = Path(operator_global_file).expanduser()
+    if _global_path.exists():
+        try:
+            _global_payload = json.loads(_global_path.read_text(encoding="utf-8"))
+        except Exception:
+            _global_payload = None
+        operator_global_layer, _ = hooks._filter_operator_global_base(_global_payload)
+if operator_global_layer:
+    expected = hooks.merge_settings(operator_global_layer, managed_defaults)
+else:
+    expected = dict(managed_defaults)
+expected = hooks.merge_settings(expected, base_payload)
 expected = hooks.merge_settings(expected, overlay_payload)
 # PR #970: `cmd_render_shared_settings` rewrites `~/.agent-bridge/hooks/`
 # prefixes in the merged settings to absolute `<BRIDGE_HOME>/hooks/` paths
@@ -2894,6 +2918,18 @@ payload = {
 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 PY
 
+  # Queue #11901: resolve the operator-global settings file for the plan's
+  # `expected` so it matches the renderer's bottom-most layer. Only the
+  # SHARED (non-isolated) path inherits it — iso v2 agents render through
+  # cmd_render_isolated_home_settings (untouched), so the isolated plan
+  # branch passes an EMPTY operator-global to keep its `expected` free of
+  # global inheritance (AC5).
+  local _operator_global_file=""
+  if [[ $_isolated_active -ne 1 ]] \
+      && command -v bridge_hook_operator_global_settings_file >/dev/null 2>&1; then
+    _operator_global_file="$(bridge_hook_operator_global_settings_file 2>/dev/null || true)"
+  fi
+
   local _plan_rc=0
   if [[ $_isolated_active -eq 1 ]]; then
     bridge_require_python
@@ -2906,7 +2942,8 @@ PY
       "$effective_file" \
       "$launch_cmd" \
       "$agent_class" \
-      "$settings_path_override"
+      "$settings_path_override" \
+      ""
     _plan_rc=$?
   else
     bridge_require_python
@@ -2919,7 +2956,8 @@ PY
       "$effective_file" \
       "$launch_cmd" \
       "$agent_class" \
-      "$settings_path_override"
+      "$settings_path_override" \
+      "$_operator_global_file"
     _plan_rc=$?
   fi
   rm -f "$_plan_py"
