@@ -437,9 +437,19 @@ bridge_build_static_claude_launch_cmd() {
   local session_id=""
   local continue_fallback=0
   local effective_continue=0
+  local model=""
+  local effort=""
 
   fallback="${BRIDGE_AGENT_LAUNCH_CMD[$agent]-}"
   [[ -n "$fallback" ]] || return 1
+
+  # #1763: pass the roster-materialized model/effort to the static builder so
+  # `agent update --model/--effort` (which upserts BRIDGE_AGENT_MODEL/EFFORT)
+  # actually reaches the launched static Claude process — the helper injects
+  # them and lets a non-empty roster value win over a stale baked flag, while
+  # an empty value preserves the baked LAUNCH_CMD byte-for-byte.
+  model="$(bridge_agent_model "$agent")"
+  effort="$(bridge_agent_effort "$agent")"
 
   continue_mode="$(bridge_agent_continue "$agent")"
   if bridge_agent_claude_effective_engine_continue "$agent"; then
@@ -473,7 +483,8 @@ bridge_build_static_claude_launch_cmd() {
     return 1
   fi
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-static-claude-build.py" \
-    "$agent" "$continue_mode" "$session_id" "$continue_fallback" "$fallback"
+    "$agent" "$continue_mode" "$session_id" "$continue_fallback" "$fallback" \
+    "$model" "$effort"
 }
 
 bridge_build_safe_claude_launch_cmd() {
