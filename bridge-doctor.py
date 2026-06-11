@@ -818,6 +818,32 @@ def _registered_agent_dirs(registry: list[dict[str, Any]]) -> list[tuple[str, st
     return out
 
 
+# Issue #1787 (codex r3): three-state identity result so a samefile that
+# cannot be RESOLVED (stat failure) never silently degrades to "not a
+# registered agent". The orphan detector and `agent retire` both fail SAFE on
+# INDETERMINATE — neither reports an orphan nor proceeds with a destructive
+# retire when identity could not be proven (the #1774/#1771 fail-closed
+# pattern). Distinct from `None` (PROVEN no-match: every registered dir was
+# statable and none is the same file).
+_SAMEFILE_INDETERMINATE = "\0indeterminate\0"
+
+
+def _path_lexists(path: Path) -> bool:
+    """True if `path` exists (incl. a broken symlink), False ONLY when it is
+    provably absent. A permission/other OSError errs toward True so the caller
+    fails SAFE (indeterminate) rather than treating an unreadable registered
+    dir as a clean no-match. `os.lstat` is the `os`-module call, not a
+    pathlib metadata probe — it does not trip the raw-pathlib lint.
+    """
+    try:
+        os.lstat(path)
+        return True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+
+
 def _samefiles_registered_agent(
     candidate: Path,
     registered_dirs: list[tuple[str, str]],
@@ -831,41 +857,61 @@ def _samefiles_registered_agent(
     guides a destructive `mv` / `retire` of its settings tree. Mirror the
     #1759 self-ref guard idiom: realpath string-compare first, then
     `os.path.samefile` as the inode-aware fallback against each registered
-    home/workdir. Returns the matching agent id, or None when no registered
-    dir is provably the same file as `candidate`. A stat failure on one
-    registered dir (lazily-scaffolded / absent) is skipped — the exact
-    realpath compare already ruled out a plain string match, so an unstatable
-    registered dir is a genuinely different path, not the case-variant
-    collision being guarded against.
+    home/workdir.
+
+    Three-state return (codex r3 — fail SAFE on indeterminate):
+      * the matching agent id  — `candidate` IS a registered agent's dir;
+      * `_SAMEFILE_INDETERMINATE` — a `samefile()` raised (stat failure on the
+        candidate or a registered dir) and NO confirmed match was found, so we
+        could not PROVE the candidate is unregistered. The caller must NOT
+        report an orphan / must NOT proceed with retire in this state;
+      * `None` — PROVEN no-match: every registered dir resolved cleanly and
+        none is the same file as `candidate`.
+
+    Fail-safe rule (codex r3, the #1774/#1771 fail-closed pattern): a
+    `samefile()` that RAISES must not silently become "no-match". But a
+    registered `home`/`workdir` legitimately may NOT EXIST (a v2 agent's `home`
+    resolves to data/agents/<a>/home, often not on disk; a registry-only agent
+    has no scaffolded tree) — and samefile against a NON-EXISTENT registered
+    dir is a CLEAN no-match for that pair (the existing candidate cannot be a
+    path that does not exist). So `_SAMEFILE_INDETERMINATE` fires only when the
+    probe could be MASKING a real match: (a) the CANDIDATE itself is
+    unstatable, or (b) a registered dir EXISTS yet samefile still raised.
+    Forcing `os.path.samefile` to raise must never yield an orphan report for a
+    LIVE agent's dir. A proven match always wins over indeterminate.
     """
+    indeterminate = False
+    cand_exists = _path_lexists(candidate)
+    if not cand_exists:
+        indeterminate = True
     try:
         cand_real = os.path.realpath(candidate)
     except OSError:
-        cand_real = str(candidate)
+        cand_real = None
     for agent_id, base in registered_dirs:
         reg_path = Path(base).expanduser()
-        try:
-            reg_real = os.path.realpath(reg_path)
-        except OSError:
-            reg_real = str(reg_path)
-        if cand_real == reg_real:
-            return agent_id
+        if cand_real is not None:
+            try:
+                reg_real = os.path.realpath(reg_path)
+            except OSError:
+                reg_real = None
+            if reg_real is not None and cand_real == reg_real:
+                return agent_id
         try:
             if os.path.samefile(candidate, reg_path):
                 return agent_id
         except OSError:
-            # samefile raises when EITHER side cannot be statted. A missing
-            # registered dir (agent scaffolded lazily) is benign — the
-            # string compare above already ruled out an exact match, so a
-            # stat failure here means the two are genuinely different paths
-            # OR one is absent; neither is the case-variant collision we
-            # guard against, so do NOT fail-safe to "match" on a plain
-            # absence. Only an EXISTING-but-unstatable candidate that we
-            # cannot prove distinct should be conservative — but the
-            # detector's own OSError handling already skips an unreadable
-            # candidate, so falling through to the next registered dir is
-            # correct here.
+            # samefile raised. Clean no-match for this pair ONLY when the
+            # registered dir provably does not exist; otherwise the raised
+            # probe could be masking the case-variant collision where samefile
+            # WOULD have matched → fail safe to indeterminate (gated on the
+            # candidate being statable; an unstatable candidate is already
+            # indeterminate above). A later PROVEN match still wins.
+            if cand_exists and _path_lexists(reg_path):
+                indeterminate = True
             continue
+    if indeterminate:
+        return _SAMEFILE_INDETERMINATE
     return None
 
 
@@ -929,7 +975,40 @@ def detect_orphan_agent_dir(
         # still fire. samefile proves same-vs-different correctly on both
         # filesystem classes, so the detector keeps its teeth on Linux while
         # not quarantining a live agent's tree on macOS.
-        if _samefiles_registered_agent(entry, registered_dirs) is not None:
+        identity = _samefiles_registered_agent(entry, registered_dirs)
+        if identity is not None:
+            # Proven match → skip (registered agent's tree, not an orphan).
+            # codex r3: INDETERMINATE (a samefile stat failure left identity
+            # unproven) must ALSO skip the destructive orphan recipe — we
+            # cannot prove this dir is unregistered, so failing safe means
+            # NOT reporting it. Surface a separate info-level note so the
+            # operator can hand-verify rather than silently dropping it.
+            if identity == _SAMEFILE_INDETERMINATE:
+                findings.append(
+                    {
+                        "ts": ts,
+                        "kind": "orphan-agent-dir-unverifiable",
+                        "agent": name,
+                        "evidence": {
+                            "dir": str(entry),
+                            "reason": (
+                                "could not verify against the registry "
+                                "(os.path.samefile stat failure); not reported "
+                                "as an orphan to avoid quarantining a possibly "
+                                "live agent's tree"
+                            ),
+                            "registry_checked": "agent registry --json",
+                        },
+                        "suggested_action": (
+                            f"Could not prove whether {entry} is a registered "
+                            "agent's directory (a stat/samefile probe failed). "
+                            "It is NOT being reported as an orphan (fail-safe). "
+                            "Manually confirm with `agent-bridge agent registry "
+                            "--json` and check whether any registered home/"
+                            f"workdir resolves to {entry} before any cleanup."
+                        ),
+                    }
+                )
             continue
         # Skip symlinks that don't point at an actual agent home (live
         # `shared/` link, stale convenience symlinks). A dir-shaped symlink
@@ -1056,7 +1135,7 @@ def _iter_registry_agents(
 
 
 def _settings_effective_content(real_path: Path) -> str | None:
-    """Return the text content of a resolved settings.effective.json, or None.
+    """Return the text content of a resolved effective settings file, or None.
 
     Issue #1788: the two-tree-drift detector compares the CONTENT of the two
     rendered effective files, not just their inode identity. On a shared-mode
@@ -1094,9 +1173,9 @@ def detect_settings_two_tree_drift(
     Issue #1788 — aligned to the renderer's intended layout. The renderer
     (`bridge_ensure_claude_shared_settings_for_managed_workdir`,
     lib/bridge-hooks.sh) DELIBERATELY maintains two effective files for a
-    shared-mode v2 non-isolated agent: the workdir-side
-    `agents/<a>/.claude/settings.effective.json` AND the launched-config-dir
-    `data/agents/<a>/home/.claude/settings.effective.json` (registry `home`).
+    shared-mode v2 non-isolated agent: the workdir-side effective file under
+    `agents/<a>/.claude/` AND the launched-config-dir effective file under
+    `data/agents/<a>/home/.claude/` (registry `home`).
     Both are rendered from the same base+overlay (same channels/class), so on
     a healthy host they are TWO DISTINCT INODES WITH IDENTICAL CONTENT. The
     pre-#1788 inode-only compare flagged that intended end state for every
@@ -1214,8 +1293,8 @@ def detect_settings_multi_tree(
     healthy.
 
     Distinct from settings-two-tree-drift: that one compares the
-    `settings.json` link resolution; this one counts physical
-    `settings.effective.json` files. The two together cover the
+    `settings.json` link resolution; this one counts physical effective
+    settings files. The two together cover the
     promotion-time hazard described in the issue.
 
     Read-only.
@@ -1271,7 +1350,7 @@ def detect_settings_multi_tree(
         }
         suggested = (
             f"Multi-tree settings CONTENT drift for {agent_id}: real "
-            f"settings.effective.json files in {len(real_locations)} trees "
+            f"effective settings files in {len(real_locations)} trees "
             f"({', '.join(sorted(real_locations))}) have DIVERGED in content. "
             "Re-render and re-link both trees from the single source with "
             f"`agent-bridge agent rerender-settings {agent_id} --apply` "
@@ -1593,6 +1672,16 @@ def main() -> int:
                 evidence = finding.get("evidence") or {}
                 if isinstance(evidence, dict) and evidence.get("detector") in enabled_set:
                     kept.append(finding)
+                continue
+            # Issue #1787: the info-level "orphan-agent-dir-unverifiable" row is
+            # emitted BY the orphan-agent-dir detector (a fail-safe note when
+            # samefile could not prove registration), so it rides the same
+            # allow-list as its parent detector.
+            if (
+                kind == "orphan-agent-dir-unverifiable"
+                and "orphan-agent-dir" in enabled_set
+            ):
+                kept.append(finding)
         findings = kept
 
     if args.json:

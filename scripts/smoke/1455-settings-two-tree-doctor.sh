@@ -162,20 +162,21 @@ make_same_tree() {
 
 # make_dual_render_identical <agent> — Issue #1788: the renderer's INTENDED
 # shape on a shared-mode v2 non-isolated host. home + workdir each have their
-# OWN real settings.effective.json (distinct inodes), each rendered from the
+# OWN real effective file (distinct inodes), each rendered from the
 # same base+overlay so their CONTENT is byte-identical, and each tree's
 # settings.json symlinks to its OWN effective file. This is healthy — the
-# content-aware detectors must NOT flag it.
+# content-aware detectors must NOT flag it. The writes below are LOCAL mktemp
+# test fixtures, not controller->isolated boundary writes (iso-helper-ratchet).
 make_dual_render_identical() {
   local agent="$1"
   local home="$AGENTS_ROOT/$agent/home"
   local workdir="$AGENTS_ROOT/$agent/workdir"
   mkdir -p "$home/.claude" "$workdir/.claude"
   local payload='{"enabledPlugins":{"teams":true}}'
-  printf '%s\n' "$payload" >"$home/.claude/settings.effective.json"
-  printf '%s\n' "$payload" >"$workdir/.claude/settings.effective.json"
-  ln -s "settings.effective.json" "$home/.claude/settings.json"
-  ln -s "settings.effective.json" "$workdir/.claude/settings.json"
+  printf '%s\n' "$payload" >"$home/.claude/settings.effective.json"  # noqa: iso-helper-boundary — local mktemp fixture, no controller->iso boundary
+  printf '%s\n' "$payload" >"$workdir/.claude/settings.effective.json"  # noqa: iso-helper-boundary — local mktemp fixture, no controller->iso boundary
+  ln -s "settings.effective.json" "$home/.claude/settings.json"  # noqa: iso-helper-boundary — local mktemp fixture symlink
+  ln -s "settings.effective.json" "$workdir/.claude/settings.json"  # noqa: iso-helper-boundary — local mktemp fixture symlink
 }
 
 # write_registry <agent...> — emit `agent registry --json`-shaped rows with

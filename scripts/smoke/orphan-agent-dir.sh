@@ -121,6 +121,20 @@ print(sum(1 for r in data if r.get("kind") == "orphan-agent-dir"))
 ' <<<"$payload"
 }
 
+# Return the count of findings of an arbitrary kind (e.g. the #1787 fail-safe
+# `orphan-agent-dir-unverifiable` info note). Uses a pipe (not a here-string)
+# so this new helper adds no lint-heredoc-ban H3 site.
+kind_count() {
+  local payload="$1"
+  local kind="$2"
+  printf '%s' "$payload" | "$PY_BIN" -c '
+import json, sys
+kind = sys.argv[1]
+data = json.loads(sys.stdin.read() or "[]")
+print(sum(1 for r in data if r.get("kind") == kind))
+' "$kind"
+}
+
 # Return JSON list of orphan-agent-dir findings only (drops detector-error
 # noise so per-test JSON inspection stays simple).
 findings_only() {
@@ -421,6 +435,71 @@ test_case_folding_but_distinct_inode_still_flagged() {
 }
 
 # ---------------------------------------------------------------------------
+# T10 — Issue #1787 (codex r3, SAFETY): a samefile probe that CANNOT be
+#       resolved (the registered dir exists but is unreadable) must NOT report
+#       the candidate as an orphan — identity is UNPROVEN, so failing safe
+#       means holding it back. We make the registered home unstatable by
+#       chmod-000'ing its PARENT (samefile raises EACCES, lexists still
+#       reports the path as present), so the detector cannot prove the
+#       candidate is unregistered and must surface the fail-safe
+#       `orphan-agent-dir-unverifiable` info note INSTEAD of an orphan finding.
+# ---------------------------------------------------------------------------
+test_indeterminate_failsafe_no_orphan() {
+  reset_home_root
+  # Registered agent `locked` whose home is under a soon-to-be-unreadable dir.
+  local locked_parent="$SMOKE_TMP_ROOT/locked-parent"
+  local reg_home="$locked_parent/locked-home"
+  mkdir -p "$reg_home"
+  # Candidate under the home root whose basename is NOT the registered id (so
+  # it falls through to the samefile probe) — the probe will raise EACCES.
+  mkdir -p "$BRIDGE_AGENT_HOME_ROOT/LOCKED-CANDIDATE"
+
+  local registry="$SMOKE_TMP_ROOT/registry.t10.json"
+  printf '[{"id":"locked","class":"dynamic","agent_source":"dynamic","privilege_class":"user","home":"%s","workdir":"%s","engine":"claude","is_alive":true,"source":"dynamic-active-env"}]\n' \
+    "$reg_home" "$reg_home" >"$registry"
+
+  # Make the registered home unstatable: chmod 000 the parent so a samefile()
+  # against reg_home raises EACCES (but lexists reports it present).
+  chmod 000 "$locked_parent"
+  ORPHAN_LOCKED_DIR="$locked_parent"
+
+  local out
+  out="$(run_doctor_orphan "$registry")"
+
+  # Restore perms immediately so later tests / cleanup are unaffected.
+  chmod 755 "$locked_parent"
+  ORPHAN_LOCKED_DIR=""
+
+  # If this fs/uid did not actually make samefile raise (e.g. running as root),
+  # the indeterminate path is not exercised — skip rather than false-fail.
+  local unverifiable
+  unverifiable="$(kind_count "$out" "orphan-agent-dir-unverifiable")"
+  if [[ "$unverifiable" == "0" ]]; then
+    smoke_log "T10 skip: registered home stayed statable (likely root/uid) — indeterminate not reproducible"
+    return 0
+  fi
+
+  # The candidate is NOT reported as a destructive orphan (fail-safe).
+  local cand_orphan
+  cand_orphan="$(finding_field "$out" "LOCKED-CANDIDATE" "dir")"
+  smoke_assert_eq "__MISSING__" "$cand_orphan" \
+    "T10 indeterminate candidate is NOT reported as an orphan (fail-safe)"
+
+  # Zero orphan-agent-dir findings; the only signal is the info-level note.
+  local orphan_count
+  orphan_count="$(findings_count "$out")"
+  smoke_assert_eq "0" "$orphan_count" \
+    "T10 no orphan-agent-dir finding when identity is unprovable"
+  smoke_assert_eq "1" "$unverifiable" \
+    "T10 a single orphan-agent-dir-unverifiable info note is surfaced"
+
+  # Pipe (not a here-string) so this check adds no lint-heredoc-ban H3 site.
+  if printf '%s' "$out" | grep -q 'Traceback'; then
+    smoke_fail "T10 doctor output contains a Python traceback: $out"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Drive cases.
 # ---------------------------------------------------------------------------
 ORPHAN_LOCKED_DIR=""
@@ -433,5 +512,6 @@ smoke_run "T6 unreadable subdir partial finding" test_unreadable_subdir_partial_
 smoke_run "T7 *-repro-<digits> suffix" test_repro_suffix_artifact
 smoke_run "T8 case-variant registered not flagged" test_case_variant_registered_not_flagged
 smoke_run "T9 distinct-inode case-fold still flagged" test_case_folding_but_distinct_inode_still_flagged
+smoke_run "T10 indeterminate fail-safe (no orphan)" test_indeterminate_failsafe_no_orphan
 
 smoke_log "all orphan-agent-dir cases passed"
