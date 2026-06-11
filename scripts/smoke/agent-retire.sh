@@ -365,6 +365,58 @@ EOF
     "T8 out-of-root refusal must not touch the path"
 }
 
+# ---------------------------------------------------------------------------
+# T9 — Issue #1787: case-variant of a REGISTERED agent name must NOT be
+#      retireable on a case-insensitive filesystem. `agent retire CRM-TEST-BSH`
+#      where the registry holds `crm-test-bsh` (same dir on APFS) must REFUSE
+#      with a pointer to the real name and plan NOTHING destructive — even
+#      under --dry-run.
+# ---------------------------------------------------------------------------
+test_refuse_case_variant_of_registered() {
+  reset_state
+  # Register the agent at its canonical lowercase spelling.
+  write_dynamic_active_env "crm-test-bsh"
+  local home
+  home="$(make_home_dir "crm-test-bsh")"
+
+  # Gate on case-insensitivity: only when the uppercase spelling reaches the
+  # SAME directory is the #1787 collision reproducible (a Linux case-sensitive
+  # fs makes them distinct dirs — nothing to guard there). Mirrors the
+  # #1759 smoke's `case_variant.exists()` APFS gate.
+  local variant_dir="$BRIDGE_AGENT_HOME_ROOT/CRM-TEST-BSH"
+  if [[ ! -d "$variant_dir" ]] || ! [[ "$variant_dir" -ef "$home" ]]; then
+    smoke_log "T9 skip: case-sensitive filesystem — case-variant collision not reproducible here"
+    return 0
+  fi
+
+  # (a) --dry-run must REFUSE (non-zero) and name the real registered agent.
+  local rc=0 out
+  out="$(agent_retire CRM-TEST-BSH --dry-run 2>&1)" || rc=$?
+  (( rc != 0 )) || smoke_fail "T9 case-variant retire --dry-run should have been refused (rc=$rc, out=$out)"
+  smoke_assert_contains "$out" "crm-test-bsh" "T9 refusal points at the registered name"
+  smoke_assert_contains "$out" "same directory" "T9 refusal explains the samefile collision"
+
+  # (b) The live agent's home + its marker are untouched (no mv/quarantine planned).
+  smoke_assert_file_exists "$home/marker.txt" "T9 live agent home must be untouched"
+  [[ -d "$home" ]] || smoke_fail "T9 live agent home should still exist: $home"
+  # No quarantine dir was created.
+  if [[ -d "$BRIDGE_HOME/archive/retired-agents" ]] \
+      && find "$BRIDGE_HOME/archive/retired-agents" -maxdepth 1 -name '*CRM-TEST-BSH*' 2>/dev/null | grep -q .; then
+    smoke_fail "T9 no quarantine dir should have been created for the case-variant"
+  fi
+
+  # (c) A genuinely unrelated orphan in the SAME run still retires (teeth intact).
+  local orphan_home
+  orphan_home="$(make_home_dir "genuine-orphan-xyz")"
+  local rc2=0 out2
+  out2="$(agent_retire genuine-orphan-xyz --json 2>&1)" || rc2=$?
+  (( rc2 == 0 )) || smoke_fail "T9 genuine orphan retire should still succeed (rc=$rc2, out=$out2)"
+  local status2
+  status2="$("$PY_BIN" -c 'import json,sys; print(json.loads(sys.stdin.read())["status"])' <<<"$out2")"
+  smoke_assert_eq "retired" "$status2" "T9 genuine orphan still retired (detector teeth intact)"
+  [[ ! -d "$orphan_home" ]] || smoke_fail "T9 genuine orphan home should be moved away"
+}
+
 smoke_run "T1 quarantine dynamic"             test_quarantine_dynamic
 smoke_run "T2 purge dynamic"                  test_purge_dynamic
 smoke_run "T3 refuse static-class"            test_refuse_static
@@ -373,5 +425,6 @@ smoke_run "T5 refuse unknown agent"           test_refuse_unknown
 smoke_run "T6 orphan quarantine"              test_orphan_quarantine
 smoke_run "T7 dry-run is no-op"               test_dry_run
 smoke_run "T8 refuse out-of-root home"        test_refuse_out_of_root
+smoke_run "T9 refuse case-variant of registered" test_refuse_case_variant_of_registered
 
 smoke_log "all checks passed"

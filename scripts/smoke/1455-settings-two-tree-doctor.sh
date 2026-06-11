@@ -160,6 +160,24 @@ make_same_tree() {
   ln -s "../home/.claude" "$workdir/.claude"
 }
 
+# make_dual_render_identical <agent> — Issue #1788: the renderer's INTENDED
+# shape on a shared-mode v2 non-isolated host. home + workdir each have their
+# OWN real settings.effective.json (distinct inodes), each rendered from the
+# same base+overlay so their CONTENT is byte-identical, and each tree's
+# settings.json symlinks to its OWN effective file. This is healthy — the
+# content-aware detectors must NOT flag it.
+make_dual_render_identical() {
+  local agent="$1"
+  local home="$AGENTS_ROOT/$agent/home"
+  local workdir="$AGENTS_ROOT/$agent/workdir"
+  mkdir -p "$home/.claude" "$workdir/.claude"
+  local payload='{"enabledPlugins":{"teams":true}}'
+  printf '%s\n' "$payload" >"$home/.claude/settings.effective.json"
+  printf '%s\n' "$payload" >"$workdir/.claude/settings.effective.json"
+  ln -s "settings.effective.json" "$home/.claude/settings.json"
+  ln -s "settings.effective.json" "$workdir/.claude/settings.json"
+}
+
 # write_registry <agent...> — emit `agent registry --json`-shaped rows with
 # the home + workdir columns the settings detectors consume.
 write_registry() {
@@ -170,6 +188,23 @@ write_registry() {
       if (( first )); then first=0; else printf ','; fi
       printf '{"id":"%s","class":"dynamic","home":"%s/%s/home","workdir":"%s/%s/workdir","engine":"claude"}' \
         "$agent" "$AGENTS_ROOT" "$agent" "$AGENTS_ROOT" "$agent"
+    done
+    printf ']\n'
+  } >"$REGISTRY"
+}
+
+# write_registry_engine <engine> <agent...> — same as write_registry but with
+# a caller-chosen engine column (Issue #1788: the settings detectors skip
+# non-claude engines).
+write_registry_engine() {
+  local engine="$1"; shift
+  local first=1 agent
+  {
+    printf '['
+    for agent in "$@"; do
+      if (( first )); then first=0; else printf ','; fi
+      printf '{"id":"%s","class":"dynamic","home":"%s/%s/home","workdir":"%s/%s/workdir","engine":"%s"}' \
+        "$agent" "$AGENTS_ROOT" "$agent" "$AGENTS_ROOT" "$agent" "$engine"
     done
     printf ']\n'
   } >"$REGISTRY"
@@ -332,6 +367,76 @@ test_same_tree_no_false_positive() {
 }
 
 # ---------------------------------------------------------------------------
+# T8 — Issue #1788: the renderer's intended dual-render (two distinct real
+# effective files with IDENTICAL content) is HEALTHY — NEITHER detector flags
+# it. This is the all-fleet false-positive #1788 reports on v0.16.8.
+# ---------------------------------------------------------------------------
+test_dual_render_identical_clean() {
+  reset_agents_root
+  make_dual_render_identical "dualok"
+  write_registry "dualok"
+  run_doctor "settings-two-tree-drift,settings-multi-tree"
+
+  smoke_assert_eq "0" "$(h_count settings-two-tree-drift)" \
+    "T8 dual-render identical content: zero two-tree-drift findings (#1788)"
+  smoke_assert_eq "0" "$(h_count settings-multi-tree)" \
+    "T8 dual-render identical content: zero multi-tree findings (#1788)"
+  smoke_assert_eq "no" "$(h_traceback)" "T8 no traceback"
+}
+
+# ---------------------------------------------------------------------------
+# T9 — Issue #1788: the corrected suggested_action names a REAL verb
+# (`agent rerender-settings`), never the non-existent `bash bridge-hooks.sh`.
+# Genuine content drift still fires (teeth intact).
+# ---------------------------------------------------------------------------
+test_corrected_recipe_text() {
+  reset_agents_root
+  make_drift "draftee"   # divergent content → genuine drift
+  make_multi "twins"     # two physical files, divergent content
+  write_registry "draftee" "twins"
+  run_doctor "settings-two-tree-drift,settings-multi-tree"
+
+  # Detector teeth: genuine divergent content still fires. Both fixtures have
+  # divergent content across their two trees, so both are legitimate
+  # two-tree-drift cases (h_agents returns a comma-sorted id list).
+  smoke_assert_eq "draftee,twins" "$(h_agents settings-two-tree-drift)" \
+    "T9 genuine content drift still fires two-tree-drift for both"
+
+  local recipe_a recipe_b
+  recipe_a="$(h_field settings-two-tree-drift draftee suggested_action)"
+  smoke_assert_contains "$recipe_a" "agent rerender-settings draftee --apply" \
+    "T9 (a) two-tree-drift recipe names the real rerender verb (#1788)"
+  if printf '%s' "$recipe_a" | grep -q "bash bridge-hooks.sh"; then
+    smoke_fail "T9 (a) recipe must NOT reference the non-existent bridge-hooks.sh"
+  fi
+
+  recipe_b="$(h_field settings-multi-tree twins suggested_action)"
+  smoke_assert_contains "$recipe_b" "agent rerender-settings twins --apply" \
+    "T9 (b) multi-tree recipe names the real rerender verb (#1788)"
+  if printf '%s' "$recipe_b" | grep -q "bash bridge-hooks.sh"; then
+    smoke_fail "T9 (b) recipe must NOT reference the non-existent bridge-hooks.sh"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# T10 — Issue #1788 Note: non-claude engines are SKIPPED. A codex agent's
+# vestigial Claude tree (even with divergent content) must not produce a
+# finding (`agent rerender-settings` refuses codex agents anyway).
+# ---------------------------------------------------------------------------
+test_non_claude_engine_skipped() {
+  reset_agents_root
+  make_drift "codexpair"   # divergent content — WOULD fire if it were claude
+  make_multi "codexmulti"
+  write_registry_engine "codex" "codexpair" "codexmulti"
+  run_doctor "settings-two-tree-drift,settings-multi-tree"
+
+  smoke_assert_eq "0" "$(h_count settings-two-tree-drift)" \
+    "T10 codex engine: two-tree-drift skipped (#1788 Note)"
+  smoke_assert_eq "0" "$(h_count settings-multi-tree)" \
+    "T10 codex engine: multi-tree skipped (#1788 Note)"
+}
+
+# ---------------------------------------------------------------------------
 # Drive cases.
 # ---------------------------------------------------------------------------
 smoke_run "T1 invariant assertion (correct layout)" test_invariant_assertion
@@ -341,5 +446,8 @@ smoke_run "T4 multi-tree fires (b)" test_multi_fires_multi_tree
 smoke_run "T5 no false positives" test_no_false_positives
 smoke_run "T6 evidence shape + no traceback" test_evidence_shape
 smoke_run "T7 same-tree no false positive" test_same_tree_no_false_positive
+smoke_run "T8 dual-render identical content clean (#1788)" test_dual_render_identical_clean
+smoke_run "T9 corrected recipe text (#1788)" test_corrected_recipe_text
+smoke_run "T10 non-claude engine skipped (#1788)" test_non_claude_engine_skipped
 
 smoke_log "all 1455 settings single-tree detector cases passed"

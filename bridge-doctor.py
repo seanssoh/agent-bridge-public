@@ -18,17 +18,20 @@ Detectors:
 - orphan-agent-dir         : directories under $BRIDGE_AGENT_HOME_ROOT that are not in
                              `agent registry --json` (#598 Track 2). Report-only;
                              emits a manual quarantine recipe in suggested_action.
-- settings-two-tree-drift  : an agent whose home + workdir `settings.json` resolve to
-                             DIFFERENT real files — i.e. the workdir copy is a second
-                             real file instead of a relative symlink back to the home
-                             effective tree (#1455). This inode divergence lets the
-                             preserved-user `enabledPlugins` key drift and was the root
-                             cause of #1453.
-- settings-multi-tree      : an agent whose effective settings file exists as a real
-                             (non-symlink) file in MORE THAN ONE location — both
-                             `home/.claude/` and `workdir/.claude/` (#1455). The
-                             single-tree invariant requires exactly one physical
-                             effective file with every other location a symlink to it.
+- settings-two-tree-drift  : a CLAUDE agent whose home + workdir `settings.json` resolve
+                             to two real files with DIFFERENT CONTENT (#1455). A
+                             preserved-user key like `enabledPlugins` drifting between
+                             the trees was the root cause of #1453. Two distinct inodes
+                             with IDENTICAL content is the renderer's intended dual-render
+                             on shared-mode v2 non-iso hosts and is NOT flagged (#1788);
+                             non-claude engines are skipped (#1788 Note).
+- settings-multi-tree      : a CLAUDE agent whose effective settings file exists as a
+                             real (non-symlink) file in MORE THAN ONE location — both
+                             `home/.claude/` and `workdir/.claude/` — with DIVERGENT
+                             content (#1455). Two byte-identical physical copies is the
+                             renderer's intended dual-render on shared-mode v2 non-iso
+                             hosts and is NOT flagged (#1788); non-claude engines are
+                             skipped (#1788 Note).
 
 Read-only contract: the CLI never mutates queue/state/tmux. `suggested_action`
 is a string the admin agent LLM parses and decides whether to execute. The two
@@ -793,6 +796,79 @@ def _iso_from_epoch(epoch: float | None) -> str:
         return ""
 
 
+def _registered_agent_dirs(registry: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """Yield (agent_id, dir) for every registered agent's home + workdir.
+
+    The orphan detector and `agent retire` both need the SET of directories
+    that belong to a registered agent so a candidate dir can be checked
+    case-insensitively (macOS APFS) via `os.path.samefile`, not just by a
+    case-sensitive basename string compare. Skips empty paths.
+    """
+    out: list[tuple[str, str]] = []
+    for row in registry:
+        if not isinstance(row, dict):
+            continue
+        agent_id = str(row.get("id") or "").strip()
+        if not agent_id:
+            continue
+        for key in ("home", "workdir"):
+            base = str(row.get(key) or "").strip()
+            if base:
+                out.append((agent_id, base))
+    return out
+
+
+def _samefiles_registered_agent(
+    candidate: Path,
+    registered_dirs: list[tuple[str, str]],
+) -> str | None:
+    """Return the registered agent id whose home/workdir IS `candidate`.
+
+    Filesystem-aware identity (Issue #1787): on a case-insensitive volume
+    (macOS APFS default) `agents/CRM-TEST-BSH` and the registry's
+    `agents/crm-test-bsh` are the SAME directory, so a case-sensitive
+    basename compare wrongly classifies a LIVE agent's dir as an orphan and
+    guides a destructive `mv` / `retire` of its settings tree. Mirror the
+    #1759 self-ref guard idiom: realpath string-compare first, then
+    `os.path.samefile` as the inode-aware fallback against each registered
+    home/workdir. Returns the matching agent id, or None when no registered
+    dir is provably the same file as `candidate`. A stat failure on one
+    registered dir (lazily-scaffolded / absent) is skipped — the exact
+    realpath compare already ruled out a plain string match, so an unstatable
+    registered dir is a genuinely different path, not the case-variant
+    collision being guarded against.
+    """
+    try:
+        cand_real = os.path.realpath(candidate)
+    except OSError:
+        cand_real = str(candidate)
+    for agent_id, base in registered_dirs:
+        reg_path = Path(base).expanduser()
+        try:
+            reg_real = os.path.realpath(reg_path)
+        except OSError:
+            reg_real = str(reg_path)
+        if cand_real == reg_real:
+            return agent_id
+        try:
+            if os.path.samefile(candidate, reg_path):
+                return agent_id
+        except OSError:
+            # samefile raises when EITHER side cannot be statted. A missing
+            # registered dir (agent scaffolded lazily) is benign — the
+            # string compare above already ruled out an exact match, so a
+            # stat failure here means the two are genuinely different paths
+            # OR one is absent; neither is the case-variant collision we
+            # guard against, so do NOT fail-safe to "match" on a plain
+            # absence. Only an EXISTING-but-unstatable candidate that we
+            # cannot prove distinct should be conservative — but the
+            # detector's own OSError handling already skips an unreadable
+            # candidate, so falling through to the next registered dir is
+            # correct here.
+            continue
+    return None
+
+
 def detect_orphan_agent_dir(
     registry: list[dict[str, Any]],
     home_root: Path,
@@ -818,6 +894,12 @@ def detect_orphan_agent_dir(
         agent_id = str(row.get("id") or "").strip()
         if agent_id:
             known.add(agent_id)
+    # Issue #1787: a case-insensitive volume (macOS APFS default) makes
+    # `agents/CRM-TEST-BSH` and the registry's `agents/crm-test-bsh` the SAME
+    # directory, so the basename string compare below is not enough — the
+    # case-variant spelling is not in `known` yet IS a live agent's dir. Build
+    # the registered home/workdir set for an inode-aware samefile fallback.
+    registered_dirs = _registered_agent_dirs(registry)
 
     try:
         entries = sorted(home_root.iterdir(), key=lambda p: p.name)
@@ -836,6 +918,18 @@ def detect_orphan_agent_dir(
         if name in known:
             continue
         if not entry.is_dir():
+            continue
+        # Issue #1787: filesystem-aware identity. Even when the basename is
+        # not a registry id (case differs), the dir may BE a registered
+        # agent's home/workdir on a case-INSENSITIVE fs (macOS APFS), where
+        # `CRM-TEST-BSH` and registered `crm-test-bsh` are the SAME inode.
+        # Use INODE identity (samefile/realpath), never an unconditional
+        # case-fold name match: on a case-SENSITIVE fs those two are DISTINCT
+        # directories and the uppercase one is a genuine orphan that must
+        # still fire. samefile proves same-vs-different correctly on both
+        # filesystem classes, so the detector keeps its teeth on Linux while
+        # not quarantining a live agent's tree on macOS.
+        if _samefiles_registered_agent(entry, registered_dirs) is not None:
             continue
         # Skip symlinks that don't point at an actual agent home (live
         # `shared/` link, stale convenience symlinks). A dir-shaped symlink
@@ -937,13 +1031,15 @@ def _real_settings_target(link_path: Path) -> Path | None:
 
 def _iter_registry_agents(
     registry: list[dict[str, Any]],
-) -> list[tuple[str, str, str]]:
-    """Yield (agent_id, home, workdir) triples from `agent registry --json`.
+) -> list[tuple[str, str, str, str]]:
+    """Yield (agent_id, home, workdir, engine) from `agent registry --json`.
 
     Skips rows missing an id or lacking BOTH a home and a workdir (nothing
     to compare). Mirrors the orphan detector's tolerance for partial rows.
+    `engine` lets a caller scope itself to one runtime (Issue #1788: the
+    settings drift detectors are Claude-tree-specific).
     """
-    out: list[tuple[str, str, str]] = []
+    out: list[tuple[str, str, str, str]] = []
     for row in registry:
         if not isinstance(row, dict):
             continue
@@ -954,37 +1050,85 @@ def _iter_registry_agents(
         workdir = str(row.get("workdir") or "").strip()
         if not home and not workdir:
             continue
-        out.append((agent_id, home, workdir))
+        engine = str(row.get("engine") or "").strip()
+        out.append((agent_id, home, workdir, engine))
     return out
+
+
+def _settings_effective_content(real_path: Path) -> str | None:
+    """Return the text content of a resolved settings.effective.json, or None.
+
+    Issue #1788: the two-tree-drift detector compares the CONTENT of the two
+    rendered effective files, not just their inode identity. On a shared-mode
+    v2 non-isolated host the renderer DELIBERATELY maintains two effective
+    files (workdir-side + launched-config-dir-side, see
+    `bridge_ensure_claude_shared_settings_for_managed_workdir` in
+    lib/bridge-hooks.sh) rendered from the same base+overlay — so two distinct
+    inodes with IDENTICAL content is the intended healthy end state, and only
+    a CONTENT divergence is the #1453 drift hazard. Read-only; any OSError
+    (unreadable iso tree, race) returns None so the caller degrades to
+    skip-this-agent rather than crashing.
+    """
+    try:
+        return real_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    except ValueError:
+        # Undecodable bytes — treat as unreadable for comparison purposes.
+        return None
 
 
 def detect_settings_two_tree_drift(
     registry: list[dict[str, Any]],
     ts: str,
 ) -> list[dict[str, Any]]:
-    """Issue #1455 detector (a): home + workdir `settings.json` diverge.
+    """Issue #1455 detector (a): home + workdir `settings.json` CONTENT diverges.
 
-    For every agent whose registry row carries BOTH a `home` and a
+    For every CLAUDE agent whose registry row carries BOTH a `home` and a
     `workdir`, resolve `<home>/.claude/settings.json` and
     `<workdir>/.claude/settings.json` to their real files and flag the
-    agent when they resolve to DIFFERENT inodes — i.e. the workdir copy is
-    a second real file instead of a relative symlink back at the home
-    effective tree. This is the silent drift that lets a stale
-    `enabledPlugins[X]=false` survive in the workdir copy (#1453 root
-    cause).
+    agent when the two real files have DIFFERENT CONTENT — the silent drift
+    that lets a stale `enabledPlugins[X]=false` survive in one tree (#1453
+    root cause).
+
+    Issue #1788 — aligned to the renderer's intended layout. The renderer
+    (`bridge_ensure_claude_shared_settings_for_managed_workdir`,
+    lib/bridge-hooks.sh) DELIBERATELY maintains two effective files for a
+    shared-mode v2 non-isolated agent: the workdir-side
+    `agents/<a>/.claude/settings.effective.json` AND the launched-config-dir
+    `data/agents/<a>/home/.claude/settings.effective.json` (registry `home`).
+    Both are rendered from the same base+overlay (same channels/class), so on
+    a healthy host they are TWO DISTINCT INODES WITH IDENTICAL CONTENT. The
+    pre-#1788 inode-only compare flagged that intended end state for every
+    Claude agent on v0.16.8 — an always-on false finding the operator could
+    neither execute the recipe for nor converge. Flagging on CONTENT instead
+    of inode keeps the #1453 teeth (a real divergent value still fires) while
+    treating the intended dual-render as healthy.
 
     Cases that are NOT flagged (no false positive):
+      * non-claude engines (codex's vestigial Claude tree; see Issue #1788
+        Note — `agent rerender-settings` refuses codex agents anyway);
       * either tree's `settings.json` missing / not-yet-rendered;
-      * both resolve to the same real file (the healthy symlinked layout);
+      * both resolve to the same real file (the classic single-tree symlink);
+      * both real files exist with byte-identical content (the renderer's
+        intended dual-render on shared-mode v2 non-iso hosts);
       * an agent with only one of {home, workdir} (no second tree to drift
         against — covered by settings-multi-tree if it ever grows one).
 
-    Read-only. `suggested_action` points at `link-shared-settings`; the
-    detector never re-points the symlink itself.
+    Read-only. `suggested_action` points at `agent rerender-settings <a>
+    --apply`; the detector never re-renders or re-points anything itself.
     """
     findings: list[dict[str, Any]] = []
-    for agent_id, home, workdir in _iter_registry_agents(registry):
+    for agent_id, home, workdir, engine in _iter_registry_agents(registry):
         if not home or not workdir:
+            continue
+        # Issue #1788 Note: scope to Claude agents. The settings.effective
+        # tree is a Claude runtime artifact; a codex agent's tree is
+        # vestigial and `agent rerender-settings` refuses it, so a finding
+        # would be unactionable. Empty/unknown engine is treated as claude
+        # (back-compat: a registry that predates the engine column, or a
+        # fixture that omits it, keeps the prior behavior).
+        if engine and engine != "claude":
             continue
         home_paths = _settings_tree_paths(home)
         work_paths = _settings_tree_paths(workdir)
@@ -1000,6 +1144,18 @@ def detect_settings_two_tree_drift(
         if home_real is None or work_real is None:
             continue
         if home_real == work_real:
+            # Same inode (classic single-tree symlink) — healthy.
+            continue
+        # Two distinct real files. Per #1788 this is only drift when their
+        # CONTENT differs; the renderer's intended dual-render produces two
+        # byte-identical files. If EITHER side is unreadable we cannot prove
+        # divergence — fail safe and skip (never flag on an unprovable read).
+        home_content = _settings_effective_content(home_real)
+        work_content = _settings_effective_content(work_real)
+        if home_content is None or work_content is None:
+            continue
+        if home_content == work_content:
+            # Intended dual-render: distinct inodes, identical content.
             continue
         try:
             work_is_symlink = work_link.is_symlink()  # noqa: raw-pathlib-controller-only — read-only evidence probe; OSError-guarded so an iso-tree PermissionError degrades to a null evidence field rather than crashing the diagnostic.
@@ -1011,17 +1167,19 @@ def detect_settings_two_tree_drift(
             "workdir_settings": str(work_link),
             "workdir_resolves_to": str(work_real),
             "workdir_is_symlink": work_is_symlink,
+            "content_diverged": True,
         }
         suggested = (
-            f"Two-tree settings drift for {agent_id}: "
-            f"{work_link} resolves to {work_real} but {home_link} resolves to "
-            f"{home_real} — the workdir settings is a SECOND real file instead "
-            "of a relative symlink to the home effective tree, so "
-            "enabledPlugins can drift (the #1453 signature). Re-point the "
-            "workdir at the home effective file with "
-            f"`bash bridge-hooks.sh link-shared-settings --agent {agent_id}` "
-            "(controller-owned render; never hand-copy). Verify with "
-            f"`realpath {work_link}` == `realpath {home_link}`."
+            f"Two-tree settings CONTENT drift for {agent_id}: "
+            f"{work_link} resolves to {work_real} and {home_link} resolves to "
+            f"{home_real} — two real effective files with DIFFERENT content, so "
+            "a preserved-user key (e.g. enabledPlugins) can drift between the "
+            "trees (the #1453 signature). Re-render and re-link both trees from "
+            "the single source with "
+            f"`agent-bridge agent rerender-settings {agent_id} --apply` "
+            "(controller-owned render; never hand-copy). Verify the finding "
+            "clears on the next `agent-bridge doctor --detectors "
+            "settings-two-tree-drift` run."
         )
         findings.append(
             {
@@ -1039,31 +1197,40 @@ def detect_settings_multi_tree(
     registry: list[dict[str, Any]],
     ts: str,
 ) -> list[dict[str, Any]]:
-    """Issue #1455 detector (b): effective settings exist in >1 real tree.
+    """Issue #1455 detector (b): effective settings physically drift across trees.
 
-    The single-tree invariant says exactly one physical
-    `settings.effective.json` may exist for an agent (canonically under
-    `home/.claude/`); every other location is a symlink to it. This
-    detector flags an agent that has a REAL (non-symlink) effective file
-    under BOTH its `home/.claude/` and its `workdir/.claude/` — two
-    physical copies, guaranteed to drift.
+    Flags a CLAUDE agent that has a REAL (non-symlink) effective file under
+    BOTH its `home/.claude/` and its `workdir/.claude/` whose CONTENTS
+    DIVERGE — two physical copies that have actually drifted apart.
+
+    Issue #1788 — aligned to the renderer's intended layout. On a shared-mode
+    v2 non-isolated host the renderer authors TWO physical effective files
+    (workdir-side + launched-config-dir-side) from the same base+overlay; two
+    byte-identical physical copies is therefore the intended end state, not a
+    violation. The pre-#1788 count-only check flagged that for every Claude
+    agent on v0.16.8 — an always-on false finding with no convergent verb.
+    Flagging on CONTENT divergence keeps the #1453 teeth (a genuinely drifted
+    second copy still fires) while treating the renderer's dual-render as
+    healthy.
 
     Distinct from settings-two-tree-drift: that one compares the
     `settings.json` link resolution; this one counts physical
-    `settings.effective.json` files. An agent can trip (b) even if its
-    `settings.json` links happen to agree, and the two together cover the
+    `settings.effective.json` files. The two together cover the
     promotion-time hazard described in the issue.
 
     Read-only.
     """
     findings: list[dict[str, Any]] = []
-    for agent_id, home, workdir in _iter_registry_agents(registry):
+    for agent_id, home, workdir, engine in _iter_registry_agents(registry):
+        # Issue #1788 Note: scope to Claude agents (see two-tree-drift).
+        if engine and engine != "claude":
+            continue
         # Map distinct PHYSICAL file (realpath) -> a display path. Keying by
         # realpath dedupes the case where `home` and `workdir` resolve to the
         # SAME tree (identical paths, or the workdir's `.claude` parent is a
         # symlink to home's) — there the same `settings.effective.json` would
         # otherwise be counted twice and produce a false multi-tree finding.
-        # Only TWO OR MORE distinct physical files is a real violation.
+        # Only TWO OR MORE distinct physical files is a candidate violation.
         physical: dict[str, str] = {}
         for base in (home, workdir):
             paths = _settings_tree_paths(base)
@@ -1081,22 +1248,36 @@ def detect_settings_multi_tree(
                 continue
         if len(physical) < 2:
             continue
+        # Issue #1788: ≥2 distinct physical files is only a violation when
+        # their CONTENT diverges; the renderer's dual-render produces
+        # byte-identical copies. Read each once; an unreadable file leaves its
+        # content None and is treated as "unknown" — if ANY content is unknown
+        # we cannot prove divergence and fail safe (skip). Otherwise flag only
+        # when more than one DISTINCT content blob exists.
         real_locations = sorted(physical.values())
+        contents = {
+            _settings_effective_content(Path(real)) for real in physical
+        }
+        if None in contents:
+            continue
+        if len(contents) < 2:
+            # All physical copies are byte-identical — the intended
+            # dual-render, not drift.
+            continue
         evidence = {
             "real_effective_files": real_locations,
             "count": len(real_locations),
+            "content_diverged": True,
         }
         suggested = (
-            f"Multi-tree settings for {agent_id}: a real settings.effective.json "
-            f"exists in {len(real_locations)} trees "
-            f"({', '.join(sorted(real_locations))}). The single-tree invariant "
-            "allows exactly one physical effective file (canonically under "
-            "home/.claude/) with every other location a symlink to it. Two "
-            "physical copies drift silently. Re-render the single home tree and "
-            "re-point the workdir with "
-            f"`bash bridge-hooks.sh link-shared-settings --agent {agent_id}`; "
-            "after that there must be ZERO physical settings.effective.json "
-            "under workdir/.claude/."
+            f"Multi-tree settings CONTENT drift for {agent_id}: real "
+            f"settings.effective.json files in {len(real_locations)} trees "
+            f"({', '.join(sorted(real_locations))}) have DIVERGED in content. "
+            "Re-render and re-link both trees from the single source with "
+            f"`agent-bridge agent rerender-settings {agent_id} --apply` "
+            "(controller-owned render; never hand-copy). Verify the finding "
+            "clears on the next `agent-bridge doctor --detectors "
+            "settings-multi-tree` run."
         )
         findings.append(
             {
