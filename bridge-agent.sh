@@ -6423,6 +6423,50 @@ run_retire() {
     agent_source="unregistered"
     privilege_class="user"
     home_dir="$BRIDGE_AGENT_HOME_ROOT/$agent"
+
+    # Issue #1787: filesystem-aware identity preflight. `bridge_agent_exists`
+    # is a case-SENSITIVE registry lookup, so on a case-insensitive volume
+    # (macOS APFS default) a case-variant spelling of a LIVE agent's name
+    # (`CRM-TEST-BSH` vs registered `crm-test-bsh`) misses the registry and
+    # lands here as "unregistered" — yet `$BRIDGE_AGENT_HOME_ROOT/$agent` IS
+    # the live agent's directory (same inode). Quarantining it would dangle
+    # the live agent's workdir `settings.json` symlink (the #1766 "Settings
+    # Error" picker class). Before treating this as a retireable orphan,
+    # samefile-compare the resolved home dir against every registered agent's
+    # home + workdir and refuse with a pointer to the real registered name.
+    local _retire_guard="$SCRIPT_DIR/lib/agent-cli-helpers/retire-samefile-guard.py"
+    if [[ -d "$home_dir" && -f "$_retire_guard" ]] \
+        && declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 \
+        && (( ${#BRIDGE_AGENT_IDS[@]} > 0 )); then
+      local _retire_rows_file _reg_agent _reg_home _reg_workdir _guard_verdict
+      local _verdict_kind _matched_agent
+      _retire_rows_file="$(mktemp "${TMPDIR:-/tmp}/bridge-retire-guard.XXXXXX")"
+      for _reg_agent in "${BRIDGE_AGENT_IDS[@]}"; do
+        _reg_home="$(bridge_agent_default_home "$_reg_agent" 2>/dev/null || printf '')"
+        _reg_workdir="$(bridge_agent_workdir "$_reg_agent" 2>/dev/null || printf '')"
+        printf '%s\t%s\t%s\n' "$_reg_agent" "$_reg_home" "$_reg_workdir" >>"$_retire_rows_file"
+      done
+      # codex r3: 3-state verdict (`match\t<id>` / `indeterminate` / `no-match`).
+      # An EMPTY/failed read is treated as `indeterminate` — never as "allow" —
+      # so a probe failure fails SAFE (refuse) rather than letting retire mv a
+      # possibly-live tree. Only `no-match` proceeds.
+      _guard_verdict="$(python3 "$_retire_guard" "$home_dir" "$_retire_rows_file" 2>/dev/null | head -n 1 || printf 'indeterminate')"
+      rm -f "$_retire_rows_file"
+      [[ -n "$_guard_verdict" ]] || _guard_verdict="indeterminate"
+      _verdict_kind="${_guard_verdict%%$'\t'*}"
+      case "$_verdict_kind" in
+        match)
+          _matched_agent="${_guard_verdict#*$'\t'}"
+          bridge_die "deny: '$agent' resolves to the same directory ($home_dir) as the REGISTERED agent '$_matched_agent' (case-insensitive filesystem). Retiring it would quarantine a live agent's settings tree. Use the registered name '$_matched_agent' with \`agent-bridge agent stop\`/\`delete\` if you really intend to act on that agent."
+          ;;
+        indeterminate)
+          bridge_die "deny: could not verify whether '$agent' ($home_dir) is a registered agent's directory — a stat/samefile probe failed, so identity is UNPROVEN. Refusing to retire (fail-safe) to avoid quarantining a possibly-live agent's tree. Confirm with \`agent-bridge agent registry --json\` (check whether any registered home/workdir resolves to $home_dir) before retrying."
+          ;;
+        *)
+          : # no-match — genuine orphan, retire may proceed.
+          ;;
+      esac
+    fi
   fi
 
   # Step 2: refuse if neither registry nor disk has anything to retire.

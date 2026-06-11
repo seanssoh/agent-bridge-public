@@ -31,9 +31,14 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib.sh"
 
 cleanup() {
+  # Restore any chmod 000 we set (T10 locks a parent dir) so rm -rf can clear.
+  if [[ -n "${RETIRE_LOCKED_DIR:-}" && -e "$RETIRE_LOCKED_DIR" ]]; then
+    chmod -R u+rwX "$RETIRE_LOCKED_DIR" 2>/dev/null || true
+  fi
   smoke_cleanup_temp_root
 }
 trap cleanup EXIT
+RETIRE_LOCKED_DIR=""
 
 smoke_setup_bridge_home "agent-retire"
 
@@ -365,6 +370,123 @@ EOF
     "T8 out-of-root refusal must not touch the path"
 }
 
+# ---------------------------------------------------------------------------
+# T9 — Issue #1787: case-variant of a REGISTERED agent name must NOT be
+#      retireable on a case-insensitive filesystem. `agent retire CRM-TEST-BSH`
+#      where the registry holds `crm-test-bsh` (same dir on APFS) must REFUSE
+#      with a pointer to the real name and plan NOTHING destructive — even
+#      under --dry-run.
+# ---------------------------------------------------------------------------
+test_refuse_case_variant_of_registered() {
+  reset_state
+  # Register the agent at its canonical lowercase spelling.
+  write_dynamic_active_env "crm-test-bsh"
+  local home
+  home="$(make_home_dir "crm-test-bsh")"
+
+  # Gate on case-insensitivity: only when the uppercase spelling reaches the
+  # SAME directory is the #1787 collision reproducible (a Linux case-sensitive
+  # fs makes them distinct dirs — nothing to guard there). Mirrors the
+  # #1759 smoke's `case_variant.exists()` APFS gate.
+  local variant_dir="$BRIDGE_AGENT_HOME_ROOT/CRM-TEST-BSH"
+  if [[ ! -d "$variant_dir" ]] || ! [[ "$variant_dir" -ef "$home" ]]; then
+    smoke_log "T9 skip: case-sensitive filesystem — case-variant collision not reproducible here"
+    return 0
+  fi
+
+  # (a) --dry-run must REFUSE (non-zero) and name the real registered agent.
+  local rc=0 out
+  out="$(agent_retire CRM-TEST-BSH --dry-run 2>&1)" || rc=$?
+  (( rc != 0 )) || smoke_fail "T9 case-variant retire --dry-run should have been refused (rc=$rc, out=$out)"
+  smoke_assert_contains "$out" "crm-test-bsh" "T9 refusal points at the registered name"
+  smoke_assert_contains "$out" "same directory" "T9 refusal explains the samefile collision"
+
+  # (b) The live agent's home + its marker are untouched (no mv/quarantine planned).
+  smoke_assert_file_exists "$home/marker.txt" "T9 live agent home must be untouched"
+  [[ -d "$home" ]] || smoke_fail "T9 live agent home should still exist: $home"
+  # No quarantine dir was created.
+  if [[ -d "$BRIDGE_HOME/archive/retired-agents" ]] \
+      && find "$BRIDGE_HOME/archive/retired-agents" -maxdepth 1 -name '*CRM-TEST-BSH*' 2>/dev/null | grep -q .; then
+    smoke_fail "T9 no quarantine dir should have been created for the case-variant"
+  fi
+
+  # (c) A genuinely unrelated orphan in the SAME run still retires (teeth
+  # intact). Assert via a substring check on the JSON (no python here-string —
+  # lint-heredoc-ban H3) so this new test adds no heredoc/here-string site.
+  local orphan_home
+  orphan_home="$(make_home_dir "genuine-orphan-xyz")"
+  local rc2=0 out2
+  out2="$(agent_retire genuine-orphan-xyz --json 2>&1)" || rc2=$?
+  (( rc2 == 0 )) || smoke_fail "T9 genuine orphan retire should still succeed (rc=$rc2, out=$out2)"
+  smoke_assert_contains "$out2" '"status": "retired"' \
+    "T9 genuine orphan still retired (detector teeth intact)"
+  [[ ! -d "$orphan_home" ]] || smoke_fail "T9 genuine orphan home should be moved away"
+}
+
+# ---------------------------------------------------------------------------
+# T10 — Issue #1787 (codex r3, SAFETY): when the samefile preflight CANNOT be
+#       resolved (a registered agent's home is unstatable), retire must REFUSE
+#       (fail-safe), never proceed — identity is unproven, so an mv could
+#       quarantine a live agent's tree. We make a registered home unstatable by
+#       chmod-000'ing its parent (samefile raises EACCES, lexists reports it
+#       present) and assert `agent retire <orphan>` is refused with the
+#       "could not verify" message and touches nothing.
+# ---------------------------------------------------------------------------
+test_refuse_indeterminate_identity() {
+  reset_state
+  # Registered agent `locked` whose home lives under a soon-unreadable parent.
+  local locked_parent="$SMOKE_TMP_ROOT/retire-locked-parent"
+  local reg_home="$locked_parent/locked-home"
+  mkdir -p "$reg_home"
+  cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
+bridge_add_agent_id_if_missing "locked"
+BRIDGE_AGENT_ENGINE["locked"]="claude"
+BRIDGE_AGENT_SESSION["locked"]="locked"
+BRIDGE_AGENT_WORKDIR["locked"]="$reg_home"
+# Resolve locked's home to the unreadable tree so the samefile preflight
+# against it raises EACCES (the indeterminate trigger).
+bridge_agent_default_home() {
+  if [[ "\$1" == "locked" ]]; then
+    printf '%s' "$reg_home"
+    return 0
+  fi
+  printf '%s/%s' "\$BRIDGE_AGENT_HOME_ROOT" "\$1"
+}
+EOF
+
+  # A genuine orphan dir on disk we ask to retire.
+  local orphan_home
+  orphan_home="$(make_home_dir "indeterminate-orphan")"
+
+  # Lock the registered home's parent so samefile() against reg_home raises.
+  chmod 000 "$locked_parent"
+  RETIRE_LOCKED_DIR="$locked_parent"
+
+  local rc=0 out
+  out="$(agent_retire indeterminate-orphan --dry-run 2>&1)" || rc=$?
+
+  # Restore perms before assertions / further tests.
+  chmod 755 "$locked_parent"
+  RETIRE_LOCKED_DIR=""
+
+  # If the probe stayed statable (e.g. running as root), the indeterminate
+  # path is not exercised — skip rather than false-fail.
+  if (( rc == 0 )); then
+    smoke_log "T10 skip: samefile preflight stayed resolvable (likely root) — indeterminate not reproducible"
+    return 0
+  fi
+
+  smoke_assert_contains "$out" "could not verify" \
+    "T10 indeterminate identity is refused with a verify-first message"
+  # Nothing was moved/quarantined.
+  smoke_assert_file_exists "$orphan_home/marker.txt" \
+    "T10 orphan home untouched under indeterminate refusal"
+  if [[ -d "$BRIDGE_HOME/archive/retired-agents" ]] \
+      && find "$BRIDGE_HOME/archive/retired-agents" -maxdepth 1 -name '*indeterminate-orphan*' 2>/dev/null | grep -q .; then
+    smoke_fail "T10 no quarantine dir should have been created under indeterminate refusal"
+  fi
+}
+
 smoke_run "T1 quarantine dynamic"             test_quarantine_dynamic
 smoke_run "T2 purge dynamic"                  test_purge_dynamic
 smoke_run "T3 refuse static-class"            test_refuse_static
@@ -373,5 +495,7 @@ smoke_run "T5 refuse unknown agent"           test_refuse_unknown
 smoke_run "T6 orphan quarantine"              test_orphan_quarantine
 smoke_run "T7 dry-run is no-op"               test_dry_run
 smoke_run "T8 refuse out-of-root home"        test_refuse_out_of_root
+smoke_run "T9 refuse case-variant of registered" test_refuse_case_variant_of_registered
+smoke_run "T10 refuse indeterminate identity" test_refuse_indeterminate_identity
 
 smoke_log "all checks passed"

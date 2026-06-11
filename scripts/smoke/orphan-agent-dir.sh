@@ -121,6 +121,20 @@ print(sum(1 for r in data if r.get("kind") == "orphan-agent-dir"))
 ' <<<"$payload"
 }
 
+# Return the count of findings of an arbitrary kind (e.g. the #1787 fail-safe
+# `orphan-agent-dir-unverifiable` info note). Uses a pipe (not a here-string)
+# so this new helper adds no lint-heredoc-ban H3 site.
+kind_count() {
+  local payload="$1"
+  local kind="$2"
+  printf '%s' "$payload" | "$PY_BIN" -c '
+import json, sys
+kind = sys.argv[1]
+data = json.loads(sys.stdin.read() or "[]")
+print(sum(1 for r in data if r.get("kind") == kind))
+' "$kind"
+}
+
 # Return JSON list of orphan-agent-dir findings only (drops detector-error
 # noise so per-test JSON inspection stays simple).
 findings_only() {
@@ -324,6 +338,168 @@ test_repro_suffix_artifact() {
 }
 
 # ---------------------------------------------------------------------------
+# T8 — Issue #1787: a case-variant spelling of a REGISTERED agent's dir is NOT
+#      flagged as an orphan on a case-insensitive filesystem. The registry
+#      holds `crm-test-bsh`; the on-disk dir was created `CRM-TEST-BSH` (same
+#      dir on APFS). The detector must samefile-match it to the registered
+#      agent and skip — never recommend a destructive quarantine of a live
+#      agent's settings tree. A genuinely unregistered dir in the same run
+#      still fires (detector teeth intact).
+# ---------------------------------------------------------------------------
+test_case_variant_registered_not_flagged() {
+  reset_home_root
+  # Create the dir with the UPPERCASE spelling; register the LOWERCASE name.
+  mkdir -p "$BRIDGE_AGENT_HOME_ROOT/CRM-TEST-BSH"
+  printf 'live\n' >"$BRIDGE_AGENT_HOME_ROOT/CRM-TEST-BSH/marker.txt"
+
+  # Gate on case-insensitivity: only reproducible when the lowercase spelling
+  # reaches the SAME dir (mirrors the #1759 smoke's APFS gate). On a
+  # case-sensitive fs the two are distinct dirs and the collision can't occur.
+  local lower_dir="$BRIDGE_AGENT_HOME_ROOT/crm-test-bsh"
+  if ! [[ -d "$lower_dir" ]] || ! [[ "$lower_dir" -ef "$BRIDGE_AGENT_HOME_ROOT/CRM-TEST-BSH" ]]; then
+    smoke_log "T8 skip: case-sensitive filesystem — case-variant collision not reproducible here"
+    return 0
+  fi
+
+  # Also drop a genuinely unregistered dir so the teeth-intact control runs.
+  mkdir -p "$BRIDGE_AGENT_HOME_ROOT/genuine-orphan-zzz"
+
+  local registry="$SMOKE_TMP_ROOT/registry.t8.json"
+  # write_registry stores home as $BRIDGE_AGENT_HOME_ROOT/<id> — i.e.
+  # $BRIDGE_AGENT_HOME_ROOT/crm-test-bsh, the lowercase (registered) spelling.
+  write_registry "$registry" "crm-test-bsh"
+
+  local out
+  out="$(run_doctor_orphan "$registry")"
+
+  # The case-variant dir is NOT flagged (samefile match to the registered home).
+  local cv_dir
+  cv_dir="$(finding_field "$out" "CRM-TEST-BSH" "dir")"
+  smoke_assert_eq "__MISSING__" "$cv_dir" \
+    "T8 case-variant of a registered agent is NOT flagged as orphan"
+
+  # The genuine orphan IS still flagged.
+  local orphan_dir
+  orphan_dir="$(finding_field "$out" "genuine-orphan-zzz" "dir")"
+  smoke_assert_contains "$orphan_dir" "genuine-orphan-zzz" \
+    "T8 genuinely unregistered dir still fires (detector teeth intact)"
+
+  local count
+  count="$(findings_count "$out")"
+  smoke_assert_eq "1" "$count" \
+    "T8 exactly one finding (genuine orphan only; case-variant skipped)"
+}
+
+# ---------------------------------------------------------------------------
+# T9 — Issue #1787 (codex r1): the skip is INODE identity, NOT an unconditional
+#      case-fold. A dir whose basename only case-DIFFERS from a registered id
+#      but is a PHYSICALLY DISTINCT directory (different inode) MUST still be
+#      flagged — otherwise the detector loses its teeth on a case-sensitive fs
+#      (Linux), where `CRM-TEST-BSH` and `crm-test-bsh` are separate dirs and
+#      the uppercase one is a genuine orphan. We reproduce the distinct-inode
+#      case on ANY fs (incl. case-insensitive APFS) by registering the agent's
+#      home at a SEPARATE physical location, so the case-folding on-disk dir is
+#      provably NOT the same file as the registered home.
+# ---------------------------------------------------------------------------
+test_case_folding_but_distinct_inode_still_flagged() {
+  reset_home_root
+  # Registered agent `widget` whose home lives OUTSIDE the home root, in a
+  # dedicated physical dir — so the same-named on-disk dir below is a
+  # genuinely different inode even on a case-insensitive volume.
+  local real_home="$SMOKE_TMP_ROOT/widget-real-home"
+  mkdir -p "$real_home"
+  # On-disk dir under the home root whose basename case-folds to `widget` but
+  # is NOT the registered home (different inode). On a case-sensitive fs this
+  # is the canonical "uppercase variant is a separate orphan" shape.
+  mkdir -p "$BRIDGE_AGENT_HOME_ROOT/WIDGET"
+
+  # Custom registry: home points at the dedicated dir, not $HOME_ROOT/widget.
+  local registry="$SMOKE_TMP_ROOT/registry.t9.json"
+  printf '[{"id":"widget","class":"dynamic","agent_source":"dynamic","privilege_class":"user","home":"%s","workdir":"%s","engine":"claude","is_alive":true,"source":"dynamic-active-env"}]\n' \
+    "$real_home" "$real_home" >"$registry"
+
+  local out
+  out="$(run_doctor_orphan "$registry")"
+
+  # `WIDGET` is a distinct inode from the registered home → still flagged
+  # (the case-fold collision must NOT suppress a genuine orphan).
+  local orphan_dir
+  orphan_dir="$(finding_field "$out" "WIDGET" "dir")"
+  smoke_assert_contains "$orphan_dir" "WIDGET" \
+    "T9 a distinct-inode case-folding dir is STILL flagged (no false negative)"
+
+  local count
+  count="$(findings_count "$out")"
+  smoke_assert_eq "1" "$count" \
+    "T9 exactly one finding (the distinct-inode orphan)"
+}
+
+# ---------------------------------------------------------------------------
+# T10 — Issue #1787 (codex r3, SAFETY): a samefile probe that CANNOT be
+#       resolved (the registered dir exists but is unreadable) must NOT report
+#       the candidate as an orphan — identity is UNPROVEN, so failing safe
+#       means holding it back. We make the registered home unstatable by
+#       chmod-000'ing its PARENT (samefile raises EACCES, lexists still
+#       reports the path as present), so the detector cannot prove the
+#       candidate is unregistered and must surface the fail-safe
+#       `orphan-agent-dir-unverifiable` info note INSTEAD of an orphan finding.
+# ---------------------------------------------------------------------------
+test_indeterminate_failsafe_no_orphan() {
+  reset_home_root
+  # Registered agent `locked` whose home is under a soon-to-be-unreadable dir.
+  local locked_parent="$SMOKE_TMP_ROOT/locked-parent"
+  local reg_home="$locked_parent/locked-home"
+  mkdir -p "$reg_home"
+  # Candidate under the home root whose basename is NOT the registered id (so
+  # it falls through to the samefile probe) — the probe will raise EACCES.
+  mkdir -p "$BRIDGE_AGENT_HOME_ROOT/LOCKED-CANDIDATE"
+
+  local registry="$SMOKE_TMP_ROOT/registry.t10.json"
+  printf '[{"id":"locked","class":"dynamic","agent_source":"dynamic","privilege_class":"user","home":"%s","workdir":"%s","engine":"claude","is_alive":true,"source":"dynamic-active-env"}]\n' \
+    "$reg_home" "$reg_home" >"$registry"
+
+  # Make the registered home unstatable: chmod 000 the parent so a samefile()
+  # against reg_home raises EACCES (but lexists reports it present).
+  chmod 000 "$locked_parent"
+  ORPHAN_LOCKED_DIR="$locked_parent"
+
+  local out
+  out="$(run_doctor_orphan "$registry")"
+
+  # Restore perms immediately so later tests / cleanup are unaffected.
+  chmod 755 "$locked_parent"
+  ORPHAN_LOCKED_DIR=""
+
+  # If this fs/uid did not actually make samefile raise (e.g. running as root),
+  # the indeterminate path is not exercised — skip rather than false-fail.
+  local unverifiable
+  unverifiable="$(kind_count "$out" "orphan-agent-dir-unverifiable")"
+  if [[ "$unverifiable" == "0" ]]; then
+    smoke_log "T10 skip: registered home stayed statable (likely root/uid) — indeterminate not reproducible"
+    return 0
+  fi
+
+  # The candidate is NOT reported as a destructive orphan (fail-safe).
+  local cand_orphan
+  cand_orphan="$(finding_field "$out" "LOCKED-CANDIDATE" "dir")"
+  smoke_assert_eq "__MISSING__" "$cand_orphan" \
+    "T10 indeterminate candidate is NOT reported as an orphan (fail-safe)"
+
+  # Zero orphan-agent-dir findings; the only signal is the info-level note.
+  local orphan_count
+  orphan_count="$(findings_count "$out")"
+  smoke_assert_eq "0" "$orphan_count" \
+    "T10 no orphan-agent-dir finding when identity is unprovable"
+  smoke_assert_eq "1" "$unverifiable" \
+    "T10 a single orphan-agent-dir-unverifiable info note is surfaced"
+
+  # Pipe (not a here-string) so this check adds no lint-heredoc-ban H3 site.
+  if printf '%s' "$out" | grep -q 'Traceback'; then
+    smoke_fail "T10 doctor output contains a Python traceback: $out"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Drive cases.
 # ---------------------------------------------------------------------------
 ORPHAN_LOCKED_DIR=""
@@ -334,5 +510,8 @@ smoke_run "T4 registered agent not flagged" test_registered_agent_not_flagged
 smoke_run "T5 _template/shared skipped" test_template_and_shared_skipped
 smoke_run "T6 unreadable subdir partial finding" test_unreadable_subdir_partial_finding
 smoke_run "T7 *-repro-<digits> suffix" test_repro_suffix_artifact
+smoke_run "T8 case-variant registered not flagged" test_case_variant_registered_not_flagged
+smoke_run "T9 distinct-inode case-fold still flagged" test_case_folding_but_distinct_inode_still_flagged
+smoke_run "T10 indeterminate fail-safe (no orphan)" test_indeterminate_failsafe_no_orphan
 
 smoke_log "all orphan-agent-dir cases passed"
