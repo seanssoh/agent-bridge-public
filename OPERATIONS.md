@@ -389,7 +389,13 @@ Health check (post-upgrade):
 TARGET_ROOT="$HOME/.agent-bridge"
 agent-bridge status | head -20
 cat "$TARGET_ROOT/state/daily-backup/state.env"   # last success / failure / cooldown
+# Queue DB integrity. From an OPERATOR SHELL the raw helper is fine:
 python3 "$TARGET_ROOT/bridge-upgrade.py" verify-tasks-db --target-root "$TARGET_ROOT"
+# From an ADMIN AGENT session the tool-policy hook blocks any Bash command
+# that names the queue DB path; use the policy-blessed doctor verb instead
+# (#1786) — a `tasks-db` finding (state=corrupt|unverifiable|missing) is the
+# signal to investigate; no finding == healthy:
+agent-bridge doctor --detectors tasks-db --json
 du -sh "$TARGET_ROOT/backups/daily" "$TARGET_ROOT/backups"/upgrade-*
 ```
 

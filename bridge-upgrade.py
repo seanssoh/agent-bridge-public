@@ -3314,6 +3314,102 @@ def cmd_daily_backup_live(args: argparse.Namespace) -> int:
     return emit_json(payload, 0)
 
 
+def open_tasks_db_readonly(
+    db_path: Path,
+) -> tuple[sqlite3.Connection | None, str, str]:
+    """Open *db_path* read-only without disturbing the live queue.
+
+    Returns ``(conn, mode, error)``. On success ``conn`` is non-None and
+    ``error`` is empty; on failure ``conn`` is None and ``error`` carries a
+    cause-tagged diagnostic.
+
+    Why a fallback ladder rather than a bare ``mode=ro`` open (Issue #1786):
+    the live queue runs in WAL journal mode (``bridge-queue.py`` sets
+    ``PRAGMA journal_mode=WAL``). A plain ``file:<db>?mode=ro`` open of a
+    WAL database from a *separate* process needs the ``-shm`` shared-memory
+    file; when no live writer is holding it open and the sidecar is absent
+    (e.g. right after a checkpoint/truncate), sqlite cannot create the
+    ``-shm`` in read-only mode and a read fails with SQLITE_CANTOPEN
+    ("unable to open database file") — a false negative on a perfectly
+    healthy db. (The ``sqlite3.connect`` call itself succeeds lazily; the
+    error surfaces on the FIRST query that touches the WAL, so we validate
+    each candidate with a cheap probe read before accepting it.)
+    ``immutable=1`` tells sqlite the file will not change for the life of the
+    connection, so it bypasses WAL/shm entirely and reads the db directly.
+
+    The ``immutable=1`` fallback is GATED on the WAL sidecar being empty or
+    absent (codex r1 P2): because immutable reads bypass the WAL, a
+    ``quick_check`` over an immutable open would validate only the
+    checkpointed main DB and silently ignore committed-but-uncheckpointed
+    pages in a non-empty ``-wal`` — a false "ok". So when ``mode=ro`` fails
+    AND a non-empty ``-wal`` sidecar exists, we return no connection and let
+    the caller report ``unverifiable`` rather than a possibly-stale "ok". A
+    bare/empty ``-wal`` (no unmerged pages) is safe to read immutably. The
+    gate is re-stat'd at the fallback point (codex r2 P2) so a live writer
+    that creates a non-empty ``-wal`` between an early stat and the immutable
+    branch cannot slip a stale "ok" through.
+    """
+
+    def _wal_has_unmerged_pages() -> bool:
+        try:
+            wal_sidecar = Path(f"{db_path}-wal")
+            return wal_sidecar.is_file() and wal_sidecar.stat().st_size > 0  # noqa: raw-pathlib-controller-only — read-only sidecar size probe on the queue DB the operator/upgrader owns; OSError-guarded.
+        except OSError:
+            # Can't stat the sidecar — be conservative and assume it may hold
+            # unmerged pages so we never silently skip them.
+            return True
+
+    last_err = ""
+    saw_unmerged_wal = False
+    for mode in ("mode=ro", "immutable=1"):
+        if mode == "immutable=1" and _wal_has_unmerged_pages():
+            # Re-stat'd here (not once up front) to close the TOCTOU race with
+            # a live writer. Skipping the WAL would hide committed pages, so
+            # refuse the potentially-stale read and fall through to
+            # unverifiable.
+            saw_unmerged_wal = True
+            last_err = last_err or "wal_unmerged: refusing immutable read that would bypass a non-empty -wal"
+            break
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?{mode}", uri=True)
+            # Probe read forces the WAL/shm attach so a lazy CANTOPEN
+            # surfaces here, not on the caller's first real query.
+            conn.execute("PRAGMA schema_version").fetchone()
+            return conn, mode, ""
+        except sqlite3.OperationalError as exc:
+            # Open/access failure (unable to open, locked, disk I/O) — retry /
+            # fall through to unverifiable.
+            last_err = f"{type(exc).__name__}: {exc}"
+            if conn is not None:
+                conn.close()
+        except sqlite3.DatabaseError as exc:
+            # A non-Operational DatabaseError ("file is not a database",
+            # "database disk image is malformed") IS corruption — the bytes
+            # read are not a valid db. Signal the caller via the "__corrupt__"
+            # mode sentinel so it reports state=corrupt, not unverifiable
+            # (codex r3 P2). Retrying immutable would raise the same error.
+            if conn is not None:
+                conn.close()
+            return None, "__corrupt__", f"{type(exc).__name__}: {exc}"
+    # Both attempts failed (or the immutable fallback was unsafe). Distinguish
+    # the open-failure cause so the operator/agent gets an actionable
+    # "unverifiable: <cause>" instead of a bare sqlite string (Issue #1786
+    # indeterminate-state contract).
+    cause = "wal_unmerged_unreadable" if saw_unmerged_wal else "open_failed"
+    try:
+        st = db_path.stat()  # noqa: raw-pathlib-controller-only — read-only cause classification on the queue DB the operator/upgrader owns; OSError-guarded, runs controller/operator-side only.
+        if not os.access(db_path, os.R_OK):
+            cause = "not_readable"
+        elif not os.access(db_path.parent, os.X_OK | os.R_OK):
+            cause = "dir_not_accessible"
+        elif not saw_unmerged_wal and st.st_size == 0:
+            cause = "empty_file"
+    except OSError:
+        cause = "stat_failed"
+    return None, "", f"{cause}: {last_err}"
+
+
 def cmd_verify_tasks_db(args: argparse.Namespace) -> int:
     target_root = Path(args.target_root).expanduser()
     db_path = target_root / "state/tasks.db"
@@ -3325,26 +3421,52 @@ def cmd_verify_tasks_db(args: argparse.Namespace) -> int:
     }
     if not db_path.exists():
         payload["error"] = "missing"
+        payload["state"] = "missing"
         # Fresh installs don't have tasks.db until the first task is filed.
         # Treat missing as non-fatal (exit 0); operator/agent reads `ok=false`
         # + `error=missing` from the JSON and decides what to do.
         return emit_json(payload, 0)
+    # `state` is a 3-state contract (Issue #1786): "ok" (quick_check passed),
+    # "corrupt" (quick_check ran but failed), or "unverifiable" (the db could
+    # not be opened for an UNKNOWN reason). An open failure must NEVER read as
+    # "ok", and must be distinguishable from "corrupt".
+    conn, open_mode, open_err = open_tasks_db_readonly(db_path)
+    if conn is None:
+        if open_mode == "__corrupt__":
+            # The probe read proved the file is not a valid db — real
+            # corruption, not an indeterminate open failure (codex r3 P2).
+            payload["state"] = "corrupt"
+            payload["quick_check"] = open_err
+            payload["error"] = f"sqlite_error: {open_err}"
+            return emit_json(payload, 1)
+        payload["state"] = "unverifiable"
+        payload["error"] = f"sqlite_error: unable to open database file ({open_err})"
+        return emit_json(payload, 1)
+    payload["open_mode"] = open_mode
     try:
-        # mode=ro avoids any journal-mode side-effects on the live DB; the
-        # Bridge guard policy that flags raw `sqlite3 state/tasks.db` from
-        # agents does not apply to this packaged read-only helper.
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
             row = conn.execute("PRAGMA quick_check").fetchone()
-            check = row[0] if row else ""
-            payload["quick_check"] = check
-            payload["ok"] = check == "ok"
-        finally:
-            conn.close()
-    except sqlite3.DatabaseError as exc:
-        payload["error"] = f"sqlite_error: {exc}"
-    except Exception as exc:  # pragma: no cover
-        payload["error"] = f"{type(exc).__name__}: {exc}"
+        except sqlite3.OperationalError as exc:
+            # Open/access failure surfacing on the query — indeterminate.
+            payload["state"] = "unverifiable"
+            payload["error"] = f"sqlite_error: {exc}"
+            return emit_json(payload, 1)
+        except sqlite3.DatabaseError as exc:
+            # Non-Operational DatabaseError = corruption (codex r3 P2).
+            payload["state"] = "corrupt"
+            payload["quick_check"] = f"{type(exc).__name__}: {exc}"
+            payload["error"] = f"sqlite_error: {exc}"
+            return emit_json(payload, 1)
+        check = row[0] if row else ""
+        payload["quick_check"] = check
+        if check == "ok":
+            payload["ok"] = True
+            payload["state"] = "ok"
+        else:
+            payload["state"] = "corrupt"
+            payload["error"] = f"quick_check: {check}"
+    finally:
+        conn.close()
     return emit_json(payload, 0 if payload["ok"] else 1)
 
 

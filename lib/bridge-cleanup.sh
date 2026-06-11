@@ -131,8 +131,26 @@ agent-bridge status 2>/dev/null | head -20
 # 3. Daily-backup state (cooldown / last success / last failure)
 cat "\$TARGET_ROOT/state/daily-backup/state.env" 2>/dev/null || echo "(no state yet)"
 
-# 4. tasks.db integrity (read-only, agent-safe)
-python3 "\$TARGET_ROOT/bridge-upgrade.py" verify-tasks-db --target-root "\$TARGET_ROOT"
+# 4. tasks.db integrity (read-only, agent-safe). Use the policy-blessed
+#    \`agent-bridge doctor\` verb — the v0.16.8 tool-policy hook blocks a Bash
+#    command that names the queue DB path, but \`doctor\` is an \`agb\` verb the
+#    hook allows, so this works from an admin AGENT session, not just an
+#    operator shell (#1786). Healthy => no \`tasks-db\` finding (empty / no
+#    rows); a \`tasks-db\` finding with state=corrupt|unverifiable|missing is
+#    the signal to investigate. The raw \`python3 bridge-upgrade.py
+#    verify-tasks-db --target-root <root>\` helper still exists for the
+#    OPERATOR SHELL (it names the DB path, so it is hook-blocked inside an
+#    agent session — use the doctor verb there instead).
+#    The queue is pinned to THIS install three ways (#1786 codex): BRIDGE_HOME
+#    = \$TARGET_ROOT; the inherited BRIDGE_TASK_DB / BRIDGE_STATE_DIR overrides
+#    are CLEARED inline (bridge-doctor.py honors them BEFORE \$BRIDGE_HOME/state
+#    — an admin session that exports them would otherwise validate a different
+#    DB; we cannot use \`--task-db <path>\` because that names the queue DB on
+#    the argv and is itself hook-blocked); and the binary is the target
+#    install's own \`\$TARGET_ROOT/agent-bridge\` (not whatever PATH resolves to)
+#    so a \`--target-root\` / multi-install host runs a doctor that actually has
+#    the \`tasks-db\` detector instead of erroring \`unknown detector kind\`.
+BRIDGE_TASK_DB= BRIDGE_STATE_DIR= BRIDGE_HOME="\$TARGET_ROOT" "\$TARGET_ROOT/agent-bridge" doctor --detectors tasks-db --json
 
 # 5. ~/.claude.json validity
 python3 -c "import json,os; json.load(open(os.path.expanduser('~/.claude.json'))); print('.claude.json OK')" \\

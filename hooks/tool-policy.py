@@ -3851,10 +3851,42 @@ def _argv_occurrences_explain_text(
     return True
 
 
+def _assignment_value(token: str) -> str | None:
+    """Return the VALUE of a ``NAME=value`` shell-assignment-shaped *token*,
+    or None when *token* is not an assignment.
+
+    Mirrors the assignment shape recognized by ``_stage_has_dangerous_env_prefix``
+    / ``_stage_first_token``: ``NAME`` must be a bare shell identifier (no
+    ``/``, not an option starting with ``-``). Used to surface a protected
+    path that rides inside an env-prefix assignment value —
+    ``DB=/…/tasks.db sqlite3 "$DB" …`` / ``BRIDGE_TASK_DB=/…/tasks.db sqlite3
+    "$BRIDGE_TASK_DB" …`` — which is statically present in the command string
+    but hidden from the plain positional path check because the whole
+    ``NAME=value`` is one shlex token (Issue #1786 codex r1; same
+    static-decodable class as #1709, distinct from the runtime-only ``$var``
+    indirection tracked in #1738). The caller checks the value of EVERY
+    assignment-shaped token, not only the leading env prefix: a value that
+    statically spells the queue DB path is a path-naming regardless of
+    position, and over-matching a coincidental non-protected value is
+    harmless (the value still has to equal the exact protected path).
+    """
+    if "=" not in token or token.startswith("-"):
+        return None
+    name, _, value = token.partition("=")
+    if not name or "/" in name:
+        return None
+    # A valid bare shell identifier: [A-Za-z_][A-Za-z0-9_]*.
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        return None
+    return value
+
+
 def _bash_argv_references_path(command: str, protected: Path) -> bool:
     """Return True if *command*, interpreted as shell argv, names
-    *protected* as a filesystem argument — either positionally or as the
-    value of a file-valued option flag like ``--body-file`` / ``-F``.
+    *protected* as a filesystem argument — either positionally, as the
+    value of a file-valued option flag like ``--body-file`` / ``-F``, or
+    inside a leading ``NAME=value`` env-prefix assignment value (Issue
+    #1786 codex r1).
 
     Behaviour contract (round-2 of PR #260 review):
 
@@ -3932,6 +3964,17 @@ def _bash_argv_references_path(command: str, protected: Path) -> bool:
             if _check_value_token(value):
                 return True
             continue
+        # Issue #1786 (codex r1): a `NAME=value` env-prefix assignment whose
+        # VALUE statically spells the protected path
+        # (`DB=/…/tasks.db sqlite3 "$DB" …`). The value is decoded the same way
+        # a positional token is. Checked regardless of whether the variable is
+        # later referenced — the path is named in the command string, which is
+        # the queue-DB WRITE-contract trigger (the var-ref `"$DB"` is just the
+        # opener). This closes the same static-decodable class #1709 covered;
+        # runtime-only `$var` indirection without a literal value is #1738.
+        assign_value = _assignment_value(tok)
+        if assign_value is not None and _check_value_token(assign_value):
+            return True
         if _token_matches_protected(tok, protected, cd_base_dir):
             return True
     return False

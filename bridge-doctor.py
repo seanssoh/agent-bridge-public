@@ -66,6 +66,7 @@ DETECTOR_KINDS = (
     "orphan-agent-dir",
     "settings-two-tree-drift",
     "settings-multi-tree",
+    "tasks-db",
 )
 
 # Issue #1455: the settings detectors share a registry-derived view of an
@@ -326,6 +327,163 @@ def fetch_blocked_tasks(conn: sqlite3.Connection | None) -> list[dict[str, Any]]
     except sqlite3.OperationalError:
         return []
     return out
+
+
+def probe_tasks_db_health(task_db: Path) -> dict[str, Any]:
+    """Read-only health probe of the queue DB (Issue #1786).
+
+    Returns a 3-state dict: ``state`` is one of ``ok`` / ``corrupt`` /
+    ``unverifiable`` / ``missing``, plus a ``quick_check`` string and an
+    ``open_mode`` showing which read path succeeded.
+
+    This is the policy-blessed counterpart to ``bridge-upgrade.py
+    verify-tasks-db``: the v0.16.8 tool-policy hook blocks a Bash command
+    that directly references the queue DB path, but `agent-bridge doctor
+    --detectors tasks-db` is an `agb` verb the hook allows, so the admin
+    agent can run the same ro `PRAGMA quick_check` from inside its session.
+
+    Why the ``mode=ro`` → ``immutable=1`` fallback ladder: the live queue is
+    WAL-journaled (``bridge-queue.py`` sets ``PRAGMA journal_mode=WAL``). A
+    plain ``mode=ro`` read of a WAL db from a separate process needs the
+    ``-shm`` sidecar; when no live writer holds it open and the sidecar is
+    absent (right after a checkpoint), sqlite cannot create ``-shm`` in
+    read-only mode and the read fails SQLITE_CANTOPEN ("unable to open
+    database file") — a FALSE negative on a healthy db. ``immutable=1``
+    bypasses WAL/shm. The open succeeds lazily, so we probe-read each
+    candidate before accepting it. An open that fails for an UNKNOWN reason
+    reports ``unverifiable: <cause>`` and NEVER ``ok`` — distinct from
+    ``corrupt`` (quick_check ran and failed).
+
+    The ``immutable=1`` fallback is GATED on the WAL sidecar being empty or
+    absent (codex r1 P2): immutable reads bypass the WAL, so a ``quick_check``
+    over an immutable open would validate only the checkpointed main DB and
+    silently skip committed-but-uncheckpointed pages in a non-empty ``-wal``,
+    a false "ok". When ``mode=ro`` fails AND a non-empty ``-wal`` exists, we
+    report ``unverifiable`` rather than risk a stale "ok". The WAL gate is
+    re-evaluated at the fallback point (codex r2 P2): a live writer could
+    create a non-empty ``-wal`` between an early stat and the immutable
+    branch, so we stat fresh right before opting into the immutable read.
+    """
+    result: dict[str, Any] = {"target": str(task_db)}
+    if not task_db.exists():  # noqa: raw-pathlib-controller-only — read-only existence probe of the controller's own queue DB; the doctor never runs inside an iso UID against another agent's tree.
+        result["state"] = "missing"
+        return result
+
+    def _wal_has_unmerged_pages() -> bool:
+        try:
+            wal_sidecar = task_db.with_name(task_db.name + "-wal")
+            return wal_sidecar.is_file() and wal_sidecar.stat().st_size > 0  # noqa: raw-pathlib-controller-only — read-only sidecar size probe on the controller's own queue DB; OSError-guarded.
+        except OSError:
+            # Can't stat the sidecar — assume it may hold unmerged pages so we
+            # never silently skip them.
+            return True
+
+    last_err = ""
+    saw_unmerged_wal = False
+    for mode in ("mode=ro", "immutable=1"):
+        if mode == "immutable=1" and _wal_has_unmerged_pages():
+            # Re-stat'd here (not once up front) to close the TOCTOU race with
+            # a live writer. Skipping the WAL would hide committed pages.
+            saw_unmerged_wal = True
+            last_err = last_err or "wal_unmerged: refusing immutable read that would bypass a non-empty -wal"
+            break
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{task_db}?{mode}", uri=True)
+            conn.execute("PRAGMA schema_version").fetchone()
+            try:
+                row = conn.execute("PRAGMA quick_check").fetchone()
+            finally:
+                conn.close()
+            check = str(row[0]) if row else ""
+            result["open_mode"] = mode
+            result["quick_check"] = check
+            result["state"] = "ok" if check == "ok" else "corrupt"
+            return result
+        except sqlite3.OperationalError as exc:
+            # Open/access failure (unable to open, locked, disk I/O) — not a
+            # statement about the db's integrity. Retry / fall through to
+            # unverifiable.
+            last_err = f"{type(exc).__name__}: {exc}"
+            if conn is not None:
+                conn.close()
+        except sqlite3.DatabaseError as exc:
+            # A non-Operational DatabaseError ("file is not a database",
+            # "database disk image is malformed", "file is encrypted or is not
+            # a database") IS corruption — the file opened far enough to be
+            # read and the bytes are not a valid db. Classify corrupt, not
+            # unverifiable (codex r3 P2): retrying with immutable would raise
+            # the same error, and calling it "unverifiable" would tell the
+            # operator NOT to treat real corruption as corruption.
+            if conn is not None:
+                conn.close()
+            result["open_mode"] = mode
+            result["quick_check"] = f"{type(exc).__name__}: {exc}"
+            result["state"] = "corrupt"
+            return result
+    # Both read attempts failed (or the immutable fallback was unsafe) —
+    # classify the open-failure cause so the operator/agent gets an actionable
+    # "unverifiable: <cause>".
+    cause = "wal_unmerged_unreadable" if saw_unmerged_wal else "open_failed"
+    try:
+        st = task_db.stat()  # noqa: raw-pathlib-controller-only — read-only cause classification on the controller's own queue DB; OSError-guarded, never crosses an iso boundary.
+        if not os.access(task_db, os.R_OK):
+            cause = "not_readable"
+        elif not os.access(task_db.parent, os.X_OK | os.R_OK):
+            cause = "dir_not_accessible"
+        elif not saw_unmerged_wal and st.st_size == 0:
+            cause = "empty_file"
+    except OSError:
+        cause = "stat_failed"
+    result["state"] = "unverifiable"
+    result["error"] = f"{cause}: {last_err}"
+    return result
+
+
+def detect_tasks_db(task_db: Path, ts: str) -> list[dict[str, Any]]:
+    """Issue #1786 detector: queue DB integrity, agent-reachable.
+
+    Emits a `tasks-db` finding ONLY when the db is unhealthy — corrupt,
+    unverifiable, or missing-on-an-otherwise-live-install. A healthy db
+    returns [] (the doctor convention: a finding means a problem). The
+    `missing` case is reported (not silently dropped) because by the time an
+    admin runs the upgrade-complete checklist the queue has already been
+    exercised, so a missing tasks.db there is a real anomaly worth surfacing;
+    the suggested action distinguishes it from corruption.
+    """
+    probe = probe_tasks_db_health(task_db)
+    state = probe.get("state")
+    if state == "ok":
+        return []
+    if state == "corrupt":
+        suggested = (
+            "Queue DB integrity check failed (quick_check error or the file is "
+            "not a valid sqlite database). Stop the daemon, restore the latest "
+            "SQL snapshot under state/backup-snapshots/ into a fresh tasks.db, "
+            "then restart. See OPERATOR_ACTIONS_PENDING.md."
+        )
+    elif state == "missing":
+        suggested = (
+            "Queue DB is absent. On a fresh install this is expected until the "
+            "first task is filed; on a live install it indicates the queue was "
+            "moved/deleted — check BRIDGE_TASK_DB / state/ and restore if needed."
+        )
+    else:  # unverifiable
+        suggested = (
+            "Queue DB could not be opened read-only for an unknown reason "
+            f"({probe.get('error', '')}). The live queue (agb inbox/claim/done) "
+            "may still be healthy — verify there first. Do NOT treat this as "
+            "corruption; check file/dir perms and the open cause before acting."
+        )
+    return [
+        {
+            "ts": ts,
+            "kind": "tasks-db",
+            "agent": "",
+            "evidence": probe,
+            "suggested_action": suggested,
+        }
+    ]
 
 
 # --- detectors -------------------------------------------------------------
@@ -1636,6 +1794,12 @@ def main() -> int:
             # Issue #1455 (b): effective settings physically present in >1 tree.
             "settings-multi-tree",
             lambda: [] if registry_load_failed else detect_settings_multi_tree(registry, ts),
+        ),
+        (
+            # Issue #1786: queue DB integrity, reachable from an agent session
+            # (the policy-blessed counterpart to `verify-tasks-db`).
+            "tasks-db",
+            lambda: detect_tasks_db(task_db, ts),
         ),
     ]
 
