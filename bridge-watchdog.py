@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -155,6 +156,22 @@ class AgentWatch:
     # is currently mid-restart does not trigger a high-priority drift
     # alert that the next tick (60s later) will obsolete anyway.
     restart_in_progress: bool = False
+    # #1801: explicit 3-state contract for the broken-symlink scan. The
+    # scan is now bounded (entry/depth/wall-time caps + dir exclusions) so
+    # a HOME-scale workdir cannot blow the 30s scan ceiling. Exactly one of
+    # the two flags below may be True; both False = a complete scan whose
+    # ``broken_links`` list is exhaustive.
+    #   - broken_links_truncated: a bound (entries/depth/time) tripped; the
+    #     ``broken_links`` list is partial — NEVER a silent cap. The note
+    #     names which bound stopped it.
+    #   - broken_links_scan_skipped: ``agent_dir`` resolved to a HOME-scale
+    #     / filesystem-root path; the deep walk was skipped entirely (empty
+    #     list) and the agent is NOT escalated for this scanner limitation.
+    # ``broken_links_note`` carries the human-readable degrade reason for
+    # the truncated / skipped states (empty on a complete scan).
+    broken_links_truncated: bool = False
+    broken_links_scan_skipped: bool = False
+    broken_links_note: str = ""
 
 
 def read_text(path: Path) -> str:
@@ -621,12 +638,244 @@ def resolve_scan_path(
     return default_path
 
 
-def collect_broken_links(agent_dir: Path) -> list[str]:
-    broken = []
-    for path in agent_dir.rglob("*"):
-        if path.is_symlink() and not path.exists():
-            broken.append(f"{path.relative_to(agent_dir)} -> {os.readlink(path)}")
-    return broken
+@dataclass
+class BrokenLinksResult:
+    """3-state result of the bounded broken-symlink scan (#1801).
+
+    Exactly one of ``truncated`` / ``scan_skipped`` may be True; both False
+    means a complete scan. The states are mutually exclusive and each is
+    surfaced explicitly in the JSON payload AND the markdown report — a
+    bound or ambiguity NEVER silently drops data:
+
+      (a) complete  → ``truncated=False, scan_skipped=False``: the walk
+          finished within every bound; ``links`` is the full list.
+      (b) truncated → ``truncated=True``: a bound (entries / depth / time)
+          tripped; ``links`` holds whatever was found before the bound and
+          ``note`` names which bound stopped it. Partial, never silent.
+      (c) skipped   → ``scan_skipped=True``: ``agent_dir`` resolved to a
+          HOME-scale / filesystem-root path; the deep walk was skipped
+          entirely (``links`` empty) and ``note`` explains the degrade.
+          The agent is NOT escalated for this scanner limitation.
+    """
+
+    links: list[str]
+    truncated: bool = False
+    scan_skipped: bool = False
+    note: str = ""
+
+
+def _is_home_scale_workdir(resolved: Path) -> bool:
+    """True when ``resolved`` (an already-realpath'd dir) is too broad to
+    deep-scan for broken symlinks: the operator HOME, a filesystem root, or
+    a mount root (a directory whose parent is itself — ``/`` on POSIX).
+
+    Conservative by construction: only these unambiguously-too-broad roots
+    trip the guard. A normal bounded agent workdir
+    (``$BRIDGE_DATA_ROOT/agents/<a>/workdir``) is several levels below HOME
+    and is never equal to HOME or a root, so it never false-skips."""
+    # Filesystem root: ``parent == self`` is true for ``/`` only.
+    # ``Path('/').parent == Path('/')``.
+    if resolved.parent == resolved:
+        return True
+    # Mount root: a mount point's parent is a normal directory, so the
+    # ``parent == self`` test above misses it. ``os.path.ismount`` catches a
+    # workdir that sits AT a mount root (``/dev``, ``/System/Volumes/*``,
+    # ``/Users/<op>/OrbStack``, an external volume, …) — as broad as HOME and
+    # just as ruinous to deep-walk. Only the mount root itself is ismount-true;
+    # a subdirectory of a mount is not, so bounded sub-workdirs never false-skip
+    # (#1801 review — _is_home_scale_workdir missed non-root mount points).
+    try:
+        if os.path.ismount(str(resolved)):
+            return True
+    except OSError:
+        pass
+    try:
+        home = Path.home()
+    except (RuntimeError, KeyError, OSError):
+        home = None
+    if home is not None:
+        try:
+            if resolved == home.resolve():
+                return True
+        except OSError:
+            # realpath of HOME failed (rare); fall back to the unresolved
+            # comparison rather than crashing the scan.
+            if resolved == home:
+                return True
+    return False
+
+
+def collect_broken_links(agent_dir: Path) -> BrokenLinksResult:
+    """Scan ``agent_dir`` for broken (dangling) symlinks, bounded on every
+    axis so a HOME-scale workdir cannot blow the watchdog scan ceiling
+    (#1801). Returns a :class:`BrokenLinksResult` carrying the explicit
+    3-state contract (complete / truncated / skipped) — never a silent cap.
+
+    The walk uses ``os.walk`` (not ``rglob``) so heavy/noise directory
+    subtrees can be pruned in-place via ``dirnames[:] = [...]``; rglob has
+    no equivalent. Bounds enforced: ``BROKEN_LINKS_EXCLUDE_DIRS`` pruning,
+    ``broken_links_max_depth()`` relative to ``agent_dir``,
+    ``broken_links_max_entries()`` total entries, and a
+    ``broken_links_budget_seconds()`` wall-time budget (checked every
+    ``BROKEN_LINKS_TIME_CHECK_INTERVAL`` entries)."""
+    # (c) skipped: degrade the scanner, not the agent, on a HOME-scale root.
+    try:
+        resolved = agent_dir.resolve()
+    except OSError:
+        resolved = agent_dir
+    if _is_home_scale_workdir(resolved):
+        return BrokenLinksResult(
+            links=[],
+            scan_skipped=True,
+            note=(
+                f"workdir is HOME-scale ({resolved}); deep broken-link "
+                "scan skipped (agent not escalated)"
+            ),
+        )
+
+    max_entries = broken_links_max_entries()
+    max_depth = broken_links_max_depth()
+    budget = broken_links_budget_seconds()
+    base_depth = len(resolved.parts)
+    started = time.perf_counter()
+
+    broken: list[str] = []
+    entries = 0
+    truncated = False
+    note = ""
+    # ``followlinks=False`` (the default) is load-bearing: a symlinked dir
+    # must NOT be descended into, both to avoid cycles and because the
+    # broken-symlink target itself is what we report, not its contents.
+    for dirpath, dirnames, filenames in os.walk(resolved, followlinks=False):
+        here = Path(dirpath)
+        depth = len(here.parts) - base_depth
+        # Prune heavy/noise subtrees in-place BEFORE descending. Two prune
+        # passes: (1) the basename denylist (codex caches, package stores,
+        # VCS internals), and (2) the path-scoped relpath denylist
+        # (#1801 r2) — a dir whose (parent-basename, own-basename) matches an
+        # entry in BROKEN_LINKS_EXCLUDE_RELPATHS is pruned only under that
+        # specific parent, so ``.claude/worktrees`` is skipped while an
+        # unrelated dir named ``worktrees`` elsewhere is still walked.
+        here_name = here.name
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in BROKEN_LINKS_EXCLUDE_DIRS
+            and (here_name, d) not in BROKEN_LINKS_EXCLUDE_RELPATHS
+        ]
+        # Depth cap: at/over max_depth, do not descend further. The current
+        # level's own entries are still inspected below.
+        if depth >= max_depth and dirnames:
+            truncated = True
+            note = f"max-depth {max_depth} reached"
+            dirnames[:] = []
+        # Count BOTH surviving subdir names and files toward the entry cap
+        # so the bound reflects total walk work (a wide tree of empty dirs
+        # is still bounded), but only ``filenames`` can hold a broken
+        # symlink: os.walk classifies a DANGLING symlink into ``filenames``
+        # regardless of its target shape — ``is_dir()`` follows the link and
+        # returns False for a broken one, so a broken symlink is never in
+        # ``dirnames``. os.walk does not stat names for us, so we lstat each
+        # file candidate.
+        entries += len(dirnames)
+        if entries > max_entries:
+            truncated = True
+            note = f"max-entries {max_entries} reached"
+            break
+        for name in filenames:
+            entries += 1
+            if entries % BROKEN_LINKS_TIME_CHECK_INTERVAL == 0:
+                if (time.perf_counter() - started) > budget:
+                    truncated = True
+                    note = f"wall-time budget {budget:g}s exceeded"
+                    break
+            if entries > max_entries:
+                truncated = True
+                note = f"max-entries {max_entries} reached"
+                break
+            candidate = here / name
+            try:
+                if candidate.is_symlink() and not candidate.exists():
+                    broken.append(
+                        f"{candidate.relative_to(resolved)} -> "
+                        f"{os.readlink(candidate)}"
+                    )
+            except OSError:
+                # A single unreadable entry must not abort the whole scan —
+                # the watchdog is the diagnostic of last resort. Skip it.
+                continue
+        if truncated:
+            break
+
+    return BrokenLinksResult(links=broken, truncated=truncated, note=note)
+
+
+def _collect_broken_links_deduped(
+    agent_dir: Path,
+    agent_name: str,
+    cache: dict[str, tuple[str, BrokenLinksResult]] | None,
+) -> BrokenLinksResult:
+    """#1801 r2 (#12626): within-scan-pass dedupe wrapper around
+    :func:`collect_broken_links`.
+
+    Two agents that share the same workdir (same ``os.path.realpath``) — the
+    common case for a codex ``<admin>-dev`` pair layered onto its admin's
+    checkout — would otherwise each walk that tree once, so a shared
+    401k-entry checkout is paid for N times in one pass. With a per-pass
+    ``cache`` dict the FIRST agent at a given realpath does the walk and
+    stores ``(agent_name, result)``; a later agent at the same realpath
+    reuses the cached result and gets a fresh :class:`BrokenLinksResult` whose
+    ``note`` records the share (``shared workdir, scanned via <first-agent>``)
+    so its row stays truthful — same ``links`` and same 3-state flags, only
+    the redundant filesystem walk is elided. A non-shared workdir is walked
+    and cached exactly as before. ``cache is None`` (legacy callers) → always
+    walk, no dedupe.
+
+    Dedupe is deliberately at the scan-pass loop level (here / the caller),
+    never inside the leaf :func:`collect_broken_links`, so the leaf scanner
+    stays a pure function of its ``agent_dir`` and remains independently
+    testable."""
+    if cache is None:
+        return collect_broken_links(agent_dir)
+    try:
+        key = os.path.realpath(agent_dir)
+    except OSError:
+        # realpath failed (rare); fall back to an un-deduped walk rather than
+        # risk a wrong-key cache hit. Correctness over the walk-elision win.
+        return collect_broken_links(agent_dir)
+    cached = cache.get(key)
+    if cached is not None:
+        first_agent, result = cached
+        # #1801 r2: optional instrumentation so a test (or an operator
+        # debugging a slow pass) can prove the dedupe fired without parsing
+        # timings. Off by default; one stderr line per elided walk.
+        if os.environ.get("BRIDGE_WATCHDOG_DEBUG_DEDUPE"):
+            print(
+                f"[bridge-watchdog] broken-links dedupe HIT: "
+                f"{agent_name} reuses {first_agent} for {key}",
+                file=sys.stderr,
+            )
+        # Re-derive the per-agent row from the cached result, appending the
+        # shared-workdir provenance to whatever degrade note the cached scan
+        # already carried (truncated / skipped notes are preserved verbatim
+        # and the share annotation is added so the row stays self-describing).
+        shared_note = f"shared workdir, scanned via {first_agent}"
+        note = f"{result.note}; {shared_note}" if result.note else shared_note
+        return BrokenLinksResult(
+            links=list(result.links),
+            truncated=result.truncated,
+            scan_skipped=result.scan_skipped,
+            note=note,
+        )
+    result = collect_broken_links(agent_dir)
+    cache[key] = (agent_name, result)
+    if os.environ.get("BRIDGE_WATCHDOG_DEBUG_DEDUPE"):
+        print(
+            f"[bridge-watchdog] broken-links dedupe MISS (walked): "
+            f"{agent_name} for {key}",
+            file=sys.stderr,
+        )
+    return result
 
 
 def parse_session_type(agent_dir: Path) -> tuple[str, str]:
@@ -688,6 +937,14 @@ NON_ONBOARDING_SESSION_TYPES = frozenset({"dynamic", "cron"})
 # audit) can read it.
 STATIC_SESSION_TYPES = frozenset({"static", "static-claude", "static-codex"})
 
+# #1801: per-agent cap on the number of broken_links entries the markdown
+# render emits. The live incident produced a 67,932-line report (one agent's
+# broken_links = ~67.8k rows) — a useless `--body-file` for the drift task.
+# The render now lists at most this many entries + a "(N more …)" summary
+# line. The full count stays in the summary; the complete list lives in the
+# JSON payload (which downstream automation reads, not the markdown body).
+BROKEN_LINKS_REPORT_CAP = 50
+
 
 # #1266 (v0.15.0-beta4 Lane G): fresh-install detection window. The
 # daemon's drift-task writer lowers the priority to `low` when every
@@ -703,6 +960,115 @@ DEFAULT_FRESH_INSTALL_WINDOW_SECS = 600
 # stale and fresh_install=False so a long-paused install that never
 # completed onboarding is not held at priority=low forever. Default 24h.
 DEFAULT_FRESH_INSTALL_PENDING_TTL_SECS = 86400
+
+# #1801: bounds for the broken-symlink scan in ``collect_broken_links``.
+# The pre-fix scan was an unbounded ``agent_dir.rglob("*")`` — no entry cap,
+# depth cap, time budget, or directory exclusions. On a HOME-scale workdir
+# (a monitor-style agent created with ``--workdir /Users/<operator>``) it
+# walks the operator's entire home (Library caches, ~/.codex rollout files,
+# ~/.agent-bridge itself, every checkout) → measured 3m21s wall, 7× the 30s
+# ``BRIDGE_WATCHDOG_SCAN_TIMEOUT_SECONDS`` ceiling, exit-124 on every tick
+# for 9+ days, a 67.9k-line report. The bounds below cap the walk so a
+# legitimately-broad workdir degrades the *scanner* (it says so), never the
+# agent.
+DEFAULT_BROKEN_LINKS_MAX_ENTRIES = 10_000
+DEFAULT_BROKEN_LINKS_MAX_DEPTH = 6
+DEFAULT_BROKEN_LINKS_BUDGET_SECONDS = 5.0
+# How often (in entries scanned) to re-check the wall-time budget. Checking
+# ``time.perf_counter()`` on every single entry is wasteful; every N entries
+# keeps the overhead negligible while still bounding the walk well under the
+# ceiling. A heavy dir of broken symlinks is the worst case, and N=256 caps
+# the over-budget overshoot to at most one stat-storm batch.
+BROKEN_LINKS_TIME_CHECK_INTERVAL = 256
+# Directory basenames pruned in-place during the walk. These are the
+# well-known heavy / high-churn / noise trees that hold thousands of stale
+# symlinks (codex runtime caches, package manager stores, VCS internals) but
+# never bridge-relevant broken-link drift. Pruning them in-place (os.walk's
+# ``dirnames[:] = [...]``) is what rglob could not do. Kept conservative:
+# only basenames that are unambiguously not part of an agent's managed
+# identity tree. A bounded normal workdir contains none of these, so its
+# genuine broken links are unaffected (no false skip / no lost coverage).
+BROKEN_LINKS_EXCLUDE_DIRS = frozenset(
+    {
+        ".git",
+        ".cache",
+        "node_modules",
+        "Library",
+        ".codex",
+        ".agent-bridge",
+        ".npm",
+        ".cargo",
+        ".rustup",
+        ".venv",
+        "__pycache__",
+        ".Trash",
+        ".local",
+    }
+)
+# #1801 r2 (#12626): path-scoped exclusions pruned by (parent-basename,
+# dir-basename) rather than a blanket basename prune. The dominant cost in
+# the live follow-up was ``.claude/worktrees/`` — agent-isolation worktrees,
+# each a FULL repo checkout (401k+ entries), multiplied by N agents. A bare
+# ``worktrees`` basename prune in ``BROKEN_LINKS_EXCLUDE_DIRS`` would also
+# blanket-skip an unrelated dir literally named ``worktrees`` elsewhere, so
+# the prune is scoped to the agent-isolation parent (``.claude``). Pruning
+# only ``.claude/worktrees`` keeps the rest of ``.claude/`` walked (settings
+# / state there is small and may hold genuine broken links). ``.git/worktrees``
+# (git's own worktree metadata) needs no entry here — it is already inside the
+# ``.git`` basename prune above. WHY this is a CORRECTNESS fix, not just speed:
+# without excluding the worktree checkouts the bounded walk burns its entire
+# max-entries / wall-time budget inside the worktrees and sets
+# ``truncated=true`` while MISSING the genuine top-level broken links it should
+# report — truncation hiding real drift.
+BROKEN_LINKS_EXCLUDE_RELPATHS = frozenset(
+    {
+        (".claude", "worktrees"),
+    }
+)
+
+
+def broken_links_max_entries() -> int:
+    """Resolve the broken-link scan entry cap from the env, with a safe
+    fall-through to ``DEFAULT_BROKEN_LINKS_MAX_ENTRIES``. A non-integer /
+    non-positive override is treated as the default so an operator typo
+    cannot disarm the bound entirely (which would re-open #1801)."""
+    raw = os.environ.get("BRIDGE_WATCHDOG_BROKEN_LINKS_MAX_ENTRIES", "")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_BROKEN_LINKS_MAX_ENTRIES
+    if parsed <= 0:
+        return DEFAULT_BROKEN_LINKS_MAX_ENTRIES
+    return parsed
+
+
+def broken_links_max_depth() -> int:
+    """Resolve the broken-link scan depth cap (relative to ``agent_dir``)
+    from the env, with a safe fall-through to
+    ``DEFAULT_BROKEN_LINKS_MAX_DEPTH``. Non-integer / non-positive → default."""
+    raw = os.environ.get("BRIDGE_WATCHDOG_BROKEN_LINKS_MAX_DEPTH", "")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_BROKEN_LINKS_MAX_DEPTH
+    if parsed <= 0:
+        return DEFAULT_BROKEN_LINKS_MAX_DEPTH
+    return parsed
+
+
+def broken_links_budget_seconds() -> float:
+    """Resolve the broken-link scan wall-time budget from the env, with a
+    safe fall-through to ``DEFAULT_BROKEN_LINKS_BUDGET_SECONDS`` (5s, well
+    under the 30s scan ceiling). Non-float / non-positive → default so a
+    typo cannot remove the time bound."""
+    raw = os.environ.get("BRIDGE_WATCHDOG_BROKEN_LINKS_BUDGET_SECONDS", "")
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_BROKEN_LINKS_BUDGET_SECONDS
+    if parsed <= 0:
+        return DEFAULT_BROKEN_LINKS_BUDGET_SECONDS
+    return parsed
 
 
 def fresh_install_window_secs() -> int:
@@ -1355,7 +1721,20 @@ def scan_agent(
     state_dir: Path | None = None,
     fresh_install_home_dir: Path | None = None,
     agent_home_dir: Path | None = None,
+    broken_links_cache: dict[str, tuple[str, BrokenLinksResult]] | None = None,
 ) -> AgentWatch:
+    # #1801 r2 (#12626): ``broken_links_cache`` is an optional per-pass dict
+    # the agent-loop in ``main()`` threads through so a workdir shared by
+    # multiple agents (same ``os.path.realpath``) is walked exactly ONCE per
+    # pass, not once per agent. A shared workdir is the common case for a
+    # codex ``<admin>-dev`` pair layered onto its admin's checkout. The key
+    # is the realpath of the scanned dir; the value is
+    # ``(first-agent-id, BrokenLinksResult)``. Every agent still gets its own
+    # truthful AgentWatch row carrying that workdir's broken_links — the
+    # cache only elides the redundant filesystem walk. A non-shared workdir
+    # is computed and cached normally with no behavior change. Legacy callers
+    # (smoke tests, ad-hoc ``watchdog scan <agent>``) pass ``None`` and the
+    # scan runs unconditionally, exactly as before.
     # `agent_name` (#1108) is the registry id, threaded through
     # explicitly because on v2 layouts ``agent_dir`` resolves to
     # ``$BRIDGE_DATA_ROOT/agents/<a>/workdir`` — so ``agent_dir.name``
@@ -1462,10 +1841,23 @@ def scan_agent(
             missing_block = False
         session_type, onboarding_state = parse_session_type(agent_dir)
         heartbeat_present, heartbeat_age = heartbeat_age_seconds(agent_dir)
-        broken_links = collect_broken_links(agent_dir)
+        # #1801 r2 (#12626): within-pass dedupe of identical workdirs keyed by
+        # realpath. The first agent with a given realpath does the walk; a
+        # later agent in the same pass that resolves to the same realpath
+        # reuses that result and annotates its note so the per-agent row stays
+        # truthful (same broken_links, same 3-state flags) while skipping the
+        # redundant walk. ``None`` cache → unconditional scan (legacy callers).
+        broken = _collect_broken_links_deduped(
+            agent_dir, resolved_name, broken_links_cache
+        )
+        # #1801: classify_status keys off the broken-link LIST only. A
+        # truncated scan that found genuine broken links still drives a
+        # `warn` (real drift); a skipped scan returns an empty list, so the
+        # agent is NOT escalated for the scanner degrade — the skip is
+        # surfaced via the dedicated field + note instead.
         status = classify_status(
             missing_files,
-            broken_links,
+            broken.links,
             onboarding_state,
             missing_block,
             session_type,
@@ -1478,7 +1870,7 @@ def scan_agent(
             onboarding_state=onboarding_state,
             status=status,
             missing_files=missing_files,
-            broken_links=broken_links,
+            broken_links=broken.links,
             missing_managed_claude_block=missing_block,
             heartbeat_present=heartbeat_present,
             heartbeat_age_seconds=heartbeat_age,
@@ -1486,6 +1878,9 @@ def scan_agent(
             agent_source=agent_source,
             fresh_install=is_fresh,
             restart_in_progress=is_restarting,
+            broken_links_truncated=broken.truncated,
+            broken_links_scan_skipped=broken.scan_skipped,
+            broken_links_note=broken.note,
         )
     except (PermissionError, FileNotFoundError, OSError) as exc:
         # #1119 r2: even when the outer `resolve_scan_path` sudo probe
@@ -1591,8 +1986,28 @@ def render_markdown(
         if item.missing_files:
             lines.append(f"- missing_files: {', '.join(item.missing_files)}")
         if item.broken_links:
-            lines.append("- broken_links:")
-            lines.extend(f"  - {entry}" for entry in item.broken_links)
+            total = len(item.broken_links)
+            # #1801: cap the per-agent list so a HOME-scale broken_links
+            # set can't make the markdown a 67k-line body. Full count stays
+            # in the summary; complete list lives in the JSON payload.
+            lines.append(f"- broken_links: {total} found")
+            shown = item.broken_links[:BROKEN_LINKS_REPORT_CAP]
+            lines.extend(f"  - {entry}" for entry in shown)
+            if total > len(shown):
+                lines.append(
+                    f"  - ...({total - len(shown)} more — truncated for "
+                    "report; full list in JSON payload)"
+                )
+        # #1801: surface the explicit 3-state scan contract so a truncated
+        # or skipped scan is never silent. A complete scan emits neither.
+        if item.broken_links_truncated:
+            lines.append(
+                f"- broken_links_truncated: yes ({item.broken_links_note})"
+            )
+        if item.broken_links_scan_skipped:
+            lines.append(
+                f"- broken_links_scan_skipped: yes ({item.broken_links_note})"
+            )
         if item.missing_managed_claude_block:
             lines.append("- missing_managed_claude_block: yes")
         # #1119: surface the scan_error fields directly under the agent
@@ -1766,6 +2181,14 @@ def main() -> int:
     # caller of either helper outside ``scan_agent``'s try/except would
     # re-introduce the same crash class — the outer guard closes both.
     records: list[AgentWatch] = []
+    # #1801 r2 (#12626): per-pass broken-links dedupe cache, keyed by the
+    # resolved-scan-path realpath. Threaded into every ``scan_agent`` call so
+    # a workdir shared by multiple agents (a codex ``<admin>-dev`` pair on its
+    # admin's checkout) is walked once per pass instead of once per agent —
+    # the dominant repeated cost in the live follow-up. Scoped to this single
+    # pass (a fresh dict each ``main()`` invocation) so a workdir whose
+    # contents change between ticks is always re-walked next tick.
+    broken_links_cache: dict[str, tuple[str, BrokenLinksResult]] = {}
     for path in scan_paths:
         agent_name = path.name
         agent_meta = registry_meta.get(agent_name, {})
@@ -1801,6 +2224,9 @@ def main() -> int:
                     # measured against the scaffold mtime, not the
                     # potentially-younger materialize target.
                     fresh_install_home_dir=path,
+                    # #1801 r2: per-pass dedupe cache (see above) so a shared
+                    # workdir's broken-link walk is paid once per pass.
+                    broken_links_cache=broken_links_cache,
                 )
             )
         except (PermissionError, FileNotFoundError, OSError) as exc:
