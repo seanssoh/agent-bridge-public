@@ -673,10 +673,22 @@ def _is_home_scale_workdir(resolved: Path) -> bool:
     trip the guard. A normal bounded agent workdir
     (``$BRIDGE_DATA_ROOT/agents/<a>/workdir``) is several levels below HOME
     and is never equal to HOME or a root, so it never false-skips."""
-    # Filesystem / mount root: ``parent == self`` is true for ``/`` and for
-    # any mount point resolved to a root. ``Path('/').parent == Path('/')``.
+    # Filesystem root: ``parent == self`` is true for ``/`` only.
+    # ``Path('/').parent == Path('/')``.
     if resolved.parent == resolved:
         return True
+    # Mount root: a mount point's parent is a normal directory, so the
+    # ``parent == self`` test above misses it. ``os.path.ismount`` catches a
+    # workdir that sits AT a mount root (``/dev``, ``/System/Volumes/*``,
+    # ``/Users/<op>/OrbStack``, an external volume, …) — as broad as HOME and
+    # just as ruinous to deep-walk. Only the mount root itself is ismount-true;
+    # a subdirectory of a mount is not, so bounded sub-workdirs never false-skip
+    # (#1801 review — _is_home_scale_workdir missed non-root mount points).
+    try:
+        if os.path.ismount(str(resolved)):
+            return True
+    except OSError:
+        pass
     try:
         home = Path.home()
     except (RuntimeError, KeyError, OSError):

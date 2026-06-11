@@ -330,4 +330,18 @@ if [[ "$DEDUPE_MISS" -ne 1 || "$DEDUPE_HIT" -ne 1 ]]; then
 fi
 smoke_log "T7 PASS: shared workdir walked once (MISS=$DEDUPE_MISS, HIT=$DEDUPE_HIT), both rows present + correct"
 
-smoke_log "all 7 tests PASS (#1801 bounded broken-links scan + r2 worktrees-exclusion + shared-workdir dedupe)"
+# ---------------------------------------------------------------------------
+# T8 — #1801 review r3: a mount-ROOT workdir is HOME-scale (degrade), not walked
+# ---------------------------------------------------------------------------
+# THE r3 BUG (queue gate): _is_home_scale_workdir only caught `/` via
+# `parent == self`; real mount points (/dev, /System/Volumes/*, an external
+# volume, /Users/<op>/OrbStack) have a normal-directory parent and slipped
+# through, so a monitor agent whose workdir is a mount root would still
+# deep-walk the whole mount — the same scan-ceiling class outside literal
+# $HOME and `/`. The fix adds an os.path.ismount() leg. This unit check
+# monkeypatches ismount and asserts: mount ROOT -> skip, mount SUBDIR -> walk.
+"$PY_BIN" "$SCRIPT_DIR/1801-helpers/assert-mount-skip.py" "$REPO_ROOT/bridge-watchdog.py" \
+  || smoke_fail "T8 failed: mount-root HOME-scale guard regressed (ismount leg missing)"
+smoke_log "T8 PASS: mount-root workdir sets scan_skipped (ismount leg), mount subdir still walked"
+
+smoke_log "all 8 tests PASS (#1801 bounded broken-links scan + r2 worktrees-exclusion + shared-workdir dedupe + r3 mount-root guard)"
