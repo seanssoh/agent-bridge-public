@@ -274,11 +274,26 @@ def _idle_ready_tail_clear(pane_text: str, patterns: list[Any]) -> bool:
     idle_start = min(starts)
     # Drop the idle composer's OWN line (the line containing idle_start) so its
     # caret/ghost text is not mistaken for an option, then scan the region BELOW
-    # it with single-caret sensitivity. Anything above idle_start is scrollback.
+    # it with single-caret sensitivity.
     region = pane_text[idle_start:]
     newline = region.find("\n")
     below_composer = region[newline + 1:] if newline != -1 else ""
-    return not _pane_has_picker_affordance(below_composer, single_caret=True)
+    if _pane_has_picker_affordance(below_composer, single_caret=True):
+        return False
+    # The region ABOVE the composer is mostly stale scrollback (answered
+    # pickers, prior output) and must NOT block the idle exclusion — but a
+    # LIVE selector resting on an option row ('❯ 1. Yes, continue' /
+    # '› Yes') is a picker artifact the TUI erases once answered, so its
+    # presence above the composer means a real picker shares this capture
+    # (queue codex review #1785 r2: the r1 Claude composite renders the
+    # picker ABOVE the idle composer/footer). Scan above with the STRONG
+    # selector-on-option signal only: bare numbered lists / menu shapes
+    # without an active selector stay classified as scrollback, preserving
+    # the #1783 stale-scrollback exclusion (smoke A3).
+    above_composer = pane_text[:idle_start]
+    if re.search(r"(?m)^\s*[❯›]\s+\S", above_composer):
+        return False
+    return True
 
 
 def classify(

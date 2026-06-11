@@ -201,6 +201,18 @@ test_a3_composite_pane_not_shadowed() {
   d="$(classify_shipped codex "$CODEX_FOREGROUND_FOOTER_BELOW")"
   smoke_assert_eq "false" "$(json_field "$d" non_picker)" "A3: codex picker with footer below options NOT non_picker (P1)"
 
+  # The r1 Claude composite (queue codex review #12458/#12482): a LIVE picker —
+  # selector resting ON an option row — rendered ABOVE the idle composer/footer
+  # must NOT be hard-excluded. The selector-on-option line ('❯ 1. Yes, …') is a
+  # live-picker artifact the TUI erases once answered, so it is distinguishable
+  # from stale scrollback (numbered lists without an active selector).
+  local claude_composite_above=$'Proceed with action?\n❯ 1. Yes, continue\n  2. No, cancel\n\n──────────────────── agent ──\n❯\n────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n'
+  d="$(classify_shipped claude "$claude_composite_above")"
+  smoke_assert_eq "false" "$(json_field "$d" non_picker)" "A3: r1 claude composite (live picker ABOVE idle tail) NOT excluded"
+  local codex_composite_above=$'Proceed with action?\n› Yes, continue\n  No, cancel\n\n›\n\n  gpt-5.5 xhigh fast · ~/.agent-bridge/data/agents/x/workdir\n'
+  d="$(classify_shipped codex "$codex_composite_above")"
+  smoke_assert_eq "false" "$(json_field "$d" non_picker)" "A3: codex composite (live selector above empty composer) NOT excluded"
+
   # Stale menu-like scrollback ABOVE a tail idle composer → still non_picker.
   d="$(classify_shipped claude "$CLAUDE_STALE_SCROLLBACK")"
   smoke_assert_eq "true" "$(json_field "$d" non_picker)" "A3: claude idle + stale scrollback above tail → non_picker"
