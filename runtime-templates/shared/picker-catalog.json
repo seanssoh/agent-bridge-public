@@ -131,6 +131,32 @@
       "policy": "auto_resolve",
       "keys": ["select_first", "down", "down", "confirm"],
       "post_resolve_verify": true
+    },
+    {
+      "picker_id": "claude-idle-ready",
+      "engine": "claude",
+      "enabled": true,
+      "confidence": "exact",
+      "comment": "#1783 fix. NON-PICKER context signal — the ORDINARY idle composer of Claude Code, not a stuck picker. The idle UI always renders the input-box border plus an EMPTY '❯' composer line and the 'bypass permissions on (shift+tab to cycle)' / '? for shortcuts' footer; because the pane is static, the unknown-stuck tracker would otherwise escalate every idle session ~5min after the auto-resolve stage comes up (19/22 sessions live on v0.16.8). policy=non_picker is a HARD EXCLUSION so an idle composer can never register as unknown-stuck. The load-bearing piece is the EMPTY-composer regex '^❯\\s*$': a real picker renders option text after the selector ('❯ 1. Yes, …') so it does NOT match this entry and still walks the unknown path. foreground_guard=true tail-scopes the exclusion (classify._idle_ready_tail_clear): it only short-circuits when this idle composer/footer is the LIVE TAIL of the capture with no foreground picker affordance at/below it — a real picker stacked as the foreground escalates, and stale menu-like scrollback ABOVE a tail idle composer is ignored. Strings verbatim from the issue's sanitized live capture (claude engine).",
+      "match": [
+        "(?m)^❯\\s*$",
+        "bypass permissions on \\(shift\\+tab to cycle\\)|\\? for shortcuts"
+      ],
+      "policy": "non_picker",
+      "foreground_guard": true
+    },
+    {
+      "picker_id": "codex-idle-ready",
+      "engine": "codex",
+      "enabled": true,
+      "confidence": "exact",
+      "comment": "#1783 fix. NON-PICKER context signal — the ORDINARY idle composer of the Codex TUI, not a stuck picker. policy=non_picker hard-excludes it so the static idle pane never escalates as unknown-stuck once the auto-resolve stage runs. TWO anchored fingerprints, both required. The composer regex matches ONLY an EMPTY composer — '(?m)^\\s*[│┃|]?\\s*›\\s*(?:[│┃|]\\s*)?$' = a line-leading '›' followed by only whitespace / a closing border. This is the P1-SAFE boundary (codex review #1783 rounds 8-9): a real picker OPTION row ALWAYS has text after '›' ('› Yes', '› /review current changes'), so it can NEVER match this fingerprint and is never hidden as idle. The deliberate trade-off: a Codex idle screen that renders GHOST placeholder text after '›' (e.g. '› Run /review …') is NOT caught by this entry and reaches the unknown path — but that residual is bounded by the 2-tick + 5-min unknown-stuck budget AND the per-pass storm fuse, which is strictly preferable to ever stranding a real stuck picker. The second regex '(?m)^.*·\\s*~/' is the idle READY status footer (model/effort tokens then '· ~/<workdir>'). foreground_guard=true additionally tail-scopes the exclusion (classify._idle_ready_tail_clear): it only short-circuits when there is no foreground picker affordance below the idle composer line — stale menu-like scrollback ABOVE the idle composer is ignored. Strings grounded in the issue's sanitized live capture (codex engine).",
+      "match": [
+        "(?m)^\\s*[│┃|]?\\s*›\\s*(?:[│┃|]\\s*)?$",
+        "(?m)^.*·\\s*~/"
+      ],
+      "policy": "non_picker",
+      "foreground_guard": true
     }
   ]
 }
