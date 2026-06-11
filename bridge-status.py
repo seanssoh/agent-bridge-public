@@ -1016,6 +1016,55 @@ def pending_upgrade_conflict_count(bridge_home: str) -> int:
     return count
 
 
+def _resolve_agent_home_root(bridge_home: str) -> Path | None:
+    """Resolve the agent-home root for the orphan-agent-dir counter (#1803).
+
+    Mirrors `bridge-doctor.py:resolve_agent_home_root` / `lib/bridge-agents.sh`:
+    $BRIDGE_AGENT_HOME_ROOT > $BRIDGE_HOME/agents > the passed bridge_home's
+    agents dir. Returns None when no root can be resolved (counter falls back
+    to 0 rather than guessing)."""
+    explicit = os.environ.get("BRIDGE_AGENT_HOME_ROOT", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    if bridge_home:
+        return Path(bridge_home).expanduser() / "agents"
+    home_env = os.environ.get("BRIDGE_HOME", "").strip()
+    if home_env:
+        return Path(home_env).expanduser() / "agents"
+    return None
+
+
+def orphan_agent_dir_count(roster: list[dict[str, str]], bridge_home: str) -> int:
+    """Count children of the agent-home root classified `orphan-agent-dir`
+    (Issue #1803). Uses the SAME `bridge_orphan_classifier` SSOT the daemon GC
+    and the doctor consume, so the dashboard number can never drift from what
+    the GC would act on. Registered dirs are derived from the roster snapshot
+    (basename id + workdir). Never raises (returns 0 on any failure)."""
+    try:
+        from bridge_orphan_classifier import count_orphan_agent_dirs
+    except Exception:  # noqa: BLE001 — counter is purely additive; never crash status
+        return 0
+    home_root = _resolve_agent_home_root(bridge_home)
+    # The home-root probe is controller-only (BRIDGE_HOME/agents, never an
+    # isolated-agent path), like the sibling pending_upgrade_conflict_count.
+    if home_root is None or not home_root.is_dir():  # noqa: raw-pathlib-controller-only
+        return 0
+    registry: list[dict[str, str]] = []
+    for row in roster:
+        agent = str(row.get("agent") or "").strip()
+        if not agent:
+            continue
+        entry: dict[str, str] = {
+            "id": agent,
+            "home": str(home_root / agent),
+        }
+        workdir = str(row.get("workdir") or "").strip()
+        if workdir:
+            entry["workdir"] = workdir
+        registry.append(entry)
+    return count_orphan_agent_dirs(registry, home_root)
+
+
 def _parse_shell_env(path: str) -> dict[str, str]:
     """Parse a daemon-written `KEY=value` shell-state file into a dict.
 
@@ -1424,6 +1473,10 @@ def render_dashboard(args: argparse.Namespace) -> str:
     wake_missing_count = sum(1 for row in roster if row.get("wake") == "miss")
     channel_missing_count = sum(1 for row in roster if row.get("channels") == "miss")
     zombie_count = sum(1 for metric in metrics.values() if int(metric.get("zombie", 0) or 0) == 1)
+    # Issue #1803: count unowned `agents/<name>` homes (the SSOT classifier's
+    # `orphan-agent-dir` verdict) so accumulation is visible on the dashboard
+    # before it grows back to triple digits. Same number the daemon GC acts on.
+    orphan_agent_dirs = orphan_agent_dir_count(roster, args.bridge_home or "")
     channel_warning_rows = [
         row
         for row in roster
@@ -1440,6 +1493,13 @@ def render_dashboard(args: argparse.Namespace) -> str:
             a2a_flag = " | a2a=ALARM"
         elif handoffd_health["state"] == "stopped":
             a2a_flag = " | a2a=DOWN"
+
+    # Issue #1803: surface the orphan-agent-dir count in the header only when
+    # non-zero (quiet on clean hosts, same pattern as a2a_flag). The JSON
+    # summary always emits the number for machine consumers.
+    orphan_dirs_flag = (
+        f" | orphan dirs={orphan_agent_dirs}" if orphan_agent_dirs > 0 else ""
+    )
 
     for row in roster:
         metric = metrics.get(row["agent"], {})
@@ -1486,7 +1546,7 @@ def render_dashboard(args: argparse.Namespace) -> str:
     lines.append(
         f"updated {iso_now()} | daemon {'running' if daemon_running else 'stopped'} pid={daemon_pid} | "
         f"active {full_active_count}/{full_total_agents} | shown {visible_agents} | "
-        f"health warn={health_warn_count} crit={health_critical_count} | wake miss={wake_missing_count} | channel miss={channel_missing_count} | zombie={zombie_count}{a2a_flag} | db {queue_db}"
+        f"health warn={health_warn_count} crit={health_critical_count} | wake miss={wake_missing_count} | channel miss={channel_missing_count} | zombie={zombie_count}{a2a_flag}{orphan_dirs_flag} | db {queue_db}"
     )
     lines.append("")
     lines.append(
@@ -1772,6 +1832,10 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
         # count so JSON consumers (dashboard / admin-bot / smoke) can
         # observe the same number the human-facing warning line emits.
         "pending_upgrade_conflicts": pending_upgrade_conflict_count(args.bridge_home or ""),
+        # Issue #1803: orphan-agent-dir count (the SSOT classifier's verdict,
+        # same number the daemon GC acts on). Always emitted so a JSON consumer
+        # observes accumulation before it grows back to triple digits.
+        "orphan_agent_dirs": orphan_agent_dir_count(roster, args.bridge_home or ""),
         # Issue #1405: A2A receiver supervisor health. JSON consumers (the
         # 1405 smoke, admin-bot) observe the same state the human dashboard
         # renders. Always emitted; `configured: false` on non-A2A installs.

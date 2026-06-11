@@ -4584,6 +4584,148 @@ process_release_monitor() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# Issue #1803 — orphan agent-dir GC as a core daemon duty.
+#
+# The daemon GCs tmux orphan SESSIONS (reap_idle_orphan_sessions) and MCP
+# orphan PROCESSES, but on-disk `agents/<name>` homes for ids absent from the
+# roster were nobody's job — a live install accumulated 119 entries over six
+# weeks. This pass owns that hygiene CONSERVATIVELY:
+#
+#   * Only a child the SSOT classifier (bridge_orphan_classifier) verdicts
+#     `orphan-agent-dir` is ever actionable. Every error / unverifiable /
+#     indeterminate / referenced-symlink-target / registered / infra child is
+#     KEEP + notify (the #1795/#1791 fail-safe rule). The generic
+#     resolved-symlink-target keep-set protects `agents/shared` (and any other
+#     symlink TARGET) so the manual-sweep failure that motivated this issue —
+#     removing `agents/shared` and breaking every agent's doc links — cannot
+#     recur.
+#   * v1 default: detect + count + ONE admin `[hygiene]` task. NOTHING moves
+#     unless BRIDGE_ORPHAN_GC_AUTO_QUARANTINE=1 (kill-switch, default 0). When
+#     off, the admin task lists what WOULD be quarantined (a dry-run notice).
+#   * Quarantine MOVES (never deletes) to backups/orphan-agents-<YYYYMMDD>/.
+#     The Python helper TOCTOU-revalidates against a FRESH registry snapshot
+#     immediately before each move. Prune is a SEPARATE pass with its own
+#     dry-run + a hard containment check.
+#
+# Env knobs (all optional, conservative defaults):
+#   BRIDGE_ORPHAN_GC_INTERVAL_SECONDS      cadence (default 86400 = daily)
+#   BRIDGE_ORPHAN_DIR_MIN_AGE_SECONDS      age gate (default 604800 = 7d)
+#   BRIDGE_ORPHAN_GC_AUTO_QUARANTINE       move kill-switch (default 0 = off)
+#   BRIDGE_ORPHAN_QUARANTINE_RETAIN_DAYS   prune retain window (default 30)
+# ---------------------------------------------------------------------------
+
+# Resolve the agent-home root the daemon scans. Mirrors the python resolver:
+# $BRIDGE_AGENT_HOME_ROOT > $BRIDGE_HOME/agents.
+bridge_orphan_gc_home_root() {
+  if [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" ]]; then
+    printf '%s' "$BRIDGE_AGENT_HOME_ROOT"
+  else
+    printf '%s/agents' "${BRIDGE_HOME:-$HOME/.agent-bridge}"
+  fi
+}
+
+# Emit ONE admin `[hygiene]` summary task per non-clean pass. Best-effort: a
+# notification failure never cascades into the main loop. Mirrors
+# bridge_emit_daily_backup_failure_admin_task (admin from BRIDGE_ADMIN_AGENT_ID,
+# --force bypasses the stopped-admin gate so the task is the signal the
+# operator restarts admin to consume).
+bridge_emit_orphan_gc_admin_task() {
+  local summary_file="$1"
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local target_bridge=""
+  local body_file=""
+  local hostname_short=""
+
+  [[ -n "$admin" ]] || return 0
+  [[ -f "$summary_file" ]] || return 0
+
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  else
+    return 0
+  fi
+
+  hostname_short="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-orphan-gc-task.md.XXXXXX")"
+  if ! python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" orphan-gc-task-body \
+        "$summary_file" "$hostname_short" >"$body_file" 2>/dev/null; then
+    rm -f "$body_file"
+    return 0
+  fi
+
+  if ! "$target_bridge" task create \
+       --to "$admin" --priority normal --from daemon \
+       --title "[hygiene] orphan agent-dir GC on ${hostname_short}" \
+       --body-file "$body_file" --force >/dev/null 2>&1; then
+    daemon_warn "failed to file [hygiene] orphan-gc task to admin=${admin}"
+  fi
+  rm -f "$body_file"
+  return 0
+}
+
+# The orphan-dir GC pass. Returns 0 when it did work (so the caller marks the
+# cycle changed), 1 when gated/clean. Cadence is gated by bridge_daemon_pass_due
+# so a busy 5s tick never re-runs the scan.
+process_orphan_dir_gc() {
+  local interval="${BRIDGE_ORPHAN_GC_INTERVAL_SECONDS:-86400}"
+  local home_root=""
+  local backups_dir=""
+  local summary_file=""
+  local prune_file=""
+  local non_clean=0
+
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=86400
+  bridge_daemon_pass_due "orphan_dir_gc" "$interval" || return 1
+
+  home_root="$(bridge_orphan_gc_home_root)"
+  [[ -d "$home_root" ]] || return 1
+  backups_dir="${BRIDGE_HOME:-$HOME/.agent-bridge}/backups"
+
+  summary_file="$(mktemp "${TMPDIR:-/tmp}/bridge-orphan-gc-quarantine.json.XXXXXX")"
+  prune_file="$(mktemp "${TMPDIR:-/tmp}/bridge-orphan-gc-prune.json.XXXXXX")"
+
+  # Quarantine pass. Prefer the live CLI for the registry (the helper
+  # re-fetches it for the TOCTOU revalidation too); fall back to nothing on a
+  # partial install (the helper SystemExits, which we swallow).
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    bridge_with_timeout 120 orphan_gc_quarantine \
+      python3 "$SCRIPT_DIR/bridge-orphan-gc.py" quarantine \
+        --agent-home-root "$home_root" \
+        --backups-dir "$backups_dir" \
+        --audit-log "$BRIDGE_AUDIT_LOG" \
+        --registry-cmd "$BRIDGE_HOME/agent-bridge" \
+        >"$summary_file" 2>/dev/null || true
+  fi
+
+  # Prune pass (SEPARATE code path). Only the helper's own dry-run/containment
+  # logic decides what is actually deleted; auto-off keeps it a dry-run.
+  bridge_with_timeout 60 orphan_gc_prune \
+    python3 "$SCRIPT_DIR/bridge-orphan-gc.py" prune \
+      --backups-dir "$backups_dir" \
+      --audit-log "$BRIDGE_AUDIT_LOG" \
+      >"$prune_file" 2>/dev/null || true
+
+  # Decide whether this pass was non-clean (anything worth telling admin).
+  if [[ -s "$summary_file" ]]; then
+    non_clean="$(python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" \
+      orphan-gc-non-clean "$summary_file" "$prune_file" 2>/dev/null || printf '0')"
+  fi
+
+  if [[ "$non_clean" == "1" ]]; then
+    bridge_emit_orphan_gc_admin_task "$summary_file"
+  fi
+
+  rm -f "$summary_file" "$prune_file"
+
+  if [[ "$non_clean" == "1" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 process_daily_backup() {
   local backup_json=""
   local subprocess_rc=0
@@ -13377,6 +13519,17 @@ cmd_sync_cycle() {
   _bridge_daemon_mark_progress "daily_backup"
   BRIDGE_DAEMON_LAST_STEP="release_monitor"
   if process_release_monitor; then
+    changed=0
+  fi
+  # Issue #1803: orphan agent-dir GC. Cadence-gated (default daily) via
+  # bridge_daemon_pass_due, so the per-tick cost is a cheap stamp check; the
+  # scan + classify only runs once per BRIDGE_ORPHAN_GC_INTERVAL_SECONDS. v1
+  # default is detect+count+notify (no move) unless
+  # BRIDGE_ORPHAN_GC_AUTO_QUARANTINE=1. Placed after the release monitor and
+  # before the reaper family so a freshly-reaped dynamic's tree is not swept
+  # mid-cycle (the age gate is the real guard; the ordering is belt-and-braces).
+  BRIDGE_DAEMON_LAST_STEP="orphan_dir_gc"
+  if process_orphan_dir_gc; then
     changed=0
   fi
   # Issue #4795: prune backoff state for agents that no longer exist in
