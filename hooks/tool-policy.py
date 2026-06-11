@@ -5328,8 +5328,8 @@ def _is_admin_credential_routine(text: str, agent: str) -> bool:
       (:func:`_validate_auth_add_args`) — boolean
       ``--stdin/--activate/--replace/--sync/--enable-auto-rotate/
       --if-auto-enabled/--json`` plus value flags
-      ``--id/--agents/--threshold/--token-file/--reason`` with their
-      per-flag safety predicates.
+      ``--id/--agents/--threshold/--token-file/--reason/--limited-until``
+      with their per-flag safety predicates.
 
     Returns False (NOT raising) on any malformed shape so the substring
     deny stays in force. Skipping the deny on a malformed shape would
@@ -5838,7 +5838,17 @@ _AUTH_FLAGS_SLUG = frozenset(
     }
 )
 _AUTH_FLAGS_REASON = frozenset({"--reason"})
-_AUTH_FLAGS_VALUE = _AUTH_FLAGS_PATH | _AUTH_FLAGS_SLUG | _AUTH_FLAGS_REASON
+# `rotate --limited-until <ISO>` (#1789 / PR #1790): the rotating-away
+# token's 429 reset time. Timestamp only — `_safe_slug_arg` rejects the
+# `:`/`+` an ISO offset carries, so it gets its own strict shape check
+# (date-time with optional fraction and Z / ±HH:MM offset, nothing else).
+_AUTH_FLAGS_ISO = frozenset({"--limited-until"})
+_AUTH_ISO_TS_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$"
+)
+_AUTH_FLAGS_VALUE = (
+    _AUTH_FLAGS_PATH | _AUTH_FLAGS_SLUG | _AUTH_FLAGS_REASON | _AUTH_FLAGS_ISO
+)
 
 
 def _validate_auth_add_args(tokens: list[str]) -> bool:
@@ -5891,6 +5901,8 @@ def _validate_auth_flag_value(flag: str, value: str) -> bool:
         return _safe_path_arg(value)
     if flag in _AUTH_FLAGS_SLUG:
         return _safe_slug_arg(value)
+    if flag in _AUTH_FLAGS_ISO:
+        return bool(_AUTH_ISO_TS_RE.match(value))
     if flag in _AUTH_FLAGS_REASON:
         # Free-text reason: only reject shell metacharacters.
         if not value:

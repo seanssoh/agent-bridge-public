@@ -2217,6 +2217,16 @@ process_usage_monitor() {
     # downstream ``case`` statement routes through the ``error:*`` branch.
     rotation_status_row="$(bridge_with_timeout 5 rotation_status_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" rotation-status-parse "$rotate_json" || true)"
     IFS=$'\t' read -r rotation_status rotation_reason rotation_from rotation_to rotation_sync_status rotation_soonest_reset <<<"$rotation_status_row"
+    # PR #1790 r3 BLOCKING 1: the helper emits `-` for EMPTY columns because
+    # bash treats tab as IFS whitespace — consecutive tabs collapse and every
+    # empty field would shift the columns after it (the all_tokens_limited
+    # row landed soonest_reset in rotation_from). Decode the sentinel here.
+    [[ "$rotation_status" == "-" ]] && rotation_status=""
+    [[ "$rotation_reason" == "-" ]] && rotation_reason=""
+    [[ "$rotation_from" == "-" ]] && rotation_from=""
+    [[ "$rotation_to" == "-" ]] && rotation_to=""
+    [[ "$rotation_sync_status" == "-" ]] && rotation_sync_status=""
+    [[ "$rotation_soonest_reset" == "-" ]] && rotation_soonest_reset=""
     # Issue #831: record `worst_case_agent` — the agent whose usage actually
     # crossed the rotation threshold this pass. Empty for legacy single-cache
     # rows. Distinct from `agent_scope` (the rotation fanout target).

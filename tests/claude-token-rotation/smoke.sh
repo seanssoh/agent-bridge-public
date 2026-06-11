@@ -1014,6 +1014,40 @@ ACTIVATE_RESTORE_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token activate se
 json_assert "activate restore" "$ACTIVATE_RESTORE_JSON" "payload['status'] == 'activated' and payload['active_token_id'] == 'second'"
 pass "explicit activate clears a pending limit-window stamp (operator override)"
 
+# PR #1790 r3 BLOCKING 1 — the daemon decodes the rotation-status-parse row
+# with `IFS=$'\t' read`, and bash treats tab as IFS WHITESPACE: consecutive
+# tabs collapse into one delimiter, so any empty column silently shifts every
+# column to its right (an all_tokens_limited row put soonest_reset into
+# rotation_from). The helper now emits `-` for empty columns and the daemon
+# maps `-` back to "". Pin the encode + the bash decode roundtrip.
+SENTINEL_ISO="2099-01-02T03:04:05+09:00"
+LIMITED_ROW="$("$PYTHON" "$REPO_ROOT/bridge-daemon-helpers.py" rotation-status-parse \
+  "{\"status\":\"skipped\",\"reason\":\"all_tokens_limited\",\"active_token_id\":\"first\",\"soonest_reset\":\"$SENTINEL_ISO\"}")"
+"$PYTHON" - "$LIMITED_ROW" "$SENTINEL_ISO" <<'PY'
+import sys
+
+cols = sys.argv[1].split("\t")
+if len(cols) != 6:
+    raise SystemExit(f"expected 6 sentinel-encoded columns, got {len(cols)}: {cols!r}")
+expect = ["skipped", "all_tokens_limited", "-", "first", "-", sys.argv[2]]
+if cols != expect:
+    raise SystemExit(f"sentinel encoding mismatch: {cols!r} != {expect!r}")
+PY
+[[ $? -eq 0 ]] || fail "rotation-status-parse did not sentinel-encode empty columns"
+IFS=$'\t' read -r SR_STATUS SR_REASON SR_FROM SR_TO SR_SYNC SR_SOONEST <<<"$LIMITED_ROW"
+[[ "$SR_FROM" == "-" ]] && SR_FROM=""
+[[ "$SR_SYNC" == "-" ]] && SR_SYNC=""
+[[ "$SR_SOONEST" == "-" ]] && SR_SOONEST=""
+[[ "$SR_STATUS" == "skipped" && "$SR_REASON" == "all_tokens_limited" && -z "$SR_FROM" && "$SR_TO" == "first" && -z "$SR_SYNC" && "$SR_SOONEST" == "$SENTINEL_ISO" ]] \
+  || fail "bash IFS decode misaligned sentinel row: status=$SR_STATUS reason=$SR_REASON from=$SR_FROM to=$SR_TO sync=$SR_SYNC soonest=$SR_SOONEST"
+ROTATED_ROW="$("$PYTHON" "$REPO_ROOT/bridge-daemon-helpers.py" rotation-status-parse \
+  '{"status":"rotated","old_active_token_id":"a","active_token_id":"b","reason":"usage:weekly:97","sync":{"status":"ok"}}')"
+IFS=$'\t' read -r SR_STATUS SR_REASON SR_FROM SR_TO SR_SYNC SR_SOONEST <<<"$ROTATED_ROW"
+[[ "$SR_SOONEST" == "-" ]] && SR_SOONEST=""
+[[ "$SR_STATUS" == "rotated" && "$SR_FROM" == "a" && "$SR_TO" == "b" && "$SR_SYNC" == "ok" && -z "$SR_SOONEST" ]] \
+  || fail "rotated row decode regressed under sentinel encoding: $ROTATED_ROW"
+pass "rotation-status-parse sentinel encoding survives the daemon's IFS=tab decode"
+
 ADD_QUOTA_JSON="$(printf '%s' "$TOKEN_C" | "$REPO_ROOT/agent-bridge" auth claude-token add --id quota --stdin --json)"
 [[ "$ADD_QUOTA_JSON" != *"$TOKEN_C"* ]] || fail "quota add output leaked token"
 CHECK_QUOTA_JSON="$(
