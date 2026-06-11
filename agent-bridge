@@ -1508,6 +1508,12 @@ INSTALL_PROJECT_SKILL=1
 SPAWN_PREFERENCE=""
 # Issue #598 Track 4: opt-in for test-artifact name patterns.
 TEST_FIXTURE=0
+# Issue #1795: disposability tag for the idle reaper. Default 0 (non-ephemeral
+# = operator-created, NEVER reaped). Throwaway-spawn surfaces (wave fixers /
+# `--prefer new` workers, smoke children) opt in via `--ephemeral` or
+# BRIDGE_AGENT_EPHEMERAL=1 so the daemon may GC them once idle.
+EPHEMERAL_MODE="${BRIDGE_AGENT_EPHEMERAL:-0}"
+[[ "$EPHEMERAL_MODE" == "1" ]] || EPHEMERAL_MODE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -1526,6 +1532,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --loop)
       LOOP_MODE=1
+      shift
+      ;;
+    --ephemeral)
+      # Issue #1795: mark this dynamic as an auto-spawned throwaway worker so
+      # the idle reaper may GC it. Operator-created dynamics omit this flag.
+      EPHEMERAL_MODE=1
       shift
       ;;
     --no-continue)
@@ -1761,6 +1773,10 @@ BRIDGE_AGENT_SOURCE["$NAME"]="dynamic"
 BRIDGE_AGENT_META_FILE["$NAME"]="$ACTIVE_FILE"
 # shellcheck disable=SC2034
 BRIDGE_AGENT_LOOP["$NAME"]="$LOOP_MODE"
+# Issue #1795: persist disposability so the daemon's idle reaper can tell an
+# auto-spawned throwaway worker (--ephemeral) from an operator-created dynamic.
+# shellcheck disable=SC2034
+BRIDGE_AGENT_EPHEMERAL["$NAME"]="$EPHEMERAL_MODE"
 # shellcheck disable=SC2034
 BRIDGE_AGENT_CONTINUE["$NAME"]="$CONTINUE_MODE"
 # shellcheck disable=SC2034

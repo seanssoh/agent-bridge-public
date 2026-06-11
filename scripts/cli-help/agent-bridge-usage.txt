@@ -134,7 +134,7 @@ Usage:
   __CLI_NAME__ migrate workspace plan <agent>
   __CLI_NAME__ migrate workspace copy <agent> [--dry-run]
   __CLI_NAME__ migrate workspace cutover <agent> --dry-run
-  __CLI_NAME__ --codex|--claude --name <agent> [--loop] [--no-continue] [--workdir <dir>] [--replace] [--no-attach] [--no-project-skill] [--prefer wake|new|shared] [--test-fixture]
+  __CLI_NAME__ --codex|--claude --name <agent> [--loop] [--ephemeral] [--no-continue] [--workdir <dir>] [--replace] [--no-attach] [--no-project-skill] [--prefer wake|new|shared] [--test-fixture]
 
 Examples:
   __CLI_NAME__ status

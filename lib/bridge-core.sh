@@ -823,6 +823,8 @@ bridge_reset_roster_maps() {
   unset BRIDGE_AGENT_IDS BRIDGE_AGENT_DESC BRIDGE_AGENT_ENGINE BRIDGE_AGENT_SESSION
   unset BRIDGE_AGENT_WORKDIR BRIDGE_AGENT_PROFILE_HOME BRIDGE_AGENT_LAUNCH_CMD BRIDGE_AGENT_ACTION
   unset BRIDGE_AGENT_SOURCE BRIDGE_AGENT_META_FILE BRIDGE_AGENT_LOOP
+  # Issue #1795: per-dynamic disposability tag consumed by the idle reaper.
+  unset BRIDGE_AGENT_EPHEMERAL
   unset BRIDGE_AGENT_CONTINUE BRIDGE_AGENT_SESSION_ID BRIDGE_AGENT_SESSION_STALE_HINT BRIDGE_AGENT_HISTORY_KEY
   unset BRIDGE_AGENT_CREATED_AT BRIDGE_AGENT_UPDATED_AT BRIDGE_AGENT_IDLE_TIMEOUT BRIDGE_AGENT_START_POLICY
   unset BRIDGE_AGENT_NOTIFY_KIND BRIDGE_AGENT_NOTIFY_TARGET BRIDGE_AGENT_NOTIFY_ACCOUNT
@@ -845,6 +847,11 @@ bridge_reset_roster_maps() {
   declare -g -A BRIDGE_AGENT_SOURCE=()
   declare -g -A BRIDGE_AGENT_META_FILE=()
   declare -g -A BRIDGE_AGENT_LOOP=()
+  # Issue #1795: disposability tag. Only auto-spawned throwaway dynamics
+  # (wave fixers / `--prefer new` workers, smoke children) set "1" at
+  # creation; operator-created dynamics + every static agent read "0" via
+  # bridge_agent_ephemeral. Absent/legacy ⇒ "0" ⇒ never reaped (fail-safe).
+  declare -g -A BRIDGE_AGENT_EPHEMERAL=()
   declare -g -A BRIDGE_AGENT_CONTINUE=()
   declare -g -A BRIDGE_AGENT_SESSION_ID=()
   declare -g -A BRIDGE_AGENT_SESSION_STALE_HINT=()
