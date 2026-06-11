@@ -8,7 +8,8 @@
 # protected-config write routing) stays in force.
 #
 # This smoke drives the REAL PreToolUse hook (hooks/tool-policy.py) end to end
-# and proves all 8 codex security teeth:
+# and proves all 9 codex security teeth (8 original + the PR #1810 r2
+# attacker-$TMPDIR hardening, Tooth 9):
 #
 #   Tooth 1 — spoofed SESSION-TYPE.md alone → treated as NON-admin. An agent
 #     that writes "session type: admin" into its own home (and even exports
@@ -31,6 +32,11 @@
 #   Tooth 8 — tilde / glob / sqlite3 sibling attempts → DENIED when containment
 #     is unprovable (glob over secrets, tilde + forbidden sibling, sqlite3
 #     against a non-task-db path).
+#   Tooth 9 — attacker-controlled $TMPDIR cannot make a PRODUCTION bridge home
+#     classify as test-temp (PR #1810 r2). With BRIDGE_HOME=<prod home> +
+#     TMPDIR=<its parent> + a forged self-admin roster, `_bridge_home_is_test_temp`
+#     is False, `is_trusted_admin_agent_for_guard` is NON-admin, and the 3a
+#     peer-write is DENIED end-to-end. The seam trusts only FIXED OS temp roots.
 #
 # The strict admin predicate (`is_trusted_admin_agent_for_guard`) reads the
 # controller roster via `agent list --json`. The smoke injects a deterministic
@@ -417,6 +423,80 @@ PYSEAM
 SEAM_OUT="$("$PYTHON_BIN" "$SEAM_PROBE" "$REAL_HOOK" "$FORGED_ROSTER" 2>&1)" \
   || { smoke_log "FAIL: seam-gate probe: $SEAM_OUT"; smoke_fail "seam-inert security check failed"; }
 smoke_log "ok: ${SEAM_OUT}"
+
+# ---------------------------------------------------------------------------
+# Tooth 9 (PR #1810 r2) — attacker-controlled $TMPDIR cannot make a PRODUCTION
+# bridge home classify as test-temp. This reproduces codex's exact escalation:
+# an attacker who controls the hook environment points BRIDGE_HOME at the REAL
+# production home and sets TMPDIR to the production home's PARENT, then injects
+# a forged BRIDGE_GUARD_ADMIN_ROSTER_JSON naming itself admin/static. Before the
+# r2 fix, `_bridge_home_is_test_temp()` appended $TMPDIR to its trusted prefix
+# set, so the production home matched → the forged roster was honored → the 3a
+# peer-write carve-out fired for a NON-admin. The seam now trusts only FIXED OS
+# temp roots, so this fails closed.
+#
+# Two layers of proof:
+#   (a) unit: with $TMPDIR = parent of a NON-temp home, `_bridge_home_is_test_temp`
+#       must be False and `is_trusted_admin_agent_for_guard` must be NON-admin.
+#   (b) end-to-end: the REAL hook, run with TMPDIR=<peer-home parent> + the
+#       forged roster, must DENY the 3a peer-write (mkdir <peer-home>/x).
+# ---------------------------------------------------------------------------
+TMPDIR_PROBE="$SMOKE_TMP_ROOT/tmpdir-attack-probe.py"
+cat >"$TMPDIR_PROBE" <<'PYTMP'
+import importlib.util, os, sys, pathlib
+spec = importlib.util.spec_from_file_location("tp", sys.argv[1])
+tp = importlib.util.module_from_spec(spec); sys.modules["tp"] = tp
+spec.loader.exec_module(tp)
+
+# Attacker scenario: BRIDGE_HOME = a non-temp "production" home; TMPDIR = its
+# parent (no fixed OS temp root involved at all).
+prod_home = "/Users/victim/.agent-bridge"
+os.environ["TMPDIR"] = "/Users/victim"
+tp.bridge_home_dir = lambda: pathlib.Path(prod_home)
+
+is_temp = tp._bridge_home_is_test_temp()
+assert is_temp is False, (
+    f"production home under attacker $TMPDIR must NOT classify test-temp: got {is_temp}"
+)
+
+# Even with the forged roster + self-admin env, the seam is inert → NON-admin.
+os.environ["BRIDGE_ADMIN_AGENT_ID"] = "attacker"
+os.environ["BRIDGE_GUARD_ADMIN_ROSTER_JSON"] = sys.argv[2]
+trusted = tp.is_trusted_admin_agent_for_guard("attacker")
+assert trusted is False, (
+    f"forged roster must stay inert despite attacker $TMPDIR: trusted={trusted}"
+)
+print(
+    "[ok] $TMPDIR=production-parent cannot make a production home test-temp; "
+    f"is_test_temp={is_temp} trusted_attacker={trusted}"
+)
+PYTMP
+TMPDIR_OUT="$("$PYTHON_BIN" "$TMPDIR_PROBE" "$REAL_HOOK" "$FORGED_ROSTER" 2>&1)" \
+  || { smoke_log "FAIL: tmpdir-attack probe: $TMPDIR_OUT"; smoke_fail "tmpdir-attack security check failed"; }
+smoke_log "ok: ${TMPDIR_OUT}"
+
+# End-to-end (b): drive the REAL hook with TMPDIR set to the peer-home parent
+# and the forged roster naming the caller admin/static. The peer-write (3a
+# mkdir into the peer home) must be DENIED — the forged-admin path is closed.
+# $BRIDGE_AGENT_HOME_ROOT (the parent of all agent homes) is the realistic
+# "production parent" an attacker would aim TMPDIR at to wrap a peer home.
+TMPDIR_E2E_PAYLOAD="$SMOKE_TMP_ROOT/tmpdir-e2e-payload.json"
+write_bash_payload "$TMPDIR_E2E_PAYLOAD" "mkdir -p $PEER_HOME/tmpdir-bypass-proof"
+TMPDIR_E2E_OUT="$(
+  HOME="$FAKE_HOME" \
+  TMPDIR="$BRIDGE_AGENT_HOME_ROOT" \
+  BRIDGE_AGENT_ID="$SPOOFER_AGENT" \
+  BRIDGE_ADMIN_AGENT_ID="$SPOOFER_AGENT" \
+  BRIDGE_GUARD_ADMIN_ROSTER_JSON="$FORGED_ROSTER" \
+    "$PYTHON_BIN" "$REAL_HOOK" <"$TMPDIR_E2E_PAYLOAD"
+)"
+if [[ "$TMPDIR_E2E_OUT" == *'"permissionDecision": "deny"'* ]]; then
+  smoke_log "ok: Tooth9 e2e attacker \$TMPDIR + forged roster peer mkdir DENIED"
+else
+  smoke_log "FAIL: Tooth9 e2e peer mkdir NOT denied under attacker \$TMPDIR"
+  smoke_log "      hook output: ${TMPDIR_E2E_OUT}"
+  smoke_fail "Tooth9: attacker \$TMPDIR forged-roster peer-write must be DENIED"
+fi
 
 smoke_log "passed"
 echo "[smoke:${SMOKE_NAME}] passed"

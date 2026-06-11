@@ -12,6 +12,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -363,33 +364,83 @@ def is_admin_agent(agent: str) -> bool:
 # and the command stays denied. This is the only predicate the #1806
 # loosenings consult.
 
-# Temp/test prefixes a sandboxed BRIDGE_HOME lives under (matches
+# Fixed OS temp roots a sandboxed BRIDGE_HOME may live under (matches
 # scripts/smoke-test.sh's own non-temp refusal guard). The roster-JSON test
 # seam is honored ONLY when the bridge home resolves under one of these, so the
 # seam is inert in a production install (`~/.agent-bridge`).
+#
+# SECURITY (PR #1810 r2): these are *fixed* roots only — never a value read
+# from an attacker-controllable env var. An earlier revision appended
+# ``$TMPDIR`` to this set, which let an attacker who controls the hook
+# environment set ``TMPDIR`` to the parent of the real production home
+# (e.g. ``TMPDIR=/Users/sean`` with ``BRIDGE_HOME=/Users/sean/.agent-bridge``)
+# and thereby make the *production* home classify as test-temp — honoring a
+# forged ``BRIDGE_GUARD_ADMIN_ROSTER_JSON`` and spoofing admin. `$TMPDIR` is
+# deliberately NOT trusted as a root here. ``tempfile.gettempdir()`` is
+# consulted only as an additional *fixed* root after its own realpath is proven
+# to resolve under one of these canonical roots, so it cannot be repointed at a
+# production path.
 _TEST_TEMP_PREFIXES = ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders")
 
 
+def _fixed_temp_roots() -> list[str]:
+    """Return canonical (realpath'd) fixed OS temp roots the seam may trust.
+
+    Only ``_TEST_TEMP_PREFIXES`` plus ``tempfile.gettempdir()`` — and the
+    latter ONLY when its own realpath already resolves under one of the fixed
+    prefixes, so a repointed ``$TMPDIR`` (which ``gettempdir()`` honors) cannot
+    smuggle in a production root. No raw env var is ever trusted as a root.
+    """
+    roots: list[str] = []
+    seen: set[str] = set()
+
+    def _add(real: str) -> None:
+        if real and real not in seen:
+            seen.add(real)
+            roots.append(real)
+
+    fixed_reals: list[str] = []
+    for prefix in _TEST_TEMP_PREFIXES:
+        try:
+            real = os.path.realpath(prefix)
+        except OSError:
+            continue
+        fixed_reals.append(real)
+        _add(real)
+
+    # tempfile.gettempdir() reflects $TMPDIR; accept it only if it canonically
+    # lands under one of the fixed roots above. This keeps "the OS temp dir"
+    # working on platforms whose realpath differs while refusing an attacker's
+    # production-parent $TMPDIR.
+    try:
+        gtmp = os.path.realpath(tempfile.gettempdir())
+    except OSError:
+        gtmp = ""
+    if gtmp:
+        for real in fixed_reals:
+            if gtmp == real or gtmp.startswith(real.rstrip("/") + "/"):
+                _add(gtmp)
+                break
+    return roots
+
+
 def _bridge_home_is_test_temp() -> bool:
-    """True iff the resolved bridge home sits under a temp/test prefix.
+    """True iff the resolved bridge home sits under a FIXED OS temp root.
 
     Used to gate the ``BRIDGE_GUARD_ADMIN_ROSTER_JSON`` seam so it is honored
     only inside the smoke sandbox; a production session ignores the env var.
+
+    The trusted roots are fixed (``_fixed_temp_roots``); no env var (notably
+    ``$TMPDIR``) can repoint them at a production path. Both the candidate home
+    and the roots are canonicalized with ``os.path.realpath`` and containment
+    is required.
     """
-    candidates = list(_TEST_TEMP_PREFIXES)
-    tmpdir = os.environ.get("TMPDIR", "").strip()
-    if tmpdir:
-        candidates.append(tmpdir)
     try:
-        home = str(bridge_home_dir().resolve())
+        home = os.path.realpath(str(bridge_home_dir()))
     except (OSError, RuntimeError):
         return False
-    for prefix in candidates:
-        try:
-            pref = str(Path(prefix).resolve())
-        except (OSError, RuntimeError):
-            pref = prefix.rstrip("/")
-        if home == pref or home.startswith(pref.rstrip("/") + "/"):
+    for root in _fixed_temp_roots():
+        if home == root or home.startswith(root.rstrip("/") + "/"):
             return True
     return False
 
