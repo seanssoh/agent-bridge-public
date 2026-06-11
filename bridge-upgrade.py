@@ -1202,6 +1202,9 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
         "updated_files": sum(len(item.updated_files) for item in results),
         "rematerialized_files": sum(len((item.rematerialize or {}).get("updated_paths") or []) for item in results),
         "scaffold_files": sum(len((item.rematerialize or {}).get("scaffold_paths") or []) for item in results),
+        # Issue #1781: agent-written state files kept (not overwritten) but
+        # still captured in the targeted backup. Surfaced for operator audit.
+        "preserved_files": sum(len((item.rematerialize or {}).get("preserved_paths") or []) for item in results),
         "agents": [asdict(item) for item in results],
     }
     return emit_json(payload, 0)
@@ -1337,6 +1340,16 @@ def build_backup_entries(
             # are add-missing-only (absent in live pre-apply); record them so a
             # rollback removes them, mirroring the rematerialize updated_paths.
             for relpath in rematerialize_payload.get("scaffold_paths") or []:
+                remember(str(relpath), "file")
+            # Issue #1781: agent-written state files (workdir MEMORY.md,
+            # users/<id>/MEMORY.md) are NEVER overwritten by rematerialization,
+            # but they must stay in the targeted backup set regardless of the
+            # fix — the issue credits that backup for the full recovery of the
+            # 13 clobbered agents. Capture the live (current) workdir copy so a
+            # future regression that re-introduces the home->workdir clobber is
+            # still recoverable, and so an operator-driven rollback restores the
+            # exact pre-upgrade memory.
+            for relpath in rematerialize_payload.get("preserved_paths") or []:
                 remember(str(relpath), "file")
 
     remember("state/upgrade/last-upgrade.json", "file")

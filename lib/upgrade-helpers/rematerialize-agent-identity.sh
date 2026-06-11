@@ -29,9 +29,28 @@ dry_run="${5:-0}"
 declare -a REMAT_CHANGED_FILE_ARGS=("${@:6}")
 
 declare -a REMAT_UPDATED_PATHS=()
+declare -a REMAT_PRESERVED_PATHS=()
 declare -a REMAT_SCAFFOLD_PATHS=()
 declare -a REMAT_ERRORS=()
 declare -a REMAT_CHANGED_FILES=()
+
+# Issue #1781 (DATA-LOSS): `MEMORY.md` is AGENT-WRITTEN state, not a managed
+# doc. The memory-daily cron and live sessions append to the WORKDIR copy; the
+# identity-source (home) copy is frequently the stale one. Copying home ->
+# workdir like the other identity docs silently rolled live memory back to the
+# stale home copy on EVERY upgrade (13/22 agents on one host, byte-identical to
+# the older home copy). State files are therefore NEVER synced here — they are
+# only RECORDED as `preserved_paths` so the upgrade's targeted backup still
+# captures the live workdir copy (the recovery anchor the issue credits — keep
+# it regardless of the fix). The match is on the basename so it also excludes
+# `users/<id>/MEMORY.md` inside the users-tree walk below. Same data-loss
+# family as the #1756 PRESERVED_USER_KEYS settings-rerender class.
+_remat_is_state_file() {
+  case "${1##*/}" in
+    MEMORY.md) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 status="applied"
 skipped_reason=""
@@ -39,11 +58,13 @@ source_dir=""
 target_dir=""
 
 _remat_tmp_paths=""
+_remat_tmp_preserved=""
 _remat_tmp_scaffold=""
 _remat_tmp_errors=""
 _remat_tmp_user_files=""
 cleanup() {
   [[ -n "$_remat_tmp_paths" ]] && rm -f -- "$_remat_tmp_paths"
+  [[ -n "$_remat_tmp_preserved" ]] && rm -f -- "$_remat_tmp_preserved"
   [[ -n "$_remat_tmp_scaffold" ]] && rm -f -- "$_remat_tmp_scaffold"
   [[ -n "$_remat_tmp_errors" ]] && rm -f -- "$_remat_tmp_errors"
   [[ -n "$_remat_tmp_user_files" ]] && rm -f -- "$_remat_tmp_user_files"
@@ -55,8 +76,22 @@ _remat_add_error() {
   REMAT_ERRORS+=("$1")
 }
 
+# Emit one named audit line per file the migration writes outside its own
+# managed marker block, so the upgrade output shows WHAT moved instead of only
+# leaving an mtime trace (Issue #1781 scope item 3). `action` is one of
+# `rematerialize` (identity doc home->workdir) or `preserve` (state file kept).
+# Best-effort: a logging failure never affects the copy outcome.
+_remat_audit_line() {
+  local action="$1" target_rel="$2"
+  printf '[rematerialize] agent=%s %s %s\n' "$agent" "$action" "$target_rel" >&2
+}
+
 _remat_emit_json() {
   _remat_tmp_paths="$(mktemp "${TMPDIR:-/tmp}/agb-remat-paths.XXXXXX")" || {
+    printf '{"agent":"%s","status":"error","source_dir":"","target_dir":"","updated_paths":[],"errors":["mktemp failed"]}\n' "$agent"
+    return 0
+  }
+  _remat_tmp_preserved="$(mktemp "${TMPDIR:-/tmp}/agb-remat-preserved.XXXXXX")" || {
     printf '{"agent":"%s","status":"error","source_dir":"","target_dir":"","updated_paths":[],"errors":["mktemp failed"]}\n' "$agent"
     return 0
   }
@@ -69,11 +104,15 @@ _remat_emit_json() {
     return 0
   }
   : >"$_remat_tmp_paths"
+  : >"$_remat_tmp_preserved"
   : >"$_remat_tmp_scaffold"
   : >"$_remat_tmp_errors"
   local item=""
   for item in "${REMAT_UPDATED_PATHS[@]}"; do
     printf '%s\n' "$item" >>"$_remat_tmp_paths"
+  done
+  for item in "${REMAT_PRESERVED_PATHS[@]}"; do
+    printf '%s\n' "$item" >>"$_remat_tmp_preserved"
   done
   for item in "${REMAT_SCAFFOLD_PATHS[@]}"; do
     printf '%s\n' "$item" >>"$_remat_tmp_scaffold"
@@ -86,7 +125,7 @@ import json
 import sys
 from pathlib import Path
 
-agent, status, source_dir, target_dir, skipped_reason, dry_run, paths_file, scaffold_file, errors_file = sys.argv[1:]
+agent, status, source_dir, target_dir, skipped_reason, dry_run, paths_file, preserved_file, scaffold_file, errors_file = sys.argv[1:]
 
 def read_lines(path):
     try:
@@ -95,6 +134,7 @@ def read_lines(path):
         return []
 
 scaffold_paths = read_lines(scaffold_file)
+preserved_paths = read_lines(preserved_file)
 payload = {
     "agent": agent,
     "status": status,
@@ -102,6 +142,10 @@ payload = {
     "target_dir": target_dir,
     "dry_run": dry_run == "1",
     "updated_paths": read_lines(paths_file),
+    # Issue #1781: agent-written state files (MEMORY.md, users/<id>/MEMORY.md)
+    # are NEVER copied home->workdir, but they ARE reported here so the
+    # targeted upgrade backup still captures the live workdir copy.
+    "preserved_paths": preserved_paths,
     "scaffold_paths": scaffold_paths,
     "scaffold_added": len(scaffold_paths),
 }
@@ -111,7 +155,7 @@ if skipped_reason:
 if errors:
     payload["errors"] = errors
 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-' "$agent" "$status" "$source_dir" "$target_dir" "$skipped_reason" "$dry_run" "$_remat_tmp_paths" "$_remat_tmp_scaffold" "$_remat_tmp_errors"
+' "$agent" "$status" "$source_dir" "$target_dir" "$skipped_reason" "$dry_run" "$_remat_tmp_paths" "$_remat_tmp_preserved" "$_remat_tmp_scaffold" "$_remat_tmp_errors"
 }
 
 _remat_finish() {
@@ -455,6 +499,26 @@ _remat_copy_one_file() {
   local force_plan=0
   target_rel="$(_remat_rel_to_target_root "$dst")"
 
+  # Issue #1781 (DATA-LOSS): agent-written state files must never be OVERWRITTEN
+  # home->workdir (that silently rolled live memory back to the stale home copy
+  # on every upgrade). But create-if-absent is still required: a fresh/legacy
+  # workdir with no MEMORY.md yet must receive the initial copy from the profile
+  # seed, or the runtime contract that Claude requires MEMORY.md
+  # (bridge-watchdog.py) breaks. So:
+  #   - dst present (file or symlink) -> PRESERVE: record the LIVE workdir copy
+  #     as a preserved path (so the upgrade backup still captures it) and never
+  #     touch it.
+  #   - dst absent -> fall through to the normal copy gate below, which
+  #     materializes the initial file when src exists (recording updated_paths +
+  #     auditing `rematerialize`) and no-ops when src is also absent.
+  # Reached for both the named-file loop and the users-tree walk, so
+  # `users/<id>/MEMORY.md` is covered by the same basename guard.
+  if _remat_is_state_file "$rel" && { [[ -e "$dst" ]] || [[ -L "$dst" ]]; }; then
+    REMAT_PRESERVED_PATHS+=("$target_rel")
+    _remat_audit_line preserve "$target_rel"
+    return 0
+  fi
+
   if _remat_changed_file_is_planned "$rel"; then
     force_plan=1
   fi
@@ -468,6 +532,7 @@ _remat_copy_one_file() {
     return 0
   fi
   REMAT_UPDATED_PATHS+=("$target_rel")
+  _remat_audit_line rematerialize "$target_rel"
   if [[ "$dry_run" == "1" ]]; then
     return 0
   fi
@@ -611,6 +676,11 @@ declare -a REMAT_SCAFFOLD_EXCLUDE=(
   "codex/AGENTS.md"
 )
 
+# Identity files synced home -> workdir. `MEMORY.md` stays in this list so the
+# loop visits it and records the live workdir copy in `preserved_paths` for
+# backup coverage — but `_remat_copy_one_file` short-circuits it (Issue #1781):
+# it is agent-written STATE and is never overwritten. Every other entry is a
+# managed DOC the migration owns and may refresh from the identity source.
 declare -a remat_names=(
   "SOUL.md"
   "SESSION-TYPE.md"
