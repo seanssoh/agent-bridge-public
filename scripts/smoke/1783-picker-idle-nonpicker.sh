@@ -172,6 +172,18 @@ CODEX_FOREGROUND_FOOTER_BELOW=$'Proceed with action?\n› Yes, continue\n› No,
 #    second-round guard: ordinary scrollback above the tail composer is ignored.
 CLAUDE_STALE_SCROLLBACK=$'earlier run:\n  1. did thing\n  2. did other\nall done — press enter\n──────────────────── agent ──\n❯\n────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n'
 CODEX_STALE_SCROLLBACK=$'earlier:\n  1. option a\n  2. option b\n›\n\n  gpt-5.5 xhigh fast · ~/.agent-bridge/data/agents/x/workdir\n'
+# #1800: Claude echoes every submitted prompt into the transcript as
+# '❯ <submitted text>' (the echo of a daemon nudge). On any agent that has
+# processed >=1 nudge — i.e. nearly the whole queue-driven fleet — a LONE
+# '❯ [Agent Bridge] task #NNNN: …' line sits above the idle composer, followed
+# by ordinary transcript ('⏺ …' / prose). The v0.16.9 bare-caret above-composer
+# regex matched this echo and refused the idle exclusion → the pane re-entered
+# unknown → unknown_stuck → escalate, re-opening the #1783 storm. This MUST
+# classify as idle non_picker (the lone caret block is NOT an option group).
+CLAUDE_ECHOED_PROMPT=$'❯ [Agent Bridge] task #4242: do X\n⏺ working on it…\n  reviewed the file and applied the edit\n\n──────────────────── agent ──\n❯\n────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n'
+# A multi-nudge transcript: several echoed prompts interleaved with output, all
+# above a clean idle composer — the steady-state shape of a long-running agent.
+CLAUDE_ECHOED_MULTI=$'❯ [Agent Bridge] task #4100: first thing\n⏺ done\n\n❯ [Agent Bridge] task #4242: second thing\n⏺ also done\n  wrote the file\n\n──────────────────── agent ──\n❯\n────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n'
 
 # ---------------------------------------------------------------------
 # A3 — composite/foreground guard (queue codex review): a FOREGROUND picker (idle
@@ -212,6 +224,16 @@ test_a3_composite_pane_not_shadowed() {
   local codex_composite_above=$'Proceed with action?\n› Yes, continue\n  No, cancel\n\n›\n\n  gpt-5.5 xhigh fast · ~/.agent-bridge/data/agents/x/workdir\n'
   d="$(classify_shipped codex "$codex_composite_above")"
   smoke_assert_eq "false" "$(json_field "$d" non_picker)" "A3: codex composite (live selector above empty composer) NOT excluded"
+
+  # #1800: Claude's echoed submitted-prompt line ('❯ [Agent Bridge] task #…')
+  # above the idle composer is a LONE caret followed by transcript — NOT an
+  # option group — so the idle exclusion must STAND (fail-OPEN direction). This
+  # is the single most representative idle capture on a queue-driven install.
+  d="$(classify_shipped claude "$CLAUDE_ECHOED_PROMPT")"
+  smoke_assert_eq "true"  "$(json_field "$d" non_picker)" "A3: #1800 echoed-prompt above idle composer → idle non_picker (no false escalation)"
+  smoke_assert_eq "claude-idle-ready" "$(json_field "$d" picker_id)" "A3: #1800 echoed-prompt resolves the idle entry"
+  d="$(classify_shipped claude "$CLAUDE_ECHOED_MULTI")"
+  smoke_assert_eq "true"  "$(json_field "$d" non_picker)" "A3: #1800 multi-nudge echoed-prompt transcript → idle non_picker"
 
   # Stale menu-like scrollback ABOVE a tail idle composer → still non_picker.
   d="$(classify_shipped claude "$CLAUDE_STALE_SCROLLBACK")"
@@ -448,6 +470,18 @@ test_a4_composite_escalates_e2e() {
     resolve_tick "agentStaleC" "sStaleC" "claude" "$CLAUDE_STALE_SCROLLBACK"
   done
   smoke_assert_eq "$b3" "$(count_escalations)" "A4: idle + stale scrollback NEVER escalates (non_picker)"
+
+  # #1800 end-to-end: a Claude idle composer carrying an ECHOED submitted-prompt
+  # line in scrollback (the steady state of every nudged agent) must NEVER
+  # escalate across ticks — the v0.16.9 regression escalated exactly this shape.
+  python3 "$PICKER_PY" clear-unknown --session sEchoC --state-dir "$BRIDGE_PICKER_STATE_DIR" >/dev/null 2>&1 || true
+  local b5; b5="$(count_escalations)"
+  for i in 1 2 3 4; do
+    SMOKE_KEYS=""
+    resolve_tick "agentEchoC" "sEchoC" "claude" "$CLAUDE_ECHOED_PROMPT"
+    smoke_assert_eq "" "${SMOKE_KEYS:-}" "A4: #1800 echoed-prompt idle sends ZERO keystrokes (tick $i)"
+  done
+  smoke_assert_eq "$b5" "$(count_escalations)" "A4: #1800 echoed-prompt idle NEVER escalates (non_picker) — the v0.16.9 storm is closed"
 
   export BRIDGE_PICKER_LOCAL_CATALOG="/nonexistent-local-catalog.json"
 }
