@@ -71,11 +71,34 @@ import time
 
 
 def workdir_slug_candidates(path: str):
+    # Claude Code names its per-project transcript dir
+    # (~/.claude/projects/<slug>/) by replacing characters in the cwd path
+    # with "-". The exact set is version-dependent, so we emit several
+    # candidates and let the caller pick whichever dir actually exists on
+    # disk:
+    #   slash_only    — "/" only (oldest behavior).
+    #   slash_and_dot — "/" and "." (the documented design; preserves "_",
+    #                   matching Claude Code versions after the #30828 fix).
+    #   slash_dot_us  — "/", ".", and "_" (issue #1807): some shipped Claude
+    #                   Code versions also map "_" → "-" (the #30828 bug,
+    #                   confirmed live on cm-prod across a v0.16.9 restart:
+    #                   ".../agents/test_clean/workdir" lands on disk as
+    #                   "...-agents-test-clean-workdir"). Without this
+    #                   candidate, any agent whose workdir contains "_" never
+    #                   matched its real project dir → 0 transcripts → rc=1 →
+    #                   fresh launch instead of --resume.
+    # We deliberately do NOT add a greedy "all non-[a-zA-Z0-9-]" candidate:
+    # agent workdir paths are bridge-controlled and only ever contain
+    # alnum / "/" / "." / "_" / "-", and a broader slug risks colliding with
+    # a different agent's project dir (candidates are tried in order, first
+    # existing dir wins). De-dupe so identical slugs are not scanned twice.
     slash_only = path.replace("/", "-")
     slash_and_dot = re.sub(r"[/.]", "-", path)
-    candidates = [slash_only]
-    if slash_and_dot != slash_only:
-        candidates.append(slash_and_dot)
+    slash_dot_us = re.sub(r"[/._]", "-", path)
+    candidates = []
+    for slug in (slash_only, slash_and_dot, slash_dot_us):
+        if slug not in candidates:
+            candidates.append(slug)
     return candidates
 
 
