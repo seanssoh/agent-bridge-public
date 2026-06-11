@@ -32,7 +32,12 @@ DEPRECATED_SHARED_FILES = (
     "SYRS-RULES.md",
     "SYRS-USER.md",
 )
-AGENT_RUNTIME_REWRITE_FILES = ("SOUL.md", "HEARTBEAT.md", "CHECKLIST.md", "MEMORY.md")
+# Identity/doc files the migration may rewrite in place (legacy ~/.openclaw
+# path normalization). Issue #1781: `MEMORY.md` is AGENT-WRITTEN state, not a
+# managed doc — the doc-migration must not rewrite it (even an in-place legacy
+# path rewrite mutates live agent memory). It is intentionally absent here; the
+# `memory/` tree and `users/<id>/MEMORY.md` are likewise never doc-rewritten.
+AGENT_RUNTIME_REWRITE_FILES = ("SOUL.md", "HEARTBEAT.md", "CHECKLIST.md")
 SHARED_CLAUDE_SKILL_NAMES = (
     "agent-bridge-runtime",
     "agent-bridge-operating-manual",

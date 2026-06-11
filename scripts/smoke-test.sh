@@ -12006,6 +12006,13 @@ bash "$REPO_ROOT/scripts/smoke/v2-scaffold-home-and-workdir.sh"
 log "running upgrade-migrate-rematerialize-workdir smoke (issue #10370)"
 bash "$REPO_ROOT/scripts/smoke/upgrade-migrate-rematerialize-workdir.sh"
 
+# Issue #1781 (DATA-LOSS) — the same HOME->workdir identity sync must NOT
+# overwrite agent-written MEMORY.md / users/<id>/MEMORY.md with the stale home
+# copy (it silently rolled live memory back on every upgrade), and the
+# preserved workdir copies must stay in the targeted backup set.
+log "running 1781-doc-migration-memory-preserve smoke (issue #1781)"
+bash "$REPO_ROOT/scripts/smoke/1781-doc-migration-memory-preserve.sh"
+
 # Issue #1238 — v0.15.0-beta1 fresh `agent create --isolate` scaffolded
 # the per-agent home tree (`SOUL.md`, `CLAUDE.md`, `.claude/`, etc.)
 # under the controller's umask and `bridge_linux_prepare_agent_isolation`
