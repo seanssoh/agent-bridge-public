@@ -280,12 +280,17 @@ _bridge_wave_dispatch_member() {
 
   # 1. Spawn the worker. --prefer new builds an isolated worktree under
   #    BRIDGE_WORKTREE_ROOT and records metadata under state/worktrees/.
+  #    Issue #1795: a wave fixer is a throwaway disposable worker, so tag it
+  #    --ephemeral. That is what lets the daemon's idle reaper GC it once it
+  #    has gone detached + queue-empty + idle; operator-created dynamics (which
+  #    omit the flag) stay reap-exempt.
   if ! "$BRIDGE_BASH_BIN" "$ab_bin" \
         "--${worker_engine}" \
         --name "$worker_name" \
         --workdir "$repo_root" \
         --prefer new \
         --no-attach \
+        --ephemeral \
         >"$spawn_log" 2>&1; then
     bridge_warn "wave dispatch: worker spawn failed for $member_id (engine=$worker_engine, see $spawn_log)"
     return 1

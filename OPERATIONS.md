@@ -691,6 +691,44 @@ Default is `--dry-run`; pass `--apply` to actually run `git worktree remove
 -f`. See `agb worktree doctor --help` for `--target-branch`, `--max-age-days`,
 `--include-stale`, and `--prune-branches`.
 
+### Idle dynamic-agent reaper (`BRIDGE_DYNAMIC_IDLE_REAP_SECONDS`)
+
+The daemon garbage-collects **auto-spawned throwaway** dynamic workers (wave
+fixers / `--prefer new` workers and smoke children, created with
+`agb --codex|--claude ... --ephemeral`) once they have been detached,
+queue-empty, and tmux-idle for at least `BRIDGE_DYNAMIC_IDLE_REAP_SECONDS`
+(default `3600`). On reap the worker's tmux session is killed and its roster
+entry removed.
+
+The reaper is deliberately conservative (issue #1795):
+
+- **Operator-created dynamics are never reaped.** Any dynamic spawned
+  interactively (`agb --codex --name <x>` *without* `--ephemeral`) is tagged
+  non-ephemeral and is skipped regardless of how long it has been idle —
+  attached or not.
+- **`loop=1` (`--loop`) dynamics are never reaped**, even if also marked
+  ephemeral: a relaunch-loop agent exists to be re-woken, so reaping it would
+  void the loop contract.
+- **Migration fail-safe.** A roster entry written before this field existed has
+  no ephemeral tag; it reads as non-ephemeral and is therefore *not* reaped.
+  Disposability must be proven (`ephemeral=1`) before the daemon will GC.
+
+When the reaper considers an idle agent and deliberately spares it, it logs a
+one-line `reaper kept idle dynamic <agent> (...)` audit so you can confirm the
+policy fired.
+
+Set the threshold to `0` to **disable the reaper entirely** (no GC of any
+dynamic worker). The supported way to tune or disable it durably is:
+
+```bash
+agb config set-env BRIDGE_DYNAMIC_IDLE_REAP_SECONDS=0     # disable
+agb config set-env BRIDGE_DYNAMIC_IDLE_REAP_SECONDS=7200  # 2h threshold
+```
+
+`set-env` writes the managed install-env-override file the daemon reloads each
+sync cycle, so no restart is required — the next reconciliation pass picks up
+the new value.
+
 ## A2A Cross-Bridge Handoff
 
 A2A lets an agent on one Agent Bridge install enqueue a task directly into

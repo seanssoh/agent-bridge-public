@@ -10616,6 +10616,23 @@ bridge_agent_loop() {
   printf '%s' "${BRIDGE_AGENT_LOOP[$agent]-1}"
 }
 
+# Issue #1795: disposability tag. Only auto-spawned throwaway dynamics (wave
+# fixers / `--prefer new` worktree workers, smoke children) are tagged
+# `ephemeral=1` AT CREATION; operator-created interactive dynamics and every
+# static agent read as `0`. The idle reaper (reap_idle_dynamic_agents) gates
+# its kill on this returning exactly "1" — absent/unknown/legacy ⇒ "0" ⇒ never
+# reaped (the indeterminate-is-conservative migration fail-safe). Mirrors the
+# bridge_agent_loop guard so an undeclared/scalar-clobbered map degrades to the
+# default instead of aborting under `set -u`.
+bridge_agent_ephemeral() {
+  local agent="$1"
+  if ! bridge_var_is_assoc BRIDGE_AGENT_EPHEMERAL; then
+    printf '%s' '0'
+    return 0
+  fi
+  printf '%s' "${BRIDGE_AGENT_EPHEMERAL[$agent]-0}"
+}
+
 bridge_agent_continue() {
   local agent="$1"
   # #1627 follow-up: see bridge_agent_source — guard the arithmetic-index read so

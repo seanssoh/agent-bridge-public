@@ -660,7 +660,8 @@ bridge_ensure_roster_maps_assoc() {
   local _m
   for _m in BRIDGE_AGENT_DESC BRIDGE_AGENT_ENGINE BRIDGE_AGENT_SESSION \
             BRIDGE_AGENT_WORKDIR BRIDGE_AGENT_SOURCE BRIDGE_AGENT_META_FILE \
-            BRIDGE_AGENT_PROVENANCE BRIDGE_AGENT_LOOP BRIDGE_AGENT_CONTINUE \
+            BRIDGE_AGENT_PROVENANCE BRIDGE_AGENT_LOOP BRIDGE_AGENT_EPHEMERAL \
+            BRIDGE_AGENT_CONTINUE \
             BRIDGE_AGENT_SESSION_ID BRIDGE_AGENT_HISTORY_KEY \
             BRIDGE_AGENT_CREATED_AT BRIDGE_AGENT_UPDATED_AT; do
     if ! declare -p "$_m" 2>/dev/null | grep -q 'declare -[A-Za-z]*A'; then
@@ -678,6 +679,7 @@ bridge_load_dynamic_agent_file() {
   local AGENT_SESSION=""
   local AGENT_WORKDIR=""
   local AGENT_LOOP=""
+  local AGENT_EPHEMERAL=""
   local AGENT_CONTINUE=""
   local AGENT_SESSION_ID=""
   local AGENT_HISTORY_KEY=""
@@ -737,6 +739,9 @@ bridge_load_dynamic_agent_file() {
   # report which loader made this id known.
   BRIDGE_AGENT_PROVENANCE["$AGENT_ID"]="dynamic-active-env"
   BRIDGE_AGENT_LOOP["$AGENT_ID"]="${AGENT_LOOP:-1}"
+  # Issue #1795: legacy active-env entries lack AGENT_EPHEMERAL ⇒ default "0"
+  # ⇒ treated as operator-created / non-disposable ⇒ never reaped.
+  BRIDGE_AGENT_EPHEMERAL["$AGENT_ID"]="${AGENT_EPHEMERAL:-0}"
   BRIDGE_AGENT_CONTINUE["$AGENT_ID"]="${AGENT_CONTINUE:-1}"
   # Hydration: gate the stored id through the freshness resolver. rc=0 keeps
   # the candidate, rc=2 swaps in a fresher transcript for the same workdir,
@@ -771,6 +776,7 @@ bridge_restore_dynamic_agents_from_history() {
   local AGENT_SESSION=""
   local AGENT_WORKDIR=""
   local AGENT_LOOP=""
+  local AGENT_EPHEMERAL=""
   local AGENT_CONTINUE=""
   local AGENT_SESSION_ID=""
   local AGENT_HISTORY_KEY=""
@@ -785,6 +791,7 @@ bridge_restore_dynamic_agents_from_history() {
     AGENT_SESSION=""
     AGENT_WORKDIR=""
     AGENT_LOOP=""
+    AGENT_EPHEMERAL=""
     AGENT_CONTINUE=""
     AGENT_SESSION_ID=""
     AGENT_HISTORY_KEY=""
@@ -815,6 +822,9 @@ bridge_restore_dynamic_agents_from_history() {
     # whose tmux session is currently live.
     BRIDGE_AGENT_PROVENANCE["$AGENT_ID"]="dynamic-history-live-session"
     BRIDGE_AGENT_LOOP["$AGENT_ID"]="${AGENT_LOOP:-1}"
+    # Issue #1795: see bridge_load_dynamic_agent_file — legacy history entries
+    # lack AGENT_EPHEMERAL ⇒ default "0" ⇒ never reaped.
+    BRIDGE_AGENT_EPHEMERAL["$AGENT_ID"]="${AGENT_EPHEMERAL:-0}"
     BRIDGE_AGENT_CONTINUE["$AGENT_ID"]="${AGENT_CONTINUE:-1}"
     # Hydration: gate stored id through resolver (see bridge_load_dynamic_agent_file).
     local _accepted="" _rc=0
@@ -902,6 +912,9 @@ bridge_reconcile_dynamic_agents_from_tmux() {
     # history file produced a registration, so the only signal is tmux.
     BRIDGE_AGENT_PROVENANCE["$session"]="dynamic-tmux-recovered"
     BRIDGE_AGENT_LOOP["$session"]="1"
+    # Issue #1795: pane-derived recovery has no disposability signal ⇒ default
+    # to "0" (non-ephemeral) so a recovered agent is never reaped.
+    BRIDGE_AGENT_EPHEMERAL["$session"]="0"
     BRIDGE_AGENT_CONTINUE["$session"]="1"
     BRIDGE_AGENT_SESSION_ID["$session"]=""
     BRIDGE_AGENT_HISTORY_KEY["$session"]="$(bridge_history_key_for "$derived_engine" "$session" "$pane_path")"
@@ -949,6 +962,7 @@ _bridge_register_dynamic_from_env_file() {
   local AGENT_SESSION=""
   local AGENT_WORKDIR=""
   local AGENT_LOOP=""
+  local AGENT_EPHEMERAL=""
   local AGENT_CONTINUE=""
   local AGENT_SESSION_ID=""
   local AGENT_HISTORY_KEY=""
@@ -976,6 +990,9 @@ _bridge_register_dynamic_from_env_file() {
   # discovery signal; the history env file just supplies engine/workdir).
   BRIDGE_AGENT_PROVENANCE["$AGENT_ID"]="dynamic-tmux-recovered"
   BRIDGE_AGENT_LOOP["$AGENT_ID"]="${AGENT_LOOP:-1}"
+  # Issue #1795: see bridge_load_dynamic_agent_file — a history env file that
+  # predates the field reads AGENT_EPHEMERAL="" ⇒ default "0" ⇒ never reaped.
+  BRIDGE_AGENT_EPHEMERAL["$AGENT_ID"]="${AGENT_EPHEMERAL:-0}"
   BRIDGE_AGENT_CONTINUE["$AGENT_ID"]="${AGENT_CONTINUE:-1}"
   # Hydration: gate the stored id through the freshness resolver. rc=0 keeps
   # the candidate, rc=2 swaps in a fresher transcript for the same workdir,
@@ -1958,13 +1975,17 @@ bridge_state_sudo_install_v2_file() {
 bridge_write_agent_state_file() {
   local agent="$1"
   local file="$2"
-  local desc engine session workdir loop_mode continue_mode session_id history_key created_at updated_at
+  local desc engine session workdir loop_mode ephemeral continue_mode session_id history_key created_at updated_at
 
   desc="$(bridge_agent_desc "$agent")"
   engine="$(bridge_agent_engine "$agent")"
   session="$(bridge_agent_session "$agent")"
   workdir="$(bridge_agent_workdir "$agent")"
   loop_mode="$(bridge_agent_loop "$agent")"
+  # Issue #1795: persist the disposability tag so the daemon reloads it each
+  # sync cycle. Absent in a legacy on-disk entry ⇒ bridge_agent_ephemeral
+  # returns "0" ⇒ never reaped (migration fail-safe).
+  ephemeral="$(bridge_agent_ephemeral "$agent")"
   continue_mode="$(bridge_agent_continue "$agent")"
   session_id="$(bridge_agent_session_id "$agent")"
   history_key="$(bridge_agent_history_key "$agent")"
@@ -1986,6 +2007,7 @@ AGENT_ENGINE=$(printf '%q' "$engine")
 AGENT_SESSION=$(printf '%q' "$session")
 AGENT_WORKDIR=$(printf '%q' "$workdir")
 AGENT_LOOP=$(printf '%q' "$loop_mode")
+AGENT_EPHEMERAL=$(printf '%q' "$ephemeral")
 AGENT_CONTINUE=$(printf '%q' "$continue_mode")
 AGENT_SESSION_ID=$(printf '%q' "$session_id")
 AGENT_HISTORY_KEY=$(printf '%q' "$history_key")

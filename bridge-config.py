@@ -107,6 +107,10 @@ ALLOWED_CALLER_SOURCES = frozenset(
 ENV_KEY_TYPE_POS_INT = "pos_int"
 ENV_KEY_TYPE_POS_FLOAT = "pos_float"
 ENV_KEY_TYPE_INT_MIN2 = "int_min2"
+#   "non_neg_int" — integer >= 0, where 0 is a meaningful "disable" sentinel
+#                   (e.g. BRIDGE_DYNAMIC_IDLE_REAP_SECONDS=0 turns the reaper
+#                   off). Distinct from pos_int, which floors at 1.
+ENV_KEY_TYPE_NON_NEG_INT = "non_neg_int"
 
 # NARROW allowlist. Each entry was confirmed to be read from `os.environ`
 # (not a JSON config field) and to be a non-secret operational timing /
@@ -125,6 +129,7 @@ ENV_KEY_TYPE_INT_MIN2 = "int_min2"
 #   BRIDGE_A2A_RECEIVER_RESTART_WINDOW_SECONDS bridge-status.py:1653        (int seconds)
 #   BRIDGE_A2A_RECEIVER_STALENESS_CLAIM_STALE_SECONDS
 #                                            lib/daemon-helpers/a2a-receiver-staleness.py:383 (int seconds)
+#   BRIDGE_DYNAMIC_IDLE_REAP_SECONDS         bridge-daemon.sh:reap_idle_dynamic_agents (int>=0; 0 disables)
 ENV_KEY_ALLOWLIST: dict[str, str] = {
     "BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS": ENV_KEY_TYPE_POS_INT,
     "BRIDGE_A2A_RECONCILE_INTERVAL": ENV_KEY_TYPE_POS_INT,
@@ -134,6 +139,11 @@ ENV_KEY_ALLOWLIST: dict[str, str] = {
     "BRIDGE_A2A_RECEIVER_MAX_RESTARTS": ENV_KEY_TYPE_POS_INT,
     "BRIDGE_A2A_RECEIVER_RESTART_WINDOW_SECONDS": ENV_KEY_TYPE_POS_INT,
     "BRIDGE_A2A_RECEIVER_STALENESS_CLAIM_STALE_SECONDS": ENV_KEY_TYPE_POS_INT,
+    # Issue #1795: idle dynamic-agent reaper threshold (seconds). 0 disables
+    # the reaper entirely — the supported operator escape hatch when a long-
+    # lived dynamic must not be GC'd. Non-secret operational knob, read from
+    # os.environ by the daemon each sync cycle.
+    "BRIDGE_DYNAMIC_IDLE_REAP_SECONDS": ENV_KEY_TYPE_NON_NEG_INT,
 }
 
 # EXPLICIT DENY — keys that must NEVER be settable through set-env even if a
@@ -461,12 +471,21 @@ def validate_env_value(key: str, raw: str) -> tuple[str | None, str | None]:
     if expected is None:  # pragma: no cover — caller checks allowlist first
         return None, f"env key '{key}' is not in the set-env allowlist"
     text = raw.strip()
-    if expected in (ENV_KEY_TYPE_POS_INT, ENV_KEY_TYPE_INT_MIN2):
+    if expected in (
+        ENV_KEY_TYPE_POS_INT,
+        ENV_KEY_TYPE_INT_MIN2,
+        ENV_KEY_TYPE_NON_NEG_INT,
+    ):
         try:
             val = int(text)
         except (TypeError, ValueError):
             return None, f"value for {key} must be an integer, got {raw!r}"
-        floor = 2 if expected == ENV_KEY_TYPE_INT_MIN2 else 1
+        if expected == ENV_KEY_TYPE_INT_MIN2:
+            floor = 2
+        elif expected == ENV_KEY_TYPE_NON_NEG_INT:
+            floor = 0
+        else:
+            floor = 1
         if val < floor:
             return None, f"value for {key} must be >= {floor}, got {val}"
         return str(val), None

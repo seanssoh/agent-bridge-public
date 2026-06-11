@@ -11884,6 +11884,8 @@ reap_idle_dynamic_agents() {
   local attached
   local idle
   local summary
+  local ephemeral
+  local loop_mode
   local live_agent=""
   local queued=0
   local claimed=0
@@ -11925,10 +11927,31 @@ reap_idle_dynamic_agents() {
     [[ "$idle" =~ ^[0-9]+$ ]] || idle=0
     (( idle >= threshold )) || continue
 
+    # Issue #1795: disposability gate. The agent has now passed every existing
+    # idle predicate (detached + queue-empty + idle>=threshold), so it is a
+    # would-be-reap candidate. Only AUTO-SPAWNED EPHEMERAL workers are actually
+    # reaped, and a loop=1 relaunch agent is NEVER reaped (reaping voids the
+    # loop contract — the daemon re-wakes loop agents on purpose). Both new
+    # conditions must hold to proceed:
+    #   ephemeral == "1"  (explicit; absent/legacy/operator-created ⇒ "0" ⇒ keep)
+    #   loop      != "1"  (hard skip on the relaunch-loop flag)
+    # When kept, emit a one-line audit so operators can see the reaper
+    # considered the agent idle and deliberately spared it.
+    ephemeral="$(bridge_agent_ephemeral "$agent")"
+    loop_mode="$(bridge_agent_loop "$agent")"
+    if [[ "$loop_mode" == "1" ]]; then
+      daemon_info "reaper kept idle dynamic ${agent} (idle=${idle}s; loop=1 relaunch agent — reap-exempt)"
+      continue
+    fi
+    if [[ "$ephemeral" != "1" ]]; then
+      daemon_info "reaper kept idle dynamic ${agent} (idle=${idle}s; non-ephemeral operator-created — reap-exempt)"
+      continue
+    fi
+
     if bridge_kill_agent_session "$agent" >/dev/null 2>&1; then
       bridge_archive_dynamic_agent "$agent"
       bridge_remove_dynamic_agent_file "$agent"
-      daemon_info "reaped dynamic ${agent} (idle=${idle}s)"
+      daemon_info "reaped dynamic ${agent} (idle=${idle}s; ephemeral)"
       changed=0
     fi
   done

@@ -4758,10 +4758,16 @@ cp "$TMP_ROOT/codex-cron-fake" "$FAKE_BIN/codex"
 chmod +x "$FAKE_BIN/codex"
 
 log "reaping idle dynamic agents and orphan smoke sessions"
+# Issue #1795: the idle reaper now only reaps EPHEMERAL (--ephemeral) dynamics.
+# IDLE_REAP_AGENT is spawned --ephemeral so it is still reaped (the disposable
+# path). KEEP_REAP_AGENT is an operator-style dynamic (no --ephemeral) that
+# must SURVIVE the same cycle (the non-ephemeral keep path).
 IDLE_REAP_AGENT="idle-reap-agent-$SESSION_NAME"
+KEEP_REAP_AGENT="keep-reap-agent-$SESSION_NAME"
 IDLE_REAP_WORKDIR="$TMP_ROOT/idle-reap-workdir"
+KEEP_REAP_WORKDIR="$TMP_ROOT/keep-reap-workdir"
 ORPHAN_REAP_SESSION="bridge-smoke-orphan-$SESSION_NAME"
-mkdir -p "$IDLE_REAP_WORKDIR"
+mkdir -p "$IDLE_REAP_WORKDIR" "$KEEP_REAP_WORKDIR"
 IDLE_REAP_OUTPUT="$("$BASH4_BIN" -lc '
   set -euo pipefail
   tmp_daemon="'"$TMP_ROOT"'/daemon-reaper.sh"
@@ -4778,7 +4784,8 @@ IDLE_REAP_OUTPUT="$("$BASH4_BIN" -lc '
     sed -n '"'"'/^bridge_agent_heartbeat_file()/,/^CMD="${1:-}"/p'"'"' "'"$REPO_ROOT"'/bridge-daemon.sh" | sed '"'"'$d'"'"'
   } >"$tmp_daemon"
   source "$tmp_daemon"
-  "'"$REPO_ROOT"'/agent-bridge" --codex --name "'"$IDLE_REAP_AGENT"'" --workdir "'"$IDLE_REAP_WORKDIR"'" --no-attach >/dev/null
+  "'"$REPO_ROOT"'/agent-bridge" --codex --name "'"$IDLE_REAP_AGENT"'" --workdir "'"$IDLE_REAP_WORKDIR"'" --no-attach --ephemeral >/dev/null
+  "'"$REPO_ROOT"'/agent-bridge" --codex --name "'"$KEEP_REAP_AGENT"'" --workdir "'"$KEEP_REAP_WORKDIR"'" --no-attach >/dev/null
   tmux new-session -d -s "'"$ORPHAN_REAP_SESSION"'" "sleep 30"
   sleep 2
   export BRIDGE_DYNAMIC_IDLE_REAP_SECONDS=1
@@ -4788,6 +4795,11 @@ IDLE_REAP_OUTPUT="$("$BASH4_BIN" -lc '
     echo "DYNAMIC_ALIVE=yes"
   else
     echo "DYNAMIC_ALIVE=no"
+  fi
+  if tmux has-session -t "='"$KEEP_REAP_AGENT"'" 2>/dev/null; then
+    echo "KEEP_ALIVE=yes"
+  else
+    echo "KEEP_ALIVE=no"
   fi
   if tmux has-session -t "='"$ORPHAN_REAP_SESSION"'" 2>/dev/null; then
     echo "ORPHAN_ALIVE=yes"
@@ -4799,10 +4811,17 @@ IDLE_REAP_OUTPUT="$("$BASH4_BIN" -lc '
   else
     echo "DYNAMIC_META=no"
   fi
+  if test -f "'"$BRIDGE_ACTIVE_AGENT_DIR"'/'"$KEEP_REAP_AGENT"'.env"; then
+    echo "KEEP_META=yes"
+  else
+    echo "KEEP_META=no"
+  fi
 ')"
 assert_contains "$IDLE_REAP_OUTPUT" "DYNAMIC_ALIVE=no"
+assert_contains "$IDLE_REAP_OUTPUT" "KEEP_ALIVE=yes"
 assert_contains "$IDLE_REAP_OUTPUT" "ORPHAN_ALIVE=no"
 assert_contains "$IDLE_REAP_OUTPUT" "DYNAMIC_META=no"
+assert_contains "$IDLE_REAP_OUTPUT" "KEEP_META=yes"
 
 log "bun plugin root + child match the orphan patterns (issue #223)"
 python3 - "$REPO_ROOT" <<'PY'
