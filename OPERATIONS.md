@@ -1565,11 +1565,24 @@ agent-bridge auth claude-token activate claude-b --sync
 To enable automatic rotation, register at least two enabled tokens and set
 the threshold. The daemon reuses the existing Claude usage monitor signal
 from `bridge-usage.py`; when a Claude usage window reaches the rotation
-threshold once per reset cycle, it runs `rotate --if-auto-enabled --sync`.
+threshold once per reset cycle, it runs `rotate --if-auto-enabled --sync
+--limited-until <reset_at>`.
 Sync keeps only a non-secret `CLAUDE_CONFIG_DIR=` pointer in the legacy
 `credentials/launch-secrets.env` file and removes any stale
 `CLAUDE_CODE_OAUTH_TOKEN=` entry, so the active OAuth token is not inherited
 by Bash/tool subprocesses.
+
+Rotation is limit-window aware (#1789): the rotating-away token's known
+429 reset time (`--limited-until`, an ISO timestamp — never a token value)
+is recorded on its registry row as `limited_until`, and selection skips any
+candidate whose own `limited_until` is still in the future (an expired or
+absent stamp keeps the token eligible, and the stamp is cleared when the
+token is activated again). When **every** enabled alternate is still inside
+a limit window, rotate returns `skipped/all_tokens_limited` with the pool's
+`soonest_reset` instead of cycling a saturated pool; the daemon then sends
+one urgent "claude token pool exhausted" notification on a cooldown latch
+(`BRIDGE_CLAUDE_POOL_EXHAUSTED_NOTICE_INTERVAL_SECONDS`, default 1800)
+rather than re-alerting on every monitor pass.
 
 The credential write path is hardened against two specific failure
 modes (see PR #799 r2-of-Path-A):

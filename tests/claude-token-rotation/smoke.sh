@@ -914,6 +914,73 @@ ENABLED_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token auto-rotate enable -
 json_assert "auto enable" "$ENABLED_JSON" "payload['status'] == 'ok' and payload['auto_rotate_enabled'] is True and payload['rotation_threshold'] == 99.0"
 pass "auto-rotate gate is registry controlled"
 
+# #1789 — rotate must record the rotating-away token's 429 reset window
+# (--limited-until) and refuse to rotate INTO a token still inside its own
+# window. Without this the daemon round-robins a saturated pool (observed:
+# median same-token return 1.2h vs 5h reset windows, 223 rotations/3 days).
+# Fixture state here: tokens first+second, active=second.
+LIMIT_FUTURE_ISO="$("$PYTHON" -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)).isoformat(timespec="seconds"))')"
+LIMIT_PAST_ISO="$("$PYTHON" -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)).isoformat(timespec="seconds"))')"
+
+LIMITED_ROTATE_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token rotate --reason smoke-1789 --limited-until "$LIMIT_FUTURE_ISO" --json)"
+[[ "$LIMITED_ROTATE_JSON" != *"$TOKEN_A"* && "$LIMITED_ROTATE_JSON" != *"$TOKEN_B"* ]] || fail "limited rotate output leaked token"
+json_assert "limited rotate" "$LIMITED_ROTATE_JSON" "payload['status'] == 'rotated' and payload['old_active_token_id'] == 'second' and payload['active_token_id'] == 'first'"
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" "$LIMIT_FUTURE_ISO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+registry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+rows = {row.get("id"): row for row in registry.get("tokens", [])}
+if rows["second"].get("limited_until") != sys.argv[2]:
+    raise SystemExit(f"rotated-away token missing limited_until stamp: {rows['second'].get('limited_until')!r}")
+if "limited_until" in rows["first"]:
+    raise SystemExit("selected token unexpectedly carries a limited_until stamp")
+PY
+[[ $? -eq 0 ]] || fail "rotate --limited-until did not stamp the rotated-away token"
+pass "rotate --limited-until stamps the rotated-away token's reset window"
+
+POOL_EXHAUSTED_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token rotate --reason smoke-1789-exhausted --json)"
+json_assert "pool exhausted" "$POOL_EXHAUSTED_JSON" "payload['status'] == 'skipped' and payload['reason'] == 'all_tokens_limited' and payload['active_token_id'] == 'first' and payload['soonest_reset'] != ''"
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+registry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if registry.get("active_token_id") != "first":
+    raise SystemExit(f"all_tokens_limited mutated active token: {registry.get('active_token_id')!r}")
+PY
+[[ $? -eq 0 ]] || fail "all_tokens_limited skip mutated the active token"
+pass "rotate refuses a fully limited pool instead of cycling it"
+
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" "$LIMIT_PAST_ISO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+registry = json.loads(path.read_text(encoding="utf-8"))
+for row in registry.get("tokens", []):
+    if row.get("id") == "second":
+        row["limited_until"] = sys.argv[2]
+path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+PY
+EXPIRED_ROTATE_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token rotate --reason smoke-1789-expired --sync --json)"
+json_assert "expired stamp rotate" "$EXPIRED_ROTATE_JSON" "payload['status'] == 'rotated' and payload['old_active_token_id'] == 'first' and payload['active_token_id'] == 'second' and payload['sync']['status'] == 'ok'"
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+registry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+rows = {row.get("id"): row for row in registry.get("tokens", [])}
+if "limited_until" in rows["second"]:
+    raise SystemExit("expired limited_until stamp survived activation")
+PY
+[[ $? -eq 0 ]] || fail "expired limited_until stamp was not cleared on activation"
+pass "expired limit window re-admits the token and clears the stale stamp"
+
 ADD_QUOTA_JSON="$(printf '%s' "$TOKEN_C" | "$REPO_ROOT/agent-bridge" auth claude-token add --id quota --stdin --json)"
 [[ "$ADD_QUOTA_JSON" != *"$TOKEN_C"* ]] || fail "quota add output leaked token"
 CHECK_QUOTA_JSON="$(
