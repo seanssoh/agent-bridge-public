@@ -4726,6 +4726,93 @@ process_orphan_dir_gc() {
   return 1
 }
 
+# Issue #1809: emit ONE admin `[hygiene]` task per non-clean codex AGENTS.md
+# doc-backfill pass. Mirrors bridge_emit_orphan_gc_admin_task (admin from
+# BRIDGE_ADMIN_AGENT_ID, --force bypasses the stopped-admin gate so the task is
+# the signal the operator restarts admin to consume).
+bridge_emit_agent_doc_backfill_admin_task() {
+  local summary_file="$1"
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local target_bridge=""
+  local body_file=""
+  local hostname_short=""
+
+  [[ -n "$admin" ]] || return 0
+  [[ -f "$summary_file" ]] || return 0
+
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  else
+    return 0
+  fi
+
+  hostname_short="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-agent-doc-backfill-task.md.XXXXXX")"
+  if ! python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" agent-doc-backfill-task-body \
+        "$summary_file" "$hostname_short" >"$body_file" 2>/dev/null; then
+    rm -f "$body_file"
+    return 0
+  fi
+
+  if ! "$target_bridge" task create \
+       --to "$admin" --priority normal --from daemon \
+       --title "[hygiene] codex AGENTS.md backfill on ${hostname_short}" \
+       --body-file "$body_file" --force >/dev/null 2>&1; then
+    daemon_warn "failed to file [hygiene] codex AGENTS.md backfill task to admin=${admin}"
+  fi
+  rm -f "$body_file"
+  return 0
+}
+
+# Issue #1809: codex AGENTS.md doc-backfill hygiene pass. For each roster codex
+# agent missing (or drifted from) its AGENTS.md instruction contract, backfill
+# create-if-absent / refresh the managed header (custom contract preserved) and
+# file ONE `[hygiene]` admin task when anything was backfilled. Returns 0 when
+# it did work (so the caller marks the cycle changed), 1 when gated/clean.
+# Cadence-gated by bridge_daemon_pass_due so a busy 5s tick never re-runs it.
+# Touches ONLY the codex entrypoint (the focused backfill-codex-entrypoints
+# subcommand), never the full template/scaffold migration.
+process_agent_doc_backfill() {
+  local interval="${BRIDGE_AGENT_DOC_BACKFILL_INTERVAL_SECONDS:-86400}"
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local summary_file=""
+  local non_clean=0
+
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=86400
+  bridge_daemon_pass_due "agent_doc_backfill" "$interval" || return 1
+
+  # Needs the source checkout (bridge-upgrade.py + bridge-lib.sh + the
+  # agents/_template tree). The runtime root carries all three.
+  [[ -f "$SCRIPT_DIR/bridge-upgrade.py" ]] || return 1
+
+  summary_file="$(mktemp "${TMPDIR:-/tmp}/bridge-agent-doc-backfill.json.XXXXXX")"
+
+  bridge_with_timeout 120 agent_doc_backfill \
+    python3 "$SCRIPT_DIR/bridge-upgrade.py" backfill-codex-entrypoints \
+      --source-root "$SCRIPT_DIR" \
+      --target-root "$BRIDGE_HOME" \
+      --admin-agent "$admin" \
+      >"$summary_file" 2>/dev/null || true
+
+  if [[ -s "$summary_file" ]]; then
+    non_clean="$(python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" \
+      agent-doc-backfill-non-clean "$summary_file" 2>/dev/null || printf '0')"
+  fi
+
+  if [[ "$non_clean" == "1" ]]; then
+    bridge_emit_agent_doc_backfill_admin_task "$summary_file"
+  fi
+
+  rm -f "$summary_file"
+
+  if [[ "$non_clean" == "1" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 process_daily_backup() {
   local backup_json=""
   local subprocess_rc=0
@@ -13530,6 +13617,18 @@ cmd_sync_cycle() {
   # mid-cycle (the age gate is the real guard; the ordering is belt-and-braces).
   BRIDGE_DAEMON_LAST_STEP="orphan_dir_gc"
   if process_orphan_dir_gc; then
+    changed=0
+  fi
+  # Issue #1809: codex AGENTS.md doc-backfill hygiene pass. Cadence-gated
+  # (default daily) via bridge_daemon_pass_due, so the per-tick cost is a cheap
+  # stamp check; the focused entrypoint backfill only runs once per
+  # BRIDGE_AGENT_DOC_BACKFILL_INTERVAL_SECONDS. Create-if-absent / managed-header
+  # refresh only (codex-only; custom contract preserved); files ONE [hygiene]
+  # admin task when it backfills. Sibling of the #1803 orphan-dir-gc hygiene
+  # pass — placed right after it so both hygiene passes share the same cadence
+  # neighborhood.
+  BRIDGE_DAEMON_LAST_STEP="agent_doc_backfill"
+  if process_agent_doc_backfill; then
     changed=0
   fi
   # Issue #4795: prune backoff state for agents that no longer exist in

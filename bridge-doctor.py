@@ -76,6 +76,7 @@ DETECTOR_KINDS = (
     "abnormal-session-pane",
     "daemon-log-split",
     "orphan-agent-dir",
+    "missing-agent-entrypoint",
     "settings-two-tree-drift",
     "settings-multi-tree",
     "tasks-db",
@@ -1200,6 +1201,95 @@ def detect_orphan_agent_dir(
     return findings
 
 
+# --- missing codex AGENTS.md entrypoint (#1809) -----------------------------
+
+
+def _engine_entrypoint_filename(engine: str) -> str:
+    """The engine's instruction-entrypoint filename, mirroring the shell
+    descriptor `bridge_engine_entrypoint_filename` and bridge-watchdog.py's
+    `engine_entrypoint_filename`. codex → AGENTS.md; claude/antigravity →
+    CLAUDE.md; unknown → "".
+    """
+    e = (engine or "").strip().lower()
+    if e == "codex":
+        return "AGENTS.md"
+    if e in ("claude", "antigravity"):
+        return "CLAUDE.md"
+    return ""
+
+
+def detect_missing_agent_entrypoint(
+    registry: list[dict[str, Any]],
+    ts: str,
+) -> list[dict[str, Any]]:
+    """Issue #1809: flag a CODEX agent whose AGENTS.md instruction entrypoint is
+    missing from BOTH its identity home and its workdir.
+
+    Codex agents created before the entrypoint-materialization existed (early
+    admin-pair provisioning) have no AGENTS.md anywhere, and nothing in the
+    runtime ever backfilled it before this issue — the watchdog flagged
+    `missing_files: AGENTS.md` forever with no remediation hook. This read-only
+    detector surfaces the gap with a `suggested_action` that names the supported
+    one-command fix (`agb upgrade`, which now backfills the codex AGENTS.md
+    home->workdir; the daemon doc-backfill hygiene pass does the same between
+    upgrades).
+
+    ENGINE-AWARE and codex-scoped: claude/antigravity agents are NEVER flagged
+    (their CLAUDE.md entrypoint is a separate, long-settled concern and may
+    legitimately live home-only). The presence check mirrors the watchdog's
+    home-fallback: an entrypoint present in EITHER tree is not drift. A row with
+    no resolvable engine or no home AND no workdir is skipped (nothing to
+    prove) — fail-safe, never a false positive.
+    """
+    findings: list[dict[str, Any]] = []
+    for agent_id, home, workdir, engine in _iter_registry_agents(registry):
+        if (engine or "").strip().lower() != "codex":
+            continue
+        entrypoint = _engine_entrypoint_filename(engine)
+        if not entrypoint:
+            continue
+        present = False
+        checked: list[str] = []
+        for base in (workdir, home):
+            if not base:
+                continue
+            candidate = Path(base) / entrypoint
+            checked.append(str(candidate))
+            if _path_lexists(candidate):
+                present = True
+                break
+        if present or not checked:
+            continue
+        findings.append(
+            {
+                "ts": ts,
+                "kind": "missing-agent-entrypoint",
+                "agent": agent_id,
+                "evidence": {
+                    "engine": "codex",
+                    "entrypoint": entrypoint,
+                    "checked_paths": checked,
+                    "home": home,
+                    "workdir": workdir,
+                    "registry_checked": "agent registry --json",
+                },
+                "suggested_action": (
+                    f"Codex agent {agent_id} has no {entrypoint} identity "
+                    "contract in its home or workdir (a pre-materialization "
+                    "agent the create-time materialize never reached). Run "
+                    "`agent-bridge upgrade` to backfill it from the current "
+                    "template (create-if-absent home->workdir; the managed "
+                    "header tracks template evolution, any custom contract "
+                    "below the marker is preserved). The daemon doc-backfill "
+                    "hygiene pass performs the same fix automatically between "
+                    "upgrades and files one `[hygiene]` admin task when it "
+                    "backfills."
+                ),
+            }
+        )
+    return findings
+
+
 # --- settings single-tree invariant (#1455) --------------------------------
 
 
@@ -1704,7 +1794,10 @@ def main() -> int:
     # (they read the home + workdir columns). Lazy-load it once when ANY of
     # those is enabled; a load failure surfaces as one detector-error per
     # affected detector (emitted lazily below) rather than failing the run.
-    registry_consumers = {"orphan-agent-dir"} | set(SETTINGS_DETECTOR_KINDS)
+    registry_consumers = (
+        {"orphan-agent-dir", "missing-agent-entrypoint"}
+        | set(SETTINGS_DETECTOR_KINDS)
+    )
     if enabled_set_pre & registry_consumers:
         try:
             registry = load_agent_registry(args)
@@ -1757,6 +1850,14 @@ def main() -> int:
             # known-set otherwise treats every dir under BRIDGE_AGENT_HOME_ROOT
             # as orphan.
             lambda: [] if registry_load_failed else detect_orphan_agent_dir(registry, home_root, ts),
+        ),
+        (
+            # Issue #1809: codex agent missing its AGENTS.md entrypoint in both
+            # home and workdir. Short-circuit on registry-load failure (the
+            # detector-error row was already emitted above) so we never flag
+            # every codex agent when the registry could not be read.
+            "missing-agent-entrypoint",
+            lambda: [] if registry_load_failed else detect_missing_agent_entrypoint(registry, ts),
         ),
         (
             # Issue #1455 (a): home + workdir settings.json diverge.
