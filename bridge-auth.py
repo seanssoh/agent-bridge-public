@@ -950,6 +950,11 @@ def cmd_activate(args: argparse.Namespace) -> int:
                 raise ValueError(f"token id is disabled: {args.id}")
             registry["active_token_id"] = args.id
             row["last_activated_at"] = now_iso()
+            # #1789 (PR #1790 r2): explicit activation is an operator
+            # override — drop any limit-window stamp so the token is not
+            # hiddenly skipped by future rotations until the old timestamp
+            # expires. Mirrors the rotate-path cleanup.
+            row.pop("limited_until", None)
             save_registry(registry_path, registry)
     except Exception as exc:
         return fail(str(exc), json_mode)

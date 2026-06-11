@@ -981,6 +981,39 @@ PY
 [[ $? -eq 0 ]] || fail "expired limited_until stamp was not cleared on activation"
 pass "expired limit window re-admits the token and clears the stale stamp"
 
+# PR #1790 r2 codex finding — explicit `activate` is an operator override and
+# must also drop a pending limit-window stamp; otherwise a manually
+# reactivated token stays hiddenly ineligible for future rotation until the
+# stale timestamp expires.
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" "$LIMIT_FUTURE_ISO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+registry = json.loads(path.read_text(encoding="utf-8"))
+for row in registry.get("tokens", []):
+    if row.get("id") == "first":
+        row["limited_until"] = sys.argv[2]
+path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+PY
+ACTIVATE_STAMPED_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token activate first --json)"
+json_assert "activate stamped" "$ACTIVATE_STAMPED_JSON" "payload['status'] == 'activated' and payload['active_token_id'] == 'first'"
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+registry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+rows = {row.get("id"): row for row in registry.get("tokens", [])}
+if "limited_until" in rows["first"]:
+    raise SystemExit("explicit activate left the limited_until stamp in place")
+PY
+[[ $? -eq 0 ]] || fail "explicit activate did not clear the limited_until stamp"
+ACTIVATE_RESTORE_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token activate second --json)"
+json_assert "activate restore" "$ACTIVATE_RESTORE_JSON" "payload['status'] == 'activated' and payload['active_token_id'] == 'second'"
+pass "explicit activate clears a pending limit-window stamp (operator override)"
+
 ADD_QUOTA_JSON="$(printf '%s' "$TOKEN_C" | "$REPO_ROOT/agent-bridge" auth claude-token add --id quota --stdin --json)"
 [[ "$ADD_QUOTA_JSON" != *"$TOKEN_C"* ]] || fail "quota add output leaked token"
 CHECK_QUOTA_JSON="$(
