@@ -693,6 +693,12 @@ def init_db(conn: sqlite3.Connection) -> None:
         ensure_column(conn, "agent_state", "prompt_ready_ts", "INTEGER")
         ensure_column(conn, "agent_state", "prompt_ready_session", "TEXT")
         ensure_column(conn, "agent_state", "prompt_ready_source", "TEXT")
+        # Issue #1792: attribution stamp for the creating context. Additive,
+        # nullable — absent on legacy rows, never rewritten. `cron:<run_id>`
+        # for cron-dispatched children (BRIDGE_CRON_RUN_ID), `session:<id>`
+        # when an interactive engine session id is visible. NOT an auth
+        # mechanism (the queue still trusts --from); pure metadata.
+        ensure_column(conn, "tasks", "origin", "TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assigned_status ON tasks(assigned_to, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_claimed_status ON tasks(claimed_by, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_lease ON tasks(status, lease_until_ts)")
@@ -1065,6 +1071,21 @@ def require_task(conn: sqlite3.Connection, task_id: int) -> sqlite3.Row:
     return row
 
 
+def task_origin(task: sqlite3.Row) -> str | None:
+    """Read the #1792 origin stamp from a task row, tolerating its absence.
+
+    The column is always present after init_db(), but a row materialized from a
+    legacy connection (or an explicit column-list SELECT that omits it) would
+    raise IndexError on `task["origin"]`; treat that as "no origin".
+    """
+    try:
+        value = task["origin"]
+    except (IndexError, KeyError):
+        return None
+    text = str(value or "").strip()
+    return text or None
+
+
 def priority_sort_sql() -> str:
     return """
       CASE priority
@@ -1302,6 +1323,146 @@ def maybe_cancel_cron_run(task: sqlite3.Row, current_ts: int) -> None:
     status_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 
 
+def _safe_run_id(value: str) -> bool:
+    # A run_id is a SINGLE directory name under runs/, so it must not traverse
+    # out of it. Allow [A-Za-z0-9._-] but explicitly reject the dot-only
+    # segments `.` / `..` (which pass the char allowlist yet are path
+    # traversal). Mirrors bridge-cron-runner._safe_agent_id + adds the dot guard.
+    if not value or value in (".", ".."):
+        return False
+    return all(ch.isalnum() or ch in "._-" for ch in value)
+
+
+def _trusted_cron_state_dir() -> Path:
+    """Resolve the cron state dir from a TRUSTED anchor, not caller env (#1792).
+
+    The state dir of the runtime being written is the parent of the actual task
+    DB (`get_db_path().parent`) — a spoofer who redirects that is writing into a
+    queue they already own. The cron state dir is normally `<state>/cron`, but
+    an operator can legitimately relocate it; `lib/bridge-cron.sh` records the
+    authoritative path in `<state>/cron-state-dir-anchor.txt`. We read that
+    anchor from the DB's own dir (NOT via the caller-settable
+    BRIDGE_CRON_STATE_DIR / BRIDGE_STATE_DIR env), so a legit relocated install
+    still verifies while a caller cannot redirect the lookup. Fall back to
+    `<state>/cron` when no anchor is present.
+    """
+    state_dir = get_db_path().parent
+    anchor_file = state_dir / "cron-state-dir-anchor.txt"
+    try:
+        recorded = anchor_file.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError):
+        recorded = ""
+    if recorded:
+        return Path(recorded).expanduser()
+    return state_dir / "cron"
+
+
+def verified_cron_run_id(claimed_run_id: str) -> str | None:
+    """Return the claimed cron run id ONLY if it maps to a live run record.
+
+    #1792 P1: BRIDGE_CRON_RUN_ID is a process-env value. On the direct path any
+    process can set it; on the gateway path a non-cron client can forward its
+    own env value. Either way the queue must not stamp `cron:<id>` on a caller's
+    say-so — that would let any process impersonate a cron child in the
+    attribution trail.
+
+    We re-derive provenance from the cron runtime's own ground truth:
+    `<state>/cron/runs/<run_id>/status.json` must exist, name the same run id,
+    and report a live `state` (`running`).
+
+    The state root is anchored to the directory of the ACTUAL task DB being
+    written (`get_db_path().parent`), NOT to the separately-overridable
+    `BRIDGE_CRON_STATE_DIR` / `BRIDGE_STATE_DIR` env (codex P2): otherwise a
+    caller could set `BRIDGE_CRON_RUN_ID` AND point the cron-state env at a
+    self-owned dir holding a fake running record and verify its own spoof. By
+    tying the lookup to the same DB the create lands in, a spoofer who
+    redirects the DB is only writing into a queue they already fully own (the
+    attribution stays internally consistent), and one who keeps the real DB can
+    no longer relocate the ground-truth lookup.
+
+    The realistic spoof this closes: a non-cron caller (direct or via a gateway
+    client forwarding its own env) cannot point the lookup at a fake record (the
+    anchor is trusted) and cannot fabricate a `running` record under the
+    controller-owned cron run tree (mode 0700 run dirs the caller's UID cannot
+    write on the multi-user/iso hosts where this matters). A residual remains
+    for a caller that can already READ the controller's run dir to learn a
+    currently-`running` run id — but that read is exactly what the 0700 boundary
+    denies, and origin is attribution metadata, NOT authorization (the queue
+    still trusts `--from`), so we deliberately do not escalate to a per-dispatch
+    secret (a secret can only reach the child via env, and the iso sudo/shell
+    launch serializes env into world-readable argv — exposing the secret would
+    be a net regression). See the PR follow-up note.
+
+    Anything indeterminate — bad/dotted shape, missing record, unreadable dir,
+    non-running state, run-id mismatch — returns None (the conservative branch:
+    drop the cron stamp, fall back to session/legacy origin). Attribution
+    metadata only; never gates the create.
+    """
+    claimed = (claimed_run_id or "").strip()
+    if not claimed or not _safe_run_id(claimed):
+        return None
+    cron_dir = _trusted_cron_state_dir()
+    status_file = cron_dir / "runs" / claimed / "status.json"
+    # Defense in depth: the resolved path must stay strictly under runs/ even if
+    # a future change loosens _safe_run_id (no escape via symlink/.. residue).
+    runs_root = (cron_dir / "runs").resolve()
+    try:
+        resolved = status_file.resolve()
+        resolved.relative_to(runs_root)
+    except (OSError, ValueError):
+        return None
+    try:
+        payload = json.loads(status_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    # The record's own run_id must match the claim so a symlinked/renamed dir
+    # cannot launder a different run's liveness onto this id.
+    if str(payload.get("run_id") or "").strip() != claimed:
+        return None
+    if str(payload.get("state") or "").strip() != "running":
+        return None
+    return claimed
+
+
+def resolve_origin() -> str | None:
+    """Attribution stamp for a freshly-created task (Issue #1792).
+
+    Returns a short, prefixed marker of the creating context — or None when no
+    origin signal is visible (legacy shape; the column stays NULL). This is
+    metadata only: it is recorded alongside the caller-asserted `created_by`
+    but never used for authorization.
+
+    - `cron:<run_id>` — a cron-dispatched child, but ONLY when the claimed
+      BRIDGE_CRON_RUN_ID is proven against the cron runtime's ground truth
+      (verified_cron_run_id). An unverifiable claim is NOT stamped as cron —
+      it falls through to the session check, so a non-cron process that set
+      BRIDGE_CRON_RUN_ID in its own env cannot mint a cron origin (#1792 P1).
+    - `session:<id>` — an interactive engine session whose id is visible in the
+      environment (CLAUDE_CODE_SESSION_ID etc.). Cron children never reach this
+      branch: the runner scrubs those vars before dispatch.
+    """
+    claimed_run_id = os.environ.get("BRIDGE_CRON_RUN_ID", "").strip()
+    verified = verified_cron_run_id(claimed_run_id)
+    if verified:
+        return f"cron:{verified}"
+    if claimed_run_id:
+        # A claim was present but could not be proven against the cron runtime
+        # ground truth — surface it for operator triage (the spoof signal),
+        # then fall through to the conservative session/legacy origin.
+        print(
+            f"queue audit=warn reason_code=rejected_unverifiable_cron_run_id "
+            f"claimed_run_id={claimed_run_id}",
+            file=sys.stderr,
+        )
+    for key in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "ANTHROPIC_SESSION_ID"):
+        session_id = os.environ.get(key, "").strip()
+        if session_id:
+            return f"session:{session_id}"
+    return None
+
+
 def cmd_create(args: argparse.Namespace) -> int:
     actor = args.actor or os.environ.get("USER", "unknown")
     # Rooms ACL (P1b): gate the inter-agent create on shared-room membership
@@ -1333,12 +1494,14 @@ def cmd_create(args: argparse.Namespace) -> int:
         if body_text is None:
             body_text = inline_text
 
+    origin = resolve_origin()
+
     with closing(connect()) as conn, conn:
         cursor = conn.execute(
             """
             INSERT INTO tasks (
-              title, assigned_to, created_by, priority, status, created_ts, updated_ts, body_text, body_path
-            ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+              title, assigned_to, created_by, priority, status, created_ts, updated_ts, body_text, body_path, origin
+            ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
             """,
             (
                 args.title.strip(),
@@ -1349,6 +1512,7 @@ def cmd_create(args: argparse.Namespace) -> int:
                 created_ts,
                 body_text,
                 body_path,
+                origin,
             ),
         )
         task_id = int(cursor.lastrowid)
@@ -1372,6 +1536,7 @@ def cmd_create(args: argparse.Namespace) -> int:
             "TASK_PRIORITY": args.priority,
             "TASK_BODY_PATH": body_path or "",
             "TASK_BODY_TEXT": body_text or "",
+            "TASK_ORIGIN": origin or "",
         }
         for key, value in fields.items():
             print(f"{key}={shlex.quote(str(value))}")
@@ -1507,6 +1672,8 @@ def cmd_show(args: argparse.Namespace) -> int:
             (args.task_id,),
         ).fetchall()
 
+    origin = task_origin(task)
+
     if args.format == "shell":
         fields = {
             "TASK_ID": task["id"],
@@ -1517,6 +1684,7 @@ def cmd_show(args: argparse.Namespace) -> int:
             "TASK_PRIORITY": task["priority"],
             "TASK_CLAIMED_BY": task["claimed_by"] or "",
             "TASK_BODY_PATH": task["body_path"] or "",
+            "TASK_ORIGIN": origin or "",
         }
         for key, value in fields.items():
             print(f"{key}={shlex.quote(str(value))}")
@@ -1526,6 +1694,8 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(f"status: {task['status']}")
     print(f"assigned_to: {task['assigned_to']}")
     print(f"created_by: {task['created_by']}")
+    if origin:
+        print(f"origin: {origin}")
     print(f"priority: {task['priority']}")
     print(f"created_at: {isoformat_ts(task['created_ts'])}")
     print(f"updated_at: {isoformat_ts(task['updated_ts'])}")

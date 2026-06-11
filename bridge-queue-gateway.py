@@ -319,16 +319,24 @@ def cmd_client(args: argparse.Namespace) -> int:
     request_id = f"{int(time.time() * 1000)}-{os.getpid()}-{secrets.token_hex(6)}"
     request_path = req_dir / f"{request_id}.request.json"
     response_path = resp_dir / f"{request_id}.json"
-    atomic_write_json(
-        request_path,
-        {
-            "id": request_id,
-            "agent": args.agent,
-            "argv": list(args.argv),
-            "cwd": os.getcwd(),
-            "created_at": now_iso(),
-        },
-    )
+    # #1792: forward the cron dispatch run id as ATTRIBUTION METADATA only.
+    # In the gateway path the queue child runs in the SERVER process, which
+    # does not inherit the cron child's BRIDGE_CRON_RUN_ID, so without this the
+    # origin stamp would be NULL for iso cron children. This is strictly
+    # weaker than the already-client-asserted `--from` (origin never gates a
+    # create); the server injects it into the child env but NEVER lets it
+    # influence the trusted-actor / ACL / argv-rewrite decision.
+    request_payload: dict[str, Any] = {
+        "id": request_id,
+        "agent": args.agent,
+        "argv": list(args.argv),
+        "cwd": os.getcwd(),
+        "created_at": now_iso(),
+    }
+    cron_run_id = os.environ.get("BRIDGE_CRON_RUN_ID", "").strip()
+    if cron_run_id:
+        request_payload["cron_run_id"] = cron_run_id
+    atomic_write_json(request_path, request_payload)
 
     deadline = time.monotonic() + max(1.0, float(args.timeout))
     poll = max(0.05, float(args.poll))
@@ -375,10 +383,34 @@ def run_queue(
     argv: list[str],
     cwd: str | None,
     trusted_actor: str | None = None,
+    cron_run_id: str | None = None,
 ) -> dict[str, Any]:
     child_env = os.environ.copy()
     child_env["BRIDGE_QUEUE_GATEWAY_SERVER"] = "1"
     child_env.pop("BRIDGE_GATEWAY_PROXY", None)
+    # #1792: attribution-only. The queue child's resolve_origin() derives the
+    # task origin from this env, so the child must see ONLY the forwarded
+    # signal — never the gateway SERVER's own inherited identity. Scrub the
+    # server's session-id vars (a gateway launched from a Claude session would
+    # otherwise misattribute EVERY gateway create as session:<server-session>),
+    # then set BRIDGE_CRON_RUN_ID from the forwarded value or clear it. A client
+    # that forwarded a run id gets origin=cron:<id>; one that did not gets the
+    # legacy NULL origin. This feeds cmd_create's resolve_origin and NOTHING
+    # else — never the trusted actor.
+    for _session_key in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "ANTHROPIC_SESSION_ID"):
+        child_env.pop(_session_key, None)
+    # #1792: forward the client's claimed cron run id into the child env as
+    # PROPOSED attribution only. The re-executed bridge-queue.py does NOT trust
+    # it blind — resolve_origin() proves it against the cron runtime's ground
+    # truth (runs/<id>/status.json state=running) before stamping cron:<id>, so
+    # a non-cron client that forwarded its own env value cannot mint a cron
+    # origin (#1792 P1). We always (re)set or clear so a stale value from the
+    # gateway process env cannot leak across requests.
+    cron_run_id = (cron_run_id or "").strip()
+    if cron_run_id:
+        child_env["BRIDGE_CRON_RUN_ID"] = cron_run_id
+    else:
+        child_env.pop("BRIDGE_CRON_RUN_ID", None)
     # Rooms ACL (P1b): pass the OS-derived trusted actor to the queue child as an
     # env var the CLIENT cannot set (this is the gateway-server's own child env).
     # bridge-queue.py:cmd_create uses BRIDGE_QUEUE_GATEWAY_ACTOR as the ISO-
@@ -491,7 +523,10 @@ def handle_request(path: Path, queue_script: Path) -> int:
                 return 0
             run_argv = rewritten
             trusted_actor = owner_agent
-    response.update(run_queue(queue_script, run_argv, cwd, trusted_actor=trusted_actor))
+    request_cron_run_id = str(request.get("cron_run_id", "") or "").strip()
+    response.update(
+        run_queue(queue_script, run_argv, cwd, trusted_actor=trusted_actor, cron_run_id=request_cron_run_id)
+    )
     atomic_write_json(path.parent.parent / "responses" / f"{response['id']}.json", response)
     path.unlink(missing_ok=True)
     return 0
@@ -1402,7 +1437,12 @@ def _handle_socket_request(
         # peer_agent is the SO_PEERCRED-authenticated actor; hand it to the queue
         # child as the rooms-ACL trusted actor (P1b). For non-create subcommands
         # this is harmless (cmd_create is the only consumer).
-        response.update(run_queue(queue_script, rewritten, cwd, trusted_actor=peer_agent))
+        # #1792: forward the cron run id (attribution metadata only) so an iso
+        # cron child's create is stamped origin=cron:<id>; never the actor.
+        request_cron_run_id = str(request.get("cron_run_id", "") or "").strip()
+        response.update(
+            run_queue(queue_script, rewritten, cwd, trusted_actor=peer_agent, cron_run_id=request_cron_run_id)
+        )
         _safe_send_json(conn, response)
     except _ProbeClose:
         # Issue #1652: liveness connect-probe (or any peer that connected and
@@ -1442,12 +1482,19 @@ def cmd_socket_client(args: argparse.Namespace) -> int:
         print(_format_client_preflight_error(exc), file=sys.stderr)
         return 2
 
-    payload = {
+    payload: dict[str, Any] = {
         "id": request_id,
         "argv": normalized_argv,
         "cwd": os.getcwd(),
         "created_at": now_iso(),
     }
+    # #1792: forward the cron run id (attribution metadata only) so an iso cron
+    # child creating through the SOCKET gateway is stamped origin=cron:<id> —
+    # same as the file client. Strictly weaker than the client-asserted --from;
+    # the server never lets it influence the trusted-actor / ACL decision.
+    cron_run_id = os.environ.get("BRIDGE_CRON_RUN_ID", "").strip()
+    if cron_run_id:
+        payload["cron_run_id"] = cron_run_id
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     if len(data) > MAX_SOCKET_BYTES:
         exc = _client_preflight_error(
