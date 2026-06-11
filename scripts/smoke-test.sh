@@ -11864,6 +11864,10 @@ bash "$REPO_ROOT/scripts/smoke/cron-mutation-audit.sh"
 log "running cron-shell-runner smoke"
 bash "$REPO_ROOT/scripts/smoke/cron-shell-runner.sh"
 
+# Issue #1792 — cron dispatch scope fence + task-create origin stamp.
+log "running 1792-cron-scope-fence smoke (issue #1792)"
+bash "$REPO_ROOT/scripts/smoke/1792-cron-scope-fence.sh"
+
 # Issue #544 PR1 — curated bin/agb shim for isolated agents.
 log "running isolated-bin-agb smoke (issue #544 PR1)"
 log "isolated-bin-agb covers shim env-source/delegation/fallback only — live PATH injection requires isolate+restart"

@@ -344,6 +344,15 @@ add_required 1594-rooms-fanout
 # show/list surfaces the cache, leader rooms unchanged, no-room/no-cache still
 # 404; unknown target -> 422 with no roster leak + full local audit recorded.
 add_required rooms-p4-5-polish
+# Issue #1792: cron scope fence + task-create origin stamp. bridge-cron-runner.py
+# build_prompt now appends a SCOPE FENCE (job-name-parameterized) so a cron child
+# cannot "helpfully" act on inherited in-flight work (ghost queue tasks under the
+# parent's name, edits in the parent's worktree); bridge-queue.py cmd_create
+# records an `origin` stamp (cron:<run_id> | session:<id>) surfaced by `agb show`.
+# In the static suite so any scripts/smoke/* change re-runs the fence-presence +
+# origin-recorded + legacy-shape teeth via the catch-all; the bridge-cron-runner.py
+# and bridge-queue.py/bridge-task.sh per-file arms below also pull it directly.
+add_required 1792-cron-scope-fence
 
 
 }
@@ -1109,6 +1118,13 @@ select_for_path() {
       # to the find-open `--all` payload (title / created_by / status / id) or
       # the cron-dispatch SQL exclusions cannot silently break the filter.
       add_required 1596-stop-drain-cron-dispatch
+      # Issue #1792: bridge-queue.py's cmd_create now records an `origin`
+      # attribution stamp (additive nullable column; cron:<run_id> from
+      # BRIDGE_CRON_RUN_ID, else session:<id>) and cmd_show surfaces it. Pull
+      # 1792-cron-scope-fence on every queue / task move so a refactor cannot
+      # drop the column, the resolve_origin precedence (cron over session), the
+      # `agb show` origin line, or regress a legacy (no-origin) row to an error.
+      add_required 1792-cron-scope-fence
       add_integration integration-minimal
       ;;
 
@@ -1176,7 +1192,13 @@ select_for_path() {
       # empty connect-probe recv as a quiet _ProbeClose (no invalid_payload /
       # BrokenPipeError spam). Pull 1652-queue-gateway-crashloop on every
       # gateway move so the listener-survival + quiet-probe contract holds.
-      add_required queue a2a-rooms-p1b-acl 1652-queue-gateway-crashloop
+      # Issue #1792: the gateway now forwards a `cron_run_id` field (attribution
+      # metadata only) and run_queue injects it into the queue child env as
+      # BRIDGE_CRON_RUN_ID so an iso cron child's create is stamped
+      # origin=cron:<id>. Pull 1792-cron-scope-fence on every gateway move so a
+      # refactor cannot drop the forward/injection or let it bleed into the
+      # trusted-actor / ACL decision.
+      add_required queue a2a-rooms-p1b-acl 1652-queue-gateway-crashloop 1792-cron-scope-fence
       ;;
 
     bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge_reconcile_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|lib/daemon-helpers/a2a-receiver-exit-cause.py|lib/daemon-helpers/a2a-receiver-staleness.py|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/smoke/rooms-p4-2-roster-broadcast-helper.py|scripts/smoke/rooms-p4-2-post-hook.sh|scripts/smoke/rooms-p4-3-room-talk-helper.py|scripts/smoke/rooms-p4-3-post-hook.sh|scripts/smoke/1594-rooms-fanout-helper.py|scripts/smoke/1594-rooms-fanout-post-hook.sh|scripts/smoke/1594-rooms-fanout-local-hook.sh|scripts/smoke/rooms-p4-5-polish.sh|scripts/smoke/rooms-p4-5-helper.py|scripts/smoke/1563-pr8-a2a-diag-recovery-helper.py|scripts/smoke/1575b-a2a-backoff-ceiling-helper.py|scripts/smoke/1618-outbox-retry-resets-attempts-helper.py|scripts/smoke/1628-a2a-deliver-per-row-guard-helper.py|scripts/smoke/1629-healthz-not-semaphore-gated-helper.py|scripts/smoke/1595-cloudflare-warp-mesh-helper.py|scripts/smoke/1758-trusted-routed-transport.sh|scripts/smoke/1758-trusted-routed-transport-helper.py|scripts/smoke/1701-warp-healthz-socket-held-helper.py|scripts/smoke/1697-a2a-net-status-helper.py|scripts/smoke/1685-boot-marker-helper.py|scripts/smoke/v0165-l0-reconcile-skeleton-helper.py|scripts/smoke/v0165-l2-tunnel-health-helper.py|scripts/smoke/v0165-l1-stable-addr-helper.py|scripts/smoke/v0165-l3-peer-reachability-helper.py|scripts/smoke/v0165-l4-token-join-helper.py|scripts/smoke/v0165-l4-token-join-post-hook.sh|scripts/smoke/v0165-l5-relay-roster-helper.py|scripts/smoke/v0165-l5-relay-post-hook.sh|scripts/smoke/v0165-l5-roster-post-hook.sh|scripts/smoke/v0165-l6-net-status-v2.sh|scripts/smoke/v0165-l6-net-status-v2-helper.py|scripts/smoke/v0166-la-tunnel-bounce-gate.sh|scripts/smoke/v0166-la-tunnel-bounce-gate-helper.py|scripts/smoke/v0166-lb-transient-peers.sh|scripts/smoke/v0166-lb-transient-peers-helper.py|scripts/smoke/1728-test-bind-state-path-guard.sh|scripts/smoke/1728-test-bind-state-path-guard-helper.py|scripts/smoke/1679-1680-a2a-receiver-supervisor-robustness.sh|scripts/install-handoffd-systemd.sh)
@@ -2150,7 +2172,14 @@ select_for_path() {
       # cannot re-introduce the fatal raise, regress to silent truncation, make
       # an empty `summary` non-fatal, or leak the scope fence (bad
       # forward_target must stay fatal).
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive
+      # Issue #1792: bridge-cron-runner.py's build_prompt now appends the
+      # job-name-parameterized SCOPE FENCE block (the cheap, big-win mitigation
+      # for cron-child scope creep) and exports BRIDGE_CRON_RUN_ID into the
+      # dispatched child env so a task it creates is attributable. Pull
+      # 1792-cron-scope-fence on every runner move so a future PR cannot drop the
+      # fence header, stop interpolating the job title, drop a load-bearing
+      # prohibition, or stop threading the run-id origin stamp.
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence
       add_integration integration-minimal
       ;;
 
