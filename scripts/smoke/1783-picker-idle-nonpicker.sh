@@ -79,7 +79,14 @@ declare -F bridge_picker_unknown_escalation_cap >/dev/null \
 
 # Issue's sanitized idle captures (composer line + footer).
 CLAUDE_IDLE=$'──────────────────── agent ──\n❯\n────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n'
-CODEX_IDLE=$'› Run /review on my current changes\n\n  gpt-5.5 xhigh fast · ~/.agent-bridge/data/agents/x/workdir\n'
+# EMPTY codex composer — the only shape the codex-idle-ready entry matches
+# (empty-only is the P1-safe boundary: a real picker option row always has
+# text after '›', so it can never masquerade as the composer line).
+CODEX_IDLE=$'›\n\n  gpt-5.5 xhigh fast · ~/.agent-bridge/data/agents/x/workdir\n'
+# GHOST-placeholder codex idle (the issue's sanitized capture). Deliberately
+# NOT excluded by the catalog (documented residual): it reaches the unknown
+# path and is bounded by the 2-tick/5-min budget + the per-pass storm fuse.
+CODEX_IDLE_GHOST=$'› Run /review on my current changes\n\n  gpt-5.5 xhigh fast · ~/.agent-bridge/data/agents/x/workdir\n'
 # A genuine novel confirm picker: option text after the selector.
 REAL_PICKER=$'Proceed with this action?\n❯ 1. Yes, continue\n  2. No, cancel\n'
 
@@ -117,6 +124,12 @@ test_a_idle_nonpicker_entries() {
   d="$(classify_shipped codex "$CODEX_IDLE")"
   smoke_assert_eq "true"  "$(json_field "$d" non_picker)" "A: codex idle → non_picker"
   smoke_assert_eq "codex-idle-ready" "$(json_field "$d" picker_id)" "A: codex idle → codex-idle-ready"
+
+  # Documented residual (empty-only boundary): GHOST placeholder text after '›'
+  # is NOT excluded — it walks the unknown path (bounded by budget + storm fuse)
+  # rather than risk a real '› /…' picker option row masquerading as idle.
+  d="$(classify_shipped codex "$CODEX_IDLE_GHOST")"
+  smoke_assert_eq "false" "$(json_field "$d" non_picker)" "A: codex GHOST idle is the documented fuse-bounded residual (not excluded)"
 
   # A genuine picker renders option text after the selector → does NOT match the
   # empty-composer idle entry, so it is still eligible for the unknown path.
@@ -158,7 +171,7 @@ CODEX_FOREGROUND_FOOTER_BELOW=$'Proceed with action?\n› Yes, continue\n› No,
 #    ready composer/footer) → still non_picker → no false escalation. This is the
 #    second-round guard: ordinary scrollback above the tail composer is ignored.
 CLAUDE_STALE_SCROLLBACK=$'earlier run:\n  1. did thing\n  2. did other\nall done — press enter\n──────────────────── agent ──\n❯\n────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n'
-CODEX_STALE_SCROLLBACK=$'earlier:\n  1. option a\n  2. option b\n› Run /review on my current changes\n\n  gpt-5.5 xhigh fast · ~/.agent-bridge/data/agents/x/workdir\n'
+CODEX_STALE_SCROLLBACK=$'earlier:\n  1. option a\n  2. option b\n›\n\n  gpt-5.5 xhigh fast · ~/.agent-bridge/data/agents/x/workdir\n'
 
 # ---------------------------------------------------------------------
 # A3 — composite/foreground guard (queue codex review): a FOREGROUND picker (idle
