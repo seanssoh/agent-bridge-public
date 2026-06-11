@@ -477,11 +477,16 @@ T6_PROBE="$SMOKE_TMP_ROOT/t6-probe.py"
   printf '    ("plain-head", "head -10 " + rp, True),\n'
   printf '    ("plain-tail", "tail -5 " + rp, True),\n'
   printf "    ('plain-awk', 'awk {print} ' + rp, True),\n"
-  # `sed` (no -i) is NOT on `_READ_INTENT_BASH_COMMANDS` and the
-  # whitelist refuses it. Operators use `cat | sed` or `agent-bridge
-  # config get` instead. This is correct behavior — sed has many
-  # write-capable subcommands ("w" / "W") even without `-i`.
-  printf "    ('plain-sed-noi', 'sed -n 1,5p ' + rp, False),\n"
+  # Issue #1806 (3d): `sed -n …p` (and other no-write sed reads) are now on
+  # `_READ_INTENT_BASH_COMMANDS` → True. The escalations stay False:
+  # the in-place flag (`-i`/`-ni`/`--in-place`, below) AND the program
+  # write/exfil commands (`w`/`W`/`r`/`R`/`s///w`) that need no `-i`, recovered
+  # via shlex so a quoted `sed 'w /tmp/leak'` script word is not fragmented.
+  printf "    ('plain-sed-noi', 'sed -n 1,5p ' + rp, True),\n"
+  printf "    ('sed-subst-read', 'sed s/a/b/ ' + rp, True),\n"
+  printf "    ('sed-write-cmd', \\\"sed 'w /tmp/leak' \\\" + rp, False),\n"
+  printf "    ('sed-subst-write', \\\"sed -n 's/x/y/w /tmp/leak' \\\" + rp, False),\n"
+  printf "    ('sed-read-ext', \\\"sed 'r /etc/passwd' \\\" + rp, False),\n"
   printf '    ("read-pipeline", "grep BRIDGE " + rp + " | head -3", True),\n'
   # Unknown stage leaders the r1 blacklist wrongly admitted → False.
   printf '    ("python3-mutator", "python3 /tmp/mutator.py " + rp, False),\n'
@@ -578,7 +583,15 @@ smoke_assert_contains "$T6_OUT" "OK classifier plain-tail" \
 smoke_assert_contains "$T6_OUT" "OK classifier plain-awk" \
   "T6: plain awk (no -i) admitted by whitelist"
 smoke_assert_contains "$T6_OUT" "OK classifier plain-sed-noi" \
-  "T6: sed (even without -i) refused by whitelist — has write-capable subcommands"
+  "T6 (#1806 3d): sed -n …p read admitted by whitelist (no-write sed is read-intent)"
+smoke_assert_contains "$T6_OUT" "OK classifier sed-subst-read" \
+  "T6 (#1806 3d): sed s/a/b/ read admitted by whitelist"
+smoke_assert_contains "$T6_OUT" "OK classifier sed-write-cmd" \
+  "T6 (#1806 3d): sed 'w file' write command refused (program write, no -i)"
+smoke_assert_contains "$T6_OUT" "OK classifier sed-subst-write" \
+  "T6 (#1806 3d): sed s///w write flag refused (program write, no -i)"
+smoke_assert_contains "$T6_OUT" "OK classifier sed-read-ext" \
+  "T6 (#1806 3d): sed 'r file' external-read refused (exfil surface)"
 
 # Classifier assertions — unknown leaders refused (codex r1 BLOCKING).
 smoke_assert_contains "$T6_OUT" "OK classifier python3-mutator" \

@@ -220,11 +220,23 @@ fi
 smoke_log "ok: D template references blessed verb pinned to \$TARGET_ROOT, no raw verify-tasks-db run line"
 
 # ---------------------------------------------------------------------------
-# E. tool-policy — blessed verb ALLOWED, raw db-path command DENIED.
+# E. tool-policy — blessed verb ALLOWED, raw db-path command routing.
 # ---------------------------------------------------------------------------
 POLICY_HOME="$(make_home policy-home)"
 "$PY_BIN" "$SEED" plain "$POLICY_HOME/state/tasks.db"
 DB_PATH="$POLICY_HOME/state/tasks.db"
+
+# Issue #1806: a STRICT trusted admin (env BRIDGE_ADMIN_AGENT_ID + controller-
+# roster agreement) may now run an EXACT `sqlite3 <task_db> …` invocation
+# (allow+audit). The strict predicate reads the controller roster via
+# `agent list --json`; pin it deterministically with the read-only test seam so
+# this smoke does NOT depend on (or leak from) the operator's live roster.
+POLICY_ROSTER_JSON="$SMOKE_TMP_ROOT/1786-controller-roster.json"
+printf -- '%s\n' \
+  '[' \
+  '  {"agent": "patch", "admin": true, "source": "static"}' \
+  ']' \
+  >"$POLICY_ROSTER_JSON"
 
 # Build a PreToolUse Bash payload. $1 target file, $2 command.
 json_escape() {
@@ -259,6 +271,7 @@ assert_bash_verdict() {
     BRIDGE_HOME="$POLICY_HOME" \
     BRIDGE_AGENT_ID="patch" \
     BRIDGE_ADMIN_AGENT_ID="patch" \
+    BRIDGE_GUARD_ADMIN_ROSTER_JSON="$POLICY_ROSTER_JSON" \
     BRIDGE_AGENT_CLASS_FOR_HOOK="system" \
     "$PY_BIN" "$POLICY" <"$payload"
   )"
@@ -288,16 +301,23 @@ assert_bash_verdict "rendered template run line" \
 # the template clears env instead of passing --task-db.
 assert_bash_verdict "doctor --task-db <db path>" \
   "agent-bridge doctor --detectors tasks-db --task-db ${DB_PATH} --json" DENY
-# The raw helper names the queue DB path on its argv -> hook-blocked. We name
-# the literal db path so the queue-DB argv gate fires (this is the "step the
-# agent cannot complete" the issue describes).
-assert_bash_verdict "raw sqlite3 on db path" \
-  "sqlite3 ${DB_PATH} 'PRAGMA quick_check'" DENY
+# Issue #1806 (operator policy 2026-06-12, SUPERSEDES #1786's admin-deny for
+# this exact shape): a STRICT trusted admin may now run an EXACT
+# `sqlite3 <literal task_db> …` invocation — allow+audit. The blessed `doctor`
+# verb above stays the RECOMMENDED path (and is what the template renders), but
+# the guard no longer hard-blocks the admin's raw read. The relaxation is tight:
+# it requires the FIRST positional to resolve to EXACTLY the task DB, with NO
+# shell metachar / embedding (so the var-indirection + sibling forms below stay
+# DENIED). Audited via the `admin_sqlite3_task_db` row.
+assert_bash_verdict "trusted-admin raw sqlite3 on literal db path (#1806)" \
+  "sqlite3 ${DB_PATH} 'PRAGMA quick_check'" ALLOW
 # Env-prefix bypass (codex r1, patch-dev): a leading `VAR=<tasks.db>` assignment
-# whose VALUE statically spells the queue DB path must be DENIED even though the
-# opener references the path via the variable. `_bash_argv_references_path` now
-# decodes leading-assignment values. (Static-decodable class #1709; runtime-only
-# $var indirection is #1738.) Both patch-dev probes verbatim:
+# whose VALUE statically spells the queue DB path must be DENIED — the opener
+# references the path via the `$VAR` indirection, which the #1806 sqlite3
+# carve-out rejects (its FIRST positional is `$DB`/`$BRIDGE_TASK_DB`, an
+# unresolved expansion → fail-closed), and the queue-DB argv gate's
+# leading-assignment decode catches the path. (Static-decodable class #1709;
+# runtime-only $var indirection is #1738.) Both patch-dev probes verbatim:
 assert_bash_verdict "env-prefix DB=<path> sqlite3 \$DB" \
   "DB=${DB_PATH} sqlite3 \"\$DB\" 'PRAGMA quick_check'" DENY
 assert_bash_verdict "env-prefix BRIDGE_TASK_DB=<path> sqlite3 \$BRIDGE_TASK_DB" \
