@@ -6,7 +6,8 @@ subprocess capture). Invoked as:
 
     assert-bounded-scan.py <case> <scan-json> <agent-id>
 
-where <case> is one of t1..t4. Exits 0 on success, non-zero with a
+where <case> is one of t1..t4, t6, or t7 (t5 is asserted inline in the
+smoke shell on the markdown body). Exits 0 on success, non-zero with a
 diagnostic on failure.
 """
 from __future__ import annotations
@@ -73,6 +74,80 @@ def case_t3(row: dict) -> None:
         _fail(f"T3: link below max-depth must NOT be reported, got {links}")
 
 
+def case_t6(row: dict) -> None:
+    """#1801 r2: exclude .claude/worktrees from the walk.
+
+    The workdir holds a genuine top-level broken link plus a populated
+    ``.claude/worktrees/<x>/`` full of broken symlinks. max-entries is forced
+    low in the shell so that WITHOUT the worktrees exclusion the bounded walk
+    would burn its budget inside the worktree volume and set truncated=true
+    while MISSING the genuine top-level link. The exclusion must (a) keep the
+    genuine top-level link reported, (b) NOT report any worktree entry, and
+    (c) NOT spuriously set truncated."""
+    links = row["broken_links"]
+    if not any("genuine-top" in link for link in links):
+        _fail(
+            f"T6: genuine top-level broken link must still be reported with "
+            f"the worktrees exclusion, got {links}"
+        )
+    if any("worktrees" in link or "wt-broken" in link for link in links):
+        _fail(
+            f"T6: .claude/worktrees entries must NOT be walked/reported, "
+            f"got {links}"
+        )
+    if row["broken_links_truncated"]:
+        _fail(
+            "T6: truncated must NOT be set — pruning .claude/worktrees keeps "
+            "the walk within budget; a true here means the worktree volume "
+            f"still consumed the budget. note={row.get('broken_links_note')!r}"
+        )
+    if row["broken_links_scan_skipped"]:
+        _fail("T6: a normal bounded workdir must not be scan_skipped")
+
+
+def case_t7(rows: list[dict]) -> None:
+    """#1801 r2: within-pass dedupe of a shared workdir.
+
+    Two agents share one realpath workdir. Assert BOTH rows are present, BOTH
+    carry the same (correct) broken_links, and exactly one row is annotated
+    with the ``shared workdir, scanned via <first>`` provenance note (the
+    second agent reusing the first's walk). The walked-once proof itself is
+    asserted on the dedupe instrumentation in the shell."""
+    if len(rows) != 2:
+        _fail(f"T7: expected exactly 2 shared-workdir rows, got {len(rows)}")
+    # Both rows must report the genuine broken link in the shared workdir.
+    for r in rows:
+        if not any("shared-broken" in link for link in r["broken_links"]):
+            _fail(
+                f"T7: agent {r['agent']!r} row must report the shared "
+                f"workdir's broken link, got {r['broken_links']}"
+            )
+        if r["broken_links_truncated"] or r["broken_links_scan_skipped"]:
+            _fail(
+                f"T7: shared workdir is a normal bounded scan; "
+                f"agent {r['agent']!r} must be complete (not truncated/skipped)"
+            )
+    # The two rows must agree on the link set (dedupe must not diverge them).
+    link_sets = [sorted(r["broken_links"]) for r in rows]
+    if link_sets[0] != link_sets[1]:
+        _fail(
+            f"T7: both shared-workdir rows must carry the SAME broken_links; "
+            f"got {link_sets[0]} vs {link_sets[1]}"
+        )
+    # Exactly one row is the reused (second) agent carrying the share note.
+    shared = [
+        r
+        for r in rows
+        if "shared workdir, scanned via" in (r.get("broken_links_note") or "")
+    ]
+    if len(shared) != 1:
+        notes = [r.get("broken_links_note") for r in rows]
+        _fail(
+            f"T7: exactly one row must carry the shared-workdir provenance "
+            f"note (the reused agent); got {len(shared)} (notes={notes})"
+        )
+
+
 def case_t4(row: dict) -> None:
     """Skipped: HOME-scale workdir."""
     if not row["broken_links_scan_skipped"]:
@@ -96,17 +171,26 @@ def case_t4(row: dict) -> None:
 def main() -> int:
     if len(sys.argv) != 4:
         print(
-            "usage: assert-bounded-scan.py <case> <scan-json> <agent-id>",
+            "usage: assert-bounded-scan.py <case> <scan-json> <agent-id>\n"
+            "  (t7: <agent-id> is a comma-joined pair 'agentA,agentB')",
             file=sys.stderr,
         )
         return 2
     case, scan_json, agent_id = sys.argv[1], sys.argv[2], sys.argv[3]
+    # t7 asserts across the two agents that share one workdir; its agent-id
+    # arg is a comma-joined pair. Every other case asserts on a single row.
+    if case == "t7":
+        agent_ids = [a for a in agent_id.split(",") if a]
+        rows = [_agent_row(scan_json, a) for a in agent_ids]
+        case_t7(rows)
+        return 0
     row = _agent_row(scan_json, agent_id)
     dispatch = {
         "t1": case_t1,
         "t2": case_t2,
         "t3": case_t3,
         "t4": case_t4,
+        "t6": case_t6,
     }
     fn = dispatch.get(case)
     if fn is None:

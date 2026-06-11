@@ -737,8 +737,20 @@ def collect_broken_links(agent_dir: Path) -> BrokenLinksResult:
     for dirpath, dirnames, filenames in os.walk(resolved, followlinks=False):
         here = Path(dirpath)
         depth = len(here.parts) - base_depth
-        # Prune heavy/noise subtrees in-place BEFORE descending.
-        dirnames[:] = [d for d in dirnames if d not in BROKEN_LINKS_EXCLUDE_DIRS]
+        # Prune heavy/noise subtrees in-place BEFORE descending. Two prune
+        # passes: (1) the basename denylist (codex caches, package stores,
+        # VCS internals), and (2) the path-scoped relpath denylist
+        # (#1801 r2) — a dir whose (parent-basename, own-basename) matches an
+        # entry in BROKEN_LINKS_EXCLUDE_RELPATHS is pruned only under that
+        # specific parent, so ``.claude/worktrees`` is skipped while an
+        # unrelated dir named ``worktrees`` elsewhere is still walked.
+        here_name = here.name
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in BROKEN_LINKS_EXCLUDE_DIRS
+            and (here_name, d) not in BROKEN_LINKS_EXCLUDE_RELPATHS
+        ]
         # Depth cap: at/over max_depth, do not descend further. The current
         # level's own entries are still inspected below.
         if depth >= max_depth and dirnames:
@@ -784,6 +796,74 @@ def collect_broken_links(agent_dir: Path) -> BrokenLinksResult:
             break
 
     return BrokenLinksResult(links=broken, truncated=truncated, note=note)
+
+
+def _collect_broken_links_deduped(
+    agent_dir: Path,
+    agent_name: str,
+    cache: dict[str, tuple[str, BrokenLinksResult]] | None,
+) -> BrokenLinksResult:
+    """#1801 r2 (#12626): within-scan-pass dedupe wrapper around
+    :func:`collect_broken_links`.
+
+    Two agents that share the same workdir (same ``os.path.realpath``) — the
+    common case for a codex ``<admin>-dev`` pair layered onto its admin's
+    checkout — would otherwise each walk that tree once, so a shared
+    401k-entry checkout is paid for N times in one pass. With a per-pass
+    ``cache`` dict the FIRST agent at a given realpath does the walk and
+    stores ``(agent_name, result)``; a later agent at the same realpath
+    reuses the cached result and gets a fresh :class:`BrokenLinksResult` whose
+    ``note`` records the share (``shared workdir, scanned via <first-agent>``)
+    so its row stays truthful — same ``links`` and same 3-state flags, only
+    the redundant filesystem walk is elided. A non-shared workdir is walked
+    and cached exactly as before. ``cache is None`` (legacy callers) → always
+    walk, no dedupe.
+
+    Dedupe is deliberately at the scan-pass loop level (here / the caller),
+    never inside the leaf :func:`collect_broken_links`, so the leaf scanner
+    stays a pure function of its ``agent_dir`` and remains independently
+    testable."""
+    if cache is None:
+        return collect_broken_links(agent_dir)
+    try:
+        key = os.path.realpath(agent_dir)
+    except OSError:
+        # realpath failed (rare); fall back to an un-deduped walk rather than
+        # risk a wrong-key cache hit. Correctness over the walk-elision win.
+        return collect_broken_links(agent_dir)
+    cached = cache.get(key)
+    if cached is not None:
+        first_agent, result = cached
+        # #1801 r2: optional instrumentation so a test (or an operator
+        # debugging a slow pass) can prove the dedupe fired without parsing
+        # timings. Off by default; one stderr line per elided walk.
+        if os.environ.get("BRIDGE_WATCHDOG_DEBUG_DEDUPE"):
+            print(
+                f"[bridge-watchdog] broken-links dedupe HIT: "
+                f"{agent_name} reuses {first_agent} for {key}",
+                file=sys.stderr,
+            )
+        # Re-derive the per-agent row from the cached result, appending the
+        # shared-workdir provenance to whatever degrade note the cached scan
+        # already carried (truncated / skipped notes are preserved verbatim
+        # and the share annotation is added so the row stays self-describing).
+        shared_note = f"shared workdir, scanned via {first_agent}"
+        note = f"{result.note}; {shared_note}" if result.note else shared_note
+        return BrokenLinksResult(
+            links=list(result.links),
+            truncated=result.truncated,
+            scan_skipped=result.scan_skipped,
+            note=note,
+        )
+    result = collect_broken_links(agent_dir)
+    cache[key] = (agent_name, result)
+    if os.environ.get("BRIDGE_WATCHDOG_DEBUG_DEDUPE"):
+        print(
+            f"[bridge-watchdog] broken-links dedupe MISS (walked): "
+            f"{agent_name} for {key}",
+            file=sys.stderr,
+        )
+    return result
 
 
 def parse_session_type(agent_dir: Path) -> tuple[str, str]:
@@ -911,6 +991,26 @@ BROKEN_LINKS_EXCLUDE_DIRS = frozenset(
         "__pycache__",
         ".Trash",
         ".local",
+    }
+)
+# #1801 r2 (#12626): path-scoped exclusions pruned by (parent-basename,
+# dir-basename) rather than a blanket basename prune. The dominant cost in
+# the live follow-up was ``.claude/worktrees/`` — agent-isolation worktrees,
+# each a FULL repo checkout (401k+ entries), multiplied by N agents. A bare
+# ``worktrees`` basename prune in ``BROKEN_LINKS_EXCLUDE_DIRS`` would also
+# blanket-skip an unrelated dir literally named ``worktrees`` elsewhere, so
+# the prune is scoped to the agent-isolation parent (``.claude``). Pruning
+# only ``.claude/worktrees`` keeps the rest of ``.claude/`` walked (settings
+# / state there is small and may hold genuine broken links). ``.git/worktrees``
+# (git's own worktree metadata) needs no entry here — it is already inside the
+# ``.git`` basename prune above. WHY this is a CORRECTNESS fix, not just speed:
+# without excluding the worktree checkouts the bounded walk burns its entire
+# max-entries / wall-time budget inside the worktrees and sets
+# ``truncated=true`` while MISSING the genuine top-level broken links it should
+# report — truncation hiding real drift.
+BROKEN_LINKS_EXCLUDE_RELPATHS = frozenset(
+    {
+        (".claude", "worktrees"),
     }
 )
 
@@ -1609,7 +1709,20 @@ def scan_agent(
     state_dir: Path | None = None,
     fresh_install_home_dir: Path | None = None,
     agent_home_dir: Path | None = None,
+    broken_links_cache: dict[str, tuple[str, BrokenLinksResult]] | None = None,
 ) -> AgentWatch:
+    # #1801 r2 (#12626): ``broken_links_cache`` is an optional per-pass dict
+    # the agent-loop in ``main()`` threads through so a workdir shared by
+    # multiple agents (same ``os.path.realpath``) is walked exactly ONCE per
+    # pass, not once per agent. A shared workdir is the common case for a
+    # codex ``<admin>-dev`` pair layered onto its admin's checkout. The key
+    # is the realpath of the scanned dir; the value is
+    # ``(first-agent-id, BrokenLinksResult)``. Every agent still gets its own
+    # truthful AgentWatch row carrying that workdir's broken_links — the
+    # cache only elides the redundant filesystem walk. A non-shared workdir
+    # is computed and cached normally with no behavior change. Legacy callers
+    # (smoke tests, ad-hoc ``watchdog scan <agent>``) pass ``None`` and the
+    # scan runs unconditionally, exactly as before.
     # `agent_name` (#1108) is the registry id, threaded through
     # explicitly because on v2 layouts ``agent_dir`` resolves to
     # ``$BRIDGE_DATA_ROOT/agents/<a>/workdir`` — so ``agent_dir.name``
@@ -1716,7 +1829,15 @@ def scan_agent(
             missing_block = False
         session_type, onboarding_state = parse_session_type(agent_dir)
         heartbeat_present, heartbeat_age = heartbeat_age_seconds(agent_dir)
-        broken = collect_broken_links(agent_dir)
+        # #1801 r2 (#12626): within-pass dedupe of identical workdirs keyed by
+        # realpath. The first agent with a given realpath does the walk; a
+        # later agent in the same pass that resolves to the same realpath
+        # reuses that result and annotates its note so the per-agent row stays
+        # truthful (same broken_links, same 3-state flags) while skipping the
+        # redundant walk. ``None`` cache → unconditional scan (legacy callers).
+        broken = _collect_broken_links_deduped(
+            agent_dir, resolved_name, broken_links_cache
+        )
         # #1801: classify_status keys off the broken-link LIST only. A
         # truncated scan that found genuine broken links still drives a
         # `warn` (real drift); a skipped scan returns an empty list, so the
@@ -2048,6 +2169,14 @@ def main() -> int:
     # caller of either helper outside ``scan_agent``'s try/except would
     # re-introduce the same crash class — the outer guard closes both.
     records: list[AgentWatch] = []
+    # #1801 r2 (#12626): per-pass broken-links dedupe cache, keyed by the
+    # resolved-scan-path realpath. Threaded into every ``scan_agent`` call so
+    # a workdir shared by multiple agents (a codex ``<admin>-dev`` pair on its
+    # admin's checkout) is walked once per pass instead of once per agent —
+    # the dominant repeated cost in the live follow-up. Scoped to this single
+    # pass (a fresh dict each ``main()`` invocation) so a workdir whose
+    # contents change between ticks is always re-walked next tick.
+    broken_links_cache: dict[str, tuple[str, BrokenLinksResult]] = {}
     for path in scan_paths:
         agent_name = path.name
         agent_meta = registry_meta.get(agent_name, {})
@@ -2083,6 +2212,9 @@ def main() -> int:
                     # measured against the scaffold mtime, not the
                     # potentially-younger materialize target.
                     fresh_install_home_dir=path,
+                    # #1801 r2: per-pass dedupe cache (see above) so a shared
+                    # workdir's broken-link walk is paid once per pass.
+                    broken_links_cache=broken_links_cache,
                 )
             )
         except (PermissionError, FileNotFoundError, OSError) as exc:

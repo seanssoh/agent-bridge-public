@@ -241,4 +241,93 @@ if [[ "$RENDERED" -gt 50 ]]; then
 fi
 smoke_log "T5 PASS: markdown render caps broken_links list at $RENDERED rows (≤ 50) + (N more …) summary"
 
-smoke_log "all 5 tests PASS (#1801 bounded broken-links scan)"
+# ---------------------------------------------------------------------------
+# T6 — #1801 r2: exclude .claude/worktrees from the walk
+# ---------------------------------------------------------------------------
+# THE r2 BUG (live follow-up #12626): the dominant cost was `.claude/worktrees/`
+# — agent-isolation worktrees, each a FULL repo checkout (401k+ entries),
+# multiplied by N agents. Without pruning that tree the bounded walk burns its
+# whole max-entries / wall-time budget INSIDE the worktree checkouts, sets
+# truncated=true, and MISSES the genuine top-level broken links it should
+# report (truncation hiding real drift). This is a CORRECTNESS fix.
+#
+# Fixture: a bounded workdir with ONE genuine top-level broken link plus a
+# populated `.claude/worktrees/wt-a/` full of broken symlinks. We force
+# max-entries LOW so that WITHOUT the exclusion the worktree volume would trip
+# truncated and the genuine top-level link would be lost. WITH the exclusion
+# the worktree is pruned, the top-level link is found, and truncated stays
+# false.
+A6="mon-worktrees"
+mkdir -p "$BRIDGE_AGENT_HOME_ROOT/$A6"
+WD6="$BRIDGE_DATA_ROOT/agents/$A6/workdir"
+seed_profile "$WD6"
+ln -s /nonexistent/genuine-top "$WD6/genuine-top"   # genuine, top-level → MUST report
+# Populate .claude/worktrees/wt-a/ with many broken symlinks (the heavy tree
+# that must NOT be walked). 200 entries >> the forced max-entries=20 below, so
+# without the exclusion the budget is exhausted before the genuine link is
+# even reached (the genuine link sorts AFTER `.claude` in os.walk order at the
+# top level, so a budget burned in .claude/worktrees would miss it).
+WT6="$WD6/.claude/worktrees/wt-a"
+mkdir -p "$WT6"
+for i in $(seq 1 200); do
+  ln -s "/nonexistent/wt-broken-$i" "$WT6/wt-broken-$i"
+done
+# Before/after entry-count proof: count what the walk WOULD see with vs
+# without the worktrees prune (deterministic filesystem count, independent of
+# the scanner). With the prune, .claude/worktrees is never descended.
+WT_ENTRY_COUNT="$(find "$WT6" -mindepth 1 | wc -l | tr -d ' ')"
+smoke_log "T6 fixture: .claude/worktrees/wt-a holds $WT_ENTRY_COUNT entries (must be skipped); 1 genuine top-level link"
+
+REG6="$SMOKE_TMP_ROOT/reg-$A6.json"
+cat >"$REG6" <<EOF
+[{"id":"$A6","class":"static","agent_source":"static","engine":"claude","workdir":"$WD6"}]
+EOF
+
+# Force max-entries low: WITHOUT the exclusion, the 200-entry worktree tree
+# would trip truncated and miss the genuine link. WITH it, the prune keeps the
+# walk tiny so the genuine link is found and truncated stays false.
+OUT6="$(BRIDGE_WATCHDOG_BROKEN_LINKS_MAX_ENTRIES=20 \
+  "$PY_BIN" "$REPO_ROOT/bridge-watchdog.py" scan --json \
+  --agent-registry-json "$REG6" 2>"$SMOKE_TMP_ROOT/t6.err")"
+"$PY_BIN" "$HELPER" t6 "$OUT6" "$A6" \
+  || smoke_fail "T6 failed: .claude/worktrees exclusion contract regressed (see $SMOKE_TMP_ROOT/t6.err)"
+smoke_log "T6 PASS: .claude/worktrees ($WT_ENTRY_COUNT entries) pruned, genuine top-level link reported, truncated=false"
+
+# ---------------------------------------------------------------------------
+# T7 — #1801 r2: within-pass dedupe of a shared workdir
+# ---------------------------------------------------------------------------
+# Two agents registered against the SAME workdir (same realpath). The scan
+# loops agents and calls the scanner once per agent → that tree was walked
+# once PER agent. The dedupe walks it once per pass, keyed by realpath, and
+# annotates the second agent's row with a `shared workdir, scanned via <first>`
+# note while keeping BOTH rows truthful (same broken_links, same 3-state).
+A7A="mon-shareA"
+A7B="mon-shareB"
+mkdir -p "$BRIDGE_AGENT_HOME_ROOT/$A7A" "$BRIDGE_AGENT_HOME_ROOT/$A7B"
+SHARED_WD="$BRIDGE_DATA_ROOT/agents/$A7A/workdir"
+seed_profile "$SHARED_WD"
+ln -s /nonexistent/shared-broken "$SHARED_WD/shared-broken"   # genuine, both rows must report
+
+REG7="$SMOKE_TMP_ROOT/reg-share.json"
+cat >"$REG7" <<EOF
+[{"id":"$A7A","class":"static","agent_source":"static","engine":"claude","workdir":"$SHARED_WD"},
+ {"id":"$A7B","class":"static","agent_source":"static","engine":"claude","workdir":"$SHARED_WD"}]
+EOF
+
+# Enable the dedupe instrumentation so we can PROVE the walk fired exactly
+# once across the two agents (1 MISS = walked, 1 HIT = reused).
+OUT7="$(BRIDGE_WATCHDOG_DEBUG_DEDUPE=1 \
+  "$PY_BIN" "$REPO_ROOT/bridge-watchdog.py" scan --json \
+  --agent-registry-json "$REG7" 2>"$SMOKE_TMP_ROOT/t7.err")"
+"$PY_BIN" "$HELPER" t7 "$OUT7" "$A7A,$A7B" \
+  || smoke_fail "T7 failed: shared-workdir dedupe contract regressed (see $SMOKE_TMP_ROOT/t7.err)"
+
+# Instrumentation proof: exactly one MISS (the walk) + one HIT (the reuse).
+DEDUPE_MISS="$(grep -c 'dedupe MISS (walked)' "$SMOKE_TMP_ROOT/t7.err" || true)"
+DEDUPE_HIT="$(grep -c 'dedupe HIT' "$SMOKE_TMP_ROOT/t7.err" || true)"
+if [[ "$DEDUPE_MISS" -ne 1 || "$DEDUPE_HIT" -ne 1 ]]; then
+  smoke_fail "T7 failed: shared workdir must be walked exactly once (1 MISS + 1 HIT); got MISS=$DEDUPE_MISS HIT=$DEDUPE_HIT (see $SMOKE_TMP_ROOT/t7.err)"
+fi
+smoke_log "T7 PASS: shared workdir walked once (MISS=$DEDUPE_MISS, HIT=$DEDUPE_HIT), both rows present + correct"
+
+smoke_log "all 7 tests PASS (#1801 bounded broken-links scan + r2 worktrees-exclusion + shared-workdir dedupe)"
