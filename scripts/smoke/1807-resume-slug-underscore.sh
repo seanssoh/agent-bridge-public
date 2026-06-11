@@ -44,6 +44,37 @@ fi
 #   T4. Negative control — a NON-underscore workdir still resolves (the
 #       existing slash+dot candidates must keep working; the new candidate
 #       de-dupes to the same slug and must not change behavior).
+#   T5. detect helper, TRANSCRIPT-ONLY fixture (no live sessions/<pid>.json).
+#       This is the tooth that genuinely pins the detect-helper slug bug. T1's
+#       fixture seeds a live same-cwd session JSON, so on origin/main the OLD
+#       helper still passes T1 even with the wrong slug: its primary
+#       live-session loop matches the session record by cwd and then finds the
+#       transcript via the *slug-independent* recursive
+#       `projects/**/<sid>.jsonl` glob (and the #827 live-pid acceptance). With
+#       NO session JSON the detect helper has only its slug-DEPENDENT fallback
+#       transcript scan, so the underscore-mapping candidate is the ONLY thing
+#       that can reach the on-disk project dir.
+#   T6. resolve helper + matching candidate, TRANSCRIPT-ONLY fixture (no live
+#       sessions/<pid>.json). The tooth that genuinely pins the resolve
+#       candidate path. T3's fixture seeds a live same-cwd session JSON, so on
+#       origin/main the #827 live-session shortcut accepts the candidate
+#       *slug-independently* and T3 passes despite the wrong slug. With no
+#       session JSON the shortcut is skipped and the candidate must be matched
+#       against the slug-DEPENDENT eligible-transcript scan.
+#
+# Discrimination proof (smoke-only r2; mirrors the US_CLAUDE_SLUG !=
+# US_SLASHDOT_SLUG sanity guard). T5/T6 use a transcript-only fixture so the
+# underscore slug alone decides pass/fail. Verified against BOTH helper
+# versions on a fixture whose on-disk project dir is the Claude-slugified
+# (`_`->`-`) name:
+#   detect  (T5):  origin/main -> ''            | branch -> <sid>
+#   resolve (T6):  origin/main -> rc=1 out=''    | branch -> rc=0 out=<sid>
+# i.e. T5/T6 FAIL on origin/main and PASS on the branch — the smoke now pins
+# the regression. (The pre-existing T2 — resolve with an EMPTY candidate — was
+# already slug-dependent on origin/main because an empty candidate skips the
+# live-session shortcut, so it failed on main too; T1/T3 were the masked ones.)
+# T1-T4 stay green on both helper versions (they assert the live-session
+# behavior + back-compat control, which the fix does not change).
 #
 # Isolation: temp BRIDGE_HOME via smoke_setup_bridge_home (v2 layout); the
 # smoke never reads or writes the operator's live `~/.claude` or bridge
@@ -102,6 +133,29 @@ seed_claude_config_dir_claude_slug() {
     >"$config_dir/sessions/$$.json"
   printf '{"sessionId":"%s"}\n' "$session_id" \
     >"$config_dir/projects/$slug/$session_id.jsonl"
+}
+
+# Seed a Claude config dir with a transcript ONLY — NO sessions/<pid>.json —
+# whose project dir is named by Claude's slugification of the workdir. This is
+# the DEAD / no-live-session shape: the helpers cannot fall back to the
+# slug-independent live-session paths (detect's recursive `projects/**` glob
+# is only reached for a matched session record; resolve's #827 live-session
+# shortcut needs a live same-cwd record), so the underscore-mapping slug
+# candidate is the only thing that can find the transcript. T5/T6 use this so
+# the smoke genuinely pins the regression instead of passing via a live record.
+seed_claude_config_dir_transcript_only() {
+  local config_dir="$1"
+  local workdir="$2"
+  local session_id="$3"
+  local slug
+  slug="$(claude_slug "$workdir")"
+  mkdir -p "$config_dir/projects/$slug"
+  printf '{"sessionId":"%s"}\n' "$session_id" \
+    >"$config_dir/projects/$slug/$session_id.jsonl"
+  # Assert the no-live-session precondition: no sessions/<pid>.json may exist,
+  # or T5/T6 would silently degrade back into the slug-independent live paths.
+  [[ ! -e "$config_dir/sessions" ]] \
+    || smoke_fail "transcript-only fixture leaked a sessions dir: $config_dir/sessions"
 }
 
 # --- Underscore-workdir fixture -----------------------------------------
@@ -191,9 +245,68 @@ test_resolve_no_underscore_control() {
     "T4 resolve helper returns the non-underscore candidate id"
 }
 
+# --- Transcript-only underscore fixture (the regression-pinning teeth) ----
+# A DEAD / no-live-session underscore workdir: a transcript exists on disk
+# under the Claude-slugified (`_`->`-`) project dir, but there is NO
+# sessions/<pid>.json. Without a live record neither helper can take its
+# slug-INDEPENDENT path (detect's recursive `projects/**` glob; resolve's #827
+# live-session shortcut), so ONLY the new underscore-mapping slug candidate can
+# reach the transcript. This is what makes T5/T6 fail on origin/main (old slugs
+# → empty/rc=1) and pass on the branch (new candidate → finds the transcript).
+TO_CONFIG_DIR="$SMOKE_TMP_ROOT/agent-home-transcript-only/.claude"
+TO_WORKDIR_PARENT="$SMOKE_TMP_ROOT/agents/dead_session"
+TO_WORKDIR="$TO_WORKDIR_PARENT/workdir"
+TO_SESSION_ID="abc12345-1807-transcript-only-fixture"
+mkdir -p "$TO_WORKDIR"
+TO_WORKDIR="$(cd -P "$TO_WORKDIR" && pwd -P)"
+[[ "$TO_WORKDIR" == *_* ]] \
+  || smoke_fail "transcript-only fixture workdir lost its underscore: $TO_WORKDIR"
+seed_claude_config_dir_transcript_only "$TO_CONFIG_DIR" "$TO_WORKDIR" "$TO_SESSION_ID"
+
+# Same discriminating-slug sanity as the T1-T3 fixture: the on-disk project
+# dir must be the Claude slug AND differ from the slash+dot-only slug, so only
+# the #1807 candidate can match.
+TO_CLAUDE_SLUG="$(claude_slug "$TO_WORKDIR")"
+TO_SLASHDOT_SLUG="${TO_WORKDIR//\//-}"; TO_SLASHDOT_SLUG="${TO_SLASHDOT_SLUG//./-}"
+[[ -d "$TO_CONFIG_DIR/projects/$TO_CLAUDE_SLUG" ]] \
+  || smoke_fail "transcript-only project dir not seeded at Claude slug: $TO_CLAUDE_SLUG"
+[[ "$TO_CLAUDE_SLUG" != "$TO_SLASHDOT_SLUG" ]] \
+  || smoke_fail "transcript-only slug not discriminating: $TO_CLAUDE_SLUG"
+
+# T5 — detect helper, TRANSCRIPT-ONLY. Genuinely pins the detect-helper slug
+# bug: with no live session record the only path to the transcript is the
+# slug-DEPENDENT fallback scan. origin/main old slugs miss → empty (FAIL);
+# the branch's underscore candidate finds it (PASS).
+test_detect_underscore_transcript_only() {
+  local out=""
+  out="$(python3 "$DETECT_HELPER" "$TO_WORKDIR" 0 "" "$TO_CONFIG_DIR")"
+  smoke_assert_eq "$TO_SESSION_ID" "$out" \
+    "T5 detect resolves an underscore workdir from transcript ONLY, no live session (#1807; FAILS on origin/main)"
+}
+
+# T6 — resolve helper + matching candidate, TRANSCRIPT-ONLY. Genuinely pins
+# the resolve candidate path: with no live session record the #827
+# live-session shortcut is skipped, so the candidate must be matched against
+# the slug-DEPENDENT eligible-transcript scan. origin/main old slugs →
+# rc=1/empty (FAIL); the branch's underscore candidate → rc=0/<sid> (PASS).
+test_resolve_underscore_candidate_transcript_only() {
+  local out="" rc=0
+  set +e
+  out="$(python3 "$RESOLVE_HELPER" \
+    "$TO_WORKDIR" "$TO_SESSION_ID" 48 testagent "" "$TO_CONFIG_DIR" 2>/dev/null)"
+  rc=$?
+  set -e
+  smoke_assert_eq "0" "$rc" \
+    "T6 resolve rc=0 accepts candidate from transcript ONLY, no live session (#1807; rc=1 on origin/main)"
+  smoke_assert_eq "$TO_SESSION_ID" "$out" \
+    "T6 resolve returns the transcript-only candidate id"
+}
+
 smoke_run "T1 detect resolves underscore workdir"           test_detect_underscore_workdir
 smoke_run "T2 resolve empty-candidate underscore workdir"   test_resolve_underscore_empty_candidate
 smoke_run "T3 resolve candidate underscore workdir"         test_resolve_underscore_candidate
 smoke_run "T4 resolve non-underscore control"               test_resolve_no_underscore_control
+smoke_run "T5 detect transcript-only underscore workdir"    test_detect_underscore_transcript_only
+smoke_run "T6 resolve candidate transcript-only workdir"    test_resolve_underscore_candidate_transcript_only
 
 smoke_log "all checks passed"
