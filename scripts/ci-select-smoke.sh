@@ -3998,7 +3998,16 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # resume on every helper move so a refactor cannot drop the trusted
       # accept (re-breaking fresh/idle restart resume) or widen it past the
       # candidate==trusted_id guard into a freshness-gate bypass.
-      add_required 1015-resume-claude-config-dir 981-restart-session-resume-snapshot Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race 1769-restart-trusted-resume
+      #
+      # Issue #1807: both helpers' workdir_slug_candidates() gained a third
+      # candidate `re.sub(r"[/._]", "-", path)` so an underscore-containing
+      # workdir matches the on-disk Claude project dir (some Claude Code
+      # versions map "_" → "-", anthropics/claude-code #30828; confirmed live
+      # on cm-prod). Pull 1807-resume-slug-underscore on every helper move so
+      # a refactor cannot drop the underscore candidate (re-breaking resume
+      # for any agent whose workdir path contains "_") or narrow the
+      # back-compat slash-only / slash+dot candidates.
+      add_required 1015-resume-claude-config-dir 981-restart-session-resume-snapshot Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race 1769-restart-trusted-resume 1807-resume-slug-underscore
       add_integration integration-minimal
       ;;
 
