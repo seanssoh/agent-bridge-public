@@ -499,16 +499,23 @@ _remat_copy_one_file() {
   local force_plan=0
   target_rel="$(_remat_rel_to_target_root "$dst")"
 
-  # Issue #1781 (DATA-LOSS): agent-written state files are never synced
-  # home->workdir. Record the LIVE workdir copy as a preserved path (so the
-  # upgrade backup still captures it) and return without touching it. This
-  # path is reached for both the named-file loop and the users-tree walk, so
+  # Issue #1781 (DATA-LOSS): agent-written state files must never be OVERWRITTEN
+  # home->workdir (that silently rolled live memory back to the stale home copy
+  # on every upgrade). But create-if-absent is still required: a fresh/legacy
+  # workdir with no MEMORY.md yet must receive the initial copy from the profile
+  # seed, or the runtime contract that Claude requires MEMORY.md
+  # (bridge-watchdog.py) breaks. So:
+  #   - dst present (file or symlink) -> PRESERVE: record the LIVE workdir copy
+  #     as a preserved path (so the upgrade backup still captures it) and never
+  #     touch it.
+  #   - dst absent -> fall through to the normal copy gate below, which
+  #     materializes the initial file when src exists (recording updated_paths +
+  #     auditing `rematerialize`) and no-ops when src is also absent.
+  # Reached for both the named-file loop and the users-tree walk, so
   # `users/<id>/MEMORY.md` is covered by the same basename guard.
-  if _remat_is_state_file "$rel"; then
-    if [[ -e "$dst" || -L "$dst" ]]; then
-      REMAT_PRESERVED_PATHS+=("$target_rel")
-      _remat_audit_line preserve "$target_rel"
-    fi
+  if _remat_is_state_file "$rel" && { [[ -e "$dst" ]] || [[ -L "$dst" ]]; }; then
+    REMAT_PRESERVED_PATHS+=("$target_rel")
+    _remat_audit_line preserve "$target_rel"
     return 0
   fi
 

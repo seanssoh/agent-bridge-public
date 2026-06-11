@@ -342,7 +342,71 @@ else:
 ' "$docs" || smoke_fail "source-token pin: bridge-docs.py still doc-rewrites MEMORY.md"
 }
 
+# PR #1782 codex r1 BLOCKING: the state-file guard must PRESERVE an existing
+# workdir MEMORY.md but still CREATE it when absent. A fresh/legacy workdir with
+# no MEMORY.md yet and a profile seed present must receive the initial copy, or
+# the runtime contract that Claude requires MEMORY.md (bridge-watchdog.py) breaks
+# and the 1113-watchdog-legacy-backfill teeth fail. This sub-test pins the
+# create-if-absent half; the divergent-preserve half stays covered above.
+test_memory_first_materialize() {
+  setup_bridge_fixture
+  write_roster fresh
+  seed_agent fresh
+  local profile="$BRIDGE_AGENT_HOME_ROOT/fresh"
+  local workdir="$BRIDGE_AGENT_ROOT_V2/fresh/workdir"
+
+  # Make the workdir a fresh/legacy one: remove the live MEMORY.md surfaces so
+  # only the profile (home) seed exists. memory/ tree removed too (irrelevant to
+  # the named/users sync set, but keep the fixture honest).
+  rm -f "$workdir/MEMORY.md" "$workdir/users/u1/MEMORY.md"
+  rm -rf "$workdir/memory"
+  [[ ! -e "$workdir/MEMORY.md" ]] || smoke_fail "fixture: workdir MEMORY.md should be absent"
+  [[ ! -e "$workdir/users/u1/MEMORY.md" ]] || smoke_fail "fixture: workdir users MEMORY.md should be absent"
+  # The profile seeds must exist (create source).
+  [[ -f "$profile/MEMORY.md" ]] || smoke_fail "fixture: profile MEMORY.md seed missing"
+  [[ -f "$profile/users/u1/MEMORY.md" ]] || smoke_fail "fixture: profile users MEMORY.md seed missing"
+
+  local out="$SMOKE_TMP_ROOT/fresh.out"
+  local stderr="$SMOKE_TMP_ROOT/fresh.stderr"
+  run_migrate >"$out" 2>"$stderr"
+
+  # Both MEMORY surfaces must be CREATED from the profile seed.
+  smoke_assert_file_exists "$workdir/MEMORY.md" \
+    "workdir MEMORY.md was not created from the profile seed (first-materialize broken)"
+  smoke_assert_file_exists "$workdir/users/u1/MEMORY.md" \
+    "workdir users/u1/MEMORY.md was not created from the profile seed"
+  smoke_assert_contains "$(cat "$workdir/MEMORY.md")" "STALE-HOME" \
+    "created workdir MEMORY.md does not hold the profile seed content"
+  smoke_assert_contains "$(cat "$workdir/users/u1/MEMORY.md")" "STALE-HOME" \
+    "created workdir users MEMORY.md does not hold the profile seed content"
+
+  # The created files must be in updated_paths (rematerialize), NOT preserved_paths.
+  local updated="" preserved=""
+  updated="$(json_agent_remat_field "$(cat "$out")" fresh updated_paths)"
+  preserved="$(json_agent_remat_field "$(cat "$out")" fresh preserved_paths)"
+  smoke_assert_contains "$updated" "agents/fresh/workdir/MEMORY.md" \
+    "created MEMORY.md not reported in updated_paths"
+  smoke_assert_contains "$updated" "agents/fresh/workdir/users/u1/MEMORY.md" \
+    "created users MEMORY.md not reported in updated_paths"
+  smoke_assert_not_contains "$preserved" "agents/fresh/workdir/MEMORY.md" \
+    "created MEMORY.md wrongly reported as preserved (should be a create, not a preserve)"
+  smoke_assert_not_contains "$preserved" "agents/fresh/workdir/users/u1/MEMORY.md" \
+    "created users MEMORY.md wrongly reported as preserved"
+
+  # Audit lines: create-if-absent must audit `rematerialize`, never `preserve`.
+  local audit=""
+  audit="$(json_agent_remat_warnings "$(cat "$out")" fresh)"
+  smoke_assert_contains "$audit" \
+    "[rematerialize] agent=fresh rematerialize agents/fresh/workdir/MEMORY.md" \
+    "missing rematerialize audit line for first-materialized MEMORY.md"
+  smoke_assert_not_contains "$audit" \
+    "[rematerialize] agent=fresh preserve agents/fresh/workdir/MEMORY.md" \
+    "first-materialize emitted a preserve audit line (should be rematerialize)"
+  : "$stderr"
+}
+
 smoke_run "workdir MEMORY.md preserved while managed docs sync" test_memory_preserved_docs_synced
+smoke_run "missing workdir MEMORY.md is first-materialized from the profile seed" test_memory_first_materialize
 smoke_run "backup manifest keeps workdir MEMORY.md" test_backup_keeps_memory
 smoke_run "source tokens pin MEMORY.md out of the copy/rewrite sets" test_source_token_pin
 smoke_log "PASS: $SMOKE_NAME"
