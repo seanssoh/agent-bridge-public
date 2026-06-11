@@ -230,6 +230,180 @@ def _pane_has_picker_affordance(text: str, *, single_caret: bool = False) -> boo
     return False
 
 
+# Confirm/back footer affordances that mark a live picker's option group (the
+# row a real picker renders under its options). Distinct from _AFFORDANCE_TOKENS:
+# this is scoped to the SAME contiguous block as a selector caret above the idle
+# composer, so it must be a picker-specific footer ('press enter to confirm' /
+# 'esc to go back' / '↑↓ to select'), not any whole-pane 'press enter' token.
+_OPTION_GROUP_FOOTER_RE = re.compile(
+    r"(?:↑↓|↑/↓|↓↑)|"
+    r"\besc\b[^\n]*\bto\b[^\n]*\b(?:go ?back|cancel|exit)\b|"
+    r"\b(?:press|hit)\b[^\n]*\benter\b[^\n]*\b(?:to\b[^\n]*)?"
+    r"(?:confirm|select|continue|choose)\b|"
+    r"\benter\b[^\n]*\bto\b[^\n]*\b(?:confirm|select|choose)\b",
+    re.IGNORECASE,
+)
+
+# Transcript markers that disqualify a line from being a picker prompt-header or
+# a sibling option row (Claude's tool/output glyphs and continuation prose).
+_TRANSCRIPT_GLYPHS = "⏺⎿●○·•"
+
+
+def _caret_row_is_selector(line: str) -> bool:
+    """True if `line` is a LINE-LEADING selector caret (❯/›) with option text —
+    the shape a live picker renders for its highlighted row. Box-drawing borders
+    and leading whitespace are tolerated; the caret must be the first
+    non-border / non-space glyph (so an inline transcript '… ❯ …' does not
+    count)."""
+    stripped = line.lstrip()
+    stripped = stripped.lstrip(_BOX_GLYPHS).lstrip()
+    if not stripped:
+        return False
+    if stripped[0] not in ("❯", "›"):
+        return False
+    return _caret_has_option_text(line)
+
+
+def _caret_above_in_option_group(above_composer: str) -> bool:
+    """True if a selector caret (❯/›) above the idle composer sits inside a live
+    OPTION GROUP — the #1785 r2 composite-pane case where a genuine novel picker
+    renders ABOVE the idle composer/footer and must still escalate.
+
+    The distinguishing feature is the SURROUNDING contiguous non-blank block, not
+    the single caret line (#1800): Claude Code echoes every submitted prompt into
+    the transcript as '❯ <submitted text>' (e.g. '❯ [Agent Bridge] task #NNNN: …',
+    the echo of a daemon nudge), so a lone '❯ <free text>' line followed by
+    ordinary transcript is the single most common thing above an idle composer on
+    a queue-driven install. The bare regex '^\\s*[❯›]\\s+\\S' matched that echoed
+    prompt and re-opened the #1783 escalation storm gated only behind "has the
+    agent ever been nudged".
+
+    Block scan: split `above_composer` into contiguous non-blank blocks (blank
+    line = transcript paragraph break). For any block that contains a
+    selector-caret row, the row is a LIVE selector only when the same block also
+    carries corroborating option-group structure:
+      - a second selector-caret-with-text row, OR
+      - a numbered option row ('1. Yes' / '2) No'), OR
+      - a confirm/back/arrow picker footer ('press enter to confirm' /
+        'esc to go back' / '↑↓'), OR
+      - a prompt-question header above the caret PLUS a sibling short-option row
+        ('Proceed?' / '❯ Yes' / '  No'), OR
+      - a HEADERLESS short-option group (#1800 r2): the caret row is itself a
+        SHORT option-shaped row ('❯ Yes') AND the immediate next non-blank row is
+        a sibling short-option row ('  No') with no intervening transcript glyph.
+    A block whose only picker-shaped line is the lone caret row (surrounded by
+    prose / '⏺ …' tool output) is an echoed prompt → NOT an option group →
+    returns False so the idle exclusion stands.
+
+    Resolution rule (the two failure directions): block the idle exclusion ONLY
+    on POSITIVE option-group evidence. Absent that evidence a caret row is
+    scrollback/echo → allow the exclusion (preserving the #1783 A3 stale-
+    scrollback exclusion: a bare numbered list with no active selector is not a
+    selector-caret row, so it never even enters the corroboration check).
+    """
+    block: list[str] = []
+
+    def _is_prompt_header(line: str, caret_idx: int, idx: int) -> bool:
+        """A picker prompt-question header ('Proceed with action?' / 'Pick an
+        option:') sits ABOVE the selector caret, ends with '?' or ':', and is not
+        itself a caret/transcript line. The echoed-prompt block has no such
+        header above its caret (the caret line is the block's first line, and its
+        own ':' is mid-line, not a trailing-': ' header above the caret)."""
+        if idx >= caret_idx:
+            return False
+        s = line.strip()
+        if not s or s[0] in _TRANSCRIPT_GLYPHS or s[0] in ("❯", "›"):
+            return False
+        return s.endswith("?") or s.endswith(":")
+
+    def _is_sibling_option_row(line: str, caret_idx: int, idx: int) -> bool:
+        """A short unmarked alternative option row beside the selected caret row
+        ('  No, cancel' under '❯ Yes, continue'). It must be a peer of the caret
+        row (adjacent, not the caret itself), carry no transcript glyph, and be
+        short option-like text — NOT a sentence of continuation prose, which is
+        what follows an echoed prompt."""
+        if idx == caret_idx:
+            return False
+        s = line.strip()
+        if not s or s[0] in _TRANSCRIPT_GLYPHS:
+            return False
+        if s[0] in ("❯", "›"):  # second caret already handled separately
+            return False
+        # Option rows are short and lack the long-prose / trailing-punctuation
+        # shape of transcript continuation lines.
+        if len(s) > 48 or s.endswith((".", "…")):
+            return False
+        return True
+
+    def _caret_row_is_short_option(line: str) -> bool:
+        """The selector-caret row of a HEADERLESS short picker is itself an
+        option-shaped row ('❯ Yes'): short text after the caret, no trailing
+        prose punctuation. An echoed submitted prompt is typically a LONGER
+        '❯ <task text>' line (e.g. '❯ [Agent Bridge] task #NNNN: …'); the same
+        len/punctuation bound that rejects prose continuation rows also keeps the
+        short '❯ Yes' / '❯ Continue' selected-option shape — but the real guard
+        against an echo is the ADJACENT-sibling check below, since the echo's
+        next line is transcript ('⏺ …'), not a short option row."""
+        s = line.strip().lstrip("❯›").strip()
+        if not s:
+            return False
+        return len(s) <= 48 and not s.endswith((".", "…"))
+
+    def _block_is_option_group(rows: list[str]) -> bool:
+        caret_idx = next(
+            (i for i, r in enumerate(rows) if _caret_row_is_selector(r)), -1
+        )
+        if caret_idx == -1:
+            return False
+        caret_rows = [r for r in rows if _caret_row_is_selector(r)]
+        # A selector caret is present. It is a LIVE selector only with
+        # corroborating option-group structure in the SAME block.
+        if len(caret_rows) >= 2:
+            return True
+        joined = "\n".join(rows)
+        if _NUMBERED_OPTION_RE.search(joined) is not None:
+            return True
+        if _OPTION_GROUP_FOOTER_RE.search(joined) is not None:
+            return True
+        # A prompt-question header above the caret PLUS a sibling unmarked option
+        # row is the '? + ❯ Yes / No' picker shape (#1785 r2 codex composite),
+        # which the echoed-prompt block (lone caret followed by transcript) lacks.
+        has_header = any(
+            _is_prompt_header(r, caret_idx, i) for i, r in enumerate(rows)
+        )
+        has_sibling = any(
+            _is_sibling_option_row(r, caret_idx, i) for i, r in enumerate(rows)
+        )
+        if has_header and has_sibling:
+            return True
+        # HEADERLESS short-option picker (#1800 r2): a real picker may render as
+        # '❯ Yes' / '  No' above the idle composer with NO question header, no
+        # second caret, no numbered row, and no footer. It is still a live option
+        # group — distinguished from an echoed submitted prompt by structure, not
+        # by a header: the caret row is itself SHORT option-shaped AND its
+        # IMMEDIATE next non-blank row (caret_idx + 1, no intervening transcript
+        # glyph) is a sibling short-option row. An echoed prompt's caret line is
+        # followed by transcript ('⏺ …' / continuation prose), which fails
+        # _is_sibling_option_row; and a long echoed '❯ <task text>' fails the
+        # short-option caret test — so neither echoed shape trips this branch.
+        if (
+            caret_idx + 1 < len(rows)
+            and _caret_row_is_short_option(rows[caret_idx])
+            and _is_sibling_option_row(rows[caret_idx + 1], caret_idx, caret_idx + 1)
+        ):
+            return True
+        return False
+
+    for line in above_composer.splitlines():
+        if line.strip():
+            block.append(line)
+            continue
+        if _block_is_option_group(block):
+            return True
+        block = []
+    return _block_is_option_group(block)
+
+
 def _idle_ready_tail_clear(pane_text: str, patterns: list[Any]) -> bool:
     """Decide whether an idle `non_picker` entry may short-circuit on this pane.
 
@@ -281,17 +455,23 @@ def _idle_ready_tail_clear(pane_text: str, patterns: list[Any]) -> bool:
     if _pane_has_picker_affordance(below_composer, single_caret=True):
         return False
     # The region ABOVE the composer is mostly stale scrollback (answered
-    # pickers, prior output) and must NOT block the idle exclusion — but a
-    # LIVE selector resting on an option row ('❯ 1. Yes, continue' /
-    # '› Yes') is a picker artifact the TUI erases once answered, so its
-    # presence above the composer means a real picker shares this capture
-    # (queue codex review #1785 r2: the r1 Claude composite renders the
-    # picker ABOVE the idle composer/footer). Scan above with the STRONG
-    # selector-on-option signal only: bare numbered lists / menu shapes
-    # without an active selector stay classified as scrollback, preserving
-    # the #1783 stale-scrollback exclusion (smoke A3).
+    # pickers, prior output) and must NOT block the idle exclusion — but a LIVE
+    # selector resting on an option row ('❯ 1. Yes, continue' / '› Yes') inside
+    # an option group is a real picker sharing this capture (queue codex review
+    # #1785 r2: the r1 Claude composite renders the picker ABOVE the idle
+    # composer/footer), so it must still escalate.
+    #
+    # Block ONLY on POSITIVE option-group evidence (#1800): a caret row counts as
+    # a live selector only when its contiguous non-blank block also carries a
+    # second selector row, a numbered option row, or a confirm/back/arrow picker
+    # footer. A LONE '❯ <free text>' line followed by ordinary transcript is
+    # Claude's echoed submitted prompt ('❯ [Agent Bridge] task #NNNN: …'), NOT a
+    # picker — the previous bare '^\s*[❯›]\s+\S' regex matched that echo and re-
+    # opened the #1783 storm on every nudged agent. Bare numbered lists / menu
+    # shapes without an active selector are not selector rows, so they stay
+    # scrollback (preserves the #1783 A3 stale-scrollback exclusion).
     above_composer = pane_text[:idle_start]
-    if re.search(r"(?m)^\s*[❯›]\s+\S", above_composer):
+    if _caret_above_in_option_group(above_composer):
         return False
     return True
 

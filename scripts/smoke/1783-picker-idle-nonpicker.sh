@@ -172,6 +172,29 @@ CODEX_FOREGROUND_FOOTER_BELOW=$'Proceed with action?\n› Yes, continue\n› No,
 #    second-round guard: ordinary scrollback above the tail composer is ignored.
 CLAUDE_STALE_SCROLLBACK=$'earlier run:\n  1. did thing\n  2. did other\nall done — press enter\n──────────────────── agent ──\n❯\n────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n'
 CODEX_STALE_SCROLLBACK=$'earlier:\n  1. option a\n  2. option b\n›\n\n  gpt-5.5 xhigh fast · ~/.agent-bridge/data/agents/x/workdir\n'
+# #1800: Claude echoes every submitted prompt into the transcript as
+# '❯ <submitted text>' (the echo of a daemon nudge). On any agent that has
+# processed >=1 nudge — i.e. nearly the whole queue-driven fleet — a LONE
+# '❯ [Agent Bridge] task #NNNN: …' line sits above the idle composer, followed
+# by ordinary transcript ('⏺ …' / prose). The v0.16.9 bare-caret above-composer
+# regex matched this echo and refused the idle exclusion → the pane re-entered
+# unknown → unknown_stuck → escalate, re-opening the #1783 storm. This MUST
+# classify as idle non_picker (the lone caret block is NOT an option group).
+CLAUDE_ECHOED_PROMPT=$'❯ [Agent Bridge] task #4242: do X\n⏺ working on it…\n  reviewed the file and applied the edit\n\n──────────────────── agent ──\n❯\n────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n'
+# A multi-nudge transcript: several echoed prompts interleaved with output, all
+# above a clean idle composer — the steady-state shape of a long-running agent.
+CLAUDE_ECHOED_MULTI=$'❯ [Agent Bridge] task #4100: first thing\n⏺ done\n\n❯ [Agent Bridge] task #4242: second thing\n⏺ also done\n  wrote the file\n\n──────────────────── agent ──\n❯\n────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n'
+# #1800 r2 (agb-dev-codex gate catch): a HEADERLESS short-option picker —
+# '❯ Yes' / '  No' with NO question header, no second caret, no numbered row, no
+# footer — rendered ABOVE the idle composer is a REAL live picker and must
+# escalate (non_picker:false). The r1 option-group relaxation gated the sibling-
+# short-option path behind a prompt header, so this shape (which a daemon nudge
+# can interrupt at any time) silently hard-excluded → the genuine picker would
+# never escalate. The distinguisher from the echoed prompts above is structural,
+# NOT a header: the caret row is itself a SHORT option-shaped row whose IMMEDIATE
+# next non-blank line is a sibling short-option row with no transcript glyph
+# between them.
+CLAUDE_HEADERLESS_SHORT_PICKER=$'❯ Yes\n  No\n\n──────────────────── agent ──\n❯\n────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n'
 
 # ---------------------------------------------------------------------
 # A3 — composite/foreground guard (queue codex review): a FOREGROUND picker (idle
@@ -212,6 +235,26 @@ test_a3_composite_pane_not_shadowed() {
   local codex_composite_above=$'Proceed with action?\n› Yes, continue\n  No, cancel\n\n›\n\n  gpt-5.5 xhigh fast · ~/.agent-bridge/data/agents/x/workdir\n'
   d="$(classify_shipped codex "$codex_composite_above")"
   smoke_assert_eq "false" "$(json_field "$d" non_picker)" "A3: codex composite (live selector above empty composer) NOT excluded"
+
+  # #1800: Claude's echoed submitted-prompt line ('❯ [Agent Bridge] task #…')
+  # above the idle composer is a LONE caret followed by transcript — NOT an
+  # option group — so the idle exclusion must STAND (fail-OPEN direction). This
+  # is the single most representative idle capture on a queue-driven install.
+  d="$(classify_shipped claude "$CLAUDE_ECHOED_PROMPT")"
+  smoke_assert_eq "true"  "$(json_field "$d" non_picker)" "A3: #1800 echoed-prompt above idle composer → idle non_picker (no false escalation)"
+  smoke_assert_eq "claude-idle-ready" "$(json_field "$d" picker_id)" "A3: #1800 echoed-prompt resolves the idle entry"
+  d="$(classify_shipped claude "$CLAUDE_ECHOED_MULTI")"
+  smoke_assert_eq "true"  "$(json_field "$d" non_picker)" "A3: #1800 multi-nudge echoed-prompt transcript → idle non_picker"
+
+  # #1800 r2 (agb-dev-codex gate catch): a HEADERLESS short-option picker
+  # ('❯ Yes' / '  No', no question header) above the idle composer is a REAL
+  # picker → must NOT be hard-excluded (fail-CLOSED direction). The r1 relaxation
+  # required a header for the sibling-short-option path and silently excluded
+  # this; the r2 fix counts a short caret row adjacent to a sibling short-option
+  # row as a live option group.
+  d="$(classify_shipped claude "$CLAUDE_HEADERLESS_SHORT_PICKER")"
+  smoke_assert_eq "false" "$(json_field "$d" non_picker)" "A3: #1800 r2 headerless short picker ('❯ Yes'/'  No') above idle → NOT non_picker (escalate)"
+  smoke_assert_eq "false" "$(json_field "$d" matched)"    "A3: #1800 r2 headerless short picker walks the unknown path"
 
   # Stale menu-like scrollback ABOVE a tail idle composer → still non_picker.
   d="$(classify_shipped claude "$CLAUDE_STALE_SCROLLBACK")"
@@ -440,6 +483,24 @@ test_a4_composite_escalates_e2e() {
   resolve_tick "agentFgS" "sFgS" "claude" "$CLAUDE_FOREGROUND_SINGLE"
   (( $(count_escalations) == b4 + 1 )) || smoke_fail "A4: single-caret foreground picker must escalate exactly once (before=$b4 after=$(count_escalations))"
 
+  # #1800 r2 end-to-end (agb-dev-codex gate catch): a HEADERLESS short-option
+  # picker ('❯ Yes' / '  No', no header) above the idle composer, held unchanged
+  # past the unknown budget, DOES escalate exactly once — proving the r2 option-
+  # group fix flows through to the unknown-stuck path, not just classify. The r1
+  # regression silently hard-excluded this so it would NEVER escalate.
+  # Reset the per-pass storm-fuse counter: this test drives resolve_session
+  # directly (not scan_all_sessions, which resets it per pass), and the three
+  # foreground-picker escalations above already consumed the default cap of 3, so
+  # without a reset this 4th escalation would be storm-suppressed (a harness
+  # artifact, not the behaviour under test). A real daemon pass resets the cap.
+  BRIDGE_PICKER_UNKNOWN_PASS_COUNT=0
+  python3 "$PICKER_PY" clear-unknown --session sHdlS --state-dir "$BRIDGE_PICKER_STATE_DIR" >/dev/null 2>&1 || true
+  local b6; b6="$(count_escalations)"
+  resolve_tick "agentHdlS" "sHdlS" "claude" "$CLAUDE_HEADERLESS_SHORT_PICKER"
+  smoke_assert_eq "$b6" "$(count_escalations)" "A4: #1800 r2 headerless short picker tick 1 arms (no escalation yet)"
+  resolve_tick "agentHdlS" "sHdlS" "claude" "$CLAUDE_HEADERLESS_SHORT_PICKER"
+  (( $(count_escalations) == b6 + 1 )) || smoke_fail "A4: #1800 r2 headerless short picker must escalate exactly once (before=$b6 after=$(count_escalations))"
+
   # Stale scrollback above a tail idle composer must NEVER escalate, even across
   # several ticks (it is non_picker — the second-round false-positive guard).
   local b3; b3="$(count_escalations)"
@@ -448,6 +509,18 @@ test_a4_composite_escalates_e2e() {
     resolve_tick "agentStaleC" "sStaleC" "claude" "$CLAUDE_STALE_SCROLLBACK"
   done
   smoke_assert_eq "$b3" "$(count_escalations)" "A4: idle + stale scrollback NEVER escalates (non_picker)"
+
+  # #1800 end-to-end: a Claude idle composer carrying an ECHOED submitted-prompt
+  # line in scrollback (the steady state of every nudged agent) must NEVER
+  # escalate across ticks — the v0.16.9 regression escalated exactly this shape.
+  python3 "$PICKER_PY" clear-unknown --session sEchoC --state-dir "$BRIDGE_PICKER_STATE_DIR" >/dev/null 2>&1 || true
+  local b5; b5="$(count_escalations)"
+  for i in 1 2 3 4; do
+    SMOKE_KEYS=""
+    resolve_tick "agentEchoC" "sEchoC" "claude" "$CLAUDE_ECHOED_PROMPT"
+    smoke_assert_eq "" "${SMOKE_KEYS:-}" "A4: #1800 echoed-prompt idle sends ZERO keystrokes (tick $i)"
+  done
+  smoke_assert_eq "$b5" "$(count_escalations)" "A4: #1800 echoed-prompt idle NEVER escalates (non_picker) — the v0.16.9 storm is closed"
 
   export BRIDGE_PICKER_LOCAL_CATALOG="/nonexistent-local-catalog.json"
 }
