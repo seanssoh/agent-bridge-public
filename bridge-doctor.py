@@ -56,6 +56,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Issue #1803: the action-safe agent-home-root classifier is the SSOT for
+# "what is a child of agents/, and is it safe to touch?". The orphan-agent-dir
+# detector below now consumes it (behavior-preserving) so the daemon GC,
+# the status counter, and this read-only detector can never drift. The
+# classifier is a repo-root sibling module (same import idiom as
+# bridge_guard_common / bridge_reconcile_common).
+from bridge_orphan_classifier import (
+    KIND_ORPHAN,
+    KIND_ORPHAN_UNVERIFIABLE,
+    classify_agent_home_root,
+)
+
 
 DETECTOR_KINDS = (
     "stale-stopped-with-queue",
@@ -1086,107 +1098,68 @@ def detect_orphan_agent_dir(
     will replace the recipe when it lands). Test-artifact prefixes get
     `evidence.is_test_artifact = true` so an operator can triage in one
     pass.
+
+    Issue #1803: the classification substrate (registered / infra /
+    referenced-symlink-target / orphan / unverifiable) was factored into the
+    shared `bridge_orphan_classifier` module so the daemon GC and the status
+    counter consume the SAME verdicts this read-only detector emits. This
+    function now wraps `classify_agent_home_root` and renders the same two
+    finding shapes it always did (orphan-agent-dir / -unverifiable) — a
+    behavior-preserving refactor (scripts/smoke/orphan-agent-dir.sh T1-T10).
+    The new `referenced-symlink-target` kind is a KEEP (skipped here, same as
+    the prior `_template`/`shared` and stale-symlink skips), so the detector's
+    reported set never grows on existing installs.
     """
     findings: list[dict[str, Any]] = []
     if not home_root.is_dir():
         return findings
 
-    known: set[str] = set()
-    for row in registry:
-        if not isinstance(row, dict):
-            continue
-        agent_id = str(row.get("id") or "").strip()
-        if agent_id:
-            known.add(agent_id)
-    # Issue #1787: a case-insensitive volume (macOS APFS default) makes
-    # `agents/CRM-TEST-BSH` and the registry's `agents/crm-test-bsh` the SAME
-    # directory, so the basename string compare below is not enough — the
-    # case-variant spelling is not in `known` yet IS a live agent's dir. Build
-    # the registered home/workdir set for an inode-aware samefile fallback.
-    registered_dirs = _registered_agent_dirs(registry)
-
-    try:
-        entries = sorted(home_root.iterdir(), key=lambda p: p.name)
-    except OSError:
-        return findings
-
-    for entry in entries:
-        name = entry.name
-        if name in ORPHAN_SKIP_NAMES:
-            continue
-        if name.startswith(".claude") or name.startswith("."):
-            continue
-        # Per spec: match by basename, not by `home` equality (dynamic agents
-        # can place their workdir anywhere). The registry `id` IS the
-        # directory basename for any home-root-resident agent.
-        if name in known:
-            continue
-        if not entry.is_dir():
-            continue
-        # Issue #1787: filesystem-aware identity. Even when the basename is
-        # not a registry id (case differs), the dir may BE a registered
-        # agent's home/workdir on a case-INSENSITIVE fs (macOS APFS), where
-        # `CRM-TEST-BSH` and registered `crm-test-bsh` are the SAME inode.
-        # Use INODE identity (samefile/realpath), never an unconditional
-        # case-fold name match: on a case-SENSITIVE fs those two are DISTINCT
-        # directories and the uppercase one is a genuine orphan that must
-        # still fire. samefile proves same-vs-different correctly on both
-        # filesystem classes, so the detector keeps its teeth on Linux while
-        # not quarantining a live agent's tree on macOS.
-        identity = _samefiles_registered_agent(entry, registered_dirs)
-        if identity is not None:
-            # Proven match → skip (registered agent's tree, not an orphan).
-            # codex r3: INDETERMINATE (a samefile stat failure left identity
-            # unproven) must ALSO skip the destructive orphan recipe — we
-            # cannot prove this dir is unregistered, so failing safe means
-            # NOT reporting it. Surface a separate info-level note so the
-            # operator can hand-verify rather than silently dropping it.
-            if identity == _SAMEFILE_INDETERMINATE:
-                findings.append(
-                    {
-                        "ts": ts,
-                        "kind": "orphan-agent-dir-unverifiable",
-                        "agent": name,
-                        "evidence": {
-                            "dir": str(entry),
-                            "reason": (
-                                "could not verify against the registry "
-                                "(os.path.samefile stat failure); not reported "
-                                "as an orphan to avoid quarantining a possibly "
-                                "live agent's tree"
-                            ),
-                            "registry_checked": "agent registry --json",
-                        },
-                        "suggested_action": (
-                            f"Could not prove whether {entry} is a registered "
-                            "agent's directory (a stat/samefile probe failed). "
-                            "It is NOT being reported as an orphan (fail-safe). "
-                            "Manually confirm with `agent-bridge agent registry "
-                            "--json` and check whether any registered home/"
-                            f"workdir resolves to {entry} before any cleanup."
+    for row in classify_agent_home_root(registry, home_root):
+        kind = row.get("kind")
+        if kind == KIND_ORPHAN_UNVERIFIABLE:
+            name = row.get("name", "")
+            entry = row.get("path", "")
+            findings.append(
+                {
+                    "ts": ts,
+                    "kind": "orphan-agent-dir-unverifiable",
+                    "agent": name,
+                    "evidence": {
+                        "dir": entry,
+                        "reason": (
+                            "could not verify against the registry "
+                            "(os.path.samefile stat failure); not reported "
+                            "as an orphan to avoid quarantining a possibly "
+                            "live agent's tree"
                         ),
-                    }
-                )
+                        "registry_checked": "agent registry --json",
+                    },
+                    "suggested_action": (
+                        f"Could not prove whether {entry} is a registered "
+                        "agent's directory (a stat/samefile probe failed). "
+                        "It is NOT being reported as an orphan (fail-safe). "
+                        "Manually confirm with `agent-bridge agent registry "
+                        "--json` and check whether any registered home/"
+                        f"workdir resolves to {entry} before any cleanup."
+                    ),
+                }
+            )
             continue
-        # Skip symlinks that don't point at an actual agent home (live
-        # `shared/` link, stale convenience symlinks). A dir-shaped symlink
-        # whose target is a real directory is still walked — that's the
-        # `--prefer new` worktree case where the agent home is a real dir.
-        try:
-            if entry.is_symlink():
-                resolved = entry.resolve(strict=False)
-                if not resolved.is_dir():
-                    continue
-        except OSError:
+        if kind != KIND_ORPHAN:
+            # registered / infra / referenced-symlink-target / detector-error
+            # are all KEEPs — never reported as an orphan (the detector's
+            # report-only set is unchanged from pre-#1803 behavior).
             continue
 
+        name = row.get("name", "")
+        entry = Path(row.get("path", ""))
         try:
             dir_mtime = os.path.getmtime(entry)
         except OSError:
             dir_mtime = None
         size_bytes = _best_effort_dir_size(entry)
         last_active = _best_effort_last_active(entry)
-        is_test_artifact = _is_test_artifact_name(name)
+        is_test_artifact = bool(row.get("is_test_artifact"))
 
         evidence: dict[str, Any] = {
             "dir": str(entry),

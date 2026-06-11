@@ -1380,6 +1380,135 @@ def cmd_a2a_diag_lookup(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _load_json_file(path: str) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001 — helper boundary; caller treats as empty
+        return None
+
+
+def cmd_orphan_gc_non_clean(args: argparse.Namespace) -> int:
+    """Issue #1803 — decide whether an orphan-dir GC pass is "non-clean"
+    (worth a `[hygiene]` admin task). Non-clean iff the quarantine summary has
+    any actually-moved, would-quarantine, kept-indeterminate, or error entry,
+    OR the prune summary actually pruned / refused something.
+
+    Prints ``1`` (non-clean) or ``0`` (clean). A fully clean pass — nothing
+    actionable, nothing held back — emits no task (prints 0).
+    """
+    quarantine = _load_json_file(args.quarantine_json) or {}
+    prune = _load_json_file(args.prune_json) or {}
+    non_clean = False
+    if isinstance(quarantine, dict):
+        for key in ("quarantined", "would_quarantine", "kept_indeterminate", "errors"):
+            if quarantine.get(key):
+                non_clean = True
+                break
+    if not non_clean and isinstance(prune, dict):
+        for key in ("pruned", "refused"):
+            if prune.get(key):
+                non_clean = True
+                break
+    print("1" if non_clean else "0")
+    return 0
+
+
+def cmd_orphan_gc_task_body(args: argparse.Namespace) -> int:
+    """Issue #1803 — render the `[hygiene]` admin task body from the quarantine
+    summary JSON. Lists what was quarantined (or WOULD be, when auto is off)
+    and what was kept-because-indeterminate, with the recovery/enable hints.
+    """
+    summary = _load_json_file(args.quarantine_json)
+    host = args.hostname or "host"
+    if not isinstance(summary, dict):
+        print(f"# orphan agent-dir GC on {host}\n\n(no summary available)")
+        return 0
+
+    auto = bool(summary.get("auto_quarantine"))
+    quarantined = summary.get("quarantined") or []
+    would = summary.get("would_quarantine") or []
+    kept = summary.get("kept_indeterminate") or []
+    too_young = summary.get("skipped_too_young") or []
+    errors = summary.get("errors") or []
+    home_root = summary.get("home_root") or ""
+
+    lines: list[str] = []
+    lines.append(f"# orphan agent-dir GC on {host}")
+    lines.append("")
+    lines.append(
+        "The daemon scanned the agent-home root for `agents/<name>` homes that "
+        "are not in `agent registry --json` and not protected by the keep-set "
+        "(registered / `_template` / `shared` / any resolved symlink target). "
+        "Only `orphan-agent-dir` is actionable; everything else is kept."
+    )
+    lines.append("")
+    lines.append(f"- Home root: `{home_root}`")
+    lines.append(f"- Auto-quarantine: **{'ON' if auto else 'OFF'}** "
+                 "(`BRIDGE_ORPHAN_GC_AUTO_QUARANTINE`)")
+    lines.append("")
+
+    if auto and quarantined:
+        lines.append(f"## Quarantined ({len(quarantined)}) — moved to `backups/orphan-agents-<date>/`")
+        for e in quarantined:
+            lines.append(
+                f"- `{e.get('name', '')}` → `{e.get('quarantine_path', '')}` "
+                f"(age {e.get('age_seconds', '?')}s"
+                f"{', test-artifact' if e.get('is_test_artifact') else ''})"
+            )
+        lines.append("")
+        lines.append("These were MOVED, never deleted. A separate prune pass "
+                     "removes them after the retain window "
+                     "(`BRIDGE_ORPHAN_QUARANTINE_RETAIN_DAYS`, default 30d).")
+        lines.append("")
+
+    if not auto and would:
+        lines.append(f"## Would quarantine ({len(would)}) — DRY RUN (auto-quarantine is OFF)")
+        for e in would:
+            lines.append(
+                f"- `{e.get('name', '')}` at `{e.get('path', '')}` "
+                f"(age {e.get('age_seconds', '?')}s"
+                f"{', test-artifact' if e.get('is_test_artifact') else ''})"
+            )
+        lines.append("")
+        lines.append(
+            "Nothing was moved. To enable automatic quarantine on this host, set "
+            "`BRIDGE_ORPHAN_GC_AUTO_QUARANTINE=1` in the daemon environment and "
+            "restart the daemon. Quarantine MOVES (never deletes) to "
+            "`backups/orphan-agents-<date>/`."
+        )
+        lines.append("")
+
+    if kept:
+        lines.append(f"## Kept — could not verify, fail-safe ({len(kept)})")
+        for e in kept:
+            lines.append(
+                f"- `{e.get('name', '')}` ({e.get('kind', '')}): {e.get('reason', '')}"
+            )
+        lines.append("")
+        lines.append("These were NOT touched. Verify by hand with "
+                     "`agent-bridge agent registry --json` before any cleanup.")
+        lines.append("")
+
+    if too_young:
+        lines.append(f"## Below the age gate ({len(too_young)}) — not yet eligible")
+        for e in too_young:
+            lines.append(f"- `{e.get('name', '')}` (age {e.get('age_seconds', '?')}s)")
+        lines.append("")
+
+    if errors:
+        lines.append(f"## Errors ({len(errors)})")
+        for e in errors:
+            if isinstance(e, dict):
+                lines.append(f"- `{e.get('name', '')}`: {e.get('error', '')}")
+            else:
+                lines.append(f"- {e}")
+        lines.append("")
+
+    print("\n".join(lines).rstrip() + "\n")
+    return 0
+
+
 SUBCOMMANDS = {
     "usage-alert-parse": (
         cmd_usage_alert_parse,
@@ -1568,6 +1697,23 @@ SUBCOMMANDS = {
         "Single TSV row (classification / tcp_probe / local_healthz / "
         "next_attempt_in_seconds / backoff_reset / tcp_healthy_backoff_waiting) "
         "for the peer, or empty when the peer is not backoff-waiting.",
+    ),
+    # Issue #1803: orphan agent-dir GC — daemon-loop helpers.
+    "orphan-gc-non-clean": (
+        cmd_orphan_gc_non_clean,
+        [
+            ("quarantine_json", "bridge-orphan-gc.py quarantine summary JSON file"),
+            ("prune_json", "bridge-orphan-gc.py prune summary JSON file"),
+        ],
+        "Prints 1 when the GC pass is non-clean (file a [hygiene] task), else 0.",
+    ),
+    "orphan-gc-task-body": (
+        cmd_orphan_gc_task_body,
+        [
+            ("quarantine_json", "bridge-orphan-gc.py quarantine summary JSON file"),
+            ("hostname", "short hostname for the task title/body"),
+        ],
+        "Render the [hygiene] admin task body (quarantined / would-quarantine / kept).",
     ),
 }
 

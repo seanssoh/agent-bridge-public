@@ -24,6 +24,7 @@ bridge-mcp-cleanup.py:0
 bridge-memory.py:97
 bridge-migrate.py:13
 bridge-notify.py:0
+bridge-orphan-gc.py:10
 bridge-profile.py:18
 bridge-queue-gateway.py:22
 bridge-queue.py:12
