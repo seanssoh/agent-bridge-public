@@ -285,7 +285,12 @@ def _caret_above_in_option_group(above_composer: str) -> bool:
       - a second selector-caret-with-text row, OR
       - a numbered option row ('1. Yes' / '2) No'), OR
       - a confirm/back/arrow picker footer ('press enter to confirm' /
-        'esc to go back' / '↑↓').
+        'esc to go back' / '↑↓'), OR
+      - a prompt-question header above the caret PLUS a sibling short-option row
+        ('Proceed?' / '❯ Yes' / '  No'), OR
+      - a HEADERLESS short-option group (#1800 r2): the caret row is itself a
+        SHORT option-shaped row ('❯ Yes') AND the immediate next non-blank row is
+        a sibling short-option row ('  No') with no intervening transcript glyph.
     A block whose only picker-shaped line is the lone caret row (surrounded by
     prose / '⏺ …' tool output) is an echoed prompt → NOT an option group →
     returns False so the idle exclusion stands.
@@ -330,6 +335,20 @@ def _caret_above_in_option_group(above_composer: str) -> bool:
             return False
         return True
 
+    def _caret_row_is_short_option(line: str) -> bool:
+        """The selector-caret row of a HEADERLESS short picker is itself an
+        option-shaped row ('❯ Yes'): short text after the caret, no trailing
+        prose punctuation. An echoed submitted prompt is typically a LONGER
+        '❯ <task text>' line (e.g. '❯ [Agent Bridge] task #NNNN: …'); the same
+        len/punctuation bound that rejects prose continuation rows also keeps the
+        short '❯ Yes' / '❯ Continue' selected-option shape — but the real guard
+        against an echo is the ADJACENT-sibling check below, since the echo's
+        next line is transcript ('⏺ …'), not a short option row."""
+        s = line.strip().lstrip("❯›").strip()
+        if not s:
+            return False
+        return len(s) <= 48 and not s.endswith((".", "…"))
+
     def _block_is_option_group(rows: list[str]) -> bool:
         caret_idx = next(
             (i for i, r in enumerate(rows) if _caret_row_is_selector(r)), -1
@@ -356,6 +375,22 @@ def _caret_above_in_option_group(above_composer: str) -> bool:
             _is_sibling_option_row(r, caret_idx, i) for i, r in enumerate(rows)
         )
         if has_header and has_sibling:
+            return True
+        # HEADERLESS short-option picker (#1800 r2): a real picker may render as
+        # '❯ Yes' / '  No' above the idle composer with NO question header, no
+        # second caret, no numbered row, and no footer. It is still a live option
+        # group — distinguished from an echoed submitted prompt by structure, not
+        # by a header: the caret row is itself SHORT option-shaped AND its
+        # IMMEDIATE next non-blank row (caret_idx + 1, no intervening transcript
+        # glyph) is a sibling short-option row. An echoed prompt's caret line is
+        # followed by transcript ('⏺ …' / continuation prose), which fails
+        # _is_sibling_option_row; and a long echoed '❯ <task text>' fails the
+        # short-option caret test — so neither echoed shape trips this branch.
+        if (
+            caret_idx + 1 < len(rows)
+            and _caret_row_is_short_option(rows[caret_idx])
+            and _is_sibling_option_row(rows[caret_idx + 1], caret_idx, caret_idx + 1)
+        ):
             return True
         return False
 
