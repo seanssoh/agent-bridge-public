@@ -921,6 +921,37 @@ main() {
     smoke_log "ok: T18 sweep — no 'sweep-canary-1358' survives in any audit row (class closed)"
   fi
 
+  # T19 — PR #1790 r3 BLOCKING 2 (#1789): the daemon's limit-window-aware
+  # rotate carries `--limited-until <ISO>` and the flag must be on the auth
+  # allowlist or an admin agent mirroring the daemon's rotation is denied at
+  # the hook. The validated surface is the anchored `agb`/`agent-bridge`
+  # verb dispatcher (`auth claude-token rotate` → `_validate_auth_flags`);
+  # the `bash bridge-auth.sh` spelling has no rotate carve-out and is out of
+  # scope here. ISO values carry `:` and `+` which `_safe_slug_arg` rejects,
+  # so the flag has its own strict timestamp predicate — verify the ALLOW
+  # for the daemon-equivalent shape and the DENY for non-timestamp values
+  # (the predicate must not become a free-text hole).
+  assert_hook_verdict \
+    "T19 rotate --limited-until ISO value" \
+    admin-1358 \
+    "agb auth claude-token rotate --if-auto-enabled --sync --reason usage:weekly:97 --limited-until 2099-01-02T03:04:05+09:00 --json" \
+    "ALLOW"
+  assert_hook_verdict \
+    "T19 rotate --limited-until Z suffix" \
+    admin-1358 \
+    "agb auth claude-token rotate --limited-until 2099-01-02T03:04:05Z --json" \
+    "ALLOW"
+  assert_hook_verdict \
+    "T19 rotate --limited-until date-only value denied" \
+    admin-1358 \
+    "agb auth claude-token rotate --limited-until 2099-01-02 --json" \
+    "DENY"
+  assert_hook_verdict \
+    "T19 rotate --limited-until free text denied" \
+    admin-1358 \
+    "agb auth claude-token rotate --limited-until tomorrow --json" \
+    "DENY"
+
   smoke_log "passed"
 }
 

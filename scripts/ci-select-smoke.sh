@@ -1769,6 +1769,14 @@ select_for_path() {
       # revert to the stale-drop-on-failure shape (which silently suppressed a
       # legitimately-queued task's nudge on a transient IO/env glitch) is caught.
       add_required 1631-nudge-helper-db-guard
+      # PR #1790 (#1789, r3 BLOCKING 1): bridge-daemon.sh's
+      # process_usage_monitor decodes the rotation-status TSV with
+      # IFS=$'\t' read and maps the helper's `-` empty-column sentinel
+      # back to "" per field. Pull the rotation suite on every
+      # bridge-daemon.sh move so a future edit that drops the sentinel
+      # decode (re-collapsing empty columns and shifting soonest_reset
+      # into rotation_from) is caught by the encode/decode roundtrip case.
+      add_required 1789-rotation-limited-until
       # v0.15.0-beta5-2 Lane η (#1314, CRITICAL/security):
       # bridge-daemon.sh's `cmd_run_cron_worker` now gates shell-cron
       # dispatch on `bridge_cron_uid_drop_preflight`. The new gate emits
@@ -3704,7 +3712,20 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # canary-absence from transcript/audit), the token-free request,
       # and the negative guard shapes. Pull it on every auth move so a
       # future refactor cannot regress the sealed-paste contract.
-      add_required F-beta4-oauth-bootstrap daemon-periodic-token-sync 1358-admin-credential-routine-exempt 1367-auth-sealed-paste 1470-engine-auth-seam 1470-codex-fleet-sync
+      # PR #1790 (#1789 D1/D2): rotate is now limit-window aware
+      # (--limited-until stamp, future-limited candidate skip,
+      # all_tokens_limited refusal + sentinel-encoded TSV). The
+      # 1789-rotation-limited-until wrapper runs the canonical
+      # tests/claude-token-rotation suite so every auth move re-proves the
+      # rotation contract end-to-end (r3 P1: previously dangling in tests/
+      # with no CI mapping).
+      add_required F-beta4-oauth-bootstrap daemon-periodic-token-sync 1358-admin-credential-routine-exempt 1367-auth-sealed-paste 1470-engine-auth-seam 1470-codex-fleet-sync 1789-rotation-limited-until
+      add_integration integration-minimal
+      ;;
+
+    tests/claude-token-rotation/*)
+      # PR #1790 (#1789): edits to the rotation suite itself must re-run it.
+      add_required 1789-rotation-limited-until
       add_integration integration-minimal
       ;;
 
@@ -3754,6 +3775,10 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # exercises it (TSV fields + absent-peer empty) so a helper refactor
       # cannot regress the enriched alert contract.
       add_required F-beta4-oauth-bootstrap daemon-periodic-token-sync daemon queue I-beta4-a2a-3-gaps mcp-liveness-giveup-auto-clear 1563-pr8-a2a-diag-recovery
+      # PR #1790 r3 BLOCKING 1: rotation-status-parse now sentinel-encodes
+      # empty TSV columns (`-`) so the daemon's IFS=$'\t' read cannot
+      # collapse them. The rotation suite pins the encode/decode roundtrip.
+      add_required 1789-rotation-limited-until
       # Issue #1732 (Lane B): bridge-daemon-helpers.py's ``a2a-stuck-decide`` is
       # now class-aware — it suppresses the [A2A] outbox stuck admin alarm for
       # transient peers (alarm_on_unreachable=False) and honors a per-peer longer

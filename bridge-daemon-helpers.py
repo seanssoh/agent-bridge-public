@@ -942,7 +942,15 @@ def cmd_rotation_status_parse(args: argparse.Namespace) -> int:
 
     Parses the bridge-auth.sh claude-token rotate --json envelope. Output (a
     single row):
-      status \\t reason \\t old_active_token_id \\t active_token_id \\t sync_status
+      status \\t reason \\t old_active_token_id \\t active_token_id \\t sync_status \\t soonest_reset
+    ``soonest_reset`` (#1789) is only populated on the ``all_tokens_limited``
+    skip — the nearest known limit-window expiry across the enabled pool.
+    EMPTY columns are emitted as the sentinel ``-`` (PR #1790 r3 BLOCKING 1):
+    the consumer decodes with ``IFS=$'\\t' read`` and bash treats tab as IFS
+    *whitespace*, so consecutive tabs collapse into one delimiter and every
+    empty field silently shifts the columns to its right (an
+    ``all_tokens_limited`` row put ``soonest_reset`` into ``rotation_from``).
+    The bash callsite maps ``-`` back to the empty string per field.
     JSON-parse error degrades to ``error\\tinvalid_rotation_output\\t...`` so
     the downstream ``case "$rotation_status:$rotation_reason"`` branch can
     classify it under ``error:*``.
@@ -952,17 +960,15 @@ def cmd_rotation_status_parse(args: argparse.Namespace) -> int:
     except Exception:
         payload = {"status": "error", "reason": "invalid_rotation_output"}
     sync = payload.get("sync") if isinstance(payload.get("sync"), dict) else {}
-    print(
-        "\t".join(
-            [
-                str(payload.get("status", "")),
-                str(payload.get("reason", "")),
-                str(payload.get("old_active_token_id", "")),
-                str(payload.get("active_token_id", "")),
-                str(sync.get("status", "")),
-            ]
-        )
-    )
+    columns = [
+        str(payload.get("status", "")),
+        str(payload.get("reason", "")),
+        str(payload.get("old_active_token_id", "")),
+        str(payload.get("active_token_id", "")),
+        str(sync.get("status", "")),
+        str(payload.get("soonest_reset", "")),
+    ]
+    print("\t".join(col if col else "-" for col in columns))
     return 0
 
 
@@ -1498,7 +1504,7 @@ SUBCOMMANDS = {
     "rotation-status-parse": (
         cmd_rotation_status_parse,
         [("rotate_json", "JSON envelope from bridge-auth.sh claude-token rotate --json")],
-        "Single-row rotation outcome: status / reason / from / to / sync_status (5 cols).",
+        "Single-row rotation outcome: status / reason / from / to / sync_status / soonest_reset (6 cols).",
     ),
     # Issue #1468: classify a native usage-probe --json result for an audit row.
     "usage-probe-result-parse": (

@@ -914,6 +914,140 @@ ENABLED_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token auto-rotate enable -
 json_assert "auto enable" "$ENABLED_JSON" "payload['status'] == 'ok' and payload['auto_rotate_enabled'] is True and payload['rotation_threshold'] == 99.0"
 pass "auto-rotate gate is registry controlled"
 
+# #1789 — rotate must record the rotating-away token's 429 reset window
+# (--limited-until) and refuse to rotate INTO a token still inside its own
+# window. Without this the daemon round-robins a saturated pool (observed:
+# median same-token return 1.2h vs 5h reset windows, 223 rotations/3 days).
+# Fixture state here: tokens first+second, active=second.
+LIMIT_FUTURE_ISO="$("$PYTHON" -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)).isoformat(timespec="seconds"))')"
+LIMIT_PAST_ISO="$("$PYTHON" -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)).isoformat(timespec="seconds"))')"
+
+LIMITED_ROTATE_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token rotate --reason smoke-1789 --limited-until "$LIMIT_FUTURE_ISO" --json)"
+[[ "$LIMITED_ROTATE_JSON" != *"$TOKEN_A"* && "$LIMITED_ROTATE_JSON" != *"$TOKEN_B"* ]] || fail "limited rotate output leaked token"
+json_assert "limited rotate" "$LIMITED_ROTATE_JSON" "payload['status'] == 'rotated' and payload['old_active_token_id'] == 'second' and payload['active_token_id'] == 'first'"
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" "$LIMIT_FUTURE_ISO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+registry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+rows = {row.get("id"): row for row in registry.get("tokens", [])}
+if rows["second"].get("limited_until") != sys.argv[2]:
+    raise SystemExit(f"rotated-away token missing limited_until stamp: {rows['second'].get('limited_until')!r}")
+if "limited_until" in rows["first"]:
+    raise SystemExit("selected token unexpectedly carries a limited_until stamp")
+PY
+[[ $? -eq 0 ]] || fail "rotate --limited-until did not stamp the rotated-away token"
+pass "rotate --limited-until stamps the rotated-away token's reset window"
+
+POOL_EXHAUSTED_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token rotate --reason smoke-1789-exhausted --json)"
+json_assert "pool exhausted" "$POOL_EXHAUSTED_JSON" "payload['status'] == 'skipped' and payload['reason'] == 'all_tokens_limited' and payload['active_token_id'] == 'first' and payload['soonest_reset'] != ''"
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+registry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if registry.get("active_token_id") != "first":
+    raise SystemExit(f"all_tokens_limited mutated active token: {registry.get('active_token_id')!r}")
+PY
+[[ $? -eq 0 ]] || fail "all_tokens_limited skip mutated the active token"
+pass "rotate refuses a fully limited pool instead of cycling it"
+
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" "$LIMIT_PAST_ISO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+registry = json.loads(path.read_text(encoding="utf-8"))
+for row in registry.get("tokens", []):
+    if row.get("id") == "second":
+        row["limited_until"] = sys.argv[2]
+path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+PY
+EXPIRED_ROTATE_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token rotate --reason smoke-1789-expired --sync --json)"
+json_assert "expired stamp rotate" "$EXPIRED_ROTATE_JSON" "payload['status'] == 'rotated' and payload['old_active_token_id'] == 'first' and payload['active_token_id'] == 'second' and payload['sync']['status'] == 'ok'"
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+registry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+rows = {row.get("id"): row for row in registry.get("tokens", [])}
+if "limited_until" in rows["second"]:
+    raise SystemExit("expired limited_until stamp survived activation")
+PY
+[[ $? -eq 0 ]] || fail "expired limited_until stamp was not cleared on activation"
+pass "expired limit window re-admits the token and clears the stale stamp"
+
+# PR #1790 r2 codex finding — explicit `activate` is an operator override and
+# must also drop a pending limit-window stamp; otherwise a manually
+# reactivated token stays hiddenly ineligible for future rotation until the
+# stale timestamp expires.
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" "$LIMIT_FUTURE_ISO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+registry = json.loads(path.read_text(encoding="utf-8"))
+for row in registry.get("tokens", []):
+    if row.get("id") == "first":
+        row["limited_until"] = sys.argv[2]
+path.write_text(json.dumps(registry, indent=2) + "\n", encoding="utf-8")
+PY
+ACTIVATE_STAMPED_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token activate first --json)"
+json_assert "activate stamped" "$ACTIVATE_STAMPED_JSON" "payload['status'] == 'activated' and payload['active_token_id'] == 'first'"
+"$PYTHON" - "$BRIDGE_CLAUDE_TOKEN_REGISTRY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+registry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+rows = {row.get("id"): row for row in registry.get("tokens", [])}
+if "limited_until" in rows["first"]:
+    raise SystemExit("explicit activate left the limited_until stamp in place")
+PY
+[[ $? -eq 0 ]] || fail "explicit activate did not clear the limited_until stamp"
+ACTIVATE_RESTORE_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token activate second --json)"
+json_assert "activate restore" "$ACTIVATE_RESTORE_JSON" "payload['status'] == 'activated' and payload['active_token_id'] == 'second'"
+pass "explicit activate clears a pending limit-window stamp (operator override)"
+
+# PR #1790 r3 BLOCKING 1 — the daemon decodes the rotation-status-parse row
+# with `IFS=$'\t' read`, and bash treats tab as IFS WHITESPACE: consecutive
+# tabs collapse into one delimiter, so any empty column silently shifts every
+# column to its right (an all_tokens_limited row put soonest_reset into
+# rotation_from). The helper now emits `-` for empty columns and the daemon
+# maps `-` back to "". Pin the encode + the bash decode roundtrip.
+SENTINEL_ISO="2099-01-02T03:04:05+09:00"
+LIMITED_ROW="$("$PYTHON" "$REPO_ROOT/bridge-daemon-helpers.py" rotation-status-parse \
+  "{\"status\":\"skipped\",\"reason\":\"all_tokens_limited\",\"active_token_id\":\"first\",\"soonest_reset\":\"$SENTINEL_ISO\"}")"
+"$PYTHON" - "$LIMITED_ROW" "$SENTINEL_ISO" <<'PY'
+import sys
+
+cols = sys.argv[1].split("\t")
+if len(cols) != 6:
+    raise SystemExit(f"expected 6 sentinel-encoded columns, got {len(cols)}: {cols!r}")
+expect = ["skipped", "all_tokens_limited", "-", "first", "-", sys.argv[2]]
+if cols != expect:
+    raise SystemExit(f"sentinel encoding mismatch: {cols!r} != {expect!r}")
+PY
+[[ $? -eq 0 ]] || fail "rotation-status-parse did not sentinel-encode empty columns"
+IFS=$'\t' read -r SR_STATUS SR_REASON SR_FROM SR_TO SR_SYNC SR_SOONEST <<<"$LIMITED_ROW"
+[[ "$SR_FROM" == "-" ]] && SR_FROM=""
+[[ "$SR_SYNC" == "-" ]] && SR_SYNC=""
+[[ "$SR_SOONEST" == "-" ]] && SR_SOONEST=""
+[[ "$SR_STATUS" == "skipped" && "$SR_REASON" == "all_tokens_limited" && -z "$SR_FROM" && "$SR_TO" == "first" && -z "$SR_SYNC" && "$SR_SOONEST" == "$SENTINEL_ISO" ]] \
+  || fail "bash IFS decode misaligned sentinel row: status=$SR_STATUS reason=$SR_REASON from=$SR_FROM to=$SR_TO sync=$SR_SYNC soonest=$SR_SOONEST"
+ROTATED_ROW="$("$PYTHON" "$REPO_ROOT/bridge-daemon-helpers.py" rotation-status-parse \
+  '{"status":"rotated","old_active_token_id":"a","active_token_id":"b","reason":"usage:weekly:97","sync":{"status":"ok"}}')"
+IFS=$'\t' read -r SR_STATUS SR_REASON SR_FROM SR_TO SR_SYNC SR_SOONEST <<<"$ROTATED_ROW"
+[[ "$SR_SOONEST" == "-" ]] && SR_SOONEST=""
+[[ "$SR_STATUS" == "rotated" && "$SR_FROM" == "a" && "$SR_TO" == "b" && "$SR_SYNC" == "ok" && -z "$SR_SOONEST" ]] \
+  || fail "rotated row decode regressed under sentinel encoding: $ROTATED_ROW"
+pass "rotation-status-parse sentinel encoding survives the daemon's IFS=tab decode"
+
 ADD_QUOTA_JSON="$(printf '%s' "$TOKEN_C" | "$REPO_ROOT/agent-bridge" auth claude-token add --id quota --stdin --json)"
 [[ "$ADD_QUOTA_JSON" != *"$TOKEN_C"* ]] || fail "quota add output leaked token"
 CHECK_QUOTA_JSON="$(

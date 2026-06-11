@@ -2104,6 +2104,7 @@ process_usage_monitor() {
   local rotation_from=""
   local rotation_to=""
   local rotation_sync_status=""
+  local rotation_soonest_reset=""
   # Footgun #11 (refs #815 Wave B): route the alert_rows / rotation_rows
   # loops through tempfiles to avoid `done <<<` heredoc_write wedges.
   local _alert_tmp="" _rotation_tmp=""
@@ -2198,11 +2199,16 @@ process_usage_monitor() {
     # Rotate only once per monitor pass; bridge-usage.py already latches each
     # provider/account/window candidate once per usage reset cycle.
     (( rotation_count > 0 )) && continue
+    # #1789: hand the rotating-away token's reset window (already on this
+    # candidate row) to the rotator so it can stamp `limited_until` on the
+    # old token and stop round-robining into tokens that are themselves
+    # still rate-limited.
     rotate_json="$(bridge_with_timeout 20 daemon_auth_token_rotate "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
       --if-auto-enabled \
       --sync \
       --agents "$rotation_agent_scope" \
       --reason "usage:${window}:${used_percent}" \
+      --limited-until "$reset_at" \
       --json 2>/dev/null || true)"
     # Issue #800 regression follow-up: rotation outcome parser moved out of
     # heredoc-stdin into the helper subcommand. 5s ceiling — pure JSON
@@ -2210,7 +2216,17 @@ process_usage_monitor() {
     # subsequent ``IFS=$'\t' read`` decodes to empty fields, which the
     # downstream ``case`` statement routes through the ``error:*`` branch.
     rotation_status_row="$(bridge_with_timeout 5 rotation_status_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" rotation-status-parse "$rotate_json" || true)"
-    IFS=$'\t' read -r rotation_status rotation_reason rotation_from rotation_to rotation_sync_status <<<"$rotation_status_row"
+    IFS=$'\t' read -r rotation_status rotation_reason rotation_from rotation_to rotation_sync_status rotation_soonest_reset <<<"$rotation_status_row"
+    # PR #1790 r3 BLOCKING 1: the helper emits `-` for EMPTY columns because
+    # bash treats tab as IFS whitespace — consecutive tabs collapse and every
+    # empty field would shift the columns after it (the all_tokens_limited
+    # row landed soonest_reset in rotation_from). Decode the sentinel here.
+    [[ "$rotation_status" == "-" ]] && rotation_status=""
+    [[ "$rotation_reason" == "-" ]] && rotation_reason=""
+    [[ "$rotation_from" == "-" ]] && rotation_from=""
+    [[ "$rotation_to" == "-" ]] && rotation_to=""
+    [[ "$rotation_sync_status" == "-" ]] && rotation_sync_status=""
+    [[ "$rotation_soonest_reset" == "-" ]] && rotation_soonest_reset=""
     # Issue #831: record `worst_case_agent` — the agent whose usage actually
     # crossed the rotation threshold this pass. Empty for legacy single-cache
     # rows. Distinct from `agent_scope` (the rotation fanout target).
@@ -2227,12 +2243,27 @@ process_usage_monitor() {
       --detail to="$rotation_to" \
       --detail sync_status="$rotation_sync_status" \
       --detail agent_scope="$rotation_agent_scope" \
-      --detail worst_case_agent="$worst_case_agent"
+      --detail worst_case_agent="$worst_case_agent" \
+      --detail soonest_reset="$rotation_soonest_reset"
     case "$rotation_status:$rotation_reason" in
       rotated:*)
         title="claude token rotated"
         body="Claude token rotated after ${window} usage reached ${used_percent}%. active_token=${rotation_to}; sync=${rotation_sync_status:-unknown}."
         priority="high"
+        ;;
+      skipped:all_tokens_limited)
+        # #1789: every enabled token is inside a known 429 limit window —
+        # rotating would re-enter a saturated token, so the rotator refused.
+        # This is one continuous condition, not a per-pass event: notify on a
+        # cooldown latch (bridge_daemon_pass_due doubles as the latch — it
+        # stamps when due), never once per 300s monitor pass.
+        if bridge_daemon_pass_due claude_pool_exhausted_notice "${BRIDGE_CLAUDE_POOL_EXHAUSTED_NOTICE_INTERVAL_SECONDS:-1800}"; then
+          title="claude token pool exhausted"
+          body="All enabled Claude tokens are rate-limited; rotation is paused instead of cycling a saturated pool (#1789). soonest_reset=${rotation_soonest_reset:-unknown}. Sessions may hit limit errors until a window resets."
+          priority="urgent"
+        else
+          title=""
+        fi
         ;;
       skipped:no_alternate_token|error:*)
         title="claude token rotation needs attention"

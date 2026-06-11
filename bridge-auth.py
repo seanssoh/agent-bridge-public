@@ -615,6 +615,17 @@ def enabled_token_ids(registry: dict[str, Any]) -> list[str]:
     return [token_id for token_id in ids if token_id]
 
 
+def token_limited_until(row: dict[str, Any]) -> datetime | None:
+    """Parse a token row's ``limited_until`` stamp (#1789).
+
+    The stamp is the 429-derived ``reset_at`` recorded when the token was
+    rotated away at-limit — an ISO timestamp, never token bytes. Returns None
+    when absent or unparseable (an unreadable stamp must never strand a token
+    as permanently ineligible).
+    """
+    return iso_to_utc(str(row.get("limited_until") or ""))
+
+
 def redact_token(text: str, token: str) -> str:
     if not text or not token:
         return text
@@ -939,6 +950,11 @@ def cmd_activate(args: argparse.Namespace) -> int:
                 raise ValueError(f"token id is disabled: {args.id}")
             registry["active_token_id"] = args.id
             row["last_activated_at"] = now_iso()
+            # #1789 (PR #1790 r2): explicit activation is an operator
+            # override — drop any limit-window stamp so the token is not
+            # hiddenly skipped by future rotations until the old timestamp
+            # expires. Mirrors the rotate-path cleanup.
+            row.pop("limited_until", None)
             save_registry(registry_path, registry)
     except Exception as exc:
         return fail(str(exc), json_mode)
@@ -977,23 +993,74 @@ def cmd_rotate(args: argparse.Namespace) -> int:
                     }
                 else:
                     old_id = str(registry.get("active_token_id") or "")
-                    if old_id not in ids:
-                        new_id = ids[0]
+                    # #1789: persist the rotating-away token's known limit
+                    # window so future selections can avoid still-limited
+                    # tokens. The caller (daemon usage monitor) passes the
+                    # 429-derived reset_at it already holds.
+                    registry_dirty = False
+                    if args.limited_until and old_id:
+                        old_row = find_token(registry, old_id)
+                        if old_row is not None and iso_to_utc(args.limited_until) is not None:
+                            old_row["limited_until"] = args.limited_until
+                            registry_dirty = True
+                    # Ring order after the active token (legacy round-robin),
+                    # but skip candidates still inside a known limit window —
+                    # rotating into one buys nothing and thrashes the pool
+                    # (#1789: median same-token return was 1.2h vs a 5h
+                    # window). An expired or absent stamp keeps the token
+                    # eligible.
+                    if old_id in ids:
+                        start = ids.index(old_id) + 1
+                        ring = [ids[(start + i) % len(ids)] for i in range(len(ids) - 1)]
                     else:
-                        new_id = ids[(ids.index(old_id) + 1) % len(ids)]
-                    row = find_token(registry, new_id)
-                    if row is None:
-                        raise ValueError(f"rotation selected missing token id: {new_id}")
-                    timestamp = now_iso()
-                    registry["active_token_id"] = new_id
-                    row["last_activated_at"] = timestamp
-                    registry["last_rotation"] = {
-                        "rotated_at": timestamp,
-                        "from": old_id,
-                        "to": new_id,
-                        "reason": args.reason or "",
-                    }
-                    save_registry(registry_path, registry)
+                        ring = list(ids)
+                    now = now_utc()
+                    new_id = ""
+                    soonest_reset: datetime | None = None
+                    for candidate in ring:
+                        candidate_row = find_token(registry, candidate)
+                        limited = token_limited_until(candidate_row or {})
+                        if limited is not None and limited > now:
+                            if soonest_reset is None or limited < soonest_reset:
+                                soonest_reset = limited
+                            continue
+                        new_id = candidate
+                        break
+                    if not new_id:
+                        # Every alternate is still rate-limited: refusing is
+                        # the truthful outcome. The caller surfaces ONE
+                        # actionable state instead of a saturated-pool
+                        # musical-chairs loop.
+                        skipped_payload = {
+                            "status": "skipped",
+                            "reason": "all_tokens_limited",
+                            "active_token_id": old_id,
+                            "soonest_reset": (
+                                soonest_reset.isoformat(timespec="seconds")
+                                if soonest_reset is not None
+                                else ""
+                            ),
+                        }
+                        if registry_dirty:
+                            save_registry(registry_path, registry)
+                    else:
+                        row = find_token(registry, new_id)
+                        if row is None:
+                            raise ValueError(f"rotation selected missing token id: {new_id}")
+                        # The selected token's window (if any) has expired —
+                        # drop the stale stamp so list/status output stays
+                        # truthful.
+                        row.pop("limited_until", None)
+                        timestamp = now_iso()
+                        registry["active_token_id"] = new_id
+                        row["last_activated_at"] = timestamp
+                        registry["last_rotation"] = {
+                            "rotated_at": timestamp,
+                            "from": old_id,
+                            "to": new_id,
+                            "reason": args.reason or "",
+                        }
+                        save_registry(registry_path, registry)
     except Exception as exc:
         return fail(str(exc), json_mode)
 
@@ -3457,6 +3524,10 @@ def build_parser() -> argparse.ArgumentParser:
     rotate_parser = sub.add_parser("rotate")
     rotate_parser.add_argument("--if-auto-enabled", action="store_true")
     rotate_parser.add_argument("--reason", default="")
+    # #1789: ISO reset_at of the rotating-away token's 429 limit window.
+    # Recorded as the old row's `limited_until` so selection can skip
+    # still-limited tokens. Timestamp only — never token bytes.
+    rotate_parser.add_argument("--limited-until", default="")
     rotate_parser.add_argument("--sync", action="store_true", help=argparse.SUPPRESS)
     rotate_parser.add_argument("--agents", help=argparse.SUPPRESS)
     rotate_parser.add_argument("--json", action="store_true")

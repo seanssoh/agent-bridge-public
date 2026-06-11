@@ -56,7 +56,7 @@ bridge-cron.sh	991	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940
 bridge-cron.sh	1610	C3	e922c8981a5dc87928344cdc8dc56501cf7cfdad8d360c59e7754c66f1600478	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-daemon.sh	800	H3	f1c1630f31d4bc24ae47602958be739975b927a70ec87c7bf819402ad94b9b0f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-daemon.sh	1022	H3	16a961e912bc1612646a256a1b085d41178d7b1c282775a10dc8f83244b92ea8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	1908	H3	23c0313bf8a6711cc33242c92c06468b8b19bc33e2b16b421f3bc60de187a677	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	2219	H3	7d4684195b1f8f572d489dc3b77c5a2803f24b2ff7f68c72526bb7952eb0eb03	here-string/procsub, non-interpreter consumer	patch	PR #1790 (#1789): same read-into-vars here-string, read list gained rotation_soonest_reset; supersedes 23c0313b
 bridge-daemon.sh	2186	H3	16ff48070939ced82df89c9c5a5aee6d60abfa8ce48e66cbc1affbe12e89db37	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-daemon.sh	3027	H3	257b2ce4f7caaf094cf6907c8feb0e4a062b7814511498ba862c60690873b494	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 bridge-daemon.sh	3036	H3	f423c7e06b3b4c0cddc08ab8d3564f61837e3c8ad7db470ce969c038eeecfea9	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -712,6 +712,8 @@ tests/admin-gateway-refactor/smoke.sh	441	C3	a85b1ae54fbb817d47075fcaa60163001b1
 tests/bootstrap-cron-schedules/smoke.sh	196	H3	ed787beec5de04a63cc901b168c263c9d2fe457e9c4f0e3852d96e4e0a88326c	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 tests/claude-token-rotation/smoke.sh	1015	C1	8b40ac1ae47b8dc42bb883423f199a472e4eb3d6b3a9ba31fc107d6cd14f1de7	heredoc in capture	patch-dev	Phase 6 PR F
 tests/claude-token-rotation/smoke.sh	1030	H3	8983fa977b37ee4a8f50f74ce401778bd9fc69d94937f3b220a18c888cba466d	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
+tests/claude-token-rotation/smoke.sh	1037	H3	2f68e4299e7ee194f1c4b787b80da5c7a89673feb0ba4025634a079dd034618d	here-string deliberately mirrors daemon IFS=tab decode (sentinel roundtrip, r3 BLOCKING 1)	patch	PR #1790 r3
+tests/claude-token-rotation/smoke.sh	1045	H3	6a820dd9da757c37e8ed54119691e4323c7a343963d14cdf7d58988ba35f448a	here-string deliberately mirrors daemon IFS=tab decode (sentinel roundtrip, r3 BLOCKING 1)	patch	PR #1790 r3
 tests/claude-token-rotation/smoke.sh	1321	C1	a1ec58846ebb8c166b188950304e0a83104b808b1c2c0658cd83914d60c1fc2e	heredoc in capture	patch-dev	Phase 6 PR F
 tests/claude-token-rotation/smoke.sh	1326	C1	9d15df02bcce12d28b50326fe3ff2b343dd51b8d690332a8ab77a0c6922e8701	heredoc in capture	patch-dev	Phase 6 PR F
 tests/claude-token-rotation/smoke.sh	1381	C1	02b9e43da015ed1103f7703be26584f4adcc3b3d1d46e1f52e82a7187bab688f	heredoc in capture	patch-dev	Phase 6 PR F
