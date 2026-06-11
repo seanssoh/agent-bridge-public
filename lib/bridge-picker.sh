@@ -242,18 +242,94 @@ bridge_picker_resolve_session() {
 bridge_picker_pane_looks_prompt_like() {
   local pane="$1"
   [[ -n "$pane" ]] || return 1
-  # Selection/menu glyphs, a TUI box edge, a y/n style prompt, an arrow-key
-  # hint, or an explicit "Enter to" affordance all indicate an interactive
-  # surface. These are intentionally broad: a false positive only means we
-  # START the unknown-tick timer; escalation still needs the pane UNCHANGED for
-  # the full minute/tick budget, which ordinary live output never satisfies.
-  case "$pane" in
-    *❯*|*›*|*"╭"*|*"╰"*|*"│"*) return 0 ;;
-    *"[y/n]"*|*"[Y/n]"*|*"[y/N]"*|*"(y/n)"*|*"(Y/n)"*) return 0 ;;
-    *"↑/↓"*|*"↑↓"*|*"press enter"*|*"Press Enter"*|*"to continue"*) return 0 ;;
-    *"Press "*"to "*) return 0 ;;
-    *) return 1 ;;
-  esac
+  # #1783: a bare selector glyph or box border is NO LONGER sufficient. Both
+  # engines' NORMAL IDLE composer screens always contain '❯'/'›' and box edges
+  # (╭╰│), so the old broad globs treated every idle session as a candidate
+  # novel prompt — and because an idle pane is static, the unknown-tick tracker
+  # escalated it as "stuck" ~5min after the stage came up (the #1783 fleet-wide
+  # false-positive wave). Require an ACTUAL interactive affordance instead:
+  #   - a selector glyph FOLLOWED BY option text (❯ / › / line-leading > + \S),
+  #     which an empty idle composer ('❯' alone on its line) never satisfies;
+  #   - a numbered option list line (e.g. "1. Yes", "  2) No");
+  #   - an explicit [y/n]-style confirm token;
+  #   - an explicit "Press <key>" / "Enter to …" / arrow-key affordance.
+  # This only gates whether we START the unknown-tick timer; a positive here
+  # still needs the pane UNCHANGED across the full minute/tick budget before any
+  # escalation, which ordinary live output never satisfies. Known catalog
+  # fingerprints are matched earlier and are unaffected by this heuristic.
+  # Issue #815 / footgun #11: slurp the captured pane through a TEMPFILE +
+  # `mapfile`, never a `done <<<"$pane"` here-string. This runs on EVERY idle
+  # pane every daemon pass (hot path), and `<<<` can wedge on the Bash 5.3.9
+  # heredoc_write deadlock — the same reason the lib/bridge-tmux.sh capture-walk
+  # loops were staged through tempfiles. The tempfile is removed BEFORE the
+  # scan loop, and there is NO RETURN trap — every return path (success and
+  # failure) is already past cleanup, so the helper never leaves or clobbers a
+  # caller's RETURN trap on its early-success paths (codex review #1783 P2).
+  local _tmp _lines=()
+  _tmp="$(mktemp)" || return 1
+  printf '%s\n' "$pane" >"$_tmp" 2>/dev/null || { rm -f -- "$_tmp"; return 1; }
+  mapfile -t _lines <"$_tmp"
+  rm -f -- "$_tmp"
+
+  local line lower trimmed rest
+  for line in "${_lines[@]}"; do
+    # Whole-line confirm / affordance tokens. Lowercase the line once so the
+    # affordance match is case-INSENSITIVE — a novel prompt's only signal may be
+    # a lower-case 'press any key to continue' / 'hit any key to continue'
+    # (codex review #1783 P2); the previous broad '*to continue*' glyph was
+    # dropped in the tightening, so re-cover it case-insensitively here.
+    lower="${line,,}"
+    case "$lower" in
+      *"[y/n]"*|*"(y/n)"*) return 0 ;;
+      *"press enter"*|*"enter to "*|*"to continue"*|*"↑/↓"*|*"↑↓"*) return 0 ;;
+      *"press "*"to "*|*"hit "*"to "*) return 0 ;;
+    esac
+    # Unicode selector glyph (❯/›) followed by real OPTION text — including when
+    # the menu is wrapped in a box ('│ ❯ Option A   │'). Take everything after
+    # the FIRST selector glyph, then strip whitespace AND trailing box-drawing
+    # chars from both ends; a non-empty remainder is an option label. An EMPTY
+    # idle composer renders the glyph alone (only spaces / a closing '│' follow),
+    # so its remainder is empty and it is correctly NOT prompt-like.
+    case "$line" in
+      *❯*|*›*)
+        rest="${line#*[❯›]}"
+        # Strip leading/trailing whitespace and box-drawing glyphs. Cover the
+        # light (│ ╮╯╭╰), heavy (┃), and ASCII (|) vertical borders so an empty
+        # composer wrapped in ANY of them ('│ ❯ │' / '┃ ❯ ┃' / '| ❯ |') trims to
+        # empty and is NOT mistaken for an option label (codex review #1783 P2).
+        rest="${rest//│/ }"
+        rest="${rest//┃/ }"
+        rest="${rest//|/ }"
+        rest="${rest//╮/ }"
+        rest="${rest//╯/ }"
+        rest="${rest//╭/ }"
+        rest="${rest//╰/ }"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        rest="${rest%"${rest##*[![:space:]]}"}"
+        [[ -n "$rest" ]] && return 0
+        ;;
+    esac
+    # Strip leading whitespace once for the structured checks below.
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    [[ -n "$trimmed" ]] || continue
+    case "$trimmed" in
+      # Line-leading ASCII '>' menu marker with option text ('> Continue').
+      ">"[[:space:]]*[![:space:]]*)
+        rest="${trimmed#>}"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        [[ -n "$rest" ]] && return 0
+        ;;
+      # Numbered option list: a leading digit run then '.'/')' then a space and
+      # text ('1. Yes', '2) No, keep current').
+      [0-9]*)
+        case "$trimmed" in
+          [0-9]". "*[![:space:]]*|[0-9]") "*[![:space:]]*|\
+          [0-9][0-9]". "*[![:space:]]*|[0-9][0-9]") "*[![:space:]]*) return 0 ;;
+        esac
+        ;;
+    esac
+  done
+  return 1
 }
 
 # No catalog entry matched. If the pane is a genuine novel prompt-like screen
@@ -297,6 +373,33 @@ bridge_picker_handle_unknown() {
     return 1
   fi
 
+  # Storm fuse (#1783): a per-pass global cap on UNKNOWN escalations, INDEPENDENT
+  # of any fingerprint. The per-session anti-loop window does not apply to
+  # escalations (they are not auto_resolve actions), so without this a heuristic
+  # regression that mis-flags every idle session files N high-priority tasks per
+  # pass. Over-cap sessions are counted into a single summarizing warn line
+  # (emitted by bridge_picker_scan_all_sessions) instead of filing N×high tasks.
+  #
+  # Anti-starvation (codex review #1783 P2): an over-cap session's unknown timer
+  # is deliberately LEFT INTACT (not cleared). The sessions that DID escalate
+  # clear their own timer below and must re-elapse a fresh budget before they can
+  # escalate again, while a suppressed session keeps its already-elapsed budget
+  # and is immediately stuck on the next pass — so the stable BRIDGE_AGENT_IDS
+  # scan order rotates which stuck sessions surface across passes instead of the
+  # first `cap` agents monopolizing every cycle. The cap still bounds escalations
+  # PER PASS; a genuinely-stuck screen is delayed, never starved.
+  BRIDGE_PICKER_UNKNOWN_PASS_COUNT=$(( ${BRIDGE_PICKER_UNKNOWN_PASS_COUNT:-0} + 1 ))
+  local cap
+  cap="$(bridge_picker_unknown_escalation_cap)"
+  if (( BRIDGE_PICKER_UNKNOWN_PASS_COUNT > cap )); then
+    BRIDGE_PICKER_UNKNOWN_PASS_SUPPRESSED=$(( ${BRIDGE_PICKER_UNKNOWN_PASS_SUPPRESSED:-0} + 1 ))
+    # Name only the first few suppressed agents in the eventual summary.
+    if (( ${BRIDGE_PICKER_UNKNOWN_PASS_SUPPRESSED:-0} <= 5 )); then
+      BRIDGE_PICKER_UNKNOWN_PASS_AGENTS="${BRIDGE_PICKER_UNKNOWN_PASS_AGENTS:-}${BRIDGE_PICKER_UNKNOWN_PASS_AGENTS:+, }${agent}"
+    fi
+    return 0
+  fi
+
   bridge_picker_log "picker detector: UNKNOWN screen stuck on session=${session} (agent=${agent}) past ${unknown_minutes}m — escalating for classification"
   # Escalate with an empty picker_id; bridge_picker_escalate renders it as
   # 'unknown' and the body carries the captured pane for the admin to classify.
@@ -306,6 +409,16 @@ bridge_picker_handle_unknown() {
   # debounce — a fresh budget must elapse before the next escalation.
   bridge_picker_py clear-unknown --session "$session" --state-dir "$(bridge_picker_state_dir)" >/dev/null 2>&1 || true
   return 0
+}
+
+# Per-pass cap on UNKNOWN-stuck escalations (storm fuse, #1783). Env-tunable via
+# BRIDGE_PICKER_UNKNOWN_ESCALATION_CAP; default 3 absorbs a fleet-wide regression
+# while still letting a couple of genuinely-novel screens through each pass. A
+# non-positive / non-numeric value falls back to the default.
+bridge_picker_unknown_escalation_cap() {
+  local cap="${BRIDGE_PICKER_UNKNOWN_ESCALATION_CAP:-3}"
+  [[ "$cap" =~ ^[0-9]+$ ]] && (( cap >= 1 )) || cap=3
+  printf '%s' "$cap"
 }
 
 # policy=defer → route to the EXISTING blocker machinery; do NOT key it here.
@@ -621,6 +734,13 @@ bridge_picker_settle() {
 bridge_picker_scan_all_sessions() {
   bridge_picker_enabled || return 1
 
+  # Reset the per-pass UNKNOWN-escalation storm-fuse counters (#1783). These are
+  # plain globals (the per-session resolver runs in this same shell, not a
+  # subshell) read+bumped inside bridge_picker_handle_unknown.
+  BRIDGE_PICKER_UNKNOWN_PASS_COUNT=0
+  BRIDGE_PICKER_UNKNOWN_PASS_SUPPRESSED=0
+  BRIDGE_PICKER_UNKNOWN_PASS_AGENTS=""
+
   local agent="" session="" engine=""
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
     engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
@@ -630,5 +750,14 @@ bridge_picker_scan_all_sessions() {
     bridge_tmux_session_exists "$session" || continue
     bridge_picker_resolve_session "$agent" "$session" "$engine" || true
   done
+
+  # Storm fuse summary (#1783): if the per-pass UNKNOWN-escalation cap tripped,
+  # emit ONE warn line naming the suppressed count + first agents instead of the
+  # N high-priority queue tasks that the over-cap sessions would otherwise file.
+  if (( ${BRIDGE_PICKER_UNKNOWN_PASS_SUPPRESSED:-0} > 0 )); then
+    local cap
+    cap="$(bridge_picker_unknown_escalation_cap)"
+    bridge_warn "picker resolver: UNKNOWN-escalation cap (${cap}/pass) tripped — suppressed ${BRIDGE_PICKER_UNKNOWN_PASS_SUPPRESSED} additional escalation(s) this pass (first: ${BRIDGE_PICKER_UNKNOWN_PASS_AGENTS:-?}). A fleet-wide unknown-stuck wave usually means a heuristic/catalog regression, not ${BRIDGE_PICKER_UNKNOWN_PASS_SUPPRESSED} genuinely-novel screens — investigate before raising BRIDGE_PICKER_UNKNOWN_ESCALATION_CAP."
+  fi
   return 0
 }

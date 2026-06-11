@@ -153,6 +153,134 @@ def pane_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
+# Box-drawing glyphs stripped when checking whether a selector caret is followed
+# by real option text (so '│ ❯ Option │' counts, '│ ❯      │' does not).
+_BOX_GLYPHS = "│┃|╮╯╭╰┐┘┌└─━"
+
+# Case-insensitive whole-pane confirm/affordance tokens that mark an interactive
+# prompt regardless of which engine rendered it.
+_AFFORDANCE_TOKENS = (
+    "[y/n]",
+    "(y/n)",
+    "press enter",
+    "enter to ",
+    "to continue",
+    "↑/↓",
+    "↑↓",
+)
+# "press <key> to <verb>" / "hit <key> to <verb>" style affordances.
+_AFFORDANCE_RE = re.compile(r"\b(?:press|hit)\b.*\bto\b", re.IGNORECASE)
+# A numbered option-list row: optional indent, a 1-2 digit run, '.'/')' , space,
+# then real text.
+_NUMBERED_OPTION_RE = re.compile(r"(?m)^\s*\d{1,2}[.)]\s+\S")
+
+
+def _caret_has_option_text(line: str) -> bool:
+    """True if a selector caret (❯/›) on this line is followed by real option
+    text (box-drawing chars stripped). An empty idle composer renders the caret
+    with only spaces / a closing border after it, so it returns False."""
+    for caret in ("❯", "›"):
+        idx = line.find(caret)
+        if idx == -1:
+            continue
+        rest = line[idx + len(caret):]
+        rest = "".join(" " if ch in _BOX_GLYPHS else ch for ch in rest)
+        if rest.strip():
+            return True
+    return False
+
+
+def _pane_has_picker_affordance(text: str, *, single_caret: bool = False) -> bool:
+    """True if `text` contains ANY interactive picker affordance.
+
+    Signals: a numbered option list ('1. Yes' / '2) No'); an explicit
+    [y/n] / Press-<key> / 'to continue' / arrow affordance; a line-leading ASCII
+    '>' menu marker with option text; or a selector caret (❯/›) followed by
+    option text.
+
+    `single_caret` controls how many caret-with-text rows count as a menu:
+      - False (default, whole-pane scan): a SINGLE caret-with-text line is the
+        engine's own idle composer (claude's is empty so it never trips this;
+        codex's idle '› <ghost text>' would), so it requires >=2 caret rows to
+        avoid mis-flagging a pure idle composer.
+      - True: ONE caret-with-text line is enough. Use this only on the region
+        BELOW the idle composer line (see _idle_ready_tail_clear), where the
+        composer itself has been excluded — there a single highlighted option
+        ('❯ Continue' with the alternative on an unmarked row) is a real picker.
+    """
+    lower = text.lower()
+    for tok in _AFFORDANCE_TOKENS:
+        if tok in lower:
+            return True
+    if _AFFORDANCE_RE.search(text):
+        return True
+    if _NUMBERED_OPTION_RE.search(text) is not None:
+        return True
+    need_carets = 1 if single_caret else 2
+    caret_option_lines = 0
+    for line in text.splitlines():
+        # Line-leading ASCII '>' menu marker with option text ('> Continue').
+        stripped = line.lstrip()
+        if stripped.startswith(">") and stripped[1:].strip():
+            return True
+        if _caret_has_option_text(line):
+            caret_option_lines += 1
+            if caret_option_lines >= need_carets:
+                return True
+    return False
+
+
+def _idle_ready_tail_clear(pane_text: str, patterns: list[Any]) -> bool:
+    """Decide whether an idle `non_picker` entry may short-circuit on this pane.
+
+    Composite-pane guard (#1783), tail-scoped to avoid two opposite failures:
+      - a GENUINE novel picker rendered as the live foreground must escalate, so
+        the idle entry must NOT hard-exclude it; but
+      - ordinary STALE scrollback (a numbered list / 'press enter' from prior
+        output) ABOVE a live idle ready composer/footer must NOT escalate — the
+        session is simply at the ready prompt.
+    In a real Claude/Codex TUI a live picker is the BOTTOM-most element (it
+    replaces the composer); when idle, the composer/footer is the bottom. So the
+    idle entry may short-circuit only when there is NO picker affordance at or
+    BELOW the idle composer line (`idle_start` = the earliest of the idle
+    patterns' last matches; the composer line is the line containing it). A
+    picker affordance ABOVE that line is scrollback and ignored.
+
+    The idle composer's OWN line is EXCLUDED before the affordance check, so the
+    region below it is scanned with single-caret sensitivity: a single
+    highlighted option ('❯ Continue' with the alternative on an unmarked row) IS
+    a real foreground picker and escalates. A pure idle pane has nothing
+    option-shaped below the composer, so it stays non_picker.
+    """
+    starts: list[int] = []
+    for pat in patterns:
+        if not isinstance(pat, str):
+            return False
+        try:
+            first = re.search(pat, pane_text)
+        except re.error:
+            return False
+        if first is None:
+            return False
+        starts.append(first.start())
+    if not starts:
+        return False
+    # Anchor on the EARLIEST idle-signature occurrence. Using the FIRST match
+    # (not the last) matters when picker option rows happen to also satisfy the
+    # composer regex (e.g. codex options that contain a '/'-command): the first
+    # such row becomes idle_start and any further option rows fall BELOW it, so
+    # they are detected as foreground affordance and the pane escalates instead
+    # of being mis-excluded (codex review #1783 P1 adversarial case).
+    idle_start = min(starts)
+    # Drop the idle composer's OWN line (the line containing idle_start) so its
+    # caret/ghost text is not mistaken for an option, then scan the region BELOW
+    # it with single-caret sensitivity. Anything above idle_start is scrollback.
+    region = pane_text[idle_start:]
+    newline = region.find("\n")
+    below_composer = region[newline + 1:] if newline != -1 else ""
+    return not _pane_has_picker_affordance(below_composer, single_caret=True)
+
+
 def classify(
     engine: str,
     pane_text: str,
@@ -163,6 +291,11 @@ def classify(
     A `non_picker` entry that matches reports matched=False (it is a context
     signal, not a stuck state) so it can shadow a noisier picker fingerprint
     and guarantee the banner never registers as stuck.
+
+    Composite-pane guard (#1783): an IDLE `non_picker` entry is SKIPPED (does not
+    short-circuit) when a genuine picker is the live foreground — see
+    _idle_ready_tail_clear. A non-idle `non_picker` banner (e.g. the
+    Auto-update-failed status line) short-circuits as before.
     """
     result: dict[str, Any] = {
         "matched": False,
@@ -195,8 +328,17 @@ def classify(
         policy = entry.get("policy", "")
         # A non_picker context signal short-circuits: report a match for
         # observability (picker_id surfaced) but matched=False + non_picker so
-        # the caller never treats it as stuck.
+        # the caller never treats it as stuck. EXCEPT idle-ready entries that opt
+        # into the foreground guard (#1783): they may only short-circuit when the
+        # idle composer/footer is the live tail with no foreground picker — a real
+        # picker stacked as the foreground must still reach the unknown path
+        # instead of being hard-excluded. A non-idle banner (foreground_guard
+        # absent, e.g. Auto-update-failed) short-circuits unconditionally.
         if policy == "non_picker":
+            if entry.get("foreground_guard") and not _idle_ready_tail_clear(
+                pane_text, patterns
+            ):
+                continue
             result["picker_id"] = entry.get("picker_id", "")
             result["policy"] = policy
             result["non_picker"] = True
