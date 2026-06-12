@@ -1467,11 +1467,67 @@ run_finalize() {
     native-finalize-run
     --jobs-file "$BRIDGE_NATIVE_CRON_JOBS_FILE"
     --request-file "$request_file"
+    --json
   )
-  if [[ $json_output -eq 1 ]]; then
-    args+=(--json)
+
+  # Issue #1843 (secondary footgun) — capture finalize JSON so a
+  # consecutive-failure escalation never stays invisible. The Python
+  # side already wrote the durable `cron_consecutive_failure_escalated`
+  # audit row; here we additionally surface it in the cron/daemon log
+  # (bridge_warn) so a chronically-broken cron can't silently accumulate
+  # errors for days (the 7-day field outage class). Best-effort: a parse
+  # miss never blocks the finalize.
+  local finalize_json=""
+  local rc=0
+  finalize_json="$(bridge_cron_python "${args[@]}")" || rc=$?
+
+  if [[ -n "$finalize_json" ]]; then
+    local escalation_line=""
+    escalation_line="$(
+      printf '%s' "$finalize_json" | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, ValueError):
+    sys.exit(0)
+esc = payload.get("escalation")
+if isinstance(esc, dict) and esc.get("kind") == "consecutive_failure":
+    print(
+        "cron consecutive-failure escalation: agent=%s job=%s "
+        "consecutive_errors=%s threshold=%s last_error=%s"
+        % (
+            esc.get("agent", "<unknown>"),
+            payload.get("job_id", "<unknown>"),
+            esc.get("consecutive_errors", "?"),
+            esc.get("threshold", "?"),
+            esc.get("last_error", ""),
+        )
+    )
+' 2>/dev/null || printf ''
+    )"
+    if [[ -n "$escalation_line" ]]; then
+      bridge_warn "$escalation_line"
+    fi
   fi
-  bridge_cron_python "${args[@]}"
+
+  if [[ $json_output -eq 1 ]]; then
+    printf '%s\n' "$finalize_json"
+  elif [[ -n "$finalize_json" ]]; then
+    # Preserve the human-readable summary the non-JSON path historically
+    # printed (reconstructed from the captured JSON so the escalation probe
+    # could consume the same single invocation).
+    printf '%s' "$finalize_json" | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, ValueError):
+    sys.exit(0)
+for key in ("status", "action", "reason", "job_id", "run_id", "final_status", "source_file", "jobs_file"):
+    if key in payload and payload[key] is not None:
+        print("%s: %s" % (key, payload[key]))
+' 2>/dev/null || true
+  fi
+  return "$rc"
 }
 
 run_sync() {

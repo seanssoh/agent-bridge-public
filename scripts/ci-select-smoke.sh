@@ -1970,6 +1970,14 @@ select_for_path() {
       # scheduler-side catch-up coalesce; pull it on every bridge-cron.sh move
       # so the compat-copy clarification cannot be silently dropped.
       add_required 8807-cron-backfill-coalesce
+      # Issue #1843 (secondary footgun): root bridge-cron.sh's run_finalize now
+      # captures the native-finalize-run JSON and bridge_warn-surfaces a
+      # consecutive-failure escalation (the durable audit row + payload block
+      # are written by bridge-cron.py). Pull
+      # 1843-cron-consecutive-failure-escalation on every bridge-cron.sh move
+      # so a future PR cannot regress the finalize escalation back to silent
+      # error accumulation (the 7-day field-outage class).
+      add_required 1843-cron-consecutive-failure-escalation
       # Issue #1353 (v0.15.0-beta5-2 Track A): bridge-daemon.sh's
       # `bridge_daemon_check_channel_status_or_hold` + `bridge_report_
       # channel_health_miss` now consult `bridge_agent_setup_pending_
@@ -2270,7 +2278,15 @@ select_for_path() {
       # 1792-cron-scope-fence on every runner move so a future PR cannot drop the
       # fence header, stop interpolating the job title, drop a load-bearing
       # prohibition, or stop threading the run-id origin stamp.
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence
+      # Issue #1843 (secondary footgun): bridge-cron.py's native-finalize-run
+      # now trips a `cron_consecutive_failure_escalated` audit row + payload
+      # `escalation` block when back-to-back cron failures cross the
+      # threshold/cadence, so a chronically-broken cron (the 7-day silent
+      # outage class) can no longer accumulate errors invisibly. Pull
+      # 1843-cron-consecutive-failure-escalation on every bridge-cron.py move
+      # so a future PR cannot drop the escalation, regress the threshold/
+      # cadence boundary, or stop clearing the provenance marker on success.
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1843-cron-consecutive-failure-escalation
       add_integration integration-minimal
       ;;
 
