@@ -3095,7 +3095,14 @@ def cmd_ensure_hud_usage_tap(args: argparse.Namespace) -> int:
     Reads the current statusLine.command from settings.json.  If it is a
     HUD command but does not yet include the tap, rewrites it in-place to
     prepend `python3 <bridge_home>/scripts/hud-usage-tap.py |` before the
-    bun/node exec call.  Idempotent: re-running after patching is a no-op.
+    bun/node exec call.  When NO statusLine is configured at all (absent key,
+    empty dict, or empty command) the tap is installed STANDALONE: its
+    passthrough output is discarded (`> /dev/null`) so the status line stays
+    visually blank exactly as before, while every live Claude Code session
+    still produces the real measured `.usage-cache.json` the rotation monitor
+    reads (real tap data beats probing a rate-limited/edge-blockable
+    endpoint).  A present-but-foreign (non-HUD, non-empty) statusLine is never
+    clobbered.  Idempotent: re-running after patching/installing is a no-op.
     """
     bridge_home = Path(args.bridge_home).expanduser()
     tap_path = str(bridge_home / "scripts" / "hud-usage-tap.py")
@@ -3103,33 +3110,13 @@ def cmd_ensure_hud_usage_tap(args: argparse.Namespace) -> int:
     settings = ensure_settings_root(settings_path)
 
     sl = settings.get("statusLine")
-    if not isinstance(sl, dict):
-        payload = {
-            "HOOK_SETTINGS_FILE": str(settings_path),
-            "HOOK_STATUS": "no-hud",
-            "HOOK_STOP_HOOK": "",
-            "HOOK_PROMPT_HOOK": "",
-            "HOOK_COMMAND": "",
-        }
-        print_payload(payload, args.format)
-        if args.format != "shell":
-            print("hud_usage_tap: no-hud (statusLine not present or not a dict)")
-        return 1
+    sl_is_dict = isinstance(sl, dict)
+    raw_cmd = sl.get("command", "") if sl_is_dict else ""
+    cmd = raw_cmd if isinstance(raw_cmd, str) else ""
 
-    cmd = sl.get("command", "")
-    if not isinstance(cmd, str) or not _is_hud_status_line(cmd):
-        payload = {
-            "HOOK_SETTINGS_FILE": str(settings_path),
-            "HOOK_STATUS": "no-hud",
-            "HOOK_STOP_HOOK": "",
-            "HOOK_PROMPT_HOOK": "",
-            "HOOK_COMMAND": cmd,
-        }
-        print_payload(payload, args.format)
-        if args.format != "shell":
-            print("hud_usage_tap: no-hud (statusLine.command is not a HUD command)")
-        return 1
-
+    # Tap already wired (either piped into a HUD command or installed
+    # standalone) → idempotent no-op. Checked FIRST so a standalone tap
+    # command (which is not HUD-shaped) does not fall into the no-hud branch.
     if _hud_tap_present(cmd):
         payload = {
             "HOOK_SETTINGS_FILE": str(settings_path),
@@ -3142,6 +3129,40 @@ def cmd_ensure_hud_usage_tap(args: argparse.Namespace) -> int:
         if args.format != "shell":
             print("hud_usage_tap: present")
         return 0
+
+    # Empty statusLine slot (absent / {} / empty command): install the tap
+    # standalone. Only a genuinely EMPTY slot qualifies — a non-dict
+    # statusLine or a non-string command is unknown config we must not
+    # clobber (handled by the no-hud branch below).
+    if sl is None or (sl_is_dict and isinstance(raw_cmd, str) and not cmd.strip()):
+        python_bin = getattr(args, "python_bin", None) or "python3"
+        installed = f"{python_bin} {shlex.quote(tap_path)} > /dev/null"
+        settings["statusLine"] = {"type": "command", "command": installed}
+        save_json(settings_path, settings)
+        payload = {
+            "HOOK_SETTINGS_FILE": str(settings_path),
+            "HOOK_STATUS": "installed",
+            "HOOK_STOP_HOOK": "",
+            "HOOK_PROMPT_HOOK": "",
+            "HOOK_COMMAND": installed,
+        }
+        print_payload(payload, args.format)
+        if args.format != "shell":
+            print("hud_usage_tap: installed (statusLine was empty; tap installed standalone)")
+        return 0
+
+    if not sl_is_dict or not isinstance(raw_cmd, str) or not _is_hud_status_line(cmd):
+        payload = {
+            "HOOK_SETTINGS_FILE": str(settings_path),
+            "HOOK_STATUS": "no-hud",
+            "HOOK_STOP_HOOK": "",
+            "HOOK_PROMPT_HOOK": "",
+            "HOOK_COMMAND": cmd,
+        }
+        print_payload(payload, args.format)
+        if args.format != "shell":
+            print("hud_usage_tap: no-hud (statusLine is not a HUD command; left untouched)")
+        return 1
 
     patched = _patch_hud_command(cmd, tap_path)
     settings["statusLine"]["command"] = patched
@@ -3166,12 +3187,16 @@ def cmd_status_hud_usage_tap(args: argparse.Namespace) -> int:
 
     sl = settings.get("statusLine")
     cmd = (sl or {}).get("command", "") if isinstance(sl, dict) else ""
-    if not cmd or not _is_hud_status_line(cmd):
-        status = "no-hud"
-        rc = 1
-    elif _hud_tap_present(cmd):
+    if not isinstance(cmd, str):
+        cmd = ""
+    # Tap-presence first: a STANDALONE tap install (empty-statusLine path in
+    # cmd_ensure_hud_usage_tap) is not HUD-shaped but is very much present.
+    if _hud_tap_present(cmd):
         status = "present"
         rc = 0
+    elif not cmd or not _is_hud_status_line(cmd):
+        status = "no-hud"
+        rc = 1
     else:
         status = "missing"
         rc = 1

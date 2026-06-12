@@ -140,6 +140,7 @@ def _claude_snapshots_from_payload(
     critical: float,
     elevated: float | None,
     agent: str | None,
+    active_token_digest: str | None = None,
 ) -> list[dict[str, Any]]:
     """Shared body for claude_snapshots() and the per-agent collector."""
     if not isinstance(payload, dict):
@@ -147,6 +148,31 @@ def _claude_snapshots_from_payload(
     data = payload.get("data") or payload.get("lastGoodData") or {}
     if not isinstance(data, dict):
         return []
+
+    # Synthetic 429-signal marker (`_signal == rate_limit_429`): the cache is a
+    # probe-fabricated near-limit SIGNAL, not a real reading. Carried into each
+    # snapshot (``signal`` field) so the monitor can route it to the rotation
+    # lane WITHOUT firing operator usage alerts (a synthetic 100% is a rotation
+    # instruction, not a usage fact worth an alert storm).
+    signal_marker = payload.get("_signal")
+    signal_marker = (
+        str(signal_marker) if isinstance(signal_marker, str) and signal_marker else None
+    )
+
+    # Stale-attribution guard: a SYNTHETIC signal cache attributed to a token
+    # that is NO LONGER active is stale — after a rotation the freshly-active
+    # token must not inherit the previous token's near-limit signal (that
+    # re-trips the monitor and ping-pongs the pool). Real readings (no _signal)
+    # are not dropped here. Fail-open: the guard only applies when BOTH the
+    # cache attribution and the caller-supplied active digest are present.
+    if signal_marker is not None and active_token_digest:
+        payload_digest = payload.get("_token_digest") or payload.get("_signal_token")
+        if (
+            isinstance(payload_digest, str)
+            and payload_digest
+            and payload_digest != active_token_digest
+        ):
+            return []
 
     snapshots: list[dict[str, Any]] = []
     plan = data.get("planName") or "subscription"
@@ -181,6 +207,8 @@ def _claude_snapshots_from_payload(
             entry["agent"] = agent
         if signal_token is not None:
             entry["signal_token"] = signal_token
+        if signal_marker is not None:
+            entry["signal"] = signal_marker
         snapshots.append(entry)
     return snapshots
 
@@ -190,6 +218,7 @@ def claude_snapshots(
     warn: float,
     critical: float,
     elevated: float | None = None,
+    active_token_digest: str | None = None,
 ) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
@@ -198,7 +227,8 @@ def claude_snapshots(
     except Exception:
         return []
     return _claude_snapshots_from_payload(
-        payload, str(path), warn, critical, elevated, agent=None
+        payload, str(path), warn, critical, elevated, agent=None,
+        active_token_digest=active_token_digest,
     )
 
 
@@ -224,6 +254,7 @@ def claude_snapshots_per_agent(
     warn: float,
     critical: float,
     elevated: float | None = None,
+    active_token_digest: str | None = None,
 ) -> list[dict[str, Any]]:
     """Issue #831: read the per-agent cache payload array (built by
     bridge-usage.sh) and emit one snapshot set per agent. Each snapshot is
@@ -251,7 +282,8 @@ def claude_snapshots_per_agent(
         source = str(entry.get("path") or "")
         snapshots.extend(
             _claude_snapshots_from_payload(
-                payload, source, warn, critical, elevated, agent=agent
+                payload, source, warn, critical, elevated, agent=agent,
+                active_token_digest=active_token_digest,
             )
         )
     return snapshots
@@ -368,6 +400,7 @@ def native_snapshots(
     warn: float,
     critical: float,
     elevated: float | None = None,
+    active_token_digest: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read the native-probe controller cache and tag it as the native source.
 
@@ -380,7 +413,10 @@ def native_snapshots(
     """
     if not _cache_is_native_probe(path):
         return []
-    snaps = claude_snapshots(path, warn, critical, elevated=elevated)
+    snaps = claude_snapshots(
+        path, warn, critical, elevated=elevated,
+        active_token_digest=active_token_digest,
+    )
     for snap in snaps:
         snap["agent"] = NATIVE_PROBE_AGENT
         snap["source"] = NATIVE_PROBE_SOURCE
@@ -392,6 +428,12 @@ def collect_snapshots(args: argparse.Namespace) -> list[dict[str, Any]]:
     critical = float(args.critical_threshold)
     elevated = _parse_elevated(args, warn, critical)
     snapshots: list[dict[str, Any]] = []
+
+    # Stale-attribution guard input: the one-way digest of the CURRENTLY-active
+    # rotation-registry token (supplied by bridge-usage.sh on registry
+    # installs). A synthetic 429-signal cache attributed to a DIFFERENT token
+    # is dropped at parse time — see _claude_snapshots_from_payload.
+    active_token_digest = getattr(args, "active_token_digest", None) or None
 
     # Issue #831: when --per-agent-cache-json is supplied, the caller is in
     # explicit per-agent mode. Per-agent mode latches on flag presence + a
@@ -411,7 +453,8 @@ def collect_snapshots(args: argparse.Namespace) -> list[dict[str, Any]]:
         per_agent_mode_active = _per_agent_payload_is_present(per_agent_path)
         if per_agent_mode_active:
             per_agent_snaps = claude_snapshots_per_agent(
-                per_agent_path, warn, critical, elevated=elevated
+                per_agent_path, warn, critical, elevated=elevated,
+                active_token_digest=active_token_digest,
             )
             snapshots.extend(per_agent_snaps)
             per_agent_resolved_paths = _per_agent_cache_paths(per_agent_path)
@@ -424,7 +467,10 @@ def collect_snapshots(args: argparse.Namespace) -> list[dict[str, Any]]:
         # probe wrote, so #1437's native signal flows without extra wiring.
         legacy_raw = getattr(args, "legacy_single_path", None) or args.claude_usage_cache
         snapshots.extend(
-            claude_snapshots(Path(legacy_raw).expanduser(), warn, critical, elevated=elevated)
+            claude_snapshots(
+                Path(legacy_raw).expanduser(), warn, critical, elevated=elevated,
+                active_token_digest=active_token_digest,
+            )
         )
 
     # Issue #1437 PRIMARY: in per-agent mode the controller/native cache is
@@ -440,7 +486,10 @@ def collect_snapshots(args: argparse.Namespace) -> list[dict[str, Any]]:
         native_path = Path(native_raw).expanduser()
         if _resolve_str(native_path) not in per_agent_resolved_paths:
             snapshots.extend(
-                native_snapshots(native_path, warn, critical, elevated=elevated)
+                native_snapshots(
+                    native_path, warn, critical, elevated=elevated,
+                    active_token_digest=active_token_digest,
+                )
             )
 
     snapshots.extend(
@@ -621,6 +670,17 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             ]
         )
         bucket = bucket_for_snapshot(snapshot, warn, critical, elevated=elevated)
+        # Synthetic 429-signal snapshots (`signal` set by the cache parser) are
+        # a ROTATION instruction, not a usage fact: route them to their own
+        # `signal` bucket class so the operator-alert ladder below never fires
+        # on them (a probe-fabricated 100% used to emit a full warn/elevated/
+        # crit alert storm every tick) while the rotation-candidate lane —
+        # which keys on used_percent, not bucket — still sees them. `signal`
+        # is absent from _BUCKET_RANK (rank 0), so it can never out-rank a
+        # latch, and it is neither "ok" nor "unknown", so it never clears or
+        # advances the alert latch either.
+        if snapshot.get("signal"):
+            bucket = "signal"
         reset_at = snapshot.get("reset_at")
         used_percent = snapshot.get("used_percent")
         previous = entries.get(key, {}) if isinstance(entries.get(key), dict) else {}
@@ -825,6 +885,13 @@ def build_parser() -> argparse.ArgumentParser:
         # additively in per-agent mode (deduped against per-agent paths) so the
         # native usage signal reaches rotation in the default daemon path.
         cmd.add_argument("--native-usage-cache", default=None, **common_kwargs)
+        # Stale-attribution guard: one-way digest of the currently-active
+        # rotation-registry token. When set, a synthetic 429-signal cache
+        # attributed to a DIFFERENT token is treated as stale (dropped) so a
+        # freshly rotated-in token never inherits the previous token's
+        # near-limit signal (rotation ping-pong guard). Optional; absent →
+        # no attribution check (back-compat).
+        cmd.add_argument("--active-token-digest", default=None, **common_kwargs)
 
     status_parser = sub.add_parser("status")
     add_source_args(status_parser)

@@ -756,9 +756,12 @@ bridge_ensure_claude_pre_compact_hook() {
 
 # Patch the HUD statusLine command to pipe through hud-usage-tap.py so
 # bridge-usage.py keeps receiving .usage-cache.json data even after
-# claude-hud v0.0.12+ removed background OAuth polling.  No-op when:
-# (a) no statusLine is configured, (b) the statusLine is not a HUD
-# command, or (c) the tap is already present.  Idempotent.
+# claude-hud v0.0.12+ removed background OAuth polling.  When the
+# statusLine slot is EMPTY (absent / {} / empty command) the tap is
+# installed standalone so live sessions still produce the real measured
+# usage cache.  No-op when: (a) the statusLine is a foreign non-HUD
+# command (never clobbered), or (b) the tap is already present.
+# Idempotent.
 bridge_ensure_hud_usage_tap() {
   local workdir="$1"
   local launch_cmd="${2-}"
