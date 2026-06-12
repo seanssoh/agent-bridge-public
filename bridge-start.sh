@@ -642,8 +642,10 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   fi
   # Ensure HUD stdin tap is in place before the sudo-wrap so that linux-user
   # isolated agents get their isolated-home settings rendered from controller
-  # context. bridge_ensure_hud_usage_tap is a no-op when no HUD statusLine is
-  # configured or when the tap is already present.
+  # context. bridge_ensure_hud_usage_tap installs the tap standalone when the
+  # statusLine slot is empty, patches a HUD statusLine to pipe through the
+  # tap, and is a no-op when the tap is already present (a foreign non-HUD
+  # statusLine is left untouched).
   bridge_ensure_hud_usage_tap "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null 2>&1 || true
   if ! bridge_disable_claude_webhook_channel "$AGENT" "$WORK_DIR" >/dev/null 2>&1; then
     bridge_warn "Claude backlog webhook channel cleanup skipped: $WORK_DIR"
