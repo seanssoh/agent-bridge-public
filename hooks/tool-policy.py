@@ -28,6 +28,7 @@ if str(_HOOKS_DIR) not in sys.path:
 
 from bridge_hook_common import (  # noqa: E402
     agent_home_root,
+    agent_root_v2,
     bridge_home_dir,
     bridge_script_dir,
     current_agent,
@@ -628,29 +629,19 @@ _NON_AGENT_ENTRIES: frozenset[str] = frozenset({
 })
 
 
-def other_agent_homes(agent: str) -> list[Path]:
-    """Return every sibling agent home under `agent_home_root()`.
+def _enumerate_peer_dirs_under(root: Path, agent: str) -> list[Path]:
+    """Return every sibling agent directory directly under *root*, skipping
+    the acting agent's own entry and the non-agent allowlist.
 
-    Excludes only entries that are never real agents on a standard
-    install — an exact-name allowlist, no prefix heuristic:
-
-    - The `shared` symlink alias (→ BRIDGE_SHARED_DIR). This was the
-      direct trigger for issue #240 — `path.resolve()` collapsed the
-      alias into the shared tree and blocked every legitimate write.
-    - `_template`, the shipped agent profile template.
-    - `.claude`, framework-internal runtime directory.
-
-    Everything else — including agents whose names start with `_` or
-    `.`, and non-alias symlink homes a site may legitimately
-    introduce — stays in the list so cross-agent isolation continues
-    to trigger on real peer paths. Codex rounds 1 and 2 on PR #242
-    both landed on this over-filter class, so we deliberately avoid
-    any prefix-based skip.
+    Shared by the legacy v1 (`agent_home_root()`) and v2 (`agent_root_v2()`)
+    peer enumeration so the iso fail-open and non-agent filtering logic stays
+    in one place. The caller is responsible for mapping each returned per-agent
+    directory to the concrete forbidden tree (the v1 home IS the dir; the v2
+    home is its `home/` child — see `other_agent_homes`).
     """
-    homes: list[Path] = []
-    root = agent_home_root()
+    dirs: list[Path] = []
     if not root.exists():
-        return homes
+        return dirs
     # Issue #1205 Family A: under iso v2 the agent-home root is owned by
     # the controller with mode ``drwx--x---`` — the isolated UID has
     # traverse-only permission and ``iterdir()`` raises PermissionError.
@@ -673,7 +664,7 @@ def other_agent_homes(agent: str) -> list[Path]:
                 )
             except Exception:  # noqa: BLE001 — best-effort, never block hooks
                 pass
-            return homes
+            return dirs
         raise
     for candidate in candidates:
         # ``is_dir()`` can also raise under iso (broken / dangling /
@@ -694,21 +685,111 @@ def other_agent_homes(agent: str) -> list[Path]:
             continue
         if name in _NON_AGENT_ENTRIES:
             continue
-        homes.append(candidate)
+        dirs.append(candidate)
+    return dirs
+
+
+def other_agent_homes(agent: str) -> list[Path]:
+    """Return every sibling agent home — across BOTH the legacy v1 tree
+    (`agent_home_root()`, ``~/.agent-bridge/agents/<peer>``) AND the v2 split
+    layout (`agent_root_v2()`, ``$BRIDGE_DATA_ROOT/agents/<peer>/home``).
+
+    Issue #1823: before this, enumeration consulted the v1 root ONLY, so on a
+    v2-layout install (the current default) a non-admin agent could Edit / Write
+    / Bash-append a PEER's v2 home ``data/agents/<other>/home/…`` with no denial
+    — the documented per-agent containment was not in force for the homes
+    sessions actually run from. The legacy ``agents/<other>/`` tree stayed
+    correctly blocked, which masked the gap. Enumerating both roots is a pure
+    TIGHTENING: it only ADDS v2 peer homes to the forbidden set, so it can only
+    add non-admin cross-agent denies and never changes admin behavior (admin
+    peer-home access keeps its own carve-outs upstream of every consumer here).
+
+    SCOPE — v2 HOME only, NOT the v2 workdir (``data/agents/<peer>/workdir``):
+    the documented ``<admin>-dev`` codex pair *shares the admin's workdir* (the
+    #1492 shared-workspace pair-review contract — only the cwd is shared; homes
+    and hooks stay distinct). Adding the v2 workdir to the forbidden set would
+    false-deny the pair's legitimate writes into the shared workspace. The home
+    is never shared, so denying cross-agent v2-home writes is always correct.
+    The v2 workdir is left as a follow-up (it would need the shared-pair
+    carve-out to land first).
+
+    A single peer that exists in BOTH trees contributes BOTH forbidden paths
+    (the v1 home dir and the v2 ``<peer>/home`` dir) — both are real on-disk
+    trees and both must deny. Name-level dedup is unnecessary because the two
+    paths are distinct and every consumer keys off ``_peer_home_agent_name`` /
+    ``_peer_home_suffix`` (below), which recover the agent name from either
+    shape.
+
+    Excludes only entries that are never real agents on a standard install —
+    an exact-name allowlist, no prefix heuristic (see ``_NON_AGENT_ENTRIES``):
+    the ``shared`` symlink alias (issue #240), ``_template``, ``.claude``.
+    Everything else — including agents whose names start with ``_`` or ``.`` —
+    stays in the list (codex rounds 1/2 on PR #242).
+    """
+    homes: list[Path] = _enumerate_peer_dirs_under(agent_home_root(), agent)
+    # Issue #1823: add the v2 per-agent home (the `home/` child of each peer's
+    # v2 agent dir). The v2 root may be absent (legacy install) — then this is
+    # a no-op and behavior is byte-identical to the pre-#1823 v1-only set.
+    root_v2 = agent_root_v2()
+    if root_v2 is not None:
+        for peer_dir in _enumerate_peer_dirs_under(root_v2, agent):
+            homes.append(peer_dir / "home")
     return homes
+
+
+def _peer_home_agent_name(home: Path) -> str:
+    """Recover the peer agent NAME from a path returned by `other_agent_homes`.
+
+    Issue #1823: a v1 entry IS the agent home dir (``…/agents/<name>`` →
+    ``.name`` is the agent), while a v2 entry is the ``home/`` child
+    (``…/agents/<name>/home`` → ``.name`` is ``"home"`` and the agent name is
+    the parent's). Discriminate by anchoring on `agent_root_v2()` rather than a
+    bare ``name == "home"`` heuristic, so a v1 agent that is literally named
+    ``home`` is not misread.
+    """
+    root_v2 = agent_root_v2()
+    if root_v2 is not None and home.name == "home" and home.parent.parent == root_v2:
+        return home.parent.name
+    return home.name
+
+
+def _peer_home_suffix(home: Path) -> str:
+    """Return the prefix-spelling-agnostic forbidden SUFFIX for a peer home.
+
+    Issue #1823: a v1 home denies the whole ``/agents/<name>`` subtree (in v1
+    the agent dir IS the home), while a v2 home denies only
+    ``/agents/<name>/home`` — NOT ``/agents/<name>/workdir`` (the shared-pair
+    workspace, see `other_agent_homes`). The ``/agents/<name>`` /
+    ``/agents/<name>/home`` tail is spelling-agnostic: it matches the absolute,
+    ``~``, ``$HOME``, ``$BRIDGE_HOME``, ``$BRIDGE_DATA_ROOT`` and brace
+    spellings alike, all of which end in that suffix.
+    """
+    name = _peer_home_agent_name(home)
+    root_v2 = agent_root_v2()
+    if root_v2 is not None and home.name == "home" and home.parent.parent == root_v2:
+        return f"/agents/{name}/home"
+    return f"/agents/{name}"
 
 
 def target_agent_for_path(path: Path, agent: str) -> str | None:
     for other_home in other_agent_homes(agent):
         if path_within(path, other_home):
-            return other_home.name
+            return _peer_home_agent_name(other_home)
     return None
 
 
 def target_agent_for_text(text: str, agent: str) -> str | None:
+    # Issue #1823 NOTE: this builds the v1-spelling substring needles only and
+    # is used SOLELY to populate the `target_agent` AUDIT label in the PreToolUse
+    # entrypoint (`detect_target_agent` → `handle_pretool`); it is NOT the deny
+    # decision for Bash (that is `protected_alias_reason`). Deliberately NOT
+    # extended with v2-home spellings: doing so would attach a peer label to an
+    # ADMIN command whose v2 peer write is legitimately allowed by policy
+    # (admin behavior must not change). The authoritative non-admin v2 deny is
+    # the admin-gated suffix matcher `_peer_forbidden_suffixes`.
     home_root = agent_home_root()
     for other in other_agent_homes(agent):
-        name = other.name
+        name = _peer_home_agent_name(other)
         needles = [
             f"{home_root}/{name}/",
             f"{home_root}/{name}",
@@ -2849,16 +2930,23 @@ def _peer_alias_list(agent: str) -> list[str]:
     home_root = agent_home_root()
     aliases: list[str] = []
     for other in other_agent_homes(agent):
+        name = _peer_home_agent_name(other)
         aliases.extend(
             (
-                f"{home_root}/{other.name}/",
-                f"{home_root}/{other.name}",
-                f"~/.agent-bridge/agents/{other.name}/",
-                f"~/.agent-bridge/agents/{other.name}",
-                f"$HOME/.agent-bridge/agents/{other.name}/",
-                f"$HOME/.agent-bridge/agents/{other.name}",
+                f"{home_root}/{name}/",
+                f"{home_root}/{name}",
+                f"~/.agent-bridge/agents/{name}/",
+                f"~/.agent-bridge/agents/{name}",
+                f"$HOME/.agent-bridge/agents/{name}/",
+                f"$HOME/.agent-bridge/agents/{name}",
             )
         )
+    # Issue #1823 NOTE: the v2 ``<peer>/home`` absolute spelling is deliberately
+    # NOT added here. `matched_alias` (computed from this list at the Stage-B
+    # call site) is NOT admin-gated, so adding the v2 spelling would DENY an
+    # admin's legitimately-allowed v2 peer write — changing admin behavior. The
+    # authoritative non-admin v2-home deny is the admin-gated suffix matcher
+    # `_peer_forbidden_suffixes` (prefix-spelling-agnostic, `/agents/<name>/home`).
     return aliases
 
 
@@ -2942,13 +3030,16 @@ def _peer_forbidden_suffixes(agent: str) -> list[str]:
     """Forbidden path SUFFIXES for cross-agent peer homes, derived from the
     same ``other_agent_homes`` SSOT ``_peer_alias_list`` uses.
 
-    e.g. ``["/agents/other-a", "/agents/other-b"]``. The ``/agents/<name>``
-    suffix is prefix-spelling-agnostic: it matches the absolute home-root
-    spelling (``…/.agent-bridge/agents/<name>``), the ``~`` / ``$HOME`` /
-    ``${HOME}`` / ``$BRIDGE_HOME`` / ``${BRIDGE_HOME}`` spellings, and any
-    future env-var prefix, all of which end in ``/agents/<name>``.
+    e.g. ``["/agents/other-a", "/agents/other-b/home"]``. The
+    ``/agents/<name>`` (v1) / ``/agents/<name>/home`` (v2, issue #1823) suffix
+    is prefix-spelling-agnostic: it matches the absolute home-root spelling
+    (``…/.agent-bridge/agents/<name>``), the ``~`` / ``$HOME`` / ``${HOME}`` /
+    ``$BRIDGE_HOME`` / ``${BRIDGE_HOME}`` / ``$BRIDGE_DATA_ROOT`` spellings, and
+    any future env-var prefix, all of which end in that suffix. The v2 variant
+    is scoped to ``/home`` so a peer's ``/workdir`` (the #1492 shared-pair
+    workspace) is NOT denied — see `other_agent_homes`.
     """
-    return [f"/agents/{other.name}" for other in other_agent_homes(agent)]
+    return [_peer_home_suffix(other) for other in other_agent_homes(agent)]
 
 
 # Bridge-home anchor tokens. A path word containing one of these is rooted
@@ -3540,19 +3631,44 @@ def _resolved_forbidden_hit(
 
 
 def _forbidden_dirs_for_suffixes(suffixes: list[str]) -> list[tuple[str, str]]:
-    """Map each forbidden *suffix* (``/shared/secrets``, ``/agents/<name>``) to
-    its absolute directory under the bridge home, returning
+    """Map each forbidden *suffix* (``/shared/secrets``, ``/agents/<name>``,
+    ``/agents/<name>/home``) to its absolute directory, returning
     ``(abs_dir, suffix)`` pairs. Derived from the SAME SSOTs as the suffix
     lists, so the resolved containment check can never drift from the spelling
     scan it replaces.
+
+    Issue #1823: a v2 peer-home suffix (``/agents/<name>/home``) resolves under
+    the v2 data root (``agent_root_v2()`` = ``$BRIDGE_DATA_ROOT/agents``), which
+    may NOT sit under the operator bridge home — so a plain ``bridge_home +
+    suffix`` join would compute the WRONG absolute dir and the resolved-path
+    containment pass would miss a real v2 peer-home write. We therefore emit the
+    abs dir under BOTH anchors for a v2-home suffix: the real v2 location AND
+    the bridge-home join (harmless when they coincide; the latter also keeps the
+    legacy spelling working on installs where the v2 tree mirrors under the
+    bridge home). Both share the SAME display suffix.
     """
     try:
         home = str(bridge_home_dir())
     except Exception:  # noqa: BLE001
-        return []
+        home = ""
+    # `agent_root_v2()` is `<data_root>/agents`; its parent is `<data_root>`,
+    # under which a `/agents/<name>/home` suffix resolves to the real v2 home.
+    v2_anchor = ""
+    try:
+        root_v2 = agent_root_v2()
+        if root_v2 is not None:
+            v2_anchor = str(root_v2.parent)
+    except Exception:  # noqa: BLE001
+        v2_anchor = ""
     out: list[tuple[str, str]] = []
     for suffix in suffixes:
-        out.append((os.path.normpath(home + suffix), suffix))
+        if home:
+            out.append((os.path.normpath(home + suffix), suffix))
+        # Resolve the v2 peer-home suffix under the real data root too.
+        if v2_anchor and suffix.startswith("/agents/") and suffix.endswith("/home"):
+            v2_dir = os.path.normpath(v2_anchor + suffix)
+            if not any(existing == v2_dir for existing, _s in out):
+                out.append((v2_dir, suffix))
     return out
 
 
