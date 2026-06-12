@@ -41,7 +41,9 @@ smoke_setup_bridge_home() {
     BRIDGE_NATIVE_CRON_JOBS_FILE \
     BRIDGE_CRON_DISPATCH_WORKER_DIR \
     BRIDGE_SOURCE_CRON_JOBS_FILE \
-    BRIDGE_OPENCLAW_CRON_JOBS_FILE
+    BRIDGE_OPENCLAW_CRON_JOBS_FILE \
+    BRIDGE_CLAUDE_PLUGINS_ROOT \
+    BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT
 
   export BRIDGE_HOME="$SMOKE_TMP_ROOT/bridge-home"
   export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
@@ -76,6 +78,18 @@ smoke_setup_bridge_home() {
   # isolated root (BRIDGE_OPENCLAW_CRON_JOBS_FILE is the same path family).
   export BRIDGE_SOURCE_CRON_JOBS_FILE="$BRIDGE_CRON_HOME_DIR/legacy-jobs.json"
   export BRIDGE_OPENCLAW_CRON_JOBS_FILE="$BRIDGE_SOURCE_CRON_JOBS_FILE"
+  # Issue #1857 — pin the Claude plugin catalog roots under the isolated
+  # root so a smoke/repro that exercises plugin wiring
+  # (bridge-dev-plugin-cache.py sync, `claude plugin marketplace add`, or any
+  # known_marketplaces.json / installed_plugins.json writer) can NEVER leak a
+  # fixture marketplace into the operator's live `~/.claude/plugins` catalog.
+  # bridge-dev-plugin-cache.py resolves both roots from these env vars and
+  # only falls back to `~/.claude/plugins` when they are unset, so an
+  # inherited live value (or the default HOME-relative path) must be
+  # overridden here — the live-state-leak class behind #1857's polluted
+  # known_marketplaces.json (`repro-mkt` → /private/tmp fixture).
+  export BRIDGE_CLAUDE_PLUGINS_ROOT="$BRIDGE_HOME/claude-plugins"
+  export BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT="$BRIDGE_CLAUDE_PLUGINS_ROOT/cache"
 
   mkdir -p \
     "$BRIDGE_HOME" \
@@ -92,7 +106,8 @@ smoke_setup_bridge_home() {
     "$BRIDGE_HOOKS_DIR" \
     "$BRIDGE_CRON_STATE_DIR" \
     "$BRIDGE_CRON_HOME_DIR" \
-    "$BRIDGE_CRON_DISPATCH_WORKER_DIR"
+    "$BRIDGE_CRON_DISPATCH_WORKER_DIR" \
+    "$BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT"
   : >"$BRIDGE_ROSTER_FILE"
   : >"$BRIDGE_ROSTER_LOCAL_FILE"
   cat >"$BRIDGE_STATE_DIR/layout-marker.sh" <<EOF

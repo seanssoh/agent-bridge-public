@@ -1605,6 +1605,139 @@ bridge_run_export_claude_launch_env() {
   [[ -n "$agent_home" ]] && export HOME="$agent_home"
 }
 
+bridge_run_ledger_has_snapshot() {
+  # Issue #1857: true when the bridge-owned grant ledger at $1 records a
+  # non-empty `installed_snapshot.plugins` map (an operator recovery snapshot
+  # worth a recovery-only manifest pass even with zero channel-declared
+  # plugins). Best-effort: a missing/unreadable/legacy `{"channels":[...]}`
+  # ledger returns non-zero.
+  local ledger="$1"
+  [[ -n "$ledger" && -f "$ledger" && -r "$ledger" ]] || return 1
+  python3 - "$ledger" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(1)
+snap = data.get("installed_snapshot") if isinstance(data, dict) else None
+plugins = snap.get("plugins") if isinstance(snap, dict) else None
+sys.exit(0 if isinstance(plugins, dict) and plugins else 1)
+PY
+}
+
+bridge_run_manifest_has_plugins() {
+  # Issue #1857 (BLOCKER 2): true when the agent's live
+  # installed_plugins.json at $1 records a NON-EMPTY `plugins` map. A
+  # brownfield dynamic agent with only operator-installed (ad-hoc) plugins
+  # and NO plugin: channels must still reach the Python seed path so the
+  # FIRST recovery snapshot is taken BEFORE its first #1854 `--replace`
+  # restart wipe — otherwise recovery has nothing to restore. The empty/
+  # missing/unparseable manifest returns non-zero (genuinely nothing to
+  # snapshot). Runs as the launching identity (iso UID or controller), so a
+  # plain file read on the running UID's own view is correct here.
+  local manifest="$1"
+  [[ -n "$manifest" && -f "$manifest" && -r "$manifest" ]] || return 1
+  python3 - "$manifest" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(1)
+plugins = data.get("plugins") if isinstance(data, dict) else None
+sys.exit(0 if isinstance(plugins, dict) and plugins else 1)
+PY
+}
+
+bridge_run_fleet_default_unsafe_reason() {
+  # Issue #1857 (spec v3 Δ3, class-b): return a non-empty reason on stdout
+  # when a fleet-default declaration token is structurally UNSAFE (path
+  # traversal / reserved component / separator in the `<plugin>@<marketplace>`
+  # identity that later forms a filesystem-resolvable catalog/manifest key).
+  # Class-(b) unsafe validation is fail-closed for ALL classes and MUST run
+  # BEFORE any path join or convergence write — a malformed marketplace/plugin
+  # identity that could escape the catalog path is a security stop, never an
+  # availability degrade. Mirrors the Python `_manifest_entry_unsafe_reason`
+  # gate (lib parity: bridge-dev-plugin-cache.py) so the bash launch-path
+  # validator and the Python writer agree on what is unsafe. Empty stdout =
+  # safe (may still be class-(a) malformed or class-(c) unavailable, handled
+  # downstream as warn-only).
+  local token="$1"
+  local plugin="" marketplace=""
+  # Split `plugin@marketplace`; a bare token (no `@`) is qualified to the
+  # agent-bridge marketplace downstream, so validate the plugin half here.
+  if [[ "$token" == *"@"* ]]; then
+    plugin="${token%%@*}"
+    marketplace="${token#*@}"
+  else
+    plugin="$token"
+    marketplace=""
+  fi
+  # PARITY CONTRACT (Issue #1857 gate-2 r4): this per-half safe-component check
+  # MUST mirror the Python `_alias_rejection_reason` gate in
+  # bridge-dev-plugin-cache.py (the same value about to become a filesystem
+  # path component in the catalog/manifest write). Because the bash launch-path
+  # validator runs FIRST and fail-closes BEFORE any convergence write, any
+  # unsafe half the Python side would reject but bash folds would let a valid
+  # earlier token converge before the Python raise — violating the
+  # fail-closed-before-any-write intent. The Python rules for a NON-EMPTY half:
+  #   1. characters outside [A-Za-z0-9._-]   (catches `/`, `\`, `*`, space, AND
+  #      a leftover `@` from a multiple-`@` token like `good@market@extra`),
+  #   2. contains `..` as a SUBSTRING        (catches `good..bad`, `../evil`),
+  #   3. reserved name `.`/`..`              (subsumed by 1/2 but explicit),
+  #   4. Windows reserved name (CON/PRN/AUX/NUL/COM[1-9]/LPT[1-9], any case),
+  #   5. leading dot disallowed unless `.git` (catches `.hidden`).
+  local field="" value=""
+  for field in plugin marketplace; do
+    if [[ "$field" == "plugin" ]]; then value="$plugin"; else value="$marketplace"; fi
+    [[ -n "$value" ]] || continue
+    # (1b) length ceiling → mirrors Python `_alias_rejection_reason` (`len >
+    # 200`). A 201-char all-safe-character half is SAFE under the charset gate
+    # but a path-length / overflow risk the Python writer rejects, so the bash
+    # launch-path gate must reject it too (else a valid earlier token converges
+    # before the Python raise). Checked before the charset glob so an
+    # over-long value short-circuits fast.
+    if (( ${#value} > 200 )); then
+      printf 'unsafe-%s: length %s exceeds 200' "$field" "${#value}"; return 0
+    fi
+    # (2) embedded `..` substring → traversal. Check first so the message is
+    # specific; the glob below would also catch it but this is clearer.
+    if [[ "$value" == *".."* ]]; then
+      printf 'unsafe-%s: contains traversal substring (%s)' "$field" "$value"; return 0
+    fi
+    # (1) any character outside the safe alias set [A-Za-z0-9._-].
+    # SECURITY (codex gate-2 r1): use a literal glob test on the QUOTED value
+    # (no word-split, no command sub), so a bare-glob value (`*`) is matched
+    # literally and never pathname-expands mid-validation. The negated bracket
+    # class `*[!A-Za-z0-9._-]*` matches when ANY disallowed char is present —
+    # this is the bash mirror of Python's `_SAFE_ALIAS_RE.fullmatch` (and it is
+    # what catches a leftover `@` from a multiple-`@` token, a `/`, `\`, `*`,
+    # or whitespace).
+    if [[ "$value" == *[!A-Za-z0-9._-]* ]]; then
+      printf 'unsafe-%s: contains characters outside [A-Za-z0-9._-] (%s)' "$field" "$value"; return 0
+    fi
+    # (3) reserved `.`/`..` exact name (defensive; (2) already caught `..`).
+    if [[ "$value" == "." || "$value" == ".." ]]; then
+      printf 'unsafe-%s: reserved component (%s)' "$field" "$value"; return 0
+    fi
+    # (4) Windows reserved device names, case-insensitive (CON, PRN, AUX, NUL,
+    # COM1-9, LPT1-9) — these resolve to devices on Windows filesystems.
+    local _upper=""
+    _upper="$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')"
+    case "$_upper" in
+      CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])
+        printf 'unsafe-%s: reserved Windows name (%s)' "$field" "$value"; return 0 ;;
+    esac
+    # (5) leading dot disallowed unless `.git` (hidden-path / dotfile escape).
+    if [[ "$value" == .* && "$value" != ".git" ]]; then
+      printf 'unsafe-%s: leading dot disallowed (%s)' "$field" "$value"; return 0
+    fi
+  done
+  printf ''
+  return 0
+}
+
 bridge_run_sync_dev_plugin_cache() {
   # v0.9.7 RC6 (refs #781): the Python linker is now criticality-aware.
   # Channel-required plugin failures (declared via BRIDGE_AGENT_CHANNELS=
@@ -1628,11 +1761,218 @@ bridge_run_sync_dev_plugin_cache() {
   [[ "$ENGINE" == "claude" ]] || return 0
   [[ $SAFE_MODE -eq 0 ]] || return 0
   channels="$(bridge_agent_effective_dev_channels_csv "$AGENT")"
-  [[ -n "$channels" ]] || return 0
 
-  # Required: every plugin: channel from the effective channel set.
+  # Issue #1857: the bridge-owned plugin grant ledger holds the operator's
+  # installed-plugins recovery snapshot (extending the existing
+  # `{"channels":[...]}` ledger). Resolved from the controller-trusted
+  # `$BRIDGE_STATE_DIR` (NOT the env-overridable plugin roots), pinned by the
+  # canonical helper, and passed as an explicit path so the Python writer can
+  # restore operator plugins after a recreate wipe without ever mutating
+  # Claude's manifest for bookkeeping or writing a parallel `.bak`.
+  local _plugin_grant_ledger=""
+  if declare -F bridge_isolated_plugin_grants_state_file >/dev/null 2>&1; then
+    _plugin_grant_ledger="$(bridge_isolated_plugin_grants_state_file "$AGENT" 2>/dev/null || true)"
+  fi
+
+  # Issue #1857 (BLOCKER 1 — fleet-default convergence): every Claude-agent
+  # launch converges `channel-declared ∪ fleet-default ∪ existing records`.
+  # The fleet-default declaration is read from the CANONICAL protected file
+  # (`$BRIDGE_HOME/agent-env.local.sh`, never env-overridable) via the pinned
+  # reader, so declaring `BRIDGE_FLEET_DEFAULT_PLUGINS` on a live fleet seeds
+  # every Claude agent on its next NATURAL relaunch — "declare once, converge
+  # forever". The union happens HERE in the launch path (not just in a reader
+  # helper): each safe fleet-default spec is folded into the effective channel
+  # set so the Python writer installs/enables/manifests it exactly like a
+  # channel plugin. Taxonomy (spec v3 Δ3):
+  #   class-(b) unsafe identity      → fail-closed for ALL classes, BEFORE any
+  #                                    path join / convergence write (return
+  #                                    non-zero so launch aborts before the
+  #                                    Python pass writes anything).
+  #   class-(a) malformed-but-safe   → skip that token + warn, process the rest.
+  #   class-(c) unavailable-but-safe → routed as OPTIONAL (warn-once, never a
+  #                                    launch blocker) — channel-required stays
+  #                                    fail-closed, fleet-default is fail-soft.
+  local _fleet_default_csv="" _fleet_qualified=""
+  if declare -F bridge_fleet_default_plugins_read >/dev/null 2>&1; then
+    _fleet_default_csv="$(bridge_fleet_default_plugins_read 2>/dev/null || true)"
+  fi
+  if [[ -n "$_fleet_default_csv" ]]; then
+    local _fd_token="" _fd_item="" _fd_unsafe=""
+    # SECURITY (codex gate-2 r1): split with `read -r -a` (NOT an unquoted
+    # `$_fleet_default_csv` word-split). An unquoted split runs Bash pathname
+    # expansion on each field FIRST, so a `*` (or any glob) in an unsafe
+    # fleet-default declaration would expand to real cwd filenames BEFORE
+    # `bridge_run_fleet_default_unsafe_reason` ever validates it — silently
+    # rewriting the token and defeating the class-(b) fail-closed contract.
+    # `read -r -a` reads literal fields with no globbing. A `__FD_SENTINEL__`
+    # tail field is appended then dropped so a TRAILING empty token (`foo,`)
+    # survives as a real empty field and still hits the class-(a) empty-token
+    # skip+warn branch below (a bare word-split silently eats trailing empties).
+    local -a _fd_arr=()
+    IFS=',' read -r -a _fd_arr <<<"${_fleet_default_csv},__FD_SENTINEL__"
+    if (( ${#_fd_arr[@]} > 0 )); then
+      unset "_fd_arr[$(( ${#_fd_arr[@]} - 1 ))]"
+    fi
+    for _fd_token in "${_fd_arr[@]}"; do
+      _fd_token="${_fd_token## }"
+      _fd_token="${_fd_token%% }"
+      # class-(a): empty token after trim is malformed-but-safe → skip+warn.
+      # A bare empty token has NO non-empty half to be unsafe, so the class-b
+      # check below would no-op anyway; skip it early as a cheap fast-path.
+      if [[ -z "$_fd_token" ]]; then
+        log_line "[dev-plugin-cache] #1857 fleet-default class-a skip: empty declaration token"
+        continue
+      fi
+      # ORDERING CONTRACT (Issue #1857 spec v3, frozen taxonomy — gate-2 r4
+      # restructure): class-(b) unsafe MUST be evaluated BEFORE the class-(a)
+      # empty-half skip. The precedence is fail-closed-first:
+      #   1. validate EVERY non-empty half for a real unsafe component
+      #      (traversal `..`/`../evil`, reserved component, catalog escape) →
+      #      if ANY non-empty half is unsafe, FAIL CLOSED (rc!=0), never
+      #      downgraded — even when the OTHER half is empty;
+      #   2. ONLY THEN, if the token is merely malformed-but-safe (empty
+      #      plugin/marketplace half with NO unsafe non-empty component), do
+      #      the class-(a) skip+warn and keep processing the list;
+      #   3. else fold the valid token into a channel.
+      # The earlier code did (2) before (1), so a token with both an empty
+      # half AND an unsafe non-empty half (`@../evil` = empty plugin + traversal
+      # marketplace; `@..` = empty plugin + reserved marketplace) was wrongly
+      # class-a downgraded (skip+warn, launch continued) instead of fail-closed.
+      # `bridge_run_fleet_default_unsafe_reason` already skips empty halves
+      # (`[[ -n "$value" ]] || continue`) and validates the non-empty half(s),
+      # so running it FIRST is exactly the fail-closed-first contract: the
+      # unsafe half wins over the empty half.
+      #
+      # class-(b): unsafe identity in ANY non-empty half fails closed BEFORE any
+      # path join / write AND before any class-a empty-half downgrade.
+      _fd_unsafe="$(bridge_run_fleet_default_unsafe_reason "$_fd_token")"
+      if [[ -n "$_fd_unsafe" ]]; then
+        bridge_warn "#1857 fleet-default unsafe declaration (fail-closed) for ${AGENT}: ${_fd_unsafe}"
+        return 1
+      fi
+      # class-(a): a token with an EMPTY plugin OR EMPTY marketplace HALF
+      # (`bad@` = empty marketplace, `@evil` = empty plugin) and NO unsafe
+      # non-empty half (the class-b check above already returned) is bad SPEC
+      # SYNTAX, not traversal — malformed-but-safe. Skip+warn that token and
+      # keep processing the rest of the list (Issue #1857, spec v3 Δ3 class-a),
+      # matching the manifest writer's established class-a behavior
+      # (bridge-dev-plugin-cache.py: missing-plugin/marketplace skip). It must
+      # NOT be folded into a channel: an empty component reaches Python's
+      # `_require_safe_path_component`, which raises ValueError on the empty
+      # value and would take down the WHOLE launch via the fleet-default path.
+      # A single typo in the protected fleet-default declaration must never
+      # block every Claude launch.
+      if [[ "$_fd_token" == *"@"* ]]; then
+        local _fd_plugin_half="${_fd_token%%@*}"
+        local _fd_marketplace_half="${_fd_token#*@}"
+        if [[ -z "$_fd_plugin_half" || -z "$_fd_marketplace_half" ]]; then
+          bridge_warn "#1857 fleet-default class-a skip for ${AGENT}: malformed spec '${_fd_token}' (empty plugin or marketplace half) — skipped, launch continues"
+          continue
+        fi
+      fi
+      # Qualify to the `plugin:<plugin>@<marketplace>` channel form the Python
+      # comparator and the manifest writer expect; a bare token gets the
+      # agent-bridge marketplace (mirrors the BRIDGE_AGENT_PLUGINS path above).
+      if [[ "$_fd_token" == *"@"* ]]; then
+        _fd_item="plugin:${_fd_token}"
+      else
+        _fd_item="plugin:${_fd_token}@agent-bridge"
+      fi
+      if [[ -n "$_fleet_qualified" ]]; then
+        _fleet_qualified+=",$_fd_item"
+      else
+        _fleet_qualified="$_fd_item"
+      fi
+    done
+  fi
+  # Snapshot the channel-required set BEFORE folding in fleet-default, so
+  # `required_channels` (block-on-fail) below derives ONLY from the channel-
+  # declared set. Fleet-default entries are routed as OPTIONAL (warn-only)
+  # further down — they must never be promoted to channel-required, or a
+  # missing fleet-default payload would block launch (violates "never a launch
+  # blocker").
+  local _channel_required_only="$channels"
+
+  # Fold the validated fleet-default set into the effective channel union so the
+  # Python pass converges it. They are OPTIONAL (fail-soft), so a missing
+  # payload / unreachable marketplace warns-once and never blocks launch.
+  if [[ -n "$_fleet_qualified" ]]; then
+    if [[ -n "$channels" ]]; then
+      channels+=",$_fleet_qualified"
+    else
+      channels="$_fleet_qualified"
+    fi
+  fi
+
+  # A dynamic agent with NO plugin: channels but operator-installed plugins
+  # (claude-hud installed ad-hoc, recorded in the ledger snapshot) is the exact
+  # #1857 scenario the create-time-only materialization missed: a recreate
+  # empties the live manifest and there is no channel set to trigger the
+  # writer. Run a recovery-only pass (empty channel set → zero verified entries
+  # → the writer's no-verified-entries recovery branch restores from the ledger
+  # snapshot) whenever the ledger records a non-empty snapshot.
+  #
+  # Fast-return only when there is genuinely nothing to do:
+  #   - no ledger path resolved, OR
+  #   - the ledger file is ABSENT, OR
+  #   - the ledger is present AND READABLE but carries no snapshot.
+  # A ledger that is PRESENT but UNREADABLE (codex r3 finding 2 — e.g. a
+  # pre-#1857 root-only ledger whose group-publish has not landed) must NOT be
+  # treated as "no snapshot": fall THROUGH to the sync pass so the Python
+  # `_read_grant_ledger` diagnostic fires and tells the operator to re-publish
+  # ownership, rather than silently skipping recovery.
+  # NOTE: this function runs AS the launching identity (the iso UID under the
+  # sudo wrap in iso v2, or the controller user in shared mode), so the file
+  # tests below use the running UID's own view — exactly the identity that must
+  # read the ledger for recovery. No sudo escalation here.
+  if [[ -z "$channels" ]]; then
+    # Issue #1857 (BLOCKER 2 — brownfield first-snapshot reachability): a
+    # dynamic agent with ONLY operator-installed (ad-hoc) plugins, NO plugin:
+    # channels, and NO fleet-default declaration has a non-empty live manifest
+    # but no ledger snapshot yet. It MUST reach the Python seed path so the
+    # FIRST recovery snapshot is taken BEFORE its first #1854 `--replace`
+    # restart wipe — otherwise recovery has nothing to restore. So before the
+    # no-channel fast-return, fall THROUGH whenever the agent's live manifest is
+    # non-empty (the Python `_seed_ledger_snapshot_if_needed` then snapshots it
+    # on the no-op path). Resolve the manifest under the SAME Claude config root
+    # the sync pass below targets, so the reachability check and the writer
+    # agree on the file. Best-effort: an unresolved root / missing manifest
+    # falls back to the original ledger-only gate.
+    local _agent_manifest=""
+    local _agent_claude_root_probe=""
+    _agent_claude_root_probe="$(bridge_run_agent_claude_root 2>/dev/null || true)"
+    if [[ -n "$_agent_claude_root_probe" ]]; then
+      _agent_manifest="$_agent_claude_root_probe/plugins/installed_plugins.json"
+    fi
+    if [[ -z "$_plugin_grant_ledger" || ! -e "$_plugin_grant_ledger" ]]; then
+      # No ledger yet. Still take the first snapshot if there is a non-empty
+      # ad-hoc manifest to protect; otherwise nothing to do.
+      if [[ -n "$_agent_manifest" ]] \
+          && bridge_run_manifest_has_plugins "$_agent_manifest"; then
+        : # fall through to the sync pass so the seed snapshot is taken
+      else
+        return 0
+      fi
+    elif [[ -r "$_plugin_grant_ledger" ]] \
+        && ! bridge_run_ledger_has_snapshot "$_plugin_grant_ledger"; then
+      # Ledger present+readable but carries no snapshot. Same brownfield gate:
+      # seed from a non-empty manifest before returning, else no-op.
+      if [[ -n "$_agent_manifest" ]] \
+          && bridge_run_manifest_has_plugins "$_agent_manifest"; then
+        : # fall through to seed the first snapshot
+      else
+        return 0
+      fi
+    fi
+    # else: present-and-(unreadable OR has-snapshot) → run the pass so either
+    # recovery happens or the Python diagnostic surfaces the unreadable ledger.
+  fi
+
+  # Required: every plugin: channel from the channel-DECLARED set only (the
+  # fleet-default union was deliberately excluded above — fleet-default is
+  # optional/warn-only, never block-on-fail).
   # These come from BRIDGE_AGENT_CHANNELS — primary-channel config.
-  required_channels="$channels"
+  required_channels="$_channel_required_only"
 
   # Optional: BRIDGE_AGENT_PLUGINS allowlist entries (#272). These are
   # bare plugin ids; qualify them with the agent-bridge marketplace so
@@ -1666,11 +2006,24 @@ bridge_run_sync_dev_plugin_cache() {
     optional_csv="$_opt_qualified"
   fi
 
+  # Issue #1857 (BLOCKER 1): mark every fleet-default channel OPTIONAL so the
+  # Python criticality split treats a missing fleet-default payload as
+  # warn-once + continue (class-(c) fail-soft), never block-on-fail. Already-
+  # qualified to `plugin:<plugin>@<marketplace>` above.
+  if [[ -n "$_fleet_qualified" ]]; then
+    if [[ -n "$optional_csv" ]]; then
+      optional_csv+=",$_fleet_qualified"
+    else
+      optional_csv="$_fleet_qualified"
+    fi
+  fi
+
   local agent_claude_root=""
   agent_claude_root="$(bridge_run_agent_claude_root)"
 
   output="$(BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT="$agent_claude_root/plugins/cache" \
     BRIDGE_CLAUDE_PLUGINS_ROOT="$agent_claude_root/plugins" \
+    BRIDGE_PLUGIN_GRANT_LEDGER="$_plugin_grant_ledger" \
     python3 "$SCRIPT_DIR/bridge-dev-plugin-cache.py" sync \
     --channels "$channels" \
     --required-channels "$required_channels" \

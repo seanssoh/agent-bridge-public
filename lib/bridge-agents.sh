@@ -2553,6 +2553,61 @@ PY
   bridge_linux_sudo_root mv "$catalog_tmp" "$catalog"
 }
 
+bridge_fleet_default_plugins_canonical_path() {
+  # Issue #1857 (spec v3 Δ2): the fleet-default plugin declaration authority is
+  # the FIXED canonical protected file under the trusted install root —
+  # `$BRIDGE_HOME/agent-env.local.sh`, exactly as written by the #341-gated
+  # `config set-env` wrapper. The convergence READER pins to this path and
+  # MUST NOT resolve the filename through `BRIDGE_AGENT_ENV_LOCAL_FILE` or any
+  # env-overridable indirection (bridge-lib.sh:380 is the bypass being closed
+  # for this read): both the value AND the path ignore the process
+  # environment. `$BRIDGE_HOME` is the launcher/daemon's trusted root, not a
+  # per-agent-overridable input at converge time. The `config set-env` WRITER
+  # may keep its test-isolation override knob; only the reader is pinned.
+  printf '%s/agent-env.local.sh' "$BRIDGE_HOME"
+}
+
+bridge_fleet_default_plugins_read() {
+  # Read the `BRIDGE_FLEET_DEFAULT_PLUGINS` declaration ONLY from the canonical
+  # protected file (above). Emits the declared value (CSV) on stdout, or the
+  # empty string when the file is absent/unreadable or the key is undeclared.
+  #
+  # Security contract (spec v3 Δ2 / r2-F2): a `BRIDGE_FLEET_DEFAULT_PLUGINS`
+  # exported in the raw process env, an agent-scoped env, an ad-hoc
+  # `agent-roster.local.sh` assignment, OR a `BRIDGE_AGENT_ENV_LOCAL_FILE`
+  # pointing at an attacker-controlled file are ALL ignored — the value is
+  # parsed out of the canonical file's `export BRIDGE_FLEET_DEFAULT_PLUGINS=...`
+  # line directly (never by sourcing into the current shell, so a malicious
+  # file cannot run code or shadow the var). An empty/absent declaration ships
+  # the zero-behavior-change default.
+  local canonical=""
+  canonical="$(bridge_fleet_default_plugins_canonical_path)"
+  [[ -n "$canonical" && -f "$canonical" && -r "$canonical" ]] || { printf ''; return 0; }
+  bridge_require_python
+  python3 - "$canonical" <<'PY'
+import re, sys
+path = sys.argv[1]
+val = ""
+try:
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            # Only the managed `export KEY=VALUE` form written by config
+            # set-env is honored; the last assignment wins (matches shell
+            # source semantics for the canonical file without sourcing it).
+            m = re.match(r'^(?:export\s+)?BRIDGE_FLEET_DEFAULT_PLUGINS=(.*)$', line)
+            if not m:
+                continue
+            raw = m.group(1).strip()
+            if (len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"')):
+                raw = raw[1:-1]
+            val = raw
+except OSError:
+    val = ""
+sys.stdout.write(val)
+PY
+}
+
 bridge_isolated_plugin_grants_state_dir() {
   # Controller-owned ledger root for plugin-share ACL grants. Keep this out
   # of $BRIDGE_ACTIVE_AGENT_DIR/<agent>: in legacy mode that path is also the
@@ -2624,29 +2679,178 @@ bridge_isolated_plugin_grants_write() {
   local state_file=""
   local state_dir=""
   local legacy_state_file=""
-  local tmp_file=""
   state_file="$(bridge_isolated_plugin_grants_state_file "$agent")"
   state_dir="$(dirname "$state_file")"
   legacy_state_file="$(bridge_isolated_plugin_grants_legacy_state_file "$agent")"
   bridge_linux_sudo_root mkdir -p "$state_dir"
-  # Place the temp file in the destination dir so the mv is always within
-  # one filesystem (atomic rename); see Blocking 2 in PR #302 r1.
-  tmp_file="$(bridge_linux_sudo_root mktemp "${state_file}.tmp.XXXXXX")"
   bridge_require_python
-  bridge_linux_sudo_root python3 - "$tmp_file" "$channels_csv" <<'PY'
-import json, sys
-out_path, csv = sys.argv[1], sys.argv[2]
+  # Issue #1857: this ledger is now a shared bridge-owned sidecar. The channel
+  # grant set is the `channels` key; the Python manifest writer
+  # (bridge-dev-plugin-cache.py) ADDITIVELY records the operator's
+  # installed-plugins recovery snapshot under `installed_snapshot`. A
+  # channel-only write here must PRESERVE that additive field (read-merge,
+  # never clobber) so the recovery snapshot survives a roster reapply — spec
+  # v3 Δ1 / impl note "new fleet-default ownership fields must not be dropped
+  # by channel-only write paths".
+  #
+  # The whole read-merge-write runs UNDER an flock on `<state_file>.lock` —
+  # the SAME lock the Python snapshot writer takes (codex r1 finding 3) — so
+  # the two read-modify-write paths cannot lose each other's update. The merge
+  # re-reads the live ledger under the lock, sets only `channels`, and atomic-
+  # replaces; mktemp lives in the destination dir for a same-filesystem rename.
+  bridge_linux_sudo_root python3 - "$state_file" "$channels_csv" <<'PY'
+import fcntl, json, os, sys, tempfile
+state_file, csv = sys.argv[1], sys.argv[2]
 channels = sorted({c.strip() for c in csv.split(",") if c.strip()})
-with open(out_path, "w") as f:
-    json.dump({"channels": channels}, f, indent=2)
+lock_path = state_file + ".lock"
+lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    data = {}
+    try:
+        with open(state_file) as f:
+            prior = json.load(f)
+        if isinstance(prior, dict):
+            data = prior
+    except (OSError, ValueError):
+        data = {}
+    data["channels"] = channels
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=os.path.basename(state_file) + ".", suffix=".tmp",
+        dir=os.path.dirname(state_file),
+    )
+    with os.fdopen(tmp_fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_name, state_file)
+finally:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(lock_fd)
 PY
-  bridge_linux_sudo_root mv "$tmp_file" "$state_file"
   bridge_linux_sudo_root chown root:root "$state_file"
   bridge_linux_sudo_root chmod 0640 "$state_file"
   bridge_linux_sudo_root chown root:root "$state_dir" >/dev/null 2>&1 || true
   bridge_linux_sudo_root chmod 0750 "$state_dir" >/dev/null 2>&1 || true
+  # Issue #1857 (codex r2): in linux iso v2 the launch-side plugin sync runs as
+  # the isolated UID under the sudo wrap and reads this ledger's
+  # `installed_snapshot` for recovery via BRIDGE_PLUGIN_GRANT_LEDGER. Root-only
+  # 0750 dir / 0640 root:root file would make the iso UID unable to READ the
+  # snapshot — the no-channel recovery would then silently skip. Publish the
+  # ledger, its parent dir, and the shared `<state_file>.lock` to the agent's
+  # v2 group (`ab-agent-<a>`) group-readable (dir/lock group-traversable +
+  # writable so a co-located writer can take the same flock), exactly as
+  # `bridge_write_isolated_installed_plugins_manifest` publishes the per-UID
+  # manifest. Owner stays root so the iso UID cannot TAMPER with the recorded
+  # grant set or snapshot — read-only group access is the contract. Shared-mode
+  # installs have no v2 group and run sync as the same controller user, so this
+  # block is a harmless no-op there (the controller already owns the file).
+  local _v2_grp=""
+  if [[ -n "$agent" ]] \
+      && declare -F bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+    _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
+      || _v2_grp=""
+  fi
+  if [[ -n "$_v2_grp" ]]; then
+    bridge_linux_sudo_root chgrp "$_v2_grp" "$state_file" >/dev/null 2>&1 || true
+    bridge_linux_sudo_root chmod 0640 "$state_file" >/dev/null 2>&1 || true
+    bridge_linux_sudo_root chgrp "$_v2_grp" "$state_dir" >/dev/null 2>&1 || true
+    # Dir mode 0750 (group r-x, NO group write): the iso UID can TRAVERSE +
+    # list the dir to read the ledger, but cannot unlink/rename/replace the
+    # root-owned ledger or lock (directory write — not file mode — controls
+    # unlink/rename, codex r3 finding 1). The iso UID never needs dir write:
+    # in iso v2 the snapshot is seeded controller-side as root; the iso-UID
+    # launch sync only READS the ledger for recovery (no lock needed for a
+    # read). Owner root + 0640 keeps the snapshot tamper-resistant. The lock
+    # is left group-readable (0640) for any controller-side concurrent access;
+    # it is never opened RW by the iso UID.
+    bridge_linux_sudo_root chmod 0750 "$state_dir" >/dev/null 2>&1 || true
+    if bridge_linux_sudo_root test -e "${state_file}.lock"; then
+      bridge_linux_sudo_root chgrp "$_v2_grp" "${state_file}.lock" >/dev/null 2>&1 || true
+      bridge_linux_sudo_root chmod 0640 "${state_file}.lock" >/dev/null 2>&1 || true
+    fi
+  fi
   if [[ "$legacy_state_file" != "$state_file" ]]; then
     bridge_linux_sudo_root rm -f "$legacy_state_file" >/dev/null 2>&1 || true
+  fi
+}
+
+bridge_isolated_plugin_grants_snapshot_seed() {
+  # Issue #1857 (codex r2): in linux iso v2 the per-UID installed_plugins.json
+  # is controller-owned and re-derived on every start by
+  # bridge_write_isolated_installed_plugins_manifest (which now merges-not-
+  # resets). The launch-side recovery reads the ledger's `installed_snapshot`
+  # as the iso UID, but the iso UID cannot WRITE that root-owned ledger — so
+  # the snapshot must be seeded/refreshed HERE, controller-side as root, from
+  # the manifest the controller just wrote. Monotonic union into the existing
+  # snapshot (never demotes a richer one), preserving the `channels` key.
+  # Best-effort — never fails the share/start path.
+  local agent="$1"
+  local manifest="$2"
+  local state_file=""
+  state_file="$(bridge_isolated_plugin_grants_state_file "$agent")"
+  [[ -n "$manifest" ]] || return 0
+  bridge_linux_sudo_root test -f "$manifest" || return 0
+  bridge_require_python
+  bridge_linux_sudo_root python3 - "$state_file" "$manifest" <<'PY' || true
+import fcntl, json, os, sys, tempfile
+state_file, manifest = sys.argv[1], sys.argv[2]
+try:
+    with open(manifest, encoding="utf-8") as f:
+        mani = json.load(f)
+except (OSError, ValueError):
+    sys.exit(0)
+mani_plugins = mani.get("plugins") if isinstance(mani, dict) else None
+if not (isinstance(mani_plugins, dict) and mani_plugins):
+    sys.exit(0)
+os.makedirs(os.path.dirname(state_file), exist_ok=True)
+lock_fd = os.open(state_file + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    data = {}
+    try:
+        with open(state_file, encoding="utf-8") as f:
+            prior = json.load(f)
+        if isinstance(prior, dict):
+            data = prior
+    except (OSError, ValueError):
+        data = {}
+    snap = data.get("installed_snapshot") if isinstance(data, dict) else None
+    existing = snap.get("plugins") if isinstance(snap, dict) else {}
+    if not isinstance(existing, dict):
+        existing = {}
+    merged = dict(existing)
+    for k, v in mani_plugins.items():
+        merged.setdefault(k, v)  # union: keep richer existing entries
+    if existing and merged == existing:
+        sys.exit(0)
+    data["installed_snapshot"] = {"version": 2, "plugins": merged}
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=os.path.basename(state_file) + ".", suffix=".tmp",
+        dir=os.path.dirname(state_file),
+    )
+    with os.fdopen(tmp_fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_name, state_file)
+finally:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(lock_fd)
+PY
+  # Re-publish ownership/group so the just-rewritten ledger keeps the iso UID's
+  # read access (the write above replaced the inode).
+  bridge_linux_sudo_root chown root:root "$state_file" >/dev/null 2>&1 || true
+  bridge_linux_sudo_root chmod 0640 "$state_file" >/dev/null 2>&1 || true
+  local _v2_grp=""
+  if declare -F bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+    _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
+      || _v2_grp=""
+  fi
+  if [[ -n "$_v2_grp" ]]; then
+    bridge_linux_sudo_root chgrp "$_v2_grp" "$state_file" >/dev/null 2>&1 || true
   fi
 }
 
@@ -2721,10 +2925,10 @@ bridge_write_isolated_installed_plugins_manifest() {
   # copy+unlink and a concurrent reader can see a half-written or
   # transiently missing manifest. (Blocking 2 in PR #302 r1.)
   manifest_tmp="$(bridge_linux_sudo_root mktemp "${manifest}.tmp.XXXXXX")"
-  if ! bridge_linux_sudo_root python3 - "$controller_plugins" "$isolated_plugins" "$channels_csv" "$manifest_tmp" "$plugins_csv" <<'PY'
+  if ! bridge_linux_sudo_root python3 - "$controller_plugins" "$isolated_plugins" "$channels_csv" "$manifest_tmp" "$plugins_csv" "$manifest" <<'PY'
 import json, os, re, sys
 
-controller_plugins, isolated_plugins, channels_csv, out_path, plugins_csv = sys.argv[1:]
+controller_plugins, isolated_plugins, channels_csv, out_path, plugins_csv, live_manifest = sys.argv[1:]
 controller_manifest = os.path.join(controller_plugins, "installed_plugins.json")
 markets_path = os.path.join(controller_plugins, "known_marketplaces.json")
 
@@ -2916,6 +3120,26 @@ for plugin_id in sorted(declared):
     new_entry = dict(entry)
     new_entry["installPath"] = real_path
     out["plugins"][plugin_id] = [new_entry]
+
+# Issue #1857: merge-not-reset. The declared set above is only the
+# channel-transport + BRIDGE_AGENT_PLUGINS allowlist — operator ad-hoc
+# plugins (claude-hud etc. installed via the iso UID's own `claude plugin
+# install`) live in the EXISTING per-UID manifest and must NOT be wiped on
+# a recreate/start re-derivation. Union every plugin key present in the
+# live manifest that this re-derivation did not already (re)write, so the
+# canonical channel/allowlist refresh lands ON TOP of the operator's set
+# rather than replacing it. The declared entries always win (fresh
+# installPath/version); only non-declared (ad-hoc) keys are carried over.
+try:
+    with open(live_manifest) as f:
+        prior = json.load(f)
+    prior_plugins = prior.get("plugins") if isinstance(prior, dict) else None
+    if isinstance(prior_plugins, dict):
+        for prior_key, prior_value in prior_plugins.items():
+            if prior_key not in out["plugins"]:
+                out["plugins"][prior_key] = prior_value
+except (OSError, ValueError):
+    pass
 
 with open(out_path, "w") as f:
     json.dump(out, f, indent=2)
@@ -3454,6 +3678,15 @@ bridge_linux_share_plugin_catalog() {
     _persist_csv="$(IFS=','; printf '%s' "${_current_plugin_channels[*]}")"
   fi
   bridge_isolated_plugin_grants_write "$agent" "$_persist_csv"
+
+  # 6c'. Issue #1857 (codex r2): seed/refresh the ledger's recovery snapshot
+  #      from the per-UID manifest the controller just wrote, as root, so the
+  #      launch-side iso-UID recovery (which can read but not write the
+  #      root-owned ledger) has an up-to-date snapshot to restore from after a
+  #      recreate. The manifest already merges-not-resets operator ad-hoc
+  #      entries, so the snapshot captures the full operator set.
+  bridge_isolated_plugin_grants_snapshot_seed \
+    "$agent" "$isolated_plugins/installed_plugins.json" >/dev/null 2>&1 || true
 
   # 6d. Audit row so operators can confirm exactly which plugins landed
   #     on the isolated UID after each reapply (#348). The detail rows

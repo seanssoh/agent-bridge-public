@@ -204,8 +204,63 @@ test_active_env_reassert() {
     "T3 loop flag preserved across the reassert+reload"
 }
 
+# Issue #1857: the #1854 restart path now routes every dynamic restart through
+# the `--replace` recreate relaunch, which re-runs the per-agent plugin
+# manifest sync (bridge-dev-plugin-cache.py, invoked by
+# bridge_run_sync_dev_plugin_cache) with the bridge-owned ledger path exported
+# as BRIDGE_PLUGIN_GRANT_LEDGER. That re-derivation MUST preserve operator-
+# installed provisioning end-to-end — a restart that drops claude-hud etc. is
+# the #1857 regression #1854 inherited. This tooth drives the REAL `sync` CLI
+# entrypoint (not the helper in isolation) through the env contract the
+# launcher exports, exercising the NO-channel recovery path a dynamic agent
+# with only ad-hoc operator plugins hits on restart.
+test_restart_preserves_provisioning() {
+  smoke_require_cmd python3
+  local proot="$SMOKE_TMP_ROOT/restart-plugins"
+  local ledger="$SMOKE_TMP_ROOT/restart-ledger.json"
+  mkdir -p "$proot/cache"
+  # Pre-restart healthy state: operator plugin recorded in the ledger snapshot.
+  # `channels` is EMPTY — a dynamic agent with no plugin: channels, only an
+  # ad-hoc operator install (the exact scenario create-time materialization
+  # missed: nothing to trigger a channel re-sync, yet the manifest got wiped).
+  cat >"$ledger" <<'JSON'
+{
+  "channels": [],
+  "installed_snapshot": {
+    "version": 2,
+    "plugins": {
+      "claude-hud@jarrodwatts": [
+        {"scope": "user", "installPath": "/operator/installed/claude-hud", "version": "9.9.9",
+         "installedAt": "2026-01-01T00:00:00Z", "lastUpdated": "2026-01-01T00:00:00Z"}
+      ]
+    }
+  }
+}
+JSON
+  # The recreate re-scaffolded the per-agent plugins tree → live manifest came
+  # back EMPTY (the verified live wipe signature).
+  printf '{\n  "version": 2,\n  "plugins": {}\n}\n' >"$proot/installed_plugins.json"
+
+  # Drive the REAL `sync` CLI as the launcher does, with the ledger env var the
+  # restart path exports and an EMPTY channel set — proving the no-channel
+  # recovery is reachable end-to-end through the production entrypoint.
+  BRIDGE_CLAUDE_PLUGINS_ROOT="$proot" \
+  BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT="$proot/cache" \
+  BRIDGE_PLUGIN_GRANT_LEDGER="$ledger" \
+  python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync \
+    --channels "" --required-channels "" --optional-channels "" --agent restart-demo \
+    >/dev/null 2>&1 \
+    || smoke_fail "T4 restart sync CLI exited non-zero on a no-channel recovery pass"
+
+  smoke_assert_file_exists "$proot/installed_plugins.json" \
+    "T4 restart sync left a manifest"
+  smoke_assert_contains "$(cat "$proot/installed_plugins.json")" "claude-hud@jarrodwatts" \
+    "T4 #1854 restart path preserved the operator-installed plugin (claude-hud) end-to-end via BRIDGE_PLUGIN_GRANT_LEDGER"
+}
+
 smoke_run "T1 recreate hint reconstructs supported command"   test_recreate_hint
 smoke_run "T2 unsupported guidance is non-destructive"         test_unsupported_guidance
 smoke_run "T3 active-env reassert re-registers dynamic agent"  test_active_env_reassert
+smoke_run "T4 #1854 restart path preserves provisioning (#1857)" test_restart_preserves_provisioning
 
 smoke_log "all checks passed"
