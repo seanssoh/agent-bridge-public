@@ -123,11 +123,26 @@ bridge_layout_v2_reconcile_roster_agents() {
   printf '%s' "${ids[*]:-}"
 }
 
+# bridge_layout_v2_reconcile_noop_json
+#   Emit the canonical STRUCTURED no-op result object. Used when there is no
+#   v1->v2 reconcile to perform (legacy / non-v2 install or no v1-only data) so
+#   the result marker is ALWAYS a well-formed structured JSON — never an empty
+#   file (rc2 soak observability). Mirrors the python helper's shape (same
+#   arrays + counts keys) with everything zeroed, plus the explicit
+#   `status:"noop"` discriminator and a timestamp. ASCII-only, printf-built (no
+#   python dependency required on this path).
+bridge_layout_v2_reconcile_noop_json() {
+  local ts
+  ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+  printf '{"status":"noop","mode":"apply","schema":"layout-v2-reconcile/1","reason":"legacy/non-v2 install or no v1-only data","copied":[],"preserved":[],"conflicted":[],"skipped":[],"warnings":[],"counts":{"copied":0,"preserved":0,"conflicted":0,"skipped":0,"warnings":0,"backed_up":0},"timestamp":"%s"}\n' \
+    "$ts"
+}
+
 # bridge_layout_v2_reconcile_run --mode apply|dry-run [--force-live-daemon]
 #   The fenced reconcile entry point. Emits the python helper's JSON on stdout.
 #   Returns:
 #     0  reconcile completed (including when conflicts were reported)
-#     2  legacy install / nothing to do (no JSON)
+#     2  legacy install / nothing to do (structured no-op JSON in apply mode)
 #     3  refused: live daemon and not forced (fencing violation)
 #     1  internal error
 bridge_layout_v2_reconcile_run() {
@@ -143,7 +158,18 @@ bridge_layout_v2_reconcile_run() {
 
   local data_root
   if ! data_root="$(bridge_layout_v2_reconcile_data_root)"; then
-    # Legacy install — no v1->v2 reconcile to perform.
+    # Legacy install — no v1->v2 reconcile to perform. Still persist a STRUCTURED
+    # no-op result to the canonical marker (apply mode only) + emit it on stdout
+    # so the upgrade path's result file is never empty / mislocated (rc2 soak
+    # observability). The caller treats rc=2 as a benign proceed.
+    if [[ "$mode" == "apply" ]]; then
+      local _noop_state_dir _noop_json
+      _noop_state_dir="$(bridge_layout_v2_reconcile_state_dir)"
+      _noop_json="$(bridge_layout_v2_reconcile_noop_json)"
+      mkdir -p "$_noop_state_dir" 2>/dev/null || true
+      printf '%s' "$_noop_json" >"$(bridge_layout_v2_reconcile_marker_path)" 2>/dev/null || true
+      printf '%s' "$_noop_json"
+    fi
     return 2
   fi
 
@@ -252,6 +278,25 @@ bridge_layout_v2_reconcile_run() {
     printf '%s\n' "$out"
     return 1
   fi
+
+  # Stamp an explicit top-level status discriminator onto the engine JSON so the
+  # persisted result is self-describing (status:"applied" vs the no-op path's
+  # status:"noop") without a consumer having to infer it from the counts (rc2
+  # soak observability). Best-effort: if the inject fails (no python / malformed
+  # — neither expected here, we just ran the engine) we fall back to the raw
+  # engine JSON, which is still structured and non-empty.
+  local _stamped
+  _stamped="$(printf '%s' "$out" | "$python_bin" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    if isinstance(d, dict) and "status" not in d:
+        d = {"status": "applied", **d}
+    sys.stdout.write(json.dumps(d, ensure_ascii=False, indent=2, sort_keys=True))
+    sys.stdout.write("\n")
+except Exception:
+    sys.exit(1)
+' 2>/dev/null)" && [[ -n "$_stamped" ]] && out="$_stamped"
 
   # Record the apply marker so resume is gated on a completed reconcile.
   if [[ "$mode" == "apply" ]]; then

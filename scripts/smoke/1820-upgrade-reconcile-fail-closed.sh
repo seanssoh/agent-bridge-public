@@ -101,9 +101,11 @@ DMN
     if [[ $DRY_RUN -eq 0 ]]; then
       if [[ -f "$TARGET_ROOT/lib/bridge-layout-v2-reconcile.sh" || -f "$TARGET_ROOT/lib/bridge-layout-v2-reconcile-driver.sh" ]]; then
         bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
+        _reconcile_result_rel="state/migration/layout-v2-reconcile/last-apply.json"
+        mkdir -p "$TARGET_ROOT/state/migration/layout-v2-reconcile" 2>/dev/null || true
         BRIDGE_HOME="$TARGET_ROOT" BRIDGE_SCRIPT_DIR="$TARGET_ROOT" \
           bash "$TARGET_ROOT"/lib/bridge-layout-v2-reconcile-driver.sh apply \
-          >"$TARGET_ROOT/state/migration/layout-v2-reconcile-upgrade.json" 2>>"$TARGET_ROOT/logs/upgrade.log"
+          >"$TARGET_ROOT/$_reconcile_result_rel" 2>>"$TARGET_ROOT/logs/upgrade.log"
         _reconcile_rc=$?
         case "$_reconcile_rc" in
           0) : ;;
