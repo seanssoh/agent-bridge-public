@@ -29,35 +29,45 @@
 #       for every allowed read, so a regression that returns None without
 #       auditing is caught.
 #
+#   ALLOW (#1711 follow-up — admin Bash peer-home WRITE parity, write-audited):
+#     - admin WRITE to a PEER home now ALLOWs and emits an
+#       `admin_cross_agent_access_allowed` audit row with intent=write,
+#       matching the non-Bash `protected_path_reason` admin peer-home
+#       exemption. Covers a plain redirect (`echo x > <peer>/MEMORY.md`) and
+#       the output-file readers (`sort -o`, `uniq IN OUT`, `yq -i`, awk
+#       in-program redirect) — none carry shell embedding or unresolved
+#       expansion, so the carve-out grants them. The parity is reached AFTER
+#       the Stage-A shared-forbidden deny and the shell-embedding guard, so it
+#       never grants a shared-secret write or an embedded mutation.
+#
 #   DENY (the teeth — must STILL be blocked):
-#     - admin read of `shared/private` / `shared/secrets` — the carve-out is
-#       peer-home only; the forbidden subtrees stay off-limits for admin.
-#     - admin WRITE-intent to a peer home (redirect) — the read carve-out
-#       must NOT grant writes.
-#     - admin read-intent leading verb that SMUGGLES a mutation via shell
-#       embedding (`cat $(…write…)`, `cat <(…)`, `cat <<EOF…`) or an output-
-#       file reader (`sort -o`, `uniq IN OUT`, `yq -i`, awk in-program
-#       redirect) — `read_intent` + the shell-embedding re-check fail closed.
-#     - admin read of a peer path spelled via an unresolved $HOME expansion —
+#     - admin read/write of `shared/private` / `shared/secrets` — the carve-out
+#       is peer-home only; the forbidden subtrees stay off-limits for admin.
+#     - admin leading verb that SMUGGLES a mutation via shell embedding
+#       (`cat $(…write…)`, `cat <(…)`, `cat <<EOF…`) — the embedding guard
+#       fails the write-parity carve-out closed (the mutation rides a `$(…)`
+#       / `<(…)` / here-string, not a plain peer-home write).
+#     - admin access to a peer path spelled via an unresolved $HOME expansion —
 #       fail closed (#1690 r4 FIX 2): the literal path never materializes for
 #       the substring gate.
-#     - NON-admin (class=user) read of a peer / shared path — the carve-out
-#       must not leak to ordinary agents.
+#     - NON-admin (class=user) read/write of a peer / shared path — neither
+#       carve-out leaks to ordinary agents.
 #
 #   SYSTEM-CLASS preserved + branch keys on is_admin_agent (not class):
 #     - a system-class NON-admin agent (BRIDGE_AGENT_CLASS_FOR_HOOK=system,
 #       no admin SESSION-TYPE) still gets its own Stage B read carve-out.
-#       This proves the new admin branch did not displace the independent
+#       This proves the new admin branches did not displace the independent
 #       system-class branch, and that admin is resolved via is_admin_agent,
 #       NOT via current_agent_class()=='system'.
 #
 #   Revert-teeth (GENUINE): the smoke builds a TEMPORARY copy of
-#   hooks/tool-policy.py with the admin carve-out stripped out, runs the
-#   admin peer-home read cases against it, and asserts they flip to DENY. If
-#   a future edit removed the carve-out from the real hook, this proof would
-#   still pass against the stripped copy — but the live ALLOW assertions
-#   above would fail. The combination means the smoke cannot pass without
-#   the fix.
+#   hooks/tool-policy.py with BOTH admin peer-home carve-outs (#1692 read +
+#   #1711 write) stripped out (via 1692-admin-bash-symmetry-strip.py), runs
+#   the admin peer-home read AND write cases against it, and asserts they flip
+#   to DENY. If a future edit removed either carve-out from the real hook, this
+#   proof would still pass against the stripped copy — but the live ALLOW
+#   assertions above would fail. The combination means the smoke cannot pass
+#   without both fixes.
 #
 # Footgun #11: the JSON stdin payload is built with `printf` (never an
 # interpreter here-string / heredoc-stdin) and piped into the hook with
@@ -116,6 +126,28 @@ mkdir -p "$PEER_HOME/memory/shared"
 printf -- '# peer memory fixture\n' >"$PEER_HOME/MEMORY.md"
 printf -- '# peer shared note\n' >"$PEER_HOME/memory/shared/note.md"
 
+# Controller-roster snapshot (the strict-predicate test seam). The #1711 admin
+# Bash peer-home WRITE parity is a cross-agent MUTATION, so — per #1806 — it
+# gates on the STRICT, anti-spoof `trusted_admin` predicate, never on the
+# spoofable loose `admin` OR-leg (an agent can write `session type: admin` into
+# its own home). Publish a controller roster naming `patch-1692` the admin
+# static role (every other fixture agent admin=false) and export
+# BRIDGE_ADMIN_AGENT_ID=patch-1692 so the genuine admin's peer-WRITE is trusted,
+# while the non-admin / system agents stay NON-admin and their peer writes stay
+# denied. Honored only because BRIDGE_HOME resolves under a temp prefix; inert
+# in production (see scripts/smoke/1806-admin-guard-allow-audit.sh seam proof).
+ROSTER_JSON="$SMOKE_TMP_ROOT/controller-roster.json"
+printf -- '%s\n' \
+  '[' \
+  "  {\"agent\": \"${ADMIN_AGENT}\", \"admin\": true, \"source\": \"static\"}," \
+  "  {\"agent\": \"${USER_AGENT}\", \"admin\": false, \"source\": \"static\"}," \
+  "  {\"agent\": \"${SYS_AGENT}\", \"admin\": false, \"source\": \"static\"}," \
+  "  {\"agent\": \"${PEER_AGENT}\", \"admin\": false, \"source\": \"static\"}" \
+  ']' \
+  >"$ROSTER_JSON"
+export BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT"
+export BRIDGE_GUARD_ADMIN_ROSTER_JSON="$ROSTER_JSON"
+
 # Shared off-limits subtrees (private/ + secrets/) under $BRIDGE_HOME/shared.
 SHARED_PRIV_DIR="$BRIDGE_SHARED_DIR/private"
 SHARED_SECRETS_DIR="$BRIDGE_SHARED_DIR/secrets"
@@ -129,28 +161,9 @@ printf -- '# operator-only key blob\n' >"$SHARED_SECRETS_DIR/key.md"
 # deny" comment that follows it). The stripped copy lives next to the real
 # hook so its sibling imports (bridge_hook_common) resolve identically.
 STRIPPED_HOOK="$SMOKE_REPO_ROOT/hooks/.tool-policy-1692-stripped-$$.py"
-"$PYTHON_BIN" - "$REAL_HOOK" "$STRIPPED_HOOK" <<'PY'
-import sys
-real, out = sys.argv[1], sys.argv[2]
-src = open(real, encoding="utf-8").read()
-# Unique signatures: the carve-out's leading comment line and the runtime
-# guard expression. The Stage-A block also MENTIONS #1692 (it documents the
-# deliberate omission), so we anchor on the carve-out's own header + the
-# following Stage-B comment, and sanity-check on the runtime guard string.
-start_marker = "    # Issue #1692 — admin read-intent carve-out for the Bash PEER-HOME"
-end_marker = "    # Stage B: peer-agent-home substring deny"
-guard_signature = "admin_peer_read_audited"
-i = src.find(start_marker)
-j = src.find(end_marker)
-if i == -1 or j == -1 or j < i:
-    sys.stderr.write("could not locate #1692 peer-home carve-out block to strip\n")
-    sys.exit(3)
-stripped = src[:i] + src[j:]
-if guard_signature in stripped:
-    sys.stderr.write("carve-out runtime guard still present after strip\n")
-    sys.exit(4)
-open(out, "w", encoding="utf-8").write(stripped)
-PY
+"$PYTHON_BIN" "$SCRIPT_DIR/1692-admin-bash-symmetry-strip.py" \
+  "$REAL_HOOK" "$STRIPPED_HOOK" \
+  || smoke_fail "could not build carve-out-stripped hook copy"
 "$PYTHON_BIN" -m py_compile "$STRIPPED_HOOK" \
   || smoke_fail "stripped hook copy did not compile"
 
@@ -247,6 +260,35 @@ assert_admin_read_allow_audited() {
   smoke_log "ok: ${label} -> ALLOW + audited"
 }
 
+# Issue #1711 follow-up — assert an ALLOWED admin peer-home WRITE ALSO emits an
+# `admin_cross_agent_access_allowed` audit row with intent=write (the
+# write-parity ledger invariant). Truncates the audit log first so the
+# assertion is scoped to this single decision. This is the parity #1692
+# deliberately deferred: an admin Bash write to a PEER home now matches the
+# non-Bash `protected_path_reason` admin peer-home exemption.
+assert_admin_write_allow_audited() {
+  local label="$1" command="$2"
+  : >"$BRIDGE_AUDIT_LOG"
+  local got
+  got="$(hook_verdict "$ADMIN_AGENT" "user" "$command" "$REAL_HOOK")"
+  if [[ "$got" != "ALLOW" ]]; then
+    smoke_log "FAIL: ${label}: verdict ${got}, want ALLOW"
+    smoke_log "      command: ${command}"
+    smoke_fail "${label}: expected ALLOW, got ${got}"
+  fi
+  if ! grep -q '"action": "admin_cross_agent_access_allowed"' "$BRIDGE_AUDIT_LOG" 2>/dev/null; then
+    smoke_log "FAIL: ${label}: ALLOW but no admin_cross_agent_access_allowed audit row"
+    smoke_log "      audit log: $(cat "$BRIDGE_AUDIT_LOG" 2>/dev/null || echo '<empty>')"
+    smoke_fail "${label}: missing write-parity audit row"
+  fi
+  if ! grep -q '"intent": "write"' "$BRIDGE_AUDIT_LOG" 2>/dev/null; then
+    smoke_log "FAIL: ${label}: write-parity audit row missing intent=write"
+    smoke_log "      audit log: $(cat "$BRIDGE_AUDIT_LOG" 2>/dev/null || echo '<empty>')"
+    smoke_fail "${label}: audit row intent mismatch"
+  fi
+  smoke_log "ok: ${label} -> ALLOW + write-audited"
+}
+
 echo "[smoke:${SMOKE_NAME}] real PreToolUse hook end-to-end"
 
 # ---------------------------------------------------------------------------
@@ -283,15 +325,20 @@ assert_hook_verdict \
   "cat $SHARED_SECRETS_DIR/key.md" \
   "DENY"
 
-# 2a. Admin WRITE-intent to a peer home — the read carve-out must NOT grant
-#     writes. A redirect is not read-intent, so it falls through to the deny.
-assert_hook_verdict \
-  "admin WRITE (redirect) to peer MEMORY.md stays denied" \
-  "$ADMIN_AGENT" "user" \
-  "echo pwned > $PEER_HOME/MEMORY.md" \
-  "DENY"
+# 2a. Admin WRITE-intent to a PEER home — issue #1711 follow-up resolves the
+#     write-parity gap #1692 deferred: an admin Bash redirect write to a peer
+#     home now ALLOWS (matching the non-Bash `protected_path_reason` admin
+#     peer-home exemption) and emits an `admin_cross_agent_access_allowed`
+#     audit row with intent=write. The shared/private + smuggle cases below
+#     still DENY, so the parity is scoped to plain peer-home writes only.
+assert_admin_write_allow_audited \
+  "admin WRITE (redirect) to peer MEMORY.md now allowed + write-audited (#1711)" \
+  "echo pwned > $PEER_HOME/MEMORY.md"
 
-# 2b. Admin WRITE-intent to a shared private path — also stays denied.
+# 2b. Admin WRITE-intent to a shared private path — STAYS DENIED. Stage-A
+#     shared/private|secrets is off-limits for every agent including admin
+#     (#1692 Option D); the #1711 write-parity carve-out is reached only AFTER
+#     the Stage-A deny, so it can never grant a shared-secret write.
 assert_hook_verdict \
   "admin WRITE (redirect) to shared private stays denied" \
   "$ADMIN_AGENT" "user" \
@@ -329,33 +376,30 @@ assert_hook_verdict \
   "cat $PEER_HOME/MEMORY.md ${HERESTRING_OP}\$(echo x)" \
   "DENY"
 
-# 2c'..2e'. Admin "reader" commands with an OUTPUT-FILE flag/positional or
-#          an in-program redirect write a peer/shared path with NO argv `>`
-#          token, so they classify as read-intent unless the read-intent
-#          classifier is hardened (codex SECURITY r2). Each must stay DENY.
-assert_hook_verdict \
-  "admin sort -o (output file) to peer stays denied" \
-  "$ADMIN_AGENT" "user" \
-  "sort -o $PEER_HOME/MEMORY.md $PEER_HOME/MEMORY.md" \
-  "DENY"
+# 2c'..2e'. Admin "reader" commands with an OUTPUT-FILE flag/positional or an
+#          in-program redirect (`sort -o`, `uniq IN OUT`, `yq -i`, `awk
+#          BEGIN{… > peer}`) WRITE a peer home with NO shell embedding /
+#          unresolved expansion. Under the #1711 write-parity carve-out these
+#          now ALLOW for ADMIN (a peer-home write the non-Bash surface already
+#          permits) and emit the write-audit row. The read-intent classifier
+#          hardening that flags them as write-intent (codex SECURITY r2) still
+#          governs the NON-admin / system-class paths (see 2f/2g below) — the
+#          parity only changes the ADMIN outcome.
+assert_admin_write_allow_audited \
+  "admin sort -o (output file) to peer now allowed + write-audited (#1711)" \
+  "sort -o $PEER_HOME/MEMORY.md $PEER_HOME/MEMORY.md"
 
-assert_hook_verdict \
-  "admin uniq IN OUT (2nd positional write) to peer stays denied" \
-  "$ADMIN_AGENT" "user" \
-  "uniq $PEER_HOME/MEMORY.md $PEER_HOME/MEMORY.md" \
-  "DENY"
+assert_admin_write_allow_audited \
+  "admin uniq IN OUT (2nd positional write) to peer now allowed + write-audited (#1711)" \
+  "uniq $PEER_HOME/MEMORY.md $PEER_HOME/MEMORY.md"
 
-assert_hook_verdict \
-  "admin yq -i (in-place edit) of peer stays denied" \
-  "$ADMIN_AGENT" "user" \
-  "yq -i . $PEER_HOME/MEMORY.md" \
-  "DENY"
+assert_admin_write_allow_audited \
+  "admin yq -i (in-place edit) of peer now allowed + write-audited (#1711)" \
+  "yq -i . $PEER_HOME/MEMORY.md"
 
-assert_hook_verdict \
-  "admin awk in-program redirect to peer stays denied" \
-  "$ADMIN_AGENT" "user" \
-  "awk 'BEGIN{print \"x\" > \"$PEER_HOME/MEMORY.md\"}' $PEER_HOME/MEMORY.md" \
-  "DENY"
+assert_admin_write_allow_audited \
+  "admin awk in-program redirect to peer now allowed + write-audited (#1711)" \
+  "awk 'BEGIN{print \"x\" > \"$PEER_HOME/MEMORY.md\"}' $PEER_HOME/MEMORY.md"
 
 # 2f. NON-admin (class=user) read of a peer home — carve-out must not leak.
 assert_hook_verdict \
@@ -440,10 +484,17 @@ revert_assert_deny() {
   fi
 }
 
-# Both cases are PEER-HOME reads that the real hook now ALLOWs for admin
-# (Group 1); against the stripped hook they must flip to DENY. (A shared/
-# private read would be DENY in both real and stripped — denied by Stage A
-# regardless — so it is NOT a valid revert-teeth flip and is not used here.)
+# PEER-HOME reads that the real hook ALLOWs for admin via the #1692 read
+# carve-out (Group 1); against the stripped hook (BOTH the #1692 read AND the
+# #1711 write carve-outs removed) they must flip to DENY. (A shared/private
+# read would be DENY in both real and stripped — denied by Stage A regardless
+# — so it is NOT a valid revert-teeth flip and is not used here.)
+#
+# NOTE: stripping ONLY the #1692 read block would NOT flip these to DENY now,
+# because the #1711 write-parity carve-out below it also allows admin
+# peer-home access (read or write) when there is no shell embedding /
+# unresolved expansion. The strip helper removes BOTH blocks so the revert
+# proof stays load-bearing for each.
 revert_assert_deny \
   "admin read of peer MEMORY.md" \
   "cat $PEER_HOME/MEMORY.md"
@@ -451,6 +502,18 @@ revert_assert_deny \
 revert_assert_deny \
   "admin read of peer memory/shared note" \
   "grep note $PEER_HOME/memory/shared/note.md"
+
+# PEER-HOME writes that the real hook now ALLOWs for admin via the #1711
+# write-parity carve-out; against the stripped hook (carve-out removed) they
+# must flip to DENY — the genuine revert proof that the write parity, not some
+# unrelated allow, is what grants these.
+revert_assert_deny \
+  "admin redirect write to peer MEMORY.md" \
+  "echo pwned > $PEER_HOME/MEMORY.md"
+
+revert_assert_deny \
+  "admin sort -o write to peer MEMORY.md" \
+  "sort -o $PEER_HOME/MEMORY.md $PEER_HOME/MEMORY.md"
 
 # Sanity: the stripped hook must still ALLOW the system-class read (its own
 # branch is untouched by stripping the admin carve-out) — confirms the

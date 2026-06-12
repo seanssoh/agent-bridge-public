@@ -611,6 +611,46 @@ def _emit_admin_credential_read_allowed(
     write_audit("agent_admin_credential_read_allowed", agent or "unknown", detail)
 
 
+def _emit_admin_cross_agent_access_allowed(
+    agent: str,
+    *,
+    target: str,
+    intent: str,
+    sample: str = "",
+    tool_input: dict[str, Any] | None = None,
+) -> None:
+    """Audit an admin agent's Bash peer-home access carve-out (issue #1711
+    follow-up — read|write parity with the non-Bash ``protected_path_reason``
+    admin peer-home exemption).
+
+    Emitted on every grant of the admin Bash peer-home carve-out so the
+    operator keeps a full ledger of admin cross-agent file access. ``target``
+    is the matched peer-home alias / suffix, ``intent`` is ``read`` or
+    ``write`` (the latter is the parity this carve-out adds — an admin write to
+    a peer home no longer routes through the queue ONLY). Mirrors the
+    ``agent_admin_credential_read_allowed`` row shape so a single audit
+    consumer reads admin allow rows uniformly. Stage-A shared/secrets reads are
+    NOT routed here (they deny above for every agent including admin).
+    """
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "target": _redact_credential_token_values(truncate_text(target, 200)),
+        "intent": intent,
+    }
+    if sample:
+        detail["sample"] = _redact_credential_token_values(truncate_text(sample, 200))
+    if tool_input is not None:
+        detail["summary"] = _redact_credential_summary(
+            tool_input_summary("Bash", tool_input)
+        )
+    elif sample:
+        detail["summary"] = {
+            "command": _redact_credential_token_values(truncate_text(sample, 240)),
+            "description": "",
+        }
+    write_audit("admin_cross_agent_access_allowed", agent or "unknown", detail)
+
+
 _NON_AGENT_ENTRIES: frozenset[str] = frozenset({
     # `shared` is the canonical symlink to BRIDGE_SHARED_DIR. Treating it
     # as a peer agent home used to collapse every shared-dir write into
@@ -863,6 +903,11 @@ _READ_INTENT_BASH_COMMANDS = frozenset(
         "stat",
         "file",
         "md5sum",
+        # macOS `md5` (issue #1822) — BSD checksum viewer, stdout-only like
+        # `md5sum`/`sha256sum`; `md5 -q <file>` / `md5 <file>` print the digest
+        # and have NO output-file / in-place flag, so a checksum read of a peer
+        # home / system-config file is no longer mis-classified write-intent.
+        "md5",
         "sha256sum",
         "sha1sum",
         "xxd",
@@ -2612,6 +2657,64 @@ def _command_is_simple_inert_quoted_heredoc_write(command: str) -> bool:
     # The closing delimiter must terminate the command (heredoc is the last
     # thing) — otherwise content after the body (e.g. `EOF | bash`) could run.
     return re.search(r"\n" + re.escape(delimiter) + r"[ \t]*\Z", command) is not None
+
+
+def _inert_heredoc_cross_agent_scan_text(text: str) -> str | None:
+    """Return the reduced scan surface for the cross-agent (Stage A/B) gates
+    when *text* is the ONE provably-inert QUOTED-heredoc write shape (issue
+    #1822, codex re-review of PR #1838): the single-line command head with the
+    heredoc BODY and the proven-inert opener token removed. For every other
+    command return ``None`` — the caller scans the raw text, preserving
+    today's deny-leaning behavior unchanged.
+
+    Why excluding the body from word scanning cannot open a bypass:
+
+    - The strip happens ONLY when ``_command_is_simple_inert_quoted_heredoc_
+      write`` matches (#1574's airtight shape): a single ``cat``/``tee`` stage
+      whose head character classes EXCLUDE every chaining / substitution /
+      interpreter route (``&``, ``;``, ``|``, ``$``, backtick, ``(``, ``)``,
+      any ``<``/``>`` beyond the opener and a simple file redirect), a QUOTED
+      delimiter (``<<'EOF'`` / ``<<"EOF"`` — bash performs NO expansion on the
+      body; it is a pure literal fed to stdin), and the closing delimiter as
+      the last line (nothing can run after the body). An interpreter consumer
+      (``bash <<'EOF'``), a pipe route (``cat <<'EOF' | bash``), or a second
+      stage can never match — those bodies stay on the raw scan surface.
+    - ``cat``/``tee`` write stdin VERBATIM; they never treat body content as
+      a path to open. The only real filesystem targets are the head's
+      redirect target / file args, which REMAIN on the returned surface — a
+      write whose destination is a peer home or a forbidden shared tree still
+      hits the cross-agent gates exactly as before.
+    - An UNQUOTED (``<<EOF``) delimiter means bash DOES expand the body
+      (``$(…)``/``$var`` execute) — not the shape, no strip, body scanned.
+    - An UNBALANCED opener (no closing delimiter line) fails the shape's
+      end-anchored terminator check — no strip, fail closed.
+    - A body line EQUAL to the delimiter (the multi-EOF payload — bash ends
+      the heredoc at the FIRST such line and EXECUTES what follows) defeats
+      the end-anchored shape check, but ``_strip_heredoc_and_herestring_
+      body``'s first-terminator semantics then refuses the match, a newline
+      survives, and the ``"\\n" in stripped`` invariant below falls back to
+      the raw scan — the executed tail stays visible. Fail closed.
+    """
+    if not _command_is_simple_inert_quoted_heredoc_write(text):
+        return None
+    stripped = _strip_heredoc_and_herestring_body(text)
+    # Invariant: the inert shape is a one-line head + body + final terminator
+    # line, so a correct strip returns a single newline-FREE head ending in
+    # the (de-quoted) `<<DELIM` opener. Any surviving newline means the
+    # strip's first-terminator semantics disagreed with the shape check's
+    # end-anchored terminator (an in-body delimiter line → bash executes the
+    # remainder). Refuse to strip; the caller scans the raw text.
+    if "\n" in stripped:
+        return None
+    # Drop the trailing heredoc opener token so the embedding gate
+    # (`_command_has_shell_embedding`'s `<<` pattern) does not re-flag the
+    # proven-inert opener. The shape guarantees the opener is the LAST token
+    # of the head; everything else (leader, flags, redirect target, file
+    # args) stays on the scan surface.
+    head = re.sub(r"[ \t]*<<-?[A-Za-z_][A-Za-z0-9_]*[ \t]*\Z", "", stripped)
+    if head == stripped:
+        return None  # opener not in terminal position — fail closed
+    return head
 
 
 def _command_cd_base_dir(command: str) -> Path | None:
@@ -4469,6 +4572,34 @@ def _forbidden_suffix_in_command(text: str, suffixes: list[str]) -> str | None:
     return None
 
 
+def _unwrap_balanced_backtick_path(word: str) -> str | None:
+    """If *word* is a single token wholly wrapped in a BALANCED pair of
+    backticks whose inner text is a literal path (no nested command-sub /
+    glob / further backtick), return the inner literal; else ``None``.
+
+    Issue #1822 FIX 1b: a backtick code-span like `` `~/.agent-bridge/shared/
+    wiki/index.md` `` reaching the obfuscation fail-close is, in these
+    contexts (single-quoted prose / assignment), a literal path reference, not
+    a live substitution. Unwrapping it lets the caller resolve the real inner
+    path and apply the normal containment test instead of fail-closing on the
+    empty prefix the leading backtick would carve out. Fail-safe: any token
+    that is NOT exactly ``` `…` ``` with a clean single-path interior returns
+    ``None`` so the conservative fail-close path is preserved.
+    """
+    if len(word) < 2 or word[0] != "`" or word[-1] != "`":
+        return None
+    inner = word[1:-1]
+    # The interior must contain no further backtick (would be a second span /
+    # unbalanced) and no nested command substitution.
+    if "`" in inner or "$(" in inner:
+        return None
+    # A single path token only — reject embedded whitespace (a real command
+    # like `` `ls -la` `` is not a path span we should unwrap-and-allow).
+    if not inner or any(ch.isspace() for ch in inner):
+        return None
+    return inner
+
+
 def _glob_prefix_reaches_forbidden_dir(word: str, suffixes: list[str]) -> bool:
     """For a glob / command-sub *word*, expand ``$VAR`` / ``~`` in the
     literal prefix BEFORE the first wildcard / command-sub char and decide
@@ -4476,13 +4607,37 @@ def _glob_prefix_reaches_forbidden_dir(word: str, suffixes: list[str]) -> bool:
 
     A forbidden directory is the absolute resolution of a forbidden suffix
     under the bridge home (``<home>/shared/secrets``, ``<home>/agents/
-    other-a``). The glob can reach it when the resolved prefix is a string
-    prefix of the forbidden dir (the wildcard sits at/above the protected
-    leaf, e.g. ``…/agents/oth*r-a``) OR the forbidden dir is a prefix of the
-    resolved prefix (the wildcard sits strictly INSIDE the forbidden tree).
+    other-a``). The glob can reach it only when its pattern COMPONENTS — a
+    bash glob's ``*``/``?``/``[…]`` never span a ``/`` separator — can
+    ``fnmatch`` the forbidden dir's path components. ``…/agents/oth*r-a``
+    reaches ``…/agents/other-a`` (component-wise match), a wildcard strictly
+    inside the tree (``…/shared/secrets/*``) reaches it (the leading
+    components match and the pattern is at least as deep), but a SHALLOW glob
+    such as ``<home>/*.sh`` does NOT — its single ``*`` component cannot match
+    the literal ``shared`` segment AND it is too shallow to even name the
+    depth-2 ``shared/secrets`` dir, so it is NOT denied (issue #1822: a
+    top-level ``grep <home>/*.sh`` was false-denied by the old bidirectional
+    ``startswith`` test, which treated any common string prefix as a reach).
     A read strictly inside the agent's OWN home (``…/agents/<self>/memory/
-    *.md``) resolves to a prefix that is neither, so it is NOT denied.
+    *.md``) does not component-match a peer / shared forbidden dir either.
+
+    Issue #1822 FIX 1b — balanced-backtick UNWRAP. A word that is wholly
+    wrapped in a balanced pair of backticks (`` `~/.agent-bridge/shared/wiki/
+    index.md` ``) is, in the contexts that reach here (a code-span inside a
+    single-quoted multi-line assignment / prose), NOT a live command
+    substitution — its content is a literal path reference. The bare-backtick
+    cut below would otherwise slice the prefix to empty (the first char is a
+    backtick) and fail closed, false-denying a benign ``shared/wiki`` mention.
+    When the backticks are balanced and the inner text is a single bridge-
+    anchored literal path with NO further command-sub / glob, we resolve that
+    inner path and re-run the SAME containment test on it: a ``shared/secrets``
+    /peer-home inner path still DENIES, a ``shared/wiki`` inner path is
+    correctly allowed. An UNbalanced backtick, or an inner text that itself
+    carries a `$(`/glob, is left to the conservative fail-close path below.
     """
+    unwrapped = _unwrap_balanced_backtick_path(word)
+    if unwrapped is not None:
+        word = unwrapped
     # First wildcard / command-sub position.
     cut = len(word)
     for i, ch in enumerate(word):
@@ -4490,20 +4645,37 @@ def _glob_prefix_reaches_forbidden_dir(word: str, suffixes: list[str]) -> bool:
             cut = i
             break
     prefix = word[:cut]
-    expanded = os.path.expandvars(os.path.expanduser(prefix))
-    if not expanded:
+    expanded_prefix = os.path.expandvars(os.path.expanduser(prefix))
+    if not expanded_prefix:
         return True  # un-resolvable prefix → fail closed
     # The caller only reaches here for a BRIDGE-ANCHORED word. If a `$VAR`
     # survived expansion (a shell var Python's environ cannot see), the
     # static prefix is inconclusive — fail closed rather than risk a
     # var-spelled glob into the secret tree (the broader carve-out gates use
     # the same "unresolved expansion → fail closed" stance, #1690 r4 FIX 2).
-    if "$" in expanded:
+    if "$" in expanded_prefix:
         return True
+    # Rebuild the full glob pattern (expanded literal prefix + the wildcard
+    # tail) so the component-wise fnmatch sees the wildcard, mirroring
+    # `_glob_word_hits_forbidden`'s containment model (issue #1822 FIX 2).
+    # A bare `$(`/backtick command-sub tail with no glob char leaves only the
+    # prefix to anchor on — `fnmatch` then degenerates to a literal
+    # component-equality check, which is the correct conservative stance.
+    pattern = os.path.normpath(expanded_prefix + word[cut:])
+    pat_parts = pattern.split(os.sep)
     bridge_home = str(bridge_home_dir())
     for suffix in suffixes:
-        forbidden_dir = f"{bridge_home}{suffix}"
-        if expanded.startswith(forbidden_dir) or forbidden_dir.startswith(expanded):
+        forbidden_dir = os.path.normpath(f"{bridge_home}{suffix}")
+        dir_parts = forbidden_dir.split(os.sep)
+        if len(pat_parts) < len(dir_parts):
+            # The pattern is too shallow to even name the forbidden dir
+            # (`<home>/*.sh` has fewer components than `<home>/shared/secrets`).
+            continue
+        # Equal depth → the glob selects the protected dir itself (an
+        # ls/find/grep -r enumerates it); deeper → it reads strictly inside.
+        # Both leak, so deny when every forbidden-dir component is fnmatched by
+        # the aligned pattern component.
+        if all(fnmatch.fnmatch(dp, pp) for pp, dp in zip(pat_parts, dir_parts)):
             return True
     return False
 
@@ -4569,6 +4741,35 @@ def _glob_word_hits_forbidden(
 # the fail-close path rejects. Surfaced in the deny message so the operator
 # can tell a suffix hit from an obfuscation fail-close.
 _OBFUSCATED_SUFFIX_SENTINEL = "(obfuscated path expansion)"
+
+
+def _obfuscation_sample(text: str) -> str:
+    """Return a short, bounded sample of the OFFENDING word(s) in *text* for an
+    obfuscation fail-close deny message (issue #1822).
+
+    The suffix matcher fails closed when a word carries a glob (`* ? [ ]`),
+    command-sub (`` ` ``/`$(`), or a surviving `$var` near a bridge anchor. We
+    surface up to two such bridge-anchored words (truncated) so the operator
+    can see WHAT was un-analyzable instead of being pointed at a fixed
+    secrets path that may not exist. Best-effort and never raises — a sampling
+    failure yields an empty string and the caller's base message stands.
+    """
+    try:
+        anchors = _bridge_anchor_tokens()
+        samples: list[str] = []
+        for word in text.split():
+            if not any(anchor in word for anchor in anchors):
+                continue
+            if any(ch in _OBFUSCATION_GLOB_CHARS for ch in word) \
+                    or "`" in word or "$(" in word or "$" in word:
+                samples.append(truncate_text(word, 60))
+                if len(samples) >= 2:
+                    break
+        if not samples:
+            return ""
+        return "(near: " + ", ".join(samples) + ")"
+    except Exception:  # noqa: BLE001 — diagnostics only, never block the deny
+        return ""
 
 
 def _command_path_candidate_words(segments: list[str]):
@@ -7235,6 +7436,15 @@ def _resolved_write_target_containment(target_word: str, agent: str) -> tuple[st
 _PEER_WRITE_SRC_DST_CMDS: frozenset[str] = frozenset({"mv", "cp"})
 _PEER_WRITE_DIR_CMDS: frozenset[str] = frozenset({"mkdir", "rmdir"})
 
+# Leaders that must NEVER ride the generic #1711 admin peer file-write parity
+# (`_admin_peer_write_targets_all_contained`): each has its OWN dedicated gate
+# whose narrower contract must remain the sole authority. `sqlite3` opens a DB
+# and is allowed ONLY against the EXACT task DB via the #1806 (3e) carve-out
+# (audited `admin_sqlite3_task_db`); a `sqlite3 <peer>/x.db` against any other
+# path must DENY (#1806 Tooth 8), so it must not be re-granted here as a generic
+# peer file write.
+_PEER_WRITE_EXCLUDED_LEADERS: frozenset[str] = frozenset({"sqlite3"})
+
 
 def _admin_peer_write_operands(text: str) -> tuple[str, list[str], list[str]] | None:
     """Extract ``(operation, source_words, dest_words)`` for a single
@@ -7275,6 +7485,143 @@ def _admin_peer_write_operands(text: str) -> tuple[str, list[str], list[str]] | 
             return None
         return leaf, [], list(positionals)
     return None
+
+
+def _admin_peer_write_targets_all_contained(
+    scan_text: str, agent: str
+) -> bool:
+    """Resolved-path containment gate for the admin Bash peer-home WRITE
+    parity carve-out (#1711 follow-up).
+
+    The carve-out grants a trusted-admin peer-home WRITE (a redirect/append
+    such as ``printf … >> <peer>/CLAUDE.md`` or the inert quoted-heredoc
+    doc-note ``cat >> <peer>/CLAUDE.md <<'EOF' … EOF``) whose mv/cp/mkdir/rmdir
+    operand shape the #1806 (3a) carve-out does NOT model. Substring-matching a
+    peer alias is NOT sufficient to authorize a MUTATION: a ``..`` traversal or
+    a symlinked parent (e.g. ``mv <peer> <peer>/../../../OUTSIDE/x`` or
+    ``mkdir <peer>/out-link/x``) names the peer alias as a substring yet
+    RESOLVES outside the bridge home / into a hard-denied tree. #1806 Tooth 7
+    proves this must DENY.
+
+    Returns True ONLY when ALL hold (else False → caller DENIES, fail closed):
+
+      - EVERY peer-/bridge-anchored path token in *scan_text* resolves (symlink
+        + ``..`` folded, via the SAME
+        :func:`_resolved_write_target_containment` resolver the #1806 (3a)
+        carve-out uses) to a location CONTAINED under the bridge home and
+        OUTSIDE shared/private, shared/secrets, and #341 protected-config. A
+        ``..`` traversal or a symlinked parent (#1806 Tooth 7:
+        ``mv <peer> <peer>/../../../OUTSIDE/x``, ``mkdir <peer>/out-link/x``)
+        names the peer alias as a SUBSTRING yet RESOLVES outside / into a denied
+        tree → containment returns None → False;
+      - the command references at least one peer home (so a benign same-home /
+        non-peer write is not mis-audited as a cross-agent write); AND
+      - the leader is NOT a command with its OWN dedicated carve-out / open
+        semantics — notably ``sqlite3`` (#1806 (3e): a sqlite3 open is allowed
+        ONLY against the EXACT task DB and is audited as
+        ``admin_sqlite3_task_db``; a ``sqlite3 <peer>/x.db`` against any other
+        path must DENY — #1806 Tooth 8 — and must NEVER be re-granted here as a
+        generic peer file write).
+
+    *scan_text* is the reduced ``cross_scan`` surface, so a proven-inert
+    quoted-heredoc DATA body never contributes a spurious target — only the real
+    head tokens (redirect target / file args) are checked. The caller has
+    already classified the command as write-intent (``not read_intent``) and
+    embedding-free, so this gate adds the missing RESOLVED-PATH containment
+    proof the substring `matched_alias` cannot give.
+    """
+    if _command_has_shell_embedding(scan_text):
+        return False
+    try:
+        tokens = shlex.split(scan_text, posix=True, comments=False)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    # A leader with its own dedicated carve-out / open semantics must NOT ride
+    # the generic #1711 peer file-write parity (e.g. `sqlite3` routes through
+    # the #1806 (3e) exact-task-db carve-out only; anything else denies).
+    if tokens[0].rsplit("/", 1)[-1] in _PEER_WRITE_EXCLUDED_LEADERS:
+        return False
+    aliases = _peer_alias_list(agent)
+    anchors = _bridge_anchor_tokens()
+    # v2-split-install anchor spellings (`$BRIDGE_DATA_ROOT`, `${BRIDGE_AGENT_
+    # ROOT_V2}`, …) that `_resolved_write_target_containment` knows how to fold
+    # to a concrete peer v2 home (issue #1823). A `$BRIDGE_AGENT_ROOT_V2/<peer>/
+    # home/…` token carries NO literal `/agents/` substring, so the marker gate
+    # below must recognize the anchor NAME to treat it as a write-target
+    # candidate (otherwise a legitimate trusted-admin v2 peer write would be
+    # silently skipped and the carve-out would not fire).
+    v2_anchor_markers = tuple(
+        marker
+        for name in _V2_ANCHOR_NAMES
+        for marker in (f"${name}", f"${{{name}")
+    )
+
+    def _carries_bridge_marker(word: str) -> bool:
+        return bool(
+            any(a in word for a in aliases)
+            or any(anchor in word for anchor in anchors)
+            or any(m in word for m in v2_anchor_markers)
+            or "/agents/" in word
+            or "/shared/" in word
+        )
+
+    references_peer = False
+    checked_any = False
+    for tok in tokens:
+        if not tok or tok.startswith("-"):
+            continue
+        # Operator tokens shlex surfaces (`>`, `>>`, `<`, …) are not path words.
+        if re.fullmatch(r"[0-9]*(>>?|<<?)", tok):
+            continue
+        # A write-target candidate must be a single PLAUSIBLE PATH word: a clean
+        # leading filesystem/anchor spelling and no embedded whitespace or
+        # shell-program punctuation. This excludes a quote-stripped PROGRAM token
+        # (e.g. an awk body `BEGIN{print "x" > "<peer>/M.md"}`) that merely
+        # CONTAINS a peer path as a substring — the program's real file output is
+        # surfaced as the separate file-arg token, which IS resolved below. Such
+        # a program token is never fed to the path resolver (which would
+        # fail-close and false-DENY a legitimate in-program write whose file arg
+        # is itself a contained peer path).
+        # `{`/`}` are deliberately ALLOWED so a Bash PARAMETER-EXPANSION anchor
+        # spelling (`${BRIDGE_DATA_ROOT:-x}/<peer>/home/…`, issue #1823 r4) stays
+        # a path candidate that `_resolved_write_target_containment` can fold;
+        # an awk/program body is still excluded because it carries whitespace
+        # and/or quote chars (forbidden below). A `$(`/`)` command-sub or a
+        # backtick is already rejected by the leg's `_command_has_shell_
+        # embedding` pre-check.
+        looks_like_path = (
+            tok.startswith(("/", "~", "./", "../", "$"))
+            or any(anchor in tok for anchor in anchors)
+        ) and not any(ch in tok for ch in " \t()'\"`;|&")
+        if not looks_like_path:
+            # A skipped PROGRAM token (e.g. an awk body) may carry its OWN
+            # in-program output redirect to a path the file-arg scan never sees
+            # (`awk 'BEGIN{print "x" > "<escape>/leak"}' <peer>/M.md`). Resolve
+            # any embedded `>`/`>>` redirect TARGET inside such a token; an
+            # escape / forbidden-tree / un-analyzable in-program write target
+            # fails the gate (fail closed) so a contained file arg cannot
+            # whitewash an in-program write that lands outside containment.
+            for embedded in re.findall(
+                r">>?\s*['\"]?([^'\"\s>|&;]+)", tok
+            ):
+                if not _carries_bridge_marker(embedded):
+                    continue
+                if _resolved_write_target_containment(embedded, agent) is None:
+                    return False
+            continue
+        # Only path words that point at a peer home / bridge anchor / v2 anchor
+        # are write-target candidates; a bare data word (`plain`) is not.
+        if not _carries_bridge_marker(tok):
+            continue
+        checked_any = True
+        contained = _resolved_write_target_containment(tok, agent)
+        if contained is None:
+            return False  # escape / forbidden tree / un-analyzable → fail closed
+        if contained[1]:
+            references_peer = True
+    return checked_any and references_peer
 
 
 def _admin_sqlite3_task_db_audit(text: str, agent: str) -> str | None:
@@ -7650,10 +7997,33 @@ def protected_alias_reason(
     if verb_deny is not None:
         return verb_deny
 
+    # Issue #1822 (codex re-review of PR #1838) — QUOTED-heredoc body data
+    # exclusion for the cross-agent gates below. When the command is the ONE
+    # provably-inert quoted-heredoc write shape (#1574's single `cat`/`tee`
+    # stage, quoted delimiter, terminator-last — see
+    # `_inert_heredoc_cross_agent_scan_text` for the full no-bypass
+    # argument), the heredoc body is pure literal DATA bash never expands and
+    # cat/tee never open as a path, so word-scanning it is a modeling error
+    # (the #1822 false-positive class: a doc-note body mentioning a bridge
+    # path / backtick code-span false-denied the whole command). The reduced
+    # surface keeps the ENTIRE command line — leader, flags, redirect target,
+    # file args — so a real cross-agent destination still denies; only the
+    # proven-data body (and the proven-inert opener token) is excluded. For
+    # every other command — unquoted/expanding delimiter, interpreter or pipe
+    # consumer, unbalanced marker, in-body delimiter line — this is None and
+    # the RAW text is scanned exactly as before (fail closed).
+    cross_scan = text
+    _inert_head = _inert_heredoc_cross_agent_scan_text(text)
+    if _inert_head is not None:
+        cross_scan = _inert_head
+
     # Issue #539 follow-up — Stage A: shared/private/ and shared/secrets/
     # are off-limits for every non-admin agent regardless of class.
     # Substring deny because the path can ride inside a heredoc body or
-    # a quoted blob the argv parser cannot surface as a clean token.
+    # a quoted blob the argv parser cannot surface as a clean token
+    # (`cross_scan` only ever differs from the raw text for the proven-inert
+    # quoted-heredoc DATA body above — every smuggle-capable body stays on
+    # the scan surface).
     #
     # Issue #1692 deliberately does NOT add an admin carve-out here. The
     # admin read-intent carve-out below covers PEER-HOME reads only; the
@@ -7668,7 +8038,7 @@ def protected_alias_reason(
     # check) — that over-permission is a separate follow-up, NOT the
     # parity target to copy into Bash.
     for forbidden_alias in _shared_forbidden_aliases():
-        if forbidden_alias in text:
+        if forbidden_alias in cross_scan:
             return (
                 "cross-agent access is blocked: shared/private and "
                 "shared/secrets are off-limits"
@@ -7687,8 +8057,23 @@ def protected_alias_reason(
     # secret/private subtrees stay off-limits for every Bash reader; the
     # admin asymmetry between Bash and the non-Bash `protected_path_reason`
     # Read path is tracked separately in #1711 and is NOT changed here).
-    shared_suffix_hit = _forbidden_suffix_in_command(text, _shared_forbidden_suffixes())
+    shared_suffix_hit = _forbidden_suffix_in_command(
+        cross_scan, _shared_forbidden_suffixes()
+    )
     if shared_suffix_hit is not None:
+        # Issue #1822 — distinguish a REAL Stage-A secrets/private suffix match
+        # from an OBFUSCATION fail-close. The fixed "shared/private and
+        # shared/secrets" wording is only accurate when the matcher actually
+        # resolved a path into one of those trees; when it returns the
+        # obfuscation sentinel (an un-analyzable glob / command-sub / surviving
+        # `$var` near a protected tree) the deny is a fail-close, not a proven
+        # secrets read, and the operator should be told that instead of being
+        # misdirected to a secrets path that may not exist.
+        if shared_suffix_hit == _OBFUSCATED_SUFFIX_SENTINEL:
+            return (
+                "cross-agent access is blocked: un-analyzable path expression "
+                f"near a protected tree {_obfuscation_sample(cross_scan)}"
+            )
         return (
             "cross-agent access is blocked: shared/private and "
             "shared/secrets are off-limits"
@@ -7847,29 +8232,116 @@ def protected_alias_reason(
     # explained by a clean argv token whose resolved Path satisfies
     # `_system_class_cross_agent_read_allowed`.
     peer_aliases = _peer_alias_list(agent)
-    matched_alias = next((a for a in peer_aliases if a in text), None)
+    matched_alias = next((a for a in peer_aliases if a in cross_scan), None)
 
     # Issue #1709 — prefix-spelling-agnostic Stage-B peer-home matcher. The
     # `_peer_alias_list` substring needles share the same brace/`$BRIDGE_HOME`
-    # gap as Stage-A: a non-admin (class=user) `cat
-    # ${HOME}/.agent-bridge/agents/<other>/MEMORY.md` matched NO alias and
-    # fell through to the `return None` ALLOW below. The suffix matcher
-    # (`/agents/<name>`) catches every prefix spelling and fail-closes on
-    # obfuscation. Scoped to NON-ADMIN only so admin Bash behavior is
-    # unchanged (the admin peer-read asymmetry between Bash and the non-Bash
-    # `protected_path_reason` Read path is #1711, out of scope here). A
-    # system-class agent that trips the suffix match still routes through
-    # the legitimate argv carve-out below (its brace-spelled path will fail
-    # the `_argv_occurrences_explain_text` proof and fail closed, which is
-    # the correct stance for an un-analyzable spelling).
-    if matched_alias is None and not admin:
+    # gap as Stage-A: a `cat ${HOME}/.agent-bridge/agents/<other>/MEMORY.md`
+    # matched NO alias and fell through to the `return None` ALLOW below. The
+    # suffix matcher (`/agents/<name>`) catches every prefix spelling and
+    # fail-closes on obfuscation.
+    #
+    # #1806 SPOOF GATE (regression fix, codex re-review of PR #1838): this match
+    # MUST run for admin too. The old `and not admin` scoping (added for the
+    # #1711 admin peer-READ Bash/non-Bash parity) left a SPOOFED-ADMIN peer
+    # WRITE bypass: a loose-admin (env-leg or SESSION-TYPE-leg, roster=non-admin)
+    # caller spelling the peer destination via `$BRIDGE_HOME`/`${BRIDGE_HOME}`
+    # matched NO `_peer_alias_list` alias, hit `matched_alias is None`, and
+    # returned ALLOW *before* the strict trusted_admin write leg could deny it
+    # (`printf x > $BRIDGE_HOME/agents/<peer>/MEMORY.md` ALLOWED while the
+    # absolute spelling DENIED). Running the suffix matcher for admin sets
+    # `matched_alias`, so the command routes through the admin carve-out legs
+    # below — and a `$BRIDGE_HOME`/brace spelling is an UNRESOLVED expansion, so
+    # BOTH the read leg and the write leg (each guarded by
+    # `not _has_unresolved_path_expansion(cross_scan)`) skip it and it DENIES
+    # (fail closed — the correct stance for an un-analyzable spelling, matching
+    # the non-admin path). A genuine admin peer access spelled absolutely / via
+    # `~`/`$HOME` already matched `_peer_alias_list` above, so its read carve-out
+    # / trusted write path is unchanged.
+    if matched_alias is None:
         peer_suffix_hit = _forbidden_suffix_in_command(
-            text, _peer_forbidden_suffixes(agent)
+            cross_scan, _peer_forbidden_suffixes(agent)
         )
         if peer_suffix_hit is not None:
             matched_alias = f"cross-agent home ({peer_suffix_hit})"
 
     if matched_alias is None:
+        return None
+
+    # Issue #1711 follow-up — admin Bash peer-home WRITE parity. The non-Bash
+    # `protected_path_reason` already lets an admin Read/Write a peer agent
+    # home (`if admin: return None`), and #1692 added the admin Bash peer-home
+    # READ carve-out above. But an admin Bash WRITE to a peer home (a routine
+    # admin maintenance op — e.g. appending a doc note to a peer's CLAUDE.md)
+    # still fell through to the Stage-B peer deny, leaving an asymmetry between
+    # the Bash and non-Bash tool surfaces for the SAME admin. This carve-out
+    # closes it for admin ONLY, with the same fail-closed guards the #1692 read
+    # carve-out uses: no unresolved path expansion ($VAR/~/brace) and no shell
+    # embedding (`$(…)` / backtick / heredoc-into-interpreter / proc-sub) may be
+    # present, so an embedded mutation or a var-spelled sibling cannot ride the
+    # allow. Stage A (`shared/private|secrets`) is NOT reached here — it denied
+    # above for every agent including admin (#1692), so this only ever grants a
+    # PEER-HOME access, never a shared-secret one. A `read|write` intent audit
+    # row is emitted for every grant so the operator keeps a full ledger.
+    # Non-admin behavior is completely unchanged (this branch is admin-gated).
+    # The guards run on `cross_scan`: for the ONE provably-inert quoted-heredoc
+    # write shape (#1574 / `_inert_heredoc_cross_agent_scan_text`) that is the
+    # command HEAD with the proven-DATA body and opener removed, so an admin
+    # doc-note `cat >> <peer>/CLAUDE.md <<'EOF' … `wiki path` … EOF` is
+    # eligible (the body is a literal bash never expands and cat/tee never
+    # open; the redirect target stays on the guard surface). For EVERY other
+    # command `cross_scan` IS the raw text and the embedding guard is the
+    # strict `_command_has_shell_embedding`: ANY `$(…)` / backtick / proc-sub
+    # / unquoted-or-unbalanced heredoc / interpreter-or-pipe-fed heredoc makes
+    # the command ineligible for the carve-out and DENIES (fail closed).
+    #
+    # #1806 SPOOF GATE (regression fix): the WRITE leg of this carve-out is a
+    # cross-agent peer-home MUTATION, so — per #1806's invariant that every new
+    # peer-WRITE loosening gates on the STRICT, anti-spoof `trusted_admin`
+    # predicate, never on the spoofable `admin` OR-leg — a write only rides
+    # this allow when `trusted_admin` holds. A spoofer that exports
+    # `BRIDGE_ADMIN_AGENT_ID=<self>` and writes `session type: admin` into its
+    # own home flips loose `admin` True but NOT `trusted_admin` (the controller
+    # roster disagrees), so its peer `mkdir`/write stays DENIED. The READ leg
+    # keeps the looser `admin` gate — reads are lower risk and that is the
+    # pre-existing #1692 peer-read parity, unchanged here.
+    if (
+        read_intent
+        and admin
+        and not _has_unresolved_path_expansion(cross_scan)
+        and not _command_has_shell_embedding(cross_scan)
+    ):
+        _emit_admin_cross_agent_access_allowed(
+            agent,
+            target=matched_alias,
+            intent="read",
+            sample=text,
+            tool_input=tool_input,
+        )
+        return None
+    # The WRITE leg deliberately does NOT pre-gate on
+    # `_has_unresolved_path_expansion`: a trusted-admin peer-home write may be
+    # spelled with a v2-anchor env var (`$BRIDGE_DATA_ROOT`/`$BRIDGE_HOME`,
+    # issue #1823) that `_admin_peer_write_targets_all_contained` RESOLVES to a
+    # concrete contained peer path (and audits). That helper is the resolved-
+    # path proof: it fails closed on ANY token it cannot reduce to a contained
+    # literal (an unresolved `$VAR`, a `..`/symlink escape, a forbidden tree, an
+    # in-program redirect escape), so an un-analyzable spelling still DENIES.
+    # The spoofed-admin `$BRIDGE_HOME` peer-write bypass is closed by the
+    # `trusted_admin` gate here, NOT by an expansion pre-check.
+    if (
+        not read_intent
+        and trusted_admin
+        and not _command_has_shell_embedding(cross_scan)
+        and _admin_peer_write_targets_all_contained(cross_scan, agent)
+    ):
+        _emit_admin_cross_agent_access_allowed(
+            agent,
+            target=matched_alias,
+            intent="write",
+            sample=text,
+            tool_input=tool_input,
+        )
         return None
 
     if not (read_intent and current_agent_class() == "system"):
