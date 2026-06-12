@@ -123,6 +123,78 @@ _kappa_snapshot_source() {
   cp "$REPO_ROOT/$rel" "$dest" || smoke_fail "could not snapshot $rel -> $dest"
 }
 
+# ---------------------------------------------------------------------
+# T1.c-class flake root cause (CI false-red, e.g. PR #1847 run
+# 27401135893): this smoke runs under `set -o pipefail`, and the
+# original assertions used the shape
+#
+#     awk '<function range>' file | grep -qF 'needle'
+#
+# `grep -q` exits 0 at the FIRST match and closes the read end of the
+# pipe. The snapshot-writer body is 4412 bytes with the needle at byte
+# 3508 — past one 4096-byte stdio buffer — so awk emits it in two
+# writes. When the runner deschedules awk between those writes (loaded
+# CI box), grep matches in write 1 and exits before write 2; awk's
+# second write then dies with SIGPIPE (rc 141), `pipefail` propagates
+# 141 as the pipeline status even though grep matched, and the leading
+# `!` turns a successful match into a false-red. Verified mechanically:
+# an identical producer (4096B chunk containing the needle + delayed
+# tail) yields pipeline rc=141 with PIPESTATUS producer=141/grep=0.
+# The failing CI runs had `lib/bridge-state.sh` byte-identical to a
+# passing main — content was never the problem; the pipe race was.
+#
+# Fix shape used below: extract the function body to a FILE (plain
+# redirect, no pipe), then `grep -q` the file. No pipeline → no
+# SIGPIPE → deterministic. T1.d (3403B) / T8.a (3857B) sit one
+# refactor away from the same >4096B cliff, so they get the same
+# treatment. Single-short-line `printf | grep -q` sites (T4 gate
+# line) are not raceable — the producer's only write necessarily
+# precedes grep's exit — and are left as-is.
+# ---------------------------------------------------------------------
+
+# Extract a shell function body by NAME from a (hermetic snapshot) source
+# file, anchored on structural brace depth rather than a textual line
+# window. Prints the function block (header line through its matching close
+# brace) to stdout — call sites MUST redirect to a file and grep the file
+# (see flake root-cause block above; piping this into `grep -q` under
+# pipefail re-opens the SIGPIPE false-red).
+#
+# Why not `awk '/^name\(\) \{/,/^\}/'`: that range stops at the FIRST line
+# whose first char is `}`. It happens to work today, but it is a fragile
+# textual window — a future refactor that places any `}`-leading line inside
+# the body (a nested close brace at col 0, a heredoc terminator, a brace
+# group) silently truncates the range and the call-site grep then false-reds.
+# Brace-depth tracking instead follows the real nesting: it opens on
+# `name() {`, accumulates the net `{`/`}` balance per line, and stops
+# exactly when depth returns to 0. Balanced `${param}` expansions net to
+# zero per line so they do not perturb the count. The result is
+# deterministic regardless of where the body's braces sit on the line.
+_kappa_extract_func_body() {
+  local fn="$1" src="$2"
+  awk -v fn="$fn" '
+    BEGIN { want = fn "() {"; infn = 0; depth = 0 }
+    {
+      if (!infn) {
+        if (index($0, want) == 1) { infn = 1; depth = 0 }
+        else next
+      }
+      print
+      depth += gsub(/\{/, "{") - gsub(/\}/, "}")
+      if (depth <= 0) exit
+    }
+  ' "$src"
+}
+
+# File-based wrapper: extract FUNC from SRC into DEST and fail loudly if
+# the extraction came back empty (function vanished / unparseable) —
+# an empty body must never let a `! grep -q` assertion pass vacuously.
+_kappa_extract_func_body_file() {
+  local fn="$1" src="$2" dest="$3"
+  _kappa_extract_func_body "$fn" "$src" >"$dest"
+  [[ -s "$dest" ]] \
+    || smoke_fail "could not extract ${fn}() body from $src (empty extraction)"
+}
+
 STATE_LIB="$SNAP_DIR/bridge-state.sh"
 AGENT_LIB="$SNAP_DIR/bridge-agent.sh"
 DAEMON_LIB="$SNAP_DIR/bridge-daemon.sh"
@@ -163,23 +235,34 @@ fi
 # T1.c — snapshot writer in lib/bridge-state.sh calls the predicate
 # inside the "no prompt" branch (the only place activity_state can
 # transition into picker_blocked from working/starting).
-if ! grep -nF 'bridge_agent_picker_blocked' "$STATE_LIB" \
-      | grep -F 'bridge_write_roster_status_snapshot' >/dev/null \
-      && ! awk '/^bridge_write_roster_status_snapshot\(\) \{/,/^\}/' "$STATE_LIB" \
-      | grep -qF 'bridge_agent_picker_blocked'; then
+#
+# Extract the EXACT function body via brace-depth into a file and grep
+# the FILE (no pipeline — see the flake root-cause block above; the
+# original `awk range | grep -q` shape false-redded under pipefail when
+# grep's early exit SIGPIPE'd awk). This also retires (1) a
+# `grep picker_blocked | grep snapshot` pipeline that only ever matched
+# a line mentioning BOTH names — dead logic that asserted nothing — and
+# (2) the `awk '/start/,/^\}/'` textual range whose first-`}` stop is a
+# truncation hazard. Empty extraction fails LOUDLY inside the wrapper.
+_kappa_extract_func_body_file 'bridge_write_roster_status_snapshot' "$STATE_LIB" \
+  "$SMOKE_TMP_ROOT/t1c-snapshot-writer.body"
+if ! grep -qF 'bridge_agent_picker_blocked' "$SMOKE_TMP_ROOT/t1c-snapshot-writer.body"; then
   smoke_fail "T1.c: bridge_write_roster_status_snapshot does not call bridge_agent_picker_blocked"
 fi
 
 # T1.d — bridge_agent_activity_state in bridge-agent.sh calls the
-# predicate.
-if ! awk '/^bridge_agent_activity_state\(\) \{/,/^\}/' "$AGENT_LIB" \
-      | grep -qF 'bridge_agent_picker_blocked'; then
+# predicate. Same file-based shape as T1.c (body is 3403 bytes — one
+# refactor away from the >4096B two-write pipe race).
+_kappa_extract_func_body_file 'bridge_agent_activity_state' "$AGENT_LIB" \
+  "$SMOKE_TMP_ROOT/t1d-activity-state.body"
+if ! grep -qF 'bridge_agent_picker_blocked' "$SMOKE_TMP_ROOT/t1d-activity-state.body"; then
   smoke_fail "T1.d: bridge_agent_activity_state does not call bridge_agent_picker_blocked"
 fi
 
 # T1.e — heartbeat path in bridge-daemon.sh calls the predicate.
-if ! awk '/^bridge_agent_heartbeat_activity_state\(\) \{/,/^\}/' "$DAEMON_LIB" \
-      | grep -qF 'bridge_agent_picker_blocked'; then
+_kappa_extract_func_body_file 'bridge_agent_heartbeat_activity_state' "$DAEMON_LIB" \
+  "$SMOKE_TMP_ROOT/t1e-heartbeat.body"
+if ! grep -qF 'bridge_agent_picker_blocked' "$SMOKE_TMP_ROOT/t1e-heartbeat.body"; then
   smoke_fail "T1.e: bridge_agent_heartbeat_activity_state does not call bridge_agent_picker_blocked"
 fi
 
@@ -393,11 +476,16 @@ awk '
   { print }
 ' "$T5_LIB" >"$SMOKE_TMP_ROOT/state-lib.t5.reverted.sh"
 
-# Now re-run the T1.c assertion against the reverted file. It MUST
-# fail (i.e., grep returns non-zero). If the assertion still passes,
-# the teeth check is broken.
-if awk '/^bridge_write_roster_status_snapshot\(\) \{/,/^\}/' "$SMOKE_TMP_ROOT/state-lib.t5.reverted.sh" \
-      | grep -qF 'bridge_agent_picker_blocked'; then
+# Now re-run the T1.c assertion against the reverted file using the SAME
+# robust extractor + file-based grep T1.c uses, so the teeth test proves
+# the real check (not a divergent textual range) catches the regression.
+# The wrapper's non-empty check also keeps the teeth honest: if the revert
+# mangled the function so badly the extraction came back empty, that is a
+# broken-teeth failure, not a vacuous pass. The extracted body MUST NOT
+# contain the predicate call anymore.
+_kappa_extract_func_body_file 'bridge_write_roster_status_snapshot' \
+  "$SMOKE_TMP_ROOT/state-lib.t5.reverted.sh" "$SMOKE_TMP_ROOT/t5-reverted.body"
+if grep -qF 'bridge_agent_picker_blocked' "$SMOKE_TMP_ROOT/t5-reverted.body"; then
   smoke_fail "T5: teeth revert failed — picker_blocked branch still present in reverted snapshot writer"
 fi
 
@@ -460,12 +548,14 @@ smoke_log "T7 PASS — teeth proves T4.a would catch the reconcile parity regres
 smoke_log "T8 (PR #1345 r2 BLOCKING): snapshot activity_state + queue.py picker_blocked exclude"
 
 # T8.a — static asserts on the snapshot writer + queue.py reader.
-if ! awk '/^bridge_write_agent_snapshot\(\) \{/,/^\}/' "$STATE_LIB" \
-      | grep -qE '\\tactivity_state"'; then
+# File-based extraction (body is 3857 bytes — see flake root-cause
+# block; `awk range | grep -q` under pipefail is the T1.c false-red).
+_kappa_extract_func_body_file 'bridge_write_agent_snapshot' "$STATE_LIB" \
+  "$SMOKE_TMP_ROOT/t8a-agent-snapshot.body"
+if ! grep -qE '\\tactivity_state"' "$SMOKE_TMP_ROOT/t8a-agent-snapshot.body"; then
   smoke_fail "T8.a: bridge_write_agent_snapshot header missing activity_state column (#1345 r2)"
 fi
-if ! awk '/^bridge_write_agent_snapshot\(\) \{/,/^\}/' "$STATE_LIB" \
-      | grep -qF 'bridge_agent_picker_blocked'; then
+if ! grep -qF 'bridge_agent_picker_blocked' "$SMOKE_TMP_ROOT/t8a-agent-snapshot.body"; then
   smoke_fail "T8.a: bridge_write_agent_snapshot does not call bridge_agent_picker_blocked (#1345 r2)"
 fi
 # $QUEUE_PY is the immutable snapshot frozen at smoke start (#1509).
