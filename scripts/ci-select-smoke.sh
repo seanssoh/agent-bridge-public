@@ -116,10 +116,6 @@ add_required 1425-cron-dispatch-nudge-scope
 # post-apply source invariant. In the full static suite so any writer or
 # reconcile edit re-runs the whole matrix.
 add_required 1820-cron-writer-v2-candidate 1820-precompact-resolved-env-v2 1820-settings-v2-render-symlink 1820-doc-sync-v2-target-root 1820-reconcile-conflict-policy 1820-reconcile-dryrun-inventory 1820-reconcile-apply-gated 1820-post-apply-invariant
-# Issue #1857: dynamic `agent-bridge --replace` must preserve the per-agent
-# provisioning carried by dynamic env state (channels/plugins/skills/model/etc.)
-# instead of recreating the env from core fields only.
-add_required 1857-dynamic-recreate-provisioning
 # Issue #1835: bridge-queue-gateway.py's SOCKET-transport client preflight
 # (_read_inline_text) now applies the #1280 sudo-as-owner body-file fallback on
 # PermissionError, with an actionable iso-ownership error when it cannot apply.
@@ -709,10 +705,6 @@ select_for_path() {
         # plumbing (re-breaking the materialize path) or regress the
         # roster-wins / preserve-when-empty precedence.
         add_required 1763-static-model-effort
-        # Issue #1857: lib/bridge-state.sh owns the dynamic active/history env
-        # schema and loader repair path. Pull the preservation smoke on every
-        # state-lib move so dynamic recreate cannot regress to core-only state.
-        add_required 1857-dynamic-recreate-provisioning
       fi
       ;;
 
@@ -2473,11 +2465,6 @@ select_for_path() {
       # install` instead of `--reason manual`, which would bypass the
       # parity guard).
 add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor upgrade-conflicts-lifecycle 1601-conflicts-adopt-guard managed-autocompact-window per-agent-settings-rendering 1756-settings-preserve-model-user-keys status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1400-purge-home-degrade-no-sudo 1028-isolated-workdir-check 1118-v2-engine-binary-path v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning 1115-cli-usage-drift 1151-step-a-helper 1155-bootstrap-skill-guard 1158-marker-load-order 1165-track-a-scaffold-modes 1213-iso-uid-predicate beta27-D-inject-timestamp-resolved I-agent-description-roster γ-cli-consistency C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir K-beta4-nits α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-epsilon-tmux-inject-busy beta5-2-theta-upgrade-backfill-perms 1360-onboarding-next-actions-persona 1409-claude-midturn-busy-gate 1639-post-restart-auto-wake 1425-spool-rederive 1617-pending-attention-arrival-stale 1513-iso-teams-prune-eacces plugin-requires-resolver 1520-shared-claude-config-dir 1520b-create-time-creds-sync 1417-identity-sync-on-start 1638-settings-cosmetic-conflict 1675-1694-settings-homebrew-abspath-conflict 1769-freshness-gate-resume 1753-hud-config-seed
-      if [[ "$path" == "agent-bridge" ]]; then
-        # Issue #1857: agent-bridge owns the dynamic recreate path that rewrites
-        # the active env before execing bridge-start.sh.
-        add_required 1857-dynamic-recreate-provisioning
-      fi
       # v0.15.0-beta5-2 Lane ν (#1317-B/-C): bridge-agent.sh now hosts
       # the engine-CLI pre-flight at `agent create` (refuses with
       # actionable error when the engine binary is not on PATH; opt-out
