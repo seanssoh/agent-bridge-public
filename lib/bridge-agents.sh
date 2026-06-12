@@ -9109,6 +9109,118 @@ bridge_agent_restart_dynamic_unsupported_guidance() {
   printf "\nRecreate it with the supported flow:\n  %s" "$(bridge_agent_restart_dynamic_recreate_hint "$agent")"
 }
 
+# Issue #1853 — self-restart detection (shared mode).
+#
+# `agent restart <self>` invoked from INSIDE the target session's process
+# tree (the agent's own Claude session, or a background child it spawned)
+# saws off its own branch: bridge_kill_agent_session takes down the whole
+# tmux session — including the process running run_restart — so the relaunch
+# leg never fires. The agent stays down until the daemon's always-on ensure
+# revives it FRESH (no trusted-resume marker consumed, continuity lost).
+#
+# The iso-v2 case (caller runs as the agent's dedicated linux user) is
+# handled separately in run_restart with a fail-closed die, because a
+# detached re-exec cannot cross the linux-user boundary back to a
+# controller. This predicate covers the SHARED-mode case the iso guard does
+# not: the caller shares the controller UID but lives inside the doomed
+# session/tree. Two independent signals (either is sufficient):
+#
+#   1. BRIDGE_AGENT_ID == <agent>. The env var the agent's session (and any
+#      child that inherits its environment) carries. This catches the issue
+#      trace: a `sleep 60 && agent restart <self>` background child of the
+#      session inherits BRIDGE_AGENT_ID.
+#   2. tmux ancestry: we are running inside tmux ($TMUX set) and the pane's
+#      session name equals the target session. This catches a child spawned
+#      without BRIDGE_AGENT_ID that still lives in the session's pane tree.
+#
+# Returns 0 when this process would kill itself by restarting <agent>.
+# The detached worker (BRIDGE_RESTART_DETACHED=1) is explicitly NOT self —
+# it has already escaped the doomed tree via setsid, so it must complete the
+# normal kill→relaunch sequence.
+bridge_agent_restart_is_self() {
+  local agent="$1"
+  local session="${2:-}"
+
+  [[ -n "$agent" ]] || return 1
+  [[ "${BRIDGE_RESTART_DETACHED:-0}" == "1" ]] && return 1
+
+  if [[ "${BRIDGE_AGENT_ID:-}" == "$agent" ]]; then
+    return 0
+  fi
+
+  if [[ -n "${TMUX:-}" && -n "$session" ]]; then
+    local current_session=""
+    current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null || true)"
+    if [[ -n "$current_session" && "$current_session" == "$session" ]]; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+# Issue #1853 — re-exec the restart detached so it survives the self-kill.
+#
+# Spawns a fresh `bridge-agent.sh restart <agent> [args...]` that is fully
+# detached from this process tree (setsid when available, else nohup) with
+# BRIDGE_RESTART_DETACHED=1 set so the survivor: (a) skips the self-restart
+# predicate above and runs the normal marker→kill→relaunch sequence, and
+# (b) cannot recursively re-detach. stdin/stdout/stderr are redirected to a
+# log under the agent's restart state dir so the kill of the parent session
+# cannot SIGHUP/EOF the survivor through a shared terminal.
+#
+# Returns 0 if the detached worker was launched (caller should then exit 0 —
+# the survivor owns the restart), 1 if no detach tool is available (caller
+# must fail closed with the delegation hint).
+bridge_agent_restart_relaunch_detached() {
+  local agent="$1"
+  shift || true
+
+  local script_dir="${SCRIPT_DIR:-}"
+  [[ -n "$script_dir" ]] || return 1
+  local bash_bin="${BRIDGE_BASH_BIN:-bash}"
+
+  local log_dir=""
+  log_dir="$(bridge_agent_restart_state_dir "$agent" 2>/dev/null || true)"
+  [[ -n "$log_dir" ]] || log_dir="${BRIDGE_HOME:-$HOME/.agent-bridge}/state/agents/$agent"
+  mkdir -p "$log_dir" 2>/dev/null || true
+  local log_file="$log_dir/restart.detached.log"
+
+  local setsid_bin=""
+  setsid_bin="$(command -v setsid 2>/dev/null || true)"
+
+  if [[ -n "$setsid_bin" ]]; then
+    BRIDGE_RESTART_DETACHED=1 "$setsid_bin" "$bash_bin" \
+      "$script_dir/bridge-agent.sh" restart "$agent" "$@" \
+      </dev/null >"$log_file" 2>&1 &
+    disown 2>/dev/null || true
+    return 0
+  fi
+
+  if command -v nohup >/dev/null 2>&1; then
+    BRIDGE_RESTART_DETACHED=1 nohup "$bash_bin" \
+      "$script_dir/bridge-agent.sh" restart "$agent" "$@" \
+      </dev/null >"$log_file" 2>&1 &
+    disown 2>/dev/null || true
+    return 0
+  fi
+
+  return 1
+}
+
+# Issue #1853 — fail-closed guidance when a self-restart is detected but no
+# detach tool (setsid/nohup) is available to survive the self-kill. The
+# running session is left intact; the operator/agent is pointed at the
+# supported out-of-band path (have a controller/admin agent run the restart,
+# or queue it) so the kill→relaunch never runs from inside the doomed tree.
+bridge_agent_restart_self_unsupported_guidance() {
+  local agent="$1"
+
+  printf "Restart of '%s' from inside its own session is unsafe on this host: the kill would take down the process running the restart before the relaunch, and no detach tool (setsid/nohup) is available to survive it." "$agent"
+  printf "\nThe running session was left intact."
+  printf "\nRun the restart from OUTSIDE the session instead — from a controller/admin shell or another agent:\n  agent-bridge agent restart %s" "$agent"
+}
+
 # --------------------------------------------------------------------------
 # Issue #1251 — restart marker + snapshot + auto-rollback (v0.15.0-beta3
 # Track C1). The marker file under `state/agents/<a>/restart.in-progress`
