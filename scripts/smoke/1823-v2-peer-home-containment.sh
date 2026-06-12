@@ -77,6 +77,24 @@
 #  Tooth 16 — (r4) NO over-block: a NON-anchor `${BRIDGE_DATA_ROOTX:-x}` (NAME is a
 #             PREFIX of a real anchor) → ALLOW, and a real anchor operator form
 #             whose tail names the peer WORKDIR (scoped out, #1492) → ALLOW.
+#  Tooth 17 — (r5) TRUSTED-ADMIN peer-v2-home write spelled through the EXPORTED
+#             v2 env-var anchor (`$BRIDGE_DATA_ROOT`, `${BRIDGE_AGENT_ROOT_V2}`)
+#             AND the PARAMETER-EXPANSION OPERATOR form (`${BRIDGE_DATA_ROOT:-x}`)
+#             → ALLOWED **and EACH emits EXACTLY ONE `admin_cross_agent_write`
+#             audit row** (correct target_agent), on SPLIT-ROOT and CO-LOCATED.
+#             Tooth 10/15 already proved these spellings ALLOW, but they used the
+#             unpinned `verdict()` path so they never checked the audit ledger —
+#             which was the r5 gap: the admin write-AUDIT containment handed the
+#             raw `$VAR`/`${...}` word to `_resolve_word_through_symlinks` (None on
+#             any expansion), so the audit branch never fired and the write fell
+#             through to an UNAUDITED allow. r3 audited only the LITERAL/absolute
+#             admin write. The r5 fix expands the SAME v2-anchor spellings the deny
+#             path recognizes (reusing `_v2_anchor_operator_token` +
+#             `_expand_bridge_prefixes`) before resolving, so the resolved peer v2
+#             home is recognized and the row fires. Cumulative-count proof: on the
+#             pre-r5 head three env-var/operator admin writes emit ONE row total
+#             (only an absolute baseline write audits); after r5 each spelling adds
+#             a row (THREE total). The audit assertions FAIL pre-r5, PASS after.
 #
 # The strict admin predicate reads the controller roster via `agent list
 # --json`; the smoke injects a deterministic roster snapshot through the
@@ -549,6 +567,101 @@ assert_bash "Tooth16 non-admin \${BRIDGE_DATA_ROOT:-x} peer WORKDIR tail ALLOWED
 assert_bash "Tooth16 non-admin \${BRIDGE_AGENT_ROOT_V2:+x} peer WORKDIR tail ALLOWED (scoped out)" \
   "$ACTOR_AGENT" "$ADMIN_AGENT" \
   'echo x >> ${BRIDGE_AGENT_ROOT_V2:+known}/'"$PEER_AGENT"'/workdir/NOTES.md' "ALLOW"
+
+# ---------------------------------------------------------------------------
+# Tooth 17 (r5) — TRUSTED-ADMIN peer-v2-home write via the EXPORTED v2 env-var
+# anchors AND the parameter-expansion OPERATOR form → ALLOW **and EACH emits
+# EXACTLY ONE `admin_cross_agent_write` audit row** (correct target_agent), on
+# SPLIT-ROOT and CO-LOCATED. This is the audit half of Tooth 10/15: those proved
+# the spellings ALLOW but used the unpinned verdict() path, so they never checked
+# the ledger — the r5 gap. The write must be a recognized peer-write SHAPE that
+# reaches the audit branch (mkdir / mv / cp / rmdir); `echo >>` carries a `>`
+# redirect and is NOT a peer-write op, so it allows via a different path and is
+# never audited (which is why Tooth 10/15 could not catch the gap). We use mkdir.
+#
+# The `$`/`{` are single-quoted so the LITERAL anchor token reaches the hook; the
+# hook expands it the SAME way the deny path does. Cumulative count over ONE fresh
+# audit log: a baseline ABSOLUTE write (audits, r3) → 1, then the three anchor
+# spellings each add a row → 3 total. On the pre-r5 head the three anchor writes
+# all fall through UNAUDITED, so the count stalls at 1 — this assertion FAILS
+# pre-r5 and PASSES after. (We assert the post-anchor cumulative directly: 3.)
+#
+#   write 1  $BRIDGE_DATA_ROOT/agents/<peer>/home          bare anchor
+#   write 2  ${BRIDGE_AGENT_ROOT_V2}/<peer>/home           brace anchor (other depth)
+#   write 3  ${BRIDGE_DATA_ROOT:-/tmp/x}/agents/<peer>/home operator (use-default)
+# The CO-LOCATED block additionally exercises the `$BRIDGE_HOME` parity spelling
+# (`$BRIDGE_HOME/data/agents/<peer>/home`) the r5 fix also audits, for FOUR rows.
+# ---------------------------------------------------------------------------
+run_admin_mkdir_audit() {
+  # $1 audit log, $2 command (LITERAL anchor token, single-quoted by caller).
+  local audit_log="$1" cmd="$2" out payload
+  payload="$SMOKE_TMP_ROOT/payload-r5-$RANDOM-$RANDOM.json"
+  write_payload "$payload" "Bash" "command" "$cmd"
+  out="$(run_hook_audit "$audit_log" "$ADMIN_AGENT" "$ADMIN_AGENT" "$payload")"
+  [[ "$out" == *'"permissionDecision": "deny"'* ]] && printf 'DENY' || printf 'ALLOW'
+}
+
+# --- split-root (default layout) ---
+AUDIT_R5_SPLIT="$SMOKE_TMP_ROOT/audit-r5-split.jsonl"
+: >"$AUDIT_R5_SPLIT"
+for spec in \
+  "bare \$BRIDGE_DATA_ROOT|"'mkdir -p $BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/home/r5_a' \
+  "brace \${BRIDGE_AGENT_ROOT_V2}|"'mkdir -p ${BRIDGE_AGENT_ROOT_V2}/'"$PEER_AGENT"'/home/r5_b' \
+  "operator \${BRIDGE_DATA_ROOT:-x}|"'mkdir -p ${BRIDGE_DATA_ROOT:-/tmp/harmless}/agents/'"$PEER_AGENT"'/home/r5_c' \
+; do
+  label="${spec%%|*}"; cmd="${spec#*|}"
+  got="$(run_admin_mkdir_audit "$AUDIT_R5_SPLIT" "$cmd")"
+  if [[ "$got" != "ALLOW" ]]; then
+    smoke_fail "Tooth17 split-root admin anchor write ($label) should ALLOW, got $got"
+  fi
+  smoke_log "ok: Tooth17 split-root admin anchor write ($label) -> ALLOW"
+done
+# Each of the 3 anchor spellings emitted exactly one row → 3 total. Pre-r5 = 1
+# (the bare/brace/operator writes were unaudited); post-r5 = 3.
+assert_audit_rows "Tooth17 split-root admin anchor writes emit 3 audit rows (1/spelling)" \
+  "$AUDIT_R5_SPLIT" "$PEER_AGENT" "3"
+
+# --- co-located control (reuses the Tooth 12 CO_* layout) ---
+AUDIT_R5_CO="$SMOKE_TMP_ROOT/audit-r5-colocated.jsonl"
+: >"$AUDIT_R5_CO"
+run_co_admin_mkdir_audit() {
+  # $1 command (LITERAL anchor token). Runs under the co-located env overrides.
+  local cmd="$1" out payload
+  payload="$SMOKE_TMP_ROOT/payload-r5co-$RANDOM-$RANDOM.json"
+  write_payload "$payload" "Bash" "command" "$cmd"
+  out="$(env \
+    HOME="$CO_FAKE_HOME" \
+    BRIDGE_AGENT_ID="$ADMIN_AGENT" \
+    BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
+    BRIDGE_GUARD_ADMIN_ROSTER_JSON="$ROSTER_JSON" \
+    BRIDGE_AUDIT_LOG="$AUDIT_R5_CO" \
+    BRIDGE_HOME="$CO_HOME" \
+    BRIDGE_AGENT_HOME_ROOT="$CO_HOME/agents" \
+    BRIDGE_SHARED_DIR="$CO_HOME/shared" \
+    BRIDGE_DATA_ROOT="$CO_DATA" \
+    BRIDGE_AGENT_ROOT_V2="$CO_AGENT_ROOT_V2" \
+    "$PYTHON_BIN" "$REAL_HOOK" <"$payload")"
+  [[ "$out" == *'"permissionDecision": "deny"'* ]] && printf 'DENY' || printf 'ALLOW'
+}
+# On the co-located layout `$BRIDGE_DATA_ROOT == $BRIDGE_HOME/data`, so a peer v2
+# home is also reachable as `$BRIDGE_HOME/data/agents/<peer>/home` — the
+# `$BRIDGE_HOME` parity spelling the r5 fix also audits (bare + brace). FOUR
+# spellings → 4 rows total. Pre-r5 every one of these falls through UNAUDITED.
+for spec in \
+  "bare \$BRIDGE_DATA_ROOT|"'mkdir -p $BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/home/r5co_a' \
+  "brace \${BRIDGE_AGENT_ROOT_V2}|"'mkdir -p ${BRIDGE_AGENT_ROOT_V2}/'"$PEER_AGENT"'/home/r5co_b' \
+  "operator \${BRIDGE_DATA_ROOT:-x}|"'mkdir -p ${BRIDGE_DATA_ROOT:-/tmp/harmless}/agents/'"$PEER_AGENT"'/home/r5co_c' \
+  "parity \$BRIDGE_HOME|"'mkdir -p $BRIDGE_HOME/data/agents/'"$PEER_AGENT"'/home/r5co_d' \
+; do
+  label="${spec%%|*}"; cmd="${spec#*|}"
+  got="$(run_co_admin_mkdir_audit "$cmd")"
+  if [[ "$got" != "ALLOW" ]]; then
+    smoke_fail "Tooth17 co-located admin anchor write ($label) should ALLOW, got $got"
+  fi
+  smoke_log "ok: Tooth17 co-located admin anchor write ($label) -> ALLOW"
+done
+assert_audit_rows "Tooth17 co-located admin anchor writes emit 4 audit rows (1/spelling)" \
+  "$AUDIT_R5_CO" "$PEER_AGENT" "4"
 
 smoke_log "passed"
 echo "[smoke:${SMOKE_NAME}] passed"

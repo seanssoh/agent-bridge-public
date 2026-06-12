@@ -3384,6 +3384,81 @@ def _word_carries_unresolved_v2_anchor(word: str) -> bool:
     return False
 
 
+def _expand_v2_anchor_leading_word(word: str) -> str | None:
+    """Resolve a *word* that BEGINS with a trusted v2 location anchor — in any
+    spelling the deny path recognizes — to a concrete absolute literal, or
+    ``None`` when *word* is not a leading-v2-anchor word this hook can resolve.
+
+    Issue #1823 (r5) CONSOLIDATION. The non-admin DENY path already recognizes
+    every v2-anchor spelling — bare ``$BRIDGE_DATA_ROOT/…``, brace
+    ``${BRIDGE_DATA_ROOT}/…``, and the Bash parameter-expansion OPERATOR forms
+    ``${BRIDGE_DATA_ROOT:-x}/…`` / ``${BRIDGE_AGENT_ROOT_V2-x}/…`` — via
+    ``_v2_anchor_operator_token`` + ``_expand_bridge_prefixes``. The admin
+    write-AUDIT path, by contrast, handed the raw word straight to
+    ``_resolve_word_through_symlinks``, which fails closed on ANY ``$``/``${``
+    word, so a trusted-admin peer-v2-home write spelled with an anchor env var
+    emitted NO ``admin_cross_agent_write`` row (it fell through to an UNAUDITED
+    allow). This helper REUSES the deny path's anchor recognition so the audit
+    path resolves the SAME spellings to a concrete literal the symlink resolver
+    can model — no second copy of the recognition logic.
+
+    Resolution mirrors the deny path's ``_unresolved_v2_anchor_forbidden_suffix``:
+
+      - The OPERATOR form is recovered with ``_v2_anchor_operator_token`` — the
+        operator/default text inside ``${…}`` does not change which tree bash
+        writes to when the anchor env var is set (it always is for a v2 agent),
+        so the literal tail after the matching ``}`` decides the path. The
+        recovered anchor NAME is resolved to its absolute value via
+        ``_v2_anchor_value`` and the tail re-rooted under it (the
+        ``$BRIDGE_AGENT_ROOT_V2`` anchor already IS ``<data_root>/agents``).
+      - The bare / brace forms are resolved by ``_expand_bridge_prefixes`` (the
+        same SSOT the deny path uses).
+
+    Returns ``None`` (caller keeps the prior fail-closed behavior) when: the
+    word carries no leading v2 anchor; the operator-form tail carries a second
+    unresolved ``$`` (undecidable); or the anchor cannot be resolved in this
+    hook's env (``agent_root_v2()`` unset — a legacy install with no v2 root,
+    so there is no peer v2 home to audit). For the ADMIN write path an
+    unresolved anchor means "no concrete target to audit" → the caller keeps
+    its existing literal-only handling (allow without a v2-anchor audit row),
+    matching r3's treatment of an unresolved-literal admin write — it never
+    DENIES the admin write (that is the non-admin path's job).
+    """
+    # OPERATOR form first (`${NAME:-x}` / `${NAME-x}` / `${NAME:+x}` / `${NAME:0}` …):
+    # recover the anchor NAME + literal tail after the matching `}`.
+    op_token = _v2_anchor_operator_token(word)
+    if op_token is not None:
+        name, tail = op_token
+        if "$" in tail:
+            return None  # a second unresolved expansion in the tail — undecidable
+        value = _v2_anchor_value(name)
+        if not value:
+            return None  # anchor unresolvable in this hook env → no concrete target
+        # Re-root the tail under the resolved anchor value. Mirror the deny path:
+        # the tail is the literal path UNDER the anchor; join with a single sep.
+        return value.rstrip("/") + "/" + tail.lstrip("/") if tail else value
+    # Bare / brace form: only treat it as a trusted-anchor word when an anchor
+    # token actually LEADS the word, so a benign `$OTHER` is left for the caller.
+    # `BRIDGE_HOME` is included for parity (the brief): `_expand_bridge_prefixes`
+    # already resolves it, and a co-located peer v2 home spelled
+    # `$BRIDGE_HOME/data/agents/<peer>/home/...` must audit the same as the v2
+    # anchors. A non-anchor `${BRIDGE_HOMEX:-…}` is excluded by the
+    # identifier-boundary guards below (same as the deny path).
+    leads_anchor = False
+    for name in (*_V2_ANCHOR_NAMES, "BRIDGE_HOME"):
+        if word.startswith("${" + name + "}") or re.match(
+            rf"\${name}(?![A-Za-z0-9_])", word
+        ):
+            leads_anchor = True
+            break
+    if not leads_anchor:
+        return None
+    expanded = _expand_bridge_prefixes(word)
+    if "$" in expanded:
+        return None  # anchor unresolvable in this hook env, or a second unresolved var
+    return expanded
+
+
 # Non-forking cd wrappers: `command`/`builtin` (each with its own option
 # grammar) and the `time` reserved word all leave the `cd` running in THIS
 # shell, so they change the cwd. `nice`/`nohup`/`env`/subshell fork, so they do
@@ -6908,19 +6983,51 @@ def _resolved_write_target_containment(target_word: str, agent: str) -> tuple[st
 
       - the word carries an unresolved expansion / glob / command-sub the
         analyzer cannot reduce to a literal — a hidden target is never a safe
-        write carve-out (fail closed);
+        write carve-out (fail closed) — EXCEPT a leading trusted v2-anchor
+        spelling (see below), which is resolved rather than denied;
       - the resolved target (or, for a not-yet-existing target, its deepest
         EXISTING ancestor resolved through symlinks) escapes OUTSIDE the bridge
         home, e.g. a `..` traversal or a symlinked parent pointing at `/etc`;
       - the resolved target sits inside shared/private, shared/secrets, or a
         protected-config path.
 
+    Issue #1823 (r5): a write-target word that LEADS with a trusted v2 anchor
+    env var (``$BRIDGE_DATA_ROOT`` / ``$BRIDGE_AGENT_ROOT_V2`` / ``$BRIDGE_HOME``
+    in bare, brace, or parameter-expansion-operator spelling) is first expanded
+    to a concrete literal — reusing the SAME anchor recognition the non-admin
+    DENY path uses (``_v2_anchor_operator_token`` + ``_expand_bridge_prefixes``)
+    — so the admin write-AUDIT recognizes the resolved peer v2 home and emits
+    exactly one ``admin_cross_agent_write`` row for it. When the anchor cannot be
+    resolved in this hook's env (legacy install, no v2 root), the word stays
+    unresolved and the caller keeps its existing handling — the admin write is
+    NOT denied (that is the non-admin deny path's job; this path is allow+audit).
+
     Containment is by RESOLVED PATH, not substring, so a symlink/`..` escape
     cannot masquerade as a contained write.
     """
     resolved_target = _resolve_word_through_symlinks(target_word)
     if resolved_target is None:
-        return None
+        # Issue #1823 (r5): `_resolve_word_through_symlinks` fails closed on ANY
+        # `$VAR`/`${...}` word, so a trusted-admin peer-v2-home write spelled
+        # with a v2 anchor env var (`$BRIDGE_DATA_ROOT/agents/<peer>/home/...`,
+        # `${BRIDGE_AGENT_ROOT_V2}/<peer>/home/...`, the operator form
+        # `${BRIDGE_DATA_ROOT:-x}/...`) reached here as None and the caller fell
+        # through to an UNAUDITED allow. CONSOLIDATE with the deny path: expand
+        # the SAME leading v2-anchor spellings it recognizes (reusing
+        # `_v2_anchor_operator_token` + `_expand_bridge_prefixes`) to a concrete
+        # literal, then re-run the symlink resolver on that literal so the
+        # resolved peer v2 home is recognized → the audit row fires. A word the
+        # anchor expander can't resolve (no leading anchor, or the anchor is
+        # unset in this hook env → no v2 root → no peer home to audit) stays
+        # None and the caller keeps its existing handling (the admin write still
+        # ALLOWs; r3's unresolved-literal admin case is never DENIED here — that
+        # is the non-admin deny path's job).
+        anchored = _expand_v2_anchor_leading_word(target_word)
+        if anchored is None:
+            return None
+        resolved_target = _resolve_word_through_symlinks(anchored)
+        if resolved_target is None:
+            return None
     # Must stay under an operator-controlled write-containment root
     # (symlink-resolved on both sides): the bridge home OR — on a v2-split
     # install — the v2 data root (`$BRIDGE_DATA_ROOT`, issue #1823 r3). A
