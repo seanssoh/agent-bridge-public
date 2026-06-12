@@ -6674,6 +6674,17 @@ AGENT_START_HELP
   shift || true
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") start <agent> [...]"
   bridge_require_agent "$agent"
+  # Issue #1836: deterministic first-start for linux-user-isolated agents.
+  # Refreshes the daemon's supplementary group set and (when needed)
+  # re-execs this start under `sg ab-agent-<agent>` so the freshly-provisioned
+  # agent's first session can traverse its isolated tree on attempt 1 instead
+  # of dying and requiring a manual second start (KNOWN_ISSUES §28). Non-fatal
+  # + idempotent + a silent no-op off Linux / on non-iso agents. When it
+  # re-execs it does not return; otherwise control falls through to the start
+  # exec below unchanged.
+  if declare -f bridge_agent_start_supp_group_preflight >/dev/null 2>&1; then
+    bridge_agent_start_supp_group_preflight "$agent" "$@"
+  fi
   exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" "$@"
 }
 
