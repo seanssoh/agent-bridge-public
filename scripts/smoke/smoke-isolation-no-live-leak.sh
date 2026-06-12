@@ -17,6 +17,14 @@
 #        install agent-dir set unchanged after the trap-driven cleanup
 #        finishes. Also verifies the cleanup trap removes the smoke-
 #        created tempdir under $TMPDIR.
+#   C4 — (#1860) the live install's runtime scripts (bridge-daemon.sh,
+#        bridge-watchdog-silence.py) content hash is unchanged after the
+#        C1/C3 smoke-test.sh runs. A daemon/watchdog-supervision smoke once
+#        wrote a `sleep 60` stub through a path that resolved to the LIVE
+#        ~/.agent-bridge/bridge-daemon.sh even under an isolated BRIDGE_HOME,
+#        silently killing the production daemon for ~4h. This is the class
+#        canary: ANY smoke write that lands on a live runtime script is
+#        caught here regardless of which stage did it.
 #
 # C1 runs smoke-test.sh up to a deliberate fail-fast (PATH stripped so
 # `require_cmd tmux` aborts) — we only need the guard region.
@@ -105,8 +113,54 @@ run_smoke_until_tmux_check() {
   PATH="$SANDBOX_BIN" "$@" bash "$SMOKE_SCRIPT" >"$out_file" 2>&1
 }
 
+# #1860 class canary — live runtime scripts the leak class is known to clobber.
+# We hash their content before/after the smoke-test.sh runs; any change means a
+# stage wrote through a path that resolved to the live install.
+LIVE_RUNTIME_SCRIPTS=(
+  "$HOME/.agent-bridge/bridge-daemon.sh"
+  "$HOME/.agent-bridge/bridge-watchdog-silence.py"
+)
+
+# Pick a stable content hasher (sha256sum on Linux, shasum on macOS).
+_live_hasher() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$@"
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$@"
+  else
+    smoke_fail "no sha256 hasher available (need sha256sum or shasum) for the #1860 live-script canary"
+  fi
+}
+
+# Snapshot "<hash>  <basename>" lines for each live runtime script that exists.
+# Absent files are recorded as "ABSENT <basename>" so an install that does not
+# ship one (or has it removed mid-run) is still compared faithfully.
+snapshot_live_runtime_scripts() {
+  local target="$1" path base
+  : >"$target"
+  for path in "${LIVE_RUNTIME_SCRIPTS[@]}"; do
+    base="$(basename -- "$path")"
+    if [[ -f "$path" ]]; then
+      printf '%s  %s\n' "$(_live_hasher "$path" | awk '{print $1}')" "$base" >>"$target"
+    else
+      printf 'ABSENT  %s\n' "$base" >>"$target"
+    fi
+  done
+}
+
+assert_live_runtime_scripts_unchanged() {
+  local before="$1" after="$2" context="$3" diff_out
+  diff_out="$(diff "$before" "$after" 2>/dev/null || true)"
+  if [[ -n "$diff_out" ]]; then
+    smoke_fail "$context: live runtime script(s) changed during the smoke run (#1860 live-install leak). before/after diff:
+$diff_out"
+  fi
+}
+
 LIVE_BEFORE="$SMOKE_TMP_ROOT/live.before"
 LIVE_AFTER="$SMOKE_TMP_ROOT/live.after"
+LIVE_SCRIPTS_BEFORE="$SMOKE_TMP_ROOT/live-scripts.before"
+LIVE_SCRIPTS_AFTER="$SMOKE_TMP_ROOT/live-scripts.after"
 
 # ---------------------------------------------------------------------------
 # C1 — BRIDGE_HOME UNSET: guard auto-isolates, no live leak.
@@ -300,8 +354,23 @@ test_sigterm_mid_run_no_live_leak() {
   C3_ISO_PARENT=""
 }
 
+# #1860 — capture the live runtime-script content hashes BEFORE any
+# smoke-test.sh run so C4 can prove they survived the C1/C3 invocations.
+snapshot_live_runtime_scripts "$LIVE_SCRIPTS_BEFORE"
+
 smoke_run "C1 unset BRIDGE_HOME auto-isolates" test_unset_auto_isolate
 smoke_run "C2 isolated BRIDGE_HOME CLI does not touch live" test_isolated_cli_no_live_leak
 smoke_run "C3 SIGTERM mid-run does not leak to live" test_sigterm_mid_run_no_live_leak
+
+# C4 — the live install's daemon/watchdog scripts must be byte-for-byte
+# unchanged after the smoke runs. This is the canary for the entire
+# smoke-live-state-leak class (#1860).
+test_live_runtime_scripts_untouched() {
+  snapshot_live_runtime_scripts "$LIVE_SCRIPTS_AFTER"
+  assert_live_runtime_scripts_unchanged "$LIVE_SCRIPTS_BEFORE" "$LIVE_SCRIPTS_AFTER" \
+    "C4 (#1860 live runtime-script canary)"
+}
+smoke_run "C4 live daemon/watchdog scripts untouched by smoke runs" \
+  test_live_runtime_scripts_untouched
 
 smoke_log "all smoke-isolation-no-live-leak cases passed"

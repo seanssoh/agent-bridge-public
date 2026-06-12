@@ -12150,6 +12150,14 @@ bash "$REPO_ROOT/scripts/smoke/layout-evidence-empty-subdir.sh"
 log "running smoke-isolation-no-live-leak smoke (refs queue #4793)"
 bash "$REPO_ROOT/scripts/smoke/smoke-isolation-no-live-leak.sh"
 
+# #1860 — a watchdog/daemon-supervision smoke once overwrote the LIVE
+# ~/.agent-bridge/bridge-daemon.sh with a `sleep 60` stub even under an
+# isolated BRIDGE_HOME. This tooth pins the two defences: the lib.sh
+# temp-root write guard, and bridge-watchdog-silence.py resolving
+# DAEMON_SCRIPT strictly inside an explicit BRIDGE_HOME (no live fallback).
+log "running 1860-smoke-daemon-stub-temp-guard smoke (#1860 live-install leak guard)"
+bash "$REPO_ROOT/scripts/smoke/1860-smoke-daemon-stub-temp-guard.sh"
+
 # Refs queue task #4773 — bridge-agent.sh registry/list/show JSON paths
 # wedged Bash 5.3.9 read_comsub via nested $() captures feeding
 # heredoc-stdin python3 subprocesses through the bridge_agent_manage_python
