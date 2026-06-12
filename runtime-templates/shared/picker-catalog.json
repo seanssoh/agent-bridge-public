@@ -67,6 +67,23 @@
       "post_resolve_verify": true
     },
     {
+      "picker_id": "claude-usage-limit-wait",
+      "engine": "claude",
+      "enabled": true,
+      "confidence": "verbatim",
+      "comment": "#1819. Claude session/usage-limit dialog shown when an interactive session hits its 5h window: header 'What do you want to do?' over the option pair '1. Stop and wait for limit to reset' / '2. Upgrade your plan'. Strings VERBATIM from the live 22-agent install pane capture in the issue (claude engine). Operator policy: ALWAYS option 1 (wait for the reset). select_first (Home -> option 1) + confirm mirrors claude-resume-compact's shape and lands the highlight on the wait option deterministically regardless of where the cursor starts. 'Upgrade your plan' is a BILLING action and must NEVER be auto-selected: it is encoded in destructive_match so the resolver's rail-(c) destructive-guard (bridge_picker_selected_is_destructive) REFUSES to advance and escalates instead if the upgrade option is the currently-selected (glyph-marked) line. The AND-pair of the two option strings is unique to this dialog, so it does not false-match other Claude pickers. post_resolve_verify=true: after resolution the session shows 'You've hit your session limit · resets <time>' and returns to an idle composer, which classifies clean.",
+      "match": [
+        "Stop and wait for limit to reset",
+        "Upgrade your plan"
+      ],
+      "destructive_match": [
+        "Upgrade your plan"
+      ],
+      "policy": "auto_resolve",
+      "keys": ["select_first", "confirm"],
+      "post_resolve_verify": true
+    },
+    {
       "picker_id": "codex-login-expired",
       "engine": "codex",
       "enabled": false,

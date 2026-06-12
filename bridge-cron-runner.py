@@ -441,14 +441,73 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _write_bytes_nofollow(path: Path, data: bytes) -> None:
+    """Write `data` to `path`, REFUSING to follow a symlink at the final
+    component (#1842 codex r3).
+
+    Every caller of `write_text`/`write_json` writes a controller-owned cron
+    run-dir artifact (result.json, status.json, stdout.log, stderr.log,
+    prompt.txt, result-schema.json) — none legitimately targets a symlink. The
+    text-cron run dir is granted the owning iso agent's group write
+    (`bridge_cron_run_dir_grant_isolation`, 3770 sticky), so an iso UID can
+    CREATE a new leaf in it. Without `O_NOFOLLOW` the controller's
+    `Path.write_text()` would FOLLOW a pre-planted symlink leaf and clobber the
+    symlink target as the controller — the output-leaf twin of the request.json
+    symlink-before-pin bypass. `O_NOFOLLOW` makes the open raise `ELOOP` on a
+    symlink leaf; the sticky bit already blocks a member from replacing an
+    existing controller-owned leaf, so first-write creation is the only window
+    and this closes it."""
+    fd = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — O_NOFOLLOW writer helper (#1842 r3/r4): controller-side cron-runner output-leaf I/O; the parent is the controller-created run dir, never an isolated-agent tree probe
+    _write_bytes_nofollow(
+        path,
+        (json.dumps(payload, ensure_ascii=True, indent=2) + "\n").encode("utf-8"),
+    )
 
 
 def write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — O_NOFOLLOW writer helper (#1842 r3/r4): controller-side cron-runner output-leaf I/O; the parent is the controller-created run dir, never an isolated-agent tree probe
+    _write_bytes_nofollow(path, content.encode("utf-8"))
+
+
+def _read_text_nofollow(path: Path) -> str:
+    """Read `path` as UTF-8, REFUSING to follow a symlink at the final
+    component (#1842 codex r4).
+
+    The read-side twin of `_write_bytes_nofollow`. The group-writable iso
+    text-cron run dir (`bridge_cron_run_dir_grant_isolation`, 3770 sticky)
+    lets an iso UID CREATE a leaf in it. A controller read of any run-dir
+    leaf whose CONTENT is NOT controller-derived — the per-run `payload.md`
+    that becomes the prompt, and the harvester-written
+    `authoritative-memory-daily.json` sidecar — must not follow a symlink the
+    iso UID pre-planted there: `Path.read_text()` would FOLLOW it and pull a
+    controller-private target into the prompt/result (the input-leaf twin of
+    the request.json symlink-before-pin bypass codex caught in r3).
+    `O_NOFOLLOW` makes the open raise `ELOOP` on a symlink leaf, so a tampered
+    leaf is a terminal read error, not a silent read-through. The sticky bit
+    blocks a member from REPLACING an existing controller/harvester-owned
+    leaf, so a freshly-planted symlink is the only window and this closes
+    it."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8")
 
 
 def run_dir_id(run_dir: Path) -> str:
@@ -461,6 +520,138 @@ def mode_has_group_or_other_write(path: Path) -> bool:
     except OSError:
         return True
     return bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def mode_has_other_write(path: Path) -> bool:
+    """True when `path` is world/other-writable (always tamper).
+
+    Unlike `mode_has_group_or_other_write`, this isolates the OTHER-write
+    bit so the iso-group-write exemption (#1842) can permit a legitimate
+    setgid `ab-agent-<agent>` group-write bit WITHOUT ever permitting an
+    other-write bit. A stat failure is treated as exposed (fail-closed).
+    """
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return True
+    return bool(mode & stat.S_IWOTH)
+
+
+def _expected_iso_group_names(agent: str) -> set[str]:
+    """The set of group NAMES that ARE `agent`'s own per-agent iso group.
+
+    Mirrors `bridge_isolation_v2_agent_group_name` (and the Python twin
+    `_canonical_actor_group_names` in lib/cron-helpers/staging.py): the
+    un-truncated common case `<prefix><agent>` plus the Linux
+    hash-truncated form `<prefix><head>-<7-hex-sha256(agent)>` clamped to
+    the groupadd 32-char cap. Derived PURELY from the agent name + the
+    `BRIDGE_AGENT_GROUP_PREFIX` policy value — never from any
+    caller-supplied group value — so it stays the actor-derived security
+    allow-list. Returns an empty set for a blank agent (no iso group →
+    the strict no-group-write rule applies, unchanged for non-iso crons).
+    """
+    agent = (agent or "").strip()
+    if not agent:
+        return set()
+    prefix = os.environ.get("BRIDGE_AGENT_GROUP_PREFIX", "ab-agent-")
+    names = {f"{prefix}{agent}"}
+    composed = f"{prefix}{agent}"
+    if len(composed) > 32:
+        avail = 32 - len(prefix)
+        if avail >= 9:
+            import hashlib
+
+            short = hashlib.sha256(agent.encode("utf-8")).hexdigest()[:7]
+            keep = avail - 1 - 7
+            names.add(f"{prefix}{agent[:keep]}-{short}")
+    return names
+
+
+def _path_group_name(path: Path) -> str | None:
+    """Resolve `path`'s on-disk group GID back to its group NAME, or None.
+
+    Pure read — no privilege. Returns None when the gid has no group
+    entry or `grp` is unavailable (non-POSIX); the caller then treats the
+    group-write bit as unexpected (fail-closed → tamper)."""
+    try:
+        gid = path.stat().st_gid
+    except OSError:
+        return None
+    try:
+        import grp
+
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return None
+    except Exception:  # noqa: BLE001 — best-effort name probe
+        return None
+
+
+def mode_has_sticky_bit(path: Path) -> bool:
+    """True when `path` has the sticky bit (S_ISVTX) set. Stat failure → False
+    (fail-closed: a dir we cannot stat is never treated as sticky-protected, so
+    its group-write bit cannot earn the exemption)."""
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return False
+    return bool(mode & stat.S_ISVTX)
+
+
+def group_write_is_expected_iso_group(path: Path, agent: str) -> bool:
+    """True ONLY when `path`'s group-write bit is the legitimate setgid+sticky
+    iso group `ab-agent-<agent>` for the owning iso agent (#1842).
+
+    Narrow, security-preserving exemption to the run-dir tamper-check.
+    Returns True iff ALL hold:
+      (a) `agent` is non-blank AND resolves to a real expected iso group
+          name (`_expected_iso_group_names` — purely agent-derived);
+      (b) `path` is NOT other-writable (other-write is ALWAYS tamper);
+      (c) `path` has the STICKY bit set (3770). On a group-writable dir the
+          sticky bit restricts rename/unlink of entries to the entry's owner
+          (the controller) / dir owner / root, so a group member (the iso UID)
+          cannot swap `request.json` for one it owns — closing the TOCTOU swap
+          window (codex r2). `bridge_cron_run_dir_grant_isolation` sets 3770;
+          a group-writable dir WITHOUT the sticky bit stays tamper, so the
+          exemption never widens if a future dir loses it;
+      (d) `path`'s actual on-disk group NAME is in the expected iso-group
+          set for `agent`.
+    For a non-iso agent (blank/unknown), or a group that is NOT the
+    agent's own `ab-agent-<agent>`, or any other-write bit, or a missing
+    sticky bit, this returns False and the strict no-group-write tamper rule
+    stands. The exemption NEVER widens past that one expected iso group, and
+    the run dir is still required (by the caller) to be controller-OWNED — so
+    a forged `agent` name cannot smuggle in a foreign-group-writable dir.
+    """
+    if mode_has_other_write(path):
+        return False
+    if not mode_has_sticky_bit(path):
+        return False
+    expected = _expected_iso_group_names(agent)
+    if not expected:
+        return False
+    name = _path_group_name(path)
+    return name is not None and name in expected
+
+
+def mode_has_disallowed_write(path: Path, agent: str = "") -> bool:
+    """Tamper predicate for a run-dir / request artifact, #1842-aware.
+
+    Equivalent to `mode_has_group_or_other_write` EXCEPT a group-write bit
+    is permitted when it is the owning iso agent's own setgid group
+    `ab-agent-<agent>` (see `group_write_is_expected_iso_group`). Other-write
+    is always disallowed; group-write with no/blank/unexpected group stays
+    disallowed. With a blank `agent` this is byte-for-byte the legacy
+    strict check (non-iso crons unchanged)."""
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return True
+    if mode & stat.S_IWOTH:
+        return True
+    if mode & stat.S_IWGRP:
+        return not group_write_is_expected_iso_group(path, agent)
+    return False
 
 
 def path_acl_has_write_exposure(path: Path, *, include_default: bool = True) -> bool:
@@ -505,6 +696,13 @@ def path_acl_has_write_exposure(path: Path, *, include_default: bool = True) -> 
 
 
 def validate_shell_request_artifacts(request_file: Path) -> tuple[bool, str | None]:
+    # SHELL-route artifacts are controller-PRIVATE by contract (run_dir 0700,
+    # request.json 0600, no group/other write, no ACL write exposure). Shell
+    # payloads skip `bridge_cron_run_dir_grant_isolation` (they use chmod 0700),
+    # so an iso shell run dir is NOT group-widened — the strict check is correct
+    # here and the #1842 iso-group exemption deliberately does NOT apply. The
+    # exemption lives in `shell_artifact_route`, which also gates TEXT crons
+    # whose iso run dir IS legitimately group-writable (group=ab-agent-<agent>).
     run_dir = request_file.parent
     controller_uid = os.getuid()
     for path in (run_dir, request_file):
@@ -521,35 +719,167 @@ def validate_shell_request_artifacts(request_file: Path) -> tuple[bool, str | No
     return True, None
 
 
-def shell_artifact_route(request_file: Path) -> tuple[str, str | None]:
+class RequestArtifactTampered(Exception):
+    """Raised when the pinned request artifact fails the trust checks.
+
+    Carries the operator-facing `reason` string (already prefixed with
+    `request_artifact_tampered:`)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class PinnedRequest:
+    """A request.json read EXACTLY ONCE through an `O_NOFOLLOW` fd, with the
+    fd's `fstat` captured at read time.
+
+    This is the anti-TOCTOU anchor (#1842 codex r2): every consumer downstream
+    (`shell_artifact_route`, the shell-route body peek, and the text-path body
+    read) parses `self.data` — nobody re-`open()`s `request_file` by path after
+    the trust check. A group member (the iso UID) that renames/unlinks the path
+    after the pin cannot matter: the fd holds the ORIGINAL inode and we never
+    look the path up again for the body. `file_st` is the fstat OF THE PINNED
+    INODE, so the owner-uid / mode checks bind to the same bytes we parse."""
+
+    __slots__ = ("data", "file_st")
+
+    def __init__(self, data: bytes, file_st: os.stat_result) -> None:
+        self.data = data
+        self.file_st = file_st
+
+    def json(self) -> Any:
+        return json.loads(self.data.decode("utf-8"))
+
+
+def pin_request_file(request_file: Path) -> PinnedRequest:
+    """Open `request_file` EXACTLY ONCE (`O_RDONLY | O_NOFOLLOW`), fstat the fd,
+    validate request-file trust on the OPEN fd, and read all bytes — closing the
+    request.json swap window (#1842 codex r2).
+
+    The request artifact is controller-private by contract (0600,
+    controller-owned) and is NEVER group-widened by
+    `bridge_cron_run_dir_grant_isolation` (only the run DIR is). We therefore
+    enforce, on the fstat of the pinned inode (NOT by a separate path stat that
+    could race a swap):
+      * owner uid == controller uid — a pre-open rename swapping in an
+        agent-OWNED request.json is caught here by the wrong uid;
+      * no group-write and no other-write bit — request.json stays strictly
+        0600 (codex r1 [P1] kept; the iso-group exemption is dir-only).
+    `O_NOFOLLOW` blocks a symlink swap on the leaf. Any failure raises
+    `RequestArtifactTampered`; the caller turns that into the terminal
+    `request_artifact_tampered` error. The returned `PinnedRequest` is the ONLY
+    source of the body bytes downstream."""
+    controller_uid = os.getuid()
+    try:
+        fd = os.open(request_file, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise RequestArtifactTampered(
+            f"request_artifact_tampered: open failed for {request_file}: {exc}"
+        ) from exc
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != controller_uid:
+            raise RequestArtifactTampered(
+                f"request_artifact_tampered: owner uid mismatch for {request_file}"
+            )
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RequestArtifactTampered(
+                f"request_artifact_tampered: group/other writable mode on {request_file}"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return PinnedRequest(b"".join(chunks), st)
+
+
+def _route_target_agent(pinned: PinnedRequest) -> str:
+    """Best-effort read of the owning agent name from the PINNED request body,
+    for the #1842 iso-group-write tamper exemption ONLY.
+
+    Parsed from the already-pinned bytes (NOT re-read from the path), AFTER the
+    fd-fstat owner-uid check confirms the request file is controller-owned, so
+    the body is controller-written (not attacker-swappable: the fd holds the
+    original inode). The value is used ONLY to NARROW which group-write bit is
+    acceptable (it must equal that agent's own `ab-agent-<agent>` group) — it
+    can never WIDEN the tamper surface: a forged name still has to match the
+    dir's actual on-disk group, which an attacker can only set to a group they
+    are themselves a member of. Any parse failure yields "" → the strict
+    no-group-write rule applies."""
+    try:
+        body = pinned.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    return str(body.get("target_agent") or "").strip()
+
+
+def shell_artifact_route(
+    request_file: Path, pinned: PinnedRequest
+) -> tuple[str, str | None]:
     """Classify request artifacts before reading untrusted request JSON.
+
+    `pinned` is the request.json already read through an `O_NOFOLLOW` fd by
+    `pin_request_file`, which has ALREADY validated the request FILE's
+    owner-uid and 0600 mode on the pinned inode. This function adds only the
+    run-DIR checks (which legitimately differ for iso text crons) and never
+    re-reads the request file by path — closing the swap window (#1842 codex
+    r2).
 
     Shell jobs are dispatched with controller-private artifacts
     (run_dir=0700, request.json=0600, no named/default ACL write exposure).
-    Group/other writable artifacts are treated as tampered before JSON parse.
+    Other-writable artifacts are treated as tampered before JSON parse.
+    Group-writable run dirs are likewise tampered EXCEPT for the legitimate
+    iso v2 setgid+sticky case (#1842): a TEXT cron run dir owned by an iso
+    agent inherits the owning agent's own group-write bit (group=ab-agent-
+    <agent>, 3770 sticky) from `bridge_cron_run_dir_grant_isolation`. That ONE
+    group is permitted (the dir is still controller-owned, not other-writable,
+    AND sticky so members cannot swap entries); arbitrary group-write, a
+    wrong/unexpected group, a non-sticky group-writable dir, and a non-iso
+    agent's group-writable dir all stay tamper.
     Named/default ACL write exposure disqualifies the shell convention but is
     only terminal once the parsed request actually declares a shell payload,
     preserving legacy text runs that intentionally carry per-run ACL grants.
     """
     run_dir = request_file.parent
     controller_uid = os.getuid()
-    states: list[tuple[Path, os.stat_result]] = []
-    for path in (run_dir, request_file):
-        try:
-            states.append((path, path.stat()))
-        except OSError as exc:
-            return "tampered", f"request_artifact_tampered: stat failed for {path}: {exc}"
+    try:
+        dir_st = run_dir.stat()
+    except OSError as exc:
+        return "tampered", f"request_artifact_tampered: stat failed for {run_dir}: {exc}"
+    # Owner-uid is the trust anchor; the request FILE's uid was already verified
+    # on the pinned fd by `pin_request_file`. Verify the run DIR's uid here
+    # before peeking the controller-written body for the owning agent name
+    # (used to narrow the iso-group exemption).
+    if dir_st.st_uid != controller_uid:
+        return "tampered", f"request_artifact_tampered: owner uid mismatch for {run_dir}"
+    # Owning agent name comes from the PINNED bytes — never a path re-read.
+    target_agent = _route_target_agent(pinned)
     acl_write_exposed = False
-    for path, st in states:
-        if st.st_uid != controller_uid:
-            return "tampered", f"request_artifact_tampered: owner uid mismatch for {path}"
-        if mode_has_group_or_other_write(path):
-            return "tampered", f"request_artifact_tampered: group/other writable mode on {path}"
-        if path_acl_has_write_exposure(path, include_default=path.is_dir()):
-            acl_write_exposed = True
+    # The #1842 iso-group-write exemption applies ONLY to the run DIRECTORY,
+    # which legitimately inherits the owning agent's setgid+sticky group-write
+    # bit (group=ab-agent-<agent>, 3770 via bridge_cron_run_dir_grant_isolation).
+    # `request.json` is NEVER group-widened by that grant; its 0600 mode was
+    # already enforced on the pinned fd, so it is not re-checked by path here
+    # (codex r1 [P1] kept; codex r2: no path re-stat of the request file).
+    if mode_has_disallowed_write(run_dir, target_agent):
+        return "tampered", f"request_artifact_tampered: group/other writable mode on {run_dir}"
+    # ACL write exposure on EITHER artifact disqualifies the shell convention
+    # (round-1 strictness preserved). These are metadata-only `getfacl` probes —
+    # they never re-open the request inode for body bytes, so the pin holds.
+    if path_acl_has_write_exposure(run_dir, include_default=True):
+        acl_write_exposed = True
+    if path_acl_has_write_exposure(request_file, include_default=False):
+        acl_write_exposed = True
 
-    run_mode = stat.S_IMODE(states[0][1].st_mode)
-    request_mode = stat.S_IMODE(states[1][1].st_mode)
+    run_mode = stat.S_IMODE(dir_st.st_mode)
+    request_mode = stat.S_IMODE(pinned.file_st.st_mode)
     if run_mode == 0o700 and request_mode == 0o600 and not acl_write_exposed:
         return "shell", None
     return "text", None
@@ -869,10 +1199,13 @@ def write_shell_terminal_error(
 ) -> None:
     run_dir = request_file.parent
     resolved_run_id = run_id or run_dir_id(run_dir)
-    result_file = (run_dir / "result.json").resolve()
-    status_file = (run_dir / "status.json").resolve()
-    stdout_log = (run_dir / "stdout.log").resolve()
-    stderr_log = (run_dir / "stderr.log").resolve()
+    # Canonical run-dir leaves with no leaf-level `.resolve()`, so the
+    # O_NOFOLLOW write in write_text/write_json binds to the dir-entry rather
+    # than a pre-followed symlink target (#1842 codex r3). run_dir is absolute.
+    result_file = run_dir / "result.json"
+    status_file = run_dir / "status.json"
+    stdout_log = run_dir / "stdout.log"
+    stderr_log = run_dir / "stderr.log"
     completed_at = now_iso()
     write_text(stdout_log, "")
     write_text(stderr_log, (summary or runner_error) + "\n")
@@ -2054,8 +2387,14 @@ def write_followup_body(
             ]
         )
 
-    body_path.parent.mkdir(parents=True, exist_ok=True)
-    body_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    # O_NOFOLLOW write (#1842 codex r4): `cron-followup.md` is a run-dir OUTPUT
+    # leaf the controller writes in the group-writable (3770 sticky) iso run
+    # dir, so it is the same output-leaf class as result.json/status.json. The
+    # r3 sweep funneled those through `write_text`, but this writer still used a
+    # bare `Path.write_text()` that would FOLLOW a symlink an iso UID pre-plants
+    # at `cron-followup.md` and clobber the target as the controller. Route it
+    # through `write_text` so a symlink leaf raises ELOOP instead.
+    write_text(body_path, "\n".join(lines).rstrip() + "\n")
 
 
 def queue_cli_path() -> Path:
@@ -3002,10 +3341,14 @@ def _extract_shell_lock_key(request_file: Path) -> tuple[str, str, str | None]:
 
 def cmd_run_shell(request_file: Path, args: argparse.Namespace) -> int:
     run_dir = request_file.parent
-    result_file = (run_dir / "result.json").resolve()
-    status_file = (run_dir / "status.json").resolve()
-    stdout_log = (run_dir / "stdout.log").resolve()
-    stderr_log = (run_dir / "stderr.log").resolve()
+    # Runner-owned leaves by canonical name; no leaf-level `.resolve()` so the
+    # O_NOFOLLOW write in write_text/write_json binds to the actual dir-entry
+    # (a `.resolve()` here would pre-follow a symlink leaf and defeat it). run_dir
+    # is already absolute (request_file is abspath-normalized) (#1842 codex r3).
+    result_file = run_dir / "result.json"
+    status_file = run_dir / "status.json"
+    stdout_log = run_dir / "stdout.log"
+    stderr_log = run_dir / "stderr.log"
 
     # Minimal pre-lock parse — lock key + run_id only. The full body
     # is re-read under the flock below for validation + exec, so this
@@ -3478,12 +3821,44 @@ def cmd_run_shell(request_file: Path, args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    request_file = Path(args.request_file).expanduser().resolve()
+    # Lexically normalize (expanduser + absolute) WITHOUT following symlinks
+    # (#1842 codex r3). `Path.resolve()` canonicalizes the leaf THROUGH any
+    # symlink BEFORE `pin_request_file()` runs, so a pre-pin attacker who swaps
+    # `request.json` for a symlink to a controller-owned private file wins: the
+    # resolve follows it, and the O_NOFOLLOW pin + run-dir uid/mode/sticky checks
+    # then bind to the RESOLVED target and ITS parent, not the original
+    # group-writable run-dir leaf — O_NOFOLLOW on the leaf is meaningless once the
+    # path was already symlink-resolved upstream. `os.path.abspath` does normpath
+    # + cwd-join only (no symlink follow), so the pin's O_NOFOLLOW open binds to
+    # the actual dir-entry the run dir holds: a symlinked request.json raises
+    # ELOOP → terminal tamper (correct), and the run-dir checks run on the
+    # original containing dir (`request_file.parent`).
+    request_file = Path(os.path.abspath(os.path.expanduser(str(args.request_file))))
     if not request_file.is_file():
         print(f"error: request file not found: {request_file}", file=sys.stderr)
         return 2
 
-    route, route_error = shell_artifact_route(request_file)
+    # Pin request.json ONCE through an O_NOFOLLOW fd (#1842 codex r2). The fstat
+    # owner-uid + mode checks bind to the pinned inode, and EVERY downstream body
+    # read below consumes `pinned.json()` — never a path re-open — so a request
+    # swap after the check cannot retarget the run. A pin failure is terminal
+    # tamper.
+    try:
+        pinned = pin_request_file(request_file)
+    except RequestArtifactTampered as exc:
+        write_shell_terminal_error(
+            request_file,
+            runner_error="request_artifact_tampered",
+            summary=exc.reason,
+            run_id=run_dir_id(request_file.parent),
+        )
+        print("status: error")
+        print(f"run_id: {run_dir_id(request_file.parent)}")
+        print("engine: shell")
+        print("runner_error: request_artifact_tampered")
+        return 1
+
+    route, route_error = shell_artifact_route(request_file, pinned)
     if route == "tampered":
         error_message = route_error or "request_artifact_tampered"
         write_shell_terminal_error(
@@ -3523,9 +3898,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         # re-reads + re-validates under its own untrusted-body model and still
         # rejects any cross-route shell payload. A corrupted/non-dict body also
         # stays on the shell path so its existing flocked error handling runs.
+        # Peek the PINNED bytes (#1842 codex r2) — never a path re-read.
         try:
-            shell_peek: Any = read_json(request_file)
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            shell_peek: Any = pinned.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
             shell_peek = None
         benign_text_in_private_dir = (
             isinstance(shell_peek, dict)
@@ -3537,8 +3913,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Non-shell route: legacy text path. The artifacts are not
     # controller-private here, so we treat the body as untrusted —
     # parse it just enough to reject any cross-route shell payload
-    # (loose-mode dir holding a shell body is tampering).
-    request = read_json(request_file)
+    # (loose-mode dir holding a shell body is tampering). The body comes
+    # from the SAME pinned inode the route check validated (#1842 codex r2):
+    # a post-check request swap can't retarget this run.
+    request = pinned.json()
     if isinstance(request, dict) and is_shell_request_payload(request):
         error_message = "request_artifact_tampered: shell request artifacts are not controller-private"
         write_shell_terminal_error(
@@ -3557,12 +3935,71 @@ def cmd_run(args: argparse.Namespace) -> int:
     engine = request.get("target_engine", "")
     run_id = request.get("run_id", "")
     workdir = request.get("target_workdir", "")
-    payload_file = Path(request["payload_file"]).expanduser().resolve()
-    result_file = Path(request["result_file"]).expanduser().resolve()
-    status_file = Path(request["status_file"]).expanduser().resolve()
-    stdout_log = Path(request["stdout_log"]).expanduser().resolve()
-    stderr_log = Path(request["stderr_log"]).expanduser().resolve()
     run_dir = request_file.parent
+    # Payload INPUT leaf — confined to the original run_dir, NOT taken from
+    # the request body through `.resolve()` (#1842 codex r4, the input-leaf
+    # twin of the r3 output-leaf fix). The scheduler's per-run payload is
+    # `<run_dir>/payload.md` (`bridge_cron_payload_file_by_id`), but other
+    # legitimate producers (preflight / claude-token-rotation harnesses) name
+    # a differently suffixed run-dir sibling (`payload.txt`), so the contract
+    # is run-dir CONTAINMENT, not one exact leaf name: the declared path's
+    # parent directory must be the run dir itself. The r3 head took
+    # `request["payload_file"]` through `.expanduser().resolve()` — a
+    # symlink-FOLLOW on the leaf — so an iso UID who pre-plants `payload.md`
+    # as a symlink in the group-writable (3770 sticky) run dir before the
+    # controller builds the prompt wins: the resolve follows it and
+    # `Path.read_text()` reads a controller-private target straight into the
+    # cron prompt (codex r4: SECRET_SENTINEL leaked as payload_text). The
+    # containment check below never resolves the LEAF: the declared path is
+    # normalized lexically, then its PARENT DIRECTORY is compared to the run
+    # dir via `os.path.realpath` on BOTH sides — dir-level canonicalization
+    # only, required because a symlinked tmp prefix (macOS `/tmp` →
+    # `/private/tmp`, CI tmp mounts) must not fail byte-identical intent,
+    # while a declared parent that is NOT the run dir (the E1k
+    # out-of-run-dir tamper case) still hard-fails. The path actually OPENED
+    # is rebuilt as `run_dir / <basename>` — the body contributes only a
+    # separator-free basename (`Path.name` of a lexically-normalized abspath
+    # cannot contain `/` or collapse to `..`), so a body path can never
+    # redirect the read outside the run dir — and the read below goes through
+    # `_read_text_nofollow` so a symlinked leaf raises ELOOP → terminal
+    # tamper, never a silent read-through.
+    declared_payload = request.get("payload_file")
+    payload_file = None
+    if declared_payload is not None:
+        declared_norm = Path(os.path.abspath(os.path.expanduser(str(declared_payload))))
+        leaf_name = declared_norm.name
+        if leaf_name not in ("", ".", "..") and os.path.realpath(
+            str(declared_norm.parent)
+        ) == os.path.realpath(str(run_dir)):
+            payload_file = run_dir / leaf_name
+    if payload_file is None:
+        error_message = "request_artifact_tampered: payload_file is not a run-dir leaf"
+        write_shell_terminal_error(
+            request_file,
+            runner_error="request_artifact_tampered",
+            summary=error_message,
+            run_id=str(run_id or run_dir_id(run_dir)),
+            audit_target_agent=str(request.get("target_agent") or "daemon"),
+        )
+        print("status: error")
+        print(f"run_id: {str(run_id or run_dir_id(run_dir))}")
+        print(f"engine: {engine}")
+        print("runner_error: request_artifact_tampered")
+        return 1
+    # Runner-OWNED output leaves are derived from the original run_dir by their
+    # canonical names — NOT from the request body (#1842 codex r3). The body is
+    # controller-written and always names these run_dir siblings, but sourcing
+    # them from run_dir removes the trust dependency entirely (a body path could
+    # never redirect a runner write outside the run dir) and matches the pattern
+    # `cmd_run_shell`/`write_shell_terminal_error` already use. The actual writes
+    # go through `write_text`/`write_json`, which open O_NOFOLLOW so a symlink
+    # leaf pre-planted by the iso UID in the group-writable run dir raises ELOOP
+    # instead of being followed/clobbered (the output-leaf twin of the
+    # request.json symlink-before-pin bypass).
+    result_file = run_dir / "result.json"
+    status_file = run_dir / "status.json"
+    stdout_log = run_dir / "stdout.log"
+    stderr_log = run_dir / "stderr.log"
     schema_file = run_dir / "result-schema.json"
     prompt_file = run_dir / "prompt.txt"
 
@@ -3615,7 +4052,26 @@ def cmd_run(args: argparse.Namespace) -> int:
         # the scheduler enqueues the next slot on its next pass.
         return 0
 
-    payload_text = payload_file.read_text(encoding="utf-8")
+    # O_NOFOLLOW read of the canonical payload leaf (#1842 codex r4): a
+    # symlink pre-planted at `payload.md` raises ELOOP here rather than being
+    # followed into a controller-private target. A non-symlink leaf reads
+    # normally.
+    try:
+        payload_text = _read_text_nofollow(payload_file)
+    except OSError as exc:
+        error_message = f"request_artifact_tampered: payload_file read refused ({exc.__class__.__name__})"
+        write_shell_terminal_error(
+            request_file,
+            runner_error="request_artifact_tampered",
+            summary=error_message,
+            run_id=str(run_id or run_dir_id(run_dir)),
+            audit_target_agent=str(request.get("target_agent") or "daemon"),
+        )
+        print("status: error")
+        print(f"run_id: {str(run_id or run_dir_id(run_dir))}")
+        print(f"engine: {engine}")
+        print("runner_error: request_artifact_tampered")
+        return 1
     prompt = build_prompt(request, payload_text)
     write_text(prompt_file, prompt)
     write_json(schema_file, RESULT_SCHEMA)
@@ -3677,7 +4133,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 # harvester's authoritative actions_taken.
                 if family == "memory-daily" and sidecar_path.is_file():
                     try:
-                        authoritative = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                        # O_NOFOLLOW read (#1842 codex r4): the sidecar is a
+                        # run-dir INPUT leaf the harvester (iso UID) writes, so
+                        # `is_file()` follows a symlink but the read must not —
+                        # a swapped `authoritative-memory-daily.json` → symlink
+                        # would otherwise pull a controller-private target into
+                        # the result. ELOOP surfaces here as OSError → treated
+                        # as an invalid sidecar (fall back to the child parse).
+                        authoritative = json.loads(_read_text_nofollow(sidecar_path))
                         parsed_child_result = validate_result(authoritative)
                         parsed_source = "authoritative-sidecar"
                     except (OSError, json.JSONDecodeError, ValueError) as exc:
@@ -3737,7 +4200,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         # when the child relay JSON was malformed / missing.
         if engine == "claude" and family == "memory-daily" and sidecar_path.is_file():
             try:
-                authoritative = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                # O_NOFOLLOW read (#1842 codex r4) — same run-dir input-leaf
+                # symlink defense as the pre-parse sidecar read above; ELOOP
+                # surfaces as OSError → sidecar recovery failed (not a
+                # read-through of a controller-private target).
+                authoritative = json.loads(_read_text_nofollow(sidecar_path))
                 child_result = validate_result(authoritative)
                 child_result_source = "authoritative-sidecar-after-parse-error"
                 final_state = "success" if child_result.get("status") != "error" else "error"
