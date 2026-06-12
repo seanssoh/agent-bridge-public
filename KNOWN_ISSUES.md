@@ -782,6 +782,37 @@ operator-side action that is required regardless of how many code
 paths defer correctly, because the group set itself lives in the
 kernel process table.
 
+**First-start auto-recovery (wave v0.16.10 / #1836).** The most common
+symptom of this entry — a freshly provisioned agent's FIRST
+`agb agent start` dies within seconds while the SECOND succeeds — is now
+handled automatically. `run_start` runs
+`bridge_agent_start_supp_group_preflight` before launch, which (1)
+refreshes the daemon's supplementary group set (the same call
+`agent create` makes) and (2) when the controller's own live group set
+is missing the just-added `ab-agent-<agent>` group (but it exists on
+disk and the controller is a member), re-execs the start under
+`sg ab-agent-<agent>` so the launching process carries the group on
+attempt 1. The re-exec is guarded by a `BRIDGE_AGENT_START_SUPP_REEXEC`
+sentinel (no loop) and is strictly non-fatal — if `sg` is unavailable or
+the on-disk membership has not landed yet, it warns and lets the legacy
+launch proceed exactly as before. The operator-side re-login / daemon
+restart above is still the canonical full refresh; the auto-recovery
+just removes the manual "start it twice" dance for the common case.
+
+**Queue-dir ownership self-heal (#1829).** A first-start-death +
+restart-rollback could strand the per-agent `requests/`/`responses/`
+queue-gateway dirs as `<controller>:<controller> 2770` instead of the
+contract `agent-bridge-<a>:ab-agent-<a> 2770`, cutting the iso UID off
+from every `agb` gateway verb (it is a member of `ab-agent-<a>` but not
+the controller's primary group). Three layers now keep this correct:
+isolate/prepare stamps it authoritatively (unchanged); both lazy
+creators in `bridge-queue-gateway.py` stamp the group after `mkdir`; and
+`bridge_isolation_v2_repair_queue_dirs` re-asserts the two dirs
+idempotently on every `agent start` (stat-skip makes the correct common
+case free). The manual repair (`agb migrate isolation v2 --apply`, or
+`chown -R agent-bridge-<a>:ab-agent-<a> requests responses && chmod 2770`)
+remains available if a custom flow bypasses start.
+
 ## 29. tmux inject spool MUST stay enabled on iso v2 (#1312 / v0.15.0-beta5-2)
 
 `BRIDGE_TMUX_INJECT_SPOOL_ENABLED=0` is silently destructive on iso v2

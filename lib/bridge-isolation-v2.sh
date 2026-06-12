@@ -1257,6 +1257,94 @@ bridge_isolation_v2_chown_file_iso_uid() {
   return 0
 }
 
+# bridge_isolation_v2_repair_queue_dirs <agent>
+#
+# Issue #1829: cheap, idempotent ownership repair for the per-agent queue
+# gateway dirs `requests/` and `responses/`. The authoritative stamp is the
+# isolate/prepare subdir loop (`agent-bridge-<a>:ab-agent-<a> 2770`), but a
+# first-start-death + restart-rollback can strand these dirs
+# `<controller>:<controller> 2770` (controller primary group), which cuts the
+# iso UID off from EVERY `agb` gateway verb (it is a member of
+# `ab-agent-<a>` but NOT the controller's primary group, so it can neither
+# write request files nor read response files). `agent start`/`restart` never
+# re-ran the prepare normalizer, so the strand could persist until a manual
+# `agb migrate isolation v2 --apply`. This helper closes that gap by
+# re-asserting ONLY the two queue dirs on every start.
+#
+# Contract (mirrors the sibling chown helpers):
+#   * Linux v2 isolation only (gated via bridge_isolation_v2_enforce);
+#     silent no-op off Linux / shared-mode / when the iso UID does not resolve.
+#   * Idempotent stat-skip: a dir already at `os_user:agent_grp 2770` is a
+#     pure stat with zero mutating syscalls — the common case is free.
+#   * Non-fatal: a failed chown/chgrp/chmod returns non-zero but the CALLER
+#     (bridge-start.sh) treats that as a warn surface, never a launch abort —
+#     a still-stranded dir is exactly today's behavior.
+#   * Only repairs dirs that EXIST; a missing dir is left to the lazy gateway
+#     creator (which now also stamps the group, see bridge-queue-gateway.py).
+bridge_isolation_v2_repair_queue_dirs() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 0
+  bridge_isolation_v2_enforce || return 0
+
+  local agent_root=""
+  agent_root="$(bridge_isolation_v2_agent_root "$agent" 2>/dev/null || printf '')"
+  [[ -n "$agent_root" ]] || return 0
+  local agent_grp=""
+  agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+  [[ -n "$agent_grp" ]] || return 0
+  local os_user=""
+  if command -v bridge_agent_os_user >/dev/null 2>&1; then
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+  fi
+  # No iso UID resolvable → shared-mode / pre-v2; the queue-dir ownership
+  # contract does not apply.
+  [[ -n "$os_user" ]] || return 0
+
+  local rc=0 sub dir cur cur_uid cur_rest cur_grp cur_mode_raw cur_mode_norm
+  for sub in requests responses; do
+    dir="$agent_root/$sub"
+    # Existence probe through the sudo-handoff helper: the per-agent root is
+    # `root:ab-agent-<a> 2750` and a stale-group controller cannot traverse it
+    # with a plain `[[ -d ]]` (#1028). Skip cleanly when absent.
+    if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+      bridge_linux_sudo_root test -d "$dir" 2>/dev/null || continue
+    else
+      [[ -d "$dir" ]] || continue
+    fi
+    # Idempotent stat-skip — read the current owner:group:mode (via sudo so a
+    # stale-group controller can still stat through the 2750 parent).
+    if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+      cur="$(bridge_linux_sudo_root stat -c '%U:%G:%a' "$dir" 2>/dev/null || printf '')"
+    else
+      cur="$(stat -c '%U:%G:%a' "$dir" 2>/dev/null || printf '')"
+    fi
+    if [[ -n "$cur" ]]; then
+      cur_uid="${cur%%:*}"
+      cur_rest="${cur#*:}"
+      cur_grp="${cur_rest%%:*}"
+      cur_mode_raw="${cur_rest##*:}"
+      cur_mode_norm="$(printf '%o' "$((8#${cur_mode_raw#0}))" 2>/dev/null || printf '%s' "$cur_mode_raw")"
+      if [[ "$cur_uid" == "$os_user" && "$cur_grp" == "$agent_grp" && "$cur_mode_norm" == "2770" ]]; then
+        continue
+      fi
+    fi
+    # Re-assert the contract. chown transfers to the iso UID (which the
+    # controller is not), so drive all three through the sudo-root helper.
+    if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+      bridge_linux_sudo_root chown "$os_user:$agent_grp" "$dir" 2>/dev/null \
+        || _bridge_isolation_v2_run_root_or_sudo chown "$os_user:$agent_grp" "$dir" \
+        || { rc=1; continue; }
+      bridge_linux_sudo_root chmod 2770 "$dir" 2>/dev/null \
+        || _bridge_isolation_v2_run_root_or_sudo chmod 2770 "$dir" \
+        || { rc=1; continue; }
+    else
+      _bridge_isolation_v2_run_root_or_sudo chown "$os_user:$agent_grp" "$dir" || { rc=1; continue; }
+      _bridge_isolation_v2_run_root_or_sudo chmod 2770 "$dir" || { rc=1; continue; }
+    fi
+  done
+  return "$rc"
+}
+
 # bridge_isolation_v2_normalize_workdir_profile_group <agent> <workdir>
 #
 # Issue #1270 (v0.15.0-beta4 Lane G): after the v2 workdir materialize

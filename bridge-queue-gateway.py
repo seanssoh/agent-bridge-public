@@ -239,8 +239,91 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
 
 
+def _agent_group_name(agent: str) -> str:
+    """Per-agent isolation group name for `agent` (ab-agent-<agent>).
+
+    Mirrors lib/bridge-isolation-v2.sh:bridge_isolation_v2_agent_group_name.
+    Override-able for tests/non-default installs via BRIDGE_AGENT_GROUP_PREFIX.
+    """
+    prefix = os.environ.get("BRIDGE_AGENT_GROUP_PREFIX", "ab-agent-")
+    return f"{prefix}{agent}"
+
+
+def _normalize_agent_queue_dir(d: Path, agent: str) -> None:
+    """Best-effort: stamp a per-agent requests/responses dir to the iso-v2
+    contract group `ab-agent-<agent>` + mode 2770 (setgid) after a lazy
+    `mkdir`. Issue #1829.
+
+    Two lazy creators (cmd_client ensure-dirs and atomic_write_json's
+    parent.mkdir) can create these dirs under whichever side wins the race —
+    notably the CONTROLLER daemon writing a response at its own umask + primary
+    group, leaving the dir `<controller>:<controller> 2770` instead of
+    `agent-bridge-<agent>:ab-agent-<agent> 2770`. The iso UID is a member of
+    `ab-agent-<agent>` but NOT of the controller's primary group, so a
+    controller-primary-group dir cuts the agent off from EVERY gateway verb
+    (it cannot create request files / read response files). The authoritative
+    isolate/prepare loop stamps this correctly; this closes the lazy gap so a
+    controller-created dir self-heals to the contract on first touch.
+
+    Fail-closed-quiet: any error (no such group off an iso install, EPERM when
+    the creator is neither owner nor root, non-Linux) is swallowed — the worst
+    case is the dir keeps whatever group it had, which is exactly today's
+    behavior. We NEVER raise into the request/response write path. The setgid
+    bit means files created afterwards inherit the right group regardless.
+    """
+    if os.name != "posix":
+        return
+    try:
+        gid = grp.getgrnam(_agent_group_name(agent)).gr_gid
+    except (KeyError, OSError):
+        # No iso group on this install (shared-mode / non-Linux dev) — the
+        # contract does not apply; leave the dir as-is.
+        return
+    try:
+        st = os.stat(d)
+    except OSError:
+        return
+    # Only act when the dir is NOT already group=ab-agent-<agent> 2770, so a
+    # correctly-provisioned dir (the common case) is a pure stat no-op and we
+    # never touch a dir the prepare loop already owns.
+    if st.st_gid == gid and stat.S_IMODE(st.st_mode) == 0o2770:
+        return
+    try:
+        os.chown(d, -1, gid)
+    except OSError:
+        # Not owner and not root (e.g. iso UID trying to chgrp a
+        # controller-owned dir) — cannot repair from this side. The
+        # controller-side daemon/prepare path is the authoritative repairer.
+        return
+    try:
+        os.chmod(d, 0o2770)
+    except OSError:
+        return
+
+
+def _normalize_agent_queue_dir_for_file(path: Path) -> None:
+    """Derive the agent name from a `<root>/<agent>/{requests,responses}/<file>`
+    path and normalize the just-created parent dir. Used by atomic_write_json,
+    which only has the file path. No-op when the path does not match the
+    requests/responses shape (e.g. controller-side gateway-instance writes).
+    """
+    parent = path.parent
+    if parent.name not in ("requests", "responses"):
+        return
+    agent = parent.parent.name
+    if agent:
+        _normalize_agent_queue_dir(parent, agent)
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    created = not path.parent.exists()  # noqa: raw-pathlib-controller-only — controller/daemon checks whether IT is creating the per-agent dir (race detection for #1829), not reading an iso artifact
     path.parent.mkdir(parents=True, exist_ok=True)
+    if created:
+        # Issue #1829: if THIS write is what created the per-agent
+        # requests/responses dir (the daemon winning the creation race under
+        # its own umask + primary group), stamp it to the iso-v2 contract so
+        # the agent is not cut off. Best-effort; never raises.
+        _normalize_agent_queue_dir_for_file(path)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     # L1-N (beta21) tail: chmod 0640 so the file-mode gateway's
@@ -575,8 +658,19 @@ def cmd_client(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser()
     req_dir = request_dir(root, args.agent)
     resp_dir = response_dir(root, args.agent)
+    req_created = not req_dir.exists()  # noqa: raw-pathlib-controller-only — gateway client checks its OWN per-agent dir existence for #1829 race-stamp, not another agent's artifact
+    resp_created = not resp_dir.exists()  # noqa: raw-pathlib-controller-only — same: client's own responses/ dir
     req_dir.mkdir(parents=True, exist_ok=True)
     resp_dir.mkdir(parents=True, exist_ok=True)
+    # Issue #1829: if cmd_client is the lazy creator (iso UID's first request,
+    # or a controller-side proxy call), stamp the freshly-made dir to the
+    # iso-v2 contract group `ab-agent-<agent>` + 2770. The iso UID can chgrp
+    # to its own member group; the controller can chgrp as owner/root. A dir
+    # the prepare loop already stamped is a stat no-op. Best-effort.
+    if req_created:
+        _normalize_agent_queue_dir(req_dir, args.agent)
+    if resp_created:
+        _normalize_agent_queue_dir(resp_dir, args.agent)
 
     # Parse ALL tunables BEFORE enqueuing the request. A malformed --poll/--timeout
     # or retry env var must fail (or fall back) here, never after
