@@ -2427,6 +2427,140 @@ def ensure_claude_settings_file(
     return path
 
 
+def settings_apikeyhelper_coherent(config_dir: Path) -> bool:
+    """True when ``settings.json`` already points at the managed apiKeyHelper.
+
+    Used by the #1855 backfill to decide create-if-absent vs no-op (and by
+    cmd_sync_agent's cred-state honesty check). Mirrors the bridge-run.sh
+    keychain-free preflight predicate: the value must be the exact path
+    ``claude_api_key_helper_path()`` would write (canonical resolve). Any other
+    value — absent, operator-owned, or a stale managed path — is NOT coherent.
+    Never raises: an unreadable / malformed settings.json reads as not-coherent
+    so the backfill repairs it.
+    """
+    try:
+        path = claude_settings_write_path(config_dir)
+    except Exception:  # noqa: BLE001 - symlink-escape etc. → repair
+        return False
+    if not path.exists():
+        return False
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - malformed → repair
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    actual = parsed.get("apiKeyHelper")
+    if not isinstance(actual, str) or not actual:
+        return False
+    actual_path = Path(actual).expanduser()
+    if not actual_path.is_absolute():
+        return False
+    return str(actual_path.resolve(strict=False)) == claude_api_key_helper_path()
+
+
+def cmd_backfill_settings(args: argparse.Namespace) -> int:
+    """Issue #1855: create-if-absent backfill of the keychain-free apiKeyHelper
+    contract for a single pre-#1520 shared Claude agent.
+
+    Pre-#1520 shared static admins were provisioned before
+    ``ensure_claude_settings_file`` learned to wire ``apiKeyHelper`` — so their
+    per-agent ``settings.json`` carries no apiKeyHelper, the #1520 keychain-free
+    gate (Darwin + executable helper + settings wired + active registry OAT)
+    can never pass, and the shared launch silently degrades to the operator
+    keychain instead of consuming the claude-token OAT pool. Same create-time-
+    only materialization gap as #1809 (AGENTS.md backfill): nothing ever
+    backfilled the older agents.
+
+    This reuses the EXACT provision-time writer (``ensure_claude_settings_file``)
+    so the backfilled end-state is byte-identical to a fresh-install scaffold.
+    Idempotent + gated:
+      - gate disabled / non-Darwin → no-op (``status: skipped``). Mirrors the
+        ``keychain_free_apikeyhelper_supported`` platform guard the writer and
+        the bridge-run.sh preflight both honor — never render a controller
+        helper path into a non-macOS agent's settings.
+      - already coherent (settings.json already points at the managed helper)
+        → no-op (``changed: false``).
+      - missing / incoherent → write via the shared atomic writer
+        (``changed: true``, ``backfilled: true``).
+    """
+    json_mode = bool(args.json)
+    check_only = bool(getattr(args, "check", False))
+    config_dir = Path(args.config_dir).expanduser()
+    agent = (args.agent or "").strip()
+    owner_uid = args.owner_uid if args.owner_uid is not None and args.owner_uid >= 0 else None
+    owner_gid = args.owner_gid if args.owner_gid is not None and args.owner_gid >= 0 else None
+    allowed_root = Path(args.allowed_root).expanduser() if args.allowed_root else None
+
+    if not (claude_keychain_free_auth_enabled() and keychain_free_apikeyhelper_supported()):
+        payload = {
+            "status": "skipped",
+            "agent": agent,
+            "reason": "keychain_free_disabled_or_unsupported_platform",
+            "changed": False,
+            "coherent": True,
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(f"skipped: {agent or config_dir} (keychain-free off or non-Darwin)")
+        return 0
+
+    already = settings_apikeyhelper_coherent(config_dir)
+
+    if check_only:
+        # Issue #1855 deliverable 3 (credential-coherence drift): read-only —
+        # report whether this keychain-free Darwin agent's settings.json points
+        # at the managed apiKeyHelper, WITHOUT writing. `coherent: false` is the
+        # provisioning-generation-drift / credential-coherence signal: the agent
+        # is on the legacy keychain fallback while the runtime ships the
+        # keychain-free contract. The daemon/doctor surface this so a registry
+        # "synced" stamp can be cross-checked against the launch path's true
+        # auth source instead of silently diverging from a fresh install.
+        payload = {
+            "status": "ok",
+            "agent": agent,
+            "coherent": already,
+            "drift": (not already),
+            "changed": False,
+            "api_key_helper": claude_api_key_helper_path(),
+        }
+        if json_mode:
+            json_dump(payload)
+        elif already:
+            print(f"ok: {agent or config_dir} keychain-free coherent")
+        else:
+            print(f"drift: {agent or config_dir} settings.json does not point at managed apiKeyHelper")
+        return 0
+    try:
+        settings_file = ensure_claude_settings_file(
+            config_dir,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            allowed_root=allowed_root,
+        )
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+
+    changed = not already
+    payload = {
+        "status": "ok",
+        "agent": agent,
+        "settings_file": str(settings_file),
+        "api_key_helper": claude_api_key_helper_path(),
+        "changed": changed,
+        "backfilled": changed,
+        "coherent": True,
+    }
+    if json_mode:
+        json_dump(payload)
+    elif changed:
+        print(f"backfilled: {agent or config_dir} <- apiKeyHelper ({settings_file})")
+    else:
+        print(f"ok: {agent or config_dir} already keychain-free coherent")
+    return 0
+
+
 def cmd_api_key_helper(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     if json_mode and not bool(args.check):
@@ -2700,6 +2834,34 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
     if claude_keychain_free_auth_enabled():
         payload["api_key_helper"] = claude_api_key_helper_path()
         payload["api_key_helper_ttl_ms"] = claude_api_key_helper_ttl_ms()
+        # Issue #1855 cred-state honesty: on a keychain-free Darwin install the
+        # launched shared agent authenticates via the apiKeyHelper wired into
+        # its per-agent settings.json — NOT the .credentials.json we just wrote.
+        # If settings.json does not point at the managed helper (a pre-#1520
+        # agent the apiKeyHelper backfill never reached), the #1520 gate can
+        # never pass and the launch silently degrades to the operator keychain:
+        # the agent never consumes the rendered per-agent credential even though
+        # we stamped it `synced`. Surface that incoherence as a structured field
+        # (and a stderr warning) instead of asserting a delivery that cannot
+        # happen, so the daemon sync-tick audit and watchdog/doctor can see it.
+        # Best-effort + non-fatal: the credential write itself already succeeded.
+        if keychain_free_apikeyhelper_supported():
+            try:
+                coherent = settings_apikeyhelper_coherent(credential_file.parent)
+            except Exception:  # noqa: BLE001 - never turn a good sync into a failure
+                coherent = True
+            payload["keychain_free_settings_coherent"] = coherent
+            if not coherent:
+                payload["status"] = "synced_incoherent"
+                print(
+                    f"warning: {args.agent} synced a per-agent credential its "
+                    "launch path cannot consume — settings.json does not point "
+                    "at the managed apiKeyHelper (pre-#1520 agent). Run "
+                    f"`agent-bridge upgrade` or `agent-bridge auth claude-token "
+                    f"backfill-settings --agents {args.agent}` to wire the "
+                    "keychain-free contract so this agent joins the OAT pool.",
+                    file=sys.stderr,
+                )
     if json_mode:
         json_dump(payload)
     else:
@@ -3577,6 +3739,24 @@ def build_parser() -> argparse.ArgumentParser:
     helper_parser.add_argument("--check", action="store_true")
     helper_parser.add_argument("--json", action="store_true")
     helper_parser.set_defaults(handler=cmd_api_key_helper)
+
+    # Issue #1855: create-if-absent keychain-free settings backfill for a single
+    # pre-#1520 shared Claude agent (driven per-agent by the upgrade / daemon
+    # hygiene roster loop). Reuses ensure_claude_settings_file so the end state
+    # is byte-identical to a fresh-install scaffold.
+    backfill_settings_parser = sub.add_parser("backfill-settings")
+    backfill_settings_parser.add_argument("--config-dir", required=True)
+    backfill_settings_parser.add_argument("--agent", default="")
+    backfill_settings_parser.add_argument("--owner-uid", type=int, default=None)
+    backfill_settings_parser.add_argument("--owner-gid", type=int, default=None)
+    backfill_settings_parser.add_argument("--allowed-root", default=None)
+    backfill_settings_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Issue #1855: read-only credential-coherence drift report — never writes settings.json",
+    )
+    backfill_settings_parser.add_argument("--json", action="store_true")
+    backfill_settings_parser.set_defaults(handler=cmd_backfill_settings)
 
     sync_parser = sub.add_parser("sync-agent")
     sync_parser.add_argument("--agent", required=True)

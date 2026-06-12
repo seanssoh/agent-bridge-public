@@ -2778,6 +2778,24 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
     done
   ' -- "$SOURCE_ROOT" "$DRY_RUN"
 
+  # Issue #1855: backfill the keychain-free apiKeyHelper contract for pre-#1520
+  # shared Claude agents. ensure_claude_settings_file wires apiKeyHelper at
+  # provision/sync time, but agents provisioned before #1520 shipped have a
+  # settings.json with no helper and were never backfilled — so the #1520 gate
+  # (Darwin + executable helper + settings wired + active registry OAT) can
+  # never pass and the shared launch silently degrades to the operator keychain.
+  # Create-if-absent + idempotent: already-coherent / non-Darwin / gate-off
+  # agents are a no-op. Best-effort + non-fatal (mirrors the skills-sync loop
+  # above): a backfill error must never block the upgrade. Skipped on --dry-run.
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[bridge-upgrade] plan: backfill keychain-free apiKeyHelper contract for pre-#1520 shared agents (idempotent; closes #1855)" >&2
+  else
+    bridge_upgrade_with_target_env "$TARGET_ROOT" \
+      "$BRIDGE_BASH_BIN" "$SOURCE_ROOT/bridge-auth.sh" \
+      claude-token backfill-settings --agents static --json \
+      >/dev/null 2>&1 || true
+  fi
+
   # Issue #4769 (reverts #517): no auto-backfill of `<admin>-dev` codex pair
   # on upgrade. The post-upgrade advisory below points operators of hosts
   # where the removed feature already auto-created admin/admin-dev to the

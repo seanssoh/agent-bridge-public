@@ -18,6 +18,7 @@ Usage:
   bash $SCRIPT_DIR/bridge-auth.sh claude-token list [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token activate <id> [--sync] [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token sync [--agents static|all|csv] [--json]
+  bash $SCRIPT_DIR/bridge-auth.sh claude-token backfill-settings [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token rotate [--if-auto-enabled] [--reason <text>] [--sync] [--agents static|all|csv] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token check <id> [--enable-on-ok] [--disable-on-quota] [--timeout <sec>] [--json]
   bash $SCRIPT_DIR/bridge-auth.sh claude-token classify-output [--stdout-file <path>] [--stderr-file <path>] [--returncode <n>]
@@ -684,6 +685,108 @@ PY
   return "$rc"
 }
 
+# bridge_auth_backfill_settings_agents <spec> <json_mode>
+#
+# Issue #1855: create-if-absent backfill of the keychain-free apiKeyHelper
+# contract into each selected Claude agent's per-agent settings.json. The
+# secondary half of the #1809-family backfill — pre-#1520 shared admins were
+# provisioned before ensure_claude_settings_file wired apiKeyHelper, so their
+# settings.json carries no helper and the #1520 keychain-free gate can never
+# pass. Reuses the SAME agent selector + iso owner-arg resolution as the sync
+# path, then calls the byte-identical writer via `bridge-auth.py
+# backfill-settings`. Idempotent: an already-coherent (or non-Darwin / gate-off)
+# agent is a no-op. Emits an aggregate JSON envelope.
+bridge_auth_backfill_settings_agents() {
+  local spec="$1"
+  local json_mode="$2"
+  local agent=""
+  local cred_file=""
+  local config_dir=""
+  local os_user=""
+  local owner_uid=""
+  local owner_gid=""
+  local user_home=""
+  local selection_output=""
+  local rc=0
+  local -a agents=()
+  local -a backfilled=()
+  local -a unchanged=()
+  local -a failed=()
+
+  if ! selection_output="$(bridge_auth_selected_agents "$spec" 2>&1)"; then
+    printf '%s\n' "$selection_output" >&2
+    return 1
+  fi
+  if [[ -n "$selection_output" ]]; then
+    mapfile -t agents <<<"$selection_output"
+  fi
+  if (( ${#agents[@]} == 0 )); then
+    [[ "$json_mode" == "1" ]] && printf '{"status": "skipped", "reason": "no_matching_claude_agents", "backfilled": [], "unchanged": [], "failed": []}\n'
+    [[ "$json_mode" == "1" ]] || printf 'skipped: no_matching_claude_agents\n'
+    return 0
+  fi
+
+  for agent in "${agents[@]}"; do
+    local -a owner_args=()
+    cred_file="$(bridge_auth_claude_credentials_file_for_agent "$agent" 2>/dev/null)" || {
+      failed+=("$agent")
+      rc=1
+      continue
+    }
+    config_dir="$(dirname "$cred_file")"
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+      if [[ -n "$os_user" ]]; then
+        owner_uid="$(id -u "$os_user" 2>/dev/null || true)"
+        owner_gid="$(id -g "$os_user" 2>/dev/null || true)"
+        user_home="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || true)"
+        [[ -n "$owner_uid" ]] && owner_args+=(--owner-uid "$owner_uid")
+        [[ -n "$owner_gid" ]] && owner_args+=(--owner-gid "$owner_gid")
+        [[ -n "$user_home" ]] && owner_args+=(--allowed-root "$user_home")
+      fi
+      local out=""
+      out="$(bridge_linux_sudo_root python3 "$SCRIPT_DIR/bridge-auth.py" \
+        backfill-settings --config-dir "$config_dir" --agent "$agent" \
+        "${owner_args[@]}" --json 2>/dev/null)" || { failed+=("$agent"); rc=1; continue; }
+    else
+      user_home="$(bridge_auth_resolved_user_home_for_agent "$agent" 2>/dev/null || true)"
+      [[ -n "$user_home" ]] && owner_args+=(--allowed-root "$user_home")
+      local out=""
+      out="$(python3 "$SCRIPT_DIR/bridge-auth.py" \
+        backfill-settings --config-dir "$config_dir" --agent "$agent" \
+        "${owner_args[@]}" --json 2>/dev/null)" || { failed+=("$agent"); rc=1; continue; }
+    fi
+    if printf '%s' "$out" | grep -q '"changed": true'; then
+      backfilled+=("$agent")
+    else
+      unchanged+=("$agent")
+    fi
+    [[ "$json_mode" == "1" ]] || printf '%s\n' "$out"
+  done
+
+  if [[ "$json_mode" == "1" ]]; then
+    python3 - "${backfilled[@]}" -- "${unchanged[@]}" --- "${failed[@]}" <<'PY'
+import json, sys
+items = sys.argv[1:]
+a = items.index("--") if "--" in items else len(items)
+backfilled = items[:a]
+rest = items[a + 1 :]
+b = rest.index("---") if "---" in rest else len(rest)
+unchanged = rest[:b]
+failed = rest[b + 1 :]
+status = "ok" if not failed else ("failed" if not (backfilled or unchanged) else "partial")
+print(json.dumps({
+    "status": status,
+    "backfilled": backfilled,
+    "unchanged": unchanged,
+    "failed": failed,
+    "non_clean": bool(backfilled or failed),
+}, ensure_ascii=True, indent=2))
+PY
+  fi
+  return "$rc"
+}
+
 # ─────────────────────────────────────────────────────────────────────
 # Codex fleet-sync adapter (#1470 Phase 2, #1467).
 #
@@ -1150,6 +1253,16 @@ case "$command" in
         bridge_auth_json_requested "$@" && json_mode=1
         agents_spec="$(bridge_auth_agents_arg "$@")"
         bridge_auth_sync_agents "$registry" "$agents_spec" "$json_mode"
+        ;;
+      backfill-settings)
+        # Issue #1855: create-if-absent keychain-free apiKeyHelper backfill for
+        # pre-#1520 shared Claude agents. Default scope mirrors `sync`'s
+        # static-only default so the daemon/upgrade roster loop only touches
+        # static agents unless an explicit --agents CSV is given.
+        json_mode=0
+        bridge_auth_json_requested "$@" && json_mode=1
+        agents_spec="$(bridge_auth_agents_arg "$@")"
+        bridge_auth_backfill_settings_agents "$agents_spec" "$json_mode"
         ;;
       rotate)
         json_mode=0

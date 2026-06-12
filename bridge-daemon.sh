@@ -4813,6 +4813,51 @@ process_agent_doc_backfill() {
   return 1
 }
 
+# process_keychain_free_backfill
+#
+# Issue #1855: keychain-free apiKeyHelper contract hygiene pass. Sibling of the
+# #1809 doc-backfill pass — between upgrades, create-if-absent the apiKeyHelper
+# into any static Claude agent's settings.json that lacks it (a pre-#1520 shared
+# admin the create-time scaffold never reached, so the #1520 keychain-free gate
+# can never pass and the launch silently degrades to the operator keychain).
+# Reuses the byte-identical writer via `bridge-auth.sh claude-token
+# backfill-settings`. Idempotent: already-coherent / non-Darwin / gate-off
+# agents are a no-op (the bash + python layers both gate on the keychain-free
+# enable flag + Darwin platform). Cadence-gated; returns 0 when it backfilled
+# at least one agent (so the caller marks the cycle changed), 1 when gated/clean.
+process_keychain_free_backfill() {
+  local interval="${BRIDGE_KEYCHAIN_FREE_BACKFILL_INTERVAL_SECONDS:-86400}"
+  local summary_file=""
+  local non_clean=0
+
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=86400
+  bridge_daemon_pass_due "keychain_free_backfill" "$interval" || return 1
+
+  # Needs the source checkout (bridge-auth.sh + bridge-lib.sh). The runtime
+  # root carries both.
+  [[ -f "$SCRIPT_DIR/bridge-auth.sh" ]] || return 1
+
+  summary_file="$(mktemp "${TMPDIR:-/tmp}/bridge-keychain-free-backfill.json.XXXXXX")"
+
+  bridge_with_timeout 120 keychain_free_backfill \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token backfill-settings \
+      --agents static --json \
+      >"$summary_file" 2>/dev/null || true
+
+  if [[ -s "$summary_file" ]]; then
+    if grep -q '"non_clean": true' "$summary_file"; then
+      non_clean=1
+    fi
+  fi
+
+  rm -f "$summary_file"
+
+  if [[ "$non_clean" == "1" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 process_daily_backup() {
   local backup_json=""
   local subprocess_rc=0
@@ -13629,6 +13674,15 @@ cmd_sync_cycle() {
   # neighborhood.
   BRIDGE_DAEMON_LAST_STEP="agent_doc_backfill"
   if process_agent_doc_backfill; then
+    changed=0
+  fi
+  # Issue #1855: keychain-free apiKeyHelper backfill hygiene pass. Sibling of
+  # the #1809 doc-backfill pass — cadence-gated (default daily), create-if-absent
+  # the apiKeyHelper into pre-#1520 shared static Claude agents so they join the
+  # OAT pool instead of silently degrading to the operator keychain. Idempotent
+  # no-op on already-contracted / non-Darwin / gate-off installs.
+  BRIDGE_DAEMON_LAST_STEP="keychain_free_backfill"
+  if process_keychain_free_backfill; then
     changed=0
   fi
   # Issue #4795: prune backoff state for agents that no longer exist in
