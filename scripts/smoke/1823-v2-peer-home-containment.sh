@@ -63,6 +63,20 @@
 #  Tooth 13 — (r3) NEGATIVE: a NON-admin write to the split-root peer v2 home →
 #             DENIED and emits ZERO `admin_cross_agent_write` rows (the audit path
 #             is admin-only; r3 changed no non-admin behavior).
+#  Tooth 14 — (r4) NON-admin Bash append spelled through a Bash PARAMETER-
+#             EXPANSION OPERATOR around the EXPORTED v2 anchor
+#             (`${BRIDGE_DATA_ROOT:-x}/agents/<peer>/home/…`, `:+` / `-` / `:off`
+#             forms, BOTH anchors) → DENIED. r2 closed bare `$NAME` + exact
+#             `${NAME}`; this closes the operator forms, which survived with a `$`
+#             and fell through to ALLOW (the residual bypass codex proved on head
+#             0b872f4b). With the exported env present bash expands every operator
+#             form to the EXACT peer home, so the operator/default text is
+#             irrelevant to which tree bash writes.
+#  Tooth 15 — (r4) TRUSTED-ADMIN with the SAME operator-form peer-home writes →
+#             ALLOWED (the #1806 admin carve-out is spelling-agnostic).
+#  Tooth 16 — (r4) NO over-block: a NON-anchor `${BRIDGE_DATA_ROOTX:-x}` (NAME is a
+#             PREFIX of a real anchor) → ALLOW, and a real anchor operator form
+#             whose tail names the peer WORKDIR (scoped out, #1492) → ALLOW.
 #
 # The strict admin predicate reads the controller roster via `agent list
 # --json`; the smoke injects a deterministic roster snapshot through the
@@ -467,6 +481,74 @@ fi
 smoke_log "ok: Tooth13 non-admin split-root peer write -> DENY"
 assert_audit_rows "Tooth13 non-admin split-root peer write emits NO admin audit row" \
   "$AUDIT_NONADMIN" "$PEER_AGENT" "0"
+
+# ---------------------------------------------------------------------------
+# Tooth 14 (r4) — NON-admin Bash append spelled through a Bash PARAMETER-
+# EXPANSION OPERATOR around the EXPORTED v2 anchor → DENIED. r2 closed the bare
+# `$NAME` and exact `${NAME}` spellings; this closes the OPERATOR forms
+# (`${NAME:-word}` / `${NAME:+word}` / `${NAME-word}` / `${NAME:offset}` …).
+# With the exported env present (v2 ALWAYS exports both vars) bash expands every
+# one of these to the EXACT peer v2 home, so the operator/default text does NOT
+# change which tree bash writes to. Before the r4 fix these were ALLOW (the
+# residual bypass codex proved on head 0b872f4b). The `$`/`{` are single-quoted
+# here so the test shell does not pre-expand the token; the LITERAL `${NAME…}`
+# reaches the hook, which recovers the anchor regardless of operator and denies
+# on the `/agents/<peer>/home` tail.
+#
+# Both anchors × representative operators are exercised:
+#   ${BRIDGE_DATA_ROOT:-word}     use-default      tail /agents/<peer>/home
+#   ${BRIDGE_DATA_ROOT:+word}     alt-value        tail /agents/<peer>/home
+#   ${BRIDGE_DATA_ROOT-word}      unset-default    tail /agents/<peer>/home
+#   ${BRIDGE_DATA_ROOT:1}         substring/offset tail /agents/<peer>/home
+#   ${BRIDGE_AGENT_ROOT_V2:-word} use-default      tail /<peer>/home
+#   ${BRIDGE_AGENT_ROOT_V2:+word} alt-value        tail /<peer>/home
+# ---------------------------------------------------------------------------
+assert_bash "Tooth14 non-admin Bash append peer home via \${BRIDGE_DATA_ROOT:-x} DENIED" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_DATA_ROOT:-/tmp/harmless}/agents/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+assert_bash "Tooth14 non-admin Bash append peer home via \${BRIDGE_DATA_ROOT:+x} DENIED" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_DATA_ROOT:+known}/agents/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+assert_bash "Tooth14 non-admin Bash append peer home via \${BRIDGE_DATA_ROOT-x} DENIED" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_DATA_ROOT-/tmp/harmless}/agents/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+assert_bash "Tooth14 non-admin Bash append peer home via \${BRIDGE_DATA_ROOT:0} DENIED" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_DATA_ROOT:0}/agents/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+assert_bash "Tooth14 non-admin Bash append peer home via \${BRIDGE_AGENT_ROOT_V2:-x} DENIED" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_AGENT_ROOT_V2:-/tmp/harmless}/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+assert_bash "Tooth14 non-admin Bash append peer home via \${BRIDGE_AGENT_ROOT_V2:+x} DENIED" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_AGENT_ROOT_V2:+known}/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+
+# ---------------------------------------------------------------------------
+# Tooth 15 (r4) — TRUSTED-ADMIN with the SAME operator-form peer-home writes →
+# ALLOWED (the #1806 admin carve-out is spelling-agnostic; only NON-admin
+# denies). Admin behavior is unchanged across every anchor spelling.
+# ---------------------------------------------------------------------------
+assert_bash "Tooth15 admin Bash append peer home via \${BRIDGE_DATA_ROOT:-x} ALLOWED" \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" \
+  'echo note >> ${BRIDGE_DATA_ROOT:-/tmp/harmless}/agents/'"$PEER_AGENT"'/home/MEMORY.md' "ALLOW"
+assert_bash "Tooth15 admin Bash append peer home via \${BRIDGE_AGENT_ROOT_V2:+x} ALLOWED" \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" \
+  'echo note >> ${BRIDGE_AGENT_ROOT_V2:+known}/'"$PEER_AGENT"'/home/MEMORY.md' "ALLOW"
+
+# ---------------------------------------------------------------------------
+# Tooth 16 (r4) — NO over-block. A NON-anchor `${OTHER:-…}` whose NAME is a
+# PREFIX of a real anchor (`BRIDGE_DATA_ROOTX`) is NOT an anchor → ALLOW, and a
+# real anchor operator form whose tail names the peer WORKDIR (scoped out, #1492)
+# stays ALLOW. Proves the operator-form recognition did not widen the deny set.
+# ---------------------------------------------------------------------------
+assert_bash "Tooth16 non-admin \${BRIDGE_DATA_ROOTX:-x} peer-home tail ALLOWED (non-anchor)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo x >> ${BRIDGE_DATA_ROOTX:-/tmp/harmless}/agents/'"$PEER_AGENT"'/home/MEMORY.md' "ALLOW"
+assert_bash "Tooth16 non-admin \${BRIDGE_DATA_ROOT:-x} peer WORKDIR tail ALLOWED (scoped out)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo x >> ${BRIDGE_DATA_ROOT:-/tmp/harmless}/agents/'"$PEER_AGENT"'/workdir/NOTES.md' "ALLOW"
+assert_bash "Tooth16 non-admin \${BRIDGE_AGENT_ROOT_V2:+x} peer WORKDIR tail ALLOWED (scoped out)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo x >> ${BRIDGE_AGENT_ROOT_V2:+known}/'"$PEER_AGENT"'/workdir/NOTES.md' "ALLOW"
 
 smoke_log "passed"
 echo "[smoke:${SMOKE_NAME}] passed"

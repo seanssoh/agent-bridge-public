@@ -3210,6 +3210,77 @@ _CD_LIKELY_SUCCESS = "\x00CD_OK\x00"
 # not mistaken for `$BRIDGE_DATA_ROOT`.
 _V2_ANCHOR_NAMES = ("BRIDGE_AGENT_ROOT_V2", "BRIDGE_DATA_ROOT")
 
+# Issue #1823 (r4): the r2/r3 anchor recognition handled ONLY the bare `$NAME`
+# and the EXACT `${NAME}` brace spellings. A non-admin can still reach a peer v2
+# home through a Bash PARAMETER-EXPANSION OPERATOR around the same trusted anchor —
+# `${BRIDGE_DATA_ROOT:-/tmp/x}/agents/<peer>/home/...`, `${BRIDGE_DATA_ROOT:+x}/...`,
+# `${BRIDGE_AGENT_ROOT_V2-x}/<peer>/home/...`, etc. With the real exported env
+# present (v2 ALWAYS exports both vars) bash expands every one of these to the
+# EXACT peer home: `:-`/`-` keep the set value, `:+`/`+` substitute (the var IS
+# set so the substitution fires when its `word` is the known root), `:offset` /
+# `#`/`%`/`/` slice the set value. So the operator/default text does NOT change
+# which tree bash writes to when the anchor env var is set — and it always is for
+# a v2 agent. We therefore recover the leading `${NAME<op>...}` token whose NAME
+# is a trusted v2 anchor as that anchor for the path-prefix decision, regardless
+# of operator, and apply the SAME expand→match-`/agents/<peer>/home`→DENY logic
+# the bare/exact forms get; fail-CLOSE (deny) when the tail names a peer v2 home.
+# A NON-anchor `${OTHER:-...}` is unaffected (NAME must match a v2 anchor exactly),
+# and `${BRIDGE_DATA_ROOTX:-...}` stays a non-anchor (the NAME parse stops at the
+# first non-identifier char, so the operator boundary check rejects a longer name).
+#
+# Operator boundary chars that may follow an anchor NAME inside `${...}` and still
+# leave it the SAME anchor token: `:` (`:-`/`:+`/`:=`/`:?`/`:off`), `-`, `+`, `=`,
+# `?`, `#` (prefix-strip), `%` (suffix-strip), `/` (replace), or `}` (the bare
+# `${NAME}` exact form, already covered separately but harmless to re-accept).
+_V2_ANCHOR_OP_BOUNDARY = frozenset(":-+=?#%/}")
+
+
+def _v2_anchor_operator_token(word: str) -> tuple[str, str] | None:
+    """If *word* BEGINS with a Bash parameter-expansion token ``${NAME<op>...}``
+    whose NAME is exactly one of the trusted v2 anchors, return
+    ``(name, tail_after_closing_brace)`` — else ``None``.
+
+    Brace-balance aware: the token runs from the leading ``${`` to its MATCHING
+    ``}`` (so a nested ``${NAME:-${OTHER}}`` consumes both closers), and *tail* is
+    whatever literal path follows that ``}``. NAME is parsed greedily over
+    identifier chars only, so ``${BRIDGE_DATA_ROOTX:-x}`` parses NAME
+    ``BRIDGE_DATA_ROOTX`` — not a v2 anchor — and returns ``None`` (no over-block).
+    The character immediately after NAME must be a parameter-expansion operator
+    boundary (or the closing ``}``); otherwise it is not a recognizable expansion
+    of this anchor and we return ``None`` (leave it to the caller's Pass-2).
+    """
+    if not word.startswith("${"):
+        return None
+    # Parse the identifier NAME directly after `${`.
+    m = re.match(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", word)
+    if m is None:
+        return None
+    name = m.group(1)
+    if name not in _V2_ANCHOR_NAMES:
+        return None
+    after_name = word[m.end():]
+    # The char after NAME must be an operator boundary or the closing brace; a
+    # different char means NAME was a prefix of a longer construct we do not model.
+    if not after_name or after_name[0] not in _V2_ANCHOR_OP_BOUNDARY:
+        return None
+    # Walk from the leading `{` (at idx 1, after `$`) to its MATCHING `}`,
+    # counting every brace so a nested default `${NAME:-${X}}` is consumed whole.
+    depth = 0
+    close_idx = -1
+    for idx in range(1, len(word)):  # idx 0 is `$`; the brace opens at idx 1
+        ch = word[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                close_idx = idx
+                break
+    if close_idx < 0:
+        return None  # unbalanced `${...` → not a complete token; Pass-2 decides
+    tail = word[close_idx + 1:]
+    return name, tail
+
 
 def _v2_anchor_value(name: str) -> str:
     """Resolve a v2 location-anchor env var NAME to the absolute path bash
@@ -3294,7 +3365,17 @@ def _word_carries_unresolved_v2_anchor(word: str) -> bool:
     ``$``-survives → ALLOW fall-through. Brace and bare spellings both count; the
     bare form uses the same identifier-boundary guard as the expander so
     ``$BRIDGE_DATA_ROOTX`` is not a false positive.
+
+    Issue #1823 (r4): a Bash parameter-expansion OPERATOR form whose NAME is a
+    trusted v2 anchor — ``${BRIDGE_DATA_ROOT:-/tmp/x}``, ``${BRIDGE_DATA_ROOT:+x}``,
+    ``${BRIDGE_AGENT_ROOT_V2-x}``, ``${BRIDGE_DATA_ROOT:0}`` … — ALSO counts: with
+    the exported env present bash expands it to the SAME anchor root, so it too
+    must fail CLOSED rather than survive with a ``$`` and fall through to ALLOW.
+    ``_v2_anchor_operator_token`` recovers the anchor regardless of operator and
+    keeps ``${BRIDGE_DATA_ROOTX:-…}`` a non-anchor.
     """
+    if _v2_anchor_operator_token(word) is not None:
+        return True
     for name in _V2_ANCHOR_NAMES:
         if "${" + name + "}" in word:
             return True
@@ -3695,15 +3776,25 @@ def _unresolved_v2_anchor_forbidden_suffix(
     # appearing mid-word is not a path root we can reason about.
     matched_name: str | None = None
     tail: str | None = None
-    for name in _V2_ANCHOR_NAMES:
-        brace = "${" + name + "}"
-        if word.startswith(brace):
-            matched_name, tail = name, word[len(brace):]
-            break
-        m = re.match(rf"\${name}(?![A-Za-z0-9_])", word)
-        if m is not None:
-            matched_name, tail = name, word[m.end():]
-            break
+    # Issue #1823 (r4): try the Bash parameter-expansion OPERATOR form first
+    # (`${NAME:-word}` / `${NAME:+word}` / `${NAME-word}` / `${NAME:off}` …).
+    # `_v2_anchor_operator_token` recovers the trusted-anchor NAME regardless of
+    # operator and returns the literal tail AFTER the matching `}` — the operator/
+    # default text inside the braces does not change which tree bash writes to when
+    # the anchor env var is set (it always is for a v2 agent), so the tail decides.
+    op_token = _v2_anchor_operator_token(word)
+    if op_token is not None:
+        matched_name, tail = op_token
+    else:
+        for name in _V2_ANCHOR_NAMES:
+            brace = "${" + name + "}"
+            if word.startswith(brace):
+                matched_name, tail = name, word[len(brace):]
+                break
+            m = re.match(rf"\${name}(?![A-Za-z0-9_])", word)
+            if m is not None:
+                matched_name, tail = name, word[m.end():]
+                break
     if matched_name is None or tail is None:
         return None
     # A second unresolved expansion in the tail is undecidable here — leave it to
