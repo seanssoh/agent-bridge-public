@@ -1285,6 +1285,7 @@ def render_agent_bridge_block(agent_dir: Path, session_type: str | None = None) 
         "- artifact가 같이 가야 하는 cross-agent handoff는 free-text task body 대신 `agent-bridge bundle create`를 우선한다.",
         "- 사람에게 보이는 Discord/Telegram 응답은 연결된 Claude 세션 안에서 처리한다. direct-send CLI는 기본 경로가 아니다.",
         "- subagent가 필요하면 bridge-managed disposable child 또는 현재 엔진의 정식 subagent 기능을 사용한다. 옛 child-session 헬퍼는 기준이 아니다.",
+        "- 멀티스텝/장시간 작업은 main 루프에서 inline 처리하지 말고 background subagent로 위임해 사람 응답성을 유지한다. 상세 패턴은 `COMMON-INSTRUCTIONS.md`의 \"Background Subagent Delegation\"을 따른다 (background subagent 기능이 없는 엔진은 해당 없음).",
         "",
         "## Task Processing Protocol",
         "- task를 수신하면 `claim → 처리 → 결과 전달 → done` 순서로 닫는다. 상세 규칙은 `COMMON-INSTRUCTIONS.md`의 \"Task Processing Protocol\"을 따른다.",
