@@ -3223,6 +3223,36 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_integration integration-minimal
       ;;
 
+    scripts/wiki-monthly-summarize.sh|scripts/wiki-weekly-summarize.sh)
+      # Issue #1849 (sibling of #1827 / #1222): the controller-run
+      # wiki monthly/weekly summarize crons run `bridge-memory.py
+      # summarize {monthly,weekly}`, which reads/writes the iso-owned
+      # 2770 memory/ dir. The controller is not in ab-agent-<slug>, so
+      # the legacy controller-direct path tallied every iso agent as a
+      # fail on every run. Both scripts now branch on linux-user
+      # isolation and run the summarize as the iso UID via
+      # bridge_isolation_run_as_agent_user_via_bash. The 1849 smoke pins,
+      # for BOTH scripts:
+      #   - ../bridge-lib.sh sourcing (so the iso helpers load)
+      #   - bridge_load_roster after that source + inside the
+      #     _BRIDGE_ISO_HELPERS_LOADED guard (without it the predicate is
+      #     always-false dead code — the #1222 r1 BLOCKING regression)
+      #   - bridge_agent_linux_user_isolation_effective gate
+      #   - bridge_isolation_run_as_agent_user_via_bash invocation
+      #   - the iso inline body runs `bridge-memory.py summarize <period>`
+      #   - non-iso branch preserved (legacy run_with_timeout summarize
+      #     path survives — no regression for shared installs)
+      #   - inline-script exit codes stay 0 or >= 10 so the wrapper's +2
+      #     shift on rc<3 cannot collide with its pre-flight band
+      #   - no heredoc/here-string in the iso inline body (footgun #11)
+      # The Linux+sudo gated T8 layer stands up a real agent-bridge-w1849
+      # user + ab-agent-w1849 group, scaffolds the iso-owned memory/ at
+      # mode 2770, and asserts the cross-boundary asymmetry (controller
+      # write fails, sudo-as-iso write succeeds) reproduces on this host.
+      add_required 1849-wiki-summarize-iso
+      add_integration integration-minimal
+      ;;
+
     scripts/wiki-daily-ingest.sh)
       # Issue #679: wiki-daily-ingest.sh Lane B excludes
       # `*pre-compact-dump*` raw envelopes from the librarian ingest
