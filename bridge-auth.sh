@@ -780,24 +780,12 @@ bridge_auth_backfill_settings_agents() {
   done
 
   if [[ "$json_mode" == "1" ]]; then
-    python3 - "${backfilled[@]}" -- "${unchanged[@]}" --- "${failed[@]}" <<'PY'
-import json, sys
-items = sys.argv[1:]
-a = items.index("--") if "--" in items else len(items)
-backfilled = items[:a]
-rest = items[a + 1 :]
-b = rest.index("---") if "---" in rest else len(rest)
-unchanged = rest[:b]
-failed = rest[b + 1 :]
-status = "ok" if not failed else ("failed" if not (backfilled or unchanged) else "partial")
-print(json.dumps({
-    "status": status,
-    "backfilled": backfilled,
-    "unchanged": unchanged,
-    "failed": failed,
-    "non_clean": bool(backfilled or failed),
-}, ensure_ascii=True, indent=2))
-PY
+    # Footgun #11 (KNOWN_ISSUES §26): the aggregate JSON render used to be a
+    # `python3 - ... <<'PY'` interpreter heredoc-stdin here. Extracted to the
+    # file-as-argv helper to keep the heredoc-stdin-to-subprocess deadlock
+    # class out of this code path.
+    python3 "$SCRIPT_DIR/lib/upgrade-helpers/auth-backfill-settings-json.py" \
+      "${backfilled[@]}" -- "${unchanged[@]}" --- "${failed[@]}"
   fi
   return "$rc"
 }

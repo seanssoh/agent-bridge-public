@@ -2442,7 +2442,7 @@ def settings_apikeyhelper_coherent(config_dir: Path) -> bool:
         path = claude_settings_write_path(config_dir)
     except Exception:  # noqa: BLE001 - symlink-escape etc. → repair
         return False
-    if not path.exists():
+    if not path.exists():  # noqa: raw-pathlib-controller-only - controller settings-coherence probe on the resolved write path
         return False
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
