@@ -7436,6 +7436,15 @@ def _resolved_write_target_containment(target_word: str, agent: str) -> tuple[st
 _PEER_WRITE_SRC_DST_CMDS: frozenset[str] = frozenset({"mv", "cp"})
 _PEER_WRITE_DIR_CMDS: frozenset[str] = frozenset({"mkdir", "rmdir"})
 
+# Leaders that must NEVER ride the generic #1711 admin peer file-write parity
+# (`_admin_peer_write_targets_all_contained`): each has its OWN dedicated gate
+# whose narrower contract must remain the sole authority. `sqlite3` opens a DB
+# and is allowed ONLY against the EXACT task DB via the #1806 (3e) carve-out
+# (audited `admin_sqlite3_task_db`); a `sqlite3 <peer>/x.db` against any other
+# path must DENY (#1806 Tooth 8), so it must not be re-granted here as a generic
+# peer file write.
+_PEER_WRITE_EXCLUDED_LEADERS: frozenset[str] = frozenset({"sqlite3"})
+
 
 def _admin_peer_write_operands(text: str) -> tuple[str, list[str], list[str]] | None:
     """Extract ``(operation, source_words, dest_words)`` for a single
@@ -7476,6 +7485,143 @@ def _admin_peer_write_operands(text: str) -> tuple[str, list[str], list[str]] | 
             return None
         return leaf, [], list(positionals)
     return None
+
+
+def _admin_peer_write_targets_all_contained(
+    scan_text: str, agent: str
+) -> bool:
+    """Resolved-path containment gate for the admin Bash peer-home WRITE
+    parity carve-out (#1711 follow-up).
+
+    The carve-out grants a trusted-admin peer-home WRITE (a redirect/append
+    such as ``printf … >> <peer>/CLAUDE.md`` or the inert quoted-heredoc
+    doc-note ``cat >> <peer>/CLAUDE.md <<'EOF' … EOF``) whose mv/cp/mkdir/rmdir
+    operand shape the #1806 (3a) carve-out does NOT model. Substring-matching a
+    peer alias is NOT sufficient to authorize a MUTATION: a ``..`` traversal or
+    a symlinked parent (e.g. ``mv <peer> <peer>/../../../OUTSIDE/x`` or
+    ``mkdir <peer>/out-link/x``) names the peer alias as a substring yet
+    RESOLVES outside the bridge home / into a hard-denied tree. #1806 Tooth 7
+    proves this must DENY.
+
+    Returns True ONLY when ALL hold (else False → caller DENIES, fail closed):
+
+      - EVERY peer-/bridge-anchored path token in *scan_text* resolves (symlink
+        + ``..`` folded, via the SAME
+        :func:`_resolved_write_target_containment` resolver the #1806 (3a)
+        carve-out uses) to a location CONTAINED under the bridge home and
+        OUTSIDE shared/private, shared/secrets, and #341 protected-config. A
+        ``..`` traversal or a symlinked parent (#1806 Tooth 7:
+        ``mv <peer> <peer>/../../../OUTSIDE/x``, ``mkdir <peer>/out-link/x``)
+        names the peer alias as a SUBSTRING yet RESOLVES outside / into a denied
+        tree → containment returns None → False;
+      - the command references at least one peer home (so a benign same-home /
+        non-peer write is not mis-audited as a cross-agent write); AND
+      - the leader is NOT a command with its OWN dedicated carve-out / open
+        semantics — notably ``sqlite3`` (#1806 (3e): a sqlite3 open is allowed
+        ONLY against the EXACT task DB and is audited as
+        ``admin_sqlite3_task_db``; a ``sqlite3 <peer>/x.db`` against any other
+        path must DENY — #1806 Tooth 8 — and must NEVER be re-granted here as a
+        generic peer file write).
+
+    *scan_text* is the reduced ``cross_scan`` surface, so a proven-inert
+    quoted-heredoc DATA body never contributes a spurious target — only the real
+    head tokens (redirect target / file args) are checked. The caller has
+    already classified the command as write-intent (``not read_intent``) and
+    embedding-free, so this gate adds the missing RESOLVED-PATH containment
+    proof the substring `matched_alias` cannot give.
+    """
+    if _command_has_shell_embedding(scan_text):
+        return False
+    try:
+        tokens = shlex.split(scan_text, posix=True, comments=False)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    # A leader with its own dedicated carve-out / open semantics must NOT ride
+    # the generic #1711 peer file-write parity (e.g. `sqlite3` routes through
+    # the #1806 (3e) exact-task-db carve-out only; anything else denies).
+    if tokens[0].rsplit("/", 1)[-1] in _PEER_WRITE_EXCLUDED_LEADERS:
+        return False
+    aliases = _peer_alias_list(agent)
+    anchors = _bridge_anchor_tokens()
+    # v2-split-install anchor spellings (`$BRIDGE_DATA_ROOT`, `${BRIDGE_AGENT_
+    # ROOT_V2}`, …) that `_resolved_write_target_containment` knows how to fold
+    # to a concrete peer v2 home (issue #1823). A `$BRIDGE_AGENT_ROOT_V2/<peer>/
+    # home/…` token carries NO literal `/agents/` substring, so the marker gate
+    # below must recognize the anchor NAME to treat it as a write-target
+    # candidate (otherwise a legitimate trusted-admin v2 peer write would be
+    # silently skipped and the carve-out would not fire).
+    v2_anchor_markers = tuple(
+        marker
+        for name in _V2_ANCHOR_NAMES
+        for marker in (f"${name}", f"${{{name}")
+    )
+
+    def _carries_bridge_marker(word: str) -> bool:
+        return bool(
+            any(a in word for a in aliases)
+            or any(anchor in word for anchor in anchors)
+            or any(m in word for m in v2_anchor_markers)
+            or "/agents/" in word
+            or "/shared/" in word
+        )
+
+    references_peer = False
+    checked_any = False
+    for tok in tokens:
+        if not tok or tok.startswith("-"):
+            continue
+        # Operator tokens shlex surfaces (`>`, `>>`, `<`, …) are not path words.
+        if re.fullmatch(r"[0-9]*(>>?|<<?)", tok):
+            continue
+        # A write-target candidate must be a single PLAUSIBLE PATH word: a clean
+        # leading filesystem/anchor spelling and no embedded whitespace or
+        # shell-program punctuation. This excludes a quote-stripped PROGRAM token
+        # (e.g. an awk body `BEGIN{print "x" > "<peer>/M.md"}`) that merely
+        # CONTAINS a peer path as a substring — the program's real file output is
+        # surfaced as the separate file-arg token, which IS resolved below. Such
+        # a program token is never fed to the path resolver (which would
+        # fail-close and false-DENY a legitimate in-program write whose file arg
+        # is itself a contained peer path).
+        # `{`/`}` are deliberately ALLOWED so a Bash PARAMETER-EXPANSION anchor
+        # spelling (`${BRIDGE_DATA_ROOT:-x}/<peer>/home/…`, issue #1823 r4) stays
+        # a path candidate that `_resolved_write_target_containment` can fold;
+        # an awk/program body is still excluded because it carries whitespace
+        # and/or quote chars (forbidden below). A `$(`/`)` command-sub or a
+        # backtick is already rejected by the leg's `_command_has_shell_
+        # embedding` pre-check.
+        looks_like_path = (
+            tok.startswith(("/", "~", "./", "../", "$"))
+            or any(anchor in tok for anchor in anchors)
+        ) and not any(ch in tok for ch in " \t()'\"`;|&")
+        if not looks_like_path:
+            # A skipped PROGRAM token (e.g. an awk body) may carry its OWN
+            # in-program output redirect to a path the file-arg scan never sees
+            # (`awk 'BEGIN{print "x" > "<escape>/leak"}' <peer>/M.md`). Resolve
+            # any embedded `>`/`>>` redirect TARGET inside such a token; an
+            # escape / forbidden-tree / un-analyzable in-program write target
+            # fails the gate (fail closed) so a contained file arg cannot
+            # whitewash an in-program write that lands outside containment.
+            for embedded in re.findall(
+                r">>?\s*['\"]?([^'\"\s>|&;]+)", tok
+            ):
+                if not _carries_bridge_marker(embedded):
+                    continue
+                if _resolved_write_target_containment(embedded, agent) is None:
+                    return False
+            continue
+        # Only path words that point at a peer home / bridge anchor / v2 anchor
+        # are write-target candidates; a bare data word (`plain`) is not.
+        if not _carries_bridge_marker(tok):
+            continue
+        checked_any = True
+        contained = _resolved_write_target_containment(tok, agent)
+        if contained is None:
+            return False  # escape / forbidden tree / un-analyzable → fail closed
+        if contained[1]:
+            references_peer = True
+    return checked_any and references_peer
 
 
 def _admin_sqlite3_task_db_audit(text: str, agent: str) -> str | None:
@@ -8090,18 +8236,29 @@ def protected_alias_reason(
 
     # Issue #1709 — prefix-spelling-agnostic Stage-B peer-home matcher. The
     # `_peer_alias_list` substring needles share the same brace/`$BRIDGE_HOME`
-    # gap as Stage-A: a non-admin (class=user) `cat
-    # ${HOME}/.agent-bridge/agents/<other>/MEMORY.md` matched NO alias and
-    # fell through to the `return None` ALLOW below. The suffix matcher
-    # (`/agents/<name>`) catches every prefix spelling and fail-closes on
-    # obfuscation. Scoped to NON-ADMIN only so admin Bash behavior is
-    # unchanged (the admin peer-read asymmetry between Bash and the non-Bash
-    # `protected_path_reason` Read path is #1711, out of scope here). A
-    # system-class agent that trips the suffix match still routes through
-    # the legitimate argv carve-out below (its brace-spelled path will fail
-    # the `_argv_occurrences_explain_text` proof and fail closed, which is
-    # the correct stance for an un-analyzable spelling).
-    if matched_alias is None and not admin:
+    # gap as Stage-A: a `cat ${HOME}/.agent-bridge/agents/<other>/MEMORY.md`
+    # matched NO alias and fell through to the `return None` ALLOW below. The
+    # suffix matcher (`/agents/<name>`) catches every prefix spelling and
+    # fail-closes on obfuscation.
+    #
+    # #1806 SPOOF GATE (regression fix, codex re-review of PR #1838): this match
+    # MUST run for admin too. The old `and not admin` scoping (added for the
+    # #1711 admin peer-READ Bash/non-Bash parity) left a SPOOFED-ADMIN peer
+    # WRITE bypass: a loose-admin (env-leg or SESSION-TYPE-leg, roster=non-admin)
+    # caller spelling the peer destination via `$BRIDGE_HOME`/`${BRIDGE_HOME}`
+    # matched NO `_peer_alias_list` alias, hit `matched_alias is None`, and
+    # returned ALLOW *before* the strict trusted_admin write leg could deny it
+    # (`printf x > $BRIDGE_HOME/agents/<peer>/MEMORY.md` ALLOWED while the
+    # absolute spelling DENIED). Running the suffix matcher for admin sets
+    # `matched_alias`, so the command routes through the admin carve-out legs
+    # below — and a `$BRIDGE_HOME`/brace spelling is an UNRESOLVED expansion, so
+    # BOTH the read leg and the write leg (each guarded by
+    # `not _has_unresolved_path_expansion(cross_scan)`) skip it and it DENIES
+    # (fail closed — the correct stance for an un-analyzable spelling, matching
+    # the non-admin path). A genuine admin peer access spelled absolutely / via
+    # `~`/`$HOME` already matched `_peer_alias_list` above, so its read carve-out
+    # / trusted write path is unchanged.
+    if matched_alias is None:
         peer_suffix_hit = _forbidden_suffix_in_command(
             cross_scan, _peer_forbidden_suffixes(agent)
         )
@@ -8137,15 +8294,51 @@ def protected_alias_reason(
     # strict `_command_has_shell_embedding`: ANY `$(…)` / backtick / proc-sub
     # / unquoted-or-unbalanced heredoc / interpreter-or-pipe-fed heredoc makes
     # the command ineligible for the carve-out and DENIES (fail closed).
+    #
+    # #1806 SPOOF GATE (regression fix): the WRITE leg of this carve-out is a
+    # cross-agent peer-home MUTATION, so — per #1806's invariant that every new
+    # peer-WRITE loosening gates on the STRICT, anti-spoof `trusted_admin`
+    # predicate, never on the spoofable `admin` OR-leg — a write only rides
+    # this allow when `trusted_admin` holds. A spoofer that exports
+    # `BRIDGE_ADMIN_AGENT_ID=<self>` and writes `session type: admin` into its
+    # own home flips loose `admin` True but NOT `trusted_admin` (the controller
+    # roster disagrees), so its peer `mkdir`/write stays DENIED. The READ leg
+    # keeps the looser `admin` gate — reads are lower risk and that is the
+    # pre-existing #1692 peer-read parity, unchanged here.
     if (
-        admin
+        read_intent
+        and admin
         and not _has_unresolved_path_expansion(cross_scan)
         and not _command_has_shell_embedding(cross_scan)
     ):
         _emit_admin_cross_agent_access_allowed(
             agent,
             target=matched_alias,
-            intent="read" if read_intent else "write",
+            intent="read",
+            sample=text,
+            tool_input=tool_input,
+        )
+        return None
+    # The WRITE leg deliberately does NOT pre-gate on
+    # `_has_unresolved_path_expansion`: a trusted-admin peer-home write may be
+    # spelled with a v2-anchor env var (`$BRIDGE_DATA_ROOT`/`$BRIDGE_HOME`,
+    # issue #1823) that `_admin_peer_write_targets_all_contained` RESOLVES to a
+    # concrete contained peer path (and audits). That helper is the resolved-
+    # path proof: it fails closed on ANY token it cannot reduce to a contained
+    # literal (an unresolved `$VAR`, a `..`/symlink escape, a forbidden tree, an
+    # in-program redirect escape), so an un-analyzable spelling still DENIES.
+    # The spoofed-admin `$BRIDGE_HOME` peer-write bypass is closed by the
+    # `trusted_admin` gate here, NOT by an expansion pre-check.
+    if (
+        not read_intent
+        and trusted_admin
+        and not _command_has_shell_embedding(cross_scan)
+        and _admin_peer_write_targets_all_contained(cross_scan, agent)
+    ):
+        _emit_admin_cross_agent_access_allowed(
+            agent,
+            target=matched_alias,
+            intent="write",
             sample=text,
             tool_input=tool_input,
         )

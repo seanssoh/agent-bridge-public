@@ -126,6 +126,28 @@ mkdir -p "$PEER_HOME/memory/shared"
 printf -- '# peer memory fixture\n' >"$PEER_HOME/MEMORY.md"
 printf -- '# peer shared note\n' >"$PEER_HOME/memory/shared/note.md"
 
+# Controller-roster snapshot (the strict-predicate test seam). The #1711 admin
+# Bash peer-home WRITE parity is a cross-agent MUTATION, so — per #1806 — it
+# gates on the STRICT, anti-spoof `trusted_admin` predicate, never on the
+# spoofable loose `admin` OR-leg (an agent can write `session type: admin` into
+# its own home). Publish a controller roster naming `patch-1692` the admin
+# static role (every other fixture agent admin=false) and export
+# BRIDGE_ADMIN_AGENT_ID=patch-1692 so the genuine admin's peer-WRITE is trusted,
+# while the non-admin / system agents stay NON-admin and their peer writes stay
+# denied. Honored only because BRIDGE_HOME resolves under a temp prefix; inert
+# in production (see scripts/smoke/1806-admin-guard-allow-audit.sh seam proof).
+ROSTER_JSON="$SMOKE_TMP_ROOT/controller-roster.json"
+printf -- '%s\n' \
+  '[' \
+  "  {\"agent\": \"${ADMIN_AGENT}\", \"admin\": true, \"source\": \"static\"}," \
+  "  {\"agent\": \"${USER_AGENT}\", \"admin\": false, \"source\": \"static\"}," \
+  "  {\"agent\": \"${SYS_AGENT}\", \"admin\": false, \"source\": \"static\"}," \
+  "  {\"agent\": \"${PEER_AGENT}\", \"admin\": false, \"source\": \"static\"}" \
+  ']' \
+  >"$ROSTER_JSON"
+export BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT"
+export BRIDGE_GUARD_ADMIN_ROSTER_JSON="$ROSTER_JSON"
+
 # Shared off-limits subtrees (private/ + secrets/) under $BRIDGE_HOME/shared.
 SHARED_PRIV_DIR="$BRIDGE_SHARED_DIR/private"
 SHARED_SECRETS_DIR="$BRIDGE_SHARED_DIR/secrets"

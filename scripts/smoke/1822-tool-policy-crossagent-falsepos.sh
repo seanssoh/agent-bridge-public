@@ -57,6 +57,25 @@ export BRIDGE_ADMIN_AGENT_ID="admin"
 # operator's real $HOME.
 export HOME="$BRIDGE_HOME"
 
+# Controller-roster snapshot (the strict-predicate test seam). The #1711 admin
+# Bash peer-home WRITE parity (Fix 4 / Fix 6a) is a cross-agent MUTATION, so —
+# per #1806 — it gates on the STRICT `trusted_admin` predicate, not the
+# spoofable loose `admin` OR-leg. Inject a controller-published roster naming
+# `admin` as the admin static role (and the peers as non-admin) so the genuine
+# admin's peer-WRITE is trusted; a SESSION-TYPE/env-only spoofer with no such
+# roster row stays NON-admin and its peer write is DENIED (covered end-to-end by
+# scripts/smoke/1806-admin-guard-allow-audit.sh Tooth 1). Honored only because
+# BRIDGE_HOME resolves under a temp prefix; inert in production.
+ROSTER_JSON="$SMOKE_TMP_ROOT/controller-roster.json"
+printf -- '%s\n' \
+  '[' \
+  '  {"agent": "admin", "admin": true, "source": "static"},' \
+  '  {"agent": "worker", "admin": false, "source": "static"},' \
+  '  {"agent": "intruder", "admin": false, "source": "dynamic"}' \
+  ']' \
+  >"$ROSTER_JSON"
+export BRIDGE_GUARD_ADMIN_ROSTER_JSON="$ROSTER_JSON"
+
 smoke_log "fixture: BRIDGE_HOME=$BRIDGE_HOME peer=$PEER (legacy tree)"
 
 OUT="$(BRIDGE_AGENT_ID="$PEER" PYTHONPATH="$SMOKE_REPO_ROOT/hooks" \
