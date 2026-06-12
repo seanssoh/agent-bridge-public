@@ -1496,7 +1496,7 @@ def _read_grant_ledger(ledger: Path) -> dict:
     versa.
     """
     try:
-        payload = json.loads(ledger.read_text(encoding="utf-8"))
+        payload = json.loads(ledger.read_text(encoding="utf-8"))  # noqa: raw-pathlib-controller-only
     except json.JSONDecodeError:
         return {}
     except PermissionError as exc:
@@ -1507,7 +1507,7 @@ def _read_grant_ledger(ledger: Path) -> dict:
         # re-published it), the iso UID cannot read it and recovery would
         # silently no-op. Surface it so the operator can re-run the share path
         # rather than mistaking it for "no snapshot".
-        if ledger.exists():
+        if ledger.exists():  # noqa: raw-pathlib-controller-only
             sys.stderr.write(
                 "[bridge-dev-plugin-cache] #1857: bridge-owned grant ledger present but "
                 "UNREADABLE (%s: %s) — recovery snapshot skipped; controller-side share "
@@ -1570,7 +1570,7 @@ def _write_ledger_snapshot(ledger: Path, plugins: dict, mode: int = 0o640) -> No
     import tempfile
 
     try:
-        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only
     except OSError:
         return
 
@@ -1617,7 +1617,7 @@ def _write_ledger_snapshot(ledger: Path, plugins: dict, mode: int = 0o640) -> No
             os.replace(tmp_name, str(ledger))
         except OSError:
             try:
-                os.unlink(tmp_name)
+                os.unlink(tmp_name)  # noqa: raw-pathlib-controller-only
             except OSError:
                 pass
     finally:
