@@ -914,3 +914,54 @@ Operator guidance:
   cross-agent reads.
 - Tracked as #1711; a follow-up will align the non-Bash path with the
   #1692 Bash least-privilege model.
+
+## 34. Queue-gateway client waits for the real response instead of false-failing a busy round-trip (#1837 / #1834)
+
+Under the file-transport queue gateway (`socket_listener=off`, the default),
+the daemon polls each agent's requests/ dir every ~5s, renames a request to
+`<id>.working.json` before processing it, and **always** writes a
+`responses/<id>.json` carrying the queue child's real exit code (including the
+idempotent `task already done` → 0). Under burst load that response arrives
+late, so the CLIENT'S read timed out and `cmd_client` raised
+`queue gateway timed out` + exit 1 even though the write had committed.
+Autonomous callers treated the committed write as a failure and **retried**,
+piling on more request files and compounding the contention into a
+self-reinforcing thrash (#1837). #1834 is the same surface: transient 1–6×
+per-call timeouts against a live daemon, with no built-in retry.
+
+Key boundary fact: `cmd_client` runs **only** as an isolated-agent UID, whose
+env sets `BRIDGE_TASK_DB=/dev/null` + `BRIDGE_GATEWAY_PROXY=1` so the agent
+cannot touch the controller task DB directly (the entire reason the gateway
+exists; see `lib/bridge-agents.sh` "BRIDGE_TASK_DB is sentineled" / #287 /
+#294). So the client has exactly one authoritative outcome signal — the
+daemon's response file — and the fix is to **wait long enough to read it**, not
+to guess the outcome from a DB it cannot read:
+
+- **Bounded read-side retry (#1834 + #1837 keystone).** Before declaring a read
+  timeout the client re-polls a few extra windows with growing backoff. The
+  daemon's response carries the real exit code, so once the bounded wait reads
+  it the client returns that **real** code (idempotent `already done` → 0
+  included) instead of a false exit 1 — the keystone is "read the real response,
+  don't give up early," never "assume the write landed." The retry only waits
+  for the response; it never re-queues a fresh write (that re-queue is the very
+  thrash being fixed), and the request the daemon may still be draining as
+  `<id>.working.json` is untouched. Tunable via
+  `BRIDGE_QUEUE_GATEWAY_READ_RETRIES` (default 3) and
+  `BRIDGE_QUEUE_GATEWAY_READ_BACKOFF_SECONDS` (default 0.5).
+- **Honest timeout, never a fabricated success.** When the bounded retry still
+  exhausts without a response, the client surfaces the real timeout (nonzero)
+  and removes the now-stale `<id>.request.json` so the next CLI call does not
+  pile a duplicate request on top. It never returns a success the daemon did
+  not actually report — the iso UID has no way to confirm an outcome other than
+  the response file.
+- **Daemon-down primitive (`gateway_daemon_liveness`).** A tri-state
+  `up` / `down` / `unknown`. From an iso UID that cannot read the controller's
+  daemon pid file, it returns **`unknown`** (not a false `down`) — status
+  presentation must render that as "unknown", never "down" (#1837 symptom 3).
+  The pid-file path follows the canonical resolution (`BRIDGE_DAEMON_PID_FILE`
+  when set, else `<BRIDGE_STATE_DIR>/daemon.pid`), so relocated/custom-pid-file
+  installs are read correctly. Exposed as the
+  `bridge-queue-gateway.py daemon-liveness [--format json]` subcommand for A3
+  (#1833 status presentation) to consume across the boundary.
+
+This is the client contract only; the daemon's write path is unchanged.
