@@ -251,6 +251,7 @@ lib/bridge-isolation-v2.sh	3167	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01e
 lib/bridge-isolation-v2.sh	3258	H3	58a0b7f22b5c4ee542c9dab74c5b4b42a91ebe63e6221f3e5ab657a398647407	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v2.sh	3501	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	same cred-ancestors procsub pattern as existing baselined sites L2213/L2256/L2347 - bash function consumer, not an interpreter subprocess; footgun #11 N/A	agb-dev-claude wave v0145	Phase 5 PR E (review per site)
 lib/bridge-isolation-v3-channel-dotenv.sh	509	H3	6ea2bf841d5322aa59c0f8097db35b7e96c081e55a995361e6b266badbd089a6	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-layout-v2-reconcile.sh	325	H3	6e31ae2ac7e074df478e78434818966ef8cfe2841f095abafffca5dbbdf64ce8	here-string/procsub, non-interpreter consumer	claude	#1820 v2-reconcile — H3 read-<<< feeding while/done loop (no subprocess deadlock surface)
 lib/bridge-migration.sh	74	C3	6702fdf57ae0cefde8722a08390e40596652642313009dad2e89585410426973	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-migration.sh	523	H3	f64739c8415ed716683a8a0d9c83f6f72857a67e8a1d1fe24ed920e0538accfa	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-skills.sh	80	C3	f3cebbf19540e5f4cdba6f0f143808a5b81a181d641e5c10c2a93279eddad24d	interpreter heredoc, no capture	patch	Phase 3 PR C
