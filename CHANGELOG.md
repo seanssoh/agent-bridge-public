@@ -4,6 +4,19 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.16.10-rc2] — 2026-06-13
+
+**Second release candidate — observability hardening for the layout-v2 reconcile, found during the rc1 fleet soak on sean-mac (drift verified zero).** No change to the migration's data logic (the gate-2-approved fencing / fail-closed reconciliation is byte-identical); these are the two NON-BLOCKING observability bugs from the rc1 soak, fixed so the cm-prod edge soak (the first host where the v1→v2 reconciliation actually moves data) can audit the migration result and verify zero drift.
+
+### Fixed
+
+- **layout-v2 reconcile always writes a structured result at a consistent path (#1820 soak).** On a no-op reconcile the upgrade left a 0-byte file, and the log message named `state/migration/layout-v2-reconcile/last-apply.json` while the code actually wrote `…-reconcile-upgrade.json` (path mismatch). The reconcile now persists a structured JSON (`status: noop|applied`, agent/isolation migration sub-results, copied/preserved/conflicted/skipped/warnings) at one canonical path (`state/migration/layout-v2-reconcile/last-apply.json`) that the writer, the upgrade log message, and the apply-gated smoke all agree on — so every fleet host's migration is auditable.
+- **Stale `last-error.json` is cleared on a successful migration pass.** A prior failed `isolation-v2-migrate` error file lingered after a later successful run (this run's `isolation_v2_migration` returned `status: ok`), misleading diagnostics. A successful migration now supersedes the specific `state/migration/last-error.json` it resolves (success-scoped; a genuine error is still written/kept).
+
+### Soak
+
+- rc1 verified **clean on sean-mac (drift 0)**: 8 agents settings-v2-normalized, memory preserved (no strand/fork), v1 tree kept as rollback evidence, rotation pool (incl. #1790/#1789) healthy. rc2 carries only the two observability fixes above; next: cm-prod edge soak → v0.16.10 LTS.
+
 ## [0.16.10-rc1] — 2026-06-13
 
 **Release candidate for the next v0.16 LTS — a large reliability + migration train that closes the dynamic-agent restart footgun, makes operator plugin/setting provisioning survive recreate, and lands a gated layout-v2 four-writer migration that stops legacy installs from forking agent memory.** This is an `-rc` prerelease for fleet soak (MacBook + cm-prod edge upgrade-with-migration verification) before the v0.16.10 LTS tag. Every code lane went through the queue pair-review gate (agb-dev-codex); the two data-loss/iso-sensitive lanes (#1857 provisioning preserve, #1820 layout-v2 migration) additionally cleared the independent `patch` adversarial gate, which across four rounds caught real defects the internal review missed — a fleet-default class-a/class-b taxonomy downgrade (`@../evil` empty-half + traversal), a foreign-symlink **ancestor** write-escape in the reconciler, and an upgrade dispatch that declared success after a reconcile refusal. The `#1838` tool-policy lane was likewise caught by CI before merge — a heredoc-body exclusion had opened a spoofed-admin peer-write bypass (#1806 Tooth1). `agb upgrade` is the same path; the layout-v2 migration runs as one gated, fail-closed, daemon-down step with both-side backups and a v1→v2 reconciliation that never strands or double-writes memory.
