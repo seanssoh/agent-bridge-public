@@ -969,9 +969,18 @@ esac
 #          rc!=0, unsafe warning, and NO convergence write (argv never written).
 # ---------------------------------------------------------------------------
 # Shared decoy cwd: real files a stray glob would expand to in every sub-case.
+# CRITICAL (codex gate-2 r3): the decoys MUST MATCH the tested glob token, or a
+# no-glob assertion is vacuous. T15a's token is `*@agent-bridge`; under the OLD
+# unquoted-split bug Bash would expand `*@agent-bridge` against the cwd — so the
+# decoys are named `<x>@agent-bridge` to be live matches. With the fix the token
+# stays literal; with the bug it would expand to these decoy basenames and the
+# leak assertion fires. (Plain `decoy-a` would NOT match `*@agent-bridge`, so the
+# glob would have stayed literal even under the bug — a false pass.)
 T15_CWD="$SMOKE_TMP_ROOT/t15-cwd"
 mkdir -p "$T15_CWD"
-: >"$T15_CWD/decoy-a"; : >"$T15_CWD/decoy-b"; : >"$T15_CWD/decoy-c"
+: >"$T15_CWD/decoyA@agent-bridge"
+: >"$T15_CWD/decoyB@agent-bridge"
+: >"$T15_CWD/decoyC@agent-bridge"
 REAL_PY3="$(command -v python3)"
 
 # Per-case captured-argv path. Deterministic from the case tag so the PARENT
@@ -1058,8 +1067,11 @@ ch = flag("channels").split(",") if flag("channels") else []
 opt = flag("optional-channels").split(",") if flag("optional-channels") else []
 literal = "plugin:*@agent-bridge"
 # Literal token must be present in channels AND optional; and NO decoy filename
-# may have leaked in (a glob bug would have replaced `*` with decoy-a/b/c).
-leaked = any("decoy-" in t for t in ch + opt)
+# may have leaked in. The decoys (`decoyA@agent-bridge` ...) are LIVE matches
+# for the `*@agent-bridge` glob, so under the old unquoted-split bug `*` would
+# have expanded to `plugin:decoyA@agent-bridge` etc. — the substring `decoy`
+# appearing in any qualified channel is the unambiguous expansion signature.
+leaked = any("decoy" in t.lower() for t in ch + opt)
 ok = (literal in ch) and (literal in opt) and not leaked
 print("GOOD" if ok else "BAD: channels=%r optional=%r leaked=%s" % (ch, opt, leaked))
 PY
