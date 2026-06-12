@@ -2604,6 +2604,23 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
 
   bridge_isolation_v2_migrate_marker_write "$data_root"
 
+  # GENUINE success: the global v2 marker is written and every per-agent marker
+  # is present (asserted above). Clear the isolation-v2-migrate last-error.json
+  # this pass supersedes so a STALE error from a PRIOR failed run (e.g. a
+  # groups-ensure failure the night before) does not mislead a diagnostician
+  # into thinking the now-healthy migration failed (rc2 soak observability).
+  # Scope: we ONLY touch $err_log — the exact file THIS function's own error
+  # branches write (state/migration/last-error.json) — never a different
+  # migration concern's error file. Overwrite-with-success (not rm) so the
+  # cleared state is auditable: a reader sees an explicit ok stamp, not an
+  # absent file that could equally mean "never ran". Best-effort; never fatal.
+  if [[ -n "${err_log:-}" && -f "$err_log" ]]; then
+    local _clr_ts
+    _clr_ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+    printf '{"mode":"isolation-v2-migrate","status":"ok","cleared":true,"note":"prior last-error superseded by a successful migration pass","cleared_at":"%s"}\n' \
+      "$_clr_ts" >"$err_log" 2>/dev/null || true
+  fi
+
   if [[ "$active_count" -gt 0 ]]; then
     bridge_isolation_v2_migrate_orchestrate_restart "$active_snapshot"
   fi

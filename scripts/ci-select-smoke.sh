@@ -115,7 +115,15 @@ add_required 1425-cron-dispatch-nudge-scope
 # gated apply (wrapper end-to-end incl. the fail-closed quiesce fence), and the
 # post-apply source invariant. In the full static suite so any writer or
 # reconcile edit re-runs the whole matrix.
-add_required 1820-cron-writer-v2-candidate 1820-precompact-resolved-env-v2 1820-settings-v2-render-symlink 1820-doc-sync-v2-target-root 1820-reconcile-conflict-policy 1820-reconcile-dryrun-inventory 1820-reconcile-apply-gated 1820-post-apply-invariant
+add_required 1820-cron-writer-v2-candidate 1820-precompact-resolved-env-v2 1820-settings-v2-render-symlink 1820-doc-sync-v2-target-root 1820-reconcile-conflict-policy 1820-reconcile-dryrun-inventory 1820-reconcile-apply-gated 1820-post-apply-invariant 1820-upgrade-reconcile-fail-closed
+# rc2 fleet-soak observability hardening for the #1820 reconcile/upgrade path:
+# the reconcile ALWAYS writes a structured result at the canonical
+# state/migration/layout-v2-reconcile/last-apply.json (status noop|applied,
+# never a 0-byte file), the upgrade redirect + log message name that SAME path,
+# and a genuine isolation-v2 migration success clears the stale last-error it
+# supersedes. In the full static suite so any reconcile/upgrade/migrate edit
+# re-runs the observability guard.
+add_required rc2-reconcile-observability
 # Issue #1835: bridge-queue-gateway.py's SOCKET-transport client preflight
 # (_read_inline_text) now applies the #1280 sudo-as-owner body-file fallback on
 # PermissionError, with an actionable iso-ownership error when it cannot apply.

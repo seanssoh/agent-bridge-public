@@ -3028,18 +3028,28 @@ if [[ $DRY_RUN -eq 0 ]]; then
     # already daemon-down stays down (we simply do not bring it back up below).
     # `--force` because the upgrader is the sanctioned daemon stop path.
     bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
-    mkdir -p "$TARGET_ROOT/state/migration" "$TARGET_ROOT/logs" 2>/dev/null || true
+    # CANONICAL reconcile result path. The driver/wrapper ALSO writes this same
+    # marker itself (apply + structured no-op), so the redirect target and the
+    # wrapper-owned marker, the log message below, and the apply-gated smoke all
+    # name ONE file — no more path mismatch (log said .../layout-v2-reconcile/
+    # last-apply.json while the redirect wrote .../layout-v2-reconcile-upgrade
+    # .json) and no more 0-byte result on a no-op (the wrapper now emits a
+    # structured object on stdout for BOTH apply and no-op). rc2 soak
+    # observability: the result file is ALWAYS present, non-empty, and structured.
+    _reconcile_result_rel="state/migration/layout-v2-reconcile/last-apply.json"
+    _reconcile_result_path="$TARGET_ROOT/$_reconcile_result_rel"
+    mkdir -p "$TARGET_ROOT/state/migration/layout-v2-reconcile" "$TARGET_ROOT/logs" 2>/dev/null || true
     # shellcheck source=lib/bridge-layout-v2-reconcile.sh
     BRIDGE_HOME="$TARGET_ROOT" BRIDGE_SCRIPT_DIR="$TARGET_ROOT" \
       bash "$TARGET_ROOT"/lib/bridge-layout-v2-reconcile-driver.sh apply \
-      >"$TARGET_ROOT/state/migration/layout-v2-reconcile-upgrade.json" 2>>"$TARGET_ROOT/logs/upgrade.log"
+      >"$_reconcile_result_path" 2>>"$TARGET_ROOT/logs/upgrade.log"
     _reconcile_rc=$?
     case "$_reconcile_rc" in
       0)
-        echo "[bridge-upgrade] layout-v2 reconcile: applied (see state/migration/layout-v2-reconcile/last-apply.json)" >&2
+        echo "[bridge-upgrade] layout-v2 reconcile: applied (see $_reconcile_result_rel)" >&2
         ;;
       2)
-        echo "[bridge-upgrade] layout-v2 reconcile: nothing to do (legacy/non-v2 install or no v1-only data) — proceeding." >&2
+        echo "[bridge-upgrade] layout-v2 reconcile: nothing to do (legacy/non-v2 install or no v1-only data) — structured no-op result at $_reconcile_result_rel; proceeding." >&2
         ;;
       *)
         # Refusal (3) or internal error (1) on a v2 install with a reconcile to
@@ -3053,7 +3063,7 @@ if [[ $DRY_RUN -eq 0 ]]; then
         {
           echo "[bridge-upgrade] FATAL: layout-v2 reconcile FAILED/REFUSED (rc=$_reconcile_rc) on a v2 install with v1 data to migrate."
           echo "[bridge-upgrade] This is a mandatory same-release migration; refusing to mark the upgrade complete or restart the daemon over a stranded v1->v2 memory fork."
-          echo "[bridge-upgrade] Diagnostics: state/migration/layout-v2-reconcile-upgrade.json and logs/upgrade.log."
+          echo "[bridge-upgrade] Diagnostics: $_reconcile_result_rel and logs/upgrade.log."
           echo "[bridge-upgrade] Resolve the blocker (e.g. ensure the daemon is fully stopped) and re-run the upgrade; the reconcile is idempotent. The daemon has been left STOPPED."
         } >&2
         # Emit a structured FAILURE marker (status=failed) so automation can
