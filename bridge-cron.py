@@ -54,6 +54,19 @@ _RUN_STATUS_FAILED_STATES = {"error", "timed_out"}
 # is no "failed" queue state. Source: bridge-queue.py status enum + #533.
 _QUEUE_TERMINAL_STATUSES = {"done", "cancelled"}
 
+# Issue #1843 (secondary footgun) — a recurring cron that fails on EVERY run
+# accumulates `consecutiveErrors` silently with no human escalation. In the
+# field this hid a 7-day, 1898-consecutive-error outage of a customer-facing
+# pipeline. The primary tamper-check root cause is fixed under #1842; this is
+# the blast-radius amplifier: sustained back-to-back failures must trip a
+# human-visible escalation rather than climbing forever in the dashboard only.
+#
+# Escalate the FIRST time the counter reaches the threshold, then re-escalate
+# on the same cadence (every Nth additional consecutive failure) so a job that
+# stays broken keeps surfacing without spamming an alert every single run.
+CRON_CONSECUTIVE_FAILURE_ESCALATE_AT = 5
+CRON_CONSECUTIVE_FAILURE_RENOTIFY_EVERY = 25
+
 SHELL_PAYLOAD_ENV_PREFIXES = ("POLL_", "SCRIPT_")
 SHELL_PROTECTED_ENV_EXACT = {"HOME", "PATH"}
 SHELL_PROTECTED_ENV_PREFIXES = ("BRIDGE_", "CRON_")
@@ -2371,6 +2384,53 @@ def run_migrate_payloads(args):
     return 0
 
 
+def _cron_consecutive_failure_escalation(consecutive_errors):
+    """Decide whether this failure crosses the escalation threshold/cadence.
+
+    Issue #1843 (secondary footgun). Returns True exactly when an alert
+    should fire for `consecutive_errors`:
+
+    - the first time the counter reaches CRON_CONSECUTIVE_FAILURE_ESCALATE_AT
+      (so a chronically-broken job surfaces early), and
+    - every CRON_CONSECUTIVE_FAILURE_RENOTIFY_EVERY failures thereafter (so a
+      job that stays broken keeps surfacing without alerting on every run).
+
+    Deterministic in the counter alone — no clock, no state read — so the
+    smoke can pin every boundary. Below the threshold returns False.
+    """
+    try:
+        n = int(consecutive_errors)
+    except (TypeError, ValueError):
+        return False
+    if n < CRON_CONSECUTIVE_FAILURE_ESCALATE_AT:
+        return False
+    if n == CRON_CONSECUTIVE_FAILURE_ESCALATE_AT:
+        return True
+    return (n - CRON_CONSECUTIVE_FAILURE_ESCALATE_AT) % CRON_CONSECUTIVE_FAILURE_RENOTIFY_EVERY == 0
+
+
+def _emit_cron_consecutive_failure_audit(job_id, agent, consecutive_errors, last_error, run_id):
+    """Append a `cron_consecutive_failure_escalated` row to the audit log.
+
+    Best-effort (reuses emit_cron_mutation_audit's never-raise contract). This
+    is the durable, machine-agnostic escalation signal #1843 pins: a human /
+    admin agent watching the audit chain sees the back-to-back-failure trip
+    even when the run's own `delivery_intent` is `silent`.
+    """
+    emit_cron_mutation_audit(
+        "cron_consecutive_failure_escalated",
+        str(job_id),
+        {
+            "job_id": str(job_id),
+            "agent": str(agent or "<unknown>"),
+            "consecutive_errors": int(consecutive_errors),
+            "threshold": CRON_CONSECUTIVE_FAILURE_ESCALATE_AT,
+            "last_error": str(last_error or ""),
+            "run_id": str(run_id or ""),
+        },
+    )
+
+
 def run_native_finalize(args):
     jobs_path = Path(args.jobs_file).expanduser().resolve()
     request_path = Path(args.request_file).expanduser().resolve()
@@ -2526,11 +2586,16 @@ def run_native_finalize(args):
             # can still render *something* identifying the task row.
             job_state["lastInboxTaskId"] = str(last_inbox_task_id)
 
+    # Issue #1843 — escalation block surfaced to the shell wrapper; stays None
+    # except on the failure branch when the threshold/cadence trips.
+    finalize_escalation = None
+
     if final_status == "success":
         job_state["nextRunAtMs"] = 0
         job_state["consecutiveErrors"] = 0
         job_state.pop("lastErrorAtMs", None)
         job_state.pop("lastError", None)
+        job_state.pop("lastEscalatedErrorCount", None)
         # Issue #614: clear deferred-retry provenance so the next deferral
         # captures a fresh original slot.
         job_state.pop("deferredRetryOfSlot", None)
@@ -2585,7 +2650,8 @@ def run_native_finalize(args):
             previous_errors = int(job_state.get("consecutiveErrors") or 0)
         except (TypeError, ValueError):
             previous_errors = 0
-        job_state["consecutiveErrors"] = previous_errors + 1
+        consecutive_errors = previous_errors + 1
+        job_state["consecutiveErrors"] = consecutive_errors
         job_state["lastErrorAtMs"] = now_ms_value
         job_state["lastError"] = (
             result.get("runner_error")
@@ -2593,6 +2659,30 @@ def run_native_finalize(args):
             or result.get("summary")
             or "cron run failed"
         )
+        # Issue #1843 (secondary footgun) — trip a human-visible escalation
+        # when a recurring cron fails back-to-back past the threshold/cadence,
+        # so a chronically-broken job (e.g. the iso text-payload tamper-check
+        # failure that fixed under #1842) can no longer accumulate silently for
+        # days. The audit row is the durable signal; `finalize_escalation` is
+        # surfaced in the payload so the shell wrapper can also notify the
+        # owning agent. `lastEscalatedErrorCount` records the last count we
+        # alerted on for provenance / dashboard use.
+        if _cron_consecutive_failure_escalation(consecutive_errors):
+            finalize_escalation = {
+                "kind": "consecutive_failure",
+                "agent": job.get("agentId") or job.get("agent") or "<unknown>",
+                "consecutive_errors": consecutive_errors,
+                "threshold": CRON_CONSECUTIVE_FAILURE_ESCALATE_AT,
+                "last_error": job_state["lastError"],
+            }
+            job_state["lastEscalatedErrorCount"] = consecutive_errors
+            _emit_cron_consecutive_failure_audit(
+                job_id,
+                finalize_escalation["agent"],
+                consecutive_errors,
+                job_state["lastError"],
+                run_id,
+            )
 
     action = "updated"
     if schedule.get("kind") == "at":
@@ -2628,6 +2718,11 @@ def run_native_finalize(args):
         "final_status": final_status,
         "jobs_file": str(jobs_path),
     }
+    # Issue #1843 — surface the consecutive-failure escalation so the shell
+    # wrapper (run_finalize) can notify the owning agent in addition to the
+    # durable audit row already written above.
+    if finalize_escalation is not None:
+        payload["escalation"] = finalize_escalation
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
@@ -2637,6 +2732,13 @@ def run_native_finalize(args):
         print(f"run_id: {run_id}")
         print(f"final_status: {final_status}")
         print(f"jobs_file: {jobs_path}")
+        if finalize_escalation is not None:
+            print(
+                "escalation: consecutive_failure "
+                f"agent={finalize_escalation['agent']} "
+                f"consecutive_errors={finalize_escalation['consecutive_errors']} "
+                f"threshold={finalize_escalation['threshold']}"
+            )
     return 0
 
 
