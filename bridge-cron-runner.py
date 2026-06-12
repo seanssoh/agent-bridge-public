@@ -3936,34 +3936,44 @@ def cmd_run(args: argparse.Namespace) -> int:
     run_id = request.get("run_id", "")
     workdir = request.get("target_workdir", "")
     run_dir = request_file.parent
-    # Payload INPUT leaf — derived from the original run_dir by its canonical
-    # name, NOT taken from the request body through `.resolve()` (#1842 codex
-    # r4, the input-leaf twin of the r3 output-leaf fix). The legitimate
-    # per-run payload is always `<run_dir>/payload.md`
-    # (`bridge_cron_payload_file_by_id`), and the body's `payload_file` always
-    # names that sibling. The r3 head took `request["payload_file"]` through
-    # `.expanduser().resolve()` — a symlink-FOLLOW on the leaf — so an iso UID
-    # who pre-plants `payload.md` as a symlink in the group-writable
-    # (3770 sticky) run dir before the controller builds the prompt wins: the
-    # resolve follows it and `Path.read_text()` reads a controller-private
-    # target straight into the cron prompt (codex r4: SECRET_SENTINEL leaked
-    # as payload_text). Sourcing the leaf from run_dir removes the
-    # body-path trust dependency entirely (a body path can never redirect the
-    # read outside the run dir), and the read below goes through
-    # `_read_text_nofollow` so a symlinked `payload.md` raises ELOOP →
-    # terminal tamper, never a silent read-through. We still reject a body that
-    # declares a NON-canonical payload_file (a tampered request naming a
-    # different file): the declared path, normalized lexically WITHOUT a
-    # symlink follow, must equal the canonical run-dir leaf.
-    payload_file = run_dir / "payload.md"
+    # Payload INPUT leaf — confined to the original run_dir, NOT taken from
+    # the request body through `.resolve()` (#1842 codex r4, the input-leaf
+    # twin of the r3 output-leaf fix). The scheduler's per-run payload is
+    # `<run_dir>/payload.md` (`bridge_cron_payload_file_by_id`), but other
+    # legitimate producers (preflight / claude-token-rotation harnesses) name
+    # a differently suffixed run-dir sibling (`payload.txt`), so the contract
+    # is run-dir CONTAINMENT, not one exact leaf name: the declared path's
+    # parent directory must be the run dir itself. The r3 head took
+    # `request["payload_file"]` through `.expanduser().resolve()` — a
+    # symlink-FOLLOW on the leaf — so an iso UID who pre-plants `payload.md`
+    # as a symlink in the group-writable (3770 sticky) run dir before the
+    # controller builds the prompt wins: the resolve follows it and
+    # `Path.read_text()` reads a controller-private target straight into the
+    # cron prompt (codex r4: SECRET_SENTINEL leaked as payload_text). The
+    # containment check below never resolves the LEAF: the declared path is
+    # normalized lexically, then its PARENT DIRECTORY is compared to the run
+    # dir via `os.path.realpath` on BOTH sides — dir-level canonicalization
+    # only, required because a symlinked tmp prefix (macOS `/tmp` →
+    # `/private/tmp`, CI tmp mounts) must not fail byte-identical intent,
+    # while a declared parent that is NOT the run dir (the E1k
+    # out-of-run-dir tamper case) still hard-fails. The path actually OPENED
+    # is rebuilt as `run_dir / <basename>` — the body contributes only a
+    # separator-free basename (`Path.name` of a lexically-normalized abspath
+    # cannot contain `/` or collapse to `..`), so a body path can never
+    # redirect the read outside the run dir — and the read below goes through
+    # `_read_text_nofollow` so a symlinked leaf raises ELOOP → terminal
+    # tamper, never a silent read-through.
     declared_payload = request.get("payload_file")
-    declared_norm = (
-        Path(os.path.abspath(os.path.expanduser(str(declared_payload))))
-        if declared_payload is not None
-        else None
-    )
-    if declared_norm != payload_file:
-        error_message = "request_artifact_tampered: payload_file is not the canonical run-dir leaf"
+    payload_file = None
+    if declared_payload is not None:
+        declared_norm = Path(os.path.abspath(os.path.expanduser(str(declared_payload))))
+        leaf_name = declared_norm.name
+        if leaf_name not in ("", ".", "..") and os.path.realpath(
+            str(declared_norm.parent)
+        ) == os.path.realpath(str(run_dir)):
+            payload_file = run_dir / leaf_name
+    if payload_file is None:
+        error_message = "request_artifact_tampered: payload_file is not a run-dir leaf"
         write_shell_terminal_error(
             request_file,
             runner_error="request_artifact_tampered",
