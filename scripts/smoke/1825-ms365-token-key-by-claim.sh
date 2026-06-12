@@ -191,25 +191,25 @@ HARNESS_EOF
   }
 
   # T1 — opaque aadObjectId input, real UPN from id_token claim.
-  HARNESS_CLAIMS='{"preferred_username":"alice@contoso.com"}'; HARNESS_GRAPH_UPN=''
+  HARNESS_CLAIMS='{"preferred_username":"alice@example.com"}'; HARNESS_GRAPH_UPN=''
   OUT="$(run_harness "00000000-aaaa-bbbb-cccc-111122223333")"
   # The durable key + `upn` field are the REAL UPN; the filename is its slug
-  # (slugUpn maps `@` → `_`, so alice@contoso.com → alice_contoso.com.json).
-  if printf '%s' "$OUT" | grep -q '"keyed_upn":"alice@contoso.com"' \
-     && printf '%s' "$OUT" | grep -q '"token_files":\["alice_contoso.com.json"\]' \
-     && printf '%s' "$OUT" | grep -q '"on_disk_upn":"alice@contoso.com"'; then
-    _pass "T1: opaque input keyed by the id_token claim → tokens/alice_contoso.com.json, upn field = real UPN"
+  # (slugUpn maps `@` → `_`, so alice@example.com → alice_example.com.json).
+  if printf '%s' "$OUT" | grep -q '"keyed_upn":"alice@example.com"' \
+     && printf '%s' "$OUT" | grep -q '"token_files":\["alice_example.com.json"\]' \
+     && printf '%s' "$OUT" | grep -q '"on_disk_upn":"alice@example.com"'; then
+    _pass "T1: opaque input keyed by the id_token claim → tokens/alice_example.com.json, upn field = real UPN"
   else
-    _fail "T1" "expected keyed_upn/on_disk_upn=alice@contoso.com, file=alice_contoso.com.json; got: $OUT"
+    _fail "T1" "expected keyed_upn/on_disk_upn=alice@example.com, file=alice_example.com.json; got: $OUT"
   fi
   unset HARNESS_CLAIMS HARNESS_GRAPH_UPN
 
   # T2 — a FORGED opaque input + a different authenticated claim: the claim wins.
-  HARNESS_CLAIMS='{"preferred_username":"real@contoso.com"}'; HARNESS_GRAPH_UPN=''
-  OUT="$(run_harness "attacker@evil.example")"
-  if printf '%s' "$OUT" | grep -q '"keyed_upn":"real@contoso.com"' \
-     && ! printf '%s' "$OUT" | grep -q 'attacker@evil.example'; then
-    _pass "T2: forged input ignored — durable key is the authenticated claim (real@contoso.com)"
+  HARNESS_CLAIMS='{"preferred_username":"real@example.com"}'; HARNESS_GRAPH_UPN=''
+  OUT="$(run_harness "attacker@example.test")"
+  if printf '%s' "$OUT" | grep -q '"keyed_upn":"real@example.com"' \
+     && ! printf '%s' "$OUT" | grep -q 'attacker@example.test'; then
+    _pass "T2: forged input ignored — durable key is the authenticated claim (real@example.com)"
   else
     _fail "T2" "forged input should not determine the key; got: $OUT"
   fi
@@ -220,7 +220,7 @@ HARNESS_EOF
   # so the code falls back to the opaque input, whose slug must still be
   # confined to the tokens dir (no '/' survives, '..' collapses to '_').
   HARNESS_CLAIMS='{"preferred_username":"../../../../etc/passwd@x"}'; HARNESS_GRAPH_UPN=''
-  OUT="$(run_harness "../../evil@contoso.com")"
+  OUT="$(run_harness "../../evil@example.com")"
   files_line="$(printf '%s' "$OUT" | sed -n 's/.*"token_files":\(\[[^]]*\]\).*/\1/p')"
   # No produced token file may contain a slash or a surviving '..' run — the
   # slug strips '/' and collapses '..' so the key stays inside tokens/. The
@@ -236,11 +236,11 @@ HARNESS_EOF
   unset HARNESS_CLAIMS HARNESS_GRAPH_UPN
 
   # T4 — no id_token claim → Graph /me fallback supplies the real UPN.
-  HARNESS_CLAIMS=''; HARNESS_GRAPH_UPN='bob@contoso.com'
+  HARNESS_CLAIMS=''; HARNESS_GRAPH_UPN='bob@example.com'
   OUT="$(run_harness "11111111-aaaa-bbbb-cccc-222233334444")"
-  if printf '%s' "$OUT" | grep -q '"keyed_upn":"bob@contoso.com"' \
-     && printf '%s' "$OUT" | grep -q '"on_disk_upn":"bob@contoso.com"'; then
-    _pass "T4: no id_token → Graph /me fallback keys by the real UPN (bob@contoso.com)"
+  if printf '%s' "$OUT" | grep -q '"keyed_upn":"bob@example.com"' \
+     && printf '%s' "$OUT" | grep -q '"on_disk_upn":"bob@example.com"'; then
+    _pass "T4: no id_token → Graph /me fallback keys by the real UPN (bob@example.com)"
   else
     _fail "T4" "graph /me fallback should supply the key; got: $OUT"
   fi
@@ -248,8 +248,8 @@ HARNESS_EOF
 
   # T5 — neither claim source resolves → degrade to the opaque input (never block).
   HARNESS_CLAIMS=''; HARNESS_GRAPH_UPN=''
-  OUT="$(run_harness "carol@contoso.com")"
-  if printf '%s' "$OUT" | grep -q '"keyed_upn":"carol@contoso.com"'; then
+  OUT="$(run_harness "carol@example.com")"
+  if printf '%s' "$OUT" | grep -q '"keyed_upn":"carol@example.com"'; then
     _pass "T5: both claim sources empty → degrade to the opaque input (pairing not blocked)"
   else
     _fail "T5" "should fall back to the opaque input when no claim resolves; got: $OUT"
