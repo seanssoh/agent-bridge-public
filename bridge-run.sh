@@ -1605,6 +1605,27 @@ bridge_run_export_claude_launch_env() {
   [[ -n "$agent_home" ]] && export HOME="$agent_home"
 }
 
+bridge_run_ledger_has_snapshot() {
+  # Issue #1857: true when the bridge-owned grant ledger at $1 records a
+  # non-empty `installed_snapshot.plugins` map (an operator recovery snapshot
+  # worth a recovery-only manifest pass even with zero channel-declared
+  # plugins). Best-effort: a missing/unreadable/legacy `{"channels":[...]}`
+  # ledger returns non-zero.
+  local ledger="$1"
+  [[ -n "$ledger" && -f "$ledger" && -r "$ledger" ]] || return 1
+  python3 - "$ledger" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(1)
+snap = data.get("installed_snapshot") if isinstance(data, dict) else None
+plugins = snap.get("plugins") if isinstance(snap, dict) else None
+sys.exit(0 if isinstance(plugins, dict) and plugins else 1)
+PY
+}
+
 bridge_run_sync_dev_plugin_cache() {
   # v0.9.7 RC6 (refs #781): the Python linker is now criticality-aware.
   # Channel-required plugin failures (declared via BRIDGE_AGENT_CHANNELS=
@@ -1628,7 +1649,51 @@ bridge_run_sync_dev_plugin_cache() {
   [[ "$ENGINE" == "claude" ]] || return 0
   [[ $SAFE_MODE -eq 0 ]] || return 0
   channels="$(bridge_agent_effective_dev_channels_csv "$AGENT")"
-  [[ -n "$channels" ]] || return 0
+
+  # Issue #1857: the bridge-owned plugin grant ledger holds the operator's
+  # installed-plugins recovery snapshot (extending the existing
+  # `{"channels":[...]}` ledger). Resolved from the controller-trusted
+  # `$BRIDGE_STATE_DIR` (NOT the env-overridable plugin roots), pinned by the
+  # canonical helper, and passed as an explicit path so the Python writer can
+  # restore operator plugins after a recreate wipe without ever mutating
+  # Claude's manifest for bookkeeping or writing a parallel `.bak`.
+  local _plugin_grant_ledger=""
+  if declare -F bridge_isolated_plugin_grants_state_file >/dev/null 2>&1; then
+    _plugin_grant_ledger="$(bridge_isolated_plugin_grants_state_file "$AGENT" 2>/dev/null || true)"
+  fi
+
+  # A dynamic agent with NO plugin: channels but operator-installed plugins
+  # (claude-hud installed ad-hoc, recorded in the ledger snapshot) is the exact
+  # #1857 scenario the create-time-only materialization missed: a recreate
+  # empties the live manifest and there is no channel set to trigger the
+  # writer. Run a recovery-only pass (empty channel set → zero verified entries
+  # → the writer's no-verified-entries recovery branch restores from the ledger
+  # snapshot) whenever the ledger records a non-empty snapshot.
+  #
+  # Fast-return only when there is genuinely nothing to do:
+  #   - no ledger path resolved, OR
+  #   - the ledger file is ABSENT, OR
+  #   - the ledger is present AND READABLE but carries no snapshot.
+  # A ledger that is PRESENT but UNREADABLE (codex r3 finding 2 — e.g. a
+  # pre-#1857 root-only ledger whose group-publish has not landed) must NOT be
+  # treated as "no snapshot": fall THROUGH to the sync pass so the Python
+  # `_read_grant_ledger` diagnostic fires and tells the operator to re-publish
+  # ownership, rather than silently skipping recovery.
+  # NOTE: this function runs AS the launching identity (the iso UID under the
+  # sudo wrap in iso v2, or the controller user in shared mode), so the file
+  # tests below use the running UID's own view — exactly the identity that must
+  # read the ledger for recovery. No sudo escalation here.
+  if [[ -z "$channels" ]]; then
+    if [[ -z "$_plugin_grant_ledger" || ! -e "$_plugin_grant_ledger" ]]; then
+      return 0
+    fi
+    if [[ -r "$_plugin_grant_ledger" ]] \
+        && ! bridge_run_ledger_has_snapshot "$_plugin_grant_ledger"; then
+      return 0
+    fi
+    # else: present-and-(unreadable OR has-snapshot) → run the pass so either
+    # recovery happens or the Python diagnostic surfaces the unreadable ledger.
+  fi
 
   # Required: every plugin: channel from the effective channel set.
   # These come from BRIDGE_AGENT_CHANNELS — primary-channel config.
@@ -1671,6 +1736,7 @@ bridge_run_sync_dev_plugin_cache() {
 
   output="$(BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT="$agent_claude_root/plugins/cache" \
     BRIDGE_CLAUDE_PLUGINS_ROOT="$agent_claude_root/plugins" \
+    BRIDGE_PLUGIN_GRANT_LEDGER="$_plugin_grant_ledger" \
     python3 "$SCRIPT_DIR/bridge-dev-plugin-cache.py" sync \
     --channels "$channels" \
     --required-channels "$required_channels" \

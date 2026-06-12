@@ -1064,6 +1064,23 @@ def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, st
 
     plugin_spec = channel[len("plugin:") :]
     plugin_name, plugin_marketplace = plugin_spec.split("@", 1)
+
+    # Issue #1857 (spec v3 Δ3, class-b): validate the channel-derived
+    # marketplace + plugin identity BEFORE any catalog write / path join, and
+    # fail CLOSED for an unsafe component (`..`, slash, reserved). Previously
+    # the safe-path gate ran only just before the cache-path join below, AFTER
+    # `ensure_known_marketplace_for_root` had already converged the catalog —
+    # so an unsafe token could trigger a write before being rejected. Class-b
+    # is a security stop, never an availability degrade; hoist it to the top.
+    for _val, _role in (
+        (marketplace_name, "marketplace name"),
+        (plugin_marketplace, "channel marketplace"),
+        (plugin_name, "plugin name"),
+    ):
+        _require_safe_path_component(
+            _val, role=_role, context=f"sync_plugin_cache channel={channel!r}",
+        )
+
     if plugin_marketplace != marketplace_name:
         return {
             "channel": channel,
@@ -1108,20 +1125,11 @@ def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, st
             "reason": f"source-unreadable:{source_path}",
         }
 
-    # Defense-in-depth: every component about to be joined into the
-    # cache path is operator/marketplace-controlled (marketplace.json,
-    # channel string). Validate before `cache_root() / mkt / plug / ver`
-    # so an unsafe component (newline, `..`, slash) cannot escape the
-    # cache root via path traversal — fail loud rather than silently
-    # caching to a poisoned path.
-    _require_safe_path_component(
-        marketplace_name, role="marketplace name",
-        context=f"sync_plugin_cache channel={channel!r}",
-    )
-    _require_safe_path_component(
-        plugin_name, role="plugin name",
-        context=f"sync_plugin_cache channel={channel!r}",
-    )
+    # Defense-in-depth: `marketplace_name` and `plugin_name` were already
+    # safe-path-validated above (before the catalog write). The `version`
+    # comes from marketplace metadata read after that point, so validate it
+    # here before `cache_root() / mkt / plug / ver` — an unsafe component
+    # (newline, `..`, slash) cannot escape the cache root via path traversal.
     _require_safe_path_component(
         str(version), role="plugin version",
         context=f"sync_plugin_cache channel={channel!r}",
@@ -1410,11 +1418,230 @@ def _read_manifest_payload(target: Path) -> tuple[dict, str | None]:
         return {}, f"read-failed: {exc}"
 
 
+def _plugin_grant_ledger_path() -> Path | None:
+    """Bridge-owned sidecar ledger path for plugin provenance + recovery (#1857).
+
+    Issue #1857 (spec v3 Δ1): provenance and the operator-installed recovery
+    snapshot live in a BRIDGE-OWNED sidecar ledger, NEVER in Claude's
+    `installed_plugins.json` (no manifest mutation for bookkeeping, so a
+    no-declaration upgrade stays byte-identical) and NEVER in a parallel
+    `.bak` next to the manifest. The launcher (bridge-run.sh) exports the
+    controller-owned ledger path as `BRIDGE_PLUGIN_GRANT_LEDGER`; when it is
+    unset (e.g. a standalone CLI invocation) recovery is simply disabled —
+    the manifest write still proceeds, it just has no snapshot to restore
+    from. Resolved ONLY from this explicit env var, never derived from the
+    env-overridable plugin roots, so a poisoned `BRIDGE_CLAUDE_PLUGINS_ROOT`
+    cannot redirect the provenance store.
+    """
+    raw = os.environ.get("BRIDGE_PLUGIN_GRANT_LEDGER", "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
+def _read_grant_ledger(ledger: Path) -> dict:
+    """Load the bridge-owned grant ledger as a dict, `{}` if absent/unreadable.
+
+    Backward-compat: the ledger's historical shape is `{"channels": [...]}`
+    written by the bash side (`bridge_isolated_plugin_grants_write`). The
+    #1857 recovery snapshot is an ADDITIVE `installed_snapshot` object; a
+    reader/writer that only knows `channels` must never drop it, and vice
+    versa.
+    """
+    try:
+        payload = json.loads(ledger.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    except PermissionError as exc:
+        # Issue #1857 (codex r2): distinguish absent (fine — no recovery state)
+        # from PRESENT-BUT-UNREADABLE. In linux iso v2 the ledger is
+        # controller-owned root:ab-agent-<a> 0640; if the group-publish has not
+        # landed (e.g. a pre-#1857 ledger created before the share path
+        # re-published it), the iso UID cannot read it and recovery would
+        # silently no-op. Surface it so the operator can re-run the share path
+        # rather than mistaking it for "no snapshot".
+        if ledger.exists():
+            sys.stderr.write(
+                "[bridge-dev-plugin-cache] #1857: bridge-owned grant ledger present but "
+                "UNREADABLE (%s: %s) — recovery snapshot skipped; controller-side share "
+                "path must re-publish it group-readable. Repair: re-run the agent's "
+                "isolate/start so the controller refreshes ledger ownership.\n"
+                % (type(exc).__name__, ledger)
+            )
+        return {}
+    except OSError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _ledger_snapshot_plugins(ledger: Path) -> dict:
+    """Return the `installed_snapshot.plugins` map from the ledger, or `{}`.
+
+    This is the last-known-good operator manifest the recovery branch restores
+    from after a recreate wipes the live manifest.
+    """
+    data = _read_grant_ledger(ledger)
+    snap = data.get("installed_snapshot") if isinstance(data, dict) else None
+    plugins = snap.get("plugins") if isinstance(snap, dict) else None
+    return plugins if isinstance(plugins, dict) else {}
+
+
+def _manifest_recreate_recovery_needed(target: Path, ledger: Path | None) -> bool:
+    """True when the bridge-owned ledger snapshot records an operator plugin key
+    that is ABSENT from the live manifest — the #1857 recreate-wipe recovery
+    signature (empty OR channel-only live manifest both qualify).
+
+    Used to defeat the no-verified-entries fast path and the already-correct
+    pre-check so the locked writer below can restore the operator's plugins.
+    Recovery is disabled (returns False) when no ledger path is available.
+    """
+    if ledger is None:
+        return False
+    live, err = _read_manifest_payload(target)
+    if err is not None:
+        return False
+    live_plugins = live.get("plugins") if isinstance(live, dict) else {}
+    if not isinstance(live_plugins, dict):
+        live_plugins = {}
+    snap_plugins = _ledger_snapshot_plugins(ledger)
+    if not snap_plugins:
+        return False
+    return any(key not in live_plugins for key in snap_plugins)
+
+
+def _write_ledger_snapshot(ledger: Path, plugins: dict, mode: int = 0o640) -> None:
+    """Monotonic union of `plugins` into the ledger's `installed_snapshot`,
+    best-effort (#1857). PRESERVES the `channels` key and any other ledger
+    fields (backward compat); only the `installed_snapshot.plugins` map is
+    updated, and only by UNION — a recreate that wiped the live manifest to
+    channel-only must never demote a richer snapshot. Never raises: a snapshot
+    failure must not fail the manifest write the agent depends on.
+    """
+    if not isinstance(plugins, dict) or not plugins:
+        return
+    import fcntl
+    import tempfile
+
+    try:
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    # Shared lock against the Bash channel writer
+    # (bridge_isolated_plugin_grants_write) and any concurrent Python pass: both
+    # do read-modify-write on this same ledger file, and atomic os.replace
+    # prevents torn files but NOT lost updates (codex r1 finding 3). Serialize
+    # via an flock on a sidecar `<ledger>.lock`, then RE-READ under the lock so
+    # the union sees a concurrent writer's just-committed channels/snapshot.
+    lock_path = ledger.with_name(f"{ledger.name}.lock")
+    try:
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError:
+            return
+        # Re-read under the lock — the merge target is the latest committed
+        # ledger, so a peer write of `channels` or `installed_snapshot` is
+        # preserved (read-merge, never clobber).
+        data = _read_grant_ledger(ledger)
+        existing = _ledger_snapshot_plugins(ledger)
+        merged = dict(existing)
+        merged.update(plugins)
+        if existing and merged == existing:
+            return  # nothing new to record
+        data["installed_snapshot"] = {"version": 2, "plugins": merged}
+        try:
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                prefix=f"{ledger.name}.", suffix=".tmp", dir=str(ledger.parent)
+            )
+        except OSError:
+            return
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fp:
+                json.dump(data, fp, ensure_ascii=False, indent=2)
+                fp.write("\n")
+            try:
+                os.chmod(tmp_name, mode)
+            except OSError:
+                pass
+            os.replace(tmp_name, str(ledger))
+        except OSError:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
+def _seed_ledger_snapshot_if_needed(target: Path, ledger: Path | None) -> None:
+    """Seed the ledger snapshot from the live non-empty manifest, best-effort.
+
+    Called before the no-mutation early returns (`no-op` / `already-correct`)
+    so an agent whose manifest is already correct still carries a recovery
+    snapshot BEFORE its first recreate wipe. Monotonic union — never demotes an
+    existing richer snapshot. Disabled when no ledger path is available. Never
+    raises.
+    """
+    if ledger is None:
+        return
+    live, err = _read_manifest_payload(target)
+    if err is not None or not isinstance(live, dict):
+        return
+    live_plugins = live.get("plugins")
+    if not (isinstance(live_plugins, dict) and live_plugins):
+        return
+    _write_ledger_snapshot(ledger, live_plugins)
+
+
+def _manifest_entry_unsafe_reason(entry: dict[str, str]) -> str | None:
+    """Issue #1857 (spec v3 Δ3, class-b): return a non-None reason when a
+    verified entry is structurally UNSAFE (path traversal / reserved component
+    / catalog-path escape in the plugin or marketplace identity used to form
+    the `<plugin>@<marketplace>` manifest key). Class-(b) failures fail-closed
+    for ALL classes and are evaluated BEFORE any path join or manifest write,
+    so the next launch can never observe a partial convergence. Class-(a)
+    malformed-but-safe tokens (missing fields, empty values) are NOT handled
+    here — the existing per-entry `continue` skips them.
+    """
+    for field in ("plugin", "marketplace"):
+        value = entry.get(field, "")
+        if not isinstance(value, str):
+            return f"unsafe-{field}: non-string"
+        if not value:
+            continue  # empty = class-(a) malformed-but-safe; skipped, not unsafe
+        # Reserved path components / traversal / separators in an identity that
+        # is later used to build a filesystem-resolvable manifest key.
+        if value in (".", "..") or "/" in value or "\\" in value or "\x00" in value:
+            return f"unsafe-{field}: reserved/traversal component ({value!r})"
+        parts = re.split(r"[@]", value)
+        if any(p in (".", "..") for p in parts):
+            return f"unsafe-{field}: reserved component ({value!r})"
+    return None
+
+
 def _update_installed_plugins_manifest(
     plugins_root: Path,
     verified_entries: list[dict[str, str]],
+    ledger: Path | None = None,
 ) -> tuple[bool, str]:
     """Merge verified plugin entries into <plugins_root>/installed_plugins.json.
+
+    `ledger` is the bridge-owned sidecar grant ledger (#1857) holding the
+    operator-installed recovery snapshot; when None (no
+    `BRIDGE_PLUGIN_GRANT_LEDGER`) recovery is disabled and this is the legacy
+    merge-only behavior. Resolved by the caller from the env-pinned canonical
+    path, never from the env-overridable plugin roots.
 
     Returns (ok, reason). The contract is now stricter than the first draft:
 
@@ -1439,23 +1666,50 @@ def _update_installed_plugins_manifest(
     import fcntl
     import tempfile
 
-    if not verified_entries:
-        return True, "no-op"
-
     target = plugins_root / "installed_plugins.json"
     lock_path = plugins_root / "installed_plugins.json.lock"
+
+    # Issue #1857 (spec v3 Δ3, class-b): unsafe-path validation runs FIRST,
+    # before any path join / early return / manifest or ledger write, and
+    # fails closed for ALL classes — a malformed marketplace/plugin identity
+    # that could escape the catalog path is a security stop, never an
+    # availability degrade and never downgraded to warn. Aborting here means
+    # the next launch can never observe a partial convergence (no settings,
+    # manifest, ledger, or doctor write has happened yet).
+    for _entry in verified_entries:
+        _unsafe = _manifest_entry_unsafe_reason(_entry)
+        if _unsafe is not None:
+            return False, f"unsafe-entry (fail-closed): {_unsafe}"
+
+    recovery_needed = _manifest_recreate_recovery_needed(target, ledger)
+
+    # Issue #1857: even with no channel-declared entries to sync, a recreate
+    # can present an empty/missing live manifest while the bridge-owned ledger
+    # snapshot holds the operator's prior plugin set (the "empty {}" wipe
+    # signature). Fall through to the locked restore-merge below in that case;
+    # otherwise the no-verified-entries fast path stays a true no-op — but
+    # first seed the recovery snapshot if the live manifest is non-empty and
+    # the ledger has no snapshot yet, so a healthy no-channel agent is
+    # protected before its first wipe.
+    if not verified_entries and not recovery_needed:
+        _seed_ledger_snapshot_if_needed(target, ledger)
+        return True, "no-op"
 
     # Read-only pre-check: when the manifest already has correct entries for
     # every verified plugin, no write is needed. This is what lets isolated
     # agents (root-owned plugins dir) skip the writable lock when the
     # share-catalog path already populated their manifest correctly.
     pre_payload, pre_err = _read_manifest_payload(target)
-    if pre_err is None:
+    if pre_err is None and verified_entries and not recovery_needed:
         all_correct = all(
             _manifest_entry_already_correct(pre_payload, entry)
             for entry in verified_entries
         )
         if all_correct:
+            # Seed the recovery snapshot before returning without a write, so
+            # an already-correct manifest is protected against the first
+            # recreate wipe.
+            _seed_ledger_snapshot_if_needed(target, ledger)
             return True, "already-correct"
 
     try:
@@ -1488,8 +1742,33 @@ def _update_installed_plugins_manifest(
             payload = {"version": 2, "plugins": {}}
 
         plugins = payload.setdefault("plugins", {})
-        now = _now_iso_utc()
+
         changed = False
+
+        # Issue #1857: recreate-wipe recovery. A dynamic agent recreate
+        # (`--replace`, and the #1854 restart path that now routes through it)
+        # can present this writer with a manifest that lost the operator's
+        # installed plugins (claude-hud etc.) — the per-agent plugins tree was
+        # re-scaffolded, so the live manifest came back either EMPTY or
+        # CHANNEL-ONLY, even though the operator's plugin payload dirs still
+        # sit on disk. The BRIDGE-OWNED ledger snapshot (refreshed as a
+        # monotonic union below) is the last-known-good operator manifest.
+        # Restore every snapshot plugin key that is ABSENT from the live map —
+        # covering both the empty and the channel-only wipe — so the channel
+        # re-sync merges ON TOP of the operator's set rather than ever shipping
+        # a narrower manifest. A key present in the live map is left as-is
+        # (live wins for keys it still records); the verified channel set below
+        # then refreshes its own entries. The snapshot lives in the bridge-owned
+        # ledger, never in Claude's manifest and never in a parallel `.bak`
+        # (spec v3 Δ1) — so a no-declaration upgrade leaves the manifest
+        # byte-identical.
+        if ledger is not None:
+            snap_plugins = _ledger_snapshot_plugins(ledger)
+            for snap_key, snap_value in snap_plugins.items():
+                if snap_key not in plugins:
+                    plugins[snap_key] = snap_value
+                    changed = True
+        now = _now_iso_utc()
 
         for entry in verified_entries:
             plugin_name = entry.get("plugin", "")
@@ -1497,6 +1776,17 @@ def _update_installed_plugins_manifest(
             version = entry.get("version", "")
             install_path = entry.get("cache", "")
             if not plugin_name or not marketplace or not install_path:
+                # Issue #1857 (spec v3 Δ3, class-a): malformed-but-safe entry
+                # (missing plugin/marketplace/cache) is skip+WARN — the entry is
+                # dropped but the rest of the list is processed and launch
+                # continues. (Class-b unsafe entries already fail-closed before
+                # this loop.) Warn so the skip is never silent.
+                sys.stderr.write(
+                    "[bridge-dev-plugin-cache] #1857 class-a skip: malformed manifest "
+                    "entry missing plugin/marketplace/cache (plugin=%r marketplace=%r "
+                    "cache=%r) — skipped, launch continues\n"
+                    % (plugin_name, marketplace, install_path)
+                )
                 continue
             key = f"{plugin_name}@{marketplace}"
             existing_list = plugins.get(key) or []
@@ -1525,6 +1815,12 @@ def _update_installed_plugins_manifest(
             changed = True
 
         if not changed:
+            # #1857: no manifest mutation, but keep the recovery snapshot
+            # current while we still hold the lock so the first recreate wipe
+            # is recoverable. Monotonic union: only adds live keys missing from
+            # the snapshot, never demotes a richer snapshot.
+            if plugins:
+                _write_ledger_snapshot(ledger, plugins) if ledger is not None else None
             return True, "no-change"
 
         try:
@@ -1547,6 +1843,17 @@ def _update_installed_plugins_manifest(
             if exc.errno == errno.EACCES:
                 return False, f"eacces (root-owned manifest, fail-soft): {exc}"
             return False, f"write-failed: {exc}"
+
+        # Issue #1857: refresh the bridge-owned recovery snapshot whenever the
+        # written manifest leaves a non-empty plugin set, so the next recreate
+        # can restore the operator's plugins from it (see the recovery branch
+        # above). The refresh is a MONOTONIC UNION into the existing snapshot
+        # (live entries win per-key, snapshot-only entries are retained), so a
+        # recreate that wiped the live manifest to channel-only never demotes a
+        # richer snapshot. Best-effort — a snapshot failure never fails the
+        # manifest write the agent depends on.
+        if plugins and ledger is not None:
+            _write_ledger_snapshot(ledger, plugins)
 
         return True, "updated"
     finally:
@@ -1663,6 +1970,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest_status, manifest_reason = _update_installed_plugins_manifest(
         claude_plugins_root(),
         verified_for_manifest,
+        _plugin_grant_ledger_path(),
     )
     manifest_summary = {
         "ok": manifest_status,
