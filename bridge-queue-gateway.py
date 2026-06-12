@@ -239,8 +239,91 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
 
 
+def _agent_group_name(agent: str) -> str:
+    """Per-agent isolation group name for `agent` (ab-agent-<agent>).
+
+    Mirrors lib/bridge-isolation-v2.sh:bridge_isolation_v2_agent_group_name.
+    Override-able for tests/non-default installs via BRIDGE_AGENT_GROUP_PREFIX.
+    """
+    prefix = os.environ.get("BRIDGE_AGENT_GROUP_PREFIX", "ab-agent-")
+    return f"{prefix}{agent}"
+
+
+def _normalize_agent_queue_dir(d: Path, agent: str) -> None:
+    """Best-effort: stamp a per-agent requests/responses dir to the iso-v2
+    contract group `ab-agent-<agent>` + mode 2770 (setgid) after a lazy
+    `mkdir`. Issue #1829.
+
+    Two lazy creators (cmd_client ensure-dirs and atomic_write_json's
+    parent.mkdir) can create these dirs under whichever side wins the race —
+    notably the CONTROLLER daemon writing a response at its own umask + primary
+    group, leaving the dir `<controller>:<controller> 2770` instead of
+    `agent-bridge-<agent>:ab-agent-<agent> 2770`. The iso UID is a member of
+    `ab-agent-<agent>` but NOT of the controller's primary group, so a
+    controller-primary-group dir cuts the agent off from EVERY gateway verb
+    (it cannot create request files / read response files). The authoritative
+    isolate/prepare loop stamps this correctly; this closes the lazy gap so a
+    controller-created dir self-heals to the contract on first touch.
+
+    Fail-closed-quiet: any error (no such group off an iso install, EPERM when
+    the creator is neither owner nor root, non-Linux) is swallowed — the worst
+    case is the dir keeps whatever group it had, which is exactly today's
+    behavior. We NEVER raise into the request/response write path. The setgid
+    bit means files created afterwards inherit the right group regardless.
+    """
+    if os.name != "posix":
+        return
+    try:
+        gid = grp.getgrnam(_agent_group_name(agent)).gr_gid
+    except (KeyError, OSError):
+        # No iso group on this install (shared-mode / non-Linux dev) — the
+        # contract does not apply; leave the dir as-is.
+        return
+    try:
+        st = os.stat(d)
+    except OSError:
+        return
+    # Only act when the dir is NOT already group=ab-agent-<agent> 2770, so a
+    # correctly-provisioned dir (the common case) is a pure stat no-op and we
+    # never touch a dir the prepare loop already owns.
+    if st.st_gid == gid and stat.S_IMODE(st.st_mode) == 0o2770:
+        return
+    try:
+        os.chown(d, -1, gid)
+    except OSError:
+        # Not owner and not root (e.g. iso UID trying to chgrp a
+        # controller-owned dir) — cannot repair from this side. The
+        # controller-side daemon/prepare path is the authoritative repairer.
+        return
+    try:
+        os.chmod(d, 0o2770)
+    except OSError:
+        return
+
+
+def _normalize_agent_queue_dir_for_file(path: Path) -> None:
+    """Derive the agent name from a `<root>/<agent>/{requests,responses}/<file>`
+    path and normalize the just-created parent dir. Used by atomic_write_json,
+    which only has the file path. No-op when the path does not match the
+    requests/responses shape (e.g. controller-side gateway-instance writes).
+    """
+    parent = path.parent
+    if parent.name not in ("requests", "responses"):
+        return
+    agent = parent.parent.name
+    if agent:
+        _normalize_agent_queue_dir(parent, agent)
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    created = not path.parent.exists()  # noqa: raw-pathlib-controller-only — controller/daemon checks whether IT is creating the per-agent dir (race detection for #1829), not reading an iso artifact
     path.parent.mkdir(parents=True, exist_ok=True)
+    if created:
+        # Issue #1829: if THIS write is what created the per-agent
+        # requests/responses dir (the daemon winning the creation race under
+        # its own umask + primary group), stamp it to the iso-v2 contract so
+        # the agent is not cut off. Best-effort; never raises.
+        _normalize_agent_queue_dir_for_file(path)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     # L1-N (beta21) tail: chmod 0640 so the file-mode gateway's
@@ -297,6 +380,206 @@ def task_db_path(home: str) -> Path:
     return Path(os.environ.get("BRIDGE_TASK_DB", str(Path(state_dir) / "tasks.db")))
 
 
+# Client-side gateway contract (#1837 keystone / #1834). The file transport's
+# response round-trip is best-effort: the daemon (cmd_serve_once) polls each
+# agent's requests/ dir every ~5s, renames a request to <id>.working.json BEFORE
+# processing it, and ALWAYS writes a responses/<id>.json carrying the queue
+# child's REAL exit code (including the idempotent "task already done" -> 0).
+#
+# The bug (#1837): under burst load the client's response READ timed out long
+# after the daemon committed the SQLite write, and cmd_client raised "queue
+# gateway timed out" + exit 1. Autonomous callers treated the committed write as
+# a failure and RETRIED, writing more request files and compounding the
+# contention into a self-reinforcing thrash. #1834 is the same surface — a
+# transient 1-6x per-call timeout against a live daemon with no built-in retry.
+#
+# CRITICAL boundary fact: cmd_client runs ONLY as the isolated-agent UID
+# (bridge_queue_gateway_proxy_agent gates on linux-user isolation), and that env
+# sets BRIDGE_TASK_DB=/dev/null + BRIDGE_GATEWAY_PROXY=1 so the agent CANNOT touch
+# the controller task DB directly (the entire reason the gateway exists; see
+# lib/bridge-agents.sh "BRIDGE_TASK_DB is sentineled" / #287 / #294). So the
+# client has exactly ONE authoritative signal for whether a write committed: the
+# daemon's response file. The fix is therefore NOT to guess the outcome from the
+# DB (impossible here) but to WAIT LONG ENOUGH to read the real response:
+#
+#   * #1834 — a bounded read-side retry with backoff before declaring a timeout,
+#     so a transient flap resolves in-process from the daemon's own (slightly
+#     delayed) response instead of forcing the caller to loop.
+#   * #1837 — the response carries the queue child's true exit code, so once the
+#     bounded wait reads it the client returns that real code (idempotent
+#     already-done -> 0 included). We NEVER fabricate a success the daemon did
+#     not actually report; the keystone is "read the real response, don't give
+#     up early," not "assume the write landed."
+#
+# The retry only re-polls for the response — it never re-queues a fresh write
+# (that re-queue is the very thrash we are fixing), and the request file the
+# daemon may still be draining as <id>.working.json is untouched by the retry.
+
+
+def gateway_daemon_liveness(home: str) -> str:
+    """Tri-state daemon liveness as seen from the calling (possibly iso) UID.
+
+    Returns one of:
+      * ``"up"``      — the daemon pid file is readable AND the pid is alive.
+      * ``"down"``    — the daemon pid file is readable AND the pid is dead/absent.
+      * ``"unknown"`` — the daemon pid file cannot be read FROM THIS CONTEXT (the
+                        iso boundary blocks the controller's pid file). The daemon
+                        may well be alive; the caller MUST NOT render this as
+                        "down". This is the #1837 false-"daemon down" guard.
+
+    The pid-file path mirrors the canonical resolution the rest of the bridge
+    uses (bridge-lib.sh / bridge-daemon-control.sh): ``BRIDGE_DAEMON_PID_FILE``
+    when set (relocated/custom installs export it into the iso agent env too),
+    else ``<BRIDGE_STATE_DIR>/daemon.pid``. Hardcoding the state-dir path would
+    false-report "unknown" on a custom-pid-file install even with a live daemon.
+
+    A3 (#1833 status presentation) consumes this primitive instead of inferring
+    liveness from a raw pid read that false-positives "down" across the iso
+    boundary. This function NEVER mutates anything and never raises.
+    """
+    pid_file = os.environ.get("BRIDGE_DAEMON_PID_FILE", "").strip()
+    if pid_file:
+        pid_path = Path(pid_file).expanduser()
+    else:
+        state_dir = os.environ.get("BRIDGE_STATE_DIR", str(Path(home).expanduser() / "state"))
+        pid_path = Path(state_dir) / "daemon.pid"
+    try:
+        raw = pid_path.read_text(encoding="utf-8").strip()
+    except (PermissionError, OSError):
+        # PermissionError: iso boundary blocked the read → genuinely unknown.
+        # FileNotFoundError (an OSError subclass): no pid file. We still report
+        # "unknown" rather than "down" because a fresh/racing daemon may not have
+        # published its pid yet and the cost of a false "down" (drives the wrong
+        # operator/agent response) is higher than a conservative "unknown".
+        return "unknown"
+    if not raw:
+        return "unknown"
+    try:
+        pid = int(raw.split()[0])
+    except (ValueError, IndexError):
+        return "unknown"
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        # The process exists but is owned by another UID we may not signal —
+        # existence is what we need. Still cmdline-verify below before "up".
+        pass
+    except (ProcessLookupError, OSError):
+        return "down"
+    # A live PID alone is not proof: a stale pid file can point at a RECYCLED
+    # pid now owned by some unrelated process, which would false-report "up".
+    # Verify the cmdline looks like the bridge daemon (mirrors the shell
+    # resolver's guard at lib/bridge-state.sh). When the cmdline is unreadable
+    # (iso boundary / another UID), we cannot DISPROVE it, so we trust the pid —
+    # consistent with the conservative "never false-down" contract.
+    daemon_script = str(Path(home).expanduser() / "bridge-daemon.sh")
+    if _pid_cmdline_disproves_daemon(pid, daemon_script):
+        return "down"
+    return "up"
+
+
+# Basenames of the shell interpreters that legitimately launch the daemon as
+# `<shell> <home>/bridge-daemon.sh run` (bridge-daemon.sh dispatches via
+# `bash bridge-daemon.sh run`; the live install proof shows argv[0] is the
+# bash binary). Keeps the position-anchor below tolerant of any bash path.
+_DAEMON_SHELL_LAUNCHERS = frozenset({"bash", "sh", "dash", "zsh", "ksh"})
+
+
+def _pid_cmdline_disproves_daemon(pid: int, daemon_script: str) -> bool:
+    """True only when we can READ the pid's argv AND it is clearly NOT the
+    bridge daemon (a recycled-pid false positive). Unreadable argv -> False
+    (cannot disprove; trust the pid), matching the shell resolver's guard.
+
+    ``daemon_script`` is the install's canonical ``<home>/bridge-daemon.sh``."""
+    argv = _read_pid_argv(pid)
+    if not argv:
+        return False
+    return not _argv_is_daemon_run(argv, daemon_script)
+
+
+def _argv_is_daemon_run(argv: list[str], daemon_script: str) -> bool:
+    """POSITION-ANCHORED proof that ``argv`` is the running bridge daemon.
+
+    The real daemon runs as ``<shell> <home>/bridge-daemon.sh run`` (see
+    bridge-daemon.sh's `bash bridge-daemon.sh run` dispatch; the live-install
+    pidfile target's argv is exactly ``<bash> <home>/bridge-daemon.sh run``), or
+    — if exec'd directly via its shebang — ``<home>/bridge-daemon.sh run``. So
+    the canonical script must sit in the *executed-script position*:
+      * ``argv[0]`` == <home>/bridge-daemon.sh, ``argv[1]`` == "run"   (direct), OR
+      * ``argv[0]`` is a shell, ``argv[1]`` == <home>/bridge-daemon.sh,
+        ``argv[2]`` == "run"                                           (wrapped).
+
+    Why position, not a token-anywhere scan: a path-anchored *token-anywhere*
+    match (basename==bridge-daemon.sh AND realpath==<home> AND next=="run",
+    scanned over every argv element) still false-reported "up" for a LIVE
+    NON-daemon process that merely carries the genuine path + "run" as ordinary
+    trailing DATA, e.g. ``python3 -c '<code>' <home>/bridge-daemon.sh run`` (the
+    path is an argument to ``python -c``, not the script being executed). codex
+    #12972 and patch-dev #12973 reproduced exactly that on ca17c4f5. Anchoring on
+    the script POSITION (argv[0], or argv[1] behind a shell) — not its mere
+    presence — closes that class.
+
+    Residual (accepted): a *deliberate* argv[0] spoof (``exec -a
+    <home>/bridge-daemon.sh someprog run``) would still pass. That is out of
+    scope for a liveness *status* heuristic — the pidfile is the primary signal,
+    and this cmdline check only DISPROVES *coincidental* recycled-pid reuse, not
+    an adversary who has already arranged to forge the daemon's argv[0]."""
+    expected = os.path.realpath(daemon_script)
+
+    def _is_canonical_script(tok: str) -> bool:
+        return (
+            os.path.basename(tok) == "bridge-daemon.sh"
+            and os.path.realpath(tok) == expected
+        )
+
+    # Direct/shebang exec: `<home>/bridge-daemon.sh run`
+    if len(argv) >= 2 and _is_canonical_script(argv[0]) and argv[1] == "run":
+        return True
+    # Shell-wrapped: `<shell> <home>/bridge-daemon.sh run`
+    if (
+        len(argv) >= 3
+        and os.path.basename(argv[0]) in _DAEMON_SHELL_LAUNCHERS
+        and _is_canonical_script(argv[1])
+        and argv[2] == "run"
+    ):
+        return True
+    return False
+
+
+def _read_pid_argv(pid: int) -> list[str] | None:
+    """Best-effort process argv as a TOKEN LIST. Linux /proc first (true
+    NUL-delimited argv — preserves elements that contain spaces, e.g. a
+    ``python3 -c '<code with spaces>'`` payload, so the position-anchor cannot
+    be fooled by argv-element splitting); then ``ps -p <pid> -o args=``
+    whitespace-split (lossy — shell quoting is not recoverable from ps, but the
+    daemon's real argv ``<shell> <home>/bridge-daemon.sh run`` is exactly three
+    space-free tokens, so its position is unambiguous either way). None when
+    neither source is available/readable."""
+    proc_cmdline = Path(f"/proc/{pid}/cmdline")
+    try:
+        raw = proc_cmdline.read_bytes()  # noqa: raw-pathlib-controller-only — world-readable /proc entry of the (controller) daemon pid, not an isolated-agent artifact
+        if raw:
+            argv = [p.decode("utf-8", "replace") for p in raw.split(b"\x00") if p]
+            if argv:
+                return argv
+    except OSError:
+        pass
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            out = proc.stdout.strip()
+            if out:
+                return out.split()
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def agent_root(root: Path, agent: str) -> Path:
     return root / agent
 
@@ -309,12 +592,95 @@ def response_dir(root: Path, agent: str) -> Path:
     return agent_root(root, agent) / "responses"
 
 
+def _emit_gateway_response(payload: dict[str, Any]) -> int:
+    """Write a gateway response payload's stdout/stderr through and return exit."""
+    stdout = str(payload.get("stdout", ""))
+    stderr = str(payload.get("stderr", ""))
+    if stdout:
+        sys.stdout.write(stdout)
+    if stderr:
+        sys.stderr.write(stderr)
+    return int(payload.get("exit_code", 1))
+
+
+def _poll_for_response(response_path: Path, deadline: float, poll: float) -> dict[str, Any] | None:
+    """Poll for the daemon's response file until `deadline`. None on timeout."""
+    while time.monotonic() < deadline:
+        if response_path.exists():  # noqa: raw-pathlib-controller-only — the gateway client polls its OWN per-agent response file, not an isolated-agent artifact
+            payload = load_json(response_path)
+            try:
+                response_path.unlink()  # noqa: raw-pathlib-controller-only — consuming the client's own response file (unchanged from the original poll loop)
+            except OSError:
+                pass
+            return payload
+        time.sleep(poll)
+    # One final non-sleeping check closes the race where the daemon wrote the
+    # response between the last poll and the deadline expiring.
+    if response_path.exists():  # noqa: raw-pathlib-controller-only — final race check on the client's own response file
+        payload = load_json(response_path)
+        try:
+            response_path.unlink()  # noqa: raw-pathlib-controller-only — consuming the client's own response file
+        except OSError:
+            pass
+        return payload
+    return None
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    """Parse a float tunable from env, clamped to `minimum`, never raising.
+
+    A MALFORMED value must not crash the gateway client: the parse happens before
+    the request is enqueued, and a traceback there would leave a queued request
+    the daemon may still execute while the caller retries -> duplicate mutations
+    (the very thrash #1837 guards against). Bad input falls back to the default.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return max(minimum, default)
+    try:
+        return max(minimum, float(raw))
+    except ValueError:
+        return max(minimum, default)
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    """Integer counterpart of _env_float — clamped, never raising. See _env_float."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return max(minimum, default)
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return max(minimum, default)
+
+
 def cmd_client(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser()
     req_dir = request_dir(root, args.agent)
     resp_dir = response_dir(root, args.agent)
+    req_created = not req_dir.exists()  # noqa: raw-pathlib-controller-only — gateway client checks its OWN per-agent dir existence for #1829 race-stamp, not another agent's artifact
+    resp_created = not resp_dir.exists()  # noqa: raw-pathlib-controller-only — same: client's own responses/ dir
     req_dir.mkdir(parents=True, exist_ok=True)
     resp_dir.mkdir(parents=True, exist_ok=True)
+    # Issue #1829: if cmd_client is the lazy creator (iso UID's first request,
+    # or a controller-side proxy call), stamp the freshly-made dir to the
+    # iso-v2 contract group `ab-agent-<agent>` + 2770. The iso UID can chgrp
+    # to its own member group; the controller can chgrp as owner/root. A dir
+    # the prepare loop already stamped is a stat no-op. Best-effort.
+    if req_created:
+        _normalize_agent_queue_dir(req_dir, args.agent)
+    if resp_created:
+        _normalize_agent_queue_dir(resp_dir, args.agent)
+
+    # Parse ALL tunables BEFORE enqueuing the request. A malformed --poll/--timeout
+    # or retry env var must fail (or fall back) here, never after
+    # atomic_write_json() has already queued a request the daemon may execute —
+    # which would strand the request + traceback the client and let a caller retry
+    # into a duplicate mutation (#1837 codex r5).
+    poll = max(0.05, float(args.poll))
+    base_timeout = max(1.0, float(args.timeout))
+    retries = _env_int("BRIDGE_QUEUE_GATEWAY_READ_RETRIES", 3, minimum=0)
+    backoff = _env_float("BRIDGE_QUEUE_GATEWAY_READ_BACKOFF_SECONDS", 0.5, minimum=0.0)
 
     request_id = f"{int(time.time() * 1000)}-{os.getpid()}-{secrets.token_hex(6)}"
     request_path = req_dir / f"{request_id}.request.json"
@@ -338,26 +704,48 @@ def cmd_client(args: argparse.Namespace) -> int:
         request_payload["cron_run_id"] = cron_run_id
     atomic_write_json(request_path, request_payload)
 
-    deadline = time.monotonic() + max(1.0, float(args.timeout))
-    poll = max(0.05, float(args.poll))
-    while time.monotonic() < deadline:
-        if response_path.exists():
-            payload = load_json(response_path)
-            try:
-                response_path.unlink()
-            except OSError:
-                pass
-            stdout = str(payload.get("stdout", ""))
-            stderr = str(payload.get("stderr", ""))
-            if stdout:
-                sys.stdout.write(stdout)
-            if stderr:
-                sys.stderr.write(stderr)
-            return int(payload.get("exit_code", 1))
-        time.sleep(poll)
+    # #1834 / #1837: bounded read-side retry. The daemon always writes a response
+    # carrying the queue child's REAL exit code; under burst load it just arrives
+    # late. Most iso-boundary timeouts are a 1–6× transient flap against a LIVE
+    # daemon, so before declaring a read timeout we re-poll a few extra windows
+    # with growing backoff (tunables parsed above, before the request was
+    # enqueued). This waits LONGER for the authoritative response — it does NOT
+    # re-queue a fresh write (that re-queue is exactly the thrash #1837
+    # describes), and the request the daemon may still be draining as
+    # <id>.working.json is untouched.
+    deadline = time.monotonic() + base_timeout
+    payload = _poll_for_response(response_path, deadline, poll)
+    attempt = 0
+    while payload is None and attempt < retries:
+        # Growing backoff window (0.5s, 1.0s, 1.5s, … by default) for each extra
+        # re-poll; the daemon ticks the gateway every ~5s so a couple of these
+        # windows comfortably span a single missed poll.
+        attempt += 1
+        window = backoff * attempt
+        if window <= 0:
+            break
+        payload = _poll_for_response(response_path, time.monotonic() + window, poll)
 
+    if payload is not None:
+        # The daemon's response is the authoritative outcome — return its REAL
+        # exit code (idempotent "already done" -> 0 included). #1837 is fixed by
+        # reading this real response instead of giving up before it lands; we
+        # never fabricate a success the daemon did not report.
+        try:
+            request_path.unlink()  # noqa: raw-pathlib-controller-only — the client removes its OWN request file after a successful round-trip (unchanged contract)
+        except OSError:
+            pass
+        return _emit_gateway_response(payload)
+
+    # The bounded retry exhausted without a response. The client (an iso UID with
+    # BRIDGE_TASK_DB=/dev/null) has no way to confirm the outcome other than the
+    # response file, so we surface the honest timeout — never a fabricated
+    # success. Remove the now-stale <id>.request.json so the next CLI call does
+    # not pile a duplicate request on top (the thrash we are fixing); if the
+    # daemon already renamed it to <id>.working.json this unlink is a no-op and
+    # the daemon still drains that working copy on a later tick.
     try:
-        request_path.unlink()
+        request_path.unlink()  # noqa: raw-pathlib-controller-only — the client removes its OWN now-stale request file on a genuine timeout (matches the original behaviour)
     except OSError:
         pass
     raise SystemExit("queue gateway timed out waiting for daemon")
@@ -792,6 +1180,23 @@ def cmd_print_runtime_id(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_daemon_liveness(args: argparse.Namespace) -> int:
+    """Expose the tri-state daemon-down primitive (`up`/`down`/`unknown`).
+
+    A3 (#1833 status presentation) invokes this so an iso UID that cannot read
+    the controller's state/daemon.pid reports `unknown` instead of a false
+    `down`. Always exit 0 — the liveness verdict is the payload, not the exit
+    code (callers parse stdout / the JSON `liveness` field).
+    """
+    home = bridge_home(args.bridge_home)
+    liveness = gateway_daemon_liveness(home)
+    if args.format == "json":
+        print(json.dumps({"liveness": liveness}, ensure_ascii=True))
+    else:
+        print(liveness)
+    return 0
+
+
 def cmd_verify_runtime(args: argparse.Namespace) -> int:
     ok, reason = verify_runtime_layout(bridge_home(args.bridge_home))
     if args.format == "json":
@@ -903,6 +1308,153 @@ def _client_preflight_error(reason_code: str, message: str = "") -> ClientPrefli
     return ClientPreflightError(reason_code, message)
 
 
+def _audit_body_file_sudo_fallback(
+    body_path: Path,
+    iso_uid: str,
+    *,
+    success: bool,
+    rc: int | None,
+    call_site: str,
+    exception: BaseException | None = None,
+) -> None:
+    """Best-effort audit row for a sudo-fallback body-file read (#1280 parity).
+
+    Mirrors ``bridge-queue.py:_audit_body_file_sudo_fallback`` /
+    ``bridge-a2a.py`` — a parallel copy, because the gateway does not
+    import ``bridge-queue`` and we deliberately avoid coupling the CLIs
+    through a shared module just for one audit hook. Any failure to emit
+    is swallowed silently.
+    """
+    audit_path = (
+        os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+        or os.path.expanduser(os.path.join(
+            os.environ.get("BRIDGE_HOME", "").strip() or "~/.agent-bridge",
+            "logs",
+            "audit.jsonl",
+        ))
+    )
+    detail = {
+        "file_path": str(body_path),
+        "iso_uid": iso_uid,
+        "fallback_method": "sudo-read",
+        "success": success,
+        "rc": rc if rc is not None else "",
+        "call_site": call_site,
+    }
+    if exception is not None:
+        detail["exception"] = str(exception)
+        detail["exception_type"] = type(exception).__name__
+    audit_script = Path(__file__).resolve().with_name("bridge-audit.py")
+    if not audit_script.is_file():  # noqa: raw-pathlib-controller-only — controller-side gateway locating its own sibling audit helper, not an isolated-agent artifact
+        return
+    cmd = [
+        sys.executable,
+        str(audit_script),
+        "write",
+        "--file",
+        audit_path,
+        "--actor",
+        "bridge-queue-gateway",
+        "--action",
+        "body_file_sudo_fallback",
+        "--target",
+        str(body_path),
+        "--detail-json",
+        json.dumps(detail, ensure_ascii=True, sort_keys=True),
+    ]
+    try:
+        Path(audit_path).expanduser().parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-side gateway creating its own audit-log parent dir, not an isolated-agent artifact
+    except OSError:
+        pass
+    try:
+        subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _sudo_read_body_file(path: Path) -> bytes | None:
+    """Issue #1280 parity: sudo-fallback body-file reader for the gateway.
+
+    Mirrors ``bridge-queue.py:_sudo_read_body_file``. On iso v2 hosts the
+    body file may be owned by an isolated UID (``agent-bridge-<a>``, mode
+    0660 ``ab-agent-<a>``) that the reading process is not a member of, so
+    the direct ``os.open`` raises ``PermissionError``. The pre-existing
+    controller<->iso boundary is ``sudo -n -u <owner> cat <path>`` (see
+    ``lib/bridge-isolation-helpers.sh``). Returns the file bytes on
+    success, ``None`` on any failure (sudo missing, owner not in the
+    ``agent-bridge-*`` namespace, already that UID, stat/subprocess error)
+    so the caller surfaces the actionable iso-ownership error rather than
+    a silent empty body. This is a READ fallback for a file the legitimate
+    owner wrote — it does NOT weaken any gateway auth.
+    """
+    try:
+        st = path.stat()  # noqa: raw-pathlib-controller-only — controller-side gateway stats the body file to read its owner uid (the #1280 sudo-fallback decision), not an isolated-agent path handler
+    except OSError:
+        return None
+    try:
+        ent = pwd.getpwuid(st.st_uid)
+    except (KeyError, OSError):
+        return None
+    owner = ent.pw_name
+    prefix = os.environ.get("BRIDGE_AGENT_OS_USER_PREFIX", "agent-bridge-")
+    if not owner.startswith(prefix):
+        return None
+    try:
+        if os.geteuid() == st.st_uid:
+            return None
+    except OSError:
+        return None
+    import shutil
+    sudo_bin = shutil.which("sudo") or "/usr/bin/sudo"
+    if not Path(sudo_bin).is_file():  # noqa: raw-pathlib-controller-only — controller-side gateway checking the system sudo binary exists, not an isolated-agent artifact
+        return None
+    try:
+        result = subprocess.run(
+            [sudo_bin, "-n", "-u", owner, "cat", "--", str(path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=None,
+            call_site="bridge-queue-gateway._read_inline_text",
+            exception=exc,
+        )
+        return None
+    if result.returncode != 0:
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=result.returncode,
+            call_site="bridge-queue-gateway._read_inline_text",
+        )
+        return None
+    _audit_body_file_sudo_fallback(
+        path, owner, success=True, rc=0,
+        call_site="bridge-queue-gateway._read_inline_text",
+    )
+    return result.stdout
+
+
+def _decode_inline_body(raw: bytes, path_text: str) -> str:
+    """Apply the inline-transport size cap + UTF-8 decode to body bytes."""
+    if len(raw) > INLINE_BODY_CAP_BYTES:
+        raise _client_preflight_error(
+            "body_file_too_large",
+            f"too large for inline transport: {len(raw)} > {INLINE_BODY_CAP_BYTES}",
+        )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _client_preflight_error("body_file_not_utf8", f"is not valid UTF-8: {exc}") from exc
+
+
 def _read_inline_text(path_text: str) -> str:
     if not path_text:
         raise _client_preflight_error("invalid_argv", "invalid argv: file path is empty")
@@ -922,7 +1474,22 @@ def _read_inline_text(path_text: str) -> str:
     except FileNotFoundError as exc:
         raise _client_preflight_error("body_file_not_found", f"not found: {path_text}") from exc
     except PermissionError as exc:
-        raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
+        # Issue #1835 (#1280 parity): an iso UID-owned body file at mode
+        # 0660 cannot be read directly by a non-member reader. Mirror the
+        # `bridge-queue.py:stabilize_body_file` sudo-as-owner fallback the
+        # `create --body-file` server path already has, so the SOCKET
+        # transport's client-side preflight reaches the same result. On
+        # success the bytes pass the SAME size/UTF-8 caps as a direct read.
+        fallback = _sudo_read_body_file(path)
+        if fallback is not None:
+            return _decode_inline_body(fallback, path_text)
+        raise _client_preflight_error(
+            "body_file_unreadable",
+            f"unreadable under client UID: {exc.strerror} "
+            f"(iso UID may own this file; pass the body inline with --body, "
+            f"or run `sudo chmod 0644 {path_text}` — `--body-file` from an "
+            f"iso UID needs the #1280 sudo grant)",
+        ) from exc
     except OSError as exc:
         # O_NOFOLLOW on a symlink raises ELOOP; treat as unreadable rather
         # than disclose the symlink shape.
@@ -959,15 +1526,7 @@ def _read_inline_text(path_text: str) -> str:
         except OSError:
             pass
 
-    if len(raw) > INLINE_BODY_CAP_BYTES:
-        raise _client_preflight_error(
-            "body_file_too_large",
-            f"too large for inline transport: {len(raw)} > {INLINE_BODY_CAP_BYTES}",
-        )
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise _client_preflight_error("body_file_not_utf8", f"is not valid UTF-8: {exc}") from exc
+    return _decode_inline_body(raw, path_text)
 
 
 def client_argv_normalize(argv: list[str]) -> list[str]:
@@ -1692,6 +2251,15 @@ def build_parser() -> argparse.ArgumentParser:
     runtime_id = sub.add_parser("print-runtime-id")
     runtime_id.add_argument("--bridge-home")
     runtime_id.set_defaults(handler=cmd_print_runtime_id)
+
+    # #1837 fix 4 — the daemon-down primitive A3 (#1833) consumes. Tri-state
+    # `up`/`down`/`unknown`; `unknown` when the caller's UID cannot read
+    # daemon.pid (iso boundary) so status presentation never false-reports
+    # `down`.
+    daemon_liveness = sub.add_parser("daemon-liveness")
+    daemon_liveness.add_argument("--bridge-home")
+    daemon_liveness.add_argument("--format", choices=("text", "json"), default="text")
+    daemon_liveness.set_defaults(handler=cmd_daemon_liveness)
 
     verify = sub.add_parser("verify-runtime")
     verify.add_argument("--bridge-home")

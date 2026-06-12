@@ -1126,6 +1126,128 @@ bridge_agent_linux_user_isolation_effective() {
   return 0
 }
 
+# bridge_agent_start_supp_group_preflight — first-start determinism for
+# linux-user-isolated agents (Issue #1836).
+#
+# Symptom this closes: the FIRST `agb agent start` of a freshly provisioned
+# iso-v2 agent dies within seconds (100% reproducible); a second start always
+# succeeds. Root cause is KNOWN_ISSUES §28: `agent create`/`isolate` runs
+# `usermod -aG ab-agent-<agent> <controller>`, but the controller's
+# already-running process (and the daemon) keep their LOGIN-TIME supplementary
+# group set — a `usermod -aG` does NOT propagate to a running process. The
+# launch then cannot traverse `data/agents/<agent>/{home,runtime,...}` (group
+# 2770, group=ab-agent-<agent>) on attempt 1, so the session dies before the
+# REPL. By attempt 2 the operator has typically restarted something / the
+# daemon poll has refreshed, so it "just works" — which is the manual
+# `attempt 2` dance every operator currently performs.
+#
+# Two deterministic refreshes, both idempotent + non-fatal:
+#   (1) Refresh the DAEMON's supplementary group set (same call agent
+#       create/delete already make) so the gateway server can serve this
+#       agent's requests/ dir.
+#   (2) If THIS controller process's LIVE group set (`id -nG`) lacks the
+#       agent group but it exists on disk (getent), re-exec the start under
+#       `sg <group>` so the launching process picks the group up. A sentinel
+#       env var prevents a re-exec loop, and the re-exec is skipped when `sg`
+#       is unavailable or the group is already live.
+#
+# Contract:
+#   - Linux + linux-user-iso-effective only; silent no-op otherwise.
+#   - NEVER aborts the start. Worst case it warns and lets the legacy
+#     (possibly-dying) first start proceed exactly as today.
+#   - Stdout-quiet (diagnostics go to stderr via bridge_warn). The caller
+#     (run_start) execs bridge-start.sh immediately after, so this must not
+#     emit anything start parses.
+#
+# When (2) re-execs, this function does NOT return (exec replaces the shell);
+# the re-exec sets BRIDGE_AGENT_START_SUPP_REEXEC=1 so the second pass skips
+# straight past the re-exec branch (the daemon refresh in the second pass is a
+# cheap already-has-group no-op).
+bridge_agent_start_supp_group_preflight() {
+  local agent="$1"
+  shift || true
+  # Remaining args are the verbatim bridge-start.sh forwards; needed only on
+  # the sg re-exec path so the relaunch is identical to the original invocation.
+  local -a _start_fwd=("$@")
+
+  [[ -n "$agent" ]] || return 0
+  [[ "$(uname -s 2>/dev/null)" == "Linux" ]] || return 0
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || return 0
+
+  local _grp=""
+  if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+    _grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+  fi
+  [[ -n "$_grp" ]] || return 0
+
+  # (1) Daemon refresh — mirrors agent create/delete. Non-fatal: a non-zero
+  # rc here is a UX surface only (daemon not running, already-has-group, etc.).
+  if command -v bridge_daemon_refresh_after_group_membership_change >/dev/null 2>&1; then
+    bridge_daemon_refresh_after_group_membership_change \
+      --group "$_grp" \
+      --reason "agent-start:$agent" \
+      >/dev/null 2>&1 || true
+  fi
+
+  # (2) Controller self-heal via sg re-exec. Already inside a re-exec? Stop —
+  # the group is now live (or sg could not deliver it and re-trying would loop).
+  if [[ "${BRIDGE_AGENT_START_SUPP_REEXEC:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  # Is the agent group already in THIS process's live set? If so, nothing to do.
+  local _live_groups=""
+  _live_groups="$(id -nG 2>/dev/null | tr ' ' '\n' || true)"
+  if printf '%s\n' "$_live_groups" | grep -Fxq -- "$_grp"; then
+    return 0
+  fi
+
+  # Group is missing from the live set. Only re-exec when it EXISTS on disk
+  # (getent) — otherwise sg would fail and the legacy launch is the better
+  # fallback. Also require `sg` to be available and the controller to actually
+  # be a member on disk (sg refuses non-members).
+  if ! getent group "$_grp" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v sg >/dev/null 2>&1; then
+    bridge_warn "isolation v2 (#1836): controller's live group set is missing '$_grp' and \`sg\` is unavailable to refresh it in-process; the first start may die (KNOWN_ISSUES §28). Re-run \`agb agent start $agent\` or refresh the shell with \`newgrp $_grp\`."
+    return 0
+  fi
+  # getent group membership check: the controller user must be listed for sg
+  # to switch into the group without a password.
+  local _ctrl_user=""
+  _ctrl_user="$(id -un 2>/dev/null || printf '')"
+  if [[ -n "$_ctrl_user" ]] \
+     && ! getent group "$_grp" | awk -F: '{print $4}' | tr ',' '\n' | grep -Fxq -- "$_ctrl_user"; then
+    # Not an on-disk member — usermod -aG has not landed yet. sg would prompt
+    # for a password / fail; do not block, let the legacy launch proceed.
+    bridge_warn "isolation v2 (#1836): controller '$_ctrl_user' is not yet an on-disk member of '$_grp'; skipping in-process group refresh (re-run isolate/create if this persists)."
+    return 0
+  fi
+
+  bridge_warn "isolation v2 (#1836): refreshing controller group set with '$_grp' via \`sg\` so the first start of '$agent' can traverse its isolated tree (KNOWN_ISSUES §28)."
+
+  # Re-exec the SAME agent-bridge start command under sg so the relaunched
+  # process carries the agent group in its live supplementary set. The
+  # sentinel stops a second pass from looping here. We re-enter via the
+  # public `agent start` verb (not bridge-start.sh directly) so the second
+  # pass takes the identical run_start path — including the daemon refresh —
+  # but short-circuits the re-exec branch.
+  local _self="$SCRIPT_DIR/bridge-agent.sh"
+  local -a _reexec_cmd=("$BRIDGE_BASH_BIN" "$_self" start "$agent")
+  if (( ${#_start_fwd[@]} > 0 )); then
+    _reexec_cmd+=("${_start_fwd[@]}")
+  fi
+  # Build a single shell-quoted command string for `sg -c`.
+  local _quoted=""
+  local _tok=""
+  for _tok in "${_reexec_cmd[@]}"; do
+    _quoted+="$(printf '%q ' "$_tok")"
+  done
+  export BRIDGE_AGENT_START_SUPP_REEXEC=1
+  exec sg "$_grp" -c "$_quoted"
+}
+
 # bridge_agent_iso_boundary_quickref_text
 #
 # Issue #1357 (v0.15.0-beta5-2 Lane E): emit the compressed iso v2 boundary

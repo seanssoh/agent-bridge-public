@@ -107,8 +107,20 @@ add_live() {
 
 add_all_required_static() {
 
-add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering 1495-settings-invalid-hook-key 1453-channel-sticky-false-inbound 1455-settings-two-tree-doctor isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1342-write-state-marker-matrix 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys 1689-statusline-preserve-rerender 1756-settings-preserve-model-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed 1753-hud-config-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1400-purge-home-degrade-no-sudo nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent 1323-nudge-eligibility-recheck-twostage 1199-action-required-claimed-skip tool-policy-roster-read-classify 1690-tasksdb-read-carveout 1692-admin-bash-symmetry 1709-shared-secret-suffix-guard 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1405-handoffd-supervision 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift phase2-install-tree-reconciler phase3-agent-home-contract 1201-1202-directory-marketplace-seed 1205-hook-iso-fail-open 1207-stale-supp-groups-allowlist 1208-lock-metadata-normalize 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1214-channel-validator-iso-fallback 1215-ms365-dir-mode beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers G-channel-spec-resolution F-daemon-supp-groups-mock F-daemon-supp-groups-real H-bootstrap-memory-iso-rebuild I-agent-description-roster ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers 6607-hook-admin-allowlist γ-cli-consistency δ-1234-daemon-start-policy B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir C-beta4-logger-and-spec B-beta4-setup-wizard A-beta4-iso-path-resolution D-beta4-daemon-lifecycle E-beta4-fresh-install-gate-state-dir H-beta4-iso-ownership F-beta4-oauth-bootstrap G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs K-beta4-nits Beta-beta5-session-id-detect-sudo α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-zeta-teams-mcp-dedup beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-eta-cron-iso-uid-preflight beta5-2-delta-nudge-session-empty beta5-2-theta-upgrade-backfill-perms beta5-2-nu-daemon-path-quarantine beta5-2-kappa-state-audit-reconcile beta5-2-iota-daemon-escalation-family beta5-2-lambda-a2a-robustness beta5-2-mu-cron-channel-creds beta5-2-xi-misc-fixes 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 1354-setup-teams-fd-password 1360-onboarding-next-actions-persona 1353-setup-pending-grace 1355-1356-ms365-wizard 1357-iso-boundary-quickref 1358-admin-credential-routine-exempt 1352-shared-codex-pair-path 1343-ms365-token-refresh 1378-iso-session-lock-fresh-start 1388-daemon-lock-fd-cloexec 1416-onboarding-state-field-anchor a2a-setup-wizard 1408-daemon-alert-nudge-hygiene 1409-claude-midturn-busy-gate 1427-A-roster-materialize 1427-B-template-sync-wizard 1426-cron-shell-noniso-help 1437-reactive-cron-rotation 1425-spool-rederive 1617-pending-attention-arrival-stale 1437-native-usage-probe 1468-usage-429-positive-signal 1464-cron-aware-stale-health 1497-v2-dynamic-handoff 1497-p1-home-resolver 1506-isolate-normalize 1497-p2-operator-home 1513-iso-teams-prune-eacces 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver plugin-requires-resolver 1520-shared-claude-config-dir 1520b-create-time-creds-sync 1520c-create-isolate-profile-publish 1533-create-isolate-content-publish 1766-iso-settings-readable 1402-stat-platform-order 1398-a2a-inbound-stopped-target-force 1463-launchd-keepalive-singleton-thrash 1470-engine-auth-seam 1470-codex-fleet-sync 1459-cron-dispatch-recovery 1417-identity-sync-on-start 1750-admin-workdir-identity-not-pair-template upgrade-migrate-rematerialize-workdir 1367-auth-sealed-paste 1563-daemon-singleton 9882-daemon-audit-fp 9981-iso-urgent-instant-wake 9981-iso-pending-attention-readable 1563-pr2-daemon-self-abort 1563-pr3-daemon-escalation 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1569-askuserquestion-bound 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1623-a2a-backpressure-failopen 1628-a2a-deliver-per-row-guard 1631-nudge-helper-db-guard 1630-a2a-fresh-arrival-nudge 1637-agb-list-iso-marker 1635-iso-backup-perm-skip 1629-healthz-not-semaphore-gated 1640-urgent-from-override 1639-post-restart-auto-wake 1638-settings-cosmetic-conflict 1650-ms365-get-valid-token 1636-rematerialize-scaffolding 1659-cron-status-walk-perf 1663-plugin-cache-sidecar-skip 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1667-daemon-control-lock-serialize 1672-link-shared-settings-idempotent 1671-teams-eaddrinuse-diagnostic 1670-rematerialize-dryrun-agent-preserved 1677-cron-summary-short-derive lts-channel-sticky-resolver 1685-receiver-staleness-selfheal 1701-warp-healthz-socket-held 1697-a2a-net-status 1693-read-viewers v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers v0166-lc-config-set-env 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1652-queue-gateway-crashloop 11901-shared-global-settings-inherit 1759-selfref-global-loop-guard 1679-1680-a2a-receiver-supervisor-robustness 1762-picker-autoresolve 1783-picker-idle-nonpicker 1764-ratchet-anchoring 1769-freshness-gate-resume 1763-static-model-effort 1781-doc-migration-memory-preserve 1786-tasksdb-doctor-verb 1795-reaper-ephemeral-policy 1803-orphan-dir-gc 1801-watchdog-bounded-broken-links 1809-agents-md-backfill 1806-admin-guard-allow-audit 1823-v2-peer-home-containment 1852-dynamic-agent-restart 1855-keychain-free-backfill 1860-smoke-daemon-stub-temp-guard 1853-self-restart-footgun 1797-reaper-keep-audit-latch 1857-recreate-provisioning-preserve 1844-plugin-liveness-probe
+add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering 1495-settings-invalid-hook-key 1453-channel-sticky-false-inbound 1455-settings-two-tree-doctor isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1342-write-state-marker-matrix 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys 1689-statusline-preserve-rerender 1756-settings-preserve-model-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed 1753-hud-config-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup 1400-purge-home-degrade-no-sudo nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent 1323-nudge-eligibility-recheck-twostage 1199-action-required-claimed-skip tool-policy-roster-read-classify 1690-tasksdb-read-carveout 1692-admin-bash-symmetry 1709-shared-secret-suffix-guard 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1405-handoffd-supervision 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift phase2-install-tree-reconciler phase3-agent-home-contract 1201-1202-directory-marketplace-seed 1205-hook-iso-fail-open 1207-stale-supp-groups-allowlist 1208-lock-metadata-normalize 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1212-bridge-hooks-marketplace 1213-iso-uid-predicate 1214-channel-validator-iso-fallback 1215-ms365-dir-mode beta27-D-inject-timestamp-resolved beta27-E-hook-permission-fail-open-markers G-channel-spec-resolution F-daemon-supp-groups-mock F-daemon-supp-groups-real H-bootstrap-memory-iso-rebuild I-agent-description-roster ζ-1236-plugins-list-marketplaces β-1231-1236-fresh-install-seed-sudoers 6607-hook-admin-allowlist γ-cli-consistency δ-1234-daemon-start-policy B-beta3-1249-1250-plugin-ux C1-beta3-1251-restart-preflight-rollback A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir C-beta4-logger-and-spec B-beta4-setup-wizard A-beta4-iso-path-resolution D-beta4-daemon-lifecycle E-beta4-fresh-install-gate-state-dir H-beta4-iso-ownership F-beta4-oauth-bootstrap G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs K-beta4-nits Beta-beta5-session-id-detect-sudo α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-zeta-teams-mcp-dedup beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-eta-cron-iso-uid-preflight beta5-2-delta-nudge-session-empty beta5-2-theta-upgrade-backfill-perms beta5-2-nu-daemon-path-quarantine beta5-2-kappa-state-audit-reconcile beta5-2-iota-daemon-escalation-family beta5-2-lambda-a2a-robustness beta5-2-mu-cron-channel-creds beta5-2-xi-misc-fixes 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 1354-setup-teams-fd-password 1360-onboarding-next-actions-persona 1353-setup-pending-grace 1355-1356-ms365-wizard 1357-iso-boundary-quickref 1358-admin-credential-routine-exempt 1352-shared-codex-pair-path 1343-ms365-token-refresh 1378-iso-session-lock-fresh-start 1388-daemon-lock-fd-cloexec 1416-onboarding-state-field-anchor a2a-setup-wizard 1408-daemon-alert-nudge-hygiene 1409-claude-midturn-busy-gate 1427-A-roster-materialize 1427-B-template-sync-wizard 1426-cron-shell-noniso-help 1437-reactive-cron-rotation 1425-spool-rederive 1617-pending-attention-arrival-stale 1437-native-usage-probe 1468-usage-429-positive-signal 1464-cron-aware-stale-health 1497-v2-dynamic-handoff 1497-p1-home-resolver 1506-isolate-normalize 1497-p2-operator-home 1513-iso-teams-prune-eacces 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver plugin-requires-resolver 1520-shared-claude-config-dir 1520b-create-time-creds-sync 1520c-create-isolate-profile-publish 1533-create-isolate-content-publish 1766-iso-settings-readable 1402-stat-platform-order 1398-a2a-inbound-stopped-target-force 1463-launchd-keepalive-singleton-thrash 1470-engine-auth-seam 1470-codex-fleet-sync 1459-cron-dispatch-recovery 1417-identity-sync-on-start 1750-admin-workdir-identity-not-pair-template upgrade-migrate-rematerialize-workdir 1367-auth-sealed-paste 1563-daemon-singleton 9882-daemon-audit-fp 9981-iso-urgent-instant-wake 9981-iso-pending-attention-readable 1563-pr2-daemon-self-abort 1563-pr3-daemon-escalation 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1569-askuserquestion-bound 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1623-a2a-backpressure-failopen 1628-a2a-deliver-per-row-guard 1631-nudge-helper-db-guard 1630-a2a-fresh-arrival-nudge 1637-agb-list-iso-marker 1635-iso-backup-perm-skip 1629-healthz-not-semaphore-gated 1640-urgent-from-override 1639-post-restart-auto-wake 1638-settings-cosmetic-conflict 1650-ms365-get-valid-token 1636-rematerialize-scaffolding 1659-cron-status-walk-perf 1663-plugin-cache-sidecar-skip 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1667-daemon-control-lock-serialize 1672-link-shared-settings-idempotent 1671-teams-eaddrinuse-diagnostic 1670-rematerialize-dryrun-agent-preserved 1677-cron-summary-short-derive lts-channel-sticky-resolver 1685-receiver-staleness-selfheal 1701-warp-healthz-socket-held 1697-a2a-net-status 1693-read-viewers v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers v0166-lc-config-set-env 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1652-queue-gateway-crashloop 11901-shared-global-settings-inherit 1759-selfref-global-loop-guard 1679-1680-a2a-receiver-supervisor-robustness 1762-picker-autoresolve 1783-picker-idle-nonpicker 1764-ratchet-anchoring 1769-freshness-gate-resume 1763-static-model-effort 1781-doc-migration-memory-preserve 1786-tasksdb-doctor-verb 1795-reaper-ephemeral-policy 1803-orphan-dir-gc 1801-watchdog-bounded-broken-links 1809-agents-md-backfill 1806-admin-guard-allow-audit 1823-v2-peer-home-containment 1852-dynamic-agent-restart 1855-keychain-free-backfill 1860-smoke-daemon-stub-temp-guard 1853-self-restart-footgun 1797-reaper-keep-audit-latch 1857-recreate-provisioning-preserve 1844-plugin-liveness-probe 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite 1833-status-gateway-timeout-not-down 1837-gateway-exit-code-on-commit 1825-ms365-token-key-by-claim 1836-iso-first-start-queue-dir-ownership
 add_required 1425-cron-dispatch-nudge-scope
+# Issue #1820: layout-v2 four-writer migration + gated v1->v2 reconciliation.
+# All eight verdict gates as smokes — cron/precompact/settings/doc-sync writer
+# fixes, the reconcile conflict policy + idempotence, the dry-run inventory and
+# gated apply (wrapper end-to-end incl. the fail-closed quiesce fence), and the
+# post-apply source invariant. In the full static suite so any writer or
+# reconcile edit re-runs the whole matrix.
+add_required 1820-cron-writer-v2-candidate 1820-precompact-resolved-env-v2 1820-settings-v2-render-symlink 1820-doc-sync-v2-target-root 1820-reconcile-conflict-policy 1820-reconcile-dryrun-inventory 1820-reconcile-apply-gated 1820-post-apply-invariant
+# Issue #1835: bridge-queue-gateway.py's SOCKET-transport client preflight
+# (_read_inline_text) now applies the #1280 sudo-as-owner body-file fallback on
+# PermissionError, with an actionable iso-ownership error when it cannot apply.
+# In the full static suite so any scripts/smoke/* move re-runs the parity guard.
+add_required 1835-create-bodyfile-iso-fallback
 # Issue #1769: trusted-resume marker — a fresh/idle Claude agent restart now
 # resumes instead of launching a brand-new session. In the full static suite
 # so any scripts/smoke/* or session-resume helper change re-runs the
@@ -896,7 +908,7 @@ select_for_path() {
       # hardcoded "unknown" stub. Pull 1844-plugin-liveness-probe on every
       # bridge-status.py move so the probe wiring + omit-when-no-probe
       # contract cannot silently regress back to all-unknown rows.
-      add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership 1803-orphan-dir-gc 1844-plugin-liveness-probe
+      add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership 1803-orphan-dir-gc 1844-plugin-liveness-probe 1833-status-gateway-timeout-not-down
       # Issue #1405 (v0.15.0 self-heal stack): bridge-status.py gained
       # read_handoffd_health + the A2A receiver health row + the
       # `a2a=DOWN`/`a2a=ALARM` header flag (text + JSON dashboards). Pull
@@ -1085,7 +1097,15 @@ select_for_path() {
       # raw-token leak, 0600 token-file mode, malformed-response deep-redact).
       # Pull on every ms365/server.ts move so a future refactor cannot
       # silently drop auto-refresh back to the 1-hour-outage state.
-      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode 1343-ms365-token-refresh 1650-ms365-get-valid-token beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
+      # Issue #1825: server.ts now keys + stores the delegated token by the
+      # AUTHENTICATED claim (id_token preferred_username/upn, Graph /me
+      # fallback) at pair_poll success, not by the opaque pair_start input —
+      # eliminating the post-pair re-key/mv/restart dance. The 1825 smoke
+      # pins that the durable key/`upn` field is the verified claim, a forged
+      # input cannot determine the key, and path-traversal is neutralized.
+      # Pull on every ms365/server.ts move so a refactor cannot regress the
+      # keying contract that the approvals plugin's identity read depends on.
+      add_required 1209-ms365-redirect-resolver 1210-ms365-scope-normalize 1215-ms365-dir-mode 1343-ms365-token-refresh 1650-ms365-get-valid-token 1825-ms365-token-key-by-claim beta5-2-zeta-teams-mcp-dedup beta5-2-xi-misc-fixes
       add_integration integration-minimal
       ;;
 
@@ -1278,7 +1298,28 @@ select_for_path() {
       # origin=cron:<id>. Pull 1792-cron-scope-fence on every gateway move so a
       # refactor cannot drop the forward/injection or let it bleed into the
       # trusted-actor / ACL decision.
-      add_required queue a2a-rooms-p1b-acl 1652-queue-gateway-crashloop 1792-cron-scope-fence
+      # Issue #1837 (keystone) + #1834: the gateway CLIENT path (cmd_client)
+      # now degrades a busy/transient file-transport round-trip without false
+      # failure — exit-code-reflects-commit for done/claim/cancel, bounded
+      # read-side retry, read-verb direct-DB fallback, and the
+      # gateway_daemon_liveness tri-state primitive (A3/#1833 consumes it).
+      # Pull 1837-gateway-exit-code-on-commit on every gateway move so a
+      # refactor cannot regress the no-false-failure client contract.
+      # Issue #1835: the gateway's SOCKET-transport client preflight
+      # (_read_inline_text) now mirrors the #1280 sudo-as-owner body-file
+      # fallback that bridge-queue.py's create server path already has, so an
+      # iso-owned `--body-file` read on PermissionError drops to
+      # `sudo -n -u <owner> cat` and otherwise emits an actionable iso-ownership
+      # error instead of an opaque body_file_unreadable. Pull
+      # 1835-create-bodyfile-iso-fallback on every gateway move so the parity +
+      # actionable-error contract cannot regress.
+      # Issue #1833 (wave v0.16.10 A3): bridge-daemon.sh status / agb status
+      # health is now anchored on gateway_daemon_liveness via
+      # bridge_daemon_liveness (lib/bridge-state.sh). Pull
+      # 1833-status-gateway-timeout-not-down on every gateway move so a
+      # primitive change cannot silently flip the status renderer back to a
+      # gateway-response-derived (false `down`) health verdict.
+      add_required queue a2a-rooms-p1b-acl 1652-queue-gateway-crashloop 1792-cron-scope-fence 1837-gateway-exit-code-on-commit 1835-create-bodyfile-iso-fallback 1833-status-gateway-timeout-not-down 1836-iso-first-start-queue-dir-ownership
       ;;
 
     bridge-a2a.py|bridge-handoffd.py|bridge_a2a_common.py|bridge_reconcile_common.py|bridge-rooms.py|bridge_rooms_common.py|bridge-handoff-daemon.sh|lib/bridge-a2a.sh|lib/daemon-helpers/a2a-receiver-exit-cause.py|lib/daemon-helpers/a2a-receiver-staleness.py|handoff.local.example.json|scripts/smoke/a2a-cross-bridge-helper.py|scripts/smoke/a2a-tailscale-identity-resolve-helper.py|scripts/smoke/a2a-daemon-selfheal-reconcile-helper.py|scripts/smoke/a2a-migrate-identity-helper.py|scripts/smoke/a2a-ip-change-announce-helper.py|scripts/smoke/a2a-setup-wizard-helper.py|scripts/smoke/a2a-rooms-p1a-helper.py|scripts/smoke/a2a-rooms-p1b-acl-helper.py|scripts/smoke/a2a-rooms-1517-bootstrap-helper.py|scripts/smoke/rooms-p4-1-cross-node-join-helper.py|scripts/smoke/rooms-p4-1-post-hook.sh|scripts/smoke/rooms-p4-2-roster-broadcast-helper.py|scripts/smoke/rooms-p4-2-post-hook.sh|scripts/smoke/rooms-p4-3-room-talk-helper.py|scripts/smoke/rooms-p4-3-post-hook.sh|scripts/smoke/1594-rooms-fanout-helper.py|scripts/smoke/1594-rooms-fanout-post-hook.sh|scripts/smoke/1594-rooms-fanout-local-hook.sh|scripts/smoke/rooms-p4-5-polish.sh|scripts/smoke/rooms-p4-5-helper.py|scripts/smoke/1563-pr8-a2a-diag-recovery-helper.py|scripts/smoke/1575b-a2a-backoff-ceiling-helper.py|scripts/smoke/1618-outbox-retry-resets-attempts-helper.py|scripts/smoke/1628-a2a-deliver-per-row-guard-helper.py|scripts/smoke/1629-healthz-not-semaphore-gated-helper.py|scripts/smoke/1595-cloudflare-warp-mesh-helper.py|scripts/smoke/1758-trusted-routed-transport.sh|scripts/smoke/1758-trusted-routed-transport-helper.py|scripts/smoke/1701-warp-healthz-socket-held-helper.py|scripts/smoke/1697-a2a-net-status-helper.py|scripts/smoke/1685-boot-marker-helper.py|scripts/smoke/v0165-l0-reconcile-skeleton-helper.py|scripts/smoke/v0165-l2-tunnel-health-helper.py|scripts/smoke/v0165-l1-stable-addr-helper.py|scripts/smoke/v0165-l3-peer-reachability-helper.py|scripts/smoke/v0165-l4-token-join-helper.py|scripts/smoke/v0165-l4-token-join-post-hook.sh|scripts/smoke/v0165-l5-relay-roster-helper.py|scripts/smoke/v0165-l5-relay-post-hook.sh|scripts/smoke/v0165-l5-roster-post-hook.sh|scripts/smoke/v0165-l6-net-status-v2.sh|scripts/smoke/v0165-l6-net-status-v2-helper.py|scripts/smoke/v0166-la-tunnel-bounce-gate.sh|scripts/smoke/v0166-la-tunnel-bounce-gate-helper.py|scripts/smoke/v0166-lb-transient-peers.sh|scripts/smoke/v0166-lb-transient-peers-helper.py|scripts/smoke/1728-test-bind-state-path-guard.sh|scripts/smoke/1728-test-bind-state-path-guard-helper.py|scripts/smoke/1679-1680-a2a-receiver-supervisor-robustness.sh|scripts/install-handoffd-systemd.sh)
@@ -1777,7 +1818,7 @@ select_for_path() {
       # can no longer rm a healthy listener's bound socket. Pull
       # 1652-queue-gateway-crashloop on every bridge-daemon.sh move so a
       # regression to the single-miss rm cannot reopen the crash-loop.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill 1833-status-gateway-timeout-not-down
       # Issue #1855: bridge-daemon.sh gained process_keychain_free_backfill, the
       # cadence-gated hygiene pass that runs `bridge-auth.sh claude-token
       # backfill-settings` for pre-#1520 shared agents. Pull 1855 on every
@@ -1968,7 +2009,15 @@ select_for_path() {
       # `ab-agent-<a>` group too (staging.py _write_result via
       # _resolve_result_gid), so the iso UID can read its own cron result.
       # Pin its smoke on bridge-cron.sh moves alongside the request-leg one.
-      add_required 1379-iso-cron-staging-group 1383-iso-cron-result-json-group
+      # Issue #1842 (CRITICAL): lib/bridge-cron.sh's
+      # `bridge_cron_run_dir_grant_isolation` now grants 3770 (setgid+STICKY,
+      # was 2770) on the iso TEXT-cron run dir, and the runner's tamper-check
+      # exemption REQUIRES that sticky bit (the #1842 codex-r2 TOCTOU defense).
+      # Pin 1842-cron-tamper-iso-groupwrite on every bridge-cron.sh move so a
+      # future PR cannot drop the sticky bit out of lockstep with the runner's
+      # sticky-gated exemption (silently re-opening the request.json swap
+      # window or re-breaking every iso cron).
+      add_required 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 1842-cron-tamper-iso-groupwrite
       # Issue #1426: root bridge-cron.sh's usage() and
       # bridge_cron_validate_shell_run_config now state the iso-v2 /
       # --run-as-agent requirement up front and point a non-iso author at
@@ -2212,7 +2261,12 @@ select_for_path() {
       # so the iso UID can read its OWN cron result without Errno 13. Pin
       # 1383-iso-cron-result-json-group on every cron-helpers move so a
       # future refactor cannot drop the result-leg group resolution.
-      add_required cron-run-artifacts-retention cron-shell-runner beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group queue
+      # Issue #1842: the runner's iso-group-write tamper exemption mirrors
+      # staging.py's `_canonical_actor_group_names` (same ab-agent-<a> +
+      # hash-truncated derivation). Pin 1842-cron-tamper-iso-groupwrite on
+      # cron-helpers moves so a change to the group-name policy stays
+      # co-verified against the tamper-check exemption.
+      add_required cron-run-artifacts-retention cron-shell-runner beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 1842-cron-tamper-iso-groupwrite queue
       add_integration integration-minimal
       ;;
 
@@ -2285,6 +2339,13 @@ select_for_path() {
       # cannot re-introduce the fatal raise, regress to silent truncation, make
       # an empty `summary` non-fatal, or leak the scope fence (bad
       # forward_target must stay fatal).
+      # Issue #1826: bridge-cron.py's parse_at_datetime now anchors a NAIVE
+      # `--at` in `--tz` (host-local when omitted) instead of the host zone,
+      # preserves an explicit offset / `Z` unchanged, errors loudly on an
+      # unhonorable `--tz` (no silent drop), and echoes the resolved instant in
+      # local + UTC. Pull 1826-cron-at-naive-tz on every bridge-cron.py /
+      # scheduler move so a future PR cannot regress naive-`--at` back to the
+      # host-zone reinterpretation, drop `--tz`, or break DST-correct anchoring.
       # Issue #1792: bridge-cron-runner.py's build_prompt now appends the
       # job-name-parameterized SCOPE FENCE block (the cheap, big-win mitigation
       # for cron-child scope creep) and exports BRIDGE_CRON_RUN_ID into the
@@ -2300,7 +2361,7 @@ select_for_path() {
       # 1843-cron-consecutive-failure-escalation on every bridge-cron.py move
       # so a future PR cannot drop the escalation, regress the threshold/
       # cadence boundary, or stop clearing the provenance marker on success.
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1843-cron-consecutive-failure-escalation
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1843-cron-consecutive-failure-escalation 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite
       add_integration integration-minimal
       ;;
 
@@ -3021,7 +3082,12 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # every isolation-lib move so a future revert at either gate
       # (A0-derive removal, Path B classifier removal) re-introduces the
       # every-stop warning regression at PR time.
-      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering 1495-settings-invalid-hook-key isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup phase2-install-tree-reconciler phase3-agent-home-contract 1207-stale-supp-groups-allowlist A-beta4-iso-path-resolution H-beta4-iso-ownership G-beta4-watchdog-noise J-beta4-workflow-docs α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms 1506-isolate-normalize 1520c-create-isolate-profile-publish 1533-create-isolate-content-publish 1766-iso-settings-readable 1513-iso-teams-prune-eacces
+      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering 1495-settings-invalid-hook-key isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state 1342-write-state-marker-matrix launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup phase2-install-tree-reconciler phase3-agent-home-contract 1207-stale-supp-groups-allowlist A-beta4-iso-path-resolution H-beta4-iso-ownership G-beta4-watchdog-noise J-beta4-workflow-docs α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms 1506-isolate-normalize 1520c-create-isolate-profile-publish 1533-create-isolate-content-publish 1766-iso-settings-readable 1513-iso-teams-prune-eacces 1836-iso-first-start-queue-dir-ownership
+      # Issue #1829: lib/bridge-isolation-v2.sh hosts
+      # bridge_isolation_v2_repair_queue_dirs (idempotent requests/responses
+      # ownership repair). Pull 1836-iso-first-start-queue-dir-ownership on
+      # every isolation-lib move so the queue-dir self-heal contract stays
+      # covered.
       # v0.15.0-beta5-2 Lane κ (#1325 M2): lib/bridge-isolation-v2-
       # reconcile.sh hosts the manual-mode parity branch (#1298 Gap B)
       # that makes `agent-bridge isolation reconcile --check` AND --apply
@@ -3178,6 +3244,67 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # parity gate re-runs whenever this hook moves, guarding both the migrated
       # surfaces and the documented deferral boundary.
       add_required 1497-p2-operator-home
+      add_integration integration-minimal
+      ;;
+
+    scripts/wiki-v2-rebuild.sh)
+      # Issue #1827 (read-side sibling of #1222): the controller-run
+      # wiki/index rebuild now branches on linux-user isolation. For an
+      # iso agent the whole rebuild/publish block (mkdir memory/, lock,
+      # rm stale tmp_db, rebuild-index, validate, mv-into-place) runs as
+      # the iso UID via bridge_isolation_run_as_agent_user_via_bash —
+      # the controller can't write the 2770 iso-owned memory/ dir, so
+      # the legacy controller-direct path tallied every iso agent as a
+      # fail/skip on every run. The 1827 smoke pins:
+      #   - ../bridge-lib.sh sourcing (so the iso helpers load)
+      #   - bridge_load_roster after that source + inside the
+      #     _BRIDGE_ISO_HELPERS_LOADED guard (without it the predicate is
+      #     always-false dead code — the #1222 r1 BLOCKING regression)
+      #   - bridge_agent_linux_user_isolation_effective gate
+      #   - bridge_isolation_run_as_agent_user_via_bash invocation
+      #   - the iso inline script covers the FULL block (mkdir + lock +
+      #     rm + rebuild-index + validate + mv); wrapping only mkdir or
+      #     only mv would re-trip the Permission denied bug
+      #   - non-iso branch preserved (no regression for shared installs)
+      #   - inline-script exit codes stay 0 or >= 10 so the wrapper's +2
+      #     shift on rc<3 cannot collide with its pre-flight band
+      #   - no heredoc/here-string in the iso inline body (footgun #11)
+      # The Linux+sudo gated T9 layer stands up a real
+      # agent-bridge-w1827 user + ab-agent-w1827 group, scaffolds the
+      # iso-owned memory/ at mode 2770 with a stale index.sqlite.rebuilding
+      # file, and asserts the cross-boundary asymmetry (controller rm
+      # fails, sudo-as-iso rm succeeds) reproduces on this host.
+      add_required 1827-wiki-v2-rebuild-iso H-bootstrap-memory-iso-rebuild
+      add_integration integration-minimal
+      ;;
+
+    scripts/wiki-monthly-summarize.sh|scripts/wiki-weekly-summarize.sh)
+      # Issue #1849 (sibling of #1827 / #1222): the controller-run
+      # wiki monthly/weekly summarize crons run `bridge-memory.py
+      # summarize {monthly,weekly}`, which reads/writes the iso-owned
+      # 2770 memory/ dir. The controller is not in ab-agent-<slug>, so
+      # the legacy controller-direct path tallied every iso agent as a
+      # fail on every run. Both scripts now branch on linux-user
+      # isolation and run the summarize as the iso UID via
+      # bridge_isolation_run_as_agent_user_via_bash. The 1849 smoke pins,
+      # for BOTH scripts:
+      #   - ../bridge-lib.sh sourcing (so the iso helpers load)
+      #   - bridge_load_roster after that source + inside the
+      #     _BRIDGE_ISO_HELPERS_LOADED guard (without it the predicate is
+      #     always-false dead code — the #1222 r1 BLOCKING regression)
+      #   - bridge_agent_linux_user_isolation_effective gate
+      #   - bridge_isolation_run_as_agent_user_via_bash invocation
+      #   - the iso inline body runs `bridge-memory.py summarize <period>`
+      #   - non-iso branch preserved (legacy run_with_timeout summarize
+      #     path survives — no regression for shared installs)
+      #   - inline-script exit codes stay 0 or >= 10 so the wrapper's +2
+      #     shift on rc<3 cannot collide with its pre-flight band
+      #   - no heredoc/here-string in the iso inline body (footgun #11)
+      # The Linux+sudo gated T8 layer stands up a real agent-bridge-w1849
+      # user + ab-agent-w1849 group, scaffolds the iso-owned memory/ at
+      # mode 2770, and asserts the cross-boundary asymmetry (controller
+      # write fails, sudo-as-iso write succeeds) reproduces on this host.
+      add_required 1849-wiki-summarize-iso
       add_integration integration-minimal
       ;;
 
