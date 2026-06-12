@@ -1674,27 +1674,65 @@ bridge_run_fleet_default_unsafe_reason() {
     plugin="$token"
     marketplace=""
   fi
+  # PARITY CONTRACT (Issue #1857 gate-2 r4): this per-half safe-component check
+  # MUST mirror the Python `_alias_rejection_reason` gate in
+  # bridge-dev-plugin-cache.py (the same value about to become a filesystem
+  # path component in the catalog/manifest write). Because the bash launch-path
+  # validator runs FIRST and fail-closes BEFORE any convergence write, any
+  # unsafe half the Python side would reject but bash folds would let a valid
+  # earlier token converge before the Python raise — violating the
+  # fail-closed-before-any-write intent. The Python rules for a NON-EMPTY half:
+  #   1. characters outside [A-Za-z0-9._-]   (catches `/`, `\`, `*`, space, AND
+  #      a leftover `@` from a multiple-`@` token like `good@market@extra`),
+  #   2. contains `..` as a SUBSTRING        (catches `good..bad`, `../evil`),
+  #   3. reserved name `.`/`..`              (subsumed by 1/2 but explicit),
+  #   4. Windows reserved name (CON/PRN/AUX/NUL/COM[1-9]/LPT[1-9], any case),
+  #   5. leading dot disallowed unless `.git` (catches `.hidden`).
   local field="" value=""
   for field in plugin marketplace; do
     if [[ "$field" == "plugin" ]]; then value="$plugin"; else value="$marketplace"; fi
     [[ -n "$value" ]] || continue
-    case "$value" in
-      .|..) printf 'unsafe-%s: reserved component (%s)' "$field" "$value"; return 0 ;;
-      */*|*\\*) printf 'unsafe-%s: reserved/traversal component (%s)' "$field" "$value"; return 0 ;;
+    # (1b) length ceiling → mirrors Python `_alias_rejection_reason` (`len >
+    # 200`). A 201-char all-safe-character half is SAFE under the charset gate
+    # but a path-length / overflow risk the Python writer rejects, so the bash
+    # launch-path gate must reject it too (else a valid earlier token converges
+    # before the Python raise). Checked before the charset glob so an
+    # over-long value short-circuits fast.
+    if (( ${#value} > 200 )); then
+      printf 'unsafe-%s: length %s exceeds 200' "$field" "${#value}"; return 0
+    fi
+    # (2) embedded `..` substring → traversal. Check first so the message is
+    # specific; the glob below would also catch it but this is clearer.
+    if [[ "$value" == *".."* ]]; then
+      printf 'unsafe-%s: contains traversal substring (%s)' "$field" "$value"; return 0
+    fi
+    # (1) any character outside the safe alias set [A-Za-z0-9._-].
+    # SECURITY (codex gate-2 r1): use a literal glob test on the QUOTED value
+    # (no word-split, no command sub), so a bare-glob value (`*`) is matched
+    # literally and never pathname-expands mid-validation. The negated bracket
+    # class `*[!A-Za-z0-9._-]*` matches when ANY disallowed char is present —
+    # this is the bash mirror of Python's `_SAFE_ALIAS_RE.fullmatch` (and it is
+    # what catches a leftover `@` from a multiple-`@` token, a `/`, `\`, `*`,
+    # or whitespace).
+    if [[ "$value" == *[!A-Za-z0-9._-]* ]]; then
+      printf 'unsafe-%s: contains characters outside [A-Za-z0-9._-] (%s)' "$field" "$value"; return 0
+    fi
+    # (3) reserved `.`/`..` exact name (defensive; (2) already caught `..`).
+    if [[ "$value" == "." || "$value" == ".." ]]; then
+      printf 'unsafe-%s: reserved component (%s)' "$field" "$value"; return 0
+    fi
+    # (4) Windows reserved device names, case-insensitive (CON, PRN, AUX, NUL,
+    # COM1-9, LPT1-9) — these resolve to devices on Windows filesystems.
+    local _upper=""
+    _upper="$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')"
+    case "$_upper" in
+      CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])
+        printf 'unsafe-%s: reserved Windows name (%s)' "$field" "$value"; return 0 ;;
     esac
-    # A leftover `@`-split component that is itself `.`/`..` (e.g. `x@..`).
-    # SECURITY (codex gate-2 r1): use `read -r -a`, not an unquoted
-    # `$value` word-split — a bare-glob value (e.g. `*`, which the `*/*` case
-    # above does NOT catch) would otherwise pathname-expand here, mid-validation.
-    # `read -r -a` keeps every component literal.
-    local _part=""
-    local -a _parts=()
-    IFS='@' read -r -a _parts <<<"$value"
-    for _part in "${_parts[@]}"; do
-      case "$_part" in
-        .|..) printf 'unsafe-%s: reserved component (%s)' "$field" "$value"; return 0 ;;
-      esac
-    done
+    # (5) leading dot disallowed unless `.git` (hidden-path / dotfile escape).
+    if [[ "$value" == .* && "$value" != ".git" ]]; then
+      printf 'unsafe-%s: leading dot disallowed (%s)' "$field" "$value"; return 0
+    fi
   done
   printf ''
   return 0
@@ -1779,12 +1817,42 @@ bridge_run_sync_dev_plugin_cache() {
       _fd_token="${_fd_token## }"
       _fd_token="${_fd_token%% }"
       # class-(a): empty token after trim is malformed-but-safe → skip+warn.
+      # A bare empty token has NO non-empty half to be unsafe, so the class-b
+      # check below would no-op anyway; skip it early as a cheap fast-path.
       if [[ -z "$_fd_token" ]]; then
         log_line "[dev-plugin-cache] #1857 fleet-default class-a skip: empty declaration token"
         continue
       fi
+      # ORDERING CONTRACT (Issue #1857 spec v3, frozen taxonomy — gate-2 r4
+      # restructure): class-(b) unsafe MUST be evaluated BEFORE the class-(a)
+      # empty-half skip. The precedence is fail-closed-first:
+      #   1. validate EVERY non-empty half for a real unsafe component
+      #      (traversal `..`/`../evil`, reserved component, catalog escape) →
+      #      if ANY non-empty half is unsafe, FAIL CLOSED (rc!=0), never
+      #      downgraded — even when the OTHER half is empty;
+      #   2. ONLY THEN, if the token is merely malformed-but-safe (empty
+      #      plugin/marketplace half with NO unsafe non-empty component), do
+      #      the class-(a) skip+warn and keep processing the list;
+      #   3. else fold the valid token into a channel.
+      # The earlier code did (2) before (1), so a token with both an empty
+      # half AND an unsafe non-empty half (`@../evil` = empty plugin + traversal
+      # marketplace; `@..` = empty plugin + reserved marketplace) was wrongly
+      # class-a downgraded (skip+warn, launch continued) instead of fail-closed.
+      # `bridge_run_fleet_default_unsafe_reason` already skips empty halves
+      # (`[[ -n "$value" ]] || continue`) and validates the non-empty half(s),
+      # so running it FIRST is exactly the fail-closed-first contract: the
+      # unsafe half wins over the empty half.
+      #
+      # class-(b): unsafe identity in ANY non-empty half fails closed BEFORE any
+      # path join / write AND before any class-a empty-half downgrade.
+      _fd_unsafe="$(bridge_run_fleet_default_unsafe_reason "$_fd_token")"
+      if [[ -n "$_fd_unsafe" ]]; then
+        bridge_warn "#1857 fleet-default unsafe declaration (fail-closed) for ${AGENT}: ${_fd_unsafe}"
+        return 1
+      fi
       # class-(a): a token with an EMPTY plugin OR EMPTY marketplace HALF
-      # (`bad@` = empty marketplace, `@evil` = empty plugin) is bad SPEC
+      # (`bad@` = empty marketplace, `@evil` = empty plugin) and NO unsafe
+      # non-empty half (the class-b check above already returned) is bad SPEC
       # SYNTAX, not traversal — malformed-but-safe. Skip+warn that token and
       # keep processing the rest of the list (Issue #1857, spec v3 Δ3 class-a),
       # matching the manifest writer's established class-a behavior
@@ -1793,8 +1861,7 @@ bridge_run_sync_dev_plugin_cache() {
       # `_require_safe_path_component`, which raises ValueError on the empty
       # value and would take down the WHOLE launch via the fleet-default path.
       # A single typo in the protected fleet-default declaration must never
-      # block every Claude launch. Class-b fail-closed (next) still fires for
-      # real traversal/reserved/escape — those have a NON-empty unsafe half.
+      # block every Claude launch.
       if [[ "$_fd_token" == *"@"* ]]; then
         local _fd_plugin_half="${_fd_token%%@*}"
         local _fd_marketplace_half="${_fd_token#*@}"
@@ -1802,12 +1869,6 @@ bridge_run_sync_dev_plugin_cache() {
           bridge_warn "#1857 fleet-default class-a skip for ${AGENT}: malformed spec '${_fd_token}' (empty plugin or marketplace half) — skipped, launch continues"
           continue
         fi
-      fi
-      # class-(b): unsafe identity fails closed BEFORE any path join / write.
-      _fd_unsafe="$(bridge_run_fleet_default_unsafe_reason "$_fd_token")"
-      if [[ -n "$_fd_unsafe" ]]; then
-        bridge_warn "#1857 fleet-default unsafe declaration (fail-closed) for ${AGENT}: ${_fd_unsafe}"
-        return 1
       fi
       # Qualify to the `plugin:<plugin>@<marketplace>` channel form the Python
       # comparator and the manifest writer expect; a bare token gets the

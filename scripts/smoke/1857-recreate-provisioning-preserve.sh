@@ -955,12 +955,13 @@ esac
 # declaration can't, because an unsafe leading token aborts before a trailing
 # empty is reached). Three self-contained sub-cases, each driving the REAL
 # launch convergence:
-#   T15a — SAFE glob-shaped token `*@agent-bridge` from a cwd full of decoy
-#          files. `*` is a safe identity (not class-(b) traversal), so launch
-#          MUST converge it as exactly ONE optional channel `plugin:*@agent-
-#          bridge`. We inspect the captured sync argv: the literal token is
-#          present and NO decoy filename leaked in — direct proof the split
-#          stayed literal (a glob bug would replace `*` with the decoy names).
+#   T15a — UNSAFE glob-shaped token `*@agent-bridge` from a cwd full of decoy
+#          files. gate-2 r4 parity: `*` is OUTSIDE the safe-alias set
+#          [A-Za-z0-9._-] the Python writer enforces, so it is class-(b) fail-
+#          closed (NOT a safe identity that folds). Launch MUST fail closed
+#          naming the LITERAL `*`, with NO convergence write and NO decoy
+#          filename leaked — direct proof the split stayed literal (a glob bug
+#          would replace `*` with the decoy basenames in the unsafe warning).
 #   T15b — SAFE declaration with a TRAILING empty `valid-plugin,`. The valid
 #          token converges; the trailing empty must trigger the class-(a)
 #          empty-token skip+warn log (proof the trailing field survived the
@@ -1046,42 +1047,37 @@ OUTER
   )
 }
 
-# --- T15a: SAFE glob token must converge LITERALLY (no cwd-filename leak) -----
+# --- T15a: UNSAFE glob token fails closed LITERALLY (no cwd-filename leak) -----
+# gate-2 r4 parity update: a `*` is OUTSIDE the safe-alias set [A-Za-z0-9._-]
+# that the Python writer (`_alias_rejection_reason`) enforces, so `*@agent-
+# bridge` is class-(b) fail-closed, NOT a safe identity that folds. (The r1
+# premise that `*` was "safe-but-literal" predates the bash↔python parity fix;
+# the authoritative writer rejects `*`, so the launch-path gate must too, or a
+# valid earlier token could converge before the Python raise.) This tooth's
+# ORIGINAL security purpose is preserved and is in fact STRONGER here: it proves
+# the split stayed LITERAL (no pathname expansion / no decoy leak) by asserting
+# the fail-closed warning quotes the LITERAL `*` and NO decoy basename leaked.
+# The decoys (`decoyA@agent-bridge` ...) are LIVE matches for the `*@agent-
+# bridge` glob, so under the OLD unquoted-split bug `*` would have expanded to
+# the decoy basenames BEFORE the validator saw it — the warn would name a decoy
+# (and the token would have folded as many channels). Asserted:
+#   (1) RC!=0 (fail-closed — `*` rejected, not folded),
+#   (2) a class-(b) unsafe WARN naming the LITERAL `*` (split stayed literal),
+#   (3) NO `decoy` substring anywhere in the output (no glob expansion / leak),
+#   (4) NO convergence write (captured-argv file ABSENT — abort before sync).
 T15A_OUT="$(_t15_run a '*@agent-bridge')"
 T15A_ARGV="$(_t15_argv a)"
-T15A_VERDICT="$(
-  T15A_ARGV="$T15A_ARGV" "$REAL_PY3" - <<'PY'
-import os, sys
-p = os.environ["T15A_ARGV"]
-try:
-    toks = [l.rstrip("\n") for l in open(p, encoding="utf-8")]
-except OSError:
-    print("BAD: no argv captured (launcher never reached sync)"); sys.exit(0)
-def flag(name):
-    f = "--" + name
-    for i, t in enumerate(toks):
-        if t == f:
-            return toks[i + 1] if i + 1 < len(toks) else ""
-    return ""
-ch = flag("channels").split(",") if flag("channels") else []
-opt = flag("optional-channels").split(",") if flag("optional-channels") else []
-literal = "plugin:*@agent-bridge"
-# Literal token must be present in channels AND optional; and NO decoy filename
-# may have leaked in. The decoys (`decoyA@agent-bridge` ...) are LIVE matches
-# for the `*@agent-bridge` glob, so under the old unquoted-split bug `*` would
-# have expanded to `plugin:decoyA@agent-bridge` etc. — the substring `decoy`
-# appearing in any qualified channel is the unambiguous expansion signature.
-leaked = any("decoy" in t.lower() for t in ch + opt)
-ok = (literal in ch) and (literal in opt) and not leaked
-print("GOOD" if ok else "BAD: channels=%r optional=%r leaked=%s" % (ch, opt, leaked))
-PY
-)"
-case "$T15A_OUT$T15A_VERDICT" in
-  *"RC=0"*GOOD)
-    smoke_log "T15a ok: safe glob-shaped token converged LITERALLY as one optional channel; no cwd filename leaked (split stayed literal, no glob expansion)" ;;
-  *)
-    smoke_fail "T15a gate2r1: glob token not literal / leaked or did not converge (out: $T15A_OUT verdict: $T15A_VERDICT)" ;;
-esac
+if [[ "$T15A_OUT" == *"RC=0"* ]]; then
+  smoke_fail "T15a gate2r4: glob token '*@agent-bridge' did NOT fail closed (RC=0 — the star was folded instead of rejected) (out: $T15A_OUT)"
+elif [[ -f "$T15A_ARGV" ]]; then
+  smoke_fail "T15a gate2r4: convergence write attempted before the class-(b) abort for '*@agent-bridge' (argv captured) (out: $T15A_OUT)"
+elif [[ "$T15A_OUT" == *decoy* || "$T15A_OUT" == *DECOY* ]]; then
+  smoke_fail "T15a gate2r1/r4: decoy filename leaked — the split pathname-expanded the glob (out: $T15A_OUT)"
+elif [[ "$T15A_OUT" != *"WARN:"*"unsafe"*'(*)'* ]]; then
+  smoke_fail "T15a gate2r4: no class-(b) unsafe warning naming the LITERAL '*' (split may have expanded) (out: $T15A_OUT)"
+else
+  smoke_log "T15a ok: unsafe glob-shaped token '*@agent-bridge' FAILED CLOSED naming the LITERAL '*' (split stayed literal, no cwd decoy leaked, no convergence write)"
+fi
 
 # --- T15b: SAFE token + TRAILING empty must hit class-(a) skip+warn -----------
 # Order-independent: the class-(a) warn log is emitted DURING the loop (before
@@ -1162,5 +1158,121 @@ PY
 # T15d: empty MARKETPLACE half (`bad@`); T15e: empty PLUGIN half (`@evil`).
 _t15_empty_component_check d 'bad@,valid-plugin@agent-bridge' 'bad@'
 _t15_empty_component_check e '@evil,valid-plugin@agent-bridge' '@evil'
+
+# --- T15f (gate-2 r4): ORDERING COMBINATION MATRIX -----------------------------
+# This is the point of the r4 RESTRUCTURE: the validation ORDER (class-b unsafe
+# FIRST, then class-a empty-half skip) must make EVERY empty/unsafe combination
+# correct, not just the one case the prior round patched. The frozen #1857
+# taxonomy precedence is fail-closed-first:
+#   1. ANY non-empty half that is a real unsafe component (traversal `..` /
+#      `../evil`, reserved component, catalog escape) → FAIL CLOSED (rc!=0),
+#      never downgraded — even when the OTHER half is empty;
+#   2. ONLY THEN, a merely-malformed token (empty plugin/marketplace half, no
+#      unsafe non-empty half) → class-a skip+warn (rc=0, launch continues);
+#   3. else fold the valid token.
+# The regression this guards: before r4 the bash fold checked the empty-half
+# condition and `continue`d (class-a skip) BEFORE running the class-b unsafe
+# check on the NON-EMPTY half, so a token with both an empty half AND an unsafe
+# non-empty half (`@../evil`, `@..`) was class-a downgraded instead of failing
+# closed — the unsafe half must always win.
+#
+# _t15_fail_closed_check: drives the REAL launch path via _t15_run and asserts a
+# class-(b) fail-closed for an empty+unsafe (or both-unsafe) combination:
+#   (1) RC!=0 (launch BLOCKED — the unsafe half won over any empty half),
+#   (2) a class-(b) unsafe WARN was emitted (fail-closed reason),
+#   (3) NO convergence write happened (the captured-argv file is ABSENT — the
+#       abort fired before the sync shim could record argv),
+#   so a valid token in the same list is NOT converged (no partial write).
+_t15_fail_closed_check() {
+  # $1=tag $2=declaration $3=human label
+  local tag="$1" decl="$2" label="$3"
+  local out argv
+  out="$(_t15_run "$tag" "$decl")"
+  argv="$(_t15_argv "$tag")"
+  if [[ "$out" == *"RC=0"* ]]; then
+    smoke_fail "T15$tag gate2r4: empty+unsafe combination ($label, '$decl') did NOT fail closed (RC=0 — class-b downgraded to class-a skip?) (out: $out)"
+  elif [[ -f "$argv" ]]; then
+    smoke_fail "T15$tag gate2r4: convergence write attempted before the class-(b) abort for '$decl' (argv captured — partial convergence) (out: $out)"
+  elif [[ "$out" != *"WARN:"*"unsafe"* ]]; then
+    smoke_fail "T15$tag gate2r4: no class-(b) unsafe fail-closed warning emitted for '$decl' (out: $out)"
+  else
+    smoke_log "T15$tag ok: empty+unsafe combination ($label, '$decl') FAILED CLOSED (RC!=0) BEFORE any convergence write — the unsafe non-empty half won over the empty half; no valid token converged"
+  fi
+}
+
+# _t15_positive_control: a lone VALID token must converge as an optional channel
+# (rc=0). This anchors the matrix — proves the fail-closed checks are not green
+# simply because the launch path is broken for everything.
+_t15_positive_control() {
+  # $1=tag $2=declaration $3=qualified-channel-expected
+  local tag="$1" decl="$2" want="$3"
+  local out argv verdict
+  out="$(_t15_run "$tag" "$decl")"
+  argv="$(_t15_argv "$tag")"
+  verdict="$(
+    T15P_ARGV="$argv" T15P_WANT="$want" "$REAL_PY3" - <<'PY'
+import os, sys
+p = os.environ["T15P_ARGV"]; want = os.environ["T15P_WANT"]
+try:
+    toks = [l.rstrip("\n") for l in open(p, encoding="utf-8")]
+except OSError:
+    print("BAD: no argv captured (valid token never converged)"); sys.exit(0)
+def flag(name):
+    f = "--" + name
+    for i, t in enumerate(toks):
+        if t == f:
+            return toks[i + 1] if i + 1 < len(toks) else ""
+    return ""
+ch = flag("channels").split(",") if flag("channels") else []
+opt = flag("optional-channels").split(",") if flag("optional-channels") else []
+ok = (want in ch) and (want in opt)
+print("GOOD" if ok else "BAD: channels=%r optional=%r" % (ch, opt))
+PY
+  )"
+  if [[ "$out" == *"RC=0"* && "$verdict" == GOOD ]]; then
+    smoke_log "T15$tag ok: positive control — lone valid token ('$decl') converged as an optional channel (RC=0)"
+  else
+    smoke_fail "T15$tag gate2r4: positive control — lone valid token ('$decl') did NOT converge (out: $out verdict: $verdict)"
+  fi
+}
+
+# Matrix rows (each drives the REAL launch path through bridge_run_sync_dev_plugin_cache):
+#   T15f: `@../evil,valid-plugin@agent-bridge` — empty plugin + TRAVERSAL marketplace.
+#         The prior round's class-a-first ordering wrongly skipped this; r4 must
+#         fail it closed (unsafe half wins), and the valid token must NOT converge.
+_t15_fail_closed_check f '@../evil,valid-plugin@agent-bridge' 'empty-plugin + traversal-marketplace'
+#   T15g: `@..` — empty plugin + RESERVED/traversal marketplace half.
+_t15_fail_closed_check g '@..' 'empty-plugin + reserved-marketplace'
+#   T15h: `bad@../evil` — BOTH non-empty, traversal marketplace (already worked
+#         pre-r4 — kept as a regression that the reorder did not break it).
+_t15_fail_closed_check h 'bad@../evil' 'both-non-empty traversal-marketplace'
+#   T15i: `../bad@agent-bridge` — TRAVERSAL plugin half (the leading non-empty
+#         half is unsafe). Confirms the class-b gate evaluates the PLUGIN half too.
+_t15_fail_closed_check i '../bad@agent-bridge' 'traversal-plugin-half'
+# --- T15k-m (gate-2 r4 codex adversarial): bash↔python class-b PARITY families.
+# Codex's adversarial enumeration found three unsafe families the bash launch-
+# path validator FOLDED while the Python writer FAIL-CLOSED — a parity gap that
+# let a valid earlier token converge (write) before the later Python raise,
+# violating fail-closed-before-any-write. The bash `bridge_run_fleet_default_
+# unsafe_reason` now mirrors Python's `_alias_rejection_reason` exactly. These
+# teeth pin that each family fails closed on the REAL launch path BEFORE any
+# convergence write (so the valid token in the same list is NOT converged):
+#   T15k: multiple-`@` token (`good@market@extra`) — marketplace half `market@
+#         extra` has a char outside [A-Za-z0-9._-]; the valid token must NOT write.
+_t15_fail_closed_check k 'good@market@extra,valid-plugin@agent-bridge' 'multiple-@ extra-segment'
+#   T15l: leading-dot plugin name (`.hidden@agent-bridge`) — dotfile/hidden escape.
+_t15_fail_closed_check l '.hidden@agent-bridge,valid-plugin@agent-bridge' 'leading-dot plugin half'
+#   T15m: embedded `..` substring in a component that is NOT literally `..`
+#         (`good..bad@agent-bridge`) — traversal substring.
+_t15_fail_closed_check m 'good..bad@agent-bridge,valid-plugin@agent-bridge' 'embedded-.. plugin half'
+#   T15n (gate-2 r4 codex r2): over-LENGTH half. A 201-char all-safe-character
+#         plugin half passes the charset gate but exceeds Python's 200-char
+#         alias ceiling — bash must reject it too (length parity), or a valid
+#         earlier token converges before the Python raise. Build the 201-char
+#         token dynamically so the source stays readable.
+_t15_overlong_plugin="$(printf 'a%.0s' $(seq 1 201))"
+_t15_fail_closed_check n "${_t15_overlong_plugin}@agent-bridge,valid-plugin@agent-bridge" 'over-length (201) plugin half'
+#   T15j: `valid-plugin@agent-bridge` alone — POSITIVE CONTROL (rc=0 converges).
+_t15_positive_control j 'valid-plugin@agent-bridge' 'plugin:valid-plugin@agent-bridge'
 
 smoke_log "all checks passed"

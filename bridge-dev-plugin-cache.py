@@ -1065,18 +1065,56 @@ def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, st
     plugin_spec = channel[len("plugin:") :]
     plugin_name, plugin_marketplace = plugin_spec.split("@", 1)
 
+    # ORDERING CONTRACT (Issue #1857 spec v3, frozen taxonomy — gate-2 r4
+    # restructure): class-(b) fail-closed MUST be evaluated BEFORE the class-(a)
+    # empty-component benign-ignore, mirroring the bash fleet-default fold. The
+    # precedence is fail-closed-first: validate every NON-EMPTY half for an
+    # unsafe component first; only if no non-empty half is unsafe do we apply
+    # the class-a empty-component skip. Previously the empty-component check
+    # returned `ignored` FIRST, so a channel with both an empty half AND an
+    # unsafe non-empty half (`plugin:@../evil` = empty plugin + traversal
+    # marketplace; `plugin:@..`) was benign-ignored instead of fail-closed —
+    # a class-b downgrade. We must NOT swallow a traversal just because the
+    # other half happens to be empty.
+    #
+    # class-(b): validate the channel-derived marketplace + plugin identity
+    # BEFORE any catalog write / path join, and fail CLOSED for an unsafe
+    # NON-EMPTY component (`..`, slash, reserved). `_require_safe_path_component`
+    # raises ValueError on BOTH empty AND unsafe values, so we must guard the
+    # empty case (`if _val`) here — an empty half is class-a (handled next),
+    # only a NON-EMPTY unsafe half is class-b fail-closed at this gate.
+    # `marketplace_name` is the resolved root marketplace (never empty) so it is
+    # always validated.
+    if marketplace_name:
+        _require_safe_path_component(
+            marketplace_name, role="marketplace name",
+            context=f"sync_plugin_cache channel={channel!r}",
+        )
+    if plugin_marketplace:
+        _require_safe_path_component(
+            plugin_marketplace, role="channel marketplace",
+            context=f"sync_plugin_cache channel={channel!r}",
+        )
+    if plugin_name:
+        _require_safe_path_component(
+            plugin_name, role="plugin name",
+            context=f"sync_plugin_cache channel={channel!r}",
+        )
+
     # Issue #1857 (spec v3 Δ3, class-a — defense-in-depth): a token with an
     # EMPTY plugin OR EMPTY marketplace half (`plugin:bad@`, `plugin:@evil`)
-    # is bad SPEC SYNTAX (malformed-but-safe), NOT path traversal. The bash
-    # fleet-default fold already class-a skip+warns these so they never become
-    # a channel here, but an OPTIONAL channel passed directly (or any caller
-    # bypass) must NOT take down the whole launch: returning a benign `ignored`
-    # result keeps the sync list-comprehension from raising the ValueError that
-    # `_require_safe_path_component` throws on an empty component (which exits
-    # the optional fleet-default path rc=1 and blocks every launch). Skip+warn
-    # and continue, matching the manifest writer's established class-a behavior.
-    # Class-b (`..`, slash, reserved) below still fail-closes — those have a
-    # NON-empty unsafe component and are handled by `_require_safe_path_component`.
+    # and NO unsafe non-empty half (the class-b gate above already raised for
+    # any traversal/reserved component) is bad SPEC SYNTAX (malformed-but-safe),
+    # NOT path traversal. The bash fleet-default fold already class-a skip+warns
+    # these so they never become a channel here, but an OPTIONAL channel passed
+    # directly (or any caller bypass) must NOT take down the whole launch:
+    # returning a benign `ignored` result keeps the sync list-comprehension from
+    # raising the ValueError that `_require_safe_path_component` throws on an
+    # empty component (which exits the optional fleet-default path rc=1 and
+    # blocks every launch). Skip+warn and continue, matching the manifest
+    # writer's established class-a behavior. Because the class-b gate ran first,
+    # an empty+unsafe combination (`plugin:@../evil`) already failed closed and
+    # never reaches this benign-ignore.
     if plugin_name == "" or plugin_marketplace == "":
         sys.stderr.write(
             "[bridge-dev-plugin-cache] #1857 class-a skip: malformed channel %r "
@@ -1089,22 +1127,6 @@ def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, st
             "status": "ignored",
             "reason": "malformed-spec:empty-component",
         }
-
-    # Issue #1857 (spec v3 Δ3, class-b): validate the channel-derived
-    # marketplace + plugin identity BEFORE any catalog write / path join, and
-    # fail CLOSED for an unsafe component (`..`, slash, reserved). Previously
-    # the safe-path gate ran only just before the cache-path join below, AFTER
-    # `ensure_known_marketplace_for_root` had already converged the catalog —
-    # so an unsafe token could trigger a write before being rejected. Class-b
-    # is a security stop, never an availability degrade; hoist it to the top.
-    for _val, _role in (
-        (marketplace_name, "marketplace name"),
-        (plugin_marketplace, "channel marketplace"),
-        (plugin_name, "plugin name"),
-    ):
-        _require_safe_path_component(
-            _val, role=_role, context=f"sync_plugin_cache channel={channel!r}",
-        )
 
     if plugin_marketplace != marketplace_name:
         return {
