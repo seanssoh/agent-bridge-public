@@ -435,6 +435,102 @@ check(
     route == "tampered" and err is not None and "writable" in err,
 )
 
+# E1i DENY (#1842 codex r3 SYMLINK-BEFORE-PIN TEETH) — drive the REAL cmd_run.
+# A pre-pin attacker in a group-writable run dir replaces request.json with a
+# SYMLINK pointing at a controller-owned PRIVATE request.json (0700/0600). The
+# r2 head `.resolve()`'d the leaf BEFORE pin_request_file, so the resolve
+# followed the symlink and the pin + run-dir checks bound to the RESOLVED target
+# and ITS private parent → the swap was accepted as a route. The r3 fix
+# normalizes lexically only (os.path.abspath, no symlink follow), so the
+# O_NOFOLLOW pin binds to the symlink dir-entry → ELOOP → terminal tamper. We
+# drive cmd_run END-TO-END (not just route_pinned) because the .resolve() the
+# bug lived in is in cmd_run, ABOVE the pin — route_pinned alone never exercised
+# it. The run dir is group-writable AND non-sticky (worst case), proving the
+# pre-pin symlink swap is terminal regardless of the dir's exemption eligibility.
+import types as _types
+# Controller-owned PRIVATE target the symlink would point at (what .resolve()
+# would have followed to). 0700 dir / 0600 request.json with a DIFFERENT victim
+# target_agent, so a successful follow would route the attacker's chosen victim.
+tgt_rd = tempfile.mkdtemp()
+tgt_req = m.Path(tgt_rd) / "request.json"
+tgt_req.write_text(json.dumps({"target_agent": "victim-via-symlink", "target_engine": "claude"}))
+os.chmod(tgt_req, 0o600)
+os.chmod(tgt_rd, 0o700)
+# Attacker run dir: group-writable, NON-sticky (the leaf an iso member controls).
+atk_rd = tempfile.mkdtemp()
+os.chown(atk_rd, -1, member_gid)
+os.chmod(atk_rd, 0o2770)
+atk_req = m.Path(atk_rd) / "request.json"
+os.symlink(tgt_req, atk_req)               # request.json IS a symlink → private target
+# (1) the pin on the lexically-normalized symlink path must raise tamper (ELOOP),
+#     never silently follow to the controller-owned target.
+normalized = m.Path(os.path.abspath(os.path.expanduser(str(atk_req))))
+pin_denied = False
+try:
+    m.pin_request_file(normalized)
+except m.RequestArtifactTampered:
+    pin_denied = True
+check("E1i-pin-on-symlink-leaf-tampered", pin_denied)
+check("E1i-normalized-path-not-symlink-followed", str(normalized) == str(atk_req))
+# (2) the REAL cmd_run must emit request_artifact_tampered and return 1 — it must
+#     NOT route the symlink's controller-owned target (victim-via-symlink).
+import io as _io
+import contextlib as _contextlib
+_buf = _io.StringIO()
+with _contextlib.redirect_stdout(_buf):
+    rc = m.cmd_run(_types.SimpleNamespace(request_file=str(atk_req), dry_run=False))
+cmd_out = _buf.getvalue()
+check("E1i-cmd_run-symlink-leaf-returns-1", rc == 1)
+check(
+    "E1i-cmd_run-symlink-leaf-tampered",
+    "request_artifact_tampered" in cmd_out,
+)
+check(
+    "E1i-cmd_run-symlink-leaf-not-routed-to-victim-target",
+    "victim-via-symlink" not in cmd_out,
+)
+
+# E1j DENY (#1842 codex r3 OUTPUT-LEAF SYMLINK TEETH) — the run dir is granted
+# the owning iso agent's group-write (3770 sticky) BEFORE the worker runs, so an
+# iso UID can CREATE a new leaf in it. The text path writes runner-owned outputs
+# (result.json / status.json / stdout.log / stderr.log) via write_text/write_json.
+# If the iso UID pre-plants one of those as a SYMLINK to a controller-owned file,
+# a follow-on-write would clobber the target as the controller (the output-leaf
+# twin of the request.json bypass). write_text/write_json now open O_NOFOLLOW, so
+# a symlink leaf raises ELOOP and the target is left untouched. Prove BOTH writers.
+victim_secret = m.Path(tempfile.mkdtemp()) / "controller-secret.txt"
+victim_secret.write_text("ORIGINAL-CONTROLLER-CONTENT")
+out_rd = tempfile.mkdtemp()
+os.chown(out_rd, -1, member_gid)
+os.chmod(out_rd, 0o3770)                   # group-writable sticky run dir (legit)
+# write_text target as a symlink → controller file
+sl_log = m.Path(out_rd) / "stdout.log"
+os.symlink(victim_secret, sl_log)
+denied_text = False
+try:
+    m.write_text(sl_log, "RUNNER-CLOBBER")
+except OSError:
+    denied_text = True
+check("E1j-write_text-symlink-leaf-denied", denied_text)
+# write_json target as a symlink → controller file
+sl_result = m.Path(out_rd) / "result.json"
+os.symlink(victim_secret, sl_result)
+denied_json = False
+try:
+    m.write_json(sl_result, {"clobbered": True})
+except OSError:
+    denied_json = True
+check("E1j-write_json-symlink-leaf-denied", denied_json)
+# The controller-owned target must be UNTOUCHED (no clobber through the symlink).
+check(
+    "E1j-symlink-target-not-clobbered",
+    victim_secret.read_text() == "ORIGINAL-CONTROLLER-CONTENT",
+)
+# A NON-symlink (normal) leaf in the same dir still writes fine (no regression).
+ok_log = m.Path(out_rd) / "stderr.log"
+m.write_text(ok_log, "normal output\n")
+check("E1j-normal-leaf-writes-ok", ok_log.read_text() == "normal output\n" and not ok_log.is_symlink())
+
 if failures:
     print("E1-FAILURES:", ",".join(failures))
     sys.exit(1)

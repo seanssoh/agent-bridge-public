@@ -441,14 +441,42 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _write_bytes_nofollow(path: Path, data: bytes) -> None:
+    """Write `data` to `path`, REFUSING to follow a symlink at the final
+    component (#1842 codex r3).
+
+    Every caller of `write_text`/`write_json` writes a controller-owned cron
+    run-dir artifact (result.json, status.json, stdout.log, stderr.log,
+    prompt.txt, result-schema.json) — none legitimately targets a symlink. The
+    text-cron run dir is granted the owning iso agent's group write
+    (`bridge_cron_run_dir_grant_isolation`, 3770 sticky), so an iso UID can
+    CREATE a new leaf in it. Without `O_NOFOLLOW` the controller's
+    `Path.write_text()` would FOLLOW a pre-planted symlink leaf and clobber the
+    symlink target as the controller — the output-leaf twin of the request.json
+    symlink-before-pin bypass. `O_NOFOLLOW` makes the open raise `ELOOP` on a
+    symlink leaf; the sticky bit already blocks a member from replacing an
+    existing controller-owned leaf, so first-write creation is the only window
+    and this closes it."""
+    fd = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+    _write_bytes_nofollow(
+        path,
+        (json.dumps(payload, ensure_ascii=True, indent=2) + "\n").encode("utf-8"),
+    )
 
 
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    _write_bytes_nofollow(path, content.encode("utf-8"))
 
 
 def run_dir_id(run_dir: Path) -> str:
@@ -1140,10 +1168,13 @@ def write_shell_terminal_error(
 ) -> None:
     run_dir = request_file.parent
     resolved_run_id = run_id or run_dir_id(run_dir)
-    result_file = (run_dir / "result.json").resolve()
-    status_file = (run_dir / "status.json").resolve()
-    stdout_log = (run_dir / "stdout.log").resolve()
-    stderr_log = (run_dir / "stderr.log").resolve()
+    # Canonical run-dir leaves with no leaf-level `.resolve()`, so the
+    # O_NOFOLLOW write in write_text/write_json binds to the dir-entry rather
+    # than a pre-followed symlink target (#1842 codex r3). run_dir is absolute.
+    result_file = run_dir / "result.json"
+    status_file = run_dir / "status.json"
+    stdout_log = run_dir / "stdout.log"
+    stderr_log = run_dir / "stderr.log"
     completed_at = now_iso()
     write_text(stdout_log, "")
     write_text(stderr_log, (summary or runner_error) + "\n")
@@ -3273,10 +3304,14 @@ def _extract_shell_lock_key(request_file: Path) -> tuple[str, str, str | None]:
 
 def cmd_run_shell(request_file: Path, args: argparse.Namespace) -> int:
     run_dir = request_file.parent
-    result_file = (run_dir / "result.json").resolve()
-    status_file = (run_dir / "status.json").resolve()
-    stdout_log = (run_dir / "stdout.log").resolve()
-    stderr_log = (run_dir / "stderr.log").resolve()
+    # Runner-owned leaves by canonical name; no leaf-level `.resolve()` so the
+    # O_NOFOLLOW write in write_text/write_json binds to the actual dir-entry
+    # (a `.resolve()` here would pre-follow a symlink leaf and defeat it). run_dir
+    # is already absolute (request_file is abspath-normalized) (#1842 codex r3).
+    result_file = run_dir / "result.json"
+    status_file = run_dir / "status.json"
+    stdout_log = run_dir / "stdout.log"
+    stderr_log = run_dir / "stderr.log"
 
     # Minimal pre-lock parse — lock key + run_id only. The full body
     # is re-read under the flock below for validation + exec, so this
@@ -3749,7 +3784,19 @@ def cmd_run_shell(request_file: Path, args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    request_file = Path(args.request_file).expanduser().resolve()
+    # Lexically normalize (expanduser + absolute) WITHOUT following symlinks
+    # (#1842 codex r3). `Path.resolve()` canonicalizes the leaf THROUGH any
+    # symlink BEFORE `pin_request_file()` runs, so a pre-pin attacker who swaps
+    # `request.json` for a symlink to a controller-owned private file wins: the
+    # resolve follows it, and the O_NOFOLLOW pin + run-dir uid/mode/sticky checks
+    # then bind to the RESOLVED target and ITS parent, not the original
+    # group-writable run-dir leaf — O_NOFOLLOW on the leaf is meaningless once the
+    # path was already symlink-resolved upstream. `os.path.abspath` does normpath
+    # + cwd-join only (no symlink follow), so the pin's O_NOFOLLOW open binds to
+    # the actual dir-entry the run dir holds: a symlinked request.json raises
+    # ELOOP → terminal tamper (correct), and the run-dir checks run on the
+    # original containing dir (`request_file.parent`).
+    request_file = Path(os.path.abspath(os.path.expanduser(str(args.request_file))))
     if not request_file.is_file():
         print(f"error: request file not found: {request_file}", file=sys.stderr)
         return 2
@@ -3852,11 +3899,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     run_id = request.get("run_id", "")
     workdir = request.get("target_workdir", "")
     payload_file = Path(request["payload_file"]).expanduser().resolve()
-    result_file = Path(request["result_file"]).expanduser().resolve()
-    status_file = Path(request["status_file"]).expanduser().resolve()
-    stdout_log = Path(request["stdout_log"]).expanduser().resolve()
-    stderr_log = Path(request["stderr_log"]).expanduser().resolve()
     run_dir = request_file.parent
+    # Runner-OWNED output leaves are derived from the original run_dir by their
+    # canonical names — NOT from the request body (#1842 codex r3). The body is
+    # controller-written and always names these run_dir siblings, but sourcing
+    # them from run_dir removes the trust dependency entirely (a body path could
+    # never redirect a runner write outside the run dir) and matches the pattern
+    # `cmd_run_shell`/`write_shell_terminal_error` already use. The actual writes
+    # go through `write_text`/`write_json`, which open O_NOFOLLOW so a symlink
+    # leaf pre-planted by the iso UID in the group-writable run dir raises ELOOP
+    # instead of being followed/clobbered (the output-leaf twin of the
+    # request.json symlink-before-pin bypass).
+    result_file = run_dir / "result.json"
+    status_file = run_dir / "status.json"
+    stdout_log = run_dir / "stdout.log"
+    stderr_log = run_dir / "stderr.log"
     schema_file = run_dir / "result-schema.json"
     prompt_file = run_dir / "prompt.txt"
 
