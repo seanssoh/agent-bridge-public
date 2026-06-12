@@ -95,6 +95,20 @@
 #             pre-r5 head three env-var/operator admin writes emit ONE row total
 #             (only an absolute baseline write audits); after r5 each spelling adds
 #             a row (THREE total). The audit assertions FAIL pre-r5, PASS after.
+#  Tooth 18 — (r6) NESTED bash-expansion bypasses the per-token-shape matcher could
+#             not track (`${ROOTX:-$ANCHOR}`, `${ANCHOR:+$ANCHOR/…}`, `${X:-${Y}}`)
+#             → DENIED by the canonical word-resolution normalizer; admin still
+#             ALLOWs + audits one row per spelling; anchor-free / WORKDIR tails
+#             stay ALLOW (no over-block).
+#  Tooth 19 — (r7) RESULT-CAP overflow must FAIL CLOSED. (a) the over-generation
+#             reduction drops the IMPOSSIBLE anchor-value branch of an empty
+#             `${ANCHOR:+}`, so codex's n=6 alt-anchor `:+` chain no longer hits
+#             the cap and DENIES directly; (b) a GENUINE 2^n `${ANCHOR:-W}`
+#             explosion that overflows the cap now appends `_STATIC_UNRESOLVED`,
+#             so a truncated word carrying a trusted anchor + peer-home tail fails
+#             CLOSED (non-admin DENY; admin ALLOW + one audit row). An overflow
+#             with a scoped-out WORKDIR / harmless tail still ALLOWs (no
+#             over-block). The DENY assertions FAIL (ALLOW) on head 2144d9e4.
 #
 # The strict admin predicate reads the controller roster via `agent list
 # --json`; the smoke injects a deterministic roster snapshot through the
@@ -741,6 +755,71 @@ assert_bash "Tooth18 non-admin nested :- default-anchor peer WORKDIR ALLOWED (sc
 assert_bash "Tooth18 non-admin :+ full-path peer WORKDIR ALLOWED (scoped out)" \
   "$ACTOR_AGENT" "$ADMIN_AGENT" \
   'echo x >> ${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/workdir/NOTES.md}' "ALLOW"
+
+# ---------------------------------------------------------------------------
+# Tooth 19 (r7) — RESULT-CAP overflow must FAIL CLOSED, not OPEN. The r6
+# normalizer (`_resolve_path_word_static`) bounds its resolved SET at
+# `_STATIC_RESOLVE_MAX_RESULTS` (64); on the pre-r7 head the overflow returned a
+# clean PARTIAL list WITHOUT the `_STATIC_UNRESOLVED` sentinel, so the caller's
+# fail-close (`saw_unresolved`) never fired and a truncated-but-clean word that
+# WOULD land in a peer home was ALLOWED. codex's field bypass: a chain of empty
+# `${ANCHOR:+}` (the alternate operator with an EMPTY word expands to "" set OR
+# unset — the anchor-value branch the pre-r7 resolver also emitted was an
+# IMPOSSIBLE candidate that over-generated the SET to the cap) prefixed to a
+# final `:+$BRIDGE_DATA_ROOT/agents/<peer>/home/…` word — n=5 DENY, n=6 ALLOW.
+#
+# Two independent r7 defenses, both asserted here:
+#   (a) over-generation REDUCTION — the empty `${ANCHOR:+}` value branch is
+#       dropped, so codex's n=6 chain no longer overflows and DENIES directly.
+#   (b) fail-CLOSE on overflow — for words that GENUINELY overflow the cap (a
+#       2^n `${ANCHOR:-W}` default explosion), the resolver now appends
+#       `_STATIC_UNRESOLVED`, so a truncated word carrying a trusted anchor AND a
+#       peer-home tail fails CLOSED. An overflow that carries NO peer-home tail
+#       (scoped-out WORKDIR / harmless) still ALLOWs — no over-block.
+#
+# Each NON-admin DENY assertion FAILS (ALLOW) on head 2144d9e4 and PASSES after.
+# The `$`/`{` are single-quoted so the LITERAL token reaches the hook.
+# ---------------------------------------------------------------------------
+# (a) codex empty-`${ANCHOR:+}` n=6 alt-anchor chain + final `:+` peer word.
+TOOTH19_PLUS_CHAIN='${BRIDGE_DATA_ROOT:+}${BRIDGE_AGENT_ROOT_V2:+}${BRIDGE_DATA_ROOT:+}${BRIDGE_AGENT_ROOT_V2:+}${BRIDGE_DATA_ROOT:+}${BRIDGE_AGENT_ROOT_V2:+}'
+assert_bash "Tooth19 non-admin n=6 empty-\${ANCHOR:+} chain + :+ peer word DENIED (#1823 r7 a)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> '"$TOOTH19_PLUS_CHAIN"'${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/home/MEMORY.md}' "DENY"
+# (b) GENUINE 2^n cap overflow (`${ANCHOR:-W}` ×7) + bare-anchor peer-home tail.
+TOOTH19_EXPLODE='${BRIDGE_DATA_ROOT:-u}.${BRIDGE_DATA_ROOT:-u}.${BRIDGE_DATA_ROOT:-u}.${BRIDGE_DATA_ROOT:-u}.${BRIDGE_DATA_ROOT:-u}.${BRIDGE_DATA_ROOT:-u}.${BRIDGE_DATA_ROOT:-u}.'
+assert_bash "Tooth19 non-admin 2^n cap-overflow + anchor peer-home tail DENIED (#1823 r7 b)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> '"$TOOTH19_EXPLODE"'$BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+# NO over-block: the SAME overflow word but a scoped-out peer WORKDIR tail → ALLOW.
+assert_bash "Tooth19 non-admin cap-overflow + peer WORKDIR tail ALLOWED (scoped out)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo x >> '"$TOOTH19_EXPLODE"'$BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/workdir/NOTES.md' "ALLOW"
+# NO over-block: the SAME overflow word (carries the anchor) but a HARMLESS tail
+# with no peer-home text → ALLOW (fail-close is conditioned on the peer tail).
+assert_bash "Tooth19 non-admin cap-overflow + harmless tail ALLOWED (no over-block)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo x >> '"$TOOTH19_EXPLODE"'/tmp/harmless.md' "ALLOW"
+
+# --- TRUSTED-ADMIN sees the overflow sentinel too: ALLOW + EXACTLY ONE audit row
+# on each of the two DENY spellings. mkdir is a recognized peer-write SHAPE that
+# reaches the audit branch; `echo >>` is not. One fresh log; each adds one row → 2.
+# On head 2144d9e4 the admin write fell through the clean partial list (no
+# sentinel) and was NOT audited for the overflow spellings → count stalled.
+AUDIT_R7="$SMOKE_TMP_ROOT/audit-r7-split.jsonl"
+: >"$AUDIT_R7"
+for spec in \
+  "n=6 empty-:+ chain|"'mkdir -p '"$TOOTH19_PLUS_CHAIN"'${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/home/r7_a}' \
+  "2^n cap-overflow|"'mkdir -p '"$TOOTH19_EXPLODE"'$BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/home/r7_b' \
+; do
+  label="${spec%%|*}"; cmd="${spec#*|}"
+  got="$(run_admin_mkdir_audit "$AUDIT_R7" "$cmd")"
+  if [[ "$got" != "ALLOW" ]]; then
+    smoke_fail "Tooth19 admin overflow anchor write ($label) should ALLOW, got $got"
+  fi
+  smoke_log "ok: Tooth19 admin overflow anchor write ($label) -> ALLOW"
+done
+assert_audit_rows "Tooth19 admin overflow anchor writes emit 2 audit rows (1/spelling)" \
+  "$AUDIT_R7" "$PEER_AGENT" "2"
 
 smoke_log "passed"
 echo "[smoke:${SMOKE_NAME}] passed"

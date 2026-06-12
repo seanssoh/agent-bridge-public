@@ -3417,12 +3417,24 @@ def _resolve_brace_token(token: str, depth: int) -> list[str]:
     # the WORD are POSSIBLE resolutions, because NAME may be set or unset at
     # runtime — we model both and let the matcher deny if EITHER lands under a
     # peer home. Recurse into W (it may itself carry anchors / nesting).
-    op_word = re.match(r":?[-+=?](.*)$", rest, re.DOTALL)
+    #
+    # Exception (issue #1823 r7): the ALTERNATE operator with an EMPTY word
+    # (`${ANCHOR:+}` / `${ANCHOR+}`) expands to the EMPTY STRING whether NAME is
+    # set or unset — it can NEVER be the var value. Emitting the anchor value
+    # there is an IMPOSSIBLE candidate that also over-generates: a chain of empty
+    # `${ANCHOR:+}` each contributed a spurious anchor-value branch, blowing the
+    # resolved SET past the result cap before the real peer tail. So for an empty
+    # alternate word we drop the value branch (the empty-string branch comes from
+    # the recursion below). A NON-empty alternate word (`${ANCHOR:+W}`) keeps the
+    # value branch unchanged — the conservative r4/r6 contract (Tooth 14/15).
+    op_word = re.match(r"(:?[-+=?])(.*)$", rest, re.DOTALL)
     if op_word is not None:
+        op, word_arg = op_word.group(1), op_word.group(2)
+        empty_alternate = op in ("+", ":+") and word_arg == ""
         results: list[str] = []
-        if value is not None:
+        if value is not None and not empty_alternate:
             results.append(value)
-        results.extend(_resolve_path_word_static(op_word.group(1), depth + 1))
+        results.extend(_resolve_path_word_static(word_arg, depth + 1))
         # NAME opaque AND nothing in the word resolved → still possibly the var's
         # unknown value; mark unresolved so a peer-tail caller fails closed.
         if value is None and all(r == _STATIC_UNRESOLVED for r in results):
@@ -3499,6 +3511,16 @@ def _resolve_path_word_static(word: str, depth: int = 0) -> list[str]:
                 seen.add(combined)
                 results.append(combined)
             if len(results) >= _STATIC_RESOLVE_MAX_RESULTS:
+                # Cap hit MID-generation: the resolved SET is now TRUNCATED — a
+                # peer-home candidate may live beyond the cut. Returning the clean
+                # partial list would let the caller see no `_STATIC_UNRESOLVED`
+                # element and fail OPEN (issue #1823 r7: an `${A:+}` chain that
+                # overflows the cap before the real peer tail resolves). Append the
+                # sentinel so an overflowing word that ALSO carries a trusted anchor
+                # + peer-home tail fails CLOSED (deny / admin-audit), exactly like a
+                # depth overflow. An anchor-free overflow still ALLOWs — the caller's
+                # fail-close is conditioned on the trusted-anchor + peer-home tail.
+                results.append(_STATIC_UNRESOLVED)
                 return results
     return results or [_STATIC_UNRESOLVED]
 
@@ -3555,9 +3577,19 @@ def _static_resolution_forbidden_hit(
     # peer-home suffix (`/agents/<peer>/home`), its no-`/agents` form
     # (`/<peer>/home`, reachable from `$BRIDGE_AGENT_ROOT_V2`), and both
     # leading-slash-stripped forms.
+    #
+    # Restrict the TEXT heuristic to the v2 peer-HOME suffix (`…/home`): that is
+    # the boundary this anchor-relative fail-close was written for. A v1-home
+    # forbidden entry is the bare `/agents/<peer>` dir (no `/home`); its
+    # no-`/agents` form `/<peer>` is too broad — it would substring-match a
+    # SCOPED-OUT `/<peer>/workdir` tail and over-block (issue #1823 r7, the cap-
+    # overflow path is the first to reach this heuristic with an anchor + workdir
+    # tail). A real v1 home is already caught CONCRETELY above (its resolved
+    # elements normpath under the v1 `abs_dir`), so excluding it here loses no
+    # containment while removing the workdir over-block.
     if saw_unresolved and _word_carries_trusted_anchor(word):
         for _abs_dir, suffix in forbidden_dirs:
-            if not suffix.startswith("/agents/"):
+            if not (suffix.startswith("/agents/") and suffix.endswith("/home")):
                 continue
             no_agents = suffix[len("/agents"):]  # `/<peer>/home`
             for tail in (suffix, suffix.lstrip("/"), no_agents, no_agents.lstrip("/")):
@@ -7057,9 +7089,8 @@ def _pick_admin_audit_candidate(target_word: str, agent: str) -> Path | None:
     candidate keeps a non-peer contained write (e.g. a ``backups/`` quarantine
     spelled through an anchor) resolvable too. Returns ``None`` when no candidate
     resolves (no trusted anchor, or the anchor is unset in this hook env)."""
+    resolutions = _resolve_path_word_static(target_word)
     candidates = _static_anchor_resolution_candidates(target_word)
-    if not candidates:
-        return None
     try:
         peer_resolved = [
             (ph.resolve(strict=False), ph) for ph in other_agent_homes(agent)
@@ -7079,6 +7110,30 @@ def _pick_admin_audit_candidate(target_word: str, agent: str) -> Path | None:
             except ValueError:
                 continue
             return resolved  # prefer the peer-home candidate (the audited write)
+    # Issue #1823 (r7): the candidate set may be TRUNCATED — `_resolve_path_word_static`
+    # bounds its result count, and an `${ANCHOR:-W}` cross-product that overflows
+    # the cap drops a `_STATIC_UNRESOLVED` sentinel and CUTS the real peer-home
+    # candidate (the anchor+tail is the LAST segment of the word, so it is what gets
+    # truncated; the surviving candidates are junk concatenations that match no peer
+    # home). Mirror the non-admin deny path's overflow fail-close: when the
+    # resolution overflowed/was unresolved AND the word carries a trusted anchor + a
+    # v2 peer-home tail (`/agents/<peer>/home`), reconstruct THAT peer's concrete
+    # home path so the admin write still emits exactly one `admin_cross_agent_write`
+    # row (allow + audit) instead of falling through UNAUDITED. The overflow
+    # reconstruction takes precedence over a junk `first_resolved`.
+    if _word_carries_trusted_anchor(target_word) and any(
+        r == _STATIC_UNRESOLVED for r in resolutions
+    ):
+        for peer_dir, ph in peer_resolved:
+            suffix = _peer_home_suffix(ph)
+            if not suffix.endswith("/home"):
+                continue  # only the v2 peer-HOME tail; v1 dir is caught concretely
+            no_agents = suffix[len("/agents"):]
+            if any(
+                tail and tail in target_word
+                for tail in (suffix, suffix.lstrip("/"), no_agents, no_agents.lstrip("/"))
+            ):
+                return peer_dir
     return first_resolved
 
 
