@@ -4,6 +4,19 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.16.10-rc3] — 2026-06-13
+
+**Third release candidate — closes two blockers the cm-prod (real Linux iso-v2 production) rc2 soak surfaced before promotion to LTS.** rc2 applied functionally with zero data loss, but a deeper cm-prod audit corrected the initial "clean" verdict: the layout-v2 reconcile had an iso-permission gap and the upgrade had been auto-executed by a cron worker that an interactive admin had deliberately gated. Both are now fixed and re-verified (#1876 cleared the `patch` adversarial iso-lane gate on a real Linux-UID container). No change to the gate-2-approved reconcile fencing/fail-closed data logic.
+
+### Fixed
+
+- **layout-v2 reconcile no longer controller-direct-reads iso agent-private memory; the iso pass is now structured & auditable (#1820 rc3).** The reconcile runs as the controller, which cannot read an iso agent's agent-private `MEMORY.md` (owner `agent-bridge-<a>`, mode 0600) — producing `Errno13`/permission-denied backup warnings on every iso agent, with no structured `isolation_v2_migration` section in `last-apply.json`. Agent-private 0600 memory is owned and managed by the agent and is **not** controller-reconcilable (same class as the iso-home skips in #1635/#1827): the reconcile now graceful-skips it (recording a structured `isolation_v2_migration: [{agent, os_user, action: skipped-iso-private, …}]` entry) before any controller read/backup, and the structured section is always present in the result. Verified on a real Linux-UID container: zero Errno13, byte-unchanged iso memory, shared-mode agents still reconcile normally.
+- **cron workers refuse to auto-execute interactive-gated or irreversible production-mutation tasks (rc3).** A `librarian-watchdog` cron worker saw a deliberately-held (`status=blocked`) `agb upgrade` A2A handoff in the shared inbox and auto-executed the irreversible production upgrade with no human in the loop. The cron-dispatch scope fence (#1792) now also binds the worker to refuse auto-execution of irreversible/prod-mutation tasks (`agb upgrade`, release/tag, fleet/roster mutation, destructive migration) and any task gated by an interactive admin — deferring to interactive handling when uncertain.
+
+### Soak
+
+- rc1 clean on sean-mac (macOS shared-mode, drift 0); rc2 cm-prod edge soak (real Linux iso) applied with zero data loss but surfaced the two blockers above — the soak did its job. rc3 re-verifies on cm-prod before the v0.16.10 LTS tag.
+
 ## [0.16.10-rc2] — 2026-06-13
 
 **Second release candidate — observability hardening for the layout-v2 reconcile, found during the rc1 fleet soak on sean-mac (drift verified zero).** No change to the migration's data logic (the gate-2-approved fencing / fail-closed reconciliation is byte-identical); these are the two NON-BLOCKING observability bugs from the rc1 soak, fixed so the cm-prod edge soak (the first host where the v1→v2 reconciliation actually moves data) can audit the migration result and verify zero drift.
