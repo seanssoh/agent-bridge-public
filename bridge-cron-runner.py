@@ -467,7 +467,7 @@ def _write_bytes_nofollow(path: Path, data: bytes) -> None:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — O_NOFOLLOW writer helper (#1842 r3/r4): controller-side cron-runner output-leaf I/O; the parent is the controller-created run dir, never an isolated-agent tree probe
     _write_bytes_nofollow(
         path,
         (json.dumps(payload, ensure_ascii=True, indent=2) + "\n").encode("utf-8"),
@@ -475,8 +475,39 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — O_NOFOLLOW writer helper (#1842 r3/r4): controller-side cron-runner output-leaf I/O; the parent is the controller-created run dir, never an isolated-agent tree probe
     _write_bytes_nofollow(path, content.encode("utf-8"))
+
+
+def _read_text_nofollow(path: Path) -> str:
+    """Read `path` as UTF-8, REFUSING to follow a symlink at the final
+    component (#1842 codex r4).
+
+    The read-side twin of `_write_bytes_nofollow`. The group-writable iso
+    text-cron run dir (`bridge_cron_run_dir_grant_isolation`, 3770 sticky)
+    lets an iso UID CREATE a leaf in it. A controller read of any run-dir
+    leaf whose CONTENT is NOT controller-derived — the per-run `payload.md`
+    that becomes the prompt, and the harvester-written
+    `authoritative-memory-daily.json` sidecar — must not follow a symlink the
+    iso UID pre-planted there: `Path.read_text()` would FOLLOW it and pull a
+    controller-private target into the prompt/result (the input-leaf twin of
+    the request.json symlink-before-pin bypass codex caught in r3).
+    `O_NOFOLLOW` makes the open raise `ELOOP` on a symlink leaf, so a tampered
+    leaf is a terminal read error, not a silent read-through. The sticky bit
+    blocks a member from REPLACING an existing controller/harvester-owned
+    leaf, so a freshly-planted symlink is the only window and this closes
+    it."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+    return b"".join(chunks).decode("utf-8")
 
 
 def run_dir_id(run_dir: Path) -> str:
@@ -2356,8 +2387,14 @@ def write_followup_body(
             ]
         )
 
-    body_path.parent.mkdir(parents=True, exist_ok=True)
-    body_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    # O_NOFOLLOW write (#1842 codex r4): `cron-followup.md` is a run-dir OUTPUT
+    # leaf the controller writes in the group-writable (3770 sticky) iso run
+    # dir, so it is the same output-leaf class as result.json/status.json. The
+    # r3 sweep funneled those through `write_text`, but this writer still used a
+    # bare `Path.write_text()` that would FOLLOW a symlink an iso UID pre-plants
+    # at `cron-followup.md` and clobber the target as the controller. Route it
+    # through `write_text` so a symlink leaf raises ELOOP instead.
+    write_text(body_path, "\n".join(lines).rstrip() + "\n")
 
 
 def queue_cli_path() -> Path:
@@ -3898,8 +3935,47 @@ def cmd_run(args: argparse.Namespace) -> int:
     engine = request.get("target_engine", "")
     run_id = request.get("run_id", "")
     workdir = request.get("target_workdir", "")
-    payload_file = Path(request["payload_file"]).expanduser().resolve()
     run_dir = request_file.parent
+    # Payload INPUT leaf — derived from the original run_dir by its canonical
+    # name, NOT taken from the request body through `.resolve()` (#1842 codex
+    # r4, the input-leaf twin of the r3 output-leaf fix). The legitimate
+    # per-run payload is always `<run_dir>/payload.md`
+    # (`bridge_cron_payload_file_by_id`), and the body's `payload_file` always
+    # names that sibling. The r3 head took `request["payload_file"]` through
+    # `.expanduser().resolve()` — a symlink-FOLLOW on the leaf — so an iso UID
+    # who pre-plants `payload.md` as a symlink in the group-writable
+    # (3770 sticky) run dir before the controller builds the prompt wins: the
+    # resolve follows it and `Path.read_text()` reads a controller-private
+    # target straight into the cron prompt (codex r4: SECRET_SENTINEL leaked
+    # as payload_text). Sourcing the leaf from run_dir removes the
+    # body-path trust dependency entirely (a body path can never redirect the
+    # read outside the run dir), and the read below goes through
+    # `_read_text_nofollow` so a symlinked `payload.md` raises ELOOP →
+    # terminal tamper, never a silent read-through. We still reject a body that
+    # declares a NON-canonical payload_file (a tampered request naming a
+    # different file): the declared path, normalized lexically WITHOUT a
+    # symlink follow, must equal the canonical run-dir leaf.
+    payload_file = run_dir / "payload.md"
+    declared_payload = request.get("payload_file")
+    declared_norm = (
+        Path(os.path.abspath(os.path.expanduser(str(declared_payload))))
+        if declared_payload is not None
+        else None
+    )
+    if declared_norm != payload_file:
+        error_message = "request_artifact_tampered: payload_file is not the canonical run-dir leaf"
+        write_shell_terminal_error(
+            request_file,
+            runner_error="request_artifact_tampered",
+            summary=error_message,
+            run_id=str(run_id or run_dir_id(run_dir)),
+            audit_target_agent=str(request.get("target_agent") or "daemon"),
+        )
+        print("status: error")
+        print(f"run_id: {str(run_id or run_dir_id(run_dir))}")
+        print(f"engine: {engine}")
+        print("runner_error: request_artifact_tampered")
+        return 1
     # Runner-OWNED output leaves are derived from the original run_dir by their
     # canonical names — NOT from the request body (#1842 codex r3). The body is
     # controller-written and always names these run_dir siblings, but sourcing
@@ -3966,7 +4042,26 @@ def cmd_run(args: argparse.Namespace) -> int:
         # the scheduler enqueues the next slot on its next pass.
         return 0
 
-    payload_text = payload_file.read_text(encoding="utf-8")
+    # O_NOFOLLOW read of the canonical payload leaf (#1842 codex r4): a
+    # symlink pre-planted at `payload.md` raises ELOOP here rather than being
+    # followed into a controller-private target. A non-symlink leaf reads
+    # normally.
+    try:
+        payload_text = _read_text_nofollow(payload_file)
+    except OSError as exc:
+        error_message = f"request_artifact_tampered: payload_file read refused ({exc.__class__.__name__})"
+        write_shell_terminal_error(
+            request_file,
+            runner_error="request_artifact_tampered",
+            summary=error_message,
+            run_id=str(run_id or run_dir_id(run_dir)),
+            audit_target_agent=str(request.get("target_agent") or "daemon"),
+        )
+        print("status: error")
+        print(f"run_id: {str(run_id or run_dir_id(run_dir))}")
+        print(f"engine: {engine}")
+        print("runner_error: request_artifact_tampered")
+        return 1
     prompt = build_prompt(request, payload_text)
     write_text(prompt_file, prompt)
     write_json(schema_file, RESULT_SCHEMA)
@@ -4028,7 +4123,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 # harvester's authoritative actions_taken.
                 if family == "memory-daily" and sidecar_path.is_file():
                     try:
-                        authoritative = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                        # O_NOFOLLOW read (#1842 codex r4): the sidecar is a
+                        # run-dir INPUT leaf the harvester (iso UID) writes, so
+                        # `is_file()` follows a symlink but the read must not —
+                        # a swapped `authoritative-memory-daily.json` → symlink
+                        # would otherwise pull a controller-private target into
+                        # the result. ELOOP surfaces here as OSError → treated
+                        # as an invalid sidecar (fall back to the child parse).
+                        authoritative = json.loads(_read_text_nofollow(sidecar_path))
                         parsed_child_result = validate_result(authoritative)
                         parsed_source = "authoritative-sidecar"
                     except (OSError, json.JSONDecodeError, ValueError) as exc:
@@ -4088,7 +4190,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         # when the child relay JSON was malformed / missing.
         if engine == "claude" and family == "memory-daily" and sidecar_path.is_file():
             try:
-                authoritative = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                # O_NOFOLLOW read (#1842 codex r4) — same run-dir input-leaf
+                # symlink defense as the pre-parse sidecar read above; ELOOP
+                # surfaces as OSError → sidecar recovery failed (not a
+                # read-through of a controller-private target).
+                authoritative = json.loads(_read_text_nofollow(sidecar_path))
                 child_result = validate_result(authoritative)
                 child_result_source = "authoritative-sidecar-after-parse-error"
                 final_state = "success" if child_result.get("status") != "error" else "error"

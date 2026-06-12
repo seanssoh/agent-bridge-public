@@ -531,6 +531,103 @@ ok_log = m.Path(out_rd) / "stderr.log"
 m.write_text(ok_log, "normal output\n")
 check("E1j-normal-leaf-writes-ok", ok_log.read_text() == "normal output\n" and not ok_log.is_symlink())
 
+# E1k DENY (#1842 codex r4 PAYLOAD INPUT-LEAF SYMLINK TEETH) — drive the REAL
+# cmd_run. The r3 head took the body-declared `payload_file` through
+# `.expanduser().resolve()` (a leaf symlink-FOLLOW) and read it with
+# `Path.read_text()`, so an iso UID who pre-plants `payload.md` as a SYMLINK in
+# the legitimately group-writable (3770 sticky) run dir wins: the controller
+# follows it and reads a controller-private target straight into the cron
+# prompt (codex r4 confirmed: SECRET_SENTINEL leaked as payload_text). The r4
+# fix (a) derives the payload leaf canonically from the run dir, (b) rejects a
+# body declaring any NON-canonical payload path (lexical compare, no symlink
+# follow), and (c) reads through `_read_text_nofollow` so a symlinked
+# `payload.md` raises ELOOP → terminal request_artifact_tampered, never a
+# silent read-through.
+# Deterministic in-smoke: never take the memory-pressure deferral branch that
+# sits between the canonical-leaf check and the payload read.
+m.check_memory_pressure = lambda: None
+secret_dir = tempfile.mkdtemp()
+secret_payload = m.Path(secret_dir) / "controller-secret.md"
+secret_payload.write_text("SECRET_SENTINEL_1842_R4")
+os.chmod(secret_payload, 0o600)
+os.chmod(secret_dir, 0o700)
+
+
+def make_payload_run_dir(payload_decl=None):
+    """Legit iso text-cron run dir (3770 sticky, member-group) + 0600
+    request.json declaring `payload_file`. Returns (run_dir, request_file)."""
+    rd = tempfile.mkdtemp()
+    d = m.Path(rd)
+    req = d / "request.json"
+    decl = str(d / "payload.md") if payload_decl is None else payload_decl
+    req.write_text(
+        json.dumps(
+            {
+                "target_agent": AGENT,
+                "target_engine": "claude",
+                "run_id": "e1k-run",
+                "payload_file": decl,
+            }
+        )
+    )
+    os.chmod(req, 0o600)
+    os.chown(rd, -1, member_gid)
+    os.chmod(rd, 0o3770)
+    return d, req
+
+
+# (1) canonical-named payload.md pre-planted as a SYMLINK → terminal tamper,
+#     and the private target's content must NOT surface anywhere in the output.
+pd, preq = make_payload_run_dir()
+os.symlink(secret_payload, pd / "payload.md")
+_buf = _io.StringIO()
+with _contextlib.redirect_stdout(_buf):
+    rc = m.cmd_run(_types.SimpleNamespace(request_file=str(preq), dry_run=False))
+e1k_out = _buf.getvalue()
+check("E1k-symlinked-payload-returns-1", rc == 1)
+check("E1k-symlinked-payload-tampered", "request_artifact_tampered" in e1k_out)
+check(
+    "E1k-symlinked-payload-sentinel-NOT-leaked",
+    "SECRET_SENTINEL_1842_R4" not in e1k_out,
+)
+# The terminal-error writer must have recorded the tamper in the run dir's own
+# status.json (O_NOFOLLOW write of a fresh leaf — the symlink was payload.md).
+check(
+    "E1k-symlinked-payload-status-records-tamper",
+    "request_artifact_tampered" in (pd / "status.json").read_text(),
+)
+
+# (2) body declaring a NON-canonical payload_file (an out-of-run-dir path) →
+#     tamper BEFORE any read; the declared target's content must not leak.
+pd2, preq2 = make_payload_run_dir(payload_decl=str(secret_payload))
+_buf = _io.StringIO()
+with _contextlib.redirect_stdout(_buf):
+    rc2 = m.cmd_run(_types.SimpleNamespace(request_file=str(preq2), dry_run=False))
+e1k2_out = _buf.getvalue()
+check("E1k-noncanonical-payload-decl-returns-1", rc2 == 1)
+check("E1k-noncanonical-payload-decl-tampered", "request_artifact_tampered" in e1k2_out)
+check(
+    "E1k-noncanonical-payload-decl-sentinel-NOT-leaked",
+    "SECRET_SENTINEL_1842_R4" not in e1k2_out,
+)
+
+# (3) reader-helper contract: a regular leaf reads normally (no regression);
+#     a symlink leaf is REFUSED (ELOOP → OSError), never followed.
+ok_payload = pd2 / "regular.md"
+ok_payload.write_text("plain payload\n")
+check(
+    "E1k-read-nofollow-regular-leaf-ok",
+    m._read_text_nofollow(ok_payload) == "plain payload\n",
+)
+sl_payload = pd2 / "sl.md"
+os.symlink(secret_payload, sl_payload)
+nofollow_denied = False
+try:
+    m._read_text_nofollow(sl_payload)
+except OSError:
+    nofollow_denied = True
+check("E1k-read-nofollow-symlink-leaf-denied", nofollow_denied)
+
 if failures:
     print("E1-FAILURES:", ",".join(failures))
     sys.exit(1)
