@@ -663,5 +663,84 @@ done
 assert_audit_rows "Tooth17 co-located admin anchor writes emit 4 audit rows (1/spelling)" \
   "$AUDIT_R5_CO" "$PEER_AGENT" "4"
 
+# ---------------------------------------------------------------------------
+# Tooth 18 (r6) — NESTED bash-expansion bypass variants the per-token-shape
+# matcher (r2 bare/exact, r4 outer-operator) could NOT track → DENIED. The r6
+# canonical word-resolution normalizer (`_resolve_path_word_static`) statically
+# resolves the word to the SET of paths bash could expand it to and denies if ANY
+# possible resolution lands under a peer v2 home. The two field-found bypasses:
+#
+#   1. ${BRIDGE_DATA_ROOTX:-$BRIDGE_DATA_ROOT}/agents/<peer>/home — the OUTER var
+#      is a NON-anchor (unset at runtime), so bash falls back to the `:-` DEFAULT
+#      word, which IS a trusted anchor → resolves to the peer home. The r4
+#      leading-token matcher rejected it (outer NAME ≠ anchor) and never looked
+#      into the default word → ALLOW on head f8e62298.
+#   2. ${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/agents/<peer>/home/x} — the OUTER var
+#      IS an anchor (set at runtime), so the `:+` ALTERNATE word fires and the
+#      FULL peer path lives INSIDE that word, not in the literal tail after the
+#      closing `}`. The r4 matcher read the (empty) tail and saw only the bare
+#      anchor root → ALLOW on head f8e62298.
+#
+# Plus a deeper nest (`${X:-${Y}}`) and the `+` (no-colon) spelling. The `$`/`{`
+# are single-quoted so the LITERAL token reaches the hook; bash in the test shell
+# must not pre-expand it. Each new tooth FAILS (ALLOW) on f8e62298, PASSES (DENY)
+# after r6.
+# ---------------------------------------------------------------------------
+assert_bash "Tooth18 non-admin nested non-anchor-outer :- default-anchor DENIED (#1823 r6 v1)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_DATA_ROOTX:-$BRIDGE_DATA_ROOT}/agents/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+assert_bash "Tooth18 non-admin :+ full-peer-path-in-word DENIED (#1823 r6 v2)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/home/MEMORY.md}' "DENY"
+assert_bash "Tooth18 non-admin + (no-colon) full-peer-path-in-word DENIED (#1823 r6 v2b)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_AGENT_ROOT_V2+$BRIDGE_AGENT_ROOT_V2/'"$PEER_AGENT"'/home/MEMORY.md}' "DENY"
+assert_bash "Tooth18 non-admin nested \${X:-\${Y}} default-anchor DENIED (#1823 r6 nest)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_DATA_ROOT:-${BRIDGE_AGENT_ROOT_V2}}/agents/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+
+# NOTE the r6 variants are BASH-surface attacks: an env-var anchor only expands
+# inside a shell. The Edit/Write `file_path` is passed verbatim to the
+# filesystem (no shell), so `${BRIDGE_DATA_ROOT…}` there is a literal directory
+# name, NOT the peer home — so there is no non-Bash anchor-spelling tooth here
+# (the non-Bash absolute-literal peer-home Edit is already covered by Tooth 1).
+
+# --- Admin ALLOW + EXACTLY ONE audit row on each nested variant -------------
+# The write must be a recognized peer-write SHAPE (mkdir) so it reaches the audit
+# branch; `echo >>` carries a `>` redirect and is not a peer-write op. One fresh
+# audit log; each nested spelling adds exactly one row → 4 total. On f8e62298 the
+# two field variants fall through UNAUDITED (and the non-admin deny is bypassed).
+AUDIT_R6="$SMOKE_TMP_ROOT/audit-r6-split.jsonl"
+: >"$AUDIT_R6"
+for spec in \
+  "nested :- default|"'mkdir -p ${BRIDGE_DATA_ROOTX:-$BRIDGE_DATA_ROOT}/agents/'"$PEER_AGENT"'/home/r6_a' \
+  ":+ full-path-in-word|"'mkdir -p ${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/home/r6_b}' \
+  "+ full-path-in-word|"'mkdir -p ${BRIDGE_AGENT_ROOT_V2+$BRIDGE_AGENT_ROOT_V2/'"$PEER_AGENT"'/home/r6_c}' \
+  "nested \${X:-\${Y}}|"'mkdir -p ${BRIDGE_DATA_ROOT:-${BRIDGE_AGENT_ROOT_V2}}/agents/'"$PEER_AGENT"'/home/r6_d' \
+; do
+  label="${spec%%|*}"; cmd="${spec#*|}"
+  got="$(run_admin_mkdir_audit "$AUDIT_R6" "$cmd")"
+  if [[ "$got" != "ALLOW" ]]; then
+    smoke_fail "Tooth18 admin nested anchor write ($label) should ALLOW, got $got"
+  fi
+  smoke_log "ok: Tooth18 admin nested anchor write ($label) -> ALLOW"
+done
+assert_audit_rows "Tooth18 admin nested anchor writes emit 4 audit rows (1/spelling)" \
+  "$AUDIT_R6" "$PEER_AGENT" "4"
+
+# --- NO over-block: anchor-free nest + workdir tail stay ALLOW --------------
+# Neither branch of `${BRIDGE_DATA_ROOTX:-/tmp/harmless}` resolves to/through a
+# trusted anchor (the normalizer's resolved-set is {/tmp/harmless/...}) → ALLOW.
+# A real anchor whose tail names the peer WORKDIR (scoped out, #1492) → ALLOW.
+assert_bash "Tooth18 non-admin anchor-free nest \${ROOTX:-/tmp/x} ALLOWED (no over-block)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo x >> ${BRIDGE_DATA_ROOTX:-/tmp/harmless}/agents/'"$PEER_AGENT"'/home/MEMORY.md' "ALLOW"
+assert_bash "Tooth18 non-admin nested :- default-anchor peer WORKDIR ALLOWED (scoped out)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo x >> ${BRIDGE_DATA_ROOTX:-$BRIDGE_DATA_ROOT}/agents/'"$PEER_AGENT"'/workdir/NOTES.md' "ALLOW"
+assert_bash "Tooth18 non-admin :+ full-path peer WORKDIR ALLOWED (scoped out)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo x >> ${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/workdir/NOTES.md}' "ALLOW"
+
 smoke_log "passed"
 echo "[smoke:${SMOKE_NAME}] passed"

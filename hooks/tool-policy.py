@@ -3210,76 +3210,14 @@ _CD_LIKELY_SUCCESS = "\x00CD_OK\x00"
 # not mistaken for `$BRIDGE_DATA_ROOT`.
 _V2_ANCHOR_NAMES = ("BRIDGE_AGENT_ROOT_V2", "BRIDGE_DATA_ROOT")
 
-# Issue #1823 (r4): the r2/r3 anchor recognition handled ONLY the bare `$NAME`
-# and the EXACT `${NAME}` brace spellings. A non-admin can still reach a peer v2
-# home through a Bash PARAMETER-EXPANSION OPERATOR around the same trusted anchor —
-# `${BRIDGE_DATA_ROOT:-/tmp/x}/agents/<peer>/home/...`, `${BRIDGE_DATA_ROOT:+x}/...`,
-# `${BRIDGE_AGENT_ROOT_V2-x}/<peer>/home/...`, etc. With the real exported env
-# present (v2 ALWAYS exports both vars) bash expands every one of these to the
-# EXACT peer home: `:-`/`-` keep the set value, `:+`/`+` substitute (the var IS
-# set so the substitution fires when its `word` is the known root), `:offset` /
-# `#`/`%`/`/` slice the set value. So the operator/default text does NOT change
-# which tree bash writes to when the anchor env var is set — and it always is for
-# a v2 agent. We therefore recover the leading `${NAME<op>...}` token whose NAME
-# is a trusted v2 anchor as that anchor for the path-prefix decision, regardless
-# of operator, and apply the SAME expand→match-`/agents/<peer>/home`→DENY logic
-# the bare/exact forms get; fail-CLOSE (deny) when the tail names a peer v2 home.
-# A NON-anchor `${OTHER:-...}` is unaffected (NAME must match a v2 anchor exactly),
-# and `${BRIDGE_DATA_ROOTX:-...}` stays a non-anchor (the NAME parse stops at the
-# first non-identifier char, so the operator boundary check rejects a longer name).
-#
-# Operator boundary chars that may follow an anchor NAME inside `${...}` and still
-# leave it the SAME anchor token: `:` (`:-`/`:+`/`:=`/`:?`/`:off`), `-`, `+`, `=`,
-# `?`, `#` (prefix-strip), `%` (suffix-strip), `/` (replace), or `}` (the bare
-# `${NAME}` exact form, already covered separately but harmless to re-accept).
-_V2_ANCHOR_OP_BOUNDARY = frozenset(":-+=?#%/}")
-
-
-def _v2_anchor_operator_token(word: str) -> tuple[str, str] | None:
-    """If *word* BEGINS with a Bash parameter-expansion token ``${NAME<op>...}``
-    whose NAME is exactly one of the trusted v2 anchors, return
-    ``(name, tail_after_closing_brace)`` — else ``None``.
-
-    Brace-balance aware: the token runs from the leading ``${`` to its MATCHING
-    ``}`` (so a nested ``${NAME:-${OTHER}}`` consumes both closers), and *tail* is
-    whatever literal path follows that ``}``. NAME is parsed greedily over
-    identifier chars only, so ``${BRIDGE_DATA_ROOTX:-x}`` parses NAME
-    ``BRIDGE_DATA_ROOTX`` — not a v2 anchor — and returns ``None`` (no over-block).
-    The character immediately after NAME must be a parameter-expansion operator
-    boundary (or the closing ``}``); otherwise it is not a recognizable expansion
-    of this anchor and we return ``None`` (leave it to the caller's Pass-2).
-    """
-    if not word.startswith("${"):
-        return None
-    # Parse the identifier NAME directly after `${`.
-    m = re.match(r"\$\{([A-Za-z_][A-Za-z0-9_]*)", word)
-    if m is None:
-        return None
-    name = m.group(1)
-    if name not in _V2_ANCHOR_NAMES:
-        return None
-    after_name = word[m.end():]
-    # The char after NAME must be an operator boundary or the closing brace; a
-    # different char means NAME was a prefix of a longer construct we do not model.
-    if not after_name or after_name[0] not in _V2_ANCHOR_OP_BOUNDARY:
-        return None
-    # Walk from the leading `{` (at idx 1, after `$`) to its MATCHING `}`,
-    # counting every brace so a nested default `${NAME:-${X}}` is consumed whole.
-    depth = 0
-    close_idx = -1
-    for idx in range(1, len(word)):  # idx 0 is `$`; the brace opens at idx 1
-        ch = word[idx]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                close_idx = idx
-                break
-    if close_idx < 0:
-        return None  # unbalanced `${...` → not a complete token; Pass-2 decides
-    tail = word[close_idx + 1:]
-    return name, tail
+# Issue #1823 (r6): the r2/r3/r4 anchor recognition matched a fixed TOKEN SHAPE
+# at the leading position (bare `$NAME`, brace `${NAME}`, one outer operator
+# `${NAME<op>...}`). That per-shape recognition could not keep up with arbitrary
+# Bash nesting (the codex/patch-dev r6 bypasses); it is REPLACED by the canonical
+# word-resolution normalizer `_resolve_path_word_static` (defined below), which
+# statically resolves a word to the SET of paths it can expand to and decides
+# containment on the result. `_v2_anchor_value` (here) stays the anchor-VALUE
+# source the normalizer expands through.
 
 
 def _v2_anchor_value(name: str) -> str:
@@ -3342,7 +3280,7 @@ def _expand_bridge_prefixes(word: str) -> str:
     # v2 layout anchors (issue #1823). Resolved from `agent_root_v2()`; when
     # that returns None (unresolvable in this env) the token is left intact so a
     # surviving `$BRIDGE_DATA_ROOT` / `$BRIDGE_AGENT_ROOT_V2` reaches the caller,
-    # which fails CLOSED on it (see `_word_carries_unresolved_v2_anchor`).
+    # which fails CLOSED on it via the r6 normalizer (`_resolve_path_word_static`).
     for name in _V2_ANCHOR_NAMES:
         value = _v2_anchor_value(name)
         if not value:
@@ -3352,111 +3290,321 @@ def _expand_bridge_prefixes(word: str) -> str:
     return out
 
 
-def _word_carries_unresolved_v2_anchor(word: str) -> bool:
-    """True iff *word* still contains a v2 location-anchor env-var token
-    (``$BRIDGE_DATA_ROOT`` / ``${BRIDGE_DATA_ROOT}`` / ``$BRIDGE_AGENT_ROOT_V2``
-    / ``${BRIDGE_AGENT_ROOT_V2}``) AFTER bridge-prefix expansion — i.e. a
-    trusted v2 anchor this hook could not statically resolve.
+# Issue #1823 (r6) CONSOLIDATION — the canonical word-resolution normalizer.
+#
+# Rounds r2 (bare/exact) and r4 (one outer operator) recognized v2 anchors by
+# matching a fixed TOKEN SHAPE at the LEADING position of the word. That can
+# never keep up with arbitrary Bash nesting — codex and patch-dev both found
+# words whose anchor sits where the per-shape matcher does not look:
+#   * ``${BRIDGE_DATA_ROOTX:-$BRIDGE_DATA_ROOT}/agents/<peer>/home`` — the outer
+#     NAME is a NON-anchor (unset at runtime), so bash falls back to the ``:-``
+#     DEFAULT word, which IS a trusted anchor → resolves to the peer home. The
+#     r4 leading-token matcher rejects it (outer NAME ≠ anchor) and never looks
+#     into the default word.
+#   * ``${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/agents/<peer>/home/x}`` — the outer
+#     NAME IS an anchor (set at runtime), so the ``:+`` ALTERNATE word fires, and
+#     the FULL peer path lives inside that word, NOT in the literal tail after the
+#     closing ``}``. The r4 matcher reads the (empty) tail and sees only the bare
+#     anchor root → ALLOW.
+#
+# We STOP matching token shapes and instead STATICALLY RESOLVE the word the way
+# bash would, using only the trusted-anchor values, into the SET of paths it can
+# expand to. A parameter-expansion operator (``${X:-W}`` / ``${X:+W}`` / …) is
+# AMBIGUOUS at analysis time — X may be set or unset — so BOTH the X-value branch
+# (when X is a known anchor) AND the default/alternate word W are POSSIBLE
+# resolutions; the matcher denies if ANY possible resolution lands under a peer
+# home. New spellings cannot bypass because they all resolve THROUGH the same
+# anchors, and the decision is made on the resolved target, not the surface
+# syntax. ``_expand_bridge_prefixes`` / ``_v2_anchor_value`` remain the
+# anchor-VALUE source the normalizer expands through.
 
-    Issue #1823 (r2): these anchors are EXPORTED into the agent runtime, so bash
-    WILL expand them to a concrete peer v2 home at execution time even when this
-    hook's own environment lacks them. The safe direction for a trusted anchor
-    that demonstrably resolves to a peer home is therefore DENY, never the
-    ``$``-survives → ALLOW fall-through. Brace and bare spellings both count; the
-    bare form uses the same identifier-boundary guard as the expander so
-    ``$BRIDGE_DATA_ROOTX`` is not a false positive.
+# Bound the resolved-SET cross product so a pathological nest cannot blow up the
+# hook. A real peer-home write needs only a handful of branches; a word that
+# overflows the cap collapses to the unresolved sentinel (fail-close-where-
+# suspect by the caller).
+_STATIC_RESOLVE_MAX_RESULTS = 64
+_STATIC_RESOLVE_MAX_DEPTH = 24
 
-    Issue #1823 (r4): a Bash parameter-expansion OPERATOR form whose NAME is a
-    trusted v2 anchor — ``${BRIDGE_DATA_ROOT:-/tmp/x}``, ``${BRIDGE_DATA_ROOT:+x}``,
-    ``${BRIDGE_AGENT_ROOT_V2-x}``, ``${BRIDGE_DATA_ROOT:0}`` … — ALSO counts: with
-    the exported env present bash expands it to the SAME anchor root, so it too
-    must fail CLOSED rather than survive with a ``$`` and fall through to ALLOW.
-    ``_v2_anchor_operator_token`` recovers the anchor regardless of operator and
-    keeps ``${BRIDGE_DATA_ROOTX:-…}`` a non-anchor.
-    """
-    if _v2_anchor_operator_token(word) is not None:
-        return True
-    for name in _V2_ANCHOR_NAMES:
-        if "${" + name + "}" in word:
-            return True
-        if re.search(rf"\${name}(?![A-Za-z0-9_])", word) is not None:
-            return True
+# A resolution element that still carries an opaque (non-anchor) ``$`` token we
+# could not statically reduce. Tracked separately so the caller can decide
+# fail-close ONLY when such an element ALSO demonstrably carries a trusted
+# anchor + peer-home tail, never for a wholly anchor-free ``${OTHER:-/tmp/x}``.
+_STATIC_UNRESOLVED = "\x00unresolved\x00"
+
+# The trusted location anchors the normalizer resolves to a concrete value
+# (everything else is opaque). `BRIDGE_HOME` / `HOME` join the v2 anchors here:
+# a co-located peer v2 home is also reachable as `$BRIDGE_HOME/data/agents/...`.
+_TRUSTED_PATH_ANCHORS = (*_V2_ANCHOR_NAMES, "BRIDGE_HOME", "HOME")
+
+
+def _resolve_param_expansion_value(name: str) -> str | None:
+    """The static VALUE of a ``$NAME`` reference to a TRUSTED anchor, or ``None``
+    when NAME is not a trusted anchor this hook resolves (an opaque var). The
+    anchors are ``BRIDGE_DATA_ROOT`` / ``BRIDGE_AGENT_ROOT_V2`` (issue #1823),
+    ``BRIDGE_HOME``, and ``HOME`` — the SAME set ``_expand_bridge_prefixes``
+    trusts. Resolved from the same SSOTs (``_v2_anchor_value`` /
+    ``bridge_home_dir`` / ``~``)."""
+    if name in _V2_ANCHOR_NAMES:
+        value = _v2_anchor_value(name)
+        return value or None
+    if name == "BRIDGE_HOME":
+        try:
+            return str(bridge_home_dir())
+        except Exception:  # noqa: BLE001 — unresolved bridge home → opaque
+            return None
+    if name == "HOME":
+        home_dir = os.path.expanduser("~")
+        return home_dir if home_dir and home_dir != "~" else None
+    return None
+
+
+def _split_top_level_param_expansion(word: str) -> tuple[str, str, str] | None:
+    """Find the FIRST top-level ``$NAME`` / ``${...}`` expansion in *word* and
+    return ``(literal_before, token, literal_after)``; ``None`` when *word* has
+    no expansion. *token* is the whole ``$NAME`` or brace-balanced ``${...}``
+    construct (a nested default ``${X:-${Y}}`` is consumed WHOLE so the recursion
+    descends into it, not across it)."""
+    i = 0
+    n = len(word)
+    while i < n:
+        if word[i] == "$":
+            if i + 1 < n and word[i + 1] == "{":
+                # Brace form: walk to the matching `}`.
+                depth = 0
+                j = i + 1
+                while j < n:
+                    if word[j] == "{":
+                        depth += 1
+                    elif word[j] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return word[:i], word[i:j + 1], word[j + 1:]
+                    j += 1
+                # Unbalanced `${...` → not a complete token; the rest is an
+                # unresolved opaque suffix the token resolver fails-closes on.
+                return word[:i], word[i:], ""
+            m = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)", word[i:])
+            if m is not None:
+                end = i + m.end()
+                return word[:i], word[i:end], word[end:]
+            # A bare `$` not starting an identifier (e.g. `$(`/`$'`) — opaque.
+            return word[:i], word[i:i + 1], word[i + 1:]
+        i += 1
+    return None
+
+
+def _resolve_brace_token(token: str, depth: int) -> list[str]:
+    """Statically resolve a single ``${...}`` brace token to the SET of strings
+    it can expand to (the anchor value where NAME is known, PLUS the recursively
+    resolved default/alternate word for parameter-expansion operators). An
+    element that cannot be reduced is ``_STATIC_UNRESOLVED``."""
+    inner = token[2:-1]  # strip `${` and the matching `}`
+    if inner.startswith("#") or inner.startswith("!"):
+        # `${#NAME}` length / `${!NAME}` indirection — not a path anchor.
+        return [_STATIC_UNRESOLVED]
+    m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", inner)
+    if m is None:
+        return [_STATIC_UNRESOLVED]
+    name = inner[:m.end()]
+    rest = inner[m.end():]
+    value = _resolve_param_expansion_value(name)
+    # Exact `${NAME}` — no operator.
+    if rest == "":
+        return [value] if value is not None else [_STATIC_UNRESOLVED]
+    # Parameter-expansion operators that carry a WORD (default / alternate /
+    # assign / error): `${X:-W}` `${X-W}` `${X:+W}` `${X+W}` `${X:=W}` `${X:?W}`.
+    # For ALL of them BOTH the var-VALUE branch (if NAME is a known anchor) AND
+    # the WORD are POSSIBLE resolutions, because NAME may be set or unset at
+    # runtime — we model both and let the matcher deny if EITHER lands under a
+    # peer home. Recurse into W (it may itself carry anchors / nesting).
+    op_word = re.match(r":?[-+=?](.*)$", rest, re.DOTALL)
+    if op_word is not None:
+        results: list[str] = []
+        if value is not None:
+            results.append(value)
+        results.extend(_resolve_path_word_static(op_word.group(1), depth + 1))
+        # NAME opaque AND nothing in the word resolved → still possibly the var's
+        # unknown value; mark unresolved so a peer-tail caller fails closed.
+        if value is None and all(r == _STATIC_UNRESOLVED for r in results):
+            return [_STATIC_UNRESOLVED]
+        return results or [_STATIC_UNRESOLVED]
+    # Substring / strip / replace / case operators (`${X:off}`, `${X#p}`,
+    # `${X%p}`, `${X/a/b}`, `${X^^}`) SLICE an existing value. With a known
+    # anchor we conservatively keep the anchor value as a possible prefix (so
+    # `${BRIDGE_DATA_ROOT:1}/agents/<peer>/home` still resolves THROUGH the
+    # anchor); an unknown NAME stays opaque.
+    if value is not None:
+        return [value]
+    return [_STATIC_UNRESOLVED]
+
+
+def _resolve_path_word_static(word: str, depth: int = 0) -> list[str]:
+    """Statically resolve a shell *word* to the LIST of distinct paths it can
+    expand to, using ONLY trusted-anchor values (``$BRIDGE_DATA_ROOT`` /
+    ``$BRIDGE_AGENT_ROOT_V2`` / ``$BRIDGE_HOME`` / ``$HOME`` / ``~``) — the way
+    bash would, but modeling parameter-expansion operators as AMBIGUOUS (both the
+    var-value branch and the default/alternate word are possible resolutions).
+    Recurses into nested defaults (``${X:-${Y:-$Z}}``).
+
+    Each element of the returned list is a concrete string OR the sentinel
+    ``_STATIC_UNRESOLVED`` (a fragment that still carries an opaque non-anchor
+    expansion). The caller decides containment on the resolved set, and fails
+    closed when an element it could not fully reduce nonetheless carries a
+    trusted anchor + a peer-home tail. A word with no expansion (after ``~``)
+    returns ``[word]`` unchanged — so the existing literal path resolves as before.
+
+    Bounded: depth and result-count caps stop a pathological nest; an overflow
+    collapses to the unresolved sentinel (fail-close-where-suspect)."""
+    if depth > _STATIC_RESOLVE_MAX_DEPTH:
+        return [_STATIC_UNRESOLVED]
+    split = _split_top_level_param_expansion(word)
+    if split is None:
+        # No `$` expansion left: only a possible leading `~` remains — reuse the
+        # bridge expander (it touches `~`/`$HOME`/`$BRIDGE_*`, all already gone
+        # here except `~`). A surviving `$` it could not resolve → unresolved.
+        out = _expand_bridge_prefixes(word)
+        return [_STATIC_UNRESOLVED] if "$" in out else [out]
+    before, token, after = split
+    # Resolve the token to its possible fragment set.
+    if token.startswith("${"):
+        frag_set = _resolve_brace_token(token, depth)
+    elif token.startswith("$") and len(token) > 1 and (
+        token[1] == "_" or token[1].isalpha()
+    ):
+        value = _resolve_param_expansion_value(token[1:])
+        frag_set = [value] if value is not None else [_STATIC_UNRESOLVED]
+    else:
+        # A bare `$` / `$(` / `$'` we do not model → opaque.
+        frag_set = [_STATIC_UNRESOLVED]
+    # `before` preceded the FIRST expansion so it has no `$`, but may carry a
+    # leading `~`; resolve it once. Recurse on the suffix (it may carry more
+    # expansions), then cross-product before × frag × after-resolutions.
+    before_resolved = _expand_bridge_prefixes(before) if before else before
+    if "$" in before_resolved:
+        before_resolved = _STATIC_UNRESOLVED  # opaque prefix → whole word suspect
+    after_set = _resolve_path_word_static(after, depth + 1) if after else [""]
+    results: list[str] = []
+    seen: set[str] = set()
+    for frag in frag_set:
+        for tail in after_set:
+            if (
+                before_resolved == _STATIC_UNRESOLVED
+                or frag == _STATIC_UNRESOLVED
+                or tail == _STATIC_UNRESOLVED
+            ):
+                combined = _STATIC_UNRESOLVED
+            else:
+                combined = before_resolved + frag + tail
+            if combined not in seen:
+                seen.add(combined)
+                results.append(combined)
+            if len(results) >= _STATIC_RESOLVE_MAX_RESULTS:
+                return results
+    return results or [_STATIC_UNRESOLVED]
+
+
+def _word_carries_trusted_anchor(word: str) -> bool:
+    """True iff *word* names a TRUSTED location anchor in ANY spelling — bare
+    ``$NAME``, brace ``${NAME}``, or inside a parameter-expansion operator word
+    (``${X:-$BRIDGE_DATA_ROOT}``). Used by the fail-close decision: an unresolved
+    word is only DENIED when it demonstrably carries a trusted anchor (so it
+    WILL resolve through the v2 root in the agent's bash), never for a wholly
+    anchor-free opaque ``$var``."""
+    for name in _TRUSTED_PATH_ANCHORS:
+        if "${" + name in word or "$" + name in word:
+            # Identifier-boundary guard: `$BRIDGE_DATA_ROOTX` is not `$BRIDGE_DATA_ROOT`.
+            if re.search(rf"\$\{{?{name}(?![A-Za-z0-9_])", word) is not None:
+                return True
     return False
 
 
-def _expand_v2_anchor_leading_word(word: str) -> str | None:
-    """Resolve a *word* that BEGINS with a trusted v2 location anchor — in any
-    spelling the deny path recognizes — to a concrete absolute literal, or
-    ``None`` when *word* is not a leading-v2-anchor word this hook can resolve.
+def _static_resolution_forbidden_hit(
+    word: str,
+    forbidden_dirs: list[tuple[str, str]],
+    eff_cwd: object = None,
+) -> str | None:
+    """Issue #1823 (r6): resolve *word* through the canonical static normalizer
+    and return the matched forbidden SUFFIX iff ANY possible resolution lands
+    inside a forbidden tree — else ``None``.
 
-    Issue #1823 (r5) CONSOLIDATION. The non-admin DENY path already recognizes
-    every v2-anchor spelling — bare ``$BRIDGE_DATA_ROOT/…``, brace
-    ``${BRIDGE_DATA_ROOT}/…``, and the Bash parameter-expansion OPERATOR forms
-    ``${BRIDGE_DATA_ROOT:-x}/…`` / ``${BRIDGE_AGENT_ROOT_V2-x}/…`` — via
-    ``_v2_anchor_operator_token`` + ``_expand_bridge_prefixes``. The admin
-    write-AUDIT path, by contrast, handed the raw word straight to
-    ``_resolve_word_through_symlinks``, which fails closed on ANY ``$``/``${``
-    word, so a trusted-admin peer-v2-home write spelled with an anchor env var
-    emitted NO ``admin_cross_agent_write`` row (it fell through to an UNAUDITED
-    allow). This helper REUSES the deny path's anchor recognition so the audit
-    path resolves the SAME spellings to a concrete literal the symlink resolver
-    can model — no second copy of the recognition logic.
+    Every concrete element of the resolved set is normpath-folded (absolute) or,
+    when RELATIVE with a known *eff_cwd*, joined under it, then compared against
+    every ``(abs_dir, suffix)`` pair. An element the normalizer could not fully
+    reduce (``_STATIC_UNRESOLVED``) fails CLOSED — returns the FIRST forbidden
+    suffix — ONLY when *word* demonstrably carries a TRUSTED anchor (it WILL
+    resolve through the v2 root in the agent's bash) AND its literal text names a
+    peer-home tail. A wholly anchor-free opaque ``$var`` does NOT over-block."""
+    resolutions = _resolve_path_word_static(word)
+    saw_unresolved = False
+    for res in resolutions:
+        if res == _STATIC_UNRESOLVED:
+            saw_unresolved = True
+            continue
+        if os.path.isabs(res):
+            resolved = os.path.normpath(res)
+        elif isinstance(eff_cwd, str) and eff_cwd is not _CWD_POISONED:
+            resolved = os.path.normpath(os.path.join(eff_cwd, res))
+        else:
+            continue  # relative + unknown base → not resolvable here
+        for abs_dir, suffix in forbidden_dirs:
+            if resolved == abs_dir or resolved.startswith(abs_dir + os.sep):
+                return suffix
+    # Fail-CLOSE: an element we could not fully resolve, but the word carries a
+    # trusted anchor AND a peer-home tail → bash WILL land it under the peer home.
+    # The tail is spelled relative to whichever anchor leads it, so match the
+    # peer-home suffix (`/agents/<peer>/home`), its no-`/agents` form
+    # (`/<peer>/home`, reachable from `$BRIDGE_AGENT_ROOT_V2`), and both
+    # leading-slash-stripped forms.
+    if saw_unresolved and _word_carries_trusted_anchor(word):
+        for _abs_dir, suffix in forbidden_dirs:
+            if not suffix.startswith("/agents/"):
+                continue
+            no_agents = suffix[len("/agents"):]  # `/<peer>/home`
+            for tail in (suffix, suffix.lstrip("/"), no_agents, no_agents.lstrip("/")):
+                if tail and tail in word:
+                    return suffix
+    return None
 
-    Resolution mirrors the deny path's ``_unresolved_v2_anchor_forbidden_suffix``:
 
-      - The OPERATOR form is recovered with ``_v2_anchor_operator_token`` — the
-        operator/default text inside ``${…}`` does not change which tree bash
-        writes to when the anchor env var is set (it always is for a v2 agent),
-        so the literal tail after the matching ``}`` decides the path. The
-        recovered anchor NAME is resolved to its absolute value via
-        ``_v2_anchor_value`` and the tail re-rooted under it (the
-        ``$BRIDGE_AGENT_ROOT_V2`` anchor already IS ``<data_root>/agents``).
-      - The bare / brace forms are resolved by ``_expand_bridge_prefixes`` (the
-        same SSOT the deny path uses).
+def _static_anchor_resolution_candidates(word: str) -> list[str]:
+    """Resolve a *word* that carries a trusted location anchor — in ANY spelling
+    the deny path recognizes — to the LIST of concrete absolute literals it can
+    statically expand to, for the admin write-AUDIT path. Empty list when *word*
+    carries no resolvable trusted anchor (no concrete peer-home target to audit).
 
-    Returns ``None`` (caller keeps the prior fail-closed behavior) when: the
-    word carries no leading v2 anchor; the operator-form tail carries a second
-    unresolved ``$`` (undecidable); or the anchor cannot be resolved in this
-    hook's env (``agent_root_v2()`` unset — a legacy install with no v2 root,
-    so there is no peer v2 home to audit). For the ADMIN write path an
-    unresolved anchor means "no concrete target to audit" → the caller keeps
-    its existing literal-only handling (allow without a v2-anchor audit row),
-    matching r3's treatment of an unresolved-literal admin write — it never
-    DENIES the admin write (that is the non-admin path's job).
-    """
-    # OPERATOR form first (`${NAME:-x}` / `${NAME-x}` / `${NAME:+x}` / `${NAME:0}` …):
-    # recover the anchor NAME + literal tail after the matching `}`.
-    op_token = _v2_anchor_operator_token(word)
-    if op_token is not None:
-        name, tail = op_token
-        if "$" in tail:
-            return None  # a second unresolved expansion in the tail — undecidable
-        value = _v2_anchor_value(name)
-        if not value:
-            return None  # anchor unresolvable in this hook env → no concrete target
-        # Re-root the tail under the resolved anchor value. Mirror the deny path:
-        # the tail is the literal path UNDER the anchor; join with a single sep.
-        return value.rstrip("/") + "/" + tail.lstrip("/") if tail else value
-    # Bare / brace form: only treat it as a trusted-anchor word when an anchor
-    # token actually LEADS the word, so a benign `$OTHER` is left for the caller.
-    # `BRIDGE_HOME` is included for parity (the brief): `_expand_bridge_prefixes`
-    # already resolves it, and a co-located peer v2 home spelled
-    # `$BRIDGE_HOME/data/agents/<peer>/home/...` must audit the same as the v2
-    # anchors. A non-anchor `${BRIDGE_HOMEX:-…}` is excluded by the
-    # identifier-boundary guards below (same as the deny path).
-    leads_anchor = False
-    for name in (*_V2_ANCHOR_NAMES, "BRIDGE_HOME"):
-        if word.startswith("${" + name + "}") or re.match(
-            rf"\${name}(?![A-Za-z0-9_])", word
-        ):
-            leads_anchor = True
-            break
-    if not leads_anchor:
-        return None
-    expanded = _expand_bridge_prefixes(word)
-    if "$" in expanded:
-        return None  # anchor unresolvable in this hook env, or a second unresolved var
-    return expanded
+    Issue #1823 (r6) CONSOLIDATION. The non-admin DENY path resolves a v2-anchor
+    word through the canonical normalizer (:func:`_resolve_path_word_static`),
+    which models every spelling — bare ``$BRIDGE_DATA_ROOT/…``, brace
+    ``${BRIDGE_DATA_ROOT}/…``, the parameter-expansion OPERATOR forms
+    ``${BRIDGE_DATA_ROOT:-x}/…`` / ``${BRIDGE_AGENT_ROOT_V2:+x}/…``, and the
+    NESTED forms ``${ROOTX:-$BRIDGE_DATA_ROOT}/…`` / ``${ROOT:+$ROOT/…/home/x}``
+    — as a SET of possible resolutions. The admin write-AUDIT path, by contrast,
+    handed the raw word straight to ``_resolve_word_through_symlinks``, which
+    fails closed on ANY ``$``/``${`` word, so a trusted-admin peer-v2-home write
+    spelled with an anchor env var emitted NO ``admin_cross_agent_write`` row (it
+    fell through to an UNAUDITED allow). This helper REUSES the SAME normalizer so
+    the audit path resolves the SAME spellings — INCLUDING the r6 nested forms —
+    to concrete literals the symlink resolver can model. No second copy of the
+    recognition logic, so the audit can never drift behind the deny path again.
+
+    Returns the concrete resolutions (sentinel-unresolved elements dropped) when
+    *word* carries a trusted anchor, else ``[]``. For the ADMIN write path an
+    empty list means "no concrete peer target to audit" → the caller keeps its
+    existing literal-only handling (allow without a v2-anchor audit row), matching
+    r3's treatment of an unresolved-literal admin write — it never DENIES the
+    admin write (that is the non-admin path's job)."""
+    if not _word_carries_trusted_anchor(word):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for res in _resolve_path_word_static(word):
+        if res == _STATIC_UNRESOLVED or "$" in res or not os.path.isabs(res):
+            continue
+        folded = os.path.normpath(res)
+        if folded not in seen:
+            seen.add(folded)
+            out.append(folded)
+    return out
 
 
 # Non-forking cd wrappers: `command`/`builtin` (each with its own option
@@ -3821,80 +3969,6 @@ def _command_effective_cwd(segments: list[str]) -> object:
     return eff
 
 
-def _unresolved_v2_anchor_forbidden_suffix(
-    word: str,
-    forbidden_dirs: list[tuple[str, str]],
-) -> str | None:
-    """Issue #1823 (r2) fail-CLOSE: *word* still carries a trusted v2 location
-    anchor (``$BRIDGE_DATA_ROOT`` / ``$BRIDGE_AGENT_ROOT_V2``) we could not
-    statically resolve, but the anchor IS exported into the agent runtime so
-    bash will expand it to the v2 root at execution time. Strip the leading
-    anchor token, ``normpath`` the literal tail, and return the matched forbidden
-    SUFFIX iff that tail is — or sits under — a v2 peer-home suffix
-    (``/agents/<peer>/home``). Returns ``None`` (caller keeps the prior
-    None→Pass-2 path) when the anchor is not leading, when the tail names no
-    forbidden suffix (a benign ``$BRIDGE_DATA_ROOT/logs/...`` write stays ALLOW),
-    or when a second unresolved ``$`` remains in the tail.
-
-    Only the v2 peer-home suffixes are matched here: the v2 anchors resolve to
-    the data / agent root, under which ``/agents/<peer>/home`` is the peer home,
-    so denying on that tail is the safe direction. The v1 ``/agents/<peer>``
-    suffix is intentionally NOT matched off the v2 anchor (it has no meaning
-    under the v2 root). The two anchors root the tail at DIFFERENT depths:
-    ``$BRIDGE_DATA_ROOT`` → ``<data_root>`` (tail begins ``/agents/<peer>/…``),
-    ``$BRIDGE_AGENT_ROOT_V2`` → ``<data_root>/agents`` (tail begins
-    ``/<peer>/…``), so the agent-root tail is re-rooted under ``/agents`` before
-    the suffix compare.
-    """
-    # Locate the leading anchor token and the literal tail after it. We only
-    # fail-close when the anchor is the PREFIX of the word — a `$BRIDGE_DATA_ROOT`
-    # appearing mid-word is not a path root we can reason about.
-    matched_name: str | None = None
-    tail: str | None = None
-    # Issue #1823 (r4): try the Bash parameter-expansion OPERATOR form first
-    # (`${NAME:-word}` / `${NAME:+word}` / `${NAME-word}` / `${NAME:off}` …).
-    # `_v2_anchor_operator_token` recovers the trusted-anchor NAME regardless of
-    # operator and returns the literal tail AFTER the matching `}` — the operator/
-    # default text inside the braces does not change which tree bash writes to when
-    # the anchor env var is set (it always is for a v2 agent), so the tail decides.
-    op_token = _v2_anchor_operator_token(word)
-    if op_token is not None:
-        matched_name, tail = op_token
-    else:
-        for name in _V2_ANCHOR_NAMES:
-            brace = "${" + name + "}"
-            if word.startswith(brace):
-                matched_name, tail = name, word[len(brace):]
-                break
-            m = re.match(rf"\${name}(?![A-Za-z0-9_])", word)
-            if m is not None:
-                matched_name, tail = name, word[m.end():]
-                break
-    if matched_name is None or tail is None:
-        return None
-    # A second unresolved expansion in the tail is undecidable here — leave it to
-    # the caller's Pass-2 obfuscation fail-close.
-    if "$" in tail:
-        return None
-    # The anchor resolves to an absolute dir; the tail is the path UNDER it.
-    # `$BRIDGE_AGENT_ROOT_V2` already IS the `agents` dir, so re-root its tail
-    # under `/agents` to match the `/agents/<peer>/home` suffix; `$BRIDGE_DATA_ROOT`
-    # roots at the data root, whose tail already includes `/agents`. `normpath`
-    # folds `..`/`//`/`/./` so `…/x/../agents/<p>/home` is judged on its resolved
-    # tail. Anchor at a leading slash so the tail reads as rooted-under-anchor.
-    inner = tail.lstrip("/")
-    if matched_name == "BRIDGE_AGENT_ROOT_V2":
-        inner = "agents/" + inner
-    folded = os.path.normpath("/" + inner)
-    for _abs_dir, suffix in forbidden_dirs:
-        # Only the v2 peer-home suffix is reachable under a v2 anchor.
-        if not (suffix.startswith("/agents/") and suffix.endswith("/home")):
-            continue
-        if folded == suffix or folded.startswith(suffix + "/"):
-            return suffix
-    return None
-
-
 def _resolved_forbidden_hit(
     word: str,
     eff_cwd: object,
@@ -3918,26 +3992,29 @@ def _resolved_forbidden_hit(
       - RELATIVE + POISONED eff_cwd → see :func:`_forbidden_suffix_in_command`
         fail-close (handled by the caller, not here).
     A surviving ``$var`` after expansion is unresolved → ``None`` here EXCEPT a
-    surviving v2 location anchor (``$BRIDGE_DATA_ROOT`` / ``$BRIDGE_AGENT_ROOT_V2``,
-    issue #1823) whose tail names a peer v2 home → fail CLOSED (deny) here, since
-    that anchor is exported into the agent runtime and bash WILL resolve it to the
-    peer home at execution time. Other surviving ``$var`` → the caller's Pass-2
-    obfuscation fail-close decides it.
+    word that the canonical static normalizer (:func:`_static_resolution_forbidden_hit`,
+    issue #1823 r6) resolves — through ANY combination of trusted anchors, bash
+    parameter-expansion operators, defaults, and nesting — to a peer v2 home →
+    fail CLOSED (deny) here, since those anchors are exported into the agent
+    runtime and bash WILL resolve the word to the peer home at execution time.
+    Other surviving ``$var`` → the caller's Pass-2 obfuscation fail-close decides it.
     """
     decoded = _decode_obfuscated_word(word)
     expanded = _expand_bridge_prefixes(decoded)
     if "$" in expanded:
-        # Issue #1823 (r2): a TRUSTED v2 anchor we could not statically resolve
-        # (e.g. unset in this hook's env) still resolves to a peer v2 home in the
-        # agent's bash — fail CLOSED when its tail names a forbidden peer-home
-        # suffix, rather than fall through to None → ALLOW. Non-v2 `$var` words
-        # are left to the caller's Pass-2.
-        if _word_carries_unresolved_v2_anchor(expanded):
-            anchor_hit = _unresolved_v2_anchor_forbidden_suffix(
-                expanded, forbidden_dirs
-            )
-            if anchor_hit is not None:
-                return anchor_hit
+        # Issue #1823 (r6): a TRUSTED anchor we could not statically resolve with
+        # the simple prefix expander (it leaves a `$` for operator/nested forms)
+        # still resolves to a peer v2 home in the agent's bash. Run the canonical
+        # word-resolution normalizer on the DECODED word — it models every anchor
+        # spelling (bare / brace / `${X:-W}` / `${X:+W}` / nested `${X:-${Y}}`)
+        # as a SET of possible resolutions and DENIES if ANY lands under a peer
+        # home — rather than fall through to None → ALLOW. A wholly anchor-free
+        # opaque `$var` resolves to no forbidden target and is left to Pass-2.
+        anchor_hit = _static_resolution_forbidden_hit(
+            decoded, forbidden_dirs, eff_cwd
+        )
+        if anchor_hit is not None:
+            return anchor_hit
         return None  # unresolved $var → caller's fail-close path decides
     if os.path.isabs(expanded):
         resolved = os.path.normpath(expanded)
@@ -6968,6 +7045,43 @@ def _resolved_target_under_containment_root(resolved_target: Path) -> bool:
     return False
 
 
+def _pick_admin_audit_candidate(target_word: str, agent: str) -> Path | None:
+    """Issue #1823 (r6): resolve an anchor-carrying *target_word* through the
+    canonical normalizer to its candidate set and pick the literal to AUDIT.
+
+    The normalizer models a parameter-expansion / nested anchor word as a SET of
+    possible resolutions (the var-value branch AND the default/alternate word).
+    For the admin write-AUDIT we PREFER the candidate that lands in a peer home
+    (matched against ``other_agent_homes`` by RESOLVED PATH) — that is the
+    cross-agent write the row records. Falling back to the first symlink-resolvable
+    candidate keeps a non-peer contained write (e.g. a ``backups/`` quarantine
+    spelled through an anchor) resolvable too. Returns ``None`` when no candidate
+    resolves (no trusted anchor, or the anchor is unset in this hook env)."""
+    candidates = _static_anchor_resolution_candidates(target_word)
+    if not candidates:
+        return None
+    try:
+        peer_resolved = [
+            (ph.resolve(strict=False), ph) for ph in other_agent_homes(agent)
+        ]
+    except (OSError, RuntimeError):
+        peer_resolved = []
+    first_resolved: Path | None = None
+    for cand in candidates:
+        resolved = _resolve_word_through_symlinks(cand)
+        if resolved is None:
+            continue
+        if first_resolved is None:
+            first_resolved = resolved
+        for peer_dir, _ph in peer_resolved:
+            try:
+                resolved.relative_to(peer_dir)
+            except ValueError:
+                continue
+            return resolved  # prefer the peer-home candidate (the audited write)
+    return first_resolved
+
+
 def _resolved_write_target_containment(target_word: str, agent: str) -> tuple[str, str] | None:
     """Resolve a write-target path word and confirm RESOLVED-PATH containment
     inside the operator bridge home AND outside every hard-denied tree.
@@ -6991,41 +7105,37 @@ def _resolved_write_target_containment(target_word: str, agent: str) -> tuple[st
       - the resolved target sits inside shared/private, shared/secrets, or a
         protected-config path.
 
-    Issue #1823 (r5): a write-target word that LEADS with a trusted v2 anchor
+    Issue #1823 (r5/r6): a write-target word that carries a trusted v2 anchor
     env var (``$BRIDGE_DATA_ROOT`` / ``$BRIDGE_AGENT_ROOT_V2`` / ``$BRIDGE_HOME``
-    in bare, brace, or parameter-expansion-operator spelling) is first expanded
-    to a concrete literal — reusing the SAME anchor recognition the non-admin
-    DENY path uses (``_v2_anchor_operator_token`` + ``_expand_bridge_prefixes``)
-    — so the admin write-AUDIT recognizes the resolved peer v2 home and emits
-    exactly one ``admin_cross_agent_write`` row for it. When the anchor cannot be
-    resolved in this hook's env (legacy install, no v2 root), the word stays
-    unresolved and the caller keeps its existing handling — the admin write is
-    NOT denied (that is the non-admin deny path's job; this path is allow+audit).
+    in bare, brace, parameter-expansion-operator, OR r6 NESTED spelling) is first
+    resolved to a concrete literal — reusing the SAME canonical normalizer the
+    non-admin DENY path uses (:func:`_resolve_path_word_static`) — so the admin
+    write-AUDIT recognizes the resolved peer v2 home and emits exactly one
+    ``admin_cross_agent_write`` row for it. When the anchor cannot be resolved in
+    this hook's env (legacy install, no v2 root), no candidate is produced and the
+    caller keeps its existing handling — the admin write is NOT denied (that is the
+    non-admin deny path's job; this path is allow+audit).
 
     Containment is by RESOLVED PATH, not substring, so a symlink/`..` escape
     cannot masquerade as a contained write.
     """
     resolved_target = _resolve_word_through_symlinks(target_word)
     if resolved_target is None:
-        # Issue #1823 (r5): `_resolve_word_through_symlinks` fails closed on ANY
-        # `$VAR`/`${...}` word, so a trusted-admin peer-v2-home write spelled
-        # with a v2 anchor env var (`$BRIDGE_DATA_ROOT/agents/<peer>/home/...`,
-        # `${BRIDGE_AGENT_ROOT_V2}/<peer>/home/...`, the operator form
-        # `${BRIDGE_DATA_ROOT:-x}/...`) reached here as None and the caller fell
-        # through to an UNAUDITED allow. CONSOLIDATE with the deny path: expand
-        # the SAME leading v2-anchor spellings it recognizes (reusing
-        # `_v2_anchor_operator_token` + `_expand_bridge_prefixes`) to a concrete
-        # literal, then re-run the symlink resolver on that literal so the
-        # resolved peer v2 home is recognized → the audit row fires. A word the
-        # anchor expander can't resolve (no leading anchor, or the anchor is
-        # unset in this hook env → no v2 root → no peer home to audit) stays
-        # None and the caller keeps its existing handling (the admin write still
-        # ALLOWs; r3's unresolved-literal admin case is never DENIED here — that
-        # is the non-admin deny path's job).
-        anchored = _expand_v2_anchor_leading_word(target_word)
-        if anchored is None:
-            return None
-        resolved_target = _resolve_word_through_symlinks(anchored)
+        # Issue #1823 (r6): `_resolve_word_through_symlinks` fails closed on ANY
+        # `$VAR`/`${...}` word, so a trusted-admin peer-v2-home write spelled with
+        # a v2 anchor env var — INCLUDING the r6 nested forms
+        # `${ROOTX:-$BRIDGE_DATA_ROOT}/agents/<peer>/home/...` and
+        # `${BRIDGE_DATA_ROOT:+$BRIDGE_DATA_ROOT/agents/<peer>/home/x}` — reached
+        # here as None and the caller fell through to an UNAUDITED allow.
+        # CONSOLIDATE with the deny path: resolve the SAME spellings through the
+        # canonical normalizer to its candidate set, prefer the candidate that
+        # lands in a peer home (the one to audit), and re-run the symlink resolver
+        # on it so the resolved peer v2 home is recognized → the audit row fires.
+        # No anchor candidate (no trusted anchor, or the anchor is unset in this
+        # hook env → no v2 root → no peer home to audit) keeps the caller's
+        # existing handling (the admin write still ALLOWs; r3's unresolved-literal
+        # admin case is never DENIED here — that is the non-admin deny path's job).
+        resolved_target = _pick_admin_audit_candidate(target_word, agent)
         if resolved_target is None:
             return None
     # Must stay under an operator-controlled write-containment root
