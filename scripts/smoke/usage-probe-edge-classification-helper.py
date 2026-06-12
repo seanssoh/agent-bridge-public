@@ -226,6 +226,58 @@ def main() -> int:
         check(cache["data"]["fiveHour"] == 100.0, "synthetic at-limit cache persisted")
         check(cache["_token_digest"] == probe._token_signal_digest(MOCK_TOKEN_A), "signal cache attributed to the active token digest")
 
+    print("[A3b] origin 429 ALSO arms a Retry-After-based backoff window (not the fixed 60s knob)")
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        reg = _registry(tmp, MOCK_TOKEN_A)
+        dig_a = probe._token_signal_digest(MOCK_TOKEN_A)
+        # cooldown=60.0 is the operator's fixed knob. An account-quota 429 must
+        # NOT settle for it: the token is unusable for the reset window, so the
+        # backoff must follow the same span contract as an edge block
+        # (max(EDGE_BACKOFF_SCHEDULE[streak], min(Retry-After, cap))). With
+        # Retry-After=3600 the first strike → 3600s, NOT 60s.
+        res = _run(
+            tmp,
+            http_get=_stub_http_error(429, RATE_LIMIT_BODY, 3600.0, headers=ANTHROPIC_HEADERS),
+            registry=reg, now=1000.0, cooldown=60.0,
+        )
+        check(res["status"] == "rate-limited-signal", "still emits the #1468 near-limit signal (contract unchanged)")
+        cooldowns = probe._token_cooldowns(tmp / "plugins" / "claude-hud" / ".usage-cache.json")
+        entry = cooldowns.get(dig_a) or {}
+        until = probe.token_cooldown_until(tmp / "plugins" / "claude-hud" / ".usage-cache.json", dig_a)
+        span = until - 1000.0
+        check(span >= min(3600.0, probe.EDGE_RETRY_AFTER_CAP_SECONDS), f"backoff honors Retry-After (got span={span:g}s)")
+        check(abs(span - 3600.0) < 1e-6, "first account-quota strike → 3600s (Retry-After), NOT the 60s knob")
+        check(span != 60.0, "explicitly NOT the fixed 60s cooldown")
+        check(int(entry.get("streak") or 0) == 1, "escalate=True bumped the consecutive-failure streak to 1")
+        check(entry.get("outcome") == "rate-limited", "cooldown outcome tagged rate-limited")
+        # A second strike on the SAME still-limited token escalates the streak.
+        res2 = _run(
+            tmp,
+            http_get=_stub_http_error(429, RATE_LIMIT_BODY, 300.0, headers=ANTHROPIC_HEADERS),
+            registry=reg, now=5000.0, cooldown=60.0,
+        )
+        check(res2["status"] in ("rate-limited-signal", "rate-limited-suppressed"), "second strike still on the signal lane")
+        entry2 = probe._token_cooldowns(tmp / "plugins" / "claude-hud" / ".usage-cache.json").get(dig_a) or {}
+        until2 = probe.token_cooldown_until(tmp / "plugins" / "claude-hud" / ".usage-cache.json", dig_a)
+        check(int(entry2.get("streak") or 0) == 2, "consecutive account-quota strike escalated streak to 2")
+        # streak 2 → EDGE_BACKOFF_SCHEDULE[1]=900s vs min(RA=300, cap)=300 → 900s wins.
+        check(abs((until2 - 5000.0) - 900.0) < 1e-6, "streak-2 backoff = max(900s schedule, 300s RA) = 900s")
+
+    print("[A3c] a clean reading clears the account-quota backoff streak (success contract preserved)")
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        reg = _registry(tmp, MOCK_TOKEN_A)
+        dig_a = probe._token_signal_digest(MOCK_TOKEN_A)
+        cache_path = tmp / "plugins" / "claude-hud" / ".usage-cache.json"
+        # Strike once (arms streak=1, 3600s window), then a clean reading after
+        # the window must clear the cooldown so a later genuine limit re-arms
+        # from streak 1 — not inherit the prior streak.
+        _run(tmp, http_get=_stub_http_error(429, RATE_LIMIT_BODY, 3600.0, headers=ANTHROPIC_HEADERS), registry=reg, now=1000.0, cooldown=60.0)
+        ok_res = _run(tmp, http_get=_stub_ok(OK_BODY), registry=reg, now=5000.0, cooldown=60.0)
+        check(ok_res["status"] == "written", "clean reading after the window writes a real cache")
+        check(probe.token_cooldown_until(cache_path, dig_a) == 0.0, "success cleared the account-quota cooldown/streak entry")
+
     print("[A4] headerless legacy seam (headers=None) → pre-headers behavior preserved")
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
