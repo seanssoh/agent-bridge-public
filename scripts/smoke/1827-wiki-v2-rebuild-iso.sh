@@ -222,8 +222,8 @@ smoke_log "ok: T7 _iso_rebuild_script exit codes are 0 or >= 10"
 #      where a `<<EOF` / `<<<` would risk the read_comsub/heredoc_write
 #      deadlock class.
 # ---------------------------------------------------------------------
-if grep -Eq '<<-?[A-Za-z_'"'"'"]|<<<' "$T_BODY"; then
-  grep -nE '<<-?[A-Za-z_'"'"'"]|<<<' "$T_BODY" >&2
+if grep -Eq '[<][<]-?[A-Za-z_'"'"'"]|[<][<][<]' "$T_BODY"; then
+  grep -nE '[<][<]-?[A-Za-z_'"'"'"]|[<][<][<]' "$T_BODY" >&2
   smoke_fail "T8 _iso_rebuild_script contains a heredoc/here-string (footgun #11)"
 fi
 smoke_log "ok: T8 no heredoc/here-string in the iso inline script"
