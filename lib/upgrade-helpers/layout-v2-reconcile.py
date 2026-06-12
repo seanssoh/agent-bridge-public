@@ -263,6 +263,28 @@ class Reconciler:
         archive_root = self.conflict_archive_root or (
             self.data_root / "agents" / agent / "home" / ".reconcile-conflicts"
         )
+        archived_probe = archive_root / self.stamp / rel
+        # Finding 1 (#1820 gate-2): the conflict-archive destination is a SEPARATE
+        # write path from the reconcile dst (it lands under .reconcile-conflicts/,
+        # not the v2 file). Guard its full chain too — a symlinked parent under
+        # the archive root (or an escaping conflict_archive_root) must fail closed
+        # before we mkdir+copy2 through it.
+        #
+        # Two fences are required (gate-2 r2, codex):
+        #   * the per-conflict path must stay under the archive root, AND
+        #   * the archive root itself must stay under data_root — otherwise an
+        #     explicit --conflict-archive-root with a SYMLINKED ANCESTOR (between
+        #     data_root and the archive root) would slip through, because fencing
+        #     the per-conflict path against the archive root alone never checks
+        #     ancestors ABOVE that root. Both default and explicit archive roots
+        #     must resolve under data_root.
+        if self.mode == "apply":
+            if not self._path_chain_fenced(archived_probe, archive_root):
+                self._skip(agent, kind, rel, "foreign_path_chain_archive")
+                return
+            if not self._path_chain_fenced(archive_root, self.data_root):
+                self._skip(agent, kind, rel, "foreign_path_chain_archive")
+                return
         # Idempotence: skip re-archiving an already-recorded identical conflict.
         dedup = self._conflict_dedup_marker(agent, rel, pair_hash) if pair_hash else None
         already_seen = bool(dedup and dedup.is_file())
@@ -375,6 +397,134 @@ class Reconciler:
         target = Path(os.path.realpath(path))
         return not self._within(target, home)
 
+    def _path_chain_fenced(self, path: Path, home: Path) -> bool:
+        """True iff EVERY component of ``path`` stays fenced under ``home``.
+
+        Finding 1 (#1820 gate-2, patch-dev): the final-path-only foreign-symlink
+        check (``_foreign_symlink``) misses a symlinked PARENT directory. If e.g.
+        ``<v2_home>/memory`` is a symlink pointing outside the v2 home, then
+        ``shutil.copy2(src, <v2_home>/memory/x.md)`` follows the parent symlink
+        and writes OUTSIDE the fenced tree even though the final component is not
+        itself a symlink. ``dst.parent.mkdir(parents=True)`` likewise materializes
+        through the escaping parent.
+
+        This guard walks the ENTIRE chain from ``home`` down to ``path`` (every
+        intermediate parent AND the final component) and fails closed unless the
+        resolved real target of each existing component remains under the resolved
+        ``home``. It is symmetric for source (read/archive) and destination
+        (copy/adopt) chains.
+
+        Rules / edge cases:
+          * ``home`` itself must resolve under itself (it does by definition once
+            ``os.path.realpath`` is applied to both — we compare realpaths).
+          * A component that does not yet exist (a leaf to be created, or a
+            not-yet-materialized parent) is fine PROVIDED no already-existing
+            ancestor of it escapes — i.e. we only need every *existing* prefix to
+            stay fenced, because a missing component cannot itself redirect.
+          * A BROKEN symlink anywhere in the chain fails closed (os.path.realpath
+            of a dangling link resolves to a path that will NOT be under home, and
+            even if it coincidentally were, lstat/readlink errors are treated as
+            escape). We never crash on a dangling link.
+          * Any OSError while inspecting a component => fail closed (return False).
+        """
+        try:
+            home_real = os.path.realpath(home)
+        except OSError:
+            return False
+        # Build the list of components from home down to the final path. We only
+        # care about the path segments at or below home; a path that is not even
+        # nominally under home is rejected outright.
+        try:
+            rel = path.resolve(strict=False).relative_to(Path(home).resolve(strict=False))
+        except (ValueError, OSError):
+            # path is not nominally under home (or unresolvable) -> reject.
+            return False
+        # Walk each prefix: home, home/p1, home/p1/p2, ... home/.../final.
+        cur = Path(home)
+        chain = [cur]
+        for part in rel.parts:
+            cur = cur / part
+            chain.append(cur)
+        for component in chain:
+            try:
+                is_link = os.path.islink(component)
+            except OSError:
+                return False
+            if is_link:
+                # A symlink (broken or not): its real target must stay under home.
+                try:
+                    target_real = os.path.realpath(component)
+                except OSError:
+                    return False
+                if not self._realpath_within(target_real, home_real):
+                    return False
+            else:
+                # Not a symlink. If it exists, its own realpath must stay fenced
+                # (guards a parent that is itself reached through an escaping
+                # symlink earlier in the chain — defense in depth). A missing
+                # non-link component is fine (nothing to redirect yet).
+                try:
+                    exists = os.path.lexists(component)
+                except OSError:
+                    return False
+                if exists:
+                    try:
+                        comp_real = os.path.realpath(component)
+                    except OSError:
+                        return False
+                    if not self._realpath_within(comp_real, home_real):
+                        return False
+        return True
+
+    def _home_anchored(self, home: Path, root: Path) -> bool:
+        """True iff every component of ``home`` stays fenced under ``root``.
+
+        Finding 1 (#1820 gate-2 r2): the agent home directory may ITSELF be a
+        symlink (e.g. ``data_root/agents/<a>/home`` -> /outside). Comparing
+        ``realpath(home)`` to ``realpath(home)`` is trivially true and misses
+        this. Instead we require the WHOLE chain from ``root`` (the resolved
+        bridge_home / data_root) down to ``home`` to stay fenced — every parent
+        AND the home component's own realpath must remain under ``realpath(root)``.
+        A home that is a symlink escaping ``root`` (or reached through an escaping
+        parent) fails closed. This reuses the same chain logic as the per-file
+        guard, so the home root is fenced with the same rigor as its contents.
+        Fails closed on any resolution error.
+        """
+        return self._path_chain_fenced(home, root)
+
+    @staticmethod
+    def _realpath_within(child_real: str, parent_real: str) -> bool:
+        """True iff resolved ``child_real`` is ``parent_real`` or a descendant.
+
+        Pure realpath-string containment (both args already os.path.realpath'd),
+        with a path-separator boundary so ``/a/bc`` is NOT treated as under
+        ``/a/b``.
+        """
+        if child_real == parent_real:
+            return True
+        prefix = parent_real.rstrip(os.sep) + os.sep
+        return child_real.startswith(prefix)
+
+    def _chains_fenced(
+        self, agent: str, kind: str, rel: str, src: Path, dst: Path
+    ) -> bool:
+        """Guard BOTH the source and destination path chains before a write.
+
+        Returns True only when every component of ``src`` stays under the v1 home
+        AND every component of ``dst`` stays under the v2 home. On any escape /
+        broken-symlink-parent / error it records a fail-closed skip and returns
+        False so the caller aborts the copy/adopt/archive for this rel.
+        """
+        v1_home = self._cur_v1_home
+        v2_home = self._cur_v2_home
+        if v1_home is not None and not self._path_chain_fenced(src, v1_home):
+            self._skip(agent, kind, rel, "foreign_path_chain_src")
+            return False
+        if v2_home is not None and not self._path_chain_fenced(dst, v2_home):
+            self._skip(agent, kind, rel, "foreign_path_chain_dst")
+            return False
+        return True
+
     # --- per-file reconcile --------------------------------------------------
     def _reconcile_file(
         self, agent: str, kind: str, rel: str, v1: Path, v2: Path, append_like: bool
@@ -390,6 +540,15 @@ class Reconciler:
             if self._foreign_symlink(v2, self._cur_v2_home):
                 self._skip(agent, kind, rel, "foreign_symlink_v2")
                 return
+        # Finding 1 (#1820 gate-2): guard the ENTIRE source AND destination path
+        # chains — every parent dir AND the final component — before any read /
+        # copy / adopt / archive. A symlinked PARENT (e.g. v2_home/memory -> an
+        # outside dir) would otherwise be followed by dst.parent.mkdir + copy2 and
+        # write OUTSIDE the fenced tree, which the final-path-only symlink guard
+        # above misses. Fail closed on any escape or broken-symlink parent.
+        if not self._chains_fenced(agent, kind, rel, v1, v2):
+            return
+
         v1_exists = v1.is_file()
         v2_exists = v2.is_file()
         if not v1_exists:
@@ -487,6 +646,24 @@ class Reconciler:
             self._warn(agent, "v2 home absent; skipped (fail-closed)")
             return
 
+        # Finding 1 (#1820 gate-2 r2, codex): the AGENT HOME ITSELF may be a
+        # symlink. If v2_home (or v1_home) resolves OUTSIDE its expected root,
+        # then using realpath(home) as the fence would point the fence AT the
+        # escape target, so every in-home write "passes" the chain guard while
+        # actually landing outside. Reject a home whose realpath escapes the
+        # expected v1/v2 agents root BEFORE any per-file work. The fence we hand
+        # to _path_chain_fenced below is the NOMINAL (un-resolved) home so a
+        # symlinked sub-path is still measured against where the home is supposed
+        # to live, not against where a symlinked home points.
+        if not self._home_anchored(v1_home, self.bridge_home):
+            self._skip(agent, "agent", ".", "foreign_v1_home")
+            self._warn(agent, "v1 home escapes expected root; skipped (fail-closed)")
+            return
+        if not self._home_anchored(v2_home, self.data_root):
+            self._skip(agent, "agent", ".", "foreign_v2_home")
+            self._warn(agent, "v2 home escapes expected root; skipped (fail-closed)")
+            return
+
         self._cur_v1_home = v1_home
         self._cur_v2_home = v2_home
 
@@ -523,7 +700,17 @@ class Reconciler:
 
         # 3. memory/** (copy v1-only; identical no-op; divergent -> archive)
         v1_mem = v1_home / "memory"
-        if v1_mem.is_dir():
+        # Finding 3 (#1820 gate-2 r2, codex): a BROKEN or escaping v1 memory/
+        # symlink makes v1_mem.is_dir() False, so the walk below would silently
+        # skip it with NO classification — masking a fail-closed event. Detect the
+        # symlinked-parent case explicitly and record foreign_path_chain_src so the
+        # operator sees that v1 memory was refused (not "no memory tree").
+        if os.path.islink(v1_mem):
+            real = os.path.realpath(v1_mem)
+            if not self._realpath_within(real, os.path.realpath(v1_home)):
+                self._skip(agent, "memory_tree", "memory", "foreign_path_chain_src")
+                v1_mem = None  # type: ignore[assignment]
+        if v1_mem is not None and v1_mem.is_dir():
             for src in sorted(v1_mem.rglob("*")):
                 if not src.is_file():
                     continue
