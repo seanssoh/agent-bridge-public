@@ -2659,6 +2659,64 @@ def _command_is_simple_inert_quoted_heredoc_write(command: str) -> bool:
     return re.search(r"\n" + re.escape(delimiter) + r"[ \t]*\Z", command) is not None
 
 
+def _inert_heredoc_cross_agent_scan_text(text: str) -> str | None:
+    """Return the reduced scan surface for the cross-agent (Stage A/B) gates
+    when *text* is the ONE provably-inert QUOTED-heredoc write shape (issue
+    #1822, codex re-review of PR #1838): the single-line command head with the
+    heredoc BODY and the proven-inert opener token removed. For every other
+    command return ``None`` — the caller scans the raw text, preserving
+    today's deny-leaning behavior unchanged.
+
+    Why excluding the body from word scanning cannot open a bypass:
+
+    - The strip happens ONLY when ``_command_is_simple_inert_quoted_heredoc_
+      write`` matches (#1574's airtight shape): a single ``cat``/``tee`` stage
+      whose head character classes EXCLUDE every chaining / substitution /
+      interpreter route (``&``, ``;``, ``|``, ``$``, backtick, ``(``, ``)``,
+      any ``<``/``>`` beyond the opener and a simple file redirect), a QUOTED
+      delimiter (``<<'EOF'`` / ``<<"EOF"`` — bash performs NO expansion on the
+      body; it is a pure literal fed to stdin), and the closing delimiter as
+      the last line (nothing can run after the body). An interpreter consumer
+      (``bash <<'EOF'``), a pipe route (``cat <<'EOF' | bash``), or a second
+      stage can never match — those bodies stay on the raw scan surface.
+    - ``cat``/``tee`` write stdin VERBATIM; they never treat body content as
+      a path to open. The only real filesystem targets are the head's
+      redirect target / file args, which REMAIN on the returned surface — a
+      write whose destination is a peer home or a forbidden shared tree still
+      hits the cross-agent gates exactly as before.
+    - An UNQUOTED (``<<EOF``) delimiter means bash DOES expand the body
+      (``$(…)``/``$var`` execute) — not the shape, no strip, body scanned.
+    - An UNBALANCED opener (no closing delimiter line) fails the shape's
+      end-anchored terminator check — no strip, fail closed.
+    - A body line EQUAL to the delimiter (the multi-EOF payload — bash ends
+      the heredoc at the FIRST such line and EXECUTES what follows) defeats
+      the end-anchored shape check, but ``_strip_heredoc_and_herestring_
+      body``'s first-terminator semantics then refuses the match, a newline
+      survives, and the ``"\\n" in stripped`` invariant below falls back to
+      the raw scan — the executed tail stays visible. Fail closed.
+    """
+    if not _command_is_simple_inert_quoted_heredoc_write(text):
+        return None
+    stripped = _strip_heredoc_and_herestring_body(text)
+    # Invariant: the inert shape is a one-line head + body + final terminator
+    # line, so a correct strip returns a single newline-FREE head ending in
+    # the (de-quoted) `<<DELIM` opener. Any surviving newline means the
+    # strip's first-terminator semantics disagreed with the shape check's
+    # end-anchored terminator (an in-body delimiter line → bash executes the
+    # remainder). Refuse to strip; the caller scans the raw text.
+    if "\n" in stripped:
+        return None
+    # Drop the trailing heredoc opener token so the embedding gate
+    # (`_command_has_shell_embedding`'s `<<` pattern) does not re-flag the
+    # proven-inert opener. The shape guarantees the opener is the LAST token
+    # of the head; everything else (leader, flags, redirect target, file
+    # args) stays on the scan surface.
+    head = re.sub(r"[ \t]*<<-?[A-Za-z_][A-Za-z0-9_]*[ \t]*\Z", "", stripped)
+    if head == stripped:
+        return None  # opener not in terminal position — fail closed
+    return head
+
+
 def _command_cd_base_dir(command: str) -> Path | None:
     """Resolve the working directory established by a leading ``cd`` stage.
 
@@ -7793,10 +7851,33 @@ def protected_alias_reason(
     if verb_deny is not None:
         return verb_deny
 
+    # Issue #1822 (codex re-review of PR #1838) — QUOTED-heredoc body data
+    # exclusion for the cross-agent gates below. When the command is the ONE
+    # provably-inert quoted-heredoc write shape (#1574's single `cat`/`tee`
+    # stage, quoted delimiter, terminator-last — see
+    # `_inert_heredoc_cross_agent_scan_text` for the full no-bypass
+    # argument), the heredoc body is pure literal DATA bash never expands and
+    # cat/tee never open as a path, so word-scanning it is a modeling error
+    # (the #1822 false-positive class: a doc-note body mentioning a bridge
+    # path / backtick code-span false-denied the whole command). The reduced
+    # surface keeps the ENTIRE command line — leader, flags, redirect target,
+    # file args — so a real cross-agent destination still denies; only the
+    # proven-data body (and the proven-inert opener token) is excluded. For
+    # every other command — unquoted/expanding delimiter, interpreter or pipe
+    # consumer, unbalanced marker, in-body delimiter line — this is None and
+    # the RAW text is scanned exactly as before (fail closed).
+    cross_scan = text
+    _inert_head = _inert_heredoc_cross_agent_scan_text(text)
+    if _inert_head is not None:
+        cross_scan = _inert_head
+
     # Issue #539 follow-up — Stage A: shared/private/ and shared/secrets/
     # are off-limits for every non-admin agent regardless of class.
     # Substring deny because the path can ride inside a heredoc body or
-    # a quoted blob the argv parser cannot surface as a clean token.
+    # a quoted blob the argv parser cannot surface as a clean token
+    # (`cross_scan` only ever differs from the raw text for the proven-inert
+    # quoted-heredoc DATA body above — every smuggle-capable body stays on
+    # the scan surface).
     #
     # Issue #1692 deliberately does NOT add an admin carve-out here. The
     # admin read-intent carve-out below covers PEER-HOME reads only; the
@@ -7811,7 +7892,7 @@ def protected_alias_reason(
     # check) — that over-permission is a separate follow-up, NOT the
     # parity target to copy into Bash.
     for forbidden_alias in _shared_forbidden_aliases():
-        if forbidden_alias in text:
+        if forbidden_alias in cross_scan:
             return (
                 "cross-agent access is blocked: shared/private and "
                 "shared/secrets are off-limits"
@@ -7830,7 +7911,9 @@ def protected_alias_reason(
     # secret/private subtrees stay off-limits for every Bash reader; the
     # admin asymmetry between Bash and the non-Bash `protected_path_reason`
     # Read path is tracked separately in #1711 and is NOT changed here).
-    shared_suffix_hit = _forbidden_suffix_in_command(text, _shared_forbidden_suffixes())
+    shared_suffix_hit = _forbidden_suffix_in_command(
+        cross_scan, _shared_forbidden_suffixes()
+    )
     if shared_suffix_hit is not None:
         # Issue #1822 — distinguish a REAL Stage-A secrets/private suffix match
         # from an OBFUSCATION fail-close. The fixed "shared/private and
@@ -7843,7 +7926,7 @@ def protected_alias_reason(
         if shared_suffix_hit == _OBFUSCATED_SUFFIX_SENTINEL:
             return (
                 "cross-agent access is blocked: un-analyzable path expression "
-                f"near a protected tree {_obfuscation_sample(text)}"
+                f"near a protected tree {_obfuscation_sample(cross_scan)}"
             )
         return (
             "cross-agent access is blocked: shared/private and "
@@ -8003,7 +8086,7 @@ def protected_alias_reason(
     # explained by a clean argv token whose resolved Path satisfies
     # `_system_class_cross_agent_read_allowed`.
     peer_aliases = _peer_alias_list(agent)
-    matched_alias = next((a for a in peer_aliases if a in text), None)
+    matched_alias = next((a for a in peer_aliases if a in cross_scan), None)
 
     # Issue #1709 — prefix-spelling-agnostic Stage-B peer-home matcher. The
     # `_peer_alias_list` substring needles share the same brace/`$BRIDGE_HOME`
@@ -8020,7 +8103,7 @@ def protected_alias_reason(
     # the correct stance for an un-analyzable spelling).
     if matched_alias is None and not admin:
         peer_suffix_hit = _forbidden_suffix_in_command(
-            text, _peer_forbidden_suffixes(agent)
+            cross_scan, _peer_forbidden_suffixes(agent)
         )
         if peer_suffix_hit is not None:
             matched_alias = f"cross-agent home ({peer_suffix_hit})"
@@ -8044,21 +8127,20 @@ def protected_alias_reason(
     # PEER-HOME access, never a shared-secret one. A `read|write` intent audit
     # row is emitted for every grant so the operator keeps a full ledger.
     # Non-admin behavior is completely unchanged (this branch is admin-gated).
-    # The embedding guard is the strict `_command_has_shell_embedding`: ANY
-    # `$(…)` / backtick / proc-sub / heredoc — including a backtick code-span or
-    # a path inside a quoted-heredoc doc-note body — makes the command ineligible
-    # for the carve-out and DENIES. A heredoc-body strip was prototyped to
-    # suppress that narrow false positive (an admin
-    # `cat >> <peer>/CLAUDE.md <<'EOF' … `wiki path` … EOF`) but was dropped:
-    # proving a heredoc body is inert data vs executable requires fully parsing
-    # the shell pipeline and a distinct bypass surfaced at each layer, so the
-    # convenience strip is omitted (not stripping only ever DENIES more). The
-    # accepted workaround is to write such a doc-note with an editor/file tool
-    # instead of a Bash heredoc.
+    # The guards run on `cross_scan`: for the ONE provably-inert quoted-heredoc
+    # write shape (#1574 / `_inert_heredoc_cross_agent_scan_text`) that is the
+    # command HEAD with the proven-DATA body and opener removed, so an admin
+    # doc-note `cat >> <peer>/CLAUDE.md <<'EOF' … `wiki path` … EOF` is
+    # eligible (the body is a literal bash never expands and cat/tee never
+    # open; the redirect target stays on the guard surface). For EVERY other
+    # command `cross_scan` IS the raw text and the embedding guard is the
+    # strict `_command_has_shell_embedding`: ANY `$(…)` / backtick / proc-sub
+    # / unquoted-or-unbalanced heredoc / interpreter-or-pipe-fed heredoc makes
+    # the command ineligible for the carve-out and DENIES (fail closed).
     if (
         admin
-        and not _has_unresolved_path_expansion(text)
-        and not _command_has_shell_embedding(text)
+        and not _has_unresolved_path_expansion(cross_scan)
+        and not _command_has_shell_embedding(cross_scan)
     ):
         _emit_admin_cross_agent_access_allowed(
             agent,

@@ -5,12 +5,13 @@
 # legacy (`$BRIDGE_AGENT_HOME_ROOT/worker`) tree, plus a shared/wiki page and a
 # shared/secrets file, then drives the cross-agent gate assertions in the
 # companion Python module-file (file-as-argv — NO heredoc-stdin to a
-# subprocess, footgun #11). Covers the FOUR retained #1822 false-positive
-# corrections only — balanced-backtick unwrap (Fix 1b), component-wise glob
-# containment (Fix 2), obfuscation message (Fix 3), admin Bash WRITE parity
-# #1711 (Fix 4), and md5 read-intent (Fix 5). The quoted-heredoc body STRIP
-# optimisation was dropped (operator decision), so this driver asserts NONE of
-# its behaviour.
+# subprocess, footgun #11). Covers the #1822 false-positive corrections —
+# balanced-backtick unwrap (Fix 1b), component-wise glob containment (Fix 2),
+# obfuscation message (Fix 3), admin Bash WRITE parity #1711 (Fix 4), md5
+# read-intent (Fix 5), and the QUOTED-heredoc BODY exclusion (Fix 6, codex
+# re-review of PR #1838). Fix 6 carries DENY teeth for every smuggle route the
+# body exclusion must NOT open: unquoted/expanding delimiter, unbalanced
+# marker, multi-EOF payload, and a protected redirect TARGET.
 #
 # Scope: #1822 false positives ONLY. The v2 peer-home CONTAINMENT gap is issue
 # #1823, owned by PR #1831 — its coverage lives in

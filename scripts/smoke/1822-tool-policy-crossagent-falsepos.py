@@ -8,17 +8,17 @@
 # the legacy (`$BRIDGE_AGENT_HOME_ROOT/<peer>`) tree, plus a shared/wiki page
 # and a shared/secrets file.
 #
-# Scope: #1822 cross-agent FALSE-POSITIVE corrections ONLY, and ONLY the FOUR
-# fixes that shipped — the quoted-heredoc BODY STRIP optimisation was dropped
-# (operator decision after 5 review rounds: proving a heredoc body is inert
-# data vs executable needs full shell-pipeline parsing and a distinct bypass
-# surfaced at every layer; not stripping is strictly safer — it only ever
-# DENIES more). The narrow remaining false positive (an admin doc-note
-# `cat >> peer/CLAUDE.md <<'EOF' … `path` … EOF` whose body contains a
-# protected-tree word now DENIES) is accepted; the workaround is to write
-# doc-notes with an editor/file tool instead of a Bash heredoc. This driver
-# therefore asserts NONE of the removed strip's behaviour (no data-sink ALLOW,
-# no interpreter-stdin DENY, no wrapper-option DENY, no pipe-route DENY).
+# Scope: #1822 cross-agent FALSE-POSITIVE corrections ONLY — the four original
+# fixes PLUS the quoted-heredoc BODY exclusion (Fix 6, codex re-review of PR
+# #1838). The body exclusion reuses #1574's provably-inert shape
+# (`_command_is_simple_inert_quoted_heredoc_write`: single cat/tee stage, NO
+# shell metachars in the head, QUOTED delimiter, terminator-last) via
+# `_inert_heredoc_cross_agent_scan_text`, which strips the proven-DATA body
+# from the cross-agent scan surface while keeping the WHOLE command line
+# (redirect target included) scanned. Everything that is not that one shape —
+# unquoted/expanding delimiter, interpreter consumer, pipe route, unbalanced
+# marker, in-body delimiter line — falls back to the raw scan (fail closed),
+# and this driver carries DENY teeth for each of those routes.
 #
 # The v2 peer-home CONTAINMENT gap is issue #1823, owned by PR #1831 (its smoke
 # coverage lives in scripts/smoke/1823-v2-peer-home-containment.sh); this driver
@@ -42,6 +42,13 @@
 #       ALLOW + admin_cross_agent_access_allowed intent=write audit row; a
 #       NON-admin peer-home write stays DENY (no carve-out for non-admin).
 #   Fix 5 — macOS `md5` checksum read of a peer home (admin) -> ALLOW.
+#   Fix 6 — quoted-heredoc BODY exclusion (codex re-review of PR #1838):
+#       a QUOTED-delimiter inert cat/tee heredoc body is pure data — a peer
+#       home path inside it no longer denies (admin doc-note ALLOW + write
+#       audit; non-admin own-file write ALLOW) — while every smuggle route
+#       stays DENY: unquoted delimiter, unbalanced marker, interpreter-fed
+#       stdin, pipe route, multi-EOF payload, and a protected redirect TARGET
+#       (peer home for non-admin, shared/secrets for everyone).
 #
 # Plus the one base invariant the admin carve-outs must not loosen:
 #   - a Stage-A shared/secrets read by ADMIN stays DENY (#1692 invariant).
@@ -245,6 +252,122 @@ def main() -> int:
         "Fix5 admin `md5 -q` peer read ALLOW (read-intent)",
         not is_deny(r),
         f"unexpected deny: {r!r}",
+    )
+
+    # --- Fix 6: QUOTED-heredoc BODY exclusion (codex re-review of PR #1838).
+    #     A quoted-delimiter inert cat/tee heredoc body is pure DATA bash never
+    #     expands and cat/tee never open as a path, so a protected-tree word
+    #     inside the body must NOT deny — while the redirect TARGET and every
+    #     smuggle route stay scanned (fail closed). `intruder` is a non-admin
+    #     peer; `worker` (alias `legacy_peer`) is a different peer home; the
+    #     driver runs as `worker`, so `intruder_home` is the caller's OWN tree.
+    NL = chr(10)
+    intruder_home = bridge_home / "agents" / nonadmin
+
+    # 6a — the LIVE repro: admin doc-note `cat >> <peer>/CLAUDE.md <<'EOF' …
+    #      <a path> … EOF`. Body mentions a peer path; redirect target is a peer
+    #      home (admin write parity, #1711) -> ALLOW + intent=write audit row.
+    before = audit_log.stat().st_size if audit_log.exists() else 0
+    a6 = (
+        f"cat >> {legacy_peer}/CLAUDE.md <<'EOF'{NL}"
+        f"see {legacy_peer}/MEMORY.md for context{NL}EOF"
+    )
+    r = tp.protected_alias_reason(a6, admin, tool_input={"command": a6})
+    check(
+        "Fix6a admin quoted-heredoc peer doc-note (body has path) ALLOW",
+        not is_deny(r),
+        f"unexpected deny (the #1838 live false-positive): {r!r}",
+    )
+    rows = _new_audit_rows(audit_log, before)
+    check(
+        "Fix6a admin quoted-heredoc write emits "
+        "admin_cross_agent_access_allowed intent=write",
+        any(
+            row.get("action") == "admin_cross_agent_access_allowed"
+            and (row.get("detail") or {}).get("intent") == "write"
+            for row in rows
+        ),
+        f"no matching write audit row in {len(rows)} new rows",
+    )
+
+    # 6b — non-admin write to OWN file, quoted-heredoc body mentions a PEER home
+    #      path. Pre-fix the body word false-denied; the exclusion makes it
+    #      ALLOW (the body is data, the OWN-file redirect target is not a peer).
+    b6 = (
+        f"cat >> {intruder_home}/MEMORY.md <<'EOF'{NL}"
+        f"reminder: {legacy_peer}/CLAUDE.md exists{NL}EOF"
+    )
+    r = tp.protected_alias_reason(b6, nonadmin, tool_input={"command": b6})
+    check(
+        "Fix6b non-admin quoted-heredoc OWN-file write (peer path in body) "
+        "ALLOW",
+        not is_deny(r),
+        f"unexpected deny: {r!r}",
+    )
+
+    # 6c TEETH — UNQUOTED delimiter: bash EXPANDS the body, so it is NOT data;
+    #      no strip, the peer path in the body is scanned and DENIES.
+    c6 = (
+        f"cat >> {intruder_home}/MEMORY.md <<EOF{NL}"
+        f"see {legacy_peer}/CLAUDE.md{NL}EOF"
+    )
+    r = tp.protected_alias_reason(c6, nonadmin, tool_input={"command": c6})
+    check(
+        "Fix6c TEETH non-admin UNQUOTED heredoc (peer path in body) DENY",
+        is_deny(r),
+        f"expected deny (expanding body must be scanned), got: {r!r}",
+    )
+
+    # 6d TEETH — UNBALANCED marker (no closing delimiter line): fails the
+    #      shape's terminator check, no strip, fail closed -> DENY.
+    d6 = (
+        f"cat >> {intruder_home}/MEMORY.md <<'EOF'{NL}"
+        f"see {legacy_peer}/CLAUDE.md{NL}NOTEOF"
+    )
+    r = tp.protected_alias_reason(d6, nonadmin, tool_input={"command": d6})
+    check(
+        "Fix6d TEETH non-admin UNBALANCED heredoc marker DENY (fail closed)",
+        is_deny(r),
+        f"expected deny (unbalanced marker), got: {r!r}",
+    )
+
+    # 6e TEETH — multi-EOF payload: bash ends the heredoc at the FIRST `EOF`
+    #      line and EXECUTES the tail. The shape's end-anchored check + the
+    #      strip's first-terminator semantics disagree, the surviving newline
+    #      invariant falls back to the raw scan, and the executed tail (a peer
+    #      read) stays visible -> DENY.
+    e6 = (
+        f"cat >> {intruder_home}/MEMORY.md <<'EOF'{NL}"
+        f"body{NL}EOF{NL}cat {legacy_peer}/CLAUDE.md{NL}EOF"
+    )
+    r = tp.protected_alias_reason(e6, nonadmin, tool_input={"command": e6})
+    check(
+        "Fix6e TEETH non-admin multi-EOF payload (peer read in tail) DENY",
+        is_deny(r),
+        f"expected deny (executed tail must stay visible), got: {r!r}",
+    )
+
+    # 6f TEETH — quoted-heredoc whose redirect TARGET is a PEER home (non-admin).
+    #      The body is excluded but the target stays on the scan surface, so a
+    #      cross-agent WRITE destination still DENIES.
+    f6 = f"cat >> {legacy_peer}/CLAUDE.md <<'EOF'{NL}hi{NL}EOF"
+    r = tp.protected_alias_reason(f6, nonadmin, tool_input={"command": f6})
+    check(
+        "Fix6f TEETH non-admin quoted-heredoc TARGET=peer home DENY",
+        is_deny(r),
+        f"expected deny (redirect target stays scanned), got: {r!r}",
+    )
+
+    # 6g TEETH — quoted-heredoc whose redirect TARGET is shared/secrets (admin).
+    #      Stage-A is off-limits for EVERY agent including admin (#1692
+    #      invariant); the body exclusion must not loosen it -> DENY.
+    g6 = f"cat >> {secrets} <<'EOF'{NL}hi{NL}EOF"
+    r = tp.protected_alias_reason(g6, admin, tool_input={"command": g6})
+    check(
+        "Fix6g TEETH admin quoted-heredoc TARGET=shared/secrets DENY "
+        "(#1692 Stage-A kept)",
+        is_deny(r),
+        f"expected deny (Stage-A invariant), got: {r!r}",
     )
 
     if FAILURES:
