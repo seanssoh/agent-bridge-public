@@ -634,7 +634,7 @@ daemon_acl_default_inheritance() {
 }
 
 daemon_socket_listener_contract() {
-  local bridge_id socket_path daemon_log create_out task_id show_out i
+  local bridge_id socket_path pid_file daemon_log create_out task_id show_out
 
   export BRIDGE_GATEWAY_TRANSPORT=file
   export BRIDGE_GATEWAY_LISTENER=auto
@@ -649,6 +649,7 @@ daemon_socket_listener_contract() {
 
   bridge_id="$(python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" print-runtime-id --bridge-home "$BRIDGE_HOME")"
   socket_path="$BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT/$bridge_id/queue-gateway.sock"
+  pid_file="$BRIDGE_STATE_DIR/queue-gateway-socket.pid"
   daemon_log="$SMOKE_TMP_ROOT/daemon-run.log"
   cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
 bridge_add_agent_id_if_missing "worker-a"
@@ -663,13 +664,11 @@ EOF
   bash "$SMOKE_REPO_ROOT/bridge-daemon.sh" run >"$daemon_log" 2>&1 &
   DAEMON_SOCKET_PID="$!"
 
-  for ((i = 0; i < 50; i++)); do
-    if [[ -S "$socket_path" ]] && kill -0 "$DAEMON_SOCKET_PID" 2>/dev/null; then
-      break
-    fi
-    sleep 0.1
-  done
-  [[ -S "$socket_path" ]] || smoke_fail "daemon did not start queue socket listener; log=$(cat "$daemon_log" 2>/dev/null || true)"
+  # Same bounded poll as the loop-restart test (the old fixed 50*0.1=5s
+  # window was the same cold-boot cliff — a passing CI run was observed
+  # taking 4.0s of it). The socket assertion below is unchanged.
+  _daemon_wait_for_socket_listener_pid "$socket_path" "$pid_file" "$DAEMON_SOCKET_PID" >/dev/null || true
+  [[ -S "$socket_path" ]] || smoke_fail "daemon did not start queue socket listener; $(_daemon_socket_listener_diag "$DAEMON_SOCKET_PID" "$daemon_log")"
 
   create_out="$(
     BRIDGE_GATEWAY_PROXY=1 BRIDGE_AGENT_ID=worker-a BRIDGE_GATEWAY_TRANSPORT=socket python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
@@ -689,8 +688,61 @@ EOF
   [[ ! -S "$socket_path" ]] || smoke_fail "daemon exit should remove queue socket"
 }
 
+# Poll, with a bounded budget, for the queue-gateway socket listener to be
+# live AND for its pid file to hold a numeric pid distinct from an optional
+# excluded pid (the restart case passes the killed listener's pid so it waits
+# for the *replacement*). Re-reads the pid file every iteration so a daemon
+# that writes the pid late is tolerated. The `kill -0 $daemon_pid` conjunct
+# gates ACCEPTANCE on the daemon still being alive — it does not fail fast
+# (a crashed-but-unreaped daemon is a zombie and zombies still pass kill -0);
+# the bounded budget is what terminates the wait. Echoes the discovered pid
+# on success (nothing on timeout) and returns non-zero on timeout, so the
+# caller's strict numeric assertion still fires when the listener never
+# comes up.
+#
+# Budget rationale (v0.16.10 wave CI flake, PR #1848 run 27401016284): the
+# daemon writes NOTHING to its own stdout/stderr on a healthy boot, so the
+# old failure message's empty `log=` was normal, not evidence of a hang.
+# What actually burns the budget on a congested runner is gateway-listener
+# cold start: each attempt is a python3 spawn with a 2s in-daemon wait
+# (BRIDGE_QUEUE_GATEWAY_SOCKET_START_WAIT_SECONDS), retried once per daemon
+# tick — so a couple of slow spawns already eat most of a fixed 10s window.
+# A healthy daemon breaks this poll the instant the socket binds, so a high
+# ceiling costs nothing on a green run; 300*0.1=30s absorbs that cold-boot
+# latency without masking a real never-start.
+_daemon_wait_for_socket_listener_pid() {
+  local socket_path="$1" pid_file="$2" daemon_pid="$3" exclude_pid="${4:-}"
+  local attempts="${DAEMON_SOCKET_LISTENER_WAIT_ATTEMPTS:-300}"
+  local found="" i
+  for ((i = 0; i < attempts; i++)); do
+    if [[ -S "$socket_path" && -f "$pid_file" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+      found="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
+      if [[ "$found" =~ ^[0-9]+$ && "$found" != "$exclude_pid" ]]; then
+        printf '%s\n' "$found"
+        return 0
+      fi
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# Failure diagnostics for the socket-listener tests. The daemon's own log is
+# empty on a healthy boot, so on timeout we also need: is the daemon process
+# still alive, and what did the gateway listener spawn actually say (its
+# errors land in state/queue-gateway-socket.log, not the daemon log).
+_daemon_socket_listener_diag() {
+  local daemon_pid="$1" daemon_log="$2"
+  local alive="no"
+  kill -0 "$daemon_pid" 2>/dev/null && alive="yes"
+  printf 'daemon_alive=%s daemon_log=[%s] gateway_socket_log=[%s]' \
+    "$alive" \
+    "$(cat "$daemon_log" 2>/dev/null || true)" \
+    "$(tail -n 20 "$BRIDGE_STATE_DIR/queue-gateway-socket.log" 2>/dev/null || true)"
+}
+
 daemon_socket_listener_loop_restart() {
-  local bridge_id socket_path pid_file daemon_log first_pid second_pid create_out task_id show_out i
+  local bridge_id socket_path pid_file daemon_log first_pid second_pid create_out task_id show_out
 
   export BRIDGE_GATEWAY_TRANSPORT=file
   export BRIDGE_GATEWAY_LISTENER=auto
@@ -717,40 +769,30 @@ BRIDGE_AGENT_ISOLATION_MODE["worker-a"]="linux-user"
 BRIDGE_AGENT_OS_USER["worker-a"]="agent-bridge-worker-a"
 EOF
   mkdir -p "$SMOKE_TMP_ROOT/worker-a"
+  # Isolation from the preceding lifecycle test: it shares BRIDGE_STATE_DIR,
+  # so a pid file left by a partially-run daemon exit trap would hand this
+  # test the OLD listener's pid as first_pid (and kill the wrong process).
+  # The daemon's stop path normally removes it; this makes it deterministic.
+  rm -f "$pid_file"
   bash "$SMOKE_REPO_ROOT/bridge-daemon.sh" run >"$daemon_log" 2>&1 &
   DAEMON_SOCKET_PID="$!"
 
-  # Issue #1644 CI flake: first_pid is `local`-declared (above) but left UNSET, so if
-  # the initial listener does not bind within the wait budget the loop exits without
-  # ever assigning it and `set -u` aborts at the check below with a cryptic
-  # "first_pid: unbound variable" instead of the intended smoke_fail. Initialize it
-  # (mirroring second_pid="" below) AND give cold daemon boot more headroom on a loaded
-  # CI runner: 50*0.1=5s was too tight; 100*0.1=10s matches the restart loop's
-  # generosity. Common case is unaffected — the loop breaks as soon as the socket binds.
-  first_pid=""
-  for ((i = 0; i < 100; i++)); do
-    if [[ -S "$socket_path" && -f "$pid_file" ]] && kill -0 "$DAEMON_SOCKET_PID" 2>/dev/null; then
-      first_pid="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
-      [[ "$first_pid" =~ ^[0-9]+$ ]] && break
-    fi
-    sleep 0.1
-  done
-  [[ "$first_pid" =~ ^[0-9]+$ ]] || smoke_fail "loop-restart: daemon did not start initial listener; log=$(cat "$daemon_log" 2>/dev/null || true)"
+  # Wait for the initial listener to come up. first_pid is "" on timeout so
+  # the strict smoke_fail below fires (not a `set -u` "unbound variable"
+  # abort — issue #1644's original CI symptom). See
+  # _daemon_wait_for_socket_listener_pid for the bounded-poll + budget
+  # rationale (the prior fixed 10s window was still too tight under the
+  # v0.16.10 wave job: PR #1848 run 27401016284).
+  first_pid="$(_daemon_wait_for_socket_listener_pid "$socket_path" "$pid_file" "$DAEMON_SOCKET_PID" || true)"
+  [[ "$first_pid" =~ ^[0-9]+$ ]] || smoke_fail "loop-restart: daemon did not start initial listener; $(_daemon_socket_listener_diag "$DAEMON_SOCKET_PID" "$daemon_log")"
 
   kill "$first_pid" >/dev/null 2>&1 || true
 
-  second_pid=""
-  for ((i = 0; i < 80; i++)); do
-    if [[ -S "$socket_path" && -f "$pid_file" ]] && kill -0 "$DAEMON_SOCKET_PID" 2>/dev/null; then
-      second_pid="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
-      if [[ "$second_pid" =~ ^[0-9]+$ && "$second_pid" != "$first_pid" ]]; then
-        break
-      fi
-    fi
-    sleep 0.1
-  done
+  # Wait for the daemon to restart the killed listener: same bounded poll, but
+  # exclude first_pid so we only accept a genuinely new listener process.
+  second_pid="$(_daemon_wait_for_socket_listener_pid "$socket_path" "$pid_file" "$DAEMON_SOCKET_PID" "$first_pid" || true)"
   [[ "$second_pid" =~ ^[0-9]+$ && "$second_pid" != "$first_pid" ]] \
-    || smoke_fail "loop-restart: daemon did not restart dead queue socket listener (first=$first_pid second=${second_pid:-}); log=$(cat "$daemon_log" 2>/dev/null || true)"
+    || smoke_fail "loop-restart: daemon did not restart dead queue socket listener (first=$first_pid second=${second_pid:-}); $(_daemon_socket_listener_diag "$DAEMON_SOCKET_PID" "$daemon_log")"
 
   create_out="$(
     BRIDGE_GATEWAY_PROXY=1 BRIDGE_AGENT_ID=worker-a BRIDGE_GATEWAY_TRANSPORT=socket python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \

@@ -4737,6 +4737,99 @@ bridge_daemon_is_running() {
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
+# Issue #1833: tri-state daemon liveness (`up` / `down` / `unknown`) anchored
+# on the daemon PIDFILE, not on a queue-gateway response. Consumes the A1
+# `gateway_daemon_liveness` primitive (#1837 / #1840, bridge-queue-gateway.py
+# `daemon-liveness` subcommand) instead of duplicating its pid+cmdline logic.
+#
+# Why the shell resolver alone is not enough: from an iso v2 agent UID,
+# `kill -0 <controller-daemon-pid>` fails with EPERM even though the process
+# is alive (bash's kill builtin cannot distinguish EPERM from ESRCH), and the
+# pidfile itself may be unreadable across the iso boundary. Both cases used
+# to collapse into "not running" → `health=down` — the #1833 false alarm that
+# made a transient gateway-call timeout look like a daemon crash. The Python
+# primitive treats EPERM-on-signal as "process exists" and an unreadable
+# pidfile as `unknown` (never `down`).
+#
+# Resolution order:
+#   1. Shell resolver (`bridge_daemon_is_running`: recorded pid + cmdline
+#      guard + pgrep fallback) — authoritative `up` in the controller
+#      context, and the only path that can find a daemon with a missing
+#      pidfile. No python fork on the healthy-controller fast path.
+#   2. The A1 primitive — `up`/`down` are trusted as-is (EPERM-aware,
+#      position-anchored cmdline proof, #683 pid-recycling guard).
+#   3. `unknown` from the primitive (or the primitive being unavailable) is
+#      disambiguated locally: when THIS context has full visibility (the
+#      pidfile is readable, or provably absent in a traversable state dir)
+#      the legacy verdict `down` stands; only a genuine visibility boundary
+#      (unreadable pidfile / untraversable state dir) yields `unknown`.
+#
+# Callers MUST NOT render `unknown` as `down` — see #1833.
+bridge_daemon_liveness() {
+  if bridge_daemon_is_running; then
+    printf 'up\n'
+    return 0
+  fi
+
+  local gw_script="${BRIDGE_SCRIPT_DIR:-$BRIDGE_HOME}/bridge-queue-gateway.py"
+  local verdict=""
+  if [[ -f "$gw_script" ]] && command -v python3 >/dev/null 2>&1; then
+    # Pass the pidfile/state-dir resolution explicitly: the primitive reads
+    # BRIDGE_DAEMON_PID_FILE / BRIDGE_STATE_DIR from its environment, and
+    # these are plain shell variables (not necessarily exported) in lib
+    # context. Only forward non-empty values — an empty-but-present
+    # BRIDGE_STATE_DIR would defeat the primitive's own default.
+    local -a liveness_env=()
+    [[ -n "${BRIDGE_DAEMON_PID_FILE:-}" ]] && liveness_env+=("BRIDGE_DAEMON_PID_FILE=$BRIDGE_DAEMON_PID_FILE")
+    [[ -n "${BRIDGE_STATE_DIR:-}" ]] && liveness_env+=("BRIDGE_STATE_DIR=$BRIDGE_STATE_DIR")
+    verdict="$(env ${liveness_env[@]+"${liveness_env[@]}"} \
+      python3 "$gw_script" daemon-liveness --bridge-home "$BRIDGE_HOME" 2>/dev/null || true)"
+  fi
+  case "$verdict" in
+    up|down)
+      printf '%s\n' "$verdict"
+      return 0
+      ;;
+  esac
+
+  # Primitive said `unknown` (or was unavailable). Keep the legacy `down`
+  # verdict whenever this context can actually SEE the pidfile state; only a
+  # blocked read is allowed to soften the verdict to `unknown`. A pidfile
+  # that is provably ABSENT (fresh install, clean stop removed it) stays
+  # `down` — preserving the documented controller-context `health=down`
+  # contract (heredoc-regression smoke case 4a, smoke-test stopped asserts).
+  local pid_file="${BRIDGE_DAEMON_PID_FILE:-}"
+  if [[ -z "$pid_file" ]]; then
+    printf 'down\n'
+    return 0
+  fi
+  if [[ -e "$pid_file" ]]; then
+    if [[ -r "$pid_file" ]]; then
+      # Readable but empty/garbled (the shell resolver already failed on
+      # it): full visibility — genuine down.
+      printf 'down\n'
+    else
+      # Exists but this UID cannot read it: the iso v2 boundary. The daemon
+      # may well be alive — never assert down here (#1833).
+      printf 'unknown\n'
+    fi
+    return 0
+  fi
+  # `-e` is false: the pidfile is either genuinely absent or hidden behind
+  # an untraversable state dir. Disambiguate on the dir itself: stat-able
+  # but not traversable → boundary (`unknown`); absent dir or traversable
+  # dir without the file → genuine down. (On iso v2 the bridge home is
+  # traversable and `state/` is the restricted leaf, so the dir stat
+  # succeeds and the -r/-x test correctly reports the boundary.)
+  local pid_dir
+  pid_dir="$(dirname -- "$pid_file")"
+  if [[ -d "$pid_dir" ]] && [[ ! -r "$pid_dir" || ! -x "$pid_dir" ]]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  printf 'down\n'
+}
+
 # Issue #815 Wave C: tick-freshness as a first-class health signal.
 #
 # Read state/daemon.heartbeat and return its age in whole seconds on
@@ -4790,51 +4883,65 @@ bridge_daemon_heartbeat_age_seconds() {
 }
 
 # Issue #815 Wave C: derived health signal from pid liveness + heartbeat
-# freshness. Writes three lines to stdout in `key=value` form:
+# freshness. Writes four lines to stdout in `key=value` form:
 #
 #   tick_age_seconds=<int or empty>
 #   tick_fresh=<true|false>
-#   health=<ok|silent|down>
+#   daemon_liveness=<up|down|unknown>
+#   health=<ok|silent|down|unknown>
 #
 # Threshold: BRIDGE_DAEMON_TICK_FRESH_SECONDS (default 120; the daemon
 # emits daemon_tick every 60s, so 2× margin = stale after 2 missed ticks).
 #
-# Health derivation:
-#   - ok      : pid alive AND tick_fresh
-#   - silent  : pid alive AND tick stale (or missing)  — repair condition
-#   - down    : pid missing or not alive
+# Health derivation (#1833: anchored on bridge_daemon_liveness — the daemon
+# PIDFILE — never on a queue-gateway response; a gateway-call timeout alone
+# must not flip health to `down` while the daemon process is alive):
+#   - ok      : liveness=up AND tick_fresh
+#   - silent  : liveness=up AND tick stale (or missing)  — repair condition
+#   - down    : liveness=down (pid provably missing/dead)
+#   - unknown : liveness=unknown (pidfile unreadable from this context, e.g.
+#               the iso v2 boundary) — NOT a crash signal; do not escalate.
 #
 # Tests can capture this directly to validate the signal independently
 # of the cmd_status text shape.
 bridge_daemon_health_signal() {
-  local pid=""
-  local pid_alive="false"
+  local liveness=""
   local age=""
   local fresh="false"
   local health="down"
   local threshold="${BRIDGE_DAEMON_TICK_FRESH_SECONDS:-120}"
   [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=120
 
-  pid="$(bridge_daemon_pid 2>/dev/null || true)"
-  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-    pid_alive="true"
-  fi
+  liveness="$(bridge_daemon_liveness 2>/dev/null || true)"
+  case "$liveness" in
+    up|down|unknown) ;;
+    *) liveness="down" ;;
+  esac
 
   age="$(bridge_daemon_heartbeat_age_seconds 2>/dev/null || true)"
   if [[ "$age" =~ ^[0-9]+$ ]] && (( age <= threshold )); then
     fresh="true"
   fi
 
-  if [[ "$pid_alive" == "true" ]]; then
-    if [[ "$fresh" == "true" ]]; then
-      health="ok"
-    else
-      health="silent"
-    fi
-  fi
+  case "$liveness" in
+    up)
+      if [[ "$fresh" == "true" ]]; then
+        health="ok"
+      else
+        health="silent"
+      fi
+      ;;
+    unknown)
+      health="unknown"
+      ;;
+    *)
+      health="down"
+      ;;
+  esac
 
   printf 'tick_age_seconds=%s\n' "$age"
   printf 'tick_fresh=%s\n' "$fresh"
+  printf 'daemon_liveness=%s\n' "$liveness"
   printf 'health=%s\n' "$health"
 }
 

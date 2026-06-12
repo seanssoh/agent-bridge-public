@@ -365,18 +365,43 @@ def backup_file(src: Path, backup_root: Path, dry_run: bool) -> None:
     shutil.copy2(src, backup_root / src.name, follow_symlinks=False)
 
 
-def list_agent_dirs(target_root: Path, selected: list[str], all_agents: bool) -> list[Path]:
+def list_agent_dirs(
+    target_root: Path,
+    selected: list[str],
+    all_agents: bool,
+    home_subdir: str = "",
+) -> list[Path]:
+    # Issue #1820: ``home_subdir`` (e.g. "home") descends one level into each
+    # agent entry so the docs engine grooms the v2 per-agent home
+    # ``<target_root>/<agent>/home`` instead of the flat v1 layout
+    # ``<target_root>/<agent>``. Selection (name match / _template / shared
+    # filtering) still keys off the agent-named parent; only the returned
+    # *home* path carries the subdir. Empty subdir preserves the legacy v1
+    # behavior byte-for-byte. The subdir is required to exist — a v2 agent
+    # entry that has no ``home`` child (mid-scaffold) is skipped rather than
+    # grooming the wrong tree.
     candidates = []
     for path in sorted(target_root.iterdir()):
         if not path.is_dir():
             continue
         if path.name.startswith(".") or path.name in {"_template", "shared"}:
             continue
-        candidates.append(path)
+        if home_subdir:
+            home_path = path / home_subdir
+            if not home_path.is_dir():  # noqa: raw-pathlib-controller-only
+                continue
+            candidates.append(home_path)
+        else:
+            candidates.append(path)
     if all_agents or not selected:
         return candidates
     selected_set = set(selected)
-    return [path for path in candidates if path.name in selected_set]
+    # When descending into a subdir the agent name is the parent dir name.
+    return [
+        path
+        for path in candidates
+        if (path.parent.name if home_subdir else path.name) in selected_set
+    ]
 
 
 def collect_relative_files(base: Path, child: str) -> list[str]:
@@ -471,6 +496,22 @@ Discord/Telegram MCP가 `fetch_messages`·channel webhook으로 반환하는 tim
 - inventory/list/create/update/delete: `{home}/agent-bridge cron ...`
 - 옛 cron helper 예시는 더 이상 기준이 아니다.
 
+## Credential & Token Rotation
+Claude OAT 풀(여러 setup-token을 등록하고 하나만 active로 두는 다중 토큰 레지스트리)과 codex fleet-sync는 `{home}/agent-bridge auth` (= `bridge-auth.sh`)로 다룬다. 주간 한도/429 쿼터/토큰 로테이션 신호가 보이면 이 verb들을 먼저 본다.
+
+- pool 상태 확인: `{home}/agent-bridge auth claude-token list` (토큰 id·fingerprint만 노출, 토큰값은 안 나옴)
+- active 전환: `{home}/agent-bridge auth claude-token activate <id> --sync`
+- 자동 로테이션: `{home}/agent-bridge auth claude-token auto-rotate enable|disable|status [--threshold 99]` (기본 threshold 99%)
+- 수동 로테이션: `{home}/agent-bridge auth claude-token rotate --reason <text> --sync`
+- 쿼터 처리: 한도 친 토큰은 `{home}/agent-bridge auth claude-token mark-quota <id> [--reset-at <iso>]`로 빼두고, reset 이후 `recover-due`가 재검증해 복구한다
+- 헬스 체크: `{home}/agent-bridge auth claude-token check <id> --disable-on-quota --enable-on-ok`
+- codex fleet-sync: `{home}/agent-bridge auth codex-cred register|source|sync|verify`
+
+caveats:
+- **계정 경계.** 로테이션이 *주간* 한도를 실제로 넘기려면 토큰이 **서로 다른 계정** 소속이어야 한다(쿼터는 account-level). 같은 계정의 토큰만 풀에 있으면 로테이션해도 같은 한도에 막힌다.
+- **토큰=시크릿.** 등록은 `--stdin` / `--token-file` (또는 운영자 터미널 전용 echo-off `receive`)로만 넣는다. 절대 argv·env·채팅·큐 본문에 토큰값을 인라인하지 않는다.
+- 운영 런북(주간 한도/쿼터 소진 시 대응)은 `OPERATIONS.md`의 "Claude setup-token registry and rotation", 전체 설계는 `docs/design/fleet-credential-design.md`를 본다.
+
 ## Ops Recipes (intent → command)
 에이전트가 운영 점검 명령을 반복적으로 잘못 추측해서 blocked 된 사례가 있다(issue #163). 이름을 처음부터 찾는 대신 아래 의도→명령 매핑을 먼저 본다.
 
@@ -486,6 +527,7 @@ Discord/Telegram MCP가 `fetch_messages`·channel webhook으로 반환하는 tim
 | 메모리 위키 정합성 점검 | `{home}/agent-bridge memory lint --agent <agent>` |
 | 다른 에이전트로 작업 넘기기 | `{home}/agent-bridge task create --to <agent> ...` |
 | 긴급 인터럽트 | `{home}/agent-bridge urgent <agent> "..."` |
+| 토큰 풀/로테이션 확인 | `{home}/agent-bridge auth claude-token list` / `auto-rotate status` |
 
 CLI가 모르는 이름을 추측하면 `혹시 이 명령이었나요?` 힌트가 함께 뜬다. 자주 빗맞는 케이스(`health`, `diag`, `cron stats`, `cron list --failed`, `ps`, `agents`, `task stats`)는 `lib/bridge-core.sh`의 `bridge_suggest_subcommand` curated alias 테이블에 이미 들어 있다.
 
@@ -1268,6 +1310,7 @@ def render_agent_bridge_block(agent_dir: Path, session_type: str | None = None) 
         "- artifact가 같이 가야 하는 cross-agent handoff는 free-text task body 대신 `agent-bridge bundle create`를 우선한다.",
         "- 사람에게 보이는 Discord/Telegram 응답은 연결된 Claude 세션 안에서 처리한다. direct-send CLI는 기본 경로가 아니다.",
         "- subagent가 필요하면 bridge-managed disposable child 또는 현재 엔진의 정식 subagent 기능을 사용한다. 옛 child-session 헬퍼는 기준이 아니다.",
+        "- 멀티스텝/장시간 작업은 main 루프에서 inline 처리하지 말고 background subagent로 위임해 사람 응답성을 유지한다. 상세 패턴은 `COMMON-INSTRUCTIONS.md`의 \"Background Subagent Delegation\"을 따른다 (background subagent 기능이 없는 엔진은 해당 없음).",
         "",
         "## Task Processing Protocol",
         "- task를 수신하면 `claim → 처리 → 결과 전달 → done` 순서로 닫는다. 상세 규칙은 `COMMON-INSTRUCTIONS.md`의 \"Task Processing Protocol\"을 따른다.",
@@ -1614,6 +1657,15 @@ def parse_args() -> argparse.Namespace:
         default=Path(os.environ.get("BRIDGE_AGENT_HOME_ROOT", str(bridge_home / "agents"))),
     )
     parser.add_argument(
+        "--home-subdir",
+        default="",
+        help=(
+            "Issue #1820: descend one level into each agent entry to reach the "
+            "v2 per-agent home (e.g. 'home' selects <target-root>/<agent>/home). "
+            "Empty (default) keeps the flat v1 layout <target-root>/<agent>."
+        ),
+    )
+    parser.add_argument(
         "--source-shared",
         type=Path,
         default=Path(os.environ.get("BRIDGE_OPENCLAW_HOME", str(Path.home() / ".openclaw"))) / "shared",
@@ -1627,7 +1679,9 @@ def main() -> int:
     target_root = args.target_root.expanduser().resolve()
     source_shared = args.source_shared.expanduser().resolve()
     registry = build_skill_registry(bridge_home)
-    agent_dirs = list_agent_dirs(target_root, args.agents, args.all_agents)
+    agent_dirs = list_agent_dirs(
+        target_root, args.agents, args.all_agents, args.home_subdir
+    )
 
     if args.command == "audit":
         audits = [audit_agent(agent_dir) for agent_dir in agent_dirs]

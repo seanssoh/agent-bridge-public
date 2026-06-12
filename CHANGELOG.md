@@ -4,6 +4,41 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.16.10-rc1] — 2026-06-13
+
+**Release candidate for the next v0.16 LTS — a large reliability + migration train that closes the dynamic-agent restart footgun, makes operator plugin/setting provisioning survive recreate, and lands a gated layout-v2 four-writer migration that stops legacy installs from forking agent memory.** This is an `-rc` prerelease for fleet soak (MacBook + cm-prod edge upgrade-with-migration verification) before the v0.16.10 LTS tag. Every code lane went through the queue pair-review gate (agb-dev-codex); the two data-loss/iso-sensitive lanes (#1857 provisioning preserve, #1820 layout-v2 migration) additionally cleared the independent `patch` adversarial gate, which across four rounds caught real defects the internal review missed — a fleet-default class-a/class-b taxonomy downgrade (`@../evil` empty-half + traversal), a foreign-symlink **ancestor** write-escape in the reconciler, and an upgrade dispatch that declared success after a reconcile refusal. The `#1838` tool-policy lane was likewise caught by CI before merge — a heredoc-body exclusion had opened a spoofed-admin peer-write bypass (#1806 Tooth1). `agb upgrade` is the same path; the layout-v2 migration runs as one gated, fail-closed, daemon-down step with both-side backups and a v1→v2 reconciliation that never strands or double-writes memory.
+
+### Fixed — dynamic agent lifecycle
+
+- **`agent restart <dynamic>` relaunches instead of deregistering + quarantining the transcript (#1852).** Restart killed the session, then the relaunch leg resolved against static roles only, the dynamic was fully deregistered (roster + active-env gone), and the abrupt kill left a resume-unsafe transcript that got quarantined. Restart now detects `source=dynamic`, re-materializes the active-env after every post-kill refresh, and relaunches via the same `--replace` path — or fails closed before any kill when the recorded metadata can't reconstruct the launch.
+- **Self-restart survives (#1853).** `agent restart <self>` from inside the target session killed the process running the restart before the relaunch ran; it now detaches the relaunch so the survivor completes the marker→kill→relaunch, preserving #981/#1769 resume; degrades to fail-closed where no detach facility exists.
+- **Per-agent provisioning is preserved across dynamic recreate/`--replace` (#1857).** Recreate dropped operator `enabledPlugins`/`statusLine` despite PRESERVED_USER_KEYS, reset `installed_plugins.json`, and lost skill carriers. The `--replace` path now applies the preserve fold, merges (not resets) the plugin manifest, records provenance in a bridge-owned ledger, and converges `channel-declared ∪ fleet-default ∪ existing` on every launch; malformed fleet-default tokens class-a skip+warn while traversal/reserved fail closed, and a brownfield no-channel agent snapshots before its first wipe.
+
+### Fixed — layout-v2 migration & drift
+
+- **Four runtime writers no longer target the v1 agent tree, with a gated v1→v2 reconciliation (#1820).** The cron memory writer, PreCompact HOME/WORKDIR fallback, per-agent settings render, and doc-sync target all resolved to the v1 `agents/<a>` tree, forking agent memory daily on installs past the v0.8 layout cut. All four now resolve v2-first; a same-release reconciliation runs as one fail-closed, daemon-down, scope-locked migration with both-side backups, content-hash conflict policy (prefix/superset merge, divergent→archive+marker+queue-task, idempotent re-apply), atomic workdir-symlink retarget, and a post-apply invariant — fencing every read/copy/adopt/archive against foreign symlink ancestors (incl. broken symlinks) and refusing to write the upgrade-complete marker or restart the daemon if reconcile is refused/fails.
+
+### Fixed — iso-v2 reliability
+
+- **Queue-gateway exit-code + retry on the iso boundary (#1837, #1834)** — exit code now reflects the actual SQLite write outcome (no more false "gateway timed out" thrash), with bounded retry and position-anchored daemon-liveness.
+- **Dedicated-agent first-start death + queue-dir ownership (#1836, #1829)** — first start is deterministic and `requests/`/`responses/` are owner-correct on success, first-start-death, and rollback.
+- **cron, body-file, status, wiki on the iso boundary** — iso cron tamper-check no longer false-positives on group-write (#1842) + consecutive-failure escalation surfaces (#1843); `task create --body-file` sudo-as-owner fallback with actionable error (#1835); `agb status` health from daemon-pid liveness not gateway timeout (#1833) + Plugin Liveness wired (#1844); controller-run wiki index-rebuild and monthly/weekly summarize cross the iso boundary cleanly (#1827, #1849).
+
+### Fixed — auth, hooks, daemon, cron
+
+- **Pre-#1520 shared admins join the OAT pool (#1855)** — an upgrade-time + daemon-hygiene backfill wires the keychain-free `apiKeyHelper` contract for legacy shared admins that were silently keychain-pinned; sync flags `synced_incoherent` when a launch path can't consume the rendered credential.
+- **tool-policy cross-agent false-positives (#1822)** — quoted-heredoc bodies and top-level globs no longer false-deny admin maintenance; the heredoc-body exclusion gates on the roster-anchored `trusted_admin` predicate so a spoofed-admin peer-write still denies (#1806 preserved).
+- **ms365 delegated token keyed by authenticated claim (#1825); cron `--at` naive datetime → local tz instead of silent UTC-drop (#1826); reaper keep-audit transition-latched to cut log volume (#1797); smoke daemon-script writes pinned under `BRIDGE_HOME` so an isolated smoke can never stub the live daemon (#1860).**
+
+### Changed
+
+- Templates make background-subagent delegation the default operating pattern (#1821).
+- CI: de-flaked the daemon + kappa state-audit smokes (#1856); a residual daemon.sh loop-restart flake under heavy CI load is tracked for a follow-up hardening.
+
+### Release process
+
+- `-rc1` is a **prerelease** for fleet soak. Upgrade order: MacBook (sean-mac) `agb upgrade` **with the layout-v2 migration** (verify zero drift) → cm-prod edge → if clean, the v0.16.10 **LTS** tag. Problems found in soak → fix → `-rc2` → repeat.
+
 ## [0.16.9] — 2026-06-12
 
 **Fleet-reliability sweep from a day of live v0.16.8 field reports — headlined by the idle-reaper policy fix that was silently killing operator-created agents.** A patch on the **v0.16 LTS line** closing seven issues, every one surfaced by running v0.16.8 on real multi-agent installs the day it shipped. The marquee is a daemon GC fix: the idle dynamic-agent reaper conflated "dynamic" (creation method) with "disposable" and was reaping operator-created long-lived agents — including `loop=1` ones — confirmed as the root cause of an operator codex pair being destroyed four separate times. Every lane went through the queue pair-review gate (agb-dev-codex), with the reaper, doctor, and daemon lanes additionally gated by the independent `patch` adversarial review; the review rounds caught real defects across the train — a `#1709`-class env-assignment guard bypass, a path-traversal escape, a quarantine-bypass, an origin-spoofing hole, and several fail-safe-direction misses. **Every v0.16.x release is an LTS release** — v0.16.9 supersedes v0.16.8 as the line head. Same `agb upgrade` path; all changes are fix-class or guard-tightening and degrade safe.

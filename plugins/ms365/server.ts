@@ -56,6 +56,7 @@ import {
 import {
   chmodSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -287,7 +288,90 @@ type CallbackFile = {
 }
 
 function slugUpn(upn: string): string {
-  return upn.replace(/[^A-Za-z0-9._-]/g, '_').toLowerCase()
+  // Defense in depth (#1825): collapse any `..` run AFTER the charset
+  // filter so a claim of `..` / `a..b` can never form a path component.
+  // The charset filter already strips `/` and `\`, so the slug is confined
+  // to TOKENS_DIR; this extra pass neutralizes dot-traversal shapes too.
+  return upn
+    .replace(/[^A-Za-z0-9._-]/g, '_')
+    .replace(/\.{2,}/g, '_')
+    .toLowerCase()
+}
+
+// Issue #1825 -----------------------------------------------------------
+// Behind a single shared bot app, pair_start only has the opaque Teams
+// `aadObjectId` (the real UPN is unknown until after sign-in). The durable
+// token key/filename + the token's `upn` field must end up as the REAL,
+// AUTHENTICATED UPN (downstream the approvals plugin reads identity from
+// the token filename / `upn` field). So at pair_poll success we derive the
+// identity from the *verified token claim* — never from the unvalidated
+// `pair_start` input — and key the token by that claim.
+//
+// The id_token returned by the authorization_code grant is minted by Azure
+// AD for our own client; its `preferred_username` (v2) / `upn` claim is the
+// authenticated principal. We decode the JWT payload locally for the key;
+// the token itself is never re-verified here (the secure channel to the
+// /token endpoint + our client_secret is the trust anchor — same as the
+// access_token we just received). A Graph `/me` fallback covers the rare
+// case where no id_token came back (e.g. an operator scope set without
+// `openid`).
+function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
+  const parts = String(jwt).split('.')
+  if (parts.length < 2) return null
+  try {
+    const json = Buffer.from(parts[1], 'base64url').toString('utf8')
+    const obj = JSON.parse(json)
+    return obj && typeof obj === 'object' ? (obj as Record<string, unknown>) : null
+  } catch {
+    return null
+  }
+}
+
+// A UPN claim is only accepted as a durable key when it is UPN-shaped
+// (`local@domain`, no whitespace, no path separators or traversal dots).
+// Anything else is rejected so a malformed/forged claim cannot determine
+// the key — pairing then falls back to the opaque pair_start input.
+function normalizeClaimedUpn(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  const s = raw.trim()
+  if (!s) return null
+  // UPN shape: exactly one `@`, non-empty local + domain, no whitespace,
+  // no `/` `\` and no `..` traversal run.
+  if (!/^[^\s@/\\]+@[^\s@/\\]+$/.test(s)) return null
+  if (s.includes('..')) return null
+  return s
+}
+
+// Extract the authenticated UPN from an id_token claim. Prefers the v2
+// `preferred_username`, falls back to the v1 `upn` claim. Returns the
+// UPN-validated string or null.
+function claimUpnFromIdToken(idToken: unknown): string | null {
+  if (typeof idToken !== 'string' || !idToken) return null
+  const payload = decodeJwtPayload(idToken)
+  if (!payload) return null
+  return (
+    normalizeClaimedUpn(payload.preferred_username) ??
+    normalizeClaimedUpn(payload.upn)
+  )
+}
+
+// Graph `/me` fallback for the authenticated UPN, used only when the
+// token-endpoint response carried no id_token to decode. Calls Graph with
+// the freshly-minted access_token directly (the token is not yet keyed in
+// the store, so we cannot route through getAccessToken/graph()). Returns a
+// UPN-validated string or null; any failure degrades to the opaque key.
+async function claimUpnFromGraph(accessToken: string): Promise<string | null> {
+  try {
+    const res = await fetch(
+      'https://graph.microsoft.com/v1.0/me?$select=userPrincipalName',
+      { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' } },
+    )
+    if (!res.ok) return null
+    const data: any = await res.json().catch(() => null)
+    return normalizeClaimedUpn(data?.userPrincipalName)
+  } catch {
+    return null
+  }
 }
 
 function tokenPath(upn: string): string {
@@ -354,14 +438,35 @@ function loadJson<T>(path: string): T | null {
   }
 }
 
+// Issue #1825: when no explicit upn is passed AND MS365_DEFAULT_UPN is not
+// configured, resolve the default to the single stored token's keyed UPN.
+// After a shared-bot pairing the token is keyed by the authenticated real
+// UPN; this lets default-UPN tool calls pick it up WITHOUT a listener
+// restart (DEFAULT_UPN is read from process.env once at startup). Only the
+// unambiguous single-token case is auto-resolved — an explicit
+// MS365_DEFAULT_UPN always wins, and zero/multiple tokens fall through to
+// the original "upn is required" error (no silent wrong-user binding).
+function singleStoredUpn(): string | null {
+  let files: string[]
+  try {
+    files = readdirSync(TOKENS_DIR).filter(f => f.endsWith('.json') && !f.endsWith('.tmp'))
+  } catch {
+    return null
+  }
+  if (files.length !== 1) return null
+  const tok = loadJson<TokenFile>(join(TOKENS_DIR, files[0]))
+  const upn = tok?.upn?.trim()
+  return upn ? upn : null
+}
+
 function resolveUpn(arg: unknown): string {
   const s = (arg == null ? DEFAULT_UPN : String(arg)).trim()
-  if (!s) {
-    throw new Error(
-      'upn is required (no default configured; pass upn or set MS365_DEFAULT_UPN in .env)',
-    )
-  }
-  return s
+  if (s) return s
+  const sole = singleStoredUpn()
+  if (sole) return sole
+  throw new Error(
+    'upn is required (no default configured; pass upn or set MS365_DEFAULT_UPN in .env)',
+  )
 }
 
 async function postForm(
@@ -488,18 +593,33 @@ async function exchangeAuthCode(
       description: JSON.stringify(redactResponseBody(data)).slice(0, 400),
     }
   }
+  // Issue #1825: key the durable token by the AUTHENTICATED claim, not the
+  // opaque `pair_start` input. Derive the real UPN from the verified
+  // id_token claim (preferred_username / upn); fall back to Graph /me with
+  // the fresh access_token; degrade to the opaque input only if both fail
+  // (never block pairing). This eliminates the post-pair re-key/mv/restart
+  // dance — a single pairing with an opaque key yields a correctly-keyed
+  // token whose filename + `upn` field are the real UPN.
+  const authUpn =
+    claimUpnFromIdToken(data.id_token) ??
+    (await claimUpnFromGraph(data.access_token)) ??
+    upn
   const token: TokenFile = {
-    upn,
+    upn: authUpn,
     access_token: data.access_token,
     refresh_token: data.refresh_token,
     expires_at: now + Number(data.expires_in ?? 3600),
     scope: String(data.scope ?? pending.scopes),
     saved_at: now,
   }
-  saveJson(tokenPath(upn), token)
-  // Issue #1343: a fresh successful pairing clears any prior
-  // token_expired marker so the channel stops reporting needs_reauth.
-  clearTokenExpired(upn)
+  saveJson(tokenPath(authUpn), token)
+  // Issue #1343: a fresh successful pairing clears any prior token_expired
+  // marker so the channel stops reporting needs_reauth. Clear it under BOTH
+  // the authenticated key and the opaque pair_start key (a re-key onboarding
+  // may have left a stale opaque-keyed marker).
+  clearTokenExpired(authUpn)
+  if (authUpn !== upn) clearTokenExpired(upn)
+  // The pending/callback handles are keyed by the opaque pair_start input.
   try { unlinkSync(pendingPath(upn)) } catch {}
   try { unlinkSync(callbackPath(pending.state)) } catch {}
   return { status: 'success', token }
@@ -854,12 +974,20 @@ const tools: ToolDef[] = [
       },
     },
     handler: async args => {
-      const upn = resolveUpn(args.upn)
-      const result = await exchangeAuthCode(upn)
+      const requestedUpn = resolveUpn(args.upn)
+      const result = await exchangeAuthCode(requestedUpn)
       if (result.status === 'success') {
+        // Issue #1825: the token is keyed by the AUTHENTICATED claim
+        // (result.token.upn), which may differ from the opaque input
+        // passed to pair_start. Report the durable key so the caller does
+        // not have to re-derive it from the filesystem.
+        const keyedUpn = result.token.upn
         return textResult({
           status: 'success',
-          upn,
+          upn: keyedUpn,
+          ...(keyedUpn !== requestedUpn
+            ? { requested_upn: requestedUpn, rekeyed: true }
+            : {}),
           scope: result.token.scope,
           expires_in_seconds: result.token.expires_at - Math.floor(Date.now() / 1000),
           has_refresh_token: Boolean(result.token.refresh_token),

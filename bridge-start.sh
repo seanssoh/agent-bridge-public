@@ -523,6 +523,21 @@ if [[ $WORK_DIR_PRESENT -eq 0 ]]; then
   fi
 fi
 
+# Issue #1829: idempotent queue-dir ownership repair on every start. A
+# first-start-death + restart-rollback can strand `requests/`/`responses/` as
+# `<controller>:<controller> 2770` instead of the iso-v2 contract
+# `agent-bridge-<agent>:ab-agent-<agent> 2770`, cutting the iso UID off from
+# EVERY `agb` gateway verb (it cannot write requests / read responses). Start
+# never re-ran the prepare normalizer, so the strand could persist until a
+# manual `agb migrate isolation v2 --apply`. Re-assert the two dirs here:
+# stat-skip makes the correctly-provisioned common case free, and a stranded
+# dir self-heals on the next start. Non-fatal — a warn, never a launch abort.
+if bridge_agent_linux_user_isolation_effective "$AGENT" \
+   && declare -f bridge_isolation_v2_repair_queue_dirs >/dev/null 2>&1; then
+  bridge_isolation_v2_repair_queue_dirs "$AGENT" \
+    || bridge_warn "isolation v2 (#1829): queue-dir ownership repair for '$AGENT' returned non-zero; the agent may still be cut off from \`agb\` gateway verbs. Run \`agb migrate isolation v2 --apply\` if \`agb inbox\` tracebacks." 2>/dev/null || true
+fi
+
 # Issue #1417 — sync-on-start identity reconciliation. For a managed-project
 # agent (workdir != home) `agent create` materializes the HOME identity files
 # into the workdir once; a later hand-edit of the HOME copy never propagates,

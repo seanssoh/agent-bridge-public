@@ -978,8 +978,14 @@ bridge_cron_run_dir_grant_isolation() {
   #
   # 1. Directory access: umask 077 in bridge-lib.sh strips all group bits at
   #    mkdir time, leaving drwx--S--- (2700). The isolated agent UID (in
-  #    ab-shared via parent setgid) has zero access. chmod 2770 restores
-  #    drwxrws--- so the isolated UID can traverse and write.
+  #    ab-shared via parent setgid) has zero access. chmod 3770 restores
+  #    drwxrws--T (setgid + STICKY) so the isolated UID can traverse and write
+  #    its own sidecars, but the sticky bit stops a group member from
+  #    renaming/unlinking entries it does not own — in particular it cannot
+  #    swap the controller-owned request.json for one of its own (#1842 codex
+  #    r2 TOCTOU defense-in-depth; the runner's tamper-check exemption also
+  #    REQUIRES this sticky bit, so a non-sticky group-writable dir stays
+  #    terminal tamper).
   #
   # 2. File readability: files written by the isolated agent inside the dir
   #    also inherit umask 077, landing at 0600 (owner-only). The controller
@@ -1009,9 +1015,9 @@ bridge_cron_run_dir_grant_isolation() {
     return 0
   fi
   # Bind the leaf to the target's per-agent group (e.g. ab-agent-<X>) before
-  # chmod 2770. Without this chgrp the leaf inherits the controller primary
+  # chmod 3770. Without this chgrp the leaf inherits the controller primary
   # group (umask 077 + non-setgid parent), which the isolated UID is not in;
-  # group=2770 would then be useless. The chgrp confines access to
+  # group=3770 would then be useless. The chgrp confines access to
   # controller + the target's isolated UID — and only them. ab-shared on the
   # parents lets isolated UIDs TRAVERSE but not read other agents' run dirs.
   if declare -F bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
@@ -1021,7 +1027,12 @@ bridge_cron_run_dir_grant_isolation() {
       chgrp "$agent_grp" "$run_dir" 2>/dev/null || return 1
     fi
   fi
-  chmod 2770 "$run_dir" 2>/dev/null || return 1
+  # 3770 = setgid + sticky + rwx for owner/group. The sticky bit (the leading
+  # 3 vs 2) is the #1842 codex-r2 TOCTOU defense-in-depth: it lets the iso UID
+  # create its own sidecars in the group-writable dir but forbids it from
+  # renaming/unlinking the controller-owned request.json, so it cannot swap in
+  # a request that retargets the run.
+  chmod 3770 "$run_dir" 2>/dev/null || return 1
   if command -v setfacl >/dev/null 2>&1; then
     setfacl -m "default:group::rw-,default:mask::rw-" "$run_dir" 2>/dev/null || true
   fi

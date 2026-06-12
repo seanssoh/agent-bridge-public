@@ -2998,6 +2998,91 @@ PY
   rm -rf "$_relink_profile_dir"
 fi
 
+# Issue #1820 — gated v1->v2 agent-data reconciliation, FAIL-CLOSED.
+#
+# This is a MANDATORY same-release migration (design verdict agb-1820, option b):
+# the four v2-aware writer fixes and this reconciliation are ONE gated surface.
+# Shipping the writer fixes (new writes go to v2) while leaving historical
+# v1-only memory UNRECONCILED strands the already-forked v1 data — the verdict's
+# FORBIDDEN partial state. So a real reconcile refusal/failure must ABORT the
+# upgrade BEFORE the upgrade-complete marker is written and BEFORE the daemon is
+# restarted/resumed — never declare success-and-resume over a stranded fork
+# (Finding 2, #1820 gate-2, patch-dev).
+#
+# Runs HERE because this is the one safe window: apply-live has deployed the four
+# writer fixes, migrate-agents has materialized the v2 agent trees, and the
+# daemon has NOT yet restarted. We quiesce the daemon ourselves so the reconcile
+# runs daemon-down-safe REGARDLESS of the --restart-daemon flag (the migration is
+# mandatory even on --no-restart-daemon; we do not gate it on RESTART_DAEMON).
+#
+# Driver exit codes (mirror bridge_layout_v2_reconcile_run):
+#   0  reconcile completed (incl. reported conflicts)         -> proceed
+#   2  legacy install / nothing-to-do (no v1 data, non-v2)    -> proceed (no-op)
+#   1  internal error  |  3  refusal (cannot prove quiesce)   -> ABORT fail-closed
+if [[ $DRY_RUN -eq 0 ]]; then
+  if [[ -f "$TARGET_ROOT/lib/bridge-layout-v2-reconcile.sh" ]]; then
+    # QUIESCE before the reconcile: stop the daemon (and its cron dispatch) so
+    # the wrapper's fail-closed fence sees a genuinely quiesced window. We do
+    # this even when --no-restart-daemon was requested — the reconcile needs the
+    # daemon down to run safely, and a --no-restart-daemon install that was
+    # already daemon-down stays down (we simply do not bring it back up below).
+    # `--force` because the upgrader is the sanctioned daemon stop path.
+    bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
+    mkdir -p "$TARGET_ROOT/state/migration" "$TARGET_ROOT/logs" 2>/dev/null || true
+    # shellcheck source=lib/bridge-layout-v2-reconcile.sh
+    BRIDGE_HOME="$TARGET_ROOT" BRIDGE_SCRIPT_DIR="$TARGET_ROOT" \
+      bash "$TARGET_ROOT"/lib/bridge-layout-v2-reconcile-driver.sh apply \
+      >"$TARGET_ROOT/state/migration/layout-v2-reconcile-upgrade.json" 2>>"$TARGET_ROOT/logs/upgrade.log"
+    _reconcile_rc=$?
+    case "$_reconcile_rc" in
+      0)
+        echo "[bridge-upgrade] layout-v2 reconcile: applied (see state/migration/layout-v2-reconcile/last-apply.json)" >&2
+        ;;
+      2)
+        echo "[bridge-upgrade] layout-v2 reconcile: nothing to do (legacy/non-v2 install or no v1-only data) — proceeding." >&2
+        ;;
+      *)
+        # Refusal (3) or internal error (1) on a v2 install with a reconcile to
+        # perform. FAIL CLOSED: do NOT write the upgrade-complete marker and do
+        # NOT restart/resume the daemon — that would mark the install healthy
+        # while forked v1 memory stays stranded. Abort the upgrade so the
+        # operator re-runs once the blocker (live writer / failure) is cleared;
+        # the writer fixes are already on disk and the reconcile is idempotent +
+        # re-runnable, and the daemon is left STOPPED (not resumed onto a
+        # partial migration).
+        {
+          echo "[bridge-upgrade] FATAL: layout-v2 reconcile FAILED/REFUSED (rc=$_reconcile_rc) on a v2 install with v1 data to migrate."
+          echo "[bridge-upgrade] This is a mandatory same-release migration; refusing to mark the upgrade complete or restart the daemon over a stranded v1->v2 memory fork."
+          echo "[bridge-upgrade] Diagnostics: state/migration/layout-v2-reconcile-upgrade.json and logs/upgrade.log."
+          echo "[bridge-upgrade] Resolve the blocker (e.g. ensure the daemon is fully stopped) and re-run the upgrade; the reconcile is idempotent. The daemon has been left STOPPED."
+        } >&2
+        # Emit a structured FAILURE marker (status=failed) so automation can
+        # distinguish this aborted upgrade from a healthy one. We do NOT reuse
+        # _bridge_upgrade_write_complete_marker here — that helper hardcodes
+        # status=ok and is the success signal; writing it would falsely report
+        # health over a stranded fork. This is a minimal pure-printf failure
+        # marker at a DISTINCT path (upgrade-reconcile-failed.json).
+        _rf_dir="$TARGET_ROOT/state/upgrade"
+        _rf_path="$_rf_dir/upgrade-reconcile-failed.json"
+        if mkdir -p "$_rf_dir" 2>/dev/null; then
+          _rf_ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+          {
+            printf '{\n'
+            printf '  "phase": "reconcile-failed",\n'
+            printf '  "status": "failed",\n'
+            printf '  "reconcile_rc": %s,\n' "$_reconcile_rc"
+            printf '  "version": "%s",\n' "${SOURCE_VERSION:-unknown}"
+            printf '  "failed_at": "%s",\n' "$_rf_ts"
+            printf '  "note": "layout-v2 v1->v2 reconcile failed/refused; upgrade aborted before marking complete or restarting the daemon. Mandatory same-release migration (#1820). Resolve the blocker and re-run; reconcile is idempotent. Daemon left stopped."\n'
+            printf '}\n'
+          } >"$_rf_path" 2>/dev/null || true
+        fi
+        exit 1
+        ;;
+    esac
+  fi
+fi
+
 # Issue #1662 — DURABLE SUCCESS MARKER + NOTICE, written BEFORE the restart
 # phase begins. On a sudo-self systemd install the upcoming daemon/systemd-unit
 # restart can cycle the INVOKING tmux session (it lives under the unit being

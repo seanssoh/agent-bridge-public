@@ -27,6 +27,7 @@ description: >-
 | 메모리 | `MEMORY-SCHEMA.md`. 팀 공유=`agent-bridge knowledge`, 개인=`agent-bridge memory`, 사용자별=`users/<id>/` |
 | 외부 push (`[Agent Bridge] event=…`) | `external-push-handling` 스킬 |
 | cron 생성·수정 | `agent-bridge cron …` (직접 crontab 금지) |
+| 사용량/주간 한도 경고·429 쿼터·토큰 로테이션·fleet 크레덴셜 동기화 | Claude OAT 풀은 `agent-bridge auth claude-token list\|activate\|auto-rotate\|mark-quota\|recover-due`, codex fleet-sync는 `agent-bridge auth codex-cred …`. 운영 런북=`OPERATIONS.md` "Claude setup-token registry and rotation", 설계 SSOT=`docs/design/fleet-credential-design.md` |
 | 변경 분류(upstream/downstream) | `CHANGE-POLICY.md` |
 | upstream issue/PR | 운영자 승인 없이 생성·`propose --yes` 금지 |
 | 인프라 장애 | `agent-bridge urgent <admin>` |

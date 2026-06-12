@@ -1784,6 +1784,56 @@ The daemon runs the probe automatically inside its usage-monitor tick
 > surface). This is the same containment posture as the rest of the
 > token-rotation path.
 
+#### Weekly-limit / quota-exhaustion runbook (operator quick reference)
+
+When a Claude account hits its weekly limit or starts returning `429`
+at-limit responses, this is the operator-side sequence (the verbs are
+detailed above; this is the short order of operations):
+
+1. **See the pool.** `agent-bridge auth claude-token list` shows the
+   registered token ids, fingerprints, and which one is active — no token
+   value is ever printed. `agent-bridge auth claude-token auto-rotate status`
+   reports whether auto-rotation is armed and the threshold.
+2. **Have a second account ready.** Rotation only crosses a *weekly* limit
+   when the next token belongs to a **different account** — quota is
+   account-level, so a pool of same-account tokens all hit the same wall.
+   Register per-account OATs (the `claude setup-token` step is interactive
+   and operator-run):
+
+   ```bash
+   claude setup-token   # interactive, operator at a terminal
+   agent-bridge auth claude-token add --id <account-b> --stdin --sync
+   ```
+
+3. **Arm auto-rotation** so the daemon's usage monitor rotates before the
+   next hard-limit instead of after a 429:
+
+   ```bash
+   agent-bridge auth claude-token auto-rotate enable --threshold 99
+   ```
+
+4. **Manual cutover** when you need it now:
+
+   ```bash
+   agent-bridge auth claude-token activate <account-b> --sync
+   # or, to pick the next eligible token by policy:
+   agent-bridge auth claude-token rotate --reason manual --sync
+   ```
+
+5. **Quota mark + recovery.** A token that hit a limit is held out of
+   rotation until its reset estimate passes. The daemon does this
+   automatically; to drive it by hand, mark the exhausted token and let the
+   recovery pass re-enable it once the reset time has elapsed:
+
+   ```bash
+   agent-bridge auth claude-token mark-quota <account-a> --reset-at <iso>
+   agent-bridge auth claude-token recover-due
+   ```
+
+The codex fleet-sync side (`agent-bridge auth codex-cred …`) and the full
+cross-engine rationale — including why true multi-engine rotation parity is
+not possible — live in [`docs/design/fleet-credential-design.md`](./docs/design/fleet-credential-design.md).
+
 ### v0.7 → v0.8 migration runbook
 
 For an isolated agent that drifted across the v0.7 → v0.8 cut:

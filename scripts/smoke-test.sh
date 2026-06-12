@@ -11887,6 +11887,12 @@ bash "$REPO_ROOT/scripts/smoke/cron-shell-runner.sh"
 log "running 1792-cron-scope-fence smoke (issue #1792)"
 bash "$REPO_ROOT/scripts/smoke/1792-cron-scope-fence.sh"
 
+# Issue #1826 — a naive cron `--at` must anchor in `--tz` (host-local when
+# omitted), preserve explicit offsets, and error loudly instead of silently
+# dropping `--tz`.
+log "running 1826-cron-at-naive-tz smoke (issue #1826)"
+bash "$REPO_ROOT/scripts/smoke/1826-cron-at-naive-tz.sh"
+
 # Issue #544 PR1 — curated bin/agb shim for isolated agents.
 log "running isolated-bin-agb smoke (issue #544 PR1)"
 log "isolated-bin-agb covers shim env-source/delegation/fallback only — live PATH injection requires isolate+restart"

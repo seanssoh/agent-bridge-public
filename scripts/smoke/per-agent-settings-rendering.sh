@@ -144,14 +144,25 @@ main() {
   # unknown-class default (1_000_000) per issue #593 back-compat.
   smoke_log "case 1: agent-A renders per-agent file with managed autoCompactWindow=1_000_000 default (#593 back-compat)"
   invoke_link_for_agent agent-a "$agent_a_workdir" "claude --model claude-opus-4-7[1m]"
-  local agent_a_effective="$agent_a_workdir/.claude/settings.effective.json"
+  # Issue #1820: under v2 (BRIDGE_AGENT_ROOT_V2 is exported by
+  # smoke_setup_bridge_home) the per-agent effective file is now rendered at the
+  # v2 layout-resolved home (`$BRIDGE_AGENT_ROOT_V2/<a>/home/.claude/...`), and
+  # the workdir settings.json symlink retargets to it. Resolve the effective
+  # path from the symlink the renderer just wrote, so the assertions follow the
+  # renderer's chosen target instead of hard-coding the (now-evidence-only) v1
+  # path. Per-agent INDEPENDENCE — the property this smoke guards — is what the
+  # resolved paths prove (agent-A and agent-B resolve to distinct files).
+  local agent_a_effective
+  agent_a_effective="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$agent_a_workdir/.claude/settings.json")"
   smoke_assert_file_exists "$agent_a_effective" "agent-A per-agent effective file rendered"
   smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A autoCompactWindow=1_000_000 (unknown class → 1M fallback, #593)"
 
   smoke_log "case 2: agent-B renders its OWN per-agent file (separate path from agent-A) with managed default"
   invoke_link_for_agent agent-b "$agent_b_workdir" "claude --model claude-opus-4-6"
-  local agent_b_effective="$agent_b_workdir/.claude/settings.effective.json"
+  local agent_b_effective
+  agent_b_effective="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$agent_b_workdir/.claude/settings.json")"
   smoke_assert_file_exists "$agent_b_effective" "agent-B per-agent effective file rendered"
+  [[ "$agent_a_effective" != "$agent_b_effective" ]] || smoke_fail "agent-A and agent-B must render to distinct per-agent effective files"
   smoke_assert_eq "1000000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B autoCompactWindow=1_000_000 (unknown class → 1M fallback, #593)"
 
   smoke_log "case 3: each agent's workdir settings.json is a symlink to its own per-agent effective file"

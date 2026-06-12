@@ -15,6 +15,14 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:  # pragma: no cover - zoneinfo ships with Python 3.9+
+    ZoneInfo = None  # type: ignore[assignment]
+
+    class ZoneInfoNotFoundError(Exception):  # type: ignore[no-redef]
+        pass
+
 
 LOCAL_TZ = datetime.now().astimezone().tzinfo
 FAMILY_RULES = (
@@ -177,6 +185,121 @@ def default_tz_name():
     if zone_name and "/" in zone_name:
         return zone_name
     return "UTC"
+
+
+def _iana_name_from_localtime_link():
+    """The IANA zone name from the `/etc/localtime` symlink, or None.
+
+    Issue #1826 (codex round 4): when `--tz` is omitted, `$TZ` is unset, and the
+    host tzinfo exposes no `.key` (common on macOS / glibc reading the
+    `/etc/localtime` symlink), neither prior source yields an IANA name and the
+    DST-aware fallback would degrade to the frozen-offset LOCAL_TZ. macOS and
+    Linux both point `/etc/localtime` at `<...>/zoneinfo/<Area>/<Zone>`, so the
+    suffix after the last `zoneinfo/` component is the IANA name.
+    """
+    if ZoneInfo is None:
+        return None
+    try:
+        target = os.path.realpath("/etc/localtime")
+    except OSError:
+        return None
+    marker = "/zoneinfo/"
+    idx = target.rfind(marker)
+    if idx == -1:
+        return None
+    candidate = target[idx + len(marker):]
+    if not candidate:
+        return None
+    try:
+        ZoneInfo(candidate)
+        return candidate
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+
+def host_iana_zone_name():
+    """The host's IANA zone name, or None when it can't be determined.
+
+    Prefer the tzinfo `.key` (set when LOCAL_TZ is a ZoneInfo), then the `TZ`
+    env var if it names a real IANA zone, then the `/etc/localtime` symlink. A
+    bare abbreviation (glibc `KST`) is NOT an IANA name and yields None so
+    callers fall back deliberately.
+    """
+    key = getattr(LOCAL_TZ, "key", None)
+    if key:
+        return key
+    tz_env = os.environ.get("TZ")
+    if tz_env and ZoneInfo is not None:
+        try:
+            ZoneInfo(tz_env)
+            return tz_env
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return _iana_name_from_localtime_link()
+
+
+def host_zone():
+    """A DST-aware tzinfo for the host wall-clock zone.
+
+    Issue #1826 (codex round 2, [P2]): `LOCAL_TZ` is captured once at import as
+    `datetime.now().astimezone().tzinfo`, which on a DST-observing host is a
+    FIXED offset for the current season (e.g. EDT -04:00 in June). Anchoring a
+    January naive `--at` against that frozen offset stores -04:00 instead of the
+    correct -05:00 (EST). Resolve the real IANA zone so the offset follows DST
+    at the *target* instant. Fall back to LOCAL_TZ only when no IANA zone is
+    determinable (then a fixed offset is the best available answer).
+    """
+    name = host_iana_zone_name()
+    if name and ZoneInfo is not None:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return LOCAL_TZ
+
+
+def local_tz_label():
+    """A faithful display name for the host wall-clock zone.
+
+    Issue #1826: `default_tz_name()` returns the literal "UTC" whenever the host
+    zone exposes no IANA `.key` and no slash-bearing abbreviation (e.g. a glibc
+    `KST`/`PST` short name) — which would mislabel an omitted-`--tz` one-shot as
+    UTC even though it was correctly anchored in the real host zone. Prefer the
+    IANA key/TZ name, then the short abbreviation, then "UTC" only as a last
+    resort.
+    """
+    name = host_iana_zone_name()
+    if name:
+        return name
+    abbrev = datetime.now().astimezone().tzname()
+    if abbrev:
+        return abbrev
+    return "UTC"
+
+
+def resolve_at_tz(name):
+    """Resolve a `--tz` name to a tzinfo for interpreting a NAIVE `--at`.
+
+    Unlike the scheduler's display-side `normalize_tz` (which silently falls
+    back to LOCAL_TZ), this MUST error loudly on an unresolvable zone: a naive
+    `--at` whose `--tz` cannot be honored is exactly the silent-drop bug from
+    Issue #1826 — the operator's intended wall-clock would be reinterpreted in
+    the host zone with no warning. An empty / missing tz means "host local",
+    resolved DST-aware via host_zone() (not the frozen-offset LOCAL_TZ).
+    """
+    if not name:
+        return host_zone()
+    if name.upper() == "UTC":
+        return timezone.utc
+    if ZoneInfo is None:
+        raise ValueError(
+            f"cannot honor --tz {name!r}: this Python build has no zoneinfo support; "
+            "pass an explicit offset in --at (e.g. 2026-06-12T13:30:00+09:00) instead"
+        )
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"invalid --tz value: {name} ({exc})") from exc
 
 
 def parse_iso_datetime(value):
@@ -1790,11 +1913,36 @@ def build_native_job_shell_payload(args, existing_payload=None, existing_executi
     return payload, {"runAsAgent": run_as_agent}
 
 
-def parse_at_datetime(value):
-    parsed = parse_iso_datetime(value)
-    if parsed is None:
+def parse_at_datetime(value, tz_name=None):
+    """Normalize a `--at` datetime to an explicit-offset isoformat string.
+
+    Returns `(normalized_string, was_naive)`. Issue #1826: a NAIVE `--at` (no
+    offset / not `Z`) is interpreted in the operator-supplied `--tz` (host-local
+    when `--tz` is omitted), NOT silently rebased to the host zone. An `--at`
+    that already carries an explicit offset (`+09:00`) or `Z` is preserved
+    exactly — only the naive case is anchored, and `was_naive` lets the caller
+    label / validate only when the tz was actually load-bearing.
+
+    The returned string always carries an explicit offset, so downstream
+    `parse_iso_datetime` / scheduler `parse_iso` only rebase it for *display*
+    and never reinterpret the absolute instant. ZoneInfo is used for the anchor,
+    so the result is DST-correct (no hand-rolled offset math).
+    """
+    if not value or not isinstance(value, str):
         raise ValueError(f"invalid --at value: {value}")
-    return parsed.isoformat(timespec="seconds")
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"invalid --at value: {value} ({exc})") from exc
+    was_naive = parsed.tzinfo is None
+    if was_naive:
+        # Naive: anchor in --tz (or host-local). resolve_at_tz errors loudly on
+        # an unresolvable zone so the request is never silently mis-scheduled.
+        parsed = parsed.replace(tzinfo=resolve_at_tz(tz_name))
+    return parsed.isoformat(timespec="seconds"), was_naive
 
 
 def resolve_native_job(records, ref):
@@ -1824,9 +1972,19 @@ def build_native_job(
 ):
     now_ms_value = now_epoch_ms()
     if at_value is not None:
+        # Issue #1826: parse_at_datetime errors loudly up-front on an unhonorable
+        # --tz for a naive --at (never written, never silently dropped), and
+        # reports whether the value was naive. For a NAIVE --at the tz is
+        # load-bearing, so we label with the operator's --tz or — when omitted —
+        # the REAL host-zone name (local_tz_label(), NOT default_tz_name(), which
+        # would mislabel a non-IANA host such as KST as UTC). For an explicit
+        # offset / `Z` the offset is authoritative and --tz is informational.
+        at_iso, _at_was_naive = parse_at_datetime(at_value, tz_name)
+        at_tz_label = tz_name or local_tz_label()
         schedule = {
             "kind": "at",
-            "at": parse_at_datetime(at_value),
+            "at": at_iso,
+            "tz": at_tz_label,
         }
     else:
         schedule = {
@@ -1998,6 +2156,25 @@ def run_native_create(args):
     )
 
     print(f"created native cron job {job_id} for {args.agent}")
+    # Issue #1826: echo the resolved one-shot instant in BOTH the schedule-local
+    # zone and UTC so the operator can confirm the wall-clock time at a glance
+    # (a naive --at silently interpreted in the wrong zone was the whole bug).
+    schedule = job.get("schedule") or {}
+    if schedule.get("kind") == "at":
+        # The stored `at` string already carries the offset it was anchored
+        # with, so its own wall-clock IS the schedule-local time — no need to
+        # re-resolve the tz label (which may be a bare abbreviation like `KST`).
+        try:
+            local_dt = datetime.fromisoformat(schedule.get("at", ""))
+        except (TypeError, ValueError):
+            local_dt = None
+        if local_dt is not None and local_dt.tzinfo is not None:
+            tz_label = schedule.get("tz") or local_tz_label()
+            utc_dt = local_dt.astimezone(timezone.utc)
+            print(
+                f"  next_run: {local_dt.isoformat(timespec='seconds')} ({tz_label})"
+                f"  |  {utc_dt.isoformat(timespec='seconds')} (UTC)"
+            )
     return 0
 
 
@@ -2023,9 +2200,28 @@ def run_native_update(args):
     agent = args.agent or existing.get("agentId") or existing.get("agent") or record["agent"]
     schedule = existing.get("schedule") or {}
     schedule_kind = schedule.get("kind") or "cron"
+    # Issue #1826 (codex r2, [P1]): decide the tz fallback by the kind this
+    # invocation PRODUCES, not the existing job's kind. A new `--at` always
+    # produces an `at` schedule (even converting a cron job to a one-shot); an
+    # existing at-job stays one unless a new `--schedule` is given.
+    producing_at = args.at is not None or (schedule_kind == "at" and args.schedule is None)
     schedule_expr = args.schedule or (schedule.get("expr") if schedule_kind == "cron" else "") or ""
     at_value = args.at or (schedule.get("at") if schedule_kind == "at" else None)
-    tz_name = args.tz or schedule.get("tz") or default_tz_name()
+    # tz fallback for the resulting schedule:
+    #   - new --at (re-anchor): only carry an EXPLICIT --tz forward; a naive --at
+    #     with no --tz re-anchors in the real DST-aware host zone. Never re-inject
+    #     the existing label / default_tz_name() to RE-ANCHOR a new naive --at.
+    #   - existing at-job, no new --at (codex r2, [P2]): preserve the stored tz
+    #     label. The stored `at` keeps its own offset (re-parse is idempotent), so
+    #     a title-only edit must NOT clobber `schedule.tz` to the host zone.
+    #   - cron schedule: prior fallback chain.
+    if producing_at:
+        if args.at is not None:
+            tz_name = args.tz
+        else:
+            tz_name = args.tz or schedule.get("tz")
+    else:
+        tz_name = args.tz or schedule.get("tz") or default_tz_name()
     requested_kind = args.kind
     shell_fields_present = any(
         value is not None
@@ -3413,7 +3609,11 @@ def build_parser():
     native_create_parser.add_argument("--run-as-agent")
     native_create_parser.add_argument("--timeout", type=int)
     native_create_parser.add_argument("--output-cap", type=int)
-    native_create_parser.add_argument("--tz", default=default_tz_name())
+    # Issue #1826: default to None (not default_tz_name()) so the `at` branch can
+    # distinguish an OMITTED --tz (anchor a naive --at in the real host LOCAL_TZ)
+    # from an EXPLICIT one. The cron branch still falls back to default_tz_name()
+    # when tz is falsy, so recurring-schedule behavior is unchanged.
+    native_create_parser.add_argument("--tz", default=None)
     native_create_parser.add_argument("--actor")
     native_create_parser.add_argument("--disabled", action="store_true")
     native_create_parser.add_argument("--delete-after-run", action="store_true")

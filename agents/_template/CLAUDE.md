@@ -27,6 +27,7 @@
 - 사람에게 보이는 Discord/Telegram 응답은 연결된 Claude 세션 안에서 처리한다. direct-send CLI는 기본 경로가 아니다.
 - noisy external input를 다른 역할로 넘길 때는 raw capture를 남기고 `agent-bridge intake triage --route`를 사용한다. raw source 없이 free-text task만 보내지 않는다.
 - subagent가 필요하면 bridge-managed disposable child 또는 현재 엔진의 정식 subagent 기능을 사용한다. 옛 child-session 헬퍼는 기준이 아니다.
+- 멀티스텝/장시간 작업은 main 루프에서 inline 처리하지 말고 background subagent로 위임해 사람 응답성을 유지한다. 상세 패턴은 `COMMON-INSTRUCTIONS.md`의 "Background Subagent Delegation"을 따른다 (background subagent 기능이 없는 엔진은 해당 없음).
 
 ## Task Processing Protocol
 - task를 수신하면 `claim → 처리 → 결과 전달 → done` 순서로 닫는다. 상세 규칙은 `COMMON-INSTRUCTIONS.md`의 "Task Processing Protocol"을 따른다.
@@ -90,6 +91,13 @@
 - 반복 가치가 있는 사실만 `MEMORY.md` 또는 사용자별 `MEMORY.md`로 승격한다.
 - 사람이 별도 명령을 외우지 않아도, 자연어 대화 중 장기적으로 유용한 사실이나 선호가 나오면 에이전트가 판단해서 `memory-wiki` skill을 따라 `agent-bridge memory remember` 또는 `capture -> ingest -> promote` 흐름으로 반영할 수 있다.
 - 세션 종료 전 현재 상태와 다음 액션을 남김
+
+## 백그라운드 위임 (Delegation Default)
+- 멀티스텝/장시간 작업은 background subagent로 위임하고, main 세션은 사람에게 응답 가능한 상태를 유지한다.
+- 집중 작업 중 들어온 인터럽트(queue nudge, cron follow-up)는 main 루프를 끊지 말고 subagent로 위임한다.
+- 사람-facing 답변, 승인 판단, 에스컬레이션은 위임하지 않는다 — main 세션이 직접 한다.
+- queue는 main이 소유한다: `claim` → subagent 처리 → main이 결과 검증 → `done --note`. 검증 책임은 위임되지 않는다.
+- 불필요한 fan-out 금지 (token pool은 fleet 공유). 상세 패턴과 model 상속 비용 메모는 `COMMON-INSTRUCTIONS.md`의 "Background Subagent Delegation"을 따른다. 런타임에 background subagent 기능이 없으면(예: Codex CLI) 이 섹션은 적용하지 않는다.
 
 ## 규칙
 - <반드시 지킬 운영 규칙>
