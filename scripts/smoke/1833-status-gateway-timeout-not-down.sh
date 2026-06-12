@@ -43,8 +43,9 @@ cleanup() {
     kill "$FAKE_DAEMON_PID" 2>/dev/null || true
     wait "$FAKE_DAEMON_PID" 2>/dev/null || true
   fi
-  # Restore readability so the temp-root cleanup can delete the tree.
-  chmod 0644 "$BRIDGE_DAEMON_PID_FILE" 2>/dev/null || true
+  # Restore readability so the temp-root cleanup can delete the tree. Guarded
+  # expansion: the EXIT trap can fire before setup exported the path.
+  chmod 0644 "${BRIDGE_DAEMON_PID_FILE:-}" 2>/dev/null || true
   smoke_cleanup_temp_root
 }
 
