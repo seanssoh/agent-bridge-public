@@ -12083,6 +12083,14 @@ bash "$REPO_ROOT/scripts/smoke/dynamic-launch-no-admin-fallback.sh"
 log "running classify-stale-dynamic-exemption smoke"
 bash "$REPO_ROOT/scripts/smoke/classify-stale-dynamic-exemption.sh"
 
+# Issue #1844: bridge-status.py's Plugin Liveness section rendered
+# "<channel>=unknown" for every agent on every host because the probe
+# was never wired (plugins_for_agent hardcoded "status": "unknown").
+# Guard the now-wired discord-relay probe + the "omit when no probe"
+# contract so a future refactor cannot regress to all-unknown rows.
+log "running 1844-plugin-liveness-probe smoke"
+bash "$REPO_ROOT/scripts/smoke/1844-plugin-liveness-probe.sh"
+
 # bridge_export_env_prefix was re-exporting BRIDGE_LAYOUT and
 # BRIDGE_DATA_ROOT from the parent process into every spawned child
 # (patch ticket #4725, 2026-05-16). On a v2-migrated install, parents

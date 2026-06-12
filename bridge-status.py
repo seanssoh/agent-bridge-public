@@ -852,18 +852,129 @@ def plugin_identity(item: str) -> tuple[str, str, str]:
     return name, marketplace, f"plugin:{spec}"
 
 
-def plugins_for_agent(row: dict[str, str]) -> list[dict[str, object]]:
+# Discord-relay liveness is considered "stale" once the relay's last poll for a
+# channel is older than this. The relay polls on the daemon cadence (well under a
+# minute on a live host), so a multi-minute gap means the relay loop is wedged or
+# the daemon stopped scheduling it.
+DISCORD_RELAY_STALE_SECONDS = 300
+
+
+def _coerce_ts(value: object) -> int:
+    """Best-effort int() of a relay-state timestamp; 0 on any malformed value.
+
+    OverflowError covers a JSON ``1e400`` that parses to ``float('inf')``;
+    TypeError/ValueError cover non-numeric strings, dicts, and ``NaN``-ish text.
+    """
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def discord_liveness_by_agent(state_dir: str) -> dict[str, dict[str, object]]:
+    """Probe per-agent Discord-relay liveness from ``discord-relay.json``.
+
+    The relay writes one entry per watched channel keyed by channel id, each
+    carrying the owning ``agent`` plus ``last_seen_ts`` (last successful poll)
+    and ``last_error_ts`` / ``last_suppressed_reason`` (issue markers set by
+    ``note_relay_issue`` in bridge-discord-relay.py). We collapse a channel into
+    a single per-agent verdict; when an agent owns several channels the worst
+    status wins so a single wedged channel is not masked by a healthy sibling.
+
+    Returns a map ``agent -> {"status": <ok|stale|issue>, ...}``. An empty map
+    (no relay file / unreadable) means "no probe signal" and the caller omits
+    the plugin rather than emitting a permanent ``unknown`` row.
+    """
+    if not state_dir:
+        return {}
+    path = Path(state_dir) / "discord-relay.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    channels = payload.get("channels") if isinstance(payload, dict) else None
+    if not isinstance(channels, dict):
+        return {}
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    rank = {"ok": 0, "stale": 1, "issue": 2}
+    out: dict[str, dict[str, object]] = {}
+    for channel_state in channels.values():
+        if not isinstance(channel_state, dict):
+            continue
+        agent = str(channel_state.get("agent") or "").strip()
+        if not agent:
+            continue
+        # Coerce defensively: discord-relay.json is local runtime state, but a
+        # truncated/partial write or hand-edit can leave a non-numeric
+        # timestamp. Treat a malformed value as 0 (missing poll) rather than
+        # letting it crash the whole dashboard + --json render.
+        last_seen = _coerce_ts(channel_state.get("last_seen_ts"))
+        last_error = _coerce_ts(channel_state.get("last_error_ts"))
+        reason = str(channel_state.get("last_suppressed_reason") or "").strip()
+        if last_error and last_error >= last_seen:
+            status = "issue"
+            detail = reason or "relay_error"
+        elif not last_seen:
+            status = "stale"
+            detail = "no_poll"
+        elif now_ts - last_seen > DISCORD_RELAY_STALE_SECONDS:
+            status = "stale"
+            detail = f"age={now_ts - last_seen}s"
+        else:
+            status = "ok"
+            detail = ""
+        candidate: dict[str, object] = {
+            "status": status,
+            "detail": detail,
+            "last_seen_ts": last_seen,
+        }
+        prior = out.get(agent)
+        if prior is None or rank[status] > rank[str(prior["status"])]:
+            out[agent] = candidate
+    return out
+
+
+def plugin_liveness_sources(state_dir: str) -> dict[str, dict[str, dict[str, object]]]:
+    """Build the channel-type -> agent -> probe-result map the renderer/JSON
+    both consume. Each top-level key is a plugin name (e.g. ``discord``) that
+    has a real liveness probe; channel types absent from this map stay silent.
+    """
+    return {"discord": discord_liveness_by_agent(state_dir)}
+
+
+def plugins_for_agent(
+    row: dict[str, str],
+    liveness: dict[str, dict[str, dict[str, object]]] | None = None,
+) -> list[dict[str, object]]:
+    """Build the per-agent plugin liveness list for the dashboard and JSON.
+
+    ``liveness`` maps channel type -> agent -> probe result. Plugins whose
+    channel type has a real probe get the probed status; plugins with no probe
+    source are omitted entirely (the issue's "make it real or make it silent"
+    contract) rather than emitting a permanent ``unknown`` row.
+    """
+    liveness = liveness or {}
+    agent = str(row.get("agent") or "")
     plugins: list[dict[str, object]] = []
     for item in configured_plugin_items(row):
         name, marketplace, plugin_id = plugin_identity(item)
-        plugins.append(
-            {
-                "name": name,
-                "id": plugin_id,
-                "marketplace": marketplace,
-                "status": "unknown",
-            }
-        )
+        probe = liveness.get(name, {}).get(agent)
+        if probe is None:
+            # No probe wired for this channel type — stay silent instead of
+            # shipping a meaningless "unknown" row (issue #1844).
+            continue
+        entry: dict[str, object] = {
+            "name": name,
+            "id": plugin_id,
+            "marketplace": marketplace,
+            "status": str(probe.get("status") or "unknown"),
+        }
+        detail = str(probe.get("detail") or "")
+        if detail:
+            entry["detail"] = detail
+        if probe.get("last_seen_ts"):
+            entry["last_seen_ts"] = probe["last_seen_ts"]
+        plugins.append(entry)
     return plugins
 
 
@@ -1532,8 +1643,9 @@ def render_dashboard(args: argparse.Namespace) -> str:
             or int(metrics.get(row["agent"], {}).get("blocked_count", 0) or 0) > 0
         ]
 
+    plugin_liveness = plugin_liveness_sources(args.bridge_state_dir)
     plugins_by_agent = {
-        row["agent"]: plugins_for_agent(row)
+        row["agent"]: plugins_for_agent(row, plugin_liveness)
         for row in roster
     }
     visible_agents = len(roster)
@@ -1679,28 +1791,52 @@ def render_dashboard(args: argparse.Namespace) -> str:
         if len(channel_warning_rows) > 8:
             lines.append(f"- ... +{len(channel_warning_rows) - 8} more")
 
-    plugin_lines: list[str] = []
+    # Issue #1844: rows are now built from real probe status (unknown plugins
+    # are omitted upstream in plugins_for_agent), so the section only prints
+    # when there is genuine signal. Non-ok rows sort first so the actionable
+    # ones survive the truncation cap, and --all-plugins / the configurable
+    # limit give the text view an escape hatch the old fixed +N more hid.
+    status_rank = {"issue": 0, "stale": 1, "ok": 2}
+    plugin_entries: list[tuple[int, str]] = []
     for row in roster:
         plugins = plugins_by_agent.get(row["agent"], [])
         if not plugins:
             continue
         rendered = []
+        worst = max(
+            (status_rank.get(str(p.get("status")), 3) for p in plugins),
+            default=3,
+        )
         for plugin in plugins:
             name = str(plugin.get("name") or plugin.get("id") or "plugin")
             status = str(plugin.get("status") or "unknown")
             extra = ""
+            detail = str(plugin.get("detail") or "")
+            if detail:
+                extra = f"({detail})"
             if plugin.get("token_hash"):
                 clients = plugin.get("connected_clients", 0)
-                extra = f" hash={plugin['token_hash']} clients={clients}"
+                extra += f" hash={plugin['token_hash']} clients={clients}"
             rendered.append(f"{name}={status}{extra}")
         if rendered:
-            plugin_lines.append(f"- {row['agent']}: {', '.join(rendered)}")
-    if plugin_lines:
+            plugin_entries.append(
+                (worst, f"- {row['agent']}: {', '.join(rendered)}")
+            )
+    if plugin_entries:
+        # Stable sort: non-ok (lower rank) first, roster order within a rank.
+        plugin_entries.sort(key=lambda item: item[0])
+        plugin_lines = [text for _, text in plugin_entries]
         lines.append("")
         lines.append("Plugin Liveness")
-        lines.extend(plugin_lines[:12])
-        if len(plugin_lines) > 12:
-            lines.append(f"- ... +{len(plugin_lines) - 12} more")
+        limit = max(1, int(args.plugin_liveness_limit))
+        if args.all_plugins or len(plugin_lines) <= limit:
+            lines.extend(plugin_lines)
+        else:
+            lines.extend(plugin_lines[:limit])
+            lines.append(
+                f"- ... +{len(plugin_lines) - limit} more "
+                f"(run with --all-plugins or status --json for the full list)"
+            )
 
     # #1405: A2A receiver health row — rendered only when handoff.local.json
     # exists (silent on non-A2A installs, the common case). Surfaces the
@@ -1749,6 +1885,9 @@ def render_dashboard(args: argparse.Namespace) -> str:
 
 def render_dashboard_json(args: argparse.Namespace) -> str:
     roster = read_roster(args.roster_snapshot)
+    # Issue #1844: JSON consumers always get the full, real per-plugin status
+    # (no truncation) so tooling can see down/stale channels the text view caps.
+    plugin_liveness = plugin_liveness_sources(args.bridge_state_dir)
     queue_db = Path(args.db)
     daemon_running, daemon_pid = daemon_status(
         args.daemon_pid_file,
@@ -1814,7 +1953,7 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
                     source=str(row.get("source", "")) or None,
                 ),
             },
-            "plugins": plugins_for_agent(row),
+            "plugins": plugins_for_agent(row, plugin_liveness),
         }
 
     nudge_window_days = max(1, int(args.nudge_recheck_window_days))
@@ -1900,6 +2039,17 @@ def main() -> int:
     )
     parser.add_argument("--footer", default="")
     parser.add_argument("--all-agents", action="store_true")
+    parser.add_argument(
+        "--all-plugins",
+        action="store_true",
+        help="Expand the Plugin Liveness section instead of truncating (#1844).",
+    )
+    parser.add_argument(
+        "--plugin-liveness-limit",
+        type=int,
+        default=int(os.environ.get("BRIDGE_PLUGIN_LIVENESS_LIMIT", "12") or 12),
+        help="Max Plugin Liveness rows before truncating in the text view (default 12).",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
