@@ -11923,6 +11923,21 @@ log "running v2-cross-class-read smoke (issue #583 closure)"
 log "v2-cross-class-read covers POSIX group + setgid permission boundary only — skips on macOS / no-sudo"
 bash "$REPO_ROOT/scripts/smoke/v2-cross-class-read.sh"
 
+# Issue #1822 — tool-policy cross-agent false-positive corrections. Drives
+# protected_alias_reason in an isolated fixture for the FOUR retained fixes:
+# balanced-backtick unwrap (Fix 1b), glob-depth component-wise fnmatch
+# (Fix 2), obfuscation deny-message (Fix 3), admin Bash peer-home write parity
+# + audit resolving the #1711 deferral (Fix 4), and macOS `md5` read-intent
+# (Fix 5). The quoted-heredoc body STRIP optimisation was dropped (operator
+# decision — proving a heredoc body is inert vs executable needs full
+# shell-pipeline parsing and a distinct bypass surfaced at each layer; not
+# stripping is strictly safer), so no strip / interpreter-stdin / wrapper-OPTION
+# behaviour is asserted. Deliberately does NOT cover v2 peer-home containment
+# (#1823, owned by PR #1831). Host-independent (no Linux/sudo dependency — gate
+# logic resolves from the BRIDGE_* fixture).
+log "running 1822-tool-policy-crossagent-falsepos smoke (issue #1822)"
+bash "$REPO_ROOT/scripts/smoke/1822-tool-policy-crossagent-falsepos.sh"
+
 # Issue #555 — per-agent settings.effective.json rendering for managed
 # (non-isolated) agents. Mixed-model installs no longer last-rerender-wins
 # on `autoCompactWindow` (or any future per-agent managed default).
