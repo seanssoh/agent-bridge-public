@@ -2585,37 +2585,86 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
 
         if not _safe_path_check("exists", settings_path, os_user):
             rel_target = os.path.relpath(shared_path, start=settings_path.parent)
-            try:
-                settings_path.symlink_to(rel_target)  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo ln fallback below (mirrors the .unlink() pattern at line 1504, see #1178 r2)
-            except FileExistsError:
-                # #1672: `_safe_path_check("is_symlink", ...)` false-negatives on
-                # an iso-owned existing symlink (the controller's sudo probe
-                # can't stat it across the boundary), so we conclude "no link"
-                # and re-create — but the link is already there, so `symlink_to`
-                # raises FileExistsError on every iso-agent restart. Re-check
-                # idempotently: resolve the EXISTING path's target across the
-                # iso boundary: `_resolve_iso_link_realpath` forces the
-                # `sudo -n -u <owner> readlink -f` resolution when the link is
-                # iso-owned (the controller can't `lstat` it, and bare
-                # `os.path.realpath` would silently return the unresolved path
-                # — see that helper's docstring + codex #1672 finding 1). If it
-                # already points at the intended shared-settings target, this is
-                # a no-op — mark unchanged and suppress the spurious warning. A
-                # wrong-target symlink or a non-symlink collision is a REAL
-                # conflict; re-raise so the structured warning below still fires.
-                current_target = _resolve_iso_link_realpath(settings_path, os_user)
-                # `shared_path` is controller-owned (lives under shared/), so a
-                # straight controller-side realpath is correct — no escalation.
-                desired_target = _safe_realpath(shared_path, None)
-                if current_target != desired_target:
-                    raise
+            # #1672 idempotence preserved across the #1820 atomic change: the
+            # iso false-negative path (where _safe_path_check reports "no link"
+            # but a correct symlink really sits on disk) must still resolve to
+            # "unchanged" rather than blindly rewriting. Probe the on-disk target
+            # FIRST via the iso-aware realpath; if it already points at the
+            # desired shared target, short-circuit. (Pre-#1820 this was achieved
+            # by letting symlink_to raise FileExistsError and re-checking; the
+            # atomic os.replace below never raises FileExistsError, so we must
+            # check up front.)
+            _existing_target = _resolve_iso_link_realpath(settings_path, os_user)
+            _desired_target = _safe_realpath(shared_path, None)
+            # Authoritative presence check: os.path.lexists sees a symlink (even
+            # broken / cross-boundary) without following it. For an iso-owned
+            # path the controller may be lexists-blind, so ALSO treat a resolved
+            # target that differs from the path itself (i.e. a real link was
+            # followed) as evidence of presence. Note: on an ABSENT path
+            # `_resolve_iso_link_realpath` returns the unresolved path itself, so
+            # we must compare against settings_path to avoid a false "present".
+            _resolved_is_real_link = bool(_existing_target) and (
+                _existing_target != _safe_realpath(settings_path, None)
+            )
+            _on_disk = os.path.lexists(settings_path) or _resolved_is_real_link
+            if _existing_target and _existing_target == _desired_target:
+                # Already the correct link — idempotent no-op (#1672).
                 status = "unchanged"
-            except PermissionError:
-                if os_user is None:
-                    raise
-                rc = _sudo_run_as(os_user, "ln", "-s", rel_target, str(settings_path))
-                if rc != 0:
-                    raise
+            elif _on_disk:
+                # Something is here but it is NOT our desired target: a
+                # wrong-target symlink or a non-symlink collision. Do NOT silently
+                # os.replace it — that would clobber an operator file / mask a real
+                # conflict. Raise FileExistsError so the structured warning fires
+                # (the #1672 REAL-conflict contract, preserved across the #1820
+                # atomic-retarget change).
+                raise FileExistsError(
+                    f"settings.json at {settings_path} is not the managed target"
+                )
+            else:
+                try:
+                    # Issue #1820: ATOMIC retarget — create the symlink at a temp
+                    # name in the same directory, then os.replace() it over the
+                    # final path (rename is atomic on POSIX). This closes the
+                    # unlink-then-symlink window where a session could read a
+                    # missing/half-written settings.json mid-swap (the verdict
+                    # requires the workdir symlink retarget to be atomic).
+                    # Controller path only; the iso/sudo fallback below keeps its
+                    # `ln -s` form.
+                    _tmp_link = settings_path.with_name(
+                        f".{settings_path.name}.tmp-{os.getpid()}"
+                    )
+                    try:
+                        _tmp_link.unlink()  # noqa: raw-pathlib-controller-only — clear a stale temp from a crashed prior run; same-dir controller-owned scratch
+                    except FileNotFoundError:
+                        pass
+                    _tmp_link.symlink_to(rel_target)  # noqa: raw-pathlib-controller-only — same-dir temp symlink, atomically renamed over the target below (#1820)
+                    os.replace(_tmp_link, settings_path)  # noqa: raw-pathlib-controller-only — atomic rename of the temp symlink onto settings.json (#1820)
+                except FileExistsError:
+                    # #1672: `_safe_path_check("is_symlink", ...)` false-negatives
+                    # on an iso-owned existing symlink (the controller's sudo probe
+                    # can't stat it across the boundary), so we conclude "no link"
+                    # and re-create — but the link is already there. The atomic
+                    # os.replace above does NOT raise FileExistsError (it
+                    # overwrites), so this branch is now reached only if the temp
+                    # symlink_to itself collides; re-check idempotently against the
+                    # EXISTING path's target across the iso boundary via
+                    # `_resolve_iso_link_realpath` (forces `sudo -n -u <owner>
+                    # readlink -f` when iso-owned). If it already points at the
+                    # intended target, no-op (unchanged); a wrong-target or
+                    # non-symlink collision is a REAL conflict — re-raise.
+                    current_target = _resolve_iso_link_realpath(settings_path, os_user)
+                    # `shared_path` is controller-owned (lives under shared/), so a
+                    # straight controller-side realpath is correct — no escalation.
+                    desired_target = _safe_realpath(shared_path, None)
+                    if current_target != desired_target:
+                        raise
+                    status = "unchanged"
+                except PermissionError:
+                    if os_user is None:
+                        raise
+                    rc = _sudo_run_as(os_user, "ln", "-s", rel_target, str(settings_path))
+                    if rc != 0:
+                        raise
     except OSError as exc:
         # #1145: surface a structured single-line warning so the operator
         # sees WHY the link failed (which UID, which path, what errno

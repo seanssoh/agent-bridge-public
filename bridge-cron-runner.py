@@ -2801,10 +2801,57 @@ def _safe_agent_id(value: str) -> bool:
     return bool(value) and all(ch.isalnum() or ch in "._-" for ch in value)
 
 
+def _layout_marker_data_root() -> Path | None:
+    """Read ``BRIDGE_DATA_ROOT`` from the v2 layout marker using only
+    ``BRIDGE_HOME``.
+
+    Issue #1820: the daemon inherits *only* ``BRIDGE_HOME`` in its
+    environment (not ``BRIDGE_DATA_ROOT`` / ``BRIDGE_AGENT_ROOT_V2``), so
+    ``bridge_data_root()`` used to fall back to ``bridge_home()`` and the cron
+    disposable worker resolved every shared agent's Claude config dir to the
+    **v1** ``<bridge_home>/agents/<a>`` tree — silently forking agent memory
+    away from the v2 ``<data_root>/agents/<a>/home`` tree that interactive
+    sessions use. The marker file is the same source-of-truth the bash layout
+    resolver reads (``<marker_dir>/layout-marker.sh``, anchored on
+    ``BRIDGE_LAYOUT_MARKER_DIR`` or ``BRIDGE_HOME/state``); it carries
+    ``BRIDGE_LAYOUT=v2`` and ``BRIDGE_DATA_ROOT='<abs>'``. Parsing it here lets
+    the runner discover the v2 data root from ``BRIDGE_HOME`` alone, matching
+    ``lib/bridge-marker-bootstrap.sh::bridge_isolation_v2_marker_path``.
+
+    Returns the parsed absolute ``BRIDGE_DATA_ROOT`` only when the marker
+    declares ``BRIDGE_LAYOUT=v2``; otherwise ``None`` (legacy installs fall
+    through to ``bridge_home()`` exactly as before).
+    """
+    marker_dir = os.environ.get("BRIDGE_LAYOUT_MARKER_DIR", "").strip()
+    if marker_dir:
+        marker_path = Path(marker_dir).expanduser() / "layout-marker.sh"
+    else:
+        home = bridge_home()
+        if home is None:
+            return None
+        marker_path = home / "state" / "layout-marker.sh"
+    layout = _env_assignment(marker_path, "BRIDGE_LAYOUT")
+    if not layout or layout.strip() != "v2":
+        return None
+    data_root = _env_assignment(marker_path, "BRIDGE_DATA_ROOT")
+    if not data_root:
+        return None
+    candidate = Path(data_root).expanduser()
+    if not candidate.is_absolute():
+        return None
+    return candidate
+
+
 def bridge_data_root() -> Path | None:
     value = os.environ.get("BRIDGE_DATA_ROOT", "").strip()
     if value:
         return Path(value).expanduser()
+    # Issue #1820: prefer the v2 layout marker (readable from BRIDGE_HOME
+    # alone) over the bare bridge_home() fallback, so the cron worker resolves
+    # v2 agent homes even when the daemon env carries only BRIDGE_HOME.
+    marker_data_root = _layout_marker_data_root()
+    if marker_data_root is not None:
+        return marker_data_root
     return bridge_home()
 
 
@@ -2865,6 +2912,12 @@ def claude_config_dir_from_launch_env(agent: str) -> Path | None:
 
 
 def _shared_agent_claude_config_candidates(agent: str) -> list[Path]:
+    # Issue #1820: order is load-bearing. ``bridge_data_root()`` now resolves to
+    # the v2 ``<data_root>`` (via env or the layout marker) on a v2 install, so
+    # the first candidate produced below is the v2 agent home
+    # ``<data_root>/agents/<a>/home/.claude`` — ahead of the v1
+    # ``<bridge_home>/agents/<a>/.claude``. On legacy installs ``data_root`` is
+    # ``bridge_home()`` and only the v1 candidates exist, preserving behavior.
     roots: list[Path] = []
     data_root = bridge_data_root()
     if data_root is not None:

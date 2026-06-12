@@ -97,6 +97,37 @@ bridge_hook_shared_settings_effective_file() {
 # but harmless — operators may delete it manually after verifying.
 bridge_hook_per_agent_settings_effective_file() {
   local agent="$1"
+  # Issue #1820: on a v2 install the per-agent effective settings — the link
+  # target every v2 workdir `.claude/settings.json` symlink points at — must
+  # live at the v2 layout-resolved agent home (`<data_root>/agents/<a>/home/
+  # .claude/settings.effective.json`), NOT the legacy v1
+  # `$BRIDGE_AGENT_HOME_ROOT/<a>/.claude/...`. Rendering+linking to v1 is what
+  # kept the v1 tree load-bearing for every session launch (the workdir symlink
+  # resolved into v1). `bridge_agent_default_home` is the canonical v2-aware
+  # resolver (returns `$BRIDGE_AGENT_ROOT_V2/<a>/home` when v2 is active, the
+  # legacy `$BRIDGE_AGENT_HOME_ROOT/<a>` otherwise) — use it so the primary
+  # render and the first symlink takeover both land on v2 from the start. The
+  # v1 file is still rendered separately as non-load-bearing rollback evidence
+  # (see bridge_hook_per_agent_settings_effective_file_v1 below); it is NOT
+  # removed in this migration.
+  if command -v bridge_agent_default_home >/dev/null 2>&1; then
+    local v2_home
+    v2_home="$(bridge_agent_default_home "$agent" 2>/dev/null || true)"
+    if [[ -n "$v2_home" ]]; then
+      printf '%s/.claude/settings.effective.json' "$v2_home"
+      return 0
+    fi
+  fi
+  printf '%s/%s/.claude/settings.effective.json' "$BRIDGE_AGENT_HOME_ROOT" "$agent"
+}
+
+# Issue #1820: the legacy v1 effective-settings path. Kept as a discrete helper
+# so the migration can render it as rollback evidence (non-load-bearing) and so
+# the reconcile/invariant smokes can assert the symlink resolves OUTSIDE this
+# tree. `bridge_agent_default_home` returns this exact path on a legacy install,
+# so the two helpers coincide on v1 and diverge only under v2.
+bridge_hook_per_agent_settings_effective_file_v1() {
+  local agent="$1"
   printf '%s/%s/.claude/settings.effective.json' "$BRIDGE_AGENT_HOME_ROOT" "$agent"
 }
 
@@ -359,9 +390,44 @@ bridge_link_claude_settings_to_shared() {
   # a sticky-false launched-channel enabledPlugins entry (#1453) instead of
   # re-disabling inbound delivery at symlink takeover. Same vars the
   # render-shared-settings call above passes.
+  #
+  # Issue #1820: `$effective_file` now resolves to the v2 agent home on a v2
+  # install (see bridge_hook_per_agent_settings_effective_file), so this
+  # link-shared-settings call atomically retargets the workdir
+  # `.claude/settings.json` symlink AWAY from the legacy v1
+  # `$BRIDGE_AGENT_HOME_ROOT/<a>/.claude/settings.effective.json` and toward the
+  # v2 effective file — making the v1 tree no longer load-bearing for session
+  # launch. The link op is itself atomic (cmd_link_shared_settings replaces the
+  # symlink via a relative-target `symlink_to`).
   bridge_hooks_python link-shared-settings --workdir "$workdir" --shared-settings-file "$effective_file" \
     --launch-cmd "$launch_cmd" \
     --channels-csv "$channels_csv"
+
+  # Issue #1820 (rollback evidence): on a v2 install, also render the legacy v1
+  # effective file so it stays a readable, current snapshot operators can fall
+  # back to if a v2 rollback is needed. It is intentionally NON-load-bearing —
+  # no symlink points at it after the takeover above — and it is NOT removed by
+  # this migration (the verdict's safe-removal conditions are enforced
+  # elsewhere). Skipped when v1 and v2 paths coincide (legacy install) or for
+  # iso agents (their canonical render is cmd_render_isolated_home_settings).
+  if [[ -n "$agent" ]] \
+      && { ! command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+           || ! bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; }; then
+    local v1_effective_file
+    v1_effective_file="$(bridge_hook_per_agent_settings_effective_file_v1 "$agent")"
+    if [[ "$(bridge_hook_paths_equal "$effective_file" "$v1_effective_file")" != "1" ]]; then
+      local v1_eff_dir="${v1_effective_file%/*}"
+      mkdir -p "$v1_eff_dir" 2>/dev/null || true
+      bridge_hooks_python render-shared-settings \
+        --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
+        --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
+        --effective-settings-file "$v1_effective_file" \
+        --operator-global-settings-file "$operator_global_file" \
+        --launch-cmd "$launch_cmd" \
+        --agent-class "$agent_class" \
+        --channels-csv "$channels_csv" >/dev/null 2>&1 || true
+    fi
+  fi
 
   # v2 non-isolated agents launch Claude with CLAUDE_CONFIG_DIR under
   # bridge_agent_default_home (<agent>/home/.claude), while the legacy shared
@@ -375,8 +441,22 @@ bridge_link_claude_settings_to_shared() {
     agent_claude_config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
     if [[ -n "$agent_claude_config_dir" ]]; then
       agent_effective_file="$agent_claude_config_dir/settings.effective.json"
-      if [[ "$(bridge_hook_paths_equal "$effective_file" "$agent_effective_file")" != "1" ]]; then
-        agent_claude_home="${agent_claude_config_dir%/.claude}"
+      agent_claude_home="${agent_claude_config_dir%/.claude}"
+      if [[ "$(bridge_hook_paths_equal "$effective_file" "$agent_effective_file")" == "1" ]]; then
+        # Issue #1820: after the writer-3 fix the PRIMARY effective render above
+        # already targets this v2 config-dir effective file
+        # (bridge_hook_per_agent_settings_effective_file now resolves to the v2
+        # home, which coincides with bridge_agent_claude_config_dir for a v2
+        # non-iso agent). Do NOT re-render — that would be redundant work — but
+        # the launched Claude CLAUDE_CONFIG_DIR still needs its own
+        # `settings.json -> settings.effective.json` symlink, so ensure that
+        # link here. (Pre-#1820 this branch was the "paths already equal, skip
+        # entirely" no-op; the config-dir link was created by the render+link
+        # in the else branch which no longer runs once the paths coincide.)
+        bridge_hooks_python link-shared-settings --workdir "$agent_claude_home" --shared-settings-file "$agent_effective_file" \
+          --launch-cmd "$launch_cmd" \
+          --channels-csv "$channels_csv" >/dev/null
+      else
         bridge_hooks_python render-shared-settings \
           --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
           --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \

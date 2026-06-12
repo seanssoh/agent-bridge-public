@@ -116,16 +116,31 @@ def _agent_home() -> Path | None:
     env_home = os.environ.get("BRIDGE_AGENT_HOME")
     if env_home:
         return Path(env_home)
-    # Issue #582 r2: under v2 layout, bridge-run.sh exports BRIDGE_AGENT_WORKDIR
-    # (not BRIDGE_AGENT_HOME). The v2 workdir is the agent's effective home for
-    # raw/captures/inbox/ writes — and it matches what wiki-daily-ingest.sh's
-    # raw enumeration walks (`<workdir>/raw/captures/inbox`). Without this
-    # fallback, v2 PreCompact envelopes land under <BRIDGE_HOME>/agents/<agent>/
-    # while the enumeration looks under the workdir, so the daily report misses
-    # them. Preferring BRIDGE_AGENT_HOME first keeps legacy/v1 behavior intact.
-    env_workdir = os.environ.get("BRIDGE_AGENT_WORKDIR")
-    if env_workdir:
-        return Path(env_workdir)
+    # Issue #1820: bridge-run.sh exports the *scalar* `_RESOLVED` aliases
+    # (BRIDGE_AGENT_WORKDIR_RESOLVED, BRIDGE_AGENT_HOME_RESOLVED) precisely
+    # because the bare names (BRIDGE_AGENT_WORKDIR, BRIDGE_AGENT_HOME) collide
+    # with associative arrays in lib/bridge-agents.sh and never reach this
+    # child process. The bare-name reads below therefore always fell through to
+    # the v1 `<BRIDGE_HOME>/agents/<agent>` legacy fallback, so PreCompact
+    # dumps (raw/captures/inbox/*-pre-compact-dump-auto.json) landed in the v1
+    # tree while interactive sessions and the wiki raw-enumeration read the v2
+    # tree — silently forking compact-recovery state for v2-split agents.
+    #
+    # Read the v2-aware aliases FIRST. The workdir alias is the agent's
+    # effective home for raw/captures/inbox writes (it matches what
+    # wiki-daily-ingest.sh's raw enumeration walks: `<workdir>/raw/captures/
+    # inbox`). The home alias is the v2 identity home; prefer the workdir for
+    # these per-session capture writes, then identity home, then the legacy
+    # bare-name reads (kept for back-compat with any launcher that still sets
+    # them), then the v1 existence-gated fallback.
+    for env_name in (
+        "BRIDGE_AGENT_WORKDIR_RESOLVED",
+        "BRIDGE_AGENT_HOME_RESOLVED",
+        "BRIDGE_AGENT_WORKDIR",
+    ):
+        value = os.environ.get(env_name)
+        if value:
+            return Path(value)
     agent = _agent_id()
     if not agent:
         return None

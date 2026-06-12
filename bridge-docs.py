@@ -365,18 +365,43 @@ def backup_file(src: Path, backup_root: Path, dry_run: bool) -> None:
     shutil.copy2(src, backup_root / src.name, follow_symlinks=False)
 
 
-def list_agent_dirs(target_root: Path, selected: list[str], all_agents: bool) -> list[Path]:
+def list_agent_dirs(
+    target_root: Path,
+    selected: list[str],
+    all_agents: bool,
+    home_subdir: str = "",
+) -> list[Path]:
+    # Issue #1820: ``home_subdir`` (e.g. "home") descends one level into each
+    # agent entry so the docs engine grooms the v2 per-agent home
+    # ``<target_root>/<agent>/home`` instead of the flat v1 layout
+    # ``<target_root>/<agent>``. Selection (name match / _template / shared
+    # filtering) still keys off the agent-named parent; only the returned
+    # *home* path carries the subdir. Empty subdir preserves the legacy v1
+    # behavior byte-for-byte. The subdir is required to exist — a v2 agent
+    # entry that has no ``home`` child (mid-scaffold) is skipped rather than
+    # grooming the wrong tree.
     candidates = []
     for path in sorted(target_root.iterdir()):
         if not path.is_dir():
             continue
         if path.name.startswith(".") or path.name in {"_template", "shared"}:
             continue
-        candidates.append(path)
+        if home_subdir:
+            home_path = path / home_subdir
+            if not home_path.is_dir():  # noqa: raw-pathlib-controller-only
+                continue
+            candidates.append(home_path)
+        else:
+            candidates.append(path)
     if all_agents or not selected:
         return candidates
     selected_set = set(selected)
-    return [path for path in candidates if path.name in selected_set]
+    # When descending into a subdir the agent name is the parent dir name.
+    return [
+        path
+        for path in candidates
+        if (path.parent.name if home_subdir else path.name) in selected_set
+    ]
 
 
 def collect_relative_files(base: Path, child: str) -> list[str]:
@@ -1632,6 +1657,15 @@ def parse_args() -> argparse.Namespace:
         default=Path(os.environ.get("BRIDGE_AGENT_HOME_ROOT", str(bridge_home / "agents"))),
     )
     parser.add_argument(
+        "--home-subdir",
+        default="",
+        help=(
+            "Issue #1820: descend one level into each agent entry to reach the "
+            "v2 per-agent home (e.g. 'home' selects <target-root>/<agent>/home). "
+            "Empty (default) keeps the flat v1 layout <target-root>/<agent>."
+        ),
+    )
+    parser.add_argument(
         "--source-shared",
         type=Path,
         default=Path(os.environ.get("BRIDGE_OPENCLAW_HOME", str(Path.home() / ".openclaw"))) / "shared",
@@ -1645,7 +1679,9 @@ def main() -> int:
     target_root = args.target_root.expanduser().resolve()
     source_shared = args.source_shared.expanduser().resolve()
     registry = build_skill_registry(bridge_home)
-    agent_dirs = list_agent_dirs(target_root, args.agents, args.all_agents)
+    agent_dirs = list_agent_dirs(
+        target_root, args.agents, args.all_agents, args.home_subdir
+    )
 
     if args.command == "audit":
         audits = [audit_agent(agent_dir) for agent_dir in agent_dirs]

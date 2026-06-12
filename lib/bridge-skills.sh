@@ -695,11 +695,30 @@ bridge_sync_skill_docs() {
   bridge_require_python
   skills_json="$(bridge_agent_skills_registry_json)"
   workdir_json="$(bridge_agent_workdir_registry_json)"
+
+  # Issue #1820: doc-sync must groom the tree sessions actually read. On a v2
+  # install the per-agent home is `<data_root>/agents/<a>/home`, not the v1
+  # `<bridge_home>/agents/<a>`. Point `--target-root` at the v2 agents root
+  # (`$BRIDGE_AGENT_ROOT_V2`, = `<data_root>/agents`) and thread
+  # `--home-subdir home` so the docs engine descends one level into each
+  # agent's v2 home. Without this the upgrade doc-sync kept grooming the v1
+  # tree that no runtime writer should target after this migration. Resolve v2
+  # activeness through the layout resolver (BRIDGE_AGENT_ROOT_V2 is exported by
+  # the v2 marker bootstrap); on legacy installs the var is empty and we keep
+  # the v1 `$BRIDGE_AGENT_HOME_ROOT` target byte-for-byte.
+  local doc_target_root="$BRIDGE_AGENT_HOME_ROOT"
+  local -a doc_home_subdir_args=()
+  if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
+    doc_target_root="$BRIDGE_AGENT_ROOT_V2"
+    doc_home_subdir_args=(--home-subdir home)
+  fi
+
   BRIDGE_AGENT_SKILLS_JSON="$skills_json" \
   BRIDGE_AGENT_WORKDIR_JSON="$workdir_json" \
     python3 "$BRIDGE_SCRIPT_DIR/bridge-docs.py" apply "$@" \
     --bridge-home "$BRIDGE_HOME" \
-    --target-root "$BRIDGE_AGENT_HOME_ROOT" \
+    --target-root "$doc_target_root" \
+    "${doc_home_subdir_args[@]}" \
     --source-shared "$BRIDGE_OPENCLAW_HOME/shared" >/dev/null
 }
 
