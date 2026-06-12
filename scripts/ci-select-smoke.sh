@@ -3111,6 +3111,37 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       add_integration integration-minimal
       ;;
 
+    scripts/wiki-v2-rebuild.sh)
+      # Issue #1827 (read-side sibling of #1222): the controller-run
+      # wiki/index rebuild now branches on linux-user isolation. For an
+      # iso agent the whole rebuild/publish block (mkdir memory/, lock,
+      # rm stale tmp_db, rebuild-index, validate, mv-into-place) runs as
+      # the iso UID via bridge_isolation_run_as_agent_user_via_bash —
+      # the controller can't write the 2770 iso-owned memory/ dir, so
+      # the legacy controller-direct path tallied every iso agent as a
+      # fail/skip on every run. The 1827 smoke pins:
+      #   - ../bridge-lib.sh sourcing (so the iso helpers load)
+      #   - bridge_load_roster after that source + inside the
+      #     _BRIDGE_ISO_HELPERS_LOADED guard (without it the predicate is
+      #     always-false dead code — the #1222 r1 BLOCKING regression)
+      #   - bridge_agent_linux_user_isolation_effective gate
+      #   - bridge_isolation_run_as_agent_user_via_bash invocation
+      #   - the iso inline script covers the FULL block (mkdir + lock +
+      #     rm + rebuild-index + validate + mv); wrapping only mkdir or
+      #     only mv would re-trip the Permission denied bug
+      #   - non-iso branch preserved (no regression for shared installs)
+      #   - inline-script exit codes stay 0 or >= 10 so the wrapper's +2
+      #     shift on rc<3 cannot collide with its pre-flight band
+      #   - no heredoc/here-string in the iso inline body (footgun #11)
+      # The Linux+sudo gated T9 layer stands up a real
+      # agent-bridge-w1827 user + ab-agent-w1827 group, scaffolds the
+      # iso-owned memory/ at mode 2770 with a stale index.sqlite.rebuilding
+      # file, and asserts the cross-boundary asymmetry (controller rm
+      # fails, sudo-as-iso rm succeeds) reproduces on this host.
+      add_required 1827-wiki-v2-rebuild-iso H-bootstrap-memory-iso-rebuild
+      add_integration integration-minimal
+      ;;
+
     scripts/wiki-daily-ingest.sh)
       # Issue #679: wiki-daily-ingest.sh Lane B excludes
       # `*pre-compact-dump*` raw envelopes from the librarian ingest
