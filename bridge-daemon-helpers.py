@@ -1515,6 +1515,91 @@ def cmd_orphan_gc_task_body(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_doc_backfill_non_clean(args: argparse.Namespace) -> int:
+    """Issue #1809 — decide whether a codex AGENTS.md doc-backfill pass is
+    "non-clean" (worth ONE `[hygiene]` admin task). Non-clean iff the summary
+    actually backfilled or refreshed at least one agent, or recorded an error.
+    A pass that checked agents but changed nothing prints ``0`` (no task).
+
+    Prints ``1`` (non-clean) or ``0`` (clean).
+    """
+    summary = _load_json_file(args.summary_json) or {}
+    non_clean = False
+    if isinstance(summary, dict):
+        for key in ("backfilled", "refreshed", "errors"):
+            if summary.get(key):
+                non_clean = True
+                break
+    print("1" if non_clean else "0")
+    return 0
+
+
+def cmd_agent_doc_backfill_task_body(args: argparse.Namespace) -> int:
+    """Issue #1809 — render the `[hygiene]` admin task body from the codex
+    AGENTS.md doc-backfill summary JSON. Lists which codex agents had their
+    AGENTS.md identity contract backfilled (created) or refreshed (managed
+    header re-rendered, custom contract preserved), plus any errors.
+    """
+    summary = _load_json_file(args.summary_json)
+    host = args.hostname or "host"
+    if not isinstance(summary, dict):
+        print(f"# codex AGENTS.md backfill on {host}\n\n(no summary available)")
+        return 0
+
+    backfilled = summary.get("backfilled") or []
+    refreshed = summary.get("refreshed") or []
+    errors = summary.get("errors") or []
+    checked = summary.get("codex_agents_checked", "?")
+
+    lines: list[str] = []
+    lines.append(f"# codex AGENTS.md backfill on {host}")
+    lines.append("")
+    lines.append(
+        "The daemon doc-backfill hygiene pass materialized the codex AGENTS.md "
+        "identity contract for roster codex agents that were missing it (a "
+        "pre-materialization gap — `bridge_layout_materialize_identity` runs at "
+        "create time only), and refreshed the managed header on agents whose "
+        "AGENTS.md had drifted from the current template. Create-if-absent only: "
+        "an existing file's hand-written custom contract (below the "
+        "`<!-- END AGENT BRIDGE DOC MIGRATION -->` marker) is preserved "
+        "byte-for-byte. Codex-only; claude agents are never touched."
+    )
+    lines.append("")
+    lines.append(f"- Codex agents checked: {checked}")
+    lines.append("")
+
+    if backfilled:
+        lines.append(f"## Backfilled — AGENTS.md created ({len(backfilled)})")
+        for name in backfilled:
+            lines.append(f"- `{name}` — had no AGENTS.md identity contract; "
+                         "materialized from the current template.")
+        lines.append("")
+
+    if refreshed:
+        lines.append(f"## Refreshed — managed header re-rendered ({len(refreshed)})")
+        for name in refreshed:
+            lines.append(f"- `{name}` — managed block updated to the current "
+                         "template; custom contract below the marker preserved.")
+        lines.append("")
+
+    if errors:
+        lines.append(f"## Errors ({len(errors)})")
+        for e in errors:
+            if isinstance(e, dict):
+                lines.append(f"- `{e.get('agent', '')}`: {e.get('error', '')}")
+            else:
+                lines.append(f"- {e}")
+        lines.append("")
+
+    lines.append(
+        "No action needed — this is an FYI that the runtime closed a standing "
+        "`missing_files: AGENTS.md` watchdog gap. The same backfill runs on "
+        "`agent-bridge upgrade`."
+    )
+    print("\n".join(lines).rstrip() + "\n")
+    return 0
+
+
 SUBCOMMANDS = {
     "usage-alert-parse": (
         cmd_usage_alert_parse,
@@ -1720,6 +1805,21 @@ SUBCOMMANDS = {
             ("hostname", "short hostname for the task title/body"),
         ],
         "Render the [hygiene] admin task body (quarantined / would-quarantine / kept).",
+    ),
+    "agent-doc-backfill-non-clean": (
+        cmd_agent_doc_backfill_non_clean,
+        [
+            ("summary_json", "bridge-upgrade.py backfill-codex-entrypoints summary JSON file"),
+        ],
+        "Prints 1 when the codex AGENTS.md backfill pass is non-clean (file a [hygiene] task), else 0.",
+    ),
+    "agent-doc-backfill-task-body": (
+        cmd_agent_doc_backfill_task_body,
+        [
+            ("summary_json", "bridge-upgrade.py backfill-codex-entrypoints summary JSON file"),
+            ("hostname", "short hostname for the task title/body"),
+        ],
+        "Render the [hygiene] admin task body (codex AGENTS.md backfilled / refreshed).",
     ),
 }
 

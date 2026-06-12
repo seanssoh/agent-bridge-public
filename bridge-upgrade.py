@@ -881,6 +881,77 @@ class AgentMigrationResult:
     rematerialize: dict[str, Any] | None = None
 
 
+def backfill_codex_agents_md_home(
+    agent_dir: Path,
+    template_root: Path,
+    agent: str,
+    display_name: str,
+    role_text: str,
+    engine: str,
+    session_type: str,
+    dry_run: bool,
+) -> str | None:
+    """Issue #1809: create-if-absent + managed-block refresh of a CODEX agent's
+    AGENTS.md identity entrypoint in its identity HOME (the authority tree).
+
+    Codex agents created before the entrypoint-materialization existed (early
+    admin-pair provisioning) have NO AGENTS.md in their home —
+    `bridge_layout_materialize_identity` runs at CREATE time only, so nothing
+    ever backfilled it and the watchdog flags `missing_files: AGENTS.md`
+    forever. The home is the identity authority: once it carries AGENTS.md, the
+    workdir copy is mirrored by `rematerialize_agent_identity` (which already
+    create-if-absents the engine entrypoint home->workdir).
+
+    AGENTS.md is CODEX-ONLY (the engine descriptor names it the codex
+    entrypoint; claude/antigravity use CLAUDE.md) so this is a no-op for every
+    other engine. The template carries the SAME `<!-- BEGIN/END AGENT BRIDGE
+    DOC MIGRATION -->` managed block as CLAUDE.md, so:
+      * absent dst  -> create-if-absent: the whole rendered template is the
+        initial materialization (managed header + custom skeleton).
+      * present dst -> marker-splice refresh: ONLY the managed header is
+        re-rendered; the agent's hand-written custom contract below the END
+        marker survives byte-for-byte (the live hand-backfill this issue must
+        not clobber).
+
+    Returns "backfilled", "refreshed", or None (no change / not codex /
+    template absent). Honors dry_run: returns the action it WOULD take without
+    writing.
+    """
+    if engine != "codex":
+        return None
+    agents_md_template = template_root / "codex" / "AGENTS.md"
+    # Controller-only: the upgrade migrate path runs as the controller against
+    # the controller-owned agent-home tree (never inside an iso UID), so these
+    # pathlib probes/mutators are the same controller-context the rest of
+    # migrate_agent_home uses (#1175 raw-pathlib whitelist).
+    if not agents_md_template.exists():  # noqa: raw-pathlib-controller-only
+        return None
+    agents_md_target = agent_dir / "AGENTS.md"
+    rendered = render_template(
+        agents_md_template.read_text(encoding="utf-8"),
+        agent,
+        display_name,
+        role_text,
+        engine,
+        session_type,
+    )
+    if not agents_md_target.exists():  # noqa: raw-pathlib-controller-only
+        if not dry_run:
+            agents_md_target.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only
+            agents_md_target.write_text(rendered, encoding="utf-8")
+        return "backfilled"
+    managed_block = extract_managed_claude_block(rendered)
+    if not managed_block:
+        return None
+    original = agents_md_target.read_text(encoding="utf-8", errors="ignore")
+    refreshed = refresh_managed_claude_block(original, managed_block)
+    if refreshed == original:
+        return None
+    if not dry_run:
+        agents_md_target.write_text(refreshed, encoding="utf-8")
+    return "refreshed"
+
+
 def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, dry_run: bool) -> AgentMigrationResult:
     agent = agent_dir.name
     session_type = detect_session_type(agent_dir, admin_agent)
@@ -962,6 +1033,19 @@ def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, d
                 if not dry_run:
                     claude_target.write_text(refreshed, encoding="utf-8")
 
+    # Issue #1809: codex AGENTS.md home-entrypoint backfill + managed-block
+    # refresh. Folded into the shared helper so the daemon doc-backfill hygiene
+    # pass (cmd_backfill_codex_entrypoints) applies the IDENTICAL create-if-
+    # absent + marker-splice refresh between upgrades.
+    entrypoint_action = backfill_codex_agents_md_home(
+        agent_dir, template_root, agent, display_name, role_text, engine,
+        session_type, dry_run,
+    )
+    if entrypoint_action == "backfilled":
+        added_files.append("AGENTS.md")
+    elif entrypoint_action == "refreshed":
+        updated_files.append("AGENTS.md")
+
     # Issue #4769 (reverts #517): no longer auto-inject the admin
     # pair-programming SOP managed block here. The block described a
     # `<admin>-dev` codex pair that was itself auto-created by the
@@ -1030,6 +1114,18 @@ def bridge_upgrade_target_env(target_root: Path) -> dict[str, str]:
         "BRIDGE_LAYOUT_RESOLVER_BYPASS": os.environ.get("BRIDGE_LAYOUT_RESOLVER_BYPASS", ""),
         "BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID": os.environ.get("BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID", ""),
         "BRIDGE_UPGRADE_CONTEXT": os.environ.get("BRIDGE_UPGRADE_CONTEXT", ""),
+        # Issue #1809: entrypoint-backfill-only mode for the daemon doc-backfill
+        # hygiene pass — the rematerialize helper short-circuits to the engine
+        # instruction entrypoint docs when this is "1".
+        "BRIDGE_REMAT_ENTRYPOINT_BACKFILL_ONLY": os.environ.get(
+            "BRIDGE_REMAT_ENTRYPOINT_BACKFILL_ONLY", ""
+        ),
+        # Test-only iso stub passthrough so the #1809 smoke can exercise the
+        # entrypoint-only mirror through the iso write path (same stubs the
+        # 1636 / workdir-migrate smokes use).
+        "BRIDGE_REMATERIALIZE_TEST_STUB_ISO": os.environ.get(
+            "BRIDGE_REMATERIALIZE_TEST_STUB_ISO", ""
+        ),
     }
 
 
@@ -1208,6 +1304,125 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
         "agents": [asdict(item) for item in results],
     }
     return emit_json(payload, 0)
+
+
+def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
+    """Issue #1809: focused codex AGENTS.md backfill pass for the daemon
+    doc-backfill hygiene cadence.
+
+    Narrower than `migrate-agents`: it touches ONLY the codex AGENTS.md
+    instruction entrypoint (home create-if-absent + managed-block refresh via
+    the shared `backfill_codex_agents_md_home` helper, then a workdir mirror via
+    the existing rematerialize helper) — NOT the full per-agent template/scaffold
+    migration. That keeps the periodic side-effect surface tiny while reusing the
+    exact same create-if-absent + marker-splice logic the upgrade path uses
+    (never a whole-file clobber; custom content below the marker is preserved).
+
+    Roster-restricted (same `collect_roster_ids` filter migrate-agents uses) so
+    orphan/test homes are never touched. Codex-only: non-codex agents are
+    skipped. Emits a compact summary JSON the daemon uses to decide non-clean
+    and render the `[hygiene]` task body.
+    """
+    template_root = Path(args.source_root).expanduser() / "agents" / "_template"
+    agent_root = Path(args.target_root).expanduser() / "agents"
+    source_root = Path(args.source_root).expanduser().resolve()
+    target_root = Path(args.target_root).expanduser().resolve()
+    admin_agent = (args.admin_agent or "").strip()
+    dry_run = bool(args.dry_run)
+
+    roster_ids, roster_sources = collect_roster_ids(target_root, admin_agent)
+    roster_filtering = "active" if (roster_sources and roster_ids) else "unavailable"
+
+    backfilled: list[str] = []
+    refreshed: list[str] = []
+    errors: list[dict[str, str]] = []
+    checked = 0
+
+    for path in discover_agent_dirs(agent_root):
+        if roster_filtering == "active" and path.name not in roster_ids:
+            continue
+        try:
+            session_type = detect_session_type(path, admin_agent)
+            engine = detect_engine(path, session_type)
+            if engine != "codex":
+                continue
+            checked += 1
+            display_name = detect_display_name(path)
+            role_text = detect_role_text(path)
+            action = backfill_codex_agents_md_home(
+                path, template_root, path.name, display_name, role_text,
+                engine, session_type, dry_run,
+            )
+            if action == "backfilled":
+                backfilled.append(path.name)
+            elif action == "refreshed":
+                refreshed.append(path.name)
+            else:
+                # No home change — nothing to mirror. Skip the workdir pass so a
+                # clean re-run stays a true no-op.
+                continue
+            # Mirror the freshly-backfilled/refreshed home entrypoint into the
+            # workdir via the existing rematerialize helper, scoped to the
+            # entrypoint docs only (BRIDGE_REMAT_ENTRYPOINT_BACKFILL_ONLY).
+            mirror = AgentMigrationResult(
+                agent=path.name,
+                added_files=[],
+                created_dirs=[],
+                updated_files=[],
+                session_type=session_type,
+                engine=engine,
+            )
+            remat = rematerialize_agent_identity_entrypoint_only(
+                source_root, target_root, mirror, dry_run,
+            )
+            remat_errors = (remat or {}).get("errors") or []
+            for err in remat_errors:
+                errors.append({"agent": path.name, "error": str(err)})
+        except PermissionError as exc:
+            errors.append({
+                "agent": path.name,
+                "error": f"PermissionError: {exc.filename or '<unknown path>'} (per-UID isolated tree)",
+            })
+        except OSError as exc:
+            errors.append({"agent": path.name, "error": f"OSError: {exc}"})
+
+    non_clean = bool(backfilled or refreshed or errors)
+    payload = {
+        "dry_run": dry_run,
+        "codex_agents_checked": checked,
+        "roster_filtering": roster_filtering,
+        "roster_sources": roster_sources,
+        "backfilled": sorted(backfilled),
+        "refreshed": sorted(refreshed),
+        "backfilled_count": len(backfilled),
+        "refreshed_count": len(refreshed),
+        "errors": errors,
+        "non_clean": non_clean,
+    }
+    return emit_json(payload, 0)
+
+
+def rematerialize_agent_identity_entrypoint_only(
+    source_root: Path,
+    target_root: Path,
+    result: AgentMigrationResult,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Run the rematerialize helper in entrypoint-backfill-only mode (Issue
+    #1809) — mirror ONLY the engine instruction entrypoint home->workdir, not
+    the full identity/users/scaffold sync. A thin wrapper around
+    `rematerialize_agent_identity` that sets BRIDGE_REMAT_ENTRYPOINT_BACKFILL_ONLY
+    so the helper short-circuits to the entrypoint docs.
+    """
+    prior = os.environ.get("BRIDGE_REMAT_ENTRYPOINT_BACKFILL_ONLY")
+    os.environ["BRIDGE_REMAT_ENTRYPOINT_BACKFILL_ONLY"] = "1"
+    try:
+        return rematerialize_agent_identity(source_root, target_root, result, dry_run)
+    finally:
+        if prior is None:
+            os.environ.pop("BRIDGE_REMAT_ENTRYPOINT_BACKFILL_ONLY", None)
+        else:
+            os.environ["BRIDGE_REMAT_ENTRYPOINT_BACKFILL_ONLY"] = prior
 
 
 def conflict_backup_relpath(relpath: str) -> str:
@@ -4215,6 +4430,17 @@ def build_parser() -> argparse.ArgumentParser:
     # "migrate every dir under agents/" behavior for operators who want it.
     migrate.add_argument("--migrate-all-agents", action="store_true")
     migrate.set_defaults(handler=cmd_migrate_agents)
+
+    # Issue #1809: focused codex AGENTS.md backfill pass for the daemon
+    # doc-backfill hygiene cadence (process_agent_doc_backfill). Touches ONLY
+    # the codex instruction entrypoint (home create-if-absent + managed-block
+    # refresh + workdir mirror), not the full template/scaffold migration.
+    backfill_entry = subparsers.add_parser("backfill-codex-entrypoints")
+    backfill_entry.add_argument("--source-root", required=True)
+    backfill_entry.add_argument("--target-root", required=True)
+    backfill_entry.add_argument("--admin-agent", default="")
+    backfill_entry.add_argument("--dry-run", action="store_true")
+    backfill_entry.set_defaults(handler=cmd_backfill_codex_entrypoints)
 
     # Issue #4769 (reverts #517): the inject subcommand for the admin
     # pair-programming managed block is removed together with the admin

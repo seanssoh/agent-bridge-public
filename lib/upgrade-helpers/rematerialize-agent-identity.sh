@@ -696,12 +696,37 @@ if [[ ! -d "$source_dir" ]]; then
   _remat_finish
   exit 0
 fi
+
+# Issue #1809: the instruction-entrypoint doc names (the engine entry + the
+# codex CLAUDE.md compat copy). Built first so the entrypoint-backfill-only mode
+# can mirror ONLY these home->workdir.
+declare -a remat_entrypoint_names=()
 if [[ -n "$engine_entry" ]]; then
-  remat_names+=("$engine_entry")
+  remat_entrypoint_names+=("$engine_entry")
 fi
 if bridge_engine_wants_claude_compat_copy "$engine" 2>/dev/null && [[ "$engine_entry" != "CLAUDE.md" ]]; then
-  remat_names+=("CLAUDE.md")
+  remat_entrypoint_names+=("CLAUDE.md")
 fi
+
+# Issue #1809: entrypoint-backfill-only mode. The daemon doc-backfill hygiene
+# pass (cmd_backfill_codex_entrypoints) sets this to mirror ONLY the freshly
+# backfilled/refreshed engine instruction entrypoint home->workdir, WITHOUT
+# re-running the full identity/users/scaffold sync (a much narrower side-effect
+# surface than the upgrade-time pass). When the engine has no entrypoint doc the
+# list is empty and the pass is a clean no-op. The home authority (the
+# AGENTS.md the upgrade-time backfill_codex_agents_md_home wrote/refreshed) is
+# source_dir, so this is a plain create-if-absent / differs mirror of that file.
+if [[ "${BRIDGE_REMAT_ENTRYPOINT_BACKFILL_ONLY:-0}" == "1" ]]; then
+  for name in ${remat_entrypoint_names[@]+"${remat_entrypoint_names[@]}"}; do
+    _remat_copy_one_file "$name" || true
+  done
+  _remat_finish
+  exit 0
+fi
+
+for name in ${remat_entrypoint_names[@]+"${remat_entrypoint_names[@]}"}; do
+  remat_names+=("$name")
+done
 
 for name in "${remat_names[@]}"; do
   _remat_copy_one_file "$name" || true
