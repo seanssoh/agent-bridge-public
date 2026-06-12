@@ -6756,6 +6756,21 @@ run_restart() {
   session="$(bridge_agent_session "$agent")"
   [[ -n "$session" ]] || bridge_die "세션 이름이 없습니다: $agent"
   engine="$(bridge_agent_engine "$agent")"
+  # Issue #1852: capture the creation source up front. A dynamic agent's
+  # registration lives only in its `state/agents/<a>.env` active-env file,
+  # which `bridge_refresh_runtime_state` (→ bridge-sync.sh
+  # prune_missing_dynamic_agents) archives+deletes the moment the session
+  # goes inactive after a kill. The relaunch leg then re-loads the roster,
+  # finds only static roles, and `bridge-start.sh` dies with "등록된
+  # 에이전트가 아닙니다" — leaving the agent fully deregistered + stopped
+  # (and, per #1795, a never-reap operator dynamic destroyed by a restart).
+  # We re-assert the active-env file after every post-kill refresh so the
+  # standalone relaunch re-loads the same dynamic agent — the same
+  # write-env-then-`bridge-start.sh --replace` mechanism the supported
+  # `--name --workdir --replace` recreate path uses (agent-bridge:1790,1805).
+  local agent_source=""
+  agent_source="$(bridge_agent_source "$agent")"
+  local dynamic_active_file=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -6806,6 +6821,23 @@ run_restart() {
   full_preflight_reason="$(bridge_agent_restart_preflight_full_reason "$agent")"
   if [[ -n "$full_preflight_reason" ]]; then
     bridge_die "$(bridge_agent_restart_preflight_full_guidance "$agent" "$full_preflight_reason")"
+  fi
+
+  # Issue #1852: dynamic-agent relaunch survival. Resolve the active-env file
+  # and confirm the in-memory roster still carries the engine + workdir we'd
+  # need to re-materialize it after the post-kill prune. Both are read from
+  # the in-memory maps (populated by bridge_load_roster at entry), which the
+  # kill does NOT touch — only the bridge-sync.sh subprocess deletes the
+  # on-disk file. If either is missing we cannot reconstruct a launchable
+  # registration, so fail closed BEFORE the kill and leave the running
+  # session untouched, pointing the operator at the supported recreate flow.
+  if [[ "$agent_source" == "dynamic" ]]; then
+    dynamic_active_file="$(bridge_dynamic_agent_file_for "$agent" 2>/dev/null || true)"
+    local _dyn_workdir=""
+    _dyn_workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+    if [[ -z "$dynamic_active_file" || -z "$engine" || -z "$_dyn_workdir" ]]; then
+      bridge_die "$(bridge_agent_restart_dynamic_unsupported_guidance "$agent")"
+    fi
   fi
 
   # #256 Gap 2: clear the rapid-fail quarantine marker only after the
@@ -6873,9 +6905,26 @@ run_restart() {
     "${BRIDGE_AGENT_RESTART_MARKER_TTL:-60}" "in_progress" "" \
     >/dev/null 2>&1 || true
 
+  # Issue #1852: re-materialize a dynamic agent's active-env file after the
+  # post-kill refresh deleted it. The in-memory roster maps still describe the
+  # agent (the kill is a tmux/in-process op; only the bridge-sync.sh
+  # subprocess prunes the on-disk file), so a single rewrite from those maps
+  # restores a registration the standalone relaunch can re-load. Returns
+  # non-zero if the rewrite fails so the caller can surface it rather than
+  # marching into a doomed relaunch.
+  restart_reassert_dynamic_env() {
+    [[ "$agent_source" == "dynamic" ]] || return 0
+    [[ -n "$dynamic_active_file" ]] || return 0
+    [[ -f "$dynamic_active_file" ]] && return 0
+    bridge_write_dynamic_agent_file "$agent" "$dynamic_active_file"
+  }
+
   if bridge_tmux_session_exists "$session"; then
     bridge_kill_agent_session "$agent"
     bridge_refresh_runtime_state
+    if ! restart_reassert_dynamic_env; then
+      bridge_die "[restart] '$agent' 동적 에이전트의 active-env 재기록에 실패했습니다: $dynamic_active_file — 세션이 종료되었습니다. 복구: $(bridge_agent_restart_dynamic_recreate_hint "$agent")"
+    fi
     if [[ -n "$resume_session_snapshot" ]]; then
       bridge_set_agent_session_id "$agent" "$resume_session_snapshot" 2>/dev/null || true
     fi
@@ -6890,6 +6939,10 @@ run_restart() {
   fi
 
   restart_once() {
+    # Issue #1852: a verify-retry loop kill + refresh (below) can prune the
+    # dynamic active-env file again between relaunches; re-assert it before
+    # each launch so the standalone bridge-start.sh always re-loads the agent.
+    restart_reassert_dynamic_env || return 1
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --replace "${start_args[@]}"
   }
 
@@ -6923,6 +6976,21 @@ run_restart() {
       "${BRIDGE_AGENT_RESTART_MARKER_TTL:-60}" "rolled_back" \
       "$rb_kind: $rb_detail" \
       >/dev/null 2>&1 || true
+
+    # Issue #1852: dynamic agents have no managed-block snapshot (the
+    # snapshot/restore machinery rewrites a roster-file managed block that
+    # only static agents have). The active-env file was already re-asserted
+    # after the kill, so the agent stays REGISTERED; here we simply retry the
+    # relaunch once (restart_once re-asserts the env again first). On failure
+    # the agent is left stopped-but-registered — never deregistered — and the
+    # operator can rerun `agent restart` or the recreate flow.
+    if [[ "$agent_source" == "dynamic" ]]; then
+      if ! restart_once; then
+        bridge_warn "[restart] dynamic relaunch failed for '$agent' — agent left stopped but still registered (active-env preserved). Underlying failure: $rb_kind: $rb_detail. 복구: $(bridge_agent_restart_dynamic_recreate_hint "$agent")"
+        return 1
+      fi
+      return 0
+    fi
 
     if [[ -z "$restart_snapshot" || ! -f "$restart_snapshot" ]]; then
       bridge_warn "[restart] no snapshot available for '$agent' — agent left stopped (rollback target unknown). Underlying failure: $rb_kind: $rb_detail"

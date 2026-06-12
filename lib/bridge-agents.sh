@@ -9071,6 +9071,44 @@ bridge_agent_restart_preflight_guidance() {
   printf "\n%s" "$(bridge_agent_channel_setup_guidance "$agent" "$reason")"
 }
 
+# Issue #1852: reconstruct the supported `agent-bridge --<engine> --name ...
+# --workdir ... --replace [--loop]` recreate command from a dynamic agent's
+# recorded roster metadata. Used both in the fail-closed guidance (when the
+# metadata is too thin to relaunch) and in the rollback warning (so the
+# operator has a copy-pasteable recovery line). Engine/workdir/loop come from
+# the in-memory maps the caller already loaded; missing fields degrade to
+# placeholders rather than aborting.
+bridge_agent_restart_dynamic_recreate_hint() {
+  local agent="$1"
+  local engine="" workdir="" loop=""
+
+  engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+  workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  loop="$(bridge_agent_loop "$agent" 2>/dev/null || true)"
+
+  [[ -n "$engine" ]] || engine="claude"
+  [[ -n "$workdir" ]] || workdir="<workdir>"
+
+  local hint=""
+  hint="agent-bridge --${engine} --name ${agent} --workdir ${workdir} --replace"
+  if [[ "$loop" == "1" ]]; then
+    hint+=" --loop"
+  fi
+  printf '%s' "$hint"
+}
+
+# Issue #1852: fail-closed guidance when `agent restart <dynamic>` cannot be
+# satisfied because the recorded metadata is insufficient to reconstruct a
+# launchable registration. Printed by bridge_die BEFORE any kill, so the
+# running session is left untouched.
+bridge_agent_restart_dynamic_unsupported_guidance() {
+  local agent="$1"
+
+  printf "Restart of dynamic agent '%s' is not supported with the current recorded metadata." "$agent"
+  printf "\nThe running session was left intact (restart is not a destroy verb for operator-created dynamics — see #1795)."
+  printf "\nRecreate it with the supported flow:\n  %s" "$(bridge_agent_restart_dynamic_recreate_hint "$agent")"
+}
+
 # --------------------------------------------------------------------------
 # Issue #1251 — restart marker + snapshot + auto-rollback (v0.15.0-beta3
 # Track C1). The marker file under `state/agents/<a>/restart.in-progress`
