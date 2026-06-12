@@ -10,7 +10,9 @@ import os
 import pwd
 import re
 import shlex
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,7 @@ if str(_HOOKS_DIR) not in sys.path:
 from bridge_hook_common import (  # noqa: E402
     agent_home_root,
     bridge_home_dir,
+    bridge_script_dir,
     current_agent,
     current_agent_class,
     current_agent_workdir,
@@ -324,6 +327,223 @@ def is_admin_agent(agent: str) -> bool:
     return False
 
 
+# Issue #1806 — the STRICT, anti-spoof admin predicate that gates every new
+# allow+audit loosening in this change.
+#
+# `is_admin_agent` is OR-logic: an admin assertion via EITHER
+# `BRIDGE_ADMIN_AGENT_ID` env match OR `SESSION-TYPE.md == admin` is enough.
+# That OR is fine for low-stakes diagnostic/display surfaces, but it is NOT
+# safe to use as the gate for the cross-agent-write / expansion-downgrade /
+# sqlite3 carve-outs #1806 adds:
+#
+#   - The `SESSION-TYPE.md` leg (`_admin_agent_from_session_type`) reads a
+#     file INSIDE the agent's own home. In shared mode the controller UID ==
+#     the agent UID, so the agent can write `session type: admin` into its
+#     own `SESSION-TYPE.md` and an ownership/st_uid check does not help — the
+#     file is agent-writable. An attacker-controlled agent could thereby
+#     self-assert admin and unlock peer-home WRITES. We therefore do NOT use
+#     the SESSION-TYPE.md leg here at all.
+#   - The `BRIDGE_ADMIN_AGENT_ID` env alone is also insufficient: an agent
+#     can `export BRIDGE_ADMIN_AGENT_ID=<self>` into its own session before
+#     the hook runs, flipping the env-leg True without ever being the
+#     operator-configured admin.
+#
+# The strict predicate requires BOTH halves to AGREE, where the second half
+# is sourced from the CONTROLLER-PUBLISHED roster (the `agent-bridge agent
+# list --json` CLI, which executes the controller's roster-load against the
+# git-ignored `agent-roster.local.sh` the agent cannot write through the
+# guard), NOT from any agent-writable file:
+#
+#   1. `BRIDGE_ADMIN_AGENT_ID` is set (non-empty) AND equals *agent*.
+#   2. The controller roster reports a row for *agent* with `admin == true`
+#      AND `source == "static"` (the admin is a registered static role;
+#      `bridge_require_admin_agent` enforces static at the bridge layer).
+#
+# ANY disagreement, lookup failure, malformed payload, subprocess error, or
+# timeout fails CLOSED → treated as NON-admin → the carve-out does not fire
+# and the command stays denied. This is the only predicate the #1806
+# loosenings consult.
+
+# Fixed OS temp roots a sandboxed BRIDGE_HOME may live under (matches
+# scripts/smoke-test.sh's own non-temp refusal guard). The roster-JSON test
+# seam is honored ONLY when the bridge home resolves under one of these, so the
+# seam is inert in a production install (`~/.agent-bridge`).
+#
+# SECURITY (PR #1810 r2): these are *fixed* roots only — never a value read
+# from an attacker-controllable env var. An earlier revision appended
+# ``$TMPDIR`` to this set, which let an attacker who controls the hook
+# environment set ``TMPDIR`` to the parent of the real production home
+# (e.g. ``TMPDIR=/Users/sean`` with ``BRIDGE_HOME=/Users/sean/.agent-bridge``)
+# and thereby make the *production* home classify as test-temp — honoring a
+# forged ``BRIDGE_GUARD_ADMIN_ROSTER_JSON`` and spoofing admin. `$TMPDIR` is
+# deliberately NOT trusted as a root here. ``tempfile.gettempdir()`` is
+# consulted only as an additional *fixed* root after its own realpath is proven
+# to resolve under one of these canonical roots, so it cannot be repointed at a
+# production path.
+_TEST_TEMP_PREFIXES = ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders")
+
+
+def _fixed_temp_roots() -> list[str]:
+    """Return canonical (realpath'd) fixed OS temp roots the seam may trust.
+
+    Only ``_TEST_TEMP_PREFIXES`` plus ``tempfile.gettempdir()`` — and the
+    latter ONLY when its own realpath already resolves under one of the fixed
+    prefixes, so a repointed ``$TMPDIR`` (which ``gettempdir()`` honors) cannot
+    smuggle in a production root. No raw env var is ever trusted as a root.
+    """
+    roots: list[str] = []
+    seen: set[str] = set()
+
+    def _add(real: str) -> None:
+        if real and real not in seen:
+            seen.add(real)
+            roots.append(real)
+
+    fixed_reals: list[str] = []
+    for prefix in _TEST_TEMP_PREFIXES:
+        try:
+            real = os.path.realpath(prefix)
+        except OSError:
+            continue
+        fixed_reals.append(real)
+        _add(real)
+
+    # tempfile.gettempdir() reflects $TMPDIR; accept it only if it canonically
+    # lands under one of the fixed roots above. This keeps "the OS temp dir"
+    # working on platforms whose realpath differs while refusing an attacker's
+    # production-parent $TMPDIR.
+    try:
+        gtmp = os.path.realpath(tempfile.gettempdir())
+    except OSError:
+        gtmp = ""
+    if gtmp:
+        for real in fixed_reals:
+            if gtmp == real or gtmp.startswith(real.rstrip("/") + "/"):
+                _add(gtmp)
+                break
+    return roots
+
+
+def _bridge_home_is_test_temp() -> bool:
+    """True iff the resolved bridge home sits under a FIXED OS temp root.
+
+    Used to gate the ``BRIDGE_GUARD_ADMIN_ROSTER_JSON`` seam so it is honored
+    only inside the smoke sandbox; a production session ignores the env var.
+
+    The trusted roots are fixed (``_fixed_temp_roots``); no env var (notably
+    ``$TMPDIR``) can repoint them at a production path. Both the candidate home
+    and the roots are canonicalized with ``os.path.realpath`` and containment
+    is required.
+    """
+    try:
+        home = os.path.realpath(str(bridge_home_dir()))
+    except (OSError, RuntimeError):
+        return False
+    for root in _fixed_temp_roots():
+        if home == root or home.startswith(root.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _controller_roster_admin_agreement(agent: str) -> bool:
+    """True iff the CONTROLLER-published roster confirms *agent* is the
+    admin static role.
+
+    The authoritative channel is the `agent-bridge agent list --json` CLI:
+    it runs the controller's roster loader (reading the protected,
+    git-ignored ``agent-roster.local.sh``), not a file the agent can edit.
+    A row qualifies only when ``agent`` matches, ``admin`` is boolean True,
+    and ``source`` is ``"static"``.
+
+    Test seam: ``BRIDGE_GUARD_ADMIN_ROSTER_JSON`` may point at a readable JSON
+    roster snapshot the smokes inject — BUT it is honored ONLY when the bridge
+    home resolves under a temp/test prefix (``_bridge_home_is_test_temp``). A
+    production session (``BRIDGE_HOME=~/.agent-bridge``) IGNORES the env var
+    entirely and consults only the real CLI, so an agent cannot grant itself
+    admin by exporting a forged-roster path: the seam is inert outside the
+    test sandbox. This keeps the anti-spoof anchor (a controller-owned roster
+    read via the CLI) the sole authority in production.
+
+    Fail-closed: any subprocess / parse / shape error returns False.
+    """
+    if not agent:
+        return False
+    rows: list[dict[str, Any]] | None = None
+    fixture = os.environ.get("BRIDGE_GUARD_ADMIN_ROSTER_JSON", "").strip()
+    if fixture and not _bridge_home_is_test_temp():
+        # Production / non-test bridge home: ignore the seam and fall through to
+        # the real CLI. The env var is inert here, so it cannot forge admin.
+        fixture = ""
+    if fixture:
+        try:
+            payload = json.loads(Path(fixture).expanduser().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        rows = _roster_rows_from_payload(payload)
+    else:
+        try:
+            cli = bridge_script_dir() / "agent-bridge"
+            proc = subprocess.run(
+                [str(cli), "agent", "list", "--json"],
+                cwd=str(bridge_script_dir()),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return False
+        try:
+            payload = json.loads(proc.stdout)
+        except ValueError:
+            return False
+        rows = _roster_rows_from_payload(payload)
+    if rows is None:
+        return False
+    for row in rows:
+        if row.get("agent") != agent:
+            continue
+        # `admin` must be a real boolean True (not a truthy string) and the
+        # role must be a registered static agent. A dynamic agent that has
+        # somehow been flagged admin in a forged snapshot still fails the
+        # `source == "static"` gate.
+        if row.get("admin") is True and row.get("source") == "static":
+            return True
+        return False
+    return False
+
+
+def _roster_rows_from_payload(payload: Any) -> list[dict[str, Any]] | None:
+    """Normalize the `agent list --json` payload into a list of row dicts.
+
+    Accepts either a bare list of rows or an object wrapping them under
+    ``agents`` / ``rows`` (mirrors :func:`_resolve_home_via_roster`).
+    Returns ``None`` for an unrecognized shape so the caller fails closed.
+    """
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        candidates = payload.get("agents") or payload.get("rows") or []
+        if isinstance(candidates, list):
+            return [row for row in candidates if isinstance(row, dict)]
+    return None
+
+
+def is_trusted_admin_agent_for_guard(agent: str) -> bool:
+    """STRICT anti-spoof admin predicate for the #1806 allow+audit carve-outs.
+
+    Requires BOTH the env-asserted admin id AND controller-roster agreement
+    (see the module note above). Never consults ``SESSION-TYPE.md``. Fails
+    closed on any disagreement or lookup failure → non-admin → deny.
+    """
+    admin = admin_agent_id()
+    if not admin or admin != agent:
+        return False
+    return _controller_roster_admin_agreement(agent)
+
+
 def _emit_admin_credential_read_allowed(
     agent: str,
     *,
@@ -571,6 +791,14 @@ _READ_INTENT_BASH_COMMANDS = frozenset(
         "ls",
         "find",
         "awk",
+        # Issue #1806 (3d): `sed` is a pure stdout filter UNLESS it carries the
+        # in-place flag. The `sed -i` / `sed -i…` write-mode forms are rejected
+        # in `_is_read_intent_bash` (the leader-specific guard that already
+        # existed for this entry's sake), so `sed -n 1,40p <file>` and other
+        # read shapes classify read-intent while `sed -i …` stays write-intent.
+        # This closes over-block #5's sibling (`sed -n` on a hooks/system-config
+        # file was denied as a #341 write because sed was absent from this set).
+        "sed",
         "cut",
         "sort",
         "uniq",
@@ -746,6 +974,117 @@ _FIND_MUTATION_FLAGS = frozenset(
         "-fls",
     }
 )
+
+
+# sed program write/exfil commands that need NO `-i` flag and no shell `>`
+# token: `[addr]w file` / `[addr]W file` write the pattern space / first line
+# to a file; `s/re/repl/w file` writes substituted lines; `[addr]r file` /
+# `[addr]R file` READ an external file (a leak when its content is then
+# printed). All take a FILENAME after the command letter + whitespace, so they
+# are detectable without the noise of matching a bare `w`/`r` inside a
+# replacement string. Like the awk in-program markers (#1690), any of these in
+# the sed PROGRAM drops read-intent (fail-closed).
+#
+# Pattern: the command letter sits at the program start or after a command
+# separator / address close (`;`, newline, `}`, or an address regex's closing
+# `/`), is one of w/W/r/R, and is followed by whitespace + a filename, or
+# directly by a `/`-rooted path (sed's `w` takes the rest of the line as the
+# filename, so `w/tmp/leak` with no space still writes) — OR a substitute
+# command carries a `w` write flag (`s/re/repl/[flags]w file`). The leading `-e`
+# flag letter is stripped before the scan so `-ew/tmp/leak` is seen as `w/...`.
+_SED_WRITE_COMMAND_RE = re.compile(r"(?:^|[;\n}/])\s*[wWrR](?:\s+\S|/)")
+_SED_SUBSTITUTE_WRITE_RE = re.compile(r"s(.).*?\1.*?\1[0-9gpiImMe]*w\b")
+
+
+def _sed_is_read_only(stage_tokens: list[str]) -> bool:
+    """Issue #1806 (3d): True iff a `sed` invocation is provably a pure read.
+
+    `sed` is on `_READ_INTENT_BASH_COMMANDS` because `sed -n 1,5p <file>` is a
+    pure stdout read. The read→write escalations are:
+
+      1. The in-place edit flag — GNU `-i` / `-i.bak` / `--in-place[=.bak]`,
+         BSD `-i ''`, and any short cluster containing `i` (`-ni` / `-ne -i`).
+      2. A PROGRAM write/exfil command that needs NO `-i` and no shell `>`:
+         `[addr]w file` / `[addr]W file` (write pattern space to a file),
+         `s/re/repl/…w file` (write substituted lines), `[addr]r/R file` (read
+         an external file). These live INSIDE the sed script shell-word, so the
+         per-token output-redirect check never sees them — exactly the
+         awk-program problem (#1690).
+
+    Returns False (→ write-intent, deny) on EITHER escalation. Re-tokenizes via
+    `_shell_words_with_expansion` (like `_awk_is_read_only`) so a quoted script
+    containing whitespace (`sed 'w /tmp/leak'`) is recovered as ONE word, and
+    fails closed when a script word is hidden by a `$VAR`/`$(…)` expansion or
+    an unbalanced quote. Plain `sed -n 1,40p`, `sed 's/a/b/'`, `sed '/re/d'`
+    reads stay read-intent.
+    """
+    try:
+        words = _shell_words_with_expansion(" ".join(stage_tokens))
+    except ValueError:
+        return False  # unbalanced quote → un-parseable → fail-closed
+    args = words[1:]  # skip the leading 'sed'
+    saw_ddash = False
+    seen_script = False
+    for value, shell_expanded in args:
+        tok = value
+        if saw_ddash:
+            if _sed_program_has_write_command(tok):
+                return False
+            continue
+        if tok == "--":
+            saw_ddash = True
+            continue
+        if tok.startswith("--"):
+            if tok == "--in-place" or tok.startswith("--in-place"):
+                return False
+            if "=" in tok:
+                _flag, _val = tok.split("=", 1)
+                if _sed_program_has_write_command(_val):
+                    return False
+            continue
+        if tok.startswith("-") and tok != "-":
+            cluster = tok[1:]
+            if "i" in cluster:
+                return False
+            if "e" in cluster:
+                # `-e <script>` carries the script glued (`-e'…'`) or in the
+                # NEXT positional; scan a glued tail here. A separate next-token
+                # script is handled as a positional below.
+                tail = cluster.split("e", 1)[1]
+                if tail and _sed_program_has_write_command(tail):
+                    return False
+            continue
+        # A positional: the FIRST one is the sed script (when no -e/-f gave it);
+        # later positionals are file paths. A `$VAR`-hidden script word can
+        # smuggle a write command past the static scan → fail closed.
+        if not seen_script:
+            seen_script = True
+            if shell_expanded:
+                return False
+        if _sed_program_has_write_command(tok):
+            return False
+    return True
+
+
+def _sed_program_has_write_command(program: str) -> bool:
+    """Conservative scan of a sed PROGRAM/script token for a write/exfil
+    command (`[addr]w file`, `[addr]W file`, `[addr]r/R file`) or a
+    `s/re/repl/…w file` substitute-write flag.
+
+    Fail-closed but precise enough not to trip on a `w`/`r` inside a
+    replacement string (`s/foo/word/`): the command form requires the letter in
+    a command position (program start / after `;`/newline/`}` / address-close
+    `/`) followed by whitespace + a filename. This never lets `sed 'w
+    /tmp/leak'` or `sed -n 's/x/y/w /tmp/leak'` ride the read-intent carve-out,
+    while `sed -n 1,40p`, `sed 's/a/b/'`, `sed '/re/d'` stay read-only.
+    """
+    if not program:
+        return False
+    if _SED_WRITE_COMMAND_RE.search(program):
+        return True
+    if _SED_SUBSTITUTE_WRITE_RE.search(program):
+        return True
+    return False
 
 
 def _find_is_read_only(stage_tokens: list[str]) -> bool:
@@ -1479,7 +1818,7 @@ def _is_read_intent_bash(command: str) -> bool:
             # Reject the in-place / write-mode flag forms even for tools
             # that are normally read-only (e.g. `sed -i`, `awk -i inplace`).
             stage_tokens = stage_stripped.split()
-            if leaf == "sed" and any(t == "-i" or t.startswith("-i") for t in stage_tokens[1:]):
+            if leaf == "sed" and not _sed_is_read_only(stage_tokens):
                 return False
             if leaf == "awk" and "-i" in stage_tokens[1:]:
                 return False
@@ -1745,6 +2084,29 @@ def protected_path_reason(
         if read_intent:
             return None
         return SYSTEM_CONFIG_DENY_REASON
+    # Issue #1711 (folded into #1806): the shared/private + shared/secrets
+    # forbidden subtrees hold operator secrets and stay DENIED for EVERY
+    # agent INCLUDING admin — harmonizing the non-Bash Read surface with the
+    # Bash `protected_alias_reason` unconditional Stage-A deny. Previously the
+    # `if admin: return None` early-return below let an admin Read
+    # `shared/secrets/*` through the Read tool even though the same path was
+    # denied via Bash `cat`. This deny is class-agnostic and intent-agnostic
+    # (read or write): there is no sanctioned Read of these trees. It MUST run
+    # BEFORE the `if admin: return None` early-return. System-config READ
+    # stays allowed for all agents (handled above; only writes route through
+    # the wrapper).
+    rel_forbidden = _resolve_under(path, bridge_home_dir() / "shared")
+    if rel_forbidden is not None:
+        rel_forbidden_str = rel_forbidden.as_posix()
+        if rel_forbidden_str != "." and any(
+            rel_forbidden_str == forbidden.rstrip("/")
+            or rel_forbidden_str.startswith(forbidden)
+            for forbidden in _SHARED_FORBIDDEN_PREFIXES
+        ):
+            return (
+                "cross-agent access is blocked: shared/private and "
+                "shared/secrets are off-limits"
+            )
     if admin:
         return None
     # Issue #539 r2: shared/* is NOT a peer-agent path, so
@@ -5954,12 +6316,347 @@ def _validate_auth_flag_value(flag: str, value: str) -> bool:
     return False
 
 
+# Issue #1806 — admin cross-agent WRITE audit row. Mirrors
+# `emit_system_cross_agent_read` (the cross-agent READ ledger) so the
+# operator retains a full ledger of admin peer-home WRITES the guard now
+# allows. `action == "admin_cross_agent_write"` is the grep anchor.
+def emit_admin_cross_agent_write(
+    *,
+    agent: str,
+    operation: str,
+    resolved_source: str,
+    resolved_target: str,
+    target_agent: str,
+    command: str,
+) -> None:
+    write_audit(
+        "admin_cross_agent_write",
+        agent or "unknown",
+        {
+            "agent": agent or "unknown",
+            "operation": operation,
+            "resolved_source": resolved_source,
+            "resolved_target": resolved_target,
+            "target_agent": target_agent,
+            "command": truncate_text(command, 240),
+            "tool": "Bash",
+        },
+    )
+
+
+def _resolve_word_through_symlinks(word: str) -> Path | None:
+    """Resolve a single absolute path *word* through symlinks + ``..``,
+    tolerating a not-yet-existing leaf.
+
+    Returns the resolved ``Path`` or ``None`` when the word is not a clean,
+    statically-modelable absolute path. Fails closed (returns ``None``) on:
+    any unresolved expansion (`$VAR`/`~`/brace), a glob/command-sub, a
+    relative path (cwd unmodeled here), or a resolution error.
+
+    For a not-yet-existing target the deepest EXISTING ancestor is resolved
+    through symlinks first, so a symlinked PARENT that escapes a containment
+    root is caught; the remaining leaf components are then re-appended to that
+    resolved base. ``..`` is folded by ``Path.resolve``.
+    """
+    w = word.strip()
+    if not w:
+        return None
+    if _has_unresolved_path_expansion(w):
+        return None
+    if any(ch in w for ch in _OBFUSCATION_GLOB_CHARS):
+        return None
+    if "$(" in w or "`" in w or "${" in w:
+        return None
+    try:
+        candidate = Path(w).expanduser()
+    except (ValueError, OSError):
+        return None
+    if not candidate.is_absolute():
+        return None
+    try:
+        existing = candidate
+        tail_parts: list[str] = []
+        while not existing.exists():
+            parent = existing.parent
+            if parent == existing:
+                return None  # walked past the filesystem root
+            tail_parts.append(existing.name)
+            existing = parent
+        resolved = existing.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    for name in reversed(tail_parts):
+        resolved = resolved / name
+    return resolved
+
+
+def _path_in_forbidden_tree(resolved: Path) -> bool:
+    """True iff *resolved* is — or sits under — shared/private, shared/secrets,
+    or a #341 protected-config path. The hard-denied trees that stay off-limits
+    even for an admin contained-write carve-out."""
+    shared_root = bridge_home_dir() / "shared"
+    rel_shared = _resolve_under(resolved, shared_root)
+    if rel_shared is not None:
+        rel_str = rel_shared.as_posix()
+        if rel_str != "." and any(
+            rel_str == forbidden.rstrip("/") or rel_str.startswith(forbidden)
+            for forbidden in _SHARED_FORBIDDEN_PREFIXES
+        ):
+            return True
+    return bool(is_protected_path(resolved))
+
+
+def _admin_read_expansion_provably_safe(text: str, agent: str) -> list[tuple[str, str]] | None:
+    """Issue #1806 (3b/3c) — prove a trusted-admin read-intent command whose
+    only blocker is an expansion / glob fail-close is SAFE, and return the
+    peer-home references to audit.
+
+    The fail-close exists because a `~`/`$VAR`/glob spelling hides a path from
+    the static analyzers (#1690 r4). For a STRICT trusted-admin we may downgrade
+    that fail-close to allow+audit, but ONLY when we can still PROVE the command
+    cannot resolve into a forbidden tree:
+
+      1. Stage A's resolved-path forbidden check already ran upstream and did
+         NOT fire (else the function returned), so the command provably does not
+         resolve into shared/private or shared/secrets via any spelling/`..`.
+      2. Here we additionally expand the bridge-KNOWN prefixes
+         (`~`/`$HOME`/`$BRIDGE_HOME`) in every path word and require that NO
+         word retains an unresolved `$`-expansion AND NO word carries a glob
+         (`* ? [ ]`) or command-sub — an un-modelable word is never provably
+         safe (fail closed → return ``None`` → the caller keeps the deny).
+      3. Each fully-resolved word is re-checked against the forbidden trees and
+         #341 protected-config; any hit → ``None`` (deny).
+
+    Returns the list of ``(resolved_path, peer_agent)`` for words that resolve
+    into a peer home (for the audit ledger), or ``None`` when the command is
+    not provably safe. An empty list (no peer-home reference) also returns
+    ``None`` so a non-peer expansion read is not mis-audited and instead falls
+    through to its normal handling.
+    """
+    # Per-word safety: split into shell words (expansion-aware) and inspect.
+    try:
+        words = _shell_words_with_expansion(text)
+    except ValueError:
+        return None
+    peer_homes = other_agent_homes(agent)
+    peer_refs: list[tuple[str, str]] = []
+    for raw_word, shell_expanded in words:
+        if not raw_word:
+            continue
+        # A command-substitution / backtick / surviving non-bridge `$var`
+        # word the shell would rewrite is un-modelable → fail closed.
+        if shell_expanded:
+            return None
+        if any(ch in raw_word for ch in _OBFUSCATION_GLOB_CHARS):
+            return None
+        expanded = _expand_bridge_prefixes(raw_word)
+        # A surviving `$` after expanding the KNOWN prefixes is an unresolved
+        # arbitrary-var expansion — never provably safe.
+        if "$" in expanded:
+            return None
+        # Only model path-shaped words (absolute after expansion). A bare flag
+        # / option word (`-l`, `--color`) is not a path.
+        if not expanded.startswith("/"):
+            continue
+        try:
+            resolved = Path(expanded).resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if _path_in_forbidden_tree(resolved):
+            return None
+        for peer_home in peer_homes:
+            try:
+                peer_resolved = peer_home.resolve(strict=False)
+            except (OSError, RuntimeError):
+                continue
+            try:
+                resolved.relative_to(peer_resolved)
+            except ValueError:
+                continue
+            peer_refs.append((str(resolved), peer_home.name))
+            break
+    if not peer_refs:
+        return None
+    return peer_refs
+
+
+def _resolved_write_target_containment(target_word: str, agent: str) -> tuple[str, str] | None:
+    """Resolve a write-target path word and confirm RESOLVED-PATH containment
+    inside the operator bridge home AND outside every hard-denied tree.
+
+    Returns ``(resolved_target, target_agent)`` when the target provably
+    lands inside the bridge home and NOT inside shared/private, shared/secrets,
+    or a #341 protected-config path. ``target_agent`` is the peer whose home
+    contains the target (for the audit row), or ``""`` when the target is a
+    safe NON-peer bridge-home location (e.g. a ``backups/`` quarantine
+    destination — the #1803 case #1 shape ``mv <peer> <bridge>/backups/…``).
+
+    Returns ``None`` (the caller denies) when:
+
+      - the word carries an unresolved expansion / glob / command-sub the
+        analyzer cannot reduce to a literal — a hidden target is never a safe
+        write carve-out (fail closed);
+      - the resolved target (or, for a not-yet-existing target, its deepest
+        EXISTING ancestor resolved through symlinks) escapes OUTSIDE the bridge
+        home, e.g. a `..` traversal or a symlinked parent pointing at `/etc`;
+      - the resolved target sits inside shared/private, shared/secrets, or a
+        protected-config path.
+
+    Containment is by RESOLVED PATH, not substring, so a symlink/`..` escape
+    cannot masquerade as a contained write.
+    """
+    resolved_target = _resolve_word_through_symlinks(target_word)
+    if resolved_target is None:
+        return None
+    bridge_home = bridge_home_dir()
+    # Must stay under the operator bridge home (symlink-resolved on both
+    # sides). A quarantine destination (backups/) and a peer workdir are both
+    # under the bridge home; an escape to /etc or another user's tree is not.
+    try:
+        bridge_resolved = bridge_home.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    try:
+        resolved_target.relative_to(bridge_resolved)
+    except ValueError:
+        return None
+    # Hard-denied trees stay denied even for a contained write.
+    if _path_in_forbidden_tree(resolved_target):
+        return None
+    # Tag the peer home (if any) the target lands in, for the audit row.
+    target_agent = ""
+    for peer_home in other_agent_homes(agent):
+        try:
+            peer_resolved = peer_home.resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        try:
+            resolved_target.relative_to(peer_resolved)
+        except ValueError:
+            continue
+        target_agent = peer_home.name
+        break
+    return str(resolved_target), target_agent
+
+
+# Filesystem-tree write commands the #1806 peer-home carve-out recognizes.
+# Each is an op the admin runs for #1803 hygiene (quarantine a retired home,
+# scaffold a workdir, copy a backup). mv/cp take ``[srcs…] dst``; mkdir/rmdir
+# take ``[dirs…]`` (all positionals are write targets).
+_PEER_WRITE_SRC_DST_CMDS: frozenset[str] = frozenset({"mv", "cp"})
+_PEER_WRITE_DIR_CMDS: frozenset[str] = frozenset({"mkdir", "rmdir"})
+
+
+def _admin_peer_write_operands(text: str) -> tuple[str, list[str], list[str]] | None:
+    """Extract ``(operation, source_words, dest_words)`` for a single
+    sanctioned filesystem-tree write, or ``None`` when *text* is not a clean
+    single-stage write of a recognized shape.
+
+    - ``mv``/``cp``: every positional except the last is a source; the last is
+      the destination. (``mv a b c/`` → sources ``[a, b]``, dest ``[c/]``.)
+    - ``mkdir``/``rmdir``: every positional is a destination; no sources.
+
+    Strictly single-stage and metachar-free: any pipe / `;` / `&&` / `&` /
+    output-or-input redirection / command-sub / heredoc makes the command
+    un-modelable, so we return ``None`` (the caller denies). The operands are
+    still each independently containment-checked by the caller — this
+    extractor only names candidate tokens, it authorizes nothing.
+    """
+    if _command_has_shell_embedding(text):
+        return None
+    if any(op in text for op in ("|", ";", "&", "\n", "<", ">")):
+        return None
+    try:
+        tokens = shlex.split(text, posix=True, comments=False)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    leaf = tokens[0].rsplit("/", 1)[-1]
+    # None of mv/cp/mkdir/rmdir take a value-bearing short flag that consumes
+    # the next positional in the shapes we allow, so a bare flag-skip is
+    # sufficient. ``--`` is dropped (end-of-options marker).
+    positionals = [t for t in tokens[1:] if t != "--" and not t.startswith("-")]
+    if leaf in _PEER_WRITE_SRC_DST_CMDS:
+        if len(positionals) < 2:
+            return None
+        return leaf, list(positionals[:-1]), [positionals[-1]]
+    if leaf in _PEER_WRITE_DIR_CMDS:
+        if not positionals:
+            return None
+        return leaf, [], list(positionals)
+    return None
+
+
+def _admin_sqlite3_task_db_audit(text: str, agent: str) -> str | None:
+    """Issue #1806 (3e) — recognize an EXACT trusted-admin
+    ``sqlite3 <task_db> …`` invocation and return the resolved task-db path
+    for the audit row, or ``None`` when *text* is not that shape.
+
+    Strict, single-stage, metachar-free (the caller also re-checks
+    `_command_has_shell_embedding`): any pipe / `;` / `&&` / `&` / redirection /
+    command-sub makes the command un-modelable, so we return ``None``. The
+    FIRST positional argv token (the sqlite3 database argument) must resolve to
+    EXACTLY the queue task DB; a sqlite3 against any other path falls through
+    unchanged (its own gates apply). No SQL is parsed — the database-path
+    identity is the entire boundary; SQL semantics are deliberately out of
+    scope (a write SELECT/UPDATE is audited the same, since the policy is
+    allow+audit for the admin, not read-only enforcement).
+    """
+    if any(op in text for op in ("|", ";", "&", "\n", "<", ">", "`")):
+        return None
+    if "$(" in text:
+        return None
+    try:
+        tokens = shlex.split(text, posix=True, comments=False)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    if tokens[0].rsplit("/", 1)[-1] != "sqlite3":
+        return None
+    # First non-flag positional after `sqlite3` is the database path.
+    db_word = None
+    for tok in tokens[1:]:
+        if tok == "--":
+            continue
+        if tok.startswith("-"):
+            continue
+        db_word = tok
+        break
+    if db_word is None:
+        return None
+    # Expand the bridge-known prefixes (`~`/$HOME/$BRIDGE_HOME); a surviving
+    # `$` is an unresolved expansion → fail closed.
+    expanded = _expand_bridge_prefixes(db_word)
+    if "$" in expanded:
+        return None
+    try:
+        candidate = Path(expanded).expanduser()
+    except (ValueError, OSError):
+        return None
+    try:
+        resolved_db = candidate.resolve(strict=False)
+        resolved_task_db = task_db_path().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    if resolved_db != resolved_task_db:
+        return None
+    return str(resolved_task_db)
+
+
 def protected_alias_reason(
     text: str,
     agent: str,
     tool_input: dict[str, Any] | None = None,
 ) -> str | None:
     admin = is_admin_agent(agent)
+    # Issue #1806 — the STRICT, anti-spoof admin predicate. Every cross-agent
+    # allow+audit loosening this change adds (peer-home read AND write,
+    # expansion/glob downgrade, sqlite3) gates on THIS predicate, never on the
+    # loose `admin` (which trusts the agent-writable SESSION-TYPE.md). Computed
+    # once up front so the carve-outs below share one fail-closed source.
+    trusted_admin = is_trusted_admin_agent_for_guard(agent)
     # The two checks below use shlex argv matching rather than substring
     # matching (closes #252). A Bash invocation that actually opens the
     # protected file still has to name the real path as a positional
@@ -6177,6 +6874,44 @@ def protected_alias_reason(
         # shared/secrets deny could fire. Instead, only the tasks.db-
         # SPECIFIC deny is lifted: fall through and keep evaluating, so a
         # forbidden path in the same command is still denied downstream.
+        # Issue #1806 (3e) — trusted-admin sqlite3 against the queue DB.
+        # sqlite3 is deliberately NOT read-intent, so a `sqlite3 <task_db>
+        # 'SELECT …'` read is denied by the `if not read_intent:` deny just
+        # below (over-block #5). For a STRICT trusted-admin, allow+audit an
+        # EXACT single-stage `sqlite3 <task_db> …` invocation. Fail-safe:
+        # `_admin_sqlite3_task_db_audit` rejects ANY shell metachar/embedding
+        # and requires the FIRST positional to resolve to EXACTLY the task DB
+        # (no room for a forbidden sibling operand). We ALSO re-run the Stage-A
+        # shared-forbidden + #341 system-config checks before allowing, so the
+        # carve-out can never return allow ahead of those gates (the task-db
+        # gate sits before Stage A in the linear flow). No SQL parser is the
+        # boundary; the audit row records the full command. A non-admin
+        # sqlite3, or a sqlite3 against a non-task-db path, falls through to the
+        # unconditional `if not read_intent:` deny below.
+        if (
+            trusted_admin
+            and not read_intent
+            and not _command_has_shell_embedding(text)
+        ):
+            sqlite_db = _admin_sqlite3_task_db_audit(text, agent)
+            if (
+                sqlite_db is not None
+                and not any(a in text for a in _shared_forbidden_aliases())
+                and _forbidden_suffix_in_command(text, _shared_forbidden_suffixes())
+                is None
+                and not _bash_argv_references_system_config(text)
+            ):
+                write_audit(
+                    "admin_sqlite3_task_db",
+                    agent or "unknown",
+                    {
+                        "agent": agent or "unknown",
+                        "target_path": sqlite_db,
+                        "command": truncate_text(text, 240),
+                        "tool": "Bash",
+                    },
+                )
+                return None
         if not read_intent:
             return "direct queue DB access is blocked; use `agb` queue commands instead"
         # Issue #1690 r4 FIX 2: the read carve-out falls through to the
@@ -6271,48 +7006,40 @@ def protected_alias_reason(
         )
 
     # Issue #1692 — admin read-intent carve-out for the Bash PEER-HOME
-    # gate (Stage B), mirroring the non-Bash `protected_path_reason` admin
-    # read exemption for peer agent homes. Without this an admin
-    # (`is_admin_agent`) could `Read file_path=<peer>/MEMORY.md` but the
+    # gate (Stage B) (retightened for #1806), mirroring the non-Bash
+    # `protected_path_reason` admin read exemption for peer agent homes.
+    # Without this an admin could `Read file_path=<peer>/MEMORY.md` but the
     # SAME read via Bash `cat`/`grep` was denied, blocking routine admin
-    # triage. Placed AFTER the Stage A shared-forbidden deny so admin
-    # reads of `shared/private|secrets` stay blocked (see above).
+    # triage. Placed AFTER the Stage A shared-forbidden deny so admin reads of
+    # `shared/private|secrets` stay blocked (see above).
     #
-    # Scope is deliberately NARROW and fail-closed. The carve-out fires
-    # ONLY when ALL of the following hold:
-    #   - `is_admin_agent(agent)` — keyed on admin, NOT
-    #     `current_agent_class()`. admin and system-class are separate
-    #     concepts (class is only user|system; admin is resolved via
-    #     session-type / admin id). The system-class read carve-out in
-    #     Stage B below stays reachable independently for a system-class
-    #     non-admin agent; non-admin agents never reach this branch.
-    #   - `read_intent` — `_is_read_intent_bash(text)`. This already
-    #     fails closed on output redirection, in-place / output-file /
-    #     external-exec reader forms (`sed -i`, `sort -o`, `uniq IN OUT`,
-    #     `xxd`, `yq -i`/`-s`, `awk` in-program redirect/pipe/system,
-    #     `find -delete/-exec`, pager `+cmd`, `rg --pre`, dangerous env
-    #     prefixes) and on unquoted shell embeddings (#1690). So an admin
-    #     WRITE-intent command to a peer home falls through to the Stage
-    #     B deny below and stays blocked — admin mutations to peer state
-    #     still route through the queue, never direct Bash. This is
-    #     intentionally tighter than the non-Bash `if admin: return None`.
-    #   - `not read_carveout_blocked_by_expansion` — a read whose path is
-    #     spelled via an unresolved `$VAR`/`~`/brace expansion loses the
-    #     carve-out (#1690 r4 FIX 2): the literal protected path never
-    #     appears for the substring gate, so a forbidden sibling could be
-    #     smuggled in. Fail closed.
+    # SCOPE NOTE (#1806): this PRE-EXISTING peer-READ carve-out keeps its loose
+    # `is_admin_agent` gate — reads are lower risk than the new WRITE/sqlite3
+    # loosenings, and retightening an already-shipped path is out of #1806's
+    # "new allow+audit" scope (it would also change behavior for existing
+    # admin-read flows). The NEW #1806 loosenings (peer-WRITE 3a, expansion/glob
+    # 3b/3c, sqlite3 3e) all gate on the STRICT `trusted_admin` predicate
+    # instead, so a spoofed SESSION-TYPE.md can never unlock a cross-agent WRITE
+    # or sqlite3. Otherwise NARROW and fail-closed, the read carve-out fires
+    # ONLY when ALL hold:
+    #   - `admin` — `is_admin_agent(agent)` (env id OR session-type).
+    #   - `read_intent` — `_is_read_intent_bash(text)`. Fails closed on output
+    #     redirection, in-place / output-file / external-exec reader forms
+    #     (`sed -i`, `sort -o`, `uniq IN OUT`, `xxd`, `yq -i`/`-s`, `awk`
+    #     in-program redirect/pipe/system, `find -delete/-exec`, pager `+cmd`,
+    #     `rg --pre`, dangerous env prefixes) and on unquoted shell embeddings
+    #     (#1690). An admin WRITE-intent peer command does NOT ride this read
+    #     carve-out — it routes through the explicit peer-WRITE carve-out below
+    #     (resolved-path contained) or the Stage B deny.
+    #   - `not read_carveout_blocked_by_expansion` — a read spelled via an
+    #     unresolved `$VAR`/`~`/brace expansion loses the carve-out (#1690 r4
+    #     FIX 2): the literal protected path never appears for the substring
+    #     gate, so a forbidden sibling could be smuggled in. Fail closed.
     #   - `not _command_has_shell_embedding(text)` — belt-and-suspenders
-    #     re-check (catches single-quoted embeddings the `read_intent`
-    #     unquoted-only check passes), mirroring the Stage B system-class
-    #     guard so an embedded mutation cannot ride a read leader.
+    #     re-check (single-quoted embeddings the `read_intent` unquoted-only
+    #     check passes), mirroring the Stage B system-class guard.
     #
-    # We emit a `system_cross_agent_read` audit row (one per matched peer
-    # alias) so the operator keeps a full ledger of admin cross-agent
-    # reads, matching the Stage B system-class discipline. We return None
-    # ONLY when a peer alias actually matched, so a non-matching admin
-    # command falls through unchanged. NOTE: the raw-substring alias
-    # matching has a separate, pre-existing brace/`$BRIDGE_HOME` spelling
-    # gap tracked in #1709 — NOT addressed here.
+    # Emits a `system_cross_agent_read` audit row (one per matched peer alias).
     if (
         admin
         and read_intent
@@ -6331,6 +7058,98 @@ def protected_alias_reason(
                 admin_peer_read_audited = True
         if admin_peer_read_audited:
             return None
+
+    # Issue #1806 (3b/3c) — trusted-admin read-intent EXPANSION/GLOB downgrade.
+    # The over-blocks: `ls ~/.agent-bridge/agents/<peer>/logs/` and a glob read
+    # of core files lose the #1692 peer-read carve-out because the `~`/glob
+    # spelling sets `read_carveout_blocked_by_expansion` / trips the
+    # obfuscation fail-close. For a STRICT trusted-admin we downgrade that
+    # fail-close to allow+audit, but ONLY when the command is PROVABLY safe:
+    # `_admin_read_expansion_provably_safe` expands the bridge-known prefixes,
+    # rejects any surviving `$`-expansion / glob / command-sub, and re-checks
+    # every resolved word against the forbidden trees + #341 config. It runs
+    # AFTER Stage A (which already proved no shared/private|secrets resolution
+    # via any spelling) and only fires for read-intent commands. If the proof
+    # fails, we do NOT allow — the command stays denied (deny even for admin,
+    # per the brief). Emits a `system_cross_agent_read` row per peer reference.
+    if trusted_admin and read_intent and not _command_has_shell_embedding(text):
+        provable = _admin_read_expansion_provably_safe(text, agent)
+        if provable is not None:
+            for resolved_path, target_agent in provable:
+                emit_system_cross_agent_read(
+                    agent=agent,
+                    target_path=resolved_path,
+                    target_agent=target_agent,
+                    tool="Bash",
+                )
+            return None
+
+    # Issue #1806 (3a) — admin peer-home WRITE carve-out: allow+audit a
+    # filesystem-tree write (mv / cp / mkdir / rmdir) whose RESOLVED target is
+    # CONTAINED under a peer agent home AND outside every hard-denied tree.
+    # This unblocks the #1803 hygiene workflow (quarantine a retired home,
+    # scaffold a peer workdir) that the operator was forced to hand-run.
+    #
+    # Fail-safe ordering: this runs AFTER the Stage A shared/private +
+    # shared/secrets denies (and after the #341 system-config gate above), so
+    # a `mv <peer> <backup>` command that also names a forbidden path has
+    # already been denied. Containment is by RESOLVED PATH (symlink + `..`
+    # folded), NOT substring — `_resolved_write_target_containment` rejects a
+    # symlink/`..` escape and re-checks the resolved target against
+    # shared/private, shared/secrets, and #341 protected-config. The command
+    # must be a single, metachar-free simple write (no `;`/`&&`/`|`/redirect/
+    # command-sub), so a `mv a b ; rm shared/secrets/x` sibling cannot ride.
+    # Gated on the STRICT `trusted_admin` predicate; non-admin (and
+    # SESSION-TYPE-spoofed) callers never reach the allow.
+    if trusted_admin and not read_carveout_blocked_by_expansion:
+        operands = _admin_peer_write_operands(text)
+        if operands is not None:
+            operation, source_words, dest_words = operands
+            # Resolve EVERY operand (sources + destinations) and require each to
+            # stay contained under the bridge home and outside the hard-denied
+            # trees (shared/private, shared/secrets, #341 protected-config). A
+            # single un-contained operand — a `..`/symlink escape, a forbidden
+            # source like `mv shared/secrets/x <dst>`, or an out-of-bridge-home
+            # target — denies the whole command (fail closed).
+            resolved_sources: list[str] = []
+            resolved_dests: list[tuple[str, str]] = []
+            references_peer = False
+            all_contained = True
+            for word in source_words:
+                contained = _resolved_write_target_containment(word, agent)
+                if contained is None:
+                    all_contained = False
+                    break
+                resolved_path, target_agent = contained
+                resolved_sources.append(resolved_path)
+                if target_agent:
+                    references_peer = True
+            if all_contained:
+                for word in dest_words:
+                    contained = _resolved_write_target_containment(word, agent)
+                    if contained is None:
+                        all_contained = False
+                        break
+                    resolved_path, target_agent = contained
+                    resolved_dests.append((resolved_path, target_agent))
+                    if target_agent:
+                        references_peer = True
+            # Only allow+audit when EVERY operand is contained AND the command
+            # actually touches a peer home (source OR destination) — so a
+            # benign same-home/non-peer write is NOT mis-audited as a
+            # cross-agent write; it falls through to its normal handling.
+            if all_contained and references_peer:
+                source_repr = " ".join(resolved_sources)
+                for resolved_target, target_agent in resolved_dests:
+                    emit_admin_cross_agent_write(
+                        agent=agent,
+                        operation=operation,
+                        resolved_source=source_repr,
+                        resolved_target=resolved_target,
+                        target_agent=target_agent,
+                        command=text,
+                    )
+                return None
 
     # Stage B: peer-agent-home substring deny with a system-class
     # read-intent exception path. The default stance is deny: a system-
