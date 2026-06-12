@@ -3194,18 +3194,62 @@ _CWD_POISONED = "\x00POISONED\x00"
 _CD_LIKELY_SUCCESS = "\x00CD_OK\x00"
 
 
+# Issue #1823 (r2): the v2 layout anchors `$BRIDGE_DATA_ROOT` and
+# `$BRIDGE_AGENT_ROOT_V2` are TRUSTED bridge location anchors — exactly like
+# `$BRIDGE_HOME` — and Agent Bridge EXPORTS both into every agent's runtime
+# environment (`lib/bridge-isolation-v2.sh`, the generated agent env files). A
+# non-admin agent's bash therefore expands `$BRIDGE_DATA_ROOT/agents/<peer>/
+# home/...` to the exact peer v2 home at runtime. They must be resolved here so
+# the v2 peer-home suffix matcher sees the resolved `/agents/<peer>/home` tail,
+# not a `$`-prefixed word that falls through to ALLOW. Resolved from the SAME
+# SSOT the rest of the guard uses (`agent_root_v2()` → `<data_root>/agents`):
+#   $BRIDGE_AGENT_ROOT_V2 → str(agent_root_v2())
+#   $BRIDGE_DATA_ROOT     → str(agent_root_v2().parent)  (== <data_root>)
+# Tokens an agent can spell to reach a peer v2 home. Order matters: the bare
+# `$NAME` regex carries a `(?![A-Za-z0-9_])` guard so `$BRIDGE_DATA_ROOTX` is
+# not mistaken for `$BRIDGE_DATA_ROOT`.
+_V2_ANCHOR_NAMES = ("BRIDGE_AGENT_ROOT_V2", "BRIDGE_DATA_ROOT")
+
+
+def _v2_anchor_value(name: str) -> str:
+    """Resolve a v2 location-anchor env var NAME to the absolute path bash
+    would expand it to at runtime, using the guard's own SSOT
+    (:func:`agent_root_v2`). Returns ``""`` when the v2 root cannot be resolved
+    in this hook's environment (e.g. neither ``BRIDGE_DATA_ROOT`` nor
+    ``BRIDGE_AGENT_ROOT_V2`` is set) — the caller treats an unresolved v2 anchor
+    as fail-CLOSE, never ALLOW.
+    """
+    try:
+        root_v2 = agent_root_v2()
+    except Exception:  # noqa: BLE001 — v2 root unresolved → caller fails closed
+        root_v2 = None
+    if root_v2 is None:
+        return ""
+    if name == "BRIDGE_AGENT_ROOT_V2":
+        return str(root_v2)
+    if name == "BRIDGE_DATA_ROOT":
+        # `agent_root_v2()` is `<data_root>/agents`; its parent is the data root.
+        return str(root_v2.parent)
+    return ""
+
+
 def _expand_bridge_prefixes(word: str) -> str:
     """Expand ONLY the bridge-known location prefixes in *word* — ``~`` /
     ``$HOME`` / ``${HOME}`` → the home dir, ``$BRIDGE_HOME`` / ``${BRIDGE_HOME}``
-    → the operator bridge home — and leave every OTHER ``$var`` literal.
+    → the operator bridge home, ``$BRIDGE_DATA_ROOT`` / ``${BRIDGE_DATA_ROOT}``
+    and ``$BRIDGE_AGENT_ROOT_V2`` / ``${BRIDGE_AGENT_ROOT_V2}`` → the v2 data /
+    agent root (issue #1823) — and leave every OTHER ``$var`` literal.
 
     Deliberately does NOT call :func:`os.path.expandvars`, which would leak
     the arbitrary process environment into the resolved path (a
     security-sensitive over-reach: an attacker-influenced variable could
     re-spell a benign word into the secret tree, or mask a real one). Only
-    ``HOME`` and ``BRIDGE_HOME`` are trusted location anchors. A surviving
-    ``$`` in the result signals an unresolved expansion the caller must treat
-    as fail-closed-where-suspect.
+    ``HOME``, ``BRIDGE_HOME``, and the v2 layout anchors ``BRIDGE_DATA_ROOT`` /
+    ``BRIDGE_AGENT_ROOT_V2`` are trusted location anchors. A surviving ``$`` in
+    the result signals an unresolved expansion the caller must treat as
+    fail-closed-where-suspect — and for the v2 anchors specifically the caller
+    fails CLOSED (deny), never ALLOW, because they demonstrably resolve to a
+    peer v2 home at runtime even when this hook's env cannot expand them.
     """
     try:
         home = str(bridge_home_dir())
@@ -3224,7 +3268,39 @@ def _expand_bridge_prefixes(word: str) -> str:
     if home_dir and home_dir != "~":
         out = out.replace("${HOME}", home_dir)
         out = re.sub(r"\$HOME(?![A-Za-z0-9_])", lambda _m: home_dir, out)
+    # v2 layout anchors (issue #1823). Resolved from `agent_root_v2()`; when
+    # that returns None (unresolvable in this env) the token is left intact so a
+    # surviving `$BRIDGE_DATA_ROOT` / `$BRIDGE_AGENT_ROOT_V2` reaches the caller,
+    # which fails CLOSED on it (see `_word_carries_unresolved_v2_anchor`).
+    for name in _V2_ANCHOR_NAMES:
+        value = _v2_anchor_value(name)
+        if not value:
+            continue
+        out = out.replace("${" + name + "}", value)
+        out = re.sub(rf"\${name}(?![A-Za-z0-9_])", lambda _m, v=value: v, out)
     return out
+
+
+def _word_carries_unresolved_v2_anchor(word: str) -> bool:
+    """True iff *word* still contains a v2 location-anchor env-var token
+    (``$BRIDGE_DATA_ROOT`` / ``${BRIDGE_DATA_ROOT}`` / ``$BRIDGE_AGENT_ROOT_V2``
+    / ``${BRIDGE_AGENT_ROOT_V2}``) AFTER bridge-prefix expansion — i.e. a
+    trusted v2 anchor this hook could not statically resolve.
+
+    Issue #1823 (r2): these anchors are EXPORTED into the agent runtime, so bash
+    WILL expand them to a concrete peer v2 home at execution time even when this
+    hook's own environment lacks them. The safe direction for a trusted anchor
+    that demonstrably resolves to a peer home is therefore DENY, never the
+    ``$``-survives → ALLOW fall-through. Brace and bare spellings both count; the
+    bare form uses the same identifier-boundary guard as the expander so
+    ``$BRIDGE_DATA_ROOTX`` is not a false positive.
+    """
+    for name in _V2_ANCHOR_NAMES:
+        if "${" + name + "}" in word:
+            return True
+        if re.search(rf"\${name}(?![A-Za-z0-9_])", word) is not None:
+            return True
+    return False
 
 
 # Non-forking cd wrappers: `command`/`builtin` (each with its own option
@@ -3589,6 +3665,70 @@ def _command_effective_cwd(segments: list[str]) -> object:
     return eff
 
 
+def _unresolved_v2_anchor_forbidden_suffix(
+    word: str,
+    forbidden_dirs: list[tuple[str, str]],
+) -> str | None:
+    """Issue #1823 (r2) fail-CLOSE: *word* still carries a trusted v2 location
+    anchor (``$BRIDGE_DATA_ROOT`` / ``$BRIDGE_AGENT_ROOT_V2``) we could not
+    statically resolve, but the anchor IS exported into the agent runtime so
+    bash will expand it to the v2 root at execution time. Strip the leading
+    anchor token, ``normpath`` the literal tail, and return the matched forbidden
+    SUFFIX iff that tail is — or sits under — a v2 peer-home suffix
+    (``/agents/<peer>/home``). Returns ``None`` (caller keeps the prior
+    None→Pass-2 path) when the anchor is not leading, when the tail names no
+    forbidden suffix (a benign ``$BRIDGE_DATA_ROOT/logs/...`` write stays ALLOW),
+    or when a second unresolved ``$`` remains in the tail.
+
+    Only the v2 peer-home suffixes are matched here: the v2 anchors resolve to
+    the data / agent root, under which ``/agents/<peer>/home`` is the peer home,
+    so denying on that tail is the safe direction. The v1 ``/agents/<peer>``
+    suffix is intentionally NOT matched off the v2 anchor (it has no meaning
+    under the v2 root). The two anchors root the tail at DIFFERENT depths:
+    ``$BRIDGE_DATA_ROOT`` → ``<data_root>`` (tail begins ``/agents/<peer>/…``),
+    ``$BRIDGE_AGENT_ROOT_V2`` → ``<data_root>/agents`` (tail begins
+    ``/<peer>/…``), so the agent-root tail is re-rooted under ``/agents`` before
+    the suffix compare.
+    """
+    # Locate the leading anchor token and the literal tail after it. We only
+    # fail-close when the anchor is the PREFIX of the word — a `$BRIDGE_DATA_ROOT`
+    # appearing mid-word is not a path root we can reason about.
+    matched_name: str | None = None
+    tail: str | None = None
+    for name in _V2_ANCHOR_NAMES:
+        brace = "${" + name + "}"
+        if word.startswith(brace):
+            matched_name, tail = name, word[len(brace):]
+            break
+        m = re.match(rf"\${name}(?![A-Za-z0-9_])", word)
+        if m is not None:
+            matched_name, tail = name, word[m.end():]
+            break
+    if matched_name is None or tail is None:
+        return None
+    # A second unresolved expansion in the tail is undecidable here — leave it to
+    # the caller's Pass-2 obfuscation fail-close.
+    if "$" in tail:
+        return None
+    # The anchor resolves to an absolute dir; the tail is the path UNDER it.
+    # `$BRIDGE_AGENT_ROOT_V2` already IS the `agents` dir, so re-root its tail
+    # under `/agents` to match the `/agents/<peer>/home` suffix; `$BRIDGE_DATA_ROOT`
+    # roots at the data root, whose tail already includes `/agents`. `normpath`
+    # folds `..`/`//`/`/./` so `…/x/../agents/<p>/home` is judged on its resolved
+    # tail. Anchor at a leading slash so the tail reads as rooted-under-anchor.
+    inner = tail.lstrip("/")
+    if matched_name == "BRIDGE_AGENT_ROOT_V2":
+        inner = "agents/" + inner
+    folded = os.path.normpath("/" + inner)
+    for _abs_dir, suffix in forbidden_dirs:
+        # Only the v2 peer-home suffix is reachable under a v2 anchor.
+        if not (suffix.startswith("/agents/") and suffix.endswith("/home")):
+            continue
+        if folded == suffix or folded.startswith(suffix + "/"):
+            return suffix
+    return None
+
+
 def _resolved_forbidden_hit(
     word: str,
     eff_cwd: object,
@@ -3611,12 +3751,27 @@ def _resolved_forbidden_hit(
         cwd) → ``None`` (do NOT over-block);
       - RELATIVE + POISONED eff_cwd → see :func:`_forbidden_suffix_in_command`
         fail-close (handled by the caller, not here).
-    A surviving ``$var`` after expansion is unresolved → ``None`` here; the
-    caller's Pass-2 obfuscation fail-close decides it.
+    A surviving ``$var`` after expansion is unresolved → ``None`` here EXCEPT a
+    surviving v2 location anchor (``$BRIDGE_DATA_ROOT`` / ``$BRIDGE_AGENT_ROOT_V2``,
+    issue #1823) whose tail names a peer v2 home → fail CLOSED (deny) here, since
+    that anchor is exported into the agent runtime and bash WILL resolve it to the
+    peer home at execution time. Other surviving ``$var`` → the caller's Pass-2
+    obfuscation fail-close decides it.
     """
     decoded = _decode_obfuscated_word(word)
     expanded = _expand_bridge_prefixes(decoded)
     if "$" in expanded:
+        # Issue #1823 (r2): a TRUSTED v2 anchor we could not statically resolve
+        # (e.g. unset in this hook's env) still resolves to a peer v2 home in the
+        # agent's bash — fail CLOSED when its tail names a forbidden peer-home
+        # suffix, rather than fall through to None → ALLOW. Non-v2 `$var` words
+        # are left to the caller's Pass-2.
+        if _word_carries_unresolved_v2_anchor(expanded):
+            anchor_hit = _unresolved_v2_anchor_forbidden_suffix(
+                expanded, forbidden_dirs
+            )
+            if anchor_hit is not None:
+                return anchor_hit
         return None  # unresolved $var → caller's fail-close path decides
     if os.path.isabs(expanded):
         resolved = os.path.normpath(expanded)

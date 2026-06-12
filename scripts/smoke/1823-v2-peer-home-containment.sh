@@ -34,6 +34,18 @@
 #   Tooth 7 — Invariant: shared/private + shared/secrets stay DENIED for the
 #             NON-admin on both the Bash and non-Bash surfaces.
 #   Tooth 8 — Invariant: admin's OWN v2 home is never self-denied.
+#   Tooth 9 — (r2) NON-admin Bash append spelled through the EXPORTED v2 env-var
+#             anchors `$BRIDGE_DATA_ROOT/agents/<other>/home/…` AND
+#             `$BRIDGE_AGENT_ROOT_V2/<other>/home/…` (bare + brace) → DENIED. v2
+#             EXPORTS both vars into the agent runtime so bash expands them to
+#             the exact peer v2 home; before the r2 fix the hook's path expander
+#             left the `$`-token intact and the word fell through to ALLOW (the
+#             residual bypass codex proved on head 45b2520f). Mirrors Tooth 2,
+#             but the LITERAL env-var token reaches the hook (the smoke escapes
+#             the `$` so the test shell does not pre-expand it).
+#  Tooth 10 — (r2) TRUSTED-ADMIN with the SAME two env-var-spelled peer-home
+#             writes → ALLOWED (the #1806 admin carve-out is spelling-agnostic;
+#             only NON-admin denies). Admin behavior is unchanged.
 #
 # The strict admin predicate reads the controller roster via `agent list
 # --json`; the smoke injects a deterministic roster snapshot through the
@@ -239,6 +251,48 @@ assert_read "Tooth7 non-admin Read shared/private DENIED" \
 assert_edit "Tooth8 admin Edit OWN v2 home ALLOWED" \
   "$ADMIN_AGENT" "$ADMIN_AGENT" \
   "$ADMIN_V2_HOME/NOTES.md" "ALLOW"
+
+# ---------------------------------------------------------------------------
+# Tooth 9 (r2) — NON-admin Bash append spelled through the EXPORTED v2 env-var
+# anchors → DENIED. The LITERAL `$BRIDGE_DATA_ROOT` / `$BRIDGE_AGENT_ROOT_V2`
+# token must reach the hook, so the `$` is escaped here (single-quoted command
+# string) — bash in the test shell must NOT pre-expand it. The hook receives
+# both vars in its env (lib.sh exports them, run_hook inherits) and expands them
+# to the peer v2 home itself. Before the r2 fix these were ALLOW (the bypass).
+#
+# Both depths are exercised:
+#   $BRIDGE_DATA_ROOT      → <data_root>            → tail /agents/<peer>/home
+#   $BRIDGE_AGENT_ROOT_V2  → <data_root>/agents     → tail /<peer>/home
+# ---------------------------------------------------------------------------
+assert_bash "Tooth9 non-admin Bash append peer home via \$BRIDGE_DATA_ROOT DENIED" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> $BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+assert_bash "Tooth9 non-admin Bash append peer home via \${BRIDGE_DATA_ROOT} DENIED" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_DATA_ROOT}/agents/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+assert_bash "Tooth9 non-admin Bash append peer home via \$BRIDGE_AGENT_ROOT_V2 DENIED" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> $BRIDGE_AGENT_ROOT_V2/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+assert_bash "Tooth9 non-admin Bash append peer home via \${BRIDGE_AGENT_ROOT_V2} DENIED" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo pwned >> ${BRIDGE_AGENT_ROOT_V2}/'"$PEER_AGENT"'/home/MEMORY.md' "DENY"
+
+# Negative-control: the env-var-spelled peer WORKDIR stays scoped out (ALLOW),
+# so the new anchor expansion did not over-block the #1492 shared workspace.
+assert_bash "Tooth9 non-admin Bash append peer WORKDIR via \$BRIDGE_DATA_ROOT ALLOWED (scoped out)" \
+  "$ACTOR_AGENT" "$ADMIN_AGENT" \
+  'echo note >> $BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/workdir/NOTES.md' "ALLOW"
+
+# ---------------------------------------------------------------------------
+# Tooth 10 (r2) — TRUSTED-ADMIN with the SAME env-var-spelled peer-home writes
+# → ALLOWED (admin carve-out is spelling-agnostic; only non-admin denies).
+# ---------------------------------------------------------------------------
+assert_bash "Tooth10 admin Bash append peer home via \$BRIDGE_DATA_ROOT ALLOWED" \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" \
+  'echo note >> $BRIDGE_DATA_ROOT/agents/'"$PEER_AGENT"'/home/MEMORY.md' "ALLOW"
+assert_bash "Tooth10 admin Bash append peer home via \$BRIDGE_AGENT_ROOT_V2 ALLOWED" \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" \
+  'echo note >> $BRIDGE_AGENT_ROOT_V2/'"$PEER_AGENT"'/home/MEMORY.md' "ALLOW"
 
 smoke_log "passed"
 echo "[smoke:${SMOKE_NAME}] passed"
