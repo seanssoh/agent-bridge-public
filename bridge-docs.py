@@ -388,7 +388,7 @@ def list_agent_dirs(
             continue
         if home_subdir:
             home_path = path / home_subdir
-            if not home_path.is_dir():
+            if not home_path.is_dir():  # noqa: raw-pathlib-controller-only
                 continue
             candidates.append(home_path)
         else:
