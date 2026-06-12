@@ -471,6 +471,22 @@ Discord/Telegram MCP가 `fetch_messages`·channel webhook으로 반환하는 tim
 - inventory/list/create/update/delete: `{home}/agent-bridge cron ...`
 - 옛 cron helper 예시는 더 이상 기준이 아니다.
 
+## Credential & Token Rotation
+Claude OAT 풀(여러 setup-token을 등록하고 하나만 active로 두는 다중 토큰 레지스트리)과 codex fleet-sync는 `{home}/agent-bridge auth` (= `bridge-auth.sh`)로 다룬다. 주간 한도/429 쿼터/토큰 로테이션 신호가 보이면 이 verb들을 먼저 본다.
+
+- pool 상태 확인: `{home}/agent-bridge auth claude-token list` (토큰 id·fingerprint만 노출, 토큰값은 안 나옴)
+- active 전환: `{home}/agent-bridge auth claude-token activate <id> --sync`
+- 자동 로테이션: `{home}/agent-bridge auth claude-token auto-rotate enable|disable|status [--threshold 99]` (기본 threshold 99%)
+- 수동 로테이션: `{home}/agent-bridge auth claude-token rotate --reason <text> --sync`
+- 쿼터 처리: 한도 친 토큰은 `{home}/agent-bridge auth claude-token mark-quota <id> [--reset-at <iso>]`로 빼두고, reset 이후 `recover-due`가 재검증해 복구한다
+- 헬스 체크: `{home}/agent-bridge auth claude-token check <id> --disable-on-quota --enable-on-ok`
+- codex fleet-sync: `{home}/agent-bridge auth codex-cred register|source|sync|verify`
+
+caveats:
+- **계정 경계.** 로테이션이 *주간* 한도를 실제로 넘기려면 토큰이 **서로 다른 계정** 소속이어야 한다(쿼터는 account-level). 같은 계정의 토큰만 풀에 있으면 로테이션해도 같은 한도에 막힌다.
+- **토큰=시크릿.** 등록은 `--stdin` / `--token-file` (또는 운영자 터미널 전용 echo-off `receive`)로만 넣는다. 절대 argv·env·채팅·큐 본문에 토큰값을 인라인하지 않는다.
+- 운영 런북(주간 한도/쿼터 소진 시 대응)은 `OPERATIONS.md`의 "Claude setup-token registry and rotation", 전체 설계는 `docs/design/fleet-credential-design.md`를 본다.
+
 ## Ops Recipes (intent → command)
 에이전트가 운영 점검 명령을 반복적으로 잘못 추측해서 blocked 된 사례가 있다(issue #163). 이름을 처음부터 찾는 대신 아래 의도→명령 매핑을 먼저 본다.
 
@@ -486,6 +502,7 @@ Discord/Telegram MCP가 `fetch_messages`·channel webhook으로 반환하는 tim
 | 메모리 위키 정합성 점검 | `{home}/agent-bridge memory lint --agent <agent>` |
 | 다른 에이전트로 작업 넘기기 | `{home}/agent-bridge task create --to <agent> ...` |
 | 긴급 인터럽트 | `{home}/agent-bridge urgent <agent> "..."` |
+| 토큰 풀/로테이션 확인 | `{home}/agent-bridge auth claude-token list` / `auto-rotate status` |
 
 CLI가 모르는 이름을 추측하면 `혹시 이 명령이었나요?` 힌트가 함께 뜬다. 자주 빗맞는 케이스(`health`, `diag`, `cron stats`, `cron list --failed`, `ps`, `agents`, `task stats`)는 `lib/bridge-core.sh`의 `bridge_suggest_subcommand` curated alias 테이블에 이미 들어 있다.
 
