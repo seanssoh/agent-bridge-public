@@ -67,3 +67,11 @@ scripts/smoke/1685-receiver-staleness-selfheal.sh
 # dirs; every `.env` match is the `os.environ` substring, never a controller->iso
 # boundary RW (same shape as the #1520c / #1533 / PR-5 / PR-8 fixture entries).
 scripts/smoke/1728-test-bind-state-path-guard-helper.py
+
+# #1825 ms365 token-key-by-claim fixture — the inline Bun/TS harness only reads
+# its own process-local env vars (`process.env.HARNESS_STATE_DIR|HARNESS_GRAPH_UPN|
+# HARNESS_CLAIMS|HARNESS_OPAQUE_INPUT`, set by the smoke's run_harness()) and
+# writes token JSON under a per-call `mktemp -d` STATE_DIR/tokens; every `.env`
+# match is the `process.env` substring, never a controller->iso boundary RW (same
+# shape as the #1563-pr8 / #1728 `os.environ` fixture entries).
+scripts/smoke/1825-ms365-token-key-by-claim.sh
