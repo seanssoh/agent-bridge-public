@@ -12182,6 +12182,66 @@ session_matches_idle_reap_patterns() {
   esac
 }
 
+# Issue #1797 NB-1: transition-latch for the reaper keep-audit line.
+#
+# reap_idle_dynamic_agents() emits a `reaper kept idle dynamic <a> (...)` audit
+# line for every idle-but-spared dynamic on EVERY daemon tick. patch gate-2
+# measured ~1.2k lines/day for a single idle operator pair; on a multi-agent
+# install that is meaningful log noise. The audit's value is the EVENT (the
+# reaper considered an agent idle and deliberately spared it), not the per-tick
+# repetition — so latch it: emit only when an agent's keep-decision TRANSITIONS
+# (first entry into a kept-state, or a change of keep-reason), and stay silent on
+# unchanged ticks.
+#
+# State lives on disk (one file per agent under
+# $BRIDGE_STATE_DIR/reaper-keep-audit/) rather than an in-memory map because a
+# sync tick may run as a supervised CHILD process (#1563 PR-2 T1 backstop), so a
+# daemon-shell global would not survive across ticks. The token is the
+# keep-reason ("loop" / "non-ephemeral"); a transition is "stored token != new
+# token" (including the no-file → first-keep case, which logs once).
+bridge_reaper_keep_audit_dir() {
+  printf '%s/reaper-keep-audit' "${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-/tmp}/state}"
+}
+
+# Return the per-agent latch file path. The agent id is sanitized to a safe
+# basename (roster ids are already constrained, but defense-in-depth keeps a
+# stray id from escaping the latch dir).
+bridge_reaper_keep_audit_path() {
+  local agent="$1"
+  local safe="${agent//[^A-Za-z0-9._-]/_}"
+  printf '%s/%s' "$(bridge_reaper_keep_audit_dir)" "$safe"
+}
+
+# Emit the keep-audit line for <agent> ONLY when its keep-reason transitions
+# from the latched value. <reason> is the stable token ("loop"/"non-ephemeral");
+# <message> is the full audit line to print on a transition. On any change the
+# new reason is persisted so the next unchanged tick stays silent. Best-effort
+# on the state write — if the latch cannot be persisted we still emit (a noisier
+# log is strictly safer than a swallowed audit).
+bridge_reaper_keep_audit_latch() {
+  local agent="$1"
+  local reason="$2"
+  local message="$3"
+  local path
+  local prev=""
+  path="$(bridge_reaper_keep_audit_path "$agent")"
+  [[ -f "$path" ]] && prev="$(cat "$path" 2>/dev/null || true)"
+  if [[ "$prev" != "$reason" ]]; then
+    daemon_info "$message"
+    mkdir -p "$(bridge_reaper_keep_audit_dir)" 2>/dev/null || true
+    printf '%s\n' "$reason" >"$path" 2>/dev/null || true
+  fi
+}
+
+# Clear the keep-audit latch for <agent> so a later re-entry into a kept-state
+# re-logs the transition. Called when an agent is reaped or is no longer a
+# would-be-keep candidate (it passed out of the idle window, gained work, or
+# left the roster), so the kept→not-kept→kept arc is a fresh transition.
+bridge_reaper_keep_audit_clear() {
+  local agent="$1"
+  rm -f "$(bridge_reaper_keep_audit_path "$agent")" 2>/dev/null || true
+}
+
 reap_idle_dynamic_agents() {
   local threshold="${BRIDGE_DYNAMIC_IDLE_REAP_SECONDS:-3600}"
   local agent
@@ -12203,12 +12263,19 @@ reap_idle_dynamic_agents() {
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
     [[ "$(bridge_agent_source "$agent")" == "dynamic" ]] || continue
     session="$(bridge_agent_session "$agent")"
-    [[ -n "$session" ]] || continue
-    bridge_tmux_session_exists "$session" || continue
+    [[ -n "$session" ]] || { bridge_reaper_keep_audit_clear "$agent"; continue; }
+    # Session gone ⇒ agent is no longer a live keep candidate; clear the latch
+    # so a future respawn re-logs its first kept transition (#1797 NB-1).
+    bridge_tmux_session_exists "$session" || { bridge_reaper_keep_audit_clear "$agent"; continue; }
 
     attached="$(bridge_tmux_session_attached_count "$session")"
     [[ "$attached" =~ ^[0-9]+$ ]] || attached=0
-    (( attached == 0 )) || continue
+    # Re-attached ⇒ no longer a would-be-keep candidate; clear the latch so a
+    # later return to the idle-kept state re-logs the transition (#1797 NB-1).
+    if (( attached != 0 )); then
+      bridge_reaper_keep_audit_clear "$agent"
+      continue
+    fi
 
     summary="$(bridge_queue_cli summary --agent "$agent" --format tsv 2>/dev/null | head -n 1 || true)"
     if [[ -n "$summary" ]]; then
@@ -12226,11 +12293,19 @@ reap_idle_dynamic_agents() {
       claimed=0
       blocked=0
     fi
-    (( queued == 0 && claimed == 0 && blocked == 0 )) || continue
+    # Has open work ⇒ active again; clear the latch (#1797 NB-1).
+    if (( queued != 0 || claimed != 0 || blocked != 0 )); then
+      bridge_reaper_keep_audit_clear "$agent"
+      continue
+    fi
 
     idle="$(bridge_tmux_session_idle_seconds "$session")"
     [[ "$idle" =~ ^[0-9]+$ ]] || idle=0
-    (( idle >= threshold )) || continue
+    # Not idle past the threshold ⇒ active again; clear the latch (#1797 NB-1).
+    if (( idle < threshold )); then
+      bridge_reaper_keep_audit_clear "$agent"
+      continue
+    fi
 
     # Issue #1795: disposability gate. The agent has now passed every existing
     # idle predicate (detached + queue-empty + idle>=threshold), so it is a
@@ -12242,20 +12317,30 @@ reap_idle_dynamic_agents() {
     #   loop      != "1"  (hard skip on the relaunch-loop flag)
     # When kept, emit a one-line audit so operators can see the reaper
     # considered the agent idle and deliberately spared it.
+    # Issue #1797 NB-1: the keep-audit lines below are latched per-agent so they
+    # fire only on a keep-decision TRANSITION (first entry into the kept-state or
+    # a change of keep-reason), not on every tick. The reason token ("loop" /
+    # "non-ephemeral") is what the latch compares; the idle seconds vary per tick
+    # and are deliberately NOT part of the token (otherwise the line would re-emit
+    # every tick as idle grows, defeating the latch).
     ephemeral="$(bridge_agent_ephemeral "$agent")"
     loop_mode="$(bridge_agent_loop "$agent")"
     if [[ "$loop_mode" == "1" ]]; then
-      daemon_info "reaper kept idle dynamic ${agent} (idle=${idle}s; loop=1 relaunch agent — reap-exempt)"
+      bridge_reaper_keep_audit_latch "$agent" "loop" \
+        "reaper kept idle dynamic ${agent} (idle=${idle}s; loop=1 relaunch agent — reap-exempt)"
       continue
     fi
     if [[ "$ephemeral" != "1" ]]; then
-      daemon_info "reaper kept idle dynamic ${agent} (idle=${idle}s; non-ephemeral operator-created — reap-exempt)"
+      bridge_reaper_keep_audit_latch "$agent" "non-ephemeral" \
+        "reaper kept idle dynamic ${agent} (idle=${idle}s; non-ephemeral operator-created — reap-exempt)"
       continue
     fi
 
     if bridge_kill_agent_session "$agent" >/dev/null 2>&1; then
       bridge_archive_dynamic_agent "$agent"
       bridge_remove_dynamic_agent_file "$agent"
+      # Reaped: drop any keep-latch so the id cannot carry a stale token.
+      bridge_reaper_keep_audit_clear "$agent"
       daemon_info "reaped dynamic ${agent} (idle=${idle}s; ephemeral)"
       changed=0
     fi
