@@ -93,19 +93,29 @@ def _default_daemon_script() -> Path:
        This is the path the launchd plist / systemd unit shipped via
        ``scripts/install-watchdog-silence-launchagent.sh`` resolves to.
     2. ``~/.agent-bridge/bridge-daemon.sh`` — documented canonical install
-       fallback used when ``BRIDGE_HOME`` is unset.
+       fallback used ONLY when ``BRIDGE_HOME`` is unset.
     3. ``SCRIPT_DIR / "bridge-daemon.sh"`` — last-resort in-tree development
        fallback so ``python3 bridge-watchdog-silence.py …`` still works when
        run directly out of a source checkout.
 
     The explicit ``BRIDGE_DAEMON_SCRIPT`` env-var override (handled by the
     caller) wins above all of these and is kept for tests.
+
+    Issue #1860 cross-home hardening: when ``BRIDGE_HOME`` IS set (an
+    isolated / test runtime root) we pin resolution INSIDE that home and
+    never fall through to the live ``~/.agent-bridge`` install — even if the
+    in-home ``bridge-daemon.sh`` does not exist yet. The old behaviour
+    (continue to step 2 when ``BRIDGE_HOME/bridge-daemon.sh`` was absent) let
+    a watchdog spawned under a temp ``BRIDGE_HOME`` resolve ``DAEMON_SCRIPT``
+    to the operator's live daemon and drive a restart against it. The
+    ``~/.agent-bridge`` fallback is for the *unset* case only.
     """
     home = os.environ.get("BRIDGE_HOME", "").strip()
     if home:
-        candidate = Path(home).expanduser() / "bridge-daemon.sh"
-        if candidate.is_file():
-            return candidate
+        # BRIDGE_HOME pins resolution inside the home, full stop. Return the
+        # in-home path whether or not it exists yet — never continue to the
+        # live ~/.agent-bridge fallback (#1860 cross-home guard).
+        return Path(home).expanduser() / "bridge-daemon.sh"
     default_home_candidate = Path.home() / ".agent-bridge" / "bridge-daemon.sh"
     if default_home_candidate.is_file():
         return default_home_candidate

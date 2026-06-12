@@ -109,6 +109,59 @@ smoke_cleanup_temp_root() {
   fi
 }
 
+# Issue #1860 defence-in-depth. A smoke that writes a stand-in daemon (or any
+# other runtime) script must never let the target resolve to the operator's
+# live install or the source checkout — a path-resolution regression once
+# overwrote the live ~/.agent-bridge/bridge-daemon.sh with a `sleep 60` stub,
+# silently killing the production daemon for ~4h. This guard asserts the write
+# target sits under the smoke's own temp root ($SMOKE_TMP_ROOT) or the isolated
+# $BRIDGE_HOME before any write, and aborts loudly otherwise.
+#
+# Usage: smoke_assert_path_in_temp "<target-path>" "<context>"
+smoke_assert_path_in_temp() {
+  local path="${1:-}"
+  local context="${2:-runtime-script write}"
+  [[ -n "$path" ]] || smoke_fail "$context: refusing to write to an empty path"
+
+  # Resolve the parent dir (the file itself may not exist yet) so symlinked
+  # temp roots (/var/folders -> /private/var/folders on macOS) compare by
+  # their real path, matching how SMOKE_TMP_ROOT/BRIDGE_HOME are pinned.
+  local dir base resolved_dir
+  dir="$(dirname -- "$path")"
+  base="$(basename -- "$path")"
+  resolved_dir="$(cd -P -- "$dir" 2>/dev/null && pwd -P)" || \
+    smoke_fail "$context: cannot resolve parent dir of write target: $path"
+  local resolved="$resolved_dir/$base"
+
+  local allowed="" candidate
+  for candidate in "${SMOKE_TMP_ROOT:-}" "${BRIDGE_HOME:-}"; do
+    [[ -n "$candidate" ]] || continue
+    candidate="$(cd -P -- "$candidate" 2>/dev/null && pwd -P)" || continue
+    case "$resolved" in
+      "$candidate"|"$candidate"/*)
+        allowed="$candidate"
+        break
+        ;;
+    esac
+  done
+  [[ -n "$allowed" ]] || smoke_fail \
+    "$context: refusing to write runtime script outside the smoke temp root (target=$resolved; allowed under SMOKE_TMP_ROOT=${SMOKE_TMP_ROOT:-<unset>} or BRIDGE_HOME=${BRIDGE_HOME:-<unset>}). This is the #1860 live-install guard."
+}
+
+# Write a stand-in/stub runtime script to <target> with <content>, but only
+# after smoke_assert_path_in_temp confirms the target is temp-rooted. Marks it
+# executable. Use this instead of a raw `printf ... >"$daemon"` whenever the
+# target filename is `bridge-daemon.sh` (or any other live runtime script) so a
+# future path-resolution regression fails loud instead of nuking the live
+# install (#1860).
+smoke_write_runtime_stub() {
+  local target="${1:-}"
+  local content="${2:-}"
+  smoke_assert_path_in_temp "$target" "runtime-stub write"
+  printf '%s' "$content" >"$target"
+  chmod +x "$target"
+}
+
 smoke_assert_eq() {
   local expected="$1"
   local actual="$2"
