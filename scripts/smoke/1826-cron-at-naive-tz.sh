@@ -23,6 +23,10 @@ source "$SCRIPT_DIR/lib.sh"
 REPO_ROOT="$SMOKE_REPO_ROOT"
 PY_BIN="${PYTHON3:-python3}"
 CRON_PY="$REPO_ROOT/bridge-cron.py"
+# File-as-argv Python helpers (footgun #11): every Python subprocess below is
+# invoked as `"$PY_BIN" "$HELPERS_DIR/<name>.py" <argv...>` — never via
+# heredoc-stdin into `python3 -`, so this smoke can never trip lint-heredoc-ban.
+HELPERS_DIR="$SCRIPT_DIR/1826-helpers"
 
 cleanup() {
   smoke_cleanup_temp_root
@@ -36,54 +40,23 @@ JOBS_FILE="$BRIDGE_NATIVE_CRON_JOBS_FILE"
 # old bug) is unambiguously distinct from one anchored in `--tz Asia/Seoul`.
 export TZ="UTC"
 
-# Helper: read the stored `at` / `tz` (and the schedule kind) for a job title.
+# Helper: read the stored `at` value for a job title.
 stored_at() {
   local title="$1"
-  "$PY_BIN" - "$JOBS_FILE" "$title" <<'PY'
-import json, sys
-jobs = json.load(open(sys.argv[1], encoding="utf-8")).get("jobs", [])
-for job in jobs:
-    if job.get("name") == sys.argv[2]:
-        sched = job.get("schedule") or {}
-        print(sched.get("at", ""))
-        break
-PY
+  "$PY_BIN" "$HELPERS_DIR/read-schedule-field.py" "$JOBS_FILE" "$title" "at"
 }
 
 # Helper: read the stored `tz` label for a job title.
 stored_tz() {
   local title="$1"
-  "$PY_BIN" - "$JOBS_FILE" "$title" <<'PY'
-import json, sys
-for job in json.load(open(sys.argv[1], encoding="utf-8")).get("jobs", []):
-    if job.get("name") == sys.argv[2]:
-        print((job.get("schedule") or {}).get("tz", "")); break
-PY
+  "$PY_BIN" "$HELPERS_DIR/read-schedule-field.py" "$JOBS_FILE" "$title" "tz"
 }
 
 # Helper: compute the absolute UTC epoch (seconds) the scheduler will honor for
 # the stored `at` value, via the production scheduler's own enumeration path.
 at_epoch() {
   local title="$1"
-  "$PY_BIN" - "$REPO_ROOT" "$JOBS_FILE" "$title" <<'PY'
-import importlib.util, json, sys
-from datetime import datetime, timezone
-
-repo, jobs_file, title = sys.argv[1], sys.argv[2], sys.argv[3]
-spec = importlib.util.spec_from_file_location(
-    "bridge_cron_scheduler", f"{repo}/bridge-cron-scheduler.py"
-)
-mod = importlib.util.module_from_spec(spec)
-sys.modules["bridge_cron_scheduler"] = mod
-spec.loader.exec_module(mod)
-
-job = next(
-    j for j in json.load(open(jobs_file, encoding="utf-8")).get("jobs", [])
-    if j.get("name") == title
-)
-occ = mod.parse_iso((job.get("schedule") or {}).get("at"))
-print(int(occ.astimezone(timezone.utc).timestamp()))
-PY
+  "$PY_BIN" "$HELPERS_DIR/at-epoch.py" "$REPO_ROOT" "$JOBS_FILE" "$title"
 }
 
 # ---- 1. naive --at honors --tz (no longer host-UTC, no silent drop) ---------
@@ -143,17 +116,7 @@ TZ="Asia/Seoul" "$PY_BIN" "$CRON_PY" native-create \
   --payload "ping" >/dev/null
 
 # 13:30 Asia/Seoul (+09:00) == 04:30 UTC == epoch 1781238600, NOT 13:30 UTC.
-SEOUL_EPOCH="$("$PY_BIN" - "$REPO_ROOT" "$SEOUL_JOBS" "naive-host-seoul" <<'PY'
-import importlib.util, json, sys
-from datetime import timezone
-repo, jobs_file, title = sys.argv[1], sys.argv[2], sys.argv[3]
-spec = importlib.util.spec_from_file_location("bridge_cron_scheduler", f"{repo}/bridge-cron-scheduler.py")
-mod = importlib.util.module_from_spec(spec); sys.modules["bridge_cron_scheduler"] = mod
-spec.loader.exec_module(mod)
-job = next(j for j in json.load(open(jobs_file, encoding="utf-8")).get("jobs", []) if j.get("name") == title)
-print(int(mod.parse_iso((job.get("schedule") or {}).get("at")).astimezone(timezone.utc).timestamp()))
-PY
-)"
+SEOUL_EPOCH="$("$PY_BIN" "$HELPERS_DIR/at-epoch.py" "$REPO_ROOT" "$SEOUL_JOBS" "naive-host-seoul")"
 smoke_assert_eq "1781238600" "$SEOUL_EPOCH" \
   "omitted --tz on a non-UTC host must anchor in the host zone (+09:00), not UTC"
 smoke_log "ok: omitted --tz on a non-UTC host honors the real host wall-clock"
@@ -257,12 +220,7 @@ smoke_log "ok: offset follows DST via ZoneInfo (no hand-rolled offset math)"
 # target month under TZ=America/New_York with --tz OMITTED.
 DST_JOBS="$BRIDGE_HOME/cron/jobs-dst.json"
 stored_at_file() {
-  "$PY_BIN" - "$1" "$2" <<'PY'
-import json, sys
-for job in json.load(open(sys.argv[1], encoding="utf-8")).get("jobs", []):
-    if job.get("name") == sys.argv[2]:
-        print((job.get("schedule") or {}).get("at", "")); break
-PY
+  "$PY_BIN" "$HELPERS_DIR/read-schedule-field.py" "$1" "$2" "at"
 }
 TZ="America/New_York" "$PY_BIN" "$CRON_PY" native-create \
   --jobs-file "$DST_JOBS" --agent agent-host-est \
@@ -281,30 +239,7 @@ smoke_log "ok: omitted --tz host-local path is DST-aware (host_zone, not frozen 
 # IANA zone must still be recovered from /etc/localtime so host_zone() stays
 # DST-aware instead of degrading to the frozen-offset LOCAL_TZ. Verify the
 # resolver contract portably (it works regardless of the runner's own zone).
-LT_CHECK="$("$PY_BIN" - "$REPO_ROOT" <<'PY'
-import importlib.util, sys, unittest.mock
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-spec = importlib.util.spec_from_file_location("bc", f"{sys.argv[1]}/bridge-cron.py")
-bc = importlib.util.module_from_spec(spec); spec.loader.exec_module(bc)
-fake = "/private/var/db/timezone/tz/2026b/zoneinfo/America/New_York"
-# No .key, no $TZ -> must resolve America/New_York from the /etc/localtime link.
-with unittest.mock.patch.dict("os.environ", {}, clear=False) as env:
-    import os
-    os.environ.pop("TZ", None)
-    with unittest.mock.patch.object(bc, "LOCAL_TZ", datetime.now(timezone.utc).astimezone().tzinfo), \
-         unittest.mock.patch("os.path.realpath", return_value=fake):
-        name = bc.host_iana_zone_name()
-        zone = bc.host_zone()
-assert name == "America/New_York", name
-assert isinstance(zone, ZoneInfo) and zone.key == "America/New_York", zone
-# And the zone is genuinely DST-aware (distinct winter/summer offsets).
-jan = datetime(2026, 1, 15, 12, tzinfo=zone).utcoffset()
-jul = datetime(2026, 7, 15, 12, tzinfo=zone).utcoffset()
-assert jan != jul, (jan, jul)
-print("OK")
-PY
-)"
+LT_CHECK="$("$PY_BIN" "$HELPERS_DIR/host-zone-localtime-fallback.py" "$REPO_ROOT")"
 smoke_assert_eq "OK" "$LT_CHECK" \
   "host zone must resolve from /etc/localtime when .key and \$TZ are absent (DST-aware)"
 smoke_log "ok: /etc/localtime fallback keeps the omitted-tz path DST-aware"
