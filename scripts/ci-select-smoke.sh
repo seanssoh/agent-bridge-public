@@ -124,6 +124,14 @@ add_required 1820-cron-writer-v2-candidate 1820-precompact-resolved-env-v2 1820-
 # supersedes. In the full static suite so any reconcile/upgrade/migrate edit
 # re-runs the observability guard.
 add_required rc2-reconcile-observability
+# Issue #1820 rc3 (cm-prod real-Linux iso-v2 production soak of v0.16.10-rc2):
+# the layout-v2 reconcile must NOT controller-direct-read an iso v2 agent's
+# agent-private 0600 memory (that raised [Errno 13] backup-failed warnings on 4
+# iso bots and the iso permission pass was absent from last-apply.json). The
+# engine now GRACEFUL-SKIPS iso agents passed in --iso-agents-json and records a
+# structured isolation_v2_migration(skipped-iso-private) section. In the full
+# static suite so any reconcile/iso edit re-runs the iso-permission guard.
+add_required 1820-iso-reconcile-permission
 # Issue #1835: bridge-queue-gateway.py's SOCKET-transport client preflight
 # (_read_inline_text) now applies the #1280 sudo-as-owner body-file fallback on
 # PermissionError, with an actionable iso-ownership error when it cannot apply.
