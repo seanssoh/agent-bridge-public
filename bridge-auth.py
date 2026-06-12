@@ -2532,6 +2532,33 @@ def cmd_backfill_settings(args: argparse.Namespace) -> int:
         else:
             print(f"drift: {agent or config_dir} settings.json does not point at managed apiKeyHelper")
         return 0
+
+    # codex review (PR #1858) MAJOR 2: a coherent agent must be a TRUE no-op —
+    # do NOT call the writer. ensure_claude_settings_file always rewrites
+    # settings.json atomically (PR #799 r4 removed its same-payload fast path),
+    # so calling it on an already-contracted agent thrashes the file (and, under
+    # iso v2, a fresh chown/replace) on every daily cadence tick while reporting
+    # `changed:false`. Short-circuit here so the hygiene pass touches disk ONLY
+    # when it actually has a backfill to apply. `settings.json` already exists in
+    # the coherent case (settings_apikeyhelper_coherent returned True), so the
+    # reported settings_file is the real on-disk path the launch reads.
+    if already:
+        settings_path = claude_settings_write_path(config_dir)
+        payload = {
+            "status": "ok",
+            "agent": agent,
+            "settings_file": str(settings_path),
+            "api_key_helper": claude_api_key_helper_path(),
+            "changed": False,
+            "backfilled": False,
+            "coherent": True,
+        }
+        if json_mode:
+            json_dump(payload)
+        else:
+            print(f"ok: {agent or config_dir} already keychain-free coherent")
+        return 0
+
     try:
         settings_file = ensure_claude_settings_file(
             config_dir,
@@ -2542,22 +2569,19 @@ def cmd_backfill_settings(args: argparse.Namespace) -> int:
     except Exception as exc:
         return fail(str(exc), json_mode)
 
-    changed = not already
     payload = {
         "status": "ok",
         "agent": agent,
         "settings_file": str(settings_file),
         "api_key_helper": claude_api_key_helper_path(),
-        "changed": changed,
-        "backfilled": changed,
+        "changed": True,
+        "backfilled": True,
         "coherent": True,
     }
     if json_mode:
         json_dump(payload)
-    elif changed:
-        print(f"backfilled: {agent or config_dir} <- apiKeyHelper ({settings_file})")
     else:
-        print(f"ok: {agent or config_dir} already keychain-free coherent")
+        print(f"backfilled: {agent or config_dir} <- apiKeyHelper ({settings_file})")
     return 0
 
 

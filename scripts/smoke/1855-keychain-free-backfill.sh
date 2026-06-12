@@ -43,6 +43,10 @@
 #   T7. Bash wrapper path — `bridge-auth.sh claude-token backfill-settings`
 #       passes the required --registry through to bridge-auth.py and reports
 #       the agent as backfilled.
+#   T8. Coherent agent is a TRUE no-op — the writer is not invoked, so the
+#       settings.json inode is unchanged (no atomic-rewrite thrash per cadence).
+#   T9. Bash wrapper --check is READ-ONLY — the wrapper forwards --check so a
+#       drifted agent reports non_clean without mutating settings.json.
 #
 # Footgun #11 (heredoc_write deadlock class): plain `printf` / file-arg writes
 # only; no command-substitution feeding a heredoc-stdin into a bridge function.
@@ -220,6 +224,66 @@ test_bash_wrapper_passes_registry() {
     "T7 wrapper writes the managed apiKeyHelper through bridge-auth.py"
 }
 
+# T8 — coherent agent is a TRUE no-op: the writer is NOT invoked, so the
+# on-disk settings.json file is not rewritten (codex review PR #1858 MAJOR 2 —
+# ensure_claude_settings_file always rewrites atomically via os.replace, which
+# would thrash the file + re-chown every daily cadence tick). Pin no-rewrite by
+# inode identity: an atomic rewrite replaces the file (new inode); a true no-op
+# leaves the same inode. Reverting to the unconditional writer call makes the
+# inode change and this tooth bites.
+test_coherent_agent_is_true_noop() {
+  local cfg ino_before ino_after out
+  cfg="$SMOKE_TMP_ROOT/noop/.claude"
+  mkdir -p "$cfg"
+  printf '{"skipDangerousModePermissionPrompt": true}\n' >"$cfg/settings.json"
+  # First backfill makes it coherent (writes once, expected).
+  backfill "$cfg" noop-agent >/dev/null
+  ino_before="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$cfg/settings.json")"
+  # Second backfill on the now-coherent agent must NOT rewrite the file.
+  out="$(backfill "$cfg" noop-agent)"
+  smoke_assert_contains "$out" '"changed": false' "T8 coherent agent reports changed:false"
+  ino_after="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$cfg/settings.json")"
+  smoke_assert_eq "$ino_before" "$ino_after" \
+    "T8 coherent agent is a TRUE no-op — settings.json inode unchanged (writer not invoked)"
+}
+
+# T9 — the bridge-auth.sh wrapper forwards --check (codex review PR #1858
+# MAJOR 3): a legacy agent run through the public wrapper with --check must be
+# READ-ONLY (drift reported, settings.json NOT mutated). Dropping the flag in
+# the wrapper would silently turn the read-only verb into a write.
+test_bash_wrapper_check_is_readonly() {
+  local agent cfg before after out
+  agent="check-wrapper-agent"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# shellcheck shell=bash disable=SC2034\n'
+    printf 'bridge_add_agent_id_if_missing %s\n' "$agent"
+    printf 'BRIDGE_AGENT_DESC["%s"]="check wrapper smoke"\n' "$agent"
+    printf 'BRIDGE_AGENT_ENGINE["%s"]="claude"\n' "$agent"
+    printf 'BRIDGE_AGENT_SESSION["%s"]="%s"\n' "$agent" "$agent"
+    printf 'BRIDGE_AGENT_WORKDIR["%s"]="%s"\n' "$agent" "$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
+    printf 'BRIDGE_AGENT_SOURCE["%s"]="static"\n' "$agent"
+    printf 'BRIDGE_AGENT_CONTINUE["%s"]="1"\n' "$agent"
+  } >"$BRIDGE_ROSTER_LOCAL_FILE"
+
+  cfg="$BRIDGE_AGENT_ROOT_V2/$agent/home/.claude"
+  mkdir -p "$cfg"
+  printf '{"skipDangerousModePermissionPrompt": true}\n' >"$cfg/settings.json"
+  before="$(cat "$cfg/settings.json")"
+
+  out="$(BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
+    bash "$AUTH_SH" claude-token backfill-settings --agents "$agent" --check --json)"
+  # Read-only: the wrapper must NOT have written the apiKeyHelper.
+  after="$(cat "$cfg/settings.json")"
+  smoke_assert_eq "$before" "$after" \
+    "T9 wrapper --check is READ-ONLY (settings.json unmutated)"
+  local helper
+  helper="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("apiKeyHelper",""))' "$cfg/settings.json")"
+  smoke_assert_eq "" "$helper" "T9 wrapper --check writes no apiKeyHelper"
+  # The drifted agent is still surfaced as non-clean in the aggregate.
+  smoke_assert_contains "$out" '"non_clean": true' "T9 wrapper --check reports drift as non_clean"
+}
+
 smoke_run "T1 legacy agent gains the managed apiKeyHelper"                test_legacy_gains_helper
 smoke_run "T2 backfill is idempotent (already-contracted untouched)"      test_idempotent_rerun
 smoke_run "T3 non-Darwin is a no-op (no controller-helper-path leak)"     test_non_darwin_noop
@@ -227,5 +291,7 @@ smoke_run "T4 create-if-absent materializes a missing settings.json"      test_c
 smoke_run "T5 --check is a read-only credential-coherence drift report"   test_check_drift_readonly
 smoke_run "T6 backfilled end-state is byte-identical to provision writer"  test_byte_identical_to_provision
 smoke_run "T7 bridge-auth.sh wrapper passes --registry to bridge-auth.py"  test_bash_wrapper_passes_registry
+smoke_run "T8 coherent agent is a TRUE no-op (writer not invoked)"         test_coherent_agent_is_true_noop
+smoke_run "T9 bridge-auth.sh wrapper --check is read-only"                 test_bash_wrapper_check_is_readonly
 
 smoke_log "all checks passed"

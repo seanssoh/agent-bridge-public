@@ -685,7 +685,7 @@ PY
   return "$rc"
 }
 
-# bridge_auth_backfill_settings_agents <spec> <json_mode>
+# bridge_auth_backfill_settings_agents <spec> <json_mode> [check_mode]
 #
 # Issue #1855: create-if-absent backfill of the keychain-free apiKeyHelper
 # contract into each selected Claude agent's per-agent settings.json. The
@@ -696,9 +696,15 @@ PY
 # path, then calls the byte-identical writer via `bridge-auth.py
 # backfill-settings`. Idempotent: an already-coherent (or non-Darwin / gate-off)
 # agent is a no-op. Emits an aggregate JSON envelope.
+#
+# check_mode=1 (codex review PR #1858 MAJOR 3): forward `--check` so the pass is
+# READ-ONLY — it reports coherence/drift per agent and writes nothing. The
+# aggregate's `non_clean` then reflects drift (incoherent agents) + failures
+# rather than backfills.
 bridge_auth_backfill_settings_agents() {
   local spec="$1"
   local json_mode="$2"
+  local check_mode="${3:-0}"
   local agent=""
   local cred_file=""
   local config_dir=""
@@ -709,10 +715,13 @@ bridge_auth_backfill_settings_agents() {
   local selection_output=""
   local registry=""
   local rc=0
+  local -a check_args=()
   local -a agents=()
   local -a backfilled=()
   local -a unchanged=()
   local -a failed=()
+
+  [[ "$check_mode" == "1" ]] && check_args=(--check)
 
   if ! selection_output="$(bridge_auth_selected_agents "$spec" 2>&1)"; then
     printf '%s\n' "$selection_output" >&2
@@ -750,16 +759,19 @@ bridge_auth_backfill_settings_agents() {
       local out=""
       out="$(bridge_linux_sudo_root python3 "$SCRIPT_DIR/bridge-auth.py" \
         --registry "$registry" backfill-settings --config-dir "$config_dir" --agent "$agent" \
-        "${owner_args[@]}" --json 2>/dev/null)" || { failed+=("$agent"); rc=1; continue; }
+        "${owner_args[@]}" "${check_args[@]}" --json 2>/dev/null)" || { failed+=("$agent"); rc=1; continue; }
     else
       user_home="$(bridge_auth_resolved_user_home_for_agent "$agent" 2>/dev/null || true)"
       [[ -n "$user_home" ]] && owner_args+=(--allowed-root "$user_home")
       local out=""
       out="$(python3 "$SCRIPT_DIR/bridge-auth.py" \
         --registry "$registry" backfill-settings --config-dir "$config_dir" --agent "$agent" \
-        "${owner_args[@]}" --json 2>/dev/null)" || { failed+=("$agent"); rc=1; continue; }
+        "${owner_args[@]}" "${check_args[@]}" --json 2>/dev/null)" || { failed+=("$agent"); rc=1; continue; }
     fi
-    if printf '%s' "$out" | grep -q '"changed": true'; then
+    # In write mode a backfilled agent reports `changed:true`; in check mode a
+    # drifted agent reports `drift:true`. Either is the "non-clean" signal that
+    # buckets the agent away from `unchanged`.
+    if printf '%s' "$out" | grep -q '"changed": true\|"drift": true'; then
       backfilled+=("$agent")
     else
       unchanged+=("$agent")
@@ -1158,6 +1170,18 @@ bridge_auth_sync_requested() {
   return 1
 }
 
+# Issue #1855 (codex review PR #1858 MAJOR 3): detect `--check` so the
+# claude-token backfill-settings wrapper can forward read-only mode to
+# bridge-auth.py instead of silently dropping it (which would make the public
+# `--check` verb a destructive write).
+bridge_auth_check_requested() {
+  local arg=""
+  for arg in "$@"; do
+    [[ "$arg" == "--check" ]] && return 0
+  done
+  return 1
+}
+
 bridge_auth_agents_arg() {
   local default="${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}"
   while [[ $# -gt 0 ]]; do
@@ -1261,11 +1285,16 @@ case "$command" in
         # Issue #1855: create-if-absent keychain-free apiKeyHelper backfill for
         # pre-#1520 shared Claude agents. Default scope mirrors `sync`'s
         # static-only default so the daemon/upgrade roster loop only touches
-        # static agents unless an explicit --agents CSV is given.
+        # static agents unless an explicit --agents CSV is given. `--check`
+        # forwards read-only coherence-report mode (codex review PR #1858
+        # MAJOR 3 — the wrapper must NOT drop the flag and turn a read-only
+        # verb into a write).
         json_mode=0
+        check_mode=0
         bridge_auth_json_requested "$@" && json_mode=1
+        bridge_auth_check_requested "$@" && check_mode=1
         agents_spec="$(bridge_auth_agents_arg "$@")"
-        bridge_auth_backfill_settings_agents "$agents_spec" "$json_mode"
+        bridge_auth_backfill_settings_agents "$agents_spec" "$json_mode" "$check_mode"
         ;;
       rotate)
         json_mode=0
