@@ -40,6 +40,9 @@
 #       coherent:false / drift:true and the settings.json is NOT mutated.
 #   T6. Byte-identical-to-provision teeth — the backfilled settings.json equals
 #       what ensure_claude_settings_file writes on a fresh dir (same writer).
+#   T7. Bash wrapper path — `bridge-auth.sh claude-token backfill-settings`
+#       passes the required --registry through to bridge-auth.py and reports
+#       the agent as backfilled.
 #
 # Footgun #11 (heredoc_write deadlock class): plain `printf` / file-arg writes
 # only; no command-substitution feeding a heredoc-stdin into a bridge function.
@@ -62,7 +65,9 @@ smoke_setup_bridge_home "1855-keychain-free-backfill"
 
 REPO_ROOT="$SMOKE_REPO_ROOT"
 AUTH_PY="$REPO_ROOT/bridge-auth.py"
+AUTH_SH="$REPO_ROOT/bridge-auth.sh"
 [[ -f "$AUTH_PY" ]] || smoke_fail "missing bridge-auth.py: $AUTH_PY"
+[[ -f "$AUTH_SH" ]] || smoke_fail "missing bridge-auth.sh: $AUTH_SH"
 
 # bridge-auth.py requires a top-level --registry; backfill-settings does not
 # read it (it operates on --config-dir), but argparse still demands the flag.
@@ -186,11 +191,41 @@ PY
     "T6 backfilled settings.json is byte-identical to the provision-time writer output"
 }
 
+test_bash_wrapper_passes_registry() {
+  local agent cfg out helper
+  agent="wrapper-agent"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# shellcheck shell=bash disable=SC2034\n'
+    printf 'bridge_add_agent_id_if_missing %s\n' "$agent"
+    printf 'BRIDGE_AGENT_DESC["%s"]="wrapper smoke"\n' "$agent"
+    printf 'BRIDGE_AGENT_ENGINE["%s"]="claude"\n' "$agent"
+    printf 'BRIDGE_AGENT_SESSION["%s"]="%s"\n' "$agent" "$agent"
+    printf 'BRIDGE_AGENT_WORKDIR["%s"]="%s"\n' "$agent" "$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
+    printf 'BRIDGE_AGENT_SOURCE["%s"]="static"\n' "$agent"
+    printf 'BRIDGE_AGENT_CONTINUE["%s"]="1"\n' "$agent"
+  } >"$BRIDGE_ROSTER_LOCAL_FILE"
+
+  cfg="$BRIDGE_AGENT_ROOT_V2/$agent/home/.claude"
+  mkdir -p "$cfg"
+  printf '{"skipDangerousModePermissionPrompt": true}\n' >"$cfg/settings.json"
+
+  out="$(BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin BRIDGE_CLAUDE_KEYCHAIN_FREE_AUTH=1 \
+    bash "$AUTH_SH" claude-token backfill-settings --agents "$agent" --json)"
+  smoke_assert_contains "$out" '"status": "ok"' "T7 wrapper returns aggregate ok"
+  smoke_assert_contains "$out" '"backfilled": [' "T7 wrapper reports a backfilled list"
+  smoke_assert_contains "$out" "\"$agent\"" "T7 wrapper reports the selected agent"
+  helper="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("apiKeyHelper",""))' "$cfg/settings.json")"
+  smoke_assert_eq "$EXPECTED_HELPER" "$helper" \
+    "T7 wrapper writes the managed apiKeyHelper through bridge-auth.py"
+}
+
 smoke_run "T1 legacy agent gains the managed apiKeyHelper"                test_legacy_gains_helper
 smoke_run "T2 backfill is idempotent (already-contracted untouched)"      test_idempotent_rerun
 smoke_run "T3 non-Darwin is a no-op (no controller-helper-path leak)"     test_non_darwin_noop
 smoke_run "T4 create-if-absent materializes a missing settings.json"      test_create_if_absent
 smoke_run "T5 --check is a read-only credential-coherence drift report"   test_check_drift_readonly
 smoke_run "T6 backfilled end-state is byte-identical to provision writer"  test_byte_identical_to_provision
+smoke_run "T7 bridge-auth.sh wrapper passes --registry to bridge-auth.py"  test_bash_wrapper_passes_registry
 
 smoke_log "all checks passed"

@@ -707,6 +707,7 @@ bridge_auth_backfill_settings_agents() {
   local owner_gid=""
   local user_home=""
   local selection_output=""
+  local registry=""
   local rc=0
   local -a agents=()
   local -a backfilled=()
@@ -725,6 +726,8 @@ bridge_auth_backfill_settings_agents() {
     [[ "$json_mode" == "1" ]] || printf 'skipped: no_matching_claude_agents\n'
     return 0
   fi
+
+  registry="$(bridge_auth_registry_path)"
 
   for agent in "${agents[@]}"; do
     local -a owner_args=()
@@ -746,14 +749,14 @@ bridge_auth_backfill_settings_agents() {
       fi
       local out=""
       out="$(bridge_linux_sudo_root python3 "$SCRIPT_DIR/bridge-auth.py" \
-        backfill-settings --config-dir "$config_dir" --agent "$agent" \
+        --registry "$registry" backfill-settings --config-dir "$config_dir" --agent "$agent" \
         "${owner_args[@]}" --json 2>/dev/null)" || { failed+=("$agent"); rc=1; continue; }
     else
       user_home="$(bridge_auth_resolved_user_home_for_agent "$agent" 2>/dev/null || true)"
       [[ -n "$user_home" ]] && owner_args+=(--allowed-root "$user_home")
       local out=""
       out="$(python3 "$SCRIPT_DIR/bridge-auth.py" \
-        backfill-settings --config-dir "$config_dir" --agent "$agent" \
+        --registry "$registry" backfill-settings --config-dir "$config_dir" --agent "$agent" \
         "${owner_args[@]}" --json 2>/dev/null)" || { failed+=("$agent"); rc=1; continue; }
     fi
     if printf '%s' "$out" | grep -q '"changed": true'; then
