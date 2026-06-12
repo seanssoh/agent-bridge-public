@@ -123,6 +123,63 @@ bridge_layout_v2_reconcile_roster_agents() {
   printf '%s' "${ids[*]:-}"
 }
 
+# bridge_layout_v2_reconcile_iso_agents_json <agents-csv>
+#   Emit a JSON object {"<agent>":"<os_user>", ...} for the subset of the given
+#   roster-scoped agents that are EFFECTIVELY iso v2 isolated (linux-user
+#   isolation active on this host for that agent). The python engine consumes
+#   this (via --iso-agents-json, file-as-argv) to GRACEFUL-SKIP the controller-
+#   side direct-read/backup of those agents' 0600 agent-private memory (#1820
+#   rc3) — the controller cannot read it and must not try.
+#
+#   Emits "{}" when no agents are isolated (shared-mode install, macOS, or the
+#   iso helpers are not sourced), which makes the engine behave exactly as it
+#   did before this fix. Best-effort + side-effect-free: a missing helper or an
+#   unresolvable os_user simply omits that agent (it then takes the normal
+#   shared-mode path). Built with printf (no python dependency on this path).
+bridge_layout_v2_reconcile_iso_agents_json() {
+  local agents_csv="$1"
+  # Without the agent iso predicate we cannot classify anything as iso — treat
+  # the whole install as shared-mode (the engine's prior behavior).
+  if ! command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then
+    printf '{}'
+    return 0
+  fi
+  local -a pairs=()
+  local agent os_user
+  local IFS=,
+  local -a ids=()
+  read -r -a ids <<<"$agents_csv"
+  unset IFS
+  for agent in "${ids[@]}"; do
+    [[ -n "$agent" ]] || continue
+    bridge_agent_linux_user_isolation_effective "$agent" || continue
+    os_user=""
+    if command -v bridge_agent_os_user >/dev/null 2>&1; then
+      os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    fi
+    [[ -n "$os_user" ]] || continue
+    # JSON-escape backslash and double-quote in agent id and os_user (both are
+    # constrained to safe charsets by the roster/os-user composers, but escape
+    # defensively so the emitted object is always valid JSON).
+    local ja jo
+    ja="${agent//\\/\\\\}"; ja="${ja//\"/\\\"}"
+    jo="${os_user//\\/\\\\}"; jo="${jo//\"/\\\"}"
+    pairs+=("\"$ja\":\"$jo\"")
+  done
+  if [[ ${#pairs[@]} -eq 0 ]]; then
+    printf '{}'
+    return 0
+  fi
+  local out="{" i=0
+  for p in "${pairs[@]}"; do
+    if [[ $i -gt 0 ]]; then out+=","; fi
+    out+="$p"
+    i=$((i + 1))
+  done
+  out+="}"
+  printf '%s' "$out"
+}
+
 # bridge_layout_v2_reconcile_noop_json
 #   Emit the canonical STRUCTURED no-op result object. Used when there is no
 #   v1->v2 reconcile to perform (legacy / non-v2 install or no v1-only data) so
@@ -134,7 +191,7 @@ bridge_layout_v2_reconcile_roster_agents() {
 bridge_layout_v2_reconcile_noop_json() {
   local ts
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
-  printf '{"status":"noop","mode":"apply","schema":"layout-v2-reconcile/1","reason":"legacy/non-v2 install or no v1-only data","copied":[],"preserved":[],"conflicted":[],"skipped":[],"warnings":[],"counts":{"copied":0,"preserved":0,"conflicted":0,"skipped":0,"warnings":0,"backed_up":0},"timestamp":"%s"}\n' \
+  printf '{"status":"noop","mode":"apply","schema":"layout-v2-reconcile/1","reason":"legacy/non-v2 install or no v1-only data","copied":[],"preserved":[],"conflicted":[],"skipped":[],"warnings":[],"isolation_v2_migration":[],"counts":{"copied":0,"preserved":0,"conflicted":0,"skipped":0,"warnings":0,"backed_up":0,"isolation_v2_migration":0},"timestamp":"%s"}\n' \
     "$ts"
 }
 
@@ -259,6 +316,20 @@ bridge_layout_v2_reconcile_run() {
   # conflicts/`. The archive PATHS are carried in the emitted JSON
   # (conflicted[].archived) and the JSON is persisted to the state marker below,
   # so archives are included in diagnostic output as the verdict requires.
+  # iso v2 (#1820 rc3): compute {agent: os_user} for effectively-isolated agents
+  # and hand it to the engine file-as-argv (footgun #11) so it graceful-skips the
+  # controller-side direct-read/backup of those agents' 0600 agent-private
+  # memory. Best-effort: "{}" (no iso agents) preserves the prior shared-mode
+  # behavior byte-for-byte. The file lives under the migration state dir so it is
+  # captured in diagnostics; we clean it up after the engine run.
+  local iso_agents_json iso_agents_file=""
+  iso_agents_json="$(bridge_layout_v2_reconcile_iso_agents_json "$agents_csv")"
+  if [[ -n "$iso_agents_json" && "$iso_agents_json" != "{}" ]]; then
+    mkdir -p "$state_dir" 2>/dev/null || true
+    iso_agents_file="$state_dir/.iso-agents-${stamp}.json"
+    printf '%s' "$iso_agents_json" >"$iso_agents_file" 2>/dev/null || iso_agents_file=""
+  fi
+
   local out rc
   out="$("$python_bin" "$helper" \
     --bridge-home "${BRIDGE_HOME:-$HOME/.agent-bridge}" \
@@ -266,8 +337,14 @@ bridge_layout_v2_reconcile_run() {
     --agents-csv "$agents_csv" \
     --mode "$mode" \
     --backup-root "$backup_root" \
+    --iso-agents-json "$iso_agents_file" \
     --queue-task-dir "$queue_dir" 2>/dev/null)"
   rc=$?
+
+  # The iso-agents map is a transient input to the engine; remove it after the
+  # run (the structured isolation_v2_migration section in the result JSON is the
+  # durable audit record, not this scratch file).
+  [[ -n "$iso_agents_file" && -f "$iso_agents_file" ]] && rm -f "$iso_agents_file" 2>/dev/null || true
 
   if [[ "$mode" == "apply" && -n "$lock_token" ]] \
       && command -v bridge_scoped_lock_release >/dev/null 2>&1; then

@@ -52,8 +52,18 @@ Emits a single structured JSON object on stdout:
       "conflicted": [ {agent, kind, rel, live, archived, marker, queue_task} ],
       "skipped":    [ {agent, kind, rel, reason} ],
       "warnings":   [ {agent, detail} ],
-      "counts": {copied, preserved, conflicted, skipped, warnings}
+      "isolation_v2_migration": [ {agent, os_user, action, reason, detail} ],
+      "counts": {copied, preserved, conflicted, skipped, warnings, ...}
     }
+
+iso v2 (#1820 rc3): an iso agent's agent-private memory is owned by its iso UID
+at mode 0600/0700 and is NOT readable by the controller that runs this
+reconcile. For each agent passed in ``--iso-agents-json`` the reconcile
+GRACEFUL-SKIPS the controller-side backup + v1->v2 memory pass (no Errno13
+perm-read) and records a structured ``isolation_v2_migration`` entry
+(``action: skipped-iso-private``) instead of an unstructured warning. The
+fencing/conflict DATA logic is unchanged — it simply is not entered for iso
+agents.
 
 Exit code: 0 on success (including conflicts — conflicts are a reported outcome,
 not a failure), non-zero only on an internal/unexpected error.
@@ -131,6 +141,19 @@ class Reconciler:
             if args.queue_task_dir
             else None
         )
+        # iso v2 agents: a map {agent_id: os_user}. Agent-private memory for these
+        # agents is owned by the iso UID at mode 0600/0700 and is NOT readable by
+        # the controller that runs this reconcile (#1820 rc3). The controller must
+        # NOT direct-read or back up that 0600 state — it would raise Errno13 and
+        # degrade to an unstructured perm-warning. For an agent in this map the
+        # reconcile GRACEFUL-SKIPS the controller-side backup + v1->v2 reconcile
+        # of its agent-private memory and records a STRUCTURED
+        # isolation_v2_migration entry instead. The agent owns and manages its own
+        # private memory; controller backup of 0600 agent-private state is the
+        # wrong contract (same class as the #1827 wiki-rebuild that could not read
+        # an iso home 0700). The conflict/fencing DATA logic below is unchanged —
+        # it simply is not entered for these agents.
+        self.iso_agents: dict[str, str] = self._load_iso_agents(args.iso_agents_json)
         self.stamp = _now_stamp()
 
         self.copied: list[dict] = []
@@ -140,8 +163,40 @@ class Reconciler:
         self.warnings: list[dict] = []
         self.agent_summaries: list[dict] = []
         self.backed_up: list[dict] = []
+        # Structured per-iso-agent audit of the isolation-v2 memory pass so the
+        # iso permission handling is auditable in last-apply.json rather than
+        # falling to unstructured warnings (#1820 rc3 observability).
+        self.isolation_v2_migration: list[dict] = []
         self._cur_v1_home: Path | None = None
         self._cur_v2_home: Path | None = None
+
+    @staticmethod
+    def _load_iso_agents(path_arg: str | None) -> dict[str, str]:
+        """Load the {agent_id: os_user} iso map from a file-as-argv JSON path.
+
+        File-as-argv (not inline) keeps the anti-deadlock contract (footgun #11)
+        and avoids passing a potentially large/odd map on the command line. A
+        missing path, empty value, or malformed file means "no iso agents" — the
+        reconcile then behaves exactly as it did before this fix (shared-mode).
+        Only string->string entries with non-empty keys/values are kept.
+        """
+        if not path_arg:
+            return {}
+        try:
+            raw = Path(path_arg).expanduser().read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        out: dict[str, str] = {}
+        for k, v in data.items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                out[k] = v
+        return out
 
     # --- path helpers --------------------------------------------------------
     def _v1_agent_home(self, agent: str) -> Path:
@@ -635,6 +690,34 @@ class Reconciler:
         }
         self.agent_summaries.append(summary)
 
+        # iso v2 graceful-skip (#1820 rc3). An iso agent's agent-private memory is
+        # owned by its iso UID at mode 0600/0700; the controller running this
+        # reconcile cannot read it (Errno13). Controller backup/reconcile of
+        # 0600 agent-private state is the wrong contract — the agent owns and
+        # manages it. Skip the ENTIRE controller-side memory pass for this agent
+        # (no direct-read, no shutil.copy2 backup, none of the per-file walk) and
+        # record a STRUCTURED isolation_v2_migration entry so the iso permission
+        # pass is auditable in last-apply.json instead of degrading to Errno13
+        # perm-warnings. This early-returns BEFORE _pre_mutation_backup and any
+        # _read_bytes, so the controller never touches the 0600 files.
+        os_user = self.iso_agents.get(agent)
+        if os_user:
+            self.isolation_v2_migration.append(
+                {
+                    "agent": agent,
+                    "os_user": os_user,
+                    "action": "skipped-iso-private",
+                    "reason": "iso-agent-private",
+                    "detail": (
+                        "agent-private memory is owned by the iso UID "
+                        f"({os_user}) at mode 0600/0700 and is not "
+                        "controller-reconcilable; the agent owns and manages it"
+                    ),
+                }
+            )
+            self._skip(agent, "agent", ".", "iso_agent_private")
+            return
+
         if not v1_home.is_dir():
             self._skip(agent, "agent", ".", "no_v1_home")
             return
@@ -752,6 +835,12 @@ class Reconciler:
             "skipped": self.skipped,
             "warnings": self.warnings,
             "backed_up": self.backed_up,
+            # Structured iso-v2 memory pass audit (#1820 rc3): one entry per iso
+            # agent whose agent-private memory was graceful-skipped (or, in a
+            # future iso-run variant, reconciled as the iso UID). Always present
+            # (empty list on a shared-mode / non-iso install) so consumers can
+            # rely on the key existing in last-apply.json.
+            "isolation_v2_migration": self.isolation_v2_migration,
             "counts": {
                 "copied": len(self.copied),
                 "preserved": len(self.preserved),
@@ -759,6 +848,7 @@ class Reconciler:
                 "skipped": len(self.skipped),
                 "warnings": len(self.warnings),
                 "backed_up": len(self.backed_up),
+                "isolation_v2_migration": len(self.isolation_v2_migration),
             },
         }
 
@@ -772,6 +862,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--backup-root", default="")
     parser.add_argument("--conflict-archive-root", default="")
     parser.add_argument("--queue-task-dir", default="")
+    # File-as-argv path to a JSON object mapping {agent_id: os_user} for iso v2
+    # agents (#1820 rc3). Agent-private memory for these agents is graceful-
+    # skipped from the controller-side reconcile/backup (see Reconciler). Empty
+    # / absent => no iso agents => prior shared-mode behavior, byte-identical.
+    parser.add_argument("--iso-agents-json", default="")
     return parser.parse_args(argv)
 
 
