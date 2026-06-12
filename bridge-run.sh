@@ -1783,6 +1783,26 @@ bridge_run_sync_dev_plugin_cache() {
         log_line "[dev-plugin-cache] #1857 fleet-default class-a skip: empty declaration token"
         continue
       fi
+      # class-(a): a token with an EMPTY plugin OR EMPTY marketplace HALF
+      # (`bad@` = empty marketplace, `@evil` = empty plugin) is bad SPEC
+      # SYNTAX, not traversal — malformed-but-safe. Skip+warn that token and
+      # keep processing the rest of the list (Issue #1857, spec v3 Δ3 class-a),
+      # matching the manifest writer's established class-a behavior
+      # (bridge-dev-plugin-cache.py: missing-plugin/marketplace skip). It must
+      # NOT be folded into a channel: an empty component reaches Python's
+      # `_require_safe_path_component`, which raises ValueError on the empty
+      # value and would take down the WHOLE launch via the fleet-default path.
+      # A single typo in the protected fleet-default declaration must never
+      # block every Claude launch. Class-b fail-closed (next) still fires for
+      # real traversal/reserved/escape — those have a NON-empty unsafe half.
+      if [[ "$_fd_token" == *"@"* ]]; then
+        local _fd_plugin_half="${_fd_token%%@*}"
+        local _fd_marketplace_half="${_fd_token#*@}"
+        if [[ -z "$_fd_plugin_half" || -z "$_fd_marketplace_half" ]]; then
+          bridge_warn "#1857 fleet-default class-a skip for ${AGENT}: malformed spec '${_fd_token}' (empty plugin or marketplace half) — skipped, launch continues"
+          continue
+        fi
+      fi
       # class-(b): unsafe identity fails closed BEFORE any path join / write.
       _fd_unsafe="$(bridge_run_fleet_default_unsafe_reason "$_fd_token")"
       if [[ -n "$_fd_unsafe" ]]; then

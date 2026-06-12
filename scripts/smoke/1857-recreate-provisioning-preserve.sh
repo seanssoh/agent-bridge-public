@@ -1109,4 +1109,58 @@ else
   smoke_log "T15c ok: unsafe traversal-glob fleet-default token failed closed BEFORE any convergence write (no glob expansion, no leak)"
 fi
 
+# --- T15d/T15e (gate-2 r3): EMPTY-COMPONENT fleet-default token is class-(a) ---
+# #1857 frozen-spec taxonomy: a token with an EMPTY plugin OR EMPTY marketplace
+# HALF (`bad@` = empty marketplace, `@evil` = empty plugin) is bad SPEC SYNTAX
+# (class-a malformed-but-safe), NOT path traversal (class-b). Before this fix
+# the bash fold treated `bad@` as safe and qualified it into a channel; Python's
+# `_require_safe_path_component` then raised ValueError on the empty component,
+# UNCAUGHT in the sync list-comprehension → the fleet-default path exited rc=1
+# and the launcher treated it as a launch-blocking dev-cache failure. A single
+# typo in the protected fleet-default declaration must NOT take down all
+# launches. Assert per case: (1) RC=0 (launch NOT blocked), (2) a class-(a)
+# skip+warn was emitted for the malformed token, (3) the VALID token in the same
+# list (`valid-plugin@agent-bridge`) still reaches OPTIONAL convergence, and
+# (4) the malformed empty-component token NEVER became a qualified channel.
+_t15_empty_component_check() {
+  # $1=tag $2=declaration $3=malformed-token-substring (for the leak assertion)
+  local tag="$1" decl="$2" bad_sub="$3"
+  local out argv verdict
+  out="$(_t15_run "$tag" "$decl")"
+  argv="$(_t15_argv "$tag")"
+  verdict="$(
+    T15X_ARGV="$argv" T15X_BAD="$bad_sub" "$REAL_PY3" - <<'PY'
+import os, sys
+p = os.environ["T15X_ARGV"]; bad = os.environ["T15X_BAD"]
+try:
+    toks = [l.rstrip("\n") for l in open(p, encoding="utf-8")]
+except OSError:
+    print("BAD: no argv captured (launcher never reached sync — fleet-default path blocked launch?)"); sys.exit(0)
+def flag(name):
+    f = "--" + name
+    for i, t in enumerate(toks):
+        if t == f:
+            return toks[i + 1] if i + 1 < len(toks) else ""
+    return ""
+ch = flag("channels").split(",") if flag("channels") else []
+opt = flag("optional-channels").split(",") if flag("optional-channels") else []
+valid = "plugin:valid-plugin@agent-bridge"
+# The malformed empty-component token must never appear as a qualified channel.
+leaked = any(bad in t for t in ch + opt)
+ok = (valid in ch) and (valid in opt) and not leaked
+print("GOOD" if ok else "BAD: channels=%r optional=%r leaked=%s" % (ch, opt, leaked))
+PY
+  )"
+  if [[ "$out" == *"RC=0"* \
+        && "$out" == *"#1857 fleet-default class-a skip"* \
+        && "$verdict" == GOOD ]]; then
+    smoke_log "T15$tag ok: empty-component fleet-default token ('$decl') class-(a) skip+warn (launch NOT blocked, RC=0); valid token still converged as an optional channel"
+  else
+    smoke_fail "T15$tag gate2r3: empty-component fleet-default token ('$decl') NOT handled as class-(a) skip+warn — launch blocked or valid token lost (out: $out verdict: $verdict)"
+  fi
+}
+# T15d: empty MARKETPLACE half (`bad@`); T15e: empty PLUGIN half (`@evil`).
+_t15_empty_component_check d 'bad@,valid-plugin@agent-bridge' 'bad@'
+_t15_empty_component_check e '@evil,valid-plugin@agent-bridge' '@evil'
+
 smoke_log "all checks passed"

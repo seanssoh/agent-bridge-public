@@ -1065,6 +1065,31 @@ def sync_plugin_cache(root: Path, channel: str, agent: str = "") -> dict[str, st
     plugin_spec = channel[len("plugin:") :]
     plugin_name, plugin_marketplace = plugin_spec.split("@", 1)
 
+    # Issue #1857 (spec v3 Δ3, class-a — defense-in-depth): a token with an
+    # EMPTY plugin OR EMPTY marketplace half (`plugin:bad@`, `plugin:@evil`)
+    # is bad SPEC SYNTAX (malformed-but-safe), NOT path traversal. The bash
+    # fleet-default fold already class-a skip+warns these so they never become
+    # a channel here, but an OPTIONAL channel passed directly (or any caller
+    # bypass) must NOT take down the whole launch: returning a benign `ignored`
+    # result keeps the sync list-comprehension from raising the ValueError that
+    # `_require_safe_path_component` throws on an empty component (which exits
+    # the optional fleet-default path rc=1 and blocks every launch). Skip+warn
+    # and continue, matching the manifest writer's established class-a behavior.
+    # Class-b (`..`, slash, reserved) below still fail-closes — those have a
+    # NON-empty unsafe component and are handled by `_require_safe_path_component`.
+    if plugin_name == "" or plugin_marketplace == "":
+        sys.stderr.write(
+            "[bridge-dev-plugin-cache] #1857 class-a skip: malformed channel %r "
+            "(empty plugin or marketplace component) — skipped, launch continues\n"
+            % (channel,)
+        )
+        return {
+            "channel": channel,
+            "plugin": plugin_name,
+            "status": "ignored",
+            "reason": "malformed-spec:empty-component",
+        }
+
     # Issue #1857 (spec v3 Δ3, class-b): validate the channel-derived
     # marketplace + plugin identity BEFORE any catalog write / path join, and
     # fail CLOSED for an unsafe component (`..`, slash, reserved). Previously
