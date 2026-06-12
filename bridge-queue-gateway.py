@@ -1251,7 +1251,7 @@ def _audit_body_file_sudo_fallback(
         detail["exception"] = str(exception)
         detail["exception_type"] = type(exception).__name__
     audit_script = Path(__file__).resolve().with_name("bridge-audit.py")
-    if not audit_script.is_file():
+    if not audit_script.is_file():  # noqa: raw-pathlib-controller-only — controller-side gateway locating its own sibling audit helper, not an isolated-agent artifact
         return
     cmd = [
         sys.executable,
@@ -1269,7 +1269,7 @@ def _audit_body_file_sudo_fallback(
         json.dumps(detail, ensure_ascii=True, sort_keys=True),
     ]
     try:
-        Path(audit_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        Path(audit_path).expanduser().parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-side gateway creating its own audit-log parent dir, not an isolated-agent artifact
     except OSError:
         pass
     try:
@@ -1300,7 +1300,7 @@ def _sudo_read_body_file(path: Path) -> bytes | None:
     owner wrote — it does NOT weaken any gateway auth.
     """
     try:
-        st = path.stat()
+        st = path.stat()  # noqa: raw-pathlib-controller-only — controller-side gateway stats the body file to read its owner uid (the #1280 sudo-fallback decision), not an isolated-agent path handler
     except OSError:
         return None
     try:
@@ -1318,7 +1318,7 @@ def _sudo_read_body_file(path: Path) -> bytes | None:
         return None
     import shutil
     sudo_bin = shutil.which("sudo") or "/usr/bin/sudo"
-    if not Path(sudo_bin).is_file():
+    if not Path(sudo_bin).is_file():  # noqa: raw-pathlib-controller-only — controller-side gateway checking the system sudo binary exists, not an isolated-agent artifact
         return None
     try:
         result = subprocess.run(
