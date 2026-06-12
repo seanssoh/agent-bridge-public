@@ -6804,6 +6804,27 @@ run_restart() {
     exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --replace "${start_args[@]}"
   fi
 
+  # Issue #1853: self-restart survival (shared mode). When the process running
+  # this restart lives INSIDE the target session's tree (the agent's own
+  # session or a background child it spawned), the kill below would take this
+  # process down before the relaunch leg — leaving the agent stopped until the
+  # daemon's always-on ensure revives it FRESH (continuity lost, the #1769
+  # trusted-resume marker never consumed on that revival). Re-exec the restart
+  # detached (setsid/nohup) so the survivor — outside the doomed tree — owns
+  # the full marker→kill→relaunch sequence atomically, preserving resume.
+  # Attach mode is exempt: it hands the operator's terminal off via exec and is
+  # an interactive foreground path, not the background-child trace this guards.
+  # The iso-v2 self-restart case is already fail-closed above (a detached
+  # re-exec cannot cross the linux-user boundary back to a controller).
+  if [[ $attach_mode -eq 0 ]] \
+      && bridge_agent_restart_is_self "$agent" "$session"; then
+    if bridge_agent_restart_relaunch_detached "$agent" "${start_args[@]}"; then
+      printf 'restart: '\''%s'\'' is restarting itself from inside its own session — handed off to a detached relaunch that survives the self-kill (resume preserved).\n' "$agent"
+      return 0
+    fi
+    bridge_die "$(bridge_agent_restart_self_unsupported_guidance "$agent")"
+  fi
+
   preflight_reason="$(bridge_agent_restart_preflight_reason "$agent")"
   if [[ -n "$preflight_reason" ]]; then
     bridge_die "$(bridge_agent_restart_preflight_guidance "$agent" "$preflight_reason")"
