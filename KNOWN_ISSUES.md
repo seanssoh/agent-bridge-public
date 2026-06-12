@@ -963,5 +963,20 @@ to guess the outcome from a DB it cannot read:
   installs are read correctly. Exposed as the
   `bridge-queue-gateway.py daemon-liveness [--format json]` subcommand for A3
   (#1833 status presentation) to consume across the boundary.
+- **Status health is anchored on that primitive (#1833, wave v0.16.10 A3).**
+  `bridge-daemon.sh status` derives its headline and `health:` verdict from
+  `bridge_daemon_liveness` (lib/bridge-state.sh) — shell pid resolver first,
+  then the `daemon-liveness` primitive — never from whether a queue-gateway
+  call timed out. A transient gateway timeout against a live daemon reports
+  `health=ok` (with `daemon_liveness=up`); an unreadable pid file (iso v2
+  boundary) reports `health=unknown` + `daemon_liveness=unknown`, never a
+  false `health=down`. `down` is reserved for a provably dead/absent daemon
+  pid. The Python dashboard (`agb status`, bridge-status.py) likewise treats
+  EPERM-on-signal as "process exists", and its resolver is tri-state
+  (`daemon_status_tri`): a BLOCKED `daemon.pid` read consults the primitive
+  and renders `daemon unknown pid=-` (JSON: additive `daemon.state` key;
+  `daemon.running` stays a bool, false for unknown) instead of the historical
+  false `stopped pid=-`. Regression smoke:
+  `scripts/smoke/1833-status-gateway-timeout-not-down.sh`.
 
 This is the client contract only; the daemon's write path is unchanged.

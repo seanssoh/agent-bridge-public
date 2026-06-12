@@ -74,7 +74,7 @@ bridge-daemon.sh	9938	H3	7895a010d149b7d0dce4311df9bbdcb4482813d5ae53f61efcb4d18
 bridge-daemon.sh	9960	H3	22934966de6a27751ea674fa1e6bfa437a185be02c4a64e308294463728df4f6	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 bridge-daemon.sh	9965	H3	ef251fdec96d3d76a27631243f309aa27460156653c99cd5636be8ad5525fa1d	here-string/procsub, non-interpreter consumer	claude	beta3-5 wave (baseline housekeeping)
 bridge-daemon.sh	11368	H3	29559f61586cbb5244c6adbfc937edcd6e5181587de3c51a92a101df4fcdeb6b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	11447	H3	32e64212066ea50d5c52673c6ab72d46a3979164ed4d30276da8e54651fe5ed5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	14500	H3	3f6486c3bd2148b2540702ce69a521825978a87e2883ed97d36323a6b2abef32	here-string/procsub, non-interpreter consumer	patch	#1833 (A3 status-liveness): same cmd_status health-signal parse loop; consumer rewritten from `done < <(bridge_daemon_health_signal)` procsub to `done <<<"$health_lines"` here-string (signal captured once earlier) — supersedes 32e64212066e
 bridge-discord-relay.sh	35	H3	b7fa996e0677d162d0061308f4f1561a488c85997ab55a095544e4d61e676bee	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-init.sh	71	C3	7ceb326cff7c07a046a9418a28c8d084da61e010f16795b90568ca6376eccdf8	interpreter heredoc, no capture	claude	beta3-5 wave (baseline housekeeping)
 bridge-init.sh	341	C3	9ddd6df1a4e0177fafc7adc674bd3612232536269ead917b7d698268dcc040e5	interpreter heredoc, no capture	patch	Phase 3 PR C
