@@ -723,34 +723,75 @@ def _daemon_pid_from_owner_pid(pid_file: str) -> str:
     return ""
 
 
-def daemon_status(
+def _daemon_liveness_verdict(pid_file: str, bridge_home: str) -> str:
+    """Consult the A1 daemon-liveness primitive (#1837/#1840) for the
+    tri-state verdict (`up`/`down`/`unknown`), reusing
+    `gateway_daemon_liveness` via its public `daemon-liveness` subcommand
+    rather than duplicating the pid+cmdline logic here. Returns '' on any
+    failure (missing sidecar script, exec error, timeout) so the caller can
+    fall back to its legacy verdict."""
+    script = Path(__file__).resolve().parent / "bridge-queue-gateway.py"
+    if not script.is_file():  # noqa: raw-pathlib-controller-only
+        return ""
+    env = dict(os.environ)
+    if pid_file:
+        # Pin the primitive to the SAME pid-file this dashboard was told to
+        # inspect (`--daemon-pid-file`), which is not necessarily exported.
+        env["BRIDGE_DAEMON_PID_FILE"] = pid_file
+    cmd = [sys.executable or "python3", str(script), "daemon-liveness"]
+    if bridge_home:
+        cmd += ["--bridge-home", bridge_home]
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=5, env=env,
+        )
+    except (OSError, ValueError, Exception):
+        return ""
+    verdict = (out.stdout or "").strip()
+    return verdict if verdict in ("up", "down", "unknown") else ""
+
+
+def daemon_status_tri(
     pid_file: str,
     state_dir: str = "",
     bridge_home: str = "",
-) -> tuple[bool, str]:
-    """Resolve daemon running-state with the same fallback chain as the
-    shell resolver (`bridge_daemon_pid` in lib/bridge-state.sh). Issue
-    #1463: the Python dashboard previously read only `daemon.pid` +
-    `kill(pid, 0)` with NO fallback, so when a losing launchd KeepAlive job
-    instance deleted the true holder's pid-file the dashboard reported
-    `stopped pid=-` while the daemon was in fact running — disagreeing with
-    the shell resolver (which has the fallbacks). Port them here.
+) -> tuple[str, str]:
+    """Resolve daemon state with the same fallback chain as the shell
+    resolver (`bridge_daemon_pid` in lib/bridge-state.sh). Issue #1463: the
+    Python dashboard previously read only `daemon.pid` + `kill(pid, 0)` with
+    NO fallback, so when a losing launchd KeepAlive job instance deleted the
+    true holder's pid-file the dashboard reported `stopped pid=-` while the
+    daemon was in fact running — disagreeing with the shell resolver (which
+    has the fallbacks). Port them here.
+
+    Returns `(state, pid)` with state `running` / `stopped` / `unknown`.
+    Issue #1833: `unknown` means the pid-file exists but cannot be read from
+    this context (the iso v2 boundary) and the daemon-liveness primitive
+    could not settle it either — it must NOT be rendered as stopped/down.
 
     Resolution order:
       1. Recorded pid (daemon.pid) — alive AND cmdline still looks like a
          bridge-daemon (PID-recycling guard, mirrors #683).
       2. Scoped pgrep for `<BRIDGE_HOME>/bridge-daemon.sh run`.
       3. mkdir-lock `owner.pid` (macOS flock-less backend).
+      4. On a BLOCKED pid-file read only: the A1 `gateway_daemon_liveness`
+         primitive (#1840) — `up` → running, `down` → stopped, else unknown.
     """
     recorded = ""
+    pidfile_blocked = False
     try:
         recorded = Path(pid_file).read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         recorded = ""
     except Exception:
         # Unreadable pid-file (perm denied etc.) — fall through to the
-        # process-level fallbacks rather than reporting a hard error.
+        # process-level fallbacks, but remember the read was BLOCKED (not
+        # absent) so the nothing-resolved terminal below can answer
+        # `unknown` instead of a false `stopped` (#1833 iso boundary).
         recorded = ""
+        pidfile_blocked = True
 
     # 1. Recorded pid with cmdline validation.
     if recorded:
@@ -761,25 +802,52 @@ def daemon_status(
         if rpid and _pid_alive(rpid):
             cmdline = _proc_cmdline(rpid)
             if not cmdline or "bridge-daemon.sh run" in cmdline:
-                return (True, recorded)
+                return ("running", recorded)
             # Recorded pid is live but is a recycled/unrelated process —
             # fall through to the pgrep/owner.pid fallbacks.
 
     # 2. Scoped pgrep fallback.
     pgrep_pid = _daemon_pid_from_pgrep(bridge_home)
     if pgrep_pid:
-        return (True, pgrep_pid)
+        return ("running", pgrep_pid)
 
     # 3. mkdir-lock owner.pid fallback (macOS flock-less backend).
     owner_pid = _daemon_pid_from_owner_pid(pid_file)
     if owner_pid:
-        return (True, owner_pid)
+        return ("running", owner_pid)
+
+    # 4. Blocked pid-file read (#1833): from an iso UID the pgrep fallback
+    # above is scoped to the CALLING uid and owner.pid is typically blocked
+    # by the same boundary, so a live controller daemon used to render
+    # `stopped pid=-` here. Ask the A1 primitive before concluding; `up` /
+    # `down` are trusted, anything else is an honest `unknown` — never a
+    # fabricated `stopped`.
+    if pidfile_blocked:
+        verdict = _daemon_liveness_verdict(pid_file, bridge_home)
+        if verdict == "up":
+            return ("running", "-")
+        if verdict != "down":
+            return ("unknown", "-")
 
     # Nothing resolved. Preserve the prior display convention: a recorded
     # (but dead/unrelated) pid is echoed back; an absent pid-file shows '-'.
     if recorded:
-        return (False, recorded)
-    return (False, "-")
+        return ("stopped", recorded)
+    return ("stopped", "-")
+
+
+def daemon_status(
+    pid_file: str,
+    state_dir: str = "",
+    bridge_home: str = "",
+) -> tuple[bool, str]:
+    """Legacy boolean shim over `daemon_status_tri`. Existing consumers
+    unpack `(running, pid)` and truth-test the first element (e.g. the
+    #1463 regression smoke drives this function directly), so the tri-state
+    must not leak a truthy non-running token through it: `unknown` maps to
+    False here. Tri-state-aware render paths use `daemon_status_tri`."""
+    state, pid = daemon_status_tri(pid_file, state_dir=state_dir, bridge_home=bridge_home)
+    return (state == "running", pid)
 
 
 def read_dotenv(path: Path) -> dict[str, str]:
@@ -1445,7 +1513,9 @@ def render_bar(value: int, width: int = 10, char: str = "#") -> str:
 def render_dashboard(args: argparse.Namespace) -> str:
     roster = read_roster(args.roster_snapshot)
     queue_db = Path(args.db)
-    daemon_running, daemon_pid = daemon_status(
+    # #1833: tri-state — `unknown` (blocked pid-file read at the iso
+    # boundary) must render as its own token, never as `stopped`.
+    daemon_state, daemon_pid = daemon_status_tri(
         args.daemon_pid_file,
         state_dir=args.bridge_state_dir,
         bridge_home=args.bridge_home or "",
@@ -1551,7 +1621,7 @@ def render_dashboard(args: argparse.Namespace) -> str:
         title += f" v{args.version}"
     lines.append(title)
     lines.append(
-        f"updated {iso_now()} | daemon {'running' if daemon_running else 'stopped'} pid={daemon_pid} | "
+        f"updated {iso_now()} | daemon {daemon_state} pid={daemon_pid} | "
         f"active {full_active_count}/{full_total_agents} | shown {visible_agents} | "
         f"health warn={health_warn_count} crit={health_critical_count} | wake miss={wake_missing_count} | channel miss={channel_missing_count} | zombie={zombie_count}{a2a_flag}{orphan_dirs_flag} | db {queue_db}"
     )
@@ -1757,7 +1827,10 @@ def render_dashboard(args: argparse.Namespace) -> str:
 def render_dashboard_json(args: argparse.Namespace) -> str:
     roster = read_roster(args.roster_snapshot)
     queue_db = Path(args.db)
-    daemon_running, daemon_pid = daemon_status(
+    # #1833: tri-state. `running` stays a bool for existing JSON consumers
+    # (false for both stopped and unknown — conservative); the additive
+    # `state` key carries the full verdict.
+    daemon_state, daemon_pid = daemon_status_tri(
         args.daemon_pid_file,
         state_dir=args.bridge_state_dir,
         bridge_home=args.bridge_home or "",
@@ -1830,8 +1903,11 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
         "updated_at": iso_now(),
         "version": args.version,
         "daemon": {
-            "running": daemon_running,
+            "running": daemon_state == "running",
             "pid": daemon_pid,
+            # #1833 additive: running|stopped|unknown (unknown = pid-file
+            # blocked at the iso boundary; NOT a crash signal).
+            "state": daemon_state,
         },
         "totals": totals,
         "agents": agents,

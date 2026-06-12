@@ -972,7 +972,11 @@ to guess the outcome from a DB it cannot read:
   boundary) reports `health=unknown` + `daemon_liveness=unknown`, never a
   false `health=down`. `down` is reserved for a provably dead/absent daemon
   pid. The Python dashboard (`agb status`, bridge-status.py) likewise treats
-  EPERM-on-signal as "process exists" instead of "stopped". Regression smoke:
+  EPERM-on-signal as "process exists", and its resolver is tri-state
+  (`daemon_status_tri`): a BLOCKED `daemon.pid` read consults the primitive
+  and renders `daemon unknown pid=-` (JSON: additive `daemon.state` key;
+  `daemon.running` stays a bool, false for unknown) instead of the historical
+  false `stopped pid=-`. Regression smoke:
   `scripts/smoke/1833-status-gateway-timeout-not-down.sh`.
 
 This is the client contract only; the daemon's write path is unchanged.

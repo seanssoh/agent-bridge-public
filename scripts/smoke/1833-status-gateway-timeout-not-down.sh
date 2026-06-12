@@ -142,8 +142,30 @@ unreadable_pidfile_reports_unknown() {
     "an unreadable pidfile never false-reports down (#1833)"
 }
 
+dashboard_unreadable_pidfile_reports_unknown() {
+  # Codex r1 P1: the agb status dashboard resolver (bridge-status.py
+  # daemon_status_tri) must answer `unknown` for the same blocked-pidfile
+  # shape — not the historical `stopped pid=-` — and the legacy boolean
+  # shim must keep mapping unknown -> not-running (False) for pre-tri-state
+  # consumers (the #1463 smoke truth-tests the first tuple element).
+  if [[ "$(id -u)" -eq 0 ]]; then
+    smoke_log "skip: running as root — mode 0000 does not block reads"
+    return 0
+  fi
+  printf '%s\n' "99999" >"$BRIDGE_DAEMON_PID_FILE"
+  chmod 0000 "$BRIDGE_DAEMON_PID_FILE"
+  local out rc=0
+  out="$(python3 "$SCRIPT_DIR/${SMOKE_NAME}-helper.py" dashboard-unknown \
+    "$SMOKE_REPO_ROOT" "$BRIDGE_DAEMON_PID_FILE" "$BRIDGE_HOME" 2>&1)" || rc=$?
+  chmod 0644 "$BRIDGE_DAEMON_PID_FILE"
+  smoke_assert_contains "$out" "ok-dashboard-unknown" \
+    "dashboard tri-state: blocked pidfile -> unknown (not stopped); legacy shim stays False"
+  [[ "$rc" -eq 0 ]] || smoke_fail "dashboard helper exited rc=$rc: $out"
+}
+
 main() {
   smoke_require_cmd python3
+  smoke_assert_file_exists "$SCRIPT_DIR/${SMOKE_NAME}-helper.py" "1833 helper sidecar present"
   smoke_setup_bridge_home "$SMOKE_NAME"
   export BRIDGE_DAEMON_PID_FILE="$BRIDGE_STATE_DIR/daemon.pid"
 
@@ -153,6 +175,8 @@ main() {
     dead_pid_reports_down
   smoke_run "unreadable pidfile -> health=unknown, never down (iso boundary)" \
     unreadable_pidfile_reports_unknown
+  smoke_run "dashboard: blocked pidfile -> unknown, not stopped (codex P1)" \
+    dashboard_unreadable_pidfile_reports_unknown
 
   smoke_log "PASS: $SMOKE_NAME"
 }

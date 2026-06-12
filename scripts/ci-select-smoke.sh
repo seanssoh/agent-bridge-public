@@ -858,6 +858,14 @@ select_for_path() {
       # SSOT. Pull the GC smoke so a status-counter refactor that drifts from
       # the classifier's verdict is caught.
       add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1209-ms365-redirect-resolver 1215-ms365-dir-mode G-channel-spec-resolution γ-cli-consistency B-beta4-setup-wizard H-beta4-iso-ownership 1803-orphan-dir-gc
+      # Issue #1833 (wave v0.16.10 A3, codex r1 P1): bridge-status.py's
+      # daemon_status_tri answers `unknown` (not a false `stopped`) for a
+      # BLOCKED daemon.pid read by consulting the gateway daemon-liveness
+      # primitive, and the legacy daemon_status boolean shim maps unknown ->
+      # False for pre-tri-state consumers (the #1463 E1/E2 probes). Pull the
+      # 1833 smoke on every bridge-status.py move so the tri-state and the
+      # shim mapping cannot silently regress.
+      add_required 1833-status-gateway-timeout-not-down
       # Issue #1405 (v0.15.0 self-heal stack): bridge-status.py gained
       # read_handoffd_health + the A2A receiver health row + the
       # `a2a=DOWN`/`a2a=ALARM` header flag (text + JSON dashboards). Pull
