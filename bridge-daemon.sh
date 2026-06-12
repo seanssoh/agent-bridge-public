@@ -14476,9 +14476,40 @@ cmd_status() {
       socket_status="running"
     fi
   fi
+
+  # Issue #815 Wave C + #1833: compute the derived health signal FIRST so the
+  # headline and the `health:` summary are keyed off the SAME pidfile-anchored
+  # liveness verdict (bridge_daemon_liveness, consuming the A1
+  # gateway_daemon_liveness primitive from #1840). Before #1833 the headline
+  # used the shell resolver alone, which false-reported `stopped` +
+  # `health=down` from an iso v2 agent UID (EPERM on kill -0 / unreadable
+  # pidfile) right after a transient queue-gateway timeout — while the daemon
+  # was provably alive. Health is derived from the daemon PID, never from a
+  # gateway response.
+  local health_age="" health_fresh="" health_state="" health_liveness=""
+  local health_lines=""
+  health_lines="$(bridge_daemon_health_signal)"
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      tick_age_seconds=*) health_age="${line#tick_age_seconds=}" ;;
+      tick_fresh=*)       health_fresh="${line#tick_fresh=}" ;;
+      daemon_liveness=*)  health_liveness="${line#daemon_liveness=}" ;;
+      health=*)           health_state="${line#health=}" ;;
+    esac
+  done <<<"$health_lines"
+
   if bridge_daemon_is_running; then
     daemon_running=1
     echo "running pid=$(bridge_daemon_pid) interval=${BRIDGE_DAEMON_INTERVAL}s db=${BRIDGE_TASK_DB} socket_listener=${socket_status}"
+  elif [[ "$health_liveness" == "up" ]]; then
+    # Cross-context up: the shell resolver could not prove liveness (iso v2
+    # boundary — kill -0 EPERM), but the pidfile+cmdline primitive did. Keep
+    # the `running pid=` grep-grammar for existing parsers.
+    daemon_running=1
+    echo "running pid=$(bridge_daemon_recorded_pid 2>/dev/null || true) interval=${BRIDGE_DAEMON_INTERVAL}s db=${BRIDGE_TASK_DB} socket_listener=${socket_status} (pid verified via daemon pidfile; cross-uid context)"
+  elif [[ "$health_liveness" == "unknown" ]]; then
+    echo "unknown socket_listener=${socket_status} (daemon pidfile not readable from this context — cannot verify daemon liveness; NOT necessarily down)"
   else
     echo "stopped socket_listener=${socket_status}"
   fi
@@ -14490,18 +14521,9 @@ cmd_status() {
   # operators can answer "is the daemon actually doing work?" not just
   # "is the pid alive?". The fields are additive — existing parsers that
   # key off `running pid=` / `stopped` are unaffected. The single-line
-  # `health: <ok|silent|down> ...` summary is the human-facing answer;
-  # the three key=value lines preserve the grep-grammar for tooling.
-  local health_age="" health_fresh="" health_state=""
-  local line
-  while IFS= read -r line; do
-    case "$line" in
-      tick_age_seconds=*) health_age="${line#tick_age_seconds=}" ;;
-      tick_fresh=*)       health_fresh="${line#tick_fresh=}" ;;
-      health=*)           health_state="${line#health=}" ;;
-    esac
-    printf '%s\n' "$line"
-  done < <(bridge_daemon_health_signal)
+  # `health: <ok|silent|down|unknown> ...` summary is the human-facing
+  # answer; the key=value lines preserve the grep-grammar for tooling.
+  printf '%s\n' "$health_lines"
   case "$health_state" in
     ok)
       echo "health: ok (pid alive, last tick ${health_age:-?}s ago)"
@@ -14512,6 +14534,11 @@ cmd_status() {
       else
         echo "health: silent (pid alive but no parseable heartbeat — likely wedged; \`agb daemon start\` will auto-repair)"
       fi
+      ;;
+    unknown)
+      # #1833: never render a visibility boundary as a crash. A queue-gateway
+      # call timing out at the same moment does NOT mean the daemon is down.
+      echo "health: unknown (daemon pidfile not readable from this context — iso boundary; a queue-gateway timeout alone does NOT mean the daemon is down. Verify from the controller: \`agb daemon status\`)"
       ;;
     *)
       echo "health: down (no live pid)"

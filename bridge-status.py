@@ -648,6 +648,13 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
+    except PermissionError:
+        # Issue #1833: EPERM means the process EXISTS but is owned by another
+        # UID (the controller's daemon as seen from an iso v2 agent). That is
+        # liveness, not absence — treating it as dead made `agb status` report
+        # the daemon stopped from an iso UID while it was provably alive.
+        # Callers that need proof the pid is the daemon still cmdline-verify.
+        return True
     except OSError:
         return False
     return True
