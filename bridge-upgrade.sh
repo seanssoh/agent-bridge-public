@@ -2980,6 +2980,40 @@ PY
   rm -rf "$_relink_profile_dir"
 fi
 
+# Issue #1820 — gated v1->v2 agent-data reconciliation. Runs HERE because this
+# is the one safe window: the daemon is stopped (line ~2096 `stop --force`),
+# apply-live has already deployed the four v2-aware writer fixes, and
+# migrate-agents has materialized the v2 agent trees — but the daemon (and its
+# cron dispatch) has NOT restarted yet. The reconcile reverse-merges v1-only
+# agent memory that accumulated while the old writers targeted v1, into v2, so
+# the install is healthy before new writes resume. It is idempotent and
+# best-effort: a failure is logged but does not abort the upgrade (the writer
+# fixes alone already stop NEW forking; the reconcile recovers historical
+# v1-only data and can be re-run). Skipped on dry-run and on legacy (non-v2)
+# installs (the wrapper returns 2 = nothing-to-do).
+if [[ $DRY_RUN -eq 0 && $RESTART_DAEMON -eq 1 ]]; then
+  if [[ -f "$TARGET_ROOT/lib/bridge-layout-v2-reconcile.sh" ]]; then
+    # QUIESCE before the reconcile (#1820 r3, codex): the apply-path daemon
+    # restart lives AFTER this block (the `stop --force` at the restart phase
+    # below), so without an explicit stop here the daemon — and its cron
+    # dispatch — is still LIVE, and the reconcile wrapper's fail-closed fence
+    # would (correctly) refuse to mutate. Stop the daemon now so the reconcile
+    # runs in a genuinely quiesced window; the restart phase below brings it
+    # back up on the new code. `--force` because the upgrader is the sanctioned
+    # daemon stop path (mirrors the restart-phase stop). Best-effort: a stop
+    # failure leaves the daemon up, the wrapper then refuses (fail-closed), and
+    # the reconcile is logged non-fatal + re-runnable.
+    bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
+    mkdir -p "$TARGET_ROOT/state/migration" "$TARGET_ROOT/logs" 2>/dev/null || true
+    # shellcheck source=lib/bridge-layout-v2-reconcile.sh
+    BRIDGE_HOME="$TARGET_ROOT" BRIDGE_SCRIPT_DIR="$TARGET_ROOT" \
+      bash "$TARGET_ROOT"/lib/bridge-layout-v2-reconcile-driver.sh apply \
+      >"$TARGET_ROOT/state/migration/layout-v2-reconcile-upgrade.json" 2>>"$TARGET_ROOT/logs/upgrade.log" \
+      && echo "[bridge-upgrade] layout-v2 reconcile: applied (see state/migration/layout-v2-reconcile/last-apply.json)" >&2 \
+      || echo "[bridge-upgrade] layout-v2 reconcile: skipped/non-fatal (legacy install or recoverable error; re-runnable)" >&2
+  fi
+fi
+
 # Issue #1662 — DURABLE SUCCESS MARKER + NOTICE, written BEFORE the restart
 # phase begins. On a sudo-self systemd install the upcoming daemon/systemd-unit
 # restart can cycle the INVOKING tmux session (it lives under the unit being
