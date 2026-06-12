@@ -1214,6 +1214,153 @@ def _client_preflight_error(reason_code: str, message: str = "") -> ClientPrefli
     return ClientPreflightError(reason_code, message)
 
 
+def _audit_body_file_sudo_fallback(
+    body_path: Path,
+    iso_uid: str,
+    *,
+    success: bool,
+    rc: int | None,
+    call_site: str,
+    exception: BaseException | None = None,
+) -> None:
+    """Best-effort audit row for a sudo-fallback body-file read (#1280 parity).
+
+    Mirrors ``bridge-queue.py:_audit_body_file_sudo_fallback`` /
+    ``bridge-a2a.py`` — a parallel copy, because the gateway does not
+    import ``bridge-queue`` and we deliberately avoid coupling the CLIs
+    through a shared module just for one audit hook. Any failure to emit
+    is swallowed silently.
+    """
+    audit_path = (
+        os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+        or os.path.expanduser(os.path.join(
+            os.environ.get("BRIDGE_HOME", "").strip() or "~/.agent-bridge",
+            "logs",
+            "audit.jsonl",
+        ))
+    )
+    detail = {
+        "file_path": str(body_path),
+        "iso_uid": iso_uid,
+        "fallback_method": "sudo-read",
+        "success": success,
+        "rc": rc if rc is not None else "",
+        "call_site": call_site,
+    }
+    if exception is not None:
+        detail["exception"] = str(exception)
+        detail["exception_type"] = type(exception).__name__
+    audit_script = Path(__file__).resolve().with_name("bridge-audit.py")
+    if not audit_script.is_file():  # noqa: raw-pathlib-controller-only — controller-side gateway locating its own sibling audit helper, not an isolated-agent artifact
+        return
+    cmd = [
+        sys.executable,
+        str(audit_script),
+        "write",
+        "--file",
+        audit_path,
+        "--actor",
+        "bridge-queue-gateway",
+        "--action",
+        "body_file_sudo_fallback",
+        "--target",
+        str(body_path),
+        "--detail-json",
+        json.dumps(detail, ensure_ascii=True, sort_keys=True),
+    ]
+    try:
+        Path(audit_path).expanduser().parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-side gateway creating its own audit-log parent dir, not an isolated-agent artifact
+    except OSError:
+        pass
+    try:
+        subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _sudo_read_body_file(path: Path) -> bytes | None:
+    """Issue #1280 parity: sudo-fallback body-file reader for the gateway.
+
+    Mirrors ``bridge-queue.py:_sudo_read_body_file``. On iso v2 hosts the
+    body file may be owned by an isolated UID (``agent-bridge-<a>``, mode
+    0660 ``ab-agent-<a>``) that the reading process is not a member of, so
+    the direct ``os.open`` raises ``PermissionError``. The pre-existing
+    controller<->iso boundary is ``sudo -n -u <owner> cat <path>`` (see
+    ``lib/bridge-isolation-helpers.sh``). Returns the file bytes on
+    success, ``None`` on any failure (sudo missing, owner not in the
+    ``agent-bridge-*`` namespace, already that UID, stat/subprocess error)
+    so the caller surfaces the actionable iso-ownership error rather than
+    a silent empty body. This is a READ fallback for a file the legitimate
+    owner wrote — it does NOT weaken any gateway auth.
+    """
+    try:
+        st = path.stat()  # noqa: raw-pathlib-controller-only — controller-side gateway stats the body file to read its owner uid (the #1280 sudo-fallback decision), not an isolated-agent path handler
+    except OSError:
+        return None
+    try:
+        ent = pwd.getpwuid(st.st_uid)
+    except (KeyError, OSError):
+        return None
+    owner = ent.pw_name
+    prefix = os.environ.get("BRIDGE_AGENT_OS_USER_PREFIX", "agent-bridge-")
+    if not owner.startswith(prefix):
+        return None
+    try:
+        if os.geteuid() == st.st_uid:
+            return None
+    except OSError:
+        return None
+    import shutil
+    sudo_bin = shutil.which("sudo") or "/usr/bin/sudo"
+    if not Path(sudo_bin).is_file():  # noqa: raw-pathlib-controller-only — controller-side gateway checking the system sudo binary exists, not an isolated-agent artifact
+        return None
+    try:
+        result = subprocess.run(
+            [sudo_bin, "-n", "-u", owner, "cat", "--", str(path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=None,
+            call_site="bridge-queue-gateway._read_inline_text",
+            exception=exc,
+        )
+        return None
+    if result.returncode != 0:
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=result.returncode,
+            call_site="bridge-queue-gateway._read_inline_text",
+        )
+        return None
+    _audit_body_file_sudo_fallback(
+        path, owner, success=True, rc=0,
+        call_site="bridge-queue-gateway._read_inline_text",
+    )
+    return result.stdout
+
+
+def _decode_inline_body(raw: bytes, path_text: str) -> str:
+    """Apply the inline-transport size cap + UTF-8 decode to body bytes."""
+    if len(raw) > INLINE_BODY_CAP_BYTES:
+        raise _client_preflight_error(
+            "body_file_too_large",
+            f"too large for inline transport: {len(raw)} > {INLINE_BODY_CAP_BYTES}",
+        )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _client_preflight_error("body_file_not_utf8", f"is not valid UTF-8: {exc}") from exc
+
+
 def _read_inline_text(path_text: str) -> str:
     if not path_text:
         raise _client_preflight_error("invalid_argv", "invalid argv: file path is empty")
@@ -1233,7 +1380,22 @@ def _read_inline_text(path_text: str) -> str:
     except FileNotFoundError as exc:
         raise _client_preflight_error("body_file_not_found", f"not found: {path_text}") from exc
     except PermissionError as exc:
-        raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
+        # Issue #1835 (#1280 parity): an iso UID-owned body file at mode
+        # 0660 cannot be read directly by a non-member reader. Mirror the
+        # `bridge-queue.py:stabilize_body_file` sudo-as-owner fallback the
+        # `create --body-file` server path already has, so the SOCKET
+        # transport's client-side preflight reaches the same result. On
+        # success the bytes pass the SAME size/UTF-8 caps as a direct read.
+        fallback = _sudo_read_body_file(path)
+        if fallback is not None:
+            return _decode_inline_body(fallback, path_text)
+        raise _client_preflight_error(
+            "body_file_unreadable",
+            f"unreadable under client UID: {exc.strerror} "
+            f"(iso UID may own this file; pass the body inline with --body, "
+            f"or run `sudo chmod 0644 {path_text}` — `--body-file` from an "
+            f"iso UID needs the #1280 sudo grant)",
+        ) from exc
     except OSError as exc:
         # O_NOFOLLOW on a symlink raises ELOOP; treat as unreadable rather
         # than disclose the symlink shape.
@@ -1270,15 +1432,7 @@ def _read_inline_text(path_text: str) -> str:
         except OSError:
             pass
 
-    if len(raw) > INLINE_BODY_CAP_BYTES:
-        raise _client_preflight_error(
-            "body_file_too_large",
-            f"too large for inline transport: {len(raw)} > {INLINE_BODY_CAP_BYTES}",
-        )
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise _client_preflight_error("body_file_not_utf8", f"is not valid UTF-8: {exc}") from exc
+    return _decode_inline_body(raw, path_text)
 
 
 def client_argv_normalize(argv: list[str]) -> list[str]:
