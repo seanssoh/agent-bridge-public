@@ -6751,6 +6751,57 @@ def _admin_read_expansion_provably_safe(text: str, agent: str) -> list[tuple[str
     return peer_refs
 
 
+def _write_target_containment_roots() -> list[Path]:
+    """The set of operator-controlled roots a contained admin write may land
+    under: the operator bridge home AND — on a v2-split install — the v2 DATA
+    ROOT (``$BRIDGE_DATA_ROOT`` == ``agent_root_v2().parent``).
+
+    Issue #1823 (r3) AUDIT gap: on a co-located install the v2 data root lives
+    *inside* ``bridge_home_dir()`` so a peer v2 home
+    (``<data_root>/agents/<peer>/home``) is already under the bridge home and the
+    #1806 admin peer-write path audits it. On a SPLIT-ROOT install the data root
+    sits OUTSIDE the bridge home, so a trusted-admin write to a split-root peer
+    v2 home failed `relative_to(bridge_home)`, `_resolved_write_target_containment`
+    returned ``None``, and the admin command fell through to ALLOW with ZERO
+    ``admin_cross_agent_write`` rows — an UNAUDITED cross-agent write. Adding the
+    v2 data root here makes containment recognize the split-root peer home, so
+    the audit fires on BOTH layouts. The data root is resolved from the same SSOT
+    the rest of the guard uses (`agent_root_v2()`); when v2 is unresolved (legacy
+    install) the list is bridge-home-only and behavior is byte-identical to the
+    pre-r3 single-root check. A pure ADDITION of accepted roots — it never
+    narrows containment, and the `_path_in_forbidden_tree` hard-deny + peer-home
+    tagging downstream are unchanged.
+    """
+    roots: list[Path] = []
+    try:
+        roots.append(bridge_home_dir().resolve(strict=False))
+    except (OSError, RuntimeError):
+        pass
+    root_v2 = agent_root_v2()
+    if root_v2 is not None:
+        # `agent_root_v2()` is `<data_root>/agents`; its parent is the data root
+        # (== `$BRIDGE_DATA_ROOT`), under which `agents/<peer>/home` is the peer
+        # v2 home. On a co-located install this resolves inside the bridge home
+        # and is a harmless duplicate of the first root.
+        try:
+            roots.append(root_v2.parent.resolve(strict=False))
+        except (OSError, RuntimeError):
+            pass
+    return roots
+
+
+def _resolved_target_under_containment_root(resolved_target: Path) -> bool:
+    """True iff *resolved_target* is contained (RESOLVED-PATH) under ANY operator
+    write-containment root — the bridge home or the v2 data root (#1823 r3)."""
+    for root in _write_target_containment_roots():
+        try:
+            resolved_target.relative_to(root)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
 def _resolved_write_target_containment(target_word: str, agent: str) -> tuple[str, str] | None:
     """Resolve a write-target path word and confirm RESOLVED-PATH containment
     inside the operator bridge home AND outside every hard-denied tree.
@@ -6779,22 +6830,26 @@ def _resolved_write_target_containment(target_word: str, agent: str) -> tuple[st
     resolved_target = _resolve_word_through_symlinks(target_word)
     if resolved_target is None:
         return None
-    bridge_home = bridge_home_dir()
-    # Must stay under the operator bridge home (symlink-resolved on both
-    # sides). A quarantine destination (backups/) and a peer workdir are both
-    # under the bridge home; an escape to /etc or another user's tree is not.
-    try:
-        bridge_resolved = bridge_home.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return None
-    try:
-        resolved_target.relative_to(bridge_resolved)
-    except ValueError:
+    # Must stay under an operator-controlled write-containment root
+    # (symlink-resolved on both sides): the bridge home OR — on a v2-split
+    # install — the v2 data root (`$BRIDGE_DATA_ROOT`, issue #1823 r3). A
+    # quarantine destination (backups/), a peer workdir, and a split-root peer
+    # v2 home are all under one of these roots; an escape to /etc or another
+    # user's tree is not. Accepting the v2 data root closes the r3 AUDIT gap:
+    # without it a trusted-admin write to a split-root peer v2 home failed
+    # containment and fell through to an UNAUDITED allow.
+    if not _resolved_target_under_containment_root(resolved_target):
         return None
     # Hard-denied trees stay denied even for a contained write.
     if _path_in_forbidden_tree(resolved_target):
         return None
     # Tag the peer home (if any) the target lands in, for the audit row.
+    # Recover the agent NAME with `_peer_home_agent_name`, NOT a bare
+    # `peer_home.name`: a v2 entry from `other_agent_homes` is the `home/` CHILD
+    # of the peer's agent dir (`…/agents/<peer>/home`), so `.name` is the literal
+    # ``"home"`` — the agent name is the parent's. Issue #1823 (r3): without this
+    # a split-root v2 peer write audited `target_agent: "home"` instead of the
+    # real peer (the v1 home, whose dir IS the agent, was already correct).
     target_agent = ""
     for peer_home in other_agent_homes(agent):
         try:
@@ -6805,7 +6860,7 @@ def _resolved_write_target_containment(target_word: str, agent: str) -> tuple[st
             resolved_target.relative_to(peer_resolved)
         except ValueError:
             continue
-        target_agent = peer_home.name
+        target_agent = _peer_home_agent_name(peer_home)
         break
     return str(resolved_target), target_agent
 
