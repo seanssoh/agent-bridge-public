@@ -372,19 +372,32 @@ def main() -> int:
         check(len(cand_b) >= 1, "monitor STILL rotates B at the equal reset_at after a real-reading latch (codex r4)")
 
     # ---- (6b) a clean reading clears the dedupe (later window can re-signal) --
+    # NOTE: an account-quota 429 now arms a Retry-After-bounded backoff window
+    # for the active token (parity with the edge-block path), so the clean probe
+    # can only fire once that window elapses — mirroring real daemon timing
+    # (the daemon would not re-probe a limited token inside its cooldown). The
+    # CONTRACT under test is unchanged: a clean reading clears the per-window
+    # dedupe so a LATER incident re-signals. We advance `now` past the cooldown
+    # span for the clean read + the subsequent re-signal instead of stacking
+    # them at the same instant the 429 fired.
     print("[6b] a clean reading clears the per-window dedupe")
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         reg = _registry(tmp, MOCK_TOKEN_A)
         r1 = _run(tmp, http_get=_stub_http_error(429, RATE_LIMIT_BODY, 3143.0), registry=reg, now=1000.0)
         check(r1["status"] == "rate-limited-signal", "tick1 signals")
-        # A clean reading on the active token (it is no longer limited).
+        # Inside the backoff window the probe serves stale (suppressed), by design.
+        r_cool = _run(tmp, http_get=_stub_http_error(429, RATE_LIMIT_BODY, 3143.0), registry=reg, now=1100.0)
+        check(r_cool["status"] == "rate-limited-suppressed", "inside the backoff window the re-emit is suppressed (serve stale)")
+        # A clean reading on the active token (it is no longer limited), AFTER the
+        # cooldown window elapsed (tick1 armed ~3143s → until ~4143).
         ok_body = {"five_hour": {"utilization": 5.0, "resets_at": "2026-06-01T18:00:00+00:00"},
                    "seven_day": {"utilization": 2.0, "resets_at": "2026-06-07T00:00:00+00:00"}}
-        r2 = _run(tmp, http_get=_stub_ok(ok_body), registry=reg, now=1000.0)
-        check(r2["status"] == "written", "tick2 reads cleanly and writes the real cache")
-        # A subsequent 429 (new incident) re-signals because the dedupe was cleared.
-        r3 = _run(tmp, http_get=_stub_http_error(429, RATE_LIMIT_BODY, 3143.0), registry=reg, now=1000.0)
+        r2 = _run(tmp, http_get=_stub_ok(ok_body), registry=reg, now=5000.0)
+        check(r2["status"] == "written", "tick2 reads cleanly and writes the real cache (post-cooldown)")
+        # A subsequent 429 (new incident) re-signals because the dedupe + the
+        # cooldown streak were cleared by the clean reading.
+        r3 = _run(tmp, http_get=_stub_http_error(429, RATE_LIMIT_BODY, 3143.0), registry=reg, now=5100.0)
         check(r3["status"] == "rate-limited-signal", "after a clean reading a later 429 re-signals")
 
     # ---- (7) the daemon-helper classifies the outcome for the audit row ------

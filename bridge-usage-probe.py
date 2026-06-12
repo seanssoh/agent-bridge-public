@@ -1022,6 +1022,22 @@ def run_probe(
     #    stale, don't hammer (and never keep refreshing a CDN edge ban window).
     #    A freshly rotated-in token has no entry and probes immediately.
     if token and token_in_cooldown(cache_path, active_digest, now):
+        # An account-quota 429 now arms the SAME backoff window as an edge block
+        # (escalate=True, Retry-After-bounded). The very next daemon tick lands
+        # inside that window, so this gate — not the rate-limit branch below —
+        # is what suppresses the re-emit for an already-signalled token. When a
+        # still-future 429 signal window exists for THIS token, report the #1468
+        # suppression contract (status + the stable window reset_at) so the
+        # over-rotation guard is observably unchanged; otherwise this is a plain
+        # edge/failure cooldown.
+        if signal_already_emitted(cache_path, active_digest, now):
+            _log("[usage-probe] active token in cooldown with a live near-limit signal window; suppressing re-emit, serving stale")
+            return {
+                "status": "rate-limited-suppressed",
+                "cache_path": str(cache_path),
+                "reset_at": _signal_windows(cache_path).get(active_digest, ""),
+                "cooldown_until": token_cooldown_until(cache_path, active_digest),
+            }
         _log("[usage-probe] active token in cooldown after recent failure; serving stale cache")
         return {
             "status": "cooldown",
@@ -1083,12 +1099,18 @@ def run_probe(
         # rotation signal — handled below.
         if classification == CLASSIFICATION_ACCOUNT_RATE_LIMIT:
             token_digest = active_digest
-            # The account told us it is limited — pause THIS token's probing for
-            # the operator cooldown (the synthetic cache also stays fresh for
-            # max_age, so this is belt-and-suspenders pacing, not new policy).
+            # The account told us it is limited — back off THIS token on the SAME
+            # window contract as an edge block (300/900/3600 escalation + the
+            # server-stated Retry-After up to the cap). An account-quota 429 means
+            # the token is unusable for the reset window; honoring only the fixed
+            # base_seconds cooldown would let the probe re-hammer a limited token
+            # after the 5-minute cache-freshness window and leave measurement
+            # thrash, so escalate the streak and respect Retry-After here too.
             record_token_cooldown(
                 cache_path, token_digest, now,
-                outcome="rate-limited", base_seconds=cooldown_seconds,
+                outcome="rate-limited",
+                retry_after=last_http_error.retry_after,
+                escalate=True,
             )
             # Suppress if THIS token already has a still-future signal window:
             # rotate this token at most once per incident, and stop on a pool
