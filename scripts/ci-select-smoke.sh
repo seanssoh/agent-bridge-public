@@ -718,6 +718,14 @@ select_for_path() {
       # 9770-codex-teardown-reap on every bridge-run.sh move so a refactor
       # cannot drop the clean-exit subtree reap or its skip+audit fallback.
       add_required 9770-codex-teardown-reap
+      # Issue #1857: bridge-run.sh's bridge_run_sync_dev_plugin_cache now hosts
+      # the launch-path provisioning convergence — the fleet-default canonical
+      # read + class-(b) fail-closed unsafe-token gate + brownfield first-snapshot
+      # reachability (teeth T13-T15 in 1857-recreate-provisioning-preserve drive
+      # these functions directly). Pull the smoke on every bridge-run.sh move so a
+      # refactor cannot silently drop the convergence union or the fail-closed
+      # split (the gate-2 glob-bypass regression lived exactly here).
+      add_required 1857-recreate-provisioning-preserve
       ;;
   esac
 

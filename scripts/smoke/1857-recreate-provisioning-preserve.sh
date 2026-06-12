@@ -732,4 +732,369 @@ else
   smoke_log "T12 skipped: running as root, chmod 000 read-block is bypassed"
 fi
 
+# ---------------------------------------------------------------------------
+# T13 — BLOCKER 1 (gate-2): fleet-default convergence is WIRED INTO THE LAUNCH
+# PATH, not reader-only. Declare BRIDGE_FLEET_DEFAULT_PLUGINS in the CANONICAL
+# $BRIDGE_HOME/agent-env.local.sh, then drive the REAL launch convergence
+# function `bridge_run_sync_dev_plugin_cache` for an agent that did NOT have the
+# plugin (NO channels, NO BRIDGE_AGENT_PLUGINS, NO ledger snapshot — NOT
+# pre-seeded). The launcher MUST consume the canonical fleet-default declaration
+# and fold it into the channel set it hands to the Python convergence pass, as
+# an OPTIONAL (warn-only / fail-soft) entry — never channel-required.
+#
+# Verifying a live marketplace install would need a full plugin payload tree;
+# the seam gate-2 says is missing is the CONSUMPTION wiring, so we capture the
+# exact `bridge-dev-plugin-cache.py sync` argv the launcher builds (via a
+# python3 shim on PATH) and assert the fleet-default plugin lands in --channels
+# AND --optional-channels, but NOT --required-channels. bridge-run.sh is an
+# entrypoint (re-execs at source time), so we eval ONLY the self-contained
+# functions under test into a controlled shell sourcing bridge-lib.sh.
+# ---------------------------------------------------------------------------
+T13_HOME="$SMOKE_TMP_ROOT/t13-home"
+mkdir -p "$T13_HOME"
+# Canonical declaration: a fleet-default plugin the agent does NOT already have.
+printf 'export BRIDGE_FLEET_DEFAULT_PLUGINS="fleet-widget@agent-bridge"\n' \
+  >"$T13_HOME/agent-env.local.sh"
+T13_CLAUDE_ROOT="$SMOKE_TMP_ROOT/t13-claude"
+mkdir -p "$T13_CLAUDE_ROOT/plugins/cache"
+printf '{\n  "version": 2,\n  "plugins": {}\n}\n' \
+  >"$T13_CLAUDE_ROOT/plugins/installed_plugins.json"
+T13_LEDGER_DIR="$SMOKE_TMP_ROOT/t13-ledger"
+mkdir -p "$T13_LEDGER_DIR"
+# python3 shim: records the sync argv to $T13_ARGV, then no-ops the sync (exit
+# 0) so the launcher's success path is exercised. The shim still defers any
+# OTHER python3 call (e.g. bridge-lib.sh's reader) to the real interpreter.
+T13_SHIM_DIR="$SMOKE_TMP_ROOT/t13-shimbin"
+T13_ARGV="$SMOKE_TMP_ROOT/t13-sync-argv.txt"
+mkdir -p "$T13_SHIM_DIR"
+REAL_PY3="$(command -v python3)"
+cat >"$T13_SHIM_DIR/python3" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *bridge-dev-plugin-cache.py)
+      # Record argv ONE TOKEN PER LINE so empty positional args (e.g. an empty
+      # --required-channels value) are preserved exactly — a flattened "\$*"
+      # would collapse an empty arg and let the next flag masquerade as the
+      # value, weakening the required/optional assertion.
+      : >"$T13_ARGV"
+      for t in "\$@"; do printf '%s\n' "\$t" >>"$T13_ARGV"; done
+      exit 0 ;;
+  esac
+done
+exec "$REAL_PY3" "\$@"
+SHIM
+chmod +x "$T13_SHIM_DIR/python3"
+
+T13_OUT="$(
+  BRIDGE_HOME="$T13_HOME" \
+  T13_CLAUDE_ROOT="$T13_CLAUDE_ROOT" \
+  T13_LEDGER_DIR="$T13_LEDGER_DIR" \
+  T13_ARGV="$T13_ARGV" \
+  REPO_ROOT="$REPO_ROOT" \
+  PATH="$T13_SHIM_DIR:$PATH" \
+  "${BASH:-bash}" <<'OUTER' 2>&1 || true
+set -uo pipefail
+source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1
+AGENT="t13-agent"; ENGINE="claude"; SAFE_MODE=0
+SCRIPT_DIR="$REPO_ROOT"
+log_line() { :; }
+bridge_run_agent_claude_root() { printf '%s' "$T13_CLAUDE_ROOT"; }
+bridge_isolated_plugin_grants_state_file() { printf '%s/%s.json' "$T13_LEDGER_DIR" "$1"; }
+bridge_agent_effective_dev_channels_csv() { printf ''; }
+bridge_agent_plugins_csv() { printf ''; }
+for fn in bridge_run_manifest_has_plugins bridge_run_ledger_has_snapshot \
+          bridge_run_fleet_default_unsafe_reason bridge_run_sync_dev_plugin_cache; do
+  body="$(sed -n "/^${fn}()/,/^}/p" "$REPO_ROOT/bridge-run.sh")"
+  [[ -n "$body" ]] || { echo "EVAL-FAIL: $fn body empty"; exit 3; }
+  eval "$body"
+done
+bridge_run_sync_dev_plugin_cache; echo "RC=$?"
+if [[ -f "$T13_ARGV" ]]; then echo "ARGV-CAPTURED=yes"; else echo "ARGV-CAPTURED=no"; fi
+OUTER
+)"
+
+# The token-per-line argv file (written by the shim) is the source of truth;
+# parse the value that immediately FOLLOWS each flag token so an empty
+# --required-channels value is read as "" (not the next flag). Assert the
+# fleet-default plugin is in --channels AND --optional-channels (warn-only) but
+# NOT in --required-channels (never a launch blocker).
+T13_VERDICT="$(
+  T13_ARGV="$T13_ARGV" "$REAL_PY3" - <<'PY'
+import os, sys
+argv_path = os.environ["T13_ARGV"]
+try:
+    with open(argv_path, encoding="utf-8") as fh:
+        toks = [ln.rstrip("\n") for ln in fh]
+except OSError:
+    print("BAD: launcher never invoked the sync (no argv captured)"); sys.exit(0)
+def flag(name):
+    f = "--" + name
+    for i, t in enumerate(toks):
+        if t == f:
+            return toks[i + 1] if i + 1 < len(toks) else ""
+    return ""
+ch = flag("channels"); opt = flag("optional-channels"); req = flag("required-channels")
+target = "plugin:fleet-widget@agent-bridge"
+ok = (target in ch.split(",")) and (target in opt.split(",")) and (target not in req.split(","))
+print("GOOD" if ok else "BAD: channels=%r optional=%r required=%r" % (ch, opt, req))
+PY
+)"
+case "$T13_VERDICT" in
+  GOOD)
+    smoke_log "T13 ok: launch path consumed the canonical fleet-default declaration and routed it as an OPTIONAL channel (installed/enabled/manifested by the convergence pass), NOT pre-seeded" ;;
+  *)
+    smoke_fail "T13 BLOCKER1: fleet-default NOT wired into bridge_run_sync_dev_plugin_cache convergence ($T13_VERDICT)" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# T14 — BLOCKER 2 (gate-2): brownfield first-snapshot reachability. A dynamic
+# agent with a NON-EMPTY installed_plugins.json (only operator-installed/ad-hoc
+# plugins), EMPTY channels, NO fleet-default declaration, and NO pre-existing
+# ledger MUST reach the Python seed path on its FIRST launch and create the
+# ledger snapshot BEFORE the first wipe. The old launcher early-returned on
+# empty-channels+absent-ledger, so the first #1854 `--replace` restart wiped
+# the manifest with NO snapshot to restore. Drive the REAL launch function:
+# first launch seeds the snapshot, then a wipe + restart restores from it.
+# The ledger is NOT pre-seeded.
+# ---------------------------------------------------------------------------
+T14_HOME="$SMOKE_TMP_ROOT/t14-home"
+mkdir -p "$T14_HOME"   # NO agent-env.local.sh → no fleet-default declaration.
+T14_CLAUDE_ROOT="$SMOKE_TMP_ROOT/t14-claude"
+T14_PLUGINS_ROOT="$T14_CLAUDE_ROOT/plugins"
+mkdir -p "$T14_PLUGINS_ROOT/cache"
+# Brownfield manifest: only an operator-installed plugin, no channels.
+cat >"$T14_PLUGINS_ROOT/installed_plugins.json" <<'JSON'
+{
+  "version": 2,
+  "plugins": {
+    "claude-hud@jarrodwatts": [
+      {"scope": "user", "installPath": "/operator/installed/claude-hud",
+       "version": "9.9.9", "installedAt": "2026-01-01T00:00:00Z",
+       "lastUpdated": "2026-01-01T00:00:00Z"}
+    ]
+  }
+}
+JSON
+T14_LEDGER_DIR="$SMOKE_TMP_ROOT/t14-ledger"
+mkdir -p "$T14_LEDGER_DIR"
+# Assert precondition: NO ledger exists yet.
+[[ ! -e "$T14_LEDGER_DIR/t14-agent.json" ]] \
+  || smoke_fail "T14 precondition: ledger pre-seeded (test would be meaningless)"
+
+T14_OUT="$(
+  BRIDGE_HOME="$T14_HOME" \
+  T14_CLAUDE_ROOT="$T14_CLAUDE_ROOT" \
+  T14_LEDGER_DIR="$T14_LEDGER_DIR" \
+  REPO_ROOT="$REPO_ROOT" \
+  "${BASH:-bash}" <<'OUTER' 2>&1 || true
+set -uo pipefail
+source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1
+AGENT="t14-agent"; ENGINE="claude"; SAFE_MODE=0
+SCRIPT_DIR="$REPO_ROOT"
+log_line() { :; }
+bridge_run_agent_claude_root() { printf '%s' "$T14_CLAUDE_ROOT"; }
+bridge_isolated_plugin_grants_state_file() { printf '%s/%s.json' "$T14_LEDGER_DIR" "$1"; }
+bridge_agent_effective_dev_channels_csv() { printf ''; }
+bridge_agent_plugins_csv() { printf ''; }
+for fn in bridge_run_manifest_has_plugins bridge_run_ledger_has_snapshot \
+          bridge_run_fleet_default_unsafe_reason bridge_run_sync_dev_plugin_cache; do
+  body="$(sed -n "/^${fn}()/,/^}/p" "$REPO_ROOT/bridge-run.sh")"
+  [[ -n "$body" ]] || { echo "EVAL-FAIL: $fn body empty"; exit 3; }
+  eval "$body"
+done
+ledger="$T14_LEDGER_DIR/t14-agent.json"
+manifest="$T14_CLAUDE_ROOT/plugins/installed_plugins.json"
+
+# First launch: empty channels, absent ledger, NON-EMPTY manifest → must NOT
+# early-return; must reach the Python seed path and create the snapshot.
+bridge_run_sync_dev_plugin_cache; rc1=$?
+echo "RC1=$rc1"
+if [[ -f "$ledger" ]]; then echo "SEEDED=yes"; else echo "SEEDED=no"; fi
+python3 - "$ledger" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("SNAP="); sys.exit(0)
+snap = ((d.get("installed_snapshot") or {}).get("plugins") or {})
+print("SNAP=%s" % ",".join(sorted(snap.keys())))
+PY
+
+# Now simulate the #1854 --replace restart wipe: live manifest comes back EMPTY.
+printf '{\n  "version": 2,\n  "plugins": {}\n}\n' >"$manifest"
+# Restart launch: empty channels again, but the ledger NOW has a snapshot →
+# recovery must restore the operator plugin into the wiped manifest.
+bridge_run_sync_dev_plugin_cache; rc2=$?
+echo "RC2=$rc2"
+python3 - "$manifest" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print("RESTORED=%s" % ",".join(sorted((d.get("plugins") or {}).keys())))
+PY
+OUTER
+)"
+
+case "$T14_OUT" in
+  *"SEEDED=yes"*"SNAP="*"claude-hud@jarrodwatts"*"RESTORED="*"claude-hud@jarrodwatts"*)
+    smoke_log "T14 ok: brownfield first launch seeded the ledger snapshot BEFORE the wipe; #1854 restart restored it" ;;
+  *)
+    smoke_fail "T14 BLOCKER2: brownfield first-snapshot path not reachable / restore failed (out: $T14_OUT)" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# T15 — gate-2 r1 codex finding: the fleet-default CSV split must NOT
+# pathname-expand its tokens, and must NOT drop a trailing empty field. A prior
+# unquoted `$_fleet_default_csv` word-split ran Bash globbing on each field
+# FIRST, so a `*`/`?`/`[` glob in a declaration would expand to real cwd
+# filenames BEFORE the validator saw it — silently rewriting one declaration
+# token into many launch channels. The same split also ate a TRAILING empty
+# token (`foo,`), so the class-(a) empty-token skip+warn never fired.
+#
+# This tooth proves the two properties INDEPENDENTLY (a single combined
+# declaration can't, because an unsafe leading token aborts before a trailing
+# empty is reached). Three self-contained sub-cases, each driving the REAL
+# launch convergence:
+#   T15a — SAFE glob-shaped token `*@agent-bridge` from a cwd full of decoy
+#          files. `*` is a safe identity (not class-(b) traversal), so launch
+#          MUST converge it as exactly ONE optional channel `plugin:*@agent-
+#          bridge`. We inspect the captured sync argv: the literal token is
+#          present and NO decoy filename leaked in — direct proof the split
+#          stayed literal (a glob bug would replace `*` with the decoy names).
+#   T15b — SAFE declaration with a TRAILING empty `valid-plugin,`. The valid
+#          token converges; the trailing empty must trigger the class-(a)
+#          empty-token skip+warn log (proof the trailing field survived the
+#          split). Asserted via the launcher's own log line.
+#   T15c — UNSAFE traversal glob `../*@agent-bridge`. Class-(b) fail-closed:
+#          rc!=0, unsafe warning, and NO convergence write (argv never written).
+# ---------------------------------------------------------------------------
+# Shared decoy cwd: real files a stray glob would expand to in every sub-case.
+T15_CWD="$SMOKE_TMP_ROOT/t15-cwd"
+mkdir -p "$T15_CWD"
+: >"$T15_CWD/decoy-a"; : >"$T15_CWD/decoy-b"; : >"$T15_CWD/decoy-c"
+REAL_PY3="$(command -v python3)"
+
+# Per-case captured-argv path. Deterministic from the case tag so the PARENT
+# shell can read it after the command-substitution subshell that runs _t15_run
+# returns (a var assigned inside the function would not survive the `$( )`
+# subshell under `set -u`). `_t15_argv <tag>` resolves it on both sides.
+_t15_argv() { printf '%s/t15-%s-argv.txt' "$SMOKE_TMP_ROOT" "$1"; }
+
+# Reusable driver: $1=case-tag $2=declaration value. Emits the launcher's
+# stdout (RC=.. + WARN/log lines) and records the captured sync argv (one token
+# per line) to `$(_t15_argv <tag>)`. An argv-recording python3 shim no-ops sync.
+_t15_run() {
+  local tag="$1" decl="$2"
+  local home="$SMOKE_TMP_ROOT/t15-$tag-home"
+  local claude_root="$SMOKE_TMP_ROOT/t15-$tag-claude"
+  local ledger_dir="$SMOKE_TMP_ROOT/t15-$tag-ledger"
+  local shim_dir="$SMOKE_TMP_ROOT/t15-$tag-shimbin"
+  local argv_file; argv_file="$(_t15_argv "$tag")"
+  mkdir -p "$home" "$claude_root/plugins/cache" "$ledger_dir" "$shim_dir"
+  printf 'export BRIDGE_FLEET_DEFAULT_PLUGINS="%s"\n' "$decl" >"$home/agent-env.local.sh"
+  printf '{\n  "version": 2,\n  "plugins": {}\n}\n' \
+    >"$claude_root/plugins/installed_plugins.json"
+  rm -f "$argv_file"
+  cat >"$shim_dir/python3" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *bridge-dev-plugin-cache.py)
+      : >"$argv_file"
+      for t in "\$@"; do printf '%s\n' "\$t" >>"$argv_file"; done
+      exit 0 ;;
+  esac
+done
+exec "$REAL_PY3" "\$@"
+SHIM
+  chmod +x "$shim_dir/python3"
+  (
+    cd "$T15_CWD" && \
+    BRIDGE_HOME="$home" \
+    T15_CLAUDE_ROOT="$claude_root" \
+    T15_LEDGER_DIR="$ledger_dir" \
+    REPO_ROOT="$REPO_ROOT" \
+    PATH="$shim_dir:$PATH" \
+    "${BASH:-bash}" <<'OUTER' 2>&1 || true
+set -uo pipefail
+source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1
+AGENT="t15-agent"; ENGINE="claude"; SAFE_MODE=0
+SCRIPT_DIR="$REPO_ROOT"
+log_line() { printf 'LOG:%s\n' "$*"; }
+bridge_warn() { printf 'WARN:%s\n' "$*"; }
+bridge_run_agent_claude_root() { printf '%s' "$T15_CLAUDE_ROOT"; }
+bridge_isolated_plugin_grants_state_file() { printf '%s/%s.json' "$T15_LEDGER_DIR" "$1"; }
+bridge_agent_effective_dev_channels_csv() { printf ''; }
+bridge_agent_plugins_csv() { printf ''; }
+for fn in bridge_run_manifest_has_plugins bridge_run_ledger_has_snapshot \
+          bridge_run_fleet_default_unsafe_reason bridge_run_sync_dev_plugin_cache; do
+  body="$(sed -n "/^${fn}()/,/^}/p" "$REPO_ROOT/bridge-run.sh")"
+  [[ -n "$body" ]] || { echo "EVAL-FAIL: $fn body empty"; exit 3; }
+  eval "$body"
+done
+bridge_run_sync_dev_plugin_cache; echo "RC=$?"
+OUTER
+  )
+}
+
+# --- T15a: SAFE glob token must converge LITERALLY (no cwd-filename leak) -----
+T15A_OUT="$(_t15_run a '*@agent-bridge')"
+T15A_ARGV="$(_t15_argv a)"
+T15A_VERDICT="$(
+  T15A_ARGV="$T15A_ARGV" "$REAL_PY3" - <<'PY'
+import os, sys
+p = os.environ["T15A_ARGV"]
+try:
+    toks = [l.rstrip("\n") for l in open(p, encoding="utf-8")]
+except OSError:
+    print("BAD: no argv captured (launcher never reached sync)"); sys.exit(0)
+def flag(name):
+    f = "--" + name
+    for i, t in enumerate(toks):
+        if t == f:
+            return toks[i + 1] if i + 1 < len(toks) else ""
+    return ""
+ch = flag("channels").split(",") if flag("channels") else []
+opt = flag("optional-channels").split(",") if flag("optional-channels") else []
+literal = "plugin:*@agent-bridge"
+# Literal token must be present in channels AND optional; and NO decoy filename
+# may have leaked in (a glob bug would have replaced `*` with decoy-a/b/c).
+leaked = any("decoy-" in t for t in ch + opt)
+ok = (literal in ch) and (literal in opt) and not leaked
+print("GOOD" if ok else "BAD: channels=%r optional=%r leaked=%s" % (ch, opt, leaked))
+PY
+)"
+case "$T15A_OUT$T15A_VERDICT" in
+  *"RC=0"*GOOD)
+    smoke_log "T15a ok: safe glob-shaped token converged LITERALLY as one optional channel; no cwd filename leaked (split stayed literal, no glob expansion)" ;;
+  *)
+    smoke_fail "T15a gate2r1: glob token not literal / leaked or did not converge (out: $T15A_OUT verdict: $T15A_VERDICT)" ;;
+esac
+
+# --- T15b: SAFE token + TRAILING empty must hit class-(a) skip+warn -----------
+# Order-independent: the class-(a) warn log is emitted DURING the loop (before
+# the final `RC=$?` echo), so assert both substrings are present rather than a
+# positional `RC=0`-then-warn pattern. Both must hold: launch succeeded (RC=0)
+# AND the trailing empty produced the class-(a) skip+warn.
+T15B_OUT="$(_t15_run b 'valid-plugin,')"
+if [[ "$T15B_OUT" == *"RC=0"* \
+      && "$T15B_OUT" == *"#1857 fleet-default class-a skip: empty declaration token"* ]]; then
+  smoke_log "T15b ok: trailing empty field survived the split and triggered the class-(a) empty-token skip+warn; the valid token still converged"
+else
+  smoke_fail "T15b gate2r1: trailing empty token did NOT reach the class-(a) skip+warn (split dropped it?) (out: $T15B_OUT)"
+fi
+
+# --- T15c: UNSAFE traversal glob must fail closed BEFORE any write ------------
+T15C_OUT="$(_t15_run c '../*@agent-bridge')"
+T15C_ARGV="$(_t15_argv c)"
+if [[ "$T15C_OUT" == *"RC=0"* ]]; then
+  smoke_fail "T15c gate2r1: unsafe traversal-glob token did NOT fail closed (out: $T15C_OUT)"
+elif [[ -f "$T15C_ARGV" ]]; then
+  smoke_fail "T15c gate2r1: convergence write attempted before class-(b) abort (argv written)"
+elif [[ "$T15C_OUT" != *"WARN:"*"unsafe"* ]]; then
+  smoke_fail "T15c gate2r1: no class-(b) unsafe warning emitted (out: $T15C_OUT)"
+else
+  smoke_log "T15c ok: unsafe traversal-glob fleet-default token failed closed BEFORE any convergence write (no glob expansion, no leak)"
+fi
+
 smoke_log "all checks passed"
