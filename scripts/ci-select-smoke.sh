@@ -373,6 +373,11 @@ add_required rooms-p4-5-polish
 # origin-recorded + legacy-shape teeth via the catch-all; the bridge-cron-runner.py
 # and bridge-queue.py/bridge-task.sh per-file arms below also pull it directly.
 add_required 1792-cron-scope-fence
+# rc3 BLOCKER 2: the scope fence also REFUSES cron-worker auto-exec of
+# irreversible/prod-mutation operations and interactive-gated (`blocked`) tasks
+# (cm-prod cron-worker-ran-a-held-`agb upgrade` incident). In the static suite
+# so any scripts/smoke/* change re-runs the guard-presence + no-over-block teeth.
+add_required 1875-cron-prod-mutation-guard
 
 
 }
@@ -2369,7 +2374,14 @@ select_for_path() {
       # 1843-cron-consecutive-failure-escalation on every bridge-cron.py move
       # so a future PR cannot drop the escalation, regress the threshold/
       # cadence boundary, or stop clearing the provenance marker on success.
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1843-cron-consecutive-failure-escalation 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite
+      # rc3 BLOCKER 2: build_prompt's scope fence now also REFUSES auto-exec of
+      # irreversible/prod-mutation operations (`agb upgrade`, release/tag,
+      # fleet/roster mutation) and any interactive-gated (`blocked`) task — the
+      # cm-prod cron-worker-auto-ran-a-held-`agb upgrade` incident. Pull
+      # 1875-cron-prod-mutation-guard on every runner move so a future PR cannot
+      # drop the prod-mutation/interactive-gated refusal or over-block routine
+      # cron jobs.
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1875-cron-prod-mutation-guard 1843-cron-consecutive-failure-escalation 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite
       add_integration integration-minimal
       ;;
 
