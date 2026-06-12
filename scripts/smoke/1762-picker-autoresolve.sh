@@ -29,6 +29,14 @@
 #   T8  — destructive-guard: destructive option selected → escalate, no keys
 #   T8b — destructive-guard recognizes a line-leading ASCII '>' selection glyph
 #         (not only the unicode ❯/› glyphs) → refuse + escalate, zero keys
+#   T8c — #1819 Claude usage-limit dialog with the WAIT option selected →
+#         auto_resolve sends select_first + confirm (selects wait), clean
+#         post-resolve verify, NO escalation
+#   T8d — #1819 usage-limit dialog with the UPGRADE (billing) option selected →
+#         rail-(c) destructive-guard refuses to advance and escalates, zero keys
+#   T8e — #1819 the SHIPPED catalog carries an enabled claude-usage-limit-wait
+#         entry: py-classify returns auto_resolve selecting wait with the upgrade
+#         option destructive-guarded; codex engine does not match it
 #   T9  — policy=escalate catalog picker (auth surface) files the admin task,
 #         zero keys
 #   T9b — TRUE novel-pane path: a prompt-like pane that matches NO catalog entry
@@ -110,6 +118,7 @@ printf '%s' '{
   "entries": [
     {"picker_id":"t-update","engine":"codex","enabled":true,"match":["Update now"],"policy":"auto_resolve","keys":["confirm"],"post_resolve_verify":true},
     {"picker_id":"t-list","engine":"claude","enabled":true,"match":["Continue where you left off","Start a new conversation"],"destructive_match":["Start a new conversation"],"policy":"auto_resolve","keys":["select_first","confirm"],"post_resolve_verify":true},
+    {"picker_id":"t-usagelimit","engine":"claude","enabled":true,"match":["Stop and wait for limit to reset","Upgrade your plan"],"destructive_match":["Upgrade your plan"],"policy":"auto_resolve","keys":["select_first","confirm"],"post_resolve_verify":true},
     {"picker_id":"t-disabled","engine":"codex","enabled":false,"match":["Disabled prompt"],"policy":"auto_resolve","keys":["confirm"]},
     {"picker_id":"t-banner","engine":"claude","enabled":true,"match":["Auto-update failed"],"policy":"non_picker"},
     {"picker_id":"t-auth","engine":"codex","enabled":true,"match":["session has expired"],"policy":"escalate"},
@@ -434,6 +443,75 @@ test_t8b_destructive_ascii_gt() {
 }
 
 # ---------------------------------------------------------------------
+# T8c — #1819 usage-limit dialog (claude-usage-limit-wait): the wait option is
+# the selected line → auto_resolve sends select_first + confirm (select wait),
+# clean post-resolve verify → NO escalation. The upgrade option (destructive)
+# is NOT the selected line here, so the guard does not (and must not) trip.
+# ---------------------------------------------------------------------
+# shellcheck disable=SC2329
+test_t8c_usagelimit_wait_autoresolve() {
+  smoke_log "T8c: #1819 usage-limit dialog (wait selected) → auto_resolve select_first+confirm, no escalation"
+  python3 "$PICKER_PY" clear-state --session sT8c --state-dir "$BRIDGE_PICKER_STATE_DIR" >/dev/null 2>&1 || true
+  SMOKE_KEYS=""
+  printf '0' >"$SMOKE_CAPTURE_COUNTER"
+  # Verbatim dialog from issue #1819: option 1 (wait) is the selected (❯) line.
+  SMOKE_PANE=$'What do you want to do?\n❯ 1. Stop and wait for limit to reset\n  2. Upgrade your plan\nEnter to confirm \xc2\xb7 Esc to cancel\n'
+  # After keying, the session returns to an idle composer → post-resolve verify clean.
+  SMOKE_PANE_AFTER=$'╭───╮\n│ > │\n╰───╯\n'
+  local before_esc; before_esc="$(count_escalations)"
+  bridge_picker_resolve_session "agentT8c" "sT8c" "claude" || true
+  smoke_assert_contains "$SMOKE_KEYS" "select_first" "T8c: sent select_first (lands on wait option 1)"
+  smoke_assert_contains "$SMOKE_KEYS" "confirm" "T8c: sent confirm"
+  smoke_assert_eq "$before_esc" "$(count_escalations)" "T8c: wait selected → clean resolve, NO escalation"
+}
+
+# ---------------------------------------------------------------------
+# T8d — #1819 destructive-guard: if the UPGRADE (billing) option is the selected
+# line, the rail-(c) destructive-guard must REFUSE to advance and escalate with
+# ZERO keys — the billing action can never be auto-chosen even if the cursor
+# lands on it.
+# ---------------------------------------------------------------------
+# shellcheck disable=SC2329
+test_t8d_usagelimit_upgrade_guarded() {
+  smoke_log "T8d: #1819 upgrade option selected → destructive-guard escalates, no keys"
+  python3 "$PICKER_PY" clear-state --session sT8d --state-dir "$BRIDGE_PICKER_STATE_DIR" >/dev/null 2>&1 || true
+  SMOKE_KEYS=""
+  printf '0' >"$SMOKE_CAPTURE_COUNTER"
+  # Cursor parked on the UPGRADE option (the destructive/billing line).
+  SMOKE_PANE=$'What do you want to do?\n  1. Stop and wait for limit to reset\n❯ 2. Upgrade your plan\nEnter to confirm \xc2\xb7 Esc to cancel\n'
+  SMOKE_PANE_AFTER=$'╭───╮\n│ > │\n╰───╯\n'
+  local before_esc; before_esc="$(count_escalations)"
+  bridge_picker_resolve_session "agentT8d" "sT8d" "claude" || true
+  (( $(count_escalations) > before_esc )) || smoke_fail "T8d: upgrade-option selection must escalate (destructive-guard)"
+  smoke_assert_not_contains "$SMOKE_KEYS" "confirm" "T8d: upgrade (billing) option is NEVER auto-selected — zero keys"
+  smoke_assert_not_contains "$SMOKE_KEYS" "select_first" "T8d: destructive-guard sends no keys at all"
+}
+
+# ---------------------------------------------------------------------
+# T8e — #1819 the SHIPPED catalog (not the test catalog) carries an ENABLED
+# claude-usage-limit-wait entry: a py-classify against the real shipped catalog
+# returns auto_resolve selecting wait with the upgrade option marked destructive.
+# This pins the actual ship surface (the other tests use $TESTCAT).
+# ---------------------------------------------------------------------
+# shellcheck disable=SC2329
+test_t8e_usagelimit_shipped_catalog() {
+  smoke_log "T8e: #1819 shipped catalog has enabled claude-usage-limit-wait → auto_resolve wait, upgrade guarded"
+  local pf
+  pf="$(mktemp "$SMOKE_TMP_ROOT/pane.XXXXXX")"
+  printf '%s' $'What do you want to do?\n❯ 1. Stop and wait for limit to reset\n  2. Upgrade your plan\nEnter to confirm \xc2\xb7 Esc to cancel\n' >"$pf"
+  local d
+  d="$(python3 "$PICKER_PY" classify --engine claude --pane-file "$pf" --catalog "$CATALOG")"
+  smoke_assert_eq "true" "$(json_field "$d" matched)" "T8e: shipped catalog matches the usage-limit dialog"
+  smoke_assert_eq "claude-usage-limit-wait" "$(json_field "$d" picker_id)" "T8e: picker_id is claude-usage-limit-wait"
+  smoke_assert_eq "auto_resolve" "$(json_field "$d" policy)" "T8e: policy is auto_resolve"
+  smoke_assert_eq "select_first confirm" "$(json_field "$d" keys)" "T8e: keys select wait (select_first + confirm)"
+  smoke_assert_contains "$(json_field "$d" destructive_match)" "Upgrade your plan" "T8e: upgrade option is destructive-guarded"
+  # Engine gate: a codex session must NOT match this claude entry.
+  d="$(python3 "$PICKER_PY" classify --engine codex --pane-file "$pf" --catalog "$CATALOG")"
+  smoke_assert_eq "false" "$(json_field "$d" matched)" "T8e: codex engine does not match the claude usage-limit entry"
+}
+
+# ---------------------------------------------------------------------
 # T9 — policy=escalate catalog picker (auth surface) files the admin task.
 # ---------------------------------------------------------------------
 # shellcheck disable=SC2329
@@ -575,6 +653,9 @@ smoke_run "T6b: recapture-failure → indeterminate verify" test_t6b_recapture_f
 smoke_run "T7: anti-loop escalation" test_t7_antiloop_escalates
 smoke_run "T8: destructive-guard" test_t8_destructive_guard
 smoke_run "T8b: destructive-guard ASCII '>'" test_t8b_destructive_ascii_gt
+smoke_run "T8c: #1819 usage-limit wait auto_resolve" test_t8c_usagelimit_wait_autoresolve
+smoke_run "T8d: #1819 upgrade option destructive-guarded" test_t8d_usagelimit_upgrade_guarded
+smoke_run "T8e: #1819 shipped catalog usage-limit entry" test_t8e_usagelimit_shipped_catalog
 smoke_run "T9: escalate policy files admin task" test_t9_escalate_policy
 smoke_run "T9b: novel unknown-pane escalation" test_t9b_unknown_pane_escalates
 smoke_run "T10: defer policy → existing machinery" test_t10_defer_policy
