@@ -253,13 +253,28 @@ explicit_model_on_child_argv() {
 }
 
 # ---------------------------------------------------------------------------
-# Tooth (c): FAIL CLOSED when no stable model source resolves (#1880 r2).
-# With per-job + cronDefaults + roster + BRIDGE_CRON_DEFAULT_MODEL ALL empty and
-# the interactive settings.json POISONED, run_claude must NOT spawn an unmodeled
-# child (which would inherit the poisoned settings.json model). It must raise an
-# actionable error naming the fix, and subprocess.run must NEVER be called.
+# Tooth (c): CONDITIONAL fail-closed when no stable model source resolves
+# (#1880 r3 — narrowed from the r2 blanket fail-closed that regressed the 1789
+# rotation cron-config-injection smoke).
+#
+# The coupling #1880 removes only exists when the interactive settings.json
+# actually carries a model — that is the value an unmodeled `claude -p` would
+# silently inherit. So with per-job + cronDefaults + roster + env fallback ALL
+# empty, run_claude must behave conditionally on the interactive settings.json:
+#
+#   (c1) settings.json HAS a model  -> FAIL CLOSED: raise the actionable
+#        CronChildModelUnresolvedError, build no unmodeled argv, NEVER spawn.
+#   (c2) settings.json has NO model -> PROCEED: no raise, config injection
+#        (apply_claude_agent_env) STILL runs, argv carries no --model (account
+#        default), and the child is spawned. This is the 1789 case + the common
+#        no-model cron flow; a blanket fail-closed here was the regression.
+#
+# The settings.json model is read ONLY to DECIDE (via
+# interactive_settings_model_for_request); it is deliberately never passed to
+# the child argv. Codex children never fail closed (no settings.json model
+# coupling) and simply omit --model in both directions.
 # ---------------------------------------------------------------------------
-fail_closed_no_stable_model_source() {
+conditional_fail_closed_no_stable_model_source() {
   local helper="$SMOKE_TMP_ROOT/fail_closed_check.py"
   {
     printf '%s\n' 'import importlib.util, json, os, subprocess, sys'
@@ -275,62 +290,79 @@ fail_closed_no_stable_model_source() {
     printf '%s\n' 'errors = []'
     printf '%s\n' 'POISON = "claude-poisoned-unavailable-9"'
     printf '%s\n' ''
-    printf '%s\n' '# POISON the interactive settings.json — the ONLY model source present.'
-    printf '%s\n' 'config_dir = tmp / "agent-home3" / ".claude"'
-    printf '%s\n' 'config_dir.mkdir(parents=True, exist_ok=True)'
-    printf '%s\n' '(config_dir / "settings.json").write_text(json.dumps({"model": POISON}), encoding="utf-8")'
-    printf '%s\n' ''
-    printf '%s\n' '# jobs.json with NO per-job model and NO cronDefaults.'
+    printf '%s\n' '# jobs.json with NO per-job model and NO cronDefaults; empty roster +'
+    printf '%s\n' '# empty env fallback => NO stable source at all (both directions).'
     printf '%s\n' 'jobs = {"format": "agent-bridge-cron-v1",'
     printf '%s\n' '        "jobs": [{"id": "job-1", "name": "digest", "agentId": "mon"}]}'
     printf '%s\n' 'jf = tmp / "jobs3.json"'
     printf '%s\n' 'jf.write_text(json.dumps(jobs), encoding="utf-8")'
-    printf '%s\n' ''
     printf '%s\n' 'workdir = tmp / "wd3"'
     printf '%s\n' 'workdir.mkdir(exist_ok=True)'
     printf '%s\n' 'request = {"target_agent": "mon", "job_id": "job-1", "source_file": str(jf),'
     printf '%s\n' '           "target_workdir": str(workdir)}'
-    printf '%s\n' ''
-    printf '%s\n' '# Empty roster + empty env fallback => NO stable source at all.'
     printf '%s\n' 'module._roster_model_effort = lambda agent: ("", "")'
     printf '%s\n' 'os.environ.pop("BRIDGE_CRON_DEFAULT_MODEL", None)'
     printf '%s\n' 'os.environ.pop("BRIDGE_CRON_DEFAULT_EFFORT", None)'
     printf '%s\n' ''
-    printf '%s\n' '# subprocess.run must NEVER fire — assert it stays uncalled. Stub it to'
-    printf '%s\n' '# record any (forbidden) call and to fail loudly if one happens.'
+    printf '%s\n' '# Shared seam stubs: no real binary, no run-as-user wrap. We do NOT stub'
+    printf '%s\n' '# apply_claude_agent_env to a no-op here — instead a SPY records whether'
+    printf '%s\n' '# the config injection actually ran (direction c2 asserts it must).'
     printf '%s\n' 'module.resolve_binary = lambda name, env: "/usr/bin/true"'
-    printf '%s\n' 'module.apply_claude_agent_env = lambda env, req, rf: None'
     printf '%s\n' 'module.command_for_run_as_user = lambda cmd, su, env: cmd'
+    printf '%s\n' 'inject_calls = []'
+    printf '%s\n' 'def spy_apply_claude_agent_env(env, req, rf):'
+    printf '%s\n' '    inject_calls.append(req.get("target_agent"))'
+    printf '%s\n' '    env["CLAUDE_CONFIG_DIR"] = str(tmp / "agent-home3" / ".claude")'
+    printf '%s\n' '    return None'
+    printf '%s\n' 'module.apply_claude_agent_env = spy_apply_claude_agent_env'
     printf '%s\n' 'spawn_calls = []'
-    printf '%s\n' 'def forbidden_run(cmd, **kw):'
+    printf '%s\n' 'def recording_run(cmd, **kw):'
     printf '%s\n' '    spawn_calls.append(cmd)'
     printf '%s\n' '    return subprocess.CompletedProcess(cmd, 0, "{}", "")'
-    printf '%s\n' 'module.subprocess.run = forbidden_run'
+    printf '%s\n' 'module.subprocess.run = recording_run'
     printf '%s\n' ''
-    printf '%s\n' '# run_claude must FAIL CLOSED: raise, do NOT build an unmodeled argv,'
-    printf '%s\n' '# do NOT spawn.'
+    printf '%s\n' '# ---- Direction (c1): interactive settings.json HAS a model -> FAIL CLOSED.'
+    printf '%s\n' '# The settings.json model is the only thing an unmodeled claude -p would'
+    printf '%s\n' '# inherit, so run_claude must raise before building an argv or spawning.'
+    printf '%s\n' 'module.interactive_settings_model_for_request = lambda req: POISON'
+    printf '%s\n' 'inject_calls.clear(); spawn_calls.clear()'
     printf '%s\n' 'raised = None'
     printf '%s\n' 'try:'
     printf '%s\n' '    module.run_claude(request, "do the job", 10)'
     printf '%s\n' 'except module.CronChildModelUnresolvedError as exc:'
     printf '%s\n' '    raised = exc'
     printf '%s\n' 'except Exception as exc:'
-    printf '%s\n' '    errors.append("run_claude raised wrong type: {0!r}".format(exc))'
-    printf '%s\n' ''
+    printf '%s\n' '    errors.append("c1: run_claude raised wrong type: {0!r}".format(exc))'
     printf '%s\n' 'if raised is None:'
-    printf '%s\n' '    errors.append("run_claude did NOT fail closed on zero stable model source")'
+    printf '%s\n' '    errors.append("c1: run_claude did NOT fail closed with a model-pinned settings.json")'
     printf '%s\n' 'else:'
     printf '%s\n' '    msg = str(raised)'
     printf '%s\n' '    if "--cron-default-model" not in msg or "BRIDGE_AGENT_MODEL" not in msg:'
-    printf '%s\n' '        errors.append("fail-closed error not actionable (missing fix hint): {0!r}".format(msg))'
-    printf '%s\n' '    if POISON in msg:'
-    printf '%s\n' '        errors.append("fail-closed error leaked the poisoned model: {0!r}".format(msg))'
-    printf '%s\n' ''
+    printf '%s\n' '        errors.append("c1: fail-closed error not actionable (missing fix hint): {0!r}".format(msg))'
+    printf '%s\n' '    if POISON not in msg:'
+    printf '%s\n' '        errors.append("c1: fail-closed error did not name the inherited interactive model: {0!r}".format(msg))'
     printf '%s\n' 'if spawn_calls:'
-    printf '%s\n' '    errors.append("FORBIDDEN: an unmodeled Claude child was spawned: {0!r}".format(spawn_calls))'
+    printf '%s\n' '    errors.append("c1: FORBIDDEN unmodeled Claude child was spawned: {0!r}".format(spawn_calls))'
     printf '%s\n' ''
-    printf '%s\n' '# A codex child with no stable source is NOT forced to fail closed (codex'
-    printf '%s\n' '# has no settings.json model-inherit coupling); it simply omits --model.'
+    printf '%s\n' '# ---- Direction (c2): interactive settings.json has NO model -> PROCEED.'
+    printf '%s\n' '# No coupling exists, so run_claude must NOT abort: config injection STILL'
+    printf '%s\n' '# runs, argv carries no --model (account default), and the child spawns.'
+    printf '%s\n' '# This is the 1789 rotation case the r2 blanket fail-closed regressed.'
+    printf '%s\n' 'module.interactive_settings_model_for_request = lambda req: ""'
+    printf '%s\n' 'inject_calls.clear(); spawn_calls.clear()'
+    printf '%s\n' 'cmd, completed = module.run_claude(request, "do the job", 10)'
+    printf '%s\n' 'if not inject_calls:'
+    printf '%s\n' '    errors.append("c2: config injection (apply_claude_agent_env) did NOT run on the no-model path")'
+    printf '%s\n' 'if not spawn_calls:'
+    printf '%s\n' '    errors.append("c2: no-model path did NOT spawn the cron child")'
+    printf '%s\n' 'if "--model" in cmd:'
+    printf '%s\n' '    errors.append("c2: no-model path added a --model flag: {0!r}".format(cmd))'
+    printf '%s\n' 'if POISON in cmd:'
+    printf '%s\n' '    errors.append("c2: no-model path argv leaked a model: {0!r}".format(cmd))'
+    printf '%s\n' 'if cmd and cmd[-1] != "do the job":'
+    printf '%s\n' '    errors.append("c2: prompt is not the trailing positional: {0!r}".format(cmd[-1]))'
+    printf '%s\n' ''
+    printf '%s\n' '# ---- Codex: never forced to fail closed (no settings.json coupling).'
     printf '%s\n' 'schema = tmp / "schema3.json"'
     printf '%s\n' 'schema.write_text("{}", encoding="utf-8")'
     printf '%s\n' 'cmd2, _c2 = module.run_codex(request, "do the job", schema, 10)'
@@ -343,7 +375,7 @@ fail_closed_no_stable_model_source() {
     printf '%s\n' '    for x in errors:'
     printf '%s\n' '        print("[smoke][error] " + x, file=sys.stderr)'
     printf '%s\n' '    sys.exit(1)'
-    printf '%s\n' 'print("[smoke] Claude cron child fails closed with an actionable error; no unmodeled spawn")'
+    printf '%s\n' 'print("[smoke] conditional fail-closed: model-pinned settings.json raises (no spawn); no-model settings.json proceeds with config injection + account default")'
   } >"$helper"
 
   REPO_ROOT="$REPO_ROOT" TMP_ROOT="$SMOKE_TMP_ROOT" "$PY_BIN" "$helper"
@@ -355,7 +387,7 @@ main() {
 
   smoke_run "resolve precedence (per-job > cron-default > roster > env) + poison immunity" resolution_precedence_and_poison_immunity
   smoke_run "cron child argv carries explicit safe model, not poisoned settings.json" explicit_model_on_child_argv
-  smoke_run "Claude cron child fails closed on zero stable model source (no unmodeled spawn)" fail_closed_no_stable_model_source
+  smoke_run "conditional fail-closed on zero stable source (model-pinned settings.json raises; no-model proceeds + injects config)" conditional_fail_closed_no_stable_model_source
 
   smoke_log "passed"
 }

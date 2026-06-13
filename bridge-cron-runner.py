@@ -3303,6 +3303,40 @@ def resolve_cron_child_model_effort(request: dict[str, Any], engine: str) -> tup
     return model, effort, model_source
 
 
+def interactive_settings_model_for_request(request: dict[str, Any]) -> str:
+    """Return the agent's interactive `.claude/settings.json` `model`, else ''.
+
+    This is read ONLY to DECIDE whether a no-stable-source Claude cron child is
+    at risk of the issue #1880 coupling — it is NEVER passed to the spawned
+    child (the cron precedence in ``resolve_cron_child_model_effort`` deliberately
+    excludes this file). A model set here means an unmodeled ``claude -p`` would
+    silently inherit it, so the runner must fail closed (see ``run_claude``).
+    When this file carries NO model there is no coupling to remove, so the child
+    proceeds on the account default exactly as it did before #1880.
+
+    All failures (no config dir, missing/unreadable/invalid settings.json, no
+    ``model`` key) degrade to '' — i.e. "no interactive model is set", the
+    no-coupling path. We never abort a cron run on a settings-probe error.
+    """
+    config_dir = claude_config_dir_for_request(request)
+    if config_dir is None:
+        return ""
+    settings_file = config_dir / "settings.json"
+    try:
+        # Plain read_text (NOT an `.is_file()` probe) keeps this off the
+        # raw-pathlib metadata-site ledger; a missing file raises OSError and
+        # degrades to '' below. The settings.json lives under the controller-
+        # resolvable agent config dir (claude_config_dir_for_request already
+        # handles the iso pw_dir case), so no O_NOFOLLOW hardening is needed.
+        payload = json.loads(settings_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    model = payload.get("model")
+    return str(model).strip() if isinstance(model, str) and model.strip() else ""
+
+
 def run_codex(request: dict[str, Any], prompt: str, schema_path: Path, timeout: int, request_file: Path | None = None) -> tuple[list[str], subprocess.CompletedProcess[str]]:
     workdir = request["target_workdir"]
     codex_bin = resolve_binary("codex", "BRIDGE_CODEX_BIN")
@@ -3355,25 +3389,39 @@ def run_claude(request: dict[str, Any], prompt: str, timeout: int, request_file:
     # has no reasoning-effort flag (that is a wrapper-only concept), so only the
     # model is passed here; effort is resolved/honored on the codex path.
     model, _effort, _model_source = resolve_cron_child_model_effort(request, "claude")
-    # FAIL CLOSED (#1880 r2): when NO stable source resolves a model, spawning
-    # `claude -p` with no `--model` would silently inherit the interactive
-    # settings.json model — the precise coupling #1880 removes. There is no
-    # safe hardcodable model string, so we refuse to spawn an unmodeled child
-    # and surface an actionable error naming the two supported fixes. The
-    # dispatch loop turns this into a failed run with the reason in the summary.
+    # FAIL CLOSED, CONDITIONALLY (#1880 r3): when NO stable source resolves a
+    # model, spawning `claude -p` with no `--model` falls back to the
+    # interactive `.claude/settings.json` model. That inherit is ONLY a problem
+    # — the #1880 coupling — when settings.json actually carries a model: if the
+    # operator's interactive model loses cron-token entitlement, the unmodeled
+    # cron child silently inherits it and 404s the whole cron surface. So we
+    # fail closed ONLY in that genuine-coupling case. When settings.json has NO
+    # model there is nothing to inherit (account default applies on both the
+    # interactive and the cron path), so the r2 blanket fail-closed regressed
+    # every legitimate no-model cron flow (it aborted before config injection,
+    # the 1789 rotation smoke being one). The settings.json model is read here
+    # ONLY to DECIDE; it is deliberately never passed to the child.
     if not model:
-        agent = str(request.get("target_agent") or "").strip() or "<agent>"
-        raise CronChildModelUnresolvedError(
-            "cron child for agent '"
-            + agent
-            + "' has no stable model source (per-job, cronDefaults, roster, or "
-            "BRIDGE_CRON_DEFAULT_MODEL are all unset); refusing to spawn an "
-            "unmodeled Claude child that would inherit the interactive "
-            ".claude/settings.json model (issue #1880). Fix: set a cron default "
-            "with `bridge-cron.py ... --cron-default-model <model>` or a roster "
-            "BRIDGE_AGENT_MODEL[" + agent + "]=<model>."
-        )
-    model_flags: list[str] = ["--model", model]
+        interactive_model = interactive_settings_model_for_request(request)
+        if interactive_model:
+            agent = str(request.get("target_agent") or "").strip() or "<agent>"
+            raise CronChildModelUnresolvedError(
+                "cron child for agent '"
+                + agent
+                + "' has no stable model source (per-job, cronDefaults, roster, or "
+                "BRIDGE_CRON_DEFAULT_MODEL are all unset) while the interactive "
+                ".claude/settings.json pins model '" + interactive_model + "'; "
+                "refusing to spawn an unmodeled Claude child that would silently "
+                "inherit that interactive model (issue #1880). Fix: set a cron "
+                "default with `bridge-cron.py ... --cron-default-model <model>` or "
+                "a roster BRIDGE_AGENT_MODEL[" + agent + "]=<model>."
+            )
+        # No stable source AND no interactive model pinned: no coupling exists.
+        # Proceed with config injection + the account default (no `--model`),
+        # exactly as cron behaved before #1880. NOTE: do NOT raise here — the
+        # raise would skip the Claude config injection below and break every
+        # no-model cron job.
+    model_flags: list[str] = ["--model", model] if model else []
     # PR1.3 — cron child never loads channel plugins or MCP servers. The
     # `--channels` injection and `apply_channel_runtime_env` paths are gone.
     # `--strict-mcp-config` is unconditional (see disable_mcp_for_request).
