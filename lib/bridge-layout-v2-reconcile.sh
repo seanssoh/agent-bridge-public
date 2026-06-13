@@ -171,6 +171,7 @@ bridge_layout_v2_reconcile_iso_agents_json() {
     return 0
   fi
   local out="{" i=0
+  local p
   for p in "${pairs[@]}"; do
     if [[ $i -gt 0 ]]; then out+=","; fi
     out+="$p"
@@ -178,6 +179,69 @@ bridge_layout_v2_reconcile_iso_agents_json() {
   done
   out+="}"
   printf '%s' "$out"
+}
+
+# bridge_layout_v2_reconcile_iso_agents_set <agents-csv>
+#   Emit a newline-separated list of the roster-scoped agents that are
+#   EFFECTIVELY or merely-REQUESTED linux-user isolated on this host — the
+#   PER-AGENT iso set the engine uses to gate the FILE-LEVEL owner-only skip
+#   (#1820 rc4 item 4 + gate-2 #13364). For an agent in this set a per-FILE
+#   PermissionError on an agent-private 0600 file becomes a structured graceful-
+#   skip; for an agent NOT in the set (a shared agent) the same PermissionError
+#   stays a warning + data skip, byte-identical to main — EVEN on a mixed
+#   iso/shared host. This is NOT a whole-home belt.
+#
+#   gate-2 #13364: this REPLACES the prior host-wide bridge_layout_v2_reconcile_
+#   iso_host boolean (true when ANY rostered agent requested linux-user
+#   isolation), which authorized the downgrade for EVERY agent on the host and so
+#   over-downgraded a SHARED agent's PermissionError on a mixed host.
+#
+#   An agent is in the set iff:
+#     * host platform is Linux (the OS-user boundary only exists there), AND
+#     * THAT agent either resolved into the iso map (effective isolation) OR
+#       merely REQUESTED linux-user isolation (isolation_mode==linux-user). We
+#       accept "requested" — not only "effective" — because the cm-prod gap is
+#       exactly that os_user resolution can be incomplete (cosmax_sales_mdj has no
+#       agent-meta.env so os_user is unresolved); gating on full resolution would
+#       re-open it. So mdj IS in the set and still downgrades, while a shared
+#       agent (no linux-user request) is NOT in the set and stays a warning.
+#   On a pure shared-mode Linux host (no agent requests linux-user) and on macOS
+#   the set is empty → every per-file PermissionError stays a warning,
+#   byte-identical to main. Best-effort + side-effect-free: a missing predicate
+#   yields an empty set.
+bridge_layout_v2_reconcile_iso_agents_set() {
+  local agents_csv="$1"
+  local platform=""
+  if command -v bridge_host_platform >/dev/null 2>&1; then
+    platform="$(bridge_host_platform 2>/dev/null || true)"
+  else
+    platform="$(uname -s 2>/dev/null || true)"
+  fi
+  [[ "$platform" == "Linux" ]] || return 0
+  # Without ANY iso predicate we cannot classify — emit an empty set (every
+  # per-file PermissionError stays a warning, shared-mode behavior).
+  command -v bridge_agent_linux_user_isolation_requested >/dev/null 2>&1 \
+    || command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+    || return 0
+  local agent
+  local IFS=,
+  local -a ids=()
+  read -r -a ids <<<"$agents_csv"
+  unset IFS
+  for agent in "${ids[@]}"; do
+    [[ -n "$agent" ]] || continue
+    # Membership is effective OR requested isolation — NOT requiring a resolved
+    # os_user, so the mdj no-agent-meta.env case is still a member. "requested"
+    # subsumes "effective" (effective ⇒ requested), so checking requested alone
+    # would suffice; we check both defensively in case only the effective
+    # predicate is sourced in a minimal context.
+    if { command -v bridge_agent_linux_user_isolation_requested >/dev/null 2>&1 \
+           && bridge_agent_linux_user_isolation_requested "$agent" 2>/dev/null; } \
+       || { command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+              && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; }; then
+      printf '%s\n' "$agent"
+    fi
+  done
 }
 
 # bridge_layout_v2_reconcile_noop_json
@@ -330,6 +394,29 @@ bridge_layout_v2_reconcile_run() {
     printf '%s' "$iso_agents_json" >"$iso_agents_file" 2>/dev/null || iso_agents_file=""
   fi
 
+  # PER-AGENT iso set for the engine's file-level owner-only 0600 skip (#1820 rc4
+  # item 4 + gate-2 #13364). A per-FILE PermissionError on an agent-private file
+  # becomes a structured graceful-skip ONLY for an agent in this set (rostered
+  # effectively/requested-isolated linux-user); for a SHARED agent (not in the
+  # set) the same PermissionError stays a warning, byte-identical to main — even
+  # on a mixed iso/shared host. This REPLACES the rc4 host-wide --iso-host
+  # boolean, which over-downgraded shared agents on a mixed host. Written file-as-
+  # argv (footgun #11) under the migration state dir so it is captured in
+  # diagnostics; cleaned up after the engine run. An EMPTY set (shared-mode /
+  # macOS) omits the flag entirely → the engine treats nothing as iso.
+  local iso_set iso_set_file=""
+  iso_set="$(bridge_layout_v2_reconcile_iso_agents_set "$agents_csv")"
+  local -a iso_set_flag=()
+  if [[ -n "$iso_set" ]]; then
+    mkdir -p "$state_dir" 2>/dev/null || true
+    iso_set_file="$state_dir/.iso-agents-set-${stamp}.txt"
+    if printf '%s\n' "$iso_set" >"$iso_set_file" 2>/dev/null; then
+      iso_set_flag=(--iso-agents "$iso_set_file")
+    else
+      iso_set_file=""
+    fi
+  fi
+
   local out rc
   out="$("$python_bin" "$helper" \
     --bridge-home "${BRIDGE_HOME:-$HOME/.agent-bridge}" \
@@ -338,13 +425,15 @@ bridge_layout_v2_reconcile_run() {
     --mode "$mode" \
     --backup-root "$backup_root" \
     --iso-agents-json "$iso_agents_file" \
+    "${iso_set_flag[@]}" \
     --queue-task-dir "$queue_dir" 2>/dev/null)"
   rc=$?
 
-  # The iso-agents map is a transient input to the engine; remove it after the
-  # run (the structured isolation_v2_migration section in the result JSON is the
-  # durable audit record, not this scratch file).
+  # The iso-agents map + per-agent set are transient inputs to the engine; remove
+  # them after the run (the structured isolation_v2_migration section in the
+  # result JSON is the durable audit record, not these scratch files).
   [[ -n "$iso_agents_file" && -f "$iso_agents_file" ]] && rm -f "$iso_agents_file" 2>/dev/null || true
+  [[ -n "$iso_set_file" && -f "$iso_set_file" ]] && rm -f "$iso_set_file" 2>/dev/null || true
 
   if [[ "$mode" == "apply" && -n "$lock_token" ]] \
       && command -v bridge_scoped_lock_release >/dev/null 2>&1; then

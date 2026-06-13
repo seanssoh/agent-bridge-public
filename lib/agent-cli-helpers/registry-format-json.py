@@ -5,8 +5,11 @@
 
 Invocation contract:
     sys.argv[1] = path to TSV file with the run_registry row format
-                  (10 tab-separated columns, see run_registry comment for
-                  the schema).
+                  (12 tab-separated columns as of #1820 rc4 — the first 10
+                  are the original schema, columns 11/12 are isolation_mode /
+                  os_user; a legacy 10-column TSV still parses, both new
+                  fields default to ""). See run_registry comment for the
+                  full schema.
 
 Output: a single JSON document on stdout — sorted by `id` for stable
 diffs.
@@ -40,6 +43,12 @@ def main() -> int:
             continue
         (id_, cls, agent_source, privilege_class, home, workdir,
          engine, session, is_alive, source) = parts[:10]
+        # #1820 rc4: isolation_mode + os_user are appended columns 11/12 so a
+        # controller scanner (watchdog) can registry-classify the iso boundary
+        # without a filesystem read. Backward-compatible: an older TSV with only
+        # 10 columns defaults both to "" (shared-mode), unchanged behavior.
+        isolation_mode = parts[10] if len(parts) > 10 else ""
+        os_user = parts[11] if len(parts) > 11 else ""
         records.append({
             "id": id_,
             "class": cls,
@@ -51,6 +60,8 @@ def main() -> int:
             "session": session,
             "is_alive": is_alive == "1",
             "source": source,
+            "isolation_mode": isolation_mode,
+            "os_user": os_user,
         })
 
     records.sort(key=lambda r: r["id"])

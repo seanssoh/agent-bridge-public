@@ -75,3 +75,5 @@ scripts/smoke/1728-test-bind-state-path-guard-helper.py
 # match is the `process.env` substring, never a controller->iso boundary RW (same
 # shape as the #1563-pr8 / #1728 `os.environ` fixture entries).
 scripts/smoke/1825-ms365-token-key-by-claim.sh
+scripts/smoke/1820-rc4-iso-stale-group-preflight.sh
+scripts/smoke/1820-rc4-watchdog-settings-source.sh

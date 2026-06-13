@@ -1126,6 +1126,197 @@ bridge_agent_linux_user_isolation_effective() {
   return 0
 }
 
+# bridge_iso_boundary_applies <agent>
+#   Common iso-v2 controller-boundary classifier (#1820 rc4), the shell
+#   sibling of lib/bridge_iso_boundary.py::iso_boundary_applies. Returns 0
+#   (true) iff the controller-vs-iso-UID file boundary applies to this agent —
+#   i.e. its home/files are owned by the iso UID at 2770/0660 and a controller
+#   scanner must NOT direct-read across the boundary.
+#
+#   This is PURELY registry-based: it delegates to
+#   bridge_agent_linux_user_isolation_effective (isolation_mode==linux-user +
+#   Linux host + resolved os_user). It performs NO filesystem read of the agent
+#   home, so it can never itself trip the Errno13 it exists to let callers
+#   avoid. Every controller-run scanner (reconcile iso-map builder, watchdog,
+#   wiki-rebuild) classifies "is this an iso boundary" through this one
+#   predicate so they all agree. A non-iso / shared-mode / macOS agent returns
+#   non-zero and the caller takes its normal path (byte-identical legacy
+#   behavior).
+bridge_iso_boundary_applies() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 || return 1
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null
+}
+
+# bridge_controller_supp_group_stale_groups <agents-csv>
+#   Print (newline-separated) the set of `ab-agent-<a>` groups that EXIST on
+#   disk for the given rostered iso agents but are MISSING from THIS process's
+#   live supplementary group set (#1820 rc4 — the shared core of the #1836
+#   stale-supp-group pattern, generalized for the reconcile + watchdog scanners).
+#
+#   Root cause this surfaces (KNOWN_ISSUES §28 / #1836): `agent create`/`isolate`
+#   runs `usermod -aG ab-agent-<a> <controller>` which does NOT propagate to an
+#   ALREADY-RUNNING process. A long-lived login shell (or a child it forked,
+#   e.g. the reconcile/watchdog scan) therefore inherits a LOGIN-TIME group set
+#   missing every iso group created after that login — so `os.scandir(2770 home)`
+#   throws Errno13 even though the controller IS an on-disk member. The exact
+#   same file is readable from a fresh process / under `sg <group>`.
+#
+#   This is a PURE classifier: it reads `id -nG` (the live set), `getent group`
+#   (on-disk existence + membership), and the registry (iso classification). It
+#   performs NO filesystem read of any agent home, so it can never itself trip
+#   the Errno13 it exists to detect. Prints nothing (and returns 0) when:
+#     * the host is not Linux, OR
+#     * no rostered agent is effectively-iso, OR
+#     * every effectively-iso agent's on-disk group is already in the live set.
+#   A group is only emitted when it EXISTS on disk AND the controller is an
+#   on-disk member of it AND it is absent from the live set — i.e. exactly the
+#   stale-cache window an `sg`/fresh-login refresh would close. A group that does
+#   not exist on disk, or that the controller is not a member of, is NOT emitted
+#   (those are genuine provisioning gaps, not a stale cache — the caller must not
+#   mask them).
+bridge_controller_supp_group_stale_groups() {
+  local agents_csv="$1"
+  [[ "$(uname -s 2>/dev/null)" == "Linux" ]] || return 0
+  [[ -n "$agents_csv" ]] || return 0
+
+  local live_groups=""
+  live_groups="$(id -nG 2>/dev/null | tr ' ' '\n' || true)"
+  local ctrl_user=""
+  ctrl_user="$(id -un 2>/dev/null || printf '')"
+
+  local agent grp on_disk_members
+  local IFS=,
+  local -a ids=()
+  read -r -a ids <<<"$agents_csv"
+  unset IFS
+  for agent in "${ids[@]}"; do
+    [[ -n "$agent" ]] || continue
+    # Effectively-iso only (Linux + linux-user mode + resolved os_user). A
+    # shared-mode / non-iso agent has no ab-agent group boundary.
+    bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || continue
+    grp=""
+    if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+      grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+    fi
+    [[ -n "$grp" ]] || continue
+    # Already live? nothing stale for this group.
+    if printf '%s\n' "$live_groups" | grep -Fxq -- "$grp"; then
+      continue
+    fi
+    # Missing from the live set. Only treat as STALE-cache (refreshable) when
+    # the group exists on disk AND the controller is an on-disk member — that
+    # is the exact window `sg`/fresh-login closes. A missing on-disk group or a
+    # non-membership is a provisioning gap, NOT a stale cache: do not emit it.
+    getent group "$grp" >/dev/null 2>&1 || continue
+    on_disk_members="$(getent group "$grp" 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n')"
+    if [[ -n "$ctrl_user" ]] && printf '%s\n' "$on_disk_members" | grep -Fxq -- "$ctrl_user"; then
+      printf '%s\n' "$grp"
+    fi
+  done
+}
+
+# bridge_controller_supp_group_refresh --agents <csv> --reason <str> \
+#                                      --sentinel <ENV_VAR_NAME> \
+#                                      [--mode reexec|detect] -- <reexec cmd...>
+#   The SHARED fresh-group preflight (#1820 rc4) used by BOTH the layout-v2
+#   reconcile invoker (item 1) and the watchdog scanner (item 2). It detects
+#   whether THIS process's live supplementary group set is stale relative to the
+#   rostered effectively-iso agents (via bridge_controller_supp_group_stale_
+#   groups) and, when so, refreshes it so a subsequent `os.scandir(2770 home)`
+#   succeeds instead of throwing Errno13 — the SAME deterministic refresh
+#   bridge_agent_start_supp_group_preflight performs for agent START.
+#
+#   Contract:
+#     * Linux only; silent no-op on macOS / non-Linux and when no iso group is
+#       stale. NEVER aborts the caller.
+#     * --mode reexec (default): if the live set is stale AND `sg` can deliver
+#       the missing group(s), re-exec the SAME command (the args after `--`)
+#       under `sg <grp> -c ...`, chaining nested `sg` invocations so EVERY stale
+#       group is layered into the relaunched process. An anti-loop sentinel env
+#       var (named by --sentinel) is set before the exec so the re-exec'd pass
+#       short-circuits straight past this branch. When `sg` is unavailable or
+#       the re-exec is otherwise impossible, it emits a CLEAR operator WARN
+#       (no silent mask) and returns 0 so the caller proceeds (a residual
+#       Errno13 then surfaces through the caller's own warning path, never
+#       silently swallowed).
+#     * --mode detect: NEVER re-execs. Returns 0 if the live set is fresh (or
+#       no iso groups), 10 if it is stale (so a daemon-context caller that
+#       cannot safely re-exec — the watchdog — can take its info-downgrade
+#       fallback). Emits the same operator WARN on the stale path.
+#
+#   When reexec fires, this function does NOT return (exec replaces the shell).
+bridge_controller_supp_group_refresh() {
+  local agents_csv="" reason="controller-scan" sentinel="" mode="reexec"
+  local -a reexec_cmd=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --agents) agents_csv="$2"; shift 2 ;;
+      --reason) reason="$2"; shift 2 ;;
+      --sentinel) sentinel="$2"; shift 2 ;;
+      --mode) mode="$2"; shift 2 ;;
+      --) shift; reexec_cmd=("$@"); break ;;
+      *) shift ;;
+    esac
+  done
+
+  [[ "$(uname -s 2>/dev/null)" == "Linux" ]] || return 0
+
+  # Anti-loop: if we already re-exec'd under this sentinel, the groups are now
+  # live (or sg could not deliver them and re-trying would loop). Stop.
+  if [[ -n "$sentinel" ]]; then
+    local _seen="${!sentinel:-0}"
+    [[ "$_seen" == "1" ]] && return 0
+  fi
+
+  local stale=""
+  stale="$(bridge_controller_supp_group_stale_groups "$agents_csv")"
+  # Trim blank-only output.
+  stale="$(printf '%s' "$stale" | sed '/^$/d')"
+  [[ -n "$stale" ]] || return 0
+
+  # The live set is stale w.r.t. at least one effectively-iso agent's on-disk
+  # ab-agent group. Refresh (reexec) or report (detect).
+  local _grp_list
+  _grp_list="$(printf '%s' "$stale" | tr '\n' ' ' | sed 's/ *$//')"
+
+  if [[ "$mode" == "detect" ]]; then
+    bridge_warn "isolation v2 (#1820 rc4): controller's live group set is STALE for iso group(s) [$_grp_list] (reason=$reason); re-run from a fresh login shell / after \`newgrp\` to clear the transient. Downgrading affected iso-uid-side rows to info."
+    return 10
+  fi
+
+  # reexec mode. Require sg + a re-exec command.
+  if ! command -v sg >/dev/null 2>&1 || (( ${#reexec_cmd[@]} == 0 )); then
+    bridge_warn "isolation v2 (#1820 rc4): controller's live group set is STALE for iso group(s) [$_grp_list] (reason=$reason) and an in-process refresh is unavailable (\`sg\` missing or no re-exec command); re-run from a fresh login shell / after \`newgrp\`. Not masking — a residual permission warning is expected."
+    return 0
+  fi
+
+  bridge_warn "isolation v2 (#1820 rc4): refreshing controller group set with [$_grp_list] via \`sg\` so $reason can traverse isolated agent trees (KNOWN_ISSUES §28)."
+
+  # Shell-quote the real re-exec command once.
+  local quoted="" tok=""
+  for tok in "${reexec_cmd[@]}"; do
+    quoted+="$(printf '%q ' "$tok")"
+  done
+
+  # Layer EVERY stale group: sg gA -c "sg gB -c '<cmd>'" ... built inside-out so
+  # the relaunched process carries the WHOLE missing set, not just one group.
+  local -a stale_arr=()
+  local g
+  while IFS= read -r g; do
+    [[ -n "$g" ]] && stale_arr+=("$g")
+  done <<<"$stale"
+  local cmd="$quoted"
+  local i
+  for (( i = ${#stale_arr[@]} - 1; i >= 0; i-- )); do
+    cmd="$(printf 'sg %q -c %q' "${stale_arr[$i]}" "$cmd")"
+  done
+
+  [[ -n "$sentinel" ]] && export "$sentinel=1"
+  exec sh -c "$cmd"
+}
+
 # bridge_agent_start_supp_group_preflight — first-start determinism for
 # linux-user-isolated agents (Issue #1836).
 #

@@ -132,6 +132,48 @@ add_required rc2-reconcile-observability
 # structured isolation_v2_migration(skipped-iso-private) section. In the full
 # static suite so any reconcile/iso edit re-runs the iso-permission guard.
 add_required 1820-iso-reconcile-permission
+# Issue #1820 rc4 (cm-prod real-Linux iso-v2 production soak of v0.16.10-rc3):
+# the rc3 6 Errno13 warnings were the invoker shell's STALE supplementary group
+# cache, NOT topology — the controller IS in every ab-agent-<a> group and the
+# 2770 iso homes are group-readable; a 15-day-old login shell missing the newly
+# created bot groups inherited a stale group set into the reconcile child so
+# os.scandir(2770 home) threw Errno13 (KNOWN_ISSUES §28 / #1836). The systemic
+# fix: a SHARED fresh-group preflight (bridge_controller_supp_group_refresh in
+# lib/bridge-agents.sh) used by BOTH the reconcile driver and the watchdog entry
+# (detect the live group set missing rostered iso groups → sg re-exec, or WARN
+# when impossible — never silently mask); REMOVAL of the retracted whole-home
+# belt; and (A2) a FILE-LEVEL 0600 owner-only skip as the SOLE skip mechanism
+# (reason file-owner-only), replacing the rc3 #1876 up-front iso-map whole-agent
+# skip so correctness does NOT depend on iso-map completeness (the no-meta mdj
+# case). The watchdog also downgrades registry-classified permission_denied iso
+# rows + (env fallback) the transient stale-group window. In the full static
+# suite so any reconcile/watchdog/iso edit re-runs the guard.
+add_required 1820-rc4-iso-stale-group-preflight
+# Issue #1820 rc4 gate-2 (#13364, patch-dev real-Linux rig): the rc4 file-level
+# iso owner-only skip was authorized by a single HOST-WIDE --iso-host boolean, so
+# on a MIXED iso/shared host a SHARED agent's per-file PermissionError got
+# silently downgraded to a file-owner-only iso skip instead of surfacing the
+# required warning. The fix replaces the host-wide gate with a PER-AGENT iso set
+# (--iso-agents, built from the same roster predicate the preflight uses —
+# effective OR requested linux-user isolation, NOT requiring a resolved os_user
+# so the no-meta mdj case still downgrades). The downgrade fires ONLY for an
+# agent in that set; a shared agent's per-file PermissionError stays a warning +
+# data skip, byte-identical to main, even on a mixed host. This rig is the
+# mixed-host reproducer. In the full static suite so any reconcile/iso edit
+# re-runs the per-agent gate guard.
+add_required 1820-rc4-iso-mixed-host-skip
+# Issue #1820 rc4 supplement (cm-prod #7277): the watchdog's broken-symlink scan
+# walks the DATA-TREE MIRROR workdir; for an original anomaly agent whose mirror
+# render is incomplete the `.claude/settings.json -> settings.effective.json`
+# mirror symlink dangles even though the agent's REAL runtime HOME effective
+# settings are fully rendered + loaded (all hooks/plugins active, bot healthy) —
+# a pure false-positive. The fix decides "has hooks/plugins" from the agent's
+# runtime HOME effective settings (iso-aware home resolution), filters the
+# dangling mirror symlink out IFF the runtime home HAS hooks/plugins (or its iso
+# home is unreadable → graceful skip via bridge_iso_boundary), and keeps the row
+# when the runtime home genuinely lacks them. In the full static suite so any
+# bridge-watchdog.py / bridge_iso_boundary.py edit re-runs the guard.
+add_required 1820-rc4-watchdog-settings-source
 # Issue #1835: bridge-queue-gateway.py's SOCKET-transport client preflight
 # (_read_inline_text) now applies the #1280 sudo-as-owner body-file fallback on
 # PermissionError, with an actionable iso-ownership error when it cannot apply.
@@ -4454,7 +4496,7 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # re-introduce the unbounded rglob (which blew the 30s scan ceiling on
       # a HOME-scale workdir for 9+ days) or silently drop / over-escalate
       # on a bound.
-      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise 1520c-create-isolate-profile-publish 1801-watchdog-bounded-broken-links codex-doctor queue
+      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise 1520c-create-isolate-profile-publish 1801-watchdog-bounded-broken-links 1820-rc4-iso-stale-group-preflight codex-doctor queue
       add_integration integration-minimal
       ;;
 
