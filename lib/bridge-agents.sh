@@ -8348,6 +8348,9 @@ bridge_agent_session_health_json() {
   local attached_exit_behavior="exit"
   local restart_readiness="not-looped"
   local broken_launch_file=""
+  local live_mcp_raw=""
+  local live_mcp_status=""
+  local live_mcp_disconnected=""
 
   session="$(bridge_agent_session "$agent")"
   if bridge_agent_is_active "$agent"; then
@@ -8374,13 +8377,24 @@ bridge_agent_session_health_json() {
     fi
   fi
 
+  # Issue #1881-C: the runtime-state counterpart to restart_readiness.
+  # File-checks can read "ready" while the live session has no MCP tools
+  # connected; surface the descendant-probe verdict (reused via
+  # bridge_agent_live_mcp_status) so JSON consumers can tell "config says
+  # enabled" from "MCP actually connected". TAB-delimited: status[\t<csv>].
+  live_mcp_raw="$(bridge_agent_live_mcp_status "$agent" 2>/dev/null || printf 'not-applicable')"
+  live_mcp_status="${live_mcp_raw%%$'\t'*}"
+  if [[ "$live_mcp_raw" == *$'\t'* ]]; then
+    live_mcp_disconnected="${live_mcp_raw#*$'\t'}"
+  fi
+
   bridge_require_python
-  python3 - "$agent" "$session" "$active" "$loop_mode" "$continue_mode" "$onboarding_state" "$attached_exit_behavior" "$restart_readiness" "$broken_launch_file" <<'PY'
+  python3 - "$agent" "$session" "$active" "$loop_mode" "$continue_mode" "$onboarding_state" "$attached_exit_behavior" "$restart_readiness" "$broken_launch_file" "$live_mcp_status" "$live_mcp_disconnected" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-agent, session, active, loop_mode, continue_mode, onboarding_state, attached_exit_behavior, restart_readiness, broken_launch_file = sys.argv[1:]
+agent, session, active, loop_mode, continue_mode, onboarding_state, attached_exit_behavior, restart_readiness, broken_launch_file, live_mcp_status, live_mcp_disconnected = sys.argv[1:]
 payload = {
     "session": session or None,
     "tmux_active": active == "yes",
@@ -8389,9 +8403,17 @@ payload = {
     "onboarding_state": onboarding_state,
     "attached_exit_behavior": attached_exit_behavior,
     "restart_readiness": restart_readiness,
+    "live_mcp_status": live_mcp_status or "not-applicable",
     "detach_hint": "Ctrl-b then d",
     "stop_command": f"agent-bridge kill {agent}",
 }
+# Issue #1881-C: only emit the disconnected-channel list when the live
+# session is actually missing tools the config claims are enabled — the
+# key's presence IS the "manual restart left MCP dead" signal.
+if live_mcp_status == "disconnected" and live_mcp_disconnected.strip():
+    payload["live_mcp_disconnected_channels"] = [
+        seg for seg in live_mcp_disconnected.split(",") if seg.strip()
+    ]
 if broken_launch_file:
     payload["broken_launch_file"] = broken_launch_file
     # Issue #1317-B (beta5-2 Lane ν): when the marker file exists on
@@ -8463,6 +8485,22 @@ bridge_agent_session_guidance_text() {
   printf -- '- onboarding_state: %s\n' "$onboarding_state"
   printf -- '- attached_exit_behavior: %s\n' "$exit_behavior"
   printf -- '- restart_readiness: %s\n' "$restart_readiness"
+  # Issue #1881-C: runtime-state counterpart to restart_readiness above.
+  # restart_readiness is a FILE-state predicate (config/plugin-file says
+  # ready); live_mcp_status is the RUNTIME-state predicate (the descendant
+  # probe confirms the MCP tools are actually connected in the running
+  # session). They diverge after a manual (non bridge-native) restart —
+  # file-checks read `ready` while the live session has zero MCP tools
+  # (`-32000`). Reuses bridge_agent_live_mcp_status (no new probe).
+  local _live_mcp_raw="" _live_mcp_status="" _live_mcp_disconnected=""
+  _live_mcp_raw="$(bridge_agent_live_mcp_status "$agent" 2>/dev/null || printf 'not-applicable')"
+  _live_mcp_status="${_live_mcp_raw%%$'\t'*}"
+  printf -- '- live_mcp_status: %s\n' "${_live_mcp_status:-not-applicable}"
+  if [[ "$_live_mcp_raw" == *$'\t'* ]]; then
+    _live_mcp_disconnected="${_live_mcp_raw#*$'\t'}"
+    printf -- '- live_mcp_disconnected_channels: %s\n' "$_live_mcp_disconnected"
+    printf -- '- live_mcp_recovery: agent-bridge agent restart %s\n' "$agent"
+  fi
   if [[ -f "$broken_launch_file" ]]; then
     printf -- '- broken_launch_file: %s\n' "$broken_launch_file"
     # Issue #1317-B (beta5-2 Lane ν): surface the JSON-encoded
@@ -8572,8 +8610,20 @@ bridge_agent_next_actions_tsv() {
       fi
 
       # Plugin installed but disabled — engine-side enable required.
+      #
+      # Issue #1881-B: route the operator to the BRIDGE-NATIVE restart, NOT
+      # `/plugin enable`. The agent's project `.claude/settings.json` is a
+      # symlink to the rendered `settings.effective.json` (the shared-
+      # effective-settings design), and Claude Code refuses to write
+      # settings through a symlink — `/plugin enable` dies with
+      # SymlinkWriteRefusedError. `agent-bridge agent restart` runs the
+      # bridge-owned `claude plugin enable --scope user` under the correct
+      # per-agent config dir (with MCP-env token injection) on the way up,
+      # which is the only path that durably enables the plugin without
+      # bypassing the symlink-write guard. The hint reason names the trap so
+      # the operator does not reach for `/plugin enable` and get stuck.
       if [[ "$plugin_installed" == "yes" && "$plugin_enabled" == "no" ]]; then
-        printf 'agent-bridge agent show %s\tplugin %s installed but not enabled in engine; ask admin to enable\tyes\n' "$agent" "$plugin_spec"
+        printf 'agent-bridge agent restart %s\tplugin %s installed but disabled; finish enabling via bridge-native restart (runs claude plugin enable --scope user under the agent config dir). Do NOT use /plugin enable — the project settings.json is a symlink and Claude Code refuses the write (SymlinkWriteRefused)\tyes\n' "$agent" "$plugin_spec"
         continue
       fi
 
@@ -8644,11 +8694,32 @@ bridge_agent_next_actions_tsv() {
       printf 'agent-bridge attach %s\tagent looped but onboarding handshake pending; attach and walk the onboarding skill\tyes\n' "$agent"
       ;;
     channel-setup-incomplete)
-      # Already surfaced per-channel above; do not duplicate. Fall
-      # through.
-      :
+      # Issue #1881-A: `setup <channel>` writes the token and validates
+      # send but leaves the engine-level plugin enable pending until the
+      # next bridge-native (re)start. When the per-channel diagnostics
+      # above did not already emit a more specific row (missing plugin /
+      # credentials / runtime), name the restart that finishes the enable
+      # so the operator is not left at "plugin ready" with no next step.
+      # The per-channel `continue`s above pre-empt the common cases; this
+      # row covers the "channel configured, plugin installed, just not
+      # engine-enabled yet" tail.
+      printf 'agent-bridge agent restart %s\tchannel setup is incomplete: the plugin enable only materializes on the next bridge-native restart. Run this to finish (do NOT use /plugin enable — settings.json is a symlink and Claude Code refuses the write)\tyes\n' "$agent"
       ;;
   esac
+
+  # Issue #1881-C: live-MCP runtime gate. restart_readiness above is a
+  # FILE-state predicate; after a manual (non bridge-native) restart it can
+  # read `ready` while the live session has zero MCP tools connected
+  # (`-32000`). Reuse bridge_agent_live_mcp_status (no new probe) to emit a
+  # concrete recovery when the descendant probe says a file-enabled channel
+  # plugin is NOT actually connected in the running session.
+  local _na_live_raw="" _na_live_status="" _na_live_csv=""
+  _na_live_raw="$(bridge_agent_live_mcp_status "$agent" 2>/dev/null || printf 'not-applicable')"
+  _na_live_status="${_na_live_raw%%$'\t'*}"
+  if [[ "$_na_live_status" == "disconnected" ]]; then
+    _na_live_csv="${_na_live_raw#*$'\t'}"
+    printf 'agent-bridge agent restart %s\tlive session is running but its MCP tools are NOT connected for: %s (config/plugin-file says enabled; the running session has no live MCP). A bridge-native restart re-establishes the MCP descendant\tyes\n' "$agent" "$_na_live_csv"
+  fi
 }
 
 bridge_agent_next_actions_text() {
@@ -9159,6 +9230,98 @@ bridge_agent_missing_plugin_mcp_channels_csv() {
   done
 
   printf '%s' "$missing"
+}
+
+# bridge_agent_live_mcp_status — issue #1881. Collapse the per-channel
+# MCP-descendant liveness scan into a single operator-facing status word
+# that distinguishes "configured + plugin-file enabled" from "live MCP
+# actually connected in the running session".
+#
+# This is the missing signal #1881-C calls out: after a manual (non
+# bridge-native) restart, the file-level checks (`restart_readiness`,
+# `plugin_enabled`, `channel_setup_complete`) can all report ready while
+# the live tmux session has ZERO MCP tools connected (engine returns
+# `-32000`). `restart_readiness` is a file-state predicate; this is the
+# orthogonal runtime-state predicate.
+#
+# REUSE (do NOT reinvent the readiness model): this function is a thin
+# classifier over `bridge_agent_missing_plugin_mcp_channels_csv`
+# (lib/bridge-agents.sh) — the canonical probeable-channel liveness scan
+# that walks the pane-pid process tree for the bun MCP descendant via
+# `bridge_plugin_mcp_descendant_ready_for_item`. We add NO new probe; we
+# only fold its CSV result into a status word + the offending channel list.
+#
+# Output (stdout): one status word, optionally followed by a TAB and the
+# CSV of disconnected channels.
+#   not-applicable   engine != claude, OR no probeable channel plugins
+#                    configured (nothing to probe — silence is correct).
+#   not-running      probeable plugins exist but the agent has no live
+#                    tmux session/pane pid to probe (start it first).
+#   connected        every probeable channel plugin has a live MCP
+#                    descendant in the running session.
+#   disconnected\t<csv>  one or more file-enabled channel plugins have NO
+#                    live MCP descendant — the live session is missing
+#                    tools the config claims are enabled. The CSV names
+#                    the offending channels.
+bridge_agent_live_mcp_status() {
+  local agent="$1"
+  local probeable=""
+  local session=""
+  local pane_pid=""
+  local missing=""
+
+  [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || { printf 'not-applicable'; return 0; }
+
+  # Only the probeable chat-plugin channels carry a descendant probe; if
+  # the agent has none configured there is nothing to assert liveness on.
+  # bridge_agent_missing_plugin_mcp_channels_csv already skips unprobeable
+  # items, but we gate up front so a configured-but-unprobeable-only agent
+  # reports not-applicable rather than a misleading "connected".
+  probeable="$(bridge_filter_probeable_plugin_channels_csv "$(bridge_agent_effective_launch_plugin_channels_csv "$agent")")"
+  if [[ -z "$probeable" ]]; then
+    printf 'not-applicable'
+    return 0
+  fi
+
+  session="$(bridge_agent_session "$agent")"
+  if [[ -z "$session" ]] || ! bridge_tmux_session_exists "$session"; then
+    printf 'not-running'
+    return 0
+  fi
+  pane_pid="$(bridge_tmux_session_pane_pid "$session")"
+  if [[ ! "$pane_pid" =~ ^[0-9]+$ ]]; then
+    printf 'not-running'
+    return 0
+  fi
+
+  missing="$(bridge_agent_missing_plugin_mcp_channels_csv "$agent")"
+  if [[ -n "$missing" ]]; then
+    printf 'disconnected\t%s' "$missing"
+    return 0
+  fi
+  printf 'connected'
+  return 0
+}
+
+# Filter a channel CSV down to the probeable chat-plugin channels (the
+# subset `bridge_agent_live_mcp_status` can actually assert MCP liveness
+# on). Reuses the per-item classifier `bridge_plugin_mcp_is_probeable_item`
+# so the probeable set cannot drift from the missing-CSV scan.
+bridge_filter_probeable_plugin_channels_csv() {
+  local channels="$1"
+  local item=""
+  local kept=""
+  local -a items=()
+
+  [[ -n "$channels" ]] || return 0
+  IFS=',' read -r -a items <<<"$channels"
+  for item in "${items[@]}"; do
+    item="$(bridge_trim_whitespace "$item")"
+    [[ -n "$item" ]] || continue
+    bridge_plugin_mcp_is_probeable_item "$item" || continue
+    kept="$(bridge_merge_channels_csv "$kept" "$item")"
+  done
+  printf '%s' "$kept"
 }
 
 bridge_agent_required_launch_channels_csv() {

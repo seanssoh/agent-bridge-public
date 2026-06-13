@@ -495,6 +495,31 @@ bridge_setup_ensure_claude_channel_plugin_for_needle() {
 
   [[ -n "$filtered" ]] || return 0
   bridge_ensure_claude_channel_plugins_for_csv "$filtered" "$agent"
+
+  # Issue #1881-A: `setup <channel>` has written the token, validated send,
+  # and run the readiness pass — but the engine-level plugin enable only
+  # MATERIALIZES on the next bridge-native (re)start. Without an explicit
+  # restart step the operator sees "Claude plugin ready" and reasonably
+  # assumes nothing else is required (then reaches for `/plugin enable`,
+  # which dies on the settings.json symlink — #1881-B). Name the exact
+  # bridge-native restart so the success path is self-completing.
+  bridge_setup_print_restart_hint "$agent"
+}
+
+# bridge_setup_print_restart_hint — issue #1881-A. After a channel setup
+# scopes the plugin readiness pass, tell the operator the ONE remaining
+# step: a bridge-native restart that finishes enabling the plugin in the
+# running session. Centralized so the message text (and the explicit
+# "do NOT use /plugin enable" steer for #1881-B) stays consistent across
+# every provider's setup verb.
+bridge_setup_print_restart_hint() {
+  local agent="$1"
+
+  [[ -n "$agent" ]] || return 0
+  bridge_info "[next] Restart the agent to finish enabling the channel plugin in the live session:"
+  bridge_info "[next]   agent-bridge agent restart $agent"
+  bridge_info "[next] The token is saved and send was validated, but the engine-level plugin enable + live MCP only take effect on the next bridge-native restart."
+  bridge_info "[next] Do NOT use /plugin enable inside the session — the project settings.json is a symlink and Claude Code refuses the write (SymlinkWriteRefused). The bridge-native restart runs the enable under the correct config dir for you."
 }
 
 bridge_setup_ensure_development_channels_launch_flag() {
