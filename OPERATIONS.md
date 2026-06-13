@@ -1413,13 +1413,20 @@ per-job/`--cron-default-*` flags are **not** carried through the iso-staging
 path (#1359); for an isolated agent, set them controller-side.
 
 If **no** stable source resolves at dispatch (per-job, `cronDefaults`, roster,
-and `BRIDGE_CRON_DEFAULT_MODEL` all unset), a **Claude** cron child **fails
-closed** instead of launching with no `--model` (which would inherit the
-interactive `.claude/settings.json` model — the exact #1880 coupling). The run
-is marked failed with an actionable summary naming the fix: set a cron default
-(`--cron-default-model <model>`) or a roster `BRIDGE_AGENT_MODEL[<agent>]`. This
-only affects Claude children with zero configured stable model; jobs/agents that
-already have any of the four sources are unaffected.
+and `BRIDGE_CRON_DEFAULT_MODEL` all unset), the handling is **conditional** on
+whether the interactive `.claude/settings.json` actually carries a `model`:
+- settings.json **has** a model (the genuine #1880 coupling — launching with no
+  `--model` would silently inherit it) → the **Claude** cron child **fails
+  closed**; the run is marked failed with an actionable summary naming the fix:
+  set a cron default (`--cron-default-model <model>`) or a roster
+  `BRIDGE_AGENT_MODEL[<agent>]`. (The settings value is read only to decide; it
+  is never passed to the child.)
+- settings.json has **no** model (or is missing/unreadable) → there is no
+  coupling to remove, so the child **proceeds** on the **account default** with
+  no `--model`, exactly as before #1880 (config injection is intact).
+This only changes Claude children with zero configured stable model AND a
+model-bearing interactive settings.json; jobs/agents with any of the four stable
+sources, or with no interactive model, are unaffected.
 
 Verify the no-inheritance contract:
 
