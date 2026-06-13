@@ -1927,6 +1927,62 @@ def is_expected_iso_boundary_row(
     )
 
 
+def _iso_group_stale_active() -> bool:
+    """True iff the shell preflight signalled that the controller's
+    supplementary group set is STALE and could NOT be refreshed in-process
+    (#1820 rc4, item 2 fallback). bridge-watchdog.sh exports
+    ``BRIDGE_WATCHDOG_ISO_GROUP_STALE=1`` ONLY in that case (re-exec impossible,
+    e.g. ``sg`` missing). The priority order is remove+preflight >
+    info-downgrade > plain-remove: the preflight (a successful re-exec) is
+    preferred and clears the rows outright; this env flag is the fallback that
+    keeps the TRANSIENT restart-window rows out of the HIGH problem count when
+    the refresh could not be applied, instead of churning them as drift."""
+    return os.environ.get("BRIDGE_WATCHDOG_ISO_GROUP_STALE", "").strip() == "1"
+
+
+def is_iso_group_stale_downgrade_row(
+    item: "AgentWatch",
+    platform: str,
+) -> bool:
+    """Info-downgrade fallback row classifier (#1820 rc4, item 2).
+
+    When the shell preflight could not refresh a stale controller group set
+    (``BRIDGE_WATCHDOG_ISO_GROUP_STALE=1``), a ``permission_denied`` scan_error
+    in an iso-boundary category (``iso-uid-side`` / ``controller-cache-stale``)
+    is the transient stale-group window — NOT real drift. Downgrade it to the
+    auditable ``iso_skipped`` bucket so the restart-window does not churn as a
+    HIGH problem. This is INTENTIONALLY looser than the registry classifier
+    (``is_expected_iso_boundary_row``): the stale-group window is exactly the
+    case where the (already-failed) per-agent registry read may be incomplete,
+    so we key on the iso-boundary CATEGORY + the explicit stale signal rather
+    than on a resolved os_user. It only fires on Linux and only under the env
+    flag; off the flag this is always False (byte-identical to the
+    registry-only downgrade). ``not_found`` / ``os_error`` rows stay problems."""
+    if not _iso_group_stale_active():
+        return False
+    if _iso_boundary_applies is None:  # common helper unavailable
+        return False
+    if not host_is_linux_platform(platform):
+        return False
+    if item.status != "scan_error":
+        return False
+    if (item.error_kind or "").strip() != "permission_denied":
+        return False
+    cat = (item.error_category or "").strip()
+    # Empty category (caller did no split) OR an iso-boundary category is the
+    # transient stale-group window. A publish-gap is operator-actionable and
+    # stays a problem.
+    if cat and cat not in ("iso-uid-side", "controller-cache-stale"):
+        return False
+    return True
+
+
+def host_is_linux_platform(platform: str) -> bool:
+    """Thin Linux check for the stale-group downgrade (#1820 rc4) that does not
+    depend on the optional common-helper import (it may be None)."""
+    return (platform or "").strip() == "Linux"
+
+
 def classify_status(
     missing_files: list[str],
     broken_links: list[str],
@@ -2648,10 +2704,18 @@ def main() -> int:
     # filesystem read of the (2770, Errno13-throwing) agent home. not_found /
     # os_error rows stay problems even on an iso agent.
     # (``host_platform`` computed once before the scan loop above.)
+    # The preferred path (a successful shell-side fresh-group re-exec) clears
+    # these rows outright before the scan. The registry classifier downgrades
+    # the rest. The stale-group env fallback (#1820 rc4 item 2) additionally
+    # downgrades iso-uid-side permission_denied rows when the preflight could not
+    # refresh in-process (BRIDGE_WATCHDOG_ISO_GROUP_STALE=1) — so the transient
+    # restart-window does not churn as HIGH. Off the flag the second clause is a
+    # no-op (byte-identical to the registry-only downgrade).
     iso_skipped_agents = {
         item.agent
         for item in records
         if is_expected_iso_boundary_row(item, registry_meta, host_platform)
+        or is_iso_group_stale_downgrade_row(item, host_platform)
     }
     effective_problems = [
         item for item in records

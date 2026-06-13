@@ -133,19 +133,22 @@ add_required rc2-reconcile-observability
 # static suite so any reconcile/iso edit re-runs the iso-permission guard.
 add_required 1820-iso-reconcile-permission
 # Issue #1820 rc4 (cm-prod real-Linux iso-v2 production soak of v0.16.10-rc3):
-# the rc3 iso skip covered only 2/8 iso bots — the other 6 were absent from the
-# engine iso map AND their HOME itself is 2770 (controller non-member), so
-# os.scandir(home) threw [Errno 13] BEFORE any per-file skip → an unstructured
-# perm-warning with no isolation_v2_migration entry. The systemic fix: a common
-# registry-based iso-boundary classifier (lib/bridge_iso_boundary.py) shared
-# across controller scanners, a defensive belt in the reconcile (host-iso-active
-# → PermissionError reaching an iso home becomes a structured graceful-skip,
-# reason home-unreadable-controller, even for an agent absent from the map), and
-# a watchdog downgrade of pure permission_denied iso-boundary rows into an
-# auditable iso_skipped bucket (not_found/os_error stay problems). The rig
-# topology is fixed to make the iso HOME unreadable (reproducing cm-prod). In
-# the full static suite so any reconcile/watchdog/iso edit re-runs the guard.
-add_required 1820-rc4-iso-home-unreadable-belt
+# the rc3 6 Errno13 warnings were the invoker shell's STALE supplementary group
+# cache, NOT topology — the controller IS in every ab-agent-<a> group and the
+# 2770 iso homes are group-readable; a 15-day-old login shell missing the newly
+# created bot groups inherited a stale group set into the reconcile child so
+# os.scandir(2770 home) threw Errno13 (KNOWN_ISSUES §28 / #1836). The systemic
+# fix: a SHARED fresh-group preflight (bridge_controller_supp_group_refresh in
+# lib/bridge-agents.sh) used by BOTH the reconcile driver and the watchdog entry
+# (detect the live group set missing rostered iso groups → sg re-exec, or WARN
+# when impossible — never silently mask); REMOVAL of the retracted whole-home
+# belt; and (A2) a FILE-LEVEL 0600 owner-only skip as the SOLE skip mechanism
+# (reason file-owner-only), replacing the rc3 #1876 up-front iso-map whole-agent
+# skip so correctness does NOT depend on iso-map completeness (the no-meta mdj
+# case). The watchdog also downgrades registry-classified permission_denied iso
+# rows + (env fallback) the transient stale-group window. In the full static
+# suite so any reconcile/watchdog/iso edit re-runs the guard.
+add_required 1820-rc4-iso-stale-group-preflight
 # Issue #1820 rc4 supplement (cm-prod #7277): the watchdog's broken-symlink scan
 # walks the DATA-TREE MIRROR workdir; for an original anomaly agent whose mirror
 # render is incomplete the `.claude/settings.json -> settings.effective.json`
@@ -4480,7 +4483,7 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # re-introduce the unbounded rglob (which blew the 30s scan ceiling on
       # a HOME-scale workdir for 9+ days) or silently drop / over-escalate
       # on a bound.
-      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise 1520c-create-isolate-profile-publish 1801-watchdog-bounded-broken-links 1820-rc4-iso-home-unreadable-belt codex-doctor queue
+      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise 1520c-create-isolate-profile-publish 1801-watchdog-bounded-broken-links 1820-rc4-iso-stale-group-preflight codex-doctor queue
       add_integration integration-minimal
       ;;
 

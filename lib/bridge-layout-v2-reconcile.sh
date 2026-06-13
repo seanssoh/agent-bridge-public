@@ -181,30 +181,25 @@ bridge_layout_v2_reconcile_iso_agents_json() {
   printf '%s' "$out"
 }
 
-# bridge_layout_v2_reconcile_host_iso_active <agents-csv>
-#   Print "1" iff this host is iso-v2-active, else "0" (#1820 rc4). This is the
-#   HOST-LEVEL signal the engine's defensive belt uses: when active, a
-#   controller PermissionError reaching an agent home is recorded as a
-#   structured graceful-skip instead of an Errno13 warning — EVEN for an agent
-#   the iso-map builder failed to classify (the cm-prod 6/8 case, where the
-#   reconcile driver context had incomplete os_user / isolation_mode registry
-#   metadata for some production bots).
+# bridge_layout_v2_reconcile_iso_host <agents-csv>
+#   Print "1" iff this host is a Linux iso-v2 host, else "0" (#1820 rc4, item 4).
+#   This is the host-level gate the engine uses for the FILE-LEVEL owner-only
+#   skip ONLY (a per-FILE PermissionError on an agent-private 0600 file becomes a
+#   structured graceful-skip instead of a warning). It is NOT a whole-home belt —
+#   the retracted whole-home --host-iso-active signal was removed (item 3).
 #
-#   A host is iso-v2-active iff:
+#   A host is a Linux iso-v2 host iff:
 #     * host platform is Linux (the OS-user boundary only exists there), AND
-#     * at least one rostered agent either resolved into the iso map OR merely
-#       REQUESTED linux-user isolation (isolation_mode==linux-user). We accept
-#       "requested" — not only "effective" — precisely because the bug is that
-#       os_user resolution can be incomplete; gating the belt on full
-#       resolution would re-open the exact gap. On a pure shared-mode Linux
-#       host (no agent requests linux-user) this is "0" and PermissionErrors
-#       stay warnings, byte-identical to pre-rc4. On macOS it is always "0".
-#   Best-effort + side-effect-free: a missing predicate yields "0" (shared-mode
-#   behavior preserved).
-bridge_layout_v2_reconcile_host_iso_active() {
+#     * at least one rostered agent REQUESTED linux-user isolation
+#       (isolation_mode==linux-user). We accept "requested" — not only
+#       "effective" — because the cm-prod gap is exactly that os_user resolution
+#       can be incomplete; gating on full resolution would re-open it. On a pure
+#       shared-mode Linux host (no agent requests linux-user) this is "0" and a
+#       per-file PermissionError stays a warning, byte-identical to main. On
+#       macOS it is always "0".
+#   Best-effort + side-effect-free: a missing predicate yields "0".
+bridge_layout_v2_reconcile_iso_host() {
   local agents_csv="$1"
-  # macOS / non-Linux: the boundary does not exist. Resolve platform via the
-  # canonical predicate when available, else uname.
   local platform=""
   if command -v bridge_host_platform >/dev/null 2>&1; then
     platform="$(bridge_host_platform 2>/dev/null || true)"
@@ -212,15 +207,6 @@ bridge_layout_v2_reconcile_host_iso_active() {
     platform="$(uname -s 2>/dev/null || true)"
   fi
   [[ "$platform" == "Linux" ]] || { printf '0'; return 0; }
-  # If the iso-map builder classified anything, the host is iso-active.
-  local iso_json
-  iso_json="$(bridge_layout_v2_reconcile_iso_agents_json "$agents_csv")"
-  if [[ -n "$iso_json" && "$iso_json" != "{}" ]]; then
-    printf '1'
-    return 0
-  fi
-  # Otherwise check whether ANY rostered agent merely REQUESTED linux-user
-  # isolation — robust to incomplete os_user resolution (the cm-prod gap).
   if command -v bridge_agent_linux_user_isolation_requested >/dev/null 2>&1; then
     local agent
     local IFS=,
@@ -388,15 +374,14 @@ bridge_layout_v2_reconcile_run() {
     printf '%s' "$iso_agents_json" >"$iso_agents_file" 2>/dev/null || iso_agents_file=""
   fi
 
-  # Host-level iso-v2-active signal for the engine's defensive belt (#1820 rc4).
-  # When active, a controller PermissionError reaching an agent home becomes a
-  # structured graceful-skip even for an agent the iso-map builder missed (the
-  # cm-prod 6/8 case). On shared-mode / macOS this is "0" → PermissionErrors
-  # stay warnings (byte-identical to pre-rc4).
-  local host_iso_active
-  host_iso_active="$(bridge_layout_v2_reconcile_host_iso_active "$agents_csv")"
-  local -a host_iso_flag=()
-  [[ "$host_iso_active" == "1" ]] && host_iso_flag=(--host-iso-active)
+  # File-level iso-host gate for the engine's owner-only 0600 skip (#1820 rc4,
+  # item 4). On a Linux iso-v2 host a per-FILE PermissionError on an agent-
+  # private file becomes a structured graceful-skip; off such a host it stays a
+  # warning (byte-identical to main). NOT a whole-home belt (item 3 removed that).
+  local iso_host
+  iso_host="$(bridge_layout_v2_reconcile_iso_host "$agents_csv")"
+  local -a iso_host_flag=()
+  [[ "$iso_host" == "1" ]] && iso_host_flag=(--iso-host)
 
   local out rc
   out="$("$python_bin" "$helper" \
@@ -406,7 +391,7 @@ bridge_layout_v2_reconcile_run() {
     --mode "$mode" \
     --backup-root "$backup_root" \
     --iso-agents-json "$iso_agents_file" \
-    "${host_iso_flag[@]}" \
+    "${iso_host_flag[@]}" \
     --queue-task-dir "$queue_dir" 2>/dev/null)"
   rc=$?
 
