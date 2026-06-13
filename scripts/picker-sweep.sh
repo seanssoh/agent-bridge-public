@@ -30,6 +30,12 @@
 #   *) Optionally set BRIDGE_PICKER_SWEEP_NOTIFY to an admin agent ID. If set,
 #      the script enqueues a queue task summarising auto-unstick events. If
 #      empty, the script logs only.
+#   *) SCRIPT_-prefixed aliases: the bridge-native SHELL-kind cron runner
+#      executes this script under `env -i` and rejects BRIDGE_-prefixed payload
+#      env (it requires POLL_/SCRIPT_ prefixes). The auto-registered shell-kind
+#      cron therefore carries SCRIPT_PICKER_SWEEP_{ENABLED,SELF,NOTIFY}, which
+#      this script reads as fallbacks (an explicit BRIDGE_* value always wins,
+#      so the OS-crontab form below is unaffected).
 #
 # OS crontab example (recommended — fully bypasses claude/codex). Note the
 # entire entry must be on ONE physical line; crontab does not honor shell
@@ -37,8 +43,12 @@
 #
 #   */10 * * * * BRIDGE_PICKER_SWEEP_ENABLED=1 BRIDGE_PICKER_SWEEP_SELF=admin BRIDGE_PICKER_SWEEP_NOTIFY=admin bash /full/path/.agent-bridge/scripts/picker-sweep.sh >> /full/path/.agent-bridge/logs/picker-sweep.log 2>&1
 #
-# See OPERATIONS.md "picker-sweep" for the bridge-native cron variant and the
-# trade-offs (self-recursion risk, future #663 shell-payload mode).
+# See OPERATIONS.md "picker-sweep" for the bridge-native cron variant. As of
+# the #833/#1052 follow-up, the auto-registered bridge-native cron is SHELL-kind
+# and controller-direct (the cron runner executes this script directly as the
+# controller, engine-independent), so there is no self-recursion risk and no
+# codex-pair dependency — the old text-kind dispatch through `claude -p`/`codex
+# exec` is gone.
 #
 # Test seams: this script reads wrapper-function names from the
 # environment so the smoke can replace tmux/queue calls with fixtures without
@@ -83,11 +93,21 @@ _psw_log() {
 # Order matters: explicit env wins over host_profile.
 # ---------------------------------------------------------------------------
 
-# host_profile=dev opt-out — only consulted when BRIDGE_PICKER_SWEEP_ENABLED is
+# SCRIPT_-prefixed aliases (shell-kind cron payloads): the bridge-native
+# shell-kind cron runner executes this script under `env -i` and rejects any
+# payload env var prefixed `BRIDGE_` (it requires `POLL_`/`SCRIPT_` prefixes —
+# see bridge-cron.py SHELL_PAYLOAD_ENV_PREFIXES). So the auto-registered
+# shell-kind picker-sweep cron carries SCRIPT_PICKER_SWEEP_{ENABLED,SELF,NOTIFY}.
+# We honor those as fallbacks. Precedence: an explicitly-set BRIDGE_* value
+# ALWAYS wins (preserves the OS-crontab contract and the existing regression
+# test); the SCRIPT_* alias only fills in when the BRIDGE_* var is unset.
+_PSW_ENABLED="${BRIDGE_PICKER_SWEEP_ENABLED:-${SCRIPT_PICKER_SWEEP_ENABLED:-}}"
+
+# host_profile=dev opt-out — only consulted when the effective ENABLED gate is
 # unset. Sourcing lib/bridge-host-profile.sh gives us `bridge_host_profile_is_dev`,
 # which reads $BRIDGE_HOME/state/install/host-profile.json directly without
 # pulling in the full bridge lib chain.
-if [[ -z "${BRIDGE_PICKER_SWEEP_ENABLED:-}" ]]; then
+if [[ -z "$_PSW_ENABLED" ]]; then
     if [[ -r "$BRIDGE_HOME/lib/bridge-host-profile.sh" ]]; then
         # shellcheck source=/dev/null
         source "$BRIDGE_HOME/lib/bridge-host-profile.sh"
@@ -99,8 +119,8 @@ if [[ -z "${BRIDGE_PICKER_SWEEP_ENABLED:-}" ]]; then
     fi
 fi
 
-if [[ "${BRIDGE_PICKER_SWEEP_ENABLED:-1}" != "1" ]]; then
-    _psw_log "BRIDGE_PICKER_SWEEP_ENABLED=0 (explicit opt-out) — picker-sweep skipped"
+if [[ "${_PSW_ENABLED:-1}" != "1" ]]; then
+    _psw_log "picker-sweep enabled gate is 0 (explicit opt-out via BRIDGE_PICKER_SWEEP_ENABLED / SCRIPT_PICKER_SWEEP_ENABLED) — picker-sweep skipped"
     exit 0
 fi
 
@@ -108,11 +128,13 @@ fi
 # Required runtime knobs. We do NOT fall back to BRIDGE_ADMIN_AGENT_ID even
 # when the roster is sourced — silent admin-as-default would re-introduce the
 # false-positive trap (admin's own pane discusses pickers in PR bodies / logs)
-# and operators must opt into self-skip + notify explicitly.
+# and operators must opt into self-skip + notify explicitly. SCRIPT_*-prefixed
+# aliases (shell-kind cron payload) are honored as fallbacks; an explicitly-set
+# BRIDGE_* value wins.
 # ---------------------------------------------------------------------------
 
-SELF_AGENT="${BRIDGE_PICKER_SWEEP_SELF:-}"
-NOTIFY_AGENT="${BRIDGE_PICKER_SWEEP_NOTIFY:-}"
+SELF_AGENT="${BRIDGE_PICKER_SWEEP_SELF:-${SCRIPT_PICKER_SWEEP_SELF:-}}"
+NOTIFY_AGENT="${BRIDGE_PICKER_SWEEP_NOTIFY:-${SCRIPT_PICKER_SWEEP_NOTIFY:-}}"
 
 if [[ -z "$SELF_AGENT" && -z "$NOTIFY_AGENT" ]]; then
     _psw_log "warn: BRIDGE_PICKER_SWEEP_SELF and BRIDGE_PICKER_SWEEP_NOTIFY both unset; running without self-skip or admin notification (log only)"
