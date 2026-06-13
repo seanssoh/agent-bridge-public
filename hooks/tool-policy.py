@@ -5395,6 +5395,42 @@ def _expand_env_split_string(toks: list[str]) -> list[str]:
     return out
 
 
+def _normalized_command_stages(text: str) -> "list[list[str]]":
+    """Yield the normalized shlex token-list for every separator-split stage.
+
+    Shared spelling-normalizer behind the `config set-env` and `agent
+    set-model`/`set-effort` attempt recognizers (issue #1734 / #1879). It applies
+    the SAME lexical normalizations both anti-spoof gates rely on so no verb grows
+    its own parallel parser:
+      • line-continuation join (`\\<newline>` / `\\<CR><newline>`) — bash removes
+        these before tokenizing (codex r6 #11742);
+      • separator split into independent command stages (`;`/`&&`/`||`/`|`/`&`);
+      • safe stderr-discard / fd-dup strip, then subshell-grouping paren
+        neutralization so a no-space `(agb …` token surfaces the inner verb;
+      • `env -S` / `--split-string` payload expansion so a packed verb triple
+        becomes visible again;
+      • leading bare `VAR=value` env-assignment strip (per-command env override) —
+        prefix COMMANDS are deliberately NOT stripped (the canonical-shape gate in
+        each caller denies them uniformly).
+    Unparseable stages are skipped. Callers scan the returned token lists for
+    their own verb spelling at ANY index.
+    """
+    text = text.replace("\\\r\n", "").replace("\\\n", "")
+    stages: list[list[str]] = []
+    for stage in _COMMAND_OPERATOR_RE.split(text):
+        scan = _SAFE_REDIRECT_RE.sub(" ", stage)
+        scan = scan.replace("(", " ").replace(")", " ")
+        try:
+            toks = shlex.split(scan, posix=True, comments=False)
+        except ValueError:
+            continue
+        toks = _expand_env_split_string(toks)
+        while toks and "=" in toks[0] and _LEADING_ENV_ASSIGN_RE.match(toks[0] + " "):
+            toks.pop(0)
+        stages.append(toks)
+    return stages
+
+
 def _config_set_env_attempt_present(text: str) -> bool:
     """True iff ANY command stage of *text* is a `config set-env` attempt —
     recognition by ALLOWLIST INVERSION (patch r3 #11718, codex r2 #11717 / r3
@@ -5403,10 +5439,11 @@ def _config_set_env_attempt_present(text: str) -> bool:
     Enumerating the bad prefixes (`env`/`exec`/`nice`/… plus `env -i`/`env --`
     options, plus the shell reserved words `time`/`!` and the `(`/`{` grouping
     metacharacters) is whack-a-mole against shell grammar. Instead we RECOGNIZE
-    broadly: in every separator-split stage, after expanding any `env -S` payload
-    and stripping ONLY leading bare `VAR=value` env-assignments (NOT prefix
-    commands), we look at ANY position in the shlex token list for either spelling
-    that reaches the wrapper:
+    broadly: in every separator-split stage (normalized by
+    `_normalized_command_stages`, which expands any `env -S` payload and strips
+    ONLY leading bare `VAR=value` env-assignments, NOT prefix commands), we look at
+    ANY position in the shlex token list for either spelling that reaches the
+    wrapper:
       • the canonical-wrapper triple ``(agb|agent-bridge) config set-env``, or
       • the direct-script spelling ``bridge-config.py set-env`` (codex r3 #11726
         — `set-env` has no protected-path argv backstop, so a direct
@@ -5428,34 +5465,10 @@ def _config_set_env_attempt_present(text: str) -> bool:
     is wrapper-side identity (bridge-config.py must not trust env-declared
     admin/source); the hook is defense-in-depth, not the boundary.
     """
-    # Bash removes line continuations (`\<newline>`, `\<CR><newline>`) BEFORE
-    # tokenizing, so `set-\<NL>env` runs as the argv token `set-env` — but
-    # neither the substring prefilter nor shlex collapse them (codex r6 #11742).
-    # Join them first (same lexical-normalization family as the r5 quote/escape
-    # strip) so the spelling is normalized for both the prefilter and the scan.
-    text = text.replace("\\\r\n", "").replace("\\\n", "")
+    # Substring prefilter (quote/escape-stripped so `set"-"env` etc. still trip).
     if "set-env" not in _SHELL_QUOTE_ESCAPE_RE.sub("", text):
         return False
-    for stage in _COMMAND_OPERATOR_RE.split(text):
-        scan = _SAFE_REDIRECT_RE.sub(" ", stage)
-        # Neutralize subshell grouping parens. bash needs NO space after `(`
-        # (`(agb config set-env)` is a valid subshell), but shlex glues `(agb`
-        # into one token and the verb triple would hide. Replacing `(`/`)` with
-        # spaces exposes the inner command for the scan; the canonical-shape gate
-        # still sees the original parens in `sanitized` and denies it.
-        scan = scan.replace("(", " ").replace(")", " ")
-        try:
-            toks = shlex.split(scan, posix=True, comments=False)
-        except ValueError:
-            continue
-        # `env -S '<packed>'` re-parses its payload into tokens at runtime —
-        # expand it so a hidden verb triple/spelling becomes visible.
-        toks = _expand_env_split_string(toks)
-        # Strip ONLY leading bare `VAR=value` env-assignments (a per-command env
-        # override the shell applies before the verb). Do NOT strip prefix
-        # commands here — the canonical-shape gate below rejects them instead.
-        while toks and "=" in toks[0] and _LEADING_ENV_ASSIGN_RE.match(toks[0] + " "):
-            toks.pop(0)
+    for toks in _normalized_command_stages(text):
         # Either recognized spelling at ANY index → recognized attempt.
         for i in range(len(toks) - 1):
             leaf = toks[i].rsplit("/", 1)[-1]
@@ -5467,6 +5480,57 @@ def _config_set_env_attempt_present(text: str) -> bool:
                     and leaf in {"agent-bridge", "agb"}
                     and toks[i + 1] == "config"
                     and toks[i + 2] == "set-env"):
+                return True
+    return False
+
+
+# Issue #1879 — `agent set-model` / `agent set-effort` exact-shape, anti-spoof
+# gate. These verbs write BRIDGE_AGENT_MODEL / BRIDGE_AGENT_EFFORT into the
+# #341-protected agent-roster.local.sh through the audited
+# `roster materialize-fields` writer; the wrapper trusts
+# `bridge_agent_update_caller_source`, which accepts an explicit
+# `BRIDGE_CALLER_SOURCE=operator-tui|operator-trusted-id` env override
+# (lib/bridge-agent-update.sh). That is safe ONLY if the hook denies an
+# agent-authored env-prefix spoof of that very caller-source — but, unlike
+# `config set`, these verbs name NO protected path in argv, so the protected-path
+# gate never fires and `_admin_bridge_verb_check` (auth/escalate/a2a only) falls
+# through to a silent allow. This is the same hole `config set-env` closes, so we
+# mirror its exact-shape anti-spoof envelope verbatim (one shared
+# normalizer/recognizer, NOT a parallel parser).
+_AGENT_SET_LAUNCH_FIELD_VERBS = frozenset({"set-model", "set-effort"})
+
+
+def _agent_set_launch_field_attempt_present(text: str) -> bool:
+    """True iff ANY command stage of *text* is an `agent set-model`/`set-effort`
+    attempt — same ALLOWLIST-INVERSION recognition as `config set-env`.
+
+    Reuses `_normalized_command_stages` (shared normalizer) and scans for either
+    spelling that reaches the roster writer:
+      • the canonical-wrapper quadruple ``(agb|agent-bridge) agent set-model`` /
+        ``… agent set-effort`` (the `agent` word routes to bridge-agent.sh), or
+      • the direct-script spelling ``bridge-agent.sh set-model`` / ``… set-effort``
+        (no protected-path argv backstop, so a direct
+        `bash bridge-agent.sh set-model …` would otherwise bypass the hook).
+    Every smuggle shape `config set-env` covers (leading/`env`/`env -S`/grouping/
+    separator/quote-concat/line-continuation prefix) resurfaces the spelling here
+    too, so the caller's canonical-shape gate denies it uniformly.
+    """
+    # Substring prefilter (quote/escape-stripped, like config set-env's).
+    stripped = _SHELL_QUOTE_ESCAPE_RE.sub("", text)
+    if "set-model" not in stripped and "set-effort" not in stripped:
+        return False
+    for toks in _normalized_command_stages(text):
+        for i in range(len(toks) - 1):
+            leaf = toks[i].rsplit("/", 1)[-1]
+            # direct-script spelling: `[bash] bridge-agent.sh set-model|set-effort`
+            if (leaf == "bridge-agent.sh"
+                    and toks[i + 1] in _AGENT_SET_LAUNCH_FIELD_VERBS):
+                return True
+            # canonical-wrapper quadruple: `(agb|agent-bridge) agent set-*`
+            if (i + 2 < len(toks)
+                    and leaf in {"agent-bridge", "agb"}
+                    and toks[i + 1] == "agent"
+                    and toks[i + 2] in _AGENT_SET_LAUNCH_FIELD_VERBS):
                 return True
     return False
 
@@ -5597,6 +5661,140 @@ def _config_set_env_check(
     return True, None
 
 
+def _agent_set_launch_field_check(
+    text: str,
+    agent: str,
+    tool_input: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """Exact-shape, anti-spoof gate for `(agent-bridge|agb) agent set-model` /
+    `… set-effort` (and the direct `bridge-agent.sh set-model|set-effort`).
+
+    Returns ``(allowed, deny_reason)`` exactly like `_config_set_env_check`:
+    - ``(True, None)``  — sanctioned shape (no agent-authored env-prefix spoof);
+      the wrapper's #341 caller-source trust gate + audit row apply.
+    - ``(False, str)``  — recognized attempt but rejected (env-assignment spoof,
+      shell embedding/redirect/separator, non-canonical prefix shape). Returned
+      so a spoof/smuggle cannot fall through to a silent allow at the peer/shared
+      gate.
+    - ``(False, None)`` — not one of these verbs at all; fall through unchanged.
+
+    Mirrors the `config set-env` envelope verbatim (issue #1879): these verbs name
+    NO protected path in argv, so this exact-shape + anti-spoof gate is the sole
+    hook boundary against an agent forging `BRIDGE_CALLER_SOURCE=operator-tui`
+    in front of the roster-writing wrapper. The wrapper's own #341 caller-source
+    gate is defense-in-depth; the value allowlist + shlex.quote launch-token live
+    on the writer side and are unchanged here.
+    """
+    # RECOGNITION: is any command stage a set-model/set-effort invocation? If
+    # not, not our verb — fall through. From here every exit is an explicit
+    # allow/deny (never a silent fall-through).
+    if not _agent_set_launch_field_attempt_present(text):
+        return False, None
+
+    # TEETH 1 — leading `VAR=value` env-assignment prefix is a spoof of the
+    # wrapper's trust env (`BRIDGE_CALLER_SOURCE` / `BRIDGE_AGENT_ID`). Deny —
+    # same reason class as config set-env's env_assignment_prefix_spoof.
+    if _has_leading_env_assignment(text):
+        _emit_agent_set_launch_field_denied_audit(
+            agent,
+            text=text,
+            tool_input=tool_input,
+            reason="env_assignment_prefix_spoof",
+        )
+        return False, (
+            "agent-bridge agent set-model/set-effort: a leading VAR=value "
+            "env-assignment prefix is not allowed (anti-spoof of "
+            "BRIDGE_CALLER_SOURCE / BRIDGE_AGENT_ID)"
+        )
+
+    # TEETH 2 — shell embeddings / redirections / separators on a recognized
+    # attempt (the wrapper cannot guard a file the shell opens or a second
+    # piped command). DENY uniformly.
+    if _command_has_shell_embedding(text):
+        _emit_agent_set_launch_field_denied_audit(
+            agent, text=text, tool_input=tool_input, reason="shell_embedding"
+        )
+        return False, (
+            "agent-bridge agent set-model/set-effort: shell embeddings "
+            "($(...), backticks, <(...), heredoc) are not allowed"
+        )
+    sanitized = _SAFE_REDIRECT_RE.sub(" ", text)
+    if "<" in sanitized or ">" in sanitized:
+        _emit_agent_set_launch_field_denied_audit(
+            agent, text=text, tool_input=tool_input, reason="io_redirection"
+        )
+        return False, (
+            "agent-bridge agent set-model/set-effort: I/O redirection is not "
+            "allowed"
+        )
+    if _COMMAND_OPERATOR_RE.search(sanitized):
+        _emit_agent_set_launch_field_denied_audit(
+            agent, text=text, tool_input=tool_input, reason="command_separator"
+        )
+        return False, (
+            "agent-bridge agent set-model/set-effort: command separators "
+            "(;, |, &, &&, ||) are not allowed"
+        )
+
+    # SHAPE — the ONLY allowed forms are a single stand-alone stage whose
+    # leading tokens are the bare canonical-wrapper quadruple
+    # `(agb|agent-bridge) agent set-model|set-effort` OR the direct
+    # `[bash] bridge-agent.sh set-model|set-effort`. TEETH 1/2 already removed a
+    # leading bare VAR=, separators, embeddings and redirects, so anything else
+    # still standing (a shell keyword, grouping metacharacter, or
+    # `env`/`exec`/… prefix before the verb) is a recognized-but-non-canonical
+    # attempt and is DENIED — these verbs have NO protected-path argv backstop.
+    try:
+        tokens = shlex.split(sanitized, posix=True, comments=False)
+    except ValueError:
+        _emit_agent_set_launch_field_denied_audit(
+            agent, text=text, tool_input=tool_input, reason="unparseable"
+        )
+        return False, "agent-bridge agent set-model/set-effort: unparseable command"
+    leaf0 = tokens[0].rsplit("/", 1)[-1] if tokens else ""
+    canonical_wrapper = (
+        len(tokens) >= 3
+        and leaf0 in {"agent-bridge", "agb"}
+        and tokens[1] == "agent"
+        and tokens[2] in _AGENT_SET_LAUNCH_FIELD_VERBS
+    )
+    # Direct-script spelling tolerates a leading `bash`/`bash -x …` interpreter
+    # in front of the `bridge-agent.sh set-*` pair (the canonical way the wrapper
+    # itself invokes it: `exec "$BRIDGE_BASH_BIN" bridge-agent.sh …`).
+    direct_script = False
+    for i in range(len(tokens) - 1):
+        if (tokens[i].rsplit("/", 1)[-1] == "bridge-agent.sh"
+                and tokens[i + 1] in _AGENT_SET_LAUNCH_FIELD_VERBS):
+            # Only an interpreter (`bash`/`sh`/`python`-free) prefix is tolerated:
+            # any non-`bash`/`sh` leading token would itself be a prefix command
+            # the wrapper cannot guard, so require the script to be token[0] or
+            # immediately preceded only by a bash/sh interpreter chain.
+            prefix_ok = all(
+                tokens[j].rsplit("/", 1)[-1] in {"bash", "sh"}
+                or tokens[j].startswith("-")
+                for j in range(i)
+            )
+            if prefix_ok:
+                direct_script = True
+            break
+    if not (canonical_wrapper or direct_script):
+        _emit_agent_set_launch_field_denied_audit(
+            agent, text=text, tool_input=tool_input, reason="non_canonical_shape"
+        )
+        return False, (
+            "agent-bridge agent set-model/set-effort: only the exact "
+            "`(agb|agent-bridge) agent set-model|set-effort <agent> <value>` "
+            "form is allowed — no leading prefix command, shell keyword, "
+            "grouping, or env wrapper"
+        )
+
+    # Sanctioned shape. The wrapper layers its own #341 caller-source trust gate
+    # (a non-operator caller is rejected there) + before/after-sha256 audit, so
+    # the hook ALLOWS the clean shape and records the allow decision.
+    _emit_agent_set_launch_field_allowed_audit(agent, text=text, tool_input=tool_input)
+    return True, None
+
+
 def _emit_config_set_env_allowed_audit(
     agent: str,
     *,
@@ -5651,6 +5849,62 @@ def _emit_config_set_env_denied_audit(
         )
     write_audit(
         "tool_policy_config_set_env_denied",
+        agent or "unknown",
+        detail,
+    )
+
+
+def _emit_agent_set_launch_field_allowed_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+) -> None:
+    """Audit row for a sanctioned `agent set-model`/`set-effort` hook allow
+    (issue #1879). Mirrors `_emit_config_set_env_allowed_audit`; the wrapper
+    emits its own before/after-hash `system_config_mutation` row on apply, this
+    row records the HOOK's allow decision.
+    """
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "verb": "agent set-model/set-effort",
+        "sample": _redact_credential_token_values(truncate_text(text, 240)),
+    }
+    if tool_input is not None:
+        detail["summary"] = _redact_credential_summary(
+            tool_input_summary("Bash", tool_input)
+        )
+    write_audit(
+        "tool_policy_agent_set_launch_field_allowed",
+        agent or "unknown",
+        detail,
+    )
+
+
+def _emit_agent_set_launch_field_denied_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+    reason: str,
+) -> None:
+    """Audit row for a denied `agent set-model`/`set-effort` attempt (issue
+    #1879). Mirrors `_emit_config_set_env_denied_audit`; `reason` records the
+    specific deny (`env_assignment_prefix_spoof` / `non_canonical_shape` / …) so
+    operators can grep spoof attempts and the smoke can pin the shape.
+    """
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "verb": "agent set-model/set-effort",
+        "reason": reason,
+        "sample": _redact_credential_token_values(truncate_text(text, 240)),
+    }
+    if tool_input is not None:
+        detail["summary"] = _redact_credential_summary(
+            tool_input_summary("Bash", tool_input)
+        )
+    write_audit(
+        "tool_policy_agent_set_launch_field_denied",
         agent or "unknown",
         detail,
     )
@@ -7863,6 +8117,21 @@ def protected_alias_reason(
         return None
     if set_env_deny is not None:
         return set_env_deny
+    # Issue #1879: the `agent set-model` / `agent set-effort` exact-shape,
+    # anti-spoof gate. Same rationale as `config set-env` above — these verbs
+    # write the #341-protected roster through the audited materialize-fields
+    # writer but name NO protected path in argv, so a forged
+    # `BRIDGE_CALLER_SOURCE=operator-tui …` prefix would otherwise fall through
+    # to a silent allow and let any agent change any agent's model/effort. The
+    # sanctioned shape is allowed (the wrapper's own caller-source gate applies);
+    # an agent-authored env-prefix spoof / smuggle is denied explicitly.
+    set_field_allowed, set_field_deny = _agent_set_launch_field_check(
+        text, agent, tool_input
+    )
+    if set_field_allowed:
+        return None
+    if set_field_deny is not None:
+        return set_field_deny
     if _bash_argv_references_path(text, roster_local_path()):
         if read_intent:
             # Issue #1690 r4 FIX 2: an unresolved path-spelling expansion
