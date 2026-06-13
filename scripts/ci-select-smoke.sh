@@ -149,6 +149,19 @@ add_required 1820-iso-reconcile-permission
 # rows + (env fallback) the transient stale-group window. In the full static
 # suite so any reconcile/watchdog/iso edit re-runs the guard.
 add_required 1820-rc4-iso-stale-group-preflight
+# Issue #1820 rc4 gate-2 (#13364, patch-dev real-Linux rig): the rc4 file-level
+# iso owner-only skip was authorized by a single HOST-WIDE --iso-host boolean, so
+# on a MIXED iso/shared host a SHARED agent's per-file PermissionError got
+# silently downgraded to a file-owner-only iso skip instead of surfacing the
+# required warning. The fix replaces the host-wide gate with a PER-AGENT iso set
+# (--iso-agents, built from the same roster predicate the preflight uses —
+# effective OR requested linux-user isolation, NOT requiring a resolved os_user
+# so the no-meta mdj case still downgrades). The downgrade fires ONLY for an
+# agent in that set; a shared agent's per-file PermissionError stays a warning +
+# data skip, byte-identical to main, even on a mixed host. This rig is the
+# mixed-host reproducer. In the full static suite so any reconcile/iso edit
+# re-runs the per-agent gate guard.
+add_required 1820-rc4-iso-mixed-host-skip
 # Issue #1820 rc4 supplement (cm-prod #7277): the watchdog's broken-symlink scan
 # walks the DATA-TREE MIRROR workdir; for an original anomaly agent whose mirror
 # render is incomplete the `.claude/settings.json -> settings.effective.json`

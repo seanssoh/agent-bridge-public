@@ -35,14 +35,18 @@
 #               mode returns 10 on stale, 0 on fresh.
 #   FILE      — the reconcile file-level skip: an iso agent with a genuine 0600
 #               owner-only memory file (chmod 000 file = non-root unreadable
-#               stand-in) records a STRUCTURED file-owner-only skip WITH --iso-host
-#               (0 warnings), while WITHOUT --iso-host it stays a warning. Its
-#               OTHER group-readable content reconciles normally (drift on the
-#               group-readable file, only the 0600 file skipped) — the home is
-#               ALWAYS traversed, never whole-skipped.
-#   NOMETA    — an iso agent ABSENT from the iso-map (the mdj no-agent-meta.env
-#               case) still gets the file-level skip WITH --iso-host — proving
-#               correctness does NOT depend on iso-map completeness.
+#               stand-in) records a STRUCTURED file-owner-only skip when it is IN
+#               the per-agent iso set (0 warnings), while with an EMPTY iso set it
+#               stays a warning. Its OTHER group-readable content reconciles
+#               normally (drift on the group-readable file, only the 0600 file
+#               skipped) — the home is ALWAYS traversed, never whole-skipped.
+#   NOMETA    — an iso agent ABSENT from the iso-MAP (the mdj no-agent-meta.env
+#               case) still gets the file-level skip when it is in the iso SET —
+#               proving correctness does NOT depend on iso-map completeness
+#               (membership is by rostered isolation, not a resolved os_user).
+#   gate-2 #13364: the file-level skip is gated by a PER-AGENT iso set, not a
+#               host-wide boolean — a SHARED agent's per-file PermissionError on a
+#               mixed host stays a warning (see 1820-rc4-iso-mixed-host-skip.sh).
 #   WD        — the watchdog downgrades a registry-classified permission_denied
 #               iso row into the auditable iso_skipped bucket (Linux), keeps a
 #               shared-mode denial a problem, downgrades NOTHING off Linux, and —
@@ -103,8 +107,13 @@ IS_ROOT=0
 
 run_engine() {
   # run_engine <bridge_home> <data_root> <agents_csv> <backup_root> \
-  #            [iso_host=0|1] [iso_agents_json_file=""]
-  local bh="$1" dr="$2" agents="$3" bkp="$4" iso_host="${5:-0}" iso_map="${6:-}"
+  #            [iso_set_csv=""] [iso_agents_json_file=""]
+  #
+  # gate-2 #13364: the 5th arg is now the PER-AGENT iso set (a CSV of the agents
+  # the file-level owner-only skip is authorized for) instead of a host-wide 0|1.
+  # An empty CSV omits --iso-agents entirely (shared-mode: every per-file
+  # PermissionError stays a warning).
+  local bh="$1" dr="$2" agents="$3" bkp="$4" iso_set_csv="${5:-}" iso_map="${6:-}"
   local -a argv=(
     "$ENGINE"
     --bridge-home "$bh"
@@ -114,7 +123,12 @@ run_engine() {
     --backup-root "$bkp"
   )
   [[ -n "$iso_map" ]] && argv+=(--iso-agents-json "$iso_map")
-  [[ "$iso_host" == "1" ]] && argv+=(--iso-host)
+  if [[ -n "$iso_set_csv" ]]; then
+    local _set_file
+    _set_file="$(mktemp "$SMOKE_TMP_ROOT/.iso-set-XXXXXX")"
+    printf '%s\n' "${iso_set_csv//,/$'\n'}" >"$_set_file"
+    argv+=(--iso-agents "$_set_file")
+  fi
   python3 "${argv[@]}" 2>/dev/null
 }
 
@@ -231,22 +245,22 @@ printf '{"isobot":"agent-bridge-isobot"}' >"$ISO_MAP"
 if [[ "$IS_ROOT" == "1" ]]; then
   smoke_log "FILE/NOMETA SKIP: running as root (chmod 000 file is root-readable; needs a non-root run or the gate-2 dual-UID rig)"
 else
-  # WITHOUT --iso-host: the 0600 file backup raises PermissionError → a warning
+  # WITHOUT the iso set: the 0600 file backup raises PermissionError → a warning
   # (shared-mode / off-iso contract preserved). The group-readable MEMORY.md is
   # still adopted (home traversed, never whole-skipped).
-  PRE_OUT="$(run_engine "$BH" "$DR" isobot "$SMOKE_TMP_ROOT/bkp-pre" 0 "$ISO_MAP")"
+  PRE_OUT="$(run_engine "$BH" "$DR" isobot "$SMOKE_TMP_ROOT/bkp-pre" "" "$ISO_MAP")"
   printf '%s' "$PRE_OUT" >"$SMOKE_TMP_ROOT/file-pre.json"
   read -r F_ERRNO _ _ _ _ F_DRIFT < <(python3 "$PROBE" "$SMOKE_TMP_ROOT/file-pre.json" isobot "$V2_MEM" "$V2_BASELINE_PRE")
-  [[ "$F_ERRNO" == "1" ]] || smoke_fail "FILE PRE FAIL: WITHOUT --iso-host a genuine 0600 owner-only file must surface as a warning, got none\n$PRE_OUT"
+  [[ "$F_ERRNO" == "1" ]] || smoke_fail "FILE PRE FAIL: with an EMPTY iso set a genuine 0600 owner-only file must surface as a warning, got none\n$PRE_OUT"
   [[ "$F_DRIFT" == "1" ]] || smoke_fail "FILE PRE FAIL: the group-readable MEMORY.md must STILL be reconciled (home traversed, not whole-skipped) — expected v2 drift, got drift 0\n$PRE_OUT"
-  smoke_log "FILE PRE PASS: off --iso-host the 0600 file is a warning; the group-readable MEMORY.md still reconciles (home traversed)"
+  smoke_log "FILE PRE PASS: with an empty iso set the 0600 file is a warning; the group-readable MEMORY.md still reconciles (home traversed)"
 
   # Reset v2 for the POST run.
   printf 'shared-line\n' >"$V2_MEM"
-  POST_OUT="$(run_engine "$BH" "$DR" isobot "$SMOKE_TMP_ROOT/bkp-post" 1 "$ISO_MAP")"
+  POST_OUT="$(run_engine "$BH" "$DR" isobot "$SMOKE_TMP_ROOT/bkp-post" isobot "$ISO_MAP")"
   printf '%s' "$POST_OUT" >"$SMOKE_TMP_ROOT/file-post.json"
   read -r P_ERRNO P_ISOCOUNT P_ACTION P_REASON P_AGENTSKIP P_DRIFT < <(python3 "$PROBE" "$SMOKE_TMP_ROOT/file-post.json" isobot "$V2_MEM" "$V2_BASELINE_PRE")
-  [[ "$P_ERRNO" == "0" ]] || smoke_fail "FILE POST FAIL: WITH --iso-host the 0600 file must NOT warn (structured skip), got a warning\n$POST_OUT"
+  [[ "$P_ERRNO" == "0" ]] || smoke_fail "FILE POST FAIL: with isobot in the iso set the 0600 file must NOT warn (structured skip), got a warning\n$POST_OUT"
   [[ "$P_ISOCOUNT" -ge 1 ]] || smoke_fail "FILE POST FAIL: expected >=1 isolation_v2_migration entry, got $P_ISOCOUNT\n$POST_OUT"
   [[ "$P_ACTION" == "skipped-iso-private" ]] || smoke_fail "FILE POST FAIL: expected action skipped-iso-private, got '$P_ACTION'\n$POST_OUT"
   [[ "$P_REASON" == "file-owner-only" ]] || smoke_fail "FILE POST FAIL: expected reason file-owner-only (per-FILE skip), got '$P_REASON'\n$POST_OUT"
@@ -256,9 +270,12 @@ else
 
   # =========================================================================
   # NOMETA — the cm-prod cosmax_sales_mdj case: an iso agent with NO iso-map
-  # entry (no agent-meta.env) still gets the file-level skip WITH --iso-host,
-  # proving correctness does NOT depend on iso-map completeness. We pass NO
-  # --iso-agents-json at all (empty map).
+  # entry (no agent-meta.env, so the {agent:os_user} map misses it) still gets
+  # the file-level skip — proving correctness does NOT depend on iso-MAP
+  # completeness. mdj IS in the per-agent iso SET (it is rostered-isolated, even
+  # without a resolved os_user — exactly what the wrapper's requested-isolation
+  # predicate captures), so the downgrade still fires. We pass NO
+  # --iso-agents-json (empty map) but DO put mdj in the iso set.
   # =========================================================================
   mkdir -p "$BH/agents/mdj/memory" "$DR/agents/mdj/home"
   printf 'shared-line\nv1-only-line\n' >"$BH/agents/mdj/MEMORY.md"
@@ -269,14 +286,14 @@ else
   MDJ_V2="$DR/agents/mdj/home/MEMORY.md"
   MDJ_BASE="$SMOKE_TMP_ROOT/mdj-baseline.md"
   cp "$MDJ_V2" "$MDJ_BASE"
-  # NO iso map (the no-meta case). --iso-host on (Linux iso host).
-  NOMETA_OUT="$(run_engine "$BH" "$DR" mdj "$SMOKE_TMP_ROOT/bkp-nometa" 1 "")"
+  # NO iso map (the no-meta case), but mdj IS in the iso set (rostered-isolated).
+  NOMETA_OUT="$(run_engine "$BH" "$DR" mdj "$SMOKE_TMP_ROOT/bkp-nometa" mdj "")"
   printf '%s' "$NOMETA_OUT" >"$SMOKE_TMP_ROOT/nometa.json"
   read -r N_ERRNO N_ISOCOUNT _N_ACTION N_REASON N_AGENTSKIP N_DRIFT < <(python3 "$PROBE" "$SMOKE_TMP_ROOT/nometa.json" mdj "$MDJ_V2" "$MDJ_BASE")
   [[ "$N_ERRNO" == "0" ]] || smoke_fail "NOMETA FAIL: the no-iso-map (mdj) agent's 0600 file must be a structured skip (0 warnings), got a warning\n$NOMETA_OUT"
-  [[ "$N_AGENTSKIP" == "1" ]] || smoke_fail "NOMETA FAIL: mdj must have a file-owner-only skip entry DESPITE being absent from the iso map (proves map-independence)\n$NOMETA_OUT"
+  [[ "$N_AGENTSKIP" == "1" ]] || smoke_fail "NOMETA FAIL: mdj must have a file-owner-only skip entry DESPITE being absent from the iso map (proves map-independence; membership is by the iso SET, not the os_user map)\n$NOMETA_OUT"
   [[ "$N_DRIFT" == "1" ]] || smoke_fail "NOMETA FAIL: mdj's group-readable MEMORY.md must STILL reconcile (home traversed) — drift expected, got 0\n$NOMETA_OUT"
-  smoke_log "NOMETA PASS: the no-agent-meta.env (mdj) agent gets the file-level skip with an EMPTY iso map — correctness independent of iso-map completeness"
+  smoke_log "NOMETA PASS: the no-agent-meta.env (mdj) agent gets the file-level skip with an EMPTY iso map but membership in the iso SET — correctness independent of iso-map completeness"
 fi
 
 # ===========================================================================
@@ -351,8 +368,18 @@ grep -q 'is_iso_group_stale_downgrade_row' "$WATCHDOG" \
   || smoke_fail "TRIP FAIL: watchdog lost the stale-group info-downgrade classifier"
 grep -q 'file-owner-only\|ISO_FILE_OWNER_ONLY_REASON' "$ENGINE" \
   || smoke_fail "TRIP FAIL: engine lost the file-level owner-only skip reason"
-grep -q '\-\-iso-host' "$ENGINE" \
-  || smoke_fail "TRIP FAIL: engine lost the --iso-host file-level gate"
+grep -q '\-\-iso-agents\b' "$ENGINE" \
+  || smoke_fail "TRIP FAIL: engine lost the per-agent --iso-agents file-level gate"
+# gate-2 #13364: the host-wide --iso-host boolean is GONE (replaced by the
+# per-agent set). Match the argparse arg / attribute (CODE), not prose mentions.
+if grep -Eq 'add_argument\(.*--iso-host|self\.iso_host\b|args\.iso_host\b' "$ENGINE"; then
+  smoke_fail "TRIP FAIL: the host-wide --iso-host gate is STILL live in the engine — gate-2 #13364 replaced it with the per-agent --iso-agents set"
+fi
+# Match live CODE tokens (the removed function call / flag-array), not the prose
+# comment that documents the replacement.
+if grep -Eq 'bridge_layout_v2_reconcile_iso_host\b|iso_host_flag|\(--iso-host\)' "$RECONCILE_SH"; then
+  smoke_fail "TRIP FAIL: the host-wide iso_host gate is STILL in the reconcile wrapper — gate-2 #13364 replaced it with the per-agent set"
+fi
 # The retracted whole-home belt must be GONE from both py + sh (item 3). Match
 # CODE tokens (the attribute / argparse arg / method def), not prose mentions of
 # the removed names in historical comments.
@@ -367,8 +394,10 @@ fi
 if grep -Eq '"reason": "iso-agent-private"|"iso_agent_private"' "$ENGINE"; then
   smoke_fail "TRIP FAIL: the rc3 #1876 up-front iso-map whole-agent skip (iso-agent-private) is STILL live in the engine — item 4 removal incomplete"
 fi
-grep -q 'bridge_layout_v2_reconcile_iso_host' "$RECONCILE_SH" \
-  || smoke_fail "TRIP FAIL: reconcile wrapper lost the file-level iso-host gate helper"
-smoke_log "TRIP PASS: preflight + file-level skip + watchdog fallback bound to source; whole-home belt + #1876 map-skip removed"
+grep -q 'bridge_layout_v2_reconcile_iso_agents_set' "$RECONCILE_SH" \
+  || smoke_fail "TRIP FAIL: reconcile wrapper lost the per-agent iso-agents-set builder"
+grep -q '\-\-iso-agents\b' "$RECONCILE_SH" \
+  || smoke_fail "TRIP FAIL: reconcile wrapper no longer passes the per-agent --iso-agents set to the engine"
+smoke_log "TRIP PASS: preflight + per-agent file-level skip + watchdog fallback bound to source; whole-home belt + #1876 map-skip + host-wide --iso-host removed"
 
 smoke_log "all 1820-rc4-iso-stale-group-preflight tests PASS"

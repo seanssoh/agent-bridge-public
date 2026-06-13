@@ -20,21 +20,23 @@
 # REMOVED — cm-prod proved the registry iso-map is INCOMPLETE (no-meta bots).
 # The reconcile now ALWAYS traverses the home and reconciles ALL group-readable
 # content; only a genuine 0600 owner-only file is structured-skipped at FILE
-# granularity (action skipped-iso-private, reason file-owner-only), gated by the
-# host-level --iso-host signal (Linux iso-v2 host), NOT by map membership. Off
-# an iso host the same per-file PermissionError stays a warning (shared-mode /
-# macOS byte-identical). The fencing/conflict DATA logic is byte-identical.
+# granularity (action skipped-iso-private, reason file-owner-only), gated by a
+# PER-AGENT iso set (gate-2 #13364 — the current agent is rostered linux-user
+# isolated), NOT a host-wide boolean and NOT by map membership. For a SHARED
+# agent (not in the set) the same per-file PermissionError stays a warning even
+# on a mixed iso/shared host (shared-mode / macOS byte-identical). The
+# fencing/conflict DATA logic is byte-identical.
 #
 # Asserts:
-#   T1 — engine WITH --iso-host over an UNREADABLE (chmod 000, simulating a
-#        0600-not-owner) iso agent-private MEMORY.md: NO Errno13 perm-warning, a
-#        structured isolation_v2_migration entry (skipped-iso-private /
-#        file-owner-only) is present, and the agent's v2 memory is UNTOUCHED
-#        (drift 0 — this agent has only the one unreadable memory file).
-#   T2 — CONTROL: the SAME unreadable fixture WITHOUT --iso-host reproduces the
+#   T1 — engine WITH isobot in the iso set over an UNREADABLE (chmod 000,
+#        simulating a 0600-not-owner) iso agent-private MEMORY.md: NO Errno13
+#        perm-warning, a structured isolation_v2_migration entry (skipped-iso-
+#        private / file-owner-only) is present, and the agent's v2 memory is
+#        UNTOUCHED (drift 0 — this agent has only the one unreadable memory file).
+#   T2 — CONTROL: the SAME unreadable fixture with an EMPTY iso set reproduces the
 #        cm-prod symptom (an Errno13 perm-warning, empty isolation_v2_migration)
-#        — proving the host-level iso signal is what classifies the boundary,
-#        not the chmod, and shared-mode stays a warning.
+#        — proving the per-agent iso set is what classifies the boundary, not the
+#        chmod, and shared-mode stays a warning.
 #   T3 — CONTROL (shared-mode, no iso host): a normal readable v1-superset agent
 #        reconciles exactly as before (prefix_superset_v1 preserved, empty
 #        isolation_v2_migration, no warnings) — the DATA path is unchanged.
@@ -96,8 +98,12 @@ smoke_assert_file_exists "$PROBE" "iso-reconcile probe helper"
 
 run_engine() {
   # run_engine <bridge_home> <data_root> <agents_csv> <backup_root> \
-  #            [iso_json] [iso_host=0|1]
-  local bh="$1" dr="$2" agents="$3" bkp="$4" iso="${5:-}" iso_host="${6:-0}"
+  #            [iso_json] [iso_set_csv=""]
+  #
+  # gate-2 #13364: the 6th arg is the PER-AGENT iso set (a CSV of agents the
+  # file-level owner-only skip is authorized for) instead of a host-wide 0|1.
+  # Empty => no --iso-agents (shared-mode: per-file PermissionError stays a warning).
+  local bh="$1" dr="$2" agents="$3" bkp="$4" iso="${5:-}" iso_set_csv="${6:-}"
   local -a argv=(
     "$ENGINE"
     --bridge-home "$bh"
@@ -107,7 +113,12 @@ run_engine() {
     --backup-root "$bkp"
   )
   [[ -n "$iso" ]] && argv+=(--iso-agents-json "$iso")
-  [[ "$iso_host" == "1" ]] && argv+=(--iso-host)
+  if [[ -n "$iso_set_csv" ]]; then
+    local _set_file
+    _set_file="$(mktemp "$SMOKE_TMP_ROOT/.iso-set-XXXXXX")"
+    printf '%s\n' "${iso_set_csv//,/$'\n'}" >"$_set_file"
+    argv+=(--iso-agents "$_set_file")
+  fi
   python3 "${argv[@]}" 2>/dev/null
 }
 
@@ -140,13 +151,14 @@ UNREADABLE_FILE="$ISO_BH/agents/isobot/MEMORY.md"
 if [[ "$IS_ROOT" == "1" ]]; then
   smoke_log "T1/T2 SKIP: running as root (chmod 000 does not block root reads; needs a non-root run or a real iso install — see Linux re-gate)"
 else
-  # T1 — WITH --iso-host: the 0600 file is a structured file-level skip. The iso
-  # MAP is passed too (os_user annotation) but is NOT what suppresses the warning
-  # (the host signal is); the no-meta path is gated separately by the rc4 smoke.
-  T1_OUT="$(run_engine "$ISO_BH" "$ISO_DR" isobot "$SMOKE_TMP_ROOT/iso/bkp-with" "$ISO_MAP" 1)"
+  # T1 — WITH isobot in the iso set: the 0600 file is a structured file-level
+  # skip. The iso MAP is passed too (os_user annotation) but is NOT what
+  # suppresses the warning (the per-agent iso set is); the no-meta path is gated
+  # separately by the rc4 smoke.
+  T1_OUT="$(run_engine "$ISO_BH" "$ISO_DR" isobot "$SMOKE_TMP_ROOT/iso/bkp-with" "$ISO_MAP" isobot)"
   printf '%s' "$T1_OUT" >"$SMOKE_TMP_ROOT/iso/t1.json"
   read -r T1_ERRNO T1_ISOCOUNT T1_ACTION T1_DRIFT < <(probe_result "$SMOKE_TMP_ROOT/iso/t1.json" "$ISO_V2_MEM" "$ISO_V2_BASELINE")
-  [[ "$T1_ERRNO" == "0" ]] || smoke_fail "T1 FAIL: an Errno13 perm-warning was emitted WITH --iso-host (expected none)\n$T1_OUT"
+  [[ "$T1_ERRNO" == "0" ]] || smoke_fail "T1 FAIL: an Errno13 perm-warning was emitted WITH isobot in the iso set (expected none)\n$T1_OUT"
   [[ "$T1_ISOCOUNT" == "1" ]] || smoke_fail "T1 FAIL: expected exactly 1 isolation_v2_migration entry, got $T1_ISOCOUNT\n$T1_OUT"
   [[ "$T1_ACTION" == "skipped-iso-private" ]] || smoke_fail "T1 FAIL: expected action skipped-iso-private, got '$T1_ACTION'\n$T1_OUT"
   [[ "$T1_DRIFT" == "0" ]] || smoke_fail "T1 FAIL: iso agent's v2 memory DRIFTED (must be untouched / drift 0)"
@@ -155,16 +167,16 @@ else
   smoke_log "T1 PASS: iso agent's 0600 file file-level skipped — no Errno13, structured isolation_v2_migration(skipped-iso-private/file-owner-only), v2 memory drift 0"
 
   # -------------------------------------------------------------------------
-  # T2 — CONTROL: SAME fixture WITHOUT --iso-host reproduces the cm-prod
+  # T2 — CONTROL: SAME fixture with an EMPTY iso set reproduces the cm-prod
   # symptom (Errno13 perm-warning + empty isolation_v2_migration) — shared-mode
   # / off-iso contract: a per-file PermissionError stays a warning.
   # -------------------------------------------------------------------------
   T2_OUT="$(run_engine "$ISO_BH" "$ISO_DR" isobot "$SMOKE_TMP_ROOT/iso/bkp-without")"
   printf '%s' "$T2_OUT" >"$SMOKE_TMP_ROOT/iso/t2.json"
   read -r T2_ERRNO T2_ISOCOUNT _T2A _T2D < <(probe_result "$SMOKE_TMP_ROOT/iso/t2.json" "$ISO_V2_MEM" "$ISO_V2_BASELINE")
-  [[ "$T2_ERRNO" == "1" ]] || smoke_fail "T2 FAIL: WITHOUT --iso-host the controller-blind read should still raise Errno13 (the symptom the host signal classifies); got none\n$T2_OUT"
-  [[ "$T2_ISOCOUNT" == "0" ]] || smoke_fail "T2 FAIL: WITHOUT --iso-host there must be no isolation_v2_migration entry, got $T2_ISOCOUNT"
-  smoke_log "T2 PASS: control reproduces the cm-prod Errno13 symptom WITHOUT --iso-host (the host signal, not the chmod, classifies the boundary; shared-mode stays a warning)"
+  [[ "$T2_ERRNO" == "1" ]] || smoke_fail "T2 FAIL: with an EMPTY iso set the controller-blind read should still raise Errno13 (the symptom the per-agent set classifies); got none\n$T2_OUT"
+  [[ "$T2_ISOCOUNT" == "0" ]] || smoke_fail "T2 FAIL: with an EMPTY iso set there must be no isolation_v2_migration entry, got $T2_ISOCOUNT"
+  smoke_log "T2 PASS: control reproduces the cm-prod Errno13 symptom with an EMPTY iso set (the per-agent set, not the chmod, classifies the boundary; shared-mode stays a warning)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -216,12 +228,14 @@ grep -q 'skipped-iso-private' "$ENGINE" \
   || smoke_fail "T5 FAIL: engine lost the graceful-skip (skipped-iso-private) iso branch"
 grep -q 'file-owner-only\|ISO_FILE_OWNER_ONLY_REASON' "$ENGINE" \
   || smoke_fail "T5 FAIL: engine lost the rc4 FILE-level owner-only skip reason (item 4)"
-grep -q -- '--iso-host' "$ENGINE" \
-  || smoke_fail "T5 FAIL: engine lost the --iso-host file-level gate"
+grep -q -- '--iso-agents\b' "$ENGINE" \
+  || smoke_fail "T5 FAIL: engine lost the per-agent --iso-agents file-level gate"
 grep -q -- '--iso-agents-json' "$RECONCILE_SH" \
   || smoke_fail "T5 FAIL: wrapper no longer passes --iso-agents-json to the engine"
 grep -q 'bridge_layout_v2_reconcile_iso_agents_json' "$RECONCILE_SH" \
   || smoke_fail "T5 FAIL: wrapper lost the iso-agents-json builder"
-smoke_log "T5 PASS: static tripwires — engine file-level iso-skip + structured section + --iso-host gate + wrapper iso-agents-json wiring all present"
+grep -q 'bridge_layout_v2_reconcile_iso_agents_set' "$RECONCILE_SH" \
+  || smoke_fail "T5 FAIL: wrapper lost the per-agent iso-agents-set builder"
+smoke_log "T5 PASS: static tripwires — engine file-level iso-skip + structured section + per-agent --iso-agents gate + wrapper iso-agents-json/-set wiring all present"
 
 smoke_log "all 1820-iso-reconcile-permission tests PASS"

@@ -193,16 +193,28 @@ class Reconciler:
         # os_user (the cm-prod mdj case) is fine and never blocks the file-level
         # skip.
         self.iso_agents: dict[str, str] = self._load_iso_agents(args.iso_agents_json)
-        # File-level iso skip host gate (#1820 rc4, item 4). On a Linux iso-v2
-        # host a per-file PermissionError on an agent-private file is the EXPECTED
-        # owner-only (0600) boundary → a structured graceful-skip. Off such a host
-        # (shared-mode / macOS / non-iso) a per-file PermissionError is GENUINE
-        # and stays a warning (byte-identical to main). This is a FILE-LEVEL gate
-        # only — it never whole-home-skips an agent (the retracted rc4 belt did,
-        # removed in item 3). Passed host-level by the wrapper (Linux + at least
-        # one rostered agent requesting linux-user isolation), independent of
-        # iso-map completeness.
-        self.iso_host: bool = bool(args.iso_host)
+        # PER-AGENT iso set for the file-level owner-only skip (#1820 rc4, item 4
+        # + gate-2 #13364). On a Linux iso-v2 host a per-file PermissionError on
+        # an agent-private file is the EXPECTED owner-only (0600) boundary → a
+        # structured graceful-skip — but ONLY for an agent that is itself an
+        # effectively/requested-isolated linux-user agent. A SHARED agent's
+        # per-file PermissionError is GENUINE and MUST stay a warning even on a
+        # mixed iso/shared host.
+        #
+        # gate-2 #13364 fix: the prior signal was a single HOST-WIDE `--iso-host`
+        # boolean (true when ANY rostered agent requested linux-user isolation),
+        # which authorized the downgrade for EVERY agent on the host. On a mixed
+        # iso/shared host that silently downgraded a SHARED agent's PermissionError
+        # to file-owner-only instead of surfacing the required warning. The fix is
+        # a PER-AGENT set: the downgrade fires only when the CURRENT agent is in
+        # this set. The set is built by the wrapper from the SAME roster predicate
+        # the preflight uses (effective OR merely-requested linux-user isolation —
+        # NOT requiring a resolved os_user, so the mdj no-agent-meta.env case is
+        # still a member and still downgrades). Off an iso host (shared-mode /
+        # macOS / non-iso) the set is empty and EVERY per-file PermissionError
+        # stays a warning (byte-identical to main). Correctness does NOT depend on
+        # iso-map completeness — only on whether THIS agent is rostered-isolated.
+        self.iso_agents_set: set[str] = self._load_iso_agents_set(args.iso_agents)
         self.stamp = _now_stamp()
 
         self.copied: list[dict] = []
@@ -252,6 +264,35 @@ class Reconciler:
                 out[k] = v
         return out
 
+    @staticmethod
+    def _load_iso_agents_set(path_arg: str | None) -> set[str]:
+        """Load the PER-AGENT iso set (#1820 rc4 gate-2) from a file-as-argv path.
+
+        The file is a newline-separated list of agent ids that are rostered as
+        effectively/requested-isolated linux-user agents on this host — the set
+        the wrapper builds from ``bridge_agent_linux_user_isolation_effective`` /
+        requested isolation. Membership authorizes the file-level owner-only
+        PermissionError downgrade for THAT agent only; a non-member (shared)
+        agent's per-file PermissionError stays a warning.
+
+        File-as-argv (not inline) keeps the anti-deadlock contract (footgun #11).
+        A missing path, empty value, or unreadable/empty file means "no iso
+        agents" → every per-file PermissionError stays a warning, byte-identical
+        to a shared-mode host. Blank lines are ignored; ids are kept verbatim
+        (the roster composer constrains the charset)."""
+        if not path_arg:
+            return set()
+        try:
+            raw = Path(path_arg).expanduser().read_text(encoding="utf-8")
+        except OSError:
+            return set()
+        out: set[str] = set()
+        for line in raw.splitlines():
+            name = line.strip()
+            if name:
+                out.add(name)
+        return out
+
     # --- path helpers --------------------------------------------------------
     def _v1_agent_home(self, agent: str) -> Path:
         return self.bridge_home / "agents" / agent
@@ -276,15 +317,20 @@ class Reconciler:
         )
 
     # --- file-level iso owner-only skip (#1820 rc4, item 4 / A2) -------------
-    def _is_iso_file_permission_error(self, exc: BaseException) -> bool:
+    def _is_iso_file_permission_error(self, agent: str, exc: BaseException) -> bool:
         """True iff ``exc`` is a controller-side permission denial (PermissionError
-        / EACCES / EPERM) on a Linux iso-v2 host — i.e. a genuine 0600 owner-only
-        agent-private file the controller cannot read even with a fresh group
-        set. Off an iso host (shared-mode / macOS / non-iso) this is False, so a
-        per-file PermissionError there stays a warning (byte-identical to main —
-        we never blanket-swallow). If the common classifier failed to import we
-        conservatively treat NOTHING as an iso boundary (warning preserved)."""
-        if not self.iso_host:
+        / EACCES / EPERM) on a genuine 0600 owner-only agent-private file the
+        controller cannot read even with a fresh group set, AND ``agent`` is a
+        rostered effectively/requested-isolated linux-user agent (member of the
+        per-agent iso set).
+
+        gate-2 #13364: the gate is PER-AGENT, not host-wide. For a SHARED agent
+        (NOT in the iso set) this returns False even on a mixed iso/shared host,
+        so its per-file PermissionError stays a warning + data skip exactly as on
+        main (no over-skip). For an agent NOT in the set, or off an iso host
+        (empty set), or if the common classifier failed to import, this returns
+        False and the warning is preserved."""
+        if agent not in self.iso_agents_set:
             return False
         if _iso_is_permission_error is None:
             return False
@@ -334,13 +380,14 @@ class Reconciler:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
         except OSError as exc:
-            # File-level iso skip (#1820 rc4 item 4): a controller-side permission
-            # denial backing up an iso agent's 0600 owner-only file is the
-            # expected per-file boundary on a Linux iso-v2 host — record a
-            # structured file-level skip, not a "backup failed" warning. Off an
-            # iso host (or any non-permission OSError) it stays a warning,
+            # File-level iso skip (#1820 rc4 item 4 + gate-2 #13364): a
+            # controller-side permission denial backing up an iso agent's 0600
+            # owner-only file is the expected per-file boundary — record a
+            # structured file-level skip, not a "backup failed" warning. The gate
+            # is PER-AGENT: for a SHARED agent (not in the iso set), or off an iso
+            # host, or any non-permission OSError, it stays a warning,
             # byte-identical to before.
-            if self._is_iso_file_permission_error(exc):
+            if self._is_iso_file_permission_error(agent, exc):
                 self._record_iso_file_skip(agent, side, rel, exc)
             else:
                 self._warn(agent, f"backup failed for {side}:{rel}: {exc}")
@@ -724,16 +771,17 @@ class Reconciler:
             # reverse-reconcile.
             self._skip(agent, kind, rel, "absent_on_v1")
             return
-        # #1820 rc4 (item 4): a per-file PermissionError reading a genuine 0600
-        # owner-only iso file on a Linux iso-v2 host is a structured file-level
-        # graceful-skip (reason file-owner-only), NOT a data-skip / warning. Off
-        # an iso host the PermissionError is genuine and falls through to the
-        # legacy v1_unreadable data-skip (byte-identical to main). _read_bytes
-        # re-raises only permission errors; other OSErrors still return None.
+        # #1820 rc4 (item 4 + gate-2 #13364): a per-file PermissionError reading a
+        # genuine 0600 owner-only iso file is a structured file-level graceful-
+        # skip (reason file-owner-only), NOT a data-skip / warning — but ONLY when
+        # THIS agent is in the per-agent iso set. For a SHARED agent (not in the
+        # set) the PermissionError is genuine and falls through to the legacy
+        # v1_unreadable data-skip (byte-identical to main), even on a mixed host.
+        # _read_bytes re-raises only permission errors; other OSErrors return None.
         try:
             v1_bytes = _read_bytes(v1)
         except PermissionError as exc:
-            if self._is_iso_file_permission_error(exc):
+            if self._is_iso_file_permission_error(agent, exc):
                 self._record_iso_file_skip(agent, kind, rel, exc)
             else:
                 self._skip(agent, kind, rel, "v1_unreadable")
@@ -750,7 +798,7 @@ class Reconciler:
         try:
             v2_bytes = _read_bytes(v2)
         except PermissionError as exc:
-            if self._is_iso_file_permission_error(exc):
+            if self._is_iso_file_permission_error(agent, exc):
                 self._record_iso_file_skip(agent, kind, rel, exc)
             else:
                 self._skip(agent, kind, rel, "v2_unreadable")
@@ -996,19 +1044,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     # shared-mode behavior, byte-identical. The map may be incomplete (the
     # cm-prod mdj case) and correctness does NOT depend on its completeness.
     parser.add_argument("--iso-agents-json", default="")
-    # Host-level iso-v2 signal for the FILE-LEVEL owner-only skip (#1820 rc4,
-    # item 4). When set (Linux + at least one rostered agent requesting
-    # linux-user isolation), a per-FILE PermissionError on an agent-private file
-    # is recorded as a structured file-level graceful-skip (reason
-    # file-owner-only) instead of a warning. Absent/unset => shared-mode / macOS
-    # / non-iso: a per-file PermissionError stays a warning, byte-identical to
-    # main. This is a FILE-LEVEL gate ONLY — it NEVER whole-home-skips an agent
-    # (the retracted rc4 whole-home belt --host-iso-active is removed, item 3).
-    parser.add_argument(
-        "--iso-host",
-        action="store_true",
-        default=False,
-    )
+    # PER-AGENT iso set for the FILE-LEVEL owner-only skip (#1820 rc4 item 4 +
+    # gate-2 #13364). File-as-argv path (footgun #11) to a newline-separated list
+    # of agent ids that are rostered effectively/requested-isolated linux-user
+    # agents on this host (built by the wrapper from
+    # bridge_agent_linux_user_isolation_effective / requested isolation, NOT
+    # requiring a resolved os_user). A per-FILE PermissionError on an agent-
+    # private file is recorded as a structured file-level graceful-skip (reason
+    # file-owner-only) ONLY when the current agent is in this set; for a SHARED
+    # agent (not in the set) it stays a warning, byte-identical to main, even on
+    # a mixed iso/shared host. Empty/absent => shared-mode / macOS / non-iso: every
+    # per-file PermissionError stays a warning. This REPLACES the rc4 host-wide
+    # --iso-host boolean, which over-downgraded shared agents on a mixed host.
+    parser.add_argument("--iso-agents", default="")
     return parser.parse_args(argv)
 
 
