@@ -41,9 +41,13 @@ except ImportError:
 try:
     from bridge_iso_boundary import (
         is_expected_iso_permission_boundary as _iso_is_expected_boundary,
+        iso_boundary_applies as _iso_boundary_applies,
+        is_permission_error as _iso_is_permission_error,
     )
 except ImportError:
     _iso_is_expected_boundary = None
+    _iso_boundary_applies = None
+    _iso_is_permission_error = None
 
 MANAGED_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
@@ -657,6 +661,192 @@ def resolve_scan_path(
                     return candidate
             raise
     return default_path
+
+
+# #1820 rc4 supplement: the relative-path basenames the broken-link scan
+# emits for the Claude settings symlink in the data-tree MIRROR workdir.
+# ``bridge_isolation_v2`` materializes ``.claude/settings.json`` as a
+# symlink to ``settings.effective.json`` (see lib/bridge-hooks.sh). When the
+# data-tree mirror render is incomplete (an original anomaly agent whose
+# data-tree home never had ``settings.effective.json`` rendered — a 3B stub),
+# that mirror symlink dangles while the agent's REAL runtime HOME effective
+# settings are fully rendered and loaded. The broken-link scan classifies the
+# dangling mirror symlink as drift even though the bot is healthy and running
+# with all hooks/plugins from its runtime home. We filter that specific entry
+# out IFF the runtime HOME effective settings actually carry hooks/plugins.
+_SETTINGS_MIRROR_SYMLINK_BASENAMES = (
+    ".claude/settings.json",
+    "settings.json",
+)
+
+
+def _runtime_home_effective_settings_path(
+    meta: dict[str, str] | None,
+) -> Path | None:
+    """Resolve the agent's RUNTIME HOME effective Claude settings file
+    (#1820 rc4 supplement) — the ``settings.effective.json`` the agent
+    actually loads at runtime — NOT the data-tree mirror under
+    ``data/agents/<a>/workdir``.
+
+    Resolution (iso-aware, mirrors ``bridge_agent_claude_config_dir`` in
+    lib/bridge-agents.sh):
+      * iso agent (registry ``os_user`` non-empty): the agent's real OS
+        home ``<pw_dir>/.claude/`` where ``pw_dir`` comes from
+        ``pwd.getpwnam(os_user)`` (conventionally ``/home/agent-bridge-<a>``).
+      * shared / non-iso agent: the registry ``home`` identity-source root's
+        ``.claude/``.
+
+    Prefers ``settings.effective.json``; falls back to ``settings.json`` when
+    the effective file is absent. Returns ``None`` when no runtime home can be
+    resolved (no os_user AND no registry home) — the caller then leaves the
+    broken-link row untouched (legacy behavior).
+    """
+    meta = meta or {}
+    os_user = (meta.get("os_user") or "").strip()
+    home_root: Path | None = None
+    if os_user:
+        try:
+            import pwd as _pwd
+
+            pw_dir = _pwd.getpwnam(os_user).pw_dir
+        except (KeyError, OSError):
+            pw_dir = ""
+        if pw_dir:
+            home_root = Path(pw_dir)
+    if home_root is None:
+        home_str = (meta.get("home") or "").strip()
+        if home_str:
+            home_root = Path(home_str).expanduser()
+    if home_root is None:
+        return None
+    claude_dir = home_root / ".claude"
+    effective = claude_dir / "settings.effective.json"
+    if effective.exists():  # noqa: raw-pathlib-controller-only — runtime-home settings probe, wrapped by caller's iso-boundary catch
+        return effective
+    return claude_dir / "settings.json"
+
+
+def _settings_have_hooks_or_plugins(settings_path: Path) -> bool:
+    """True iff the JSON at ``settings_path`` carries a non-empty ``hooks``
+    block OR a non-empty ``enabledPlugins`` list (#1820 rc4 supplement).
+
+    A missing file / empty stub / unparseable JSON → False (the agent has no
+    discoverable hooks/plugins from this source). Read failures other than a
+    permission boundary are treated as "no hooks/plugins" (conservative — the
+    dangling mirror symlink stays flagged); a ``PermissionError`` is allowed to
+    propagate so the caller can classify it as the iso boundary.
+    """
+    try:
+        raw = settings_path.read_text(encoding="utf-8")  # noqa: raw-pathlib-controller-only — runtime-home settings probe, PermissionError handled by caller
+    except PermissionError:
+        raise
+    except (OSError, FileNotFoundError):
+        return False
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict) and any(hooks.values()):
+        return True
+    if isinstance(hooks, list) and hooks:
+        return True
+    plugins = data.get("enabledPlugins")
+    if isinstance(plugins, (list, dict)) and plugins:
+        return True
+    return False
+
+
+def _runtime_home_hooks_plugins_state(
+    meta: dict[str, str] | None,
+    platform: str,
+) -> str:
+    """Classify whether the agent's RUNTIME HOME effective settings carry
+    hooks/plugins (#1820 rc4 supplement). Returns one of:
+
+      * ``"has"``            — runtime HOME effective settings DO carry
+        hooks/plugins. The dangling data-tree mirror symlink is a pure
+        false-positive and is filtered out of the broken-link list.
+      * ``"none"``           — runtime HOME effective settings genuinely lack
+        hooks/plugins (or no runtime home could be resolved). The dangling
+        symlink stays a problem — don't blanket-suppress the check.
+      * ``"iso-unreadable"`` — reading the runtime HOME hit a permission
+        boundary on an effectively-iso agent (the controller can't read the
+        2770/0700 iso home, but the iso UID owns + loads it). Routed through
+        the common ``bridge_iso_boundary`` classifier → graceful iso-skip:
+        the dangling mirror symlink is NOT flagged (it would be a false
+        "no hooks/plugins" problem). Perms are NEVER relaxed.
+    """
+    meta = meta or {}
+    settings_path = _runtime_home_effective_settings_path(meta)
+    if settings_path is None:
+        return "none"
+    try:
+        return "has" if _settings_have_hooks_or_plugins(settings_path) else "none"
+    except PermissionError as exc:
+        # Controller can't read the runtime HOME. If this is an effectively-iso
+        # agent, that is the EXPECTED iso controller boundary (mechanism a of
+        # the common classifier — registry metadata only, no further fs read):
+        # downgrade to a graceful iso-skip rather than fabricating a
+        # "no hooks/plugins" problem. On a shared / non-iso / off-Linux host a
+        # PermissionError here is genuine and the symlink stays flagged.
+        is_iso = (
+            _iso_boundary_applies is not None
+            and _iso_is_permission_error is not None
+            and _iso_is_permission_error(exc)
+            and _iso_boundary_applies(
+                platform=platform,
+                isolation_mode=meta.get("isolation_mode", ""),
+                os_user=meta.get("os_user", ""),
+            )
+        )
+        return "iso-unreadable" if is_iso else "none"
+
+
+def filter_settings_mirror_false_positive(
+    broken_links: list[str],
+    meta: dict[str, str] | None,
+    platform: str,
+) -> list[str]:
+    """Drop the data-tree MIRROR ``settings.json`` dangling-symlink entry from
+    ``broken_links`` when it is a pure false-positive (#1820 rc4 supplement).
+
+    The entry is removed IFF the agent's RUNTIME HOME effective settings
+    actually carry hooks/plugins (``"has"``) OR the runtime HOME can't be read
+    across the iso boundary (``"iso-unreadable"`` → graceful skip). When the
+    runtime HOME genuinely lacks hooks/plugins (``"none"``) the entry is KEPT
+    so a truly-broken settings render is still surfaced. Every other broken
+    link (a genuinely dangling symlink elsewhere in the workdir) is untouched.
+    """
+    settings_rows = [
+        link
+        for link in broken_links
+        if _broken_link_is_settings_mirror(link)
+    ]
+    if not settings_rows:
+        return broken_links
+    state = _runtime_home_hooks_plugins_state(meta, platform)
+    if state == "none":
+        return broken_links
+    # "has" or "iso-unreadable": the dangling mirror symlink is not real drift.
+    return [link for link in broken_links if link not in settings_rows]
+
+
+def _broken_link_is_settings_mirror(link: str) -> bool:
+    """True iff a broken-link entry (``"<relpath> -> <target>"``) is the
+    Claude settings mirror symlink whose target is ``settings.effective.json``.
+    Matching on BOTH the source relpath basename AND the
+    ``settings.effective.json`` target keeps an unrelated dangling
+    ``settings.json`` (not the effective-settings mirror) a real problem."""
+    src = link.split(" -> ", 1)[0].strip()
+    target = link.split(" -> ", 1)[1].strip() if " -> " in link else ""
+    src_match = src in _SETTINGS_MIRROR_SYMLINK_BASENAMES or src.endswith(
+        "/.claude/settings.json"
+    ) or src.endswith("/settings.json")
+    target_match = "settings.effective.json" in target
+    return src_match and target_match
 
 
 @dataclass
@@ -1792,6 +1982,8 @@ def scan_agent(
     fresh_install_home_dir: Path | None = None,
     agent_home_dir: Path | None = None,
     broken_links_cache: dict[str, tuple[str, BrokenLinksResult]] | None = None,
+    registry_meta_entry: dict[str, str] | None = None,
+    host_platform: str = "",
 ) -> AgentWatch:
     # #1801 r2 (#12626): ``broken_links_cache`` is an optional per-pass dict
     # the agent-loop in ``main()`` threads through so a workdir shared by
@@ -1919,6 +2111,21 @@ def scan_agent(
         # redundant walk. ``None`` cache → unconditional scan (legacy callers).
         broken = _collect_broken_links_deduped(
             agent_dir, resolved_name, broken_links_cache
+        )
+        # #1820 rc4 supplement: the broken-link scan walks the DATA-TREE MIRROR
+        # workdir, not the agent's runtime HOME. For an original anomaly agent
+        # whose data-tree mirror render is incomplete, the
+        # ``.claude/settings.json -> settings.effective.json`` mirror symlink
+        # dangles even though the agent's REAL runtime HOME effective settings
+        # are fully rendered + loaded (all hooks/plugins active, bot healthy).
+        # Decide "does this agent have hooks/plugins" from the RUNTIME HOME
+        # effective settings, not from whether the mirror symlink resolves —
+        # and drop the false-positive entry when the runtime home HAS
+        # hooks/plugins (or its iso home can't be read by the controller, which
+        # routes through the common iso-boundary classifier → graceful skip).
+        # A runtime home that genuinely lacks hooks/plugins keeps the row.
+        broken.links = filter_settings_mirror_false_positive(
+            broken.links, registry_meta_entry, host_platform
         )
         # #1801: classify_status keys off the broken-link LIST only. A
         # truncated scan that found genuine broken links still drives a
@@ -2282,6 +2489,12 @@ def main() -> int:
     # pass (a fresh dict each ``main()`` invocation) so a workdir whose
     # contents change between ticks is always re-walked next tick.
     broken_links_cache: dict[str, tuple[str, BrokenLinksResult]] = {}
+    # #1820 rc4 supplement: host platform is needed inside the scan loop too
+    # (the settings-mirror false-positive filter routes a runtime-HOME read
+    # PermissionError through the common iso-boundary classifier, which is a
+    # no-op off Linux). Computed once and reused by the post-loop iso_skipped
+    # classification below.
+    host_platform = _host_platform()
     for path in scan_paths:
         agent_name = path.name
         agent_meta = registry_meta.get(agent_name, {})
@@ -2320,6 +2533,14 @@ def main() -> int:
                     # #1801 r2: per-pass dedupe cache (see above) so a shared
                     # workdir's broken-link walk is paid once per pass.
                     broken_links_cache=broken_links_cache,
+                    # #1820 rc4 supplement: registry metadata + host platform
+                    # so scan_agent can decide the settings-mirror dangling
+                    # symlink from the RUNTIME HOME effective settings (iso-aware
+                    # os_user/home resolution) instead of the data-tree mirror,
+                    # routing an iso-unreadable home through the common
+                    # iso-boundary classifier as a graceful skip.
+                    registry_meta_entry=agent_meta,
+                    host_platform=host_platform,
                 )
             )
         except (PermissionError, FileNotFoundError, OSError) as exc:
@@ -2426,7 +2647,7 @@ def main() -> int:
     # into the auditable ``iso_skipped`` bucket. Registry-classified — no
     # filesystem read of the (2770, Errno13-throwing) agent home. not_found /
     # os_error rows stay problems even on an iso agent.
-    host_platform = _host_platform()
+    # (``host_platform`` computed once before the scan loop above.)
     iso_skipped_agents = {
         item.agent
         for item in records

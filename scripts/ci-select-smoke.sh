@@ -146,6 +146,18 @@ add_required 1820-iso-reconcile-permission
 # topology is fixed to make the iso HOME unreadable (reproducing cm-prod). In
 # the full static suite so any reconcile/watchdog/iso edit re-runs the guard.
 add_required 1820-rc4-iso-home-unreadable-belt
+# Issue #1820 rc4 supplement (cm-prod #7277): the watchdog's broken-symlink scan
+# walks the DATA-TREE MIRROR workdir; for an original anomaly agent whose mirror
+# render is incomplete the `.claude/settings.json -> settings.effective.json`
+# mirror symlink dangles even though the agent's REAL runtime HOME effective
+# settings are fully rendered + loaded (all hooks/plugins active, bot healthy) —
+# a pure false-positive. The fix decides "has hooks/plugins" from the agent's
+# runtime HOME effective settings (iso-aware home resolution), filters the
+# dangling mirror symlink out IFF the runtime home HAS hooks/plugins (or its iso
+# home is unreadable → graceful skip via bridge_iso_boundary), and keeps the row
+# when the runtime home genuinely lacks them. In the full static suite so any
+# bridge-watchdog.py / bridge_iso_boundary.py edit re-runs the guard.
+add_required 1820-rc4-watchdog-settings-source
 # Issue #1835: bridge-queue-gateway.py's SOCKET-transport client preflight
 # (_read_inline_text) now applies the #1280 sudo-as-owner body-file fallback on
 # PermissionError, with an actionable iso-ownership error when it cannot apply.
