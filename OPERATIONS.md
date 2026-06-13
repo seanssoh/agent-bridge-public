@@ -1402,9 +1402,24 @@ agent-bridge cron create --agent <agent> ... --cron-default-model <model-id>
 `--effort` applies to **codex** targets only — it maps to codex's
 `-c model_reasoning_effort=<effort>`; raw `claude -p` has no effort flag, so the
 effort tier is resolved but unused on the Claude path. `agent-bridge cron show
-<job>` reports the resolved `model:` / `effort:` rows (`-` when unset). The
+<job>` reports the **effective** resolved `model:` / `effort:` rows each with a
+`(source: per-job|cron-default|fallback|unset)` annotation, plus the raw
+`per_job_model:` / `per_job_effort:` override (`-` when the job has no per-job
+value and relies on a default). `show` resolves the in-process legs (per-job →
+`cronDefaults` → `BRIDGE_CRON_DEFAULT_MODEL`); the roster leg
+(`BRIDGE_AGENT_MODEL`) resolves at **dispatch**, so an effective `unset` in
+`show` may still pick up a roster/env model when the job fires. The
 per-job/`--cron-default-*` flags are **not** carried through the iso-staging
 path (#1359); for an isolated agent, set them controller-side.
+
+If **no** stable source resolves at dispatch (per-job, `cronDefaults`, roster,
+and `BRIDGE_CRON_DEFAULT_MODEL` all unset), a **Claude** cron child **fails
+closed** instead of launching with no `--model` (which would inherit the
+interactive `.claude/settings.json` model — the exact #1880 coupling). The run
+is marked failed with an actionable summary naming the fix: set a cron default
+(`--cron-default-model <model>`) or a roster `BRIDGE_AGENT_MODEL[<agent>]`. This
+only affects Claude children with zero configured stable model; jobs/agents that
+already have any of the four sources are unaffected.
 
 Verify the no-inheritance contract:
 

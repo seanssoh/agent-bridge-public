@@ -48,7 +48,9 @@ agb cron update <job-id> --model ""             # clear -> fall back to cron-def
 agb cron create --agent <agent> ... --cron-default-model <model-id>   # default for jobs with no per-job model
 ```
 
-Resolution precedence (highest first): per-job `--model` -> `--cron-default-model` (jobs-file `cronDefaults`) -> roster `BRIDGE_AGENT_MODEL` -> `BRIDGE_CRON_DEFAULT_MODEL` env. `--effort` applies to **codex** targets only (raw `claude -p` has no effort flag). `agb cron show <job>` reports the resolved `model:` / `effort:` rows. The cron child NEVER reads the interactive `.claude/settings.json` for its model.
+Resolution precedence (highest first): per-job `--model` -> `--cron-default-model` (jobs-file `cronDefaults`) -> roster `BRIDGE_AGENT_MODEL` -> `BRIDGE_CRON_DEFAULT_MODEL` env. `--effort` applies to **codex** targets only (raw `claude -p` has no effort flag). `agb cron show <job>` reports the **effective** resolved `model:` / `effort:` rows with their `(source: per-job|cron-default|fallback|unset)`, plus the raw `per_job_model:` / `per_job_effort:` override. `show` resolves the in-process legs (per-job → cron-default → `BRIDGE_CRON_DEFAULT_MODEL`); the roster leg resolves at **dispatch** (bash), so an effective `unset` may still pick up a roster/env value when the job actually fires. The cron child NEVER reads the interactive `.claude/settings.json` for its model.
+
+If **no** stable source resolves (per-job, `cronDefaults`, roster, and `BRIDGE_CRON_DEFAULT_MODEL` all unset), a **Claude** cron child **fails closed** rather than spawning unmodeled (which would inherit the interactive `.claude/settings.json` model — the #1880 coupling). The run is marked failed with an actionable error naming the fix: set `--cron-default-model <model>` or a roster `BRIDGE_AGENT_MODEL[<agent>]`.
 
 ## CLI Help
 

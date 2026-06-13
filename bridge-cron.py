@@ -62,7 +62,24 @@ def apply_cron_defaults(raw_payload, *, model=_UNSET, effort=_UNSET):
     changed (so the caller can decide whether to rewrite the file).
     """
     changed = False
-    defaults = dict(raw_payload.get("cronDefaults") or {})
+    # #1880 r2 (P2): this runs on EVERY create/update, even when no
+    # --cron-default-* flag is set (both args default to _UNSET). A malformed
+    # cronDefaults (non-dict, e.g. a stray string) must not blow up an
+    # unrelated create/update with a generic `dict()` TypeError/ValueError.
+    # When the caller is NOT updating defaults, treat a non-dict cronDefaults
+    # as empty and leave it untouched. When the caller IS updating defaults,
+    # raise a focused validation error that points at the offending field.
+    raw_defaults = raw_payload.get("cronDefaults")
+    updating_defaults = model is not _UNSET or effort is not _UNSET
+    if raw_defaults is not None and not isinstance(raw_defaults, dict):
+        if updating_defaults:
+            raise ValueError(
+                "cronDefaults in the jobs file is not an object "
+                f"(got {type(raw_defaults).__name__}); cannot update "
+                "cron-default model/effort until it is a valid object or removed"
+            )
+        return False
+    defaults = dict(raw_defaults or {})
     for key, value in (("model", model), ("effort", effort)):
         if value is _UNSET:
             continue
@@ -545,7 +562,43 @@ def is_error_record(record):
     return record["consecutive_errors"] > 0 or record["last_status"] not in ("-", "ok", "success", "deferred")
 
 
-def build_job_record(job):
+def resolve_effective_model_effort(job, cron_defaults):
+    """Resolve the EFFECTIVE cron-child model/effort + source for display (#1880).
+
+    Mirrors the runner's precedence as far as is resolvable in-process for the
+    inventory/show surface: per-job → cron-default (``cronDefaults``) → env
+    fallback (``BRIDGE_CRON_DEFAULT_MODEL`` / ``BRIDGE_CRON_DEFAULT_EFFORT``).
+    The ROSTER leg (``BRIDGE_AGENT_MODEL``) is resolved by the runner at
+    dispatch from the bash roster stack and is intentionally NOT sourced here
+    (show must stay fast and side-effect-free); when nothing resolves locally
+    the source is reported as ``unset`` and the effective value is None, with
+    the understanding that a roster/env value may still apply at dispatch.
+
+    Returns ``(model, model_source, effort, effort_source)`` — model/effort
+    None when unresolved; source one of ``per-job`` / ``cron-default`` /
+    ``fallback`` / ``unset``. The interactive ``.claude/settings.json`` is
+    NEVER consulted.
+    """
+    defaults = cron_defaults if isinstance(cron_defaults, dict) else {}
+
+    def _pick(field, env_var):
+        per_job = job.get(field)
+        if isinstance(per_job, str) and per_job.strip():
+            return per_job.strip(), "per-job"
+        default = defaults.get(field)
+        if isinstance(default, str) and default.strip():
+            return default.strip(), "cron-default"
+        env_val = os.environ.get(env_var)
+        if isinstance(env_val, str) and env_val.strip():
+            return env_val.strip(), "fallback"
+        return None, "unset"
+
+    model, model_source = _pick("model", "BRIDGE_CRON_DEFAULT_MODEL")
+    effort, effort_source = _pick("effort", "BRIDGE_CRON_DEFAULT_EFFORT")
+    return model, model_source, effort, effort_source
+
+
+def build_job_record(job, cron_defaults=None):
     state = job.get("state") or {}
     schedule = job.get("schedule") or {}
     payload = job.get("payload") or {}
@@ -569,6 +622,13 @@ def build_job_record(job):
     last_error = parse_epoch_ms(state.get("lastErrorAtMs"))
     if last_error is None and (consecutive_errors > 0 or last_status not in ("-", "ok", "success")):
         last_error = last_run
+
+    # Issue #1880 r2 (P1) — resolve the EFFECTIVE model/effort + source for the
+    # display record from the in-process precedence (per-job → cron-default →
+    # env fallback). `cron_defaults` is the jobs-file top-level `cronDefaults`.
+    _eff_model, _eff_model_source, _eff_effort, _eff_effort_source = resolve_effective_model_effort(
+        job, cron_defaults
+    )
 
     return {
         "id": job.get("id", ""),
@@ -604,6 +664,15 @@ def build_job_record(job):
         # `agb cron show` / `--json` reveal what model a cron child will use.
         "model": job.get("model") or None,
         "effort": job.get("effort") or None,
+        # Issue #1880 r2 (P1) — the EFFECTIVE resolved model/effort + source so
+        # `agb cron show` / `--json` show what a cron child will actually run
+        # with (per-job → cron-default → env fallback), not just the raw per-job
+        # field that prints `-` for a job relying on cronDefaults. The roster
+        # leg resolves at dispatch (bash); see resolve_effective_model_effort.
+        "effective_model": _eff_model,
+        "effective_model_source": _eff_model_source,
+        "effective_effort": _eff_effort,
+        "effective_effort_source": _eff_effort_source,
         "payload_kind": payload_kind,
         "payload_shell_script": payload.get("script", ""),
         "payload_shell_args": payload.get("args") if isinstance(payload.get("args"), list) else [],
@@ -769,8 +838,18 @@ def serialize_record(record, include_payload=False):
         "session_target": record["session_target"],
         "wake_mode": record["wake_mode"],
         # Issue #1880 — explicit cron-child model/effort (null when unset).
-        "model": record.get("model"),
-        "effort": record.get("effort"),
+        # `model`/`effort` are the EFFECTIVE resolved values a cron child runs
+        # with (per-job → cron-default → env fallback); `*_source` names the
+        # winning leg; `per_job_*` is the raw per-job override alone. JSON/shell
+        # consumers can distinguish "job has no override but a default applies"
+        # (per_job_model=null, model="<default>") from "nothing resolves"
+        # (model=null, model_source="unset" — roster may still apply at dispatch).
+        "model": record.get("effective_model"),
+        "model_source": record.get("effective_model_source") or "unset",
+        "effort": record.get("effective_effort"),
+        "effort_source": record.get("effective_effort_source") or "unset",
+        "per_job_model": record.get("model"),
+        "per_job_effort": record.get("effort"),
         "payload_kind": record["payload_kind"],
         "payload_shell_script": record.get("payload_shell_script", ""),
         "payload_shell_args": record.get("payload_shell_args", []),
@@ -2172,7 +2251,7 @@ def print_native_list(args, records):
 
 def run_native_create(args):
     raw_payload, jobs = load_native_jobs_payload(args.jobs_file)
-    records = [build_job_record(job) for job in jobs]
+    records = [build_job_record(job, raw_payload.get("cronDefaults")) for job in jobs]
     actor = args.actor or os.environ.get("USER", "unknown")
     title = args.title.strip()
     payload_text = ""
@@ -2283,7 +2362,7 @@ def run_native_create(args):
 
 def run_native_update(args):
     raw_payload, jobs = load_native_jobs_payload(args.jobs_file)
-    records = [build_job_record(job) for job in jobs]
+    records = [build_job_record(job, raw_payload.get("cronDefaults")) for job in jobs]
     actor = args.actor or os.environ.get("USER", "unknown")
     try:
         record = resolve_native_job(records, args.job_ref)
@@ -2478,7 +2557,7 @@ def run_native_update(args):
 
 def run_native_delete(args):
     raw_payload, jobs = load_native_jobs_payload(args.jobs_file)
-    records = [build_job_record(job) for job in jobs]
+    records = [build_job_record(job, raw_payload.get("cronDefaults")) for job in jobs]
     try:
         record = resolve_native_job(records, args.job_ref)
     except ValueError as exc:
@@ -3611,10 +3690,21 @@ def print_show(args, records):
     print(f"enabled: {'yes' if record['enabled'] else 'no'}")
     print(f"session_target: {record['session_target']}")
     print(f"wake_mode: {record['wake_mode']}")
-    # Issue #1880 — explicit cron-child model/effort ("-" when unset; the
-    # runner then falls back to cron-default → roster).
-    print(f"model: {record.get('model') or '-'}")
-    print(f"effort: {record.get('effort') or '-'}")
+    # Issue #1880 — cron-child model/effort. `model:`/`effort:` show the
+    # EFFECTIVE resolved value a cron child will run with (per-job →
+    # cron-default → env fallback), with its source; `per_job_*` shows the
+    # raw per-job override alone ("-" when the job relies on a default). The
+    # roster leg resolves at dispatch (bash) — when the effective source is
+    # `unset`, a roster/env value may still apply then. Never the interactive
+    # .claude/settings.json.
+    eff_model = record.get("effective_model")
+    eff_model_source = record.get("effective_model_source") or "unset"
+    eff_effort = record.get("effective_effort")
+    eff_effort_source = record.get("effective_effort_source") or "unset"
+    print(f"model: {eff_model or '-'} (source: {eff_model_source})")
+    print(f"effort: {eff_effort or '-'} (source: {eff_effort_source})")
+    print(f"per_job_model: {record.get('model') or '-'}")
+    print(f"per_job_effort: {record.get('effort') or '-'}")
     print(f"payload_kind: {record['payload_kind']}")
     print(f"schedule: {record['schedule_text']}")
     print(f"next_run: {format_dt(record['next_run_at'])}")
@@ -3862,8 +3952,8 @@ def main():
 
     if args.command == "native-list":
         try:
-            _, jobs = load_native_jobs_payload(args.jobs_file)
-            records = [build_job_record(job) for job in jobs]
+            _native_raw, jobs = load_native_jobs_payload(args.jobs_file)
+            records = [build_job_record(job, _native_raw.get("cronDefaults")) for job in jobs]
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"error: failed to read jobs file: {exc}", file=sys.stderr)
             return 2
@@ -3964,7 +4054,10 @@ def main():
             )
             return 2
         raw_payload, jobs = load_jobs_payload(args.jobs_file)
-        records = [build_job_record(job) for job in jobs]
+        # `raw_payload` is a bare list when jobs.json is a top-level array
+        # (no cronDefaults possible); only a dict carries top-level cronDefaults.
+        _cron_defaults = raw_payload.get("cronDefaults") if isinstance(raw_payload, dict) else None
+        records = [build_job_record(job, _cron_defaults) for job in jobs]
     except FileNotFoundError:
         print(f"error: jobs file not found: {args.jobs_file}", file=sys.stderr)
         return 2

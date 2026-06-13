@@ -214,6 +214,20 @@ class IncompleteCronCaptureError(ValueError):
     """Claude captured a background-completion re-entry, not the work turn."""
 
 
+class CronChildModelUnresolvedError(RuntimeError):
+    """No stable model source resolved for a Claude cron child (issue #1880).
+
+    Raised instead of spawning an unmodeled `claude -p` that would silently
+    fall back to the interactive agent-home `.claude/settings.json` model —
+    the exact coupling #1880 removes. Carries an operator-facing `reason` that
+    names the two supported fixes (a cron default or a roster model).
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 CLAUDE_SESSION_ENV_EXACT = {
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
@@ -3220,7 +3234,7 @@ def _roster_model_effort(agent: str) -> tuple[str, str]:
     if not _safe_agent_id(agent):
         return "", ""
     lib = ROOT / "bridge-lib.sh"
-    if not lib.is_file():
+    if not lib.is_file():  # noqa: raw-pathlib-controller-only — controller-side in-repo roster-lib preflight (ROOT is the source checkout, never an iso-agent tree)
         return "", ""
     # Plain `bash -c` argv (NOT a heredoc / process-substitution): sources the
     # roster, then echoes the two accessor outputs. `bridge_load_roster`
@@ -3341,7 +3355,25 @@ def run_claude(request: dict[str, Any], prompt: str, timeout: int, request_file:
     # has no reasoning-effort flag (that is a wrapper-only concept), so only the
     # model is passed here; effort is resolved/honored on the codex path.
     model, _effort, _model_source = resolve_cron_child_model_effort(request, "claude")
-    model_flags: list[str] = ["--model", model] if model else []
+    # FAIL CLOSED (#1880 r2): when NO stable source resolves a model, spawning
+    # `claude -p` with no `--model` would silently inherit the interactive
+    # settings.json model — the precise coupling #1880 removes. There is no
+    # safe hardcodable model string, so we refuse to spawn an unmodeled child
+    # and surface an actionable error naming the two supported fixes. The
+    # dispatch loop turns this into a failed run with the reason in the summary.
+    if not model:
+        agent = str(request.get("target_agent") or "").strip() or "<agent>"
+        raise CronChildModelUnresolvedError(
+            "cron child for agent '"
+            + agent
+            + "' has no stable model source (per-job, cronDefaults, roster, or "
+            "BRIDGE_CRON_DEFAULT_MODEL are all unset); refusing to spawn an "
+            "unmodeled Claude child that would inherit the interactive "
+            ".claude/settings.json model (issue #1880). Fix: set a cron default "
+            "with `bridge-cron.py ... --cron-default-model <model>` or a roster "
+            "BRIDGE_AGENT_MODEL[" + agent + "]=<model>."
+        )
+    model_flags: list[str] = ["--model", model]
     # PR1.3 — cron child never loads channel plugins or MCP servers. The
     # `--channels` injection and `apply_channel_runtime_env` paths are gone.
     # `--strict-mcp-config` is unconditional (see disable_mcp_for_request).

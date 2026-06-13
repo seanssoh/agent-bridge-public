@@ -252,12 +252,110 @@ explicit_model_on_child_argv() {
   REPO_ROOT="$REPO_ROOT" TMP_ROOT="$SMOKE_TMP_ROOT" "$PY_BIN" "$helper"
 }
 
+# ---------------------------------------------------------------------------
+# Tooth (c): FAIL CLOSED when no stable model source resolves (#1880 r2).
+# With per-job + cronDefaults + roster + BRIDGE_CRON_DEFAULT_MODEL ALL empty and
+# the interactive settings.json POISONED, run_claude must NOT spawn an unmodeled
+# child (which would inherit the poisoned settings.json model). It must raise an
+# actionable error naming the fix, and subprocess.run must NEVER be called.
+# ---------------------------------------------------------------------------
+fail_closed_no_stable_model_source() {
+  local helper="$SMOKE_TMP_ROOT/fail_closed_check.py"
+  {
+    printf '%s\n' 'import importlib.util, json, os, subprocess, sys'
+    printf '%s\n' 'from pathlib import Path'
+    printf '%s\n' ''
+    printf '%s\n' 'repo_root = os.environ["REPO_ROOT"]'
+    printf '%s\n' 'tmp = Path(os.environ["TMP_ROOT"])'
+    printf '%s\n' 'target = os.path.join(repo_root, "bridge-cron-runner.py")'
+    printf '%s\n' 'spec = importlib.util.spec_from_file_location("bridge_cron_runner", target)'
+    printf '%s\n' 'module = importlib.util.module_from_spec(spec)'
+    printf '%s\n' 'spec.loader.exec_module(module)'
+    printf '%s\n' ''
+    printf '%s\n' 'errors = []'
+    printf '%s\n' 'POISON = "claude-poisoned-unavailable-9"'
+    printf '%s\n' ''
+    printf '%s\n' '# POISON the interactive settings.json — the ONLY model source present.'
+    printf '%s\n' 'config_dir = tmp / "agent-home3" / ".claude"'
+    printf '%s\n' 'config_dir.mkdir(parents=True, exist_ok=True)'
+    printf '%s\n' '(config_dir / "settings.json").write_text(json.dumps({"model": POISON}), encoding="utf-8")'
+    printf '%s\n' ''
+    printf '%s\n' '# jobs.json with NO per-job model and NO cronDefaults.'
+    printf '%s\n' 'jobs = {"format": "agent-bridge-cron-v1",'
+    printf '%s\n' '        "jobs": [{"id": "job-1", "name": "digest", "agentId": "mon"}]}'
+    printf '%s\n' 'jf = tmp / "jobs3.json"'
+    printf '%s\n' 'jf.write_text(json.dumps(jobs), encoding="utf-8")'
+    printf '%s\n' ''
+    printf '%s\n' 'workdir = tmp / "wd3"'
+    printf '%s\n' 'workdir.mkdir(exist_ok=True)'
+    printf '%s\n' 'request = {"target_agent": "mon", "job_id": "job-1", "source_file": str(jf),'
+    printf '%s\n' '           "target_workdir": str(workdir)}'
+    printf '%s\n' ''
+    printf '%s\n' '# Empty roster + empty env fallback => NO stable source at all.'
+    printf '%s\n' 'module._roster_model_effort = lambda agent: ("", "")'
+    printf '%s\n' 'os.environ.pop("BRIDGE_CRON_DEFAULT_MODEL", None)'
+    printf '%s\n' 'os.environ.pop("BRIDGE_CRON_DEFAULT_EFFORT", None)'
+    printf '%s\n' ''
+    printf '%s\n' '# subprocess.run must NEVER fire — assert it stays uncalled. Stub it to'
+    printf '%s\n' '# record any (forbidden) call and to fail loudly if one happens.'
+    printf '%s\n' 'module.resolve_binary = lambda name, env: "/usr/bin/true"'
+    printf '%s\n' 'module.apply_claude_agent_env = lambda env, req, rf: None'
+    printf '%s\n' 'module.command_for_run_as_user = lambda cmd, su, env: cmd'
+    printf '%s\n' 'spawn_calls = []'
+    printf '%s\n' 'def forbidden_run(cmd, **kw):'
+    printf '%s\n' '    spawn_calls.append(cmd)'
+    printf '%s\n' '    return subprocess.CompletedProcess(cmd, 0, "{}", "")'
+    printf '%s\n' 'module.subprocess.run = forbidden_run'
+    printf '%s\n' ''
+    printf '%s\n' '# run_claude must FAIL CLOSED: raise, do NOT build an unmodeled argv,'
+    printf '%s\n' '# do NOT spawn.'
+    printf '%s\n' 'raised = None'
+    printf '%s\n' 'try:'
+    printf '%s\n' '    module.run_claude(request, "do the job", 10)'
+    printf '%s\n' 'except module.CronChildModelUnresolvedError as exc:'
+    printf '%s\n' '    raised = exc'
+    printf '%s\n' 'except Exception as exc:'
+    printf '%s\n' '    errors.append("run_claude raised wrong type: {0!r}".format(exc))'
+    printf '%s\n' ''
+    printf '%s\n' 'if raised is None:'
+    printf '%s\n' '    errors.append("run_claude did NOT fail closed on zero stable model source")'
+    printf '%s\n' 'else:'
+    printf '%s\n' '    msg = str(raised)'
+    printf '%s\n' '    if "--cron-default-model" not in msg or "BRIDGE_AGENT_MODEL" not in msg:'
+    printf '%s\n' '        errors.append("fail-closed error not actionable (missing fix hint): {0!r}".format(msg))'
+    printf '%s\n' '    if POISON in msg:'
+    printf '%s\n' '        errors.append("fail-closed error leaked the poisoned model: {0!r}".format(msg))'
+    printf '%s\n' ''
+    printf '%s\n' 'if spawn_calls:'
+    printf '%s\n' '    errors.append("FORBIDDEN: an unmodeled Claude child was spawned: {0!r}".format(spawn_calls))'
+    printf '%s\n' ''
+    printf '%s\n' '# A codex child with no stable source is NOT forced to fail closed (codex'
+    printf '%s\n' '# has no settings.json model-inherit coupling); it simply omits --model.'
+    printf '%s\n' 'schema = tmp / "schema3.json"'
+    printf '%s\n' 'schema.write_text("{}", encoding="utf-8")'
+    printf '%s\n' 'cmd2, _c2 = module.run_codex(request, "do the job", schema, 10)'
+    printf '%s\n' 'if "--model" in cmd2:'
+    printf '%s\n' '    errors.append("run_codex unexpectedly added --model with no source: {0!r}".format(cmd2))'
+    printf '%s\n' 'if POISON in cmd2:'
+    printf '%s\n' '    errors.append("run_codex argv leaked the poisoned model: {0!r}".format(cmd2))'
+    printf '%s\n' ''
+    printf '%s\n' 'if errors:'
+    printf '%s\n' '    for x in errors:'
+    printf '%s\n' '        print("[smoke][error] " + x, file=sys.stderr)'
+    printf '%s\n' '    sys.exit(1)'
+    printf '%s\n' 'print("[smoke] Claude cron child fails closed with an actionable error; no unmodeled spawn")'
+  } >"$helper"
+
+  REPO_ROOT="$REPO_ROOT" TMP_ROOT="$SMOKE_TMP_ROOT" "$PY_BIN" "$helper"
+}
+
 main() {
   smoke_require_cmd "$PY_BIN"
   smoke_make_temp_root "$SMOKE_NAME"
 
   smoke_run "resolve precedence (per-job > cron-default > roster > env) + poison immunity" resolution_precedence_and_poison_immunity
   smoke_run "cron child argv carries explicit safe model, not poisoned settings.json" explicit_model_on_child_argv
+  smoke_run "Claude cron child fails closed on zero stable model source (no unmodeled spawn)" fail_closed_no_stable_model_source
 
   smoke_log "passed"
 }
