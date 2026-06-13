@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import pwd
+import re
 import shlex
 import shutil
 import signal
@@ -211,6 +212,20 @@ SHELL_PROTECTED_ENV_PREFIXES = ("BRIDGE_", "CRON_")
 
 class IncompleteCronCaptureError(ValueError):
     """Claude captured a background-completion re-entry, not the work turn."""
+
+
+class CronChildModelUnresolvedError(RuntimeError):
+    """No stable model source resolved for a Claude cron child (issue #1880).
+
+    Raised instead of spawning an unmodeled `claude -p` that would silently
+    fall back to the interactive agent-home `.claude/settings.json` model —
+    the exact coupling #1880 removes. Carries an operator-facing `reason` that
+    names the two supported fixes (a cron default or a roster model).
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 CLAUDE_SESSION_ENV_EXACT = {
@@ -3136,9 +3151,205 @@ def resolve_binary(name: str, override_env: str) -> str:
     raise FileNotFoundError(f"{name} binary not found; searched PATH and common dirs: {', '.join(searched)}")
 
 
+# ---------------------------------------------------------------------------
+# Issue #1880 — explicit cron-child model/effort resolution.
+#
+# The cron disposable child must launch with an EXPLICIT model so it never
+# inherits whatever the interactive agent-home `.claude/settings.json` carries
+# (that is the file interactive `/model` writes). When an operator's
+# interactive model loses cron-token entitlement, an implicit inherit 404s the
+# WHOLE cron surface while the interactive session looks healthy. We therefore
+# resolve model/effort from STABLE sources only, in this strict precedence
+# (highest first):
+#
+#   1. per-job          jobs.json job["model"] / job["effort"]
+#   2. cron-default     jobs.json top-level cronDefaults.{model,effort}
+#   3. roster           BRIDGE_AGENT_MODEL["<a>"] / BRIDGE_AGENT_EFFORT["<a>"]
+#                       read via the existing bash accessor (no duplicate parse)
+#   4. stable fallback  BRIDGE_CRON_DEFAULT_MODEL / BRIDGE_CRON_DEFAULT_EFFORT
+#                       — env-configured ONLY; never an implicit hardcode.
+#
+# The interactive settings.json is DELIBERATELY not in this chain.
+# ---------------------------------------------------------------------------
+
+# Token shape guard mirroring bridge-cron.py::validate_cron_model_effort — a
+# value pulled from any source is only accepted as an argv flag value when it
+# matches this shape, so a tampered jobs.json / roster cannot smuggle a shell
+# fragment into the spawned child command.
+_CRON_MODEL_EFFORT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*$")
+
+
+def _safe_model_effort_token(value: Any) -> str:
+    """Return a stripped model/effort token only if it is argv-safe, else ''."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or len(text) > 128 or not _CRON_MODEL_EFFORT_RE.match(text):
+        return ""
+    return text
+
+
+def _job_model_effort_from_jobs_file(source_file: str, job_id: str) -> tuple[str, str, str, str]:
+    """Read per-job + cron-default model/effort from the dispatch jobs.json.
+
+    ``source_file`` is the request's recorded jobs.json path; ``job_id`` keys
+    the per-job entry. Returns ``(job_model, job_effort, default_model,
+    default_effort)`` — each '' when absent/unreadable/unsafe. All failures are
+    swallowed to '' so a malformed/missing jobs file degrades to the roster /
+    fallback legs rather than aborting the dispatch.
+    """
+    if not source_file:
+        return "", "", "", ""
+    try:
+        # O_NOFOLLOW is unnecessary here (controller-owned jobs file, not a
+        # run-dir input leaf); a plain read is fine and matches bridge-cron.py.
+        raw = json.loads(Path(source_file).expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return "", "", "", ""
+    if not isinstance(raw, dict):
+        return "", "", "", ""
+    defaults = raw.get("cronDefaults")
+    default_model = _safe_model_effort_token((defaults or {}).get("model")) if isinstance(defaults, dict) else ""
+    default_effort = _safe_model_effort_token((defaults or {}).get("effort")) if isinstance(defaults, dict) else ""
+    job_model = job_effort = ""
+    jobs = raw.get("jobs")
+    if isinstance(jobs, list) and job_id:
+        for job in jobs:
+            if isinstance(job, dict) and str(job.get("id") or "") == job_id:
+                job_model = _safe_model_effort_token(job.get("model"))
+                job_effort = _safe_model_effort_token(job.get("effort"))
+                break
+    return job_model, job_effort, default_model, default_effort
+
+
+def _roster_model_effort(agent: str) -> tuple[str, str]:
+    """Read the roster BRIDGE_AGENT_MODEL/EFFORT for ``agent`` via the existing
+    bash accessor (``bridge_agent_model`` / ``bridge_agent_effort``).
+
+    Sources the canonical roster stack (``bridge-lib.sh`` → ``bridge_load_roster``)
+    and prints the two accessor values on two lines. This is the SAME accessor
+    the interactive launch builders use, so we never duplicate roster parsing
+    here. Any failure (no bash, no roster, accessor error) degrades to ('', '').
+    """
+    if not _safe_agent_id(agent):
+        return "", ""
+    lib = ROOT / "bridge-lib.sh"
+    if not lib.is_file():  # noqa: raw-pathlib-controller-only — controller-side in-repo roster-lib preflight (ROOT is the source checkout, never an iso-agent tree)
+        return "", ""
+    # Plain `bash -c` argv (NOT a heredoc / process-substitution): sources the
+    # roster, then echoes the two accessor outputs. `bridge_load_roster`
+    # materializes BRIDGE_AGENT_MODEL/EFFORT that the accessors read.
+    script = (
+        'set +e; '
+        'source "$1" >/dev/null 2>&1 || exit 0; '
+        'bridge_load_roster >/dev/null 2>&1 || true; '
+        'printf "%s\\n" "$(bridge_agent_model "$2" 2>/dev/null)"; '
+        'printf "%s\\n" "$(bridge_agent_effort "$2" 2>/dev/null)"'
+    )
+    try:
+        completed = subprocess.run(
+            ["bash", "-c", script, "bridge-load-roster", str(lib), agent],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=runner_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    if completed.returncode != 0:
+        return "", ""
+    lines = completed.stdout.splitlines()
+    model = _safe_model_effort_token(lines[0]) if len(lines) >= 1 else ""
+    effort = _safe_model_effort_token(lines[1]) if len(lines) >= 2 else ""
+    return model, effort
+
+
+def resolve_cron_child_model_effort(request: dict[str, Any], engine: str) -> tuple[str, str, str]:
+    """Resolve the EXPLICIT model + effort for a cron disposable child.
+
+    Returns ``(model, effort, source)`` where ``source`` names the winning
+    precedence leg (``per-job`` / ``cron-default`` / ``roster`` / ``fallback`` /
+    ``none``) for audit/debug. Model and effort resolve INDEPENDENTLY so a
+    per-job model can pair with a roster effort. ``effort`` is only meaningful
+    for the codex engine (raw `claude -p` has no effort flag); it is still
+    resolved and returned so the codex command builder can consume it.
+
+    NEVER reads the interactive agent-home `.claude/settings.json` — that
+    coupling is exactly issue #1880.
+    """
+    agent = str(request.get("target_agent") or "").strip()
+    source_file = str(request.get("source_file") or "").strip()
+    job_id = str(request.get("job_id") or "").strip()
+
+    job_model, job_effort, default_model, default_effort = _job_model_effort_from_jobs_file(source_file, job_id)
+    roster_model, roster_effort = _roster_model_effort(agent)
+    fallback_model = _safe_model_effort_token(os.environ.get("BRIDGE_CRON_DEFAULT_MODEL"))
+    fallback_effort = _safe_model_effort_token(os.environ.get("BRIDGE_CRON_DEFAULT_EFFORT"))
+
+    def pick(per_job: str, default: str, roster: str, fallback: str) -> tuple[str, str]:
+        if per_job:
+            return per_job, "per-job"
+        if default:
+            return default, "cron-default"
+        if roster:
+            return roster, "roster"
+        if fallback:
+            return fallback, "fallback"
+        return "", "none"
+
+    model, model_source = pick(job_model, default_model, roster_model, fallback_model)
+    effort, _effort_source = pick(job_effort, default_effort, roster_effort, fallback_effort)
+    return model, effort, model_source
+
+
+def interactive_settings_model_for_request(request: dict[str, Any]) -> str:
+    """Return the agent's interactive `.claude/settings.json` `model`, else ''.
+
+    This is read ONLY to DECIDE whether a no-stable-source Claude cron child is
+    at risk of the issue #1880 coupling — it is NEVER passed to the spawned
+    child (the cron precedence in ``resolve_cron_child_model_effort`` deliberately
+    excludes this file). A model set here means an unmodeled ``claude -p`` would
+    silently inherit it, so the runner must fail closed (see ``run_claude``).
+    When this file carries NO model there is no coupling to remove, so the child
+    proceeds on the account default exactly as it did before #1880.
+
+    All failures (no config dir, missing/unreadable/invalid settings.json, no
+    ``model`` key) degrade to '' — i.e. "no interactive model is set", the
+    no-coupling path. We never abort a cron run on a settings-probe error.
+    """
+    config_dir = claude_config_dir_for_request(request)
+    if config_dir is None:
+        return ""
+    settings_file = config_dir / "settings.json"
+    try:
+        # Plain read_text (NOT an `.is_file()` probe) keeps this off the
+        # raw-pathlib metadata-site ledger; a missing file raises OSError and
+        # degrades to '' below. The settings.json lives under the controller-
+        # resolvable agent config dir (claude_config_dir_for_request already
+        # handles the iso pw_dir case), so no O_NOFOLLOW hardening is needed.
+        payload = json.loads(settings_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    model = payload.get("model")
+    return str(model).strip() if isinstance(model, str) and model.strip() else ""
+
+
 def run_codex(request: dict[str, Any], prompt: str, schema_path: Path, timeout: int, request_file: Path | None = None) -> tuple[list[str], subprocess.CompletedProcess[str]]:
     workdir = request["target_workdir"]
     codex_bin = resolve_binary("codex", "BRIDGE_CODEX_BIN")
+    # Issue #1880 — resolve an EXPLICIT model/effort from the stable precedence
+    # (per-job → cron-default → roster → fallback). NEVER the interactive
+    # settings.json. Emitted BEFORE the trailing positional prompt. Codex takes
+    # reasoning effort via the `-c model_reasoning_effort=<e>` config override.
+    model, effort, _model_source = resolve_cron_child_model_effort(request, "codex")
+    model_flags: list[str] = []
+    if model:
+        model_flags += ["--model", model]
+    if effort:
+        model_flags += ["-c", f"model_reasoning_effort={effort}"]
     command = [
         codex_bin,
         "exec",
@@ -3150,6 +3361,7 @@ def run_codex(request: dict[str, Any], prompt: str, schema_path: Path, timeout: 
         workdir,
         "--skip-git-repo-check",
         "--dangerously-bypass-approvals-and-sandbox",
+        *model_flags,
         prompt,
     ]
     env = runner_env()
@@ -3171,6 +3383,45 @@ def run_codex(request: dict[str, Any], prompt: str, schema_path: Path, timeout: 
 def run_claude(request: dict[str, Any], prompt: str, timeout: int, request_file: Path | None = None) -> tuple[list[str], subprocess.CompletedProcess[str]]:
     workdir = request["target_workdir"]
     claude_bin = resolve_binary("claude", "BRIDGE_CLAUDE_BIN")
+    # Issue #1880 — resolve an EXPLICIT model from the stable precedence
+    # (per-job → cron-default → roster → fallback), NEVER the interactive
+    # agent-home `.claude/settings.json` that `/model` writes. Raw `claude -p`
+    # has no reasoning-effort flag (that is a wrapper-only concept), so only the
+    # model is passed here; effort is resolved/honored on the codex path.
+    model, _effort, _model_source = resolve_cron_child_model_effort(request, "claude")
+    # FAIL CLOSED, CONDITIONALLY (#1880 r3): when NO stable source resolves a
+    # model, spawning `claude -p` with no `--model` falls back to the
+    # interactive `.claude/settings.json` model. That inherit is ONLY a problem
+    # — the #1880 coupling — when settings.json actually carries a model: if the
+    # operator's interactive model loses cron-token entitlement, the unmodeled
+    # cron child silently inherits it and 404s the whole cron surface. So we
+    # fail closed ONLY in that genuine-coupling case. When settings.json has NO
+    # model there is nothing to inherit (account default applies on both the
+    # interactive and the cron path), so the r2 blanket fail-closed regressed
+    # every legitimate no-model cron flow (it aborted before config injection,
+    # the 1789 rotation smoke being one). The settings.json model is read here
+    # ONLY to DECIDE; it is deliberately never passed to the child.
+    if not model:
+        interactive_model = interactive_settings_model_for_request(request)
+        if interactive_model:
+            agent = str(request.get("target_agent") or "").strip() or "<agent>"
+            raise CronChildModelUnresolvedError(
+                "cron child for agent '"
+                + agent
+                + "' has no stable model source (per-job, cronDefaults, roster, or "
+                "BRIDGE_CRON_DEFAULT_MODEL are all unset) while the interactive "
+                ".claude/settings.json pins model '" + interactive_model + "'; "
+                "refusing to spawn an unmodeled Claude child that would silently "
+                "inherit that interactive model (issue #1880). Fix: set a cron "
+                "default with `bridge-cron.py ... --cron-default-model <model>` or "
+                "a roster BRIDGE_AGENT_MODEL[" + agent + "]=<model>."
+            )
+        # No stable source AND no interactive model pinned: no coupling exists.
+        # Proceed with config injection + the account default (no `--model`),
+        # exactly as cron behaved before #1880. NOTE: do NOT raise here — the
+        # raise would skip the Claude config injection below and break every
+        # no-model cron job.
+    model_flags: list[str] = ["--model", model] if model else []
     # PR1.3 — cron child never loads channel plugins or MCP servers. The
     # `--channels` injection and `apply_channel_runtime_env` paths are gone.
     # `--strict-mcp-config` is unconditional (see disable_mcp_for_request).
@@ -3185,6 +3436,7 @@ def run_claude(request: dict[str, Any], prompt: str, timeout: int, request_file:
         json.dumps(RESULT_SCHEMA, ensure_ascii=True),
         "--permission-mode",
         "bypassPermissions",
+        *model_flags,
         prompt,
     ]
     env = runner_env()

@@ -36,6 +36,22 @@ agb cron delete <job-id>
 - If the recurring work only matters after explicit human approval, do not schedule it automatically.
 - If the job routinely produces "no change" results, the disposable cron worker should return `needs_human_followup=false`.
 
+## Pinning the cron child model (issue #1880)
+
+The disposable cron child does **not** inherit the model an interactive `/model` writes into the agent-home `.claude/settings.json`. Pin a stable model so a scheduled cron does not silently follow (and 404 with) whatever the interactive session is using.
+
+```bash
+agb cron create --agent <agent> --schedule "0 9 * * *" --title "Daily check" --payload "..." \
+  --model <model-id> [--effort <effort>]
+agb cron update <job-id> --model <model-id>     # set
+agb cron update <job-id> --model ""             # clear -> fall back to cron-default/roster
+agb cron create --agent <agent> ... --cron-default-model <model-id>   # default for jobs with no per-job model
+```
+
+Resolution precedence (highest first): per-job `--model` -> `--cron-default-model` (jobs-file `cronDefaults`) -> roster `BRIDGE_AGENT_MODEL` -> `BRIDGE_CRON_DEFAULT_MODEL` env. `--effort` applies to **codex** targets only (raw `claude -p` has no effort flag). `agb cron show <job>` reports the **effective** resolved `model:` / `effort:` rows with their `(source: per-job|cron-default|fallback|unset)`, plus the raw `per_job_model:` / `per_job_effort:` override. `show` resolves the in-process legs (per-job → cron-default → `BRIDGE_CRON_DEFAULT_MODEL`); the roster leg resolves at **dispatch** (bash), so an effective `unset` may still pick up a roster/env value when the job actually fires. The cron child NEVER reads the interactive `.claude/settings.json` for its model.
+
+If **no** stable source resolves (per-job, `cronDefaults`, roster, and `BRIDGE_CRON_DEFAULT_MODEL` all unset), the handling is **conditional** on the interactive `.claude/settings.json`: if it **has** a `model` (the genuine #1880 coupling), the **Claude** cron child **fails closed** — the run is marked failed with an actionable error naming the fix (`--cron-default-model <model>` or roster `BRIDGE_AGENT_MODEL[<agent>]`); the settings value is read only to decide, never passed. If settings.json has **no** model (or is missing/unreadable), there is no coupling, so the child **proceeds on the account default** with no `--model` (config injection intact), exactly as before #1880.
+
 ## CLI Help
 
 `agb` is a compact dispatcher for `agent-bridge`. Use `agb --help` and `agb cron --help` for the full surface. `agb help` (without dashes) is **not** a recognised command; nor are `agb list` / `agb status` (use `agent-bridge ...` for those — `agb` is queue/dispatch only).
