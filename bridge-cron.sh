@@ -180,6 +180,28 @@ run_list() {
   bridge_cron_python "${py_args[@]}"
 }
 
+# Predicate: does the shell-cron run-as-agent resolve to the controller's own
+# UID? When true, the cron-runner takes the controller-direct execution branch
+# (`env -i ... script`, no sudo/setpriv UID drop — bridge-cron-runner.py
+# shell_command_for_execution: `current_uid == uid`) and the uid-drop preflight
+# already short-circuits to OK (bridge_cron_uid_drop_preflight same-UID
+# short-circuit, lib/bridge-cron.sh). This is a SUPPORTED shell-cron shape that
+# does NOT require linux-user isolation: the script runs as the controller
+# itself, which is exactly what a controller-scoped sweep (e.g. picker-sweep,
+# which scans the controller-owned tmux server and sends keys) needs. Returns 0
+# when the agent's roster os_user (or, when absent, the agent name) resolves to
+# a UID equal to the controller's. #833/#1052 follow-up.
+bridge_cron_shell_run_as_is_controller() {
+  local run_as_agent="$1"
+  local os_user current_uid target_uid
+  [[ -n "$run_as_agent" ]] || return 1
+  os_user="$(bridge_agent_os_user "$run_as_agent" 2>/dev/null || printf '')"
+  [[ -n "$os_user" ]] || os_user="$run_as_agent"
+  current_uid="$(id -u 2>/dev/null || printf '')"
+  target_uid="$(id -u "$os_user" 2>/dev/null || printf '')"
+  [[ -n "$current_uid" && -n "$target_uid" && "$current_uid" == "$target_uid" ]]
+}
+
 bridge_cron_validate_shell_run_config() {
   local run_as_agent="$1"
   local script_path="${2:-}"
@@ -187,21 +209,27 @@ bridge_cron_validate_shell_run_config() {
   [[ -n "$run_as_agent" ]] || bridge_die "--run-as-agent is required for --kind shell"
   bridge_load_roster
   bridge_require_agent "$run_as_agent"
-  # Issue #1426: `--kind shell` runs a script under a dedicated isolated OS
-  # UID, which only exists on Linux hosts with linux-user isolation (iso v2)
-  # active. On macOS / non-iso installs there is no per-agent UID to drop to,
-  # so this kind is structurally unavailable. Point the author at the
-  # supported scheduled-shell paths instead of leaving them at a dead end
-  # after they have already written and tested a script.
-  bridge_agent_linux_user_isolation_effective "$run_as_agent" \
-    || bridge_die "$(printf '%s\n%s\n%s\n%s' \
-        "--kind shell requires a linux-user isolated agent (iso v2); '$run_as_agent' is not one." \
-        "iso v2 is Linux-only — on macOS / non-iso installs --kind shell is unavailable." \
-        "To run a script on a schedule without iso, use one of:" \
-        "  1) OS crontab (recommended; bypasses claude/codex entirely), or 2) a --kind text cron whose payload runs 'bash <script>' against a non-Claude (codex) agent. See OPERATIONS.md \"Scheduled shell scripts without iso v2\".")"
+  # Issue #1426: `--kind shell` normally runs a script under a dedicated
+  # isolated OS UID, which only exists on Linux hosts with linux-user isolation
+  # (iso v2) active. On macOS / non-iso installs there is no per-agent UID to
+  # drop to. EXCEPTION (#833/#1052 follow-up): when the run-as-agent resolves to
+  # the CONTROLLER's own UID, no drop is needed — the runner runs the script
+  # directly as the controller (`env -i ... script`). This controller-direct
+  # shape is how a controller-scoped sweep (picker-sweep) registers a
+  # shell-kind cron without iso v2. Admit it here; otherwise require iso v2 and
+  # point the author at the supported scheduled-shell paths.
+  if ! bridge_cron_shell_run_as_is_controller "$run_as_agent"; then
+    bridge_agent_linux_user_isolation_effective "$run_as_agent" \
+      || bridge_die "$(printf '%s\n%s\n%s\n%s' \
+          "--kind shell requires a linux-user isolated agent (iso v2) or a run-as-agent that resolves to the controller UID; '$run_as_agent' is neither." \
+          "iso v2 is Linux-only — on macOS / non-iso installs --kind shell needs a controller-UID run-as-agent." \
+          "To run a script on a schedule without iso, use one of:" \
+          "  1) OS crontab (recommended; bypasses claude/codex entirely), or 2) a --kind text cron whose payload runs 'bash <script>' against a non-Claude (codex) agent. See OPERATIONS.md \"Scheduled shell scripts without iso v2\".")"
+  fi
 
   local os_user
   os_user="$(bridge_agent_os_user "$run_as_agent")"
+  [[ -n "$os_user" ]] || os_user="$run_as_agent"
   [[ -n "$os_user" ]] || bridge_die "--run-as-agent has no os_user: $run_as_agent"
   if [[ "$run_as_agent" =~ ^[0-9]+$ || "$os_user" =~ ^[0-9]+$ ]]; then
     bridge_die "--run-as-agent must be an agent id, not a numeric UID/user"
@@ -221,8 +249,13 @@ bridge_cron_validate_shell_run_config() {
   [[ -f "$resolved_script" && -x "$resolved_script" ]] || bridge_die "--script must be an executable file: $resolved_script"
 
   local owner_uid run_uid controller_uid mode_bits
-  owner_uid="$(stat -c '%u' "$resolved_script" 2>/dev/null || true)"
-  mode_bits="$(stat -c '%a' "$resolved_script" 2>/dev/null || true)"
+  # Portable stat: GNU (`-c`) first, BSD/macOS (`-f`) fallback. The
+  # controller-direct shell-cron path (#833/#1052) now reaches this check on
+  # macOS dev hosts, where GNU-only `stat -c` returns empty and would trip the
+  # "could not resolve" die. Mirrors the portable form already used below for
+  # cron_home_owner.
+  owner_uid="$(stat -c '%u' "$resolved_script" 2>/dev/null || stat -f '%u' "$resolved_script" 2>/dev/null || true)"
+  mode_bits="$(stat -c '%a' "$resolved_script" 2>/dev/null || stat -f '%Lp' "$resolved_script" 2>/dev/null || true)"
   run_uid="$(id -u "$os_user" 2>/dev/null || true)"
   controller_uid="$(id -u)"
   [[ -n "$owner_uid" && -n "$run_uid" ]] || bridge_die "could not resolve --script owner or --run-as-agent uid"
@@ -1248,21 +1281,40 @@ run_enqueue() {
     shell_run_as_agent="${CRON_JOB_EXECUTION_RUN_AS_AGENT:-}"
     [[ -n "$shell_run_as_agent" ]] || bridge_die "shell cron job is missing execution.runAsAgent: $CRON_JOB_NAME"
     bridge_require_agent "$shell_run_as_agent"
-    bridge_agent_linux_user_isolation_effective "$shell_run_as_agent" \
-      || bridge_die "shell cron run_as_agent must be linux-user isolated: $shell_run_as_agent"
-    shell_os_user="$(bridge_agent_os_user "$shell_run_as_agent")"
-    [[ -n "$shell_os_user" ]] || bridge_die "shell cron run_as_agent has no os_user: $shell_run_as_agent"
-    [[ ! "$shell_run_as_agent" =~ ^[0-9]+$ && ! "$shell_os_user" =~ ^[0-9]+$ ]] \
-      || bridge_die "shell cron run_as_agent must be an agent id, not numeric UID/user"
-    shell_uid="$(id -u "$shell_os_user")"
-    shell_gid="$(id -g "$shell_os_user")"
-    shell_home="$(getent passwd "$shell_os_user" | awk -F: '{print $6}' | head -n1)"
-    [[ -n "$shell_home" ]] || shell_home="$(bridge_agent_linux_user_home "$shell_os_user")"
-    shell_agent_env_file="$(bridge_agent_linux_env_file "$shell_run_as_agent")"
-    if [[ ! -f "$shell_agent_env_file" ]] && command -v bridge_write_linux_agent_env_file >/dev/null 2>&1; then
-      bridge_write_linux_agent_env_file "$shell_run_as_agent" "$shell_agent_env_file"
+    # Controller-direct shell cron (#833/#1052 follow-up): when the run-as-agent
+    # resolves to the controller's own UID, the runner executes the script
+    # directly as the controller (`env -i ... script`) with no UID drop, so the
+    # linux-user-isolation requirement does not apply. This is how a
+    # controller-scoped sweep (picker-sweep) dispatches without iso v2. For the
+    # iso case the original requirement stands.
+    if bridge_cron_shell_run_as_is_controller "$shell_run_as_agent"; then
+      shell_os_user="$(bridge_agent_os_user "$shell_run_as_agent")"
+      [[ -n "$shell_os_user" ]] || shell_os_user="$(id -un)"
+      shell_uid="$(id -u "$shell_os_user")"
+      shell_gid="$(id -g "$shell_os_user")"
+      shell_home="$(getent passwd "$shell_os_user" 2>/dev/null | awk -F: '{print $6}' | head -n1)"
+      # macOS / no-getent fallback: dscl, then the controller's own home via `cd ~`.
+      [[ -n "$shell_home" ]] || shell_home="$(dscl . -read "/Users/$shell_os_user" NFSHomeDirectory 2>/dev/null | awk '{print $2}' | head -n1)"
+      [[ -n "$shell_home" ]] || shell_home="$(cd ~ 2>/dev/null && pwd)"
+      shell_agent_env_file="$(bridge_agent_linux_env_file "$shell_run_as_agent" 2>/dev/null || true)"
+      shell_env_snapshot_json="$(build_shell_env_snapshot_json "$shell_run_as_agent" "$shell_os_user" "$shell_home" "$shell_agent_env_file")"
+    else
+      bridge_agent_linux_user_isolation_effective "$shell_run_as_agent" \
+        || bridge_die "shell cron run_as_agent must be linux-user isolated or resolve to the controller UID: $shell_run_as_agent"
+      shell_os_user="$(bridge_agent_os_user "$shell_run_as_agent")"
+      [[ -n "$shell_os_user" ]] || bridge_die "shell cron run_as_agent has no os_user: $shell_run_as_agent"
+      [[ ! "$shell_run_as_agent" =~ ^[0-9]+$ && ! "$shell_os_user" =~ ^[0-9]+$ ]] \
+        || bridge_die "shell cron run_as_agent must be an agent id, not numeric UID/user"
+      shell_uid="$(id -u "$shell_os_user")"
+      shell_gid="$(id -g "$shell_os_user")"
+      shell_home="$(getent passwd "$shell_os_user" | awk -F: '{print $6}' | head -n1)"
+      [[ -n "$shell_home" ]] || shell_home="$(bridge_agent_linux_user_home "$shell_os_user")"
+      shell_agent_env_file="$(bridge_agent_linux_env_file "$shell_run_as_agent")"
+      if [[ ! -f "$shell_agent_env_file" ]] && command -v bridge_write_linux_agent_env_file >/dev/null 2>&1; then
+        bridge_write_linux_agent_env_file "$shell_run_as_agent" "$shell_agent_env_file"
+      fi
+      shell_env_snapshot_json="$(build_shell_env_snapshot_json "$shell_run_as_agent" "$shell_os_user" "$shell_home" "$shell_agent_env_file")"
     fi
-    shell_env_snapshot_json="$(build_shell_env_snapshot_json "$shell_run_as_agent" "$shell_os_user" "$shell_home" "$shell_agent_env_file")"
   fi
   request_rel="${request_file#$BRIDGE_HOME/}"
   result_rel="${result_file#$BRIDGE_HOME/}"
