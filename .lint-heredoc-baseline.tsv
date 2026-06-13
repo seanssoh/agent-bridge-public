@@ -183,7 +183,7 @@ lib/bridge-agents.sh	5923	C3	80fcc340a0b98b0ce607e977f247e1ff449866103e9e57e75df
 lib/bridge-agents.sh	6497	C3	c83c54b6c2bfa499e3fcb336d45a2ab60f0dd93871ccd1f17f3fcf372ae83b36	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-agents.sh	6599	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-agents.sh	6675	C3	86d8be2f8efb1c66475f8381b2c220041e644fd78aa619f3c5b93b618dfa4fb9	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	6781	C3	a86b7f9ed439e40c69ca6402d6328478729610504db5f88174402f909953fb0f	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	8392	C3	447a906e4d577d29bcaf90b9c7603283cefce04c40ef41efb0ef4fa97b23bca2	interpreter heredoc, no capture	claude	#1881 live_mcp_status argv added to existing session_health_json heredoc (pre-existing C3 site a86b7f9, content edited not new heredoc)
 lib/bridge-agents.sh	7258	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-agents.sh	7297	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-agents.sh	7322	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -196,6 +196,7 @@ lib/bridge-agents.sh	8854	C3	7fd9d92ec0f389cfd150c18d07df9816e0d7430b3943e364f3f
 lib/bridge-agents.sh	8887	C3	2a37cc61060152656d688f197079816b3c801180d26b9cd05b49acccbe19cef2	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-agents.sh	9136	H3	28c851126fa7ff64d39080d7ce681118cd8bc7ca09b01c53484eee24282647ba	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-agents.sh	9189	H3	28c851126fa7ff64d39080d7ce681118cd8bc7ca09b01c53484eee24282647ba	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	9360	H3	e470978788504a3913cff8fd33088c6a864b692cda56dbbfb5db1cc2f49d54a4	here-string/procsub, non-interpreter consumer	claude	#1881 bridge_filter_probeable_plugin_channels_csv IFS=',' read here-string (dup of existing safe pattern, no interpreter)
 lib/bridge-agents.sh	9623	H3	7df84eb9232986fb58e31393fb467f8fae42994efe8452977643e6d5de2448f4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-agents.sh	9684	H3	7df84eb9232986fb58e31393fb467f8fae42994efe8452977643e6d5de2448f4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-agents.sh	9806	H3	967276bccff3eae7ab3fe0ebb717d60a4a3793d2edc085f88df3c7390b65841f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
