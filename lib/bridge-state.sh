@@ -2661,10 +2661,78 @@ print(",".join(ids), end="")
 PY
 }
 
+# bridge_resume_quarantine_id_is_foreign <agent> <session_id> <workdir>
+#
+# Returns 0 (true) iff the session's transcript `<sid>.jsonl` exists in the
+# controller/operator HOME `~/.claude/projects/<slug>/` AND does NOT exist
+# under the agent's OWN config dir `<config_root>/projects/<slug>/`. That is
+# the exact shape of the operator-session-hijack bug: a mis-detected operator
+# transcript that the agent does not own. Returns 1 (false/not-foreign) when
+# the transcript is the agent's own, when it does not exist in the operator
+# HOME at all, or when ownership cannot be evaluated — callers treat a non-zero
+# result as "safe to proceed with the historical behaviour".
+#
+# Pure bash (no heredoc) so it adds no footgun-#11 site. Slug candidates match
+# the python `workdir_slug_candidates` (/ → -, then also . , then also _).
+bridge_resume_quarantine_id_is_foreign() {
+  local agent="$1"
+  local session_id="$2"
+  local workdir="$3"
+  [[ -n "$agent" && -n "$session_id" && -n "$workdir" ]] || return 1
+
+  local config_root=""
+  if command -v bridge_resolve_agent_claude_config_dir >/dev/null 2>&1; then
+    config_root="$(bridge_resolve_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+  fi
+
+  local operator_home="" operator_claude=""
+  if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+    operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+  fi
+  [[ -z "$operator_home" ]] && operator_home="${HOME:-}"
+  [[ -n "$operator_home" ]] || return 1
+  operator_claude="$operator_home/.claude"
+
+  # Three slug candidates (matches scripts/python-helpers slug logic).
+  local slug_slash slug_dot slug_us
+  slug_slash="${workdir//\//-}"
+  slug_dot="${slug_slash//./-}"
+  slug_us="${slug_dot//_/-}"
+
+  local slug in_operator=0 in_agent=0 op_path agent_path
+  for slug in "$slug_slash" "$slug_dot" "$slug_us"; do
+    op_path="$operator_claude/projects/$slug/$session_id.jsonl"
+    [[ -f "$op_path" ]] && in_operator=1
+    if [[ -n "$config_root" ]]; then
+      agent_path="$config_root/projects/$slug/$session_id.jsonl"
+      [[ -f "$agent_path" ]] && in_agent=1
+    fi
+  done
+
+  # Foreign iff present in operator HOME and NOT present under the agent's own
+  # config dir. If the agent's config dir IS the operator HOME (config_root
+  # resolved equal to operator_claude, e.g. a shared admin), in_agent tracks
+  # the same file so the result is "not foreign" — historical behaviour.
+  [[ "$in_operator" == "1" && "$in_agent" != "1" ]]
+}
+
 # bridge_agent_resume_quarantine_add — append <session_id> with <reason> to the
 # per-agent quarantine list. flock + atomic rewrite. Cap enforced (oldest
 # evicted) at $BRIDGE_RESUME_QUARANTINE_CAP (default 50). No-op when the id is
 # already present. Silently no-ops when the session id fails validation.
+#
+# Ownership-scoped (operator-session-hijack fix): refuse to record a quarantine
+# entry that targets a FOREIGN transcript — i.e. one whose `.jsonl` exists in
+# the controller/operator HOME `~/.claude/projects/<slug>/` but NOT under the
+# agent's OWN config dir. Recording such an entry would be acting on the
+# operator's session (its archive companion would then try to move it). The
+# resolver-side exclude that this metadata feeds is harmless for an id that has
+# no transcript at all (a genuinely stale agent id), so those are still
+# recorded; only a proven-foreign id is refused (log only). FAIL SAFE: when the
+# agent's own config dir cannot be resolved we cannot prove ownership either
+# way, so we keep the historical behaviour (record) ONLY when the id is not
+# found in the operator HOME; if it IS in the operator HOME and we cannot prove
+# it is also the agent's own, we refuse.
 bridge_agent_resume_quarantine_add() {
   local agent="$1"
   local session_id="$2"
@@ -2676,6 +2744,19 @@ bridge_agent_resume_quarantine_add() {
   [[ -n "$agent" ]] || return 1
   bridge_resume_session_id_valid "$session_id" || return 1
   workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+
+  # Foreign-transcript guard. If the rejected id's transcript lives in the
+  # operator/daemon HOME but NOT under the agent's own config dir, this is a
+  # mis-detected foreign (operator) session — refuse to quarantine it.
+  if [[ -n "$workdir" ]] \
+     && bridge_resume_quarantine_id_is_foreign "$agent" "$session_id" "$workdir"; then
+    if [[ "${BRIDGE_DEBUG:-0}" == "1" ]]; then
+      printf '[quarantine] add refused for %s sid=%s — transcript is in operator/daemon HOME, not the agent config dir (foreign session, not quarantining)\n' \
+        "$agent" "$session_id" >&2
+    fi
+    return 0
+  fi
+
   file="$(bridge_agent_resume_quarantine_file "$agent")"
   mkdir -p "$(dirname "$file")" 2>/dev/null || true
 
@@ -2747,20 +2828,61 @@ bridge_agent_resume_quarantine_clear() {
 # project slug dir so the detector's `*.jsonl` glob no longer matches it.
 # Returns 0 even when no transcript was found — the resolver-side exclude_csv
 # is the primary guard; this just prevents fs-scan from re-discovering the id.
+#
+# Ownership-scoped (operator-session-hijack fix): this function MUST only ever
+# move a transcript that lives UNDER THE AGENT'S OWN config dir
+# (`<config_root>/projects/<slug>/`). The historical body hard-coded the
+# controller/operator HOME `~/.claude/projects/` — so when a mis-detection
+# fed it the OPERATOR's session id (see the F1 fix above), it physically moved
+# the operator's vanilla transcript into `.quarantined/`, destroying it from
+# `claude --resume`. We now resolve the agent's own config dir via
+# `bridge_resolve_agent_claude_config_dir` (the SAME resolver the launch and
+# detection use) and hand it to the helper as the ONLY base to search, with a
+# python-side realpath/commonpath containment re-check before any move. FAIL
+# SAFE: if the config dir cannot be proven to be the agent's own
+# (resolver returned empty — unregistered, stale-scaffold, or operator-HOME
+# fallthrough), DO NOT move anything (log only). This is defense-in-depth: even
+# if some future detection bug picks a foreign session, this gate prevents
+# destroying it.
 bridge_agent_resume_quarantine_archive_transcript() {
   local agent="$1"
   local session_id="$2"
   local workdir=""
+  local config_root=""
 
   [[ -n "$agent" ]] || return 1
   bridge_resume_session_id_valid "$session_id" || return 1
   workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
   [[ -n "$workdir" ]] || return 0
 
-  python3 - "$workdir" "$session_id" 2>/dev/null <<'PY' || true
+  # Resolve the agent's OWN Claude config dir. Empty ⇒ the agent does not
+  # own a provable isolated config dir on this host (unregistered, empty
+  # #1316 scaffold, or operator-HOME fallthrough). In that case there is no
+  # agent-owned transcript to archive: do NOT touch the controller/operator
+  # HOME — fail safe (log only, no move).
+  if command -v bridge_resolve_agent_claude_config_dir >/dev/null 2>&1; then
+    config_root="$(bridge_resolve_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+  fi
+  if [[ -z "$config_root" ]]; then
+    if [[ "${BRIDGE_DEBUG:-0}" == "1" ]]; then
+      printf '[quarantine] archive skipped for %s sid=%s — no provable agent-owned config dir (refusing to touch operator/daemon HOME)\n' \
+        "$agent" "$session_id" >&2
+    fi
+    return 0
+  fi
+
+  python3 - "$workdir" "$session_id" "$config_root" 2>/dev/null <<'PY' || true
 import os, re, shutil, sys, time
 workdir = sys.argv[1]
 sid = sys.argv[2]
+config_root = sys.argv[3]
+# Containment proof: every candidate src must resolve to a real path strictly
+# under <config_root>/projects/. Anything else (esp. the operator/daemon HOME
+# ~/.claude/projects/) is refused — never moved. config_root is the agent's
+# OWN dir as resolved by bridge_resolve_agent_claude_config_dir.
+if not config_root:
+    raise SystemExit(0)
+projects_root = os.path.realpath(os.path.join(config_root, "projects"))
 def slugs(path):
     a = path.replace("/", "-")
     b = re.sub(r"[/.]", "-", path)
@@ -2768,10 +2890,23 @@ def slugs(path):
     if b != a:
         out.append(b)
     return out
+def contained(child, parent):
+    # True iff realpath(child) is parent itself or strictly below it.
+    try:
+        c = os.path.realpath(child)
+        p = os.path.realpath(parent)
+        return c == p or os.path.commonpath([c, p]) == p
+    except Exception:
+        return False
 for slug in slugs(workdir):
-    base = os.path.expanduser(f"~/.claude/projects/{slug}")
+    base = os.path.join(config_root, "projects", slug)
     src = os.path.join(base, f"{sid}.jsonl")
     if not os.path.isfile(src):
+        continue
+    # Re-prove containment AFTER resolving symlinks: the src (and its base)
+    # must live strictly under the agent's own projects/ root. A symlinked or
+    # crafted slug that escapes the config dir is refused.
+    if not contained(src, projects_root):
         continue
     qdir = os.path.join(base, ".quarantined")
     try:
@@ -4189,6 +4324,41 @@ bridge_resolve_agent_claude_config_dir() {
   # A derived-but-absent path means the agent is not actually isolated on
   # this host; do not let it shadow the caller's HOME.
   [[ -n "$config_dir" && -d "$config_dir" ]] || return 0
+
+  # Operator-session-hijack fix: a REGISTERED DYNAMIC agent launches Claude
+  # with its OWN isolated CLAUDE_CONFIG_DIR (<agent-home>/.claude — see
+  # bridge_run_agent_claude_root / bridge_run_shared_launch's
+  # `export CLAUDE_CONFIG_DIR`). Resume detection MUST scan that SAME dir so
+  # detection-dir == launch-dir. The #1370 "empty isolated projects = stale
+  # #1316 scaffold ⇒ fall through to the controller/operator HOME ~/.claude"
+  # heuristic is WRONG for these agents: an empty isolated projects/ means
+  # "fresh dynamic agent", NOT "share the operator HOME". Letting it fall
+  # through made detection pick the OPERATOR's newest ~/.claude transcript
+  # (no ownership filter), launch `--resume <operator-session>` against the
+  # agent's isolated config (which lacks it) → no-conversation-found → and
+  # the post-#1769 resume→fail→quarantine then archived the OPERATOR's
+  # transcript. Return the isolated dir UNCONDITIONALLY so an empty
+  # projects/ ⇒ fresh start (the python helper scans the empty isolated dir
+  # and finds nothing) with NO operator-HOME fallback, while a populated
+  # isolated projects/ still resumes the agent's OWN prior transcript
+  # (#981/#1769 legit isolated resume preserved). Fail-safe: only take this
+  # branch when the derived config dir is genuinely the agent's own and is
+  # NOT the operator HOME ~/.claude — if it equals operator HOME we fall
+  # through to the unchanged scaffold check below rather than treat the
+  # operator HOME as an isolated dir.
+  if command -v bridge_agent_source >/dev/null 2>&1 \
+     && [[ "$(bridge_agent_source "$agent" 2>/dev/null || true)" == "dynamic" ]]; then
+    local _operator_claude=""
+    if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+      local _operator_home=""
+      _operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+      [[ -n "$_operator_home" ]] && _operator_claude="$_operator_home/.claude"
+    fi
+    if [[ -z "$_operator_claude" || "$config_dir" != "$_operator_claude" ]]; then
+      printf '%s' "$config_dir"
+      return 0
+    fi
+  fi
 
   # Issue #1370 (beta5-2 #1316 regression) gated this purely on linux-user
   # isolation being *effective*: when it is NOT (every non-Linux host, and
