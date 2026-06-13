@@ -4,6 +4,28 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.16.10] — 2026-06-13 (LTS)
+
+**v0.16.10 LTS — a large reliability + migration train, hardened through a fleet soak across sean-mac (macOS shared-mode) and cm-prod (real-Linux iso-v2 production).** This consolidates the rc1→rc3 candidates into the blessed LTS tag for the v0.16.x line. It closes the dynamic-agent restart footgun, makes operator plugin/setting provisioning survive recreate, and lands a gated layout-v2 four-writer migration with a fail-closed v1→v2 reconciliation that stops legacy installs from forking agent memory. Every code lane cleared the queue pair-review gate; the two data-loss/iso-sensitive lanes (#1857 provisioning preserve, #1820 layout-v2 migration) additionally cleared the independent `patch` adversarial gate across four rounds, and the reconcile iso-permission handling (#1820 rc3) was re-verified on a real Linux-UID host.
+
+### Highlights (consolidated rc1–rc3)
+
+- **Dynamic agent lifecycle:** `agent restart <dynamic>` now relaunches instead of deregistering + quarantining the transcript (#1852); self-restart survives the kill→relaunch (#1853); per-agent `enabledPlugins`/`statusLine`/plugin-manifest/skills are preserved across recreate/`--replace` with a bridge-owned provenance ledger and fail-closed token validation (#1857).
+- **layout-v2 migration & drift-0:** the cron memory writer, PreCompact fallback, per-agent settings render, and doc-sync target all resolved to the v1 `agents/<a>` tree and forked agent memory daily on post-v0.8 installs; all four now resolve v2-first, and a same-release reconciliation runs as one fail-closed, daemon-down, scope-locked migration with both-side backups, content-hash conflict policy (prefix/superset merge, divergent→archive+marker+queue-task, idempotent re-apply), atomic workdir-symlink retarget, foreign-symlink-ancestor fencing, and a post-apply invariant (#1820).
+- **iso-v2 reconcile correctness (rc3):** the controller-run reconcile graceful-skips iso agent-private 0600 memory it cannot read and records a structured, auditable `isolation_v2_migration` section in `last-apply.json` (#1820 rc3); cron workers refuse to auto-execute interactive-gated or irreversible production-mutation tasks (rc3, extends #1792).
+- **Observability (rc2):** the reconcile always writes a structured result at one canonical path (`state/migration/layout-v2-reconcile/last-apply.json`); a successful migration clears the stale `last-error.json` it resolves.
+- **Security:** the #1838 tool-policy lane closed a spoofed-admin peer-write bypass (heredoc-body exclusion gated on loose admin instead of strict trusted-admin), caught by CI before merge.
+
+### Soak verdict
+
+- **sean-mac (macOS shared-mode):** clean, drift 0 — 8 agents settings-v2-normalized, memory preserved (no strand/fork), v1 tree kept as rollback evidence.
+- **cm-prod (first real Linux iso-v2 production host, 7 customer bots):** v1→v2 migration applied with **zero data loss and zero drift**; reconcile result structured/auditable. A controller-shell stale-supplementary-group condition (a 15-day login shell missing groups added after its start — KNOWN_ISSUES §28 / #1836) produced cosmetic `Errno13` reconcile warnings on iso homes; refreshing the controller's group set (fresh login / `newgrp`) clears them with zero data impact. An automatic fresh-group preflight that removes the manual step ships as a follow-up hardening in the next v0.16.x patch (does not affect migration correctness).
+
+### Notes
+
+- LTS line head for v0.16.x. Production / conservative installs should pin the `lts` channel.
+- Follow-up hardening tracked post-tag: controller fresh-group preflight for `agb upgrade`/watchdog (removes the stale-shell manual step) and a watchdog data-tree-mirror settings-source correction (cosmetic anomaly-agent false-positive).
+
 ## [0.16.10-rc3] — 2026-06-13
 
 **Third release candidate — closes two blockers the cm-prod (real Linux iso-v2 production) rc2 soak surfaced before promotion to LTS.** rc2 applied functionally with zero data loss, but a deeper cm-prod audit corrected the initial "clean" verdict: the layout-v2 reconcile had an iso-permission gap and the upgrade had been auto-executed by a cron worker that an interactive admin had deliberately gated. Both are now fixed and re-verified (#1876 cleared the `patch` adversarial iso-lane gate on a real Linux-UID container). No change to the gate-2-approved reconcile fencing/fail-closed data logic.
