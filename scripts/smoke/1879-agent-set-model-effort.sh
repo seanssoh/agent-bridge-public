@@ -40,10 +40,19 @@ trap cleanup EXIT
 smoke_require_cmd python3
 smoke_require_cmd bash
 
-# Trusted caller (operator-tui source) — the sanctioned path.
+# Trusted caller (operator-tui source) — the sanctioned operator path. The
+# operator-tui claim is only honored for a NON-agent process, so we unset
+# BRIDGE_AGENT_ID / BRIDGE_ADMIN_AGENT_ID here (#1879 r3): the operator TUI runs
+# without an agent session id. Without the unsets this wrapper would inherit a
+# leaked BRIDGE_AGENT_ID from a runner that is itself a bridge agent session
+# (e.g. when the smoke is run by hand from inside an agent), and the r3 wrapper
+# fix would correctly treat the forged claim as a non-admin agent claim and deny
+# — env-fragility, not a behavior change. Pinning the env makes the operator
+# path deterministic on any runner. stdin from /dev/null so no stray TTY skews
+# the source resolution either.
 BA() {
-  BRIDGE_CALLER_SOURCE="operator-tui" \
-    bash "$SMOKE_REPO_ROOT/bridge-agent.sh" "$@"
+  env -u BRIDGE_AGENT_ID -u BRIDGE_ADMIN_AGENT_ID BRIDGE_CALLER_SOURCE="operator-tui" \
+    bash "$SMOKE_REPO_ROOT/bridge-agent.sh" "$@" </dev/null
 }
 
 # Untrusted caller — no BRIDGE_CALLER_SOURCE override and no admin identity, so

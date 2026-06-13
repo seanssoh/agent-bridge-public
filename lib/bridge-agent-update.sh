@@ -37,11 +37,14 @@
 
 # bridge_agent_update_caller_source — return one of operator-tui /
 # operator-trusted-id / agent-direct, mirroring
-# bridge-config.py:detect_caller_source. Bash equivalent: respect an
-# explicit BRIDGE_CALLER_SOURCE env override first, then auto-promote
-# admin-agent sessions (issue #1122), then fall back to TTY detection
-# (stdin+stdout both attached). Anything else is agent-direct, which
-# the wrapper rejects.
+# bridge-config.py:detect_caller_source. Trust precedence:
+#   1. Agent sessions (`BRIDGE_AGENT_ID` set) derive trust ONLY from a
+#      non-forgeable signal — the admin identity (#1122). An agent's
+#      inherited `BRIDGE_CALLER_SOURCE` claim is NOT honored.
+#   2. Non-agent (operator) processes honor an explicit
+#      `BRIDGE_CALLER_SOURCE=operator-tui|operator-trusted-id` claim, then
+#      fall back to TTY detection. Anything else is agent-direct, which
+#      the wrapper rejects.
 #
 # Issue #1122 — admin Claude Code sessions: when the caller is
 # identifiably the admin agent (`BRIDGE_AGENT_ID == BRIDGE_ADMIN_AGENT_ID`,
@@ -53,11 +56,59 @@
 # mutating subcommand. The auto-promotion closes that workflow gap
 # without weakening the non-admin rejection: a non-admin session with
 # no explicit override still falls through to agent-direct.
+#
+# Issue #1879 PR #1887 r3 — `bash -c` env-claim spoof close. An
+# agent-authored process carries `BRIDGE_AGENT_ID` (the agent's session
+# id), and that env var follows the process into ANY subshell /
+# `bash -c '...'` / `eval` / nested process. `operator-tui` and
+# `operator-trusted-id` are OPERATOR sources, never agent sources — so an
+# agent session must never be able to ASSERT one of them through the
+# forgeable `BRIDGE_CALLER_SOURCE` env var. Before this fix the explicit
+# env claim was honored first, so a NON-admin agent could hide the
+# roster-writing verb inside `bash -c` (defeating the argv-visible
+# tool-policy hook gate) while keeping the forged
+# `BRIDGE_CALLER_SOURCE=operator-tui` for the child, and the wrapper
+# wrote the #341-protected roster with rc=0. The fix: an agent session
+# (`BRIDGE_AGENT_ID` set) is resolved by IDENTITY only — admin agent →
+# `operator-trusted-id` (#1122 path), every other agent → `agent-direct`
+# (the env claim and a stray inherited TTY are both ignored). The
+# operator-tui human path runs WITHOUT `BRIDGE_AGENT_ID`, so its env
+# claim / TTY are still honored. Because `BRIDGE_AGENT_ID` is present in
+# the child of any `VAR=val cmd` / `bash -c` / `eval` / nested spelling,
+# the non-admin rejection now holds across all of them.
 bridge_agent_update_caller_source() {
-  # Strip leading/trailing whitespace before lowercasing — operators
-  # editing env files commonly leave a stray space that would otherwise
-  # silently demote the source to agent-direct. Mirrors
-  # bridge-config.py:94 (`.strip().lower()`).
+  # Resolve the session/admin identity FIRST. An agent session is gated
+  # by identity, not by the forgeable BRIDGE_CALLER_SOURCE env claim.
+  # Both sides stripped (mirrors bridge_agent_update_caller_is_admin and
+  # bridge-config.py:107/237): a trailing newline must not silently
+  # demote a legitimate admin or promote a forged non-admin claim.
+  local _session_agent _admin_agent
+  _session_agent="${BRIDGE_AGENT_ID:-}"
+  _session_agent="$(printf '%s' "$_session_agent" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  _admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
+  _admin_agent="$(printf '%s' "$_admin_agent" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+  if [[ -n "$_session_agent" ]]; then
+    # Agent session. Trust comes ONLY from the admin identity (#1122) —
+    # never from an inherited BRIDGE_CALLER_SOURCE claim (which an agent
+    # can forge and carry into bash -c / eval / any subshell, #1879 r3)
+    # and never from a stray inherited TTY. The admin agent is promoted
+    # by identity; every non-admin agent is agent-direct (→ deny).
+    if [[ -n "$_admin_agent" && "$_session_agent" == "$_admin_agent" ]]; then
+      bridge_agent_update_emit_caller_source_auto_promotion_audit "$_session_agent" "admin-agent-signal"
+      printf '%s' "operator-trusted-id"
+      return 0
+    fi
+    printf '%s' "agent-direct"
+    return 0
+  fi
+
+  # Non-agent (operator) process: no BRIDGE_AGENT_ID. Honor an explicit
+  # BRIDGE_CALLER_SOURCE claim (the verified-channel-handler path, #341),
+  # then fall back to TTY detection. Strip+lowercase before matching —
+  # operators editing env files commonly leave a stray space that would
+  # otherwise silently demote the source. Mirrors bridge-config.py:94
+  # (`.strip().lower()`).
   local explicit="${BRIDGE_CALLER_SOURCE:-}"
   explicit="$(printf '%s' "$explicit" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   explicit="${explicit,,}"
@@ -73,23 +124,6 @@ bridge_agent_update_caller_source() {
       return 0
       ;;
   esac
-  # Issue #1122: admin-session auto-promotion. Placed BEFORE the TTY
-  # branch so a Claude Code Bash tool subshell (no TTY) inside the
-  # admin agent is treated as operator-trusted. The agent-id check
-  # mirrors bridge_agent_update_caller_is_admin: both sides stripped,
-  # both must be non-empty, and they must compare equal. A non-admin
-  # session (BRIDGE_AGENT_ID set but not equal to BRIDGE_ADMIN_AGENT_ID)
-  # is NOT promoted and falls through to TTY / agent-direct.
-  local _session_agent _admin_agent
-  _session_agent="${BRIDGE_AGENT_ID:-}"
-  _session_agent="$(printf '%s' "$_session_agent" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  _admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
-  _admin_agent="$(printf '%s' "$_admin_agent" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  if [[ -n "$_session_agent" && -n "$_admin_agent" && "$_session_agent" == "$_admin_agent" ]]; then
-    bridge_agent_update_emit_caller_source_auto_promotion_audit "$_session_agent" "admin-agent-signal"
-    printf '%s' "operator-trusted-id"
-    return 0
-  fi
   if [[ -t 0 && -t 1 ]]; then
     printf '%s' "operator-tui"
     return 0
