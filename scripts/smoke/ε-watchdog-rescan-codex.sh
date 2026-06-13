@@ -125,10 +125,18 @@ assert row["status"] == "unsupported_engine_contract", (
     f"T4: expected unsupported_engine_contract for engine without contract, got {row['status']}"
 )
 
-# unsupported_engine_contract counts as a problem so latest.md surfaces
-# the gap. (broken_links-only on unknown engines would warn — covered in
-# watchdog-profile-contract.py.)
-problem_rows = [r for r in payload["agents"] if r["status"] != "ok"]
+# #1872: unsupported_engine_contract is ADVISORY — it stays visible in the
+# per-agent report (asserted above) but is excluded from problem_count so it no
+# longer regenerates a HIGH `[watchdog] agent profile drift` task for a healthy
+# unknown-engine agent. The expected problem set therefore excludes the pure
+# advisory status. (broken_links-only on unknown engines would warn and IS a
+# problem — covered in watchdog-profile-contract.py and
+# 1872-watchdog-unsupported-engine-info.py.)
+_advisory = {"unsupported_engine_contract"}
+problem_rows = [
+    r for r in payload["agents"]
+    if r["status"] != "ok" and r["status"] not in _advisory
+]
 assert payload["problem_count"] == len(problem_rows), (
     payload["problem_count"], len(problem_rows)
 )

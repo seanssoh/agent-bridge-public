@@ -91,6 +91,42 @@ CODEX_OPTIONAL_PROBES = (".codex/hooks.json",)
 # until a contract is added here.
 KNOWN_ENGINE_CONTRACTS = frozenset({"claude", "codex"})
 
+# #1872: statuses that are INFORMATIONAL/advisory, not operator-actionable
+# problems. ``unsupported_engine_contract`` is emitted by classify_status for
+# an engine the watchdog has no implemented contract for (e.g. antigravity,
+# any future engine) — its mere presence is the signal, NOT drift the operator
+# must fix. A healthy antigravity static agent (heartbeat ok, broken_links 0,
+# onboarding complete) is functionally fine; the only reason it is not "ok" is
+# that the watchdog has nothing to assert about it. Counting that as a problem
+# regenerated a HIGH ``[watchdog] agent profile drift`` task on every scan
+# (patch-agy noise; the fleet closes each as a stale alarm). These rows stay
+# VISIBLE in the report (the per-agent block still renders
+# ``status: unsupported_engine_contract``) but are excluded from the problem
+# count and the HIGH drift-task gate.
+#
+# Scope is the engine-contract status ONLY. A GENUINE problem on an
+# unsupported-engine agent does NOT carry this status — classify_status returns
+# ``warn`` for broken_links even on an unknown engine (the engine-agnostic
+# drift signal), and a scan failure returns ``scan_error``. Those statuses are
+# not in this set and STILL page. Do not add ``warn`` / ``error`` /
+# ``scan_error`` here — that would blanket-suppress real drift on unsupported
+# engines, which is exactly what #1872's negative-control smoke guards against.
+ADVISORY_STATUSES = frozenset({"unsupported_engine_contract"})
+
+
+def is_advisory_status(status: str) -> bool:
+    """True when ``status`` is informational-only (#1872) and must be excluded
+    from the watchdog problem count / HIGH drift-task gate while staying
+    visible in the report. See :data:`ADVISORY_STATUSES`.
+
+    This is deliberately a status-only predicate: it keys on the classified
+    status string, NOT on the engine. A broken-link drift row on an
+    unsupported engine classifies ``warn`` (a genuine problem) and is NOT
+    advisory; only the pure ``unsupported_engine_contract`` no-contract status
+    is.
+    """
+    return status in ADVISORY_STATUSES
+
 
 @dataclass
 class AgentWatch:
@@ -2283,9 +2319,16 @@ def render_markdown(
     # not_found / os_error rows (even on an iso agent) are NOT in this set and
     # stay problems.
     iso_skipped_agents = iso_skipped_agents or set()
+    # #1872: keep the markdown ``- problems:`` summary in lockstep with the JSON
+    # ``problem_count`` — advisory ``unsupported_engine_contract`` rows are NOT
+    # problems. The per-agent block for the advisory row still renders below
+    # (it is in ``records``), so the status stays visible; it is only excluded
+    # from the problem TALLY. Genuine warn/error/scan_error rows are unaffected.
     problems = [
         item for item in records
-        if item.status != "ok" and item.agent not in iso_skipped_agents
+        if item.status != "ok"
+        and not is_advisory_status(item.status)
+        and item.agent not in iso_skipped_agents
     ]
     iso_skipped = [item for item in records if item.agent in iso_skipped_agents]
     orphan_directories = orphan_directories or []
@@ -2717,9 +2760,17 @@ def main() -> int:
         if is_expected_iso_boundary_row(item, registry_meta, host_platform)
         or is_iso_group_stale_downgrade_row(item, host_platform)
     }
+    # #1872: ``unsupported_engine_contract`` rows are advisory, not problems —
+    # exclude them from ``effective_problems`` (and thus from ``problem_count``
+    # and the daemon's HIGH drift-task gate) while leaving the row in
+    # ``records`` so it still renders. ``is_advisory_status`` keys on the
+    # status string only, so a genuine ``warn`` (broken_links) / ``error`` /
+    # ``scan_error`` row on an unsupported-engine agent is NOT excluded and
+    # still pages.
     effective_problems = [
         item for item in records
         if item.status != "ok"
+        and not is_advisory_status(item.status)
         and not item.restart_in_progress
         and item.agent not in iso_skipped_agents
     ]
