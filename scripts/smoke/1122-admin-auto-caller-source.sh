@@ -17,9 +17,15 @@
 #     (the security boundary did not move).
 #   - An anonymous session (no BRIDGE_AGENT_ID or no admin configured)
 #     is STILL rejected.
-#   - An explicit (and bogus) `BRIDGE_CALLER_SOURCE` continues to be
-#     honored over the admin-session signal — bogus values still demote
-#     to agent-direct and deny.
+#   - A NON-admin agent session that FORGES a trusted `BRIDGE_CALLER_SOURCE`
+#     (operator-tui / operator-trusted-id) is STILL rejected. Issue #1879
+#     PR #1887 r3 moved agent-session trust onto the non-forgeable admin
+#     IDENTITY: an agent process carries BRIDGE_AGENT_ID into any
+#     subshell / `bash -c` / `eval`, so a non-admin's inherited
+#     BRIDGE_CALLER_SOURCE claim is ignored and the session stays
+#     agent-direct. The admin agent is promoted by its identity regardless
+#     of any stray inherited BRIDGE_CALLER_SOURCE (it has no need to forge
+#     a source — its admin identity IS the trust).
 #
 # Roster contract: `bridge_reset_roster_maps` (lib/bridge-core.sh) unsets
 # BRIDGE_ADMIN_AGENT_ID before reloading the roster, so the smoke must
@@ -177,19 +183,47 @@ assert_unconfigured_admin_session_denied() {
     "T4: BRIDGE_AGENT_ID set but no admin configured is denied"
 }
 
-assert_explicit_bogus_source_still_demoted() {
+assert_non_admin_forged_source_denied() {
   reset_runtime
   write_admin_roster
   local out
-  # Admin session AND a bogus BRIDGE_CALLER_SOURCE — the explicit
-  # override must continue to take precedence over the admin-session
-  # signal so an operator-set bogus value cannot accidentally pass
-  # through the auto-promotion path.
+  # Non-admin agent session FORGING a trusted BRIDGE_CALLER_SOURCE. Issue
+  # #1879 PR #1887 r3 resolves an agent session (BRIDGE_AGENT_ID set) by
+  # the non-forgeable admin IDENTITY only — a non-admin's inherited
+  # operator-tui / operator-trusted-id claim is ignored, so the session
+  # stays agent-direct and is denied. This is the security-critical case:
+  # the forged claim follows an agent process into ANY bash -c / eval /
+  # subshell, so it MUST NOT confer operator trust on a non-admin agent.
+  out="$(BRIDGE_AGENT_ID="worker_a" BRIDGE_ADMIN_AGENT_ID="$ADMIN" \
+    BRIDGE_CALLER_SOURCE="operator-trusted-id" \
+    run_create dev_test --engine claude --dry-run)"
+  smoke_assert_contains "$out" "caller source agent-direct is not allowed to mutate system config" \
+    "T5: non-admin agent forging operator-trusted-id is still denied (identity wins, #1879 r3)"
+  # operator-tui claim — same outcome, denied.
+  out="$(BRIDGE_AGENT_ID="worker_a" BRIDGE_ADMIN_AGENT_ID="$ADMIN" \
+    BRIDGE_CALLER_SOURCE="operator-tui" \
+    run_create dev_test --engine claude --dry-run)"
+  smoke_assert_contains "$out" "caller source agent-direct is not allowed to mutate system config" \
+    "T5: non-admin agent forging operator-tui is still denied (identity wins, #1879 r3)"
+}
+
+assert_admin_identity_wins_over_stray_source() {
+  reset_runtime
+  write_admin_roster
+  local out
+  # Admin session AND a stray/bogus BRIDGE_CALLER_SOURCE. Issue #1879
+  # PR #1887 r3 — the admin agent's trust is its non-forgeable identity
+  # (BRIDGE_AGENT_ID == BRIDGE_ADMIN_AGENT_ID), NOT the forgeable
+  # BRIDGE_CALLER_SOURCE env claim. A stray inherited value must NOT
+  # demote the admin (the admin has no need to set a source — it never
+  # forges one), so the create plan still reaches the dry-run path.
   out="$(BRIDGE_AGENT_ID="$ADMIN" BRIDGE_ADMIN_AGENT_ID="$ADMIN" \
     BRIDGE_CALLER_SOURCE="definitely-not-trusted" \
     run_create dev_test --engine claude --dry-run)"
-  smoke_assert_contains "$out" "caller source agent-direct is not allowed to mutate system config" \
-    "T5: explicit bogus BRIDGE_CALLER_SOURCE is demoted to agent-direct and denied"
+  smoke_assert_not_contains "$out" "not allowed to mutate system config" \
+    "T6: admin identity is honored even with a stray BRIDGE_CALLER_SOURCE (#1879 r3)"
+  smoke_assert_contains "$out" "agent: dev_test" \
+    "T6: admin-session create reaches the create plan path despite stray source"
 }
 
 main() {
@@ -199,7 +233,8 @@ main() {
   smoke_run "T2: non-admin session still denied"                 assert_non_admin_session_denied
   smoke_run "T3: anonymous session still denied"                 assert_anonymous_session_denied
   smoke_run "T4: no admin configured still denied"               assert_unconfigured_admin_session_denied
-  smoke_run "T5: explicit bogus source still demoted + denied"   assert_explicit_bogus_source_still_demoted
+  smoke_run "T5: non-admin forged trusted source still denied"   assert_non_admin_forged_source_denied
+  smoke_run "T6: admin identity wins over stray source"          assert_admin_identity_wins_over_stray_source
 
   smoke_log "PASS"
 }

@@ -325,8 +325,149 @@ assert_bash_verdict \
   "FOO=bar echo hello" \
   "ALLOW"
 
-# Roster still byte-identical after the ALLOW probes (the hook does not write;
-# only the wrapper would, and these probes never invoke it).
-smoke_assert_eq "$ROSTER_SHA_BEFORE" "$(roster_sha)" "allow: roster bytes still untouched"
+# ===========================================================================
+# SECTION 3 — DENY-IF-WRAPPED (issue #1879 PR #1887 r4, operator-chosen).
+# env-based caller-source trust is fundamentally spoofable inside an agent
+# session: an agent can `env -u BRIDGE_AGENT_ID`, `bash -c '…'`, `eval '…'` to
+# drop/forge the trust env and hide the roster-writing verb from the r2 argv
+# recognizer. The hook now FAILS CLOSED: if it cannot prove a clean top-level
+# un-wrapped set-model/set-effort, it DENIES. Every wrapped/buried spelling
+# below -> DENY, roster byte-identical.
+# ===========================================================================
 
-smoke_log "PASS: agent set-model/set-effort hook anti-spoof gate held (deny spoofs, allow clean)"
+# 3a. ★the exact r3 bypass: forged outer env + `bash -c` that drops the agent
+#     identity and re-forges operator-tui around the direct bridge-agent.sh.
+#     This is the spelling that ALLOWed on r3 head; it must DENY now.
+assert_bash_verdict \
+  "deny: r3 env-u bash-c bypass (set-model)" \
+  "$USER_AGENT" \
+  'env BRIDGE_AGENT_ID=attacker BRIDGE_ADMIN_AGENT_ID=patch BRIDGE_CALLER_SOURCE=operator-tui bash -c "env -u BRIDGE_AGENT_ID BRIDGE_CALLER_SOURCE=operator-tui bash bridge-agent.sh set-model victim claude-opus-4-8"' \
+  "DENY"
+assert_bash_verdict \
+  "deny: r3 env-u bash-c bypass (set-effort)" \
+  "$USER_AGENT" \
+  'env BRIDGE_AGENT_ID=attacker BRIDGE_CALLER_SOURCE=operator-tui bash -c "env -u BRIDGE_AGENT_ID bash bridge-agent.sh set-effort victim xhigh"' \
+  "DENY"
+
+# 3b. plain `bash -c` / `sh -c` burial of the wrapper verb.
+assert_bash_verdict \
+  "deny: bash -c single-quoted burial" \
+  "$USER_AGENT" \
+  "bash -c 'bash bridge-agent.sh set-model victim claude-opus-4-8'" \
+  "DENY"
+assert_bash_verdict \
+  "deny: sh -c burial of agb agent set-model" \
+  "$USER_AGENT" \
+  "sh -c 'agb agent set-model victim claude-opus-4-8'" \
+  "DENY"
+assert_bash_verdict \
+  "deny: bash --command long-flag burial" \
+  "$USER_AGENT" \
+  "bash --command 'agb agent set-effort victim high'" \
+  "DENY"
+
+# 3c. `eval` string burial (incl. a nested `bash -c` inside the eval string).
+assert_bash_verdict \
+  "deny: eval string burial" \
+  "$USER_AGENT" \
+  "eval 'agb agent set-model victim claude-opus-4-8'" \
+  "DENY"
+assert_bash_verdict \
+  "deny: eval nested bash -c burial" \
+  "$USER_AGENT" \
+  "eval 'bash -c \"agb agent set-effort victim xhigh\"'" \
+  "DENY"
+
+# 3d. env-u / env-i prefix that drops the identity around a top-level verb
+#     (clean-recognized, denied by the exact-shape gate — confirms symmetry).
+assert_bash_verdict \
+  "deny: env -u BRIDGE_AGENT_ID prefix" \
+  "$USER_AGENT" \
+  "env -u BRIDGE_AGENT_ID agb agent set-model victim claude-opus-4-8" \
+  "DENY"
+
+# 3e. subshell / command-sub / separator / env -S / time / xargs / exec wraps.
+assert_bash_verdict \
+  "deny: subshell wrap" \
+  "$USER_AGENT" \
+  "(agb agent set-model victim claude-opus-4-8)" \
+  "DENY"
+assert_bash_verdict \
+  "deny: command-sub wrap" \
+  "$USER_AGENT" \
+  'x=$(agb agent set-model victim claude-opus-4-8)' \
+  "DENY"
+assert_bash_verdict \
+  "deny: ; separator burial" \
+  "$USER_AGENT" \
+  "true; agb agent set-model victim claude-opus-4-8" \
+  "DENY"
+assert_bash_verdict \
+  "deny: env -S packed payload" \
+  "$USER_AGENT" \
+  "env -S 'agent-bridge agent' set-model victim claude-opus-4-8" \
+  "DENY"
+assert_bash_verdict \
+  "deny: time wrapper" \
+  "$USER_AGENT" \
+  "time agb agent set-model victim claude-opus-4-8" \
+  "DENY"
+assert_bash_verdict \
+  "deny: xargs wrapper" \
+  "$USER_AGENT" \
+  "echo victim | xargs -I{} agb agent set-model {} claude-opus-4-8" \
+  "DENY"
+assert_bash_verdict \
+  "deny: exec wrapper" \
+  "$USER_AGENT" \
+  "exec agb agent set-model victim claude-opus-4-8" \
+  "DENY"
+
+# 3f. an ADMIN running the wrapped form is ALSO denied — the wrap, not the
+#     role, is the disqualifier (a legit admin runs the verb top-level).
+assert_bash_verdict \
+  "deny: admin wrapped bash -c still denied" \
+  "$ADMIN_AGENT" \
+  "bash -c 'agb agent set-model victim claude-opus-4-8'" \
+  "DENY"
+
+# ===========================================================================
+# SECTION 4 — ★non-target controls: a wrapper/env-mutation construct WITHOUT
+# a set-model/set-effort verb must be UNAFFECTED (the deny-if-wrapped scope is
+# the verb, not the wrapper). These must ALLOW.
+# ===========================================================================
+assert_bash_verdict \
+  "allow: control bash -c echo (no set-model)" \
+  "$USER_AGENT" \
+  "bash -c 'echo hi'" \
+  "ALLOW"
+assert_bash_verdict \
+  "allow: control env FOO=bar echo (no set-model)" \
+  "$USER_AGENT" \
+  "env FOO=bar echo hi" \
+  "ALLOW"
+assert_bash_verdict \
+  "allow: control eval echo (no set-model)" \
+  "$USER_AGENT" \
+  "eval 'echo done'" \
+  "ALLOW"
+# `set-model`/`set-effort` as a bare WORD with no bridge launcher adjacency
+# (echo/grep) must NOT be hijacked by the verb-presence prefilter.
+assert_bash_verdict \
+  "allow: control echo set-model word (no launcher)" \
+  "$USER_AGENT" \
+  "bash -c 'echo set-model is just a word'" \
+  "ALLOW"
+assert_bash_verdict \
+  "allow: control grep set-effort file (no launcher)" \
+  "$USER_AGENT" \
+  "grep set-effort /tmp/notes.txt" \
+  "ALLOW"
+
+# Roster still byte-identical after the deny + allow probes (the hook does not
+# write; only the wrapper would, and these probes never invoke it).
+smoke_assert_eq "$ROSTER_SHA_BEFORE" "$(roster_sha)" "allow: roster bytes still untouched"
+smoke_assert_contains "$(cat "$BRIDGE_ROSTER_LOCAL_FILE")" "$ROSTER_SENTINEL" \
+  "post-wrapped: roster sentinel preserved"
+
+smoke_log "PASS: agent set-model/set-effort hook anti-spoof gate held (deny spoofs + wrapped, allow clean, non-target unaffected)"
