@@ -432,6 +432,108 @@ assert_bash_verdict \
   "DENY"
 
 # ===========================================================================
+# SECTION 3B — ★r4 BYPASS + COMBINED-FLAG / EXOTIC FAMILY (issue #1879 PR #1887
+# r5). r4 enumerated the interpreter command-string FLAGS (`-c`/`--command`) and
+# `bash -lc` slipped through because `-lc` is not equal to `-c` (the 4th bypass).
+# r5 inverts to an ALLOWLIST: the hook re-exposes EVERY token and re-tests the
+# launcher+verb adjacency, so any combined/long/here-string/substitution spelling
+# that carries the verb is DENIED by NOT being the clean top-level shape — no
+# wrapper enumeration. Every form below -> DENY, roster byte-identical.
+# ===========================================================================
+
+# 3B-a. ★THE r4 BYPASS — forged outer env + `bash -lc` dropping the agent identity
+#       and re-forging operator-tui around the direct bridge-agent.sh. ALLOWed on
+#       r4 head (the blocking bug); it MUST DENY now.
+assert_bash_verdict \
+  "deny: r4 bash -lc bypass (set-model)" \
+  "$USER_AGENT" \
+  'env BRIDGE_AGENT_ID=attacker BRIDGE_ADMIN_AGENT_ID=patch BRIDGE_CALLER_SOURCE=operator-tui bash -lc "env -u BRIDGE_AGENT_ID BRIDGE_CALLER_SOURCE=operator-tui bash bridge-agent.sh set-model victim claude-opus-4-8"' \
+  "DENY"
+
+# 3B-b. combined interpreter flags `-lc` / `-ic` carrying the verb.
+assert_bash_verdict \
+  "deny: bash -lc burial" \
+  "$USER_AGENT" \
+  "bash -lc 'agb agent set-model victim claude-opus-4-8'" \
+  "DENY"
+assert_bash_verdict \
+  "deny: bash -ic burial" \
+  "$USER_AGENT" \
+  "bash -ic 'agb agent set-effort victim xhigh'" \
+  "DENY"
+assert_bash_verdict \
+  "deny: sh -lc burial" \
+  "$USER_AGENT" \
+  "sh -lc 'agb agent set-model victim claude-opus-4-8'" \
+  "DENY"
+
+# 3B-c. option-bearing interpreter forms: `--rcfile X -c`, `-l -c`.
+assert_bash_verdict \
+  "deny: bash --rcfile X -c burial" \
+  "$USER_AGENT" \
+  "bash --rcfile /tmp/x -c 'agb agent set-model victim claude-opus-4-8'" \
+  "DENY"
+assert_bash_verdict \
+  "deny: bash -l -c burial" \
+  "$USER_AGENT" \
+  "bash -l -c 'agb agent set-effort victim high'" \
+  "DENY"
+
+# 3B-d. env-mutation prefix + combined `-lc` (the r4 spelling minus the inner env).
+assert_bash_verdict \
+  "deny: env-mutation + bash -lc burial" \
+  "$USER_AGENT" \
+  "FOO=bar bash -lc 'agb agent set-model victim claude-opus-4-8'" \
+  "DENY"
+
+# 3B-e. here-string body feeding an interpreter (the `<<` embedding the clean
+#       path never re-scans because the verb is in the body, not at top level).
+assert_bash_verdict \
+  "deny: bash here-string body burial" \
+  "$USER_AGENT" \
+  "bash <<< 'agb agent set-model victim claude-opus-4-8'" \
+  "DENY"
+
+# 3B-f. process/command substitution carrying the verb.
+assert_bash_verdict \
+  "deny: process-substitution <( ) burial" \
+  "$USER_AGENT" \
+  "cat <(agb agent set-model victim claude-opus-4-8)" \
+  "DENY"
+assert_bash_verdict \
+  "deny: command-substitution \$( ) burial" \
+  "$USER_AGENT" \
+  'printf %s "$(agb agent set-model victim claude-opus-4-8)"' \
+  "DENY"
+
+# 3B-g. `command bash -lc` and `xargs` wraps around the verb.
+assert_bash_verdict \
+  "deny: command bash -lc wrap" \
+  "$USER_AGENT" \
+  "command bash -lc 'agb agent set-model victim claude-opus-4-8'" \
+  "DENY"
+assert_bash_verdict \
+  "deny: xargs feed of the verb" \
+  "$USER_AGENT" \
+  "echo victim | xargs -I{} agb agent set-model {} claude-opus-4-8" \
+  "DENY"
+
+# 3B-h. `;` / `&&` burial of the verb after a benign leader.
+assert_bash_verdict \
+  "deny: ; separator burial (3B)" \
+  "$USER_AGENT" \
+  "true; agb agent set-model victim claude-opus-4-8" \
+  "DENY"
+assert_bash_verdict \
+  "deny: && separator burial (3B)" \
+  "$USER_AGENT" \
+  "true && agb agent set-effort victim xhigh" \
+  "DENY"
+
+# Confirm the r5 family wrote NOTHING (roster byte-identical).
+smoke_assert_eq "$ROSTER_SHA_BEFORE" "$(roster_sha)" "deny: roster bytes untouched after r5 combined-flag/exotic denies"
+
+# ===========================================================================
 # SECTION 4 — ★non-target controls: a wrapper/env-mutation construct WITHOUT
 # a set-model/set-effort verb must be UNAFFECTED (the deny-if-wrapped scope is
 # the verb, not the wrapper). These must ALLOW.
@@ -440,6 +542,14 @@ assert_bash_verdict \
   "allow: control bash -c echo (no set-model)" \
   "$USER_AGENT" \
   "bash -c 'echo hi'" \
+  "ALLOW"
+# ★r5 control: the combined-flag interpreter without the verb must NOT be
+# over-blocked by the allowlist-inversion re-exposure (the deny scope is the
+# launcher+verb adjacency, not the `-lc` wrapper itself).
+assert_bash_verdict \
+  "allow: control bash -lc echo (no set-model)" \
+  "$USER_AGENT" \
+  "bash -lc 'echo hi'" \
   "ALLOW"
 assert_bash_verdict \
   "allow: control env FOO=bar echo (no set-model)" \

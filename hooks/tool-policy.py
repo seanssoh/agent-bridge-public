@@ -5547,84 +5547,94 @@ def _agent_set_launch_field_stage_has_verb(toks: "list[str]") -> bool:
     return False
 
 
-# Interpreter `-c` / `--command` string-argument flags. `bash -c '<cmd>'` /
-# `sh -c '<cmd>'` re-parse their string argument as a fresh command at runtime;
-# the argument arrives at the hook as a single opaque shlex token, so the
-# `agent set-model` verb buried inside it is invisible to the clean-stage
-# recognizer. The wrapped recognizer below re-scans that inner string.
-_INTERP_DASH_C_FLAGS = frozenset({"-c", "--command"})
-_SHELL_INTERPRETER_LEAVES = frozenset({"bash", "sh", "dash", "zsh", "ksh", "mksh"})
-
-
 def _agent_set_launch_field_inner_command_strings(
     text: str, depth: int = 0
 ) -> "list[str]":
-    """Yield *text* plus the inner command string of every ``-c``/``--command``
-    interpreter argument and every ``eval`` argument it contains, recursively.
+    """Yield *text* plus EVERY token that could be re-parsed as a command at
+    runtime, recursively — an ALLOWLIST-INVERSION re-exposure, not a wrapper
+    blocklist.
 
     The clean-stage recognizer (`_agent_set_launch_field_attempt_present`) only
     sees verbs that survive as their own shlex tokens at the top level. A verb
-    hidden inside ``bash -c '<cmd>'`` / ``sh -c "<cmd>"`` / ``eval '<cmd>'``
-    arrives as a single opaque string token, so the adjacency scan misses it
-    (issue #1879 PR #1887 r4 — the env-u bash-c bypass). This re-exposes those
-    inner strings (bounded recursion depth so a pathological nest cannot spin)
-    so the wrapped recognizer can scan them for the launcher+verb adjacency.
+    hidden inside an interpreter command string — ``bash -c '<cmd>'``,
+    ``bash -lc '<cmd>'``, ``bash -ic '<cmd>'``, ``sh --rcfile X -c '<cmd>'``,
+    ``eval '<cmd>'``, a here-string body ``bash <<< '<cmd>'``, a process/command
+    substitution ``<(… set-model …)`` / ``$(… set-model …)``, ``xargs … set-model``
+    — arrives as ONE opaque shlex token, so the top-level adjacency scan misses
+    it. PR #1887 r4 tried to enumerate the wrapping FLAGS (`-c`/`--command`) and
+    `bash -lc` slipped through because `-lc` is not equal to `-c` (the 4th bypass).
+    The lesson is decisive: a blocklist of wrapper spellings is always incomplete
+    (`-lc`/`-ic`/`--rcfile`/here-strings/process-subst/…).
+
+    So instead of enumerating which flag carries the inner command, we re-expose
+    EVERY non-flag token recursively and let the launcher+verb ADJACENCY scan
+    decide. A benign token (`victim`, `claude-opus-4-8`, `echo`, an arbitrary
+    string) re-parses to itself / harmless tokens with no `bridge-agent.sh
+    set-model` or `(agb|agent-bridge) agent set-model` adjacency, so it is not
+    recognized; only a token that actually embeds a launcher+verb invocation
+    surfaces one. This makes the wrapped recognizer spelling-agnostic: any present
+    or future interpreter-flag spelling that carries the verb is caught because
+    the verb's launcher adjacency reappears once the carrying token is re-parsed,
+    NOT because we recognized the flag. Recursion depth is bounded (each wrapping
+    layer costs ~2 levels — one to surface the inner command-string token, one to
+    re-parse it — so the cap covers ~6 nested wraps, far past any realistic attack
+    AND past the point bash's own quote-nesting stays parseable, while a
+    pathological nest still cannot spin).
     """
     fragments: list[str] = [text]
-    if depth > 6:
+    if depth > 12:
         return fragments
     for toks in _normalized_command_stages(text):
-        n = len(toks)
-        for i in range(n):
-            leaf = toks[i].rsplit("/", 1)[-1]
-            # `eval '<cmd>'` — every following non-option token is re-parsed.
-            if leaf == "eval":
-                for j in range(i + 1, n):
-                    if toks[j].startswith("-"):
-                        continue
-                    fragments.extend(
-                        _agent_set_launch_field_inner_command_strings(
-                            toks[j], depth + 1
-                        )
-                    )
+        for tok in toks:
+            # Skip option flags themselves (`-lc`, `--rcfile`, `--command`) and
+            # the literal launcher/verb tokens already visible at this level:
+            # re-parsing an option flag or a plain word yields nothing new, and
+            # the top-level stage that produced `toks` is already scanned by the
+            # caller. Re-parse only tokens that carry embedded shell text — i.e.
+            # tokens whose shlex split differs from the single token itself, the
+            # signature of a quoted/composite command-string argument.
+            if tok.startswith("-"):
                 continue
-            # `<interp> -c '<cmd>'` / `<interp> --command '<cmd>'` — the token
-            # right after the `-c`/`--command` flag is the command string.
-            if leaf in _SHELL_INTERPRETER_LEAVES:
-                for j in range(i + 1, n):
-                    if toks[j] in _INTERP_DASH_C_FLAGS:
-                        if j + 1 < n:
-                            fragments.extend(
-                                _agent_set_launch_field_inner_command_strings(
-                                    toks[j + 1], depth + 1
-                                )
-                            )
-                        break
+            try:
+                inner = shlex.split(tok, posix=True, comments=False)
+            except ValueError:
+                # Unparseable inner — keep verbatim so its literal text still
+                # reaches the scan (fail-closed; never drops a candidate).
+                inner = None
+            if inner is None or inner != [tok]:
+                fragments.extend(
+                    _agent_set_launch_field_inner_command_strings(tok, depth + 1)
+                )
     return fragments
 
 
 def _agent_set_launch_field_wrapped_present(text: str) -> bool:
-    """True iff *text* invokes `agent set-model`/`set-effort` through a shell
-    wrapper / env-mutation construct that hides the verb from the clean-stage
-    recognizer — i.e. buried inside a ``bash -c '…'`` / ``sh -c "…"`` / ``eval
-    '…'`` command string (issue #1879 PR #1887 r4).
+    """True iff *text* reaches a roster-writing `agent set-model`/`set-effort`
+    launcher invocation through ANY construct that hides the verb from the
+    clean-stage recognizer — an interpreter command string regardless of flag
+    spelling (``bash -c`` / ``bash -lc`` / ``bash -ic`` / ``sh --rcfile X -c`` /
+    ``bash -l -c``), an ``eval`` string, a here-string body (``bash <<< '…'``),
+    a process/command substitution (``<(…)`` / ``$(…)``), an ``xargs …`` feed,
+    a ``command``/``exec``/``time`` prefix wrapping such a form — issue #1879
+    PR #1887 r5.
 
-    SCOPE (critical): this is gated on the verb ACTUALLY being present. The
-    substring prefilter returns False for any command without `set-model`/
-    `set-effort` in it, so a normal `bash -c 'echo hi'` / `env FOO=bar cmd` is
-    UNAFFECTED. And the launcher+verb adjacency requirement means a benign
-    `echo set-model` / `grep set-model file` (verb word but no
-    `bridge-agent.sh` / `(agb|agent-bridge) agent` launcher) is NOT recognized.
-    Only a real wrapped roster-writing invocation matches.
+    This is the ALLOWLIST-INVERSION half of the gate: the caller ALLOWS only a
+    clean, top-level, un-wrapped launcher invocation (the clean-stage recognizer
+    + exact-shape TEETH) and DENIES everything else that still embeds the
+    launcher+verb adjacency anywhere. We do NOT enumerate wrapper spellings; we
+    re-expose every token (`_agent_set_launch_field_inner_command_strings`) and
+    test the SAME launcher+verb adjacency scan, so `-lc`/`-ic`/`--rcfile`/
+    here-strings/substitutions and every future spelling are caught by NOT being
+    the clean top-level shape, not by being on a blocklist.
 
-    The clean-stage recognizer already surfaces (and the exact-shape gate then
-    denies) every form where the verb survives as a top-level token — env/exec/
-    nohup/setsid/time prefixes, leading `VAR=`, `;`/`&&`/`||`/`|` separators,
-    `(…)` subshells, `$(…)` command-sub, `env -S` packed payloads. This wrapped
-    recognizer only ADDS the `-c`/`eval` string-burial class that the clean
-    recognizer cannot see; the caller DENIES any match (fail-closed
-    deny-if-wrapped), because a legitimate caller has no reason to wrap a
-    privileged roster mutation in an interpreter string.
+    SCOPE (critical): gated on the verb ACTUALLY being present AND adjacent to a
+    real bridge launcher. The substring prefilter returns False for any command
+    without `set-model`/`set-effort` in it, so a normal `bash -lc 'echo hi'` /
+    `env FOO=bar cmd` is UNAFFECTED. And the launcher+verb adjacency requirement
+    means a benign `echo set-model` / `grep set-effort file` /
+    `bash -c 'echo set-model is just a word'` (verb word but no `bridge-agent.sh`
+    / `(agb|agent-bridge) agent` launcher) is NOT recognized. Only a real wrapped
+    roster-writing invocation matches.
     """
     stripped = _SHELL_QUOTE_ESCAPE_RE.sub("", text)
     if "set-model" not in stripped and "set-effort" not in stripped:
@@ -5775,47 +5785,56 @@ def _agent_set_launch_field_check(
       the wrapper's #341 caller-source trust gate + audit row apply.
     - ``(False, str)``  — recognized attempt but rejected (env-assignment spoof,
       shell embedding/redirect/separator, non-canonical prefix shape, or a
-      `bash -c`/`eval` wrapped/buried invocation — issue #1879 r4). Returned so
-      a spoof/smuggle cannot fall through to a silent allow at the peer/shared
-      gate.
+      wrapped/buried invocation through ANY interpreter command string / eval /
+      here-string / substitution — issue #1879 r4/r5). Returned so a
+      spoof/smuggle cannot fall through to a silent allow at the peer/shared gate.
     - ``(False, None)`` — not one of these verbs at all; fall through unchanged.
 
     Mirrors the `config set-env` envelope (issue #1879): these verbs name NO
     protected path in argv, so this exact-shape + anti-spoof gate is the sole
     hook boundary against an agent forging `BRIDGE_CALLER_SOURCE=operator-tui`
-    in front of the roster-writing wrapper. r4 hardens this to FAIL-CLOSED
-    deny-if-wrapped: env-based caller-source trust is fundamentally spoofable
-    from inside an agent session (`env -u BRIDGE_AGENT_ID`, `bash -c`, `eval`,
-    a forged `BRIDGE_CALLER_SOURCE`), so the hook ALLOWS only a clean, top-level,
-    un-wrapped invocation with no env mutation and DENIES every wrapped/buried
-    form. The hook's authority is its OWN process env identity (the session
-    `BRIDGE_AGENT_ID`, unspoofable by the agent's Bash children); the wrapper's
-    #341/#1122 identity gate is defense-in-depth, and the value allowlist +
-    shlex.quote launch-token live on the writer side and are unchanged here.
+    in front of the roster-writing wrapper. r4/r5 harden this to FAIL-CLOSED
+    ALLOWLIST INVERSION: env-based caller-source trust is fundamentally spoofable
+    from inside an agent session (`env -u BRIDGE_AGENT_ID`, `bash -c`/`-lc`/`-ic`,
+    `eval`, a forged `BRIDGE_CALLER_SOURCE`), so the hook ALLOWS only a clean,
+    top-level, un-wrapped invocation with no env mutation and DENIES everything
+    else that still embeds the launcher+verb adjacency — r5 stops enumerating
+    wrapper spellings (r4's `-c`/`--command` blocklist let `bash -lc` through,
+    the 4th bypass) and instead re-exposes every token, so any present/future
+    wrapper spelling is denied by NOT being the clean shape. The hook's authority
+    is its OWN process env identity (the session `BRIDGE_AGENT_ID`, unspoofable by
+    the agent's Bash children); the wrapper's #341/#1122 identity gate is
+    defense-in-depth, and the value allowlist + shlex.quote launch-token live on
+    the writer side and are unchanged here.
     """
     # RECOGNITION: is any command stage a CLEAN top-level set-model/set-effort
     # invocation (the verb surviving as its own shlex token)? If not, it is
-    # either (a) the verb buried inside a `bash -c '…'` / `eval '…'` string the
-    # clean recognizer cannot see, or (b) not our verb at all.
+    # either (a) the verb buried inside an interpreter command string / eval /
+    # here-string / substitution the clean recognizer cannot see, or (b) not our
+    # verb at all.
     if not _agent_set_launch_field_attempt_present(text):
-        # DENY-IF-WRAPPED (issue #1879 PR #1887 r4) — the operator-chosen
-        # fail-closed close of the env-based caller-source trust bypass. An
-        # agent could defeat the r2 argv recognizer (and the r3 wrapper-side
-        # identity gate) by hiding the roster-writing verb inside an interpreter
-        # string while dropping/forging the trust env:
-        #   env BRIDGE_AGENT_ID=x bash -c "env -u BRIDGE_AGENT_ID \
+        # DENY-IF-WRAPPED, now an ALLOWLIST INVERSION (issue #1879 PR #1887 r5).
+        # env-based caller-source trust is fundamentally spoofable from inside an
+        # agent session, so the only safe gate is: ALLOW only a clean top-level
+        # un-wrapped launcher invocation, DENY everything else that still embeds
+        # the launcher+verb adjacency anywhere. r4 tried to enumerate the
+        # wrapping flags (`-c`/`--command`/`eval`) and `bash -lc` slipped through
+        # because `-lc` != `-c` (the 4th bypass):
+        #   env BRIDGE_AGENT_ID=x bash -lc "env -u BRIDGE_AGENT_ID \
         #       BRIDGE_CALLER_SOURCE=operator-tui bash bridge-agent.sh \
         #       set-model victim <m>"
-        # The clean recognizer never sees `set-model` (it is one opaque
-        # `-c` string token), so the call used to fall through to a silent
-        # allow. Here we re-scan the inner `-c`/`eval` command strings: if a
-        # real launcher+verb invocation hides in one, DENY — the hook cannot
-        # prove a clean, top-level, un-wrapped set-model/set-effort with no env
-        # mutation, and a legitimate caller has no reason to wrap a privileged
-        # roster mutation. SCOPE: this is gated on the verb actually being
-        # present + a real bridge launcher adjacency, so a normal
-        # `bash -c 'echo hi'` / `env FOO=bar cmd` (no set-model/set-effort) is
-        # UNAFFECTED.
+        # The clean recognizer never sees `set-model` (it is one opaque `-lc`
+        # string token). Rather than chase the next flag spelling, the wrapped
+        # recognizer now re-exposes EVERY token recursively and re-runs the SAME
+        # launcher+verb adjacency scan, so `-lc`/`-ic`/`--rcfile X -c`/`-l -c`/
+        # here-strings (`bash <<< '…'`)/substitutions (`$(…)`/`<(…)`)/`xargs`/
+        # `command`/`exec`/`time` wraps — and any future spelling — are denied by
+        # NOT being the clean top-level shape, not by being on a blocklist. The
+        # hook cannot prove a clean, un-wrapped, un-mutated invocation, and a
+        # legitimate caller has no reason to wrap a privileged roster mutation.
+        # SCOPE: gated on the verb actually being present + a real bridge
+        # launcher adjacency, so a normal `bash -lc 'echo hi'` / `env FOO=bar cmd`
+        # / `echo set-model` / `grep set-effort file` (no launcher) is UNAFFECTED.
         if _agent_set_launch_field_wrapped_present(text):
             _emit_agent_set_launch_field_denied_audit(
                 agent,
@@ -5825,8 +5844,10 @@ def _agent_set_launch_field_check(
             )
             return False, (
                 "agent-bridge agent set-model/set-effort: the verb is reached "
-                "through a shell wrapper / env-mutation construct (bash -c / "
-                "sh -c / eval string burial). Only a clean top-level "
+                "through a shell wrapper / env-mutation construct (any "
+                "interpreter command string — bash -c / -lc / -ic / --rcfile, "
+                "eval, here-string, $(…)/<(…), xargs, command/exec/time wrap). "
+                "Only a clean top-level "
                 "`(agb|agent-bridge) agent set-model|set-effort <agent> <value>` "
                 "(or `[bash] bridge-agent.sh set-model|set-effort …`) with no "
                 "wrapping or env mutation is allowed"
