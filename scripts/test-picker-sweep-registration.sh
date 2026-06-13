@@ -103,7 +103,7 @@ if [[ "\$1" == "cron" ]]; then
         esac
       done
       python3 - "\$JOBS_FILE" "\$title" "\$payload" "\$agent" "\$run_as_agent" "\$schedule" "\$kind" "\$script" "\${env_pairs[@]}" <<'PY'
-import json, sys
+import json, secrets, sys
 path, title, payload, agent, run_as_agent, schedule, kind, script = sys.argv[1:9]
 env_pairs = sys.argv[9:]
 env = {}
@@ -114,7 +114,15 @@ for raw in env_pairs:
 with open(path, "r", encoding="utf-8") as fh:
     data = json.load(fh)
 jobs = data.setdefault("jobs", [])
-record = {"title": title, "agent": agent, "schedule": schedule, "payload": {"kind": kind}}
+# bridge-cron.py dedups on (agent, title), not title alone — mirror that so the
+# coexist case (two same-title rows, different agents) is reproducible.
+if any(j.get("title") == title and j.get("agent") == agent for j in jobs):
+    sys.stderr.write("native cron job already exists for agent/title\n")
+    sys.exit(1)
+# Assign a unique id like the real CLI (slug + hex token) so the migration can
+# delete the legacy row BY ID.
+job_id = "%s-%s" % (title, secrets.token_hex(4))
+record = {"id": job_id, "title": title, "agent": agent, "schedule": schedule, "payload": {"kind": kind}}
 if kind == "shell":
     record["payload"]["script"] = script
     record["payload"]["env"] = env
@@ -130,12 +138,24 @@ PY
     delete)
       shift
       ref="\${1:-}"
+      # Mirror bridge-cron.py resolve_show_record: delete by exact id OR exact
+      # title, but REJECT (rc=2) when an exact-title ref matches >1 row — that is
+      # the ambiguity the by-id migration must avoid.
       python3 - "\$JOBS_FILE" "\$ref" <<'PY'
 import json, sys
 path, ref = sys.argv[1:3]
 with open(path, "r", encoding="utf-8") as fh:
     data = json.load(fh)
-data["jobs"] = [j for j in data.get("jobs", []) if j.get("title") != ref]
+jobs = data.get("jobs", [])
+exact = [j for j in jobs if j.get("id") == ref or j.get("title") == ref]
+if len(exact) > 1:
+    sys.stderr.write("error: multiple jobs matched exactly for %r\n" % ref)
+    sys.exit(2)
+if not exact:
+    sys.stderr.write("error: native job not found: %s\n" % ref)
+    sys.exit(2)
+target = exact[0]
+data["jobs"] = [j for j in jobs if j is not target]
 with open(path, "w", encoding="utf-8") as fh:
     json.dump(data, fh)
 PY
@@ -150,15 +170,17 @@ MOCK_CLI
 }
 
 # Seed a legacy TEXT-kind picker-sweep job (the broken codex-pair form) so the
-# migration path can be exercised.
+# migration path can be exercised. Carries an id (slug + hex) like the real CLI
+# so the by-id migration delete can target it.
 seed_legacy_text_job() {
   local jobs_file="$1"
   python3 - "$jobs_file" <<'PY'
-import json, sys
+import json, secrets, sys
 path = sys.argv[1]
 with open(path, "r", encoding="utf-8") as fh:
     data = json.load(fh)
 data.setdefault("jobs", []).append({
+    "id": "picker-sweep-%s" % secrets.token_hex(4),
     "title": "picker-sweep",
     "agent": "patch-dev",
     "schedule": "*/10 * * * *",
@@ -166,6 +188,54 @@ data.setdefault("jobs", []).append({
 })
 with open(path, "w", encoding="utf-8") as fh:
     json.dump(data, fh)
+PY
+}
+
+# Seed a fixed SHELL-kind picker-sweep job (run-as the admin/controller) — the
+# correct row. Used by the coexist case to verify the migration keeps it.
+seed_fixed_shell_job() {
+  local jobs_file="$1" admin="${2:-patch}"
+  python3 - "$jobs_file" "$admin" <<'PY'
+import json, secrets, sys
+path, admin = sys.argv[1:3]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+data.setdefault("jobs", []).append({
+    "id": "picker-sweep-%s" % secrets.token_hex(4),
+    "title": "picker-sweep",
+    "agent": admin,
+    "schedule": "*/10 * * * *",
+    "payload": {
+        "kind": "shell",
+        "script": "$BRIDGE_HOME/scripts/picker-sweep.sh",
+        "env": {
+            "SCRIPT_PICKER_SWEEP_ENABLED": "1",
+            "SCRIPT_PICKER_SWEEP_SELF": admin,
+            "SCRIPT_PICKER_SWEEP_NOTIFY": admin,
+        },
+    },
+    "execution": {"runAsAgent": admin},
+})
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh)
+PY
+}
+
+# Count picker-sweep jobs of a given payload kind.
+count_picker_sweep_jobs_kind() {
+  local jobs_file="$1" want="$2"
+  python3 - "$jobs_file" "$want" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+want = sys.argv[2]
+n = 0
+for j in data.get("jobs", []):
+    if j.get("title") != "picker-sweep":
+        continue
+    if (j.get("payload") or {}).get("kind", "") == want:
+        n += 1
+print(n)
 PY
 }
 
@@ -396,6 +466,50 @@ if [[ "$R7_PRE_KIND" == "text" && "$R7_COUNT" == "1" && "$R7_POST_KIND" == "shel
   ok
 else
   err "pre_kind=$R7_PRE_KIND count=$R7_COUNT post_kind=$R7_POST_KIND post_run_as=$R7_POST_RUNAS (expected text / 1 / shell / patch)"
+fi
+
+# ---------------------------------------------------------------------------
+# R9: coexist migration (#1888 r2 finding 3). Native cron dedups on
+#     (agent, title), so an upgraded/partially-repaired host can hold BOTH a
+#     legacy `patch-dev/picker-sweep` (text) AND a fixed `patch/picker-sweep`
+#     (shell) row at once. In that state `cron delete picker-sweep` (by title)
+#     is AMBIGUOUS and the real CLI rejects it (`multiple jobs matched
+#     exactly`). The migration must enumerate + delete the LEGACY text row BY ID,
+#     keep the shell row, and end with EXACTLY ONE shell-kind job — idempotently.
+# ---------------------------------------------------------------------------
+step "R9: legacy text + fixed shell coexist → migration removes only legacy, keeps shell (exactly one shell job)"
+R9_DIR="$TMP_ROOT/r9"
+R9_CLI="$(setup_mock_cli "$R9_DIR")"
+R9_JOBS="$R9_DIR/jobs.json"
+mkdir -p "$R9_DIR/state/install"
+printf '{"profile":"server"}\n' > "$R9_DIR/state/install/host-profile.json"
+export BRIDGE_HOME="$R9_DIR"
+export BRIDGE_STATE_DIR="$R9_DIR/state"
+# Seed both rows: legacy text (patch-dev) + fixed shell (patch).
+seed_legacy_text_job "$R9_JOBS"
+seed_fixed_shell_job "$R9_JOBS" patch
+R9_PRE_TOTAL="$(count_picker_sweep_jobs "$R9_JOBS")"
+R9_PRE_TEXT="$(count_picker_sweep_jobs_kind "$R9_JOBS" text)"
+R9_PRE_SHELL="$(count_picker_sweep_jobs_kind "$R9_JOBS" shell)"
+
+# First migration pass: must remove ONLY the legacy text row, keep the shell.
+run_register "$R9_CLI" >/dev/null 2>&1
+R9_TOTAL_1="$(count_picker_sweep_jobs "$R9_JOBS")"
+R9_TEXT_1="$(count_picker_sweep_jobs_kind "$R9_JOBS" text)"
+R9_SHELL_1="$(count_picker_sweep_jobs_kind "$R9_JOBS" shell)"
+R9_RUNAS_1="$(picker_sweep_field "$R9_JOBS" execution.runAsAgent)"
+
+# Second pass: idempotent — still exactly one shell job, no text, no dup.
+run_register "$R9_CLI" >/dev/null 2>&1
+R9_TOTAL_2="$(count_picker_sweep_jobs "$R9_JOBS")"
+R9_SHELL_2="$(count_picker_sweep_jobs_kind "$R9_JOBS" shell)"
+
+if [[ "$R9_PRE_TOTAL" == "2" && "$R9_PRE_TEXT" == "1" && "$R9_PRE_SHELL" == "1" \
+   && "$R9_TOTAL_1" == "1" && "$R9_TEXT_1" == "0" && "$R9_SHELL_1" == "1" && "$R9_RUNAS_1" == "patch" \
+   && "$R9_TOTAL_2" == "1" && "$R9_SHELL_2" == "1" ]]; then
+  ok
+else
+  err "pre(total/text/shell)=$R9_PRE_TOTAL/$R9_PRE_TEXT/$R9_PRE_SHELL pass1(total/text/shell/runas)=$R9_TOTAL_1/$R9_TEXT_1/$R9_SHELL_1/$R9_RUNAS_1 pass2(total/shell)=$R9_TOTAL_2/$R9_SHELL_2 (expected pre 2/1/1, pass1 1/0/1/patch, pass2 1/1)"
 fi
 
 # ---------------------------------------------------------------------------

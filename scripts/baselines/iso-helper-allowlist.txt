@@ -77,3 +77,10 @@ scripts/smoke/1728-test-bind-state-path-guard-helper.py
 scripts/smoke/1825-ms365-token-key-by-claim.sh
 scripts/smoke/1820-rc4-iso-stale-group-preflight.sh
 scripts/smoke/1820-rc4-watchdog-settings-source.sh
+
+# #1888 picker-sweep registration regression suite — the `.env` matches are all
+# dotted JSON paths into the cron payload's `env` MAP (`payload.env`,
+# `payload.env.SCRIPT_PICKER_SWEEP_*`) used to ASSERT the shell-kind cron's
+# script-env contract against a mktemp jobs.json fixture; never a controller->iso
+# boundary RW (same shape as the #1520c / #1533 / #1825 fixture entries).
+scripts/test-picker-sweep-registration.sh

@@ -1292,7 +1292,15 @@ run_enqueue() {
       [[ -n "$shell_os_user" ]] || shell_os_user="$(id -un)"
       shell_uid="$(id -u "$shell_os_user")"
       shell_gid="$(id -g "$shell_os_user")"
-      shell_home="$(getent passwd "$shell_os_user" 2>/dev/null | awk -F: '{print $6}' | head -n1)"
+      # #1888 r2: `getent` is absent on macOS. Under `set -euo pipefail` an
+      # unguarded `getent ...` command substitution exits 127 and aborts the
+      # whole runner BEFORE the dscl fallback can run, breaking the
+      # controller-direct shell cron path on macOS. Guard with `command -v`
+      # and `|| true` so a missing getent falls through to dscl / `cd ~`.
+      shell_home=""
+      if command -v getent >/dev/null 2>&1; then
+        shell_home="$(getent passwd "$shell_os_user" 2>/dev/null | awk -F: '{print $6}' | head -n1 || true)"
+      fi
       # macOS / no-getent fallback: dscl, then the controller's own home via `cd ~`.
       [[ -n "$shell_home" ]] || shell_home="$(dscl . -read "/Users/$shell_os_user" NFSHomeDirectory 2>/dev/null | awk '{print $2}' | head -n1)"
       [[ -n "$shell_home" ]] || shell_home="$(cd ~ 2>/dev/null && pwd)"

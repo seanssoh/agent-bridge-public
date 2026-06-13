@@ -149,8 +149,18 @@ run_ordering_probe() {
 
   # Isolated roster file: starts with the admin only (the pre-create state a
   # first-run init reaches after the admin `agent create`).
+  #
+  # #1888 r2 (codex BLOCKING finding 2): register a REAL admin record, not just
+  # the id. `bridge_agent_exists` checks BRIDGE_AGENT_SESSION[<id>] (not
+  # BRIDGE_AGENT_IDS), so a bare `bridge_add_agent_id_if_missing patch` left the
+  # picker-sweep `bridge_agent_exists patch` gate failing
+  # (`admin agent patch not in roster`). Write the BRIDGE_AGENT_SESSION entry the
+  # admin `agent create` actually persists so the gate sees a real admin.
   local roster_local="$probe_dir/agent-roster.local.sh"
-  printf 'bridge_add_agent_id_if_missing %q\n' "$admin" >"$roster_local"
+  {
+    printf 'bridge_add_agent_id_if_missing %q\n' "$admin"
+    printf 'BRIDGE_AGENT_SESSION[%q]=%q\n' "$admin" "$admin"
+  } >"$roster_local"
 
   # CLI shim: handles the two subcommands the helpers invoke.
   #   - `agent create <name> …` → append a roster block that registers the
@@ -279,6 +289,12 @@ assert_server_codex_absent_solo() {
 # (codex r1 BLOCKING): the provisioning helper must invalidate + reload the
 # parent's roster cache after the child `agent create`, or the immediately
 # following picker-sweep `bridge_agent_exists` gate sees stale state and skips.
+#
+# #1888 r2 (codex BLOCKING finding 2): picker-sweep is now a SHELL-kind
+# controller-direct cron run-as the ADMIN (resolves to the controller UID) — NOT
+# a TEXT-kind dispatch to the `<admin>-dev` codex pair (a codex cron-subagent
+# cannot exec a bash payload). Assert the new contract: `--kind shell --agent
+# patch --run-as-agent patch` carrying the SCRIPT_PICKER_SWEEP_* env.
 assert_first_run_provisions_and_registers_cron() {
   local out cron_log
   out="$(run_ordering_probe patch)"
@@ -290,8 +306,16 @@ assert_first_run_provisions_and_registers_cron() {
   [[ -n "$cron_log" ]] || smoke_fail "first-run ordering: picker-sweep cron was not registered in the same run (stale-cache regression). Helper output: $out"
   smoke_assert_contains "$cron_log" "picker-sweep" \
     "first-run ordering: registered cron must be the picker-sweep job"
-  smoke_assert_contains "$cron_log" "--agent patch-dev" \
-    "first-run ordering: picker-sweep cron must target the freshly created <admin>-dev pair"
+  smoke_assert_contains "$cron_log" "--kind shell" \
+    "first-run ordering: picker-sweep cron must be SHELL-kind (controller-direct, engine-independent)"
+  smoke_assert_contains "$cron_log" "--agent patch" \
+    "first-run ordering: picker-sweep cron must target the admin (controller UID), not the codex pair"
+  smoke_assert_contains "$cron_log" "--run-as-agent patch" \
+    "first-run ordering: picker-sweep shell cron must run-as the admin (resolves to controller UID)"
+  smoke_assert_contains "$cron_log" "SCRIPT_PICKER_SWEEP_ENABLED=1" \
+    "first-run ordering: picker-sweep shell cron must carry SCRIPT_PICKER_SWEEP_ENABLED=1"
+  smoke_assert_not_contains "$cron_log" "--agent patch-dev" \
+    "first-run ordering: picker-sweep cron must NOT dispatch to the <admin>-dev codex pair (unrunnable text-kind)"
 }
 
 # Source-level guard: the provisioning helper must refresh the parent's roster

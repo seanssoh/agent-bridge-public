@@ -37,11 +37,25 @@
 # keep each registration in its own function so re-runs can be reasoned about
 # independently.
 
-# Probe the registered picker-sweep job's payload kind. Prints `shell`, `text`,
-# or empty (no job / list unavailable). Used to drive the idempotency-vs-migrate
-# decision. Footgun #11: route the CLI JSON through a tempfile and the probe
-# python through its own tempfile rather than a heredoc-stdin pipe.
-_bridge_init_picker_sweep_kind() {
+# Enumerate EVERY registered job titled `picker-sweep` as `<id>\t<kind>` lines
+# (one per matched job). Prints nothing when there is no job / the list is
+# unavailable. Drives the idempotency-vs-migrate decision.
+#
+# #1888 r2 (codex BLOCKING finding 3): native cron dedups on `(agent, title)`,
+# NOT title alone (bridge-cron.py build_native_create), so an upgraded/partially
+# repaired host can legitimately hold BOTH a legacy `patch-dev/picker-sweep`
+# (text) AND a fixed `patch/picker-sweep` (shell) row at once. The old probe
+# only inspected the FIRST matching job and the migration deleted BY TITLE —
+# which `bridge-cron.py` rejects as ambiguous once two same-title rows coexist
+# (`multiple jobs matched exactly`). We therefore enumerate by id+kind so the
+# caller can delete the legacy text row(s) BY ID and leave any correct shell row
+# intact. The `id` is required for the by-id delete; jobs without an id (older
+# list shapes / mock fixtures) fall back to a stable empty id and are matched on
+# title only — the caller still deletes the title in that single-row case.
+#
+# Footgun #11: route the CLI JSON through a tempfile and the probe python
+# through its own tempfile rather than a heredoc-stdin pipe.
+_bridge_init_picker_sweep_enumerate() {
   local agent_bridge_cli="$1"
   local list_tmp="" script_tmp="" out=""
   list_tmp="$(mktemp 2>/dev/null)" || return 0
@@ -57,16 +71,20 @@ except Exception:
     sys.exit(0)
 jobs = data.get("jobs", data) if isinstance(data, dict) else data
 for j in (jobs or []):
+    if not isinstance(j, dict):
+        continue
     name = (j.get("title") or j.get("name") or "")
-    if name == "picker-sweep":
-        payload = j.get("payload") or {}
-        kind = ""
-        if isinstance(payload, dict):
-            kind = payload.get("kind") or ""
-        if not kind:
-            kind = j.get("payload_kind") or "text"
-        sys.stdout.write(kind)
-        sys.exit(0)
+    if name != "picker-sweep":
+        continue
+    payload = j.get("payload") or {}
+    kind = ""
+    if isinstance(payload, dict):
+        kind = payload.get("kind") or ""
+    if not kind:
+        kind = j.get("payload_kind") or "text"
+    job_id = j.get("id") or ""
+    # Tab-separated: a job id never contains a tab/newline (slug + hex token).
+    sys.stdout.write("%s\t%s\n" % (job_id, kind))
 sys.exit(0)
 PY
   if "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron list --json >"$list_tmp" 2>/dev/null; then
@@ -106,30 +124,68 @@ bridge_init_register_default_picker_sweep() {
     return 0
   fi
 
-  # Idempotency + migration. Probe the registered picker-sweep job's payload
-  # kind:
-  #   - shell  → already on the fixed shell-kind cron; skip (idempotent).
-  #   - text   → legacy broken codex-pair cron from an upgraded install; delete
-  #              it and fall through to re-register as shell-kind (migration).
-  #   - empty  → no job yet (fresh install, or list unavailable); register.
-  # `cron list --json` exits non-zero on a fresh install where jobs.json does
-  # not exist yet — the probe treats that as "no job, proceed".
-  local existing_kind
-  existing_kind="$(_bridge_init_picker_sweep_kind "$agent_bridge_cli")"
-  if [[ "$existing_kind" == "shell" ]]; then
-    printf '[init] picker-sweep cron already registered (shell-kind) — skip\n' >&2
-    return 0
-  fi
-  if [[ "$existing_kind" == "text" ]]; then
-    # Legacy text-kind (codex-pair) job present — it can never run. Delete it so
-    # the shell-kind re-registration below takes effect. Non-fatal: if the
-    # delete fails, the create below would no-op on the title collision, so we
-    # warn and continue.
+  # Idempotency + migration. Enumerate EVERY job titled picker-sweep (id+kind):
+  #   - a shell-kind row exists → already on the fixed cron. Delete any legacy
+  #     text-kind row(s) BY ID (a coexisting pair leaves a dangling unrunnable
+  #     job + makes `cron delete picker-sweep` ambiguous), then skip the create
+  #     (idempotent).
+  #   - only text-kind row(s) exist → legacy broken codex-pair cron from an
+  #     upgraded install. Delete each BY ID, then fall through to register the
+  #     shell-kind row (migration).
+  #   - no row → fresh install (or list unavailable); register.
+  #
+  # #1888 r2 (codex BLOCKING finding 3): delete BY ID, not by title. Native cron
+  # permits two same-title rows (different agents), so once a legacy text and a
+  # fixed shell row coexist, `cron delete picker-sweep` errors with
+  # `multiple jobs matched exactly`. Deleting the specific legacy id removes only
+  # the broken row and keeps the shell row, and the whole pass stays idempotent.
+  # `cron list --json` exits non-zero on a fresh install where jobs.json does not
+  # exist yet — the enumerate treats that as "no job, proceed".
+  local enum_lines shell_seen=0 legacy_ids=() legacy_titleonly=0
+  enum_lines="$(_bridge_init_picker_sweep_enumerate "$agent_bridge_cli")"
+  local _id _kind
+  while IFS=$'\t' read -r _id _kind; do
+    [[ -n "$_kind" || -n "$_id" ]] || continue
+    if [[ "$_kind" == "shell" ]]; then
+      shell_seen=1
+      continue
+    fi
+    # Any non-shell row (text, or unknown legacy) is a migration target.
+    if [[ -n "$_id" ]]; then
+      legacy_ids+=("$_id")
+    else
+      # No id surfaced (older list shape / mock without ids) — fall back to a
+      # title-scoped delete, which is only unambiguous when this is the sole row.
+      legacy_titleonly=1
+    fi
+  done <<< "$enum_lines"
+
+  # Remove every legacy non-shell row by its id (precise; never touches a shell
+  # row). Non-fatal: a delete failure leaves the broken row behind but must not
+  # block init — we warn and continue.
+  local _legacy_id
+  for _legacy_id in "${legacy_ids[@]:-}"; do
+    [[ -n "$_legacy_id" ]] || continue
+    if "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron delete "$_legacy_id" >/dev/null 2>&1; then
+      printf '[init] picker-sweep cron migrate — removed legacy text-kind (codex-pair) job id=%s\n' "$_legacy_id" >&2
+    else
+      printf '[init] picker-sweep cron migrate — could not remove legacy text-kind job id=%s; shell-kind re-register may be skipped\n' "$_legacy_id" >&2
+    fi
+  done
+  # Title-only fallback for an id-less single legacy row (no shell row present,
+  # so a title delete is unambiguous).
+  if [[ "$legacy_titleonly" -eq 1 && "$shell_seen" -eq 0 && "${#legacy_ids[@]}" -eq 0 ]]; then
     if "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron delete picker-sweep >/dev/null 2>&1; then
-      printf '[init] picker-sweep cron migrate — removed legacy text-kind (codex-pair) job\n' >&2
+      printf '[init] picker-sweep cron migrate — removed legacy text-kind (codex-pair) job (by title)\n' >&2
     else
       printf '[init] picker-sweep cron migrate — could not remove legacy text-kind job; shell-kind re-register may be skipped\n' >&2
     fi
+  fi
+
+  if [[ "$shell_seen" -eq 1 ]]; then
+    printf '[init] picker-sweep cron already registered (shell-kind) — skip%s\n' \
+      "$([[ "${#legacy_ids[@]}" -gt 0 ]] && printf ' (removed %s legacy row(s))' "${#legacy_ids[@]}")" >&2
+    return 0
   fi
 
   # Register the SHELL-kind controller-direct cron. The run-as-agent is the
