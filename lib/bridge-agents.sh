@@ -1126,6 +1126,29 @@ bridge_agent_linux_user_isolation_effective() {
   return 0
 }
 
+# bridge_iso_boundary_applies <agent>
+#   Common iso-v2 controller-boundary classifier (#1820 rc4), the shell
+#   sibling of lib/bridge_iso_boundary.py::iso_boundary_applies. Returns 0
+#   (true) iff the controller-vs-iso-UID file boundary applies to this agent —
+#   i.e. its home/files are owned by the iso UID at 2770/0660 and a controller
+#   scanner must NOT direct-read across the boundary.
+#
+#   This is PURELY registry-based: it delegates to
+#   bridge_agent_linux_user_isolation_effective (isolation_mode==linux-user +
+#   Linux host + resolved os_user). It performs NO filesystem read of the agent
+#   home, so it can never itself trip the Errno13 it exists to let callers
+#   avoid. Every controller-run scanner (reconcile iso-map builder, watchdog,
+#   wiki-rebuild) classifies "is this an iso boundary" through this one
+#   predicate so they all agree. A non-iso / shared-mode / macOS agent returns
+#   non-zero and the caller takes its normal path (byte-identical legacy
+#   behavior).
+bridge_iso_boundary_applies() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 || return 1
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null
+}
+
 # bridge_agent_start_supp_group_preflight — first-start determinism for
 # linux-user-isolated agents (Issue #1836).
 #

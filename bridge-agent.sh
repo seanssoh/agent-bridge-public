@@ -2110,6 +2110,11 @@ AGENT_LIST_HELP
 #   is_alive        bridge_agent_is_active (tmux session exists)
 #   source          provenance: static-roster | dynamic-active-env |
 #                   dynamic-history-live-session | dynamic-tmux-recovered
+#   isolation_mode  bridge_agent_isolation_mode (#1820 rc4): linux-user |
+#                   "" — lets a controller scanner registry-classify the iso
+#                   boundary without a filesystem read of the agent home
+#   os_user         bridge_agent_os_user (#1820 rc4): the iso UID account
+#                   (e.g. agent-bridge-<a>) | "" on shared-mode agents
 run_registry() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2147,6 +2152,8 @@ AGENT_REGISTRY_HELP
   local session
   local provenance
   local is_alive
+  local isolation_mode
+  local os_user
   local rows=""
 
   if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 && (( ${#BRIDGE_AGENT_IDS[@]} > 0 )); then
@@ -2174,7 +2181,15 @@ AGENT_REGISTRY_HELP
       else
         is_alive="0"
       fi
-      rows+=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      # #1820 rc4: surface the registry isolation classification so
+      # controller-run scanners (the watchdog) can registry-classify "this is
+      # an iso-v2 boundary" WITHOUT a filesystem read of the agent home (the
+      # read that throws Errno13). isolation_mode==linux-user + a resolved
+      # os_user is the same triple bridge_agent_linux_user_isolation_effective
+      # checks. Empty on shared-mode agents.
+      isolation_mode="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || printf '')"
+      os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+      rows+=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$agent" \
         "$cleanup_class" \
         "$agent_source" \
@@ -2184,7 +2199,9 @@ AGENT_REGISTRY_HELP
         "$engine" \
         "$session" \
         "$is_alive" \
-        "$provenance")
+        "$provenance" \
+        "$isolation_mode" \
+        "$os_user")
       rows+=$'\n'
     done
   fi

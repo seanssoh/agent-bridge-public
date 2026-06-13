@@ -132,6 +132,20 @@ add_required rc2-reconcile-observability
 # structured isolation_v2_migration(skipped-iso-private) section. In the full
 # static suite so any reconcile/iso edit re-runs the iso-permission guard.
 add_required 1820-iso-reconcile-permission
+# Issue #1820 rc4 (cm-prod real-Linux iso-v2 production soak of v0.16.10-rc3):
+# the rc3 iso skip covered only 2/8 iso bots — the other 6 were absent from the
+# engine iso map AND their HOME itself is 2770 (controller non-member), so
+# os.scandir(home) threw [Errno 13] BEFORE any per-file skip → an unstructured
+# perm-warning with no isolation_v2_migration entry. The systemic fix: a common
+# registry-based iso-boundary classifier (lib/bridge_iso_boundary.py) shared
+# across controller scanners, a defensive belt in the reconcile (host-iso-active
+# → PermissionError reaching an iso home becomes a structured graceful-skip,
+# reason home-unreadable-controller, even for an agent absent from the map), and
+# a watchdog downgrade of pure permission_denied iso-boundary rows into an
+# auditable iso_skipped bucket (not_found/os_error stay problems). The rig
+# topology is fixed to make the iso HOME unreadable (reproducing cm-prod). In
+# the full static suite so any reconcile/watchdog/iso edit re-runs the guard.
+add_required 1820-rc4-iso-home-unreadable-belt
 # Issue #1835: bridge-queue-gateway.py's SOCKET-transport client preflight
 # (_read_inline_text) now applies the #1280 sudo-as-owner body-file fallback on
 # PermissionError, with an actionable iso-ownership error when it cannot apply.
@@ -4454,7 +4468,7 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # re-introduce the unbounded rglob (which blew the 30s scan ceiling on
       # a HOME-scale workdir for 9+ days) or silently drop / over-escalate
       # on a bound.
-      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise 1520c-create-isolate-profile-publish 1801-watchdog-bounded-broken-links codex-doctor queue
+      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex G-beta4-watchdog-noise 1520c-create-isolate-profile-publish 1801-watchdog-bounded-broken-links 1820-rc4-iso-home-unreadable-belt codex-doctor queue
       add_integration integration-minimal
       ;;
 

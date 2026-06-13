@@ -80,6 +80,25 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Common iso-v2 controller-boundary classifier (#1820 rc4). This standalone
+# helper lives in lib/upgrade-helpers/, so the shared module sits one level up
+# in lib/. Import it via a sys.path-relative insert that works under the
+# file-as-argv invocation (footgun #11 — no package install, no PYTHONPATH
+# assumption). If the import is ever unavailable (a stripped-down install), the
+# belt below degrades to the prior behavior (PermissionError stays a warning),
+# never crashing.
+_RECONCILE_LIB_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _RECONCILE_LIB_DIR not in sys.path:
+    sys.path.insert(0, _RECONCILE_LIB_DIR)
+try:
+    from bridge_iso_boundary import (
+        is_permission_error as _iso_is_permission_error,
+        iso_skip_reason as _iso_skip_reason,
+    )
+except ImportError:  # pragma: no cover — stripped-down install fallback
+    _iso_is_permission_error = None
+    _iso_skip_reason = None
+
 SCHEMA = "layout-v2-reconcile/1"
 
 # Append-like memory files reconciled with the prefix/superset rule. Anything
@@ -154,6 +173,21 @@ class Reconciler:
         # an iso home 0700). The conflict/fencing DATA logic below is unchanged —
         # it simply is not entered for these agents.
         self.iso_agents: dict[str, str] = self._load_iso_agents(args.iso_agents_json)
+        # iso-v2-active host signal for the DEFENSIVE belt (#1820 rc4). The
+        # up-front iso-map skip (braces) only covers agents the wrapper managed
+        # to classify; cm-prod proved 6/8 iso bots can be ABSENT from that map
+        # (registry metadata not fully loaded in the reconcile driver context),
+        # fall through to the home traversal, and throw Errno13 on
+        # os.scandir(2770-home). The belt catches that PermissionError and — ONLY
+        # when this host is iso-v2-active — records a structured graceful-skip
+        # (reason=home-unreadable-controller) instead of an unstructured
+        # warning. On a shared-mode / macOS / non-iso install this flag is False
+        # and a PermissionError STILL surfaces as a warning (byte-identical
+        # legacy behavior — we never blanket-swallow perm errors off an iso
+        # host). The flag is host-level (passed by the wrapper from the layout
+        # marker + Linux platform), independent of whether any single agent made
+        # it into the iso map — that independence is the whole point of the belt.
+        self.host_iso_active: bool = bool(args.host_iso_active)
         self.stamp = _now_stamp()
 
         self.copied: list[dict] = []
@@ -167,6 +201,11 @@ class Reconciler:
         # iso permission handling is auditable in last-apply.json rather than
         # falling to unstructured warnings (#1820 rc3 observability).
         self.isolation_v2_migration: list[dict] = []
+        # Agents for which the defensive belt (#1820 rc4) has already recorded a
+        # structured iso skip — so a per-FILE PermissionError storm on one iso
+        # agent's home produces exactly ONE isolation_v2_migration entry, not
+        # one per file.
+        self._iso_belt_recorded: set[str] = set()
         self._cur_v1_home: Path | None = None
         self._cur_v2_home: Path | None = None
 
@@ -221,6 +260,56 @@ class Reconciler:
             {"agent": agent, "kind": kind, "rel": rel, "reason": reason}
         )
 
+    # --- iso-boundary defensive belt (#1820 rc4) ----------------------------
+    def _is_iso_boundary_permission_error(self, exc: BaseException) -> bool:
+        """True iff ``exc`` is a controller-side permission denial (Errno13 /
+        Errno1) raised crossing the iso boundary AND this host is iso-v2-active.
+
+        Off an iso host (shared-mode / macOS) this is always False, so a
+        PermissionError there is NOT absorbed — it falls through to the caller's
+        legacy warning path, byte-identical to pre-rc4 behavior. The classifier
+        delegates to the common helper; if that helper failed to import we
+        conservatively treat NOTHING as an iso boundary (warning preserved)."""
+        if not self.host_iso_active:
+            return False
+        if _iso_is_permission_error is None:
+            return False
+        return _iso_is_permission_error(exc)
+
+    def _record_iso_belt_skip(self, agent: str, exc: BaseException) -> None:
+        """Record a STRUCTURED graceful-skip for an iso agent whose home the
+        controller could not read (Errno13 reaching the 2770 home), instead of
+        an unstructured warning. Reason ``home-unreadable-controller`` is
+        distinct from the clean up-front ``iso-agent-private`` so last-apply.json
+        can tell "skipped by registry classification" from "skipped because the
+        controller hit the boundary at the home". os_user is taken from the iso
+        map when present (the agent WAS classified but the belt still fired,
+        e.g. a partial read), else empty (the agent was absent from the map —
+        the cm-prod 6/8 case the belt exists to cover).
+
+        Idempotent per agent: a per-file PermissionError storm on one iso home
+        records exactly ONE entry (first hit wins) so last-apply.json carries one
+        skip per iso agent, matching the up-front-skip shape."""
+        if agent in self._iso_belt_recorded:
+            return
+        self._iso_belt_recorded.add(agent)
+        reason = _iso_skip_reason(None) if _iso_skip_reason else "home-unreadable-controller"
+        self.isolation_v2_migration.append(
+            {
+                "agent": agent,
+                "os_user": self.iso_agents.get(agent, ""),
+                "action": "skipped-iso-private",
+                "reason": reason,
+                "detail": (
+                    "controller could not read this iso agent's home "
+                    f"({exc.__class__.__name__}: {exc}); the iso UID owns and "
+                    "manages its agent-private memory — controller backup/"
+                    "reconcile of it is the wrong contract (graceful-skip)"
+                ),
+            }
+        )
+        self._skip(agent, "agent", ".", "iso_home_unreadable_controller")
+
     # --- mutation primitives (no-op in dry-run) ------------------------------
     def _backup(self, agent: str, side: str, src: Path, rel: str) -> None:
         if self.mode != "apply" or self.backup_root is None:
@@ -230,7 +319,15 @@ class Reconciler:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
         except OSError as exc:
-            self._warn(agent, f"backup failed for {side}:{rel}: {exc}")
+            # iso-boundary belt (#1820 rc4): a controller-side permission denial
+            # backing up an iso agent's 0600 agent-private file is the expected
+            # boundary on an iso-v2-active host — record a structured skip, not a
+            # "backup failed" warning. Off an iso host (or any non-permission
+            # OSError) it stays a warning, byte-identical to before.
+            if self._is_iso_boundary_permission_error(exc):
+                self._record_iso_belt_skip(agent, exc)
+            else:
+                self._warn(agent, f"backup failed for {side}:{rel}: {exc}")
 
     def _pre_mutation_backup(self, agent: str, v1_home: Path, v2_home: Path) -> None:
         """Snapshot BOTH sides' reconcile surfaces before any write.
@@ -821,7 +918,18 @@ class Reconciler:
             try:
                 self._reconcile_agent(agent)
             except Exception as exc:  # pragma: no cover — defensive
-                self._warn(agent, f"unexpected error: {exc}")
+                # iso-boundary belt (#1820 rc4): a PermissionError raised while
+                # reaching this agent's home (os.scandir / iterdir / is_dir on
+                # the 2770 iso home) on an iso-v2-active host is the EXPECTED
+                # controller boundary — record it as a structured graceful-skip
+                # (no Errno13 warning), even if the agent was absent from the
+                # iso map (the cm-prod 6/8 case). Off an iso host, or for any
+                # non-permission error, it stays an unstructured warning exactly
+                # as before — we never blanket-swallow.
+                if self._is_iso_boundary_permission_error(exc):
+                    self._record_iso_belt_skip(agent, exc)
+                else:
+                    self._warn(agent, f"unexpected error: {exc}")
         return {
             "mode": self.mode,
             "schema": SCHEMA,
@@ -867,6 +975,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     # skipped from the controller-side reconcile/backup (see Reconciler). Empty
     # / absent => no iso agents => prior shared-mode behavior, byte-identical.
     parser.add_argument("--iso-agents-json", default="")
+    # Host-level iso-v2-active signal for the defensive belt (#1820 rc4). When
+    # set, a controller PermissionError reaching an agent home is recorded as a
+    # structured graceful-skip instead of an Errno13 warning — EVEN for an agent
+    # absent from --iso-agents-json (the cm-prod 6/8 case). Absent/unset =>
+    # shared-mode / macOS / non-iso install: a PermissionError stays a warning,
+    # byte-identical to pre-rc4. The wrapper sets this from the layout marker +
+    # Linux platform; it is host-level, not per-agent, by design.
+    parser.add_argument(
+        "--host-iso-active",
+        action="store_true",
+        default=False,
+    )
     return parser.parse_args(argv)
 
 

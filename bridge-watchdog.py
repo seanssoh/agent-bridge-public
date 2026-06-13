@@ -32,6 +32,18 @@ except ImportError:
     _isolated_workdir_owner_canonical = None
     _sudo_run_as_canonical = None
     _sudo_run_as_capture_canonical = None
+# Common iso-v2 controller-boundary classifier (#1820 rc4) — shared with
+# layout-v2-reconcile.py so both scanners agree on "this is the iso boundary".
+# Used to downgrade ONLY the pure expected-iso-boundary scan_error rows
+# (permission_denied on an effectively-iso agent) out of the problem count into
+# an auditable iso_skipped bucket. If the import is unavailable the downgrade is
+# a no-op and every row stays a problem (legacy behavior).
+try:
+    from bridge_iso_boundary import (
+        is_expected_iso_permission_boundary as _iso_is_expected_boundary,
+    )
+except ImportError:
+    _iso_is_expected_boundary = None
 
 MANAGED_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
@@ -379,11 +391,20 @@ def _registry_ids_from_payload(
         # ONLY as a fall-back location for the engine entrypoint when it is
         # absent from the scanned dir — a genuinely missing AGENTS.md
         # (absent from BOTH) still surfaces as drift.
+        # `isolation_mode` + `os_user` (#1820 rc4): the registry classification
+        # the watchdog uses to decide "this row's permission_denied is the
+        # EXPECTED iso controller boundary" purely from loaded metadata — no
+        # filesystem read of the (2770, Errno13-throwing) agent home. Missing =>
+        # "" => shared-mode => the iso-boundary downgrade never fires (legacy
+        # behavior preserved). The same triple the reconcile iso-map builder and
+        # `bridge_agent_linux_user_isolation_effective` use.
         meta[agent_id] = {
             "engine": str(row.get("engine") or "").strip(),
             "agent_source": str(row.get("agent_source") or "").strip(),
             "workdir": str(row.get("workdir") or "").strip(),
             "home": str(row.get("home") or "").strip(),
+            "isolation_mode": str(row.get("isolation_mode") or "").strip(),
+            "os_user": str(row.get("os_user") or "").strip(),
         }
     return ids, meta
 
@@ -1667,6 +1688,55 @@ def required_profile_files(engine: str, agent_source: str = "") -> tuple[str, ..
     return ()
 
 
+def _host_platform() -> str:
+    """Resolve the host platform for the iso-boundary classifier (#1820 rc4).
+
+    Honors ``BRIDGE_HOST_PLATFORM_OVERRIDE`` (the same env var the shell
+    ``bridge_host_platform`` predicate reads) so a smoke can stub ``Linux`` on a
+    macOS dev host without a real cross-UID boundary; otherwise falls back to
+    ``platform.system()`` (``Linux`` / ``Darwin`` / …)."""
+    override = os.environ.get("BRIDGE_HOST_PLATFORM_OVERRIDE", "").strip()
+    if override:
+        return override
+    try:
+        import platform as _platform
+
+        return _platform.system()
+    except Exception:  # pragma: no cover — defensive
+        return ""
+
+
+def is_expected_iso_boundary_row(
+    item: "AgentWatch",
+    registry_meta: RegistryMeta,
+    platform: str,
+) -> bool:
+    """True iff ``item`` is the PURE expected iso controller-boundary
+    (#1820 rc4) — a ``scan_error`` row whose ``error_kind`` is
+    ``permission_denied`` on an EFFECTIVELY-iso agent (registry-classified
+    linux-user + resolved os_user + Linux host), and whose ``error_category`` is
+    an iso-boundary category (not a ``publish-gap`` / not a ``not_found`` /
+    ``os_error``).
+
+    Only such rows are downgraded out of the problem count into the auditable
+    ``iso_skipped`` bucket. ``not_found`` / ``os_error`` rows — even on an iso
+    agent — stay genuine problems (they are real drift, not the boundary). The
+    classification is delegated to the common helper so the watchdog and the
+    reconcile agree on "this is the iso boundary"."""
+    if _iso_is_expected_boundary is None:
+        return False
+    if item.status != "scan_error":
+        return False
+    meta = registry_meta.get(item.agent, {})
+    return _iso_is_expected_boundary(
+        platform=platform,
+        isolation_mode=meta.get("isolation_mode", ""),
+        os_user=meta.get("os_user", ""),
+        error_kind=item.error_kind,
+        error_category=item.error_category,
+    )
+
+
 def classify_status(
     missing_files: list[str],
     broken_links: list[str],
@@ -1939,9 +2009,22 @@ def render_markdown(
     records: list[AgentWatch],
     bridge_home: Path,
     orphan_directories: list[str] | None = None,
+    iso_skipped_agents: set[str] | None = None,
 ) -> str:
     now_iso = datetime.now().astimezone().isoformat()
-    problems = [item for item in records if item.status != "ok"]
+    # #1820 rc4: pure expected-iso-boundary scan_error rows (permission_denied on
+    # an effectively-iso agent, controller can't read but the iso UID owns its
+    # own files) are NOT problems — they are an expected, harmless controller-
+    # side observability artifact. Exclude them from the problem count and
+    # surface them in a dedicated auditable ``iso_skipped`` bucket instead.
+    # not_found / os_error rows (even on an iso agent) are NOT in this set and
+    # stay problems.
+    iso_skipped_agents = iso_skipped_agents or set()
+    problems = [
+        item for item in records
+        if item.status != "ok" and item.agent not in iso_skipped_agents
+    ]
+    iso_skipped = [item for item in records if item.agent in iso_skipped_agents]
     orphan_directories = orphan_directories or []
     lines = [
         "# Watchdog Report",
@@ -1950,9 +2033,19 @@ def render_markdown(
         f"- bridge_home: {bridge_home}",
         f"- agents: {len(records)}",
         f"- problems: {len(problems)}",
+        f"- iso_skipped: {len(iso_skipped)}",
         f"- orphan_directories: {len(orphan_directories)}",
         "",
     ]
+    if iso_skipped:
+        # Auditable bucket: the operator can see these rows were downgraded as
+        # expected iso boundaries (not silently dropped). Each names the agent +
+        # the path the controller could not read across the 2770 boundary.
+        lines.append("## iso_skipped")
+        for item in iso_skipped:
+            detail = item.error_path or item.error_kind or "permission_denied"
+            lines.append(f"- {item.agent}: expected iso controller boundary ({detail})")
+        lines.append("")
     if orphan_directories:
         # Refs queue #4796: orphan dirs (smoke leaks, manual mkdir) used to
         # surface as profile_drift warns when the watchdog enumerated
@@ -2328,16 +2421,33 @@ def main() -> int:
     # daemon "every problem row in this report is a fresh-install
     # candidate — file at priority=low instead of high". When mixed
     # (some fresh, some not), the high-priority path is preserved.
+    # #1820 rc4: identify the pure expected-iso-boundary rows (permission_denied
+    # on an effectively-iso agent) and downgrade them out of the problem count
+    # into the auditable ``iso_skipped`` bucket. Registry-classified — no
+    # filesystem read of the (2770, Errno13-throwing) agent home. not_found /
+    # os_error rows stay problems even on an iso agent.
+    host_platform = _host_platform()
+    iso_skipped_agents = {
+        item.agent
+        for item in records
+        if is_expected_iso_boundary_row(item, registry_meta, host_platform)
+    }
     effective_problems = [
         item for item in records
-        if item.status != "ok" and not item.restart_in_progress
+        if item.status != "ok"
+        and not item.restart_in_progress
+        and item.agent not in iso_skipped_agents
     ]
+    iso_skipped_count = sum(1 for item in records if item.agent in iso_skipped_agents)
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
         "bridge_home": str(bridge_home),
         "agent_home_root": str(agent_root),
         "agent_count": len(records),
         "problem_count": len(effective_problems),
+        # Auditable: how many rows were downgraded as expected iso boundaries.
+        "iso_skipped_count": iso_skipped_count,
+        "iso_skipped_agents": sorted(iso_skipped_agents),
         "fresh_install_only": bool(effective_problems) and all(
             item.fresh_install for item in effective_problems
         ),
@@ -2348,7 +2458,9 @@ def main() -> int:
         "orphan_directories": orphan_directories,
         "agents": [asdict(item) for item in records],
     }
-    rendered_markdown = render_markdown(records, bridge_home, orphan_directories)
+    rendered_markdown = render_markdown(
+        records, bridge_home, orphan_directories, iso_skipped_agents
+    )
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
