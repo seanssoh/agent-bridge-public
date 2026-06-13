@@ -62,6 +62,8 @@ Subcommands:
   doctor             Run a 7-step CRUD self-check (create/update/registry/
                      show/reclassify/retire/delete) against an isolated fixture.
   roster             Roster-field surgery (materialize-fields writer, #1427).
+  set-model          Sanctioned audited per-agent BRIDGE_AGENT_MODEL write (#1879).
+  set-effort         Sanctioned audited per-agent BRIDGE_AGENT_EFFORT write (#1879).
   rerender-settings  Re-render per-agent settings.effective.json.
   start              Launch <agent> in tmux.
   safe-mode          Launch <agent> in safe-mode (no auto-resume).
@@ -84,6 +86,8 @@ Examples:
   $(basename "$0") show reviewer --json
   $(basename "$0") describe reviewer
   $(basename "$0") roster materialize-fields reviewer --model claude-opus-4-8 --effort xhigh --dry-run
+  $(basename "$0") set-model reviewer claude-opus-4-8
+  $(basename "$0") set-effort reviewer xhigh --dry-run
   $(basename "$0") reclassify --apply
   $(basename "$0") rerender-settings --apply
   $(basename "$0") start reviewer --dry-run
@@ -129,6 +133,22 @@ override) — same trust model as 'agent-bridge config set'. Repeatable.
                                        restores warm always-on semantics.
   --json                               emit JSON envelope
   --dry-run                            do not mutate; emit planned diff
+
+set-model / set-effort (sanctioned audited per-agent launch-shape write,
+issue #1879). The typed in-session surface an operator-directed model/effort
+change uses instead of a hand edit of the #341-protected roster. Same trust
+model as 'agent-bridge config set' / 'roster materialize-fields' (admin agent
++ operator-tui / operator-trusted-id source); a non-admin / non-trusted caller
+is rejected. The value is validated against a strict allowlist and is NEVER
+shell-eval'd into the launch string (#1738) — it is stored as a roster field
+and re-emitted as a separate argv token at launch. A restart applies the change.
+
+  $(basename "$0") set-model  <agent> <model>  [--dry-run] [--json]
+  $(basename "$0") set-effort <agent> <effort> [--dry-run] [--json]
+
+  <model>   allowlisted token (^[A-Za-z][A-Za-z0-9._-]{0,127}$): e.g.
+            claude-opus-4-8, claude-sonnet-4-5, gpt-5.5
+  <effort>  one of: minimal low medium high xhigh none
 
 Create options:
   --engine claude|codex        Agent runtime engine (default: claude)
@@ -8067,6 +8087,193 @@ run_roster_write_template_profile() {
   fi
 }
 
+# bridge_agent_validate_model_token — strict allowlist for a per-agent model
+# token (#1879). The token is stored in BRIDGE_AGENT_MODEL[<a>] and re-emitted
+# at launch as a SEPARATE argv token (shlex.quote'd in
+# scripts/python-helpers/launch-cmd-static-claude-build.py), so it is never
+# shell-eval'd. The validator is the write-boundary belt to #1738's
+# braces/braces: reject ANY token carrying shell-metacharacters, whitespace,
+# path separators, or control bytes so a spoofed value can never reach the
+# launch string in any shape. We intentionally do NOT pin an exact-enum of
+# model IDs — model names churn (claude-opus-4-8 → -4-9, gpt-5.5 → gpt-6) and
+# a stale enum would lock the admin out of the exact failover the verb exists
+# for. The shape `^[A-Za-z][A-Za-z0-9._-]{0,127}$` admits every real Claude /
+# Codex model id (alnum + dot + underscore + hyphen) and refuses everything
+# eval-able. Returns 0 (valid) / non-zero (reject); never bridge_die so the
+# caller owns the error message + the no-write guarantee.
+bridge_agent_validate_model_token() {
+  local token="${1:-}"
+  [[ -n "$token" ]] || return 1
+  [[ "$token" =~ ^[A-Za-z][A-Za-z0-9._-]{0,127}$ ]] || return 1
+  return 0
+}
+
+# bridge_agent_validate_effort_token — closed-enum allowlist for a per-agent
+# effort level (#1879). Unlike model ids this IS a fixed value space across
+# both engines (Claude: low|medium|high|xhigh; Codex/gpt: minimal|low|medium|
+# high plus the explicit `none`), so an exact enum is correct here and any
+# other token (including shell-metachar payloads) is rejected. Returns 0/non-0.
+bridge_agent_validate_effort_token() {
+  local token="${1:-}"
+  case "$token" in
+    minimal|low|medium|high|xhigh|none) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# run_set_model / run_set_effort — sanctioned, trust-gated, audited per-agent
+# launch-shape mutation (#1879).
+#
+# Problem: the model/effort live in agent-roster.local.sh
+# (BRIDGE_AGENT_MODEL/EFFORT, read on the launch hot path), a #341-protected
+# path. From an agent session `config set` is JSON-only, `config set-env`
+# deny-prefixes BRIDGE_AGENT_*, and a direct Edit/Write is blocked by
+# tool-policy. So an operator-directed model-down failover stalled on a manual
+# human roster edit — even the admin agent (built for fleet recovery) was
+# locked out of the one mutation recovery needs.
+#
+# Design (plan-agreed candidate 1 — typed audited roster verb; env-override
+# and a config set-env carve-out were both REJECTED as widening the spoofable
+# env surface / blurring roster source-of-truth):
+#   1. Trust gate — REUSE the materialize-fields / config-set #341 model:
+#      bridge_agent_update_caller_source() must be operator-tui /
+#      operator-trusted-id (admin-session auto-promotion #1122 applies). A
+#      non-admin / non-trusted caller is rejected by the SAME gate
+#      run_roster_materialize_fields enforces; we do not invent a new one.
+#      We pre-check it here (before validation) so a denied caller cannot even
+#      probe which tokens are allowlisted.
+#   2. Allowlist + NO shell-eval (#1738) — the value is validated against the
+#      strict token allowlist above BEFORE any write. It is then handed to the
+#      writer as a typed flag value (argv), stored as a roster field, and
+#      re-emitted at launch as a separate shlex.quote'd argv token. It is
+#      never interpolated/eval'd into BRIDGE_AGENT_LAUNCH_CMD.
+#   3. Writer reuse — the actual mutation + before/after-sha256 audit row is
+#      delegated to run_roster_materialize_fields (the existing audited
+#      single-field-or-multi writer). We do NOT duplicate roster parsing /
+#      writing / audit emission; this verb is just the sanctioned typed entry.
+#   4. Restart still required — the verb mutates the roster only; a subsequent
+#      'agent restart <agent>' applies the new launch shape. We say so on the
+#      human path.
+run_set_model() {
+  _run_set_launch_field "model" "$@"
+}
+
+run_set_effort() {
+  _run_set_launch_field "effort" "$@"
+}
+
+# _run_set_launch_field — shared body for set-model / set-effort. $1 is the
+# dimension ("model" | "effort"); the rest is `<agent> <value> [--dry-run]
+# [--json]`. Parses, trust-gates, allowlist-validates, then routes through
+# run_roster_materialize_fields with the single matching typed flag. The trust
+# gate is env-driven (BRIDGE_AGENT_ID / BRIDGE_CALLER_SOURCE, with the #1122
+# admin-session auto-promotion) — the same caller_source signal
+# materialize-fields uses — so there is intentionally no `--from` flag here:
+# the materialize writer's gate does not consult one, and exposing a no-op
+# flag would mislead.
+_run_set_launch_field() {
+  local dimension="$1"
+  shift || true
+
+  case "${1:-}" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+  esac
+
+  local agent="${1:-}"
+  shift || true
+  [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") set-$dimension <agent> <$dimension> [--dry-run] [--json]"
+
+  local value=""
+  local value_present=0
+  local dry_run=0
+  local json_mode=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --*)
+        bridge_die "지원하지 않는 set-$dimension 옵션입니다: $1"
+        ;;
+      *)
+        # First bare positional is the value. A second one is an error so a
+        # stray shell-split token can never be silently swallowed.
+        if [[ $value_present -eq 1 ]]; then
+          bridge_die "set-$dimension 은 단일 <$dimension> 값만 받습니다 (예상치 못한 인자: $1)"
+        fi
+        value="$1"
+        value_present=1
+        shift
+        ;;
+    esac
+  done
+
+  [[ $value_present -eq 1 ]] || bridge_die "Usage: $(basename "$0") set-$dimension <agent> <$dimension> [--dry-run] [--json]"
+
+  bridge_require_agent "$agent"
+
+  # Trust gate FIRST — same #341 model as config set / materialize-fields. A
+  # denied caller is rejected before allowlist validation so it cannot probe
+  # which tokens are accepted. The materialize-fields writer re-checks the
+  # same gate (defense-in-depth); the pre-check just gives a verb-specific
+  # error and keeps the deny path eval-free.
+  local caller_source
+  caller_source="$(bridge_agent_update_caller_source)"
+  if [[ "$caller_source" != "operator-tui" && "$caller_source" != "operator-trusted-id" ]]; then
+    bridge_die "deny: caller source $caller_source is not allowed to mutate system config (need operator-tui or operator-trusted-id)"
+  fi
+
+  # Allowlist — reject a non-allowlisted token with NO write and NO eval
+  # (#1738). The value never touches a shell beyond this string comparison.
+  if [[ "$dimension" == "model" ]]; then
+    if ! bridge_agent_validate_model_token "$value"; then
+      bridge_die "deny: not an allowlisted model token (expected ^[A-Za-z][A-Za-z0-9._-]{0,127}\$, e.g. claude-opus-4-8 / gpt-5.5): $value"
+    fi
+  else
+    if ! bridge_agent_validate_effort_token "$value"; then
+      bridge_die "deny: not an allowlisted effort level (expected one of: minimal low medium high xhigh none): $value"
+    fi
+  fi
+
+  # Route through the EXISTING audited writer. It re-runs the trust gate,
+  # writes BRIDGE_AGENT_MODEL/EFFORT into the managed-role block via the same
+  # python materializer create/update use, and emits the system_config_mutation
+  # audit row with before/after sha256. We pass only the one matching flag so
+  # the other dimension is left byte-for-byte untouched (materialize semantics:
+  # an unpassed dimension is not cleared). --dry-run / --json pass straight
+  # through.
+  local -a fwd=()
+  fwd+=("$agent")
+  fwd+=("--$dimension" "$value")
+  [[ $dry_run -eq 1 ]] && fwd+=("--dry-run")
+  [[ $json_mode -eq 1 ]] && fwd+=("--json")
+
+  local rc=0
+  run_roster_materialize_fields "${fwd[@]}" || rc=$?
+
+  # Human-path reminder: the roster changed but the running session keeps its
+  # old launch shape until it is restarted. Routed to stderr (bridge_info) so
+  # the --json stdout envelope stays clean; suppressed on --dry-run (nothing
+  # was written) and --json (machine path).
+  if [[ $rc -eq 0 && $json_mode -eq 0 && $dry_run -eq 0 ]]; then
+    bridge_info "restart '$agent' to apply the new $dimension (roster is updated; the running session keeps its current launch shape until restart)."
+  fi
+  return $rc
+}
+
 # run_roster — template-sync (#1427) roster sub-dispatch. Hosts the
 # Contract-II materialize-fields writer and the gated template-defaults
 # profile writer. Reached via `agent-bridge agent roster <action>` (the
@@ -8131,6 +8338,15 @@ case "$subcommand" in
     # Contract-II `materialize-fields` writer.
     run_roster "$@"
     ;;
+  set-model)
+    # #1879: sanctioned audited per-agent BRIDGE_AGENT_MODEL write. Trust-gated
+    # (#341) + allowlisted (#1738) typed surface over the materialize writer.
+    run_set_model "$@"
+    ;;
+  set-effort)
+    # #1879: sanctioned audited per-agent BRIDGE_AGENT_EFFORT write.
+    run_set_effort "$@"
+    ;;
   doctor)
     bridge_doctor_run "$@"
     ;;
@@ -8173,7 +8389,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create update delete retire list registry show describe reclassify roster doctor rerender-settings start safe-mode stop restart ack-crash forget-session set-onboarding attach compact handoff")"
+      "create update delete retire list registry show describe reclassify roster set-model set-effort doctor rerender-settings start safe-mode stop restart ack-crash forget-session set-onboarding attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;

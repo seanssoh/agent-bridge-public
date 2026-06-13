@@ -832,6 +832,11 @@ bridge_reset_roster_maps() {
   unset BRIDGE_AGENT_SKILLS
   unset BRIDGE_AGENT_ISOLATION_MODE BRIDGE_AGENT_OS_USER
   unset BRIDGE_AGENT_CLASS
+  # template-sync (#1427) / #1879: per-agent launch-shape dimensions written by
+  # `agent create --model/--effort`, `roster materialize-fields`, and the
+  # `agent set-model`/`set-effort` verbs. See the declare block below for why
+  # they must be reset here and not only in bridge-agent.sh.
+  unset BRIDGE_AGENT_MODEL BRIDGE_AGENT_EFFORT BRIDGE_AGENT_PERMISSION_MODE
   unset BRIDGE_AGENT_PROVENANCE
   # Issue #597 Track B: PreCompact channel auto-notify opt-in maps.
   unset BRIDGE_AGENT_PRECOMPACT_NOTIFY BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG
@@ -889,6 +894,22 @@ bridge_reset_roster_maps() {
   # Operators opt agents into class=system in agent-roster.local.sh; the
   # public roster declares no system-class agents.
   declare -g -A BRIDGE_AGENT_CLASS=()
+  # template-sync (#1427) / #1879: per-agent launch-shape dimensions
+  # (model / effort / permission_mode). bridge-agent.sh declares these as
+  # associative arrays at its OWN load (lines ~35-41) because it is the writer,
+  # but EVERY other entry point that loads a roster carrying a
+  # `BRIDGE_AGENT_MODEL["<a>"]=...` line (notably bridge-run.sh / the daemon
+  # launch path via lib/bridge-state.sh) would otherwise arithmetic-index the
+  # `["<a>"]` subscript under `set -u` and abort with `<a>: unbound variable`
+  # (the #1213/#1407 scalar-vs-assoc class). Declaring them in the SHARED
+  # roster reset — which runs before every roster source — makes a roster that
+  # carries model/effort/permission_mode loadable from any entry point, so a
+  # `set-model`/`set-effort` actually applies on the next daemon restart
+  # instead of wedging the launch. The getters already guard with
+  # bridge_var_is_assoc; this closes the assignment-time gap before any getter.
+  declare -g -A BRIDGE_AGENT_MODEL=()
+  declare -g -A BRIDGE_AGENT_EFFORT=()
+  declare -g -A BRIDGE_AGENT_PERMISSION_MODE=()
   # Issue #598 Track 1: provenance tag set by each loader path so the
   # registry endpoint can report which registry made the agent id known
   # (`static-roster`, `dynamic-active-env`, `dynamic-history-live-session`,
