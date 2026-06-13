@@ -14,8 +14,8 @@ Usage:
   $(basename "$0") show <job-name-or-id> [--json]
   $(basename "$0") import [--source-jobs-file <path>] [--dry-run]
   $(basename "$0") list [--agent <bridge-agent>] [--enabled yes|no|all] [--limit <count>] [--json]
-  $(basename "$0") create --agent <bridge-agent> (--schedule "<cron-expr>" | --at "<iso-datetime>") --title "<title>" [--payload "<text>" | --payload-file <path>] [--kind text|shell --script <path> --run-as-agent <agent> [--script-arg <arg>] [--script-env KEY=VALUE] [--timeout <seconds>] [--output-cap <bytes>]] [--tz <iana-tz>] [--delete-after-run]
-  $(basename "$0") update <job-id> [--agent <bridge-agent>] [--schedule "<cron-expr>" | --at "<iso-datetime>"] [--title "<title>"] [--payload "<text>" | --payload-file <path>] [--kind text|shell --script <path> --run-as-agent <agent> [--script-arg <arg>] [--script-env KEY=VALUE] [--timeout <seconds>] [--output-cap <bytes>] [--allow-kind-transition]] [--tz <iana-tz>] [--enable|--disable] [--delete-after-run|--keep-after-run]
+  $(basename "$0") create --agent <bridge-agent> (--schedule "<cron-expr>" | --at "<iso-datetime>") --title "<title>" [--payload "<text>" | --payload-file <path>] [--kind text|shell --script <path> --run-as-agent <agent> [--script-arg <arg>] [--script-env KEY=VALUE] [--timeout <seconds>] [--output-cap <bytes>]] [--tz <iana-tz>] [--model <id>] [--effort <effort>] [--cron-default-model <id>] [--cron-default-effort <effort>] [--delete-after-run]
+  $(basename "$0") update <job-id> [--agent <bridge-agent>] [--schedule "<cron-expr>" | --at "<iso-datetime>"] [--title "<title>"] [--payload "<text>" | --payload-file <path>] [--kind text|shell --script <path> --run-as-agent <agent> [--script-arg <arg>] [--script-env KEY=VALUE] [--timeout <seconds>] [--output-cap <bytes>] [--allow-kind-transition]] [--tz <iana-tz>] [--model <id>|""] [--effort <effort>|""] [--cron-default-model <id>|""] [--cron-default-effort <effort>|""] [--enable|--disable] [--delete-after-run|--keep-after-run]
   $(basename "$0") delete <job-id>
   $(basename "$0") rebalance-memory-daily [--jobs-file <path>] [--schedule "<cron-expr>"] [--tz <iana-tz>] [--dry-run] [--json]
   $(basename "$0") migrate-payloads --jsonl-aware [--jobs-file <path>] [--dry-run] [--json]
@@ -33,6 +33,15 @@ Notes:
   without iso, use OS crontab (recommended) or a --kind text cron whose payload
   runs 'bash <script>' against a non-Claude (codex) agent. See OPERATIONS.md
   "Scheduled shell scripts without iso v2".
+
+  --model / --effort pin the model the disposable cron CHILD launches with, so
+  cron output does not silently follow whatever model an interactive '/model'
+  left in the agent-home .claude/settings.json (issue #1880). Precedence
+  (highest first): per-job --model -> --cron-default-model -> roster
+  BRIDGE_AGENT_MODEL -> BRIDGE_CRON_DEFAULT_MODEL env. --effort applies to codex
+  targets only (raw 'claude -p' has no effort flag). On update, pass "" to clear
+  a field and fall back to the next precedence tier. These flags are NOT carried
+  through the iso-staging path; set them controller-side for iso agents.
 EOF
 }
 
@@ -254,7 +263,13 @@ run_create() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --agent|--schedule|--at|--title|--payload|--payload-file|--tz|--actor|--kind|--script|--script-arg|--script-env|--run-as-agent|--timeout|--output-cap)
+      # Issue #1880: --model/--effort (per-job) and --cron-default-model/
+      # --cron-default-effort pass straight through to native-create. They
+      # pin the disposable cron CHILD's model so it never inherits the
+      # interactive `/model` settings.json. NOTE: the iso-staging path
+      # (#1359) does not carry these fields; an iso agent that needs a per-job
+      # cron model should have the controller-side admin set it.
+      --agent|--schedule|--at|--title|--payload|--payload-file|--tz|--actor|--kind|--script|--script-arg|--script-env|--run-as-agent|--timeout|--output-cap|--model|--effort|--cron-default-model|--cron-default-effort)
         [[ $# -lt 2 ]] && bridge_die "$1 뒤에 값을 지정하세요."
         case "$1" in
           --kind) kind="$2" ;;
@@ -764,7 +779,11 @@ run_update() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --agent|--schedule|--at|--title|--payload|--payload-file|--tz|--actor|--kind|--script|--script-arg|--script-env|--run-as-agent|--timeout|--output-cap)
+      # Issue #1880: per-job --model/--effort and --cron-default-model/
+      # --cron-default-effort. Pass a value to set, an empty string ("") to
+      # CLEAR (drop back to cron-default/roster). These are NOT shell-kind
+      # options, so they must not set shell_option_seen.
+      --agent|--schedule|--at|--title|--payload|--payload-file|--tz|--actor|--kind|--script|--script-arg|--script-env|--run-as-agent|--timeout|--output-cap|--model|--effort|--cron-default-model|--cron-default-effort)
         [[ $# -lt 2 ]] && bridge_die "$1 뒤에 값을 지정하세요."
         case "$1" in
           --kind) kind="$2" ;;

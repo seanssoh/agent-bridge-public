@@ -2431,7 +2431,17 @@ select_for_path() {
       # 1875-cron-prod-mutation-guard on every runner move so a future PR cannot
       # drop the prod-mutation/interactive-gated refusal or over-block routine
       # cron jobs.
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1875-cron-prod-mutation-guard 1843-cron-consecutive-failure-escalation 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite
+      # Issue #1880: bridge-cron-runner.py's run_claude/run_codex now pass an
+      # EXPLICIT --model (and codex reasoning effort) resolved by
+      # resolve_cron_child_model_effort (per-job jobs.json → cron-default →
+      # roster accessor → BRIDGE_CRON_DEFAULT_MODEL env), so the disposable cron
+      # child never inherits the interactive `.claude/settings.json` model that
+      # `/model` writes; bridge-cron.py's native-create/native-update persist the
+      # per-job + cronDefaults fields. Pull 1880-cron-explicit-model on every
+      # runner/bridge-cron.py move so a future PR cannot drop the explicit
+      # --model, regress the precedence order, or re-couple the child to the
+      # interactive settings.json (the entitlement-drop 404 incident).
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue beta5-2-eta-cron-iso-uid-preflight 1359-cron-create-iso-staging 1379-iso-cron-staging-group 1383-iso-cron-result-json-group 8807-cron-backfill-coalesce 1459-cron-dispatch-recovery 1659-cron-status-walk-perf 1677-cron-summary-short-derive 1792-cron-scope-fence 1875-cron-prod-mutation-guard 1843-cron-consecutive-failure-escalation 1826-cron-at-naive-tz 1842-cron-tamper-iso-groupwrite 1880-cron-explicit-model
       add_integration integration-minimal
       ;;
 

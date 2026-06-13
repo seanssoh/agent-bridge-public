@@ -36,6 +36,20 @@ agb cron delete <job-id>
 - If the recurring work only matters after explicit human approval, do not schedule it automatically.
 - If the job routinely produces "no change" results, the disposable cron worker should return `needs_human_followup=false`.
 
+## Pinning the cron child model (issue #1880)
+
+The disposable cron child does **not** inherit the model an interactive `/model` writes into the agent-home `.claude/settings.json`. Pin a stable model so a scheduled cron does not silently follow (and 404 with) whatever the interactive session is using.
+
+```bash
+agb cron create --agent <agent> --schedule "0 9 * * *" --title "Daily check" --payload "..." \
+  --model <model-id> [--effort <effort>]
+agb cron update <job-id> --model <model-id>     # set
+agb cron update <job-id> --model ""             # clear -> fall back to cron-default/roster
+agb cron create --agent <agent> ... --cron-default-model <model-id>   # default for jobs with no per-job model
+```
+
+Resolution precedence (highest first): per-job `--model` -> `--cron-default-model` (jobs-file `cronDefaults`) -> roster `BRIDGE_AGENT_MODEL` -> `BRIDGE_CRON_DEFAULT_MODEL` env. `--effort` applies to **codex** targets only (raw `claude -p` has no effort flag). `agb cron show <job>` reports the resolved `model:` / `effort:` rows. The cron child NEVER reads the interactive `.claude/settings.json` for its model.
+
 ## CLI Help
 
 `agb` is a compact dispatcher for `agent-bridge`. Use `agb --help` and `agb cron --help` for the full surface. `agb help` (without dashes) is **not** a recognised command; nor are `agb list` / `agb status` (use `agent-bridge ...` for those — `agb` is queue/dispatch only).

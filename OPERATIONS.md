@@ -1358,6 +1358,60 @@ bash scripts/smoke/picker-sweep.sh
 The smoke runs in an isolated `BRIDGE_HOME` with mock tmux + mock queue
 seams; it does not touch a live tmux server or live queue state.
 
+### Pinning the cron-child model / effort (issue #1880)
+
+The bridge cron runner spawns a **disposable child** (`claude -p` / `codex
+exec`) for every text-payload cron job. Before #1880 the runner passed **no
+explicit `--model`**, so the child inherited whatever model the agent-home
+`.claude/settings.json` carried — the same file an interactive `/model` writes.
+When an operator switched the interactive session to a model that lacks
+entitlement for the cron token pool, **every** cron child 404'd
+(`api_error_status: 404 ... selected model may not exist`) while the interactive
+session looked healthy (observed `consecutive_errors=7`).
+
+The cron child now launches with an **explicit, stable** model resolved from
+sources that do **not** change when an operator runs `/model` interactively. The
+interactive `.claude/settings.json` is **deliberately never consulted** for the
+cron child's model.
+
+**Resolution precedence (highest first):**
+
+1. **per-job** — `jobs.json` `model` / `effort` (set via `cron create/update
+   --model/--effort`).
+2. **cron-default** — `jobs.json` top-level `cronDefaults.{model,effort}` (set
+   via `--cron-default-model` / `--cron-default-effort`).
+3. **roster** — `BRIDGE_AGENT_MODEL["<agent>"]` / `BRIDGE_AGENT_EFFORT["<agent>"]`
+   (read through the existing `bridge_agent_model` / `bridge_agent_effort`
+   accessor — the same value an interactive launch uses).
+4. **stable fallback** — `BRIDGE_CRON_DEFAULT_MODEL` / `BRIDGE_CRON_DEFAULT_EFFORT`
+   env, **only** if deliberately configured (never an implicit hardcode).
+
+```bash
+# Per-job: this job's cron child always runs on <model-id>.
+agent-bridge cron create --agent <agent> --schedule '0 9 * * *' \
+    --title daily-digest --payload '...' --model <model-id> [--effort <effort>]
+
+# Update / clear (pass "" to drop back to the next precedence tier):
+agent-bridge cron update <job-id> --model <model-id>
+agent-bridge cron update <job-id> --model ""
+
+# Cron-default for every job on this jobs file that has no per-job model:
+agent-bridge cron create --agent <agent> ... --cron-default-model <model-id>
+```
+
+`--effort` applies to **codex** targets only — it maps to codex's
+`-c model_reasoning_effort=<effort>`; raw `claude -p` has no effort flag, so the
+effort tier is resolved but unused on the Claude path. `agent-bridge cron show
+<job>` reports the resolved `model:` / `effort:` rows (`-` when unset). The
+per-job/`--cron-default-*` flags are **not** carried through the iso-staging
+path (#1359); for an isolated agent, set them controller-side.
+
+Verify the no-inheritance contract:
+
+```bash
+bash scripts/smoke/1880-cron-explicit-model.sh
+```
+
 ## Platform Scope
 
 Agent Bridge runs on both macOS and Linux, but the two hosts have
