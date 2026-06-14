@@ -47,7 +47,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
 fi
 
 PRIVATE_CONFIG_DIR="$SMOKE_TMP_ROOT/agent-home/.claude"
-SECRET_FILE="$SMOKE_TMP_ROOT/launch-secrets.env"
+SECRET_FILE="$SMOKE_TMP_ROOT/launch-secrets.env"  # noqa: iso-helper-boundary  (controller-only test fixture path, not a runtime boundary RW)
 ERRFILE="$SMOKE_TMP_ROOT/errfile.log"
 OUTFILE="$SMOKE_TMP_ROOT/child-out.log"
 mkdir -p "$PRIVATE_CONFIG_DIR"
