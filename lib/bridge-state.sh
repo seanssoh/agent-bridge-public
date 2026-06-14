@@ -138,6 +138,18 @@ bridge_build_dynamic_launch_cmd() {
           2>/dev/null || true
       fi
     fi
+  elif [[ "$engine" == "codex" ]] \
+       && command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+       && bridge_agent_is_dynamic_vanilla_codex "$agent"; then
+    # Issue #1899: a dynamic Codex agent runs as vanilla Codex CLI against the
+    # operator-global ~/.codex. The bridge must NEVER emit `codex resume <id>`
+    # for it (no bridge transcript scan, no persisted session id). When continue
+    # is intended the codex case below emits native `codex resume --last`
+    # (most-recent session in cwd; the cwd filter is the safety boundary —
+    # never `--all`); otherwise a fresh `codex`. session_id stays empty so the
+    # builder cannot add a bridge id. Skip bridge_normalize_agent_session_id so
+    # the resolver never re-detects the operator-global session.
+    session_id=""
   else
     bridge_normalize_agent_session_id "$agent"
     session_id="$(bridge_agent_session_id "$agent")"
@@ -145,7 +157,43 @@ bridge_build_dynamic_launch_cmd() {
 
   case "$engine" in
     codex)
-      if [[ "$continue_mode" == "1" && -n "$session_id" ]]; then
+      if command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+         && bridge_agent_is_dynamic_vanilla_codex "$agent"; then
+        # Issue #1899: native resume. Continue intent emits `codex resume --last`
+        # (most-recent session in cwd, identical to the operator typing it) ONLY
+        # when there is actually a resumable codex session for this workdir;
+        # first wake (no transcript yet) and continue=0 launch a fresh `codex`.
+        # `codex resume --last` against an empty cwd has no session to reopen, so
+        # gating on the cwd-scoped detector keeps the first-wake launch from
+        # depending on `--last` finding nothing (mirrors the Claude first-wake
+        # gate). No `--resume <id>`, no `--all` (the cwd filter is the safety
+        # boundary). The forced `-c` flags are operational only:
+        # `features.hooks=true` is the fail-closed bridge-comms guarantee (the
+        # project-local <workdir>/.codex/hooks.json must run), and
+        # `features.fast_mode=true` + `--dangerously-bypass-approvals-and-sandbox`
+        # + `--no-alt-screen` are the same unattended-worker flags every dynamic
+        # Codex launch carries (bridge_codex_launch_with_hooks re-pins
+        # hooks+fast_mode on every wake regardless). We do NOT force `--model` /
+        # `-m` / `-p`/`--profile` / auth, so the operator-global ~/.codex (model,
+        # profile, auth.json) is inherited untouched — the vanilla invariant.
+        local _dvc_has_session=0
+        if [[ "$continue_mode" == "1" ]] \
+           && bridge_codex_has_resumable_session_state "$(bridge_agent_workdir "$agent")"; then
+          _dvc_has_session=1
+        fi
+        if [[ "$continue_mode" == "1" && "$_dvc_has_session" == "1" ]]; then
+          bridge_join_quoted codex resume --last -c "features.hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+        else
+          if [[ "$continue_mode" == "1" ]]; then
+            bridge_warn "Codex agent '$agent' has continue=1 but no resumable session in its workdir yet (first wake); launching fresh."
+            bridge_audit_log state codex_session_resume_skipped_first_wake "$agent" \
+              --field "continue_mode=$continue_mode" \
+              --field "reason=no_transcript" \
+              2>/dev/null || true
+          fi
+          bridge_join_quoted codex -c "features.hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+        fi
+      elif [[ "$continue_mode" == "1" && -n "$session_id" ]]; then
         bridge_join_quoted codex resume "$session_id" -c "features.hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
       else
         bridge_join_quoted codex -c "features.hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
@@ -192,6 +240,16 @@ bridge_build_resume_launch_cmd() {
   # operator transcript id for these agents.
   if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
      && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    return 1
+  fi
+  # Issue #1899: dynamic vanilla Codex never resumes by bridge-tracked session
+  # id either. Decline the resume-cmd builder so the caller falls through to
+  # bridge_build_dynamic_launch_cmd, which emits plain `codex` / `codex resume
+  # --last` (native, no `codex resume <id>`). Declining BEFORE
+  # bridge_normalize_agent_session_id also means the bridge never persists an
+  # operator transcript id for these agents.
+  if command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_codex "$agent"; then
     return 1
   fi
   if [[ "$engine" == "claude" ]] && ! bridge_agent_claude_effective_engine_continue "$agent"; then
@@ -337,6 +395,14 @@ bridge_normalize_agent_session_id() {
   # native `claude -c`.
   if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
      && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    return 0
+  fi
+  # #1899: dynamic vanilla Codex likewise holds no bridge-managed session id and
+  # must never touch the resolver (which would re-detect the operator-global
+  # ~/.codex session). Hard no-op so resume classifiers fall through to native
+  # `codex resume --last`.
+  if command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_codex "$agent"; then
     return 0
   fi
 
@@ -4315,9 +4381,16 @@ bridge_persist_agent_state() {
     # instead of resurrected. The detector/resolver chokepoints already prevent
     # a non-empty id from ever entering memory for this class; this closes the
     # persist-time back door. Static/admin/Codex keep the #1305 race guard.
+    # #1899: dynamic vanilla Codex is held to the same contract — it must NEVER
+    # hold a bridge-managed id, so an empty in-memory id is authoritative for it
+    # too and the #1305 rehydrate is skipped (a stale id in a pre-fix history
+    # env file is written through cleared, not resurrected).
     local _is_dyn_vanilla=0
     if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
        && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+      _is_dyn_vanilla=1
+    elif command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+       && bridge_agent_is_dynamic_vanilla_codex "$agent"; then
       _is_dyn_vanilla=1
     fi
     if [[ "$_is_dyn_vanilla" != "1" \
@@ -4624,6 +4697,19 @@ bridge_resolve_resume_session_id() {
   local max_age_hours="${5:-${BRIDGE_RESUME_MAX_AGE_HOURS:-48}}"
   local exclude_csv="${6:-}"
 
+  # #1899: dynamic vanilla Codex must resolve to EMPTY at the central chokepoint,
+  # BEFORE the generic `engine != claude` echo-through below (which would
+  # otherwise reflect a candidate id straight back into bridge state — the
+  # persist back door). This class holds no bridge-managed id and resumes only
+  # via native `codex resume --last`; a stale id in a pre-fix history env file or
+  # a restart snapshot must NOT be preserved. rc 0 keeps the hydration `case
+  # 0|2)` arm storing the empty result. Static/admin Codex (and Claude) untouched.
+  if [[ -n "$agent" ]] \
+     && command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_codex "$agent"; then
+    return 0
+  fi
+
   if [[ "$engine" != "claude" ]]; then
     if [[ -n "$candidate" ]]; then printf '%s' "$candidate"; fi
     return 0
@@ -4750,6 +4836,37 @@ bridge_claude_has_resumable_session_state() {
   local rc=0
   bridge_resolve_resume_session_id claude "$agent" "$workdir" "" >/dev/null 2>/dev/null || rc=$?
   [[ "$rc" != 1 ]]
+}
+
+# Issue #1899: returns 0 (true) iff the operator-global ~/.codex/sessions holds a
+# codex session whose cwd is <workdir> — i.e. there is something for `codex
+# resume --last` to reopen. Used by the dynamic-vanilla-codex launch builder to
+# pick `codex resume --last` (resumable) vs plain `codex` (first wake).
+#
+# Deliberately FORK-ONLY (find + grep), NOT the python `bridge_detect_codex_
+# session_id` heredoc-stdin helper: this probe runs INSIDE the
+# `$(bridge_build_dynamic_launch_cmd ...)` command substitution on the daemon
+# launch path, which is exactly the bash 5.3.9 `heredoc_write`/`read_comsub`
+# deadlock class (footgun #11). A grep for the `"cwd":"<workdir>"` token the
+# codex session_meta line carries avoids any bash stdin read. Best-effort: a
+# missing sessions dir / unreadable file simply yields "no resumable state".
+bridge_codex_has_resumable_session_state() {
+  local workdir="$1"
+  [[ -n "$workdir" ]] || return 1
+  local sessions_dir="${HOME}/.codex/sessions"
+  [[ -d "$sessions_dir" ]] || return 1
+  # Match the JSON token codex writes for the session cwd. Both compact
+  # (`"cwd":"…"`) and spaced (`"cwd": "…"`) encodings are covered.
+  local needle_compact="\"cwd\":\"${workdir}\""
+  local needle_spaced="\"cwd\": \"${workdir}\""
+  local f
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if grep -qF -e "$needle_compact" -e "$needle_spaced" "$f" 2>/dev/null; then
+      return 0
+    fi
+  done < <(find "$sessions_dir" -type f -name '*.jsonl' 2>/dev/null)
+  return 1
 }
 
 # Returns 0 (true) iff the given session id is eligible to resume for the
@@ -4883,6 +5000,14 @@ bridge_refresh_agent_session_id() {
   # detect-empty contract callers already handle). Static/admin unchanged.
   if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
      && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    return 1
+  fi
+  # #1899: dynamic vanilla Codex is a hard no-op here too. The codex detector
+  # scans the operator-global ~/.codex/sessions and would capture + PERSIST the
+  # operator's live session id. This class resumes only via native `codex resume
+  # --last`, so never run detection and never persist an id. rc 1 = no id.
+  if command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_codex "$agent"; then
     return 1
   fi
 

@@ -681,7 +681,18 @@ elif [[ "$ENGINE" == "codex" && $SAFE_MODE -eq 0 ]]; then
       bridge_warn "Codex bridge skill bootstrap skipped or conflicted: $WORK_DIR"
     fi
   fi
-  if ! bridge_ensure_codex_hooks >/dev/null; then
+  if command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_codex "$AGENT"; then
+    # Issue #1899: a dynamic vanilla Codex agent inherits the operator-global
+    # ~/.codex and must NOT have the bridge rewrite ~/.codex/hooks.json (operator
+    # pollution). Install the comms hooks PROJECT-LOCAL at <workdir>/.codex/
+    # hooks.json instead, and detect+report if Codex project trust would block
+    # them. A hard write failure is non-fatal here (the launch still proceeds
+    # with features.hooks forced on); only operator-visible reporting downgrades.
+    if ! bridge_ensure_codex_dynamic_project_hooks "$AGENT" "$WORK_DIR"; then
+      bridge_warn "Codex dynamic project hook 설정에 실패했습니다: $WORK_DIR (comms degraded)"
+    fi
+  elif ! bridge_ensure_codex_hooks >/dev/null; then
     bridge_die "Codex hook 설정에 실패했습니다: $WORK_DIR"
   fi
 fi

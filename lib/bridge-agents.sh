@@ -939,6 +939,38 @@ bridge_agent_is_dynamic_vanilla_claude() {
   return 0
 }
 
+# Issue #1899 (sibling of #1890): the ONE boundary for the "dynamic Codex =
+# vanilla Codex CLI + bridge comms only" contract. True (rc 0) iff this agent is
+# a DYNAMIC CODEX agent that is NOT linux-user-isolated (iso v2). Everything
+# else — static / admin Codex, any Claude agent, and iso-v2 Codex agents on
+# Linux — returns non-zero and keeps ALL pre-#1899 managed-Codex behavior
+# (CODEX_HOME = <agent_home>/.codex, bridge `codex resume <id>`, managed
+# auth.json sync, per-agent .codex/hooks.json + profiles).
+#
+# Why these three terms and nothing else (codex consensus constraint #1, mirror
+# of the Claude predicate above):
+#   - engine == codex: the vanilla-Codex-CLI contract is Codex-specific; Claude
+#     has its own predicate (bridge_agent_is_dynamic_vanilla_claude) and model.
+#   - source == dynamic: static/admin Codex are persistent isolated identities
+#     (own home / profile / managed auth) and must stay isolated. Only ephemeral
+#     dynamic workers become "vanilla Codex CLI + bridge layer".
+#   - NOT iso-effective: an iso UID (agent-bridge-<a>) cannot read the operator's
+#     ~/.codex, so global passthrough is impossible there; Linux iso hosts keep
+#     the per-agent CODEX_HOME behavior. On macOS / shared-mode this term is
+#     always satisfied.
+# Do NOT widen this to infer from workdir location, shared-mode, or agent name.
+bridge_agent_is_dynamic_vanilla_codex() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  [[ "$(bridge_agent_engine "$agent" 2>/dev/null || true)" == "codex" ]] || return 1
+  [[ "$(bridge_agent_source "$agent" 2>/dev/null || true)" == "dynamic" ]] || return 1
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+     && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
 # Issue #598 Track 1: which loader path made this agent id known.
 # Closed value space: {static-roster, dynamic-active-env,
 # dynamic-history-live-session, dynamic-tmux-recovered}. Falls back to

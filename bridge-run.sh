@@ -1652,6 +1652,39 @@ bridge_run_export_claude_launch_env() {
   [[ -n "$agent_home" ]] && export HOME="$agent_home"
 }
 
+# shellcheck disable=SC2030,SC2031 # launch env export is intentional for the child command below.
+bridge_run_export_codex_launch_env() {
+  [[ "$ENGINE" == "codex" ]] || return 0
+
+  # Issue #1899: a dynamic vanilla Codex agent must run against the operator-
+  # global ~/.codex (config.toml model/profile, auth.json, sessions/), exactly
+  # like the operator typing `codex` in this workdir. Pin BOTH:
+  #   - HOME = operator home, so any HOME-relative read resolves to the operator
+  #     tree (and the default CODEX_HOME = $HOME/.codex lands there);
+  #   - CODEX_HOME = <operator_home>/.codex EXPLICITLY, so even a future
+  #     HOME repoint cannot make CODEX_HOME become <agent_home>/.codex (the
+  #     invariant #1899 protects).
+  # CODEX_SQLITE_HOME is intentionally left untouched (unset unless the operator
+  # already exported it). Managed/static/admin Codex and iso-v2 Codex are
+  # excluded by the predicate and keep their per-agent CODEX_HOME behavior.
+  if command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_codex "$AGENT"; then
+    local _operator_home=""
+    if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+      _operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+    fi
+    if [[ -n "$_operator_home" ]]; then
+      export HOME="$_operator_home"
+      export CODEX_HOME="$_operator_home/.codex"
+    fi
+    return 0
+  fi
+  # Managed/static/admin Codex: no-op. HOME / CODEX_HOME are resolved by the
+  # existing managed path (iso-v2 secret-env loader sets HOME = iso UID home;
+  # shared mode inherits the operator HOME), unchanged from pre-#1899.
+  return 0
+}
+
 bridge_run_ledger_has_snapshot() {
   # Issue #1857: true when the bridge-owned grant ledger at $1 records a
   # non-empty `installed_snapshot.plugins` map (an operator recovery snapshot
@@ -2347,6 +2380,8 @@ while true; do
 
   if [[ "$ENGINE" == "claude" ]]; then
     bridge_run_export_claude_launch_env
+  elif [[ "$ENGINE" == "codex" ]]; then
+    bridge_run_export_codex_launch_env
   fi
 
   if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then

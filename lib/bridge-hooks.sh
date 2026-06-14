@@ -1067,3 +1067,83 @@ bridge_ensure_codex_agent_hooks() {
     --python-bin "$(command -v python3 || printf '/usr/bin/python3')" \
     >/dev/null 2>&1 || true
 }
+
+# Issue #1899: a dynamic vanilla Codex agent runs as vanilla Codex CLI against
+# the operator-global ~/.codex, so the bridge must NOT write its comms hooks to
+# ~/.codex/hooks.json (operator-global pollution) NOR to <agent_home>/.codex/
+# hooks.json (the managed per-agent path the agent never reads in this mode).
+# Instead it installs them PROJECT-LOCAL at <workdir>/.codex/hooks.json — a
+# layer Codex merges on top of the user layer (all sources run; higher layers
+# don't replace lower hooks). Returns the resolved path.
+bridge_codex_dynamic_project_hooks_file() {
+  local workdir="$1"
+  [[ -n "$workdir" ]] || return 1
+  printf '%s/.codex/hooks.json' "$workdir"
+}
+
+# bridge_ensure_codex_dynamic_project_hooks <agent> <workdir>
+#
+# Issue #1899: install/update the bridge comms hooks into the project-local
+# <workdir>/.codex/hooks.json for a dynamic vanilla Codex agent, then DETECT +
+# REPORT (operator-visible warning + audit row) when Codex project trust would
+# prevent those hooks from firing. We do NOT establish trust and do NOT blanket
+# `--dangerously-bypass-hook-trust` (it bypasses trust for ALL enabled hooks —
+# too broad as a default); the fail-closed comms guarantee is the forced
+# `-c features.hooks=true` on the launch command (lib/bridge-state.sh). rc 0 on
+# a successful write even when trust is unresolved — the launch must proceed and
+# the operator decides on trust; rc non-zero only on a hard write failure.
+bridge_ensure_codex_dynamic_project_hooks() {
+  local agent="$1"
+  local workdir="$2"
+  local hook_file=""
+  local operator_home=""
+  local codex_config=""
+  local trust_out=""
+  [[ -n "$agent" && -n "$workdir" ]] || return 0
+
+  hook_file="$(bridge_codex_dynamic_project_hooks_file "$workdir")" || return 0
+  mkdir -p "$(dirname "$hook_file")" 2>/dev/null || return 1
+
+  if ! bridge_hooks_python ensure-codex-hooks \
+       --codex-hooks-file "$hook_file" \
+       --bridge-home "${BRIDGE_HOME:-$BRIDGE_SCRIPT_DIR}" \
+       --python-bin "$(command -v python3 || printf '/usr/bin/python3')" \
+       >/dev/null 2>&1; then
+    bridge_warn "Codex dynamic project hooks 설치 실패: $hook_file"
+    return 1
+  fi
+
+  # Detect + report trust state against the SAME config.toml the launched codex
+  # will read. The dynamic vanilla launch pins CODEX_HOME = <operator_home>/.codex
+  # (bridge_run_export_codex_launch_env), so trust must be checked there — NOT
+  # against this controller process's ambient CODEX_HOME, which may point
+  # elsewhere and would mis-report trust for the launched child.
+  if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+    operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+  fi
+  [[ -n "$operator_home" ]] || operator_home="$HOME"
+  codex_config="$operator_home/.codex/config.toml"
+
+  trust_out="$(bridge_hooks_python status-codex-project-trust \
+    --workdir "$workdir" --codex-config-file "$codex_config" 2>/dev/null || true)"
+  local _blocked="" _trust=""
+  if [[ -n "$trust_out" ]]; then
+    _blocked="$(printf '%s\n' "$trust_out" | sed -n 's/^CODEX_PROJECT_HOOKS_COMMS_BLOCKED=//p' | tr -d "'\"")"
+    _trust="$(printf '%s\n' "$trust_out" | sed -n 's/^CODEX_PROJECT_TRUST_LEVEL=//p' | tr -d "'\"")"
+  fi
+  if [[ "$_blocked" == "1" ]]; then
+    bridge_warn "Codex dynamic agent '$agent': project '$workdir' is UNTRUSTED — the bridge comms hooks at $hook_file will NOT run until you trust the project (run 'codex' once in $workdir and accept, or set trust_level=\"trusted\" for it in $codex_config). Bridge queue/inbox delivery is degraded until then."
+    bridge_audit_log state codex_dynamic_project_hooks_untrusted "$agent" \
+      --field "workdir=$workdir" \
+      --field "hooks_file=$hook_file" \
+      --field "trust_level=${_trust:-untrusted}" \
+      2>/dev/null || true
+  elif [[ "$_trust" == "unknown" ]]; then
+    bridge_warn "Codex dynamic agent '$agent': could not confirm Codex project trust for '$workdir' (config: $codex_config). If bridge queue hooks do not fire, trust the project in Codex (run 'codex' once in $workdir and accept)."
+    bridge_audit_log state codex_dynamic_project_hooks_trust_unknown "$agent" \
+      --field "workdir=$workdir" \
+      --field "hooks_file=$hook_file" \
+      2>/dev/null || true
+  fi
+  return 0
+}
