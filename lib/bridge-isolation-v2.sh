@@ -1936,8 +1936,19 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
   # from the command line — a sibling subtree. This guarantees the
   # recursive chgrp/chmod can never re-group shared plugin material to
   # the per-agent group and break other isolated agents.
+  #
+  # Optional --exclude-name <basename> args (#1891): a LEAF basename
+  # (matched anywhere in the tree via `-name`) whose node is pruned from
+  # every find pass — neither chgrp'd nor chmod'd. Unlike --exclude-subdir
+  # (whose dir node IS still mutated, only its contents skipped),
+  # --exclude-name skips the matched node entirely. The load-bearing
+  # caller is the memory-tree normalize: `memory/index.sqlite` must stay
+  # controller-owned 0600 (the controller-side reducer/rebuilder owns it;
+  # the iso UID never reads it directly), so it must NOT be relaxed to the
+  # 0660 ab-agent-<a> content contract that the rest of `memory/` gets.
   local -a _excl_names=()
   local -a _excl_paths=()
+  local -a _excl_basenames=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --exclude-subdir)
@@ -1955,6 +1966,14 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
         [[ -n "$2" ]] && _excl_paths+=("$2")
         shift 2
         ;;
+      --exclude-name)
+        [[ $# -ge 2 ]] || {
+          bridge_warn "chgrp_setgid_recursive: --exclude-name requires a value"
+          return 1
+        }
+        [[ -n "$2" ]] && _excl_basenames+=("$2")
+        shift 2
+        ;;
       *) bridge_warn "chgrp_setgid_recursive: unknown option: $1"; return 1 ;;
     esac
   done
@@ -1964,6 +1983,13 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
   local _fp_n
   for _fp_n in "${_excl_names[@]}"; do
     _find_prune+=('-path' "$root/$_fp_n/*" '-prune' '-o')
+  done
+  # --exclude-name prunes any node whose leaf basename matches (the node
+  # itself; no `/*` clause — these are files we skip in place, not subtrees
+  # to descend). Keeps `index.sqlite` controller-owned 0600 (#1891).
+  local _fp_b
+  for _fp_b in "${_excl_basenames[@]}"; do
+    _find_prune+=('-name' "$_fp_b" '-prune' '-o')
   done
   # --exclude-path prunes the matched node AND everything beneath it:
   # `-path "$abs" -prune -o -path "$abs/*" -prune -o`. The bare `-path
@@ -1982,6 +2008,10 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
   local _ea_p
   for _ea_p in "${_excl_paths[@]}"; do
     _excl_args+=('--exclude-path' "$_ea_p")
+  done
+  local _ea_b
+  for _ea_b in "${_excl_basenames[@]}"; do
+    _excl_args+=('--exclude-name' "$_ea_b")
   done
   # Platform discriminator gate (S5 Track A1, extending S3 pattern):
   # recursive chgrp + setgid bit only has a security model on hosts
@@ -2096,10 +2126,12 @@ bridge_isolation_v2_verify_chgrp_setgid_recursive() {
   [[ -d "$root" ]] || return 0  # nothing to verify
   local -a _excl_names=()
   local -a _excl_paths=()
+  local -a _excl_basenames=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --exclude-subdir) _excl_names+=("$2"); shift 2 ;;
       --exclude-path) [[ -n "${2:-}" ]] && _excl_paths+=("$2"); shift 2 ;;
+      --exclude-name) [[ -n "${2:-}" ]] && _excl_basenames+=("$2"); shift 2 ;;
       *) shift ;;
     esac
   done
@@ -2115,6 +2147,13 @@ bridge_isolation_v2_verify_chgrp_setgid_recursive() {
   for _fp_p in "${_excl_paths[@]}"; do
     _find_prune+=('-path' "$_fp_p" '-prune' '-o'
                   '-path' "$_fp_p/*" '-prune' '-o')
+  done
+  # #1891: prune --exclude-name nodes from the verify scan too, so the
+  # deliberately-skipped `index.sqlite` (controller-owned 0600, NOT in the
+  # agent group) does not register as a group/mode mismatch.
+  local _fp_b
+  for _fp_b in "${_excl_basenames[@]}"; do
+    _find_prune+=('-name' "$_fp_b" '-prune' '-o')
   done
 
   # Normalize expected modes to %04o so `stat` output ("2770", "660")
@@ -2184,6 +2223,99 @@ bridge_isolation_v2_verify_chgrp_setgid_recursive() {
     fi
   fi
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# 4a-mem. iso-owned memory/ tree normalize (#1891)
+# ---------------------------------------------------------------------------
+
+bridge_isolation_v2_normalize_memory_tree() {
+  # #1891 — Normalize an isolated agent's `memory/` subtree to the
+  # header-matrix contract: dirs `2770` group=`ab-agent-<a>`, files `0660`,
+  # EXCEPT the controller-owned `memory/index.sqlite` which stays `0600`
+  # (the controller-side memory reducer/rebuilder is its sole writer; the
+  # iso UID reads memory via the markdown wiki + the controller-published
+  # aggregate, never the raw index DB).
+  #
+  # Why a dedicated helper instead of leaning on the broad content-tree
+  # normalize: later-created (Jun-4+) iso agents finished provisioning with
+  # `memory/` left controller-owned `2700` (no group bits) — a create-time
+  # normalize that silently under-reached or failed. The iso UID then can't
+  # read its OWN memory/ (daily harvest fails). This helper is invoked from
+  # BOTH the create path and reapply/reconcile so an EXISTING stale `2700`
+  # subtree is repaired, not just fresh creates. It deliberately does NOT
+  # relax `index.sqlite` (criterion 2): a naive recursive group-open would
+  # break the controller-owned 0600 invariant the rebuilder relies on.
+  #
+  # Args:
+  #   $1 group   — ab-agent-<a>
+  #   $2+ roots  — one or more `memory/` dirs (e.g. <root>/home/memory,
+  #                <root>/workdir/memory). Missing roots are skipped.
+  # Returns non-zero if any present root failed to normalize. A complete
+  # no-op success off Linux / when v2 primitives are not initialized
+  # (the recursive helper gates on `bridge_isolation_v2_enforce`).
+  local group="$1"; shift
+  [[ -n "$group" ]] || {
+    bridge_warn "normalize_memory_tree: group required"
+    return 1
+  }
+  command -v bridge_isolation_v2_chgrp_setgid_recursive >/dev/null 2>&1 || return 0
+  # Off Linux / when v2 is not the security model this is a complete no-op
+  # success (mirrors the recursive helper's own gate, but applied up-front so
+  # the index.sqlite re-assert below does NOT run on a dev host either).
+  # Smokes force enforcement via BRIDGE_ISOLATION_REQUIRED=yes.
+  bridge_isolation_v2_enforce || return 0
+
+  local _mem_root
+  local _rc=0
+  for _mem_root in "$@"; do
+    [[ -n "$_mem_root" && -d "$_mem_root" ]] || continue
+    # Skip index.sqlite by leaf name so the recursive pass never relaxes the
+    # memory index DB to the 0660 ab-agent-<a> content mode. Its 0600 mode is
+    # the special case the contract carves out (criterion 2) — group members
+    # (incl. the controller) must not gain read on it via the memory walk.
+    # Scope: this helper's roots are the `memory/` trees themselves (the caller
+    # passes `home/memory` + `workdir/memory`), so the basename match is
+    # effectively `memory/**/index.sqlite` — the ONLY place a memory index DB
+    # lives. The broad #1506/#1533 passes elsewhere only add the exclude on the
+    # memory-bearing roots (home/workdir), so no `index.sqlite` outside a
+    # `memory/` tree is unintentionally exempted.
+    if ! bridge_isolation_v2_chgrp_setgid_recursive \
+          "$group" 2770 0660 "$_mem_root" --exclude-name index.sqlite; then
+      bridge_warn "normalize_memory_tree: chgrp/chmod of '$_mem_root' returned non-zero for group '$group' (the iso UID may not read its own memory/ until \`agent-bridge isolate <a> --reapply\` succeeds)."
+      _rc=1
+    fi
+    # Belt-and-braces: if index.sqlite exists, re-assert its restrictive 0600
+    # mode. The recursive pass skipped it by name, but a prior drift could have
+    # left it group-readable (e.g. an earlier blanket 0660); restore 0600 so
+    # the DB never gains group read. OWNER is intentionally left untouched: the
+    # rebuild writes the live DB AS the iso UID inside the 2770 memory dir
+    # (scripts/wiki-v2-rebuild.sh drops to the iso UID), so it is legitimately
+    # iso-owned — a chown here would fight that model. 0600 has no group bits,
+    # so iso-owned 0600 is exactly "no group read", which is the invariant.
+    #
+    # The memory dir is iso-UID-owned (2770), so the iso UID could swap
+    # index.sqlite for a symlink between the test and the chmod (TOCTOU /
+    # planted-redirect). Refuse a symlinked target — chmod only a real regular
+    # file. Best-effort: a chmod failure narrows the read audience, never
+    # widens it, so it is non-fatal.
+    local _idx="$_mem_root/index.sqlite"
+    if [[ -f "$_idx" && ! -L "$_idx" ]]; then
+      if ! { chmod 0600 "$_idx" 2>/dev/null \
+              || _bridge_isolation_v2_run_root_or_sudo chmod 0600 "$_idx" 2>/dev/null; }; then
+        # A failed re-restrict means index.sqlite may stay group-readable
+        # (0660 left by the content publisher) — the exact criterion-2 break.
+        # Surface it via the helper's return code so the reapply driver records
+        # an error row (and the create-path warn fires). Still NON-fatal at the
+        # call sites (they `|| bridge_warn`), matching the #1506/#1533 contract.
+        bridge_warn "normalize_memory_tree: could not reassert 0600 on '$_idx' — it may remain group-readable; re-run \`agent-bridge isolate <a> --reapply\`."
+        _rc=1
+      fi
+    elif [[ -L "$_idx" ]]; then
+      bridge_warn "normalize_memory_tree: refusing symlinked index.sqlite at '$_idx' (planted-redirect guard); not chmod'd."
+    fi
+  done
+  return "$_rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -4558,6 +4690,87 @@ bridge_isolation_v2_write_agent_metadata() {
     fi
   fi
 
+  return 0
+}
+
+bridge_isolation_v2_verify_agent_metadata() {
+  # #1891 (F3a) — Confirm `state/agents/<a>/agent-meta.env` is present AND
+  # carries the canonical `0640 controller:ab-agent-<a>` contract AND the
+  # iso UID can actually consume it. This is the visible/nonzero check the
+  # create-path uses so an absent/under-permissioned snippet becomes a hard
+  # failure instead of a silent warn (the symptom: later-created agents
+  # finished provisioning with the snippet missing, and the daemon then
+  # mis-detected the engine). Secret-free: the snippet itself carries no
+  # secrets, and this verifier neither logs nor reads file contents.
+  #
+  # Returns 0 only when every assertion holds. On any failure it
+  # bridge_warns the specific reason and returns 1.
+  local agent="$1"
+  [[ -n "$agent" ]] || { bridge_warn "verify_agent_metadata: agent required"; return 1; }
+
+  # Linux-only + iso-v2-only, mirroring the writer's own gates: on a
+  # macOS/dev host or for a non-iso agent the writer is a no-op success, so
+  # the verifier must also pass (there is nothing to verify).
+  [[ "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]] || return 0
+  command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 || return 0
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || return 0
+
+  local meta_file="${BRIDGE_ACTIVE_AGENT_DIR:-$BRIDGE_HOME/state/agents}/$agent/agent-meta.env"  # noqa: iso-helper-boundary — controller-owned 0640 snippet path; controller-side stat/verify, not an iso boundary RW (the iso-read probe below uses bridge_isolation_run_as_agent_user_via_bash)
+  if [[ ! -f "$meta_file" ]]; then
+    bridge_warn "verify_agent_metadata: $meta_file absent after apply for agent '$agent' (iso UID cannot resolve its own engine/config_dir; the daemon may mis-detect the engine)."
+    return 1
+  fi
+
+  # Mode 0640 (controller rw, agent group r, world none).
+  local stat_fmt
+  if [[ "$(uname)" == "Darwin" ]]; then stat_fmt=(-f %A); else stat_fmt=(-c %a); fi
+  local mode
+  mode="$(stat "${stat_fmt[@]}" "$meta_file" 2>/dev/null || true)"
+  mode="$(printf '%04o' "$((8#${mode:-0}))" 2>/dev/null || printf '%s' "$mode")"
+  if [[ "$mode" != "0640" ]]; then
+    bridge_warn "verify_agent_metadata: $meta_file mode=$mode, expected 0640 for agent '$agent'."
+    return 1
+  fi
+
+  # Owner = controller. The snippet is controller-owned (the writer creates it
+  # under the controller umask, then only chgrps the GROUP to ab-agent-<a>).
+  # An iso-UID owner here would mean the file was rewritten cross-boundary —
+  # the iso UID must never own the metadata contract (it could then forge its
+  # own engine/config_dir). Skip silently if the controller user is unresolved.
+  local want_owner cur_owner own_fmt
+  want_owner="$(bridge_current_user 2>/dev/null || id -un 2>/dev/null || true)"
+  if [[ -n "$want_owner" ]]; then
+    if [[ "$(uname)" == "Darwin" ]]; then own_fmt=(-f %Su); else own_fmt=(-c %U); fi
+    cur_owner="$(stat "${own_fmt[@]}" "$meta_file" 2>/dev/null || true)"
+    if [[ -n "$cur_owner" && "$cur_owner" != "$want_owner" ]]; then
+      bridge_warn "verify_agent_metadata: $meta_file owner=$cur_owner, expected controller '$want_owner' for agent '$agent'."
+      return 1
+    fi
+  fi
+
+  # Group ab-agent-<a>.
+  local agent_grp want_grp
+  want_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+  if [[ -n "$want_grp" ]]; then
+    local grp_fmt
+    if [[ "$(uname)" == "Darwin" ]]; then grp_fmt=(-f %Sg); else grp_fmt=(-c %G); fi
+    agent_grp="$(stat "${grp_fmt[@]}" "$meta_file" 2>/dev/null || true)"
+    if [[ -n "$agent_grp" && "$agent_grp" != "$want_grp" ]]; then
+      bridge_warn "verify_agent_metadata: $meta_file group=$agent_grp, expected $want_grp for agent '$agent'."
+      return 1
+    fi
+  fi
+
+  # Iso-UID consumption: confirm the agent's own OS user can read the file.
+  # `bridge_isolation_run_as_agent_user_via_bash` drops to the iso UID; a
+  # `test -r` there proves the group-read path the iso process depends on.
+  if command -v bridge_isolation_run_as_agent_user_via_bash >/dev/null 2>&1; then
+    if ! bridge_isolation_run_as_agent_user_via_bash "$agent" \
+          "test -r '$meta_file'" >/dev/null 2>&1; then
+      bridge_warn "verify_agent_metadata: iso UID for agent '$agent' cannot read $meta_file (group-read path broken)."
+      return 1
+    fi
+  fi
   return 0
 }
 
