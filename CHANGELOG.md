@@ -4,6 +4,37 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [0.16.11-rc1] — 2026-06-15
+
+**Release candidate for dynamic vanilla agents + iso-v2 create-path / doc-backfill hardening, prepared for VM/fleet soak before LTS promotion.** Rolls up everything merged on `main` since the v0.16.10 LTS tag. Headline: operational convergence for **dynamic agents** — a dynamic Claude or Codex agent now runs like vanilla Claude Code / Codex CLI against the operator's global config (settings, model, session history, installed plugins, MCP, credentials) with native resume, and the bridge layers only its comms/queue hooks via project-local settings, superseding the prior private-config-dir isolation that was destroying operator sessions. Intended to be validated by a VM/fleet soak (incl. cm-prod real-Linux iso-v2 acceptance) before promotion to the v0.16.11 LTS tag. **Not yet soak-verified.**
+
+### Dynamic agents — vanilla-equivalent (operator-directed)
+
+- **Dynamic Claude agents run as vanilla Claude Code + bridge comms only (#1900, #1890).** A dynamic Claude agent now inherits the operator/user global `~/.claude` (settings, model, session history, installed plugins, MCP, credentials), resumes via native `claude -c`, and gets no private `CLAUDE_CONFIG_DIR`. Bridge comms/queue hooks are layered via project-local `<workdir>/.claude/settings.local.json` (operator keys preserved, `.git/info/exclude` guard, refuses to modify a tracked file), and `hooks/prompt-guard.py` no-ops without a bridge session so an operator's later vanilla session in the same workdir is unaffected. This supersedes #1889's private-config isolation for dynamic Claude — safety is now "no destructive session machinery", not isolation; the bridge no longer detects, persists, or quarantines a session id for dynamic Claude. Static/admin Claude agents are unchanged.
+- **Dynamic Codex agents run as vanilla Codex CLI + bridge comms only (#1901, #1899).** The Codex sibling: a dynamic Codex agent inherits the operator-global Codex durable root (`~/.codex`), resumes via native `codex resume --last` (cwd-filtered), gets no per-agent durable root, and layers comms via project-local `<workdir>/.codex/hooks.json` with read-only hook-trust detection (operator-visible report; never a blanket trust bypass). Bridge session detect/persist is a no-op for this class, and the v2 secret-env launch path is fail-closed re-pinned to the operator durable root. Static/admin Codex agents are unchanged.
+
+### Operator-session safety + iso-v2 hardening
+
+- **Dynamic-agent resume detection + quarantine scoped to the agent's own config dir (#1889).** The original operator-session-hijack fix: a fresh dynamic agent launched in an operator workdir could detect, resume, and quarantine (move) the operator's vanilla Claude session transcript. Detection + quarantine are scoped to the agent's own config dir; the operator transcript is never selected or moved. (For dynamic agents this is now subsumed by the vanilla-equivalent behavior above; it remains the static/admin contract.)
+- **iso-v2 create-path completeness: iso-owned `memory/` + always-create `agent-meta.env` (#1895, #1891).** Later-created iso agents could finish provisioning with `memory/` left controller-owned `2700` (the iso UID then can't read its own memory → daily harvest fails) and `agent-meta.env` silently absent. The create path and reapply/reconcile now normalize the iso-owned `memory/` trees (dirs `2770` group `ab-agent-<a>`, files `0660`, `index.sqlite` kept controller `0600`), including existing stale subtrees, and `agent-meta.env` absence is now a visible failure rather than a warn-only fallback.
+- **doc-backfill / watchdog engine detection is fail-closed on the roster (#1896, #1892).** When `agent-meta.env` was absent the daemon's codex `AGENTS.md` backfill could mis-detect the engine and materialize a codex entrypoint on a claude-roster agent. Engine resolution is now roster-first; absence is never inferred as codex; a roster/metadata disagreement holds and warns (surfaced in the operator hygiene task) instead of materializing the wrong template.
+- **Controller scanners graceful-skip the iso boundary consistently (#1878, #1820 rc4).** A common iso-boundary graceful-skip across the reconcile/watchdog controller scanners (reading the runtime-home effective settings for hooks/plugins rather than the data-tree mirror), closing the last of the #1820 layout-v2 reconcile iso-permission edges.
+
+### Other fixes
+
+- **watchdog: `unsupported_engine_contract` reclassified as info, not a HIGH drift problem (#1884, #1872).** Antigravity / unknown engines with otherwise-valid links no longer page; broken links for the same engine still do.
+- **cron children get an explicit model instead of inheriting interactive `settings.json` (#1885, #1880).** Cron-dispatched children no longer derive their model from interactive settings; precedence is per-job → cron-default → roster → documented fallback, with a conditional fail-closed only when an inheritable model is present.
+- **channel restart guidance + live-MCP readiness; route plugin-enable away from a symlink-write (#1886, #1881).** `agent show` / diagnostics gain a live-MCP connectivity signal for probeable channel plugins, and operators are routed to bridge-native restart/repair rather than a `settings.effective.json` symlink write.
+- **picker-sweep registered as a shell-kind cron (#1888).**
+
+### CI / dev-infra
+
+- **unit/static smoke battery sharded across a 3-way matrix + aggregate gate (#1898, #1897).** The required-smoke battery had crossed the 25-minute job timeout and was intermittently false-red; it now runs as `unit/static smoke shard N/3` in parallel (~6–10 min each) behind an aggregate gate named exactly `unit/static smoke` that preserves the branch-protection check and fails if any shard fails. No user-facing change.
+
+### Soak
+
+- Release candidate prepared for VM/fleet soak. The soak must exercise the iso-sensitive lanes (#1878, #1895, #1896) and the dynamic-vanilla behavior (#1900, #1901), including cm-prod real-Linux iso-v2 acceptance, before any v0.16.11 LTS promotion. Not yet soak-verified at rc1.
+
 ## [0.16.10] — 2026-06-13 (LTS)
 
 **v0.16.10 LTS — a large reliability + migration train, hardened through a fleet soak across sean-mac (macOS shared-mode) and cm-prod (real-Linux iso-v2 production).** This consolidates the rc1→rc3 candidates into the blessed LTS tag for the v0.16.x line. It closes the dynamic-agent restart footgun, makes operator plugin/setting provisioning survive recreate, and lands a gated layout-v2 four-writer migration with a fail-closed v1→v2 reconciliation that stops legacy installs from forking agent memory. Every code lane cleared the queue pair-review gate; the two data-loss/iso-sensitive lanes (#1857 provisioning preserve, #1820 layout-v2 migration) additionally cleared the independent `patch` adversarial gate across four rounds, and the reconcile iso-permission handling (#1820 rc3) was re-verified on a real Linux-UID host.
