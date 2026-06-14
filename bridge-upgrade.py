@@ -661,6 +661,37 @@ _ROSTER_IDS_ARRAY_RE = re.compile(
     re.S,
 )
 _ROSTER_ARRAY_TOKEN_RE = re.compile(r"""(['"])(.*?)\1|([^\s'"]+)""")
+# `BRIDGE_AGENT_ENGINE["id"]="engine"` map assignment in the roster shell
+# files — the authoritative per-agent engine declaration the scaffolder writes
+# alongside the membership record (Issue #1892). Static parse only (never
+# sources the file), mirroring _parse_roster_*_ids. Captures id (group 2) and
+# the assigned engine token (group 4) so the doc-backfill pass can treat the
+# roster engine as the source of truth when agent-meta.env is absent.
+#
+# FAIL-CLOSED tokenization: the engine token must be the ENTIRE assignment
+# value AND occupy the whole logical line — the (optional) closing quote is
+# followed only by trailing whitespace and an optional ``# comment`` before the
+# line end. This rejects every ambiguous / non-atomic RHS whose static value a
+# regex cannot trust:
+#   * shell-expansion-tainted: ``"codex"$VAR`` / ``codex$VAR`` / ``${ENGINE:-codex}``
+#   * concatenation / trailing junk: ``"codex"more`` / ``codex foo`` / ``"codex" $VAR``
+#   * ``;``-chained multi-assignment on one line: ``...=codex; ...=claude``
+#     (shell last-wins is NOT statically resolvable here — anchoring to the whole
+#     line declines the chain entirely instead of mis-reading the FIRST clause).
+# Any rejected line leaves the engine UNKNOWN → the decision helper holds
+# fail-closed, never mis-resolving an ambiguous declaration to a positive codex.
+# ``\r?`` tolerates CRLF rosters. A clean single whole-line assignment
+# (``BRIDGE_AGENT_ENGINE["x"]="codex"`` / ``=codex`` / ``=codex  # note``) matches.
+# A trailing ``# comment`` is only honored when it is a REAL shell comment —
+# i.e. preceded by whitespace. ``=codex#junk`` / ``="codex"#junk`` have a runtime
+# value of ``codex#junk`` (``#`` is NOT a comment mid-word), so they must NOT
+# resolve to a bare ``codex``; the missing-whitespace form fails the whole-line
+# anchor and is declined (engine unknown -> held).
+_ROSTER_ENGINE_RE = re.compile(
+    r"""^[ \t]*BRIDGE_AGENT_ENGINE\[\s*(['"]?)([^'"\]\s]+)\1\s*\]"""
+    r"""[ \t]*=[ \t]*(['"]?)([A-Za-z0-9._-]+)\3(?:[ \t]+\#[^\r\n]*)?[ \t]*\r?$""",
+    re.M,
+)
 
 
 def _parse_roster_shell_ids(text: str) -> set[str]:
@@ -698,6 +729,44 @@ def _parse_roster_tsv_ids(path: Path) -> set[str]:
         if first:
             ids.add(first)
     return ids
+
+
+def _parse_roster_engines(text: str) -> dict[str, str]:
+    """Best-effort extraction of per-agent engine declarations from a roster
+    shell file. Static parse only — never sources the file. Returns an
+    ``id -> engine`` map for every ``BRIDGE_AGENT_ENGINE["id"]="engine"`` clause
+    (Issue #1892). Shell-expansion ids are dropped (mirrors _parse_roster_shell_ids).
+    """
+    engines: dict[str, str] = {}
+    for match in _ROSTER_ENGINE_RE.finditer(text):
+        agent_id = match.group(2)
+        engine = match.group(4).strip().lower()
+        if not agent_id or "$" in agent_id or "{" in agent_id:
+            continue
+        if engine:
+            engines[agent_id] = engine
+    return engines
+
+
+def collect_roster_engines(target_root: Path) -> dict[str, str]:
+    """Build the roster-declared ``id -> engine`` map for the doc-backfill pass.
+
+    Issue #1892: the codex AGENTS.md doc-backfill must treat the roster engine
+    as the source of truth, not a filesystem heuristic. The roster shell files
+    (``agent-roster.sh`` + the operator's ``agent-roster.local.sh`` override)
+    are the authoritative engine declaration. The local override wins on a
+    conflict (it is the last-sourced map in the live runtime). Read-as-existence
+    check (the OSError IS the probe) keeps the #1175 raw-pathlib audit ceiling.
+    """
+    engines: dict[str, str] = {}
+    for rel in ("agent-roster.sh", "agent-roster.local.sh"):
+        roster_path = target_root / rel
+        try:
+            text = roster_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        engines.update(_parse_roster_engines(text))
+    return engines
 
 
 def collect_roster_ids(target_root: Path, admin_agent: str) -> tuple[set[str], list[str]]:
@@ -1306,6 +1375,68 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
     return emit_json(payload, 0)
 
 
+def resolve_backfill_engine_decision(
+    roster_engine: str | None,
+    detected_engine: str,
+) -> tuple[str, str | None]:
+    """Fail-closed engine resolution for the codex AGENTS.md doc-backfill (#1892).
+
+    The roster engine is the source of truth. ``detected_engine`` is the
+    filesystem heuristic (``detect_engine``) used ONLY to corroborate or to
+    flag a disagreement — never to manufacture a positive codex signal from the
+    absence of a claude one.
+
+    Returns ``(decision, hold_reason)`` where ``decision`` is one of:
+      * ``"backfill"`` — roster says codex (or roster-unknown but the heuristic
+        positively detected codex AND nothing contradicts it).
+      * ``"skip"``     — roster says a non-codex engine; never materialize a
+        codex template on it. Absence of metadata is NOT a codex signal.
+      * ``"hold"``     — roster engine and the filesystem heuristic disagree
+        (roster=claude-or-other vs heuristic=codex, or vice-versa in a way that
+        could destructively materialize the wrong template). Emit an
+        operator-visible warning instead of backfilling. ``hold_reason`` carries
+        the human-readable cause.
+
+    Truth table (roster \\ heuristic):
+      roster=codex,  heuristic=codex  -> backfill
+      roster=codex,  heuristic!=codex -> backfill (roster authoritative; the
+                                          heuristic is the weaker signal)
+      roster=claude/other, any        -> skip if heuristic agrees (non-codex),
+                                          HOLD if heuristic=codex (disagreement)
+      roster=unknown, heuristic=codex -> HOLD (no positive roster signal; do not
+                                          materialize on a filesystem guess)
+      roster=unknown, heuristic!=codex-> skip (no codex signal anywhere)
+    """
+    roster = (roster_engine or "").strip().lower()
+    detected = (detected_engine or "").strip().lower()
+
+    if roster == "codex":
+        return ("backfill", None)
+    if roster and roster != "codex":
+        # Roster positively declares a non-codex engine. Never materialize a
+        # codex template here. If the filesystem heuristic disagrees (thinks
+        # codex), that is a real conflict the operator should see — hold/warn.
+        if detected == "codex":
+            return (
+                "hold",
+                f"roster engine={roster} but filesystem heuristic detected codex; "
+                "holding codex AGENTS.md backfill (no destructive materialization)",
+            )
+        return ("skip", None)
+    # roster engine unknown (no roster declaration parsed / agent-meta.env absent).
+    # Fail-closed: absence of a positive claude signal must NEVER become a
+    # positive codex signal. Only the filesystem heuristic is left, and a bare
+    # filesystem guess is not strong enough to destructively materialize.
+    if detected == "codex":
+        return (
+            "hold",
+            "roster engine unknown (no roster declaration) and only a filesystem "
+            "heuristic suggests codex; holding backfill until the engine is "
+            "authoritatively resolvable",
+        )
+    return ("skip", None)
+
+
 def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
     """Issue #1809: focused codex AGENTS.md backfill pass for the daemon
     doc-backfill hygiene cadence.
@@ -1332,9 +1463,15 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
 
     roster_ids, roster_sources = collect_roster_ids(target_root, admin_agent)
     roster_filtering = "active" if (roster_sources and roster_ids) else "unavailable"
+    # #1892: roster engine is the source of truth. When agent-meta.env is absent
+    # the daemon's in-memory engine map is gone, so resolve the declared engine
+    # statically from the roster shell files. Absence of a positive claude signal
+    # must NEVER be inferred as codex (fail-closed) — see resolve_backfill_engine_decision.
+    roster_engines = collect_roster_engines(target_root)
 
     backfilled: list[str] = []
     refreshed: list[str] = []
+    held: list[dict[str, str]] = []
     errors: list[dict[str, str]] = []
     checked = 0
 
@@ -1343,9 +1480,24 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
             continue
         try:
             session_type = detect_session_type(path, admin_agent)
-            engine = detect_engine(path, session_type)
-            if engine != "codex":
+            detected_engine = detect_engine(path, session_type)
+            roster_engine = roster_engines.get(path.name)
+            decision, hold_reason = resolve_backfill_engine_decision(
+                roster_engine, detected_engine,
+            )
+            if decision == "hold":
+                held.append({
+                    "agent": path.name,
+                    "roster_engine": (roster_engine or "unknown"),
+                    "detected_engine": detected_engine,
+                    "reason": hold_reason or "engine disagreement; held",
+                })
                 continue
+            if decision != "backfill":
+                continue
+            # Roster is authoritative: materialize the codex template under the
+            # roster-declared engine (`codex`), never the filesystem heuristic.
+            engine = "codex"
             checked += 1
             display_name = detect_display_name(path)
             role_text = detect_role_text(path)
@@ -1386,7 +1538,10 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
         except OSError as exc:
             errors.append({"agent": path.name, "error": f"OSError: {exc}"})
 
-    non_clean = bool(backfilled or refreshed or errors)
+    # #1892: a held agent (roster/heuristic engine disagreement) is non-clean so
+    # the daemon files the operator-visible `[hygiene]` warning task instead of
+    # silently materializing the wrong template.
+    non_clean = bool(backfilled or refreshed or held or errors)
     payload = {
         "dry_run": dry_run,
         "codex_agents_checked": checked,
@@ -1396,6 +1551,8 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
         "refreshed": sorted(refreshed),
         "backfilled_count": len(backfilled),
         "refreshed_count": len(refreshed),
+        "held": sorted(held, key=lambda h: h["agent"]),
+        "held_count": len(held),
         "errors": errors,
         "non_clean": non_clean,
     }
