@@ -472,6 +472,16 @@ bridge_isolation_v2_reapply_one_agent() {
                   --exclude-subdir .discord --exclude-subdir .telegram
                   --exclude-subdir .mattermost)
       fi
+      # #1891: home/ and workdir/ carry a `memory/` subtree whose
+      # `index.sqlite` must keep its restrictive 0600 mode — never relaxed to
+      # the 0660 ab-agent-<a> content mode by this recursive pass (0600 = no
+      # group read, the criterion-2 carve-out). Scope the leaf-name exclude to
+      # the memory-bearing roots only. The dedicated memory normalize below
+      # re-asserts 0600 and group-opens the rest of `memory/` (incl. a stale
+      # 2700 tree).
+      if [[ "$_writable_sub" == "home" || "$_writable_sub" == "workdir" ]]; then
+        _ws_excl+=(--exclude-name index.sqlite)
+      fi
       if bridge_isolation_v2_chgrp_setgid_recursive \
             "$agent_grp" 2770 0660 "$agent_root/$_writable_sub" \
             "${_ws_excl[@]}" \
@@ -496,6 +506,33 @@ bridge_isolation_v2_reapply_one_agent() {
         "$_non_apply_status"
     fi
   done
+
+  # #1891: explicitly repair the iso-owned `memory/` trees under BOTH the
+  # effective home and the workdir, INCLUDING an existing stale
+  # controller-owned `2700` subtree (the later-created-agent symptom that
+  # v0.16.10 reconcile did NOT repair). The recursive pass above skips
+  # `index.sqlite`; this dedicated call group-opens the rest of `memory/`
+  # to 2770/0660 and re-asserts the restrictive 0600 mode on index.sqlite
+  # (no group read). Only mutates on apply; check/dry-run report drift via
+  # the recursive row above (memory/ is a subtree of home/workdir already
+  # scanned).
+  if [[ "$apply" == "1" ]] \
+      && command -v bridge_isolation_v2_normalize_memory_tree >/dev/null 2>&1; then
+    local _mem_a="$agent_root/home/memory"
+    local _mem_b="$agent_root/workdir/memory"
+    if bridge_isolation_v2_normalize_memory_tree "$agent_grp" "$_mem_a" "$_mem_b" 2>/dev/null; then
+      bridge_isolation_v2_reapply_record_action \
+        "$actions_file" "$agent_root/{home,workdir}/memory" \
+        "memory_tree_normalize" "drift|2700" "$agent_grp 2770/0660 +index.sqlite=0600" "ok"
+    else
+      bridge_isolation_v2_reapply_record_action \
+        "$actions_file" "$agent_root/{home,workdir}/memory" \
+        "memory_tree_normalize" "drift|2700" "$agent_grp 2770/0660 +index.sqlite=0600" \
+        "error:memory_tree_normalize_failed"
+      printf '%s\n' "memory/ tree normalize failed for $agent: $_mem_a / $_mem_b (iso UID may not read its own memory/; need root or passwordless sudo; rerun after addressing)" \
+        >> "$errors_file"
+    fi
+  fi
 
   # v0.9.7 RC1 (refs #781): apply the per-agent state/agents/<X>/ matrix
   # row through reapply too. The dedicated CLI users hit this surface
@@ -635,22 +672,35 @@ bridge_isolation_v2_reapply_one_agent() {
   # cmd refresh. Same staleness window — if the os_user / engine /
   # config_dir composition drifted (e.g. operator manually
   # renamed/migrated the iso UID), the iso UID context would carry
-  # stale identity until next prepare. Non-fatal: snippet absence is
-  # handled by the getent-based fallback in
-  # `bridge_agent_claude_home_dir`.
+  # stale identity until next prepare.
+  #
+  # #1891 (F3a): was warn-only on write failure AND never verified
+  # presence after a "successful" write — so an absent/under-permissioned
+  # snippet stayed silent (the daemon then mis-detected the engine). On
+  # apply, write then VERIFY presence + the `0640 controller:ab-agent-<a>`
+  # contract + iso-UID readability; record a hard `error:*` row + an
+  # errors_file line on any failure so the reapply wrapper exits nonzero
+  # (an explicit held state, not a silent pass).
   if [[ "$apply" == "1" ]]; then
     if command -v bridge_isolation_v2_write_agent_metadata >/dev/null 2>&1; then
       local _meta_file="${BRIDGE_ACTIVE_AGENT_DIR:-$BRIDGE_HOME/state/agents}/$agent/agent-meta.env"
-      if bridge_isolation_v2_write_agent_metadata "$agent" 2>/dev/null; then
-        bridge_isolation_v2_reapply_record_action \
-          "$actions_file" "$_meta_file" "agent_meta_regen" \
-          "stale|absent" "live-roster" "ok"
-      else
+      if ! bridge_isolation_v2_write_agent_metadata "$agent" 2>/dev/null; then
         bridge_isolation_v2_reapply_record_action \
           "$actions_file" "$_meta_file" "agent_meta_regen" \
           "stale|absent" "live-roster" "error:write_failed"
-        printf '%s\n' "agent_meta_regen failed for $agent: $_meta_file (iso UID will fall back to getent-based config_dir resolution; #1272/#1277 mitigations remain operative)" \
+        printf '%s\n' "agent_meta_regen write failed for $agent: $_meta_file (iso UID cannot resolve its own engine/config_dir; the daemon may mis-detect the engine; rerun after addressing)" \
           >> "$errors_file"
+      elif command -v bridge_isolation_v2_verify_agent_metadata >/dev/null 2>&1 \
+          && ! bridge_isolation_v2_verify_agent_metadata "$agent" 2>/dev/null; then
+        bridge_isolation_v2_reapply_record_action \
+          "$actions_file" "$_meta_file" "agent_meta_regen" \
+          "stale|absent" "live-roster" "error:verify_failed"
+        printf '%s\n' "agent_meta_regen verify failed for $agent: $_meta_file (absent or wrong owner/group/mode after apply; see preceding verify_agent_metadata warning; rerun after addressing)" \
+          >> "$errors_file"
+      else
+        bridge_isolation_v2_reapply_record_action \
+          "$actions_file" "$_meta_file" "agent_meta_regen" \
+          "stale|absent" "live-roster" "ok"
       fi
     fi
   else

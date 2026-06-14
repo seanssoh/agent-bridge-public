@@ -5317,10 +5317,37 @@ bridge_linux_prepare_agent_isolation() {
                        --exclude-subdir .discord --exclude-subdir .telegram
                        --exclude-subdir .mattermost)
       fi
+      # #1891: the home/ and workdir/ trees carry a `memory/` subtree whose
+      # `index.sqlite` must keep its restrictive 0600 mode — never relaxed to
+      # the 0660 ab-agent-<a> content mode by this recursive pass (0600 = no
+      # group read, the criterion-2 carve-out). Scope the leaf-name exclude to
+      # the memory-bearing roots only (runtime/logs/requests/responses carry no
+      # memory index DB). The dedicated memory normalize below re-asserts 0600
+      # on index.sqlite and group-opens the rest of `memory/`.
+      if [[ "$_v2_norm_sub" == "$_v2_agent_root/home" || "$_v2_norm_sub" == "$workdir" ]]; then
+        _v2_norm_excl+=(--exclude-name index.sqlite)
+      fi
       bridge_isolation_v2_chgrp_setgid_recursive \
         "$_v2_agent_group" 2770 0660 "$_v2_norm_sub" "${_v2_norm_excl[@]}" \
         || bridge_warn "isolation v2 (#1506): group/mode normalization of '$_v2_norm_sub' returned non-zero for agent '$agent'; controller-side reads (watchdog scan) may still see drift. Re-run \`agent-bridge isolate $agent --reapply\`."
     done
+  fi
+
+  # #1891: explicitly normalize the iso-owned `memory/` trees under BOTH
+  # the effective home and the workdir, INCLUDING an existing stale
+  # controller-owned `2700` subtree (the later-created-agent symptom). The
+  # broad recursive pass above already touches these when it can traverse;
+  # this dedicated call is the repair for the case the broad pass
+  # under-reached. NOTE: the #1533 content-tree publisher near the END of
+  # prepare re-walks `home`/`workdir` and would re-relax a nested
+  # `memory/index.sqlite` to 0660 (its excludes are top-level only); a SECOND
+  # normalize runs AFTER that publisher (see end of this function) to land
+  # `index.sqlite` back at 0600. Non-fatal warn (operator can `--reapply`) so
+  # create still succeeds.
+  if command -v bridge_isolation_v2_normalize_memory_tree >/dev/null 2>&1; then
+    bridge_isolation_v2_normalize_memory_tree "$_v2_agent_group" \
+      "$_v2_agent_root/home/memory" "$workdir/memory" \
+      || bridge_warn "isolation v2 (#1891): memory/ tree normalize returned non-zero for agent '$agent'; the iso UID may not read its own memory/ until \`agent-bridge isolate $agent --reapply\`."
   fi
 
   # Issue #1520c (v0.16.0-beta3 residual): the #1506 recursive normalize
@@ -5542,13 +5569,26 @@ bridge_linux_prepare_agent_isolation() {
   # `BRIDGE_AGENT_OS_USER` / `BRIDGE_AGENT_ISOLATION_MODE` / etc.
   # without read access to the protected `agent-roster.local.sh`.
   # Closes the precondition gap for #1272 (Path A0) and the
-  # ISOLATION_MODE bash-side surface from #1213. Non-fatal — the lane
-  # also adds a `getent`-based fallback in `bridge_agent_claude_home_dir`,
-  # so a write failure here degrades to the existing roster-array path
-  # rather than wedging.
+  # ISOLATION_MODE bash-side surface from #1213.
+  #
+  # #1891 (F3a): this was previously warn-only, so a silent write failure
+  # left the snippet absent — later-created agents finished provisioning
+  # with the metadata snippet missing and the daemon mis-detected the
+  # engine. Make it a VISIBLE/NONZERO failure: write, then verify the
+  # presence + the `0640 controller:ab-agent-<a>` contract + iso-UID
+  # readability. A failed verify aborts prepare (`return 1`) exactly like
+  # the grant-matrix apply below, so `agent create` no longer reports
+  # green on a tree that is missing this invariant.
   if command -v bridge_isolation_v2_write_agent_metadata >/dev/null 2>&1; then
-    bridge_isolation_v2_write_agent_metadata "$agent" \
-      || bridge_warn "bridge_linux_prepare_agent_isolation: agent-meta.env write failed for agent=$agent (non-fatal; iso UID will fall back to getent-based config_dir resolution)"
+    if ! bridge_isolation_v2_write_agent_metadata "$agent"; then
+      bridge_warn "bridge_linux_prepare_agent_isolation: agent-meta.env write FAILED for agent=$agent (see preceding write_agent_metadata warning)."
+      return 1
+    fi
+    if command -v bridge_isolation_v2_verify_agent_metadata >/dev/null 2>&1 \
+        && ! bridge_isolation_v2_verify_agent_metadata "$agent"; then
+      bridge_warn "bridge_linux_prepare_agent_isolation: agent-meta.env verify FAILED for agent=$agent (snippet absent or wrong owner/group/mode; see preceding verify_agent_metadata warning)."
+      return 1
+    fi
   fi
 
   # Issue #1533 (run LAST in prepare — after the #1506 normalize, the
@@ -5649,6 +5689,20 @@ bridge_linux_prepare_agent_isolation() {
       bridge_isolation_v2_chgrp_file_iso_group "$agent" "$_settings_link_target" 0640 \
         || bridge_warn "isolation v2 (#1766): could not group-publish the per-agent effective settings file for '$agent' (non-fatal); the iso UID may EACCES on its own project settings."
     fi
+  fi
+
+  # #1891: the #1533 content-tree publisher above (run LAST, always-root,
+  # fd-based) walks `home`/`workdir` and group-opens every iso-owned regular
+  # file to 0660 — INCLUDING a nested `memory/index.sqlite` (the walker's
+  # excludes are TOP-LEVEL only, so a nested DB is not skipped and the early
+  # memory normalize's 0600 would be undone). Re-run the memory normalize as
+  # the final create-path step so `memory/index.sqlite` lands back at its
+  # restrictive 0600 (no group read) AFTER the publisher. Idempotent: the rest
+  # of `memory/` is already 2770/0660, so this only re-restricts the index DB.
+  if command -v bridge_isolation_v2_normalize_memory_tree >/dev/null 2>&1; then
+    bridge_isolation_v2_normalize_memory_tree "$_v2_agent_group" \
+      "$_v2_agent_root/home/memory" "$workdir/memory" \
+      || bridge_warn "isolation v2 (#1891): post-publish memory/ normalize returned non-zero for agent '$agent'; \`memory/index.sqlite\` may be group-readable. Re-run \`agent-bridge isolate $agent --reapply\`."
   fi
 }
 bridge_linux_install_isolated_channel_symlink() {

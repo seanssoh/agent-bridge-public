@@ -84,3 +84,11 @@ scripts/smoke/1820-rc4-watchdog-settings-source.sh
 # script-env contract against a mktemp jobs.json fixture; never a controller->iso
 # boundary RW (same shape as the #1520c / #1533 / #1825 fixture entries).
 scripts/test-picker-sweep-registration.sh
+
+# #1891 iso-v2 create-path completeness — the `agent-meta.env` matches are all
+# comment + assertion strings (grep needles / smoke_log labels) that ASSERT the
+# memory/ normalize + agent-meta.env write/verify contract against a mktemp
+# fixture (the memory tree is controller-owned, normalized via the forced-
+# enforcement primary-group seam); never a controller->iso boundary RW (same
+# shape as the #1520c / #1533 / #1766 fixture entries).
+scripts/smoke/1891-iso-create-path-completeness.sh
