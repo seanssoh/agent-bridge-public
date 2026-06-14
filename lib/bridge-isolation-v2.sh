@@ -426,14 +426,22 @@ bridge_isolation_v2_exec_with_secret_env() {
     # the child without an authoritative CODEX_HOME. Pairs are newline-
     # separated KEY=VALUE; only the first '=' splits so a value may contain '='.
     if [[ -n "$_repin_pairs" ]]; then
+      # Iterate newline-separated KEY=VALUE without a here-string/procsub
+      # (heredoc-ban H3) AND without a pipe/subshell — the exports MUST land
+      # in THIS pre-exec shell. IFS=newline splits on lines only (values may
+      # contain spaces); `set -f` stops a '*'/'?' in a value from
+      # pathname-expanding. No restore needed: exec replaces the shell next.
       local _repin_line _repin_key _repin_val
-      while IFS= read -r _repin_line; do
+      local IFS=$'\n'
+      set -f
+      for _repin_line in $_repin_pairs; do
         [[ -n "$_repin_line" ]] || continue
         _repin_key="${_repin_line%%=*}"
         _repin_val="${_repin_line#*=}"
         [[ -n "$_repin_key" && "$_repin_key" != "$_repin_line" ]] || continue
         export "$_repin_key=$_repin_val"
-      done <<< "$_repin_pairs"
+      done
+      set +f
     fi
     exec "$_bash_bin" -lc "$_launch_cmd"
   ) 2> >(tee -a "$_errfile" >&2); then

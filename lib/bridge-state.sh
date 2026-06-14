@@ -4859,13 +4859,16 @@ bridge_codex_has_resumable_session_state() {
   # (`"cwd":"…"`) and spaced (`"cwd": "…"`) encodings are covered.
   local needle_compact="\"cwd\":\"${workdir}\""
   local needle_spaced="\"cwd\": \"${workdir}\""
-  local f
-  while IFS= read -r f; do
-    [[ -n "$f" ]] || continue
-    if grep -qF -e "$needle_compact" -e "$needle_spaced" "$f" 2>/dev/null; then
-      return 0
-    fi
-  done < <(find "$sessions_dir" -type f -name '*.jsonl' 2>/dev/null)
+  # Boolean probe: does any session jsonl under the operator sessions dir
+  # record this workdir as its cwd? Use `find -exec grep -l … {} +` piped to
+  # `grep -q .` rather than a process-substitution while-loop (heredoc-ban
+  # H3) — the function result comes from the pipeline's exit status (via the
+  # `if`), so the pipe subshell does not swallow a `return`.
+  if find "$sessions_dir" -type f -name '*.jsonl' \
+       -exec grep -lF -e "$needle_compact" -e "$needle_spaced" {} + 2>/dev/null \
+       | grep -q .; then
+    return 0
+  fi
   return 1
 }
 
