@@ -192,30 +192,57 @@ chmod 0600 "$T8_ROOT/workdir/memory/notes.md" "$T8_ROOT/workdir/memory/daily/202
     || { printf 'T8 normalize returned non-zero\n' >&2; exit 5; }
 ) || smoke_fail "T8 normalize sub-shell failed (see preceding output)"
 
-t8_mode() { stat -f '%A' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
-t8_assert() {
-  local path="$1" want="$2" got
-  got="$(t8_mode "$path")"
-  got="$(printf '%04o' "$((8#${got:-0}))" 2>/dev/null || printf '%s' "$got")"
-  local exp
-  exp="$(printf '%04o' "$((8#$want))" 2>/dev/null || printf '%s' "$want")"
-  [[ "$got" == "$exp" ]] || smoke_fail "T8 mode mismatch at $path: expected $exp, got $got"
+# Portable mode helpers (repo canon — scripts/smoke/1506-isolate-normalize.sh).
+# GNU `stat -c '%a'` first (Linux CI), BSD `stat -f '%Lp'` fallback. Two reasons
+# BSD-first single-mode was wrong here (#1891 CI fix):
+#   1. On Linux, BSD `stat -f` is --file-system and returns garbage exit-0, so a
+#      `stat -f ... || stat -c` fallback never fires.
+#   2. BSD `%Lp` reports only the permission bits and DROPS the setgid bit, so a
+#      directory normalized to 2770 reads back as 770 on macOS. Assert the low
+#      bits via t8_low and the setgid bit SEPARATELY via t8_has_setgid.
+t8_mode() {  # clean low-bits octal (files: setgid never set, so safe for 8# math)
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
 }
-t8_assert "$T8_ROOT/workdir/memory"            2770
-t8_assert "$T8_ROOT/workdir/memory/daily"      2770
-t8_assert "$T8_ROOT/home/memory"               2770
-t8_assert "$T8_ROOT/workdir/memory/notes.md"   0660
-t8_assert "$T8_ROOT/workdir/memory/daily/2026.md" 0660
-t8_assert "$T8_ROOT/home/memory/notes.md"      0660
+t8_low() {  # last 3 octal digits (strip any GNU leading setgid digit)
+  local m; m="$(t8_mode "$1")"
+  printf '%s' "${m: -3}"
+}
+t8_has_setgid() {  # 0 when the setgid bit is set, portably
+  local p="$1" gnu_mode perms
+  gnu_mode="$(stat -c '%a' "$p" 2>/dev/null || printf '')"
+  if [[ -n "$gnu_mode" ]]; then
+    case "$gnu_mode" in 2*|3*|6*|7*) return 0 ;; *) return 1 ;; esac
+  fi
+  # shellcheck disable=SC2012  # single known path, not a glob expansion
+  perms="$(ls -ld "$p" 2>/dev/null | awk '{print $1}')"
+  case "$perms" in ??????[sS]*) return 0 ;; *) return 1 ;; esac
+}
+t8_dir_assert() {  # dir contract: low bits 770 + setgid set (2770)
+  local path="$1" got
+  got="$(t8_low "$path")"
+  [[ "$got" == "770" ]] || smoke_fail "T8 dir low-bits mismatch at $path: expected 770, got ${got:-<empty>}"
+  t8_has_setgid "$path" || smoke_fail "T8 dir missing setgid at $path (expected 2770)"
+}
+t8_file_assert() {  # file contract: exact low bits, no setgid
+  local path="$1" want="$2" got
+  got="$(t8_low "$path")"
+  [[ "$got" == "$want" ]] || smoke_fail "T8 file mode mismatch at $path: expected $want, got ${got:-<empty>}"
+}
+t8_dir_assert "$T8_ROOT/workdir/memory"
+t8_dir_assert "$T8_ROOT/workdir/memory/daily"
+t8_dir_assert "$T8_ROOT/home/memory"
+t8_file_assert "$T8_ROOT/workdir/memory/notes.md"      660
+t8_file_assert "$T8_ROOT/workdir/memory/daily/2026.md" 660
+t8_file_assert "$T8_ROOT/home/memory/notes.md"         660
 # Criterion 2: index.sqlite keeps its restrictive 0600 (no group read).
-t8_assert "$T8_ROOT/workdir/memory/index.sqlite" 0600
+t8_file_assert "$T8_ROOT/workdir/memory/index.sqlite"  600
 # Group assertion (criterion 4 — group, not just mode): the normalized
 # memory/ entries carry the group we passed; index.sqlite must NOT (0600 has
 # no group bits, but the chgrp would still have set the group name — the
 # exclude prevents that, so the index keeps the controller's *original*
 # group, i.e. unchanged from fixture creation under the controller).
-t8_grp() { stat -f '%Sg' "$1" 2>/dev/null || stat -c '%G' "$1" 2>/dev/null; }
-t8_owner() { stat -f '%Su' "$1" 2>/dev/null || stat -c '%U' "$1" 2>/dev/null; }
+t8_grp() { stat -c '%G' "$1" 2>/dev/null || stat -f '%Sg' "$1" 2>/dev/null; }
+t8_owner() { stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null; }
 [[ "$(t8_grp "$T8_ROOT/workdir/memory")" == "$T8_GRP" ]] \
   || smoke_fail "T8 memory dir group not normalized to $T8_GRP (got $(t8_grp "$T8_ROOT/workdir/memory"))"
 [[ "$(t8_grp "$T8_ROOT/workdir/memory/notes.md")" == "$T8_GRP" ]] \
