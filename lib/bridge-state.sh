@@ -53,6 +53,29 @@ bridge_claude_dynamic_launch_cmd() {
   local model effort pm
   local -a argv=(claude)
 
+  # Issue #1890: a dynamic vanilla Claude agent is vanilla Claude Code + bridge
+  # comms only. It must NEVER carry `--resume <id>` (defense-in-depth — the
+  # builders above already force session_id empty; this guard makes a future
+  # caller-side regression unable to reintroduce the operator-session-hijack
+  # class), and — critically — it must NOT inject `--model` / `--effort` /
+  # `--permission-mode`. Those would OVERRIDE the operator-global
+  # `~/.claude/settings.json` model the agent is meant to inherit (the #1890
+  # observed symptom: dynamic agents came up on Claude's built-in default
+  # instead of the operator's global model). The only flags kept are the
+  # operational ones every autonomous dynamic worker needs:
+  # `--dangerously-skip-permissions` (unattended; no permission prompt to block
+  # on) and `--name <agent>` (bridge session label). Continue intent collapses
+  # to native `--continue` (workdir-keyed, identical to the operator typing it).
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    if [[ "$effective_continue" == "1" || "$continue_fallback" == "1" ]]; then
+      argv+=(--continue)
+    fi
+    argv+=(--dangerously-skip-permissions --name "$agent")
+    bridge_join_quoted "${argv[@]}"
+    return 0
+  fi
+
   if [[ "$effective_continue" == "1" && -n "$session_id" ]]; then
     argv+=(--resume "$session_id")
   elif [[ "$continue_fallback" == "1" ]]; then
@@ -82,7 +105,22 @@ bridge_build_dynamic_launch_cmd() {
   continue_mode="$(bridge_agent_continue "$agent")"
   continue_fallback=0
   effective_continue=0
-  if [[ "$engine" == "claude" ]]; then
+  if [[ "$engine" == "claude" ]] \
+     && command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    # Issue #1890: a dynamic Claude agent runs as vanilla Claude Code against
+    # the operator-global ~/.claude. The bridge must NEVER emit `--resume <id>`
+    # for it (no transcript discovery, no quarantine-feeding session id) — that
+    # is the brittle machinery that hijacked / destroyed operator sessions.
+    # When continue is intended we emit plain `claude --continue` (native,
+    # workdir-keyed, identical to the operator typing it); otherwise a fresh
+    # `claude`. session_id stays empty so the builder cannot add `--resume`.
+    session_id=""
+    if bridge_agent_claude_effective_engine_continue "$agent"; then
+      effective_continue=1
+      continue_fallback=1
+    fi
+  elif [[ "$engine" == "claude" ]]; then
     if bridge_agent_claude_effective_engine_continue "$agent"; then
       effective_continue=1
       session_id="$(bridge_claude_resume_session_id_for_agent "$agent" || true)"
@@ -146,6 +184,16 @@ bridge_build_resume_launch_cmd() {
 
   engine="$(bridge_agent_engine "$agent")"
   continue_mode="$(bridge_agent_continue "$agent")"
+  # Issue #1890: dynamic vanilla Claude never resumes by bridge-tracked session
+  # id. Decline the resume-cmd builder so the caller falls through to
+  # bridge_build_dynamic_launch_cmd, which emits plain `claude` / `claude
+  # --continue` (native, no `--resume <id>`). Declining BEFORE
+  # bridge_normalize_agent_session_id also means the bridge never persists an
+  # operator transcript id for these agents.
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    return 1
+  fi
   if [[ "$engine" == "claude" ]] && ! bridge_agent_claude_effective_engine_continue "$agent"; then
     return 1
   fi
@@ -2743,6 +2791,23 @@ bridge_agent_resume_quarantine_add() {
 
   [[ -n "$agent" ]] || return 1
   bridge_resume_session_id_valid "$session_id" || return 1
+
+  # Issue #1890 (constraint #4, defense-in-depth): a dynamic vanilla Claude
+  # agent never emits `--resume <id>` and never owns a per-agent transcript, so
+  # there is nothing legitimate to quarantine — any id reaching here would be an
+  # operator-global session mis-routed by a future launch regression. Refuse to
+  # record a quarantine entry for these agents UNCONDITIONALLY (the archive
+  # companion would otherwise try to move it). This makes the quarantine path
+  # unreachable for dynamic Claude even if `--resume` were somehow reintroduced.
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    if [[ "${BRIDGE_DEBUG:-0}" == "1" ]]; then
+      printf '[quarantine] add refused for %s sid=%s — dynamic vanilla Claude (no per-agent transcript; #1890)\n' \
+        "$agent" "$session_id" >&2
+    fi
+    return 0
+  fi
+
   workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
 
   # Foreign-transcript guard. If the rejected id's transcript lives in the
@@ -2852,6 +2917,24 @@ bridge_agent_resume_quarantine_archive_transcript() {
 
   [[ -n "$agent" ]] || return 1
   bridge_resume_session_id_valid "$session_id" || return 1
+
+  # Issue #1890 (constraint #4, defense-in-depth): never archive (move) a
+  # transcript for a dynamic vanilla Claude agent. These agents run against the
+  # operator-global ~/.claude; any transcript a future regression handed us
+  # would be an OPERATOR session, and moving it is exactly the destruction
+  # #1889/#1890 exist to prevent. Refuse before any path resolution. (The
+  # config-dir resolver already returns empty for these agents, which would
+  # fail-safe below — this explicit guard makes the intent unmissable and
+  # regression-proof.)
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    if [[ "${BRIDGE_DEBUG:-0}" == "1" ]]; then
+      printf '[quarantine] archive refused for %s sid=%s — dynamic vanilla Claude (operator-global passthrough, #1890)\n' \
+        "$agent" "$session_id" >&2
+    fi
+    return 0
+  fi
+
   workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
   [[ -n "$workdir" ]] || return 0
 
@@ -4320,6 +4403,21 @@ bridge_resolve_agent_claude_config_dir() {
   if command -v bridge_agent_exists >/dev/null 2>&1; then
     bridge_agent_exists "$agent" || return 0
   fi
+  # Issue #1890: a dynamic vanilla Claude agent launches with NO per-agent
+  # CLAUDE_CONFIG_DIR (operator-global ~/.claude passthrough). Detection-dir
+  # MUST mirror launch-dir, so return empty here → the python detect helper /
+  # quarantine resolver fall back to $HOME/.claude (the operator global tree),
+  # never a per-agent dir. This SUPERSEDES the #1889 "return the isolated dir
+  # for dynamic" branch below, which existed only because pre-#1890 dynamic
+  # Claude DID launch with a private config dir. Returning empty also makes
+  # bridge_agent_resume_quarantine_archive_transcript fail-safe (no provable
+  # agent-owned dir ⇒ no transcript move) for these agents — part of the
+  # quarantine-unreachable contract (constraint #4).
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    return 0
+  fi
+
   config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
   # A derived-but-absent path means the agent is not actually isolated on
   # this host; do not let it shadow the caller's HOME.

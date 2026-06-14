@@ -343,66 +343,71 @@ test_resolver_agreement() {
     "T4 launch resolver == bridge_agent_claude_config_dir (single config-dir SSOT)"
 }
 
-# T5 — shared DYNAMIC Claude agent (codex Phase-4 r2 BLOCKING): no per-agent
-# credential to start with (daemon static-scope sync skips dynamic agents),
-# so the launch must seed it on demand, then export. After the launch:
-#   - CLAUDE_CONFIG_DIR == per-agent dir (per-agent config isolation applies),
-#   - the per-agent credential file is PRESENT (auth not broken).
-# This is the exact regression the export would otherwise cause for a
-# previously operator-global-authed dynamic agent.
+# T5 — shared DYNAMIC Claude agent (#1890 supersede): a dynamic Claude agent now
+# runs as VANILLA Claude Code against the operator-global ~/.claude. The shared
+# launch must NEITHER seed a per-agent credential NOR export CLAUDE_CONFIG_DIR —
+# the launched `claude` resolves config from $HOME/.claude (operator global),
+# exactly like the operator typing `claude` in the workdir. (Pre-#1890 this path
+# seeded+exported a per-agent dir; #1890 removes that for dynamic Claude.)
 DYN_AGENT="scd-1520-dyn"
 DYN_WORKDIR="$SMOKE_TMP_ROOT/dyn-workdir"
 mkdir -p "$DYN_WORKDIR"
 DYN_WORKDIR="$(cd -P "$DYN_WORKDIR" && pwd -P)"
-test_shared_dynamic_seeds_then_exports() {
+test_shared_dynamic_passthrough_no_seed_no_export() {
   : >"$MARKER"
   register_agent "$DYN_AGENT" claude "$DYN_WORKDIR" dynamic
   AGENT="$DYN_AGENT"
   ENGINE="claude"
 
+  # Sanity: on this non-iso host the agent is classified dynamic-vanilla-claude.
+  bridge_agent_is_dynamic_vanilla_claude "$DYN_AGENT" \
+    || smoke_fail "T5 precondition: dynamic shared Claude must classify dynamic-vanilla-claude"
+
   local expected_dir
   expected_dir="$(bridge_agent_claude_config_dir "$DYN_AGENT")"
   clear_agent_credential "$expected_dir"
-  [[ ! -f "$expected_dir/.credentials.json" ]] \
-    || smoke_fail "T5 precondition: dynamic agent should start without a credential"
 
-  # Simulate the daemon's real sync succeeding for this on-demand seed.
-  SEED_SHOULD_SUCCEED=1
+  SEED_SHOULD_SUCCEED=1   # would succeed IF called — it must NOT be called
   SEED_CALLED=0
   SEED_TARGET_CRED="$expected_dir/.credentials.json"
+  unset CLAUDE_CONFIG_DIR
 
   bridge_run_shared_launch "$BASH" "$(probe_launch_cmd)" "$ERRFILE" \
     || smoke_fail "T5 dynamic shared launch returned non-zero"
 
-  smoke_assert_eq "1" "$SEED_CALLED" \
-    "T5 missing credential triggers an on-demand seed-at-launch"
-  smoke_assert_file_exists "$expected_dir/.credentials.json" \
-    "T5 per-agent credential is present after the seed (auth not broken)"
+  smoke_assert_eq "0" "$SEED_CALLED" \
+    "T5 #1890 dynamic Claude does NOT seed a per-agent credential (operator-global passthrough)"
+  [[ ! -f "$expected_dir/.credentials.json" ]] \
+    || smoke_fail "T5 #1890 dynamic Claude must NOT create a per-agent credential file"
 
   local launched_dir
   launched_dir="$(cat "$MARKER" 2>/dev/null || true)"
-  smoke_assert_eq "$expected_dir" "$launched_dir" \
-    "T5 dynamic launch exports CLAUDE_CONFIG_DIR == per-agent dir after seeding"
+  [[ -z "$launched_dir" || "$launched_dir" == "__UNSET__" ]] \
+    || smoke_fail "T5 #1890 dynamic Claude must NOT export CLAUDE_CONFIG_DIR (got '$launched_dir')"
 
   unset SEED_TARGET_CRED
   SEED_SHOULD_SUCCEED=0
 }
 
-# T6 — graceful degrade (codex r2): a shared Claude agent whose per-agent dir
-# has NO credential AND the seed cannot produce one (operator never authed)
-# must NOT be exported onto an empty dir — the launch falls back to the
-# operator-global config (CLAUDE_CONFIG_DIR unset), exactly the pre-#1520
-# behavior the agent was previously relying on. Never strand it authless.
+# T6 — graceful degrade (codex r2), now exercised on a STATIC shared Claude
+# agent (the class that still uses a per-agent config dir post-#1890). When the
+# per-agent dir has NO credential AND the seed cannot produce one (operator
+# never authed), the launch must NOT export onto an empty dir — it falls back to
+# the operator-global config (CLAUDE_CONFIG_DIR unset). Never strand it authless.
+STATIC_DEGRADE_AGENT="scd-1520-static-degrade"
+STATIC_DEGRADE_WORKDIR="$SMOKE_TMP_ROOT/static-degrade-workdir"
+mkdir -p "$STATIC_DEGRADE_WORKDIR"
+STATIC_DEGRADE_WORKDIR="$(cd -P "$STATIC_DEGRADE_WORKDIR" && pwd -P)"
 test_degrade_when_seed_fails() {
   : >"$MARKER"
   : >"$WARN_LOG"
   BRIDGE_RUN_DEGRADE_WARNED=()
-  register_agent "$DYN_AGENT" claude "$DYN_WORKDIR" dynamic
-  AGENT="$DYN_AGENT"
+  register_agent "$STATIC_DEGRADE_AGENT" claude "$STATIC_DEGRADE_WORKDIR" static
+  AGENT="$STATIC_DEGRADE_AGENT"
   ENGINE="claude"
 
   local expected_dir
-  expected_dir="$(bridge_agent_claude_config_dir "$DYN_AGENT")"
+  expected_dir="$(bridge_agent_claude_config_dir "$STATIC_DEGRADE_AGENT")"
   clear_agent_credential "$expected_dir"
 
   # Seed cannot produce a credential (models no resolvable controller cred).
@@ -473,11 +478,14 @@ test_unproven_keychain_free_does_not_export_empty_dir() {
   : >"$MARKER"
   : >"$WARN_LOG"
   BRIDGE_RUN_DEGRADE_WARNED=()
-  register_agent "$DYN_AGENT" claude "$DYN_WORKDIR" dynamic
-  AGENT="$DYN_AGENT"
+  # #1890: the keychain-free proof-gate / seed mechanics apply to agents that
+  # use a per-agent config dir — i.e. STATIC shared Claude (dynamic Claude is now
+  # operator-global passthrough, no seed/export, covered by T5). Register static.
+  register_agent "$STATIC_DEGRADE_AGENT" claude "$STATIC_DEGRADE_WORKDIR" static
+  AGENT="$STATIC_DEGRADE_AGENT"
   ENGINE="claude"
   local expected_dir
-  expected_dir="$(bridge_agent_claude_config_dir "$DYN_AGENT")"
+  expected_dir="$(bridge_agent_claude_config_dir "$STATIC_DEGRADE_AGENT")"
   clear_agent_credential "$expected_dir"
 
   # keychain-free is ENABLED (env flag) but NOT proven, and the seed can't
@@ -510,11 +518,12 @@ test_unproven_keychain_free_does_not_export_empty_dir() {
 test_degrade_warning_is_one_time() {
   : >"$WARN_LOG"
   BRIDGE_RUN_DEGRADE_WARNED=()
-  register_agent "$DYN_AGENT" claude "$DYN_WORKDIR" dynamic
-  AGENT="$DYN_AGENT"
+  # #1890: degrade-warning de-dup is a per-agent-config-dir concern → STATIC.
+  register_agent "$STATIC_DEGRADE_AGENT" claude "$STATIC_DEGRADE_WORKDIR" static
+  AGENT="$STATIC_DEGRADE_AGENT"
   ENGINE="claude"
   local expected_dir
-  expected_dir="$(bridge_agent_claude_config_dir "$DYN_AGENT")"
+  expected_dir="$(bridge_agent_claude_config_dir "$STATIC_DEGRADE_AGENT")"
 
   SEED_SHOULD_SUCCEED=0
   SEED_TARGET_CRED="$expected_dir/.credentials.json"
@@ -608,11 +617,13 @@ test_inherited_proven_spoof_export_attribute_scrubbed() {
   : >"$MARKER"
   : >"$WARN_LOG"
   BRIDGE_RUN_DEGRADE_WARNED=()
-  register_agent "$DYN_AGENT" claude "$DYN_WORKDIR" dynamic
-  AGENT="$DYN_AGENT"
+  # #1890: the keychain-free spoof-scrub + seed gate is a per-agent-config-dir
+  # concern (STATIC shared Claude). Dynamic Claude is operator-global passthrough.
+  register_agent "$STATIC_DEGRADE_AGENT" claude "$STATIC_DEGRADE_WORKDIR" static
+  AGENT="$STATIC_DEGRADE_AGENT"
   ENGINE="claude"
   local expected_dir
-  expected_dir="$(bridge_agent_claude_config_dir "$DYN_AGENT")"
+  expected_dir="$(bridge_agent_claude_config_dir "$STATIC_DEGRADE_AGENT")"
   clear_agent_credential "$expected_dir"
   SEED_SHOULD_SUCCEED=0
   SEED_CALLED=0
@@ -717,8 +728,8 @@ smoke_run "T1 shared STATIC Claude launch exports per-agent CLAUDE_CONFIG_DIR" t
 smoke_run "T2 teeth: reverting the export empties CLAUDE_CONFIG_DIR"           test_teeth_revert_makes_config_dir_empty
 smoke_run "T3 codex shared launch sets no CLAUDE_CONFIG_DIR"                   test_codex_shared_no_config_dir
 smoke_run "T4 launch resolver agrees with config-dir SSOT"                    test_resolver_agreement
-smoke_run "T5 shared DYNAMIC seeds credential then exports (auth not broken)"  test_shared_dynamic_seeds_then_exports
-smoke_run "T6 degrade: unseedable agent skips the export (no auth break)"      test_degrade_when_seed_fails
+smoke_run "T5 #1890 shared DYNAMIC Claude: no per-agent seed, no CLAUDE_CONFIG_DIR export" test_shared_dynamic_passthrough_no_seed_no_export
+smoke_run "T6 degrade: unseedable STATIC agent skips the export (no auth break)" test_degrade_when_seed_fails
 smoke_run "T7 proven keychain-free exports without a credential file"          test_proven_keychain_free_exports_without_credential_file
 smoke_run "T8 teeth: unproven keychain-free does NOT export empty per-agent dir" test_unproven_keychain_free_does_not_export_empty_dir
 smoke_run "T9 degrade warning is one-time across N relaunches (sentinel)"      test_degrade_warning_is_one_time

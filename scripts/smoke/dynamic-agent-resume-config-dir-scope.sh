@@ -6,31 +6,32 @@
 # Live data-loss: launching a NEW dynamic agent in a folder where the operator
 # has a vanilla (non-bridge) Claude session DESTROYED the operator's session —
 # its transcript was moved to `.quarantined/` and vanished from `claude
-# --resume`. 2-stage root cause:
+# --resume`.
 #
-#   Defect A — resume detection scanned the WRONG config dir. For a fresh
-#   dynamic agent whose isolated `<agent-home>/.claude/projects/` is empty,
-#   `bridge_resolve_agent_claude_config_dir` returned EMPTY (the #1370
-#   "stale scaffold ⇒ HOME fallback" heuristic). Empty config dir → detection
-#   fell back to the operator HOME `~/.claude/projects/<slug>/`, sorted by
-#   mtime, and picked the OPERATOR's newest session (no ownership filter).
+# #1889 fixed this by scoping dynamic-agent resume detection + quarantine to the
+# agent's OWN private config dir. #1890 SUPERSEDES that for dynamic Claude: a
+# dynamic Claude agent now runs as VANILLA Claude Code against the operator-
+# global ~/.claude and NEVER uses bridge resume / quarantine at all (resume is
+# native `claude --continue`, keyed by workdir). The safety property is the same
+# — the operator's transcript is never resume-hijacked and never quarantined —
+# but the mechanism flips from "scope to the agent's own private dir" to "no
+# bridge resume/quarantine machinery for dynamic Claude".
 #
-#   Defect B — quarantine was not ownership-scoped. On the resume failure the
-#   archive helper moved that OPERATOR-HOME transcript into `.quarantined/`.
-#
-# This smoke pins all three required fixes with a differential fixture: an
-# isolated BRIDGE_HOME + a FAKE operator HOME holding a vanilla transcript for
+# This smoke pins the #1890 dynamic-Claude contract with a differential fixture:
+# an isolated BRIDGE_HOME + a FAKE operator HOME holding a vanilla transcript for
 # the agent's workdir slug.
 #
-#   A1 (F1) — a NEW dynamic agent with an EMPTY isolated config dir resolves to
-#     its OWN config dir (NOT empty, NO operator-HOME fallthrough) → detection
-#     finds nothing in the empty isolated dir → fresh start. The operator's
-#     transcript is NOT selected for resume.
-#   A2 (F1, legit-preserve) — a dynamic agent WHOSE OWN isolated projects/ holds
-#     its prior transcript still resumes that transcript (#981/#1769 preserved).
-#   A3 (F2) — a quarantine/archive attempt for a session whose transcript lives
-#     ONLY in the operator HOME (outside the agent's config dir) is REFUSED: the
-#     operator transcript is NOT moved and stays present.
+#   A1 (#1890) — for a dynamic Claude agent `bridge_resolve_agent_claude_config_
+#     dir` returns EMPTY (operator-global passthrough; detection-dir == launch-
+#     dir == $HOME/.claude, no private dir). The predicate
+#     `bridge_agent_is_dynamic_vanilla_claude` is the only boundary.
+#   A2 (#1890) — even if a transcript exists under the legacy per-agent dir, the
+#     resolver still returns EMPTY for a dynamic Claude agent: the bridge no
+#     longer keys resume off a private dir for these agents.
+#   A3 (#1889 carry-over + #1890 guard) — a quarantine/archive attempt for the
+#     operator session is REFUSED (the explicit dynamic-Claude guard fires before
+#     any path resolution): the operator transcript is NOT moved and stays
+#     present.
 #
 # Plus the end-to-end safety invariant: across A1+A3 the operator-HOME
 # transcript is never resume-selected AND never quarantined.
@@ -139,81 +140,66 @@ lib_eval() {
 }
 
 # ===========================================================================
-# A1 (F1) — empty isolated config dir ⇒ fresh start; operator session NOT
-# selected. The dynamic agent's <agent-home>/.claude exists but its projects/
-# is empty. The resolver must return the agent's OWN config dir (so detection
-# scans the empty isolated dir and finds nothing) — NOT empty (which would fall
-# back to the operator HOME and pick the operator session).
+# A1 (#1890) — a dynamic Claude agent resolves to EMPTY (operator-global
+# passthrough). The legacy per-agent dir is NOT used: detection-dir mirrors the
+# launch-dir, which for dynamic Claude is $HOME/.claude (operator global). The
+# resolver must return EMPTY so the python detect helper / quarantine resolver
+# fall back to the operator HOME — and so the explicit predicate boundary is the
+# one gate.
 # ===========================================================================
 A1_AGENT="dyn_fresh"
 
-test_a1_empty_isolated_is_fresh() {
+test_a1_dynamic_claude_resolves_empty() {
   local out=""
   out="$(lib_eval "$A1_AGENT" '
-    # Materialize the empty isolated config dir (fresh dynamic agent shape).
+    # Materialize the (now-unused) legacy per-agent config dir to prove the
+    # resolver ignores it for dynamic Claude.
     mkdir -p "$cfg/projects" "$cfg/sessions"
+    is_vanilla="no"
+    if bridge_agent_is_dynamic_vanilla_claude "$agent"; then is_vanilla="yes"; fi
     resolved="$(bridge_resolve_agent_claude_config_dir "$agent")"
-    detected="$(bridge_detect_claude_session_id "'"$WORKDIR"'" 0 "" "$resolved" 2>/dev/null)"
     printf "CFG=%s\n" "$cfg"
+    printf "ISVANILLA=%s\n" "$is_vanilla"
     printf "RESOLVED=%s\n" "$resolved"
-    printf "DETECTED=%s\n" "$detected"
   ')" || smoke_fail "A1 lib_eval failed: $out"
 
-  local cfg resolved detected
-  cfg="$(printf '%s\n' "$out" | sed -n 's/^CFG=//p' | head -n1)"
+  local is_vanilla resolved
+  is_vanilla="$(printf '%s\n' "$out" | sed -n 's/^ISVANILLA=//p' | head -n1)"
   resolved="$(printf '%s\n' "$out" | sed -n 's/^RESOLVED=//p' | head -n1)"
-  detected="$(printf '%s\n' "$out" | sed -n 's/^DETECTED=//p' | head -n1)"
 
-  # F1: empty isolated projects/ ⇒ the AGENT'S OWN config dir, not empty.
-  smoke_assert_eq "$cfg" "$resolved" \
-    "A1 dynamic agent with empty isolated config dir resolves to its OWN dir (no operator-HOME fallthrough)"
-  [[ -n "$resolved" ]] \
-    || smoke_fail "A1 resolved config dir must be non-empty (got empty ⇒ operator-HOME fallback re-introduced)"
-  # F1: the operator HOME must NOT be the resolved dir.
-  smoke_assert_not_contains "$resolved" "$OPERATOR_HOME/.claude" \
-    "A1 resolved dir must never be the operator HOME ~/.claude"
-  # End-to-end: detection must NOT select the operator session — fresh start.
-  smoke_assert_eq "" "$detected" \
-    "A1 detection finds NO session (fresh start) — operator session not selected"
-  smoke_assert_not_contains "$detected" "$OPERATOR_SESSION_ID" \
-    "A1 operator session id is never returned by detection"
+  smoke_assert_eq "yes" "$is_vanilla" \
+    "A1 a shared-mode dynamic Claude agent is classified dynamic-vanilla-claude (#1890 boundary)"
+  # #1890: dynamic Claude resolves to EMPTY (operator-global passthrough).
+  smoke_assert_eq "" "$resolved" \
+    "A1 dynamic Claude config dir resolves EMPTY (operator-global ~/.claude passthrough, no private dir)"
 }
 
 # ===========================================================================
-# A2 (F1, legit-preserve) — a dynamic agent WHOSE OWN isolated projects/ holds
-# its prior transcript still resumes it (#981/#1769). Only the operator-HOME
-# fallback was removed; legitimate isolated resume must not regress.
+# A2 (#1890) — even WITH a transcript present under the legacy per-agent dir,
+# the resolver still returns EMPTY for a dynamic Claude agent. The bridge no
+# longer keys resume off a private dir for these agents (resume is native
+# `claude --continue`).
 # ===========================================================================
 A2_AGENT="dyn_own_resume"
 
-test_a2_own_transcript_resumes() {
+test_a2_dynamic_claude_ignores_private_transcript() {
   local out=""
   out="$(lib_eval "$A2_AGENT" '
     slug="'"$SLUG"'"
     own_sid="'"$AGENT_OWN_SESSION_ID"'"
     mkdir -p "$cfg/projects/$slug" "$cfg/sessions"
-    # The agent'\''s OWN prior transcript (fresh, non-empty) under its isolated dir.
+    # A prior transcript under the legacy per-agent dir — must NOT be resolved.
     printf "{\"sessionId\":\"%s\",\"type\":\"user\"}\n" "$own_sid" \
       >"$cfg/projects/$slug/$own_sid.jsonl"
     resolved="$(bridge_resolve_agent_claude_config_dir "$agent")"
-    detected="$(bridge_detect_claude_session_id "'"$WORKDIR"'" 0 "" "$resolved" 2>/dev/null)"
-    printf "CFG=%s\n" "$cfg"
     printf "RESOLVED=%s\n" "$resolved"
-    printf "DETECTED=%s\n" "$detected"
   ')" || smoke_fail "A2 lib_eval failed: $out"
 
-  local cfg resolved detected
-  cfg="$(printf '%s\n' "$out" | sed -n 's/^CFG=//p' | head -n1)"
+  local resolved
   resolved="$(printf '%s\n' "$out" | sed -n 's/^RESOLVED=//p' | head -n1)"
-  detected="$(printf '%s\n' "$out" | sed -n 's/^DETECTED=//p' | head -n1)"
 
-  smoke_assert_eq "$cfg" "$resolved" \
-    "A2 dynamic agent with its OWN populated isolated projects/ resolves its own dir"
-  # The agent resumes its OWN prior session — NOT the operator's.
-  smoke_assert_eq "$AGENT_OWN_SESSION_ID" "$detected" \
-    "A2 detection resumes the agent's OWN isolated transcript (#981/#1769 legit resume preserved)"
-  smoke_assert_not_contains "$detected" "$OPERATOR_SESSION_ID" \
-    "A2 operator session id is never returned even with an own transcript present"
+  smoke_assert_eq "" "$resolved" \
+    "A2 dynamic Claude resolver returns EMPTY even with a legacy per-agent transcript present (#1890)"
 }
 
 # ===========================================================================
@@ -261,13 +247,13 @@ test_operator_transcript_survives() {
 }
 
 # --- run ------------------------------------------------------------------
-smoke_run "A1 empty isolated config ⇒ fresh, operator not selected" \
-  test_a1_empty_isolated_is_fresh
-smoke_run "A2 own isolated transcript still resumes (legit preserved)" \
-  test_a2_own_transcript_resumes
+smoke_run "A1 dynamic Claude resolves EMPTY (operator-global passthrough)" \
+  test_a1_dynamic_claude_resolves_empty
+smoke_run "A2 dynamic Claude ignores legacy private transcript" \
+  test_a2_dynamic_claude_ignores_private_transcript
 smoke_run "A3 foreign-transcript quarantine refused" \
   test_a3_foreign_quarantine_refused
 smoke_run "operator transcript survives untouched" \
   test_operator_transcript_survives
 
-smoke_log "PASS — dynamic-agent resume detection + quarantine scoped to the agent's own config dir (operator-session hijack fixed)"
+smoke_log "PASS — #1890 dynamic Claude = operator-global passthrough; no bridge resume/quarantine; operator session never hijacked"

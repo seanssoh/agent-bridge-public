@@ -317,6 +317,27 @@ fail-open한다. 두 엔진은 이 하나의 shared predicate를 공유하고 no
 
 이 레이어는 "보안 제품"이 아니라 shared-user runtime의 containment/audit layer다.
 
+**Dynamic Claude = vanilla CC + bridge comms only (#1890).** `engine == claude &&
+source == dynamic && !iso`인 agent는 `bridge_agent_is_dynamic_vanilla_claude`
+하나로 분기된다(다른 추론 금지 — workdir 위치/shared-mode/agent 이름으로 추론하지
+않는다). 이 분기는: (1) launch builder가 `--resume <id>`를 절대 emit하지 않고 plain
+`claude` / 네이티브 `claude --continue`만 쓴다(`bridge_build_dynamic_launch_cmd` /
+`bridge_build_resume_launch_cmd` / `bridge_claude_dynamic_launch_cmd`), (2)
+per-agent `CLAUDE_CONFIG_DIR` export와 credential/first-run seed를 건너뛰어
+operator-global `~/.claude`를 그대로 상속한다(`bridge_run_shared_launch` /
+`bridge_run_export_claude_launch_env` / `bridge_ensure_claude_first_run_config`),
+(3) detection-side resolver(`bridge_resolve_agent_claude_config_dir`)가 EMPTY를
+돌려주고 quarantine add/archive는 dynamic-Claude guard로 거부된다(defense-in-depth),
+(4) bridge comms hook은 managed `settings.json`이 아니라 project-local
+`<workdir>/.claude/settings.local.json`에 머지된다(operator key 보존 +
+`.git/info/exclude` guard + tracked면 LOUD FAIL). hook은 `BRIDGE_AGENT_ID`가 없으면
+모두 no-op이어야 하므로 `hooks/prompt-guard.py`도 agent 없을 때 no-op으로 만들었다.
+**static/admin은 모든 기존 동작 유지** — per-agent config dir + bridge `--resume` +
+managed `settings.json` 그대로다. 이는 dynamic Claude에 한해 #1889를 대체한다(안전성은
+"isolation"이 아니라 "파괴적 머신러리 제거"로 확보). same-workdir 동시성은 hard guard
+없이 WARN만 한다(KNOWN_ISSUES #35). regression smoke:
+`scripts/smoke/1890-dynamic-vanilla-claude.sh`.
+
 **Identity materialization invariant (#10370).** v2 layout에서 authored identity와
 runtime workdir copy는 의도적으로 분리되어 있다. create/start 경로는 HOME/source의
 identity 파일을 workdir read-target으로 **copy-on-materialize** 하며, reader를 HOME으로

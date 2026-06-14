@@ -59,6 +59,20 @@ threshold_for_surface = _guard.threshold_for_surface
 
 
 def main() -> int:
+    # Issue #1890: this hook now also rides project-local
+    # `<workdir>/.claude/settings.local.json` for dynamic vanilla Claude agents,
+    # so an OPERATOR who later runs plain `claude` in that same workdir loads it
+    # too. Outside a bridge session (no BRIDGE_AGENT_ID) the guard must NOT
+    # analyze or block — it would otherwise gate the operator's own prompts with
+    # no bridge protection contract to enforce. Inside a bridge session
+    # (BRIDGE_AGENT_ID set) the full guard runs unchanged, preserving dynamic
+    # agents' prompt-injection protection. This makes prompt-guard.py no-op-safe
+    # without BRIDGE_AGENT_ID like the other project-local bridge hooks, so it
+    # can be wired into settings.local.json rather than excluded.
+    agent = current_agent()
+    if not agent:
+        return 0
+
     if not prompt_guard_enabled():
         return 0
 
@@ -71,7 +85,6 @@ def main() -> int:
     if not prompt.strip():
         return 0
 
-    agent = current_agent()
     threshold = threshold_for_surface("prompt", "high")
     result = analyze_text(prompt, threshold=threshold, surface="prompt", agent=agent)
 

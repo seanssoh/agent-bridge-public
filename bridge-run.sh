@@ -1278,6 +1278,15 @@ bridge_run_claude_keychain_free_preflight() {
 
   [[ "$ENGINE" == "claude" ]] || return 0
   [[ $SAFE_MODE -eq 0 ]] || return 0
+  # Issue #1890: dynamic vanilla Claude authenticates from the operator-global
+  # ~/.claude (no per-agent config dir, no per-agent settings.json / apiKeyHelper
+  # / .credentials.json). The keychain-free preflight validates a PER-AGENT
+  # settings.json and bridge_dies when it is absent — which it always is for a
+  # passthrough agent. Skip it: vanilla Claude resolves the operator's own auth.
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$AGENT"; then
+    return 0
+  fi
   bridge_claude_keychain_free_auth_enabled || return 0
   ttl_ms="$(bridge_claude_api_key_helper_ttl_ms)"
   export CLAUDE_CODE_API_KEY_HELPER_TTL_MS="$ttl_ms"
@@ -1329,6 +1338,17 @@ bridge_run_claude_keychain_free_preflight() {
 bridge_run_ensure_claude_launch_channel_plugins() {
   local agent_claude_root=""
   local agent_home=""
+
+  # Issue #1890: dynamic vanilla Claude has no per-agent config dir — it
+  # inherits the operator-global ~/.claude (settings / plugins / MCP). Enabling
+  # channel plugins into the unused per-agent dir (and re-pointing HOME /
+  # CLAUDE_CONFIG_DIR there) would both be a no-op for the launched process and
+  # defeat the global passthrough. Skip it; the operator-global plugin set is
+  # what the agent runs with.
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$AGENT"; then
+    return 0
+  fi
 
   agent_claude_root="$(bridge_run_agent_claude_root)"
   if command -v bridge_agent_claude_home_dir >/dev/null 2>&1; then
@@ -1529,7 +1549,18 @@ bridge_run_shared_launch() {
   local _errfile="$3"
   local _agent_claude_root=""
 
-  if [[ "$ENGINE" == "claude" ]]; then
+  if [[ "$ENGINE" == "claude" ]] \
+     && command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$AGENT"; then
+    # Issue #1890: dynamic vanilla Claude inherits the operator-global
+    # ~/.claude (model / settings / plugins / MCP / credentials). Skip BOTH the
+    # per-agent CLAUDE_CONFIG_DIR export AND the per-agent credential seed:
+    # leaving _agent_claude_root empty falls through to the no-export branch
+    # below so the launched `claude` resolves config from $HOME/.claude exactly
+    # like the operator typing `claude` in this workdir. Do NOT seed a
+    # per-agent credential — vanilla resolves the operator's own auth.
+    _agent_claude_root=""
+  elif [[ "$ENGINE" == "claude" ]]; then
     _agent_claude_root="$(bridge_run_agent_claude_root)"
     # r2: gate the export on the per-agent dir actually being authed. If the
     # credential is missing AND cannot be seeded, clear the root so we skip
@@ -1585,6 +1616,22 @@ bridge_run_export_claude_launch_env() {
   local agent_home=""
 
   [[ "$ENGINE" == "claude" ]] || return 0
+
+  # Issue #1890: dynamic vanilla Claude must run with the OPERATOR HOME so
+  # `~/.claude` resolves to the operator-global tree (model / settings /
+  # plugins / MCP / session history / credentials), exactly like the operator
+  # typing `claude` in this workdir. Without this it would inherit
+  # HOME=<agent-home> (the scaffolded per-agent home under BRIDGE_AGENT_HOME_-
+  # ROOT) and see none of the operator global config — the very bug #1890 fixes.
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$AGENT"; then
+    local _operator_home=""
+    if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+      _operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+    fi
+    [[ -n "$_operator_home" ]] && export HOME="$_operator_home"
+    return 0
+  fi
 
   agent_claude_root="$(bridge_run_agent_claude_root)"
   if command -v bridge_agent_claude_home_dir >/dev/null 2>&1; then
@@ -1760,6 +1807,14 @@ bridge_run_sync_dev_plugin_cache() {
 
   [[ "$ENGINE" == "claude" ]] || return 0
   [[ $SAFE_MODE -eq 0 ]] || return 0
+  # Issue #1890: dynamic vanilla Claude inherits operator-global plugins/MCP and
+  # uses no per-agent config dir, so syncing a per-agent dev-plugin cache is a
+  # no-op for the launched process. Skip it so a missing per-agent cache cannot
+  # `exit 65` block a passthrough launch.
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$AGENT"; then
+    return 0
+  fi
   channels="$(bridge_agent_effective_dev_channels_csv "$AGENT")"
 
   # Issue #1857: the bridge-owned plugin grant ledger holds the operator's
@@ -2057,6 +2112,12 @@ bridge_run_prune_legacy_teams_mcp() {
 
   [[ "$ENGINE" == "claude" ]] || return 0
   [[ $SAFE_MODE -eq 0 ]] || return 0
+  # Issue #1890: dynamic vanilla Claude has no per-agent config dir / manifest to
+  # prune — operator-global MCP is inherited as-is. Skip.
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$AGENT"; then
+    return 0
+  fi
   channels="$(bridge_agent_effective_dev_channels_csv "$AGENT")"
   bridge_channel_csv_contains "$channels" "plugin:teams" || return 0
 
