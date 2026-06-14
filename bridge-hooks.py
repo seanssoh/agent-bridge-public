@@ -1317,7 +1317,7 @@ def _codex_project_trust_level(config_path: Path, workdir: str) -> str:
     the operator's call; the bridge only detects + reports — constraint #3).
     """
     try:
-        if not config_path.is_file():
+        if not config_path.is_file():  # noqa: raw-pathlib-controller-only  (reads the operator-owned $CODEX_HOME/config.toml for trust detection; never an isolated-agent tree)
             return "unknown"
         raw = config_path.read_text(encoding="utf-8")
     except OSError:
@@ -1379,7 +1379,7 @@ def cmd_status_codex_project_trust(args: argparse.Namespace) -> int:
     hooks_file = Path(args.workdir).expanduser() / ".codex" / "hooks.json"
     config_path = Path(args.codex_config_file).expanduser()
     trust = _codex_project_trust_level(config_path, workdir)
-    hooks_present = hooks_file.is_file()
+    hooks_present = hooks_file.is_file()  # noqa: raw-pathlib-controller-only  (the bridge-written project-local <workdir>/.codex/hooks.json, controller-accessible; never an isolated-agent tree)
     # Comms is "blocked" only when we can POSITIVELY see an untrusted project —
     # an unknown trust state is reported as a soft warning, not a hard block, so
     # we never over-claim. Either way the operator is told.
