@@ -970,6 +970,16 @@ bridge_auth_codex_selected_agents() {
     all|codex)
       for agent in "${BRIDGE_AGENT_IDS[@]}"; do
         [[ "$(bridge_agent_engine "$agent")" == "$engine" ]] || continue
+        # Issue #1899: a dynamic vanilla Codex agent inherits the operator-global
+        # ~/.codex/auth.json — it has no per-agent .codex/auth.json to sync, and
+        # writing one would be a no-op the agent never reads. Exclude it from the
+        # codex-cred fleet sync. (static-spec already excludes it via source !=
+        # static; this closes the all/codex spec. Explicit csv still errors loud
+        # below if an operator names one, surfacing the misconfiguration.)
+        if command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+           && bridge_agent_is_dynamic_vanilla_codex "$agent"; then
+          continue
+        fi
         printf '%s\n' "$agent"
       done
       ;;
@@ -1121,6 +1131,13 @@ bridge_auth_codex_sync_agents() {
   for agent in "${agents[@]}"; do
     # Never re-write the source itself (it is the source of truth).
     [[ "$agent" == "$source_agent" ]] && continue
+    # Issue #1899: defense-in-depth — never write a per-agent auth.json for a
+    # dynamic vanilla Codex agent even if it slipped into the selection (e.g.
+    # an explicit csv). It inherits the operator-global ~/.codex/auth.json.
+    if command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+       && bridge_agent_is_dynamic_vanilla_codex "$agent"; then
+      continue
+    fi
     if out="$(bridge_auth_codex_sync_one "$source_file" "$agent" 2>/dev/null)"; then
       case "$out" in
         *'"status": "unchanged"'*|*'"status":"unchanged"'*) unchanged+=("$agent") ;;

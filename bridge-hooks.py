@@ -1302,6 +1302,95 @@ def cmd_status_codex_hooks(args: argparse.Namespace) -> int:
     return 0 if core_present else 1
 
 
+def _codex_project_trust_level(config_path: Path, workdir: str) -> str:
+    """Best-effort read of Codex's per-project trust level from config.toml.
+
+    Issue #1899: a dynamic vanilla Codex agent's bridge comms hooks live in the
+    project-local <workdir>/.codex/hooks.json. Codex only RUNS project-local
+    hooks once the project layer is trusted (config.toml `[projects."<path>"]`
+    `trust_level = "trusted"`). This helper returns one of:
+      - "trusted"        — project explicitly trusted (hooks will run)
+      - "untrusted"      — config exists but this project is not trusted
+      - "unknown"        — no config / unreadable / cannot determine (be loud,
+                           but do not claim a definite block)
+    It is read-only: it NEVER writes Codex's trust store (establishing trust is
+    the operator's call; the bridge only detects + reports — constraint #3).
+    """
+    try:
+        if not config_path.is_file():  # noqa: raw-pathlib-controller-only  (reads the operator-owned $CODEX_HOME/config.toml for trust detection; never an isolated-agent tree)
+            return "unknown"
+        raw = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return "unknown"
+
+    data = None
+    try:
+        import tomllib  # py311+
+
+        data = tomllib.loads(raw)
+    except ModuleNotFoundError:
+        data = None
+    except Exception:
+        return "unknown"
+
+    if isinstance(data, dict):
+        projects = data.get("projects")
+        if isinstance(projects, dict):
+            proj = projects.get(workdir)
+            if isinstance(proj, dict):
+                level = str(proj.get("trust_level") or "").strip().lower()
+                return "trusted" if level == "trusted" else "untrusted"
+            return "untrusted"
+        return "unknown"
+
+    # tomllib unavailable (py<3.11): conservative line scan. We only POSITIVELY
+    # report "trusted" when we can see this exact project's table followed by a
+    # trusted marker before the next table; anything ambiguous is "unknown" so
+    # we never silently suppress the operator warning.
+    import re as _re
+
+    esc = _re.escape(workdir)
+    header = _re.compile(r'^\s*\[projects\.(?:"%s"|%s)\]\s*$' % (esc, esc))
+    next_table = _re.compile(r"^\s*\[")
+    lines = raw.splitlines()
+    in_table = False
+    for line in lines:
+        if header.match(line):
+            in_table = True
+            continue
+        if in_table:
+            if next_table.match(line):
+                break
+            if _re.match(r'^\s*trust_level\s*=\s*"?trusted"?\s*$', line):
+                return "trusted"
+    return "unknown"
+
+
+def cmd_status_codex_project_trust(args: argparse.Namespace) -> int:
+    """Report whether a dynamic Codex agent's project-local hooks can run.
+
+    Issue #1899: detect + report (never silently bypass) when project / hook
+    trust would prevent the bridge comms hooks in <workdir>/.codex/hooks.json
+    from firing. Emits shell-parseable lines for the launch-time guard in
+    lib/bridge-hooks.sh, which turns CODEX_PROJECT_HOOKS_COMMS_BLOCKED=1 into an
+    operator-visible warning + audit row.
+    """
+    workdir = str(Path(args.workdir).expanduser())
+    hooks_file = Path(args.workdir).expanduser() / ".codex" / "hooks.json"
+    config_path = Path(args.codex_config_file).expanduser()
+    trust = _codex_project_trust_level(config_path, workdir)
+    hooks_present = hooks_file.is_file()  # noqa: raw-pathlib-controller-only  (the bridge-written project-local <workdir>/.codex/hooks.json, controller-accessible; never an isolated-agent tree)
+    # Comms is "blocked" only when we can POSITIVELY see an untrusted project —
+    # an unknown trust state is reported as a soft warning, not a hard block, so
+    # we never over-claim. Either way the operator is told.
+    blocked = "1" if (hooks_present and trust == "untrusted") else "0"
+    print(shell_line("CODEX_PROJECT_HOOKS_FILE", str(hooks_file)))
+    print(shell_line("CODEX_PROJECT_HOOKS_PRESENT", "true" if hooks_present else "false"))
+    print(shell_line("CODEX_PROJECT_TRUST_LEVEL", trust))
+    print(shell_line("CODEX_PROJECT_HOOKS_COMMS_BLOCKED", blocked))
+    return 0
+
+
 def cmd_ensure_codex_hooks(args: argparse.Namespace) -> int:
     bridge_home = Path(args.bridge_home).expanduser()
     hooks_path = codex_hooks_path(args)
@@ -3318,6 +3407,14 @@ def build_parser() -> argparse.ArgumentParser:
     status_codex_parser.add_argument("--codex-hooks-file")
     status_codex_parser.add_argument("--format", choices=("text", "shell"), default="text")
     status_codex_parser.set_defaults(handler=cmd_status_codex_hooks)
+
+    # Issue #1899: detect (read-only) whether a dynamic Codex agent's project-
+    # local <workdir>/.codex/hooks.json will actually run, given Codex project
+    # trust in the operator-global config.toml. Reports; never establishes trust.
+    status_codex_trust_parser = subparsers.add_parser("status-codex-project-trust")
+    status_codex_trust_parser.add_argument("--workdir", required=True)
+    status_codex_trust_parser.add_argument("--codex-config-file", required=True)
+    status_codex_trust_parser.set_defaults(handler=cmd_status_codex_project_trust)
 
     link_shared_parser = subparsers.add_parser("link-shared-settings")
     link_shared_parser.add_argument("--workdir", required=True)

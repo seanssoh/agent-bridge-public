@@ -370,6 +370,20 @@ bridge_isolation_v2_exec_with_secret_env() {
   #      the ambient env. Unsetting them HERE, inside the loader+exec
   #      subshell, guarantees the launched child sees them absent regardless
   #      of the launch-secrets.env content. Empty/unset → no scrub.
+  #   $7 repin_env_pairs (optional) newline-separated KEY=VALUE assignments
+  #      to `export` AFTER the scrub and BEFORE the `exec` — the dynamic
+  #      vanilla Codex HOME/CODEX_HOME re-pin (#1899 Phase-4 BLOCKING).
+  #      Unlike the scrub, which only *removes* a variable, the re-pin SETS
+  #      it to an operator value. Scrubbing CODEX_HOME alone is insufficient
+  #      for a dynamic vanilla Codex agent: the secrets file may carry a
+  #      stale per-agent CODEX_HOME/HOME, and merely unsetting it would let
+  #      the launch fall back to whatever HOME the loader left, not the
+  #      operator-global ~/.codex the #1899 contract requires. So the caller
+  #      passes the scrub keys (HOME CODEX_HOME) AND the re-pin pairs
+  #      (HOME=<op_home>, CODEX_HOME=<op_home>/.codex); the scrub clears any
+  #      stale value first, then the re-pin authoritatively sets the operator
+  #      value. Each line is `KEY=VALUE` (value may contain '='; only the
+  #      first '=' splits). Empty/unset → no re-pin.
   #
   # Side effects:
   #   - Sets BRIDGE_ISOLATION_V2_LAST_EXEC_RC to the child's exit code.
@@ -380,6 +394,7 @@ bridge_isolation_v2_exec_with_secret_env() {
   local _errfile="$4"
   local _agent="$5"
   local _scrub_keys="${6:-}"
+  local _repin_pairs="${7:-}"
   # PR-C r2 review P2 #1: cannot use the subshell exit code as the
   # loader-failure sentinel — the same subshell `exec`s the agent
   # command, so any legitimate child exit code (e.g. exit 75 from a
@@ -403,6 +418,30 @@ bridge_isolation_v2_exec_with_secret_env() {
     if [[ -n "$_scrub_keys" ]]; then
       # shellcheck disable=SC2086  # intentional word-split of the name list
       unset $_scrub_keys 2>/dev/null || true
+    fi
+    # #1899 Phase-4 BLOCKING: re-pin the operator HOME/CODEX_HOME for a
+    # dynamic vanilla Codex agent AFTER the scrub (which cleared any stale
+    # launch-secrets.env value) and BEFORE the exec. The re-pin is the only
+    # step that can SET the operator value — a scrub-only fix would leave
+    # the child without an authoritative CODEX_HOME. Pairs are newline-
+    # separated KEY=VALUE; only the first '=' splits so a value may contain '='.
+    if [[ -n "$_repin_pairs" ]]; then
+      # Iterate newline-separated KEY=VALUE without a here-string/procsub
+      # (heredoc-ban H3) AND without a pipe/subshell — the exports MUST land
+      # in THIS pre-exec shell. IFS=newline splits on lines only (values may
+      # contain spaces); `set -f` stops a '*'/'?' in a value from
+      # pathname-expanding. No restore needed: exec replaces the shell next.
+      local _repin_line _repin_key _repin_val
+      local IFS=$'\n'
+      set -f
+      for _repin_line in $_repin_pairs; do
+        [[ -n "$_repin_line" ]] || continue
+        _repin_key="${_repin_line%%=*}"
+        _repin_val="${_repin_line#*=}"
+        [[ -n "$_repin_key" && "$_repin_key" != "$_repin_line" ]] || continue
+        export "$_repin_key=$_repin_val"
+      done
+      set +f
     fi
     exec "$_bash_bin" -lc "$_launch_cmd"
   ) 2> >(tee -a "$_errfile" >&2); then

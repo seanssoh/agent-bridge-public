@@ -1040,3 +1040,42 @@ This supersedes #1889's private-config-dir + ownership-scoped-quarantine
 approach **for dynamic Claude** (safety is now "no destructive machinery", not
 "isolation"); #1889's static/admin protections and the realpath containment
 stay. Regression smoke: `scripts/smoke/1890-dynamic-vanilla-claude.sh`.
+
+## 36. Dynamic Codex agents share the operator-global `~/.codex` + native `codex resume --last` + project-local hooks (#1899)
+
+The Codex sibling of #35. A **dynamic** Codex agent (`engine == codex && source
+== dynamic`, non-iso) now runs as **vanilla Codex CLI + the bridge comms layer
+only**:
+
+- **`CODEX_HOME` → operator global `~/.codex`** (config.toml model/profile,
+  `auth.json`, `sessions/`), pinned explicitly at launch
+  (`bridge_run_export_codex_launch_env`) so it can never become
+  `<agent_home>/.codex`. `CODEX_SQLITE_HOME` is left untouched.
+- **Resume = native `codex resume --last`** (most-recent session in the cwd; the
+  cwd filter is the safety boundary — never `--all`, never `codex resume <id>`,
+  never a bridge transcript scan). First wake / `continue=0` = plain `codex`.
+- **No bridge session machinery.** The codex session detector / refresh /
+  normalize / central resolver / `#1305` persist-guard / daemon `bridge-sync.sh`
+  backfill all no-op for this class, so the bridge never detects or persists an
+  operator `~/.codex/sessions` id.
+- **Comms hooks are project-local** at `<workdir>/.codex/hooks.json` (NOT
+  `~/.codex/hooks.json`, NOT `<agent_home>/.codex/hooks.json`). The launch forces
+  `-c features.hooks=true` for a fail-closed comms guarantee but does NOT force
+  model/profile/auth (operator-global inheritance preserved).
+- **Auth inherits `$CODEX_HOME/auth.json`.** Dynamic Codex is excluded from the
+  `codex-cred` fleet sync; ambient `OPENAI_API_KEY` / `CODEX_ACCESS_TOKEN` stay
+  scrubbed by default (`BRIDGE_CODEX_UNMANAGED_AUTH=1` remains the explicit
+  env-token escape hatch).
+
+**Hook-trust is the crux.** Codex only RUNS project-local hooks once the project
+layer is trusted (config.toml `[projects."<path>"]` `trust_level = "trusted"`).
+The bridge **detects + REPORTS** (operator warning + audit row) when project /
+hook trust would block comms — it does NOT silently blanket
+`--dangerously-bypass-hook-trust` (that bypasses ALL enabled hooks, too broad).
+If bridge queue delivery is degraded for a dynamic Codex agent, trust its
+workdir in Codex (run `codex` once in the workdir and accept) or set
+`trust_level = "trusted"` for it in `~/.codex/config.toml`.
+
+**Static / admin Codex are unchanged** — per-agent `<agent_home>/.codex` profiles
++ `hooks.json` + managed `auth.json` sync + bridge `codex resume <id>`.
+Regression smoke: `scripts/smoke/1899-dynamic-vanilla-codex.sh`.

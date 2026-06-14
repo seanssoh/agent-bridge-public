@@ -1652,6 +1652,39 @@ bridge_run_export_claude_launch_env() {
   [[ -n "$agent_home" ]] && export HOME="$agent_home"
 }
 
+# shellcheck disable=SC2030,SC2031 # launch env export is intentional for the child command below.
+bridge_run_export_codex_launch_env() {
+  [[ "$ENGINE" == "codex" ]] || return 0
+
+  # Issue #1899: a dynamic vanilla Codex agent must run against the operator-
+  # global ~/.codex (config.toml model/profile, auth.json, sessions/), exactly
+  # like the operator typing `codex` in this workdir. Pin BOTH:
+  #   - HOME = operator home, so any HOME-relative read resolves to the operator
+  #     tree (and the default CODEX_HOME = $HOME/.codex lands there);
+  #   - CODEX_HOME = <operator_home>/.codex EXPLICITLY, so even a future
+  #     HOME repoint cannot make CODEX_HOME become <agent_home>/.codex (the
+  #     invariant #1899 protects).
+  # CODEX_SQLITE_HOME is intentionally left untouched (unset unless the operator
+  # already exported it). Managed/static/admin Codex and iso-v2 Codex are
+  # excluded by the predicate and keep their per-agent CODEX_HOME behavior.
+  if command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_codex "$AGENT"; then
+    local _operator_home=""
+    if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+      _operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+    fi
+    if [[ -n "$_operator_home" ]]; then
+      export HOME="$_operator_home"
+      export CODEX_HOME="$_operator_home/.codex"
+    fi
+    return 0
+  fi
+  # Managed/static/admin Codex: no-op. HOME / CODEX_HOME are resolved by the
+  # existing managed path (iso-v2 secret-env loader sets HOME = iso UID home;
+  # shared mode inherits the operator HOME), unchanged from pre-#1899.
+  return 0
+}
+
 bridge_run_ledger_has_snapshot() {
   # Issue #1857: true when the bridge-owned grant ledger at $1 records a
   # non-empty `installed_snapshot.plugins` map (an operator recovery snapshot
@@ -2347,6 +2380,8 @@ while true; do
 
   if [[ "$ENGINE" == "claude" ]]; then
     bridge_run_export_claude_launch_env
+  elif [[ "$ENGINE" == "codex" ]]; then
+    bridge_run_export_codex_launch_env
   fi
 
   if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
@@ -2446,11 +2481,36 @@ while true; do
        && bridge_agent_is_dynamic_vanilla_claude "$AGENT"; then
       _v2_codex_scrub="${_v2_codex_scrub:+$_v2_codex_scrub }CLAUDE_CONFIG_DIR"
     fi
+    # #1899 Phase-4 BLOCKING: a dynamic vanilla Codex agent must run against
+    # the operator-global ~/.codex (the #1899 contract). bridge_run_export_
+    # codex_launch_env pins HOME/CODEX_HOME in the PARENT, but this v2 secret-env
+    # loader runs AFTER that and exports launch-secrets.env rows verbatim — a
+    # stale file may carry a per-agent CODEX_HOME/HOME (the Codex analogue of the
+    # #1900 CLAUDE_CONFIG_DIR leak). Scrubbing alone is insufficient here:
+    # CODEX_HOME/HOME must be SET to operator values, not merely unset. So scrub
+    # them (clear any stale row) AND re-pin the operator values inside the
+    # loader+exec subshell, AFTER the loader and BEFORE exec. Static/admin +
+    # managed Codex are excluded by the predicate and keep their per-agent
+    # CODEX_HOME. CODEX_SQLITE_HOME is left untouched (operator-set only).
+    _v2_codex_repin=""
+    if [[ "$ENGINE" == "codex" ]] \
+       && command -v bridge_agent_is_dynamic_vanilla_codex >/dev/null 2>&1 \
+       && bridge_agent_is_dynamic_vanilla_codex "$AGENT"; then
+      _v2_repin_home=""
+      if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+        _v2_repin_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+      fi
+      if [[ -n "$_v2_repin_home" ]]; then
+        _v2_codex_scrub="${_v2_codex_scrub:+$_v2_codex_scrub }HOME CODEX_HOME"
+        _v2_codex_repin="$(printf 'HOME=%s\nCODEX_HOME=%s/.codex' "$_v2_repin_home" "$_v2_repin_home")"
+      fi
+      unset _v2_repin_home
+    fi
     BRIDGE_ISOLATION_V2_LAST_EXEC_RC=0
     bridge_isolation_v2_exec_with_secret_env \
-      "$_v2_secret_file" "$BRIDGE_BASH_BIN" "$LAUNCH_CMD" "$ERRFILE" "$AGENT" "$_v2_codex_scrub"
+      "$_v2_secret_file" "$BRIDGE_BASH_BIN" "$LAUNCH_CMD" "$ERRFILE" "$AGENT" "$_v2_codex_scrub" "$_v2_codex_repin"
     EXIT_CODE="$BRIDGE_ISOLATION_V2_LAST_EXEC_RC"
-    unset BRIDGE_ISOLATION_V2_LAST_EXEC_RC _v2_codex_scrub
+    unset BRIDGE_ISOLATION_V2_LAST_EXEC_RC _v2_codex_scrub _v2_codex_repin
   else
     # Issue #1520: shared (non v2-secret-env) final launch. For Claude
     # agents this exports the per-agent CLAUDE_CONFIG_DIR so the launched
