@@ -4860,13 +4860,17 @@ bridge_codex_has_resumable_session_state() {
   local needle_compact="\"cwd\":\"${workdir}\""
   local needle_spaced="\"cwd\": \"${workdir}\""
   # Boolean probe: does any session jsonl under the operator sessions dir
-  # record this workdir as its cwd? Use `find -exec grep -l … {} +` piped to
-  # `grep -q .` rather than a process-substitution while-loop (heredoc-ban
-  # H3) — the function result comes from the pipeline's exit status (via the
-  # `if`), so the pipe subshell does not swallow a `return`.
-  if find "$sessions_dir" -type f -name '*.jsonl' \
-       -exec grep -lF -e "$needle_compact" -e "$needle_spaced" {} + 2>/dev/null \
-       | grep -q .; then
+  # record this workdir as its cwd? Use a single recursive `grep -rl …`
+  # (no pipe, no process-substitution, no command-substitution): a pipe to
+  # `grep -q .` is NOT pipefail-safe (under `set -o pipefail` a large match
+  # set makes the downstream `-q` close early → SIGPIPE → the upstream grep
+  # is treated as failed → false negative), and a procsub/here-string would
+  # trip the heredoc-ban H3 gate. `grep -r` recurses the dated session
+  # subdirs like the old `find`, `--include` filters to jsonl, and the
+  # function result is the grep exit status directly (0 = any match).
+  if grep -rlF --include='*.jsonl' \
+       -e "$needle_compact" -e "$needle_spaced" \
+       "$sessions_dir" >/dev/null 2>&1; then
     return 0
   fi
   return 1
