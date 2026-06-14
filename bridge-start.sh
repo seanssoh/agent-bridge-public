@@ -590,19 +590,22 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   if ! bridge_project_skill_bootstrap_needed "$ENGINE" "$WORK_DIR"; then
     bridge_start_note_fresh_trip skill_bootstrap_needed "$_fresh_required_setup"
   fi
-  if ! bridge_claude_stop_hook_status "$WORK_DIR" >/dev/null 2>&1; then
+  # Issue #1890: pass $AGENT so the status probe reads the SAME target the
+  # ensure path writes (settings.local.json for dynamic Claude, settings.json
+  # for static) instead of inferring from the workdir.
+  if ! bridge_claude_stop_hook_status "$WORK_DIR" "$AGENT" >/dev/null 2>&1; then
     bridge_start_note_fresh_trip stop_hook_status 0
   fi
-  if ! bridge_claude_session_start_hook_status "$WORK_DIR" >/dev/null 2>&1; then
+  if ! bridge_claude_session_start_hook_status "$WORK_DIR" "$AGENT" >/dev/null 2>&1; then
     bridge_start_note_fresh_trip session_start_hook_status 0
   fi
-  if ! bridge_claude_prompt_hook_status "$WORK_DIR" >/dev/null 2>&1; then
+  if ! bridge_claude_prompt_hook_status "$WORK_DIR" "$AGENT" >/dev/null 2>&1; then
     bridge_start_note_fresh_trip prompt_hook_status 0
   fi
-  if ! bridge_claude_prompt_guard_hook_status "$WORK_DIR" >/dev/null 2>&1; then
+  if ! bridge_claude_prompt_guard_hook_status "$WORK_DIR" "$AGENT" >/dev/null 2>&1; then
     bridge_start_note_fresh_trip prompt_guard_hook_status 0
   fi
-  if ! bridge_claude_tool_policy_hooks_status "$WORK_DIR" >/dev/null 2>&1; then
+  if ! bridge_claude_tool_policy_hooks_status "$WORK_DIR" "$AGENT" >/dev/null 2>&1; then
     bridge_start_note_fresh_trip tool_policy_hooks_status 0
   fi
   unset _fresh_required_setup

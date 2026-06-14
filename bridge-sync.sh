@@ -118,6 +118,18 @@ refresh_missing_session_ids() {
       continue
     fi
 
+    # #1890: a dynamic vanilla Claude agent never carries a bridge-managed
+    # session id — it resumes via native `claude -c` against the operator-
+    # global ~/.claude. This daemon backfill sweep calls the detector
+    # directly (bypassing bridge_refresh_agent_session_id's guard), and the
+    # config-dir resolver returns empty for this class, so without this gate
+    # the detector falls back to $HOME/.claude and would persist the
+    # OPERATOR's live session id. Skip detection + persistence entirely.
+    if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+       && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+      continue
+    fi
+
     sid="$(bridge_agent_session_id "$agent")"
     if [[ -n "$sid" ]]; then
       continue

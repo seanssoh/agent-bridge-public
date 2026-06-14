@@ -1741,23 +1741,9 @@ if [[ -f "$ACTIVE_FILE" ]]; then
   fi
 fi
 
-if [[ $CONTINUE_MODE -eq 1 && -f "$HISTORY_FILE" ]]; then
-  AGENT_SESSION_ID=""
-  # shellcheck source=/dev/null
-  source "$HISTORY_FILE"
-  # Gate the stored id through the freshness resolver. rc=0 keeps it,
-  # rc=2 swaps in a fresher in-window transcript for the same workdir,
-  # anything else means start fresh (no --resume). This is the dynamic
-  # ad-hoc analogue of the hydration sites in lib/bridge-state.sh.
-  _RESUME_RC=0
-  SESSION_ID="$(bridge_resolve_resume_session_id "$ENGINE" "$NAME" "$WORKDIR" "${AGENT_SESSION_ID:-}" 2>/dev/null)" || _RESUME_RC=$?
-  case "$_RESUME_RC" in
-    0|2) ;;
-    *)   SESSION_ID="" ;;
-  esac
-  unset _RESUME_RC
-fi
-
+# Register the agent in the in-memory roster FIRST (with an empty session id),
+# so the canonical predicates below can classify THIS agent by its real
+# engine/source/isolation fields rather than re-deriving them ad hoc.
 bridge_add_agent_id_if_missing "$NAME"
 # shellcheck disable=SC2034
 BRIDGE_AGENT_DESC["$NAME"]="Ad hoc ${ENGINE} agent (${WORKDIR})"
@@ -1779,6 +1765,52 @@ BRIDGE_AGENT_LOOP["$NAME"]="$LOOP_MODE"
 BRIDGE_AGENT_EPHEMERAL["$NAME"]="$EPHEMERAL_MODE"
 # shellcheck disable=SC2034
 BRIDGE_AGENT_CONTINUE["$NAME"]="$CONTINUE_MODE"
+
+# Issue #1890: a dynamic Claude agent runs as vanilla Claude Code against the
+# operator-global ~/.claude. It must NOT rehydrate a bridge-tracked session id
+# (which would later become `--resume <id>` and risk the operator-session-
+# hijack class). Native `claude --continue` (workdir-keyed) is the resume path.
+# Codex dynamics and any iso-v2 Claude dynamic keep the resolver rehydration.
+# Classify via the canonical predicate on the now-registered agent: it is the
+# SAME boundary (engine==claude && source==dynamic && !linux-user-isolation-
+# effective) the launch/config-dir/quarantine sites use, so a shared-mode
+# dynamic Claude on a Linux v2-active host (iso NOT effective for this agent)
+# is correctly classified vanilla, while an iso-effective agent keeps the
+# legacy resolver path (codex review finding 2).
+_DYN_VANILLA_CLAUDE=0
+if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+   && bridge_agent_is_dynamic_vanilla_claude "$NAME"; then
+  _DYN_VANILLA_CLAUDE=1
+fi
+
+# Issue #1890 (constraint #8): visible same-workdir concurrency warning. A
+# dynamic Claude agent uses the operator-global Claude config + native
+# `claude -c`, so sharing this workdir with a human Claude session may continue
+# that human session. WARN (not block) — a hard heuristic guard would recreate
+# the brittle direct-detect class #1890 removed.
+if [[ "$_DYN_VANILLA_CLAUDE" -eq 1 ]]; then
+  echo "[info] '$NAME' is a dynamic Claude agent: it uses your operator-global Claude config (~/.claude) and native 'claude --continue'." >&2
+  echo "[warn] Sharing this workdir ($WORKDIR) with your own Claude session may continue that human session. Use a dedicated workdir/worktree (--prefer new) for isolation." >&2
+fi
+
+if [[ $CONTINUE_MODE -eq 1 && -f "$HISTORY_FILE" && $_DYN_VANILLA_CLAUDE -eq 0 ]]; then
+  AGENT_SESSION_ID=""
+  # shellcheck source=/dev/null
+  source "$HISTORY_FILE"
+  # Gate the stored id through the freshness resolver. rc=0 keeps it,
+  # rc=2 swaps in a fresher in-window transcript for the same workdir,
+  # anything else means start fresh (no --resume). This is the dynamic
+  # ad-hoc analogue of the hydration sites in lib/bridge-state.sh.
+  _RESUME_RC=0
+  SESSION_ID="$(bridge_resolve_resume_session_id "$ENGINE" "$NAME" "$WORKDIR" "${AGENT_SESSION_ID:-}" 2>/dev/null)" || _RESUME_RC=$?
+  case "$_RESUME_RC" in
+    0|2) ;;
+    *)   SESSION_ID="" ;;
+  esac
+  unset _RESUME_RC
+fi
+unset _DYN_VANILLA_CLAUDE
+
 # shellcheck disable=SC2034
 BRIDGE_AGENT_SESSION_ID["$NAME"]="$SESSION_ID"
 # shellcheck disable=SC2034

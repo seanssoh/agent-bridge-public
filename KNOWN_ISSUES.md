@@ -1011,3 +1011,32 @@ to guess the outcome from a DB it cannot read:
   `scripts/smoke/1833-status-gateway-timeout-not-down.sh`.
 
 This is the client contract only; the daemon's write path is unchanged.
+
+## 35. Dynamic Claude agents share the operator-global Claude config + native `claude -c` resume (#1890)
+
+A **dynamic** Claude agent (`agent-bridge --name <x> --workdir <p>`, `source ==
+dynamic`, non-iso) now runs as **vanilla Claude Code + the bridge comms layer
+only**: it inherits the operator/user global `~/.claude` (settings, model,
+session history, installed plugins, MCP, credentials), resumes via native
+`claude --continue` (NEVER the bridge's `--resume <id>`), and gets no private
+`CLAUDE_CONFIG_DIR`. The bridge adds only its queue/messaging hooks, written to
+the project-local `<workdir>/.claude/settings.local.json` (operator keys
+preserved, `.git/info/exclude`-guarded). **Static / admin agents are
+unchanged** — they keep their per-agent config dir, bridge `--resume`, and
+managed `<workdir>/.claude/settings.json`.
+
+Consequence to be aware of (by design, not a bug): because dynamic Claude uses
+the operator-global config and native `claude -c`, **sharing one workdir
+between a human's vanilla Claude session and a dynamic bridge Claude session can
+let `claude -c` continue the human's most-recent conversation** (vanilla
+workdir-keyed resume). This is non-destructive — it never moves or quarantines a
+transcript — but it can cross sessions. Give each dynamic agent its **own
+workdir / worktree** (`--prefer new`) when you need isolation from a concurrent
+human Claude session in the same directory. The bridge intentionally does NOT
+add a hard concurrency guard here: a heuristic same-workdir detector would
+recreate exactly the brittle direct-session-detection class #1890 removed.
+
+This supersedes #1889's private-config-dir + ownership-scoped-quarantine
+approach **for dynamic Claude** (safety is now "no destructive machinery", not
+"isolation"); #1889's static/admin protections and the realpath containment
+stay. Regression smoke: `scripts/smoke/1890-dynamic-vanilla-claude.sh`.

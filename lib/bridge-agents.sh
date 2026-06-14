@@ -907,6 +907,38 @@ bridge_agent_source() {
   printf '%s' "${BRIDGE_AGENT_SOURCE[$agent]-static}"
 }
 
+# Issue #1890: the ONE boundary for the "dynamic Claude = vanilla Claude Code +
+# bridge comms only" contract. True (rc 0) iff this agent is a DYNAMIC CLAUDE
+# agent that is NOT linux-user-isolated (iso v2). Everything else — static /
+# admin Claude, any Codex agent, and iso-v2 Claude agents on Linux — returns
+# non-zero and keeps ALL pre-#1890 behavior (private CLAUDE_CONFIG_DIR, bridge
+# session-id resume / `--resume <id>`, transcript quarantine, managed
+# `.claude/settings.json`).
+#
+# Why these three terms and nothing else (codex consensus constraint #1):
+#   - engine == claude: the vanilla-Claude-Code contract is Claude-specific;
+#     Codex has its own resume/auth model and is untouched.
+#   - source == dynamic: static/admin agents are persistent isolated identities
+#     (own home / memory / model) and must stay isolated. Only ephemeral dynamic
+#     workers become "vanilla CC + bridge layer".
+#   - NOT iso-effective: an iso UID (agent-bridge-<a>) cannot read the operator's
+#     ~/.claude, so global passthrough is impossible there; Linux iso hosts keep
+#     the per-agent config-dir behavior. On macOS / shared-mode this term is
+#     always satisfied.
+# Do NOT widen this to infer from workdir location, shared-mode, or agent name —
+# that was the brittle direct-detect class #1890 removes.
+bridge_agent_is_dynamic_vanilla_claude() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  [[ "$(bridge_agent_engine "$agent" 2>/dev/null || true)" == "claude" ]] || return 1
+  [[ "$(bridge_agent_source "$agent" 2>/dev/null || true)" == "dynamic" ]] || return 1
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+     && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
 # Issue #598 Track 1: which loader path made this agent id known.
 # Closed value space: {static-roster, dynamic-active-env,
 # dynamic-history-live-session, dynamic-tmux-recovered}. Falls back to
@@ -6030,6 +6062,15 @@ bridge_ensure_claude_first_run_config() {
 
   engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
   [[ "$engine" == "claude" ]] || return 0
+
+  # Issue #1890: dynamic vanilla Claude reuses the operator's already-onboarded
+  # ~/.claude (same rationale the admin path relies on) — there is no per-agent
+  # config dir to pre-seed. Skip so we never scaffold an unused per-agent
+  # .claude.json for a passthrough agent.
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    return 0
+  fi
 
   config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
   [[ -n "$config_dir" ]] || return 0

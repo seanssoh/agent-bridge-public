@@ -206,6 +206,139 @@ bridge_claude_settings_mode() {
   printf 'local'
 }
 
+# Issue #1890: resolve the local-mode bridge-hook settings target for
+# <workdir> [<agent>]. For a DYNAMIC VANILLA CLAUDE agent (engine==claude &&
+# source==dynamic && !iso) the bridge comms hooks go in
+# `<workdir>/.claude/settings.local.json` (project-LOCAL scope) — NOT the managed
+# `<workdir>/.claude/settings.json`. Claude Code merges user→project→project-
+# local and merges hooks additively, so the operator-global ~/.claude
+# (settings/model/plugins/MCP) is inherited while the bridge layer rides the
+# local overlay. Echoes the settings.local.json path for a dynamic Claude agent;
+# echoes nothing otherwise (callers keep the bridge-hooks.py `--workdir` default
+# = settings.json, so static managed rendering is unchanged).
+#
+# Decision keys on the CURRENT agent's predicate (codex review finding 3): when
+# the caller passes the agent id (every start/upgrade/run caller does), route on
+# THAT agent only — a static/admin agent sharing a workdir with a dynamic agent
+# is NEVER redirected. The workdir-scan fallback (no agent id given) is retained
+# only for back-compat callers, and it still requires a dynamic-vanilla match.
+bridge_claude_dynamic_local_settings_target() {
+  local workdir="$1"
+  local explicit_agent="${2-}"
+  local agent="" agent_workdir=""
+  [[ -n "$workdir" ]] || return 0
+  command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 || return 0
+
+  if [[ -n "$explicit_agent" ]]; then
+    if bridge_agent_is_dynamic_vanilla_claude "$explicit_agent"; then
+      printf '%s/.claude/settings.local.json' "$workdir"
+    fi
+    return 0
+  fi
+
+  # Back-compat: no agent id. Fall back to a workdir scan, still gated on the
+  # dynamic-vanilla predicate so a static-only workdir is never redirected.
+  declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 || return 0
+  for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+    bridge_agent_is_dynamic_vanilla_claude "$agent" || continue
+    agent_workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+    [[ -n "$agent_workdir" ]] || continue
+    if [[ "$(bridge_hook_paths_equal "$workdir" "$agent_workdir")" == "1" ]]; then
+      printf '%s/.claude/settings.local.json' "$workdir"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Issue #1890 (constraints #6): prepare `<workdir>/.claude/settings.local.json`
+# before the bridge merges its hook entries into it. The merge itself (in
+# bridge-hooks.py) is additive + marker/predicate-based and preserves operator
+# keys, so this helper only handles the file-level guards:
+#   - LOUD FAIL if the file is already git-TRACKED (refuse to silently modify a
+#     committed operator file — return 1 so the caller aborts the hook write).
+#   - git-ignore guard: ensure `.claude/settings.local.json` is ignored via
+#     `.git/info/exclude` (local-only; never a committed repo .gitignore change)
+#     so the bridge-created file does not show up as an untracked change in the
+#     operator's repo.
+#   - Outside a git repo: create the parent + an empty `{}` file at 0600.
+# Idempotent. Returns 0 when the target is safe to write, 1 to abort.
+bridge_claude_prepare_dynamic_local_settings() {
+  local target="$1"
+  local workdir="" claude_dir="" rel="" git_top="" exclude_file=""
+  [[ -n "$target" ]] || return 0
+  claude_dir="$(dirname "$target")"
+  workdir="$(dirname "$claude_dir")"
+
+  # Resolve the enclosing git worktree (if any) from the workdir.
+  git_top="$(git -C "$workdir" rev-parse --show-toplevel 2>/dev/null || true)"
+
+  if [[ -n "$git_top" ]]; then
+    # LOUD FAIL: refuse to modify a tracked settings.local.json.
+    if git -C "$workdir" ls-files --error-unmatch -- "$target" >/dev/null 2>&1; then
+      bridge_warn "[#1890] $target is git-TRACKED — refusing to write bridge hooks into a committed operator file. Move it aside (or 'git rm --cached') and restart the agent."
+      return 1
+    fi
+    # git-ignore guard via .git/info/exclude (local-only). Compute the path
+    # relative to the worktree top via `git rev-parse --show-prefix` (robust to
+    # macOS /private vs /var symlink differences between $workdir and the
+    # realpath'd $git_top) + the fixed `.claude/settings.local.json` suffix.
+    local _prefix=""
+    _prefix="$(git -C "$workdir" rev-parse --show-prefix 2>/dev/null || true)"
+    rel="${_prefix}.claude/settings.local.json"
+    exclude_file="$git_top/.git/info/exclude"
+    # In a linked worktree .git is a file pointer; resolve the real git dir.
+    if [[ -f "$git_top/.git" ]]; then
+      local real_gitdir=""
+      real_gitdir="$(git -C "$workdir" rev-parse --git-common-dir 2>/dev/null || true)"
+      [[ -n "$real_gitdir" ]] && exclude_file="$real_gitdir/info/exclude"
+    fi
+    if [[ -n "$rel" && -n "$exclude_file" ]]; then
+      mkdir -p "$(dirname "$exclude_file")" 2>/dev/null || true
+      if [[ ! -f "$exclude_file" ]] || ! grep -qxF "$rel" "$exclude_file" 2>/dev/null; then
+        printf '%s\n' "$rel" >> "$exclude_file" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  # Create the parent + a seed file if absent. Outside git (and in git too) the
+  # bridge owns this file; seed an empty object at 0600 so the python merge has
+  # a valid JSON root to fold its hook entries into, and so an operator who runs
+  # vanilla `claude` here does not inherit a stray world-readable file.
+  mkdir -p "$claude_dir" 2>/dev/null || true
+  if [[ ! -e "$target" ]]; then
+    ( umask 0177; printf '{}\n' > "$target" ) 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Issue #1890: resolve the local-mode bridge-hooks.py target args for <workdir>
+# into the caller-named array (arg $2, default BRIDGE_LOCAL_HOOK_TARGET_ARGS).
+# For a dynamic vanilla Claude workdir the array becomes
+# (--settings-file <workdir>/.claude/settings.local.json) after the file-level
+# prepare guard runs; for every other workdir it is the unchanged
+# (--workdir <workdir>) (bridge-hooks.py default = settings.json). Returns
+# non-zero ONLY when the dynamic target is git-tracked and must not be clobbered
+# — the caller then skips the hook write loudly. Each ensure/status helper's
+# local branch routes through this so the dynamic redirect lives in ONE place
+# and static managed rendering is byte-for-byte unchanged.
+bridge_claude_local_hook_target_args() {
+  local workdir="$1"
+  local _outvar="${2:-BRIDGE_LOCAL_HOOK_TARGET_ARGS}"
+  local explicit_agent="${3-}"
+  local target=""
+  target="$(bridge_claude_dynamic_local_settings_target "$workdir" "$explicit_agent")"
+  if [[ -n "$target" ]]; then
+    bridge_claude_prepare_dynamic_local_settings "$target" || return 1
+    # shellcheck disable=SC2086 # eval-assign a 2-element array to the named out var
+    eval "$_outvar=(--settings-file \"\$target\")"
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  eval "$_outvar=(--workdir \"\$workdir\")"
+  return 0
+}
+
 bridge_ensure_claude_shared_settings_for_managed_workdir() {
   local workdir="$1"
   local launch_cmd="${2-}"
@@ -480,46 +613,56 @@ bridge_ensure_claude_project_trust() {
 
 bridge_claude_stop_hook_status() {
   local workdir="$1"
+  local agent="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python status-stop-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN"
   else
-    bridge_hooks_python status-stop-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python status-stop-hook "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN"
   fi
 }
 
 bridge_claude_session_start_hook_status() {
   local workdir="$1"
+  local agent="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python status-session-start-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   else
-    bridge_hooks_python status-session-start-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python status-session-start-hook "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi
 }
 
 bridge_claude_prompt_hook_status() {
   local workdir="$1"
+  local agent="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python status-prompt-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN"
   else
-    bridge_hooks_python status-prompt-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python status-prompt-hook "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN"
   fi
 }
 
 bridge_claude_prompt_guard_hook_status() {
   local workdir="$1"
+  local agent="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python status-prompt-guard-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   else
-    bridge_hooks_python status-prompt-guard-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python status-prompt-guard-hook "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi
 }
 
 bridge_claude_tool_policy_hooks_status() {
   local workdir="$1"
+  local agent="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python status-tool-policy-hooks --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   else
-    bridge_hooks_python status-tool-policy-hooks --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python status-tool-policy-hooks "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi
 }
 
@@ -533,7 +676,8 @@ bridge_ensure_claude_stop_hook() {
     bridge_hooks_python ensure-stop-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --bash-bin bash >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
-    bridge_hooks_python ensure-stop-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python ensure-stop-hook "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN"
   fi
 }
 
@@ -545,7 +689,8 @@ bridge_ensure_claude_session_start_hook() {
     bridge_hooks_python ensure-session-start-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
-    bridge_hooks_python ensure-session-start-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python ensure-session-start-hook "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
@@ -557,7 +702,8 @@ bridge_ensure_claude_prompt_hook() {
     bridge_hooks_python ensure-prompt-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --bash-bin bash --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
-    bridge_hooks_python ensure-prompt-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN" --python-bin "$(bridge_hook_pinned_python_bin)"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python ensure-prompt-hook "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
@@ -569,7 +715,8 @@ bridge_ensure_claude_prompt_guard_hook() {
     bridge_hooks_python ensure-prompt-guard-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
-    bridge_hooks_python ensure-prompt-guard-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python ensure-prompt-guard-hook "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
@@ -581,7 +728,8 @@ bridge_ensure_claude_tool_policy_hooks() {
     bridge_hooks_python ensure-tool-policy-hooks --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
-    bridge_hooks_python ensure-tool-policy-hooks --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python ensure-tool-policy-hooks "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
@@ -601,7 +749,8 @@ bridge_ensure_claude_pre_compact_hook() {
     bridge_hooks_python ensure-pre-compact-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
-    bridge_hooks_python ensure-pre-compact-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python ensure-pre-compact-hook "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
@@ -624,7 +773,8 @@ bridge_ensure_hud_usage_tap() {
       bridge_install_isolated_home_settings "$agent" "$launch_cmd" >/dev/null 2>&1 || true
     fi
   else
-    bridge_hooks_python ensure-hud-usage-tap --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python ensure-hud-usage-tap "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
   fi
 }
 
