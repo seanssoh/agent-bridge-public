@@ -1526,7 +1526,9 @@ def cmd_agent_doc_backfill_non_clean(args: argparse.Namespace) -> int:
     summary = _load_json_file(args.summary_json) or {}
     non_clean = False
     if isinstance(summary, dict):
-        for key in ("backfilled", "refreshed", "errors"):
+        # #1892: `held` (roster/heuristic engine disagreement) is non-clean too,
+        # so the operator gets a visible warning instead of a silent skip.
+        for key in ("backfilled", "refreshed", "held", "errors"):
             if summary.get(key):
                 non_clean = True
                 break
@@ -1548,6 +1550,7 @@ def cmd_agent_doc_backfill_task_body(args: argparse.Namespace) -> int:
 
     backfilled = summary.get("backfilled") or []
     refreshed = summary.get("refreshed") or []
+    held = summary.get("held") or []
     errors = summary.get("errors") or []
     checked = summary.get("codex_agents_checked", "?")
 
@@ -1582,6 +1585,28 @@ def cmd_agent_doc_backfill_task_body(args: argparse.Namespace) -> int:
                          "template; custom contract below the marker preserved.")
         lines.append("")
 
+    if held:
+        lines.append(f"## Held — engine disagreement, NOT backfilled ({len(held)})")
+        lines.append(
+            "The roster-declared engine and the filesystem heuristic disagreed "
+            "(or the engine could not be authoritatively resolved). The pass "
+            "held the codex AGENTS.md materialization fail-closed rather than "
+            "risk writing the wrong template onto a non-codex agent (#1892). "
+            "**Action**: confirm the agent's intended engine in the roster; if it "
+            "is genuinely codex, the next pass will backfill once the roster "
+            "declares it. Do NOT hand-create a codex AGENTS.md on a claude agent."
+        )
+        for h in held:
+            if isinstance(h, dict):
+                lines.append(
+                    f"- `{h.get('agent', '')}` — roster_engine="
+                    f"{h.get('roster_engine', 'unknown')}, "
+                    f"detected={h.get('detected_engine', '')}: {h.get('reason', '')}"
+                )
+            else:
+                lines.append(f"- {h}")
+        lines.append("")
+
     if errors:
         lines.append(f"## Errors ({len(errors)})")
         for e in errors:
@@ -1592,9 +1617,10 @@ def cmd_agent_doc_backfill_task_body(args: argparse.Namespace) -> int:
         lines.append("")
 
     lines.append(
-        "No action needed — this is an FYI that the runtime closed a standing "
+        "Backfilled/refreshed rows are an FYI that the runtime closed a standing "
         "`missing_files: AGENTS.md` watchdog gap. The same backfill runs on "
-        "`agent-bridge upgrade`."
+        "`agent-bridge upgrade`. Held rows need an operator engine-confirmation "
+        "(see above)."
     )
     print("\n".join(lines).rstrip() + "\n")
     return 0
