@@ -266,6 +266,17 @@ bridge_claude_resume_session_id_for_agent() {
   local workdir=""
   local _quarantine_csv=""
 
+  # #1890: a dynamic vanilla Claude agent never carries a bridge-managed
+  # session id — it resumes purely via native `claude -c` against the
+  # operator-global ~/.claude. The detector would otherwise fall back to
+  # $HOME/.claude (the config-dir resolver returns empty for this class)
+  # and capture the OPERATOR's live session id. Hard no-op: emit nothing,
+  # rc 1, so no caller can persist an operator-global id into bridge state.
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    return 1
+  fi
+
   [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 1
 
   workdir="$(bridge_agent_workdir "$agent")"
@@ -318,6 +329,16 @@ bridge_normalize_agent_session_id() {
   local engine=""
   local workdir=""
   local session_id=""
+
+  # #1890: dynamic vanilla Claude never participates in bridge-managed
+  # resume normalization. It holds no bridge session id and must never
+  # touch the resolver (which would re-detect the operator-global session).
+  # Hard no-op so the resume-mode/safe-mode classifiers fall through to
+  # native `claude -c`.
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    return 0
+  fi
 
   engine="$(bridge_agent_engine "$agent")"
   workdir="$(bridge_agent_workdir "$agent")"
@@ -4286,7 +4307,21 @@ bridge_persist_agent_state() {
   _bridge_persist_agent_state_locked() {
     local _inner_rc=0
 
-    if [[ "${BRIDGE_SKIP_EMPTY_SESSION_ID_PERSIST_GUARD:-0}" != "1" ]]; then
+    # #1890: the empty-session-id-persist guard (#1305) rehydrates a persisted
+    # id when the in-memory id is empty, to avoid clobbering a sibling's write.
+    # A dynamic vanilla Claude agent must NEVER hold a bridge-managed id, so for
+    # this class an empty in-memory id is AUTHORITATIVE — skip the rehydrate so
+    # a stale id left in a pre-fix history env file is written through (cleared)
+    # instead of resurrected. The detector/resolver chokepoints already prevent
+    # a non-empty id from ever entering memory for this class; this closes the
+    # persist-time back door. Static/admin/Codex keep the #1305 race guard.
+    local _is_dyn_vanilla=0
+    if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+       && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+      _is_dyn_vanilla=1
+    fi
+    if [[ "$_is_dyn_vanilla" != "1" \
+          && "${BRIDGE_SKIP_EMPTY_SESSION_ID_PERSIST_GUARD:-0}" != "1" ]]; then
       local _in_mem_sid=""
       _in_mem_sid="${BRIDGE_AGENT_SESSION_ID[$agent]-}"
       if [[ -z "$_in_mem_sid" ]]; then
@@ -4595,6 +4630,25 @@ bridge_resolve_resume_session_id() {
   fi
   [[ -n "$workdir" ]] || return 1
 
+  # #1890: a dynamic vanilla Claude agent must never have its session id
+  # resolved against a transcript scan. Its config-dir resolver returns empty,
+  # so the helper would fall back to the operator-global $HOME/.claude and could
+  # swap in (rc=2) a fresh OPERATOR transcript. This is the single chokepoint
+  # every resolver caller funnels through — the function-level guards in
+  # bridge_refresh/bridge_claude_resume/bridge_normalize and the bridge-sync
+  # backfill loop, plus the direct dynamic-agent hydration loaders
+  # (bridge_load_dynamic_agent_file / _from_history / _from_tmux) — so gating
+  # here is the defense-in-depth net. Resolve to EMPTY unconditionally (never
+  # echo the candidate): this class holds no bridge-managed id, and a stale id
+  # left in a pre-fix history env file or carried in via a restart snapshot must
+  # NOT be preserved. rc 0 keeps the hydration `case 0|2)` arm, which then stores
+  # the empty result. Static/admin and Codex paths are untouched.
+  if [[ -n "$agent" ]] \
+     && command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    return 0
+  fi
+
   # The python body lives in a file rather than an inline heredoc-stdin
   # for the same reason bridge_detect_claude_session_id does — see issue
   # #827 / #815 / #800. The live-session shortcut (issue #827) and the
@@ -4820,6 +4874,17 @@ bridge_refresh_agent_session_id() {
   local -a excluded=()
   local -a extra_excluded=()
   local other try_index extra
+
+  # #1890: dynamic vanilla Claude is a hard no-op here. The detector falls
+  # back to $HOME/.claude (the config-dir resolver returns empty for this
+  # class) and would capture + PERSIST the operator-global session id into
+  # BRIDGE_AGENT_SESSION_ID. This class resumes only via native `claude -c`,
+  # so never run detection and never persist an id. rc 1 = no id (matches the
+  # detect-empty contract callers already handle). Static/admin unchanged.
+  if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+     && bridge_agent_is_dynamic_vanilla_claude "$agent"; then
+    return 1
+  fi
 
   sid="$(bridge_agent_session_id "$agent")"
   if [[ -n "$sid" ]]; then

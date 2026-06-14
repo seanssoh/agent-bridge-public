@@ -2435,6 +2435,17 @@ while true; do
     if [[ "$ENGINE" == "codex" && "${BRIDGE_CODEX_UNMANAGED_AUTH:-0}" != "1" ]]; then
       _v2_codex_scrub="OPENAI_API_KEY CODEX_ACCESS_TOKEN"
     fi
+    # #1890: a dynamic vanilla Claude agent must inherit the operator-global
+    # ~/.claude, so it must NOT receive a per-agent CLAUDE_CONFIG_DIR from any
+    # source. The v2 secret-env loader exports launch-secrets.env rows verbatim,
+    # and that file may still carry a (non-secret) CLAUDE_CONFIG_DIR pointer from
+    # a prior managed-Claude config. Add it to the post-loader scrub list (mirror
+    # of the Codex ambient-key scrub) so the child cannot inherit a private
+    # config dir. Static/admin Claude + Codex paths keep their config dir.
+    if command -v bridge_agent_is_dynamic_vanilla_claude >/dev/null 2>&1 \
+       && bridge_agent_is_dynamic_vanilla_claude "$AGENT"; then
+      _v2_codex_scrub="${_v2_codex_scrub:+$_v2_codex_scrub }CLAUDE_CONFIG_DIR"
+    fi
     BRIDGE_ISOLATION_V2_LAST_EXEC_RC=0
     bridge_isolation_v2_exec_with_secret_env \
       "$_v2_secret_file" "$BRIDGE_BASH_BIN" "$LAUNCH_CMD" "$ERRFILE" "$AGENT" "$_v2_codex_scrub"
