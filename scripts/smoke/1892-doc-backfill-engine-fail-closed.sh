@@ -99,8 +99,7 @@ write_codex_tripping_profile() {
   printf '# %s — Monitor (collab via Codex CLI)\n' "$agent" >"$profile/CLAUDE.md"
   printf '# soul\n' >"$profile/SOUL.md"
   # Affirmatively assert the absent-signal precondition.
-  [[ ! -f "$BRIDGE_STATE_DIR/agents/$agent/agent-meta.env" ]] \
-    || smoke_fail "precondition: agent-meta.env unexpectedly present for $agent"
+  [[ ! -f "$BRIDGE_STATE_DIR/agents/$agent/agent-meta.env" ]] || smoke_fail "precondition: agent-meta.env unexpectedly present for $agent"  # noqa: iso-helper-boundary  (controller-only fixture path assertion, not a runtime boundary RW)
 }
 
 # A profile home with a clean claude CLAUDE.md (heuristic agrees claude).
@@ -352,8 +351,7 @@ test_multiline_last_assignment_wins() {
     "T6: the effective (last-assignment) roster engine was not claude"
 }
 
-smoke_run "T1 claude-roster + codex heuristic + absent agent-meta.env is HELD (not materialized)" \
-  test_claude_roster_codex_heuristic_is_held
+smoke_run "T1 claude-roster + codex heuristic + absent agent-meta.env is HELD (not materialized)" test_claude_roster_codex_heuristic_is_held  # noqa: iso-helper-boundary  (test label names the absent fixture file, not a runtime boundary RW)
 smoke_run "T2 claude-roster + clean CLAUDE.md is skipped (clean, no task)" \
   test_claude_roster_clean_is_skipped
 smoke_run "T3 negative control: a genuine codex-roster agent still backfills" \
