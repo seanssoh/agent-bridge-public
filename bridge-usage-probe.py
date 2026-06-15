@@ -62,6 +62,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -283,15 +284,31 @@ class ProbeHTTPError(Exception):
 
 
 def _parse_retry_after(value: str | None) -> float | None:
+    # RFC 7231: Retry-After is EITHER a delta-seconds integer OR an HTTP-date.
+    # The delta-seconds form is the common case; the HTTP-date form (e.g.
+    # "Fri, 12 Jun 2026 06:46:49 GMT") must also be honored — converted to a
+    # non-negative seconds-from-now — or a server-stated window sent as a date is
+    # silently dropped (#1832 review finding; falls back to schedule backoff).
     if not value:
         return None
+    value = value.strip()
     try:
-        seconds = float(value.strip())
+        seconds = float(value)
     except (TypeError, ValueError):
+        seconds = None
+    if seconds is not None:
+        return seconds if seconds >= 0 else None
+    # HTTP-date form.
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
         return None
-    if seconds < 0:
+    if when is None:
         return None
-    return seconds
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delta = (when - datetime.now(timezone.utc)).total_seconds()
+    return delta if delta >= 0 else 0.0
 
 
 def _http_get_usage(
