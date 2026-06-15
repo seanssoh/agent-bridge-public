@@ -103,9 +103,12 @@ run_helper() {
 }
 
 # Run a helper with NO canonical detector in scope — this exercises the INLINE
-# `systemctl --user is-active` fallback, which is the REAL production path
-# (lib/bridge-daemon-control.sh is not sourced by bridge-upgrade.sh). The
-# is-active outcome is controlled via IS_ACTIVE_RC_FILE. $1 = helper.
+# `systemctl --user is-active` fallback (the defensive belt-and-suspenders path
+# for when lib/bridge-daemon-control.sh is not sourced). In production
+# bridge-upgrade.sh DOES source that module (via bridge-lib.sh), so the
+# canonical detector exercised in T1/T3 is the normal path and this inline
+# fallback is the safety net. The is-active outcome is controlled via
+# IS_ACTIVE_RC_FILE. $1 = helper.
 run_helper_inline_fallback() {
   local fn="$1"
   PATH="$SHIM_DIR:$PATH" "$BRIDGE_BASH" -c "
@@ -157,12 +160,14 @@ smoke_assert_eq "0" "$NS_COUNT" "T3 non-systemd quiesce (canonical detector fals
 smoke_log "T3 PASS: non-systemd path (canonical detector) makes zero systemctl calls (unchanged behavior)"
 
 # --- T4: INLINE-fallback path, service INACTIVE → ZERO MUTATING calls ---------
-# The REAL production path: bridge-upgrade.sh does NOT source
-# lib/bridge-daemon-control.sh, so the gate uses the inline
-# `systemctl --user is-active` fallback. With the service inactive the quiesce
-# helper must make ONLY the read-only is-active probe and ZERO mutating
-# (stop/start) calls — i.e. a non-systemd / inactive install is behaviorally
-# unchanged (no daemon-unit state is touched).
+# The defensive fallback: when lib/bridge-daemon-control.sh is NOT in scope the
+# gate uses the inline `systemctl --user is-active` check instead of the
+# canonical detector. (In production bridge-upgrade.sh sources that module via
+# bridge-lib.sh, so this fallback is belt-and-suspenders — but it must still be
+# correct.) With the service inactive the quiesce helper must make ONLY the
+# read-only is-active probe and ZERO mutating (stop/start) calls — i.e. a
+# non-systemd / inactive install is behaviorally unchanged (no daemon-unit
+# state is touched).
 : >"$SYSTEMCTL_LOG"
 printf '1' >"$IS_ACTIVE_RC_FILE"   # is-active → inactive
 run_helper_inline_fallback _bridge_upgrade_systemd_quiesce_daemon
@@ -175,7 +180,7 @@ smoke_log "T4 PASS: inline-fallback inactive path probes is-active only, zero mu
 
 # --- T5: INLINE-fallback path, service ACTIVE → timer-then-service stop -------
 # Same inline fallback, but is-active → active: the quiesce helper must now
-# stop the liveness TIMER then the SERVICE (proving the real production gate
+# stop the liveness TIMER then the SERVICE (proving the inline fallback gate
 # also drives the fix, not just the canonical-detector path).
 : >"$SYSTEMCTL_LOG"
 printf '0' >"$IS_ACTIVE_RC_FILE"   # is-active → active
