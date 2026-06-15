@@ -1806,6 +1806,88 @@ bridge_with_timeout() {
   return $?
 }
 
+# ---------------------------------------------------------------------------
+# Issue #1738 (SECURITY) — controller-published config-caller binding.
+#
+# `bridge-config.py` (the #341 `config set` / `config set-env` write gate) must
+# NOT trust env-declared identity. The controller publishes a per-agent record
+# carrying the tmux `pane_pid` of the launched session; the wrapper walks its
+# OWN process ancestry and matches the parent chain against `pane_pid` (a shell
+# cannot set its own parent pid). bridge-start.sh calls the writer immediately
+# after `tmux new-session` succeeds.
+#
+# Integrity model: the record is published under controller-owned `state/`, so
+# on linux-user isolation an iso agent UID cannot overwrite it (file is
+# 0644-readable, dir not agent-writable). On a shared-UID install the file is
+# owned by the same OS user the agent runs as and is therefore best-effort —
+# this still closes the verified env-spoof / indirection path for normal
+# agent-command descendants (documented honest caveat in bridge-config.py).
+bridge_config_caller_bindings_dir() {
+  printf '%s/config-caller-bindings' "$BRIDGE_STATE_DIR"
+}
+
+bridge_config_caller_binding_file() {
+  local agent="$1"
+  printf '%s/%s.json' "$(bridge_config_caller_bindings_dir)" "$agent"
+}
+
+# Publish (or refresh) the binding for $1=agent given $2=pane_pid, $3=engine.
+# pane_pid must be a positive integer; a non-integer is a no-op (the wrapper
+# treats a missing/stale binding as fail-closed, so a failed publish denies
+# rather than mis-authorizes). Writes atomically at mode 0644.
+bridge_publish_config_caller_binding() {
+  local agent="$1"
+  local pane_pid="$2"
+  local engine="${3:-}"
+  local bindings_dir="" target="" tmp="" admin="" session="" updated_at=""
+
+  [[ -n "$agent" ]] || return 0
+  [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 0
+
+  bindings_dir="$(bridge_config_caller_bindings_dir)"
+  mkdir -p "$bindings_dir" 2>/dev/null || return 0
+  # 0711: an iso UID can traverse to read its own 0644 record by exact path but
+  # cannot list the dir; on shared-UID this is a normal traversable dir.
+  chmod 0711 "$bindings_dir" 2>/dev/null || true
+
+  admin="$(bridge_admin_agent_id 2>/dev/null || true)"
+  session="$(bridge_agent_session "$agent" 2>/dev/null || true)"
+  updated_at="$(bridge_now_iso 2>/dev/null || true)"
+  target="$(bridge_config_caller_binding_file "$agent")"
+  tmp="${target}.tmp.$$"
+
+  bridge_require_python
+  # Build the JSON with python so values are safely escaped (file-as-argv, no
+  # heredoc-stdin — footgun #11 / lint-heredoc-ban).
+  if BRIDGE_BIND_AGENT="$agent" \
+     BRIDGE_BIND_ADMIN="$admin" \
+     BRIDGE_BIND_SESSION="$session" \
+     BRIDGE_BIND_PANE_PID="$pane_pid" \
+     BRIDGE_BIND_ENGINE="$engine" \
+     BRIDGE_BIND_UPDATED="$updated_at" \
+     BRIDGE_BIND_TMP="$tmp" \
+     python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/config-caller-binding-write.py"; then
+    if mv -f "$tmp" "$target" 2>/dev/null; then
+      chmod 0644 "$target" 2>/dev/null || true
+      return 0
+    fi
+  fi
+  rm -f "$tmp" 2>/dev/null || true
+  return 0
+}
+
+# Remove the published binding for $1=agent (session stopped / replaced). The
+# wrapper fails closed on a missing binding, so a removed record simply denies
+# any further env-spoofed mutation attempt for that agent.
+bridge_remove_config_caller_binding() {
+  local agent="$1"
+  local target=""
+  [[ -n "$agent" ]] || return 0
+  target="$(bridge_config_caller_binding_file "$agent")"
+  rm -f "$target" 2>/dev/null || true
+  return 0
+}
+
 bridge_mcp_orphan_cleanup_state_dir() {
   printf '%s/mcp-orphan-cleanup' "$BRIDGE_STATE_DIR"
 }

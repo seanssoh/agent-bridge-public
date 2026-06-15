@@ -80,6 +80,23 @@ roster_sha() {
 }
 ROSTER_SHA_BEFORE="$(roster_sha)"
 
+# Issue #1738: the wrapper now authorizes from a controller-published pane
+# binding matched against its own process ancestry, NOT from env identity. The
+# wrapper subprocess is a descendant of THIS smoke shell ($$), so a binding
+# whose pane_pid == $$ matches its ancestry — that is how we drive the positive
+# admin path here (in production the controller publishes pane_pid after
+# `tmux new-session`). Negative controls publish NO binding (or a non-admin
+# one), so the env-trust spoof shapes stay denied.
+BINDINGS_DIR="$BRIDGE_STATE_DIR/config-caller-bindings"
+mkdir -p "$BINDINGS_DIR"
+seed_admin_binding() {
+  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
+    "$ADMIN_AGENT" "$ADMIN_AGENT" "$$" >"$BINDINGS_DIR/$ADMIN_AGENT.json"
+}
+clear_bindings() {
+  rm -f "$BINDINGS_DIR"/*.json 2>/dev/null || true
+}
+
 # --- Wrapper plumbing -------------------------------------------------------
 
 # Run the wrapper with a chosen caller agent + source. Echoes rc on a trailing
@@ -253,8 +270,12 @@ fi
 smoke_log "ok: no managed file created by any denied attempt"
 
 # ===========================================================================
-# SECTION 2 — WRAPPER positive: allowed key by admin/operator-TTY applies.
+# SECTION 2 — WRAPPER positive: allowed key by admin pane-binding applies.
 # ===========================================================================
+
+# Issue #1738: publish a matching admin pane binding so the wrapper's ancestry
+# check authorizes the admin path (env identity alone no longer does).
+seed_admin_binding
 
 : >"$BRIDGE_AUDIT_LOG"
 rc="$(run_wrapper "$ADMIN_AGENT" "operator-tui" "BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS=86400")"

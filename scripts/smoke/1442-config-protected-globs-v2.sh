@@ -37,6 +37,10 @@ fi
 
 BRIDGE_HOME="$(mktemp -d -t agb-1442-smoke.XXXXXX)"
 export BRIDGE_HOME
+# Issue #1738: pin BRIDGE_STATE_DIR under the isolated home so the wrapper's
+# config-caller-binding lookup does NOT leak to an ambient live BRIDGE_STATE_DIR
+# inherited from a bridge-managed session env.
+export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
 trap 'rm -rf "$BRIDGE_HOME"' EXIT
 
 ADMIN_AGENT="patch"
@@ -71,6 +75,15 @@ write_access_fixture "$PREV2_DISCORD_PATH"
 # A non-protected JSON sibling in the same workdir/.discord dir.
 printf '{"note": "not a protected file"}\n' >"$V2_NONPROTECTED_PATH"
 
+# Issue #1738: the wrapper now authorizes from a controller-published pane
+# binding matched against its own process ancestry (NOT env identity). The
+# wrapper subprocess is a descendant of THIS smoke shell ($$), so a binding
+# whose pane_pid == $$ matches its ancestry — that drives the admin path here.
+BINDINGS_DIR="$BRIDGE_HOME/state/config-caller-bindings"
+mkdir -p "$BINDINGS_DIR"
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$$" >"$BINDINGS_DIR/$ADMIN_AGENT.json"
+
 PASS=0
 FAIL=0
 FAILURES=()
@@ -87,15 +100,22 @@ fail() {
 }
 
 run_config() {
-  # Operator-attached TUI context + admin caller — the only context the
-  # #341 wrapper allows to mutate. Args after the env are passed to the
-  # wrapper verbatim.
+  # Admin pane-binding context (issue #1738) — the wrapper authorizes from the
+  # controller binding matched against this process's ancestry. `--from` is
+  # appended for the mutating verbs so the binding-agent identity is confirmed;
+  # `list-protected` ignores it. BRIDGE_AGENT_ID / BRIDGE_CALLER_SOURCE are kept
+  # to prove they no longer drive the decision (the binding does).
+  local verb="${1:-}"
+  local -a from_args=()
+  if [[ "$verb" == "set" || "$verb" == "set-env" ]]; then
+    from_args=(--from "$ADMIN_AGENT")
+  fi
   BRIDGE_HOME="$BRIDGE_HOME" \
     BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
     BRIDGE_CALLER_SOURCE="operator-tui" \
     BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
     BRIDGE_AGENT_ID="$ADMIN_AGENT" \
-    "$PYTHON" "$REPO_ROOT/bridge-config.py" "$@" </dev/null 2>&1 || true
+    "$PYTHON" "$REPO_ROOT/bridge-config.py" "$@" "${from_args[@]}" </dev/null 2>&1 || true
 }
 
 # --- Scenario 1: list-protected includes the v2 globs --------------------

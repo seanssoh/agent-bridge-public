@@ -48,6 +48,9 @@ fi
 
 BRIDGE_HOME="$(mktemp -d -t agb-341-smoke.XXXXXX)"
 export BRIDGE_HOME
+# Issue #1738: pin BRIDGE_STATE_DIR under the isolated home so the wrapper's
+# config-caller-binding lookup does not leak to an ambient live BRIDGE_STATE_DIR.
+export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
 trap 'rm -rf "$BRIDGE_HOME"' EXIT
 
 ADMIN_AGENT="patch"
@@ -58,6 +61,15 @@ AUDIT_LOG="$BRIDGE_HOME/logs/audit.jsonl"
 
 mkdir -p "$BRIDGE_HOME/agents/$ADMIN_AGENT/.discord"
 mkdir -p "$BRIDGE_HOME/logs"
+
+# Issue #1738: the wrapper authorizes from a controller pane binding matched
+# against its own process ancestry (NOT env identity). The wrapper subprocess is
+# a descendant of THIS smoke shell ($$), so a binding whose pane_pid == $$ drives
+# the admin path. Negative scenarios (non-admin / agent-direct) publish no
+# matching admin binding and stay denied.
+mkdir -p "$BRIDGE_HOME/state/config-caller-bindings"
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$$" >"$BRIDGE_HOME/state/config-caller-bindings/$ADMIN_AGENT.json"
 cat >"$ACCESS_PATH" <<'JSON'
 {
   "version": 1,
@@ -218,7 +230,8 @@ sce2_out="$(BRIDGE_HOME="$BRIDGE_HOME" \
   BRIDGE_AGENT_ID="$ADMIN_AGENT" \
   "$PYTHON" "$REPO_ROOT/bridge-config.py" set \
     --path "$ACCESS_PATH" \
-    --change "groups.append=12345" 2>&1 || true)"
+    --change "groups.append=12345" \
+    --from "$ADMIN_AGENT" 2>&1 || true)"
 after_sha="$("$PYTHON" -c "import hashlib,sys; sys.stdout.write(hashlib.sha256(open('$ACCESS_PATH','rb').read()).hexdigest())")"
 if [[ "$sce2_out" == applied:* ]] && [[ "$before_sha" != "$after_sha" ]]; then
   pass "scenario 2: wrapper applied groups.append=12345"
@@ -242,19 +255,27 @@ else
   fail "scenario 2: wrapper-apply audit row shape invalid — $sce2_shape_err"
 fi
 
-# --- Scenario 3: wrapper denial — non-admin caller ----------------------
+# --- Scenario 3: wrapper denial — non-admin pane binding ----------------
+# Issue #1738: a NON-admin agent whose pane binding matches the caller ancestry
+# is denied even if env/--from claims admin. We publish a non-admin binding for
+# the SAME pane_pid ($$), so the wrapper matches it on ancestry and denies as
+# agent-direct (the meaningful #1738 negative). The admin binding is removed for
+# this scenario so the non-admin one is the unique match.
+rm -f "$BRIDGE_HOME/state/config-caller-bindings/$ADMIN_AGENT.json"
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
+  "$NON_ADMIN_AGENT" "$ADMIN_AGENT" "$$" >"$BRIDGE_HOME/state/config-caller-bindings/$NON_ADMIN_AGENT.json"
 sce3_out="$(BRIDGE_HOME="$BRIDGE_HOME" \
   BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
   BRIDGE_CALLER_SOURCE="operator-tui" \
   BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
-  BRIDGE_AGENT_ID="$NON_ADMIN_AGENT" \
+  BRIDGE_AGENT_ID="$ADMIN_AGENT" \
   "$PYTHON" "$REPO_ROOT/bridge-config.py" set \
     --path "$ACCESS_PATH" \
     --change "groups.append=99999" 2>&1 || true)"
-if [[ "$sce3_out" == *"deny:"* ]] && [[ "$sce3_out" == *"not the admin"* ]]; then
-  pass "scenario 3: wrapper rejected non-admin caller"
+if [[ "$sce3_out" == *"deny:"* ]] && [[ "$sce3_out" == *"agent-direct"* ]]; then
+  pass "scenario 3: wrapper rejected non-admin pane binding (env-spoof ignored)"
 else
-  fail "scenario 3: wrapper did not reject non-admin — output: $sce3_out"
+  fail "scenario 3: wrapper did not reject non-admin binding — output: $sce3_out"
 fi
 
 if sce3_shape_err="$(audit_row_shape_check "wrapper-deny" "$ACCESS_PATH" 0 2>&1)"; then
@@ -274,24 +295,27 @@ else
   fail "scenario 3: file was mutated despite deny"
 fi
 
-# --- Scenario 4: wrapper denial — untrusted source -----------------------
-# Caller is the admin id but caller-source is agent-direct (no TTY, no env
-# override). Mirrors the channel-message path: the message sender is not
-# a verified operator, so even if the queue task says "patch please run X"
-# the wrapper refuses.
+# --- Scenario 4: wrapper denial — env-admin identity, NO binding ---------
+# Issue #1738: env/--from-declared admin identity is NOT trusted when no pane
+# binding matches the caller ancestry and there is no operator TTY. This is the
+# fail-closed path that closes the env-spoof-behind-indirection root: a sibling
+# shell stage seeding BRIDGE_AGENT_ID/BRIDGE_CALLER_SOURCE no longer authorizes
+# a write. Remove ALL bindings so nothing matches.
+rm -f "$BRIDGE_HOME"/state/config-caller-bindings/*.json
 sce4_out="$(BRIDGE_HOME="$BRIDGE_HOME" \
   BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
   BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
   BRIDGE_AGENT_ID="$ADMIN_AGENT" \
-  BRIDGE_CALLER_SOURCE="agent-direct" \
+  BRIDGE_CALLER_SOURCE="operator-trusted-id" \
   "$PYTHON" "$REPO_ROOT/bridge-config.py" set \
     --path "$ACCESS_PATH" \
     --change "groups.append=88888" \
+    --from "$ADMIN_AGENT" \
     </dev/null 2>&1 || true)"
-if [[ "$sce4_out" == *"deny:"* ]] && [[ "$sce4_out" == *"agent-direct"* ]]; then
-  pass "scenario 4: wrapper rejected untrusted-source admin call"
+if [[ "$sce4_out" == *"deny:"* ]] && [[ "$sce4_out" == *"noninteractive-untrusted"* ]]; then
+  pass "scenario 4: wrapper rejected env-admin identity with no pane binding"
 else
-  fail "scenario 4: wrapper did not reject untrusted source — output: $sce4_out"
+  fail "scenario 4: wrapper did not reject env-admin/no-binding — output: $sce4_out"
 fi
 
 if sce4_shape_err="$(audit_row_shape_check "wrapper-deny" "$ACCESS_PATH" 0 2>&1)"; then
@@ -322,7 +346,11 @@ fi
 # refuse with a wrapper-deny row + a manual-flow message; the operator
 # uses the queued admin task to edit the shell file by hand. Codex r1
 # #341 CP10 surfaced this gap — the path was implemented but never
-# exercised by smoke.
+# exercised by smoke. Re-seed the admin binding (scenario 4 cleared all) so the
+# caller PASSES the #1738 trust gate and reaches the non-JSON-suffix deny.
+mkdir -p "$BRIDGE_HOME/state/config-caller-bindings"
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$$" >"$BRIDGE_HOME/state/config-caller-bindings/$ADMIN_AGENT.json"
 sce6_out="$(BRIDGE_HOME="$BRIDGE_HOME" \
   BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
   BRIDGE_CALLER_SOURCE="operator-tui" \

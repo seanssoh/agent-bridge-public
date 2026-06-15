@@ -5597,6 +5597,126 @@ def _config_set_env_check(
     return True, None
 
 
+# Issue #1738 — interim defense-in-depth indirection gate for BOTH config
+# mutation verbs (`config set` / `config set-env`).
+#
+# This gate is DEFENSE-IN-DEPTH, NOT the close criterion. The durable fix is
+# wrapper-side (bridge-config.py derives identity from process ancestry vs the
+# controller-published pane binding, never from env). But a static hook can
+# still cheaply deny the indirection shapes the literal-spelling recognizers
+# (`_is_config_set_wrapper`, `_config_set_env_attempt_present`) cannot resolve:
+# a mutation verb hidden behind `eval` / `bash -c` / `sh -c`, or behind an
+# unresolved command-position `$var` around the verb. We DENY those uniformly.
+#
+# We deliberately ACCEPT false denials for legitimately-scripted `bash -c`
+# config mutation — privileged config writes should use the direct wrapper
+# shape, not a nested shell. We do NOT add brace-normalization: the issue's own
+# analysis (PR #1736 r6) shows brace forms are non-exploitable against argparse
+# and are closed naturally by the wrapper identity fix.
+_INDIRECTION_SHELL_LEAVES = frozenset({"eval", "bash", "sh"})
+
+# A command-position `$var` / `${var}` / `$(...)` that expands to (part of) the
+# verb. We flag an UNRESOLVED `$` adjacent to the config-mutation surface
+# (`config` / `set` / `set-env` / `--path` / the assignment) so a
+# `V=set-env; agb config $V K=V` or `P=<roster>; agb config set --path $P …`
+# cannot hide the real argv from the literal recognizers.
+_CONFIG_VERB_TOKENS = ("config", "set", "set-env")
+
+
+def _stage_reaches_config_mutation(stage: str) -> bool:
+    """True iff *stage* mentions a config-mutation verb surface (literal or var).
+
+    Substring recognition over the quote/escape-stripped stage — broad on
+    purpose so the indirection gate fails closed. The mutation surface is
+    `config` PLUS any of: the `set` / `set-env` subcommand spelling, the
+    `--path` write flag, OR an unresolved `$` (a var that could expand to the
+    subcommand, e.g. `config $V K=V` where `V=set-env`). The bare `agb config`
+    read verbs (`get` / `list-protected`) without `set`/`--path`/`$` are NOT
+    flagged.
+    """
+    flat = _SHELL_QUOTE_ESCAPE_RE.sub("", stage)
+    if "config" not in flat:
+        return False
+    return ("set" in flat) or ("--path" in flat) or ("$" in flat)
+
+
+def _config_mutation_via_indirection(text: str) -> str | None:
+    """Return an indirection reason iff a config mutation is hidden behind
+    `eval` / `bash -c` / `sh -c`, or an unresolved command-position `$var`
+    around the verb — else None.
+
+    Recognizes per separator-split stage. A stage whose FIRST token (after a
+    leading `VAR=` env-assignment strip) is `eval` / `bash` / `sh` AND whose
+    remaining argument text reaches the config-mutation surface is an
+    indirection attempt. Separately, a stage that reaches the config-mutation
+    surface AND carries an unresolved `$` immediately around the verb / path /
+    assignment is also flagged (a `$var` the static hook cannot expand).
+    """
+    joined = text.replace("\\\r\n", "").replace("\\\n", "")
+    for stage in _COMMAND_OPERATOR_RE.split(joined):
+        scan = _SAFE_REDIRECT_RE.sub(" ", stage)
+        try:
+            toks = shlex.split(scan, posix=True, comments=False)
+        except ValueError:
+            # Unparseable stage that mentions the mutation surface — fail closed.
+            if _stage_reaches_config_mutation(stage):
+                return "unparseable_config_mutation_stage"
+            continue
+        # Strip a leading `VAR=value` env-assignment (the spoof-prefix) so the
+        # first real command word is examined.
+        while toks and "=" in toks[0] and _LEADING_ENV_ASSIGN_RE.match(toks[0] + " "):
+            toks.pop(0)
+        if not toks:
+            continue
+        leaf = toks[0].rsplit("/", 1)[-1]
+        if leaf in _INDIRECTION_SHELL_LEAVES:
+            # `eval '<payload>'` / `bash -c '<payload>'` / `sh -c '<payload>'`.
+            # The payload is a later token; if ANY token in the stage reaches
+            # the config-mutation surface, the verb is being run through a
+            # nested interpreter → deny.
+            payload = " ".join(toks[1:])
+            if _stage_reaches_config_mutation(payload) or _stage_reaches_config_mutation(stage):
+                return f"config_mutation_via_{leaf}"
+        # Unresolved command-position `$var` around the verb surface. `$` only
+        # survives shlex when it was inside single quotes or escaped; a bare
+        # `$V` would already have been (not) expanded by shlex into the literal
+        # `$V` token. Either way an unexpanded `$` next to the config verb means
+        # the real argv is hidden from the literal recognizers.
+        if _stage_reaches_config_mutation(stage) and "$" in scan:
+            # Only flag when the `$` is adjacent to the mutation surface, not an
+            # unrelated `$HOME` in a comment-free benign position. Conservative:
+            # any `$` in a stage that ALSO reaches the config-mutation surface
+            # is treated as indirection (privileged writes must use literal
+            # argv). Accepts a false deny for `--change x=$(date)` etc.
+            return "config_mutation_via_unresolved_var"
+    return None
+
+
+def _emit_config_mutation_via_indirection_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+    reason: str,
+) -> None:
+    """Audit row for a config mutation denied at the interim indirection gate."""
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "verb": "config set/set-env",
+        "reason": reason,
+        "sample": _redact_credential_token_values(truncate_text(text, 240)),
+    }
+    if tool_input is not None:
+        detail["summary"] = _redact_credential_summary(
+            tool_input_summary("Bash", tool_input)
+        )
+    write_audit(
+        "tool_policy_config_mutation_indirection_denied",
+        agent or "unknown",
+        detail,
+    )
+
+
 def _emit_config_set_env_allowed_audit(
     agent: str,
     *,
@@ -7849,6 +7969,22 @@ def protected_alias_reason(
     # they just tried to call. Letting the wrapper through here only
     # delegates audit responsibility to the wrapper itself; non-operator
     # callers still get rejected at bridge-config.py.
+    # Issue #1738 (defense-in-depth): deny a config mutation hidden behind
+    # `eval` / `bash -c` / `sh -c` or an unresolved command-position `$var`
+    # around the verb. Runs BEFORE the `_is_config_set_wrapper` carve-out so an
+    # indirection shape can never be mistaken for the sanctioned literal wrapper
+    # invocation. The durable boundary is wrapper-side (bridge-config.py process
+    # ancestry); this only narrows the static-hook window.
+    indirection_reason = _config_mutation_via_indirection(text)
+    if indirection_reason is not None:
+        _emit_config_mutation_via_indirection_audit(
+            agent, text=text, tool_input=tool_input, reason=indirection_reason
+        )
+        return (
+            "agent-bridge config set / set-env reached through eval / bash -c / "
+            "sh -c / unresolved $var indirection is not allowed — run the "
+            "wrapper directly with literal argv (issue #1738)"
+        )
     if _is_config_set_wrapper(text):
         return None
     # Issue #1734: the `config set-env` exact-shape, admin-only, anti-spoof

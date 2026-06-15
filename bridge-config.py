@@ -24,12 +24,17 @@ Both before-sha256 and after-sha256 are recorded in the audit row so the
 operator can compare a wrapper-apply event against the file's at-rest
 hash on disk.
 
-Trust model recap (from the issue's "신뢰 경계 정의" table):
+Trust model (issue #1738 — process-ancestry binding, NOT env identity):
 
-    operator-tui          interactive shell (stdin+stdout are TTYs)
-    operator-trusted-id   set explicitly by a verified channel handler
-                          via BRIDGE_CALLER_SOURCE env
-    agent-direct          everything else — denied
+    The `set` / `set-env` mutation gate authorizes from a controller-published
+    per-agent tmux pane-pid binding matched against THIS wrapper's process
+    ancestry (a shell cannot set its own parent pid), or a real operator TTY
+    passing `--from <canonical-admin>` when no agent binding matches.
+    `BRIDGE_AGENT_ID` / `BRIDGE_ADMIN_AGENT_ID` / `BRIDGE_CALLER_SOURCE` no
+    longer drive any positive authorization (they were spoofable by a sibling
+    shell stage behind eval / bash -c / sh -c / $var indirection). See
+    `resolve_config_caller` for the full decision table. The `operator-tui` /
+    `operator-trusted-id` / `agent-direct` labels remain only as audit buckets.
 
 This file is invoked through `bridge-config.sh`, which is in turn dispatched
 by the `agent-bridge config …` subcommand.
@@ -64,17 +69,12 @@ from system_config_paths import (  # noqa: E402
 )
 
 
+# Caller-source audit buckets. These are the LABELS the audit row records for
+# the resolved caller (issue #1738 `resolve_config_caller`); they are no longer
+# read from process env for an authorization decision.
 CALLER_SOURCE_OPERATOR_TUI = "operator-tui"
 CALLER_SOURCE_OPERATOR_TRUSTED_ID = "operator-trusted-id"
 CALLER_SOURCE_AGENT_DIRECT = "agent-direct"
-
-# Caller sources allowed to mutate. The operator can extend this set via
-# the env var below at deploy time, but the default set is deliberately
-# narrow — issue #341 §"권한 모델이 코드에 없고 가이드 텍스트에만 있음" is
-# the failure mode we are correcting.
-ALLOWED_CALLER_SOURCES = frozenset(
-    {CALLER_SOURCE_OPERATOR_TUI, CALLER_SOURCE_OPERATOR_TRUSTED_ID}
-)
 
 
 # ---------------------------------------------------------------------------
@@ -202,64 +202,375 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def detect_caller_source() -> str:
-    """Resolve which trust bucket the current process belongs to.
-
-    `BRIDGE_CALLER_SOURCE` is the explicit override a verified channel
-    handler uses to declare it has already validated the operator's
-    user_id against the canonical roster (issue #341 §B). When unset,
-    we fall back to TTY detection: an interactive shell invoking
-    `agent-bridge config set` is treated as operator-tui. Any
-    non-interactive non-overridden caller is `agent-direct` and the
-    wrapper denies the mutation.
-    """
-    explicit = os.environ.get("BRIDGE_CALLER_SOURCE", "").strip().lower()
-    if explicit in {CALLER_SOURCE_OPERATOR_TUI, CALLER_SOURCE_OPERATOR_TRUSTED_ID}:
-        return explicit
-    if explicit:
-        return CALLER_SOURCE_AGENT_DIRECT
-    try:
-        if sys.stdin.isatty() and sys.stdout.isatty():
-            return CALLER_SOURCE_OPERATOR_TUI
-    except (OSError, ValueError):
-        pass
-    return CALLER_SOURCE_AGENT_DIRECT
-
-
 def admin_agent_id() -> str:
+    """Return the configured canonical admin agent id.
+
+    Read from `BRIDGE_ADMIN_AGENT_ID` (the controller exports this into the
+    launch env). NOTE (issue #1738): this is the CANONICAL admin NAME, not a
+    trust signal — `resolve_config_caller` authorizes by process-ancestry vs
+    the controller-published binding (or a real operator TTY), never by this
+    env value alone. An agent that re-exports a different value cannot thereby
+    authorize a write: the binding's `admin_agent_id` is what the agent-pane
+    path keys on, and the operator-TTY fallback still requires a real TTY.
+    """
     return os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()
 
 
-def caller_agent_id(args: argparse.Namespace) -> str:
-    explicit = getattr(args, "from_agent", None)
+# ---------------------------------------------------------------------------
+# Issue #1738 (SECURITY) — process-ancestry config-caller resolution.
+#
+# The pre-#1738 mutation gate (`detect_caller_source` / `caller_is_admin`)
+# derived admin/operator trust ENTIRELY from process env
+# (`BRIDGE_AGENT_ID`, `BRIDGE_ADMIN_AGENT_ID`, `BRIDGE_CALLER_SOURCE`). A
+# sibling shell stage in the SAME agent-issued Bash command can seed exactly
+# those vars and then hide the real invocation behind `eval` / `bash -c` /
+# `sh -c` / `$var` indirection that the static `tool-policy.py` hook cannot
+# resolve — so a non-admin agent spoofed admin and performed protected writes.
+#
+# The durable, unspoofable signal: A SHELL CANNOT SET ITS OWN PARENT PID. The
+# controller (`bridge-start.sh`) publishes a per-agent binding record under
+# `$BRIDGE_STATE_DIR/config-caller-bindings/<agent>.json` carrying the tmux
+# `pane_pid` of the launched session right after `tmux new-session`. This
+# wrapper walks ITS OWN process ancestry (via an absolute `/bin/ps`, falling
+# back to /proc) and matches the parent chain against the published
+# `pane_pid`. We deliberately do NOT trust `$TMUX`, a `$PATH` `tmux`, or
+# env-provided identity — only ancestry vs the controller-published binding.
+#
+# HONEST CAVEAT (carry in the report / KNOWN_ISSUES): on a shared-UID install
+# (e.g. macOS without linux-user isolation) the binding file is owned by the
+# same OS user the agent runs as, so an agent CAN overwrite it, and a detached
+# same-UID child that allocates a pty cannot be cryptographically distinguished
+# from the operator. This closes the verified env-spoof / indirection path for
+# normal agent-command descendants and preserves the raw-operator-TTY path; a
+# "any same-UID process is hostile" model needs a controller-IPC service (a
+# separate 2nd-round design, explicitly NOT attempted here). On linux-user
+# isolation the binding lives under the controller-owned `state/` tree, which an
+# iso agent UID cannot write — there the ancestry+ownership form is a real
+# boundary.
+
+CONFIG_CALLER_CONTEXT_AGENT_PANE = "agent-pane"
+CONFIG_CALLER_CONTEXT_OPERATOR_TTY = "operator-tty"
+CONFIG_CALLER_CONTEXT_UNKNOWN = "unknown"
+
+# Walk at most this many ancestry hops. A real pane→engine→shell→wrapper chain
+# is a handful deep; the bound stops a corrupted ppid loop (e.g. a ppid that
+# points back into the chain) from spinning.
+_ANCESTRY_MAX_HOPS = 64
+
+# Absolute paths to the system ps. We refuse a `$PATH` ps so an agent cannot
+# shadow it with a binary that lies about ppids. If neither absolute path
+# exists we fall back to /proc (Linux) and finally fail closed.
+_PS_ABSOLUTE_CANDIDATES = ("/bin/ps", "/usr/bin/ps")
+
+
+class ConfigCaller:
+    """Resolved, authorization-relevant identity of a `set`/`set-env` call.
+
+    Carries the EFFECTIVE agent/admin derived from the unspoofable binding
+    (or the raw-operator-TTY fallback), the trust ``source`` bucket the audit
+    row records, the ``context`` the decision came from, an ``allowed`` flag,
+    and a ``reason`` string (a denial reason when ``allowed`` is False, or the
+    allow rationale when True). Env identity is NEVER the basis of a positive
+    decision.
+    """
+
+    __slots__ = (
+        "agent_id",
+        "admin_agent_id",
+        "source",
+        "context",
+        "allowed",
+        "reason",
+    )
+
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        admin_agent_id: str,
+        source: str,
+        context: str,
+        allowed: bool,
+        reason: str,
+    ) -> None:
+        self.agent_id = agent_id
+        self.admin_agent_id = admin_agent_id
+        self.source = source
+        self.context = context
+        self.allowed = allowed
+        self.reason = reason
+
+
+def config_caller_bindings_dir() -> Path:
+    """Directory the controller publishes per-agent binding records into.
+
+    `BRIDGE_STATE_DIR` is the canonical state root (the shell default is
+    `$BRIDGE_HOME/state`). The binding writer in `lib/bridge-state.sh` and this
+    reader MUST agree on this path. On iso this directory is controller-owned so
+    the binding cannot be forged; on shared-UID it is best-effort (see caveat).
+    """
+    explicit = os.environ.get("BRIDGE_STATE_DIR", "").strip()  # noqa: raw-pathlib-controller-only
     if explicit:
-        return str(explicit).strip()
-    return os.environ.get("BRIDGE_AGENT_ID", "").strip()
+        return Path(explicit).expanduser() / "config-caller-bindings"
+    return bridge_home_dir() / "state" / "config-caller-bindings"
 
 
-def caller_is_admin(agent: str) -> bool:
-    """Return True only when the caller has explicitly identified as the
-    admin agent.
+def _ps_ppid(pid: int) -> int | None:
+    """Return the parent pid of *pid* via an ABSOLUTE ps, or None.
 
-    Strict identity check (codex r1 #341 CP5): the caller must pass
-    ``--from <admin>`` *or* run with ``BRIDGE_AGENT_ID=<admin>`` set.
-    A missing caller agent is rejected even from operator-TUI — the
-    wrapper does not accept "operator at a TTY" as an implicit admin
-    bypass. Bridge-managed TUI sessions already export
-    ``BRIDGE_AGENT_ID``; operators running from a raw shell must pass
-    ``--from`` explicitly.
+    Uses `<abs-ps> -o ppid= -p <pid>` (no `$PATH` lookup, no shell). On a
+    platform without an absolute ps but with /proc (Linux), parses
+    `/proc/<pid>/stat` field 4. Any failure returns None (the caller treats a
+    broken hop as end-of-chain — fail-closed for matching).
+    """
+    for ps_bin in _PS_ABSOLUTE_CANDIDATES:
+        if not os.path.exists(ps_bin):  # noqa: raw-pathlib-controller-only
+            continue
+        try:
+            out = subprocess.run(
+                [ps_bin, "-o", "ppid=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return None
+        text = out.stdout.strip()
+        if not text:
+            return None
+        try:
+            return int(text.split()[0])
+        except (ValueError, IndexError):
+            return None
+    # /proc fallback (Linux without an absolute ps on the probed paths).
+    stat_path = Path("/proc") / str(pid) / "stat"  # noqa: raw-pathlib-controller-only
+    try:
+        raw = stat_path.read_text(encoding="utf-8", errors="replace")  # noqa: raw-pathlib-controller-only
+    except OSError:
+        return None
+    # Field 2 (comm) is parenthesized and may contain spaces/parens — split on
+    # the LAST ')' so field indexing after it is stable. ppid is field 4 (0-idx
+    # 1 after the close-paren split).
+    close = raw.rfind(")")
+    if close == -1:
+        return None
+    tail = raw[close + 1:].split()
+    if len(tail) < 2:
+        return None
+    try:
+        return int(tail[1])
+    except ValueError:
+        return None
 
-    The check is intentionally stricter than the hook's
-    ``is_admin_agent`` — the hook gates by session-type files that an
-    agent could in theory plant; the wrapper requires an env- or
-    flag-declared admin id and refuses anonymous callers.
+
+def process_ancestry_pids(start_pid: int) -> list[int]:
+    """Return the chain of ancestor pids of *start_pid* (excluding itself).
+
+    Walks ppid links until pid 1 / 0, a broken hop, a repeat (cycle guard), or
+    the hop bound. The returned list is what we match the controller-published
+    `pane_pid` against — the shell cannot forge any entry because it cannot set
+    its own ppid.
+    """
+    chain: list[int] = []
+    seen: set[int] = {start_pid}
+    cur = start_pid
+    for _ in range(_ANCESTRY_MAX_HOPS):
+        ppid = _ps_ppid(cur)
+        if ppid is None or ppid <= 1 or ppid in seen:
+            break
+        chain.append(ppid)
+        seen.add(ppid)
+        cur = ppid
+    return chain
+
+
+def _load_binding_record(path: Path) -> dict[str, Any] | None:
+    """Parse one binding JSON record; return None on any read/parse problem."""
+    try:
+        raw = path.read_text(encoding="utf-8")  # noqa: raw-pathlib-controller-only
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _candidate_binding_paths(bindings_dir: Path) -> list[Path]:
+    """Return the binding files to consider.
+
+    Primary path: glob the bindings dir. On a shared-UID install this lists
+    every agent's binding, so a match is found regardless of which agent the
+    caller is. On linux-user isolation the controller publishes the dir at
+    `state/` `dir_only_traverse` mode (0711) — an iso UID can NOT list it — so
+    the glob returns nothing. Fallback: read the single per-agent record at the
+    exact path `<dir>/<BRIDGE_AGENT_ID>.json` (0644, reachable by exact path
+    even without dir-list). Using `BRIDGE_AGENT_ID` only SELECTS a candidate
+    file; it is NOT trusted for authorization — the candidate's `pane_pid`
+    still has to be in the caller's process ancestry, which an agent lying
+    about its id cannot forge.
+    """
+    candidates: list[Path] = []
+    try:
+        listed = sorted(bindings_dir.glob("*.json"))  # noqa: raw-pathlib-controller-only
+    except OSError:
+        listed = []
+    if listed:
+        return listed
+    env_agent = os.environ.get("BRIDGE_AGENT_ID", "").strip()
+    # Restrict to a single path component so the candidate cannot escape the
+    # bindings dir via a crafted BRIDGE_AGENT_ID (e.g. `../../etc/x`).
+    if env_agent and "/" not in env_agent and env_agent not in (".", ".."):
+        per_agent = bindings_dir / f"{env_agent}.json"
+        if per_agent.is_file():  # noqa: raw-pathlib-controller-only
+            candidates.append(per_agent)
+    return candidates
+
+
+def _bindings_matching_ancestry(ancestry: set[int]) -> list[dict[str, Any]]:
+    """Return binding records whose integer `pane_pid` is in *ancestry*.
+
+    A record with a missing / non-integer `pane_pid` is STALE and never
+    matches (deny-side of the decision table). Multiple matches are returned so
+    the caller can deny on ambiguity.
+    """
+    bindings_dir = config_caller_bindings_dir()
+    matched: list[dict[str, Any]] = []
+    for entry in _candidate_binding_paths(bindings_dir):
+        record = _load_binding_record(entry)
+        if record is None:
+            continue
+        pane_pid = record.get("pane_pid")
+        # bool is a subclass of int — exclude it explicitly so a JSON `true`
+        # cannot masquerade as pid 1.
+        if not isinstance(pane_pid, int) or isinstance(pane_pid, bool):
+            # Stale / malformed binding — never matches (fail-closed).
+            continue
+        if pane_pid in ancestry:
+            matched.append(record)
+    return matched
+
+
+def resolve_config_caller(args: argparse.Namespace) -> ConfigCaller:
+    """Resolve the authoritative caller for a `set`/`set-env` mutation.
+
+    Implements the #1738 decision table. The ONLY positive authorization
+    inputs are (a) a binding record whose `pane_pid` is in this wrapper's
+    process ancestry, or (b) a real operator TTY with `--from <canonical
+    admin>` when NO binding matches. `BRIDGE_AGENT_ID` /
+    `BRIDGE_ADMIN_AGENT_ID` / `BRIDGE_CALLER_SOURCE` never drive a positive
+    decision.
     """
     admin = admin_agent_id()
-    if not admin:
-        return False
-    if not agent:
-        return False
-    return agent == admin
+    from_agent = getattr(args, "from_agent", None)
+    from_agent = str(from_agent).strip() if from_agent else ""
+
+    ancestry = set(process_ancestry_pids(os.getpid()))
+    matches = _bindings_matching_ancestry(ancestry)
+
+    if len(matches) > 1:
+        return ConfigCaller(
+            agent_id="",
+            admin_agent_id=admin,
+            source=CALLER_SOURCE_AGENT_DIRECT,
+            context=CONFIG_CALLER_CONTEXT_AGENT_PANE,
+            allowed=False,
+            reason=(
+                "agent-binding-ambiguous: multiple controller bindings match "
+                "this process ancestry — stale or corrupt state, refusing"
+            ),
+        )
+
+    if len(matches) == 1:
+        record = matches[0]
+        bound_agent = str(record.get("agent_id", "") or "").strip()
+        bound_admin = str(record.get("admin_agent_id", "") or "").strip()
+        # `--from` must agree with the bound identity — a mismatch is an
+        # explicit identity spoof (env / flag claiming a different agent than
+        # the one the pane is actually bound to).
+        if from_agent and from_agent != bound_agent:
+            return ConfigCaller(
+                agent_id=bound_agent,
+                admin_agent_id=bound_admin,
+                source=CALLER_SOURCE_AGENT_DIRECT,
+                context=CONFIG_CALLER_CONTEXT_AGENT_PANE,
+                allowed=False,
+                reason=(
+                    f"identity-spoof: --from {from_agent} does not match the "
+                    f"pane-bound agent {bound_agent}"
+                ),
+            )
+        # Binding agent == binding admin → legitimate admin-agent call. This is
+        # the only env-free positive admin path (no TTY required); it preserves
+        # the launch-injected admin identity WITHOUT trusting env, because the
+        # ancestry match is the proof, not BRIDGE_AGENT_ID.
+        if bound_admin and bound_agent == bound_admin:
+            return ConfigCaller(
+                agent_id=bound_agent,
+                admin_agent_id=bound_admin,
+                source=CALLER_SOURCE_OPERATOR_TRUSTED_ID,
+                context=CONFIG_CALLER_CONTEXT_AGENT_PANE,
+                allowed=True,
+                reason="agent-pane-binding",
+            )
+        # Binding matches a NON-admin agent → deny, regardless of what env or
+        # `--from` claims.
+        return ConfigCaller(
+            agent_id=bound_agent,
+            admin_agent_id=bound_admin,
+            source=CALLER_SOURCE_AGENT_DIRECT,
+            context=CONFIG_CALLER_CONTEXT_AGENT_PANE,
+            allowed=False,
+            reason=(
+                f"agent-direct: pane-bound agent {bound_agent or '<unknown>'} "
+                "is not the admin agent — refusing system-config mutation"
+            ),
+        )
+
+    # No binding matched this process ancestry.
+    try:
+        is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+    except (OSError, ValueError):
+        is_tty = False
+
+    if is_tty and from_agent and admin and from_agent == admin:
+        # Raw-operator fallback: a real interactive TTY explicitly passing
+        # `--from <canonical admin>`, with NO matching agent binding. This is
+        # the only allowed path when ancestry yields nothing.
+        return ConfigCaller(
+            agent_id=from_agent,
+            admin_agent_id=admin,
+            source=CALLER_SOURCE_OPERATOR_TUI,
+            context=CONFIG_CALLER_CONTEXT_OPERATOR_TTY,
+            allowed=True,
+            reason="operator-tty-from-admin",
+        )
+
+    # Everything else with no binding is fail-closed. Crucially this includes
+    # the historical env-trust path (ambient BRIDGE_AGENT_ID / CALLER_SOURCE in
+    # a non-TTY context): it no longer authorizes anything.
+    if from_agent and admin and from_agent == admin:
+        reason = (
+            "noninteractive-untrusted: no pane binding matches this process "
+            "and there is no operator TTY — env/--from-declared admin identity "
+            "is not trusted for a config mutation (issue #1738)"
+        )
+    else:
+        reason = (
+            "agent-binding-missing: no controller pane binding matches this "
+            "process ancestry and no operator-TTY admin fallback applies"
+        )
+    return ConfigCaller(
+        agent_id=from_agent,
+        admin_agent_id=admin,
+        source=CALLER_SOURCE_AGENT_DIRECT,
+        context=CONFIG_CALLER_CONTEXT_UNKNOWN,
+        allowed=False,
+        reason=reason,
+    )
 
 
 def write_audit(detail: dict[str, Any]) -> Path:
@@ -668,31 +979,20 @@ def cmd_get(args: argparse.Namespace) -> int:
 
 def cmd_set(args: argparse.Namespace) -> int:
     path = Path(args.path).expanduser()
-    caller_agent = caller_agent_id(args)
-    caller_source = detect_caller_source()
+    # Issue #1738: derive the caller from the unspoofable controller pane-pid
+    # binding + process ancestry, NOT from env identity. `resolve_config_caller`
+    # implements the full decision table; env (BRIDGE_AGENT_ID /
+    # BRIDGE_ADMIN_AGENT_ID / BRIDGE_CALLER_SOURCE) never drives a positive
+    # authorization.
+    caller = resolve_config_caller(args)
+    caller_agent = caller.agent_id
+    caller_source = caller.source
 
     deny_reason: str | None = None
     if not is_protected_path(path):
         deny_reason = "path not in system-config protected list"
-    elif not caller_agent:
-        # Strict admin check (codex r1 #341 CP5): the caller must
-        # explicitly identify via --from or BRIDGE_AGENT_ID. Anonymous
-        # callers (raw shell with neither set) cannot satisfy the
-        # admin requirement, even from operator-TUI.
-        deny_reason = (
-            "caller_agent unspecified — pass `--from <admin-agent>` or set "
-            "BRIDGE_AGENT_ID before invoking `agent-bridge config set`"
-        )
-    elif not caller_is_admin(caller_agent):
-        deny_reason = (
-            f"caller agent {caller_agent} is not the admin "
-            "agent — refusing system-config mutation"
-        )
-    elif caller_source not in ALLOWED_CALLER_SOURCES:
-        deny_reason = (
-            f"caller source {caller_source} is not allowed to mutate "
-            "system config (need operator-tui or operator-trusted-id)"
-        )
+    elif not caller.allowed:
+        deny_reason = caller.reason
 
     actor_label = caller_agent or (
         "operator" if caller_source == CALLER_SOURCE_OPERATOR_TUI else "unknown"
@@ -826,8 +1126,11 @@ def cmd_set_env(args: argparse.Namespace) -> int:
     `system_config_mutation` audit row with before/after file hashes.
     """
     path = agent_env_local_path()
-    caller_agent = caller_agent_id(args)
-    caller_source = detect_caller_source()
+    # Issue #1738: same unspoofable resolver as cmd_set. The set-env write gate
+    # no longer trusts env-declared identity/source.
+    caller = resolve_config_caller(args)
+    caller_agent = caller.agent_id
+    caller_source = caller.source
     actor_label = caller_agent or (
         "operator" if caller_source == CALLER_SOURCE_OPERATOR_TUI else "unknown"
     )
@@ -855,27 +1158,12 @@ def cmd_set_env(args: argparse.Namespace) -> int:
         print(f"deny: {reason}", file=sys.stderr)
         return code
 
-    # Trust gate FIRST — identical shape to cmd_set (codex r1 #341 CP5):
-    # explicit admin identity AND an operator caller-source. A non-admin or
-    # non-operator-TTY caller is denied before we even consider the key.
-    if not caller_agent:
-        return deny(
-            "caller_agent unspecified — pass `--from <admin-agent>` or set "
-            "BRIDGE_AGENT_ID before invoking `agent-bridge config set-env`",
-            3,
-        )
-    if not caller_is_admin(caller_agent):
-        return deny(
-            f"caller agent {caller_agent} is not the admin agent — refusing "
-            "set-env",
-            3,
-        )
-    if caller_source not in ALLOWED_CALLER_SOURCES:
-        return deny(
-            f"caller source {caller_source} is not allowed to set env "
-            "(need operator-tui or operator-trusted-id)",
-            3,
-        )
+    # Trust gate FIRST (issue #1738): the resolver's decision is the boundary.
+    # A non-admin pane binding, an identity spoof, a stale/ambiguous binding, or
+    # a noninteractive caller with no binding is denied before we consider the
+    # key.
+    if not caller.allowed:
+        return deny(caller.reason, 3)
 
     # Key screen: explicit deny BEFORE allowlist (fail-closed), then allowlist.
     forbidden = env_key_deny_reason(key)

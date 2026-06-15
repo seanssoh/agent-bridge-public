@@ -528,6 +528,18 @@ add_required 1792-cron-scope-fence
 # (cm-prod cron-worker-ran-a-held-`agb upgrade` incident). In the static suite
 # so any scripts/smoke/* change re-runs the guard-presence + no-over-block teeth.
 add_required 1875-cron-prod-mutation-guard
+# Issue #1738 (SECURITY): the #341 `config set` / `config set-env` write gate now
+# authorizes from a controller-published tmux pane-pid binding matched against
+# bridge-config.py's OWN process ancestry (a shell cannot set its parent pid),
+# NOT from spoofable process env (BRIDGE_AGENT_ID / BRIDGE_ADMIN_AGENT_ID /
+# BRIDGE_CALLER_SOURCE). bridge-start.sh publishes the binding via
+# bridge_publish_config_caller_binding (lib/bridge-state.sh) after tmux
+# new-session; hooks/tool-policy.py adds the interim eval/bash -c/sh -c/$var
+# indirection deny. In the full static suite so any scripts/smoke/* change
+# re-runs the adversarial env-spoof matrix (both verbs DENY + target-unchanged,
+# legit admin-binding + operator-TTY ALLOW); the per-file arms below pull it on
+# bridge-config.py / bridge-start.sh / lib/bridge-state.sh / tool-policy.py moves.
+add_required 1738-config-caller-binding
 
 
 }
@@ -807,6 +819,14 @@ select_for_path() {
         # or regress the migration fail-safe (which would re-open reaping of
         # operator-created dynamics).
         add_required 1795-reaper-ephemeral-policy
+        # Issue #1738 (SECURITY): lib/bridge-state.sh hosts the config-caller
+        # binding writer (bridge_publish_config_caller_binding / _remove /
+        # _dir / _file) — the controller-published pane-pid record
+        # bridge-config.py's `config set` / `set-env` write gate matches its
+        # process ancestry against (instead of spoofable env). Pull the
+        # adversarial binding smoke on every bridge-state.sh move so a refactor
+        # cannot rename/drop the writer or change the binding shape/path.
+        add_required 1738-config-caller-binding
         add_required 1378-iso-session-lock-fresh-start
         # Issue #9981 (sibling of #1378): lib/bridge-state.sh hosts the
         # pending-attention spool resolvers (bridge_agent_pending_attention_
@@ -2906,6 +2926,15 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       if [[ "$path" == "bridge-run.sh" || "$path" == "bridge-start.sh" ]]; then
         add_required 1639-post-restart-auto-wake
       fi
+      # Issue #1738 (SECURITY): bridge-start.sh publishes the config-caller
+      # pane-pid binding (bridge_publish_config_caller_binding) after tmux
+      # new-session — the unspoofable signal bridge-config.py's `config set` /
+      # `set-env` write gate matches its process ancestry against. Pull the
+      # adversarial binding smoke whenever bridge-start.sh moves so a future PR
+      # cannot drop the publish call or break the binding shape.
+      if [[ "$path" == "bridge-start.sh" ]]; then
+        add_required 1738-config-caller-binding
+      fi
       # v0.15.0-beta5-2 Lane ξ (#1330/#1332/#1334/#1318-A): bridge-start.sh
       # gained the BRIDGE_AGENT_ID env-prefix inline (#1330 M7) and the
       # EFFECTIVE_CONTINUE_MODE warn gate (#1334 L4); bridge-run.sh's
@@ -3153,7 +3182,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # tool-policy.py moves so a future PR cannot regress the anti-spoof
       # predicate, the resolved-path containment, or the forbidden-tree denies
       # that stay in force even for admin.
-      add_required hooks agent-update v2-cross-class-read admin-hook-exemption tool-policy-roster-read-classify 1205-hook-iso-fail-open 6607-hook-admin-allowlist K-beta4-nits 1358-admin-credential-routine-exempt 1367-auth-sealed-paste 1442-config-protected-globs-v2 1569-askuserquestion-bound 1690-tasksdb-read-carveout 1692-admin-bash-symmetry 1709-shared-secret-suffix-guard 1693-read-viewers v0166-lc-config-set-env 1786-tasksdb-doctor-verb 1806-admin-guard-allow-audit 1823-v2-peer-home-containment
+      # Issue #1738 (SECURITY): bridge-config.py's `config set`/`set-env` write
+      # gate now resolves the caller from a controller pane-pid binding +
+      # process ancestry (resolve_config_caller), NOT env identity; tool-policy.py
+      # adds the interim eval/bash -c/sh -c/$var indirection deny. Pull the
+      # adversarial matrix smoke whenever tool-policy.py or bridge-config.py moves
+      # so a future PR cannot regress the env-spoof DENY (both verbs) or the
+      # legit admin-binding / operator-TTY ALLOW.
+      add_required hooks agent-update v2-cross-class-read admin-hook-exemption tool-policy-roster-read-classify 1205-hook-iso-fail-open 6607-hook-admin-allowlist K-beta4-nits 1358-admin-credential-routine-exempt 1367-auth-sealed-paste 1442-config-protected-globs-v2 1569-askuserquestion-bound 1690-tasksdb-read-carveout 1692-admin-bash-symmetry 1709-shared-secret-suffix-guard 1693-read-viewers v0166-lc-config-set-env 1786-tasksdb-doctor-verb 1806-admin-guard-allow-audit 1823-v2-peer-home-containment 1738-config-caller-binding
       # Issue #1497 (P2): lib/system_config_paths.py::bridge_home_dir() now
       # delegates to lib/operator_home.py::operator_home() (the operator-home
       # SSOT). Pull 1497-p2-operator-home so a change to this module or the

@@ -1295,6 +1295,21 @@ if [[ -z "$(bridge_agent_session_id "$AGENT")" ]]; then
   # intent is fully preserved.
   bridge_refresh_agent_session_id "$AGENT" 12 0.25 >/dev/null || true
 fi
+
+# Issue #1738 (SECURITY): publish the controller config-caller binding for this
+# session. bridge-config.py matches its own process ancestry against this
+# pane_pid to authorize `config set` / `config set-env` without trusting
+# spoofable process env. Best-effort: a failed publish leaves no binding, and
+# the wrapper fails closed (denies env-spoofed mutations) rather than
+# mis-authorizing.
+if command -v bridge_publish_config_caller_binding >/dev/null 2>&1; then
+  _bridge_start_pane_pid="$(bridge_tmux_session_pane_pid "$SESSION" 2>/dev/null || true)"
+  if [[ "$_bridge_start_pane_pid" =~ ^[0-9]+$ ]]; then
+    bridge_publish_config_caller_binding "$AGENT" "$_bridge_start_pane_pid" "$ENGINE" || true
+  fi
+  unset _bridge_start_pane_pid
+fi
+
 echo "[info] 세션 '$SESSION' 시작 완료"
 
 # Issue #715-C / #714-5: short post-launch has-session polling so a session

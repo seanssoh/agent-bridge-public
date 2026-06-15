@@ -12316,6 +12316,13 @@ bridge_kill_agent_session() {
   bridge_mcp_orphan_cleanup_after_session_stop "$agent" >/dev/null 2>&1 || true
   bridge_agent_port_aware_orphan_cleanup_after_session_stop "$agent" \
     >/dev/null 2>&1 || true
+  # Issue #1738: drop the controller config-caller binding for the stopped
+  # session so a later same-UID process cannot ride its stale pane_pid. The
+  # binding is re-published on the next bridge-start; until then the wrapper
+  # fails closed (denies env-spoofed config mutations) for this agent.
+  if command -v bridge_remove_config_caller_binding >/dev/null 2>&1; then
+    bridge_remove_config_caller_binding "$agent" >/dev/null 2>&1 || true
+  fi
   bridge_agent_clear_idle_marker "$agent"
   bridge_info "[info] killed ${agent}/${session}"
 }
