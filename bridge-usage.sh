@@ -571,6 +571,20 @@ run_python() {
   if [[ "${BRIDGE_USAGE_PROBE_ENABLED:-1}" == "1" ]]; then
     base_args+=(--native-usage-cache "$claude_usage_cache")
   fi
+  # Stale-attribution guard (rotation ping-pong): tell the monitor which
+  # token is CURRENTLY active (token-FREE one-way digest — never the token
+  # itself) so a synthetic 429-signal cache written for a PREVIOUSLY-active
+  # token is treated as stale instead of instantly re-rotating the freshly
+  # activated token. Registry installs only — without a rotation registry
+  # there is no rotation lane to protect, and the helper prints nothing.
+  if [[ "${BRIDGE_USAGE_PROBE_ENABLED:-1}" == "1" && -f "$claude_token_registry" ]]; then
+    local _active_digest=""
+    _active_digest="$(command python3 "$SCRIPT_DIR/bridge-usage-probe.py" active-token-digest \
+      --registry-path "$claude_token_registry" 2>/dev/null || builtin true)"
+    if [[ -n "$_active_digest" ]]; then
+      base_args+=(--active-token-digest "$_active_digest")
+    fi
+  fi
   base_args+=("$@")
   python3 "$SCRIPT_DIR/bridge-usage.py" "${base_args[@]}"
 }
@@ -729,22 +743,33 @@ bridge_usage_probe_audit() {
   local row=""
   row="$(command python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" usage-probe-result-parse "$probe_json" 2>/dev/null || builtin true)"
   [[ -n "$row" ]] || return 0
-  local p_status p_reset p_retry p_http
+  local p_status p_reset p_retry p_http p_detail
   # #1468: split the tab-separated probe row WITHOUT a here-string (footgun #11
-  # / lint-heredoc-ban H3). The row is token-free (status/reset/retry/http) and
-  # we read it back from a temp file so `read`'s field semantics are preserved
-  # exactly (verified byte-identical to the prior here-string parse).
+  # / lint-heredoc-ban H3). The row is token-free (status/reset/retry/http/
+  # detail) and we read it back from a temp file so `read`'s field semantics
+  # are preserved exactly (verified byte-identical to the prior here-string
+  # parse).
   local _row_tmp=""
   _row_tmp="$(command mktemp "${TMPDIR:-/tmp}/agb-usage-probe-row.XXXXXX" 2>/dev/null)" || return 0
   printf '%s\n' "$row" >"$_row_tmp" 2>/dev/null || { command rm -f "$_row_tmp"; return 0; }
-  IFS=$'\t' read -r p_status p_reset p_retry p_http <"$_row_tmp"
+  IFS=$'\t' read -r p_status p_reset p_retry p_http p_detail <"$_row_tmp"
   command rm -f "$_row_tmp"
   [[ -n "$p_status" ]] || return 0
+  # Decode the `-` sentinel back to empty: the python helper writes `-` for
+  # empty columns so bash `read -r` cannot collapse adjacent IFS=$'\t'
+  # separators (tab is IFS whitespace; an empty middle field used to shift
+  # http_status into the reset_at slot). Same producer/consumer contract as
+  # the mcp-miss-queue drain rows.
+  [[ "$p_reset" == "-" ]] && p_reset=""
+  [[ "$p_retry" == "-" ]] && p_retry=""
+  [[ "$p_http" == "-" ]] && p_http=""
+  [[ "$p_detail" == "-" ]] && p_detail=""
   bridge_audit_log daemon usage_probe "$admin_agent" \
     --detail status="$p_status" \
     --detail reset_at="$p_reset" \
     --detail retry_after="$p_retry" \
     --detail http_status="$p_http" \
+    --detail detail="$p_detail" \
     --detail source="native-oauth-probe" >/dev/null 2>&1 || builtin true
 }
 

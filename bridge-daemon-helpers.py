@@ -895,13 +895,23 @@ def cmd_usage_probe_result_parse(args: argparse.Namespace) -> int:
     probe --json`. Output: a SINGLE tab-separated row IFF the outcome is
     NOTEWORTHY (worth an audit row) — empty stdout otherwise (so the daemon /
     wrapper emits nothing on the common fresh/written/cooldown ticks):
-      status \\t reset_at \\t retry_after \\t http_status
+      status \\t reset_at \\t retry_after \\t http_status \\t detail
+
+    Empty columns are emitted as the `-` sentinel: the consuming bash
+    ``IFS=$'\\t' read`` treats tab as IFS whitespace and COLLAPSES adjacent
+    separators, so an empty middle field would shift every later field left
+    (http_status used to land in the reset_at slot). The consumer decodes
+    `-` back to empty — same producer/consumer contract as the rotation TSV
+    sentinel and the mcp-miss-queue drain rows.
 
     Noteworthy statuses:
       - rate-limited-signal     — a genuine 429 → proactive near-limit signal
                                   persisted (the #1468 catch-22 break).
       - rate-limited-suppressed — a genuine 429 already signalled this window
                                   (idempotent; no re-rotate).
+      - edge-blocked            — the CDN edge blocked the poll (Server:
+                                  cloudflare / no anthropic origin headers);
+                                  NOT an account signal, probe backing off.
       - degraded / scope-degraded / no-token — a probe FAILURE (was silent
                                   best-effort; now observable per #1468 §5).
 
@@ -918,19 +928,26 @@ def cmd_usage_probe_result_parse(args: argparse.Namespace) -> int:
     noteworthy = {
         "rate-limited-signal",
         "rate-limited-suppressed",
+        "edge-blocked",
         "degraded",
         "scope-degraded",
         "no-token",
     }
     if status not in noteworthy:
         return 0
+
+    def _col(value: object) -> str:
+        text = _tsv_clean(value)
+        return text if text else "-"
+
     print(
         "\t".join(
             [
                 status,
-                str(payload.get("reset_at") or ""),
-                str(payload.get("retry_after") if payload.get("retry_after") is not None else ""),
-                str(payload.get("http_status") if payload.get("http_status") is not None else ""),
+                _col(payload.get("reset_at")),
+                _col(payload.get("retry_after") if payload.get("retry_after") is not None else ""),
+                _col(payload.get("http_status") if payload.get("http_status") is not None else ""),
+                _col(payload.get("detail")),
             ]
         )
     )
@@ -1750,7 +1767,8 @@ SUBCOMMANDS = {
     "usage-probe-result-parse": (
         cmd_usage_probe_result_parse,
         [("probe_json", "JSON result from bridge-usage-probe.py probe --json")],
-        "Single noteworthy-outcome row (status/reset_at/retry_after/http_status) or empty.",
+        "Single noteworthy-outcome row (status/reset_at/retry_after/http_status/"
+        "detail, `-` for empty cols) or empty.",
     ),
     "recovery-status-parse": (
         cmd_recovery_status_parse,
