@@ -209,6 +209,13 @@ add_required 1905-upgrade-systemd-quiesce-respawn
 # upgrade-quiesce/restart-phase edit re-runs the launchd-aware guard alongside
 # the systemd one.
 add_required 655-upgrade-launchd-quiesce-respawn
+# Issue #1916: bridge_init_register_default_picker_sweep now migrates the legacy
+# text-kind picker-sweep cron to shell-kind FAIL-SAFE (recreate-first /
+# verify-before-delete) — the legacy row is deleted only after a shell row is
+# confirmed present, so a failed re-register can never strand the host with zero
+# picker-sweep crons. In the full static suite so any init-cron migration edit
+# re-runs the ordering guard.
+add_required 1916-picker-sweep-migrate-atomic
 # rc2 fleet-soak observability hardening for the #1820 reconcile/upgrade path:
 # the reconcile ALWAYS writes a structured result at the canonical
 # state/migration/layout-v2-reconcile/last-apply.json (status noop|applied,
@@ -4537,7 +4544,7 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # identity. Pull 1750-admin-workdir-identity-not-pair-template on every
       # pair-provisioning / init move so the fail-safe foreign-owner guard
       # stays wired to the topology that produced the drift.
-      add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering I-agent-description-roster β-1231-1236-fresh-install-seed-sudoers F-beta4-oauth-bootstrap G-beta4-watchdog-noise beta5-2-epsilon-tmux-inject-busy 1492-admin-dev-pair-workspace-v2 1750-admin-workdir-identity-not-pair-template
+      add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering I-agent-description-roster β-1231-1236-fresh-install-seed-sudoers F-beta4-oauth-bootstrap G-beta4-watchdog-noise beta5-2-epsilon-tmux-inject-busy 1492-admin-dev-pair-workspace-v2 1750-admin-workdir-identity-not-pair-template 1916-picker-sweep-migrate-atomic
       add_integration integration-minimal
       ;;
 

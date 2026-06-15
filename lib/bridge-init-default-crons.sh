@@ -143,8 +143,15 @@ bridge_init_register_default_picker_sweep() {
   # exist yet — the enumerate treats that as "no job, proceed".
   local enum_lines shell_seen=0 legacy_ids=() legacy_titleonly=0
   enum_lines="$(_bridge_init_picker_sweep_enumerate "$agent_bridge_cli")"
-  local _id _kind
-  while IFS=$'\t' read -r _id _kind; do
+  local _line _id _kind
+  while IFS= read -r _line; do
+    # Split on the FIRST tab WITHOUT IFS whitespace-stripping. `IFS=$'\t' read`
+    # would strip a *leading* tab, so an id-less `\t<kind>` row (older `cron
+    # list` shape / mock without ids) collapses the kind into _id and the id-less
+    # leave/warn path below goes dead (codex #1919 r1 finding). Parameter
+    # expansion preserves the empty id field.
+    _id="${_line%%$'\t'*}"
+    _kind="${_line#*$'\t'}"
     [[ -n "$_kind" || -n "$_id" ]] || continue
     if [[ "$_kind" == "shell" ]]; then
       shell_seen=1
@@ -154,48 +161,47 @@ bridge_init_register_default_picker_sweep() {
     if [[ -n "$_id" ]]; then
       legacy_ids+=("$_id")
     else
-      # No id surfaced (older list shape / mock without ids) — fall back to a
-      # title-scoped delete, which is only unambiguous when this is the sole row.
+      # No id surfaced (older list shape / mock without ids) — the id-less
+      # leave/warn path (a title delete is ambiguous once a shell row coexists).
       legacy_titleonly=1
     fi
   done <<< "$enum_lines"
 
-  # Remove every legacy non-shell row by its id (precise; never touches a shell
-  # row). Non-fatal: a delete failure leaves the broken row behind but must not
-  # block init — we warn and continue.
-  local _legacy_id
-  for _legacy_id in "${legacy_ids[@]:-}"; do
-    [[ -n "$_legacy_id" ]] || continue
-    if "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron delete "$_legacy_id" >/dev/null 2>&1; then
-      printf '[init] picker-sweep cron migrate — removed legacy text-kind (codex-pair) job id=%s\n' "$_legacy_id" >&2
-    else
-      printf '[init] picker-sweep cron migrate — could not remove legacy text-kind job id=%s; shell-kind re-register may be skipped\n' "$_legacy_id" >&2
-    fi
-  done
-  # Title-only fallback for an id-less single legacy row (no shell row present,
-  # so a title delete is unambiguous).
-  if [[ "$legacy_titleonly" -eq 1 && "$shell_seen" -eq 0 && "${#legacy_ids[@]}" -eq 0 ]]; then
-    if "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron delete picker-sweep >/dev/null 2>&1; then
-      printf '[init] picker-sweep cron migrate — removed legacy text-kind (codex-pair) job (by title)\n' >&2
-    else
-      printf '[init] picker-sweep cron migrate — could not remove legacy text-kind job; shell-kind re-register may be skipped\n' >&2
-    fi
-  fi
+  # #1916 FAIL-SAFE migration ordering (recreate-first / verify-before-delete).
+  # The legacy text-kind row is deleted ONLY after a shell-kind row is confirmed
+  # present — never the old delete-then-recreate, where a failed re-register
+  # (observed on a v0.16.12 cm-prod upgrade: the create raced the daemon-restart
+  # window) stranded the host with ZERO picker-sweep crons. Deletes are BY ID
+  # (precise; never touches a shell row), so create-first + delete-after stays
+  # unambiguous even while a legacy text row and the new shell row briefly
+  # coexist.
 
+  # Case A: a shell-kind row already exists → migration already complete on a
+  # prior pass. Safe to remove any coexisting legacy text-kind rows now.
   if [[ "$shell_seen" -eq 1 ]]; then
+    _bridge_init_picker_sweep_remove_legacy_by_id "$agent_bridge_cli" "${legacy_ids[@]:-}"
+    if [[ "$legacy_titleonly" -eq 1 ]]; then
+      # An id-less legacy row cannot be title-deleted while a shell row also
+      # exists (`cron delete picker-sweep` matches both → ambiguous). Leave it
+      # rather than risk deleting the working shell row; warn for the operator.
+      printf '[init] picker-sweep cron migrate — legacy id-less text-kind row remains (cannot title-delete alongside the shell row); operator can remove it manually per OPERATIONS.md\n' >&2
+    fi
     printf '[init] picker-sweep cron already registered (shell-kind) — skip%s\n' \
       "$([[ "${#legacy_ids[@]}" -gt 0 ]] && printf ' (removed %s legacy row(s))' "${#legacy_ids[@]}")" >&2
     return 0
   fi
 
-  # Register the SHELL-kind controller-direct cron. The run-as-agent is the
-  # admin (resolves to the controller UID), so the cron runner executes
-  # scripts/picker-sweep.sh directly as the controller — engine-independent, no
-  # codex pair, no self-recursion. `$BRIDGE_HOME` in --script is expanded by the
-  # CLI at registration time (resolve_shell_script). The knobs are carried as
-  # SCRIPT_-prefixed env (the shell runner rejects BRIDGE_-prefixed payload env);
-  # scripts/picker-sweep.sh reads SCRIPT_PICKER_SWEEP_* as fallbacks.
-  if "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron create \
+  # Case B: no shell-kind row → register it FIRST, then delete the legacy
+  # text-kind row(s) ONLY after the shell row is confirmed present.
+  #
+  # The run-as-agent is the admin (resolves to the controller UID), so the cron
+  # runner executes scripts/picker-sweep.sh directly as the controller —
+  # engine-independent, no codex pair, no self-recursion. `$BRIDGE_HOME` in
+  # --script is expanded by the CLI at registration time (resolve_shell_script).
+  # The knobs are carried as SCRIPT_-prefixed env (the shell runner rejects
+  # BRIDGE_-prefixed payload env); scripts/picker-sweep.sh reads
+  # SCRIPT_PICKER_SWEEP_* as fallbacks.
+  if ! "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron create \
         --kind shell \
         --agent "$admin_agent" \
         --run-as-agent "$admin_agent" \
@@ -205,9 +211,68 @@ bridge_init_register_default_picker_sweep() {
         --script-env "SCRIPT_PICKER_SWEEP_ENABLED=1" \
         --script-env "SCRIPT_PICKER_SWEEP_SELF=${admin_agent}" \
         --script-env "SCRIPT_PICKER_SWEEP_NOTIFY=${admin_agent}" >/dev/null 2>&1; then
-    printf '[init] picker-sweep cron registered (*/10 * * * *, shell-kind, run-as=%s, self/notify=%s)\n' "$admin_agent" "$admin_agent" >&2
-  else
-    printf '[init] picker-sweep cron registration failed — operator can register manually per OPERATIONS.md\n' >&2
+    # FAIL-SAFE: the shell-kind register failed → do NOT delete any legacy row.
+    # The host keeps its existing (text-kind) picker-sweep; the next upgrade pass
+    # retries the migration. This is the #1916 fix — no window with neither.
+    if [[ "${#legacy_ids[@]}" -gt 0 || "$legacy_titleonly" -eq 1 ]]; then
+      printf '[init] picker-sweep cron registration failed — legacy text-kind job LEFT IN PLACE so the host keeps a working picker-sweep; the next upgrade retries the shell-kind migration\n' >&2
+    else
+      printf '[init] picker-sweep cron registration failed — operator can register manually per OPERATIONS.md\n' >&2
+    fi
+    return 0
+  fi
+  printf '[init] picker-sweep cron registered (*/10 * * * *, shell-kind, run-as=%s, self/notify=%s)\n' "$admin_agent" "$admin_agent" >&2
+
+  # Verify-before-delete: re-enumerate and confirm the shell row is actually
+  # present before removing the legacy text-kind row(s). A create that returned 0
+  # but did not commit (the suspected daemon-restart race) must NOT trigger the
+  # legacy delete — leaving the legacy row is the safe direction.
+  if ! _bridge_init_picker_sweep_shell_present "$agent_bridge_cli"; then
+    printf '[init] picker-sweep cron migrate — shell-kind not confirmed after create; legacy text-kind job LEFT IN PLACE (verify-before-delete); next upgrade retries\n' >&2
+    return 0
+  fi
+
+  # Shell row confirmed present → safe to remove the legacy text-kind row(s).
+  _bridge_init_picker_sweep_remove_legacy_by_id "$agent_bridge_cli" "${legacy_ids[@]:-}"
+  if [[ "$legacy_titleonly" -eq 1 ]]; then
+    # See Case A: a post-create title delete is ambiguous (legacy + new shell
+    # share the title). Leave the id-less legacy row + warn rather than risk the
+    # shell row.
+    printf '[init] picker-sweep cron migrate — legacy id-less text-kind row remains (cannot title-delete alongside the new shell row); operator can remove it manually per OPERATIONS.md\n' >&2
   fi
   return 0
+}
+
+# Delete each legacy picker-sweep row BY ID (precise — never touches a shell-kind
+# row). Non-fatal: a delete failure leaves the broken row behind but must not
+# block init — we warn and continue. Called by the migration ONLY after a
+# shell-kind row is confirmed present (#1916 recreate-first ordering).
+_bridge_init_picker_sweep_remove_legacy_by_id() {
+  local agent_bridge_cli="$1"; shift
+  local _legacy_id
+  for _legacy_id in "$@"; do
+    [[ -n "$_legacy_id" ]] || continue
+    if "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron delete "$_legacy_id" >/dev/null 2>&1; then
+      printf '[init] picker-sweep cron migrate — removed legacy text-kind (codex-pair) job id=%s\n' "$_legacy_id" >&2
+    else
+      printf '[init] picker-sweep cron migrate — could not remove legacy text-kind job id=%s (left in place)\n' "$_legacy_id" >&2
+    fi
+  done
+}
+
+# Returns 0 iff at least one SHELL-kind picker-sweep job is registered. Used by
+# the migration's verify-before-delete step (#1916). Matches with a `case` glob
+# on the captured output — NOT a `<<<` here-string or `< <()` process
+# substitution (both trip lint-heredoc-ban H3), and NOT a `| grep -q` pipe
+# (a pipefail SIGPIPE could false-negative, the #1813 class).
+_bridge_init_picker_sweep_shell_present() {
+  local agent_bridge_cli="$1" _out
+  _out="$(_bridge_init_picker_sweep_enumerate "$agent_bridge_cli")"
+  # enumerate emits one `<id>\t<kind>` line per picker-sweep job; kind is exactly
+  # "text" or "shell". Wrap with newlines so every line (including the last, whose
+  # trailing newline `$()` stripped) is bounded, then glob for a `\tshell\n` token.
+  case $'\n'"$_out"$'\n' in
+    *$'\tshell\n'*) return 0 ;;
+  esac
+  return 1
 }
