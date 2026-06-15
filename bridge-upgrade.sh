@@ -97,6 +97,12 @@ RESTART_AGENTS_EXPLICIT=0
 # nounset-safe even when the reconcile block is skipped (e.g. the reconcile lib
 # is absent).
 _UPGRADE_DAEMON_SYSTEMD_MANAGED=0
+# Issue #655: set to 1 by the #1820 quiesce step when this install's daemon is
+# launchd-managed (macOS) so the restart phase restores via launchctl
+# bootstrap+kickstart instead of `bridge-daemon.sh ensure`. Same nounset-safe
+# init rationale as the systemd flag above. A host is systemd OR launchd, never
+# both, so at most one of these two flags is ever set to 1.
+_UPGRADE_DAEMON_LAUNCHD_MANAGED=0
 JSON=0
 ALLOW_DIRTY=0
 ALLOW_DIRTY_SOURCE=0
@@ -1312,6 +1318,117 @@ _bridge_upgrade_systemd_restart_daemon() {
   return 0
 }
 # END: Issue #1905 systemd-aware quiesce/restart helpers
+
+# BEGIN: Issue #655 launchd-aware quiesce/restart around the #1820 reconcile
+# The macOS analog of #1905. On a macOS launchd install the daemon lifecycle is
+# owned by the agent-bridge LaunchAgent (`KeepAlive=true`). A script-level
+# `bridge-daemon.sh stop` is NOT launchd-aware, so launchd RESPAWNS the daemon
+# within ~1-2s inside the #1820 reconcile quiesce window and the fail-closed
+# fence (lib/bridge-layout-v2-reconcile.sh) keeps seeing a live pid → rc=3 abort
+# → half-applied upgrade. (Same failure shape #1905 fixed for systemd; the
+# systemd helpers above are a no-op on macOS because they gate on `systemctl`.)
+# Mirror the installer's own bootout/bootstrap lifecycle
+# (scripts/install-daemon-launchagent.sh): when launchd-managed, BOOT OUT (and
+# disable) the KeepAlive job for the reconcile window so launchd cannot respawn,
+# and BOOTSTRAP + enable it back on restart. Everything here is gated behind a
+# launchd-active check and is best-effort, so non-launchd installs (Linux
+# systemd, plain-bash) are byte-for-byte unchanged — a host is systemd OR
+# launchd, never both.
+
+# True only when this is a macOS launchd-managed install (Darwin + launchctl +
+# a resolvable agent-bridge LaunchAgent label). Reuses _bridge_daemon_launchd_label
+# from lib/bridge-daemon-control.sh (sourced via bridge-lib.sh) — the same
+# "we are launchd-managed" signal the #1463 supervisor restart uses (the label
+# resolves from the installer-written state/launchagent.config marker, or the
+# bridge-lib default only when the plist actually exists on disk, so a
+# systemd/plain-bash install is correctly treated as non-launchd). Prints
+# nothing; rc-only. The resolved label is exported in _BRIDGE_UPGRADE_LAUNCHD_LABEL
+# for the quiesce/restart helpers so they don't re-resolve it.
+_BRIDGE_UPGRADE_LAUNCHD_LABEL=""
+_bridge_upgrade_daemon_launchd_active() {
+  [[ "$(uname 2>/dev/null)" == "Darwin" ]] || return 1
+  command -v launchctl >/dev/null 2>&1 || return 1
+  command -v _bridge_daemon_launchd_label >/dev/null 2>&1 || return 1
+  local label
+  label="$(_bridge_daemon_launchd_label 2>/dev/null || true)"
+  [[ -n "$label" ]] || return 1
+  _BRIDGE_UPGRADE_LAUNCHD_LABEL="$label"
+  return 0
+}
+
+# Boot out (and disable) the launchd KeepAlive job so launchd cannot respawn the
+# daemon during the #1820 reconcile. `bootout` unloads the supervised job
+# entirely; `disable` keeps KeepAlive from re-loading it for the reconcile
+# window. Best-effort (`|| true`): a launchctl failure must never abort the
+# upgrade. No-op (returns 0, no launchctl calls) on a non-launchd install.
+_bridge_upgrade_launchd_quiesce_daemon() {
+  _bridge_upgrade_daemon_launchd_active || return 0
+  local uid label
+  uid="$(id -u 2>/dev/null || printf '%s' "${UID:-}")"
+  label="$_BRIDGE_UPGRADE_LAUNCHD_LABEL"
+  if [[ -z "$uid" || -z "$label" ]]; then
+    echo "[bridge-upgrade] WARN: launchd-managed daemon detected but could not resolve uid/label — leaving the script-level stop to handle the quiesce (launchd KeepAlive may respawn the daemon and race the #1820 fence; if the reconcile refuses (rc=3), run: launchctl bootout gui/\$(id -u)/<label> ; then re-run the upgrade)." >&2
+    return 0
+  fi
+  echo "[bridge-upgrade] launchd-managed daemon detected — booting out gui/${uid}/${label} for the layout-v2 reconcile window (KeepAlive would otherwise respawn the daemon and race the #1820 fence)." >&2
+  # disable first so a bootout cannot be immediately re-loaded by KeepAlive,
+  # then bootout to unload the running job. Both best-effort.
+  launchctl disable "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  launchctl bootout "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  return 0
+}
+
+# Restore the launchd KeepAlive job after the reconcile. Re-enable, bootstrap the
+# plist back, then kickstart so the supervised instance comes up immediately.
+# Mirrors the installer's --load path (scripts/install-daemon-launchagent.sh).
+# Best-effort. ALWAYS returns 0 so a launchctl hiccup can NEVER abort the upgrade
+# under `set -euo pipefail` — the caller invokes this as the last statement of a
+# `then`-branch, where a non-zero return WOULD trip set -e. If launchctl has
+# somehow vanished, or the plist cannot be resolved, WARN and leave the operator
+# to re-load by hand (the daemon stays down rather than the upgrade aborting).
+_bridge_upgrade_launchd_restart_daemon() {
+  if ! command -v launchctl >/dev/null 2>&1; then
+    echo "[bridge-upgrade] WARN: launchctl not found at restart time on a launchd-managed install — re-load the LaunchAgent by hand (launchctl bootstrap gui/\$(id -u) <plist>)." >&2
+    return 0
+  fi
+  local uid label
+  uid="$(id -u 2>/dev/null || printf '%s' "${UID:-}")"
+  # Prefer the label resolved at quiesce time (persists in this process); fall
+  # back to re-resolving it so this helper is self-contained (mirrors the
+  # systemd restart helper re-asserting the user bus).
+  label="${_BRIDGE_UPGRADE_LAUNCHD_LABEL:-}"
+  if [[ -z "$label" ]] && command -v _bridge_daemon_launchd_label >/dev/null 2>&1; then
+    label="$(_bridge_daemon_launchd_label 2>/dev/null || true)"
+  fi
+  if [[ -z "$uid" || -z "$label" ]]; then
+    echo "[bridge-upgrade] WARN: could not resolve uid/label to restore the launchd job — re-load the LaunchAgent by hand (launchctl bootstrap gui/\$(id -u) <plist>)." >&2
+    return 0
+  fi
+  # Resolve the plist path from the installer-written marker so bootstrap names
+  # the right file (the label-only restore is not enough — bootstrap needs the
+  # plist). Fall back to the bridge-lib default, then the standard install path.
+  local plist=""
+  local config_path="${BRIDGE_STATE_DIR:-$TARGET_ROOT/state}/launchagent.config"
+  if [[ -f "$config_path" ]]; then
+    plist="$(
+      # shellcheck disable=SC1090
+      source "$config_path" 2>/dev/null
+      printf '%s' "${BRIDGE_LAUNCHAGENT_PLIST:-}"
+    )"
+  fi
+  [[ -n "$plist" ]] || plist="${BRIDGE_DAEMON_LAUNCHAGENT_PLIST:-}"
+  [[ -n "$plist" ]] || plist="${HOME:-}/Library/LaunchAgents/${label}.plist"
+  echo "[bridge-upgrade] restoring launchd-managed daemon — re-enabling + bootstrapping gui/${uid}/${label}." >&2
+  launchctl enable "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  if [[ -f "$plist" ]]; then
+    launchctl bootstrap "gui/${uid}" "$plist" >/dev/null 2>&1 || true
+  else
+    echo "[bridge-upgrade] WARN: launchd plist not found at '$plist' — cannot bootstrap; kickstart-only restore (KeepAlive will re-supervise if the job is still loaded)." >&2
+  fi
+  launchctl kickstart -k "gui/${uid}/${label}" >/dev/null 2>&1 || true
+  return 0
+}
+# END: Issue #655 launchd-aware quiesce/restart helpers
 
 # #8945 Track D: record the Codex CLI version across upgrades and surface a
 # NON-FATAL operator advisory when the MAJOR or MINOR component changes.
@@ -3179,6 +3296,33 @@ if [[ $DRY_RUN -eq 0 ]]; then
     # Best-effort: the quiesce helper always returns 0; `|| true` is
     # belt-and-suspenders so a systemctl hiccup can never abort the upgrade.
     _bridge_upgrade_systemd_quiesce_daemon || true
+    # Issue #655: the launchd analog. On a macOS launchd install the LaunchAgent
+    # KeepAlive=true respawns the daemon inside this quiesce window and the #1820
+    # fence keeps seeing a live pid → rc=3 abort (the systemd helper above is a
+    # no-op here because it gates on `systemctl`). Boot out + disable the launchd
+    # job FIRST so launchd cannot respawn, then fall through to the script-level
+    # stop. The helper is a no-op on non-launchd installs (gated on Darwin +
+    # launchctl + a resolvable label), so systemd/plain-bash keep the existing
+    # path unchanged. Remember whether this install was launchd-managed so the
+    # restart phase below restores via launchctl bootstrap+kickstart instead of
+    # `bridge-daemon.sh ensure` (the job is booted out now, so we cannot
+    # re-detect at restart time).
+    #
+    # A host is systemd OR launchd, never both, but make that mutual exclusion
+    # STRUCTURAL: only detect/quiesce launchd when systemd was NOT managed, so
+    # the quiesce side mirrors the restart side's `if systemd / elif launchd`
+    # precedence exactly. This guarantees we never boot out a launchd job that
+    # the restart phase would then skip restoring (the restart prefers the
+    # systemd branch when both flags are set), which would leave the daemon down.
+    _UPGRADE_DAEMON_LAUNCHD_MANAGED=0
+    if [[ "$_UPGRADE_DAEMON_SYSTEMD_MANAGED" != "1" ]]; then
+      if _bridge_upgrade_daemon_launchd_active; then
+        _UPGRADE_DAEMON_LAUNCHD_MANAGED=1
+      fi
+      # Best-effort: the quiesce helper always returns 0; `|| true` is
+      # belt-and-suspenders so a launchctl hiccup can never abort the upgrade.
+      _bridge_upgrade_launchd_quiesce_daemon || true
+    fi
     # `--force` because the upgrader is the sanctioned daemon stop path.
     bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
     # CANONICAL reconcile result path. The driver/wrapper ALSO writes this same
@@ -3285,6 +3429,15 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
     # helper always returns 0, and the trailing `|| true` is belt-and-suspenders
     # so the upgrade can never abort here under set -e.
     _bridge_upgrade_systemd_restart_daemon || true
+  elif [[ "${_UPGRADE_DAEMON_LAUNCHD_MANAGED:-0}" == "1" ]]; then
+    # Issue #655: this install is launchd-managed (macOS) and the #1820 quiesce
+    # step booted out + disabled its LaunchAgent. Don't fight launchd on the way
+    # back up — restore via launchctl (re-enable + bootstrap the plist +
+    # kickstart) instead of `bridge-daemon.sh ensure`, mirroring the installer's
+    # --load path. Best-effort: the helper always returns 0, and the trailing
+    # `|| true` is belt-and-suspenders so the upgrade can never abort here under
+    # set -e.
+    _bridge_upgrade_launchd_restart_daemon || true
   else
     # --force: the upgrader is the sanctioned daemon stop+restart path
     # (issue #314 Layer 3 / #315 Track 3). Bypass the active-agent guard.
