@@ -11574,12 +11574,14 @@ bridge_agent_wake_status() {
 
   session="$(bridge_agent_session "$agent")"
   if [[ -n "$session" ]] && bridge_tmux_session_exists "$session"; then
-    case "$(bridge_tmux_claude_blocker_state "$session" 2>/dev/null || true)" in
-      trust|summary)
-        printf '%s' "block"
-        return 0
-        ;;
-    esac
+    # Issue #1181: same blocking-modal predicate the snapshot writer uses
+    # (bridge_tmux_claude_blocker_state_is_block) so `agent show` / heartbeat
+    # agree with `agb status`. The modal list lives in one place (bridge-tmux.sh).
+    if bridge_tmux_claude_blocker_state_is_block \
+      "$(bridge_tmux_claude_blocker_state "$session" 2>/dev/null || true)"; then
+      printf '%s' "block"
+      return 0
+    fi
   fi
 
   if bridge_agent_has_wake_channel "$agent"; then

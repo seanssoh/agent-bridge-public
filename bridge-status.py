@@ -1670,6 +1670,15 @@ def render_dashboard(args: argparse.Namespace) -> str:
         for row in roster
         if row.get("channels") == "miss"
     ]
+    # Issue #1181: agents whose input pane is owned by a blocking Claude modal
+    # (wake=block) so a nudge can't land. Surface the modal class (wake_reason)
+    # in a dedicated block so the operator can act on it, not just see `block`
+    # in the wake column.
+    wake_blocked_rows = [
+        row
+        for row in roster
+        if row.get("wake") == "block"
+    ]
     # #1405: A2A receiver supervisor health. Read-only over the daemon-written
     # supervise state; rendered only on A2A-configured installs (silent
     # otherwise). `a2a_flag` is the header summary token (ALARM/DOWN), empty
@@ -1868,6 +1877,19 @@ def render_dashboard(args: argparse.Namespace) -> str:
         if len(channel_warning_rows) > 8:
             lines.append(f"- ... +{len(channel_warning_rows) - 8} more")
 
+    # Issue #1181: a wake=block agent has a modal owning its input pane and
+    # cannot receive nudges. Name the modal class so the operator knows what to
+    # dismiss (feedback_survey is auto-dismissable; permission/overwrite/
+    # context_pressure carry real semantics and need a human).
+    if wake_blocked_rows:
+        lines.append("")
+        lines.append("Wake Blocked (input pane held by a modal — nudges can't land)")
+        for row in wake_blocked_rows[:8]:
+            reason = (row.get("wake_reason") or "unknown modal").strip()
+            lines.append(f"- {row['agent']}: {reason}")
+        if len(wake_blocked_rows) > 8:
+            lines.append(f"- ... +{len(wake_blocked_rows) - 8} more")
+
     # Issue #1844: rows are now built from real probe status (unknown plugins
     # are omitted upstream in plugins_for_agent), so the section only prints
     # when there is genuine signal. Non-ok rows sort first so the actionable
@@ -2009,6 +2031,9 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
             "active": active,
             "activity_state": row.get("activity_state") or ("stopped" if not active else "working"),
             "wake": row.get("wake") or "-",
+            # Issue #1181: modal-class blocker (feedback_survey, permission_grant,
+            # ...) that owns the input pane when wake=block. Empty otherwise.
+            "wake_reason": row.get("wake_reason") or "",
             "channel_status": row.get("channels") or "-",
             "channel_reason": row.get("channel_reason") or "",
             "configured_channels": row.get("configured_channels") or "",

@@ -1079,3 +1079,40 @@ workdir in Codex (run `codex` once in the workdir and accept) or set
 **Static / admin Codex are unchanged** — per-agent `<agent_home>/.codex` profiles
 + `hooks.json` + managed `auth.json` sync + bridge `codex resume <id>`.
 Regression smoke: `scripts/smoke/1899-dynamic-vanilla-codex.sh`.
+
+## 37. Claude feedback-survey (and other modals) can silently block nudge delivery (#1181)
+
+Symptom:
+
+- A long-running Claude agent (uptime measured in days, always-on) periodically
+  has Claude Code's post-session rating modal drawn into its input pane:
+  `How is Claude doing this session? ... 0: Dismiss`. While the modal owns the
+  input, the composer never consumes pasted nudges, so queue notifications and
+  channel messages sit unanswered — the agent is silently deaf.
+
+Detection (v0.16.13+, Layer 1):
+
+- `bridge_tmux_claude_blocker_state_from_text` now recognises the feedback
+  survey plus `permission_grant` / `overwrite_confirm` / `context_pressure`
+  modals (best-guess signatures for the latter three; a missed match returns
+  `none`, the safe direction).
+- A blocked agent reports `wake=block` with a `wake_reason` (e.g.
+  `wake_reason=feedback_survey`) on `agent-bridge status`, `status --json`, and
+  `agent show`. The dashboard's **Wake Blocked** block names the modal class.
+- A nudge that drops while a modal owns the pane records
+  `session_nudge_dropped reason=modal_<state>` in the audit log (the original
+  `submit_lost_post_grace` reason stays reserved for the #331 composer race),
+  so the row is operator-actionable.
+- Layer 1 is **detection + status + audit only** — it never sends keys to the
+  pane. Dismissal stays an operator action: `tmux capture-pane -p` the session,
+  send `0`, and the agent recovers on the next nudge tick. (An opt-in Layer 2
+  auto-dismiss for the feedback survey only is a deferred follow-up.)
+
+Recommended noise-reduction config:
+
+- Set `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1` in the agent's
+  `~/.claude/settings.json` `env` block so the survey modal never renders for
+  future Claude Code sessions on that host. This removes the *survey* signature
+  only; the detection above still covers the other modal classes.
+
+Regression smoke: `scripts/smoke/1181-modal-blocker-detect.sh`.

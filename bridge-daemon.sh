@@ -8181,11 +8181,16 @@ bridge_daemon_sweep_cron_dispatch_backlog() {
 
 # Issue #1459 — late nudge-success sweep. SEPARATE from the cron
 # reconciler (run_reconcile_run_state): this reconciles HUMAN nudge drops,
-# not cron status-file state pairs. For each prior
-# `session_nudge_dropped reason=submit_lost_post_grace` audit row whose
-# task later reached claimed/done, emit `session_nudge_late_success` once
-# so status/reporting can count UNRESOLVED drops (not raw drop rows). The
-# resolved-drop marker dir prevents a re-emit every tick.
+# not cron status-file state pairs. For each prior `session_nudge_dropped`
+# audit row whose task later reached claimed/done, emit
+# `session_nudge_late_success` once so status/reporting can count UNRESOLVED
+# drops (not raw drop rows). The resolved-drop marker dir prevents a re-emit
+# every tick.
+# Issue #1181: the drop reason can now be `submit_lost_post_grace` (the #331
+# composer race) OR `modal_<state>` (input blocked by a Claude modal). Both
+# resolve the same way — the next nudge tick lands once the agent is
+# unblocked — so the sweep filters by --action alone (session_nudge_dropped is
+# emitted from exactly one site) rather than pinning to a single reason string.
 bridge_daemon_nudge_late_success_state_dir() {
   printf '%s/nudge-late-success' "$BRIDGE_STATE_DIR"
 }
@@ -8209,7 +8214,7 @@ bridge_daemon_sweep_nudge_late_success() {
   state_dir="$(bridge_daemon_nudge_late_success_state_dir)"
   mkdir -p "$state_dir" 2>/dev/null || true
 
-  local list_args=(list --file "$BRIDGE_AUDIT_LOG" --action session_nudge_dropped --contains submit_lost_post_grace --limit 200)
+  local list_args=(list --file "$BRIDGE_AUDIT_LOG" --action session_nudge_dropped --limit 200)
   if [[ -n "$since_iso" ]]; then
     list_args+=(--since "$since_iso")
   fi
@@ -9188,9 +9193,23 @@ nudge_agent_session() {
       else
         _total_wait_seconds=$nudge_grace_seconds
       fi
+      # Issue #1181: distinguish "agent input blocked by a modal" from the
+      # #331 composer race. Probe the live pane (detection only — no
+      # key-sending); if a known blocker modal owns the input, record
+      # reason=modal_<state> so the audit row is operator-actionable.
+      # submit_lost_post_grace stays reserved for the genuine composer race so
+      # existing audit consumers filtering on it still find that class.
+      local _nudge_drop_reason="submit_lost_post_grace"
+      local _blocker_state="none"
+      if [[ -n "$session" ]]; then
+        _blocker_state="$(bridge_tmux_claude_blocker_state "$session" 2>/dev/null || printf 'none')"
+        if [[ "$_blocker_state" != "none" ]]; then
+          _nudge_drop_reason="modal_${_blocker_state}"
+        fi
+      fi
       bridge_audit_log daemon session_nudge_dropped "$agent" \
         --detail task_id="$task_id" \
-        --detail reason=submit_lost_post_grace \
+        --detail reason="$_nudge_drop_reason" \
         --detail grace_seconds="$nudge_grace_seconds" \
         --detail grace_stage2_total_seconds="$nudge_grace_stage2_total" \
         --detail grace_total_seconds="$_total_wait_seconds" \
