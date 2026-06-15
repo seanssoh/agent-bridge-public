@@ -1068,6 +1068,32 @@ def detect_engine(agent_dir: Path, session_type: str) -> str:
     return "claude"
 
 
+# Issue #1906: identity-line signature of a Codex-contract AGENTS.md. The codex
+# AGENTS.md template (agents/_template/codex/AGENTS.md) opens its managed block
+# with this exact literal prose — it carries no `<placeholder>` tokens, so it
+# survives render_template byte-for-byte in every scaffolded/backfilled codex
+# AGENTS.md. Keying on the rendered identity line (rather than mere file
+# presence) means a codex agent's own legitimate AGENTS.md is recognised, while
+# a hand-authored non-codex AGENTS.md never trips the residue detector.
+CODEX_CONTRACT_AGENTS_MD_MARKER = "You are a Codex (gpt) agent"
+
+
+def agents_md_is_codex_contract(agents_md_path: Path) -> bool:
+    """Issue #1906: True iff ``AGENTS.md`` carries the Codex operating contract.
+
+    Read-only content-signature probe (never mutates / never renames). Detects
+    the codex identity line the codex AGENTS.md template materializes; an absent
+    or unreadable file, or one without the marker, returns False.
+    """
+    try:
+        if not agents_md_path.is_file():  # noqa: raw-pathlib-controller-only
+            return False
+        text = agents_md_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return CODEX_CONTRACT_AGENTS_MD_MARKER in text
+
+
 @dataclass
 class AgentMigrationResult:
     agent: str
@@ -1601,6 +1627,13 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
     backfilled: list[str] = []
     refreshed: list[str] = []
     held: list[dict[str, str]] = []
+    # Issue #1906: REPORT-ONLY residue list. A correct non-codex agent that
+    # still carries a stale Codex-contract AGENTS.md (a pre-#1896 mis-scaffold
+    # residue) is invisible to the `skip` path — `detect_engine` keys on
+    # CLAUDE.md only, so a stray codex AGENTS.md never flips the decision off
+    # `skip` and the file is never inspected. Flag it for the operator; NEVER
+    # delete/rename/edit it here (removal stays a deliberate operator action).
+    engine_mismatch_docs: list[dict[str, str]] = []
     errors: list[dict[str, str]] = []
     checked = 0
 
@@ -1623,6 +1656,28 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
                 })
                 continue
             if decision != "backfill":
+                # decision == "skip": roster declares a non-codex engine (or no
+                # engine signal). #1906 residue scan — REPORT-ONLY. Only a
+                # POSITIVE non-codex roster engine is authoritative enough to
+                # call an existing Codex-contract AGENTS.md "mismatched"; an
+                # engine-unknown skip is not (mirrors the fail-closed stance,
+                # and the disagreement-with-a-codex-CLAUDE.md case already
+                # lands in `hold`, never here). Note: a non-codex agent's
+                # compat CLAUDE.md is legitimate (lib/bridge-agent-layout.sh
+                # codex read-target), so the symmetric "stray CLAUDE.md on a
+                # codex agent" is NOT a mismatch and is intentionally out of
+                # scope.
+                roster = (roster_engine or "").strip().lower()
+                if roster and roster != "codex":
+                    agents_md = path / "AGENTS.md"
+                    if agents_md_is_codex_contract(agents_md):
+                        engine_mismatch_docs.append({
+                            "agent": path.name,
+                            "roster_engine": roster,
+                            "doc": "AGENTS.md",
+                            "detected_contract": "codex",
+                            "path": str(agents_md),
+                        })
                 continue
             # Roster is authoritative: materialize the codex template under the
             # roster-declared engine (`codex`), never the filesystem heuristic.
@@ -1669,8 +1724,12 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
 
     # #1892: a held agent (roster/heuristic engine disagreement) is non-clean so
     # the daemon files the operator-visible `[hygiene]` warning task instead of
-    # silently materializing the wrong template.
-    non_clean = bool(backfilled or refreshed or held or errors)
+    # silently materializing the wrong template. #1906: an engine-mismatched doc
+    # (stale Codex-contract AGENTS.md on a non-codex agent) is non-clean too, so
+    # the same `[hygiene]` surface flags the residue for an operator to remove.
+    non_clean = bool(
+        backfilled or refreshed or held or engine_mismatch_docs or errors
+    )
     payload = {
         "dry_run": dry_run,
         "codex_agents_checked": checked,
@@ -1682,6 +1741,10 @@ def cmd_backfill_codex_entrypoints(args: argparse.Namespace) -> int:
         "refreshed_count": len(refreshed),
         "held": sorted(held, key=lambda h: h["agent"]),
         "held_count": len(held),
+        "engine_mismatch_docs": sorted(
+            engine_mismatch_docs, key=lambda d: d["agent"]
+        ),
+        "engine_mismatch_docs_count": len(engine_mismatch_docs),
         "errors": errors,
         "non_clean": non_clean,
     }
