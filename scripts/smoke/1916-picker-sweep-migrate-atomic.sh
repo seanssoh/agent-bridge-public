@@ -238,7 +238,12 @@ assert_idless_legacy_only_create_leaves_and_warns() {
 main() {
   smoke_require_cmd grep
   smoke_require_cmd sed
-  smoke_make_temp_root
+  # Full isolated BRIDGE_HOME (not just a temp root): the driver sources
+  # bridge-lib.sh and calls bridge_load_roster / bridge_agent_exists, which need
+  # a clean BRIDGE_HOME + BRIDGE_ROSTER_FILE. Without it the gate silently
+  # early-returns on Linux CI (empty cron log) while macOS happened to tolerate
+  # it — same env-isolation pattern the admin-pair sibling smoke uses.
+  smoke_setup_bridge_home "$SMOKE_NAME"
   : "${BRIDGE_BASH_BIN_FALLBACK:=bash}"
   export BRIDGE_BASH_BIN_FALLBACK
 
