@@ -68,10 +68,16 @@ assert_agent_symlink_created() {
   [[ -L "$link" ]] || smoke_fail \
     "agent home must contain ADMIN-PROTOCOL.md as a symlink (got non-symlink or missing)"
 
-  local target
-  target="$(readlink "$link")"
-  smoke_assert_eq "../shared/ADMIN-PROTOCOL.md" "$target" \
-    "ADMIN-PROTOCOL.md symlink must point to ../shared/ADMIN-PROTOCOL.md"
+  # Issue #1813: the link target is now depth-correct (os.path.relpath from the
+  # agent home to <bridge_home>/shared), not the hard-coded `../shared/<name>`
+  # that only resolved at v1 depth. The contract is resolution, not byte form —
+  # assert the link RESOLVES to the canonical shared file regardless of the
+  # relative representation (so v1 and v2 homes both pass).
+  local resolved expected
+  resolved="$(cd -P "$agent_home" 2>/dev/null && python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "ADMIN-PROTOCOL.md")"
+  expected="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$BRIDGE_HOME/shared/ADMIN-PROTOCOL.md")"
+  smoke_assert_eq "$expected" "$resolved" \
+    "ADMIN-PROTOCOL.md symlink must resolve to <bridge_home>/shared/ADMIN-PROTOCOL.md"
 
   # Resolve must succeed — broken symlinks would defeat the wire-up.
   [[ -f "$link" ]] || smoke_fail \

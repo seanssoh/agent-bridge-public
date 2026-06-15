@@ -32,6 +32,12 @@ DEPRECATED_SHARED_FILES = (
     "SYRS-RULES.md",
     "SYRS-USER.md",
 )
+# The shared-doc filenames the engine itself ever symlinks into an agent home:
+# the current canon links plus the deprecated ones cleanup garbage-collects.
+# Broken-link cleanup (#1813) is scoped to THIS namespace — a broken link whose
+# resolved name is outside it (e.g. an operator-authored `OPERATOR-NOTE.md` that
+# happens to point into `shared/`) is foreign and must be left untouched.
+MANAGED_SHARED_DOC_NAMES = frozenset(AGENT_SHARED_LINKS) | frozenset(DEPRECATED_SHARED_FILES)
 # Identity/doc files the migration may rewrite in place (legacy ~/.openclaw
 # path normalization). Issue #1781: `MEMORY.md` is AGENT-WRITTEN state, not a
 # managed doc — the doc-migration must not rewrite it (even an in-place legacy
@@ -1466,12 +1472,55 @@ def render_agent_skills_md(agent_dir: Path, registry: dict[str, SkillEntry]) -> 
     return "\n".join(lines) + "\n"
 
 
-def ensure_agent_shared_links(agent_dir: Path, dry_run: bool, backup_root: Path) -> list[str]:
+def _shared_link_target(agent_dir: Path, shared_dir: Path, name: str) -> str:
+    """Relative symlink target from `agent_dir` to `<shared_dir>/<name>`.
+
+    Issue #1813: the old code hard-coded `../shared/<name>`, which only
+    resolves at v1 depth (`agents/<agent>/` is one level below
+    `<bridge_home>/shared/`). At v2 home depth
+    (`data/agents/<agent>/home/`) the shared dir is three levels up, so
+    the same string resolved to a non-existent `data/agents/<agent>/shared/`
+    and the canon links never reached the home v2 sessions actually read.
+    `os.path.relpath` computes the correct relative path at either depth.
+    """
+    return os.path.relpath(shared_dir / name, agent_dir)
+
+
+def _resolves_to_shared_doc(path: Path, shared_dir: Path) -> str | None:
+    """Return the shared-doc `<name>` a symlink resolves to, else None.
+
+    Resolution-based intent check (#1813): follows the link's target
+    (`os.path.realpath`, which resolves a broken link's intent lexically) and
+    reports the `<name>` when it lands directly inside `<shared_dir>` on a `.md`
+    file — regardless of whether the link was written absolute or relative, by
+    the engine or by an operator. Callers gate on the returned name:
+    `ensure_agent_shared_links` accepts a link only when the name matches the
+    canon doc it is wiring; cleanup only deletes when the name is in the
+    bridge-managed namespace, so a foreign operator link is never touched.
+    """
+    try:
+        resolved = Path(os.path.realpath(path))
+        shared_resolved = Path(os.path.realpath(shared_dir))
+    except OSError:
+        return None
+    if resolved.parent != shared_resolved or resolved.suffix != ".md":
+        return None
+    return resolved.name
+
+
+def ensure_agent_shared_links(
+    agent_dir: Path, bridge_home: Path, dry_run: bool, backup_root: Path
+) -> list[str]:
     changed: list[str] = []
+    shared_dir = bridge_home / "shared"
     for name in AGENT_SHARED_LINKS:
         path = agent_dir / name
-        target = f"../shared/{name}"
-        current_ok = path.is_symlink() and os.readlink(path) == target
+        target = _shared_link_target(agent_dir, shared_dir, name)
+        # Accept an existing link as correct when it *resolves* to the
+        # canonical shared file, regardless of representation (absolute or
+        # relative, engine- or operator-seeded). This stops the next apply
+        # from clobbering a correct absolute link back into a broken form.
+        current_ok = path.is_symlink() and _resolves_to_shared_doc(path, shared_dir) == name
         if current_ok:
             continue
         if path.exists() or path.is_symlink():
@@ -1481,15 +1530,29 @@ def ensure_agent_shared_links(agent_dir: Path, dry_run: bool, backup_root: Path)
     return changed
 
 
-def cleanup_broken_shared_doc_links(agent_dir: Path, dry_run: bool, backup_root: Path) -> list[str]:
+def cleanup_broken_shared_doc_links(
+    agent_dir: Path, bridge_home: Path, dry_run: bool, backup_root: Path
+) -> list[str]:
     changed: list[str] = []
+    shared_dir = bridge_home / "shared"
     for path in sorted(agent_dir.iterdir()):
         if not path.is_symlink() or path.name in AGENT_SHARED_LINKS:
             continue
-        target = os.readlink(path)
-        if not target.startswith("../shared/") or not target.endswith(".md"):
-            continue
+        # A live link is not broken — leave it. Only consider broken links.
         if path.exists():
+            continue
+        # Resolution-based scoping (#1813): only remove a broken link whose
+        # resolved intent is a doc the engine itself manages. The old name-based
+        # `target.startswith("../shared/")` test deleted any broken `../shared/
+        # *.md` link — including the exact artifact the engine mis-created at v2
+        # depth — but it also could not tell a foreign operator link apart.
+        # Resolving the broken target against `<shared_dir>` AND requiring the
+        # resolved name to be in MANAGED_SHARED_DOC_NAMES keeps cleanup limited
+        # to the engine's own namespace: an operator link such as
+        # `OPERATOR-NOTE.md -> ../shared/OPERATOR-NOTE.md` resolves into shared
+        # but is NOT a managed name, so it is preserved.
+        resolved_name = _resolves_to_shared_doc(path, shared_dir)
+        if resolved_name is None or resolved_name not in MANAGED_SHARED_DOC_NAMES:
             continue
         backup_file(path, backup_root, dry_run)
         if not dry_run:
@@ -1540,8 +1603,8 @@ def sync_agent_docs(agent_dir: Path, bridge_home: Path, dry_run: bool, stamp: st
     changed: list[str] = []
     backup_root = bridge_home / "state" / "doc-migration" / "backups" / stamp / agent_dir.name
 
-    changed.extend(cleanup_broken_shared_doc_links(agent_dir, dry_run, backup_root))
-    changed.extend(ensure_agent_shared_links(agent_dir, dry_run, backup_root))
+    changed.extend(cleanup_broken_shared_doc_links(agent_dir, bridge_home, dry_run, backup_root))
+    changed.extend(ensure_agent_shared_links(agent_dir, bridge_home, dry_run, backup_root))
     changed.extend(sync_memory_schema_from_template(agent_dir, bridge_home, dry_run, backup_root))
 
     if normalize_claude(agent_dir, dry_run, backup_root):

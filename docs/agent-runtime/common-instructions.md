@@ -1,6 +1,6 @@
 # Agent Runtime — Common Instructions
 
-> Canonical SSOT for every non-admin (and admin) Agent Bridge runtime. Each agent home installs this file as `COMMON-INSTRUCTIONS.md` (symlink to `docs/agent-runtime/common-instructions.md`). The `<!-- BEGIN/END AGENT BRIDGE DOC MIGRATION -->` block in every `CLAUDE.md` is a pointer that tells the agent to read this file — it is no longer a hardcopy of the body.
+> Canonical SSOT for every non-admin (and admin) Agent Bridge runtime. The bridge renders this body into `<bridge_home>/shared/COMMON-INSTRUCTIONS.md`, and each agent home installs `COMMON-INSTRUCTIONS.md` as a symlink that resolves to that shared file (depth-correct on both v1 `agents/<a>/` and v2 `data/agents/<a>/home/` layouts; issue #1813). The `<!-- BEGIN/END AGENT BRIDGE DOC MIGRATION -->` block in every `CLAUDE.md` is a pointer that tells the agent to read this file — it is no longer a hardcopy of the body.
 >
 > Admin-only onboarding and admin execution details live in [`admin-protocol.md`](admin-protocol.md). Short-term session continuity + long-term wiki rules live in [`memory-schema.md`](memory-schema.md). How to migrate an existing agent into this runtime lives in [`migration-guide.md`](migration-guide.md).
 

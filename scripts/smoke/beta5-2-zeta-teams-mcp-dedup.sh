@@ -436,7 +436,13 @@ test_t8_ci_select_registration() {
   fi
   local req_block
   req_block="$(sed -n "${req_static_start},${req_static_end}p" "$CI_SELECT")"
-  if ! printf '%s\n' "$req_block" | grep -q "$SMOKE_NAME"; then
+  # Pure-bash substring test. NOT `printf ... | grep -q` (under `set -o pipefail`
+  # grep -q closes the pipe on first match, printf then takes SIGPIPE, the pipeline
+  # returns non-zero → a false "missing" once the required list is long enough to
+  # fill the pipe buffer before grep exits: Linux/CI; macOS's shorter list hides
+  # it). And NOT a `grep <<<` here-string (the heredoc-ban ratchet flags
+  # here-strings). `[[ == *..* ]]` has neither a pipe nor a here-string.
+  if [[ "$req_block" != *"$SMOKE_NAME"* ]]; then
     smoke_fail "T8: '$SMOKE_NAME' not in add_all_required_static() list"
   fi
   smoke_log "T8 PASS"
