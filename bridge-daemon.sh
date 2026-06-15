@@ -6930,6 +6930,55 @@ bridge_daemon_sweep_orphan_autostart_state() {
   return "$changed"
 }
 
+# Issue #1738 r2 (BLOCKER 2, daemon reconcile prune): remove config-caller
+# bindings whose recorded tmux session is gone. The orderly session-kill GC
+# (lib/bridge-agents.sh) only runs on a clean stop; crash / OOM / reboot /
+# `tmux kill-server` / external SIGKILL leave an orphan binding behind. With no
+# periodic prune, a non-admin process that PID-camps the freed admin pane_pid
+# (iso shares the host PID space) could ride the orphan record. This sweep, plus
+# bridge-config.py's match-time liveness re-check, closes that lifecycle path.
+# Returns 0 if it removed anything (so cmd_sync_cycle records a change), 1 if
+# nothing was pruned.
+bridge_daemon_prune_orphan_config_caller_bindings() {
+  local dir="" changed=1 agent="" session="" rows=""
+
+  if ! command -v bridge_config_caller_bindings_dir >/dev/null 2>&1; then
+    return "$changed"
+  fi
+  dir="$(bridge_config_caller_bindings_dir)"
+  [[ -n "$dir" && -d "$dir" ]] || return "$changed"
+
+  # Materialize the `<agent>\t<session>` rows from the file-as-argv helper to a
+  # temp file, then loop over it with a plain `< file` redirect. We deliberately
+  # avoid process substitution (`< <(...)` is a banned H3 site, lint-heredoc-ban)
+  # and a `| while` pipe (which would run the loop in a subshell and discard the
+  # `changed` flag + the SIGPIPE footgun #1813).
+  rows="$(mktemp "${TMPDIR:-/tmp}/agb-cbprune.XXXXXX")" || return "$changed"
+  bridge_daemon_helper_python config-binding-list "$dir" >"$rows" 2>/dev/null || true
+
+  # IFS scoped to the read so only TAB splits the columns (the helper strips any
+  # stray tabs/newlines from each field).
+  while IFS=$'\t' read -r agent session; do
+    [[ -n "$agent" ]] || continue
+    # An empty / non-live session means the bound pane is gone -> orphan.
+    if [[ -n "$session" ]] && bridge_tmux_session_exists "$session"; then
+      continue
+    fi
+    if command -v bridge_remove_config_caller_binding >/dev/null 2>&1; then
+      bridge_remove_config_caller_binding "$agent" >/dev/null 2>&1 || true
+    else
+      rm -f "$dir/$agent.json" 2>/dev/null || true
+    fi
+    bridge_audit_log daemon config_caller_binding_orphan_pruned "$agent" \
+      --detail session="${session:-<none>}" 2>/dev/null || true
+    daemon_info "config-caller binding pruned for ${agent} (session ${session:-<none>} gone)"
+    changed=0
+  done <"$rows"
+
+  rm -f "$rows" 2>/dev/null || true
+  return "$changed"
+}
+
 bridge_dashboard_post_if_changed() {
   local summary_output="$1"
   local summary_file
@@ -13797,6 +13846,14 @@ cmd_sync_cycle() {
   # a new backoff row on the same tick.
   BRIDGE_DAEMON_LAST_STEP="autostart_state_sweep"
   if bridge_daemon_sweep_orphan_autostart_state; then
+    changed=0
+  fi
+  # Issue #1738 r2 (BLOCKER 2): prune config-caller bindings whose tmux session
+  # is gone. Orderly stops GC their own binding (lib/bridge-agents.sh); this
+  # catches the crash/reboot/kill-server/SIGKILL orphans that never run the
+  # orderly path, so a PID-reuse forger cannot ride a stale admin binding.
+  BRIDGE_DAEMON_LAST_STEP="config_caller_binding_prune"
+  if bridge_daemon_prune_orphan_config_caller_bindings; then
     changed=0
   fi
   BRIDGE_DAEMON_LAST_STEP="on_demand_agents"

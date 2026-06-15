@@ -177,6 +177,68 @@ smoke_write_runtime_stub() {
   chmod +x "$target"
 }
 
+# Issue #1738 r2: install the match-time-liveness tmux stub for config-caller
+# binding smokes. bridge-config.py re-resolves the live `#{pane_pid}` of a
+# matched binding's session via an ABSOLUTE tmux (BRIDGE_CONFIG_TMUX_BIN may
+# point at a stub) and requires it to equal the bound pane_pid. With no real
+# tmux server, this stub answers `display-message -t <SMOKE_LIVE_SESSION> -p
+# '#{pane_pid}'` with $SMOKE_LIVE_PANE_PID and exits 1 for any other session.
+# Exports SMOKE_LIVE_SESSION (use as the binding's `session`) + SMOKE_LIVE_PANE_PID
+# (default $$, the smoke shell = the bound pane_pid's ancestor). Idempotent.
+smoke_install_config_caller_tmux_stub() {
+  export SMOKE_LIVE_SESSION="${SMOKE_LIVE_SESSION:-sess-live}"
+  export SMOKE_LIVE_PANE_PID="${SMOKE_LIVE_PANE_PID:-$$}"
+  local stub="$SMOKE_TMP_ROOT/config-caller-fake-tmux"
+  smoke_assert_path_in_temp "$stub" "config-caller tmux stub"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'want_session=""'
+    printf '%s\n' 'while [[ $# -gt 0 ]]; do'
+    printf '%s\n' '  case "$1" in'
+    printf '%s\n' '    -t) want_session="$2"; shift 2 ;;'
+    printf '%s\n' '    *) shift ;;'
+    printf '%s\n' '  esac'
+    printf '%s\n' 'done'
+    printf '%s\n' 'if [[ "$want_session" == "'"$SMOKE_LIVE_SESSION"'" && -n "${SMOKE_LIVE_PANE_PID:-}" ]]; then'
+    printf '%s\n' '  printf "%s\\n" "$SMOKE_LIVE_PANE_PID"; exit 0'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'exit 1'
+  } >"$stub"
+  chmod 0755 "$stub"
+  # The override is honored ONLY under the explicit test sentinel; normal
+  # operation resolves tmux from fixed absolute paths only (no env hole).
+  export BRIDGE_CONFIG_ALLOW_TEST_TMUX="1"
+  export BRIDGE_CONFIG_TMUX_BIN="$stub"
+}
+
+# Seed a TRUSTED config-caller admin binding for the positive (legit-admin)
+# path: live session + a store made non-writable by the caller (the iso,
+# controller-owned shape) so Option 1's store-writability gate (#1738 r2) trusts
+# it. $1=bindings dir, $2=agent, $3=admin (default = agent). Requires
+# smoke_install_config_caller_tmux_stub to have run.
+smoke_seed_trusted_admin_binding() {
+  local dir="$1" agent="$2" admin="${3:-$2}"
+  mkdir -p "$dir"
+  chmod 0755 "$dir" 2>/dev/null || true
+  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
+    "$agent" "$admin" "${SMOKE_LIVE_SESSION:-sess-live}" "${SMOKE_LIVE_PANE_PID:-$$}" \
+    >"$dir/$agent.json"
+  # Drop the caller's write bit on the dir + record so os.access(W_OK) is False
+  # for the owner (just as an iso agent UID cannot write the controller store).
+  chmod 0444 "$dir/$agent.json" 2>/dev/null || true
+  chmod 0555 "$dir" 2>/dev/null || true
+}
+
+# Restore a config-caller bindings dir to writable + empty (undo
+# smoke_seed_trusted_admin_binding's chmods so the next seed/rm is unobstructed).
+smoke_clear_config_caller_bindings() {
+  local dir="$1"
+  [[ -n "$dir" ]] || return 0
+  chmod 0755 "$dir" 2>/dev/null || true
+  chmod 0644 "$dir"/*.json 2>/dev/null || true
+  rm -f "$dir"/*.json 2>/dev/null || true
+}
+
 smoke_assert_eq() {
   local expected="$1"
   local actual="$2"

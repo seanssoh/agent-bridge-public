@@ -51,7 +51,10 @@ export BRIDGE_HOME
 # Issue #1738: pin BRIDGE_STATE_DIR under the isolated home so the wrapper's
 # config-caller-binding lookup does not leak to an ambient live BRIDGE_STATE_DIR.
 export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
-trap 'rm -rf "$BRIDGE_HOME"' EXIT
+# Restore any non-writable config-caller bindings dir (#1738 r2 makes it 0555 to
+# simulate the controller-owned store) before the recursive rm so cleanup is not
+# blocked by the dropped write bit.
+trap 'chmod -R u+w "$BRIDGE_HOME" 2>/dev/null || true; rm -rf "$BRIDGE_HOME"' EXIT
 
 ADMIN_AGENT="patch"
 NON_ADMIN_AGENT="huchu"
@@ -67,9 +70,37 @@ mkdir -p "$BRIDGE_HOME/logs"
 # a descendant of THIS smoke shell ($$), so a binding whose pane_pid == $$ drives
 # the admin path. Negative scenarios (non-admin / agent-direct) publish no
 # matching admin binding and stay denied.
-mkdir -p "$BRIDGE_HOME/state/config-caller-bindings"
-printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
-  "$ADMIN_AGENT" "$ADMIN_AGENT" "$$" >"$BRIDGE_HOME/state/config-caller-bindings/$ADMIN_AGENT.json"
+#
+# Issue #1738 r2: a matched binding now also requires its session to be LIVE
+# (re-resolved via an ABSOLUTE tmux — we install a stub answering display-message
+# #{pane_pid} for the live session); and the admin POSITIVE path requires the
+# store to be NON-writable by the caller (the iso/controller-owned shape), since
+# a self-writable store is forgeable (Option 1).
+CC_BINDINGS_DIR="$BRIDGE_HOME/state/config-caller-bindings"
+CC_LIVE_SESSION="sess-live"
+CC_FAKE_TMUX="$BRIDGE_HOME/config-caller-fake-tmux"
+mkdir -p "$CC_BINDINGS_DIR"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'want_session=""'
+  printf '%s\n' 'while [[ $# -gt 0 ]]; do'
+  printf '%s\n' '  case "$1" in'
+  printf '%s\n' '    -t) want_session="$2"; shift 2 ;;'
+  printf '%s\n' '    *) shift ;;'
+  printf '%s\n' '  esac'
+  printf '%s\n' 'done'
+  printf '%s\n' '[[ "$want_session" == "'"$CC_LIVE_SESSION"'" ]] && { printf "%s\\n" "'"$$"'"; exit 0; }'
+  printf '%s\n' 'exit 1'
+} >"$CC_FAKE_TMUX"
+chmod 0755 "$CC_FAKE_TMUX"
+# Override is honored only under the explicit test sentinel (no production hole).
+export BRIDGE_CONFIG_ALLOW_TEST_TMUX="1"
+export BRIDGE_CONFIG_TMUX_BIN="$CC_FAKE_TMUX"
+# Admin positive path: live session + store made non-writable (trusted iso shape).
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$CC_LIVE_SESSION" "$$" >"$CC_BINDINGS_DIR/$ADMIN_AGENT.json"
+chmod 0444 "$CC_BINDINGS_DIR/$ADMIN_AGENT.json" 2>/dev/null || true
+chmod 0555 "$CC_BINDINGS_DIR" 2>/dev/null || true
 cat >"$ACCESS_PATH" <<'JSON'
 {
   "version": 1,
@@ -258,12 +289,16 @@ fi
 # --- Scenario 3: wrapper denial — non-admin pane binding ----------------
 # Issue #1738: a NON-admin agent whose pane binding matches the caller ancestry
 # is denied even if env/--from claims admin. We publish a non-admin binding for
-# the SAME pane_pid ($$), so the wrapper matches it on ancestry and denies as
-# agent-direct (the meaningful #1738 negative). The admin binding is removed for
-# this scenario so the non-admin one is the unique match.
-rm -f "$BRIDGE_HOME/state/config-caller-bindings/$ADMIN_AGENT.json"
-printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
-  "$NON_ADMIN_AGENT" "$ADMIN_AGENT" "$$" >"$BRIDGE_HOME/state/config-caller-bindings/$NON_ADMIN_AGENT.json"
+# the SAME pane_pid ($$) and the LIVE session, so the wrapper matches it on
+# ancestry + liveness and denies as agent-direct (the meaningful #1738 negative).
+# The admin binding is removed for this scenario so the non-admin one is the
+# unique match. (A non-admin binding denies regardless of store writability, so
+# we restore the dir to writable to swap records.)
+chmod 0755 "$CC_BINDINGS_DIR" 2>/dev/null || true
+chmod 0644 "$CC_BINDINGS_DIR"/*.json 2>/dev/null || true
+rm -f "$CC_BINDINGS_DIR/$ADMIN_AGENT.json"
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
+  "$NON_ADMIN_AGENT" "$ADMIN_AGENT" "$CC_LIVE_SESSION" "$$" >"$CC_BINDINGS_DIR/$NON_ADMIN_AGENT.json"
 sce3_out="$(BRIDGE_HOME="$BRIDGE_HOME" \
   BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
   BRIDGE_CALLER_SOURCE="operator-tui" \
@@ -347,10 +382,17 @@ fi
 # uses the queued admin task to edit the shell file by hand. Codex r1
 # #341 CP10 surfaced this gap — the path was implemented but never
 # exercised by smoke. Re-seed the admin binding (scenario 4 cleared all) so the
-# caller PASSES the #1738 trust gate and reaches the non-JSON-suffix deny.
-mkdir -p "$BRIDGE_HOME/state/config-caller-bindings"
-printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
-  "$ADMIN_AGENT" "$ADMIN_AGENT" "$$" >"$BRIDGE_HOME/state/config-caller-bindings/$ADMIN_AGENT.json"
+# caller PASSES the #1738 trust gate and reaches the non-JSON-suffix deny. r2:
+# the binding must be live (CC_LIVE_SESSION) AND the store non-writable (trusted
+# iso shape) or the wrapper would deny at the trust gate before the suffix check.
+mkdir -p "$CC_BINDINGS_DIR"
+chmod 0755 "$CC_BINDINGS_DIR" 2>/dev/null || true
+chmod 0644 "$CC_BINDINGS_DIR"/*.json 2>/dev/null || true
+rm -f "$CC_BINDINGS_DIR"/*.json 2>/dev/null || true
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$CC_LIVE_SESSION" "$$" >"$CC_BINDINGS_DIR/$ADMIN_AGENT.json"
+chmod 0444 "$CC_BINDINGS_DIR/$ADMIN_AGENT.json" 2>/dev/null || true
+chmod 0555 "$CC_BINDINGS_DIR" 2>/dev/null || true
 sce6_out="$(BRIDGE_HOME="$BRIDGE_HOME" \
   BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
   BRIDGE_CALLER_SOURCE="operator-tui" \

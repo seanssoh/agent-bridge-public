@@ -87,14 +87,20 @@ ROSTER_SHA_BEFORE="$(roster_sha)"
 # admin path here (in production the controller publishes pane_pid after
 # `tmux new-session`). Negative controls publish NO binding (or a non-admin
 # one), so the env-trust spoof shapes stay denied.
+#
+# Issue #1738 r2: the positive path now also requires (a) the bound session to
+# be LIVE — re-resolved via an absolute tmux (we install a stub) — and (b) the
+# bindings store to be NON-writable by the caller (the iso, controller-owned
+# shape), since a self-writable store is treated as forgeable (Option 1). The
+# shared smoke_seed_trusted_admin_binding helper handles both.
 BINDINGS_DIR="$BRIDGE_STATE_DIR/config-caller-bindings"
 mkdir -p "$BINDINGS_DIR"
+smoke_install_config_caller_tmux_stub
 seed_admin_binding() {
-  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
-    "$ADMIN_AGENT" "$ADMIN_AGENT" "$$" >"$BINDINGS_DIR/$ADMIN_AGENT.json"
+  smoke_seed_trusted_admin_binding "$BINDINGS_DIR" "$ADMIN_AGENT" "$ADMIN_AGENT"
 }
 clear_bindings() {
-  rm -f "$BINDINGS_DIR"/*.json 2>/dev/null || true
+  smoke_clear_config_caller_bindings "$BINDINGS_DIR"
 }
 
 # --- Wrapper plumbing -------------------------------------------------------

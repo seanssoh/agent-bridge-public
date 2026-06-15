@@ -71,18 +71,80 @@ printf '{"existing":"value"}\n' >"$PROTECTED_JSON"
 BINDINGS_DIR="$BRIDGE_STATE_DIR/config-caller-bindings"
 mkdir -p "$BINDINGS_DIR"
 
+# --- fake tmux (match-time liveness stub, #1738 r2 BLOCKER 2) ----------------
+#
+# bridge-config.py re-resolves the live `#{pane_pid}` of a matched binding's
+# session via an ABSOLUTE tmux and requires it to equal the bound pane_pid; a
+# dead session / mismatch denies. There is no real tmux server in this smoke, so
+# we point BRIDGE_CONFIG_TMUX_BIN at this stub. It prints the pane_pid the test
+# wants for the queried session:
+#   * `display-message -t <SESSION_LIVE> -p '#{pane_pid}'` -> $FAKE_LIVE_PID
+#     (the smoke sets this to $$, the bound pane_pid, so the session is "live").
+#   * any other session (the stale / dead case) -> exit 1 (session gone).
+# Setting FAKE_LIVE_PID to a different value simulates pid-reuse (mismatch).
+SESSION_LIVE="sess-live"
+FAKE_TMUX="$SMOKE_TMP_ROOT/fake-tmux"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' '# fake tmux for #1738 liveness smoke. Honors only display-message #{pane_pid}.'
+  printf '%s\n' 'want_session=""'
+  printf '%s\n' 'while [[ $# -gt 0 ]]; do'
+  printf '%s\n' '  case "$1" in'
+  printf '%s\n' '    -t) want_session="$2"; shift 2 ;;'
+  printf '%s\n' '    *) shift ;;'
+  printf '%s\n' '  esac'
+  printf '%s\n' 'done'
+  printf '%s\n' 'if [[ "$want_session" == "'"$SESSION_LIVE"'" && -n "${FAKE_LIVE_PID:-}" ]]; then'
+  printf '%s\n' '  printf "%s\\n" "$FAKE_LIVE_PID"; exit 0'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'exit 1'
+} >"$FAKE_TMUX"
+chmod 0755 "$FAKE_TMUX"
+# The override is ONLY honored under the explicit test sentinel — in normal
+# operation bridge-config.py resolves tmux from fixed absolute paths only, so an
+# agent cannot point the liveness probe at a lying stub via env.
+export BRIDGE_CONFIG_ALLOW_TEST_TMUX="1"
+export BRIDGE_CONFIG_TMUX_BIN="$FAKE_TMUX"
+# Default: the live session resolves to THIS shell's pid (the bound pane_pid).
+export FAKE_LIVE_PID="$$"
+
 # --- binding helpers --------------------------------------------------------
 
 # Publish a binding for $1=agent $2=admin with pane_pid == THIS smoke shell ($$)
 # so the wrapper subprocess (a descendant of this shell) matches it on ancestry.
+# session defaults to the live session ($3, default SESSION_LIVE) so the
+# match-time liveness check (BLOCKER 2) passes for the positive cases; pass a
+# different session to seed a stale (dead-session) binding.
 seed_binding() {
-  local agent="$1" admin="$2"
-  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
-    "$agent" "$admin" "$$" >"$BINDINGS_DIR/$agent.json"
+  local agent="$1" admin="$2" session="${3:-$SESSION_LIVE}"
+  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
+    "$agent" "$admin" "$session" "$$" >"$BINDINGS_DIR/$agent.json"
 }
 
 clear_bindings() {
+  # Restore writability first: a prior store_make_nonwritable may have dropped
+  # the dir/file write bits, which would otherwise block the rm.
+  chmod 0755 "$BINDINGS_DIR" 2>/dev/null || true
+  chmod 0644 "$BINDINGS_DIR"/*.json 2>/dev/null || true
   rm -f "$BINDINGS_DIR"/*.json 2>/dev/null || true
+}
+
+# --- store-writability toggle (#1738 r2 BLOCKER 1, Option 1) -----------------
+#
+# Option 1 fails closed when the bindings store is writable by the caller (a
+# shared-UID install: the agent owns the store and could forge a record). The
+# smoke's BRIDGE_STATE_DIR is caller-writable by construction (single UID), so
+# the DEFAULT here IS the shared-UID/forgeable shape. To exercise the legit iso
+# positive path (controller-owned, non-writable store) we drop the caller's
+# write bit on the dir + each record (os.access(W_OK) then returns False for the
+# owner, just as an iso agent UID cannot write the controller's 0711/0644 store).
+store_make_nonwritable() {
+  chmod 0555 "$BINDINGS_DIR" 2>/dev/null || true
+  chmod 0444 "$BINDINGS_DIR"/*.json 2>/dev/null || true
+}
+store_make_writable() {
+  chmod 0755 "$BINDINGS_DIR" 2>/dev/null || true
+  chmod 0644 "$BINDINGS_DIR"/*.json 2>/dev/null || true
 }
 
 # --- target hash plumbing ---------------------------------------------------
@@ -264,14 +326,17 @@ seed_binding "$USER_AGENT" "$ADMIN_AGENT"   # bound agent != admin
     set-env "BRIDGE_A2A_RECONCILE_INTERVAL=60" --from "$ADMIN_AGENT" )
 
 # ===========================================================================
-# SECTION 3 — WRAPPER: matching ADMIN binding -> both verbs WRITE.
+# SECTION 3 — WRAPPER: matching ADMIN binding (non-writable store) -> WRITE.
 #
-# This is the legit admin-agent path (process ancestry matches the controller
-# binding), with NO TTY and NO trusted BRIDGE_CALLER_SOURCE.
+# This is the legit iso admin-agent path: process ancestry matches the
+# controller binding, the bound session is LIVE (the tmux stub resolves it to
+# the bound pane_pid), and the store is NOT writable by the caller (controller-
+# owned on iso) so Option 1 trusts it. NO TTY and NO trusted BRIDGE_CALLER_SOURCE.
 # ===========================================================================
 
 clear_bindings
 seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"
+store_make_nonwritable
 
 : >"$BRIDGE_AUDIT_LOG"
 BEFORE_JSON="$(sha_of "$PROTECTED_JSON")"
@@ -365,5 +430,98 @@ assert_bash_verdict "hook: unrelated bash -c not hijacked" "$ADMIN_AGENT" \
   "bash -c 'echo hello'" "ALLOW"
 assert_bash_verdict "hook: unrelated \$var cmd not hijacked" "$ADMIN_AGENT" \
   'V=ls; $V -la' "ALLOW"
+
+# Assert a wrapper invocation DENIES (rc!=0, target unchanged) AND the deny
+# stderr carries a specific reason substring (the r2 fail-closed reasons).
+assert_wrapper_deny_reason() {
+  local label="$1" target="$2" want_reason="$3"
+  shift 3
+  local before after rc
+  before="$(sha_of "$target")"
+  rc="$(run_wrapper_raw "$@")"
+  after="$(sha_of "$target")"
+  if [[ "$rc" == "0" ]]; then
+    smoke_log "FAIL: ${label}: wrapper rc=0 (expected deny)"
+    smoke_log "      out: $(cat "$SMOKE_TMP_ROOT/wrap.out")"
+    smoke_fail "${label}: expected deny, got apply"
+  fi
+  smoke_assert_contains "$(cat "$SMOKE_TMP_ROOT/wrap.err")" "$want_reason" \
+    "${label}: deny reason"
+  smoke_assert_eq "$before" "$after" "${label}: target unchanged on deny"
+  smoke_log "ok: ${label} -> DENY (reason '${want_reason}', rc=${rc})"
+}
+
+# ===========================================================================
+# SECTION 6 — WRAPPER: #1738 r2 BLOCKER 1 (Option 1 store-writability gate).
+#
+# TEETH: round 1 authorizes a forged admin binding on a self-writable
+# (shared-UID) store. r2 fails closed there and ONLY trusts the binding when the
+# store is NOT writable by the caller (iso, controller-owned). This proves the
+# gate keys on writability, not a blanket disable.
+# ===========================================================================
+
+# 6a. Forgery on a WRITABLE store: the smoke's bindings dir is caller-writable
+#     by construction (single UID = shared-UID), exactly the forgeable shape. A
+#     "forged" admin binding (agent_id==admin, pane_pid==our ancestor, live
+#     session) now DENIES with the store-writable reason. (r1: this WRITES.)
+clear_bindings
+seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"   # writable store (default)
+store_make_writable
+assert_wrapper_deny_reason \
+  "set: forged admin binding on writable store" "$PROTECTED_JSON" \
+  "agent-binding-store-writable" \
+  set --path "$PROTECTED_JSON" --change "forge=1" --from "$ADMIN_AGENT"
+assert_wrapper_deny_reason \
+  "set-env: forged admin binding on writable store" "$ENV_FILE" \
+  "agent-binding-store-writable" \
+  set-env "BRIDGE_A2A_RECONCILE_INTERVAL=60" --from "$ADMIN_AGENT"
+
+# 6b. SAME binding, store made NON-writable (controller-owned / iso shape):
+#     the binding is now trusted and WRITES. This is the positive control that
+#     proves 6a is the writability gate, not a blanket agent-binding disable.
+clear_bindings
+seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"
+store_make_nonwritable
+rm -f "$ENV_FILE"
+rc="$(run_wrapper_raw set-env "BRIDGE_A2A_RECONCILE_INTERVAL=60" --from "$ADMIN_AGENT")"
+smoke_assert_eq "0" "$rc" "set-env: non-writable store admin-binding apply rc"
+smoke_assert_file_exists "$ENV_FILE" "set-env: non-writable store wrote managed file"
+smoke_log "ok: non-writable-store admin binding -> WROTE (gate keys on writability)"
+
+# ===========================================================================
+# SECTION 7 — WRAPPER: #1738 r2 BLOCKER 2 (match-time liveness / PID-reuse).
+#
+# TEETH: round 1 authorizes a binding purely on `pane_pid in ancestry`, never
+# checking pane liveness, so an orphan binding whose pane is dead (its pid later
+# reused) still matches. r2 re-resolves the live #{pane_pid} of the recorded
+# session and denies on a dead session / pid mismatch.
+# ===========================================================================
+
+# 7a. Stale binding: bound to a session the tmux stub reports as GONE (any
+#     session != SESSION_LIVE exits 1). pane_pid is still in ancestry ($$), so
+#     r1 would authorize; r2 denies because the session no longer resolves to
+#     the bound pane_pid. Store made non-writable so the ONLY thing under test
+#     is liveness (the writability gate would otherwise also deny).
+clear_bindings
+seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT" "sess-dead"
+store_make_nonwritable
+assert_wrapper_deny_unchanged \
+  "set: stale binding (dead session) denies despite ancestry" "$PROTECTED_JSON" \
+  set --path "$PROTECTED_JSON" --change "stale=1" --from "$ADMIN_AGENT"
+
+# 7b. PID-reuse: live session, but the live pane_pid now resolves to a DIFFERENT
+#     pid than the bound one (the pane exited and a new process took the pid).
+#     The bound pane_pid is still in ancestry ($$); r2 denies on the mismatch.
+clear_bindings
+seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"   # session=SESSION_LIVE, pane_pid=$$
+store_make_nonwritable
+FAKE_LIVE_PID="999999" \
+  assert_wrapper_deny_unchanged \
+    "set: pid-reuse (live pane_pid != bound) denies" "$PROTECTED_JSON" \
+    set --path "$PROTECTED_JSON" --change "reuse=1" --from "$ADMIN_AGENT"
+
+# Restore a clean, writable, empty store before exit so temp-root cleanup and
+# any later harness step is unobstructed.
+clear_bindings
 
 smoke_log "PASS: all #1738 config-caller-binding wrapper + hook cases held"

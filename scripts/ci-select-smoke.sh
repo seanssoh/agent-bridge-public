@@ -1022,6 +1022,13 @@ select_for_path() {
       # refactor cannot revert it to the trust|summary-only case arm and let the
       # two surfaces drift.
       add_required 1181-modal-blocker-detect
+      # Issue #1738 r2 (GC gap): bridge_kill_agent_session (this lib) now also
+      # drops the config-caller binding on its dead-session / no-session early
+      # returns (not only the orderly tail), so a stopped/crashed agent's stale
+      # pane_pid cannot be ridden by a later same-pid process. Pull the
+      # adversarial binding smoke on every bridge-agents.sh move so a refactor
+      # cannot re-open the early-return GC gap.
+      add_required 1738-config-caller-binding
       ;;
   esac
 
@@ -2407,9 +2414,24 @@ select_for_path() {
       # refactor cannot drop the modal-reason tagging.
       if [[ "$path" == "bridge-daemon.sh" ]]; then
         add_required 1181-modal-blocker-detect
+        # Issue #1738 r2 (BLOCKER 2): bridge-daemon.sh's reconcile pass now
+        # prunes config-caller bindings whose tmux session is gone
+        # (bridge_daemon_prune_orphan_config_caller_bindings, via the
+        # lib/daemon-helpers/config-binding-list.py lister). Pull the adversarial
+        # binding smoke on every bridge-daemon.sh move so a refactor cannot drop
+        # the orphan-prune (which would re-open the PID-reuse forgery window).
+        add_required 1738-config-caller-binding
       fi
       add_integration integration-minimal
       add_live live-tmux-daemon
+      ;;
+
+    lib/daemon-helpers/config-binding-list.py)
+      # Issue #1738 r2 (BLOCKER 2): this helper lists config-caller bindings as
+      # `<agent>\t<session>` rows for the daemon orphan-prune. Pull the
+      # adversarial binding smoke on every move so a change to the row shape /
+      # parse cannot silently break the prune (re-opening the PID-reuse window).
+      add_required 1738-config-caller-binding
       ;;
 
     lib/bridge-resource-guard.sh)

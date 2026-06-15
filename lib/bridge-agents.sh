@@ -12268,11 +12268,24 @@ bridge_kill_agent_session() {
   session="$(bridge_agent_session "$agent")"
   if [[ -z "$session" ]]; then
     bridge_warn "tmux 세션 정보가 없습니다: $agent"
+    # Issue #1738 r2 (GC gap): the orderly-path binding GC at the function tail
+    # is unreachable on this early return. Drop any stale config-caller binding
+    # for this agent now so a later same-pid process cannot ride it.
+    if command -v bridge_remove_config_caller_binding >/dev/null 2>&1; then
+      bridge_remove_config_caller_binding "$agent" >/dev/null 2>&1 || true
+    fi
     return 1
   fi
 
   if ! bridge_tmux_session_exists "$session"; then
     bridge_warn "이미 종료된 세션입니다: $agent/$session"
+    # Issue #1738 r2 (GC gap): the session is already dead, so the orderly-path
+    # binding GC at the function tail is unreachable on this early return. A
+    # dead session frees the bound pane_pid; remove the binding now so a later
+    # process that reuses the pid cannot match the orphan record.
+    if command -v bridge_remove_config_caller_binding >/dev/null 2>&1; then
+      bridge_remove_config_caller_binding "$agent" >/dev/null 2>&1 || true
+    fi
     return 1
   fi
 
