@@ -140,7 +140,7 @@ def substitute_live_root_claude(source_root: Path, target_root: Path, dry_run: b
     never overwritten.
     """
     live_path = target_root / "CLAUDE.md"
-    live = live_path.read_bytes() if live_path.exists() else None
+    live = live_path.read_bytes() if live_path.exists() else None  # noqa: raw-pathlib-controller-only
     if live is None:
         # Fresh install: the tracked contract is skipped in should_skip_relpath,
         # so seed the operator stub so the live root is never empty.
