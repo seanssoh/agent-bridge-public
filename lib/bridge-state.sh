@@ -2796,6 +2796,36 @@ print(",".join(ids), end="")
 PY
 }
 
+# bridge_resume_path_resolves_into <path> <ancestor>
+#
+# Returns 0 (true) iff realpath(<path>) is <ancestor> itself or strictly below
+# it (after resolving symlinks on BOTH sides). Used by the operator-HOME
+# exclusion in bridge_resolve_agent_claude_config_dir (#1893 Finding 1): a
+# sabotaged <agent-home>/.claude symlinked to the operator's global ~/.claude
+# string-differs but realpath-resolves INTO operator HOME — only a realpath
+# compare catches it. Returns 1 (false/not-contained) when either argument is
+# empty or when the paths cannot be resolved/proven contained — callers treat a
+# non-zero result as "this is NOT the operator HOME" (the pre-#1893 behaviour),
+# which is the historical default. python3 is a hard bridge dependency so the
+# resolver is always available in practice. No heredoc — single-argv `python3
+# -c`, footgun-#11 safe.
+bridge_resume_path_resolves_into() {
+  local path="$1"
+  local ancestor="$2"
+  [[ -n "$path" && -n "$ancestor" ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  # NOTE: `python3 -c` does NOT honour `--` as an end-of-options marker, so the
+  # two paths are passed directly as argv[1]/argv[2]. os.path.realpath resolves
+  # non-existent leaves via their parent, so a missing dir still canonicalises.
+  python3 -c 'import os, sys
+c = os.path.realpath(sys.argv[1])
+p = os.path.realpath(sys.argv[2])
+try:
+    sys.exit(0 if (c == p or os.path.commonpath([c, p]) == p) else 1)
+except Exception:
+    sys.exit(1)' "$path" "$ancestor" 2>/dev/null
+}
+
 # bridge_resume_quarantine_id_is_foreign <agent> <session_id> <workdir>
 #
 # Returns 0 (true) iff the session's transcript `<sid>.jsonl` exists in the
@@ -3041,11 +3071,25 @@ bridge_agent_resume_quarantine_archive_transcript() {
     return 0
   fi
 
-  python3 - "$workdir" "$session_id" "$config_root" 2>/dev/null <<'PY' || true
+  # #1893 Finding 1 (defense-in-depth refuse): pass the operator HOME so the
+  # python re-check can refuse outright when the agent's OWN projects root
+  # realpaths INTO the operator's projects root. This catches a sabotaged
+  # config_root (e.g. <agent-home>/.claude symlinked to the operator ~/.claude)
+  # that the resolver's #1893 F1 fix should already have excluded — but here we
+  # refuse the MOVE regardless of how config_root was derived, so even a future
+  # resolver regression cannot destroy an operator transcript.
+  local operator_home=""
+  if command -v bridge_agent_operator_home_dir >/dev/null 2>&1; then
+    operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+  fi
+  [[ -n "$operator_home" ]] || operator_home="${HOME:-}"
+
+  python3 - "$workdir" "$session_id" "$config_root" "$operator_home" 2>/dev/null <<'PY' || true
 import os, re, shutil, sys, time
 workdir = sys.argv[1]
 sid = sys.argv[2]
 config_root = sys.argv[3]
+operator_home = sys.argv[4] if len(sys.argv) > 4 else ""
 # Containment proof: every candidate src must resolve to a real path strictly
 # under <config_root>/projects/. Anything else (esp. the operator/daemon HOME
 # ~/.claude/projects/) is refused — never moved. config_root is the agent's
@@ -3053,6 +3097,23 @@ config_root = sys.argv[3]
 if not config_root:
     raise SystemExit(0)
 projects_root = os.path.realpath(os.path.join(config_root, "projects"))
+# #1893 Finding 1: REFUSE the entire archive when the agent's own projects root
+# realpaths to (or into) the operator's own projects root. A sabotaged
+# config_root symlinked to the operator ~/.claude resolves projects_root INTO
+# operator HOME — moving anything there would destroy an operator transcript.
+# Never move when ownership cannot be disentangled from the operator HOME.
+if operator_home:
+    operator_projects = os.path.realpath(
+        os.path.join(operator_home, ".claude", "projects"))
+    try:
+        if (projects_root == operator_projects
+                or os.path.commonpath([projects_root, operator_projects])
+                == operator_projects):
+            raise SystemExit(0)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
 def slugs(path):
     a = path.replace("/", "-")
     b = re.sub(r"[/.]", "-", path)
@@ -4527,9 +4588,6 @@ bridge_resolve_agent_claude_config_dir() {
   fi
 
   config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
-  # A derived-but-absent path means the agent is not actually isolated on
-  # this host; do not let it shadow the caller's HOME.
-  [[ -n "$config_dir" && -d "$config_dir" ]] || return 0
 
   # Operator-session-hijack fix: a REGISTERED DYNAMIC agent launches Claude
   # with its OWN isolated CLAUDE_CONFIG_DIR (<agent-home>/.claude — see
@@ -4548,10 +4606,24 @@ bridge_resolve_agent_claude_config_dir() {
   # and finds nothing) with NO operator-HOME fallback, while a populated
   # isolated projects/ still resumes the agent's OWN prior transcript
   # (#981/#1769 legit isolated resume preserved). Fail-safe: only take this
-  # branch when the derived config dir is genuinely the agent's own and is
-  # NOT the operator HOME ~/.claude — if it equals operator HOME we fall
-  # through to the unchanged scaffold check below rather than treat the
-  # operator HOME as an isolated dir.
+  # branch when the derived config dir is genuinely the agent's own and does
+  # NOT resolve to the operator HOME ~/.claude.
+  #
+  # #1893 Finding 2 (hoist above the -d guard): this branch runs BEFORE the
+  # "derived-but-absent ⇒ return 0" guard below, so a registered dynamic agent
+  # whose <agent-home>/.claude does NOT yet exist on disk still resolves to its
+  # OWN (empty) dir — "fresh, scan my own dir" — instead of falling back to the
+  # operator HOME and resume-selecting an operator session. The python detect
+  # helper scanning a non-existent dir finds nothing (fresh start); F2 archive's
+  # realpath-containment re-check fail-safes any move.
+  #
+  # #1893 Finding 1 (realpath compare): the operator-HOME exclusion is a
+  # REALPATH compare (bridge_resume_path_resolves_into), not a raw-string one. A
+  # sabotaged <agent-home>/.claude symlinked to the operator's global ~/.claude
+  # string-differs but realpaths INTO operator HOME — a raw-string compare would
+  # have returned it as the agent's "own" isolated dir (and F2 would then
+  # physically move the operator transcript). Comparing realpaths makes a
+  # symlinked-to-operator-HOME dir fall THROUGH to the scaffold check below.
   if command -v bridge_agent_source >/dev/null 2>&1 \
      && [[ "$(bridge_agent_source "$agent" 2>/dev/null || true)" == "dynamic" ]]; then
     local _operator_claude=""
@@ -4560,11 +4632,19 @@ bridge_resolve_agent_claude_config_dir() {
       _operator_home="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
       [[ -n "$_operator_home" ]] && _operator_claude="$_operator_home/.claude"
     fi
-    if [[ -z "$_operator_claude" || "$config_dir" != "$_operator_claude" ]]; then
+    if [[ -n "$config_dir" ]] \
+       && ! bridge_resume_path_resolves_into "$config_dir" "$_operator_claude"; then
       printf '%s' "$config_dir"
       return 0
     fi
   fi
+
+  # A derived-but-absent path means the agent is not actually isolated on
+  # this host; do not let it shadow the caller's HOME. (The dynamic branch
+  # above already returned the own-dir for registered dynamic agents; this
+  # guard now covers static/admin agents and the dynamic symlink-to-operator-
+  # HOME fall-through.)
+  [[ -n "$config_dir" && -d "$config_dir" ]] || return 0
 
   # Issue #1370 (beta5-2 #1316 regression) gated this purely on linux-user
   # isolation being *effective*: when it is NOT (every non-Linux host, and

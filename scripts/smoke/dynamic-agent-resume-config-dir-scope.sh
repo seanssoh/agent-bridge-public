@@ -32,8 +32,16 @@
 #     operator session is REFUSED (the explicit dynamic-Claude guard fires before
 #     any path resolution): the operator transcript is NOT moved and stays
 #     present.
+#   A4 (#1893 Finding 2) — a DYNAMIC CODEX agent (NOT dynamic-vanilla-claude, so
+#     the F1 branch + F2 archive python actually run) whose <agent-home>/.claude
+#     does NOT exist resolves to its OWN (empty) dir, not the operator HOME — the
+#     F1 branch now sits ABOVE the `-d` guard. No operator-session fallback.
+#   A5 (#1893 Finding 1) — a DYNAMIC CODEX agent whose <agent-home>/.claude is a
+#     symlink to the operator's global ~/.claude: the F1 realpath compare + the
+#     F2 archive's operator-HOME refuse mean the operator transcript is NEVER
+#     moved (raw-string F1 used to return it as "own" and F2 then destroyed it).
 #
-# Plus the end-to-end safety invariant: across A1+A3 the operator-HOME
+# Plus the end-to-end safety invariant: across A1+A3+A4+A5 the operator-HOME
 # transcript is never resume-selected AND never quarantined.
 #
 # Isolation: temp BRIDGE_HOME via smoke_setup_bridge_home; a temp "operator
@@ -110,10 +118,20 @@ AGENT_OWN_SESSION_ID="a9en70wn-1111-2222-3333-444444444444"
 # The agent's OWN config dir is whatever bridge_agent_claude_config_dir
 # resolves to in this layout; snippets reference it via $cfg (pre-computed in
 # the subshell) so the fixture is layout-agnostic.
+#
+# Optional 3rd arg = engine (default `claude`). A4/A5 use a dynamic CODEX agent
+# so the #1890 bridge_agent_is_dynamic_vanilla_claude early-return is NOT taken
+# and the resolver's #1893 F1 branch + the F2 archive python actually run — that
+# is the exact code #1893 hardens. (A dynamic CLAUDE agent on this Darwin shape
+# is dynamic-vanilla-claude and short-circuits to EMPTY before F1/F2, which is
+# the #1890 contract A1/A2/A3 already pin.) The Claude per-agent config dir
+# resolver is engine-agnostic, so a dynamic codex agent still derives a
+# <agent-home>/.claude path — the same path the sabotage targets.
 # ---------------------------------------------------------------------------
 lib_eval() {
   local agent="$1"
   local snippet="$2"
+  local engine="${3:-claude}"
   HOME="$OPERATOR_HOME" \
   BRIDGE_CONTROLLER_HOME="$OPERATOR_HOME" \
   BRIDGE_HOST_PLATFORM_OVERRIDE="Darwin" \
@@ -124,7 +142,7 @@ lib_eval() {
 
     agent='$agent'
     BRIDGE_AGENT_IDS+=(\$agent)
-    BRIDGE_AGENT_ENGINE[\$agent]=claude
+    BRIDGE_AGENT_ENGINE[\$agent]='$engine'
     BRIDGE_AGENT_SESSION[\$agent]=\$agent
     BRIDGE_AGENT_WORKDIR[\$agent]='$WORKDIR'
     BRIDGE_AGENT_SOURCE[\$agent]=dynamic
@@ -236,6 +254,82 @@ test_a3_foreign_quarantine_refused() {
 }
 
 # ===========================================================================
+# A4 (#1893 Finding 2) — a registered DYNAMIC agent whose <agent-home>/.claude
+# does NOT exist on disk must resolve to its OWN (empty) dir — "fresh, scan my
+# own dir" — NOT fall back to the operator HOME. Pre-#1893 the resolver returned
+# EMPTY at the `-d` guard for a missing dir, which let detection fall back to the
+# operator HOME and resume-SELECT an operator session. Uses a dynamic CODEX
+# agent so the #1890 vanilla-claude short-circuit is not taken and the F1 branch
+# (now hoisted above the `-d` guard) runs.
+#   FAIL on un-fixed code: resolver returns "" (operator-HOME fallback path).
+#   PASS on the fix:        resolver returns the agent's own dir ($cfg).
+# ===========================================================================
+A4_AGENT="dyn_missing_cfg"
+
+test_a4_missing_isolated_claude_no_operator_fallback() {
+  local out=""
+  out="$(lib_eval "$A4_AGENT" '
+    # Deliberately do NOT create "$cfg" — the isolated .claude is absent.
+    [[ -e "$cfg" ]] && rm -rf "$cfg"
+    ophome="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+    resolved="$(bridge_resolve_agent_claude_config_dir "$agent")"
+    printf "CFG=%s\n" "$cfg"
+    printf "OPCLAUDE=%s\n" "$ophome/.claude"
+    printf "RESOLVED=%s\n" "$resolved"
+  ' codex)" || smoke_fail "A4 lib_eval failed: $out"
+
+  local cfg resolved opclaude
+  cfg="$(printf '%s\n' "$out" | sed -n 's/^CFG=//p' | head -n1)"
+  opclaude="$(printf '%s\n' "$out" | sed -n 's/^OPCLAUDE=//p' | head -n1)"
+  resolved="$(printf '%s\n' "$out" | sed -n 's/^RESOLVED=//p' | head -n1)"
+
+  smoke_assert_eq "$cfg" "$resolved" \
+    "A4 a missing isolated .claude resolves to the agent's OWN dir (fresh), not EMPTY (#1893 Finding 2 hoist)"
+  smoke_assert_not_contains "$resolved" "$opclaude" \
+    "A4 the resolved dir is NOT the operator HOME ~/.claude (no operator-session fallback)"
+}
+
+# ===========================================================================
+# A5 (#1893 Finding 1) — a SABOTAGED <agent-home>/.claude symlinked to the
+# operator's global ~/.claude must NOT cause the operator transcript to be
+# moved. F1's raw-string exclusion was defeated by the symlink (path string-
+# differs) → resolver returned it as the agent's "own" dir → F2 archive resolved
+# projects_root INTO operator HOME and physically moved the operator transcript
+# (DATA LOSS). The #1893 realpath compare (F1) + the F2 archive's operator-HOME
+# refuse close it. Uses a dynamic CODEX agent (F1/F2 actually run).
+#   FAIL on un-fixed code: F2 moves the operator transcript (archived != "",
+#                          operator transcript GONE).
+#   PASS on the fix:       F2 refuses (archived == ""), transcript survives.
+# ===========================================================================
+A5_AGENT="dyn_symlink_sabotage"
+
+test_a5_symlinked_config_dir_refuses_move() {
+  local out=""
+  out="$(lib_eval "$A5_AGENT" '
+    op_sid="'"$OPERATOR_SESSION_ID"'"
+    ophome="$(bridge_agent_operator_home_dir 2>/dev/null || true)"
+    # Sabotage: replace the agent own .claude with a symlink to operator global.
+    [[ -e "$cfg" ]] && rm -rf "$cfg"
+    mkdir -p "$(dirname "$cfg")"
+    ln -s "$ophome/.claude" "$cfg"
+    # F1: the resolver must NOT short-circuit-return the symlink at the dynamic
+    # branch (it realpaths into operator HOME ⇒ falls through). We cannot observe
+    # the branch directly, but the data-loss guard is F2:
+    archived="$(bridge_agent_resume_quarantine_archive_transcript "$agent" "$op_sid" 2>/dev/null \
+      | tr "\n" "," | sed "s/,\$//")"
+    printf "ARCHIVED=%s\n" "$archived"
+  ' codex)" || smoke_fail "A5 lib_eval failed: $out"
+
+  local archived
+  archived="$(printf '%s\n' "$out" | sed -n 's/^ARCHIVED=//p' | head -n1)"
+
+  smoke_assert_eq "" "$archived" \
+    "A5 symlinked-to-operator config dir: F2 archive REFUSES the move (nothing moved, #1893 Finding 1)"
+  smoke_assert_file_exists "$OPERATOR_TRANSCRIPT" \
+    "A5 the operator transcript survives the symlink-sabotage archive attempt"
+}
+
+# ===========================================================================
 # End-to-end safety invariant — the operator transcript survives untouched.
 # ===========================================================================
 test_operator_transcript_survives() {
@@ -253,7 +347,11 @@ smoke_run "A2 dynamic Claude ignores legacy private transcript" \
   test_a2_dynamic_claude_ignores_private_transcript
 smoke_run "A3 foreign-transcript quarantine refused" \
   test_a3_foreign_quarantine_refused
+smoke_run "A4 missing isolated .claude => own (empty) dir, no operator fallback" \
+  test_a4_missing_isolated_claude_no_operator_fallback
+smoke_run "A5 symlinked-to-operator config dir => F2 refuses move" \
+  test_a5_symlinked_config_dir_refuses_move
 smoke_run "operator transcript survives untouched" \
   test_operator_transcript_survives
 
-smoke_log "PASS — #1890 dynamic Claude = operator-global passthrough; no bridge resume/quarantine; operator session never hijacked"
+smoke_log "PASS — #1890 dynamic Claude = operator-global passthrough; #1893 realpath-harden (missing/symlinked config dir) never moves the operator session"
