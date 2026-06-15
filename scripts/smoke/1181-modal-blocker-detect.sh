@@ -215,7 +215,10 @@ test_d_daemon_audit_reason() {
 # shellcheck disable=SC2329
 build_min_db() {
   local db="$1"
-  python3 - "$db" <<'PY'
+  # NOTE: inline via `python3 -c` (single-quoted body, no single quotes inside)
+  # rather than a `python3 - <<PY` heredoc — heredoc-stdin to a subprocess is the
+  # Bash 5.3.9 footgun #11 deadlock surface the lint-heredoc-ban ratchet rejects.
+  python3 -c '
 import sqlite3, sys, time
 db = sys.argv[1]
 conn = sqlite3.connect(db)
@@ -250,7 +253,7 @@ conn.execute(
 )
 conn.commit()
 conn.close()
-PY
+' "$db"
 }
 
 # shellcheck disable=SC2329
@@ -282,16 +285,20 @@ test_e_status_surfaces() {
     --json 2>/dev/null)" \
     || smoke_fail "bridge-status.py --json exited non-zero"
 
-  # Named --json field carries the modal class.
-  python3 - "$json_out" <<'PY' || smoke_fail "wake_reason not surfaced in --json for the blocked agent"
+  # Named --json field carries the modal class. Inline via `python3 -c`
+  # (single-quoted body) rather than heredoc-stdin — see build_min_db NOTE.
+  # f-strings precompute their values so the body stays single-quote-free.
+  python3 -c '
 import json, sys
 data = json.loads(sys.argv[1])
 agents = data.get("agents", {})
 w = agents.get("watcher")
 assert w is not None, "watcher agent missing from --json"
-assert w.get("wake") == "block", f"expected wake=block, got {w.get('wake')!r}"
-assert w.get("wake_reason") == "feedback_survey", f"expected wake_reason=feedback_survey, got {w.get('wake_reason')!r}"
-PY
+wake = w.get("wake")
+assert wake == "block", f"expected wake=block, got {wake!r}"
+reason = w.get("wake_reason")
+assert reason == "feedback_survey", f"expected wake_reason=feedback_survey, got {reason!r}"
+' "$json_out" || smoke_fail "wake_reason not surfaced in --json for the blocked agent"
 
   # Human render names the modal in the "Wake Blocked" block.
   local human_out
