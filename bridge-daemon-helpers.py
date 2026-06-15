@@ -1535,8 +1535,10 @@ def cmd_orphan_gc_task_body(args: argparse.Namespace) -> int:
 def cmd_agent_doc_backfill_non_clean(args: argparse.Namespace) -> int:
     """Issue #1809 — decide whether a codex AGENTS.md doc-backfill pass is
     "non-clean" (worth ONE `[hygiene]` admin task). Non-clean iff the summary
-    actually backfilled or refreshed at least one agent, or recorded an error.
-    A pass that checked agents but changed nothing prints ``0`` (no task).
+    actually backfilled or refreshed at least one agent, held a roster/heuristic
+    engine disagreement (#1892), flagged an engine-mismatched doc (#1906), or
+    recorded an error. A pass that checked agents but changed nothing prints
+    ``0`` (no task).
 
     Prints ``1`` (non-clean) or ``0`` (clean).
     """
@@ -1545,7 +1547,10 @@ def cmd_agent_doc_backfill_non_clean(args: argparse.Namespace) -> int:
     if isinstance(summary, dict):
         # #1892: `held` (roster/heuristic engine disagreement) is non-clean too,
         # so the operator gets a visible warning instead of a silent skip.
-        for key in ("backfilled", "refreshed", "held", "errors"):
+        # #1906: `engine_mismatch_docs` (a stale Codex-contract AGENTS.md on a
+        # non-codex agent) is non-clean too — the same [hygiene] surface flags
+        # the residue so an operator can reversible-backup-rename it.
+        for key in ("backfilled", "refreshed", "held", "engine_mismatch_docs", "errors"):
             if summary.get(key):
                 non_clean = True
                 break
@@ -1557,7 +1562,9 @@ def cmd_agent_doc_backfill_task_body(args: argparse.Namespace) -> int:
     """Issue #1809 — render the `[hygiene]` admin task body from the codex
     AGENTS.md doc-backfill summary JSON. Lists which codex agents had their
     AGENTS.md identity contract backfilled (created) or refreshed (managed
-    header re-rendered, custom contract preserved), plus any errors.
+    header re-rendered, custom contract preserved), the engine-disagreement
+    `held` rows (#1892), the flag-only engine-mismatched-doc residue rows
+    (#1906), plus any errors.
     """
     summary = _load_json_file(args.summary_json)
     host = args.hostname or "host"
@@ -1568,6 +1575,7 @@ def cmd_agent_doc_backfill_task_body(args: argparse.Namespace) -> int:
     backfilled = summary.get("backfilled") or []
     refreshed = summary.get("refreshed") or []
     held = summary.get("held") or []
+    engine_mismatch_docs = summary.get("engine_mismatch_docs") or []
     errors = summary.get("errors") or []
     checked = summary.get("codex_agents_checked", "?")
 
@@ -1624,6 +1632,34 @@ def cmd_agent_doc_backfill_task_body(args: argparse.Namespace) -> int:
                 lines.append(f"- {h}")
         lines.append("")
 
+    if engine_mismatch_docs:
+        lines.append(
+            f"## Engine-mismatched docs — FLAG ONLY, not removed "
+            f"({len(engine_mismatch_docs)})"
+        )
+        lines.append(
+            "These non-codex agents carry a stale Codex-contract `AGENTS.md` "
+            "(a pre-#1896 mis-scaffold residue). Runtime-harmless — a Claude "
+            "session never reads `AGENTS.md` — but it is misleading residue and "
+            "an audit smell. The pass reports it ONLY; nothing was deleted, "
+            "renamed, or edited (#1906). **Action**: an operator may "
+            "reversible-backup-rename the stray doc (e.g. "
+            "`mv AGENTS.md AGENTS.md.bak-<date>`); removal stays a deliberate "
+            "operator action, never an automatic sweep."
+        )
+        for d in engine_mismatch_docs:
+            if isinstance(d, dict):
+                lines.append(
+                    f"- `{d.get('agent', '')}` — roster_engine="
+                    f"{d.get('roster_engine', '')}, "
+                    f"{d.get('doc', 'AGENTS.md')} carries a "
+                    f"{d.get('detected_contract', 'codex')} contract: "
+                    f"{d.get('path', '')}"
+                )
+            else:
+                lines.append(f"- {d}")
+        lines.append("")
+
     if errors:
         lines.append(f"## Errors ({len(errors)})")
         for e in errors:
@@ -1636,8 +1672,9 @@ def cmd_agent_doc_backfill_task_body(args: argparse.Namespace) -> int:
     lines.append(
         "Backfilled/refreshed rows are an FYI that the runtime closed a standing "
         "`missing_files: AGENTS.md` watchdog gap. The same backfill runs on "
-        "`agent-bridge upgrade`. Held rows need an operator engine-confirmation "
-        "(see above)."
+        "`agent-bridge upgrade`. Held rows need an operator engine-confirmation, "
+        "and engine-mismatched-doc rows are flag-only residue an operator may "
+        "reversible-backup-rename (see above)."
     )
     print("\n".join(lines).rstrip() + "\n")
     return 0
