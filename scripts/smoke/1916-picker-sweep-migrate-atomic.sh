@@ -62,11 +62,16 @@ run_migrate_probe() {
   # title=="picker-sweep", payload.kind ∈ {text,shell}, id surfaced.
   local LEGACY='{"id":"leg1","title":"picker-sweep","payload":{"kind":"text"}}'
   local SHELL='{"id":"sh1","title":"picker-sweep","payload":{"kind":"shell"}}'
+  # Id-less legacy row (older `cron list` shape / mock without ids): enumerate
+  # emits a leading-tab `\ttext` line for it.
+  local LEGACY_NOID='{"title":"picker-sweep","payload":{"kind":"text"}}'
   case "$initial" in
-    legacy)        printf '{"jobs":[%s]}\n' "$LEGACY" >"$state_json" ;;
-    legacy+shell)  printf '{"jobs":[%s,%s]}\n' "$LEGACY" "$SHELL" >"$state_json" ;;
-    empty)         printf '{"jobs":[]}\n' >"$state_json" ;;
-    *)             smoke_fail "unknown initial state: $initial" ;;
+    legacy)            printf '{"jobs":[%s]}\n' "$LEGACY" >"$state_json" ;;
+    legacy+shell)      printf '{"jobs":[%s,%s]}\n' "$LEGACY" "$SHELL" >"$state_json" ;;
+    legacy-noid)       printf '{"jobs":[%s]}\n' "$LEGACY_NOID" >"$state_json" ;;
+    legacy-noid+shell) printf '{"jobs":[%s,%s]}\n' "$LEGACY_NOID" "$SHELL" >"$state_json" ;;
+    empty)             printf '{"jobs":[]}\n' >"$state_json" ;;
+    *)                 smoke_fail "unknown initial state: $initial" ;;
   esac
   # Post-successful-create state (what `cron list` returns after a 0-exit create):
   # the shell row is present so the verify-before-delete step confirms it.
@@ -195,6 +200,41 @@ assert_fresh_install_creates_no_delete() {
     "fresh: helper must log the registration"
 }
 
+# Scenario 5 (id-less edge, codex #1919 r1): an id-less legacy row alongside a
+# shell row → leave + warn, NEVER a bogus `cron delete text` (the misparse bug
+# where `IFS=$'\t' read` collapsed the kind into the id field).
+# shellcheck disable=SC2329
+assert_idless_legacy_with_shell_leaves_and_warns() {
+  local out log
+  out="$(run_migrate_probe idless-shell legacy-noid+shell 0)"
+  log="$(probe_cron_log "$out")"
+
+  smoke_assert_not_contains "$log" "create" \
+    "id-less+shell: a shell row already present must NOT trigger a create"
+  smoke_assert_not_contains "$log" "delete" \
+    "id-less+shell: no id to target + title-delete ambiguous with the shell row → must NOT delete (no 'cron delete text' misparse)"
+  smoke_assert_contains "$out" "legacy id-less text-kind row remains" \
+    "id-less+shell: must warn that the id-less legacy row is left in place"
+}
+
+# Scenario 6 (id-less edge): an id-less legacy-only row + successful create →
+# shell registered, legacy LEFT + warn, NEVER `cron delete text`.
+# shellcheck disable=SC2329
+assert_idless_legacy_only_create_leaves_and_warns() {
+  local out log
+  out="$(run_migrate_probe idless-only legacy-noid 0)"
+  log="$(probe_cron_log "$out")"
+
+  smoke_assert_contains "$log" "--kind shell" \
+    "id-less-only: shell-kind cron must be registered"
+  smoke_assert_not_contains "$log" "delete" \
+    "id-less-only: no id to delete → must NOT emit 'cron delete text' (the misparse bug)"
+  smoke_assert_contains "$out" "picker-sweep cron registered" \
+    "id-less-only: helper must log the registration"
+  smoke_assert_contains "$out" "legacy id-less text-kind row remains" \
+    "id-less-only: must warn that the id-less legacy row is left in place"
+}
+
 main() {
   smoke_require_cmd grep
   smoke_require_cmd sed
@@ -210,6 +250,10 @@ main() {
     assert_idempotent_removes_legacy_no_create
   smoke_run "fresh install → shell-kind created, nothing to delete" \
     assert_fresh_install_creates_no_delete
+  smoke_run "id-less legacy + shell present → leave + warn (no bogus 'delete text')" \
+    assert_idless_legacy_with_shell_leaves_and_warns
+  smoke_run "id-less legacy only + create OK → registered, leave + warn (no 'delete text')" \
+    assert_idless_legacy_only_create_leaves_and_warns
 
   smoke_log "all #1916 picker-sweep migration fail-safe ordering checks pass"
 }

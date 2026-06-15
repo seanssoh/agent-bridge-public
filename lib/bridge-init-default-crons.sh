@@ -143,8 +143,15 @@ bridge_init_register_default_picker_sweep() {
   # exist yet — the enumerate treats that as "no job, proceed".
   local enum_lines shell_seen=0 legacy_ids=() legacy_titleonly=0
   enum_lines="$(_bridge_init_picker_sweep_enumerate "$agent_bridge_cli")"
-  local _id _kind
-  while IFS=$'\t' read -r _id _kind; do
+  local _line _id _kind
+  while IFS= read -r _line; do
+    # Split on the FIRST tab WITHOUT IFS whitespace-stripping. `IFS=$'\t' read`
+    # would strip a *leading* tab, so an id-less `\t<kind>` row (older `cron
+    # list` shape / mock without ids) collapses the kind into _id and the id-less
+    # leave/warn path below goes dead (codex #1919 r1 finding). Parameter
+    # expansion preserves the empty id field.
+    _id="${_line%%$'\t'*}"
+    _kind="${_line#*$'\t'}"
     [[ -n "$_kind" || -n "$_id" ]] || continue
     if [[ "$_kind" == "shell" ]]; then
       shell_seen=1
@@ -154,8 +161,8 @@ bridge_init_register_default_picker_sweep() {
     if [[ -n "$_id" ]]; then
       legacy_ids+=("$_id")
     else
-      # No id surfaced (older list shape / mock without ids) — fall back to a
-      # title-scoped delete, which is only unambiguous when this is the sole row.
+      # No id surfaced (older list shape / mock without ids) — the id-less
+      # leave/warn path (a title delete is ambiguous once a shell row coexists).
       legacy_titleonly=1
     fi
   done <<< "$enum_lines"
