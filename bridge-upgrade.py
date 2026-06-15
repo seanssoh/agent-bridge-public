@@ -104,25 +104,33 @@ bridge-managed contract, never an edited file).
 """
 
 
-def _managed_contract_sha256_set(source_root: Path) -> frozenset[str]:
+def _managed_contract_sha256_set(source_root: Path, upstream_ref: str = "") -> frozenset[str]:
     """The set of content hashes that count as "the unmodified managed contract":
-    the frozen historical allowlist plus the contract this upgrade is shipping
-    (the source checkout's own repo-root CLAUDE.md). Adding the current source
-    hash means a freshly-cut contract version is recognized without a code edit,
-    while still requiring an EXACT byte match (operator edits never match)."""
-    source_claude = source_root / "CLAUDE.md"
+    the frozen historical allowlist plus the contract this upgrade is shipping.
+    Adding the current contract hash means a freshly-cut contract version is
+    recognized without a code edit, while still requiring an EXACT byte match
+    (operator edits never match).
+
+    #1817 r2: "the contract this upgrade ships" is read via ``upstream_file_bytes``
+    so that on a dry-run ``--ref`` preview it is the *ref's* CLAUDE.md (the bytes
+    that would actually be deployed), not the checked-out working tree — making
+    the dry-run ``live_root_claude_action`` preview faithful to the requested ref.
+    On the apply path (``upstream_ref==""``) this is the working-tree read,
+    unchanged."""
     try:
-        current = sha256_bytes(source_claude.read_bytes())
+        current_bytes = upstream_file_bytes(source_root, upstream_ref, "CLAUDE.md")
     except OSError:
         return KNOWN_CONTRACT_SHA256
-    return KNOWN_CONTRACT_SHA256 | {current}
+    if not current_bytes:  # None (path absent in the ref) or empty — never add an empty hash
+        return KNOWN_CONTRACT_SHA256
+    return KNOWN_CONTRACT_SHA256 | {sha256_bytes(current_bytes)}
 
 
 def render_live_root_operator_stub() -> bytes:
     return LIVE_ROOT_OPERATOR_STUB.format(marker=LIVE_ROOT_CLAUDE_MARKER).encode("utf-8")
 
 
-def substitute_live_root_claude(source_root: Path, target_root: Path, dry_run: bool) -> str | None:
+def substitute_live_root_claude(source_root: Path, target_root: Path, dry_run: bool, upstream_ref: str = "") -> str | None:
     """Issue #1817: keep the live-root `CLAUDE.md` a thin operator stub.
 
     Returns the action taken ("created" | "substituted") or None when the live
@@ -142,7 +150,7 @@ def substitute_live_root_claude(source_root: Path, target_root: Path, dry_run: b
     if LIVE_ROOT_CLAUDE_MARKER.encode("utf-8") in live:
         # Already the generated stub — leave it (idempotent re-run).
         return None
-    if sha256_bytes(live) not in _managed_contract_sha256_set(source_root):
+    if sha256_bytes(live) not in _managed_contract_sha256_set(source_root, upstream_ref):
         # Operator-customized file (or an unrecognized variant) — preserve it.
         return None
     if not dry_run:
@@ -3291,7 +3299,7 @@ def apply_live(
     # Issue #1817: the tracked root `CLAUDE.md` is skipped by the deploy
     # classifier; decide the live-root operator-stub action here (detection
     # only — no write — so the dry-run preview is faithful) and surface it.
-    live_root_claude_action = substitute_live_root_claude(source_root, target_root, dry_run=True)
+    live_root_claude_action = substitute_live_root_claude(source_root, target_root, dry_run=True, upstream_ref=upstream_ref)
 
     payload = {
         "mode": "upgrade-apply",
