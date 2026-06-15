@@ -91,6 +91,12 @@ DRY_RUN=0
 RESTART_DAEMON=1
 RESTART_AGENTS=1
 RESTART_AGENTS_EXPLICIT=0
+# Issue #1905: set to 1 by the #1820 quiesce step when this install's daemon is
+# systemd-managed (so the restart phase restores via systemctl instead of
+# `bridge-daemon.sh ensure`). Initialized here so the restart phase stays
+# nounset-safe even when the reconcile block is skipped (e.g. the reconcile lib
+# is absent).
+_UPGRADE_DAEMON_SYSTEMD_MANAGED=0
 JSON=0
 ALLOW_DIRTY=0
 ALLOW_DIRTY_SOURCE=0
@@ -1189,6 +1195,67 @@ _bridge_upgrade_write_complete_marker() {
   return 0
 }
 # END: Issue #1662 upgrade-complete marker helpers
+
+# BEGIN: Issue #1905 systemd-aware quiesce/restart around the #1820 reconcile
+# On a sudo-self systemd install the daemon lifecycle is owned by
+# `agent-bridge-daemon.service` (Restart=) + `agent-bridge-daemon-liveness.timer`.
+# A script-level `bridge-daemon.sh stop` is NOT systemd-aware, so systemd
+# RESPAWNS `bridge-daemon.sh run` inside the #1820 reconcile quiesce window and
+# the fail-closed fence (lib/bridge-layout-v2-reconcile.sh) keeps seeing a live
+# pid → rc=3 abort → half-applied upgrade. Mirror the prior art already in the
+# A2A receiver path (bridge_a2a_receiver_systemd_active → systemctl, don't fight
+# systemd): when systemd-managed, stop the units for the reconcile window and
+# bring them back via systemctl on restart. Everything here is gated behind a
+# systemd-active check and is best-effort, so non-systemd installs (macOS
+# launchd, plain-bash) are byte-for-byte unchanged.
+
+# True only when systemctl exists AND agent-bridge-daemon.service is active.
+# Prefers the canonical detector (lib/bridge-daemon-control.sh) when it is in
+# scope; falls back to an inline `systemctl --user is-active` so this helper is
+# self-contained and never errors on a host without that module sourced. rc-only,
+# no output.
+_bridge_upgrade_daemon_systemd_active() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  if command -v _bridge_daemon_control_systemd_active >/dev/null 2>&1; then
+    _bridge_daemon_control_systemd_active
+    return $?
+  fi
+  systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null
+}
+
+# Stop the systemd-user daemon units so systemd cannot respawn the daemon during
+# the #1820 reconcile. Stop the liveness TIMER first (so it can't re-fire the
+# service), then the service. Best-effort (|| true): a systemctl failure must
+# never abort the upgrade. No-op (returns 0, no systemctl calls) on a
+# non-systemd-managed install.
+_bridge_upgrade_systemd_quiesce_daemon() {
+  _bridge_upgrade_daemon_systemd_active || return 0
+  echo "[bridge-upgrade] systemd-managed daemon detected — stopping agent-bridge-daemon-liveness.timer + agent-bridge-daemon.service for the layout-v2 reconcile window (they would otherwise respawn the daemon and race the #1820 fence)." >&2
+  systemctl --user stop agent-bridge-daemon-liveness.timer >/dev/null 2>&1 || true
+  systemctl --user stop agent-bridge-daemon.service >/dev/null 2>&1 || true
+  return 0
+}
+
+# Restore the systemd-user daemon units after the reconcile. Start the SERVICE
+# first, then re-arm the liveness TIMER. Best-effort. ALWAYS returns 0 so a
+# missing systemctl or a unit-start failure can NEVER abort the upgrade under
+# `set -euo pipefail` — the caller invokes this as the last statement of a
+# `then`-branch, where a non-zero return WOULD trip set -e. NOTE: checks
+# systemctl presence directly rather than is-active, because the service was
+# just stopped by the quiesce step and would report inactive; if systemctl has
+# somehow vanished since quiesce we skip and leave the unit's own Restart= /
+# liveness-timer policy to bring the daemon back.
+_bridge_upgrade_systemd_restart_daemon() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "[bridge-upgrade] WARN: systemctl not found at restart time on a systemd-managed install — leaving the daemon to its unit Restart= / liveness-timer policy." >&2
+    return 0
+  fi
+  echo "[bridge-upgrade] restoring systemd-managed daemon — starting agent-bridge-daemon.service + agent-bridge-daemon-liveness.timer." >&2
+  systemctl --user start agent-bridge-daemon.service >/dev/null 2>&1 || true
+  systemctl --user start agent-bridge-daemon-liveness.timer >/dev/null 2>&1 || true
+  return 0
+}
+# END: Issue #1905 systemd-aware quiesce/restart helpers
 
 # #8945 Track D: record the Codex CLI version across upgrades and surface a
 # NON-FATAL operator advisory when the MAJOR or MINOR component changes.
@@ -3026,6 +3093,25 @@ if [[ $DRY_RUN -eq 0 ]]; then
     # this even when --no-restart-daemon was requested — the reconcile needs the
     # daemon down to run safely, and a --no-restart-daemon install that was
     # already daemon-down stays down (we simply do not bring it back up below).
+    #
+    # Issue #1905: on a systemd-managed install a script-level stop is NOT
+    # systemd-aware — `agent-bridge-daemon.service` (Restart=) +
+    # `agent-bridge-daemon-liveness.timer` respawn the daemon inside this
+    # quiesce window and the #1820 fence keeps seeing a live pid → rc=3 abort.
+    # Stop the units FIRST (timer before service) so systemd cannot respawn,
+    # then fall through to the script-level stop as belt-and-suspenders. The
+    # helper is a no-op on non-systemd installs (gated on systemctl + active),
+    # so launchd/plain-bash keep the existing path unchanged. Remember whether
+    # this install was systemd-managed so the restart phase below restores via
+    # systemctl instead of `bridge-daemon.sh ensure` (the service is stopped
+    # now, so we cannot re-detect at restart time).
+    _UPGRADE_DAEMON_SYSTEMD_MANAGED=0
+    if _bridge_upgrade_daemon_systemd_active; then
+      _UPGRADE_DAEMON_SYSTEMD_MANAGED=1
+    fi
+    # Best-effort: the quiesce helper always returns 0; `|| true` is
+    # belt-and-suspenders so a systemctl hiccup can never abort the upgrade.
+    _bridge_upgrade_systemd_quiesce_daemon || true
     # `--force` because the upgrader is the sanctioned daemon stop path.
     bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
     # CANONICAL reconcile result path. The driver/wrapper ALSO writes this same
@@ -3124,15 +3210,25 @@ fi
 # END: Issue #1662 upgrade-complete marker + restart notice
 
 if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
-  # --force: the upgrader is the sanctioned daemon stop+restart path
-  # (issue #314 Layer 3 / #315 Track 3). Bypass the active-agent guard.
-  bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
-  # Issue #1661: close the upgrade-lock flock fd for the (daemonizing,
-  # tmux-spawning) child so it cannot inherit + pin the lock past our exit.
-  # `:-` keeps this nounset-safe when reached without a lock token (empty token
-  # => run_without is a transparent pass-through, pre-#1661 behavior).
-  bridge_scoped_lock_run_without "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" \
-    bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
+  if [[ "${_UPGRADE_DAEMON_SYSTEMD_MANAGED:-0}" == "1" ]]; then
+    # Issue #1905: this install is systemd-managed and the #1820 quiesce step
+    # stopped its units. Don't fight systemd on the way back up — restore via
+    # systemctl (service first, then re-arm the liveness timer) instead of
+    # `bridge-daemon.sh ensure`, mirroring the unit-down path. Best-effort: the
+    # helper always returns 0, and the trailing `|| true` is belt-and-suspenders
+    # so the upgrade can never abort here under set -e.
+    _bridge_upgrade_systemd_restart_daemon || true
+  else
+    # --force: the upgrader is the sanctioned daemon stop+restart path
+    # (issue #314 Layer 3 / #315 Track 3). Bypass the active-agent guard.
+    bash "$TARGET_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
+    # Issue #1661: close the upgrade-lock flock fd for the (daemonizing,
+    # tmux-spawning) child so it cannot inherit + pin the lock past our exit.
+    # `:-` keeps this nounset-safe when reached without a lock token (empty token
+    # => run_without is a transparent pass-through, pre-#1661 behavior).
+    bridge_scoped_lock_run_without "${_BRIDGE_UPGRADE_LOCK_TOKEN:-}" \
+      bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
+  fi
 fi
 
 # Issue #1612 — cycle the A2A handoff receiver when --restart-daemon was
