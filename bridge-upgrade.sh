@@ -3139,10 +3139,34 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   # instead of restoring the pre-upgrade content. See codex review
   # of the v0.3.8 -> v0.4.0 diff.
   if [[ $DRY_RUN -eq 0 ]]; then
+    # Issue #1813 / #1820 (writer 4): on a v2 install the per-agent home that
+    # sessions actually read is `<data_root>/agents/<a>/home`, not the v1
+    # `<target_root>/agents/<a>`. Resolve the target install's data root from
+    # ITS layout marker (the target may not be the controller's own
+    # BRIDGE_HOME, so the bridge-lib marker loader is not authoritative here),
+    # then point bridge-docs.py at the v2 agents root + `--home-subdir home`.
+    # Without this the upgrade doc-sync grooms the v1 ghost tree, so the canon
+    # shared-doc symlinks (COMMON-INSTRUCTIONS/CHANGE-POLICY/TOOLS/ADMIN-
+    # PROTOCOL) never reach the v2 homes. On legacy/v1 installs the marker is
+    # absent and the v1 `<target_root>/agents` target is used byte-for-byte.
+    _docs_target_root="$TARGET_ROOT/agents"
+    _docs_home_subdir_args=()
+    _docs_marker="$TARGET_ROOT/state/layout-marker.sh"
+    if [[ -f "$_docs_marker" && ! -L "$_docs_marker" ]]; then
+      _docs_layout="$(grep -E '^[[:space:]]*BRIDGE_LAYOUT=' "$_docs_marker" 2>/dev/null \
+        | tail -n1 | sed -E 's/^[[:space:]]*BRIDGE_LAYOUT=//; s/^["'\'']//; s/["'\'']$//')"
+      _docs_data_root="$(grep -E '^[[:space:]]*BRIDGE_DATA_ROOT=' "$_docs_marker" 2>/dev/null \
+        | tail -n1 | sed -E 's/^[[:space:]]*BRIDGE_DATA_ROOT=//; s/^["'\'']//; s/["'\'']$//')"
+      if [[ "$_docs_layout" == "v2" && -n "$_docs_data_root" && "$_docs_data_root" == /* ]]; then
+        _docs_target_root="$_docs_data_root/agents"
+        _docs_home_subdir_args=(--home-subdir home)
+      fi
+    fi
     DOCS_PREVIEW_JSON="$(bridge_upgrade_with_target_env "$TARGET_ROOT" \
       python3 "$SOURCE_ROOT/bridge-docs.py" apply --all --dry-run --json \
       --bridge-home "$TARGET_ROOT" \
-      --target-root "$TARGET_ROOT/agents" 2>/dev/null || printf '{"changed_paths":[]}')"
+      --target-root "$_docs_target_root" \
+      ${_docs_home_subdir_args[@]+"${_docs_home_subdir_args[@]}"} 2>/dev/null || printf '{"changed_paths":[]}')"
     python3 "$SOURCE_ROOT/bridge-upgrade.py" backup-extend-live \
       --target-root "$TARGET_ROOT" \
       --backup-root "$BACKUP_ROOT" \
@@ -3150,7 +3174,8 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
     bridge_upgrade_with_target_env "$TARGET_ROOT" \
       python3 "$SOURCE_ROOT/bridge-docs.py" apply --all \
       --bridge-home "$TARGET_ROOT" \
-      --target-root "$TARGET_ROOT/agents" >/dev/null 2>&1 || true
+      --target-root "$_docs_target_root" \
+      ${_docs_home_subdir_args[@]+"${_docs_home_subdir_args[@]}"} >/dev/null 2>&1 || true
   fi
 
   # Enforce the singleton channel plugin policy (closes #244). Running this

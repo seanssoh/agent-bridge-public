@@ -83,7 +83,7 @@ For each agent home under `<bridge-home>/agents/`:
 1. **Inventory snapshot**: `CLAUDE.md` line count, managed-block byte size + SHA, root symlinks list, `USER.md` presence, `users/*/` partitions, research aggregations.
 2. **Backup**: write the rollback copy under `<bridge-home>/state/doc-migration/backups-<stamp>/<agent>.CLAUDE.md.bak`. If the managed block contains legacy inline sections, also write `CLAUDE.md.bak-<YYYYMMDD>-managed-block` beside the file for operator inspection; rollback still uses the state backup.
 3. **Render new CLAUDE.md**: call `bridge_docs.normalize_claude(agent_dir, session_type=<resolved>)`. The managed block is replaced with the pointer-only body. Custom sections outside the markers are preserved byte-for-byte.
-4. **Rewire symlinks**: `bridge_docs.ensure_agent_shared_links(agent_dir, session_type)` installs `COMMON-INSTRUCTIONS.md → ../../docs/agent-runtime/common-instructions.md`, `MEMORY-SCHEMA.md → ../../docs/agent-runtime/memory-schema.md`, `CHANGE-POLICY.md → ../shared/CHANGE-POLICY.md`, `TOOLS.md → ../shared/TOOLS.md`. If admin, also `ADMIN-PROTOCOL.md → ../../docs/agent-runtime/admin-protocol.md`.
+4. **Rewire symlinks**: `bridge_docs.ensure_agent_shared_links(agent_dir, bridge_home, …)` installs `COMMON-INSTRUCTIONS.md`, `CHANGE-POLICY.md`, `TOOLS.md`, and `ADMIN-PROTOCOL.md` as symlinks that **resolve to `<bridge_home>/shared/<name>`** — the canonical shared docs that `sync_shared_docs` renders. The link target is computed depth-correct via `os.path.relpath(<shared_dir>, agent_dir)` (issue #1813), so it resolves at both v1 home depth (`agents/<a>/`) and v2 home depth (`data/agents/<a>/home/`); an already-correct link (absolute or relative) is accepted by realpath equality and never clobbered. `MEMORY-SCHEMA.md` is **not** a symlink — it is template-synced in place by `sync_memory_schema_from_template`.
 5. **Remove deprecated**: delete root `USER.md` (file or symlink) if it was pointing at `shared/SYRS-USER.md`. Delete root `SYRS-USER.md` root-level duplicate. Move `compound/lessons.md` → `memory/lessons.md`. Delete `recent-context.md` if present.
 6. **Users partition**: if `users/<user>/` doesn't exist yet and a primary user was extracted from the old `SYRS-USER.md`, create `users/owner/USER.md` from its body. Cross-refs are rewritten to wiki canonical (`shared/wiki/people/<slug>.md`).
 7. **Research aggregations**: if `memory/projects/<big-file>.md` is present and > 8 KB with > 3 heading sections, schedule it for `agb knowledge split-legacy --llm` (interactive; not part of `--apply --yes`).
@@ -159,8 +159,8 @@ Hosts that never registered the relay require no action.
 | Root `USER.md` file/symlink count | 0 |
 | Dangling root symlinks | 0 |
 | Admin agents with `ADMIN-PROTOCOL.md` symlink | equals admin agent count |
-| `COMMON-INSTRUCTIONS.md` target | `../../docs/agent-runtime/common-instructions.md` |
-| `MEMORY-SCHEMA.md` target | `../../docs/agent-runtime/memory-schema.md` |
+| `COMMON-INSTRUCTIONS.md` link | resolves to `<bridge_home>/shared/COMMON-INSTRUCTIONS.md` (depth-correct relative; #1813) |
+| `MEMORY-SCHEMA.md` | template-synced in place (not a symlink) |
 | Wiki tree edges (per [`wiki-graph-rules.md`](wiki-graph-rules.md)) | 0 |
 | Entity meta-index nodes (`-md`, `memory`, `session-handoff`) | 0 |
 | Duplicate entity files (fuzzy match pre-dedup) | 0 (or tagged canonical-from) |
