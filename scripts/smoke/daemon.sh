@@ -645,7 +645,16 @@ daemon_socket_listener_contract() {
   export BRIDGE_TMPFILES_DIR="$SMOKE_TMP_ROOT/tmpfiles.d"
   export BRIDGE_TMPFILES_DRIVER=shim
   export BRIDGE_QUEUE_GATEWAY_SOCKET_START_WAIT_SECONDS=2
-  export BRIDGE_DAEMON_INTERVAL=60
+  # #1699: the daemon re-ensures the listener once per main-loop iteration,
+  # and the loop sleeps BRIDGE_DAEMON_INTERVAL between iterations. At the old
+  # value of 60, a startup listener-spawn that was CPU-starved on a contended
+  # CI runner had its NEXT retry ~60s away — past this test's 30s readiness
+  # poll — so the lifecycle case could still cold-boot-flake despite the
+  # bounded wait. Drop to 1 (matching the loop-restart case) so a slow spawn
+  # gets a prompt in-window retry. No assertion depends on the interval value;
+  # the test only needs the listener up once and accepting for the proxy
+  # create/show + cleanup checks below.
+  export BRIDGE_DAEMON_INTERVAL=1
 
   bridge_id="$(python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" print-runtime-id --bridge-home "$BRIDGE_HOME")"
   socket_path="$BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT/$bridge_id/queue-gateway.sock"
@@ -668,7 +677,7 @@ EOF
   # window was the same cold-boot cliff — a passing CI run was observed
   # taking 4.0s of it). The socket assertion below is unchanged.
   _daemon_wait_for_socket_listener_pid "$socket_path" "$pid_file" "$DAEMON_SOCKET_PID" >/dev/null || true
-  [[ -S "$socket_path" ]] || smoke_fail "daemon did not start queue socket listener; $(_daemon_socket_listener_diag "$DAEMON_SOCKET_PID" "$daemon_log")"
+  [[ -S "$socket_path" ]] || smoke_fail "daemon did not start queue socket listener; $(_daemon_socket_listener_diag "$DAEMON_SOCKET_PID" "$daemon_log" "$socket_path")"
 
   create_out="$(
     BRIDGE_GATEWAY_PROXY=1 BRIDGE_AGENT_ID=worker-a BRIDGE_GATEWAY_TRANSPORT=socket python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
@@ -688,6 +697,19 @@ EOF
   [[ ! -S "$socket_path" ]] || smoke_fail "daemon exit should remove queue socket"
 }
 
+# Probe whether the queue-gateway socket is *accepting connections right now*,
+# not merely that the socket file exists. Reuses the daemon's own standalone
+# connect-probe helper (lib/daemon-helpers/gateway-socket-connect-probe.py,
+# file-as-argv, no heredoc-stdin) so the smoke's readiness gate matches the
+# daemon's: connect() against the SEQPACKET socket returns 0 only when a
+# listener is bound AND accepting. Returns 0 when accepting, 1 otherwise.
+_daemon_socket_accepting() {
+  local socket_path="$1"
+  [[ -n "$socket_path" ]] || return 1
+  python3 "$SMOKE_REPO_ROOT/lib/daemon-helpers/gateway-socket-connect-probe.py" \
+    "$socket_path" >/dev/null 2>&1
+}
+
 # Poll, with a bounded budget, for the queue-gateway socket listener to be
 # live AND for its pid file to hold a numeric pid distinct from an optional
 # excluded pid (the restart case passes the killed listener's pid so it waits
@@ -700,6 +722,18 @@ EOF
 # caller's strict numeric assertion still fires when the listener never
 # comes up.
 #
+# Readiness TOCTOU closed here (#1699): the daemon writes the pid file
+# (bridge-daemon.sh:13131) BEFORE its own connect-probe loop confirms the
+# socket actually accepts (bridge-daemon.sh:13143-13145). So a poll that gated
+# only on socket-file + pid-file + daemon-alive could return the moment those
+# files appear and hand the caller a socket that is bound but not yet
+# accepting — the smoke then raced ahead to its proxy-create assertion against
+# a not-yet-ready listener. The `_daemon_socket_accepting` conjunct makes this
+# poll require the SAME accept proof the daemon requires, so success means the
+# listener is genuinely serving. Teeth intact: a socket that never accepts
+# never satisfies the conjunct, the bounded budget elapses, and the caller's
+# strict numeric assertion fails as before.
+#
 # Budget rationale (v0.16.10 wave CI flake, PR #1848 run 27401016284): the
 # daemon writes NOTHING to its own stdout/stderr on a healthy boot, so the
 # old failure message's empty `log=` was normal, not evidence of a hang.
@@ -707,7 +741,7 @@ EOF
 # cold start: each attempt is a python3 spawn with a 2s in-daemon wait
 # (BRIDGE_QUEUE_GATEWAY_SOCKET_START_WAIT_SECONDS), retried once per daemon
 # tick — so a couple of slow spawns already eat most of a fixed 10s window.
-# A healthy daemon breaks this poll the instant the socket binds, so a high
+# A healthy daemon breaks this poll the instant the socket accepts, so a high
 # ceiling costs nothing on a green run; 300*0.1=30s absorbs that cold-boot
 # latency without masking a real never-start.
 _daemon_wait_for_socket_listener_pid() {
@@ -717,7 +751,8 @@ _daemon_wait_for_socket_listener_pid() {
   for ((i = 0; i < attempts; i++)); do
     if [[ -S "$socket_path" && -f "$pid_file" ]] && kill -0 "$daemon_pid" 2>/dev/null; then
       found="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
-      if [[ "$found" =~ ^[0-9]+$ && "$found" != "$exclude_pid" ]]; then
+      if [[ "$found" =~ ^[0-9]+$ && "$found" != "$exclude_pid" ]] \
+         && _daemon_socket_accepting "$socket_path"; then
         printf '%s\n' "$found"
         return 0
       fi
@@ -729,14 +764,26 @@ _daemon_wait_for_socket_listener_pid() {
 
 # Failure diagnostics for the socket-listener tests. The daemon's own log is
 # empty on a healthy boot, so on timeout we also need: is the daemon process
-# still alive, and what did the gateway listener spawn actually say (its
-# errors land in state/queue-gateway-socket.log, not the daemon log).
+# still alive, did the socket file / pid file even appear, is the socket
+# actually accepting (alive-but-slow vs dead — #1699 asked for this split),
+# and what did the gateway listener spawn actually say (its errors land in
+# state/queue-gateway-socket.log, not the daemon log).
 _daemon_socket_listener_diag() {
-  local daemon_pid="$1" daemon_log="$2"
-  local alive="no"
+  local daemon_pid="$1" daemon_log="$2" socket_path="${3:-}"
+  local alive="no" socket_present="no" pid_file_present="no" accepting="n/a"
+  local pid_file="$BRIDGE_STATE_DIR/queue-gateway-socket.pid"
   kill -0 "$daemon_pid" 2>/dev/null && alive="yes"
-  printf 'daemon_alive=%s daemon_log=[%s] gateway_socket_log=[%s]' \
+  [[ -n "$socket_path" && -S "$socket_path" ]] && socket_present="yes"
+  [[ -f "$pid_file" ]] && pid_file_present="yes"
+  if [[ -n "$socket_path" ]]; then
+    accepting="no"
+    _daemon_socket_accepting "$socket_path" && accepting="yes"
+  fi
+  printf 'daemon_alive=%s socket_present=%s socket_accepting=%s pid_file=%s daemon_log=[%s] gateway_socket_log=[%s]' \
     "$alive" \
+    "$socket_present" \
+    "$accepting" \
+    "$pid_file_present" \
     "$(cat "$daemon_log" 2>/dev/null || true)" \
     "$(tail -n 20 "$BRIDGE_STATE_DIR/queue-gateway-socket.log" 2>/dev/null || true)"
 }
@@ -784,7 +831,7 @@ EOF
   # rationale (the prior fixed 10s window was still too tight under the
   # v0.16.10 wave job: PR #1848 run 27401016284).
   first_pid="$(_daemon_wait_for_socket_listener_pid "$socket_path" "$pid_file" "$DAEMON_SOCKET_PID" || true)"
-  [[ "$first_pid" =~ ^[0-9]+$ ]] || smoke_fail "loop-restart: daemon did not start initial listener; $(_daemon_socket_listener_diag "$DAEMON_SOCKET_PID" "$daemon_log")"
+  [[ "$first_pid" =~ ^[0-9]+$ ]] || smoke_fail "loop-restart: daemon did not start initial listener; $(_daemon_socket_listener_diag "$DAEMON_SOCKET_PID" "$daemon_log" "$socket_path")"
 
   kill "$first_pid" >/dev/null 2>&1 || true
 
@@ -792,7 +839,7 @@ EOF
   # exclude first_pid so we only accept a genuinely new listener process.
   second_pid="$(_daemon_wait_for_socket_listener_pid "$socket_path" "$pid_file" "$DAEMON_SOCKET_PID" "$first_pid" || true)"
   [[ "$second_pid" =~ ^[0-9]+$ && "$second_pid" != "$first_pid" ]] \
-    || smoke_fail "loop-restart: daemon did not restart dead queue socket listener (first=$first_pid second=${second_pid:-}); $(_daemon_socket_listener_diag "$DAEMON_SOCKET_PID" "$daemon_log")"
+    || smoke_fail "loop-restart: daemon did not restart dead queue socket listener (first=$first_pid second=${second_pid:-}); $(_daemon_socket_listener_diag "$DAEMON_SOCKET_PID" "$daemon_log" "$socket_path")"
 
   create_out="$(
     BRIDGE_GATEWAY_PROXY=1 BRIDGE_AGENT_ID=worker-a BRIDGE_GATEWAY_TRANSPORT=socket python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
