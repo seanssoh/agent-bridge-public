@@ -768,6 +768,16 @@ _daemon_wait_for_socket_listener_pid() {
 # actually accepting (alive-but-slow vs dead — #1699 asked for this split),
 # and what did the gateway listener spawn actually say (its errors land in
 # state/queue-gateway-socket.log, not the daemon log).
+#
+# #1699 facet 2: when the spawned `bridge-daemon.sh run` dies on cold boot
+# with an EMPTY daemon_log, the exit reason is NOT lost — the daemon's EXIT
+# trap writes a structured `daemon exit pid=N ec=E ... last_step=STEP` record
+# to state/launchagent.log and (on ec!=0) state/daemon-crash.log, never to its
+# own stdout/stderr (= the captured daemon_log). A singleton-lock refusal
+# (`last_step=ensure_singleton` ec=1) is the tell that the loop-restart daemon
+# raced the prior lifecycle daemon's still-held flock. Surface those records
+# so the next occurrence confirms the cause definitively rather than showing a
+# bare `daemon_log=[]`.
 _daemon_socket_listener_diag() {
   local daemon_pid="$1" daemon_log="$2" socket_path="${3:-}"
   local alive="no" socket_present="no" pid_file_present="no" accepting="n/a"
@@ -779,13 +789,55 @@ _daemon_socket_listener_diag() {
     accepting="no"
     _daemon_socket_accepting "$socket_path" && accepting="yes"
   fi
-  printf 'daemon_alive=%s socket_present=%s socket_accepting=%s pid_file=%s daemon_log=[%s] gateway_socket_log=[%s]' \
+  printf 'daemon_alive=%s socket_present=%s socket_accepting=%s pid_file=%s daemon_log=[%s] gateway_socket_log=[%s] daemon_exit_record=[%s]' \
     "$alive" \
     "$socket_present" \
     "$accepting" \
     "$pid_file_present" \
     "$(cat "$daemon_log" 2>/dev/null || true)" \
-    "$(tail -n 20 "$BRIDGE_STATE_DIR/queue-gateway-socket.log" 2>/dev/null || true)"
+    "$(tail -n 20 "$BRIDGE_STATE_DIR/queue-gateway-socket.log" 2>/dev/null || true)" \
+    "$(tail -n 5 "$BRIDGE_STATE_DIR/launchagent.log" "$BRIDGE_STATE_DIR/daemon-crash.log" 2>/dev/null || true)"
+}
+
+# #1699 facet 2 — wait, with a bounded budget, for the daemon singleton flock
+# at ${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}.lock to be FREE
+# before spawning a new `bridge-daemon.sh run`. The socket-listener tests share
+# one BRIDGE_STATE_DIR, so they share this lock; the daemon holds it for its
+# process lifetime (bridge_daemon_ensure_singleton, lib/bridge-daemon-control.
+# sh) and the kernel releases it only when the process is fully reaped —
+# `kill`+`wait` returning does NOT guarantee the flock is gone before the next
+# spawn. On a cold/loaded CI runner that residual hold makes the next daemon
+# lose ensure_singleton and exit ec=1 with an empty daemon_log (the reason
+# lands in launchagent.log, see the diag above), which is the facet-2 flake.
+# Probe NON-destructively with the daemon's own idiom (open an fd on the lock,
+# try `flock -n`, release immediately): success means the prior holder is gone,
+# failure means it still holds. Pure-bash poll, no heredoc-stdin / here-string
+# / procsub / `grep -q` (lint-heredoc-ban H3 + #1813 SIGPIPE). Returns 0 once
+# free (or when flock(1) is unavailable — nothing to serialize), non-zero if
+# still held at budget; the caller does not fail on a non-zero return — the
+# bounded wait only narrows the race, and the existing strict listener
+# assertion remains the teeth (a daemon that never starts still goes red).
+_daemon_wait_for_singleton_lock_free() {
+  local lock_path="${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}.lock"
+  local attempts="${DAEMON_SINGLETON_LOCK_FREE_WAIT_ATTEMPTS:-300}"
+  local probe_fd i
+  command -v flock >/dev/null 2>&1 || return 0
+  for ((i = 0; i < attempts; i++)); do
+    if [[ ! -e "$lock_path" ]]; then
+      return 0
+    fi
+    if exec {probe_fd}>"$lock_path" 2>/dev/null; then
+      if flock -n "$probe_fd" 2>/dev/null; then
+        # We took it — the prior holder is gone. Release immediately so the
+        # daemon we are about to spawn can re-acquire it.
+        exec {probe_fd}>&- 2>/dev/null || true
+        return 0
+      fi
+      exec {probe_fd}>&- 2>/dev/null || true
+    fi
+    sleep 0.1
+  done
+  return 1
 }
 
 daemon_socket_listener_loop_restart() {
@@ -821,6 +873,13 @@ EOF
   # test the OLD listener's pid as first_pid (and kill the wrong process).
   # The daemon's stop path normally removes it; this makes it deterministic.
   rm -f "$pid_file"
+  # #1699 facet 2: the lifecycle test (run immediately before us) shares this
+  # BRIDGE_STATE_DIR and therefore the daemon SINGLETON flock; its kill+wait
+  # does not guarantee the kernel has released that flock before we spawn. If
+  # it is still held, our daemon loses bridge_daemon_ensure_singleton and exits
+  # ec=1 with an empty daemon_log (the cold-boot flake). Wait, bounded, for the
+  # lock to be free first so the spawn below wins the singleton cleanly.
+  _daemon_wait_for_singleton_lock_free || true
   bash "$SMOKE_REPO_ROOT/bridge-daemon.sh" run >"$daemon_log" 2>&1 &
   DAEMON_SOCKET_PID="$!"
 
