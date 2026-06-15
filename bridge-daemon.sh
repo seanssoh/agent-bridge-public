@@ -6937,10 +6937,31 @@ bridge_daemon_sweep_orphan_autostart_state() {
 # periodic prune, a non-admin process that PID-camps the freed admin pane_pid
 # (iso shares the host PID space) could ride the orphan record. This sweep, plus
 # bridge-config.py's match-time liveness re-check, closes that lifecycle path.
-# Returns 0 if it removed anything (so cmd_sync_cycle records a change), 1 if
-# nothing was pruned.
+# Returns 0 if it removed/republished anything (so cmd_sync_cycle records a
+# change), 1 if it made no change.
+#
+# Issue #1738 r3 (FIX 3, false-delete / fleet self-DoS): `tmux has-session` exits
+# 1 BOTH when the session is gone AND when the tmux server is momentarily
+# unreachable (socket EAGAIN / `tmux kill-server` / server bounce). A per-binding
+# `has-session` during a transient server outage would delete EVERY live agent's
+# binding fleet-wide in a single tick — and publish happens only once at session
+# start (bridge-start.sh), so there is no recovery until a full restart. We mirror
+# the fail-safe `reap_idle_orphan_sessions` pattern instead:
+#   1. PRECONDITION GUARD: probe server reachability ONCE via
+#      `tmux list-sessions`; if it fails, the server is unreachable -> SKIP the
+#      whole pass (prune nothing, the conservative choice on an inconclusive
+#      query).
+#   2. Materialize the live-session SET from that successful listing and check
+#      each binding against the SET (membership), never per-binding has-session.
+#      A binding is pruned ONLY when tmux is provably up AND its session is
+#      provably absent — never on an inconclusive query.
+#   3. SELF-HEAL: re-publish the binding for any roster agent whose session IS
+#      live but whose binding file is missing, so the single-point-of-publish
+#      fragility (and any mistaken delete) self-repairs on the next tick.
 bridge_daemon_prune_orphan_config_caller_bindings() {
-  local dir="" changed=1 agent="" session="" rows=""
+  local dir="" changed=1 agent="" session="" rows="" sessions=""
+  local -A live_sessions=()
+  local name="" _heal_pane_pid="" _heal_engine=""
 
   if ! command -v bridge_config_caller_bindings_dir >/dev/null 2>&1; then
     return "$changed"
@@ -6948,11 +6969,28 @@ bridge_daemon_prune_orphan_config_caller_bindings() {
   dir="$(bridge_config_caller_bindings_dir)"
   [[ -n "$dir" && -d "$dir" ]] || return "$changed"
 
+  # (1) PRECONDITION GUARD: probe the tmux server ONCE. `list-sessions` to a temp
+  # file (no process substitution / pipe — lint-heredoc-ban H3 + #1813 SIGPIPE).
+  # A non-zero rc means the server is unreachable (or bouncing) -> skip the pass
+  # entirely so a transient outage prunes nothing. An empty-but-OK listing (rc=0,
+  # genuinely no sessions) is a valid live set and proceeds.
+  sessions="$(mktemp "${TMPDIR:-/tmp}/agb-cblive.XXXXXX")" || return "$changed"
+  if ! tmux list-sessions -F '#{session_name}' >"$sessions" 2>/dev/null; then
+    rm -f "$sessions" 2>/dev/null || true
+    daemon_info "config-caller binding prune skipped: tmux server unreachable (no prune this tick)"
+    return "$changed"
+  fi
+
+  # (2) Materialize the live-session SET from the successful listing.
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    live_sessions["$name"]=1
+  done <"$sessions"
+  rm -f "$sessions" 2>/dev/null || true
+
   # Materialize the `<agent>\t<session>` rows from the file-as-argv helper to a
-  # temp file, then loop over it with a plain `< file` redirect. We deliberately
-  # avoid process substitution (`< <(...)` is a banned H3 site, lint-heredoc-ban)
-  # and a `| while` pipe (which would run the loop in a subshell and discard the
-  # `changed` flag + the SIGPIPE footgun #1813).
+  # temp file, then loop over it with a plain `< file` redirect (same no-process-
+  # substitution / no-pipe discipline as the listing above).
   rows="$(mktemp "${TMPDIR:-/tmp}/agb-cbprune.XXXXXX")" || return "$changed"
   bridge_daemon_helper_python config-binding-list "$dir" >"$rows" 2>/dev/null || true
 
@@ -6960,8 +6998,10 @@ bridge_daemon_prune_orphan_config_caller_bindings() {
   # stray tabs/newlines from each field).
   while IFS=$'\t' read -r agent session; do
     [[ -n "$agent" ]] || continue
-    # An empty / non-live session means the bound pane is gone -> orphan.
-    if [[ -n "$session" ]] && bridge_tmux_session_exists "$session"; then
+    # Provable life: a non-empty session that IS in the live set survives. Only a
+    # binding with no session, or a session provably absent from the live set,
+    # is an orphan (the server is provably up — guarded above).
+    if [[ -n "$session" && -n "${live_sessions[$session]:-}" ]]; then
       continue
     fi
     if command -v bridge_remove_config_caller_binding >/dev/null 2>&1; then
@@ -6976,6 +7016,34 @@ bridge_daemon_prune_orphan_config_caller_bindings() {
   done <"$rows"
 
   rm -f "$rows" 2>/dev/null || true
+
+  # (3) SELF-HEAL: re-publish the binding for any roster agent whose session is
+  # live but whose binding file is missing (single-point-of-publish fragility +
+  # recovery from a mistaken delete). Best-effort and idempotent — a present,
+  # current binding is left untouched.
+  if command -v bridge_publish_config_caller_binding >/dev/null 2>&1 \
+     && [[ "${#BRIDGE_AGENT_IDS[@]}" -gt 0 ]]; then
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      [[ -n "$agent" ]] || continue
+      session="$(bridge_agent_session "$agent" 2>/dev/null || true)"
+      [[ -n "$session" && -n "${live_sessions[$session]:-}" ]] || continue
+      [[ -f "$dir/$agent.json" ]] && continue
+      _heal_pane_pid="$(bridge_tmux_session_pane_pid "$session" 2>/dev/null || true)"
+      [[ "$_heal_pane_pid" =~ ^[0-9]+$ ]] || continue
+      _heal_engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+      bridge_publish_config_caller_binding "$agent" "$_heal_pane_pid" "$_heal_engine" \
+        >/dev/null 2>&1 || true
+      # Only log + count a change when the binding file actually materialized — a
+      # persistent publish failure must NOT churn a misleading "self-healed" audit
+      # row every reconcile tick (codex r3 non-blocking).
+      [[ -f "$dir/$agent.json" ]] || continue
+      bridge_audit_log daemon config_caller_binding_self_healed "$agent" \
+        --detail session="$session" 2>/dev/null || true
+      daemon_info "config-caller binding self-healed for ${agent} (live session ${session}, binding was missing)"
+      changed=0
+    done
+  fi
+
   return "$changed"
 }
 
@@ -13848,10 +13916,14 @@ cmd_sync_cycle() {
   if bridge_daemon_sweep_orphan_autostart_state; then
     changed=0
   fi
-  # Issue #1738 r2 (BLOCKER 2): prune config-caller bindings whose tmux session
-  # is gone. Orderly stops GC their own binding (lib/bridge-agents.sh); this
-  # catches the crash/reboot/kill-server/SIGKILL orphans that never run the
-  # orderly path, so a PID-reuse forger cannot ride a stale admin binding.
+  # Issue #1738 r2/r3 (BLOCKER 2 + FIX 3): prune config-caller bindings whose
+  # tmux session is provably gone. Orderly stops GC their own binding
+  # (lib/bridge-agents.sh); this catches the crash/reboot/kill-server/SIGKILL
+  # orphans that never run the orderly path, so a PID-reuse forger cannot ride a
+  # stale admin binding. r3: a precondition server-reachability guard + a
+  # materialized live-session set make a transient tmux outage prune NOTHING
+  # (instead of every live binding fleet-wide), and live-but-missing bindings
+  # self-heal next tick.
   BRIDGE_DAEMON_LAST_STEP="config_caller_binding_prune"
   if bridge_daemon_prune_orphan_config_caller_bindings; then
     changed=0

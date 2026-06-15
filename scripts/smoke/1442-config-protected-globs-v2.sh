@@ -78,39 +78,34 @@ write_access_fixture "$PREV2_DISCORD_PATH"
 # A non-protected JSON sibling in the same workdir/.discord dir.
 printf '{"note": "not a protected file"}\n' >"$V2_NONPROTECTED_PATH"
 
-# Issue #1738: the wrapper now authorizes from a controller-published pane
-# binding matched against its own process ancestry (NOT env identity). The
-# wrapper subprocess is a descendant of THIS smoke shell ($$), so a binding
-# whose pane_pid == $$ matches its ancestry — that drives the admin path here.
-# Issue #1738 r2: the positive path also requires (a) the bound session to be
-# LIVE — re-resolved via an ABSOLUTE tmux (we install a stub at
-# BRIDGE_CONFIG_TMUX_BIN that answers display-message #{pane_pid} for the live
-# session) — and (b) the store to be NON-writable by the caller (the iso /
-# controller-owned shape), since a self-writable store is forgeable (Option 1).
+# Issue #1738 r3: the wrapper authorizes a `set` from a controller-published pane
+# binding matched against the wrapper's process ancestry (NOT env identity), and
+# the positive ADMIN WRITE path requires (a) the bound session to be LIVE —
+# re-resolved via a REAL tmux (the env-stub seam was REMOVED, FIX 2), so the
+# wrapper must run INSIDE a real pane — AND (b) a store the caller does NOT own
+# (FIX 1: ownership, not chmod). We reuse the shared smoke lib helpers to start a
+# real session + make the store foreign-owned (sudo); the mutating ALLOW
+# scenarios (2, 4) are SKIPPED (logged) where a real tmux session or passwordless
+# sudo is unavailable. The read-only `list-protected` (scenario 1) and the
+# path-gate DENY scenarios (3, 5 — denied BEFORE authorization) need no binding
+# and run as a direct subprocess regardless.
+# shellcheck source=scripts/smoke/lib.sh
+source "$REPO_ROOT/scripts/smoke/lib.sh"
+SMOKE_NAME="1442-config-protected-globs-v2"
+SMOKE_TMP_ROOT="$BRIDGE_HOME"
+export SMOKE_TMP_ROOT
+# Augment the existing EXIT trap with the lib's live-session teardown.
+trap 'smoke_config_caller_stop_live_session; chmod -R u+w "$BRIDGE_HOME" 2>/dev/null || true; if [[ "${SMOKE_CONFIG_CALLER_ISO_OK:-0}" == "1" ]] && command -v sudo >/dev/null 2>&1; then sudo -n chown -R "$(id -u):$(id -g)" "$BRIDGE_HOME" 2>/dev/null || true; fi; rm -rf "$BRIDGE_HOME"' EXIT
+
 BINDINGS_DIR="$BRIDGE_HOME/state/config-caller-bindings"
 mkdir -p "$BINDINGS_DIR"
-CC_LIVE_SESSION="sess-live"
-CC_FAKE_TMUX="$BRIDGE_HOME/config-caller-fake-tmux"
-{
-  printf '%s\n' '#!/usr/bin/env bash'
-  printf '%s\n' 'want_session=""'
-  printf '%s\n' 'while [[ $# -gt 0 ]]; do'
-  printf '%s\n' '  case "$1" in'
-  printf '%s\n' '    -t) want_session="$2"; shift 2 ;;'
-  printf '%s\n' '    *) shift ;;'
-  printf '%s\n' '  esac'
-  printf '%s\n' 'done'
-  printf '%s\n' '[[ "$want_session" == "'"$CC_LIVE_SESSION"'" ]] && { printf "%s\\n" "'"$$"'"; exit 0; }'
-  printf '%s\n' 'exit 1'
-} >"$CC_FAKE_TMUX"
-chmod 0755 "$CC_FAKE_TMUX"
-# Override is honored only under the explicit test sentinel (no production hole).
-export BRIDGE_CONFIG_ALLOW_TEST_TMUX="1"
-export BRIDGE_CONFIG_TMUX_BIN="$CC_FAKE_TMUX"
-printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
-  "$ADMIN_AGENT" "$ADMIN_AGENT" "$CC_LIVE_SESSION" "$$" >"$BINDINGS_DIR/$ADMIN_AGENT.json"
-chmod 0444 "$BINDINGS_DIR/$ADMIN_AGENT.json" 2>/dev/null || true
-chmod 0555 "$BINDINGS_DIR" 2>/dev/null || true
+smoke_config_caller_start_live_session || true
+
+# True iff the iso positive WRITE path is exercisable here.
+config_caller_positive_available() {
+  [[ "${SMOKE_CONFIG_CALLER_LIVE_OK:-0}" == "1" ]] || return 1
+  command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null
+}
 
 PASS=0
 FAIL=0
@@ -127,23 +122,42 @@ fail() {
   printf '[smoke][fail] %s\n' "$1" >&2
 }
 
+skip() {
+  printf '[smoke][skip] %s\n' "$1"
+}
+
+# Read-only / path-gate-deny verbs (list-protected, get, and `set` on a
+# non-protected path) need NO binding — run as a direct subprocess.
 run_config() {
-  # Admin pane-binding context (issue #1738) — the wrapper authorizes from the
-  # controller binding matched against this process's ancestry. `--from` is
-  # appended for the mutating verbs so the binding-agent identity is confirmed;
-  # `list-protected` ignores it. BRIDGE_AGENT_ID / BRIDGE_CALLER_SOURCE are kept
-  # to prove they no longer drive the decision (the binding does).
-  local verb="${1:-}"
-  local -a from_args=()
-  if [[ "$verb" == "set" || "$verb" == "set-env" ]]; then
-    from_args=(--from "$ADMIN_AGENT")
-  fi
   BRIDGE_HOME="$BRIDGE_HOME" \
     BRIDGE_AUDIT_LOG="$AUDIT_LOG" \
     BRIDGE_CALLER_SOURCE="operator-tui" \
     BRIDGE_ADMIN_AGENT_ID="$ADMIN_AGENT" \
     BRIDGE_AGENT_ID="$ADMIN_AGENT" \
-    "$PYTHON" "$REPO_ROOT/bridge-config.py" "$@" "${from_args[@]}" </dev/null 2>&1 || true
+    "$PYTHON" "$REPO_ROOT/bridge-config.py" "$@" </dev/null 2>&1 || true
+}
+
+# Authorized `set` on a PROTECTED path: run the wrapper IN the live pane against
+# a foreign-owned store (the iso admin positive path), so the binding is trusted
+# and the write lands. Seeds the binding + foreign store on first use. Echoes the
+# wrapper's combined stdout/stderr (matching run_config's shape).
+config_caller_set_ready=0
+run_config_set_authorized() {
+  if [[ "$config_caller_set_ready" != "1" ]]; then
+    smoke_clear_config_caller_bindings "$BINDINGS_DIR"
+    smoke_seed_trusted_admin_binding "$BINDINGS_DIR" "$ADMIN_AGENT" "$ADMIN_AGENT"
+    smoke_config_caller_make_store_foreign "$BINDINGS_DIR"
+    config_caller_set_ready=1
+  fi
+  SMOKE_CC_ENV=(
+    "BRIDGE_HOME=$BRIDGE_HOME"
+    "BRIDGE_STATE_DIR=$BRIDGE_STATE_DIR"
+    "BRIDGE_AUDIT_LOG=$AUDIT_LOG"
+    "BRIDGE_ADMIN_AGENT_ID=$ADMIN_AGENT"
+    "BRIDGE_AGENT_ID=$ADMIN_AGENT"
+  )
+  smoke_config_caller_run_in_pane "$REPO_ROOT/bridge-config.py" "$@" --from "$ADMIN_AGENT" >/dev/null
+  cat "$SMOKE_TMP_ROOT/wrap.out" "$SMOKE_TMP_ROOT/wrap.err" 2>/dev/null || true
 }
 
 # --- Scenario 1: list-protected includes the v2 globs --------------------
@@ -166,34 +180,39 @@ else
 fi
 
 # --- Scenario 2: config set on v2 access.json is ALLOWED + writes --------
-set2_out="$(run_config set --path "$V2_DISCORD_PATH" --change "groups.append=12345")"
-if [[ "$set2_out" == applied:* ]]; then
-  pass "scenario 2: config set on v2 .discord/access.json ALLOWED (applied)"
-else
-  fail "scenario 2: config set on v2 path NOT allowed — output: $set2_out"
-fi
-# Explicitly assert it was NOT the stale-glob denial.
-if [[ "$set2_out" == *"not in system-config protected list"* ]]; then
-  fail "scenario 2: v2 path hit the stale 'not in protected list' deny — output: $set2_out"
-else
-  pass "scenario 2: v2 path did not hit the stale 'not in protected list' deny"
-fi
-# The change must have actually landed on disk.
-if "$PYTHON" -c "
+# Authorized writes need the iso positive path (real tmux + foreign store).
+if config_caller_positive_available; then
+  set2_out="$(run_config_set_authorized set --path "$V2_DISCORD_PATH" --change "groups.append=12345")"
+  if [[ "$set2_out" == applied:* ]]; then
+    pass "scenario 2: config set on v2 .discord/access.json ALLOWED (applied)"
+  else
+    fail "scenario 2: config set on v2 path NOT allowed — output: $set2_out"
+  fi
+  # Explicitly assert it was NOT the stale-glob denial.
+  if [[ "$set2_out" == *"not in system-config protected list"* ]]; then
+    fail "scenario 2: v2 path hit the stale 'not in protected list' deny — output: $set2_out"
+  else
+    pass "scenario 2: v2 path did not hit the stale 'not in protected list' deny"
+  fi
+  # The change must have actually landed on disk.
+  if "$PYTHON" -c "
 import json, sys
 data = json.load(open('$V2_DISCORD_PATH'))
 sys.exit(0 if data.get('groups') == [12345] else 1)
 "; then
-  pass "scenario 2: v2 .discord/access.json groups now [12345]"
+    pass "scenario 2: v2 .discord/access.json groups now [12345]"
+  else
+    fail "scenario 2: v2 .discord/access.json was not mutated"
+  fi
+  # Telegram path is also protected + mutable.
+  set2t_out="$(run_config_set_authorized set --path "$V2_TELEGRAM_PATH" --change "groups.append=67890")"
+  if [[ "$set2t_out" == applied:* ]]; then
+    pass "scenario 2: config set on v2 .telegram/access.json ALLOWED (applied)"
+  else
+    fail "scenario 2: config set on v2 telegram path NOT allowed — output: $set2t_out"
+  fi
 else
-  fail "scenario 2: v2 .discord/access.json was not mutated"
-fi
-# Telegram path is also protected + mutable.
-set2t_out="$(run_config set --path "$V2_TELEGRAM_PATH" --change "groups.append=67890")"
-if [[ "$set2t_out" == applied:* ]]; then
-  pass "scenario 2: config set on v2 .telegram/access.json ALLOWED (applied)"
-else
-  fail "scenario 2: config set on v2 telegram path NOT allowed — output: $set2t_out"
+  skip "scenario 2: v2 ALLOWED+write path (no real tmux live session + passwordless sudo)"
 fi
 
 # --- Scenario 3: non-protected path under the same workdir denied --------
@@ -211,20 +230,24 @@ else
 fi
 
 # --- Scenario 4: pre-v2 layout still matches (no regression) -------------
-set4_out="$(run_config set --path "$PREV2_DISCORD_PATH" --change "groups.append=55555")"
-if [[ "$set4_out" == applied:* ]]; then
-  pass "scenario 4: config set on pre-v2 .discord/access.json still ALLOWED"
-else
-  fail "scenario 4: pre-v2 path regressed (no longer allowed) — output: $set4_out"
-fi
-if "$PYTHON" -c "
+if config_caller_positive_available; then
+  set4_out="$(run_config_set_authorized set --path "$PREV2_DISCORD_PATH" --change "groups.append=55555")"
+  if [[ "$set4_out" == applied:* ]]; then
+    pass "scenario 4: config set on pre-v2 .discord/access.json still ALLOWED"
+  else
+    fail "scenario 4: pre-v2 path regressed (no longer allowed) — output: $set4_out"
+  fi
+  if "$PYTHON" -c "
 import json, sys
 data = json.load(open('$PREV2_DISCORD_PATH'))
 sys.exit(0 if data.get('groups') == [55555] else 1)
 "; then
-  pass "scenario 4: pre-v2 .discord/access.json groups now [55555]"
+    pass "scenario 4: pre-v2 .discord/access.json groups now [55555]"
+  else
+    fail "scenario 4: pre-v2 .discord/access.json was not mutated"
+  fi
 else
-  fail "scenario 4: pre-v2 .discord/access.json was not mutated"
+  skip "scenario 4: pre-v2 ALLOWED+write path (no real tmux live session + passwordless sudo)"
 fi
 
 # --- Scenario 5: nested look-alike paths are NOT protected (no over-reach)

@@ -268,14 +268,11 @@ def admin_agent_id() -> str:
 # directly: the orderly session-kill GC (fires even on the dead-session early
 # return now) and a daemon reconcile prune that deletes bindings whose session
 # is gone (covering crash / reboot / kill-server / SIGKILL).
-#   Test seam: `_resolve_tmux_bin` honors `BRIDGE_CONFIG_TMUX_BIN` ONLY when the
-#   explicit `BRIDGE_CONFIG_ALLOW_TEST_TMUX=1` sentinel is also set, so the smoke
-#   can drive liveness without a real tmux server. The sentinel is never set in
-#   normal operation, so the env override cannot weaken the production boundary
-#   there. (An attacker who set BOTH the sentinel and a lying stub could defeat
-#   the liveness LAYER — but not BLOCKER 1's writability gate, and the GC + prune
-#   make the orphan binding short-lived regardless; mirrors the documented
-#   `BRIDGE_A2A_ALLOW_TEST_BIND` test-only seam.)
+#   No env seam (#1738 r3 FIX 2): `_resolve_tmux_bin` resolves tmux ONLY from a
+#   fixed absolute candidate list, never from any env var — an agent owns its env
+#   when it execs the wrapper, so an env-selectable tmux would be a
+#   caller-controlled liveness oracle. The smoke drives liveness against a REAL
+#   tmux session (real `#{pane_pid}`), not a stub.
 
 CONFIG_CALLER_CONTEXT_AGENT_PANE = "agent-pane"
 CONFIG_CALLER_CONTEXT_OPERATOR_TTY = "operator-tty"
@@ -502,8 +499,42 @@ def _bindings_matching_ancestry(ancestry: set[int]) -> list[dict[str, Any]]:
     return matched
 
 
+def _path_is_caller_forgeable(path: str) -> bool:
+    """True iff THIS euid could write/replace *path* (#1738 r3 B1, ownership).
+
+    OWNERSHIP is the test, not the current mode bits. `os.access(W_OK)` only
+    reflects the mode at probe time, which the OWNER can flip: a same-UID
+    attacker can forge the record, then `chmod 0444`/`0555` it before invoking
+    the wrapper so `os.access` reports non-writable — yet the owner can re-chmod
+    and rewrite at will, so the record is still forgeable (r2 B1 bypass,
+    reproduced by both reviewers). So we treat a path as forgeable when ANY of:
+
+      * the caller OWNS it (`st_uid == os.geteuid()`) — the owner can always
+        re-chmod and overwrite, regardless of the current 0444/0555 camouflage;
+      * it is group-writable or other-writable (a non-owner in the group, or
+        anyone, could write it directly).
+
+    Only a path owned by a DIFFERENT uid AND not group/other-writable is
+    non-forgeable by this caller — exactly the linux-user-isolation shape
+    (controller-owned 0711 dir / 0644 file under a different uid). Any
+    `os.stat` failure (missing / unreadable) is treated as forgeable
+    (fail-closed): we never open the authorization on an inconclusive probe.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return True
+    if st.st_uid == os.geteuid():
+        return True
+    # Group-writable (S_IWGRP 0o020) or other-writable (S_IWOTH 0o002): a
+    # non-owner could still create/overwrite the record.
+    if st.st_mode & 0o022:
+        return True
+    return False
+
+
 def _binding_store_is_caller_writable(record: dict[str, Any]) -> bool:
-    """True iff THIS process could forge the matched binding (#1738 r2 B1).
+    """True iff THIS process could forge the matched binding (#1738 r3 B1).
 
     The binding record is unsigned. On a shared-UID install the agent runs as
     the same OS user that owns the bindings store, so it can create or replace
@@ -513,26 +544,25 @@ def _binding_store_is_caller_writable(record: dict[str, Any]) -> bool:
     agent-pane admin binding only authorizes when the caller could NOT have
     written it.
 
-    Forgeable means the caller can write EITHER the bindings directory (create /
-    replace a record) OR the matched record file (overwrite it in place). On
-    linux-user isolation the controller owns the store (0711 dir / 0644 file)
-    and the agent UID can do neither, so this returns False → trusted (the real
-    boundary). On shared-UID both are writable → True → fail-closed. We default
-    to "writable" (fail-closed) if either probe raises, so an unexpected OS
-    error never opens the authorization.
+    Forgeable (via `_path_is_caller_forgeable`, OWNERSHIP-based — r2's
+    `os.access(W_OK)` was chmod-camouflage-bypassable) means the caller could
+    write EITHER the bindings directory (create / replace a record) OR the
+    matched record file (overwrite it in place). On linux-user isolation the
+    controller owns the store under a different uid (0711 dir / 0644 file) and
+    the agent UID owns neither → returns False → trusted (the real boundary). On
+    shared-UID the caller owns both → True → fail-closed, regardless of any
+    `chmod 0444`/`0555` the owner applied. We default to "writable" (fail-closed)
+    if a probe raises, so an unexpected OS error never opens the authorization.
     """
     try:
         bindings_dir = str(config_caller_bindings_dir())
-        if os.access(bindings_dir, os.W_OK):
-            return True
     except OSError:
+        return True
+    if _path_is_caller_forgeable(bindings_dir):
         return True
     source = record.get("_source_path")
     if isinstance(source, str) and source:
-        try:
-            if os.access(source, os.W_OK):
-                return True
-        except OSError:
+        if _path_is_caller_forgeable(source):
             return True
     return False
 
@@ -540,23 +570,16 @@ def _binding_store_is_caller_writable(record: dict[str, Any]) -> bool:
 def _resolve_tmux_bin() -> str | None:
     """Return an ABSOLUTE tmux path for the liveness probe, or None.
 
-    Mirrors `_PS_ABSOLUTE_CANDIDATES`: in normal operation we resolve tmux ONLY
-    from the fixed absolute candidate list — never through `$PATH`, `$TMUX`, or a
-    plain env override — because an agent controls its own env and could point us
-    at a binary that lies about `#{pane_pid}` and re-open the orphan-binding
-    match. Bridge requires tmux, so this list resolves in production; None makes
-    the liveness check fail closed.
-
-    The single env seam (`BRIDGE_CONFIG_TMUX_BIN`) is consulted ONLY when the
-    explicit test sentinel `BRIDGE_CONFIG_ALLOW_TEST_TMUX=1` is also set — it
-    exists so the smoke can drive the liveness path without standing up a real
-    tmux server, mirroring `BRIDGE_A2A_ALLOW_TEST_BIND`. It is NEVER consulted in
-    normal operation (no sentinel), so it cannot weaken the production boundary.
+    Mirrors `_PS_ABSOLUTE_CANDIDATES`: tmux resolves ONLY from the fixed absolute
+    candidate list — never through `$PATH`, `$TMUX`, or ANY env override. There is
+    DELIBERATELY no env seam (#1738 r3 FIX 2): an agent owns its own env when it
+    execs the wrapper, so any env-selectable tmux is a caller-controlled security
+    oracle — it could point liveness at a stub that lies about `#{pane_pid}` and
+    re-open the orphan-binding match (the r2 `BRIDGE_CONFIG_ALLOW_TEST_TMUX` seam
+    did exactly this; both reviewers rejected it). Bridge requires tmux, so this
+    list resolves in production; the smoke drives liveness against a REAL tmux
+    session. None makes the liveness check fail closed.
     """
-    if os.environ.get("BRIDGE_CONFIG_ALLOW_TEST_TMUX", "").strip() == "1":
-        override = os.environ.get("BRIDGE_CONFIG_TMUX_BIN", "").strip()
-        if override and os.path.isabs(override) and os.path.exists(override):  # noqa: raw-pathlib-controller-only
-            return override
     for candidate in _TMUX_ABSOLUTE_CANDIDATES:
         if os.path.exists(candidate):  # noqa: raw-pathlib-controller-only
             return candidate
@@ -570,18 +593,28 @@ def _live_pane_pid_for_session(session: str) -> int | None:
     '#{pane_pid}'`, no `$PATH`, no shell). None means the session is gone, tmux
     is unavailable, or the output is not an integer — every such case is treated
     by the caller as "binding is stale → skip" (fail-closed).
+
+    `TMUX` / `TMUX_PANE` are STRIPPED from the child env (#1738 r3 FIX 2): the
+    controller publishes the binding's session on the DEFAULT tmux server, so
+    liveness must query that server. An agent owns its own env when it execs the
+    wrapper and could otherwise set `$TMUX` to point this probe at a private
+    server where it created a same-named session with a forged pane_pid —
+    re-opening the orphan-binding match the absolute-binary discipline closes.
+    Removing the socket-selection vars forces the probe onto the default server.
     """
     if not session:
         return None
     tmux_bin = _resolve_tmux_bin()
     if tmux_bin is None:
         return None
+    child_env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
     try:
         out = subprocess.run(
             [tmux_bin, "display-message", "-t", session, "-p", "#{pane_pid}"],
             capture_output=True,
             text=True,
             check=False,
+            env=child_env,
         )
     except OSError:
         return None
@@ -699,15 +732,17 @@ def resolve_config_caller(args: argparse.Namespace) -> ConfigCaller:
         # identity (not BRIDGE_AGENT_ID) — BUT the binding record is unsigned, so
         # before we trust it we must rule out that THIS caller forged it.
         if bound_admin and bound_agent == bound_admin:
-            # #1738 r2 BLOCKER 1 (Option 1, fail-closed on a self-writable
-            # store): on a shared-UID install the agent owns the bindings store
-            # and can write `<admin>.json` itself, so an ancestry-matched admin
-            # binding is forgeable → do NOT authorize from it. The only thing
-            # that still authorizes here is a real operator TTY with `--from`
-            # admin (an interactive operator, not an agent shell); anything else
-            # is denied. On linux-user isolation the controller owns the store
-            # and the agent UID cannot write it → not forgeable → trust the
-            # binding (the real boundary).
+            # #1738 r3 BLOCKER 1 (fail-closed on a caller-OWNED store): on a
+            # shared-UID install the agent owns the bindings store, so it can
+            # write `<admin>.json` itself (and re-chmod it at will — the r2
+            # `os.access(W_OK)` mode check was chmod-camouflage-bypassable), so
+            # an ancestry-matched admin binding is forgeable → do NOT authorize
+            # from it. The only thing that still authorizes here is a real
+            # operator TTY with `--from` admin (an interactive operator, not an
+            # agent shell); anything else is denied. On linux-user isolation the
+            # controller owns the store under a DIFFERENT uid and the agent UID
+            # owns neither → not forgeable → trust the binding (the real
+            # boundary).
             if _binding_store_is_caller_writable(record):
                 if operator_tty_admin:
                     return operator_tty_caller()
@@ -719,9 +754,9 @@ def resolve_config_caller(args: argparse.Namespace) -> ConfigCaller:
                     allowed=False,
                     reason=(
                         "agent-binding-store-writable: the config-caller "
-                        "bindings store is writable by this UID (shared-UID) — "
-                        "an agent-pane admin binding is forgeable here and is "
-                        "not trusted; run this from an operator TTY"
+                        "bindings store is owned by this UID (shared-UID) — the "
+                        "owner can forge/re-chmod an agent-pane admin binding, so "
+                        "it is not trusted here; run this from an operator TTY"
                     ),
                 )
             return ConfigCaller(

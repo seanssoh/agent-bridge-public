@@ -80,22 +80,21 @@ roster_sha() {
 }
 ROSTER_SHA_BEFORE="$(roster_sha)"
 
-# Issue #1738: the wrapper now authorizes from a controller-published pane
-# binding matched against its own process ancestry, NOT from env identity. The
-# wrapper subprocess is a descendant of THIS smoke shell ($$), so a binding
-# whose pane_pid == $$ matches its ancestry — that is how we drive the positive
-# admin path here (in production the controller publishes pane_pid after
-# `tmux new-session`). Negative controls publish NO binding (or a non-admin
-# one), so the env-trust spoof shapes stay denied.
+# Issue #1738: the wrapper authorizes from a controller-published pane binding
+# matched against its own process ancestry, NOT from env identity. Negative
+# controls publish NO binding (or a non-admin one), so the env-trust spoof shapes
+# stay denied — those run as a direct subprocess (a deny needs no live pane).
 #
-# Issue #1738 r2: the positive path now also requires (a) the bound session to
-# be LIVE — re-resolved via an absolute tmux (we install a stub) — and (b) the
-# bindings store to be NON-writable by the caller (the iso, controller-owned
-# shape), since a self-writable store is treated as forgeable (Option 1). The
-# shared smoke_seed_trusted_admin_binding helper handles both.
+# Issue #1738 r3: the positive ADMIN WRITE path now requires (a) the bound
+# session to be LIVE — re-resolved via a REAL tmux (the env-stub seam was REMOVED,
+# FIX 2), so the wrapper must run INSIDE a real pane — AND (b) a store the caller
+# does NOT own (FIX 1: ownership, not chmod — a caller-owned store is always
+# forgeable -> shared-UID fail-closes). The shared helpers start a real session
+# + make the store foreign-owned (sudo), and the positive WRITE asserts are
+# SKIPPED (logged) where a real tmux session or passwordless sudo is unavailable.
 BINDINGS_DIR="$BRIDGE_STATE_DIR/config-caller-bindings"
 mkdir -p "$BINDINGS_DIR"
-smoke_install_config_caller_tmux_stub
+smoke_config_caller_start_live_session || true
 seed_admin_binding() {
   smoke_seed_trusted_admin_binding "$BINDINGS_DIR" "$ADMIN_AGENT" "$ADMIN_AGENT"
 }
@@ -103,10 +102,18 @@ clear_bindings() {
   smoke_clear_config_caller_bindings "$BINDINGS_DIR"
 }
 
+# True iff the iso positive WRITE path is exercisable here (real tmux session +
+# passwordless sudo to make the store foreign-owned). When false the positive
+# WRITE asserts are skipped; all deny-side asserts still run.
+config_caller_positive_available() {
+  [[ "${SMOKE_CONFIG_CALLER_LIVE_OK:-0}" == "1" ]] || return 1
+  command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null
+}
+
 # --- Wrapper plumbing -------------------------------------------------------
 
-# Run the wrapper with a chosen caller agent + source. Echoes rc on a trailing
-# line; stdout/stderr captured by the caller via command substitution.
+# Run the wrapper with a chosen caller agent + source (DIRECT subprocess — for
+# DENY cases, which need no live pane). Echoes rc; out/err captured by the caller.
 # $1 agent, $2 caller_source, $3.. set-env argv.
 run_wrapper() {
   local agent="$1" source="$2"
@@ -118,6 +125,22 @@ run_wrapper() {
   local rc=$?
   set -e
   printf '%s' "$rc"
+}
+
+# Run the wrapper INSIDE the live pane against a FOREIGN-owned store (the iso
+# admin positive WRITE path). Echoes rc; out/err in $SMOKE_TMP_ROOT/wrap.{out,err}.
+# Caller must have seeded the binding + made the store foreign-owned.
+run_wrapper_positive() {
+  SMOKE_CC_ENV=(
+    "BRIDGE_HOME=$BRIDGE_HOME"
+    "BRIDGE_STATE_DIR=$BRIDGE_STATE_DIR"
+    "BRIDGE_AGENT_ENV_LOCAL_FILE=$ENV_FILE"
+    "BRIDGE_AUDIT_LOG=$BRIDGE_AUDIT_LOG"
+    "BRIDGE_ADMIN_AGENT_ID=$ADMIN_AGENT"
+    "BRIDGE_AGENT_ID=$ADMIN_AGENT"
+    "BRIDGE_ROSTER_LOCAL_FILE=$BRIDGE_ROSTER_LOCAL_FILE"
+  )
+  smoke_config_caller_run_in_pane "$WRAPPER" set-env "$@" --from "$ADMIN_AGENT"
 }
 
 assert_wrapper_denied() {
@@ -277,56 +300,69 @@ smoke_log "ok: no managed file created by any denied attempt"
 
 # ===========================================================================
 # SECTION 2 — WRAPPER positive: allowed key by admin pane-binding applies.
+#
+# Needs the iso positive path (#1738 r3): a real live tmux session (so the
+# in-pane wrapper's ancestry + liveness match) + a foreign-owned store (so the
+# ownership gate trusts the binding). Skipped (logged) where unavailable; the
+# negative controls above + the key-allowlist denies still cover the wrapper.
 # ===========================================================================
 
-# Issue #1738: publish a matching admin pane binding so the wrapper's ancestry
-# check authorizes the admin path (env identity alone no longer does).
-seed_admin_binding
+if config_caller_positive_available; then
+  clear_bindings
+  seed_admin_binding   # real session + real pane_pid
+  smoke_config_caller_make_store_foreign "$BINDINGS_DIR"
 
-: >"$BRIDGE_AUDIT_LOG"
-rc="$(run_wrapper "$ADMIN_AGENT" "operator-tui" "BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS=86400")"
-smoke_assert_eq "0" "$rc" "wrapper: allowed apply rc"
-smoke_assert_file_exists "$ENV_FILE" "wrapper: managed file written"
+  : >"$BRIDGE_AUDIT_LOG"
+  rc="$(run_wrapper_positive "BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS=86400")"
+  smoke_assert_eq "0" "$rc" "wrapper: allowed apply rc"
+  smoke_assert_file_exists "$ENV_FILE" "wrapper: managed file written"
 
-# The value lands as a quoted shell export, single line, no eval.
-ENV_BODY="$(cat "$ENV_FILE")"
-smoke_assert_contains "$ENV_BODY" \
-  "export BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS='86400'" \
-  "wrapper: quoted export line"
+  # The value lands as a quoted shell export, single line, no eval.
+  ENV_BODY="$(cat "$ENV_FILE")"
+  smoke_assert_contains "$ENV_BODY" \
+    "export BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS='86400'" \
+    "wrapper: quoted export line"
 
-# The managed file sources cleanly and yields the value.
-SOURCED="$(/usr/bin/env bash -c "source '$ENV_FILE'; printf '%s' \"\${BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS:-UNSET}\"")"
-smoke_assert_eq "86400" "$SOURCED" "wrapper: managed file sources to value"
+  # The managed file sources cleanly and yields the value.
+  SOURCED="$(/usr/bin/env bash -c "source '$ENV_FILE'; printf '%s' \"\${BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS:-UNSET}\"")"
+  smoke_assert_eq "86400" "$SOURCED" "wrapper: managed file sources to value"
 
-# Roster / role bytes untouched.
-ROSTER_SHA_AFTER="$(roster_sha)"
-smoke_assert_eq "$ROSTER_SHA_BEFORE" "$ROSTER_SHA_AFTER" "wrapper: roster bytes untouched"
-smoke_assert_contains "$(cat "$BRIDGE_ROSTER_LOCAL_FILE")" "$ROSTER_SENTINEL" \
-  "wrapper: roster sentinel preserved"
+  # Roster / role bytes untouched.
+  ROSTER_SHA_AFTER="$(roster_sha)"
+  smoke_assert_eq "$ROSTER_SHA_BEFORE" "$ROSTER_SHA_AFTER" "wrapper: roster bytes untouched"
+  smoke_assert_contains "$(cat "$BRIDGE_ROSTER_LOCAL_FILE")" "$ROSTER_SENTINEL" \
+    "wrapper: roster sentinel preserved"
 
-# Audit row carries before + after hashes for the apply.
-AUDIT="$(cat "$BRIDGE_AUDIT_LOG")"
-smoke_assert_contains "$AUDIT" '"trigger": "set-env-apply"' "wrapper: apply audit row"
-smoke_assert_contains "$AUDIT" '"before_sha256"' "wrapper: audit before hash"
-smoke_assert_contains "$AUDIT" '"after_sha256"' "wrapper: audit after hash"
-smoke_log "ok: wrapper applied allowed key with before/after-hash audit"
+  # Audit row carries before + after hashes for the apply.
+  AUDIT="$(cat "$BRIDGE_AUDIT_LOG")"
+  smoke_assert_contains "$AUDIT" '"trigger": "set-env-apply"' "wrapper: apply audit row"
+  smoke_assert_contains "$AUDIT" '"before_sha256"' "wrapper: audit before hash"
+  smoke_assert_contains "$AUDIT" '"after_sha256"' "wrapper: audit after hash"
+  smoke_log "ok: wrapper applied allowed key with before/after-hash audit"
 
-# A second allowed set-env replaces idempotently and preserves a sibling.
-rc="$(run_wrapper "$ADMIN_AGENT" "operator-tui" "BRIDGE_A2A_RECONCILE_INTERVAL=60")"
-smoke_assert_eq "0" "$rc" "wrapper: sibling apply rc"
-rc="$(run_wrapper "$ADMIN_AGENT" "operator-tui" "BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS=120")"
-smoke_assert_eq "0" "$rc" "wrapper: replace apply rc"
-EXPORT_COUNT="$(grep -c '^export ' "$ENV_FILE")"
-smoke_assert_eq "2" "$EXPORT_COUNT" "wrapper: idempotent replace (no dup), sibling preserved"
-smoke_log "ok: wrapper idempotent replace + sibling preserved"
+  # A second allowed set-env replaces idempotently and preserves a sibling.
+  rc="$(run_wrapper_positive "BRIDGE_A2A_RECONCILE_INTERVAL=60")"
+  smoke_assert_eq "0" "$rc" "wrapper: sibling apply rc"
+  rc="$(run_wrapper_positive "BRIDGE_A2A_WARP_HANDSHAKE_STALE_SECONDS=120")"
+  smoke_assert_eq "0" "$rc" "wrapper: replace apply rc"
+  EXPORT_COUNT="$(grep -c '^export ' "$ENV_FILE")"
+  smoke_assert_eq "2" "$EXPORT_COUNT" "wrapper: idempotent replace (no dup), sibling preserved"
+  smoke_log "ok: wrapper idempotent replace + sibling preserved"
 
-# Audit row for a wrapper deny carries before hash but NO after hash.
-: >"$BRIDGE_AUDIT_LOG"
-run_wrapper "$ADMIN_AGENT" "operator-tui" "BRIDGE_HOME=/x" >/dev/null
-DENY_AUDIT="$(cat "$BRIDGE_AUDIT_LOG")"
-smoke_assert_contains "$DENY_AUDIT" '"trigger": "set-env-deny"' "wrapper: deny audit row"
-smoke_assert_not_contains "$DENY_AUDIT" '"after_sha256"' "wrapper: deny row has NO after hash"
-smoke_log "ok: wrapper deny audit row omits after hash"
+  # Audit row for a wrapper deny (key NOT in the allowlist) carries before hash
+  # but NO after hash. This deny is POST-authorization, so it needs the in-pane
+  # trusted path too.
+  : >"$BRIDGE_AUDIT_LOG"
+  run_wrapper_positive "BRIDGE_HOME=/x" >/dev/null
+  DENY_AUDIT="$(cat "$BRIDGE_AUDIT_LOG")"
+  smoke_assert_contains "$DENY_AUDIT" '"trigger": "set-env-deny"' "wrapper: deny audit row"
+  smoke_assert_not_contains "$DENY_AUDIT" '"after_sha256"' "wrapper: deny row has NO after hash"
+  smoke_log "ok: wrapper deny audit row omits after hash"
+
+  clear_bindings
+else
+  smoke_log "skip: wrapper positive admin WRITE path (no real tmux live session + passwordless sudo)"
+fi
 
 # ===========================================================================
 # SECTION 3 — HOOK negative controls (the Bash gate).

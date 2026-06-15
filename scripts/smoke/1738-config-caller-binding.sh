@@ -10,26 +10,39 @@
 # OWN process ancestry against `pane_pid` (a shell cannot set its parent pid);
 # env identity no longer drives a positive authorization.
 #
-# This smoke is the ADVERSARIAL MATRIX for both verbs. It drives two real
+# This smoke is the ADVERSARIAL MATRIX for both verbs. It drives the real
 # surfaces end-to-end in an isolated BRIDGE_HOME:
-#   (A) the wrapper bridge-config.py — every env-spoof shape (direct literal,
-#       $V/$P var-expanded argv, direct `python3 bridge-config.py`, `env -i`
-#       with only spoofed trust vars, ambient env) DENIES and leaves the target
-#       file unchanged; only a matching admin pane-binding (process ancestry) or
-#       a real operator-TTY+--from writes.
+#   (A) the wrapper bridge-config.py — every env-spoof shape DENIES + leaves the
+#       target file unchanged; only a NON-forgeable admin pane-binding (iso,
+#       controller-owned store) or a real operator-TTY+--from writes.
 #   (B) the real PreToolUse hook hooks/tool-policy.py — the interim
 #       defense-in-depth gate denies a config mutation reached through eval /
 #       bash -c / sh -c / unresolved $var around the verb, for BOTH verbs.
 #
-# Teeth: against origin/main (env-trust model) the spoof shapes ALLOW + write
-# the target — so this smoke FAILS on main and PASSES only with the #1738 fix.
+# #1738 r3 security closure (this round, both reviewers + adversarial sweep):
+#   * FIX 1 (B1): the writability gate keys on OWNERSHIP, not os.access(W_OK)
+#     mode bits — a same-UID owner who chmod-camouflages a forged record
+#     (0444/0555) is STILL the owner and can re-chmod, so a caller-OWNED store
+#     ALWAYS fail-closes (shared-UID -> operator-TTY-only). Only a foreign-owned
+#     (iso, controller-owned) store trusts the binding.
+#   * FIX 2 (B2): the env-settable liveness seam (BRIDGE_CONFIG_TMUX_BIN /
+#     BRIDGE_CONFIG_ALLOW_TEST_TMUX) is REMOVED. Liveness uses a REAL tmux
+#     session — the wrapper runs INSIDE a real pane, with the binding seeded from
+#     the real session + real pane_pid.
+#
+# Teeth: against `5a82e4e1` (r2) the chmod-camouflage forgery AUTHORIZES + writes
+# the target, and the env-stub liveness seam authorizes a stub-faked dead session
+# — so this smoke FAILS on r2 and PASSES only with the r3 fix.
 #
 # Footgun #11 / lint-heredoc-ban: all fixtures + JSON payloads are built with
 # printf and `>` file-redirect; the hook payload is piped from a file with
 # `< file`. No heredoc / here-string operator anywhere (incl. comments).
 #
-# macOS: pure policy-decision + file-write smoke; no sudo / multi-UID needed.
-# Runs under /opt/homebrew/bin/bash 5.x and Linux CI bash alike.
+# macOS: the deny-side teeth (chmod-camouflage DENY, shared-UID DENY, dead/stale
+# liveness DENY) run single-UID with a real tmux. The iso POSITIVE-WRITE path
+# needs a foreign-owned store (sudo chown) — skipped with a clear log when
+# passwordless sudo is unavailable (CI / Linux runs it). Runs under
+# /opt/homebrew/bin/bash 5.x and Linux CI bash alike.
 
 set -euo pipefail
 
@@ -71,80 +84,37 @@ printf '{"existing":"value"}\n' >"$PROTECTED_JSON"
 BINDINGS_DIR="$BRIDGE_STATE_DIR/config-caller-bindings"
 mkdir -p "$BINDINGS_DIR"
 
-# --- fake tmux (match-time liveness stub, #1738 r2 BLOCKER 2) ----------------
+# --- real tmux live session (#1738 r3 FIX 2 — no env stub) -------------------
 #
-# bridge-config.py re-resolves the live `#{pane_pid}` of a matched binding's
-# session via an ABSOLUTE tmux and requires it to equal the bound pane_pid; a
-# dead session / mismatch denies. There is no real tmux server in this smoke, so
-# we point BRIDGE_CONFIG_TMUX_BIN at this stub. It prints the pane_pid the test
-# wants for the queried session:
-#   * `display-message -t <SESSION_LIVE> -p '#{pane_pid}'` -> $FAKE_LIVE_PID
-#     (the smoke sets this to $$, the bound pane_pid, so the session is "live").
-#   * any other session (the stale / dead case) -> exit 1 (session gone).
-# Setting FAKE_LIVE_PID to a different value simulates pid-reuse (mismatch).
-SESSION_LIVE="sess-live"
-FAKE_TMUX="$SMOKE_TMP_ROOT/fake-tmux"
-{
-  printf '%s\n' '#!/usr/bin/env bash'
-  printf '%s\n' '# fake tmux for #1738 liveness smoke. Honors only display-message #{pane_pid}.'
-  printf '%s\n' 'want_session=""'
-  printf '%s\n' 'while [[ $# -gt 0 ]]; do'
-  printf '%s\n' '  case "$1" in'
-  printf '%s\n' '    -t) want_session="$2"; shift 2 ;;'
-  printf '%s\n' '    *) shift ;;'
-  printf '%s\n' '  esac'
-  printf '%s\n' 'done'
-  printf '%s\n' 'if [[ "$want_session" == "'"$SESSION_LIVE"'" && -n "${FAKE_LIVE_PID:-}" ]]; then'
-  printf '%s\n' '  printf "%s\\n" "$FAKE_LIVE_PID"; exit 0'
-  printf '%s\n' 'fi'
-  printf '%s\n' 'exit 1'
-} >"$FAKE_TMUX"
-chmod 0755 "$FAKE_TMUX"
-# The override is ONLY honored under the explicit test sentinel — in normal
-# operation bridge-config.py resolves tmux from fixed absolute paths only, so an
-# agent cannot point the liveness probe at a lying stub via env.
-export BRIDGE_CONFIG_ALLOW_TEST_TMUX="1"
-export BRIDGE_CONFIG_TMUX_BIN="$FAKE_TMUX"
-# Default: the live session resolves to THIS shell's pid (the bound pane_pid).
-export FAKE_LIVE_PID="$$"
+# The wrapper resolves tmux ONLY from fixed absolute paths and re-resolves the
+# LIVE #{pane_pid} of the bound session on the DEFAULT tmux server (the wrapper
+# strips $TMUX from its probe). We start a REAL detached session on the default
+# server and run the positive-path wrapper INSIDE its pane so the pane process is
+# a genuine ancestor of the wrapper (pane_pid in ancestry) and the liveness
+# re-resolve matches.
+#
+# HARD REQUIREMENT (no silent false-pass): if tmux IS available but the live
+# session cannot start, FAIL — the FIX 1 ownership teeth + liveness teeth depend
+# on a real session, and a silent skip would let the security cases pass
+# vacuously on CI. Only a genuinely tmux-less host (rare for bridge, which
+# requires tmux) skips those sections, and that skip is loud.
+smoke_config_caller_start_live_session || true
+if [[ "${SMOKE_CONFIG_CALLER_LIVE_OK:-0}" != "1" ]] && command -v tmux >/dev/null 2>&1; then
+  smoke_fail "tmux is available but the live session could not start — the FIX 1 ownership + liveness teeth cannot run (refusing to PASS vacuously). See the config-caller start logs above."
+fi
 
 # --- binding helpers --------------------------------------------------------
 
-# Publish a binding for $1=agent $2=admin with pane_pid == THIS smoke shell ($$)
-# so the wrapper subprocess (a descendant of this shell) matches it on ancestry.
-# session defaults to the live session ($3, default SESSION_LIVE) so the
-# match-time liveness check (BLOCKER 2) passes for the positive cases; pass a
-# different session to seed a stale (dead-session) binding.
+# Seed a binding for $1=agent $2=admin using the REAL live session + REAL
+# pane_pid (so the in-pane wrapper's ancestry + liveness both match). Pass $3 to
+# override the session (e.g. a dead-session name for the stale liveness case).
 seed_binding() {
-  local agent="$1" admin="$2" session="${3:-$SESSION_LIVE}"
-  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
-    "$agent" "$admin" "$session" "$$" >"$BINDINGS_DIR/$agent.json"
+  local agent="$1" admin="$2" session="${3:-${SMOKE_LIVE_SESSION:-sess-live}}"
+  smoke_seed_trusted_admin_binding "$BINDINGS_DIR" "$agent" "$admin" "$session"
 }
 
 clear_bindings() {
-  # Restore writability first: a prior store_make_nonwritable may have dropped
-  # the dir/file write bits, which would otherwise block the rm.
-  chmod 0755 "$BINDINGS_DIR" 2>/dev/null || true
-  chmod 0644 "$BINDINGS_DIR"/*.json 2>/dev/null || true
-  rm -f "$BINDINGS_DIR"/*.json 2>/dev/null || true
-}
-
-# --- store-writability toggle (#1738 r2 BLOCKER 1, Option 1) -----------------
-#
-# Option 1 fails closed when the bindings store is writable by the caller (a
-# shared-UID install: the agent owns the store and could forge a record). The
-# smoke's BRIDGE_STATE_DIR is caller-writable by construction (single UID), so
-# the DEFAULT here IS the shared-UID/forgeable shape. To exercise the legit iso
-# positive path (controller-owned, non-writable store) we drop the caller's
-# write bit on the dir + each record (os.access(W_OK) then returns False for the
-# owner, just as an iso agent UID cannot write the controller's 0711/0644 store).
-store_make_nonwritable() {
-  chmod 0555 "$BINDINGS_DIR" 2>/dev/null || true
-  chmod 0444 "$BINDINGS_DIR"/*.json 2>/dev/null || true
-}
-store_make_writable() {
-  chmod 0755 "$BINDINGS_DIR" 2>/dev/null || true
-  chmod 0644 "$BINDINGS_DIR"/*.json 2>/dev/null || true
+  smoke_clear_config_caller_bindings "$BINDINGS_DIR"
 }
 
 # --- target hash plumbing ---------------------------------------------------
@@ -158,10 +128,12 @@ sha_of() {
   fi
 }
 
-# --- wrapper plumbing -------------------------------------------------------
-
-# Run the wrapper verbatim from argv ($@), capturing rc + stdout/stderr. Caller
-# controls the env (so we can drive the env-spoof shapes explicitly).
+# --- wrapper plumbing (direct subprocess — for DENY cases) ------------------
+#
+# A DENY decision needs no live pane (the binding is rejected before any live
+# match matters / there is no binding), so the deny-side cases run the wrapper as
+# a direct subprocess of this smoke shell. Caller controls the env (so we can
+# drive the env-spoof shapes explicitly).
 run_wrapper_raw() {
   set +e
   "$PYTHON_BIN" "$WRAPPER" "$@" >"$SMOKE_TMP_ROOT/wrap.out" 2>"$SMOKE_TMP_ROOT/wrap.err"
@@ -187,6 +159,66 @@ assert_wrapper_deny_unchanged() {
   smoke_assert_contains "$(cat "$SMOKE_TMP_ROOT/wrap.err")" "deny" "${label}: deny message"
   smoke_assert_eq "$before" "$after" "${label}: target unchanged on deny"
   smoke_log "ok: ${label} -> DENY + target unchanged (rc=${rc})"
+}
+
+# Same as above but also asserts a specific deny-reason substring.
+assert_wrapper_deny_reason() {
+  local label="$1" target="$2" want_reason="$3"
+  shift 3
+  local before after rc
+  before="$(sha_of "$target")"
+  rc="$(run_wrapper_raw "$@")"
+  after="$(sha_of "$target")"
+  if [[ "$rc" == "0" ]]; then
+    smoke_log "FAIL: ${label}: wrapper rc=0 (expected deny)"
+    smoke_log "      out: $(cat "$SMOKE_TMP_ROOT/wrap.out")"
+    smoke_fail "${label}: expected deny, got apply"
+  fi
+  smoke_assert_contains "$(cat "$SMOKE_TMP_ROOT/wrap.err")" "$want_reason" \
+    "${label}: deny reason"
+  smoke_assert_eq "$before" "$after" "${label}: target unchanged on deny"
+  smoke_log "ok: ${label} -> DENY (reason '${want_reason}', rc=${rc})"
+}
+
+# --- wrapper plumbing (in-pane — for the iso positive WRITE path) ------------
+#
+# The trusted-binding WRITE path needs (a) the wrapper to run inside the live
+# pane (real ancestry + liveness) AND (b) a foreign-owned store (#1738 r3: a
+# caller-owned store is always forgeable). Runs the wrapper in the pane with
+# BRIDGE_* env set; echoes rc; out/err in $SMOKE_TMP_ROOT/wrap.{out,err}.
+run_wrapper_in_pane() {
+  SMOKE_CC_ENV=(
+    "BRIDGE_HOME=$BRIDGE_HOME"
+    "BRIDGE_STATE_DIR=$BRIDGE_STATE_DIR"
+    "BRIDGE_AGENT_ENV_LOCAL_FILE=$ENV_FILE"
+    "BRIDGE_AUDIT_LOG=$BRIDGE_AUDIT_LOG"
+    "BRIDGE_ADMIN_AGENT_ID=$ADMIN_AGENT"
+    "BRIDGE_AGENT_ID=$ADMIN_AGENT"
+  )
+  smoke_config_caller_run_in_pane "$WRAPPER" "$@"
+}
+
+# Assert: an IN-PANE wrapper invocation DENIES (rc != 0) with a specific
+# deny-reason substring AND leaves the named target file's bytes unchanged. Used
+# where the deny only triggers AFTER an ancestry match (so the wrapper must run
+# inside the live pane — a direct subprocess would deny earlier with
+# "no pane binding matches", masking the gate under test).
+assert_in_pane_deny_reason() {
+  local label="$1" target="$2" want_reason="$3"
+  shift 3
+  local before after rc
+  before="$(sha_of "$target")"
+  rc="$(run_wrapper_in_pane "$@")"
+  after="$(sha_of "$target")"
+  if [[ "$rc" == "0" ]]; then
+    smoke_log "FAIL: ${label}: in-pane wrapper rc=0 (expected deny)"
+    smoke_log "      out: $(cat "$SMOKE_TMP_ROOT/wrap.out")"
+    smoke_fail "${label}: expected deny, got apply"
+  fi
+  smoke_assert_contains "$(cat "$SMOKE_TMP_ROOT/wrap.err")" "$want_reason" \
+    "${label}: deny reason"
+  smoke_assert_eq "$before" "$after" "${label}: target unchanged on deny"
+  smoke_log "ok: ${label} -> DENY (reason '${want_reason}', rc=${rc})"
 }
 
 # --- hook plumbing (printf only) --------------------------------------------
@@ -326,45 +358,71 @@ seed_binding "$USER_AGENT" "$ADMIN_AGENT"   # bound agent != admin
     set-env "BRIDGE_A2A_RECONCILE_INTERVAL=60" --from "$ADMIN_AGENT" )
 
 # ===========================================================================
-# SECTION 3 — WRAPPER: matching ADMIN binding (non-writable store) -> WRITE.
+# SECTION 3 — WRAPPER: #1738 r3 FIX 1 (ownership-based writability gate).
 #
-# This is the legit iso admin-agent path: process ancestry matches the
-# controller binding, the bound session is LIVE (the tmux stub resolves it to
-# the bound pane_pid), and the store is NOT writable by the caller (controller-
-# owned on iso) so Option 1 trusts it. NO TTY and NO trusted BRIDGE_CALLER_SOURCE.
+# B1 chmod-camouflage TEETH: on r2 a same-UID owner forges <admin>.json, then
+# chmod 0444/0555 it so os.access(W_OK) reads False -> the gate trusts it ->
+# forged admin write authorized (rc=0). On r3 the gate keys on OWNERSHIP: the
+# caller OWNS the store, so it ALWAYS fail-closes regardless of mode bits.
 # ===========================================================================
 
-clear_bindings
-seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"
-store_make_nonwritable
+# 3a. chmod-camouflage forgery on a caller-OWNED store -> DENY (the FIX 1 teeth).
+#     The binding must MATCH (live session + ancestry) to reach the ownership
+#     gate, so we run the wrapper IN the live pane. We drop the record/dir write
+#     bits to mimic the r2 bypass; on r2 os.access(W_OK)=False -> trusted -> WRITE
+#     (forged), on r3 ownership wins -> the store is forgeable -> fail-closed.
+if [[ "${SMOKE_CONFIG_CALLER_LIVE_OK:-0}" == "1" ]]; then
+  clear_bindings
+  seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"   # real session + real pane_pid
+  chmod 0444 "$BINDINGS_DIR"/*.json 2>/dev/null || true
+  chmod 0555 "$BINDINGS_DIR" 2>/dev/null || true
+  assert_in_pane_deny_reason \
+    "set: chmod-camouflage forgery on caller-owned store" "$PROTECTED_JSON" \
+    "agent-binding-store-writable" \
+    set --path "$PROTECTED_JSON" --change "forge=1" --from "$ADMIN_AGENT"
+  assert_in_pane_deny_reason \
+    "set-env: chmod-camouflage forgery on caller-owned store" "$ENV_FILE" \
+    "agent-binding-store-writable" \
+    set-env "BRIDGE_A2A_RECONCILE_INTERVAL=60" --from "$ADMIN_AGENT"
+  clear_bindings
 
-: >"$BRIDGE_AUDIT_LOG"
-BEFORE_JSON="$(sha_of "$PROTECTED_JSON")"
-rc="$(run_wrapper_raw set --path "$PROTECTED_JSON" --change "groups.append=12345" --from "$ADMIN_AGENT")"
-smoke_assert_eq "0" "$rc" "set: admin-binding apply rc"
-AFTER_JSON="$(sha_of "$PROTECTED_JSON")"
-[[ "$BEFORE_JSON" != "$AFTER_JSON" ]] || smoke_fail "set: admin-binding did not change the JSON"
-smoke_assert_contains "$(cat "$PROTECTED_JSON")" "12345" "set: admin-binding wrote value"
-smoke_log "ok: set admin-binding -> WROTE protected JSON"
+  # 3b. POSITIVE control — iso (foreign-owned) store + REAL live session -> WRITE.
+  #     Proves 3a is the OWNERSHIP gate, not a blanket disable: a binding the
+  #     caller does NOT own is trusted and writes. Needs a foreign-owned store
+  #     (sudo chown) — skipped (logged) where passwordless sudo is unavailable.
+  clear_bindings
+  seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"   # real session + real pane_pid
+  if smoke_config_caller_make_store_foreign "$BINDINGS_DIR"; then
+    : >"$BRIDGE_AUDIT_LOG"
+    rm -f "$ENV_FILE"
+    rc="$(run_wrapper_in_pane set-env "BRIDGE_A2A_RECONCILE_INTERVAL=60" --from "$ADMIN_AGENT")"
+    smoke_assert_eq "0" "$rc" "set-env: iso foreign-owned store admin-binding apply rc"
+    smoke_assert_file_exists "$ENV_FILE" "set-env: iso foreign-owned store wrote managed file"
+    smoke_assert_contains "$(cat "$ENV_FILE")" \
+      "export BRIDGE_A2A_RECONCILE_INTERVAL='60'" "set-env: iso admin-binding export line"
+    # Audit rows carry before+after hashes for an apply (forensic anchor intact).
+    smoke_assert_contains "$(cat "$BRIDGE_AUDIT_LOG")" '"before_sha256"' "iso-binding: audit before hash"
+    smoke_assert_contains "$(cat "$BRIDGE_AUDIT_LOG")" '"after_sha256"' "iso-binding: audit after hash"
+    smoke_log "ok: iso (foreign-owned) admin binding + real live session -> WROTE"
+    clear_bindings
+  else
+    smoke_log "skip: iso foreign-owned-store WRITE path (no passwordless sudo) — deny-side teeth still ran"
+    clear_bindings
+  fi
 
-rc="$(run_wrapper_raw set-env "BRIDGE_A2A_RECONCILE_INTERVAL=60" --from "$ADMIN_AGENT")"
-smoke_assert_eq "0" "$rc" "set-env: admin-binding apply rc"
-smoke_assert_file_exists "$ENV_FILE" "set-env: admin-binding wrote managed file"
-smoke_assert_contains "$(cat "$ENV_FILE")" \
-  "export BRIDGE_A2A_RECONCILE_INTERVAL='60'" "set-env: admin-binding export line"
-smoke_log "ok: set-env admin-binding -> WROTE managed env file"
-
-# Audit rows carry before+after hashes for an apply (forensic anchor intact).
-AUDIT="$(cat "$BRIDGE_AUDIT_LOG")"
-smoke_assert_contains "$AUDIT" '"before_sha256"' "admin-binding: audit before hash"
-smoke_assert_contains "$AUDIT" '"after_sha256"' "admin-binding: audit after hash"
-
-# --from that DISAGREES with the binding is an identity spoof -> deny.
-clear_bindings
-seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"
-assert_wrapper_deny_unchanged \
-  "set: --from mismatch vs binding" "$PROTECTED_JSON" \
-  set --path "$PROTECTED_JSON" --change "spoof=5" --from "$USER_AGENT"
+  # 3c. --from that DISAGREES with the binding is an identity spoof -> deny. The
+  #     mismatch check fires after the ancestry match (run in-pane), before the
+  #     ownership gate, so a caller-owned store is fine here.
+  clear_bindings
+  seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"
+  assert_in_pane_deny_reason \
+    "set: --from mismatch vs binding" "$PROTECTED_JSON" \
+    "identity-spoof" \
+    set --path "$PROTECTED_JSON" --change "spoof=5" --from "$USER_AGENT"
+  clear_bindings
+else
+  smoke_log "skip: FIX 1 ownership-gate cases (3a/3b/3c) — no real tmux live session available"
+fi
 
 # ===========================================================================
 # SECTION 4 — HOOK: eval / bash -c / sh -c / $var indirection DENY (both verbs).
@@ -402,10 +460,9 @@ assert_bash_verdict "hook: \$P set --path indirection denied" "$ADMIN_AGENT" \
 #     sibling word lands in argparse's single positional slot and the wrapper
 #     rejects it (rc=2, unrecognized arguments) before any write — it is
 #     non-exploitable, so we deliberately do NOT teach the hook to normalize
-#     braces. Drive the bash-expanded argv straight at the wrapper (with an
-#     admin binding seeded) and assert it does NOT write the managed file.
+#     braces. Drive the bash-expanded argv straight at the wrapper (no live
+#     binding needed — argparse rejects before any authorization).
 clear_bindings
-seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"
 rm -f "$ENV_FILE"
 set +e
 "$PYTHON_BIN" "$WRAPPER" config set-env x-env "BRIDGE_A2A_RECONCILE_INTERVAL=60" --from "$ADMIN_AGENT" \
@@ -431,97 +488,170 @@ assert_bash_verdict "hook: unrelated bash -c not hijacked" "$ADMIN_AGENT" \
 assert_bash_verdict "hook: unrelated \$var cmd not hijacked" "$ADMIN_AGENT" \
   'V=ls; $V -la' "ALLOW"
 
-# Assert a wrapper invocation DENIES (rc!=0, target unchanged) AND the deny
-# stderr carries a specific reason substring (the r2 fail-closed reasons).
-assert_wrapper_deny_reason() {
-  local label="$1" target="$2" want_reason="$3"
-  shift 3
-  local before after rc
-  before="$(sha_of "$target")"
-  rc="$(run_wrapper_raw "$@")"
-  after="$(sha_of "$target")"
-  if [[ "$rc" == "0" ]]; then
-    smoke_log "FAIL: ${label}: wrapper rc=0 (expected deny)"
-    smoke_log "      out: $(cat "$SMOKE_TMP_ROOT/wrap.out")"
-    smoke_fail "${label}: expected deny, got apply"
-  fi
-  smoke_assert_contains "$(cat "$SMOKE_TMP_ROOT/wrap.err")" "$want_reason" \
-    "${label}: deny reason"
-  smoke_assert_eq "$before" "$after" "${label}: target unchanged on deny"
-  smoke_log "ok: ${label} -> DENY (reason '${want_reason}', rc=${rc})"
-}
-
 # ===========================================================================
-# SECTION 6 — WRAPPER: #1738 r2 BLOCKER 1 (Option 1 store-writability gate).
-#
-# TEETH: round 1 authorizes a forged admin binding on a self-writable
-# (shared-UID) store. r2 fails closed there and ONLY trusts the binding when the
-# store is NOT writable by the caller (iso, controller-owned). This proves the
-# gate keys on writability, not a blanket disable.
-# ===========================================================================
-
-# 6a. Forgery on a WRITABLE store: the smoke's bindings dir is caller-writable
-#     by construction (single UID = shared-UID), exactly the forgeable shape. A
-#     "forged" admin binding (agent_id==admin, pane_pid==our ancestor, live
-#     session) now DENIES with the store-writable reason. (r1: this WRITES.)
-clear_bindings
-seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"   # writable store (default)
-store_make_writable
-assert_wrapper_deny_reason \
-  "set: forged admin binding on writable store" "$PROTECTED_JSON" \
-  "agent-binding-store-writable" \
-  set --path "$PROTECTED_JSON" --change "forge=1" --from "$ADMIN_AGENT"
-assert_wrapper_deny_reason \
-  "set-env: forged admin binding on writable store" "$ENV_FILE" \
-  "agent-binding-store-writable" \
-  set-env "BRIDGE_A2A_RECONCILE_INTERVAL=60" --from "$ADMIN_AGENT"
-
-# 6b. SAME binding, store made NON-writable (controller-owned / iso shape):
-#     the binding is now trusted and WRITES. This is the positive control that
-#     proves 6a is the writability gate, not a blanket agent-binding disable.
-clear_bindings
-seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"
-store_make_nonwritable
-rm -f "$ENV_FILE"
-rc="$(run_wrapper_raw set-env "BRIDGE_A2A_RECONCILE_INTERVAL=60" --from "$ADMIN_AGENT")"
-smoke_assert_eq "0" "$rc" "set-env: non-writable store admin-binding apply rc"
-smoke_assert_file_exists "$ENV_FILE" "set-env: non-writable store wrote managed file"
-smoke_log "ok: non-writable-store admin binding -> WROTE (gate keys on writability)"
-
-# ===========================================================================
-# SECTION 7 — WRAPPER: #1738 r2 BLOCKER 2 (match-time liveness / PID-reuse).
+# SECTION 6 — WRAPPER: #1738 r2/r3 BLOCKER 2 (real-tmux liveness / PID-reuse).
 #
 # TEETH: round 1 authorizes a binding purely on `pane_pid in ancestry`, never
-# checking pane liveness, so an orphan binding whose pane is dead (its pid later
-# reused) still matches. r2 re-resolves the live #{pane_pid} of the recorded
-# session and denies on a dead session / pid mismatch.
+# checking pane liveness, so an orphan binding whose pane is dead still matches.
+# r2/r3 re-resolve the live #{pane_pid} of the recorded session via a REAL tmux
+# (no env stub — FIX 2) and deny on a dead session / pid mismatch. These cases
+# use a FOREIGN-owned store so the ONLY thing under test is liveness (the
+# ownership gate would otherwise also deny); skipped where iso store is
+# unavailable, since the dead-session deny is then indistinguishable from the
+# shared-UID ownership deny.
 # ===========================================================================
 
-# 7a. Stale binding: bound to a session the tmux stub reports as GONE (any
-#     session != SESSION_LIVE exits 1). pane_pid is still in ancestry ($$), so
-#     r1 would authorize; r2 denies because the session no longer resolves to
-#     the bound pane_pid. Store made non-writable so the ONLY thing under test
-#     is liveness (the writability gate would otherwise also deny).
-clear_bindings
-seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT" "sess-dead"
-store_make_nonwritable
-assert_wrapper_deny_unchanged \
-  "set: stale binding (dead session) denies despite ancestry" "$PROTECTED_JSON" \
-  set --path "$PROTECTED_JSON" --change "stale=1" --from "$ADMIN_AGENT"
+if [[ "${SMOKE_CONFIG_CALLER_LIVE_OK:-0}" == "1" ]]; then
+  # 6a. Stale binding: bound to a session that does NOT exist on the real server
+  #     (so display-message resolves to nothing). pane_pid is still the live
+  #     pane's (ancestry would match in-pane), so r1 would authorize; r2/r3 deny
+  #     because the recorded session no longer resolves to the bound pane_pid.
+  clear_bindings
+  seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT" "agb-cc-dead-session"
+  if smoke_config_caller_make_store_foreign "$BINDINGS_DIR"; then
+    rc="$(run_wrapper_in_pane set --path "$PROTECTED_JSON" --change "stale=1" --from "$ADMIN_AGENT")"
+    if [[ "$rc" == "0" ]]; then
+      smoke_fail "set: stale (dead-session) binding authorized despite dead session (rc=0)"
+    fi
+    smoke_assert_contains "$(cat "$SMOKE_TMP_ROOT/wrap.err")" "deny" "stale-binding: deny message"
+    smoke_assert_eq "{\"existing\":\"value\"}" "$(tr -d '\n' < "$PROTECTED_JSON")" \
+      "stale-binding: target unchanged"
+    smoke_log "ok: stale binding (dead session) -> DENY despite ancestry (rc=${rc})"
+    clear_bindings
+  else
+    smoke_log "skip: dead-session liveness DENY (no foreign store; would alias shared-UID deny)"
+    clear_bindings
+  fi
+else
+  smoke_log "skip: real-tmux liveness cases (no live session available)"
+fi
 
-# 7b. PID-reuse: live session, but the live pane_pid now resolves to a DIFFERENT
-#     pid than the bound one (the pane exited and a new process took the pid).
-#     The bound pane_pid is still in ancestry ($$); r2 denies on the mismatch.
-clear_bindings
-seed_binding "$ADMIN_AGENT" "$ADMIN_AGENT"   # session=SESSION_LIVE, pane_pid=$$
-store_make_nonwritable
-FAKE_LIVE_PID="999999" \
-  assert_wrapper_deny_unchanged \
-    "set: pid-reuse (live pane_pid != bound) denies" "$PROTECTED_JSON" \
-    set --path "$PROTECTED_JSON" --change "reuse=1" --from "$ADMIN_AGENT"
+# ===========================================================================
+# SECTION 7 — DAEMON PRUNE: #1738 r3 FIX 3 (false-delete / fleet self-DoS).
+#
+# `bridge_daemon_prune_orphan_config_caller_bindings` r2 deleted a binding
+# whenever `tmux has-session` failed — but has-session ALSO fails when the tmux
+# SERVER is momentarily unreachable, so a transient outage during one reconcile
+# tick deleted EVERY live agent's binding fleet-wide (no recovery until restart).
+# r3 adds a precondition guard (probe the server once; skip the whole pass if it
+# is unreachable) + a materialized live-session SET membership check + a
+# self-heal re-publish. TEETH: on r2 a server-outage prune deletes a live
+# binding; on r3 it is preserved.
+#
+# We exercise the REAL prune function (extracted from bridge-daemon.sh by a small
+# slicer, eval'd into THIS shell) with a `tmux` shell FUNCTION that shadows the
+# external binary so we can deterministically simulate "server unreachable"
+# (list-sessions exits 1) vs "server up, session X live" (list-sessions prints X).
+# ===========================================================================
 
-# Restore a clean, writable, empty store before exit so temp-root cleanup and
-# any later harness step is unobstructed.
+PRUNE_BD="$BRIDGE_STATE_DIR/config-caller-bindings"
+mkdir -p "$PRUNE_BD"
+PRUNE_LIVE_SESSION="agb-cc-prune-live"
+
+# Slice ONLY the prune function body out of bridge-daemon.sh (no full-daemon
+# boot) and eval it here. The committed slicer does a brace-depth walk
+# (file-as-argv, no heredoc-stdin) and emits just that one function definition.
+PRUNE_SLICER="$SCRIPT_DIR/1738-helpers/extract-shell-fn.py"
+eval "$("$PYTHON_BIN" "$PRUNE_SLICER" "$REPO_ROOT/bridge-daemon.sh" \
+  "bridge_daemon_prune_orphan_config_caller_bindings()")"
+
+# Minimal shims the prune fn calls (the rest of the daemon is not booted). The
+# `tmux` FUNCTION below is the controlled server: PRUNE_TMUX_MODE selects its
+# list-sessions behaviour.
+bridge_config_caller_bindings_dir() { printf '%s' "$PRUNE_BD"; }
+bridge_daemon_helper_python() { "$PYTHON_BIN" "$REPO_ROOT/lib/daemon-helpers/config-binding-list.py" "$2"; }
+bridge_remove_config_caller_binding() { rm -f "$PRUNE_BD/$1.json" 2>/dev/null || true; }
+bridge_publish_config_caller_binding() { :; }
+bridge_agent_session() { :; }
+bridge_agent_engine() { :; }
+bridge_tmux_session_pane_pid() { :; }
+bridge_audit_log() { :; }
+daemon_info() { :; }
+BRIDGE_AGENT_IDS=()
+PRUNE_TMUX_MODE="server-up"
+tmux() {
+  if [[ "$1" == "list-sessions" ]]; then
+    if [[ "$PRUNE_TMUX_MODE" == "server-down" ]]; then
+      printf 'error connecting to server\n' >&2
+      return 1
+    fi
+    printf '%s\n' "$PRUNE_LIVE_SESSION"
+    return 0
+  fi
+  return 1
+}
+
+run_prune() {
+  PRUNE_TMUX_MODE="$1"
+  bridge_daemon_prune_orphan_config_caller_bindings >/dev/null 2>&1 || true
+}
+
+# 7a. SERVER DOWN: a live binding must SURVIVE (the precondition guard skips the
+#     whole pass). TEETH: on r2 (per-binding has-session, no guard) the binding
+#     is deleted; on r3 it survives.
+clear_bindings
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":12345,"engine":"claude","updated_at":"now"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$PRUNE_LIVE_SESSION" >"$PRUNE_BD/$ADMIN_AGENT.json"
+run_prune "server-down"
+if [[ -f "$PRUNE_BD/$ADMIN_AGENT.json" ]]; then
+  smoke_log "ok: prune SERVER-DOWN preserved the live binding (no false-delete)"
+else
+  smoke_fail "prune SERVER-DOWN false-deleted a live binding (r3 precondition guard regressed)"
+fi
+
+# 7b. SERVER UP, session GONE: a genuine orphan (session not in the live set) is
+#     pruned. Positive control that 7a is the guard, not a blanket no-op.
+clear_bindings
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":12345,"engine":"claude","updated_at":"now"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "agb-cc-prune-dead" >"$PRUNE_BD/$ADMIN_AGENT.json"
+run_prune "server-up"
+if [[ -f "$PRUNE_BD/$ADMIN_AGENT.json" ]]; then
+  smoke_fail "prune SERVER-UP did not remove a genuinely orphaned binding"
+fi
+smoke_log "ok: prune SERVER-UP removed the genuinely orphaned binding"
+
+# 7c. SERVER UP, session LIVE: a live binding is NOT pruned.
+clear_bindings
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":12345,"engine":"claude","updated_at":"now"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$PRUNE_LIVE_SESSION" >"$PRUNE_BD/$ADMIN_AGENT.json"
+run_prune "server-up"
+if [[ ! -f "$PRUNE_BD/$ADMIN_AGENT.json" ]]; then
+  smoke_fail "prune SERVER-UP deleted a binding whose session IS live"
+fi
+smoke_log "ok: prune SERVER-UP preserved the binding whose session is live"
+
+# 7d. SELF-HEAL: a roster agent whose session is LIVE but whose binding file is
+#     MISSING gets re-published this tick (single-point-of-publish fragility +
+#     recovery from a mistaken delete). Override the roster + agent shims so the
+#     self-heal loop has a live agent to repair, and make publish actually write
+#     the record (mirrors the real publisher's effect).
+clear_bindings
+BRIDGE_AGENT_IDS=("$ADMIN_AGENT")
+bridge_agent_session() { [[ "$1" == "$ADMIN_AGENT" ]] && printf '%s' "$PRUNE_LIVE_SESSION"; }
+bridge_tmux_session_pane_pid() { printf '54321'; }
+bridge_agent_engine() { printf 'claude'; }
+bridge_publish_config_caller_binding() {
+  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"engine":"%s","updated_at":"healed"}\n' \
+    "$1" "$1" "$PRUNE_LIVE_SESSION" "$2" "$3" >"$PRUNE_BD/$1.json"
+}
+# Binding is MISSING (live session, but no record) — self-heal must re-create it.
+run_prune "server-up"
+if [[ -f "$PRUNE_BD/$ADMIN_AGENT.json" ]] && grep -q '"updated_at":"healed"' "$PRUNE_BD/$ADMIN_AGENT.json"; then
+  smoke_log "ok: prune SELF-HEAL re-published the missing binding for a live agent"
+else
+  smoke_fail "prune SELF-HEAL did not re-publish a missing binding for a live-session agent"
+fi
+# A persistent publish FAILURE must NOT churn (binding stays absent, no false heal).
+clear_bindings
+bridge_publish_config_caller_binding() { :; }   # publish that writes nothing
+run_prune "server-up"
+if [[ -f "$PRUNE_BD/$ADMIN_AGENT.json" ]]; then
+  smoke_fail "prune SELF-HEAL logged success despite a publish that wrote nothing"
+fi
+smoke_log "ok: prune SELF-HEAL no-op on a publish failure (no churn)"
+
+unset -f tmux bridge_agent_session bridge_tmux_session_pane_pid bridge_agent_engine bridge_publish_config_caller_binding
+# Restore a clean, writable, empty store before exit.
 clear_bindings
 
-smoke_log "PASS: all #1738 config-caller-binding wrapper + hook cases held"
+smoke_log "PASS: all #1738 config-caller-binding wrapper + hook + prune cases held"
