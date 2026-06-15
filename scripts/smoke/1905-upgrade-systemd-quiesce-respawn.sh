@@ -8,20 +8,31 @@
 # respawn the daemon inside the quiesce window and the fail-closed fence keeps
 # seeing a live pid → rc=3 abort → half-applied upgrade.
 #
-# The fix adds three gated, best-effort systemd helpers to bridge-upgrade.sh:
-#   _bridge_upgrade_daemon_systemd_active   — systemctl + service is-active gate
+# The fix adds gated, best-effort systemd helpers to bridge-upgrade.sh:
+#   _bridge_upgrade_systemd_user_bus_ready  — establish XDG_RUNTIME_DIR (#1905 r2)
+#   _bridge_upgrade_daemon_systemd_active   — bus + systemctl + is-active gate
 #   _bridge_upgrade_systemd_quiesce_daemon  — stop timer THEN service (no respawn)
 #   _bridge_upgrade_systemd_restart_daemon  — start service THEN re-arm timer
 #
 # This smoke sources ONLY those helper bodies from the live bridge-upgrade.sh
 # source (extracted between the #1905 BEGIN/END markers, so the test tracks the
 # real implementation, not a copy), installs a `systemctl` shim that records
-# every call, and asserts:
+# every call AND reproduces the real no-bus failure (#1905 r2: `--user` without
+# XDG_RUNTIME_DIR fails "connect to bus" and is NOT logged — closing the CI blind
+# spot that masked the r2 regression), and asserts (with the test env
+# XDG_RUNTIME_DIR UNSET so the helpers MUST establish it):
 #   T1 — systemd-active quiesce stops the liveness TIMER, then the SERVICE
 #        (timer first so it can't re-fire the service).
 #   T2 — systemd restart starts the SERVICE, then re-arms the liveness TIMER.
 #   T3 — NON-systemd path (detector → false) makes ZERO systemctl calls
 #        (byte-for-byte unchanged behavior) even with systemctl on PATH.
+#   T4/T5 — inline-fallback detector: inactive → is-active probe only; active →
+#        timer-then-service stop.
+#   T6 — _bridge_upgrade_systemd_user_bus_ready exports XDG_RUNTIME_DIR from
+#        /run/user/<uid> when unset, respects an already-set value, and fails
+#        (rc!=0) when no user runtime dir exists.
+#   T7 — with NO reachable user bus, quiesce makes ZERO systemctl calls (graceful
+#        fallback to the script-level stop, never a silent broken `--user` call).
 
 set -uo pipefail
 SMOKE_NAME="1905-upgrade-systemd-quiesce-respawn"
@@ -62,6 +73,17 @@ IS_ACTIVE_RC_FILE="$SMOKE_TMP_ROOT/is-active-rc"
 printf '0' >"$IS_ACTIVE_RC_FILE"
 cat >"$SHIM_DIR/systemctl" <<EOF
 #!/usr/bin/env bash
+# #1905 r2: \`systemctl --user\` needs XDG_RUNTIME_DIR to reach the user bus.
+# Reproduce the real no-bus failure — if --user is requested without
+# XDG_RUNTIME_DIR, fail "connect to bus" and DO NOT log (the call never reached
+# the bus). This closes the CI blind spot that masked the r2 regression: a fix
+# that forgets to establish XDG_RUNTIME_DIR shows up as ZERO logged calls.
+__is_user=0
+for __a in "\$@"; do [[ "\$__a" == "--user" ]] && __is_user=1; done
+if [[ "\$__is_user" == "1" && -z "\${XDG_RUNTIME_DIR:-}" ]]; then
+  echo "systemctl --user: Failed to connect to bus (XDG_RUNTIME_DIR not defined)" >&2
+  exit 1
+fi
 printf '%s\n' "\$*" >>"$SYSTEMCTL_LOG"
 case "\$*" in
   *is-active*) exit "\$(cat '$IS_ACTIVE_RC_FILE' 2>/dev/null || printf 0)" ;;
@@ -69,6 +91,18 @@ case "\$*" in
 esac
 EOF
 chmod +x "$SHIM_DIR/systemctl"
+
+# #1905 r2: fake user-runtime-dir bases so the smoke can deterministically drive
+# _bridge_upgrade_systemd_user_bus_ready (which establishes XDG_RUNTIME_DIR from
+# BRIDGE_UPGRADE_SYSTEMD_RUNTIME_BASE/<uid>) without needing a real /run/user.
+# GOOD has the <uid> subdir (bus establishable); EMPTY does not (bus down).
+SMOKE_UID="$(id -u)"
+RUNTIME_BASE_GOOD="$SMOKE_TMP_ROOT/run-user"
+mkdir -p "$RUNTIME_BASE_GOOD/$SMOKE_UID"
+RUNTIME_BASE_EMPTY="$SMOKE_TMP_ROOT/run-user-empty"
+mkdir -p "$RUNTIME_BASE_EMPTY"
+# Default for T1-T5: a reachable bus. Individual tests override per-case.
+TEST_RUNTIME_BASE="$RUNTIME_BASE_GOOD"
 
 # Count non-empty lines in a file (0 when absent/empty). grep -c emits "0" AND
 # exits non-zero on no match, so a `|| fallback` would double-print — use a
@@ -94,8 +128,15 @@ count_mutating_calls() {
 # $1 = detector rc (0=systemd, 1=not), $2 = helper to invoke.
 run_helper() {
   local det_rc="$1" fn="$2"
-  PATH="$SHIM_DIR:$PATH" "$BRIDGE_BASH" -c "
+  # #1905 r2: run with XDG_RUNTIME_DIR UNSET so the helper MUST establish it from
+  # the injected runtime base — otherwise the no-bus shim rejects every `--user`
+  # call and the stop/start calls go unlogged (which is exactly the regression we
+  # want to catch).
+  PATH="$SHIM_DIR:$PATH" \
+  BRIDGE_UPGRADE_SYSTEMD_RUNTIME_BASE="$TEST_RUNTIME_BASE" \
+  "$BRIDGE_BASH" -c "
     set -uo pipefail
+    unset XDG_RUNTIME_DIR
     source '$HELPERS'
     _bridge_daemon_control_systemd_active() { return $det_rc; }
     $fn
@@ -111,8 +152,11 @@ run_helper() {
 # IS_ACTIVE_RC_FILE. $1 = helper.
 run_helper_inline_fallback() {
   local fn="$1"
-  PATH="$SHIM_DIR:$PATH" "$BRIDGE_BASH" -c "
+  PATH="$SHIM_DIR:$PATH" \
+  BRIDGE_UPGRADE_SYSTEMD_RUNTIME_BASE="$TEST_RUNTIME_BASE" \
+  "$BRIDGE_BASH" -c "
     set -uo pipefail
+    unset XDG_RUNTIME_DIR
     source '$HELPERS'
     $fn
   " 2>/dev/null
@@ -193,5 +237,51 @@ T5_SECOND_STOP="$(printf '%s\n' "$T5_STOPS" | sed -n '2p')"
 [[ "$T5_FIRST_STOP" == *"liveness.timer"* && "$T5_SECOND_STOP" == *"daemon.service"* ]] \
   || smoke_fail "T5 FAIL: inline-fallback must stop timer BEFORE service. stops=$T5_STOPS"
 smoke_log "T5 PASS: inline-fallback active path stops liveness.timer THEN daemon.service"
+
+# --- T6: user-bus establishment (_bridge_upgrade_systemd_user_bus_ready) -------
+# (a) XDG unset + a present /run/user/<uid> (GOOD base) → exports XDG_RUNTIME_DIR.
+T6_OUT="$SMOKE_TMP_ROOT/t6-xdg.out"
+: >"$T6_OUT"
+PATH="$SHIM_DIR:$PATH" BRIDGE_UPGRADE_SYSTEMD_RUNTIME_BASE="$RUNTIME_BASE_GOOD" "$BRIDGE_BASH" -c "
+  set -uo pipefail
+  unset XDG_RUNTIME_DIR
+  source '$HELPERS'
+  _bridge_upgrade_systemd_user_bus_ready && printf '%s' \"\${XDG_RUNTIME_DIR:-}\" >'$T6_OUT'
+" 2>/dev/null
+smoke_assert_eq "$RUNTIME_BASE_GOOD/$SMOKE_UID" "$(cat "$T6_OUT")" "T6a bus-ready exports XDG_RUNTIME_DIR from /run/user/<uid> when unset"
+# (b) XDG already set to an existing dir → respected unchanged (BASE ignored).
+: >"$T6_OUT"
+PATH="$SHIM_DIR:$PATH" XDG_RUNTIME_DIR="$RUNTIME_BASE_GOOD" BRIDGE_UPGRADE_SYSTEMD_RUNTIME_BASE="$RUNTIME_BASE_EMPTY" "$BRIDGE_BASH" -c "
+  set -uo pipefail
+  source '$HELPERS'
+  _bridge_upgrade_systemd_user_bus_ready && printf '%s' \"\${XDG_RUNTIME_DIR:-}\" >'$T6_OUT'
+" 2>/dev/null
+smoke_assert_eq "$RUNTIME_BASE_GOOD" "$(cat "$T6_OUT")" "T6b bus-ready respects an already-set XDG_RUNTIME_DIR"
+# (c) XDG unset + NO /run/user/<uid> (EMPTY base) → returns non-zero (bus down).
+if PATH="$SHIM_DIR:$PATH" BRIDGE_UPGRADE_SYSTEMD_RUNTIME_BASE="$RUNTIME_BASE_EMPTY" "$BRIDGE_BASH" -c "
+  set -uo pipefail
+  unset XDG_RUNTIME_DIR
+  source '$HELPERS'
+  _bridge_upgrade_systemd_user_bus_ready
+" 2>/dev/null; then
+  smoke_fail "T6c FAIL: bus-ready must return non-zero when no user runtime dir exists"
+fi
+smoke_log "T6 PASS: user-bus establishment (export-when-unset / respect-when-set / fail-when-no-runtime-dir)"
+
+# --- T7: no reachable user bus → quiesce makes ZERO systemctl calls -----------
+# XDG unset + NO /run/user/<uid>: the bus-ready gate fails, so even with the
+# canonical detector "active" the quiesce helper must NOT emit broken
+# `systemctl --user` calls — it short-circuits (detector returns 1) and the real
+# call site falls back to the script-level stop. The no-bus shim would reject any
+# leaked `--user` call, so ZERO logged calls proves the graceful fallback (this
+# is the regression T1 catches from the other side: T1 needs the helper to
+# ESTABLISH the bus, T7 needs it to FALL BACK when it cannot).
+: >"$SYSTEMCTL_LOG"
+TEST_RUNTIME_BASE="$RUNTIME_BASE_EMPTY"
+run_helper 0 _bridge_upgrade_systemd_quiesce_daemon
+T7_COUNT="$(count_calls "$SYSTEMCTL_LOG")"
+TEST_RUNTIME_BASE="$RUNTIME_BASE_GOOD"
+smoke_assert_eq "0" "$T7_COUNT" "T7 no-bus quiesce makes ZERO systemctl calls (graceful fallback, got: $(cat "$SYSTEMCTL_LOG"))"
+smoke_log "T7 PASS: no reachable user bus → quiesce short-circuits to script-level fallback (zero systemctl calls)"
 
 smoke_log "all systemd quiesce/respawn tests PASS (#1905)"

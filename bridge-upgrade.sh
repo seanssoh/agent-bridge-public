@@ -1209,13 +1209,52 @@ _bridge_upgrade_write_complete_marker() {
 # systemd-active check and is best-effort, so non-systemd installs (macOS
 # launchd, plain-bash) are byte-for-byte unchanged.
 
-# True only when systemctl exists AND agent-bridge-daemon.service is active.
-# Prefers the canonical detector (lib/bridge-daemon-control.sh) when it is in
-# scope; falls back to an inline `systemctl --user is-active` so this helper is
-# self-contained and never errors on a host without that module sourced. rc-only,
-# no output.
+# Issue #1905 r2 (cm-prod real-host catch): `systemctl --user` talks to the
+# per-user systemd bus, which needs XDG_RUNTIME_DIR (DBUS_SESSION_BUS_ADDRESS is
+# derived from it). In the upgrader's environment — whether triggered from an
+# operator shell OR spawned by the running daemon — XDG_RUNTIME_DIR is frequently
+# UNSET (Linger=no, no login session; the daemon's own /proc/<pid>/environ lacks
+# it), so a bare `systemctl --user` fails "Failed to connect to bus". Swallowed by
+# the `|| true` guards on every call here, that failure would SILENTLY no-op the
+# whole systemd-aware path: the stops do nothing → systemd respawns → the #1820
+# fence sees a live pid → rc=3 (the exact bug this fix targets), and the detector
+# misclassifies a systemd host as non-systemd. Fix: point XDG_RUNTIME_DIR at the
+# user manager's runtime dir (/run/user/<uid>) before any `systemctl --user`.
+# Returns 0 if a usable XDG_RUNTIME_DIR is in place (exported if it was unset),
+# 1 if no user runtime dir exists at all (user manager down) — the caller then
+# WARNs and falls back to the script-level stop. The runtime base is overridable
+# (BRIDGE_UPGRADE_SYSTEMD_RUNTIME_BASE) for smoke injection only; it defaults to
+# the real /run/user. rc-only, no output.
+_bridge_upgrade_systemd_user_bus_ready() {
+  # Respect an already-usable runtime dir (operator running under a real session).
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" ]]; then
+    return 0
+  fi
+  local _uid _rundir
+  _uid="$(id -u 2>/dev/null || printf '')"
+  [[ -n "$_uid" ]] || return 1
+  _rundir="${BRIDGE_UPGRADE_SYSTEMD_RUNTIME_BASE:-/run/user}/$_uid"
+  if [[ -d "$_rundir" ]]; then
+    export XDG_RUNTIME_DIR="$_rundir"
+    return 0
+  fi
+  return 1
+}
+
+# True only when systemctl exists, the user bus is reachable, AND
+# agent-bridge-daemon.service is active. Establishes XDG_RUNTIME_DIR first (#1905
+# r2) so the `systemctl --user` query below — and the canonical detector, which
+# also calls `systemctl --user is-active` — actually reach the bus instead of
+# silently failing and misclassifying the host as non-systemd. Prefers the
+# canonical detector (lib/bridge-daemon-control.sh) when it is in scope (it
+# inherits the exported XDG_RUNTIME_DIR, same process); falls back to an inline
+# `systemctl --user is-active` so this helper is self-contained on a host without
+# that module sourced. If the user bus cannot be established (no /run/user/<uid>),
+# returns 1 — the caller decides whether to WARN (unit file present on disk)
+# before falling back to the script path. rc-only, no output.
 _bridge_upgrade_daemon_systemd_active() {
   command -v systemctl >/dev/null 2>&1 || return 1
+  _bridge_upgrade_systemd_user_bus_ready || return 1
   if command -v _bridge_daemon_control_systemd_active >/dev/null 2>&1; then
     _bridge_daemon_control_systemd_active
     return $?
@@ -1230,6 +1269,14 @@ _bridge_upgrade_daemon_systemd_active() {
 # non-systemd-managed install.
 _bridge_upgrade_systemd_quiesce_daemon() {
   _bridge_upgrade_daemon_systemd_active || return 0
+  # Issue #1905 r2: the STOP path below is the ACTUAL origin of the rc=3 race —
+  # if `systemctl --user stop` runs without a reachable user bus it fails and the
+  # `|| true` swallows it, leaving the daemon up for systemd to respawn → fence
+  # rc=3 (the whole bug). The detector above already established the user bus (it
+  # returned 0 only after _bridge_upgrade_systemd_user_bus_ready succeeded), but
+  # re-assert it explicitly here so the STOP path is self-evidently bus-covered
+  # and cannot silently regress if the detector call is ever refactored away.
+  _bridge_upgrade_systemd_user_bus_ready || true
   echo "[bridge-upgrade] systemd-managed daemon detected — stopping agent-bridge-daemon-liveness.timer + agent-bridge-daemon.service for the layout-v2 reconcile window (they would otherwise respawn the daemon and race the #1820 fence)." >&2
   systemctl --user stop agent-bridge-daemon-liveness.timer >/dev/null 2>&1 || true
   systemctl --user stop agent-bridge-daemon.service >/dev/null 2>&1 || true
@@ -1248,6 +1295,15 @@ _bridge_upgrade_systemd_quiesce_daemon() {
 _bridge_upgrade_systemd_restart_daemon() {
   if ! command -v systemctl >/dev/null 2>&1; then
     echo "[bridge-upgrade] WARN: systemctl not found at restart time on a systemd-managed install — leaving the daemon to its unit Restart= / liveness-timer policy." >&2
+    return 0
+  fi
+  # Issue #1905 r2: re-establish the user bus before `systemctl --user` (the
+  # XDG_RUNTIME_DIR export from the quiesce-time detection already persists in
+  # this process, but re-assert it so this helper is self-contained). If the bus
+  # cannot be reached, WARN and leave the daemon to its unit Restart= /
+  # liveness-timer policy rather than emitting silently-failing start calls.
+  if ! _bridge_upgrade_systemd_user_bus_ready; then
+    echo "[bridge-upgrade] WARN: no user systemd bus reachable at restart time (XDG_RUNTIME_DIR unset and no /run/user/<uid>) — cannot 'systemctl --user start'; leaving the daemon to its unit Restart= / liveness-timer policy." >&2
     return 0
   fi
   echo "[bridge-upgrade] restoring systemd-managed daemon — starting agent-bridge-daemon.service + agent-bridge-daemon-liveness.timer." >&2
@@ -3108,6 +3164,17 @@ if [[ $DRY_RUN -eq 0 ]]; then
     _UPGRADE_DAEMON_SYSTEMD_MANAGED=0
     if _bridge_upgrade_daemon_systemd_active; then
       _UPGRADE_DAEMON_SYSTEMD_MANAGED=1
+    elif [[ -f "${HOME:-}/.config/systemd/user/agent-bridge-daemon.service" ]] \
+         && ! _bridge_upgrade_systemd_user_bus_ready; then
+      # Issue #1905 r2: the unit file is on disk (this install IS systemd-managed)
+      # but no user bus is reachable (XDG_RUNTIME_DIR unset and no /run/user/<uid>
+      # — Linger=no + no login session), so we cannot drive `systemctl --user`
+      # here. We fall through to the script-level stop below, but WARN LOUDLY
+      # (never a silent skip): if the daemon respawns and the reconcile refuses
+      # (rc=3), the operator must export XDG_RUNTIME_DIR and stop the units by
+      # hand, then re-run. This branch also keeps us from misclassifying a
+      # genuinely systemd-managed host as non-systemd without a trace.
+      echo "[bridge-upgrade] WARN: agent-bridge-daemon.service unit file is present (systemd-managed install) but no user systemd bus is reachable (XDG_RUNTIME_DIR unset and no /run/user/<uid>; Linger=no/no session). Cannot drive 'systemctl --user' for the #1820 reconcile quiesce — falling back to the script-level daemon stop. If the daemon respawns and the reconcile refuses (rc=3), run: export XDG_RUNTIME_DIR=/run/user/\$(id -u); systemctl --user stop agent-bridge-daemon-liveness.timer agent-bridge-daemon.service ; then re-run the upgrade." >&2
     fi
     # Best-effort: the quiesce helper always returns 0; `|| true` is
     # belt-and-suspenders so a systemctl hiccup can never abort the upgrade.
