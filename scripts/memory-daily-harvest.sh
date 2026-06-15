@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # memory-daily harvester stub — thin CLI adapter between cron runner and
 # bridge-memory.py. Keep this script policy-free; Python owns all decisions.
-# Under linux-user isolation the stub probes passwordless sudo and either
-# re-execs Python as the target OS user or signals --skipped-permission.
+# Under linux-user isolation the controller UID cannot read the iso agent's
+# iso-owned ~/.claude/projects tree (issue #1894), so the stub runs ONLY the
+# bounded transcript scan as the target OS user (passwordless sudo via the
+# sudoers `bash` allowlist) and feeds the result back to the controller-UID
+# harvest via --transcripts-json — the harvest itself, and every queue-DB /
+# aggregate write, stays in the controller context (Design A, #786). If
+# passwordless sudo is unavailable the stub falls back to --skipped-permission.
 set -euo pipefail
 
 AGENT=""
@@ -17,6 +22,27 @@ done
 : "${BRIDGE_HOME:=$HOME/.agent-bridge}"
 BRIDGE_AGB="${BRIDGE_AGB:-$BRIDGE_HOME/agb}"
 BRIDGE_PYTHON="${BRIDGE_PYTHON:-python3}"
+
+# Issue #1894: source the iso helpers so the linux-user branch below can run
+# the transcript scan AS the iso UID via `bridge_isolation_run_as_agent_user_via_bash`.
+# Mirrors the wiki-monthly-summarize.sh guard (#1849/#1827/#1222): merely
+# sourcing bridge-lib.sh does NOT populate the per-agent roster arrays the
+# isolation predicate reads — `bridge_load_roster` does. Source, verify the
+# helpers AND the roster loader exist, then load. On a stripped install (or a
+# smoke harness with a minimal $BRIDGE_HOME) the iso path stays unavailable and
+# the existing controller-read / --skipped-permission fallback handles it.
+_BRIDGE_ISO_HELPERS_LOADED=0
+if [[ -r "$BRIDGE_HOME/bridge-lib.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "$BRIDGE_HOME/bridge-lib.sh" || true
+  if declare -F bridge_isolation_run_as_agent_user_via_bash >/dev/null 2>&1 \
+      && declare -F bridge_isolation_can_sudo_to_agent >/dev/null 2>&1 \
+      && declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && declare -F bridge_load_roster >/dev/null 2>&1 \
+      && bridge_load_roster >/dev/null 2>&1; then
+    _BRIDGE_ISO_HELPERS_LOADED=1
+  fi
+fi
 
 json="$("$BRIDGE_AGB" agent show "$AGENT" --json 2>/dev/null)" \
   || { echo "error: agent show failed for $AGENT" >&2; exit 2; }
@@ -258,43 +284,95 @@ print(os.path.realpath(sys.argv[1]))
 # the agent's daily note populated from the latest session jsonl first.
 reconcile_jsonl_for_cron "$AGENT" "$workdir"
 
-# linux-user isolation (issue #219 v1.3 design): Python harvester always runs
-# as the controller UID so queue DB reads (task_events), dedupe lookups
-# (_task_status), and backfill writes (bridge-task.sh create) remain in the
-# controller context. When the target agent is isolated and the os_user
-# differs, we instead grant the controller r-X on the target's transcripts
-# tree (ACL added by bridge_linux_prepare_agent_isolation) and pass
-# --transcripts-home so _scan_transcripts reads the correct store. If the
-# transcripts dir is unreadable (ACL not yet re-applied, or operator has not
-# ensured the target home exists), fall back to --skipped-permission so the
-# admin aggregate surfaces the gap.
+# linux-user isolation (issue #219 v1.3 design + #1894 run-as-iso read-lens):
+# the Python harvester always runs as the controller UID so queue DB reads
+# (task_events), dedupe lookups (_task_status), and backfill writes
+# (bridge-task.sh create) remain in the controller context (Design A, #786).
+#
+# The one thing the controller UID CANNOT do is read the target agent's
+# transcript tree: under iso-v2 `<iso-home>/.claude` is group-setgid 3770, but
+# Claude creates `projects/` at runtime under the iso UID's umask 077, landing
+# at mode 2700 — no group read. There is no prepare-isolation ACL granting the
+# controller r-X (that earlier claim was contract drift — #1894). So we run
+# ONLY the bounded transcript scan AS the iso UID via the sanctioned sudoers
+# `bash` allowlist (`bridge_isolation_run_as_agent_user_via_bash`), capture the
+# JSON list on the controller's stdout, and feed it to the controller-UID
+# harvest via --transcripts-json. Nothing else crosses the boundary.
+#
+# If passwordless sudo is unavailable (helper not loaded, or
+# bridge_isolation_can_sudo_to_agent != 0), fall back to --skipped-permission
+# so the admin aggregate surfaces the gap rather than erroring.
 if [[ "$isolation_mode" == "linux-user" \
       && -n "$os_user" \
       && -n "$current_user" \
       && "$os_user" != "$current_user" \
       && "$current_uid" != "0" ]]; then
-  transcripts_dir="$target_home/.claude/projects"
-  if [[ -r "$transcripts_dir" && -x "$transcripts_dir" ]]; then
-    exec "$BRIDGE_PYTHON" "$BRIDGE_HOME/bridge-memory.py" harvest-daily \
-      --agent "$AGENT" \
-      --home "$home" \
-      --workdir "$workdir" \
-      --os-user "$os_user" \
-      --transcripts-home "$target_home" \
-      --sidecar-out "$sidecar_out" \
-      "${v2_extra_args[@]}" \
-      --json
-  else
-    exec "$BRIDGE_PYTHON" "$BRIDGE_HOME/bridge-memory.py" harvest-daily \
-      --agent "$AGENT" \
-      --home "$home" \
-      --workdir "$workdir" \
-      --os-user "$os_user" \
-      --skipped-permission \
-      --sidecar-out "$sidecar_out" \
-      "${v2_extra_args[@]}" \
-      --json
+  iso_can_sudo=1
+  if (( _BRIDGE_ISO_HELPERS_LOADED == 1 )) \
+      && bridge_isolation_can_sudo_to_agent "$AGENT" 2>/dev/null; then
+    iso_can_sudo=0
   fi
+
+  if (( iso_can_sudo == 0 )); then
+    # Run-as-iso transcript scan. The self-contained inline script invokes
+    # `bridge-memory.py scan-transcripts` (read-only; emits the JSON list) as
+    # the iso UID and prints it to stdout, which the controller captures here.
+    # Footgun #11: argv-only, no heredoc-stdin in the inline body.
+    #
+    # Args bound inside the script:
+    #   $1 = BRIDGE_PYTHON, $2 = BRIDGE_HOME, $3 = workdir, $4 = transcripts-home
+    iso_scan_script='
+bridge_python="$1"
+bridge_home="$2"
+workdir="$3"
+transcripts_home="$4"
+"$bridge_python" "$bridge_home/bridge-memory.py" scan-transcripts \
+  --workdir "$workdir" \
+  --transcripts-home "$transcripts_home"
+'
+    transcripts_json="$(mktemp "${TMPDIR:-/tmp}/agb-memharvest-transcripts.XXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -f '$transcripts_json' 2>/dev/null" EXIT INT TERM
+    iso_scan_rc=0
+    bridge_isolation_run_as_agent_user_via_bash "$AGENT" "$iso_scan_script" \
+      "$BRIDGE_PYTHON" "$BRIDGE_HOME" "$workdir" "$target_home" \
+      >"$transcripts_json" 2>/dev/null || iso_scan_rc=$?
+
+    if [[ "$iso_scan_rc" -eq 0 ]]; then
+      # Cannot `exec` here — the EXIT trap must still fire to remove the temp.
+      harvest_rc=0
+      "$BRIDGE_PYTHON" "$BRIDGE_HOME/bridge-memory.py" harvest-daily \
+        --agent "$AGENT" \
+        --home "$home" \
+        --workdir "$workdir" \
+        --os-user "$os_user" \
+        --transcripts-json "$transcripts_json" \
+        --sidecar-out "$sidecar_out" \
+        "${v2_extra_args[@]}" \
+        --json || harvest_rc=$?
+      exit "$harvest_rc"
+    fi
+
+    # Scan failed (iso UID could not run the scan, e.g. transient sudo or
+    # Python error). Surface the gap via --skipped-permission rather than
+    # silently emitting an empty transcript set. The fallback exec below
+    # replaces this process, so the EXIT trap will NOT fire — remove the temp
+    # and clear the trap explicitly here to avoid leaking it.
+    rm -f "$transcripts_json" 2>/dev/null || true
+    trap - EXIT INT TERM
+    printf '[memory-daily-harvest] iso transcript scan failed (rc=%d) for agent=%s; recording skipped-permission\n' \
+      "$iso_scan_rc" "$AGENT" >&2
+  fi
+
+  exec "$BRIDGE_PYTHON" "$BRIDGE_HOME/bridge-memory.py" harvest-daily \
+    --agent "$AGENT" \
+    --home "$home" \
+    --workdir "$workdir" \
+    --os-user "$os_user" \
+    --skipped-permission \
+    --sidecar-out "$sidecar_out" \
+    "${v2_extra_args[@]}" \
+    --json
 fi
 
 exec "$BRIDGE_PYTHON" "$BRIDGE_HOME/bridge-memory.py" harvest-daily \

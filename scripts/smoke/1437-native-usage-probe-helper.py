@@ -226,8 +226,12 @@ def main() -> int:
             return "{}"
 
         res2 = _run(tmp, http_get=_should_not_run, registry=reg, now=2030.0, max_age=0.0, cooldown=60.0)
-        check(res2["status"] == "cooldown", "second probe within cooldown is suppressed")
-        check(marker["called"] is False, "cooldown prevented a second network call")
+        # The account-quota 429 now arms the same Retry-After-bounded backoff as
+        # an edge block AND leaves a live near-limit signal window, so the next
+        # in-window tick is reported with the #1468 suppression status (it still
+        # serves stale and makes NO network call — the property under test).
+        check(res2["status"] == "rate-limited-suppressed", "second probe within the backoff window is suppressed (live signal window)")
+        check(marker["called"] is False, "the in-window tick prevented a second network call")
 
     # ---- (d2) 429 WITH a short Retry-After → single capped retry succeeds -
     print("[d2] 429 + Retry-After=0 → single retry then success")

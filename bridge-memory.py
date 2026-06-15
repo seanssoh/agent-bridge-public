@@ -2980,6 +2980,64 @@ def _scan_transcripts(
     return [r for r in results if not _is_self_signal_event(r)]
 
 
+def cmd_scan_transcripts(args: argparse.Namespace) -> int:
+    """Emit the bounded transcript scan for one date as a JSON list (issue #1894).
+
+    Read-only companion to ``harvest-daily``. Under linux-user isolation the
+    controller UID cannot read the iso agent's ``~/.claude/projects`` tree
+    (mode 2700, iso-owned), so the harvest stub runs THIS subcommand as the
+    iso UID (via the sudoers ``bash`` allowlist) and marshals the resulting
+    list back to the controller-UID ``harvest-daily`` via ``--transcripts-json``.
+    The controller keeps owning every queue-DB / manifest / aggregate write
+    (Design A, #786) — only the transcript read crosses the boundary.
+
+    Output: ``json.dumps(_scan_transcripts(...))`` to stdout (a list of
+    session dicts, identical to what the controller would have produced).
+    """
+    workdir = args.workdir
+    if not workdir:
+        sys.stderr.write("scan-transcripts: --workdir is required\n")
+        return 2
+    tz_name = args.tz or "Asia/Seoul"
+    if args.date:
+        try:
+            date = _parse_harvest_date_arg(args.date, arg_name="--date").date().isoformat()
+        except ValueError as exc:
+            sys.stderr.write(f"scan-transcripts: {exc}\n")
+            return 2
+    else:
+        date = _harvest_default_date(tz_name)
+    start_dt, end_dt = _harvest_date_window(date, tz_name)
+    transcripts_home = (
+        Path(args.transcripts_home).expanduser() if args.transcripts_home else None
+    )
+    sessions = _scan_transcripts(
+        workdir, start_dt, end_dt, transcripts_home=transcripts_home
+    )
+    print(json.dumps(sessions, ensure_ascii=True))
+    return 0
+
+
+def _load_scanned_transcripts(path: Path) -> list[dict]:
+    """Load a pre-scanned transcript list emitted by ``scan-transcripts`` (#1894).
+
+    Degrades to ``[]`` (never raises) when the file is missing, unreadable, or
+    not a JSON list of dicts — the controller-side harvest must continue and
+    classify on the other activity signals rather than crash on a bad handoff.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [r for r in data if isinstance(r, dict)]
+
+
 def _scan_queue_events(db_path: Path, agent: str, start: datetime, end: datetime) -> list[int]:
     if not db_path.exists():
         return []
@@ -3732,10 +3790,21 @@ def _harvest_one_date(args: argparse.Namespace, date: str) -> dict:
 
     # --- Activity scan ------------------------------------------------------
     start_dt, end_dt = _harvest_date_window(date, tz_name)
-    transcripts_home = (
-        Path(args.transcripts_home).expanduser() if args.transcripts_home else None
-    )
-    transcripts = _scan_transcripts(workdir, start_dt, end_dt, transcripts_home=transcripts_home)
+    # Issue #1894: under linux-user isolation the controller UID cannot read
+    # the iso agent's ~/.claude/projects tree, so the harvest stub runs the
+    # transcript scan AS the iso UID (`scan-transcripts`) and hands the result
+    # back here via --transcripts-json. When that file is present we consume
+    # it verbatim instead of re-scanning from the controller context (which
+    # would hit Permission denied and return []). Everything else in this
+    # function still runs as the controller UID (Design A, #786).
+    transcripts_json = getattr(args, "transcripts_json", None)
+    if transcripts_json:
+        transcripts = _load_scanned_transcripts(Path(transcripts_json).expanduser())
+    else:
+        transcripts_home = (
+            Path(args.transcripts_home).expanduser() if args.transcripts_home else None
+        )
+        transcripts = _scan_transcripts(workdir, start_dt, end_dt, transcripts_home=transcripts_home)
     queue_tasks = _scan_queue_events(db_path, agent, start_dt, end_dt)
     medium_caps, weak_caps = _scan_ingested_captures(home, start_dt, end_dt)
     git_commits = _scan_git(Path(workdir).expanduser(), start_dt, end_dt)
@@ -4242,7 +4311,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--transcripts-home",
         help="override base for ~/.claude/projects scan (resolved by stub for linux-user isolation)",
     )
+    hd_parser.add_argument(
+        "--transcripts-json",
+        help=(
+            "path to a pre-scanned transcript list (JSON array) produced by "
+            "`scan-transcripts`. Issue #1894: under linux-user isolation the "
+            "stub runs the scan AS the iso UID and passes the result here so "
+            "the controller-UID harvest does not re-read the iso-owned "
+            "~/.claude/projects tree. When set, --transcripts-home is ignored."
+        ),
+    )
     hd_parser.set_defaults(func=cmd_harvest_daily)
+
+    # scan-transcripts (issue #1894): read-only iso-UID transcript scan. Emits
+    # the same list _scan_transcripts produces so the controller can ingest it
+    # via harvest-daily --transcripts-json without re-reading the iso tree.
+    st_parser = subparsers.add_parser(
+        "scan-transcripts",
+        help="Emit the bounded transcript scan for one date as JSON (issue #1894)",
+    )
+    st_parser.add_argument("--workdir", required=True, help="agent workdir (no fallback)")
+    st_parser.add_argument(
+        "--date", help="YYYY-MM-DD; defaults to yesterday in --tz",
+    )
+    st_parser.add_argument("--tz", default="Asia/Seoul")
+    st_parser.add_argument(
+        "--transcripts-home",
+        help="override base for ~/.claude/projects scan (the iso UID's home)",
+    )
+    st_parser.set_defaults(func=cmd_scan_transcripts)
 
     return parser
 
