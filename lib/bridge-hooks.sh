@@ -733,6 +733,39 @@ bridge_ensure_claude_tool_policy_hooks() {
   fi
 }
 
+# Issue #1923: hard-ban AskUserQuestion for EVERY Claude agent. Installs the
+# dedicated PreToolUse deny hook (the guaranteed mechanism under
+# `--dangerously-skip-permissions`) + the scoped `AskUserQuestion(*)` deny.
+# Same shared/local routing as the helpers above: shared mode mutates the
+# shared base file then relinks; local mode routes through
+# bridge_claude_local_hook_target_args so a dynamic-vanilla agent writes the
+# ban into <workdir>/.claude/settings.local.json (#1890 comms-only target) and
+# a static-local agent writes settings.json. This is the ONE AskUserQuestion
+# surface a vanilla agent gets — it does NOT depend on full tool-policy.
+bridge_ensure_claude_askuserquestion_ban() {
+  local workdir="$1"
+  local launch_cmd="${2-}"
+  local agent="${3-}"
+  if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
+    bridge_hooks_python ensure-askuserquestion-ban --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)" >/dev/null
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
+  else
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python ensure-askuserquestion-ban "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(bridge_hook_pinned_python_bin)"
+  fi
+}
+
+bridge_claude_askuserquestion_ban_status() {
+  local workdir="$1"
+  local agent="${2-}"
+  if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
+    bridge_hooks_python status-askuserquestion-ban --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+  else
+    local -a _ta=(); bridge_claude_local_hook_target_args "$workdir" _ta "$agent" || return 1
+    bridge_hooks_python status-askuserquestion-ban "${_ta[@]}" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+  fi
+}
+
 # Same shape as the five helpers above, but for the PreCompact event.
 # Issue #509 / PR #510 added the snapshot-on-pre-compact path; without
 # this entry on the upgrade-propagation loop, existing hosts that

@@ -658,6 +658,15 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   if ! bridge_ensure_claude_tool_policy_hooks "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
     bridge_die "Claude tool policy hook 설정에 실패했습니다: $WORK_DIR"
   fi
+  # Issue #1923: hard-ban AskUserQuestion for EVERY Claude agent (static AND
+  # dynamic vanilla). For a dynamic-vanilla agent this is the ONLY
+  # AskUserQuestion safety surface — it gets only comms hooks, not
+  # tool-policy.py's handle_askuserquestion (#1890), so its blocking picker
+  # would otherwise still render. The dedicated PreToolUse deny hook is the
+  # mechanism that survives --dangerously-skip-permissions.
+  if ! bridge_ensure_claude_askuserquestion_ban "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
+    bridge_die "Claude AskUserQuestion ban hook 설정에 실패했습니다: $WORK_DIR"
+  fi
   # Ensure HUD stdin tap is in place before the sudo-wrap so that linux-user
   # isolated agents get their isolated-home settings rendered from controller
   # context. bridge_ensure_hud_usage_tap installs the tap standalone when the

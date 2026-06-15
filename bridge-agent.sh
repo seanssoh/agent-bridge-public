@@ -2891,6 +2891,15 @@ expected = hooks.merge_settings(expected, overlay_payload)
 # report `needs-rerender` after a successful apply on every run.
 if hasattr(hooks, "_normalize_bridge_hook_paths") and hasattr(hooks, "_bridge_home_from_base_settings"):
     hooks._normalize_bridge_hook_paths(expected, hooks._bridge_home_from_base_settings(base_path))
+# Issue #1923: cmd_render_shared_settings applies a scoped
+# `permissions.deny: ["AskUserQuestion(*)"]` at the FINAL render invariant
+# (post-merge) as defense-in-depth for the AskUserQuestion hard-ban. Mirror it
+# into `expected` so the post-apply `effective_payload == expected` check stays
+# symmetric — without this every rerender reports `needs-rerender` forever after
+# a successful apply. Reuse the renderer's own helper + constant so the two stay
+# symmetric across future changes.
+if hasattr(hooks, "ensure_scoped_permission_deny") and hasattr(hooks, "ASKUSERQUESTION_SCOPED_DENY"):
+    hooks.ensure_scoped_permission_deny(expected, hooks.ASKUSERQUESTION_SCOPED_DENY)
 
 current_error = ""
 try:

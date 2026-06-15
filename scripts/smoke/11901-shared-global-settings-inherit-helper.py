@@ -258,7 +258,18 @@ def main(argv: list[str]) -> int:
         "mark-idle.sh" in stop_hook_cmd(eff)
         and "/Users/op/evil.sh" not in stop_hook_cmd(eff),
     )
-    _check("FILTER permissions dropped", "permissions" not in eff)
+    # #1923: the render now injects a bridge-managed
+    # `permissions.deny: ["AskUserQuestion(*)"]` at the final render invariant
+    # (the AskUserQuestion hard-ban defense-in-depth). The operator-global
+    # `permissions` content (here `allow: ["Bash(rm:*)"]`) must STILL be fully
+    # dropped by the safety filter — only the managed deny may appear.
+    _eff_perms = eff.get("permissions") or {}
+    _check(
+        "FILTER operator-global permissions.allow dropped (only managed deny remains)",
+        "allow" not in _eff_perms
+        and _eff_perms.get("deny") == ["AskUserQuestion(*)"],
+        detail=json.dumps(_eff_perms),
+    )
     _check("FILTER env dropped", "env" not in eff)
     _check("FILTER awsAuthRefresh dropped", "awsAuthRefresh" not in eff)
     _check(

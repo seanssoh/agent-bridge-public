@@ -481,6 +481,20 @@ def tool_policy_hook_command(bridge_home: Path, python_bin: str) -> str:
     return shell_command(python_bin, shell_path(hook_path))
 
 
+# Issue #1923: hard-ban AskUserQuestion for ALL bridge agents. The dedicated
+# standalone hook is the GUARANTEED mechanism under
+# `--dangerously-skip-permissions` (a PreToolUse `permissionDecision: deny`
+# fires before the permission-prompt system). It is the only AskUserQuestion
+# safety surface a dynamic-vanilla agent gets (#1890 = comms hooks only, no
+# tool-policy.py), and a belt-and-suspenders guard for hook-managed agents.
+ASKUSERQUESTION_SCOPED_DENY = "AskUserQuestion(*)"
+
+
+def askuserquestion_ban_hook_command(bridge_home: Path, python_bin: str) -> str:
+    hook_path = bridge_home / "hooks" / "askuserquestion-ban.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
 def pre_compact_hook_command(bridge_home: Path, python_bin: str) -> str:
     hook_path = bridge_home / "hooks" / "pre-compact.py"
     return shell_command(python_bin, shell_path(hook_path))
@@ -601,6 +615,10 @@ def is_prompt_guard_hook(command: str) -> bool:
 
 def is_tool_policy_hook(command: str) -> bool:
     return "tool-policy.py" in str(command)
+
+
+def is_askuserquestion_ban_hook(command: str) -> bool:
+    return "askuserquestion-ban.py" in str(command)
 
 
 def is_pre_compact_hook(command: str) -> bool:
@@ -813,6 +831,99 @@ def ensure_command_hook(
         save_json(settings_path, settings)
 
     return changed
+
+
+def ensure_scoped_permission_deny(settings: dict[str, Any], rule: str) -> bool:
+    """Append a scoped `permissions.deny` rule to an in-memory settings dict.
+
+    Issue #1923 defense-in-depth: a scoped deny like `AskUserQuestion(*)` is
+    documented to apply in EVERY permission mode (including bypassPermissions),
+    so it backs up the PreToolUse ban hook. This mutates the dict in place and
+    returns True iff it changed it; the caller `save_json`s afterward.
+
+    Applied at the FINAL render invariant (post-merge), NOT in
+    managed_claude_settings_defaults — `merge_settings` REPLACES lists, so a
+    base/overlay/preserved `permissions.deny` would clobber a default-only
+    entry. Careful, fail-loud editing (mirrors the #1890 local-settings
+    writer): create `permissions`/`permissions.deny` when the key is ABSENT;
+    append once when `deny` is a list; FAIL LOUD (SystemExit) on any present-
+    but-invalid shape — a non-dict `permissions` or a non-list `deny`,
+    INCLUDING an explicit JSON `null` (which is neither a dict nor a list) —
+    never clobber operator data. Idempotent: a no-op when present.
+    """
+    if "permissions" not in settings:
+        settings["permissions"] = {}
+    permissions = settings["permissions"]
+    if not isinstance(permissions, dict):
+        raise SystemExit(
+            "settings 'permissions' must be a JSON object to add the "
+            f"AskUserQuestion deny (got {_json_type_name(permissions)})"
+        )
+
+    if "deny" not in permissions:
+        permissions["deny"] = [rule]
+        return True
+    deny = permissions["deny"]
+    if not isinstance(deny, list):
+        raise SystemExit(
+            "settings 'permissions.deny' must be a JSON array to add the "
+            f"AskUserQuestion deny (got {_json_type_name(deny)})"
+        )
+    if rule in deny:
+        return False
+    deny.append(rule)
+    return True
+
+
+def _json_type_name(value: Any) -> str:
+    """Human-readable JSON type for fail-loud messages (so `null` reads as
+    `null` rather than Python's `NoneType`)."""
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
+def validate_scoped_permission_deny_shape(settings_path: Path) -> None:
+    """Fail loudly (without writing) if `permissions`/`permissions.deny` is
+    PRESENT but an invalid non-dict/non-list shape (operator data we must
+    never clobber). An explicit JSON `null` is invalid (not a dict/list).
+
+    Pre-flight for `cmd_ensure_askuserquestion_ban` so a fail-loud leaves the
+    file BYTE-for-byte untouched — the validation must run before any write
+    (the PreToolUse-hook write would otherwise mutate the file before the deny
+    step raised). A no-op when the shapes are valid or the keys are absent.
+    """
+    settings = ensure_settings_root(settings_path)
+    if "permissions" not in settings:
+        return
+    permissions = settings["permissions"]
+    if not isinstance(permissions, dict):
+        raise SystemExit(
+            "settings 'permissions' must be a JSON object to add the "
+            f"AskUserQuestion deny (got {_json_type_name(permissions)})"
+        )
+    if "deny" not in permissions:
+        return
+    deny = permissions["deny"]
+    if not isinstance(deny, list):
+        raise SystemExit(
+            "settings 'permissions.deny' must be a JSON array to add the "
+            f"AskUserQuestion deny (got {_json_type_name(deny)})"
+        )
+
+
+def ensure_scoped_permission_deny_file(settings_path: Path, rule: str) -> bool:
+    """Disk-backed wrapper around `ensure_scoped_permission_deny`.
+
+    Loads the settings root, applies the deny, and `save_json`s when changed.
+    Used for the local (settings.local.json) + shared base targets where the
+    ban is written directly rather than at a render's post-merge invariant.
+    """
+    settings = ensure_settings_root(settings_path)
+    if ensure_scoped_permission_deny(settings, rule):
+        save_json(settings_path, settings)
+        return True
+    return False
 
 
 def reorder_event_hook_before(
@@ -1196,6 +1307,76 @@ def cmd_ensure_tool_policy_hooks(args: argparse.Namespace) -> int:
         print("post_tool_use_hook: present")
         print("post_tool_failure_hook: present")
     return 0
+
+
+def cmd_ensure_askuserquestion_ban(args: argparse.Namespace) -> int:
+    """Issue #1923: install the AskUserQuestion hard-ban into a settings file.
+
+    Two parts, both idempotent:
+      1. a PreToolUse hook group `matcher: "AskUserQuestion"` -> the standalone
+         `hooks/askuserquestion-ban.py` deny hook (the guaranteed mechanism);
+      2. a scoped `permissions.deny` entry `AskUserQuestion(*)` (defense-in-
+         depth; unverified against live Claude Code — the hook is the SSOT).
+
+    Targets the file resolved by `resolve_settings_path` (--settings-file for a
+    dynamic-vanilla agent's settings.local.json or the shared base, --workdir
+    for a static managed settings.json).
+    """
+    bridge_home = Path(args.bridge_home).expanduser()
+    settings_path = resolve_settings_path(args)
+    desired_command = askuserquestion_ban_hook_command(bridge_home, args.python_bin)
+    # Pre-flight the deny shape BEFORE any write so an invalid operator
+    # `permissions`/`permissions.deny` fails loud with the file untouched
+    # (otherwise the PreToolUse-hook write below would mutate it first).
+    validate_scoped_permission_deny_shape(settings_path)
+    changed = ensure_command_hook(
+        settings_path,
+        "PreToolUse",
+        desired_command,
+        is_askuserquestion_ban_hook,
+        timeout=3,
+        additional_context=True,
+        group_matcher="AskUserQuestion",
+    )
+    changed = ensure_scoped_permission_deny_file(settings_path, ASKUSERQUESTION_SCOPED_DENY) or changed
+    payload = {
+        "HOOK_SETTINGS_FILE": str(settings_path),
+        "HOOK_STATUS": "updated" if changed else "unchanged",
+        "HOOK_STOP_HOOK": "",
+        "HOOK_PROMPT_HOOK": "",
+        "HOOK_COMMAND": desired_command,
+        "HOOK_ADDITIONAL_CONTEXT": "true",
+    }
+    print_payload(payload, args.format)
+    if args.format != "shell":
+        print("askuserquestion_ban_hook: present")
+        print(f"askuserquestion_scoped_deny: {ASKUSERQUESTION_SCOPED_DENY}")
+    return 0
+
+
+def cmd_status_askuserquestion_ban(args: argparse.Namespace) -> int:
+    settings_path = resolve_settings_path(args)
+    settings = ensure_settings_root(settings_path)
+    pre_hooks = hooks_list(settings, "PreToolUse")
+    _group, hook = find_command_hook(pre_hooks, is_askuserquestion_ban_hook)
+    permissions = settings.get("permissions")
+    deny = permissions.get("deny") if isinstance(permissions, dict) else None
+    deny_present = isinstance(deny, list) and ASKUSERQUESTION_SCOPED_DENY in deny
+    command = str(hook.get("command") or "") if hook else ""
+    present = bool(hook) and deny_present
+    payload = {
+        "HOOK_SETTINGS_FILE": str(settings_path),
+        "HOOK_STATUS": "present" if present else "missing",
+        "HOOK_STOP_HOOK": "",
+        "HOOK_PROMPT_HOOK": "",
+        "HOOK_COMMAND": command,
+        "HOOK_ADDITIONAL_CONTEXT": "",
+    }
+    print_payload(payload, args.format)
+    if args.format != "shell":
+        print(f"askuserquestion_ban_hook: {'present' if hook else 'missing'}")
+        print(f"askuserquestion_scoped_deny: {'present' if deny_present else 'missing'}")
+    return 0 if present else 1
 
 
 def codex_hooks_path(args: argparse.Namespace) -> Path:
@@ -2247,6 +2428,12 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     # plugins *after* the preserved merge so the sticky-false is repaired on
     # this rerender instead of being carried forward forever.
     _repair_sticky_false_channel_enables(merged, launch_cmd, str(effective_path), channels_csv)
+    # #1923: re-assert the AskUserQuestion scoped deny at the FINAL render
+    # invariant (post-merge + preserved-key pass). merge_settings REPLACES
+    # lists, so a base/overlay/preserved `permissions.deny` would otherwise
+    # clobber a managed-default entry; applying it here makes the effective
+    # file the authoritative fence (belt-and-suspenders behind the ban hook).
+    ensure_scoped_permission_deny(merged, ASKUSERQUESTION_SCOPED_DENY)
     save_json(effective_path, merged)
 
     # #1175: report-only `overlay_present` probe routes through the
@@ -2381,6 +2568,11 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # sticky-false (same trap as the shared renderer above) so an isolated
     # channel agent's inbound delivery is not silently dropped.
     _repair_sticky_false_channel_enables(merged, launch_cmd, str(effective_path), channels_csv)
+    # #1923: re-assert the AskUserQuestion scoped deny at the post-merge
+    # invariant (same rationale as the shared renderer — merge_settings
+    # replaces lists). The isolated home's effective file is the authoritative
+    # fence behind the PreToolUse ban hook.
+    ensure_scoped_permission_deny(merged, ASKUSERQUESTION_SCOPED_DENY)
 
     # 3. Atomic write of the effective file (mode 0644 so the isolated UID
     # can read it; ownership stays with whoever invoked us — controller
@@ -3420,6 +3612,23 @@ def build_parser() -> argparse.ArgumentParser:
     status_tool_policy_parser.add_argument("--python-bin", required=True)
     status_tool_policy_parser.add_argument("--format", choices=("text", "shell"), default="text")
     status_tool_policy_parser.set_defaults(handler=cmd_status_tool_policy_hooks)
+
+    # Issue #1923: AskUserQuestion hard-ban (PreToolUse deny hook + scoped deny).
+    ensure_auq_ban_parser = subparsers.add_parser("ensure-askuserquestion-ban")
+    ensure_auq_ban_parser.add_argument("--workdir")
+    ensure_auq_ban_parser.add_argument("--settings-file")
+    ensure_auq_ban_parser.add_argument("--bridge-home", required=True)
+    ensure_auq_ban_parser.add_argument("--python-bin", required=True)
+    ensure_auq_ban_parser.add_argument("--format", choices=("text", "shell"), default="text")
+    ensure_auq_ban_parser.set_defaults(handler=cmd_ensure_askuserquestion_ban)
+
+    status_auq_ban_parser = subparsers.add_parser("status-askuserquestion-ban")
+    status_auq_ban_parser.add_argument("--workdir")
+    status_auq_ban_parser.add_argument("--settings-file")
+    status_auq_ban_parser.add_argument("--bridge-home", required=True)
+    status_auq_ban_parser.add_argument("--python-bin", required=True)
+    status_auq_ban_parser.add_argument("--format", choices=("text", "shell"), default="text")
+    status_auq_ban_parser.set_defaults(handler=cmd_status_askuserquestion_ban)
 
     ensure_codex_parser = subparsers.add_parser("ensure-codex-hooks")
     ensure_codex_parser.add_argument("--codex-hooks-file")
