@@ -5604,6 +5604,7 @@ bridge_write_roster_status_snapshot() {
   local agent
   local active
   local wake
+  local wake_reason
   local channels
   local channel_reason
   local configured_channels
@@ -5613,12 +5614,17 @@ bridge_write_roster_status_snapshot() {
   local engine
   local recent
   local quarantined
+  local blocker_state
 
   {
-    echo -e "agent\tengine\tsession\tworkdir\tsource\tloop\tactive\twake\tchannels\tchannel_reason\tactivity_state\tconfigured_channels"
+    # Issue #1181: trailing `wake_reason` column appended in lockstep with the
+    # data row below. bridge-status.py reads via csv.DictReader, so a new
+    # trailing column is safe for existing fixed-position-free consumers.
+    echo -e "agent\tengine\tsession\tworkdir\tsource\tloop\tactive\twake\tchannels\tchannel_reason\tactivity_state\tconfigured_channels\twake_reason"
     for agent in "${BRIDGE_AGENT_IDS[@]}"; do
       active=0
       wake="-"
+      wake_reason=""
       channels="$(bridge_agent_channel_status "$agent")"
       channel_reason=""
       if [[ "$channels" == "miss" ]]; then
@@ -5661,11 +5667,17 @@ bridge_write_roster_status_snapshot() {
         if bridge_agent_requires_wake_channel "$agent"; then
           wake="ok"
           if [[ "$engine" == "claude" && -n "$recent" ]]; then
-            case "$(bridge_tmux_claude_blocker_state_from_text "$recent")" in
-              trust|summary)
-                wake="block"
-                ;;
-            esac
+            # Issue #1181: centralise the blocking-modal list in
+            # bridge_tmux_claude_blocker_state_is_block so it can't drift
+            # between this snapshot writer and bridge_agent_wake_status. A
+            # modal that owns the input pane (trust/summary plus the new
+            # feedback_survey/permission_grant/overwrite_confirm/context_pressure)
+            # means a nudge can't land → wake=block with the modal as the reason.
+            blocker_state="$(bridge_tmux_claude_blocker_state_from_text "$recent")"
+            if bridge_tmux_claude_blocker_state_is_block "$blocker_state"; then
+              wake="block"
+              wake_reason="$blocker_state"
+            fi
           fi
         fi
         # Issue #1317 Lane ν R2 + Lane κ #1319 (merged ν → κ rebase):
@@ -5697,7 +5709,7 @@ bridge_write_roster_status_snapshot() {
         fi
       fi
 
-      echo -e "${agent}\t${engine}\t${session}\t$(bridge_agent_workdir "$agent")\t$(bridge_agent_source "$agent")\t${loop_mode}\t${active}\t${wake}\t${channels}\t${channel_reason}\t${activity_state}\t${configured_channels}"
+      echo -e "${agent}\t${engine}\t${session}\t$(bridge_agent_workdir "$agent")\t$(bridge_agent_source "$agent")\t${loop_mode}\t${active}\t${wake}\t${channels}\t${channel_reason}\t${activity_state}\t${configured_channels}\t${wake_reason}"
     done
   } >"$file"
 }

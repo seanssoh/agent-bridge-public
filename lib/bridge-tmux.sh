@@ -430,7 +430,53 @@ bridge_tmux_claude_blocker_state_from_text() {
     return 0
   fi
 
+  # Issue #1181: post-session feedback survey ("How is Claude doing this
+  # session? ... 0: Dismiss"). Observed string from the affected install.
+  # While this modal owns the input pane the composer never consumes pasted
+  # nudges, so the agent goes silently deaf with activity_state=idle.
+  if [[ "$text" == *"How is Claude doing this session?"* && "$text" == *"0: Dismiss"* ]]; then
+    printf '%s' "feedback_survey"
+    return 0
+  fi
+
+  # Issue #1181: per-session permission grant. Best-guess signature; kept
+  # conservative (requires all three fragments) so a miss returns "none".
+  if [[ "$text" == *"Allow "* && "$text" == *"for this session?"* && "$text" == *"(y/n)"* ]]; then
+    printf '%s' "permission_grant"
+    return 0
+  fi
+
+  # Issue #1181: overwrite / create confirm. Best-guess signature; conservative.
+  if [[ "$text" == *"Overwrite?"* && "$text" == *"(y/n)"* ]]; then
+    printf '%s' "overwrite_confirm"
+    return 0
+  fi
+
+  # Issue #1181: auto-compact / context-pressure warning that needs an
+  # acknowledgement keystroke. Best-guess signature; conservative.
+  if [[ "$text" == *"context pressure"* && "$text" == *"Press Enter to"* ]]; then
+    printf '%s' "context_pressure"
+    return 0
+  fi
+
   printf '%s' "none"
+}
+
+# Issue #1181: single source of truth for "this blocker state owns the input
+# pane, so a nudge cannot be delivered — surface it as wake=block". Called from
+# BOTH the status-snapshot writer (bridge_write_roster_status_snapshot in
+# bridge-state.sh) and the agent-show/heartbeat path (bridge_agent_wake_status
+# in bridge-agents.sh) so the blocking-modal list cannot drift between the two
+# surfaces. devchannels is intentionally excluded: it has its own boot-time
+# allow_devchannels toggle + Claude-foreground advance dance and is meant to be
+# transient during agent boot, not surfaced as a persistent wake=block.
+bridge_tmux_claude_blocker_state_is_block() {
+  case "${1:-none}" in
+    trust|summary|feedback_survey|permission_grant|overwrite_confirm|context_pressure)
+      return 0
+      ;;
+  esac
+  return 1
 }
 
 bridge_tmux_claude_blocker_state() {

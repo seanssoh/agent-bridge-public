@@ -171,6 +171,13 @@ add_required 1897-ci-select-shard
 # (lib/bridge-agents.sh) are the surfaces. In the full static suite so any
 # channel/agent-surface edit re-runs it.
 add_required 1881-channel-enable-live-mcp-readiness
+# Issue #1181: modal-blocker detection (Layer 1). Spans lib/bridge-tmux.sh
+# (matcher + shared is_block predicate), lib/bridge-state.sh (snapshot
+# wake_reason column), lib/bridge-agents.sh (wake status), bridge-daemon.sh
+# (nudge-drop reason=modal_<state>), and bridge-status.py (wake_reason
+# surfaces). In the full static suite so any scripts/smoke/* move re-runs the
+# detection + status-surface contract.
+add_required 1181-modal-blocker-detect
 # Issue #1820: layout-v2 four-writer migration + gated v1->v2 reconciliation.
 # All eight verdict gates as smokes — cron/precompact/settings/doc-sync writer
 # fixes, the reconcile conflict policy + idempotence, the dry-run inventory and
@@ -902,6 +909,13 @@ select_for_path() {
         # detects/persists a codex session id. Pull 1899 on every bridge-state.sh
         # move so a refactor cannot regress the codex launch/resume contract.
         add_required 1899-dynamic-vanilla-codex
+        # Issue #1181: lib/bridge-state.sh's bridge_write_roster_status_snapshot
+        # now appends the trailing wake_reason column and routes the blocker
+        # state through the shared bridge_tmux_claude_blocker_state_is_block
+        # predicate. Pull the smoke on every bridge-state.sh move so a refactor
+        # cannot drop the wake_reason column (header/row lockstep) or revert the
+        # snapshot to the trust|summary-only wake=block arm.
+        add_required 1181-modal-blocker-detect
       fi
       ;;
 
@@ -974,6 +988,13 @@ select_for_path() {
       # bridge_agent_is_dynamic_vanilla_codex predicate — the boundary every
       # #1899 site gates on. Pull 1899 on every bridge-agents.sh move.
       add_required 1899-dynamic-vanilla-codex
+      # Issue #1181: lib/bridge-agents.sh's bridge_agent_wake_status now routes
+      # the agent-show / heartbeat wake decision through the shared
+      # bridge_tmux_claude_blocker_state_is_block predicate so it agrees with the
+      # snapshot writer. Pull the smoke on every bridge-agents.sh move so a
+      # refactor cannot revert it to the trust|summary-only case arm and let the
+      # two surfaces drift.
+      add_required 1181-modal-blocker-detect
       ;;
   esac
 
@@ -1233,6 +1254,13 @@ select_for_path() {
       # `/plugin enable` (SymlinkWriteRefused). Pull 1881 on every bridge-setup.sh
       # move so a refactor cannot drop the restart-name or the route-away.
       add_required 1881-channel-enable-live-mcp-readiness
+      # Issue #1181: bridge-status.py reads the trailing wake_reason snapshot
+      # column, emits it as a named --json field, and renders the "Wake Blocked"
+      # human block. Pull the smoke on every bridge-status.py move so a refactor
+      # cannot drop the wake_reason surfaces.
+      if [[ "$path" == "bridge-status.py" ]]; then
+        add_required 1181-modal-blocker-detect
+      fi
       add_integration integration-minimal
       ;;
 
@@ -2344,6 +2372,15 @@ select_for_path() {
       # daemon_escalation_task_create_failed audit + retry retention), or
       # (c) drop the patch-dev fallback / giveup→admin-task routing.
       add_required 1563-pr3-daemon-escalation
+      # Issue #1181: bridge-daemon.sh's nudge_agent_session now probes the live
+      # blocker state before emitting session_nudge_dropped and tags the audit
+      # row reason=modal_<state> (keeping submit_lost_post_grace reserved for the
+      # #331 composer race); the late-success sweep no longer pins to that one
+      # reason string. Pull the smoke on every bridge-daemon.sh move so a
+      # refactor cannot drop the modal-reason tagging.
+      if [[ "$path" == "bridge-daemon.sh" ]]; then
+        add_required 1181-modal-blocker-detect
+      fi
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -2824,6 +2861,14 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
         # Issue #1783: the idle-nonpicker smoke drives the same resolver
         # keystroke path (idle composers must never key); pull it too.
         add_required 1783-picker-idle-nonpicker
+        # Issue #1181: lib/bridge-tmux.sh hosts
+        # bridge_tmux_claude_blocker_state_from_text (the new feedback_survey /
+        # permission_grant / overwrite_confirm / context_pressure branches) and
+        # the shared bridge_tmux_claude_blocker_state_is_block predicate. Pull
+        # the smoke on every bridge-tmux.sh move so a refactor cannot drop a
+        # modal signature, regress the trailing none default, or let the
+        # is_block list drift from the snapshot/wake surfaces.
+        add_required 1181-modal-blocker-detect
       fi
       # Fleet-credential Phase 2 (#1470, Q6): bridge-run.sh's entry envelope
       # now active-scrubs the OpenAI-key / Codex-token ambient env vars and

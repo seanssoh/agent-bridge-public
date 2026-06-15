@@ -454,6 +454,33 @@ orphaned but harmless after migration (no symlink references it);
 operators may delete it manually after verifying the per-agent files
 exist and contain the expected `autoCompactWindow` value.
 
+### Feedback-survey modal and the blocker detector (v0.16.13+, issue #1181)
+
+Claude Code periodically draws a post-session rating modal
+(`How is Claude doing this session? ... 0: Dismiss`) into a long-running
+agent's input pane. While the modal owns the input, the composer never
+consumes pasted nudges, so the agent goes silently deaf even though it
+looks active+idle. The bridge now **detects** this class (and the
+per-session permission grant / overwrite-confirm / context-pressure
+modals): a blocked agent shows `wake=block` with a `wake_reason` on
+`agent-bridge status`, `status --json`, and `agent show`, and a dropped
+nudge records `session_nudge_dropped reason=modal_<state>` in the audit
+log. Detection is status/audit only — it does not send keys; dismissal
+stays an operator action (capture the pane, send `0`).
+
+Recommended noise-reduction config: set
+
+```sh
+export CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1
+```
+
+in `agent-roster.local.sh` (or the agent's `~/.claude/settings.json` `env`
+block) so the survey modal never renders for future Claude Code sessions on
+that host. Env wins over settings per Claude Code's resolution order and
+survives `agent-bridge upgrade --apply`. This removes the *survey* signature
+only; the detector above still covers the other modal classes. See
+`KNOWN_ISSUES.md` §37.
+
 ### promptSuggestionEnabled default (v0.7.x+, issue #630)
 
 `bridge-hooks.py render-shared-settings` writes a managed
