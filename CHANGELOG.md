@@ -22,7 +22,7 @@ version bumps via the `VERSION` file.
 ### CI / test-harness de-flaking
 
 - **daemon.sh loop-restart cold-boot — two facets closed (#1699).** Two chronic required-smoke flakes that forced reruns on otherwise-green PRs: (1) an accept-readiness TOCTOU — the readiness poll returned the instant the socket/pid files appeared, before the gateway listener was actually accepting; the poll now requires the same accept-proof the daemon itself requires. (2) a singleton-lock test-isolation race — the loop-restart test shared the daemon singleton flock with the preceding lifecycle test, and `kill`+`wait` did not guarantee flock release before the next spawn; the spawn now bounded-waits for the flock to free, and the diagnostic surfaces the daemon's `launchagent.log` exit record (which made the empty-`daemon_log` signature legible). Test-harness only.
-- **Canon-link resolver + smoke SIGPIPE/heredoc hardening (#1813).** Pure-bash `[[ == ]]` membership replaces a `printf | grep -q` here-string/pipe in a smoke, avoiding both the SIGPIPE-under-pipefail false-fail and the lint-heredoc-ban here-string flag.
+- **Canon shared-doc symlinks resolve correctly in layout-v2 agent homes (#1813).** `bridge-docs.py` now computes the canon shared-doc link target from the actual agent home to `shared/` for both v1 and v2 layouts, accepts already-correct absolute/relative links by realpath, scopes broken-link cleanup to bridge-managed shared-doc names, and the upgrade doc-sync path now targets v2 `<data_root>/agents/<agent>/home`. The related smoke was also hardened to avoid a SIGPIPE/pipefail + heredoc-ban false failure.
 
 ## [0.16.12] — 2026-06-15 (LTS)
 
