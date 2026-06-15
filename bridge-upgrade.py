@@ -32,6 +32,131 @@ MANAGED_CLAUDE_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
 # extract/refresh helpers below take delimiter args so the same logic
 # rerenders both blocks idempotently.
 
+# Issue #1817: the repo-root `CLAUDE.md` is the ~24 KB *contributor contract*
+# (release rules, codex pair-review workflow, iso-v2 boundary tables). On
+# layout v2 every agent workdir is a descendant of `BRIDGE_HOME`, so Claude
+# Code's ancestor `CLAUDE.md` loading injects that whole contract into every
+# agent session — including comms/ops agents that never edit source. The file
+# even says so itself ("If you are an operator ... this is the wrong file").
+# So the upgrader (a) skips the tracked root `CLAUDE.md` in the deploy
+# classifier and (b) substitutes a thin operator-facing stub at the live root
+# whenever the live file is still the *unmodified* bridge-managed contract.
+#
+# The #1 invariant is "never clobber an operator-customized CLAUDE.md". A loose
+# marker/heading match would fail it: an operator who took the deployed contract
+# and appended local notes still carries the markers but must be preserved. So
+# detection is EXACT-MATCH on content hash — only bytes that the bridge has
+# itself shipped to a live root count as "the managed contract". Any operator
+# edit (even one byte) changes the hash and is preserved.
+LIVE_ROOT_CLAUDE_MARKER = "<!-- agent-bridge: live-root operator stub (#1817) -->"
+# Frozen allowlist of sha256 of every distinct repo-root `CLAUDE.md` content the
+# bridge has shipped (one per distinct version of the tracked contributor
+# contract across the v0.1x release tags). The current-source contract hash is
+# added dynamically at call time (see `_managed_contract_sha256_set`) so a
+# freshly-cut contract version is recognized without editing this list. Exact
+# bytes only — an operator-edited copy never matches.
+KNOWN_CONTRACT_SHA256 = frozenset(
+    {
+        # v0.14.5-beta27 .. v0.15.0-beta3 (14,329 B)
+        "7acf7dd6989abc2581fe0bc8f43c5087af2dd01e1f9c92b00371be0c4a71cc8b",
+        # v0.15.0-beta4 .. beta5-2 (17,075 B)
+        "d23fde873a132d38f74f387ecb17c5f079a82a9d52b3a1e2527b0d1fbcdaf3cb",
+        # v0.15.0-beta5-3 .. v0.15.1 (21,365 B)
+        "e7e6c4a5e208f8a419df3888d42f67aa11beedcf4b882afa022d4b886ba0afcd",
+        # v0.15.2 .. v0.16.3 (22,300 B)
+        "b2c54809fbfbfba9173ed8446ce23c589b628f49cfc3bd197ed47c4abf4e3b80",
+        # v0.16.4 (24,287 B)
+        "35a019ba867c0621e72bc022efcb728b3a47dbe9496d7c439460bb1b8e5479d4",
+        # v0.16.5 .. v0.16.11 (24,495 B — the field 24,495-byte file in #1817)
+        "7938251cdc06c35a96ce37934bdd97b784063615ba2a101f33a438fe7a8ae861",
+        # Earlier distinct contract revisions observed in the v0.1x tag history.
+        "11608b008b6d750c5bb88cbca58c7759589ecd60efaca8cbe36ad2ac12ad453f",
+        "2f6c0663cb656e0df4e3b18f12894779107f0c6f09482e0c4331094c70c158f7",
+        "52f5c1ce5de1db43d0b2039d731ab1173eb0de57542cf1e00c2914398bfab789",
+        "b088ea7c778aff4e4c5d134b2cebcba0b13cecc682121c2d51160cf2b88ca60b",
+        "fc90ba800217a73d9aa5f6c03eab9f0cb275c1a9bf36ede314df4deeeb9d0dc9",
+    }
+)
+LIVE_ROOT_OPERATOR_STUB = """\
+# CLAUDE.md (live runtime root)
+
+{marker}
+
+This is the Agent Bridge **live runtime root** (`$BRIDGE_HOME`), not the source
+checkout. Agent sessions ancestor-load this file, so it is deliberately thin —
+the per-agent contract lives in each agent home's own `CLAUDE.md` /
+`COMMON-INSTRUCTIONS.md`, and the repo *contributor* contract lives only in the
+source checkout.
+
+- **Operators / agents at first wake**: read your agent home's `SOUL.md`,
+  `CLAUDE.md`, and `SESSION-TYPE.md`, then the shared docs under
+  `shared/` and `docs/agent-runtime/`. Do not treat this root file as your
+  operating manual.
+- **Contributors editing Agent Bridge source**: the full contributor contract
+  (source-vs-runtime boundaries, queue semantics, high-risk surfaces, release
+  rules) lives in the source checkout's repo-root `CLAUDE.md`
+  (`~/.agent-bridge-source` or wherever `AGENT_BRIDGE_SOURCE_DIR` points), not
+  here. Edit there and run `agb upgrade`.
+
+This stub is generated and refreshed by `agb upgrade`. Operator edits to this
+file are preserved across upgrades (the upgrader only replaces an unmodified
+bridge-managed contract, never an edited file).
+"""
+
+
+def _managed_contract_sha256_set(source_root: Path, upstream_ref: str = "") -> frozenset[str]:
+    """The set of content hashes that count as "the unmodified managed contract":
+    the frozen historical allowlist plus the contract this upgrade is shipping.
+    Adding the current contract hash means a freshly-cut contract version is
+    recognized without a code edit, while still requiring an EXACT byte match
+    (operator edits never match).
+
+    #1817 r2: "the contract this upgrade ships" is read via ``upstream_file_bytes``
+    so that on a dry-run ``--ref`` preview it is the *ref's* CLAUDE.md (the bytes
+    that would actually be deployed), not the checked-out working tree — making
+    the dry-run ``live_root_claude_action`` preview faithful to the requested ref.
+    On the apply path (``upstream_ref==""``) this is the working-tree read,
+    unchanged."""
+    try:
+        current_bytes = upstream_file_bytes(source_root, upstream_ref, "CLAUDE.md")
+    except OSError:
+        return KNOWN_CONTRACT_SHA256
+    if not current_bytes:  # None (path absent in the ref) or empty — never add an empty hash
+        return KNOWN_CONTRACT_SHA256
+    return KNOWN_CONTRACT_SHA256 | {sha256_bytes(current_bytes)}
+
+
+def render_live_root_operator_stub() -> bytes:
+    return LIVE_ROOT_OPERATOR_STUB.format(marker=LIVE_ROOT_CLAUDE_MARKER).encode("utf-8")
+
+
+def substitute_live_root_claude(source_root: Path, target_root: Path, dry_run: bool, upstream_ref: str = "") -> str | None:
+    """Issue #1817: keep the live-root `CLAUDE.md` a thin operator stub.
+
+    Returns the action taken ("created" | "substituted") or None when the live
+    file is operator-customized / already a stub (left untouched). Only a file
+    whose content hash EXACTLY matches a bridge-shipped contract is replaced —
+    an operator-edited CLAUDE.md (any byte changed, or the generated stub) is
+    never overwritten.
+    """
+    live_path = target_root / "CLAUDE.md"
+    live = live_path.read_bytes() if live_path.exists() else None  # noqa: raw-pathlib-controller-only
+    if live is None:
+        # Fresh install: the tracked contract is skipped in should_skip_relpath,
+        # so seed the operator stub so the live root is never empty.
+        if not dry_run:
+            write_bytes(live_path, render_live_root_operator_stub(), 0o644)
+        return "created"
+    if LIVE_ROOT_CLAUDE_MARKER.encode("utf-8") in live:
+        # Already the generated stub — leave it (idempotent re-run).
+        return None
+    if sha256_bytes(live) not in _managed_contract_sha256_set(source_root, upstream_ref):
+        # Operator-customized file (or an unrecognized variant) — preserve it.
+        return None
+    if not dry_run:
+        write_bytes(live_path, render_live_root_operator_stub(), 0o644)
+    return "substituted"
+
 
 def emit_json(payload: Any, rc: int = 0, *, indent: int | None = 2) -> int:
     """Emit a command's JSON payload to stdout, BrokenPipe-safe (Issue #1660).
@@ -528,7 +653,11 @@ def read_upstream_version(source_root: Path, upstream_ref: str) -> str:
 
 
 def should_skip_relpath(relpath: str) -> bool:
-    if relpath in {"agent-roster.local.sh"}:
+    # Issue #1817: the tracked root `CLAUDE.md` is the contributor contract and
+    # must NOT land at the live root (it would ancestor-inject into every agent
+    # session). The deploy classifier skips it; `substitute_live_root_claude`
+    # then maintains a thin operator stub there instead.
+    if relpath in {"agent-roster.local.sh", "CLAUDE.md"}:
         return True
     for prefix in ("logs/", "shared/", "state/", "backups/", "worktrees/"):
         if relpath.startswith(prefix):
@@ -3167,6 +3296,11 @@ def apply_live(
             }
         )
 
+    # Issue #1817: the tracked root `CLAUDE.md` is skipped by the deploy
+    # classifier; decide the live-root operator-stub action here (detection
+    # only — no write — so the dry-run preview is faithful) and surface it.
+    live_root_claude_action = substitute_live_root_claude(source_root, target_root, dry_run=True, upstream_ref=upstream_ref)
+
     payload = {
         "mode": "upgrade-apply",
         "source_root": str(source_root),
@@ -3178,6 +3312,7 @@ def apply_live(
         "counts": counts,
         "conflicts": conflicts,
         "conflict_backups": conflict_backups,
+        "live_root_claude_action": live_root_claude_action,
         "actions": [
             {
                 "path": action["path"],
@@ -3222,6 +3357,12 @@ def apply_live(
         if kind == "merge_conflict":
             write_bytes(Path(action["conflict_backup_path"]), action["conflict_bytes"])
         write_bytes(live_path, action["bytes"], target_mode)
+
+    # Issue #1817: now that the tracked payload has landed, maintain the thin
+    # operator stub at the live root. Re-detect against the on-disk file (the
+    # earlier call was dry-run) so a contract is substituted, a missing file is
+    # seeded, and an operator-customized CLAUDE.md is left untouched.
+    payload["live_root_claude_action"] = substitute_live_root_claude(source_root, target_root, dry_run=False)
 
     payload["applied"] = True
 
