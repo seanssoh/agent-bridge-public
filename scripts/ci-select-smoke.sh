@@ -170,6 +170,12 @@ add_required 1881-channel-enable-live-mcp-readiness
 # post-apply source invariant. In the full static suite so any writer or
 # reconcile edit re-runs the whole matrix.
 add_required 1820-cron-writer-v2-candidate 1820-precompact-resolved-env-v2 1820-settings-v2-render-symlink 1820-doc-sync-v2-target-root 1820-reconcile-conflict-policy 1820-reconcile-dryrun-inventory 1820-reconcile-apply-gated 1820-post-apply-invariant 1820-upgrade-reconcile-fail-closed
+# Issue #1905: bridge-upgrade.sh's #1820 reconcile quiesce is now systemd-aware —
+# it stops agent-bridge-daemon.service + agent-bridge-daemon-liveness.timer via
+# systemctl so systemd cannot respawn the daemon back into the fail-closed fence
+# (and restores them on the restart phase). In the full static suite so any
+# upgrade-quiesce/restart-phase edit re-runs the systemd-aware guard.
+add_required 1905-upgrade-systemd-quiesce-respawn
 # rc2 fleet-soak observability hardening for the #1820 reconcile/upgrade path:
 # the reconcile ALWAYS writes a structured result at the canonical
 # state/migration/layout-v2-reconcile/last-apply.json (status noop|applied,
@@ -3996,7 +4002,7 @@ add_required launch launch-dev-channels-injection tmux-injection upgrade-source-
       # workdir copies must stay in the targeted backup set. Pull the focused
       # smoke on every upgrade-entry move so the state-vs-doc split, the
       # preserved_paths plumbing, and the backup-set coverage stay pinned.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver upgrade-migrate-rematerialize-workdir 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1635-iso-backup-perm-skip 1638-settings-cosmetic-conflict 1636-rematerialize-scaffolding 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve lts-channel-sticky-resolver 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1786-tasksdb-doctor-verb 1809-agents-md-backfill 1892-doc-backfill-engine-fail-closed 1855-keychain-free-backfill
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task phase2-install-tree-reconciler phase3-agent-home-contract α-beta5-upgrade-backfill-normalize gamma-beta5-reconcile-helper-status beta5-2-theta-upgrade-backfill-perms beta5-2-mu-cron-channel-creds codex-version-surface codex-doctor 1516-upgrade-downgrade-guard 1612-upgrade-restart-receiver upgrade-migrate-rematerialize-workdir 1602-dryrun-ref-fidelity 1601-conflicts-adopt-guard 1611-migrate-orphan-skip 1613-wiki-mention-fence-indent 1635-iso-backup-perm-skip 1638-settings-cosmetic-conflict 1636-rematerialize-scaffolding 1660-upgrade-emit-brokenpipe 1661-upgrade-singleton-lock 1662-upgrade-complete-marker 1670-rematerialize-dryrun-agent-preserved 1781-doc-migration-memory-preserve lts-channel-sticky-resolver 1567-codex-orphan-upgrade-reaper 1675-1694-settings-homebrew-abspath-conflict 1786-tasksdb-doctor-verb 1809-agents-md-backfill 1892-doc-backfill-engine-fail-closed 1905-upgrade-systemd-quiesce-respawn 1855-keychain-free-backfill
       add_integration integration-minimal
       ;;
 
