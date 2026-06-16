@@ -3,6 +3,15 @@
 
 SMOKE_LIB_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SMOKE_REPO_ROOT="$(cd -P "$SMOKE_LIB_DIR/../.." && pwd -P)"
+
+# Fleet-down guard: force a PRIVATE tmux socket universe (and sever an inherited
+# live `$TMUX`) before any smoke that touches tmux runs. A smoke run from inside
+# an agent's tmux pane would otherwise tear down the shared default tmux server
+# and down the whole fleet (2026-06-16 incident). Sourced here so every smoke
+# that uses this lib is isolated; the orchestrators source it too.
+# shellcheck source=../../lib/bridge-smoke-tmux-isolation.sh
+source "$SMOKE_REPO_ROOT/lib/bridge-smoke-tmux-isolation.sh"
+
 SMOKE_NAME="${SMOKE_NAME:-$(basename "$0" .sh)}"
 SMOKE_TMP_ROOT="${SMOKE_TMP_ROOT:-}"
 

@@ -5,6 +5,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
 
+# Fleet-down guard FIRST — this harness is destructive (stops daemons, runs
+# `tmux kill-session`/teardown). Force a private tmux socket + sever an inherited
+# live `$TMUX` before anything else, so a run from inside an agent's tmux pane
+# cannot tear down the shared default server and down the whole fleet (the
+# 2026-06-16 incident). Must precede every tmux op below.
+# shellcheck source=../lib/bridge-smoke-tmux-isolation.sh
+source "$REPO_ROOT/lib/bridge-smoke-tmux-isolation.sh"
+
 # shellcheck source=../lib/bridge-session-patterns.sh
 source "$REPO_ROOT/lib/bridge-session-patterns.sh"
 
