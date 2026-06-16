@@ -46,6 +46,20 @@ def main() -> int:
         "updated_at": os.environ.get("BRIDGE_BIND_UPDATED", "").strip(),
     }
 
+    # #1738 r5 FIX C: record the OS UID that the bound agent's pane process runs
+    # as, resolved by the CONTROLLER (`bridge_publish_config_caller_binding`)
+    # from the bound agent's OS user. `bridge-config.py` re-resolves the live
+    # pane PID's owner UID and requires it to equal this value — an attacker on
+    # linux-user isolation runs as a different OS user and cannot own a process
+    # as the admin UID, so a forged/camped "live" pid is rejected at the kernel
+    # boundary. Only an INTEGER value is recorded; a missing / non-integer input
+    # is omitted, and the wrapper then falls back to the caller's own euid (the
+    # safe shared-UID value). The record is controller-owned on iso, so the
+    # value is not agent-forgeable.
+    raw_owner_uid = os.environ.get("BRIDGE_BIND_OWNER_UID", "").strip()
+    if raw_owner_uid.lstrip("-").isdigit():
+        record["owner_uid"] = int(raw_owner_uid)
+
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(record, fh, ensure_ascii=True, sort_keys=True)
         fh.write("\n")

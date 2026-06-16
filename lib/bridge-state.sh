@@ -1831,6 +1831,38 @@ bridge_config_caller_binding_file() {
   printf '%s/%s.json' "$(bridge_config_caller_bindings_dir)" "$agent"
 }
 
+# #1738 r5 FIX C: resolve the OS UID that $1=agent's pane process runs as, so
+# the binding record can pin the expected pane owner. On linux-user isolation
+# the agent runs as `agent-bridge-<agent>` (a distinct OS user) — we map its
+# username to a UID via `id -u`. On shared-UID (no iso) the agent runs as the
+# controller, so we record the controller's own UID. The wrapper requires the
+# live pane PID's owner UID to equal this value; an attacker cannot own a
+# process as the admin UID, so a forged "live" pid is rejected at the kernel
+# boundary. Prints the UID on stdout (empty if unresolvable — the writer then
+# omits owner_uid and the wrapper falls back to the caller's euid, the safe
+# shared-UID value).
+bridge_config_caller_pane_owner_uid() {
+  local agent="$1" os_user="" uid=""
+  if command -v bridge_agent_os_user >/dev/null 2>&1; then
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+  fi
+  if [[ -n "$os_user" ]]; then
+    uid="$(id -u "$os_user" 2>/dev/null || true)"
+    if [[ "$uid" =~ ^[0-9]+$ ]]; then
+      printf '%s' "$uid"
+      return 0
+    fi
+  fi
+  # Shared-UID (or unresolved iso user): the pane runs as the controller. Prefer
+  # the recorded controller UID, else this process's own euid.
+  if [[ "${BRIDGE_CONTROLLER_UID:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$BRIDGE_CONTROLLER_UID"
+    return 0
+  fi
+  uid="$(id -u 2>/dev/null || true)"
+  [[ "$uid" =~ ^[0-9]+$ ]] && printf '%s' "$uid"
+}
+
 # Publish (or refresh) the binding for $1=agent given $2=pane_pid, $3=engine.
 # pane_pid must be a positive integer; a non-integer is a no-op (the wrapper
 # treats a missing/stale binding as fail-closed, so a failed publish denies
@@ -1839,7 +1871,7 @@ bridge_publish_config_caller_binding() {
   local agent="$1"
   local pane_pid="$2"
   local engine="${3:-}"
-  local bindings_dir="" target="" tmp="" admin="" session="" updated_at=""
+  local bindings_dir="" target="" tmp="" admin="" session="" updated_at="" owner_uid=""
 
   [[ -n "$agent" ]] || return 0
   [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 0
@@ -1853,6 +1885,7 @@ bridge_publish_config_caller_binding() {
   admin="$(bridge_admin_agent_id 2>/dev/null || true)"
   session="$(bridge_agent_session "$agent" 2>/dev/null || true)"
   updated_at="$(bridge_now_iso 2>/dev/null || true)"
+  owner_uid="$(bridge_config_caller_pane_owner_uid "$agent" 2>/dev/null || true)"
   target="$(bridge_config_caller_binding_file "$agent")"
   tmp="${target}.tmp.$$"
 
@@ -1865,6 +1898,7 @@ bridge_publish_config_caller_binding() {
      BRIDGE_BIND_PANE_PID="$pane_pid" \
      BRIDGE_BIND_ENGINE="$engine" \
      BRIDGE_BIND_UPDATED="$updated_at" \
+     BRIDGE_BIND_OWNER_UID="$owner_uid" \
      BRIDGE_BIND_TMP="$tmp" \
      python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/config-caller-binding-write.py"; then
     if mv -f "$tmp" "$target" 2>/dev/null; then

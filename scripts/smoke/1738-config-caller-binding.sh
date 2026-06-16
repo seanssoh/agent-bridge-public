@@ -616,6 +616,154 @@ else
 fi
 
 # ===========================================================================
+# SECTION 6c — WRAPPER: #1738 r5 FIX B (env ALLOWLIST kills loader injection).
+#
+# The r3/r4 probe built its child env as a DENYLIST (strip only TMUX*), so the
+# dynamic-linker preload hooks DYLD_INSERT_LIBRARIES / DYLD_* (macOS) and
+# LD_PRELOAD / LD_* (Linux) PASSED THROUGH — an attacker preloads a
+# connect()-interpose library into the ABSOLUTE tmux (homebrew tmux is
+# adhoc-signed; /usr/bin/tmux honors LD_PRELOAD) and redirects its socket to a
+# private server returning a forged #{pane_pid}. r5 rebuilds the probe env as a
+# strict ALLOWLIST (`_clean_probe_env`): only HOME/USER/LOGNAME/LANG/LC_* survive;
+# every loader/preload AND TMUX* var is dropped by construction.
+#
+# TEETH (non-vacuous): export DYLD_INSERT_LIBRARIES + DYLD_LIBRARY_PATH +
+# LD_PRELOAD + LD_LIBRARY_PATH + TMUX + TMUX_TMPDIR, then call _clean_probe_env
+# and assert NONE of them appear in the returned env while a benign LANG DOES.
+# A DENYLIST (old code) would leave every DYLD_*/LD_* var present, failing this.
+# ===========================================================================
+
+CLEAN_ENV_DUMP="$(
+  DYLD_INSERT_LIBRARIES=/tmp/x.dylib \
+  DYLD_LIBRARY_PATH=/tmp/x \
+  LD_PRELOAD=/tmp/x.so \
+  LD_LIBRARY_PATH=/tmp/x \
+  TMUX=/tmp/tmux-9/default,1,0 \
+  TMUX_TMPDIR=/tmp/attacker \
+  LANG=en_US.UTF-8 \
+  "$PYTHON_BIN" -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("bc", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+env = m._clean_probe_env()
+for k in sorted(env):
+    print(k)
+' "$WRAPPER" 2>/dev/null || true
+)"
+for forbidden in DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH LD_PRELOAD LD_LIBRARY_PATH TMUX TMUX_TMPDIR; do
+  if printf '%s\n' "$CLEAN_ENV_DUMP" | grep -qx "$forbidden"; then
+    smoke_fail "FIX B: '$forbidden' survived into the probe child env (denylist regression — injection seam open)"
+  fi
+done
+# Anti-vacuous: a benign allowlisted var MUST survive (proves _clean_probe_env is
+# not just returning an empty dict, which would also pass the forbidden checks).
+if ! printf '%s\n' "$CLEAN_ENV_DUMP" | grep -qx "LANG"; then
+  smoke_fail "FIX B: allowlisted LANG did NOT survive — _clean_probe_env is over-stripping (tooth would be vacuous)"
+fi
+smoke_log "ok: FIX B probe env is an ALLOWLIST — DYLD_*/LD_*/TMUX* dropped, LANG kept"
+
+# ===========================================================================
+# SECTION 6d — WRAPPER: #1738 r5 FIX C (live pane must be OWNED by admin UID).
+#
+# On iso the liveness probe queries the attacker's OWN per-EUID default tmux
+# server and can be fed a forged/camped pane_pid that matches the bound
+# pane_pid. r5 closes this at the kernel boundary: the live pane PID's process
+# OWNER UID must equal the admin agent's expected OS UID (`owner_uid`, recorded
+# by the controller in the controller-owned record). An attacker runs as a
+# DIFFERENT OS user and cannot own a process as the admin UID.
+#
+# We unit-test `_binding_session_is_live` directly (it owns both the liveness +
+# owner checks): seed a record for the REAL live session + REAL pane_pid (so
+# liveness resolves), and vary the recorded `owner_uid`.
+#   - owner_uid == the live pane's REAL owner (this caller's uid)  -> live=True
+#   - owner_uid == a NON-admin uid (the live pane is NOT owned by it) -> live=False
+# TEETH (non-vacuous): without the owner check BOTH cases return True (liveness
+# alone passes); the FIX makes the mismatched-owner case return False (DENY).
+# ===========================================================================
+
+if [[ "${SMOKE_CONFIG_CALLER_LIVE_OK:-0}" == "1" ]]; then
+  SELF_UID="$(id -u)"
+  # A uid that is NOT this caller's (so the live pane is provably not owned by
+  # it): 0 if we are non-root, else 1.
+  if [[ "$SELF_UID" != "0" ]]; then WRONG_UID=0; else WRONG_UID=1; fi
+  fixc_is_live() {
+    # $1 = owner_uid to record. Prints "True"/"False" from _binding_session_is_live.
+    "$PYTHON_BIN" -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("bc", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+rec = {
+    "session": sys.argv[2],
+    "pane_pid": int(sys.argv[3]),
+    "owner_uid": int(sys.argv[4]),
+}
+print(m._binding_session_is_live(rec))
+' "$WRAPPER" "$SMOKE_LIVE_SESSION" "$SMOKE_LIVE_PANE_PID" "$1" 2>/dev/null || printf 'ERR'
+  }
+  # Positive control: owner_uid matches the live pane's REAL owner -> live.
+  fixc_match="$(fixc_is_live "$SELF_UID")"
+  smoke_assert_eq "True" "$fixc_match" \
+    "FIX C: live pane owned by recorded owner_uid -> session is live (positive control)"
+  # Teeth: owner_uid is a uid the live pane is NOT owned by -> NOT live (DENY).
+  fixc_mismatch="$(fixc_is_live "$WRONG_UID")"
+  smoke_assert_eq "False" "$fixc_mismatch" \
+    "FIX C: live pane NOT owned by recorded owner_uid -> session NOT live (forged/camped pid rejected)"
+  smoke_log "ok: FIX C owner check — pane owner UID must equal recorded owner_uid (kernel boundary)"
+
+  # FIX C codex-r5 BLOCKER closure: a record MISSING owner_uid must FAIL CLOSED
+  # on an iso (foreign-owned) store — the geteuid() fallback would otherwise let
+  # an iso attacker pass by parking a PID they own (owner == their euid). The
+  # fallback is allowed ONLY on a caller-WRITABLE (shared-UID) store. We unit-test
+  # _expected_pane_owner_uid against a record with a _source_path in a store of
+  # each ownership shape.
+  fixc_expected_uid() {
+    # $1 = bindings-dir to use for the store-writability probe (BRIDGE_STATE_DIR
+    # selects config_caller_bindings_dir). Prints the resolved expected uid or
+    # "None". The record carries NO owner_uid (the legacy/missing case).
+    BRIDGE_STATE_DIR="$1" "$PYTHON_BIN" -c '
+import importlib.util, sys, os
+spec = importlib.util.spec_from_file_location("bc", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+src = os.path.join(os.environ["BRIDGE_STATE_DIR"], "config-caller-bindings", "patch.json")
+rec = {"session": "s", "pane_pid": 1, "_source_path": src}
+print(m._expected_pane_owner_uid(rec))
+' "$WRAPPER" 2>/dev/null || printf 'ERR'
+  }
+  # Shared-UID (caller-owned store): missing owner_uid -> geteuid() fallback (our
+  # own uid), NOT None (so a legacy shared-UID record is not spuriously denied).
+  MISS_SHARED="$(fixc_expected_uid "$BRIDGE_STATE_DIR")"
+  smoke_assert_eq "$SELF_UID" "$MISS_SHARED" \
+    "FIX C: missing owner_uid on caller-owned (shared-UID) store -> geteuid() fallback"
+  # Iso (foreign-owned store): missing owner_uid MUST fail closed (-> None), so an
+  # attacker cannot ride a legacy record with a self-owned camped pid. Needs sudo
+  # to fabricate a foreign-owned store; skipped (logged) where unavailable.
+  FOREIGN_STATE="$SMOKE_TMP_ROOT/fixc-foreign-state"
+  mkdir -p "$FOREIGN_STATE/config-caller-bindings"
+  printf '{"version":1}\n' >"$FOREIGN_STATE/config-caller-bindings/patch.json"
+  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    foreign_owner="nobody"; id nobody >/dev/null 2>&1 || foreign_owner="1"
+    if sudo -n chown -R "$foreign_owner" "$FOREIGN_STATE/config-caller-bindings" 2>/dev/null; then
+      sudo -n chmod 0711 "$FOREIGN_STATE/config-caller-bindings" 2>/dev/null || true
+      sudo -n chmod 0644 "$FOREIGN_STATE/config-caller-bindings/patch.json" 2>/dev/null || true
+      MISS_ISO="$(fixc_expected_uid "$FOREIGN_STATE")"
+      smoke_assert_eq "None" "$MISS_ISO" \
+        "FIX C: missing owner_uid on foreign-owned (iso) store -> FAIL CLOSED (None, not geteuid())"
+      smoke_log "ok: FIX C missing-owner_uid fails closed on a foreign (iso) store (codex-r5 BLOCKER closed)"
+      sudo -n chown -R "$SELF_UID" "$FOREIGN_STATE/config-caller-bindings" 2>/dev/null || true
+    else
+      smoke_log "skip: FIX C foreign-store missing-owner_uid tooth (sudo chown failed)"
+    fi
+  else
+    smoke_log "skip: FIX C foreign-store missing-owner_uid tooth (no passwordless sudo) — shared-UID fallback tooth still ran"
+  fi
+else
+  smoke_log "skip: FIX C owner-check cases (no real tmux live session available)"
+fi
+
+# ===========================================================================
 # SECTION 7 — DAEMON PRUNE: #1738 r3 FIX 3 (false-delete / fleet self-DoS).
 #
 # `bridge_daemon_prune_orphan_config_caller_bindings` r2 deleted a binding
@@ -659,8 +807,37 @@ bridge_agent_session() { :; }
 bridge_agent_engine() { :; }
 bridge_tmux_session_pane_pid() { :; }
 bridge_admin_agent_id() { printf '%s' "$ADMIN_AGENT"; }
-bridge_audit_log() { :; }
-daemon_info() { :; }
+# #1738 r5 FIX C: the self-heal resolves the EXPECTED pane-owner UID for the
+# agent via this helper (records it into the binding + checks the present
+# record's owner_uid against it). Shim it to a fixed test UID so the present-
+# record stale-check + the FIX C backfill path are deterministic.
+PRUNE_OWNER_UID="12345"
+bridge_config_caller_pane_owner_uid() { printf '%s' "$PRUNE_OWNER_UID"; }
+# #1738 r5 FIX B: the prune fn calls bridge_daemon_scrub_probe_env (not sliced
+# out — the slicer emits only the prune fn). Shim it to the real scrub behaviour
+# so the smoke's `tmux` shell-function shadow is still reachable inside the
+# subshell (the helper only `unset`s vars, never execs).
+bridge_daemon_scrub_probe_env() {
+  local _v=""
+  unset TMUX TMUX_PANE TMUX_TMPDIR 2>/dev/null || true
+  for _v in $(compgen -v 2>/dev/null); do
+    case "$_v" in
+      DYLD_*|LD_*) unset "$_v" 2>/dev/null || true ;;
+    esac
+  done
+}
+# #1738 r5 FIX A tooth: record each daemon audit EVENT + each daemon_info line so
+# the self-heal teeth can assert WHICH outcome (healed vs failed) was emitted —
+# a bare file-exists check cannot tell a verified heal from a false one.
+PRUNE_AUDIT_EVENTS="$SMOKE_TMP_ROOT/prune-audit-events.log"
+PRUNE_INFO_LINES="$SMOKE_TMP_ROOT/prune-info-lines.log"
+: >"$PRUNE_AUDIT_EVENTS"
+: >"$PRUNE_INFO_LINES"
+bridge_audit_log() {
+  # argv: <actor> <event> <subject> [--detail k=v ...]; record the event name.
+  printf '%s\n' "${2:-}" >>"$PRUNE_AUDIT_EVENTS"
+}
+daemon_info() { printf '%s\n' "${1:-}" >>"$PRUNE_INFO_LINES"; }
 BRIDGE_AGENT_IDS=()
 PRUNE_TMUX_MODE="server-up"
 tmux() {
@@ -725,8 +902,11 @@ bridge_agent_session() { [[ "$1" == "$ADMIN_AGENT" ]] && printf '%s' "$PRUNE_LIV
 bridge_tmux_session_pane_pid() { printf '54321'; }
 bridge_agent_engine() { printf 'claude'; }
 bridge_publish_config_caller_binding() {
-  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"engine":"%s","updated_at":"healed"}\n' \
-    "$1" "$1" "$PRUNE_LIVE_SESSION" "$2" "$3" >"$PRUNE_BD/$1.json"
+  # Mirror the real publisher: record owner_uid (the FIX C field) so the
+  # self-heal's post-publish verification (which now also checks owner_uid)
+  # sees a CURRENT record.
+  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"owner_uid":%s,"engine":"%s","updated_at":"healed"}\n' \
+    "$1" "$1" "$PRUNE_LIVE_SESSION" "$2" "$PRUNE_OWNER_UID" "$3" >"$PRUNE_BD/$1.json"
 }
 # Binding is MISSING (live session, but no record) — self-heal must re-create it.
 run_prune "server-up"
@@ -756,13 +936,14 @@ else
   smoke_fail "prune SELF-HEAL did not repair a present record with a stale pane_pid (FIX 3 regressed)"
 fi
 
-# 7f. A PRESENT and CURRENT record (correct pane_pid + agent + admin) must be
-#     LEFT UNTOUCHED — no churn, no rewrite. Seed it already-current (pane_pid
-#     54321 = the live shim value, updated_at sentinel 'current') and assert the
-#     self-heal does NOT overwrite it with the 'healed' marker.
+# 7f. A PRESENT and CURRENT record (correct pane_pid + agent + admin + owner_uid)
+#     must be LEFT UNTOUCHED — no churn, no rewrite. Seed it already-current
+#     (pane_pid 54321 = the live shim value, owner_uid = the expected shim value,
+#     updated_at sentinel 'current') and assert the self-heal does NOT overwrite
+#     it with the 'healed' marker.
 clear_bindings
-printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":54321,"engine":"claude","updated_at":"current"}\n' \
-  "$ADMIN_AGENT" "$ADMIN_AGENT" "$PRUNE_LIVE_SESSION" >"$PRUNE_BD/$ADMIN_AGENT.json"
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":54321,"owner_uid":%s,"engine":"claude","updated_at":"current"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$PRUNE_LIVE_SESSION" "$PRUNE_OWNER_UID" >"$PRUNE_BD/$ADMIN_AGENT.json"
 run_prune "server-up"
 if grep -q '"updated_at":"current"' "$PRUNE_BD/$ADMIN_AGENT.json" \
    && ! grep -q '"updated_at":"healed"' "$PRUNE_BD/$ADMIN_AGENT.json"; then
@@ -771,16 +952,85 @@ else
   smoke_fail "prune SELF-HEAL rewrote a present-and-current binding (false churn)"
 fi
 
-# A persistent publish FAILURE must NOT churn (binding stays absent, no false heal).
+# 7f2. #1738 r5 FIX C BACKFILL (codex r5 r2 finding): a PRESENT record that
+#      matches pane_pid + agent + admin but LACKS owner_uid (a legacy / pre-r5
+#      record) must be treated as stale and REPUBLISHED so owner_uid is backfilled
+#      — otherwise the wrapper (which fails closed on a missing owner_uid on iso)
+#      would deny the admin's config-set indefinitely until some unrelated
+#      republish. Seed a record with the right pane_pid/agent/admin but NO
+#      owner_uid and assert the self-heal rewrites it (healed marker + owner_uid
+#      now present). Non-vacuous: without the owner_uid arm in the present-record
+#      skip, this record matches the 3 legacy fields -> skipped -> never backfilled.
 clear_bindings
+: >"$PRUNE_AUDIT_EVENTS"
+bridge_publish_config_caller_binding() {
+  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"owner_uid":%s,"engine":"%s","updated_at":"healed"}\n' \
+    "$1" "$1" "$PRUNE_LIVE_SESSION" "$2" "$PRUNE_OWNER_UID" "$3" >"$PRUNE_BD/$1.json"
+}
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":54321,"engine":"claude","updated_at":"legacy-no-owner"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$PRUNE_LIVE_SESSION" >"$PRUNE_BD/$ADMIN_AGENT.json"
+run_prune "server-up"
+if grep -q '"updated_at":"healed"' "$PRUNE_BD/$ADMIN_AGENT.json" \
+   && grep -q "\"owner_uid\":$PRUNE_OWNER_UID" "$PRUNE_BD/$ADMIN_AGENT.json" \
+   && grep -q '^config_caller_binding_self_healed$' "$PRUNE_AUDIT_EVENTS"; then
+  smoke_log "ok: FIX C BACKFILL — legacy record lacking owner_uid is republished with owner_uid (no indefinite fail-closed)"
+else
+  smoke_fail "FIX C BACKFILL: a present record lacking owner_uid was NOT republished (legacy iso record would stay fail-closed forever)"
+fi
+
+# A persistent publish FAILURE (no record at all) must NOT churn (binding stays
+# absent, no false heal) and must record a self-heal FAILURE, not a success.
+clear_bindings
+: >"$PRUNE_AUDIT_EVENTS"
 bridge_publish_config_caller_binding() { :; }   # publish that writes nothing
 run_prune "server-up"
 if [[ -f "$PRUNE_BD/$ADMIN_AGENT.json" ]]; then
   smoke_fail "prune SELF-HEAL logged success despite a publish that wrote nothing"
 fi
-smoke_log "ok: prune SELF-HEAL no-op on a publish failure (no churn)"
+if grep -q '^config_caller_binding_self_healed$' "$PRUNE_AUDIT_EVENTS"; then
+  smoke_fail "prune SELF-HEAL emitted a self_healed audit row despite a publish that wrote NO record"
+fi
+smoke_log "ok: prune SELF-HEAL no-op on a missing-after-publish failure (no churn, no false self_healed)"
 
-unset -f tmux bridge_agent_session bridge_tmux_session_pane_pid bridge_agent_engine bridge_publish_config_caller_binding
+# ===========================================================================
+# 7g. #1738 r5 FIX A (codex r4 BLOCKER) — self-heal must VERIFY the heal.
+#
+# The pre-r5 self-heal logged/counted `config_caller_binding_self_healed` after
+# publish on a bare `[[ -f "$dir/$agent.json" ]]`. When a STALE record already
+# EXISTS and publish is a NO-OP (or fails to rewrite it), the stale file still
+# satisfies `-f`, so the daemon emits a `self_healed` audit row while the record
+# is STILL stale (codex reproduced: seed pane_pid:99999, publish writes nothing,
+# false `self_healed`). FIX A re-reads the record after publish and requires
+# pane_pid == live pane AND agent_id == agent AND admin_agent_id == admin BEFORE
+# emitting `self_healed`; a still-stale record emits a
+# `config_caller_binding_self_heal_failed` row instead.
+#
+# TEETH (non-vacuous): seed a PRESENT-but-STALE record (pane_pid 99999, live pane
+# is 54321 from the shim) and force publish to a NO-OP (leaves the stale file in
+# place). Assert NO `self_healed` row is emitted and a `self_heal_failed` row IS.
+# Reverting FIX A (the bare `[[ -f ]]` + unconditional self_healed) makes this
+# tooth FAIL: the stale file satisfies `-f` so a false `self_healed` is emitted
+# and the `self_heal_failed` row is absent.
+# ===========================================================================
+clear_bindings
+: >"$PRUNE_AUDIT_EVENTS"
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":99999,"engine":"claude","updated_at":"stale"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$PRUNE_LIVE_SESSION" >"$PRUNE_BD/$ADMIN_AGENT.json"
+bridge_publish_config_caller_binding() { :; }   # publish that writes nothing (no-op)
+run_prune "server-up"
+if grep -q '^config_caller_binding_self_healed$' "$PRUNE_AUDIT_EVENTS"; then
+  smoke_fail "prune SELF-HEAL emitted self_healed for a STALE-present record that publish did NOT repair (FIX A regressed)"
+fi
+if ! grep -q '^config_caller_binding_self_heal_failed$' "$PRUNE_AUDIT_EVENTS"; then
+  smoke_fail "prune SELF-HEAL did NOT emit self_heal_failed for a still-stale record after a no-op publish (FIX A regressed)"
+fi
+# The stale record is still present (publish wrote nothing) — the point is the
+# AUDIT row reflects FAILURE, not a false success.
+smoke_assert_contains "$(cat "$PRUNE_BD/$ADMIN_AGENT.json")" '"pane_pid":99999' \
+  "FIX A: stale record left in place by no-op publish (audit is the signal, not deletion)"
+smoke_log "ok: FIX A self-heal VERIFIES — stale-present + no-op publish emits self_heal_failed, NOT self_healed"
+
+unset -f tmux bridge_agent_session bridge_tmux_session_pane_pid bridge_agent_engine bridge_publish_config_caller_binding bridge_daemon_scrub_probe_env bridge_config_caller_pane_owner_uid
 # Restore a clean, writable, empty store before exit.
 clear_bindings
 

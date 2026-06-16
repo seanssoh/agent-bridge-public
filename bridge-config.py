@@ -320,6 +320,52 @@ _TMUX_ABSOLUTE_CANDIDATES = (
 # the two in sync.
 _TMUX_SOCKET_SELECTION_ENV = ("TMUX", "TMUX_PANE", "TMUX_TMPDIR")
 
+# #1738 r5 FIX B (env injection, HIGH): every probe subprocess (the absolute
+# tmux liveness probe, the absolute ps ancestry walk, the absolute ps/owner
+# lookup) runs with a STRICT ALLOWLIST env, NOT a denylist. The r3/r4 code
+# stripped only the tmux socket-selection vars (`_TMUX_SOCKET_SELECTION_ENV`) but
+# PASSED THROUGH everything else — including the dynamic-linker preload hooks
+# `DYLD_INSERT_LIBRARIES` / `DYLD_*` (macOS) and `LD_PRELOAD` / `LD_*` (Linux).
+# An agent owns its own env when it execs the wrapper, so it could preload a
+# `connect()`-interpose library into the ABSOLUTE tmux/ps binary (homebrew tmux
+# is adhoc-signed and honors DYLD_INSERT_LIBRARIES; `/usr/bin/tmux` honors
+# LD_PRELOAD), redirecting tmux's socket connection to a private server that
+# returns a forged `#{pane_pid}` — re-opening the orphan-binding match the
+# absolute-binary + socket-strip discipline was meant to close (empirically
+# confirmed on this host: forged 96506 vs real 89557). A denylist can never
+# enumerate every injection seam; an allowlist passes ONLY the few vars the
+# probes legitimately need and drops everything else (DYLD_*, LD_*, TMUX*, and
+# any future loader/preload var) by construction.
+#
+# What stays: HOME (ps/tmux may read it), USER/LOGNAME (cosmetic), and the
+# locale vars (LANG/LANGUAGE/LC_*) so ps/tmux output is not garbled. PATH is
+# DELIBERATELY omitted — every probe execs an ABSOLUTE binary, so PATH is unused
+# and a caller-controlled PATH is one less seam. TZ is dropped (irrelevant to
+# pid/owner). The DEFAULT is exclude: an env name only survives if it is in
+# `_PROBE_ENV_ALLOW` or matches `_PROBE_ENV_ALLOW_LC_PREFIX`.
+_PROBE_ENV_ALLOW = ("HOME", "USER", "LOGNAME", "LANG", "LANGUAGE")
+# Locale vars are an open-ended family (LC_ALL, LC_CTYPE, LC_MESSAGES, …). Allow
+# the whole `LC_` namespace by prefix — none of them is a loader/preload seam.
+_PROBE_ENV_ALLOW_LC_PREFIX = "LC_"
+
+
+def _clean_probe_env() -> dict[str, str]:
+    """Build the STRICT ALLOWLIST env for a #1738 probe subprocess (r5 FIX B).
+
+    Returns a fresh dict containing ONLY the vars in `_PROBE_ENV_ALLOW` (when
+    present in the current environment) plus any `LC_*` locale var. Every other
+    var — crucially the dynamic-linker preload hooks (`DYLD_*`, `LD_*`) AND the
+    tmux socket-selection vars (`TMUX`, `TMUX_PANE`, `TMUX_TMPDIR`) — is dropped
+    by construction. This is the SINGLE place probe child env is built: the
+    wrapper liveness probe, the ancestry `ps`, and the owner-UID lookup all use
+    it, so there is exactly one allowlist to audit and keep correct.
+    """
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in _PROBE_ENV_ALLOW or key.startswith(_PROBE_ENV_ALLOW_LC_PREFIX):
+            env[key] = value
+    return env
+
 
 class ConfigCaller:
     """Resolved, authorization-relevant identity of a `set`/`set-env` call.
@@ -390,6 +436,10 @@ def _ps_ppid(pid: int) -> int | None:
                 capture_output=True,
                 text=True,
                 check=False,
+                # #1738 r5 FIX B: strict allowlist env so a caller-injected
+                # DYLD_*/LD_* preload cannot interpose this absolute ps (which
+                # walks the ancestry the whole authorization rests on).
+                env=_clean_probe_env(),
             )
         except OSError:
             return None
@@ -610,32 +660,32 @@ def _live_pane_pid_for_session(session: str) -> int | None:
     is unavailable, or the output is not an integer — every such case is treated
     by the caller as "binding is stale → skip" (fail-closed).
 
-    ALL tmux socket-selection env (`TMUX`, `TMUX_PANE`, `TMUX_TMPDIR` —
-    `_TMUX_SOCKET_SELECTION_ENV`) is STRIPPED from the child env (#1738 r3
-    FIX 1): the controller publishes the binding's session on the DEFAULT tmux
-    server, so liveness must query that server. An agent owns its own env when
-    it execs the wrapper and could otherwise point this probe at a private
-    server — via `$TMUX`/`$TMUX_PANE` OR via `$TMUX_TMPDIR` (the parent of the
-    default socket dir) — carrying a same-named session with a forged pane_pid,
-    re-opening the orphan-binding match the absolute-binary discipline closes.
-    Removing every socket-selection var forces the probe onto the real default
-    server the controller wrote to.
+    The child env is built by `_clean_probe_env` — a STRICT ALLOWLIST (#1738 r5
+    FIX B) that drops, by construction, ALL tmux socket-selection env (`TMUX`,
+    `TMUX_PANE`, `TMUX_TMPDIR` — `_TMUX_SOCKET_SELECTION_ENV`, the r3 FIX 1
+    closure) AND the dynamic-linker preload hooks (`DYLD_*`, `LD_*`). The
+    controller publishes the binding's session on the DEFAULT tmux server, so
+    liveness must query that server. An agent owns its own env when it execs the
+    wrapper and could otherwise point this probe at a private server — via
+    `$TMUX`/`$TMUX_PANE`, via `$TMUX_TMPDIR` (the parent of the default socket
+    dir), OR via a `connect()`-interpose library preloaded into the absolute
+    tmux through `$DYLD_INSERT_LIBRARIES`/`$LD_PRELOAD` — carrying a same-named
+    session with a forged pane_pid, re-opening the orphan-binding match the
+    absolute-binary discipline closes. The allowlist passes only the few
+    benign vars tmux needs and drops every redirection seam.
     """
     if not session:
         return None
     tmux_bin = _resolve_tmux_bin()
     if tmux_bin is None:
         return None
-    child_env = {
-        k: v for k, v in os.environ.items() if k not in _TMUX_SOCKET_SELECTION_ENV
-    }
     try:
         out = subprocess.run(
             [tmux_bin, "display-message", "-t", session, "-p", "#{pane_pid}"],
             capture_output=True,
             text=True,
             check=False,
-            env=child_env,
+            env=_clean_probe_env(),
         )
     except OSError:
         return None
@@ -650,17 +700,119 @@ def _live_pane_pid_for_session(session: str) -> int | None:
         return None
 
 
-def _binding_session_is_live(record: dict[str, Any]) -> bool:
-    """True iff the matched binding's pane is still the LIVE pane (#1738 r2 B2).
+def _pid_owner_uid(pid: int) -> int | None:
+    """Return the OS owner UID of process *pid*, or None if unresolvable.
 
-    The ancestry match alone authorizes purely on `pane_pid in ancestry`, which
-    a non-admin agent can satisfy after the admin pane exits by PID-camping the
-    freed `pane_pid` (iso shares the host PID space — no PID namespace) and
-    matching the orphan binding. We re-resolve the live `#{pane_pid}` of the
-    recorded tmux `session` and require it to equal the bound `pane_pid`: a
-    recycled pid will NOT be the current pane_pid of the recorded session, and a
-    dead session resolves to None. Any mismatch / dead session / no-tmux is
-    stale → False (skip the binding, fail-closed).
+    Used by `_binding_session_is_live` for the #1738 r5 FIX C owner check.
+    Linux: `os.stat("/proc/<pid>").st_uid` — the kernel's authoritative owner,
+    not forgeable by the process. Otherwise (macOS / no /proc): the ABSOLUTE
+    `/bin/ps -o uid= -p <pid>` under the FIX B clean env, so a preloaded
+    interpose library cannot lie about the owner. Any failure / non-integer
+    output returns None, which the caller treats as "owner unverifiable →
+    not-live" (fail-closed).
+    """
+    if pid <= 0:
+        return None
+    proc_path = f"/proc/{pid}"
+    if os.path.isdir(proc_path):  # noqa: raw-pathlib-controller-only
+        try:
+            return os.stat(proc_path).st_uid  # noqa: raw-pathlib-controller-only
+        except OSError:
+            return None
+    for ps_bin in _PS_ABSOLUTE_CANDIDATES:
+        if not os.path.exists(ps_bin):  # noqa: raw-pathlib-controller-only
+            continue
+        try:
+            out = subprocess.run(
+                [ps_bin, "-o", "uid=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=_clean_probe_env(),
+            )
+        except OSError:
+            return None
+        text = out.stdout.strip()
+        if not text:
+            return None
+        try:
+            return int(text.split()[0])
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
+def _expected_pane_owner_uid(record: dict[str, Any]) -> int | None:
+    """Expected OS owner UID of the bound pane process (#1738 r5 FIX C).
+
+    The controller records `owner_uid` at publish time
+    (`bridge_publish_config_caller_binding`) — the UID of the bound agent's OS
+    user (on linux-user isolation, `agent-bridge-<agent>`; on shared-UID, the
+    controller UID). The record lives in the controller-owned store, so on iso
+    an attacking agent cannot forge `owner_uid` (it owns neither the dir nor the
+    file). We require an explicit integer `owner_uid`.
+
+    MISSING / malformed `owner_uid` (a legacy pre-r5 record, or a corrupt one)
+    must FAIL CLOSED on iso (codex r5 BLOCKER): the only safe non-explicit value
+    is the caller's own euid, and on iso the caller IS the attacker, so a
+    geteuid() fallback would let an attacker park a PID THEY own on the recorded
+    `pane_pid` slot and pass the owner check (their pid's owner == their euid).
+    We therefore allow the geteuid() fallback ONLY when the bindings store is
+    caller-WRITABLE — i.e. shared-UID, where the pane and caller are the same OS
+    user anyway AND the admin-pane path is already operator-TTY-only via
+    `_binding_store_is_caller_writable`. On a foreign-owned (iso) store with no
+    explicit `owner_uid`, we return None → the binding is treated as NOT live
+    (fail-closed). Iso records are (re)published WITH `owner_uid` by the daemon
+    self-heal, so this denies only a transient legacy/corrupt record, never a
+    healthy one.
+    """
+    owner_uid = record.get("owner_uid")
+    if isinstance(owner_uid, bool):
+        owner_uid = None
+    if isinstance(owner_uid, int):
+        return owner_uid
+    if isinstance(owner_uid, str) and owner_uid.strip().lstrip("-").isdigit():
+        try:
+            return int(owner_uid.strip())
+        except ValueError:
+            pass
+    # No explicit owner_uid: fall back to the caller's euid ONLY on a
+    # caller-writable (shared-UID) store; fail closed on a foreign-owned (iso)
+    # store where geteuid() would be the attacker's own UID.
+    if not _binding_store_is_caller_writable(record):
+        return None
+    try:
+        return os.geteuid()
+    except AttributeError:  # pragma: no cover - non-POSIX
+        return None
+
+
+def _binding_session_is_live(record: dict[str, Any]) -> bool:
+    """True iff the matched binding's pane is still the LIVE, admin-OWNED pane.
+
+    Two checks, both must hold (#1738 r2 B2 liveness + r5 FIX C ownership):
+
+    1. LIVENESS (r2 B2): the ancestry match alone authorizes purely on
+       `pane_pid in ancestry`, which a non-admin agent can satisfy after the
+       admin pane exits by PID-camping the freed `pane_pid` (iso shares the host
+       PID space — no PID namespace). We re-resolve the live `#{pane_pid}` of the
+       recorded tmux `session` and require it to equal the bound `pane_pid`.
+
+    2. OWNERSHIP (r5 FIX C): even with the socket-strip + absolute-binary
+       discipline, on iso the liveness probe derives tmux's default socket from
+       the PROBE process's EUID — the attacker's own iso UID — so it queries a
+       server the ATTACKER controls and could be fed a forged `#{pane_pid}` that
+       matches the bound pane_pid (camp the pid, or have the private server
+       report it). We close this at the kernel boundary: the live pane PID's
+       process OWNER UID must equal the admin agent's expected OS UID
+       (`owner_uid`, recorded by the controller). An attacker runs as a
+       DIFFERENT OS user and physically cannot own a process as the admin UID,
+       so a forged/camped pid owned by anyone but the admin is rejected. On
+       shared-UID the expected owner is the caller's own UID (a trivial pass)
+       and the admin-pane path is already fail-closed by the ownership gate.
+
+    Any mismatch / dead session / unresolvable owner is stale → False (skip the
+    binding, fail-closed).
     """
     session = str(record.get("session", "") or "").strip()
     pane_pid = record.get("pane_pid")
@@ -669,7 +821,16 @@ def _binding_session_is_live(record: dict[str, Any]) -> bool:
     live = _live_pane_pid_for_session(session)
     if live is None:
         return False
-    return live == pane_pid
+    if live != pane_pid:
+        return False
+    # r5 FIX C: the live pane PID must be OWNED by the admin's expected OS UID.
+    expected_uid = _expected_pane_owner_uid(record)
+    if expected_uid is None:
+        return False
+    actual_uid = _pid_owner_uid(live)
+    if actual_uid is None or actual_uid != expected_uid:
+        return False
+    return True
 
 
 def resolve_config_caller(args: argparse.Namespace) -> ConfigCaller:

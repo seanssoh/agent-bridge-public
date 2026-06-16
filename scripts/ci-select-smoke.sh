@@ -2443,6 +2443,15 @@ select_for_path() {
       add_required 1738-config-caller-binding
       ;;
 
+    scripts/python-helpers/config-caller-binding-write.py)
+      # Issue #1738 r5 (FIX C): this helper writes the binding record, including
+      # the `owner_uid` field the wrapper's pane-owner check requires (the
+      # kernel-boundary closer for the iso forged-pid exploit). Pull the binding
+      # smoke on every move so a change to the record schema (dropping owner_uid)
+      # cannot silently disable the owner check and re-open the forged-pid window.
+      add_required 1738-config-caller-binding
+      ;;
+
     lib/bridge-resource-guard.sh)
       # Incident #8807 P0a: the resource-guard primitive + the daemon-side
       # defer/audit/throttled-warn wrapper. Pull 8807-resource-guard-defer on

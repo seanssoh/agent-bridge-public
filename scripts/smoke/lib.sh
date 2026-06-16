@@ -343,8 +343,13 @@ smoke_seed_trusted_admin_binding() {
   local dir="$1" agent="$2" admin="${3:-$2}" session="${4:-${SMOKE_LIVE_SESSION:-sess-live}}"
   mkdir -p "$dir"
   chmod 0755 "$dir" 2>/dev/null || true
-  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"engine":"claude","updated_at":"now"}\n' \
-    "$agent" "$admin" "$session" "${SMOKE_LIVE_PANE_PID:-$$}" \
+  # #1738 r5 FIX C: record owner_uid so the wrapper's pane-owner check exercises
+  # the REAL recorded-UID path (not just the legacy geteuid fallback). The live
+  # pane is started by this smoke caller, so its owner is the caller's uid.
+  local owner_uid=""
+  owner_uid="$(id -u 2>/dev/null || true)"
+  printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":%s,"owner_uid":%s,"engine":"claude","updated_at":"now"}\n' \
+    "$agent" "$admin" "$session" "${SMOKE_LIVE_PANE_PID:-$$}" "${owner_uid:-0}" \
     >"$dir/$agent.json"
 }
 
