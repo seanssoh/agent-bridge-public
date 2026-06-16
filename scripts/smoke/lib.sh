@@ -204,29 +204,49 @@ smoke_write_runtime_stub() {
 # session, so the smoke must run the wrapper INSIDE a real pane (the pane process
 # is then a genuine ancestor of the wrapper, and its pane_pid is the bound one).
 #
-# smoke_config_caller_start_live_session: start a detached tmux session on a
-# PRIVATE socket under the smoke temp root (never the operator's default server).
-# Exports SMOKE_LIVE_SESSION, SMOKE_LIVE_PANE_PID (the REAL pane pid), and
-# SMOKE_LIVE_TMUX_SOCKET. Registers cleanup via a global var the smoke's EXIT
-# trap (smoke_cleanup_temp_root) tears down. Skips with a clear message + sets
+# The liveness teeth need the wrapper's probe (bridge-config.py
+# `_live_pane_pid_for_session`) to SEE this test session. That probe runs tmux
+# under `_clean_probe_env` — a strict allowlist that DROPS every tmux
+# socket-selection var (`TMUX`, `TMUX_PANE`, `TMUX_TMPDIR`), so it always queries
+# the per-uid DEFAULT server (`<default-TMUX_TMPDIR>/tmux-<uid>/default`). But the
+# smoke harness sources lib/bridge-smoke-tmux-isolation.sh (fleet-down guard),
+# which EXPORTS a PRIVATE `TMUX_TMPDIR`; a bare `tmux new-session` would therefore
+# create the session on the private socket the probe can never see — the binding
+# reads as not-live and the liveness-dependent teeth (chmod-camouflage, real-tmux
+# liveness, owner-uid) deny on the wrong precondition (the #1738↔#1932 socket
+# mismatch this fixes). smoke_config_caller_default_server_tmux runs tmux with the
+# SAME socket-selection env the probe strips (TMUX/TMUX_PANE/TMUX_TMPDIR unset) so
+# the test session lands on EXACTLY the socket the probe queries. We still only
+# ever `kill-session -t <unique-name>` (never `kill-server`), so a co-resident
+# operator tmux on that default server is untouched — the #1932 fleet-down was a
+# `kill-server`/teardown of the shared server, which this code never does.
+smoke_config_caller_default_server_tmux() {
+  local tmux_bin=""
+  tmux_bin="$(command -v tmux 2>/dev/null || true)"
+  [[ -n "$tmux_bin" ]] || return 127
+  env -u TMUX -u TMUX_PANE -u TMUX_TMPDIR "$tmux_bin" "$@"
+}
+
+# smoke_config_caller_start_live_session: start a detached tmux session on the
+# per-uid DEFAULT tmux server — the exact socket the wrapper's liveness probe
+# queries (TMUX/TMUX_PANE/TMUX_TMPDIR stripped) — using a UNIQUE session name.
+# Exports SMOKE_LIVE_SESSION, SMOKE_LIVE_PANE_PID (the REAL pane pid). Registers
+# cleanup via a global var the smoke's EXIT trap (smoke_cleanup_temp_root) tears
+# down (kill-session only, never kill-server). Skips with a clear message + sets
 # SMOKE_CONFIG_CALLER_LIVE_OK=0 if tmux is unavailable.
 SMOKE_CONFIG_CALLER_LIVE_NAME=""
 smoke_config_caller_start_live_session() {
   export SMOKE_CONFIG_CALLER_LIVE_OK=0
-  local tmux_bin=""
-  tmux_bin="$(command -v tmux 2>/dev/null || true)"
-  if [[ -z "$tmux_bin" ]]; then
+  if ! command -v tmux >/dev/null 2>&1; then
     smoke_log "config-caller: tmux unavailable — live-session positive path skipped"
     return 1
   fi
-  # Start the session on the DEFAULT tmux server (no -S), with a unique name. The
-  # wrapper (#1738 r3 FIX 2) STRIPS $TMUX/$TMUX_PANE from its liveness probe so it
-  # always queries the default server — exactly where the controller publishes in
-  # production. A private -S socket would therefore NOT be found by the wrapper.
-  # We kill ONLY our own session (never kill-server) so a co-resident operator
-  # tmux is untouched.
+  # Start the session on the DEFAULT tmux server, with a unique name, on the SAME
+  # socket the wrapper's probe resolves to (probe-socket == smoke-session-socket;
+  # see smoke_config_caller_default_server_tmux). We kill ONLY our own session
+  # (never kill-server) so a co-resident operator tmux is untouched.
   local session="agb-cc-live-$$-$RANDOM"
-  if ! "$tmux_bin" new-session -d -s "$session" 2>/dev/null; then
+  if ! smoke_config_caller_default_server_tmux new-session -d -s "$session" 2>/dev/null; then
     smoke_log "config-caller: tmux new-session (default server) failed — live-session positive path skipped"
     return 1
   fi
@@ -234,9 +254,9 @@ smoke_config_caller_start_live_session() {
   # Give the pane shell a moment to spawn so #{pane_pid} resolves.
   sleep 0.4
   local pane_pid=""
-  pane_pid="$("$tmux_bin" display-message -t "$session" -p '#{pane_pid}' 2>/dev/null || true)"
+  pane_pid="$(smoke_config_caller_default_server_tmux display-message -t "$session" -p '#{pane_pid}' 2>/dev/null || true)"
   if [[ ! "$pane_pid" =~ ^[0-9]+$ ]]; then
-    "$tmux_bin" kill-session -t "$session" 2>/dev/null || true
+    smoke_config_caller_default_server_tmux kill-session -t "$session" 2>/dev/null || true
     SMOKE_CONFIG_CALLER_LIVE_NAME=""
     smoke_log "config-caller: could not resolve real pane_pid — live-session positive path skipped"
     return 1
@@ -251,10 +271,10 @@ smoke_config_caller_start_live_session() {
 # kill-server, so a co-resident operator tmux on the default server is left
 # alone). Called from the smoke's EXIT cleanup; idempotent and silent.
 smoke_config_caller_stop_live_session() {
-  local tmux_bin=""
-  tmux_bin="$(command -v tmux 2>/dev/null || true)"
-  if [[ -n "$tmux_bin" && -n "$SMOKE_CONFIG_CALLER_LIVE_NAME" ]]; then
-    "$tmux_bin" kill-session -t "$SMOKE_CONFIG_CALLER_LIVE_NAME" 2>/dev/null || true
+  if [[ -n "$SMOKE_CONFIG_CALLER_LIVE_NAME" ]] && command -v tmux >/dev/null 2>&1; then
+    # kill-session on the SAME default server the session was created on
+    # (TMUX_TMPDIR stripped), never kill-server.
+    smoke_config_caller_default_server_tmux kill-session -t "$SMOKE_CONFIG_CALLER_LIVE_NAME" 2>/dev/null || true
   fi
   SMOKE_CONFIG_CALLER_LIVE_NAME=""
 }
@@ -268,11 +288,10 @@ smoke_config_caller_stop_live_session() {
 # smoke_config_caller_start_live_session (SMOKE_CONFIG_CALLER_LIVE_OK=1).
 smoke_config_caller_run_in_pane() {
   local wrapper="$1"; shift
-  local tmux_bin="" session="$SMOKE_LIVE_SESSION"
+  local session="$SMOKE_LIVE_SESSION"
   local out="$SMOKE_TMP_ROOT/wrap.out" err="$SMOKE_TMP_ROOT/wrap.err" rcf="$SMOKE_TMP_ROOT/wrap.rc"
-  tmux_bin="$(command -v tmux 2>/dev/null || true)"
   rm -f "$out" "$err" "$rcf" 2>/dev/null || true
-  if [[ -z "$tmux_bin" || -z "$session" ]]; then
+  if ! command -v tmux >/dev/null 2>&1 || [[ -z "$session" ]]; then
     printf '127' >"$rcf"; printf '127'; return 0
   fi
   # Build an `export` line for any caller-provided env, then the wrapper call.
@@ -289,7 +308,9 @@ smoke_config_caller_run_in_pane() {
     cmd+=" $(printf '%q' "$a")"
   done
   cmd+=" >$(printf '%q' "$out") 2>$(printf '%q' "$err"); printf '%s' \$? >$(printf '%q' "$rcf")"
-  "$tmux_bin" send-keys -t "$session" "$cmd" Enter 2>/dev/null || true
+  # send-keys to the SAME default server the session lives on (TMUX_TMPDIR
+  # stripped) so the keys reach the real pane, not the harness's private socket.
+  smoke_config_caller_default_server_tmux send-keys -t "$session" "$cmd" Enter 2>/dev/null || true
   # Poll for the rc file (the in-pane command writes it last).
   local waited=0
   while [[ ! -s "$rcf" && "$waited" -lt 100 ]]; do
