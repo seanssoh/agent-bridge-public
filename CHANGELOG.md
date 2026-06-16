@@ -4,9 +4,9 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
-## [0.16.13-rc2] — 2026-06-17
+## [0.16.13] — 2026-06-17 (LTS)
 
-**v0.16.13 LTS (RC2) — RC1's upgrade/runtime fixes PLUS a bundled security + reliability wave: config-mutation trust derived from an unspoofable pane binding (#1738), a tmux-socket single-point-of-failure that downed a whole agent fleet (#1932/#1936), and a hook-path footgun that bricked a production farm (#1934).** RC2 supersedes the `v0.16.13-rc1` prerelease (tagged 2026-06-15), layering the bundled security + reliability wave on top of RC1's upgrade/runtime fixes; it is the prerelease for the re-run VM + macbook + cm-prod upgrade-test sequence before v0.16.13 is cut official. The conservative `lts` channel stays on v0.16.12 until then.
+**v0.16.13 LTS — a security + reliability hardening bundle on top of v0.16.12's upgrade-respawn fixes: config-mutation trust derived from an unspoofable pane binding (#1738), a tmux-socket single-point-of-failure that could down a whole agent fleet (#1932/#1936), and a hook-path footgun that bricked a production farm (#1934).** Promotes the `v0.16.13-rc2` prerelease to the blessed LTS tag for the v0.16 line after a three-way re-test (macbook isolated + a real OrbStack Linux iso-v2 `agb upgrade` + cm-prod production-host isolated verification). The conservative `lts` channel now resolves to v0.16.13. (The "(new in RC2)" sub-heading below is kept verbatim as the record of what landed between the v0.16.12 and v0.16.13 LTS tags.)
 
 ### Security & reliability (new in RC2)
 
@@ -30,6 +30,13 @@ version bumps via the `VERSION` file.
 
 - **daemon.sh loop-restart cold-boot — two facets closed (#1699).** Two chronic required-smoke flakes that forced reruns on otherwise-green PRs: (1) an accept-readiness TOCTOU — the readiness poll returned the instant the socket/pid files appeared, before the gateway listener was actually accepting; the poll now requires the same accept-proof the daemon itself requires. (2) a singleton-lock test-isolation race — the loop-restart test shared the daemon singleton flock with the preceding lifecycle test, and `kill`+`wait` did not guarantee flock release before the next spawn; the spawn now bounded-waits for the flock to free, and the diagnostic surfaces the daemon's `launchagent.log` exit record (which made the empty-`daemon_log` signature legible). Test-harness only.
 - **Canon shared-doc symlinks resolve correctly in layout-v2 agent homes (#1813).** `bridge-docs.py` now computes the canon shared-doc link target from the actual agent home to `shared/` for both v1 and v2 layouts, accepts already-correct absolute/relative links by realpath, scopes broken-link cleanup to bridge-managed shared-doc names, and the upgrade doc-sync path now targets v2 `<data_root>/agents/<agent>/home`. The related smoke was also hardened to avoid a SIGPIPE/pipefail + heredoc-ban false failure.
+- **#1738 config-caller foreign-store smoke is non-vacuous (#1939).** The iso positive-control helper chmod'd the seeded binding files with a caller-shell glob that could not expand after the store was chowned to a foreign owner + `0711` — so the positive assertion false-failed on passwordless-sudo hosts and was green-by-skip elsewhere. The glob now expands inside a root shell so the binding files land `nobody:0644` (controller-readable, the real iso store shape). Found by the cm-prod production-host verification; test-harness only.
+
+### Soak / acceptance (verified before the cut)
+
+- **macbook isolated:** the #1738 config-caller-binding, #1934 hook-path-canonical-fence, and #1934 hook-file-self-heal smokes pass on macOS (homebrew bash 5.3.9); the #1932 fleet-down tmux-socket guard was confirmed live.
+- **OrbStack real-Linux VM (Ubuntu noble, iso-v2):** a real `agb upgrade --ref v0.16.13-rc2 --apply` from `v0.16.13-rc1` applied clean (rc=0, 0 conflicts, the systemd-aware #1905 quiesce fired, daemon + 12 agents restarted, `shared_settings_rerender failed=0`); post-upgrade health warn=0 crit=0; the three rc2 smokes pass on Linux.
+- **cm-prod production-host isolated verification (real-Linux iso-v2, live customer Teams bots):** the full bundle's smokes pass on the cm-prod host (#1934 both facets, #1932 fleet stayed up across 6+ smokes, #1923, #1916, #1181) and the #1738 trust logic was confirmed correct (all 11 security DENY teeth). The live customer-fleet upgrade was intentionally NOT run — cm-prod is stable-only and adopts this LTS via the `lts` channel. That verification surfaced the #1939 smoke-harness fix folded into this cut.
 
 ## [0.16.12] — 2026-06-15 (LTS)
 
