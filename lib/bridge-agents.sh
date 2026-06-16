@@ -3108,21 +3108,40 @@ finally:
 PY
   bridge_linux_sudo_root chown root:root "$state_file"
   bridge_linux_sudo_root chmod 0640 "$state_file"
-  bridge_linux_sudo_root chown root:root "$state_dir" >/dev/null 2>&1 || true
-  bridge_linux_sudo_root chmod 0750 "$state_dir" >/dev/null 2>&1 || true
+  # Issue #1934 facet 3: the grant ledger dir is SHARED across every isolated
+  # agent (`<state_dir>/<agent>.json`), so its ownership/mode is a cross-class
+  # contract, NOT a per-agent one. Re-assert the controller-published shared
+  # contract on every write, idempotently: `<controller>:ab-shared` mode 0710
+  # — owner rwX, group --x (traverse-only, no listing), no world. This matches
+  # the established `state-channels-root` / `state-queue-dir` shared-parent rows
+  # in bridge-isolation-v2-reconcile.sh. Every isolated UID is in `ab-shared`,
+  # so each agent's launcher can TRAVERSE this dir to reach its own
+  # `<agent>.json`; the per-agent file's own `ab-agent-<a>` group (below) is
+  # what keeps one agent from reading another's grants. NEVER chgrp this dir to
+  # the writing agent's private `ab-agent-<a>` group: doing so group-locks the
+  # shared dir to one agent and revokes every OTHER agent's launcher traverse —
+  # the cm-prod incident that killed launchers right after start.
+  local _shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
+  local _ctrl_user=""
+  _ctrl_user="$(bridge_current_user 2>/dev/null || printf '')"
+  [[ -n "$_ctrl_user" ]] || _ctrl_user="root"
+  bridge_linux_sudo_root chown "$_ctrl_user:$_shared_grp" "$state_dir" >/dev/null 2>&1 \
+    || bridge_linux_sudo_root chgrp "$_shared_grp" "$state_dir" >/dev/null 2>&1 || true
+  bridge_linux_sudo_root chmod 0710 "$state_dir" >/dev/null 2>&1 || true
   # Issue #1857 (codex r2): in linux iso v2 the launch-side plugin sync runs as
   # the isolated UID under the sudo wrap and reads this ledger's
-  # `installed_snapshot` for recovery via BRIDGE_PLUGIN_GRANT_LEDGER. Root-only
-  # 0750 dir / 0640 root:root file would make the iso UID unable to READ the
-  # snapshot — the no-channel recovery would then silently skip. Publish the
-  # ledger, its parent dir, and the shared `<state_file>.lock` to the agent's
-  # v2 group (`ab-agent-<a>`) group-readable (dir/lock group-traversable +
-  # writable so a co-located writer can take the same flock), exactly as
-  # `bridge_write_isolated_installed_plugins_manifest` publishes the per-UID
-  # manifest. Owner stays root so the iso UID cannot TAMPER with the recorded
-  # grant set or snapshot — read-only group access is the contract. Shared-mode
-  # installs have no v2 group and run sync as the same controller user, so this
-  # block is a harmless no-op there (the controller already owns the file).
+  # `installed_snapshot` for recovery via BRIDGE_PLUGIN_GRANT_LEDGER. A root-only
+  # 0640 root:root file would make the iso UID unable to READ the snapshot — the
+  # no-channel recovery would then silently skip. Publish the ledger FILE and
+  # the shared `<state_file>.lock` to the agent's v2 group (`ab-agent-<a>`)
+  # group-readable, exactly as `bridge_write_isolated_installed_plugins_manifest`
+  # publishes the per-UID manifest. Owner stays root so the iso UID cannot TAMPER
+  # with the recorded grant set or snapshot — read-only group access is the
+  # contract. Shared-mode installs have no v2 group and run sync as the same
+  # controller user, so this block is a harmless no-op there (the controller
+  # already owns the file). NOTE: this publishes the per-agent FILE only — the
+  # shared PARENT DIR is handled above under the cross-class `ab-shared`
+  # contract and must never be flipped to `ab-agent-<a>` (Issue #1934).
   local _v2_grp=""
   if [[ -n "$agent" ]] \
       && declare -F bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
@@ -3132,17 +3151,6 @@ PY
   if [[ -n "$_v2_grp" ]]; then
     bridge_linux_sudo_root chgrp "$_v2_grp" "$state_file" >/dev/null 2>&1 || true
     bridge_linux_sudo_root chmod 0640 "$state_file" >/dev/null 2>&1 || true
-    bridge_linux_sudo_root chgrp "$_v2_grp" "$state_dir" >/dev/null 2>&1 || true
-    # Dir mode 0750 (group r-x, NO group write): the iso UID can TRAVERSE +
-    # list the dir to read the ledger, but cannot unlink/rename/replace the
-    # root-owned ledger or lock (directory write — not file mode — controls
-    # unlink/rename, codex r3 finding 1). The iso UID never needs dir write:
-    # in iso v2 the snapshot is seeded controller-side as root; the iso-UID
-    # launch sync only READS the ledger for recovery (no lock needed for a
-    # read). Owner root + 0640 keeps the snapshot tamper-resistant. The lock
-    # is left group-readable (0640) for any controller-side concurrent access;
-    # it is never opened RW by the iso UID.
-    bridge_linux_sudo_root chmod 0750 "$state_dir" >/dev/null 2>&1 || true
     if bridge_linux_sudo_root test -e "${state_file}.lock"; then
       bridge_linux_sudo_root chgrp "$_v2_grp" "${state_file}.lock" >/dev/null 2>&1 || true
       bridge_linux_sudo_root chmod 0640 "${state_file}.lock" >/dev/null 2>&1 || true
@@ -3217,6 +3225,18 @@ finally:
         pass
     os.close(lock_fd)
 PY
+  # Issue #1934 facet 3: the os.makedirs above can create the SHARED grant
+  # ledger dir if a seed runs before any write. Re-assert the cross-class shared
+  # contract on it idempotently — `<controller>:ab-shared` mode 0710 — so every
+  # agent's launcher keeps traverse access. Never the writing agent's private
+  # group (see bridge_isolated_plugin_grants_write).
+  local _shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
+  local _ctrl_user=""
+  _ctrl_user="$(bridge_current_user 2>/dev/null || printf '')"
+  [[ -n "$_ctrl_user" ]] || _ctrl_user="root"
+  bridge_linux_sudo_root chown "$_ctrl_user:$_shared_grp" "$(dirname "$state_file")" >/dev/null 2>&1 \
+    || bridge_linux_sudo_root chgrp "$_shared_grp" "$(dirname "$state_file")" >/dev/null 2>&1 || true
+  bridge_linux_sudo_root chmod 0710 "$(dirname "$state_file")" >/dev/null 2>&1 || true
   # Re-publish ownership/group so the just-rewritten ledger keeps the iso UID's
   # read access (the write above replaced the inode).
   bridge_linux_sudo_root chown root:root "$state_file" >/dev/null 2>&1 || true
