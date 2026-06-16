@@ -35,7 +35,7 @@ version bumps via the `VERSION` file.
 ### Soak / acceptance (verified before the cut)
 
 - **macbook isolated:** the #1738 config-caller-binding, #1934 hook-path-canonical-fence, and #1934 hook-file-self-heal smokes pass on macOS (homebrew bash 5.3.9); the #1932 fleet-down tmux-socket guard was confirmed live.
-- **OrbStack real-Linux VM (Ubuntu noble, iso-v2):** a real `agb upgrade --ref v0.16.13-rc2 --apply` from `v0.16.13-rc1` applied clean (rc=0, 0 conflicts, the systemd-aware #1905 quiesce fired, daemon + 12 agents restarted, `shared_settings_rerender failed=0`); post-upgrade health warn=0 crit=0; the three rc2 smokes pass on Linux.
+- **OrbStack real-Linux VM (Ubuntu noble, iso-v2):** a real `agb upgrade --ref v0.16.13-rc2 --apply` from `v0.16.13-rc1` applied clean (rc=0, 0 conflicts, the systemd-aware #1905 quiesce fired, daemon restarted, 12 agents considered/migrated — 2 eligible agents restarted and 10 skipped (9 inactive, 1 manual-stop)); post-upgrade health warn=0 crit=0; the three rc2 smokes pass on Linux.
 - **cm-prod production-host isolated verification (real-Linux iso-v2, live customer Teams bots):** the full bundle's smokes pass on the cm-prod host (#1934 both facets, #1932 fleet stayed up across 6+ smokes, #1923, #1916, #1181) and the #1738 trust logic was confirmed correct (all 11 security DENY teeth). The live customer-fleet upgrade was intentionally NOT run — cm-prod is stable-only and adopts this LTS via the `lts` channel. That verification surfaced the #1939 smoke-harness fix folded into this cut.
 
 ## [0.16.12] — 2026-06-15 (LTS)
