@@ -34,6 +34,14 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")"/../.. && pwd -P)"
+
+# Fleet-down guard: force a private tmux universe (and sever any inherited
+# $TMUX) before any work, so a run from inside a live agent pane can't reach
+# the shared fleet socket. Idempotent + harmless even though this smoke does
+# not itself drive tmux.
+# shellcheck source=../../lib/bridge-smoke-tmux-isolation.sh
+source "$REPO_ROOT/lib/bridge-smoke-tmux-isolation.sh"
+
 PYTHON="${BRIDGE_PYTHON:-$(command -v python3 || echo /usr/bin/python3)}"
 
 # Hermetic isolation: this smoke may run inside a LIVE bridge agent session

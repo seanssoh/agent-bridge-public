@@ -6,6 +6,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
 
+# Fleet-down guard: this runner spawns destructive smokes; isolate the tmux
+# socket (and sever an inherited live `$TMUX`) so a selected smoke can never
+# tear down the shared default server. Exported here, inherited by every smoke
+# this runner spawns — covers smokes that do not source scripts/smoke/lib.sh.
+# shellcheck source=../lib/bridge-smoke-tmux-isolation.sh
+source "$REPO_ROOT/lib/bridge-smoke-tmux-isolation.sh"
+
 suite="required"
 run_selected=0
 base_ref="${BASE_SHA:-}"
