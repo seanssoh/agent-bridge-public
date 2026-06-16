@@ -7161,6 +7161,160 @@ bridge_daemon_prune_orphan_config_caller_bindings() {
   return "$changed"
 }
 
+# Issue #1934 facet 2 (self-heal): a live Claude agent whose rendered hook
+# COMMAND points at a script FILE that no longer exists is bricked — the OS
+# reaped a transient /tmp hooks dir (the pre-facet-1 bug), or the install's
+# hooks dir was otherwise removed. Claude fail-CLOSES on a missing hook script:
+# UserPromptSubmit → silent deafness, PreToolUse `*` → tool-deadlock (the agent
+# cannot even Write to recover). Facet 1 stops the BAD write going forward; this
+# tick RECOVERS an already-stale settings file without a human by forcing a
+# canonical re-render of the agent's hooks (the same render the start path / the
+# manual `bridge-start.sh <agent> --replace` runs).
+#
+# Per-agent, live-session-gated, best-effort. The scan helper is fail-SAFE (an
+# unreadable/malformed settings file, or a non-bridge hook script, reports `ok`)
+# so this never acts on a foreign hook — only a CONFIRMED-absent BRIDGE hook
+# script triggers a re-render.
+#
+# codex r1 hardening:
+#  - VERIFY the heal: re-scan AFTER the re-render and only audit success +
+#    count a change when the post-scan is `ok`. A re-render that did NOT clear
+#    the missing file (e.g. the canonical install itself is gone, or an iso
+#    permission boundary blocked the repair) emits a distinct *_failed audit and
+#    does NOT mark success — so a persistently-broken agent is reported ONCE per
+#    transition, never re-rendered in a storm every tick (the failure audit's
+#    presence + the unchanged scan are what gate the next tick's behaviour).
+#  - ISO agents: scan the agent's ACTIVE isolated `settings.effective.json` (the
+#    file the live session actually reads) and repair via
+#    bridge_install_isolated_home_settings — NOT the controller-side per-agent
+#    path, which an iso session does not consume. When the controller cannot read
+#    the iso effective file the scan fail-safes to `ok` (the iso agent re-renders
+#    cleanly on its next start regardless).
+# Per-agent durable failure marker for the hook-file self-heal (#1934 codex r2).
+# Records the missing-hook path of the LAST re-render that FAILED to clear it, so
+# a persistently-broken agent (canonical install genuinely gone, iso boundary)
+# is NOT re-rendered every ~30s tick forever. The marker is honoured only while
+# the SAME script is still missing; a different missing script (a fresh failure
+# mode) or a clean scan clears it and re-arms a heal attempt.
+bridge_daemon_hook_heal_fail_marker() {
+  printf '%s/hook-heal-fail/%s' "$BRIDGE_STATE_DIR" "$1"
+}
+
+bridge_daemon_reheal_missing_hook_files() {
+  local changed=1 agent="" engine="" workdir="" is_iso=0
+  local effective="" scan_out="" scan_status="" missing_path=""
+  local launch_cmd="" post_out="" post_status="" marker="" prev_fail=""
+
+  # Need a roster + the settings render helpers (sourced via bridge-lib.sh ->
+  # lib/bridge-hooks.sh). If unavailable this tick no-ops.
+  [[ "${#BRIDGE_AGENT_IDS[@]}" -gt 0 ]] || return "$changed"
+  command -v bridge_ensure_claude_tool_policy_hooks >/dev/null 2>&1 || return "$changed"
+  command -v bridge_hook_per_agent_settings_effective_file >/dev/null 2>&1 || return "$changed"
+
+  for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+    [[ -n "$agent" ]] || continue
+    # Only LIVE agents — a stopped agent re-renders cleanly on its next start.
+    bridge_agent_is_active "$agent" 2>/dev/null || continue
+    # Claude-only: the missing-hook fail-closed deadlock is a Claude settings.json
+    # failure mode. Codex hooks live in ~/.codex/hooks.json with different
+    # semantics and are not scanned here.
+    engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+    [[ "$engine" == "claude" ]] || continue
+    workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+    [[ -n "$workdir" ]] || continue
+
+    # Resolve the ACTIVE effective settings path. For a v2 linux-user-isolated
+    # agent that is the file under its isolated home; otherwise the controller's
+    # per-agent effective file.
+    is_iso=0
+    effective=""
+    if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+       && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      is_iso=1
+      # Resolve the iso agent's ACTIVE effective settings the same way
+      # bridge_install_isolated_home_settings does: <iso-home>/.claude/.
+      local _os_user="" _iso_home=""
+      _os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+      if [[ -n "$_os_user" ]]; then
+        _iso_home="$(bridge_agent_linux_user_home "$_os_user" 2>/dev/null || true)"
+        [[ -n "$_iso_home" ]] && effective="$_iso_home/.claude/settings.effective.json"
+      fi
+    else
+      effective="$(bridge_hook_per_agent_settings_effective_file "$agent" 2>/dev/null || true)"
+    fi
+    # The controller may be unable to stat an iso effective file (permission
+    # boundary). `-f` then fails → skip; the iso agent self-heals on next start.
+    [[ -n "$effective" && -f "$effective" ]] || continue
+
+    scan_out="$(bridge_daemon_helper_python hook-file-missing-scan "$effective" 2>/dev/null || true)"
+    # `missing\t<path>` → a confirmed-absent BRIDGE hook script; else → ok.
+    scan_status="${scan_out%%$'\t'*}"
+    marker="$(bridge_daemon_hook_heal_fail_marker "$agent")"
+    if [[ "$scan_status" != "missing" ]]; then
+      # Clean (or unreadable→fail-safe ok): clear any prior failure marker so a
+      # future genuine miss re-arms a heal attempt.
+      rm -f "$marker" 2>/dev/null || true
+      continue
+    fi
+    missing_path="${scan_out#*$'\t'}"
+
+    # codex r2 storm-guard: if we ALREADY tried to heal this exact missing script
+    # and it failed last time, do NOT re-render again this tick. The marker is
+    # cleared above on a clean scan or below when the missing script changes, so
+    # a NEW failure mode still gets a fresh attempt — only the same unfixable
+    # miss is suppressed (operator must restore the canonical install / fix iso).
+    prev_fail=""
+    [[ -f "$marker" ]] && prev_fail="$(cat "$marker" 2>/dev/null || true)"
+    if [[ -n "$prev_fail" && "$prev_fail" == "$missing_path" ]]; then
+      continue
+    fi
+
+    # Force a canonical re-render. Facet 1 makes the render resolve hook command
+    # paths to the canonical install hooks dir (a /tmp-reap-surviving directory).
+    launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+    if [[ "$is_iso" -eq 1 ]]; then
+      bridge_install_isolated_home_settings "$agent" "$launch_cmd" >/dev/null 2>&1 || true
+    else
+      (
+        bridge_ensure_claude_stop_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
+        bridge_ensure_claude_session_start_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
+        bridge_ensure_claude_prompt_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
+        bridge_ensure_claude_prompt_guard_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
+        bridge_ensure_claude_tool_policy_hooks "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
+        bridge_ensure_claude_pre_compact_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
+        bridge_ensure_claude_askuserquestion_ban "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1
+      ) || true
+    fi
+
+    # VERIFY the heal — re-scan the (possibly rewritten) effective file. STRICT
+    # success: ONLY a post-scan `ok` counts. A still-`missing` result OR any
+    # empty/unknown helper output means the re-render did not point the hooks at
+    # a surviving dir (canonical install gone / iso boundary) — record a durable
+    # failure marker so this exact miss is not re-rendered every tick, emit a
+    # distinct *_failed audit, and move on. The operator restoring the canonical
+    # install (or fixing the iso boundary) flips the scan to `ok`, which clears
+    # the marker on the next tick.
+    post_out="$(bridge_daemon_helper_python hook-file-missing-scan "$effective" 2>/dev/null || true)"
+    post_status="${post_out%%$'\t'*}"
+    if [[ "$post_status" != "ok" ]]; then
+      mkdir -p "$(dirname "$marker")" 2>/dev/null || true
+      printf '%s' "$missing_path" >"$marker" 2>/dev/null || true
+      bridge_audit_log daemon hook_file_missing_self_heal_failed "$agent" \
+        --detail missing="${missing_path:-<unknown>}" --detail iso="$is_iso" 2>/dev/null || true
+      daemon_warn "hook-file self-heal FAILED for ${agent}: re-render did not restore a surviving hook script (still missing: ${missing_path:-<unknown>}). Canonical install hooks dir may be gone — operator action needed (not retried until it changes)."
+      continue
+    fi
+    # Success — clear any stale failure marker.
+    rm -f "$marker" 2>/dev/null || true
+    bridge_audit_log daemon hook_file_missing_self_healed "$agent" \
+      --detail missing="${missing_path:-<unknown>}" --detail iso="$is_iso" 2>/dev/null || true
+    daemon_info "hook-file self-heal: re-rendered ${agent} hooks to canonical (was missing: ${missing_path:-<unknown>})"
+    changed=0
+  done
+
+  return "$changed"
+}
+
 bridge_dashboard_post_if_changed() {
   local summary_output="$1"
   local summary_file
@@ -14040,6 +14194,15 @@ cmd_sync_cycle() {
   # self-heal next tick.
   BRIDGE_DAEMON_LAST_STEP="config_caller_binding_prune"
   if bridge_daemon_prune_orphan_config_caller_bindings; then
+    changed=0
+  fi
+  # Issue #1934 facet 2: self-heal a live Claude agent whose rendered hook
+  # command points at a script file the OS reaped (transient /tmp hooks dir) —
+  # force a canonical re-render so the agent does not stay fail-closed-deaf +
+  # tool-deadlocked until a human runs `bridge-start.sh <agent> --replace`.
+  # Subshell-isolated + `|| true` so a re-render error can never abort the tick.
+  BRIDGE_DAEMON_LAST_STEP="reheal_missing_hook_files"
+  if ( bridge_daemon_reheal_missing_hook_files ); then
     changed=0
   fi
   BRIDGE_DAEMON_LAST_STEP="on_demand_agents"

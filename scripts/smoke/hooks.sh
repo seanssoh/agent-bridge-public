@@ -283,6 +283,11 @@ controller_home_bridge_hook_paths_are_absolute() {
   bridge_home="$controller_home/.agent-bridge"
   workdir="$case_dir/workdir"
   mkdir -p "$bridge_home/hooks" "$workdir"
+  # #1934: with HOME overridden to $controller_home, the canonical install hooks
+  # dir resolves to exactly this $bridge_home/hooks (the operator's own
+  # ~/.agent-bridge/hooks), so the stable-hooks-dir resolver returns the same
+  # absolute path the assertion below expects — a bridge_home under the
+  # controller HOME is the canonical install, not a transient pollution source.
 
   HOME="$controller_home" python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" ensure-prompt-hook \
     --workdir "$workdir" \
@@ -436,6 +441,15 @@ hook_runtime_helpers() {
 main() {
   smoke_require_cmd python3
   smoke_setup_bridge_home "hooks"
+  # #1934: the stable-hooks-dir resolver fences a transient BRIDGE_HOME to the
+  # host's canonical `~/.agent-bridge/hooks` when one EXISTS. These assertions
+  # pin the temp-BRIDGE_HOME absolute-path rewrite, so point HOME at an empty
+  # temp dir (no `.agent-bridge/hooks`) — there is then no canonical install to
+  # fence to, the resolver keeps this temp BRIDGE_HOME's own hooks path, and the
+  # smoke stays hermetic + host-independent.
+  HOME="$SMOKE_TMP_ROOT/fake-home"
+  export HOME
+  mkdir -p "$HOME"
   smoke_run "Codex hooks ensure/status" codex_hooks_contract
   smoke_run "Claude hooks ensure/status" claude_hooks_contract
   smoke_run "Claude shared settings context defaults" claude_shared_settings_context_defaults
