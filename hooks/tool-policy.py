@@ -5635,6 +5635,87 @@ _CONFIG_CLI_LEAVES = frozenset({"agb", "agent-bridge"})
 # cannot hide the real argv from the literal recognizers.
 _CONFIG_VERB_TOKENS = ("config", "set", "set-env")
 
+# Transparent command prefixes that exec the FOLLOWING argv with no shape change
+# of their own (`env FOO=1 <cmd>`, `command <cmd>`, `exec <cmd>`, `nice <cmd>`,
+# `nohup <cmd>`, `stdbuf -oL <cmd>`). The real command is whatever follows the
+# prefix (plus the prefix's own flags / env-assignments). A recognizer that keys
+# off the leaf command word must resolve THROUGH a stack of these or the prefix
+# masquerades as the leaf — `env agb config $V K=V` reads as leaf `env`, not
+# `agb` (#1738 r7 bypass).
+#
+# The value goes to a PER-PREFIX table of options that consume the NEXT token as
+# their separate value: if such a flag is skipped but not its argument, the
+# argument is mistaken for the real command leaf and re-opens the bypass (codex
+# #1738 r7 — `stdbuf -o L agb …`, `nice --adjustment 5 agb …`). These tool option
+# sets are small and bounded (not open shell grammar), so an exact per-prefix
+# map closes the class without whack-a-mole. Attached forms (`-oL`, `-n5`,
+# `--adjustment=5`) carry their value in the same token and need no lookahead.
+# Anything not listed is a value-less flag.
+_TRANSPARENT_PREFIX_ARG_OPTS: dict[str, frozenset[str]] = {
+    # `env -u NAME`, `env -C DIR` (the `=`-attached signal flags carry their own
+    # value; `env -S`/`--split-string` is dissolved by `_expand_env_split_string`
+    # before this resolver runs, so it never reaches the table).
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
+    # `command -p`/`-v`/`-V` take no separate value.
+    "command": frozenset(),
+    # `exec -a NAME`; `-c`/`-l` take no value.
+    "exec": frozenset({"-a"}),
+    # `nice -n N` / `nice --adjustment N`.
+    "nice": frozenset({"-n", "--adjustment"}),
+    # `nohup` takes no options.
+    "nohup": frozenset(),
+    # `stdbuf -i/-o/-e MODE` (and the long forms) each take a MODE value.
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+}
+_TRANSPARENT_COMMAND_PREFIXES = frozenset(_TRANSPARENT_PREFIX_ARG_OPTS)
+
+
+def _skip_transparent_command_prefixes(tokens: list[str], start: int = 0) -> int:
+    """Return the index of the REAL command leaf in *tokens* (from *start*), after
+    stripping leading `VAR=value` env-assignments and a stack of transparent
+    prefix commands (`env`/`command`/`exec`/`nice`/`nohup`/`stdbuf`) plus each
+    prefix's own flags and value-taking options.
+
+    The caller is expected to have run `_expand_env_split_string` first so an
+    `env -S '<packed cmd>'` payload is already inlined as tokens (the resolver
+    does not re-expand it). Loops so stacked prefixes (`env command exec agb …`)
+    all resolve. Shared by `_is_bash_wrapper_receive` and the #1738
+    config-mutation indirection gate so the two recognizers see the same leaf for
+    the same prefix shapes (codex #1738 r6/r7 — `env`/`command`/`exec`/`nice`/
+    `stdbuf` were bypassing the indirection gate because the leaf was the prefix,
+    not the config CLI).
+    """
+    idx = start
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if _LEADING_ENV_ASSIGN_RE.match(tok + " "):
+            idx += 1
+            continue
+        base = tok.rsplit("/", 1)[-1]
+        if base not in _TRANSPARENT_COMMAND_PREFIXES:
+            break
+        arg_opts = _TRANSPARENT_PREFIX_ARG_OPTS[base]
+        idx += 1
+        # Consume this prefix's own flags + `env`-style `VAR=value`. A bare `-`
+        # (env's "clear environment" marker, equivalent to `-i`) is a value-less
+        # option that still precedes the real command, so it is consumed too. A
+        # separate-value option (`-o MODE`, `-n N`, `--adjustment N`) also
+        # consumes the following token so its value is not read as the leaf.
+        while idx < len(tokens):
+            a = tokens[idx]
+            if _LEADING_ENV_ASSIGN_RE.match(a + " "):
+                idx += 1
+                continue
+            if a.startswith("-"):
+                # `--opt=value` / `-oMODE` carry their value in-token already.
+                consumes_arg = "=" not in a and a in arg_opts
+                idx += 1
+                if consumes_arg and idx < len(tokens):
+                    idx += 1
+                continue
+            break
+    return idx
+
 
 def _stage_reaches_config_mutation(stage: str) -> bool:
     """True iff *stage* mentions a config-mutation verb surface (literal or var).
@@ -5675,10 +5756,18 @@ def _config_mutation_via_indirection(text: str) -> str | None:
             if _stage_reaches_config_mutation(stage):
                 return "unparseable_config_mutation_stage"
             continue
-        # Strip a leading `VAR=value` env-assignment (the spoof-prefix) so the
-        # first real command word is examined.
-        while toks and "=" in toks[0] and _LEADING_ENV_ASSIGN_RE.match(toks[0] + " "):
-            toks.pop(0)
+        # Dissolve any `env -S '<packed cmd>'` / `--split-string=` payload into
+        # its component tokens (mirrors `_config_set_env_attempt_present`) so a
+        # `env -S 'agb config ${V} K=V'` cannot hide the verb in a single token.
+        toks = _expand_env_split_string(toks)
+        # Resolve THROUGH leading `VAR=value` env-assignments AND transparent
+        # prefix commands (`env`/`command`/`exec`/`nice`/`nohup`/`stdbuf`, plus
+        # their flags + value-taking options) so the REAL command leaf is
+        # examined. Without this, a `V=set-env; env agb config $V K=V` reads as
+        # leaf `env` (not `agb`) and the config-CLI gate below misses it
+        # (#1738 r7 bypass).
+        idx = _skip_transparent_command_prefixes(toks)
+        toks = toks[idx:]
         if not toks:
             continue
         leaf = toks[0].rsplit("/", 1)[-1]
@@ -6398,9 +6487,6 @@ SEALED_RECEIVE_BASH_DENY_REASON = (
 )
 
 
-_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-
-
 def _is_bash_wrapper_receive(text: str) -> bool:
     """True iff *text* invokes `bash <…>/bridge-auth.sh claude-token receive …`.
 
@@ -6427,6 +6513,9 @@ def _is_bash_wrapper_receive(text: str) -> bool:
         # Unbalanced quotes etc. (a smuggling attempt) but the command
         # still names the wrapper receive — deny rather than fall through.
         return "receive" in stripped
+    # Dissolve any `env -S '<packed cmd>'` payload before the shared resolver,
+    # which expects it pre-expanded (mirrors the indirection gate's call order).
+    tokens = _expand_env_split_string(tokens)
     # See through leading `VAR=value` env-assignments AND `env`/`command`
     # /`/usr/bin/env` command-prefix wrappers (with their own flags +
     # `env`'s VAR=value / `-u NAME` args), then bash options — codex #1367
@@ -6443,30 +6532,11 @@ def _is_bash_wrapper_receive(text: str) -> bool:
     # agent that bypasses both layers can only store ITS OWN token, outside
     # that threat model. We deny the common spellings here for a clean early
     # signal + audit.
-    idx = 0
-    while idx < len(tokens):
-        tok = tokens[idx]
-        if _ENV_ASSIGN_RE.match(tok):
-            idx += 1
-            continue
-        base = tok.rsplit("/", 1)[-1]
-        if base in ("env", "command", "nice", "nohup", "stdbuf"):
-            idx += 1
-            # Consume the wrapper's own flags + `env` VAR=value / `-u NAME`.
-            while idx < len(tokens):
-                a = tokens[idx]
-                if _ENV_ASSIGN_RE.match(a):
-                    idx += 1
-                    continue
-                if a.startswith("-"):
-                    consumes_arg = a == "-u"
-                    idx += 1
-                    if consumes_arg and idx < len(tokens):
-                        idx += 1
-                    continue
-                break
-            continue
-        break
+    # See through leading `VAR=value` env-assignments + transparent prefix
+    # commands (`env`/`command`/`exec`/`nice`/`nohup`/`stdbuf`) and their flags,
+    # via the shared resolver the #1738 indirection gate also uses so the two
+    # recognizers agree on the same leaf for the same prefix shapes.
+    idx = _skip_transparent_command_prefixes(tokens)
     # tokens[idx] must now be the bash interpreter.
     if idx >= len(tokens) or tokens[idx].rsplit("/", 1)[-1] != "bash":
         return False
