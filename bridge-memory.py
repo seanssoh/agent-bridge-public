@@ -42,6 +42,23 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _iter_readable(path: Path, entries_fn) -> list:
+    """Enumerate `entries_fn(path)`, graceful-skipping an unreadable dir.
+
+    A controller-run index rebuild may walk an iso agent's `0700`
+    (iso-UID-only) home, where `iterdir`/`glob`/`rglob` raise
+    `PermissionError`. That boundary is correct isolation, not a bug, so a
+    rebuild that cannot read a subtree should skip it with a warning and
+    keep indexing the readable docs (Issue #1947). Genuine logic errors are
+    not caught here — only the OS read/permission boundary.
+    """
+    try:
+        return list(entries_fn(path))
+    except OSError as exc:
+        print(f"note: skipping unreadable path {path}: {exc}", file=sys.stderr)
+        return []
+
+
 def write_text(path: Path, text: str, dry_run: bool) -> None:
     """Atomic + locked text write.
 
@@ -1115,12 +1132,22 @@ def cmd_search(args: argparse.Namespace) -> int:
 def collect_index_documents(home: Path, shared_root: Path | None = None, include_cascade: bool = False) -> list[dict]:
     documents: list[dict] = []
 
+    def _exists_readable(path: Path) -> bool:
+        # Issue #1947: a controller-run rebuild may probe a path under an iso
+        # agent's 0700 home; `exists()` then raises PermissionError. Treat an
+        # unreadable path as "skip" (warn + drop) rather than aborting.
+        try:
+            return path.exists()
+        except OSError as exc:
+            print(f"note: skipping unreadable path {path}: {exc}", file=sys.stderr)
+            return False
+
     def add_markdown(path: Path, kind: str, user_id: str = "") -> None:
-        if path.exists():
+        if _exists_readable(path):
             documents.append({"path": path, "kind": kind, "user_id": user_id, "format": "markdown"})
 
     def add_json(path: Path, kind: str) -> None:
-        if path.exists():
+        if _exists_readable(path):
             documents.append({"path": path, "kind": kind, "user_id": "", "format": "json"})
 
     add_markdown(home / "SOUL.md", "agent-soul")
@@ -1136,27 +1163,29 @@ def collect_index_documents(home: Path, shared_root: Path | None = None, include
 
     for subdir, kind in (("shared", "shared"), ("projects", "project"), ("decisions", "decision")):
         root = home / "memory" / subdir
-        if root.exists():
-            for path in sorted(root.glob("*.md")):
+        if _exists_readable(root):
+            for path in sorted(_iter_readable(root, lambda r: r.glob("*.md"))):
                 add_markdown(path, kind)
 
     users_root = home / "users"
-    if users_root.exists():
-        for user_root in sorted(path for path in users_root.iterdir() if path.is_dir()):
+    if _exists_readable(users_root):
+        for user_root in sorted(
+            path for path in _iter_readable(users_root, lambda r: r.iterdir()) if path.is_dir()
+        ):
             user_id = user_root.name
             add_markdown(user_root / "USER.md", "user-profile", user_id=user_id)
             add_markdown(user_root / "MEMORY.md", "user-memory", user_id=user_id)
             daily_root = user_root / "memory"
-            if daily_root.exists():
-                for path in sorted(daily_root.glob("*.md")):
+            if _exists_readable(daily_root):
+                for path in sorted(_iter_readable(daily_root, lambda r: r.glob("*.md"))):
                     add_markdown(path, "daily", user_id=user_id)
 
     for raw_root, kind in (
         (home / "raw" / "captures" / "ingested", "raw-ingested"),
         (home / "raw" / "captures" / "inbox", "raw-inbox"),
     ):
-        if raw_root.exists():
-            for path in sorted(raw_root.glob("*.json")):
+        if _exists_readable(raw_root):
+            for path in sorted(_iter_readable(raw_root, lambda r: r.glob("*.json"))):
                 add_json(path, kind)
 
     if include_cascade:
@@ -1173,14 +1202,14 @@ def collect_index_documents(home: Path, shared_root: Path | None = None, include
             (home / "memory" / "weekly", "memory-weekly"),
             (home / "memory" / "monthly", "memory-monthly"),
         ):
-            if cascade_dir.exists():
-                for path in sorted(cascade_dir.glob("*.md")):
+            if _exists_readable(cascade_dir):
+                for path in sorted(_iter_readable(cascade_dir, lambda r: r.glob("*.md"))):
                     add_markdown(path, kind)
 
     if shared_root is not None:
         wiki_root = shared_root / "wiki"
-        if wiki_root.exists():
-            for path in sorted(wiki_root.rglob("*.md")):
+        if _exists_readable(wiki_root):
+            for path in sorted(_iter_readable(wiki_root, lambda r: r.rglob("*.md"))):
                 # Skip workspace + audit scratch areas — they are noisy
                 # and change on every hygiene run.
                 rel = path.relative_to(shared_root)
@@ -1343,6 +1372,7 @@ def cmd_rebuild_index(args: argparse.Namespace) -> int:
     documents = collect_index_documents(home, shared_root=shared_root, include_cascade=include_cascade)
 
     chunk_count = 0
+    skipped_count = 0
     if not args.dry_run:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(db_path)
@@ -1381,18 +1411,26 @@ def cmd_rebuild_index(args: argparse.Namespace) -> int:
                             relpath = str(path)
                     else:
                         relpath = str(path)
-                if doc["format"] == "markdown":
-                    text = read_text(path)
-                    chunks = chunk_markdown_text(text)
-                    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                    size_bytes = len(text.encode("utf-8"))
-                    user_id = doc["user_id"]
-                else:
-                    start_line, end_line, text, capture_user = chunk_json_capture(path)
-                    chunks = [(start_line, end_line, text)]
-                    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                    size_bytes = len(text.encode("utf-8"))
-                    user_id = capture_user or doc["user_id"]
+                try:
+                    if doc["format"] == "markdown":
+                        text = read_text(path)
+                        chunks = chunk_markdown_text(text)
+                        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                        size_bytes = len(text.encode("utf-8"))
+                        user_id = doc["user_id"]
+                    else:
+                        start_line, end_line, text, capture_user = chunk_json_capture(path)
+                        chunks = [(start_line, end_line, text)]
+                        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                        size_bytes = len(text.encode("utf-8"))
+                        user_id = capture_user or doc["user_id"]
+                except OSError as exc:
+                    # Issue #1947: a single doc owned by an iso UID (0600/0700)
+                    # may be unreadable to the controller running the rebuild.
+                    # Skip it with a warning instead of aborting the rebuild.
+                    print(f"note: skipping unreadable doc {path}: {exc}", file=sys.stderr)
+                    skipped_count += 1
+                    continue
 
                 conn.execute(
                     """
@@ -1429,7 +1467,7 @@ def cmd_rebuild_index(args: argparse.Namespace) -> int:
                     "home": str(home),
                     "shared_root": str(shared_root) if shared_root else "",
                     "indexed_at": indexed_at,
-                    "document_count": str(len(documents)),
+                    "document_count": str(len(documents) - skipped_count),
                     "chunk_count": str(chunk_count),
                 }.items(),
             )
@@ -1438,18 +1476,30 @@ def cmd_rebuild_index(args: argparse.Namespace) -> int:
             conn.close()
     else:
         for doc in documents:
-            if doc["format"] == "markdown":
-                chunk_count += len(chunk_markdown_text(read_text(doc["path"])))
-            else:
-                chunk_count += 1
+            try:
+                if doc["format"] == "markdown":
+                    chunk_count += len(chunk_markdown_text(read_text(doc["path"])))
+                else:
+                    # Issue #1947: actually read the JSON capture (as the
+                    # non-dry-run path does via chunk_json_capture) so an
+                    # unreadable JSON doc is skipped here too — otherwise the
+                    # dry-run count would diverge from the real rebuild.
+                    chunk_json_capture(doc["path"])
+                    chunk_count += 1
+            except OSError as exc:
+                # Issue #1947: match the non-dry-run skip so a dry-run over an
+                # iso tree the controller cannot read reports rather than aborts.
+                print(f"note: skipping unreadable doc {doc['path']}: {exc}", file=sys.stderr)
+                skipped_count += 1
 
     payload = {
         "agent": args.agent,
         "db_path": str(db_path),
         "index_kind": index_kind,
         "shared_root": str(shared_root) if shared_root else "",
-        "document_count": len(documents),
+        "document_count": len(documents) - skipped_count,
         "chunk_count": chunk_count,
+        "skipped_count": skipped_count,
         "indexed_at": indexed_at,
         "dry_run": args.dry_run,
     }
@@ -1461,8 +1511,10 @@ def cmd_rebuild_index(args: argparse.Namespace) -> int:
         print(f"index_kind: {index_kind}")
         if shared_root:
             print(f"shared_root: {shared_root}")
-        print(f"document_count: {len(documents)}")
+        print(f"document_count: {len(documents) - skipped_count}")
         print(f"chunk_count: {chunk_count}")
+        if skipped_count:
+            print(f"skipped_count: {skipped_count}")
         print(f"dry_run: {'yes' if args.dry_run else 'no'}")
     return 0
 

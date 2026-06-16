@@ -21,7 +21,7 @@ bridge-hooks.py:0
 bridge-intake.py:4
 bridge-knowledge.py:26
 bridge-mcp-cleanup.py:0
-bridge-memory.py:97
+bridge-memory.py:90
 bridge-migrate.py:13
 bridge-notify.py:0
 bridge-orphan-gc.py:10
