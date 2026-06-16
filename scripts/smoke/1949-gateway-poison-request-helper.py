@@ -35,10 +35,6 @@ def _write_request(req_dir: Path, req_id: str, payload: dict) -> None:
     (req_dir / f"{req_id}.request.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _write_raw_working(req_dir: Path, req_id: str, raw: str) -> None:
-    (req_dir / f"{req_id}.working.json").write_text(raw, encoding="utf-8")
-
-
 def _stub_queue(root: Path) -> Path:
     # A trivial queue child that always succeeds — the test exercises the
     # gateway's batch resilience, not real queue semantics.
@@ -58,10 +54,20 @@ def cmd_setup(root: Path) -> int:
         "id": "poison-cwd", "agent": agent, "argv": ["noop"],
         "cwd": str(root / "does-not-exist-cwd"),
     })
-    # Poison B — a malformed working file already promoted into the drain; the
-    # OLD serve-once would re-crash on it every tick. Tests the per-request
-    # try/except dead-letter (it must be retired out of the drain).
-    _write_raw_working(req, "poison-malformed", "{ this is not valid json ")
+    # Poison B — a VALID request (valid agent + str argv + accessible cwd) whose
+    # argv carries an embedded NUL byte. `subprocess.run` rejects a NUL byte in a
+    # process argument with ValueError, which handle_request does NOT catch
+    # internally (its only internal guard wraps the JSON parse) and which the cwd
+    # fallback does not touch — so it propagates into cmd_serve_once's
+    # per-request try/except. This is the ONLY fixture that actually exercises
+    # the dead-letter wrapper: an invalid-JSON payload would be caught by
+    # handle_request internally, and a bad CWD is now absorbed by the cwd
+    # fallback (os.path.isdir returns False for an inaccessible / NUL-byte path).
+    # responses/ stays writable so the dead-letter response is observable.
+    _write_request(req, "poison-nullargv", {
+        "id": "poison-nullargv", "agent": agent, "argv": ["noop\x00bad"],
+        "cwd": str(root),
+    })
     # Healthy sibling — must still be drained despite the two poisons.
     _write_request(req, "healthy", {
         "id": "healthy", "agent": agent, "argv": ["noop"], "cwd": str(root),
@@ -89,31 +95,48 @@ def cmd_assert(root: Path) -> int:
     agent = "t1"
     req = root / agent / "requests"
     resp = root / agent / "responses"
-    # 1) The healthy request was drained: a response exists with exit 0.
-    healthy_resp = resp / "healthy.json"
-    if not healthy_resp.exists():
-        print("FAIL: healthy request was NOT processed (no response) — the batch did not survive the poison")
+
+    def _resp(req_id: str) -> dict | None:
+        p = resp / f"{req_id}.json"
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+
+    # Batch survival: the healthy sibling was drained despite both poisons.
+    h = _resp("healthy")
+    if h is None or int(h.get("exit_code", -1)) != 0:
+        print(f"FAIL: healthy request not drained cleanly (batch did not survive): {h}")
         return 1
-    data = json.loads(healthy_resp.read_text(encoding="utf-8"))
-    if int(data.get("exit_code", -1)) != 0:
-        print(f"FAIL: healthy response exit_code={data.get('exit_code')} != 0")
+
+    # Fix A (cwd fallback): the inaccessible-cwd request was PROCESSED (success
+    # response, stub exit 0) and NOT dead-lettered — proving run_queue fell back
+    # to a safe cwd instead of raising. Without fix A this request would instead
+    # be caught by fix B and dead-lettered (a `.poison` file + exit_code 1), so
+    # asserting a clean success here genuinely gates fix A.
+    a = _resp("poison-cwd")
+    if a is None or int(a.get("exit_code", -1)) != 0:
+        print(f"FAIL: poison-cwd was NOT processed via the cwd fallback (fix A): {a}")
         return 1
-    # 2) The poison-cwd request was drained too (cwd fell back, did not crash):
-    #    its request/working files are gone from the drain.
-    if list(req.glob("poison-cwd.*.json")) and not list(req.glob("poison-cwd.*.poison")):
-        leftover = [p.name for p in req.glob("poison-cwd.*")]
-        # A still-pending poison-cwd request means it neither processed nor
-        # dead-lettered — the fix failed.
-        if any(n.endswith(".request.json") or n.endswith(".working.json") for n in leftover):
-            print(f"FAIL: poison-cwd still pending in drain: {leftover}")
-            return 1
-    # 3) The malformed poison was retired out of the drain (dead-lettered),
-    #    NOT left as a re-draining .working.json.
-    malformed_pending = [p.name for p in req.glob("poison-malformed.working.json")]
-    if malformed_pending:
-        print(f"FAIL: malformed poison left in drain (would re-crash every tick): {malformed_pending}")
+    if list(req.glob("poison-cwd.*.poison")):
+        print("FAIL: poison-cwd was dead-lettered — fix A did not handle it (fix B caught it instead)")
         return 1
-    print("ok-assert: batch survived poison-cwd + malformed; healthy drained; poisons retired")
+
+    # Fix B (per-request dead-letter): the NUL-byte-argv request raised in
+    # subprocess.run (ValueError), past handle_request's internal guards, and was
+    # dead-lettered — a structured error response (exit_code 1 + dead-letter
+    # stderr) AND the promoted working file retired to `<id>.working.json.poison`
+    # (out of the drain, no re-crash).
+    b = _resp("poison-nullargv")
+    if b is None or int(b.get("exit_code", -1)) != 1:
+        print(f"FAIL: poison-nullargv has no dead-letter response — fix B not exercised: {b}")
+        return 1
+    if "dead-lettered" not in str(b.get("stderr", "")):
+        print(f"FAIL: poison-nullargv response missing the dead-letter stderr: {b.get('stderr')!r}")
+        return 1
+    if not (req / "poison-nullargv.working.json.poison").exists():
+        leftover = [p.name for p in req.glob("poison-nullargv*")]
+        print(f"FAIL: poison-nullargv not retired to .poison (would re-crash every tick): {leftover}")
+        return 1
+
+    print("ok-assert: fix A processed the inaccessible-cwd request; fix B dead-lettered the NUL-argv poison; healthy drained")
     return 0
 
 
