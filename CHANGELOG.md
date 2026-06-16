@@ -6,7 +6,7 @@ version bumps via the `VERSION` file.
 
 ## [0.16.13-rc2] — 2026-06-17
 
-**v0.16.13 LTS (RC2) — RC1's upgrade/runtime fixes PLUS a bundled security + reliability wave: config-mutation trust derived from an unspoofable pane binding (#1738), a tmux-socket single-point-of-failure that downed a whole agent fleet (#1932/#1936), and a hook-path footgun that bricked a production farm (#1934).** RC2 supersedes RC1 (no separate RC1 release shipped); it is the prerelease for the re-run VM + macbook + cm-prod upgrade-test sequence before v0.16.13 is cut official. The conservative `lts` channel stays on v0.16.12 until then.
+**v0.16.13 LTS (RC2) — RC1's upgrade/runtime fixes PLUS a bundled security + reliability wave: config-mutation trust derived from an unspoofable pane binding (#1738), a tmux-socket single-point-of-failure that downed a whole agent fleet (#1932/#1936), and a hook-path footgun that bricked a production farm (#1934).** RC2 supersedes the `v0.16.13-rc1` prerelease (tagged 2026-06-15), layering the bundled security + reliability wave on top of RC1's upgrade/runtime fixes; it is the prerelease for the re-run VM + macbook + cm-prod upgrade-test sequence before v0.16.13 is cut official. The conservative `lts` channel stays on v0.16.12 until then.
 
 ### Security & reliability (new in RC2)
 
