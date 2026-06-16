@@ -5615,6 +5615,19 @@ def _config_set_env_check(
 # and are closed naturally by the wrapper identity fix.
 _INDIRECTION_SHELL_LEAVES = frozenset({"eval", "bash", "sh"})
 
+# The direct config-CLI command leaves. The unresolved-`$` indirection branch
+# below only fires when the stage's actual command IS one of these (a config
+# verb/path/assignment hidden behind a `$var` ARGUMENT, e.g. `agb config $V
+# K=V`) OR the command word itself is an unresolved `$var` (the CLI hidden, e.g.
+# `$C config set …`). Without this gate the branch false-positives on ANY
+# command whose argument text merely contains the substring "config" plus a "$"
+# — e.g. a pure read `awk '{print $1}' lib/system_config_paths.py` (the filename
+# carries "config", the awk program carries "$1"). The durable wrapper-side
+# identity fix covers a verb reached through other interpreters (`python3 -c …`);
+# this static hook stays scoped to the shell-indirection + direct-CLI shapes.
+# (#1738 r6 — closes the 1690-tasksdb-read-carveout smoke false-positive.)
+_CONFIG_CLI_LEAVES = frozenset({"agb", "agent-bridge"})
+
 # A command-position `$var` / `${var}` / `$(...)` that expands to (part of) the
 # verb. We flag an UNRESOLVED `$` adjacent to the config-mutation surface
 # (`config` / `set` / `set-env` / `--path` / the assignment) so a
@@ -5682,12 +5695,20 @@ def _config_mutation_via_indirection(text: str) -> str | None:
         # `$V` would already have been (not) expanded by shlex into the literal
         # `$V` token. Either way an unexpanded `$` next to the config verb means
         # the real argv is hidden from the literal recognizers.
-        if _stage_reaches_config_mutation(stage) and "$" in scan:
-            # Only flag when the `$` is adjacent to the mutation surface, not an
-            # unrelated `$HOME` in a comment-free benign position. Conservative:
-            # any `$` in a stage that ALSO reaches the config-mutation surface
-            # is treated as indirection (privileged writes must use literal
-            # argv). Accepts a false deny for `--change x=$(date)` etc.
+        if (
+            (leaf in _CONFIG_CLI_LEAVES or "$" in toks[0])
+            and _stage_reaches_config_mutation(stage)
+            and "$" in scan
+        ):
+            # Flag ONLY when the command is the config CLI itself (`agb` /
+            # `agent-bridge`, with a `$var` hiding the verb / path / assignment)
+            # OR the command word is itself an unresolved `$var` (the CLI hidden,
+            # e.g. `$C config set …`). A `$` elsewhere in a NON-config command
+            # (e.g. `awk '{print $1}' lib/system_config_paths.py` — "config" in
+            # the filename, `$1` in the awk program) is NOT indirection. The
+            # `$`-adjacency stays conservative: any `$` in such a config-CLI
+            # stage is treated as indirection (privileged writes must use literal
+            # argv). Accepts a false deny for `agb config set --change x=$(date)`.
             return "config_mutation_via_unresolved_var"
     return None
 
