@@ -810,9 +810,25 @@ def run_queue(
     else:
         child_env.pop("BRIDGE_QUEUE_GATEWAY_ACTOR", None)
 
+    # F8 (#1949): a request records the CLIENT's cwd. An iso agent that runs
+    # `agb` from inside a 0700 iso-owned dir (e.g. `.teams/attachments/<id>`)
+    # records a path this controller-run gateway server cannot chdir into, so
+    # `subprocess.run(cwd=<that dir>)` raises PermissionError BEFORE the child
+    # runs. Left unguarded that aborts the whole serve-once batch and the
+    # promoted `.working.json` re-crashes every tick → fleet-wide silent queue
+    # death. Queue ops key off BRIDGE_* env + the queue DB (not cwd), so falling
+    # back to the gateway process's own dir (cwd=None) when the recorded cwd is
+    # missing or inaccessible is behavior-preserving and lets the request run.
+    safe_cwd = cwd
+    if safe_cwd is not None:
+        try:
+            if not (os.path.isdir(safe_cwd) and os.access(safe_cwd, os.R_OK | os.X_OK)):
+                safe_cwd = None
+        except OSError:
+            safe_cwd = None
     proc = subprocess.run(
         [sys.executable, str(queue_script), *argv],
-        cwd=cwd,
+        cwd=safe_cwd,
         capture_output=True,
         text=True,
         env=child_env,
@@ -920,6 +936,34 @@ def handle_request(path: Path, queue_script: Path) -> int:
     return 0
 
 
+def _dead_letter_poison_request(working: Path, exc: BaseException) -> None:
+    """F8 (#1949): retire a request whose handler raised so it cannot re-crash
+    the serve-once batch every tick. Best-effort: write an error response for
+    the waiting client, then rename the working file to a non-draining
+    ``.poison`` name (iter_requests only globs ``*.request.json`` /
+    ``*.working.json``), falling back to unlink."""
+    req_id = working.name.split(".", 1)[0]
+    try:
+        responses_dir = working.parent.parent / "responses"
+        responses_dir.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — gateway server writes its own controller-side responses dir
+        atomic_write_json(responses_dir / f"{req_id}.json", {
+            "id": req_id,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": f"queue gateway: request dead-lettered after a handler error: {type(exc).__name__}: {exc}\n",
+            "processed_at": now_iso(),
+        })
+    except Exception:  # noqa: BLE001 — best-effort error surfacing; never re-raise into the batch loop
+        pass
+    try:
+        working.rename(working.with_name(working.name + ".poison"))  # noqa: raw-pathlib-controller-only — gateway server retires its own controller-side working file
+    except OSError:
+        try:
+            working.unlink(missing_ok=True)  # noqa: raw-pathlib-controller-only — gateway server consumes its own controller-side working file
+        except OSError:
+            pass
+
+
 def cmd_serve_once(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser()
     queue_script = Path(args.queue_script).expanduser()
@@ -936,7 +980,17 @@ def cmd_serve_once(args: argparse.Namespace) -> int:
                 os.replace(candidate, working)
         except OSError:
             continue
-        handle_request(working, queue_script)
+        try:
+            handle_request(working, queue_script)
+        except Exception as exc:  # noqa: BLE001 — F8 (#1949): one poison request must NEVER abort the batch
+            # A request that deterministically raises (e.g. an inaccessible cwd
+            # that slipped past run_queue's guard, or any future poison) would
+            # otherwise crash the whole serve-once batch AND leave the promoted
+            # `.working.json` to re-crash every tick → fleet-wide silent queue
+            # death. Write a clear error response (so the waiting client gets a
+            # failure, not an indefinite timeout), retire the poison file out of
+            # the drain path, and CONTINUE draining the rest of the batch.
+            _dead_letter_poison_request(working, exc)
         processed += 1
 
     print(processed)
