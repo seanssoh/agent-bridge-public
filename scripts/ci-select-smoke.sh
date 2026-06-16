@@ -2114,7 +2114,7 @@ select_for_path() {
       # can no longer rm a healthy listener's bound socket. Pull
       # 1652-queue-gateway-crashloop on every bridge-daemon.sh move so a
       # regression to the single-miss rm cannot reopen the crash-loop.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill 1833-status-gateway-timeout-not-down
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp F-daemon-supp-groups-mock F-daemon-supp-groups-real δ-1234-daemon-start-policy A3-beta3-1248-restart-session-id-resume A12-beta3-1246-1252-daemon-supp-group-and-state-dir D-beta4-daemon-lifecycle A-beta4-iso-path-resolution E-beta4-fresh-install-gate-state-dir G-beta4-watchdog-noise I-beta4-a2a-3-gaps J-beta4-workflow-docs Beta-beta5-session-id-detect-sudo beta5-1-session-id-detect-race dev-channel-auto-accept-no-attach mcp-liveness-giveup-auto-clear beta5-2-epsilon-tmux-inject-busy beta5-2-pi-daemon-crashloop-no-set-e-leak beta5-2-kappa-state-audit-reconcile 1359-cron-create-iso-staging 1380-admin-autostart-recovery 1388-daemon-lock-fd-cloexec 1407-runtime-hardening 1405-handoffd-supervision 1679-1680-a2a-receiver-supervisor-robustness 1408-daemon-alert-nudge-hygiene 1473-agent-list-iso-state-fallback 1461-cron-max-parallel-override 1463-launchd-keepalive-singleton-thrash 1563-pr2-daemon-self-abort 1563-pr4-a2a-receiver-healthz 1563-pr5-fp-control-matrix 1563-pr6-watchdog-scan-timeout 1563-pr7-tick-cadence 1563-pr8-a2a-diag-recovery 1629-healthz-not-semaphore-gated 1685-receiver-staleness-selfheal v0165-l0-reconcile-skeleton v0165-l2-tunnel-health v0165-l1-stable-addr v0165-l3-peer-reachability v0165-l4-token-join v0165-l5-relay-roster v0165-l6-net-status-v2 v0166-la-tunnel-bounce-gate v0166-lb-transient-peers 1652-queue-gateway-crashloop 1803-orphan-dir-gc 1809-agents-md-backfill 1855-keychain-free-backfill 1833-status-gateway-timeout-not-down 1934-hook-file-self-heal
       # Issue #1899: bridge-sync.sh's refresh_missing_session_ids backfill sweep
       # now skips dynamic vanilla Codex (it must never detect/persist an operator
       # ~/.codex session id). Pull 1899 on bridge-sync.sh moves so the daemon
@@ -2448,6 +2448,17 @@ select_for_path() {
       # smoke on every move so a change to the field shape / parse cannot
       # silently break the stale-record repair.
       add_required 1738-config-caller-binding
+      ;;
+
+    lib/daemon-helpers/hook-file-missing-scan.py)
+      # Issue #1934 (facet 2): this helper scans an agent's rendered hook command
+      # paths for an absent FILE; the daemon `bridge_daemon_reheal_missing_hook_files`
+      # reconcile arm uses its `ok`/`missing` result to force a self-heal re-render.
+      # Pull the self-heal smoke on every move so a change to the scan output / the
+      # basename allowlist cannot silently break the missing-hook recovery (the
+      # cm-prod farm-outage class). The canonical-fence smoke rides along since the
+      # re-render and the renderer share the `_stable_hooks_dir` builders.
+      add_required 1934-hook-file-self-heal 1934-hook-path-canonical-fence
       ;;
 
     scripts/python-helpers/config-caller-binding-write.py)
