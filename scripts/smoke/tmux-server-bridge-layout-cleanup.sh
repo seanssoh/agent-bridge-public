@@ -50,6 +50,12 @@ SMOKE_NAME="tmux-server-bridge-layout-cleanup"
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd -P)"
 
+# Fleet-down guard: this smoke creates AND tears down a tmux server. Force a
+# private tmux universe (and sever any inherited $TMUX) BEFORE the first tmux
+# op so a run from inside a live agent pane can't kill the shared fleet socket.
+# shellcheck source=../../lib/bridge-smoke-tmux-isolation.sh
+source "$SCRIPT_DIR/../../lib/bridge-smoke-tmux-isolation.sh"
+
 echo "[smoke:${SMOKE_NAME}] starting"
 
 failed=0

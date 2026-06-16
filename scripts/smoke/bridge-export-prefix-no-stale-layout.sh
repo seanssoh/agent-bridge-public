@@ -45,6 +45,13 @@ SMOKE_NAME="bridge-export-prefix-no-stale-layout"
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd -P)"
 
+# Fleet-down guard: force a private tmux universe (and sever any inherited
+# $TMUX) before any work, so a run from inside a live agent pane can't reach
+# the shared fleet socket. Idempotent + harmless even though this smoke does
+# not itself drive tmux.
+# shellcheck source=../../lib/bridge-smoke-tmux-isolation.sh
+source "$SCRIPT_DIR/../../lib/bridge-smoke-tmux-isolation.sh"
+
 echo "[smoke:${SMOKE_NAME}] starting"
 
 # Run the prefix computation in a child shell so the smoke harness

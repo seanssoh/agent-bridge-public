@@ -56,6 +56,12 @@ set -uo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd -P)"
 
+# Fleet-down guard: this smoke is destructive (it forks daemon-shaped children
+# and exercises lock teardown). Force a private tmux universe BEFORE any such
+# op so a stray run from inside a live agent pane can't down the shared fleet.
+# shellcheck source=../../lib/bridge-smoke-tmux-isolation.sh
+source "$SCRIPT_DIR/../../lib/bridge-smoke-tmux-isolation.sh"
+
 FAILS=0
 TOTAL=0
 _pass() { TOTAL=$((TOTAL + 1)); printf '[ok] %s\n' "$1"; }
