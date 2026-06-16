@@ -51,7 +51,27 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/smoke/lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
-trap smoke_cleanup_temp_root EXIT
+# #1738 r3 FIX 2 — false-green guard. The r3 smoke returned rc=0 after only the
+# SERVER-DOWN prune tooth on at least one host (codex review: execution stopped
+# after `run_prune "server-up"` yet the script still exited 0), so the SERVER-UP
+# prune + self-heal teeth + the final PASS marker silently never ran. A green
+# exit code WITHOUT the final marker is the exact false-pass we must make
+# impossible. SMOKE_REACHED_END is set ONLY on the line that prints the PASS
+# marker; this EXIT trap forces a non-zero exit whenever the script is about to
+# exit 0 without having set it (early `return`/`exit`/`set -e` abort, a swallowed
+# failure, anything). It still always runs temp-root cleanup.
+SMOKE_REACHED_END=0
+smoke_1738_exit_guard() {
+  local rc=$?
+  smoke_cleanup_temp_root
+  if [[ "$rc" == "0" && "$SMOKE_REACHED_END" != "1" ]]; then
+    printf '[smoke:%s][error] %s\n' "$SMOKE_NAME" \
+      "exiting rc=0 WITHOUT the final PASS marker — teeth were skipped (the #1738 r3 false-green). Failing." >&2
+    exit 1
+  fi
+  exit "$rc"
+}
+trap smoke_1738_exit_guard EXIT
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -527,6 +547,75 @@ else
 fi
 
 # ===========================================================================
+# SECTION 6b — WRAPPER: #1738 r3 FIX 1 (TMUX_TMPDIR is not a liveness oracle).
+#
+# TMUX_TMPDIR is the PARENT of tmux's default socket dir, so a caller can stand
+# up a PRIVATE default server under a dir it controls, create a same-named
+# session carrying a FORGED pane_pid, and (pre-fix) make the wrapper's liveness
+# probe resolve that forged pid as "live" — re-opening the orphan-binding match
+# the absolute-binary discipline closes (codex r3 proof:
+# `_live_with_TMUX_TMPDIR=44062`, `_live_without=None`). FIX 1 strips
+# TMUX_TMPDIR (with TMUX/TMUX_PANE) from the probe's child env, forcing it onto
+# the controller's real default server. TEETH: build a private TMUX_TMPDIR
+# server whose session is ABSENT from the default server, set TMUX_TMPDIR to it,
+# and assert `_live_pane_pid_for_session` returns None (the strip ignored the
+# caller-pointed server); a sanity probe confirms the private server WOULD have
+# resolved the forged pid without the strip (so the tooth is not vacuous).
+# ===========================================================================
+
+if command -v tmux >/dev/null 2>&1; then
+  # The private TMUX_TMPDIR must live under a SHORT base path: tmux derives its
+  # socket as "$TMUX_TMPDIR/tmux-<uid>/default", and a macOS unix-domain socket
+  # path caps at ~104 chars — $SMOKE_TMP_ROOT (/private/var/folders/...) blows
+  # past that, so we mktemp a short /tmp dir and clean it up explicitly (it sits
+  # outside the EXIT-trap's SMOKE_TMP_ROOT teardown).
+  TMPDIR_PRIV="$(mktemp -d "${TMPDIR:-/tmp}/agb-cc-tt.XXXXXX" 2>/dev/null || mktemp -d /tmp/agb-cc-tt.XXXXXX)"
+  case "$TMPDIR_PRIV" in
+    /private/var/folders/*) TMPDIR_PRIV="$(mktemp -d /tmp/agb-cc-tt.XXXXXX)" ;;
+  esac
+  TMPDIR_SESS="agb-cc-tmpdir-probe-$$"
+  # Create the private server with TMUX/TMUX_PANE unset so TMUX_TMPDIR (not an
+  # inherited $TMUX) selects the socket dir. Kill ONLY this private server on the
+  # way out (never the default server a co-resident operator may be using).
+  if ( unset TMUX TMUX_PANE; TMUX_TMPDIR="$TMPDIR_PRIV" tmux new-session -d -s "$TMPDIR_SESS" ) 2>/dev/null; then
+    sleep 0.4
+    TMPDIR_FORGED_PID="$( ( unset TMUX TMUX_PANE; TMUX_TMPDIR="$TMPDIR_PRIV" tmux display-message -t "$TMPDIR_SESS" -p '#{pane_pid}' ) 2>/dev/null || true)"
+    # Precondition: the default server must NOT carry this session, else the
+    # tooth would be inconclusive (a default-server hit, not a TMUX_TMPDIR hit).
+    if ( unset TMUX TMUX_PANE TMUX_TMPDIR; tmux has-session -t "$TMPDIR_SESS" 2>/dev/null ); then
+      smoke_log "skip: TMUX_TMPDIR oracle tooth — default server already has '$TMPDIR_SESS' (inconclusive)"
+    elif [[ ! "$TMPDIR_FORGED_PID" =~ ^[0-9]+$ ]]; then
+      smoke_log "skip: TMUX_TMPDIR oracle tooth — private server pane_pid did not resolve"
+    else
+      # Sanity (anti-vacuous): WITHOUT the strip the private server DOES resolve
+      # the forged pid — proves the redirect is real on this host.
+      TMPDIR_ENV_AWARE="$( ( unset TMUX TMUX_PANE; TMUX_TMPDIR="$TMPDIR_PRIV" tmux display-message -t "$TMPDIR_SESS" -p '#{pane_pid}' ) 2>/dev/null || true)"
+      smoke_assert_eq "$TMPDIR_FORGED_PID" "$TMPDIR_ENV_AWARE" \
+        "TMUX_TMPDIR tooth: private server resolves the forged pid env-aware (anti-vacuous)"
+      # The wrapper's probe WITH caller-set TMUX_TMPDIR must IGNORE the private
+      # server (strip → default server → no such session → None).
+      TMPDIR_WRAP="$( ( unset TMUX TMUX_PANE; TMUX_TMPDIR="$TMPDIR_PRIV" "$PYTHON_BIN" -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("bc", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+print(m._live_pane_pid_for_session(sys.argv[2]))
+' "$WRAPPER" "$TMPDIR_SESS" ) 2>/dev/null || true)"
+      if [[ "$TMPDIR_WRAP" != "None" ]]; then
+        smoke_fail "TMUX_TMPDIR tooth: wrapper liveness resolved the caller-pointed private server (got '$TMPDIR_WRAP', expected None) — TMUX_TMPDIR is still a liveness oracle"
+      fi
+      smoke_log "ok: TMUX_TMPDIR caller-pointed private server IGNORED by wrapper liveness (None; forged pid ${TMPDIR_FORGED_PID} not honored)"
+    fi
+    ( unset TMUX TMUX_PANE; TMUX_TMPDIR="$TMPDIR_PRIV" tmux kill-server ) 2>/dev/null || true
+  else
+    smoke_log "skip: TMUX_TMPDIR oracle tooth — could not start a private tmux server"
+  fi
+  rm -rf "$TMPDIR_PRIV" 2>/dev/null || true
+else
+  smoke_log "skip: TMUX_TMPDIR oracle tooth (no tmux)"
+fi
+
+# ===========================================================================
 # SECTION 7 — DAEMON PRUNE: #1738 r3 FIX 3 (false-delete / fleet self-DoS).
 #
 # `bridge_daemon_prune_orphan_config_caller_bindings` r2 deleted a binding
@@ -559,12 +648,17 @@ eval "$("$PYTHON_BIN" "$PRUNE_SLICER" "$REPO_ROOT/bridge-daemon.sh" \
 # `tmux` FUNCTION below is the controlled server: PRUNE_TMUX_MODE selects its
 # list-sessions behaviour.
 bridge_config_caller_bindings_dir() { printf '%s' "$PRUNE_BD"; }
-bridge_daemon_helper_python() { "$PYTHON_BIN" "$REPO_ROOT/lib/daemon-helpers/config-binding-list.py" "$2"; }
+# Dispatch on the helper NAME ($1) so the prune fn can reach BOTH the list helper
+# (prune pass) and the record helper (#1738 r3 FIX 3 stale-record self-heal).
+bridge_daemon_helper_python() {
+  "$PYTHON_BIN" "$REPO_ROOT/lib/daemon-helpers/$1.py" "$2"
+}
 bridge_remove_config_caller_binding() { rm -f "$PRUNE_BD/$1.json" 2>/dev/null || true; }
 bridge_publish_config_caller_binding() { :; }
 bridge_agent_session() { :; }
 bridge_agent_engine() { :; }
 bridge_tmux_session_pane_pid() { :; }
+bridge_admin_agent_id() { printf '%s' "$ADMIN_AGENT"; }
 bridge_audit_log() { :; }
 daemon_info() { :; }
 BRIDGE_AGENT_IDS=()
@@ -641,6 +735,42 @@ if [[ -f "$PRUNE_BD/$ADMIN_AGENT.json" ]] && grep -q '"updated_at":"healed"' "$P
 else
   smoke_fail "prune SELF-HEAL did not re-publish a missing binding for a live-session agent"
 fi
+
+# 7e. SELF-HEAL of a PRESENT-but-STALE record (#1738 r3 FIX 3). The r3 pass only
+#     repaired a MISSING record; a present record for the live session with a
+#     WRONG pane_pid (left over after a restart that recycled the pane) was
+#     skipped and kept authorizing against the recycled pid. The fixed pass
+#     validates the present record against the live pane_pid (54321 from the
+#     shim) + bound agent + admin id and republishes on a mismatch. Seed a
+#     present record with a STALE pane_pid (99999) and assert it is rewritten to
+#     the live pid with the healed marker.
+clear_bindings
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":99999,"engine":"claude","updated_at":"stale"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$PRUNE_LIVE_SESSION" >"$PRUNE_BD/$ADMIN_AGENT.json"
+run_prune "server-up"
+if [[ -f "$PRUNE_BD/$ADMIN_AGENT.json" ]] \
+   && grep -q '"updated_at":"healed"' "$PRUNE_BD/$ADMIN_AGENT.json" \
+   && grep -q '"pane_pid":54321' "$PRUNE_BD/$ADMIN_AGENT.json"; then
+  smoke_log "ok: prune SELF-HEAL re-published a PRESENT-but-stale binding (wrong pane_pid -> live pane_pid)"
+else
+  smoke_fail "prune SELF-HEAL did not repair a present record with a stale pane_pid (FIX 3 regressed)"
+fi
+
+# 7f. A PRESENT and CURRENT record (correct pane_pid + agent + admin) must be
+#     LEFT UNTOUCHED — no churn, no rewrite. Seed it already-current (pane_pid
+#     54321 = the live shim value, updated_at sentinel 'current') and assert the
+#     self-heal does NOT overwrite it with the 'healed' marker.
+clear_bindings
+printf '{"version":1,"agent_id":"%s","admin_agent_id":"%s","session":"%s","pane_pid":54321,"engine":"claude","updated_at":"current"}\n' \
+  "$ADMIN_AGENT" "$ADMIN_AGENT" "$PRUNE_LIVE_SESSION" >"$PRUNE_BD/$ADMIN_AGENT.json"
+run_prune "server-up"
+if grep -q '"updated_at":"current"' "$PRUNE_BD/$ADMIN_AGENT.json" \
+   && ! grep -q '"updated_at":"healed"' "$PRUNE_BD/$ADMIN_AGENT.json"; then
+  smoke_log "ok: prune SELF-HEAL left a present-and-current binding untouched (no churn)"
+else
+  smoke_fail "prune SELF-HEAL rewrote a present-and-current binding (false churn)"
+fi
+
 # A persistent publish FAILURE must NOT churn (binding stays absent, no false heal).
 clear_bindings
 bridge_publish_config_caller_binding() { :; }   # publish that writes nothing
@@ -654,4 +784,8 @@ unset -f tmux bridge_agent_session bridge_tmux_session_pane_pid bridge_agent_eng
 # Restore a clean, writable, empty store before exit.
 clear_bindings
 
+# Reaching this line means every tooth above ran (no early abort). Set the
+# sentinel the EXIT guard checks, THEN print the PASS marker; a rc=0 exit without
+# this is treated as a false-green and forced to fail (#1738 r3 FIX 2).
+SMOKE_REACHED_END=1
 smoke_log "PASS: all #1738 config-caller-binding wrapper + hook + prune cases held"

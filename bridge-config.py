@@ -304,6 +304,22 @@ _TMUX_ABSOLUTE_CANDIDATES = (
     "/bin/tmux",
 )
 
+# tmux env vars that select WHICH tmux server the absolute binary talks to. They
+# are STRIPPED from the liveness probe's child env (#1738 r3 FIX 1) so a caller
+# cannot redirect the probe at a private server carrying a forged pane_pid:
+#   - TMUX / TMUX_PANE: set by tmux inside a pane; identify the *current* server
+#     + pane. With them present, an absolute `tmux display-message` (no `-S`)
+#     attaches to whatever server they name.
+#   - TMUX_TMPDIR: the PARENT of tmux's default socket dir. tmux derives its
+#     default socket path from it, so a caller-set TMUX_TMPDIR points a no-`-S`
+#     `tmux` command at a private default server under a dir the agent controls
+#     (codex r3 proof: `_live_with_TMUX_TMPDIR=44062`, `_live_without=None`).
+# This tuple is the SINGLE SOURCE OF TRUTH for the strip list, mirrored by the
+# daemon prune's subshell `unset TMUX TMUX_PANE TMUX_TMPDIR` guard in
+# bridge-daemon.sh (`bridge_daemon_prune_orphan_config_caller_bindings`). Keep
+# the two in sync.
+_TMUX_SOCKET_SELECTION_ENV = ("TMUX", "TMUX_PANE", "TMUX_TMPDIR")
+
 
 class ConfigCaller:
     """Resolved, authorization-relevant identity of a `set`/`set-env` call.
@@ -594,20 +610,25 @@ def _live_pane_pid_for_session(session: str) -> int | None:
     is unavailable, or the output is not an integer — every such case is treated
     by the caller as "binding is stale → skip" (fail-closed).
 
-    `TMUX` / `TMUX_PANE` are STRIPPED from the child env (#1738 r3 FIX 2): the
-    controller publishes the binding's session on the DEFAULT tmux server, so
-    liveness must query that server. An agent owns its own env when it execs the
-    wrapper and could otherwise set `$TMUX` to point this probe at a private
-    server where it created a same-named session with a forged pane_pid —
+    ALL tmux socket-selection env (`TMUX`, `TMUX_PANE`, `TMUX_TMPDIR` —
+    `_TMUX_SOCKET_SELECTION_ENV`) is STRIPPED from the child env (#1738 r3
+    FIX 1): the controller publishes the binding's session on the DEFAULT tmux
+    server, so liveness must query that server. An agent owns its own env when
+    it execs the wrapper and could otherwise point this probe at a private
+    server — via `$TMUX`/`$TMUX_PANE` OR via `$TMUX_TMPDIR` (the parent of the
+    default socket dir) — carrying a same-named session with a forged pane_pid,
     re-opening the orphan-binding match the absolute-binary discipline closes.
-    Removing the socket-selection vars forces the probe onto the default server.
+    Removing every socket-selection var forces the probe onto the real default
+    server the controller wrote to.
     """
     if not session:
         return None
     tmux_bin = _resolve_tmux_bin()
     if tmux_bin is None:
         return None
-    child_env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
+    child_env = {
+        k: v for k, v in os.environ.items() if k not in _TMUX_SOCKET_SELECTION_ENV
+    }
     try:
         out = subprocess.run(
             [tmux_bin, "display-message", "-t", session, "-p", "#{pane_pid}"],

@@ -2434,6 +2434,15 @@ select_for_path() {
       add_required 1738-config-caller-binding
       ;;
 
+    lib/daemon-helpers/config-binding-record.py)
+      # Issue #1738 r3 (FIX 3): this helper emits a present binding's stale-check
+      # fields (`<pane_pid>\t<agent_id>\t<admin_agent_id>`) so the daemon
+      # self-heal can republish a present-but-stale record. Pull the binding
+      # smoke on every move so a change to the field shape / parse cannot
+      # silently break the stale-record repair.
+      add_required 1738-config-caller-binding
+      ;;
+
     lib/bridge-resource-guard.sh)
       # Incident #8807 P0a: the resource-guard primitive + the daemon-side
       # defer/audit/throttled-warn wrapper. Pull 8807-resource-guard-defer on
